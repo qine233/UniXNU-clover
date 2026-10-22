@@ -125,10 +125,26 @@ The firmware's own `uefiplat.cfg` (same dump, `fw/xbl-uefiplat.txt`) then overro
 device trees on the splash address, `0x9d400000` rather than the overlay's `0x9d500000`;
 `notes/clover-device-tree-sources.md` section 5 keeps the reasoning.
 
-Still open: the load offsets in `[bootimg.image]`, which are gta4l's placeholders. The
-unit's stock `boot` partition is in the dump (`img/unixnu-boot.img`) and its page size and
-kernel size read cleanly, but its address fields sit one slot off the documented v1 layout,
-so the offsets need a known mkbootimg image to calibrate against rather than a guess.
+And the boot image parameters stopped being a guess. The dump pulled the whole
+`boot` and `recovery` partitions (`img/unixnu-boot.img`, `img/unixnu-recovery.img` —
+the `unixnu-` prefix is the script's naming, the bytes are stock Xiaomi), and their
+headers agree with each other on every field `[bootimg.image]` needs:
+
+| field | value | how it is known, not just read |
+| --- | --- | --- |
+| header version | `0` | the slot at 0x28 is zero in both images |
+| page size | `0x1000` | independently proven by the arithmetic: the ramdisk starts exactly at `0x1000 + align(kernel_size, 0x1000)` |
+| kernel offset | `0x8000` | base-relative; `0x80000000` stays out of the header, which is why `base = 0` |
+| ramdisk offset | `0x1000000` | same |
+| tags offset | `0x100` | same |
+| dtb | appended | the kernel section is `Image.gz` plus concatenated DTBs right after the gzip stream: 111 in `boot`, 1 in `recovery` |
+
+Neither image has an AVB footer and both have an all-zero `id`, so nothing in the
+boot image itself is signed on this variant.  The gta4l placeholders that used to
+sit in `[bootimg.image]` (`ramdisk_offset 0x20000000`, `tags_offset 0x01e00000`,
+`header_version 1`) were wrong for clover and the firmware repository's checker now
+pins the real numbers.
+
 
 ## What is intentionally left out
 

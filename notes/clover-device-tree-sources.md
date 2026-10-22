@@ -81,9 +81,7 @@ lavender 推断。`NumCpus = 4 / NumActiveCores = 8`（簇数/核数）与 `proc
 - ~~`qcom,board-id` 在真机 DTB 上的实际 subtype~~ → 已确认，见第 5 节
 - ~~userdata GPT 的 first/last LBA 与 logical_block_size~~ → `0xf10520` / `0x747bfde`，512 字节扇区，已写进 `board.toml`
 - ~~真机 DTB 里的 `/memory`、`/chosen`、ABL 实际使用的 display 区域~~ → 见第 5 节
-- stock `boot` 分区头里 kernel/ramdisk 加载地址那一组字段的排布（`img/unixnu-boot.img` 的
-  `0x0c/0x10/0x14` 与文档化的 v1 布局差一格，需要一个已知 mkbootimg 镜像来校准，
-  现在 `board.toml [bootimg.image]` 的三个 offset 还是 gta4l 的占位值）
+- ~~stock `boot` 分区头里 kernel/ramdisk 加载地址那一组字段的排布~~ → 见第 7 节，已经解出来并写进 `board.toml [bootimg.image]`
 
 结构性缺口（跟设备树无关，别抱期待）：
 - XNU 没有原生 eMMC/SDHCI 驱动（`NativeUfs` 才有），所以拿 sheng 那种「userdata 里直接挂 APFS」的路子走不通，
@@ -91,3 +89,38 @@ lavender 推断。`NumCpus = 4 / NumActiveCores = 8`（簇数/核数）与 `proc
 - `NativeAdreno` 只支持 Adreno 740，Adreno 512 无驱动 → 目标是 UEFI 菜单 → XNU 控制台 / CPU 渲染
 - 该平板 USB 只有 device 模式（`dr_mode = "peripheral"`），UniXNU 菜单的交互要靠串口或触摸
 - 触摸是 ft5406，UniXNU 没有对应驱动
+
+## 7. stock boot 头：不需要外部镜像校准，两个分区自己就能证明（2026-10-22）
+
+上次说「`0x0c/0x10/0x14` 与文档化的 v1 布局差一格」是我按 v1 去读 v0 的头。dump 里
+`img/unixnu-boot.img`、`img/unixnu-recovery.img` 就是这台机器的 boot / recovery 整分区
+（`unixnu-` 只是脚本的命名前缀），按 v0 布局读，两个镜像逐字段一致：
+
+| 偏移 | 字段 | boot | recovery |
+| --- | --- | --- | --- |
+| 0x00 | magic | `ANDROID!` | 同 |
+| 0x08 | kernel_size | `0x2fd1ac0` | `0xd02c1d` |
+| 0x0c | kernel_addr | `0x8000` | `0x8000` |
+| 0x10 | ramdisk_size | `0x140cb5` | `0x16cf38d` |
+| 0x14 | ramdisk_addr | `0x1000000` | `0x1000000` |
+| 0x18/0x1c | second | 0 / 0 | 0 / 0 |
+| 0x20 | tags_addr | `0x100` | `0x100` |
+| 0x24 | page_size | `0x1000` | `0x1000` |
+| 0x28 | header_version | **0** | **0** |
+
+三个「地址」其实是相对 DRAM 基址的偏移，`0x80000000` 由 ABL 自己加 —— 这正是它看着不像
+物理地址的原因，也是 `board.toml` 里 `base` 必须保持 0 的原因（写进去就翻两倍）。
+
+不靠读表、能独立自证的两条：
+
+- **page size**：kernel 段从 `0x1000` 起，ramdisk 恰好落在 `0x1000 + align(kernel_size, 0x1000)`
+  （boot 是 `0x2fd3000`，recovery 是 `0x0d04000`），两处实测都是 `1f 8b` gzip 头。
+- **append_dtb**：内核段里 gzip 流结束的下一个字节就是 `d00dfeed`。boot 里是 **111 个 DTB 串联**
+  （同一套镜像要覆盖 8 吋/10.1"、Wi-Fi/LTE），recovery 里只有 1 个 —— 后者就是我们打包的形状，
+  ABL 用 `qcom,msm-id` + `qcom,board-id` 在这堆里挑。
+- 两个镜像都没有 AVB 尾（分区末尾 8 KiB 内无 `AVB0`），头里的 `id` 全零，所以这条链上
+  boot 镜像自身不带签名。
+
+结论：`header_version` 从 lavender 的 1 改成本机的 0，`ramdisk_offset`/`tags_offset` 丢掉 gta4l
+的 `0x20000000`/`0x01e00000`。`uefi-clover/scripts/check-clover-uefi.py` 现在拿这组实测值当基准，
+board.toml 写错会直接报错。

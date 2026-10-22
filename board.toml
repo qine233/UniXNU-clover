@@ -170,16 +170,22 @@ packed_data_ramdisk = true
 ipad_identity = true
 unique_chip_id = "required"         # the platform seed is not stored in any repository
 
-# Image parameters come from the Mu-Silicium device config (clover.toml: header version 1,
-# gzip kernel, appended dtb); these override the load offsets.
-# TODO-DEVICE: verify against the header of facts/.../img/unixnu-boot.img.
+# Load offsets read off this unit: facts/<serial>-<stamp>/img/unixnu-boot.img and
+# unixnu-recovery.img are the stock boot and recovery partitions, and both carry the
+# same header -- version 0, page_size 0x1000, and 0x8000 / 0x1000000 / 0x100 in the
+# kernel_addr, ramdisk_addr and tags_addr slots.  Those three are base-relative
+# offsets with the 0x80000000 left out, which is why `base` stays 0 here: the ABL
+# adds the DRAM base itself, and adding it in the packer too would load the kernel
+# at 0x1_00008000.  The stock kernel section is Image.gz with device trees appended
+# after the gzip stream (111 of them in boot, selected by qcom,msm-id and
+# qcom,board-id), the same shape [boot_image_kernel] append_dtb describes.
 [bootimg.image]
 base = 0
 kernel_offset = 0x00008000
-ramdisk_offset = 0x20000000
-tags_offset = 0x01e00000
+ramdisk_offset = 0x01000000
+tags_offset = 0x00000100
 pagesize = 4096
-header_version = 1
+header_version = 0
 
 # The stock ABL switches the panel off when the tree it loads has no splash region,
 # so the appended device tree must declare the one the firmware reserves: Display
