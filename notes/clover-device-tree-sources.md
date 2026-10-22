@@ -28,9 +28,9 @@
 
 ```
 msm-id / SoC      317 (0x13D), SDM660
-board-id          <11 0>  (MTP 基座；真机 DTBO 可能再叠 subtype，待 dump 确认)
+board-id          <11 0>  (MTP 基座；真机 merged dtb 叠了 subtype 1，见第 5 节)
 DRAM base         0x80000000            (lavender 的 UEFI 也是这个)
-splash / FB       0x9d500000 + 0x2400000 (36 MiB)   mainline 自用 fb 在 0x9d400000
+splash / FB       0x9d500000 + 0x2400000 (36 MiB)   mainline 自用 fb 在 0x9d400000；真机固件是 0x9d400000，port 用它（第 5 节）
 分辨率            1200 x 1920, stride 4800, a8r8g8b8
 GIC               dist 0x17a00000 / redist 0x17b00000, stride 0x20000
 eMMC              sdhc_1 @ 0xc0c4000 (hc 0xc0c4000/0x1000, cqhci 0xc0c5000/0x1000, ICE 0xc0c8000/0x8000), CQE + HS400ES, 8-bit
@@ -47,16 +47,43 @@ Mu-Silicium 的 `lavender`（Redmi Note 7，同 SDM660/StarlordPkg）已跑通�
 `QcomPkg/Drivers/SdccDxe`（SDCC = 高通 eMMC 主机）和 `UFSDxe` —— 说明固件层驱动这台平板的 eMMC 是现成的。
 内存图：DDR `0x80000000`、FD `0x9FC00000/0x300000`、boot header v1、append_dtb、psci smc。
 
-## 5. 判断：能适配的部分 vs 仍然卡住的部分
+## 5. 真机 dump 校正了设备树的三处
+
+`scripts/dump-clover-facts.sh` 跑完后（`facts/<serial>-<stamp>/`），三处设备树推断被真机推翻或补齐：
+
+- **splash 地址**：真机 xbl 里的 `uefiplat.cfg`（`fw/xbl-uefiplat.txt`）把 "Display Reserved" 定在
+  **`0x9d400000 + 0x02400000`**，也就是说 stock xbl 开机时已经把 splash 画在这段窗口里，UEFI 接手时
+  framebuffer 只有这个地址能用。`clover-overlay.dtsi` 的 `0x9d500000` 是给「内核自己重画 splash」
+  预留的，非 overlay 的基座设备树本来就是 `0x9d400000`。结论：**固件赢，port 用 `0x9d400000`**。
+- **DRAM 分 bank**：`dt/memory.raw.txt` 是两个 bank —— `0x80000000 + 0x80000000` 和
+  `0x100000000 + 0x7e4c0000`（MemTotal 3825460 kB，确实是 4 GB 版）。之前笔记里「高 bank 在
+  `0x1800000000`」是错的。`/chosen` 只带一组 dram-base/dram-size，所以 ADT 仍只描述低 2 GiB。
+- **board-id**：真机 merged dtb 是 `qcom,board-id = <0x0001000b 0x0>`（低 16 位 0x000b = MTP 平台号
+  11，高 16 位 subtype 1），`qcom,msm-id` 就是 `<317 0>`。
+
+同一份 `uefiplat.cfg` 还给了 `[RegisterMap]` 33 行和 `[ConfigParameters]` 33 个键，
+`Library/MemoryMapLib` 与 `Library/ConfigurationMapLib` 现在都是它的逐行照抄，不再是从
+lavender 推断。`NumCpus = 4 / NumActiveCores = 8`（簇数/核数）与 `proc/cpuinfo.txt` 的
+4×CPU part 0x801 + 4×0x800 一致。
+
+**UEFI blob 的来源也不是 `uefi` 分区**：clover 的 GPT 里没有 `uefi`/`uefi_a`，SEC 直接 gunzip
+`xbl`（mmcblk0p1）里偏移 `0xa89b0` 的 gzip 流，得到 `FvLength = 0x459040` 的固件卷，
+83 个 FFS 文件、全是 AArch64 PE32，模块 GUID 与上游 lavender 的 Device-Binaries 逐个对得上。
+`../uefi-clover/scripts/extract-clover-blobs.py --xbl <file>` 就是按这个流程把
+`Binaries/clover` 填出来的。
+
+## 6. 判断：能适配的部分 vs 仍然卡住的部分
 
 能直接落地：ADT（dram-base/dram-size/display-base/reserved-memory/msm-id/board-id/cpu-regs）、
-`clover.dts` 与 splash_region、MemoryMapLib、UEFI framebuffer 1920x1200、boot.img 打包参数（多数可由 header v1 + append_dtb 推定）。
+`clover.dts` 与 splash_region、MemoryMapLib、UEFI framebuffer 1200x1920、boot.img 打包参数（多数可由 header v1 + append_dtb 推定）。
 
 仍需真机（`scripts/dump-clover-facts.sh`）：
-- `qcom,board-id` 在真机 DTB 上的实际 subtype（要 `dtc` 解 dtb/dtbo）
-- userdata GPT 的 first/last LBA 与 logical_block_size（board.toml `[userdata]` 必需，只能从机器读）
-- 真机 DTB 里的 `/memory`、`/chosen`、ABL 实际使用的 display 区域
-- 该机的 DDR 总量在 bootloader 视角的可用来跑 XNU 的量（4 GB 版）
+- ~~`qcom,board-id` 在真机 DTB 上的实际 subtype~~ → 已确认，见第 5 节
+- ~~userdata GPT 的 first/last LBA 与 logical_block_size~~ → `0xf10520` / `0x747bfde`，512 字节扇区，已写进 `board.toml`
+- ~~真机 DTB 里的 `/memory`、`/chosen`、ABL 实际使用的 display 区域~~ → 见第 5 节
+- stock `boot` 分区头里 kernel/ramdisk 加载地址那一组字段的排布（`img/unixnu-boot.img` 的
+  `0x0c/0x10/0x14` 与文档化的 v1 布局差一格，需要一个已知 mkbootimg 镜像来校准，
+  现在 `board.toml [bootimg.image]` 的三个 offset 还是 gta4l 的占位值）
 
 结构性缺口（跟设备树无关，别抱期待）：
 - XNU 没有原生 eMMC/SDHCI 驱动（`NativeUfs` 才有），所以拿 sheng 那种「userdata 里直接挂 APFS」的路子走不通，

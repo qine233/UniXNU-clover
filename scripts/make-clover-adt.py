@@ -9,6 +9,13 @@ Two public sources describe this board and they agree on every constant used her
                arch/arm64/boot/dts/vendor/qcom/  (qcom,msm-id = <317 0x0>,
                cont_splash_mem = 0x9d500000 + 0x2400000)
 
+They disagree on one thing, the splash address, and there the firmware decides.  The
+uefiplat.cfg in this unit's own xbl partition reserves Display Reserved at
+0x9d400000 + 0x2400000, which is the window the stock xbl has already drawn into by
+the time UEFI runs -- the same base the non-overlay device trees use.  Only
+clover-overlay.dtsi moves it, to 0x9d500000, for a kernel that re-draws its own
+splash, so the firmware and the base trees win.
+
 The node set follows docs/porting/device-tree.md: /chosen (with random-seed, the NVRAM
 proxy and the memory-map placeholders), /cpus, /psci, /arm-io with the GICv3 child,
 /defaults and /options. Values only the unit itself knows are marked TODO-DEVICE and
@@ -25,9 +32,11 @@ import zlib
 # --- board constants -------------------------------------------------------
 # SDM660 DRAM starts at 0x80000000 (gta4l's SM6115 uses 0x40000000).
 DRAM_BASE = 0x80000000
-# A 4 GiB Mi Pad 4 reports two banks: 0x80000000+2 GiB and 0x1800000000+2 GiB.
-# TODO-DEVICE: confirm from dt/memory*.reg in the dump; the ADT describes the low
-# bank only, which is the region the first bring-up needs.
+# /proc/device-tree/memory/reg from this unit, read as two banks:
+#   0x80000000 + 0x80000000   and   0x100000000 + 0x7E4C0000
+# which is the 4 GiB Mi Pad 4 (MemTotal 3825460 kB).  /chosen carries a single
+# dram-base/dram-size pair, so the ADT describes the low bank and leaves the
+# high one to a later map; nothing above 4 GiB is reachable until then.
 DRAM_SIZE = 0x80000000
 TIMEBASE_HZ = 19200000
 
@@ -41,20 +50,30 @@ CLOVER_HARDWARE_SPEC = {
     "model": 'Xiaomi Mi Pad 4 8" LTE (2018)',
     "compatible": ["xiaomi,clover-lte", "qcom,sdm660"],
     "msm_id": [0x13D, 0x0],            # qcom,msm-id = <317 0x0>
-    "board_id": [11, 0],               # qcom,board-id of sdm660-mtp-clover
-                                       # TODO-DEVICE: the DTBO subtype of this unit
+    "board_id": [0x0001000B, 0x0],     # qcom,board-id as the merged dtb on this unit
+                                       # carries it: platform 11 (sdm660-mtp-clover's
+                                       # board id) in the low 16 bits, DTB subtype 1
+                                       # in the high 16
+                                       # (dt/root.words.txt, dt/root.strings.txt)
     "clock_frequency": TIMEBASE_HZ,
     "framebuffer": {
-        # The stock ABL hands over cont_splash_mem; UniXNU draws in its head.
-        "base": 0x9D500000,
+        # The stock xbl draws its splash into 0x9D400000 and the stock ABL hands
+        # that window over; UniXNU draws in its head.  Some clover device trees
+        # move cont_splash_mem to 0x9D500000, which is the kernel's own
+        # reservation for a splash it does not inherit -- the firmware on this
+        # unit says 0x9D400000, and uefiplat.cfg in xbl is what UEFI reads.
+        "base": 0x9D400000,
         "window_size": 0x02400000,     # the whole cont_splash_mem region
         "size": 1200 * 1920 * 4,
         "width": 1200,
         "height": 1920,
         "stride": 1200 * 4,
         "format": "a8r8g8b8",
-        # Portrait-native panel, Android runs it in landscape.
-        # TODO-DEVICE: verify the handed-over orientation is 270 and not 90.
+        # Portrait-native panel, Android runs it in landscape.  270 is inferred
+        # from the stock landscape splash, not measured: nothing on the running
+        # Android describes the orientation a payload inherits, so this is the
+        # one framebuffer field the first real UniXNU boot has to confirm -- if
+        # the picture comes out upside down, the answer is 90.
         "rotation": 270,
     },
     # Stock carve-outs, recorded so the UEFI memory map and check-clover.py can be reasoned
@@ -69,8 +88,11 @@ CLOVER_HARDWARE_SPEC = {
     "reserved_memory": [
         # Sizes here are clover-overlay.dtsi's, which overrides sdm660-common.dtsi on
         # this board: adsp is 0x1f00000 there (0x1e00000 in the SoC default), and mba and
-        # cdsp move up to 0x94900000/0x94b00000.  The three are contiguous, so the UEFI
-        # memory map can cover them as one "PIL Reserved" block of 0x2700000.
+        # cdsp move up to 0x94900000/0x94b00000.  The three are contiguous and end at
+        # 0x95100000.  The device's own map does not follow them: adsp falls in the
+        # 0x86200000..0x94000000 hole the stock uefiplat.cfg leaves unlisted, and mba and
+        # cdsp land inside "DXE Heap", which is what stock UEFI does with them -- those
+        # windows only become real when the Android kernel loads that firmware.
         {"name": "pil_adsp_mem",  "base": 0x92A00000, "size": 0x01F00000},
         {"name": "pil_mba_mem",   "base": 0x94900000, "size": 0x00200000},
         {"name": "pil_cdsp_mem",  "base": 0x94B00000, "size": 0x00600000},
@@ -78,7 +100,7 @@ CLOVER_HARDWARE_SPEC = {
         # downstream tree only carves it out of a reusable CMA pool in the low 512 MiB, so
         # the UEFI memory map does not reserve this address.
         {"name": "pil_venus_mem", "base": 0x9CC00000, "size": 0x00800000},
-        {"name": "framebuffer0",  "base": 0x9D500000, "size": 1200 * 1920 * 4},
+        {"name": "framebuffer0",  "base": 0x9D400000, "size": 1200 * 1920 * 4},
         {"name": "ramoops",       "base": 0x9FE00000, "size": 0x00100000},
         {"name": "gpu_zap_mem",   "base": 0x0F0B00000, "size": 0x00002000},
     ],

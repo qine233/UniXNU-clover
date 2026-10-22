@@ -31,11 +31,13 @@ fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustC
 
 # The raw image for the userdata partition: the OS and SystemOS disk images of the IPSW behind a manifest.
 # clover has eMMC (mmcblk0) with 512-byte logical sectors, so lba_bytes is 512.
-# TODO-DEVICE: first_lba/last_lba are the GPT entry named userdata on this unit.
-# scripts/dump-clover-facts.sh writes them into facts/.../userdata-window.txt.
+# The window is mmcblk0p64 as this unit reports it (facts/.../userdata-window.txt:
+# start 15795488, size 106347199, of a 122142720 sector disk), so last_lba leaves the
+# 34 trailing sectors of the backup GPT alone.  A different ROM can lay the GPT out
+# differently, which is why the dump comes before any image is written behind it.
 [userdata]
-first_lba = 0x0
-last_lba = 0x0
+first_lba = 0xf10520
+last_lba = 0x747bfde
 lba_bytes = 512
 windows = [
   { name = "OS", component = "OS" },
@@ -133,8 +135,9 @@ UNIXNU_BUILD = "1"
 
 # The ramdisk of the boot image: a FAT volume with the UniXNU config, the kernel, its device
 # tree and the optional trust cache. The loader (DarwinBoot) is part of the firmware volume.
-# dram_size is the low DRAM bank only: SDM660 maps 2 GiB at 0x80000000 and, on the 4 GiB
-# unit, another 2 GiB at 0x1800000000. TODO-DEVICE: confirm the bank split from the dump.
+# dram_size is the low DRAM bank only: this 4 GiB unit reports 0x80000000+0x80000000 and
+# 0x100000000+0x7e4c0000 in dt/memory.raw.txt, and /chosen carries one base/size pair, so
+# the high bank stays unused until the port can describe two.
 [payload]
 volume = "CLOVERESP"
 size_mib = 192
@@ -179,10 +182,11 @@ pagesize = 4096
 header_version = 1
 
 # The stock ABL switches the panel off when the tree it loads has no splash region,
-# so the appended device tree must declare the one Xiaomi reserves.
+# so the appended device tree must declare the one the firmware reserves: Display
+# Reserved in this unit's uefiplat.cfg, 0x9d400000 + 0x2400000.
 [[bootimg.dtb_node]]
 path = "/reserved-memory/splash_region"
 props = [
   { name = "label", type = "s", value = "cont_splash_region" },
-  { name = "reg", type = "x", value = ["0x0", "0x9d500000", "0x0", "0x2400000"] },
+  { name = "reg", type = "x", value = ["0x0", "0x9d400000", "0x0", "0x2400000"] },
 ]

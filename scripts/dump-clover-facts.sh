@@ -38,9 +38,12 @@ cap() { # cap <path> <shell command...>
       return 1
     fi
   fi
+  mkdir -p "$OUT/$(dirname "$dest")"
   printf '%s\n' "$out" > "$OUT/$dest"
 }
-# decode a devicetree property as 32-bit little-endian words
+# decode a devicetree property as 32-bit words.  The tree stores them big-endian and
+# od reads them little-endian, so each printed word has to be byte-reversed: a line
+# "0000a017 00000100" is reg = <0x17a00000 0x00010000>.
 dtwords() { # dtwords <relative dt path>
   local p="$1" o
   o=$(S "od -An -tx4 '/proc/device-tree/$p'")
@@ -81,7 +84,8 @@ S "for f in /proc/device-tree/cpus/cpu@*/reg; do echo \$f \$(od -An -tx4 \$f); d
 S "cat /proc/device-tree/cpus/timebase-frequency 2>/dev/null | od -An -tx4; ls -d /proc/device-tree/timer* 2>/dev/null; for f in /proc/device-tree/timer*/*; do echo \$f; done" > "$OUT/dt/timer.txt"
 echo "-- psci"; cap dt/psci.txt "cat /proc/device-tree/psci/method; cat /proc/device-tree/psci/compatible"
 echo "-- interrupt controller"
-cap dt/gic.raw.txt "ls -d /proc/device-tree/interrupt-controller*; for f in /proc/device-tree/interrupt-controller*/reg /proc/device-tree/interrupt-controller*/redistributor-stride /proc/device-tree/interrupt-controller*/#redistributor-regions; do echo \$f \$(od -An -tx4 \$f); done"
+# The GICv3 sits under /soc on this tree, so a root-level glob alone finds nothing.
+cap dt/gic.raw.txt "for d in /proc/device-tree/interrupt-controller* /proc/device-tree/soc*/interrupt-controller*; do [ -e \"\$d\" ] || continue; echo == \$d; for f in reg redistributor-stride '#redistributor-regions' '#interrupt-cells' compatible; do [ -e \"\$d/\$f\" ] && echo \"\$f \$(od -An -tx4 \"\$d/\$f\" | tr -s '\n' ' ')\"; done; done"
 echo "-- memory banks"
 cap dt/memory.raw.txt "ls -d /proc/device-tree/memory*; for f in /proc/device-tree/memory*/reg; do echo \$f \$(od -An -tx4 \$f); done"
 echo "-- reserved-memory (panel splash + framebuffer regions)"

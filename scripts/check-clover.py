@@ -8,7 +8,8 @@ every check works from either location. Three groups run independently:
          back, and asserts the nodes and properties ArmDTPlatform and DarwinBoot require.
          Python 3 alone is enough, so this is the check to run first on a new host.
   board  cross-checks board.toml against the defconfig, the payload contract and the hardware
-         constants. It needs tomllib, that is Python 3.11 or newer, or the tomli module.
+         constants.  It parses the TOML with tomllib (3.11+) or tomli when they exist and with
+         a built-in subset reader otherwise, so it runs on the Python macOS ships.
   region compares the windows the board spec declares: the splash region, the firmware volume,
          the described DRAM and the stock reserved carve-outs must not lie on each other.
   tree   reports the modules the kernel and firmware steps expect.
@@ -28,10 +29,13 @@ import tempfile
 HERE = pathlib.Path(__file__).resolve()
 REPO = HERE.parents[1]
 
-# SDM660 facts, from the two device trees described in notes/clover-device-tree-sources.md.
+# SDM660 facts.  MSM_ID and CPU_REGS come from the two device trees described in
+# notes/clover-device-tree-sources.md; SPLASH_BASE, DRAM_BASE and DRAM_SIZE from
+# this unit itself (fw/xbl-uefiplat.txt and dt/memory.raw.txt under
+# facts/<serial>-<stamp>/), which is where they disagree with clover-overlay.dtsi.
 MSM_ID = 0x13D
 CPU_REGS = [0x0, 0x1, 0x2, 0x3, 0x100, 0x101, 0x102, 0x103]
-SPLASH_BASE = 0x9D500000
+SPLASH_BASE = 0x9D400000
 SPLASH_SIZE = 0x02400000
 DRAM_BASE = 0x80000000
 DRAM_SIZE = 0x80000000
@@ -215,19 +219,170 @@ def check_adt(errors: list) -> str:
     return f"{len(data)} bytes, {len(cpus)} cores"
 
 
+def toml_split(text: str, at: str = ",") -> list:
+    """Split on `at` outside quotes and brackets."""
+    parts, depth, quote, start = [], 0, None, 0
+    for i, char in enumerate(text):
+        if quote:
+            if char == quote and text[i - 1:i] != "\\":
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+        elif char == at and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return [p.strip() for p in parts if p.strip()]
+
+
+def toml_unquote(text: str) -> str:
+    text = text.strip()
+    inner = text[1:-1]
+    return inner.replace('\\"', '"').replace("\\\\", "\\") if text[0] == '"' else inner
+
+
+def toml_value(text: str):
+    text = text.strip()
+    if text.startswith("[") and text.endswith("]"):
+        return [toml_value(item) for item in toml_split(text[1:-1])]
+    if text.startswith("{") and text.endswith("}"):
+        return toml_table(text[1:-1])
+    if text[:1] in "\"'" and text[-1:] == text[:1] and len(text) > 1:
+        return toml_unquote(text)
+    if text in ("true", "false"):
+        return text == "true"
+    try:
+        return int(text, 16) if text[:2].lower() == "0x" else int(text, 10)
+    except ValueError:
+        return text
+
+
+def toml_table(text: str) -> dict:
+    table = {}
+    for item in toml_split(text):
+        key, _, value = item.partition("=")
+        table[toml_value(key.strip())] = toml_value(value)
+    return table
+
+
+def toml_subset(text: str) -> dict:
+    root: dict = {}
+    stack: list = []                                   # the tables [a.b] descends into
+    for line in _toml_logical_lines(text):
+        line = line.strip()
+        if line.startswith("[[") and line.endswith("]]"):
+            keys = [toml_value(k) for k in line[2:-2].split(".")]
+            parent = _toml_descend(root, keys[:-1])
+            entry: dict = {}
+            parent.setdefault(keys[-1], [])
+            if not isinstance(parent[keys[-1]], list):
+                raise ValueError(f"{line} redeclares {keys[-1]} as an array")
+            parent[keys[-1]].append(entry)
+            stack = [entry]
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            keys = [toml_value(k) for k in line[1:-1].split(".")]
+            stack = [root]
+            for key in keys:
+                child = stack[-1].setdefault(key, {})
+                if not isinstance(child, dict):
+                    raise ValueError(f"{line} redeclares {key} as a value")
+                stack.append(child)
+            continue
+        key, _, value = line.partition("=")
+        stack[-1][toml_value(key.strip())] = toml_value(value)
+    return root
+
+
+def _toml_descend(root: dict, keys: list) -> dict:
+    table = root
+    for key in keys:
+        table = table.setdefault(key, {})
+    return table
+
+
+def _toml_logical_lines(text: str):
+    """One entry per key or header, comments dropped and arrays joined."""
+    buffer = ""
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        cut = _toml_comment_at(line)
+        if not buffer and cut == 0:
+            continue
+        line = line[:cut].rstrip() if cut >= 0 else line
+        if not buffer and not line.strip():
+            continue
+        buffer = f"{buffer} {line.strip()}".strip() if buffer else line.strip()
+        if _toml_balanced(buffer):
+            yield buffer
+            buffer = ""
+    if buffer:
+        yield buffer
+
+
+def _toml_comment_at(line: str) -> int:
+    quote = None
+    for i, char in enumerate(line):
+        if quote:
+            if char == quote and line[i - 1:i] != "\\":
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "#":
+            return i
+    return -1
+
+
+def _toml_balanced(text: str) -> bool:
+    quote = None
+    depth = 0
+    for i, char in enumerate(text):
+        if quote:
+            if char == quote and text[i - 1:i] != "\\":
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+    return depth <= 0
+
+
+def load_toml(path: pathlib.Path):
+    """board.toml as a dict, on any Python this board's host ships.
+
+    tomllib is 3.11+, tomli is its predecessor, and the subset reader above
+    covers what board.toml uses: tables, dotted headers, arrays of tables,
+    inline tables, arrays, hex integers, strings and booleans.  The sibling
+    repository carries the same reader in uefi-clover/scripts/check-clover-uefi.py
+    for the same reason; keep the two in step.
+    """
+    try:
+        import tomllib                                  # Python 3.11 and newer
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib                     # its pure-Python predecessor
+        except ModuleNotFoundError:
+            return toml_subset(path.read_text())
+    return tomllib.loads(path.read_text())
+
+
 def check_board(errors: list) -> str:
     board_path = next((candidate / "board.toml" for candidate in (REPO, pathlib.Path.cwd())
                        if (candidate / "board.toml").is_file()), None)
     if board_path is None:
         return "board.toml not visible"
     try:
-        import tomllib
-    except ModuleNotFoundError:
-        try:
-            import tomli as tomllib        # the pure-Python predecessor of tomllib
-        except ModuleNotFoundError:
-            return "board cross-check skipped (needs Python 3.11 or the tomli module)"
-    board = tomllib.loads(board_path.read_text())
+        board = load_toml(board_path)
+    except (ValueError, SyntaxError) as error:
+        errors.append(f"board.toml did not parse: {error}")
+        return "board.toml unreadable"
 
     if board["board"]["name"] != "clover" or board["board"]["soc"] != "SDM660":
         errors.append("board.toml does not describe clover / SDM660")

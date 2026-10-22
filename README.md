@@ -28,8 +28,9 @@ Nothing above claims more than that table.
 
 ## Hardware facts used here
 
-Every constant comes from a published device tree, not from guesswork. Both trees agree,
-and `feeds.toml` pins them so `unixnu fetch` keeps a copy:
+Most constants come from a published device tree, pinned in `feeds.toml` so `unixnu fetch`
+keeps a copy; the ones the tablet itself answers come from the dump under
+`facts/<serial>-<stamp>/`, and the source column says which is which:
 
 | Item | Value | Source |
 | --- | --- | --- |
@@ -37,9 +38,9 @@ and `feeds.toml` pins them so `unixnu fetch` keeps a copy:
 | Downstream board-id | `qcom,board-id = <11 0>` on the MTP base | `sdm660-mtp-clover.dts` |
 | Cores | Silver `0x0-0x3` (A53, 1804800 kHz), Gold `0x100-0x103` (2208000 kHz) | `sdm660.dtsi` → `sdm630.dtsi` |
 | Timebase | 19.2 MHz | both trees |
-| DRAM | base `0x80000000`; the 4 GB unit adds a second bank at `0x1800000000` | both trees, TODO-DEVICE |
+| DRAM | base `0x80000000` + `0x80000000`, second bank `0x100000000` + `0x7e4c0000` | `dt/memory.raw.txt`, `proc/meminfo.txt` (MemTotal 3825460 kB) |
 | GIC | distributor `0x17a00000`/`0x10000`, redistributor `0x17b00000`/`0x100000`, stride `0x20000` | downstream `sdm660.dtsi` |
-| Splash / framebuffer | `cont_splash_mem` = `0x9d500000` + `0x02400000` (the base board declares `0x9d400000` + `0x23ff000`; the clover overlay moves it) | `clover-overlay.dtsi` |
+| Splash / framebuffer | `0x9d400000` + `0x02400000`, the "Display Reserved" row of the firmware's own memory map. `clover-overlay.dtsi` moves `cont_splash_mem` to `0x9d500000` for a kernel that re-draws its splash; the firmware this unit boots decides the address instead, and the base trees agree with it | `fw/xbl-uefiplat.txt` |
 | Panel | 1200×1920, `boe,tv080wum-nx2` / `novatek,nt51021`, 107×172 mm, so 8 inch | mainline + downstream |
 | Touch | `edt,edt-ft5406` at `blsp_i2c3` 0x38 (mainline); downstream uses focaltech `fts` | `sdm660-xiaomi-clover-regular-common.dtsi` |
 | Backlight | `pm660l_wled`, an LED driver rather than a PWM | same |
@@ -74,9 +75,9 @@ facts/                         per-unit dumps, ignored by Git
 The kernel step is macOS-only; the firmware step builds on Linux. The host still needs
 two things before any of this runs: `sudo xcodebuild -license accept` (Xcode 27 on this
 machine is installed but unlicensed, which also breaks `git` and Homebrew until it is
-accepted) and a Python 3.11+ interpreter for `./unixnu` and the board cross-check — the
-system Python 3.9 has no `tomllib`, so `scripts/check-clover.py` runs its ADT group and
-skips the board group there.
+accepted) and a Python 3.11+ interpreter for `./unixnu` itself. `scripts/check-clover.py`
+has no such requirement: it reads board.toml with `tomllib`, `tomli` or its own subset
+parser, so all four groups run on the system Python 3.9.
 
 ```sh
 git clone --recurse-submodules https://github.com/UniXNU/UniXNU
@@ -101,7 +102,7 @@ temporary file, decodes the Apple node encoding again, and asserts `/chosen` (64
 `TrustCache`, `/cpus` with the eight MPIDR values, `/psci`, `/arm-io` with `ranges` and
 the GICv3 node, `/defaults`, `/options` and `/product`.
 
-## Before the first install
+## What the dump answered
 
 `scripts/dump-clover-facts.sh` collects what only this unit can answer and writes it to
 `facts/<serial>-<stamp>/`:
@@ -110,13 +111,24 @@ the GICv3 node, `/defaults`, `/options` and `/product`.
 adb shell cp /tmp/dump-clover-facts.sh /data/local/tmp/ && adb shell sh /data/local/tmp/dump-clover-facts.sh
 ```
 
-Three values in `board.toml` are placeholders until then, and each is marked `TODO-DEVICE`:
+The dump has been run once (2026-10-22) and three of the placeholders in `board.toml` are
+now answered by the device itself:
 
-- `[userdata] first_lba` / `last_lba` — the GPT entry named `userdata` on this tablet.
-  Without them no image can be written behind the manifest.
-- The DRAM bank split — `dram_size` currently declares the low 2 GiB bank only.
-- `qcom,board-id` as the merged dtb/dtbo of this unit actually declares it, and the ABL
-  boot-image parameters.
+- `[userdata] first_lba` / `last_lba` — `0xf10520` / `0x747bfde`, mmcblk0p64 in 512-byte
+  sectors. Without them no image can be written behind the manifest.
+- The DRAM bank split — `0x80000000+0x80000000` and `0x100000000+0x7e4c0000`; `dram_size`
+  declares the low bank only, because `/chosen` carries one base/size pair.
+- `qcom,board-id` — the merged dtb declares `<0x0001000b 0x0>`, and `qcom,msm-id` is
+  `<317 0>` after all.
+
+The firmware's own `uefiplat.cfg` (same dump, `fw/xbl-uefiplat.txt`) then overrode the
+device trees on the splash address, `0x9d400000` rather than the overlay's `0x9d500000`;
+`notes/clover-device-tree-sources.md` section 5 keeps the reasoning.
+
+Still open: the load offsets in `[bootimg.image]`, which are gta4l's placeholders. The
+unit's stock `boot` partition is in the dump (`img/unixnu-boot.img`) and its page size and
+kernel size read cleanly, but its address fields sit one slot off the documented v1 layout,
+so the offsets need a known mkbootimg image to calibrate against rather than a guess.
 
 ## What is intentionally left out
 
