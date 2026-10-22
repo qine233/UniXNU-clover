@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Preflight check for the Xiaomi Mi Pad 4 8" LTE (clover, SDM660) board.
+
+The firmware step runs this from the assembled build tree, where board.toml is not copied, so
+every check works from either location. Three groups run independently:
+
+  ADT    calls scripts/make-clover-adt.py into a temporary file, reads the Apple node encoding
+         back, and asserts the nodes and properties ArmDTPlatform and DarwinBoot require.
+         Python 3 alone is enough, so this is the check to run first on a new host.
+  board  cross-checks board.toml against the defconfig, the payload contract and the hardware
+         constants. It needs tomllib, that is Python 3.11 or newer, or the tomli module.
+  tree   reports the modules the kernel and firmware steps expect.
+
+Exit status is 1 when any group reports an error.
+"""
+from __future__ import annotations
+
+import pathlib
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve()
+REPO = HERE.parents[1]
+
+# SDM660 facts, from the two device trees described in notes/clover-device-tree-sources.md.
+MSM_ID = 0x13D
+CPU_REGS = [0x0, 0x1, 0x2, 0x3, 0x100, 0x101, 0x102, 0x103]
+SPLASH_BASE = 0x9D500000
+SPLASH_SIZE = 0x02400000
+DRAM_BASE = 0x80000000
+DRAM_SIZE = 0x80000000
+ARM_IO_BASE = 0x17000000
+GICD_PHYS = 0x17A00000
+TIMEBASE_HZ = 19200000
+
+REQUIRED_CHOSEN = ["random-seed", "nvram-proxy-data", "nvram-bank-size", "dram-base",
+                   "dram-size", "crypto-hash-method", "root-matching", "display-base",
+                   "unique-chip-id"]
+REQUIRED_MEMORY_MAP = ["RAMDisk", "PackedRAMDisk", "TrustCache"]
+
+
+def read_node(data: bytes, offset: int):
+    """Decode one node: u32 property count, u32 child count, properties, then children."""
+    prop_count, child_count = struct.unpack_from("<II", data, offset)
+    cursor = offset + 8
+    properties = {}
+    for _ in range(prop_count):
+        name = data[cursor:cursor + 32].split(b"\0", 1)[0].decode("ascii", "replace")
+        length, = struct.unpack_from("<I", data, cursor + 32)
+        properties[name] = data[cursor + 36:cursor + 36 + length]
+        cursor += 36 + ((length + 3) & ~3)
+    children = {}
+    for _ in range(child_count):
+        child = read_node(data, cursor)
+        children[child["name"]] = child
+        cursor = child["end"]
+    # The name property carries its own NUL terminator.
+    return {"name": properties.get("name", b"").split(b"\0", 1)[0].decode("ascii", "replace"),
+            "properties": properties, "children": children, "end": cursor}
+
+
+def parse_adt(data: bytes):
+    root = read_node(data, 0)
+    if len(data) != root["end"]:
+        raise ValueError(f"trailing bytes: the root node ends at {root['end']}, the blob is {len(data)}")
+    return root
+
+
+def adt_command(output: pathlib.Path):
+    return [sys.executable, str(REPO / "scripts/make-clover-adt.py"), "--output", str(output),
+            "--dram-size", hex(DRAM_SIZE), "--owned-memory-size", "0x40000000",
+            "--root-match-volume-uuid", "04769D26-2CA0-4825-B443-E2E5F88300F2",
+            "--chip-id", hex(MSM_ID), "--cpu-regs", ",".join(hex(v) for v in CPU_REGS),
+            "--psci-method", "smc", "--unique-chip-id", "0x0123456789ab",
+            "--packed-data-ramdisk", "--trust-cache", "--ipad-identity"]
+
+
+def check_adt(errors: list) -> str:
+    generator = REPO / "scripts/make-clover-adt.py"
+    if not generator.is_file():
+        errors.append("scripts/make-clover-adt.py is missing")
+        return "no generator"
+    with tempfile.TemporaryDirectory() as work:
+        output = pathlib.Path(work) / "kernel.macho.adt"
+        result = subprocess.run(adt_command(output), capture_output=True, text=True)
+        if result.returncode:
+            errors.append(f"the ADT generator failed: {(result.stdout + result.stderr).strip()}")
+            return "generator failed"
+        data = output.read_bytes()
+        try:
+            root = parse_adt(data)
+        except ValueError as error:
+            errors.append(f"ADT encoding: {error}")
+            return "ADT unreadable"
+
+        chosen = root["children"].get("chosen")
+        if chosen is None:
+            errors.append("the ADT has no /chosen")
+            return f"{len(data)} bytes"
+        for prop in REQUIRED_CHOSEN:
+            if prop not in chosen["properties"]:
+                errors.append(f"/chosen is missing {prop}")
+        if len(chosen["properties"].get("random-seed", b"")) != 64:
+            errors.append("/chosen/random-seed is not 64 bytes")
+        if chosen["properties"].get("dram-base") != struct.pack("<Q", DRAM_BASE):
+            errors.append(f"/chosen/dram-base is not 0x{DRAM_BASE:x}")
+
+        memory_map = chosen["children"].get("memory-map")
+        if memory_map is None:
+            errors.append("/chosen/memory-map is missing")
+        else:
+            for placeholder in REQUIRED_MEMORY_MAP:
+                value = memory_map["properties"].get(placeholder)
+                if value is None:
+                    errors.append(f"/chosen/memory-map is missing {placeholder}")
+                elif len(value) != 16:
+                    errors.append(f"/chosen/memory-map/{placeholder} is {len(value)} bytes, not 16")
+
+        for node in ("cpus", "arm-io", "defaults", "options"):
+            if node not in root["children"]:
+                errors.append(f"the ADT has no /{node}; the platform expert refuses without it")
+
+        cpus = root["children"].get("cpus", {}).get("children", {})
+        regs = sorted(struct.unpack("<I", cpu["properties"]["reg"])[0]
+                      for cpu in cpus.values() if "reg" in cpu["properties"])
+        if regs != CPU_REGS:
+            errors.append(f"/cpus carries {regs}, expected the Kryo 260 set {CPU_REGS}")
+        stray = [name for name in cpus if not re.fullmatch(r"cpu[0-7]", name)]
+        if stray:
+            errors.append(f"/cpus has a child that is not cpuN: {stray}")
+        timebases = {struct.unpack("<I", cpu["properties"]["timebase-frequency"])[0]
+                     for cpu in cpus.values() if "timebase-frequency" in cpu["properties"]}
+        if timebases and timebases != {TIMEBASE_HZ}:
+            errors.append(f"/cpus timebase is {timebases}, expected 19.2 MHz")
+
+        arm_io = root["children"].get("arm-io", {})
+        ranges = arm_io.get("properties", {}).get("ranges")
+        if ranges is None or len(ranges) != 24:
+            errors.append("/arm-io/ranges is missing or is not three 64-bit cells")
+        elif struct.unpack("<QQQ", ranges)[1] != ARM_IO_BASE:
+            errors.append("/arm-io does not open the Snapdragon peripheral window at 0x17000000")
+        intc = arm_io.get("children", {}).get("intc")
+        if intc is None:
+            errors.append("/arm-io/intc is missing; ArmCpu has no GIC to map")
+        elif intc["properties"].get("compatible", b"").split(b"\0")[0] != b"arm,gic-v3":
+            errors.append("/arm-io/intc is not compatible with arm,gic-v3")
+        elif len(intc["properties"].get("reg", b"")) != 32:
+            errors.append("/arm-io/intc reg is not two 64-bit address-size pairs")
+        elif struct.unpack("<4Q", intc["properties"]["reg"])[0] + ARM_IO_BASE != GICD_PHYS:
+            errors.append(f"/arm-io/intc does not resolve to the GICD at 0x{GICD_PHYS:x}")
+
+        psci = root["children"].get("psci")
+        if psci is None:
+            errors.append("/psci is missing; the eight cores cannot be started")
+        elif psci["properties"].get("compatible", b"").split(b"\0")[0] != b"arm,psci-1.0":
+            errors.append("/psci is not arm,psci-1.0")
+
+        display = chosen["properties"].get("display-base")
+        if display and struct.unpack("<Q", display)[0] != SPLASH_BASE:
+            errors.append(f"/chosen/display-base is not the clover splash region 0x{SPLASH_BASE:x}")
+    return f"{len(data)} bytes, {len(cpus)} cores"
+
+
+def check_board(errors: list) -> str:
+    board_path = next((candidate / "board.toml" for candidate in (REPO, pathlib.Path.cwd())
+                       if (candidate / "board.toml").is_file()), None)
+    if board_path is None:
+        return "board.toml not visible"
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib        # the pure-Python predecessor of tomllib
+        except ModuleNotFoundError:
+            return "board cross-check skipped (needs Python 3.11 or the tomli module)"
+    board = tomllib.loads(board_path.read_text())
+
+    if board["board"]["name"] != "clover" or board["board"]["soc"] != "SDM660":
+        errors.append("board.toml does not describe clover / SDM660")
+    if board["board"].get("example"):
+        errors.append("board.toml still marks the board as an example")
+
+    defconfig_name = board["kernel"]["defconfig"]
+    defconfig_path = next((base / "configs" / defconfig_name
+                           for base in (board_path.parent, pathlib.Path.cwd())
+                           if (base / "configs" / defconfig_name).is_file()), None)
+    if defconfig_path is None:
+        errors.append(f"configs/{defconfig_name} is missing")
+    else:
+        text = defconfig_path.read_text()
+        flags = dict(re.findall(r"^CONFIG_XNU_([A-Z0-9_]+)=(.*)$", text, re.M))
+        for required in ("ARM_DT_PLATFORM", "ARMCPU", "NATIVE_AES", "CRYPTO_BOOTSTRAP"):
+            if flags.get(required) not in ("y", "1", '"prelinked"'):
+                errors.append(f"{defconfig_name} does not enable CONFIG_XNU_{required}")
+        for forbidden in ("NATIVE_UFS", "NATIVE_ADRENO"):
+            if flags.get(forbidden, "n").strip('"') in ("y", "1"):
+                errors.append(f"{defconfig_name} enables CONFIG_XNU_{forbidden}, "
+                              "for which clover has no driver")
+        if "libCloverDisplayStub.a" in text and \
+                not any("build-clover-display-stub.py" in entry for entry in board["kernel"]["archives"]):
+            errors.append("the defconfig links the display stub but [kernel] archives omits its builder")
+
+    adt = board["payload"]["adt"]
+    cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
+    if cores != CPU_REGS:
+        errors.append(f"unexpected Kryo 260 MPIDR set: {cores}")
+    if int(adt["chip_id"], 0) != MSM_ID:
+        errors.append(f"[payload.adt] chip_id is {adt['chip_id']}, the SDM660 msm-id is 0x13d")
+    owned = int(adt["owned_memory_size"], 0)
+    dram = int(board["payload"]["dram_size"], 0)
+    if not 0x10000000 <= owned <= 0x100000000 or owned % 0x200000:
+        errors.append(f"owned_memory_size {owned:#x} is outside 256 MiB..8 GiB or not 2 MiB aligned")
+    if owned > dram:
+        errors.append(f"owned_memory_size {owned:#x} is larger than dram_size {dram:#x}")
+
+    volume = board["payload"]["volume"]
+    if len(volume) > 11:
+        errors.append(f"[payload] volume {volume} is longer than 11 characters")
+    for argument in board["payload"]["kernel_args"]:
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]+(=[A-Za-z0-9_.,\-]+)?", argument):
+            errors.append(f"kernel argument {argument} fails the payload pattern")
+
+    splash = [entry for entry in board.get("bootimg", {}).get("dtb_node", [])
+              if "splash" in entry["path"]]
+    if splash:
+        values = [int(cell, 0) for cell in
+                  next(prop["value"] for prop in splash[0]["props"] if prop["name"] == "reg")]
+        if values[1] != SPLASH_BASE or values[3] != SPLASH_SIZE:
+            errors.append(f"the boot image splash region {values[1]:#x}+{values[3]:#x} does not match "
+                          f"the ADT display region {SPLASH_BASE:#x}+{SPLASH_SIZE:#x}")
+    else:
+        errors.append("no [[bootimg.dtb_node]] declares the splash region the stock ABL expects")
+
+    named = board["kernel"]["archives"] + board["firmware"].get("preflight", []) + [adt["tool"]]
+    if board["payload"].get("skip_setup_tool"):
+        named.append(board["payload"]["skip_setup_tool"])
+    from_tree = pathlib.Path.cwd() != REPO
+    for script in named:
+        name = script.split(" ", 1)[0]
+        relative = name if "/" in name else f"scripts/{name}"
+        if (REPO / relative).is_file() or (pathlib.Path.cwd() / relative).is_file():
+            continue
+        # A board-owned script must be in this repository. A generic one, such as
+        # build-corecrypto-14.py, is supplied by the base repository through the assembled tree,
+        # so it is only missing when this check already runs inside that tree.
+        if "clover" in pathlib.Path(relative).name or from_tree:
+            errors.append(f"{relative} is named by board.toml but is in neither this repository nor the tree")
+
+    if board["ipsw"]["product"] != "iPad7,1" or board["ipsw"]["chip_id"] != 0x8011:
+        errors.append("the IPSW identity is not the iPad7,1 / 0x8011 image a 4 KiB Kryo 260 can run")
+    return f"{defconfig_name}, {volume}"
+
+
+def check_tree(errors: list) -> str:
+    """The kernel and firmware steps expect these modules in the assembled tree.
+
+    Run from the repository alone, an absent module is a notice: the tree is what supplies
+    DarwinBoot and NativePrelink. Run from a directory that already looks like a tree, it is
+    an error, because the build would fail later and far away from the cause.
+    """
+    tree = pathlib.Path.cwd()
+    is_tree = tree != REPO
+    notices, missing = [], []
+    for relative in ("drivers/DarwinBoot", "kits/NativePrelink", "scripts/build-arm-driver.py"):
+        if (tree / relative).exists() or (REPO / relative).exists():
+            continue
+        (missing if is_tree else notices).append(relative)
+    for relative in missing:
+        errors.append(f"neither the assembled tree nor this repository has {relative}")
+    for relative in notices:
+        print(f"[check-clover] notice: {relative} comes from the base repository; "
+              "run this from out/clover/tree to check it", file=sys.stderr)
+    return "modules visible" if not missing else f"{len(missing)} missing"
+
+
+def main() -> int:
+    errors: list = []
+    adt_summary = check_adt(errors)
+    board_summary = check_board(errors)
+    tree_summary = check_tree(errors)
+    for error in errors:
+        print(f"[check-clover] {error}", file=sys.stderr)
+    if errors:
+        return 1
+    print(f"[check-clover] clover ok: ADT {adt_summary}; board {board_summary}; {tree_summary}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

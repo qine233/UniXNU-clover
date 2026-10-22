@@ -1,0 +1,46 @@
+# Build outputs and caches: everything here is re-derivable from board.toml and the tree.
+/build/
+/Build/
+/out/
+/.cache/
+/refer/
+/.local*/
+/unixnu.lock
+
+# Per-unit dumps. They carry the serial number, the platform UUID and proprietary firmware,
+# so they stay on this machine; notes/ holds the reusable conclusions instead.
+/facts/
+
+# Local development files
+*.log
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+*.dSYM/
+
+# Inputs, images and products that never belong in Git
+*.ipsw
+*.dmg
+*.im4p
+*.img
+*.dbr
+*.macho
+*.adt
+*.o
+*.a
+*.dylib
+*.efi
+*.dtb
+*.dtbo
+*.bc
+*.mbn
+*.fw
+*.pem
+*.key
+.env
+local.toml

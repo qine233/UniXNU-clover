@@ -1,0 +1,42 @@
+# Kernel configuration of the clover image, selected by [kernel] defconfig in board.toml.
+# CONFIG_XNU_<NAME> becomes XNU_<NAME> for the kernel build scripts; y and n are 1 and 0,
+# a quoted string or a number is passed through, and {tree} is the assembled build tree.
+#
+# The list follows the board that has the same structural problem — an eMMC device with a
+# GPU that no native driver supports (UniXNU-gta4l, SM6115). clover keeps that shape:
+# no CONFIG_XNU_NATIVE_UFS, no CONFIG_XNU_NATIVE_ADRENO, no mobile display stack. The first
+# goal is stage 5 of the bring-up order: XNU reaching the platform expert and the console.
+
+CONFIG_XNU_SOURCE_CORECRYPTO14=y
+CONFIG_XNU_SOURCE_PTHREAD=y
+CONFIG_XNU_ARM_DT_PLATFORM=y
+CONFIG_XNU_ARMCPU=y
+CONFIG_XNU_NATIVE_AES=y
+CONFIG_XNU_TRUST_CACHE_RUNTIME=y
+CONFIG_XNU_SOURCE_MOCKFS=y
+CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
+CONFIG_XNU_NATIVE_ARCH_TIMER=y
+CONFIG_XNU_NATIVE_PAN=y
+CONFIG_XNU_BOOT_PROGRESS=y
+
+CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+
+# The prelink roots in board.toml keep Apple's original display and GPU families, so the
+# link needs the stub archive that stands in for a driver clover does not have yet
+# (scripts/build-clover-display-stub.py, listed in [kernel] archives).
+CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-display-stub/libCloverDisplayStub.a"
+
+# Not set, on purpose, and each one is a real porting task rather than a switch to flip:
+#   NATIVE_UFS          — clover boots from eMMC (sdhc_1 at 0xc0c4000); XNU has no SDHCI driver.
+#   NATIVE_ADRENO       — the sheng driver targets Adreno 740; clover has Adreno 512.
+#   NATIVE_MOBILE_DISPLAY / NATIVE_LEGACY_DISPLAY — no MDP5/EVB bring-up yet.
+#   ARMVIRT_PLATFORM    — the DT platform expert owns the tree; the virt platform would shadow it.
+#   OWNER_*             — sheng's verified-root and Data-volume stack needs the userdata block driver.
+CONFIG_XNU_ARMVIRT_PLATFORM=n
+CONFIG_XNU_NATIVE_UFS=n
+CONFIG_XNU_NATIVE_ADRENO=n
+CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+
+# The archive builders reuse these flags and add -Werror. Apple clang 17 (Xcode 16.4) does not
+# know -Wno-unnecessary-virtual-specifier, so the list stays without it, as on gta4l.
+CONFIG_XNU_EXTRA_CFLAGS="-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers -Wno-suggest-override -Wno-suggest-destructor-override -Wno-ms-bitfield-padding"

@@ -1,0 +1,28 @@
+# Extra sources for the clover device repository. These are read-only references, kind = refer:
+# nothing here is copied into the build and nothing here is a UniXNU module. They are the two
+# device trees every hardware constant in board.toml and scripts/make-clover-adt.py comes from,
+# so `unixnu fetch` keeps them pinned and reproducible instead of relying on a saved copy.
+
+[[source]]
+name = "clover-mainline-dts"
+kind = "refer"
+git = "https://github.com/sdm660-mainline/linux"
+ref = "qcom-sdm660-7.2.y"
+commit = "dd1ed52c8ceef4f16715118ed0252fe75adbe71d"
+path = "arch/arm64/boot/dts/qcom"
+# sdm660-xiaomi-clover.dts           model "Xiaomi Mi Pad 4 LTE", compatible xiaomi,clover-lte
+# sdm660-xiaomi-clover-common.dtsi   framebuffer, reserved-memory, eMMC, USB, audio
+# sdm660-xiaomi-clover-regular-common.dtsi  boe,tv080wum-nx2 panel, edt-ft5406 touch, pm660l WLED
+# sdm660.dtsi / sdm630.dtsi          Kryo 260 cores, qcom,adreno-512.0, qcom,sdm660-mdp5
+
+[[source]]
+name = "clover-downstream-dts"
+kind = "refer"
+git = "https://github.com/E7G/clover-sdm660-ksb"
+ref = "main"
+commit = "5c81a3faf37e332be5008512c9b2dc2444dbcc01"
+path = "arch/arm64/boot/dts/vendor/qcom"
+# sdm660.dtsi                 qcom,msm-id = <317 0x0>, GICD/GICR, sdhc_1: sdhci@c0c4000
+# sdm660-mtp-clover.dts       qcom,board-id = <11 0>, pm660 + pm660l
+# xiaomi/mi/clover/clover-overlay.dtsi   cont_splash_mem = <0x0 0x9d500000 0x0 0x02400000>
+# xiaomi/mi/clover/dsi-panel-nt51021-boe-video.dtsi   1200x1920 at 107x172 mm, so 8 inch

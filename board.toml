@@ -1,0 +1,183 @@
+# Board description of the Xiaomi Mi Pad 4 8" LTE (clover, SDM660), read by the unixnu build driver.
+#
+# Hardware constants come from two public device trees that agree with each other:
+#   mainline    sdm660-mainline/linux    arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover*.dts*
+#   downstream  Xiaomi's CAF clover kernel, arch/arm64/boot/dts/vendor/qcom/
+# Anything marked TODO-DEVICE must be filled from facts/<serial>-<stamp>/ produced by
+# scripts/dump-clover-facts.sh before an install is attempted.
+
+[board]
+name = "clover"
+soc = "SDM660"
+description = "Xiaomi Mi Pad 4 8\" LTE (2018)"
+kit = "clover"                      # the package/ of this repository appears as kits/clover in the build tree
+
+# The target OS image: the unchanged iPad7,1 iPadOS 17.7.11 restore image, the same
+# identity every arm64 (not arm64e) board in the project uses. Kryo 260 is ARMv8.0 with
+# no pointer authentication, so this is the only class of image that can run.
+[ipsw]
+url = "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+product = "iPad7,1"
+version = "17.7.11"
+build = "21H461"
+device_class = "j120ap"
+chip_id = 0x8011
+board_id = 12
+fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
+
+[ipsw.sha256]
+"044-76040-038.dmg" = "3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d"
+"044-76034-038.dmg" = "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f"
+
+# The raw image for the userdata partition: the OS and SystemOS disk images of the IPSW behind a manifest.
+# clover has eMMC (mmcblk0) with 512-byte logical sectors, so lba_bytes is 512.
+# TODO-DEVICE: first_lba/last_lba are the GPT entry named userdata on this unit.
+# scripts/dump-clover-facts.sh writes them into facts/.../userdata-window.txt.
+[userdata]
+first_lba = 0x0
+last_lba = 0x0
+lba_bytes = 512
+windows = [
+  { name = "OS", component = "OS" },
+  { name = "SystemOS", component = "Cryptex1,SystemOS" },
+]
+
+[kernel]
+defconfig = "clover_defconfig"
+# Archive builders of the kernel step, in order. Bare names resolve in the build tree,
+# which is how the gta4l board lists them.
+archives = [
+  "build-corecrypto-14.py",
+  "build-corecrypto-14.py --namespace",
+  "build-arm-driver.py ArmDTPlatform",
+  "build-arm-driver.py ArmCpu",
+  "build-arm-driver.py NativeAES",
+  "build-native-aes-bindings.py",
+  "build-mockfs-fixture.py",
+  "build-libpthread-kernel.py",
+  "build-clover-display-stub.py",
+]
+
+[kernel.prelink]
+tool = "kits/NativePrelink/emit_prelink.py"
+kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
+kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
+slide = "-0x1000000"
+early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
+roots = [
+  "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib",
+  "com.apple.driver.AppleARMPlatform",
+  "com.apple.driver.AppleARMWatchdogTimer",
+  "com.apple.driver.AppleAudioClockLibs",
+  "com.apple.driver.AppleEffaceableStorage",
+  "com.apple.driver.AppleIISController",
+  "com.apple.driver.AppleM2ScalerCSCDriver",
+  "com.apple.driver.AppleMobileFileIntegrity",
+  "com.apple.driver.ApplePMGR",
+  "com.apple.driver.IODARTFamily",
+  "com.apple.filesystems.apfs",
+  "com.apple.iokit.CoreAnalyticsFamily",
+  "com.apple.iokit.IOAVFamily",
+  "com.apple.iokit.IOAudio2Family",
+  "com.apple.iokit.IOCECFamily",
+  "com.apple.iokit.IOCryptoAcceleratorFamily",
+  "com.apple.iokit.IOGPUFamily",
+  "com.apple.iokit.IOHDCPFamily",
+  "com.apple.iokit.IOMobileGraphicsFamily",
+  "com.apple.iokit.IOReportFamily",
+  "com.apple.iokit.IOSlowAdaptiveClockingFamily",
+  "com.apple.iokit.IOStorageFamily",
+  "com.apple.iokit.IOSurface",
+  "com.apple.kec.Libm",
+  "com.apple.kec.corecrypto",
+  "com.apple.kext.AppleMatch",
+  "com.apple.kext.CoreTrust",
+  "com.apple.security.AppleImage4",
+  "com.apple.security.sandbox",
+  "com.apple.iokit.IOHIDFamily",
+  "com.apple.iokit.IOHIDEventDriver",
+]
+
+[firmware]
+config = "clover"                  # Resources/Configs/clover.toml in the Mu-Silicium checkout (--uefi)
+dsc = "Platforms/Xiaomi/cloverPkg/clover.dsc"
+fd = "Build/cloverPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+preflight = ["scripts/check-clover.py"]
+submodules = ["Common/Mu", "Common/Mu_OEM_Sample", "Silicium-ACPI", "Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl"]
+packages = [
+  "{uefi}",
+  "{uefi}/Platforms/Xiaomi",
+  "{tree}/package",
+  "{tree}/drivers/DarwinBoot",
+  "{edk2}",
+  "{uefi}/Common/Mu",
+  "{uefi}/Common/Mu_OEM_Sample",
+  "{uefi}/Silicon/Qualcomm",
+  "{uefi}/Silicon/Silicium",
+  "{uefi}/Silicium-ACPI",
+  "{uefi}/Silicium-ACPI/Platforms/Xiaomi",
+  "{uefi}/Silicium-ACPI/Silicon/Qualcomm",
+]
+
+[firmware.defines]
+ENABLE_SECUREBOOT = "1"
+DEVICE_MODEL = "clover"
+MEMORY_PROTECTION = "TRUE"
+SHIP_MODE = "FALSE"
+BUILDID_STRING = "clover-research"
+
+# The ramdisk of the boot image: a FAT volume with the UniXNU config, the kernel, its device
+# tree and the optional trust cache. The loader (DarwinBoot) is part of the firmware volume.
+# dram_size is the low DRAM bank only: SDM660 maps 2 GiB at 0x80000000 and, on the 4 GiB
+# unit, another 2 GiB at 0x1800000000. TODO-DEVICE: confirm the bank split from the dump.
+[payload]
+volume = "CLOVERESP"
+size_mib = 192
+loader = "firmware"
+title = "clover first boot: source 4K XNU to console"
+dram_size = "0x80000000"
+panic_screen = true
+skip_setup_tool = "scripts/seed-data-skip-setup.py"
+kernel_args = [
+  "-v",
+  "serial=3",
+  "debug=0x14e",
+  "kt_fixed_zones=120",
+  "boot-progress=2",
+]
+
+[payload.adt]
+tool = "scripts/make-clover-adt.py"
+chip_id = "0x13d"                   # qcom,msm-id of SDM660
+# DarwinBoot asks the firmware for one contiguous physical window. On clover the low bank is
+# 0x80000000-0x100000000 and the reserved regions (PIL 0x92a00000-0x95100000, venus up to
+# 0x9cc00000, splash to 0x9f900000, the firmware FD at 0x9fc00000) leave 0xa0000000-0x100000000,
+# so 1 GiB is the largest request that still has an obvious home. 2 GiB does not fit contiguously.
+owned_memory_size = "0x40000000"
+root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the scratch Data volume
+# Kryo 260: Silver cluster 0x0-0x3 (Cortex-A53), Gold cluster 0x100-0x103 (Kryo / A73)
+cpu_regs = "0x0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"
+psci_method = "smc"
+packed_data_ramdisk = true
+ipad_identity = true
+unique_chip_id = "required"         # the platform seed is not stored in any repository
+
+# Image parameters come from the Mu-Silicium device config (clover.toml: header version 1,
+# gzip kernel, appended dtb); these override the load offsets.
+# TODO-DEVICE: verify against the header of facts/.../img/unixnu-boot.img.
+[bootimg.image]
+base = 0
+kernel_offset = 0x00008000
+ramdisk_offset = 0x20000000
+tags_offset = 0x01e00000
+pagesize = 4096
+header_version = 1
+
+# The stock ABL switches the panel off when the tree it loads has no splash region,
+# so the appended device tree must declare the one Xiaomi reserves.
+[[bootimg.dtb_node]]
+path = "/reserved-memory/splash_region"
+props = [
+  { name = "label", type = "s", value = "cont_splash_region" },
+  { name = "reg", type = "x", value = ["0x0", "0x9d500000", "0x0", "0x2400000"] },
+]
