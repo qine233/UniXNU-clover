@@ -22,6 +22,10 @@ git = "https://github.com/E7G/clover-sdm660-ksb"
 ref = "main"
 commit = "5c81a3faf37e332be5008512c9b2dc2444dbcc01"
 path = "arch/arm64/boot/dts/vendor/qcom"
+# Chosen over the stock CAF mirror xiaomi-sdm660/android_kernel_xiaomi_clover
+# (kernel.lnx.4.4.r38-rel-wifi, 731dd538), which carries sdm660.dtsi and sdm660-common.dtsi
+# under arch/arm/boot/dts/qcom but no clover files at all. This 4.19 tree is the one that
+# actually describes the tablet.
 # sdm660.dtsi                 qcom,msm-id = <317 0x0>, GICD/GICR, sdhc_1: sdhci@c0c4000
 # sdm660-mtp-clover.dts       qcom,board-id = <11 0>, pm660 + pm660l
 # xiaomi/mi/clover/clover-overlay.dtsi   cont_splash_mem = <0x0 0x9d500000 0x0 0x02400000>

@@ -9,12 +9,15 @@ every check works from either location. Three groups run independently:
          Python 3 alone is enough, so this is the check to run first on a new host.
   board  cross-checks board.toml against the defconfig, the payload contract and the hardware
          constants. It needs tomllib, that is Python 3.11 or newer, or the tomli module.
+  region compares the windows the board spec declares: the splash region, the firmware volume,
+         the described DRAM and the stock reserved carve-outs must not lie on each other.
   tree   reports the modules the kernel and firmware steps expect.
 
 Exit status is 1 when any group reports an error.
 """
 from __future__ import annotations
 
+import importlib.util
 import pathlib
 import re
 import struct
@@ -76,6 +79,54 @@ def adt_command(output: pathlib.Path):
             "--chip-id", hex(MSM_ID), "--cpu-regs", ",".join(hex(v) for v in CPU_REGS),
             "--psci-method", "smc", "--unique-chip-id", "0x0123456789ab",
             "--packed-data-ramdisk", "--trust-cache", "--ipad-identity"]
+
+
+def load_generator():
+    """Import scripts/make-clover-adt.py as a module; it guards main() behind __name__."""
+    path = REPO / "scripts/make-clover-adt.py"
+    spec = importlib.util.spec_from_file_location("clover_adt", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def check_regions(errors: list, hardware: dict | None = None) -> str:
+    """The windows UniXNU actually uses must not lie on top of each other.
+
+    The splash region is the one a board gets wrong: it is where the firmware draws, and the
+    firmware volume itself sits just below the top of the described DRAM.
+    """
+    path = REPO / "scripts/make-clover-adt.py"
+    if hardware is None:
+        if not path.is_file():
+            return "no board spec"
+        try:
+            hardware = load_generator().CLOVER_HARDWARE_SPEC
+        except Exception as error:    # a broken generator must not hide the rest of the run
+            errors.append(f"the board spec cannot be imported: {error}")
+            return "spec unreadable"
+    frame = hardware["framebuffer"]
+    fb_start, fb_end = frame["base"], frame["base"] + frame["window_size"]
+    fd = hardware["uefi_fd"]
+    fd_start, fd_end = fd["base"], fd["base"] + fd["size"]
+    dram_end = DRAM_BASE + DRAM_SIZE
+
+    def overlap(first, second, third, fourth, label):
+        if max(first, third) < min(second, fourth):
+            errors.append(f"{label} overlap: {first:#x}-{second:#x} and {third:#x}-{fourth:#x}")
+
+    overlap(fb_start, fb_end, fd_start, fd_end, "splash and the firmware volume")
+    if fb_end > dram_end:
+        errors.append(f"the splash window ends at {fb_end:#x}, past the described DRAM")
+    for region in hardware["reserved_memory"]:
+        # framebuffer0 is the used part of the splash window, so it overlaps by design, and
+        # ramoops is the collision documented in the board spec: no pstore under UniXNU, the
+        # panic log goes to the UART.
+        if region["name"] in ("framebuffer0", "ramoops"):
+            continue
+        overlap(region["base"], region["base"] + region["size"], fb_start, fb_end,
+                f"{region['name']} and the splash window")
+    return f"splash {fb_start:#x}-{fb_end:#x}, FD {fd_start:#x}-{fd_end:#x}"
 
 
 def check_adt(errors: list) -> str:
@@ -279,13 +330,15 @@ def check_tree(errors: list) -> str:
 def main() -> int:
     errors: list = []
     adt_summary = check_adt(errors)
+    region_summary = check_regions(errors)
     board_summary = check_board(errors)
     tree_summary = check_tree(errors)
     for error in errors:
         print(f"[check-clover] {error}", file=sys.stderr)
     if errors:
         return 1
-    print(f"[check-clover] clover ok: ADT {adt_summary}; board {board_summary}; {tree_summary}")
+    print(f"[check-clover] clover ok: ADT {adt_summary}; {region_summary}; "
+          f"board {board_summary}; {tree_summary}")
     return 0
 
 

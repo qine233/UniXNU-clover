@@ -57,9 +57,15 @@ CLOVER_HARDWARE_SPEC = {
         # TODO-DEVICE: verify the handed-over orientation is 270 and not 90.
         "rotation": 270,
     },
-    # Stock carve-outs. Documentation for check-clover.py's overlap test and for the
-    # UEFI memory map; XNU learns the DRAM window from /chosen and the splash from
-    # display-base, not from these entries.
+    # Stock carve-outs, recorded so the UEFI memory map and check-clover.py can be reasoned
+    # about. XNU learns its DRAM window from /chosen and the splash from display-base; these
+    # entries are not read by the kernel.
+    #
+    # Note the collision the stock layout has with a UEFI firmware volume: ramoops at
+    # 0x9fe00000 + 0x100000 ends where the 3 MiB firmware volume starting at 0x9fc00000
+    # still lives, so under UniXNU there is no usable pstore region and the panic log goes to
+    # the serial console instead. It is listed here because the dump script reads it off the
+    # device and a future map change should not lose that fact.
     "reserved_memory": [
         {"name": "pil_adsp_mem",  "base": 0x92A00000, "size": 0x01E00000},
         {"name": "pil_mba_mem",   "base": 0x94900000, "size": 0x00200000},
