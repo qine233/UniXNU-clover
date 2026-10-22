@@ -67,9 +67,16 @@ CLOVER_HARDWARE_SPEC = {
     # the serial console instead. It is listed here because the dump script reads it off the
     # device and a future map change should not lose that fact.
     "reserved_memory": [
-        {"name": "pil_adsp_mem",  "base": 0x92A00000, "size": 0x01E00000},
+        # Sizes here are clover-overlay.dtsi's, which overrides sdm660-common.dtsi on
+        # this board: adsp is 0x1f00000 there (0x1e00000 in the SoC default), and mba and
+        # cdsp move up to 0x94900000/0x94b00000.  The three are contiguous, so the UEFI
+        # memory map can cover them as one "PIL Reserved" block of 0x2700000.
+        {"name": "pil_adsp_mem",  "base": 0x92A00000, "size": 0x01F00000},
         {"name": "pil_mba_mem",   "base": 0x94900000, "size": 0x00200000},
         {"name": "pil_cdsp_mem",  "base": 0x94B00000, "size": 0x00600000},
+        # Video codec PIL: mainline pins it here (sdm660-xiaomi-clover-common.dtsi), the
+        # downstream tree only carves it out of a reusable CMA pool in the low 512 MiB, so
+        # the UEFI memory map does not reserve this address.
         {"name": "pil_venus_mem", "base": 0x9CC00000, "size": 0x00800000},
         {"name": "framebuffer0",  "base": 0x9D500000, "size": 1200 * 1920 * 4},
         {"name": "ramoops",       "base": 0x9FE00000, "size": 0x00100000},

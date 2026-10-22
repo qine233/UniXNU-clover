@@ -125,6 +125,11 @@ DEVICE_MODEL = "clover"
 MEMORY_PROTECTION = "TRUE"
 SHIP_MODE = "FALSE"
 BUILDID_STRING = "clover-research"
+# firmware.py turns every key here into a -D on the EDK II command line, so the
+# clover DSC/FDF can guard the UniXNU-only modules (UniXNUPkg, DarwinBoot) with
+# !ifdef $(UNIXNU_BUILD).  Without it the same checkout still builds a plain
+# Android-oriented firmware through build_uefi.py -d clover.
+UNIXNU_BUILD = "1"
 
 # The ramdisk of the boot image: a FAT volume with the UniXNU config, the kernel, its device
 # tree and the optional trust cache. The loader (DarwinBoot) is part of the firmware volume.
