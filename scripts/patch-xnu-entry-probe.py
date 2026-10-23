@@ -51,13 +51,17 @@ CAVE_OFFSETS = {1: 0x78, 2: 0xD8, 3: 0x138, 4: 0x198}
 CAVE_SIZE = 0x60
 TIMEBASE = 19200000
 
+# The DarwinBoot hand-off fills boot_args.Video; if it is empty the paint is
+# skipped instead of storing to address 0, so "no bar" never masks the hand-off.
 PAINT = """
   ldr x1, [{args}, #0x28]
+  cbz x1, 2f
   ldr x2, [{args}, #0x38]
   ldr x3, [{args}, #0x48]
   mul x2, x2, x3
   lsr x2, x2, #4
   bic x2, x2, #7
+  cbz x2, 2f
   mov x4, #{band}
   mul x5, x2, x4
   add x1, x1, x5
@@ -68,6 +72,7 @@ PAINT = """
   subs x2, x2, #8
   b.hi 1b
   dsb sy
+2:
 """
 
 SOURCES = {
