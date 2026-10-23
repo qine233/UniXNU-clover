@@ -18,10 +18,10 @@
 | 板级描述 | `board.toml` 可解析；`scripts/check-clover.py` 把它与 defconfig 和 payload 契约交叉核对 |
 | ADT | `scripts/make-clover-adt.py` 为 8 个 Kryo 260 核生成 13,880 字节；检查器会把编码读回来，并断言 `ArmDTPlatform` 和 DarwinBoot 需要的节点 |
 | 内核 | 已构建：`DEVELOPMENT_ARM64_BCM2837` 的 51.8 MB `kernel.macho` |
-| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.8` 起 payload 里的 `kernel.macho` 是一份打了入口探针的副本（见"菜单之后看什么"） |
+| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.10` 起 payload 里的 `kernel.macho` 是一份打了探针的副本：入口色带、panic 屏幕，以及开 MMU 后 6 秒的复位信号（见"菜单之后看什么"） |
 | 固件 | 由 `uefi-clover` 构建（3 MiB 固件卷，内含 UniXNU 与 DarwinBoot）；`v0.3.10` 起 DXE 尾部完整派发，`CloverGopDxe` 发布 GOP |
 | 设备事实 | 2026-10-22 采集过一次，位于 `facts/81ffcaaa-20261022-210928/` |
-| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.8` 的入口探针已打进 payload，屏幕上的三段色带与 panic 屏幕**尚未上机确认** |
+| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.9` 实测屏幕出现**绿 + 蓝 + 品红**三条色带，即 DarwinBoot 已交接、XNU 入口已执行、引导页表已建好；开 MMU 之后的 6 秒复位信号（`v0.2.10`）尚未上机 |
 
 上面这张表之外，不做任何额外声称。
 
@@ -184,14 +184,26 @@ payload 里放的是一份**打了探针的 kernel 副本**（`scripts/patch-xnu
 页计数画在了内核自己的 framebuffer 映射上——正好可以拍照。没有 panic 时
 屏幕就停在最后画完的色带。
 
+MMU 一开，framebuffer 就不可读了，所以下一个问题只能由**时间**回答：
+`entry_probe_reset_delay = 6` 会在 `msr sctlr_el1, x0; isb` 之后等 6 秒，
+然后发 PSCI `SYSTEM_RESET`（`smc`，功能号 `0x84000009`）。读法：
+
+| 现象 | 含义 |
+| --- | --- |
+| 品红出现后约 6 秒设备自己重启，回到小米标志 / 菜单 | 开 MMU 成功，CPU 走过了这一步，问题在更后面的 XNU 初始化 |
+| 品红一直停着，永不重启 | 卡在开 MMU 本身或紧随其后的几条指令（`cpacr_el1`、`tpidr_el1`、`ret`） |
+
+这次复位是探针主动发的冷复位，不写任何分区，重启后仍从 `boot` 上的固件进菜单。
+
 ```sh
 fastboot flash cache ../UniXNU/out/clover/payload/payload.img   # 只换这一格，boot 不变
 fastboot reboot
 ```
 
 `boot` 镜像没有变化：固件卷、BootShim 和 DTB 都没动，只有 `cache` 上的 payload
-卷换了。探针默认**不带**自动复位；`entry_probe_reset_delay` 才会启用"开 MMU 后
-等 N 秒发 PSCI SYSTEM_RESET"的第三条信号，那会重启设备，不适合拍照。
+卷换了。当前 `board.toml` 设了 `entry_probe_reset_delay = 6`，所以这一版会主动
+重启；如果只想拍照、不想重启，把这一行删掉重打 payload 即可（`payload.py` 会
+改传 `--no-reset`，只保留三条色带和 panic 屏幕）。
 
 ## 有意省略的部分
 

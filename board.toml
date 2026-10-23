@@ -154,6 +154,10 @@ dram_size = "0x80000000"
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
 panic_screen = true
+# The framebuffer is unreadable once the MMU is on, so the next question is
+# answered by time: reset six seconds after SCTLR_EL1 enables the MMU. A reboot
+# means execution survived the switch.
+entry_probe_reset_delay = 6
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 kernel_args = [
   "-v",

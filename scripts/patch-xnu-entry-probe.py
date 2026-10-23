@@ -330,6 +330,11 @@ def zero_runs(data, va):
         yield va + (run - file_offset(va)), stop - run
 
 
+def padding_fits(data, load, size):
+    """Whether the zero run that contains load is long enough for size bytes."""
+    return any(start <= load and load + size <= start + length for start, length in zero_runs(data, load))
+
+
 def entry_body(symbols):
     """The entry body after _start_first_cpu; the SCTLR/ISB/CPACR sequence lives inside.
 
@@ -433,11 +438,20 @@ def main():
         text = ROOT / 'scripts/xnu-panic-screen.c'
         if not text.is_file():
             raise SystemExit(f'{text} is missing')
+        at = max(caves[stage] for _, stage, _ in sites) + CAVE_SIZE
         with tempfile.TemporaryDirectory() as tmp:
-            code, load, panic_entry = assemble_c(text, max(caves[stage] for _, stage, _ in sites) + CAVE_SIZE, Path(tmp), names)
+            code, load, panic_entry = assemble_c(text, at, Path(tmp), names)
+            if not padding_fits(data, load, len(code)):
+                # Three staged caves can leave too little room next to the entry; the
+                # renderer is position-independent, so take the next zero run that fits.
+                at = next((start for start, length in zero_runs(data, at)
+                           if start > at and length >= len(code)), None)
+                if at is None:
+                    raise SystemExit(f'No {len(code):#x}-byte padding for the panic screen')
+                code, load, panic_entry = assemble_c(text, at, Path(tmp), names)
+                if not padding_fits(data, load, len(code)):
+                    raise SystemExit(f'No padding for the panic screen ({len(code):#x} bytes) at {load:#x}')
             common_entry = panic_common_entry(Path(tmp), code, load)
-        if not any(start <= load and load + len(code) <= start + length for start, length in zero_runs(data, load)):
-            raise SystemExit(f'No padding for the panic screen ({len(code):#x} bytes) at {load:#x}')
         data[file_offset(load):file_offset(load) + len(code)] = code
         struct.pack_into('<I', data, file_offset(panic_va), branch(panic_va, panic_entry))
         common = names.get('_panic_trap_to_debugger')
