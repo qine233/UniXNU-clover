@@ -144,7 +144,11 @@ size_mib = 192
 loader = "firmware"
 title = "clover first boot: source 4K XNU to console"
 dram_size = "0x80000000"
-panic_screen = true
+# The payload driver applies this with scripts/patch-xnu-entry-probe.py, which the tree at
+# 1a01c2a does not contain (same gap as build-boot-progress.py), and the screen needs a
+# framebuffer this port does not have yet -- NATIVE_MOBILE_DISPLAY is off.  Both the panic
+# screen and entry_probe_reset_* are therefore unavailable until that layer lands.
+panic_screen = false
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 kernel_args = [
   "-v",

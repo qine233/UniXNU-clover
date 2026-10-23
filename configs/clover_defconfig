@@ -8,6 +8,9 @@
 # goal is stage 5 of the bring-up order: XNU reaching the platform expert and the console.
 
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
+# The kernel link needs the archives listed in [kernel] archives of board.toml, and the driver
+# only runs those builders when this is on.
+CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_SOURCE_PTHREAD=y
 CONFIG_XNU_ARM_DT_PLATFORM=y
 CONFIG_XNU_ARMCPU=y
@@ -17,7 +20,6 @@ CONFIG_XNU_SOURCE_MOCKFS=y
 CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
-CONFIG_XNU_BOOT_PROGRESS=y
 
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 
@@ -32,7 +34,13 @@ CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-display-stub/libCloverDisplayS
 #   NATIVE_MOBILE_DISPLAY / NATIVE_LEGACY_DISPLAY — no MDP5/EVB bring-up yet.
 #   ARMVIRT_PLATFORM    — the DT platform expert owns the tree; the virt platform would shadow it.
 #   OWNER_*             — sheng's verified-root and Data-volume stack needs the userdata block driver.
+#   BOOT_PROGRESS       — build-xnu-4k-baseline.sh only runs the layer when NATIVE_UFS, NATIVE_VIRTIO_BLOCK,
+#                         OWNER_ROOT_AUDIT and SOURCE_CORECRYPTO14 are all set, because its checkpoints sit in the
+#                         audited block path; clover has nothing on that path yet, and scripts/build-boot-progress.py
+#                         of the upstream tree is absent, so the switch cannot be honoured. Enable it with the eMMC
+#                         storage driver, not before.
 CONFIG_XNU_ARMVIRT_PLATFORM=n
+CONFIG_XNU_BOOT_PROGRESS=n
 CONFIG_XNU_NATIVE_UFS=n
 CONFIG_XNU_NATIVE_ADRENO=n
 CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
