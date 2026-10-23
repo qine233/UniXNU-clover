@@ -150,7 +150,10 @@ size_mib = 56
 loader = "firmware"
 title = "clover first boot: source 4K XNU to console"
 dram_size = "0x80000000"
-panic_screen = false
+# After the menu there is no serial console on this board, so the panel is the
+# only output: the entry probe paints DarwinBoot's stage bar and the kernel's
+# entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
+panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 kernel_args = [
   "-v",

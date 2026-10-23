@@ -18,10 +18,10 @@
 | 板级描述 | `board.toml` 可解析；`scripts/check-clover.py` 把它与 defconfig 和 payload 契约交叉核对 |
 | ADT | `scripts/make-clover-adt.py` 为 8 个 Kryo 260 核生成 13,880 字节；检查器会把编码读回来，并断言 `ArmDTPlatform` 和 DarwinBoot 需要的节点 |
 | 内核 | 已构建：`DEVELOPMENT_ARM64_BCM2837` 的 51.8 MB `kernel.macho` |
-| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文） |
+| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.8` 起 payload 里的 `kernel.macho` 是一份打了入口探针的副本（见"菜单之后看什么"） |
 | 固件 | 由 `uefi-clover` 构建（3 MiB 固件卷，内含 UniXNU 与 DarwinBoot）；`v0.3.10` 起 DXE 尾部完整派发，`CloverGopDxe` 发布 GOP |
 | 设备事实 | 2026-10-22 采集过一次，位于 `facts/81ffcaaa-20261022-210928/` |
-| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU，XNU/DarwinBoot 的串口输出尚未采集 |
+| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.8` 的入口探针已打进 payload，屏幕上的三段色带与 panic 屏幕**尚未上机确认** |
 
 上面这张表之外，不做任何额外声称。
 
@@ -89,7 +89,7 @@ python3 ../UniXNU-clover/scripts/check-clover.py      # 预检，任何时候都
 ./unixnu build firmware --uefi ../uefi-clover          # 需要固件仓库
 ./unixnu build kernel                                  # macOS + Xcode
 ./unixnu build package
-./unixnu build payload --unique-chip-id 0x<device seed>
+./unixnu build payload --unique-chip-id 0x<device seed> --uefi ../uefi-clover
 ./unixnu build boot
 ```
 
@@ -160,6 +160,38 @@ fastboot flash boot  ../UniXNU/out/clover/boot/unixnu-diag-nopayload.img   # 只
 fastboot flash cache ../UniXNU/out/clover/payload/payload.img
 fastboot reboot
 ```
+
+## 菜单之后看什么
+
+`blsp1_uart2` 在这块板子上没有引出，所以菜单之后只能让屏幕说话。`v0.2.8` 的
+payload 里放的是一份**打了探针的 kernel 副本**（`scripts/patch-xnu-entry-probe.py`
+改副本，原始 `out/clover/kernel/kernel.macho` 不动）。探针代码写在入口之后、
+原本全零的填充区里（`0xFFFFFFF0073EC48C` 起 0xB74 字节），每个站点在改写前都
+会先核对原始指令，内核一变就拒绝打补丁。
+
+屏幕从上往下是 1/16 屏高的色带，最上面一条绿带由固件里的 DarwinBoot 自己画
+（`v0.3.10` 就有，不需要改内核）：
+
+| 色带 | 位置 | 含义 |
+| --- | --- | --- |
+| 绿 | 第 0 条，DarwinBoot 画 | `DarwinEnter` 跑到了跳转内核入口的那条 `br` |
+| 蓝 | 第 1 条，内核入口 | `_start` 的第一条 `b` 之前：CPU 已经进 XNU，MMU 还是关的 |
+| 品红 | 第 2 条，开 MMU 之前 | `msr sctlr_el1, x0` 之前：引导页表已经建好，正准备开 MMU |
+
+三条都在，说明内核跑过了入口和页表建立；只有绿带说明 DarwinBoot 交接了但内核
+第一条指令就没回来；只有绿和蓝说明卡在 `_start_first_cpu` 的引导阶段。色带
+以下如果出现白字，那是 `panic_screen` 把 panic 的格式串、`TCR`、`SCTLR`、
+页计数画在了内核自己的 framebuffer 映射上——正好可以拍照。没有 panic 时
+屏幕就停在最后画完的色带。
+
+```sh
+fastboot flash cache ../UniXNU/out/clover/payload/payload.img   # 只换这一格，boot 不变
+fastboot reboot
+```
+
+`boot` 镜像没有变化：固件卷、BootShim 和 DTB 都没动，只有 `cache` 上的 payload
+卷换了。探针默认**不带**自动复位；`entry_probe_reset_delay` 才会启用"开 MMU 后
+等 N 秒发 PSCI SYSTEM_RESET"的第三条信号，那会重启设备，不适合拍照。
 
 ## 有意省略的部分
 
