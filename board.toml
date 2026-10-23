@@ -133,17 +133,22 @@ BUILDID_STRING = "clover-research"
 # Android-oriented firmware through build_uefi.py -d clover.
 UNIXNU_BUILD = "1"
 
-# The ramdisk of the boot image: a FAT volume with the UniXNU config, the kernel, its device
-# tree and the optional trust cache. The loader (DarwinBoot) is part of the firmware volume.
+# The payload volume: a FAT volume with the UniXNU config, the kernel, its device tree and
+# the optional trust cache. The loader (DarwinBoot) is part of the firmware volume.
 # dram_size is the low DRAM bank only: this 4 GiB unit reports 0x80000000+0x80000000 and
 # 0x100000000+0x7e4c0000 in dt/memory.raw.txt, and /chosen carries one base/size pair, so
 # the high bank stays unused until the port can describe two.
 [payload]
 volume = "CLOVERESP"
-# The boot partition is mmcblk0p12, 131072 sectors = 64 MiB, and the payload travels inside
-# the boot image's ramdisk, so the volume plus the 1.7 MiB kernel section has to fit there.
-# 56 MiB leaves the 51.8 MB kernel.macho and the ADT room and keeps boot.img near 58 MiB.
-# The upstream default of 192 MiB does not fit this partition.
+# This volume does not travel in the boot image. clover's firmware volume has no ramdisk
+# filesystem driver -- Fat and Partition watch BlockIo, and the only BlockIo in the volume
+# is SdccDxe's eMMC -- so a payload flashed as the boot image's ramdisk is invisible to
+# UniXNU, which scans every SimpleFileSystem for \EFI\UniXNU\unixnu.toml. Write the volume
+# to an eMMC partition instead (cache, mmcblk0p49, 256 MiB, is the expendable one):
+#   fastboot flash cache <UniXNU checkout>/out/clover/payload/payload.img
+# The boot image then carries no ramdisk at all. 56 MiB keeps the 51.8 MB kernel.macho and
+# the ADT in one image; 512-byte clusters give 112,892 of them, above the 65,525 the
+# firmware's Fat driver requires to accept a Fat32 volume.
 size_mib = 56
 loader = "firmware"
 title = "clover first boot: source 4K XNU to console"

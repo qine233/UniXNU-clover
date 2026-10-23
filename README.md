@@ -18,11 +18,11 @@ Xiaomi uses for the platform (`BoardPlatform: clover`), so the board keeps it.
 | --- | --- |
 | Board description | `board.toml` parses; `scripts/check-clover.py` cross-checks it against the defconfig and the payload contract |
 | ADT | `scripts/make-clover-adt.py` emits 13,880 bytes for the 8 Kryo 260 cores; the check reads the encoding back and asserts the nodes `ArmDTPlatform` and DarwinBoot require |
-| Kernel | **not built** — the UniXNU kernel step needs macOS with an accepted Xcode license |
-| Payload / boot.img | **not built** — they depend on the kernel artifacts |
-| Firmware | **not built** — needs the `uefi-clover` checkout and this unit's proprietary firmware inputs |
-| Device facts | `scripts/dump-clover-facts.sh` is ready; nothing has been collected from the tablet yet |
-| Boot on hardware | **not demonstrated** |
+| Kernel | built: a 51.8 MB `kernel.macho` for `DEVELOPMENT_ARM64_BCM2837` |
+| Payload / boot.img | built: a 56 MiB Fat32 payload volume and a boot image whose kernel section is the firmware; the payload does **not** travel in the ramdisk (see below) |
+| Firmware | built by `uefi-clover` (3 MiB FV, UniXNU and DarwinBoot inside) and running on the tablet: the checkpoint bars appear and the device reaches BDS |
+| Device facts | collected once, 2026-10-22, under `facts/81ffcaaa-20261022-210928/` |
+| Boot on hardware | firmware boots; the UniXNU menu and the XNU handoff are **not yet demonstrated** |
 
 Nothing above claims more than that table.
 
@@ -145,6 +145,29 @@ sit in `[bootimg.image]` (`ramdisk_offset 0x20000000`, `tags_offset 0x01e00000`,
 `header_version 1`) were wrong for clover and the firmware repository's checker now
 pins the real numbers.
 
+
+## Where the payload lives
+
+The payload volume is not a ramdisk in the boot image. The firmware volume this board
+builds contains `Fat`, `PartitionDxe` and `DiskIoDxe`, but no ramdisk filesystem driver
+of any kind, so the only `SimpleFileSystem` instances that can ever appear are the ones
+mounted over `SdccDxe`'s eMMC. UniXNU finds its configuration by scanning every
+`SimpleFileSystem` for `\EFI\UniXNU\unixnu.toml`; a volume that exists only in the
+ramdisk field of the boot image is not among them. It has no way to see it, whatever
+the image's size.
+
+The volume is therefore written to an eMMC partition, the way upstream fajita writes it
+to `boot_a`. `cache` (`mmcblk0p49`, 256 MiB, 524288 sectors) is expendable and large
+enough for the 56 MiB volume. `fastboot flash cache` writes the bare Fat32 filesystem,
+which is what the firmware mounts: the partition type does not matter to PartitionDxe,
+and the `CLOVERESP` label is cosmetic. The boot image keeps no ramdisk at all, which
+also keeps it far below the size where the ABL stops returning.
+
+```sh
+fastboot flash boot  ../UniXNU/out/clover/boot/unixnu-diag-nopayload.img   # firmware only
+fastboot flash cache ../UniXNU/out/clover/payload/payload.img
+fastboot reboot
+```
 
 ## What is intentionally left out
 
