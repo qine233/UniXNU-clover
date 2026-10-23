@@ -140,7 +140,11 @@ UNIXNU_BUILD = "1"
 # the high bank stays unused until the port can describe two.
 [payload]
 volume = "CLOVERESP"
-size_mib = 192
+# The boot partition is mmcblk0p12, 131072 sectors = 64 MiB, and the payload travels inside
+# the boot image's ramdisk, so the volume plus the 1.7 MiB kernel section has to fit there.
+# 56 MiB leaves the 51.8 MB kernel.macho and the ADT room and keeps boot.img near 58 MiB.
+# The upstream default of 192 MiB does not fit this partition.
+size_mib = 56
 loader = "firmware"
 title = "clover first boot: source 4K XNU to console"
 dram_size = "0x80000000"
@@ -191,12 +195,10 @@ tags_offset = 0x00000100
 pagesize = 4096
 header_version = 0
 
-# The stock ABL switches the panel off when the tree it loads has no splash region,
-# so the appended device tree must declare the one the firmware reserves: Display
-# Reserved in this unit's uefiplat.cfg, 0x9d400000 + 0x2400000.
-[[bootimg.dtb_node]]
-path = "/reserved-memory/splash_region"
-props = [
-  { name = "label", type = "s", value = "cont_splash_region" },
-  { name = "reg", type = "x", value = ["0x0", "0x9d400000", "0x0", "0x2400000"] },
-]
+# No [[bootimg.dtb_node]] for the splash window.  The unit's own tree, which is what the
+# boot image appends, already carries it: /reserved-memory/splash_region@9d400000, label
+# cont_splash_mem, reg 0x9d400000 + 0x23ff000, one page short of the 0x2400000 the
+# firmware reserves.  patch_dtb creates its node with "fdtput -c", and libfdt resolves
+# the un-suffixed path /reserved-memory/splash_region to that node, so the create fails
+# with FDT_ERR_EXISTS.  The tree already declares the region the ABL looks for, which is
+# all that check was for.
