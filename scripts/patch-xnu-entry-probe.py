@@ -6,16 +6,18 @@ own video console exists, so the early boot stages are reported by side
 channels. The stage code lives in the zero padding after the kernel entry
 (_start is one `b`) and displaced instructions are re-executed there:
 
-  stage 1 (kernel entry, MMU off)       blue bar, then raises boot_args.memSize
-                                        (and memSizeActual) to cover the frame
-                                        buffer, so the V=P bootstrap map that
-                                        _start_first_cpu builds includes it, and
-                                        continues.
-  stage 2 (just before the MMU is on)   magenta bar, then seeds the kernel's
-                                        vc_info (_vinfo) with the frame buffer
-                                        geometry and a marker in v_type, so both
-                                        the panic screen and the stage 3 paint
-                                        have a console before vc_init exists.
+  stage 1 (kernel entry, MMU off)       blue bar, then continues.
+  stage 2 (just before the MMU is on)   magenta bar, then adds identity block
+                                        entries for the frame buffer to the V=P
+                                        bootstrap tables (reusing the L2 table
+                                        of the kernel window's L1 entry, since
+                                        DarwinBoot's window sits above the frame
+                                        buffer and cannot grow down to it), and
+                                        seeds the kernel's vc_info (_vinfo) with
+                                        the frame buffer geometry and a marker
+                                        in v_type, so both the panic screen and
+                                        the stage 3 paint have a console before
+                                        vc_init exists.
   stage 3 (right after the MMU is on)   waits --reset-delay seconds, then PSCI
                                         SYSTEM_RESET. A reboot by itself after
                                         that time shows the CPU got through the
@@ -62,8 +64,20 @@ import sys
 import tempfile
 from pathlib import Path
 
-CAVE_OFFSETS = {1: 0x78, 2: 0x178, 3: 0x278, 4: 0x378}
+CAVE_OFFSETS = {1: 0x78, 2: 0x178, 3: 0x378, 4: 0x478}
 CAVE_SIZE = 0x100
+
+
+def cave_limits():
+    """Bytes available to each stage between its cave and the next one."""
+    ordered = sorted(CAVE_OFFSETS.items(), key=lambda item: item[1])
+    return {stage: (ordered[index + 1][1] if index + 1 < len(ordered) else offset + CAVE_SIZE) - offset
+            for index, (stage, offset) in enumerate(ordered)}
+
+
+# The stage 2 cave installs page-table entries, so it gets the gap up to
+# stage 3 (0x200 bytes); the others keep one 0x100 slot each.
+CAVE_LIMITS = cave_limits()
 TIMEBASE = 19200000
 # Written into vinfo.v_type by the seed below; the panic screen cleans the data
 # cache only for a frame buffer it knows is Normal-WB (see xnu-panic-screen.c).
@@ -93,73 +107,96 @@ PAINT = """
 2:
 """
 
-# DarwinBoot sizes WindowsSize (boot_args.memSize) to 256 MB, and
-# _start_first_cpu builds both the V=P and the KVA bootstrap tables from that
-# field. The frame buffer sits above that window, so after the MMU comes on
-# nothing maps it. Raise memSize, before the tables are built, to cover the
-# frame buffer: both maps then translate it and the V=P half makes the physical
-# address usable as an address at EL1. The cap keeps arm_init on 4 KB pages.
-GROW = """
-  ldr x1, [{args}, #0x10]
-  ldr x2, [{args}, #0x28]
-  ldr x3, [{args}, #0x38]
-  ldr x4, [{args}, #0x48]
-  mul x3, x3, x4
-  add x2, x2, x3
-  cmp x2, x1
-  b.ls 3f
-  sub x2, x2, x1
-  mov x3, #0x200000
-  sub x3, x3, #1
-  add x2, x2, x3
-  lsr x2, x2, #21
-  lsl x2, x2, #21
-  mov x3, #0x40000000
-  cmp x2, x3
-  b.hi 3f
-  ldr x3, [{args}, #0x18]
-  cmp x2, x3
-  b.ls 3f
-  str x2, [{args}, #0x18]
-  str x2, [{args}, #0x478]
-3:
+# The firmware memory map puts the display reservation at 0x9D400000-0xA0000000
+# and the only free run large enough for DarwinBoot's 1 GiB window above it, at
+# 0xA0000000. _start_first_cpu builds the V=P mapping from that window upward, so
+# it can never reach the frame buffer by growing memSize. Install the missing
+# block entries instead, with the MMU still off:
+#   * TTBR0 already holds the V=P L1 table, so its PA is read back from it;
+#   * both the window and the frame buffer are in the same 1 GiB L1 slot on this
+#     board, and the L2 table that slot already points at has free entries below
+#     the window;
+#   * attrs are copied from the window's first block so the frame buffer is
+#     Normal-WB, EL1 RW, just like kernel memory (the painters clean to PoC).
+# Any surprise (empty Video, a non-table L1 entry) skips the whole thing: the
+# later AT query then skips the paint rather than faulting.
+MAPFB = """
+  mov x8, xzr
+  ldr x9, [{args}, #0x28]
+  cbz x9, 9f
+  ldp x10, x11, [{args}, #0x38]
+  ldr x12, [{args}, #0x48]
+  mul x10, x10, x12
+  cbz x10, 9f
+  add x10, x9, x10
+  mov x15, #0x1FFFFF
+  add x10, x10, x15
+  lsr x10, x10, #21
+  lsl x10, x10, #21
+  bic x9, x9, #0x1FFFFF
+  mrs x11, ttbr0_el1
+  ldr x12, =0x0000fffffffff000
+  and x11, x11, x12
+  lsr x13, x9, #30
+  and x13, x13, #0x1FF
+  ldr x13, [x11, x13, lsl #3]
+  tst x13, #0x2
+  b.eq 9f
+  and x11, x13, x12
+  ldr x13, [{args}, #0x10]
+  lsr x13, x13, #21
+  and x13, x13, #0x1FF
+  ldr x12, [x11, x13, lsl #3]
+  tst x12, #0x3
+  b.eq 9f
+  tst x12, #0x2
+  b.ne 9f
+  and x12, x12, #0x1FFFFF
+  mov x15, #0x200000
+1:
+  lsr x14, x9, #21
+  and x14, x14, #0x1FF
+  orr x13, x9, x12
+  str x13, [x11, x14, lsl #3]
+  add x9, x9, x15
+  cmp x9, x10
+  b.lo 1b
+  dsb sy
+  tlbi vmalle1
+  dsb sy
+  isb
+  mov x8, #1
+9:
 """
 
 # Just before the MMU goes on, publish the frame buffer in the kernel's own
 # vc_info so the panic screen has something to draw on long before vc_init
 # exists. The seed happens with the MMU off, so vinfo is written at its
 # physical address. baseaddr stays the physical address: it is valid as an
-# address only while the V=P map exists, which is exactly the window this probe
-# is for. If GROW did not raise memSize, the frame buffer is outside the map,
-# so leave vinfo zero and let the panic screen fall back to its timed reset.
+# address only through the V=P map, which MAPFB has just extended to it -- so
+# seed only when MAPFB succeeded (x8), otherwise leave vinfo zero and let the
+# panic screen take its timed reset instead of faulting on the marker read.
 SEED = """
-  stp x9, x10, [sp, #-32]!
-  str x11, [sp, #16]
-  ldr x10, [{args}, #0x18]
-  mov x11, #0x10000000
-  cmp x10, x11
-  b.ls 2f
+  cbz x8, 9f
+  stp x10, x11, [sp, #-32]!
+  stp x12, x13, [sp, #16]
   ldr x9, ={vinfo}
   ldr x10, [{args}, #0x08]
   sub x9, x9, x10
   ldr x10, [{args}, #0x10]
   add x9, x9, x10
-  ldr w10, [{args}, #0x48]
-  str w10, [x9, #0x00]
-  ldr w10, [{args}, #0x40]
-  str w10, [x9, #0x04]
-  ldr w10, [{args}, #0x50]
-  str w10, [x9, #0x08]
-  ldr w10, [{args}, #0x38]
-  str w10, [x9, #0x0C]
+  ldp x10, x11, [{args}, #0x48]
+  ldp x12, x13, [{args}, #0x38]
+  stp w10, w13, [x9, #0x00]
+  stp w11, w12, [x9, #0x08]
   ldr x10, [{args}, #0x28]
   str x10, [x9, #0x10]
-  movz w10, #{marker_lo}
-  movk w10, #{marker_hi}, lsl #16
-  str w10, [x9, #0x18]
-2:
-  ldr x11, [sp, #16]
-  ldp x9, x10, [sp], #32
+  movz w11, #{marker_lo}
+  movk w11, #{marker_hi}, lsl #16
+  str w11, [x9, #0x18]
+  ldp x12, x13, [sp, #16]
+  ldp x10, x11, [sp], #32
+9:
 """
 
 # Post-MMU paint, sourced from the seeded vc_info instead of boot_args: no
@@ -214,12 +251,12 @@ PAINT_INFO = """
 SOURCES = {
     1: (".text\n.global _start\n_start:\n"
         + PAINT.format(args='x0', band=1, lo='0x00FF', hi='0xFF00')
-        + GROW.format(args='x0')
         + "  b target\n"),
     # vinfo='{vinfo}' leaves the symbol as a placeholder for main(), which is the
     # first place the kernel's symbol table (and so the address) exists.
     2: (".text\n.global _start\n_start:\n"
         + PAINT.format(args='x20', band=2, lo='0x00FF', hi='0xFFFF')
+        + MAPFB.format(args='x20')
         + SEED.format(args='x20', vinfo='{vinfo}',
                       marker_lo=f'0x{VINFO_SEED & 0xFFFF:04X}', marker_hi=f'0x{VINFO_SEED >> 16:04X}')
         + "  msr SCTLR_EL1, x0\n  b target\n.ltorg\n"),
@@ -555,7 +592,7 @@ def main():
         if word(va) != value:
             raise SystemExit(f'{va:#x} holds {word(va):#010x}, expected {value:#010x}: not the kernel these probes are for')
     for stage, va in caves.items():
-        if any(data[file_offset(va):file_offset(va) + CAVE_SIZE]):
+        if any(data[file_offset(va):file_offset(va) + CAVE_LIMITS[stage]]):
             raise SystemExit(f'Stage {stage} padding at {va:#x} is not empty')
 
     sites = [(entry, 1, {'target': start_first_cpu}),
@@ -594,7 +631,7 @@ def main():
                 source = RESET_BEFORE if (stage == 4 and args.reset_before) else SOURCES[stage].format(
                     ticks=TIMEBASE * args.reset_delay, vinfo=f'{names["_vinfo"]:#x}UL')
             code = assemble(source, caves[stage], symbols, Path(tmp))
-            if len(code) > CAVE_SIZE:
+            if len(code) > CAVE_LIMITS[stage]:
                 raise SystemExit(f'Stage {stage} code is too large')
             data[file_offset(caves[stage]):file_offset(caves[stage]) + len(code)] = code
     for site, stage, _ in sites:
@@ -606,7 +643,7 @@ def main():
         text = ROOT / 'scripts/xnu-panic-screen.c'
         if not text.is_file():
             raise SystemExit(f'{text} is missing')
-        at = max(caves[stage] for _, stage, _ in sites) + CAVE_SIZE
+        at = max(caves[stage] + CAVE_LIMITS[stage] for _, stage, _ in sites)
         with tempfile.TemporaryDirectory() as tmp:
             code, load, panic_entry = assemble_c(text, at, Path(tmp), names)
             if not padding_fits(data, load, len(code)):
