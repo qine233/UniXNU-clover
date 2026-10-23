@@ -154,22 +154,17 @@ dram_size = "0x80000000"
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
 panic_screen = true
-# The framebuffer is unreadable once the MMU is on, so the next questions are
-# answered by time: reset six seconds after a chosen call in arm_init returns.
-# _PE_init_platform is the first call that consumes the device tree, so it is
-# the boundary that splits the pre-VM block in half.
+# The framebuffer is unreadable once the MMU is on, and before arm_vm_init the
+# bootstrap tables only linear-map the 256 MB DarwinBoot window, so the panel
+# has no kernel VA yet: the questions in this range are answered by time.
+# reset six seconds after a chosen call in arm_init returns.
+# The v0.2.12 run proved _PE_init_platform returns; _thread_bootstrap is the
+# midpoint between it and arm_vm_init, after the device-tree and CPU-topology
+# block and before the thread/CPU/rtclock bootstrap.
 entry_probe_reset_delay = 6
-entry_probe_reset_after = "_PE_init_platform"
+entry_probe_reset_after = "_thread_bootstrap"
 entry_probe_reset_in = "_arm_init"
 entry_probe_reset_occurrence = 1
-# Before that reset, try one bar from the MMU-on world: the store is guarded by
-# an address-translation query, so it either proves the frame buffer is still
-# reachable or is skipped without faulting. The bar is painted on reaching the
-# _cpu_data_init call, then that call really runs.
-entry_probe_paint_after = "_cpu_data_init"
-entry_probe_paint_in = "_arm_init"
-entry_probe_paint_band = 3
-entry_probe_paint_occurrence = 1
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 kernel_args = [
   "-v",

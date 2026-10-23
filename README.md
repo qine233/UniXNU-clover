@@ -18,10 +18,10 @@
 | 板级描述 | `board.toml` 可解析；`scripts/check-clover.py` 把它与 defconfig 和 payload 契约交叉核对 |
 | ADT | `scripts/make-clover-adt.py` 为 8 个 Kryo 260 核生成 13,880 字节；检查器会把编码读回来，并断言 `ArmDTPlatform` 和 DarwinBoot 需要的节点 |
 | 内核 | 已构建：`DEVELOPMENT_ARM64_BCM2837` 的 51.8 MB `kernel.macho` |
-| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.12` 起 payload 里的 `kernel.macho` 是一份打了探针的副本：入口色带、开 MMU 后的黄带、panic 屏幕，以及定时复位（见"菜单之后看什么"） |
+| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.13` 起 payload 里的 `kernel.macho` 是一份打了探针的副本：入口色带、panic 屏幕，以及 `arm_init` 某个调用返回后触发的定时复位（见"菜单之后看什么"） |
 | 固件 | 由 `uefi-clover` 构建（3 MiB 固件卷，内含 UniXNU 与 DarwinBoot）；`v0.3.10` 起 DXE 尾部完整派发，`CloverGopDxe` 发布 GOP |
 | 设备事实 | 2026-10-22 采集过一次，位于 `facts/81ffcaaa-20261022-210928/` |
-| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.9` 实测屏幕出现**绿 + 蓝 + 品红**三条色带，即 DarwinBoot 已交接、XNU 入口已执行、引导页表已建好；`v0.2.10` 实测**品红出现约 6 秒后设备自己重启**，即 `sctlr_el1` 打开 MMU 后没有立刻死掉；`v0.2.11` 的 `_arm_vm_init` 复位点没有触发（**品红一直停着**），说明还没走到它；`v0.2.12` 把黄带画在 `_cpu_data_init` 调用点、复位放在 `_PE_init_platform` 之后，待上机 |
+| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.9` 实测屏幕出现**绿 + 蓝 + 品红**三条色带，即 DarwinBoot 已交接、XNU 入口已执行、引导页表已建好；`v0.2.10` 实测**品红出现约 6 秒后设备自己重启**，即 `sctlr_el1` 打开 MMU 后没有立刻死掉；`v0.2.11` 的 `_arm_vm_init` 复位点没有触发（**品红一直停着**），说明还没走到它；`v0.2.12` 实测**只有绿 + 蓝 + 品红、约 6 秒后自复位**，即 `_PE_init_platform` 返回了、开 MMU 后写屏确实不可用；`v0.2.13` 把复位点挪到 `_thread_bootstrap` 返回后，待上机 |
 
 上面这张表之外，不做任何额外声称。
 
@@ -177,9 +177,8 @@ payload 里放的是一份**打了探针的 kernel 副本**（`scripts/patch-xnu
 | 绿 | 第 0 条，DarwinBoot 画 | `DarwinEnter` 跑到了跳转内核入口的那条 `br` |
 | 蓝 | 第 1 条，内核入口 | `_start` 的第一条 `b` 之前：CPU 已经进 XNU，MMU 还是关的 |
 | 品红 | 第 2 条，开 MMU 之前 | `msr sctlr_el1, x0` 之前：引导页表已经建好，正准备开 MMU |
-| 黄 | 第 3 条，开 MMU 之后 | `v0.2.12` 起：`arm_init` 里的 `_cpu_data_init` 调用点，证明 MMU 后写屏可见（见下） |
 
-前三条都在，说明内核跑过了入口和页表建立；只有绿带说明 DarwinBoot 交接了但内核
+三条都在，说明内核跑过了入口和页表建立；只有绿带说明 DarwinBoot 交接了但内核
 第一条指令就没回来；只有绿和蓝说明卡在 `_start_first_cpu` 的引导阶段。色带
 以下如果出现白字，那是 `panic_screen` 把 panic 的格式串、`TCR`、`SCTLR`、
 页计数画在了内核自己的 framebuffer 映射上——正好可以拍照。没有 panic 时
@@ -193,44 +192,42 @@ reboot 本身就是"执行到了这里"的证据；停住不动就是"没到"。
 实测品红出现约 6 秒后设备自己重启，说明 `sctlr_el1` 生效、`cpacr_el1`、
 `tpidr_el1` 和执行流都没问题。
 
-`v0.2.11` 把复位点换成**调用返回后**（`board.toml` 的
-`entry_probe_reset_after = "_arm_vm_init"`、`entry_probe_reset_in = "_arm_init"`、
-`entry_probe_reset_occurrence = 1`）。真机结果是**品红一直停着、不重启**，
-也就是 `arm_init` 第 1 次调用 `_arm_vm_init` 要么没走到、要么没返回。于是
-`v0.2.12` 把这一问拆成两个信号：
+`v0.2.11` 把复位点换成**调用返回后**（`entry_probe_reset_after = "_arm_vm_init"`）：
+真机结果是**品红一直停着、不重启**，也就是 `_arm_vm_init` 没走到。`v0.2.12` 把
+复位点前移到 `_PE_init_platform` 之后，并在 `_cpu_data_init` 调用点试画一条黄带。
+真机读数是**只有绿 + 蓝 + 品红，约 6 秒后自复位**：复位照常发生，说明
+`_PE_init_platform` 确实返回了；黄带没出现，说明开 MMU 之后这块屏暂时画不了。
 
-- **黄带（第 3 条）**：探针在 `arm_init` 调用 `_cpu_data_init` 的站点
-  （`0xFFFFFFF0079AFD98`）跳进 cave，先画黄带，再真正执行这次 `bl` 并返回。
-  这是第一次在开 MMU 之后画屏：写之前用 `AT S1E1W` 查一次翻译，没映射就
-  跳过（不触发异常）；写完按 VA 做 `dc civac` + `dsb sy`，因为开 MMU 后
-  framebuffer 可能是 Normal-WB 映射，不清洁缓存面板就看不到。黄带只证明
-  "到了这个调用点"，不证明 `_cpu_data_init` 跑完。
-- **复位点**：同一次 `arm_init` 里下一次调用 `_PE_init_platform`
-  （`0xFFFFFFF0079AFDA4`，第一个真正消费设备树的调用）返回后，再等 6 秒
-  发 PSCI 复位。
+原因已经静态查清：DarwinBoot 把 `boot_args.MemorySize` 设成 `WindowSize`
+（默认 256 MB），`_start_first_cpu` 用同一组 `virtBase / physBase / memSize`
+建引导页表，所以开 MMU 后的线性映射只覆盖内核窗口那 256 MB；framebuffer 在
+`0x9D400000`，离窗口起点约 490 MB，落在映射之外。`_vinfo` 又要等到
+`vc_init`（视频控制台）才被填上，那已在 `arm_vm_init` 之后很远。因此
+`arm_init` 这一段里没有能写屏的内核 VA，**颜色通道暂时关闭，只能继续用时间**。
+
+`v0.2.13` 把复位点放在 `arm_init` 第 1 次调用 `_thread_bootstrap` 之后
+（`0xFFFFFFF0079AFEA8`）——它正好在 `_PE_init_platform` 与 `_arm_vm_init`
+的中点，前面是设备树与 CPU 拓扑块，后面是线程 / CPU / 时钟引导：
 
 | 现象 | 含义 |
 | --- | --- |
-| 绿 + 蓝 + 品红 + 黄，约 6 秒后自复位 | 到了 `_cpu_data_init` 调用点，且 MMU 后写屏可见；`_PE_init_platform` 也已返回。卡点在它之后 |
-| 绿 + 蓝 + 品红 + 黄，之后一直不动 | 过了 `_cpu_data_init` 调用点，卡在 `_PE_init_platform` 内部（读 ADT/设备树的路径） |
-| 只有绿 + 蓝 + 品红，约 6 秒后自复位 | 复位说明确实跑到了 `_PE_init_platform` 之后；黄带没出现不是"没走到"，而是这一步 framebuffer 写不进去（AT 失败或缓存没到位）。卡点在 PE 之后 |
-| 只有绿 + 蓝 + 品红，一直不动 | 卡在 `_cpu_data_init` 调用点之前，或同样写不进屏地卡在 `_PE_init_platform` 内；下一轮把黄带继续前移 |
-| 品红之后十几秒自复位 | 先发生了 panic，但那时 vinfo 还是 0，panic 屏幕画不出来，兜底等 12 秒后复位 |
+| 品红之后约 6 秒自复位 | `_PE_init_platform`、两次 `SecureDT*`、`platform_stall`、`ml_parse_cpu_topology`、`ml_get_*` 和 `thread_bootstrap` 都返回了；卡点在 `machine_set_current_thread` / `cpu_bootstrap` / `rtclock_early_init` / `kernel_startup_bootstrap` / `timer_call_init` / `cpu_init` / `processor_bootstrap` 这一串之后、`arm_vm_init` 之前 |
+| 品红一直停着，永不重启 | 卡在 `/chosen` 查找、`xnu_platform_stall` 读取、`ml_parse_cpu_topology`、`ml_get_*` 或 `thread_bootstrap` 内部（若 `thread_bootstrap` 返回 NULL，紧接着写 `thread->machine` 也会 fault） |
+| 品红之后十几秒自复位 | 先发生了 panic；那时 `vinfo` 还是 0，panic 屏幕画不出来，兜底等 12 秒后复位 |
 | 色带下方出现白字 | panic 屏幕画出来了；白字是 panic 的格式串和寄存器快照，直接拍照 |
 
 这次复位是探针主动发的冷复位，不写任何分区，重启后仍从 `boot` 上的固件进菜单。
 
 ```sh
-fastboot flash cache ~/clover-out/round42-payload.img   # 只换这一格，boot 不变
+fastboot flash cache ~/clover-out/round43-payload.img   # 只换这一格，boot 不变
 fastboot reboot
 ```
 
 `boot` 镜像没有变化：固件卷、BootShim 和 DTB 都没动，只有 `cache` 上的 payload
 卷换了。`entry_probe_reset_delay` 控制等待秒数；`entry_probe_reset_after` 换成
 别的符号（并配 `entry_probe_reset_in` / `_occurrence`）就把复位点挪到别的调用
-之后，删掉它则退回 `v0.2.10` 的"开 MMU 后复位"；`entry_probe_paint_after` /
-`entry_probe_paint_in` / `entry_probe_paint_band` 控制黄带画在哪个调用点、哪一条
-色带。只想要色带和 panic 屏幕、不主动重启的话，把 `entry_probe_reset_delay`
+之后，删掉它则退回 `v0.2.10` 的"开 MMU 后复位"。只想要色带和 panic 屏幕、
+不主动重启的话，把 `entry_probe_reset_delay`
 删掉重打 payload 即可（`payload.py` 会改传 `--no-reset`）。
 
 ## 有意省略的部分
