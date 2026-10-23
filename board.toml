@@ -156,12 +156,20 @@ dram_size = "0x80000000"
 panic_screen = true
 # The framebuffer is unreadable once the MMU is on, so the next questions are
 # answered by time: reset six seconds after a chosen call in arm_init returns.
-# _arm_vm_init is the boundary where the kernel gets its own mappings; reaching
-# it means the platform expert, CPU topology and Apple register setup returned.
+# _PE_init_platform is the first call that consumes the device tree, so it is
+# the boundary that splits the pre-VM block in half.
 entry_probe_reset_delay = 6
-entry_probe_reset_after = "_arm_vm_init"
+entry_probe_reset_after = "_PE_init_platform"
 entry_probe_reset_in = "_arm_init"
 entry_probe_reset_occurrence = 1
+# Before that reset, try one bar from the MMU-on world: the store is guarded by
+# an address-translation query, so it either proves the frame buffer is still
+# reachable or is skipped without faulting. The bar is painted on reaching the
+# _cpu_data_init call, then that call really runs.
+entry_probe_paint_after = "_cpu_data_init"
+entry_probe_paint_in = "_arm_init"
+entry_probe_paint_band = 3
+entry_probe_paint_occurrence = 1
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 kernel_args = [
   "-v",

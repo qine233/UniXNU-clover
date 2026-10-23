@@ -23,6 +23,12 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         Nth call, --occurrence). It replaces
                                         stage 3, so one run asks one question:
                                         did the kernel get past that call?
+  stage 3 (--paint-after SYMBOL)        paint one bar after the call to SYMBOL and
+                                        keep booting. The store is guarded by an
+                                        AT S1E1W query, so an unmapped frame
+                                        buffer skips the bar instead of faulting;
+                                        this asks whether the frame buffer is
+                                        still reachable once the MMU is on.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
 DarwinBoot paints (band index = stage). Each patch site is checked against its
@@ -47,8 +53,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-CAVE_OFFSETS = {1: 0x78, 2: 0xD8, 3: 0x138, 4: 0x198}
-CAVE_SIZE = 0x60
+CAVE_OFFSETS = {1: 0x78, 2: 0x148, 3: 0x218, 4: 0x2E8}
+CAVE_SIZE = 0xC0
 TIMEBASE = 19200000
 
 # The DarwinBoot hand-off fills boot_args.Video; if it is empty the paint is
@@ -73,6 +79,51 @@ PAINT = """
   b.hi 1b
   dsb sy
 2:
+"""
+
+# Once the MMU is on, boot_args.Video.v_baseaddr (a physical address) is only
+# usable if the live tables map that virtual address. AT asks the hardware and
+# reports a fault in PAR_EL1.F instead of raising one, so an unmapped frame
+# buffer costs a skipped bar, not a fault in the middle of the kernel's first
+# calls. Only the first page of the band is checked; the carveout is one
+# contiguous range, and a fault later would surface as the panic reset.
+PAINT_MMU = """
+  stp x1, x2, [sp, #-48]!
+  stp x3, x4, [sp, #16]
+  stp x5, x6, [sp, #32]
+  ldr x1, [{args}, #0x28]
+  cbz x1, 2f
+  at s1e1w, x1
+  isb
+  mrs x6, par_el1
+  tbnz x6, #0, 2f
+  ldr x2, [{args}, #0x38]
+  ldr x3, [{args}, #0x48]
+  mul x2, x2, x3
+  lsr x2, x2, #4
+  bic x2, x2, #7
+  mov x4, #{band}
+  mul x5, x2, x4
+  add x1, x1, x5
+  mov x4, x1
+  mov x5, x2
+  movz w6, #{lo}
+  movk w6, #{hi}, lsl #16
+1:
+  stp w6, w6, [x1], #8
+  subs x2, x2, #8
+  b.hi 1b
+  dsb sy
+3:
+  dc civac, x4
+  add x4, x4, #64
+  subs x5, x5, #64
+  b.hi 3b
+  dsb sy
+2:
+  ldp x5, x6, [sp, #32]
+  ldp x3, x4, [sp, #16]
+  ldp x1, x2, [sp], #48
 """
 
 SOURCES = {
@@ -378,6 +429,10 @@ def main():
     parser.add_argument('--reset-delay', type=int, default=6, help='seconds before the reset')
     parser.add_argument('--reset-after', metavar='SYMBOL', help='place the reset after this call in arm_init instead of stage 3')
     parser.add_argument('--reset-before', action='store_true', help='reset at the call site before invoking SYMBOL (requires --reset-after)')
+    parser.add_argument('--paint-after', metavar='SYMBOL', help='paint a bar after this call and keep booting (no reset)')
+    parser.add_argument('--paint-in', dest='paint_function', default='_arm_init', help='function that makes the painted call (default _arm_init)')
+    parser.add_argument('--paint-band', type=int, default=3, help='which 1/16th band the painted bar fills (default 3)')
+    parser.add_argument('--paint-occurrence', type=int, default=1, help='which call to SYMBOL to paint after (1 = first)')
     parser.add_argument('--panic-screen', action='store_true', help='draw panic() messages on the kernel frame buffer')
     parser.add_argument('--no-reset', action='store_true', help='no reset probe at all')
     parser.add_argument('--occurrence', type=int, default=1, help='which call to SYMBOL (1 = first)')
@@ -422,9 +477,27 @@ def main():
         sites.append((after_mmu, 3, {'target': after_mmu + 4}))
         description = f'stage 3 reset {args.reset_delay} s after the MMU is on'
 
+    # Stage 3 doubles as the post-MMU paint when asked: the cave paints first and
+    # then really executes the displaced `bl`, so booting continues untouched.
+    paint_source = None
+    if args.paint_after:
+        paint_va, paint_callee = find_call(data, symbols_by_address, args.paint_function, args.paint_after,
+                                           args.paint_occurrence)
+        if any(site == paint_va for site, _, _ in sites):
+            raise SystemExit(f'--paint-after and the reset site are both {paint_va:#x}')
+        sites.append((paint_va, 3, {'callee': paint_callee, 'target': paint_va + 4}))
+        paint_source = ('.text\n.global _start\n_start:\n'
+                        + PAINT_MMU.format(args='x20', band=args.paint_band, lo='0xFF00', hi='0x00FF')
+                        + '  bl callee\n  b target\n')
+        description += (f', stage 3 paints band {args.paint_band} on reaching call #{args.paint_occurrence}'
+                        f' to {args.paint_after} in {args.paint_function} (at {paint_va:#x}) and continues')
+
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
-            source = RESET_BEFORE if (stage == 4 and args.reset_before) else SOURCES[stage].format(ticks=TIMEBASE * args.reset_delay)
+            if paint_source is not None and site == paint_va:
+                source = paint_source
+            else:
+                source = RESET_BEFORE if (stage == 4 and args.reset_before) else SOURCES[stage].format(ticks=TIMEBASE * args.reset_delay)
             code = assemble(source, caves[stage], symbols, Path(tmp))
             if len(code) > CAVE_SIZE:
                 raise SystemExit(f'Stage {stage} code is too large')
