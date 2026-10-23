@@ -1,20 +1,16 @@
-# Board description of the Xiaomi Mi Pad 4 8" LTE (clover, SDM660), read by the unixnu build driver.
-#
-# Hardware constants come from two public device trees that agree with each other:
-#   mainline    sdm660-mainline/linux    arch/arm64/boot/dts/qcom/sdm660-xiaomi-clover*.dts*
-#   downstream  Xiaomi's CAF clover kernel, arch/arm64/boot/dts/vendor/qcom/
-# Anything marked TODO-DEVICE must be filled from facts/<serial>-<stamp>/ produced by
-# scripts/dump-clover-facts.sh before an install is attempted.
+# Board description of the Xiaomi Mi Pad 4 8" LTE (clover, SDM660).
+# Hardware constants come from two device trees that agree with each other (mainline
+# sdm660-xiaomi-clover and Xiaomi's CAF clover kernel) and from facts/<serial>-<stamp>/,
+# produced by scripts/dump-clover-facts.sh.
 
 [board]
 name = "clover"
 soc = "SDM660"
 description = "Xiaomi Mi Pad 4 8\" LTE (2018)"
-kit = "clover"                      # the package/ of this repository appears as kits/clover in the build tree
+kit = "clover"
 
-# The target OS image: the unchanged iPad7,1 iPadOS 17.7.11 restore image, the same
-# identity every arm64 (not arm64e) board in the project uses. Kryo 260 is ARMv8.0 with
-# no pointer authentication, so this is the only class of image that can run.
+# The unchanged iPad7,1 image, the class every 4 KiB arm64 board in the project uses.
+# Kryo 260 is ARMv8.0 without pointer authentication, so arm64e images cannot run.
 [ipsw]
 url = "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
 product = "iPad7,1"
@@ -29,12 +25,9 @@ fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustC
 "044-76040-038.dmg" = "3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d"
 "044-76034-038.dmg" = "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f"
 
-# The raw image for the userdata partition: the OS and SystemOS disk images of the IPSW behind a manifest.
-# clover has eMMC (mmcblk0) with 512-byte logical sectors, so lba_bytes is 512.
-# The window is mmcblk0p64 as this unit reports it (facts/.../userdata-window.txt:
-# start 15795488, size 106347199, of a 122142720 sector disk), so last_lba leaves the
-# 34 trailing sectors of the backup GPT alone.  A different ROM can lay the GPT out
-# differently, which is why the dump comes before any image is written behind it.
+# The Data window is mmcblk0p64 as the unit reports it (15795488 + 106347199 sectors of a
+# 122142720-sector disk), so last_lba leaves the backup GPT alone. A different ROM can
+# lay the GPT out differently, which is why the window comes from a dump.
 [userdata]
 first_lba = 0xf10520
 last_lba = 0x747bfde
@@ -46,8 +39,6 @@ windows = [
 
 [kernel]
 defconfig = "clover_defconfig"
-# Archive builders of the kernel step, in order. Bare names resolve in the build tree,
-# which is how the gta4l board lists them.
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
@@ -101,7 +92,7 @@ roots = [
 ]
 
 [firmware]
-config = "clover"                  # Resources/Configs/clover.toml in the Mu-Silicium checkout (--uefi)
+config = "clover"
 dsc = "Platforms/Xiaomi/cloverPkg/clover.dsc"
 fd = "Build/cloverPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
 preflight = ["scripts/check-clover.py"]
@@ -127,36 +118,38 @@ DEVICE_MODEL = "clover"
 MEMORY_PROTECTION = "TRUE"
 SHIP_MODE = "FALSE"
 BUILDID_STRING = "clover-research"
-# firmware.py turns every key here into a -D on the EDK II command line, so the
-# clover DSC/FDF can guard the UniXNU-only modules (UniXNUPkg, DarwinBoot) with
-# !ifdef $(UNIXNU_BUILD).  Without it the same checkout still builds a plain
-# Android-oriented firmware through build_uefi.py -d clover.
+# Turns the UniXNU, UniXNUDxe and DarwinBoot modules on in clover.dsc and DXE.inc.
 UNIXNU_BUILD = "1"
 
-# The payload volume: a FAT volume with the UniXNU config, the kernel, its device tree and
-# the optional trust cache. The loader (DarwinBoot) is part of the firmware volume.
-# dram_size is the low DRAM bank only: this 4 GiB unit reports 0x80000000+0x80000000 and
-# 0x100000000+0x7e4c0000 in dt/memory.raw.txt, and /chosen carries one base/size pair, so
-# the high bank stays unused until the port can describe two.
+# Load offsets are this unit's own: both `boot` and `recovery` carry header version 0,
+# page 4096, and 0x8000 / 0x1000000 / 0x100 in the three slots. They are base-relative,
+# so base stays 0 and the ABL adds the 0x80000000 DRAM base itself.
+[bootimg.image]
+base = 0
+kernel_offset = 0x00008000
+ramdisk_offset = 0x01000000
+tags_offset = 0x00000100
+pagesize = 4096
+header_version = 0
+
+# No [[bootimg.dtb_node]]: the unit's own tree, which is what the boot image appends,
+# already carries /reserved-memory/splash_region@9d400000 (label cont_splash_mem,
+# reg 0x9d400000 + 0x23ff000). patch_dtb creates nodes with `fdtput -c`, and libfdt
+# resolves the un-suffixed path to that node, so the create fails with FDT_ERR_EXISTS.
+# uefi-clover's checker pins the address against both this tree and MemoryMapLib.
+
+# The payload volume is a FAT volume with the UniXNU config, the kernel, its device
+# tree and the optional trust cache. It does not travel in the boot image: this
+# firmware has no ramdisk filesystem driver, so UniXNU only sees it on an eMMC
+# partition. `cache` (mmcblk0p49, 256 MiB) is the expendable one.
+# 56 MiB keeps the 51.8 MB kernel.macho and the ADT in one image; 512-byte clusters
+# give 112,892 of them, above the 65,525 the firmware's Fat driver requires.
 [payload]
 volume = "CLOVERESP"
-# This volume does not travel in the boot image. clover's firmware volume has no ramdisk
-# filesystem driver -- Fat and Partition watch BlockIo, and the only BlockIo in the volume
-# is SdccDxe's eMMC -- so a payload flashed as the boot image's ramdisk is invisible to
-# UniXNU, which scans every SimpleFileSystem for \EFI\UniXNU\unixnu.toml. Write the volume
-# to an eMMC partition instead (cache, mmcblk0p49, 256 MiB, is the expendable one):
-#   fastboot flash cache <UniXNU checkout>/out/clover/payload/payload.img
-# The boot image then carries no ramdisk at all. 56 MiB keeps the 51.8 MB kernel.macho and
-# the ADT in one image; 512-byte clusters give 112,892 of them, above the 65,525 the
-# firmware's Fat driver requires to accept a Fat32 volume.
 size_mib = 56
 loader = "firmware"
 title = "clover first boot: source 4K XNU to console"
 dram_size = "0x80000000"
-# The payload driver applies this with scripts/patch-xnu-entry-probe.py, which the tree at
-# 1a01c2a does not contain (same gap as build-boot-progress.py), and the screen needs a
-# framebuffer this port does not have yet -- NATIVE_MOBILE_DISPLAY is off.  Both the panic
-# screen and entry_probe_reset_* are therefore unavailable until that layer lands.
 panic_screen = false
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 kernel_args = [
@@ -169,41 +162,13 @@ kernel_args = [
 
 [payload.adt]
 tool = "scripts/make-clover-adt.py"
-chip_id = "0x13d"                   # qcom,msm-id of SDM660
-# DarwinBoot asks the firmware for one contiguous physical window. On clover the low bank is
-# 0x80000000-0x100000000 and the reserved regions (PIL 0x92a00000-0x95100000, venus up to
-# 0x9cc00000, splash to 0x9f900000, the firmware FD at 0x9fc00000) leave 0xa0000000-0x100000000,
-# so 1 GiB is the largest request that still has an obvious home. 2 GiB does not fit contiguously.
+chip_id = "0x13d"
+# The low bank is 0x80000000-0x100000000; PIL, venus, the splash and the firmware FD
+# leave 0xa0000000-0x100000000, so 1 GiB is the largest obviously free request.
 owned_memory_size = "0x40000000"
-root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the scratch Data volume
-# Kryo 260: Silver cluster 0x0-0x3 (Cortex-A53), Gold cluster 0x100-0x103 (Kryo / A73)
+root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 cpu_regs = "0x0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"
 psci_method = "smc"
 packed_data_ramdisk = true
 ipad_identity = true
-unique_chip_id = "required"         # the platform seed is not stored in any repository
-
-# Load offsets read off this unit: facts/<serial>-<stamp>/img/unixnu-boot.img and
-# unixnu-recovery.img are the stock boot and recovery partitions, and both carry the
-# same header -- version 0, page_size 0x1000, and 0x8000 / 0x1000000 / 0x100 in the
-# kernel_addr, ramdisk_addr and tags_addr slots.  Those three are base-relative
-# offsets with the 0x80000000 left out, which is why `base` stays 0 here: the ABL
-# adds the DRAM base itself, and adding it in the packer too would load the kernel
-# at 0x1_00008000.  The stock kernel section is Image.gz with device trees appended
-# after the gzip stream (111 of them in boot, selected by qcom,msm-id and
-# qcom,board-id), the same shape [boot_image_kernel] append_dtb describes.
-[bootimg.image]
-base = 0
-kernel_offset = 0x00008000
-ramdisk_offset = 0x01000000
-tags_offset = 0x00000100
-pagesize = 4096
-header_version = 0
-
-# No [[bootimg.dtb_node]] for the splash window.  The unit's own tree, which is what the
-# boot image appends, already carries it: /reserved-memory/splash_region@9d400000, label
-# cont_splash_mem, reg 0x9d400000 + 0x23ff000, one page short of the 0x2400000 the
-# firmware reserves.  patch_dtb creates its node with "fdtput -c", and libfdt resolves
-# the un-suffixed path /reserved-memory/splash_region to that node, so the create fails
-# with FDT_ERR_EXISTS.  The tree already declares the region the ABL looks for, which is
-# all that check was for.
+unique_chip_id = "required"

@@ -438,7 +438,12 @@ def check_board(errors: list) -> str:
             errors.append(f"the boot image splash region {values[1]:#x}+{values[3]:#x} does not match "
                           f"the ADT display region {SPLASH_BASE:#x}+{SPLASH_SIZE:#x}")
     else:
-        errors.append("no [[bootimg.dtb_node]] declares the splash region the stock ABL expects")
+        # No node to patch: the unit's own tree, which is what the boot image appends,
+        # already declares /reserved-memory/splash_region@9d400000.  uefi-clover's
+        # checker holds that against both the tree and MemoryMapLib; this repository
+        # does not carry the tree, so it can only say why nothing is declared here.
+        print("[check-clover] notice: no [[bootimg.dtb_node]]; the appended device tree "
+              "already declares the splash region")
 
     named = board["kernel"]["archives"] + board["firmware"].get("preflight", []) + [adt["tool"]]
     if board["payload"].get("skip_setup_tool"):
