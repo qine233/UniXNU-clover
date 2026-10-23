@@ -153,18 +153,21 @@ dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
+#
+# v0.2.14 asks two questions in one run and never resets the tablet:
+#   * the blue cave raises boot_args.memSize (and memSizeActual) to cover the
+#     frame buffer, so the V=P bootstrap map includes it once the MMU is on;
+#   * the magenta cave publishes the frame buffer in the kernel's own vc_info,
+#     which the panic screen and the paint both read;
+#   * a yellow bar is painted right after _cpu_data_init, from that vc_info.
+# A yellow band proves arm_init was entered with a mapped frame buffer. If a
+# panic follows, the same mapping draws its message. No band and no message
+# means the kernel never reached the first call in arm_init.
 panic_screen = true
-# The framebuffer is unreadable once the MMU is on, and before arm_vm_init the
-# bootstrap tables only linear-map the 256 MB DarwinBoot window, so the panel
-# has no kernel VA yet: the questions in this range are answered by time.
-# reset six seconds after a chosen call in arm_init returns.
-# The v0.2.12 run proved _PE_init_platform returns; _thread_bootstrap is the
-# midpoint between it and arm_vm_init, after the device-tree and CPU-topology
-# block and before the thread/CPU/rtclock bootstrap.
-entry_probe_reset_delay = 6
-entry_probe_reset_after = "_thread_bootstrap"
-entry_probe_reset_in = "_arm_init"
-entry_probe_reset_occurrence = 1
+entry_probe_paint_after = "_cpu_data_init"
+entry_probe_paint_in = "_arm_init"
+entry_probe_paint_band = 3
+entry_probe_paint_occurrence = 1
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 kernel_args = [
   "-v",

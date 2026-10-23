@@ -6,13 +6,21 @@ own video console exists, so the early boot stages are reported by side
 channels. The stage code lives in the zero padding after the kernel entry
 (_start is one `b`) and displaced instructions are re-executed there:
 
-  stage 1 (kernel entry, MMU off)       blue bar, then continues
-  stage 2 (just before the MMU is on)   magenta bar, then continues
+  stage 1 (kernel entry, MMU off)       blue bar, then raises boot_args.memSize
+                                        (and memSizeActual) to cover the frame
+                                        buffer, so the V=P bootstrap map that
+                                        _start_first_cpu builds includes it, and
+                                        continues.
+  stage 2 (just before the MMU is on)   magenta bar, then seeds the kernel's
+                                        vc_info (_vinfo) with the frame buffer
+                                        geometry and a marker in v_type, so both
+                                        the panic screen and the stage 3 paint
+                                        have a console before vc_init exists.
   stage 3 (right after the MMU is on)   waits --reset-delay seconds, then PSCI
                                         SYSTEM_RESET. A reboot by itself after
                                         that time shows the CPU got through the
-                                        MMU enable; the frame buffer is not
-                                        mapped by then, so time is the signal.
+                                        MMU enable; nothing draws in that window,
+                                        so time is the signal.
   panic screen (--panic-screen)         panic() and its common panic funnel draw
                                         their format string on the kernel's own
                                         frame buffer mapping and stops
@@ -24,11 +32,12 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         stage 3, so one run asks one question:
                                         did the kernel get past that call?
   stage 3 (--paint-after SYMBOL)        paint one bar after the call to SYMBOL and
-                                        keep booting. The store is guarded by an
-                                        AT S1E1W query, so an unmapped frame
-                                        buffer skips the bar instead of faulting;
-                                        this asks whether the frame buffer is
-                                        still reachable once the MMU is on.
+                                        keep booting, from the seeded vc_info. The
+                                        store is guarded by an AT S1E1W query, so
+                                        an unmapped frame buffer skips the bar
+                                        instead of faulting; this asks whether the
+                                        frame buffer is still reachable once the
+                                        MMU is on.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
 DarwinBoot paints (band index = stage). Each patch site is checked against its
@@ -53,9 +62,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-CAVE_OFFSETS = {1: 0x78, 2: 0x148, 3: 0x218, 4: 0x2E8}
-CAVE_SIZE = 0xC0
+CAVE_OFFSETS = {1: 0x78, 2: 0x178, 3: 0x278, 4: 0x378}
+CAVE_SIZE = 0x100
 TIMEBASE = 19200000
+# Written into vinfo.v_type by the seed below; the panic screen cleans the data
+# cache only for a frame buffer it knows is Normal-WB (see xnu-panic-screen.c).
+VINFO_SEED = 0xC10C10C1
 
 # The DarwinBoot hand-off fills boot_args.Video; if it is empty the paint is
 # skipped instead of storing to address 0, so "no bar" never masks the hand-off.
@@ -81,24 +93,96 @@ PAINT = """
 2:
 """
 
-# Once the MMU is on, boot_args.Video.v_baseaddr (a physical address) is only
-# usable if the live tables map that virtual address. AT asks the hardware and
-# reports a fault in PAR_EL1.F instead of raising one, so an unmapped frame
-# buffer costs a skipped bar, not a fault in the middle of the kernel's first
-# calls. Only the first page of the band is checked; the carveout is one
-# contiguous range, and a fault later would surface as the panic reset.
-PAINT_MMU = """
-  stp x1, x2, [sp, #-48]!
+# DarwinBoot sizes WindowsSize (boot_args.memSize) to 256 MB, and
+# _start_first_cpu builds both the V=P and the KVA bootstrap tables from that
+# field. The frame buffer sits above that window, so after the MMU comes on
+# nothing maps it. Raise memSize, before the tables are built, to cover the
+# frame buffer: both maps then translate it and the V=P half makes the physical
+# address usable as an address at EL1. The cap keeps arm_init on 4 KB pages.
+GROW = """
+  ldr x1, [{args}, #0x10]
+  ldr x2, [{args}, #0x28]
+  ldr x3, [{args}, #0x38]
+  ldr x4, [{args}, #0x48]
+  mul x3, x3, x4
+  add x2, x2, x3
+  cmp x2, x1
+  b.ls 3f
+  sub x2, x2, x1
+  mov x3, #0x200000
+  sub x3, x3, #1
+  add x2, x2, x3
+  lsr x2, x2, #21
+  lsl x2, x2, #21
+  mov x3, #0x40000000
+  cmp x2, x3
+  b.hi 3f
+  ldr x3, [{args}, #0x18]
+  cmp x2, x3
+  b.ls 3f
+  str x2, [{args}, #0x18]
+  str x2, [{args}, #0x478]
+3:
+"""
+
+# Just before the MMU goes on, publish the frame buffer in the kernel's own
+# vc_info so the panic screen has something to draw on long before vc_init
+# exists. The seed happens with the MMU off, so vinfo is written at its
+# physical address. baseaddr stays the physical address: it is valid as an
+# address only while the V=P map exists, which is exactly the window this probe
+# is for. If GROW did not raise memSize, the frame buffer is outside the map,
+# so leave vinfo zero and let the panic screen fall back to its timed reset.
+SEED = """
+  stp x9, x10, [sp, #-32]!
+  str x11, [sp, #16]
+  ldr x10, [{args}, #0x18]
+  mov x11, #0x10000000
+  cmp x10, x11
+  b.ls 2f
+  ldr x9, ={vinfo}
+  ldr x10, [{args}, #0x08]
+  sub x9, x9, x10
+  ldr x10, [{args}, #0x10]
+  add x9, x9, x10
+  ldr w10, [{args}, #0x48]
+  str w10, [x9, #0x00]
+  ldr w10, [{args}, #0x40]
+  str w10, [x9, #0x04]
+  ldr w10, [{args}, #0x50]
+  str w10, [x9, #0x08]
+  ldr w10, [{args}, #0x38]
+  str w10, [x9, #0x0C]
+  ldr x10, [{args}, #0x28]
+  str x10, [x9, #0x10]
+  movz w10, #{marker_lo}
+  movk w10, #{marker_hi}, lsl #16
+  str w10, [x9, #0x18]
+2:
+  ldr x11, [sp, #16]
+  ldp x9, x10, [sp], #32
+"""
+
+# Post-MMU paint, sourced from the seeded vc_info instead of boot_args: no
+# register of the interrupted kernel code holds boot_args, and the vinfo copy is
+# exactly what the panic screen will use, so a visible bar also proves the panic
+# screen has a usable frame buffer. AT asks the hardware and reports a fault in
+# PAR_EL1.F instead of raising one, so an unmapped frame buffer costs a skipped
+# bar, not a fault. The pixels are Normal-WB here, so they are cleaned to the
+# point of coherency before the display engine can see them.
+PAINT_INFO = """
+  stp x1, x2, [sp, #-64]!
   stp x3, x4, [sp, #16]
   stp x5, x6, [sp, #32]
-  ldr x1, [{args}, #0x28]
+  str x9, [sp, #48]
+  ldr x9, ={vinfo}
+  ldr x1, [x9, #0x10]
   cbz x1, 2f
   at s1e1w, x1
   isb
   mrs x6, par_el1
   tbnz x6, #0, 2f
-  ldr x2, [{args}, #0x38]
-  ldr x3, [{args}, #0x48]
+  ldr w2, [x9, #0x0C]
+  ldr w3, [x9, #0x00]
   mul x2, x2, x3
   lsr x2, x2, #4
   bic x2, x2, #7
@@ -121,15 +205,24 @@ PAINT_MMU = """
   b.hi 3b
   dsb sy
 2:
+  ldr x9, [sp, #48]
   ldp x5, x6, [sp, #32]
   ldp x3, x4, [sp, #16]
-  ldp x1, x2, [sp], #48
+  ldp x1, x2, [sp], #64
 """
 
 SOURCES = {
-    1: ".text\n.global _start\n_start:\n" + PAINT.format(args='x0', band=1, lo='0x00FF', hi='0xFF00') + "  b target\n",
-    2: ".text\n.global _start\n_start:\n" + PAINT.format(args='x20', band=2, lo='0x00FF', hi='0xFFFF')
-       + "  msr SCTLR_EL1, x0\n  b target\n",
+    1: (".text\n.global _start\n_start:\n"
+        + PAINT.format(args='x0', band=1, lo='0x00FF', hi='0xFF00')
+        + GROW.format(args='x0')
+        + "  b target\n"),
+    # vinfo='{vinfo}' leaves the symbol as a placeholder for main(), which is the
+    # first place the kernel's symbol table (and so the address) exists.
+    2: (".text\n.global _start\n_start:\n"
+        + PAINT.format(args='x20', band=2, lo='0x00FF', hi='0xFFFF')
+        + SEED.format(args='x20', vinfo='{vinfo}',
+                      marker_lo=f'0x{VINFO_SEED & 0xFFFF:04X}', marker_hi=f'0x{VINFO_SEED >> 16:04X}')
+        + "  msr SCTLR_EL1, x0\n  b target\n.ltorg\n"),
     3: """.text
 .global _start
 _start:
@@ -487,8 +580,9 @@ def main():
             raise SystemExit(f'--paint-after and the reset site are both {paint_va:#x}')
         sites.append((paint_va, 3, {'callee': paint_callee, 'target': paint_va + 4}))
         paint_source = ('.text\n.global _start\n_start:\n'
-                        + PAINT_MMU.format(args='x20', band=args.paint_band, lo='0xFF00', hi='0x00FF')
-                        + '  bl callee\n  b target\n')
+                        + PAINT_INFO.format(vinfo=f'{names["_vinfo"]:#x}UL', band=args.paint_band,
+                                            lo='0xFF00', hi='0x00FF')
+                        + '  bl callee\n  b target\n.ltorg\n')
         description += (f', stage 3 paints band {args.paint_band} on reaching call #{args.paint_occurrence}'
                         f' to {args.paint_after} in {args.paint_function} (at {paint_va:#x}) and continues')
 
@@ -497,7 +591,8 @@ def main():
             if paint_source is not None and site == paint_va:
                 source = paint_source
             else:
-                source = RESET_BEFORE if (stage == 4 and args.reset_before) else SOURCES[stage].format(ticks=TIMEBASE * args.reset_delay)
+                source = RESET_BEFORE if (stage == 4 and args.reset_before) else SOURCES[stage].format(
+                    ticks=TIMEBASE * args.reset_delay, vinfo=f'{names["_vinfo"]:#x}UL')
             code = assemble(source, caves[stage], symbols, Path(tmp))
             if len(code) > CAVE_SIZE:
                 raise SystemExit(f'Stage {stage} code is too large')

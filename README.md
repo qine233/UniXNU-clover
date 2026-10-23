@@ -18,10 +18,10 @@
 | 板级描述 | `board.toml` 可解析；`scripts/check-clover.py` 把它与 defconfig 和 payload 契约交叉核对 |
 | ADT | `scripts/make-clover-adt.py` 为 8 个 Kryo 260 核生成 13,880 字节；检查器会把编码读回来，并断言 `ArmDTPlatform` 和 DarwinBoot 需要的节点 |
 | 内核 | 已构建：`DEVELOPMENT_ARM64_BCM2837` 的 51.8 MB `kernel.macho` |
-| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.13` 起 payload 里的 `kernel.macho` 是一份打了探针的副本：入口色带、panic 屏幕，以及 `arm_init` 某个调用返回后触发的定时复位（见"菜单之后看什么"） |
+| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.13` 起 payload 里的 `kernel.macho` 是一份打了探针的副本：入口色带、panic 屏幕，以及 `arm_init` 某个调用返回后触发的定时复位；`v0.2.14` 起还会把引导映射扩到 framebuffer、预先填好 `_vinfo`，让开 MMU 之后也能画屏（见"菜单之后看什么"） |
 | 固件 | 由 `uefi-clover` 构建（3 MiB 固件卷，内含 UniXNU 与 DarwinBoot）；`v0.3.10` 起 DXE 尾部完整派发，`CloverGopDxe` 发布 GOP |
 | 设备事实 | 2026-10-22 采集过一次，位于 `facts/81ffcaaa-20261022-210928/` |
-| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.9` 实测屏幕出现**绿 + 蓝 + 品红**三条色带，即 DarwinBoot 已交接、XNU 入口已执行、引导页表已建好；`v0.2.10` 实测**品红出现约 6 秒后设备自己重启**，即 `sctlr_el1` 打开 MMU 后没有立刻死掉；`v0.2.11` 的 `_arm_vm_init` 复位点没有触发（**品红一直停着**），说明还没走到它；`v0.2.12` 实测**只有绿 + 蓝 + 品红、约 6 秒后自复位**，即 `_PE_init_platform` 返回了、开 MMU 后写屏确实不可用；`v0.2.13` 把复位点挪到 `_thread_bootstrap` 返回后，待上机 |
+| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.9` 实测屏幕出现**绿 + 蓝 + 品红**三条色带，即 DarwinBoot 已交接、XNU 入口已执行、引导页表已建好；`v0.2.10` 实测**品红出现约 6 秒后设备自己重启**，即 `sctlr_el1` 打开 MMU 后没有立刻死掉；`v0.2.11` 的 `_arm_vm_init` 复位点没有触发（**品红一直停着**），说明还没走到它；`v0.2.12` 实测**只有绿 + 蓝 + 品红、约 6 秒后自复位**，即 `_PE_init_platform` 返回了、开 MMU 后写屏确实不可用；`v0.2.13` 的 `_thread_bootstrap` 复位点实测是**品红后十几秒才复位、没有白字**，符合"panic 屏幕在 `vinfo` 仍为 0 时走了 12 秒兜底"；`v0.2.14` 扩映射并预填 `_vinfo`、不再主动复位，待上机 |
 
 上面这张表之外，不做任何额外声称。
 
@@ -184,10 +184,6 @@ payload 里放的是一份**打了探针的 kernel 副本**（`scripts/patch-xnu
 页计数画在了内核自己的 framebuffer 映射上——正好可以拍照。没有 panic 时
 屏幕就停在最后画完的色带。
 
-MMU 一开，framebuffer 就不可读了，所以之后的问题只能由**时间**回答：探针在
-指定位置等一会儿，再发 PSCI `SYSTEM_RESET`（`smc`，功能号 `0x84000009`）。
-reboot 本身就是"执行到了这里"的证据；停住不动就是"没到"。
-
 `v0.2.10` 的复位点在 `msr sctlr_el1, x0; isb` 之后，回答"MMU 本身开没开成"：
 实测品红出现约 6 秒后设备自己重启，说明 `sctlr_el1` 生效、`cpacr_el1`、
 `tpidr_el1` 和执行流都没问题。
@@ -198,37 +194,52 @@ reboot 本身就是"执行到了这里"的证据；停住不动就是"没到"。
 真机读数是**只有绿 + 蓝 + 品红，约 6 秒后自复位**：复位照常发生，说明
 `_PE_init_platform` 确实返回了；黄带没出现，说明开 MMU 之后这块屏暂时画不了。
 
-原因已经静态查清：DarwinBoot 把 `boot_args.MemorySize` 设成 `WindowSize`
-（默认 256 MB），`_start_first_cpu` 用同一组 `virtBase / physBase / memSize`
-建引导页表，所以开 MMU 后的线性映射只覆盖内核窗口那 256 MB；framebuffer 在
-`0x9D400000`，离窗口起点约 490 MB，落在映射之外。`_vinfo` 又要等到
-`vc_init`（视频控制台）才被填上，那已在 `arm_vm_init` 之后很远。因此
-`arm_init` 这一段里没有能写屏的内核 VA，**颜色通道暂时关闭，只能继续用时间**。
+原因：DarwinBoot 把 `boot_args.MemorySize` 设成 `WindowSize`（默认 256 MB），
+`_start_first_cpu` 用同一组 `virtBase / physBase / memSize` 建引导页表，所以开
+MMU 后的线性映射只覆盖内核窗口那 256 MB；framebuffer 在 `0x9D400000`，离窗口
+起点约 490 MB。`_vinfo` 又要等到 `vc_init` 才被填上，那已在 `arm_vm_init` 之后
+很远，所以 `arm_init` 这一段没有任何写屏的途径。
 
-`v0.2.13` 把复位点放在 `arm_init` 第 1 次调用 `_thread_bootstrap` 之后
-（`0xFFFFFFF0079AFEA8`）——它正好在 `_PE_init_platform` 与 `_arm_vm_init`
-的中点，前面是设备树与 CPU 拓扑块，后面是线程 / CPU / 时钟引导：
+`v0.2.13` 把复位点放在 `arm_init` 第 1 次调用 `_thread_bootstrap` 之后，真机读数
+是**品红后十几秒才复位、屏幕没有白字**——不是 6 秒的检查点，而是 panic 屏幕在
+`vinfo` 还是 0 时走了 12 秒兜底。也就是说 MMU 之后确实发生过一次 panic，只是画
+不出来。
+
+`v0.2.14` 直接把这条通道修好，并且**不再主动复位**：
+
+1. **蓝带**：在 `_start_first_cpu` 建表之前，把 `boot_args.memSize`（以及
+   `memSizeActual`）抬到能盖住 framebuffer 的 2 MB 对齐值（约 480 MB，上限
+   1 GB，避免 `arm_init` 切到 16 KB 页）。V=P 引导映射因此包含 `0x9D400000`，
+   `Video.base` 这个物理地址在 EL1 下可以直接当地址用。
+2. **品红带**：开 MMU 前把 `boot_args.Video` 的几何信息写进内核自己的 `_vinfo`
+   （此时 MMU 未开，按物理地址写），并在 `v_type` 里放标记 `0xC10C10C1`。panic
+   屏幕和涂色都读这个结构，不再依赖 `vc_init`。
+3. **黄带**：`arm_init` 第 1 次调用 `_cpu_data_init` 返回后，按 `_vinfo` 涂第 3
+   条带。涂之前用 `AT S1E1W` 查一次翻译（失败就跳过，不 fault），涂完用
+   `dc civac` + `dsb sy` 把 Normal-WB 的像素推到显示引擎可见。
+4. **panic 屏幕**：只在看到 `v_type` 标记时做整屏 `dc civac`；`vc_init` 之后填的
+   `vinfo` 是 device 映射，不需要也不该清。
+
+因为没有复位探针，这一轮**不会自己重启**：停住就长按电源 + 音量下键 10–20 秒。
 
 | 现象 | 含义 |
 | --- | --- |
-| 品红之后约 6 秒自复位 | `_PE_init_platform`、两次 `SecureDT*`、`platform_stall`、`ml_parse_cpu_topology`、`ml_get_*` 和 `thread_bootstrap` 都返回了；卡点在 `machine_set_current_thread` / `cpu_bootstrap` / `rtclock_early_init` / `kernel_startup_bootstrap` / `timer_call_init` / `cpu_init` / `processor_bootstrap` 这一串之后、`arm_vm_init` 之前 |
-| 品红一直停着，永不重启 | 卡在 `/chosen` 查找、`xnu_platform_stall` 读取、`ml_parse_cpu_topology`、`ml_get_*` 或 `thread_bootstrap` 内部（若 `thread_bootstrap` 返回 NULL，紧接着写 `thread->machine` 也会 fault） |
-| 品红之后十几秒自复位 | 先发生了 panic；那时 `vinfo` 还是 0，panic 屏幕画不出来，兜底等 12 秒后复位 |
-| 色带下方出现白字 | panic 屏幕画出来了；白字是 panic 的格式串和寄存器快照，直接拍照 |
-
-这次复位是探针主动发的冷复位，不写任何分区，重启后仍从 `boot` 上的固件进菜单。
+| 绿 + 蓝 + 品红 + **黄带**，随后白字 | 映射与 `_vinfo` 都通了，内核踩到 panic；直接拍白字 |
+| 绿 + 蓝 + 品红 + **黄带**，然后停住 | `arm_init` 里 `_cpu_data_init` 返回了，之后是自旋而不是 panic；下一轮把复位点放回 `_thread_bootstrap` 等位置做时间二分 |
+| 绿 + 蓝 + 品红，之后**白字但没有黄带** | panic 发生在 MMU 之后、`_cpu_data_init` 之前（种子已在，所以能画） |
+| 绿 + 蓝 + 品红，无黄带也无白字 | 扩映射没生效或 `AT` 判定 framebuffer 仍不可达；也可能根本没走到 `_cpu_data_init` |
+| 品红后十几秒自复位、无白字 | panic 发生在品红种子之前，`vinfo` 仍为 0，panic 屏幕走 12 秒兜底（与 `v0.2.13` 相同） |
 
 ```sh
-fastboot flash cache ~/clover-out/round43-payload.img   # 只换这一格，boot 不变
+fastboot flash cache ~/clover-out/round44-payload.img   # 只换这一格，boot 不变
 fastboot reboot
 ```
 
 `boot` 镜像没有变化：固件卷、BootShim 和 DTB 都没动，只有 `cache` 上的 payload
-卷换了。`entry_probe_reset_delay` 控制等待秒数；`entry_probe_reset_after` 换成
-别的符号（并配 `entry_probe_reset_in` / `_occurrence`）就把复位点挪到别的调用
-之后，删掉它则退回 `v0.2.10` 的"开 MMU 后复位"。只想要色带和 panic 屏幕、
-不主动重启的话，把 `entry_probe_reset_delay`
-删掉重打 payload 即可（`payload.py` 会改传 `--no-reset`）。
+卷换了。`entry_probe_paint_after` / `entry_probe_paint_in` /
+`entry_probe_paint_band` / `entry_probe_paint_occurrence` 控制涂色位置；把
+`entry_probe_reset_delay` 加回来（并可配 `entry_probe_reset_after`）就恢复定时
+复位探针。
 
 ## 有意省略的部分
 

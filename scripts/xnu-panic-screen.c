@@ -26,7 +26,12 @@ typedef unsigned char u8;
 struct vc_info {
   u32 v_height, v_width, v_depth, v_rowbytes;
   u64 v_baseaddr;
+  u32 v_type;
 };
+
+/* Written into v_type by the entry probe's vinfo seed. It marks a console whose
+ * frame buffer is reached through the kernel's identity map. */
+#define VINFO_SEED 0xC10C10C1u
 
 #define SCALE   3
 
@@ -51,6 +56,21 @@ __attribute__((noreturn)) static void park (void)
   for (;;) {
     __asm__ volatile ("wfe");
   }
+}
+
+/* The seeded console is reached through the kernel's identity map, which is
+ * Normal-WB, so the display engine does not see the pixels until they are
+ * cleaned to the point of coherency. A vinfo filled by vc_init describes a
+ * device mapping and needs none of this. */
+static void clean_seeded (volatile struct vc_info *v)
+{
+  u64 p = v->v_baseaddr;
+  u64 end = p + (u64)v->v_rowbytes * v->v_height;
+
+  for (; p < end; p += 64) {
+    __asm__ volatile ("dc civac, %0" : : "r" (p) : "memory");
+  }
+  __asm__ volatile ("dsb sy" : : : "memory");
 }
 
 /* vinfo stays zero until the kernel's own video console exists, so a panic in
@@ -303,6 +323,9 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   mark[0] = 0xC0FFEE11u;
   mark[1] = 0x5CEEDA7Au;
   __asm__ volatile ("dsb sy");
+  if (v->v_type == VINFO_SEED) {
+    clean_seeded (v);
+  }
   park ();
 }
 
