@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: parent sleeps between polls"
+title = "clover md0 root: parked or killed, wait4 says"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -743,6 +743,28 @@ dram_size = "0x80000000"
 #     means select itself cannot sleep here, which is a fact about this port worth
 #     having; and if nothing appears at all, no timer reaches EL0 deadlines -- but
 #     then the child has the core permanently, and what it prints is the reading.
+#   * v0.2.48 because round 77 returned the first and the fourth of those, and the
+#     fourth one is a port fact, not a probe fact. The child's nine lines came back
+#     the moment the parent left the processor -- alive, the exec banner, thread=259
+#     task=515 host=771, reply=1827 -- and stopped exactly where round 74 stopped:
+#     `[clover] el0 mach: msg=` painted, its number never appearing. So starvation
+#     was the whole reason rounds 75-76 showed a silent child, and both of those
+#     readings are void. Photographed again after two full minutes, the panel had
+#     gained nothing: no panic screen, no `waited`, not one glyph. The parent went
+#     to sleep on a 50 ms deadline and never woke, which means no timer reaches an
+#     EL0 deadline on this board, so a timed wait is an unbounded sleep -- and every
+#     timeout this probe has ever used, the 200 polls and the msg2 receive's 3000 ms
+#     included, is a way to lose a process rather than a way to bound one. Round 78
+#     therefore takes the clocks out and waits on the one event that needs no
+#     timer: the child dying. A blocking wait4 leaves the core (rounds 70-74 proved
+#     that is what lets the child print) and wakes for exit and for SIGKILL but not
+#     for a parked thread, which is the distinction four rounds have been missing.
+#     The child adds the third case with one instruction: exit(448), stage 14 * 32,
+#     immediately after its number. So the parent's status line reads three ways
+#     without any panic screen -- which also keeps the console from being wiped --
+#     114688 (448 << 8) means the number went out and the process finished, N < 256
+#     means it was killed inside that write with the signal in the low byte, and no
+#     status line at all means the write itself never came back.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -752,7 +774,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["1364b4ec5b11a297142475649e5453caf30dc10383d04a77e7411eb643645b0e"]
+trust_cache_sha256 = ["9a91d15d6dbe94f5d95a267db211ca2ab4be9feb5a0d6b98034fa3cddf1b2cb2"]
 kernel_args = [
   "-v",
   "serial=3",

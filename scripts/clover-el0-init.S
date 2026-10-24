@@ -119,6 +119,30 @@
 // changes nothing else, so the panel answers exactly one question: was the child
 // starved, or is it stuck on its own?
 //
+// Round 77 answered it: the child's nine lines came back the moment the parent
+// started leaving the processor, and they stopped exactly where round 74 stopped
+// them -- `[clover] el0 mach: msg=` painted, its number never appearing. Starvation
+// was the whole reason rounds 75-76 showed a silent child, so those readings are
+// void and the console is innocent twice over.
+//
+// The same panel, photographed again two minutes later, had gained nothing at all:
+// no panic screen, no `waited`, no extra glyph. The parent had gone to sleep in
+// select(0, ..., &tv) with a 50 ms deadline and never came back, which is a fact
+// about this port on its own -- no timer reaches an EL0 deadline here, so every
+// timed wait in this file, the 200 polls and the msg2 receive's 3000 ms both, is
+// really an unbounded sleep. v0.2.48 therefore stops using timers, in the parent
+// and in the reading.
+//
+// What is left is the question round 74 could not ask and round 77 could not
+// answer either, because the parent was nowhere near a position to report it: at
+// that `msg=` line, is the child dead or parked? A blocking wait4 tells them apart
+// by itself -- exit and SIGKILL both wake it, a parked thread never does -- and it
+// hands the core over, which is what the child needs. The child adds the third
+// distinction: it exits with 448 (14 * 32, and stage 14 lives nowhere else) as the
+// very next instruction after the number, so the parent's status line decodes
+// three ways: 448 << 8 = the number printed and the probe finished, N < 256 = it
+// was killed inside that write, nothing = the write never returned.
+//
 // Why the console has to be opened by us. Round 65 retired the assumption that
 // fd 1 is a console: this XNU has no open_console() at all, bsd_init hands
 // initproc an empty descriptor table, and the console is just a devfs node --
@@ -445,6 +469,16 @@ _start:
   bl _puts
   mov x0, x20
   bl _print_line
+
+  // Round 78's marker, and the only new instruction in the child: leave here,
+  // one instruction after the number and one before the trap, through exit().
+  // The parent is sitting in a blocking wait4 for exactly this, so its status
+  // line says which of the three things happened to the write above: 114688
+  // (448 << 8) means the number went out and the process was still whole, a
+  // value below 256 means it was killed inside that write with the low byte as
+  // the signal, and no status line at all means the write never came back.
+  mov x23, #448
+  b _exit_now
 
   // ---- the question of this round: mach_msg2_trap, index 47 ----
   //
@@ -913,85 +947,46 @@ _parent:
   // plain wait4, the child printed page after page. In rounds 75-76, where the
   // parent polls with WNOHANG and burns a counter loop in between, the child has
   // not produced a single glyph. The one thing that differs is whether this
-  // parent ever leaves the processor, so round 77 changes exactly that and
-  // nothing else: between two polls, the parent sleeps.
+  // parent ever leaves the processor, so round 77 changed exactly that and nothing
+  // else: between two polls, the parent slept, through select(0, NULL, NULL, NULL,
+  // &tv) at 50 ms a poll.
   //
-  // The primitive is select(0, NULL, NULL, NULL, &tv), picked out of the source
-  // rather than by habit, because the three other ways to wait at EL0 in this
-  // kernel are all closed: semaphore_timedwait_trap and __semwait_signal both
-  // need a Mach right, and port 0 is not one -- port_name_to_semaphore returns
-  // KERN_INVALID_NAME (osfmk/kern/sync_sema.c:1168), which __semwait_signal turns
-  // into EINVAL (bsd/kern/kern_sig.c:1090) -- and mach_wait_until, trap 90, wants
-  // an absolute tick that no trap in this table can read. select needs none of
-  // that: with nd = 0 the timeval is the only thing the kernel copies in, and it
-  // lives in this file's own .data. selcount returns a count of zero
-  // (bsd/kern/sys_generic.c:1332), selprocess therefore skips selscan for that
-  // same reason, and the call reaches waitq_assert_wait64_leeway plus
-  // tsleep1(.., "select", ..) at bsd/kern/sys_generic.c:1455: a real blocking
-  // sleep that hands the core over. 200 polls of 50 ms is ten seconds the child
-  // gets for free, and because the kernel times them, the timeout stops being an
-  // estimate of how fast this core happens to count.
+  // Round 77's panel gave the answer for starvation -- all nine of the child's
+  // lines, stopping where round 74 stopped -- and its second photograph, taken
+  // after two full minutes, gave a second one nobody asked for: the parent never
+  // came back out of that sleep. No timer reaches an EL0 deadline on this port, so
+  // a timed wait is an unbounded one, and every timeout this file has ever used
+  // (the 200 polls, the msg2 receive's 3000 ms) is a way to lose a process rather
+  // than a way to bound one. So round 78 takes the timers out and waits on the one
+  // event that does not need a clock: the child dying.
   //
-  // The four readings, and they split what is left of the space:
-  //   the child's lines come back -- `alive`, the exec banner, the mach lines --
-  //       and the panel stops where round 74 stopped it. Starvation confirmed:
-  //       the parent's loop was the entire reason the child never ran, every
-  //       "silent child" reading from rounds 75-76 is void, and the mach question
-  //       can be read again.
-  //   the child stays silent and the panic screen still says 384. The parent
-  //       slept, so the child had the processor and produced nothing anyway: it
-  //       is stuck inside the kernel on its own, not starved by its parent.
-  //   the panic screen says 416 + errno. select itself cannot sleep on this
-  //       kernel -- a fact about the port worth having on its own -- and the low
-  //       bits name the errno.
-  //   the panel freezes with no panic screen at all. The parent slept and never
-  //       woke, i.e. no timer reaches EL0 deadlines; that also gives the child
-  //       the processor permanently, so whatever the child prints is the real
-  //       reading.
-  mov x20, #0                       // polls taken; never printed
-_parent_poll:
-  add x20, x20, #1
-
+  // A blocking wait4 is both halves of the parent's job at once. It leaves the
+  // processor, which rounds 70-74 proved is what lets the child print, and it wakes
+  // for exit and for SIGKILL but never for a parked thread, which is the distinction
+  // the last four rounds kept missing. The child supplies the third case: it calls
+  // exit(448) as the instruction right after its number, so the parent's status line
+  // reads three ways and needs no panic screen to be believed -- and no panic screen
+  // means the console keeps the child's lines instead of wiping them.
+  //
+  //   waited pid=2 status=114688        448 << 8: the number went out, the probe
+  //       finished, and whatever ate it in round 77 was the parent's sleep, not the
+  //       write.
+  //   waited pid=2 status=N, N < 256    killed inside that write, low byte = signal.
+  //       9 is SIGKILL, which is what the guard exceptions looked like in round 72.
+  //   no waited line, ever             the write never returned, with the core on
+  //       offer and the parent asleep: the tty path itself is where this stops.
   mov x0, x19                       // our child, not any child
   adrp x1, _scratch@PAGE
   add x1, x1, _scratch@PAGEOFF
-  mov x2, #1                        // WNOHANG
+  mov x2, #0                        // no options: block until it dies
   mov x3, #0
   mov x16, #7                       // SYS_wait4
   svc #0x80
   b.cs _wait_error
   cbnz x0, _wait_reaped
-
-  // The only new instruction sequence in this file: give the processor away.
-  mov x0, #0                        // nd = 0, so no descriptor set is touched
-  mov x1, #0
-  mov x2, #0
-  mov x3, #0
-  adrp x4, _tv@PAGE
-  add x4, x4, _tv@PAGEOFF
-  mov x16, #93                      // SYS_select
-  svc #0x80
-  // Loud and distinguishable: 416 = 13 * 32 and no stage 13 exists anywhere else
-  // in this file, so `exit status 416+errno` can only mean the yield call itself
-  // failed, with errno in the low bits.
-  b.cs _select_error
-
-  cmp x20, #200
-  b.lo _parent_poll
-  // Out of patience, not out of ideas: leave through the channel that needs no
-  // console. 384 = 12 * 32 with errno 0, and no stage 12 exists, so a panic
-  // reading `exit status 384` still means "ten seconds passed and the child never
-  // died" -- the same reading round 76 produced, now with the parent provably not
-  // hogging the core.
-  mov x23, #384
-  b _exit_now
-
-_select_error:
-  // errno is in x0 and _exit_now only reads x23, so this needs no console at all:
-  // the panic screen is the channel, and round 76 proved that channel works.
-  mov x23, #416
-  add x23, x23, x0
-  b _exit_now
+  // 0 with no WNOHANG would mean "a child changed state but cannot be reaped",
+  // which this kernel does not return; park rather than loop on it.
+  b _checkpoint
 
 _wait_error:
   // The call itself failed, which is its own answer: the parent is alive, the
@@ -1168,15 +1163,6 @@ _scratch:
   .quad 0
 _scratch_size:
   .quad 8
-// select's timeout, ready to be copied in. This is a LP64 process, so
-// select_nocancel takes the IS_64BIT_PROCESS branch and copyins a
-// user64_timeval: two 8-byte fields, tv_sec then tv_usec
-// (bsd/kern/sys_generic.c:1141). Both fields are long, so 50 ms is 50000 in
-// the second one, not the 4-byte offset an ILP32 struct would want.
-.balign 8
-_tv:
-  .quad 0
-  .quad 50000
 _console_path:
   .asciz "/dev/console"
 _banner:
