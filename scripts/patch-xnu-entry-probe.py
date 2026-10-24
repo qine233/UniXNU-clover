@@ -861,7 +861,14 @@ def assemble_c(source, va, workdir, symbols):
     definitions = []
     for macro, name, width in (('MAX_MEM', '_max_mem', 8),
                                ('PAGE_TOTAL', '_vm_page_pages', 4),
-                               ('PAGE_FREE', '_vm_page_free_count', 4)):
+                               ('PAGE_FREE', '_vm_page_free_count', 4),
+                               ('ARM_TIMER', '_armcpu_timer_interrupts', 8),
+                               ('ARM_IPI', '_armcpu_ipi_interrupts', 8),
+                               ('ARM_IPI_SENT', '_armcpu_ipi_sent', 8),
+                               ('ARM_IRQ_ID', '_armcpu_irq_id', 4),
+                               ('ARM_IRQ_PHASE', '_armcpu_irq_phase', 4),
+                               ('ARM_TIMER_INTID', '_armcpu_timer_intid', 4),
+                               ('ARM_GIC_BOOT', '_armcpu_gic_boot', 4)):
         address = symbols.get(name)
         if address is None or address % width or not any(
                 base <= address and address + width <= base + size

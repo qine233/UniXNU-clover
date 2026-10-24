@@ -400,6 +400,18 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   (void)MAX_MEM;
   hex (&g, "\npages=", *(volatile const u32 *)PAGE_TOTAL);
   hex (&g, "\nfree=", *(volatile const u32 *)PAGE_FREE);
+  /* The clock, in the kernel's own counts, because no process on this board has ever been able to report
+   * one: round77 measured that no timed wait anywhere -- in EL0 or in the kernel -- ever returns. ticks=0
+   * next to intid=19 (the INTID clover's device tree gives the EL1 virtual timer) would mean the line is
+   * armed and raised but never reaches ICC_IAR1_EL1, which is a different fault from a hung console.
+   * typer is GICD_TYPER as the driver read it back at boot: how many INTIDs this GIC implements. */
+  hex (&g, "\nticks=", *(volatile const u64 *)ARM_TIMER);
+  hex (&g, "\nipi=", *(volatile const u64 *)ARM_IPI);
+  hex (&g, " sent=", *(volatile const u64 *)ARM_IPI_SENT);
+  hex (&g, "\nirq=", *(volatile const u32 *)ARM_IRQ_ID);
+  hex (&g, " phase=", *(volatile const u32 *)ARM_IRQ_PHASE);
+  hex (&g, " intid=", *(volatile const u32 *)ARM_TIMER_INTID);
+  hex (&g, " typer=", *(volatile const u32 *)(ARM_GIC_BOOT + 3 * 4));
   /* The raw argument slots are not dumped: the formatted message above already carries them (room for the PANIC_TEXT copy). */
   mark[0] = 0xC0FFEE11u;
   mark[1] = 0x5CEEDA7Au;

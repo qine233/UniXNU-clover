@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: alive and stopped says the write returned"
+title = "clover md0 root: intid 19 gives the board a clock"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -823,6 +823,44 @@ dram_size = "0x80000000"
 #     succeeded, no stop, the child exited(2). panic 768: kill failed, the child
 #     exited(1) -- 37 is unreachable here. No panic screen: the write is the one that
 #     blocks.
+#   * v0.2.52 because round 81 came back as the fourth reading: no panic screen at all,
+#     and that reading is now stronger than it looked. SIGSTOP is acted out *inside* the
+#     kill (kern_sig.c:2349 stopsigmask -> :2362 p_stat=SSTOP -> :2373 stop(), which
+#     wakes the parent from within the syscall), so a delivered stop would have woken
+#     wait4 even if the child never ran another instruction. The child never reached
+#     kill: the label write did not return.
+#     The round then stops treating that write as a tty mystery on its own, because the
+#     reference ports document this exact pair of symptoms and fix it without touching
+#     XNU. xVanTuring/UniXNU-tb128fu board.toml:199-212 passes armcpu-* boot-args and
+#     says why: on those Snapdragons ICC_SGI1R_EL1 generates nothing, so IPIs are
+#     re-hosted as software-pended SPIs and the timer's INTID is corrected (their note:
+#     the value ArmCpu used before "is another source that stays asserted"). The
+#     mechanism was already in our tree -- the driver reads armcpu-self-ipi,
+#     armcpu-spi-ipi and armcpu-diagnostics -- but its timer number was wrong for this
+#     board: the base driver enables redistributor PPI bit 27 and services INTID 27 as
+#     the clock, while clover.dts:2233 describes the architected timer as PPIs 1, 2, 3,
+#     0, i.e. INTIDs 17, 18, 19, 16 (a device-tree PPI number is INTID 16 + number), and
+#     enableCPUTimeBase arms CNTV_CTL_EL0, the EL1 *virtual* timer, whose line is 19. The
+#     siblings in the same tree explain where 27 came from: dodge.dts:7290 lists PPIs 13, 14,
+#     11, 10, so there the very same source (non-secure EL1 virtual) is INTID 27 -- 27 and 19
+#     are one line under two device-tree numberings, and the base driver carried the old one.
+#     The
+#     counter event was therefore started and its interrupt could never reach
+#     ICC_IAR1_EL1: this board has never taken a tick. That is precisely what round 77
+#     measured twice from the outside -- a select() with a 50 ms deadline parks the
+#     parent forever, and an EL0 spin starves the sibling on the same CPU, which needs
+#     the absence of preemption, and preemption needs the tick.
+#     So this round changes the kernel only, and the EL0 probe stays byte-identical to
+#     round 81 (same root, same trustcache): drivers/ArmCpu is vendored into this device
+#     repository with two additions behind boot-args, and the panic screen now prints the
+#     driver's own counters so every photograph says whether the clock runs --
+#     ticks=, ipi=, sent=, irq= (the last INTID from ICC_IAR1_EL1), phase=, intid= (the
+#     line armed) and typer= (GICD_TYPER, how many INTIDs this GIC implements).
+#     armcpu-clock-panic=30000 is the safety net that keeps the round from being silent
+#     whatever happens: the clock itself panics once it has taken 30000 ticks, so a hang
+#     that survives the fix still reaches the panel. The panic screen keeps the *first*
+#     panic, so a probe that finished earlier is untouched, and reaching the watchdog at
+#     all is itself the reading that the timer interrupt now arrives.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -877,6 +915,19 @@ kernel_args = [
   # ending at `legacy: presend` says the gate is still firing and the tunable is
   # the thing that did not do what this tree says it does.
   "allow_legacy_mach_msg=1",
+  # The clock. 19 is the EL1 virtual timer's INTID in this device's own tree
+  # (Resources/DTBs/clover.dts:2233, PPI 3); 27, the base driver's number, is a line
+  # SDM660 does not route the architected timer to, so until now the kernel armed a
+  # source that never fires and masked the one that does.
+  "armcpu-timer-intid=19",
+  # Panic on the 30000th tick (~30 s at XNU's 1 ms tick). Silence is not allowed to be
+  # a reading: if the write still does not return, the clock says so on the panel.
+  "armcpu-clock-panic=30000",
+  # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
+  # the multi-core case, and this board runs one CPU (no sheng-smp), while the driver's
+  # software-IPI SPI numbers are hardcoded at 1008..1015 -- tb128fu had to move its base
+  # to 536 because its GIC implements fewer INTIDs. typer= on the panic screen is this
+  # board's GICD_TYPER, and until it is read, 1008 is a guess.
 ]
 
 [payload.adt]
