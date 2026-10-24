@@ -93,16 +93,15 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         vm_mem_bootstrap was called. Band 5,
                                         painted when kmem_init returns, closes
                                         the first half of vm_mem_bootstrap.
-                                        Bands 10-13 then mark the tail calls
-                                        (startup_upto KMEM, vm_fault_init,
-                                        startup_upto ZALLOC, the final kprintf),
-                                        and band 14, painted when that kprintf
-                                        returns, is followed by the usual timed
-                                        reset. Read the missing band: it names
-                                        the call that did not return. A stall
-                                        before band 14 leaves no reset, so a
-                                        device that stays on is itself a
-                                        reading.
+                                        Band 15 green, painted over the red
+                                        handoff bar when the call returns, says
+                                        the whole function returned; the same
+                                        cave then calls _vcattach, which clears
+                                        the screen and replays msgbuf, so from
+                                        there on the panel shows kernel text
+                                        and not bars. There is no timed reset:
+                                        a device that sits is showing its last
+                                        line.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
 DarwinBoot paints (band index = stage). Each patch site is checked against its
@@ -458,33 +457,26 @@ RESET_PAINT_BAND = (15, '0x0000', '0x00FF')
 #    7 cyan    that printf returned
 #    6 white   vm_mem_bootstrap was reached
 #    5 red     kmem_init returned: the five calls of the first half all returned
-#   10 yellow  kernel_startup_initialize_upto(STARTUP_SUB_KMEM) was reached
-#   11 blue    vm_fault_init was reached
-#   12 white   kernel_startup_initialize_upto(STARTUP_SUB_ZALLOC) was reached
-#   13 orange  the final kprintf was reached
-#   14 magenta that kprintf returned; wait a reset_delay and reset
+#   15 green   vm_mem_bootstrap returned; the video console is attached next
 # A missing band is caused by the call immediately before it, because each one
-# paints only after the previous one returned -- except the two startup calls and
-# vm_fault_init, which paint on entry, so their band proves the call was made and
-# the next band proves it returned. Bands 10-14 used to carry the five calls of
-# the first half; v0.2.30's photo showed all of them returning, so they are
-# retired. The post-console trace stays off while the ladder is active.
+# paints only after the previous one returned -- except band 6, painted on
+# entry, whose call site now also attaches the console. Bands 10-14 carried the
+# five calls of the first half (v0.2.30) and then the tail calls (v0.2.31);
+# both readings came back complete, so they are retired.
+#
+# Attaching the console is the point of the round. vcattach() clears the screen
+# (gc_enable) and replays msgbuf, so after it returns the panel shows kernel
+# text instead of bars: the bands disappear, and whatever the kernel prints
+# from there on -- including a panic -- stays on screen. There is no timed
+# reset any more; a device that sits is showing its last line.
 HANDOFF_ENTER_BAND = 15
 HANDOFF_LADDER = (
     {'caller': '_machine_startup', 'callee': '_machine_conf', 'mode': 'after', 'bands': (9,)},
     {'caller': '_kernel_bootstrap', 'callee': '_printf', 'mode': 'around', 'bands': (8, 7)},
-    {'caller': '_kernel_bootstrap', 'callee': '_vm_mem_bootstrap', 'mode': 'enter', 'bands': (6,)},
-    # The tail of vm_mem_bootstrap. Both startup calls share one callee, so they
-    # are told apart by occurrence and by the argument loaded right before them.
+    # The displaced call, the console attach and the return, all in one cave.
+    {'caller': '_kernel_bootstrap', 'callee': '_vm_mem_bootstrap', 'mode': 'enter_console',
+     'bands': (6,)},
     {'caller': '_vm_mem_bootstrap', 'callee': '_kmem_init', 'mode': 'after', 'bands': (5,)},
-    {'caller': '_vm_mem_bootstrap', 'callee': '_kernel_startup_initialize_upto', 'mode': 'enter',
-     'bands': (10,), 'occurrence': 1, 'expect': {-4: 0x528000C0}},   # mov w0, #STARTUP_SUB_KMEM
-    {'caller': '_vm_mem_bootstrap', 'callee': '_vm_fault_init', 'mode': 'enter', 'bands': (11,)},
-    {'caller': '_vm_mem_bootstrap', 'callee': '_kernel_startup_initialize_upto', 'mode': 'enter',
-     'bands': (12,), 'occurrence': 2, 'expect': {-4: 0x528000E0}},   # mov w0, #STARTUP_SUB_ZALLOC
-    {'caller': '_vm_mem_bootstrap', 'callee': '_kprintf', 'mode': 'around_reset', 'bands': (13, 14),
-     # The last call of the function: after it the frame is popped and it returns.
-     'expect': {-4: 0x9A891140, 4: 0xA9417BFD}},                     # csel x0,...; ldp x29, x30
 )
 HANDOFF_COLOURS = {
     15: ('0x0000', '0x00FF'),   # red
@@ -643,6 +635,9 @@ def handoff_source(mode, bands, vinfo, ticks):
     """Cave that puts band(s) of the handoff ladder around the call at CALLEE.
 
     after:  call, paint when it returns, continue.
+    enter_console: paint on entry, call, paint the green band over the red
+                  handoff band, call vcattach, continue (the screen is cleared
+                  and msgbuf replayed, so text replaces the bars).
     around: paint on entry, call, paint again when it returns, continue.
     around_reset: paint on entry, call, paint the second band when it returns,
                   wait TICKS, reset (the end of the measured stretch).
@@ -652,6 +647,12 @@ def handoff_source(mode, bands, vinfo, ticks):
     tail = '  b target\n.ltorg\n'
     if mode == 'enter':
         return head + handoff_paint(vinfo, bands[0]) + '  bl callee\n' + tail
+    if mode == 'enter_console':
+        # The second paint is not from the colour table: green over the red
+        # handoff bar says vm_mem_bootstrap returned and the attach begins.
+        return (head + handoff_paint(vinfo, bands[0]) + '  bl callee\n'
+                + PAINT_INFO.format(vinfo=f'{vinfo:#x}UL', band=15, lo='0xFF00', hi='0x0000')
+                + '  bl vcattach\n' + tail)
     if mode == 'after':
         return (head + '  bl callee\n  str x0, [sp, #-16]!\n'
                 + handoff_paint(vinfo, bands[0]) + '  ldr x0, [sp], #16\n' + tail)
@@ -1150,6 +1151,8 @@ def main():
     handoff = bool(args.reset_before and args.reset_after == '_machine_startup')
     ladder = []
     if handoff:
+        if '_vcattach' not in names:
+            raise SystemExit('the kernel has no _vcattach; cannot attach the video console')
         for item in HANDOFF_LADDER:
             site, callee = find_call(data, symbols_by_address, item['caller'], item['callee'],
                                      item.get('occurrence', 1))
@@ -1210,11 +1213,12 @@ def main():
             next_free = cave_va + CAVE_SIZE
         ladder_caves = []
         for site, callee, mode, bands in ladder:
-            size = {'enter': CAVE_SIZE, 'after': CAVE_SIZE,
+            size = {'enter': CAVE_SIZE, 'after': CAVE_SIZE, 'enter_console': 0x200,
                     'around': 0x200, 'around_reset': 0x300}[mode]
             cave_va = zero_slot(data, next_free, size, f'{mode} cave for {callee:#x}')
             source = handoff_source(mode, bands, names['_vinfo'], TIMEBASE * args.reset_delay)
-            code = assemble(source, cave_va, {'callee': callee, 'target': site + 4}, Path(tmp))
+            code = assemble(source, cave_va, {'callee': callee, 'target': site + 4,
+                                              'vcattach': names['_vcattach']}, Path(tmp))
             if len(code) > size:
                 raise SystemExit(f'Handoff cave for {callee:#x} is too large ({len(code):#x} bytes)')
             calls = []
@@ -1224,11 +1228,9 @@ def main():
                     delta = value & 0x3FFFFFF
                     delta -= (1 << 26) if delta & (1 << 25) else 0
                     calls.append(cave_va + offset + delta * 4)
-            if mode == 'reset':
-                if calls:
-                    raise SystemExit(f'Reset cave at {cave_va:#x} unexpectedly calls {calls[0]:#x}')
-            elif calls != [callee]:
-                raise SystemExit(f'Handoff cave at {cave_va:#x} calls {calls}, not exactly {callee:#x}')
+            expected = {'reset': [], 'enter_console': [callee, names['_vcattach']]}.get(mode, [callee])
+            if calls != expected:
+                raise SystemExit(f'Handoff cave at {cave_va:#x} calls {calls}, not exactly {expected}')
             data[file_offset(cave_va):file_offset(cave_va) + len(code)] = code
             ladder_caves.append((site, cave_va))
             next_free = cave_va + size

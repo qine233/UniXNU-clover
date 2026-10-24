@@ -397,6 +397,28 @@ dram_size = "0x80000000"
 #     kprintf paints on entry and again on return. Band 13 without 14 means the
 #     kprintf itself did not return; 14 plus the reset means the whole function
 #     returned and the next stall is after vm_mem_bootstrap.
+#   * v0.2.32 takes the v0.2.31 device reading: bands 13 and 14 both appeared and
+#     the tablet reset after fifteen seconds, so the final kprintf returned and
+#     the whole vm_mem_bootstrap returned. The stall is somewhere in the rest of
+#     kernel_bootstrap. Instead of another ladder, this round attaches the video
+#     console and lets the kernel speak for itself: the cave that replaces the
+#     vm_mem_bootstrap call paints band 6 white, makes the call, repaints band
+#     15 green when it returns, and calls _vcattach before continuing.
+#     _vcattach reacquires the screen, allocates the console buffers with
+#     Z_WAITOK (zalloc is up: STARTUP_SUB_ZALLOC has run) and replays the
+#     statically allocated msgbuf, so from then on kprintf draws on the panel
+#     and every later message is readable. There is no timed reset this round:
+#     a tablet that sits is showing its last line. Three readings:
+#       bars remain (including green 15)  vcattach was entered but never reached
+#                                         the clear: it is stuck inside, or the
+#                                         screen is not reacquirable
+#       bars replaced by text or blank    the console attached and cleared; read
+#                                         the text (boot messages, or a panic)
+#       white panic text                  a panic after the attach, drawn by the
+#                                         panic screen (which parks instead of
+#                                         resetting once the frame buffer maps)
+#     Bands 5, 8, 7 and 9 keep their meanings as the road to this point; band 6
+#     is still painted on entry to vm_mem_bootstrap.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
