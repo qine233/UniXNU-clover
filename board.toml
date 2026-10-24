@@ -154,8 +154,9 @@ dram_size = "0x80000000"
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
 #
-# v0.2.17-v0.2.21 ask where the frame buffer went and then walk the ADT
-# contract, in one run at a time, and never reset:
+# v0.2.17-v0.2.22 ask where the frame buffer went, then walk the ADT contract
+# and the kernel's CPU-feature assumptions, in one run at a time, and never
+# reset:
 #   * _start_first_cpu maps only the DarwinBoot window (V=P, memSize bytes), and
 #     this unit's window cannot start below 0x9D400000: everything below is
 #     reserved, the only free row is 148 MiB, and a 1 GiB window has to fit in
@@ -211,6 +212,14 @@ dram_size = "0x80000000"
 #     default and the eight cores form one flat cluster, which is exactly the
 #     state this Pi 3 kernel starts from without an ADT. A faithful two-cluster
 #     description needs a kernel rebuilt with MAX_CPU_CLUSTERS >= 2.
+#   * v0.2.22 then reached past the topology and faulted on the first PAN
+#     instruction: "Undefined kernel instruction ... instr=d500419f" at
+#     0x79aff58, i.e. `msr pan, #1` before arm_vm_init. Kryo 260 is ARMv8.0 and
+#     has no PSTATE.PAN, but configs/clover_defconfig still carried sheng's
+#     CONFIG_XNU_NATIVE_PAN=y. The defconfig now sets it to n, so the 15
+#     `msr pan` words and the -march=armv8.1-a flags on copyio.c, pcb.c and
+#     platform_tests.c are gone from the rebuilt kernel. Only the kernel build
+#     configuration changed here; the patch script and the ADT did not.
 #   * the paint probes and their targets are defaults inside this
 #     repository's scripts/patch-xnu-entry-probe.py (--no-paint/--no-paint2 turn
 #     them off), so the base repository's payload step needs no local change.

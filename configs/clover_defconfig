@@ -19,7 +19,10 @@ CONFIG_XNU_TRUST_CACHE_RUNTIME=y
 CONFIG_XNU_SOURCE_MOCKFS=y
 CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
-CONFIG_XNU_NATIVE_PAN=y
+# Kryo 260 (Cortex-A73/A53 derivatives) is ARMv8.0 and has no PSTATE.PAN: with
+# this on, the kernel's first `msr pan, #1` in arm_init raises an undefined
+# instruction at 0x79aff58, before arm_vm_init.
+CONFIG_XNU_NATIVE_PAN=n
 
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 
