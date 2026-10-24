@@ -39,6 +39,18 @@
 // console on screen as the reading. A failure still exits with stage * 32 +
 // errno, whose panic text is self-contained and needs no banner.
 //
+// Round 67 came back as a panel full of that line, parked: the tty paints, and
+// fd 0 plus pagesize 4096 were the extra readings in it. Round 68 therefore
+// spends the flood and asks the next wall real userland will hit: two user
+// processes. After the banner the init forks; the child prints its own pid and
+// ppid and exits with 7, the parent waits with wait4(-1) and prints the reaped
+// pid plus the raw status, then parks. That one dance exercises the pmap copy
+// (the child's first store is a copy-on-write fault), the scheduler picking the
+// child up while the parent sleeps, and exit/wait4 reaping it -- and the status
+// the parent prints decodes whatever happened instead: 1792 is exit(7) reached,
+// a small number is the signal that killed the child, and code << 8 is the
+// child's own stage * 32 + errno (stage 7 being its writes).
+//
 // Why the console has to be opened by us. Round 65 retired the assumption that
 // fd 1 is a console: this XNU has no open_console() at all, bsd_init hands
 // initproc an empty descriptor table, and the console is just a devfs node --
@@ -95,16 +107,9 @@ _start:
   b.cs _fail                        // no fd: the banner has nowhere to go
   mov x22, x0
 
-  // A failure leaves through _exit_now with stage * 32 + errno; the panic text
-  // that follows it is self-contained and needs no banner on the panel.
-  cbnz x23, _exit_now
-
-  // Success never exits: the banner goes up 240 times, two whole screens of
-  // 120 rows, so the live console itself is the reading and no photograph can
-  // miss the line. x19/x21/x22 survive the helpers; x24 is the loop's own.
-  mov x24, #240
-1:
-  // "[clover] el0 init: pid="
+  // "[clover] el0 init: pid=" … one line, once. Round 67 wrote it 240 times to
+  // prove the tty paints; the flood is spent, and from here on a round prints
+  // its evidence once and parks, leaving the live console on screen.
   // The length is computed at run time from the two labels: the assembler
   // cannot fold a label difference into a mov (unknown AArch64 fixup kind), and
   // hardcoding the count here would be a second source of truth for the string.
@@ -155,15 +160,131 @@ _start:
   bl _write_console
   mov x1, #128
   b.cs _fail
-  sub x24, x24, #1
-  cbnz x24, 1b
 
-  // A write that failed mid-loop was recorded in x23; report it now instead of
-  // parking behind a panel that may never have lit up.
+  // A failure leaves through _exit_now with stage * 32 + errno; the panic text
+  // that follows it is self-contained and needs no banner on the panel.
   cbnz x23, _exit_now
 
-  // Every line accepted: stay here with the panel full of them. A parked EL0
-  // process behind a lit banner is the one shape this port has never shown.
+  // pid = fork()                                    (SYS_fork = 2)
+  // The one question of round 68: can this kernel run two user processes on
+  // this hardware? fork copies the pmap, so the child's first store is a
+  // copy-on-write fault; the scheduler has to pick the child up while the
+  // parent sleeps in wait4; exit and wait4 have to reap it again. Everything
+  // real userland does later stands on those four, and none of them has been
+  // on this silicon yet.
+  mov x16, #2
+  svc #0x80
+  mov x1, #160
+  b.cs _fail
+  cbnz x0, _parent
+
+  // Child: the descriptor table is inherited, so x22 is the console here too.
+  // Its whole payload is one line and one exit code; the parent reports both.
+  mov x16, #20
+  svc #0x80
+  mov x1, #32
+  b.cs _fail
+  mov x19, x0
+  mov x16, #39                        // getppid
+  svc #0x80
+  mov x1, #32
+  b.cs _fail
+  mov x20, x0
+
+  adrp x1, _child_banner@PAGE
+  add x1, x1, _child_banner@PAGEOFF
+  adrp x2, _child_banner_end@PAGE
+  add x2, x2, _child_banner_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  mov x0, x19
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+
+  adrp x1, _child_mid@PAGE
+  add x1, x1, _child_mid@PAGEOFF
+  adrp x2, _child_mid_end@PAGE
+  add x2, x2, _child_mid_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  mov x0, x20
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+
+  adrp x1, _newline@PAGE
+  add x1, x1, _newline@PAGEOFF
+  adrp x2, _newline_end@PAGE
+  add x2, x2, _newline_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+
+  mov x0, #7                        // the number the parent's wait4 must echo
+  mov x16, #1
+  svc #0x80
+  b _checkpoint
+
+_parent:
+  mov x19, x0                       // the child's pid, as fork returned it
+  // wait4(-1, &_scratch, 0, 0)                      (SYS_wait4 = 7)
+  mov x0, #-1
+  adrp x1, _scratch@PAGE
+  add x1, x1, _scratch@PAGEOFF
+  mov x2, #0
+  mov x3, #0
+  mov x16, #7
+  svc #0x80
+  mov x1, #192
+  b.cs _fail
+  mov x20, x0                       // the reaped pid
+  adrp x0, _scratch@PAGE
+  add x0, x0, _scratch@PAGEOFF
+  ldr x24, [x0]                     // raw wait status: exit code << 8, or signal
+
+  adrp x1, _wait_banner@PAGE
+  add x1, x1, _wait_banner@PAGEOFF
+  adrp x2, _wait_banner_end@PAGE
+  add x2, x2, _wait_banner_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #128
+  b.cs _fail
+  mov x0, x20
+  bl _print_dec
+  mov x1, #128
+  b.cs _fail
+
+  adrp x1, _wait_mid@PAGE
+  add x1, x1, _wait_mid@PAGEOFF
+  adrp x2, _wait_mid_end@PAGE
+  add x2, x2, _wait_mid_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #128
+  b.cs _fail
+  mov x0, x24
+  bl _print_dec
+  mov x1, #128
+  b.cs _fail
+
+  adrp x1, _newline@PAGE
+  add x1, x1, _newline@PAGEOFF
+  adrp x2, _newline_end@PAGE
+  add x2, x2, _newline_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #128
+  b.cs _fail
+
+  // Both processes did their whole dance: stay here with the three lines on
+  // the panel. A parked parent behind its child's obituary is the reading.
   b _checkpoint
 
 _exit_now:
@@ -236,6 +357,18 @@ _middle_end:
 _tail:
   .ascii " pagesize="
 _tail_end:
+_child_banner:
+  .ascii "[clover] el0 child: pid="
+_child_banner_end:
+_child_mid:
+  .ascii " ppid="
+_child_mid_end:
+_wait_banner:
+  .ascii "[clover] el0 init: waited pid="
+_wait_banner_end:
+_wait_mid:
+  .ascii " status="
+_wait_mid_end:
 _newline:
   .ascii "\n"
 _newline_end:

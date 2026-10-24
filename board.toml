@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: EL0 init parks behind its banner"
+title = "clover md0 root: EL0 init forks a child"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -560,6 +560,20 @@ dram_size = "0x80000000"
 #     `[clover] el0 init:` lines is the one shape this port has never shown; a
 #     panel that still shows the boot log tail with the device parked means the
 #     tty accepts writes but never paints them, which is the next wall.
+#     Round 67 read a panel full of that line with the device parked: the tty
+#     paints, so the EL0-to-panel channel is closed. fd 0 and pagesize 4096 were
+#     the extra readings in the line (empty descriptor table, 4 KiB pages).
+#   * v0.2.38 spends the flood and asks the next wall real userland will hit:
+#     two user processes. The init prints its banner once, forks, and the child
+#     prints `[clover] el0 child: pid=<n> ppid=<n>` and exits with 7 while the
+#     parent waits with wait4(-1) and prints `[clover] el0 init: waited pid=<n>
+#     status=<raw>` before parking. The dance covers the pmap copy (the child's
+#     first store is a copy-on-write fault), the scheduler picking the child up
+#     while the parent sleeps, and exit/wait4 reaping it. The raw status is the
+#     fallback reading: 1792 = exit(7) reached, a small number = the signal that
+#     killed the child, code << 8 = the child's own stage * 32 + errno with
+#     stage 7 as its writes. New failure stages on the parent side: 5 = fork
+#     (160 + errno), 6 = wait4 (192 + errno).
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -569,7 +583,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["e0a7d7eeb7515ff96059ac4b1a5aa608ad36daf248f73ed9cf3d1fad1cf1274d"]
+trust_cache_sha256 = ["e0cce6ec02c38752c277e3902c63304d42b67a2ecab47844cd8833c42ee01474"]
 kernel_args = [
   "-v",
   "serial=3",
