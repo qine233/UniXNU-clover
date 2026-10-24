@@ -51,6 +51,18 @@
 // a small number is the signal that killed the child, and code << 8 is the
 // child's own stage * 32 + errno (stage 7 being its writes).
 //
+// Round 70 brought those five lines back and 1792 with them, so the process
+// model works on this silicon: the pmap copy faulted, the second core picked the
+// child up, the child exited, the parent woke and reaped it. Round 71 therefore
+// replaces the child's exit(7) with the thing a real init does first:
+// execve("/sbin/launchd"). On a mockfs root that path is this same image, so a
+// successful exec is a child that reappears as a second copy of this program --
+// only pid 1 forks now, and the second banner is the proof. It also moves the
+// console descriptor: the exec preserves fd 0, so the fresh copy's own
+// open("/dev/console") returns 1, and "console fd=1" on that line is the
+// descriptor table surviving the swap. A refused exec prints its errno and
+// exits with 9, which the parent reports as 2304.
+//
 // Why the console has to be opened by us. Round 65 retired the assumption that
 // fd 1 is a console: this XNU has no open_console() at all, bsd_init hands
 // initproc an empty descriptor table, and the console is just a devfs node --
@@ -164,6 +176,18 @@ _start:
   // A failure leaves through _exit_now with stage * 32 + errno; the panic text
   // that follows it is self-contained and needs no banner on the panel.
   cbnz x23, _exit_now
+
+  // Only pid 1 forks.
+  //
+  // The child of this round execs /sbin/launchd, and on a mockfs root that path
+  // is this very image: an exec that works replaces the child's address space
+  // with a second copy of this program, which starts again at _start with the
+  // pid the kernel gave it. Without this guard that copy forks, its child execs,
+  // and the pair multiplies until the process table is full -- a fork bomb whose
+  // only evidence is a panel scrolling banners. Parking on "I am not pid 1" is
+  // also the reading: a second banner line means the exec happened.
+  cmp x19, #1
+  b.ne _checkpoint
 
   // pid = fork()                                    (SYS_fork = 2)
   // The one question of round 68: can this kernel run two user processes on
@@ -297,7 +321,85 @@ _start:
   mov x1, #224
   b.cs _fail
 
-  mov x0, #7                        // the number the parent's wait4 must echo
+  // execve("/sbin/launchd", argv, envp)             (SYS_execve = 59)
+  //
+  // The next wall after "two processes" is "a process that becomes another one".
+  // exec is what every real init does first, and on this port it has one extra
+  // hurdle: the file is the root block device reinterpreted as a Mach-O, the
+  // cdhash has to pass AMFI again, and the new address space has to be built
+  // where the CoW'd one just was.
+  //
+  // Number 59 comes from this tree's bsd/kern/syscalls.master:
+  //     59  AUE_EXECVE  ALL  { int execve(char *fname, char **argp, char **envp)
+  //                             NO_SYSCALL_STUB; }
+  // NO_SYSCALL_STUB does not mean the kernel lacks the call -- it means only
+  // that no libSystem stub is generated for it -- and four of the syscalls this
+  // program has already retired on real hardware (exit, fork, open, wait4) carry
+  // exactly that marker.
+  //
+  // argv and envp are two NULL-terminated pointer arrays, and they are filled in
+  // at run time rather than written as `.quad _exec_path`: this image links
+  // -static, and an absolute address in the data section is a relocation the
+  // linker would have to resolve for a load address it does not know.
+  adrp x0, _argv@PAGE
+  add x0, x0, _argv@PAGEOFF
+  adrp x8, _exec_path@PAGE
+  add x8, x8, _exec_path@PAGEOFF
+  str x8, [x0, #0]
+  str xzr, [x0, #8]
+  adrp x0, _envp@PAGE
+  add x0, x0, _envp@PAGEOFF
+  str xzr, [x0, #0]
+
+  // One word before the call, so a child that dies inside the exec (a killed
+  // task, not an errno) is still distinguishable from one that never got there.
+  adrp x1, _exec_try@PAGE
+  add x1, x1, _exec_try@PAGEOFF
+  adrp x2, _exec_try_end@PAGE
+  add x2, x2, _exec_try_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+
+  adrp x0, _exec_path@PAGE
+  add x0, x0, _exec_path@PAGEOFF
+  adrp x1, _argv@PAGE
+  add x1, x1, _argv@PAGEOFF
+  adrp x2, _envp@PAGE
+  add x2, x2, _envp@PAGEOFF
+  mov x16, #59
+  svc #0x80
+
+  // Reaching here means the kernel refused: a successful exec never returns to
+  // the caller's instructions, it returns to the new image's _start. The carry
+  // flag says which of the two happened, and x0 is the errno on this path only.
+  mov x26, x0
+  adrp x1, _exec_fail@PAGE
+  add x1, x1, _exec_fail@PAGEOFF
+  adrp x2, _exec_fail_end@PAGE
+  add x2, x2, _exec_fail_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  mov x0, x26
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+  adrp x1, _newline@PAGE
+  add x1, x1, _newline@PAGEOFF
+  adrp x2, _newline_end@PAGE
+  add x2, x2, _newline_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+
+  // 9, not 7: round 70's reading was the parent printing 7 << 8 = 1792, and the
+  // parent must not be able to mistake "the child exited after a refused exec"
+  // for the old plan. 9 << 8 is 2304.
+  mov x0, #9
   mov x16, #1
   svc #0x80
   b _checkpoint
@@ -496,6 +598,19 @@ _child_x0_end:
 _child_x1:
   .ascii " x1="
 _child_x1_end:
+_exec_path:
+  .asciz "/sbin/launchd"
+_exec_try:
+  .ascii "[clover] el0 child: exec /sbin/launchd\n"
+_exec_try_end:
+_exec_fail:
+  .ascii "[clover] el0 child: exec errno="
+_exec_fail_end:
+.balign 8
+_argv:
+  .space 16                         // { "/sbin/launchd", NULL }, filled in at run time
+_envp:
+  .space 8                          // { NULL }, same
 _wait_banner:
   .ascii "[clover] el0 init: waited pid="
 _wait_banner_end:

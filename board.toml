@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: EL0 fork dispatches on x1"
+title = "clover md0 root: EL0 child execs launchd"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -611,6 +611,24 @@ dram_size = "0x80000000"
 #     status=1792`. The child's x0 matching its own getpid is the ABI confirmed;
 #     the waited line is exit and wait4 closing the loop, which nothing has
 #     proved yet on this silicon.
+#   * round 70 read exactly those lines plus `child: alive`, and status=1792 is
+#     exit(7) reaped by the parent: fork copies the pmap, the second core
+#     schedules the child, its copy-on-write stack is writable, exit and wait4
+#     both work. Two user processes on this tablet is settled.
+#   * v0.2.41 replaces the child's exit(7) with execve("/sbin/launchd"), number
+#     59 in this tree's bsd/kern/syscalls.master. NO_SYSCALL_STUB there only
+#     means libSystem generates no stub, not that the kernel lacks the call, and
+#     exit, fork, open and wait4 all carry the same marker and all retired here.
+#     On a mockfs root that path is this same image, so only pid 1 forks now: a
+#     successful exec reappears as a second copy of this program, and the fresh
+#     copy parks instead of forking, which keeps the pair from multiplying into a
+#     fork bomb. argv/envp are filled in at run time instead of .quad, because an
+#     absolute address in the data section would be a relocation for a load
+#     address the linker does not know. Reading: the banner a second time with
+#     `pid=2 console fd=1` (fd 0 survives the exec, so the fresh open returns 1:
+#     the descriptor table crossed the boundary), `child: exec /sbin/launchd`
+#     under it, and no waited line, because the parent is still asleep. A refused
+#     exec prints `exec errno=N` and exits 9, which the parent reports as 2304.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -620,7 +638,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["d476c073c4449535503c95b1cba2cf4c2d77fb1e05f69594d159369453e08412"]
+trust_cache_sha256 = ["d7ada04a7c0ea8436c8b9eb8b178ee210d89b7b43a1b959d79216fe967323617"]
 kernel_args = [
   "-v",
   "serial=3",
