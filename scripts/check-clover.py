@@ -45,8 +45,11 @@ TIMEBASE_HZ = 19200000
 
 REQUIRED_CHOSEN = ["random-seed", "nvram-proxy-data", "nvram-bank-size", "dram-base",
                    "dram-size", "crypto-hash-method", "root-matching", "display-base",
-                   "unique-chip-id"]
-REQUIRED_MEMORY_MAP = ["RAMDisk", "PackedRAMDisk", "TrustCache"]
+                   "unique-chip-id", "amfi-only-platform-code"]
+# One RAMDisk placeholder, no PackedRAMDisk: this board's root is the md0/mockfs image
+# (scripts/make-clover-root.py), which DarwinBoot hands over dense, and its AdtNode
+# refuses a memory-map that declares a ramdisk twice.
+REQUIRED_MEMORY_MAP = ["RAMDisk", "TrustCache"]
 
 
 def read_node(data: bytes, offset: int):
@@ -82,7 +85,7 @@ def adt_command(output: pathlib.Path):
             "--root-match-volume-uuid", "04769D26-2CA0-4825-B443-E2E5F88300F2",
             "--chip-id", hex(MSM_ID), "--cpu-regs", ",".join(hex(v) for v in CPU_REGS),
             "--psci-method", "smc", "--unique-chip-id", "0x0123456789ab",
-            "--packed-data-ramdisk", "--trust-cache", "--ipad-identity"]
+            "--data-ramdisk", "--trust-cache", "--ipad-identity"]
 
 
 def load_generator():
@@ -162,6 +165,10 @@ def check_adt(errors: list) -> str:
             errors.append("/chosen/random-seed is not 64 bytes")
         if chosen["properties"].get("dram-base") != struct.pack("<Q", DRAM_BASE):
             errors.append(f"/chosen/dram-base is not 0x{DRAM_BASE:x}")
+        # AMFI reads this at load and panics ("no amfi-only-platform-code device tree
+        # node!", AppleMobileFileIntegrity.cpp:5025) unless it is a 4-byte property.
+        if len(chosen["properties"].get("amfi-only-platform-code", b"")) != 4:
+            errors.append("/chosen/amfi-only-platform-code is missing or is not a 4-byte integer")
 
         memory_map = chosen["children"].get("memory-map")
         if memory_map is None:
@@ -173,6 +180,9 @@ def check_adt(errors: list) -> str:
                     errors.append(f"/chosen/memory-map is missing {placeholder}")
                 elif len(value) != 16:
                     errors.append(f"/chosen/memory-map/{placeholder} is {len(value)} bytes, not 16")
+            if "PackedRAMDisk" in memory_map["properties"]:
+                errors.append("/chosen/memory-map declares PackedRAMDisk next to RAMDisk; "
+                              "DarwinBoot's AdtNode rejects a memory-map with two ramdisk slots")
 
         for node in ("cpus", "arm-io", "defaults", "options"):
             if node not in root["children"]:
@@ -443,6 +453,21 @@ def check_board(errors: list) -> str:
     for argument in board["payload"]["kernel_args"]:
         if not re.fullmatch(r"[A-Za-z0-9_.\-]+(=[A-Za-z0-9_.,\-]+)?", argument):
             errors.append(f"kernel argument {argument} fails the payload pattern")
+
+    # The root contract. clover has no block driver, so the only root this kernel can
+    # find is the RAM one: the payload carries the md0/mockfs image as initrd, the ADT
+    # carries its plain RAMDisk placeholder, rd=md0 tells IOFindBSDRoot to take it, and
+    # the pinned trust cache carries the init program's cdhash so exec can validate it.
+    # A packed placeholder would mean the Data-seed shape instead, which needs NativeRamBlock.
+    if adt.get("packed_data_ramdisk"):
+        errors.append("[payload.adt] packed_data_ramdisk is true, but this board's root is the "
+                      "dense md0/mockfs image; the payload step would emit PackedRAMDisk")
+    if "rd=md0" not in board["payload"]["kernel_args"]:
+        errors.append('[payload] kernel_args has no rd=md0: without it IOFindBSDRoot waits for '
+                      'a root IOMedia that no clover driver publishes')
+    if not board["payload"].get("trust_cache_sha256"):
+        errors.append("[payload] trust_cache_sha256 is empty: the md0/mockfs init program would "
+                      "have no offline trust, and the exec of /sbin/launchd is a panic")
 
     splash = [entry for entry in board.get("bootimg", {}).get("dtb_node", [])
               if "splash" in entry["path"]]

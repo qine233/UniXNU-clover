@@ -112,16 +112,24 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         init block, kminit, IOKitBSDInit,
                                         loopattach, ether_family_init,
                                         net_init_run, vfs_mountroot,
-                                        devfs_kernel_mount). Each cave keeps
-                                        x0-x8 across its printf and then runs
-                                        the displaced call, so the last
-                                        printed marker names the call that
+                                        devfs_kernel_mount, siginit). Each
+                                        cave keeps x0-x8 across its printf and
+                                        then runs the displaced call, so the
+                                        last printed marker names the call that
                                         did not return. These read the same
                                         panel as the rest of the log, which
                                         matters because the last ordinary
                                         line (an NVRAM sync) can come from a
                                         background kext thread and say
                                         nothing about the boot thread.
+                                        siginit is the end of the list on
+                                        purpose: _bsd_utaskbootstrap follows it
+                                        and never returns, because it execs
+                                        /sbin/launchd in the boot thread. After
+                                        that marker the panel can only show an
+                                        exec or AMFI panic, or the kernel's own
+                                        report about the init process -- which
+                                        is what makes the two distinguishable.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
 DarwinBoot paints (band index = stage). Each patch site is checked against its
@@ -521,6 +529,14 @@ BSD_MARKERS = (
     {'callee': '_net_init_run', 'message': '[clover] net_init_run returned\\n'},
     {'callee': '_vfs_mountroot', 'message': '[clover] vfs_mountroot returned\\n'},
     {'callee': '_devfs_kernel_mount', 'message': '[clover] devfs_kernel_mount returned\\n'},
+    # The last call of _bsd_init that can return. What follows is
+    # _bsd_utaskbootstrap, which execs /sbin/launchd in this very thread: the
+    # boot thread becomes the init process, so no marker can come after it and
+    # bsd_init ends in panic("bsd_init returned from call to
+    # bsd_utaskbootstrap"). The next text this port can see on the panel is
+    # therefore either an exec/AMFI panic or the kernel's own report about the
+    # init process.
+    {'callee': '_siginit', 'message': '[clover] siginit returned, execing init\\n'},
 )
 MARKER_CALLER = '_bsd_init'
 

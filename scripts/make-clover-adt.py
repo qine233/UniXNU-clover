@@ -209,8 +209,15 @@ def generate_adt(args) -> bytes:
 
     chosen = node("chosen", [
         ("random-seed", os.urandom(64)),
-        *([("ephemeral-storage", u32(1))] if writable_root else []),
-        ("osenvironment", cstr("ramdisk" if args.data_ramdisk else "main")),
+        # This board has no Data volume: NativeRamBlock is not linked, so the
+        # image behind --data-ramdisk is the md0/mockfs root (see
+        # scripts/make-clover-root.py), not a seed the kernel writes to. The
+        # upstream QEMU fixture that boots that root passes only the RAMDisk
+        # placeholder, and keeps /chosen as a normal main boot, so this does too
+        # -- ephemeral-storage and osenvironment=ramdisk would add kernel
+        # behaviour changes this round has no way to attribute.
+        *([("ephemeral-storage", u32(1))] if args.packed_data_ramdisk else []),
+        ("osenvironment", cstr("main")),
         ("darwinboot-memory-size", u64(args.owned_memory_size)),
         *root_matching,
         ("dram-base", u64(args.dram_base)),

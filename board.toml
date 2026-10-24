@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover first boot: source 4K XNU to console"
+title = "clover md0 root: XNU to EL0 init"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -468,6 +468,48 @@ dram_size = "0x80000000"
 #     board does not pass, so they get no marker. An expected reading with a
 #     root-device wait is the net_init_run marker followed by no vfs_mountroot
 #     marker, and `Still waiting for root device` every 60 s.
+#   * v0.2.34 takes that reading: every marker through `[clover] net_init_run
+#     returned` printed and `[clover] vfs_mountroot returned` did not, and the
+#     last line on the panel was
+#       Waiting on <dict ... IOProviderClass ... IOMedia ... IOPropertyMatch ...
+#       UUID ...>
+#     So this is not a bug and not a hang: the boot thread is parked in
+#     IOFindBSDRoot waiting for a root IOMedia that no driver on this board will
+#     ever publish. clover's root is eMMC (sdhc_1 at 0xc0c4000) and this kernel
+#     links no SDHCI driver, so there is no block device to match. Stage 6 needs
+#     a root that does not require a driver, and XNU has one: /chosen/memory-map
+#     RAMDisk plus rd=md0 turns a payload file into /dev/md0 (IOKitBSDInit.cpp
+#     does mdevadd + mdevlookup and then `goto iofrootx`, which skips the wait),
+#     and the mockfs filesystem - linked into this kernel, its vfsconf sits in
+#     __DATA.__data - mounts that image as the whole of /, with /dev as a devfs
+#     mount point and /sbin/launchd as the image itself. The project validates
+#     exactly this shape on QEMU (scripts/probe-darwinboot-xnu.py --native-user:
+#     initrd = the signed static Mach-O, rd=md0, one RAMDisk placeholder).
+#     This round therefore:
+#       - scripts/clover-el0-init.S and scripts/make-clover-root.py build and
+#         sign that image: getpid, sysctl (CTL_HW/HW_PAGESIZE), one console line
+#         with both results, then exit(0).
+#       - [payload.adt] packed_data_ramdisk = false, so the ADT carries one plain
+#         RAMDisk placeholder and no PackedRAMDisk, and /chosen stays a normal
+#         main boot (no ephemeral-storage).
+#       - rd=md0 joins the kernel arguments and the trust cache bundle made by
+#         the same script is pinned by trust_cache_sha256: AMFI has to see the
+#         init program's cdhash or the exec of /sbin/launchd is the next panic.
+#       - the marker list grows one entry. `[clover] siginit returned, execing
+#         init` is the last call of _bsd_init that can return; what follows is
+#         bsd_utaskbootstrap, which execs /sbin/launchd in the boot thread itself
+#         (bsd_init ends in panic("bsd_init returned ... bsd_utaskbootstrap")),
+#         so no marker can come after it.
+#     Readings, in the order they become interesting:
+#       BSD root: md0, major 3, minor 0   the RAMDisk placeholder was filled and
+#                                         mdevadd took it
+#       [clover] siginit returned ...     mountroot returned and the exec is next
+#       panic "initproc failed to start"  the image was found but could not exec
+#                                         (bad cdhash, bad arch, mockfs layout)
+#       panic "initproc exited" plus the  EL0 ran and made syscalls: the root and
+#       pid/sysctl line above it          the userland entry both work
+#       still the IOMedia wait            rd=md0 did not reach the kernel, or the
+#                                         placeholder stayed unfilled
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -475,12 +517,16 @@ entry_probe_reset_in = "_arm_init"
 entry_probe_reset_occurrence = 1
 panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
+# The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
+# root and published to AMFI through this bundle (scripts/make-clover-root.py).
+trust_cache_sha256 = ["e7c5257fe61d49a7d57fb176003b2c42c276b65451c7bc3c1f1b9b87e81c22db"]
 kernel_args = [
   "-v",
   "serial=3",
   "debug=0x14e",
   "kt_fixed_zones=120",
   "boot-progress=2",
+  "rd=md0",
 ]
 
 [payload.adt]
@@ -492,6 +538,9 @@ owned_memory_size = "0x40000000"
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 cpu_regs = "0x0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"
 psci_method = "smc"
-packed_data_ramdisk = true
+# False means the --data-ramdisk image gets one plain RAMDisk placeholder, which is
+# what the md0/mockfs root needs; a packed one would add PackedRAMDisk and
+# ephemeral-storage, i.e. the Data-seed shape this board has no driver for.
+packed_data_ramdisk = false
 ipad_identity = true
 unique_chip_id = "required"
