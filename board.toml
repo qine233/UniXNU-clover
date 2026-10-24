@@ -149,7 +149,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover tty: exit between the two writes, now that the clock runs"
+title = "clover tty: the child panics the kernel itself, past the msg= write"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -935,7 +935,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["b5b064c41801cab0f0386cda47059963b5a150a31b09e4b4d862e57fd7c97099"]
+trust_cache_sha256 = ["d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4"]
 kernel_args = [
   "-v",
   "serial=3",

@@ -262,6 +262,29 @@
 //   no panic screen, ever     the write blocks with the timer running, so no wake-up is missing:
 //       the block is inside kmoutput/ttwrite, and the next cut goes in there.
 //
+// Round 85 (v0.2.56) keeps that last row and changes only the instrument that reads it. Round 84
+// hit it -- `msg=` painted, no panic screen, nothing after two minutes -- and its own photograph
+// dismantled the theory behind it. Eight child lines are legible above the stop, so the exec'd
+// child's write() had already returned at least eight times, three of them bare labels with no
+// newline, and the newline that produced the `msg=` row scrolled the entire panel. That retires
+// "the exec'd child's syscalls don't work", "only writes ending in \n return" and "the stop follows
+// the last row" together, and leaves the suspect write indistinguishable from the eight that
+// worked. What the picture still cannot separate is (a) the write never returned, (b) it returned
+// and the child's exit never did, (c) both completed and the parent's blocking wait4 was never
+// woken -- and all three speak only through the tty and through wait4, the two things under test.
+// So the child now speaks through neither: reboot(2) with RB_PANIC|RB_QUICK panics the kernel from
+// its own syscall, on a path that touches no filesystem, no console write and no parent.
+//
+// Two things learned reading that path, both of which outlive this round. `boot-progress=2` in
+// board.toml is inert: CONFIG_XNU_BOOT_PROGRESS=n makes boot_progress_active() the literal 0
+// (osfmk/kern/boot_progress.h:22), so the branch at video_console.c:1234 is not compiled, and the
+// panel really does go through gc_putchar, the lck_ticket_t vcputc_lock at video_console.c:153 and
+// console_write()'s global ring buffer (osfmk/console/serial_console.c:526) -- where
+// console_ring_reserve_space spins without bound on failure and console_ring_try_empty spins
+// holding the write lock while console_ring.nreserved is nonzero. Those are the next suspects, and
+// they are the reason a character can be on the screen while the write that produced it has not
+// returned.
+//
 // Why the console has to be opened by us. Round 65 retired the assumption that
 // fd 1 is a console: this XNU has no open_console() at all, bsd_init hands
 // initproc an empty descriptor table, and the console is just a devfs node --
@@ -587,19 +610,56 @@ _start:
   sub x2, x2, x1
   bl _puts
 
-  // Round 84's single change, and it is in the child: between the label write and the
-  // number write it now dies, with exit(448) -- round 79's cut, re-run on a board that
-  // finally has a clock. Round 81's kill(getpid(), SIGSTOP, 0) is deleted rather than
-  // moved: it answered "did the child survive the write" with "the parent woke for a
-  // stop", and with a timer running there is a cheaper answer. If this exit reaches the
-  // parent, the write returned -- and if it does not, no wake-up can be blamed, because
-  // round 82 proved an in-kernel deadline now expires (that AMFI panic *is* an expired
-  // waitForMatchingService returning nothing).
+  // Round 85's single change, and it is a change of channel rather than of question. Round 84
+  // came back as the last row of its table -- `msg=` painted, no panic screen, nothing added after
+  // two minutes -- and the photograph under it is the most informative of the ten, because for the
+  // first time the child's whole history is legible: `el0 child: alive`, the post-exec banner,
+  // `thread=259 task=515 host=771`, `reply=1827`, and only then the `msg=` label. So:
   //
-  // x23 is the exit code and _exit_now does not test it, so this leaves as exit(448), which the
-  // parent decodes from the raw status and reports as 0. The codes 1 and 2 that round 81 spent on
-  // "kill failed" and "no stop happened" are free again, and 1 now means something else.
-  mov x23, #448
+  //   - the exec'd child's write() has already returned at least eight times (`_write_console`
+  //     takes the `_fail` exit on any errno, and each of those lines is a bare label write, a
+  //     decimal write and a newline write that all had to come back for the next line to appear);
+  //   - three of those eight were `_puts` of `thread=`, ` task=` and ` host=` with no trailing
+  //     newline, so "only writes ending in \n return" is out;
+  //   - the newline that ended `reply=1827` scrolled the whole panel, which is what put `msg=` on
+  //     the last row, so gc_scroll_up/vc_scroll_up/video_scroll_up are out too.
+  //
+  // That leaves the suspect write indistinguishable from the eight that worked -- it is the ninth --
+  // and it leaves three states the picture cannot separate, because all three report through the
+  // two channels under examination: (a) the label write never returned, (b) it returned and the
+  // child's exit(448) never did, (c) both completed and the parent's blocking wait4 was never
+  // woken. Round 70's parent-waking child was fork-without-exec, so whether exec keeps childproc
+  // attached is genuinely untested here.
+  //
+  // So the child now panics the kernel itself, which needs neither the tty nor the parent:
+  // reboot(2), syscall 55 (syscalls.master:109, `int reboot(int opt, char *msg)`), with
+  // RB_PANIC|RB_QUICK = 0x800|0x400. kern_xxx.c:182 tests exactly that pair and calls
+  // panic_kernel() straight away, which is panic_with_options(.., "userspace panic: %s", message)
+  // -- before system_inshutdown, before the swap-thread waits, before sync and before any unmount,
+  // so nothing on this path can be held up by a filesystem or a thread this board does not have.
+  // The message is copied in by copyinstr (kern_xxx.c:132); a bad pointer comes back as
+  // "user space RB_PANIC message copyin failed" and still panics, so the report survives even a
+  // mistake in the argument. And on this DEVELOPMENT_ARM64_BCM2837 kernel both the suser test
+  // (:116) and the MACF reboot check (:142) are skipped for RB_PANIC, so the call needs no grant
+  // -- which matters because a grant is exactly the kind of thing this port keeps getting wrong.
+  //
+  //   panic `userspace panic: clover-el0: write returned`   the label write came back, and so does
+  //       a child's syscall after exec. Every suspect moves to the exit/wait4 wake-up side.
+  //   panic `initproc exited ... exit status 1`             the write came back and reboot(2)
+  //       returned an error, which the child reports by leaving with 449 -- the parent's
+  //       "exited, but not with our exit(448)" code. Not expected; would name a policy layer.
+  //   no panic screen, ever                                 the write never returned, or reboot(2)
+  //       itself blocked inside the kernel. Those two are still one reading, and the next cut
+  //       separates them by calling reboot before the write instead of after it.
+  adrp x1, _panic_msg@PAGE
+  add x1, x1, _panic_msg@PAGEOFF
+  mov x0, #0xc00                      // RB_PANIC | RB_QUICK
+  mov x16, #55                        // reboot(int opt, char *msg)
+  svc #0x80
+
+  // Reached only if reboot(2) came back, which means the write came back first. 449 is deliberately
+  // not 448 so the parent reports 1 rather than 0.
+  mov x23, #449
   b _exit_now
 
   // Not reached this round: the two instructions below are what rounds 78-83 hung
@@ -1361,6 +1421,12 @@ _mach_reply_end:
 _mach_msg:
   .ascii "[clover] el0 mach: msg="
 _mach_msg_end:
+// Round 85's report, handed to the kernel by reboot(RB_PANIC|RB_QUICK) and drawn as
+// `userspace panic: clover-el0: write returned` on the panic screen -- which is the first
+// statement this port has ever made about the console without going through the console.
+// copyinstr(2) wants the NUL, and the kernel truncates at kPanicStringMaxLen = 1024.
+_panic_msg:
+  .asciz "clover-el0: write returned"
 _m2_presend:
   .ascii "[clover] el0 m2: presend\n"
 _m2_presend_end:
