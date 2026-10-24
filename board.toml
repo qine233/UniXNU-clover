@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: one writer, panic-screen exit"
+title = "clover md0 root: parent sleeps between polls"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -714,6 +714,35 @@ dram_size = "0x80000000"
 #     and the panic screen still appears, the console is fine and the child is
 #     alone in this; if it freezes and no panic screen ever comes, the parent could
 #     not leave either, which is a wedged tty and not a wedged ipc.
+#   * v0.2.47 because round 76 returned the third of those and none of the first
+#     two. The parent's two lines came out whole -- digits and all -- the timeout
+#     fired, and the panic screen drew `initproc failed to start -- no exit reason
+#     available -- (signal 0, exit status 384)` with a2 = 0x180, so the console
+#     paints fine with one writer and the panic screen is a live second channel.
+#     The absent reading is the one that matters: between `forked pid=2 x1=0` and
+#     its own exit, the child wrote not one character, and the parent never reaped
+#     it, so the child never died either. Two writers were never the problem --
+#     there was only ever one, and the other process never reached the screen.
+#     That inverts the question. In rounds 70-74, where the parent sat blocked in
+#     a plain wait4, the same child printed page after page; in rounds 75-76, where
+#     it polls with WNOHANG and burns a counter loop in between, the child produced
+#     no glyph at all. The variable is not the console and not osfmk/ipc, it is
+#     whether this parent ever leaves the processor. So round 77 changes one thing:
+#     between two polls the parent sleeps, with select(0, NULL, NULL, NULL, &tv) at
+#     50 ms a poll and 200 polls -- selected from the source, because with nd = 0
+#     the timeval in this file's own .data is the only thing the kernel copies in
+#     (bsd/kern/sys_generic.c:1138), selcount yields a count of zero so selscan is
+#     skipped (:1332), and the call reaches waitq_assert_wait64_leeway plus
+#     tsleep1(.., "select", ..) at :1455. It needs no Mach right, which is exactly
+#     what semaphore_timedwait_trap, __semwait_signal and mach_wait_until all do.
+#     A side benefit: the timeout is kernel-timed now, so ten seconds means ten
+#     seconds instead of "somewhere between 10 and 30, depending on the core". If
+#     the child's lines come back, it was starvation and every "silent child"
+#     reading since round 75 is void; if the child stays silent and the panic still
+#     says 384, the child had the processor and is stuck on its own; 416 + errno
+#     means select itself cannot sleep here, which is a fact about this port worth
+#     having; and if nothing appears at all, no timer reaches EL0 deadlines -- but
+#     then the child has the core permanently, and what it prints is the reading.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -723,7 +752,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["197a08e136c4a31557cab24e2f13b0b7841f1a394cfa1e7c18c4f6d5f8df749a"]
+trust_cache_sha256 = ["1364b4ec5b11a297142475649e5453caf30dc10383d04a77e7411eb643645b0e"]
 kernel_args = [
   "-v",
   "serial=3",

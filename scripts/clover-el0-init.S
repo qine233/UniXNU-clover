@@ -105,6 +105,20 @@
 // screen is drawn straight into the frame buffer and does not go through the
 // console under test. Whatever that panel says, it says it about the console.
 //
+// Round 76 said it: the parent's two lines came out whole, digits and all, and
+// the panic screen drew `initproc failed to start ... (signal 0, exit status
+// 384)` with a2 = 0x180. So the console is innocent -- one writer, and it paints
+// fine -- and the panic screen is a working second channel. The reading that
+// matters is the one that is not there: between the parent's `forked pid=2 x1=0`
+// and its own exit, the child wrote not one character, and the parent never
+// reaped it, so the child never died either. Since rounds 70-74 showed that same
+// child printing pages whenever the parent was blocked in a plain wait4, the
+// variable is not the console and not mach: it is whether the parent leaves the
+// processor. v0.2.47 therefore replaces the parent's counter loop with a real
+// sleep -- select(0, NULL, NULL, NULL, &tv), 50 ms per poll, 200 polls -- and
+// changes nothing else, so the panel answers exactly one question: was the child
+// starved, or is it stuck on its own?
+//
 // Why the console has to be opened by us. Round 65 retired the assumption that
 // fd 1 is a console: this XNU has no open_console() at all, bsd_init hands
 // initproc an empty descriptor table, and the console is just a devfs node --
@@ -886,39 +900,57 @@ _parent:
   // hand, this process cannot be the one holding it, because it never enters the
   // tty here.
   //
-  // The parent still cannot sleep -- see the note below on this kernel's sleep
-  // primitives -- so it burns a counter loop between polls and writes nothing.
+  // Round 76 ran that plan and the console came back clean: the parent wrote two
+  // whole lines with their numbers, the timeout fired, and the panic screen drew
+  // itself with `exit status 384` and a2 = 0x180 to prove the exit code was the
+  // probe's own. What did not happen is the interesting part. The child wrote
+  // nothing at all -- no `el0 child: alive`, no post-exec banner, no mach line --
+  // and the parent never reaped it, so it was not dead either. Two writers were
+  // never the problem; there was only ever one writer, and the other process
+  // never reached the screen.
   //
-  // Between polls the parent burns tens of milliseconds in a counter loop rather
-  // than sleeping, because every sleep primitive here needs either a Mach right
-  // (semaphore_timedwait_trap on port 0 is KERN_INVALID_NAME, per
-  // port_name_to_semaphore in osfmk/kern/sync_sema.c:1168, so the
-  // __semwait_signal(0,0,1,1,...) shape is not a delay on this kernel) or a
-  // struct the kernel copies in. A counter needs neither, and its only cost is
-  // that "slow" and "stuck" are separated by an estimate instead of a clock.
+  // That inverts the question. In rounds 70-74, where the parent sat blocked in a
+  // plain wait4, the child printed page after page. In rounds 75-76, where the
+  // parent polls with WNOHANG and burns a counter loop in between, the child has
+  // not produced a single glyph. The one thing that differs is whether this
+  // parent ever leaves the processor, so round 77 changes exactly that and
+  // nothing else: between two polls, the parent sleeps.
   //
-  // The four readings, and they are exhaustive:
-  //   the child's lines all appear and then `waited pid=2 status=N` => the freeze
-  //       was the two writers. N decodes as always: signal in the low byte,
-  //       2816 = the probe reached exit(11), 9 = SIGKILL.
-  //   the child stops mid-output, and seconds later the panic screen says
-  //   `exit status 384` => the parent was alive, the panel could still be drawn,
-  //       and the child is stuck on its own -- with no second writer anywhere.
-  //   the child stops mid-output and no panic screen ever appears => this process
-  //       never reached exit either, so it was blocked in a wait4 that was asked
-  //       not to block, or the ticket lock really is held by the child and even
-  //       the panic path cannot get the pixels back.
-  //   everything appears except the panic => the console paints again once only
-  //       one process writes, which is the same conclusion as reading one.
+  // The primitive is select(0, NULL, NULL, NULL, &tv), picked out of the source
+  // rather than by habit, because the three other ways to wait at EL0 in this
+  // kernel are all closed: semaphore_timedwait_trap and __semwait_signal both
+  // need a Mach right, and port 0 is not one -- port_name_to_semaphore returns
+  // KERN_INVALID_NAME (osfmk/kern/sync_sema.c:1168), which __semwait_signal turns
+  // into EINVAL (bsd/kern/kern_sig.c:1090) -- and mach_wait_until, trap 90, wants
+  // an absolute tick that no trap in this table can read. select needs none of
+  // that: with nd = 0 the timeval is the only thing the kernel copies in, and it
+  // lives in this file's own .data. selcount returns a count of zero
+  // (bsd/kern/sys_generic.c:1332), selprocess therefore skips selscan for that
+  // same reason, and the call reaches waitq_assert_wait64_leeway plus
+  // tsleep1(.., "select", ..) at bsd/kern/sys_generic.c:1455: a real blocking
+  // sleep that hands the core over. 200 polls of 50 ms is ten seconds the child
+  // gets for free, and because the kernel times them, the timeout stops being an
+  // estimate of how fast this core happens to count.
+  //
+  // The four readings, and they split what is left of the space:
+  //   the child's lines come back -- `alive`, the exec banner, the mach lines --
+  //       and the panel stops where round 74 stopped it. Starvation confirmed:
+  //       the parent's loop was the entire reason the child never ran, every
+  //       "silent child" reading from rounds 75-76 is void, and the mach question
+  //       can be read again.
+  //   the child stays silent and the panic screen still says 384. The parent
+  //       slept, so the child had the processor and produced nothing anyway: it
+  //       is stuck inside the kernel on its own, not starved by its parent.
+  //   the panic screen says 416 + errno. select itself cannot sleep on this
+  //       kernel -- a fact about the port worth having on its own -- and the low
+  //       bits name the errno.
+  //   the panel freezes with no panic screen at all. The parent slept and never
+  //       woke, i.e. no timer reaches EL0 deadlines; that also gives the child
+  //       the processor permanently, so whatever the child prints is the real
+  //       reading.
   mov x20, #0                       // polls taken; never printed
 _parent_poll:
   add x20, x20, #1
-  // 0x4000000 rather than a round decimal: MOVZ can only place a 16-bit field at
-  // a multiple of 16 bits, so 100000000 would need a second instruction.
-  mov x21, #0x4000000               // ~70 ms of counting at this core's clock
-_poll_spin:
-  subs x21, x21, #1
-  b.ne _poll_spin
 
   mov x0, x19                       // our child, not any child
   adrp x1, _scratch@PAGE
@@ -930,14 +962,35 @@ _poll_spin:
   b.cs _wait_error
   cbnz x0, _wait_reaped
 
-  // ~10-30 s of polls at the loop's estimate, counting the A53 and A73 clocks as
-  // the two ends of the range. Out of patience, not out of ideas: leave by the
-  // channel that needs no console. 384 is 12 * 32 with errno 0, and no stage 12
-  // exists anywhere else in this file, so a panic reading `exit status 384` can
-  // only mean "the parent timed out waiting for a child that never died".
+  // The only new instruction sequence in this file: give the processor away.
+  mov x0, #0                        // nd = 0, so no descriptor set is touched
+  mov x1, #0
+  mov x2, #0
+  mov x3, #0
+  adrp x4, _tv@PAGE
+  add x4, x4, _tv@PAGEOFF
+  mov x16, #93                      // SYS_select
+  svc #0x80
+  // Loud and distinguishable: 416 = 13 * 32 and no stage 13 exists anywhere else
+  // in this file, so `exit status 416+errno` can only mean the yield call itself
+  // failed, with errno in the low bits.
+  b.cs _select_error
+
   cmp x20, #200
   b.lo _parent_poll
+  // Out of patience, not out of ideas: leave through the channel that needs no
+  // console. 384 = 12 * 32 with errno 0, and no stage 12 exists, so a panic
+  // reading `exit status 384` still means "ten seconds passed and the child never
+  // died" -- the same reading round 76 produced, now with the parent provably not
+  // hogging the core.
   mov x23, #384
+  b _exit_now
+
+_select_error:
+  // errno is in x0 and _exit_now only reads x23, so this needs no console at all:
+  // the panic screen is the channel, and round 76 proved that channel works.
+  mov x23, #416
+  add x23, x23, x0
   b _exit_now
 
 _wait_error:
@@ -1115,6 +1168,15 @@ _scratch:
   .quad 0
 _scratch_size:
   .quad 8
+// select's timeout, ready to be copied in. This is a LP64 process, so
+// select_nocancel takes the IS_64BIT_PROCESS branch and copyins a
+// user64_timeval: two 8-byte fields, tv_sec then tv_usec
+// (bsd/kern/sys_generic.c:1141). Both fields are long, so 50 ms is 50000 in
+// the second one, not the 4-byte offset an ILP32 struct would want.
+.balign 8
+_tv:
+  .quad 0
+  .quad 50000
 _console_path:
   .asciz "/dev/console"
 _banner:
