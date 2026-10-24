@@ -380,6 +380,23 @@ dram_size = "0x80000000"
 #     Each rung paints before its call, so a missing band names the call that
 #     did not return. A stall before band 5 leaves no reset: a tablet that stays
 #     on past twenty seconds is itself the reading.
+#   * v0.2.31 takes the v0.2.30 device reading: all sixteen bars were on screen,
+#     including red 5, so every call of the first half of vm_mem_bootstrap
+#     returned and the reset rung was reached. The stall is in the tail of
+#     vm_mem_bootstrap. The five proven calls are retired; band 5 keeps its
+#     meaning as the closing line of the first half, and bands 10-14 move to the
+#     tail:
+#       band 5  red      kmem_init returned
+#       band 10 yellow   kernel_startup_initialize_upto(STARTUP_SUB_KMEM) reached
+#       band 11 blue     vm_fault_init reached
+#       band 12 white    kernel_startup_initialize_upto(STARTUP_SUB_ZALLOC) reached
+#       band 13 orange   the final kprintf reached
+#       band 14 magenta  that kprintf returned - wait 15 s, reset
+#     The two startup calls paint on entry and are told apart by occurrence and
+#     by the w0 loaded right before them (6 = KMEM, 7 = ZALLOC); the final
+#     kprintf paints on entry and again on return. Band 13 without 14 means the
+#     kprintf itself did not return; 14 plus the reset means the whole function
+#     returned and the next stall is after vm_mem_bootstrap.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true

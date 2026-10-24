@@ -90,16 +90,18 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         says _machine_conf returned, 8/7 that
                                         _kernel_bootstrap was entered and its
                                         first printf returned, and 6 that
-                                        vm_mem_bootstrap was called. Bands 10-14
-                                        then mark the calls vm_mem_bootstrap
-                                        makes (vm_page_bootstrap, zone_bootstrap,
-                                        vm_object_bootstrap, vm_map_init,
-                                        kmem_init), and band 5, painted when
-                                        kmem_init returns, is followed by the
-                                        usual timed reset. Read the missing band:
-                                        it names the call that did not return.
-                                        A stall before band 5 leaves no reset, so
-                                        a device that stays on is itself a
+                                        vm_mem_bootstrap was called. Band 5,
+                                        painted when kmem_init returns, closes
+                                        the first half of vm_mem_bootstrap.
+                                        Bands 10-13 then mark the tail calls
+                                        (startup_upto KMEM, vm_fault_init,
+                                        startup_upto ZALLOC, the final kprintf),
+                                        and band 14, painted when that kprintf
+                                        returns, is followed by the usual timed
+                                        reset. Read the missing band: it names
+                                        the call that did not return. A stall
+                                        before band 14 leaves no reset, so a
+                                        device that stays on is itself a
                                         reading.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
@@ -455,26 +457,34 @@ RESET_PAINT_BAND = (15, '0x0000', '0x00FF')
 #    8 orange  _kernel_bootstrap was entered (before its first printf)
 #    7 cyan    that printf returned
 #    6 white   vm_mem_bootstrap was reached
-#   10 yellow  vm_page_bootstrap was reached
-#   11 blue    zone_bootstrap was reached
-#   12 white   vm_object_bootstrap was reached
-#   13 orange  vm_map_init was reached
-#   14 magenta kmem_init was reached
-#    5 red     kmem_init returned; wait a reset_delay and reset
+#    5 red     kmem_init returned: the five calls of the first half all returned
+#   10 yellow  kernel_startup_initialize_upto(STARTUP_SUB_KMEM) was reached
+#   11 blue    vm_fault_init was reached
+#   12 white   kernel_startup_initialize_upto(STARTUP_SUB_ZALLOC) was reached
+#   13 orange  the final kprintf was reached
+#   14 magenta that kprintf returned; wait a reset_delay and reset
 # A missing band is caused by the call immediately before it, because each one
-# paints only after the previous one returned. Bands 10-14 used to carry the
-# arm_init trace; that trace is retired now that arm_init has been cleared, and
-# the post-console trace stays off while the ladder is active.
+# paints only after the previous one returned -- except the two startup calls and
+# vm_fault_init, which paint on entry, so their band proves the call was made and
+# the next band proves it returned. Bands 10-14 used to carry the five calls of
+# the first half; v0.2.30's photo showed all of them returning, so they are
+# retired. The post-console trace stays off while the ladder is active.
 HANDOFF_ENTER_BAND = 15
 HANDOFF_LADDER = (
     {'caller': '_machine_startup', 'callee': '_machine_conf', 'mode': 'after', 'bands': (9,)},
     {'caller': '_kernel_bootstrap', 'callee': '_printf', 'mode': 'around', 'bands': (8, 7)},
     {'caller': '_kernel_bootstrap', 'callee': '_vm_mem_bootstrap', 'mode': 'enter', 'bands': (6,)},
-    {'caller': '_vm_mem_bootstrap', 'callee': '_vm_page_bootstrap', 'mode': 'enter', 'bands': (10,)},
-    {'caller': '_vm_mem_bootstrap', 'callee': '_zone_bootstrap', 'mode': 'enter', 'bands': (11,)},
-    {'caller': '_vm_mem_bootstrap', 'callee': '_vm_object_bootstrap', 'mode': 'enter', 'bands': (12,)},
-    {'caller': '_vm_mem_bootstrap', 'callee': '_vm_map_init', 'mode': 'enter', 'bands': (13,)},
-    {'caller': '_vm_mem_bootstrap', 'callee': '_kmem_init', 'mode': 'around_reset', 'bands': (14, 5)},
+    # The tail of vm_mem_bootstrap. Both startup calls share one callee, so they
+    # are told apart by occurrence and by the argument loaded right before them.
+    {'caller': '_vm_mem_bootstrap', 'callee': '_kmem_init', 'mode': 'after', 'bands': (5,)},
+    {'caller': '_vm_mem_bootstrap', 'callee': '_kernel_startup_initialize_upto', 'mode': 'enter',
+     'bands': (10,), 'occurrence': 1, 'expect': {-4: 0x528000C0}},   # mov w0, #STARTUP_SUB_KMEM
+    {'caller': '_vm_mem_bootstrap', 'callee': '_vm_fault_init', 'mode': 'enter', 'bands': (11,)},
+    {'caller': '_vm_mem_bootstrap', 'callee': '_kernel_startup_initialize_upto', 'mode': 'enter',
+     'bands': (12,), 'occurrence': 2, 'expect': {-4: 0x528000E0}},   # mov w0, #STARTUP_SUB_ZALLOC
+    {'caller': '_vm_mem_bootstrap', 'callee': '_kprintf', 'mode': 'around_reset', 'bands': (13, 14),
+     # The last call of the function: after it the frame is popped and it returns.
+     'expect': {-4: 0x9A891140, 4: 0xA9417BFD}},                     # csel x0,...; ldp x29, x30
 )
 HANDOFF_COLOURS = {
     15: ('0x0000', '0x00FF'),   # red
@@ -1141,7 +1151,12 @@ def main():
     ladder = []
     if handoff:
         for item in HANDOFF_LADDER:
-            site, callee = find_call(data, symbols_by_address, item['caller'], item['callee'], 1)
+            site, callee = find_call(data, symbols_by_address, item['caller'], item['callee'],
+                                     item.get('occurrence', 1))
+            for offset, value in item.get('expect', {}).items():
+                if word(site + offset) != value:
+                    raise SystemExit(f'handoff site {site:#x}{offset:+d} holds {word(site + offset):#010x}, '
+                                     f'expected {value:#010x}: not the call this rung is for')
             if any(site == probe for probe, _, _ in sites) or any(site == probe for probe, _, _ in traces):
                 raise SystemExit(f'handoff site {site:#x} is already a probe site')
             ladder.append((site, callee, item['mode'], item['bands']))
