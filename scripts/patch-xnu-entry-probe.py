@@ -106,6 +106,22 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         kernel text and not bars. There is no
                                         timed reset: a device that sits is
                                         showing its last line.
+  bsd markers (--no-marks off)          with the console attached, print a
+                                        line after each phase call in
+                                        _bsd_init (vfsinit, the pre-autoconf
+                                        init block, kminit, IOKitBSDInit,
+                                        loopattach, ether_family_init,
+                                        net_init_run, vfs_mountroot,
+                                        devfs_kernel_mount). Each cave keeps
+                                        x0-x8 across its printf and then runs
+                                        the displaced call, so the last
+                                        printed marker names the call that
+                                        did not return. These read the same
+                                        panel as the rest of the log, which
+                                        matters because the last ordinary
+                                        line (an NVRAM sync) can come from a
+                                        background kext thread and say
+                                        nothing about the boot thread.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
 DarwinBoot paints (band index = stage). Each patch site is checked against its
@@ -486,6 +502,59 @@ HANDOFF_LADDER = (
      'bands': (6,)},
     {'caller': '_vm_mem_bootstrap', 'callee': '_kmem_init', 'mode': 'after', 'bands': (5,)},
 )
+# Once the text console is attached, the panel itself is the probe. Each of
+# these calls is displaced into a cave that prints one line when the call
+# returns and then continues; the last `[clover]` line names the call that did
+# not return. _kminit and _IOKitBSDInit are the inlined body of bsd_autoconf
+# (Clang inlined it into _bsd_init; the standalone _bsd_autoconf symbol is
+# unreferenced), and the rest are the calls that follow it. Markers are only
+# placed after unconditional calls: the three OSKextLoadKextWithIdentifier
+# sites are guarded by boot-args this board does not pass, so their absence
+# would not mean anything.
+BSD_MARKERS = (
+    {'callee': '_vfsinit', 'message': '[clover] vfsinit returned\\n'},
+    {'callee': '_proc_uuid_policy_init', 'message': '[clover] pre-autoconf inits returned\\n'},
+    {'callee': '_kminit', 'message': '[clover] kminit returned\\n'},
+    {'callee': '_IOKitBSDInit', 'message': '[clover] IOKitBSDInit returned\\n'},
+    {'callee': '_loopattach', 'message': '[clover] loopattach returned\\n'},
+    {'callee': '_ether_family_init', 'message': '[clover] ether_family_init returned\\n'},
+    {'callee': '_net_init_run', 'message': '[clover] net_init_run returned\\n'},
+    {'callee': '_vfs_mountroot', 'message': '[clover] vfs_mountroot returned\\n'},
+    {'callee': '_devfs_kernel_mount', 'message': '[clover] devfs_kernel_mount returned\\n'},
+)
+MARKER_CALLER = '_bsd_init'
+
+# Print a marker after the displaced call returns. printf takes x0 by
+# convention and may use every caller-saved register, so the argument and
+# indirect-result registers of the interrupted code are parked on the stack
+# (x19-x28 are callee-saved and survive printf by contract). The message lives
+# in the same cave right after the branch back, so `adr` reaches it.
+MARKER_CAVE = """
+.text
+.global _start
+_start:
+  stp x0, x1, [sp, #-96]!
+  stp x2, x3, [sp, #16]
+  stp x4, x5, [sp, #32]
+  stp x6, x7, [sp, #48]
+  str x8, [sp, #64]
+  bl callee
+  str x0, [sp, #72]
+  adr x0, message
+  bl printf
+  ldr x0, [sp, #72]
+  ldr x8, [sp, #64]
+  ldp x6, x7, [sp, #48]
+  ldp x4, x5, [sp, #32]
+  ldp x2, x3, [sp, #16]
+  ldp x0, x1, [sp], #96
+  b target
+message:
+  .asciz "{message}"
+  .balign 4
+.ltorg
+"""
+
 HANDOFF_COLOURS = {
     15: ('0x0000', '0x00FF'),   # red
     9: ('0xFF00', '0x0000'),    # green
@@ -1027,6 +1096,8 @@ def main():
                              'calls between the second PE_init_platform and a reset before _machine_startup)')
     parser.add_argument('--no-trace', action='store_true', help='leave out the post-console trace bands')
     parser.add_argument('--panic-screen', action='store_true', help='draw panic() messages on the kernel frame buffer')
+    parser.add_argument('--no-marks', action='store_true',
+                        help='leave out the post-console text markers in _bsd_init')
     parser.add_argument('--no-reset', action='store_true', help='no reset probe at all')
     parser.add_argument('--occurrence', type=int, default=1, help='which call to SYMBOL (1 = first)')
     parser.add_argument('--in', dest='function', default='_arm_init', help='function that makes the call (default _arm_init)')
@@ -1183,6 +1254,23 @@ def main():
                         + ', '.join(f'{item["callee"]} (bands {"-".join(map(str, item["bands"]))})'
                                     for item in HANDOFF_LADDER))
 
+    # Text markers. Only meaningful once the console is attached, which the
+    # handoff ladder does; the panel then shows the last marker printed.
+    marks = []
+    if handoff and not args.no_marks:
+        if '_printf' not in names:
+            raise SystemExit('the kernel has no _printf; cannot place text markers')
+        for item in BSD_MARKERS:
+            if item['callee'] not in names:
+                raise SystemExit(f'{args.kernel} has no {item["callee"]}')
+            site, callee = find_call(data, symbols_by_address, MARKER_CALLER, item['callee'], 1)
+            if any(site == probe for probe, *_ in sites) or \
+                    any(site == probe for probe, _, _ in traces) or \
+                    any(site == probe for probe, *_ in ladder):
+                raise SystemExit(f'marker site {site:#x} is already a probe site')
+            marks.append((site, callee, item['message']))
+        description += ', text markers after ' + ', '.join(item['callee'] for item in BSD_MARKERS)
+
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
             if paint2_source is not None and site == paint2_va:
@@ -1252,11 +1340,34 @@ def main():
             data[file_offset(cave_va):file_offset(cave_va) + len(code)] = code
             ladder_caves.append((site, cave_va))
             next_free = cave_va + size
+        mark_caves = []
+        for site, callee, message in marks:
+            cave_va = zero_slot(data, next_free, CAVE_SIZE, f'marker cave for {callee:#x}')
+            code = assemble(MARKER_CAVE.format(message=message), cave_va,
+                            {'callee': callee, 'target': site + 4, 'printf': names['_printf']},
+                            Path(tmp))
+            if len(code) > CAVE_SIZE:
+                raise SystemExit(f'Marker cave for {callee:#x} is too large ({len(code):#x} bytes)')
+            calls = []
+            for offset in range(0, len(code), 4):
+                value = struct.unpack_from('<I', code, offset)[0]
+                if value >> 26 == 0b100101:
+                    delta = value & 0x3FFFFFF
+                    delta -= (1 << 26) if delta & (1 << 25) else 0
+                    calls.append(cave_va + offset + delta * 4)
+            if calls != [callee, names['_printf']]:
+                raise SystemExit(f'Marker cave at {cave_va:#x} calls {calls}, not exactly '
+                                 f'[{callee:#x}, {names["_printf"]:#x}]')
+            data[file_offset(cave_va):file_offset(cave_va) + len(code)] = code
+            mark_caves.append((site, cave_va))
+            next_free = cave_va + CAVE_SIZE
     for site, stage, _ in sites:
         struct.pack_into('<I', data, file_offset(site), branch(site, caves[stage]))
     for site, cave_va, _ in trace_caves:
         struct.pack_into('<I', data, file_offset(site), branch(site, cave_va))
     for site, cave_va in ladder_caves:
+        struct.pack_into('<I', data, file_offset(site), branch(site, cave_va))
+    for site, cave_va in mark_caves:
         struct.pack_into('<I', data, file_offset(site), branch(site, cave_va))
     if args.panic_screen:
         panic_va = names['_panic']

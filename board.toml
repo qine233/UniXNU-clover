@@ -444,6 +444,30 @@ dram_size = "0x80000000"
 #     text = the text-mode switch did not take. The panic screen keeps only rows
 #     [h/8, h/2), which is why bands 8 and 9 stayed visible under the v0.2.32
 #     panic.
+#   * v0.2.34 takes the v0.2.33 device reading: the text console works. The
+#     panel showed the full boot log (AMFI loaded with the iPad7,1 model name,
+#     Sandbox, CoreAnalyticsHub, dill_init, apfs, AppleImage4) and stopped at an
+#     NVRAM sync failure with no panic:
+#       IONVRAMController.cpp:serverIsAvailable:615 - No _nvramController
+#       IONVRAMController.cpp:sync:894 - serializedVariables failed,
+#       ret=0xe00002bc ... {Event: sync} completed
+#     Those lines can come from a background kext thread, so they do not name
+#     the boot thread's stall; the boot thread may already be waiting for a
+#     root device in vfs_mountroot. The console is attached, so the probe now
+#     speaks the kernel's own language: each unconditional phase call in
+#     _bsd_init is displaced into a cave that preserves x0-x8, runs the call,
+#     prints one `[clover] ... returned` line through printf, restores the
+#     registers and jumps back. The last marker printed names the call that did
+#     not return:
+#       vfsinit, _proc_uuid_policy_init (the first unconditional call after the
+#       boot-arg-guarded kext block), kminit (bsd_autoconf was inlined into
+#       _bsd_init; the standalone symbol has no caller), IOKitBSDInit,
+#       loopattach, ether_family_init, net_init_run, vfs_mountroot,
+#       devfs_kernel_mount.
+#     The three OSKextLoadKextWithIdentifier sites are guarded by boot-args this
+#     board does not pass, so they get no marker. An expected reading with a
+#     root-device wait is the net_init_run marker followed by no vfs_mountroot
+#     marker, and `Still waiting for root device` every 60 s.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
