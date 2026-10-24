@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: EL0 init forks a child"
+title = "clover md0 root: EL0 init reports fork"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -574,6 +574,24 @@ dram_size = "0x80000000"
 #     killed the child, code << 8 = the child's own stage * 32 + errno with
 #     stage 7 as its writes. New failure stages on the parent side: 5 = fork
 #     (160 + errno), 6 = wait4 (192 + errno).
+#     Round 68 read the banner as the last line on the panel and nothing below
+#     it: no child line, no waited line, no panic, no reset. Three stories share
+#     that photo -- fork never returned in the parent, the child was created but
+#     never picked up by the scheduler, or the child ran and hung before its
+#     first write landed. The tty paints per character, so even half a line
+#     would have been evidence, and there was not even that.
+#   * v0.2.39 keeps the kernel, the ADT and the contract alone and splits that
+#     fork point into three marks. The parent prints `[clover] el0 init: forked
+#     pid=<n>` the instant fork returns, before it sleeps in wait4; the child's
+#     first instruction is one write of `[clover] el0 child: alive` and only then
+#     does it ask for its pid and ppid. So: neither line = the parent is inside
+#     fork, which is a kernel problem and nothing to do with the child; forked
+#     without alive = a child that exists but never ran, which points at the
+#     secondary CPU, its pmap, or the scheduler not taking it; a partial alive
+#     = the child ran and its first write blocked or faulted; both lines = two
+#     processes on this silicon, and the waited line decides the rest. The two
+#     lines may interleave byte by byte, since one console tty has no writer
+#     lock; the reading is which strings appear at all, not how they sit.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -583,7 +601,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["e0cce6ec02c38752c277e3902c63304d42b67a2ecab47844cd8833c42ee01474"]
+trust_cache_sha256 = ["c662d13849495396d4bd94ee3c7964ad7646bb9f06b4686c4e945f2a5e8a82ee"]
 kernel_args = [
   "-v",
   "serial=3",

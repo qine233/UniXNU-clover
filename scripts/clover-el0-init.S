@@ -172,6 +172,27 @@ _start:
   // parent sleeps in wait4; exit and wait4 have to reap it again. Everything
   // real userland does later stands on those four, and none of them has been
   // on this silicon yet.
+//
+// Round 68 came back with that banner as the last line on the panel and nothing
+// under it: no child line, no waited line, no panic, no reset. That is three
+// different stories wearing the same photo -- fork never returned in the parent,
+// the child was created but never picked up by the scheduler, or the child ran
+// and hung before its first write landed. The tty paints a character the moment
+// it arrives, so even half a line would have been evidence. Round 69 splits the
+// fork point into three separate marks: the parent prints "forked pid=" the
+// instant fork returns, the child prints one word "alive" as its very first
+// instruction, and the wait4 line stays where it was.
+//
+//   neither line          the parent is inside fork, which is a kernel problem
+//   forked, no alive      the child exists but never ran: the second CPU, its
+//                         pmap, or the scheduler not taking it
+//   forked, half alive    the child ran and its first write faulted or blocked
+//   forked, alive         both processes are on this silicon, and the round's
+//                         answer is the waited line that follows
+//
+// The two new lines can interleave byte by byte, since both processes share one
+// console tty and the tty has no writer lock here. That is fine: the reading is
+// which strings appear at all, not how neatly they sit.
   mov x16, #2
   svc #0x80
   mov x1, #160
@@ -179,7 +200,18 @@ _start:
   cbnz x0, _parent
 
   // Child: the descriptor table is inherited, so x22 is the console here too.
-  // Its whole payload is one line and one exit code; the parent reports both.
+  // The first thing it does is write one word. The console tty paints each
+  // character as it arrives, so this line also distinguishes a child that ran
+  // and blocked mid-write (half a line on the panel) from one that was never
+  // scheduled at all (nothing at all).
+  adrp x1, _alive@PAGE
+  add x1, x1, _alive@PAGEOFF
+  adrp x2, _alive_end@PAGE
+  add x2, x2, _alive_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
   mov x16, #20
   svc #0x80
   mov x1, #32
@@ -233,6 +265,32 @@ _start:
 
 _parent:
   mov x19, x0                       // the child's pid, as fork returned it
+
+  // fork gave the parent a number, so say so before sleeping in wait4. A panel
+  // with this line and no alive line is a child that was never scheduled; a
+  // panel with neither is a parent that never came back from fork itself.
+  adrp x1, _forked@PAGE
+  add x1, x1, _forked@PAGEOFF
+  adrp x2, _forked_end@PAGE
+  add x2, x2, _forked_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #128
+  b.cs _fail
+  mov x0, x19
+  bl _print_dec
+  mov x1, #128
+  b.cs _fail
+
+  adrp x1, _newline@PAGE
+  add x1, x1, _newline@PAGEOFF
+  adrp x2, _newline_end@PAGE
+  add x2, x2, _newline_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #128
+  b.cs _fail
+
   // wait4(-1, &_scratch, 0, 0)                      (SYS_wait4 = 7)
   mov x0, #-1
   adrp x1, _scratch@PAGE
@@ -357,6 +415,12 @@ _middle_end:
 _tail:
   .ascii " pagesize="
 _tail_end:
+_forked:
+  .ascii "[clover] el0 init: forked pid="
+_forked_end:
+_alive:
+  .ascii "[clover] el0 child: alive\n"
+_alive_end:
 _child_banner:
   .ascii "[clover] el0 child: pid="
 _child_banner_end:
