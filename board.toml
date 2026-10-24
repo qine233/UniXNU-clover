@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: CMD13 asks the card whether anyone is still home"
+title = "clover emmc: which RCA is the card awake on"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1015,12 +1015,24 @@ kernel_args = [
   # CORE_DLL_LOCK set, and the last firmware command CMD12 after a multi-block DMA read. Mode 1
   # stays as the control; it still writes nothing.
   #
-  # Mode 2 (this round) is the first write: it clears only the command group of INT_STATUS
-  # (write-1-to-clear), writes ARGUMENT = RCA 1 << 16 and COMMAND = CMD13 with an R1 response
-  # and CRC/index checking, then polls INT_STATUS within a fixed bound. No clock change, no
-  # reset, no bus-width change, no data phase. The report names one of five verdicts and carries
-  # INT_STATUS, both response words, the decoded R1 state and PRESENT_STATE before and after.
-  "clover-emmc=2",
+  # Mode 2 was round88's first write: it cleared only the command group of INT_STATUS
+  # (write-1-to-clear), wrote ARGUMENT = RCA 1 << 16 and COMMAND = CMD13 with an R1 response
+  # and CRC/index checking, then polled INT_STATUS within a fixed bound. No clock change, no
+  # reset, no bus-width change, no data phase. The photograph read back
+  # "CMD13 rca=1 timeout: no rsp": the command went out, the controller waited out its own
+  # timeout, and nothing drove the CMD line -- no CRC and no index error, so the line was not
+  # noisy, it was silent. The command word (0x0d1a) matches Linux sdhci.h's encoding.
+  #
+  # Mode 3 (this round) is the RCA sweep, and it is the same three writes repeated once per
+  # address: 2..15 first, then 0 (0 is not a valid RCA, so it goes last and cannot mask a real
+  # answer). RCA 1 is skipped because round88 already spent a timeout there; EDK2's stack uses
+  # Rca = Slot + 1 = 1, so this firmware's SdccDxe is either a different stack or the card is in
+  # a state that does not answer. CMD13 is read-only in stand-by and transfer, so the sweep
+  # changes nothing on the card. Each attempt is preceded by a bounded wait for CMD_INHIBIT and
+  # followed by a bounded poll twice mode 2's length, so a real card timeout cannot be mistaken
+  # for the loop giving up. The single panic report names the answering RCA and its R1, or says
+  # every address was silent and how many attempts were timeouts, response errors or busy skips.
+  "clover-emmc=3",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

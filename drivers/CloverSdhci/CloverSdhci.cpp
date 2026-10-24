@@ -16,13 +16,17 @@
 // firmware leave it in?** Round87 answered it -- 8-bit bus, 1.8 V, 200 MHz base clock with the
 // divider at 0, the SDCC v5 DLL locked, the last firmware command a CMD12 after a multi-block
 // read. Mode 1, the dump that asked it, stays: it is the control whenever a later reading looks
-// wrong. Mode 2 asks the next question, and it does have to write: whether a command issued from
-// the kernel is answered at all.
+// wrong. Mode 2 asked the next question, and it did have to write: whether a command issued from
+// the kernel is answered at all. Round88 answered it -- CMD13 to RCA 1 came back as the
+// controller's own timeout, with no CRC error and no index error, i.e. nothing drove the CMD
+// line. The command word was right, so the two candidates left are a different RCA and a card
+// that is not in a state which answers. Mode 3 asks which RCA: the same three writes, once per
+// address, and the card can answer at most one of them.
 //
 // Mode 1 therefore issues no commands, sets no clock, touches no reset line, enables no
 // interrupt, and writes nothing anywhere. It maps one 4 KiB window, reads, formats, and panics.
-// Mode 2 writes three registers -- INT_STATUS (write-1-to-clear), ARGUMENT and COMMAND -- for one
-// CMD13 SEND_STATUS and nothing else. No clock change, no reset, no bus-width change, no data.
+// Modes 2 and 3 write three registers -- INT_STATUS (write-1-to-clear), ARGUMENT and COMMAND --
+// for CMD13 SEND_STATUS and nothing else. No clock change, no reset, no bus-width change, no data.
 //
 // WHY IT RUNS FROM sheng_pmgr_run()
 //
@@ -44,15 +48,17 @@
 // WHAT IT DOES NOT CLAIM
 //
 // No block device, no IOMedia, no root volume, and no read of a single byte of user data. The
-// next rounds add those, in this order, one flash each: CMD13 SEND_STATUS (mode 2, no data: it
-// proves the command path and the response registers), then one block with FIFO data (CMD17 at
+// next rounds add those, in this order, one flash each: finish CMD13 SEND_STATUS (mode 3 finds
+// the RCA the firmware left the card at; no data), then one block with FIFO data (CMD17 at
 // LBA 1, whose first five bytes are the GPT magic "EFI PART" -- an answer that checks itself),
 // then whatever the log-in-a-partition plan needs of it.
 //
 // CMD13 is addressed to a relative card address, and the firmware's RCA is not recorded anywhere
-// this port has found. RCA 1 is what the UEFI SD/MMC stack assigns to the first non-removable
-// card, so that is the address this round asks about; a card that does not answer is what a wrong
-// RCA looks like from here, which is why "no response" is a reading and not a failure.
+// this port has found. Round88 asked 1 (the Linux mmc core's fixed choice) and got silence; an
+// eMMC whose RCA does not match simply does not drive the line, which is indistinguishable from
+// a dead card until a different address is tried. The EDK2 eMMC stack, which a UEFI SdccDxe is
+// the most likely ancestor of, uses 2; Qualcomm's own stack could use anything. A sweep of 0..15
+// is read-only on the card and costs one command timeout per silent address.
 //
 // Every path that is not the success path panics, because on this board silence is not a reading.
 // Round87's photograph also settled what the watchdog is worth here: ticks=0 at this scheduling
@@ -341,14 +347,16 @@ static void inspectHost (void)
 // CMD13 SEND_STATUS is the smallest command an eMMC answers: a 48-bit R1 response, no data phase,
 // no card state change. That makes it the one measurement that separates the three things a first
 // write to this controller could break -- the command register path, the response path, and the
-// card's willingness to talk -- from the data path, which round89 will add. The host is left
-// exactly as the firmware configured it (200 MHz, 8-bit, 1.8 V, DLL locked); the only registers
-// written are the three a command requires.
+// card's willingness to talk -- from the data path, which comes after the RCA is known. The host
+// is left exactly as the firmware configured it (200 MHz, 8-bit, 1.8 V, DLL locked); the only
+// registers written are the three a command requires. Round88's photograph read back
+// "timeout: no rsp", so this mode stays as the recorded control for address 1.
 static const uint32_t kProbeRca = 1;
-// The controller's own command timeout is 2^14 TMCLK and this host reports TMCLK = 50 kHz
-// (capabilities bits 5:0 = 0x32, bit 6 = 0: kHz), so roughly a third of a second. The bound has to
-// outlast that, or a real card timeout would be reported as our loop giving up. Interrupts are
-// masked this early, so this loop is the only clock there is: a bound, not a duration.
+// The controller's own command timeout is 2^14 TMCLK. This host's capabilities low byte is 0xb2:
+// bits 5:0 = 0x32 = 50, bit 7 = the unit = MHz (Linux SDHCI_TIMEOUT_CLK_UNIT, sdhci.h), so TMCLK
+// is 50 MHz and the timeout is about 0.33 ms. The bound has to outlast that, or a real card
+// timeout would be reported as our loop giving up. Interrupts are masked this early, so this loop
+// is the only clock there is: a bound, not a duration.
 static const uint32_t kCommandSpinLimit = 1u << 22;
 
 static void cmd13Probe (void)
@@ -445,6 +453,164 @@ static void cmd13Probe (void)
   clover_emmc_stage = 6;
 }
 
+// ------------------------------------------------------------------- mode 3: which RCA
+//
+// Round88 wrote CMD13 to RCA 1 and the controller reported INT_TIMEOUT: the command went out,
+// nothing drove the CMD line back, and no CRC/index error says the line was noisy. For eMMC that
+// is exactly what a non-matching RCA looks like -- the card compares the address and stays quiet.
+// The firmware assigned the RCA during its own identification and leaves no register holding it,
+// so the only way to read it is to ask each address in turn. CMD13 is read-only and legal in
+// stand-by and transfer, so the sweep cannot change the card's state.
+//
+// EDK2's SdMmcPciHcDxe computes `Rca = Slot + 1` (EmmcDevice.c, EmmcIdentification), so slot 0
+// would be 1 -- the address round88 already tried. Either this firmware's SdccDxe is not that
+// stack, or the card is not in a state that answers. The sweep cannot tell those apart on its
+// own, but a hit at any other address settles the RCA question outright; no hit rules out every
+// plausible address at this clock and sends the next round to a full re-identification.
+//
+// Order: 1..15, then 0. 1 goes first so this run also retests round88's address under exactly
+// the same conditions -- its timeout could have been the first command after handoff rather than
+// the address, and one more timeout is cheap. 0 is last because it is not a valid RCA; a card that
+// answered it must not mask a real address earlier in the list. Every attempt clears only the
+// command group of INT_STATUS, and each is preceded by a bounded wait for CMD_INHIBIT to drop,
+// because a timed-out command holds the register for a moment and a second command written into it
+// would be a different experiment.
+//
+// The spin bound is mode 2's: the controller's own command timeout is 2^14 TMCLK at 50 MHz,
+// about 0.33 ms, and 1 << 22 reads is orders of magnitude past that. An attempt that hits the
+// bound without an event is therefore our loop giving up, not the card timing out, and the
+// report keeps those two apart.
+static void cmd13Sweep (void)
+{
+  static const uint8_t kAddresses[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0};
+  uint32_t capabilities = read32 (SDHCI_CAPABILITIES);
+  uint16_t clockControl = read16 (SDHCI_CLOCK_CONTROL);
+  uint32_t presentBefore = read32 (SDHCI_PRESENT_STATE);
+  uint32_t statusBefore = read32 (SDHCI_INT_STATUS);
+  uint32_t response0 = 0, response1 = 0, lastStatus = 0, spins = 0, attempts = 0;
+  uint32_t timeouts = 0, responseErrors = 0, silent = 0, busySkipped = 0;
+  int found = -1;
+
+  clover_emmc_stage = 4;
+  for (unsigned index = 0; index < sizeof (kAddresses); index++) {
+    uint32_t rca = kAddresses[index];
+    uint32_t guard = 0;
+    while (read32 (SDHCI_PRESENT_STATE) & SDHCI_CMD_INHIBIT) {
+      if (++guard >= kCommandSpinLimit) {
+        break;
+      }
+    }
+    if (read32 (SDHCI_PRESENT_STATE) & (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT)) {
+      busySkipped++;
+      continue;
+    }
+    // Only the command group: a stale Command Complete would otherwise be read as this
+    // address's answer, and the data/interrupt groups are not ours to clear.
+    write32 (SDHCI_INT_STATUS, SDHCI_INT_RESPONSE | SDHCI_INT_TIMEOUT | SDHCI_INT_CRC |
+                               SDHCI_INT_END_BIT | SDHCI_INT_INDEX);
+    write32 (SDHCI_ARGUMENT, rca << 16);
+    clover_emmc_stage = 5;
+    write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (13, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                SDHCI_CMD_INDEX));
+    uint32_t status = 0;
+    spins = 0;
+    for (;;) {
+      status = read32 (SDHCI_INT_STATUS);
+      if (status & SDHCI_INT_CMD_MASK) {
+        break;
+      }
+      if (++spins >= kCommandSpinLimit) {
+        break;
+      }
+    }
+    attempts++;
+    lastStatus = status;
+    if ((status & SDHCI_INT_RESPONSE) &&
+        !(status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+      found = static_cast<int> (rca);
+      response0 = read32 (SDHCI_RESPONSE);
+      response1 = read32 (SDHCI_RESPONSE + 4);
+      break;
+    }
+    if (status & SDHCI_INT_TIMEOUT) {
+      timeouts++;
+    } else if (status & (SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX)) {
+      responseErrors++;
+    } else {
+      silent++;
+    }
+  }
+
+  uint32_t presentAfter = read32 (SDHCI_PRESENT_STATE);
+  unsigned baseClock = 0, divider = 0, sdClockHz = 0;
+  clockFacts (capabilities, clockControl, baseClock, divider, sdClockHz);
+
+  gReportLength = 0;
+  clover_emmc_observation[0] = found < 0 ? 0xffffffffULL : static_cast<uint64_t> (found);
+  clover_emmc_observation[1] = response0;
+  clover_emmc_observation[2] = response1;
+  clover_emmc_observation[3] = presentBefore;
+  clover_emmc_observation[4] = presentAfter;
+  clover_emmc_observation[5] = lastStatus;
+  clover_emmc_observation[6] = attempts;
+  clover_emmc_observation[7] = timeouts;
+  clover_emmc_observation[8] = responseErrors;
+  clover_emmc_observation[9] = silent;
+  clover_emmc_observation[10] = busySkipped;
+  clover_emmc_observation[11] = spins;
+
+  emitText ("CMD13 sweep ");
+  if (found >= 0) {
+    emitText ("answered rca=");
+    emitDec (static_cast<uint32_t> (found));
+  } else {
+    emitText ("none: 0..15 silent");
+  }
+  emitText ("\n int last");
+  emitHex (lastStatus, 8);
+  emitText (" before");
+  emitHex (statusBefore, 8);
+  emitText (" tries");
+  emitDec (attempts);
+  emitText (" spins");
+  emitDec (spins);
+  emitText ("\n rsp");
+  emitHex (response0, 8);
+  emitByte (' ');
+  emitHex (response1, 8);
+  emitText ("\n R1");
+  if (found >= 0) {
+    emitText (" state=");
+    emitDec ((response0 >> 9) & 0xf);
+    emitText (" ready=");
+    emitDec ((response0 >> 8) & 1);
+    emitText (" err=");
+    emitHex (response0 & 0xffff, 4);
+  } else {
+    emitText (" none");
+  }
+  emitText ("\n clk");
+  emitHex (baseClock, 3);
+  emitText ("MHz div");
+  emitDec (divider);
+  emitText (" sd");
+  emitDec (sdClockHz / 1000000U);
+  emitText ("MHz\n pst");
+  emitHex (presentBefore, 8);
+  emitText (" -> ");
+  emitHex (presentAfter, 8);
+  emitText ("\n cmd0d1a to");
+  emitDec (timeouts);
+  emitText (" re");
+  emitDec (responseErrors);
+  emitText (" si");
+  emitDec (silent);
+  emitText (" busy");
+  emitDec (busySkipped);
+  emitByte ('\n');
+  clover_emmc_stage = 6;
+}
+
 extern "C" void clover_emmc_run (void)
 {
   unsigned mode = 0;
@@ -454,7 +620,7 @@ extern "C" void clover_emmc_run (void)
   clover_emmc_stage = 1;
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
   // the storage instrument it was asked for.
-  if (mode != 1 && mode != 2) {
+  if (mode != 1 && mode != 2 && mode != 3) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -464,8 +630,10 @@ extern "C" void clover_emmc_run (void)
   }
   if (mode == 1) {
     inspectHost ();
-  } else {
+  } else if (mode == 2) {
     cmd13Probe ();
+  } else {
+    cmd13Sweep ();
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.

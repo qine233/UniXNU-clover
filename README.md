@@ -3207,6 +3207,131 @@ fastboot reboot
 CMD 序列（如果需要重新识别）、Data 通路（`SDHCI_BUFFER` 32-bit 或 ADMA64 表）和
 `IOBlockStorageDevice`。日志分区那件事要等这三样齐了才开始。
 
+### round88 读数（v0.2.60 已发布）：CMD13 发出去了，卡没有回话
+
+照片上的判定行是：
+
+```
+CloverSdhci: CMD13 rca=1 timeout: no rsp
+```
+
+这句话能读成三件事，每一件都排除了别的解释：
+
+- **命令确实发出去了。** 写 `COMMAND` 之前 `PRESENT_STATE` 没有 Command/Data Inhibit，
+  判定不是 `not sent: busy`；随后置位的是控制器自己的超时中断（`INT_STATUS` 的
+  `0x10000`），不是我们轮询到上限的 `no completion`。这颗 host 的命令超时是 `2^14` 个
+  TMCLK；`cap` 低 8 位 `0xb2` 里 5:0 = 50、bit 7 = 1（单位 MHz，Linux 的
+  `SDHCI_TIMEOUT_CLK_UNIT`）⇒ TMCLK = 50 MHz，超时约 **0.33 ms**。
+  「等够了才放弃」是控制器的结论，不是循环的结论。
+- **不是电气噪声。** `INT_CRC` / `INT_END_BIT` / `INT_INDEX` 一个都没置。有响应但采样错，
+  通常先在这三位上出声；`timeout` 只说明 **CMD 线上没有任何一位被驱动**。
+- **命令字没有抄错。** 事后又用 Linux `drivers/mmc/host/sdhci.h` 核了一遍：响应类型
+  1:0 是 00 无响应 / 01 136 位 / 10 48 位 / 11 48 位带 busy，`0x0d1a` = index 13、
+  R1、CRC + index 检查，正是 CMD13 该有的形状。
+
+于是只剩两个嫌疑：
+
+1. **RCA 不是 1。** eMMC 只回答与自己 RCA 相符的 CMD13；地址不对时它按规范保持沉默，
+   从 host 看与「卡不在」完全一样。固件在它自己的识别过程里分配 RCA，而且不把它留在
+   任何这个移植读得到的寄存器里。顺带查了 EDK2 的 `SdMmcPciHcDxe`
+   （`EmmcDevice.c`，`EmmcIdentification`）：`Rca = Slot + 1`，slot 0 就是 1 —— 与这一轮
+   试的地址相同。所以这固件的 `SdccDxe`（二进制、无源码）要么不是那套栈，要么卡已经不在
+   会应答的状态。
+2. **卡不在会应答 CMD13 的状态。** 例如在 handoff 前被复位回 idle、被断电，或者不在
+   stand-by/transfer。round87 留下的最后一条命令是 CMD12（一次多块读的收尾）且
+   `PRESENT_STATE` 无 inhibit，这让「还在 transfer」更像真的，但不能证明。
+
+这两个嫌疑不需要新的硬件状态来区分：同一个时钟、同一套三颗寄存器，把地址换掉再问一遍。
+CMD13 是只读命令，stand-by 与 transfer 都合法，问错地址不会改变卡上任何东西。
+
+### v0.2.61（round89）：把地址问一遍 —— CMD13 扫 RCA
+
+这一轮只问一个问题：**卡是不是在另一个 RCA 上醒着？** 时钟、位宽、电压、DLL 全部保持
+round87 读到的固件状态；仍然只写三颗寄存器（`INT_STATUS` 命令组 W1C、`ARGUMENT`、
+`COMMAND`），仍然不碰 Data，仍然不重置控制器。
+
+| 改动 | 作用 |
+| --- | --- |
+| `drivers/CloverSdhci/CloverSdhci.cpp` | mode 3：对 16 个地址各发一次 CMD13；地址顺序 1..15、最后 0；1 放最前面，同时重测 round88 那一次静默 |
+| `board.toml` | `clover-emmc=3`、菜单标题换成这一轮的问题 |
+| `scripts/verify-clover-payload.py` | `check_sdhci()` 加第五条串 `CMD13 sweep` |
+
+具体形状：
+
+- 每次发命令前先有界地等 `CMD_INHIBIT` 落下 —— 超时的命令会在寄存器里多占一会儿，
+  否则下一颗命令是写给 host 而不是写给卡的；
+- 只清命令组的 W1C，然后 `ARGUMENT = rca << 16`、`COMMAND = 0x0d1a`；
+- 轮询上限沿用 mode 2 的 `1 << 22`。控制器自己的命令超时只有 `2^14 / 50 MHz ≈ 0.33 ms`，
+  这个上限高出几个数量级，足以把「控制器超时」和「我们的循环先放弃」分开；
+- 第一个带 `INT_RESPONSE` 且没有错误位的地址就停；报告 R1 的 state/ready/err；
+- 一个都没有时，报告 `none: 0..15 silent`，并给出 `to`（超时）、`re`（CRC/END/INDEX）、
+  `si`（循环到上限也没事件）、`busy`（根本没发出去）四个计数。
+
+报告仍然是 7 行，第一行二选一：
+
+```
+CMD13 sweep answered rca=2
+CMD13 sweep none: 0..15 silent
+```
+
+产物：这一轮仍然换内核（`7ea53a94…` → `92eb373a…`），根镜像与 trust cache 一字未动；
+卷内副本变成 `9ef324ac…`（代码比 round88 长了约 16 KiB，panic 屏和探针的位置由分配器
+重新落在 `__PLK_TEXT_EXEC` 的零填充里）。
+
+```
+scratch-data.img == signed root            OK
+trustcache == published bundle             OK
+kernel.macho: probe patch localized        OK (5959 bytes in 35 runs, sha256 9ef324ac…)
+kernel.macho: original-PMGR bindings alive OK (5 bindings, 0 moved; provider text present)
+kernel.macho: CloverSdhci linked           OK (五条串全在)
+```
+
+boot-args 自证：卷里的 `unixnu.toml` 是
+`… clover-pmgr=2 clover-emmc=3 armcpu-clock-panic=60000`，557 B / `fb7217b4…`，
+标题 `clover emmc: which RCA is the card awake on`。
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round89-payload.img` | 58720256 B | `2a58ce508b0d34f8b0a46cf4ddabd638d0ce13aa3f78ab2a4f79fe7b7f2be580` |
+| `round89-kernel.macho`（构建产物） | 51863552 B | `92eb373a0a008244985f7f7abd8ee2c14554bd50706a42bcb5b9a211400e3e17` |
+| `round89-in-volume-kernel.macho`（卷内副本，含探针与 panic 屏） | 51863552 B | `9ef324aca1be9e58e56f40146deae30e57ce517468d5399e1731be38cd5ac244` |
+| `round89-in-volume-scratch-data.img`（与 round85–88 相同） | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round89-in-volume-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round89-in-volume-kernel.macho.adt` | 13476 B | `09577650b1439030af5b904ab93fb9bcd2c512e596ec2be1957b0e787b31999e` |
+| `round89-in-volume-unixnu.toml` | 557 B | `fb7217b4855adf02b4ba6514db47655bced69f1c3cc19c9ea06194dee7077bb5` |
+
+固件与 boot 分区仍然一个字节没碰，`round87-boot.img`（`196b284f…`）继续有效。刷机只需
+换 `cache`（永远冷刷）：
+
+```sh
+fastboot flash cache ~/clover-out/round89-payload.img
+fastboot reboot
+```
+
+要让分区状态完全可复现就连 boot 一起刷（先 boot 后 cache）：
+
+```sh
+fastboot flash boot  ~/clover-out/round87-boot.img
+fastboot flash cache ~/clover-out/round89-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `CMD13 sweep answered rca=N`，`R1 state=4`（tran）或 `5`（data），`err=0000` | RCA 就是 N，卡醒着、命令与响应通路都通 | round90：CMD17 读 LBA 1，前五字节应当自己说出 `EFI PART` |
+| `none: 0..15 silent`，`to` 接近 16 | 这块时钟下没有任何常见 RCA 应答 —— 不是「地址差一个」的问题 | round90：降速到 400 kHz，走 CMD0/CMD1/CMD2/CMD3/CMD9 重新识别并把 RCA 定成 1，再发 CMD13 |
+| `none`，但 `re` > 0 | 有东西在线上，只是 CRC/INDEX/END_BIT 不过 —— 200 MHz 下没有做过 tuning，采样相位可疑 | round90：同样先降到 400 kHz；如果低速能答，说明是时序/tuning 而不是卡 |
+| `none`，`si` > 0 | 有几次是我们的循环先到上限，不是控制器超时 | 先看对应 `spins`；若与 `to` 混合，直接进 re-init，不用再纠结局部的循环长度 |
+| `none`，`busy` > 0 | 控制器的 Command/Data Inhibit 没落下来，地址根本没问出去 | 只对命令/数据通路做一次 `SOFTWARE_RESET`，再重跑本模式 |
+| 只有 `CloverSdhci: failed at stage …` | 窗口映射或 mode 参数错 | 2 = mode 不认识、3 = 映射失败、4/5 = 写入路径 |
+| **什么 panic 屏都没有** | 仍然要怀疑那次 `COMMAND`/`ARGUMENT` 写把互联挂住了（`ticks=0`，看门狗不会响） | 与 round88 相同：拆成单颗写、或把窗口改成 device-nGnRnE 再试 |
+
+**这轮之后仍然没有块设备。** 已经有的是一条能读的窗口、一条确定能发出去的命令通路；
+还差一个会应答的地址（或一次重新识别）、Data 通路（`SDHCI_BUFFER` 32-bit 或 ADMA64 表）
+和 `IOBlockStorageDevice`。日志分区那件事要等这三样齐了才开始。
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -3214,8 +3339,10 @@ CMD 序列（如果需要重新识别）、Data 通路（`SDHCI_BUFFER` 32-bit �
   控制台优先的内核，带 `CONFIG_XNU_SOURCE_MOCKFS`，没有
   `CONFIG_XNU_NATIVE_UFS`，`[userdata]` 留在板级文件里。
   `v0.2.58` 起的 `drivers/CloverSdhci` **不是**这块缺口的答案：它先是一份只读的寄存器
-  探测，`v0.2.60` 起才发第一颗命令（CMD13 `SEND_STATUS`），仍然不碰 Data、不发布
-  `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
+  探测，`v0.2.60` 起才发第一颗命令（CMD13 `SEND_STATUS`），`v0.2.61` 起在 15 个 RCA 上
+  逐个问同一颗命令，仍然不碰 Data、不发布
+  `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答」
+  逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，
   再由 mockfs 把它当作整个 `/`，`root-matching` 那条 UUID 匹配表还留在
   `/chosen` 里（`rd=md0` 会在等待循环之前就 `goto iofrootx`，所以它不参与）。
