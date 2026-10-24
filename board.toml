@@ -349,6 +349,20 @@ dram_size = "0x80000000"
 #     the placement loop aligns each run to 16 bytes and requires the aligned
 #     start to still fit, and every emitted bl is decoded and checked against
 #     the callee. All five caves now start on a 16-byte boundary.
+#   * v0.2.29 takes the v0.2.28 device reading: bands 10-14 and the red 15 all
+#     appeared and the tablet reset after fifteen seconds, so the five traced
+#     calls returned and arm_init reached the _machine_startup call site. The
+#     checkpoint no longer stops there: the stage 4 cave paints band 15, calls
+#     _machine_startup and returns to arm_init only if it unexpectedly comes
+#     back, and the reset moves to the end of a handoff ladder inside
+#     kernel_bootstrap:
+#       band 9  _machine_conf returned (first call of _machine_startup)
+#       band 8  _kernel_bootstrap was entered (painted before its first printf)
+#       band 7  that printf returned
+#       band 6  vm_mem_bootstrap was reached - paint, wait 15 s, reset
+#     Every rung paints only after the call before it returned, so the highest
+#     missing band names the call that did not return. Bands 10-14 are kept so
+#     the reading stays comparable with v0.2.28.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true

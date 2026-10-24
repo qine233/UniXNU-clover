@@ -46,6 +46,12 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         Nth call, --occurrence). It replaces
                                         stage 3, so one run asks one question:
                                         did the kernel get past that call?
+                                        With --reset-before and SYMBOL
+                                        _machine_startup the checkpoint stops
+                                        there no longer: band 15 marks the
+                                        handoff and the cave makes the call.
+                                        The reset then moves into the handoff
+                                        ladder (below), inside kernel_bootstrap.
   stage 3 (--paint-after SYMBOL)        paint one bar when the call to SYMBOL is
                                         reached and keep booting, from the seeded
                                         vc_info. The store is guarded by an AT
@@ -76,6 +82,17 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         bands live in the screen's lower half,
                                         which the panic screen does not clear,
                                         so they survive until a photo is taken.
+  handoff ladder                        implied by --reset-before with
+                                        --reset-after _machine_startup. Band 15
+                                        says arm_init reached the handoff; the
+                                        cave then calls _machine_startup. Band 9
+                                        says _machine_conf returned, 8/7 that
+                                        _kernel_bootstrap was entered and its
+                                        first printf returned, and 6 (painted
+                                        where vm_mem_bootstrap is called) is
+                                        followed by the usual timed reset. Read
+                                        the missing band: it names the call that
+                                        did not return.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
 DarwinBoot paints (band index = stage). Each patch site is checked against its
@@ -420,6 +437,32 @@ TRACE_BANDS = ((10, '0xFFFF', '0xFFFF'),
                (14, '0x00FF', '0xFFFF'))
 RESET_PAINT_BAND = (15, '0x0000', '0x00FF')
 
+# Handoff ladder. When the checkpoint resets just before _machine_startup, the
+# boot does not stop there any more: the stage 4 cave paints band 15, runs
+# _machine_startup and returns to arm_init only if it unexpectedly returns.
+# The calls that follow are traced instead, in execution order. Bands, all in
+# the lower half so the panic screen leaves them visible:
+#   15 red    arm_init reached the handoff and called _machine_startup
+#    9 green  _machine_conf returned
+#    8 orange _kernel_bootstrap was entered (before its first printf)
+#    7 cyan   that printf returned
+#    6 white  vm_mem_bootstrap was reached; wait a reset_delay and reset
+# A missing band is caused by the call immediately before it, because each one
+# paints only after the previous one returned.
+HANDOFF_ENTER_BAND = 15
+HANDOFF_LADDER = (
+    {'caller': '_machine_startup', 'callee': '_machine_conf', 'mode': 'after', 'bands': (9,)},
+    {'caller': '_kernel_bootstrap', 'callee': '_printf', 'mode': 'around', 'bands': (8, 7)},
+    {'caller': '_kernel_bootstrap', 'callee': '_vm_mem_bootstrap', 'mode': 'reset', 'bands': (6,)},
+)
+HANDOFF_COLOURS = {
+    15: ('0x0000', '0x00FF'),   # red
+    9: ('0xFF00', '0x0000'),    # green
+    8: ('0x8000', '0xFFFF'),    # orange
+    7: ('0xFFFF', '0xFF00'),    # cyan
+    6: ('0xFFFF', '0xFFFF'),    # white
+}
+
 SOURCES = {
     1: (".text\n.global _start\n_start:\n"
         + paint('x0', '0x00FF', '0xFF00', band=1)
@@ -551,6 +594,37 @@ _start:
   wfe
   b 2b
 """ + ".ltorg\n"
+
+
+def handoff_paint(vinfo, band):
+    """One band of the handoff ladder, through the post-console vc_info."""
+    lo, hi = HANDOFF_COLOURS[band]
+    return PAINT_INFO.format(vinfo=f'{vinfo:#x}UL', band=band, lo=lo, hi=hi)
+
+
+def handoff_source(mode, bands, vinfo, ticks):
+    """Cave that puts band(s) of the handoff ladder around the call at CALLEE.
+
+    after:  call, paint when it returns, continue.
+    around: paint on entry, call, paint again when it returns, continue.
+    reset:  paint, wait TICKS, reset (the end of the measured stretch).
+    """
+    head = '.text\n.global _start\n_start:\n'
+    tail = '  b target\n.ltorg\n'
+    if mode == 'enter':
+        return head + handoff_paint(vinfo, bands[0]) + '  bl callee\n' + tail
+    if mode == 'after':
+        return (head + '  bl callee\n  str x0, [sp, #-16]!\n'
+                + handoff_paint(vinfo, bands[0]) + '  ldr x0, [sp], #16\n' + tail)
+    if mode == 'around':
+        return (head + handoff_paint(vinfo, bands[0]) + '  bl callee\n'
+                + '  str x0, [sp, #-16]!\n' + handoff_paint(vinfo, bands[1])
+                + '  ldr x0, [sp], #16\n' + tail)
+    if mode == 'reset':
+        lo, hi = HANDOFF_COLOURS[bands[0]]
+        return RESET_BEFORE.format(ticks=ticks, vinfo=f'{vinfo:#x}UL',
+                                   band=bands[0], lo=lo, hi=hi)
+    raise SystemExit(f'unknown handoff mode {mode}')
 
 ROOT = Path(__file__).resolve().parents[1]
 SEGMENTS = []   # (vmaddr, vmsize, fileoff, filesize) of the kernel being patched
@@ -769,6 +843,21 @@ def zero_runs(data, va):
 def padding_fits(data, load, size):
     """Whether the zero run that contains load is long enough for size bytes."""
     return any(start <= load and load + size <= start + length for start, length in zero_runs(data, load))
+
+
+def zero_slot(data, cursor, size, what):
+    """An aligned VA at or after CURSOR with SIZE zero bytes inside one run.
+
+    16-byte alignment is what keeps every branch in the cave at the address the
+    cave was assembled for: lld aligns _start up, so an unaligned slot would
+    shift all PC-relative instructions.
+    """
+    start = (cursor + 15) & ~15
+    run = next(((lo, length) for lo, length in zero_runs(data, start)
+                if ((lo + 15) & ~15) + size <= lo + length), None)
+    if run is None:
+        raise SystemExit(f'No {size:#x}-byte padding for the {what} after {start:#x}')
+    return (run[0] + 15) & ~15
 
 
 def entry_body(symbols):
@@ -1002,6 +1091,22 @@ def main():
         description += ', trace after ' + ', '.join(
             f'{name} (band {TRACE_BANDS[index][0]})' for index, (_, _, name) in enumerate(traces))
 
+    # Handoff ladder. With the checkpoint before _machine_startup the stage 4
+    # cave stops resetting: it paints 15 and makes the call, and the reset moves
+    # to the end of the ladder, inside kernel_bootstrap. Each rung paints after
+    # the call before it returned, so the first missing band names the stall.
+    handoff = bool(args.reset_before and args.reset_after == '_machine_startup')
+    ladder = []
+    if handoff:
+        for item in HANDOFF_LADDER:
+            site, callee = find_call(data, symbols_by_address, item['caller'], item['callee'], 1)
+            if any(site == probe for probe, _, _ in sites) or any(site == probe for probe, _, _ in traces):
+                raise SystemExit(f'handoff site {site:#x} is already a probe site')
+            ladder.append((site, callee, item['mode'], item['bands']))
+        description += (f', handoff ladder: band {HANDOFF_ENTER_BAND} enters _machine_startup, then '
+                        + ', '.join(f'{item["callee"]} (bands {"-".join(map(str, item["bands"]))})'
+                                    for item in HANDOFF_LADDER))
+
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
             if paint2_source is not None and site == paint2_va:
@@ -1009,9 +1114,13 @@ def main():
             elif paint_source is not None and site == paint_va:
                 source = paint_source
             elif stage == 4 and args.reset_before:
-                band, lo, hi = RESET_PAINT_BAND
-                source = RESET_BEFORE.format(ticks=TIMEBASE * args.reset_delay,
-                                             vinfo=f'{names["_vinfo"]:#x}UL', band=band, lo=lo, hi=hi)
+                if handoff:
+                    source = handoff_source('enter', (HANDOFF_ENTER_BAND,), names['_vinfo'],
+                                            TIMEBASE * args.reset_delay)
+                else:
+                    band, lo, hi = RESET_PAINT_BAND
+                    source = RESET_BEFORE.format(ticks=TIMEBASE * args.reset_delay,
+                                                 vinfo=f'{names["_vinfo"]:#x}UL', band=band, lo=lo, hi=hi)
             else:
                 source = SOURCES[stage].format(ticks=TIMEBASE * args.reset_delay,
                                                vinfo=f'{names["_vinfo"]:#x}UL')
@@ -1027,16 +1136,9 @@ def main():
         trace_caves = []
         for index, (site, callee, name) in enumerate(traces):
             band, lo, hi = TRACE_BANDS[index]
-            cursor = (next_free + 15) & ~15
-            # A zero run can start at 4 mod 8; lld would then place _start at the
-            # next 8-byte boundary and every branch in the cave would point four
-            # bytes low. Only accept runs that still hold a cave when taken from
-            # an aligned address, and use that address.
-            run = next(((start, length) for start, length in zero_runs(data, cursor)
-                        if ((start + 15) & ~15) + CAVE_SIZE <= start + length), None)
-            if run is None:
-                raise SystemExit(f'No {CAVE_SIZE:#x}-byte padding for the trace cave after {cursor:#x}')
-            cave_va = (run[0] + 15) & ~15
+            # 16-byte aligned: lld aligns .text up, and a cave assembled for an
+            # unaligned address would have every branch shifted by the difference.
+            cave_va = zero_slot(data, next_free, CAVE_SIZE, f'trace cave for {name}')
             source = TRACE_PAINT.format(vinfo=f'{names["_vinfo"]:#x}UL', band=band, lo=lo, hi=hi)
             code = assemble(source, cave_va, {'callee': callee, 'target': site + 4}, Path(tmp))
             if len(code) > CAVE_SIZE:
@@ -1049,9 +1151,34 @@ def main():
             data[file_offset(cave_va):file_offset(cave_va) + len(code)] = code
             trace_caves.append((site, cave_va, name))
             next_free = cave_va + CAVE_SIZE
+        ladder_caves = []
+        for site, callee, mode, bands in ladder:
+            size = 0x200 if mode == 'around' else CAVE_SIZE
+            cave_va = zero_slot(data, next_free, size, f'{mode} cave for {callee:#x}')
+            source = handoff_source(mode, bands, names['_vinfo'], TIMEBASE * args.reset_delay)
+            code = assemble(source, cave_va, {'callee': callee, 'target': site + 4}, Path(tmp))
+            if len(code) > size:
+                raise SystemExit(f'Handoff cave for {callee:#x} is too large ({len(code):#x} bytes)')
+            calls = []
+            for offset in range(0, len(code), 4):
+                value = struct.unpack_from('<I', code, offset)[0]
+                if value >> 26 == 0b100101:
+                    delta = value & 0x3FFFFFF
+                    delta -= (1 << 26) if delta & (1 << 25) else 0
+                    calls.append(cave_va + offset + delta * 4)
+            if mode == 'reset':
+                if calls:
+                    raise SystemExit(f'Reset cave at {cave_va:#x} unexpectedly calls {calls[0]:#x}')
+            elif calls != [callee]:
+                raise SystemExit(f'Handoff cave at {cave_va:#x} calls {calls}, not exactly {callee:#x}')
+            data[file_offset(cave_va):file_offset(cave_va) + len(code)] = code
+            ladder_caves.append((site, cave_va))
+            next_free = cave_va + size
     for site, stage, _ in sites:
         struct.pack_into('<I', data, file_offset(site), branch(site, caves[stage]))
     for site, cave_va, _ in trace_caves:
+        struct.pack_into('<I', data, file_offset(site), branch(site, cave_va))
+    for site, cave_va in ladder_caves:
         struct.pack_into('<I', data, file_offset(site), branch(site, cave_va))
     if args.panic_screen:
         panic_va = names['_panic']
