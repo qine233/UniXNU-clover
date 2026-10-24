@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: allow legacy mach_msg"
+title = "clover md0 root: mach_msg2_trap from EL0"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -667,6 +667,19 @@ dram_size = "0x80000000"
 #     receive, plus a mark before the receive - so `presend` with no `send=` means
 #     the boot-arg did not take effect, and `send=<number>` means mach_msg
 #     itself is now the thing under test.
+#   * v0.2.44 stops treating "the legacy gate is still closed" as a fact. Round 73
+#     re-read the same panel, and every link in that chain checked out against the
+#     shipping binary -- the gate is live code, the args reach the kernel through
+#     PE_boot_args(), the parser path for a trailing token works, the signature
+#     carries no hardened bit -- yet the process still died with status 9. The
+#     cause is therefore recorded as undetermined, and the round asks a different
+#     question: the message now goes out over mach_msg2_trap (table slot 47, eight
+#     packed arguments, MACH64_SEND_MQ_CALL on the send leg), whose dispatch never
+#     calls ipc_policy_allow_legacy_send_trap. Both of msg2's own gates are fatal
+#     guard exceptions rather than errors, so a panel that prints `m2: send=<n>`
+#     has already cleared policy. The legacy call is replayed last, unchanged,
+#     which turns this boot-arg into an independent reading that cannot contaminate
+#     the main one.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -676,7 +689,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["f28765e628305318cb35c0751fdb7e84bcf29b1b2838ae25db948c5f5a7e270e"]
+trust_cache_sha256 = ["37066666713620155505f9d561d9af8c52f5d6025feb56db3c08f39537ef3f24"]
 kernel_args = [
   "-v",
   "serial=3",
@@ -684,25 +697,42 @@ kernel_args = [
   "kt_fixed_zones=120",
   "boot-progress=2",
   "rd=md0",
-  # Round 72 proved the mach traps dispatch and that this task's IPC space hands
-  # out real port names, and then the exec'd copy died with SIGKILL (the parent's
-  # wait4 read status 9) inside its very first mach_msg. The killer is policy, not
-  # the kernel's IPC code: ipc_policy_allow_legacy_send_trap (osfmk/ipc/ipc_policy.c:269)
-  # rejects the legacy mach_msg_trap (index 31) for any task that is neither
-  # hardened nor on a whitelisted platform/SDK with a whitelisted msgh_id, and it
-  # does not merely return an error -- it calls mach_port_guard_exception(...,
-  # kGUARD_EXC_INVALID_OPTIONS), which is below MAX_FATAL_kGUARD_EXC_CODE
-  # (osfmk/mach/port.h:497,526) and therefore fatal regardless of task_exc_guard.
-  # The guard AST then finds no EXC_GUARD port on this kernel and runs
-  # exit_with_guard_exception -> exit_with_reason(p, W_EXITCODE(0, SIGKILL))
-  # (osfmk/ipc/mach_port.c:2510, bsd/kern/kern_exit.c:3581), so the syscall
-  # "returns" KERN_NOT_SUPPORTED and the process is killed before its next
-  # instruction retires. The same function honours this boot-arg when the kernel
-  # is built DEVELOPMENT || DEBUG (TUNABLE(bool, allow_legacy_mach_msg, ...),
-  # ipc_policy.c:65) -- which is what clover_defconfig selects -- and it is the
-  # knob Apple left in for exactly this case. The real fix for a shipping root is
-  # mach_msg2_trap (index 47), whose send leg has no such check; that stays a
-  # later round, one question at a time.
+  # Round 72 died with SIGKILL (parent's wait4 read status 9) inside its first
+  # mach_msg; round 73 bracketed that call with markers and added this boot-arg,
+  # and the panel looked exactly the same: presend, no send=. So the boot-arg did
+  # not open the gate -- and unlike round 72, that claim can no longer be blamed
+  # on the policy being compiled out, because it is now checked against the bytes
+  # that are actually running:
+  #   - out/clover/logs/kernel.log: the kernel is DEVELOPMENT_ARM64_BCM2837, and
+  #     objdump of out/clover/kernel/kernel.macho shows the DEVELOPMENT branch
+  #     inside _ipc_policy_allow_legacy_send_trap reading _allow_legacy_mach_msg
+  #     (adrp 0xfffffff007158000 + ldrb #0x1a8, tbnz bit 0) before it reaches the
+  #     guard call;
+  #   - the args string embedded in the payload really ends with
+  #     allow_legacy_mach_msg=1, and PE_boot_args() (pexpert/arm/pe_bootargs.c:11)
+  #     returns exactly ((boot_args *)PE_state.bootArgs)->CommandLine --
+  #     PE_init_platform (pexpert/arm/pe_init.c:416) takes it from the booter and
+  #     never consults a device-tree chosen/boot-args;
+  #   - the parser handles a name=1 token at the end of the string: the key scan
+  #     stops at '=' so the "no value" shortcut (bootargs.c:126) does not fire,
+  #     getval() consumes the '=' (bootargs.c:416), argnumcpy writes one int8_t
+  #     (bootargs.c:380), and kernel_startup_tunable_init normalises the bool
+  #     (startup.c:291).
+  # Which leaves the death unexplained, and an unexplained death is not evidence.
+  # The probe therefore stops arguing with mach_msg_trap (index 31) and asks the
+  # modern call instead: mach_msg2_trap (index 47) builds its send context out of
+  # the packed registers and never enters ipc_policy_allow_legacy_send_trap, whose
+  # only caller (mach_msg_copyin_user_header, osfmk/ipc/mach_msg.c:611) is reached
+  # solely from mach_msg_overwrite_trap. msg2's own two checks -- exactly one CFI
+  # bit in ipc_preflight_msg_option64 (ipc_policy.c:144) and a destination that
+  # matches it in ipc_validate_kmsg_dest_from_user (ipc_policy.c:686) -- are passed
+  # by sending with MACH64_SEND_MQ_CALL to a reply port.
+  #
+  # The boot-arg stays, as the experiment's control variable: the probe now repeats
+  # the legacy mach_msg *last*, after msg2 has answered, so `legacy: send=<code>`
+  # says the tunable is live and round 73 died of something else, while a panel
+  # ending at `legacy: presend` says the gate is still firing and the tunable is
+  # the thing that did not do what this tree says it does.
   "allow_legacy_mach_msg=1",
 ]
 

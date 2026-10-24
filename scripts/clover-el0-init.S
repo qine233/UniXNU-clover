@@ -76,6 +76,20 @@
 // confirms the probe finished rather than the round merely running out of
 // screen.
 //
+// Round 72 came back with the four port names -- thread, task, host and a reply
+// port made from nothing -- and then silence in the middle of the mach_msg send,
+// with the parent reading status 9. Round 73 added markers on both sides of that
+// send and passed allow_legacy_mach_msg=1 to open the legacy-trap policy gate the
+// source blamed, and the panel was identical: presend, no send=. v0.2.44 therefore
+// stops arguing with that one call and asks the question of the API Apple
+// intends: mach_msg2_trap, index 47, whose send leg never enters the legacy
+// policy at all. Its packed eight-register form is worked out in the probe
+// below, along with the two option checks it does have to pass -- and because
+// failing either of them is the same silent SIGKILL, a panel that shows the
+// return code after it is proof by itself. The legacy call is retried at the
+// very end, after msg2 has answered, so that whichever of the two dies, the
+// other one's reading survives on the screen.
+//
 // Why the console has to be opened by us. Round 65 retired the assumption that
 // fd 1 is a console: this XNU has no open_console() at all, bsd_init hands
 // initproc an empty descriptor table, and the console is just a devfs node --
@@ -300,166 +314,191 @@ _start:
   b.cs _fail
   cbz x25, _mach_done                 // no right: there is nothing to send to
 
-  // One plain message, sent to that port and received back from it. The header
-  // is mach_msg_header_t as this tree defines it for LP64 (osfmk/mach/message.h
-  // :577): bits, size, remote, local, voucher, id -- six fields, 24 bytes.
-  // msgh_bits is MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0) = 20, and
-  // MACH_MSG_TYPE_MAKE_SEND is documented there as "Must hold receive right",
-  // which is exactly what the reply port is.
-  adrp x7, _msgbuf@PAGE
-  add x7, x7, _msgbuf@PAGEOFF
-  mov w8, #20
-  str w8, [x7, #0]                    // msgh_bits
-  mov w8, #24
-  str w8, [x7, #4]                    // msgh_size
-  str w25, [x7, #8]                   // msgh_remote_port
-  str wzr, [x7, #12]                  // msgh_local_port
-  str wzr, [x7, #16]                  // msgh_voucher_port
-  str wzr, [x7, #20]                  // msgh_id
+  // The message buffer lives in x20, not x7, for the whole probe.
+  //
+  // The buffer used to sit in x7 because x7 was not an argument of the legacy
+  // mach_msg trap and the trap had no reason to touch it. mach_msg2_trap takes
+  // eight arguments (/* 47 */ MACH_TRAP(mach_msg2_trap, 8, 16, munge_llllllll),
+  // osfmk/kern/syscall_sw.c:154) and its eighth is the timeout, so x7 is now
+  // live input and the pointer has to move somewhere the trap never reads: x20,
+  // which _write_console (x0/x16/x22) and _print_dec (x27-x29, x9-x11) leave
+  // alone and x19 is already spent on the pid.
+  adrp x20, _msgbuf@PAGE
+  add x20, x20, _msgbuf@PAGEOFF
+  bl _mheader                         // x20 buffer, x25 reply port
 
-  // Round 72 read thread=259 task=515 host=771 and reply=1827 -- the negated
-  // table positions are right and this task's IPC space does answer -- and then
-  // nothing: the send/rcv line never appeared, and the parent's wait4 came back
-  // with status 9, SIGKILL, next to the kernel's own "Failed to send exception
-  // EXC_CORPSE_NOTIFY" (osfmk/kern/task.c:2461, which every EL0 death prints on
-  // this kernel because no exception task exists). That photo had two readings
-  // and no way to tell them apart, because the probe printed once for both
-  // calls: either the send never returned, or the send worked and the receive
-  // killed us. So the message is bracketed the way the fork point was bracketed
-  // in round 69 -- one mark before the kernel is entered, one value right after
-  // it comes back -- and the address of the buffer goes out first.
+  // Round 73 kept every marker and still came back empty-handed: msg=<address>,
+  // presend, and no send= line, with the parent's wait4 at status 9 again. The
+  // boot-arg did not open the gate.
   //
-  // The source in this tree says what the kill was, and it is not about ports.
-  // mach_msg's send leg runs the legacy-trap policy check before it copies in a
-  // single right (osfmk/ipc/mach_msg.c:611):
+  // What v0.2.43 assumed was that ipc_policy_allow_legacy_send_trap() (osfmk/ipc
+  // /ipc_policy.c:269) is what fired, and that allow_legacy_mach_msg=1 would
+  // short-circuit it. Both halves of that story have now been checked against
+  // the bytes that are actually running on this tablet, and both hold up:
   //
-  //   ipc_policy_allow_legacy_send_trap(msgh_id, options)   // osfmk/ipc/ipc_policy.c:269
-  //     if (!(opts & MACH64_POLICY_HARDENED)) {
-  //             if (allow_legacy_mach_msg) return MACH_MSG_SUCCESS;   // DEVELOPMENT
-  //             if (platform whitelist says yes) return MACH_MSG_SUCCESS;
-  //     }
-  //     mach_port_guard_exception(msgid, 0, 0, kGUARD_EXC_INVALID_OPTIONS);
-  //     return KERN_NOT_SUPPORTED;
+  //   - the kernel is DEVELOPMENT_ARM64_BCM2837 (out/clover/logs/kernel.log), and
+  //     objdump of out/clover/kernel/kernel.macho at _ipc_policy_allow_legacy_
+  //     send_trap+0x20 reads the tunable and branches on bit 0:
+  //         tbnz x1, #0x37, <guard>           // MACH64_POLICY_HARDENED, bit 55
+  //         adrp x8, 0xfffffff007158000
+  //         ldrb w8, [x8, #0x1a8]             // _allow_legacy_mach_msg
+  //         tbnz w8, #0x0, <return 0>         // boot-arg branch, compiled in
+  //     so #if DEVELOPMENT || DEBUG is true here and the knob is live code;
+  //   - the argument string in the payload really is
+  //         -v serial=3 debug=0x14e kt_fixed_zones=120 boot-progress=2 rd=md0 \
+  //         allow_legacy_mach_msg=1
+  //     and PE_boot_args() (pexpert/arm/pe_bootargs.c:11) hands back exactly
+  //     ((boot_args *)PE_state.bootArgs)->CommandLine, which is the buffer
+  //     DarwinBoot fills -- not the device tree: PE_init_platform
+  //     (pexpert/arm/pe_init.c:416) sets bootArgs straight from the booter's
+  //     args and never looks for a chosen/boot-args property. rd=md0 arriving as
+  //     "BSD root: md0, major 3, minor 0" is the proof of that channel;
+  //   - the parser handles a trailing token of the form name=1: the name scan
+  //     stops at '=' so c == '=' and the "no value" shortcut at bootargs.c:126
+  //     does not fire, getval() eats the '=' (bootargs.c:416) and returns NUM
+  //     with val=1, argnumcpy writes one int8_t (bootargs.c:380), and
+  //     kernel_startup_tunable_init normalises it to a bool (startup.c:291). The
+  //     token is 21 characters, the same length as the name, which is what the
+  //     strncmp-plus-length test at bootargs.c:105 wants.
   //
-  // So the plain mach_msg_trap (index 31) is policy-rejected for a binary that
-  // is neither hardened nor on a whitelisted platform with a whitelisted msgh_id,
-  // and the rejection is not an error return: kGUARD_EXC_INVALID_OPTIONS = 3 is
-  // below MAX_FATAL_kGUARD_EXC_CODE (mach/port.h:497,526), which makes the guard
-  // fatal regardless of task_exc_guard. thread_guard_violation arms AST_GUARD,
-  // and on the way back to EL0 mach_port_guard_ast (osfmk/ipc/mach_port.c:2510)
-  // finds no EXC_GUARD port, so exit_with_guard_exception runs
-  // exit_with_reason(p, W_EXITCODE(0, SIGKILL), ...) -- status 9 for the parent,
-  // and a corpse. That is a syscall that returned and a process that was then
-  // killed before its next instruction, which is exactly the shape of round 72's
-  // panel: no print after the svc, and x0's KERN_NOT_SUPPORTED never seen.
+  // So the legacy gate should have been open, and the process still died inside
+  // the send. That is a contradiction, and it means the kill's origin is not
+  // established -- so the gate is no longer treated as the answer, and the round
+  // is designed so the panel says which of the two readings is the real one.
   //
-  // The fix is the knob Apple put in the same function for this kernel's build:
-  // TUNABLE(bool, allow_legacy_mach_msg, "allow_legacy_mach_msg", false) is
-  // compiled under DEVELOPMENT || DEBUG, and board.toml now passes it. The
-  // markers stay, because they are what says whether the boot-arg took: presend
-  // with no send= means the policy is still firing; send=<number> means we got
-  // past it and are reading a real mach_msg_return_t.
+  // mach_msg2_trap is the call to make: it is the one Apple intends userspace to
+  // use, and it never walks the legacy path at all. mach_msg_copyin_user_header,
+  // the only caller of ipc_policy_allow_legacy_send_trap, lives inside
+  // #if IPC_HAS_LEGACY_MACH_MSG_TRAP (mach_msg.c:555-617) and is reached only
+  // from mach_msg_overwrite_trap (mach_msg.c:859); mach_msg2_trap synthesizes
+  // its send_uctx straight out of the packed arguments (mach_msg.c:972-1010).
+  //
+  // msg2 has two gates of its own, and both kill silently rather than return,
+  // which is what makes the reading self-proving:
+  //
+  //   - ipc_preflight_msg_option64 (ipc_policy.c:144): with SEND_MSG and
+  //     MACH64_MACH_MSG2, opts & MACH64_MSG_OPTION_CFI_MASK must have exactly
+  //     one bit set (SEND_ANY is masked out on non-macOS builds), and
+  //   - ipc_validate_kmsg_dest_from_user (ipc_policy.c:612): the destination
+  //     must match the CFI bit -- a message queue, which is what a reply port
+  //     is, requires MACH64_SEND_MQ_CALL.
+  //
+  // Each one ends in mach_port_guard_exception(..., kGUARD_EXC_INVALID_OPTIONS),
+  // and 3 < MAX_FATAL_kGUARD_EXC_CODE (mach/port.h:526), so a wrong option word
+  // is the same silent SIGKILL as round 72 and 73. Get the options right and the
+  // trap answers with a mach_msg_return_t instead: which is precisely why a
+  // panel that shows m2send=<number> proves EL0 got past every policy layer, with
+  // no boot-arg and no whitelist involved.
+  //
+  // The packing is struct mach_msg2_trap_args (osfmk/mach/mach_traps.h:465) read
+  // through MACH_MSG2_SHIFT_ARGS(lo, hi) = hi << 32 | lo (message.h:1505), and
+  // mach_msg2_trap's own unpacking (mach_msg.c:937-942, 972-1010, 1020-1045)
+  // fixes which half of each register means what:
+  //
+  //   x0 data (the buffer), x1 options, x2 msgh_bits | send_size << 32,
+  //   x3 msgh_remote_port | msgh_local_port << 32,
+  //   x4 msgh_voucher_port | msgh_id << 32,
+  //   x5 desc_count | rcv_name << 32, x6 rcv_size | priority << 32, x7 timeout.
+  //
+  // Note what that means for the buffer: the header fields of a msg2 send come
+  // from the registers, not from memory. ipc_kmsg_get_and_inflate_from_user
+  // (ipc_kmsg.c:2953) copies the user buffer in from byte 24 onward, so the
+  // first three words written by _mheader below are what the *legacy* call reads
+  // and nothing else. They stay filled anyway, because the receive copies its
+  // result back over them and the legacy test needs to know it is being handed
+  // the header it expects rather than the kernel's leftovers.
   // "[clover] el0 mach: msg=<address>": where the buffer actually is.
   adrp x1, _mach_msg@PAGE
   add x1, x1, _mach_msg@PAGEOFF
   adrp x2, _mach_msg_end@PAGE
   add x2, x2, _mach_msg_end@PAGEOFF
   sub x2, x2, x1
-  bl _write_console
-  mov x1, #224
-  b.cs _fail
-  mov x0, x7
-  bl _print_dec
-  mov x1, #224
-  b.cs _fail
-  adrp x1, _newline@PAGE
-  add x1, x1, _newline@PAGEOFF
-  adrp x2, _newline_end@PAGE
-  add x2, x2, _newline_end@PAGEOFF
-  sub x2, x2, x1
-  bl _write_console
-  mov x1, #224
-  b.cs _fail
-
-  // "[clover] el0 mach: presend" -- printed before the send is issued, so a
-  // panel that has it and lacks "send=" points at the send call itself.
-  adrp x1, _mach_presend@PAGE
-  add x1, x1, _mach_presend@PAGEOFF
-  adrp x2, _mach_presend_end@PAGE
-  add x2, x2, _mach_presend_end@PAGEOFF
-  sub x2, x2, x1
-  bl _write_console
-  mov x1, #224
-  b.cs _fail
-
-  // mach_msg(msg, option, msgt_size, msgo_size, rcv_name, timeout, reserved):
-  // seven arguments, taken from x0..x6 in order by arm_get_mach_syscall_args.
-  // x7 keeps the buffer pointer across the calls; it is not an argument
-  // register, so the trap has no reason to touch it.
-  mov x0, x7
-  mov x1, #1                          // MACH_SEND_MSG
-  mov x2, #24                         // bytes to send: the header
-  mov x3, #0
-  mov x4, #0
-  mov x5, #0
-  mov x6, #0
-  mov x16, #-31
-  svc #0x80
-  mov x20, x0                         // the send's kern_return_t
-
-  // The send returned, so say so before touching the receive: MACH_SEND_*
-  // errors are above 0x10000000 and come out as a number in the 268-million
-  // range, which is unmistakable in decimal.
-  adrp x1, _mach_send@PAGE
-  add x1, x1, _mach_send@PAGEOFF
-  adrp x2, _mach_send_end@PAGE
-  add x2, x2, _mach_send_end@PAGEOFF
-  sub x2, x2, x1
-  bl _write_console
-  mov x1, #224
-  b.cs _fail
+  bl _puts
   mov x0, x20
-  bl _print_dec
-  mov x1, #224
-  b.cs _fail
-  adrp x1, _newline@PAGE
-  add x1, x1, _newline@PAGEOFF
-  adrp x2, _newline_end@PAGE
-  add x2, x2, _newline_end@PAGEOFF
-  sub x2, x2, x1
-  bl _write_console
-  mov x1, #224
-  b.cs _fail
+  bl _print_line
 
-  adrp x1, _mach_prercv@PAGE
-  add x1, x1, _mach_prercv@PAGEOFF
-  adrp x2, _mach_prercv_end@PAGE
-  add x2, x2, _mach_prercv_end@PAGEOFF
+  // ---- the question of this round: mach_msg2_trap, index 47 ----
+  //
+  // "m2 presend" goes out before the kernel is entered, so from here on every
+  // missing line is a kill, and after v0.2.43's analysis a kill can only be a
+  // guard the option word or the destination provoked -- not the legacy gate.
+  adrp x1, _m2_presend@PAGE
+  add x1, x1, _m2_presend@PAGEOFF
+  adrp x2, _m2_presend_end@PAGE
+  add x2, x2, _m2_presend_end@PAGEOFF
   sub x2, x2, x1
-  bl _write_console
-  mov x1, #224
-  b.cs _fail
+  bl _puts
 
-  mov x0, x7
+  mov x0, x20                         // data: the message buffer
+  mov x1, #1                          // MACH_SEND_MSG
+  movk x1, #4, lsl #32                // | MACH64_SEND_MQ_CALL (4 << 32): a reply
+                                      // port is a message queue, and
+                                      // ipc_validate_kmsg_dest_from_user
+                                      // (ipc_policy.c:686) demands the bit match
+  mov x2, #20                         // msgh_bits = MACH_MSGH_BITS(MAKE_SEND, 0)
+  movk x2, #24, lsl #32               // | send_size << 32
+  mov w3, w25                         // msgh_remote_port, and the local half --
+                                      // which is msgh_local_port, i.e. where a
+                                      // reply would go -- stays MACH_PORT_NULL
+  mov x4, #0                          // voucher 0 | msgh_id 0
+  mov x5, #0                          // desc_count 0 | rcv_name 0
+  mov x6, #0                          // rcv_size 0 | priority 0
+  mov x7, #0                          // timeout: nothing to wait for on a send
+  mov x16, #-47
+  svc #0x80
+  mov x21, x0                         // mach_msg_return_t of the send leg
+
+  // If this line appears at all, the option64 survived both preflight
+  // (ipc_policy.c:144: exactly one CFI bit) and the destination check, and what
+  // follows it is a real return code: 0 = the message is queued, 268435459 =
+  // MACH_SEND_INVALID_DEST, 268435475 = MACH_SEND_INVALID_OPTIONS, and anything
+  // in the 268-million range means the trap answered instead of killing us.
+  adrp x1, _m2_send@PAGE
+  add x1, x1, _m2_send@PAGEOFF
+  adrp x2, _m2_send_end@PAGE
+  add x2, x2, _m2_send_end@PAGEOFF
+  sub x2, x2, x1
+  bl _puts
+  mov x0, x21
+  bl _print_line
+
+  adrp x1, _m2_prercv@PAGE
+  add x1, x1, _m2_prercv@PAGEOFF
+  adrp x2, _m2_prercv_end@PAGE
+  add x2, x2, _m2_prercv_end@PAGEOFF
+  sub x2, x2, x1
+  bl _puts
+
+  // A pure receive needs no CFI bit: ipc_preflight_msg_option64 only asks for
+  // one when MACH_SEND_MSG is set (ipc_policy.c:148). rcv_name is the high half
+  // of x5 and rcv_size the low half of x6, per mach_msg2_trap's own unpacking at
+  // mach_msg.c:1021 and :1044.
+  mov x0, x20                         // data: the answer is copied here
   mov x1, #0x102                      // MACH_RCV_MSG | MACH_RCV_TIMEOUT
   mov x2, #0
-  mov x3, #48                         // buffer size, and the header is 24 of it
-  mov x4, x25                         // rcv_name
-  mov x5, #3000                       // ms: a hung receive must not hang the round
-  mov x6, #0
-  mov x16, #-31
+  mov x3, #0
+  mov x4, #0
+  mov w5, w25
+  lsl x5, x5, #32                     // rcv_name = the reply port
+  mov x6, #48                         // rcv_size = the whole buffer, header included
+  mov x7, #3000                       // timeout in ms: a stuck receive must not eat the round
+  mov x16, #-47
   svc #0x80
-  mov x21, x0                         // the receive's kern_return_t
-  ldr w24, [x7, #4]                   // msgh_size as it came back
+  mov x21, x0                         // the receive's mach_msg_return_t
+  ldr w24, [x20, #4]                  // msgh_size as it came back
 
-  adrp x1, _mach_rcv@PAGE
-  add x1, x1, _mach_rcv@PAGEOFF
-  adrp x2, _mach_rcv_end@PAGE
-  add x2, x2, _mach_rcv_end@PAGEOFF
+  // rcv=0 size=24 is the round trip: one message made from nothing, queued to
+  // this task's own port, and pulled back out of it. Anything else in rcv= is
+  // still an answer -- 268451842 = MACH_RCV_INVALID_NAME, 268451843 =
+  // MACH_RCV_TIMED_OUT, 268451844 = MACH_RCV_TOO_LARGE -- and 268451843 would
+  // mean the send queued the message somewhere other than the port we are
+  // reading.
+  adrp x1, _m2_rcv@PAGE
+  add x1, x1, _m2_rcv@PAGEOFF
+  adrp x2, _m2_rcv_end@PAGE
+  add x2, x2, _m2_rcv_end@PAGEOFF
   sub x2, x2, x1
-  bl _write_console
-  mov x1, #224
-  b.cs _fail
+  bl _puts
   mov x0, x21
   bl _print_dec
   mov x1, #224
@@ -469,21 +508,46 @@ _start:
   adrp x2, _mach_size_end@PAGE
   add x2, x2, _mach_size_end@PAGEOFF
   sub x2, x2, x1
-  bl _write_console
-  mov x1, #224
-  b.cs _fail
+  bl _puts
   mov x0, x24
-  bl _print_dec
-  mov x1, #224
-  b.cs _fail
-  adrp x1, _newline@PAGE
-  add x1, x1, _newline@PAGEOFF
-  adrp x2, _newline_end@PAGE
-  add x2, x2, _newline_end@PAGEOFF
+  bl _print_line
+
+  // ---- the second question, asked last because only its death is informative
+  //
+  // The legacy trap, index 31, with the same header and the same destination as
+  // round 73, once the msg2 pair has already been answered. lghsend= with a
+  // number after it means allow_legacy_mach_msg=1 was honored and round 73's
+  // death was something else entirely; lghpresend as the last line on the panel
+  // means the gate is still firing, and then the tunable -- not the policy, not
+  // the table, not the signature -- is the thing that is not doing what this
+  // tree's source says it does.
+  bl _mheader                         // the receive overwrote the buffer
+  adrp x1, _lgh_presend@PAGE
+  add x1, x1, _lgh_presend@PAGEOFF
+  adrp x2, _lgh_presend_end@PAGE
+  add x2, x2, _lgh_presend_end@PAGEOFF
   sub x2, x2, x1
-  bl _write_console
-  mov x1, #224
-  b.cs _fail
+  bl _puts
+
+  mov x0, x20
+  mov x1, #1                          // MACH_SEND_MSG, and nothing else
+  mov x2, #24                         // bytes to send: the header
+  mov x3, #0
+  mov x4, #0
+  mov x5, #0                          // timeout
+  mov x6, #0                          // priority
+  mov x16, #-31
+  svc #0x80
+  mov x21, x0
+
+  adrp x1, _lgh_send@PAGE
+  add x1, x1, _lgh_send@PAGEOFF
+  adrp x2, _lgh_send_end@PAGE
+  add x2, x2, _lgh_send_end@PAGEOFF
+  sub x2, x2, x1
+  bl _puts
+  mov x0, x21
+  bl _print_line
 
 _mach_done:
   // Leave, so the parent's wait4 line confirms the probe ran to the end rather
@@ -876,6 +940,57 @@ _print_dec:
   sub x2, x28, x29
   b _write_console
 
+// x1 = bytes, x2 = length: write them and check the carry in one go, so a line
+// of labels does not have to repeat the two-instruction test after every call.
+_puts:
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  ret
+
+// x0 = value: decimal, then the newline. Two writes, one failure stage, and a
+// return to the line that asked for it -- _print_dec tail-branches into
+// _write_console, so its `ret` lands here rather than one frame deeper.
+_print_line:
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+  adrp x1, _newline@PAGE
+  add x1, x1, _newline@PAGEOFF
+  adrp x2, _newline_end@PAGE
+  add x2, x2, _newline_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  ret
+
+// The 24-byte mach_msg_header_t this round sends, written into the buffer at x20
+// with the reply port at x25 as its destination. Used twice: once before the
+// msg2 pair, so the buffer is a real message even though msg2 takes its header
+// from registers, and once again before the legacy call, because the receive
+// copied the kernel's answer over the first one and the legacy trap reads its
+// header from memory (osfmk/ipc/mach_msg.c:587).
+//
+// msgh_bits is MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0) = 20: making a send
+// right out of nothing requires holding the receive right, and the reply port is
+// exactly that (osfmk/mach/message.h). msgh_local_port stays MACH_PORT_NULL --
+// this message has no reply to receive, the receiver is us, through the same
+// port. msgh_id 0 is deliberate: it is not on the legacy whitelist
+// (ipc_policy.c:257, which admits only task_threads, task_info,
+// thread_get_state, mach_vm_read and mach_vm_read_overwrite), so if the
+// boot-arg really is live the legacy call has one way to say so.
+_mheader:
+  mov w8, #20
+  str w8, [x20, #0]                   // msgh_bits
+  mov w8, #24
+  str w8, [x20, #4]                   // msgh_size
+  str w25, [x20, #8]                  // msgh_remote_port
+  str wzr, [x20, #12]                 // msgh_local_port
+  str wzr, [x20, #16]                 // msgh_voucher_port
+  str wzr, [x20, #20]                 // msgh_id
+  ret
+
 .data
 .balign 8
 _mib:
@@ -940,21 +1055,27 @@ _mach_reply_end:
 _mach_msg:
   .ascii "[clover] el0 mach: msg="
 _mach_msg_end:
-_mach_presend:
-  .ascii "[clover] el0 mach: presend\n"
-_mach_presend_end:
-_mach_send:
-  .ascii "[clover] el0 mach: send="
-_mach_send_end:
-_mach_prercv:
-  .ascii "[clover] el0 mach: prercv\n"
-_mach_prercv_end:
-_mach_rcv:
-  .ascii "[clover] el0 mach: rcv="
-_mach_rcv_end:
+_m2_presend:
+  .ascii "[clover] el0 m2: presend\n"
+_m2_presend_end:
+_m2_send:
+  .ascii "[clover] el0 m2: send="
+_m2_send_end:
+_m2_prercv:
+  .ascii "[clover] el0 m2: prercv\n"
+_m2_prercv_end:
+_m2_rcv:
+  .ascii "[clover] el0 m2: rcv="
+_m2_rcv_end:
 _mach_size:
   .ascii " size="
 _mach_size_end:
+_lgh_presend:
+  .ascii "[clover] el0 legacy: presend\n"
+_lgh_presend_end:
+_lgh_send:
+  .ascii "[clover] el0 legacy: send="
+_lgh_send_end:
 .balign 8
 _argv:
   .space 16                         // { "/sbin/launchd", NULL }, filled in at run time
