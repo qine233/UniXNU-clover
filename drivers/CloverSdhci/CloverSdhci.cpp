@@ -65,6 +65,16 @@
 // the SD spec allows 1..65535. Round89 swept 1..15 and 0 and got silence from all sixteen, so a
 // sweep cannot settle this: mode 4 stops asking and re-identifies the card instead.
 //
+// Mode 4 then proved that both CMD0 probes complete, at the firmware's clock and after writing the
+// SDHCI 10-bit divider -- and that CMD1 still times out. sdhci-msm.c:1766 is the missing fact:
+// this controller has no internal divider ("MSM controller do not use clock divider"), its card
+// clock is the GCC root clock, and the firmware left that root clock at the 200 MHz it used for
+// HS200. 200 MHz is not an identification clock, and div=255 was a number no hardware read. Mode 5
+// changes the clock where the hardware takes it: the SDM660 GCC sdcc1_apps_clk_src
+// (gcc-sdm660.c:747) is programmed to the table's own 400 kHz row (gcc-sdm660.c:735), the host's
+// vendor clock mux is pointed back at the default MCLK (msm_hc_select_default, sdhci-msm.c:779),
+// the host is reset to legacy timing, and CMD0/CMD1/CMD2/CMD3 start over.
+//
 // Every path that is not the success path panics, because on this board silence is not a reading.
 // Round87's photograph also settled what the watchdog is worth here: ticks=0 at this scheduling
 // point. sheng_pmgr_run() runs right after bsd_bufferinit, about ten seconds of boot before
@@ -94,16 +104,19 @@ volatile uint32_t clover_emmc_stage = 0;
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
 static uintptr_t gHost = 0;
+// Mode 5 also needs the SDCC1 clock source, which is in GCC, not in this 4 KiB window.
+static OSSharedPtr<IOMemoryMap> gGccMap;
+static uintptr_t gGcc = 0;
 
-static uintptr_t mapRange (uint64_t phys, uint64_t length)
+static uintptr_t mapRange (OSSharedPtr<IOMemoryMap> &slot, uint64_t phys, uint64_t length)
 {
   IODeviceMemory *memory = IODeviceMemory::withRange (phys, length);
   if (!memory) {
     return 0;
   }
-  gHostMap = OSSharedPtr<IOMemoryMap> (memory->map (kIOMapAnywhere | kIOMapInhibitCache), OSNoRetain);
+  slot = OSSharedPtr<IOMemoryMap> (memory->map (kIOMapAnywhere | kIOMapInhibitCache), OSNoRetain);
   memory->release ();
-  return gHostMap ? static_cast<uintptr_t> (gHostMap->getVirtualAddress ()) : 0;
+  return slot ? static_cast<uintptr_t> (slot->getVirtualAddress ()) : 0;
 }
 
 static uint32_t read32 (unsigned offset)
@@ -710,6 +723,318 @@ static const char *commandVerdict (uint32_t status, bool sent)
   return "ok";
 }
 
+// ------------------------------------------------------------------- mode 5: a real card clock
+//
+// Round90 wrote the SDHCI 10-bit divider and CMD1 still timed out. sdhci-msm.c:1766 says why:
+// this controller does not have an internal divider ("MSM controller do not use clock divider");
+// the card clock is the GCC root clock, and the firmware left that root clock at the 200 MHz it
+// used for HS200. 200 MHz is not an identification clock, so CMD1 never had a chance.
+//
+// 400 kHz is the table's own row for sdcc1_apps_clk_src (gcc-sdm660.c:735): XO 19.2 MHz / 12 *
+// 1/4. clk-rcg.h:10 stores a divider h as 2h-1, so h=12 is 23 (0x17) in CFG[4:0]; the MND fields
+// are M=1, N=~3=0xfc, D=~4=0xfb, with CFG mode bit12 set (clk-rcg2.c:290-333).
+static const uint64_t kGccPhys = 0x116000;   // GCC 0x100000 (clover.dts:4309) + SDCC1 0x16000
+static const uint64_t kGccSize = 0x1000;
+static const unsigned kGccAppsGate = 0x004;  // 0x16004: bit0 enable, bit31 off
+static const unsigned kGccAhbGate = 0x008;   // 0x16008
+static const unsigned kGccAppsCmd = 0x02c;   // 0x1602c: bit0 update, self-clearing
+static const unsigned kGccAppsCfg = 0x030;   // 0x16030: 4:0 divider, 10:8 src, 13:12 mode
+static const unsigned kGccAppsM = 0x034;
+static const unsigned kGccAppsN = 0x038;
+static const unsigned kGccAppsD = 0x03c;
+static const uint32_t kGccGateEnable = 0x00000001u;
+static const uint32_t kGccGateOff = 0x80000000u;
+static const uint32_t kGccCfg400k = 0x00002017u;
+static const uint32_t kGccCfgMask = 0x0010371fu;
+static const uint32_t kGccM = 0x01u, kGccN = 0xfcu, kGccD = 0xfbu;
+static const uint32_t kRcgUpdateLimit = 1u << 16;
+static const uint32_t kCmd1Gap = 1u << 18;
+// Vendor clock mux (sdhci-msm.c:78-85): 10:8 select the MCLK, bit18 enables the HS400-only
+// selector, 21:19 name it. Default is 2, the free-running MCLK.
+static const unsigned kSdhciVendorSpec = 0x20c;
+static const unsigned kSdhciVendorSpec3 = 0x250;
+static const uint32_t kHcMclkSelMask = 3u << 8;
+static const uint32_t kHcMclkSelDefault = 2u << 8;
+static const uint32_t kHcSelectInEn = 1u << 18;
+static const uint32_t kHcSelectInMask = 7u << 19;
+static const uint32_t kPwrSaveDll = 1u << 3;
+
+static uint32_t readGcc32 (unsigned offset)
+{
+  uint32_t value = *reinterpret_cast<volatile uint32_t *> (gGcc + offset);
+  __asm__ volatile ("dsb sy" ::: "memory");
+  return value;
+}
+
+static void writeGcc32 (unsigned offset, uint32_t value)
+{
+  *reinterpret_cast<volatile uint32_t *> (gGcc + offset) = value;
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+// The firmware was clocking this controller, so both gates should already be on; the enable path
+// exists so that a gate lost at handoff is a reading (bit 31 still set) instead of a dead end.
+static bool gateOn (unsigned offset)
+{
+  uint32_t value = readGcc32 (offset);
+  if ((value & kGccGateEnable) && !(value & kGccGateOff)) {
+    return true;
+  }
+  writeGcc32 (offset, value | kGccGateEnable);
+  uint32_t guard = 0;
+  do {
+    value = readGcc32 (offset);
+    if ((value & kGccGateEnable) && !(value & kGccGateOff)) {
+      return true;
+    }
+  } while (++guard < kCommandSpinLimit);
+  return false;
+}
+
+static void coldBringUp (void)
+{
+  clover_emmc_stage = 4;
+  uint32_t gateBefore = readGcc32 (kGccAppsGate);
+  uint32_t ahbBefore = readGcc32 (kGccAhbGate);
+  uint32_t cmdBefore = readGcc32 (kGccAppsCmd);
+  uint32_t cfgBefore = readGcc32 (kGccAppsCfg);
+
+  // Stop the host first, so the root clock changes with no card clock running.
+  bool resetDone = false;
+  write8 (SDHCI_SOFTWARE_RESET, SDHCI_RESET_ALL);
+  uint32_t resetGuard = 0;
+  while (resetGuard++ < kCommandSpinLimit) {
+    if (!(read8 (SDHCI_SOFTWARE_RESET) & SDHCI_RESET_ALL)) {
+      resetDone = true;
+      break;
+    }
+  }
+  clover_emmc_stage = 5;
+
+  // M/N/D first, then CFG, then the self-clearing update bit, the order clk-rcg2.c uses. Linux
+  // allows 500 us for the update; `up=0` below is the reading if this bound expires instead.
+  gateOn (kGccAppsGate);
+  gateOn (kGccAhbGate);
+  writeGcc32 (kGccAppsM, (readGcc32 (kGccAppsM) & ~0xffu) | kGccM);
+  writeGcc32 (kGccAppsN, (readGcc32 (kGccAppsN) & ~0xffu) | kGccN);
+  writeGcc32 (kGccAppsD, (readGcc32 (kGccAppsD) & ~0xffu) | kGccD);
+  uint32_t cfg = readGcc32 (kGccAppsCfg);
+  writeGcc32 (kGccAppsCfg, (cfg & ~kGccCfgMask) | kGccCfg400k);
+  writeGcc32 (kGccAppsCmd, readGcc32 (kGccAppsCmd) | 1u);
+  bool updated = false;
+  uint32_t updateGuard = 0;
+  while (updateGuard++ < kRcgUpdateLimit) {
+    if (!(readGcc32 (kGccAppsCmd) & 1u)) {
+      updated = true;
+      break;
+    }
+  }
+  uint32_t mAfter = readGcc32 (kGccAppsM);
+  uint32_t nAfter = readGcc32 (kGccAppsN);
+  uint32_t dAfter = readGcc32 (kGccAppsD);
+  uint32_t cfgAfter = readGcc32 (kGccAppsCfg);
+  uint32_t gateAfter = readGcc32 (kGccAppsGate);
+
+  // Legacy timing, 1-bit bus, 1.8 V bus power, the longest timeout: EDK2's cold order, including
+  // the power toggle (SdMmcPciHci.c:975) and TIMEOUT_CONTROL = 0x0e (:1191).
+  bool clockStable = false;
+  if (resetDone) {
+    write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
+    write8 (SDHCI_HOST_CONTROL, 0x00);
+    write16 (SDHCI_HOST_CONTROL2, 0x0000);
+    write8 (SDHCI_POWER_CONTROL, SDHCI_POWER_180);
+    for (volatile uint32_t spin = 0; spin < 1000; spin = spin + 1) {
+    }
+    write8 (SDHCI_POWER_CONTROL, SDHCI_POWER_180 | SDHCI_POWER_ON);
+    // No divider: the MSM controller takes its card clock straight from the root clock above.
+    write16 (SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_EN);
+    uint32_t stableGuard = 0;
+    while (stableGuard++ < kCommandSpinLimit) {
+      if (read16 (SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_INT_STABLE) {
+        clockStable = true;
+        break;
+      }
+    }
+  }
+  // With the card clock still off, point the vendor mux at the free-running MCLK, so the first
+  // edge the card sees does not come from the HS200/HS400 DLL path.
+  if (clockStable) {
+    uint32_t vendor = read32 (kSdhciVendorSpec);
+    vendor &= ~kHcMclkSelMask;
+    vendor |= kHcMclkSelDefault;
+    vendor &= ~kHcSelectInEn;
+    vendor &= ~kHcSelectInMask;
+    write32 (kSdhciVendorSpec, vendor);
+    uint32_t vendor3 = read32 (kSdhciVendorSpec3);
+    write32 (kSdhciVendorSpec3, vendor3 & ~kPwrSaveDll);
+    write16 (SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_CARD_EN);
+  }
+  uint16_t clockAfter = read16 (SDHCI_CLOCK_CONTROL);
+  uint8_t powerAfter = read8 (SDHCI_POWER_CONTROL);
+  uint8_t hostControlAfter = read8 (SDHCI_HOST_CONTROL);
+  uint16_t hostControl2After = read16 (SDHCI_HOST_CONTROL2);
+  uint32_t presentAfter = read32 (SDHCI_PRESENT_STATE);
+  uint32_t vendorAfter = read32 (kSdhciVendorSpec);
+  uint32_t vendor3After = read32 (kSdhciVendorSpec3);
+  clover_emmc_stage = 6;
+
+  bool sent0 = false, sent1 = false, sent2 = false, sent3 = false;
+  uint32_t status0 = 0, status1 = 0, status2 = 0, status3 = 0;
+  uint32_t rsp0 = 0, rsp1 = 0, rsp10 = 0, rsp11 = 0, rsp20 = 0, rsp21 = 0, rsp30 = 0, rsp31 = 0;
+  uint32_t spins = 0, spins1 = 0, tries = 0, timeouts = 0;
+  bool ready = false;
+  const char *verdict1 = "skip";
+
+  bool hostReady = resetDone && clockStable && updated;
+  if (hostReady) {
+    status0 = runCommand (SDHCI_MAKE_CMD (0, SDHCI_CMD_RESP_NONE), 0, sent0, rsp0, rsp1, spins);
+  }
+  // CMD1 is retried on the controller's own timeout as well: 0x0e is 2^14 TMCLK = about 0.33 ms,
+  // and a card that has just been reset is allowed to be slower than that. Round90 broke on the
+  // first timeout, which turned "not yet" into "never".
+  if (hostReady) {
+    clover_emmc_stage = 7;
+    for (tries = 1; tries <= kCmd1Retries; tries++) {
+      status1 = runCommand (SDHCI_MAKE_CMD (1, SDHCI_CMD_RESP_SHORT), kEmmcOcr,
+                            sent1, rsp10, rsp11, spins1);
+      if (!sent1) {
+        break;
+      }
+      if (status1 & SDHCI_INT_TIMEOUT) {
+        timeouts++;
+        continue;
+      }
+      if (status1 & (SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX)) {
+        break;
+      }
+      if (!(status1 & SDHCI_INT_RESPONSE)) {
+        break;
+      }
+      if (rsp10 & 0x80000000u) {
+        ready = true;
+        break;
+      }
+      // R3 arrived without bit 31: powered, not ready. EDK2 stalls 10 ms between these polls;
+      // this spin is the substitute, and its length is a bound, not a promise.
+      for (volatile uint32_t spin = 0; spin < kCmd1Gap; spin = spin + 1) {
+      }
+    }
+    verdict1 = commandVerdict (status1, sent1);
+    if (ready) {
+      verdict1 = "ok";
+    } else if (sent1 && (status1 & SDHCI_INT_RESPONSE) &&
+               !(status1 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                            SDHCI_INT_INDEX))) {
+      verdict1 = "no pwr";
+    }
+  }
+
+  bool cmd2Ok = false;
+  if (ready) {
+    status2 = runCommand (SDHCI_MAKE_CMD (2, SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC), 0,
+                          sent2, rsp20, rsp21, spins);
+    cmd2Ok = sent2 && (status2 & SDHCI_INT_RESPONSE) &&
+             !(status2 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                          SDHCI_INT_INDEX));
+  }
+  if (cmd2Ok) {
+    status3 = runCommand (SDHCI_MAKE_CMD (3, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                             SDHCI_CMD_INDEX),
+                          kProbeRca << 16, sent3, rsp30, rsp31, spins);
+  }
+
+  clover_emmc_observation[0] = cfgBefore;
+  clover_emmc_observation[1] = cfgAfter;
+  clover_emmc_observation[2] = cmdBefore;
+  clover_emmc_observation[3] = gateBefore;
+  clover_emmc_observation[4] = ahbBefore;
+  clover_emmc_observation[5] = vendorAfter;
+  clover_emmc_observation[6] = vendor3After;
+  clover_emmc_observation[7] = status0;
+  clover_emmc_observation[8] = status1;
+  clover_emmc_observation[9] = rsp10;
+  clover_emmc_observation[10] = status2;
+  clover_emmc_observation[11] = rsp20;
+  clover_emmc_observation[12] = status3;
+  clover_emmc_observation[13] = rsp30;
+  clover_emmc_observation[14] = (static_cast<uint64_t> (tries) << 16) | timeouts;
+
+  gReportLength = 0;
+  emitText ("gcc0 cmd=");
+  emitHex (cmdBefore, 8);
+  emitText (" cfg=");
+  emitHex (cfgBefore, 8);
+  emitText (" br=");
+  emitHex (gateBefore, 8);
+  emitText (" ahb=");
+  emitHex (ahbBefore, 8);
+
+  emitText ("\ngcc1 cfg=");
+  emitHex (cfgAfter, 8);
+  emitText (" m=");
+  emitHex (mAfter & 0xffu, 2);
+  emitText (" n=");
+  emitHex (nAfter & 0xffu, 2);
+  emitText (" d=");
+  emitHex (dAfter & 0xffu, 2);
+  emitText (" up=");
+  emitDec (updated ? 1 : 0);
+  emitText (" br=");
+  emitHex (gateAfter, 8);
+
+  emitText ("\nsdh rst=");
+  emitDec (resetDone ? 1 : 0);
+  emitText (" clk=");
+  emitHex (clockAfter, 4);
+  emitText (" pw=");
+  emitHex (powerAfter, 2);
+  emitText (" hc=");
+  emitHex (hostControlAfter, 2);
+  emitText (" h2=");
+  emitHex (hostControl2After, 4);
+
+  emitText ("\nvs ");
+  emitHex (vendorAfter, 8);
+  emitText (" vs3 ");
+  emitHex (vendor3After, 8);
+  emitText (" ps ");
+  emitHex (presentAfter, 8);
+
+  emitText ("\ncmd0 ");
+  emitText (hostReady ? commandVerdict (status0, sent0) : "skip");
+  emitText (" int=");
+  emitHex (status0, 8);
+
+  emitText ("\ncmd1 ");
+  emitText (verdict1);
+  emitText (" t=");
+  emitDec (tries);
+  emitText (" to=");
+  emitDec (timeouts);
+  emitText (" rsp=");
+  emitHex (rsp10, 8);
+
+  emitText ("\ncmd2 ");
+  emitText (ready ? commandVerdict (status2, sent2) : "skip");
+  if (ready) {
+    emitText (" rsp=");
+    emitHex (rsp20, 8);
+  }
+
+  emitText ("\ncmd3 ");
+  emitText (cmd2Ok ? commandVerdict (status3, sent3) : "skip");
+  if (cmd2Ok) {
+    emitText (" rca=");
+    emitDec ((rsp30 >> 16) & 0xffffu);
+    emitText (" st=");
+    emitDec ((rsp30 >> 9) & 0xfu);
+    emitText (" rsp=");
+    emitHex (rsp30, 8);
+  }
+  emitByte ('\n');
+  clover_emmc_stage = 8;
+}
+
 static void reidentify (void)
 {
   clover_emmc_stage = 4;
@@ -908,11 +1233,11 @@ extern "C" void clover_emmc_run (void)
   clover_emmc_stage = 1;
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
   // the storage instrument it was asked for.
-  if (mode != 1 && mode != 2 && mode != 3 && mode != 4) {
+  if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
-  gHost = mapRange (kSdhciHostPhys, kSdhciHostSize);
+  gHost = mapRange (gHostMap, kSdhciHostPhys, kSdhciHostSize);
   if (!gHost) {
     emmcFail (3, kSdhciHostPhys);
   }
@@ -922,8 +1247,14 @@ extern "C" void clover_emmc_run (void)
     cmd13Probe ();
   } else if (mode == 3) {
     cmd13Sweep ();
-  } else {
+  } else if (mode == 4) {
     reidentify ();
+  } else {
+    gGcc = mapRange (gGccMap, kGccPhys, kGccSize);
+    if (!gGcc) {
+      emmcFail (4, kGccPhys);
+    }
+    coldBringUp ();
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.

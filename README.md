@@ -3480,6 +3480,126 @@ fastboot reboot
 识别 + RCA=1」；还差 CMD9/CMD7 与 Data 通路（`SDHCI_BUFFER` 32-bit 或 ADMA64 表）和
 `IOBlockStorageDevice`。日志分区那件事要等这三样齐了才开始。
 
+### round90 读数（v0.2.62 已发布）：命令通路活着，但卡收到的从不是 392 kHz
+
+照片上是五行：
+
+```text
+cmd0a ok int=00010000
+clk2 st=0 en=1 div=255 clk=ff05
+cmd0b ok int=00010000
+cmd1 to tries=1 to=1 rsp=00000000
+cmd2 skip
+cmd3 skip
+```
+
+由此确定：
+
+- **两次 CMD0 都完成。** 第一次在固件交出的时钟下，第二次在写进 10 位分频之后，所以
+  SDHCI 的内部时钟与命令移位器都活着；`RESET_CMD`、`ARGUMENT`、`COMMAND` 三条写没有把
+  互联挂住。
+- **CMD0 完成不等于卡收到了时钟。** CMD0 是 `RESP_NONE`，`Command Complete` 由主机自己
+  产生；卡有没有看到这根命令线，CMD0 证明不了。`clk2 st=0`（`INT_STABLE` 为 0）与
+  `clk=ff05` 也在提示：分频字段没有被硬件当真。
+- **CMD1 是第一次静默。** `to=1`、`rsp=0`，没有 CRC、没有 index 错误 —— 命令线上没有
+  噪声，是没人答。round90 的修法是在第一次超时上 `break`，把「还没准备好」当成「永远
+  不会」。
+
+真正的原因是 Linux 的 MSM 驱动自己写下来的：`sdhci-msm.c:1766` 附近，
+`__sdhci_msm_set_clock()` 明说 **“MSM controller do not use clock divider”**，写
+`CLOCK_CONTROL` 时连分频都不放；卡时钟来自 GCC 的根时钟。固件为 HS200 把
+`sdcc1_apps_clk_src` 留在约 200 MHz，`div=255` 只是一个没有硬件读的数。200 MHz 不是
+识别时钟，CMD1 从一开始就没有机会。
+
+### v0.2.63（round91）：把 400 kHz 写进 GCC 根时钟
+
+这一轮不再动 SDHCI 的分频，改在硬件真正取时钟的地方：
+
+1. 映射 GCC 窗口 `0x116000`（`clock-controller@100000`，reg 0x100000 + 0x94000；
+   SDCC1 的 RCG 在 +0x16000）。
+2. 先 `SOFTWARE_RESET = RESET_ALL` 停住主机，再确认并使能两路分支门控
+   `gcc_sdcc1_apps_clk`（0x16004）与 `gcc_sdcc1_ahb_clk`（0x16008）。
+3. 按 `clk-rcg2.c` 的顺序写 M/N/D → CFG → 置 update 位并等它自清。目标是
+   `gcc-sdm660.c:735` 频率表里唯一一行 400 kHz：`F(400000, P_XO, 12, 1, 4)` =
+   XO 19.2 MHz / 12 × 1/4。`clk-rcg.h:10` 把分频 h 存成 `2h-1`，所以 CFG[4:0] =
+   23 = 0x17；MND 是 M=0x01、N=~3=0xfc、D=~4=0xfb，模式位 12 置 1，CFG = 0x2017，
+   mask 0x0010371f。Linux 给 update 500 µs，这里的上界是一个自旋；面板上的 `up=0`
+   就是上界到期。
+4. 主机按 EDK2 的冷启动顺序回到 legacy：`TIMEOUT_CONTROL = 0x0e`、1-bit
+   （`HOST_CONTROL = 0`）、`HOST_CONTROL2 = 0`、`POWER_CONTROL` 先 0x0a 再 0x0b
+   （1.8 V 的开关循环，`SdMmcPciHci.c:975`），然后 `INT_EN` 等 `INT_STABLE`，**不写
+   分频**。
+5. 卡时钟仍关着时，先把 vendor mux（`sdhci-msm.c:78`，0x20c）的 10:8 指回默认的
+   自由运行 MCLK（2）、清掉 HS400 的输入选择（bit18 / 21:19），再清 0x250 的
+   `PWRSAVE_DLL`，最后 `INT_EN | CARD_EN`。
+6. CMD0 → CMD1（最多 200 次，超时不再当作终点；每次之间自旋一段）→ CMD2 → CMD3。
+   CMD1 的 R3 只有 bit31 置位才算 PowerUp 完成；R3 到了但 bit31 为 0，判 `no pwr`。
+
+报告是八行，最长约 58 字符：
+
+```text
+gcc0 cmd=00000000 cfg=0000a007 br=8000000f ahb=0000000f
+gcc1 cfg=00002017 m=01 n=fc d=fb up=1 br=0000000f
+sdh rst=1 clk=0007 pw=0b hc=00 h2=0000
+vs 00000200 vs3 00000000 ps 01ff0000
+cmd0 ok int=00010000
+cmd1 ok t=1 to=0 rsp=c0ff8080
+cmd2 ok rsp=...
+cmd3 ok rca=1 st=2 rsp=...
+```
+
+（这些数值是**格式示意**，不是预测；`cfg`、`br`、`ps` 和三个响应字以实机照片为准。）
+
+构建时撞到一个新错误：clang 把 `volatile uint32_t` 的自增当成
+`-Werror,-Wdeprecated-volatile`，两处延时循环改成 `spin = spin + 1` 才能过。
+
+产物（内核这一轮**变了**，root 与 trust cache 没动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round91-payload.img` | 58720256 B | `5ab7295505d56230391fe07120e995c68545f030422205990bcd352256a2435a` |
+| `round91-kernel.macho`（构建产物） | 51879936 B | `5940ab2173a3756f0b2d01f4b5498265ee3c33d55cb0e8399e7146bd44e98e85` |
+| `round91-in-volume-kernel.macho`（卷内副本，含探针与 panic 屏） | 51879936 B | `a6c94014f24cb03da5904a011abf63f44319888f88014c23746bc461f00f65e7` |
+| `round91-scratch-data.img`（与 round85–90 相同） | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round91-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round91-kernel.macho.adt` | 13476 B | `8e74ea739459d0e156ed0a69fd3f6700cd6d2deb66d921078c7959be84ef5ceb`（`random-seed` 每轮都换，payload 因此每次构建都不同） |
+| `round91-unixnu.toml` | 565 B | `7d077dc01f2daa105b36dd9696466b0e953bdf376edd92167244fb9b2e2916b4` |
+
+校验器读数：探针补丁定位 35 处、5958 字节；PMGR 5 条绑定 0 位移；CloverSdhci
+六条串全在。卷内 boot-args 末尾是
+`… clover-pmgr=2 clover-emmc=5 armcpu-clock-panic=60000`，标题
+`clover emmc: clock at GCC -- 400 kHz, then identify`。固件与 boot 分区不变，
+`round87-boot.img`（`196b284f…`）继续有效：
+
+```sh
+fastboot flash cache ~/clover-out/round91-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `gcc1 … up=0` | RCG 的 update 位没有自清：窗口/偏移认错，或门控没真正打开，卡看到的还是旧时钟 | 回读 0x11602c 与两路门控；按 Linux 的 `clk_rcg2_configure` 逐字段比对 |
+| `gcc1 cfg` 不是 `00002017` | CFG 的 mask 或源选择写歪了 | 只改 CFG 一位一位试，保住 M/N/D 不动 |
+| `sdh rst=0` | `RESET_ALL` 没有自清，主机没停住 | 先查 GCC 是否在复位域里被关掉；必要时先不动时钟只做复位 |
+| `sdh clk` 的 `INT_STABLE` 为 0 | 内部时钟没稳，等于 GCC 没输出 | 门控电平与 RCG 实际频率；这会把问题钉在时钟树上而不是卡上 |
+| `cmd1 ok`（`rsp` bit31=1）+ `cmd2 ok` + `cmd3 ok` | 卡在真正的 400 kHz 上完成了识别，RCA=1 是我们写下去的 | 下一轮：CMD9 读 CSD → CMD7 选中 → CMD16 设块长 → CMD17 读 LBA 1，前五字节应自己说出 `EFI PART` |
+| `cmd1 to`，`to=200` | 换了真识别时钟、重试 200 次仍然静默 | 问题不再是时钟：查供电/复位与 CMD 线，先做完整上电循环再 CMD0/CMD1 |
+| `cmd1 no pwr`，`t=… to=0` | 卡回了 R3 但不置 PowerUp：OCR 电压窗口与这条 1.8 V 轨不匹配，或卡忙 | 打印 R3 全值，按 OCR 的电压位改 `ARGUMENT`，并拉长重试 |
+| `cmd2 crc` / `cmd3 crc` | 命令出去了、响应 CRC 不过：400 kHz 下不像采样相位问题，更像线上完整性 | 检查 1-bit 与上拉；必要时降到约 200 kHz 再试 |
+| 只有 `CloverSdhci: failed at stage 4` | GCC 窗口映射失败 | 窗口地址/大小；2/3/4 分别对应参数、host 窗口、GCC 窗口 |
+| 只有 `failed at stage 5/6/7` | 分别停在 GCC 编程、主机初始化、CMD1 | 用前一行读数定位哪一个等待点 |
+| **什么 panic 屏都没有** | 某次 GCC 写把互联挂住了（`ticks` 不涨，看门狗也不响） | 把门控、MND、CFG、update 拆成四轮单写 |
+
+eMMC 的 R1 有一个容易误读的地方：**bits 31:16 在 eMMC 上是保留位**，所以
+`cmd3 rca=0` 是正常的；判定靠 `ok` 与 `state`，而 `state` 是转换**前**的状态（stand-by=3
+要等下一条命令才出现，CMD3 之后读到的 2 是 identification）。
+
+**这轮之后仍然没有块设备。** 若识别通过，得到的只是「卡在 400 kHz 上活着、RCA=1」；
+还差 CMD9/CMD7/CMD16/CMD17 与 Data 通路（`SDHCI_BUFFER` 32-bit 或 ADMA64 表）和
+`IOBlockStorageDevice`。日志分区要等这三样齐了才开始。
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -3488,7 +3608,8 @@ fastboot reboot
   `CONFIG_XNU_NATIVE_UFS`，`[userdata]` 留在板级文件里。
   `v0.2.58` 起的 `drivers/CloverSdhci` **不是**这块缺口的答案：它先是一份只读的寄存器
   探测，`v0.2.60` 起才发第一颗命令（CMD13 `SEND_STATUS`），`v0.2.61` 起在 15 个 RCA 上
-  逐个问同一颗命令，`v0.2.62` 起改成从 CMD0 重头识别（CMD0/CMD1/CMD2/CMD3，降到 392 kHz），
+  逐个问同一颗命令，`v0.2.62` 起改成从 CMD0 重头识别（CMD0/CMD1/CMD2/CMD3，降低时钟），
+  `v0.2.63` 起把卡时钟改到 GCC 的 `sdcc1_apps_clk_src`（400 kHz）再重做整套识别，
   仍然不碰 Data、不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用

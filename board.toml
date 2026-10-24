@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: start over -- CMD0, CMD1, CMD2, CMD3 at 392 kHz"
+title = "clover emmc: clock at GCC -- 400 kHz, then identify"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1044,7 +1044,35 @@ kernel_args = [
   # the RCA field is reserved, so the state (2 = identification, since the transition lands after
   # the response) and the ok are what decide. No power rail, no bus width and no data phase are
   # touched.
-  "clover-emmc=4",
+  #
+  # Round90's photograph read "cmd0a ok", "cmd0b ok", "cmd1 to tries=1 rsp=0", "cmd2 skip",
+  # "cmd3 skip". Both CMD0s completed -- at the firmware's clock and after writing the 10-bit
+  # divider -- so the SD clock and the command shifter work, and the card saw the line go out and
+  # chose not to answer CMD1. sdhci-msm.c:1766 is the missing fact: this controller has no
+  # internal divider ("MSM controller do not use clock divider"); its card clock is the GCC root
+  # clock, and the firmware had left sdcc1_apps_clk_src at the 200 MHz it used for HS200. The
+  # divider write was a number no hardware read, and 200 MHz is not an identification clock.
+  # clk2=ff05 in the same photograph (INT_STABLE = 0) fits a divider field the hardware ignores.
+  #
+  # Mode 5 (this round) changes the clock where the hardware takes it. It maps GCC at 0x116000
+  # (clock-controller@100000 + the SDCC1 block at 0x16000), stops the host with RESET_ALL, checks
+  # and enables both SDCC1 branch gates, then programs sdcc1_apps_clk_src to the frequency
+  # table's own 400 kHz row (gcc-sdm660.c:735): XO 19.2 MHz / 12 * 1/4, which clk-rcg.h stores
+  # as predivider 23 (0x17), M=1, N=0xfc, D=0xfb, CFG = 0x2017. Linux waits 500 us for the
+  # self-clearing update bit; the bound here is a spin, and "up=0" on the panel means it expired.
+  # Then the host is reset to legacy timing (TIMEOUT_CONTROL 0x0e, 1-bit, 1.8 V power toggle,
+  # EDK2's cold order at SdMmcPciHci.c:975/:1191), the internal clock is made stable with no
+  # divider, and only then is the vendor mux (sdhci-msm.c:78) pointed at the free-running MCLK
+  # before CARD_EN. CMD1 now retries on the controller's own timeout up to 200 times instead of
+  # breaking on the first one, because a freshly reset card may answer later than 0.33 ms. CMD2
+  # and CMD3 follow EDK2's order as before.
+  #
+  # Readings: gcc0/gcc1 lines say whether the gates were already on and whether CFG/M/N/D took;
+  # "sdh rst=1 clk=<INT_STABLE|CARD_EN> pw=<0b> hc=00 h2=0000" says the host came up in legacy
+  # mode; "cmd1 ok ... rsp=40ff8080" with CMD2/CMD3 following is a card that now identifies at
+  # 400 kHz. "cmd1 to ... to=200" means the card is still silent even with a real identification
+  # clock, which moves the question to power/CMD-line wiring rather than to the clock.
+  "clover-emmc=5",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)
