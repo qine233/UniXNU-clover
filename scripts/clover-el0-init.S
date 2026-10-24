@@ -317,6 +317,81 @@ _start:
   str wzr, [x7, #16]                  // msgh_voucher_port
   str wzr, [x7, #20]                  // msgh_id
 
+  // Round 72 read thread=259 task=515 host=771 and reply=1827 -- the negated
+  // table positions are right and this task's IPC space does answer -- and then
+  // nothing: the send/rcv line never appeared, and the parent's wait4 came back
+  // with status 9, SIGKILL, next to the kernel's own "Failed to send exception
+  // EXC_CORPSE_NOTIFY" (osfmk/kern/task.c:2461, which every EL0 death prints on
+  // this kernel because no exception task exists). That photo had two readings
+  // and no way to tell them apart, because the probe printed once for both
+  // calls: either the send never returned, or the send worked and the receive
+  // killed us. So the message is bracketed the way the fork point was bracketed
+  // in round 69 -- one mark before the kernel is entered, one value right after
+  // it comes back -- and the address of the buffer goes out first.
+  //
+  // The source in this tree says what the kill was, and it is not about ports.
+  // mach_msg's send leg runs the legacy-trap policy check before it copies in a
+  // single right (osfmk/ipc/mach_msg.c:611):
+  //
+  //   ipc_policy_allow_legacy_send_trap(msgh_id, options)   // osfmk/ipc/ipc_policy.c:269
+  //     if (!(opts & MACH64_POLICY_HARDENED)) {
+  //             if (allow_legacy_mach_msg) return MACH_MSG_SUCCESS;   // DEVELOPMENT
+  //             if (platform whitelist says yes) return MACH_MSG_SUCCESS;
+  //     }
+  //     mach_port_guard_exception(msgid, 0, 0, kGUARD_EXC_INVALID_OPTIONS);
+  //     return KERN_NOT_SUPPORTED;
+  //
+  // So the plain mach_msg_trap (index 31) is policy-rejected for a binary that
+  // is neither hardened nor on a whitelisted platform with a whitelisted msgh_id,
+  // and the rejection is not an error return: kGUARD_EXC_INVALID_OPTIONS = 3 is
+  // below MAX_FATAL_kGUARD_EXC_CODE (mach/port.h:497,526), which makes the guard
+  // fatal regardless of task_exc_guard. thread_guard_violation arms AST_GUARD,
+  // and on the way back to EL0 mach_port_guard_ast (osfmk/ipc/mach_port.c:2510)
+  // finds no EXC_GUARD port, so exit_with_guard_exception runs
+  // exit_with_reason(p, W_EXITCODE(0, SIGKILL), ...) -- status 9 for the parent,
+  // and a corpse. That is a syscall that returned and a process that was then
+  // killed before its next instruction, which is exactly the shape of round 72's
+  // panel: no print after the svc, and x0's KERN_NOT_SUPPORTED never seen.
+  //
+  // The fix is the knob Apple put in the same function for this kernel's build:
+  // TUNABLE(bool, allow_legacy_mach_msg, "allow_legacy_mach_msg", false) is
+  // compiled under DEVELOPMENT || DEBUG, and board.toml now passes it. The
+  // markers stay, because they are what says whether the boot-arg took: presend
+  // with no send= means the policy is still firing; send=<number> means we got
+  // past it and are reading a real mach_msg_return_t.
+  // "[clover] el0 mach: msg=<address>": where the buffer actually is.
+  adrp x1, _mach_msg@PAGE
+  add x1, x1, _mach_msg@PAGEOFF
+  adrp x2, _mach_msg_end@PAGE
+  add x2, x2, _mach_msg_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  mov x0, x7
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+  adrp x1, _newline@PAGE
+  add x1, x1, _newline@PAGEOFF
+  adrp x2, _newline_end@PAGE
+  add x2, x2, _newline_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+
+  // "[clover] el0 mach: presend" -- printed before the send is issued, so a
+  // panel that has it and lacks "send=" points at the send call itself.
+  adrp x1, _mach_presend@PAGE
+  add x1, x1, _mach_presend@PAGEOFF
+  adrp x2, _mach_presend_end@PAGE
+  add x2, x2, _mach_presend_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+
   // mach_msg(msg, option, msgt_size, msgo_size, rcv_name, timeout, reserved):
   // seven arguments, taken from x0..x6 in order by arm_get_mach_syscall_args.
   // x7 keeps the buffer pointer across the calls; it is not an argument
@@ -332,18 +407,9 @@ _start:
   svc #0x80
   mov x20, x0                         // the send's kern_return_t
 
-  mov x0, x7
-  mov x1, #0x102                      // MACH_RCV_MSG | MACH_RCV_TIMEOUT
-  mov x2, #0
-  mov x3, #48                         // buffer size, and the header is 24 of it
-  mov x4, x25                         // rcv_name
-  mov x5, #3000                       // ms: a hung receive must not hang the round
-  mov x6, #0
-  mov x16, #-31
-  svc #0x80
-  mov x21, x0                         // the receive's kern_return_t
-  ldr w24, [x7, #4]                   // msgh_size as it came back
-
+  // The send returned, so say so before touching the receive: MACH_SEND_*
+  // errors are above 0x10000000 and come out as a number in the 268-million
+  // range, which is unmistakable in decimal.
   adrp x1, _mach_send@PAGE
   add x1, x1, _mach_send@PAGEOFF
   adrp x2, _mach_send_end@PAGE
@@ -356,6 +422,36 @@ _start:
   bl _print_dec
   mov x1, #224
   b.cs _fail
+  adrp x1, _newline@PAGE
+  add x1, x1, _newline@PAGEOFF
+  adrp x2, _newline_end@PAGE
+  add x2, x2, _newline_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+
+  adrp x1, _mach_prercv@PAGE
+  add x1, x1, _mach_prercv@PAGEOFF
+  adrp x2, _mach_prercv_end@PAGE
+  add x2, x2, _mach_prercv_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+
+  mov x0, x7
+  mov x1, #0x102                      // MACH_RCV_MSG | MACH_RCV_TIMEOUT
+  mov x2, #0
+  mov x3, #48                         // buffer size, and the header is 24 of it
+  mov x4, x25                         // rcv_name
+  mov x5, #3000                       // ms: a hung receive must not hang the round
+  mov x6, #0
+  mov x16, #-31
+  svc #0x80
+  mov x21, x0                         // the receive's kern_return_t
+  ldr w24, [x7, #4]                   // msgh_size as it came back
+
   adrp x1, _mach_rcv@PAGE
   add x1, x1, _mach_rcv@PAGEOFF
   adrp x2, _mach_rcv_end@PAGE
@@ -841,11 +937,20 @@ _mach_host_end:
 _mach_reply:
   .ascii "[clover] el0 mach: reply="
 _mach_reply_end:
+_mach_msg:
+  .ascii "[clover] el0 mach: msg="
+_mach_msg_end:
+_mach_presend:
+  .ascii "[clover] el0 mach: presend\n"
+_mach_presend_end:
 _mach_send:
   .ascii "[clover] el0 mach: send="
 _mach_send_end:
+_mach_prercv:
+  .ascii "[clover] el0 mach: prercv\n"
+_mach_prercv_end:
 _mach_rcv:
-  .ascii " rcv="
+  .ascii "[clover] el0 mach: rcv="
 _mach_rcv_end:
 _mach_size:
   .ascii " size="

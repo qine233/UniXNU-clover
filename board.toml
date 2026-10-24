@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: EL0 sends one mach msg"
+title = "clover md0 root: allow legacy mach_msg"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -648,6 +648,25 @@ dram_size = "0x80000000"
 #     ports, one reply port, then sends a 24-byte header to that port and
 #     receives it back with a 3 second timeout, and exits 11 - not a stage code,
 #     so the parent's status of 2816 can only mean the probe finished.
+#   * round 72 read `thread=259 task=515 host=771` and `reply=1827`, so the
+#     negated indices are right and this task's IPC space does allocate ports and
+#     copy them back to user pages. Then nothing: the send/rcv line never printed
+#     and the parent read status 9 = SIGKILL, next to the kernel's
+#     "Failed to send exception EXC_CORPSE_NOTIFY. error code: 5 for pid 2"
+#     (task.c:2461 - every EL0 death prints that here, because no exception task
+#     is registered; 5 is KERN_FAILURE, the corpse notify failing, not the cause).
+#     That photo had two readings and the probe could not separate them, because
+#     it printed once for both calls.
+#   * v0.2.43 separates them and answers the question in the same round, from the
+#     source: the legacy mach_msg_trap is policy-rejected for this binary. See the
+#     kernel_args comment above for the chain (ipc_policy.c:269 -> fatal
+#     kGUARD_EXC_INVALID_OPTIONS -> mach_port.c:2510 -> W_EXITCODE(0, SIGKILL)),
+#     and note the kill lands on the AST on the way back to EL0, so x0's
+#     KERN_NOT_SUPPORTED is never read. The probe now prints the buffer address,
+#     a mark before the send and the send's return value before it issues the
+#     receive, plus a mark before the receive - so `presend` with no `send=` means
+#     the boot-arg did not take effect, and `send=<number>` means mach_msg
+#     itself is now the thing under test.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -657,7 +676,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["ecef35eb97a0720f4c3d8f0a0d9e14f97773e3af9b2a8602e9ae0c4dbf19d571"]
+trust_cache_sha256 = ["f28765e628305318cb35c0751fdb7e84bcf29b1b2838ae25db948c5f5a7e270e"]
 kernel_args = [
   "-v",
   "serial=3",
@@ -665,6 +684,26 @@ kernel_args = [
   "kt_fixed_zones=120",
   "boot-progress=2",
   "rd=md0",
+  # Round 72 proved the mach traps dispatch and that this task's IPC space hands
+  # out real port names, and then the exec'd copy died with SIGKILL (the parent's
+  # wait4 read status 9) inside its very first mach_msg. The killer is policy, not
+  # the kernel's IPC code: ipc_policy_allow_legacy_send_trap (osfmk/ipc/ipc_policy.c:269)
+  # rejects the legacy mach_msg_trap (index 31) for any task that is neither
+  # hardened nor on a whitelisted platform/SDK with a whitelisted msgh_id, and it
+  # does not merely return an error -- it calls mach_port_guard_exception(...,
+  # kGUARD_EXC_INVALID_OPTIONS), which is below MAX_FATAL_kGUARD_EXC_CODE
+  # (osfmk/mach/port.h:497,526) and therefore fatal regardless of task_exc_guard.
+  # The guard AST then finds no EXC_GUARD port on this kernel and runs
+  # exit_with_guard_exception -> exit_with_reason(p, W_EXITCODE(0, SIGKILL))
+  # (osfmk/ipc/mach_port.c:2510, bsd/kern/kern_exit.c:3581), so the syscall
+  # "returns" KERN_NOT_SUPPORTED and the process is killed before its next
+  # instruction retires. The same function honours this boot-arg when the kernel
+  # is built DEVELOPMENT || DEBUG (TUNABLE(bool, allow_legacy_mach_msg, ...),
+  # ipc_policy.c:65) -- which is what clover_defconfig selects -- and it is the
+  # knob Apple left in for exactly this case. The real fix for a shipping root is
+  # mach_msg2_trap (index 47), whose send leg has no such check; that stays a
+  # later round, one question at a time.
+  "allow_legacy_mach_msg=1",
 ]
 
 [payload.adt]
