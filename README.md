@@ -3600,6 +3600,110 @@ eMMC 的 R1 有一个容易误读的地方：**bits 31:16 在 eMMC 上是保留�
 还差 CMD9/CMD7/CMD16/CMD17 与 Data 通路（`SDHCI_BUFFER` 32-bit 或 ADMA64 表）和
 `IOBlockStorageDevice`。日志分区要等这三样齐了才开始。
 
+### round91 读数（v0.2.63 已发布）：GCC 那一半全对，主机那一半没跑
+
+照片上的报告：
+
+```text
+CloverSdhci: gcc0 cmd=00000000 cfg=0000050f br=00004221 ahb=20008001
+gcc1 cfg=00002017 m=01 n=fc d=fb up=1 br=00004221
+sdh rst=0 clk=0003 pw=00 hc=00 h2=0000
+vs 00240a0e vs3 02626440 ps 01f800f0
+cmd0 skip int=00000000
+cmd1 skip t=0 to=0 rsp=00000000
+cmd2 skip
+cmd3 skip
+```
+
+（`ahb=` 在面板上折成两行，完整值是 `20008001`。）
+
+这轮把一个假设切成了两半，两半的答案相反：
+
+- **GCC 那一半完全成功。** `cfg=00002017`、`m=01 n=fc d=fb`、`up=1`，说明
+  `sdcc1_apps_clk_src` 接收了频率表里的 400 kHz 行，update 位也自清了；两路门控
+  `br=00004221` 与 `ahb=20008001` 的 bit0 都是 1、bit31 都是 0。round91 关于
+  「MSM 的卡时钟来自 GCC 根时钟」的推断因此被寄存器证实。
+- **主机那一半一步都没走。** `rst=0`：`RESET_ALL` 在我们轮询的上界内没有自清，
+  于是 `resetDone` 为假，后面的 legacy 初始化与 CMD0–CMD3 全部被跳过。`clk=0003`
+  与 `pw=00` 不是「主机上电后的读数」，而是那次复位写留下的现场。
+- `vs=00240a0e` 里 bit18（`SELECT_IN_EN`）为 1、bits 21:19 = 4，正是固件留下的
+  HS200 DLL 选择；`vs3=02626440` 的 `PWRSAVE_DLL` 已经是 0。
+
+所以 round91 没有回答「400 kHz 够不够」——它回答的是 **GCC 编程正确，而在固件的
+HS200 卡时钟仍在运行时写 `RESET_ALL` 会把主机卡住**。Linux 的 `sdhci_set_clock(0)`
+在关时钟时会先把 vendor mux 指回默认、再停时钟；顺序反了，复位就可能等不到它要的
+条件。
+
+### v0.2.64（round92）：先停卡时钟，绕开 `RESET_ALL`
+
+mode 6 只改主机入口，GCC 那一段原样保留（这轮的报告仍带 `gcc0`/`gcc1`，回归一眼看得见）：
+
+1. 读 `CLOCK_CONTROL`（报告里的 `clk=`）。
+2. 写 `CLOCK_CONTROL = 0`，轮询 `INT_EN` 与 `CARD_EN` 都清零；读回来的值就是 `clr=`。
+   **如果 `clr=` 非零，整段 GCC 编程被跳过**——在活着的卡时钟上改根时钟不是这版驱动
+   敢冒的险。
+3. 只复位命令与数据状态机（`RESET_CMD|RESET_DATA = 0x06`，round90 已经见它自清），
+   不再碰 `RESET_ALL`。`rst=` 是这个掩码的自清结果。
+4. GCC：门控 → M/N/D → CFG=0x2017 → update，和 round91 相同。
+5. 主机仍关着时钟时，先把 vendor mux 的 10:8 指回默认 MCLK 2、清 `SELECT_IN_EN`
+   与 bits 21:19、清 `PWRSAVE_DLL`；然后 `TIMEOUT_CONTROL=0x0e`、1-bit、
+   `HOST_CONTROL2=0`、`POWER_CONTROL` 0x0a→0x0b、`INT_EN` 等 `INT_STABLE`，最后
+   `INT_EN|CARD_EN`。
+6. CMD0 → CMD1（最多 200 次）→ CMD2 → CMD3。
+
+报告变成九行：
+
+```text
+gcc0 cmd=00000000 cfg=0000050f br=00004221 ahb=20008001
+gcc1 cfg=00002017 m=01 n=fc d=fb up=1 br=00004221
+sdh0 clk=0007 rst=1 clr=0000 vs3 02626440
+sdh1 clk=0007 pw=0b hc=00 h2=0000 vs 00240a0e ps 01f800f0
+cmd0 ok int=00010000
+cmd1 ok t=1 to=0 rsp=c0ff8080
+cmd2 ok rsp=...
+cmd3 ok rca=1 st=2 rsp=...
+```
+
+（同样只是格式示意。）
+
+产物（内核又变了，root / trust cache 仍未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round92-payload.img` | 58720256 B | `3d005d526187abcb5375f3998e210ace1fd7c0c1a8f861a739a5226891d6185a` |
+| `round92-kernel.macho`（构建产物） | 51879936 B | `bf388d39293a3fb5d98b6c4d0a006186255bbfb339c3ee6f2ea16394dc83a4b7` |
+| `round92-in-volume-kernel.macho`（卷内副本） | 51879936 B | `b11e4e0169f3e31bbe8d37bcf9672763609e4a27019f25403e394ed41e32bf60` |
+| `round92-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round92-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round92-kernel.macho.adt` | 13476 B | `66d3b4430e42ec268e610121c9e75aaffa268d4c26134513d8c4ee2a55ea8807` |
+| `round92-unixnu.toml` | 562 B | `a92e9b0d72282abcd3b829e376439cceef4e983bfdcf689d4486f97a930c1789` |
+
+校验器：探针 35 处 5959 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在。卷内
+boot-args 末尾是 `… clover-pmgr=2 clover-emmc=6 armcpu-clock-panic=60000`。boot 仍是
+`round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round92-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `clr=0007`（`CARD_EN` 没清掉） | 写 `CLOCK_CONTROL` 无效；代码按设计跳过了 GCC 与全部命令 | 先查为什么卡时钟关不掉：供电/`POWER_CONTROL` 与 vendor DLL 的关系，或改用 vendor 侧停时钟 |
+| `clr=0000`、`rst=0` | 连 `RESET_CMD|RESET_DATA` 都不自清，主机状态机是真的卡住 | 下一轮完全不复位；只停时钟 + 改 GCC + 直接发 CMD0 |
+| `clr=0000 rst=1 up=1`，`sdh1 clk=0007 pw=0b` | 主机真的上电、真的有时钟，legacy 路径成立 | 看 CMD 四行 |
+| `sdh1 clk=0003 pw=0b` | 供电写进去了，但 `CARD_EN` 仍不置位 | 控制器拒绝开卡时钟：怀疑 vendor `SELECT_IN`/DLL 或需要一次完整复位；这是下一轮要切的点 |
+| `cmd0 ok`，`cmd1 ok`（bit31=1），`cmd2/3 ok` | 卡在真正的 400 kHz 上完成识别，RCA=1 | 下一轮 CMD9 → CMD7 → CMD16 → CMD17 读 LBA 1，前五字节应说出 `EFI PART` |
+| `cmd1 to`，`to=200` | 时钟与命令都通了，卡仍静默 | 问题转到供电/复位/CMD 线，不再是时钟 |
+| `cmd1 no pwr` | 卡回了 R3 但不置 PowerUp：OCR 电压窗口或卡忙 | 打印 R3 全值，按 OCR 电压位改 `ARGUMENT` |
+| 只有 `CloverSdhci: failed at stage 4` | GCC 窗口映射失败 | 窗口地址/大小 |
+| **什么 panic 屏都没有** | 某次寄存器写把互联挂住（`ticks` 不涨） | 把停时钟、复位、GCC、上电拆成四轮单写 |
+
+**这轮之后仍然没有块设备。** 若识别通过，还差 CMD9/CMD7/CMD16/CMD17 与 Data 通路
+（`SDHCI_BUFFER` 32-bit 或 ADMA64 表）和 `IOBlockStorageDevice`。
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -3610,6 +3714,7 @@ eMMC 的 R1 有一个容易误读的地方：**bits 31:16 在 eMMC 上是保留�
   探测，`v0.2.60` 起才发第一颗命令（CMD13 `SEND_STATUS`），`v0.2.61` 起在 15 个 RCA 上
   逐个问同一颗命令，`v0.2.62` 起改成从 CMD0 重头识别（CMD0/CMD1/CMD2/CMD3，降低时钟），
   `v0.2.63` 起把卡时钟改到 GCC 的 `sdcc1_apps_clk_src`（400 kHz）再重做整套识别，
+  `v0.2.64` 起先停卡时钟、只复位命令/数据状态机（`RESET_ALL` 会把主机卡住），
   仍然不碰 Data、不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用

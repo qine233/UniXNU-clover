@@ -75,6 +75,15 @@
 // vendor clock mux is pointed back at the default MCLK (msm_hc_select_default, sdhci-msm.c:779),
 // the host is reset to legacy timing, and CMD0/CMD1/CMD2/CMD3 start over.
 //
+// Mode 5's photograph split the result in two: the GCC half worked (cfg=00002017, m=01 n=fc d=fb,
+// up=1 -- the RCG took the 400 kHz row and the update bit self-cleared), but the host half never
+// ran, because RESET_ALL never self-cleared (rst=0) and every command was skipped. It was written
+// while the firmware's HS200 card clock was still running. Mode 6 stops that clock first
+// (CLOCK_CONTROL = 0, the state MSM's set_clock(0) leaves), resets only the command and data
+// machines -- the pair round90 already saw self-clear -- and then does the GCC and legacy host
+// bring-up unchanged. `rst=` and `clr=` in the report are the two readings that separate
+// "the reset bit is the problem" from "the clock will not stop".
+//
 // Every path that is not the success path panics, because on this board silence is not a reading.
 // Round87's photograph also settled what the watchdog is worth here: ticks=0 at this scheduling
 // point. sheng_pmgr_run() runs right after bsd_bufferinit, about ten seconds of boot before
@@ -733,6 +742,12 @@ static const char *commandVerdict (uint32_t status, bool sent)
 // 400 kHz is the table's own row for sdcc1_apps_clk_src (gcc-sdm660.c:735): XO 19.2 MHz / 12 *
 // 1/4. clk-rcg.h:10 stores a divider h as 2h-1, so h=12 is 23 (0x17) in CFG[4:0]; the MND fields
 // are M=1, N=~3=0xfc, D=~4=0xfb, with CFG mode bit12 set (clk-rcg2.c:290-333).
+//
+// Mode 5's photograph proved every one of those GCC writes (cfg=00002017, m=01 n=fc d=fb, up=1)
+// and then stopped at the host: RESET_ALL never self-cleared, so the legacy init and all four
+// commands were skipped. Mode 6 (fullReset=false) leaves GCC alone and changes only the host
+// entry: stop the card clock, reset CMD+DATA, then the same bring-up. Its report keeps the GCC
+// half so a regression there is still visible.
 static const uint64_t kGccPhys = 0x116000;   // GCC 0x100000 (clover.dts:4309) + SDCC1 0x16000
 static const uint64_t kGccSize = 0x1000;
 static const unsigned kGccAppsGate = 0x004;  // 0x16004: bit0 enable, bit31 off
@@ -791,20 +806,39 @@ static bool gateOn (unsigned offset)
   return false;
 }
 
-static void coldBringUp (void)
+static void coldBringUp (bool fullReset)
 {
   clover_emmc_stage = 4;
   uint32_t gateBefore = readGcc32 (kGccAppsGate);
   uint32_t ahbBefore = readGcc32 (kGccAhbGate);
   uint32_t cmdBefore = readGcc32 (kGccAppsCmd);
   uint32_t cfgBefore = readGcc32 (kGccAppsCfg);
+  uint16_t clockBefore = read16 (SDHCI_CLOCK_CONTROL);
 
-  // Stop the host first, so the root clock changes with no card clock running.
+  // Round91 wrote RESET_ALL while the firmware's HS200 card clock was still running, and the bit
+  // never self-cleared. Mode 6 stops the card clock first and then resets only the command and
+  // data machines, which round90 already saw self-clear. `clr=` is the clock read back after the
+  // stop; `rst=` is the reset mask's own self-clear.
+  bool clockStopped = false;
+  uint16_t clockCleared = clockBefore;
+  if (!fullReset) {
+    write16 (SDHCI_CLOCK_CONTROL, 0x0000);
+    uint32_t stopGuard = 0;
+    while (stopGuard++ < kCommandSpinLimit) {
+      clockCleared = read16 (SDHCI_CLOCK_CONTROL);
+      if (!(clockCleared & (SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_CARD_EN))) {
+        clockStopped = true;
+        break;
+      }
+    }
+  }
+
   bool resetDone = false;
-  write8 (SDHCI_SOFTWARE_RESET, SDHCI_RESET_ALL);
+  uint8_t resetMask = fullReset ? SDHCI_RESET_ALL : (SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+  write8 (SDHCI_SOFTWARE_RESET, resetMask);
   uint32_t resetGuard = 0;
   while (resetGuard++ < kCommandSpinLimit) {
-    if (!(read8 (SDHCI_SOFTWARE_RESET) & SDHCI_RESET_ALL)) {
+    if (!(read8 (SDHCI_SOFTWARE_RESET) & resetMask)) {
       resetDone = true;
       break;
     }
@@ -813,35 +847,51 @@ static void coldBringUp (void)
 
   // M/N/D first, then CFG, then the self-clearing update bit, the order clk-rcg2.c uses. Linux
   // allows 500 us for the update; `up=0` below is the reading if this bound expires instead.
-  gateOn (kGccAppsGate);
-  gateOn (kGccAhbGate);
-  writeGcc32 (kGccAppsM, (readGcc32 (kGccAppsM) & ~0xffu) | kGccM);
-  writeGcc32 (kGccAppsN, (readGcc32 (kGccAppsN) & ~0xffu) | kGccN);
-  writeGcc32 (kGccAppsD, (readGcc32 (kGccAppsD) & ~0xffu) | kGccD);
-  uint32_t cfg = readGcc32 (kGccAppsCfg);
-  writeGcc32 (kGccAppsCfg, (cfg & ~kGccCfgMask) | kGccCfg400k);
-  writeGcc32 (kGccAppsCmd, readGcc32 (kGccAppsCmd) | 1u);
+  // The root clock is only touched once the card clock is off: a glitch on a live card clock is
+  // not something this driver gets to risk, so a failed `clr=` also skips this whole block.
   bool updated = false;
-  uint32_t updateGuard = 0;
-  while (updateGuard++ < kRcgUpdateLimit) {
-    if (!(readGcc32 (kGccAppsCmd) & 1u)) {
-      updated = true;
-      break;
+  uint32_t mAfter = 0, nAfter = 0, dAfter = 0;
+  uint32_t cfgAfter = cfgBefore, gateAfter = gateBefore;
+  if (fullReset || clockStopped) {
+    gateOn (kGccAppsGate);
+    gateOn (kGccAhbGate);
+    writeGcc32 (kGccAppsM, (readGcc32 (kGccAppsM) & ~0xffu) | kGccM);
+    writeGcc32 (kGccAppsN, (readGcc32 (kGccAppsN) & ~0xffu) | kGccN);
+    writeGcc32 (kGccAppsD, (readGcc32 (kGccAppsD) & ~0xffu) | kGccD);
+    uint32_t cfg = readGcc32 (kGccAppsCfg);
+    writeGcc32 (kGccAppsCfg, (cfg & ~kGccCfgMask) | kGccCfg400k);
+    writeGcc32 (kGccAppsCmd, readGcc32 (kGccAppsCmd) | 1u);
+    uint32_t updateGuard = 0;
+    while (updateGuard++ < kRcgUpdateLimit) {
+      if (!(readGcc32 (kGccAppsCmd) & 1u)) {
+        updated = true;
+        break;
+      }
     }
+    mAfter = readGcc32 (kGccAppsM);
+    nAfter = readGcc32 (kGccAppsN);
+    dAfter = readGcc32 (kGccAppsD);
+    cfgAfter = readGcc32 (kGccAppsCfg);
+    gateAfter = readGcc32 (kGccAppsGate);
   }
-  uint32_t mAfter = readGcc32 (kGccAppsM);
-  uint32_t nAfter = readGcc32 (kGccAppsN);
-  uint32_t dAfter = readGcc32 (kGccAppsD);
-  uint32_t cfgAfter = readGcc32 (kGccAppsCfg);
-  uint32_t gateAfter = readGcc32 (kGccAppsGate);
 
   // Legacy timing, 1-bit bus, 1.8 V bus power, the longest timeout: EDK2's cold order, including
   // the power toggle (SdMmcPciHci.c:975) and TIMEOUT_CONTROL = 0x0e (:1191).
   bool clockStable = false;
-  if (resetDone) {
+  if (resetDone && (fullReset || clockStopped)) {
     write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
     write8 (SDHCI_HOST_CONTROL, 0x00);
     write16 (SDHCI_HOST_CONTROL2, 0x0000);
+    // The vendor mux sits in the clock path, so it goes back to the free-running MCLK while both
+    // clocks are still off: the first edge the card sees must not come from the HS200 DLL path.
+    uint32_t vendor = read32 (kSdhciVendorSpec);
+    vendor &= ~kHcMclkSelMask;
+    vendor |= kHcMclkSelDefault;
+    vendor &= ~kHcSelectInEn;
+    vendor &= ~kHcSelectInMask;
+    write32 (kSdhciVendorSpec, vendor);
+    uint32_t vendor3 = read32 (kSdhciVendorSpec3);
+    write32 (kSdhciVendorSpec3, vendor3 & ~kPwrSaveDll);
     write8 (SDHCI_POWER_CONTROL, SDHCI_POWER_180);
     for (volatile uint32_t spin = 0; spin < 1000; spin = spin + 1) {
     }
@@ -856,17 +906,7 @@ static void coldBringUp (void)
       }
     }
   }
-  // With the card clock still off, point the vendor mux at the free-running MCLK, so the first
-  // edge the card sees does not come from the HS200/HS400 DLL path.
   if (clockStable) {
-    uint32_t vendor = read32 (kSdhciVendorSpec);
-    vendor &= ~kHcMclkSelMask;
-    vendor |= kHcMclkSelDefault;
-    vendor &= ~kHcSelectInEn;
-    vendor &= ~kHcSelectInMask;
-    write32 (kSdhciVendorSpec, vendor);
-    uint32_t vendor3 = read32 (kSdhciVendorSpec3);
-    write32 (kSdhciVendorSpec3, vendor3 & ~kPwrSaveDll);
     write16 (SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_CARD_EN);
   }
   uint16_t clockAfter = read16 (SDHCI_CLOCK_CONTROL);
@@ -885,7 +925,7 @@ static void coldBringUp (void)
   bool ready = false;
   const char *verdict1 = "skip";
 
-  bool hostReady = resetDone && clockStable && updated;
+  bool hostReady = resetDone && (fullReset || clockStopped) && clockStable && updated;
   if (hostReady) {
     status0 = runCommand (SDHCI_MAKE_CMD (0, SDHCI_CMD_RESP_NONE), 0, sent0, rsp0, rsp1, spins);
   }
@@ -958,6 +998,8 @@ static void coldBringUp (void)
   clover_emmc_observation[12] = status3;
   clover_emmc_observation[13] = rsp30;
   clover_emmc_observation[14] = (static_cast<uint64_t> (tries) << 16) | timeouts;
+  clover_emmc_observation[15] = (static_cast<uint64_t> (clockBefore) << 32) |
+                                (static_cast<uint64_t> (clockCleared) << 16) | clockAfter;
 
   gReportLength = 0;
   emitText ("gcc0 cmd=");
@@ -982,9 +1024,16 @@ static void coldBringUp (void)
   emitText (" br=");
   emitHex (gateAfter, 8);
 
-  emitText ("\nsdh rst=");
+  emitText ("\nsdh0 clk=");
+  emitHex (clockBefore, 4);
+  emitText (" rst=");
   emitDec (resetDone ? 1 : 0);
-  emitText (" clk=");
+  emitText (" clr=");
+  emitHex (clockCleared, 4);
+  emitText (" vs3 ");
+  emitHex (vendor3After, 8);
+
+  emitText ("\nsdh1 clk=");
   emitHex (clockAfter, 4);
   emitText (" pw=");
   emitHex (powerAfter, 2);
@@ -992,11 +1041,8 @@ static void coldBringUp (void)
   emitHex (hostControlAfter, 2);
   emitText (" h2=");
   emitHex (hostControl2After, 4);
-
-  emitText ("\nvs ");
+  emitText (" vs ");
   emitHex (vendorAfter, 8);
-  emitText (" vs3 ");
-  emitHex (vendor3After, 8);
   emitText (" ps ");
   emitHex (presentAfter, 8);
 
@@ -1233,7 +1279,7 @@ extern "C" void clover_emmc_run (void)
   clover_emmc_stage = 1;
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
   // the storage instrument it was asked for.
-  if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5) {
+  if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -1254,7 +1300,7 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp ();
+    coldBringUp (mode == 5);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.
