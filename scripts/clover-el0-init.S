@@ -143,6 +143,27 @@
 // three ways: 448 << 8 = the number printed and the probe finished, N < 256 = it
 // was killed inside that write, nothing = the write never returned.
 //
+// Round 78 returned that third reading: the panel ends at `[clover] el0 mach:
+// msg=` and the parent's status line never appears. So the child is not dead --
+// the parent sits in a blocking wait4, and exit and SIGKILL both wake it -- and it
+// is not starved either, because the parent was asleep in that wait4 and gave up
+// its core. It is stuck inside one write, in the kernel, with the label's bytes
+// already on the panel.
+//
+// That last detail is this round's question. Characters reach the screen from
+// *inside* the write: ttwrite (bsd/kern/tty.c:2459) fills tp->t_outq, ttstart
+// calls kmstart, kmoutput drains the queue through console_write, and only then
+// does the syscall return. So a painted label is compatible with two very
+// different places to be stuck: the label write returned and the digits write is
+// the one that never came back, or the label write itself painted its bytes and
+// then blocked on the way out -- ttwrite's ovhiwat path sleeps on TSA_OLOWAT with
+// tp->t_timeout (tty.c:2656), and round 77 proved that no deadline on this port
+// ever fires, which makes any such sleep permanent. v0.2.49 moves the child's
+// exit(448) up two instructions, from after _print_line to before it, and that is
+// the only change in the file: the parent's status line reads 114688 (448 << 8) if
+// the label write finishes and the process leaves from there, and nothing at all if
+// the label write is the one that hangs after painting.
+//
 // Why the console has to be opened by us. Round 65 retired the assumption that
 // fd 1 is a console: this XNU has no open_console() at all, bsd_init hands
 // initproc an empty descriptor table, and the console is just a devfs node --
@@ -467,18 +488,22 @@ _start:
   add x2, x2, _mach_msg_end@PAGEOFF
   sub x2, x2, x1
   bl _puts
-  mov x0, x20
-  bl _print_line
 
-  // Round 78's marker, and the only new instruction in the child: leave here,
-  // one instruction after the number and one before the trap, through exit().
-  // The parent is sitting in a blocking wait4 for exactly this, so its status
-  // line says which of the three things happened to the write above: 114688
-  // (448 << 8) means the number went out and the process was still whole, a
-  // value below 256 means it was killed inside that write with the low byte as
-  // the signal, and no status line at all means the write never came back.
+  // Round 79's marker, and the only new instruction in the child: leave here,
+  // after the label write and before the digits write. The parent is sitting in a
+  // blocking wait4 for exactly this, so its status line says which of the two
+  // writes is the one that never returned: 114688 (448 << 8) with `msg=` painted
+  // means the label write came back and the process left whole, and no status line
+  // at all means the label blocked on its way out of ttwrite, after its own
+  // characters were already on the panel.
   mov x23, #448
   b _exit_now
+
+  // Not reached this round: the two instructions below are what round 78 hung on,
+  // and v0.2.49 keeps them in place so the next round only has to delete the
+  // branch above.
+  mov x0, x20
+  bl _print_line
 
   // ---- the question of this round: mach_msg2_trap, index 47 ----
   //

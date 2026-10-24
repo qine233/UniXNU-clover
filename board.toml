@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: parked or killed, wait4 says"
+title = "clover md0 root: which of the two writes never returns"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -765,6 +765,25 @@ dram_size = "0x80000000"
 #     114688 (448 << 8) means the number went out and the process finished, N < 256
 #     means it was killed inside that write with the signal in the low byte, and no
 #     status line at all means the write itself never came back.
+#   * v0.2.49 because round 78 returned that last case, and it is the one that says
+#     the child is neither dead nor starved: it is inside a write. The parent sat in
+#     the blocking wait4, so an exit or a SIGKILL would have woken it and painted a
+#     status line, and the parent had given up its core, so the child had a
+#     processor. What the panel showed was `[clover] el0 mach: msg=` and nothing
+#     after it, forever. That shape has one wrinkle worth pressing on: characters
+#     reach the screen from *inside* the write -- ttwrite (bsd/kern/tty.c:2459)
+#     fills tp->t_outq, ttstart runs kmstart, kmoutput pushes the bytes through
+#     console_write -- all before the syscall returns. So a painted label cannot by
+#     itself tell you which write hung. It could be the label write returning and
+#     the digits write blocking, or the label write blocking on its way out, after
+#     its own characters were already on the panel; the second is what ttwrite's
+#     ovhiwat path does when it sleeps on TSA_OLOWAT with tp->t_timeout (tty.c:2656),
+#     because round 77 proved no deadline here ever fires and such a sleep never
+#     ends. Round 79 moves the child's exit(448) up two instructions, to sit between
+#     the label write and the digits write, and that is the whole change: 114688 with
+#     `msg=` painted means the label write came back and the digits are the hang,
+#     and no status line at all means the label write is the one that paints itself
+#     and then stops.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -774,7 +793,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["9a91d15d6dbe94f5d95a267db211ca2ab4be9feb5a0d6b98034fa3cddf1b2cb2"]
+trust_cache_sha256 = ["cabc9d22ea035a2f99eed4479de70b57e0fe8ce499003065545343f02022adef"]
 kernel_args = [
   "-v",
   "serial=3",
