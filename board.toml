@@ -154,7 +154,7 @@ dram_size = "0x80000000"
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
 #
-# v0.2.17 asks where the frame buffer went, in one run, and never resets:
+# v0.2.17/v0.2.18 ask where the frame buffer went, in one run, and never reset:
 #   * _start_first_cpu maps only the DarwinBoot window (V=P, memSize bytes), and
 #     this unit's window cannot start below 0x9D400000: everything below is
 #     reserved, the only free row is 148 MiB, and a 1 GiB window has to fit in
@@ -176,15 +176,18 @@ dram_size = "0x80000000"
 #     geometry, 3 window L1 not a table, 4 window entry not a block, 5 no free
 #     page, 6 target L2 entry in use), and the vc_info seed is skipped.
 #   * a CYAN band at index 4 is painted right after the SCTLR write, so it proves
-#     the MMU is on and the frame buffer is writable V=P; a yellow bar right
-#     after _cpu_data_init then proves arm_init passed that call. Cyan without
-#     yellow means the stall is between start.s and arm_init. Any later panic
-#     draws on the same mapping.
+#     the MMU is on and the frame buffer is writable V=P.
+#   * v0.2.18 adds an ORANGE band at index 12 at the first call inside arm_init
+#     (_arm_set_kernel_tbi). It reads boot_args from x0 and uses no stack, no AT
+#     and no vinfo, so it answers "did arm_init start" independently of the
+#     vinfo painter. The yellow band at index 3 then paints when the call to
+#     _cpu_data_init is reached (that painter uses the seeded vinfo, the stack
+#     and an AT check). Orange without yellow puts the fault between arm_init's
+#     entry and that call; no orange means arm_init was never entered.
+#   * the two paint probes and their targets are defaults inside this
+#     repository's scripts/patch-xnu-entry-probe.py (--no-paint/--no-paint2 turn
+#     them off), so the base repository's payload step needs no local change.
 panic_screen = true
-entry_probe_paint_after = "_cpu_data_init"
-entry_probe_paint_in = "_arm_init"
-entry_probe_paint_band = 3
-entry_probe_paint_occurrence = 1
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 kernel_args = [
   "-v",

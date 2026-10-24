@@ -46,13 +46,21 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         Nth call, --occurrence). It replaces
                                         stage 3, so one run asks one question:
                                         did the kernel get past that call?
-  stage 3 (--paint-after SYMBOL)        paint one bar after the call to SYMBOL and
-                                        keep booting, from the seeded vc_info. The
-                                        store is guarded by an AT S1E1W query, so
-                                        an unmapped frame buffer skips the bar
-                                        instead of faulting; this asks whether the
-                                        frame buffer is still reachable once the
-                                        MMU is on.
+  stage 3 (--paint-after SYMBOL)        paint one bar when the call to SYMBOL is
+                                        reached and keep booting, from the seeded
+                                        vc_info. The store is guarded by an AT
+                                        S1E1W query, so an unmapped frame buffer
+                                        skips the bar instead of faulting; this
+                                        asks whether the frame buffer is still
+                                        reachable once the MMU is on.
+  stage 4 (--paint2-after SYMBOL)       a second, independent bar: it paints from
+                                        the boot_args pointer in x0 and uses no
+                                        stack, no AT and no vc_info. It defaults
+                                        to _arm_init's first call, so arm_init
+                                        being entered is visible separately from
+                                        the vc_info painter working. Both bars
+                                        are on by default; --no-paint/--no-paint2
+                                        turn them off.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
 DarwinBoot paints (band index = stage). Each patch site is checked against its
@@ -119,6 +127,41 @@ def paint(args, lo, hi, band):
   stp w6, w6, [x1], #8
   subs x2, x2, #8
   b.hi 1b
+  dsb sy
+2:
+"""
+
+# Same band but sourced from a boot_args pointer held in x0, after the MMU is on
+# (so the pointer is a KVA). No stack, no AT, no vinfo: this is the independent
+# probe used to tell "never reached arm_init" from "reached it but the vinfo
+# paint cannot draw". Caller-saved x1-x6 are clobbered, x0 is preserved for the
+# displaced call.
+PAINT_BOOTARGS = """
+  ldr x1, [x0, #0x28]
+  cbz x1, 2f
+  ldr x2, [x0, #0x38]
+  ldr x3, [x0, #0x48]
+  mul x2, x2, x3
+  lsr x2, x2, #4
+  bic x2, x2, #7
+  cbz x2, 2f
+  mov x4, #{band}
+  mul x5, x2, x4
+  add x1, x1, x5
+  mov x4, x1
+  mov x5, x2
+  movz w6, #{lo}
+  movk w6, #{hi}, lsl #16
+1:
+  stp w6, w6, [x1], #8
+  subs x2, x2, #8
+  b.hi 1b
+  dsb sy
+3:
+  dc civac, x4
+  add x4, x4, #64
+  subs x5, x5, #64
+  b.hi 3b
   dsb sy
 2:
 """
@@ -676,10 +719,17 @@ def main():
     parser.add_argument('--reset-delay', type=int, default=6, help='seconds before the reset')
     parser.add_argument('--reset-after', metavar='SYMBOL', help='place the reset after this call in arm_init instead of stage 3')
     parser.add_argument('--reset-before', action='store_true', help='reset at the call site before invoking SYMBOL (requires --reset-after)')
-    parser.add_argument('--paint-after', metavar='SYMBOL', help='paint a bar after this call and keep booting (no reset)')
+    parser.add_argument('--paint-after', metavar='SYMBOL', help='paint a bar before this call and keep booting')
+    parser.add_argument('--no-paint', action='store_true', help='leave out the stage 3 bar')
     parser.add_argument('--paint-in', dest='paint_function', default='_arm_init', help='function that makes the painted call (default _arm_init)')
     parser.add_argument('--paint-band', type=int, default=3, help='which 1/16th band the painted bar fills (default 3)')
     parser.add_argument('--paint-occurrence', type=int, default=1, help='which call to SYMBOL to paint after (1 = first)')
+    parser.add_argument('--paint2-after', metavar='SYMBOL',
+                        help='paint an independent bar before this call; the call site must hold boot_args in x0')
+    parser.add_argument('--no-paint2', action='store_true', help='leave out the independent stage 4 bar')
+    parser.add_argument('--paint2-in', dest='paint2_function', default='_arm_init', help='function that makes the second painted call (default _arm_init)')
+    parser.add_argument('--paint2-band', type=int, default=12, help='which 1/16th band the second bar fills (default 12)')
+    parser.add_argument('--paint2-occurrence', type=int, default=1, help='which call to SYMBOL the second bar precedes (1 = first)')
     parser.add_argument('--panic-screen', action='store_true', help='draw panic() messages on the kernel frame buffer')
     parser.add_argument('--no-reset', action='store_true', help='no reset probe at all')
     parser.add_argument('--occurrence', type=int, default=1, help='which call to SYMBOL (1 = first)')
@@ -687,6 +737,14 @@ def main():
     args = parser.parse_args()
     if args.reset_before and not args.reset_after:
         raise SystemExit('--reset-before requires --reset-after')
+    # Defaults make both post-MMU bars part of this board's kernel without a
+    # local change to the base repository's payload step. Stage 3 paints from the
+    # seeded vinfo; stage 4 paints from the boot_args pointer in x0. A cave that
+    # a reset probe claimed is left alone.
+    if not args.no_paint and not args.paint_after and (args.no_reset or args.reset_after):
+        args.paint_after = '_cpu_data_init'
+    if not args.no_paint2 and not args.paint2_after and (args.no_reset or not args.reset_after):
+        args.paint2_after = '_arm_set_kernel_tbi'
     data = bytearray(args.kernel.read_bytes())
     load_segments(data)
     symbols_by_address = kernel_symbols(args.kernel)
@@ -741,9 +799,30 @@ def main():
         description += (f', stage 3 paints band {args.paint_band} on reaching call #{args.paint_occurrence}'
                         f' to {args.paint_after} in {args.paint_function} (at {paint_va:#x}) and continues')
 
+    # The stage 4 cave carries an independent painter: it reads boot_args through
+    # x0 and never uses the vinfo copy, the stack, or AT. It exists to separate
+    # "the kernel never reached this call" from "the vinfo painter cannot draw".
+    paint2_source = None
+    if args.paint2_after:
+        paint2_va, paint2_callee = find_call(data, symbols_by_address, args.paint2_function, args.paint2_after,
+                                             args.paint2_occurrence)
+        if any(site == paint2_va for site, _, _ in sites):
+            raise SystemExit(f'--paint2-after is already a probe site: {paint2_va:#x}')
+        if any(stage == 4 for _, stage, _ in sites):
+            raise SystemExit('--paint2-after needs the stage 4 cave, which the reset probe is using')
+        sites.append((paint2_va, 4, {'callee': paint2_callee, 'target': paint2_va + 4}))
+        paint2_source = ('.text\n.global _start\n_start:\n'
+                         + PAINT_BOOTARGS.format(band=args.paint2_band, lo='0x8000', hi='0xFFFF')
+                         + '  bl callee\n  b target\n.ltorg\n')
+        description += (f', stage 4 paints band {args.paint2_band} from boot_args on reaching call '
+                        f'#{args.paint2_occurrence} to {args.paint2_after} in {args.paint2_function} '
+                        f'(at {paint2_va:#x}) and continues')
+
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
-            if paint_source is not None and site == paint_va:
+            if paint2_source is not None and site == paint2_va:
+                source = paint2_source
+            elif paint_source is not None and site == paint_va:
                 source = paint_source
             else:
                 source = RESET_BEFORE if (stage == 4 and args.reset_before) else SOURCES[stage].format(
