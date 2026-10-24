@@ -192,6 +192,14 @@ dram_size = "0x80000000"
 #     red means _arm_set_kernel_tbi never returned; orange and red without
 #     yellow means the rebase block or the memmove before the _cpu_data_init
 #     call is the stall.
+#   * v0.2.20 is the first round after the bars did their job. v0.2.19 drew the
+#     white panic screen (from the seeded vinfo) with "CPU property
+#     'cluster-type' has bad size 6 @machine_routines.c:936", so the kernel
+#     reached ml_parse_cpu_topology inside arm_init. The ADT generator had
+#     emitted the strings "ECore"/"PCore", but ml_readprop() accepts only
+#     1/2/4/8-byte integers and the topology compares the value with 'E'/'P'.
+#     cpuN.cluster-type is now u32 'E' (cpu0-3) / 'P' (cpu4-7), and
+#     check-clover.py asserts it. No kernel patch changed; only the ADT did.
 #   * the paint probes and their targets are defaults inside this
 #     repository's scripts/patch-xnu-entry-probe.py (--no-paint/--no-paint2 turn
 #     them off), so the base repository's payload step needs no local change.

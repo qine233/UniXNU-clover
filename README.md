@@ -18,10 +18,10 @@
 | 板级描述 | `board.toml` 可解析；`scripts/check-clover.py` 把它与 defconfig 和 payload 契约交叉核对 |
 | ADT | `scripts/make-clover-adt.py` 为 8 个 Kryo 260 核生成 13,880 字节；检查器会把编码读回来，并断言 `ArmDTPlatform` 和 DarwinBoot 需要的节点 |
 | 内核 | 已构建：`DEVELOPMENT_ARM64_BCM2837` 的 51.8 MB `kernel.macho` |
-| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.13` 起 payload 里的 `kernel.macho` 是一份打了探针的副本：入口色带、panic 屏幕，以及 `arm_init` 某个调用返回后触发的定时复位；`v0.2.16` 起在开 MMU 前调用一个 mapper 洞穴，把 framebuffer 恒等映射进 TTBR0（与窗口同槽就复用 L2 表，否则用窗口最后一页新建一张），并预先填好 `_vinfo`；mapper 失败会涂一条白色诊断带；`v0.2.17` 改成用自身 PC 定位引导页表（`boot_args.physBase` 落在 `__PRELINK_TEXT` 上、本身没有被映射），并在 MMU 打开后立刻涂第 4 条青色带；`v0.2.18` 再加一条独立的橙色带（第 12 条），在 `arm_init` 的第一条调用处直接从 `boot_args` 涂，不依赖栈、AT 和 `_vinfo`；`v0.2.19` 修掉种子守卫写反的 bug（`cbz x8` 在 mapper 成功时跳过种子，`_vinfo` 因此一直是 0，黄带从 `v0.2.15` 起从未画出来过），并在第一条调用返回后再涂一条红带（第 13 条）（见"菜单之后看什么"） |
+| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.13` 起 payload 里的 `kernel.macho` 是一份打了探针的副本：入口色带、panic 屏幕，以及 `arm_init` 某个调用返回后触发的定时复位；`v0.2.16` 起在开 MMU 前调用一个 mapper 洞穴，把 framebuffer 恒等映射进 TTBR0（与窗口同槽就复用 L2 表，否则用窗口最后一页新建一张），并预先填好 `_vinfo`；mapper 失败会涂一条白色诊断带；`v0.2.17` 改成用自身 PC 定位引导页表（`boot_args.physBase` 落在 `__PRELINK_TEXT` 上、本身没有被映射），并在 MMU 打开后立刻涂第 4 条青色带；`v0.2.18` 再加一条独立的橙色带（第 12 条），在 `arm_init` 的第一条调用处直接从 `boot_args` 涂，不依赖栈、AT 和 `_vinfo`；`v0.2.19` 修掉种子守卫写反的 bug（`cbz x8` 在 mapper 成功时跳过种子，`_vinfo` 因此一直是 0，黄带从 `v0.2.15` 起从未画出来过），并在第一条调用返回后再涂一条红带（第 13 条）；`v0.2.20` 修掉 ADT 里 `cluster-type` 的尺寸契约（字符串改为 4 字节整数 `'E'` / `'P'`），内核补丁不变（见"菜单之后看什么"） |
 | 固件 | 由 `uefi-clover` 构建（3 MiB 固件卷，内含 UniXNU 与 DarwinBoot）；`v0.3.10` 起 DXE 尾部完整派发，`CloverGopDxe` 发布 GOP |
 | 设备事实 | 2026-10-22 采集过一次，位于 `facts/81ffcaaa-20261022-210928/` |
-| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.9` 实测屏幕出现**绿 + 蓝 + 品红**三条色带，即 DarwinBoot 已交接、XNU 入口已执行、引导页表已建好；`v0.2.10` 实测**品红出现约 6 秒后设备自己重启**，即 `sctlr_el1` 打开 MMU 后没有立刻死掉；`v0.2.11` 的 `_arm_vm_init` 复位点没有触发（**品红一直停着**），说明还没走到它；`v0.2.12` 实测**只有绿 + 蓝 + 品红、约 6 秒后自复位**，即 `_PE_init_platform` 返回了、开 MMU 后写屏确实不可用；`v0.2.13` 的 `_thread_bootstrap` 复位点实测是**品红后十几秒才复位、没有白字**，符合"panic 屏幕在 `vinfo` 仍为 0 时走了 12 秒兜底"；`v0.2.14` 扩映射并预填 `_vinfo`、不再主动复位，实测**仍是绿 + 蓝 + 品红，无黄带无白字**，由此定位到窗口在 framebuffer 之上、向上扩 `memSize` 永远够不到；`v0.2.15` 改为直接补页表项，实测**仍是绿 + 蓝 + 品红、无黄无白**，原因是 1 GiB 窗口只能落在高 DRAM bank，与 framebuffer 不在同一个 1 GB 槽，旧代码查错了槽位就退出；`v0.2.16` 换成独立 mapper 洞穴（同槽复用、异槽新建 L2 表），失败时用白色带自报错误码，实测**绿 + 蓝 + 品红 + 第 9 条白带**，即 mapper 走到自检第 4 步：窗口的第一个 L2 项不是 2 MB 块；由此查明 `boot_args.physBase` 锚在 `__PRELINK_TEXT` 上、本身不在引导映射内；`v0.2.17` 改为从 mapper 自己的 PC 反推引导映射，修掉复用 L2 表时未掩掉低位的 bug，并在 MMU 打开后立刻涂第 4 条青色带，实测**绿 + 蓝 + 品红 + 青、无黄**，即 MMU 已开、framebuffer 已经可写，卡点在 `_cpu_data_init` 被调用之前；`v0.2.18` 增加第 12 条橙色带（`arm_init` 入口后的第一条调用，不依赖 vinfo/栈/AT），实测**绿 + 蓝 + 品红 + 青 + 橙、无黄**，确认 `arm_init` 已进入、第一条调用点已到达；由此回查代码发现种子守卫从 `v0.2.15` 起就是反的（`cbz x8` 在 mapper 成功时跳过种子），`_vinfo` 一直为 0，黄带从未有机会出现；`v0.2.19` 改成 `cbnz x8`，并让第一条调用返回后再涂第 13 条红带，待上机 |
+| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.9` 实测屏幕出现**绿 + 蓝 + 品红**三条色带，即 DarwinBoot 已交接、XNU 入口已执行、引导页表已建好；`v0.2.10` 实测**品红出现约 6 秒后设备自己重启**，即 `sctlr_el1` 打开 MMU 后没有立刻死掉；`v0.2.11` 的 `_arm_vm_init` 复位点没有触发（**品红一直停着**），说明还没走到它；`v0.2.12` 实测**只有绿 + 蓝 + 品红、约 6 秒后自复位**，即 `_PE_init_platform` 返回了、开 MMU 后写屏确实不可用；`v0.2.13` 的 `_thread_bootstrap` 复位点实测是**品红后十几秒才复位、没有白字**，符合"panic 屏幕在 `vinfo` 仍为 0 时走了 12 秒兜底"；`v0.2.14` 扩映射并预填 `_vinfo`、不再主动复位，实测**仍是绿 + 蓝 + 品红，无黄带无白字**，由此定位到窗口在 framebuffer 之上、向上扩 `memSize` 永远够不到；`v0.2.15` 改为直接补页表项，实测**仍是绿 + 蓝 + 品红、无黄无白**，原因是 1 GiB 窗口只能落在高 DRAM bank，与 framebuffer 不在同一个 1 GB 槽，旧代码查错了槽位就退出；`v0.2.16` 换成独立 mapper 洞穴（同槽复用、异槽新建 L2 表），失败时用白色带自报错误码，实测**绿 + 蓝 + 品红 + 第 9 条白带**，即 mapper 走到自检第 4 步：窗口的第一个 L2 项不是 2 MB 块；由此查明 `boot_args.physBase` 锚在 `__PRELINK_TEXT` 上、本身不在引导映射内；`v0.2.17` 改为从 mapper 自己的 PC 反推引导映射，修掉复用 L2 表时未掩掉低位的 bug，并在 MMU 打开后立刻涂第 4 条青色带，实测**绿 + 蓝 + 品红 + 青、无黄**，即 MMU 已开、framebuffer 已经可写，卡点在 `_cpu_data_init` 被调用之前；`v0.2.18` 增加第 12 条橙色带（`arm_init` 入口后的第一条调用，不依赖 vinfo/栈/AT），实测**绿 + 蓝 + 品红 + 青 + 橙、无黄**，确认 `arm_init` 已进入、第一条调用点已到达；由此回查代码发现种子守卫从 `v0.2.15` 起就是反的（`cbz x8` 在 mapper 成功时跳过种子），`_vinfo` 一直为 0，黄带从未有机会出现；`v0.2.19` 改成 `cbnz x8`，并让第一条调用返回后再涂第 13 条红带，实测读到**白字 panic 屏幕**：`CPU property 'cluster-type' has bad size 6 @machine_routines.c:936`，即种子/画屏/早段 `arm_init` 全通，内核已走到 `ml_parse_cpu_topology`；`v0.2.20` 把 `cluster-type` 从字符串改成 4 字节整数 `'E'` / `'P'`，待上机 |
 
 上面这张表之外，不做任何额外声称。
 
@@ -257,9 +257,9 @@ framebuffer 的槽号去查 L1，再看那个槽的 L2 表。可是 `0x10000000`
    V=P 可写"才会出现。这样青带把"开 MMU 这一刻"和之后的 `_cpu_data_init` 分开：
    有青无黄 = 卡在 `start.s` 到 `arm_init` 之间；再配合下一轮的橙带，可以把
    "没进 `arm_init`"和"进了但没走到调用点"区分开。
-6. **黄带**：`arm_init` 第 1 次调用 `_cpu_data_init` 返回后，按 `_vinfo` 涂第 3 条
-   带。涂之前用 `AT S1E1W` 查一次翻译（失败就跳过），涂完用 `dc civac` + `dsb sy`
-   把 Normal-WB 的像素推到显示引擎可见。
+6. **黄带**：`arm_init` 第 1 次调用 `_cpu_data_init` **之前**，按 `_vinfo` 涂第 3 条
+   带（洞穴先涂色，再执行被挪走的 `bl`）。涂之前用 `AT S1E1W` 查一次翻译
+   （失败就跳过），涂完用 `dc civac` + `dsb sy` 把 Normal-WB 的像素推到显示引擎可见。
 
 `v0.2.17` 上机的结果是**绿 + 蓝 + 品红 + 青，无黄**；`v0.2.18` 加橙带后再测，读数是
 **青 + 橙，仍然无黄**。橙带出现说明 `arm_init` 确实进了、第一条调用点也到了；黄带
@@ -277,13 +277,30 @@ framebuffer 的槽号去查 L1，再看那个槽的 L2 表。可是 `0x10000000`
 callee-saved）涂**红带 13**（`0xFF0000FF`，证明调用真的返回了）。这样一次上机就能把
 "没进 `arm_init` / 没从第一条调用返回 / 到了调用点"三件事分开。
 
+`v0.2.19` 上机后第一次读到了**白字 panic 屏幕**（panic 屏幕按设计从第 `h/8` 行往下
+清屏，第 2 条以下的色带都被清掉，所以只剩绿 + 蓝是正常的）：
+
+```text
+CPU property 'cluster-type' has bad size 6 @machine_routines.c:936
+```
+
+这一屏同时证明了三件事：种子修好之后 `_vinfo` 可用、panic 屏幕能照着它画、内核已经
+走到 `_arm_init` 里的 `ml_parse_cpu_topology`（`_cpu_data_init`、`_PE_init_platform`
+都已经返回）。panic 的原因是 ADT 契约错误：生成器把 `cluster-type` 写成了字符串
+`"ECore"` / `"PCore"`（6 字节，含结尾 0），而 `ml_readprop()` 只接受 1/2/4/8 字节
+整数，拓扑代码再把值跟 `'E'` / `'P'` 比较。`v0.2.20` 把每个 `cpuN` 的
+`cluster-type` 改成 4 字节整数——cpu0–3 是 `'E'`，cpu4–7 是 `'P'`——并在
+`check-clover.py` 里加了断言，防止它再退化成字符串。内核补丁没有任何变化，只有
+payload 里的 `kernel.macho.adt` 换了（`kernel.macho` 的哈希与 `v0.2.19` 相同）。
+
 这一轮的色带把"没画出来"变成可读：白带说明 mapper 的哪一步拒绝，青带说明 MMU
 打开后 framebuffer 真的可写，橙带说明 `arm_init` 走到了第一条调用，红带说明它返回了，
 黄带说明 `_cpu_data_init` 的调用点已经被走到（黄带在 `bl` 之前涂，不证明调用返回）。
+一旦出现白字，色带会被 panic 屏幕清掉，读数以白字为准。
 
 | 现象 | 含义 |
 | --- | --- |
-| 绿 + 蓝 + 品红 + **青 + 橙 + 红 + 黄带**，随后白字 | mapper、种子、`AT`、`arm_init` 全通，内核之后踩到 panic；直接拍白字 |
+| 绿 + 蓝（第 2 条以下被清空），随后**白字** | 内核 panic，panic 屏幕画出来了；直接拍白字，按 `file:line` 和属性名定位契约错误 |
 | 绿 + 蓝 + 品红 + **青 + 橙 + 红 + 黄带**，然后停住 | `_cpu_data_init` 调用点到了，之后是自旋而不是 panic；下一轮把复位点放回 `_thread_bootstrap` 做时间二分 |
 | 绿 + 蓝 + 品红 + **青 + 橙 + 红带**，无黄带 | 第一条调用返回了，但没走到 `_cpu_data_init` 调用点：卡在 rebase 块或 `_memmove` 里；下一轮在 `_memmove` 调用处加一条带 |
 | 绿 + 蓝 + 品红 + **青 + 橙带**，无红带 | `_arm_set_kernel_tbi` 没有返回；下一轮先确认它的函数体 |
@@ -293,7 +310,7 @@ callee-saved）涂**红带 13**（`0xFF0000FF`，证明调用真的返回了）�
 | 品红后十几秒自复位、无白字 | panic 发生在种子之前，`vinfo` 仍为 0，走 12 秒兜底 |
 
 ```sh
-fastboot flash cache ~/clover-out/round49-payload.img   # 只换这一格，boot 不变
+fastboot flash cache ~/clover-out/round50-payload.img   # 只换这一格，boot 不变
 fastboot reboot
 ```
 

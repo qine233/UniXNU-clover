@@ -171,7 +171,10 @@ def build_cpu_node(cpu_idx: int, mpidr: int) -> bytes:
         # DEVELOPMENT_ARM64_BCM2837 kernel this board builds.
         ("compatible", cstr("arm,armv8")),
         ("cpu-id", u32(cpu_idx)),
-        ("cluster-type", cstr("ECore" if silver else "PCore")),
+        # machine_routines.c reads this with ml_readprop(), which accepts only
+        # 1/2/4/8-byte integers, and compares the value with 'E' or 'P'. A
+        # string here panics with "has bad size 6" before the topology is built.
+        ("cluster-type", u32(ord('E') if silver else ord('P'))),
         ("timebase-frequency", u32(spec["clock_frequency"])),
         ("fixed-frequency-khz", u32(freq)),
     ])
