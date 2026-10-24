@@ -419,6 +419,31 @@ dram_size = "0x80000000"
 #                                         resetting once the frame buffer maps)
 #     Bands 5, 8, 7 and 9 keep their meanings as the road to this point; band 6
 #     is still painted on entry to vm_mem_bootstrap.
+#   * v0.2.33 takes the v0.2.32 device reading: the screen kept the bars (green
+#     top, blue, the orange and green bands below the panic block, and the UEFI
+#     menu) and the panic screen printed a real kernel panic:
+#       "AMFI: no amfi-only-platform-code device tree node!"
+#       @AppleMobileFileIntegrity.cpp:5025
+#     with RA 0xfffffff004ac9884 and LR 0xfffffff004ab4f90, both inside the
+#     prelinked AMFI kext. So the kernel did not stall after vm_mem_bootstrap at
+#     all: it ran through the rest of kernel_bootstrap, IOKit and the prelinked
+#     kexts, and stopped in AMFI. This also means the earlier "the reset fired"
+#     readings were measuring our own timed reset, not a stall. Two fixes:
+#       - the ADT now publishes amfi-only-platform-code = <1> under /chosen,
+#         the same property the QEMU fixture publishes; AMFI refuses to start
+#         without it (and checks that its size is 4).
+#       - the console cave now also calls initialize_screen(NULL, kPETextMode)
+#         before _vcattach. vcattach alone is a no-op on this port because
+#         PE_create_console selected graphics mode (PE_state.video.v_display is
+#         nonzero), which leaves gc_graphics_boot TRUE and makes vcattach skip
+#         its attach block. kPETextMode clears that flag; the acquire inside
+#         vcattach then runs gc_enable(TRUE), allocates the console buffers,
+#         clears the screen and replays msgbuf.
+#     Reading: kernel text (boot messages) or a new white panic = the console
+#     is attached; the last line is the new stall. Bars still on screen with no
+#     text = the text-mode switch did not take. The panic screen keeps only rows
+#     [h/8, h/2), which is why bands 8 and 9 stayed visible under the v0.2.32
+#     panic.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true

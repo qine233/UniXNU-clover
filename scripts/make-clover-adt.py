@@ -216,6 +216,11 @@ def generate_adt(args) -> bytes:
         ("dram-base", u64(args.dram_base)),
         ("dram-size", u64(args.dram_size)),
         ("crypto-hash-method", cstr("sha2-384")),
+        # AMFI refuses to start ("AMFI: no amfi-only-platform-code device
+        # tree node!" @AppleMobileFileIntegrity.cpp:5025) unless the platform
+        # code is declared. This is the same property the QEMU fixture
+        # publishes, as a u32 one under /chosen.
+        ("amfi-only-platform-code", u32(1)),
         ("unique-chip-id", u64(args.unique_chip_id)),
         ("chip-id", u32(int(args.chip_id, 0))),
         *empty_nvram_proxy(),

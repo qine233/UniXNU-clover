@@ -96,12 +96,16 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         Band 15 green, painted over the red
                                         handoff bar when the call returns, says
                                         the whole function returned; the same
-                                        cave then calls _vcattach, which clears
-                                        the screen and replays msgbuf, so from
-                                        there on the panel shows kernel text
-                                        and not bars. There is no timed reset:
-                                        a device that sits is showing its last
-                                        line.
+                                        cave then calls initialize_screen(NULL,
+                                        kPETextMode) and _vcattach. vcattach
+                                        alone is a no-op here because the
+                                        booter chose graphics mode; the text
+                                        mode clears that flag, and the attach
+                                        clears the screen and replays msgbuf,
+                                        so from there on the panel shows
+                                        kernel text and not bars. There is no
+                                        timed reset: a device that sits is
+                                        showing its last line.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
 DarwinBoot paints (band index = stage). Each patch site is checked against its
@@ -464,11 +468,15 @@ RESET_PAINT_BAND = (15, '0x0000', '0x00FF')
 # five calls of the first half (v0.2.30) and then the tail calls (v0.2.31);
 # both readings came back complete, so they are retired.
 #
-# Attaching the console is the point of the round. vcattach() clears the screen
-# (gc_enable) and replays msgbuf, so after it returns the panel shows kernel
-# text instead of bars: the bands disappear, and whatever the kernel prints
-# from there on -- including a panic -- stays on screen. There is no timed
-# reset any more; a device that sits is showing its last line.
+# Attaching the console is the point of the round. The booter picked graphics
+# mode, so gc_graphics_boot is TRUE and vcattach() alone returns without doing
+# anything; the cave first calls initialize_screen(NULL, kPETextMode) to clear
+# that flag. The acquire inside vcattach then runs gc_enable(TRUE), which
+# allocates the console buffers and clears the screen, and vcattach replays
+# msgbuf, so after it the panel shows kernel text instead of bars: the bands
+# disappear, and whatever the kernel prints from there on -- including a panic
+# -- stays on screen. There is no timed reset any more; a device that sits is
+# showing its last line.
 HANDOFF_ENTER_BAND = 15
 HANDOFF_LADDER = (
     {'caller': '_machine_startup', 'callee': '_machine_conf', 'mode': 'after', 'bands': (9,)},
@@ -636,8 +644,9 @@ def handoff_source(mode, bands, vinfo, ticks):
 
     after:  call, paint when it returns, continue.
     enter_console: paint on entry, call, paint the green band over the red
-                  handoff band, call vcattach, continue (the screen is cleared
-                  and msgbuf replayed, so text replaces the bars).
+                  handoff band, switch the screen to text mode, call vcattach,
+                  continue (the screen is cleared and msgbuf replayed, so text
+                  replaces the bars).
     around: paint on entry, call, paint again when it returns, continue.
     around_reset: paint on entry, call, paint the second band when it returns,
                   wait TICKS, reset (the end of the measured stretch).
@@ -652,6 +661,11 @@ def handoff_source(mode, bands, vinfo, ticks):
         # handoff bar says vm_mem_bootstrap returned and the attach begins.
         return (head + handoff_paint(vinfo, bands[0]) + '  bl callee\n'
                 + PAINT_INFO.format(vinfo=f'{vinfo:#x}UL', band=15, lo='0xFF00', hi='0x0000')
+                # vcattach alone does nothing when the booter chose graphics
+                # mode (gc_graphics_boot is TRUE and vcattach skips its attach
+                # block). kPETextMode clears that flag; the acquire inside
+                # vcattach then enables the text console and replays msgbuf.
+                + '  mov x0, #0\n  mov w1, #2\n  bl initialize_screen\n'
                 + '  bl vcattach\n' + tail)
     if mode == 'after':
         return (head + '  bl callee\n  str x0, [sp, #-16]!\n'
@@ -1153,6 +1167,8 @@ def main():
     if handoff:
         if '_vcattach' not in names:
             raise SystemExit('the kernel has no _vcattach; cannot attach the video console')
+        if '_initialize_screen' not in names:
+            raise SystemExit('the kernel has no _initialize_screen; cannot switch to text mode')
         for item in HANDOFF_LADDER:
             site, callee = find_call(data, symbols_by_address, item['caller'], item['callee'],
                                      item.get('occurrence', 1))
@@ -1218,7 +1234,8 @@ def main():
             cave_va = zero_slot(data, next_free, size, f'{mode} cave for {callee:#x}')
             source = handoff_source(mode, bands, names['_vinfo'], TIMEBASE * args.reset_delay)
             code = assemble(source, cave_va, {'callee': callee, 'target': site + 4,
-                                              'vcattach': names['_vcattach']}, Path(tmp))
+                                              'vcattach': names['_vcattach'],
+                                              'initialize_screen': names['_initialize_screen']}, Path(tmp))
             if len(code) > size:
                 raise SystemExit(f'Handoff cave for {callee:#x} is too large ({len(code):#x} bytes)')
             calls = []
@@ -1228,7 +1245,8 @@ def main():
                     delta = value & 0x3FFFFFF
                     delta -= (1 << 26) if delta & (1 << 25) else 0
                     calls.append(cave_va + offset + delta * 4)
-            expected = {'reset': [], 'enter_console': [callee, names['_vcattach']]}.get(mode, [callee])
+            expected = {'reset': [], 'enter_console': [callee, names['_initialize_screen'],
+                                                       names['_vcattach']]}.get(mode, [callee])
             if calls != expected:
                 raise SystemExit(f'Handoff cave at {cave_va:#x} calls {calls}, not exactly {expected}')
             data[file_offset(cave_va):file_offset(cave_va) + len(code)] = code
