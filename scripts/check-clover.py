@@ -453,6 +453,28 @@ def check_board(errors: list) -> str:
             errors.append("[kernel] archives builds the PMGR provider but the defconfig leaves "
                           "CONFIG_XNU_SHENG_PMGR off, so nothing ever loads it")
 
+        # round87, the eMMC host instrument. CONFIG_XNU_EXTRA_LD_ARCHIVES lists both extra archives
+        # as plain paths, with no -Wl,-force_load, so each one survives the link only because
+        # something else names its single exported symbol. For CloverSdhci that symbol is
+        # clover_emmc_run, called from the tail of CloverPMGR's sheng_pmgr_run() -- which is itself
+        # only compiled into bsd_init.o when SHENG_PMGR is on. Drop either half and the link does
+        # not fail; the eMMC round simply stops existing, which on a board whose only output is one
+        # photograph is the worst possible silence.
+        sdhci_builder = any("CloverSdhci" in entry for entry in board["kernel"]["archives"])
+        sdhci_arg = any(argument.startswith("clover-emmc=") for argument in board["payload"]["kernel_args"])
+        if "libCloverSdhci.a" in text and not sdhci_builder:
+            errors.append("the defconfig links libCloverSdhci.a but [kernel] archives omits "
+                          "build-arm-driver.py CloverSdhci, so that archive does not exist")
+        if sdhci_builder and not sdhci_arg:
+            errors.append("[kernel] archives builds CloverSdhci but no clover-emmc= boot arg reaches "
+                          "it: clover_emmc_run() returns without touching the host")
+        if sdhci_arg and not sdhci_builder:
+            errors.append("kernel_args passes clover-emmc= but [kernel] archives does not build "
+                          "CloverSdhci, so the arg is noise")
+        if sdhci_builder and flags.get("SHENG_PMGR", "n") not in ("y", "1"):
+            errors.append("CloverSdhci is scheduled from sheng_pmgr_run(), which CONFIG_XNU_SHENG_PMGR="
+                          f"{flags.get('SHENG_PMGR', 'n')} does not compile into the kernel")
+
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
     if cores != CPU_REGS:

@@ -41,6 +41,10 @@ void clover_original_pmgr_nub_write(IOService *, uint64_t);
 // read-after,own-before,own-after,nub-before,nub-after,attached,registered,mode.
 volatile uint64_t clover_pmgr_observation[16];
 __attribute__((noinline)) void clover_pmgr_checkpoint(void) { __asm__ volatile("" ::: "memory"); }
+// drivers/CloverSdhci, scheduled from here because a device repository has no patch slot for an
+// IOKit personality (see that file's header comment). It is opt-in through its own boot argument
+// and returns without touching anything when `clover-emmc` is absent.
+void clover_emmc_run(void);
 }
 
 // The panic screen prints these lines, so the reading survives even when the console is the
@@ -190,4 +194,7 @@ extern "C" void sheng_pmgr_run(void)
   OSSafeReleaseNULL(matched);
   OSSafeReleaseNULL(description);
   clover_pmgr_checkpoint();
+  // Only once the publication above held, so an eMMC reading and a failed PMGR step can never
+  // share a photograph: CloverPMGR's own panic comes first and names its own stage.
+  clover_emmc_run();
 }

@@ -50,6 +50,7 @@ archives = [
   "build-libpthread-kernel.py",
   "build-clover-display-stub.py",
   "build-clover-pmgr.py",
+  "build-arm-driver.py CloverSdhci",
 ]
 
 [kernel.prelink]
@@ -149,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover tty: the tick panic reports the address the child is hung on"
+title = "clover emmc: the sdhci register dump answers whether the window is live"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1004,6 +1005,17 @@ kernel_args = [
   # self-verify it with waitForMatchingService (2 ms, safe now that the clock runs). Any other
   # value panics on purpose -- round82 proved that this board's silence is never a reading.
   "clover-pmgr=2",
+  # drivers/CloverSdhci, called from the tail of the hook above once the nub publication held.
+  # Mode 1 is a look-only dump: it maps 0xc0c4000 for 4 KiB, reads about thirty SDHCI and
+  # Qualcomm SDCC v5 registers into clover_emmc_observation[16], formats them into one 512-byte
+  # report and ends in panic("CloverSdhci: %s") so the photograph is the reading. It issues no
+  # command, sets no clock, touches no reset, enables no interrupt and writes no register --
+  # because the firmware's only SDHCI driver is the SdccDxe blob, so nothing here knows what
+  # state to put the host in, and the state it is in right now is the fact worth having.
+  # All-zero fields mean the SDCC interface clock is gated; all-ones means the read aborted at
+  # the NoC; a plausible CAPABILITIES base clock and a spec version mean the window is live and
+  # the next round may issue CMD13.
+  "clover-emmc=1",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

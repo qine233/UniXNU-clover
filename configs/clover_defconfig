@@ -38,10 +38,19 @@ CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 # The prelink roots in board.toml keep Apple's original display and GPU families, so the
 # link needs the stub archive that stands in for a driver clover does not have yet
 # (scripts/build-clover-display-stub.py, listed in [kernel] archives).
-CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-display-stub/libCloverDisplayStub.a"
+#
+# The second entry is drivers/CloverSdhci (round87). Neither one uses -Wl,-force_load, and that
+# is deliberate: this variable is appended to the link line as a plain archive path, and both
+# archives define exactly the symbols something else in the kernel already references
+# (native_legacy_display_probe from the DEVELOPMENT patch, clover_emmc_run from
+# drivers/CloverPMGR/CloverPMGR.cpp), so ordinary archive resolution pulls the member in.
+# force_load would additionally keep anything unreferenced, which here means nothing.
+CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-display-stub/libCloverDisplayStub.a {tree}/build/clover-sdhci/libCloverSdhci.a"
 
 # Not set, on purpose, and each one is a real porting task rather than a switch to flip:
-#   NATIVE_UFS          — clover boots from eMMC (sdhc_1 at 0xc0c4000); XNU has no SDHCI driver.
+#   NATIVE_UFS          — clover boots from eMMC (sdhc_1 at 0xc0c4000), not UFS; there is no XNU SDHCI
+#                         driver to configure. drivers/CloverSdhci is this board's own, and round87 is
+#                         its first round: a read-only register dump, no commands, no block device.
 #   NATIVE_ADRENO       — the sheng driver targets Adreno 740; clover has Adreno 512.
 #   NATIVE_MOBILE_DISPLAY / NATIVE_LEGACY_DISPLAY — no MDP5/EVB bring-up yet.
 #   ARMVIRT_PLATFORM    — the DT platform expert owns the tree; the virt platform would shadow it.

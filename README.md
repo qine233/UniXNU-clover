@@ -2851,13 +2851,185 @@ python3.13 scripts/decode-clover-address.py --kernel ~/clover-out/round86-in-vol
 叫 `gc_putc_normal`/`gc_putc_gotpars`、搬像素的那个叫 `video_scroll_up`），脚本会照实说 `absent from this
 image`，表里的每一条都是拿 `llvm-nm` 逐条查过名字的。
 
+### round86 的实机读数：第 60000 次 tick 打断的是**用户态**，位置在 `_puts + 4`
+
+照片（两行的接缝在 `spsr=fffffff5` + `feff6d50`，其余字段逐字清楚）：
+
+```
+ArmCpu: clock watchdog at 60000 ticks (elr=100000b3c spsr=fffffff5feff6d50
+                                       elr2=100000b3c cnt0=124f800 cnt1=0 freq=124f800)
+ticks=0xea60  ipi=0x0  sent=0x0  irq=0x13  phase=0x3  intid=0x13  typer=0x7b04f3
+pmgr=0x5 status=0x0 mode=0x2  nub=0xfffffff818932800 attached=0x1 registered=0x2
+aon=0xffffffff=>0xffffffff
+LR=0xfffffff007968b40
+```
+
+**判定表命中的是第三格**：`spsr` 低 4 位 = `0` = EL0t，而 `elr` 是个用户态地址 ⇒ 被 tick 打断的那个
+上下文当时**在跑用户态指令**，没有堵在内核里。
+
+`elr` 对着**根镜像**解（不是内核 —— 它是 EL0 地址）：`llvm-nm -n build/clover-root/launchd.macho`
+给 `_puts = 0x100000b38`，于是 `0x100000b3c` = `_puts + 4`：
+
+```
+100000b38:  bl   _write_console     <- write(2) 的 svc 在它里面（x16=4, fd 在 x22）
+100000b3c:  mov  x1, #0xe0          <- 第 60000 次 tick 打断在这里
+100000b40:  b.hs _fail
+100000b44:  ret
+```
+
+`_puts` 的八个调用点全落在 `0x10000060c .. 0x10000078c`，也就是 `_start` 的**孩子分支**（父亲在
+`_parent` 里直接 `bl _write_console`，不经过 `_puts`）。⇒ 从 round74 挂到今天的那条「孩子卡在那次
+`write` 里面」**正式出局**：write 返回了，而核在它返回后的第三条指令上被采样到。
+
+但一轮一张照片只买得起一个「出局」，因为它同时买下一个说不通的分支：`_puts + 4` 往后只有三条指令就
+`ret`，正常执行时它活不过几纳秒，在 60000 个 tick 里恰好采到它 —— 要么是撞巧，要么那个核**根本没往下
+走**。一次采样分不开这两条，因为两种情况给出的都是同一个地址：
+
+- 核真的在跑 ⇒ `msg=` 之后本该有下一行，问题从「write 堵了」变成「输出为什么丢了」；
+- 或者 `ELR_EL1` 在这个 handler 里是陈旧的（这里是第一次读它，没有自查手段）⇒ 要换的是仪器。
+
+所以下一轮把 tick 从秒表改成**采样器**：在几个阈值各存一份 `(elr, spsr, sp_el0)`，同时存内核
+`current_thread()` 里那份**软件保存的** PC —— 硬件视角与内核视角对得上、且五份全同，才谈得上「线程真的
+冻在那条指令上」。这条排在 eMMC 之后（2026-10-25 用户的话：「你先编写 emmc 驱动吧」），见 v0.2.58。
+
+其余五条读数是本轮的副产品，按字面收：
+
+| 读数 | 含义 |
+| --- | --- |
+| `ticks=0xea60` = 60000、`intid = irq = 0x13` = 19 | 看门狗在自己设定的数上响；INTID 19 第二次独立确认 |
+| `phase=0x3` | 是在 `rtclock_intr()` **之后**才撞上看门狗 ⇒ XNU 的时钟子系统被真实 tick 喂了 60000 次 |
+| `typer=0x7b04f3` | 第一次读到 GICD_TYPER：ITLinesNumber = 19 ⇒ 最大 INTID 639 ⇒ `drivers/ArmCpu/ArmCpu.cpp:122` 硬编码的 `kIpiSpiBase = 1008` **出界**（tb128fu 当年为此把基址挪到 536）。今天无害 —— 只跑一个核、没走 SPI IPI —— 但这条账从此是已知量而不是猜测 |
+| `pmgr=0x5 status=0x0 mode=0x2 aon=0xffffffff=>0xffffffff` | CloverPMGR 走完全程并用 AMFI 自己的查询证实了发布 ⇒ round83 那颗守卫壳是真答案，不是碰巧没 panic |
+| `LR=0xfffffff007968b40` = `ArmCpu::interrupt() + 0x280` | caller evidence 指回我们自己的 `panic` 调用点，说明照片上的数字没读错 |
+
+仪器上留着一处**没修好的 bug**：`cnt0 = freq = 0x124f800 = 19,194,112` = 19.2 MHz（Snapdragon 的标准
+计数频率 ✓），而 `cnt1 = 0`。60000 个 tick 之后 `CNTVCT_EL0` 不可能是 0；`panic()` 的七个实参与七个转换
+也确实一一对得上（`drivers/ArmCpu/ArmCpu.cpp:630-632`），所以矛盾没法用「读错一位」打发动掉，**tick 周期
+仍然没量到**。改法与采样器一起做：两个 counter 值先写进全局再打印，别让实参求值参与。
+
+顺带从同一份反汇编里补上一条一直缺的事实：`_exit_now` 是
+`mov x0, x23; mov x16, #1; svc #0x80; b _checkpoint`，而 `_checkpoint` 就是 `b _checkpoint` 的永久自旋
+（`0x100000ad8`）；父亲的 `wait4` 返回 0 也走同一条 ⇒ 「`exit` 不干活」在这份探针里的**表现**是卡在
+`0x100000ad8`。这次采到的是 `_puts + 4` 而不是它，于是这条也顺带被排掉一次。
+
+本轮只读照片，代码一行没动，`round86-*` 仍是当时的产物。
+
+### v0.2.58（round87）：第一次把手伸向那颗 eMMC —— 这一轮只看不写
+
+用户 2026-10-25 的话是「你先编写 emmc 驱动吧」，而它后面还挂着更早的一条要求：「你能不能让它自己把日志
+存在某个分区，然后我们读取」。两条合起来需要的能力只有一个：**内核能写闪存**。
+
+第一个硬事实决定了这一轮不能直接写驱动。这块板上唯一的 SDHCI 实现是固件里的二进制 `SdccDxe`
+（`uefi-clover/Binaries/clover/QcomPkg/Drivers/SdccDxe/SdccDxe.inf`）—— 没有源码，所以初始化序列、
+CMD 序列、HS400 tuning 全在 blob 里，**没有可抄的东西**；XNU 侧也只有 UFS 的 `NativeUfs`（tb128fu 那台
+其实是 UFS 2.2，它的 `package/BootLog.c` 形状能抄，硬件通路不能）。于是 round87 采取的形状是
+**继承而不是重新初始化**：先看固件把 `0xc0c4000` 留成什么样子。
+
+这轮只问一个问题：**这块寄存器窗口在 XNU 手里是活的吗？** 答法是把窗口映射起来、把固件留在里面的状态
+原样读出来、用 panic 屏拍照。**一个命令都不发，一个字节都不写，一次复位都不做。**
+
+| 改动 | 作用 |
+| --- | --- |
+| `drivers/CloverSdhci/SdhciRegs.h` | SDHCI 系统地址块的每个偏移与位域，外加 Qualcomm SDCC v5 的**两套**扩展布局；每一条都带 `file:line` 出处 |
+| `drivers/CloverSdhci/CloverSdhci.cpp` | mode 1：映射 → 读约 40 个寄存器 → 手拼一份 512 B 报告 → `panic ("CloverSdhci: %s", …)` |
+| `drivers/CloverSdhci/README.md` | 为什么是继承、以及读回来之后下一步做什么 |
+| `drivers/CloverPMGR/CloverPMGR.cpp` | `sheng_pmgr_run()` **尾部**调用 `clover_emmc_run()` |
+| `scripts/build-arm-driver.py` | `CloverSdhci` 进 `choices` 与 out 目录表 |
+| `configs/clover_defconfig` | `CONFIG_XNU_EXTRA_LD_ARCHIVES` 追加 `libCloverSdhci.a` |
+| `board.toml` | `[kernel] archives` 加一行构建器、`kernel_args` 加 `clover-emmc=1`、菜单标题换成本轮的问题 |
+| `scripts/check-clover.py` | 四条 round87 规则：构建器 / 归档 / boot-arg / `SHENG_PMGR` 四者必须同时成立 |
+| `scripts/verify-clover-payload.py` | 新增 `check_sdhci()`：在最终内核里钉三条串 |
+
+调度点的选择不是偷懒。设备仓没有 core XNU 的补丁位（round86 查到的那条：`feeds.py` 按 `(kind,name)`
+取第一个存在的路径，设备仓一旦建 `patches/xnu` 就会**整体顶掉**上游上百个补丁），也就没有地方登记一个
+IOKit personality；而 `bsd_init.c` 里那个 `sheng_pmgr_run()` 钩子是基仓给 clover 留好的，round83 已实机
+证明它能跑。调用点放在 **PMGR 发布成功之后**，这样「eMMC 的读数」和「PMGR 某一步失败」永远不会挤进
+同一张照片 —— 后者的 panic 先来，也先报名字。
+
+链接形状沿用 display stub：归档以**裸路径**进 `CONFIG_XNU_EXTRA_LD_ARCHIVES`，不带
+`-Wl,-force_load`，因为成员是被一个已存在的引用拉进来的（`clover_emmc_run` 由 `CloverPMGR.cpp` 调用）。
+代价是「没人引用就不进镜像」，所以这条风险被写成断言：`check_sdhci()` 直接在最终内核里钉
+`clover-emmc`、`look-only dump of c0c4000`、`CloverSdhci: failed at stage` 三条串。
+
+一张照片能读什么（报告字段 → 偏移 → 为什么是它）：
+
+| 字段 | 偏移 | 读它是因为 |
+| --- | --- | --- |
+| `cap` / `cap2` | 0x40 / 0x44 | 总线宽度、速率位、时钟基数。设备树声称这颗 SDCC 有 8-bit 总线与 HS400/HS200/DDR 1p8v，所以 `cap2` 的速率位**应当非零** |
+| `ver` … `slot` | 0xFC 那颗 u32（15:0 slot 中断状态，31:16 主机版本） | 规格版本；`ver=0x0300` 是 SDHCI 3.0，`0x0000` 就是没人应答 |
+| `pst` | 0x24 | Command Inhibit (bit 0) / Data Inhibit (bit 1)：固件退出时留着一笔没做完的传输，会直接读出来 |
+| `int` / `en` / `sig` | 0x30 / 0x34 / 0x38 | 中断状态与两级屏蔽。SDCC 的 IRQ 是 `GIC_SPI 110` ⇒ INTID **142**，和 27 那个 PPI 家族无关 |
+| `hcl` `pw` `clk` `hcn` `tmo` `rst` | 0x28 / 0x29 / 0x2C / 0x3E / 0x2E / 0x2F | 总线控制、电压位、时钟控制、Host Control 2（速率模式）、超时、软件复位 —— 复位位若还置着，说明控制器仍在 reset 里 |
+| `blk` `cnt` `tm` `cmd` `arg` `a2` `acmd` `max` | 0x04 / 0x06 / 0x0C / 0x0E / 0x08 / 0x00 / 0x3C / 0x48 | 固件最后一次事务的残留：块大小、块数、传输模式、命令、两个参数（`a2` 就是 `SDHCI_DMA_ADDRESS` 那颗）、auto-command 状态、电流能力 |
+| `rsp`（四颗） | 0x10 / 0x14 / 0x18 / 0x1C | 响应寄存器；`rsp0` 是 RCA/CSD 首字，能验证卡当年真的答过话 |
+| `clk…MHz x… div… sd…MHz` | 由 `cap` 的 15:8 与 `clk` 的分频位算 | 这块板的 SD 时钟到底是多少 MHz，以及 Linux 同款算法给出的分频 |
+| `msm v50/318`、`dll 100/200`、`dsts 108/208`、`gen 70/320` | 两套候选布局各读一遍 | `sdhci-msm.c:206` 用 0x318/0x320/0x200/0x208，`:239` 用 0x050/0x070/0x100/0x108。设备树没说这颗 SDCC 是哪一种 ⇒ 一次拍照把这个问题**定死** |
+
+看门狗保持武装（`armcpu-clock-panic=60000` 原样留着）。这不是装饰：如果某一次裸读把互联挂住，照片会是一张
+tick 看门狗 panic，`elr=` 用 `scripts/decode-clover-address.py --kernel ~/clover-out/round87-in-volume-kernel.macho`
+就能命名到 `inspectHost` 里的那条 `ldr`。
+
+产物：本轮换的是**内核**（`e87a5127…` → `eb1e2356…`），根镜像与 trust cache 一字未动。
+
+```
+scratch-data.img == signed root            OK
+trustcache == published bundle             OK
+kernel.macho: probe patch localized        OK (5960 bytes in 35 runs, sha256 014c4950…)
+kernel.macho: original-PMGR bindings alive OK (5 bindings, 0 moved; provider text present)
+kernel.macho: CloverSdhci linked           OK (三条串全在)
+```
+
+boot-args 自证：卷里抽出的 `unixnu.toml` 实到
+`… clover-pmgr=2 clover-emmc=1 armcpu-clock-panic=60000`，585 B / `a6eb9731…`，
+标题 `clover emmc: the sdhci register dump answers whether the window is live`。
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round87-payload.img` | 58720256 B | `c2fe92b33a3b7f951c14b2af5c3fd0a767fe868a00d6e638f7b2763fead34663` |
+| `round87-kernel.macho`（构建产物） | 51847168 B | `eb1e23566247d25e66e135207b0f06b15c9a8cb0294ac49075cb41843109f6b8` |
+| `round87-in-volume-kernel.macho`（卷内副本） | 51847168 B | `014c49502948bbcf7da978f2c5113352944f20926b286d481218ff2296ab9b8c` |
+| `round87-in-volume-scratch-data.img`（与 round85/86 相同） | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round87-in-volume-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` ⇒ 与 `trust_cache_sha256` 一致，无需改 |
+| `round87-in-volume-kernel.macho.adt` | 13476 B | `1390d6bcceceb1383b25ca8393ac852e93d6c62336e66d726853d3c9d9340d28`（每轮 `random-seed` 都换） |
+| `round87-in-volume-unixnu.toml` | 585 B | `a6eb97311a82e6281e80abee28fc26cef4367f2d6f2a988586d35ca43cd07d67` |
+
+刷机（永远冷刷）：
+
+```sh
+fastboot flash cache ~/clover-out/round87-payload.img
+fastboot reboot
+```
+
+**拍一张就够**：这是启动早期的一次 panic，不等 tick，也不等 EL0。
+
+判定表：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `CloverSdhci: look-only dump of c0c4000`，且 `cap` / `ver` 像样（`ver` 非 0，`cap` 的 15:8 是个正常基数） | 窗口在 XNU 手里**是活的**，固件留下的状态可读 | round88 发第一颗命令：CMD13 `SEND_STATUS`（ac, R1），只问「卡还认不认我们」，仍不碰 Data |
+| 所有字段全 0 | 接口时钟被门掉了（`iface_clk` / `core_clk` 没开），寄存器读起来是常量 0 | 这一轮变成时钟树问题。MMCC 里 SDCC1 的 RCGR 偏移**还没查到**（两次 curl 都 404），届时要么从 `SdccDxe` 二进制里扫出来，要么按 `clover.dts` 的 `clock-names` 顺序试并让 `cap` 出声 |
+| 所有字段全 `0xffffffff` | 映射成功但总线不该我们拿：NoC 侧 abort，或者那颗 SDCC 的电源域没开 | 转到 GCC / L4 电源域那一侧，别再往窗口里读 |
+| `pst` 的 Command 或 Data Inhibit 还置着 | 固件留了一笔没做完的传输 | 下一轮把 `pst` 读两次（前后各一次），判断它是自己会清还是必须发一次 `SOFTWARE_RESET` |
+| `clk` 那行给出一个说得通的 MHz，`msm v50/318` 里**只有一侧**像版本号 | 顺带定死两件事：SD 时钟到底多少，以及这颗 SDCC 用哪套 vendor 布局 | 后续寄存器表按那一侧写死，另一侧不再读 |
+| `CloverSdhci: failed at stage 3 detail c0c4000` | `IODeviceMemory::withRange` / `map` 拒了这块窗口 | 查 ADT 与设备树里 `sdhc_1` 是否被 `reserved` / `no-map` 摘掉了 |
+| 没有 `CloverSdhci`，而是 tick 看门狗先响、`elr=` 落在 `CloverSdhci` / `inspectHost` 区间 | 某一次裸读把互联挂住了 | 退到「只读 0x40 一颗寄存器」的最小版本，然后一颗一颗加回去 |
+| 什么照片都没有 | 连 `sheng_pmgr_run()` 都没到，或者 PMGR 先失败并自己报了 | 与 round86 的采样器同轮处理：先让调度点自己出声 |
+
+**这轮之后仍然没有块设备。** 读日志分区还差三样：CMD 序列（CMD0/CMD1/CMD2/CMD3/CMD9 那一串）、Data
+通路（`SDHCI_BUFFER` 的 32-bit 读或 ADMA2 表），以及 `IOBlockStorageDevice` 的形状（在
+`/Users/zhouzhou/UniXNU/drivers/NativeRamBlock/NativeRamBlock.cpp` 里有可抄的骨架）。窗口这次映射了
+就不再释放 —— 一次启动只出一张照片，没有第二次使用它的人。
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
   sheng 那条"直接从 userdata 读 APFS 卷"的路走不通。clover 走 gta4l 的形状：
   控制台优先的内核，带 `CONFIG_XNU_SOURCE_MOCKFS`，没有
-  `CONFIG_XNU_NATIVE_UFS`，`[userdata]` 留在板级文件里，等哪天有 SDHCI 驱动。
-  根设备因此不走磁盘：`v0.2.35` 用 `rd=md0` 把 payload 里的 initrd 变成内存盘，
+  `CONFIG_XNU_NATIVE_UFS`，`[userdata]` 留在板级文件里。
+  `v0.2.58` 起的 `drivers/CloverSdhci` **不是**这块缺口的答案：它是一份只读的寄存器
+  探测（不发命令、不碰 Data、不发布 `IOBlockStorageDevice`），目的是先把「固件留下的
+  SDHCI 窗口在 XNU 手里活不活」这一件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
+  `rd=md0` 把 payload 里的 initrd 变成内存盘，
   再由 mockfs 把它当作整个 `/`，`root-matching` 那条 UUID 匹配表还留在
   `/chosen` 里（`rd=md0` 会在等待循环之前就 `goto iofrootx`，所以它不参与）。
 - **没有 GPU。** `NativeAdreno` 面向 Adreno 740；这块板子是 Adreno 512。

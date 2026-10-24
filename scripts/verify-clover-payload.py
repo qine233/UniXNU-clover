@@ -94,6 +94,21 @@ def check_pmgr(kernel: bytes) -> bool:
     return ok
 
 
+def check_sdhci(kernel: bytes) -> bool:
+    """drivers/CloverSdhci is linked as a plain archive, not with -force_load (see
+    configs/clover_defconfig), so nothing but a reference keeps it: the link would silently drop
+    the whole eMMC instrument if the call in sheng_pmgr_run() ever went away. Its three strings
+    are the proof the member is in this image -- the boot argument it parses, the dump it builds,
+    and the panic every failure path takes."""
+    label = "kernel.macho: CloverSdhci linked"
+    found = {name: name.encode() in kernel
+             for name in ("clover-emmc", "look-only dump of c0c4000", "CloverSdhci: failed at stage")}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def report(image: pathlib.Path) -> int:
     print(f"== {image}")
     ok = True
@@ -147,6 +162,7 @@ def report(image: pathlib.Path) -> int:
             ok &= localized
     if kernel is not None:
         ok &= check_pmgr(kernel)
+        ok &= check_sdhci(kernel)
     return 0 if ok else 1
 
 
