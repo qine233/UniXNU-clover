@@ -164,6 +164,31 @@
 // the label write finishes and the process leaves from there, and nothing at all if
 // the label write is the one that hangs after painting.
 //
+// Round 79 returned the second of those: still `[clover] el0 mach: msg=`, still no
+// line from the parent. The probe was never reached, so the label write is the call
+// that took its characters to the screen and then did not come back. That shape has
+// a name in this kernel: ttwrite fills tp->t_outq, ttstart drains it through
+// kmoutput, and the only place past the draining where the call can stop is the
+// ovhiwat sleep on TSA_OLOWAT with tp->t_timeout (bsd/kern/tty.c:2656) -- and a
+// timeout on this board is an unbounded sleep, which round 77 proved.
+//
+// But one photograph cannot separate three states, and the third is new: the label
+// write returned, the child's exit ran, the parent woke -- and it is the parent's
+// print of the status line that is missing. All three say "nothing after msg=". So
+// v0.2.50 asks which of them it is without using the console at all: the parent, on
+// waking, writes nothing and leaves through exit(512 + signal byte), and initproc's
+// exit is what paints the panic screen -- a channel this port has already shown
+// works while the tty is under suspicion (scripts/xnu-panic-screen.c prints straight
+// to the framebuffer and never calls vcputc). Three readings, and the one that is
+// silent is the one that means the child really is inside that write:
+//
+//   panic `exit status 512`        the label write returned, the child exited, wait4
+//       woke. Whatever is missing is a *print*, by either process, and the tty is
+//       guilty from that byte onward.
+//   panic `exit status 512 + N`    the child died of signal N instead (9 = SIGKILL).
+//   no panic screen                the child never died: it is stuck in the write,
+//       with the parent asleep behind it and nothing else running.
+//
 // Why the console has to be opened by us. Round 65 retired the assumption that
 // fd 1 is a console: this XNU has no open_console() at all, bsd_init hands
 // initproc an empty descriptor table, and the console is just a devfs node --
@@ -490,12 +515,12 @@ _start:
   bl _puts
 
   // Round 79's marker, and the only new instruction in the child: leave here,
-  // after the label write and before the digits write. The parent is sitting in a
-  // blocking wait4 for exactly this, so its status line says which of the two
-  // writes is the one that never returned: 114688 (448 << 8) with `msg=` painted
-  // means the label write came back and the process left whole, and no status line
-  // at all means the label blocked on its way out of ttwrite, after its own
-  // characters were already on the panel.
+  // after the label write and before the digits write. Round 79 showed this branch
+  // is never reached -- the panel stops at the label and the parent never wakes --
+  // so the write below is the call under test. It stays exactly as it was; v0.2.50
+  // changes only how the parent reports, which is what round 79's photograph cannot
+  // settle (its label returning, the child exiting, and the parent's own print being
+  // the missing one are all the same picture).
   mov x23, #448
   b _exit_now
 
@@ -988,18 +1013,23 @@ _parent:
   // A blocking wait4 is both halves of the parent's job at once. It leaves the
   // processor, which rounds 70-74 proved is what lets the child print, and it wakes
   // for exit and for SIGKILL but never for a parked thread, which is the distinction
-  // the last four rounds kept missing. The child supplies the third case: it calls
-  // exit(448) as the instruction right after its number, so the parent's status line
-  // reads three ways and needs no panic screen to be believed -- and no panic screen
-  // means the console keeps the child's lines instead of wiping them.
+  // the last four rounds kept missing. Rounds 78-79 read that wake-up off the console,
+  // and round 79 showed why that was the wrong instrument: with the tty itself under
+  // suspicion, a missing print tells you nothing about who is stuck. So v0.2.50 keeps
+  // the wait4 and replaces the parent's report: on waking it writes no character and
+  // exits with 512 + (status & 0xff), which reaches the panel through the panic
+  // screen -- initproc's exit, a kernel printf straight to the framebuffer, and the
+  // one channel on this board that has already been seen to work while the tty was
+  // not (scripts/xnu-panic-screen.c, proven in round 76).
   //
-  //   waited pid=2 status=114688        448 << 8: the number went out, the probe
-  //       finished, and whatever ate it in round 77 was the parent's sleep, not the
-  //       write.
-  //   waited pid=2 status=N, N < 256    killed inside that write, low byte = signal.
-  //       9 is SIGKILL, which is what the guard exceptions looked like in round 72.
-  //   no waited line, ever             the write never returned, with the core on
-  //       offer and the parent asleep: the tty path itself is where this stops.
+  //   panic `exit status 512`          the child's exit(448) ran with its label
+  //       painted, wait4 woke, and the parent left. Everything in both processes
+  //       outside the console works; the only thing missing since round 78 is a
+  //       print, by whoever makes it.
+  //   panic `exit status 512 + N`      the child died of signal N instead of
+  //       exiting: 9 is SIGKILL, which is the guard-exception shape from round 72.
+  //   no panic screen, ever            the child never died, so it is inside that
+  //       write, with the parent asleep behind it and nothing else left to run.
   mov x0, x19                       // our child, not any child
   adrp x1, _scratch@PAGE
   add x1, x1, _scratch@PAGEOFF
@@ -1014,63 +1044,32 @@ _parent:
   b _checkpoint
 
 _wait_error:
-  // The call itself failed, which is its own answer: the parent is alive, the
-  // console is alive, and wait4 says this process has no child to wait for.
-  mov x24, x0
-  adrp x1, _wait_err@PAGE
-  add x1, x1, _wait_err@PAGEOFF
-  adrp x2, _wait_err_end@PAGE
-  add x2, x2, _wait_err_end@PAGEOFF
-  sub x2, x2, x1
-  bl _puts
-  mov x0, x24
-  bl _print_line
-  b _checkpoint
+  // The call itself failed. It says so through exit, not through the console:
+  // ECHILD here would mean there is no child at all, and that is a reading about
+  // the fork, so it must arrive even if the tty is the thing under test.
+  mov x1, #544                      // stage 17 * 32
+  b _fail
 
 _wait_reaped:
-  mov x20, x0                       // the reaped pid
   adrp x0, _scratch@PAGE
   add x0, x0, _scratch@PAGEOFF
   ldr x24, [x0]                     // raw wait status: exit code << 8, or signal
 
-  adrp x1, _wait_banner@PAGE
-  add x1, x1, _wait_banner@PAGEOFF
-  adrp x2, _wait_banner_end@PAGE
-  add x2, x2, _wait_banner_end@PAGEOFF
-  sub x2, x2, x1
-  bl _write_console
-  mov x1, #128
-  b.cs _fail
-  mov x0, x20
-  bl _print_dec
-  mov x1, #128
-  b.cs _fail
-
-  adrp x1, _wait_mid@PAGE
-  add x1, x1, _wait_mid@PAGEOFF
-  adrp x2, _wait_mid_end@PAGE
-  add x2, x2, _wait_mid_end@PAGEOFF
-  sub x2, x2, x1
-  bl _write_console
-  mov x1, #128
-  b.cs _fail
-  mov x0, x24
-  bl _print_dec
-  mov x1, #128
-  b.cs _fail
-
-  adrp x1, _newline@PAGE
-  add x1, x1, _newline@PAGEOFF
-  adrp x2, _newline_end@PAGE
-  add x2, x2, _newline_end@PAGEOFF
-  sub x2, x2, x1
-  bl _write_console
-  mov x1, #128
-  b.cs _fail
-
-  // Both processes did their whole dance: stay here with the three lines on
-  // the panel. A parked parent behind its child's obituary is the reading.
-  b _checkpoint
+  // Round 80's whole change, and it is in the parent: having woken, leave through
+  // exit without writing a single character. The panic screen is the only channel
+  // left, and it is the one path on this board proven not to go through the tty
+  // (scripts/xnu-panic-screen.c writes the framebuffer with its own printf), so a
+  // code appearing there can no longer be confused with the console being dead.
+  //   512 (16 * 32)            the child's exit(448) ran, its status came back with
+  //       the signal byte zero, and wait4 woke -- so the label write returned and
+  //       the only thing that can still be missing is a *print* by either process.
+  //   512 + N, N < 256         the child died of signal N instead (9 = SIGKILL).
+  //   no panic screen, ever    the child never died: it is still inside that write,
+  //       with the parent asleep behind it.
+  mov x23, #512
+  and x24, x24, #0xff
+  add x23, x23, x24
+  b _exit_now
 
 _exit_now:
   mov x0, x23
@@ -1271,15 +1270,6 @@ _envp:
   .space 8                          // { NULL }, same
 _msgbuf:
   .space 48                         // 24-byte mach_msg_header_t, then room for what comes back
-_wait_banner:
-  .ascii "[clover] el0 init: waited pid="
-_wait_banner_end:
-_wait_mid:
-  .ascii " status="
-_wait_mid_end:
-_wait_err:
-  .ascii "[clover] parent: wait4 error "
-_wait_err_end:
 _newline:
   .ascii "\n"
 _newline_end:

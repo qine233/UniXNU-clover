@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: which of the two writes never returns"
+title = "clover md0 root: did the child ever reach the parent"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -784,6 +784,24 @@ dram_size = "0x80000000"
 #     `msg=` painted means the label write came back and the digits are the hang,
 #     and no status line at all means the label write is the one that paints itself
 #     and then stops.
+#   * v0.2.50 because round 79 returned the second of those and the photograph turns
+#     out to be worth less than it looks. The probe was never reached, so the label
+#     write is the call that put its own characters on the panel and did not come
+#     back -- which is exactly what ttwrite's ovhiwat sleep on TSA_OLOWAT with
+#     tp->t_timeout (bsd/kern/tty.c:2656) would look like on a board where no
+#     deadline ever fires. But three states share that picture: the label write
+#     blocking after painting, the label write returning and the child's exit
+#     blocking, and the child exiting, the parent waking, and the parent's own status
+#     print being the missing thing. The child cannot tell them apart, and neither can
+#     a console that is itself the suspect. So this round changes only the parent's
+#     report: on waking it writes nothing at all and exits with 512 + (status & 0xff),
+#     reaching the panel through initproc's panic screen -- the one channel on this
+#     board already seen to work while the tty was under suspicion (round 76). 512
+#     means the child exited and wait4 woke, so everything outside the console in both
+#     processes works and a *print* is all that is missing; 512 + N means the child
+#     died of signal N (9 = SIGKILL, the round 72 shape); no panic screen means the
+#     child never died and is genuinely inside that write. The child is untouched from
+#     round 79, and so is the wait4.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -793,7 +811,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["cabc9d22ea035a2f99eed4479de70b57e0fe8ce499003065545343f02022adef"]
+trust_cache_sha256 = ["544369a3e44d11faf3c881c31bb965ff19acf20f5490b9de31071584e04e3047"]
 kernel_args = [
   "-v",
   "serial=3",
