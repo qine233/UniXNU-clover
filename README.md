@@ -2053,7 +2053,7 @@ fastboot reboot
 | `round79-payload.img` | 58720256 B | `17c422c18ef8f55191852676e194c0c4e3c5ecaa79209ffd22d3ef373f64c840` |
 | `round79-scratch-data.img`（launchd.macho） | 35520 B | `4522dff71879b7f1141e19865db4d961a372e06d50feb5491256bc28829c4238`，cdhash `f3992a47accc44bef4c4a583bd45cf4106cee693` |
 | `round79-kernel.macho.trustcache` | 56 B | `cabc9d22ea035a2f99eed4479de70b57e0fe8ce499003065545343f02022adef` |
-| `round79-kernel.macho.adt` | 13476 B | `2329d37bc72b978d940725ae624fe291b34e44e5e09e41c3171650f6a204098`（每轮 `random-seed` 都换） |
+| `round79-kernel.macho.adt` | 13476 B | `2329d37bc72b978d940725ae624fe291b34e44e5e09e41c3171650f68a204098`（每轮 `random-seed` 都换） |
 
 卷内 `unixnu.toml` 493 B `efa4d6955ac69e9c…`，boot-args 依旧
 `-v serial=3 debug=0x14e kt_fixed_zones=120 boot-progress=2 rd=md0 allow_legacy_mach_msg=1`，
