@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: EL0 child execs launchd"
+title = "clover md0 root: EL0 sends one mach msg"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -629,6 +629,25 @@ dram_size = "0x80000000"
 #     the descriptor table crossed the boundary), `child: exec /sbin/launchd`
 #     under it, and no waited line, because the parent is still asleep. A refused
 #     exec prints `exec errno=N` and exits 9, which the parent reports as 2304.
+#   * round 71 read six lines and the last was the exec'd copy's own banner with
+#     `console fd=1`: namei, the mockfs read, the second AMFI check and the
+#     address-space swap all work, and no waited line appeared because that
+#     child never exited again.
+#   * v0.2.42 asks about mach, because launchd is nothing but a message loop and
+#     this task did not come from a parent's posix_spawn. The trap ABI is not the
+#     BSD one: handle_svc (osfmk/arm64/sleh.c) reads x16 through
+#     get_saved_state_svc_number, which truncates to a signed int, and
+#     mach_syscall (osfmk/arm64/bsd_arm64.c) negates it to index
+#     mach_trap_table - so x16 holds the negated table position (thread_self 27,
+#     task_self 28, host_self 29, mach_reply_port 26, mach_msg 31). The return is
+#     x0 only: arm_set_mach_syscall_ret writes no x1 and never touches the carry
+#     flag, so the b.cs habit does not apply, and for the four entries marked
+#     .mach_trap_returns_port x0 is the port name (MACH_PORT_NULL on failure).
+#     ipc_task_enable runs on both paths that made this task (kern_exec.c:4445,
+#     kern_fork.c:597), so the probe expects live names. It prints three self
+#     ports, one reply port, then sends a 24-byte header to that port and
+#     receives it back with a 3 second timeout, and exits 11 - not a stage code,
+#     so the parent's status of 2816 can only mean the probe finished.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -638,7 +657,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["d7ada04a7c0ea8436c8b9eb8b178ee210d89b7b43a1b959d79216fe967323617"]
+trust_cache_sha256 = ["ecef35eb97a0720f4c3d8f0a0d9e14f97773e3af9b2a8602e9ae0c4dbf19d571"]
 kernel_args = [
   "-v",
   "serial=3",

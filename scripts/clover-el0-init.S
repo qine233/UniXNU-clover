@@ -63,6 +63,19 @@
 // descriptor table surviving the swap. A refused exec prints its errno and
 // exits with 9, which the parent reports as 2304.
 //
+// Round 71 came back with exactly that: six lines, the last one the new image's
+// own banner with fd 1, and no waited line, because the exec'd child never
+// exited. So namei, the mockfs read, the second AMFI check and the address space
+// swap all work. What has still never been attempted from EL0 on this hardware
+// is a mach trap -- and launchd is nothing but a mach message loop, so initproc
+// cannot be replaced until one retires. v0.2.42 therefore asks that one
+// question, in the exec'd copy only: three self ports (thread_self, task_self,
+// host_self), a reply port made from nothing, and one plain message sent to it
+// and received back. Each step prints its own line, so the panel says where the
+// IPC path stopped, and the copy then exits with 11 so the parent's waited line
+// confirms the probe finished rather than the round merely running out of
+// screen.
+//
 // Why the console has to be opened by us. Round 65 retired the assumption that
 // fd 1 is a console: this XNU has no open_console() at all, bsd_init hands
 // initproc an empty descriptor table, and the console is just a devfs node --
@@ -176,6 +189,216 @@ _start:
   // A failure leaves through _exit_now with stage * 32 + errno; the panic text
   // that follows it is self-contained and needs no banner on the panel.
   cbnz x23, _exit_now
+
+  // The mach probe, in the exec'd copy only.
+  //
+  // Round 71 proved a process can replace itself. What it did not prove is the
+  // thing launchd actually is: a mach message server. Every launchd syscall is
+  // either a BSD call or a mach trap, and this process is unusual in the first
+  // place -- it was not posix_spawn'ed by a parent, it is the task
+  // bsd_utaskbootstrap built, reached through our own fork+exec. Whether its IPC
+  // space answers at all is untested, and if it does not, nothing above initproc
+  // can ever run.
+  //
+  // The ABI is not the BSD one and this tree says so. handle_svc
+  // (osfmk/arm64/sleh.c) reads x16 through get_saved_state_svc_number, which
+  // truncates it to a *signed int*: negative goes to mach_syscall, non-negative
+  // to unix_syscall. mach_syscall (osfmk/arm64/bsd_arm64.c) then does
+  // call_number = -call_number and indexes mach_trap_table, so x16 must hold the
+  // negated table position: thread_self is /* 27 */, task_self /* 28 */,
+  // host_self /* 29 */, mach_reply_port /* 26 */, mach_msg /* 31 */.
+  //
+  // And the return is not the BSD return either: arm_set_mach_syscall_ret writes
+  // x0 and nothing else -- no x1, and the carry flag is never touched, so the
+  // b.cs habit from the BSD path would read a stale flag here. For the four
+  // traps marked .mach_trap_returns_port the value in x0 is the port name
+  // itself, and MACH_PORT_NULL is how they report failure.
+  cmp x19, #1
+  b.eq _skip_mach
+
+  mov x16, #-27                       // thread_self
+  svc #0x80
+  mov x24, x0
+  mov x16, #-28                       // task_self
+  svc #0x80
+  mov x21, x0                         // pagesize was in x21 and has been printed
+  mov x16, #-29                       // host_self
+  svc #0x80
+  mov x26, x0
+
+  adrp x1, _mach_self@PAGE
+  add x1, x1, _mach_self@PAGEOFF
+  adrp x2, _mach_self_end@PAGE
+  add x2, x2, _mach_self_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+
+  // Three non-zero names is the whole answer to "is this task's IPC space on".
+  mov x0, x24
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+  adrp x1, _mach_task@PAGE
+  add x1, x1, _mach_task@PAGEOFF
+  adrp x2, _mach_task_end@PAGE
+  add x2, x2, _mach_task_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  mov x0, x21
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+  adrp x1, _mach_host@PAGE
+  add x1, x1, _mach_host@PAGEOFF
+  adrp x2, _mach_host_end@PAGE
+  add x2, x2, _mach_host_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  mov x0, x26
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+  adrp x1, _newline@PAGE
+  add x1, x1, _newline@PAGEOFF
+  adrp x2, _newline_end@PAGE
+  add x2, x2, _newline_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+
+  // A port to talk to, with no parent and no namespace: mach_reply_port takes
+  // zero arguments and hands back a fresh receive right in this task's space.
+  mov x16, #-26
+  svc #0x80
+  mov x25, x0
+  adrp x1, _mach_reply@PAGE
+  add x1, x1, _mach_reply@PAGEOFF
+  adrp x2, _mach_reply_end@PAGE
+  add x2, x2, _mach_reply_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  mov x0, x25
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+  adrp x1, _newline@PAGE
+  add x1, x1, _newline@PAGEOFF
+  adrp x2, _newline_end@PAGE
+  add x2, x2, _newline_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  cbz x25, _mach_done                 // no right: there is nothing to send to
+
+  // One plain message, sent to that port and received back from it. The header
+  // is mach_msg_header_t as this tree defines it for LP64 (osfmk/mach/message.h
+  // :577): bits, size, remote, local, voucher, id -- six fields, 24 bytes.
+  // msgh_bits is MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0) = 20, and
+  // MACH_MSG_TYPE_MAKE_SEND is documented there as "Must hold receive right",
+  // which is exactly what the reply port is.
+  adrp x7, _msgbuf@PAGE
+  add x7, x7, _msgbuf@PAGEOFF
+  mov w8, #20
+  str w8, [x7, #0]                    // msgh_bits
+  mov w8, #24
+  str w8, [x7, #4]                    // msgh_size
+  str w25, [x7, #8]                   // msgh_remote_port
+  str wzr, [x7, #12]                  // msgh_local_port
+  str wzr, [x7, #16]                  // msgh_voucher_port
+  str wzr, [x7, #20]                  // msgh_id
+
+  // mach_msg(msg, option, msgt_size, msgo_size, rcv_name, timeout, reserved):
+  // seven arguments, taken from x0..x6 in order by arm_get_mach_syscall_args.
+  // x7 keeps the buffer pointer across the calls; it is not an argument
+  // register, so the trap has no reason to touch it.
+  mov x0, x7
+  mov x1, #1                          // MACH_SEND_MSG
+  mov x2, #24                         // bytes to send: the header
+  mov x3, #0
+  mov x4, #0
+  mov x5, #0
+  mov x6, #0
+  mov x16, #-31
+  svc #0x80
+  mov x20, x0                         // the send's kern_return_t
+
+  mov x0, x7
+  mov x1, #0x102                      // MACH_RCV_MSG | MACH_RCV_TIMEOUT
+  mov x2, #0
+  mov x3, #48                         // buffer size, and the header is 24 of it
+  mov x4, x25                         // rcv_name
+  mov x5, #3000                       // ms: a hung receive must not hang the round
+  mov x6, #0
+  mov x16, #-31
+  svc #0x80
+  mov x21, x0                         // the receive's kern_return_t
+  ldr w24, [x7, #4]                   // msgh_size as it came back
+
+  adrp x1, _mach_send@PAGE
+  add x1, x1, _mach_send@PAGEOFF
+  adrp x2, _mach_send_end@PAGE
+  add x2, x2, _mach_send_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  mov x0, x20
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+  adrp x1, _mach_rcv@PAGE
+  add x1, x1, _mach_rcv@PAGEOFF
+  adrp x2, _mach_rcv_end@PAGE
+  add x2, x2, _mach_rcv_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  mov x0, x21
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+  adrp x1, _mach_size@PAGE
+  add x1, x1, _mach_size@PAGEOFF
+  adrp x2, _mach_size_end@PAGE
+  add x2, x2, _mach_size_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  mov x0, x24
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+  adrp x1, _newline@PAGE
+  add x1, x1, _newline@PAGEOFF
+  adrp x2, _newline_end@PAGE
+  add x2, x2, _newline_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+
+_mach_done:
+  // Leave, so the parent's wait4 line confirms the probe ran to the end rather
+  // than the panel merely showing the last line it got to. 11 is not a stage
+  // code: every stage is a multiple of 32 plus an errno, so the parent's status
+  // of 11 << 8 = 2816 can only mean "the exec'd copy finished its mach probe".
+  mov x0, #11
+  mov x16, #1
+  svc #0x80
+
+_skip_mach:
 
   // Only pid 1 forks.
   //
@@ -606,11 +829,34 @@ _exec_try_end:
 _exec_fail:
   .ascii "[clover] el0 child: exec errno="
 _exec_fail_end:
+_mach_self:
+  .ascii "[clover] el0 mach: thread="
+_mach_self_end:
+_mach_task:
+  .ascii " task="
+_mach_task_end:
+_mach_host:
+  .ascii " host="
+_mach_host_end:
+_mach_reply:
+  .ascii "[clover] el0 mach: reply="
+_mach_reply_end:
+_mach_send:
+  .ascii "[clover] el0 mach: send="
+_mach_send_end:
+_mach_rcv:
+  .ascii " rcv="
+_mach_rcv_end:
+_mach_size:
+  .ascii " size="
+_mach_size_end:
 .balign 8
 _argv:
   .space 16                         // { "/sbin/launchd", NULL }, filled in at run time
 _envp:
   .space 8                          // { NULL }, same
+_msgbuf:
+  .space 48                         // 24-byte mach_msg_header_t, then room for what comes back
 _wait_banner:
   .ascii "[clover] el0 init: waited pid="
 _wait_banner_end:
