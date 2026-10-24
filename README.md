@@ -110,8 +110,15 @@ cd ../UniXNU
 ./unixnu build payload --unique-chip-id 0x<device seed> --uefi ../mu-clover \
   --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
   --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
-./unixnu build boot
+./unixnu bootimg --uefi ../mu-clover --target RELEASE \
+  --dtb ../mu-clover/Resources/DTBs/clover.dtb --ramdisk none
 ```
+
+最后一行是 boot 分区唯一需要的命令：`unixnu` 没有 `build boot` 这一步（`build` 的子步是
+kernel/package/firmware/payload/userdata/prelink），boot 镜像由 `bootimg` 从 `--fd`
+（固件卷，`--target RELEASE` 下自动找）和 `--dtb`（固件构建时打过 splash 补丁的那份）
+拼出来；`--ramdisk none` 不是省略而是**必须**，否则它会把 payload 卷当 ramdisk 塞进去，
+而这块板子的固件根本看不见 ramdisk 里的卷。产物是 `out/clover/boot/boot.img`。
 
 Xcode 27 的 clang 在设备仓重建归档时不带 `-isysroot`，会拿 macOS SDK 去编译 iOS
 目标，并把 `-Wincompatible-sysroot` 当成错误；上面显式指定 iPhoneOS SDK 就是为了
@@ -2991,14 +2998,33 @@ boot-args 自证：卷里抽出的 `unixnu.toml` 实到
 | `round87-in-volume-scratch-data.img`（与 round85/86 相同） | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
 | `round87-in-volume-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` ⇒ 与 `trust_cache_sha256` 一致，无需改 |
 | `round87-in-volume-kernel.macho.adt` | 13476 B | `1390d6bcceceb1383b25ca8393ac852e93d6c62336e66d726853d3c9d9340d28`（每轮 `random-seed` 都换） |
+| `round87-boot.img`（只有固件，无 ramdisk） | 1613824 B | `196b284fc15119610260480c767a5d0a14bf18b4eed31d2e267548be1ba7d00b` |
 | `round87-in-volume-unixnu.toml` | 585 B | `a6eb97311a82e6281e80abee28fc26cef4367f2d6f2a988586d35ca43cd07d67` |
 
-刷机（永远冷刷）：
+刷机（永远冷刷）。这一轮**只换 `cache`**：boot 分区装的是固件，round87 一个字节没碰它
+（新的 `round87-boot.img` 与上一份 `clover-boot.img` 只差 21 字节 —— gzip 头里那个 `OS`
+字节和由它派生的 boot 头 `id` 哈希；解开后的固件是**同一份** `af09f6b3…`，1600 万字节里
+一个字都不差）：
 
 ```sh
 fastboot flash cache ~/clover-out/round87-payload.img
 fastboot reboot
 ```
+
+要连 boot 一起刷（从不必要，只是让分区状态可复现；**冷刷，先刷 boot 再刷 cache**）：
+
+```sh
+fastboot flash boot  ~/clover-out/round87-boot.img
+fastboot flash cache ~/clover-out/round87-payload.img
+fastboot reboot
+```
+
+`round87-boot.img` 由 `./unixnu bootimg --uefi ../mu-clover --target RELEASE --dtb
+../mu-clover/Resources/DTBs/clover.dtb --ramdisk none -o ~/clover-out/round87-boot.img`
+生成（两次构建逐字节相同）；头是 `ANDROID!`、`header_version 0`、`kernel_addr 0x8000`、
+`tags_addr 0x100`、`ramdisk_size 0`，kernel 段 1609203 B = gzip(BootShim + 固件卷) 加串联
+DTB。**不要**给这条命令塞 `--ramdisk`：这块板子的固件没有 ramdisk 文件系统驱动，卷塞进
+boot 里它根本看不见（见「payload 放在哪」）。
 
 **拍一张就够**：这是启动早期的一次 panic，不等 tick，也不等 EL0。
 
@@ -3019,6 +3045,26 @@ fastboot reboot
 通路（`SDHCI_BUFFER` 的 32-bit 读或 ADMA2 表），以及 `IOBlockStorageDevice` 的形状（在
 `/Users/zhouzhou/UniXNU/drivers/NativeRamBlock/NativeRamBlock.cpp` 里有可抄的骨架）。窗口这次映射了
 就不再释放 —— 一次启动只出一张照片，没有第二次使用它的人。
+
+### v0.2.59：只修文档 —— `./unixnu build boot` 这一步根本不存在
+
+这一轮不动代码、不刷机，只把「boot 分区从哪来」写对。README 的构建步骤里一直挂着
+`./unixnu build boot`，而 `unixnu` 的 `build` 只认识
+`kernel / package / firmware / payload / userdata / prelink`，跑这条会直接
+`invalid choice: 'boot'` 退出。boot 镜像真正的入口是顶层子命令 `unixnu bootimg`
+（`scripts/unixnu/bootimg.py`），它把 `gzip(BootShim + 固件卷)` 和 DTB 串成 Android
+header v0 的镜像；不传 `-o` 时落在 `out/clover/boot/boot.img`。
+
+两个参数是坑：`--target RELEASE`（不写会去找只有 DEBUG 才有的
+`Build/cloverPkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd`，这台机器上只有
+`RELEASE_CLANGPDB`），以及 `--ramdisk none`（不写就把 payload 卷当 ramdisk 塞进 boot，
+而这块板子的固件没有 ramdisk 文件系统驱动，塞了它也不亮）。`--dtb` 不会自动找，得显式给
+`../mu-clover/Resources/DTBs/clover.dtb`（固件构建时打过 splash 补丁的那份）。
+
+顺带把 round87 的产物做成可复现：`round87-boot.img`（1613824 B，`196b284f…`）两次构建
+逐字节相同，与上一份 `clover-boot.img`（`af500654…`）只差 21 字节 —— gzip 头里的 `OS`
+字节和由它派生的 boot 头 `id` 哈希，解开后都是同一份固件 `af09f6b3…`。所以 round87
+**只需要刷 `cache`**；连 boot 一起刷只是让分区状态可复现，不是修什么。
 
 ## 有意省略的部分
 
