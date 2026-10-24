@@ -172,32 +172,43 @@ _start:
   // parent sleeps in wait4; exit and wait4 have to reap it again. Everything
   // real userland does later stands on those four, and none of them has been
   // on this silicon yet.
-//
-// Round 68 came back with that banner as the last line on the panel and nothing
-// under it: no child line, no waited line, no panic, no reset. That is three
-// different stories wearing the same photo -- fork never returned in the parent,
-// the child was created but never picked up by the scheduler, or the child ran
-// and hung before its first write landed. The tty paints a character the moment
-// it arrives, so even half a line would have been evidence. Round 69 splits the
-// fork point into three separate marks: the parent prints "forked pid=" the
-// instant fork returns, the child prints one word "alive" as its very first
-// instruction, and the wait4 line stays where it was.
-//
-//   neither line          the parent is inside fork, which is a kernel problem
-//   forked, no alive      the child exists but never ran: the second CPU, its
-//                         pmap, or the scheduler not taking it
-//   forked, half alive    the child ran and its first write faulted or blocked
-//   forked, alive         both processes are on this silicon, and the round's
-//                         answer is the waited line that follows
-//
-// The two new lines can interleave byte by byte, since both processes share one
-// console tty and the tty has no writer lock here. That is fine: the reading is
-// which strings appear at all, not how neatly they sit.
+  //
+  // Round 68 came back with that banner as the last line on the panel and nothing
+  // under it: no child line, no waited line, no panic, no reset. That is three
+  // different stories wearing the same photo -- fork never returned in the parent,
+  // the child was created but never picked up by the scheduler, or the child ran
+  // and hung before its first write landed. The tty paints a character the moment
+  // it arrives, so even half a line would have been evidence. Round 69 therefore
+  // split the fork point into three separate marks: the parent printed "forked
+  // pid=" the instant fork returns, the child printed one word "alive" as its
+  // very first instruction, and the wait4 line stayed where it was.
+  //
+  // Round 69 read two identical `[clover] el0 init: forked pid=2` lines, no alive
+  // and no waited. That is not a kernel failure: it is our own ABI mistake, and the
+  // kernel says so in two lines. thread_set_child (osfmk/arm64/status.c) hands the
+  // child x0 = the child's pid and x1 = 1, and fork() in bsd/kern/kern_fork.c sets
+  // retval[1] = 0 for the parent, so both processes retire the same svc with the
+  // same pid in x0 and x1 is the only thing that tells them apart. libSystem's
+  // fork() is what turns the child's x0 back into 0; a hand-written svc gets no
+  // such service, so `cbnz x0, _parent` sent both processes down the parent path.
+  // The child then called wait4(-1) with no children of its own, got ECHILD, and
+  // fell into _fail -- which was reached by a branch, so its `ret` returned to a
+  // stale x30 and the two instructions there formed a silent spin. That is why
+  // round 68 showed nothing either: the same wrong branch, one round earlier.
+  //
+  // So the child is dispatched on x1 -- mov does not touch the carry flag, so the
+  // syscall's error still reaches b.cs -- both processes print the x0/x1 pair they
+  // were handed, and _fail now exits instead of returning: a failure that cannot
+  // print is worth a panic with a number, and a failure that spins is worth
+  // nothing at all.
   mov x16, #2
   svc #0x80
+  mov x26, x0                         // both processes see the child's pid here
+  mov x25, x1                         // 1 in the child, 0 in the parent
   mov x1, #160
   b.cs _fail
-  cbnz x0, _parent
+  cmp x25, #1
+  b.ne _parent
 
   // Child: the descriptor table is inherited, so x22 is the console here too.
   // The first thing it does is write one word. The console tty paints each
@@ -249,6 +260,34 @@ _start:
   mov x1, #224
   b.cs _fail
 
+  // The two numbers the kernel actually handed this process. x0 equals getpid
+  // and x1 is 1, which is the whole fork ABI reading in one line.
+  adrp x1, _child_x0@PAGE
+  add x1, x1, _child_x0@PAGEOFF
+  adrp x2, _child_x0_end@PAGE
+  add x2, x2, _child_x0_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  mov x0, x26
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+
+  adrp x1, _child_x1@PAGE
+  add x1, x1, _child_x1@PAGEOFF
+  adrp x2, _child_x1_end@PAGE
+  add x2, x2, _child_x1_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #224
+  b.cs _fail
+  mov x0, x25
+  bl _print_dec
+  mov x1, #224
+  b.cs _fail
+
   adrp x1, _newline@PAGE
   add x1, x1, _newline@PAGEOFF
   adrp x2, _newline_end@PAGE
@@ -264,11 +303,13 @@ _start:
   b _checkpoint
 
 _parent:
-  mov x19, x0                       // the child's pid, as fork returned it
+  mov x19, x26                      // the child's pid, as both processes saw it
 
   // fork gave the parent a number, so say so before sleeping in wait4. A panel
   // with this line and no alive line is a child that was never scheduled; a
-  // panel with neither is a parent that never came back from fork itself.
+  // panel with neither is a parent that never came back from fork itself. The
+  // x1 here is the flag the kernel did not set for us, and it is the point of
+  // the round: 0 on this line, 1 on the child's.
   adrp x1, _forked@PAGE
   add x1, x1, _forked@PAGEOFF
   adrp x2, _forked_end@PAGE
@@ -278,6 +319,19 @@ _parent:
   mov x1, #128
   b.cs _fail
   mov x0, x19
+  bl _print_dec
+  mov x1, #128
+  b.cs _fail
+
+  adrp x1, _forked_mid@PAGE
+  add x1, x1, _forked_mid@PAGEOFF
+  adrp x2, _forked_mid_end@PAGE
+  add x2, x2, _forked_mid_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #128
+  b.cs _fail
+  mov x0, x25
   bl _print_dec
   mov x1, #128
   b.cs _fail
@@ -359,12 +413,18 @@ _checkpoint:
 // Record the first failure only: later ones are consequences of the first, and
 // a sum of stage codes would decode as a different stage.
 // x0 = errno as returned by the syscall, x1 = that call's stage * 32.
+//
+// The exit, not a return: every call site reaches this by a branch, so there is
+// no frame to go back to, and rounds 68 and 69 showed what a `ret` does here --
+// x30 still points at the last helper call, the two instructions after it still
+// see the failing carry flag, and the process spins without writing another
+// character. A parked process is the one reading this port cannot tell apart
+// from a dead one, so a failure leaves and lets the panic screen carry the code.
 _fail:
-  cbnz x23, _fail_done
+  cbnz x23, _exit_now
   and x0, x0, #31
   add x23, x1, x0
-_fail_done:
-  ret
+  b _exit_now
 
 // x22 = fd, x1 = bytes, x2 = length. Leaves the carry flag as the kernel set it,
 // so the caller can test the write without a second register dance.
@@ -418,6 +478,9 @@ _tail_end:
 _forked:
   .ascii "[clover] el0 init: forked pid="
 _forked_end:
+_forked_mid:
+  .ascii " x1="
+_forked_mid_end:
 _alive:
   .ascii "[clover] el0 child: alive\n"
 _alive_end:
@@ -427,6 +490,12 @@ _child_banner_end:
 _child_mid:
   .ascii " ppid="
 _child_mid_end:
+_child_x0:
+  .ascii " x0="
+_child_x0_end:
+_child_x1:
+  .ascii " x1="
+_child_x1_end:
 _wait_banner:
   .ascii "[clover] el0 init: waited pid="
 _wait_banner_end:

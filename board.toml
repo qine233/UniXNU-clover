@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: EL0 init reports fork"
+title = "clover md0 root: EL0 fork dispatches on x1"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -592,6 +592,25 @@ dram_size = "0x80000000"
 #     processes on this silicon, and the waited line decides the rest. The two
 #     lines may interleave byte by byte, since one console tty has no writer
 #     lock; the reading is which strings appear at all, not how they sit.
+#     Round 69 read two identical `[clover] el0 init: forked pid=2` lines and
+#     nothing else, which is neither of those three stories: it is the fork ABI.
+#     thread_set_child (osfmk/arm64/status.c) gives the child x0 = its own pid
+#     and x1 = 1, and fork() (bsd/kern/kern_fork.c) sets retval[1] = 0 for the
+#     parent, so both processes retire the same svc with the same number in x0
+#     and only x1 tells them apart - libSystem is what turns the child's x0 into
+#     0, and a hand-written svc gets no such service. `cbnz x0, _parent`
+#     therefore sent both processes down the parent path, which also explains
+#     round 68: the child's wait4(-1) has no children to wait for, it took
+#     ECHILD into _fail, and because _fail was reached by a branch its `ret`
+#     went back to a stale x30 and spun there without writing another character.
+#   * v0.2.40 dispatches on x1 (mov leaves the carry flag alone, so b.cs still
+#     sees the syscall's error), prints the x0/x1 pair each process was handed,
+#     and makes _fail exit instead of returning, so no failure can turn into a
+#     silent spin again. The reading this round wants is four lines: the banner,
+#     `forked pid=2 x1=0`, `child: pid=2 ppid=1 x0=2 x1=1` and `waited pid=2
+#     status=1792`. The child's x0 matching its own getpid is the ABI confirmed;
+#     the waited line is exit and wait4 closing the loop, which nothing has
+#     proved yet on this silicon.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -601,7 +620,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["c662d13849495396d4bd94ee3c7964ad7646bb9f06b4686c4e945f2a5e8a82ee"]
+trust_cache_sha256 = ["d476c073c4449535503c95b1cba2cf4c2d77fb1e05f69594d159369453e08412"]
 kernel_args = [
   "-v",
   "serial=3",
