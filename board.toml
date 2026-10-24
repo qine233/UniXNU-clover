@@ -900,6 +900,32 @@ dram_size = "0x80000000"
 #     as `exit status 0` and a SIGSTOP as `exit status 127`. The parent now builds a code that fits
 #     (0 = our exit(448), 1 = exited another way, 32+N = signal N, 96+N = stopped on N) and the
 #     panic screen's own readings are unchanged.
+#   * round84's reading came back as the last row of its table -- msg= painted, no panic screen,
+#     nothing added after two minutes -- and it is the most informative photograph of the ten,
+#     because for the first time the child's whole history is legible: eight lines below the boot
+#     log, from `el0 child: alive` through `thread=259 task=515 host=771` and `reply=1827` to the
+#     `msg=` label itself. Three claims die in that picture. The exec'd child's write() has already
+#     returned at least eight times; three of those eight were bare `_puts` labels with no trailing
+#     newline, so "only writes ending in \n come back" is out too; and the newline that produced the
+#     `msg=` row scrolled the whole panel, so gc_scroll_up/vc_scroll_up/video_scroll_up are not the
+#     blocker either. What is left is that this write is indistinguishable from the eight that
+#     worked, and that the photograph still cannot separate (a) the write never returned,
+#     (b) it returned and the child's exit() never did, and (c) both completed but the parent's
+#     blocking wait4 was never woken -- round70's parent-waking child was fork-without-exec, and
+#     whether exec keeps childproc attached has never been tested here. All three report through
+#     the two channels under examination. So v0.2.56 changes the channel, not the question: the
+#     child panics the kernel itself with reboot(2) (syscall 55, syscalls.master:109) using
+#     RB_PANIC|RB_QUICK = 0xc00, which kern_xxx.c:182 turns straight into
+#     panic_with_options("userspace panic: %s", message) -- no sync, no unmount, no tty, no parent.
+#     On this DEVELOPMENT_ARM64_BCM2837 kernel both the suser test (kern_xxx.c:116) and the MACF
+#     check (:142) are skipped for RB_PANIC, so nothing has to be granted for the call to work.
+#   * one more thing found while reading source for v0.2.56: `boot-progress=2` in kernel_args below
+#     is inert. CONFIG_XNU_BOOT_PROGRESS=n (configs/clover_defconfig:55), so boot_progress_active()
+#     expands to the literal 0 (boot_progress.h:22) and the branch at video_console.c:1234 is
+#     compiled away. Panel text therefore really does go through gc_putchar and the lck_ticket_t
+#     vcputc_lock at video_console.c:153, and through console_write()'s ring buffer
+#     (serial_console.c:526) -- which is what the next rounds are about. Left in place rather than
+#     deleted so this round's payload differs from round84's by the probe alone.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
