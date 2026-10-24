@@ -149,7 +149,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover pmgr: publish an ApplePMGRNub so AMFI waits for nothing"
+title = "clover tty: exit between the two writes, now that the clock runs"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -889,6 +889,17 @@ dram_size = "0x80000000"
 #     twelve lines of register dumps. This round adds three more lines of its own, so the
 #     readings come first and the caller evidence last. Kernel unchanged (44866929375b6ba9...);
 #     the screen is injected into the in-volume copy at payload time.
+#   * v0.2.55 (round 84) re-runs round 79's cut on a board that now has both a clock and a published
+#     ApplePMGRNub: the child's kill(getpid(), SIGSTOP, 0) block is deleted and its last act is
+#     exit(448) between the label write and the number write. One thing found while writing it down
+#     changed the parent too. initproc's exit reaches the panel through
+#     panic_with_options(... "%s -- no exit reason available -- (signal %d, exit status %d %s)") at
+#     kern_exit.c:1875, and that field is WEXITSTATUS(rv) = (rv >> 8) & 0xff (wait.h:144) where
+#     rv = W_EXITCODE(C, 0) = C << 8 (kern_exit.c:1466). The channel carries eight bits, so rounds
+#     80-83's 512 + sixteen-bit code was folded before it ever got there: exit(448) would have read
+#     as `exit status 0` and a SIGSTOP as `exit status 127`. The parent now builds a code that fits
+#     (0 = our exit(448), 1 = exited another way, 32+N = signal N, 96+N = stopped on N) and the
+#     panic screen's own readings are unchanged.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -898,7 +909,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["bb790ec9e2e3539dc9763af63fa10fe13ccea2d4d39e06dcf394ec3a2a2533ac"]
+trust_cache_sha256 = ["b5b064c41801cab0f0386cda47059963b5a150a31b09e4b4d862e57fd7c97099"]
 kernel_args = [
   "-v",
   "serial=3",
