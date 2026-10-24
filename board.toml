@@ -154,7 +154,7 @@ dram_size = "0x80000000"
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
 #
-# v0.2.17/v0.2.18 ask where the frame buffer went, in one run, and never reset:
+# v0.2.17-v0.2.19 ask where the frame buffer went, in one run, and never reset:
 #   * _start_first_cpu maps only the DarwinBoot window (V=P, memSize bytes), and
 #     this unit's window cannot start below 0x9D400000: everything below is
 #     reserved, the only free row is 148 MiB, and a 1 GiB window has to fit in
@@ -180,11 +180,19 @@ dram_size = "0x80000000"
 #   * v0.2.18 adds an ORANGE band at index 12 at the first call inside arm_init
 #     (_arm_set_kernel_tbi). It reads boot_args from x0 and uses no stack, no AT
 #     and no vinfo, so it answers "did arm_init start" independently of the
-#     vinfo painter. The yellow band at index 3 then paints when the call to
-#     _cpu_data_init is reached (that painter uses the seeded vinfo, the stack
-#     and an AT check). Orange without yellow puts the fault between arm_init's
-#     entry and that call; no orange means arm_init was never entered.
-#   * the two paint probes and their targets are defaults inside this
+#     vinfo painter.
+#   * v0.2.19 fixes an inverted seed guard that dates back to v0.2.15: "cbz x8"
+#     skipped the vinfo seed exactly when the mapper succeeded, so vinfo stayed
+#     zero on every successful boot and the yellow band (index 3, painted when
+#     the call to _cpu_data_init is reached, from the seeded vinfo) could never
+#     appear. It also painted the panic screen a frame buffer after a *failed*
+#     map. The guard is now "cbnz". After the displaced call returns, the same
+#     cave paints a RED band at index 13 from the callee-saved boot_args copy in
+#     x19, so "the first call returned" is a separate reading. Orange without
+#     red means _arm_set_kernel_tbi never returned; orange and red without
+#     yellow means the rebase block or the memmove before the _cpu_data_init
+#     call is the stall.
+#   * the paint probes and their targets are defaults inside this
 #     repository's scripts/patch-xnu-entry-probe.py (--no-paint/--no-paint2 turn
 #     them off), so the base repository's payload step needs no local change.
 panic_screen = true

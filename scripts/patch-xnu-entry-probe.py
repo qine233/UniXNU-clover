@@ -58,9 +58,13 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         stack, no AT and no vc_info. It defaults
                                         to _arm_init's first call, so arm_init
                                         being entered is visible separately from
-                                        the vc_info painter working. Both bars
-                                        are on by default; --no-paint/--no-paint2
-                                        turn them off.
+                                        the vc_info painter working. After the
+                                        displaced call returns it paints a third
+                                        band from the callee-saved boot_args copy
+                                        in x19, so "the call returned" is also a
+                                        distinct colour. All bars are on by
+                                        default; --no-paint/--no-paint2 turn
+                                        them off.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
 DarwinBoot paints (band index = stage). Each patch site is checked against its
@@ -99,8 +103,10 @@ def cave_limits():
 
 
 # The stage 2 cave installs page-table entries, so it gets the gap up to
-# stage 3 (0x200 bytes); the others keep one 0x100 slot each.
+# stage 3 (0x200 bytes); stage 4 paints on both sides of its displaced call and
+# may use the gap up to the mapper cave; the rest keep one 0x100 slot each.
 CAVE_LIMITS = cave_limits()
+CAVE_LIMITS[4] = HELPER_OFFSET - CAVE_OFFSETS[4]
 TIMEBASE = 19200000
 # Written into vinfo.v_type by the seed below; the panic screen cleans the data
 # cache only for a frame buffer it knows is Normal-WB (see xnu-panic-screen.c).
@@ -131,16 +137,16 @@ def paint(args, lo, hi, band):
 2:
 """
 
-# Same band but sourced from a boot_args pointer held in x0, after the MMU is on
-# (so the pointer is a KVA). No stack, no AT, no vinfo: this is the independent
-# probe used to tell "never reached arm_init" from "reached it but the vinfo
-# paint cannot draw". Caller-saved x1-x6 are clobbered, x0 is preserved for the
-# displaced call.
+# Same band but sourced from a boot_args pointer in a register, after the MMU is
+# on (so the pointer is a KVA). No stack, no AT, no vinfo: this is the
+# independent probe used to tell "never reached arm_init" from "reached it but
+# the vinfo paint cannot draw". Caller-saved x1-x6 are clobbered; the register
+# holding boot_args is only read.
 PAINT_BOOTARGS = """
-  ldr x1, [x0, #0x28]
+  ldr x1, [{reg}, #0x28]
   cbz x1, 2f
-  ldr x2, [x0, #0x38]
-  ldr x3, [x0, #0x48]
+  ldr x2, [{reg}, #0x38]
+  ldr x3, [{reg}, #0x48]
   mul x2, x2, x3
   lsr x2, x2, #4
   bic x2, x2, #7
@@ -288,11 +294,16 @@ _start:
 # exists. The seed happens with the MMU off, so vinfo is written at its
 # physical address. baseaddr stays the physical address: it is valid as an
 # address only through the V=P map, which the mapper has just extended to it --
-# so seed only when the mapping succeeded (x8), otherwise leave vinfo zero and
-# let the panic screen take its timed reset instead of faulting on the marker
-# read. No stack here: SP is a KVA and the MMU is off.
+# so seed only when the mapping succeeded (x8 == 0), otherwise leave vinfo zero
+# and let the panic screen take its timed reset instead of faulting on the
+# marker read. No stack here: SP is a KVA and the MMU is off.
+#
+# v0.2.15 had this guard inverted (cbz), so the seed only ran when the mapper
+# had failed: vinfo stayed zero on every successful boot, which silently
+# disabled the vinfo painter (and would have pointed the panic screen at an
+# unmapped frame buffer after a failure).
 SEED = """
-  cbz x8, 9f
+  cbnz x8, 9f
   ldr x9, ={vinfo}
   ldr x10, [{args}, #0x08]
   sub x9, x9, x10
@@ -729,6 +740,8 @@ def main():
     parser.add_argument('--no-paint2', action='store_true', help='leave out the independent stage 4 bar')
     parser.add_argument('--paint2-in', dest='paint2_function', default='_arm_init', help='function that makes the second painted call (default _arm_init)')
     parser.add_argument('--paint2-band', type=int, default=12, help='which 1/16th band the second bar fills (default 12)')
+    parser.add_argument('--paint2-return-band', type=int, default=13,
+                        help='band painted after the displaced call returns, from the boot_args copy in x19 (default 13)')
     parser.add_argument('--paint2-occurrence', type=int, default=1, help='which call to SYMBOL the second bar precedes (1 = first)')
     parser.add_argument('--panic-screen', action='store_true', help='draw panic() messages on the kernel frame buffer')
     parser.add_argument('--no-reset', action='store_true', help='no reset probe at all')
@@ -812,11 +825,16 @@ def main():
             raise SystemExit('--paint2-after needs the stage 4 cave, which the reset probe is using')
         sites.append((paint2_va, 4, {'callee': paint2_callee, 'target': paint2_va + 4}))
         paint2_source = ('.text\n.global _start\n_start:\n'
-                         + PAINT_BOOTARGS.format(band=args.paint2_band, lo='0x8000', hi='0xFFFF')
-                         + '  bl callee\n  b target\n.ltorg\n')
+                         + PAINT_BOOTARGS.format(reg='x0', band=args.paint2_band, lo='0x8000', hi='0xFFFF')
+                         + '  bl callee\n'
+                         # arm_init keeps boot_args in x19 before making the call
+                         # (callee-saved), so a bar painted from it after the call
+                         # can only appear if the call returned.
+                         + PAINT_BOOTARGS.format(reg='x19', band=args.paint2_return_band, lo='0x00FF', hi='0xFF00')
+                         + '  b target\n.ltorg\n')
         description += (f', stage 4 paints band {args.paint2_band} from boot_args on reaching call '
                         f'#{args.paint2_occurrence} to {args.paint2_after} in {args.paint2_function} '
-                        f'(at {paint2_va:#x}) and continues')
+                        f'(at {paint2_va:#x}), band {args.paint2_return_band} when it returns, and continues')
 
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
