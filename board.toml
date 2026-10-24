@@ -154,9 +154,10 @@ dram_size = "0x80000000"
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
 #
-# v0.2.17-v0.2.22 ask where the frame buffer went, then walk the ADT contract
-# and the kernel's CPU-feature assumptions, in one run at a time, and never
-# reset:
+# v0.2.17-v0.2.23 ask where the frame buffer went, then walk the ADT contract
+# and the kernel's CPU-feature assumptions, one run at a time. From v0.2.23 the
+# signals are timed resets again: arm_vm_init installs the kernel's own tables,
+# and after that no probe can paint.
 #   * _start_first_cpu maps only the DarwinBoot window (V=P, memSize bytes), and
 #     this unit's window cannot start below 0x9D400000: everything below is
 #     reserved, the only free row is 148 MiB, and a 1 GiB window has to fit in
@@ -220,9 +221,25 @@ dram_size = "0x80000000"
 #     `msr pan` words and the -march=armv8.1-a flags on copyio.c, pcb.c and
 #     platform_tests.c are gone from the rebuilt kernel. Only the kernel build
 #     configuration changed here; the patch script and the ADT did not.
+#   * v0.2.23 answers the run after that: all bars fired (green, blue, magenta,
+#     yellow, cyan, orange, red) and no white text appeared, so the kernel
+#     entered arm_init, both early probes returned and it died at or after
+#     `bl _arm_vm_init` - with no visible panic. arm_vm_init switches TTBR0 to
+#     the kernel's own table ("From here on out, we're off the bootstrap
+#     translation tables"), which drops the frame buffer identity map, so a
+#     panic after that point would fault on its first pixel and freeze unseen.
+#     The panic screen now queries the mapping first and reboots after 3 s when
+#     it cannot draw, and the checkpoint below reboots 10 s after the
+#     arm_vm_init call returns. Three outcomes: white text = panic before the
+#     switch; ~3 s reset = panic after it; ~10 s reset = arm_vm_init returned;
+#     no reset = a spin inside arm_vm_init.
 #   * the paint probes and their targets are defaults inside this
 #     repository's scripts/patch-xnu-entry-probe.py (--no-paint/--no-paint2 turn
 #     them off), so the base repository's payload step needs no local change.
+entry_probe_reset_delay = 10
+entry_probe_reset_after = "_arm_vm_init"
+entry_probe_reset_in = "_arm_init"
+entry_probe_reset_occurrence = 1
 panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 kernel_args = [

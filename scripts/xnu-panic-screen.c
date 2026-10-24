@@ -1,6 +1,8 @@
 /* Draw a kernel panic message, with its arguments, on the frame buffer, then stop.
  * With no usable vinfo yet (panic before the video console exists) there is
- * nothing to draw on, so that case resets after twelve seconds instead.
+ * nothing to draw on, so that case resets after twelve seconds instead; a panic
+ * after arm_vm_init dropped the bootstrap identity map, where the seeded vinfo
+ * address no longer translates, resets after three seconds.
  *
  * Taken from the sheng port (UniXNU/UniXNU-sheng, scripts/xnu-panic-screen.c) and
  * built by this repository's scripts/patch-xnu-entry-probe.py. The layout of the
@@ -73,15 +75,12 @@ static void clean_seeded (volatile struct vc_info *v)
   __asm__ volatile ("dsb sy" : : : "memory");
 }
 
-/* vinfo stays zero until the kernel's own video console exists, so a panic in
- * the first calls of arm_init cannot draw. Report that case by time instead:
- * twelve seconds then PSCI SYSTEM_RESET, which is distinguishable from the
- * six-second checkpoint reset and proves the stop was a panic, not a spin. */
-__attribute__((noreturn)) static void reset_unseen (void)
+/* Wait `seconds` (on the 19.2 MHz counter) and reboot through PSCI. */
+__attribute__((noreturn)) static void reset_after (u64 seconds)
 {
   u64 deadline;
   __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (deadline));
-  deadline += 12ULL * 19200000ULL;
+  deadline += seconds * 19200000ULL;
   for (;;) {
     u64 now;
     __asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r" (now));
@@ -96,6 +95,34 @@ __attribute__((noreturn)) static void reset_unseen (void)
                     "mov x3, xzr\n\t"
                     "smc #0");
   park ();
+}
+
+/* vinfo stays zero until the kernel's own video console exists, so a panic in
+ * the first calls of arm_init cannot draw. Report that case by time instead:
+ * twelve seconds then PSCI SYSTEM_RESET, which is distinguishable from the
+ * checkpoint reset and proves the stop was a panic, not a spin. */
+__attribute__((noreturn)) static void reset_unseen (void)
+{
+  reset_after (12);
+}
+
+/* Does EL1 currently translate this address writably? AT reports a fault in
+ * PAR_EL1.F instead of raising one. */
+static int mapped (u64 a)
+{
+  u64 par;
+  __asm__ volatile ("at s1e1w, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (a) : "memory");
+  return !(par & 1);
+}
+
+/* arm_vm_init installs the kernel's own translation tables, and the seeded
+ * vinfo address is a physical address that only the bootstrap identity map
+ * translated. Once that map is gone, every pixel of this screen would fault and
+ * turn the panic into a silent freeze. Report it by time instead: three
+ * seconds, which the ten-second arm_vm_init checkpoint reset cannot mimic. */
+__attribute__((noreturn)) static void reset_unmapped (void)
+{
+  reset_after (3);
 }
 
 static void put (struct ctx *g, u8 c)
@@ -279,6 +306,9 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   g.h    = v->v_height;
   if (g.base == 0 || v->v_depth != 32 || fmt == 0) {
     reset_unseen ();
+  }
+  if (!mapped ((u64)g.base)) {
+    reset_unmapped ();
   }
 
   /* First panic wins: a marker in the last row's first two pixels means a panic already drew
