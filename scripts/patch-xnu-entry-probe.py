@@ -74,25 +74,33 @@ channels. The stage code lives in the zero padding after the kernel entry
   trace (--trace-calls SYMBOL,...)      after the video console exists, run each
                                         named call from its own cave, paint one
                                         band and jump back. The calls between the
-                                        second PE_init_platform and a reset just
-                                        before _machine_startup are traced by
-                                        default (bands 10-14); the reset cave
-                                        paints band 15 first, so a missing band
-                                        names the call that did not return. The
-                                        bands live in the screen's lower half,
-                                        which the panic screen does not clear,
-                                        so they survive until a photo is taken.
+                                        second PE_init_platform and a checkpoint
+                                        inside arm_init are traced by default
+                                        (bands 10-14); the reset cave paints band
+                                        15 first, so a missing band names the call
+                                        that did not return. The bands live in the
+                                        screen's lower half, which the panic screen
+                                        does not clear, so they survive until a
+                                        photo is taken. The handoff checkpoint
+                                        below owns those bands and gets no trace.
   handoff ladder                        implied by --reset-before with
                                         --reset-after _machine_startup. Band 15
                                         says arm_init reached the handoff; the
                                         cave then calls _machine_startup. Band 9
                                         says _machine_conf returned, 8/7 that
                                         _kernel_bootstrap was entered and its
-                                        first printf returned, and 6 (painted
-                                        where vm_mem_bootstrap is called) is
-                                        followed by the usual timed reset. Read
-                                        the missing band: it names the call that
-                                        did not return.
+                                        first printf returned, and 6 that
+                                        vm_mem_bootstrap was called. Bands 10-14
+                                        then mark the calls vm_mem_bootstrap
+                                        makes (vm_page_bootstrap, zone_bootstrap,
+                                        vm_object_bootstrap, vm_map_init,
+                                        kmem_init), and band 5, painted when
+                                        kmem_init returns, is followed by the
+                                        usual timed reset. Read the missing band:
+                                        it names the call that did not return.
+                                        A stall before band 5 leaves no reset, so
+                                        a device that stays on is itself a
+                                        reading.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
 DarwinBoot paints (band index = stage). Each patch site is checked against its
@@ -442,18 +450,31 @@ RESET_PAINT_BAND = (15, '0x0000', '0x00FF')
 # _machine_startup and returns to arm_init only if it unexpectedly returns.
 # The calls that follow are traced instead, in execution order. Bands, all in
 # the lower half so the panic screen leaves them visible:
-#   15 red    arm_init reached the handoff and called _machine_startup
-#    9 green  _machine_conf returned
-#    8 orange _kernel_bootstrap was entered (before its first printf)
-#    7 cyan   that printf returned
-#    6 white  vm_mem_bootstrap was reached; wait a reset_delay and reset
+#   15 red     arm_init reached the handoff and called _machine_startup
+#    9 green   _machine_conf returned
+#    8 orange  _kernel_bootstrap was entered (before its first printf)
+#    7 cyan    that printf returned
+#    6 white   vm_mem_bootstrap was reached
+#   10 yellow  vm_page_bootstrap was reached
+#   11 blue    zone_bootstrap was reached
+#   12 white   vm_object_bootstrap was reached
+#   13 orange  vm_map_init was reached
+#   14 magenta kmem_init was reached
+#    5 red     kmem_init returned; wait a reset_delay and reset
 # A missing band is caused by the call immediately before it, because each one
-# paints only after the previous one returned.
+# paints only after the previous one returned. Bands 10-14 used to carry the
+# arm_init trace; that trace is retired now that arm_init has been cleared, and
+# the post-console trace stays off while the ladder is active.
 HANDOFF_ENTER_BAND = 15
 HANDOFF_LADDER = (
     {'caller': '_machine_startup', 'callee': '_machine_conf', 'mode': 'after', 'bands': (9,)},
     {'caller': '_kernel_bootstrap', 'callee': '_printf', 'mode': 'around', 'bands': (8, 7)},
-    {'caller': '_kernel_bootstrap', 'callee': '_vm_mem_bootstrap', 'mode': 'reset', 'bands': (6,)},
+    {'caller': '_kernel_bootstrap', 'callee': '_vm_mem_bootstrap', 'mode': 'enter', 'bands': (6,)},
+    {'caller': '_vm_mem_bootstrap', 'callee': '_vm_page_bootstrap', 'mode': 'enter', 'bands': (10,)},
+    {'caller': '_vm_mem_bootstrap', 'callee': '_zone_bootstrap', 'mode': 'enter', 'bands': (11,)},
+    {'caller': '_vm_mem_bootstrap', 'callee': '_vm_object_bootstrap', 'mode': 'enter', 'bands': (12,)},
+    {'caller': '_vm_mem_bootstrap', 'callee': '_vm_map_init', 'mode': 'enter', 'bands': (13,)},
+    {'caller': '_vm_mem_bootstrap', 'callee': '_kmem_init', 'mode': 'around_reset', 'bands': (14, 5)},
 )
 HANDOFF_COLOURS = {
     15: ('0x0000', '0x00FF'),   # red
@@ -461,6 +482,12 @@ HANDOFF_COLOURS = {
     8: ('0x8000', '0xFFFF'),    # orange
     7: ('0xFFFF', '0xFF00'),    # cyan
     6: ('0xFFFF', '0xFFFF'),    # white
+    10: ('0xFF00', '0x00FF'),   # yellow
+    11: ('0x00FF', '0x0000'),   # blue
+    12: ('0xFFFF', '0xFFFF'),   # white
+    13: ('0x8000', '0xFFFF'),   # orange
+    14: ('0x00FF', '0xFFFF'),   # magenta
+    5: ('0x0000', '0x00FF'),    # red
 }
 
 SOURCES = {
@@ -607,6 +634,8 @@ def handoff_source(mode, bands, vinfo, ticks):
 
     after:  call, paint when it returns, continue.
     around: paint on entry, call, paint again when it returns, continue.
+    around_reset: paint on entry, call, paint the second band when it returns,
+                  wait TICKS, reset (the end of the measured stretch).
     reset:  paint, wait TICKS, reset (the end of the measured stretch).
     """
     head = '.text\n.global _start\n_start:\n'
@@ -620,6 +649,17 @@ def handoff_source(mode, bands, vinfo, ticks):
         return (head + handoff_paint(vinfo, bands[0]) + '  bl callee\n'
                 + '  str x0, [sp, #-16]!\n' + handoff_paint(vinfo, bands[1])
                 + '  ldr x0, [sp], #16\n' + tail)
+    if mode == 'around_reset':
+        lo, hi = HANDOFF_COLOURS[bands[1]]
+        return (head + handoff_paint(vinfo, bands[0]) + '  bl callee\n'
+                + '  str x0, [sp, #-16]!\n'
+                + handoff_paint(vinfo, bands[1])
+                + '  ldr x0, [sp], #16\n'
+                + f'  mrs x1, cntpct_el0\n  ldr x2, ={ticks}\n  add x2, x1, x2\n'
+                + '1:\n  isb\n  mrs x1, cntpct_el0\n  cmp x1, x2\n  b.lo 1b\n'
+                + '  movz w0, #0x0009\n  movk w0, #0x8400, lsl #16\n'
+                + '  mov x1, xzr\n  mov x2, xzr\n  mov x3, xzr\n  smc #0\n'
+                + '2:\n  wfe\n  b 2b\n.ltorg\n')
     if mode == 'reset':
         lo, hi = HANDOFF_COLOURS[bands[0]]
         return RESET_BEFORE.format(ticks=ticks, vinfo=f'{vinfo:#x}UL',
@@ -971,11 +1011,13 @@ def main():
     if args.no_trace:
         args.trace_calls = ''
     elif args.trace_calls is None:
-        # Board default: with the checkpoint just before _machine_startup, mark
-        # every call arm_init makes after the second PE_init_platform. A trace
-        # that stops says which call did not return.
-        args.trace_calls = ','.join(TRACE_CALLS) if (args.reset_before and
-                                                     args.reset_after == '_machine_startup') else ''
+        # Board default: with a checkpoint inside arm_init, mark every call it
+        # makes after the second PE_init_platform. A trace that stops says which
+        # call did not return. The handoff checkpoint is measured by the ladder
+        # instead, which owns bands 10-14, so it gets no arm_init trace.
+        args.trace_calls = (','.join(TRACE_CALLS)
+                            if (args.reset_before and
+                                args.reset_after != '_machine_startup') else '')
     # Defaults make both post-MMU bars part of this board's kernel without a
     # local change to the base repository's payload step. Stage 3 paints from the
     # seeded vinfo; stage 4 paints from the boot_args pointer in x0. A cave that
@@ -1153,7 +1195,8 @@ def main():
             next_free = cave_va + CAVE_SIZE
         ladder_caves = []
         for site, callee, mode, bands in ladder:
-            size = 0x200 if mode == 'around' else CAVE_SIZE
+            size = {'enter': CAVE_SIZE, 'after': CAVE_SIZE,
+                    'around': 0x200, 'around_reset': 0x300}[mode]
             cave_va = zero_slot(data, next_free, size, f'{mode} cave for {callee:#x}')
             source = handoff_source(mode, bands, names['_vinfo'], TIMEBASE * args.reset_delay)
             code = assemble(source, cave_va, {'callee': callee, 'target': site + 4}, Path(tmp))

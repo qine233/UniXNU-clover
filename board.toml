@@ -363,6 +363,23 @@ dram_size = "0x80000000"
 #     Every rung paints only after the call before it returned, so the highest
 #     missing band names the call that did not return. Bands 10-14 are kept so
 #     the reading stays comparable with v0.2.28.
+#   * v0.2.30 takes the v0.2.29 device reading: the whole ladder was on screen
+#     (15, 9, 8, 7, 6, plus 10-14 and red 15) and the tablet reset after fifteen
+#     seconds, so _machine_conf returned, _kernel_bootstrap was entered, its
+#     first printf returned and vm_mem_bootstrap was called. The stall is inside
+#     vm_mem_bootstrap. The arm_init trace that owned bands 10-14 is retired;
+#     those bands now mark the calls vm_mem_bootstrap makes, and the reset moves
+#     past kmem_init:
+#       band 6  white    vm_mem_bootstrap was entered (painted before the call)
+#       band 10 yellow   vm_page_bootstrap was reached
+#       band 11 blue     zone_bootstrap was reached
+#       band 12 white    vm_object_bootstrap was reached
+#       band 13 orange   vm_map_init was reached
+#       band 14 magenta  kmem_init was reached
+#       band 5  red      kmem_init returned - wait 15 s, reset
+#     Each rung paints before its call, so a missing band names the call that
+#     did not return. A stall before band 5 leaves no reset: a tablet that stays
+#     on past twenty seconds is itself the reading.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
