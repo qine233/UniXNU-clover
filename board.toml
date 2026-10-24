@@ -154,7 +154,7 @@ dram_size = "0x80000000"
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
 #
-# v0.2.17-v0.2.25 ask where the frame buffer went, then walk the ADT contract
+# v0.2.17-v0.2.26 ask where the frame buffer went, then walk the ADT contract
 # and the kernel's CPU-feature assumptions, one run at a time. From v0.2.23 the
 # signals are timed resets again: arm_vm_init installs the kernel's own tables,
 # and after that no probe can paint.
@@ -287,10 +287,33 @@ dram_size = "0x80000000"
 #     the console renders; bars and then nothing = the stall is now inside
 #     initialize_screen/ml_io_map_unmappable or the next startup call, not at
 #     check_for_panic_log.
+#   * v0.2.26 takes the v0.2.25 device reading: the bars appeared and the tablet
+#     reset itself after about fifteen seconds, so the skipped panic-log probe
+#     was the stall: PE_create_console returned with the video console
+#     initialized, and so did the second PE_init_platform. There was still no
+#     text, which is expected rather than a fault: initialize_screen sets
+#     gc_initialized but leaves gc_enabled false (only vcattach, reached from
+#     gc_enable, sets it), and vcputc_options drops every character until both
+#     are true -- and arm_init calls PE_init_printf(FALSE), which does not
+#     attach. kprintf therefore cannot mark this stretch yet; the checkpoint
+#     moves on.
+#     The remaining body of arm_init is now traced with the same vinfo painter
+#     that has worked since v0.2.19. Each of the five calls that follow the
+#     second PE_init_platform gets a cave that runs the call, paints one band
+#     and jumps back: band 6 _ml_map_cpu_pio, 7 _cpu_timebase_init,
+#     8 _kptimer_curcpu_up, 9 _PE_init_cpu, 10 _fiq_context_init. The checkpoint
+#     is now the call to _machine_startup itself, and its cave paints band 11
+#     (red) before the 15 s wait, so the trace bands can only be blamed on a
+#     call when 11 did appear. Readings: bands 6-10 then 11 then ~15 s reset =
+#     all five calls returned and the stall is inside machine_startup; the last
+#     band before 11 missing = that call did not return; no 11 at all = the
+#     reset cave was never reached or cannot paint either; white text = a panic
+#     after the console, so photograph it.
 entry_probe_reset_delay = 15
-entry_probe_reset_after = "_PE_init_platform"
+entry_probe_reset_after = "_machine_startup"
+entry_probe_reset_before = true
 entry_probe_reset_in = "_arm_init"
-entry_probe_reset_occurrence = 2
+entry_probe_reset_occurrence = 1
 panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 kernel_args = [

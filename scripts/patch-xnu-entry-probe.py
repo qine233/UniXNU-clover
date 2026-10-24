@@ -65,6 +65,14 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         distinct colour. All bars are on by
                                         default; --no-paint/--no-paint2 turn
                                         them off.
+  trace (--trace-calls SYMBOL,...)      after the video console exists, run each
+                                        named call from its own cave, paint one
+                                        band and jump back. The calls between the
+                                        second PE_init_platform and a reset just
+                                        before _machine_startup are traced by
+                                        default (bands 6-10); the reset cave
+                                        paints band 11 first, so a missing band
+                                        names the call that did not return.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
 DarwinBoot paints (band index = stage). Each patch site is checked against its
@@ -375,6 +383,36 @@ PAINT_INFO = """
   ldp x1, x2, [sp], #64
 """
 
+# Post-console trace. PE_create_console leaves the video console initialized but
+# not enabled (gc_enabled stays false until vcattach), so kprintf text is not a
+# usable marker yet. Paint through the kernel's vc_info instead: by then
+# initialize_screen has published the frame buffer's kernel KVA there. One band
+# per call, painted after it returns, with x0 parked so a return value survives.
+TRACE_PAINT = """
+.text
+.global _start
+_start:
+  bl callee
+  str x0, [sp, #-16]!
+""" + PAINT_INFO + """  ldr x0, [sp], #16
+  b target
+.ltorg
+"""
+
+# Calls traced by default when the checkpoint resets just before
+# _machine_startup: they are what arm_init does after the second
+# PE_init_platform call. Bands follow in address order: 6 magenta, 7 cyan,
+# 8 orange, 9 green, 10 white. The reset cave paints band 11 red first, so a
+# trace that never appears can be blamed on the calls only when 11 did.
+TRACE_CALLS = ('_ml_map_cpu_pio', '_cpu_timebase_init', '_kptimer_curcpu_up',
+               '_PE_init_cpu', '_fiq_context_init')
+TRACE_BANDS = ((6, '0x00FF', '0xFFFF'),
+               (7, '0xFFFF', '0xFF00'),
+               (8, '0x8000', '0xFFFF'),
+               (9, '0xFF00', '0x0000'),
+               (10, '0xFFFF', '0xFFFF'))
+RESET_PAINT_BAND = (11, '0x0000', '0x00FF')
+
 SOURCES = {
     1: (".text\n.global _start\n_start:\n"
         + paint('x0', '0x00FF', '0xFF00', band=1)
@@ -482,19 +520,30 @@ _start:
 """ + ".ltorg\n",
 }
 
-RESET_BEFORE = """.text
+RESET_BEFORE = """
+.text
 .global _start
 _start:
+  str x0, [sp, #-16]!
+""" + PAINT_INFO + """  ldr x0, [sp], #16
+  mrs x1, cntpct_el0
+  ldr x2, ={ticks}
+  add x2, x1, x2
+1:
+  isb
+  mrs x1, cntpct_el0
+  cmp x1, x2
+  b.lo 1b
   movz w0, #0x0009
   movk w0, #0x8400, lsl #16
   mov x1, xzr
   mov x2, xzr
   mov x3, xzr
   smc #0
-1:
+2:
   wfe
-  b 1b
-"""
+  b 2b
+""" + ".ltorg\n"
 
 ROOT = Path(__file__).resolve().parents[1]
 SEGMENTS = []   # (vmaddr, vmsize, fileoff, filesize) of the kernel being patched
@@ -548,6 +597,21 @@ def find_call(data, symbols, function, name, occurrence):
     if len(hits) < occurrence:
         raise SystemExit(f'{function} has {len(hits)} call(s) to {name}, not {occurrence}')
     return hits[occurrence - 1]
+
+
+def calls_after(data, symbols, function, start_va, targets):
+    """(site, callee) of every `bl` to TARGETS in FUNCTION at or after START_VA."""
+    low, high = function_range(symbols, function)
+    hits = []
+    for va in range(max(low, start_va) & ~3, high, 4):
+        word = struct.unpack_from('<I', data, file_offset(va))[0]
+        if word >> 26 == 0b100101:
+            delta = word & 0x3FFFFFF
+            delta -= (1 << 26) if delta & (1 << 25) else 0
+            target = va + delta * 4
+            if target in targets:
+                hits.append((va, target))
+    return hits
 
 
 def assemble_c(source, va, workdir, symbols):
@@ -778,6 +842,10 @@ def main():
     parser.add_argument('--paint2-return-band', type=int, default=13,
                         help='band painted after the displaced call returns, from the boot_args copy in x19 (default 13)')
     parser.add_argument('--paint2-occurrence', type=int, default=1, help='which call to SYMBOL the second bar precedes (1 = first)')
+    parser.add_argument('--trace-calls', metavar='SYMBOL[,SYMBOL]',
+                        help='paint one band after each named call in --in returns (default: the '
+                             'calls between the second PE_init_platform and a reset before _machine_startup)')
+    parser.add_argument('--no-trace', action='store_true', help='leave out the post-console trace bands')
     parser.add_argument('--panic-screen', action='store_true', help='draw panic() messages on the kernel frame buffer')
     parser.add_argument('--no-reset', action='store_true', help='no reset probe at all')
     parser.add_argument('--occurrence', type=int, default=1, help='which call to SYMBOL (1 = first)')
@@ -785,6 +853,14 @@ def main():
     args = parser.parse_args()
     if args.reset_before and not args.reset_after:
         raise SystemExit('--reset-before requires --reset-after')
+    if args.no_trace:
+        args.trace_calls = ''
+    elif args.trace_calls is None:
+        # Board default: with the checkpoint just before _machine_startup, mark
+        # every call arm_init makes after the second PE_init_platform. A trace
+        # that stops says which call did not return.
+        args.trace_calls = ','.join(TRACE_CALLS) if (args.reset_before and
+                                                     args.reset_after == '_machine_startup') else ''
     # Defaults make both post-MMU bars part of this board's kernel without a
     # local change to the base repository's payload step. Stage 3 paints from the
     # seeded vinfo; stage 4 paints from the boot_args pointer in x0. A cave that
@@ -872,15 +948,47 @@ def main():
                         f'#{args.paint2_occurrence} to {args.paint2_after} in {args.paint2_function} '
                         f'(at {paint2_va:#x}), band {args.paint2_return_band} when it returns, and continues')
 
+    # Post-console trace. Each named call gets a paint cave of its own, placed
+    # after the mapper; the reset cave also paints band 11 before it waits, so a
+    # missing trace band can only be blamed on the calls when 11 did appear.
+    traces = []
+    wanted = [name for name in args.trace_calls.split(',') if name]
+    if wanted:
+        platform_va, _ = find_call(data, symbols_by_address, args.function, '_PE_init_platform', 2)
+        stop = function_range(symbols_by_address, args.function)[1]
+        if args.reset_after:
+            stop = min(stop, next(site for site, stage, _ in sites if stage == 4))
+        targets = {}
+        for name in wanted:
+            if name not in names:
+                raise SystemExit(f'{args.kernel} has no {name}')
+            targets[names[name]] = name
+        hits = calls_after(data, symbols_by_address, args.function, platform_va + 4, set(targets))
+        for index, name in enumerate(wanted):
+            if index >= len(TRACE_BANDS):
+                raise SystemExit(f'at most {len(TRACE_BANDS)} trace calls are supported')
+            site = next((va for va, target in hits if target == names[name] and va < stop), None)
+            if site is None:
+                raise SystemExit(f'{args.function} does not call {name} between _PE_init_platform #2 and the checkpoint')
+            if any(site == probe for probe, _, _ in sites):
+                raise SystemExit(f'trace site {site:#x} is already a probe site')
+            traces.append((site, names[name], name))
+        description += ', trace after ' + ', '.join(
+            f'{name} (band {TRACE_BANDS[index][0]})' for index, (_, _, name) in enumerate(traces))
+
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
             if paint2_source is not None and site == paint2_va:
                 source = paint2_source
             elif paint_source is not None and site == paint_va:
                 source = paint_source
+            elif stage == 4 and args.reset_before:
+                band, lo, hi = RESET_PAINT_BAND
+                source = RESET_BEFORE.format(ticks=TIMEBASE * args.reset_delay,
+                                             vinfo=f'{names["_vinfo"]:#x}UL', band=band, lo=lo, hi=hi)
             else:
-                source = RESET_BEFORE if (stage == 4 and args.reset_before) else SOURCES[stage].format(
-                    ticks=TIMEBASE * args.reset_delay, vinfo=f'{names["_vinfo"]:#x}UL')
+                source = SOURCES[stage].format(ticks=TIMEBASE * args.reset_delay,
+                                               vinfo=f'{names["_vinfo"]:#x}UL')
             code = assemble(source, caves[stage], symbols, Path(tmp))
             if len(code) > CAVE_LIMITS[stage]:
                 raise SystemExit(f'Stage {stage} code is too large')
@@ -889,8 +997,27 @@ def main():
         if not padding_fits(data, helper_va, len(helper)):
             raise SystemExit(f'No room for the {len(helper):#x}-byte mapper at {helper_va:#x}')
         data[file_offset(helper_va):file_offset(helper_va) + len(helper)] = helper
+        next_free = helper_va + len(helper)
+        trace_caves = []
+        for index, (site, callee, name) in enumerate(traces):
+            band, lo, hi = TRACE_BANDS[index]
+            cursor = (next_free + 15) & ~15
+            run = next(((start, length) for start, length in zero_runs(data, cursor)
+                        if length >= CAVE_SIZE), None)
+            if run is None:
+                raise SystemExit(f'No {CAVE_SIZE:#x}-byte padding for the trace cave after {cursor:#x}')
+            cave_va = run[0]
+            source = TRACE_PAINT.format(vinfo=f'{names["_vinfo"]:#x}UL', band=band, lo=lo, hi=hi)
+            code = assemble(source, cave_va, {'callee': callee, 'target': site + 4}, Path(tmp))
+            if len(code) > CAVE_SIZE:
+                raise SystemExit(f'Trace cave for {name} is too large ({len(code):#x} bytes)')
+            data[file_offset(cave_va):file_offset(cave_va) + len(code)] = code
+            trace_caves.append((site, cave_va, name))
+            next_free = cave_va + CAVE_SIZE
     for site, stage, _ in sites:
         struct.pack_into('<I', data, file_offset(site), branch(site, caves[stage]))
+    for site, cave_va, _ in trace_caves:
+        struct.pack_into('<I', data, file_offset(site), branch(site, cave_va))
     if args.panic_screen:
         panic_va = names['_panic']
         if word(panic_va) in (0, 0xFFFFFFFF):
@@ -899,7 +1026,7 @@ def main():
         if not text.is_file():
             raise SystemExit(f'{text} is missing')
         at = max(max(caves[stage] + CAVE_LIMITS[stage] for _, stage, _ in sites),
-                 helper_va + len(helper))
+                 helper_va + len(helper), next_free)
         at = (at + 15) & ~15
         with tempfile.TemporaryDirectory() as tmp:
             code, load, panic_entry = assemble_c(text, at, Path(tmp), names)
