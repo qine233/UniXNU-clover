@@ -3332,6 +3332,154 @@ fastboot reboot
 还差一个会应答的地址（或一次重新识别）、Data 通路（`SDHCI_BUFFER` 32-bit 或 ADMA64 表）
 和 `IOBlockStorageDevice`。日志分区那件事要等这三样齐了才开始。
 
+### round89 读数（v0.2.61 已发布）：16 个地址全静默
+
+照片里只有第一行有信息量：
+
+```
+CloverSdhci: CMD13 sweep none: 0..15 silent
+```
+
+RCA 1..15 与 0 各问了一次，没有一次带 `INT_RESPONSE`。round89 判定表的第二格命中：
+**不是「地址差一个」的问题。** 但这一行只否掉了一个猜测，没有指出剩下的路：
+
+- 从规范上说，RCA 是 1..65535 里的任意值，固件完全可以在 16 以外挑一个。所以「16 个地址
+  全灭」并不能证明「卡不应答 CMD13」——它只能证明**这 16 个地址里没有它**；
+- CMD13 是「有响应才算数」的命令。它分不开「命令根本没发出去」和「卡收下但不回话」，
+  而这两件事指向完全不同的下一步（MMCC 时钟门 vs 卡的状态/供电）；
+- round88 已经在这颗地址上等到过一次控制器自己的超时，round89 把同一件事重复了 16 次。
+  继续换地址、换命令都不会多出信息。
+
+所以 round90 不再问「你在哪个地址」，而是先问一个更底层的事实：**这颗时钟还在把命令移出去吗？**
+
+### v0.2.62（round90）：重头识别 —— CMD0 两次、CMD1/CMD2/CMD3
+
+这一轮只问两个问题，第二个问题的答案只有在第一个成立时才有意义：
+
+1. 固件交给我们的那条 200 MHz 总线上，命令通路还在不在？
+2. 如果在，卡能不能从 CMD0 开始被重新识别一遍，并把 RCA 定成我们自己选的 1？
+
+CMD13 答不了第一个问题，因为它的成功条件是**卡回话**。CMD0 不一样：它没有响应类型
+（`RESP_NONE`），SDHCI 只要把命令字移出去就置 `INT_COMMAND_COMPLETE`。于是
+`cmd0a ok` = 时钟在跳、命令在走；`cmd0a to` = 什么都没移出去，卡是否活着根本还没轮到它说话。
+这里要克制一种误读：`ok` 只证明**命令移出去了**，卡收没收下、认不认，CMD0 不会说（它没有响应）；
+「卡活着」要靠随后的 CMD1 R3 来证明。
+
+CMD0 发两次，这是这一轮的全部技巧：
+
+- **cmd0a**：在固件留下的时钟上（`clk=0007`，分频 0 = 200 MHz），什么都不改；
+- **cmd0b**：在我们把卡时钟改成 392 kHz 之后，同一条命令再来一次。
+
+两次之间夹着一次时钟改写。于是四种读数各自指向不同结论，「时钟早就没了」与「是我们把它弄坏的」
+不再混在一起。
+
+| 改动 | 作用 |
+| --- | --- |
+| `drivers/CloverSdhci/CloverSdhci.cpp` | mode 4：`SOFTWARE_RESET`（只重置命令/数据两组）→ CMD0a → 降到 392 kHz → CMD0b → CMD1 循环 → CMD2 → CMD3 |
+| `board.toml` | `clover-emmc=4`、菜单标题换成这一轮的问题 |
+| `scripts/verify-clover-payload.py` | `check_sdhci()` 的第六条串改成 `no pwr`（原因见下） |
+
+具体形状：
+
+- 先只重置 `RESET_CMD | RESET_DATA`，不用 `RESET_ALL` —— 后者会把供电与时钟一起清掉，
+  而这两个正是本轮要量的东西。重置位自清，等它自清也自带 `1 << 22` 的上限；
+- **CMD0a**：`ARGUMENT=0`、`COMMAND=0x0000`（`RESP_NONE`），等 `INT_COMMAND_COMPLETE`；
+- 降速：先清 `CARD_EN`，再写 `INT_EN | (255 的低 8 位 << 8) | (255 的高 2 位 << 6)`，
+  轮询 `INT_STABLE`，稳定后才重新置 `CARD_EN`。基数取 `CAPABILITIES` 的 15:8（round87 读到
+  `0xc8` = 200 MHz），10 位分频 255 ⇒ `200 MHz / (2 × 255) = 392 kHz`，落在识别时钟
+  100–400 kHz 的窗口里；
+- **CMD0b**：同一条无响应命令，在 392 kHz 上再发一次；
+- **CMD1**：`OCR = 0x40FF8080`（EDK2 的 `EMMC_CMD1_CAPACITY_GREATER_THAN_2GB`），
+  短响应、不查 CRC/索引（R3 本来就没有）。最多 200 次，只有 R3 的 bit31（PowerUp）置起来才算过；
+  卡回了话但 bit31 一直不置时报告 `no pwr`；
+- **CMD2**：长响应 + CRC（R2，CID）；**CMD3**：短响应 + CRC + 索引（R1），
+  `ARGUMENT = 1 << 16`，RCA 由我们自己定成 1。
+
+顺序与常量都有本地一手源码可对：`Mu_Basecore/EmbeddedPkg/Universal/MmcDxe/MmcIdentification.c`
+的 `:572`（CMD0）、`:588`（CMD1 循环）、`:619`（进入 `EmmcIdentificationMode`）、`:141` 起
+（CMD2 → `RCA = ++mEmmcRcaCount` = 1 → CMD3 → CMD9 → CMD7），以及
+`EmbeddedPkg/Include/Protocol/MmcHost.h:64-65` 的 `0x00FF8080` / `0x40FF8080`。
+
+报告仍然是 7 行（最长一行 58 字符，小于面板的约 66，不会折行）。下面是形状示例，不是读数：
+
+```
+CloverSdhci: pre clk=0007 pw=0b hc=38 hn=0003 pst=01f800f0
+cmd0a ok rst=1 int=00000001
+clk2=ff07 st=1 en=1 div=255 392kHz
+cmd0b ok int=00000001
+cmd1 ok tries=2 rsp=c0ff8080
+cmd2 ok rsp=15010047...
+cmd3 ok rca=0 state=2 rsp=00010000
+```
+
+`cmd3` 那一行有个**必须提前说清的坑**：eMMC 的 R1 里 bits 31:16 是保留位，RCA 不像 SD 那样
+回读，所以 `rca=0` 是正常的；判定成功看的是 `ok` 与 `state=2`（identification）。state 反映的是
+命令生效**之前**的状态；CMD3 之后卡才进 stand-by，`state=3` 要等下一颗命令（下一轮的
+CMD9/CMD7）才会出现在 R1 里。
+
+产物：这一轮又换内核（`92eb373a…` → `e0adb6c5…`，+16384 B），根镜像与 trust cache 一字未动；
+卷内副本 `fb905074…`。
+
+```
+scratch-data.img == signed root            OK
+trustcache == published bundle             OK
+kernel.macho: probe patch localized        OK (5960 bytes in 35 runs, sha256 fb905074…)
+kernel.macho: original-PMGR bindings alive OK (5 bindings, 0 moved; provider text present)
+kernel.macho: CloverSdhci linked           OK (六条串全在)
+```
+
+第六根钉子是 `no pwr` 而不是报告里的任何标签，这是构建逼出来的：mode 4 的 `emitText("…")`
+字面量都被 clang 折叠成立即数直接写进 `__TEXT,__text`，`__cstring` 里一个都不留；只有被取过
+地址的串还在。`no pwr` 是本轮新增、只在三元表达式里返回的串，所以它才是「mode 4 真的链接
+进来了」的证据。六条串是：`clover-emmc`、`look-only dump of c0c4000`、`CMD13 rca=1`、
+`CMD13 sweep`、`no pwr`、`CloverSdhci: failed at stage`。
+
+boot-args 自证：卷里的 `unixnu.toml` 是
+`… clover-pmgr=2 clover-emmc=4 armcpu-clock-panic=60000`，574 B / `c5fdac95…`，
+标题 `clover emmc: start over -- CMD0, CMD1, CMD2, CMD3 at 392 kHz`。
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round90-payload.img` | 58720256 B | `f0a3a71f612b6a0c3fc1fd16b2dfd4f80af8e61fcd37b7875943ad676a65d942` |
+| `round90-kernel.macho`（构建产物） | 51879936 B | `e0adb6c5dc520d356407a0245a92249f2d0a92a1e4a90a28e4658512550e9ad2` |
+| `round90-in-volume-kernel.macho`（卷内副本，含探针与 panic 屏） | 51879936 B | `fb905074823c9f53944148ff2aad24e249993e54a5358745343ee2ced73befa5` |
+| `round90-scratch-data.img`（与 round85–89 相同） | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round90.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round90.adt` | 13476 B | `c2714d473382144e2d2b4e299a49d93cd5aad3ad68e14781eca17cba25575112`（每轮 `random-seed` 都换，payload 因此每次构建都不同） |
+| `round90-unixnu.toml` | 574 B | `c5fdac952e26ab9828b6bbe2849d10b80371b18115f6488303af5959a10b7ea0` |
+
+固件与 boot 分区仍然一个字节没碰，`round87-boot.img`（`196b284f…`）继续有效。刷机只需换 `cache`：
+
+```sh
+fastboot flash cache ~/clover-out/round90-payload.img
+fastboot reboot
+```
+
+要让分区状态完全可复现就连 boot 一起刷（先 boot 后 cache）：
+
+```sh
+fastboot flash boot  ~/clover-out/round87-boot.img
+fastboot flash cache ~/clover-out/round90-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `cmd0a to`（`rst=1`） | 固件交出的时钟下，命令一个字都没移出去 —— `clk=0007` 是寄存器的读数，不是线上的事实；嫌疑转向 MMCC 对 SDCC1 的门控 | round91：先把 MMCC 那路根时钟查出来（`clover.dts` 的 `sdhc_1` 时钟表 + RCGR 偏移），或对时钟控制做一次完整 `RESET_ALL` 后重发 CMD0 |
+| `cmd0a ok`，`clk2` 的 `st=1 en=1 div=255`，`cmd0b to` | 命令通路本来活着，是**我们改时钟把它弄坏了**（分频写法、PLL 位或稳定等待） | round91：保留固件时钟只做 `RESET_CMD`，或只改分频不碰 `INT_EN`，把三种写法分开 |
+| `cmd0b ok`，`cmd1 to` | 时钟与命令通路都通，卡不答 CMD1 —— 卡不在 idle（CMD0 没被它收下）、停在 sleep，或供电/复位没放 | round91：先做一次完成的上电循环（`POWER_CONTROL` `0x0f` → `0x0b`）再 CMD0/CMD1 |
+| `cmd1 no pwr`，`tries=200` | 卡收下了 CMD1 但不置 PowerUp —— OCR 电压窗口与这条 1.8 V 轨不匹配，或卡忙 | round91：把 200 次拉长并打印 R3 原值，按 OCR 的电压位改 `ARGUMENT` |
+| `cmd1 ok` + `cmd2 ok` + `cmd3 ok`，`state=2` | 卡被重新识别，RCA=1 是我们自己写下去的 | round91：CMD9（CSD）→ CMD7（选中）→ CMD17 读 LBA 1，前五字节应当自己说出 `EFI PART` |
+| `cmd2 crc` / `cmd3 crc` | 命令出去了但响应 CRC 不过：392 kHz 下仍像采样相位或线上完整性 | round91：再降一档（分频 511 ≈ 196 kHz），并确认重置后卡回到 1-bit |
+| 只有 `CloverSdhci: failed at stage …` | 窗口映射或 mode 参数错 | 2 = mode 不认识、3 = 映射失败；4/5/6 是本轮三个等待点 |
+| **什么 panic 屏都没有** | `COMMAND`/`ARGUMENT`/`CLOCK_CONTROL` 其中一次写把互联挂住了（`ticks=0`，看门狗不会响） | 把三颗写拆成三轮单写，或用 device-nGnRnE 映射重试 |
+
+**这轮之后仍然没有块设备。** round90 若成功，得到的是「总线是活的 + 卡在 392 kHz 上完成了
+识别 + RCA=1」；还差 CMD9/CMD7 与 Data 通路（`SDHCI_BUFFER` 32-bit 或 ADMA64 表）和
+`IOBlockStorageDevice`。日志分区那件事要等这三样齐了才开始。
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -3340,9 +3488,10 @@ fastboot reboot
   `CONFIG_XNU_NATIVE_UFS`，`[userdata]` 留在板级文件里。
   `v0.2.58` 起的 `drivers/CloverSdhci` **不是**这块缺口的答案：它先是一份只读的寄存器
   探测，`v0.2.60` 起才发第一颗命令（CMD13 `SEND_STATUS`），`v0.2.61` 起在 15 个 RCA 上
-  逐个问同一颗命令，仍然不碰 Data、不发布
-  `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答」
-  逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
+  逐个问同一颗命令，`v0.2.62` 起改成从 CMD0 重头识别（CMD0/CMD1/CMD2/CMD3，降到 392 kHz），
+  仍然不碰 Data、不发布
+  `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
+  时钟是不是还在移命令」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，
   再由 mockfs 把它当作整个 `/`，`root-matching` 那条 UUID 匹配表还留在
   `/chosen` 里（`rd=md0` 会在等待循环之前就 `goto iofrootx`，所以它不参与）。

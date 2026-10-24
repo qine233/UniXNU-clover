@@ -97,13 +97,15 @@ def check_pmgr(kernel: bytes) -> bool:
 def check_sdhci(kernel: bytes) -> bool:
     """drivers/CloverSdhci is linked as a plain archive, not with -force_load (see
     configs/clover_defconfig), so nothing but a reference keeps it: the link would silently drop
-    the whole eMMC instrument if the call in sheng_pmgr_run() ever went away. Its five strings
+    the whole eMMC instrument if the call in sheng_pmgr_run() ever went away. Its six strings
     are the proof the member is in this image -- the boot argument it parses, the dump each mode
-    builds, both command reports, and the panic every failure path takes."""
+    builds, both CMD13 reports, mode 4's "no pwr" verdict (the one mode 4 literal the compiler
+    cannot fold into immediates, because it is an address taken in a ternary), and the panic
+    every failure path takes."""
     label = "kernel.macho: CloverSdhci linked"
     found = {name: name.encode() in kernel
              for name in ("clover-emmc", "look-only dump of c0c4000", "CMD13 rca=1", "CMD13 sweep",
-                          "CloverSdhci: failed at stage")}
+                          "no pwr", "CloverSdhci: failed at stage")}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")

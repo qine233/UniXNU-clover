@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: which RCA is the card awake on"
+title = "clover emmc: start over -- CMD0, CMD1, CMD2, CMD3 at 392 kHz"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1023,16 +1023,28 @@ kernel_args = [
   # timeout, and nothing drove the CMD line -- no CRC and no index error, so the line was not
   # noisy, it was silent. The command word (0x0d1a) matches Linux sdhci.h's encoding.
   #
-  # Mode 3 (this round) is the RCA sweep, and it is the same three writes repeated once per
-  # address: 2..15 first, then 0 (0 is not a valid RCA, so it goes last and cannot mask a real
-  # answer). RCA 1 is skipped because round88 already spent a timeout there; EDK2's stack uses
-  # Rca = Slot + 1 = 1, so this firmware's SdccDxe is either a different stack or the card is in
-  # a state that does not answer. CMD13 is read-only in stand-by and transfer, so the sweep
-  # changes nothing on the card. Each attempt is preceded by a bounded wait for CMD_INHIBIT and
-  # followed by a bounded poll twice mode 2's length, so a real card timeout cannot be mistaken
-  # for the loop giving up. The single panic report names the answering RCA and its R1, or says
-  # every address was silent and how many attempts were timeouts, response errors or busy skips.
-  "clover-emmc=3",
+  # Mode 3 was round89's RCA sweep: the same three writes repeated once per address, 1..15
+  # first and 0 last (0 is not a valid RCA, so it cannot mask a real answer). 1 went first so the
+  # run also retested round88's address. EDK2's stack uses Rca = Slot + 1 = 1, so this firmware's
+  # SdccDxe is either a different stack or the card is in a state that does not answer. The
+  # photograph's first line was "CMD13 sweep none: 0..15 silent": all sixteen addresses silent.
+  # CMD13 is read-only in stand-by and transfer, so that sweep cannot have changed the card.
+  #
+  # Mode 4 (this round) stops asking for the old RCA and re-identifies the card. It first resets
+  # the host's command and data state machines (not RESET_ALL: that would clear power and clock,
+  # the two inputs this round measures), then sends CMD0 at the firmware's untouched 200 MHz.
+  # CMD0 wants no response, so Command Complete means the SD clock is still running and the
+  # command path works; a timeout means nothing is shifting commands out any more. Then it drops
+  # the card clock to 392 kHz -- base 200 MHz divided by 2*255 through the 10-bit SDHCI 3.0
+  # divider, inside the 100..400 kHz identification window -- and sends a second CMD0, so "the
+  # clock was already gone" and "this change broke it" stay distinguishable. If that completes,
+  # it follows EDK2's identification order (MmcIdentification.c:572-619): CMD1 with OCR
+  # 0x40FF8080 (EmbeddedPkg MmcHost.h:65) retried until R3 bit 31 says power-up, CMD2 for the
+  # CID, CMD3 to assign RCA 1. CMD3's R1 is printed with bits 31:16 and CURRENT_STATE; on eMMC
+  # the RCA field is reserved, so the state (2 = identification, since the transition lands after
+  # the response) and the ok are what decide. No power rail, no bus width and no data phase are
+  # touched.
+  "clover-emmc=4",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)
