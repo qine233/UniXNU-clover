@@ -361,6 +361,39 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   format (&g, fmt, args);
   g.log = 0;
   __asm__ volatile ("dsb sy");
+  /* Resolved from this candidate's symbols by the patcher, never fixed addresses.
+   * Values are sampled at panic time and need not form an atomic VM snapshot. */
+  (void)MAX_MEM;
+  hex (&g, "\npages=", *(volatile const u32 *)PAGE_TOTAL);
+  hex (&g, "\nfree=", *(volatile const u32 *)PAGE_FREE);
+  /* The clock, in the kernel's own counts, because no process on this board has ever been able to report
+   * one: round77 measured that no timed wait anywhere -- in EL0 or in the kernel -- ever returns. ticks=0
+   * next to intid=19 (the INTID clover's device tree gives the EL1 virtual timer) would mean the line is
+   * armed and raised but never reaches ICC_IAR1_EL1, which is a different fault from a hung console.
+   * typer is GICD_TYPER as the driver read it back at boot: how many INTIDs this GIC implements. */
+  hex (&g, "\nticks=", *(volatile const u64 *)ARM_TIMER);
+  hex (&g, "\nipi=", *(volatile const u64 *)ARM_IPI);
+  hex (&g, " sent=", *(volatile const u64 *)ARM_IPI_SENT);
+  hex (&g, "\nirq=", *(volatile const u32 *)ARM_IRQ_ID);
+  hex (&g, " phase=", *(volatile const u32 *)ARM_IRQ_PHASE);
+  hex (&g, " intid=", *(volatile const u32 *)ARM_TIMER_INTID);
+  hex (&g, " typer=", *(volatile const u32 *)(ARM_GIC_BOOT + 3 * 4));
+  /* Round83: drivers/CloverPMGR publishes an ApplePMGRNub before AMFI's thread-call deadline
+   * can fire, and records every step in these sixteen slots. stage is the step it reached, so
+   * a panic here that never got to publish is distinguishable from the AMFI one by sight.
+   * read=-> is the original AON pair that AMFI reads through slot 320 then writes through 321. */
+  hex (&g, "\npmgr=", *(volatile const u64 *)PMGR_OBS);
+  hex (&g, " status=", *(volatile const u64 *)(PMGR_OBS + 8));
+  hex (&g, " mode=", *(volatile const u64 *)(PMGR_OBS + 120));
+  hex (&g, "\nnub=", *(volatile const u64 *)(PMGR_OBS + 40));
+  hex (&g, " attached=", *(volatile const u64 *)(PMGR_OBS + 104));
+  hex (&g, " registered=", *(volatile const u64 *)(PMGR_OBS + 112));
+  hex (&g, "\naon=", *(volatile const u64 *)(PMGR_OBS + 56));
+  hex (&g, "=>", *(volatile const u64 *)(PMGR_OBS + 64));
+  /* The panel is a fixed height and characters that would land below its last row are
+   * dropped silently, so the readings this board asked for are drawn first and the
+   * caller evidence last: round82's photograph lost its final two lines (intid= and
+   * typer=) exactly that way, and this round adds three more of its own. */
   /* Caller evidence. The panic screen can only show what the formatter read,
    * so it also prints the registers that lead back: RA is the LR on entry
    * (in _Assert: its return into panic()), FP the caller's frame pointer, and
@@ -395,35 +428,6 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
     hex (&g, "\nTCR=", tcr);
     hex (&g, "\nSCTLR=", sctlr);
   }
-  /* Resolved from this candidate's symbols by the patcher, never fixed addresses.
-   * Values are sampled at panic time and need not form an atomic VM snapshot. */
-  (void)MAX_MEM;
-  hex (&g, "\npages=", *(volatile const u32 *)PAGE_TOTAL);
-  hex (&g, "\nfree=", *(volatile const u32 *)PAGE_FREE);
-  /* The clock, in the kernel's own counts, because no process on this board has ever been able to report
-   * one: round77 measured that no timed wait anywhere -- in EL0 or in the kernel -- ever returns. ticks=0
-   * next to intid=19 (the INTID clover's device tree gives the EL1 virtual timer) would mean the line is
-   * armed and raised but never reaches ICC_IAR1_EL1, which is a different fault from a hung console.
-   * typer is GICD_TYPER as the driver read it back at boot: how many INTIDs this GIC implements. */
-  hex (&g, "\nticks=", *(volatile const u64 *)ARM_TIMER);
-  hex (&g, "\nipi=", *(volatile const u64 *)ARM_IPI);
-  hex (&g, " sent=", *(volatile const u64 *)ARM_IPI_SENT);
-  hex (&g, "\nirq=", *(volatile const u32 *)ARM_IRQ_ID);
-  hex (&g, " phase=", *(volatile const u32 *)ARM_IRQ_PHASE);
-  hex (&g, " intid=", *(volatile const u32 *)ARM_TIMER_INTID);
-  hex (&g, " typer=", *(volatile const u32 *)(ARM_GIC_BOOT + 3 * 4));
-  /* Round83: drivers/CloverPMGR publishes an ApplePMGRNub before AMFI's thread-call deadline
-   * can fire, and records every step in these sixteen slots. stage is the step it reached, so
-   * a panic here that never got to publish is distinguishable from the AMFI one by sight.
-   * read=-> is the original AON pair that AMFI reads through slot 320 then writes through 321. */
-  hex (&g, "\npmgr=", *(volatile const u64 *)PMGR_OBS);
-  hex (&g, " status=", *(volatile const u64 *)(PMGR_OBS + 8));
-  hex (&g, " mode=", *(volatile const u64 *)(PMGR_OBS + 120));
-  hex (&g, "\nnub=", *(volatile const u64 *)(PMGR_OBS + 40));
-  hex (&g, " attached=", *(volatile const u64 *)(PMGR_OBS + 104));
-  hex (&g, " registered=", *(volatile const u64 *)(PMGR_OBS + 112));
-  hex (&g, "\naon=", *(volatile const u64 *)(PMGR_OBS + 56));
-  hex (&g, "=>", *(volatile const u64 *)(PMGR_OBS + 64));
   /* The raw argument slots are not dumped: the formatted message above already carries them (room for the PANIC_TEXT copy). */
   mark[0] = 0xC0FFEE11u;
   mark[1] = 0x5CEEDA7Au;

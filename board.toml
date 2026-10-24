@@ -883,6 +883,12 @@ dram_size = "0x80000000"
 #     would photograph exactly like round82.
 #     The clock watchdog goes with it: it has done its job (the clock is proven), and leaving it
 #     on would put a 30 s timer panic on top of whatever EL0 reports this round.
+#   * v0.2.54 changes no decision and no argument, only the order the panic screen draws in.
+#     put() returns without drawing once g->y + 42 exceeds the panel height, so characters past
+#     the last row vanish silently -- that is how round82 lost intid= and typer=, which sat after
+#     twelve lines of register dumps. This round adds three more lines of its own, so the
+#     readings come first and the caller evidence last. Kernel unchanged (44866929375b6ba9...);
+#     the screen is injected into the in-volume copy at payload time.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
