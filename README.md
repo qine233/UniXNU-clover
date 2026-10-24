@@ -18,10 +18,10 @@
 | 板级描述 | `board.toml` 可解析；`scripts/check-clover.py` 把它与 defconfig 和 payload 契约交叉核对 |
 | ADT | `scripts/make-clover-adt.py` 为 8 个 Kryo 260 核生成 13,880 字节；检查器会把编码读回来，并断言 `ArmDTPlatform` 和 DarwinBoot 需要的节点 |
 | 内核 | 已构建：`DEVELOPMENT_ARM64_BCM2837` 的 51.8 MB `kernel.macho` |
-| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.13` 起 payload 里的 `kernel.macho` 是一份打了探针的副本：入口色带、panic 屏幕，以及 `arm_init` 某个调用返回后触发的定时复位；`v0.2.16` 起在开 MMU 前调用一个 mapper 洞穴，把 framebuffer 恒等映射进 TTBR0（与窗口同槽就复用 L2 表，否则用窗口最后一页新建一张），并预先填好 `_vinfo`；mapper 失败会涂一条白色诊断带（见"菜单之后看什么"） |
+| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.13` 起 payload 里的 `kernel.macho` 是一份打了探针的副本：入口色带、panic 屏幕，以及 `arm_init` 某个调用返回后触发的定时复位；`v0.2.16` 起在开 MMU 前调用一个 mapper 洞穴，把 framebuffer 恒等映射进 TTBR0（与窗口同槽就复用 L2 表，否则用窗口最后一页新建一张），并预先填好 `_vinfo`；mapper 失败会涂一条白色诊断带；`v0.2.17` 改成用自身 PC 定位引导页表（`boot_args.physBase` 落在 `__PRELINK_TEXT` 上、本身没有被映射），并在 MMU 打开后立刻涂第 4 条青色带（见"菜单之后看什么"） |
 | 固件 | 由 `uefi-clover` 构建（3 MiB 固件卷，内含 UniXNU 与 DarwinBoot）；`v0.3.10` 起 DXE 尾部完整派发，`CloverGopDxe` 发布 GOP |
 | 设备事实 | 2026-10-22 采集过一次，位于 `facts/81ffcaaa-20261022-210928/` |
-| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.9` 实测屏幕出现**绿 + 蓝 + 品红**三条色带，即 DarwinBoot 已交接、XNU 入口已执行、引导页表已建好；`v0.2.10` 实测**品红出现约 6 秒后设备自己重启**，即 `sctlr_el1` 打开 MMU 后没有立刻死掉；`v0.2.11` 的 `_arm_vm_init` 复位点没有触发（**品红一直停着**），说明还没走到它；`v0.2.12` 实测**只有绿 + 蓝 + 品红、约 6 秒后自复位**，即 `_PE_init_platform` 返回了、开 MMU 后写屏确实不可用；`v0.2.13` 的 `_thread_bootstrap` 复位点实测是**品红后十几秒才复位、没有白字**，符合"panic 屏幕在 `vinfo` 仍为 0 时走了 12 秒兜底"；`v0.2.14` 扩映射并预填 `_vinfo`、不再主动复位，实测**仍是绿 + 蓝 + 品红，无黄带无白字**，由此定位到窗口在 framebuffer 之上、向上扩 `memSize` 永远够不到；`v0.2.15` 改为直接补页表项，实测**仍是绿 + 蓝 + 品红、无黄无白**，原因是 1 GiB 窗口只能落在高 DRAM bank，与 framebuffer 不在同一个 1 GB 槽，旧代码查错了槽位就退出；`v0.2.16` 换成独立 mapper 洞穴（同槽复用、异槽新建 L2 表），失败时用白色带自报错误码，待上机 |
+| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.9` 实测屏幕出现**绿 + 蓝 + 品红**三条色带，即 DarwinBoot 已交接、XNU 入口已执行、引导页表已建好；`v0.2.10` 实测**品红出现约 6 秒后设备自己重启**，即 `sctlr_el1` 打开 MMU 后没有立刻死掉；`v0.2.11` 的 `_arm_vm_init` 复位点没有触发（**品红一直停着**），说明还没走到它；`v0.2.12` 实测**只有绿 + 蓝 + 品红、约 6 秒后自复位**，即 `_PE_init_platform` 返回了、开 MMU 后写屏确实不可用；`v0.2.13` 的 `_thread_bootstrap` 复位点实测是**品红后十几秒才复位、没有白字**，符合"panic 屏幕在 `vinfo` 仍为 0 时走了 12 秒兜底"；`v0.2.14` 扩映射并预填 `_vinfo`、不再主动复位，实测**仍是绿 + 蓝 + 品红，无黄带无白字**，由此定位到窗口在 framebuffer 之上、向上扩 `memSize` 永远够不到；`v0.2.15` 改为直接补页表项，实测**仍是绿 + 蓝 + 品红、无黄无白**，原因是 1 GiB 窗口只能落在高 DRAM bank，与 framebuffer 不在同一个 1 GB 槽，旧代码查错了槽位就退出；`v0.2.16` 换成独立 mapper 洞穴（同槽复用、异槽新建 L2 表），失败时用白色带自报错误码，实测**绿 + 蓝 + 品红 + 第 9 条白带**，即 mapper 走到自检第 4 步：窗口的第一个 L2 项不是 2 MB 块；由此查明 `boot_args.physBase` 锚在 `__PRELINK_TEXT` 上、本身不在引导映射内；`v0.2.17` 改为从 mapper 自己的 PC 反推引导映射，修掉复用 L2 表时未掩掉低位的 bug，并在 MMU 打开后立刻涂第 4 条青色带，待上机 |
 
 上面这张表之外，不做任何额外声称。
 
@@ -212,15 +212,25 @@ framebuffer 的槽号去查 L1，再看那个槽的 L2 表。可是 `0x10000000`
 `x8` 保持 0，种子被跳过，`_vinfo` 仍为 0，`AT` 查不到映射就跳过黄带——既没有黄带
 也没有白字，`--no-reset` 下就停住。
 
-`v0.2.16` 把 mapper 搬进独立的洞穴，不再假设槽位，仍然**不主动复位**：
+`v0.2.17` 修正 mapper 的定位方式，仍然**不主动复位**：
 
 1. **蓝带**：入口，MMU 关闭，和以前一样。
-2. **品红带**：原样。涂完之后、`msr sctlr_el1, x0` 之前（MMU 仍关），`bl` 进
+2. **品红带**：涂完之后、`msr sctlr_el1, x0` 之前（MMU 仍关），`bl` 进
    `entry + 0x600` 的 mapper 洞穴（`lr` 存在 `x16`，不用栈——此时 `sp` 是高地址
-   KVA）：
-   - 从 `TTBR0_EL1` 取回 V=P 的 L1 表物理地址，并确认窗口自己的 L1 项是表、其第一个
-     L2 项是 2 MB 块，把这个块当作属性模板；
-   - framebuffer 所在槽若已有 L2 表（与窗口同槽）：直接把缺的恒等块补进这张表；
+   KVA）。
+   - **不再读 `boot_args.physBase`**。这个字段等于 DarwinBoot 分配窗口的地址，
+     而内核 Mach-O 里 `__PRELINK_TEXT` 的 vmaddr 比 `__TEXT` 低约 0x2D88000，
+     所以 `Kernel.Base` 取的是 prelink 段的地址，`DarwinBoot` 把窗口起始交给它，
+     `_mh_execute_header` 落在窗口起始 + 0x2D88000。`start.s` 的引导映射是从
+     `_mh_execute_header` 向上建的，**physBase 本身没有被映射**——`v0.2.16` 从
+     `[x20, #0x10]` 取窗口基址，读到的是块映射以下的空地，所以自检第 4 步失败。
+   - `v0.2.17` 改用 `adr x14, .` 取 mapper 自己运行时的物理 PC（`adr` 是 PC 相对
+     的，MMU 关着时就是 PA），从这里向下取 L1 表基址，再确认窗口 L1 项是表、
+     其第一个 L2 项是 2 MB 块，把这个块当属性模板。这条路径不依赖任何 boot_args
+     字段，而且一定落在已映射区间内。
+   - framebuffer 所在槽若已有 L2 表（与窗口同槽）：先把 L1 项的有效位/类型位掩掉
+     得到表基址（`v0.2.16` 漏了这一步，复用路径一走到就会非对齐访问），再把缺的
+     恒等块补进这张表；
    - 若是 1 GB 块：整槽已映射，直接算成功；
    - 若是无效项（通常情况）：拿窗口最后一页做一张新 L2 表（DarwinBoot 保证窗口顶部
      至少留 2 MB，所以这页是空闲的），清零后写满 framebuffer 的恒等块，再挂到
@@ -241,23 +251,29 @@ framebuffer 的槽号去查 L1，再看那个槽的 L2 表。可是 `0x10000000`
 4. **种子**：`x8 == 0` 才把 `boot_args.Video` 的几何写进内核自己的 `_vinfo`
    （MMU 未开，按物理地址写，不压栈），`v_type` 放 `0xC10C10C1`。映射失败时
    `_vinfo` 保持 0，panic 屏幕走 12 秒兜底而不是 fault。
-5. **黄带**：`arm_init` 第 1 次调用 `_cpu_data_init` 返回后，按 `_vinfo` 涂第 3 条
+5. **青带（新增，第 4 条）**：`msr sctlr_el1` + `isb` 之后立刻按同样的几何涂第 4 条
+   1/16 带，颜色是青色（`0xFF00FFFF`，BGRA），涂完 `dc civac` + `dsb sy` 再跳去
+   `target`。它和 mapper 成功标志、`Video` 的几何绑定：只有"MMU 已开、framebuffer
+   V=P 可写"才会出现。这样青带把"开 MMU 这一刻"和之后的 `_cpu_data_init` 分开：
+   有青无黄 = 卡在 `start.s` 到 `arm_init` 之间；青黄都有 = 已经走进 `arm_init`。
+6. **黄带**：`arm_init` 第 1 次调用 `_cpu_data_init` 返回后，按 `_vinfo` 涂第 3 条
    带。涂之前用 `AT S1E1W` 查一次翻译（失败就跳过），涂完用 `dc civac` + `dsb sy`
    把 Normal-WB 的像素推到显示引擎可见。
 
-这一轮的白带把"没画出来"变成可读：看到白带就知道是 mapper 的哪一步拒绝，
-看到黄带就知道 MMU 之后 framebuffer 真的可达。
+这一轮的色带把"没画出来"变成可读：白带说明 mapper 的哪一步拒绝，青带说明 MMU
+打开后 framebuffer 真的可写，黄带说明 `_cpu_data_init` 已经返回。
 
 | 现象 | 含义 |
 | --- | --- |
-| 绿 + 蓝 + 品红 + **黄带**，随后白字 | mapper、种子、`AT` 都通了，内核之后踩到 panic；直接拍白字 |
-| 绿 + 蓝 + 品红 + **黄带**，然后停住 | `_cpu_data_init` 返回了，之后是自旋而不是 panic；下一轮把复位点放回 `_thread_bootstrap` 做时间二分 |
-| 绿 + 蓝 + 品红，**没有白带也没有黄带** | mapper 走到了成功分支但 `AT` 仍失败；下一轮回到定时信号继续二分 |
+| 绿 + 蓝 + 品红 + **青带 + 黄带**，随后白字 | mapper、种子、`AT` 都通了，内核之后踩到 panic；直接拍白字 |
+| 绿 + 蓝 + 品红 + **青带 + 黄带**，然后停住 | `_cpu_data_init` 返回了，之后是自旋而不是 panic；下一轮把复位点放回 `_thread_bootstrap` 做时间二分 |
+| 绿 + 蓝 + 品红 + **青带**，无黄带 | MMU 已开、framebuffer 可写，但还没走到 `_cpu_data_init`；卡点在 `start.s` 到 `arm_init` 之间 |
+| 绿 + 蓝 + 品红，**没有青带也没有白带** | mapper 返回成功但 `bl` 没能回到品红洞穴，或 `msr` 之前就 fault；下一轮回到定时信号继续二分 |
 | 绿 + 蓝 + 品红 + **白带在第 6–11 条** | mapper 失败；带号减 5 就是上表的错误码 |
 | 品红后十几秒自复位、无白字 | panic 发生在种子之前，`vinfo` 仍为 0，走 12 秒兜底 |
 
 ```sh
-fastboot flash cache ~/clover-out/round46-payload.img   # 只换这一格，boot 不变
+fastboot flash cache ~/clover-out/round47-payload.img   # 只换这一格，boot 不变
 fastboot reboot
 ```
 

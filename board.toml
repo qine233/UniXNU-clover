@@ -154,23 +154,32 @@ dram_size = "0x80000000"
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
 #
-# v0.2.16 asks where the frame buffer went, in one run, and never resets:
+# v0.2.17 asks where the frame buffer went, in one run, and never resets:
 #   * _start_first_cpu maps only the DarwinBoot window (V=P, memSize bytes), and
 #     this unit's window cannot start below 0x9D400000: everything below is
 #     reserved, the only free row is 148 MiB, and a 1 GiB window has to fit in
 #     the high DRAM bank. So the frame buffer is never inside the map, and
 #     growing memSize upward (v0.2.14) cannot reach it either.
-#   * the magenta cave calls a mapper in its own cave (entry + 0x600). It maps
-#     the frame buffer identity in TTBR0: it adds the missing block entries to
-#     the window's L2 table when the frame buffer shares its 1 GiB slot, and
+#   * the window base in boot_args is anchored on __PRELINK_TEXT, whose vmaddr
+#     is ~0x2D88000 below __TEXT, so _mh_execute_header sits at window base +
+#     0x2D88000 and the bootstrap map starts there. The window base itself is
+#     therefore unmapped (v0.2.16 failed self-check 4 reading it).
+#   * the magenta cave calls a mapper in its own cave (entry + 0x600). It finds
+#     the bootstrap L1 table from its own PC (adr), so it never touches unmapped
+#     boot_args. It maps the frame buffer identity in TTBR0: it adds the missing
+#     block entries to the window's L2 table when the frame buffer shares its
+#     1 GiB slot (masking the L1 descriptor down to the table base), and
 #     otherwise builds a table on the window's last page and points the frame
-#     buffer's L1 slot at it (v0.2.15 assumed the slots coincided and quit).
+#     buffer's L1 slot at it.
 #   * the mapper returns a code in x8. On failure the magenta cave paints a
 #     WHITE band at index 5+code before the MMU goes on (1 no Video, 2 zero
 #     geometry, 3 window L1 not a table, 4 window entry not a block, 5 no free
 #     page, 6 target L2 entry in use), and the vc_info seed is skipped.
-#   * a yellow bar right after _cpu_data_init proves arm_init runs with the
-#     frame buffer reachable; any later panic draws on the same mapping.
+#   * a CYAN band at index 4 is painted right after the SCTLR write, so it proves
+#     the MMU is on and the frame buffer is writable V=P; a yellow bar right
+#     after _cpu_data_init then proves arm_init passed that call. Cyan without
+#     yellow means the stall is between start.s and arm_init. Any later panic
+#     draws on the same mapping.
 panic_screen = true
 entry_probe_paint_after = "_cpu_data_init"
 entry_probe_paint_in = "_arm_init"

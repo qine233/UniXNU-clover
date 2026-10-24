@@ -20,10 +20,17 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         the window's L2 table when the frame
                                         buffer shares its 1 GiB slot, otherwise
                                         it builds one from the window's last
-                                        page. It returns a code in x8; on
-                                        failure a WHITE band at index 5+code
-                                        names the check that failed, so a
+                                        page. It finds the bootstrap map from
+                                        its own PC, because boot_args.physBase
+                                        is anchored on __PRELINK_TEXT and is
+                                        not itself mapped. It returns a code in
+                                        x8; on failure a WHITE band at index
+                                        5+code names the check that failed, so a
                                         silent "no yellow" is not possible.
+                                        Immediately after the SCTLR write it
+                                        paints band 4 CYAN through that
+                                        mapping: the MMU is on and the frame
+                                        buffer translates.
   stage 3 (right after the MMU is on)   waits --reset-delay seconds, then PSCI
                                         SYSTEM_RESET. A reboot by itself after
                                         that time shows the CPU got through the
@@ -122,14 +129,19 @@ def paint(args, lo, hi, band):
 # the MMU still off. Called with `bl` from the stage 2 cave; boot_args are in
 # x20 and x0 holds the SCTLR value, so neither may be touched.
 #
-#   * the window's L1 entry must be a table, and the first block under it is
+#   * the address used to find the bootstrap tables and the attribute template
+#     is the mapper's own PC (adr), not boot_args.physBase. The kernel image
+#     starts at __PRELINK_TEXT, which sits ~45 MB below _mh_execute_header, so
+#     DarwinBoot's PhysicalBase describes a window address that start.s never
+#     maps: start.s re-anchors the bootstrap map on _mh_execute_header. The PC
+#     is inside that map by construction;
+#   * the L1 entry for the PC's slot must be a table, and the block under it is
 #     copied as the attribute template, so the frame buffer is Normal-WB,
 #     EL1 RW, like kernel memory (the painters clean to PoC);
 #   * when the frame buffer shares the window's 1 GiB slot, its entries are
-#     added to that L2 table; otherwise (the usual case here) an L2 table is
-#     built on the window's last page, which is free because DarwinBoot keeps
-#     2 MB of the window below the top, and published in the frame buffer's
-#     L1 slot;
+#     added to that L2 table; otherwise an L2 table is built on the window's
+#     last page, which is free because DarwinBoot keeps 2 MB of the window
+#     below the top, and published in the frame buffer's L1 slot;
 #   * no stack: SP is a KVA and the MMU is off; no lr: the caller saves it.
 #
 # x8 returns 0 on success or the number of the check that refused:
@@ -156,7 +168,7 @@ _start:
   mrs x11, ttbr0_el1
   ldr x12, =0x0000fffffffff000
   and x11, x11, x12
-  ldr x14, [x20, #0x10]
+  adr x14, .
   mov x8, #3
   lsr x15, x14, #30
   and x15, x15, #0x1FF
@@ -177,6 +189,7 @@ _start:
   mov x8, #5
   ldr x2, [x11, x1, lsl #3]
   and x3, x2, #3
+  and x2, x2, x12
   cmp x3, #1
   b.eq 5f
   cmp x3, #3
@@ -319,7 +332,51 @@ SOURCES = {
         + "3:\n"
         + SEED.format(args='x20', vinfo='{vinfo}',
                       marker_lo=f'0x{VINFO_SEED & 0xFFFF:04X}', marker_hi=f'0x{VINFO_SEED >> 16:04X}')
-        + "  msr SCTLR_EL1, x0\n  b target\n.ltorg\n"),
+        # Band 4 is painted after the SCTLR write, through the mapping the helper
+        # just published: it proves the MMU is on and the frame buffer
+        # translates. The address and the band size are preloaded while boot_args
+        # is still readable -- with the MMU on, boot_args' physical address is
+        # below the bootstrap map's start and cannot be dereferenced. Skipped when
+        # the mapper failed, because the address would not translate.
+        + """  cbnz x8, 7f
+  ldr x9, [{args}, #0x28]
+  cbz x9, 7f
+  ldr x10, [{args}, #0x38]
+  ldr x11, [{args}, #0x48]
+  mul x10, x10, x11
+  lsr x10, x10, #4
+  bic x10, x10, #7
+  cbz x10, 7f
+  add x9, x9, x10, lsl #2
+  b 8f
+7:
+  mov x9, xzr
+8:
+""".format(args='x20')
+        + """  msr SCTLR_EL1, x0
+  isb
+  cbz x9, 9f
+  movz w6, #0xFFFF
+  movk w6, #0xFF00, lsl #16
+  mov x1, x9
+  mov x2, x10
+  mov x4, x9
+1:
+  stp w6, w6, [x1], #8
+  subs x2, x2, #8
+  b.hi 1b
+  dsb sy
+  mov x5, x10
+2:
+  dc civac, x4
+  add x4, x4, #64
+  subs x5, x5, #64
+  b.hi 2b
+  dsb sy
+9:
+  b target
+.ltorg
+"""),
     3: """.text
 .global _start
 _start:
