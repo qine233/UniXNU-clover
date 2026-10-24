@@ -189,6 +189,44 @@
 //   no panic screen                the child never died: it is stuck in the write,
 //       with the parent asleep behind it and nothing else running.
 //
+// Round 80 returned the third: the panel sits at `[clover] el0 mach: msg=` and no
+// panic screen ever appears, twice photographed a couple of minutes apart. Two
+// independent things are absent there. The parent's wait4 has not woken, so the
+// child has not died; and the kernel's own kprintf line for a death it did not
+// expect ("Failed to send exception EXC_CORPSE_NOTIFY ... for pid 2") never showed
+// in the boot-log tail either, which agrees -- kprintf reaches the panel through
+// the video console, not through the tty under test. So the child is inside
+// something, still.
+//
+// And the two remaining suspects are the label write and the exit, because this
+// photograph has a third reading that round 79's did not: the parent never reached
+// its own exit, so nothing about the child's exit was ever given a chance. Note
+// what has not been proven about exit here: the child that printed 1792 in round 70
+// was forked, never exec'd; rounds 72-73 ended in SIGKILL, which is not an exit. An
+// exit() from a fork+exec'd process on this board is an untested call, and it is the
+// next instruction after the write.
+//
+// v0.2.51 splits them by asking the child for something that is neither of those.
+// After the label write it stops rather than dies: kill(getpid(), SIGSTOP, 0) --
+// Darwin's kill takes a third argument, `posix` (syscalls.master:91), and 0 is the
+// legacy path. A stop is a wait4-visible state change that is acted out on the way
+// *into* userland, so it reports the child alive past the write even if the child
+// never runs another instruction -- and the parent waits with WUNTRACED (2,
+// bsd/sys/wait.h:122) and keeps the low 16 bits of the status, because
+// W_STOPCODE(17) is (17 << 8) | 0x7f = 4479 (wait.h:159) and masking to a byte
+// folded it onto "killed by signal 127". Four readings, all through the panic
+// screen and none through the tty:
+//
+//   panic `exit status 4991`  512 + 4479: the child is alive and stopped, so the
+//       label write returned and it is the child's exit() that never came back.
+//   panic `exit status 1024`  512 + (2 << 8): kill succeeded, no stop followed, the
+//       child exited(2) -- EL0 cannot stop a process here, and a plain exit after
+//       that write does reach the parent.
+//   panic `exit status 768`   512 + (1 << 8): the kill failed, so syscall 37 is not
+//       reachable or the signal was refused; the child exited(1) on the error path.
+//   no panic screen           the child reached none of the write's successors, so
+//       the write is the one that blocks.
+//
 // Why the console has to be opened by us. Round 65 retired the assumption that
 // fd 1 is a console: this XNU has no open_console() at all, bsd_init hands
 // initproc an empty descriptor table, and the console is just a devfs node --
@@ -514,19 +552,46 @@ _start:
   sub x2, x2, x1
   bl _puts
 
-  // Round 79's marker, and the only new instruction in the child: leave here,
-  // after the label write and before the digits write. Round 79 showed this branch
-  // is never reached -- the panel stops at the label and the parent never wakes --
-  // so the write below is the call under test. It stays exactly as it was; v0.2.50
-  // changes only how the parent reports, which is what round 79's photograph cannot
-  // settle (its label returning, the child exiting, and the parent's own print being
-  // the missing one are all the same picture).
-  mov x23, #448
+  // Round 81's single change, and it is in the child: after the label write it
+  // stops instead of dying. Round 80's panel is still `msg=` with no panic screen,
+  // which says the child never changed state -- but "never changed state" is what
+  // both of the remaining suspects look like from the outside: a write that paints
+  // its characters and then blocks inside ttwrite's over-full queue, and a write
+  // that returns followed by an exit() that never does. exit() from a process that
+  // was fork+exec'd has never been proven on this board (round 70's exiting child
+  // was fork-only; rounds 72-73 died of SIGKILL, which is not an exit).
+  //
+  // So the child now performs its last act in a way that needs no return: a
+  // stop is a wait4-visible state change that happens on the way *into* userland,
+  // so the parent wakes whether or not the child ever runs another instruction.
+  // kill(2) here is the Darwin three-argument form (syscalls.master:91,
+  // `kill(int pid, int signum, int posix)`), so x2 = 0 asks for the legacy path.
+  //
+  //   panic `exit status 4991`  512 + W_STOPCODE(17) = 512 + 4479: the label write
+  //       returned, the child is alive and stopped, and the thing round 80 never
+  //       came back from is the child's exit().
+  //   panic `exit status 1024`  kill returned and no stop followed -- the child
+  //       exited(2) anyway. Two port facts at once: EL0 cannot stop a process with
+  //       SIGSTOP, and a plain exit after that label write does reach the parent.
+  //   panic `exit status 768`   kill itself failed (the child exited(1) on the
+  //       error path), so 37 is not in this kernel's table or the signal was refused.
+  //   no panic screen, ever     the child never reached the kill, the stop or the
+  //       exit -- the write is the one that blocks.
+  mov x0, x19                       // our own pid, still what getpid left there
+  mov x1, #17                       // SIGSTOP
+  mov x2, #0                        // posix = 0
+  mov x16, #37                      // SYS_kill
+  svc #0x80
+  b.cs _kill_error
+  mov x23, #2                       // still running: the stop never took
   b _exit_now
 
-  // Not reached this round: the two instructions below are what round 78 hung on,
-  // and v0.2.49 keeps them in place so the next round only has to delete the
-  // branch above.
+_kill_error:
+  mov x23, #1
+  b _exit_now
+
+  // Not reached this round: the two instructions below are what rounds 78-80 hung
+  // on, and they stay in place so the next round only has to delete the block above.
   mov x0, x20
   bl _print_line
 
@@ -1030,10 +1095,17 @@ _parent:
   //       exiting: 9 is SIGKILL, which is the guard-exception shape from round 72.
   //   no panic screen, ever            the child never died, so it is inside that
   //       write, with the parent asleep behind it and nothing else left to run.
+  //
+  // Round 80's reading was the third line: nothing, ever. That rules out the child
+  // dying but it does not say where it is stuck, so the parent now also asks to be
+  // woken for a child that merely stops (WUNTRACED = 2, bsd/sys/wait.h:122), and it
+  // keeps the whole low half-word of the status instead of just its signal byte --
+  // W_STOPCODE(17) is (17 << 8) | 0x7f = 4479 (wait.h:159), which the old masking
+  // folded onto "killed by signal 127".
   mov x0, x19                       // our child, not any child
   adrp x1, _scratch@PAGE
   add x1, x1, _scratch@PAGEOFF
-  mov x2, #0                        // no options: block until it dies
+  mov x2, #2                        // WUNTRACED: a stop wakes us too
   mov x3, #0
   mov x16, #7                       // SYS_wait4
   svc #0x80
@@ -1060,14 +1132,15 @@ _wait_reaped:
   // left, and it is the one path on this board proven not to go through the tty
   // (scripts/xnu-panic-screen.c writes the framebuffer with its own printf), so a
   // code appearing there can no longer be confused with the console being dead.
-  //   512 (16 * 32)            the child's exit(448) ran, its status came back with
-  //       the signal byte zero, and wait4 woke -- so the label write returned and
-  //       the only thing that can still be missing is a *print* by either process.
-  //   512 + N, N < 256         the child died of signal N instead (9 = SIGKILL).
-  //   no panic screen, ever    the child never died: it is still inside that write,
-  //       with the parent asleep behind it.
+  //   512 + 4479 = 4991   the child stopped on SIGSTOP -- it is alive, and it is
+  //       alive *past* the label write, which is the question round 81 asks.
+  //   512 + 512 = 1024    kill returned, no stop happened, the child exited(2).
+  //   512 + 256 = 768     kill failed and the child exited(1) on the error path.
+  //   512 + N, N < 256    the child died of signal N (9 = SIGKILL, the shape of
+  //       round 72's guard exceptions).
+  //   no panic screen     the child reached none of the above: the write blocks.
   mov x23, #512
-  and x24, x24, #0xff
+  and x24, x24, #0xffff
   add x23, x23, x24
   b _exit_now
 

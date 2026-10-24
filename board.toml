@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: did the child ever reach the parent"
+title = "clover md0 root: alive and stopped says the write returned"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -802,6 +802,27 @@ dram_size = "0x80000000"
 #     died of signal N (9 = SIGKILL, the round 72 shape); no panic screen means the
 #     child never died and is genuinely inside that write. The child is untouched from
 #     round 79, and so is the wait4.
+#   * v0.2.51 because round 80 came back as the third reading: `[clover] el0 mach:
+#     msg=` and no panic screen, ever, in two photographs a couple of minutes apart.
+#     The parent's wait4 has not woken, so the child has not died, and the kernel's
+#     own kprintf for an unexpected death ("Failed to send exception
+#     EXC_CORPSE_NOTIFY ... for pid 2") never appeared in the boot-log tail either --
+#     that line reaches the panel through the video console, not the tty under test,
+#     so its absence is independent evidence. Two suspects are left, and the child's
+#     exit() is one of them for the first time: an exit from a fork+exec'd process has
+#     never been proven on this board (round 70's exiting child was fork-only, rounds
+#     72-73 ended in SIGKILL, which is not an exit). So this round asks the child for
+#     a third kind of event, one that needs no return: after the label write it does
+#     kill(getpid(), SIGSTOP, 0) -- Darwin's kill takes a `posix` third argument
+#     (syscalls.master:91), 0 for the legacy path -- and a stop is acted out on the
+#     way *into* userland, so the parent is told the child is alive past the write
+#     even if the child never runs another instruction. The parent waits with
+#     WUNTRACED (2) and keeps the low 16 bits of the status, because W_STOPCODE(17)
+#     is 4479 and masking to a byte folded it onto "signal 127". panic 4991 = 512 +
+#     4479: the write returned and the child's exit is the hole. panic 1024: kill
+#     succeeded, no stop, the child exited(2). panic 768: kill failed, the child
+#     exited(1) -- 37 is unreachable here. No panic screen: the write is the one that
+#     blocks.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -811,7 +832,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["544369a3e44d11faf3c881c31bb965ff19acf20f5490b9de31071584e04e3047"]
+trust_cache_sha256 = ["bb790ec9e2e3539dc9763af63fa10fe13ccea2d4d39e06dcf394ec3a2a2533ac"]
 kernel_args = [
   "-v",
   "serial=3",
