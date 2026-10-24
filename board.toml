@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: mach_msg2_trap from EL0"
+title = "clover md0 root: is the mach probe hung or dead"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -680,6 +680,17 @@ dram_size = "0x80000000"
 #     has already cleared policy. The legacy call is replayed last, unchanged,
 #     which turns this boot-arg into an independent reading that cannot contaminate
 #     the main one.
+#   * v0.2.45 keeps the child's probe instruction-for-instruction what round 74
+#     ran with, and changes only the parent: it no longer sleeps in wait4. Round 74
+#     came back with `[clover] el0 mach: msg=` as the last row on the panel, cursor
+#     after the `=`, the address missing, no `m2:` line, no corpse-notify line and
+#     no `waited` line -- and a panel that stays like that. An exit would have
+#     printed the latter two, so what stopped is a process that is either blocked
+#     inside its own write or still running, and a blocking wait4 shows the same
+#     picture either way. Polling with WNOHANG and printing each poll is what
+#     separates "child hung, console fine" from "child died, parent blocked on the
+#     obituary write" from "the tty write path is dead", which is a different
+#     suspect than anything in osfmk/ipc.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -689,7 +700,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["37066666713620155505f9d561d9af8c52f5d6025feb56db3c08f39537ef3f24"]
+trust_cache_sha256 = ["57f7fc5485d889f448e1140ca6f7d168acdc5b3b3f94c79c598d241e368187f3"]
 kernel_args = [
   "-v",
   "serial=3",

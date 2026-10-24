@@ -830,16 +830,94 @@ _parent:
   mov x1, #128
   b.cs _fail
 
-  // wait4(-1, &_scratch, 0, 0)                      (SYS_wait4 = 7)
-  mov x0, #-1
+  // ---- round 75: the parent does not sleep in wait4 ----
+  //
+  // Round 74's panel ends in the middle of a line: `[clover] el0 mach: msg=`,
+  // cursor sitting right after the `=`, the address never printed, no `m2:` line,
+  // no `Failed to send exception EXC_CORPSE_NOTIFY`, and -- the part that decides
+  // how to read all of it -- no `waited` line from this process. The exec'd copy
+  // therefore did not exit: an exit wakes wait4, and the kernel prints over the
+  // corpse of every EL0 process on this board because no exception port is set
+  // (task.c:2461). So the child stopped *inside* the write syscall that was going
+  // to carry the digits, or it is still running, and the panel cannot say which.
+  //
+  // A blocking wait4 cannot separate those, because both of them freeze the panel
+  // the same way: if the child died while holding the console lock, this process
+  // would block on its own obituary write and the screen would stop exactly where
+  // it is now. So the parent polls instead. wait4(pid, &status, WNOHANG, 0)
+  // returns 0 while the child runs, the pid once it is gone, and an errno if the
+  // call itself fails -- three answers this port can tell apart, as long as each
+  // one is printed by a process that is demonstrably still able to print.
+  //
+  // Between polls the parent burns tens of milliseconds in a counter loop rather
+  // than sleeping, because every sleep primitive here needs either a Mach right
+  // (semaphore_timedwait_trap on port 0 is KERN_INVALID_NAME, per
+  // port_name_to_semaphore in osfmk/kern/sync_sema.c:1168, so the
+  // __semwait_signal(0,0,1,1,...) shape is not a delay on this kernel) or a
+  // struct the kernel copies in. A counter needs neither, and its only cost is
+  // that "slow" and "stuck" are separated by an estimate instead of a clock.
+  //
+  // The three readings, and they are exhaustive:
+  //   polls keep appearing, no waited line  => the child is hung in the kernel;
+  //                                           the console is fine and mach is
+  //                                           not the reason the panel stopped.
+  //   a waited line with status N           => the child died; N decodes as
+  //                                           signal in the low byte, exit code
+  //                                           at N >> 8, and 9 means SIGKILL.
+  //   polls stop at the same instant as the
+  //   child's output                        => the tty write path itself is
+  //                                           dead, and every mach conclusion
+  //                                           from rounds 72-74 is void.
+  mov x20, #0                       // polls taken
+_parent_poll:
+  add x20, x20, #1
+  // 0x4000000 rather than a round decimal: MOVZ can only place a 16-bit field at
+  // a multiple of 16 bits, so 100000000 would need a second instruction.
+  mov x21, #0x4000000               // ~70 ms of counting at this core's clock
+_poll_spin:
+  subs x21, x21, #1
+  b.ne _poll_spin
+
+  mov x0, x19                       // our child, not any child
   adrp x1, _scratch@PAGE
   add x1, x1, _scratch@PAGEOFF
-  mov x2, #0
+  mov x2, #1                        // WNOHANG
   mov x3, #0
-  mov x16, #7
+  mov x16, #7                       // SYS_wait4
   svc #0x80
-  mov x1, #192
-  b.cs _fail
+  b.cs _wait_error
+  cbnz x0, _wait_reaped
+
+  // Still running. Chatter for the first ten polls and then go quiet, so a long
+  // hang does not scroll the child's own last lines off the panel; keep polling
+  // either way, because a child that dies at poll 400 should still be reported.
+  cmp x20, #10
+  b.hi _parent_poll
+  adrp x1, _poll_label@PAGE
+  add x1, x1, _poll_label@PAGEOFF
+  adrp x2, _poll_label_end@PAGE
+  add x2, x2, _poll_label_end@PAGEOFF
+  sub x2, x2, x1
+  bl _puts
+  mov x0, x20
+  bl _print_line
+  b _parent_poll
+
+_wait_error:
+  // The call itself failed, which is its own answer: the parent is alive, the
+  // console is alive, and wait4 says this process has no child to wait for.
+  mov x24, x0
+  adrp x1, _wait_err@PAGE
+  add x1, x1, _wait_err@PAGEOFF
+  adrp x2, _wait_err_end@PAGE
+  add x2, x2, _wait_err_end@PAGEOFF
+  sub x2, x2, x1
+  bl _puts
+  mov x0, x24
+  bl _print_line
+  b _checkpoint
+
+_wait_reaped:
   mov x20, x0                       // the reaped pid
   adrp x0, _scratch@PAGE
   add x0, x0, _scratch@PAGEOFF
@@ -1089,6 +1167,12 @@ _wait_banner_end:
 _wait_mid:
   .ascii " status="
 _wait_mid_end:
+_poll_label:
+  .ascii "[clover] parent: poll "
+_poll_label_end:
+_wait_err:
+  .ascii "[clover] parent: wait4 error "
+_wait_err_end:
 _newline:
   .ascii "\n"
 _newline_end:
