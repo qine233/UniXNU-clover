@@ -328,6 +328,27 @@ dram_size = "0x80000000"
 #     slots m2, m1, a0-a5. Every slot is read only after an AT S1E1R query, so
 #     a bogus va_list prints dashes instead of faulting. The checkpoint is
 #     unchanged: reset before _machine_startup, 15 s.
+#   * v0.2.28 takes the v0.2.27 device reading: the screen showed green, blue
+#     and the new diagnostic block. It read RA=0xfffffff00797a3b0 (the return
+#     into _Assert), LR=0xfffffff0073f1dc4, fmt at a real assertion string, and
+#     a0=1, a1=0, a2=0xd - but the only reference to that string is _Assert,
+#     whose call sites pass file/line/expression constants, and none of its
+#     callers pass 0xd as the expression. The call chain did not add up, so the
+#     probe itself was disassembled instead of the kernel. The band-14 cave had
+#     been placed at 0xfffffff0073ed784, which is 4 mod 8. ld.lld aligns .text
+#     up, so _start landed at 0x3ed788 while the binary was written at
+#     0x3ed784: every PC-relative branch in that cave was four bytes low. Its
+#     bl went to _fiq_context_init - 4 (the bl _Assert inside
+#     platform_syscall's cold block) with x0/x1/x2 still holding arm_init's
+#     arguments to _fiq_context_init (TRUE, 0, 0xd), which is exactly what the
+#     screen printed; its b went back to the call site instead of site+4. Bands
+#     10-13 were aligned and returned correctly, so _ml_map_cpu_pio,
+#     _cpu_timebase_init, _kptimer_curcpu_up and _PE_init_cpu did return; the
+#     v0.2.27 photo says nothing about _fiq_context_init or _machine_startup.
+#     assemble() now refuses a cave whose _start is not at the requested VA,
+#     the placement loop aligns each run to 16 bytes and requires the aligned
+#     start to still fit, and every emitted bl is decoded and checked against
+#     the callee. All five caves now start on a 16-byte boundary.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true

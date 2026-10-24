@@ -804,6 +804,17 @@ def assemble(source, va, symbols, workdir):
     subprocess.run([tool('ld.lld', 'brew install llvm'), f'-Ttext={va:#x}',
                     *[f'--defsym={name}={value:#x}' for name, value in symbols.items()],
                     '-e', '_start', obj, '-o', elf], check=True)
+    # lld aligns .text up (8 bytes), so a cave address that is not aligned would
+    # have _start past the requested VA. The caller writes the binary at VA, and
+    # every PC-relative branch in it would then be off by the difference; refuse
+    # instead of leaving a cave that calls four bytes below its callee.
+    starts = {parts[2]: int(parts[0], 16)
+              for line in subprocess.check_output([tool('llvm-nm', 'brew install llvm'), elf],
+                                                  text=True).splitlines()
+              if len(parts := line.split()) == 3}
+    if starts.get('_start') != va:
+        raise SystemExit(f'Cave assembled at {starts.get("_start"):#x}, not the requested {va:#x}: '
+                         'give it an 8-byte aligned address')
     subprocess.run([tool('llvm-objcopy', 'brew install llvm'), '-O', 'binary', elf, binary], check=True)
     return binary.read_bytes()
 
@@ -1017,15 +1028,24 @@ def main():
         for index, (site, callee, name) in enumerate(traces):
             band, lo, hi = TRACE_BANDS[index]
             cursor = (next_free + 15) & ~15
+            # A zero run can start at 4 mod 8; lld would then place _start at the
+            # next 8-byte boundary and every branch in the cave would point four
+            # bytes low. Only accept runs that still hold a cave when taken from
+            # an aligned address, and use that address.
             run = next(((start, length) for start, length in zero_runs(data, cursor)
-                        if length >= CAVE_SIZE), None)
+                        if ((start + 15) & ~15) + CAVE_SIZE <= start + length), None)
             if run is None:
                 raise SystemExit(f'No {CAVE_SIZE:#x}-byte padding for the trace cave after {cursor:#x}')
-            cave_va = run[0]
+            cave_va = (run[0] + 15) & ~15
             source = TRACE_PAINT.format(vinfo=f'{names["_vinfo"]:#x}UL', band=band, lo=lo, hi=hi)
             code = assemble(source, cave_va, {'callee': callee, 'target': site + 4}, Path(tmp))
             if len(code) > CAVE_SIZE:
                 raise SystemExit(f'Trace cave for {name} is too large ({len(code):#x} bytes)')
+            first = struct.unpack_from('<I', code, 0)[0]
+            delta = first & 0x3FFFFFF
+            delta -= (1 << 26) if delta & (1 << 25) else 0
+            if first >> 26 != 0b100101 or cave_va + delta * 4 != callee:
+                raise SystemExit(f'Trace cave for {name} calls {cave_va + delta * 4:#x}, not {callee:#x}')
             data[file_offset(cave_va):file_offset(cave_va) + len(code)] = code
             trace_caves.append((site, cave_va, name))
             next_free = cave_va + CAVE_SIZE
