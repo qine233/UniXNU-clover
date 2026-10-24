@@ -90,6 +90,21 @@
 // very end, after msg2 has answered, so that whichever of the two dies, the
 // other one's reading survives on the screen.
 //
+// Round 74 came back with `[clover] el0 mach: msg=` as the last line and nothing
+// under it, and round 75 -- whose only change was that the parent polled with
+// WNOHANG instead of sleeping in wait4 -- came back with `[clover] parent: poll `
+// as the last line, its own digit missing and the child's first word never
+// written. Neither panel carries a panic screen, so neither process returned an
+// errno from the write that stopped: they are either parked inside the tty, or
+// the tty is still accepting bytes and the panel stopped showing them. What the
+// two rounds have in common is not mach at all -- it is that a write immediately
+// after a successful write was the last thing on the screen, and the one thing
+// that differs from round 74 to round 75 is that the parent became a second
+// writer. So the mach question is on hold: v0.2.46 takes the parent's writing
+// away entirely and lets the timeout report through exit(), because the panic
+// screen is drawn straight into the frame buffer and does not go through the
+// console under test. Whatever that panel says, it says it about the console.
+//
 // Why the console has to be opened by us. Round 65 retired the assumption that
 // fd 1 is a console: this XNU has no open_console() at all, bsd_init hands
 // initproc an empty descriptor table, and the console is just a devfs node --
@@ -830,24 +845,49 @@ _parent:
   mov x1, #128
   b.cs _fail
 
-  // ---- round 75: the parent does not sleep in wait4 ----
+  // ---- round 76: the parent polls without writing a single character ----
   //
-  // Round 74's panel ends in the middle of a line: `[clover] el0 mach: msg=`,
-  // cursor sitting right after the `=`, the address never printed, no `m2:` line,
-  // no `Failed to send exception EXC_CORPSE_NOTIFY`, and -- the part that decides
-  // how to read all of it -- no `waited` line from this process. The exec'd copy
-  // therefore did not exit: an exit wakes wait4, and the kernel prints over the
-  // corpse of every EL0 process on this board because no exception port is set
-  // (task.c:2461). So the child stopped *inside* the write syscall that was going
-  // to carry the digits, or it is still running, and the panel cannot say which.
+  // Round 75 answered its question, and the answer is not about mach. The panel
+  // ends `[clover] parent: poll ` with the cursor sitting right after the space:
+  // the label's write retired, and the very next write -- one digit -- never came
+  // back. A write that *failed* would have taken the b.cs below _print_line,
+  // exited initproc, and painted the panic screen over the upper half of this
+  // one. The screen is intact and un-panicked, so this process is not returning
+  // from the syscall with an errno; it is either stopped inside it or writing
+  // into a console that no longer paints. And the exec'd child, which in rounds
+  // 72-74 got four port names and three more labels onto this same panel while
+  // its parent slept in wait4, did not even get out its first word this round:
+  // `[clover] el0 child: alive` is a single write ending in a newline, and there
+  // is none of it on the screen.
   //
-  // A blocking wait4 cannot separate those, because both of them freeze the panel
-  // the same way: if the child died while holding the console lock, this process
-  // would block on its own obituary write and the screen would stop exactly where
-  // it is now. So the parent polls instead. wait4(pid, &status, WNOHANG, 0)
-  // returns 0 while the child runs, the pid once it is gone, and an errno if the
-  // call itself fails -- three answers this port can tell apart, as long as each
-  // one is printed by a process that is demonstrably still able to print.
+  // Round 74 is the same shape, one process earlier: `[clover] el0 mach: msg=`
+  // retired its label and the address after it never appeared. So two rounds in
+  // a row stopped at a write that immediately followed a successful write, and
+  // the only thing that changed between them is that round 75 made the parent a
+  // *second* writer while the child was still running. That is a property of the
+  // console, not of mach, and while it is unexplained every reading taken next
+  // to it is contaminated -- round 74's included.
+  //
+  // The lock is in the tree: every character of EL0 output ends in
+  // vcputc_options (osfmk/console/video_console.c:1231), which takes VCPUTC_LOCK,
+  // an lck_ticket_t (video_console.c:153), around hide_cursor / gc_putchar /
+  // show_cursor. A ticket lock is a spin with a queue: a holder that stops
+  // releasing it stops every later writer forever, and nothing on this path can
+  // time out. The same function also *silently drops* output when gc_enabled is
+  // false, which is the other way to lose a character with a satisfied write --
+  // and the two are indistinguishable from a photograph.
+  //
+  // So round 76 takes the second writer away and lets the timeout speak through
+  // the one channel that does not touch vcputc at all: exit(). initproc exiting
+  // goes to proc_handle_critical_exit -> panic(), and panic is patched
+  // (scripts/xnu-panic-screen.c) to draw glyphs straight into the frame buffer
+  // with its own printf. If the console is merely not painting, that screen
+  // still appears; if a thread is parked inside the tty with the ticket lock in
+  // hand, this process cannot be the one holding it, because it never enters the
+  // tty here.
+  //
+  // The parent still cannot sleep -- see the note below on this kernel's sleep
+  // primitives -- so it burns a counter loop between polls and writes nothing.
   //
   // Between polls the parent burns tens of milliseconds in a counter loop rather
   // than sleeping, because every sleep primitive here needs either a Mach right
@@ -857,18 +897,20 @@ _parent:
   // struct the kernel copies in. A counter needs neither, and its only cost is
   // that "slow" and "stuck" are separated by an estimate instead of a clock.
   //
-  // The three readings, and they are exhaustive:
-  //   polls keep appearing, no waited line  => the child is hung in the kernel;
-  //                                           the console is fine and mach is
-  //                                           not the reason the panel stopped.
-  //   a waited line with status N           => the child died; N decodes as
-  //                                           signal in the low byte, exit code
-  //                                           at N >> 8, and 9 means SIGKILL.
-  //   polls stop at the same instant as the
-  //   child's output                        => the tty write path itself is
-  //                                           dead, and every mach conclusion
-  //                                           from rounds 72-74 is void.
-  mov x20, #0                       // polls taken
+  // The four readings, and they are exhaustive:
+  //   the child's lines all appear and then `waited pid=2 status=N` => the freeze
+  //       was the two writers. N decodes as always: signal in the low byte,
+  //       2816 = the probe reached exit(11), 9 = SIGKILL.
+  //   the child stops mid-output, and seconds later the panic screen says
+  //   `exit status 384` => the parent was alive, the panel could still be drawn,
+  //       and the child is stuck on its own -- with no second writer anywhere.
+  //   the child stops mid-output and no panic screen ever appears => this process
+  //       never reached exit either, so it was blocked in a wait4 that was asked
+  //       not to block, or the ticket lock really is held by the child and even
+  //       the panic path cannot get the pixels back.
+  //   everything appears except the panic => the console paints again once only
+  //       one process writes, which is the same conclusion as reading one.
+  mov x20, #0                       // polls taken; never printed
 _parent_poll:
   add x20, x20, #1
   // 0x4000000 rather than a round decimal: MOVZ can only place a 16-bit field at
@@ -888,20 +930,15 @@ _poll_spin:
   b.cs _wait_error
   cbnz x0, _wait_reaped
 
-  // Still running. Chatter for the first ten polls and then go quiet, so a long
-  // hang does not scroll the child's own last lines off the panel; keep polling
-  // either way, because a child that dies at poll 400 should still be reported.
-  cmp x20, #10
-  b.hi _parent_poll
-  adrp x1, _poll_label@PAGE
-  add x1, x1, _poll_label@PAGEOFF
-  adrp x2, _poll_label_end@PAGE
-  add x2, x2, _poll_label_end@PAGEOFF
-  sub x2, x2, x1
-  bl _puts
-  mov x0, x20
-  bl _print_line
-  b _parent_poll
+  // ~10-30 s of polls at the loop's estimate, counting the A53 and A73 clocks as
+  // the two ends of the range. Out of patience, not out of ideas: leave by the
+  // channel that needs no console. 384 is 12 * 32 with errno 0, and no stage 12
+  // exists anywhere else in this file, so a panic reading `exit status 384` can
+  // only mean "the parent timed out waiting for a child that never died".
+  cmp x20, #200
+  b.lo _parent_poll
+  mov x23, #384
+  b _exit_now
 
 _wait_error:
   // The call itself failed, which is its own answer: the parent is alive, the
@@ -1167,9 +1204,6 @@ _wait_banner_end:
 _wait_mid:
   .ascii " status="
 _wait_mid_end:
-_poll_label:
-  .ascii "[clover] parent: poll "
-_poll_label_end:
 _wait_err:
   .ascii "[clover] parent: wait4 error "
 _wait_err_end:

@@ -148,7 +148,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: is the mach probe hung or dead"
+title = "clover md0 root: one writer, panic-screen exit"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -691,6 +691,29 @@ dram_size = "0x80000000"
 #     separates "child hung, console fine" from "child died, parent blocked on the
 #     obituary write" from "the tty write path is dead", which is a different
 #     suspect than anything in osfmk/ipc.
+#   * v0.2.46 puts the mach question on hold, because round 75 read as a console
+#     result. Its panel ended `[clover] parent: poll ` with the cursor after the
+#     space and the digit never written, the child's first word (`el0 child:
+#     alive`, one write ending in a newline) absent, and no panic screen anywhere.
+#     A write that returned an errno would have exited initproc and painted one,
+#     so the parent is either parked inside the tty or its bytes are being dropped
+#     on the floor -- and round 74 stopped the same way, one process earlier, at
+#     `el0 mach: msg=`. Two rounds, two different processes, both stopping at a
+#     write that immediately followed a successful one; the only thing that changed
+#     between them is that the parent became a second writer. Every character of
+#     EL0 output ends in vcputc_options (osfmk/console/video_console.c:1231) under
+#     an lck_ticket_t (video_console.c:153), a spin that cannot time out, and the
+#     same function drops output silently when gc_enabled is false, so a
+#     photograph cannot tell those apart either. Round 76 therefore removes the
+#     second writer -- the parent polls with WNOHANG and does not write a single
+#     character while the child runs -- and lets the timeout speak through exit(384)
+#     instead of the console, because the panic screen is patched to draw glyphs
+#     straight into the frame buffer with its own printf (scripts/xnu-panic-screen.c)
+#     and never calls vcputc. If the child's lines now come back, the freeze was
+#     contention and the mach reading has to be taken over; if the panel freezes
+#     and the panic screen still appears, the console is fine and the child is
+#     alone in this; if it freezes and no panic screen ever comes, the parent could
+#     not leave either, which is a wedged tty and not a wedged ipc.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -700,7 +723,7 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["57f7fc5485d889f448e1140ca6f7d168acdc5b3b3f94c79c598d241e368187f3"]
+trust_cache_sha256 = ["197a08e136c4a31557cab24e2f13b0b7841f1a394cfa1e7c18c4f6d5f8df749a"]
 kernel_args = [
   "-v",
   "serial=3",
