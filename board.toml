@@ -154,7 +154,7 @@ dram_size = "0x80000000"
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
 #
-# v0.2.17-v0.2.23 ask where the frame buffer went, then walk the ADT contract
+# v0.2.17-v0.2.24 ask where the frame buffer went, then walk the ADT contract
 # and the kernel's CPU-feature assumptions, one run at a time. From v0.2.23 the
 # signals are timed resets again: arm_vm_init installs the kernel's own tables,
 # and after that no probe can paint.
@@ -236,10 +236,35 @@ dram_size = "0x80000000"
 #   * the paint probes and their targets are defaults inside this
 #     repository's scripts/patch-xnu-entry-probe.py (--no-paint/--no-paint2 turn
 #     them off), so the base repository's payload step needs no local change.
-entry_probe_reset_delay = 10
-entry_probe_reset_after = "_arm_vm_init"
+#   * v0.2.24 takes the v0.2.23 device reading: the bars appeared and the tablet
+#     reset itself after about ten seconds, which is the checkpoint firing, so
+#     arm_vm_init returned and the stall is after it. What follows in arm_init
+#     is patch_low_glo (debug_boot_arg), PE_consistent_debug_inherit,
+#     serial_init, kernel_startup_initialize_upto(KPRINTF), PE_create_console,
+#     PE_init_printf, dump_kva_space, cpu_machine_idle_init and
+#     PE_init_platform(TRUE, &BootCpuData). serial_init finds no "gpio" or "aux"
+#     node in the ADT, so it registers nothing and returns 0. PE_create_console
+#     is the first place the panel can come back: initialize_screen sees
+#     kernel_map == VM_MAP_NULL and calls ml_io_map_unmappable() on
+#     boot_args.Video, stores the new KVA in vinfo.v_baseaddr, and from then on
+#     the panic screen can draw again. Its first act is check_for_panic_log,
+#     which this BCM2837 build compiles with PLATFORM_PANIC_LOG_PADDR
+#     0x3c0fc000 - a Pi address below clover's DRAM; reading it here very likely
+#     raises an external abort, and at that moment the frame buffer is still
+#     unmapped, so the reading would still be the 3 s panic reset. The
+#     checkpoint is therefore after call #2 of PE_init_platform (the TRUE one
+#     with &BootCpuData), which is past console creation: a reset 15 s after the
+#     bars means the console was created and PE_init_platform returned, and any
+#     kprintf text that appeared on the panel in those 15 s came from a working
+#     video console. Four readings: bars plus text then ~15 s reset = console
+#     alive; bars then ~15 s reset with no text = console returned but nothing
+#     rendered; bars then white text and no reset = a panic after console, with
+#     a drawable screen, so photograph it; bars and then nothing = the stall is
+#     at or before console creation (or a panic that could not draw).
+entry_probe_reset_delay = 15
+entry_probe_reset_after = "_PE_init_platform"
 entry_probe_reset_in = "_arm_init"
-entry_probe_reset_occurrence = 1
+entry_probe_reset_occurrence = 2
 panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 kernel_args = [
