@@ -149,7 +149,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover tty: the child panics the kernel itself, past the msg= write"
+title = "clover tty: the tick panic reports the address the child is hung on"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -926,6 +926,21 @@ dram_size = "0x80000000"
 #     vcputc_lock at video_console.c:153, and through console_write()'s ring buffer
 #     (serial_console.c:526) -- which is what the next rounds are about. Left in place rather than
 #     deleted so this round's payload differs from round84's by the probe alone.
+#   * v0.2.56 (round 85) read "no panic screen, ever", and that closes the argument for probing the
+#     child any further. Four different exits were tried from the same instruction pointer -- the
+#     write returning (78-79), exit(448) (84), kill(SIGSTOP) (81), reboot(RB_PANIC) (85) -- and none
+#     of them ever reached the panel, while round84's photograph proved the child's write had already
+#     returned eight times. The three states left (write never returned / exit never returned / the
+#     parent's wait4 never woke) cannot be separated from userspace, because all three speak only
+#     through the tty or through the parent. So the reporting moves inside the kernel, and not into
+#     the path under test: kprintf at the tty sleep points was the obvious move and is a trap, since
+#     console_write is itself a ring buffer behind a write lock (serial_console.c:526, :572, :424)
+#     and printing from inside it re-enters the thing being measured. The timer takes the interrupt
+#     that the hung context cannot mask and holds that context's address in ELR_EL1, which is the
+#     first reading this board can produce about the hang without touching the hang. Kernel-side
+#     source patches also have no device-repo slot: tree/patches/xnu is a symlink to the base
+#     repository, and a device patches/xnu would replace the upstream set wholesale rather than join
+#     it -- so the instrumentation goes in drivers/ArmCpu, which the device repo already owns.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -989,9 +1004,18 @@ kernel_args = [
   # self-verify it with waitForMatchingService (2 ms, safe now that the clock runs). Any other
   # value panics on purpose -- round82 proved that this board's silence is never a reading.
   "clover-pmgr=2",
-  # No longer passed: armcpu-clock-panic=30000 existed so a surviving hang would still reach
-  # the panel, and round82 read ticks=0x14e5 -- the clock runs, so the safety net would now
-  # only pre-empt the EL0 report with its own timer panic.
+  # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
+  # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
+  # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)
+  # went silent in the same shape. The tick panic is the only reporter on this board that the
+  # tty cannot influence: it is taken by the timer, in EL1, while the hung context is the one
+  # holding the core, and its ELR is that context's address. 60000 ticks, not round82's 30000:
+  # the tick number is a boot-progress coordinate rather than a duration, and round82 read
+  # ticks=0x14e5=5349 at the AMFI check inside launchd's exec -- one step before initproc runs
+  # in EL0 -- so 60000 is roughly eleven times past the point the probe reaches, without
+  # depending on how long a tick actually is. That period is now measured at the same time
+  # (cnt0/cnt1/freq on the panic line), which is the first real clock this port has had.
+  "armcpu-clock-panic=60000",
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board runs one CPU (no sheng-smp), while the driver's
   # software-IPI SPI numbers are hardcoded at 1008..1015 -- tb128fu had to move its base
