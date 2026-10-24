@@ -154,7 +154,8 @@ dram_size = "0x80000000"
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
 #
-# v0.2.17-v0.2.19 ask where the frame buffer went, in one run, and never reset:
+# v0.2.17-v0.2.21 ask where the frame buffer went and then walk the ADT
+# contract, in one run at a time, and never reset:
 #   * _start_first_cpu maps only the DarwinBoot window (V=P, memSize bytes), and
 #     this unit's window cannot start below 0x9D400000: everything below is
 #     reserved, the only free row is 148 MiB, and a 1 GiB window has to fit in
@@ -200,6 +201,16 @@ dram_size = "0x80000000"
 #     1/2/4/8-byte integers and the topology compares the value with 'E'/'P'.
 #     cpuN.cluster-type is now u32 'E' (cpu0-3) / 'P' (cpu4-7), and
 #     check-clover.py asserts it. No kernel patch changed; only the ADT did.
+#   * v0.2.21 then hit the next topology assertion: with the 4-byte property in
+#     place, "phys_cluster_id <= MAX_CPU_CLUSTER_PHY_ID" failed at
+#     machine_routines.c:1099. This kernel builds ARM64_BOARD_CONFIG_BCM2837,
+#     which sets MAX_CPU_CLUSTERS 1 and leaves HAS_CLUSTER unset: the code
+#     turns (cluster_type == 'P') into physical cluster 1 and asserts it is 0,
+#     so a single-cluster kernel cannot accept the Kryo 260 E/P split at all.
+#     The ADT now omits cluster-type, so every CPU keeps the CLUSTER_TYPE_SMP
+#     default and the eight cores form one flat cluster, which is exactly the
+#     state this Pi 3 kernel starts from without an ADT. A faithful two-cluster
+#     description needs a kernel rebuilt with MAX_CPU_CLUSTERS >= 2.
 #   * the paint probes and their targets are defaults inside this
 #     repository's scripts/patch-xnu-entry-probe.py (--no-paint/--no-paint2 turn
 #     them off), so the base repository's payload step needs no local change.

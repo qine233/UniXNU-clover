@@ -190,15 +190,21 @@ def check_adt(errors: list) -> str:
                      for cpu in cpus.values() if "timebase-frequency" in cpu["properties"]}
         if timebases and timebases != {TIMEBASE_HZ}:
             errors.append(f"/cpus timebase is {timebases}, expected 19.2 MHz")
-        # ml_readprop() rejects anything but 1/2/4/8-byte integers, so a string
-        # here panics in ml_parse_cpu_topology before the topology is built.
+        # The BCM2837 kernel has MAX_CPU_CLUSTERS 1 and no HAS_CLUSTER, so
+        # ml_parse_cpu_topology derives the physical cluster from
+        # (cluster_type == 'P') and asserts it fits in 0. cluster-type must
+        # therefore be absent (the CLUSTER_TYPE_SMP default) or a 4-byte 'E';
+        # anything else aborts in ml_readprop or on that assertion.
         for name, cpu in cpus.items():
             value = cpu["properties"].get("cluster-type")
             if value is None:
-                errors.append(f"/cpus/{name} has no cluster-type")
-            elif len(value) != 4 or struct.unpack("<I", value)[0] not in (ord("E"), ord("P")):
+                continue
+            if len(value) != 4 or struct.unpack("<I", value)[0] not in (ord("E"), ord("P")):
                 errors.append(f"/cpus/{name}/cluster-type is {len(value)} bytes and must be a "
                               f"4-byte 'E'/'P' integer")
+            elif struct.unpack("<I", value)[0] == ord("P"):
+                errors.append(f"/cpus/{name}/cluster-type is 'P', but this single-cluster kernel "
+                              f"asserts the physical cluster id is 0")
 
         arm_io = root["children"].get("arm-io", {})
         ranges = arm_io.get("properties", {}).get("ranges")

@@ -171,10 +171,13 @@ def build_cpu_node(cpu_idx: int, mpidr: int) -> bytes:
         # DEVELOPMENT_ARM64_BCM2837 kernel this board builds.
         ("compatible", cstr("arm,armv8")),
         ("cpu-id", u32(cpu_idx)),
-        # machine_routines.c reads this with ml_readprop(), which accepts only
-        # 1/2/4/8-byte integers, and compares the value with 'E' or 'P'. A
-        # string here panics with "has bad size 6" before the topology is built.
-        ("cluster-type", u32(ord('E') if silver else ord('P'))),
+        # No cluster-type: this kernel is built for ARM64_BOARD_CONFIG_BCM2837,
+        # where MAX_CPU_CLUSTERS is 1 and HAS_CLUSTER is unset. The topology
+        # code then derives the physical cluster from (cluster_type == 'P') and
+        # asserts it is <= 0, so a 'P' CPU aborts at machine_routines.c:1099.
+        # Leaving the property out keeps every CPU at the CLUSTER_TYPE_SMP
+        # default, i.e. one flat cluster. Reporting the Kryo 260 E/P split needs
+        # a kernel rebuilt with MAX_CPU_CLUSTERS >= 2.
         ("timebase-frequency", u32(spec["clock_frequency"])),
         ("fixed-frequency-khz", u32(freq)),
     ])
