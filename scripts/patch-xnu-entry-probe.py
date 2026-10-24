@@ -71,6 +71,11 @@ DarwinBoot paints (band index = stage). Each patch site is checked against its
 expected original instruction first, and the tool refuses a kernel that does
 not match.
 
+Every run also drops the inlined panic-log probe at the head of
+_PE_create_console. This kernel is a BCM2837 build, so PLATFORM_PANIC_LOG_PADDR
+is 0x3c0fc000; on clover that is about a gigabyte below DRAM and the first load
+aborts before any video console exists.
+
 Unlike the sheng tool this port does not shift fixed virtual addresses: the
 clover kernel keeps its symbol table, so the entry, _start_first_cpu, _panic,
 _vinfo and the panic counter symbols are read from the kernel itself. Only the
@@ -724,6 +729,36 @@ def assemble(source, va, symbols, workdir):
     return binary.read_bytes()
 
 
+PANIC_LOG_BLOCK = 0x10
+PANIC_LOG_RESUME = 0x94
+
+
+def skip_pi_panic_log(data, symbols, word):
+    """Drop the inlined BCM2837 panic-log probe at the head of PE_create_console.
+
+    PLATFORM_PANIC_LOG_PADDR is 0x3c0fc000, a Raspberry Pi address. On clover that
+    is about a gigabyte below DRAM, so the first load aborts before the video
+    console is ever created. The block is inlined (there is no check_for_panic_log
+    symbol): it maps the region, reads eph_magic and bzeroes it. Replace its first
+    four instructions with the only value it leaves behind for the tail, w20 = 1
+    (initialize_screen's graphics-mode argument), and branch to the console call.
+    gPanicBase stays 0, which debug_log_init() already handles.
+    """
+    start, end = function_range(symbols, '_PE_create_console')
+    at = start + PANIC_LOG_BLOCK
+    resume = start + PANIC_LOG_RESUME
+    expected = [0x52880013, 0x52980000, 0x72A781E0, 0x52880001]
+    patched = [0x52800034, branch(at + 4, resume), 0xD503201F, 0xD503201F]
+    original = [word(at + 4 * index) for index in range(4)]
+    if original == patched:
+        return False, at, resume
+    if original != expected or resume >= end or word(resume) & 0x9F000000 != 0x90000000:
+        raise SystemExit(f'{at:#x} does not hold the inlined panic-log probe: not the kernel these probes are for')
+    for index, value in enumerate(patched):
+        struct.pack_into('<I', data, file_offset(at + 4 * index), value)
+    return True, at, resume
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('kernel', type=Path, help='the COPY of the kernel to patch in place')
@@ -780,6 +815,7 @@ def main():
     for va, value in expected.items():
         if word(va) != value:
             raise SystemExit(f'{va:#x} holds {word(va):#010x}, expected {value:#010x}: not the kernel these probes are for')
+    skipped, panic_log_at, panic_log_resume = skip_pi_panic_log(data, symbols_by_address, word)
     for stage, va in caves.items():
         if any(data[file_offset(va):file_offset(va) + CAVE_LIMITS[stage]]):
             raise SystemExit(f'Stage {stage} padding at {va:#x} is not empty')
@@ -886,7 +922,9 @@ def main():
         struct.pack_into('<I', data, file_offset(common), branch(common, common_entry))
         description += f', panic screen ({len(code):#x} bytes at {panic_entry:#x}; common funnel at {common:#x})'
     args.kernel.write_bytes(data)
-    print(f'patched {args.kernel.name}: stage 1 blue bar at {entry:#x}, stage 2 magenta bar at {mmu:#x}, {description}')
+    print(f'patched {args.kernel.name}: stage 1 blue bar at {entry:#x}, stage 2 magenta bar at {mmu:#x}, '
+          f'panic log {"skipped" if skipped else "already skipped"} at {panic_log_at:#x} -> {panic_log_resume:#x}, '
+          f'{description}')
 
 
 if __name__ == '__main__':

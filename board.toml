@@ -154,7 +154,7 @@ dram_size = "0x80000000"
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
 #
-# v0.2.17-v0.2.24 ask where the frame buffer went, then walk the ADT contract
+# v0.2.17-v0.2.25 ask where the frame buffer went, then walk the ADT contract
 # and the kernel's CPU-feature assumptions, one run at a time. From v0.2.23 the
 # signals are timed resets again: arm_vm_init installs the kernel's own tables,
 # and after that no probe can paint.
@@ -261,6 +261,32 @@ dram_size = "0x80000000"
 #     rendered; bars then white text and no reset = a panic after console, with
 #     a drawable screen, so photograph it; bars and then nothing = the stall is
 #     at or before console creation (or a panic that could not draw).
+#   * v0.2.25 takes the v0.2.24 device reading: the bars appeared and then
+#     nothing - no text, no reset - so the stall is not the checkpoint but
+#     something between arm_vm_init and PE_init_platform. A static pass over
+#     that span leaves one concrete suspect. kernel_startup_bootstrap() already
+#     ran every entry up to STARTUP_SUB_LOCKS before arm_vm_init, so the later
+#     kernel_startup_initialize_upto(KPRINTF) runs exactly one entry,
+#     PE_init_kprintf, whose serial_init finds no node and returns 0 at once;
+#     kprintf before the console is a panel no-op (vcputc_options returns while
+#     gc_initialized is false), and the log and kprintf locks are initialized.
+#     PE_create_console, however, starts with the inlined check_for_panic_log,
+#     and this BCM2837 build compiles that with PLATFORM_PANIC_LOG_PADDR
+#     0x3c0fc000 - a Pi address about a gigabyte below clover's DRAM. The first
+#     ml_io_map_wcomb+load there raises an external abort, the video console
+#     does not exist yet, and the panic screen cannot draw: bars, then nothing.
+#     The patcher now rewrites the first four instructions of PE_create_console
+#     (mov w19,#0x4000; mov w0,#0x3c0fc000; mov w1,#0x4000) into
+#     mov w20,#1; b +0x94; nop; nop, jumping straight to the gPESF check before
+#     initialize_screen. w20=1 is what the normal path sets after the map and
+#     what "cinc w1, w20, eq" turns into the mode argument, and leaving
+#     gPanicBase zero is the state debug_log_init already handles. The
+#     checkpoint stays where v0.2.24 put it (call #2 of PE_init_platform, 15 s)
+#     so the readings remain comparable: bars plus ~15 s reset = the console was
+#     created and PE_init_platform returned; bars plus text then ~15 s reset =
+#     the console renders; bars and then nothing = the stall is now inside
+#     initialize_screen/ml_io_map_unmappable or the next startup call, not at
+#     check_for_panic_log.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_PE_init_platform"
 entry_probe_reset_in = "_arm_init"
