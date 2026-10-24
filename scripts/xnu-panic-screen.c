@@ -20,6 +20,11 @@
  * 0-flag, width, precision and l/ll/z). Kernel strings are checked with an
  * active hardware translation query before reading each byte;
  * unmapped/device/user pointers print as pointers. VINFO names that mapping prefix.
+ *
+ * Below the message it prints RA, FP and LR (three registers that lead back to
+ * the call site), the format pointer, the argument pointer and the raw slots
+ * around it. A photo of that block identifies the panic's caller even when the
+ * argument list does not look like the source would suggest.
  */
 typedef unsigned long u64;
 typedef unsigned int u32;
@@ -292,8 +297,27 @@ static void hex (struct ctx *g, const char *label, u64 v)
   number (g, v, 16, 16, 1);
 }
 
-/* x0 = fmt as for panic(); x1 is set by the stub to the entry stack pointer. */
-__attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main (const char *fmt, const u64 *args)
+/* One raw argument slot, read only after a translation query. A slot whose
+ * address does not translate is drawn as dashes, so a bad va_list still
+ * leaves a screen instead of a fault. */
+static void slot (struct ctx *g, const char *label, const u64 *args, int index)
+{
+  u64 address = (u64)(args + index);
+
+  text (g, label);
+  if (!readable ((const char *)address, 0)) {
+    text (g, "----------------");
+    return;
+  }
+  put (g, '0');
+  put (g, 'x');
+  number (g, *(volatile const u64 *)address, 16, 16, 1);
+}
+
+/* x0 = fmt as for panic(); x1 = the first variadic slot; x2 = the caller's LR
+ * (x30 on the panic() hook, x6 on the trap funnel); x3 = the caller's frame
+ * pointer, whose saved LR names the assert call site that came before. */
+__attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main (const char *fmt, const u64 *args, u64 caller, u64 frame)
 {
   volatile struct vc_info *v = (volatile struct vc_info *)VINFO;
   struct ctx g;
@@ -321,7 +345,9 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   g.y = g.h / 8;
   g.log = 0;
   g.logn = 0;
-  for (row = g.y; row < g.h; row++) {
+  /* Clear the middle of the screen only: the entry probe's trace bands live in
+   * the lower half and must survive the panic for a photograph. */
+  for (row = g.y; row < g.h / 2; row++) {
     for (col = 0; col < g.w; col++) {
       *(volatile u32 *)(g.base + (u64)row * g.rb + (u64)col * 4) = 0;
     }
@@ -335,6 +361,31 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   format (&g, fmt, args);
   g.log = 0;
   __asm__ volatile ("dsb sy");
+  /* Caller evidence. The panic screen can only show what the formatter read,
+   * so it also prints the registers that lead back: RA is the LR on entry
+   * (in _Assert: its return into panic()), FP the caller's frame pointer, and
+   * LR the return address saved in that frame, which names the function that
+   * called _Assert. The slots around the va_list make a shifted argument
+   * list visible instead of silently wrong. */
+  hex (&g, "\nRA=", caller);
+  hex (&g, "\nFP=", frame);
+  {
+    u64 saved = 0;
+    if (frame != 0 && readable ((const char *)(frame + 8), 0)) {
+      saved = *(volatile u64 *)(frame + 8);
+    }
+    hex (&g, "\nLR=", saved);
+  }
+  hex (&g, "\nfmt=", (u64)fmt);
+  hex (&g, "\nargs=", (u64)args);
+  slot (&g, "\nm2=", args, -2);
+  slot (&g, " m1=", args, -1);
+  slot (&g, "\na0=", args, 0);
+  slot (&g, " a1=", args, 1);
+  slot (&g, "\na2=", args, 2);
+  slot (&g, " a3=", args, 3);
+  slot (&g, "\na4=", args, 4);
+  slot (&g, " a5=", args, 5);
   /* Sample the active CPU translation regime, without changing it. This is
    * panic-time evidence only; it does not establish early mappings or EL0 ABI. */
   {
@@ -359,10 +410,12 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   park ();
 }
 
-/* Entry from panic(): keep the stack pointer, which addresses the variadic arguments. */
+/* Entry from panic(): keep the stack pointer, which addresses the variadic
+ * arguments, and hand over the caller's LR and frame pointer before the C
+ * prologue can overwrite them. */
 __attribute__((naked, noreturn, section(".text.a_entry"))) void panic_screen (const char *fmt)
 {
-  __asm__ volatile ("mov x1, sp\n\tb panic_screen_main");
+  __asm__ volatile ("mov x2, x30\n\tmov x3, x29\n\tmov x1, sp\n\tb panic_screen_main");
 }
 
 /* The real panic_trap_to_debugger signature takes (fmt, va_list *, ...).
@@ -372,7 +425,7 @@ __attribute__((naked, noreturn, section(".text.a_entry"))) void panic_screen (co
  */
 __attribute__((naked, noreturn, section(".text.a_common"))) void panic_screen_common (void)
 {
-  __asm__ volatile ("ldr x1, [x1]\n\tb panic_screen_main");
+  __asm__ volatile ("mov x2, x6\n\tmov x3, x29\n\tldr x1, [x1]\n\tb panic_screen_main");
 }
 
 #include "Font.h"

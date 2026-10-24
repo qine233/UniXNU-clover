@@ -154,7 +154,7 @@ dram_size = "0x80000000"
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
 # entry bars on ABL's framebuffer, and a panic stays on screen for a photo.
 #
-# v0.2.17-v0.2.26 ask where the frame buffer went, then walk the ADT contract
+# v0.2.17-v0.2.27 ask where the frame buffer went, then walk the ADT contract
 # and the kernel's CPU-feature assumptions, one run at a time. From v0.2.23 the
 # signals are timed resets again: arm_vm_init installs the kernel's own tables,
 # and after that no probe can paint.
@@ -309,6 +309,25 @@ dram_size = "0x80000000"
 #     band before 11 missing = that call did not return; no 11 at all = the
 #     reset cave was never reached or cannot paint either; white text = a panic
 #     after the console, so photograph it.
+#   * v0.2.27 takes the v0.2.26 device reading: the tablet showed green, blue
+#     and white panic text reading "<1>:0 Assertion failed: <d>" (the two %s
+#     arguments are the unreadable pointers 0x1 and 0xd), with TCR/SCTLR and
+#     pages=free=0. A panic() therefore fired before the VM page bootstrap,
+#     inside the traced arm_init tail, and the video console can draw again
+#     (PE_create_console re-mapped the frame buffer). Two problems hid the
+#     caller: the panic screen cleared rows [h/8, h), which erased every band
+#     below the blue one, and the printed arguments do not match the only
+#     reference to that format string. _Assert(file, line, expression) is its
+#     sole user and the cold call sites pass constants ("kptimer.c" 575,
+#     "machine_routines.c" 2404), not 0x1/0xd.
+#     The screen now clears only [h/8, h/2) and the trace bands moved to
+#     10-14 (white, orange, green, cyan, magenta) with the reset control at 15
+#     (red), all below the cleared rows. It also prints RA (the LR on entry),
+#     FP (the caller's frame pointer), LR (the saved return address at [FP+8],
+#     which names the function that called _Assert), fmt, args and the raw
+#     slots m2, m1, a0-a5. Every slot is read only after an AT S1E1R query, so
+#     a bogus va_list prints dashes instead of faulting. The checkpoint is
+#     unchanged: reset before _machine_startup, 15 s.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true

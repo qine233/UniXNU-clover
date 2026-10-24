@@ -70,9 +70,12 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         band and jump back. The calls between the
                                         second PE_init_platform and a reset just
                                         before _machine_startup are traced by
-                                        default (bands 6-10); the reset cave
-                                        paints band 11 first, so a missing band
-                                        names the call that did not return.
+                                        default (bands 10-14); the reset cave
+                                        paints band 15 first, so a missing band
+                                        names the call that did not return. The
+                                        bands live in the screen's lower half,
+                                        which the panic screen does not clear,
+                                        so they survive until a photo is taken.
 
 The bars are the 1/16th bands of the frame buffer below the green one that
 DarwinBoot paints (band index = stage). Each patch site is checked against its
@@ -401,17 +404,21 @@ _start:
 
 # Calls traced by default when the checkpoint resets just before
 # _machine_startup: they are what arm_init does after the second
-# PE_init_platform call. Bands follow in address order: 6 magenta, 7 cyan,
-# 8 orange, 9 green, 10 white. The reset cave paints band 11 red first, so a
-# trace that never appears can be blamed on the calls only when 11 did.
+# PE_init_platform call. Bands follow in address order: 10 white, 11 orange,
+# 12 green, 13 cyan, 14 magenta. The reset cave paints band 15 red first, so a
+# trace that never appears can be blamed on the calls only when 15 did.
+#
+# Bands 10-15 sit in the lower half of the screen because the panic screen
+# clears only rows [h/8, h/2): a panic keeps the entry bars on the top and the
+# trace bars on the bottom visible in the same photo.
 TRACE_CALLS = ('_ml_map_cpu_pio', '_cpu_timebase_init', '_kptimer_curcpu_up',
                '_PE_init_cpu', '_fiq_context_init')
-TRACE_BANDS = ((6, '0x00FF', '0xFFFF'),
-               (7, '0xFFFF', '0xFF00'),
-               (8, '0x8000', '0xFFFF'),
-               (9, '0xFF00', '0x0000'),
-               (10, '0xFFFF', '0xFFFF'))
-RESET_PAINT_BAND = (11, '0x0000', '0x00FF')
+TRACE_BANDS = ((10, '0xFFFF', '0xFFFF'),
+               (11, '0x8000', '0xFFFF'),
+               (12, '0xFF00', '0x0000'),
+               (13, '0xFFFF', '0xFF00'),
+               (14, '0x00FF', '0xFFFF'))
+RESET_PAINT_BAND = (15, '0x0000', '0x00FF')
 
 SOURCES = {
     1: (".text\n.global _start\n_start:\n"
@@ -678,14 +685,22 @@ def panic_common_entry(workdir, code, load):
     names = {parts[2]: int(parts[0], 16)
              for line in subprocess.check_output([tool('llvm-nm', 'brew install llvm'), workdir / 'panic.elf'], text=True).splitlines()
              if len(parts := line.split()) == 3}
-    entry = names.get('panic_screen_common')
+    common = names.get('panic_screen_common')
+    entry = names.get('panic_screen')
     main = names.get('panic_screen_main')
-    if entry is None or main is None or not load <= entry <= load + len(code) - 8:
-        raise SystemExit('Common panic renderer entry is missing or out of bounds')
+    if common is None or entry is None or main is None:
+        raise SystemExit('Panic renderer entry is missing')
+    at = common - load
+    if not load <= common <= load + len(code) - 16 or code[at:at + 16] != struct.pack(
+            '<IIII', 0xAA0603E2, 0xAA1D03E3, 0xF9400021, branch(common + 12, main)):
+        raise SystemExit('Common panic entry does not pass the caller LR and frame, dereference the Darwin '
+                         'va_list pointer and branch to the renderer')
     at = entry - load
-    if code[at:at + 8] != struct.pack('<II', 0xf9400021, branch(entry + 4, main)):
-        raise SystemExit('Common panic entry does not dereference the Darwin va_list pointer and branch to the renderer')
-    return entry
+    if not load <= entry <= load + len(code) - 16 or code[at:at + 16] != struct.pack(
+            '<IIII', 0xAA1E03E2, 0xAA1D03E3, 0x910003E1, branch(entry + 12, main)):
+        raise SystemExit('Panic entry does not pass the caller LR and frame, keep the argument stack '
+                         'pointer and branch to the renderer')
+    return common
 
 
 def load_segments(data):
@@ -949,8 +964,8 @@ def main():
                         f'(at {paint2_va:#x}), band {args.paint2_return_band} when it returns, and continues')
 
     # Post-console trace. Each named call gets a paint cave of its own, placed
-    # after the mapper; the reset cave also paints band 11 before it waits, so a
-    # missing trace band can only be blamed on the calls when 11 did appear.
+    # after the mapper; the reset cave also paints band 15 before it waits, so a
+    # missing trace band can only be blamed on the calls when 15 did appear.
     traces = []
     wanted = [name for name in args.trace_calls.split(',') if name]
     if wanted:
