@@ -412,6 +412,18 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   hex (&g, " phase=", *(volatile const u32 *)ARM_IRQ_PHASE);
   hex (&g, " intid=", *(volatile const u32 *)ARM_TIMER_INTID);
   hex (&g, " typer=", *(volatile const u32 *)(ARM_GIC_BOOT + 3 * 4));
+  /* Round83: drivers/CloverPMGR publishes an ApplePMGRNub before AMFI's thread-call deadline
+   * can fire, and records every step in these sixteen slots. stage is the step it reached, so
+   * a panic here that never got to publish is distinguishable from the AMFI one by sight.
+   * read=-> is the original AON pair that AMFI reads through slot 320 then writes through 321. */
+  hex (&g, "\npmgr=", *(volatile const u64 *)PMGR_OBS);
+  hex (&g, " status=", *(volatile const u64 *)(PMGR_OBS + 8));
+  hex (&g, " mode=", *(volatile const u64 *)(PMGR_OBS + 120));
+  hex (&g, "\nnub=", *(volatile const u64 *)(PMGR_OBS + 40));
+  hex (&g, " attached=", *(volatile const u64 *)(PMGR_OBS + 104));
+  hex (&g, " registered=", *(volatile const u64 *)(PMGR_OBS + 112));
+  hex (&g, "\naon=", *(volatile const u64 *)(PMGR_OBS + 56));
+  hex (&g, "=>", *(volatile const u64 *)(PMGR_OBS + 64));
   /* The raw argument slots are not dumped: the formatted message above already carries them (room for the PANIC_TEXT copy). */
   mark[0] = 0xC0FFEE11u;
   mark[1] = 0x5CEEDA7Au;

@@ -49,6 +49,7 @@ archives = [
   "build-mockfs-fixture.py",
   "build-libpthread-kernel.py",
   "build-clover-display-stub.py",
+  "build-clover-pmgr.py",
 ]
 
 [kernel.prelink]
@@ -148,7 +149,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover md0 root: intid 19 gives the board a clock"
+title = "clover pmgr: publish an ApplePMGRNub so AMFI waits for nothing"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -861,6 +862,27 @@ dram_size = "0x80000000"
 #     that survives the fix still reaches the panel. The panic screen keeps the *first*
 #     panic, so a probe that finished earlier is untouched, and reaching the watchdog at
 #     all is itself the reading that the timer interrupt now arrives.
+#   * v0.2.53 because round 82 came back as the first panic screen this board has ever drawn,
+#     and the reading was ticks=0x14e5 (5349): the clock took 5349 ticks before the AMFI panic
+#     beat the watchdog, so INTID 19 is the right line and the watchdog never had to fire. The
+#     panic itself was "AMFI: No PMGR?" (ConfigurationSettings.cpp:235, thread-call worker).
+#     That is not a regression from the clock: AMFI calls waitForMatchingService(serviceMatching
+#     ("ApplePMGRNub"), timeout) whose timeout is in NANOSECONDS and becomes an absolute
+#     deadline (IOService.cpp:6582, clock_absolutetime_interval_to_deadline + SLEEPNOTIFYTO).
+#     With no tick, that deadline could never expire, so rounds 70-81 simply hung there and the
+#     boot still reached EL0; with a tick it expires at once, the match returns nothing, and
+#     AMFI panics. The clock made an old wall visible instead of building it.
+#     So this round answers one question: does an unmodified AMFI stop panicking once a board
+#     publishes an ApplePMGRNub? drivers/CloverPMGR (built by scripts/build-clover-pmgr.py into
+#     the path the base link hardcodes) does it in the shape sheng uses -- load
+#     com.apple.driver.ApplePMGR, rebuild the provider's ABI, mint the original nub with the
+#     original factory, attach/start/register it under a guard shell whose every power-domain
+#     slot panics except the AON read/write pair AMFI actually uses -- and reports through 16
+#     observation slots that the panic screen now draws (pmgr=/status=/mode=, nub=/attached=/
+#     registered=, aon=0x…=>0x… for the pair AMFI reads then writes). Unlike sheng, every failure path here panics by name; a silent bail
+#     would photograph exactly like round82.
+#     The clock watchdog goes with it: it has done its job (the clock is proven), and leaving it
+#     on would put a 30 s timer panic on top of whatever EL0 reports this round.
 entry_probe_reset_delay = 15
 entry_probe_reset_after = "_machine_startup"
 entry_probe_reset_before = true
@@ -920,9 +942,13 @@ kernel_args = [
   # SDM660 does not route the architected timer to, so until now the kernel armed a
   # source that never fires and masked the one that does.
   "armcpu-timer-intid=19",
-  # Panic on the 30000th tick (~30 s at XNU's 1 ms tick). Silence is not allowed to be
-  # a reading: if the write still does not return, the clock says so on the panel.
-  "armcpu-clock-panic=30000",
+  # CloverPMGR's own switch, read inside sheng_pmgr_run(): 2 = publish the original nub and
+  # self-verify it with waitForMatchingService (2 ms, safe now that the clock runs). Any other
+  # value panics on purpose -- round82 proved that this board's silence is never a reading.
+  "clover-pmgr=2",
+  # No longer passed: armcpu-clock-panic=30000 existed so a surviving hang would still reach
+  # the panel, and round82 read ticks=0x14e5 -- the clock runs, so the safety net would now
+  # only pre-empt the EL0 report with its own timer panic.
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board runs one CPU (no sheng-smp), while the driver's
   # software-IPI SPI numbers are hardcoded at 1008..1015 -- tb128fu had to move its base

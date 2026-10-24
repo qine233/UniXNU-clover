@@ -19,6 +19,15 @@ CONFIG_XNU_TRUST_CACHE_RUNTIME=y
 CONFIG_XNU_SOURCE_MOCKFS=y
 CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
+# AMFI's thread-call waits (in nanoseconds) for a service matching `ApplePMGRNub`, and with a
+# working clock (round82) that deadline now fires and panics "AMFI: No PMGR?". The hook that
+# lets a board publish one is in the base tree's zzz-boot-progress.patch (bsd_init.c, between
+# bsd_bufferinit() and IOKitInitializeTime()) and its name is fixed there: XNU_SHENG_PMGR makes
+# bsd_init.o call sheng_pmgr_run(), and build-xnu-4k-baseline.sh force-loads
+# build/sheng-platform-power/libShengPlatformPower.a -- the exact path, with no CONFIG_ override,
+# so scripts/build-clover-pmgr.py writes our archive there. Requires SOURCE_CORECRYPTO14, which
+# is on above; the mode stamp at .sheng-pmgr-mode rebuilds bsd_init.o when it flips.
+CONFIG_XNU_SHENG_PMGR=y
 # Kryo 260 (Cortex-A73/A53 derivatives) is ARMv8.0 and has no PSTATE.PAN: with
 # this on, the kernel's first `msr pan, #1` in arm_init raises an undefined
 # instruction at 0x79aff58, before arm_vm_init.

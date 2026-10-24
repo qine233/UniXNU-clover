@@ -433,6 +433,25 @@ def check_board(errors: list) -> str:
         if "libCloverDisplayStub.a" in text and \
                 not any("build-clover-display-stub.py" in entry for entry in board["kernel"]["archives"]):
             errors.append("the defconfig links the display stub but [kernel] archives omits its builder")
+        # round83, the AMFI PMGR contract. Three facts have to agree or the board ships a kernel
+        # that silently has no power manager again: the defconfig switch (which both compiles the
+        # sheng_pmgr_run() call into bsd_init.o and makes the link force-load
+        # build/sheng-platform-power/libShengPlatformPower.a), the archive builder that writes that
+        # exact path, and the clover-pmgr=2 boot arg the provider reads -- any other value panics.
+        # scripts/patch-xnu-entry-probe.py also demands _clover_pmgr_observation for the panic
+        # screen, so turning the switch off fails the payload build by name.
+        pmgr_builder = any("build-clover-pmgr.py" in entry for entry in board["kernel"]["archives"])
+        if flags.get("SHENG_PMGR", "n") in ("y", "1"):
+            if not pmgr_builder:
+                errors.append("CONFIG_XNU_SHENG_PMGR is on but [kernel] archives omits "
+                              "build-clover-pmgr.py, so the base link's test -f on "
+                              "libShengPlatformPower.a stops the build")
+            if "clover-pmgr=2" not in board["payload"]["kernel_args"]:
+                errors.append("CONFIG_XNU_SHENG_PMGR is on but no clover-pmgr=2 in kernel_args: "
+                              "sheng_pmgr_run() panics on any mode it does not know")
+        elif pmgr_builder:
+            errors.append("[kernel] archives builds the PMGR provider but the defconfig leaves "
+                          "CONFIG_XNU_SHENG_PMGR off, so nothing ever loads it")
 
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]

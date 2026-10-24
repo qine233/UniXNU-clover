@@ -868,7 +868,8 @@ def assemble_c(source, va, workdir, symbols):
                                ('ARM_IRQ_ID', '_armcpu_irq_id', 4),
                                ('ARM_IRQ_PHASE', '_armcpu_irq_phase', 4),
                                ('ARM_TIMER_INTID', '_armcpu_timer_intid', 4),
-                               ('ARM_GIC_BOOT', '_armcpu_gic_boot', 4)):
+                               ('ARM_GIC_BOOT', '_armcpu_gic_boot', 4),
+                               ('PMGR_OBS', '_clover_pmgr_observation', 128)):
         address = symbols.get(name)
         if address is None or address % width or not any(
                 base <= address and address + width <= base + size

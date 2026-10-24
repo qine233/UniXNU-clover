@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import pathlib
 import subprocess
 import sys
@@ -26,6 +27,10 @@ XNU_PAYLOAD = pathlib.Path("/Users/zhouzhou/UniXNU/out/clover/payload/payload.im
 LOCAL_ROOT = pathlib.Path("/Users/zhouzhou/UniXNU-clover/build/clover-root/launchd.macho")
 LOCAL_CACHE = pathlib.Path("/Users/zhouzhou/UniXNU-clover/build/clover-root/trustcache.bundle")
 LOCAL_KERNEL = pathlib.Path("/Users/zhouzhou/UniXNU/out/clover/kernel/kernel.macho")
+# The assembled build tree: scripts/build-clover-pmgr.py records the original-PMGR addresses it
+# audited here, and kits/NativePrelink (a symlink into the UniXNU base) parses Mach-O for it.
+TREE = pathlib.Path("/Users/zhouzhou/UniXNU/out/clover/tree")
+PMGR_REPORT = TREE / "build/clover-pmgr/build-report.json"
 
 PAYLOADS = "Payloads"
 FILES = ["unixnu.toml", "kernel.macho", "scratch-data.img", "kernel.macho.adt",
@@ -59,6 +64,34 @@ def locate(image: pathlib.Path, name: str) -> str:
         if short in listing or short.split(".")[0][:6] in listing:
             return candidate
     raise KeyError(name)
+
+
+def check_pmgr(kernel: bytes) -> bool:
+    """The round83 provider binds the original ApplePMGR by absolute address, so the addresses
+    written into build/clover-pmgr/original-bindings.S have to still name those symbols in the
+    kernel this round actually linked. A layout shift would otherwise ship a power manager that
+    dispatches into the wrong function, and the only sign on the panel would be round82's
+    `AMFI: No PMGR?` again -- indistinguishable from never having published a nub."""
+    label = "kernel.macho: original-PMGR bindings alive"
+    if not PMGR_REPORT.exists():
+        print(f"{label:42} SKIPPED (no {PMGR_REPORT})")
+        return False
+    report = json.loads(PMGR_REPORT.read_text())
+    # Our own helper aliases are absolute symbols this object defines for the link; they are not
+    # exported by the kernel and cannot be looked up in it.
+    originals = {name: int(value, 16) for name, value in report["bindings"].items()
+                 if not name.startswith("_clover_")}
+    sys.path.insert(0, str(TREE / "kits/NativePrelink"))
+    from native_prelink import exports, macho  # noqa: PLC0415 - needs the tree on sys.path
+    names = {name: va for va, found in exports(kernel, macho(kernel)).items() for name in found}
+    drifted = sorted(name for name, va in originals.items() if names.get(name) != va)
+    linked = b"CloverPMGR: failed at stage" in kernel
+    ok = not drifted and linked
+    print(f"{label:42} {'OK' if ok else 'FAIL'} "
+          f"({len(originals)} bindings, {len(drifted)} moved"
+          f"{', ' + ', '.join(drifted) if drifted else ''}; provider text "
+          f"{'present' if linked else 'absent'})")
+    return ok
 
 
 def report(image: pathlib.Path) -> int:
@@ -112,6 +145,8 @@ def report(image: pathlib.Path) -> int:
                   f"({len(offs)} bytes in {runs} runs, "
                   f"sha256 {hashlib.sha256(kernel).hexdigest()})")
             ok &= localized
+    if kernel is not None:
+        ok &= check_pmgr(kernel)
     return 0 if ok else 1
 
 
