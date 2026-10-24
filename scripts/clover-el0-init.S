@@ -8,11 +8,12 @@
 // bsd_utaskbootstrap and never returns: the thread becomes the process. So this
 // file is the whole userland of this round -- static, no dyld, no libraries and
 // no Apple userspace bytes, exactly like the upstream QEMU fixture
-// (scripts/qemu-entry/native-user.S), with one addition: it exits.
+// (scripts/qemu-entry/native-user.S), with one addition: it can exit, and only
+// does so when something failed.
 //
-// Why exiting is the point. The panel is the only output on this tablet, and a
-// process that spins at EL0 looks from the outside exactly like a boot thread
-// that never got there. exit() on the other hand runs through
+// Why exiting is the failure channel. The panel is the only output on this
+// tablet, and a process that spins at EL0 looks from the outside exactly like
+// a boot thread that never got there. exit() on the other hand runs through
 // proc_handle_critical_exit (bsd/kern/kern_exit.c), which panics with
 // "initproc failed to start -- no exit reason available -- (signal %d, exit
 // status %d)": white text on the panic screen, which can only appear if the root
@@ -25,6 +26,18 @@
 // The exit status is the reading, so it is spent carefully: 0 means every step
 // below worked, and anything else is stage * 32 + errno, where the stage is 1
 // for getpid, 2 for sysctl, 3 for open("/dev/console") and 4 for write.
+//
+// Round 66 spent it and got 0 back: the open returned a descriptor and the
+// write returned clean, so EL0 can talk to the console tty. What the photo
+// could not show is the line itself. The panic hook (xnu-panic-screen.c) clears
+// [h/8, h/2) and prints from h/8+8; the strip above it is whatever the live
+// console and the msgbuf replay left there, and tty output never enters the
+// msgbuf, so the banner was drawn and then erased by the very panic that
+// reported its success. Exiting is therefore only the failure channel now: on
+// success this program fills the panel with the banner -- 240 lines, two whole
+// screens, so no photograph can miss it -- and parks at EL0, leaving the live
+// console on screen as the reading. A failure still exits with stage * 32 +
+// errno, whose panic text is self-contained and needs no banner.
 //
 // Why the console has to be opened by us. Round 65 retired the assumption that
 // fd 1 is a console: this XNU has no open_console() at all, bsd_init hands
@@ -82,6 +95,15 @@ _start:
   b.cs _fail                        // no fd: the banner has nowhere to go
   mov x22, x0
 
+  // A failure leaves through _exit_now with stage * 32 + errno; the panic text
+  // that follows it is self-contained and needs no banner on the panel.
+  cbnz x23, _exit_now
+
+  // Success never exits: the banner goes up 240 times, two whole screens of
+  // 120 rows, so the live console itself is the reading and no photograph can
+  // miss the line. x19/x21/x22 survive the helpers; x24 is the loop's own.
+  mov x24, #240
+1:
   // "[clover] el0 init: pid="
   // The length is computed at run time from the two labels: the assembler
   // cannot fold a label difference into a mov (unknown AArch64 fixup kind), and
@@ -133,11 +155,22 @@ _start:
   bl _write_console
   mov x1, #128
   b.cs _fail
+  sub x24, x24, #1
+  cbnz x24, 1b
 
-  // exit(x23): 0 here means EL0 wrote to the console and every step agreed.
+  // A write that failed mid-loop was recorded in x23; report it now instead of
+  // parking behind a panel that may never have lit up.
+  cbnz x23, _exit_now
+
+  // Every line accepted: stay here with the panel full of them. A parked EL0
+  // process behind a lit banner is the one shape this port has never shown.
+  b _checkpoint
+
+_exit_now:
   mov x0, x23
   mov x16, #1
   svc #0x80
+  b _checkpoint
 
   // exit returned, which userland never does: park where a debugger (or a
   // future photo of a stuck panel) can find the registers.
