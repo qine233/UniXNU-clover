@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: the sdhci register dump answers whether the window is live"
+title = "clover emmc: CMD13 asks the card whether anyone is still home"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1006,16 +1006,21 @@ kernel_args = [
   # value panics on purpose -- round82 proved that this board's silence is never a reading.
   "clover-pmgr=2",
   # drivers/CloverSdhci, called from the tail of the hook above once the nub publication held.
-  # Mode 1 is a look-only dump: it maps 0xc0c4000 for 4 KiB, reads about thirty SDHCI and
-  # Qualcomm SDCC v5 registers into clover_emmc_observation[16], formats them into one 512-byte
-  # report and ends in panic("CloverSdhci: %s") so the photograph is the reading. It issues no
-  # command, sets no clock, touches no reset, enables no interrupt and writes no register --
-  # because the firmware's only SDHCI driver is the SdccDxe blob, so nothing here knows what
-  # state to put the host in, and the state it is in right now is the fact worth having.
-  # All-zero fields mean the SDCC interface clock is gated; all-ones means the read aborted at
-  # the NoC; a plausible CAPABILITIES base clock and a spec version mean the window is live and
-  # the next round may issue CMD13.
-  "clover-emmc=1",
+  # Mode 1 is the look-only dump that round87 ran: it mapped 0xc0c4000 for 4 KiB, read about
+  # thirty SDHCI and Qualcomm SDCC v5 registers, and panicked with the dump as the photograph.
+  # It answered -- capabilities 0x742dc8b2 (200 MHz base clock), host control 0x38 (8-bit,
+  # ADMA64), power 0x0b (1.8 V), clock control 0x0007 (internal clock enabled and stable, card
+  # clock on, divider 0), host control 2 0x0003 (SDR104/HS200 select), the SDCC v5 core version
+  # 0x1000006b at 0x318 with the msi layout at 0x050 answering zero, DLL status 0x184 with
+  # CORE_DLL_LOCK set, and the last firmware command CMD12 after a multi-block DMA read. Mode 1
+  # stays as the control; it still writes nothing.
+  #
+  # Mode 2 (this round) is the first write: it clears only the command group of INT_STATUS
+  # (write-1-to-clear), writes ARGUMENT = RCA 1 << 16 and COMMAND = CMD13 with an R1 response
+  # and CRC/index checking, then polls INT_STATUS within a fixed bound. No clock change, no
+  # reset, no bus-width change, no data phase. The report names one of five verdicts and carries
+  # INT_STATUS, both response words, the decoded R1 state and PRESENT_STATE before and after.
+  "clover-emmc=2",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

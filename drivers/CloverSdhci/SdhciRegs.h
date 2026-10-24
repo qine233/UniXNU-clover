@@ -194,7 +194,7 @@
 // SDHCI_CAPABILITIES (0x40, u32), the fields a dump has to be read against
 #define SDHCI_TIMEOUT_CLK_MASK  0x0000003F
 #define SDHCI_TIMEOUT_CLK_UNIT  0x00000080
-#define SDHCI_CLOCK_BASE_MASK   0x00003F00
+#define SDHCI_CLOCK_BASE_MASK   0x0000FF00   // 15:8, MHz; the 6-bit 13:8 field is SDHCI 1.0 only
 #define SDHCI_CLOCK_BASE_SHIFT  8
 #define SDHCI_MAX_BLOCK_MASK    0x00030000
 #define SDHCI_CAN_DO_8BIT       0x00040000

@@ -779,6 +779,14 @@ def handoff_source(mode, bands, vinfo, ticks):
 ROOT = Path(__file__).resolve().parents[1]
 SEGMENTS = []   # (vmaddr, vmsize, fileoff, filesize) of the kernel being patched
 
+# Segments a cave or the panic screen may be written into beyond __TEXT_EXEC. __KLD is
+# executable in the image, but OSKext zeroes and frees it after the prelink bootstrap
+# (OSRuntime.cpp:349, OSKext.cpp:1262), so code parked there can disappear before a later
+# panic; __PLK_TEXT_EXEC is prelinked kext text and stays mapped for the life of the kernel.
+PLACEMENT_SEGMENTS = (b'__TEXT_EXEC', b'__PLK_TEXT_EXEC')
+EXEC_SEGMENTS = []   # (vmaddr, vmsize, fileoff, filesize) of PLACEMENT_SEGMENTS
+CLAIMED = []         # (lo, hi) byte ranges this run has written; never hand out twice
+
 
 def tool(name, hint):
     # Prefer the Homebrew LLVM over Apple's: the cross aarch64-none-elf objects and
@@ -942,12 +950,16 @@ def load_segments(data):
         raise SystemExit('Not a 64-bit Mach-O')
     offset = 32
     SEGMENTS.clear()
+    EXEC_SEGMENTS.clear()
+    CLAIMED.clear()
     for _ in range(ncmds):
         cmd, size = struct.unpack_from('<II', data, offset)
         if cmd == 0x19:
-            _, vmaddr, vmsize, fileoff, filesize = struct.unpack_from('<16sQQQQ', data, offset + 8)
+            name, vmaddr, vmsize, fileoff, filesize = struct.unpack_from('<16sQQQQ', data, offset + 8)
             if filesize:
                 SEGMENTS.append((vmaddr, vmsize, fileoff, filesize))
+                if name.rstrip(b'\0') in PLACEMENT_SEGMENTS:
+                    EXEC_SEGMENTS.append((vmaddr, vmsize, fileoff, filesize))
         offset += size
 
 
@@ -1003,19 +1015,62 @@ def padding_fits(data, load, size):
     return any(start <= load and load + size <= start + length for start, length in zero_runs(data, load))
 
 
+def claim(lo, size):
+    CLAIMED.append((lo, lo + size))
+
+
+def unclaimed(lo, size):
+    return not any(lo < hi and start < lo + size for start, hi in CLAIMED)
+
+
+def slot_in(lo, length, size):
+    """An aligned VA inside the run [lo, lo+length) that holds size unclaimed bytes."""
+    slot = (lo + 15) & ~15
+    return slot if slot + size <= lo + length and unclaimed(slot, size) else None
+
+
 def zero_slot(data, cursor, size, what):
-    """An aligned VA at or after CURSOR with SIZE zero bytes inside one run.
+    """An aligned VA with SIZE zero bytes, preferring the first hole at or after CURSOR.
 
     16-byte alignment is what keeps every branch in the cave at the address the
     cave was assembled for: lld aligns _start up, so an unaligned slot would
     shift all PC-relative instructions.
+
+    The fallback runs backwards in practice: round88's CMD13 code grew __TEXT_EXEC
+    into the last hole past the entry, and the remaining marker caves had nowhere
+    to go. Cave code is position-independent and every caller re-checks the
+    branches it assembled, so an earlier hole — or one in another placement
+    segment that stays mapped — is as good as a later one. Claimed ranges are
+    skipped because assembled code can contain zero words of its own.
     """
     start = (cursor + 15) & ~15
-    run = next(((lo, length) for lo, length in zero_runs(data, start)
-                if ((lo + 15) & ~15) + size <= lo + length), None)
-    if run is None:
-        raise SystemExit(f'No {size:#x}-byte padding for the {what} after {start:#x}')
-    return (run[0] + 15) & ~15
+    for lo, length in zero_runs(data, start):
+        slot = slot_in(lo, length, size)
+        if slot is not None:
+            claim(slot, size)
+            return slot
+    for vmaddr, _, _, _ in EXEC_SEGMENTS:
+        for lo, length in zero_runs(data, vmaddr):
+            slot = slot_in(lo, length, size)
+            if slot is not None:
+                claim(slot, size)
+                return slot
+    raise SystemExit(f'No {size:#x}-byte padding for the {what} after {start:#x}')
+
+
+def code_slot(data, at, size):
+    """A VA where a freestanding C blob of SIZE bytes fits, with zero_slot's fallbacks."""
+    for lo, length in zero_runs(data, at):
+        if lo > at:
+            slot = slot_in(lo, length, size)
+            if slot is not None:
+                return slot
+    for vmaddr, _, _, _ in EXEC_SEGMENTS:
+        for lo, length in zero_runs(data, vmaddr):
+            slot = slot_in(lo, length, size)
+            if slot is not None:
+                return slot
+    return None
 
 
 def entry_body(symbols):
@@ -1320,6 +1375,9 @@ def main():
         if not padding_fits(data, helper_va, len(helper)):
             raise SystemExit(f'No room for the {len(helper):#x}-byte mapper at {helper_va:#x}')
         data[file_offset(helper_va):file_offset(helper_va) + len(helper)] = helper
+        for stage, va in caves.items():
+            claim(va, CAVE_LIMITS[stage])
+        claim(helper_va, len(helper))
         next_free = helper_va + len(helper)
         trace_caves = []
         for index, (site, callee, name) in enumerate(traces):
@@ -1405,18 +1463,21 @@ def main():
         at = (at + 15) & ~15
         with tempfile.TemporaryDirectory() as tmp:
             code, load, panic_entry = assemble_c(text, at, Path(tmp), names)
-            if not padding_fits(data, load, len(code)):
+            if not padding_fits(data, load, len(code)) or not unclaimed(load, len(code)):
                 # Three staged caves can leave too little room next to the entry; the
                 # renderer is position-independent, so take the next zero run that fits.
-                at = next((start for start, length in zero_runs(data, at)
-                           if start > at and length >= len(code)), None)
+                # Round88: kernel text had grown into every hole large enough, so this
+                # search may leave __TEXT_EXEC for __PLK_TEXT_EXEC (prelinked kext text,
+                # never freed). Branch range is checked by branch() either way.
+                at = code_slot(data, at, len(code))
                 if at is None:
                     raise SystemExit(f'No {len(code):#x}-byte padding for the panic screen')
                 code, load, panic_entry = assemble_c(text, at, Path(tmp), names)
-                if not padding_fits(data, load, len(code)):
+                if not padding_fits(data, load, len(code)) or not unclaimed(load, len(code)):
                     raise SystemExit(f'No padding for the panic screen ({len(code):#x} bytes) at {load:#x}')
             common_entry = panic_common_entry(Path(tmp), code, load)
         data[file_offset(load):file_offset(load) + len(code)] = code
+        claim(load, len(code))
         struct.pack_into('<I', data, file_offset(panic_va), branch(panic_va, panic_entry))
         common = names.get('_panic_trap_to_debugger')
         if common is None or word(common) in (0, 0xFFFFFFFF):

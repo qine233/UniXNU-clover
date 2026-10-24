@@ -3066,15 +3066,156 @@ header v0 的镜像；不传 `-o` 时落在 `out/clover/boot/boot.img`。
 字节和由它派生的 boot 头 `id` 哈希，解开后都是同一份固件 `af09f6b3…`。所以 round87
 **只需要刷 `cache`**；连 boot 一起刷只是让分区状态可复现，不是修什么。
 
+### round87 读数（v0.2.58 已发布）：窗口是活的，固件留下的是一条 HS200 总线
+
+照片只有一屏 panic，`CloverSdhci: look-only dump of c0c4000` 下面是全部读数：
+
+```
+cap=742dc8b2 cap2=0000808f ver=6b02
+pst=01f800f0 int=00000000 en=07ff003f sig=00000000
+hcl=38 pw=0b clk=0007 hcn=0003 tmo=0f rst=00
+blk=0200 cnt=0000 tm=0033 cmd=0c02 arg=00000000 a2=00000000 acmd=00030000
+rsp 00000000 00000000 00000000 00000000
+msm v50/318 00000000/1000006b
+dll 100/200 00000000/0705642c
+dsts 108/208 00000000/00000184
+gen 70/320 00000000/00f04003
+```
+
+逐项读完，能确定的事比预想的多：
+
+| 读数 | 含义 |
+| --- | --- |
+| `cap=742dc8b2` | 时钟基数位 15:8 = `0xc8` = **200 MHz**；1.8 V + 3.3 V、64-bit、ADMA2、High Speed 都在 |
+| `cap2=0000808f` | SDR50/SDR104/DDR50、Driver Type D、HS400 —— 设备树声称的速率档位在控制器里是真的 |
+| `ver=6b02` | vendor `0x6b`（Qualcomm）、spec `0x02`；窗口不是常量 0，也不是 `0xffffffff` |
+| `pst=01f800f0` | Command/Data Inhibit **都没置**；DAT[3:0] 与 CMD 都是高电平；bits 4-7 是保留位、这里读 1；card-inserted 0（焊死的卡） |
+| `int=0` / `en=07ff003f` | 没有挂起的中断；两级屏蔽都没挡住命令完成位 |
+| `hcl=38` | 8-bit 总线 + ADMA64 |
+| `pw=0b` | 1.8 V 那一路是开的（vendor 自己驱动供电） |
+| `clk=0007` | 内部时钟已使能且稳定、卡时钟已开、**分频 0** ⇒ SDCLK = 200 MHz |
+| `hcn=0003` | UHS SDR104 选择位 —— `sdhci-msm` 正是用它表示 HS200 |
+| `tm=0033` | DMA + block count + read + multi，**auto CMD12 关着** |
+| `cmd=0c02` | CMD12（STOP_TRANSMISSION）、短响应、不查 CRC/索引 —— 固件最后一件事是手工补了一次 CMD12 |
+| `msm v50/318`、`dll 100/200`、`dsts 108/208`、`gen 70/320` | 只有 v5 那套布局应答：`0x318=0x1000006b`（core 版本 1.0x6b）、`0x200=0x0705642c`（DLL_EN + CK_OUT_EN）、`0x208=0x00000184`（**CORE_DLL_LOCK 已锁**）、`0x320=0x00f04003`；旧 msi 那套（`0x050/0x070/0x100/0x108`）全是 0 |
+
+所以 round87 的判定是：**窗口在 XNU 手里是活的；固件把卡和控制器留在了一条 8-bit、1.8 V、
+200 MHz、DLL 已锁的 HS200 状态里；最后一笔事务是一次多块 DMA 读之后的 CMD12。** 总线此刻
+是静的（没有 inhibit，DAT/CMD 都是高），下一颗命令可以直接发。
+
+这张照片还暴露了报告自己的三个 bug，round88 一并修掉：`SDHCI_CLOCK_BASE_MASK` 写成了
+SDHCI 1.0 的 6 位字段 `0x3F00`（把 `0xc8` 印成 `008`）、MHz 换算乘了 `100000` 而不是
+`1000000`、以及把「分频 0」当成「时钟停了」而报 `sd0MHz`。寄存器本身的读数没有错，错的
+只是那行字。
+
+另一件必须记账的事：照片里 `ticks=0`、`ipi=0`、`sent=0`。`sheng_pmgr_run()` 在
+`bsd_bufferinit` 之后、`ml_set_interrupts_enabled()` 之前，定时器中断在这里根本不会被
+服务 ⇒ **tick 看门狗抓不到 `CloverSdhci` 里的挂死**。从这一轮起，驱动里的每一个等待都
+必须自带上限。
+
+### v0.2.60（round88）：发第一颗命令 —— CMD13 问「卡还认不认我们」
+
+这一轮只问一个问题：**从内核发出的第一条命令，会不会得到应答？** 选的命令是 CMD13
+`SEND_STATUS`（ac，R1 响应，无数据），因为它是唯一一条「只证明命令通路、不碰 Data」的
+命令。mode 1 原样保留，作为任何时候的对照。
+
+| 改动 | 作用 |
+| --- | --- |
+| `drivers/CloverSdhci/CloverSdhci.cpp` | mode 2：只写三颗寄存器 —— `INT_STATUS`（只清命令组，W1C）、`ARGUMENT`、`COMMAND`；带上限地轮询 `INT_STATUS`；读 RSP0/RSP1 解 R1 |
+| `drivers/CloverSdhci/SdhciRegs.h` | 时钟基数掩码改成 `0x0000FF00`，并把「分频 0 = 基频」写清楚 |
+| `board.toml` | `clover-emmc=2`、菜单标题换成这一轮的问题 |
+| `scripts/verify-clover-payload.py` | `check_sdhci()` 加第四条串 `CMD13 rca=1` |
+| `scripts/patch-xnu-entry-probe.py` | 探针洞穴的分配器：向后找不到洞时，改到可执行落点段里找；并记录已写区域，绝不二次分配 |
+
+命令的具体形状：RCA 用 **1**（UEFI SD/MMC 栈给第一张不可移除卡的默认相对地址；固件真正的
+RCA 没有记录在任何这个移植读得到的地方）。`ARGUMENT = 1 << 16`，`COMMAND` 由
+`SDHCI_MAKE_CMD(13, RESP_SHORT | CRC | INDEX)` 拼成 **`0x0d1a`**。发之前先确认
+`PRESENT_STATE` 的 Command/Data Inhibit 都没置；轮询上限是 `1 << 22` 次读，任何情况下都会
+落到一个 panic，不会无声自旋。R1 的低 16 位是错误/当前状态，`(rsp0 >> 9) & 0xf` 是卡状态
+（4 = tran，5 = data），`(rsp0 >> 8) & 1` 是 ready。
+
+这一轮还有一次构建事故值得写下来，因为它会重复发生：payload 的入口探针要在内核的零填充里
+挖 15 个 0x100 字节的洞，外加一个 0xe13 字节的 panic 屏。round88 新增的 CMD13 代码让
+`__TEXT_EXEC` 长了 `0x1930` 字节，正好吃掉了入口后面最后一块够大的填充，构建直接以
+`No 0x100-byte padding for the marker cave` 失败。查清之后的边界是：
+
+- `__KLD` 虽然 prot 是 `r-x`，但 `OSKext` 在 prelink bootstrap 之后会 `bzero` 再
+  `ml_static_mfree`（`OSRuntime.cpp:349`、`OSKext.cpp:1262`）⇒ 放在那儿的代码可能在一次
+  更晚的 panic 之前就消失，**不能用**。
+- `__PLK_TEXT_EXEC` 是预链接 kext 的文本段，一直映射、一直是 `r-x`，里面有成片从没被
+  使用过的零填充（开头就有 0x49000 字节）⇒ 可以用。
+- 洞穴代码本身是位置无关的，每个调用点都会重新验算自己刚编出来的分支；所以「更早的洞」
+  和「更晚的洞」等价。分配器现在先向后找，再按地址顺序扫 `__TEXT_EXEC` /
+  `__PLK_TEXT_EXEC`，并且把已经写过的区间记下来（汇编出来的代码自己也会含零字）。
+- 这一轮 panic 屏因此落在 **`0xfffffff004920000`**（`__PLK_TEXT_EXEC` 的零填充，
+  0xe13 字节），从 `_panic` 过去的 `b` 偏移是 −50.7 MB，仍在 ARM64 的 ±128 MB 内；
+  `branch()` 会拒绝越界。`_panic_trap_to_debugger` 同理。
+
+产物：本轮换的是**内核**（`eb1e2356…` → `7ea53a94…`），根镜像和 trust cache 一字未动。
+
+```
+scratch-data.img == signed root            OK
+trustcache == published bundle             OK
+kernel.macho: probe patch localized        OK (5960 bytes in 35 runs, sha256 7bc0667e…)
+kernel.macho: original-PMGR bindings alive OK (5 bindings, 0 moved; provider text present)
+kernel.macho: CloverSdhci linked           OK (四条串全在)
+```
+
+boot-args 自证：卷里的 `unixnu.toml` 是
+`… clover-pmgr=2 clover-emmc=2 armcpu-clock-panic=60000`，575 B / `2edd1834…`，
+标题 `clover emmc: CMD13 asks the card whether anyone is still home`。
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round88-payload.img` | 58720256 B | `6551c580a9b2238c2e2c0d1fcf1c7be6a1b8a956ab0786f77a323726d158a7a0` |
+| `round88-kernel.macho`（构建产物） | 51847168 B | `7ea53a94efb462b167628146b448100b62fe6d32443ded283fc10bd763028a07` |
+| `round88-in-volume-kernel.macho`（卷内副本，含探针与 panic 屏） | 51847168 B | `7bc0667ec7a6dd8ef0c1356ae56895b3b7555586aad7758bed00f81c54dbc6f3` |
+| `round88-in-volume-scratch-data.img`（与 round85–87 相同） | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round88-in-volume-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round88-in-volume-kernel.macho.adt` | 13476 B | `777c622d1a4242af92c6c85ea1fd94a9a4a6791cfb64d38fb123ad9ed0e55eaa` |
+| `round88-in-volume-unixnu.toml` | 575 B | `2edd183400ef124683c06e165a76650b65595629dbec55f10b7a5a4270a6e832` |
+
+固件与 boot 分区这一轮一个字节没碰，`round87-boot.img`（`196b284f…`）继续有效。刷机只需
+换 `cache`（永远冷刷）：
+
+```sh
+fastboot flash cache ~/clover-out/round88-payload.img
+fastboot reboot
+```
+
+要让分区状态完全可复现就连 boot 一起刷（先 boot 后 cache）：
+
+```sh
+fastboot flash boot  ~/clover-out/round87-boot.img
+fastboot flash cache ~/clover-out/round88-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `CMD13 rca=1 answered`，`R1 state=4`（tran）或 `5`（data），`err=0000` | 命令与响应通路都通，RCA=1 就是这张卡的地址 | round89：CMD17 读 LBA 1，前五字节应当自己说出 `EFI PART` |
+| `CMD13 rca=1 timeout: no rsp`（`int` 里有 `0x10000`） | 命令发出去了，但没有卡应答 —— RCA 不是 1，或者卡不在 transfer 状态 | 走 CMD0/CMD1/CMD2/CMD3 重新拿 RCA；仍不碰 Data |
+| `CMD13 rca=1 rsp error`（`int` 是 CRC/END_BIT/INDEX） | 总线的电气/时序与固件留下的 HS200 状态不匹配（我们没有 tuning，也没有改时钟） | 先降速：把 `hcn` 改回默认速度、只留 1-bit，再发一次 CMD13 |
+| `CMD13 rca=1 no completion`（`spins` 到上限，`int` 无命令位） | 控制器接受了写但没产生完成事件 | 先看 `pst` 前后有没有 inhibit 变化；下一步读 `INT_STATUS` 的原始值并把 `en` 一起印出来 |
+| `CMD13 rca=1 not sent: busy` | 固件留下的那笔事务还占着 Command/Data 线 | 只对命令/数据通路做一次 `SOFTWARE_RESET`，然后再发 CMD13 |
+| 只有 `CloverSdhci: failed at stage …` | 窗口映射或 mode 参数错 | 按 stage 定位：2 = mode 不认识、3 = 映射失败、4/5 = 写入路径 |
+| **什么 panic 屏都没有** | 对 `COMMAND`/`ARGUMENT` 的那次写把互联挂住了（这里 `ticks=0`，看门狗不会响） | 下一轮把写拆成单颗寄存器、每次写前用 `inspectHost` 的顺序重读一遍；或者先把窗口映射改成 device-nGnRnE 再试 |
+
+**这轮之后仍然没有块设备。** 已经有的是一条被证明能读的窗口和一条待证明的命令通路；还差
+CMD 序列（如果需要重新识别）、Data 通路（`SDHCI_BUFFER` 32-bit 或 ADMA64 表）和
+`IOBlockStorageDevice`。日志分区那件事要等这三样齐了才开始。
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
   sheng 那条"直接从 userdata 读 APFS 卷"的路走不通。clover 走 gta4l 的形状：
   控制台优先的内核，带 `CONFIG_XNU_SOURCE_MOCKFS`，没有
   `CONFIG_XNU_NATIVE_UFS`，`[userdata]` 留在板级文件里。
-  `v0.2.58` 起的 `drivers/CloverSdhci` **不是**这块缺口的答案：它是一份只读的寄存器
-  探测（不发命令、不碰 Data、不发布 `IOBlockStorageDevice`），目的是先把「固件留下的
-  SDHCI 窗口在 XNU 手里活不活」这一件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
+  `v0.2.58` 起的 `drivers/CloverSdhci` **不是**这块缺口的答案：它先是一份只读的寄存器
+  探测，`v0.2.60` 起才发第一颗命令（CMD13 `SEND_STATUS`），仍然不碰 Data、不发布
+  `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，
   再由 mockfs 把它当作整个 `/`，`root-matching` 那条 UUID 匹配表还留在
   `/chosen` 里（`rd=md0` 会在等待循环之前就 `goto iofrootx`，所以它不参与）。

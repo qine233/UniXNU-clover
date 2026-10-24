@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// clover (Mi Pad 4, SDM660): the eMMC host driver's first question, asked without writing a
-// single register.
+// clover (Mi Pad 4, SDM660): the eMMC host driver, one question per boot argument.
 //
 // WHY THIS FILE EXISTS IN THIS SHAPE
 //
@@ -13,14 +12,17 @@
 // milliseconds before the kernel took over, and a card that was demonstrably left in transfer
 // state by it.
 //
-// That is the thing worth one photograph: **does the host still answer, and what state did the
-// firmware leave it in?** A read of SDHCI_CAPABILITIES that comes back with a plausible base
-// clock and a spec version between 1.0 and 4.2 says the window is mapped, the SDCC clocks are
-// running, and the bus is not hung. All zeros says gated. All ones says a NoC abort. Anything
-// else says look at the fields.
+// That was the thing worth one photograph: **does the host still answer, and what state did the
+// firmware leave it in?** Round87 answered it -- 8-bit bus, 1.8 V, 200 MHz base clock with the
+// divider at 0, the SDCC v5 DLL locked, the last firmware command a CMD12 after a multi-block
+// read. Mode 1, the dump that asked it, stays: it is the control whenever a later reading looks
+// wrong. Mode 2 asks the next question, and it does have to write: whether a command issued from
+// the kernel is answered at all.
 //
-// This round therefore issues no commands, sets no clock, touches no reset line, enables no
+// Mode 1 therefore issues no commands, sets no clock, touches no reset line, enables no
 // interrupt, and writes nothing anywhere. It maps one 4 KiB window, reads, formats, and panics.
+// Mode 2 writes three registers -- INT_STATUS (write-1-to-clear), ARGUMENT and COMMAND -- for one
+// CMD13 SEND_STATUS and nothing else. No clock change, no reset, no bus-width change, no data.
 //
 // WHY IT RUNS FROM sheng_pmgr_run()
 //
@@ -42,14 +44,22 @@
 // WHAT IT DOES NOT CLAIM
 //
 // No block device, no IOMedia, no root volume, and no read of a single byte of user data. The
-// next rounds add those, in this order, one flash each: a command with no data (CMD13
-// SEND_STATUS, which proves the command path and the response registers), then one block with
-// FIFO data (CMD17 at LBA 1, whose first five bytes are the GPT magic "EFI PART" -- an answer
-// that checks itself), then whatever the log-in-a-partition plan needs of it.
+// next rounds add those, in this order, one flash each: CMD13 SEND_STATUS (mode 2, no data: it
+// proves the command path and the response registers), then one block with FIFO data (CMD17 at
+// LBA 1, whose first five bytes are the GPT magic "EFI PART" -- an answer that checks itself),
+// then whatever the log-in-a-partition plan needs of it.
+//
+// CMD13 is addressed to a relative card address, and the firmware's RCA is not recorded anywhere
+// this port has found. RCA 1 is what the UEFI SD/MMC stack assigns to the first non-removable
+// card, so that is the address this round asks about; a card that does not answer is what a wrong
+// RCA looks like from here, which is why "no response" is a reading and not a failure.
 //
 // Every path that is not the success path panics, because on this board silence is not a reading.
-// The tick watchdog stays armed at 60000 ticks: if a plain MMIO read hangs the interconnect, the
-// panic that follows is the watchdog's, and its `elr=` names the instruction we are stuck on.
+// Round87's photograph also settled what the watchdog is worth here: ticks=0 at this scheduling
+// point. sheng_pmgr_run() runs right after bsd_bufferinit, about ten seconds of boot before
+// ml_set_interrupts_enabled(), so the timer never reaches ICC_IAR1_EL1 and a hang inside this
+// driver produces no panic at all. Every wait below therefore has its own bound, and reaching it
+// is a reading ("no completion"), not a fallthrough.
 #include <IOKit/IOLib.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IODeviceMemory.h>
@@ -104,6 +114,34 @@ static uint8_t read8 (unsigned offset)
   uint8_t value = *reinterpret_cast<volatile uint8_t *> (gHost + offset);
   __asm__ volatile ("dsb sy" ::: "memory");
   return value;
+}
+
+// Mode 2 is the first code here that writes. Same window, same rule: the barrier follows every
+// access, so a command register write cannot be reordered ahead of the argument it sends.
+static void write32 (unsigned offset, uint32_t value)
+{
+  *reinterpret_cast<volatile uint32_t *> (gHost + offset) = value;
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void write16 (unsigned offset, uint16_t value)
+{
+  *reinterpret_cast<volatile uint16_t *> (gHost + offset) = value;
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+// Base clock and divider as SDHCI defines them, not as round87's report printed them. That line
+// was wrong three ways: it masked 13:8 (the 6-bit SDHCI 1.0 field) so 0xc8 read back as 8, it
+// scaled MHz by 100000 instead of 1000000, and it called divider 0 "0 MHz" when 0 is the base
+// clock itself. The raw registers were right all along; only the label lied.
+static void clockFacts (uint32_t capabilities, uint16_t clockControl,
+                        unsigned &baseMhz, unsigned &divider, unsigned &sdClockHz)
+{
+  baseMhz = static_cast<unsigned>((capabilities & SDHCI_CLOCK_BASE_MASK) >> SDHCI_CLOCK_BASE_SHIFT);
+  // 10-bit divided clock mode: 15:8 is the low eight bits, 7:6 are the top two.
+  divider = static_cast<unsigned>((clockControl >> SDHCI_DIVIDER_SHIFT) & 0xff) |
+            static_cast<unsigned>(((clockControl >> 6) & 0x3) << 8);
+  sdClockHz = divider ? (baseMhz * 1000000U) / (2U * divider) : baseMhz * 1000000U;
 }
 
 // ------------------------------------------------------------------ the report, by hand
@@ -211,13 +249,11 @@ static void inspectHost (void)
   uint32_t genericsHere = read32 (0x070);
   uint32_t genericsThere = read32 (0x320);
 
-  // Base clock in kHz, the way Linux computes it: CLOCK_BASE_MASK 15:8, and the unit multiplier
-  // is bit 24 of CAPABILITIES_1 (x1 in the spec's own words: "SDHCI_CLOCK_MUL_MASK 23:16" carries
-  // the ratio, 0 means the field is in Hz * 1000 as usual).
-  unsigned baseClock = (capabilities & SDHCI_CLOCK_BASE_MASK) >> SDHCI_CLOCK_BASE_SHIFT;
-  unsigned clockMultiplier = (capabilities1 & 0x00800000) ? 1 : 0;
-  unsigned divider = ((clockControl >> SDHCI_DIVIDER_SHIFT) & 0xff) | ((clockControl & 0x300) >> 6);
-  unsigned sdClockHz = divider ? (baseClock * 100000U) / (2U * divider) : 0;
+  // Base clock in MHz and the divider, from clockFacts(): round87's report had all three of its
+  // derived numbers wrong (bad mask, bad unit, divider 0 called stopped), which this one shares
+  // instead of repeating.
+  unsigned baseClock = 0, divider = 0, sdClockHz = 0;
+  clockFacts (capabilities, clockControl, baseClock, divider, sdClockHz);
 
   clover_emmc_observation[0] = capabilities;
   clover_emmc_observation[1] = capabilities1;
@@ -274,9 +310,7 @@ static void inspectHost (void)
   emitHex (response3, 8);
   emitText ("\nclk");
   emitHex (baseClock, 3);
-  emitText ("MHz x");
-  emitDec (clockMultiplier ? 1 : 0);
-  emitText (" div");
+  emitText ("MHz div");
   emitDec (divider);
   emitText (" sd");
   emitDec (sdClockHz / 1000000U);
@@ -302,6 +336,115 @@ static void inspectHost (void)
   clover_emmc_stage = 3;
 }
 
+// ------------------------------------------------------------------- mode 2: one command, no data
+//
+// CMD13 SEND_STATUS is the smallest command an eMMC answers: a 48-bit R1 response, no data phase,
+// no card state change. That makes it the one measurement that separates the three things a first
+// write to this controller could break -- the command register path, the response path, and the
+// card's willingness to talk -- from the data path, which round89 will add. The host is left
+// exactly as the firmware configured it (200 MHz, 8-bit, 1.8 V, DLL locked); the only registers
+// written are the three a command requires.
+static const uint32_t kProbeRca = 1;
+// The controller's own command timeout is 2^14 TMCLK and this host reports TMCLK = 50 kHz
+// (capabilities bits 5:0 = 0x32, bit 6 = 0: kHz), so roughly a third of a second. The bound has to
+// outlast that, or a real card timeout would be reported as our loop giving up. Interrupts are
+// masked this early, so this loop is the only clock there is: a bound, not a duration.
+static const uint32_t kCommandSpinLimit = 1u << 22;
+
+static void cmd13Probe (void)
+{
+  uint32_t capabilities = read32 (SDHCI_CAPABILITIES);
+  uint16_t clockControl = read16 (SDHCI_CLOCK_CONTROL);
+  uint32_t presentBefore = read32 (SDHCI_PRESENT_STATE);
+  uint32_t statusBefore = read32 (SDHCI_INT_STATUS);
+  uint32_t status = 0, response0 = 0, response1 = 0, spins = 0;
+  const char *verdict = "answered";
+
+  clover_emmc_stage = 4;
+  if (presentBefore & (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT)) {
+    // Round87 read both inhibit bits clear. If that changed, the firmware left a transfer open
+    // after all and the honest move is to say so rather than write a command into it.
+    verdict = "not sent: busy";
+  } else {
+    // Write-1-to-clear only the command group. A stale Command Complete would otherwise be read
+    // as this command's response; everything else in the register is left for the report.
+    write32 (SDHCI_INT_STATUS, SDHCI_INT_RESPONSE | SDHCI_INT_TIMEOUT | SDHCI_INT_CRC |
+                               SDHCI_INT_END_BIT | SDHCI_INT_INDEX);
+    write32 (SDHCI_ARGUMENT, kProbeRca << 16);
+    clover_emmc_stage = 5;
+    // R1 (48-bit, checked): what a SEND_STATUS answer has to be, and letting the controller check
+    // the CRC and the echoed index is what makes "garbage on the bus" distinguishable from a card
+    // that simply did not answer.
+    write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (13, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                SDHCI_CMD_INDEX));
+    for (;;) {
+      status = read32 (SDHCI_INT_STATUS);
+      if (status & SDHCI_INT_CMD_MASK) {
+        break;
+      }
+      if (++spins >= kCommandSpinLimit) {
+        break;
+      }
+    }
+    response0 = read32 (SDHCI_RESPONSE);
+    response1 = read32 (SDHCI_RESPONSE + 4);
+    if (status & SDHCI_INT_TIMEOUT) {
+      verdict = "timeout: no rsp";
+    } else if (status & (SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX)) {
+      verdict = "rsp error";
+    } else if (!(status & SDHCI_INT_RESPONSE)) {
+      verdict = "no completion";
+    }
+  }
+
+  uint32_t presentAfter = read32 (SDHCI_PRESENT_STATE);
+  unsigned baseClock = 0, divider = 0, sdClockHz = 0;
+  clockFacts (capabilities, clockControl, baseClock, divider, sdClockHz);
+
+  gReportLength = 0;
+  clover_emmc_observation[0] = status;
+  clover_emmc_observation[1] = response0;
+  clover_emmc_observation[2] = response1;
+  clover_emmc_observation[3] = presentBefore;
+  clover_emmc_observation[4] = presentAfter;
+  clover_emmc_observation[5] = spins;
+
+  emitText ("CMD13 rca=1 ");
+  emitText (verdict);
+  emitText ("\n int");
+  emitHex (status, 8);
+  emitText (" before");
+  emitHex (statusBefore, 8);
+  emitText (" spins");
+  emitDec (spins);
+  emitText ("\n rsp");
+  emitHex (response0, 8);
+  emitByte (' ');
+  emitHex (response1, 8);
+  // R1 bits 12:9 are CURRENT_STATE (4 = transfer, 7 = ready-for-data), bit 8 is READY_FOR_DATA,
+  // 15:0 carry the error and status flags. Decoded here so the photograph does not need the spec.
+  emitText ("\n R1 state=");
+  emitDec ((response0 >> 9) & 0xf);
+  emitText (" ready=");
+  emitDec ((response0 >> 8) & 1);
+  emitText (" err=");
+  emitHex (response0 & 0xffff, 4);
+  emitText ("\n clk");
+  emitHex (baseClock, 3);
+  emitText ("MHz div");
+  emitDec (divider);
+  emitText (" sd");
+  emitDec (sdClockHz / 1000000U);
+  emitText ("MHz\n pst");
+  emitHex (presentBefore, 8);
+  emitText (" -> ");
+  emitHex (presentAfter, 8);
+  emitText ("\n cmd0d1a arg");
+  emitHex (kProbeRca << 16, 8);
+  emitByte ('\n');
+  clover_emmc_stage = 6;
+}
+
 extern "C" void clover_emmc_run (void)
 {
   unsigned mode = 0;
@@ -309,9 +452,9 @@ extern "C" void clover_emmc_run (void)
     return;
   }
   clover_emmc_stage = 1;
-  // One question at a time: mode 1 is the only thing this round implements, and an unimplemented
-  // mode has to say so rather than boot quietly without the storage instrument it was asked for.
-  if (mode != 1) {
+  // One question at a time: an unimplemented mode has to say so rather than boot quietly without
+  // the storage instrument it was asked for.
+  if (mode != 1 && mode != 2) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -319,7 +462,11 @@ extern "C" void clover_emmc_run (void)
   if (!gHost) {
     emmcFail (3, kSdhciHostPhys);
   }
-  inspectHost ();
+  if (mode == 1) {
+    inspectHost ();
+  } else {
+    cmd13Probe ();
+  }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.
   panic ("CloverSdhci: %s", clover_emmc_report);
