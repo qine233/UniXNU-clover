@@ -18,10 +18,10 @@
 | 板级描述 | `board.toml` 可解析；`scripts/check-clover.py` 把它与 defconfig 和 payload 契约交叉核对 |
 | ADT | `scripts/make-clover-adt.py` 为 8 个 Kryo 260 核生成 13,880 字节；检查器会把编码读回来，并断言 `ArmDTPlatform` 和 DarwinBoot 需要的节点 |
 | 内核 | 已构建：`DEVELOPMENT_ARM64_BCM2837` 的 51.8 MB `kernel.macho` |
-| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.13` 起 payload 里的 `kernel.macho` 是一份打了探针的副本：入口色带、panic 屏幕，以及 `arm_init` 某个调用返回后触发的定时复位；`v0.2.16` 起在开 MMU 前调用一个 mapper 洞穴，把 framebuffer 恒等映射进 TTBR0（与窗口同槽就复用 L2 表，否则用窗口最后一页新建一张），并预先填好 `_vinfo`；mapper 失败会涂一条白色诊断带；`v0.2.17` 改成用自身 PC 定位引导页表（`boot_args.physBase` 落在 `__PRELINK_TEXT` 上、本身没有被映射），并在 MMU 打开后立刻涂第 4 条青色带；`v0.2.18` 再加一条独立的橙色带（第 12 条），在 `arm_init` 的第一条调用处直接从 `boot_args` 涂，不依赖栈、AT 和 `_vinfo`；`v0.2.19` 修掉种子守卫写反的 bug（`cbz x8` 在 mapper 成功时跳过种子，`_vinfo` 因此一直是 0，黄带从 `v0.2.15` 起从未画出来过），并在第一条调用返回后再涂一条红带（第 13 条）；`v0.2.20` 修掉 ADT 里 `cluster-type` 的尺寸契约（字符串改为 4 字节整数 `'E'` / `'P'`）；`v0.2.21` 又因为这份内核只支持单簇而移除该属性，让 8 个核落在一个 `CLUSTER_TYPE_SMP` 平坦簇里；`v0.2.22` 关掉 `CONFIG_XNU_NATIVE_PAN` 并重建内核（Kryo 260 是 ARMv8.0，没有 PAN），这是本轮第一次改内核构建配置，探针脚本不变；`v0.2.23` 换回定时信号：`arm_vm_init` 返回后 10 秒复位，panic 屏幕在 framebuffer 不再翻译时 3 秒复位；`v0.2.24` 把复位点移到第二次 `PE_init_platform(TRUE)` 返回后 15 秒，这一段跨过 `serial_init`、`kernel_startup_initialize_upto(KPRINTF)` 和 `PE_create_console`，后者会重新映射 framebuffer，成功的话 panic 屏幕又能画字（见"菜单之后看什么"）；`v0.2.25` 修掉 `PE_create_console` 开头内联的 panic-log 探测（这份 BCM2837 内核读树莓派地址 `0x3c0fc000`，在 clover 上是外部异常），复位点不变；`v0.2.26` 把 `arm_init` 后段五个调用各接一个涂色洞穴（第 6–10 条带），复位点移到 `_machine_startup` 调用处，复位洞穴先涂第 11 条红带再等 15 秒；`v0.2.27` 把刻度带移到第 10–14 条、控制带移到第 15 条（都在 panic 屏不清的下半屏），并让 panic 屏印出 RA/FP/LR、fmt/args 和 va_list 前后各槽，用于从照片定位断言调用点；`v0.2.28` 修掉刻度洞穴的 4 字节对齐缺陷（第 14 条洞穴整体左移、`bl` 落到 `_fiq_context_init - 4`，`v0.2.27` 的白字是探针自己的误报），并在打洞时校验每条 `_start` 与每个 `bl` 目标；`v0.2.29` 把检查点从 `_machine_startup` 调用前推进到交接之后：第 15 带表示进入 `_machine_startup`，随后 9/8/7/6 带依次覆盖 `_machine_conf` 返回、`_kernel_bootstrap` 入口、首条 `printf` 返回和 `vm_mem_bootstrap` 调用点，复位也移到最后一档；`v0.2.30` 把第 10–14 条带从 `arm_init` 改标 `vm_mem_bootstrap` 里的五个调用（`vm_page_bootstrap`、`zone_bootstrap`、`vm_object_bootstrap`、`vm_map_init`、`kmem_init`），第 5 条红带表示 `kmem_init` 返回、随后 15 秒复位；`v0.2.31` 把已经证明返回的五个调用摘掉，第 5 条红带保留为前半段的收尾，第 10–14 条带改标后段（`kernel_startup_initialize_upto(KMEM)`、`vm_fault_init`、`kernel_startup_initialize_upto(ZALLOC)`、最后那条 `kprintf` 的进入与返回），返回后 15 秒复位；`v0.2.32` 在 `vm_mem_bootstrap` 返回后直接调用 `_vcattach`，第 15 条带从红改涂绿表示调用返回，控制台接上后屏幕交给内核文字，本轮不再定时复位；`v0.2.33` 在 ADT 的 `/chosen` 发布 `amfi-only-platform-code = <1>`（AMFI 启动的前置），并让控制台洞穴先调 `initialize_screen(NULL, kPETextMode)` 再调 `_vcattach`（单独 `vcattach` 在本机是空操作：`PE_create_console` 选了图形模式，`gc_graphics_boot` 为真）；`v0.2.34` 不再画带，改为在 `_bsd_init` 的九个无条件调用（`vfsinit`、自动配置前的初始化块、`kminit`、`IOKitBSDInit`、`loopattach`、`ether_family_init`、`net_init_run`、`vfs_mountroot`、`devfs_kernel_mount`）返回后各印一行 `[clover] … returned`，最后一行标记直接指出没返回的调用；`v0.2.35` 起 payload 多了两个文件，`Payloads/scratch-data.img`（签过名的静态 EL0 init，DarwinBoot 把它放进窗口并填 `/chosen/memory-map/RAMDisk`，内核当 `md0` 挂成 mockfs 根）和 `Payloads/kernel.macho.trustcache`（那颗 cdhash 的离线信任），`unixnu.toml` 里因此有 `initrd` 和 `rd=md0`，ADT 只有一个 `RAMDisk` 槽、不再有 `PackedRAMDisk` |
+| payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.13` 起 payload 里的 `kernel.macho` 是一份打了探针的副本：入口色带、panic 屏幕，以及 `arm_init` 某个调用返回后触发的定时复位；`v0.2.16` 起在开 MMU 前调用一个 mapper 洞穴，把 framebuffer 恒等映射进 TTBR0（与窗口同槽就复用 L2 表，否则用窗口最后一页新建一张），并预先填好 `_vinfo`；mapper 失败会涂一条白色诊断带；`v0.2.17` 改成用自身 PC 定位引导页表（`boot_args.physBase` 落在 `__PRELINK_TEXT` 上、本身没有被映射），并在 MMU 打开后立刻涂第 4 条青色带；`v0.2.18` 再加一条独立的橙色带（第 12 条），在 `arm_init` 的第一条调用处直接从 `boot_args` 涂，不依赖栈、AT 和 `_vinfo`；`v0.2.19` 修掉种子守卫写反的 bug（`cbz x8` 在 mapper 成功时跳过种子，`_vinfo` 因此一直是 0，黄带从 `v0.2.15` 起从未画出来过），并在第一条调用返回后再涂一条红带（第 13 条）；`v0.2.20` 修掉 ADT 里 `cluster-type` 的尺寸契约（字符串改为 4 字节整数 `'E'` / `'P'`）；`v0.2.21` 又因为这份内核只支持单簇而移除该属性，让 8 个核落在一个 `CLUSTER_TYPE_SMP` 平坦簇里；`v0.2.22` 关掉 `CONFIG_XNU_NATIVE_PAN` 并重建内核（Kryo 260 是 ARMv8.0，没有 PAN），这是本轮第一次改内核构建配置，探针脚本不变；`v0.2.23` 换回定时信号：`arm_vm_init` 返回后 10 秒复位，panic 屏幕在 framebuffer 不再翻译时 3 秒复位；`v0.2.24` 把复位点移到第二次 `PE_init_platform(TRUE)` 返回后 15 秒，这一段跨过 `serial_init`、`kernel_startup_initialize_upto(KPRINTF)` 和 `PE_create_console`，后者会重新映射 framebuffer，成功的话 panic 屏幕又能画字（见"菜单之后看什么"）；`v0.2.25` 修掉 `PE_create_console` 开头内联的 panic-log 探测（这份 BCM2837 内核读树莓派地址 `0x3c0fc000`，在 clover 上是外部异常），复位点不变；`v0.2.26` 把 `arm_init` 后段五个调用各接一个涂色洞穴（第 6–10 条带），复位点移到 `_machine_startup` 调用处，复位洞穴先涂第 11 条红带再等 15 秒；`v0.2.27` 把刻度带移到第 10–14 条、控制带移到第 15 条（都在 panic 屏不清的下半屏），并让 panic 屏印出 RA/FP/LR、fmt/args 和 va_list 前后各槽，用于从照片定位断言调用点；`v0.2.28` 修掉刻度洞穴的 4 字节对齐缺陷（第 14 条洞穴整体左移、`bl` 落到 `_fiq_context_init - 4`，`v0.2.27` 的白字是探针自己的误报），并在打洞时校验每条 `_start` 与每个 `bl` 目标；`v0.2.29` 把检查点从 `_machine_startup` 调用前推进到交接之后：第 15 带表示进入 `_machine_startup`，随后 9/8/7/6 带依次覆盖 `_machine_conf` 返回、`_kernel_bootstrap` 入口、首条 `printf` 返回和 `vm_mem_bootstrap` 调用点，复位也移到最后一档；`v0.2.30` 把第 10–14 条带从 `arm_init` 改标 `vm_mem_bootstrap` 里的五个调用（`vm_page_bootstrap`、`zone_bootstrap`、`vm_object_bootstrap`、`vm_map_init`、`kmem_init`），第 5 条红带表示 `kmem_init` 返回、随后 15 秒复位；`v0.2.31` 把已经证明返回的五个调用摘掉，第 5 条红带保留为前半段的收尾，第 10–14 条带改标后段（`kernel_startup_initialize_upto(KMEM)`、`vm_fault_init`、`kernel_startup_initialize_upto(ZALLOC)`、最后那条 `kprintf` 的进入与返回），返回后 15 秒复位；`v0.2.32` 在 `vm_mem_bootstrap` 返回后直接调用 `_vcattach`，第 15 条带从红改涂绿表示调用返回，控制台接上后屏幕交给内核文字，本轮不再定时复位；`v0.2.33` 在 ADT 的 `/chosen` 发布 `amfi-only-platform-code = <1>`（AMFI 启动的前置），并让控制台洞穴先调 `initialize_screen(NULL, kPETextMode)` 再调 `_vcattach`（单独 `vcattach` 在本机是空操作：`PE_create_console` 选了图形模式，`gc_graphics_boot` 为真）；`v0.2.34` 不再画带，改为在 `_bsd_init` 的九个无条件调用（`vfsinit`、自动配置前的初始化块、`kminit`、`IOKitBSDInit`、`loopattach`、`ether_family_init`、`net_init_run`、`vfs_mountroot`、`devfs_kernel_mount`）返回后各印一行 `[clover] … returned`，最后一行标记直接指出没返回的调用；`v0.2.35` 起 payload 多了两个文件，`Payloads/scratch-data.img`（签过名的静态 EL0 init，DarwinBoot 把它放进窗口并填 `/chosen/memory-map/RAMDisk`，内核当 `md0` 挂成 mockfs 根）和 `Payloads/kernel.macho.trustcache`（那颗 cdhash 的离线信任），`unixnu.toml` 里因此有 `initrd` 和 `rd=md0`，ADT 只有一个 `RAMDisk` 槽、不再有 `PackedRAMDisk`；`v0.2.36` 只换根镜像里的 init 程序（它自己 `open("/dev/console")`，退出码按「阶段 × 32 + errno」编码），`kernel.macho` 与探针逐字节不变 |
 | 固件 | 由 `uefi-clover` 构建（3 MiB 固件卷，内含 UniXNU 与 DarwinBoot）；`v0.3.10` 起 DXE 尾部完整派发，`CloverGopDxe` 发布 GOP |
 | 设备事实 | 2026-10-22 采集过一次，位于 `facts/81ffcaaa-20261022-210928/` |
-| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.9` 实测屏幕出现**绿 + 蓝 + 品红**三条色带，即 DarwinBoot 已交接、XNU 入口已执行、引导页表已建好；`v0.2.10` 实测**品红出现约 6 秒后设备自己重启**，即 `sctlr_el1` 打开 MMU 后没有立刻死掉；`v0.2.11` 的 `_arm_vm_init` 复位点没有触发（**品红一直停着**），说明还没走到它；`v0.2.12` 实测**只有绿 + 蓝 + 品红、约 6 秒后自复位**，即 `_PE_init_platform` 返回了、开 MMU 后写屏确实不可用；`v0.2.13` 的 `_thread_bootstrap` 复位点实测是**品红后十几秒才复位、没有白字**，符合"panic 屏幕在 `vinfo` 仍为 0 时走了 12 秒兜底"；`v0.2.14` 扩映射并预填 `_vinfo`、不再主动复位，实测**仍是绿 + 蓝 + 品红，无黄带无白字**，由此定位到窗口在 framebuffer 之上、向上扩 `memSize` 永远够不到；`v0.2.15` 改为直接补页表项，实测**仍是绿 + 蓝 + 品红、无黄无白**，原因是 1 GiB 窗口只能落在高 DRAM bank，与 framebuffer 不在同一个 1 GB 槽，旧代码查错了槽位就退出；`v0.2.16` 换成独立 mapper 洞穴（同槽复用、异槽新建 L2 表），失败时用白色带自报错误码，实测**绿 + 蓝 + 品红 + 第 9 条白带**，即 mapper 走到自检第 4 步：窗口的第一个 L2 项不是 2 MB 块；由此查明 `boot_args.physBase` 锚在 `__PRELINK_TEXT` 上、本身不在引导映射内；`v0.2.17` 改为从 mapper 自己的 PC 反推引导映射，修掉复用 L2 表时未掩掉低位的 bug，并在 MMU 打开后立刻涂第 4 条青色带，实测**绿 + 蓝 + 品红 + 青、无黄**，即 MMU 已开、framebuffer 已经可写，卡点在 `_cpu_data_init` 被调用之前；`v0.2.18` 增加第 12 条橙色带（`arm_init` 入口后的第一条调用，不依赖 vinfo/栈/AT），实测**绿 + 蓝 + 品红 + 青 + 橙、无黄**，确认 `arm_init` 已进入、第一条调用点已到达；由此回查代码发现种子守卫从 `v0.2.15` 起就是反的（`cbz x8` 在 mapper 成功时跳过种子），`_vinfo` 一直为 0，黄带从未有机会出现；`v0.2.19` 改成 `cbnz x8`，并让第一条调用返回后再涂第 13 条红带，实测读到**白字 panic 屏幕**：`CPU property 'cluster-type' has bad size 6 @machine_routines.c:936`，即种子/画屏/早段 `arm_init` 全通，内核已走到 `ml_parse_cpu_topology`；`v0.2.20` 把 `cluster-type` 从字符串改成 4 字节整数 `'E'` / `'P'`，实测接着触发 `machine_routines.c:1099` 的 `phys_cluster_id <= MAX_CPU_CLUSTER_PHY_ID` 断言——这份 BCM2837 内核只支持单簇，无法接受 E/P 双簇描述；`v0.2.21` 改为不发布 `cluster-type`，让 8 核按 `CLUSTER_TYPE_SMP` 建一个平坦簇，实测拓扑已通过，接着读到 `Undefined kernel instruction: pc=0xfffffff0079aff58 instr=d500419f`——`msr pan, #1`，Kryo 260 是 ARMv8.0，没有 PAN；`v0.2.22` 把 `CONFIG_XNU_NATIVE_PAN` 改成 `n` 并重建内核，实测七条带全部出现（绿 + 蓝 + 品红 + 黄 + 青 + 橙 + 红）、没有白字：内核进了 `arm_init`，两个早段探针都返回了，之后死在 `bl _arm_vm_init` 处或更晚，而且没有可见的 panic；`v0.2.23` 因此把信号换回定时复位，并让 panic 屏幕在 framebuffer 不可翻译时也能报出来，实测**色带出现后约 10 秒自复位**，即 `arm_vm_init` 返回了，卡点在它后面；`v0.2.24` 把复位点移到 `PE_create_console` 之后的第二次 `PE_init_platform(TRUE)`，实测**色带之后什么都没有**——既没有文字，也没有 15 秒复位，卡点在 `arm_vm_init` 返回之后、`PE_init_platform` 之前；`v0.2.25` 据此跳过 `PE_create_console` 开头读树莓派 panic log 地址的四条指令，实测**色带 + 约 15 秒复位、无文字**，即控制台与第二次 `PE_init_platform` 都已返回（无文字是 `gc_enabled` 仍为假所致，不是故障）；`v0.2.26` 给随后五个调用各涂一条带（6–10）并把复位点推到 `_machine_startup` 之前；实测**绿 + 蓝 + 白字**（`<1>:0 Assertion failed: <d>`、`TCR=0x…1a251a`、`pages=free=0`），即 `arm_init` 后段有断言 panic、发生在 VM 页初始化之前，但旧清屏把第 2 条以下的带全擦掉、参数又与已知冷段常量对不上；`v0.2.27` 因此改印 RA/FP/LR 与原始参数槽；其实机读数（绿 + 蓝 + 白字、`LR=0xfffffff0073f1dc4`、`a0=1 a1=0 a2=0xd`）指向的不是内核断言，而是第 14 条刻度洞穴自己：它被放在 `0x3ed784`（4 mod 8），`ld.lld` 把 `_start` 对齐到 `0x3ed788`，而 patcher 仍按 `0x3ed784` 写入，整段 `bl` 左移 4 字节落到 `_fiq_context_init - 4`（`_platform_syscall` 冷段里的 `bl _Assert`），`x0/x1/x2` 还留着 `arm_init` 传给 `_fiq_context_init` 的 `TRUE/0/0xd`；`v0.2.28` 修掉打洞对齐并逐条校验 `bl` 目标，第 10–13 条带则证明那四个调用确实都返回了；`v0.2.28` 上机读数是**10–14 全在 + 15 红 + 约 15 秒复位**，即 `_fiq_context_init` 也返回了、`arm_init` 已到 `_machine_startup` 调用点，交接之前没有任何卡死；`v0.2.29` 因此让检查点真正进入 `_machine_startup`，把刻度推进到 `kernel_bootstrap` 的 `vm_mem_bootstrap` 调用处；`v0.2.29` 上机读数是**整条梯子全亮 + 约 15 秒复位**（逐带取中位色：10 白、11 橙、12 绿、13 青、14 品红、15 红、6 白），即 `_machine_conf`、首条 `printf` 都返回了，`vm_mem_bootstrap` 已被调用，卡点在它内部；`v0.2.30` 因此把第 10–14 条带改成 `vm_mem_bootstrap` 内五个调用的探针、复位后移到 `kmem_init` 之后；`v0.2.30` 上机读数是**十六条带全在、含第 5 条红带、约 15 秒复位**，即 `vm_page_bootstrap` 到 `kmem_init` 五个调用全部返回、复位档也到达，卡点在 `vm_mem_bootstrap` 后段；`v0.2.31` 因此摘掉这五个已证调用，第 5 条红带保留为前半段收尾，第 10–14 条带改标后段四个调用；`v0.2.31` 上机读数是**13、14 都在 + 约 15 秒复位**，即最后那条 `kprintf` 返回、整个 `vm_mem_bootstrap` 返回，卡点在 `kernel_bootstrap` 更后面；`v0.2.32` 因此不再加刻度，而是在 `vm_mem_bootstrap` 返回后调用 `_vcattach` 接上视频控制台；`v0.2.32` 上机读数是一块**白字 panic**：`"AMFI: no amfi-only-platform-code device tree node!" @AppleMobileFileIntegrity.cpp:5025`，RA/LR 都落在预链接的 AMFI kext 里，说明内核根本没停在 `vm_mem_bootstrap` 之后，而是一路走到 AMFI；色带还在是因为 `vcattach` 被 `gc_graphics_boot == TRUE` 短路成了空操作；`v0.2.33` 因此补上 ADT 的 `amfi-only-platform-code` 属性，并先用 `kPETextMode` 清掉图形模式标志再 attach；`v0.2.33` 上机读数：**文字控制台已接上**，满屏内核日志（AMFI、Sandbox、apfs、AppleImage4 都走过），最后停在 NVRAM sync 失败那一行、**没有 panic**；但那一行可能来自后台 kext 线程，不能当作启动线程的卡点；`v0.2.34` 因此在 `_bsd_init` 的九个调用返回后各印一行 `[clover]` 标记；`v0.2.34` 上机读数是**九行标记全部印到 `[clover] net_init_run returned`，`vfs_mountroot returned` 没有**，最后一行是 `Waiting on <dict … IOProviderClass IOMedia … IOPropertyMatch … UUID …>`，即启动线程正常停在 `IOFindBSDRoot`，等的根 `IOMedia` 在这块没有驱动的 eMMC 板上永远不会被发布——不是卡死，是这条路不通；`v0.2.35` 因此把根换成 `rd=md0` + mockfs，并让 init 自己 `exit(0)`，用 `initproc exited` 这条 panic 证明 EL0 跑到了（round65，待上机） |
+| 真机启动 | **菜单已到**（Stage 1）：`v0.3.10` 固件在屏幕上渲染 UniXNU 菜单并读到了 payload；菜单 3 秒后默认进 XNU。`v0.2.9` 实测屏幕出现**绿 + 蓝 + 品红**三条色带，即 DarwinBoot 已交接、XNU 入口已执行、引导页表已建好；`v0.2.10` 实测**品红出现约 6 秒后设备自己重启**，即 `sctlr_el1` 打开 MMU 后没有立刻死掉；`v0.2.11` 的 `_arm_vm_init` 复位点没有触发（**品红一直停着**），说明还没走到它；`v0.2.12` 实测**只有绿 + 蓝 + 品红、约 6 秒后自复位**，即 `_PE_init_platform` 返回了、开 MMU 后写屏确实不可用；`v0.2.13` 的 `_thread_bootstrap` 复位点实测是**品红后十几秒才复位、没有白字**，符合"panic 屏幕在 `vinfo` 仍为 0 时走了 12 秒兜底"；`v0.2.14` 扩映射并预填 `_vinfo`、不再主动复位，实测**仍是绿 + 蓝 + 品红，无黄带无白字**，由此定位到窗口在 framebuffer 之上、向上扩 `memSize` 永远够不到；`v0.2.15` 改为直接补页表项，实测**仍是绿 + 蓝 + 品红、无黄无白**，原因是 1 GiB 窗口只能落在高 DRAM bank，与 framebuffer 不在同一个 1 GB 槽，旧代码查错了槽位就退出；`v0.2.16` 换成独立 mapper 洞穴（同槽复用、异槽新建 L2 表），失败时用白色带自报错误码，实测**绿 + 蓝 + 品红 + 第 9 条白带**，即 mapper 走到自检第 4 步：窗口的第一个 L2 项不是 2 MB 块；由此查明 `boot_args.physBase` 锚在 `__PRELINK_TEXT` 上、本身不在引导映射内；`v0.2.17` 改为从 mapper 自己的 PC 反推引导映射，修掉复用 L2 表时未掩掉低位的 bug，并在 MMU 打开后立刻涂第 4 条青色带，实测**绿 + 蓝 + 品红 + 青、无黄**，即 MMU 已开、framebuffer 已经可写，卡点在 `_cpu_data_init` 被调用之前；`v0.2.18` 增加第 12 条橙色带（`arm_init` 入口后的第一条调用，不依赖 vinfo/栈/AT），实测**绿 + 蓝 + 品红 + 青 + 橙、无黄**，确认 `arm_init` 已进入、第一条调用点已到达；由此回查代码发现种子守卫从 `v0.2.15` 起就是反的（`cbz x8` 在 mapper 成功时跳过种子），`_vinfo` 一直为 0，黄带从未有机会出现；`v0.2.19` 改成 `cbnz x8`，并让第一条调用返回后再涂第 13 条红带，实测读到**白字 panic 屏幕**：`CPU property 'cluster-type' has bad size 6 @machine_routines.c:936`，即种子/画屏/早段 `arm_init` 全通，内核已走到 `ml_parse_cpu_topology`；`v0.2.20` 把 `cluster-type` 从字符串改成 4 字节整数 `'E'` / `'P'`，实测接着触发 `machine_routines.c:1099` 的 `phys_cluster_id <= MAX_CPU_CLUSTER_PHY_ID` 断言——这份 BCM2837 内核只支持单簇，无法接受 E/P 双簇描述；`v0.2.21` 改为不发布 `cluster-type`，让 8 核按 `CLUSTER_TYPE_SMP` 建一个平坦簇，实测拓扑已通过，接着读到 `Undefined kernel instruction: pc=0xfffffff0079aff58 instr=d500419f`——`msr pan, #1`，Kryo 260 是 ARMv8.0，没有 PAN；`v0.2.22` 把 `CONFIG_XNU_NATIVE_PAN` 改成 `n` 并重建内核，实测七条带全部出现（绿 + 蓝 + 品红 + 黄 + 青 + 橙 + 红）、没有白字：内核进了 `arm_init`，两个早段探针都返回了，之后死在 `bl _arm_vm_init` 处或更晚，而且没有可见的 panic；`v0.2.23` 因此把信号换回定时复位，并让 panic 屏幕在 framebuffer 不可翻译时也能报出来，实测**色带出现后约 10 秒自复位**，即 `arm_vm_init` 返回了，卡点在它后面；`v0.2.24` 把复位点移到 `PE_create_console` 之后的第二次 `PE_init_platform(TRUE)`，实测**色带之后什么都没有**——既没有文字，也没有 15 秒复位，卡点在 `arm_vm_init` 返回之后、`PE_init_platform` 之前；`v0.2.25` 据此跳过 `PE_create_console` 开头读树莓派 panic log 地址的四条指令，实测**色带 + 约 15 秒复位、无文字**，即控制台与第二次 `PE_init_platform` 都已返回（无文字是 `gc_enabled` 仍为假所致，不是故障）；`v0.2.26` 给随后五个调用各涂一条带（6–10）并把复位点推到 `_machine_startup` 之前；实测**绿 + 蓝 + 白字**（`<1>:0 Assertion failed: <d>`、`TCR=0x…1a251a`、`pages=free=0`），即 `arm_init` 后段有断言 panic、发生在 VM 页初始化之前，但旧清屏把第 2 条以下的带全擦掉、参数又与已知冷段常量对不上；`v0.2.27` 因此改印 RA/FP/LR 与原始参数槽；其实机读数（绿 + 蓝 + 白字、`LR=0xfffffff0073f1dc4`、`a0=1 a1=0 a2=0xd`）指向的不是内核断言，而是第 14 条刻度洞穴自己：它被放在 `0x3ed784`（4 mod 8），`ld.lld` 把 `_start` 对齐到 `0x3ed788`，而 patcher 仍按 `0x3ed784` 写入，整段 `bl` 左移 4 字节落到 `_fiq_context_init - 4`（`_platform_syscall` 冷段里的 `bl _Assert`），`x0/x1/x2` 还留着 `arm_init` 传给 `_fiq_context_init` 的 `TRUE/0/0xd`；`v0.2.28` 修掉打洞对齐并逐条校验 `bl` 目标，第 10–13 条带则证明那四个调用确实都返回了；`v0.2.28` 上机读数是**10–14 全在 + 15 红 + 约 15 秒复位**，即 `_fiq_context_init` 也返回了、`arm_init` 已到 `_machine_startup` 调用点，交接之前没有任何卡死；`v0.2.29` 因此让检查点真正进入 `_machine_startup`，把刻度推进到 `kernel_bootstrap` 的 `vm_mem_bootstrap` 调用处；`v0.2.29` 上机读数是**整条梯子全亮 + 约 15 秒复位**（逐带取中位色：10 白、11 橙、12 绿、13 青、14 品红、15 红、6 白），即 `_machine_conf`、首条 `printf` 都返回了，`vm_mem_bootstrap` 已被调用，卡点在它内部；`v0.2.30` 因此把第 10–14 条带改成 `vm_mem_bootstrap` 内五个调用的探针、复位后移到 `kmem_init` 之后；`v0.2.30` 上机读数是**十六条带全在、含第 5 条红带、约 15 秒复位**，即 `vm_page_bootstrap` 到 `kmem_init` 五个调用全部返回、复位档也到达，卡点在 `vm_mem_bootstrap` 后段；`v0.2.31` 因此摘掉这五个已证调用，第 5 条红带保留为前半段收尾，第 10–14 条带改标后段四个调用；`v0.2.31` 上机读数是**13、14 都在 + 约 15 秒复位**，即最后那条 `kprintf` 返回、整个 `vm_mem_bootstrap` 返回，卡点在 `kernel_bootstrap` 更后面；`v0.2.32` 因此不再加刻度，而是在 `vm_mem_bootstrap` 返回后调用 `_vcattach` 接上视频控制台；`v0.2.32` 上机读数是一块**白字 panic**：`"AMFI: no amfi-only-platform-code device tree node!" @AppleMobileFileIntegrity.cpp:5025`，RA/LR 都落在预链接的 AMFI kext 里，说明内核根本没停在 `vm_mem_bootstrap` 之后，而是一路走到 AMFI；色带还在是因为 `vcattach` 被 `gc_graphics_boot == TRUE` 短路成了空操作；`v0.2.33` 因此补上 ADT 的 `amfi-only-platform-code` 属性，并先用 `kPETextMode` 清掉图形模式标志再 attach；`v0.2.33` 上机读数：**文字控制台已接上**，满屏内核日志（AMFI、Sandbox、apfs、AppleImage4 都走过），最后停在 NVRAM sync 失败那一行、**没有 panic**；但那一行可能来自后台 kext 线程，不能当作启动线程的卡点；`v0.2.34` 因此在 `_bsd_init` 的九个调用返回后各印一行 `[clover]` 标记；`v0.2.34` 上机读数是**九行标记全部印到 `[clover] net_init_run returned`，`vfs_mountroot returned` 没有**，最后一行是 `Waiting on <dict … IOProviderClass IOMedia … IOPropertyMatch … UUID …>`，即启动线程正常停在 `IOFindBSDRoot`，等的根 `IOMedia` 在这块没有驱动的 eMMC 板上永远不会被发布——不是卡死，是这条路不通；`v0.2.35` 因此把根换成 `rd=md0` + mockfs，并让 init 自己 `exit(0)`，用 `initproc exited` 这条 panic 证明 EL0 跑到了；`v0.2.35` 上机读数是 **`initproc failed to start -- no exit reason available -- (signal 0, exit status 0)`、没有 `CS_KILLED`**，也就是 pid 1 已经建好、已经跑进 EL0、四个 syscall 都返回、最后自己 `exit(0)`——Stage 6 达成（exec 真失败会报 `Process 1 exec of … failed, errno N`）。缺的那行 banner 不是 bug：这份 XNU 没有 `open_console()`，initproc 的 fd 0/1/2 是空的，`v0.2.36` 因此让 init 自己 `open("/dev/console")`（round66，待上机） |
 
 上面这张表之外，不做任何额外声称。
 
@@ -74,8 +74,24 @@ facts/                        按机器存放的 dump，Git 忽略
 内核这一步只能在 macOS 上做；固件这一步在 Linux 上构建。动手之前宿主机还差
 两件事：`sudo xcodebuild -license accept`（这台机器的 Xcode 27 已安装但未接受
 许可，未接受前 `git` 和 Homebrew 也会跟着坏）以及给 `./unixnu` 本身准备的
-Python 3.11+。`scripts/check-clover.py` 没有这个要求：它用 `tomllib`、`tomli`
+Python 3.11+。`./unixnu` 的 shebang 是 `env python3`，而 macOS 自带的
+`/usr/bin/python3` 是 3.9、没有 `tomllib`，Homebrew 的 3.13 又叫
+`python3.13`，所以要给 PATH 准备一个不带版本号的 `python3`：
+
+```sh
+mkdir -p ~/UniXNU-clover/build/shim
+ln -sf /opt/homebrew/bin/python3.13 ~/UniXNU-clover/build/shim/python3
+```
+
+下面所有 `./unixnu` 都以 `PATH=$HOME/UniXNU-clover/build/shim:$PATH` 开头。
+`scripts/check-clover.py` 没有这个要求：它用 `tomllib`、`tomli`
 或自带的子集解析器读 board.toml，所以在系统 Python 3.9 上四组检查都能跑。
+
+`--uefi` 指向的不是 `uefi-clover`，而是**应用了它的 overlay 的那份 Mu-Silicium
+检出**（本机 `../mu-clover`）：payload 的 panic 屏幕要复用固件的 8×16 点阵，
+`patch-xnu-entry-probe.py` 因此去 `<uefi>/Silicon/Silicium/SiliciumPkg/Library/
+FrameBufferSerialPortLib/Font.h` 取字模，而 `uefi-clover` 只有板级的那几个
+目录。
 
 ```sh
 git clone --recurse-submodules https://github.com/UniXNU/UniXNU
@@ -86,12 +102,12 @@ cd UniXNU
 ./unixnu fetch
 ./unixnu tree
 python3 ../UniXNU-clover/scripts/check-clover.py      # 预检，任何时候都可以跑
-./unixnu build firmware --uefi ../uefi-clover          # 需要固件仓库
+./unixnu build firmware --uefi ../mu-clover            # 应用了 overlay 的固件检出
 SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" ./unixnu build kernel   # macOS + Xcode
 ./unixnu build package
 cd ../UniXNU-clover && python3 ../UniXNU-clover/scripts/make-clover-root.py   # md0/mockfs 根 + trust cache
 cd ../UniXNU
-./unixnu build payload --unique-chip-id 0x<device seed> --uefi ../uefi-clover \
+./unixnu build payload --unique-chip-id 0x<device seed> --uefi ../mu-clover \
   --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
   --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
 ./unixnu build boot
@@ -897,15 +913,19 @@ memory-map 必须恰好有 `RAMDisk` 与 `TrustCache` 且不得出现 `PackedRAM
 它在**启动线程自己身上** exec `/sbin/launchd`（`bsd_init` 的最后一行是
 `panic("bsd_init returned from call to bsd_utaskbootstrap")`），所以不可能有
 标记在它之后。init 主动 `exit(0)`，`kern_exit.c` 会先印
-`pid 1 exited -- exit reason …`，再 panic `initproc exited` —— 这是"已经跑到
-EL0"最明确、最可读的信号。写 fd 1 只是附赠通道：这台机器没有注册控制台 tty。
+`initproc failed to start -- no exit reason available -- (signal 0, exit status 0)`，
+再 panic —— 这是"已经跑到 EL0"最明确、最可读的信号。但那次面板上没有任何
+`[clover] el0 init:` 行：这份 XNU 没有 `open_console()`，pid 1 的 fd 0/1/2 是空的，
+所以往 fd 1 写什么都不会到面板。要看见用户态写的字，init 得自己
+`open("/dev/console")` —— 那就是 v0.2.36。
 
 | 现象 | 含义 |
 | --- | --- |
 | `BSD root: md0, major 3, minor 0` | `RAMDisk` 占位被 DarwinBoot 填上了，`mdevadd`/`mdevlookup` 也认了 |
 | `[clover] siginit returned, execing init` | `vfs_mountroot` 与 `devfs_kernel_mount` 都返回了，下一步就是 exec |
-| panic `initproc failed to start` | 根找到了但 exec 失败：cdhash 不被信任、架构/page size 不对、mockfs 布局不合期望 |
-| panic `initproc exited` + 那行 `[clover] el0 init: pid=… sysctl=…` | EL0 真的跑起来并发了 syscall：根和用户态入口都通了 |
+| panic `Process 1 exec of %s failed, errno N` | 根找到了但 exec 失败：cdhash 不被信任、架构/page size 不对、mockfs 布局不合期望（`kern_exec.c:7198`） |
+| panic `initproc failed to start` | pid 1 已经建好、已经跑到用户态并且退出了。它**不是** exec 失败：`initproc_spawned` 是 launchd 自己在 `main` 里写 `kern.initproc_spawned` 才置位的（`kern_exit.c:1338`），我们的 init 不写它，所以连干净的 `exit(0)` 也会报成 "failed to start" |
+| panic `initproc exited` + 那行 `[clover] el0 init: pid=… sysctl=…` | 一个会写 `kern.initproc_spawned` 的 init 跑完退出；本轮的 init 不会走到这一支 |
 | `IOFindBSDRoot: specified root memory device, md0, has not been configured` | `rd=md0` 传到了，但 `mdevadd` 没成功（占位没填、或 `ml_static_ptovirt` 够不到那颗物理地址） |
 | 还是那条 `Waiting on … IOMedia …` | `rd=md0` 没进内核，或 payload 里没有 `initrd` |
 
@@ -914,7 +934,7 @@ EL0"最明确、最可读的信号。写 fd 1 只是附赠通道：这台机器�
 ```sh
 cd ../UniXNU-clover && /opt/homebrew/bin/python3.13 scripts/make-clover-root.py
 cd ../UniXNU
-./unixnu build payload --unique-chip-id 0x<device seed> --uefi ../uefi-clover \
+./unixnu build payload --unique-chip-id 0x<device seed> --uefi ../mu-clover \
   --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
   --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
 ```
@@ -928,6 +948,82 @@ ADT `e3668f1d…`（13476 字节，比上一轮少 396 字节，正是撤掉 `Pa
 
 ```sh
 fastboot flash cache ~/clover-out/round65-payload.img
+fastboot reboot
+```
+
+### v0.2.36：让 init 自己打开 /dev/console
+
+`v0.2.35` 的照片一次答完两问。panic 是
+
+```
+initproc failed to start -- no exit reason available -- (signal 0, exit status 0)
+```
+
+前面没有 `CS_KILLED`，`a1`/`a2` 两个参数槽都是 0。这一支来自
+`proc_handle_critical_exit()`（`bsd/kern/kern_exit.c:1845-1873`），能走到这里
+的前提是 pid 1 已经建好、已经跑进用户态、并且**自己退出了**；exec 真失败的话
+报的是另一条 `Process 1 exec of %s failed, errno %d`（`kern_exec.c:7198`）。
+`signal 0, exit status 0` 就是我们的 `exit(0)`。所以 `md0` + mockfs + 签名静态
+EL0 init 这条根是通的，Stage 6 达成：`getpid`、`sysctl`、`write`、`exit` 四个
+syscall 都返回了，AMFI 也认了那颗 cdhash。它上面还留着一整屏内核日志
+（`zone_init`、`VM bootstrap done`、`IOKit JOINed astownership`、`RTKit`、
+`Firehose configured`），说明 v0.2.33 接上的文字控制台一路工作到 exec 之前。
+
+唯一没出现的是 `[clover] el0 init: pid=…` 那行。原因不是写坏了，是**根本没有
+fd 1**：这份 XNU 已经没有 `open_console()`（全树 grep 无引用），`bsd_init` 交给
+initproc 的描述符表是空的，真正的 launchd 自己去开 `/dev/console`。而
+`/dev/console` 在这台机器上是存在的：`devfs_init()` 在挂载 devfs 时做了
+`devfs_make_node(makedev(0, 0), …, "console")`
+（`bsd/miscfs/devfs/devfs_vfsops.c:115`），`devfs_kernel_mount("/dev")` 由
+`bsd_init.c:999` 调用，mockfs 给 `/dev` 留的就是那个挂载点；打开它时
+`cnopen()`（`bsd/dev/arm/cons.c:74`）转发到 `km_tty[0]`，那棵 tty 是 `kminit()`
+（`bsd/dev/arm/km.c:53`）在 `bsd_autoconf` 里 `ttymalloc()` 出来的——v0.2.34 的
+`[clover] kminit returned` 标记印过，所以它一定分配好了；`kmopen()` 再用
+`PE_current_console` 把窗口算成 150×120（1200/8 × 1920/16）。写出去就是
+`tty → kmputc → PE_char_out`，落到我们已经接上的视频控制台。
+
+本轮因此只换 init，内核、探针、ADT 契约一律不动：
+
+- `getpid` 之后 `sysctl({CTL_HW, HW_PAGESIZE})` 现在把**值**读回来（不只是返回
+  码），因为把 4096 抄进用户页同时证明了用户栈的可写映射；
+- `open("/dev/console", O_RDWR)`（`svc` 5），拿到 fd 之后所有文字都写到那个 fd；
+- banner 变成 `[clover] el0 init: pid=<n> console fd=<n> pagesize=<n>`；
+- 退出码是这一轮的读数：**阶段 × 32 + errno**，阶段 1=`getpid`、2=`sysctl`、
+  3=`open`、4=`write`，只记第一次失败（后面都是它的后果，加起来会解码成另一个
+  阶段）。全对则 `exit(0)`。
+
+| 现象 | 含义 |
+| --- | --- |
+| `[clover] el0 init: pid=1 console fd=0 pagesize=4096` + `exit status 0` | EL0 有自己的控制台了，Stage 7 的通道打通 |
+| `exit status 32+n` / `64+n` | `getpid` / `sysctl` 失败，errno = n；banner 仍然会印出来 |
+| `exit status 96+n` | `open("/dev/console")` 被拒：`+6` ENXIO 是 cdevsw 里没有 console 主设备，`+2` ENOENT 是 devfs 没挂到 mockfs 的 `/dev` 上，`+13` EACCES 是 `devfs_check_protected` 那条路径 |
+| `exit status 128+n` | fd 开到了但写被拒（`+6` ENXIO 表示 `kmopen` 之后那条 tty 没有输出通道） |
+| 只有 panic、没有 banner | 退出码仍然会印出来，用它定位 |
+
+换镜像会换 cdhash，所以 `scripts/make-clover-root.py` 重跑一次要连着更新
+`[payload] trust_cache_sha256`（本轮 `df4f2924…`，镜像 33840 字节，DarwinBoot
+的窗口仍按 `ALIGN_VALUE(size, 4096)` 取 36864）。构建命令与上一轮相同，只是
+`--data-ramdisk` 换上新镜像：
+
+```sh
+cd ../UniXNU-clover && /opt/homebrew/bin/python3.13 scripts/make-clover-root.py
+cd ../UniXNU
+PATH=$HOME/UniXNU-clover/build/shim:$PATH ./unixnu build payload \
+  --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+```
+
+本轮 payload 是 `~/clover-out/round66-payload.img`（`178c3e46…`，58720256
+字节）。逐字节校验过卷内四个文件：`kernel.macho` `1c8e9a40…`（与 round65 同一
+份，本轮没碰内核）、ADT `95f9143f…`（13476 字节，`memory-map` 里恰好
+`RAMDisk` + `TrustCache` 两个零占位、`amfi-only-platform-code` 4 字节、
+`osenvironment = main`）、根镜像 `a7459855…`、trust cache `df4f2924…`；
+`unixnu.toml` 的 `initrd` 与 `rd=md0` 都在，菜单标题已换成
+`clover md0 root: EL0 init on /dev/console`。
+
+```sh
+fastboot flash cache ~/clover-out/round66-payload.img
 fastboot reboot
 ```
 
