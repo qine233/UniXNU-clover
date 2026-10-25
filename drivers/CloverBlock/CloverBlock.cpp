@@ -4,10 +4,11 @@
 //
 // Round 106 left the card selected by drivers/CloverSdhci with a working paced-PIO read, and
 // round 104/105 proved logfs survives a reboot when that path reads it. This file is the other
-// half: it registers a block device above the same path, lets IOStorageFamily attach its
-// IOBlockStorageDriver and create the IOMedia, then reads the GPT and the newest logfs slot
-// *through IOMedia* and prints what came back. A working line here means the kernel and the card
-// agree through the storage stack, not merely through a driver-private function.
+// half: it registers a block device above the same path, starts IOStorageFamily's driver by name
+// (round109: the synchronous catalogue match never returned on this boot path), then reads the
+// GPT and the newest logfs slot *through IOMedia* and writes one new record back through it.
+// A working line here means the kernel and the card agree through the storage stack, not merely
+// through a driver-private function.
 //
 // The class has to be hand-written. IOStorageFamily is loaded at runtime from the boot kext
 // collection (kernel.macho exports no IOBlockStorageDevice, IOMedia or IOBlockStorageDriver
@@ -48,6 +49,7 @@ void clover_block_static_init (void) __asm__ ("__GLOBAL__sub_I_CloverBlock.cpp")
 uint32_t clover_emmc_block_ready (void);
 uint32_t clover_emmc_block_sectors (void);
 uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint32_t blocks);
+uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words, uint32_t blocks);
 // stage,kext-load,class-size,postModLoad,instances,media-sectors,blockSize<<32|writable,
 // open,gpt-status,entrySize<<32|entries,logfsLast<<32|index,kind<<32|len,stored-sum,
 // computed-sum,header-status,text-status.
@@ -62,6 +64,10 @@ static const uint32_t kLogSlots = 16;
 static const uint32_t kLogMagic0 = 0x554e5855u;   // "UXNU" in memory order
 static const uint32_t kLogMagic1 = 0x31474f4cu;   // "LOG1"
 static const uint32_t kLogPrefixLength = 23;      // "unixnu clover emmc log\n"
+// One canonical record, written and read back through IOMedia in stage 14. It is deliberately
+// fixed text: the point of this round is the path, and a fixed string lets the readback compare
+// whole blocks instead of re-deriving the report before it is assembled.
+static const char kWriteText[] = "unixnu clover emmc log\nblock write through IOMedia\n";
 
 // GPT entry name "logfs" as the bytes an on-disk entry carries: UTF-16LE, then a NUL wchar.
 static const uint8_t kLogfsName[12] = {
@@ -291,7 +297,9 @@ IOReturn CloverBlockDevice::reportWriteProtection(bool *isWriteProtected)
   if (!isWriteProtected) {
     return kIOReturnBadArgument;
   }
-  *isWriteProtected = true;   // this round publishes a reader only
+  // Round109 only read. Stage 14 now writes one logfs record through IOMedia, so the media has
+  // to be genuinely writable; IOBlockStorageDriver builds its media from this answer.
+  *isWriteProtected = false;
   return kIOReturnSuccess;
 }
 
@@ -317,8 +325,9 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
   IOReturn status = kIOReturnSuccess;
   UInt64 done = 0;
   uint32_t sectors = clover_emmc_block_sectors();
+  const IODirection direction = buffer ? buffer->getDirection() : kIODirectionNone;
 
-  if (!buffer || buffer->getDirection() != kIODirectionIn) {
+  if (!buffer || (direction != kIODirectionIn && direction != kIODirectionOut)) {
     status = kIOReturnNotWritable;
   } else if (block >= sectors || nblks > sectors - block) {
     status = kIOReturnBadArgument;
@@ -329,13 +338,24 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
     }
     uint32_t words[kBlockWords];
     for (; done < nblks; done++) {
-      if (clover_emmc_block_read(static_cast<uint32_t>(block + done), words, 1) != 1) {
-        status = kIOReturnError;
-        break;
-      }
-      if (buffer->writeBytes(done * kBlockBytes, words, kBlockBytes) != kBlockBytes) {
-        status = kIOReturnNoSpace;
-        break;
+      if (direction == kIODirectionOut) {
+        if (buffer->readBytes(done * kBlockBytes, words, kBlockBytes) != kBlockBytes) {
+          status = kIOReturnNoSpace;
+          break;
+        }
+        if (clover_emmc_block_write(static_cast<uint32_t>(block + done), words, 1) != 1) {
+          status = kIOReturnError;
+          break;
+        }
+      } else {
+        if (clover_emmc_block_read(static_cast<uint32_t>(block + done), words, 1) != 1) {
+          status = kIOReturnError;
+          break;
+        }
+        if (buffer->writeBytes(done * kBlockBytes, words, kBlockBytes) != kBlockBytes) {
+          status = kIOReturnNoSpace;
+          break;
+        }
       }
     }
   }
@@ -435,6 +455,10 @@ struct BlockResult {
   uint32_t prefixOk;
   uint32_t headerStatus;
   uint32_t textStatus;
+  uint32_t writeSlot;
+  uint32_t writeOk;
+  uint32_t readbackOk;
+  uint32_t writeStatus;
   uint32_t previewLength;
   char preview[25];
 };
@@ -490,6 +514,7 @@ struct MediaRead {
 };
 
 static MediaRead gMediaRead;
+static MediaRead gMediaWrite;
 
 static void mediaReadDone(void *target, void *, IOReturn status, UInt64 actualByteCount)
 {
@@ -523,12 +548,38 @@ static IOReturn readMediaBlock(IOMedia *media, IOService *client,
   return kIOReturnSuccess;
 }
 
+// The write mirror of readMediaBlock, same inline-completion contract and same descriptor copy.
+// A write must go to a media the device reported writable, which is what stage 9 now opens.
+static IOReturn writeMediaBlock(IOMedia *media, IOService *client,
+                                IOMemoryDescriptor *buffer, uint64_t lba,
+                                MediaRead *op, const uint8_t *in)
+{
+  op->done = 0;
+  op->status = static_cast<uint32_t>(kIOReturnNotReady);
+  op->actual = 0;
+  if (buffer->writeBytes(0, in, kBlockBytes) != kBlockBytes) {
+    return kIOReturnNoSpace;
+  }
+  IOStorageCompletion completion;
+  completion.target = op;
+  completion.action = mediaReadDone;
+  completion.parameter = nullptr;
+  media->write(client, lba * kBlockBytes, buffer, nullptr, &completion);
+  if (!op->done) {
+    return kIOReturnTimeout;
+  }
+  if (op->status != static_cast<uint32_t>(kIOReturnSuccess) || op->actual != kBlockBytes) {
+    return static_cast<IOReturn>(op->status);
+  }
+  return kIOReturnSuccess;
+}
+
 // A hang between two stages used to leave the panel at the last subsystem that spoke, which says
 // nothing about this one. The marker is printed before the call that can hang, so the last line on
 // the screen names the step instead of the next boot having to guess.
 static void blockStage(const char *step)
 {
-  IOLog("CloverBlock r109: %s\n", step);
+  IOLog("CloverBlock r110: %s\n", step);
 }
 
 extern "C" void clover_block_run(void)
@@ -658,18 +709,20 @@ extern "C" void clover_block_run(void)
       break;
     }
 
-    // Stage 9: open as a reader. The media's own checks (size, block size) have now been read
-    // through the storage stack rather than from this driver's globals.
+    // Stage 9: open for reading and writing. The media's own checks (size, block size) have now
+    // been read through the storage stack rather than from this driver's globals.
     r.stage = 9;
     blockStage("9 open");
-    if (!media->open(device, 0, kIOStorageAccessReader)) {
+    if (!media->open(device, 0, kIOStorageAccessReaderWriter)) {
       break;
     }
     r.open = 1;
 
     OSSharedPtr<IOBufferMemoryDescriptor> buffer =
         IOBufferMemoryDescriptor::withCapacity(kBlockBytes, kIODirectionIn, true);
-    if (!buffer.get()) {
+    OSSharedPtr<IOBufferMemoryDescriptor> outBuffer =
+        IOBufferMemoryDescriptor::withCapacity(kBlockBytes, kIODirectionOut, true);
+    if (!buffer.get() || !outBuffer.get()) {
       break;
     }
     uint8_t block[kBlockBytes];
@@ -784,6 +837,62 @@ extern "C" void clover_block_run(void)
       r.preview[i] = (c >= 0x20 && c < 0x7f) ? c : (c == '\n' ? '|' : '.');
       r.previewLength = i + 1;
     }
+    // Stage 14: write one canonical record into the first free slot through IOMedia, then read
+    // both blocks back through the same media. Slot selection follows mode 19: slot k is two
+    // blocks at logfs start + 2k, and the first slot without this driver's magic is free. A full
+    // window is reported, never wrapped onto slot 0.
+    r.stage = 14;
+    blockStage("14 write");
+    uint32_t freeSlot = r.slot + 1;
+    r.writeSlot = freeSlot;
+    if (freeSlot >= kLogSlots) {
+      break;
+    }
+    {
+      uint64_t slotLba = r.logfsFirst + 2 * freeSlot;
+      uint32_t length = sizeof(kWriteText) - 1;
+      uint32_t sum = 0;
+      for (uint32_t i = 0; i < length; i++) {
+        sum += static_cast<uint8_t>(kWriteText[i]);
+      }
+      uint32_t header[kBlockWords];
+      uint8_t text[kBlockBytes];
+      memset(header, 0, sizeof(header));
+      memset(text, 0, sizeof(text));
+      header[0] = kLogMagic0;
+      header[1] = kLogMagic1;
+      header[2] = static_cast<uint32_t>(slotLba);
+      header[3] = length;
+      header[4] = sum;
+      header[5] = 21;
+      header[6] = length;
+      header[7] = freeSlot;
+      memcpy(text, kWriteText, length);
+
+      IOReturn wrote = writeMediaBlock(media, device, outBuffer.get(), slotLba, &gMediaWrite,
+                                       reinterpret_cast<const uint8_t *>(header));
+      if (wrote == kIOReturnSuccess) {
+        wrote = writeMediaBlock(media, device, outBuffer.get(), slotLba + 1, &gMediaWrite, text);
+      }
+      if (wrote != kIOReturnSuccess) {
+        r.writeStatus = static_cast<uint32_t>(wrote);
+        break;
+      }
+      r.writeOk = 1;
+
+      bool same = false;
+      IOReturn check = readMediaBlock(media, device, buffer.get(), slotLba, &gMediaRead, block);
+      if (check == kIOReturnSuccess && memcmp(block, header, kBlockBytes) == 0) {
+        check = readMediaBlock(media, device, buffer.get(), slotLba + 1, &gMediaRead, block);
+        same = (check == kIOReturnSuccess && memcmp(block, text, kBlockBytes) == 0);
+      }
+      if (!same) {
+        r.writeStatus = static_cast<uint32_t>(check);
+        break;
+      }
+      r.readbackOk = 1;
+    }
+
     r.stage = 15;
     blockStage("15 done");
   } while (false);
@@ -859,6 +968,16 @@ extern "C" void clover_block_run(void)
   if (r.textStatus) {
     emitText(" ts=");
     emitHex(r.textStatus, 8);
+  }
+  emitText("\nb w s=");
+  emitDec(r.writeSlot);
+  emitText(" wr=");
+  emitDec(r.writeOk);
+  emitText(" rb=");
+  emitDec(r.readbackOk);
+  if (r.writeStatus) {
+    emitText(" ws=");
+    emitHex(r.writeStatus, 8);
   }
   emitText("\nb tx ");
   for (uint32_t i = 0; i < r.previewLength; i++) {

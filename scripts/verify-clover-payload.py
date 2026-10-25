@@ -97,10 +97,12 @@ def check_pmgr(kernel: bytes) -> bool:
 def check_sdhci(kernel: bytes) -> bool:
     """drivers/CloverSdhci is linked as a plain archive, not with -force_load (see
     configs/clover_defconfig), so nothing but a reference keeps it: the link would silently drop
-    the whole eMMC instrument if the call in sheng_pmgr_run() ever went away. These six facts
+    the whole eMMC instrument if the call in sheng_pmgr_run() ever went away. These eight facts
     prove the member is in this image -- the boot argument it parses, the dump each mode builds,
     mode 4's "no pwr" verdict (an address taken in a ternary, so never folded), the panic every
-    failure path takes, and both symbols the archive exports. The CMD13 report strings used to
+    failure path takes, and the four symbols this image must export (run, block read, block
+    write, panic append). The CMD13
+    report strings used to
     be checked here, but the panic hook forced the whole driver to -mgeneral-regs-only, and
     without SIMD clang now folds those two twelve-byte literals into immediate stores: their
     characters are in the text (see cmd13Probe) but the rodata strings are gone."""
@@ -108,7 +110,8 @@ def check_sdhci(kernel: bytes) -> bool:
     found = {name: name.encode() in kernel
              for name in ("clover-emmc", "look-only dump of c0c4000",
                           "no pwr", "CloverSdhci: failed at stage",
-                          "_clover_emmc_run", "_clover_emmc_panic_append")}
+                          "_clover_emmc_run", "_clover_emmc_block_read",
+                          "_clover_emmc_block_write", "_clover_emmc_panic_append")}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")

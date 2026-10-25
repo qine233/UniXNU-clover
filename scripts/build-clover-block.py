@@ -47,6 +47,7 @@ EMMC_IMPORTS = {
     '_clover_emmc_block_ready',
     '_clover_emmc_block_sectors',
     '_clover_emmc_block_read',
+    '_clover_emmc_block_write',
 }
 # Everything IOBlockStorageDevice owns on iOS: the four macOS-only deprecated virtuals are
 # compiled out by TARGET_OS_OSX, and APPLE_KEXT_VTABLE_PADDING is 0, so the slot list is exactly

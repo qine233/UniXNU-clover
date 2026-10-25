@@ -5639,6 +5639,107 @@ fastboot reboot
 `b st=… dm=… ds=…`。三者同屏即完整读数。这一轮仍不写 logfs（panic 钩子未武装），
 盘上记录不变。
 
+## round109 读数（v0.2.81 实机）：手工启动经住了，块栈闭合
+
+上一轮的判定表走到了成功分支：标记一路到 `15 done`，`b st=15 ld=0 cs=0090 pm=0
+dm=1 ds=1`、`b dv=1 md=1 …`，`b lf … c=1 p=1` 与 `b tx` 都在。这一读数说明：
+
+- 按名字取 `IOBlockStorageDriver` 元类、`alloc`/`init(nullptr)`/`attach`/`start` 这条
+  绕开 IOCatalogue 的路径，在这台机器上返回了；round108 卡住的从来不是 ABI，而是同步匹配。
+- 驱动确实挂成了设备的子节点（`dv=1`、`driver == handDriver`），它创建的 IOMedia 也
+  通过了 `sz=`/`bl=512` 的几何核对（`md=1`）。
+- GPT、表项数组、logfs 头和正文全部经 IOMedia 读回，校验和与前缀都对（`c=1 p=1`）。
+  也就是说，XNU 的存储栈已经是一个真实的**读**消费者。
+
+这一轮没有照片，读数按判定表的成功分支记录。剩下的一半是写。
+
+## v0.2.82（round110）：让 logfs 的写入也经 IOMedia
+
+上一轮只证明了读。写仍然只有 CloverSdhci 的私有 PIO（mode 17/19 和 panic 钩子），
+块设备对上层声明的是只读。这一轮把写这一半也交给存储栈：
+
+1. `reportWriteProtection()` 改答 `false`，IOBlockStorageDriver 据此建出可写媒体；
+   stage 9 的 `open` 从 `kIOStorageAccessReader` 改为 `ReaderWriter`。
+2. CloverSdhci 新增 `clover_emmc_block_write()`，门控与 `block_read` 相同（ready、
+   EXT_CSD 几何、单调用者 guard、计数器 2 秒上限），底层复用 mode 17/19 已验证的
+   `writePioBlock`（CMD24，160 µs 节奏、200 ms 数据相位上限）。
+3. `CloverBlockDevice::doAsyncReadWrite()` 现在同时处理 `kIODirectionOut`：
+   从 descriptor 取出一块，交给 `clover_emmc_block_write`。完成回调契约与读方向一致。
+4. 新 stage 14 `14 write`：按 mode 19 的规则找第一个没有本驱动 magic 的空槽，把一条
+   固定记录（前缀 + `block write through IOMedia`）的头块和正文块经 **IOMedia 的写路径**
+   写入，再经 **IOMedia 的读路径**把两块整块读回、逐字节比较。报告新增
+   `b w s=<slot> wr=1 rb=1`；失败时 `ws=` 带上 IOReturn。
+5. 16 个槽写满时停在 stage 14、`wr=0`，不绕回槽 0；panic 钩子仍未武装，panic 屏上的
+   记录写入仍归 mode 20。
+
+成功时屏上应含：
+
+```text
+CloverPMGR r110: args [-v serial=3 debug=0x14e kt_fixed_zones=120 boot-progress=2
+ rd=md0 allow_legacy_mach_msg=1 armcpu-timer-intid=19 clover-pmgr=2 clover-emmc=21
+ armcpu-clock-panic=60000]
+...
+CloverBlock r110: 13 text
+CloverBlock r110: 14 write
+CloverBlock r110: 15 done
+...
+b st=15 ld=0 cs=0090 pm=0 dm=1 ds=1
+b dv=1 md=1 sz=<n> bl=512
+b op=1 wp=1 gp=1 ix=39
+b lf s=<旧槽> a=12320768 b=12337151 m=<kind> n=<len> c=1 p=1
+b w s=<新槽> wr=1 rb=1
+b tx <上一启动记录的正文开头>
+args [-v serial=3 … clover-emmc=21 armcpu-clock-panic=60000]
+```
+
+`wp` 从 0 变 1 是这一轮的契约变化：媒体现在是可写的。`b lf` 仍是**本次启动读到**的
+上一条记录；`b w` 才是这次经块栈写进去的那一条。
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `14 write`、`15 done`、`b w s=<n> wr=1 rb=1` | 写和读回都经 IOMedia 完成，存储栈成为真正的读写消费者 | 同一 payload 再重启一次：stage 13 应读到这条 `b tx block write through IOMedia` |
+| `wr=1 rb=0`，`ws=` 为读回错误 | 写完成，但从媒体读回的内容不一致 | 对照 `ws`，查写/读路径的块偏移与缓存 |
+| `wr=0 rb=0`，停在 `14 write`，`ws=` 非零 | 写请求在块设备或卡上失败 | 按 `ws` 的 IOReturn 定位：不可写、参数、卡错误 |
+| 停在 `14 write` 且 `s=16` | 16 个日志槽已满，按设计不绕回 | 下一轮实现窗口回收或手动清槽 |
+| 停在 `9 open` | 媒体仍不可写，ReaderWriter 打开被拒 | 查 `reportWriteProtection` 是否被 IOMedia 缓存 |
+| 停在 13 或更早 | 读路径出现回归 | 按最后一条标记回看该阶段 |
+| 没有 `CloverPMGR r110` | 固件启动的不是这份 payload | 核对刷写目标与启动卷 |
+
+产物（内核与 payload 变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round110-payload.img` | 58720256 B | `8196ed2e74dfe5bd6965e285214adde51beecc70e766c01f7bdfa33db13f22e2` |
+| `round110-kernel.macho`（构建产物） | 51990528 B | `a10c3863a1cbd6c56c02fb11f9b8b555f19334a8787604108e279e095513f57c` |
+| `round110-in-volume-kernel.macho`（卷内副本） | 51990528 B | `bbdcb286aad8cd20e3606e8856294345a11f845954e6e65c228b237e121512d2` |
+| `round110-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round110-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round110-kernel.macho.adt` | 13476 B | `d2d7793d43669c447f253604962b6cff902c258022ad2a0836c17892858b9daa` |
+| `round110-unixnu.toml` | 579 B | `dc5fb66dd90a97c1073419fedaf5ed93c8425f57a3e0164a5d3564c723916db3` |
+
+校验器：探针 35 处 6040 字节、PMGR 5 条绑定 0 位移、CloverSdhci 八项全在（含
+`_clover_emmc_block_read` 与 `_clover_emmc_block_write` 两个符号），卷内 boot-args 末尾
+仍是 `… clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`。三条 r110 字符串在卷内
+内核里都在：`CloverPMGR r110: args [%s]`、`CloverSdhci r110: no clover-emmc boot arg`、
+`CloverBlock r110: %s`。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_block_write`
+`0xfffffff007971a30`、`_clover_emmc_run` `0xfffffff00797231c`、`_clover_block_run`
+`0xfffffff0079920a0`、`lookupMetaClass` `0xfffffff007994b48`。
+boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round110-payload.img
+fastboot reboot
+```
+
+**拍一张就够；想验证跨启动再重启一次。** 先看 `CloverPMGR r110` 与参数，再看
+`14 write` / `15 done`，最后读 `b w s=… wr=1 rb=1` 和 `wp=1`。同一次启动里 `b tx`
+仍是上一条记录；再按一次重启（不重刷）后，stage 13 应把这次写的槽读出来，
+`b lf s=` 变成这次的槽，`b tx` 变成 `block write through IOMedia`。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

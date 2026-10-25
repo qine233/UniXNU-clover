@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: start IOBlockStorageDriver by name, one marker per call"
+title = "clover emmc: write a log record through IOMedia and read it back"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1267,12 +1267,13 @@ kernel_args = [
   # the geometry the block device reports. "ex 1 n=128 sc=<n> st=..." is that reading; the block
   # stack's own lines are "b st=15 ld=0 cs=0090 pm=0" (load status 0, postModLoad 0, the
   # class size 0x90 the overrides were built against), "b dv=1 md=1 sz=<n> bl=512", "b op=1
-  # wp=0 gp=1 ix=39", "b lf s=<slot> a=12320768 b=12337151 m=<kind> n=<len> c=1 p=1" and
-  # "b tx ...". A "st" below 15 names the stage that stopped: 1 card not proven, 2
-  # IOStorageFamily load or class size, 3 metaclass registration, 4 allocation, 5 attach or the
-  # hand-started driver's meta/alloc/attach/start, 6 no IOBlockStorageDriver, 7 no IOMedia or
-  # geometry mismatch, 9 media open, 10 GPT header
-  # through IOMedia, 11 entry walk, 12 slot scan, 13 text read.
+  # wp=1 gp=1 ix=39", "b lf s=<slot> a=12320768 b=12337151 m=<kind> n=<len> c=1 p=1",
+  # "b w s=<slot> wr=1 rb=1" and "b tx ...". A "st" below 15 names the stage that stopped: 1
+  # card not proven, 2 IOStorageFamily load or class size, 3 metaclass registration, 4
+  # allocation, 5 attach or the hand-started driver's meta/alloc/attach/start, 6 no
+  # IOBlockStorageDriver, 7 no IOMedia or geometry mismatch, 9 media open, 10 GPT header
+  # through IOMedia, 11 entry walk, 12 slot scan, 13 text read, 14 write/readback through
+  # IOMedia.
   # Round107's photograph ended at "IOCPUInterruptController: not registry member" with no block
   # report at all, while PMGR's nub had clearly been published (AMFI latched to it). The only
   # silent exit in this chain was the missing-argument return above, so the arguments that kernel
@@ -1299,6 +1300,16 @@ kernel_args = [
   # A last line of "5 driver start" means the hang is inside IOBlockStorageDriver::start
   # (media creation/registration), not in matching; "6 driver" with dv=0 means it started but
   # left no child of the expected class.
+  # Round109's photograph showed every marker through "15 done": the hand-started driver and its
+  # IOMedia are real. Round110 makes the block device writable (reportWriteProtection now answers
+  # false) and adds the write half of clover_emmc_block_*, so the logfs record is appended the
+  # way a real consumer would: stage 14 picks the first slot without this driver's magic, writes
+  # header and text through IOMedia's write path, then reads both blocks back through IOMedia and
+  # compares them whole. "b w s=<slot> wr=1 rb=1" is the positive; ws= carries the failing
+  # IOReturn. A full 16-slot window stops at stage 14 with wr=0 and is never wrapped onto slot 0.
+  # This is also the first boot whose record the next boot's stage 12/13 reads: the text is
+  # "block write through IOMedia", the marker that the write side of the stack, not the driver's
+  # PIO helper, produced it.
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under

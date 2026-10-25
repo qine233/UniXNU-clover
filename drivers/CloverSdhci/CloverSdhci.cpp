@@ -1073,6 +1073,45 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
   return (status & SDHCI_INT_DATA_END) && wordCount == kBlockWords;
 }
 
+// The write half of the pair above. Same gate: ready, measured geometry, one caller at a time,
+// and the counter deadline, because at this point in boot no scheduler timer will rescue a
+// stuck host. Callers hand it whole 512-byte blocks; nothing here touches the logfs format.
+extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words, uint32_t blocks)
+{
+  if (!words || !blocks) {
+    return 0;
+  }
+  const uint32_t sectors = __atomic_load_n (&gBlockSectors, __ATOMIC_ACQUIRE);
+  if (!__atomic_load_n (&gBlockReady, __ATOMIC_ACQUIRE) || !sectors ||
+      lba >= sectors || blocks > sectors - lba) {
+    return 0;
+  }
+  uint32_t expected = 0;
+  if (!__atomic_compare_exchange_n (&gBlockGuard, &expected, 1u, false,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    return 0;
+  }
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint64_t deadline = frequency * 2ULL;
+  const uint64_t start = readCounter ();
+  uint32_t done = 0;
+  for (; done < blocks; done++) {
+    if (readCounter () - start > deadline) {
+      break;
+    }
+    uint32_t handed = 0;
+    uint32_t status = 0;
+    if (!writePioBlock (lba + done, words + done * kBlockWords, handed, status)) {
+      break;
+    }
+  }
+  __atomic_store_n (&gBlockGuard, 0, __ATOMIC_RELEASE);
+  return done;
+}
+
 // Returns the command group of INT_STATUS. `sent` is false when the register was never written,
 // which is a host verdict, not a card one. The response words are read even after an error: a CRC
 // error still leaves the bits that arrived in the register, and that is evidence.
@@ -3679,7 +3718,7 @@ extern "C" void clover_emmc_run (void)
     // AMFI latched, the kernel booted to IOCPU, and the screen never said whether the argument
     // was missing or the storage stack had hung. The pair (clover-pmgr=2 without clover-emmc) is
     // a payload built wrong, so it panics and prints the command line that caused it.
-    panic ("CloverSdhci r109: no clover-emmc boot arg\nargs [%s]", PE_boot_args ());
+    panic ("CloverSdhci r110: no clover-emmc boot arg\nargs [%s]", PE_boot_args ());
   }
   clover_emmc_stage = 1;
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
