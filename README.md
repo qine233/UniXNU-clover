@@ -5417,6 +5417,100 @@ fastboot reboot
 这一轮不写 logfs（panic 钩子没武装，`elog` 即使可见也是 1），所以刷完前后盘上的
 记录不受影响。
 
+## v0.2.80（round108）：让 payload 自己报出身份、命令行与块栈阶段
+
+round107 的照片是一次**普通启动**：固件日志、XNU 的 `using 4098 buffer headers …`、
+`apfs_module_start`、`AMFI: PMGRAON latched to: ffffffff`、
+`AMFI: Enabling developer mode …`、`IOCPUInterruptController: not registry member`，
+然后就没有了——没有 `CloverSdhci:` 的 panic。PMGR 的 nub 显然已经发布（AMFI 都 latch
+到了它），说明 `sheng_pmgr_run()` 跑过；而 mode 21 必定 panic，所以只能是
+`clover_emmc_run()` 在缺参数的静默 `return` 处退出：**这次内核收到的命令行里没有
+`clover-emmc`**。核对下来，round83/84/86 那几代的 boot-args 恰好是
+`clover-pmgr=2` 而没有 `clover-emmc`，最可能的解释是固件这次启动的并不是刚刷进去的
+那一份 payload。但屏幕上没有任何一个字能证明这一点，这一轮先把这台「测谎仪」装上。
+
+四处改动，各自回答一个问题：
+
+1. `sheng_pmgr_run()` 在任何分支之前无条件打印本次收到的完整命令行
+   （`CloverPMGR r108: args [...]`，数据源是 `PE_boot_args()`）。有这一行，就证明
+   跑的是这份内核；没有，就证明刷写没有落到固件实际启动的那个卷上。
+2. 缺 `clover-emmc` 不再静默返回，改为
+   `panic("CloverSdhci r108: no clover-emmc boot arg\nargs [%s]", …)`。参数拼错是
+   payload 构建错误，不该伪装成「启动正常」。
+3. mode 21 的 panic 末尾再打印一次命令行（`args [...]`）。上面的 IOLog 会随启动日志
+   滚出屏幕，判定依据必须和读数在同一块屏上。
+4. `clover_block_run()` 在每个阶段之前打一行 `CloverBlock r108: <step>`：`2 storage
+   family`、`3 metaclass`、`4 allocate`、`5 attach`、`5 register`、`6 driver`、
+   `7 media`、`9 open`、`10 gpt`、`11 entries`、`12 slots`、`13 text`、`15 done`。
+   如果 `b st=` 那几行没出现，最后一行标记就是卡住的阶段——round107 连「卡住」还是
+   「没跑」都分不出来，这一轮分得出来。
+
+成功时屏上应含（`<...>` 与 round107 相同）：
+
+```text
+CloverPMGR r108: args [-v serial=3 debug=0x14e kt_fixed_zones=120 boot-progress=2
+ rd=md0 allow_legacy_mach_msg=1 armcpu-timer-intid=19 clover-pmgr=2 clover-emmc=21
+ armcpu-clock-panic=60000]
+...
+CloverBlock r108: 2 storage family
+...
+CloverBlock r108: 15 done
+...
+CloverSdhci:
+...（驱动链）
+b st=15 ld=0 cs=0090 pm=0
+b dv=1 md=1 sz=<n> bl=512
+b op=1 wp=0 gp=1 ix=39
+b lf s=<k> a=12320768 b=12337151 m=<m> n=<len> c=1 p=1
+b tx <最新一条记录的正文开头>
+args [-v serial=3 … clover-emmc=21 armcpu-clock-panic=60000]
+```
+
+命令行那一行在屏上可能被折行；判定只看三个词：`clover-pmgr=2`、`clover-emmc=21`、
+`armcpu-clock-panic=60000` 是否都在。
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| 有 `CloverPMGR r108: args [...]`，且其中含 `clover-emmc=21`，末尾 `b st=15 …` | 这就是 round107 该有的读数，存储栈这条线真正闭合 | 下一轮把 logfs 挂成真正的块设备消费者 |
+| 有 `CloverPMGR r108: args [...]`，但**不含** `clover-emmc`，随后 `CloverSdhci r108: no clover-emmc boot arg` | 固件启动的确实是这份内核，是 payload 的命令行拼错了 | 对 `board.toml` 的 `kernel_args` 重建 payload |
+| **没有** `CloverPMGR r108` 这一行 | 固件启动的不是这份内核：刷写没有落到它实际读取的卷/分区，或菜单启动的是另一个条目 | 核对 `fastboot flash cache` 的目标与固件启动卷；这一轮不再猜参数 |
+| 有 `CloverPMGR r108`，随后只有部分 `CloverBlock r108: <step>`，没有 `b st=` | 块栈在最后一个 `<step>` 之后停住；参数是对的，问题在那一阶段内部 | 按 `<step>` 定位；这是 round107 缺的那个「停在哪」 |
+| 固件日志里出现 `DARWINBOOT: boot args rejected at ...` | 命令行在 DarwinBoot 就被拒（超长或非 ASCII），内核拿不到任何参数 | 缩短 `kernel_args`；本行在 UEFI 阶段就已画出 |
+
+产物（内核变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round108-payload.img` | 58720256 B | `b61f8194e22dd06df97beda5caa4b3475fdaed0144ec5aa399793ad532ab0a12` |
+| `round108-kernel.macho`（构建产物） | 51990528 B | `4dcf80b9873d83f55251e66a7219450b7ee38d2c1cc13086780225f44385e43c` |
+| `round108-in-volume-kernel.macho`（卷内副本） | 51990528 B | `dcc1105a96cebb225afea32b49d4e14654a1bb5e1655539e9d40dc9130cf2eec` |
+| `round108-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round108-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round108-kernel.macho.adt` | 13476 B | `7dce589dda054f64d9448d05ce45c45e1ce4d6e4baaad3ca0dc124de37df7c1d` |
+| `round108-unixnu.toml` | 567 B | `a91845a1a2eb02f9af1e41d98776a02dd3dc0d0b02261e31373e00849b932f39` |
+
+校验器：探针 35 处 6038 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六项全在，
+卷内 boot-args 末尾仍是 `… clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`。
+三条新字符串在卷内内核里都在：`CloverPMGR r108: args [%s]`、
+`CloverSdhci r108: no clover-emmc boot arg`、`CloverBlock r108: %s`。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_run`
+`0xfffffff007972254`、`_clover_block_run` `0xfffffff007991d6c`。
+boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round108-payload.img
+fastboot reboot
+```
+
+**拍一张就够（可能两张）。** 这一张回答的问题是：这次到底是哪个 payload 在跑、
+它拿到的命令行是什么、块栈停在哪个阶段。先看屏上有没有
+`CloverPMGR r108: args [...]`，再读那行里的参数，最后看 `b st=`；
+三者在同一张照片里能同时判定。若参数缺失，屏上会出现 `CloverSdhci r108` 的 panic，
+同样是完整读数，不需要重刷。这一轮仍然不写 logfs（panic 钩子未武装），盘上记录不变。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -5454,7 +5548,9 @@ fastboot reboot
   交给驱动导出的 `clover_emmc_panic_append`，追加成下一格 kind 20 记录，下一次
   启动由 mode 20 读回最新一格、校验并武装供再下一次追加使用，`v0.2.79` 起 mode 21
   通过 `drivers/CloverBlock` 发布 `IOBlockStorageDevice`，GPT、表项数组和 logfs
-  记录改由 `IOMedia` 读回（见上一节）。这些轮次量的是「固件留下的 SDHCI 窗口活不活、
+  记录改由 `IOMedia` 读回，`v0.2.80` 起 PMGR 在切换前打印本次收到的完整命令行、
+  缺 `clover-emmc` 改为 panic、块栈每个阶段先打一行标记（见上一节）。这些轮次量的是
+  「固件留下的 SDHCI 窗口活不活、
   卡还答不答、在哪个地址答、时钟是不是还在移命令、数据阶段能不能自己走完」。
   根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，

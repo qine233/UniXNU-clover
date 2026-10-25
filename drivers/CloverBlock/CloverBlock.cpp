@@ -521,6 +521,14 @@ static IOReturn readMediaBlock(IOMedia *media, IOService *client,
   return kIOReturnSuccess;
 }
 
+// A hang between two stages used to leave the panel at the last subsystem that spoke, which says
+// nothing about this one. The marker is printed before the call that can hang, so the last line on
+// the screen names the step instead of the next boot having to guess.
+static void blockStage(const char *step)
+{
+  IOLog("CloverBlock r108: %s\n", step);
+}
+
 extern "C" void clover_block_run(void)
 {
   BlockResult &r = gResult;
@@ -542,6 +550,7 @@ extern "C" void clover_block_run(void)
     // Stage 2: bring in IOStorageFamily and require the *exact* original class size. A layout
     // change would make every override below sit on the wrong slot, so this stops first.
     r.stage = 2;
+    blockStage("2 storage family");
     kern_return_t load = OSKextLoadKextWithIdentifier("com.apple.iokit.IOStorageFamily");
     r.load = static_cast<uint32_t>(load);
     const OSMetaClass *base = lookupMetaClass("IOBlockStorageDevice");
@@ -555,6 +564,7 @@ extern "C" void clover_block_run(void)
 
     // Stage 3: register our metaclass with the freshly loaded superclass.
     r.stage = 3;
+    blockStage("3 metaclass");
     CloverBlockDevice::superClass = base;
     void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!handle) {
@@ -569,6 +579,7 @@ extern "C" void clover_block_run(void)
     r.instances = CloverBlockDevice::gMetaClass.getInstanceCount();
 
     r.stage = 4;
+    blockStage("4 allocate");
     CloverBlockDevice *device = new CloverBlockDevice;
     if (!device || !device->init(nullptr)) {
       break;
@@ -577,14 +588,17 @@ extern "C" void clover_block_run(void)
     // Stage 5: attach to the platform and register synchronously, which is what makes
     // IOBlockStorageDriver attach and start *inside* this call.
     r.stage = 5;
+    blockStage("5 attach");
     IOPlatformExpert *platform = IOService::getPlatform();
     if (!platform || !device->attach(platform) || !device->start(platform)) {
       break;
     }
+    blockStage("5 register");
     device->registerService(kIOServiceSynchronous);
 
     // Stage 6: the driver and its media are children in the service plane.
     r.stage = 6;
+    blockStage("6 driver");
     IORegistryEntry *driverEntry = device->getChildEntry(gIOServicePlane);
     IOService *driver = driverEntry
         ? static_cast<IOService *>(driverEntry->metaCast("IOBlockStorageDriver")) : nullptr;
@@ -594,6 +608,7 @@ extern "C" void clover_block_run(void)
     r.driverFound = 1;
 
     r.stage = 7;
+    blockStage("7 media");
     IORegistryEntry *mediaEntry = driver->getChildEntry(gIOServicePlane);
     IOMedia *media = mediaEntry
         ? static_cast<IOMedia *>(mediaEntry->metaCast("IOMedia")) : nullptr;
@@ -611,6 +626,7 @@ extern "C" void clover_block_run(void)
     // Stage 9: open as a reader. The media's own checks (size, block size) have now been read
     // through the storage stack rather than from this driver's globals.
     r.stage = 9;
+    blockStage("9 open");
     if (!media->open(device, 0, kIOStorageAccessReader)) {
       break;
     }
@@ -627,6 +643,7 @@ extern "C" void clover_block_run(void)
     // here means the request was not completed inline, which is a reading about the storage stack
     // rather than a failure of the card.
     r.stage = 10;
+    blockStage("10 gpt");
     IOReturn status = readMediaBlock(media, device, buffer.get(), 1, &gMediaRead, block);
     r.gptStatus = static_cast<uint32_t>(status);
     if (status != kIOReturnSuccess || memcmp(block, "EFI PART", 8) != 0) {
@@ -646,6 +663,7 @@ extern "C" void clover_block_run(void)
     // Stage 11: walk the entry array for the entry named exactly "logfs". The name is UTF-16LE
     // at byte 56, so the match includes the terminator and cannot accept "logfsx".
     r.stage = 11;
+    blockStage("11 entries");
     const uint32_t perBlock = kBlockBytes / entrySize;
     uint32_t blocks = (entryCount + perBlock - 1) / perBlock;
     if (blocks > 128) {
@@ -676,6 +694,7 @@ extern "C" void clover_block_run(void)
     // failure and an unwritten slot are different readings: the former is recorded, the latter
     // leaves s=0.
     r.stage = 12;
+    blockStage("12 slots");
     for (uint32_t slot = 0; slot < kLogSlots; slot++) {
       status = readMediaBlock(media, device, buffer.get(), r.logfsFirst + 2 * slot, &gMediaRead, block);
       if (status != kIOReturnSuccess) {
@@ -707,6 +726,7 @@ extern "C" void clover_block_run(void)
     // Stage 13: the text block that header names. Length is clamped before it drives a loop,
     // and the byte sum is recomputed rather than trusted.
     r.stage = 13;
+    blockStage("13 text");
     status = readMediaBlock(media, device, buffer.get(), r.logfsFirst + 2 * r.slot + 1, &gMediaRead, block);
     r.textStatus = static_cast<uint32_t>(status);
     if (status != kIOReturnSuccess) {
@@ -730,6 +750,7 @@ extern "C" void clover_block_run(void)
       r.previewLength = i + 1;
     }
     r.stage = 15;
+    blockStage("15 done");
   } while (false);
 
   clover_block_observation[0] = r.stage;

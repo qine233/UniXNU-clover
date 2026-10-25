@@ -3675,7 +3675,11 @@ extern "C" void clover_emmc_run (void)
 {
   unsigned mode = 0;
   if (!PE_parse_boot_argn ("clover-emmc", &mode, sizeof (mode)) || !mode) {
-    return;
+    // Round107 proved that the old silent return here can absorb a whole round: PMGR published,
+    // AMFI latched, the kernel booted to IOCPU, and the screen never said whether the argument
+    // was missing or the storage stack had hung. The pair (clover-pmgr=2 without clover-emmc) is
+    // a payload built wrong, so it panics and prints the command line that caused it.
+    panic ("CloverSdhci r108: no clover-emmc boot arg\nargs [%s]", PE_boot_args ());
   }
   clover_emmc_stage = 1;
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
@@ -3714,9 +3718,12 @@ extern "C" void clover_emmc_run (void)
   if (mode == 21) {
     // Both halves of the same boot on one screen: the driver's chain, then what the storage stack
     // read through the block device published above it. This deliberately does not arm the panic
-    // hook; that stays mode 20's, because this run handed the card to another subsystem.
+    // hook; that stays mode 20's, because this run handed the card to another subsystem. The
+    // command line is repeated here because the boot log above scrolls, and "which arguments
+    // produced this reading" must survive the photograph.
     clover_block_run ();
-    panic ("CloverSdhci:\n%s\n%s", clover_emmc_report, clover_block_report);
+    panic ("CloverSdhci:\n%s\n%s\nargs [%s]", clover_emmc_report, clover_block_report,
+           PE_boot_args ());
   }
   panic ("CloverSdhci:\n%s", clover_emmc_report);
 }

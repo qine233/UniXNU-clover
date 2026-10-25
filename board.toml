@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: read the card through IOMedia"
+title = "clover emmc: name the payload, args, and block stage"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1272,6 +1272,16 @@ kernel_args = [
   # IOStorageFamily load or class size, 3 metaclass registration, 4 allocation, 5 attach/start,
   # 6 no IOBlockStorageDriver, 7 no IOMedia or geometry mismatch, 9 media open, 10 GPT header
   # through IOMedia, 11 entry walk, 12 slot scan, 13 text read.
+  # Round107's photograph ended at "IOCPUInterruptController: not registry member" with no block
+  # report at all, while PMGR's nub had clearly been published (AMFI latched to it). The only
+  # silent exit in this chain was the missing-argument return above, so the arguments that kernel
+  # received did not contain clover-emmc -- most likely a pre-eMMC payload was what the firmware
+  # actually booted. Round108 removes that ambiguity from the screen: sheng_pmgr_run logs
+  # "CloverPMGR r108: args [<command line>]" before it switches on anything, a missing
+  # clover-emmc panics with the same string instead of returning, this panic repeats it, and
+  # clover_block_run logs "CloverBlock r108: <step>" before every stage. A photograph therefore
+  # names the payload that ran (present or absent line), the exact command line it received, and
+  # -- if no "b st=" follows -- the last block step that was reached.
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
