@@ -6608,6 +6608,76 @@ fastboot reboot
 
 **一次刷机只回答一个问题：`bdevvp(1<<24|39)` 拿到的那个 vnode，XNU 自己读得动吗 —— 也就是 mockfs 经缓冲区缓存读 eMMC 的头 4096 字节，能不能让根挂载走完。** 看到 `initproc failed to start` 就算通：那时唯一的缺件是分区里还没有镜像，下一轮再单独问「能不能把它写进去」。
 
+## round119 读数（v0.2.91 实机）：`rd=` 被读进来了，也被丢了
+
+照片上能辨认的是 `Failed to mount root device @IOKitBSDInit.cpp:984`，`ticks=0x0000000000000b0c`，也就是 2820 个 tick。这个数字先排除一种可能：它不是 `armcpu-clock-panic=60000` 那颗看门狗，而是根设备等待本身——十次超时之后 iOS 分支在 :984 开枪（`ROOTDEVICETIMEOUT` 一轮一轮地睡）。
+
+然后是一条源码事实，把 v0.2.91 的整张预测表推翻了一半。`IOFindBSDRoot()` 确实解析了 `rd=`（IOKitBSDInit.cpp:781），但它在同一个函数里被丢了：
+
+```cpp
+data = OSDynamicCast(OSData, regEntry->getProperty( "root-matching" ));
+if (data) {
+    unserializedContainer = OSUnserializeXML((char *)data->getBytesNoCopy());
+    matching = OSDynamicCast(OSDictionary, unserializedContainer);
+    if (matching) { continue; }           // :790-797
+}
+...
+if ((!matching) && rdBootVar[0]) {        // :888  —— matching 已经非空，整块跳过
+    ...
+    matching = IOBSDNameMatching( look ); // :917
+}
+```
+
+也就是说等的一直是本板设备树里那颗从 sheng 抄来的卷 UUID（`root_match_volume_uuid = 04769D26-…`），而这颗板上没有任何服务带它。`grep -rn root-matching` 扫过 `.cache/xnu-work` 全树，只有 :790 这一处读点——这颗属性除了抢在 `rd=` 前面，什么都不做。
+
+三条结论：
+
+- round118 钉住的时序没坏，`disk0s39` 的媒体、BSD 名字、major/minor 都还在（那两行 `CloverBlock` 的读数本轮也仍按 round118 的形状出现）；本轮失败点不在块栈，在根查找选字典的那一步。
+- 「根契约」从来不是两项而是一项半：payload 带镜像、ADT 留 `RAMDisk` 占位，这些都对，但**只要 ADT 替内核点了名，`rd=` 就是死文本**。v0.2.91 的预测表里那一行「停在 `Waiting on <dict … IOMedia …>`」写错了方向，实际会是 `Waiting on <dict …UUID…>`。
+- vnode 那条读路本轮根本没走到，问题原封不动留着。
+
+## v0.2.92（round120）：设备树不再替内核点名根
+
+改动只有一处语义：`[payload.adt]` 的 `root_match_volume_uuid` 删除，ADT 里不再有 `/chosen/root-matching`。连带 `scripts/make-clover-adt.py` 的 `if args.root_match_volume_uuid:` 走空分支（脚本本身不用改），`check-clover.py` 从 `REQUIRED_CHOSEN` 里把它挪进新的 `FORBIDDEN_CHOSEN`，再断言 `[payload.adt]` 也不许带这颗键（`scripts/unixnu/payload.py:150` 会把键直接翻成 `--root-match-volume-uuid`），自检用的生成命令行同步摘掉。驱动只升身份串：`CloverBlock` 三处、`CloverPMGR` 一处 `r119` → `r120`。
+
+**为什么是删掉而不是改写成 `BSD Name=disk0s39`。** 两处声明「哪块是根」正是本轮量出来的缺陷本身；而 `IOBSDNameMatching()`（:191）造的字典是 `{IOProviderClass=IOService; BSD Name=<名字>}`，和 CloverBlock 第 6 步自己构造并等过的那颗一模一样，round118 已经实机证明它在这块板上应答得来。留着 ADT 那条路等于把同一件事交给两条都没验证过的通道。
+
+**从源码读出来的下一堵墙（这轮还没量到）。** 根一旦不是 `md0`，`bsd_rooted_ramdisk()`（bsd_init.c:450，只对前缀 `md0` 为真）就是假，`require_rootauth` 成立，于是内核在挂载成功之后对根 vnode 发 `FSIOC_KERNEL_ROOTAUTH`（:1072）。mockfs 的 vnop 表把 ioctl 接到 `err_ioctl`，返回 `ENOTSUP`（vfs_support.c:279），而 owner-trust 那条逃生门要 `XNU_OWNER_ROOT_AUDIT`/`XNU_OWNER_ROOT_TRUST` 编进 `bsd_init.o`，本板的 `clover_defconfig` 明确不开。所以本轮**最好的期望读数是 `rootvp not authenticated after mounting`（bsd_init.c:1098）**，它等价于「根已经挂在 eMMC 上了」；exec 那一步还轮不到出场。
+
+| 屏幕上的行 | 含义 |
+| --- | --- |
+| `Waiting on <dict … BSD Name=disk0s39>` | ADT 让开了，`rd=` 第一次真正被用上 |
+| `Got boot device = …` + `BSD root: disk0s39, major 1, minor 39` | 匹配与编号都对，`rootdev = makedev(1, 39)` |
+| `rootvp not authenticated after mounting` | **本轮想要的读数**：缓冲区缓存那条读通了、mockfs 挂上了，只差认证 |
+| `Failed to mount root device` | 还有别的东西抢在 `rd=` 前面（或媒体没等到） |
+| `CloverBlock r120: <step> <value>` | 块栈自己出问题，与根契约无关 |
+| 只有看门狗（60000 tick） | vnode 那条读挂住了；`elr=` 就是挂点的地址 |
+
+产物（内核、payload、ADT、unixnu.toml 变了；root / trust cache / scratch / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round120-payload.img` | 58720256 B | `dc9aa749c3073a91f5da86345a3d767d1efb3b24cef555c7636ffa7c2316023c` |
+| `round120-kernel.macho`（构建产物） | 51974144 B | `2f43b4124b479e66c658b9e464d4594c56454ab8b01da8cfbe4138994bb04a9d` |
+| `round120-in-volume-kernel.macho`（卷内副本） | 51974144 B | `6fdf9be1d180275ac84e148ec86cae903e85d2419e8165ca3a4aef1cfc9c2af6` |
+| `round120-kernel.macho.adt` | 13268 B | `7840f41a986d4cb247bafd84ab16de9f1f46179299de5e09c436eada08b8c7c2` |
+| `round120-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round120-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round120-unixnu.toml` | 571 B | `340036be1ba79a82b15f02aaa5571782ca82b21ebbf004c146f4a58148cec1ea` |
+
+ADT 从 13476 掉到 13268 字节，少的正是那颗属性。校验器：`check-clover.py` 通过（打印 `ADT 13268 bytes`，根契约要求 `rd=disk0s39` 且 `[payload.adt]` 不带 `root_match_volume_uuid`）；`verify-clover-payload.py` 通过，卷内 ADT 13268 字节、`strings` 里 `root-matching` 出现 0 次；`CloverBlock` 审计通过（265600 字节、190 个槽、26 个覆写）。卷内 `args` 与上一轮逐字相同（`… rd=disk0s39 … armcpu-clock-panic=60000`），内核只有 r120 字符串 4 处、无 r119 残留。菜单标题改成「clover emmc: let the kernel's own rd= name the root」。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_run` `0xfffffff00797231c`、`_clover_block_run` `0xfffffff007992054`、`_clover_block_request` `0xfffffff0079928e8`（与上一轮逐个相同）。boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+一条工务记录，值得写下来：`out/clover/kernel/kernel.macho` 不只是产物，它还是 `build-clover-pmgr.py` 与 `build-clover-block.py` 的 `--reference` 输入（审计要拿上一轮链接好的内核比对符号）。本轮清产物时把它删了，构建立刻在 archive 10/12 报 `kernel.macho missing: build the kernel once without this knob first`，只能从归档 `round119-kernel.macho` 还原才继续得下去。删 `out/` 之前先想清楚谁在读它。
+
+```sh
+fastboot flash cache ~/clover-out/round120-payload.img
+fastboot reboot
+```
+
+**一次刷机只回答一个问题：把 ADT 让开之后，`rd=disk0s39` 能不能让内核走到那个 vnode 上，经缓冲区缓存读 eMMC 的头 4096 字节并把 mockfs 根挂上。** 看到 `rootvp not authenticated after mounting` 就算通——那时挂载已经完成，下一轮单独问认证；还看到 `Failed to mount root device` 就说明另有东西抢在前面。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

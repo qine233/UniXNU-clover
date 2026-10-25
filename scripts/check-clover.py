@@ -44,12 +44,20 @@ GICD_PHYS = 0x17A00000
 TIMEBASE_HZ = 19200000
 
 REQUIRED_CHOSEN = ["random-seed", "nvram-proxy-data", "nvram-bank-size", "dram-base",
-                   "dram-size", "crypto-hash-method", "root-matching", "display-base",
+                   "dram-size", "crypto-hash-method", "display-base",
                    "unique-chip-id", "amfi-only-platform-code"]
+# /chosen/root-matching is the round119 failure and must stay absent. IOFindBSDRoot
+# (IOKitBSDInit.cpp:790-797) deserializes it into its `matching` dictionary and `continue`s, so the
+# `rd=` branch at :888 -- which is the only thing that turns `rd=disk0s39` into a wait on the media
+# CloverBlock publishes -- never runs; the kernel then waits on a volume UUID no service here
+# carries and panics at :984. It has exactly one reader in the tree, so nothing else loses it.
+FORBIDDEN_CHOSEN = ["root-matching"]
 # One RAMDisk placeholder, no PackedRAMDisk: the mockfs image (scripts/make-clover-root.py)
 # is what gets mounted as /, DarwinBoot hands it over dense, and its AdtNode refuses a
-# memory-map that declares a ramdisk twice. Since round119 `rd=` names the eMMC partition
-# rather than md0, but the RAMDisk slot stays because mdevadd runs before the rd= branch.
+# memory-map that declares a ramdisk twice. Since round119 `rd=` names the eMMC partition rather
+# than md0, but the RAMDisk slot stays: mdevadd runs at IOKitBSDInit.cpp:826-843, before any of
+# the root-matching or rd= branches, so md0 keeps existing and keeps the payload byte-identical
+# for the rounds that come after the partition root works.
 REQUIRED_MEMORY_MAP = ["RAMDisk", "TrustCache"]
 
 
@@ -83,7 +91,6 @@ def parse_adt(data: bytes):
 def adt_command(output: pathlib.Path):
     return [sys.executable, str(REPO / "scripts/make-clover-adt.py"), "--output", str(output),
             "--dram-size", hex(DRAM_SIZE), "--owned-memory-size", "0x40000000",
-            "--root-match-volume-uuid", "04769D26-2CA0-4825-B443-E2E5F88300F2",
             "--chip-id", hex(MSM_ID), "--cpu-regs", ",".join(hex(v) for v in CPU_REGS),
             "--psci-method", "smc", "--unique-chip-id", "0x0123456789ab",
             "--data-ramdisk", "--trust-cache", "--ipad-identity"]
@@ -162,6 +169,9 @@ def check_adt(errors: list) -> str:
         for prop in REQUIRED_CHOSEN:
             if prop not in chosen["properties"]:
                 errors.append(f"/chosen is missing {prop}")
+        for prop in FORBIDDEN_CHOSEN:
+            if prop in chosen["properties"]:
+                errors.append(f"/chosen carries {prop}, which makes IOFindBSDRoot ignore the board's rd=")
         if len(chosen["properties"].get("random-seed", b"")) != 64:
             errors.append("/chosen/random-seed is not 64 bytes")
         if chosen["properties"].get("dram-base") != struct.pack("<Q", DRAM_BASE):
@@ -519,6 +529,14 @@ def check_board(errors: list) -> str:
     # IOFindBSDRoot waits. The pinned trust cache carries the init program's cdhash so exec can
     # validate it whatever the backing device is. A packed placeholder would mean the Data-seed
     # shape instead, which needs NativeRamBlock.
+    # The `rd=` half only holds if nothing else claims the root first: round119 proved
+    # /chosen/root-matching wins that race (IOKitBSDInit.cpp:790-797 versus the guard at :888),
+    # so the ADT must not carry it, and neither may the board table that feeds the generator
+    # (scripts/unixnu/payload.py:150 turns the key into --root-match-volume-uuid).
+    if adt.get("root_match_volume_uuid"):
+        errors.append('[payload.adt] root_match_volume_uuid is set: the generator would emit '
+                      '/chosen/root-matching, IOFindBSDRoot would wait on that dictionary and '
+                      'never read rd=disk0s39 -- the round119 panic')
     if adt.get("packed_data_ramdisk"):
         errors.append("[payload.adt] packed_data_ramdisk is true, but this board's root is the "
                       "dense mockfs image; the payload step would emit PackedRAMDisk")

@@ -58,6 +58,13 @@
 // what happens after this driver returns -- bdevvp(1<<24|39)'s vnode is read by mockfs through the
 // buffer cache, which is the first read this board performs that does not go through a call this file
 // makes itself.
+// Round 119's photograph read `Failed to mount root device @IOKitBSDInit.cpp:984` at ticks=0xb0c, and the
+// cause was not this driver: /chosen's `root-matching` property is deserialized into IOFindBSDRoot's
+// `matching` dictionary at :790-797 and `continue`s, while the branch that turns `rd=` into
+// IOBSDNameMatching is guarded by `if ((!matching) && rdBootVar[0])` at :888 -- so the argument was parsed
+// at :781, ignored, and ten waits ran against a stock volume UUID no service here carries. Round 120 takes
+// that property out of the device tree, which leaves step 6's dictionary as the only root contract and is
+// the same wait round 118 already showed answering on this board.
 //
 // The class has to be hand-written. IOStorageFamily is loaded at runtime from the boot kext
 // collection (kernel.macho exports no IOBlockStorageDevice, IOMedia or IOBlockStorageDriver
@@ -75,7 +82,7 @@
 // an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
 // attached for start (startCandidate() attaches again after the matching loop's detach).
 //
-// A failure panics with one short CloverBlock r119 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r120 line naming the step; success prints one line
 // and lets the boot continue. A refire of the IOBSD notification prints one counted line and
 // returns, so the photograph shows both that the run completed and how many times it was offered.
 #define IOKIT_ENABLE_SHARED_PTR 1
@@ -476,7 +483,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r119: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r120: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 // The mask's job is done: round115 showed that the names this file wants are taken by the tree
@@ -571,7 +578,7 @@ extern "C" void clover_block_run(void)
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    IOLog("CloverBlock r119: refire n=%u (already ran)\n", fires);
+    IOLog("CloverBlock r120: refire n=%u (already ran)\n", fires);
     return;
   }
 
@@ -711,7 +718,7 @@ extern "C" void clover_block_run(void)
     fail("map", 0);
   }
 
-  IOLog("CloverBlock r119: auto p=%u %s %u:%u bd=1 map=1 fires=%u\n", partitions,
+  IOLog("CloverBlock r120: auto p=%u %s %u:%u bd=1 map=1 fires=%u\n", partitions,
         bsdName->getCStringNoCopy(), bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
 }

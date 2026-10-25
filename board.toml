@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: root on the partition the kernel named"
+title = "clover emmc: let the kernel's own rd= name the root"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -959,29 +959,43 @@ kernel_args = [
   "debug=0x14e",
   "kt_fixed_zones=120",
   "boot-progress=2",
-  # Round119 moves the root from the RAMDisk to the eMMC partition. `rd=` is the only
-  # change: with a name that is not `md?`, IOFindBSDRoot skips the mdevadd shortcut (line
-  # 849), builds IOBSDNameMatching("disk0s39") (line 917) and waits on it -- and the disk
-  # is already published, because CloverBlock's run is triggered by the earlier
-  # publishResource("IOBSD") inside IOKitBSDInit(), which is why round118's success line
-  # printed before `Adding ramdisk device md0`. So the wait answers immediately, rootdev
-  # becomes makedev(1, 39), and vfs_mountroot's bdevvp(rootdev) hands mockfs a vnode whose
-  # reads go through IOMediaBSDClient -> IOBlockStorageDriver -> drivers/CloverSdhci's PIO
-  # read instead of a page table. That vnode path is the new thing under test: round118
-  # proved media->read() (map=1) and bdevvp() itself (bd=1), never a read through the
-  # returned vnode.
-  # Nothing mountable is at the start of logfs yet, and that is deliberate. mockfs reads
-  # the first 4096 bytes through the device, sees no `N4KROOT` magic, and falls to its
-  # legacy single-Mach-O mode, where /sbin/launchd is the whole device from offset zero
-  # (mockfs_fsnode.c:82, mockfs_vfsops.c:134). The mount should therefore succeed and the
-  # exec should fail on garbage, which separates "the root plumbing over eMMC works" from
-  # "there is no image there yet" -- the image goes in a later round, and writing logfs is
-  # destructive, so it waits for an explicit go-ahead.
-  # Readings: `Got boot device = <service path>` + `BSD root: disk0s39, major 1, minor 39`
-  # = the match and the number; `initproc failed to start ... (error N)` = root mounted over
-  # eMMC and only the image is missing; `Failed to mount root device` (panic at
-  # IOKitBSDInit.cpp:984 after ten timed-out waits) = the media was not there when the root
-  # search ran; a mount error naming mockfs/bdevvp = the vnode path is what breaks.
+  # Round119 moved the root from the RAMDisk to the eMMC partition and round119 read back that the
+  # kernel never looked at this argument. `Failed to mount root device` @IOKitBSDInit.cpp:984 arrived
+  # at ticks=0xb0c (2820), which is ten timed-out waits, not an absent partition: `rd=` is parsed at
+  # line 781 and then ignored, because /chosen's `root-matching` property is deserialized into
+  # `matching` at :790-797 and `continue`s, while the BSD-name branch that would use `rd=` is guarded
+  # by `if ((!matching) && rdBootVar[0])` at :888. The wait therefore ran on the stock volume UUID
+  # dictionary this port put into the device tree first (scripts/make-clover-adt.py, from sheng), and
+  # no service on this board carries that UUID. `grep -rn root-matching` over .cache/xnu-work returns
+  # exactly that one read site, so the property has no other consumer to keep.
+  # Round120 deletes it instead of rewriting it to name the partition. Two places declaring which
+  # media is root is the defect just measured, and the dictionary IOFindBSDRoot builds for a BSD name
+  # (`{IOProviderClass=IOService; BSD Name=disk0s39}`, IOBSDNameMatching at :191) is the one round118
+  # already proved matches here -- step 6 of the run builds that same dictionary and waits on the same
+  # call, and its success line printed `disk0s39 1:39`.
+  # With the property gone, the ordering the argument was written for holds: CloverBlock's run is
+  # triggered by the earlier publishResource("IOBSD") inside IOKitBSDInit(), so the media is published
+  # before vfs_mountroot's search runs; rootdev becomes makedev(1, 39); bdevvp hands mockfs a vnode
+  # whose reads go through IOMediaBSDClient -> IOBlockStorageDriver -> drivers/CloverSdhci's PIO read
+  # instead of a page table. That vnode path is still the new thing under test: round118 proved
+  # media->read() (map=1) and bdevvp() itself (bd=1), never a read through the returned vnode.
+  # Nothing mountable is at the start of logfs yet, and that is deliberate. mockfs reads the first
+  # 4096 bytes through the device, sees no `N4KROOT` magic, and falls to its legacy single-Mach-O
+  # mode, where /sbin/launchd is the whole device from offset zero (mockfs_fsnode.c:82,
+  # mockfs_vfsops.c:134). The mount should therefore succeed and everything after it is a different
+  # wall: with a name that is not `md0`, bsd_rooted_ramdisk() (bsd_init.c:450) is false, so
+  # require_rootauth is true, and FSIOC_KERNEL_ROOTAUTH on the mockfs root reaches err_ioctl ->
+  # ENOTSUP (vfs_support.c:279) -> `panic("rootvp not authenticated after mounting")` (bsd_init.c
+  # :1098). The owner-trust escape hatch is not compiled on this board (clover_defconfig leaves
+  # OWNER_* off), so that panic is the expected best-case reading and it means the mount worked.
+  # Readings, in the order they now become distinguishable:
+  #   `Waiting on <dict ... BSD Name=disk0s39>` + `Got boot device = <path>` + `BSD root: disk0s39,
+  #     major 1, minor 39` = the ADT is out of the way and the match answered;
+  #   `rootvp not authenticated after mounting` = root mounted over eMMC, authentication is the next
+  #     and only wall;
+  #   `Failed to mount root device` again = something else still pre-empts `rd=`;
+  #   `CloverBlock r120: <step> <value>` = the block stack itself broke;
+  #   no new line and the clock watchdog = the buffer-cache read hung, which the tick panic localises.
   "rd=disk0s39",
   # Round 72 died with SIGKILL (parent's wait4 read status 9) inside its first
   # mach_msg; round 73 bracketed that call with markers and added this boot-arg,
@@ -1390,9 +1404,14 @@ kernel_args = [
   # exactly that -- "auto p=39 disk0s39 1:39 bd=1 map=1 fires=1", one "refire n=2 (already ran)",
   # then the log running on through APFS to the EL0 init and its mach lines, ending in the tick
   # watchdog's scheduled panic with spsr ending in 0 (EL0t): userspace was running when it fired.
-  # One line on success, "CloverBlock r119: auto p=<n> disk0s39 <maj>:<min> bd=1 map=1 fires=<k>"
-  # (fires=1 on the run that succeeded); each refire prints "CloverBlock r119: refire n=<k> (already
-  # ran)". Every failure panics as "CloverBlock r119: <step> <value>". "auto <n>" means no named
+  # Round119 pointed rd= at this partition and the photograph read `Failed to mount root device
+  # @IOKitBSDInit.cpp:984` at ticks=0xb0c: rd= was parsed and then ignored, because /chosen's
+  # root-matching filled IOFindBSDRoot's matching dictionary first (:790-797, and the rd= branch is
+  # guarded by `!matching` at :888), so the ten waits ran against the stock volume UUID. Round120
+  # deletes that property (see [payload.adt]), which leaves rd=disk0s39 as the only root contract.
+  # One line on success, "CloverBlock r120: auto p=<n> disk0s39 <maj>:<min> bd=1 map=1 fires=<k>"
+  # (fires=1 on the run that succeeded); each refire prints "CloverBlock r120: refire n=<k> (already
+  # ran)". Every failure panics as "CloverBlock r120: <step> <value>". "auto <n>" means no named
   # partition appeared in time: the value is 0x10000 if the whole disk itself was named, plus the
   # number of named partitions seen. "notify 0/1" means the IOBSD matching dictionary or the
   # notification itself could not be installed. No CloverBlock line at all means it never fired.
@@ -1422,7 +1441,12 @@ chip_id = "0x13d"
 # The low bank is 0x80000000-0x100000000; PIL, venus, the splash and the firmware FD
 # leave 0xa0000000-0x100000000, so 1 GiB is the largest obviously free request.
 owned_memory_size = "0x40000000"
-root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
+# Deliberately absent: root_match_volume_uuid, and with it /chosen's `root-matching`.
+# IOFindBSDRoot deserializes that property into its `matching` dictionary at
+# IOKitBSDInit.cpp:790-797 and `continue`s, which is what made round119's `rd=disk0s39` dead
+# text -- the branch at :888 that would turn `rd=` into IOBSDNameMatching only runs when
+# `matching` is still NULL. The kernel's own `rd=` is now the only root contract on this board,
+# and scripts/check-clover.py asserts the property stays absent.
 cpu_regs = "0x0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"
 psci_method = "smc"
 # False means the --data-ramdisk image gets one plain RAMDisk placeholder, which is
