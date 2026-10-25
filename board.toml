@@ -1310,6 +1310,15 @@ kernel_args = [
   # This is also the first boot whose record the next boot's stage 12/13 reads: the text is
   # "block write through IOMedia", the marker that the write side of the stack, not the driver's
   # PIO helper, produced it.
+  # Round110's photograph stopped at "14 write" with the assertion at IOMemoryDescriptor.cpp:2612
+  # (!(kIOMemoryPreparedReadOnly & _flags)). Its writeMediaBlock filled one shared outBuffer with
+  # writeBytes; the first media->write prepared that kIODirectionOut descriptor for the device
+  # (UPL_COPYOUT_FROM sets kIOMemoryPreparedReadOnly), so the second block's writeBytes tripped
+  # the assert. The header block itself did land, which means that slot now holds a valid header
+  # and stale text. Round111 builds one withBytes(..., kIODirectionOut) descriptor per block,
+  # filled at construction and never touched after submission, and keeps both alive for the whole
+  # run; writeMediaBlock only submits. Expected: "b w s=<slot> wr=1 rb=1". If "b lf" names the
+  # round110 slot, "c=0 p=0" is that half record, not a new failure.
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under

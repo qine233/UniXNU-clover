@@ -548,18 +548,19 @@ static IOReturn readMediaBlock(IOMedia *media, IOService *client,
   return kIOReturnSuccess;
 }
 
-// The write mirror of readMediaBlock, same inline-completion contract and same descriptor copy.
-// A write must go to a media the device reported writable, which is what stage 9 now opens.
+// The write mirror of readMediaBlock, same inline-completion contract. The buffer must already
+// hold the block: preparing a kIODirectionOut descriptor for the device sets
+// kIOMemoryPreparedReadOnly (IOMemoryDescriptor.cpp:4405), after which writeBytes() asserts
+// (line 2612). Round110 filled a shared descriptor here after the first write had prepared it,
+// and the second block panicked. Ownership of the bytes therefore stays with the caller, which
+// builds a fresh descriptor per block with withBytes() and never mutates it after submission.
 static IOReturn writeMediaBlock(IOMedia *media, IOService *client,
                                 IOMemoryDescriptor *buffer, uint64_t lba,
-                                MediaRead *op, const uint8_t *in)
+                                MediaRead *op)
 {
   op->done = 0;
   op->status = static_cast<uint32_t>(kIOReturnNotReady);
   op->actual = 0;
-  if (buffer->writeBytes(0, in, kBlockBytes) != kBlockBytes) {
-    return kIOReturnNoSpace;
-  }
   IOStorageCompletion completion;
   completion.target = op;
   completion.action = mediaReadDone;
@@ -579,7 +580,7 @@ static IOReturn writeMediaBlock(IOMedia *media, IOService *client,
 // the screen names the step instead of the next boot having to guess.
 static void blockStage(const char *step)
 {
-  IOLog("CloverBlock r110: %s\n", step);
+  IOLog("CloverBlock r111: %s\n", step);
 }
 
 extern "C" void clover_block_run(void)
@@ -720,9 +721,12 @@ extern "C" void clover_block_run(void)
 
     OSSharedPtr<IOBufferMemoryDescriptor> buffer =
         IOBufferMemoryDescriptor::withCapacity(kBlockBytes, kIODirectionIn, true);
-    OSSharedPtr<IOBufferMemoryDescriptor> outBuffer =
-        IOBufferMemoryDescriptor::withCapacity(kBlockBytes, kIODirectionOut, true);
-    if (!buffer.get() || !outBuffer.get()) {
+    // The write descriptors outlive the whole function, not just stage 14: the storage stack may
+    // still hold a reference after the synchronous completion, and releasing memory under it is
+    // not something this boot can debug. They are assigned, never reused.
+    OSSharedPtr<IOBufferMemoryDescriptor> headerBuffer;
+    OSSharedPtr<IOBufferMemoryDescriptor> textBuffer;
+    if (!buffer.get()) {
       break;
     }
     uint8_t block[kBlockBytes];
@@ -869,10 +873,16 @@ extern "C" void clover_block_run(void)
       header[7] = freeSlot;
       memcpy(text, kWriteText, length);
 
-      IOReturn wrote = writeMediaBlock(media, device, outBuffer.get(), slotLba, &gMediaWrite,
-                                       reinterpret_cast<const uint8_t *>(header));
+      headerBuffer =
+          IOBufferMemoryDescriptor::withBytes(header, kBlockBytes, kIODirectionOut, true);
+      textBuffer = IOBufferMemoryDescriptor::withBytes(text, kBlockBytes, kIODirectionOut, true);
+      if (!headerBuffer.get() || !textBuffer.get()) {
+        r.writeStatus = static_cast<uint32_t>(kIOReturnNoMemory);
+        break;
+      }
+      IOReturn wrote = writeMediaBlock(media, device, headerBuffer.get(), slotLba, &gMediaWrite);
       if (wrote == kIOReturnSuccess) {
-        wrote = writeMediaBlock(media, device, outBuffer.get(), slotLba + 1, &gMediaWrite, text);
+        wrote = writeMediaBlock(media, device, textBuffer.get(), slotLba + 1, &gMediaWrite);
       }
       if (wrote != kIOReturnSuccess) {
         r.writeStatus = static_cast<uint32_t>(wrote);

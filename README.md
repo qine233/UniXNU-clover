@@ -5740,6 +5740,99 @@ fastboot reboot
 仍是上一条记录；再按一次重启（不重刷）后，stage 13 应把这次写的槽读出来，
 `b lf s=` 变成这次的槽，`b tx` 变成 `block write through IOMedia`。
 
+## v0.2.83（round111）：写描述符在提交前填好，之后不再碰
+
+round110 的照片停在 `14 write`，panic 屏上是：
+
+```text
+Assertion failed: !(kIOMemoryPreparedReadOnly & _flags)
+@/xnu/iokit/Kernel/IOMemoryDescriptor.cpp:2612
+```
+
+RA / LR 分别落在 `panic_with_data` 与 `IOMemoryDescriptor::writeBytes`。问题不在卡，也不在
+块栈：`writeMediaBlock()` 原来在每次 `media->write` 前用 `buffer->writeBytes(0, in, 512)`
+往同一个 `outBuffer` 里填块。第一块提交时，IOStorageFamily 按设备读方向 `prepare()` 了这个
+`kIODirectionOut` 描述符，置上 `kIOMemoryPreparedReadOnly`（`UPL_COPYOUT_FROM`，
+IOMemoryDescriptor.cpp:4405）；第二块的 `writeBytes` 因此命中 2612 的断言。第一块其实已经
+写进槽里了，所以那个槽现在只有一个有效的头块和并不匹配的正文块。
+
+这一轮只改描述符的生命周期：
+
+1. `writeMediaBlock()` 不再改写 buffer，只负责提交；内容由调用者在提交前填好。
+2. stage 14 为头块和正文块各建一个
+   `IOBufferMemoryDescriptor::withBytes(…, 512, kIODirectionOut, true)`：创建即带内容，
+   提交后不再改动。两个 `OSSharedPtr` 声明在函数作用域，活过整次块栈运行。
+3. 去掉 stage 9 里共享的 `outBuffer`。
+
+其余路径（只读扫描、槽选择、可写打开、读回比较）与 round110 相同。
+
+成功时屏上应含：
+
+```text
+CloverPMGR r111: args [-v serial=3 debug=0x14e kt_fixed_zones=120 boot-progress=2
+ rd=md0 allow_legacy_mach_msg=1 armcpu-timer-intid=19 clover-pmgr=2 clover-emmc=21
+ armcpu-clock-panic=60000]
+...
+CloverBlock r111: 13 text
+CloverBlock r111: 14 write
+CloverBlock r111: 15 done
+...
+b st=15 ld=0 cs=0090 pm=0 dm=1 ds=1
+b dv=1 md=1 sz=<n> bl=512
+b op=1 wp=1 gp=1 ix=39
+b lf s=<上一槽> a=12320768 b=12337151 m=<kind> n=<len> c=<0/1> p=<0/1>
+b w s=<本次槽> wr=1 rb=1
+b tx <上一槽正文开头>
+args [-v serial=3 … clover-emmc=21 armcpu-clock-panic=60000]
+```
+
+如果 `b lf` 指向 round110 留下的半条记录，`c=0 p=0` 是**预期读数**而不是本次失败：头块
+里的长度和校验和是真的，正文块却是旧的。这一轮的答案看 `b w s=… wr=1 rb=1`。
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `15 done`、`b w s=<n> wr=1 rb=1` | 写和读回都经 IOMedia 完成 | 不重刷再重启一次：stage 13 应读出 `b tx block write through IOMedia` |
+| `b lf … c=0 p=0`，但 `b w … wr=1 rb=1` | round110 的半条记录按预期判无效，新记录完好 | 重启一次确认新记录被读回 |
+| 停在 `14 write`，panic 又是 2612 | 仍有描述符在提交后被改写 | 看 LR 是否为 `writeBytes`；核对 `withBytes` 的调用路径 |
+| 停在 `14 write`，`ws=` 非零 | 媒体写或读回失败 | 按 `ws` 的 IOReturn 定位 |
+| `wr=1 rb=0`，`ws=` 为读回错误 | 写完成但读回内容不一致 | 查块偏移与缓存 |
+| 停在 `9 open` | 媒体仍不可写 | 查 `reportWriteProtection` 与 open 权限 |
+| 停在 13 或更早 | 读路径出现回归 | 按最后一条标记回看该阶段 |
+| 没有 `CloverPMGR r111` | 固件启动的不是这份 payload | 核对刷写目标与启动卷 |
+
+产物（内核与 payload 变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round111-payload.img` | 58720256 B | `8bc00486aea486138ded73f46bb90d6c15fea534fd4c81e6f896809a8d1e05dc` |
+| `round111-kernel.macho`（构建产物） | 51990528 B | `fb1a2df9258bf635f95a08a4bee6f6707b27fbe1e830ade3d263c44f13784817` |
+| `round111-in-volume-kernel.macho`（卷内副本） | 51990528 B | `07f0d091022b198ce43344edcd1eb8ab90fde80eb526d005b133c7b371fad8b0` |
+| `round111-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round111-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round111-kernel.macho.adt` | 13476 B | `acc16b7d9a9be048295e4168d35c687aee20ec2792647207f6ee5a4f380ce6d6` |
+| `round111-unixnu.toml` | 579 B | `dc5fb66dd90a97c1073419fedaf5ed93c8425f57a3e0164a5d3564c723916db3` |
+
+校验器：探针 35 处 6040 字节、PMGR 5 条绑定 0 位移、CloverSdhci 八项全在（含
+`_clover_emmc_block_read` 与 `_clover_emmc_block_write`），卷内 boot-args 末尾仍是
+`… clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`。三条 r111 字符串都在卷内内核里：
+`CloverPMGR r111: args [%s]`、`CloverSdhci r111: no clover-emmc boot arg`、
+`CloverBlock r111: %s`。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_block_write`
+`0xfffffff007971a30`、`_clover_emmc_run` `0xfffffff00797231c`、`_clover_block_run`
+`0xfffffff0079920a0`、`lookupMetaClass` `0xfffffff007994b78`。
+boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round111-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 先确认 `CloverPMGR r111` 与参数，再顺着 `13 text` / `14 write` 看停在哪，
+最后读 `b w s=… wr=1 rb=1`；`b lf` 若仍指向 round110 的半槽，`c=0 p=0` 属预期。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
