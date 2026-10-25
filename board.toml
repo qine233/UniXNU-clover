@@ -1504,6 +1504,21 @@ kernel_args = [
   # in EL0 -- so 60000 is roughly eleven times past the point the probe reaches, without
   # depending on how long a tick actually is. That period is now measured at the same time
   # (cnt0/cnt1/freq on the panic line), which is the first real clock this port has had.
+  # The instrument still cannot report a duration: the frame taken after the logfs root booted reads
+  # `clock watchdog at 60000 ticks (elr=100000b3c spsr=ffffffff14084cd50 elr2=100000b3c cnt0=124f800
+  # cnt1=0 freq=124f800) @ArmCpu.cpp:632` -- cnt0 == freq again, cnt1 == 0, the same defect recorded at
+  # README's round82 section, so the tick period remains unmeasured and the tick number stays a
+  # coordinate. What this frame does give is the sample: spsr's mode field is 0 (EL0t), so the timer
+  # interrupted user mode rather than a syscall, and 0x100000b3c is our own EL0 image's __TEXT base
+  # (0x100000000, no slide) plus 0xb3c -- `_puts + 4`, the instruction after `bl _write_console`
+  # returned and before the `b.hs _fail` test of its return flags. All eight `_puts` sites live in the
+  # mach-probe block, which `cmp x19, #1` / `b.eq _skip_mach` (clover-el0-init.S:425) keeps off pid 1,
+  # while `_parent` (:1040) speaks only through `_write_console` and `_print_dec` -- so the interrupted
+  # thread is the exec'd child, and a write had just come back. Yet round85's self-panic string (`userspace panic: clover-el0: write returned`, reboot(2) at
+  # 0x10000061c, three instructions after that `_puts` returns) is absent, and the panic screen keeps
+  # the first panic. Those two cannot both be a linear boot: the next reading has to say which of them
+  # the frame is lying about, and the .S already prescribes the cut -- reboot before the write instead
+  # of after it.
   "armcpu-clock-panic=60000",
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board runs one CPU (no sheng-smp), while the driver's

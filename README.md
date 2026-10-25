@@ -6831,6 +6831,40 @@ fastboot reboot
 
 **下一帧要问的：** `el0 mach: msg=` 后面被截断的那一行写了什么。它是本轮唯一没读回来的仪器数，也是「EL0 从 eMMC 起来之后，mach 握手到底交换了什么」这个问题的答案本体。
 
+## round121 之后·第二帧（同一份负载）：看门狗到点，样本落在 EL0 自己那句 write 后面
+
+第二张照片给的是同一次启动的下一时刻。`msg=` 那半行仍然没有下文，取而代之的是看门狗：
+
+```
+ArmCpu: clock watchdog at 60000 ticks (elr=100000b3c spsr=ffffffff14084cd50 elr2=100000b3c
+       cnt0=124f800 cnt1=0 freq=124f800) @ArmCpu.cpp:632
+pages=0x000000000003af7c   free=0x0000000000039530   ticks=0x000000000000ea60
+ipi=0 sent=0 | irq=0x13 phase=0x3 intid=0x13 typer=0x7b04f3
+```
+
+先把 `elr` 解干净。我们那份 EL0 镜像（`build/clover-root/launchd.macho`，与刷进 `logfs` 的 `round121-scratch-data.img` 逐字节相同，`fe27be32…`）的 `__TEXT` 就在 `0x100000000`，没有 slide，所以 `0x100000b3c` = `_puts + 4`：
+
+```
+_write_console:                      _puts:
+  mov x0, x22                          100000b38  bl  _write_console
+  mov x16, #4            // write      100000b3c  mov x1, #0xe0   ← 样本
+  svc #0x80                            100000b40  b.hs _fail
+  ret                                  100000b44  ret
+```
+
+`spsr` 低四位是 0 ⇒ **EL0t**：中断打在用户态，不是某个 syscall 里面。`scripts/clover-el0-init.S` 里八处 `_puts` 全在 mach 探针那一段，而整段被 `cmp x19, #1` / `b.eq _skip_mach`（:425）挡在 pid 1 之外 —— 只有 exec 之后的 pid=2 会走；`_parent`（:1040）那一路的出声全直接调 `_write_console` 与 `_print_dec`，一次 `_puts` 都不经过。所以被打断的线程是孩子，而它刚刚从一次 `write()` 回来、连返回值都还没测。
+
+于是这一帧内部是矛盾的，而且矛盾本身就是读数：`_puts` 返回后三条指令就是 round85 那颗自 panic（`mov x0,#0xc00` / `mov x16,#0x37` / `svc` 在 `0x10000061c`，`reboot(RB_PANIC|RB_QUICK, "clover-el0: write returned")`），屏上却没有 `userspace panic: clover-el0: write returned`，而 panic screen 只保留第一个 panic。⇒ 到 60000 tick 为止那颗 `reboot(2)` 没走完，可样本又说孩子正停在它前面四步的位置上。线性推进的解释不成立，下一帧必须说明这两件事里哪一件是画面在骗人。
+
+两条附带账目：`free` 从上一帧的 `0x3a121` 掉到 `0x39530`（约 2844 页 ≈ 44 MB），说明这一帧确实晚于上一帧、且中间有真实分配发生；`cnt0 == freq == 0x124f800`、`cnt1 == 0` 是 round82 那节就记下的仪器缺陷（`gTick0Counter` 取到了 CNTFRQ 的值，`counter()` 在 panic 时读回 0），所以**这帧仍然给不出 60000 tick 是多久**，tick 数只能继续当启动进度坐标用。
+
+```sh
+# 负载与分区内容都没变，仍然只是冷刷
+fastboot reboot
+```
+
+**下一帧要问的（一次刷机一问）：** 把 round85 那颗 `reboot(2)` 从「`msg=` 那次 write 之后」挪到「之前」——`scripts/clover-el0-init.S:651` 的注释早就写好了这一刀。看到 `userspace panic: clover-el0: before write`，就说明孩子能走到那儿、被吃掉的是那次 write；仍然只看门狗到点，就说明孩子根本没走到，而 `elr` 会告诉我们它在哪。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
