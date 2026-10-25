@@ -6749,6 +6749,33 @@ fastboot reboot
 
 **一次刷机只回答一个问题：把根的名字报成 `md0s39`，`bsd_init.c` 的认证块跳过去之后，boot 能不能走到 exec。** 看到 `Process 1 exec of /sbin/launchd failed, errno <n>` 就算通——那时根、挂载、认证三关都在身后，下一轮单独问分区里的镜像；再看到 `rootvp not authenticated after mounting` 就说明前缀测试根本没看见这个名字。
 
+## round121 读数（v0.2.93 实机）：认证跳过去了，exec 读到的是 eMMC 的字节
+
+照片第一行就是本轮想要的 pass line：
+
+```
+Process 1 exec of /sbin/launchd failed, errno 8 @kern_exec.c:8104
+```
+
+`errno 8` 是 `ENOEXEC`。这一行同时结掉了三件事：`bsd_rooted_ramdisk()` 的前缀测试认了这个名字，整块 `FSIOC_KERNEL_ROOTAUTH` 被跳过（round120 那堵墙没了）；根搜到了别名并按它挂了 mockfs（否则这里会是 `Failed to mount root device`）；exec 真的从根上读出字节、并且读完了才发现不是 Mach-O（否则会是 `ENOENT`）。
+
+地址逐个对回本轮的卷内内核（`round121-in-volume-kernel.macho`，`__TEXT` 在 `0xfffffff007004000`）：
+
+| 屏上的字段 | 值 | 解出来 |
+| --- | --- | --- |
+| `fmt` | `0xfffffff0070c12d1` | 文件偏移 `0xbd2d1`，字面量就是 `Process 1 exec of %s failed, errno %d @%s:%d` |
+| `RA` | `0xfffffff0076d68e8` | `_load_init_program + 0x1c0`，即 :8104 那颗 panic 自己 |
+| `LR` | `0xfffffff0076ac3dc` | `_bsdinit_task + 0x68`，它的调用者，与 :8104 的栈一致 |
+| `FP` / `args` | `0xfffffff0b77…` | 内核栈地址，不是符号 |
+| `ticks` | `0x124` = 292 | round120 是 `0xd3` = 211；多出来的这段正是挂载之后走到 exec 的路 |
+| `pages` / `free` | `0x3af7c` = 241532 / `0x3a121` = 237857 | 16 KiB 一页 ≈ 3.96 GB 总、3.89 GB 空闲：没吃进任何镜像，内存账本还是干净的 |
+
+`load_init_program()` 对 `ENOENT` 是静默跳过的（:8099 `else if (error != ENOENT)` 才打 `failed loading …` 那行），而 panic 只报最后试的那颗（:8104 `init_programs[i - 1]`）。屏上既没有 `launchd.debug` 也没有 `launchd.development` 的失败行，最后落在 `/sbin/launchd` 且错号是 8 —— 也就是前两颗根本不存在（mockfs 那个 legacy 目录里只有一个名字），第三颗存在、可读、字节不对。这跟 round119/120 写在 `rd=` 注释里的 mockfs 形状严丝合缝：没有 `N4KROOT` 魔数就退化成「整块设备从 0 起就是 `/sbin/launchd`」。
+
+还有一条排除值得记下来：万一这个根其实是 RAMDisk 上那份 mockfs 镜像，`/sbin/launchd` 会是真的、签名过的 Mach-O，exec 就往下走了，不会报 8。报 8 恰恰证明读上来的是 eMMC 分区自己的字节 —— 块栈、缓冲区缓存、mockfs、exec 这一整条链是通的，缺的只是分区里还没有镜像。
+
+这一帧里 `CloverBlock r121: auto …` 和 `BSD root: …` 已经被滚出画面，但上面那串推论不依赖它们：别名没写成功就挂不上根，挂不上根就到不了 exec。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

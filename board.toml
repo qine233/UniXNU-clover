@@ -1030,6 +1030,16 @@ kernel_args = [
   #     read-back, or the fresh dictionary not resolving to this media);
   #   `CloverBlock r121: <any other step>` = the block stack broke before step 9;
   #   no new line and the clock watchdog = the buffer-cache read hung, which the tick panic localises.
+  # Round121 printed the pass line: `Process 1 exec of /sbin/launchd failed, errno 8 @kern_exec.c:8104`
+  # at ticks=0x124 (292, against round120's 211), whose RA is _load_init_program+0x1c0 and whose fmt is
+  # the literal itself. ENOEXEC closes three questions at once: the prefix test accepted the alias so the
+  # rootauth block was skipped, the root mounted on the media named md0s39, and exec read real bytes off
+  # eMMC and found them not to be a Mach-O. load_init_program() stays silent about ENOENT (:8099) and the
+  # panic names only the last candidate (:8104), so the absence of any `failed loading launchd.debug` line
+  # says the first two were missing and the third was there -- mockfs's legacy shape, where the whole
+  # device from offset zero is /sbin/launchd. Had this root been the RAMDisk image, that name would hold
+  # a signed Mach-O and exec would have continued; errno 8 is positive evidence the bytes are the
+  # partition's. What is left is content, not plumbing: logfs holds no root image yet.
   "rd=md0s39",
   # Round 72 died with SIGKILL (parent's wait4 read status 9) inside its first
   # mach_msg; round 73 bracketed that call with markers and added this boot-arg,
