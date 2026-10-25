@@ -1598,9 +1598,34 @@ kernel_args = [
   # Beware that this file's `_puts` and `_print_line` test the carry against a hardcoded stage of 224, so
   # B's write failures exit with 224+errno: on the parent's line that reads (224+errno)<<8, e.g. 59904
   # for ENAMETOECOPY-free plain EIO(5) -> 229<<8 = 58880. A clean run is 5<<8 = 1280.
+  # Round 124 came back and none of the four readings matched: the panel carries `[clover] b` -- the
+  # deliberate no-newline label, so the digit that should have followed on the same row never did -- then
+  # five more clean A lines, then the round123 wedge verbatim at `[clover] el0 mach: msg=`. No prober
+  # line, because the parent is still blocked in wait4(B). So the console is NOT dead for every writer: a
+  # second process reached it, and A kept reserving ring space after B's last glyph. Read the deadline's
+  # second frame anyway -- it costs nothing but 18 minutes and is the only way to make "B produced no
+  # digit" permanent.
+  # Why that is the whole answer this round can give: the source (out/feeds/xnu-0b4b910d) leaves exactly
+  # two tty parks, ttwrite's "ttydcd" (tty.c:2489, timo=0) and "ttywri" (:2656, timo=tp->t_timeout which
+  # nothing ever sets -- the sole writer is TIOCSDRAINWAIT at :1603, and this tree spells it that way, not
+  # TIOCSTIME), and ttysleep() is msleep0(chan, &tp->t_lock, ...) so BOTH drop the tty lock, which is the
+  # only shape where one writer hangs forever while others write. km.c has no ttwwakeup()/ttwakeup() at
+  # all, so nothing in the drain path ever wakes the watermark sleeper. The console layer cannot be where
+  # B stopped: console_write runs entirely inside kmwrite's tty_lock, so a B parked on flush_lock would
+  # have locked A out, and A wrote five more lines. Note hiwat computes to 1440 while ttymalloc gives
+  # t_outq TTYCLSIZE=1024 bytes, so tty.c:2541's `c_cc > hiwat` can never fire and `overfull:` needs a
+  # genuinely undrained 1024-byte queue -- which the panel cannot count. That is why round125 stops
+  # probing from EL0 (no time source: yield is nosys, PL0VCTEN off, select deadlines never fire) and has
+  # the watchdog's panic screen print ring.len/used/nreserved, disableConsoleOutput/console_suspended and
+  # km_tty[0]'s t_state/c_cc/lowat/hiwat/timeout at the deadline. TS_SO_OLOWAT with c_cc at 1024 means the
+  # missing ttwwakeup is the root cause; used==len with nreserved>0 means the console locks are. Also
+  # unmeasured and load-bearing: how many CPUs are online here -- the `while (nreserved > 0) cpu_pause()`
+  # spin in console_ring_try_empty() is only a candidate on a second core.
   "armcpu-clock-panic=60000",
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
-  # the multi-core case, and this board runs one CPU (no sheng-smp), while the driver's
+  # the multi-core case, and this board has never had its online-CPU count measured (round70's panel
+  # read as the child being picked up by a second core, so "one CPU" below is an assumption, not a
+  # reading), while the driver's
   # software-IPI SPI numbers are hardcoded at 1008..1015 -- tb128fu had to move its base
   # to 536 because its GIC implements fewer INTIDs. typer= on the panic screen is this
   # board's GICD_TYPER, and until it is read, 1008 is a guess.

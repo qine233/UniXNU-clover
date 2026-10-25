@@ -7230,6 +7230,56 @@ fastboot flash logfs /Users/zhouzhou/clover-out/round124-scratch-data.img   # 35
 
 拍两张：一张尽快，一张等看门狗那帧自己占屏（≈18 分钟）—— 本轮没有任何 `reboot(2)`，所以第二张必然有 panic 屏，它顺带给出「B 到底有没有走完」的第二个坐标。
 
+## round124 实机（第一帧）：B 的字上了屏，控制台并没有对所有人废
+
+倒数第七行不在四值里，也不在两支预设的分支里。逐字（尽快拍的那一张，尾部九行，上面是引导自己的日志）：
+
+```
+[clover] el0 init: pid=1 console fd=0 pagesize=4096
+[clover] el0 init: forked pid=2 x1=0
+[clover] el0 child: alive
+[clover] b[clover] el0 child: pid=2 ppid=1 x0=2 x1=1
+[clover] el0 child: exec /sbin/launchd
+[clover] el0 init: pid=2 console fd=1 pagesize=4096
+[clover] el0 mach: thread=259 task=515 host=771
+[clover] el0 mach: reply=1827
+[clover] el0 mach: msg=▮
+```
+
+身份先钉死：`[clover] b` 这十个字节只写在 round124 的 `_prober` 里，round123 及之前没有任何路径能产出它；而 `el0 init: pid=2 console fd=1` 这行证明 exec 过得了 AMFI —— 它跑的就是 `efb2cd85…` 那份 logfs 根镜像，`53d1583f…` 那颗 `cache` 里的信任缓存（只有 32508dc5… 一份）认的就是它。所以这张照片读的是本轮的字节，不是残留。
+
+四值一支都没中。屏上有一个 `b`（无编号、无换行，因为 `_prober_mark` 故意不带 `\n`，等 `_print_line` 补上），没有 `b2`…`b24`，也没有父亲的 `prober status=`；而 A 在 `b` 之后**又成功写出了五行**，最后落在 round123 那个一模一样的位置 `[clover] el0 mach: msg=`，编号不出。
+
+于是本轮的主问题有了答案，而且是负的那个：**控制台没有对所有人废**。B 被创建、被调度、写进了屏幕，父亲和 A 也照写不误；卡住的是**那一次调用**，不是那台设备。
+
+接着读源码，把「一次 write 卡死而别人照写」这件事在 `bsd/dev/arm/km.c` + `bsd/kern/tty.c` + `osfmk/console/serial_console.c` 里钉出三种可能的落点（树是 `out/feeds/xnu-0b4b910d`）：
+
+1. **tty 层有两处睡眠，两处都永久，且两处都释放 tty 锁。** `ttwrite` 进来先查载体：`TS_CONNECTED` 不在就 `ttysleep(tp, TSA_CARR_ON(tp), TTIPRI|PCATCH, "ttydcd", 0)`（tty.c:2489，`timo=0`）；写满出队再查水位：`ttysleep(tp, TSA_OLOWAT(tp), TTOPRI|PCATCH, "ttywri", tp->t_timeout)`（tty.c:2656）。而 `ttysleep` = `msleep0(chan, &tp->t_lock, …)`，**睡着的时候锁是放开的** —— 这正是「一个人永久卡住、其他人照样写得动」唯一能成立的形状。
+2. **这两处睡眠都没人喊醒。** 出队唤醒只发生在 `ttwwakeup()`（tty.c:2897，条件 `TS_SO_OLOWAT && c_cc <= t_lowat`），全树的调用点只有三处：`ttyioctl_locked` 的 TIOCSETA/CLOCAL 跳变（:1340，km 走不到 —— `kmioctl` 在拷入前把 CLOCAL 强行或进用户结构，而 `kmopen` 早就把 `t_cflag` 设成 `CREAD|CS8|CLOCAL`）、`ttyflush(FWRITE)`（:1888）、`ttymodem(tp, 1)`（:2054，km 从不调用）。**`km.c` 里一个 `ttwwakeup`/`ttwakeup` 都没有**，`kmoutput` 排空出队之后只 `(*linesw[t_line].l_start)(tp)`。所以进了 `ttywri` 就出不来。
+3. **`tp->t_timeout` 恒为 0。** 全树唯一给它赋值的地方是 `TIOCSDRAINWAIT`（tty.c:1603，`*(int*)data * hz`；顺带 `wakeup(TSA_OCOMPLETE)` + `wakeup(TSA_OLOWAT)`），本板没人发过这颗 ioctl —— 上一轮笔记里我把它记成了 `TIOCSTIME`，本树的 spelled 名字是 `TIOCSDRAINWAIT` = `_IOW('t', 87, int)`。`ttymalloc` 用 `Z_ZERO` 清零，所以 `timo=0`，`msleep0` 就是无期限。
+
+水位这几个数也顺手算了出来（免得下次再猜）：`kmopen` 把 `t_ospeed = TTYDEF_SPEED`（9600），`ttsetwater` 于是给出 `cps = 960`、`t_lowat = CLAMP(480, 256, 32) = 256`、`t_hiwat = roundup(1440, CBSIZE) = 1440`；而 `ttymalloc` 给 `t_outq` 只 `clalloc(…, TTYCLSIZE=1024, 0)`。**`hiwat(1440) > 出队容量(1024)`，所以 tty.c:2541 那句 `c_cc > hiwat` 永远不成立，进 `overfull:` 只能靠 `b_to_q` 在 1024 字节的出队塞满时返回非零。** 换句话说：`ttywri` 这一支要有 1024 字节没排空才会触发，本轮屏上总共才几十字节 —— 除非排空动作本身没发生（`kmstart` 见 `TS_TIMEOUT|TS_BUSY|TS_TTSTOP` 就 `goto out`）。这条留给下一轮的数字去判，不在这张照片里。
+
+console 层反过来支持「不是它」：`console_write`（serial_console.c:524）**从不为硬件阻塞** —— 它把字塞进 ring，末尾只做一次 `if (get_preemption_level() == 0) console_ring_try_empty(true);` 的 fail-fast 冲刷；ring 满才进 `while (reserve == NULL) { if (preempt != 0) return; console_ring_try_empty(false); }`，而 `try_empty(false)` 会 `lck_mtx_lock(&flush_lock)` 真睡。**关键：这一条整段都跑在 `tty_lock(tp)` 里面**（`kmwrite` 持锁不放）。所以如果 B 卡在 console 层，它是**带着 tty 锁睡的**，A 的下一颗 write 就绝对进不去 —— 而 A 明明又写了五行。加上 ring 的落屏顺序就是各次 reserve 的先后（屏上画的是被排空过的字节，不是「已返回的 write」，这一点本身是个坑），`b` 之后 A 能连着 reserve 五次，就证明 B 当时既不持 tty 锁、也不持 flush_lock。**B 的第二次 write 要么睡在 tty 那两处（放开锁的睡眠）里，要么根本没再被调度 —— 这张照片分不开这两支。**
+
+A 的位置仍是 round123 的那个位置、形状一字不差（`msg=` 上了屏、编号不出），这条已经复现四轮，可以当常量用。
+
+### 为什么下一刀不能再用 EL0 探针切
+
+本来想得很美：让 B 发一颗 `ioctl(1, TIOCSDRAINWAIT, &secs)` —— 它既需要 `tty_lock`（能测锁的活性），又会 `wakeup(TSA_OLOWAT)` 并给 `t_timeout` 装上期限（既能喊醒睡在 `ttywri` 的人，又让以后每次那种睡最多数秒就带着 EIO 回来）。三支读数干净利落。
+
+**但它排不过去。** 探针必须发生在 A 卡住**之后**，而 EL0 没有任何可靠的时间源：`sched_yield` 是 `nosys`，`mrs cntvct_el0` 要 `CNTKCTL_EL1.PL0VCTEN`（本板没走到 `_enable_timebase_event_stream()`），`select` 的 deadline 从不触发（round77 证过），自旋 N 次要多久更是无从标定 —— 赌赢了多一个读数，赌输了整颗白刷。B 自己又是那种「第一行写完就没了」的状态，连把读数带出来的机会都没有。
+
+于是 round125 换成内核侧一刀，而且**仍是一题**：看门狗在 60000 tick 占屏这件事已经复现两轮，panic 屏又是直写帧缓冲、不经被试的控制台的通道。就让它在那一刻把这几个字打出来：
+
+- `console_ring.len / used / nreserved` —— ring 满不满、有没有人 reserved 之后再没归还（>0 且 used 不减 = console 层卡死）。
+- `disableConsoleOutput / console_suspended` —— 是不是有人在把字**静默丢掉**（`console_write` 有两处直接 `return` 的丢字出口：`disableConsoleOutput` 和 `get_preemption_level() != 0`）。
+- `km_tty[0]->t_state / t_outq.c_cc / t_lowat / t_hiwat / t_timeout` —— 有没有 `TS_SO_OLOWAT`、`TS_BUSY`、`TS_CONNECTED`，出队到底攒了多少字节。
+
+两行读数互斥：`t_state` 带 `TS_SO_OLOWAT` 且 `c_cc` 顶着 1024 ⇒ 上面第 2、3 条（km.c 漏 `ttwwakeup` + `t_timeout=0`）就是根因，修法是驱动排空后补一次 `ttwwakeup()`；`ring.used == len` 且 `nreserved > 0` ⇒ 根因在 console 层的锁，tty 那两处睡眠是无辜的。
+
+第二帧（本轮同一次启动，等到 ≈18 分钟看门狗占屏）仍值得拍：它只补一个坐标 —— B 的沉默是不是永久的。不拍也不影响 round125 的读数。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
