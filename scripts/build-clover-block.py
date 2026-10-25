@@ -46,6 +46,7 @@ BASE_ALIASES = {
 EMMC_IMPORTS = {
     '_clover_emmc_block_ready',
     '_clover_emmc_block_sectors',
+    '_clover_emmc_block_window',
     '_clover_emmc_block_read',
     '_clover_emmc_block_write',
 }

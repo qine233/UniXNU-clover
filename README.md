@@ -7432,6 +7432,95 @@ fastboot flash cache /Users/zhouzhou/clover-out/round126-payload.img
 
 冷刷，不用 `fastboot boot`。开机认出菜单第一行的 `clover r126:`，然后**几十秒内**就该看到答案：屏上是 `userspace panic: clover-el0: after fstat` 还是 `exit status <64+e>`；两个都没有才需要等到 ≈18 分钟的看门狗那一帧（那一帧仍然读 round125 那六行，顺便验证 `elr` 是否跟着镜像移到了 `0xc40`）。拍照注意：panic 块连标题占 19 行，会把屏上半截旧日志和 EL0 尾部盖掉，所以第一帧（引导日志停在哪儿的那张）也顺手拍。
 
+## v0.2.99（round127）：把媒体换成 logfs 那 8 MiB，问 apfs 能爬到多深
+
+一刷一个问题，这一轮问的不是根，是文件系统：Apple 自己的 `com.apple.filesystems.apfs`
+能不能 attach 到 `drivers/CloverBlock` 发布的那颗 `IOMedia`，读到一个容器超级块，并一路爬到
+「发布出一个卷」。答案照旧画在 panic 屏上，因为 round125 已经证明 console 那一刻是空的。
+
+三处改动：
+
+1. `scripts/make-clover-apfs-container.py`（新）用宿主的 `diskutil apfs createContainer` 造一份
+   恰好 8388608 字节（= logfs 的 16384 扇区）的裸容器：容器从镜像第 0 字节开始，超级块 `NXSB`
+   落在 0x20，块大小 4096、块数 2048，一个卷 `CLOVER127` 里放一个 `MARKER.txt`。这份字节就是
+   Apple 的 kext 预期看到的字节，不是本移植手搓的。APFS 容器里带自己的 UUID 与时间戳，每重造
+   一次字节都不同，所以 sha 不钉在板级文件里，而是每次由脚本写进 `build/clover-apfs/report.json`；
+   本轮要刷的那份是 `~/clover-out/round127-logfs.img`，sha256 `9a362cdc…`。
+2. `drivers/CloverSdhci` 把窗口端出来：mode 14 那条 GPT 表项走查里，一旦表项 39 恰好是
+   `12320768..12337151`（round101 从卡上自己读到的那段，也是 mode 16-20 写 logfs 时把的那道门），
+   就把首 LBA 与扇区数 release-store 进 `gBlockWindow*`，新导出的 `clover_emmc_block_window(&first,
+   &sectors)` 让 CloverBlock 取走；不匹配就两个字保持 0。顺带把 `gBlockGuard` 从「有人占着就直接
+   返回失败」改成最多等 2 秒的交接：文件系统会把读并发派发下来，一次被拒的读对它是挂载失败，
+   不是「待会儿再来」。
+3. `drivers/CloverBlock` 把描述的几何换成窗口：`mediaSectors()`/`reportMaxValidBlock()` 报 16384
+   而不是整卡，`doAsyncReadWrite` 给每个块号加上 `gWindowFirst` —— 于是媒体的第 0 字节就是 logfs
+   的第 0 块，也就是那个容器超级块。卡上的 GPT 一个字没动，也没有事后属性手术（匹配发生在媒体
+   注册的那一刻，round115 那棵手工第二树就是死在 EEXIST 上的）。步骤改成 1b 解析 `clover-apfs=1`
+   并闩窗、4 之后走 4b 的 `apfsProbe`；步骤 5-9（找 `disk0s39`、改名 `md0s39`）只在没带这个参数时
+   照跑，round118-121 那条路随时可复现。
+
+`apfsProbe` 就是本轮的全部，而且它不返回：先 `whole->open(..., kIOStorageAccessReader)` 读媒体的
+第 0 块、`memcmp` 0x20 处的 `NXSB`（`m=`），然后 `close` —— 容器方案要 open 它的 provider，探针
+不能占着自己的租约去量它；接着 `OSKextLoadKextWithIdentifier("com.apple.filesystems.apfs")`（`l=`），
+这个 kext 和 IOStorageFamily 一样在 boot kext collection 里而不在链接好的内核里，加载它同时也就是
+给它的 personality 排匹配；最后把读写计数清零，3000 次 × `IOSleep(10)` = 30 秒轮询 `whole` 在
+`gIOServicePlane` 上的后代（深度 ≤ 4、每层 ≤ 64），`metaCast` 三个类名
+`AppleAPFSContainerScheme` / `AppleAPFSContainer` / `AppleAPFSVolume`。挂在这个媒体下面的服务
+按构造就是挂在**这块盘**上的，不需要匹配字典（也就没有 round116 那次双释放），也不需要跟别人
+比 provider。用轮询而不是 `waitForService`：要等的这次 attach 正是由当前正在跑的配置机械执行的，
+把控制权交回去是唯一不阻塞自己的办法。30 秒相对看门狗很宽：round119 十次一秒等待烧掉
+`ticks=0xb0c` ⇒ 一个 tick ≈ 3.5 ms ⇒ 60000 tick ≈ 210 秒。
+
+`Whole=Yes` 这条依据是在宿主上验过的：`ioreg -l -c IOMedia` 里那颗没有分区图的整媒体带
+`Whole=Yes`，而 apfs.kext 的 `AppleAPFSContainerSchemeWholeDisk` personality 就是
+`IOPropertyMatch {"Whole"=Yes}`、`IOProbeScore` 2000；`IOBlockStorageDriver` 在这里合成的 `IOMedia`
+本来就带这个字。`emit_prelink.py` 的 root 列表里也一直有 `com.apple.filesystems.apfs`。
+
+根这一轮退回 `rd=md0`：本轮不在乎根挂在哪儿，在乎活到 CloverBlock 跑完；挂着窗口去 `rd=md0s39`
+只会让 `IOFindBSDRoot` 的十次等待全部落空、死在 `IOKitBSDInit.cpp:984`。`scripts/check-clover.py`
+现在同时断言 `rd=md0`、禁止 `rd=md0s39` 与 `rd=disk0s39`、并且 `clover-apfs=1` 必须和
+`clover-emmc=21` 同时在场。
+
+```
+cd ~/UniXNU-clover && python3.13 scripts/make-clover-apfs-container.py   # 8388608 B + report.json
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && scripts/verify-clover-payload.py
+```
+
+`build kernel` 这一轮是必须的：两个驱动都归 `[kernel] archives` 管，只重打 payload 会用上一轮的
+`.a`。本轮链接出的内核 sha256 `5514f6df…`（本地）/ 卷内 `82a84dd1…`（打补丁后，探针偏移 6680 字节
+分布在 35 段里，其余逐字节相同）；`scripts/verify-clover-payload.py` 新加一格
+`kernel.macho: CloverBlock linked`，查 `clover-apfs`、`CloverBlock r127: apfs`、
+`AppleAPFSContainerScheme`、`_clover_emmc_block_window`、`_clover_block_run` 五个字都在卷内内核里，
+和 `check_sdhci` 一样是对「链没链进来」的独立证明。EL0 根镜像与信任缓存这轮没动，仍是
+`614b8356…` / `c3ed2152…`。归档在 `~/clover-out/round127-*`（`round127-SHA256SUMS`，另加
+`round127-logfs.img` 与 `round127-apfs-report.json`）。
+
+**本轮刷两格：`logfs`（第 39 格，换成 8 MiB APFS 容器 —— 这会盖掉 round121 之后写进那格的根镜像，
+本轮根走 `rd=md0`，不需要它）和 `cache`（负载）。** 两条命令都写 eMMC 分区，请你自己确认后执行；
+boot 仍不碰（还是 round87 那份）：
+
+```
+fastboot flash logfs /Users/zhouzhou/clover-out/round127-logfs.img   # 8388608 B，9a362cdc…
+fastboot flash cache /Users/zhouzhou/clover-out/round127-payload.img  # 56 MiB，260648eb…
+```
+
+冷刷，不用 `fastboot boot`。菜单第一行应认得 `clover r127: apfs attaches to the logfs window`。
+答案在 CloverBlock 那一步，几十秒内就该上屏，一行读数各字段：
+
+- `CloverBlock r127: window 0` —— 卡自己报的表项 39 不是 `12320768..12337151`，窗口不存在。
+- `CloverBlock r127: first-read <IOReturn>` —— 媒体的第 0 块读不出来，块路径本身有问题。
+- `apfs f=<first> n=<sectors> m=0 …` —— 读出来了但 0x20 处不是 `NXSB`：窗口起点或镜像不对。
+- `l=` 非 0 —— apfs.kext 没加载起来，后面 `s/c/v` 全 0 是必然结果，不是 apfs 的失败。
+- `d>`0 而 `s=0` —— 有服务挂上了这颗媒体，但不是 apfs（或 apfs 停在 scheme 之前）。
+- `s=1 c=0 v=0` —— 容器方案 attach 上了，读不到或不认这个容器。
+- `v=1` —— 通了，卷都出来了（等待会提前结束，`r=` 是它读过的块数）。
+- `r=`/`w=` —— 那 30 秒里存储栈经过这颗媒体读/写了多少块；全 0 说明 attach 之后根本没人来读。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -7473,10 +7562,12 @@ fastboot flash cache /Users/zhouzhou/clover-out/round126-payload.img
   缺 `clover-emmc` 改为 panic、块栈每个阶段先打一行标记（见上一节）。这些轮次量的是
   「固件留下的 SDHCI 窗口活不活、
   卡还答不答、在哪个地址答、时钟是不是还在移命令、数据阶段能不能自己走完」。
-  根设备因此仍然不走磁盘：`v0.2.35` 用
-  `rd=md0` 把 payload 里的 initrd 变成内存盘，
-  再由 mockfs 把它当作整个 `/`，`root-matching` 那条 UUID 匹配表还留在
-  `/chosen` 里（`rd=md0` 会在等待循环之前就 `goto iofrootx`，所以它不参与）。
+  根设备目前不从磁盘挂：`v0.2.35` 用
+  `rd=md0` 把 payload 里的 initrd 变成内存盘，再由 mockfs 把它当作整个 `/`。
+  `root-matching` 已经从 `/chosen` 删掉（round120；它会赢下与 `rd=` 的竞争，
+  `scripts/check-clover.py` 现在反向断言它缺席）。round119-121 试过把根指向 eMMC
+  上的 `disk0s39`/`md0s39` 并真的挂上了，round127 为了让 CloverBlock 跑到 apfs
+  探针把根改回 `rd=md0`。
 - **没有 GPU。** `NativeAdreno` 面向 Adreno 740；这块板子是 Adreno 512。
   所以显示栈缺席，`scripts/build-clover-display-stub.py` 只提供
   DEVELOPMENT-only XNU 补丁无条件调用的那一个空符号。首次启动的目标是 UEFI

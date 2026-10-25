@@ -533,6 +533,9 @@ def check_board(errors: list) -> str:
     # IOFindBSDRoot's memory-device shortcut (rdBootVar[3] == 0 at :849) still rejects it and the
     # BSD-name branch at :888 still numbers the root from the media's own properties. mdevadd(-1,
     # ..., 0) at :843 takes its unit explicitly, so the placeholder ramdisk is unaffected.
+    # Since round127 it is md0 again, for a reason that has nothing to do with authentication: the
+    # same driver now describes logfs's own window under clover-apfs=1, so no IOGUIDPartitionScheme
+    # runs over it, no disk0s39 is ever named, and a root that asked for one would only time out.
     # The pinned trust cache carries the init program's cdhash so exec can validate it whatever the
     # backing device is. A packed placeholder would mean the Data-seed shape instead, which needs
     # NativeRamBlock.
@@ -543,18 +546,33 @@ def check_board(errors: list) -> str:
     if adt.get("root_match_volume_uuid"):
         errors.append('[payload.adt] root_match_volume_uuid is set: the generator would emit '
                       '/chosen/root-matching, IOFindBSDRoot would wait on that dictionary and '
-                      'never read rd=md0s39 -- the round119 panic')
+                      'never read rd= at all -- the round119 panic')
     if adt.get("packed_data_ramdisk"):
         errors.append("[payload.adt] packed_data_ramdisk is true, but this board's root is the "
                       "dense mockfs image; the payload step would emit PackedRAMDisk")
-    if "rd=md0s39" not in board["payload"]["kernel_args"]:
-        errors.append('[payload] kernel_args has no rd=md0s39: round121 asks whether the boot runs '
-                      'past bsd_init.c:1098 once the name prefix skips rootauth, and that needs the '
-                      'alias CloverBlock step 9 writes -- rd=disk0s39 gets authenticated again, '
-                      'rd=md0 takes the memory-device shortcut off the RAMDisk')
-    if "rd=disk0s39" in board["payload"]["kernel_args"]:
-        errors.append('[payload] rd=disk0s39 is round120: the root mounted there and died at the '
-                      'seal check, so the argument must have moved to the md0s39 alias')
+    # Round127 asks a different question of the same media, and the answer is on the other side of a
+    # window: drivers/CloverBlock now describes logfs's own partition, whose block zero is an APFS
+    # container superblock instead of a GPT header, so IOGUIDPartitionScheme publishes no disk0s39
+    # under it and the alias step 9 used to write never happens. The root therefore goes back to the
+    # RAMDisk the payload carries, which is the shape every round up to 118 booted with, and stays
+    # out of the way of the probe. Both eMMC-named arguments are refused, because either one would
+    # spend ten timeouts and panic in IOKitBSDInit.cpp:984 before the depth is reported.
+    if "rd=md0" not in board["payload"]["kernel_args"]:
+        errors.append('[payload] kernel_args has no rd=md0: round127 wants the RAMDisk root, because '
+                      'the window CloverBlock publishes has no partition table under it and nothing '
+                      'named disk0s39 or md0s39 exists to mount')
+    for retired in ("rd=md0s39", "rd=disk0s39"):
+        if retired in board["payload"]["kernel_args"]:
+            errors.append(f'[payload] {retired} names a media that only the whole-card description '
+                          'publishes; round127 re-scopes it to logfs\'s window, so that root search '
+                          'would time out')
+    if "clover-apfs=1" not in board["payload"]["kernel_args"]:
+        errors.append('[payload] kernel_args has no clover-apfs=1: without it CloverBlock keeps the '
+                      'whole-card geometry and never reaches the apfs depth probe')
+    if "clover-emmc=21" not in board["payload"]["kernel_args"]:
+        errors.append('[payload] clover-apfs=1 is set but clover-emmc=21 is not: the logfs window is '
+                      "published by the same mode 21 run that reads EXT_CSD, so the probe would stop "
+                      'at "window 0"')
     if not board["payload"].get("trust_cache_sha256"):
         errors.append("[payload] trust_cache_sha256 is empty: the mockfs init program would "
                       "have no offline trust, and the exec of /sbin/launchd is a panic")

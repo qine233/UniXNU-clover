@@ -231,10 +231,19 @@ static uint32_t gReadBlock[128];
 // count is gated on the logfs extent's last LBA: a card that does not even reach the partition
 // this port has been reading is not a geometry to hand to the storage stack.
 static uint32_t gExtCsd[128];
+static const uint32_t kLogfsFirstLba = 12320768u;
 static const uint32_t kLogfsLastLba = 12337151u;   // sysfs: start 12320768, 16384 sectors
 static volatile uint32_t gBlockReady = 0;
 static volatile uint32_t gBlockSectors = 0;
 static volatile uint32_t gBlockGuard = 0;
+// Round127's second export: the logfs partition as a window, first LBA and length, taken from the
+// GPT entry this boot read rather than from the constants above -- those two only decide whether
+// the entry is the one this port has been reading. A block device described as this window has
+// its first sector at media byte zero, which is what lets a filesystem that expects to own a whole
+// disk (APFS finds its container superblock at offset 0) attach to a partition without the card's
+// partition table being touched. Zero until the entry walk says the extent is exactly right.
+static volatile uint32_t gBlockWindowFirst = 0;
+static volatile uint32_t gBlockWindowSectors = 0;
 
 // Mode 17 stores the report as text, so the first bytes of the block identify it when read on
 // another OS. The newline is part of the stored length: the block reads as a small text file.
@@ -963,6 +972,47 @@ extern "C" uint32_t clover_emmc_block_sectors (void)
   return __atomic_load_n (&gBlockSectors, __ATOMIC_ACQUIRE);
 }
 
+// The window drivers/CloverBlock can instead describe: logfs's own first LBA and sector count, or
+// zero when the card's GPT entry 39 is not the extent this port reads. A caller that takes this
+// geometry has to add `first` to every block number it hands to clover_emmc_block_read, which the
+// caller does and this function deliberately does not.
+extern "C" void clover_emmc_block_window (uint32_t *first, uint32_t *sectors)
+{
+  if (first) {
+    *first = __atomic_load_n (&gBlockWindowFirst, __ATOMIC_ACQUIRE);
+  }
+  if (sectors) {
+    *sectors = __atomic_load_n (&gBlockWindowSectors, __ATOMIC_ACQUIRE);
+  }
+}
+
+// One command engine and one FIFO: the guard has to be held for the whole request. What changed for
+// round127 is the second caller's fate. It used to be refused, and a refused read is not a retry
+// for a filesystem -- it is a mount failure -- so it waits now. The wait is bounded by the same
+// two-second counter deadline the request itself gets, because a host stuck on someone else's
+// transfer has to stay a timeout rather than become a hang, and no timer runs here to wake anyone.
+// On success the caller gets the tick to measure its own deadline from, after the wait.
+static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start)
+{
+  frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint64_t handover = frequency * 2ULL;
+  const uint64_t waitStart = readCounter ();
+  for (;;) {
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n (&gBlockGuard, &expected, 1u, false,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      start = readCounter ();
+      return true;
+    }
+    if (readCounter () - waitStart > handover) {
+      return false;
+    }
+  }
+}
+
 extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint32_t blocks)
 {
   if (!words || !blocks) {
@@ -973,17 +1023,12 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
       lba >= sectors || blocks > sectors - lba) {
     return 0;
   }
-  uint32_t expected = 0;
-  if (!__atomic_compare_exchange_n (&gBlockGuard, &expected, 1u, false,
-                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+  uint64_t frequency = 0;
+  uint64_t start = 0;
+  if (!acquireBlockGuard (frequency, start)) {
     return 0;
   }
-  uint64_t frequency = counterFrequency ();
-  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
-    frequency = 19200000ULL;
-  }
   const uint64_t deadline = frequency * 2ULL;   // 2 s for the whole request
-  const uint64_t start = readCounter ();
   uint32_t done = 0;
   for (; done < blocks; done++) {
     if (readCounter () - start > deadline) {
@@ -1073,9 +1118,10 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
   return (status & SDHCI_INT_DATA_END) && wordCount == kBlockWords;
 }
 
-// The write half of the pair above. Same gate: ready, measured geometry, one caller at a time,
-// and the counter deadline, because at this point in boot no scheduler timer will rescue a
-// stuck host. Callers hand it whole 512-byte blocks; nothing here touches the logfs format.
+// The write half of the pair above. Same gate: ready, measured geometry, one caller at a time with
+// the same bounded hand-over, and the counter deadline, because at this point in boot no scheduler
+// timer will rescue a stuck host. Callers hand it whole 512-byte blocks; nothing here touches the
+// logfs format.
 extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words, uint32_t blocks)
 {
   if (!words || !blocks) {
@@ -1086,17 +1132,12 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
       lba >= sectors || blocks > sectors - lba) {
     return 0;
   }
-  uint32_t expected = 0;
-  if (!__atomic_compare_exchange_n (&gBlockGuard, &expected, 1u, false,
-                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+  uint64_t frequency = 0;
+  uint64_t start = 0;
+  if (!acquireBlockGuard (frequency, start)) {
     return 0;
   }
-  uint64_t frequency = counterFrequency ();
-  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
-    frequency = 19200000ULL;
-  }
   const uint64_t deadline = frequency * 2ULL;
-  const uint64_t start = readCounter ();
   uint32_t done = 0;
   for (; done < blocks; done++) {
     if (readCounter () - start > deadline) {
@@ -2369,6 +2410,16 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                 break;
               }
             }
+          }
+          // The window for drivers/CloverBlock round127, taken from the entry this boot read. The
+          // two constants decide nothing about the geometry: they only refuse a card whose entry 39
+          // is not the extent every logfs round above has been reading, which would make the media
+          // and the partition table disagree about where the filesystem starts.
+          if (entryFound14 != 0 && entryFirst14 == kLogfsFirstLba &&
+              entryLast14 == kLogfsLastLba) {
+            __atomic_store_n (&gBlockWindowFirst, entryFirst14, __ATOMIC_RELEASE);
+            __atomic_store_n (&gBlockWindowSectors, entryLast14 - entryFirst14 + 1,
+                              __ATOMIC_RELEASE);
           }
           if (probeMode == 16 && entryFound14 != 0) {
             // Writing into logfs is the step this whole chain has been for: the block carries

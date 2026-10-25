@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r126: fstat64 on the wedged console fd"
+title = "clover r127: apfs attaches to the logfs window"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1079,7 +1079,30 @@ kernel_args = [
   # flash reported `Sending 'logfs' (34 KB) OKAY` / `Writing 'logfs' OKAY` beside a
   # `Warning: skip copying logfs image avb footer (logfs partition size: 0, …)` that is that missing size
   # entry, not a failed write. "getvar has no such partition" cannot be used as "this partition does not exist".
-  "rd=md0s39",
+  # Round127 puts the APFS container where this partition's root image used to be, so the root goes back
+  # to the RAMDisk and the eMMC is asked a different question. `rd=md0` is the shape every round up to 118
+  # booted with: mockfs reads the initrd the payload carries (`--data-ramdisk
+  # build/clover-root/launchd.macho`), `bsd_rooted_ramdisk()` is true by the name itself rather than by
+  # step 9's alias, and EL0 runs. With `clover-apfs=1` the block device no longer describes the card -- it
+  # describes logfs's own window, so there is no GPT at its block zero, no IOGUIDPartitionScheme pass over
+  # it, and therefore no disk0s39 for `rd=md0s39` to name: that argument would spend ten timeouts and
+  # panic in `Failed to mount root device` before the probe below finished. Steps 5-9 of the run stay in
+  # the source for a boot without the argument; a boot with it stops after step 4 and reports a depth.
+  # Readings, in the order they now become distinguishable, all of them drawn on the panic screen:
+  #   `CloverBlock r127: window 0` = the card's GPT entry 39 was not the extent drivers/CloverSdhci
+  #     publishes, so nothing was described (the same gate every logfs round uses);
+  #   `CloverBlock r127: first-read <IOReturn>` = the window's block zero could not be read through
+  #     IOMedia at all -- a block-stack failure, not an APFS one;
+  #   `... m=0 ...` = it read cleanly and is not a container: the flash did not land, or the geometry is
+  #     offset by something;
+  #   `... l=<nonzero> ...` = apfs.kext would not load from the boot kext collection, so the depth below
+  #     it cannot mean anything;
+  #   `... s=0` = the container scheme never attached to this media;
+  #   `... s=1 c=0 v=0` = it attached and read the superblock but the container did not parse -- which
+  #     blocks, and how many bytes were served, is `r=`;
+  #   `... v=1` = a volume object exists, i.e. Apple's own filesystem found a mountable volume on a
+  #     device this port wrote by hand. That is the pass line for an iOS boot.
+  "rd=md0",
   # Round 72 died with SIGKILL (parent's wait4 read status 9) inside its first
   # mach_msg; round 73 bracketed that call with markers and added this boot-arg,
   # and the panel looked exactly the same: presend, no send=. So the boot-arg did
@@ -1500,14 +1523,44 @@ kernel_args = [
   # re-matches the alias through a fresh IOBSDNameMatching dictionary, which must resolve to the same
   # object. Nothing else in the run changes: steps 1-8 still look the partition up as disk0s39 and still
   # measure major 1 minor 39, so a step-9 failure cannot be mistaken for a block-stack failure.
-  # One line on success, "CloverBlock r121: auto p=<n> disk0s39>md0s39 <maj>:<min> bd=1 map=1 fires=<k>"
-  # (fires=1 on the run that succeeded); each refire prints "CloverBlock r121: refire n=<k> (already
-  # ran)". Every failure panics as "CloverBlock r121: <step> <value>", where "alias", "alias-read" and
+  # One line on success, "CloverBlock r127: auto p=<n> disk0s39>md0s39 <maj>:<min> bd=1 map=1 fires=<k>"
+  # (fires=1 on the run that succeeded); each refire prints "CloverBlock r127: refire n=<k> (already
+  # ran)". Every failure panics as "CloverBlock r127: <step> <value>", where "alias", "alias-read" and
   # "alias-match" are step 9's property write, its read-back, and the alias dictionary resolving to
   # something other than this media (alias-match carries the object it found). "auto <n>" means no named
   # partition appeared in time: the value is 0x10000 if the whole disk itself was named, plus the
   # number of named partitions seen. "notify 0/1" means the IOBSD matching dictionary or the
   # notification itself could not be installed. No CloverBlock line at all means it never fired.
+  # Round127 keeps every line above but only runs steps 1-4, because `clover-apfs=1` re-scopes the media
+  # to logfs's own window: first LBA 12320768 and 16384 sectors, both taken from the GPT entry this boot
+  # read (round101's `lg i=39 a=12320768 b=12337151`, the same extent modes 16-20 gate their writes on),
+  # and drivers/CloverSdhci publishes it only when that entry is exactly that extent. Byte zero of the
+  # media is then byte zero of the partition, which holds the 8 MiB bare APFS container that
+  # scripts/make-clover-apfs-container.py builds on the host (`NXSB` at 0x20, 4096-byte blocks, 2048
+  # of them, one volume named CLOVER127 with a MARKER.txt; the container carries its own UUID and
+  # timestamps, so the bytes differ on every host run -- scripts/make-clover-apfs-container.py writes
+  # the sha256 of the run this release flashed into build/clover-apfs/report.json) --
+  # built by macOS's own `diskutil apfs createContainer`, so the bytes
+  # the board reads are the bytes Apple's kext wrote, and re-attaching the same file on the host mounts
+  # it. A whole media with no partition map is what apfs.kext's `AppleAPFSContainerSchemeWholeDisk`
+  # personality matches (`IOPropertyMatch {"Whole"=Yes}`, ioreg shows it firing on such an image), and
+  # the IOMedia IOBlockStorageDriver synthesizes here already carries Whole=Yes -- so the card's own GPT
+  # is not touched, and no property has to be written after the fact (matching runs while the media
+  # registers, and round115's second hand-built tree is the EEXIST defect that taught this file to wait
+  # for the automatic pass instead of making one).
+  # What it reports is a depth, always as a panic, because the console is the channel rounds 122-126
+  # proved unusable this late: "CloverBlock r127: apfs f=<first> n=<sectors> m=<magic> l=<kext load>
+  # d=<services seen> s=<scheme> c=<container> v=<volume> r=<blocks read> w=<blocks written>". The three
+  # class names are found by walking this media's own IOService-plane descendants and metaCast-ing them
+  # (the same lookup step 4 uses for "IOMedia"), so a hit is attached to *this* disk by construction --
+  # no matching dictionary, and none of round116's double-release. The walk polls with IOSleep(10) for
+  # 30 s rather than blocking in waitForService, because the attach being waited for is done by the same
+  # configuration machinery that is running this handler. `l=` is why apfs.kext is loaded explicitly
+  # here, the way IOStorageFamily is in step 2: it lives in the boot kext collection, and nothing in this
+  # boot has a reason to ask for a filesystem on a disk that only just appeared. `r=`/`w=` reset after
+  # the probe's own read, so they are the stack above this device talking, and `w=` also says whether
+  # APFS wanted to write its container. The pass line is `v=1`.
+  "clover-apfs=1",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under

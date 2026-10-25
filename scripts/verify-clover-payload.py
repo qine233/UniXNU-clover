@@ -118,6 +118,25 @@ def check_sdhci(kernel: bytes) -> bool:
     return ok
 
 
+def check_block(kernel: bytes) -> bool:
+    """drivers/CloverBlock is the other plain archive in the link, kept alive only because
+    CloverSdhci's mode 21 tail names clover_block_run(). Round127's probe is three strings and one
+    import: the boot argument that selects the logfs window, the panic line that carries the depth,
+    the container-scheme class name it walks the registry for, and the window accessor CloverSdhci
+    has to have linked in for the geometry to exist at all. Any of the four going missing means the
+    round silently asks nothing -- the failure shape check-clover.py refuses to let the archives
+    have."""
+    label = "kernel.macho: CloverBlock linked"
+    found = {name: name.encode() in kernel
+             for name in ("clover-apfs", "CloverBlock r127: apfs",
+                          "AppleAPFSContainerScheme", "_clover_emmc_block_window",
+                          "_clover_block_run")}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def report(image: pathlib.Path) -> int:
     print(f"== {image}")
     ok = True
@@ -172,6 +191,7 @@ def report(image: pathlib.Path) -> int:
     if kernel is not None:
         ok &= check_pmgr(kernel)
         ok &= check_sdhci(kernel)
+        ok &= check_block(kernel)
     return 0 if ok else 1
 
 

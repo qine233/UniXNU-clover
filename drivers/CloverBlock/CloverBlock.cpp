@@ -81,6 +81,32 @@
 // is to ask what lies past it: the exec of /sbin/launchd should now fail on the partition's contents
 // (kern_exec.c:8104, `Process 1 exec of /sbin/launchd failed, errno N`) instead of on authentication.
 //
+// Round 127 asks a different question with the same device, and changes what the device is made to
+// describe. Apple's own apfs.kext is in this port's boot kext collection, and the only way to find
+// out whether it can attach to a device this port published, let alone mount a volume, is to hand it
+// something to attach to. It matches a whole disk
+// whose first block is a container superblock -- on a host, ioreg shows the personality
+// `IOPropertyMatch {"Whole"=Yes}` firing for an image with no partition map at all, and the
+// synthesized volume of a real container carries `Content Hint` = 41504653-... An eMMC partition
+// cannot be advertised that way after the fact: the match runs while the media registers, and
+// rewriting the card's GPT to change one entry's type GUID would move every filesystem this port
+// has been reading. So the media itself is re-scoped. drivers/CloverSdhci exports logfs's own
+// window -- first LBA and length, taken from the GPT entry this boot read, published only when that
+// entry is the extent it has always been -- and under the `clover-apfs=1` boot arg this file
+// describes exactly that window: `reportMaxValidBlock` stops at the partition, `doAsyncReadWrite`
+// adds the window's first LBA to every block number it is given. Media byte zero then is logfs
+// block zero, which is where the container image built by
+// scripts/make-clover-apfs-container.py puts its `NXSB` superblock, and Whole=Yes is what an
+// un-partitioned disk already carries. Nothing on the card's partition table changed.
+//
+// The reading is a depth, and it is panic-drawn because the console cannot be trusted this late:
+// did apfs load, did the container scheme attach to *this* media (the walk only ever descends from
+// it, so a match is by construction ours), did a container parse, did a volume get published, and
+// how many blocks did the device serve on the way. Steps 5-9 -- the disk0s39 wait, the root
+// dictionary, bdevvp, the offset map, the md0s39 rename -- are round118-121's measurements of a
+// partition-named root and cannot run against a window (there is no GPT at its block zero), so the
+// apfs branch stops after step 4's size check and reports.
+//
 // The class has to be hand-written. IOStorageFamily is loaded at runtime from the boot kext
 // collection (kernel.macho exports no IOBlockStorageDevice, IOMedia or IOBlockStorageDriver
 // symbol), so the standard OSDefineMetaClass* macros cannot be used: they would take the
@@ -97,8 +123,9 @@
 // an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
 // attached for start (startCandidate() attaches again after the matching loop's detach).
 //
-// A failure panics with one short CloverBlock r121 line naming the step; success prints one line
-// and lets the boot continue. A refire of the IOBSD notification prints one counted line and
+// A failure panics with one short CloverBlock r127 line naming the step; success prints one line
+// and lets the boot continue, except under clover-apfs=1, where the depth itself is the report and
+// the run always panics with it. A refire of the IOBSD notification prints one counted line and
 // returns, so the photograph shows both that the run completed and how many times it was offered.
 #define IOKIT_ENABLE_SHARED_PTR 1
 #include <IOKit/IOLib.h>
@@ -113,6 +140,7 @@
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSObject.h>
 #include <libkern/c++/OSSymbol.h>
+#include <pexpert/pexpert.h>
 #include <mach/kmod.h>
 
 extern "C" {
@@ -121,9 +149,11 @@ kern_return_t OSKextLoadKextWithIdentifier (const char *);
 void clover_block_static_init (void) __asm__ ("__GLOBAL__sub_I_CloverBlock.cpp");
 // Provided by drivers/CloverSdhci. `ready` is false until mode 21 has read EXT_CSD and gated the
 // sector count against the logfs extent, so the block device can never claim a geometry the
-// partition table does not describe.
+// partition table does not describe. The window is logfs's own first LBA and length, published only
+// when the GPT entry this boot read is that extent, and zero otherwise (round127).
 uint32_t clover_emmc_block_ready (void);
 uint32_t clover_emmc_block_sectors (void);
+void clover_emmc_block_window (uint32_t *first, uint32_t *sectors);
 uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint32_t blocks);
 uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words, uint32_t blocks);
 // The kernel's own block-device vnode constructor (bsd/vfs/vfs_subr.c). dev_t is the composite
@@ -143,6 +173,28 @@ static const char kBSDMinorKey[] = "BSD Minor";
 // the first test and fails the second -- rootauth gets skipped, the root still comes from the BSD-name
 // match, and the trailing s39 keeps naming the same slice the storage family named disk0s39.
 static const char kRootAlias[] = "md0s39";
+// Round127's geometry, latched from drivers/CloverSdhci's window before the device is published and
+// never touched again: zero sectors means the old whole-card description, nonzero means this device
+// *is* logfs's partition, and every block number the storage stack hands down has the window's
+// first LBA added to it before it reaches the card.
+static volatile uint32_t gWindowFirst = 0;
+static volatile uint32_t gWindowSectors = 0;
+// Blocks this device actually served. Reset after this file's own first read so what the panic line
+// reports is traffic the storage stack above it asked for, not the probe's.
+static volatile uint32_t gBlocksRead = 0;
+static volatile uint32_t gBlocksWritten = 0;
+// The APFS container superblock: nxs_magic is the fourth field of nx_super_block, 32 bytes of
+// reserved space into the 4096-byte block, and its bytes spell NXSB. Byte zero of the window is
+// byte zero of the container, which is the whole reason the window is what this round describes.
+static const uint32_t kNxsbOffset = 0x20;
+static const uint8_t kNxsbMagic[4] = { 'N', 'X', 'S', 'B' };
+static const char kApfsKext[] = "com.apple.filesystems.apfs";
+// The three classes whose appearance under this media is the depth, in the order a successful
+// attach produces them. Names are compared by metaCast, not by a matching dictionary: the walk only
+// ever descends from this media, so anything found is attached to this media by construction.
+static const char kApfsSchemeClass[] = "AppleAPFSContainerScheme";
+static const char kApfsContainerClass[] = "AppleAPFSContainer";
+static const char kApfsVolumeClass[] = "AppleAPFSVolume";
 
 // The IOBSD publish notification is delivered on the persistent gIOResources service, whose
 // doServiceMatch re-invokes every still-matching gIOPublishNotification on each pass and ignores the
@@ -338,12 +390,21 @@ IOReturn CloverBlockDevice::reportEjectability(bool *isEjectable)
   return kIOReturnSuccess;
 }
 
+// The capacity this device claims: the window under round127, the whole card otherwise. Both are
+// what the card reported to drivers/CloverSdhci, so a description here can still only be as good as
+// a measurement made on this boot.
+static uint32_t mediaSectors (void)
+{
+  uint32_t window = __atomic_load_n (&gWindowSectors, __ATOMIC_ACQUIRE);
+  return window ? window : clover_emmc_block_sectors ();
+}
+
 IOReturn CloverBlockDevice::reportMaxValidBlock(UInt64 *maxBlock)
 {
   if (!maxBlock) {
     return kIOReturnBadArgument;
   }
-  uint32_t sectors = clover_emmc_block_sectors();
+  uint32_t sectors = mediaSectors();
   if (!sectors) {
     return kIOReturnNotReady;
   }
@@ -404,7 +465,8 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
 {
   IOReturn status = kIOReturnSuccess;
   UInt64 done = 0;
-  uint32_t sectors = clover_emmc_block_sectors();
+  uint32_t sectors = mediaSectors();
+  uint32_t windowFirst = __atomic_load_n (&gWindowFirst, __ATOMIC_ACQUIRE);
   const IODirection direction = buffer ? buffer->getDirection() : kIODirectionNone;
 
   if (!buffer || (direction != kIODirectionIn && direction != kIODirectionOut)) {
@@ -418,17 +480,21 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
     }
     uint32_t words[kBlockWords];
     for (; done < nblks; done++) {
+      // The caller's block numbers are relative to what this device claims, and the card's are
+      // absolute; the window's first LBA is the only difference between the two.
+      uint32_t cardBlock = windowFirst + static_cast<uint32_t>(block + done);
       if (direction == kIODirectionOut) {
         if (buffer->readBytes(done * kBlockBytes, words, kBlockBytes) != kBlockBytes) {
           status = kIOReturnNoSpace;
           break;
         }
-        if (clover_emmc_block_write(static_cast<uint32_t>(block + done), words, 1) != 1) {
+        if (clover_emmc_block_write(cardBlock, words, 1) != 1) {
           status = kIOReturnError;
           break;
         }
+        __atomic_add_fetch(&gBlocksWritten, 1u, __ATOMIC_RELAXED);
       } else {
-        if (clover_emmc_block_read(static_cast<uint32_t>(block + done), words, 1) != 1) {
+        if (clover_emmc_block_read(cardBlock, words, 1) != 1) {
           status = kIOReturnError;
           break;
         }
@@ -436,6 +502,7 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
           status = kIOReturnNoSpace;
           break;
         }
+        __atomic_add_fetch(&gBlocksRead, 1u, __ATOMIC_RELAXED);
       }
     }
   }
@@ -504,7 +571,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r121: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r127: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 // The mask's job is done: round115 showed that the names this file wants are taken by the tree
@@ -586,6 +653,120 @@ static IOReturn readMediaBytes(IOMedia *media, IOService *client, IOMemoryDescri
   return kIOReturnSuccess;
 }
 
+// ---------------------------------------------------------------- round127's apfs depth
+
+// Every service that descends from this media in the IOService plane attached to it, so a class name
+// found here is attached to *this* disk, not to somebody else's reader: no matching dictionary (and
+// so none of round116's double-release), no provider comparison, no second tree. The three flags are
+// the depths a real attach produces in the order it produces them -- the scheme reads the container,
+// the container object parses it, a volume appears only for a filesystem it can name -- and `seen`
+// says how many services hung off the media at all, which tells "apfs never came" from "something
+// came and stopped".
+struct ApfsDepth {
+  uint32_t seen;
+  uint32_t scheme;
+  uint32_t container;
+  uint32_t volume;
+};
+
+static void measureApfsDepth(IORegistryEntry *entry, ApfsDepth *depth, uint32_t level)
+{
+  OSSharedPtr<OSIterator> children = entry->getChildIterator(gIOServicePlane);
+  if (!children.get()) {
+    return;
+  }
+  while (depth->seen < 64) {
+    OSObject *object = children->getNextObject();
+    if (!object) {
+      break;
+    }
+    IORegistryEntry *child = OSDynamicCast(IORegistryEntry, object);
+    if (!child) {
+      continue;
+    }
+    depth->seen++;
+    if (child->metaCast(kApfsSchemeClass)) {
+      depth->scheme = 1;
+    }
+    if (child->metaCast(kApfsContainerClass)) {
+      depth->container = 1;
+    }
+    if (child->metaCast(kApfsVolumeClass)) {
+      depth->volume = 1;
+    }
+    if (level < 4) {
+      measureApfsDepth(child, depth, level + 1);
+    }
+  }
+}
+
+// The whole of round127, and it never returns: the console is the thing this board cannot trust this
+// late, so the depth is drawn on the panic screen like every other reading since round121.
+__attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *client)
+{
+  // 1. Whether the container is where the window says it is, seen through IOMedia rather than
+  // through this port's own PIO: byte zero of the media is block zero of logfs, and NXSB sits 32
+  // bytes into that block.
+  OSSharedPtr<IOBufferMemoryDescriptor> first =
+      IOBufferMemoryDescriptor::withCapacity(kBlockBytes, kIODirectionIn, true);
+  if (!first.get()) {
+    fail("buffer", 0);
+  }
+  if (!whole->open(client, 0, kIOStorageAccessReader)) {
+    fail("open", 0);
+  }
+  IOReturn status = readMediaBytes(whole, client, first.get(), 0, &gMediaOp);
+  whole->close(client);
+  if (status != kIOReturnSuccess) {
+    fail("first-read", static_cast<uint32_t>(status));
+  }
+  const uint8_t *bytes = static_cast<const uint8_t *>(first->getBytesNoCopy());
+  uint32_t magic = bytes && memcmp(bytes + kNxsbOffset, kNxsbMagic, sizeof(kNxsbMagic)) == 0 ? 1u : 0u;
+
+  // 2. The media has to be free before anyone above it can claim it: the container scheme opens its
+  // provider, and a probe that still held the read open would be measuring its own lease. The close
+  // above is the last thing this file does to the media; everything below is registry traffic.
+  //
+  // apfs.kext is in the boot kext collection, not the linked kernel, exactly like IOStorageFamily --
+  // and nothing in the boot asks for a filesystem on a disk that only just appeared. Loading it is
+  // also what schedules matching for its personalities, which is why this happens before the wait.
+  kern_return_t loaded = OSKextLoadKextWithIdentifier(kApfsKext);
+
+  // 3. Poll, do not block on a semaphore: the attach this is waiting for is performed by the same
+  // configuration machinery that is running this handler, so the wait has to keep handing control
+  // back. Step 5 of the partition path has been doing exactly this since round116, and the budget
+  // here is the same shape -- 30 s at 10 ms a turn, which fits long before the tick watchdog's
+  // 60000 ticks. The counters start now, so what they report is the storage stack's traffic and not
+  // the one read taken above.
+  __atomic_store_n(&gBlocksRead, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&gBlocksWritten, 0, __ATOMIC_RELEASE);
+  ApfsDepth best = { 0, 0, 0, 0 };
+  for (uint32_t attempt = 0; attempt < 3000 && !best.volume; attempt++) {
+    ApfsDepth now = { 0, 0, 0, 0 };
+    measureApfsDepth(whole, &now, 0);
+    if (now.seen > best.seen) {
+      best.seen = now.seen;
+    }
+    if (now.scheme) {
+      best.scheme = 1;
+    }
+    if (now.container) {
+      best.container = 1;
+    }
+    if (now.volume) {
+      best.volume = 1;
+    }
+    IOSleep(10);
+  }
+
+  panic("CloverBlock r127: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u r=%u w=%u",
+        __atomic_load_n(&gWindowFirst, __ATOMIC_ACQUIRE),
+        __atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE), magic,
+        static_cast<uint32_t>(loaded), best.seen, best.scheme, best.container, best.volume,
+        __atomic_load_n(&gBlocksRead, __ATOMIC_ACQUIRE),
+        __atomic_load_n(&gBlocksWritten, __ATOMIC_ACQUIRE));
+}
+
 extern "C" void clover_block_run(void)
 {
   // 0. Latch. The IOBSD publish notification is re-delivered on the persistent gIOResources service
@@ -599,13 +780,33 @@ extern "C" void clover_block_run(void)
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    IOLog("CloverBlock r121: refire n=%u (already ran)\n", fires);
+    IOLog("CloverBlock r127: refire n=%u (already ran)\n", fires);
     return;
   }
 
   // 1. The PIO path has to be proven before anything claims a device over it.
   if (!clover_emmc_block_ready() || clover_emmc_block_sectors() == 0) {
     fail("ready", 0);
+  }
+
+  // 1b. Which geometry to describe. `clover-apfs=1` asks for logfs's own window, and the window only
+  // exists if this boot's card reported GPT entry 39 as exactly the extent drivers/CloverSdhci reads:
+  // a media that claimed a partition the partition table does not describe would be a second card,
+  // and every filesystem above it would be reading the wrong bytes. Latched here, before the device
+  // is published, because reportMaxValidBlock() is what IOBlockStorageDriver builds the media from
+  // and the size has to be right the first time anything reads it.
+  uint32_t apfs = 0;
+  if (PE_parse_boot_argn("clover-apfs", &apfs, sizeof(apfs)) && apfs) {
+    uint32_t first = 0;
+    uint32_t sectors = 0;
+    clover_emmc_block_window(&first, &sectors);
+    if (!first || !sectors) {
+      // The printed value is the sector count. Zero means the entry never matched; a matching entry with
+      // first LBA zero is not a thing a GPT can hold, so the two cases do not need separating.
+      fail("window", sectors);
+    }
+    __atomic_store_n(&gWindowFirst, first, __ATOMIC_RELEASE);
+    __atomic_store_n(&gWindowSectors, sectors, __ATOMIC_RELEASE);
   }
 
   // 2. IOStorageFamily plus the exact original class size: every override in CloverBlockDevice
@@ -647,8 +848,16 @@ extern "C" void clover_block_run(void)
   IORegistryEntry *mediaEntry = driver->getChildEntry(gIOServicePlane);
   IOMedia *whole = mediaEntry
       ? static_cast<IOMedia *>(mediaEntry->metaCast("IOMedia")) : nullptr;
-  if (!whole || whole->getSize() / kBlockBytes != clover_emmc_block_sectors()) {
+  if (!whole || whole->getSize() / kBlockBytes != mediaSectors()) {
     fail("media", 0);
+  }
+
+  // 4b. Under the window this is where the run ends, and deliberately so: steps 5-9 below are the
+  // partition-named root's measurements, and a window has no GPT at its block zero, hence no
+  // IOGUIDPartitionScheme, no disk0s39, no root dictionary and no bdevvp. What round127 is asking
+  // instead is whether Apple's own filesystem lives on top of this tree.
+  if (__atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE)) {
+    apfsProbe(whole, device);
   }
 
   // 5. The tree is not built here. The driver's own registerService() on this media is what makes
@@ -772,7 +981,7 @@ extern "C" void clover_block_run(void)
     fail("alias-match", reinterpret_cast<uint64_t>(aliasService));
   }
 
-  IOLog("CloverBlock r121: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
+  IOLog("CloverBlock r127: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
         kRootAlias, bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
 }
