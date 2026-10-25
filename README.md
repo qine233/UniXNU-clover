@@ -5837,6 +5837,106 @@ fastboot reboot
 写入经 IOMedia 完成、两块读回一致，存储栈从此是真正的读写消费者。跨启动读回
 （`b tx block write through IOMedia`）这次没有单独验证。
 
+## v0.2.84（round112）：GPT 交给 XNU 自己的分区方案，根设备走到 bdevvp
+
+round111 之后开始收仪器。`drivers/CloverBlock` 不再自己解析 GPT、不再往 `logfs` 里写记录，
+也不再维护面板读数和 512 字节报告文本；它只做一件事，把 eMMC 接进 XNU 的存储栈，然后让
+XNU 自己的代码回答“根设备在哪”。
+
+这一轮的链路（boot 仍是 `rd=md0`，不写任何分区）：
+
+1. `clover_emmc_block_ready()` 先证明 PIO 读路径可用，`CloverBlockDevice` 再作为
+   `IOBlockStorageDevice` 挂到平台上；`IOStorageFamily` 按标识符加载，类大小必须正好
+   `0x90`。
+2. 手工启动 `IOBlockStorageDriver`（round109 证明同步匹配在这条引导路径上不返回），整盘
+   `IOMedia` 的扇区数必须等于 eMMC 的扇区数。
+3. 用 `IOGUIDPartitionScheme` 对整盘做 `probe()` / `start()`：LBA 0、LBA 1 和分区表项都由
+   XNU 自己读，不再有第二份手写解析器。分区对象由 scheme 发布为子节点。
+4. 在 scheme 的子节点里找 `Partition ID == 39`（`logfs`），数出 scheme 发布的总数。
+5. 先给整盘、再给目标分区启动 `IOMediaBSDClient`；后者是正常启动时给每块盘起名的那段
+   代码，目标分区应得到 `BSD Name`、`BSD Major`、`BSD Minor`。
+6. 复现 `setconf()` 对 `rd=<bsd name>` 做的事：
+   `IOBSDNameMatching()` + `IOService::waitForService(1s)` 必须返回目标分区本身。
+7. 用 `major << 24 | minor` 调 `bdevvp()`——`vfs_mountroot()` 用的就是这个调用。它成功
+   说明 `bdevsw` 的 minor 已由 BSD 客户端登记，根挂载所需的 vnode 可以建立。
+8. 最后验证偏移映射：同一块数据，从整盘 `base` 处读一次，从分区 0 处读一次，512 字节必须
+   逐字节相同。
+
+成功时只有一行（随后继续引导到 `rd=md0` 的 EL0 init）：
+
+```text
+CloverPMGR r112: args [-v serial=3 debug=0x14e kt_fixed_zones=120 boot-progress=2
+ rd=md0 allow_legacy_mach_msg=1 armcpu-timer-intid=19 clover-pmgr=2 clover-emmc=21
+ armcpu-clock-panic=60000]
+...
+CloverBlock r112: p=<n> disk0s39 <maj>:<min> bd=1 map=1
+...
+initproc failed to start ...
+```
+
+`p=` 是 scheme 实际发布的分区数；`disk0s39` 是正常命名结果（若之前已有别的磁盘占用了锚点，
+名字会是 `disk<N>s39`，成功行会照实打印）。`bd=1` 表示 `bdevvp` 返回 0 且有 vnode，
+`map=1` 表示两次读取一致。
+
+失败一律 panic，一行一段，格式 `CloverBlock r112: <step> <value>`：
+
+| 停在哪 | 含义 |
+| --- | --- |
+| `ready` / `storage` / `abi` | PIO 未就绪、`IOStorageFamily` 未加载、类大小不是 0x90 |
+| `modload` / `postload` | 自己的 metaclass 没注册上 |
+| `device` / `attach` / `driver` / `media` | 设备、驱动或整盘 IOMedia 没起来 |
+| `gpt` / `gpt-probe <score>` / `gpt-start` | scheme 没分配到、没认出 GPT、没启动 |
+| `gpt-children` / `gpt-target <n>` | 没有子节点；或 `n` 个分区里没有 `Partition ID 39` |
+| `bsd-whole` / `bsd-root` | BSD 客户端在整盘或目标分区上没启动 |
+| `bsd-props` | 目标分区缺 `BSD Name` / `BSD Major` / `BSD Minor` |
+| `root-match <ptr>` | `IOBSDNameMatching` + `waitForService` 没返回目标分区 |
+| `bdevvp <err>` | `dev_t` 打不开，返回 XNU 的 errno |
+| `buffer` / `open-whole` / `read-whole` / `open-part` / `read-part` | 缓冲区或读路径失败，值为 IOReturn |
+| `map` | 整盘 `base` 处与分区 0 处的内容不同 |
+| 没有 `CloverPMGR r112` | 固件启动的不是这份 payload |
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| 成功行 + 走到 `initproc failed to start` | GPT 发布、BSD 命名、根设备发现、`bdevvp`、偏移映射全部由 XNU 自己验证 | 下一轮把 `rd=` 指向这个 BSD 名做真正的根挂载 |
+| 停在 `gpt-probe`，`score` 为 0 | scheme 的 `probe` 没接受整盘（GPT 读不到或 `isFormatted` 不成立） | 先按上一轮已知的 LBA 读核对整盘媒体大小 |
+| `gpt-target <n>`，`n>0` | scheme 能读表，但没有 39 号分区 | 核对哪一份 GPT 被读到 |
+| `bsd-props` | BSD 客户端启动但没写属性 | 查 `IOMediaBSDClient::start` 的返回与 `bdevsw_add` |
+| `root-match 0` | 名字匹配不到刚注册的服务 | 查 `IOBSDNameMatching` 用的名字与注册顺序 |
+| `bdevvp <err>` | 名字对，但 minor 打不开 | 按 errno 查 `bdevsw` 登记 |
+| `map` | 分区偏移映射不一致 | 查 `getBase()` 与 PIO 的 LBA 换算 |
+| 停在更早的步骤 | 存储栈出现回归 | 按 step 名回看该阶段 |
+
+产物（内核与 payload 变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round112-payload.img` | 58720256 B | `e3504615fa65b599576a165e9d094f2b335315509f5f763a1ad3b164c04d0e7b` |
+| `round112-kernel.macho`（构建产物） | 51974144 B | `6c0aa97bdf357b5bc0e526ad7adb567e4fa3b4ffc6ad5bbcb4c9204630c542ac` |
+| `round112-in-volume-kernel.macho`（卷内副本） | 51974144 B | `e524faf3e857540527a51ea6321eecda6ef42ef674a86067ac174fdbcb1a363a` |
+| `round112-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round112-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round112-kernel.macho.adt` | 13476 B | `4dfcb1239ad9e7377a9d2ad1b2d40678bf39aebd1a1319d85e995e0177e5fb61` |
+| `round112-unixnu.toml` | 579 B | `80df7ecf30bd2cb87ee2a72cf6e828a367d701d2e6eb0b242af0f3b008f5689a` |
+
+校验器：`verify-clover-payload.py` 逐文件通过（探针 35 处 6040 字节、PMGR 5 条绑定 0 位移、
+CloverSdhci 十项全在），`check-clover.py` 通过（ADT 13476 字节、8 核、splash 与 FD 不变）。
+卷内 boot-args 末尾仍是 `… clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`。两条 r112
+字符串都在卷内内核里：`CloverPMGR r112: args [%s]`、`CloverBlock r112: p=%u %s %u:%u bd=1 map=1`。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_block_write`
+`0xfffffff007971a30`、`_clover_emmc_run` `0xfffffff00797231c`、`_clover_block_run`
+`0xfffffff007992054`。boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round112-payload.img
+fastboot reboot
+```
+
+**一次刷机只回答一个问题：GPT 发布和根设备发现是否由 XNU 自己走通。** 成功行出现后，
+本轮结论就成立；下一轮才把 `rd=` 从 `md0` 换成这个 BSD 名。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
