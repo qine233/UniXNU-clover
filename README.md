@@ -6506,6 +6506,108 @@ fastboot reboot
 
 **一次刷机只回答一个问题：加了闩锁之后，`clover_block_run()` 是否只执行了一次，让注册不再撞重复类，并把 `CloverBlock r118: auto … fires=` 这条成功行留在屏幕上。** 只要这一行出现（且没有第二次 `preModLoad`），下一轮就把 `rd=` 换成 `disk0s39` 去碰真正的根挂载。
 
+## round118 读数（v0.2.90 实机）：注册只跑一次，启动第一次走到 EL0 的 mach 行
+
+这一屏没有异常面板，从上到下是一条完整的启动日志（挑出与块栈有关的部分）：
+
+```text
+[Clover] IOKitBSDInit returned
+ifnet_attach: All kernel I/O threads created for interface lo0 have been scheduled at least once, Proceeding,
+[Clover] loopattach returned
+[clover] ether_family_init returned
+skip attaching fsw to lo0 using legacy VX model(clover) net_init_run returned
+PMGR: pmgrInit done!
+AMFI: Enabling developer mode since protected data is not available
+apfs_module_start:3232: load: com.apple.filesystems.apfs, v2236.140.6, apfs-2236.140.6, 2025-07-11
+CloverBlock r118: auto p=39 disk0s39 1:39 bd=1 map=1 fires=1
+Setting up notifier for CoreAnalyticsNub
+AppleImage4: magazine(cptx): magazine data cannot be written: 30
+AppleImage4: magazine(zlns): magazine write failed; may be expected: 30
+[System Event] [Subsystem: nvmall] [Event: sync triggered
+TOUCHPANELCHandler.cpp:serialIzzeVariables:615 - No _nvramController
+TOUCHPANELCHandler.cpp:sync:894 - serializeVariables failed, ret=0x00002d0
+install_apfs_vfs_init: apfs: speculative telemetry feature ENABLED by boot-arg
+apfs_syscall_register:4007: apfs registering sysctls.
+CloverBlock r118: refire n=2 (already ran)
+Adding ramdisk device md0/rdmd0 (83886080/83886080) at FFFFFFF008395000 for 0000000000009000
+BSD root: md0, major 3, minor 0
+[clover] v4_mount returned
+[clover] devfs_kernel_mount returned
+[clover] siginit returned, execing init
+VM Swap Subsystem is ON
+load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+load_init_program: attempting to load /sbin/launchd
+[clover] el0 init: pid=1 console_fd=0 pagesize=4096
+[clover] el0 init: forked pid=2 x!=0
+[clover] el0 child: alive
+[clover] el0 child: exec /sbin/launchd
+[clover] el0 init: pid=2 console_fd=1 pagesize=4096
+[clover] el0 mach: thread=259 task=575 host=771
+[clover] el0 mach: reply=1827
+[clover] el0 mach: msg=
+```
+
+三条结论：
+
+- **闩锁按设计工作。** 成功行 `auto p=39 disk0s39 1:39 bd=1 map=1 fires=1` 打在最前面，
+  后面只有一行 `refire n=2 (already ran)`。也就是说这一趟启动里 IOBSD 通知被投了两次，
+  第一次跑完六个步骤，第二次被 CAS 挡在门外 —— round117 的第二次 `preModLoad` 从此不存在，
+  `postModLoad` 的重复类 panic 也就没有了。
+- **块栈的时间点是对的。** 两行 `CloverBlock` 都夹在 `apfs_syscall_register` 与
+  `Adding ramdisk device md0/rdmd0` 之间，也就是根设备发现阶段之内：XNU 自己在找
+  `rd=` 的时候，我们的盘已经在下面服务了。`bd=1 map=1` 说明整盘@base 与分区@0 读到的
+  那一块 512 字节逐字节相同，`bdevvp(1<<24|39)` 也拿到了 vnode。
+- **启动走到了用户态。** `siginit returned, execing init` → `load_init_program` →
+  `[clover] el0 init` → `el0 child: exec /sbin/launchd` → `el0 mach: thread/task/host`、
+  `reply=1827`，最后停在 `msg=`。这是 mockfs + `rd=md0` 那条路的已知终点，不是块栈的失败。
+
+顺带记下的既有噪声（与本轮无关，都是 sheng 板子的老面孔）：`AppleImage4: magazine … cannot
+be written: 30`、`TOUCHPANELCHandler … No _nvramController`、`nvmall sync … ret=0x00002d0`、
+`IOGPUInterruptController not registry mount at registerService()`。
+
+## v0.2.91（round119）：把根交给内核点名的那个分区
+
+只翻一个 boot-arg：`rd=md0` → `rd=disk0s39`。`CloverBlock` 的六个步骤、闩锁、日志格式一行都不动，只把身份串升到 `r119`。
+
+先确认这件事**不会自锁**。`rd=` 不是 `md?` 形状时，`IOFindBSDRoot()` 跳过 `mdevadd` 那条捷径（IOKitBSDInit.cpp:849），改用 `IOBSDNameMatching("disk0s39")`（:917）去 `waitForService()` 等（:958，超时 `ROOTDEVICETIMEOUT`，最多十次，iOS 分支十次之后 `panic("Failed to mount root device")` :984）。等的是媒体，而媒体早就在了：本驱动的 run 由 `IOKitBSDInit()` 里那句 `publishResource("IOBSD")`（:113）触发，round118 的照片已经把时序钉死 —— 两行 `CloverBlock` 都落在 `apfs_syscall_register` 与 `Adding ramdisk device md0` 之间，也就是根设备查找开始之前。所以这一趟 `waitForService` 应当立刻返回，接着打 `Got boot device = <服务路径>` 与 `BSD root: disk0s39, major 1, minor 39`，`rootdev = makedev(1, 39)`。
+
+真正被问的是**之后**那一步。`vfs_mountroot()` 对 `rootdev` 做 `bdevvp()`，然后遍历 vfstable：只有 mockfs 带 `vfc_mountroot`，于是 `mockfs_mountroot()` 用 `buf_meta_bread(rvp, 0, 4096)` 从**设备**读第一个 4096 字节（mockfs_vfsops.c:134）。这条读要穿过 specfs/缓冲区缓存/`VOP_STRATEGY`/`IOMediaBSDClient`/`IOBlockStorageDriver`，最后才是 CloverSdhci 的 PIO —— 是本板第一次做不由 `CloverBlock.cpp` 自己发起的读。round118 证过 `media->read()`（`map=1`）和 `bdevvp()` 本身（`bd=1`），唯独没证过拿到的那个 vnode 能不能读。
+
+logfs 开头**故意不放镜像**。mockfs 读不到 `N4KROOT` 魔数就退回它的 legacy 单 Mach-O 模式：`/sbin/launchd` 就是整块设备从 0 开始（`mockfs_fsnode.c:82` 把文件大小设成 `si_devsize`，也就是这 8 MiB）。挂载应当成功、exec 应当因为读到垃圾而失败 —— 这一刀正好把「根管道通了」和「那里还没有镜像」切开。镜像要写进 logfs，是破坏性操作，等它单独一轮、单独一次同意。
+
+| 屏幕上的行 | 含义 |
+| --- | --- |
+| `Got boot device = …` + `BSD root: disk0s39, major 1, minor 39` | 匹配与编号都对，`rootdev` 已经指向 eMMC 分区 |
+| `initproc failed to start … (error N)` | 根已经挂在 eMMC 上，只差镜像 —— 本轮想要的读数 |
+| `Failed to mount root device`（panic） | 根查找时媒体还不在，时序假设错了 |
+| `CloverBlock r119: <step> <value>` | 与上一轮相同，只是标签升到 `r119` |
+| 停在 `Waiting on <dict … IOMedia …>` | `rd=` 没送到内核，或名字没被发布 |
+
+产物（内核、payload、ADT、unixnu.toml 变了；root / trust cache / scratch / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round119-payload.img` | 58720256 B | `fad9ef7c6f6b21857cb125288f741705745a341b2166adfc3c8e0fa7ecbe71ac` |
+| `round119-kernel.macho`（构建产物） | 51974144 B | `4934b8ad5abd6db1046852a502800ddf1145fd27f38e6bf65b5c869a6a22934f` |
+| `round119-in-volume-kernel.macho`（卷内副本） | 51974144 B | `79f041afc1d12703f157afbd09e66534ae349180b7be8bc911141a0fd8a926bd` |
+| `round119-kernel.macho.adt` | 13476 B | `d96c13d5cdf11697646a83845439540b5d91f36fb76e0a8398b156199023fa97` |
+| `round119-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round119-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round119-unixnu.toml` | 571 B | `04d5770e8f7c0cc16847b3b0f887d45d96cf965e27d1c4478c5bef92e4d7dc8c` |
+
+校验器：`check-clover.py` 通过（ADT 13476 字节、8 核、splash `0x9d400000-0x9f800000`、FD `0x9fc00000-0x9ff00000`、`clover_defconfig`、`CLOVERESP`、模块可见），它的根契约断言这次要求的是 `rd=disk0s39`；`verify-clover-payload.py` 通过（probe 补丁只落在本地化、PMGR 绑定仍在、CloverSdhci 已链接）；`CloverBlock` 导入与 vtable 审计通过（265592 字节、190 个槽、26 个覆写）。卷内 `args` 已是 `-v serial=3 debug=0x14e kt_fixed_zones=120 boot-progress=2 rd=disk0s39 allow_legacy_mach_msg=1 armcpu-timer-intid=19 clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`；卷内内核只有 r119 字符串（4 处），没有 r118 残留。菜单标题改成「clover emmc: root on the partition the kernel named」。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_run` `0xfffffff00797231c`、`_clover_block_run` `0xfffffff007992054`、`_clover_block_request` `0xfffffff0079928e8`（与上一轮逐个相同：这轮只换了字符串，长度没变）。boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+`armcpu-clock-panic=60000` 仍然挂着，这是有意的：万一 vnode 那条读路真的挂住，它是本板唯一不受 tty 影响的报告者。round118 之后它按点到过枪 —— `ArmCpu: clock watchdog at 60000 ticks (elr=10000b3c spsr=…50 …)`，`spsr` 低 4 位是 0（EL0t）、`elr` 不是 `0xfffffff0…` 的内核地址，说明开枪时被打断的是**用户态**，也就是启动已经跑完、用户在跑。等根真挂上之后再把它摘掉。
+
+```sh
+fastboot flash cache ~/clover-out/round119-payload.img
+fastboot reboot
+```
+
+**一次刷机只回答一个问题：`bdevvp(1<<24|39)` 拿到的那个 vnode，XNU 自己读得动吗 —— 也就是 mockfs 经缓冲区缓存读 eMMC 的头 4096 字节，能不能让根挂载走完。** 看到 `initproc failed to start` 就算通：那时唯一的缺件是分区里还没有镜像，下一轮再单独问「能不能把它写进去」。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

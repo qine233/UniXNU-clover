@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: register once, let the boot finish"
+title = "clover emmc: root on the partition the kernel named"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -959,7 +959,30 @@ kernel_args = [
   "debug=0x14e",
   "kt_fixed_zones=120",
   "boot-progress=2",
-  "rd=md0",
+  # Round119 moves the root from the RAMDisk to the eMMC partition. `rd=` is the only
+  # change: with a name that is not `md?`, IOFindBSDRoot skips the mdevadd shortcut (line
+  # 849), builds IOBSDNameMatching("disk0s39") (line 917) and waits on it -- and the disk
+  # is already published, because CloverBlock's run is triggered by the earlier
+  # publishResource("IOBSD") inside IOKitBSDInit(), which is why round118's success line
+  # printed before `Adding ramdisk device md0`. So the wait answers immediately, rootdev
+  # becomes makedev(1, 39), and vfs_mountroot's bdevvp(rootdev) hands mockfs a vnode whose
+  # reads go through IOMediaBSDClient -> IOBlockStorageDriver -> drivers/CloverSdhci's PIO
+  # read instead of a page table. That vnode path is the new thing under test: round118
+  # proved media->read() (map=1) and bdevvp() itself (bd=1), never a read through the
+  # returned vnode.
+  # Nothing mountable is at the start of logfs yet, and that is deliberate. mockfs reads
+  # the first 4096 bytes through the device, sees no `N4KROOT` magic, and falls to its
+  # legacy single-Mach-O mode, where /sbin/launchd is the whole device from offset zero
+  # (mockfs_fsnode.c:82, mockfs_vfsops.c:134). The mount should therefore succeed and the
+  # exec should fail on garbage, which separates "the root plumbing over eMMC works" from
+  # "there is no image there yet" -- the image goes in a later round, and writing logfs is
+  # destructive, so it waits for an explicit go-ahead.
+  # Readings: `Got boot device = <service path>` + `BSD root: disk0s39, major 1, minor 39`
+  # = the match and the number; `initproc failed to start ... (error N)` = root mounted over
+  # eMMC and only the image is missing; `Failed to mount root device` (panic at
+  # IOKitBSDInit.cpp:984 after ten timed-out waits) = the media was not there when the root
+  # search ran; a mount error naming mockfs/bdevvp = the vnode path is what breaks.
+  "rd=disk0s39",
   # Round 72 died with SIGKILL (parent's wait4 read status 9) inside its first
   # mach_msg; round 73 bracketed that call with markers and added this boot-arg,
   # and the panel looked exactly the same: presend, no send=. So the boot-arg did
@@ -1363,10 +1386,13 @@ kernel_args = [
   # still-matching gIOPublishNotification on each pass ignoring the handler's return value, so
   # returning false does not retire it; every later publishResource() re-fires the handler.
   # Round118 latches the run: one atomic CAS admits the first invocation and every refire counts
-  # itself and returns, so the metaclass registers once and the boot continues.
-  # One line on success, "CloverBlock r118: auto p=<n> disk0s39 <maj>:<min> bd=1 map=1 fires=<k>"
-  # (fires=1 on the run that succeeded); each refire prints "CloverBlock r118: refire n=<k> (already
-  # ran)". Every failure panics as "CloverBlock r118: <step> <value>". "auto <n>" means no named
+  # itself and returns, so the metaclass registers once and the boot continues. Its photograph said
+  # exactly that -- "auto p=39 disk0s39 1:39 bd=1 map=1 fires=1", one "refire n=2 (already ran)",
+  # then the log running on through APFS to the EL0 init and its mach lines, ending in the tick
+  # watchdog's scheduled panic with spsr ending in 0 (EL0t): userspace was running when it fired.
+  # One line on success, "CloverBlock r119: auto p=<n> disk0s39 <maj>:<min> bd=1 map=1 fires=<k>"
+  # (fires=1 on the run that succeeded); each refire prints "CloverBlock r119: refire n=<k> (already
+  # ran)". Every failure panics as "CloverBlock r119: <step> <value>". "auto <n>" means no named
   # partition appeared in time: the value is 0x10000 if the whole disk itself was named, plus the
   # number of named partitions seen. "notify 0/1" means the IOBSD matching dictionary or the
   # notification itself could not be installed. No CloverBlock line at all means it never fired.

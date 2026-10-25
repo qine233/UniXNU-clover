@@ -46,9 +46,10 @@ TIMEBASE_HZ = 19200000
 REQUIRED_CHOSEN = ["random-seed", "nvram-proxy-data", "nvram-bank-size", "dram-base",
                    "dram-size", "crypto-hash-method", "root-matching", "display-base",
                    "unique-chip-id", "amfi-only-platform-code"]
-# One RAMDisk placeholder, no PackedRAMDisk: this board's root is the md0/mockfs image
-# (scripts/make-clover-root.py), which DarwinBoot hands over dense, and its AdtNode
-# refuses a memory-map that declares a ramdisk twice.
+# One RAMDisk placeholder, no PackedRAMDisk: the mockfs image (scripts/make-clover-root.py)
+# is what gets mounted as /, DarwinBoot hands it over dense, and its AdtNode refuses a
+# memory-map that declares a ramdisk twice. Since round119 `rd=` names the eMMC partition
+# rather than md0, but the RAMDisk slot stays because mdevadd runs before the rd= branch.
 REQUIRED_MEMORY_MAP = ["RAMDisk", "TrustCache"]
 
 
@@ -510,19 +511,23 @@ def check_board(errors: list) -> str:
         if not re.fullmatch(r"[A-Za-z0-9_.\-]+(=[A-Za-z0-9_.,\-]+)?", argument):
             errors.append(f"kernel argument {argument} fails the payload pattern")
 
-    # The root contract. clover has no block driver, so the only root this kernel can
-    # find is the RAM one: the payload carries the md0/mockfs image as initrd, the ADT
-    # carries its plain RAMDisk placeholder, rd=md0 tells IOFindBSDRoot to take it, and
-    # the pinned trust cache carries the init program's cdhash so exec can validate it.
-    # A packed placeholder would mean the Data-seed shape instead, which needs NativeRamBlock.
+    # The root contract. Two halves: the payload still carries the mockfs image as initrd and
+    # the ADT still carries its plain RAMDisk placeholder, so md0 exists either way; what `rd=`
+    # names decides which one becomes /. Since round119 it names the eMMC partition published by
+    # drivers/CloverBlock (disk0s39, major 1 minor 39), which is only possible because that
+    # driver's run is triggered by publishResource("IOBSD") inside IOKitBSDInit(), before
+    # IOFindBSDRoot waits. The pinned trust cache carries the init program's cdhash so exec can
+    # validate it whatever the backing device is. A packed placeholder would mean the Data-seed
+    # shape instead, which needs NativeRamBlock.
     if adt.get("packed_data_ramdisk"):
         errors.append("[payload.adt] packed_data_ramdisk is true, but this board's root is the "
-                      "dense md0/mockfs image; the payload step would emit PackedRAMDisk")
-    if "rd=md0" not in board["payload"]["kernel_args"]:
-        errors.append('[payload] kernel_args has no rd=md0: without it IOFindBSDRoot waits for '
-                      'a root IOMedia that no clover driver publishes')
+                      "dense mockfs image; the payload step would emit PackedRAMDisk")
+    if "rd=disk0s39" not in board["payload"]["kernel_args"]:
+        errors.append('[payload] kernel_args has no rd=disk0s39: round119 asks whether XNU can mount '
+                      'root on the eMMC partition CloverBlock publishes, and rd=md0 would take the '
+                      'mdevadd shortcut and skip that path entirely')
     if not board["payload"].get("trust_cache_sha256"):
-        errors.append("[payload] trust_cache_sha256 is empty: the md0/mockfs init program would "
+        errors.append("[payload] trust_cache_sha256 is empty: the mockfs init program would "
                       "have no offline trust, and the exec of /sbin/launchd is a panic")
 
     splash = [entry for entry in board.get("bootimg", {}).get("dtb_node", [])

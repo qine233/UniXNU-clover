@@ -50,6 +50,14 @@
 // re-fires this handler. Round 118 keeps the notifier installed but latches the run: an atomic
 // compare-and-swap admits the first invocation and turns every refire into a counted no-op, so the
 // metaclass is registered exactly once and the boot continues to answer the real question.
+// Round 118 measured that on the device: `auto p=39 disk0s39 1:39 bd=1 map=1 fires=1` printed, then
+// one `refire n=2 (already ran)`, and the log ran on through APFS to the EL0 init. The block stack
+// is also timed right -- both lines sit between apfs_syscall_register() and md0's mdevadd(), so the
+// media exists before IOFindBSDRoot looks for a root. Round 119 therefore points `rd=` at this
+// partition instead of md0. Nothing here changes: the same six steps, the same latch. What is new is
+// what happens after this driver returns -- bdevvp(1<<24|39)'s vnode is read by mockfs through the
+// buffer cache, which is the first read this board performs that does not go through a call this file
+// makes itself.
 //
 // The class has to be hand-written. IOStorageFamily is loaded at runtime from the boot kext
 // collection (kernel.macho exports no IOBlockStorageDevice, IOMedia or IOBlockStorageDriver
@@ -67,7 +75,7 @@
 // an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
 // attached for start (startCandidate() attaches again after the matching loop's detach).
 //
-// A failure panics with one short CloverBlock r118 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r119 line naming the step; success prints one line
 // and lets the boot continue. A refire of the IOBSD notification prints one counted line and
 // returns, so the photograph shows both that the run completed and how many times it was offered.
 #define IOKIT_ENABLE_SHARED_PTR 1
@@ -468,7 +476,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r118: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r119: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 // The mask's job is done: round115 showed that the names this file wants are taken by the tree
@@ -563,7 +571,7 @@ extern "C" void clover_block_run(void)
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    IOLog("CloverBlock r118: refire n=%u (already ran)\n", fires);
+    IOLog("CloverBlock r119: refire n=%u (already ran)\n", fires);
     return;
   }
 
@@ -703,7 +711,7 @@ extern "C" void clover_block_run(void)
     fail("map", 0);
   }
 
-  IOLog("CloverBlock r118: auto p=%u %s %u:%u bd=1 map=1 fires=%u\n", partitions,
+  IOLog("CloverBlock r119: auto p=%u %s %u:%u bd=1 map=1 fires=%u\n", partitions,
         bsdName->getCStringNoCopy(), bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
 }
