@@ -411,6 +411,8 @@ struct BlockResult {
   uint32_t classSize;
   uint32_t post;
   uint32_t instances;
+  uint32_t driverMeta;
+  uint32_t driverStarted;
   uint32_t driverFound;
   uint32_t mediaFound;
   uint64_t mediaSectors;
@@ -526,7 +528,7 @@ static IOReturn readMediaBlock(IOMedia *media, IOService *client,
 // the screen names the step instead of the next boot having to guess.
 static void blockStage(const char *step)
 {
-  IOLog("CloverBlock r108: %s\n", step);
+  IOLog("CloverBlock r109: %s\n", step);
 }
 
 extern "C" void clover_block_run(void)
@@ -585,16 +587,49 @@ extern "C" void clover_block_run(void)
       break;
     }
 
-    // Stage 5: attach to the platform and register synchronously, which is what makes
-    // IOBlockStorageDriver attach and start *inside* this call.
+    // Stage 5: attach to the platform, then start the one driver this device is for.
+    //
+    // Round108 ended on "5 register" and never returned. That call was
+    // registerService(kIOServiceSynchronous), whose inline match runs the catalogue before
+    // IOKitInitializeTime: the photograph shows APFS and AMFI kext starts and an
+    // IOCPUInterruptController registerService nested under it, then silence. PMGR's two
+    // synchronous registrations return because no kext matches them; ours matches
+    // IOStorageFamily, so the inline match drags in the early kext cascade and stops there.
+    //
+    // Round109 no longer asks the catalogue. It allocates IOBlockStorageDriver by name and
+    // does what startCandidate() would do -- attach, then start -- with a marker before each
+    // call. The driver's own media registration stays asynchronous (our device never entered
+    // kIOServiceSynchronousState), so the same cascade is not entered from here.
     r.stage = 5;
     blockStage("5 attach");
     IOPlatformExpert *platform = IOService::getPlatform();
     if (!platform || !device->attach(platform) || !device->start(platform)) {
       break;
     }
-    blockStage("5 register");
-    device->registerService(kIOServiceSynchronous);
+
+    blockStage("5 driver meta");
+    const OSMetaClass *driverMeta = lookupMetaClass("IOBlockStorageDriver");
+    if (!driverMeta) {
+      break;
+    }
+    r.driverMeta = 1;
+
+    blockStage("5 driver alloc");
+    IOService *handDriver = static_cast<IOService *>(driverMeta->alloc());
+    if (!handDriver || !handDriver->init(nullptr)) {
+      break;
+    }
+
+    blockStage("5 driver attach");
+    if (!handDriver->attach(device)) {
+      break;
+    }
+
+    blockStage("5 driver start");
+    if (!handDriver->start(device)) {
+      break;
+    }
+    r.driverStarted = 1;
 
     // Stage 6: the driver and its media are children in the service plane.
     r.stage = 6;
@@ -602,7 +637,7 @@ extern "C" void clover_block_run(void)
     IORegistryEntry *driverEntry = device->getChildEntry(gIOServicePlane);
     IOService *driver = driverEntry
         ? static_cast<IOService *>(driverEntry->metaCast("IOBlockStorageDriver")) : nullptr;
-    if (!driver || driver->getProvider() != device) {
+    if (!driver || driver->getProvider() != device || driver != handDriver) {
       break;
     }
     r.driverFound = 1;
@@ -779,6 +814,10 @@ extern "C" void clover_block_run(void)
   emitHex(r.classSize, 4);
   emitText(" pm=");
   emitDec(r.post);
+  emitText(" dm=");
+  emitDec(r.driverMeta);
+  emitText(" ds=");
+  emitDec(r.driverStarted);
   emitText("\nb dv=");
   emitDec(r.driverFound);
   emitText(" md=");

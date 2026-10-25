@@ -5511,6 +5511,134 @@ fastboot reboot
 三者在同一张照片里能同时判定。若参数缺失，屏上会出现 `CloverSdhci r108` 的 panic，
 同样是完整读数，不需要重刷。这一轮仍然不写 logfs（panic 钩子未武装），盘上记录不变。
 
+## round108 读数（照片，v0.2.80 实机）：payload 对了，块栈停在同步注册里面
+
+照片开头是 `CloverPMGR r108: args [...]`，括号里完整包含
+`clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`——**刷进去的这份 payload
+确实在跑，round107 的「旧 payload」疑问排除**。接着是
+`CloverBlock r108: 2 storage family`、`3 metaclass`、`4 allocate`、`5 attach`、
+`5 register`，然后在同一块屏上出现 `apfs_module_start…`、`ktrrglue_register_subsystem_strings`、
+`AMFI: PMGRAON latched to: ffffffff`、`AMFI: Enabling developer mode…`、
+`IOCPUInterruptController: not registry member at registerService()`，之后没有 `6 driver`、
+没有 `b st=`、也没有 mode 21 的 panic。
+
+读法是确定的，不是猜：
+
+- `5 register` 与 `6 driver` 之间只有一条语句，`device->registerService(kIOServiceSynchronous)`；
+  `blockStage("6 driver")` 在它返回后无条件执行，mode 21 又在 `clover_block_run()` 返回后
+  无条件 panic。两者都没出现 ⇒ **调用没有返回**，卡在 `registerService` 内部。
+- PMGR 自己在这一轮之前的两条 `registerService(kIOServiceSynchronous)`（provider 和 nub）
+  都返回了（否则走不到块栈），所以「同步注册」这个机制本身在这台机器上是通的。
+- 差别在于匹配对象：`ApplePMGR`/`ApplePMGRNub` 没有 kext 认领，匹配集是空的；我们的
+  `CloverBlockDevice` 会被 IOStorageFamily 的 `IOBlockStorageDriver` 认领。
+- 因此那几行 APFS/AMFI/IOCPU **不是** `bsd_init` 在 `sheng_pmgr_run()` 之后的正常续跑
+  （若续跑，就必然先看到 `6 driver` 和 panic），而是这次 inline 匹配把早期的 kext 启动
+  级联拉进了自己的调用栈。最后一行的 `IOCPUInterruptController … registerService()` 是
+  级联里另一次注册，之后停在某个 kext 启动里——这个启动点还没到
+  `IOKitInitializeTime()`，任何依赖定时器/后续服务的等待都不会被满足。
+
+所以这张照片否定的是「块设备 ABI 不对」：加载、类大小、元类注册、分配、attach/start
+全部走过（2–5 attach）。真正卡住的是「让 IOCatalogue 现场做同步匹配」这一步。round109
+不再经过它。
+
+## v0.2.81（round109）：不经过匹配，按名字手工启动 IOBlockStorageDriver
+
+`clover_block_run()` 的 stage 5 改为：
+
+1. `5 attach`：设备 attach 到 platform 并 `start`（与上一轮相同，已证明会返回）。
+2. `5 driver meta`：`OSMetaClass::getMetaClassWithName("IOBlockStorageDriver")`。
+3. `5 driver alloc`：`driverMeta->alloc()` + `init(nullptr)`。
+4. `5 driver attach`：`driver->attach(device)`。
+5. `5 driver start`：`driver->start(device)`。
+
+这三步正是 `IOService::startCandidate()` 对一个候选驱动做的事，只是候选集由我们自己
+指定、不经过 `findDrivers`/`isModuleLoaded`/kext 加载。我们的设备从未进入
+`kIOServiceSynchronousState`，因此驱动内部为 IOMedia 做的注册是异步的，不会再从
+这里进入那条早期 kext 级联。每步都先打 `CloverBlock r109: <step>`，卡住时最后一行
+就是答案：停在 `5 driver start` 说明问题在驱动的媒体创建/注册里，不是匹配。
+
+`b st=` 行新增两个读数：`dm=`（元类找到）与 `ds=`（`driver->start` 返回 true）。
+`CloverPMGR r109` / `CloverSdhci r109` 同步改号，照片仍能自证是哪一版在跑。
+
+成功时，除 `<step>` 编号外，期望屏与上一轮相同：`b st=15 ld=0 cs=0090 pm=0 dm=1 ds=1`、
+`b dv=1 md=1 sz=<n> bl=512`、`b op=1 wp=0 gp=1 ix=39`，以及 `b lf`/`b tx`。
+若停在 `5 driver start`，则 `b st=5 … dm=1 ds=0` 会出现在 panic 屏上（mode 21 的
+panic 在块段之后，始终会画）。
+
+成功时屏上应含：
+
+```text
+CloverPMGR r109: args [-v serial=3 debug=0x14e kt_fixed_zones=120 boot-progress=2
+ rd=md0 allow_legacy_mach_msg=1 armcpu-timer-intid=19 clover-pmgr=2 clover-emmc=21
+ armcpu-clock-panic=60000]
+...
+CloverBlock r109: 2 storage family
+CloverBlock r109: 3 metaclass
+CloverBlock r109: 4 allocate
+CloverBlock r109: 5 attach
+CloverBlock r109: 5 driver meta
+CloverBlock r109: 5 driver alloc
+CloverBlock r109: 5 driver attach
+CloverBlock r109: 5 driver start
+CloverBlock r109: 6 driver
+...
+CloverBlock r109: 15 done
+...
+CloverSdhci:
+...（驱动链）
+b st=15 ld=0 cs=0090 pm=0 dm=1 ds=1
+b dv=1 md=1 sz=<n> bl=512
+b op=1 wp=0 gp=1 ix=39
+b lf s=<k> a=12320768 b=12337151 m=<m> n=<len> c=1 p=1
+b tx <最新一条记录的正文开头>
+args [-v serial=3 … clover-emmc=21 armcpu-clock-panic=60000]
+```
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| 标记一路走到 `15 done`，末尾 `b st=15 … dm=1 ds=1`、`b dv=1` | 手工启动绕开了同步匹配，块栈闭合 | 下一轮把 logfs 挂成真正的块设备消费者 |
+| 停在 `5 driver meta`，`b st=5 … dm=0 ds=0` | `IOBlockStorageDriver` 这个元类此刻还不存在（IOStorageFamily 尚未启动） | 先按标识符加载 IOStorageFamily，再取元类 |
+| 停在 `5 driver alloc` / `5 driver attach`，`dm=1 ds=0` | 元类找到了，实例化或 attach 失败（类大小/ABI 不符） | 读 `cs=` 与驱动的类大小对照 |
+| 停在 `5 driver start`，`dm=1 ds=0` | 驱动起来了但 `start` 未返回或未成功：媒体创建/注册是新的卡点 | 反汇编 `IOBlockStorageDriver::start` 的媒体创建段 |
+| 停在 `5 attach` 或更早（2/3/4） | 上一轮已通过的位置出现回归 | 按最后一行标记回看该阶段 |
+| 没有 `CloverPMGR r109` 这一行 | 固件启动的不是这份 payload | 核对 `fastboot flash cache` 的目标与固件启动卷 |
+
+产物（内核与 payload 变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round109-payload.img` | 58720256 B | `05e8e1b1e5819057b453487ff6e94ac1e62a58bd116871c9919f238f9f04572d` |
+| `round109-kernel.macho`（构建产物） | 51990528 B | `1e84dbc2949a3415491f2cdf3b20bef0e2cb36d7677c0ed15b8397c251010365` |
+| `round109-in-volume-kernel.macho`（卷内副本） | 51990528 B | `dd528b77eef73132348ae21a9fe5dde19fa90245bb6c1a78e860a41189a15586` |
+| `round109-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round109-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round109-kernel.macho.adt` | 13476 B | `4fcc133045865ca1d372c17975529741a5700f39a0b130d2dcf007af7d4742f0` |
+| `round109-unixnu.toml` | 583 B | `8d334ae9966ef043f78ffb5788e28dec11b69892f3b1626b4a40c5a98053d1c0` |
+
+校验器：探针 35 处 6040 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六项全在，
+卷内 boot-args 末尾仍是 `… clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`。
+三条新字符串在卷内内核里都在：`CloverPMGR r109: args [%s]`、
+`CloverSdhci r109: no clover-emmc boot arg`、`CloverBlock r109: %s`。
+卷内文件是只读挂载取出后逐字节校验的（本轮的 payload 曾因一次可写挂载被改写，
+已重建并从只读挂载重新归档）。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_run`
+`0xfffffff007972254`、`_clover_block_run` `0xfffffff007991d6c`、
+`lookupMetaClass` `0xfffffff0079940f8`。
+boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round109-payload.img
+fastboot reboot
+```
+
+**拍一张就够（可能两张）。** 先看 `CloverPMGR r109: args [...]` 是否在、参数是否齐全，
+再顺着 `CloverBlock r109:` 的标记数到停在哪一条，最后读 panic 屏上的
+`b st=… dm=… ds=…`。三者同屏即完整读数。这一轮仍不写 logfs（panic 钩子未武装），
+盘上记录不变。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

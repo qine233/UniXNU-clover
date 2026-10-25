@@ -3679,7 +3679,7 @@ extern "C" void clover_emmc_run (void)
     // AMFI latched, the kernel booted to IOCPU, and the screen never said whether the argument
     // was missing or the storage stack had hung. The pair (clover-pmgr=2 without clover-emmc) is
     // a payload built wrong, so it panics and prints the command line that caused it.
-    panic ("CloverSdhci r108: no clover-emmc boot arg\nargs [%s]", PE_boot_args ());
+    panic ("CloverSdhci r109: no clover-emmc boot arg\nargs [%s]", PE_boot_args ());
   }
   clover_emmc_stage = 1;
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without

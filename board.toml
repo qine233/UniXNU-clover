@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: name the payload, args, and block stage"
+title = "clover emmc: start IOBlockStorageDriver by name, one marker per call"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1269,8 +1269,9 @@ kernel_args = [
   # class size 0x90 the overrides were built against), "b dv=1 md=1 sz=<n> bl=512", "b op=1
   # wp=0 gp=1 ix=39", "b lf s=<slot> a=12320768 b=12337151 m=<kind> n=<len> c=1 p=1" and
   # "b tx ...". A "st" below 15 names the stage that stopped: 1 card not proven, 2
-  # IOStorageFamily load or class size, 3 metaclass registration, 4 allocation, 5 attach/start,
-  # 6 no IOBlockStorageDriver, 7 no IOMedia or geometry mismatch, 9 media open, 10 GPT header
+  # IOStorageFamily load or class size, 3 metaclass registration, 4 allocation, 5 attach or the
+  # hand-started driver's meta/alloc/attach/start, 6 no IOBlockStorageDriver, 7 no IOMedia or
+  # geometry mismatch, 9 media open, 10 GPT header
   # through IOMedia, 11 entry walk, 12 slot scan, 13 text read.
   # Round107's photograph ended at "IOCPUInterruptController: not registry member" with no block
   # report at all, while PMGR's nub had clearly been published (AMFI latched to it). The only
@@ -1282,6 +1283,22 @@ kernel_args = [
   # clover_block_run logs "CloverBlock r108: <step>" before every stage. A photograph therefore
   # names the payload that ran (present or absent line), the exact command line it received, and
   # -- if no "b st=" follows -- the last block step that was reached.
+  # Round108's photograph answered those: the args line was present with clover-emmc=21, and the
+  # block markers ran 2, 3, 4, 5 attach, 5 register -- then nothing. "6 driver" is unconditional
+  # right after registerService(), and mode 21's panic follows the block run, so the synchronous
+  # registration did not return. PMGR's own two registerService(kIOServiceSynchronous) calls did,
+  # because no kext matches them; ours matches IOStorageFamily, and the APFS / AMFI /
+  # IOCPUInterruptController lines after "5 register" are that inline match pulling the early
+  # kext cascade into itself. Round109 therefore stops asking the catalogue: it looks up
+  # IOBlockStorageDriver's metaclass by name after IOStorageFamily is loaded, allocates it,
+  # attach()es it to this device, and start()s it -- the same three steps startCandidate() would
+  # take -- with "5 driver meta", "5 driver alloc", "5 driver attach", "5 driver start" printed
+  # before each. Our device never enters kIOServiceSynchronousState, so the driver's own
+  # IOMedia registration stays asynchronous and cannot re-enter that cascade from here. The
+  # "b st=" line now also carries dm= (metaclass found) and ds= (driver start returned true).
+  # A last line of "5 driver start" means the hang is inside IOBlockStorageDriver::start
+  # (media creation/registration), not in matching; "6 driver" with dv=0 means it started but
+  # left no child of the expected class.
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
