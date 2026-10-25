@@ -212,6 +212,10 @@ volatile uint64_t clover_emmc_observation[16];
 // The formatted report, one %s argument, so the panic screen's argument list cannot shift.
 char clover_emmc_report[512];
 volatile uint32_t clover_emmc_stage = 0;
+// drivers/CloverBlock's entry point and its %s argument: mode 21 publishes this boot's block
+// device and prints what XNU's storage stack read through it, as the second half of one screen.
+void clover_block_run (void);
+extern char clover_block_report[512];
 }
 
 // One 512-byte PIO block at a time, in BSS rather than on a kernel stack: mode 14 reads the GPT
@@ -220,6 +224,17 @@ volatile uint32_t clover_emmc_stage = 0;
 static uint32_t gEntryBlock[128];
 static uint32_t gWriteBlock[128];
 static uint32_t gReadBlock[128];
+
+// Mode 21 publishes this same path as a block device through drivers/CloverBlock. That device
+// reports the card's own EXT_CSD sector count and serves reads one block at a time, so both the
+// geometry and the data come from the card this boot measured, not from a constant. The published
+// count is gated on the logfs extent's last LBA: a card that does not even reach the partition
+// this port has been reading is not a geometry to hand to the storage stack.
+static uint32_t gExtCsd[128];
+static const uint32_t kLogfsLastLba = 12337151u;   // sysfs: start 12320768, 16384 sectors
+static volatile uint32_t gBlockReady = 0;
+static volatile uint32_t gBlockSectors = 0;
+static volatile uint32_t gBlockGuard = 0;
 
 // Mode 17 stores the report as text, so the first bytes of the block identify it when read on
 // another OS. The newline is part of the stored length: the block reads as a small text file.
@@ -850,15 +865,16 @@ static bool waitCommandSlot (void)
   return waitCommandSlot (false);
 }
 
-// One whole 512-byte block, read the way mode 12's drain proved works: CMD17 with the block
-// count enabled and the card's own addressing, then one FIFO word per counter gap and a final
-// level-gated sweep for whatever DATA_END raced with. Mode 14 uses this to walk the GPT entry
-// array block by block; the first block (LBA 1) keeps its own inline path, so the sequence that
-// round99 proved is not disturbed. `status` is the INT_STATUS group the data phase ended on,
-// `wordCount` how many words were stored, and the return value is true only for a clean command
-// response, DATA_END and all 128 words.
-static bool readPioBlock (uint32_t lba, uint32_t *words, uint32_t &wordCount,
-                          uint32_t &status)
+// One whole 512-byte block, read the way mode 12's drain proved works: an adtc command with a
+// short R1 and the block count enabled, then one FIFO word per counter gap and a final level-gated
+// sweep for whatever DATA_END raced with. Mode 14 uses this to walk the GPT entry array block by
+// block; the first block (LBA 1) keeps its own inline path, so the sequence that round99 proved is
+// not disturbed. Mode 21 passes CMD8 here, which is the same command shape and one register field
+// larger. `status` is the INT_STATUS group the data phase ended on, `wordCount` how many words
+// were stored, and the return value is true only for a clean command response, DATA_END and all
+// 128 words.
+static bool readDataBlock (uint16_t command, uint32_t argument, uint32_t *words,
+                           uint32_t &wordCount, uint32_t &status)
 {
   wordCount = 0;
   status = 0;
@@ -869,9 +885,9 @@ static bool readPioBlock (uint32_t lba, uint32_t *words, uint32_t &wordCount,
   write16 (SDHCI_BLOCK_SIZE, 512);
   write16 (SDHCI_BLOCK_COUNT, 1);
   write32 (SDHCI_INT_STATUS, 0xffffffffu);
-  write32 (SDHCI_ARGUMENT, lba);
+  write32 (SDHCI_ARGUMENT, argument);
   write16 (SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN);
-  write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (17, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+  write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (command, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
                                           SDHCI_CMD_INDEX | SDHCI_CMD_DATA));
   uint32_t spins = 0;
   for (;;) {
@@ -922,6 +938,65 @@ static bool readPioBlock (uint32_t lba, uint32_t *words, uint32_t &wordCount,
     words[wordCount++] = read32 (SDHCI_BUFFER);
   }
   return (status & SDHCI_INT_DATA_END) && wordCount == kBlockWords;
+}
+
+static bool readPioBlock (uint32_t lba, uint32_t *words, uint32_t &wordCount,
+                          uint32_t &status)
+{
+  return readDataBlock (MMC_READ_SINGLE_BLOCK, lba, words, wordCount, status);
+}
+
+// The three symbols drivers/CloverBlock links against. Ready and the sector count are only what
+// mode 21 published after a clean EXT_CSD read whose SEC_COUNT contains the logfs extent, so the
+// block device can never describe a card this port has not measured. A block read is gated on
+// that geometry, on the same single-block PIO path, and on a guard that keeps a second caller out
+// while the first owns the host; the deadline is the counter, because at this scheduling point the
+// watchdog does not tick. `blocks` is capped by what is left of the card, so no caller can walk
+// past the end.
+extern "C" uint32_t clover_emmc_block_ready (void)
+{
+  return __atomic_load_n (&gBlockReady, __ATOMIC_ACQUIRE);
+}
+
+extern "C" uint32_t clover_emmc_block_sectors (void)
+{
+  return __atomic_load_n (&gBlockSectors, __ATOMIC_ACQUIRE);
+}
+
+extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint32_t blocks)
+{
+  if (!words || !blocks) {
+    return 0;
+  }
+  const uint32_t sectors = __atomic_load_n (&gBlockSectors, __ATOMIC_ACQUIRE);
+  if (!__atomic_load_n (&gBlockReady, __ATOMIC_ACQUIRE) || !sectors ||
+      lba >= sectors || blocks > sectors - lba) {
+    return 0;
+  }
+  uint32_t expected = 0;
+  if (!__atomic_compare_exchange_n (&gBlockGuard, &expected, 1u, false,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    return 0;
+  }
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint64_t deadline = frequency * 2ULL;   // 2 s for the whole request
+  const uint64_t start = readCounter ();
+  uint32_t done = 0;
+  for (; done < blocks; done++) {
+    if (readCounter () - start > deadline) {
+      break;
+    }
+    uint32_t got = 0;
+    uint32_t status = 0;
+    if (!readPioBlock (lba + done, words + done * kBlockWords, got, status)) {
+      break;
+    }
+  }
+  __atomic_store_n (&gBlockGuard, 0, __ATOMIC_RELEASE);
+  return done;
 }
 
 // One whole 512-byte block, written the mirror image of readPioBlock: CMD24 with the block count
@@ -1666,6 +1741,11 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   uint32_t logNewestWords20 = 0, logNewestStatus20 = 0;
   bool logFindOk20 = true, logNewestTextOk20 = false, logNewestCheck20 = false;
 
+  // Mode 21 adds one reading to the chain: EXT_CSD, read through the same paced PIO as the GPT
+  // header. Its SEC_COUNT is what the block device publishes and what gates every read it serves.
+  bool extOk21 = false;
+  uint32_t extWords21 = 0, extStatus21 = 0, extSectors21 = 0;
+
   bool cmd2Ok = false;
   if (probeMode == 0) {
     if (ready) {
@@ -2292,6 +2372,21 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                 }
               }
             }
+          }
+        }
+        // Mode 21: the sector count the block device publishes is the card's own, read with the
+        // same paced PIO as the GPT header. SEC_COUNT lives at byte 212, i.e. word 53 of the
+        // 512-byte EXT_CSD block. The count is gated on the logfs extent: a card that does not
+        // reach the partition this port has been reading is not a geometry to publish, and
+        // without the gate the block device would describe a card the next read disagrees with.
+        if (probeMode == 21 && (readStatus11 & SDHCI_INT_DATA_END) && drained11) {
+          extOk21 = readDataBlock (MMC_SEND_EXT_CSD, 0, gExtCsd, extWords21, extStatus21);
+          extSectors21 = gExtCsd[53];
+          if (!extOk21 || extSectors21 <= kLogfsLastLba) {
+            extOk21 = false;
+          } else {
+            gBlockSectors = extSectors21;
+            __atomic_store_n (&gBlockReady, 1, __ATOMIC_RELEASE);
           }
         }
       }
@@ -3266,6 +3361,19 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
         emitDec (drained11 && hdr11a == 0x20494645u && hdr11b == 0x54524150u ? 1 : 0);
       }
     }
+    if (probeMode >= 21) {
+      // EXT_CSD's reading, printed even when the CMD17 phase did not end: `ok` is the block's own
+      // verdict, `n` how many words arrived (128 means the whole structure), `sc` the sector count
+      // the block device will publish, `st` the INT_STATUS group its data phase ended on.
+      emitText ("\nex ");
+      emitDec (extOk21 ? 1 : 0);
+      emitText (" n=");
+      emitDec (extWords21);
+      emitText (" sc=");
+      emitDec (extSectors21);
+      emitText (" st=");
+      emitHex (extStatus21, 8);
+    }
     if (attemptedStop11) {
       emitText ("\nc12 ");
       emitText (verdictStop11);
@@ -3575,7 +3683,7 @@ extern "C" void clover_emmc_run (void)
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
       mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12 && mode != 13 &&
       mode != 14 && mode != 15 && mode != 16 && mode != 17 && mode != 18 && mode != 19 &&
-      mode != 20) {
+      mode != 20 && mode != 21) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -3596,12 +3704,19 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp (mode == 5, (mode >= 7 && mode <= 20) ? mode : 0);
+    coldBringUp (mode == 5, (mode >= 7 && mode <= 21) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.
   // Round94's photograph showed the screen wraps at 66 characters (its 68-character `h` line put
   // `f0` on the next line), and the 13-character label would otherwise eat into the first line's
   // 66; the newline keeps every report line starting at column zero.
+  if (mode == 21) {
+    // Both halves of the same boot on one screen: the driver's chain, then what the storage stack
+    // read through the block device published above it. This deliberately does not arm the panic
+    // hook; that stays mode 20's, because this run handed the card to another subsystem.
+    clover_block_run ();
+    panic ("CloverSdhci:\n%s\n%s", clover_emmc_report, clover_block_report);
+  }
   panic ("CloverSdhci:\n%s", clover_emmc_report);
 }

@@ -51,6 +51,7 @@ archives = [
   "build-clover-display-stub.py",
   "build-clover-pmgr.py",
   "build-arm-driver.py CloverSdhci",
+  "build-clover-block.py",
 ]
 
 [kernel.prelink]
@@ -150,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: let the panic screen write its own log record"
+title = "clover emmc: read the card through IOMedia"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1259,7 +1260,19 @@ kernel_args = [
   # scan or write. The first mode-20 boot therefore reads slot 1 (round105's report, m=19) and
   # appends a panic record to slot 2; a second boot with the same payload reads slot 2 and
   # appends to slot 3.
-  "clover-emmc=20",
+  # Mode 21 is the first mode whose reader is not this driver. It publishes the same card as an
+  # IOBlockStorageDevice (drivers/CloverBlock), lets IOStorageFamily attach its own driver and
+  # build the IOMedia, then reads the GPT and the newest logfs slot *through IOMedia*. The card
+  # path is mode 20's chain up to the GPT header plus one CMD8 for EXT_CSD, whose SEC_COUNT is
+  # the geometry the block device reports. "ex 1 n=128 sc=<n> st=..." is that reading; the block
+  # stack's own lines are "b st=15 ld=0 cs=0090 pm=0" (load status 0, postModLoad 0, the
+  # class size 0x90 the overrides were built against), "b dv=1 md=1 sz=<n> bl=512", "b op=1
+  # wp=0 gp=1 ix=39", "b lf s=<slot> a=12320768 b=12337151 m=<kind> n=<len> c=1 p=1" and
+  # "b tx ...". A "st" below 15 names the stage that stopped: 1 card not proven, 2
+  # IOStorageFamily load or class size, 3 metaclass registration, 4 allocation, 5 attach/start,
+  # 6 no IOBlockStorageDriver, 7 no IOMedia or geometry mismatch, 9 media open, 10 GPT header
+  # through IOMedia, 11 entry walk, 12 slot scan, 13 text read.
+  "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

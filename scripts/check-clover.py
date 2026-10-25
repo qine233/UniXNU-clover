@@ -475,6 +475,21 @@ def check_board(errors: list) -> str:
             errors.append("CloverSdhci is scheduled from sheng_pmgr_run(), which CONFIG_XNU_SHENG_PMGR="
                           f"{flags.get('SHENG_PMGR', 'n')} does not compile into the kernel")
 
+        # round107, the block device. libCloverBlock.a is linked because CloverSdhci names
+        # clover_block_run() from its mode 21 tail, and only mode 21 publishes the geometry and
+        # the block read service that class calls. All three halves have to agree, or the
+        # storage stack silently never exists -- the same failure shape as the two above.
+        block_builder = any("build-clover-block.py" in entry for entry in board["kernel"]["archives"])
+        if "libCloverBlock.a" in text and not block_builder:
+            errors.append("the defconfig links libCloverBlock.a but [kernel] archives omits "
+                          "build-clover-block.py, so that archive does not exist")
+        if block_builder and "libCloverBlock.a" not in text:
+            errors.append("[kernel] archives builds CloverBlock but the defconfig does not link "
+                          "libCloverBlock.a, so clover_block_run() is undefined")
+        if block_builder and "clover-emmc=21" not in board["payload"]["kernel_args"]:
+            errors.append("[kernel] archives builds CloverBlock but kernel_args does not select "
+                          "clover-emmc=21, the only mode that publishes the block device")
+
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
     if cores != CPU_REGS:

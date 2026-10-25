@@ -45,7 +45,7 @@ CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 # (native_legacy_display_probe from the DEVELOPMENT patch, clover_emmc_run from
 # drivers/CloverPMGR/CloverPMGR.cpp), so ordinary archive resolution pulls the member in.
 # force_load would additionally keep anything unreferenced, which here means nothing.
-CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-display-stub/libCloverDisplayStub.a {tree}/build/clover-sdhci/libCloverSdhci.a"
+CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-display-stub/libCloverDisplayStub.a {tree}/build/clover-sdhci/libCloverSdhci.a {tree}/build/clover-block/libCloverBlock.a"
 
 # Not set, on purpose, and each one is a real porting task rather than a switch to flip:
 #   NATIVE_UFS          — clover boots from eMMC (sdhc_1 at 0xc0c4000), not UFS; there is no XNU SDHCI

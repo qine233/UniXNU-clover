@@ -5264,13 +5264,166 @@ dd if=logfs.bin bs=512 skip=5 count=1 2>/dev/null | tr -d '\0'
 dd if=logfs.bin bs=512 skip=7 count=1 2>/dev/null | tr -d '\0'
 ```
 
+## v0.2.79（round107）：把 eMMC 发布成 IOBlockStorageDevice，由 IOMedia 读 GPT 与 logfs
+
+这一轮换掉读者。前 106 轮里，卡上的每一个字节都是 `drivers/CloverSdhci` 自己发 CMD17、
+自己按节奏排空 FIFO 读出来的。这一轮它只负责把卡交出去：新的 `drivers/CloverBlock`
+在**同一条 PIO 路径**上发布一台 `IOBlockStorageDevice`，IOStorageFamily 加载后自己
+挂上 `IOBlockStorageDriver`、建出 `IOMedia`，然后 GPT 头、表项数组、logfs 格头和正文
+全部**经 IOMedia** 读回来。屏上第一段仍是驱动自己那条链，第二段是存储栈的读数，
+两段在同一个 panic 里（`panic("CloverSdhci:\n%s\n%s", …)`）。
+
+链路分四段：
+
+1. mode 21 在 mode 20 的链（识别、GPT 头、`logfs` 定位、最新格扫描）后面多发一条
+   CMD8 `SEND_EXT_CSD`（arg 0，512 字节，仍用同一条 paced PIO 排空）。字 53 是
+   SEC_COUNT。只有它大于 logfs 末 LBA（12337151）才写 `gBlockSectors` 并置
+   `gBlockReady`——geometry 来自这张卡自己的 EXT_CSD，而不是常量；一张连这个端口
+   已经读过 16384 个扇区的分区都到不了的卡，也不该被交给存储栈。
+2. 驱动导出 `clover_emmc_block_ready/sectors/read`。`read` 一块一条 CMD17，整次请求
+   用一个两秒的 `CNTVCT` 预算，并用一次 4 字节比较交换挡住重入；未就绪、越界、
+   读失败都返回**已经完成的块数**，不挂起。
+3. `CloverBlockDevice` 手写 `MetaClass`。IOStorageFamily 是运行时从 boot kext collection
+   加载的，链接期没有 `IOBlockStorageDevice` 的元类地址，所以标准
+   `OSDefineMetaClass*` 宏不能用：`superClass` 在 `OSKextLoadKextWithIdentifier`
+   之后填，再用 `OSMetaClass::preModLoad/postModLoad` 注册本类。类大小必须恰好等于
+   基类上报的 `0x90`，否则停在 stage 2——偏移错一格，下面所有 override 都会落在
+   错的虚槽上。基类 ctor/dtor 的两个符号（同样不导出）由
+   `scripts/build-clover-block.py` 按名别名到 `IOService`，并与全部 190 个 vtable
+   条目、26 个必须覆盖的槽一起审计。
+4. 注册用 `registerService(kIOServiceSynchronous)`，`IOBlockStorageDriver` 的
+   attach/start 就在这次调用里完成。stage 6 在 service plane 找到驱动，stage 7 找到
+   `IOMedia` 并比较它的 size/block size 与本驱动的 geometry；stage 9 以读者身份
+   `open`；stage 10 起只走 `IOMedia::read`。设备的 `doAsyncReadWrite` 只接受
+   `kIODirectionIn` 并**内联**调用完成回调，所以整条 `IOMedia::read` 链在本启动点
+   同步返回；设备层依旧用异步签名是因为推迟与否只有栈自己知道。
+
+`IOMedia::read` 的完成标志是一个静态结构：回调写 done/status/actual，调用返回后
+立刻检查。若请求被推迟到工作环而在这个启动点没有定时器能等它，函数返回
+`kIOReturnTimeout`（`0xe00002d6`），屏上就是 `gp=0 … hs=e00002d6`——这是
+「存储栈没有内联完成」的读数，不是卡读失败。换成同步形态则可能在 `IOSleep` 里
+永久停住，而这块板子的唯一输出就是这一张照片。
+
+成功时两段应长这样（`<n>` 是这张卡的 SEC_COUNT，`<k>/<m>/<len>` 是盘上最新一条
+logfs 记录；round106 已在实机上写进过 kind 20 的 panic 记录，所以 `m/n` 多半是
+`20/504`）：
+
+```text
+CloverSdhci:
+...（驱动链，与 round106 相同）
+ex 1 n=128 sc=<n> st=<...>
+
+b st=15 ld=0 cs=0090 pm=0
+b dv=1 md=1 sz=<n> bl=512
+b op=1 wp=0 gp=1 ix=39
+b lf s=<k> a=12320768 b=12337151 m=<m> n=<len> c=1 p=1
+b tx <最新一条记录的正文开头>
+...
+elog=1
+```
+
+各字段：
+
+- `ex` 是驱动侧：`ok=1` 表示 EXT_CSD 512 字节整块读完，`n=128` 是字数，
+  `sc` 是发布给块设备的扇区数，`st` 是数据阶段结束时的 `INT_STATUS`。
+- `b st=15` 是存储栈走完；`ld` 是 `OSKextLoadKextWithIdentifier` 的返回，
+  `cs=0090` 是存储栈自己报的类大小（也是本次编译时断言的），`pm` 是
+  `postModLoad` 的返回。
+- `dv=1 md=1` 是 service plane 里真的出现了 `IOBlockStorageDriver` 和 `IOMedia`；
+  `sz` 必须等于 `ex` 的 `sc`，`bl=512`。
+- `op=1` 是媒体以读者身份打开；`wp=0` 表示不可写（这一轮只发布读）；
+  `gp=1` 是 GPT 头经 IOMedia 读到并认出 `EFI PART`；`ix=39` 是 `logfs` 在表项
+  数组里的 1 起序号。
+- `b lf` 是经 IOMedia 读到的 logfs 坐标与最新格：`a/b` 是首末 LBA，
+  `m/n` 是 kind 与长度，`c=1` 是以头块长度重算的字节和与头块一致，`p=1` 是
+  正文前缀 `unixnu clover emmc log\n` 对得上。`b tx` 是正文预览。
+- `elog=1` 在这里是**预期**的：mode 21 不武装 panic 钩子（`probeMode == 20`
+  才武装），因为它已经把卡交给了另一个子系统，这一轮也不写 logfs。`rd` 那行
+  同样不会出现，它是 mode 20 的。round106 的照片里 `elog=` 已经落在固定屏高之外，
+  所以这一行看不看得见都不影响判定；`b st=15` 那几行才是判定依据。
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `ex 1 n=128 sc=<n>`，`sz=<n>`，`gp=1 ix=39`，`c=1 p=1` | XNU 的存储栈自己读到了这张卡：geometry 来自 EXT_CSD，GPT、表项数组、logfs 头和正文都经 IOMedia 返回 | 存储栈这条线闭合；下一轮可以把 logfs 挂成真正的块设备消费者 |
+| `ex 0`，随后 `b st=1` | EXT_CSD 没读完（看 `n`/`st`），或 SEC_COUNT 不大于 logfs 末 LBA；块设备从未发布 | 先修 `ex`；`n<128` 与 `st` 一起区分是少了数据还是命令失败 |
+| `b st=2` | IOStorageFamily 加载失败（`ld≠0`），或类大小不是 `0x90`（`cs≠0090`） | 看 `ld`/`cs`；后者说明基类布局变了，override 必须重排 |
+| `b st=3` | `preModLoad` 失败，或 `postModLoad` 返回非零（`pm`） | 类没注册上，不会出现驱动 |
+| `b st=4` | `new`/`init` 失败 | 内存或属性初始化 |
+| `b st=5` | `attach`/`start` 失败 | 平台节点或 `start` 的返回值 |
+| `b st=6` | 服务注册了，但没有 `IOBlockStorageDriver` 子节点（`dv=0`） | IOStorageFamily 已加载但没匹配；看类名与 provider |
+| `b st=7` | 没有 `IOMedia`，或它的 size/block size 与 geometry 不符（`md=1` 时看 `sz`/`bl`） | 比较 `sz` 与 `ex` 的 `sc` |
+| `b st=9` | 媒体拒绝以读者身份打开 | 上一阶段的挂载/独占状态 |
+| `b st=10`，`hs=e00002d6` | `IOMedia::read` 没有内联完成；请求被推迟，而这里没有定时器等它 | 这是「栈没同步完成」的读数；卡本身已在此前的 stage 证明可读 |
+| `b st=10`，`hs=` 其它值 | IOMedia 读 GPT 头返回错误 | `hs` 就是那个 `IOReturn` |
+| `b st=11` | 表项数组读失败（`hs`） | 与 round101 的 `lg` 链对照 |
+| `b st=12` 且有 `hs` | 格头读失败 | 与 round104 的 `rd r=` 对照 |
+| `b st=12` 且无 `hs`、`lf s=0 m=0 n=0` | 第一格没有 magic：logfs 是空的 | 先让 mode 19/20 写一条 |
+| `b st=13` 且有 `ts` | 正文块读失败 | |
+| `st=15` 但 `c=0` | 读回的正文与头块里的字节和不符 | 写入端或读取端有一处错位 |
+| `st=15` 但 `p=0` | 正文前缀不是 `unixnu clover emmc log\n` | 读到的不是这份布局 |
+
+产物（内核变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round107-payload.img` | 58720256 B | `2508c2ff173e5d2b0eab9c520e945e8fbb15dd41648de6b517345eddda33b37f` |
+| `round107-kernel.macho`（构建产物） | 51990528 B | `fe7e9f272089bb1132821fe673c310610b64959df82de88f6a5a6f08a4ee4969` |
+| `round107-in-volume-kernel.macho`（卷内副本） | 51990528 B | `13cb96411082ab15eed597ac8eddb42c36e041c58f49803ee7d451c0d7efdb52` |
+| `round107-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round107-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round107-kernel.macho.adt` | 13476 B | `ffc817be657b9b3a8ff3ace99d243e6eea854ba1157044beab87656bf550e19c` |
+| `round107-unixnu.toml` | 557 B | `60c985c31523b1c6b6c43471d80496d3f40e139bbf8775108ee5c61b9e594dd1` |
+
+校验器：探针 35 处 6040 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六项全在
+（`clover-emmc`、`look-only dump of c0c4000`、`no pwr`、`CloverSdhci: failed at stage`、
+`_clover_emmc_run`、`_clover_emmc_panic_append`）。`scripts/build-clover-block.py`
+报告 `libCloverBlock.a` 276288 字节、190 个 vtable 条目、26 个必须覆盖的槽，
+每个槽都是运行时类的 override，每个 import 都有归属，两条基类别名与三个 eMMC
+导入都记录在 `build-report.json`。
+
+反汇编自查：
+
+- 分发白名单已从 1..20 扩到 1..21：clang 把它折成
+  `sub w9,w1,#0x16; cmn w9,#0x16; b.hi`，21 在界内。mode 21 的分支是
+  `cmp w8,#0x15; b.ne`。`coldBringUp` 的 `probeMode` 由
+  `sub w9,w8,#7; cmp w9,#0xf; csel w1,w8,wzr,lo` 生成，即 7..21。
+- `clover_emmc_run` 末尾先 `bl _clover_block_run` 再 `bl _panic`；panic 的格式串
+  `CloverSdhci:\n%s\n%s` 在 `0xfffffff00712f8d8`，两个参数分别是
+  `0xfffffff007b1a0a8`（`clover_emmc_report`）与 `0xfffffff007b1a330`
+  （`clover_block_report`）。
+- `readMediaBlock` 只有一次 vtable 调用，槽偏移 `0x558`（`IOMedia::read`），
+  紧随其后的 `done` 检查失败即返回 `mov w0,#0x2d6; movk w0,#0xe000,lsl#16`；
+  完成回调地址是 `mediaReadDone`。
+- 内核符号：`_clover_emmc_block_ready` `0xfffffff0079718c0`、
+  `_clover_emmc_block_sectors` `0xfffffff0079718d0`、
+  `_clover_emmc_block_read` `0xfffffff0079718e0`、
+  `_clover_emmc_panic_append` `0xfffffff007971a20`、
+  `_clover_emmc_run` `0xfffffff007972244`、`_clover_block_run` `0xfffffff007991da0`、
+  `readMediaBlock` `0xfffffff007993d60`、`mediaReadDone` `0xfffffff007993e4c`、
+  `__GLOBAL__sub_I_CloverBlock.cpp` `0xfffffff007993e60`。卷内 boot-args 末尾是
+  `… clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`。
+- boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round107-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 这一张回答的问题是：XNU 自己的存储栈能不能经 `IOBlockStorageDevice`
+→ `IOBlockStorageDriver` → `IOMedia` 读到这张卡。`st=15`、`dv=1 md=1`、`gp=1`、
+`c=1 p=1` 同时出现，就是能；`st` 小于 15 时，它自己会在 `b st=` 上停下并指名阶段。
+这一轮不写 logfs（panic 钩子没武装，`elog` 即使可见也是 1），所以刷完前后盘上的
+记录不受影响。
+
 ## 有意省略的部分
 
-- **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
+- **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
   sheng 那条"直接从 userdata 读 APFS 卷"的路走不通。clover 走 gta4l 的形状：
   控制台优先的内核，带 `CONFIG_XNU_SOURCE_MOCKFS`，没有
   `CONFIG_XNU_NATIVE_UFS`，`[userdata]` 留在板级文件里。
-  `v0.2.58` 起的 `drivers/CloverSdhci` **不是**这块缺口的答案：它先是一份只读的寄存器
+  `v0.2.58` 起的 `drivers/CloverSdhci` 先把这条缺口量清楚：它先是一份只读的寄存器
   探测，`v0.2.60` 起才发第一颗命令（CMD13 `SEND_STATUS`），`v0.2.61` 起在 15 个 RCA 上
   逐个问同一颗命令，`v0.2.62` 起改成从 CMD0 重头识别（CMD0/CMD1/CMD2/CMD3，降低时钟），
   `v0.2.63` 起把卡时钟改到 GCC 的 `sdcc1_apps_clk_src`（400 kHz）再重做整套识别，
@@ -5299,9 +5452,11 @@ dd if=logfs.bin bs=512 skip=7 count=1 2>/dev/null | tr -d '\0'
   两块格，扫描到第一格没有 magic 就写那一格（头块多一个格号字），不再覆盖格 0，
   读完逐字/逐字节比对新记录，`v0.2.78` 起 panic 屏把自己画出的前 480 字节
   交给驱动导出的 `clover_emmc_panic_append`，追加成下一格 kind 20 记录，下一次
-  启动由 mode 20 读回最新一格、校验并武装供再下一次追加使用，仍然不发布
-  `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
-  时钟是不是还在移命令、数据阶段能不能自己走完」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
+  启动由 mode 20 读回最新一格、校验并武装供再下一次追加使用，`v0.2.79` 起 mode 21
+  通过 `drivers/CloverBlock` 发布 `IOBlockStorageDevice`，GPT、表项数组和 logfs
+  记录改由 `IOMedia` 读回（见上一节）。这些轮次量的是「固件留下的 SDHCI 窗口活不活、
+  卡还答不答、在哪个地址答、时钟是不是还在移命令、数据阶段能不能自己走完」。
+  根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，
   再由 mockfs 把它当作整个 `/`，`root-matching` 那条 UUID 匹配表还留在
   `/chosen` 里（`rd=md0` 会在等待循环之前就 `goto iofrootx`，所以它不参与）。
