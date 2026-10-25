@@ -1040,6 +1040,29 @@ kernel_args = [
   # device from offset zero is /sbin/launchd. Had this root been the RAMDisk image, that name would hold
   # a signed Mach-O and exec would have continued; errno 8 is positive evidence the bytes are the
   # partition's. What is left is content, not plumbing: logfs holds no root image yet.
+  # That last clause was then closed without rebuilding anything: the same v0.2.93 artifacts, with only
+  # `fastboot flash logfs round121-scratch-data.img` (35456 B, `fe27be32…`, first four bytes `cf fa ed fe`,
+  # cdhash already inside this board's trust cache) followed by a cold reboot. The panel answered
+  # `Got boot device = IOService:/ArmDTPlatform/CloverBlockDevice/IOBlockStorageDriver/Clover eMMC
+  # Media/IOGUIDPartitionScheme/logfs@39` -- the registry path names GPT entry 39 by its own partition
+  # label while `BSD root: md0s39, major 1, minor 39` still carries the alias, which is the exact shape
+  # step 9 was written for -- and then `signit returned, execing init` instead of errno 8, `el0 init:
+  # pid=1`, a fork, `el0 child: exec /sbin/launchd`, and `el0 mach: thread=259 task=515 host=771` +
+  # `reply=1827`. So the block stack, buffer cache, mockfs, rootauth bypass, exec and EL0 are all read
+  # through real eMMC storage. `Added memory device md0/rdmd0 (03000000/BE000000)` is still on the screen:
+  # the RAMDisk exists at major 3 and is not the root, which is the distinction the alias design depends on.
+  # Two caveats this reading leaves open. The flashed image is 35456 B inside an 8 MiB partition (round101:
+  # `lg i=39 a=12320768 b=12337151`), and mockfs's legacy mode makes the one file as large as the device, so
+  # byte 35457 onward is this partition's old self-report records -- nothing has read past the end yet, and
+  # either growing the image to the partition or adding the `N4KROOT` layout closes that. And the frame cut
+  # off mid-line at `el0 mach: msg=`, which is the next instrument reading rather than a failure.
+  # A fastboot fact worth keeping, because it overturns an obvious-looking inference: the name table behind
+  # `getvar partition-size:<name>` is not the name resolution behind `fastboot flash <name>`. This board
+  # lists sizes only for vendor/cache/userdata/system, answers `partition-size:logfs` and
+  # `partition-size:boot` with `FAILED (remote: 'GetVar Variable Not found')`, and still wrote both -- the
+  # flash reported `Sending 'logfs' (34 KB) OKAY` / `Writing 'logfs' OKAY` beside a
+  # `Warning: skip copying logfs image avb footer (logfs partition size: 0, …)` that is that missing size
+  # entry, not a failed write. "getvar has no such partition" cannot be used as "this partition does not exist".
   "rd=md0s39",
   # Round 72 died with SIGKILL (parent's wait4 read status 9) inside its first
   # mach_msg; round 73 bracketed that call with markers and added this boot-arg,

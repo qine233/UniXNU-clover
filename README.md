@@ -6776,6 +6776,61 @@ Process 1 exec of /sbin/launchd failed, errno 8 @kern_exec.c:8104
 
 这一帧里 `CloverBlock r121: auto …` 和 `BSD root: …` 已经被滚出画面，但上面那串推论不依赖它们：别名没写成功就挂不上根，挂不上根就到不了 exec。
 
+## round121 之后（同一份 v0.2.93 负载）：把根镜像写进 logfs，EL0 从 eMMC 起来
+
+**这一轮没有构建任何新产物。** 板上的内核、payload、ADT、trust cache、`unixnu.toml` 与 round121 逐字相同，七个文件的 SHA-256 一个没变。改动的只有 eMMC 里 `logfs` 分区的内容：
+
+```sh
+fastboot flash logfs ~/clover-out/round121-scratch-data.img   # 35456 B，fe27be32…
+fastboot reboot                                                # 冷刷
+```
+
+`round121-scratch-data.img` 就是 payload 里那份 scratch data 镜像，开头四个字节 `cf fa ed fe`（Mach-O 64 位小端），它的 cdhash 已经在 `round121-kernel.macho.trustcache`（`d310ae35…`）里 —— 也就是 mockfs legacy 模式下「整块设备从 0 起就是 `/sbin/launchd`」这句话，现在字面上成立了。
+
+一次刷机回答的那一个问题：**上一轮报 `errno 8` 的那段字节，是不是只差内容？** 屏上给的是「是」：
+
+```
+Waiting on <dict … <key>BSD Name</key><string …>md0s39</string></dict>
+Got boot device = IOService:/ArmDTPlatform/CloverBlockDevice/IOBlockStorageDriver/Clover eMMC Media/IOGUIDPartitionScheme/logfs@39
+BSD root: md0s39, major 1, minor 39
+ [clover] vfs_mountroot returned
+ [clover] devfs_kernel_mount returned
+ [clover] signit returned, execing init
+load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+load_init_program: attempting to load /sbin/launchd
+[clover] el0 init: pid=1 console fd=0 pagesize=4096
+[clover] el0 init: forked pid=2 x1=0
+[clover] el0 child: alive
+[clover] el0 child: pid=2 ppid=1 x0=2 x1=1
+[clover] el0 child: exec /sbin/launchd
+[clover] el0 init: pid=2 console fd=1 pagesize=4096
+[clover] el0 mach: thread=259 task=515 host=771
+[clover] el0 mach: reply=1827
+[clover] el0 mach: msg=          ← 画面在这里被截断
+```
+
+| 屏上的行 | 为什么是新的 |
+| --- | --- |
+| `Got boot device = …/IOGUIDPartitionScheme/logfs@39` | 注册路径里带着 GPT 表项的名字和编号：命中的正是 39 号 `logfs`，而 `BSD Name` 已经是别名 `md0s39`。宿主侧那次 `fastboot flash logfs` 落对了地方 |
+| `signit returned, execing init` | round121 卡在这之前的 `errno 8`；字节合法了，exec 走完 |
+| `el0 init: pid=1` → `forked pid=2` → `el0 child: exec /sbin/launchd` | EL0 真的在跑，而且是从 eMMC 上那份镜像里跑起来的 |
+| `el0 mach: thread=259 task=515 host=771` + `reply=1827` | round118 那三行 mach 握手第一次以「根在磁盘上」的身份重现；`reply=1827` 是拿到回复，不是超时 |
+| `Added memory device md0/rdmd0 (03000000/BE000000) …` | RAMDisk 还在（major 3），但它不再是根。两回事同时成立，正是别名设计要的形状 |
+| `CloverBlock r121: refire n=2 (already ran)` | 闩锁照常，重投只记账不重注册 |
+
+`vnode_create_internal: alias vnode (vid = 818394427) … (start)/(end)` 两行、`VM Swap Subsystem is ON`、`No POST boot-arg set.`，加上画面顶部的 `AppleImage4: magazine write failed; may be expected: 30`、`IONVRAMCHRHandler.cpp:serializeVariables:615 - No _nvramController` / `ret=0xe00002d8`、`install_apfs_vfs_fs:8240`、`apfs_sysctl_register:1407`，都是此前每轮就在的常态噪声，本轮不解释。
+
+一条 fastboot 工务记录，值得单独写下来，因为它推翻了一个看起来显然的推断：**`fastboot getvar partition-size:<name>` 的名字表不等于 `fastboot flash <name>` 的名字解析。** 本机 `getvar all` 只列 `vendor 0x80000000`、`cache 0x10000000`、`userdata 0xCAD753E00`、`system 0xC0000000` 四颗分区大小，`partition-size:boot` 与 `partition-size:logfs` 都回 `FAILED (remote: 'GetVar Variable Not found')` —— 而 `boot` 早就刷过、`logfs` 本轮也刷成功了（`Sending 'logfs' (34 KB) OKAY` / `Writing 'logfs' OKAY`）。所以「getvar 查不到」不能当「分区不存在」用。刷机时伴随一句 `Warning: skip copying logfs image avb footer (logfs partition size: 0, …)`，那是 fastboot 自己的大小表缺项导致的跳过，不是写入失败。
+
+一条还没被量到的代价：`logfs` 是 8 MiB（round101 的 `lg i=39 a=12320768 b=12337151`，一万六千三百八十四扇区），镜像只有 35456 字节。mockfs 的 legacy 模式把整块设备当作那一个文件，所以「`/sbin/launchd`」的第 35457 字节往后仍是这个分区早先留下的自证记录。目前为止 launchd 只读到 `msg=` 那一行，还没暴露出越界读；真要用这条路由，下一轮要么把镜像补齐到分区大小，要么换成带 `N4KROOT` 魔数的正经布局。
+
+```sh
+fastboot flash logfs ~/clover-out/round121-scratch-data.img
+fastboot reboot
+```
+
+**下一帧要问的：** `el0 mach: msg=` 后面被截断的那一行写了什么。它是本轮唯一没读回来的仪器数，也是「EL0 从 eMMC 起来之后，mach 握手到底交换了什么」这个问题的答案本体。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
