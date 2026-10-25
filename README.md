@@ -4115,6 +4115,134 @@ fastboot reboot
 | `c2`/`c3`/`c7`/`c13` 任何一步退步 | bring-up 退化（round95 之后不该发生） | 对照 round95 的表头与 `c0`/`c1` |
 | 只有 `CloverSdhci: failed at stage …` | 主机侧初始化失败 | 按 stage 查对应的寄存器 |
 
+## round96 读数：命令全通、数据没来 —— 坏在主机这一侧的两处
+
+照片原文（v0.2.68 报告的形状，末尾的 `@CloverSdhci.cpp:2155` 是 panic 调用点，不参与读数）：
+
+```text
+g cfg=00002017 m=01 n=fc d=fb up=1 br=00004221 ab=20008001
+h clk=0007 rst=1 clr=0002 pw=0b vs 00000a0e vs3 02626440
+c0 ok c1 ok t=3 to=0 rsp=c0ff8080
+c2 ok int=00000001
+c3 ok st=2 int=00000001
+c7 ok int=00000001
+c13 ok st=4 rsp=00000900
+c16 ok int=00000001
+c17 nodata int=00000021 ps=01f80af6 bs=0200
+hdr 00000000 00000000
+efi 0
+```
+
+逐项：
+
+- **识别与选中没有退化。** `c2`/`c3`/`c7`/`c13` 与 round95 逐字相同，`c13` 的 R1 仍是
+  `00000900`；表头与 `c0`/`c1` 也和 round92 起的所有读数一致。
+- **CMD16 被接受**（`int` 只有 RESPONSE）。块长 512 成立，不是被拒后继续。
+- **CMD17 的响应到了，数据阶段没有完成。** `int=00000021` = RESPONSE|DATA_AVAIL：命令收下了，
+  FIFO 报告过“有数据”。但没有 DATA_END，也没有任何数据错误位（DATA_TIMEOUT/CRC/END_BIT/ADMA
+  全为 0）—— 卡没有拒绝，也没有把 CRC 弄坏，只是没有把一块送完。
+- **`ps=01f80af6` 说明主机方向是对的、并且还在等。** 逐位：bit1 DATA_INHIBIT=1、bit2
+  DAT_LINE_ACTIVE=1、bit9 DOING_READ=1、bit8 DOING_WRITE=0、bit11 DATA_AVAILABLE=1，
+  DAT[7:4] 与 DAT[3:0] 全为 1（固件留下的 8-bit 总线），bit24 CMD_LVL=1（命令线空闲）。
+  读方向、FIFO 有字、数据机仍占线。
+- **`hdr` 的两个零不能当成“0 号扇区”。** `DATA_AVAILABLE` 只保证“至少有一个字”，而 mode 10
+  在拿到第一个 DATA_AVAIL 后无条件读满 128 个字；FIFO 空时读出来就是 0。这一轮没有证据说卡
+  送过任何非零字节。
+
+问题因此收敛到主机这一侧。对着 `sdhci-msm.c` 与 Linux 的 `sdhci.c` 逐行比，mode 10 与这条
+路有两处不同：
+
+1. **少写了 `SDHCI_TRNS_BLK_CNT_EN`。** `sdhci-msm` 不设 `SDHCI_QUIRK2_SUPPORT_SINGLE`，
+   所以 Linux 对单块传输也总是置块计数使能（`sdhci.c:1483`，`ds-sdhci.c:1173`）。mode 10
+   只写了 `TRANSFER_MODE=0x10`；MSM 的数据机可能根本没有“无块计数”的单块模式。
+2. **地址差 512 倍。** OCR `c0ff8080` 的 bit 30 是 CCS（高容量/扇区寻址）。Linux 在
+   `ds-mmc.c:2092` 看到它就 `mmc_card_set_blockaddr`，块层对这类卡**不左移 9 位**
+   （`ds-block.c:1661`）。mode 10 按字节寻址传了 512，实际问的是 LBA 512。
+
+另外把收尾的协议查清了：数据没结束时，Linux 用 CMD12 停传输、用 R1（`0x1a`，不是 R1B）解析
+应答，并且**只有停止命令可以越过 DATA_INHIBIT**（`sdhci.c:1675`）；CMD13 只走命令线，同样
+不必等数据机。
+
+## v0.2.69（round97）：补上块计数使能与扇区寻址，并把数据阶段逐步记下来
+
+mode 10 的路由不变（CMD2 关 CRC → CMD3 RCA 1 → CMD7 → CMD13 要求 `st=4`），改的是数据：
+
+1. **CMD16** 照旧 512，`c16` 仍单独报 verdict/INT_STATUS/R1。
+2. **读参数由这张卡自己的 OCR 决定**：`rsp10 & (1<<30)` 为真时 `ARGUMENT=1`（扇区号），
+   否则 `ARGUMENT=512`（字节）。报告里的 `ar=` 就是实际写进去的值。
+3. **`TRANSFER_MODE = READ | BLK_CNT_EN`**（`0x12`），`BLOCK_COUNT=1`。
+4. **FIFO 按 PRESENT_STATE 的实时电平排空**，不再按 INT_STATUS 的 DATA_AVAIL 事件：
+   后者是写 1 清除的粘滞位，round96 在两字已读完之后仍看到它。排空循环以 DATA_END 或数据错误
+   为出口，整体有 `1<<22` 上限；报告新增 `nw=`（实际取到的字数）与 `sm=`（它们的 32 位和），
+   “满块零”和“一个字节都没送”从此分得开。
+5. **DATA_END 没来就问卡**：CMD12（`R1`，`0x1a`）越过 DATA_INHIBIT 停下，再 CMD13 读状态，
+   两行分别是 `c12` 与 `c13b`。这样即使这一轮仍然没有数据，也能看到卡是被停住的、还是本来就
+   不在 data 状态。
+
+报告多了五行，所以 mode 11 的表头省掉 `vs`/`vs3` 两个自 round92 起没变过的 vendor 选择子
+（`clk=`/`rst=`/`clr=` 仍能回答时钟问题），最坏约 416 字节。
+
+```text
+g cfg=00002017 m=01 n=fc d=fb up=1 br=00004221 ab=20008001
+h clk=0007 rst=1 clr=0002 pw=0b
+c0 ok c1 ok t=3 to=0 rsp=c0ff8080
+c2 ok int=00000001
+c3 ok st=2
+c7 ok int=00000001
+c13 ok st=4
+c16 ok int=00000001 r=00000900
+c17 ok int=00000003 ar=1 tm=12
+ev nc=3 ia=00000001 ns=8 nw=128
+ps a=01f80000 e=01f80af6
+hdr 20494645 54524150 sm=00000000
+efi 1
+```
+
+（示意值；`efi 1` 当且仅当排空到的头两个字是 `0x20494645 0x54524150`。）
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `c17 ok` + `efi 1` | 数据通路工作、扇区寻址正确、LBA 1 真是 GPT 头 | 读完整 GPT 头与分区表，找目标分区 |
+| `c17 ok` + `efi 0` + `nw=128` + `sm` 非零 | 传输完成但字节不同：地址单位或字序 | 用 `hdr` 对照 LBA 0/1 与字节交换 |
+| `c17 ok` + `nw=128` + `sm=00000000` | 块到了但全零 | 换一个已知非零的 LBA（如 GPT 备份头在最后） |
+| `c17 nodata` + `nw=0` | 卡仍然一个字节都不送 | 看 `c12`/`c13b`：卡是否在 data 状态、CMD12 是否被接受 |
+| `c17 nodata` + `nw>0` | 送了一部分就停 | `ns=` 是数据机轮询次数；查 `TIMEOUT_CONTROL` 与块长 |
+| `c17 dto` / `dcrc` / `dend` | 数据阶段自己报错 | 400 kHz 下不像信号问题，先查总线宽度/电源 |
+| `c17` = `to`/`crc`/`idx` | 卡拒绝读命令 | 看 `c16` 与 `c13`，可能需要先修 SET_BLOCKLEN |
+| `c12`/`c13b` 也 `busy` | 数据机占住命令槽，复位也不自清 | 下一轮先 `RESET_CMD|RESET_DATA` 再重问 |
+| `c2`…`c13` 任何一步退步 | bring-up 退化 | 对照 round95/96 的表头与 `c0`/`c1` |
+
+产物（内核变了；root / trust cache / boot 镜像仍未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round97-payload.img` | 58720256 B | `7421daa6c142a234ddc87eb1547ae059d58a13219121d2e36867eeb00842df86` |
+| `round97-kernel.macho`（构建产物） | 51949568 B | `c2258d4c27a9a781feaaa97b246438379c8592cf09609b3bd373f951e74397a6` |
+| `round97-in-volume-kernel.macho`（卷内副本） | 51949568 B | `efaff4b2a84dd7490319ec1ce209f31e3e3aa9a466bb096202e526794e24527e` |
+| `round97-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round97-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round97-kernel.macho.adt` | 13476 B | `cc440e68f47903c7df9fe2d195012ed98c392b507a54ace922c1945b1d88c75d` |
+| `round97-unixnu.toml` | 554 B | `8dcf7bb48644fdea7129a7c5188539e7dfca0b0462051a992806ec14b4d64cd7` |
+
+校验器：探针 35 处 5960 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在。反汇编
+`__ZL11coldBringUpbj` 里有一条 `#0x12`（`TRANSFER_MODE = READ|BLK_CNT_EN`）紧跟 `#0x113a`
+（CMD17），两条 `#0x101a`（CMD16）、一条 `#0xc1a`（CMD12）与三条 `#0xd1a`（CMD13，`0x1a`
+即不带 BUSY 的 R1）；OCR 判断是 `tst w9, #0x40000000` + `csinc w12, w9, wzr, eq`，位 30
+置位时参数为 1、否则 512。报告字面量这次被编译器直接折成立即数写进缓冲区（函数变大后
+`emitText` 被内联，`__cstring` 里因此找不到 `c17`；写 `gReportLength` 与
+`clover_emmc_report` 的 `strb` 序列在反汇编尾部可见）。卷内 boot-args 末尾是
+`… clover-pmgr=2 clover-emmc=11 armcpu-clock-panic=60000`。boot 仍是
+`round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round97-payload.img
+fastboot reboot
+```
+
+**拍一张就够。**
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -4130,7 +4258,8 @@ fastboot reboot
   `v0.2.66` 起把 CRC 开关与重武装的先后对调（先关 CRC 的首槽位，再带 CRC 的重武装后槽位，
   并补上 CMD9/CMD13），`v0.2.67` 起不再走带校验的 CMD2，改用 CMD2(关校验)/CMD3/CMD13/CMD9/CMD7
   把卡第一次送进 transfer，`v0.2.68` 起发第一颗数据命令（CMD16 设块长 + CMD17 PIO 单块读
-  byte 512，前五个字节应是 `EFI PART`），仍然不发布
+  byte 512，前五个字节应是 `EFI PART`），`v0.2.69` 起按 Linux 的 MSM 路径给单块传输置块计数
+  使能、并按 OCR bit 30 改用扇区号，数据阶段把实际取到的字数与校验和写进报告，仍然不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令、数据阶段能不能自己走完」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，

@@ -138,9 +138,24 @@
 // Mode 10 is therefore mode 9 minus CMD9, plus the first data command this port has ever sent:
 // CMD16 (SET_BLOCKLEN 512, non-fatal -- 512 is already the reset length), then CMD17 READ with
 // PIO and a single 512-byte block from byte 512, which on a GPT disk is LBA 1: the header that
-// starts with "EFI PART". Two words of the FIFO and an efi flag are the reading; the rest is
-// drained because the card will not report DATA_END with a full buffer. The data phase at 392 kHz
-// lasts about 10 ms, hence the same bounded polls as everywhere else.
+// starts with "EFI PART". Two words of the FIFO and an efi flag are the reading.
+//
+// Mode 10's photograph: c2/c3/c7/c13/c16 all ok, then `c17 nodata int=00000021 ps=01f80af6 bs=0200`
+// -- the response was accepted and DATA_AVAIL fired, but DATA_END never set, the two FIFO words
+// were zero, and PRESENT_STATE still showed DATA_INHIBIT, DOING_READ, DATA_AVAILABLE and DAT3..0
+// high. The direction is right; the card is not delivering. Two host-side differences from Linux's
+// own path on this controller are visible in its sources. sdhci-msm does not set
+// SDHCI_QUIRK2_SUPPORT_SINGLE, so Linux always sets BLK_CNT_EN even for one block
+// (sdhci.c:1483), while mode 10 sent TRANSFER_MODE 0x10 alone. And the OCR has bit 30
+// (rsp=c0ff8080), so mmc core marks the card block-addressed and the block layer passes the LBA
+// through unshifted (ds-mmc.c:2092, ds-block.c:1661), while mode 10 asked for byte 512 -- LBA 512.
+// Mode 11 applies both and keeps every step as a reading: CMD16 still sent so a rejection is seen,
+// the FIFO drained only while PRESENT_STATE's live level says a word is there (INT_STATUS's
+// DATA_AVAIL is a sticky event this driver never acknowledges, which is why `int=00000021` still
+// carried it after two reads), the word count and sum printed so "zeros" and "nothing sent" cannot
+// be confused, and -- if DATA_END still does not come -- CMD12 then CMD13, because the stop command
+// is the one command Linux lets past DATA_INHIBIT (sdhci.c:1675). The data phase at 392 kHz lasts
+// about 10 ms, hence the same bounded polls as everywhere else.
 //
 // Every path that is not the success path panics, because on this board silence is not a reading.
 // Round87's photograph also settled what the watchdog is worth here: ticks=0 at this scheduling
@@ -732,11 +747,16 @@ static void cmd13Sweep (void)
 static const uint32_t kEmmcOcr = 0x40FF8080;
 static const uint32_t kIdentifyDivider = 255;
 static const uint32_t kCmd1Retries = 200;
+// One 512-byte block is 128 32-bit FIFO words; the buffer register is 32-bit access only.
+static const uint32_t kBlockWords = 128;
 
-static bool waitCommandSlot (void)
+static bool waitCommandSlot (bool ignoreDataInhibit)
 {
   uint32_t guard = 0;
-  while (read32 (SDHCI_PRESENT_STATE) & (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT)) {
+  const uint32_t mask = ignoreDataInhibit
+                        ? SDHCI_CMD_INHIBIT
+                        : (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT);
+  while (read32 (SDHCI_PRESENT_STATE) & mask) {
     if (++guard >= kCommandSpinLimit) {
       return false;
     }
@@ -744,13 +764,19 @@ static bool waitCommandSlot (void)
   return true;
 }
 
+static bool waitCommandSlot (void)
+{
+  return waitCommandSlot (false);
+}
+
 // Returns the command group of INT_STATUS. `sent` is false when the register was never written,
 // which is a host verdict, not a card one. The response words are read even after an error: a CRC
 // error still leaves the bits that arrived in the register, and that is evidence.
-static uint32_t runCommand (uint16_t command, uint32_t argument, bool &sent,
-                            uint32_t &response0, uint32_t &response1, uint32_t &spins)
+static uint32_t runCommandWith (uint16_t command, uint32_t argument, bool &sent,
+                                uint32_t &response0, uint32_t &response1, uint32_t &spins,
+                                bool ignoreDataInhibit)
 {
-  sent = waitCommandSlot ();
+  sent = waitCommandSlot (ignoreDataInhibit);
   if (!sent) {
     response0 = 0;
     response1 = 0;
@@ -774,6 +800,22 @@ static uint32_t runCommand (uint16_t command, uint32_t argument, bool &sent,
   response0 = read32 (SDHCI_RESPONSE);
   response1 = read32 (SDHCI_RESPONSE + 4);
   return status;
+}
+
+static uint32_t runCommand (uint16_t command, uint32_t argument, bool &sent,
+                            uint32_t &response0, uint32_t &response1, uint32_t &spins)
+{
+  return runCommandWith (command, argument, sent, response0, response1, spins, false);
+}
+
+// The one command Linux lets through while the data circuit is still busy is the stop command
+// (sdhci.c:1675, "We shouldn't wait for data inhibit for stop commands, even though they might
+// use busy signaling"). CMD13 is the same kind of question: it uses the command line only, so a
+// stuck DAT line must not keep it from being asked. Everything else still waits for both.
+static uint32_t runCommandBusy (uint16_t command, uint32_t argument, bool &sent,
+                                uint32_t &response0, uint32_t &response1, uint32_t &spins)
+{
+  return runCommandWith (command, argument, sent, response0, response1, spins, true);
 }
 
 static const char *commandVerdict (uint32_t status, bool sent)
@@ -1253,6 +1295,29 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   const char *verdictId10 = "skip", *verdictAddr10 = "skip", *verdictSel10 = "skip";
   const char *verdictState10 = "skip", *verdictBlk = "skip", *verdictRead = "skip";
 
+  // Mode 11: mode 10's chain with the two host-side differences from Linux's MSM path repaired,
+  // and every step of the data phase kept as a reading. The names carry the mode so a later
+  // photograph cannot be read against the wrong round's line.
+  bool sentId11 = false, sentAddr11 = false, sentSel11 = false, sentState11 = false;
+  bool sentBlk11 = false, sentRead11 = false, drained11 = false, attemptedStop11 = false;
+  bool sentStop11 = false, sentAfter11 = false;
+  bool idOk11 = false, addrOk11 = false, selOk11 = false, stateOk11 = false, blkOk11 = false;
+  uint32_t idStatus11 = 0, addrStatus11 = 0, selStatus11 = 0, stateStatus11 = 0;
+  uint32_t blkStatus11 = 0, readStatus11 = 0, stopStatus11 = 0, afterStatus11 = 0;
+  uint32_t idRsp11 = 0, idRsp11b = 0, addrRsp11 = 0, addrRsp11b = 0;
+  uint32_t selRsp11 = 0, selRsp11b = 0, stateRsp11 = 0, stateRsp11b = 0;
+  uint32_t blkRsp11 = 0, blkRsp11b = 0, rdRsp11 = 0;
+  uint32_t stopRsp11 = 0, stopRsp11b = 0, afterRsp11 = 0, afterRsp11b = 0;
+  uint32_t spinsId11 = 0, spinsAddr11 = 0, spinsSel11 = 0, spinsState11 = 0, spinsBlk11 = 0;
+  uint32_t spinsCmd11 = 0, spinsBrr11 = 0, spinsStop11 = 0, spinsAfter11 = 0;
+  uint32_t statusCmd11 = 0, statusEnd11 = 0;
+  uint32_t psCmd11 = 0, psEnd11 = 0, readArg11 = 0, transferMode11 = 0;
+  uint32_t hdr11a = 0, hdr11b = 0, drainSum11 = 0, drainWords11 = 0;
+  const char *verdictId11 = "skip", *verdictAddr11 = "skip", *verdictSel11 = "skip";
+  const char *verdictState11 = "skip", *verdictBlk11 = "skip", *verdictRead11 = "skip";
+  const char *verdictStop11 = "skip", *verdictAfter11 = "skip";
+
+
   bool cmd2Ok = false;
   if (probeMode == 0) {
     if (ready) {
@@ -1553,6 +1618,162 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
         verdictRead = dataVerdict (readStatus, sentRead);
       }
     }
+  } else if (probeMode == 11 && hostReady && ready) {
+    // Round96 accepted CMD17 (RESPONSE|DATA_AVAIL) but never saw DATA_END, and the FIFO returned
+    // zeros. Two host-side differences from Linux's path on this exact controller are repaired
+    // here, and every step is kept as a reading so a remaining failure names itself:
+    //   1. OCR bit 30 is set (rsp=c0ff8080), so the card is sector addressed: mmc core marks
+    //      MMC_STATE_BLOCKADDR from that bit and the block layer sends `blk_rq_pos` unchanged,
+    //      shifting by 9 only for byte-addressed cards. LBA 1 is therefore argument 1 here.
+    //   2. sdhci-msm does not set SDHCI_QUIRK2_SUPPORT_SINGLE, so Linux always sets BLK_CNT_EN
+    //      for a one-block transfer (sdhci.c:1483). Round96 sent TRANSFER_MODE 0x10 alone; the
+    //      MSM data machine may simply have no single-block mode to fall back on.
+    idStatus11 = runCommand (SDHCI_MAKE_CMD (2, SDHCI_CMD_RESP_LONG), 0,
+                             sentId11, idRsp11, idRsp11b, spinsId11);
+    verdictId11 = probeVerdict (idStatus11, sentId11);
+    idOk11 = sentId11 && (idStatus11 & SDHCI_INT_RESPONSE) &&
+             !(idStatus11 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                             SDHCI_INT_INDEX));
+    if (idOk11) {
+      addrStatus11 = runCommand (SDHCI_MAKE_CMD (3, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                 SDHCI_CMD_INDEX), kProbeRca << 16,
+                                 sentAddr11, addrRsp11, addrRsp11b, spinsAddr11);
+      verdictAddr11 = probeVerdict (addrStatus11, sentAddr11);
+      addrOk11 = sentAddr11 && (addrStatus11 & SDHCI_INT_RESPONSE) &&
+                 !(addrStatus11 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                   SDHCI_INT_INDEX));
+    }
+    if (addrOk11) {
+      selStatus11 = runCommand (SDHCI_MAKE_CMD (7, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                SDHCI_CMD_INDEX), kProbeRca << 16,
+                                sentSel11, selRsp11, selRsp11b, spinsSel11);
+      verdictSel11 = probeVerdict (selStatus11, sentSel11);
+      selOk11 = sentSel11 && (selStatus11 & SDHCI_INT_RESPONSE) &&
+                !(selStatus11 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                 SDHCI_INT_INDEX));
+    }
+    if (selOk11) {
+      stateStatus11 = runCommand (SDHCI_MAKE_CMD (13, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                  SDHCI_CMD_INDEX), kProbeRca << 16,
+                                  sentState11, stateRsp11, stateRsp11b, spinsState11);
+      verdictState11 = probeVerdict (stateStatus11, sentState11);
+      stateOk11 = sentState11 && (stateStatus11 & SDHCI_INT_RESPONSE) &&
+                  !(stateStatus11 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                     SDHCI_INT_INDEX)) &&
+                  (((stateRsp11 >> 9) & 0xfu) == 4);
+    }
+    if (stateOk11) {
+      // SET_BLOCKLEN is still sent: the reset length is the card's own READ_BL_LEN (9), but
+      // saying it makes a rejection visible instead of assumed.
+      blkStatus11 = runCommand (SDHCI_MAKE_CMD (16, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                SDHCI_CMD_INDEX), 512,
+                                sentBlk11, blkRsp11, blkRsp11b, spinsBlk11);
+      verdictBlk11 = probeVerdict (blkStatus11, sentBlk11);
+      blkOk11 = sentBlk11 && (blkStatus11 & SDHCI_INT_RESPONSE) &&
+                !(blkStatus11 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                 SDHCI_INT_INDEX));
+      bool canRead11 = blkOk11 ? true : resetCommandCircuit ();
+      if (canRead11 && !waitCommandSlot ()) {
+        verdictRead11 = "busy";
+      } else if (canRead11) {
+        // Sector 1 for a sector-addressed card, byte 512 otherwise; decided from the OCR this
+        // boot actually returned rather than from a constant.
+        readArg11 = (rsp10 & 0x40000000u) ? 1u : 512u;
+        transferMode11 = SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN;
+        // Same order as Linux: timeout, size, count, argument, transfer mode, command. INT_STATUS
+        // is cleared last so the command's own completion is the first bit seen.
+        write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
+        write16 (SDHCI_BLOCK_SIZE, 512);
+        write16 (SDHCI_BLOCK_COUNT, 1);
+        write32 (SDHCI_INT_STATUS, 0xffffffffu);
+        write32 (SDHCI_ARGUMENT, readArg11);
+        write16 (SDHCI_TRANSFER_MODE, static_cast<uint16_t> (transferMode11));
+        write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (17, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                 SDHCI_CMD_INDEX | SDHCI_CMD_DATA));
+        sentRead11 = true;
+        uint32_t status = 0;
+        for (spinsCmd11 = 0;; spinsCmd11++) {
+          status = read32 (SDHCI_INT_STATUS);
+          if (status & SDHCI_INT_CMD_MASK) {
+            break;
+          }
+          if (spinsCmd11 >= kCommandSpinLimit) {
+            break;
+          }
+        }
+        statusCmd11 = status;
+        // Present state here says whether the data machine had even started when the response
+        // arrived, and the response the card actually sent is what round96 never read.
+        psCmd11 = read32 (SDHCI_PRESENT_STATE);
+        rdRsp11 = read32 (SDHCI_RESPONSE);
+        bool cmdOk11 = (status & SDHCI_INT_RESPONSE) &&
+                       !(status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                   SDHCI_INT_INDEX));
+        statusEnd11 = status;
+        if (cmdOk11) {
+          // The FIFO's own level bit is PRESENT_STATE[11], not INT_STATUS[DATA_AVAIL]: the status
+          // bit is a sticky event that this driver never acknowledges, which is why round96's
+          // `int=00000021` still carried it after two words had been read. One bounded loop reads
+          // a word whenever the live level says one is there and stops on DATA_END or a data
+          // error, so a card that stops mid-block produces a report instead of a silent hang.
+          for (spinsBrr11 = 0;; spinsBrr11++) {
+            status = read32 (SDHCI_INT_STATUS);
+            if (status & (SDHCI_INT_DATA_END | SDHCI_INT_DATA_TIMEOUT |
+                          SDHCI_INT_DATA_CRC | SDHCI_INT_DATA_END_BIT |
+                          SDHCI_INT_ADMA_ERROR)) {
+              break;
+            }
+            if ((read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE) &&
+                drainWords11 < kBlockWords) {
+              uint32_t word = read32 (SDHCI_BUFFER);
+              if (drainWords11 == 0) {
+                hdr11a = word;
+              } else if (drainWords11 == 1) {
+                hdr11b = word;
+              }
+              drainSum11 += word;
+              drainWords11++;
+            }
+            if (spinsBrr11 >= kCommandSpinLimit) {
+              break;
+            }
+          }
+          // DATA_END can set in the same read that the last word lands, so what is still in the
+          // FIFO is taken here; the cap is one block either way.
+          while (drainWords11 < kBlockWords &&
+                 (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
+            uint32_t word = read32 (SDHCI_BUFFER);
+            if (drainWords11 == 0) {
+              hdr11a = word;
+            } else if (drainWords11 == 1) {
+              hdr11b = word;
+            }
+            drainSum11 += word;
+            drainWords11++;
+          }
+          drained11 = drainWords11 > 0;
+          statusEnd11 = status;
+        }
+        psEnd11 = read32 (SDHCI_PRESENT_STATE);
+        readStatus11 = statusEnd11;
+        verdictRead11 = dataVerdict (readStatus11, sentRead11);
+        // A data phase that did not end is asked to stop in the card's own protocol, and then
+        // CMD13 says which state the card is in afterwards. Both wait on the command line only:
+        // Linux does that for the stop command, and CMD13 does not touch DAT at all.
+        if (cmdOk11 && !(readStatus11 & SDHCI_INT_DATA_END)) {
+          attemptedStop11 = true;
+          stopStatus11 = runCommandBusy (SDHCI_MAKE_CMD (12, SDHCI_CMD_RESP_SHORT |
+                                                          SDHCI_CMD_CRC | SDHCI_CMD_INDEX), 0,
+                                          sentStop11, stopRsp11, stopRsp11b, spinsStop11);
+          verdictStop11 = probeVerdict (stopStatus11, sentStop11);
+          afterStatus11 = runCommandBusy (SDHCI_MAKE_CMD (13, SDHCI_CMD_RESP_SHORT |
+                                                           SDHCI_CMD_CRC | SDHCI_CMD_INDEX),
+                                           kProbeRca << 16, sentAfter11, afterRsp11,
+                                           afterRsp11b, spinsAfter11);
+          verdictAfter11 = probeVerdict (afterStatus11, sentAfter11);
+        }
+      }
+    }
   }
 
   clover_emmc_observation[0] = cfgBefore;
@@ -1617,6 +1838,18 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
     clover_emmc_observation[13] = hdr0;
     clover_emmc_observation[14] = hdr1;
     clover_emmc_observation[15] = read32 (SDHCI_PRESENT_STATE);
+  } else if (probeMode == 11) {
+    // The chain, then the data phase's three statuses and the R1 the card gave CMD17, then the
+    // two header words and the checksum of the whole drained block.
+    clover_emmc_observation[7] = idStatus11;
+    clover_emmc_observation[8] = addrStatus11;
+    clover_emmc_observation[9] = selStatus11;
+    clover_emmc_observation[10] = stateStatus11;
+    clover_emmc_observation[11] = blkStatus11;
+    clover_emmc_observation[12] = statusEnd11;
+    clover_emmc_observation[13] = rdRsp11;
+    clover_emmc_observation[14] = hdr11a;
+    clover_emmc_observation[15] = hdr11b;
   }
 
   gReportLength = 0;
@@ -1647,10 +1880,15 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   emitHex (clockCleared, 4);
   emitText (" pw=");
   emitHex (powerAfter, 2);
-  emitText (" vs ");
-  emitHex (vendorAfter, 8);
-  emitText (" vs3 ");
-  emitHex (vendor3After, 8);
+  // Mode 11's data phase needs five more lines than mode 10's, and the report buffer is 511
+  // bytes. The two vendor selectors have been stable since round92 and are only needed when the
+  // clock itself is in question, which `clk=` and the CMD0/CMD1 row already answer.
+  if (probeMode != 11) {
+    emitText (" vs ");
+    emitHex (vendorAfter, 8);
+    emitText (" vs3 ");
+    emitHex (vendor3After, 8);
+  }
 
   emitText ("\nc0 ");
   emitText (hostReady ? commandVerdict (status0, sent0) : "skip");
@@ -1861,7 +2099,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
       emitText (" rsp=");
       emitHex (state2Rsp0, 8);
     }
-  } else {
+  } else if (probeMode == 10) {
     // Mode 10: the same chain without the CID or CSD lines, plus the data command and the first
     // two words of what it returned. `efi 1` means those bytes are "EFI PART", i.e. LBA 1 really
     // is the GPT header and the data path works; `efi 0` with `c17 ok` means the transfer
@@ -1918,6 +2156,89 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
       bool efi = drained && hdr0 == 0x20494645u && hdr1 == 0x54524150u;
       emitText ("\nefi ");
       emitDec (efi ? 1 : 0);
+    }
+  } else if (probeMode == 11) {
+    // Mode 11: mode 10's chain, then the same read with BLK_CNT_EN set and the card's own
+    // addressing. `nw` is how many FIFO words actually arrived and `sm` their 32-bit sum, so a
+    // block of zeros and a block that was never sent cannot be read alike. `ev` carries the
+    // command-completion spins/status and the whole data-phase poll count.
+    emitText ("\nc2 ");
+    emitText (verdictId11);
+    emitText (" int=");
+    emitHex (idStatus11, 8);
+    emitText ("\nc3 ");
+    emitText (verdictAddr11);
+    if (sentAddr11) {
+      emitText (" st=");
+      emitDec ((addrRsp11 >> 9) & 0xfu);
+    }
+    emitText ("\nc7 ");
+    emitText (verdictSel11);
+    if (sentSel11) {
+      emitText (" int=");
+      emitHex (selStatus11, 8);
+    }
+    emitText ("\nc13 ");
+    emitText (verdictState11);
+    if (sentState11) {
+      emitText (" st=");
+      emitDec ((stateRsp11 >> 9) & 0xfu);
+    }
+    emitText ("\nc16 ");
+    emitText (verdictBlk11);
+    if (sentBlk11) {
+      emitText (" int=");
+      emitHex (blkStatus11, 8);
+      emitText (" r=");
+      emitHex (blkRsp11, 8);
+    }
+    emitText ("\nc17 ");
+    emitText (verdictRead11);
+    if (sentRead11) {
+      emitText (" int=");
+      emitHex (readStatus11, 8);
+      emitText (" ar=");
+      emitDec (readArg11);
+      emitText (" tm=");
+      emitHex (transferMode11, 2);
+      emitText ("\nev nc=");
+      emitDec (spinsCmd11);
+      emitText (" ia=");
+      emitHex (statusCmd11, 8);
+      emitText (" ns=");
+      emitDec (spinsBrr11);
+      emitText (" nw=");
+      emitDec (drainWords11);
+      emitText ("\nps a=");
+      emitHex (psCmd11, 8);
+      emitText (" e=");
+      emitHex (psEnd11, 8);
+      emitText ("\nhdr ");
+      emitHex (hdr11a, 8);
+      emitText (" ");
+      emitHex (hdr11b, 8);
+      emitText (" sm=");
+      emitHex (drainSum11, 8);
+      emitText ("\nefi ");
+      emitDec (drained11 && hdr11a == 0x20494645u && hdr11b == 0x54524150u ? 1 : 0);
+    }
+    if (attemptedStop11) {
+      emitText ("\nc12 ");
+      emitText (verdictStop11);
+      if (sentStop11) {
+        emitText (" st=");
+        emitDec ((stopRsp11 >> 9) & 0xfu);
+      }
+      emitText (" int=");
+      emitHex (stopStatus11, 8);
+      emitText ("\nc13b ");
+      emitText (verdictAfter11);
+      if (sentAfter11) {
+        emitText (" st=");
+        emitDec ((afterRsp11 >> 9) & 0xfu);
+        emitText (" r=");
+        emitHex (afterRsp11, 8);
+      }
     }
   }
   emitByte ('\n');
@@ -2123,7 +2444,7 @@ extern "C" void clover_emmc_run (void)
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
   // the storage instrument it was asked for.
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
-      mode != 8 && mode != 9 && mode != 10) {
+      mode != 8 && mode != 9 && mode != 10 && mode != 11) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -2145,7 +2466,7 @@ extern "C" void clover_emmc_run (void)
       emmcFail (4, kGccPhys);
     }
     coldBringUp (mode == 5,
-                 (mode == 7 || mode == 8 || mode == 9 || mode == 10) ? mode : 0);
+                 (mode == 7 || mode == 8 || mode == 9 || mode == 10 || mode == 11) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.
