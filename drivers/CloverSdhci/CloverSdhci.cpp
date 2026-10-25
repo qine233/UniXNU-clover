@@ -1476,6 +1476,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   uint32_t entryBlocks14 = 0, entryFail14 = 0, entryGot14 = 0;
   uint32_t entryFound14 = 0, entryFirst14 = 0, entryLast14 = 0;
   uint32_t entryType14 = 0, entryTypeB14 = 0;
+  uint32_t entryFirstIdx15 = 0, entryFirstA15 = 0, entryFirstW15[3] = { 0, 0, 0 };
   bool entryOk14 = false, entryBad14 = false;
 
   bool cmd2Ok = false;
@@ -2031,11 +2032,26 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
               }
               for (uint32_t e = 0; e < perBlock && (b * perBlock + e) < entryEn14; e++) {
                 const uint32_t *entry = &gEntryBlock[e * entryWords];
-                // Name is UTF-16LE at byte 56: "logfs" plus its terminator is exactly words
-                // 14..16 of a 128-byte entry. Matching the terminator too keeps "logfsx" out.
-                if (entryWords >= 17 && entry[14] == 0x6f6cu && entry[15] == 0x6667u &&
-                    entry[16] == 0x0073u) {
-                  entryFound14 = b * perBlock + e + 1;   // 1-based, the way the kernel names it
+                // Name is UTF-16LE at byte 56: each character is two bytes, so "logfs" plus
+                // its terminator spans words 14..16 as 0x006f006c, 0x00660067, 0x00000073.
+                // Round100 compared the first two against 0x6f6c/0x6667 -- the same letters
+                // with the zero bytes squeezed out -- read all 16 entry blocks cleanly and
+                // matched nothing. Matching the terminator too keeps "logfsx" out.
+                const uint32_t index = b * perBlock + e + 1;
+                if (probeMode >= 15 && entryFirstIdx15 == 0 && entryWords >= 17 &&
+                    (entry[0] | entry[1] | entry[2] | entry[3]) != 0) {
+                  // The first used entry, for calibrating the encoding if the name still does
+                  // not match: its raw name words and start LBA say where and how names are
+                  // stored independently of the one string this round is looking for.
+                  entryFirstIdx15 = index;
+                  entryFirstA15 = entry[8];
+                  entryFirstW15[0] = entry[14];
+                  entryFirstW15[1] = entry[15];
+                  entryFirstW15[2] = entry[16];
+                }
+                if (entryWords >= 17 && entry[14] == 0x006f006cu && entry[15] == 0x00660067u &&
+                    entry[16] == 0x00000073u) {
+                  entryFound14 = index;   // 1-based, the way the kernel names it
                   entryFirst14 = entry[8];
                   entryLast14 = entry[10];
                   entryType14 = entry[0];
@@ -2535,6 +2551,21 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             emitText (" ");
             emitHex (entryTypeB14, 8);
           }
+          if (probeMode >= 15 && entryFound14 == 0 && entryFirstIdx15) {
+            // Calibration: raw words 14..16 and the start LBA of the first used entry. On this
+            // board that is xbl at LBA 131072, so 00620078 0000006c 00000000 confirms both the
+            // UTF-16LE packing and the place the entry array was read from.
+            emitText ("\ne0 i=");
+            emitDec (entryFirstIdx15);
+            emitText (" w=");
+            emitHex (entryFirstW15[0], 8);
+            emitText (" ");
+            emitHex (entryFirstW15[1], 8);
+            emitText (" ");
+            emitHex (entryFirstW15[2], 8);
+            emitText (" a=");
+            emitDec (entryFirstA15);
+          }
           emitText ("\nps e=");
           emitHex (psEnd11, 8);
           emitText (" clk=");
@@ -2819,7 +2850,7 @@ extern "C" void clover_emmc_run (void)
   // the storage instrument it was asked for.
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
       mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12 && mode != 13 &&
-      mode != 14) {
+      mode != 14 && mode != 15) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -2840,7 +2871,7 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp (mode == 5, (mode >= 7 && mode <= 14) ? mode : 0);
+    coldBringUp (mode == 5, (mode >= 7 && mode <= 15) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.

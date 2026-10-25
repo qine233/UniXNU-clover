@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: the GPT entry array, looking for logfs"
+title = "clover emmc: the logfs entry, with the name read as UTF-16"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1190,7 +1190,18 @@ kernel_args = [
   # at 12320768 and is 16384 sectors long, so "lg i=39 a=12320768 b=12337151" would be an
   # independent confirmation; a clean scan with "i=0" means the name is not where the header
   # points, and "ok=0" names the block that failed.
-  "clover-emmc=14",
+  # Round100's photograph: "sc el=2 en=64 es=128 b=16 ok=1", "lg i=0", "efi 1". Every one of
+  # the 16 entry blocks was read cleanly, so the array, the address and the data path are all
+  # right; nothing matched because the comparison constants were wrong. A GPT name is UTF-16LE:
+  # "logfs" is 6C 00 6F 00 67 00 66 00 73 00 00 00, i.e. words 14/15/16 = 0x006f006c,
+  # 0x00660067, 0x00000073. Mode 14 compared the first two against 0x6f6c/0x6667 -- the same
+  # letters with the zero bytes squeezed out -- while word 16's 0x0073 is numerically the same as
+  # 0x00000073, so exactly the first two comparisons were wrong. Mode 15 uses the packed
+  # words. If the name still does not match it prints the first used entry's raw words 14..16
+  # and start LBA: "e0 i=1 w=00620078 0000006c 00000000 a=131072" is xbl on this board, and that
+  # line calibrates the encoding and the entry-array origin without trusting the string under
+  # test. "lg i=39 a=12320768 b=12337151" is still the expected positive.
+  "clover-emmc=15",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)
