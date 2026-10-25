@@ -7618,6 +7618,21 @@ fastboot flash userdata /Users/zhouzhou/clover-out/round128-userdata-root.img   
 fastboot flash cache    /Users/zhouzhou/clover-out/round128-payload.img         # 56 MiB，441a3169…
 ```
 
+**上面第一条在 macOS 上刷不动，这是宿主的限制，不是设备的。** 实测 macOS 把单次 `read()` 截在
+2147483647 字节（请求 9.38 GB 只回 2 GiB − 1），而 fastboot 的 raw 路径是「一次读完整张文件」，
+于是报 `fastboot: error: Failed reading from userdata` —— 一个字节都没写到卡上。
+`fastboot -S 512M` 能绕开这次大读，但它把连续全零的块编成 DONT_CARE，也就是**那些块不写**，留在卡上的
+是原装 Android `/data` 的旧字节；`img2simg` 同样做零检测。所以要「Apple 的字节一个不改」就别用它俩：
+`scripts/make-clover-sparse.py`（新）把原镜像封装成 **只有 CHUNK_TYPE_RAW 块**的 Android sparse 容器
+（280 块 × 32 MiB，块大小 4096，头 `image_checksum` 是展开数据的标准 CRC-32，不加 per-chunk CRC —— 写坏了
+会让刷到一半失败），fastboot 走 sparse 路径就是逐块读、逐块写，字节与原镜像逐位相同。产物
+`round128-userdata-root.sparse.img`（9382661436 B，`be354a4a…`），`--verify` 已经把 280 块逐块 sha256
+比过原镜像：
+
+```
+fastboot flash userdata /Users/zhouzhou/clover-out/round128-userdata-root.sparse.img
+```
+
 冷刷，不用 `fastboot boot`。菜单第一行应认得 `clover r128: apfs reads iPadOS's own container off userdata`。
 读数还是同一行形状 `CloverBlock r128: apfs f=… n=… m=… l=… d=… s=… c=… v=… r=… w=…`：
 
