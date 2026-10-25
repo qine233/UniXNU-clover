@@ -602,6 +602,30 @@ _start:
   // and nothing else. They stay filled anyway, because the receive copies its
   // result back over them and the legacy test needs to know it is being handed
   // the header it expects rather than the kernel's leftovers.
+  // Round 122 moves this probe in front of the write it used to follow. That is the cut the comment
+  // below already prescribed, and it is the only thing round121's second frame left unresolved: the
+  // clock watchdog's entry sample was `_puts + 4` -- the instruction after `bl _write_console`
+  // returned, taken in EL0, since spsr's mode field is 0 -- and every `_puts` call site sits behind
+  // `b.eq _skip_mach`, so the interrupted thread is this child. Yet the panic the call below raises
+  // never appeared, and the panic screen keeps the first panic it is given. Those two cannot both be
+  // a linear boot, and nothing that sits after the `_puts` can say which half is lying. So the call
+  // moves ahead of it. The child reaches this point on every frame since round 84 (the `reply=` line
+  // before it always prints), which makes the reading two-valued: a panic screen here proves
+  // reboot(2) from EL0 is a working channel at all -- the premise round85 bought and never tested --
+  // and a watchdog-only frame proves the child never reaches the call, wherever the sample says it
+  // is.
+  adrp x1, _panic_msg_before@PAGE
+  add x1, x1, _panic_msg_before@PAGEOFF
+  mov x0, #0xc00                      // RB_PANIC | RB_QUICK
+  mov x16, #55                        // reboot(int opt, char *msg)
+  svc #0x80
+
+  // Only reachable if reboot(2) came back with an errno. 450 rather than 449 so the parent's code
+  // names this call site, and the message it would have carried.
+  mov x23, #450
+  b _exit_now
+
+  // Not reached this round: the label write, and the panic that used to sit behind it.
   // "[clover] el0 mach: msg=<address>": where the buffer actually is.
   adrp x1, _mach_msg@PAGE
   add x1, x1, _mach_msg@PAGEOFF
@@ -1427,6 +1451,11 @@ _mach_msg_end:
 // copyinstr(2) wants the NUL, and the kernel truncates at kPanicStringMaxLen = 1024.
 _panic_msg:
   .asciz "clover-el0: write returned"
+// Round 122's report, and the whole of its change: the same reboot(2) asked in front of the write it
+// used to follow, so a panic screen carrying this string says the channel works and says nothing about
+// the console -- which is the thing round85's reading could not conclude either way.
+_panic_msg_before:
+  .asciz "clover-el0: before write"
 _m2_presend:
   .ascii "[clover] el0 m2: presend\n"
 _m2_presend_end:

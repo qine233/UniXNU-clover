@@ -6865,6 +6865,72 @@ fastboot reboot
 
 **下一帧要问的（一次刷机一问）：** 把 round85 那颗 `reboot(2)` 从「`msg=` 那次 write 之后」挪到「之前」——`scripts/clover-el0-init.S:651` 的注释早就写好了这一刀。看到 `userspace panic: clover-el0: before write`，就说明孩子能走到那儿、被吃掉的是那次 write；仍然只看门狗到点，就说明孩子根本没走到，而 `elr` 会告诉我们它在哪。
 
+## v0.2.94（round122）：把那颗 reboot(2) 挪到吃掉 `msg=` 的那次 write 前面
+
+第二帧留下的是一处自相矛盾，而矛盾本身是唯一的读数来源：看门狗在 60000 tick 打到的样本是 `_puts + 4`，`spsr` 低四位为 0 ⇒ EL0 用户态；而 `_puts` 的八个调用点全在 `b.eq _skip_mach` 之后，pid 1 一个都到不了 —— 被打断的必须是 exec 出来的孩子。孩子从 `_puts` 回来之后第四条指令就是 round85 那颗 `reboot(2)`，可 `userspace panic: clover-el0: write returned` 从来没上过屏，而 panic 屏只保留它收到的第一个 panic。两件事不能同时是「线性推进」，而放在那次 write 之后的任何代码都说不清这两半里哪一半是画面在骗人。⇒ 把调用搬到 write 前面。
+
+改动只有一处，`scripts/clover-el0-init.S` 里那段 `msg=` 探针：`reboot(RB_PANIC|RB_QUICK, "clover-el0: before write")` 现在坐在标签 write 之前，原来的「write + reboot」整对留在下面当够不着的脚手架（本文件一直的做法是保留被替换的仪器，而不是删掉它）。新增的字节只有七条指令和一句 `.asciz`：
+
+```asm
+  adrp x1, _panic_msg_before@PAGE
+  add  x1, x1, _panic_msg_before@PAGEOFF   // 0x100004179: "clover-el0: before write\0"
+  mov  x0, #0xc00                          // RB_PANIC | RB_QUICK
+  mov  x16, #55                            // reboot(int opt, char *msg)
+  svc  #0x80                               // 0x100000608
+  mov  x23, #450                           // 只有 syscall 回了 errno 才走到这里
+  b    _exit_now
+```
+
+孩子每帧都走到这个点（它前面那行 `reply=` 每次都印出来），所以读数是两值的：panic 屏出现 ⇒ `reboot(2)` 从 EL0 打得通，这一条正是 round85 买来却没验过的前提；仍然只有看门狗 ⇒ 孩子根本没走到调用，而 `elr` 会告诉我们它究竟在哪。
+
+| 屏幕上的行 | 含义 | 下一刀 |
+| --- | --- | --- |
+| `userspace panic: clover-el0: before write` | **本轮想要的两条之一**：EL0 → `reboot(2)` → `panic_kernel()` 这条通道在这台机器上是活的，与被吃掉的 write 无关 | 通道既然活着，回去问 write：把探针放回 write 之后、但让 `msg=` 的地址先经 panic 屏出声 |
+| 只有看门狗，`elr` 落在 `_write_console`/`_print_dec`/`_puts` 之内（本轮 0xb08 / 0xb18 / 0xb54 附近） | 孩子仍然停在一次 write 里面 —— 堵点在 tty 输出路径 | 切点进 `vcputc_options` 那一侧 |
+| 只有看门狗，`elr` 落在别处 | 「`_puts + 4` 就是孩子」这个推断本身错了 | 按新的 `elr` 重解 |
+| `initproc exited … exit status 1` | `reboot(2)` 回了 errno（`x23=450`），父亲的报告带把它记成 1 | 有一层策略没编进来或被拒；把 errno 挤进报告带 |
+| 出现 `el0 mach: msg=` | 不可能 —— 这行本轮写在调用之后，够不着；见了就是刷进去的镜像不是本轮那份 | 核对 `logfs` 内容与 trust cache 指纹 |
+
+**内核一行没动。** 校验器把卷内 `kernel.macho` 读回来是 `559ab0323052b3ee…`，与 round121 逐字节相同（构建产物 `48a52153…` 也相同），变的只有 EL0 那份根镜像、它的 trust cache、负载和菜单标题。所以这一轮的成本是三行命令：重签根镜像 → 钉住新的 `trust_cache_sha256` → 重建 payload。
+
+```sh
+cd ~/UniXNU-clover && python3.13 scripts/make-clover-root.py     # launchd.macho + trustcache.bundle
+# board.toml: trust_cache_sha256 换成新 bundle 的 sha256，title 换成本轮
+cd ~/UniXNU && ./unixnu build payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+```
+
+产物（root 镜像 / trust cache / scratch / payload / unixnu.toml 变了；内核、ADT、boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round122-payload.img` | 58720256 B | `8de1d10a77567f456fc53179bd652dd9fba43ae8bb67aebae3a4bf7bcb5e6052` |
+| `round122-scratch-data.img`（= 新的 `launchd.macho`） | 35488 B | `890e94417bf79dfde8090e07a2ef13e606b8097eb65d6cd7d95dd34ee3339281` |
+| `round122-kernel.macho.trustcache` | 56 B | `6062a6a45c2ff822563a3c6ef698fdef8222f13e4800a1cf02ec93818709a434` |
+| `round122-in-volume-kernel.macho`（卷内副本，与 round121 相同） | 51974144 B | `559ab0323052b3eec4fa6c33e3177f660ec34174a436ff164e9c93430d3ee6e8` |
+| `round122-kernel.macho`（构建产物，与 round121 相同） | 51974144 B | `48a52153232c9e9160bf93e34d378993f98079d342f86ac57d11d3240dea338e` |
+| `round122-in-volume-kernel.macho.adt`（未动） | 13268 B | `4bb2cadb6b0302c9e25e046fb8b7de0c366590df38200ac659a1ffc6d1c65c88` |
+| `round122-unixnu.toml` | 572 B | `a19e11806f87f7d98814ef1442d3a8d64ff48fdffdc036b4837dc452cb9bcdef` |
+
+根镜像的 cdhash 是 `769d413c00980dc4f745be7f67c57c13122f4c13`，`board.toml` 的 `trust_cache_sha256` 已钉成上面那颗 bundle。校验：`check-clover.py` 通过（`clover ok: ADT 13268 bytes…`）；`verify-clover-payload.py` 通过，并逐条确认卷内 `scratch-data.img == 签名根镜像`、`trustcache == 本轮 bundle`、探针补丁 / PMGR 绑定 / `CloverSdhci` 链接全在。卷内 `args` 与 round121 逐字相同：`-v serial=3 debug=0x14e kt_fixed_zones=120 boot-progress=2 rd=md0s39 allow_legacy_mach_msg=1 armcpu-timer-intid=19 clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`。boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+新一份 EL0 镜像的符号表（`__TEXT` 仍在 `0x100000000`，无 slide；`0x100000604` 之后全部 +0x1c）：`_start` `0x380`、`_mach_done` `0x7b4`、`_skip_mach` `0x7c0`、`_parent` `0x9d8`、`_wait_error` `0xa84`、`_wait_reaped` `0xa8c`、`_exited_other` `0xab8`、`_not_exited` `0xac0`、`_signaled` `0xad8`、`_exit_now` `0xae4`、`_checkpoint` `0xaf4`、`_fail` `0xaf8`、`_write_console` `0xb08`、`_print_dec` `0xb18`、`_puts` `0xb54`、`_print_line` `0xb64`、`_mheader` `0xb94`（照片读到的 `elr` 要按这张表解，不要再用 round121 的 `0xb38`）。
+
+三条已经记在账上的缺陷，本轮都不动它们：
+
+- **父亲的 448 记号进不了八位通道。** `_wait_reaped` 先 `and x24, x24, #0xff` 再 `cmp x24, #448`（`.S:1257-1258`），掩过之后最大 255，这条比较永不成立 —— 于是 round84 那张表里的 `exit status 0` 从那轮起就是够不着的一行，孩子无论以 448、449 还是本轮的 450 退出，父亲都报 1。修法很小（比 `#192`，或让孩子用八位以内的码），但它要一次自己的刷机。
+- `logfs` 是 8 MiB，镜像只有 35488 字节：mockfs 的 legacy 单文件视图仍然越过镜像尾巴读旧自证记录。
+- `cnt0 == freq`、`cnt1 == 0` 的仪器缺陷仍在，所以看门狗那行仍然给不出 60000 tick 是多久。
+
+```sh
+fastboot flash cache ~/clover-out/round122-payload.img
+fastboot flash logfs ~/clover-out/round122-scratch-data.img   # 写 eMMC 分区：本轮 exec 的是这份
+fastboot reboot                                                # 冷刷
+```
+
+**一次刷机只回答一个问题：从 EL0 发一颗 `reboot(2)`，panic 屏收不收得到它。** 收到，就证明 round85 之后所有「孩子没走到」的推断都得推翻，`msg=` 那次 write 重新变成活题；收不到而看门狗照旧，就把 `elr` 交出来，按它重解孩子究竟卡在哪。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

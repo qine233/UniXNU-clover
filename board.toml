@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: name the eMMC root md0s39 and skip the seal"
+title = "clover el0: panic before the write that swallowed msg="
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -952,7 +952,11 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-trust_cache_sha256 = ["d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4"]
+# Round122 replaces the image that lives here twice over -- as this RAMDisk and as the bytes flashed
+# into logfs, which is the one actually exec'd -- so the cdhash moves with it: `clover-el0: before
+# write` now precedes the `msg=` label write. 769d413c00980dc4f745be7f67c57c13122f4c13, 35488 bytes,
+# sha256 890e94417bf79dfd. The kernel is byte-for-byte round121's, so nothing else in the volume moves.
+trust_cache_sha256 = ["6062a6a45c2ff822563a3c6ef698fdef8222f13e4800a1cf02ec93818709a434"]
 kernel_args = [
   "-v",
   "serial=3",
@@ -1519,6 +1523,11 @@ kernel_args = [
   # the first panic. Those two cannot both be a linear boot: the next reading has to say which of them
   # the frame is lying about, and the .S already prescribes the cut -- reboot before the write instead
   # of after it.
+  # Round122 ships that cut: reboot(2) now precedes the `msg=` write and carries "clover-el0: before
+  # write", so a panic screen with that string proves the EL0 -> panic_kernel channel works and says
+  # nothing about the console, and a watchdog-only frame proves the child never reached the call. Decode
+  # a new sample against this image, not round121's: everything after the call site at 0x100000604 moved
+  # up 0x1c -- _puts 0x100000b54, _write_console 0x100000b08, _print_dec 0x100000b18.
   "armcpu-clock-panic=60000",
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board runs one CPU (no sheng-smp), while the driver's
