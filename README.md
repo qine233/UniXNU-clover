@@ -3813,6 +3813,103 @@ fastboot reboot
 | 只有 `CloverSdhci: failed at stage 4` | GCC 窗口映射失败 | 窗口地址/大小 |
 | **什么 panic 屏都没有** | 某次寄存器写把互联挂住（`ticks` 不涨） | 把 A/B 拆成两轮单写 |
 
+### round93 读数（v0.2.65 实机）：只有 R2 的 CRC 门不同意
+
+照片上的六行：
+
+```text
+cmd2 a=crc int=00028000
+cidA 00c0ff80 80000000 00000000 00000000
+reinit r=1 c0=ok c1=1 t=3 to=0
+cmd2b ok int=00000001 ps 01f800f0
+cidB 00150100 4448b644 41420281 ffcaaac5
+cmd3 ok rca=0 st=2 int=00000001
+```
+
+逐条读：
+
+- `int=00028000` = `INT_ERROR`(0x8000) + `INT_CRC`(0x20000)，没有 `INT_RESPONSE`：
+  命令发出去了、响应也来了，是主机的 CRC7 校验拒绝它。
+- `cidA` 不是坏 CID，是**上一次 CMD1 的 OCR**（`c0ff8080` 按 R2 的 136 位对齐后正好
+  落成 `00c0ff80 80000000 …`）。被拒的命令不锁存响应字，所以失败行上的 `cid*` 只能按
+  「没更新」读，不能按内容读。
+- `cmd2b ok int=00000001` 加上完整 CID ⇒ 关掉 CRC 门后 136 位响应一位不差。
+- `cidB 00150100 4448b644 41420281 ffcaaac5` 按 SDHCI 的 R2 约定（前 8 位为 0，随后
+  120 位内容）解出 MID=0x15（Samsung）、OID=0x0100、PRV=0x02、PSN=0x81ffcaaa；PNM 的
+  第三字节读成 `0xb6`（不是 ASCII）、MDT 读成 `0xc5`（解成 2002 年），两处都像第 7 位
+  被翻——这是猜测，要看两次读的 CID 是否逐字节一致才能定成稳定的内容。
+- `cmd3 ok rca=0 st=2`：eMMC 的 R1 里 RCA 域是保留的（`rca=0` 正常），`st=2` 是转换前
+  的 identification ⇒ CMD3 被接受，卡已进入 stand-by、地址是 1。
+
+所以唯一失败的部件是 **CMD2 响应的 CRC7 门**。但 A 与 B 同时变了两个量：CRC 开关，
+以及 CMD1 ready 之后的等待时间（B 前面多一次 CMD0 与三轮 CMD1）。round93 分不开它们。
+
+### v0.2.66（round94）：把 CRC 门挪到重武装的另一侧
+
+mode 8 保留整套 bring-up，只把两次 CMD2 的内容对调：
+
+1. **X** = `LONG`（关 CRC），放在 round93 A 的槽位：CMD1 报 ready 之后的第一条命令，
+   中间什么都不插。
+2. X 出错才 `RESET_CMD`，然后 **CMD0 + 完整 CMD1 轮询**重新武装。
+3. **Y** = `LONG|CRC`，放在 round93 B 的槽位（重武装之后）。
+4. Y 只要发出去，就发 **CMD3**（`CRC|INDEX`，RCA 1）。
+5. CMD3 成功 → **CMD9**（SEND_CSD，`LONG|CRC`，第二条 136 位响应）与 **CMD13**
+   （`CRC|INDEX`，RCA 1，看状态是不是 3 = stand-by）。
+
+报告形状（示意；Y 失败时 `cidB` 又会是上一次响应的残留）：
+
+```text
+g cfg=00002017 m=01 n=fc d=fb up=1 br=00004221 ab=20008001
+h clk=0007 rst=1 clr=0002 pw=0b vs 00000a0e vs3 02626440 ps 01f800f0
+c0 ok c1 ok t=3 to=0 rsp=c0ff8080
+c2a ok int=00000001
+cidA 00150100 4448b644 41420281 ffcaaac5
+ra c0=ok c1=1 t=3 to=0
+c2b crc int=00028000
+cidB 00c0ff80 80000000 00000000 00000000
+c3 ok rca=0 st=2 int=00000001
+c9 ok int=00000001
+csd 00000000 00000000 00000000 00000000
+c13 ok st=3 rsp=00000000
+```
+
+为塞进 511 字节，表头从四行压成三行（`g`/`h`/`c0 c1`），`hc=`/`h2=` 不再单列；
+最坏情况 461 字节。
+
+产物（内核又变了；root / trust cache 仍未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round94-payload.img` | 58720256 B | `a060238b3af868e8ce08a2cb0c0926fc72bee88a4098583b35c0479609405ea0` |
+| `round94-kernel.macho`（构建产物） | 51900416 B | `d53c39b33da504a22f047d9fadf4c87f3823315100b74c58fbdec4f0424cc10e` |
+| `round94-in-volume-kernel.macho`（卷内副本） | 51900416 B | `0d170bc7e08e7705fd657aa2e4b4bd9044d7dec7aa83b5aacc9ee47bdd843b7a` |
+| `round94-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round94-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round94-kernel.macho.adt` | 13476 B | `46d91777b21094f52bfc62da160b0b46f922d8f99bd3134dcfb2a281bb662911` |
+| `round94-unixnu.toml` | 578 B | `b7efce90ea81d8e6a499ee6915e0b5c536827bc28fd134d63f0c941fdfd5c312` |
+
+校验器：探针 35 处 5960 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在。卷内
+boot-args 末尾是 `… clover-pmgr=2 clover-emmc=8 armcpu-clock-panic=60000`。boot 仍是
+`round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round94-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `c2a ok` + `c2b ok` | round93 的 A 是发得太早，CRC 门本身没问题 | 下一轮在 CMD1 ready 后加一段等待，然后 CMD9→CMD7→CMD16→CMD17 |
+| `c2a ok` + `c2b crc`，两次 `cidA`/`cidB` 一致 | 不是等待问题：这个时钟下 CID 的 CRC 就是过不了（或校验电路本身） | 用软件 CRC7 校验同一份 CID，分清采样与校验；只读命令先关 CRC |
+| `c2a ok` + `c2b crc`，两次 CID 逐字不同 | 采样边沿不稳 | 改采样点/DLL，或重复读到一致 |
+| `c2a crc`/`c2a to` + `c2b ok` | 第一槽位本身坏，重武装才让它好 | 查 ready 之后 CMD 线的建立时间；下一轮固定等待 |
+| `c9 ok` 而 `c2b crc` | CRC 门对 CSD 能用、只对 CID 不行 | 问题集中在 CID 那 17 字节的采样，不在校验电路 |
+| `c9 crc` | 所有 R2 都过不了 CRC 门 | 校验通路本身：软件 CRC7 或对 R2 关校验 |
+| `c3 to`/`crc` | CMD2 之后卡没进 identification | 先复位命令电路再发 CMD3 |
+| 只有 `CloverSdhci: failed at stage …` | 主机侧初始化失败 | 按 stage 查对应的寄存器 |
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -3825,7 +3922,8 @@ fastboot reboot
   `v0.2.63` 起把卡时钟改到 GCC 的 `sdcc1_apps_clk_src`（400 kHz）再重做整套识别，
   `v0.2.64` 起先停卡时钟、只复位命令/数据状态机（`RESET_ALL` 会把主机卡住），
   `v0.2.65` 起把 CMD2 发两遍（一遍带 CRC、一遍关掉 CRC，中间 CMD0+CMD1 重武装），
-  仍然不碰 Data、不发布
+  `v0.2.66` 起把 CRC 开关与重武装的先后对调（先关 CRC 的首槽位，再带 CRC 的重武装后槽位，
+  并补上 CMD9/CMD13），仍然不碰 Data、不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，
