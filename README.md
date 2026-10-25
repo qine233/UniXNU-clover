@@ -3910,6 +3910,121 @@ fastboot reboot
 | `c3 to`/`crc` | CMD2 之后卡没进 identification | 先复位命令电路再发 CMD3 |
 | 只有 `CloverSdhci: failed at stage …` | 主机侧初始化失败 | 按 stage 查对应的寄存器 |
 
+### round94 读数（v0.2.66 实机）：settle 时间出局，R2 的锁存是完好的
+
+照片上的画面（表头两行在 66 字符处折行，这里还原成一行）：
+
+```text
+g cfg=00002017 m=01 n=fc d=fb up=1 br=00004221 ab=20008001
+h clk=0007 rst=1 clr=0002 pw=0b vs 00000a0e vs3 02626440 ps 01f800f0
+c0 ok c1 ok t=3 to=0 rsp=c0ff8080
+c2a ok int=00000001
+cidA 00150100 4448b644 41420281 ffcaaac5
+ra c0=ok c1=1 t=3 to=0
+c2b crc int=00028000
+cidB 00c0ff80 8048b644 41420281 ffcaaac5
+c3 to rca=0 st=0 int=00018000
+c9 skip
+csd none
+c13 skip
+```
+
+这落在判定表的「`c2a ok` + `c2b crc`，两次 `cidA`/`cidB` 一致」一行，而且比那一行多说三件事：
+
+- **等待时间出局。** X 在 round93 A 的槽位（CMD1 ready 之后的第一条命令，中间什么都不插）
+  返回 `ok`，Y 在 B 的槽位（重武装之后）返回 `crc`。A 失败不是「发得太早」，而是 CRC 门
+  对这份 CID 的判定。
+- **两次 boot 读出的 CID 完全一致**（`00150100 4448b644 41420281 ffcaaac5`）⇒ 采样是确定性
+  的，不是边沿抖动；PNM 里的 `0xb6` 和 MDT 的 `0xc5` 要么是这颗卡的真实值，要么是同一个
+  确定性的位错，但绝不是随机噪声。
+- **`cidB` 不再是上一次的 OCR，而是「半个新 CID」。** 按 R2 的排布（`RESPONSE[3]` 是最高字）
+  和 `cidA` 对齐：`RESPONSE[1]`、`RESPONSE[0]`、`RESPONSE[2]` 的低 3 字节逐字节等于真 CID
+  （88 位），只有 `RESPONSE[2]` 的最高字节 `0x80` 和整个 `RESPONSE[3]`（`00c0ff80`）还是
+  CMD1 的 OCR 顺移后的残影。⇒ **136 位帧确实到了、也确实移进了响应寄存器**，控制器是在校验
+  失败那一刻停止锁存，而不是没收到。
+- **`c3 to rca=0 st=0 int=00018000`**（`INT_ERROR|INT_TIMEOUT`）：CMD3 发出去了、没有人答。
+  代码在这一步之前**已经**跑过 `RESET_CMD`（`canSend3` 的错误分支），所以这不是「命令电路
+  还脏」：一次被 CRC 拒绝的 136 位响应之后，`RESET_CMD` 修不回下一条命令的通路。round93 的
+  `cmd3 ok` 都是在**校验通过**的 CMD2 之后发的，两者不能直接对比。
+- 所以 `c9 skip`、`csd none`、`c13 skip` 只是没轮到，不含信息。
+
+于是下一轮的形状被钉死：**不再让 CMD2 走带校验的那条路**，用 round94 的 X（`LONG`，关校验）
+完成识别；要问「R2 的 CRC 门是不是对 CID 特别坏」，唯一干净的问法是 CMD9（CSD，同样是 136
+位），而且要在地址已经拿到、命令通路健康的时候发。
+
+### v0.2.67（round95）：把卡第一次送进 transfer
+
+mode 9 沿用整套 bring-up（GCC 400 kHz、停卡时钟、CMD+DATA 复位、主机 legacy 初始化），
+然后把识别链走到底：
+
+1. **CMD2** `LONG`（关 CRC）——round94 的 X，本机唯一接受的 CMD2；卡进入 identification。
+2. **CMD3** `SHORT|CRC|INDEX`，RCA 1——卡拿到地址、进入 stand-by。R1 报的是转移**前**的状态，
+   所以这一行 `st=2` 是期望值而不是失败。
+3. **CMD13** `SHORT|CRC|INDEX`，RCA 1——stand-by 应为 `st=3`；这也是拿到地址后的第一条 R1，
+   把「地址可用」与「CSD 读取的结果」分开。
+4. **CMD9** `LONG|CRC`，RCA 1——第二条 136 位响应。`c9 ok` 说明只有 CID 过不了校验门；
+   `c9 crc` 说明所有 R2 都过不了。CMD9 只在 stand-by 合法，所以必须在 CMD7 之前。
+5. **CMD7** `SHORT|CRC|INDEX`，RCA 1——stand-by → transfer，所有数据命令的前提。
+6. **CMD13** 再来一次——`st=4` 就是选中的证据，也是 round96 的 CMD16/CMD17 的起点。
+
+每一步都以上一步成功为前提；任何一条命令报错，下一条命令之前先 `RESET_CMD`（并且把这次
+复位**不够**当成 round94 已记录的读数，而不是当成修复）。表头去掉了 `ps`（`present state`
+已稳定为 `01f800f0`），报告改为在标签之后另起一行：round94 的照片证明面板在 66 字符处折行，
+`CloverSdhci: ` 这 13 个字符会吃掉第一行的预算。最坏情况约 400 字节。
+
+报告形状（示意；`rsp`/`csd` 是占位，真实值由卡决定）：
+
+```text
+g cfg=00002017 m=01 n=fc d=fb up=1 br=00004221 ab=20008001
+h clk=0007 rst=1 clr=0002 pw=0b vs 00000a0e vs3 02626440
+c0 ok c1 ok t=3 to=0 rsp=c0ff8080
+c2 ok int=00000001
+cid 00150100 4448b644 41420281 ffcaaac5
+c3 ok st=2 int=00000001
+c13 ok st=3 rsp=00000000
+c9 ok int=00000001
+csd 00000000 00000000 00000000 00000000
+c7 ok int=00000001
+c13b ok st=4 rsp=00000000
+```
+
+产物（内核变了；root / trust cache 仍未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round95-payload.img` | 58720256 B | `e82a6cc9d9c9047bc78b79b32df9470743d861cdaec8412d3d0f99514fd59b80` |
+| `round95-kernel.macho`（构建产物） | 51916800 B | `ea1165f2efe5f4d90e81cb7dfe302027cf3b31e29f370d60cac7ed9c2133ac04` |
+| `round95-in-volume-kernel.macho`（卷内副本） | 51916800 B | `844cd33aa2238ffbafecd923edc07ac49a1352b9a4fe7b106c419725e32d2961` |
+| `round95-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round95-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round95-kernel.macho.adt` | 13476 B | `74c1fef02b8d80a968cbef6fd9ad28b07cce6655903f1087b8e8f687957ea25a` |
+| `round95-unixnu.toml` | 568 B | `7b832f02eec57d1b1ae0c9836792302a178b3c72737ea994b46783fcbe053058` |
+
+校验器：探针 35 处 5960 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在；反汇编
+`__ZL11coldBringUpbj` 里能数到两条 `#0x909`（mode 8 与 mode 9 的 CMD9）和一条 `#0x71a`
+（只有 mode 9 会发 CMD7）。卷内 boot-args 末尾是
+`… clover-pmgr=2 clover-emmc=9 armcpu-clock-panic=60000`。boot 仍是
+`round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round95-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `c9 ok` + 合理的 `csd` | 只有 CID 过不了 R2 门；CSD 能读、地址可用、卡能选中 | CMD16 设 512 字节块长 + CMD17 读 LBA 1（前五字节 `EFI PART`） |
+| `c9 crc` + `c7 ok` + `c13b st=4` | 所有 R2 都过不了校验门，但数据命令不受影响 | CSD 只用于容量；跳过它或关校验，直接 CMD16/CMD17 |
+| `c9 crc` + `c7 to` | 校验失败之后命令通路确实不可用，与 round94 的 `c3 to` 同源 | 先修「CRC 错误后的恢复」：试 `RESET_ALL`，或先 CMD13 探活再继续 |
+| `c3 to`/`crc` | 干净的 CMD2 之后 CMD3 不答，说明 round94 的 `c3 to` 与 CRC 无关 | 查 48 位响应通路与 CMD3 的参数 |
+| `c13 to`/`crc` 而 `c3 ok` | 地址拿到了，但 R1 不答 | 查 RCA 与 R1 通路 |
+| `c7 to`/`crc` 而 `c13 ok st=3` | 选中本身失败 | 查 CMD7 参数与卡状态 |
+| `c13b` 不是 `st=4` | CMD7 回了但卡没进 transfer | 看 R1 的错误位与当前状态 |
+| `c2 to`/`crc` 或 `c0`/`c1` 退步 | bring-up 退化（round94 之后不该发生） | 对照 round94 的表头与 `c0`/`c1` |
+| 只有 `CloverSdhci: failed at stage …` | 主机侧初始化失败 | 按 stage 查对应的寄存器 |
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -3923,7 +4038,8 @@ fastboot reboot
   `v0.2.64` 起先停卡时钟、只复位命令/数据状态机（`RESET_ALL` 会把主机卡住），
   `v0.2.65` 起把 CMD2 发两遍（一遍带 CRC、一遍关掉 CRC，中间 CMD0+CMD1 重武装），
   `v0.2.66` 起把 CRC 开关与重武装的先后对调（先关 CRC 的首槽位，再带 CRC 的重武装后槽位，
-  并补上 CMD9/CMD13），仍然不碰 Data、不发布
+  并补上 CMD9/CMD13），`v0.2.67` 起不再走带校验的 CMD2，改用 CMD2(关校验)/CMD3/CMD13/CMD9/CMD7
+  把卡第一次送进 transfer，仍然不碰 Data、不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，

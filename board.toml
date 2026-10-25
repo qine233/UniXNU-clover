@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: CMD2, the CRC check on the other side of the re-arm"
+title = "clover emmc: CMD9's CRC gate, then the first selection"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1106,7 +1106,32 @@ kernel_args = [
   # the re-arm is what fixed B. "c9 ok" after a failed c2b says the gate works for the CSD but
   # not for the CID (a bit-error/sampling story), while "c9 crc" says every R2 fails it (the
   # check path itself). Two cidB runs that differ in the same position would make it marginal.
-  "clover-emmc=8",
+  #
+  # Round94's photograph picked that second reading and added two facts. X (check off, first slot)
+  # returned the whole CID with int=0x00000001, byte-identical to round93's B on a second boot;
+  # Y (check on, after the re-arm) failed with the same 0x00028000. So the settle time does not
+  # matter -- the CRC gate is the one failing part. Y's words were no longer the previous OCR
+  # either: RESPONSE[1..0] and RESPONSE[2]'s low three bytes were the true CID tail (88 bits), and
+  # only RESPONSE[2]'s top byte plus all of RESPONSE[3] were the old OCR shifted along. The
+  # 136-bit frame did arrive and shift in; the controller stops latching at the check. And the
+  # CMD3 that followed that rejected frame timed out (int=0x00018000) although RESET_CMD had run
+  # first, so a failed 136-bit response leaves the command path unusable in a way 0x06 does not
+  # repair.
+  #
+  # Mode 9 (this round) therefore never takes the checked path: CMD2 LONG (check off), CMD3 to
+  # take RCA 1, CMD13 at that address (stand-by is state 3), CMD9 LONG|CRC at that address (the
+  # second 136-bit response: does the gate reject only the CID or every R2?), CMD7 to select the
+  # card, CMD13 again (transfer is state 4). Each step is gated on the one before it, and a
+  # command error is followed by RESET_CMD before the next one. The header loses `ps`, and the
+  # report starts on its own line: round94's photograph showed the panel wraps at 66 characters.
+  #
+  # Readings: "c2 ok" + "c3 ok st=2" + "c13 ok st=3" => identification and the address work.
+  # "c9 ok" + a plausible "csd" => only the CID fails the R2 gate, and the card can be selected;
+  # the next round is CMD16 (512-byte blocks) and CMD17 at LBA 1 ("EFI PART"). "c9 crc" => every
+  # R2 fails the gate; if "c7" still works, later rounds can keep the check off for CMD9 only,
+  # and if "c7" times out too, the post-CRC path is the thing to fix first. "c7 to"/"crc" with
+  # "c13 ok" => the selection itself failed; "c13b st=4" is the proof the card is in transfer.
+  "clover-emmc=9",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

@@ -113,6 +113,21 @@
 // X crc/to     => the first slot is bad whatever the check says; the re-arm is what fixed B.
 // CMD9's verdict then separates "every R2 fails the check" from "only the CID does".
 //
+// Mode 8's photograph picked the second row: X (check off, first slot) returned the whole CID with
+// int=0x00000001, and Y (check on, after the re-arm) failed with the same 0x00028000 as round93's
+// A. So the settle time does not matter; the CRC gate does. X's CID was byte-identical to round93's
+// B on a second boot. Two more facts came with that photograph. Y's words were no longer the
+// previous OCR: RESPONSE[1..0] and RESPONSE[2]'s low three bytes were the true CID tail (88 bits)
+// and only RESPONSE[2]'s top byte plus all of RESPONSE[3] were the old OCR shifted along -- the
+// 136-bit frame did arrive and shift in, and the controller simply stops latching when the check
+// fails. And the CMD3 that followed that rejected frame timed out (int=0x00018000), although the
+// code did reset the command circuit first (0x06), so a failed 136-bit response leaves the command
+// path unusable for the next command in a way RESET_CMD does not repair. Mode 9 never takes that
+// path: CMD2 with the check off, CMD3 to take RCA 1, CMD13 to see stand-by, CMD9 with the check on
+// to ask whether the gate rejects only the CID or every R2, CMD7 to select the card, CMD13 again
+// to see transfer. Each step is gated on the one before it, so the first failure names the next
+// question.
+//
 // Every path that is not the success path panics, because on this board silence is not a reading.
 // Round87's photograph also settled what the watchdog is worth here: ticks=0 at this scheduling
 // point. sheng_pmgr_run() runs right after bsd_bufferinit, about ten seconds of boot before
@@ -1082,7 +1097,6 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   }
   uint16_t clockAfter = read16 (SDHCI_CLOCK_CONTROL);
   uint8_t powerAfter = read8 (SDHCI_POWER_CONTROL);
-  uint32_t presentAfter = read32 (SDHCI_PRESENT_STATE);
   uint32_t vendorAfter = read32 (kSdhciVendorSpec);
   uint32_t vendor3After = read32 (kSdhciVendorSpec3);
   clover_emmc_stage = 6;
@@ -1162,6 +1176,21 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   CardRearm rearm8 = {};
   const char *verdictX = "skip", *verdictY = "skip", *verdictU = "skip";
   const char *verdictS = "skip", *verdictD = "skip";
+
+  // Mode 9's chain: identification with the check off (the pair round94 proved works), then the
+  // commands that need the address this port assigns, in the order the state machine allows.
+  bool sentCid = false, sentAddr = false, sentCsd = false;
+  bool sentState = false, sentSel = false, sentState2 = false;
+  uint32_t cidStatus = 0, addrStatus = 0, csdStatus = 0;
+  uint32_t stateStatus = 0, selStatus = 0, state2Status = 0;
+  uint32_t cidRsp[4] = { 0, 0, 0, 0 }, csdRsp[4] = { 0, 0, 0, 0 };
+  uint32_t addrRsp0 = 0, addrRsp1 = 0, stateRsp0 = 0, stateRsp1 = 0;
+  uint32_t selRsp0 = 0, selRsp1 = 0, state2Rsp0 = 0, state2Rsp1 = 0;
+  uint32_t spinsCid = 0, spinsAddr = 0, spinsCsd = 0;
+  uint32_t spinsState = 0, spinsSel = 0, spinsState2 = 0;
+  bool cmd2Ok9 = false, cmd3Ok9 = false, cmd9Ok = false, cmd13Ok = false, cmd7Ok = false;
+  const char *verdictCid = "skip", *verdictAddr = "skip", *verdictCsd = "skip";
+  const char *verdictState = "skip", *verdictSel = "skip", *verdictState2 = "skip";
 
   bool cmd2Ok = false;
   if (probeMode == 0) {
@@ -1277,6 +1306,72 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                             sentD, rspD0, rspD1, spinsD);
       verdictD = probeVerdict (statusD, sentD);
     }
+  } else if (probeMode == 9 && hostReady && ready) {
+    // CMD2 with the check off: round94's X, the one CMD2 this host accepts. It leaves the card in
+    // identification, the state CMD3 is legal in. Taking the checked path is exactly what round94
+    // showed cannot be recovered from, so it is not taken at all here.
+    cidStatus = runCommand4 (SDHCI_MAKE_CMD (2, SDHCI_CMD_RESP_LONG), 0,
+                             sentCid, cidRsp, spinsCid);
+    verdictCid = probeVerdict (cidStatus, sentCid);
+    cmd2Ok9 = sentCid && (cidStatus & SDHCI_INT_RESPONSE) &&
+              !(cidStatus & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                             SDHCI_INT_INDEX));
+    if (cmd2Ok9) {
+      // CMD3 SET_RELATIVE_ADDR: the card takes RCA 1 and moves to stand-by. Its R1 reports the
+      // state it is leaving (2), so `st=2` on this line is the expected value, not a failure.
+      addrStatus = runCommand (SDHCI_MAKE_CMD (3, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                               SDHCI_CMD_INDEX), kProbeRca << 16,
+                               sentAddr, addrRsp0, addrRsp1, spinsAddr);
+      verdictAddr = probeVerdict (addrStatus, sentAddr);
+      cmd3Ok9 = sentAddr && (addrStatus & SDHCI_INT_RESPONSE) &&
+                !(addrStatus & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                SDHCI_INT_INDEX));
+    }
+    if (cmd3Ok9) {
+      // CMD13 at the address CMD3 just assigned: stand-by is state 3, and this is also the first
+      // R1 asked after a 136-bit response, so it separates "the address works" from anything the
+      // CSD read does next.
+      stateStatus = runCommand (SDHCI_MAKE_CMD (13, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                SDHCI_CMD_INDEX), kProbeRca << 16,
+                                sentState, stateRsp0, stateRsp1, spinsState);
+      verdictState = probeVerdict (stateStatus, sentState);
+      cmd13Ok = sentState && (stateStatus & SDHCI_INT_RESPONSE) &&
+                !(stateStatus & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                 SDHCI_INT_INDEX));
+      // CMD9 SEND_CSD with the check on: the second 136-bit response, and the one that says
+      // whether the CRC gate rejects every R2 or only the CID. CMD9 is legal in stand-by, and the
+      // card stays there whether or not the host accepts the frame.
+      bool canAskCsd = cmd13Ok ? true : resetCommandCircuit ();
+      if (canAskCsd) {
+        csdStatus = runCommand4 (SDHCI_MAKE_CMD (9, SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC),
+                                 kProbeRca << 16, sentCsd, csdRsp, spinsCsd);
+        verdictCsd = probeVerdict (csdStatus, sentCsd);
+        cmd9Ok = sentCsd && (csdStatus & SDHCI_INT_RESPONSE) &&
+                 !(csdStatus & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                SDHCI_INT_INDEX));
+      }
+      // CMD7 SELECT_CARD: stand-by -> transfer, the state every data command needs. Sent on any
+      // path that still owns the address, because the selection is the goal, not a bonus of the
+      // CSD read; a rejected 136-bit answer gets the same reset round94 showed is not enough, and
+      // the photograph then says so.
+      bool canSelect = cmd9Ok ? true : resetCommandCircuit ();
+      if (canSelect) {
+        selStatus = runCommand (SDHCI_MAKE_CMD (7, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                               SDHCI_CMD_INDEX), kProbeRca << 16,
+                                sentSel, selRsp0, selRsp1, spinsSel);
+        verdictSel = probeVerdict (selStatus, sentSel);
+        cmd7Ok = sentSel && (selStatus & SDHCI_INT_RESPONSE) &&
+                 !(selStatus & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                SDHCI_INT_INDEX));
+      }
+      if (cmd7Ok) {
+        // CMD13 again: state 4 is transfer, the reading round96's CMD16/CMD17 will be built on.
+        state2Status = runCommand (SDHCI_MAKE_CMD (13, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                   SDHCI_CMD_INDEX), kProbeRca << 16,
+                                   sentState2, state2Rsp0, state2Rsp1, spinsState2);
+        verdictState2 = probeVerdict (state2Status, sentState2);
+      }
+    }
   }
 
   clover_emmc_observation[0] = cfgBefore;
@@ -1319,6 +1414,17 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
     // after the address is owned.
     clover_emmc_observation[14] = (static_cast<uint64_t> (statusS) << 32) | statusD;
     clover_emmc_observation[15] = (static_cast<uint64_t> (rspS[0]) << 32) | rspD0;
+  } else if (probeMode == 9) {
+    clover_emmc_observation[7] = cidStatus;
+    clover_emmc_observation[8] = cidRsp[0];
+    clover_emmc_observation[9] = cidRsp[3];
+    clover_emmc_observation[10] = addrStatus;
+    clover_emmc_observation[11] = addrRsp0;
+    clover_emmc_observation[12] = csdStatus;
+    clover_emmc_observation[13] = csdRsp[0];
+    // CMD13's status beside CMD7's, then the second CMD13's status beside its R1.
+    clover_emmc_observation[14] = (static_cast<uint64_t> (stateStatus) << 32) | selStatus;
+    clover_emmc_observation[15] = (static_cast<uint64_t> (state2Status) << 32) | state2Rsp0;
   }
 
   gReportLength = 0;
@@ -1353,8 +1459,6 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   emitHex (vendorAfter, 8);
   emitText (" vs3 ");
   emitHex (vendor3After, 8);
-  emitText (" ps ");
-  emitHex (presentAfter, 8);
 
   emitText ("\nc0 ");
   emitText (hostReady ? commandVerdict (status0, sent0) : "skip");
@@ -1440,7 +1544,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
       emitText (" int=");
       emitHex (statusC, 8);
     }
-  } else {
+  } else if (probeMode == 8) {
     // Mode 8: X (check off, first slot), the re-arm, Y (check on, after it), then the commands
     // that only exist if the card is identified and addressed.
     emitText ("\nc2a ");
@@ -1509,6 +1613,61 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
       emitDec ((rspD0 >> 9) & 0xfu);
       emitText (" rsp=");
       emitHex (rspD0, 8);
+    }
+  } else {
+    // Mode 9: the identification round94 proved (check off), the address it assigns, the first R1
+    // at that address, the second 136-bit response with the check on, then the selection.
+    emitText ("\nc2 ");
+    emitText (verdictCid);
+    emitText (" int=");
+    emitHex (cidStatus, 8);
+    emitText ("\ncid ");
+    if (sentCid) {
+      emitCid (cidRsp);
+    } else {
+      emitText ("none");
+    }
+    emitText ("\nc3 ");
+    emitText (verdictAddr);
+    if (sentAddr) {
+      emitText (" st=");
+      emitDec ((addrRsp0 >> 9) & 0xfu);
+      emitText (" int=");
+      emitHex (addrStatus, 8);
+    }
+    emitText ("\nc13 ");
+    emitText (verdictState);
+    if (sentState) {
+      emitText (" st=");
+      emitDec ((stateRsp0 >> 9) & 0xfu);
+      emitText (" rsp=");
+      emitHex (stateRsp0, 8);
+    }
+    emitText ("\nc9 ");
+    emitText (verdictCsd);
+    if (sentCsd) {
+      emitText (" int=");
+      emitHex (csdStatus, 8);
+    }
+    emitText ("\ncsd ");
+    if (sentCsd) {
+      emitCid (csdRsp);
+    } else {
+      emitText ("none");
+    }
+    emitText ("\nc7 ");
+    emitText (verdictSel);
+    if (sentSel) {
+      emitText (" int=");
+      emitHex (selStatus, 8);
+    }
+    emitText ("\nc13b ");
+    emitText (verdictState2);
+    if (sentState2) {
+      emitText (" st=");
+      emitDec ((state2Rsp0 >> 9) & 0xfu);
+      emitText (" rsp=");
+      emitHex (state2Rsp0, 8);
     }
   }
   emitByte ('\n');
@@ -1714,7 +1873,7 @@ extern "C" void clover_emmc_run (void)
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
   // the storage instrument it was asked for.
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
-      mode != 8) {
+      mode != 8 && mode != 9) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -1735,9 +1894,12 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp (mode == 5, (mode == 7 || mode == 8) ? mode : 0);
+    coldBringUp (mode == 5, (mode == 7 || mode == 8 || mode == 9) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.
-  panic ("CloverSdhci: %s", clover_emmc_report);
+  // Round94's photograph showed the screen wraps at 66 characters (its 68-character `h` line put
+  // `f0` on the next line), and the 13-character label would otherwise eat into the first line's
+  // 66; the newline keeps every report line starting at column zero.
+  panic ("CloverSdhci:\n%s", clover_emmc_report);
 }
