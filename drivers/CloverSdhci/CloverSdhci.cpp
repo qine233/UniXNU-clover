@@ -212,10 +212,9 @@ volatile uint64_t clover_emmc_observation[16];
 // The formatted report, one %s argument, so the panic screen's argument list cannot shift.
 char clover_emmc_report[512];
 volatile uint32_t clover_emmc_stage = 0;
-// drivers/CloverBlock's entry point and its %s argument: mode 21 publishes this boot's block
-// device and prints what XNU's storage stack read through it, as the second half of one screen.
+// drivers/CloverBlock's entry point: mode 21 publishes the boot's block device and hands the
+// partition table to XNU's own partition scheme and BSD client.
 void clover_block_run (void);
-extern char clover_block_report[512];
 }
 
 // One 512-byte PIO block at a time, in BSS rather than on a kernel stack: mode 14 reads the GPT
@@ -3714,11 +3713,10 @@ extern "C" void clover_emmc_run (void)
 {
   unsigned mode = 0;
   if (!PE_parse_boot_argn ("clover-emmc", &mode, sizeof (mode)) || !mode) {
-    // Round107 proved that the old silent return here can absorb a whole round: PMGR published,
-    // AMFI latched, the kernel booted to IOCPU, and the screen never said whether the argument
-    // was missing or the storage stack had hung. The pair (clover-pmgr=2 without clover-emmc) is
-    // a payload built wrong, so it panics and prints the command line that caused it.
-    panic ("CloverSdhci r111: no clover-emmc boot arg\nargs [%s]", PE_boot_args ());
+    // No argument means the board was not asked for eMMC; the RAMDisk root still boots. This
+    // used to panic so a mis-built payload was visible, but that is instrumentation: the boot
+    // now either uses the card or does not.
+    return;
   }
   clover_emmc_stage = 1;
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
@@ -3749,20 +3747,12 @@ extern "C" void clover_emmc_run (void)
     }
     coldBringUp (mode == 5, (mode >= 7 && mode <= 21) ? mode : 0);
   }
-  // The report is one pointer argument; if the panic screen cannot read it, it prints the
-  // address in angle brackets instead of faulting, and the raw slots above still name the call.
-  // Round94's photograph showed the screen wraps at 66 characters (its 68-character `h` line put
-  // `f0` on the next line), and the 13-character label would otherwise eat into the first line's
-  // 66; the newline keeps every report line starting at column zero.
+  // Mode 21 is the boot path now, not a report: the block stack runs, prints one line of its
+  // own, and the boot continues. Every other mode still ends on the panic screen with the
+  // driver's report, because those modes exist only to answer a question.
   if (mode == 21) {
-    // Both halves of the same boot on one screen: the driver's chain, then what the storage stack
-    // read through the block device published above it. This deliberately does not arm the panic
-    // hook; that stays mode 20's, because this run handed the card to another subsystem. The
-    // command line is repeated here because the boot log above scrolls, and "which arguments
-    // produced this reading" must survive the photograph.
     clover_block_run ();
-    panic ("CloverSdhci:\n%s\n%s\nargs [%s]", clover_emmc_report, clover_block_report,
-           PE_boot_args ());
+    return;
   }
   panic ("CloverSdhci:\n%s", clover_emmc_report);
 }

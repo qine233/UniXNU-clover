@@ -2,13 +2,13 @@
 // clover (Mi Pad 4, SDM660): publish the eMMC as an IOBlockStorageDevice so XNU's own storage
 // stack, not this port's private PIO report, is what reads the card.
 //
-// Round 106 left the card selected by drivers/CloverSdhci with a working paced-PIO read, and
-// round 104/105 proved logfs survives a reboot when that path reads it. This file is the other
-// half: it registers a block device above the same path, starts IOStorageFamily's driver by name
-// (round109: the synchronous catalogue match never returned on this boot path), then reads the
-// GPT and the newest logfs slot *through IOMedia* and writes one new record back through it.
-// A working line here means the kernel and the card agree through the storage stack, not merely
-// through a driver-private function.
+// Round 111 left the logfs write path proven through IOMedia. Round 112 starts collecting the
+// instruments and moves up a layer: the partition table is no longer walked by hand. IOStorage
+// Family's IOGUIDPartitionScheme parses the GPT and publishes each entry as an IOMedia, and
+// IOMediaBSDClient gives the whole disk and the logfs partition BSD names. The run then performs
+// the two discovery steps the kernel's own root code performs, IOBSDNameMatching and bdevvp, so
+// a success line means setconf()/vfs_mountroot() could name this partition as the root device.
+// The boot itself still runs from the RAMDisk (rd=md0); this round only proves the device side.
 //
 // The class has to be hand-written. IOStorageFamily is loaded at runtime from the boot kext
 // collection (kernel.macho exports no IOBlockStorageDevice, IOMedia or IOBlockStorageDriver
@@ -21,9 +21,8 @@
 // destructor (IOBlockStorageDevice's are not exported either) are aliased by name to IOService's
 // in scripts/build-clover-block.py, where that alias is audited together with every import.
 //
-// Nothing here panics. CloverSdhci already panicked for its own failures; this report is the
-// second %s on that same panic screen, so a block stack that stopped early still names its stage
-// instead of leaving the panel identical to a driver-only run.
+// A failure panics with one short CloverBlock r112 line naming the step; success prints one line
+// and lets the boot continue, because there is nothing left to photograph.
 #define IOKIT_ENABLE_SHARED_PTR 1
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
@@ -50,29 +49,19 @@ uint32_t clover_emmc_block_ready (void);
 uint32_t clover_emmc_block_sectors (void);
 uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint32_t blocks);
 uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words, uint32_t blocks);
-// stage,kext-load,class-size,postModLoad,instances,media-sectors,blockSize<<32|writable,
-// open,gpt-status,entrySize<<32|entries,logfsLast<<32|index,kind<<32|len,stored-sum,
-// computed-sum,header-status,text-status.
-volatile uint64_t clover_block_observation[16];
-// One %s argument; a failure leaves the later lines at zero and names its stage.
-char clover_block_report[512];
+// The kernel's own block-device vnode constructor (bsd/vfs/vfs_subr.c). dev_t is the composite
+// major<<24|minor this file passes; the vnode is never touched, and it stays for boot lifetime
+// exactly as it would when it becomes the root vnode.
+int bdevvp (int32_t dev, void **vpp);
 }
 
 static const uint32_t kBlockBytes = 512;
 static const uint32_t kBlockWords = kBlockBytes / 4;
-static const uint32_t kLogSlots = 16;
-static const uint32_t kLogMagic0 = 0x554e5855u;   // "UXNU" in memory order
-static const uint32_t kLogMagic1 = 0x31474f4cu;   // "LOG1"
-static const uint32_t kLogPrefixLength = 23;      // "unixnu clover emmc log\n"
-// One canonical record, written and read back through IOMedia in stage 14. It is deliberately
-// fixed text: the point of this round is the path, and a fixed string lets the readback compare
-// whole blocks instead of re-deriving the report before it is assembled.
-static const char kWriteText[] = "unixnu clover emmc log\nblock write through IOMedia\n";
-
-// GPT entry name "logfs" as the bytes an on-disk entry carries: UTF-16LE, then a NUL wchar.
-static const uint8_t kLogfsName[12] = {
-  0x6c, 0x00, 0x6f, 0x00, 0x67, 0x00, 0x66, 0x00, 0x73, 0x00, 0x00, 0x00
-};
+static const uint32_t kLogfsPartitionId = 39;   // GPT index, from the round101 entry walk
+static const char kPartitionIdKey[] = "Partition ID";
+static const char kBSDNameKey[] = "BSD Name";
+static const char kBSDMajorKey[] = "BSD Major";
+static const char kBSDMinorKey[] = "BSD Minor";
 
 // ---------------------------------------------------------------- block device
 
@@ -414,158 +403,49 @@ static const OSMetaClass *lookupMetaClass(const char *text)
   return name ? OSMetaClass::getMetaClassWithName(name.get()) : nullptr;
 }
 
-static uint32_t readLe32(const uint8_t *p)
+static OSObject *property(IORegistryEntry *entry, const char *key)
 {
-  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-         (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  return entry->getProperty(key);
+#pragma clang diagnostic pop
 }
 
-static uint64_t readLe64(const uint8_t *p)
+__attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  return static_cast<uint64_t>(readLe32(p)) | (static_cast<uint64_t>(readLe32(p + 4)) << 32);
+  panic("CloverBlock r112: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
-struct BlockResult {
-  uint32_t stage;
-  uint32_t load;
-  uint32_t classSize;
-  uint32_t post;
-  uint32_t instances;
-  uint32_t driverMeta;
-  uint32_t driverStarted;
-  uint32_t driverFound;
-  uint32_t mediaFound;
-  uint64_t mediaSectors;
-  uint32_t blockSize;
-  uint32_t open;
-  uint32_t writable;
-  uint32_t gptOk;
-  uint32_t gptStatus;
-  uint32_t entryCount;
-  uint32_t entrySize;
-  uint32_t logfsIndex;
-  uint64_t logfsFirst;
-  uint64_t logfsLast;
-  uint32_t slot;
-  uint32_t slotKind;
-  uint32_t slotLen;
-  uint32_t slotSum;
-  uint32_t slotCalc;
-  uint32_t slotCheck;
-  uint32_t prefixOk;
-  uint32_t headerStatus;
-  uint32_t textStatus;
-  uint32_t writeSlot;
-  uint32_t writeOk;
-  uint32_t readbackOk;
-  uint32_t writeStatus;
-  uint32_t previewLength;
-  char preview[25];
-};
-
-static BlockResult gResult;
-static unsigned gReportLength;
-
-static void putChar(char c)
-{
-  if (gReportLength < sizeof(clover_block_report) - 1) {
-    clover_block_report[gReportLength++] = c;
-  }
-}
-
-static void emitText(const char *text)
-{
-  while (*text) {
-    putChar(*text++);
-  }
-}
-
-static void emitDec(uint64_t value)
-{
-  char digits[20];
-  unsigned count = 0;
-  do {
-    digits[count++] = static_cast<char>('0' + value % 10);
-    value /= 10;
-  } while (value);
-  while (count) {
-    putChar(digits[--count]);
-  }
-}
-
-static void emitHex(uint64_t value, unsigned digits)
-{
-  static const char kHex[] = "0123456789abcdef";
-  for (unsigned i = digits; i; i--) {
-    putChar(kHex[(value >> ((i - 1) * 4)) & 0xf]);
-  }
-}
-
-// One 512-byte block through IOMedia's asynchronous interface. The completion is expected inline:
-// IOBlockStorageDriver runs the request through its command gate on this thread, and the device
-// above completes inline. If the stack defers instead, `done` stays zero and the caller records
-// kIOReturnTimeout -- a reading, not a hang, which matters because a sleep at this point in boot
-// has no timer to wake it. `out` is the caller's copy of the descriptor's memory, so the GPT walk
-// never reads the descriptor twice and every block has the same lifetime.
-struct MediaRead {
+struct MediaOp {
   volatile uint32_t done;
   volatile uint32_t status;
   volatile uint64_t actual;
 };
 
-static MediaRead gMediaRead;
-static MediaRead gMediaWrite;
+static MediaOp gMediaOp;
 
-static void mediaReadDone(void *target, void *, IOReturn status, UInt64 actualByteCount)
+static void mediaOpDone(void *target, void *, IOReturn status, UInt64 actualByteCount)
 {
-  MediaRead *read = static_cast<MediaRead *>(target);
-  read->status = static_cast<uint32_t>(status);
-  read->actual = actualByteCount;
-  read->done = 1;
+  MediaOp *op = static_cast<MediaOp *>(target);
+  op->status = static_cast<uint32_t>(status);
+  op->actual = actualByteCount;
+  op->done = 1;
 }
 
-static IOReturn readMediaBlock(IOMedia *media, IOService *client,
-                               IOMemoryDescriptor *buffer, uint64_t lba,
-                               MediaRead *read, uint8_t *out)
-{
-  read->done = 0;
-  read->status = static_cast<uint32_t>(kIOReturnNotReady);
-  read->actual = 0;
-  IOStorageCompletion completion;
-  completion.target = read;
-  completion.action = mediaReadDone;
-  completion.parameter = nullptr;
-  media->read(client, lba * kBlockBytes, buffer, nullptr, &completion);
-  if (!read->done) {
-    return kIOReturnTimeout;
-  }
-  if (read->status != static_cast<uint32_t>(kIOReturnSuccess)) {
-    return static_cast<IOReturn>(read->status);
-  }
-  if (read->actual != kBlockBytes || buffer->readBytes(0, out, kBlockBytes) != kBlockBytes) {
-    return kIOReturnError;
-  }
-  return kIOReturnSuccess;
-}
-
-// The write mirror of readMediaBlock, same inline-completion contract. The buffer must already
-// hold the block: preparing a kIODirectionOut descriptor for the device sets
-// kIOMemoryPreparedReadOnly (IOMemoryDescriptor.cpp:4405), after which writeBytes() asserts
-// (line 2612). Round110 filled a shared descriptor here after the first write had prepared it,
-// and the second block panicked. Ownership of the bytes therefore stays with the caller, which
-// builds a fresh descriptor per block with withBytes() and never mutates it after submission.
-static IOReturn writeMediaBlock(IOMedia *media, IOService *client,
-                                IOMemoryDescriptor *buffer, uint64_t lba,
-                                MediaRead *op)
+// One block through IOMedia, with the same inline-completion contract the round111 reads used:
+// IOBlockStorageDriver completes on this thread, so a deferred request is a reading
+// (kIOReturnTimeout), not a hang.
+static IOReturn readMediaBytes(IOMedia *media, IOService *client, IOMemoryDescriptor *buffer,
+                               uint64_t byteStart, MediaOp *op)
 {
   op->done = 0;
   op->status = static_cast<uint32_t>(kIOReturnNotReady);
   op->actual = 0;
   IOStorageCompletion completion;
   completion.target = op;
-  completion.action = mediaReadDone;
+  completion.action = mediaOpDone;
   completion.parameter = nullptr;
-  media->write(client, lba * kBlockBytes, buffer, nullptr, &completion);
+  media->read(client, byteStart, buffer, nullptr, &completion);
   if (!op->done) {
     return kIOReturnTimeout;
   }
@@ -575,423 +455,183 @@ static IOReturn writeMediaBlock(IOMedia *media, IOService *client,
   return kIOReturnSuccess;
 }
 
-// A hang between two stages used to leave the panel at the last subsystem that spoke, which says
-// nothing about this one. The marker is printed before the call that can hang, so the last line on
-// the screen names the step instead of the next boot having to guess.
-static void blockStage(const char *step)
+// Hand-start an IOStorageFamily service by name. Round109 showed the synchronous catalogue match
+// never returns on this boot path, so each object is allocated from its metaclass and driven
+// through attach/start directly. The objects are never released: the registry, the media tree
+// and the BSD minor table all keep pointing at them for the rest of the boot.
+static IOService *startService(const char *className, IOService *provider)
 {
-  IOLog("CloverBlock r111: %s\n", step);
+  const OSMetaClass *meta = lookupMetaClass(className);
+  if (!meta) {
+    return nullptr;
+  }
+  IOService *service = static_cast<IOService *>(meta->alloc());
+  if (!service || !service->init(nullptr) || !service->attach(provider) ||
+      !service->start(provider)) {
+    return nullptr;
+  }
+  return service;
 }
 
 extern "C" void clover_block_run(void)
 {
-  BlockResult &r = gResult;
-  gReportLength = 0;
-  clover_block_report[0] = 0;
-  for (unsigned i = 0; i < 16; i++) {
-    clover_block_observation[i] = 0;
+  // 1. The PIO path has to be proven before anything claims a device over it.
+  if (!clover_emmc_block_ready() || clover_emmc_block_sectors() == 0) {
+    fail("ready", 0);
   }
 
-  do {
-    // Stage 1: the card path must already be proven. Mode 21 sets the ready flag only after a
-    // clean CMD17 and a gated EXT_CSD read, so a block device can never appear over an unproven
-    // data path.
-    r.stage = 1;
-    if (!clover_emmc_block_ready() || clover_emmc_block_sectors() == 0) {
-      break;
-    }
-
-    // Stage 2: bring in IOStorageFamily and require the *exact* original class size. A layout
-    // change would make every override below sit on the wrong slot, so this stops first.
-    r.stage = 2;
-    blockStage("2 storage family");
-    kern_return_t load = OSKextLoadKextWithIdentifier("com.apple.iokit.IOStorageFamily");
-    r.load = static_cast<uint32_t>(load);
-    const OSMetaClass *base = lookupMetaClass("IOBlockStorageDevice");
-    if (!base) {
-      break;
-    }
-    r.classSize = base->getClassSize();
-    if (r.classSize != sizeof(CloverBlockDevice)) {
-      break;
-    }
-
-    // Stage 3: register our metaclass with the freshly loaded superclass.
-    r.stage = 3;
-    blockStage("3 metaclass");
-    CloverBlockDevice::superClass = base;
-    void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
-    if (!handle) {
-      break;
-    }
-    clover_block_static_init();
-    OSReturn post = OSMetaClass::postModLoad(handle);
-    r.post = static_cast<uint32_t>(post);
-    if (post) {
-      break;
-    }
-    r.instances = CloverBlockDevice::gMetaClass.getInstanceCount();
-
-    r.stage = 4;
-    blockStage("4 allocate");
-    CloverBlockDevice *device = new CloverBlockDevice;
-    if (!device || !device->init(nullptr)) {
-      break;
-    }
-
-    // Stage 5: attach to the platform, then start the one driver this device is for.
-    //
-    // Round108 ended on "5 register" and never returned. That call was
-    // registerService(kIOServiceSynchronous), whose inline match runs the catalogue before
-    // IOKitInitializeTime: the photograph shows APFS and AMFI kext starts and an
-    // IOCPUInterruptController registerService nested under it, then silence. PMGR's two
-    // synchronous registrations return because no kext matches them; ours matches
-    // IOStorageFamily, so the inline match drags in the early kext cascade and stops there.
-    //
-    // Round109 no longer asks the catalogue. It allocates IOBlockStorageDriver by name and
-    // does what startCandidate() would do -- attach, then start -- with a marker before each
-    // call. The driver's own media registration stays asynchronous (our device never entered
-    // kIOServiceSynchronousState), so the same cascade is not entered from here.
-    r.stage = 5;
-    blockStage("5 attach");
-    IOPlatformExpert *platform = IOService::getPlatform();
-    if (!platform || !device->attach(platform) || !device->start(platform)) {
-      break;
-    }
-
-    blockStage("5 driver meta");
-    const OSMetaClass *driverMeta = lookupMetaClass("IOBlockStorageDriver");
-    if (!driverMeta) {
-      break;
-    }
-    r.driverMeta = 1;
-
-    blockStage("5 driver alloc");
-    IOService *handDriver = static_cast<IOService *>(driverMeta->alloc());
-    if (!handDriver || !handDriver->init(nullptr)) {
-      break;
-    }
-
-    blockStage("5 driver attach");
-    if (!handDriver->attach(device)) {
-      break;
-    }
-
-    blockStage("5 driver start");
-    if (!handDriver->start(device)) {
-      break;
-    }
-    r.driverStarted = 1;
-
-    // Stage 6: the driver and its media are children in the service plane.
-    r.stage = 6;
-    blockStage("6 driver");
-    IORegistryEntry *driverEntry = device->getChildEntry(gIOServicePlane);
-    IOService *driver = driverEntry
-        ? static_cast<IOService *>(driverEntry->metaCast("IOBlockStorageDriver")) : nullptr;
-    if (!driver || driver->getProvider() != device || driver != handDriver) {
-      break;
-    }
-    r.driverFound = 1;
-
-    r.stage = 7;
-    blockStage("7 media");
-    IORegistryEntry *mediaEntry = driver->getChildEntry(gIOServicePlane);
-    IOMedia *media = mediaEntry
-        ? static_cast<IOMedia *>(mediaEntry->metaCast("IOMedia")) : nullptr;
-    if (!media) {
-      break;
-    }
-    r.mediaFound = 1;
-    r.mediaSectors = media->getSize() / kBlockBytes;
-    r.blockSize = static_cast<uint32_t>(media->getPreferredBlockSize());
-    r.writable = media->isWritable() ? 1 : 0;
-    if (r.mediaSectors != clover_emmc_block_sectors() || r.blockSize != kBlockBytes) {
-      break;
-    }
-
-    // Stage 9: open for reading and writing. The media's own checks (size, block size) have now
-    // been read through the storage stack rather than from this driver's globals.
-    r.stage = 9;
-    blockStage("9 open");
-    if (!media->open(device, 0, kIOStorageAccessReaderWriter)) {
-      break;
-    }
-    r.open = 1;
-
-    OSSharedPtr<IOBufferMemoryDescriptor> buffer =
-        IOBufferMemoryDescriptor::withCapacity(kBlockBytes, kIODirectionIn, true);
-    // The write descriptors outlive the whole function, not just stage 14: the storage stack may
-    // still hold a reference after the synchronous completion, and releasing memory under it is
-    // not something this boot can debug. They are assigned, never reused.
-    OSSharedPtr<IOBufferMemoryDescriptor> headerBuffer;
-    OSSharedPtr<IOBufferMemoryDescriptor> textBuffer;
-    if (!buffer.get()) {
-      break;
-    }
-    uint8_t block[kBlockBytes];
-
-    // Stage 10: the GPT header through IOMedia. `gp` is the stack's own status: kIOReturnTimeout
-    // here means the request was not completed inline, which is a reading about the storage stack
-    // rather than a failure of the card.
-    r.stage = 10;
-    blockStage("10 gpt");
-    IOReturn status = readMediaBlock(media, device, buffer.get(), 1, &gMediaRead, block);
-    r.gptStatus = static_cast<uint32_t>(status);
-    if (status != kIOReturnSuccess || memcmp(block, "EFI PART", 8) != 0) {
-      break;
-    }
-    uint64_t entryLba = readLe64(block + 72);
-    uint32_t entryCount = readLe32(block + 80);
-    uint32_t entrySize = readLe32(block + 84);
-    r.entryCount = entryCount;
-    r.entrySize = entrySize;
-    if (entryCount == 0 || entrySize < 128 || entrySize > kBlockBytes ||
-        (kBlockBytes % entrySize) != 0) {
-      break;
-    }
-    r.gptOk = 1;
-
-    // Stage 11: walk the entry array for the entry named exactly "logfs". The name is UTF-16LE
-    // at byte 56, so the match includes the terminator and cannot accept "logfsx".
-    r.stage = 11;
-    blockStage("11 entries");
-    const uint32_t perBlock = kBlockBytes / entrySize;
-    uint32_t blocks = (entryCount + perBlock - 1) / perBlock;
-    if (blocks > 128) {
-      blocks = 128;
-    }
-    for (uint32_t b = 0; b < blocks && !r.logfsIndex; b++) {
-      status = readMediaBlock(media, device, buffer.get(), entryLba + b, &gMediaRead, block);
-      if (status != kIOReturnSuccess) {
-        r.gptOk = 0;
-        r.gptStatus = static_cast<uint32_t>(status);
-        break;
-      }
-      for (uint32_t e = 0; e < perBlock && (b * perBlock + e) < entryCount; e++) {
-        const uint8_t *entry = block + e * entrySize;
-        if (memcmp(entry + 56, kLogfsName, sizeof(kLogfsName)) == 0) {
-          r.logfsIndex = b * perBlock + e + 1;   // 1-based, the way the kernel names it
-          r.logfsFirst = readLe64(entry + 32);
-          r.logfsLast = readLe64(entry + 40);
-          break;
-        }
-      }
-    }
-    if (!r.logfsIndex) {
-      break;
-    }
-
-    // Stage 12: scan the fixed two-block logfs slots and keep the last valid header. A read
-    // failure and an unwritten slot are different readings: the former is recorded, the latter
-    // leaves s=0.
-    r.stage = 12;
-    blockStage("12 slots");
-    for (uint32_t slot = 0; slot < kLogSlots; slot++) {
-      status = readMediaBlock(media, device, buffer.get(), r.logfsFirst + 2 * slot, &gMediaRead, block);
-      if (status != kIOReturnSuccess) {
-        r.headerStatus = static_cast<uint32_t>(status);
-        break;
-      }
-      const uint32_t *words = reinterpret_cast<const uint32_t *>(block);
-      if (words[0] != kLogMagic0 || words[1] != kLogMagic1) {
-        break;
-      }
-      r.slot = slot;
-      r.slotLen = words[3];
-      r.slotSum = words[4];
-      r.slotKind = words[5];
-      if (slot == kLogSlots - 1) {
-        break;
-      }
-    }
-    // `slotSum` is zero only when no slot header carried the magic; a real empty slot 0 still
-    // has this boot's own header because mode 21 does not write, so the previous boot's record
-    // is what the scan finds.
-    if (r.headerStatus) {
-      break;
-    }
-    if (r.slotLen == 0 && r.slotSum == 0 && r.slotKind == 0) {
-      break;
-    }
-
-    // Stage 13: the text block that header names. Length is clamped before it drives a loop,
-    // and the byte sum is recomputed rather than trusted.
-    r.stage = 13;
-    blockStage("13 text");
-    status = readMediaBlock(media, device, buffer.get(), r.logfsFirst + 2 * r.slot + 1, &gMediaRead, block);
-    r.textStatus = static_cast<uint32_t>(status);
-    if (status != kIOReturnSuccess) {
-      break;
-    }
-    uint32_t length = r.slotLen;
-    if (length > kBlockBytes) {
-      length = kBlockBytes;
-    }
-    uint32_t sum = 0;
-    for (uint32_t i = 0; i < length; i++) {
-      sum += block[i];
-    }
-    r.slotCalc = sum;
-    r.slotCheck = (sum == r.slotSum) ? 1 : 0;
-    r.prefixOk = (length >= kLogPrefixLength &&
-                  memcmp(block, "unixnu clover emmc log\n", kLogPrefixLength) == 0) ? 1 : 0;
-    for (uint32_t i = 0; i < sizeof(r.preview) - 1 && kLogPrefixLength + i < length; i++) {
-      char c = static_cast<char>(block[kLogPrefixLength + i]);
-      r.preview[i] = (c >= 0x20 && c < 0x7f) ? c : (c == '\n' ? '|' : '.');
-      r.previewLength = i + 1;
-    }
-    // Stage 14: write one canonical record into the first free slot through IOMedia, then read
-    // both blocks back through the same media. Slot selection follows mode 19: slot k is two
-    // blocks at logfs start + 2k, and the first slot without this driver's magic is free. A full
-    // window is reported, never wrapped onto slot 0.
-    r.stage = 14;
-    blockStage("14 write");
-    uint32_t freeSlot = r.slot + 1;
-    r.writeSlot = freeSlot;
-    if (freeSlot >= kLogSlots) {
-      break;
-    }
-    {
-      uint64_t slotLba = r.logfsFirst + 2 * freeSlot;
-      uint32_t length = sizeof(kWriteText) - 1;
-      uint32_t sum = 0;
-      for (uint32_t i = 0; i < length; i++) {
-        sum += static_cast<uint8_t>(kWriteText[i]);
-      }
-      uint32_t header[kBlockWords];
-      uint8_t text[kBlockBytes];
-      memset(header, 0, sizeof(header));
-      memset(text, 0, sizeof(text));
-      header[0] = kLogMagic0;
-      header[1] = kLogMagic1;
-      header[2] = static_cast<uint32_t>(slotLba);
-      header[3] = length;
-      header[4] = sum;
-      header[5] = 21;
-      header[6] = length;
-      header[7] = freeSlot;
-      memcpy(text, kWriteText, length);
-
-      headerBuffer =
-          IOBufferMemoryDescriptor::withBytes(header, kBlockBytes, kIODirectionOut, true);
-      textBuffer = IOBufferMemoryDescriptor::withBytes(text, kBlockBytes, kIODirectionOut, true);
-      if (!headerBuffer.get() || !textBuffer.get()) {
-        r.writeStatus = static_cast<uint32_t>(kIOReturnNoMemory);
-        break;
-      }
-      IOReturn wrote = writeMediaBlock(media, device, headerBuffer.get(), slotLba, &gMediaWrite);
-      if (wrote == kIOReturnSuccess) {
-        wrote = writeMediaBlock(media, device, textBuffer.get(), slotLba + 1, &gMediaWrite);
-      }
-      if (wrote != kIOReturnSuccess) {
-        r.writeStatus = static_cast<uint32_t>(wrote);
-        break;
-      }
-      r.writeOk = 1;
-
-      bool same = false;
-      IOReturn check = readMediaBlock(media, device, buffer.get(), slotLba, &gMediaRead, block);
-      if (check == kIOReturnSuccess && memcmp(block, header, kBlockBytes) == 0) {
-        check = readMediaBlock(media, device, buffer.get(), slotLba + 1, &gMediaRead, block);
-        same = (check == kIOReturnSuccess && memcmp(block, text, kBlockBytes) == 0);
-      }
-      if (!same) {
-        r.writeStatus = static_cast<uint32_t>(check);
-        break;
-      }
-      r.readbackOk = 1;
-    }
-
-    r.stage = 15;
-    blockStage("15 done");
-  } while (false);
-
-  clover_block_observation[0] = r.stage;
-  clover_block_observation[1] = r.load;
-  clover_block_observation[2] = r.classSize;
-  clover_block_observation[3] = r.post;
-  clover_block_observation[4] = r.instances;
-  clover_block_observation[5] = r.mediaSectors;
-  clover_block_observation[6] = (static_cast<uint64_t>(r.blockSize) << 32) | r.writable;
-  clover_block_observation[7] = r.open;
-  clover_block_observation[8] = r.gptStatus;
-  clover_block_observation[9] = (static_cast<uint64_t>(r.entrySize) << 32) | r.entryCount;
-  clover_block_observation[10] = (static_cast<uint64_t>(r.logfsLast & 0xffffffffu) << 32) |
-                                 r.logfsIndex;
-  clover_block_observation[11] = (static_cast<uint64_t>(r.slotKind) << 32) | r.slotLen;
-  clover_block_observation[12] = r.slotSum;
-  clover_block_observation[13] = r.slotCalc;
-  clover_block_observation[14] = r.headerStatus;
-  clover_block_observation[15] = r.textStatus;
-
-  emitText("b st=");
-  emitDec(r.stage);
-  emitText(" ld=");
-  emitDec(r.load);
-  emitText(" cs=");
-  emitHex(r.classSize, 4);
-  emitText(" pm=");
-  emitDec(r.post);
-  emitText(" dm=");
-  emitDec(r.driverMeta);
-  emitText(" ds=");
-  emitDec(r.driverStarted);
-  emitText("\nb dv=");
-  emitDec(r.driverFound);
-  emitText(" md=");
-  emitDec(r.mediaFound);
-  emitText(" sz=");
-  emitDec(r.mediaSectors);
-  emitText(" bl=");
-  emitDec(r.blockSize);
-  emitText("\nb op=");
-  emitDec(r.open);
-  emitText(" wp=");
-  emitDec(r.writable);
-  emitText(" gp=");
-  emitDec(r.gptOk);
-  emitText(" ix=");
-  emitDec(r.logfsIndex);
-  emitText("\nb lf s=");
-  emitDec(r.slot);
-  emitText(" a=");
-  emitDec(r.logfsFirst);
-  emitText(" b=");
-  emitDec(r.logfsLast);
-  emitText(" m=");
-  emitDec(r.slotKind);
-  emitText(" n=");
-  emitDec(r.slotLen);
-  emitText(" c=");
-  emitDec(r.slotCheck);
-  emitText(" p=");
-  emitDec(r.prefixOk);
-  if (!r.gptOk && r.gptStatus) {
-    emitText(" hs=");
-    emitHex(r.gptStatus, 8);
+  // 2. IOStorageFamily plus the exact original class size: every override in CloverBlockDevice
+  // sits on an IOBlockStorageDevice slot, so a layout change has to stop here.
+  kern_return_t load = OSKextLoadKextWithIdentifier("com.apple.iokit.IOStorageFamily");
+  if (load) {
+    fail("storage", static_cast<uint32_t>(load));
   }
-  if (r.headerStatus) {
-    emitText(" hs=");
-    emitHex(r.headerStatus, 8);
+  const OSMetaClass *base = lookupMetaClass("IOBlockStorageDevice");
+  if (!base || base->getClassSize() != sizeof(CloverBlockDevice)) {
+    fail("abi", base ? base->getClassSize() : 0);
   }
-  if (r.textStatus) {
-    emitText(" ts=");
-    emitHex(r.textStatus, 8);
+
+  // 3. Register this class against the freshly loaded superclass.
+  CloverBlockDevice::superClass = base;
+  void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+  if (!handle) {
+    fail("modload", 0);
   }
-  emitText("\nb w s=");
-  emitDec(r.writeSlot);
-  emitText(" wr=");
-  emitDec(r.writeOk);
-  emitText(" rb=");
-  emitDec(r.readbackOk);
-  if (r.writeStatus) {
-    emitText(" ws=");
-    emitHex(r.writeStatus, 8);
+  clover_block_static_init();
+  if (OSMetaClass::postModLoad(handle)) {
+    fail("postload", 0);
   }
-  emitText("\nb tx ");
-  for (uint32_t i = 0; i < r.previewLength; i++) {
-    putChar(r.preview[i]);
+
+  // 4. Publish the block device and start the one driver it is for.
+  CloverBlockDevice *device = new CloverBlockDevice;
+  IOPlatformExpert *platform = IOService::getPlatform();
+  if (!device || !device->init(nullptr)) {
+    fail("device", 0);
   }
-  clover_block_report[gReportLength] = 0;
+  if (!platform || !device->attach(platform) || !device->start(platform)) {
+    fail("attach", 0);
+  }
+  const OSMetaClass *driverMeta = lookupMetaClass("IOBlockStorageDriver");
+  IOService *driver = driverMeta ? static_cast<IOService *>(driverMeta->alloc()) : nullptr;
+  if (!driver || !driver->init(nullptr) || !driver->attach(device) || !driver->start(device)) {
+    fail("driver", 0);
+  }
+  IORegistryEntry *mediaEntry = driver->getChildEntry(gIOServicePlane);
+  IOMedia *whole = mediaEntry
+      ? static_cast<IOMedia *>(mediaEntry->metaCast("IOMedia")) : nullptr;
+  if (!whole || whole->getSize() / kBlockBytes != clover_emmc_block_sectors()) {
+    fail("media", 0);
+  }
+
+  // 5. The real partition table reader. probe() opens the media, reads LBA 0/1 and the entry
+  // array and keeps one media object per entry; start() attaches and registers each of them.
+  const OSMetaClass *schemeMeta = lookupMetaClass("IOGUIDPartitionScheme");
+  IOService *scheme = schemeMeta ? static_cast<IOService *>(schemeMeta->alloc()) : nullptr;
+  if (!scheme || !scheme->init(nullptr)) {
+    fail("gpt", 0);
+  }
+  SInt32 score = 0;
+  if (!scheme->probe(whole, &score)) {
+    fail("gpt-probe", static_cast<uint32_t>(score));
+  }
+  if (!scheme->attach(whole) || !scheme->start(whole)) {
+    fail("gpt-start", 0);
+  }
+
+  // 6. The logfs entry the round101 walk named. The count is the scheme's own published total,
+  // so a wrong number is visible without another hand-rolled GPT parse.
+  uint32_t partitions = 0;
+  IOMedia *target = nullptr;
+  OSSharedPtr<OSIterator> children = scheme->getChildIterator(gIOServicePlane);
+  if (!children.get()) {
+    fail("gpt-children", 0);
+  }
+  // IOMedia's metaclass symbol belongs to IOStorageFamily, not the kernel, so the cast is by
+  // name: the only class this scheme publishes children of is IOMedia.
+  while (OSObject *object = children->getNextObject()) {
+    IOMedia *partition = static_cast<IOMedia *>(object->metaCast("IOMedia"));
+    if (!partition) {
+      continue;
+    }
+    partitions++;
+    OSNumber *id = OSDynamicCast(OSNumber, property(partition, kPartitionIdKey));
+    if (id && id->unsigned32BitValue() == kLogfsPartitionId) {
+      target = partition;
+    }
+  }
+  if (!target) {
+    fail("gpt-target", partitions);
+  }
+
+  // 7. BSD nodes. The whole disk is started first so the anchor is unit 0 and the partition is
+  // named disk0s39 by the same code that names every disk in a normal boot.
+  if (!startService("IOMediaBSDClient", whole)) {
+    fail("bsd-whole", 0);
+  }
+  if (!startService("IOMediaBSDClient", target)) {
+    fail("bsd-root", 0);
+  }
+  OSString *bsdName = OSDynamicCast(OSString, property(target, kBSDNameKey));
+  OSNumber *bsdMajor = OSDynamicCast(OSNumber, property(target, kBSDMajorKey));
+  OSNumber *bsdMinor = OSDynamicCast(OSNumber, property(target, kBSDMinorKey));
+  if (!bsdName || !bsdMajor || !bsdMinor) {
+    fail("bsd-props", 0);
+  }
+
+  // 8. The exact discovery setconf() performs for rd=<bsd name>.
+  OSDictionary *matching = IOBSDNameMatching(bsdName->getCStringNoCopy());
+  mach_timespec_t timeout = { 1, 0 };
+  IOService *matched = matching ? IOService::waitForService(matching, &timeout) : nullptr;
+  OSSafeReleaseNULL(matching);
+  if (matched != target) {
+    fail("root-match", reinterpret_cast<uint64_t>(matched));
+  }
+
+  // 9. bdevvp() is what vfs_mountroot() calls on that dev_t. It opens the minor through the
+  // bdevsw IOMediaBSDClient installed, so this both proves the number and leaves the vnode the
+  // root mount would use.
+  int32_t rootdev = (static_cast<int32_t>(bsdMajor->unsigned32BitValue()) << 24) |
+                    static_cast<int32_t>(bsdMinor->unsigned32BitValue());
+  void *rootvp = nullptr;
+  int error = bdevvp(rootdev, &rootvp);
+  if (error || !rootvp) {
+    fail("bdevvp", static_cast<uint32_t>(error));
+  }
+
+  // 10. The partition's offset mapping: the same block read through the whole media at the
+  // partition's base and through the partition at byte zero has to be identical.
+  OSSharedPtr<IOBufferMemoryDescriptor> wholeBlock =
+      IOBufferMemoryDescriptor::withCapacity(kBlockBytes, kIODirectionIn, true);
+  OSSharedPtr<IOBufferMemoryDescriptor> partBlock =
+      IOBufferMemoryDescriptor::withCapacity(kBlockBytes, kIODirectionIn, true);
+  if (!wholeBlock.get() || !partBlock.get()) {
+    fail("buffer", 0);
+  }
+  uint64_t partitionBase = target->getBase();
+  if (!whole->open(device, 0, kIOStorageAccessReader)) {
+    fail("open-whole", 0);
+  }
+  IOReturn status = readMediaBytes(whole, device, wholeBlock.get(), partitionBase, &gMediaOp);
+  whole->close(device);
+  if (status != kIOReturnSuccess) {
+    fail("read-whole", static_cast<uint32_t>(status));
+  }
+  if (!target->open(device, 0, kIOStorageAccessReader)) {
+    fail("open-part", 0);
+  }
+  status = readMediaBytes(target, device, partBlock.get(), 0, &gMediaOp);
+  target->close(device);
+  if (status != kIOReturnSuccess) {
+    fail("read-part", static_cast<uint32_t>(status));
+  }
+  const void *wholeBytes = wholeBlock->getBytesNoCopy();
+  const void *partBytes = partBlock->getBytesNoCopy();
+  if (!wholeBytes || !partBytes || memcmp(wholeBytes, partBytes, kBlockBytes) != 0) {
+    fail("map", 0);
+  }
+
+  IOLog("CloverBlock r112: p=%u %s %u:%u bd=1 map=1\n", partitions,
+        bsdName->getCStringNoCopy(), bsdMajor->unsigned32BitValue(),
+        bsdMinor->unsigned32BitValue());
 }
+
