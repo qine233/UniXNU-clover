@@ -7664,6 +7664,122 @@ fastboot flash userdata /Users/zhouzhou/clover-out/round128-userdata-root.sparse
 **下一格的问题**：容器已经能被认出来、卷已经能发布，缺的是「真 mount + 把文件字节读回来」。下一轮在同一个探针里再走一步：
 拿 `measureApfsDepth` 找到的那颗卷向 vfs 要一次挂载，读回容器里一个已知路径的字节，仍然画在 panic 屏上。
 
+## v0.3.2（round129）：向内核要一次真挂载，把卷里的一个文件字节读回屏上
+
+round128 的 `v=1` 只是一次 registry 计数：`AppleAPFSVolume` 发布出来了，但没有任何人 mount 过它，更没有谁从它读过
+一个字节。本轮在**同一个探针、同一颗卡、同一份镜像、同一串 boot args** 里再走一步：把那颗卷的媒体交给 vfs，
+让它做一次真正的挂载，然后读回 `System/Library/CoreServices/SystemVersion.plist` 的头 1024 字节 —— 全部印在同一行
+panic 上。`f/n/m/l/d/s/c/v` 八字段原样保留，新的是后面那串。
+
+**先记一条被否掉的路（下一轮别重新试）**：不走 `kernel_mount()`。`vfs_mount()` 只在 `VFC_VFSLOCALARGS` 下解析设备名 ——
+`copyin(fsmountargs, &devpath, 8)` 之后 `NDINIT(..., UIO_USERSPACE, devpath)` + `namei()`
+（`bsd/vfs/vfs_syscalls.c:1312-1400`），也就是要一个**用户态地址**和一个**解析得出的 `/dev` 节点**；clover 的根是 mockfs、
+扁平、没有子目录，`/dev` 根本不存在。按角色挂载（`KERNEL_MOUNT_DATAVOL` 那一族，:1490-1607）则要一个已经挂好的 origin
+`mp`，而本轮要问的恰恰是第一个挂载。
+
+**本轮的形状 = 把引导根自己那段代码抄一遍**（`bsd/vfs/vfs_subr.c:1240-1294`），逐档都有出处：
+
+1. 卷的 BSD 名与 major/minor：`IOMediaBSDClient` attach 到那颗 per-volume 媒体时写上去的，和 round116 起给 `disk0s39`
+   命名的是同一趟异步配置。`volumeBsd()` 用 1000 轮 × `IOSleep(10)` 等它，等法是 step 5 从 round116 就在用的那种
+   —— 轮询而不是 semaphore，因为干活的配置机器正在跑我们自己。
+2. `bdevvp(major<<24 | minor, &devvp)` —— :1240。
+3. `vfs_rootmountalloc("apfs", <卷自己的 BSD 名>, &mp)` —— :1176 沿 `vfsconf` 比 `vfc_name`（:1181），:1258 是它的调用点。
+4. `VFS_MOUNT(mp, devvp, 0, ctx)` —— :1265，引导根那条「无 data 参数」的形状。
+5. `vfs_unbusy(mp)`（:1284）+ `mount_list_add(mp)`（:1286）—— 这两档不是可选的：`vfs_rootmountalloc_internal()` 在
+   :1146 就 `vfs_busy()` 过这颗挂载点，只有 `vfs_unbusy()` 会放掉那把共享 rwlock；而不在 `mountlist` 上的挂载点对
+   `vfs_work_thread()` 是不可见的，那正是消化 `mnt_workerqueue` 的线程 —— apfs 把卷的延后拆解挂在那条队列上。
+   `mount_list_add()` 要写 `mp->mnt_list`，但那个偏移在内核里读，我们的不透明指针不付代价。
+6. `VFS_START(mp, 0, ctx)` → `VFS_ROOT(mp, &dir, ctx)`。
+7. 四次 `vnode_lookupat(<单个组件>, 0, &next, ctx, dir)` 走 `System` / `Library` / `CoreServices` / `SystemVersion.plist`。
+8. `vn_rdwr(UIO_READ, vp, buf, 1024, 0, UIO_SYSSPACE, IO_UNIT, cred, &resid, NULL)`。
+
+**明确承认的缺口**：`mp->mnt_devvp = rootvp` 和它后面那句 `v_specflags |= SI_MOUNTEDON` 没抄 —— `struct mount` 的布局只在
+`bsd/sys/mount_internal.h`，不是本归档编译时用到的头，所以设备 vnode 只经由 `VFS_MOUNT` 的第二个参数进文件系统。树里读
+`mnt_devvp` 的地方（bootcache `vfs_cluster.c:537/546`、`vnode_pager.c:248`、`vm_compressor_backing_file.c`、
+`kpi_vfs.c:847/1766`、`vfs_syscalls.c:2042/2895/14707`、`mockfs_fsnode.c:81`）都不在这条路上；如果 apfs 需要它，
+`mt=` 这一栏会替它说话。`vfs_init_io_attributes()`（:1294）同样跳过：它只为根的换页调 I/O 尺寸，本轮是一个文件的一次缓冲读。
+
+**namei 的引用归属是读源码定的，不是猜的**：`namei` 不吃调用方的 `start_dvp` —— `usedvp_dp` 短路掉那份额外的 usecount
+（`vfs_lookup.c:427`），`lookup()` 用 `vnode_getwithref(dp)`（:1125）自取一份、在 :931 丢掉；返回的 `*vpp` 带一个 iocount。
+所以阶梯里那句 `vnode_put(dir)` 放的正是「它来到时所在的那一级」，既不泄漏也不放空。
+
+**为什么读 `SystemVersion.plist`**：`measureApfsDepth` 只能说「卷发布了」，读什么得自己挑一个「一定在、而且是二进制格式」的
+路径。`System/Library/CoreServices/SystemVersion.plist` 的头 8 字节是 `bplist00`，按小端两个字读就是 `0x696c7062`、`0x30307473` ——
+一行 panic 里能直接放得下「这些字节真是从卡上来的」的凭据。路径拆成四次单组件查找，因为一次拍照只带回一行，四级里停在哪一级
+必须能说出来。没有挑 round128 缓存里那颗 `044-76040-038.dmg`（5,157,406,069 字节）：`round128-userdata-root.json` 记的是
+`"source": "remote"`，文件不在本机，宿主机上算不出它的 inode 与偏移，也就没法预先知道该读哪个 LBA。
+
+**不 fail-fast**：每一档都 `return` 而不 `panic`，全部 errno 汇成一行读数；`0xffff`（65535）= 「这一档没走到」，`0` = 走了且过了。
+第一个 65535 就是失败点，它前面的字段依然是答案。这是「一次刷机只回答一个问题」的写法：挂载死在第三个路径组件，也得把前两级的
+结果带回来。
+
+**预算这轮换了性质**：round128 那 464 块是配置线程读的，而挂载 + 读文件是**缓冲缓存经由这颗设备**发 I/O，走的还是 PIO 那条
+≈20 ms/512 B 的路（round127 实测）。真容器头几页就是几十秒，所以轮询仍是 12000 轮、`armcpu-clock-panic=180000`（≈11 分钟
+@ ≈275 tick/秒）都留着。**如果这轮死在定时器上而不是死在这行上，`elr=` 是那笔慢读，不是 bug。**
+
+**这台机器已经证明这级梯子爬得动**：round120 的 `rootvp not authenticated after mounting @bsd_init.c:1098` 出自一次
+成功的根挂载**之后** —— 也就是 `bdevvp(makedev(1,39))` → mockfs → `buf_meta_bread(rvp, 0, 4096)` → `VOP_STRATEGY` →
+`IOMediaBSDClient` → `IOBlockStorageDriver` → CloverSdhci PIO 全通过；round121 的 `Process 1 exec of /sbin/launchd failed,
+errno 8 @kern_exec.c:8104` 同理。本轮只是把梯子指向一颗真卷，而不是 mockfs。
+
+构建：
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && scripts/verify-clover-payload.py
+```
+
+`kernel` 这格照旧不能省（两个驱动都归 `[kernel] archives` 管）。本轮 `userdata` 不重建 —— 镜像一个字节都没变。
+产物：内核本地 `dac3deef…` / 卷内 `1ea78352…`（51,994,624 B，探针偏移 6680 字节分布在 35 段里，其余逐字节相同）；
+`payload.img` `327b215b…`（58,720,256 B = 56 MiB）；ADT `fd99843a…`（13,268 B）；`unixnu.toml` `33375ba3…`（600 B）；
+`libCloverBlock.a` 296,888 字节。
+根镜像 `614b8356…` 与信任缓存 `c3ed2152…` 这轮没动，boot 仍是 round87 那份 `196b284f…`，`userdata` 仍是
+`round128-userdata-root.sparse.img` `be354a4a…`。归档在 `~/clover-out/round129-*`（`round129-SHA256SUMS`）。
+
+checker 增量：`verify-clover-payload.py` 的 `check_block()` 新增 `CloverBlock r129: apfs`、`AppleAPFSVolume`、
+`SystemVersion.plist` 三条（`AppleAPFSContainerScheme` 那类旧断言都保留）；`check-clover.py` 的根契约文案升到 round129，
+断言本身不变：`rd=md0` 在场、`rd=md0s39`/`rd=disk0s39` 缺席、`clover-apfs=2` 与 `clover-emmc=21` 同时在场、
+`[userdata]` 必须真的带 `windows`。
+
+**本轮只刷一格：`cache`（负载）。** 这是有意声明的：**本轮不写任何新的 eMMC 分区** —— `userdata` 保持 round128 刷进去的那张
+iPadOS 容器镜像，一个字节都不再动，`logfs` 与 `boot` 也不碰。
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round129-payload.img   # 56 MiB，327b215b…
+fastboot reboot
+```
+
+冷刷，不用 `fastboot boot`。菜单第一行应认得 `clover r129: mount iPadOS's published APFS volume and read a file back`。
+一次刷机只回答一个问题：**这级梯子能不能走到 `rd=0 g=1024 x=0x696c7062 y=0x30307473`**（取在 `CloverBlock.cpp:1073`）。
+
+`CloverBlock r129: apfs f= n= m= l= d= s= c= v= dv=major:minor bd= al= mt= st= rt= k=a/b/c/d rd= g= x=0x.. y=0x.. r= w=`
+各字段怎么读：
+
+- 前八字段与 round128 同义；`v=0` 时后面**全部**是 65535，本轮结论就退回「卷没发布」，不是挂载失败。
+- `dv=major:minor` —— 卷媒体上的 BSD 号。`65535:65535` = `IOMediaBSDClient` 没给这颗叶子媒体命名，梯子第一步就无从下手。
+- `bd=` —— `bdevvp()` 的 errno，非 0 是 vnode 表那一层的旧账（round120 已证明这条路本身在这台机器上走得通）。
+- `al=` —— `vfs_rootmountalloc()`；非 0（`ENODEV`=19）说明 `vfsconf` 里没有名为 `apfs` 的 vfstable，也就是 apfs.kext 没把
+  自己注册进去 —— 和 `l=` 一道读。
+- `mt=` —— `VFS_MOUNT` 的 errno，**本轮真正的答案**：0 就是 Apple 的 apfs 挂载了一颗由本移植驱动的卷。`mnt_devvp` 那个缺口
+  如果不够用，也是在这一栏说话。
+- `st=` —— `VFS_START`。它不 fail-fast，所以即使非 0，`rt=` 与后面依然会有值。
+- `rt=` —— `VFS_ROOT`；非 0 时 `k=` 全是 65535。
+- `k=a/b/c/d` —— 四级各自的 errno：第一个既非 0 又非 65535 的位置就是路径断在哪一级（`ENOENT`=2 说明卷根里没有 `System`，
+  那要么读的是 Data 卷，要么 BSD 号取错了卷）。
+- `rd=` —— `vn_rdwr()` 的 errno。
+- `g=` —— 实际读回的字节数（`1024 - resid`）。**>0 就是卡上的字节**，这是本移植第一次读到文件内容。
+- `x=/y=` —— 头 8 字节的两个小端字；`0x696c7062 0x30307473` = `bplist00`，那就是读对了。
+- `r=/w=` —— 现在里面是缓冲缓存的流量，应当**远大于** round128 的 464；`w=` 若不再是 0，说明 apfs 在挂载过程中写了东西，
+  那是下一条要记的结果（本移植的 PIO 写路径至今没被真的文件系统碰过）。
+
+**下一格的问题**（拿到答案之后）：如果读到的是 Data 卷而不是 `OS` 卷，`dv=` 与 `k=` 会先把它说出来，下一轮就按 BSD 号挑卷；
+如果 `mt=` 非 0，下一格是把 `mnt_devvp` 那块布局补上；如果 `g=1024 x=0x696c7062 y=0x30307473` 真到了屏上，下一格就不再需要
+探针 —— 该把 `rd=` 指向这颗卷、让内核拿它当根，走 `/sbin/launchd` 那条路。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

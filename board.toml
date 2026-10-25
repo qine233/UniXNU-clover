@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r128: apfs reads iPadOS's own container off userdata"
+title = "clover r129: mount iPadOS's published APFS volume and read a file back"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1633,6 +1633,29 @@ kernel_args = [
   # round's scripts/make-clover-sparse.py emits) flashed in one command with the bootloader accepting the
   # sparse stream chunk by chunk -- first hardware proof that this device's fastboot understands sparse, and
   # that the path sidesteps the host's 2 GiB single-read cap that kills the raw file.
+  # Round129 keeps the geometry, the boot args and the flash command of round128 and asks the next
+  # question of the same photograph: the walk found a volume, so can the kernel *mount* it. The probe
+  # now keeps the AppleAPFSVolume's media, reads its BSD numbers, and transcribes the boot root's own
+  # ladder (bsd/vfs/vfs_subr.c:1240-1294) on it -- bdevvp, vfs_rootmountalloc("apfs"), VFS_MOUNT with
+  # no data argument, vfs_unbusy + mount_list_add, VFS_START, then VFS_ROOT, four one-component
+  # vnode_lookupat() steps down System/Library/CoreServices/SystemVersion.plist and one vn_rdwr() of
+  # 1024 bytes. mp->mnt_devvp and vfs_init_io_attributes are the two steps it cannot copy: struct
+  # mount is only laid out in a header this archive does not compile against. It is the same ladder
+  # round120 proved this board can climb (that frame's panic came from *after* a successful root
+  # mount), just aimed at a volume instead of at mockfs.
+  # Nothing on that ladder panics: every rung's errno lands on one line, because one flash is one
+  # photograph and a mount that dies at the third component still has to show the first two.
+  # "CloverBlock r129: apfs f= n= m= l= d= s= c= v= dv=major:minor bd= al= mt= st= rt= k=a/b/c/d "
+  # "rd= g= x=0x.. y=0x.. r= w=" -- the eight r128 fields first, then bdevvp / rootmountalloc / mount /
+  # start / root / the four lookups / the read, the byte count that came back, the first two words of
+  # the file (a real SystemVersion.plist opens with "bplist00", which as two little-endian words is
+  # x=0x696c7062 y=0x30307473), and the block counters. 65535 in any errno field means the rung was
+  # never reached, so the first 65535 names the failure and the fields before it are still the answer.
+  # The budget question changed shape: round128's 464 blocks were IOKit's reads, and a mount plus one
+  # file is the buffer cache reading through this device on a thread that is not a configuration
+  # thread. At the measured ~20 ms per 512-byte block a container's first pages are tens of seconds and
+  # 180000 watchdog ticks is still eleven times round128's frame, so if this round ends on the timer
+  # instead of on the line, elr= is the read that is slow and not a bug.
   "clover-apfs=2",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the

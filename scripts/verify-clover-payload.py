@@ -124,13 +124,16 @@ def check_block(kernel: bytes) -> bool:
     partition over: the boot argument that selects the root image, the panic line that carries the
     depth, the container-scheme class name it walks the registry for, both window accessors
     CloverSdhci has to have linked in for the geometry to exist at all, and the two magics it reads
-    (the SHNGROOT manifest and the GPT header the window turns out to carry). Any of them going
+    (the SHNGROOT manifest and the GPT header the window turns out to carry). Round129 adds the
+    second half of the same line: the volume class whose media it mounts, the filesystem name handed
+    to vfs_rootmountalloc() and the path it walks once the mount is up. Any of them going
     missing means the round silently asks nothing -- the failure shape check-clover.py refuses to let
     the archives have."""
     label = "kernel.macho: CloverBlock linked"
     found = {name: name.encode() in kernel
-             for name in ("clover-apfs", "CloverBlock r128: apfs",
-                          "AppleAPFSContainerScheme", "_clover_emmc_block_window",
+             for name in ("clover-apfs", "CloverBlock r129: apfs",
+                          "AppleAPFSContainerScheme", "AppleAPFSVolume",
+                          "SystemVersion.plist", "_clover_emmc_block_window",
                           "_clover_emmc_block_userdata_window", "SHNGROOT", "EFI PART",
                           "_clover_block_run")}
     ok = all(found.values())
