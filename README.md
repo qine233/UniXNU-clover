@@ -7280,7 +7280,63 @@ A 的位置仍是 round123 的那个位置、形状一字不差（`msg=` 上了�
 
 第二帧（本轮同一次启动，等到 ≈18 分钟看门狗占屏）仍值得拍：它只补一个坐标 —— B 的沉默是不是永久的。不拍也不影响 round125 的读数。
 
-## 有意省略的部分
+## v0.2.97（round125）：看门狗占屏那一刻，panic 屏把 console ring 和 km tty 打出来
+
+问题还是上一轮那句，只是换了问的对象：**A 卡住的那一次 `write` 停在哪一层** —— tty 那两处会放开 `tty_lock` 的睡眠（`"ttydcd"` / `"ttywri"`），还是 console 层的 `flush_lock`/ring。上一轮已经证明 EL0 探针排不过去（没有可靠时间源），所以这一刀完全落在内核侧：复现两轮的 60000-tick 看门狗 panic 就是触发器，panic 屏又是直写帧缓冲、不经被试控制台的通道。
+
+改动三处，EL0 镜像与根镜像一字未动：
+
+- `scripts/patch-xnu-entry-probe.py`：`assemble_c()` 里新增一条与 `MAX_MEM`/`PMGR_OBS` 同规格的符号解析表（`CONSOLE_RING`/`KM_TTY`/`DIS_CONS`/`CONS_SUSP`），每个都查自然对齐与所属段边界，缺失的符号让 `.c` 里的 0 默认值接管，于是没有 tty 控制台的内核渲染如旧。`console_ring` 是 `serial_console.c` 里的 file-static 变量，靠本核带 STABS 才拿到名字：`b ffffffff007b3bcf0 _console_ring`。
+- `scripts/xnu-panic-screen.c`：`format(&g, fmt, args)` 之后**第一件事**就是画这六行（画在 `pages=` 之前，因为本轮的答案在这里，屏的高度只留得下二十来行，尾部 `RA/FP/LR/slots` 是被挤掉的那一段）。新增的 `word()` 与 `slot()` 同规矩：每个地址先过 `readable()` 的硬件翻译查询，不过就画十六个 `-`，所以一个陈旧的 `km_tty[0]` 只会留下一行破折号，不会把 panic 变成无声的死机。
+- `board.toml`：`title = "clover r125: panic screen reads the console ring"`。本轮 EL0 没有任何变化，`[clover] b`、`msg=` 那些行 round124 也画得出来 —— **菜单第一行有没有 `r125` 是这张照片属于哪一轮的唯一判据**。
+
+屏上六个坐标与它们的偏移，全部取自这份镜像自己的反汇编（`llvm-objdump --macho -d --section=__TEXT_EXEC,__text --dis-symname …`），不是头文件里的猜测：
+
+| 屏上标签 | 地址 | 意义 | 怎么读 |
+| --- | --- | --- | --- |
+| `ring len=` | `_console_ring + 0x8` | `console_ring.len` | `vm_map_round_page(256*(MAX_CPUS+1))`，`used` 与它相等就是 ring 满 |
+| ` used=` | `+ 0xc` | `used` | 已塞进 ring、还没排空给硬件的字节数 |
+| ` nres=` | `+ 0x10` | `nreserved` | 正在被写的区段数；`>0` 且不再降 = 有人 reserve 之后没归还，排空者就在 `while (nreserved > 0) cpu_pause()` 里转 |
+| `buf= / wr= / rd=` | `+0x0 / +0x18 / +0x20` | `buffer`、`write_ptr`、`read_ptr` | `wr-rd` 与 `used` 对不对得上；偏移取自 `_console_ring_try_empty` 的 `ldr x23,[x10,#0x20]`、`stur …,[x9,#0x14]` |
+| `fl=` | `+ 0x28 + 8` | `flush_lock` 的锁字 | `_lck_mtx_try_lock` 在结构 +8 处 `ldaxr/cbnz/stxr`，存进去的是持有者的 cpu 号（取自 `TPIDR_EL1+0x510`）：非 0 ⇒ 锁被占，0 ⇒ 空闲**或者**被 cpu 0 占着，这份镜像分不开这两种 |
+| ` wt=` | `+ 0x38 + 8` | `write_lock` 的票字 | `_lck_ticket_lock` 在结构 +8 处 `ubfx w10,w9,#16,#8; cmp w10, w9 lsr #24`，**只有 bits[23:16] == bits[31:24] 才算空闲**；不相等 ⇒ 有人在锁里排队，而 `console_write` 的 ring 满重试正好要拿它 |
+| `dis=` | `_disableConsoleOutput`（`int`） | 静默丢字出口一 | `console_write` 开头 `if (disableConsoleOutput) return`（:526） |
+| `susp=` | `_console_suspended`（`bool`） | 静默丢字出口二 | `console_io_allowed()` 里 `console_suspended || !is_console_initialized() || pmap_in_ppl()`（:536） |
+| `tty=` | `_km_tty[0]` | 这块板上唯一那颗 tty | `bsd/dev/arm/km.c:39 struct tty *km_tty[1]` |
+| `state=` | `tp + 0xc0` | `t_state` | 下一行直接把它问出来，不用手算 |
+| `cc=` | `tp + 0x80` | `t_outq.c_cc` | 出队里攒了多少字节；`ttymalloc` 只给了 `clalloc(…, TTYCLSIZE=1024, 0)` |
+| `low= / hi= / to=` | `+0x1d0 / +0x1cc / +0x1d4` | `t_lowat`、`t_hiwat`、`t_timeout` | 预期 `256 / 1440 / 0`；`to=0` 就是「进了 `ttywri` 出不来」的那半句话 |
+| `owner=` | `tp + 0x1e8` | `t_locked_thread` | `_tty_lock` 的 `str x0,[x19,#0x1e8]`。**非空 ⇒ panic 那一刻确实有线程持着 `tty_lock`**，也就是有人还在 `kmwrite` 里面；空 ⇒ 没人持锁，卡住的那位在睡眠或者根本没被调度 |
+| `OLOWAT yes/no` | `tp + 0xc0` 的 bit 0 | `TS_SO_OLOWAT` | 照片上手算 hex 容易看错，所以让屏自己回答 |
+
+三个读数，前两个互斥：
+
+1. **`OLOWAT yes` + `cc=` 顶到 1024** ⇒ 上一轮源码账的第 2、3 条（`km.c` 从不 `ttwwakeup`、`t_timeout` 恒为 0）就是根因。修法是驱动排空出队之后补一次 `ttwwakeup()`；这颗探针顺便成了验证。
+2. **`used == len` 且 `nres > 0`**（或者 `fl=`/`wt=` 显示锁被占）⇒ 根因在 console 层的锁，tty 那两处睡眠是无辜的。这时 `owner=` 也应当非空，因为整段 ring 代码都跑在 `tty_lock` 里面。
+3. **六个坐标全是干净值**（`used=0`、`nres=0`、`fl=0`、票字相等、`OLOWAT no`、`owner=0`）⇒ panic 那一刻**没有人在 console 层**，卡住的 A 只能是在 tty 睡眠里或者根本不再被调度；那么 `cc=` 与 `state=` 的其余位（`TS_BUSY 0x4`、`TS_CONNECTED 0x20000`）就是下一个问题，而不是这一轮的失败。
+
+顺手把这条也记下来，免得下一次又当成回归：`kernel.macho.adt` 的哈希每轮构建都变，因为 `make-clover-adt.py:211` 每次重新 `os.urandom(64)` 写进 `/chosen` 的 `random-seed`。本轮两份 ADT（`bfab69bb…`、`b0c6697b…`）来自同一颗内核的两个构建，就是这个原因。
+
+### 构建、校验与本轮该刷哪一格
+
+```
+# 只重打 payload：panic 屏是补丁器在 build payload 时编译进内核文本空洞的
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && scripts/verify-clover-payload.py
+```
+
+归档在 `~/clover-out/round125-*`（`round125-SHA256SUMS`）：payload `58720256` 字节 `cb4cc89b…`；卷内 `kernel.macho` `5beb1f97…`（补丁 6679 字节 / 35 段，比 round124 多出 panic 屏那六行）；**`scratch-data.img` 仍是 `efb2cd85…`，与 round124 逐字节相同**，信任缓存仍是唯一那一份 `32508dc5…`，boot-args 一个字符没动。所以本轮**只刷 `cache` 一格**，`logfs`（第 39 格，装着 exec 的根镜像）和 boot 都不碰：
+
+```
+fastboot flash cache ~/clover-out/round125-payload.img
+```
+
+冷刷，不用 `fastboot boot`。开机认出菜单第一行的 `clover r125:`，然后让 A 照旧卡在 `msg=`，等 ≈18 分钟看门狗自己占屏 —— 那一帧就是本轮的全部答案，读上面六行。第一帧（引导日志停在 `msg=` 那张）也顺手拍，用来确认 `r125` 与 A 的位置没变。
+
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
   sheng 那条"直接从 userdata 读 APFS 卷"的路走不通。clover 走 gta4l 的形状：

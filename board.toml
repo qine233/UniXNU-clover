@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover el0: prober B writes the console while A stays wedged"
+title = "clover r125: panic screen reads the console ring"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1621,6 +1621,21 @@ kernel_args = [
   # missing ttwwakeup is the root cause; used==len with nreserved>0 means the console locks are. Also
   # unmeasured and load-bearing: how many CPUs are online here -- the `while (nreserved > 0) cpu_pause()`
   # spin in console_ring_try_empty() is only a candidate on a second core.
+  # Round 125 is that cut, shipped as v0.2.97. It prints six lines, in this order and ahead of pages=/ticks=
+  # because the panel only keeps about twenty rows: ring len/used/nreserved, buf/wr/rd, fl=/wt=/dis=/susp=,
+  # tty=/state=/cc=, low=/hi=/to=/owner=, then a line that asks TS_SO_OLOWAT by name instead of leaving the
+  # hex to be read by eye. Offsets come from this image's own disassembly, not a header: _console_ring_
+  # try_empty loads used at ring+0xc, read_ptr at +0x20 and takes flush_lock at +0x28, write_lock at +0x38
+  # (the struct ends where _console_suspended begins, +0x48); _lck_mtx_try_lock tests the mutex word at its
+  # argument+8 and _lck_ticket_lock compares bits [23:16] with [31:24] of the word at its argument+8, so
+  # fl= and wt= are those two words. fl= nonzero names the holder's cpu, 0 means free or held by cpu 0,
+  # which this image cannot tell apart; wt= free means the two bytes agree. owner= is t_locked_thread
+  # (+0x1e8, the `str x0,[x19,#0x1e8]` in _tty_lock): nonzero at panic time says a thread still holds
+  # tty_lock, i.e. somebody is inside kmwrite -- which is the tie-breaker the round124 photo could not give.
+  # Nothing in this round touches the EL0 image, so scratch-data.img stays efb2cd85… and only `cache` needs
+  # reflashing; the payload title ("clover r125: …") is the only visible thing that separates this photo
+  # from round124's. kernel.macho.adt's hash changes every build for an unrelated reason: make-clover-adt.py
+  # writes a fresh os.urandom(64) /chosen random-seed.
   "armcpu-clock-panic=60000",
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board has never had its online-CPU count measured (round70's panel

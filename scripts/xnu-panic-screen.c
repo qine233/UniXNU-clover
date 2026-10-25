@@ -68,6 +68,47 @@ struct ctx {
 #endif
 #define PANIC_LOG_BYTES 480
 
+/* Round125 asks the panic screen what the console itself was doing. The patcher resolves these four
+ * kernel addresses the same way it resolves the counters above; a kernel whose symbol table lacks one
+ * leaves the macro at 0 and the corresponding line is drawn as dashes. */
+#ifndef CONSOLE_RING
+#define CONSOLE_RING 0UL
+#endif
+#ifndef KM_TTY
+#define KM_TTY 0UL
+#endif
+#ifndef DIS_CONS
+#define DIS_CONS 0UL
+#endif
+#ifndef CONS_SUSP
+#define CONS_SUSP 0UL
+#endif
+
+/* console_ring (osfmk/console/serial_console.c:62), read off this kernel's own disassembly of
+ * _console_ring_try_empty: it loads len at +0x8, used at +0xc, nreserved at +0x10, read_ptr at
+ * +0x20, takes flush_lock at +0x28 and write_lock at +0x38, and _console_suspended sits at +0x48. */
+#define RING_BUFFER      0x00
+#define RING_LEN         0x08
+#define RING_USED        0x0c
+#define RING_NRESERVED   0x10
+#define RING_WRITE       0x18
+#define RING_READ        0x20
+#define RING_FLUSH       0x28
+#define RING_WLOCK       0x38
+
+/* struct tty, likewise from _ttwrite/_tty_lock in this image: c_cc at +0x80, t_state at +0xc0,
+ * t_hiwat/t_lowat/t_timeout at +0x1cc/+0x1d0/+0x1d4 (msleep0's timo argument is the last of those),
+ * and t_locked_thread at +0x1e8. */
+#define TTY_CC              0x80
+#define TTY_STATE           0xc0
+#define TTY_HIWAT           0x1cc
+#define TTY_LOWAT           0x1d0
+#define TTY_TIMEOUT         0x1d4
+#define TTY_LOCKED_THREAD   0x1e8
+
+/* The one TS_* bit (bsd/sys/tty.h) this round asks about by name. */
+#define TS_SO_OLOWAT        0x1u
+
 __attribute__((noreturn)) static void park (void)
 {
   for (;;) {
@@ -326,6 +367,27 @@ static void slot (struct ctx *g, const char *label, const u64 *args, int index)
   number (g, *(volatile const u64 *)address, 16, 16, 1);
 }
 
+/* One kernel field, read only after a translation query, in the same spirit as slot(): an address
+ * that does not translate is drawn as dashes instead of faulting, so a stale tty pointer still
+ * leaves a readable screen. size is 1, 4 or 8. */
+static void word (struct ctx *g, const char *label, u64 address, u32 size)
+{
+  text (g, label);
+  if (address == 0 || (address & (size - 1)) || !readable ((const char *)address, 0)) {
+    text (g, "----------------");
+    return;
+  }
+  put (g, '0');
+  put (g, 'x');
+  if (size == 8) {
+    number (g, *(volatile const u64 *)address, 16, 16, 1);
+  } else if (size == 4) {
+    number (g, *(volatile const u32 *)address, 16, 16, 1);
+  } else {
+    number (g, *(volatile const u8 *)address, 16, 16, 1);
+  }
+}
+
 /* x0 = fmt as for panic(); x1 = the first variadic slot; x2 = the caller's LR
  * (x30 on the panic() hook, x6 on the trap funnel); x3 = the caller's frame
  * pointer, whose saved LR names the assert call site that came before. */
@@ -375,6 +437,46 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   }
   format (&g, fmt, args);
   __asm__ volatile ("dsb sy");
+  /* Round125's question, drawn ahead of every other reading: twice in a row the board wedged inside
+   * one write(2) to /dev/console and the clock watchdog's panic took the panel, so the screen now
+   * reports what the console layer looked like at that moment. The ring words say whether a writer
+   * was staging bytes (used, nreserved) or a drainer was left waiting for reservations to close;
+   * fl= and wt= are the two locks console_ring_try_empty holds while it spins -- _lck_mtx_try_lock
+   * stores the holder's cpu number in the mutex word, so a non-zero fl= names it and 0 means free
+   * (or held by cpu 0, which this image cannot tell apart), and the ticket is free only when its
+   * tix and ticket bytes agree. dis= and susp= are the two flags that make console_write() return
+   * without storing anything: the other way a write can finish and still print nothing. */
+  {
+    u64 tp = 0;
+    if (KM_TTY != 0 && readable ((const char *)KM_TTY, 0)) {
+      tp = *(volatile const u64 *)KM_TTY;
+    }
+    word (&g, "\nring len=", CONSOLE_RING + RING_LEN, 4);
+    word (&g, " used=", CONSOLE_RING + RING_USED, 4);
+    word (&g, " nres=", CONSOLE_RING + RING_NRESERVED, 4);
+    word (&g, "\nbuf=", CONSOLE_RING + RING_BUFFER, 8);
+    word (&g, " wr=", CONSOLE_RING + RING_WRITE, 8);
+    word (&g, " rd=", CONSOLE_RING + RING_READ, 8);
+    word (&g, "\nfl=", CONSOLE_RING + RING_FLUSH + 8, 4);
+    word (&g, " wt=", CONSOLE_RING + RING_WLOCK + 8, 4);
+    word (&g, " dis=", DIS_CONS, 4);
+    word (&g, " susp=", CONS_SUSP, 1);
+    /* state= carries the TS_* bits; TS_SO_OLOWAT (0x1) with cc= at the queue's 1024-byte capacity is
+     * the shape of a writer parked in ttysleep waiting for a wakeup that km.c never sends, and to= is
+     * that sleep's timo -- 0 forever. owner= is the thread that holds tty_lock, which is the answer to
+     * whether anyone is inside kmwrite at all. */
+    word (&g, "\ntty=", KM_TTY, 8);
+    word (&g, " state=", tp + TTY_STATE, 4);
+    word (&g, " cc=", tp + TTY_CC, 4);
+    word (&g, "\nlow=", tp + TTY_LOWAT, 4);
+    word (&g, " hi=", tp + TTY_HIWAT, 4);
+    word (&g, " to=", tp + TTY_TIMEOUT, 4);
+    word (&g, " owner=", tp + TTY_LOCKED_THREAD, 8);
+    if (tp != 0 && readable ((const char *)(tp + TTY_STATE), 0)) {
+      /* Ask the bit directly: decoding a hex t_state by hand off a photo is error-prone. */
+      text (&g, (*(volatile const u32 *)(tp + TTY_STATE) & TS_SO_OLOWAT) ? "\nOLOWAT yes" : "\nOLOWAT no");
+    }
+  }
   /* Resolved from this candidate's symbols by the patcher, never fixed addresses.
    * Values are sampled at panic time and need not form an atomic VM snapshot. */
   (void)MAX_MEM;

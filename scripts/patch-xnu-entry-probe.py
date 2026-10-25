@@ -898,6 +898,25 @@ def assemble_c(source, va, workdir, symbols):
         if not any(base <= sink and sink + 4 <= base + size for base, size, _, _ in SEGMENTS):
             raise SystemExit('Invalid _clover_emmc_panic_append')
         definitions.append(f'-DPANIC_SINK={sink:#x}UL')
+    # Round125 puts the console itself on the panic screen: the ring buffer's three counters, the flags
+    # that make console_write() drop bytes silently, and the one tty this board has. `console_ring` is
+    # file-static in osfmk/console/serial_console.c, but this kernel carries STABS, so llvm-nm still
+    # names it (verified: b ffffffff007b3bcf0 _console_ring). Its size is 0x48: buffer/len/used/
+    # nreserved/write_ptr/read_ptr, then flush_lock (lck_mtx_t) and write_lock (lck_ticket_t), and
+    # `console_suspended` sits at exactly +0x48, which is how the size was read off this image.
+    # Absent symbols leave the macro at its 0 default in the .c, so a kernel without a tty console
+    # renders exactly as before.
+    for macro, name, align, need in (('CONSOLE_RING', '_console_ring', 8, 0x48),
+                                     ('KM_TTY', '_km_tty', 8, 8),
+                                     ('DIS_CONS', '_disableConsoleOutput', 4, 4),
+                                     ('CONS_SUSP', '_console_suspended', 1, 1)):
+        address = symbols.get(name)
+        if address is None:
+            continue
+        if address % align or not any(base <= address and address + need <= base + size
+                                      for base, size, _, _ in SEGMENTS):
+            raise SystemExit(f'Invalid diagnostic symbol {name}')
+        definitions.append(f'-D{macro}={address:#x}UL')
     subprocess.run([clang, '--target=aarch64-none-elf', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
                     '-mgeneral-regs-only', '-fno-pic', '-mcmodel=tiny', '-Oz', f'-DVINFO={symbols["_vinfo"]:#x}UL',
                     *definitions, f'-I{font_dir}', '-c', source, '-o', obj], check=True)
