@@ -889,6 +889,15 @@ def assemble_c(source, va, workdir, symbols):
         if not any(base <= text and text + 256 <= base + size for base, size, _, _ in SEGMENTS):
             raise SystemExit('Invalid _boot_progress_panic_text')
         definitions.append(f'-DPANIC_TEXT={text:#x}UL')
+    # drivers/CloverSdhci exports the panic-time writer: the renderer hands it everything it drew
+    # and the driver appends that text to a logfs record, which the next boot reads back. Resolved
+    # like every other diagnostic address, never fixed. A kernel without the driver keeps the
+    # renderer's old behaviour (PANIC_SINK 0).
+    sink = symbols.get('_clover_emmc_panic_append')
+    if sink is not None:
+        if not any(base <= sink and sink + 4 <= base + size for base, size, _, _ in SEGMENTS):
+            raise SystemExit('Invalid _clover_emmc_panic_append')
+        definitions.append(f'-DPANIC_SINK={sink:#x}UL')
     subprocess.run([clang, '--target=aarch64-none-elf', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
                     '-mgeneral-regs-only', '-fno-pic', '-mcmodel=tiny', '-Oz', f'-DVINFO={symbols["_vinfo"]:#x}UL',
                     *definitions, f'-I{font_dir}', '-c', source, '-o', obj], check=True)

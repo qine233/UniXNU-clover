@@ -243,6 +243,14 @@ static uintptr_t gHost = 0;
 static OSSharedPtr<IOMemoryMap> gGccMap;
 static uintptr_t gGcc = 0;
 
+// The panic screen can hand this driver text this boot never assembled itself: after formatting
+// the panic message it calls clover_emmc_panic_append by address. That call is only safe while
+// the card is still selected and the host is exactly as the last logfs pass left it, so the
+// function refuses unless this boot has both matched the logfs extent and completed a logfs
+// read. A panic before that point writes nothing instead of driving an unselected card.
+static uint32_t gPanicLogFirst = 0;
+static volatile uint32_t gPanicLogReady = 0;
+
 static uintptr_t mapRange (OSSharedPtr<IOMemoryMap> &slot, uint64_t phys, uint64_t length)
 {
   IODeviceMemory *memory = IODeviceMemory::withRange (phys, length);
@@ -1646,6 +1654,18 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   bool logHeaderOk19 = false, logTextOk19 = false;
   bool logHeaderReadOk19 = false, logTextReadOk19 = false;
 
+  // Mode 20 reads the newest record and writes nothing itself: the scan keeps the last slot whose
+  // header carries the magic, then the text block is read and its byte sum recomputed. `kind` is
+  // the writer's mode field (19 = report, 20 = panic-screen text), so a record that this boot did
+  // not assemble is still identifiable. The two previews (start and end of the stored text) are
+  // what separates a panic-screen log from a report: the latter carries readings the report does
+  // not, and the panic path's own "@CloverSdhci.cpp:line" suffix.
+  uint32_t logNewest20 = 0, logNewestFound20 = 0, logNewestLba20 = 0;
+  uint32_t logNewestLen20 = 0, logNewestKind20 = 0, logNewestSum20 = 0, logNewestCalc20 = 0;
+  uint32_t logFindWords20 = 0, logFindStatus20 = 0;
+  uint32_t logNewestWords20 = 0, logNewestStatus20 = 0;
+  bool logFindOk20 = true, logNewestTextOk20 = false, logNewestCheck20 = false;
+
   bool cmd2Ok = false;
   if (probeMode == 0) {
     if (ready) {
@@ -2933,7 +2953,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             }
           }
 
-          if (probeMode >= 18) {
+          if (probeMode == 18 || probeMode == 19) {
             // Read the record a previous boot left behind. Nothing here writes, so a clean `c=1`
             // is evidence that logfs kept the text across the reboot, not that this run rebuilt
             // it. The header's length is clamped before use; a stale or foreign block shows up as
@@ -2986,7 +3006,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             }
           }
 
-          if (probeMode >= 19) {
+          if (probeMode == 19) {
             // Append rather than overwrite. Slot k is two blocks at logfs start + 2k, and the
             // first header that does not carry this driver's magic is free. The loop is bounded
             // at kLogSlots: a full window is printed as `ap f=`, never wrapped onto slot 0, so a
@@ -3106,6 +3126,88 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                     emitByte (c == '\n' ? '|' : (c >= 0x20 && c < 0x7f) ? static_cast<char> (c) : '.');
                   }
                 }
+              }
+            }
+          }
+
+          if (probeMode == 20) {
+            // The newest record, whichever boot wrote it. Reading it is also the arming step for
+            // this boot's panic hook: by the time the panic comes, the card is selected and the
+            // logfs coordinates are known, so the hook can append without repeating any of this
+            // chain. `m=` says which writer left the record (19 report, 20 panic text).
+            if (entryFound14 == 0) {
+              emitText ("\nrd i=0");
+            } else if (!(entryFirst14 == 12320768u && entryLast14 == 12337151u)) {
+              emitText ("\nrd g=1");
+            } else {
+              logFindOk20 = true;
+              for (logNewest20 = 0; logNewest20 < kLogSlots; logNewest20++) {
+                logFindOk20 = readPioBlock (entryFirst14 + 2 * logNewest20, gReadBlock,
+                                            logFindWords20, logFindStatus20);
+                if (!logFindOk20 ||
+                    (gReadBlock[0] != kLogMagic0 || gReadBlock[1] != kLogMagic1)) {
+                  break;
+                }
+                logNewestFound20 = logNewest20 + 1;
+                logNewestLba20 = entryFirst14 + 2 * logNewest20;
+                logNewestLen20 = gReadBlock[3];
+                logNewestKind20 = gReadBlock[5];
+                logNewestSum20 = gReadBlock[4];
+              }
+              if (!logFindOk20) {
+                emitText ("\nrd r=");
+                emitDec (logNewest20);
+                emitText (" st=");
+                emitHex (logFindStatus20, 8);
+              } else if (logNewestFound20 == 0) {
+                emitText ("\nrd e=0 ss=");
+                emitDec (logNewest20);
+              } else {
+                if (logNewestLen20 <= 512) {
+                  logNewestTextOk20 = readPioBlock (logNewestLba20 + 1, gReadBlock,
+                                                    logNewestWords20, logNewestStatus20);
+                }
+                const uint8_t *stored = reinterpret_cast<const uint8_t *> (gReadBlock);
+                if (logNewestTextOk20) {
+                  for (uint32_t i = 0; i < logNewestLen20; i++) {
+                    logNewestCalc20 += stored[i];
+                  }
+                  logNewestCheck20 = logNewestCalc20 == logNewestSum20;
+                }
+                emitText ("\nrd s=");
+                emitDec (logNewestFound20 - 1);
+                emitText (" n=");
+                emitDec (logNewestLen20);
+                emitText (" m=");
+                emitDec (logNewestKind20);
+                emitText (" s=");
+                emitHex (logNewestSum20, 8);
+                emitText (" c=");
+                emitDec (logNewestCheck20 ? 1 : 0);
+                emitText (" ss=");
+                emitDec (logNewest20);
+                if (!logNewestTextOk20) {
+                  emitText (" ts=");
+                  emitHex (logNewestStatus20, 8);
+                }
+                if (logNewestTextOk20) {
+                  emitText ("\nrt ");
+                  for (uint32_t i = 0; i < logNewestLen20 && i < 32; i++) {
+                    uint8_t c = stored[i];
+                    emitByte (c == '\n' ? '|' : (c >= 0x20 && c < 0x7f) ? static_cast<char> (c) : '.');
+                  }
+                  emitText ("\nre ");
+                  uint32_t from = logNewestLen20 > 32 ? logNewestLen20 - 32 : 0;
+                  for (uint32_t i = from; i < logNewestLen20; i++) {
+                    uint8_t c = stored[i];
+                    emitByte (c == '\n' ? '|' : (c >= 0x20 && c < 0x7f) ? static_cast<char> (c) : '.');
+                  }
+                }
+                // Only a boot that found and read a record arms the panic hook. Its first job is
+                // to append the text the panic screen formats, which is where a crash log first
+                // stops being the driver's own report.
+                gPanicLogFirst = entryFirst14;
+                gPanicLogReady = 1;
               }
             }
           }
@@ -3376,6 +3478,91 @@ static void reidentify (void)
   clover_emmc_stage = 6;
 }
 
+// Append text that this boot did not assemble -- the panic screen formats the panic message and
+// its readings into a stack buffer and calls this by address (patch-xnu-entry-probe.py resolves
+// the symbol and passes it as PANIC_SINK). No bring-up, no allocation, no locks: the card is
+// still selected and the host is exactly as the last logfs pass left it, so the same paced PIO
+// path is reused. A panic that fires before this boot reached logfs finds the ready flag clear
+// and gets a status instead of a reset. There is deliberately no read-back here: the next boot's
+// mode 20 is the reader, and a failure now must not hang the only screen this board has.
+//
+// Body is capped at 480 bytes so prefix + body + newline fits one block. Returns 100 + slot after
+// both blocks were written, or 1..5 naming the stage that refused.
+extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int length)
+{
+  if (!gPanicLogReady || !gHost || !gPanicLogFirst || !text) {
+    return 1;
+  }
+  uint32_t slot = 0, words = 0, status = 0;
+  bool ok = true;
+  for (slot = 0; slot < kLogSlots; slot++) {
+    ok = readPioBlock (gPanicLogFirst + 2 * slot, gReadBlock, words, status);
+    if (!ok || (gReadBlock[0] != kLogMagic0 || gReadBlock[1] != kLogMagic1)) {
+      break;
+    }
+  }
+  if (!ok) {
+    return 2;
+  }
+  if (slot >= kLogSlots) {
+    return 3;
+  }
+  if (length > 480) {
+    length = 480;
+  }
+  const uint32_t body = length;
+  const uint32_t total = kLogPrefixLength + body + 1;
+  uint32_t sum = 0;
+  for (uint32_t i = 0; i < kLogPrefixLength; i++) {
+    sum += static_cast<uint8_t> (kLogPrefix[i]);
+  }
+  for (uint32_t i = 0; i < body; i++) {
+    sum += static_cast<uint8_t> (text[i]);
+  }
+  sum += static_cast<uint8_t> ('\n');
+
+  const uint32_t lba = gPanicLogFirst + 2 * slot;
+  for (uint32_t i = 0; i < kBlockWords; i++) {
+    gWriteBlock[i] = 0;
+  }
+  gWriteBlock[0] = kLogMagic0;
+  gWriteBlock[1] = kLogMagic1;
+  gWriteBlock[2] = lba;
+  gWriteBlock[3] = total;
+  gWriteBlock[4] = sum;
+  gWriteBlock[5] = 20;   // written by the panic screen, not by a report pass
+  gWriteBlock[6] = body;
+  gWriteBlock[7] = slot;
+
+  uint32_t rsp = 0, rstatus = 0, polls = 0;
+  bool headerOk = writePioBlock (lba, gWriteBlock, words, status);
+  waitCardReady (rsp, rstatus, polls);
+  if (!headerOk) {
+    return 4;
+  }
+
+  uint8_t *block = reinterpret_cast<uint8_t *> (gWriteBlock);
+  for (uint32_t i = 0; i < 512; i++) {
+    block[i] = 0;
+  }
+  for (uint32_t i = 0; i < kLogPrefixLength; i++) {
+    block[i] = static_cast<uint8_t> (kLogPrefix[i]);
+  }
+  for (uint32_t i = 0; i < body; i++) {
+    uint8_t c = static_cast<uint8_t> (text[i]);
+    block[kLogPrefixLength + i] =
+        (c == '\n') ? static_cast<uint8_t> ('\n')
+                    : (c >= 0x20 && c < 0x7f) ? c : static_cast<uint8_t> ('.');
+  }
+  block[kLogPrefixLength + body] = '\n';
+  bool textOk = writePioBlock (lba + 1, gWriteBlock, words, status);
+  waitCardReady (rsp, rstatus, polls);
+  if (!textOk) {
+    return 5;
+  }
+  return 100 + slot;
+}
+
 extern "C" void clover_emmc_run (void)
 {
   unsigned mode = 0;
@@ -3387,7 +3574,8 @@ extern "C" void clover_emmc_run (void)
   // the storage instrument it was asked for.
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
       mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12 && mode != 13 &&
-      mode != 14 && mode != 15 && mode != 16 && mode != 17 && mode != 18 && mode != 19) {
+      mode != 14 && mode != 15 && mode != 16 && mode != 17 && mode != 18 && mode != 19 &&
+      mode != 20) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -3408,7 +3596,7 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp (mode == 5, (mode >= 7 && mode <= 19) ? mode : 0);
+    coldBringUp (mode == 5, (mode >= 7 && mode <= 20) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.

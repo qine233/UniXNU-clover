@@ -86,6 +86,11 @@ if component in ('NativeVirtioBlock', 'NativeRamBlock', 'NativeUfs'):
 if component == 'NativeUfs':
     command += ['-I', str(ROOT / 'kits/VerifiedRoot/include'), '-I', str(ROOT / 'drivers/NativeVirtioBlock'),
                 '-DNATIVE_VERIFIED_BLOCK=1', '-DNATIVE_VERIFIED_BLOCK_MULTI_POLICY=1', '-mgeneral-regs-only']
+if component == 'CloverSdhci':
+    # The panic-screen hook in this driver runs after the kernel has already stopped, so it must
+    # not touch FP/SIMD: a vectorized checksum loop would clobber (or trap on) state this path
+    # cannot save. The driver has no floating point; keep every compiled loop scalar.
+    command += ['-mgeneral-regs-only']
 if component=='NativeOfflineGPU':
     command += ['-I',str(ROOT/'drivers/NativeVirtioConsole')]
 if component in ('NativeLegacyDisplay','NativeHidInput'):

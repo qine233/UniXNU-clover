@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: append this boot's record beside the last one"
+title = "clover emmc: let the panic screen write its own log record"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1243,7 +1243,23 @@ kernel_args = [
   # h=1 t=1 hc=128 tc=343" plus "bta unixnu clover emmc log|..." is the positive: slot 0 was
   # recognised as occupied, so this boot appended to slot 1 and read it back. "ap f=16" means the
   # window is full and nothing was written; "ap r=<slot> st=..." names a header read that failed.
-  "clover-emmc=19",
+  # Round105's photograph: "ap s=1 ss=2 a=12320770 n=439 h=1 t=1 hc=128 tc=439" beside the
+  # unchanged "bk ... n=343 s=000059b2 c=1". The scan found slot 1, both blocks read back byte for
+  # byte, and 439 is the 343-byte report plus the 44-byte bk line and the 52-byte bt line that mode
+  # 19 also prints. Appending is closed.
+  # Mode 20 turns the record into something the driver did not write itself. It reads the newest
+  # occupied slot and writes nothing: "rd s=2 n=504 m=20 s=<sum> c=1 ss=3" plus two previews
+  # ("rt" the first 32 bytes, "re" the last 32) is the positive. The record it reads second is the
+  # one the panic screen appended on the previous boot through clover_emmc_panic_append: kind 20,
+  # and its body is the first 480 characters the screen drew -- the panic message (including the
+  # macro's "@CloverSdhci.cpp:line" suffix) followed by as many of the pages/ticks/pmgr and caller
+  # readings as fit; the record is prefix 23 + body 480 + newline, so n=504, and the tail that 480
+  # cuts off is not stored. "elog=102" on the panic screen means slot 2 was written there;
+  # "elog=1" means the hook declined because this boot never reached logfs; 2..5 name a failed
+  # scan or write. The first mode-20 boot therefore reads slot 1 (round105's report, m=19) and
+  # appends a panic record to slot 2; a second boot with the same payload reads slot 2 and
+  # appends to slot 3.
+  "clover-emmc=20",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

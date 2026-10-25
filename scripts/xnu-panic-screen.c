@@ -49,14 +49,24 @@ extern const u64 gFont[];
 struct ctx {
   u8  *base;
   u32 rb, w, h, x, y;
-  u8  *log;   /* kernel buffer that also receives the formatted message (PANIC_TEXT), 0 = none */
+  u8  *log;   /* buffer that also receives the formatted screen text, 0 = none */
   u32 logn;
+  u32 logcap;
 };
 
 #ifndef PANIC_TEXT
 #define PANIC_TEXT 0UL
 #endif
 #define PANIC_TEXT_BYTES 256
+
+/* The board may give the panic screen a place to put text that outlives the panic. On clover this
+ * is drivers/CloverSdhci's clover_emmc_panic_append, resolved by the patcher: the screen hands it
+ * everything it drew, the driver appends it to logfs as a record, and the next boot reads it back.
+ * 0 means this build has no sink and the screen behaves exactly as before. */
+#ifndef PANIC_SINK
+#define PANIC_SINK 0UL
+#endif
+#define PANIC_LOG_BYTES 480
 
 __attribute__((noreturn)) static void park (void)
 {
@@ -135,8 +145,10 @@ static void put (struct ctx *g, u8 c)
   const u32 cell = 6 * SCALE, line = 14 * SCALE;
   u32 row, col, dy, dx;
 
-  if (g->log && g->logn < PANIC_TEXT_BYTES - 1 && c >= 9 && c <= 126) {
-    g->log[g->logn++] = (c < 32) ? ' ' : c;
+  if (g->log && g->logn < g->logcap && c >= 9 && c <= 126) {
+    /* Newlines are kept: this copy becomes a text file on the card. Other control bytes have no
+     * meaning to a reader of that file and are stored as one space. */
+    g->log[g->logn++] = (c == '\n') ? '\n' : (c >= 32) ? c : ' ';
     g->log[g->logn] = 0;
   }
 
@@ -321,6 +333,7 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
 {
   volatile struct vc_info *v = (volatile struct vc_info *)VINFO;
   struct ctx g;
+  u8 logbuf[PANIC_LOG_BYTES + 1];
   u32 row, col;
 
   __asm__ volatile ("msr daifset, #15");
@@ -343,7 +356,8 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   }
   g.x = 0;
   g.y = g.h / 8;
-  g.log = 0;
+  g.log = logbuf;
+  g.logcap = PANIC_LOG_BYTES;
   g.logn = 0;
   /* Clear the middle of the screen only: the entry probe's trace bands live in
    * the lower half and must survive the panic for a photograph. */
@@ -357,9 +371,9 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
    * boot_progress_panic_text). The first panic's text is kept: a buffer that already holds one is left alone. */
   if (PANIC_TEXT && *(volatile u8 *)PANIC_TEXT == 0) {
     g.log = (u8 *)PANIC_TEXT;
+    g.logcap = PANIC_TEXT_BYTES - 1;
   }
   format (&g, fmt, args);
-  g.log = 0;
   __asm__ volatile ("dsb sy");
   /* Resolved from this candidate's symbols by the patcher, never fixed addresses.
    * Values are sampled at panic time and need not form an atomic VM snapshot. */
@@ -427,6 +441,20 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
     __asm__ volatile ("mrs %0, sctlr_el1" : "=r" (sctlr));
     hex (&g, "\nTCR=", tcr);
     hex (&g, "\nSCTLR=", sctlr);
+  }
+  /* Everything above was also copied into logbuf. Hand that copy to the board's sink -- the eMMC
+   * driver appends it to a logfs record -- and draw its verdict. 0 means this build has no sink;
+   * 1 means the sink declined (the card was never selected); 100 + slot means both blocks of that
+   * slot were written; 2..5 name a scan or write that failed. The line itself is drawn after the
+   * copy is detached, so the log does not contain its own outcome. */
+  if (PANIC_SINK) {
+    u8 *capture = g.log;
+    u32 captured = g.logn;
+    u32 written;
+    g.log = 0;
+    written = ((u32 (*) (const char *, u32)) PANIC_SINK) ((const char *)capture, captured);
+    text (&g, "\nelog=");
+    number (&g, written, 10, 0, 0);
   }
   /* The raw argument slots are not dumped: the formatted message above already carries them (room for the PANIC_TEXT copy). */
   mark[0] = 0xC0FFEE11u;

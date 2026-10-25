@@ -5120,6 +5120,150 @@ bta unixnu clover emmc log|g cfg=00002017 m=
 结论：自描述记录能连续占两格而不互相覆盖，选址来自盘上内容而不是内存里的假设。
 下一步该让记录里装的不再只是驱动的自述，而是**别处产生的文本**——panic 屏幕那份。
 
+## v0.2.78（round106）：panic 屏把画出的文本交给驱动，写进下一格
+
+这一轮换掉记录的**作者**。之前每一条记录都是驱动在正常启动里自己拼的报告；现在
+panic 屏把它已经画在 framebuffer 上的文本（panic 消息 + 屏幕自己的读数）整段交给
+驱动，由驱动追加成一条 kind 20 的记录。下一次启动用 mode 20 把最新一条读回来。
+
+链路分四段：
+
+1. `scripts/xnu-panic-screen.c` 新增一个 480 字节的栈上捕获缓冲。`put()` 在画字时
+   顺手把字符复制进去（换行保留，其它不可打印字节变空格），所以捕获的就是屏幕
+   实际会显示的内容，而不是另拼一份。
+2. 所有文字和诊断画完之后、写「第一次 panic」标记之前，屏调用
+   `PANIC_SINK(capture, captured)`。`PANIC_SINK` 由
+   `scripts/patch-xnu-entry-probe.py` 从卷内内核的符号表里解析
+   `_clover_emmc_panic_append` 得到，和其它诊断地址一样是**符号**，不是固定地址。
+   没有这个符号的内核保持旧行为（`PANIC_SINK=0`）。
+3. 驱动导出 `extern "C" unsigned int clover_emmc_panic_append(const char*, unsigned)`。
+   它不复用任何启动链：只检查 `gPanicLogReady`（本启动确实读完过一条 logfs 记录）、
+   `gHost`、`gPanicLogFirst` 和文本指针，然后从格 0 开始读头块，找到第一个没有
+   magic 的格，按 mode 17 的布局写头块与文本块。正文截到 480 字节，前缀 23 + 正文
+   480 + 换行正好 504，仍是一块。做完两块都等 `READY_FOR_DATA`，**不做读回**——
+   panic 路径上再读一次只会多一个可能挂住的点；读者是下一次启动。
+4. mode 20 在正常启动里扫描 16 格，记住**最后一个** magic 合法的格，读它的文本块、
+   按头块长度重算字节和，打印 `rd s= n= m= s= c= ss=` 和两段 32 字节预览
+   （`rt` 开头、`re` 结尾）。只有成功读完一条记录才把 `gPanicLogFirst` 设成 logfs
+   首 LBA 并置 `gPanicLogReady=1`，panic 钩子从此可以用。
+
+panic 钩子和它调用的 PIO 辅助函数都按 `-mgeneral-regs-only` 编译：panic 时内核
+不能保存 FP/SIMD 状态。整份 `CloverSdhci` 因此都不再使用 SIMD，这也让两个 12 字节
+的 `CMD13 rca=1`/`CMD13 sweep` 字面量被 clang 折成立即数、不再出现在 `__cstring`，
+所以 `scripts/verify-clover-payload.py` 的「成员在镜像里」检查改成这两个字符串之外
+的四个字符串加上 `_clover_emmc_run` / `_clover_emmc_panic_append` 两个导出符号
+（六项，含义不变）。
+
+第一次刷同一颗 payload（本启动读到的是 round105 留在格 1 的记录，kind 19）：
+
+```text
+rd s=1 n=439 m=19 s=000059b2 c=1 ss=2
+rt unixnu clover emmc log|g cfg=00
+re ...（round105 报告最后 32 字节，末尾是 bta 预览行的尾部）
+...
+elog=102
+```
+
+`elog=` 是 panic 屏画在最后的判定：`102` = 100 + 格号 2，头块和文本块都写成功。
+`s=1`、`m=19`、`n=439`、`s=000059b2` 与 round105 的照片逐项相同，说明 mode 20
+读的确实是上一轮那条；`c=1` 是这次启动从卡上重算的和。随后 panic（`@CloverSdhci.cpp:3606`）
+把屏上文本写进格 2。
+
+再刷同一颗 payload（不换镜像，只重启）应读到刚写的那条：
+
+```text
+rd s=2 n=504 m=20 s=<新和> c=1 ss=3
+rt unixnu clover emmc log|CloverSdh
+re ...（捕获文本的第 457..480 字符，落在诊断区）
+...
+elog=103
+```
+
+`m=20` 证明这条不是报告链写的；`n=504` 证明正文被 480 字节截断；`rt` 的
+`CloverSdh` 是 panic 消息 `CloverSdhci:\n...` 的开头，报告链永远不会有这个开头；
+`elog=103` 说明这次又把新的 panic 文本写进了格 3。**两条记录都在盘上，格 0、1
+没被覆盖。**
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| 第一刷 `rd s=1 n=439 m=19 s=000059b2 c=1 ss=2` + `elog=102` | mode 20 读到 round105 的记录并武装；panic 屏把文本写进格 2 | 再刷同一颗 payload，应出现 `m=20 n=504` 和 `elog=103` |
+| 第二刷 `rd s=2 n=504 m=20 c=1 ss=3` + `elog=103` | 记录的作者已经换成 panic 屏；捕获、追加、重算和跨启动读回全闭合 | 可以开始把 `IOBlockStorageDevice` 接到这条已经会写日志的路径上 |
+| 有 `rd …` 但 `elog=1` | 钩子拒绝：未武装、主机空、首 LBA 为 0 或文本指针空 | 先看 `rd` 是否成功；`rd` 成功而 `elog=1` 说明卷内屏没有拿到/没有调用 sink |
+| 屏上只有 `elog=` 没有 `rd` | 记录写成功，但 mode 20 在这之前就没读到记录 | 看 `rd e=0`/`rd i=0`/`rd g=1`，回 mode 19 先写一条 |
+| `elog=2` | 扫描头块读失败 | 对照 mode 19 的 `ap r=<k> st=…` |
+| `elog=3` | 16 格全满，什么都没写 | 用 Linux 侧清 logfs 前 64 KB |
+| `elog=4` / `elog=5` | 头块 / 文本块写失败 | 看 PIO 路径；panic 时已禁用中断，只能靠状态字 |
+| 第二个 32 字节预览里没有 `CloverSdh` 之类的 panic 文本 | 写的不是 panic 屏捕获的缓冲 | 查 `PANIC_SINK` 是否解析到 `_clover_emmc_panic_append` |
+| `rd … c=0` | 读回文本与头块 `s` 不符 | 写入未完成或长度错；先看 `elog` 是否 102/103 |
+
+产物（内核变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round106-payload.img` | 58720256 B | `fc0b2ba082a1425860e62f39cff91e0661303f95ca9953ef1f87eb14514f1d42` |
+| `round106-kernel.macho`（构建产物） | 51965952 B | `43d94be24f67d2381a5ae7c18f9bcb4685cdc8eba473e8d71f14ec7266951a58` |
+| `round106-in-volume-kernel.macho`（卷内副本） | 51965952 B | `6b2a0d4dbe5c7876c71f4d15698515ee2fea314320812c6aaa8d32b53dfc62b2` |
+| `round106-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round106-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round106-kernel.macho.adt` | 13476 B | `babba3e5b1395b1727429be5ed54d73f2337dac12da8810992e79ffadc9482fe` |
+| `round106-unixnu.toml` | 573 B | `c1f071d6652ab5c6c04fca009bff8473de08b51189312de2ba55c3c7337720a6` |
+
+校验器：探针 35 处 6039 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六项全在
+（`clover-emmc`、`look-only dump of c0c4000`、`no pwr`、`CloverSdhci: failed at stage`、
+`_clover_emmc_run`、`_clover_emmc_panic_append`）。卷内内核与本地按同样参数重打的
+内核逐字节相同（`6b2a0d4d…`），所以下面这个 sink 调用确实在要刷的镜像里。
+
+反汇编自查：
+
+- 驱动对象 `CloverSdhci.o` 里 `_clover_emmc_panic_append` 是 `__text` 的第一个符号。
+  槽上限 `cmp w22,#0x10` 在 `0xbc`；扫描读 `bl readPioBlock` 在 `0x9c`；
+  magic 常量在 `0x64`–`0x70`；正文上限 `cmp w19,#0x1e0` 在 `0x10c`；
+  `mov w8,#0x14` 在 `0x1dc`（头块 `[5]=20`）；头块写 `bl writePioBlock` 在 `0x1f0`；
+  文本块写在 `0x3f0`；返回值 `add w8,w22,#0x64` 在 `0x4c4`。整份对象没有
+  `movi.16b`/`ushll`/`addv`/`fmov`/`ldp q` 之类的 SIMD 指令。
+- mode 20 的武装点在对象 `0x1e7a0`/`0x1e7ac`：因为 gate 已经把唯一可能的非零
+  `entryFirst14` 钉成 `12320768`，clang 把 `gPanicLogFirst` 写成字节 `1` 当哨兵，
+  并把真正的 LBA 折成常量。panic 钩子里 `mov w26,#0xbc0000` 在链接后
+  `0xfffffff007971934`，`csel` 在 `0xfffffff007971948`，与哨兵检查配套；
+  这不是丢高位，是编译器的全程序推断。
+- panic 屏从 `0xfffffff007a32610` 起 `0xe7a` 字节。sink 调用在屏内偏移 `0x9f4`：
+  `movn x8,#0xE73F; movk x8,#0x797,lsl#16; movk x8,#0xfff0,lsl#32`（对象里写成
+  `mov x8,#-59200; movk x8,#1943,lsl#16; movk x8,#65520,lsl#32`）把 `x8` 装成
+  `0xfffffff0079718c0`，紧接 `blr x8` 在偏移 `0xa00`；之后才画 `elog=`。
+  捕获缓冲 480 字节，`logcap` 在 `put()` 里限住。
+- 内核符号：`_clover_emmc_panic_append` `0xfffffff0079718c0`、
+  `_clover_emmc_run` `0xfffffff00797232c`、`coldBringUp` `0xfffffff00797c4f8`、
+  `readPioBlock` `0xfffffff007971d98`、`writePioBlock` `0xfffffff007971fe4`、
+  `waitCardReady` `0xfffffff007972230`。编译进驱动对象的 panic 行号是 3606
+  （`mov w8,#0xe16` 在对象 `0x200dc`），与屏上的 `@CloverSdhci.cpp:3606` 对应。
+  门是 `mode != 20`，分发器 `mode >= 7 && mode <= 20`。卷内 boot-args 末尾是
+  `… clover-pmgr=2 clover-emmc=20 armcpu-clock-panic=60000`。
+- boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round106-payload.img
+fastboot reboot
+```
+
+**拍一张就够，但这一轮值得拍两张。** 第一张是 round106 的进入状态：读到
+round105 的 `m=19` 记录、`elog=102`。如果只拍这一张，只能证明屏写了；再刷一次
+同一颗 payload、冷启动，第二张出现 `m=20 n=504` 和 `elog=103`，才证明它写下的
+文本能被下一次启动读回。两次之间不要换镜像、不要动 logfs。
+
+Linux 侧取三格（设备已 root；格 k 的文本在块 `2k+1`）：
+
+```sh
+adb shell su -c 'dd if=/dev/block/by-name/logfs bs=512 count=8' > logfs.bin
+# 格 1：round105 的报告（kind 19）
+dd if=logfs.bin bs=512 skip=3 count=1 2>/dev/null | tr -d '\0'
+# 格 2：panic 屏第一次写的文本（kind 20）
+dd if=logfs.bin bs=512 skip=5 count=1 2>/dev/null | tr -d '\0'
+# 格 3：第二次启动再写的那条（kind 20）
+dd if=logfs.bin bs=512 skip=7 count=1 2>/dev/null | tr -d '\0'
+```
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -5153,7 +5297,9 @@ bta unixnu clover emmc log|g cfg=00002017 m=
   校验 magic/长度/字节和并打出前 48 字节（round104 读回 `c=1`，`bt` 正是上一轮
   报告的第一行），用来证明它跨启动存活，`v0.2.77` 起把 logfs 开头当成 16 个固定
   两块格，扫描到第一格没有 magic 就写那一格（头块多一个格号字），不再覆盖格 0，
-  读完逐字/逐字节比对新记录，仍然不发布
+  读完逐字/逐字节比对新记录，`v0.2.78` 起 panic 屏把自己画出的前 480 字节
+  交给驱动导出的 `clover_emmc_panic_append`，追加成下一格 kind 20 记录，下一次
+  启动由 mode 20 读回最新一格、校验并武装供再下一次追加使用，仍然不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令、数据阶段能不能自己走完」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，
