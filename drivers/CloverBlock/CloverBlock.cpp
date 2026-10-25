@@ -10,6 +10,13 @@
 // a success line means setconf()/vfs_mountroot() could name this partition as the root device.
 // The boot itself still runs from the RAMDisk (rd=md0); this round only proves the device side.
 //
+// Round 113 ran all of that from sheng_pmgr_run() and stopped at bsd-props. That hook is in
+// bsd_init() before vfsinit(), so devfs is not initialized yet, devfs_make_node() returns NULL,
+// and IOMediaBSDClient::start() still reports success because it ignores createNodes(). The run is
+// now started by the publication of IOKit's "IOBSD" resource, which IOKitBSDInit() performs at the
+// end of bsd_autoconf(), after vfsinit(); clover_block_request() at the bottom explains why that
+// is the only post-vfsinit hook this repository owns.
+//
 // The class has to be hand-written. IOStorageFamily is loaded at runtime from the boot kext
 // collection (kernel.macho exports no IOBlockStorageDevice, IOMedia or IOBlockStorageDriver
 // symbol), so the standard OSDefineMetaClass* macros cannot be used: they would take the
@@ -26,7 +33,7 @@
 // an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
 // attached for start (startCandidate() attaches again after the matching loop's detach).
 //
-// A failure panics with one short CloverBlock r113 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r114 line naming the step; success prints one line
 // and lets the boot continue, because there is nothing left to photograph.
 #define IOKIT_ENABLE_SHARED_PTR 1
 #include <IOKit/IOLib.h>
@@ -418,7 +425,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r113: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r114: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 struct MediaOp {
@@ -640,8 +647,46 @@ extern "C" void clover_block_run(void)
     fail("map", 0);
   }
 
-  IOLog("CloverBlock r113: p=%u %s %u:%u bd=1 map=1\n", partitions,
+  IOLog("CloverBlock r114: post-vfsinit p=%u %s %u:%u bd=1 map=1\n", partitions,
         bsdName->getCStringNoCopy(), bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue());
+}
+
+// ---------------------------------------------------------------- the post-vfsinit hand-off
+
+// Where this runs matters more than what it does. sheng_pmgr_run() is called by bsd_init() before
+// vfsinit(), and vfsinit() is what calls devfs_init() -> devfs_sinit(), the only place that sets
+// devfs_ready. Before that, devfs_make_node() refuses with a NULL node, MinorTable::insert() fails,
+// and IOMediaBSDClient::start() returns true anyway -- round113's bsd-props with no properties
+// behind it. bdevvp() has the same prerequisite: it needs the vnode tables vntblinit()/nchinit()
+// build inside vfsinit().
+//
+// IOKitBSDInit() publishes the "IOBSD" resource from the end of bsd_autoconf(), which is the first
+// point in the boot past vfsinit() and still before setconf()/vfs_mountroot(). A publish
+// notification for that resource is therefore a post-vfsinit hook that this repository owns: a
+// device patches/xnu would shadow the base repository's whole patch set (CloverSdhci.cpp explains
+// that wall at length), and bsd_init.c itself is out of reach.
+//
+// The handler runs on IOKit's config thread, the same kind of thread probeCandidates() uses for a
+// normal personality match, so the work is no longer on the boot thread. The boot does not wait for
+// it: rd= is still md0 and this round only asks whether the device side completes. When a later
+// round points rd= at disk0s39, setconf()'s IOFindBSDRoot() supplies the wait.
+static bool cloverBlockIOBSD(void *, void *, IOService *, IONotifier *)
+{
+  clover_block_run();
+  return false;   // one shot: the resource is published once per boot
+}
+
+extern "C" void clover_block_request(void)
+{
+  OSSharedPtr<OSDictionary> matching = IOService::resourceMatching("IOBSD");
+  if (!matching) {
+    fail("notify", 0);
+  }
+  IONotifier *notifier = IOService::addMatchingNotification(
+      gIOPublishNotification, matching.get(), &cloverBlockIOBSD, nullptr, nullptr, 0);
+  if (!notifier) {
+    fail("notify", 1);
+  }
 }
 

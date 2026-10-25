@@ -6034,6 +6034,125 @@ fastboot reboot
 **一次刷机只回答一个问题：补上 attach 之后，`IOGUIDPartitionScheme::scan()` 能不能看到整盘。**
 看到成功行，根设备这条链就由 XNU 自己闭合了；下一轮才把 `rd=` 从 `md0` 换成这个 BSD 名。
 
+## v0.2.86（round114）：把块栈挪到 vfsinit 之后
+
+round113 的照片已经越过了 `Kernel data abort`，停在 `CloverBlock r113: bsd-props 0`：GPT 认出来了、
+分区发布了、整盘和目标分区上的 `IOMediaBSDClient` 都 `start()` 成功了，但目标分区上读不到
+`BSD Name` / `BSD Major` / `BSD Minor`。
+
+原因不在块栈，而在它跑得太早。`bsd_init()` 里 `sheng_pmgr_run()` 在 `vfsinit()` 之前（本树
+`bsd_init.c:779` 对 `:791`），而 `vfsinit()` 里的 `devfs_init()` → `devfs_sinit()` 是唯一把
+`devfs_ready` 置 1 的地方（`devfs_tree.c:163`、`:218`）。在那之前：
+
+- `devfs_make_node()` 打一行 `devfs_make_node: not ready for devices!` 就返回 NULL
+  （`devfs_tree.c:1622`）。
+- `MinorTable::insert()` 拿到空的 bdev/cdev 节点就返回 `kInvalidMinorID`
+  （`IOMediaBSDClient.cpp:3581-3605`），`createNodes()` 跳到 `createNodesErr`，那四行
+  `media->setProperty("BSD Name" / "BSD Unit" / "BSD Major" / "BSD Minor")`（`:595-598`）
+  根本没执行。
+- 但 `IOMediaBSDClient::start()` 不看 `createNodes()` 的返回值（`:351`），照样
+  `registerService()` 并 `return true`（`:362-364`）。所以 `bsd-whole` / `bsd-root` 都过了，
+  直到自己读属性才暴露。
+
+`bdevvp()` 也有同一前提：它要的是 `vfsinit()` 里 `vntblinit()` / `nchinit()` 建好的 vnode 表。
+所以整个块栈必须整体后移，而不是只补某一步。
+
+round114 只换触发点：
+
+1. `clover-emmc=21` 仍由 `sheng_pmgr_run()` 走到 CloverBlock，但只调
+   `clover_block_request()`：用 `IOService::resourceMatching("IOBSD")` 注册一个一次性的
+   `gIOPublishNotification`。
+2. `IOKitBSDInit()` 在 `bsd_autoconf()` 末尾发布 `IOBSD` 资源（`IOKitBSDInit.cpp:110`），此时
+   `vfsinit()` 已完成、`setconf()` / `vfs_mountroot()` 还没开始。发布走
+   `gIOResources->registerService()` → `startMatching(0)`，匹配通知在 IOKit 配置线程上派发。
+3. 处理器只做一件事：调一次 `clover_block_run()`，然后返回 false 把自己摘掉。round113 的整条
+   链路（attach → probe → start → 子节点 → 两个 BSD 客户端 → 属性 → `IOBSDNameMatching` +
+   `waitForService` → `bdevvp` → `base` 比较）一行没改。
+
+为什么用通知而不是自己起线程或延时：`bsd_autoconf()` 之后没有别的设备侧插入点——device
+`patches/xnu` 会遮住基础仓库的整批补丁，`bsd_init.c` 本身也动不了；而资源发布点由
+`IOKitBSDInit()` 保证在 `vfsinit()` 之后。自己 `kernel_thread_start` 加延时是竞态，不能当作
+「已经初始化」的证据。
+
+boot 仍是 `rd=md0`，不写任何分区。成功时是一行，后面照旧继续引导：
+
+```text
+CloverPMGR r114: args [-v serial=3 debug=0x14e kt_fixed_zones=120 boot-progress=2
+ rd=md0 allow_legacy_mach_msg=1 armcpu-timer-intid=19 clover-pmgr=2 clover-emmc=21
+ armcpu-clock-panic=60000]
+...
+CloverBlock r114: post-vfsinit p=<n> disk0s39 <maj>:<min> bd=1 map=1
+...
+initproc failed to start ...
+```
+
+注意这行现在由 IOKit 配置线程打印，不再和 boot 线程同步：它可能落在 `initproc failed to start`
+之前或之后，也可能稍晚才出现。判定时先看整屏有没有 `CloverBlock r114`，不要拿它和 `initproc`
+的先后当证据。
+
+失败一律 panic，一行一段，格式 `CloverBlock r114: <step> <value>`：
+
+| 停在哪 | 含义 |
+| --- | --- |
+| `notify 0` / `notify 1` | `resourceMatching("IOBSD")` 或 `addMatchingNotification` 返回空，通知没装上；此后不会再有 CloverBlock 行 |
+| `ready` / `storage` / `abi` | PIO 未就绪、`IOStorageFamily` 未加载、类大小不是 0x90 |
+| `modload` / `postload` | 自己的 metaclass 没注册上 |
+| `device` / `attach` / `driver` / `media` | 设备、驱动或整盘 IOMedia 没起来 |
+| `gpt` / `gpt-attach` | scheme 没分配到；或 attach 到整盘失败 |
+| `gpt-probe <score>` / `gpt-start` | 已 attach 但没认出 GPT、或没启动 |
+| `gpt-children` / `gpt-target <n>` | 没有子节点；或 `n` 个分区里没有 `Partition ID 39` |
+| `bsd-whole` / `bsd-root` | BSD 客户端在整盘或目标分区上没启动 |
+| `bsd-props` | 目标分区仍缺 `BSD Name` / `BSD Major` / `BSD Minor` |
+| `root-match <ptr>` | `IOBSDNameMatching` + `waitForService` 没返回目标分区 |
+| `bdevvp <err>` | `dev_t` 打不开，返回 XNU 的 errno |
+| `buffer` / `open-whole` / `read-whole` / `open-part` / `read-part` | 缓冲区或读路径失败，值为 IOReturn |
+| `map` | 整盘 `base` 处与分区 0 处的内容不同 |
+| 没有 `CloverPMGR r114` | 固件启动的不是这份 payload |
+| 有 `CloverPMGR r114`、没有 `CloverBlock r114`、也没有 panic | `IOBSD` 发布时通知没派发（资源未发布或 IOKit 配置线程没跑起来） |
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| 成功行 + 走到 `initproc failed to start` | vfsinit 就是 round113 的缺口：devfs 节点、BSD 属性、`bdevvp`、偏移映射一次走通 | 把 `rd=` 从 `md0` 换成 `disk0s39`，去问根挂载本身 |
+| 仍是 `bsd-props 0` | 通知确实晚于 vfsinit，但节点还是没建成 | 把 `devfs_ready` 与 `createNodes()` 的返回值一起打进 panic，查 `getWholeMedia` / anchor |
+| `notify 0` / `notify 1` | IOBSD 匹配字典或通知没装上 | 核对 `resourceMatching` 的符号导出与 `gIOPublishNotification` |
+| 只有 `CloverPMGR r114`，没有任何 CloverBlock 行 | 通知从未触发 | 查 `gIOResources` 是否真的被 `registerService`，以及配置线程有没有起来 |
+| 仍是 `Kernel data abort`，pc 在 `IOGUIDPartitionScheme` | attach 顺序回归 | 核对 `attach(whole)` 用的整盘对象 |
+| 停在 `gpt-*` / `bsd-whole` / `root-match` / `bdevvp` / `map` | 说明已经跑到 vfsinit 之后，但后面的老链路出问题 | 按 step 名回看 round113 的对应阶段 |
+| 停在更早的步骤 | 存储栈出现回归 | 按 step 名回看该阶段 |
+
+产物（内核与 payload 变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round114-payload.img` | 58720256 B | `7d7a3c1212687a0a56625bc45df5b5082c1e2783ef11068e1a87dccaa8372c84` |
+| `round114-kernel.macho`（构建产物） | 51974144 B | `87dbf082d5b8bb55c76f6998b580229b8ea86895d5af3f470f3af52eea7bbd00` |
+| `round114-in-volume-kernel.macho`（卷内副本） | 51974144 B | `ba142946c1fcd41939342a2f9c6154a125e7425a16949443d544dc680fbc0adf` |
+| `round114-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round114-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round114-kernel.macho.adt` | 13476 B | `60a323bdb922adf86db9a97c17b6c49a00cca239f03ad739f7407701fd972fbb` |
+| `round114-unixnu.toml` | 561 B | `ed168370cb15cf36ce4ac858834e5a850c8973ecd041c081ac6d88f7250b996b` |
+
+校验器：`check-clover.py` 通过（ADT 13476 字节、8 核、splash `0x9d400000-0x9f800000`、
+FD `0x9fc00000-0x9ff00000`、`clover_defconfig`、`CLOVERESP`、模块可见）。卷内 boot-args
+末尾仍是 `… clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`。r114 的字符串都在
+卷内内核里：`CloverPMGR r114: args [%s]`、`CloverBlock r114: post-vfsinit p=%u %s %u:%u bd=1 map=1`，
+panic 行末尾照旧带 `@CloverBlock.cpp:<line>`。`CloverBlock` 的导入与 vtable 审计仍然通过，
+`clover_block_request` 是这次新增的唯一导出口。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_run`
+`0xfffffff00797231c`、`_clover_block_run` `0xfffffff007992054`、`_clover_block_request`
+`0xfffffff00799296c`。boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round114-payload.img
+fastboot reboot
+```
+
+**一次刷机只回答一个问题：把块栈放到 `vfsinit()` 之后，BSD 命名、属性和 `bdevvp` 能不能一次走完。**
+看到成功行，`rd=md0` 就可以换成 `disk0s39`，下一轮问的是根挂载本身。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

@@ -212,9 +212,10 @@ volatile uint64_t clover_emmc_observation[16];
 // The formatted report, one %s argument, so the panic screen's argument list cannot shift.
 char clover_emmc_report[512];
 volatile uint32_t clover_emmc_stage = 0;
-// drivers/CloverBlock's entry point: mode 21 publishes the boot's block device and hands the
-// partition table to XNU's own partition scheme and BSD client.
-void clover_block_run (void);
+// drivers/CloverBlock's entry points: mode 21 asks for the boot's block device, and the block run
+// itself is deferred to the IOBSD resource publication because it needs devfs and the vnode tables
+// vfsinit() builds (round113 proved the early run gets no devfs node at all).
+void clover_block_request (void);
 }
 
 // One 512-byte PIO block at a time, in BSS rather than on a kernel stack: mode 14 reads the GPT
@@ -3747,11 +3748,12 @@ extern "C" void clover_emmc_run (void)
     }
     coldBringUp (mode == 5, (mode >= 7 && mode <= 21) ? mode : 0);
   }
-  // Mode 21 is the boot path now, not a report: the block stack runs, prints one line of its
-  // own, and the boot continues. Every other mode still ends on the panic screen with the
-  // driver's report, because those modes exist only to answer a question.
+  // Mode 21 is the boot path now, not a report: it asks CloverBlock for the block stack and the
+  // boot continues. The stack itself runs later, when IOKitBSDInit() publishes "IOBSD" -- after
+  // vfsinit(), which is where devfs and bdevvp become usable. Every other mode still ends on the
+  // panic screen with the driver's report, because those modes exist only to answer a question.
   if (mode == 21) {
-    clover_block_run ();
+    clover_block_request ();
     return;
   }
   panic ("CloverSdhci:\n%s", clover_emmc_report);

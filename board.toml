@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: attach the GPT scheme before probing it"
+title = "clover emmc: run the block stack after vfsinit"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1331,10 +1331,20 @@ kernel_args = [
   # getProvider() returned null and scan() dereferenced it. The scheme had never been attached;
   # IOService::probeCandidates attaches before probing, and this file had called probe() first.
   # Round113 attaches the scheme before probe(), keeps it attached for start, and adds "gpt-attach"
-  # as a failure step.
-  # One line on success, "CloverBlock r113: p=<n> disk0s39 <maj>:<min> bd=1 map=1"; every
-  # failure panics as "CloverBlock r113: <step> <value>". boot stays rd=md0 and nothing is
+  # as a failure step. Its photograph got past the data abort and stopped at "bsd-props 0": the
+  # scheme published its partitions, but the BSD client wrote no BSD Name/Major/Minor. Cause:
+  # sheng_pmgr_run() is before vfsinit(), so devfs_ready is still 0, devfs_make_node() returns
+  # NULL, MinorTable::insert() fails, and IOMediaBSDClient::start() returns true anyway because it
+  # ignores createNodes(). bdevvp() has the same prerequisite. Round114 keeps the whole run but
+  # starts it from the publication of IOKit's "IOBSD" resource, which IOKitBSDInit() performs at
+  # the end of bsd_autoconf() -- after vfsinit(), before setconf(). A device patches/xnu would
+  # shadow the base repository's patch set, so this notification is the post-vfsinit hook the
+  # device repo owns. The handler runs on IOKit's config thread; rd= stays md0 and nothing is
   # written to logfs.
+  # One line on success, "CloverBlock r114: post-vfsinit p=<n> disk0s39 <maj>:<min> bd=1 map=1";
+  # every failure panics as "CloverBlock r114: <step> <value>". "notify 0/1" means the IOBSD
+  # matching dictionary or the notification itself could not be installed. No CloverBlock line at
+  # all means the notification never fired.
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
