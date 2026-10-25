@@ -6426,6 +6426,86 @@ fastboot reboot
 
 **一次刷机只回答一个问题：只释放一次匹配字典之后，`waitForService` 会不会返回的正是 `disk0s39`，并让 `bdevvp` 与偏移比较都通过。** 三条验证都通过后，下一轮才把 `rd=` 换成 `disk0s39` 去碰真正的根挂载。
 
+## round117 读数（v0.2.89 实机）：通知重投让第二次 run 撞上重复类
+
+照片不是 `CloverBlock` 的 `fail()` 行，也不是成功行，而是一屏 data abort 异常面板：
+
+```text
+pc 0xfffffff007a231a4
+lr 0xfffffff00782ef6c
+```
+
+把这两个地址对着 `round117-kernel.macho` 反汇编，落点很清楚：
+
+- pc 落在 `OSMetaClass::postModLoad.cold.1` 里面，也就是冷路径上那条重复类 panic 分支；它要读的是 `orig->reserved->kext`，而 `reserved->kext` 是 0。
+- lr 是 `postModLoad` 正常体里 `bl` 的返回地址，即「刚调完 `preModLoad` 就进了冷路径」。
+
+要让这条分支成立，`postModLoad` 必须被调用第二遍，而 `sAllClassesDict` 里已经有 `CloverBlockDevice`。也就是说 `clover_block_run()` 在这台机器上**跑了两次**：
+
+1. 第一次走完 6 步，注册 `CloverBlockDevice`，建 `IOBlockStorageDriver`/`IOMedia`，拿到 `disk0s39`，全部通过 —— 屏幕上启动日志一路走到 APFS 和 launchd，就是它成功的证据；
+2. 第二次又进 `preModLoad` → `clover_block_static_init()`（重建 `gMetaClass`，把 `reserved->kext` 重新写成 NULL）→ `postModLoad`，这一次 `sAllClassesDict` 命中，走 panic 分支，读 `reserved->kext` 就是空指针。
+
+第二次是怎么来的，是这一轮真正学到的东西。`clover_block_request()` 用 `IOService::resourceMatching("IOBSD")` 挂 `gIOPublishNotification`，而 `resourceMatching` 匹配的是**常驻的 `gIOResources` 服务**，不是某个一次性对象。XNU 那边：
+
+- `IOService::doServiceMatch()` 每趟都会把仍在匹配的 `gIOPublishNotification` 重新收集、重新调用一遍；
+- 调用点是 `invokeNotifier(notify)`，**返回值被丢掉**，所以 handler 里 `return false` 并不能退役这个 notifier；
+- `IOKitBSDInit.cpp` 里每次 `publishResource()`（第 113、126、808、909 行等）都会重新匹配 `gIOResources`，于是通知一而再地投过来。
+
+代码里原来那句注释「one shot: the resource is published once per boot」因此是错的，本轮已改。v0.2.89 的 release 修复本身没问题，只是它挡不住第二次进入。
+
+## v0.2.90（round118）：闩锁让注册只发生一次
+
+只改一处：`clover_block_run()` 开头加一对原子计数，让函数体**只被放行一次**，其余步骤、超时、日志格式都不动。
+
+```cpp
+uint32_t fires = __atomic_add_fetch(&gCloverBlockFires, 1u, __ATOMIC_RELAXED);
+uint32_t expected = 0;
+if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
+                                 __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+  IOLog("CloverBlock r118: refire n=%u (already ran)\n", fires);
+  return;
+}
+```
+
+`__atomic_*` 是 GCC 内建，不需要头文件，和本仓库 `CloverSdhci.cpp` 里 `gBlockGuard` 用的那对 `__atomic_load_n`/`__atomic_compare_exchange_n` 是同一套写法。handler 依旧 `return false`，但注释现在写的是实情：false 不会退役 notifier，是闩锁保证只跑一次。
+
+行数自证：成功行末尾多了 `fires=<k>`（跑通那一趟通常是 1），后面每一次重投各打一行 `refire n=<k> (already ran)`。一张照片同时回答「注册跑完了吗」和「被投了几次」。
+
+| 失败行 | 含义 |
+| --- | --- |
+| `notify` / `auto <n>` / `bsd-type` / `root-match <ptr>` / `bdevvp <err>` / `buffer` / `open-*` / `read-*` / `map` | 与 v0.2.89 完全相同，只是标签升到 `r118` |
+
+成功行：
+
+```text
+CloverBlock r118: auto p=39 disk0s39 1:39 bd=1 map=1 fires=1
+```
+
+`rd=` 仍是 `md0`。`CloverPMGR` 只把行首标签升到 `r118`，参数行内容不变。
+
+产物（内核与 payload 变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round118-payload.img` | 58720256 B | `3a9f91d89443fcf92a1f91ddce384e528652ea33b875b7a894eec43af4b8de3b` |
+| `round118-kernel.macho`（构建产物） | 51974144 B | `5ed34258c60e2bc03cea01b16ae873241100553ac4c1e98cb0cfc138265ee856` |
+| `round118-in-volume-kernel.macho`（卷内副本） | 51974144 B | `94cc3ac6109fd3b0d4c8b30b784478b3d5b823694623028a97aca065c80a8e0b` |
+| `round118-kernel.macho.adt` | 13476 B | `0e25bd558a9c9698c66262e09c28c2601bd770e6a3556e24405d0a7de9df88d4` |
+| `round118-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round118-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round118-unixnu.toml` | 562 B | `def713de19bb1b050747a0e868c60c6cebdb7ddd4bf400be6cc129b3c6274dd1` |
+
+校验器：`check-clover.py` 通过（ADT 13476 字节、8 核、splash `0x9d400000-0x9f800000`、FD `0x9fc00000-0x9ff00000`、`clover_defconfig`、`CLOVERESP`、模块可见）；`verify-clover-payload.py` 通过（probe 补丁只落在本地化、PMGR 绑定仍在、CloverSdhci 已链接）；`CloverBlock` 导入与 vtable 审计通过（265592 字节、190 个槽、26 个覆写）。卷内 boot-args 末尾仍是 `… clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`；卷内内核只有 r118 字符串，没有 r117 残留。反汇编确认第 6 步仍是 `matching->retain()` → `waitForService` → 释放一次，而函数入口先是 `__atomic_add_fetch` 再是 CAS。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_run` `0xfffffff00797231c`、`_clover_block_run` `0xfffffff007992054`、`_clover_block_request` `0xfffffff0079928e8`。boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round118-payload.img
+fastboot reboot
+```
+
+**一次刷机只回答一个问题：加了闩锁之后，`clover_block_run()` 是否只执行了一次，让注册不再撞重复类，并把 `CloverBlock r118: auto … fires=` 这条成功行留在屏幕上。** 只要这一行出现（且没有第二次 `preModLoad`），下一轮就把 `rd=` 换成 `disk0s39` 去碰真正的根挂载。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

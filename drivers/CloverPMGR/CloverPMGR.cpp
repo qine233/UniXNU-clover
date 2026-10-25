@@ -114,7 +114,7 @@ extern "C" void sheng_pmgr_run(void)
   // not contain clover-emmc. Every later boot names the kernel and echoes the command line before
   // any switch, so a photograph either contains this line (this payload ran) or does not (the
   // payload that booted is not the one that was flashed).
-  IOLog("CloverPMGR r117: args [%s]\n", PE_boot_args());
+  IOLog("CloverPMGR r118: args [%s]\n", PE_boot_args());
   unsigned mode = 0;
   if (!PE_parse_boot_argn("clover-pmgr", &mode, sizeof(mode)) || !mode) return;
   clover_pmgr_observation[15] = mode;

@@ -35,6 +35,22 @@
 // releases it once after the wait, so the run can reach the root-match check, bdevvp and the
 // offset comparison.
 //
+// Round 117's photograph was a bare data abort at pc 0xfffffff007a231a4, lr 0xfffffff00782ef6c --
+// not one of the fail() lines below, so the first run had already cleared postload and registered
+// CloverBlockDevice. The pc is inside OSMetaClass::postModLoad.cold.1, the duplicate-class panic
+// path, reading orig->reserved->kext (NULL) to name the kext that already owns the class; the lr is
+// postModLoad's call to that path. In other words clover_block_run() executed a second time: the
+// re-run rebuilt gMetaClass (resetting reserved->kext to NULL), and its postModLoad found the first
+// run's CloverBlockDevice already in sAllClassesDict. The boot log had reached APFS and launchd, so
+// the first run finished and the crash came later. The cause is the notification itself.
+// resourceMatching("IOBSD") matches the persistent gIOResources service, and IOService::doServiceMatch
+// re-collects and re-invokes every gIOPublishNotification whose matching still matches on each pass,
+// ignoring the handler's return value -- so returning false does NOT retire it here. Every later
+// publishResource() (the property loop and boot-uuid in IOKitBSDInit) re-matches gIOResources and
+// re-fires this handler. Round 118 keeps the notifier installed but latches the run: an atomic
+// compare-and-swap admits the first invocation and turns every refire into a counted no-op, so the
+// metaclass is registered exactly once and the boot continues to answer the real question.
+//
 // The class has to be hand-written. IOStorageFamily is loaded at runtime from the boot kext
 // collection (kernel.macho exports no IOBlockStorageDevice, IOMedia or IOBlockStorageDriver
 // symbol), so the standard OSDefineMetaClass* macros cannot be used: they would take the
@@ -51,8 +67,9 @@
 // an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
 // attached for start (startCandidate() attaches again after the matching loop's detach).
 //
-// A failure panics with one short CloverBlock r117 line naming the step; success prints one line
-// and lets the boot continue, because there is nothing left to photograph.
+// A failure panics with one short CloverBlock r118 line naming the step; success prints one line
+// and lets the boot continue. A refire of the IOBSD notification prints one counted line and
+// returns, so the photograph shows both that the run completed and how many times it was offered.
 #define IOKIT_ENABLE_SHARED_PTR 1
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
@@ -90,6 +107,16 @@ static const uint32_t kBlockWords = kBlockBytes / 4;
 static const char kBSDNameKey[] = "BSD Name";
 static const char kBSDMajorKey[] = "BSD Major";
 static const char kBSDMinorKey[] = "BSD Minor";
+
+// The IOBSD publish notification is delivered on the persistent gIOResources service, whose
+// doServiceMatch re-invokes every still-matching gIOPublishNotification on each pass and ignores the
+// handler's return, so returning false does not retire it: every later publishResource() re-fires
+// the handler. Round117 ran the whole body twice and the second postModLoad hit the duplicate-class
+// path (CloverBlockDevice was already in sAllClassesDict) and dereferenced a NULL reserved->kext.
+// gCloverBlockRan is a latch, not a lock: the first invocation flips 0->1 and runs, every refire
+// sees 1 and returns after counting itself in gCloverBlockFires. Neither is ever cleared.
+static volatile uint32_t gCloverBlockRan = 0;
+static volatile uint32_t gCloverBlockFires = 0;
 
 // ---------------------------------------------------------------- block device
 
@@ -441,7 +468,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r117: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r118: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 // The mask's job is done: round115 showed that the names this file wants are taken by the tree
@@ -525,6 +552,21 @@ static IOReturn readMediaBytes(IOMedia *media, IOService *client, IOMemoryDescri
 
 extern "C" void clover_block_run(void)
 {
+  // 0. Latch. The IOBSD publish notification is re-delivered on the persistent gIOResources service
+  // every time a later publishResource() re-matches it, and returning false does not retire it, so
+  // this body is offered more than once per boot. Only the first offer may run: preModLoad +
+  // clover_block_static_init + postModLoad register CloverBlockDevice, and a second run would find
+  // it already in sAllClassesDict and take the duplicate-class panic path (round117's data abort on
+  // a NULL reserved->kext). Count every offer, admit exactly one, and report each refire so the
+  // photograph shows the notification really did fire again.
+  uint32_t fires = __atomic_add_fetch(&gCloverBlockFires, 1u, __ATOMIC_RELAXED);
+  uint32_t expected = 0;
+  if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
+                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    IOLog("CloverBlock r118: refire n=%u (already ran)\n", fires);
+    return;
+  }
+
   // 1. The PIO path has to be proven before anything claims a device over it.
   if (!clover_emmc_block_ready() || clover_emmc_block_sectors() == 0) {
     fail("ready", 0);
@@ -661,9 +703,9 @@ extern "C" void clover_block_run(void)
     fail("map", 0);
   }
 
-  IOLog("CloverBlock r117: auto p=%u %s %u:%u bd=1 map=1\n", partitions,
+  IOLog("CloverBlock r118: auto p=%u %s %u:%u bd=1 map=1 fires=%u\n", partitions,
         bsdName->getCStringNoCopy(), bsdMajor->unsigned32BitValue(),
-        bsdMinor->unsigned32BitValue());
+        bsdMinor->unsigned32BitValue(), fires);
 }
 
 // ---------------------------------------------------------------- the post-vfsinit hand-off
@@ -694,7 +736,12 @@ extern "C" void clover_block_run(void)
 static bool cloverBlockIOBSD(void *, void *, IOService *, IONotifier *)
 {
   clover_block_run();
-  return false;   // one shot: the resource is published once per boot
+  // Returning false does NOT retire this notifier: it matches the persistent gIOResources service,
+  // and doServiceMatch re-invokes every still-matching publish notification on each pass regardless
+  // of the return value, so every later publishResource() re-fires the handler. The latch at the top
+  // of clover_block_run() is what makes the body run once; this only stops the notifier from being
+  // re-added by a waiter. The refire count it prints is the proof that this really fires again.
+  return false;
 }
 
 extern "C" void clover_block_request(void)

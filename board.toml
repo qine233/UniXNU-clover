@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: take the disk the kernel named"
+title = "clover emmc: register once, let the boot finish"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1354,11 +1354,22 @@ kernel_args = [
   # IOService::waitForService() already releases that dictionary -- IOFindBSDRoot() retains it once
   # per wait for exactly this reason. Round117 does the same, so the run reaches root-match,
   # bdevvp and the offset comparison.
-  # One line on success, "CloverBlock r117: auto p=<n> disk0s39 <maj>:<min> bd=1 map=1"; every
-  # failure panics as "CloverBlock r117: <step> <value>". "auto <n>" means no named partition
-  # appeared in time: the value is 0x10000 if the whole disk itself was named, plus the number of
-  # named partitions seen. "notify 0/1" means the IOBSD matching dictionary or the notification
-  # itself could not be installed. No CloverBlock line at all means the notification never fired.
+  # Round117's photograph was a bare data abort at pc 0xfffffff007a231a4, lr 0xfffffff00782ef6c --
+  # inside OSMetaClass::postModLoad.cold.1, the duplicate-class panic path, dereferencing a NULL
+  # orig->reserved->kext. That is not a fail() line: the first run had already registered
+  # CloverBlockDevice, and a second run's postModLoad found it in sAllClassesDict. The boot log had
+  # reached APFS and launchd, so the first run finished and the crash came later. resourceMatching
+  # ("IOBSD") matches the persistent gIOResources service, and doServiceMatch re-invokes every
+  # still-matching gIOPublishNotification on each pass ignoring the handler's return value, so
+  # returning false does not retire it; every later publishResource() re-fires the handler.
+  # Round118 latches the run: one atomic CAS admits the first invocation and every refire counts
+  # itself and returns, so the metaclass registers once and the boot continues.
+  # One line on success, "CloverBlock r118: auto p=<n> disk0s39 <maj>:<min> bd=1 map=1 fires=<k>"
+  # (fires=1 on the run that succeeded); each refire prints "CloverBlock r118: refire n=<k> (already
+  # ran)". Every failure panics as "CloverBlock r118: <step> <value>". "auto <n>" means no named
+  # partition appeared in time: the value is 0x10000 if the whole disk itself was named, plus the
+  # number of named partitions seen. "notify 0/1" means the IOBSD matching dictionary or the
+  # notification itself could not be installed. No CloverBlock line at all means it never fired.
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
