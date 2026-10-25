@@ -4343,6 +4343,104 @@ fastboot reboot
 
 **拍一张就够。**
 
+## round98 读数：节奏对了，FIFO 端口没有前进
+
+照片（正向；末尾是 panic 调用点）：
+
+```text
+g cfg=00002017 m=01 n=fc d=fb up=1 br=00004221 ab=20008001
+h clk=0007 rst=1 clr=0002 pw=0b
+c0 ok c1 ok t=3 to=0 rsp=c0ff8080
+c2 ok int=00000001
+c3 ok st=2
+c7 ok int=00000001
+c13 ok st=4
+c16 ok int=00000001 r=00000900
+c17 nodata int=00000021 ar=1 tm=12
+hc 00 0000
+dt f=10415 l=30747 nw=128 nd=0
+ps a=01f802f6 e=01f80af6 clk=0007
+hdr 20494645 20494645 sm=24a32280
+gpt lba=541673029 el=541673029 en=541673029 es=541673029
+efi 0
+c12 to st=4 int=00018000
+```
+
+这张照片把 round97 的「读得太快」正式结掉，并把嫌疑锁到一个寄存器位上：
+
+1. **节奏完全正确。** 第一字落在 `f=10415` µs：400 kHz、1-bit 总线、512 字节
+   = 4096 bit ≈ 10.24 ms。最后一字 `l=30747`，正好是 `f + 128 × 160 µs`。
+   也就是说排空循环一直在按卡的节奏走，没有抢跑。
+2. **128 次读仍是同一个字，而且现在能证明是端口问题。** `nd=0`、`sm` 仍是
+   128 × `0x20494645`，`ps e` 的 bit11（buffer read enable）到最后一刻还是 1。
+   如果 SDHCI 缓冲在消费数据，读第二次电平就该变；它没变 ⇒ **每次读都落在同一条
+   不前进的端口上**，而不是「卡只送了一个字」。
+3. **`hc 00 0000` 是新的读数。** 这次 `RESET_ALL` 之后驱动只恢复了时钟和电源，
+   `HOST_CONTROL` 是 0x00（1-bit 总线、DMA 选 SDMA），`HC2` 是 0。PIO 不看 DMA
+   选择位，1-bit 也与 `dt f` 的理论值吻合，所以**不是**这轮的嫌疑；它只是说明
+   round96/97 提到的「8-bit 总线」是固件留下的读数，不是我们设的。
+4. **GPT 四字段全是同一个数** `541673029 = 0x20494645`，即 `"EFI "` 被当作
+   LBA/表项数读了出来；`efi 0` 同理。地址没错，错的是块内容只有第一个字。
+5. `c12 to st=4 int=00018000` 与 round97 逐字相同：卡早已回到 transfer，
+   CMD12 只是没等到 CC。
+
+那么「端口为什么不前进」。round87 读到的 `vs3=02626440` 里 bit 10 是 1 ——
+这是 `CORE_FIFO_ALT_EN`（`sdhci-msm.c:144`），Linux 在 `sdhci_msm_init` 里专门清它，
+注释是 “Ensure SDHCI FIFO is enabled by disabling alternative FIFO”（`:5586`）。
+固件把 eMMC 交给了 Qualcomm 的备用 FIFO，我们的 PIO 读的是 SDHCI 的 `0x20`；
+电平位来自数据机，读窗口却通向另一条没被喂的队列——这正好解释「指针不动、
+电平不落、每读一次都是同一个字」。
+
+## v0.2.71（round99）：把 FIFO 从备用路径收回 SDHCI
+
+mode 13 = mode 12 原样，只加一次写：
+
+1. 在 `RESET_ALL` 之后、卡时钟恢复之后、任何传输之前，读 `VENDOR_SPEC3`（0x250），
+   清 bit 10，再读回。这一步只做一次，没有命令在飞、数据机已复位。
+2. 报告把 mode 12 的 `hc <HOST_CONTROL> <HC2>` 换成 `v3 <before> <after>`（各取低
+   16 位），用来分开三种情况：位原本就没置、写进不去、写进去了但 FIFO 还是不动。
+3. 其余一个字节不改：同一条识别链、同一个 `TRANSFER_MODE=0x12`、`ar=1`、同样的
+   160 µs 节奏与 200 ms 期限、同样的 `dt`/`ps`/`hdr`/`gpt`/`efi`。
+
+报告约 480 字节，仍在 512 字节缓冲内（`hc` 占 11 字节，`v3` 占 13 字节）。
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `v3` 前一个数 bit10=1、后一个 bit10=0，且 `nd>0` | 备用 FIFO 就是元凶；端口恢复前进 | 看 `efi 1`，读 GPT 分区表项 |
+| 同上但 `nd` 仍为 0 | 位清了，端口还是不动 | 下一轮换 ADMA2/ADMA64（固件用的是 ADMA64，`hcl=38`） |
+| `v3` 前一个数 bit10=0 | 固件这次没开备用 FIFO，假设出局 | 直接查数据机的 `TIMEOUT_CONTROL`/块长/总线宽度 |
+| 后一个数 bit10 仍为 1 | 写没落下去 | 查该寄存器的时钟/电源门控 |
+| `v3 0000 0000` | 冷启动没走到这一步（读回 0） | 先解决 bring-up，不看 FIFO |
+
+产物（内核变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round99-payload.img` | 58720256 B | `3b0c5e6c5ca7fd6d68b31db9e7f118629cd5aa6956389ee171538dd4bd6f7b06` |
+| `round99-kernel.macho`（构建产物） | 51949568 B | `0141659d0537d69b8a9038e098ad340e755e6f3a9c984289bcb6ab2812418574` |
+| `round99-in-volume-kernel.macho`（卷内副本） | 51949568 B | `1eccfbc44315571e1b2b0f13d2dc0f242e5841406952dc9ef0ccbff21ef04760` |
+| `round99-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round99-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round99-kernel.macho.adt` | 13476 B | `7e9427f8c50d55f8503e6d26275ae41e9770bf1b9868a891fc9834d67fbee778` |
+| `round99-unixnu.toml` | 581 B | `063bbd45d37aba28b4cc2864a3a02aaaa63bd36b5e94039285d5c14d64dd81a4` |
+
+校验器：探针 35 处 5960 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在。反汇编
+`__ZL11coldBringUpbj`：mode 13 的门是 `cmp w1,#0xd; b.lo`（对象 `0xa50c`），随后
+`ldr w9,[x9,#0x250]`、`and w10,w9,#0xfffffbff`、`str w10,[x11,#0x250]`、再读一次；
+报告侧 `cmp w19,#0xd; b.lo` 分去 mode 12 的 `hc`，否则逐字符写 `\n` `v` `3` 空格
+（对象 `0x1256c`–`0x125c8`），两次 `emitHex(…,4)` 中间隔一个空格。卷内 boot-args
+末尾是 `… clover-pmgr=2 clover-emmc=13 armcpu-clock-panic=60000`。
+boot 仍是 `round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round99-payload.img
+fastboot reboot
+```
+
+**拍一张就够。**
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -4361,6 +4459,8 @@ fastboot reboot
   byte 512，前五个字节应是 `EFI PART`），`v0.2.69` 起按 Linux 的 MSM 路径给单块传输置块计数
   使能、并按 OCR bit 30 改用扇区号，`v0.2.70` 起用 `CNTVCT_EL0` 把 FIFO 读速降到卡的节奏以下
   （round97 的 128 次读全是同一个字：主机比卡快了一个数量级），并把 GPT 头的四个字段解出来，
+  `v0.2.71` 起在传输前清掉 `VENDOR_SPEC3` 的备用 FIFO 选择位（round98 证明节奏已经对了，
+  是端口本身不前进），
   仍然不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令、数据阶段能不能自己走完」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用

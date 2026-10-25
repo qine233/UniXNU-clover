@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: LBA 1, drained at the card's pace"
+title = "clover emmc: LBA 1, on the SDHCI FIFO instead of the alternate one"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1165,7 +1165,18 @@ kernel_args = [
   # count and entry size from the header. "c17 ok" + "efi 1" + "nd=127" => the data path works
   # and the partition table is on the screen; "efi 0" with nd=127 => bytes but not a GPT header;
   # nd=0 with nw=128 => the card still delivers one word; nw<128 => the deadline fired.
-  "clover-emmc=12",
+  #
+  # Round98's photograph handed the failure to the host: dt f=10415 (a full 512-byte block at
+  # 400 kHz takes ~10.2 ms), dt l=30747 (the 128 reads were the intended 160 us apart), nw=128,
+  # nd=0, and the level bit still set at the end -- the buffer port never advanced, so pacing was
+  # never the problem. The firmware leaves VENDOR_SPEC3 = 0x02626440, whose bit 10 is
+  # CORE_FIFO_ALT_EN (sdhci-msm.c:144); Linux clears that bit in sdhci_msm_init with the comment
+  # "Ensure SDHCI FIFO is enabled by disabling alternative FIFO" (:5586). Mode 13 clears it once,
+  # with the data machine already reset and no transfer running, and then runs mode 12's drain
+  # unchanged. "v3 <before> <after>" replaces "hc" (which has not moved since round92) and shows
+  # the low 16 bits around the write; "c17 ok" + "nd=127" + "efi 1" => the SDHCI FIFO was the
+  # whole difference; nd=0 again => the port stays the question and the next round is ADMA.
+  "clover-emmc=13",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

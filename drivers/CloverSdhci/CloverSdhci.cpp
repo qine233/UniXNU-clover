@@ -175,6 +175,19 @@
 // decodes the GPT header's own fields. It also prints HOST_CONTROL, HOST_CONTROL2 and the final
 // CLOCK_CONTROL, so a stopped clock or an unexpected bus width is visible on the same photograph.
 //
+// Mode 12's photograph separated arrival from consumption: the first word came at 10.4 ms, about
+// when a 512-byte block at 400 kHz has finished, and the last read at 30.7 ms -- the 128 reads
+// really were 160 us apart -- yet every one returned 0x20494645, nd stayed 0, and the level bit
+// was still set at the end. So the buffer port never advanced, and reading slower cannot fix it.
+// The one register this driver has left at its firmware value that decides which FIFO that port
+// reads is VENDOR_SPEC3 bit 10, CORE_FIFO_ALT_EN (round87 read 0x02626440, bit 10 set). Linux
+// clears it in sdhci_msm_init "to ensure the SDHCI FIFO is enabled" (sdhci-msm.c:5586). Mode 13
+// clears it with the data machine already reset and runs mode 12's drain unchanged, printing the
+// selector before and after (`v3`) in place of `hc`. If the port advances now, nd=127 and efi=1
+// and the data path is PIO, which the rest of the driver can use; if it still returns one word,
+// the FIFO question is closed the other way and the next round is ADMA, the path both the
+// firmware and Linux use on this controller.
+//
 // Every path that is not the success path panics, because on this board silence is not a reading.
 // Round87's photograph also settled what the watchdog is worth here: ticks=0 at this scheduling
 // point. sheng_pmgr_run() runs right after bsd_bufferinit, about ten seconds of boot before
@@ -1087,6 +1100,11 @@ static const uint32_t kHcMclkSelDefault = 2u << 8;
 static const uint32_t kHcSelectInEn = 1u << 18;
 static const uint32_t kHcSelectInMask = 7u << 19;
 static const uint32_t kPwrSaveDll = 1u << 3;
+// CORE_VENDOR_SPEC3 bit 10: "alternative FIFO enable" (sdhci-msm.c:144). Linux clears it in
+// sdhci_msm_init with the comment "Ensure SDHCI FIFO is enabled by disabling alternative FIFO"
+// (:5586), i.e. 0 leaves the SDHCI buffer port in charge and 1 hands the data path to Qualcomm's
+// own FIFO. Round87 read vs3 = 0x02626440, so bit 10 is set on this board as the firmware left it.
+static const uint32_t kFifoAltEn = 1u << 10;
 
 static uint32_t readGcc32 (unsigned offset)
 {
@@ -1190,6 +1208,9 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   // Legacy timing, 1-bit bus, 1.8 V bus power, the longest timeout: EDK2's cold order, including
   // the power toggle (SdMmcPciHci.c:975) and TIMEOUT_CONTROL = 0x0e (:1191).
   bool clockStable = false;
+  // Mode 13's reading: the FIFO selector before and after clearing CORE_FIFO_ALT_EN. Both stay
+  // zero when the cold bring-up itself did not get this far.
+  uint32_t vendor3Before13 = 0, vendor3After13 = 0;
   if (resetDone && (fullReset || clockStopped)) {
     write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
     write8 (SDHCI_HOST_CONTROL, 0x00);
@@ -1204,6 +1225,16 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
     write32 (kSdhciVendorSpec, vendor);
     uint32_t vendor3 = read32 (kSdhciVendorSpec3);
     write32 (kSdhciVendorSpec3, vendor3 & ~kPwrSaveDll);
+    if (probeMode >= 13) {
+      // Round98 paced the FIFO reads and still got the same word 128 times with the level bit
+      // stuck, so the buffer port itself never advanced. This one bit is the difference between
+      // the port the firmware left behind and the one Linux initialises before every transfer:
+      // clear it with the data machine already reset and no transfer running, then read it back
+      // so a write that did not land cannot be mistaken for a FIFO that did not switch.
+      vendor3Before13 = read32 (kSdhciVendorSpec3);
+      write32 (kSdhciVendorSpec3, vendor3Before13 & ~kFifoAltEn);
+      vendor3After13 = read32 (kSdhciVendorSpec3);
+    }
     write8 (SDHCI_POWER_CONTROL, SDHCI_POWER_180);
     for (volatile uint32_t spin = 0; spin < 1000; spin = spin + 1) {
     }
@@ -1661,10 +1692,12 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
         verdictRead = dataVerdict (readStatus, sentRead);
       }
     }
-  } else if ((probeMode == 11 || probeMode == 12) && hostReady && ready) {
-    // Round96 accepted CMD17 (RESPONSE|DATA_AVAIL) but never saw DATA_END, and the FIFO returned
-    // zeros. Two host-side differences from Linux's path on this exact controller are repaired
-    // here, and every step is kept as a reading so a remaining failure names itself:
+  } else if (probeMode >= 11 && hostReady && ready) {
+    // Modes 11-13 share the chain; only the data phase differs (11 burst, 12 paced, 13 paced with
+    // the SDHCI FIFO selected first). Round96 accepted CMD17 (RESPONSE|DATA_AVAIL) but never saw
+    // DATA_END, and the FIFO returned zeros. Two host-side differences from Linux's path on this
+    // exact controller are repaired here, and every step is kept as a reading so a remaining
+    // failure names itself:
     //   1. OCR bit 30 is set (rsp=c0ff8080), so the card is sector addressed: mmc core marks
     //      MMC_STATE_BLOCKADDR from that bit and the block layer sends `blk_rq_pos` unchanged,
     //      shifting by 9 only for byte-addressed cards. LBA 1 is therefore argument 1 here.
@@ -1759,7 +1792,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
           // `int=00000021` still carried it after two words had been read. Round97 gated on the
           // level bit and read 128 words as fast as the loop ran, and 127 of them were the first
           // word again: the level says "the buffer has data", not "another word has arrived".
-          if (probeMode == 12) {
+          if (probeMode >= 12) {
             // Paced drain. At 400 kHz single-bit a 32-bit word takes ~80 us, so one read every
             // 160 us is slower than any arrival rate this link can produce; a buffer that fills
             // up simply stops the card clock until the next read. The deadline bounds the whole
@@ -1944,7 +1977,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
     clover_emmc_observation[13] = hdr0;
     clover_emmc_observation[14] = hdr1;
     clover_emmc_observation[15] = read32 (SDHCI_PRESENT_STATE);
-  } else if (probeMode == 11 || probeMode == 12) {
+  } else if (probeMode >= 11) {
     // The chain, then the data phase's three statuses and the R1 the card gave CMD17, then the
     // two header words and the checksum of the whole drained block.
     clover_emmc_observation[7] = idStatus11;
@@ -1989,7 +2022,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   // Mode 11's data phase needs five more lines than mode 10's, and the report buffer is 511
   // bytes. The two vendor selectors have been stable since round92 and are only needed when the
   // clock itself is in question, which `clk=` and the CMD0/CMD1 row already answer.
-  if (probeMode != 11 && probeMode != 12) {
+  if (probeMode < 11) {
     emitText (" vs ");
     emitHex (vendorAfter, 8);
     emitText (" vs3 ");
@@ -2263,7 +2296,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
       emitText ("\nefi ");
       emitDec (efi ? 1 : 0);
     }
-  } else if (probeMode == 11 || probeMode == 12) {
+  } else if (probeMode >= 11) {
     // Mode 11: mode 10's chain, then the same read with BLK_CNT_EN set and the card's own
     // addressing. `nw` is how many FIFO words actually arrived and `sm` their 32-bit sum, so a
     // block of zeros and a block that was never sent cannot be read alike. `ev` carries the
@@ -2271,6 +2304,8 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
     // Mode 12 keeps the chain and replaces the burst with a paced drain: `dt f=` is when the
     // first word arrived, `dt l=` when the last did (both in us), and `nd` counts the words that
     // differed from the one before, which separates a real block from one word read 128 times.
+    // Mode 13 is mode 12 after clearing CORE_FIFO_ALT_EN; `v3` replaces `hc`, which has not moved
+    // since round92, because the FIFO selector is what this round changed.
     emitText ("\nc2 ");
     emitText (verdictId11);
     emitText (" int=");
@@ -2310,13 +2345,22 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
       emitDec (readArg11);
       emitText (" tm=");
       emitHex (transferMode11, 2);
-      if (probeMode == 12) {
-        // The bus width and the DMA selector the data phase actually ran with, then the timing,
-        // the final clock control, the header words and where that header says the entries are.
-        emitText ("\nhc ");
-        emitHex (read8 (SDHCI_HOST_CONTROL), 2);
-        emitText (" ");
-        emitHex (read16 (SDHCI_HOST_CONTROL2), 4);
+      if (probeMode >= 12) {
+        // The FIFO selector (13) or the bus width and DMA selector (12), then the timing, the
+        // final clock control, the header words and where that header says the entries are. The
+        // low 16 bits of VENDOR_SPEC3 carry CORE_FIFO_ALT_EN (bit 10) and nothing the RCG path
+        // touches, so they are enough to read a write that landed.
+        if (probeMode >= 13) {
+          emitText ("\nv3 ");
+          emitHex (vendor3Before13 & 0xffffu, 4);
+          emitText (" ");
+          emitHex (vendor3After13 & 0xffffu, 4);
+        } else {
+          emitText ("\nhc ");
+          emitHex (read8 (SDHCI_HOST_CONTROL), 2);
+          emitText (" ");
+          emitHex (read16 (SDHCI_HOST_CONTROL2), 4);
+        }
         emitText ("\ndt f=");
         emitDec (firstUs12);
         emitText (" l=");
@@ -2592,7 +2636,7 @@ extern "C" void clover_emmc_run (void)
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
   // the storage instrument it was asked for.
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
-      mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12) {
+      mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12 && mode != 13) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -2613,9 +2657,7 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp (mode == 5,
-                 (mode == 7 || mode == 8 || mode == 9 || mode == 10 || mode == 11 ||
-                  mode == 12) ? mode : 0);
+    coldBringUp (mode == 5, (mode >= 7 && mode <= 13) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.
