@@ -7643,6 +7643,27 @@ fastboot flash userdata /Users/zhouzhou/clover-out/round128-userdata-root.sparse
 - `s=1 c=1 v=1` —— Apple 的容器字节在自己的 `IOGUIDPartitionScheme` 切出来的那片上被认出来了，**这才是「真容器」的答案**；`s=0` 而 `d>0` 说明分区那趟没把 APFS 切片交上去。
 - `d=`/`r=` —— 这轮要多穿两层，`d=` 该比 round127 的 7 大；`r=` 是这段里经过这颗媒体读掉的 512 字节块数，真容器的头几页应当远大于 56。
 
+## round128 读数（v0.3.1 实机）：iPadOS 原装容器字节在自己的盘上发布出卷
+
+开机约 **7.97 秒**上屏：`CloverBlock r128: apfs f=15797536 n=11870275 m=1 l=0 d=10 s=1 c=1 v=1 r=464 w=0 @CloverBlock.cpp:861`。
+
+- `f/n` 就是清单里 OS 那一条换算成 512 字节扇区（`15795488 + 0x100000/512`、`6077580800/512`）⇒ SHNGROOT 清单
+  和卡上 GPT 表项 64 两件事同时成立，一个 `root-*` / `udwindow` 步骤都没触发。
+- `m=1` 是 UDIF 那个意外的形状被实机确认：**窗口第 512 字节是 `EFI PART`**，媒体是一张整盘，容器在 `0x104400`。
+  这也正是本轮把切分交给 `IOGUIDPartitionScheme` 而不是自己动手的理由。
+- `s=1 c=1 v=1` 是本轮要的那一格：**Apple 未经修改的 iPadOS `OS` 容器**，逐字节就是 IPSW 里那颗 DMG 展开出来的东西，
+  被 apfs.kext 分区 → 认容器 → **发布出卷**，跑在本移植自己驱动的盘上。round127 证的是「我们造的容器它能读」，
+  这轮证的是「它自己发的容器它能读」，后者才是 iOS 路线的前提。
+- `d=10`（round127 是 7）= 多穿的两层（scheme + slice）连同它们的乘客；`r=464` = 上面那层读掉 232 KiB；`w=0` = 挂载前不写。
+- 两笔涨上去的预算都没用上：同帧 `ticks=0x892`=2194，按 ≈275 tick/秒 ≈ 7.9 秒，和屏上时间戳对得上；
+  但**别把它当秒表** —— round127 那一帧 9.8 秒只走了 295 tick，两者不互洽，tick 仍然只是「 boot 进度坐标」。
+- 怎么刷上去的也是一条结果：`round128-userdata-root.sparse.img`（本轮 `make-clover-sparse.py` 出的 all-RAW 容器）
+  **一条命令刷完**，bootloader 逐块接受了 sparse 流。这是这台机器的 fastboot 认 sparse 的第一次实机证据，
+  也顺带绕过了宿主那个 2 GiB 单次 `read()` 上限（raw 文件正是死在它上面）。
+
+**下一格的问题**：容器已经能被认出来、卷已经能发布，缺的是「真 mount + 把文件字节读回来」。下一轮在同一个探针里再走一步：
+拿 `measureApfsDepth` 找到的那颗卷向 vfs 要一次挂载，读回容器里一个已知路径的字节，仍然画在 panic 屏上。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

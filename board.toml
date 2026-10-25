@@ -1615,6 +1615,24 @@ kernel_args = [
   # roughly 20 ms per 512-byte block and 164 ms per 4 KiB APFS block -- a real container's first pages
   # are tens of seconds, so the poll is 12000 turns of IOSleep(10) rather than 3000. The watchdog is
   # raised to match below, because the answer this round wants is the probe's panic, not the timer's.
+  # Round128's photograph came back a pass on every field again:
+  # "CloverBlock r128: apfs f=15797536 n=11870275 m=1 l=0 d=10 s=1 c=1 v=1 r=464 w=0 @CloverBlock.cpp:861".
+  # f/n are the manifest's OS entry in 512-byte sectors (15795488 + 0x100000/512, 6077580800/512), so the
+  # SHNGROOT window and the card's own GPT entry 64 agreed and no root-* / udwindow step fired. m=1 is the
+  # UDIF's real shape: byte 512 of the window is "EFI PART", which is why the container this round measures
+  # sits at 0x104400 and why slicing was handed to IOGUIDPartitionScheme instead of being done here. s/c/v
+  # together are the point of the round -- Apple's unmodified iPadOS OS container, byte for byte as the IPSW
+  # ships it, was partitioned, recognized and *published a volume* by apfs.kext, on a disk this port drives.
+  # d=10 against round127's 7 is the two extra levels (scheme + slice) plus their passengers; r=464 blocks is
+  # the 232 KiB the stack above read, w=0 that it wrote nothing.
+  # Neither grown budget was spent: the panel's own log timestamps put this frame at about 7.97 s and it
+  # reads ticks=0x892 (2194, ~275/s -- round119's calibration again), so 12000 poll turns and 180000 watchdog
+  # ticks were slack. Read that as a rate for *this* frame only: round127's 295 ticks under a 9.8 s stamp does
+  # not fit it, so the tick number stays a boot-progress coordinate and not a duration.
+  # How it got on the card is a result too: `round128-userdata-root.sparse.img` (the all-RAW container this
+  # round's scripts/make-clover-sparse.py emits) flashed in one command with the bootloader accepting the
+  # sparse stream chunk by chunk -- first hardware proof that this device's fastboot understands sparse, and
+  # that the path sidesteps the host's 2 GiB single-read cap that kills the raw file.
   "clover-apfs=2",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
