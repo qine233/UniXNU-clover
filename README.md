@@ -7135,6 +7135,73 @@ load_init_program: attempting to load /sbin/launchd
 
 **下一题（round124，仍然只改 EL0 镜像）：** 现在嫌疑人被钉在「第九次 console write 进去了、没出来」，而前八次同一个孩子、同一条路径都出来了。要切的是「**控制台是不是对所有人都不再应答**」—— 因为 `cons_write` 这类路径是串行的，如果第九次调用持着某把锁卡住，那么任何进程的下一次 write 都会一起卡。做法：父亲从 round78 的阻塞 `wait4` 改回**带截止时间的静默轮询**，每若干轮 `_puts` 一句 `el0 init: waiting <n>`，到点用同一颗已证明能上屏的 `reboot(2)` 报 `clover-el0: parent deadline`。读数三值：父亲的心跳行出现 ⇒ 控制台对别的进程还活着，卡的是那一次调用；心跳行没出现但 panic 上了屏 ⇒ 父亲没走 write 就到达了 deadline（还能顺带证明 panic 通道不受控制台影响）；心跳和 panic 都没有 ⇒ 父亲也卡在 write 里，控制台全局废了。一次刷机三值。
 
+## round123 读数·第二帧（同一份 v0.2.95，等到看门狗自己占屏）：整个剩余寿命里一档都没响 —— 「拍早了」排掉
+
+第一帧之后没有断电、没有重刷，只等。屏最终换成了这一帧：
+
+```
+（上方残留的开机 console 文本，10.312421 … 10.541290，最后一行是
+  [ 10.541290]: debug_log_init: Error!! gPanicBase is still not initialized）
+
+ArmCpu: clock watchdog at 60000 ticks (elr=100000b98 spsr=fffffff6e65dbd50 elr2=100000b98
+       cnt0=124f800 cnt1=0 freq=124f800) @ArmCpu.cpp:632
+pages=0x000000000003af7e
+free=0x0000000000039527
+ticks=0x000000000000ea60
+ipi=0x0000000000000000 sent=0x0000000000000000
+irq=0x0000000000000013 phase=0x0000000000000003 intid=0x0000000000000013 typer=0x000000000007b04f3
+pmgr=0x0000000000000005 status=0x0000000000000000 mode=0x0000000000000002
+nub=0xfffffff8ffedc800 attached=0x0000000000000001 registered=0x0000000000000002
+aon=0x00000000ffffffff=>0x00000000ffffffff
+RA=0xfffffff007a31024
+FP=0xfffffff106ffcee0
+LR=0xfffffff007968b40
+fmt=0xfffffff00712e7ec
+a0=0x000000000000ea60  a1=0x0000000100000b98
+a2=0xfffffff6e65dbd50  a3=0x0000000100000b98
+a4=0x000000000124f800  a5=0x0000000000000000
+TCR=0x00000022a51a251a
+```
+
+`spsr=` 那一格跨行折了一次（第一行末 `…spsr=fffffff6`，第二行首 `e65dbd50`），所以它的位数最容易读错；屏底部 `a0…a5` 是同一批 panic 参数溢出到栈上的槽，逐格与表头对得上，于是这一帧的所有数都被同屏读过了两遍。
+
+**这一帧把上一节留下的「拍照时机」备选排掉了。** `panic()` 只保留**第一个** panic —— 这是 round78 以来一直用来做排除的那条性质。本轮孩子在尾段一共埋了六颗 `reboot(2)`，任何一颗被执行，屏上第一个 panic 就应该是 `userspace panic: clover-el0: after write …`，看门狗根本没机会占屏；round122 又已经量过这条通道从 EL0 的 `svc` 到 panic 上屏只要约 10 秒。现在屏上是看门狗，而且 `ticks=0xea60` 正好等于 deadline：⇒ **从第一个 tick 到 deadline，六档一颗都没被执行过**。按 round122 那对候选值（553 tick ↔ 9.94 秒 ⇒ ≈18 ms/tick）算，这段等待是**十几分钟**量级。所以第一帧的结论从「那次 write 没返回」升级成「在这次启动剩下的全部寿命里，它一次也没返回」。
+
+屏上方那些带时间戳的行不能用来给 panic 定时：panic 屏只清自己光标行到半屏（`xnu-panic-screen.c:364`），上方留的是开机时写上去的旧文本 —— 同一句 `debug_log_init: Error!! gPanicBase is still not initialized` 在 round122 那帧读的是 `9.942761` 秒，本轮读 `10.541290` 秒，它们只说明这次启动至少走到了 10.5 秒。
+
+**panic 屏自己的账目仍然逐格能解**，而且这次解出来的是「谁开的枪」：
+
+| 屏上的数 | 解出来 | 依据 |
+| --- | --- | --- |
+| `RA` = `0xfffffff007a31024` | `__ZN6ArmCpu9interruptEv.cold.2 + 0x0` | `nm -n round123-in-volume-kernel.macho`；下一个符号 `signalCPU…cold.1` 在 `0xfffffff007a31064`，所以这是那个 cold 块的开头 |
+| `LR` = `0xfffffff007968b40` | `ArmCpu::interrupt() + 0x280` | 同一张表：`_ZN6ArmCpu9interruptEv` 起于 `0xfffffff0079688c0`，下一个符号 `signalCPUEP5IOCPU` 在 `0xfffffff007968b60` ⇒ 落在 `interrupt()` 体内，就是跳进上面那个 cold 块的那条分支的返回地址 |
+| `fmt` = `0xfffffff00712e7ec` | 看门狗自己那句格式串 | `__TEXT` vmaddr `0xfffffff007004000`、fileoff 0 ⇒ 文件偏移 `0x12a7ec`，那里逐字节是 `ArmCpu: clock watchdog at %llu ticks (elr=%llx spsr=%llx elr2=%llx cnt0=%llx cnt1=%llx freq=%llx) @%s:%d` |
+| `FP` = `0xfffffff106ffcee0` | 内核栈帧 | `0xfffffff10…` 与 round122 的 `0xfffffff70b…` 同一量级 |
+
+⇒ 开枪的确实是 `drivers/ArmCpu/ArmCpu.cpp:624` 那个 `armcpu_timer_interrupts >= gClockPanic` 分支，不是别人冒名。附带地，`irq=0x13 phase=0x3` 说的是同一件事：`phase` 在 :621 被写成 3，也就是 `rtclock_intr()` 已经返回、正走到看门狗判断；round122 那帧是 `irq=0x3ff phase=0`（没有中断在处理中），因为那次 panic 是孩子在 EL1 里自己发起的，跟 tick 无关。`intid=0x13`=19 与 `armcpu-timer-intid=19` 一致；`typer=0x7b04f3` 不变；`ipi=0 sent=0` 仍然说明这块板上一个 IPI 都没到过。
+
+**样本这一侧，两个字段各自坏得很整齐。**
+
+`elr` / `elr2` = `0x100000b98`。本轮镜像（`build/clover-root/launchd.macho`，与刷进 `logfs` 的 `round123-scratch-data.img` 逐字节相同）`__TEXT` 在 `0x100000000`、无 slide，所以这就是 `_puts + 4`：
+
+```
+_write_console:                       _puts:
+  100000b48  mov x0, x22                100000b94  bl  _write_console
+  100000b4c  mov x16, #4  // write      100000b98  mov x1, #0xe0   ← 样本
+  100000b50  svc #0x80                  100000b9c  b.hs _fail
+  100000b54  ret                        100000ba0  ret
+```
+
+`objdump` 数过：全镜像八处 `bl _puts` 落在 `0x10000060c … 0x1000007d4`，全部在 `_mach_done`（`0x7f4`）之前，也就是 exec 之后那段只有 pid=2 会走的 mach 探针里；`_parent`（`0xa18`）出声只经 `_write_console` 与 `_print_dec`。所以被打断的线程只能是孩子，而样本给它的位置是「某次 write 的返回点」—— 八处共用同一个返回点，它连是哪一次 write 都说不清。
+
+关键在于这个「不巧」跨了两轮：round121 那帧的样本是 `0x100000b3c`，正是**那一版**镜像的 `_puts + 4`；本轮镜像的 `_puts` 整体后移了 `0x5c`，样本跟着后移 `0x5c`。随机采不到这种一致性，但**「读的是被阻塞那次调用的返回地址」能**：孩子停在 `_write_console` 的 `svc`（`0x100000b50`）里出不来，它挂在栈上的返回地址恰好是 `0x100000b98`。这样两帧不再互相打脸，而是同一件事的两种画法 —— 采样侧少算了一层帧。上一节把 `elr` 判成「不可信」，这一帧把它坏的方式钉准了：**它报的是「这次 write 该回到哪儿」，不是「孩子现在在哪儿」**，而按这个读法，它和六档阶梯完全吻合。
+
+`spsr` = `0xfffffff6e65dbd50` 则坏得更干脆：SPSR_EL1 的 `[63:32]` 是 RES0，`mrs` 不可能读出高 32 位全满的值；round121 那帧同格记的是 `0xffffffff14084cd50` —— 同样是「一长串 `f` 顶满高 32 位、低半截还多出第九位」的形状（那一帧也跨行折过，具体几位不必再较真），而那个量级看着更像内核指针而不是状态字。低四位仍是 0（EL0t），所以「中断打在用户态」这句结论没被推翻，但这一格除了 mode 之外不能再用。
+
+其余读数与既往同类：`pages=0x3af7e`（round121/122 那两帧是 `0x3af7c`，总页数在不同启动之间本来就会差几页）；`free=0x39527`，比 round121 第二帧的 `0x39530` 又少 9 页 —— 卡住一个孩子并没有让内核停摆，别的分配还在发生。`pmgr=0x5 status=0 mode=0x2`、`nub=0xfffffff8ffedc800 attached=0x1 registered=0x2`、`aon=0xffffffff=>0xffffffff` 与 round122 同型（`nub` 的地址每次启动都换）。`cnt0=124f800 cnt1=0 freq=124f800` 是 round82 那节记下的老缺陷，原样复现：`counter()` 在 panic 时读回 0，tick 周期仍然测不出来，18 分钟只能继续当候选。
+
+**round124 照旧，而且更值了。** 一次刷机只问一题：控制台此刻是不是对**所有人**都不再应答。父亲从阻塞 `wait4` 改成带截止时间的静默轮询，每若干轮 `_puts` 一句 `el0 init: waiting <n>`，到点用同一颗已证明能上屏的 `reboot(2)` 报 `clover-el0: parent deadline`。三值读数不变（心跳出现 ⇒ 卡的是那一次调用；只有 panic ⇒ 父亲绕开了 write；两者都没有 ⇒ 父亲也卡在 write 里）。新增一件顺手可做的：轮询体里直接 `mrs x0, cntvct_el0` —— 这块板上没有任何定时等待能返回（round77），而架构计数器的 EL0 读是另一条路；把它读到的值打进心跳行，第一次能同时给出「父亲等了多久」和「一个 tick 到底多长」。风险也写清楚：若 `CNTKCTL_EL1.EL0VCTEN` 没开，那条 `mrs` 在 EL0 是未定义指令，孩子会带 SIGILL 死掉 —— 而父亲的 `wait4` 会把它报出来，所以这条也不会变成静默失败。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

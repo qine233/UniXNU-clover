@@ -1564,6 +1564,21 @@ kernel_args = [
   # treat every `elr` from this instrument as untrusted until the sampling defect is fixed. Open
   # alternative: the photo may simply predate a slow return -- a second frame after the 60000-tick
   # deadline separates them without new bytes. See README's round123 section.
+  # The second frame arrived, on the same boot and the same bytes, and it is the watchdog's own panic at
+  # exactly `ticks=0xea60`. panic() keeps the first panic, so a deadline frame proves none of the six rungs
+  # was executed for the whole remaining life of the boot -- at round122's candidate ~18ms/tick that is
+  # minutes, not milliseconds, and the "photo predates a slow return" alternative is closed. The verdict is
+  # now permanent, not provisional. The frame also pins how the sampler is broken: elr=elr2=0x100000b98 is
+  # _puts+4 in *this* image (round121's sample was _puts+4 in *its* image, +0x5c earlier), i.e. it reports
+  # the return address of the write that is in flight rather than the PC the child is parked at -- the child
+  # is inside _write_console's svc at 0x100000b50 and the two frames agree perfectly under that reading.
+  # spsr=0xfffffff6e65dbd50 is broken outright: SPSR_EL1[63:32] is RES0, so mrs cannot return a value with
+  # the top half set; only its mode field (0 = EL0t) is still usable. The rest of the screen decodes clean
+  # -- RA = ArmCpu::interrupt().cold.2+0, LR = ArmCpu::interrupt()+0x280, fmt = the watchdog's own format
+  # cstring at __TEXT+0x12a7ec, irq=0x13/phase=3 = the branch taken right after rtclock_intr() returned.
+  # cnt0=124f800 cnt1=0 freq=124f800 reproduces the round82 defect verbatim, so the tick period is still
+  # unmeasured. See README's round123 second-frame section for the full transcription and the round124 plan
+  # (parent polls with an EL0 `mrs cntvct_el0` deadline, which is also the first way to time a tick).
   "armcpu-clock-panic=60000",
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board runs one CPU (no sheng-smp), while the driver's
