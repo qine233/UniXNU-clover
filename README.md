@@ -7079,6 +7079,62 @@ fastboot reboot
 
 `Warning: skip copying logfs image avb footer (logfs partition size: 0, …)` 仍然是分区表缺条目、不是写失败。一次刷机只回答一个问题：屏上那一句 `after write <名字>` 就是最后一次返回的 write 的名字。
 
+## round123 读数（v0.2.95 实机）：阶梯一档都没响 —— `msg=` 那次 write 停在里面
+
+整屏是一条连续的 console 日志，**没有 panic 屏**，最后一行是半行加光标块：
+
+```
+AppleImage4: magazine[cptx]: magazine data cannot be written: 30
+AppleImage4: magazine[zlne]: magazine write failed; may be expected: 30
+[System Event] [254410393] [INFO] [Subsystem: nvram] [Event: sync]
+IONVRAMCHRPHandler.cpp:serializeVariables:615 - No _nvramController
+IONVRAMCHRPHandler.cpp:sync:894 - serializeVariables failed, ret=0xe00002d8
+install_apfs_vfs_fs:8248: apfs: speculative telemetry feature ENABLED by boot-arg
+apfs_sysctl_register:1407: done registering sysctls.
+CloverBlock r121: refire n=2 (already ran)
+Added memory device md0/rd0 (03000000/0E000000) at FFFFFFF00839…
+Waiting on <dict ID="0"><key>IOProviderClass</key><string ID="1"…
+Got boot device = IOService:/ArmDTPlatform/CloverBlockDevice/IOB…
+BSD root: md0s39, major 1, minor 39
+vnode_create_internal: alias vnode (vid = 63544114) is in state (start) v_fflags = 0x828 v_numoutput = 0
+vnode_create_internal: alias vnode (vid = 63544114), ls in state (end) v_fflags = 0x828 v_numoutput = 0
+[clover] vfs_mountroot returned
+[clover] devfs_kernel_mount returned
+[clover] signit returned, execing init
+VM Swap Subsystem is ON
+No POST boot-arg set.
+load_init_program: attempting to load /usr/appleinternal/sbin/launchd
+load_init_program: attempting to load /sbin/launchd
+[clover] el0 init: pid=1 console fd=0 pagesize=4096
+[clover] el0 init: forked pid=2 x1=0
+[clover] el0 child: alive
+[clover] el0 child: pid=2 ppid=1 x0=2 x1=1
+[clover] el0 child: exec /sbin/launchd
+[clover] el0 init: pid=2 console fd=1 pagesize=4096
+[clover] el0 mach: thread=259 task=515 host=771
+[clover] el0 mach: reply=1027
+[clover] el0 mach: msg=▮
+```
+
+**先确认这是 round123 的字节在跑**，因为屏上没有任何 EL0 身份串可比。链条是：本轮 payload 里的 trust cache 只有**一个**条目 —— `422d125bc557cd0e…`，也就是 `round123-scratch-data.img` 的 cdhash（56 字节的 bundle 装一颗）；屏上有 `signit returned, execing init`、有 exec 之后的 `[clover] el0 child: exec /sbin/launchd` 和 exec 副本自己那句 `el0 init: pid=2 console fd=1`，说明 AMFI 放行了那次 exec。所以被 exec 的 `logfs` 字节只能是 round123 那颗镜像 —— 换成 round122 的会先撞上 `before write` 的 panic 屏，换成更早的会因 cdhash 不匹配而起不来。
+
+**于是六档阶梯的读数落在最空的一支：一档都没响。** 按本轮的读数表，这意味着 `msg=` 那 23 字节的 write **没有返回**。而它已经画出来了：屏上最后一行正是那 23 个字符，光标块停在 `msg=` 后面，地址和换行永远没跟上。
+
+这条结论的强度来自「返回了却不可能不响」的穷举：`bl _puts` 一返回，接下来是 `mov x1,#0xe0`、`b.hs _fail`、`ret`，然后就是档 1 那五条直线指令。
+
+- 若 write 返回且 carry 置起（errno），`_fail` 会走 `and x0,x0,#31 / add x23,x1,x0 / b _exit_now`，孩子带码退出 ⇒ 父亲那句阻塞 `wait4` 会醒，屏上必然多出 `el0 init: child …` 一行。没有。
+- 若 write 返回且无 errno，档 1 的 `svc #0x80` 就在眼前，round122 已经量过这条路径从 EL0 到 panic 屏只要约 10 秒。没有。
+- 若 `reboot(2)` 本身带 errno 返回，六档全返回才轮到 `_mach_done` 的 exit(11)，同样会叫醒父亲。没有。
+- 剩下的可能只有：那次 `write` 停在里面（或者孩子在 syscall 里被杀掉、根本没回到 EL0），两种都是「这次 write 没回来」。
+
+**round121 那处矛盾就此结掉，而且结在样本那一侧。** 那帧看门狗交出的 `elr=0x100000b3c` = `_puts + 4`，是「`bl _write_console` 已返回之后」的那条指令；本轮直接测 write 本身回没回来，答案是没回来。所以那个单点 `elr` 不是「孩子此刻在哪」的忠实读数 —— 看门狗的采样侧有缺陷，这条从本轮起算既定事实，任何后续 `elr` 读数都要按「不可信」处理，直到采样缺陷被单独修好。
+
+顺带两个新数据点：`reply=1027`（端口号每启动都不同，round84/122 读到的是 1827，无意义）；`BSD root: md0s39, major 1, minor 39` 与 `CloverBlock r121: refire n=2 (already ran)` 说明根仍然走 eMMC 的 39 号分区、块栈与固件侧一字未动 —— 本轮只换了 EL0 镜像。
+
+**一个还没排掉的解释：拍照时机。** 「write 停在里面」和「write 还在飞、照片拍早了」在这一帧里分不开。区分它不需要新固件：候选 tick 周期 ≈18 ms 下 60000 tick ≈ 18 分钟，看门狗到点会自己占屏（round121 第二帧证明它确实会）。所以**同一份 v0.2.95 复拍一张、间隔足够长**：如果屏变成看门狗 panic，那 `msg=` 那一刻起就一直没动，本帧结论从「没返回」升级成「永久卡死」；如果复拍出现某档 `after write …`，那才是「慢但会回来」，问题整体挪到父亲/exit 那一侧。
+
+**下一题（round124，仍然只改 EL0 镜像）：** 现在嫌疑人被钉在「第九次 console write 进去了、没出来」，而前八次同一个孩子、同一条路径都出来了。要切的是「**控制台是不是对所有人都不再应答**」—— 因为 `cons_write` 这类路径是串行的，如果第九次调用持着某把锁卡住，那么任何进程的下一次 write 都会一起卡。做法：父亲从 round78 的阻塞 `wait4` 改回**带截止时间的静默轮询**，每若干轮 `_puts` 一句 `el0 init: waiting <n>`，到点用同一颗已证明能上屏的 `reboot(2)` 报 `clover-el0: parent deadline`。读数三值：父亲的心跳行出现 ⇒ 控制台对别的进程还活着，卡的是那一次调用；心跳行没出现但 panic 上了屏 ⇒ 父亲没走 write 就到达了 deadline（还能顺带证明 panic 通道不受控制台影响）；心跳和 panic 都没有 ⇒ 父亲也卡在 write 里，控制台全局废了。一次刷机三值。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

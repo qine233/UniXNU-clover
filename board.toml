@@ -1556,6 +1556,14 @@ kernel_args = [
   # decodes against round122's image; against round123's the same helpers moved +0x40 -- _puts
   # 0x100000b94, _write_console 0x100000b48, _print_dec 0x100000b58 -- and the rungs are the six svc
   # sites listed by the [payload] trust_cache comment.
+  # Round123 read back: no panic screen at all, panel ending at the half line `[clover] el0 mach: msg=`
+  # with the cursor block. Not one rung fired, so the label write never came back -- and since the
+  # volume's trust cache carries exactly one cdhash (round123's image) and the post-exec banner printed,
+  # the exec'd bytes are provably this round's. That closes round121's contradiction against the
+  # watchdog's own sample: `_puts + 4` claims a returned write that the ladder says never returned, so
+  # treat every `elr` from this instrument as untrusted until the sampling defect is fixed. Open
+  # alternative: the photo may simply predate a slow return -- a second frame after the 60000-tick
+  # deadline separates them without new bytes. See README's round123 section.
   "armcpu-clock-panic=60000",
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board runs one CPU (no sheng-smp), while the driver's
