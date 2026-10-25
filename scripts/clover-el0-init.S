@@ -309,6 +309,17 @@
 // twenty-four numbered lines and exits, and the parent -- blocking in wait4 throughout, which is the
 // shape rounds 70-74 proved lets another process reach the screen -- prints B's wait status and then
 // waits for A. Read the four possible panels in _parent's comment above that fork.
+//
+// 125 photographed that fork's second frame and the answer was neither of the two shapes 124 offered:
+// at the watchdog's deadline the tty and the console are both vacant -- t_state carries neither
+// TS_SO_OLOWAT nor a cleared TS_CARR_ON, t_locked_thread is zero (and tty_lock stores it only after the
+// acquire, so zero means nobody holds it, hence nobody queues), the ring is empty with no reservation
+// out, and both console locks are free. The wedged write is therefore in the segment of write(2) above
+// the tty. 126 tests that from the other side, on the same fd, before the write: fstat64 goes through
+// this vnode and never through kmwrite, tty_lock or the ring, and its own reboot rung now terminates the
+// boot in seconds -- so the panel either carries `after fstat` (the vnode answers, the write chain does
+// not), an errno folded into the exit code (nothing is wedged), or only the watchdog (fstat is stuck
+// beside the write, and the block is in front of both). See the block above that probe for the bands.
 .text
 
 .global _start, _checkpoint
@@ -628,7 +639,8 @@ _start:
   // place there is now a ladder. Immediately after each write site below sits one
   // reboot(RB_PANIC|RB_QUICK, <a string naming the line that write belongs to>). panic() keeps the
   // first panic it is handed and stops the boot there, so exactly one string is ever drawn, and it
-  // names the last write that came back. Six rungs, in program order:
+  // names the last write that came back. Six rungs, in program order -- as of round 126 none of them is
+  // reachable, because the fstat rung below now fires first:
   //
   //   after write msg-label      the `msg=` label write came back and nothing after it did -- the
   //                              write the round121 watchdog sample (`_puts + 4`) pointed at.
@@ -647,6 +659,55 @@ _start:
   // And the empty reading is still on the table: no panic screen, only the clock watchdog, means the
   // first write of the ladder never returned. That is what round121's sample said, and with the
   // pre-write panic deleted it is now the only thing left standing.
+  //
+  // ---- round 126 (v0.2.98): a syscall on this fd that never enters the tty ----
+  //
+  // Round 125 read the tty and the console at the watchdog's deadline and found both vacant: TS_CARR_ON
+  // set (so tty.c:2489's "ttydcd" was never entered), TS_SO_OLOWAT clear one line below the only site
+  // that sets it (so neither was "ttywri"), t_locked_thread zero -- which means nobody holds the lock,
+  // because tty_lock() stores it *after* the acquire (tty.c:275-281) and tty_unlock() clears it *before*
+  // the release (:333), and a thread cannot be queued behind nobody --, the ring empty with wr == rd and
+  // nreserved 0, both console locks free, and neither suppress flag set. So the wedged write is in the
+  // segment above the tty: VNOP_WRITE's vnode lock, spec_write's cdevsw dispatch, or a uiomove fault.
+  //
+  // That exclusion was taken by reading state bits, and state bits only say "nobody is parked *here* at
+  // this instant". Cut the same question from the other side: ask this fd for something that goes through
+  // the vnode and never touches the tty at all. fstat64, index 339 (syscalls.master:520,
+  // `{ int sys_fstat64(int fd, user_addr_t ub); }`), reaches the same console vnode through specfs'
+  // VNOP_GETATTR -- no kmwrite, no t_lock, no console ring.
+  //
+  // The probe sits *ahead* of the suspect write, not after it, because the ladder is one-shot: reboot(2)
+  // with RB_PANIC stops the boot, so the first rung reached is the only string the panel ever draws and a
+  // rung placed after the wedge could never be reached by a process that is wedged. (That is also why a
+  // `getpid` control rung cannot be added beside this one -- whichever comes first wins and the other is
+  // unreachable.) Three readings, and two of them land in about ten seconds, which is the answer to
+  // eighteen minutes:
+  //
+  //   `userspace panic: clover-el0: after fstat`   fstat64 returned. The vnode answers a getattr from
+  //       the same thread, seconds before the write that does not, so the wedge belongs to the write
+  //       chain itself and not to the vnode in front of it. This rung then ends the boot, so the six
+  //       rungs below are unreachable this round -- the write is not re-observed, only contrasted.
+  //   `exit status 64 + (errno & 31)`              fstat64 came back *with* an errno (stage 18 * 32 =
+  //       576, whose low byte the parent's decode now passes through), so nothing is wedged and the
+  //       console has been reporting errors, not blocking. 78 (ENOSYS) & 31 = 14 -> 78 means the probe
+  //       is inert; 9 (EBADF) & 31 = 9 -> 73 means x22 is not the fd it claims to be.
+  //   neither, the watchdog frame only             fstat64 is stuck too -> the block is in front of the
+  //       tty and in front of the write's own work: the vnode lock or the spec dispatch.
+  mov x0, x22                       // the console fd, opened at stage 3
+  adrp x1, _statbuf@PAGE
+  add x1, x1, _statbuf@PAGEOFF
+  mov x16, #339                     // SYS_fstat64
+  svc #0x80
+  mov x1, #576                      // stage 18 * 32
+  b.cs _fail
+
+  // Rung 0: the getattr came back clean. Say so and stop here.
+  adrp x1, _w_fstat@PAGE
+  add x1, x1, _w_fstat@PAGEOFF
+  mov x0, #0xc00                      // RB_PANIC | RB_QUICK
+  mov x16, #55                        // reboot(int opt, char *msg)
+  svc #0x80
+
   // "[clover] el0 mach: msg=<address>": where the buffer actually is.
   adrp x1, _mach_msg@PAGE
   add x1, x1, _mach_msg@PAGEOFF
@@ -1179,12 +1240,9 @@ _parent:
   // panel. Those two readings need different next cuts, and right now the boot cannot
   // tell them apart, because there is no second writer left alive to ask.
   //
-  // So B is one: forked by the parent, inheriting the same open fd in x22, writing
-  // twenty-four numbered lines and then exiting. The parent stays inside a *blocking*
-  // wait4 the whole time, which rounds 70-74 proved is what lets other processes run and
-  // rounds 76-77 proved a polling parent prevents. Nothing in this round calls reboot(2),
-  // so the clock watchdog keeps its deadline and still fires: an unclaimed panel gets a
-  // second reading for free, and the panic screen cannot be stolen by our own rung.
+  // So B is one: forked by the parent, inheriting the same open fd in x22, writing twenty-four numbered
+  // lines and then exiting. The parent stays inside a *blocking* wait4 the whole time, which rounds
+  // 70-74 proved is what lets other processes run and rounds 76-77 proved a polling parent prevents.
   //
   //   b1..b24 plus `prober status=`   the console answers another writer. The wedge is
   //       per-call, not per-console, and the next cut goes inside that one write.
@@ -1195,65 +1253,36 @@ _parent:
   //   b lines absent, `prober status=5`  every one of B's writes returned without an
   //       errno and none of them painted -- output is being dropped, not blocked.
   //
-  // B's failure exits carry `_puts`' own stage (224 + errno), and the parent reads the
-  // raw wait status off the panel, so "a write failed with an errno" is a fourth,
-  // different-looking number rather than a missing one.
+  // Round 125 read that first row and round 126 keeps B for it: the b stream is still the control group
+  // that says "the console answers somebody else after A stopped". Two of the four rows are no longer
+  // available, both because of what changed elsewhere -- the parent's wait moved behind A, so nothing
+  // reaps B and `prober status=` can never print (B's failure codes, `_puts`' stage 224 + errno, are now
+  // unreportable and have to be inferred from where the b stream stops), and because round 126 *does*
+  // call reboot(2), from the fstat rung in A, so a clean fstat steals the panel from the watchdog and
+  // the "watchdog only" row is only the reading when that rung never fires.
   mov x16, #2                         // SYS_fork, again -- this time from the parent
   svc #0x80
-  mov x20, x0                         // B's pid, in both processes
   mov x21, x1                         // 1 in B, 0 here
   mov x1, #192
   b.cs _fail
   cmp x21, #1
   b.eq _prober
 
-  // Wait for B, and for nothing else: A is still the process being observed, and this
-  // call must not be the thing that ends the round. WUNTRACED for the same reason the
-  // wait below uses it -- a stopped B is a reading, not a reason to sleep forever.
-  mov x0, x20
-  adrp x1, _scratch@PAGE
-  add x1, x1, _scratch@PAGEOFF
-  mov x2, #2
-  mov x3, #0
-  mov x16, #7                         // SYS_wait4
-  svc #0x80
-  b.cs _wait_error
-  cbnz x0, _prober_report
-  b _checkpoint
-
-_prober_report:
-  // B is gone. Its status is read here rather than carried in an exit code because the
-  // exit code reaches this panel only as eight bits through the panic screen, while the
-  // status is a number the console can print in full -- and whether *this* print lands is
-  // itself part of the reading: it is a write by a process that has already succeeded at
-  // writes on this panel, made after B's whole stream.
-  adrp x0, _scratch@PAGE
-  add x0, x0, _scratch@PAGEOFF
-  ldr x21, [x0]                       // B's pid is no longer wanted; x21 is free here
-  adrp x1, _prober_status@PAGE
-  add x1, x1, _prober_status@PAGEOFF
-  adrp x2, _prober_status_end@PAGE
-  add x2, x2, _prober_status_end@PAGEOFF
-  sub x2, x2, x1
-  bl _write_console
-  mov x1, #128
-  b.cs _fail
-  mov x0, x21
-  bl _print_dec
-  mov x1, #128
-  b.cs _fail
-  adrp x1, _newline@PAGE
-  add x1, x1, _newline@PAGEOFF
-  adrp x2, _newline_end@PAGE
-  add x2, x2, _newline_end@PAGEOFF
-  sub x2, x2, x1
-  bl _write_console
-  mov x1, #128
-  b.cs _fail
-
-  // Only now wait for A, exactly as round 78 made this parent do it. If the console
-  // lives, the panel's tail is B's stream and this line; if it does not, the watchdog's
-  // panic is the last thing to touch the screen either way.
+  // ---- round 126 (v0.2.98): wait for A, not for B ----
+  //
+  // Round 124 put a blocking wait4 on B here, and it is the reason round124's fourth reading -- `prober
+  // status=` with the b lines absent -- could not be told apart from a parent that never woke: B dies in
+  // seconds, A never does, so whichever child changes state first is always B and the parent's report is
+  // spent on the witness rather than on the suspect. Round 126's second reading needs the parent parked
+  // behind A: if the fstat probe comes back with an errno, A leaves through _fail, and the only way that
+  // reaches a photograph is a wait4 that wakes for A. So this call waits on x19 and the prober's report
+  // is gone -- `_prober` itself stays, because B's twenty-four lines on the panel are the control group
+  // for "the console still answers somebody else after A stopped", and that reading needs no reaping.
+  // What round 126 cannot say is B's wait status: it is a zombie nobody collects, which costs nothing
+  // here because the exit code it would have carried is a number, not a glyph.
+  //
+  // WUNTRACED for the reason the round80 note below gives: a stopped A is a reading, not a reason to
+  // sleep forever.
   //
   // ---- round 76: the parent polls without writing a single character ----
   //
@@ -1399,6 +1428,9 @@ _wait_reaped:
   //         for the wait4 error path above, whose stage*32 happens to land there.
   //   96+N  WUNTRACED still asks for stops; nothing stops this round, so 96+17 = 113
   //         would mean the child blocked in a SIGSTOP it never asked for.
+  //   64+e  round 126: A left through the fstat probe with errno e (e = errno and-31, stage 18 * 32 =
+  //         576, whose low byte is this band). The pass-through below is what makes it readable; every
+  //         other _fail stage still folds into 1.
   //   no panic screen   the child reached none of the above: the write blocks with the
   //         clock running, so no wake-up is missing and the block is inside the tty
   //         output path -- the next cut goes in there.
@@ -1406,6 +1438,18 @@ _wait_reaped:
   cbnz x0, _not_exited
   lsr x24, x24, #8
   and x24, x24, #0xff               // WEXITSTATUS of the child
+
+  // Round 126's pass-through: the fstat probe leaves with stage 18 * 32 = 576 plus errno and-31, whose
+  // low byte lands in 64..95, a band none of the other codes can reach. Hand it to the panic screen
+  // whole, because "which errno" is the difference between the probe being a measurement (ENOTDIR, EFAULT)
+  // and being inert (ENOSYS 78 & 31 = 14 -> 78, EBADF 9 -> 73). Any other code stays the coarse 1.
+  cmp x24, #64
+  b.lt _not_fstat_band
+  cmp x24, #95
+  b.gt _not_fstat_band
+  mov x23, x24
+  b _exit_now
+_not_fstat_band:
   cmp x24, #448
   b.ne _exited_other
   mov x23, #0
@@ -1454,9 +1498,9 @@ _prober_loop:
   bl _print_line
   b _prober_loop
 _prober_done:
-  // 5, not 0: the parent prints this number through the console, and a code that some
-  // other path could also produce would make "B wrote all twenty-four" depend on which
-  // stage failed instead of on the count on the panel.
+  // 5, not 0: a code that some other path could also produce would make "B wrote all twenty-four" depend
+  // on which stage failed instead of on the count on the panel. Since round 126 nobody reaps B, so this
+  // code reaches a photograph only if a later round puts a wait back on it.
   mov x0, #5
   mov x16, #1                         // SYS_exit
   svc #0x80
@@ -1595,15 +1639,13 @@ _forked_end:
 _forked_mid:
   .ascii " x1="
 _forked_mid_end:
-// Round 124's two additions. `_prober_mark` is the line head B writes before each of its
-// twenty-four numbers, and `_prober_status` is the parent's one line about B. Neither sits
-// between a label and its `_end`, so no computed write length changes.
+// Round 124's addition, still live: `_prober_mark` is the line head B writes before each of its
+// twenty-four numbers. Round 126 deleted its partner `_prober_status` along with the parent's report --
+// the parent now parks behind A, so B's stream is read off the panel and not reaped. Neither string ever
+// sat between a label and its `_end`, so no computed write length changed.
 _prober_mark:
   .ascii "[clover] b"
 _prober_mark_end:
-_prober_status:
-  .ascii "[clover] el0 init: prober status="
-_prober_status_end:
 _alive:
   .ascii "[clover] el0 child: alive\n"
 _alive_end:
@@ -1671,6 +1713,11 @@ _w_m2_rcv:
   .asciz "clover-el0: after write m2-rcv-line"
 _w_probe_done:
   .asciz "clover-el0: after write probe-done"
+// Round 126's rung, and the only one of the ladder this round can reach: it sits ahead of the `msg=`
+// label write because the ladder stops the boot at the first rung, and a rung placed after the wedged
+// write could not be reached by the process that is wedged.
+_w_fstat:
+  .asciz "clover-el0: after fstat"
 _m2_presend:
   .ascii "[clover] el0 m2: presend\n"
 _m2_presend_end:
@@ -1705,3 +1752,10 @@ _newline_end:
 .balign 8
 _numbuf:
   .space 24
+.balign 8
+// Round 126's fstat64 destination. struct stat is 152 bytes in this ABI (bsd/sys/stat.h, and this
+// kernel is 64-bit-inode-only), so 256 leaves room to spare and the copyout cannot run off the end of
+// the section. It is last in .data on purpose: every label-difference length this file computes at run
+// time is a distance inside .data, and nothing may be inserted between a `.ascii` label and its `_end`.
+_statbuf:
+  .space 256

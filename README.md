@@ -7390,15 +7390,47 @@ irq=0x0000000000000013 phase=0x0000000000000003 intid=0x000000000000
 
 ### round126 的问题：同一颗 fd 上，一颗不进 tty 的 syscall 回不回得来
 
-上面那张表把 tty 和 console 都排掉了，但排掉的方式是「读状态位」，状态位只能说明「那一刻没人在这」。要钉死，得从**另一侧**再切一次：让 A 在 `msg=` 标签 write 之后、第一档 `reboot` 之前，插一颗 `fstat64(1, buf)`（`syscalls.master:520` 的 339 号；`specfs` 的 `VNOP_GETATTR`，全程不进 `kmwrite`、不进 tty、不进 ring）。
+上面那张表把 tty 和 console 都排掉了，但排掉的方式是「读状态位」，状态位只能说明「那一刻没人在这」。要钉死，得从**另一侧**再切一次：让 A 在 `msg=` 标签 write **之前**插一颗 `fstat64(fd, buf)`（`syscalls.master:520` 的 339 号，`{ int sys_fstat64(int fd, user_addr_t ub); }`；走 `specfs` 的 `VNOP_GETATTR`，全程不进 `kmwrite`、不进 tty、不进 ring），后面紧跟一档自己的 `reboot(RB_PANIC|RB_QUICK, "clover-el0: after fstat")`。
+
+排在**前面**而不是后面，是这架梯子的形状决定的：`reboot` 一响就停住启动，先到的那一档就是屏上唯一的那句话（first-panic-wins），所以放在卡死之后的 rung 永远等不到人走到它 —— 同一个理由也否掉了「在旁边再加一颗 `getpid` 对照档」的想法。
 
 读数三值，互斥，而且**两值几秒就能拍**，正好接住「等十八分钟太久了」：
 
-- 屏上出现 `userspace panic: clover-el0: after fstat` ⇒ `fstat64` 回来了 ⇒ 这颗 vnode 在 write 之外是活的 ⇒ 卡点确实只在 write 自己那条链上，**那就要回头怀疑本轮这套状态位的读法**。
-- 屏上出现 `exit status <N>` ⇒ A 带着 errno 退出了（`_fail` 那条路），没有任何人卡住，是**字在被丢/在报错**，不是被堵住。这一支要父亲先等 A 才报得出来，见下。
+- 屏上出现 `userspace panic: clover-el0: after fstat` ⇒ `fstat64` 回来了 ⇒ 同一个线程、同一颗 fd、几秒之差，getattr 答了而 write 不答 ⇒ 卡点属于 write 自己那条链，不是它前面那颗 vnode。**代价：这一档把本轮的其余六档全挡死了，write 本轮不再被重新观察，只是被对照。**
+- 屏上出现 `exit status <64+e>` ⇒ A 带着 errno 退出了（`_fail` 那条路），没有任何人卡住，是**报错/丢字**，不是被堵住。`e = errno & 31`（探针的失败 stage 是 18×32=576，屏上读到的低字节就是 64+e）：78（ENOSYS 78&31=14）意味着 339 号在这台内核里是空的，本轮读数作废；73（EBADF）意味着 x22 不是它自称的那颗 fd。这一支要父亲先等 A 才报得出来，见下。
 - 两者都没有，只有看门狗那一帧 ⇒ `fstat64` 也停在里面 ⇒ **卡点在 tty 之前**，就是那颗 vnode 锁或者它的派发链。
 
-配套只改一处：父亲现在先 `wait4(B)`（`_parent` 里 round124 加的那颗），A 万一从 `_fail` 退出，父亲永远看不见 —— 第二值就废了。所以本轮把顺序倒回来：**先等 A**（醒来照 round80 的老规矩一颗字都不写、直接 `exit`，让 panic 屏去报 `exit status`），再等 B。B 的二十四行 `[clover] b<n>` 留在原位当**对照组**：`b1..b24` 全上屏就说明控制台在 A 停住之后仍然答了二十四次。
+配套改的两处都在父亲身上。第一，`_parent` 的等待顺序倒回来：**只等 A**（`mov x0, x19`），醒来照 round80 的老规矩一颗字都不写、直接 `exit`，让 panic 屏去报 `exit status`。round124 挂在原地的 `wait4(B)` 被删掉了 —— B 几秒就死、A 永远不死，所以「谁先变更状态」永远轮到 B，父亲那份报告花在证人身上而不是嫌疑人身上了；`_prober_status` 那行字随之删除，本轮也一并读不到 B 的 wait status。B 本身留在原位，`b1..b24` 上屏仍然是「控制台在 A 停住之后还答了二十四次」的对照组，只是判据从「有没有 `prober status=`」改成「b 流停在第几行」。第二，`_wait_reaped` 的解码加了一条通道：A 的退出码落在 64..95 时原样透传，不再折成粗读的 `1`，否则第二值只剩「A 从 `_fail` 走了」这一句，分不清是哪颗 errno。
+
+## v0.2.98（round126）：把 `fstat64` 插到那次 write 前面，并让父亲只等 A
+
+只改 `scripts/clover-el0-init.S`，四处：
+
+1. A 在 `msg=` 标签 write 之前多了一段：`fstat64(x22, _statbuf)`（`x16=#339`）→ `mov x1,#576`（stage 18×32）→ `b.cs _fail`，紧跟一档 `reboot(0xc00, "clover-el0: after fstat")`。镜像里 `svc` 分别在 `0x100000608`（fstat64）和 `0x100000624`（这一档的 reboot），被试的那次 `bl _puts` 在 `0x10000063c`。
+2. `.data` 尾部新增 `_statbuf: .space 256`（`struct stat` 在这个 ABI 里 152 字节，`bsd/sys/stat.h`；原来的 `_scratch` 只有 8 字节，装不下）。放在整个 `.data` 最后，是因为本文件所有写长度都是运行期算的标签差，任何 `.ascii` 与它的 `_end` 之间都不许插东西。
+3. 父亲删掉 `wait4(B)` 与 `_prober_report`，fork 之后一路落到原来的 `mov x0, x19` 那颗阻塞 `wait4`，醒来仍然一个字不写、直接 `exit`。`_prober_status` 那串字符随之删除，`_parent` 里那条 `mov x20, x0`（B 的 pid）成了死码也一并删；B 本身、`_prober_mark`、`b1..b24` 全留作对照组。
+4. `_wait_reaped` 的解码加一条通道：A 的退出码落在 64..95 时原样透传（`_not_fstat_band`），其余仍折成 `1`。屏上 `exit status 64+e`，`e = errno & 31`（`_fail` 的 `and x0, x0, #31`）。
+
+本轮镜像的座标表（对象地址 +0x380 = 镜像地址；helper 相对 round125 整体下移 0x40，因为 `_parent` 里删掉的 `_prober_report` 正好 64 字节，而新探针那 ~48 字节被 `_parent` 之后的删除抵消了）：`_parent` `0x100000a48`、`_wait_reaped` `0x100000b18`、`_not_fstat_band` `0x100000b4c`、`_prober` `0x100000b88`、`_fail` `0x100000be0`、`_write_console` `0x100000bf0`（它的 `svc` 在 `0xbf8`）、`_print_dec` `0x100000c00`、`_puts` `0x100000c3c`、`_print_line` `0x100000c4c`、`_mheader` `0x100000c7c`。**如果看门狗仍然占屏，`elr` 该读 `0x100000c40`（= `_puts + 4`）而不是上一轮的 `0xc80`** —— 这一格本轮是可证的：`elr` 若是陈旧值就仍落在别处，若是活的样本就必然跟着镜像移动。
+
+```
+cd ~/UniXNU-clover && python3.13 scripts/make-clover-root.py   # 35888 B, sha256 614b8356…, cdhash 4f63be63…
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && scripts/verify-clover-payload.py
+```
+
+归档在 `~/clover-out/round126-*`（`round126-SHA256SUMS`）：payload `0c23f1d5…`；卷内 `kernel.macho` 仍是 `5beb1f97…`，与 round125 逐字节相同（本轮没动内核也没动 panic 屏）；`scratch-data.img` `614b8356…`（变了，EL0 换了）；信任缓存 `c3ed2152…`（变了，钉的是那颗 cdhash）；ADT `53c65564…`（每轮都变，`make-clover-adt.py` 重画 random-seed）。**本轮要刷两格：`logfs`（第 39 格，exec 的根镜像换了）和 `cache`（负载 + 信任缓存）。** 这两条命令都要写 eMMC 分区，请你自己确认后执行；boot 仍不碰（还是 round87 那份）：
+
+```
+fastboot flash logfs /Users/zhouzhou/clover-out/round126-scratch-data.img   # 35888 B，614b8356…
+fastboot flash cache /Users/zhouzhou/clover-out/round126-payload.img
+```
+
+冷刷，不用 `fastboot boot`。开机认出菜单第一行的 `clover r126:`，然后**几十秒内**就该看到答案：屏上是 `userspace panic: clover-el0: after fstat` 还是 `exit status <64+e>`；两个都没有才需要等到 ≈18 分钟的看门狗那一帧（那一帧仍然读 round125 那六行，顺便验证 `elr` 是否跟着镜像移到了 `0xc40`）。拍照注意：panic 块连标题占 19 行，会把屏上半截旧日志和 EL0 尾部盖掉，所以第一帧（引导日志停在哪儿的那张）也顺手拍。
 
 ## 有意省略的部分
 
