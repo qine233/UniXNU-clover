@@ -7133,7 +7133,7 @@ load_init_program: attempting to load /sbin/launchd
 
 **一个还没排掉的解释：拍照时机。** 「write 停在里面」和「write 还在飞、照片拍早了」在这一帧里分不开。区分它不需要新固件：候选 tick 周期 ≈18 ms 下 60000 tick ≈ 18 分钟，看门狗到点会自己占屏（round121 第二帧证明它确实会）。所以**同一份 v0.2.95 复拍一张、间隔足够长**：如果屏变成看门狗 panic，那 `msg=` 那一刻起就一直没动，本帧结论从「没返回」升级成「永久卡死」；如果复拍出现某档 `after write …`，那才是「慢但会回来」，问题整体挪到父亲/exit 那一侧。
 
-**下一题（round124，仍然只改 EL0 镜像）：** 现在嫌疑人被钉在「第九次 console write 进去了、没出来」，而前八次同一个孩子、同一条路径都出来了。要切的是「**控制台是不是对所有人都不再应答**」—— 因为 `cons_write` 这类路径是串行的，如果第九次调用持着某把锁卡住，那么任何进程的下一次 write 都会一起卡。做法：父亲从 round78 的阻塞 `wait4` 改回**带截止时间的静默轮询**，每若干轮 `_puts` 一句 `el0 init: waiting <n>`，到点用同一颗已证明能上屏的 `reboot(2)` 报 `clover-el0: parent deadline`。读数三值：父亲的心跳行出现 ⇒ 控制台对别的进程还活着，卡的是那一次调用；心跳行没出现但 panic 上了屏 ⇒ 父亲没走 write 就到达了 deadline（还能顺带证明 panic 通道不受控制台影响）；心跳和 panic 都没有 ⇒ 父亲也卡在 write 里，控制台全局废了。一次刷机三值。
+**下一题（round124，仍然只改 EL0 镜像）：** 现在嫌疑人被钉在「第九次 console write 进去了、没出来」，而前八次同一个孩子、同一条路径都出来了。要切的是「**控制台是不是对所有人都不再应答**」—— 因为 `cons_write` 这类路径是串行的，如果第九次调用持着某把锁卡住，那么任何进程的下一次 write 都会一起卡。做法：父亲从 round78 的阻塞 `wait4` 改回**带截止时间的静默轮询**，每若干轮 `_puts` 一句 `el0 init: waiting <n>`，到点用同一颗已证明能上屏的 `reboot(2)` 报 `clover-el0: parent deadline`。读数三值：父亲的心跳行出现 ⇒ 控制台对别的进程还活着，卡的是那一次调用；心跳行没出现但 panic 上了屏 ⇒ 父亲没走 write 就到达了 deadline（还能顺带证明 panic 通道不受控制台影响）；心跳和 panic 都没有 ⇒ 父亲也卡在 write 里，控制台全局废了。一次刷机三值。（这条计划里「静默轮询 + deadline panic」那半截在动手前被推翻，见下面 v0.2.96 那节的第一段：`sched_yield` 在本树是 nosys，轮询体没法让步；发出去的是第二个写者，不是心跳。）
 
 ## round123 读数·第二帧（同一份 v0.2.95，等到看门狗自己占屏）：整个剩余寿命里一档都没响 —— 「拍早了」排掉
 
@@ -7200,7 +7200,35 @@ _write_console:                       _puts:
 
 其余读数与既往同类：`pages=0x3af7e`（round121/122 那两帧是 `0x3af7c`，总页数在不同启动之间本来就会差几页）；`free=0x39527`，比 round121 第二帧的 `0x39530` 又少 9 页 —— 卡住一个孩子并没有让内核停摆，别的分配还在发生。`pmgr=0x5 status=0 mode=0x2`、`nub=0xfffffff8ffedc800 attached=0x1 registered=0x2`、`aon=0xffffffff=>0xffffffff` 与 round122 同型（`nub` 的地址每次启动都换）。`cnt0=124f800 cnt1=0 freq=124f800` 是 round82 那节记下的老缺陷，原样复现：`counter()` 在 panic 时读回 0，tick 周期仍然测不出来，18 分钟只能继续当候选。
 
-**round124 照旧，而且更值了。** 一次刷机只问一题：控制台此刻是不是对**所有人**都不再应答。父亲从阻塞 `wait4` 改成带截止时间的静默轮询，每若干轮 `_puts` 一句 `el0 init: waiting <n>`，到点用同一颗已证明能上屏的 `reboot(2)` 报 `clover-el0: parent deadline`。三值读数不变（心跳出现 ⇒ 卡的是那一次调用；只有 panic ⇒ 父亲绕开了 write；两者都没有 ⇒ 父亲也卡在 write 里）。新增一件顺手可做的：轮询体里直接 `mrs x0, cntvct_el0` —— 这块板上没有任何定时等待能返回（round77），而架构计数器的 EL0 读是另一条路；把它读到的值打进心跳行，第一次能同时给出「父亲等了多久」和「一个 tick 到底多长」。风险也写清楚：若 `CNTKCTL_EL1.EL0VCTEN` 没开，那条 `mrs` 在 EL0 是未定义指令，孩子会带 SIGILL 死掉 —— 而父亲的 `wait4` 会把它报出来，所以这条也不会变成静默失败。
+**round124 照旧，而且更值了。** 一次刷机只问一题：控制台此刻是不是对**所有人**都不再应答。父亲从阻塞 `wait4` 改成带截止时间的静默轮询，每若干轮 `_puts` 一句 `el0 init: waiting <n>`，到点用同一颗已证明能上屏的 `reboot(2)` 报 `clover-el0: parent deadline`。三值读数不变（心跳出现 ⇒ 卡的是那一次调用；只有 panic ⇒ 父亲绕开了 write；两者都没有 ⇒ 父亲也卡在 write 里）。新增一件顺手可做的：轮询体里直接 `mrs x0, cntvct_el0` —— 这块板上没有任何定时等待能返回（round77），而架构计数器的 EL0 读是另一条路；把它读到的值打进心跳行，第一次能同时给出「父亲等了多久」和「一个 tick 到底多长」。风险也写清楚：若 `CNTKCTL_EL1.EL0VCTEN` 没开，那条 `mrs` 在 EL0 是未定义指令，孩子会带 SIGILL 死掉 —— 而父亲的 `wait4` 会把它报出来，所以这条也不会变成静默失败。（这一段的两条都被否掉了：`sched_yield` 在本树是 nosys，「带截止时间的静默轮询」做不成让步轮询；`mrs cntvct_el0` 的可用性取决于 `_enable_timebase_event_stream()` 是否为本板置了 `CNTKCTL_EL1.PL0VCTEN`，而它只在 `user_timebase_type() != USER_TIMEBASE_NONE` 时置位 —— 本核没走到那条分支。发出去的 round124 因此不问时间，只另起一个写者；见下面 v0.2.96 那节。）
+
+## v0.2.96（round124）：再 fork 一个只写控制台的探子
+
+上面两段写的 round124 计划在动手前被推翻了两处，先记账，再写真正发出去的东西 —— 因为「计划」如果只留在段落里，下一轮读数就会去解一颗根本没上屏的 panic。
+
+第一处：`sched_yield` 在这棵树里不存在。`bsd/kern/syscalls.master` 的 326 号是 `{ int nosys(void); }`，所以「让步轮询」里那句让出 CPU 的调用会变成一次 nosys 返回 EINVAL 的 svc —— 轮询体照样是热的，round76-77 那两轮的饿死问题一点没解决。第二处更硬：`mrs x0, cntvct_el0` 在 EL0 是否可用取决于 `CNTKCTL_EL1.PL0VCTEN`，而这棵树里只有 `_enable_timebase_event_stream()`（`osfmk/arm64/machine_routines.c:2380`）在 `user_timebase_type() != USER_TIMEBASE_NONE` 时才置这一对位（:488-497 按 `HAS_ACNTVCT` / `__ARM_ARCH_8_6__` 三分支返回 NOSPEC_APPLE / NOSPEC / SPEC），本板的 dtb 没走到那条路上。于是「顺手量 tick 周期」这条也拿掉了 —— 它原本只是搭车，不该拿主问题陪绑。
+
+发出去的 round124 不问时间，只问**还有没有人写得动**。`_parent` 在 `forked pid=…` 那句横幅之后立刻 `fork()` 出 B（x20=B 的 pid，x21 分岔，B 走 `_prober`），B 只做一件事：二十四个 `[clover] b<n>` 行，写完 `exit(5)`。父亲全程留在**阻塞** `wait4` 里 —— 先等 B，醒来把 `[clover] el0 init: prober status=<原始 wait 状态>` 打上屏，再落回 round78 那颗等 A 的 `wait4`。本轮没有任何 `reboot(2)`，所以六档阶梯照旧在 A 身上、看门狗仍会在 60000 tick 自己占屏。
+
+读数四值，全部来自同一张照片：
+
+- 屏上有 `b1`…`b24` 和 `prober status=1280`（5<<8）⇒ 另一个进程照样能把字打上去，卡的是那一次调用本身，不是控制台；下一刀切进 `msg=` 那次 write 的内侧。
+- `b1`…`b<k>`（k<24）之后就没了、也没有 prober 行 ⇒ 控制台答了 k 行之后不再接受写者，屏上的编号指名它是在哪一行接管的。
+- 一行 `b` 都没有，只剩看门狗那帧 ⇒ B 第一次 write 就没回来。这一支残留一个二义：「B 卡在 tty 里」和「B 从没被调度」在屏上长得一样；前者才是主嫌疑，因为父亲这四个轮次一直是阻塞 `wait4`，round70-74 证明过这个形状下别的进程能跑。
+- `b` 行不在但 `prober status=` 出现了，且值是 `(224+errno)<<8` ⇒ B 的 write 是带着 errno 返回的：控制台没堵住，是在丢字。
+
+`b` 行的编号还顺带治了 round123 那张照片的一处不便：`elr` 不可信，而 B 的行是**自己报自己到哪**，不依赖任何采样。
+
+本轮要写两颗 eMMC 分区，冷刷，绝不 `fastboot boot`：
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round124-payload.img
+fastboot flash logfs /Users/zhouzhou/clover-out/round124-scratch-data.img   # 35888 B，efb2cd85…，exec 的就是这份
+```
+
+`cache` 必须重刷：`trust_cache_sha256` 换成了 32508dc5…（B 的新代码改了 cdhash），而音量里的信任缓存只有一份，`logfs` 上的根镜像 cdhash 对不上就是下一颗 exec 失败。kernel.macho 仍是 559ab032…，与 round123 逐字节相同。boot 仍是 round87-boot.img，本轮不动。
+
+拍两张：一张尽快，一张等看门狗那帧自己占屏（≈18 分钟）—— 本轮没有任何 `reboot(2)`，所以第二张必然有 panic 屏，它顺带给出「B 到底有没有走完」的第二个坐标。
 
 ## 有意省略的部分
 

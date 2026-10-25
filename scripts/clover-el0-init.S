@@ -295,6 +295,20 @@
 // port puts a character on the panel from EL0, and the banner it writes is the
 // payload of this round: pid, the fd the open returned, and the page size the
 // sysctl read back.
+//
+// Rounds 122-124 are the arc that runs from that sentence to this image. 122 proved the tty-free
+// channel: reboot(RB_PANIC|RB_QUICK) from EL0 reaches panic_kernel(), and the panic screen draws the
+// string it was handed (README's round122 section decodes RA/LR/fmt for it). 123 spent that proof as
+// an instrument -- six rungs, one reboot(2) after each of the probe's writes -- and every rung came
+// back silent, including the first, whose label is the half line the panel ends on. Its second frame,
+// taken at the watchdog's own deadline rather than early, made that permanent and showed the sampler
+// reports the in-flight write's return address rather than the parked PC. So the one thing still open
+// is the scope of the wedge: A is inside a write, and the suspects are of two kinds -- a lock held
+// across the block, which takes the console from every later writer, or a block inside the call,
+// which does not. Round 124 answers it with a process rather than a clock: pid 1 forks B, B writes
+// twenty-four numbered lines and exits, and the parent -- blocking in wait4 throughout, which is the
+// shape rounds 70-74 proved lets another process reach the screen -- prints B's wait status and then
+// waits for A. Read the four possible panels in _parent's comment above that fork.
 .text
 
 .global _start, _checkpoint
@@ -1145,6 +1159,102 @@ _parent:
   mov x1, #128
   b.cs _fail
 
+  // ---- round 124 (v0.2.96): a second writer, on its own, while A is wedged ----
+  //
+  // Round 123's ladder says one thing and says it with the loudest instrument this port
+  // has: none of the six reboot(2) rungs fired, not even the first, whose write is the
+  // `msg=` label that the panel shows painted and un-newlined. Re-photographing at the
+  // watchdog's own deadline closed the alternative that a slow return had simply been
+  // photographed too early. So the exec'd child is inside a write that never came back,
+  // and the panel's last half line is where it went in.
+  //
+  // What that does *not* settle is whose console is broken. The blocked thread is one
+  // thread inside one syscall, and the suspects are of two kinds. If the wedge is a
+  // held lock -- vcputc's lck_ticket_t (video_console.c:153) or serial_ring's write lock,
+  // both unbounded spins -- then a thread parked inside the tty while holding the ticket
+  // takes the console away from every later writer, and no other process can print again
+  // for the rest of the boot. If instead the wedge is inside the call -- the tty waiting
+  // on an event that the clock cannot deliver, a wakeup nobody ever performs -- then the
+  // lock is never held across it, and an unrelated process can still put glyphs on the
+  // panel. Those two readings need different next cuts, and right now the boot cannot
+  // tell them apart, because there is no second writer left alive to ask.
+  //
+  // So B is one: forked by the parent, inheriting the same open fd in x22, writing
+  // twenty-four numbered lines and then exiting. The parent stays inside a *blocking*
+  // wait4 the whole time, which rounds 70-74 proved is what lets other processes run and
+  // rounds 76-77 proved a polling parent prevents. Nothing in this round calls reboot(2),
+  // so the clock watchdog keeps its deadline and still fires: an unclaimed panel gets a
+  // second reading for free, and the panic screen cannot be stolen by our own rung.
+  //
+  //   b1..b24 plus `prober status=`   the console answers another writer. The wedge is
+  //       per-call, not per-console, and the next cut goes inside that one write.
+  //   b1..b<k>, k < 24, no status     the console answered k lines and then stopped
+  //       taking writers -- the panel names the line where it took hold.
+  //   nothing, watchdog only          B blocked in its very first write, which is what a
+  //       held ticket lock looks like: one wedged call, console dead for everyone.
+  //   b lines absent, `prober status=5`  every one of B's writes returned without an
+  //       errno and none of them painted -- output is being dropped, not blocked.
+  //
+  // B's failure exits carry `_puts`' own stage (224 + errno), and the parent reads the
+  // raw wait status off the panel, so "a write failed with an errno" is a fourth,
+  // different-looking number rather than a missing one.
+  mov x16, #2                         // SYS_fork, again -- this time from the parent
+  svc #0x80
+  mov x20, x0                         // B's pid, in both processes
+  mov x21, x1                         // 1 in B, 0 here
+  mov x1, #192
+  b.cs _fail
+  cmp x21, #1
+  b.eq _prober
+
+  // Wait for B, and for nothing else: A is still the process being observed, and this
+  // call must not be the thing that ends the round. WUNTRACED for the same reason the
+  // wait below uses it -- a stopped B is a reading, not a reason to sleep forever.
+  mov x0, x20
+  adrp x1, _scratch@PAGE
+  add x1, x1, _scratch@PAGEOFF
+  mov x2, #2
+  mov x3, #0
+  mov x16, #7                         // SYS_wait4
+  svc #0x80
+  b.cs _wait_error
+  cbnz x0, _prober_report
+  b _checkpoint
+
+_prober_report:
+  // B is gone. Its status is read here rather than carried in an exit code because the
+  // exit code reaches this panel only as eight bits through the panic screen, while the
+  // status is a number the console can print in full -- and whether *this* print lands is
+  // itself part of the reading: it is a write by a process that has already succeeded at
+  // writes on this panel, made after B's whole stream.
+  adrp x0, _scratch@PAGE
+  add x0, x0, _scratch@PAGEOFF
+  ldr x21, [x0]                       // B's pid is no longer wanted; x21 is free here
+  adrp x1, _prober_status@PAGE
+  add x1, x1, _prober_status@PAGEOFF
+  adrp x2, _prober_status_end@PAGE
+  add x2, x2, _prober_status_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #128
+  b.cs _fail
+  mov x0, x21
+  bl _print_dec
+  mov x1, #128
+  b.cs _fail
+  adrp x1, _newline@PAGE
+  add x1, x1, _newline@PAGEOFF
+  adrp x2, _newline_end@PAGE
+  add x2, x2, _newline_end@PAGEOFF
+  sub x2, x2, x1
+  bl _write_console
+  mov x1, #128
+  b.cs _fail
+
+  // Only now wait for A, exactly as round 78 made this parent do it. If the console
+  // lives, the panel's tail is B's stream and this line; if it does not, the watchdog's
+  // panic is the last thing to touch the screen either way.
+  //
   // ---- round 76: the parent polls without writing a single character ----
   //
   // Round 75 answered its question, and the answer is not about mach. The panel
@@ -1315,6 +1425,43 @@ _signaled:
   b _exit_now
   b _exit_now
 
+// Round 124's prober. This process is B: pid 3, parent is initproc, the console fd is
+// x22 as inherited, and nothing here execs or forks, so the tree stays three deep.
+//
+// Twenty-four lines of `[clover] b<n>`, one numbered line at a time, each through the
+// same two helpers the rest of this file uses -- `_puts` for the label, `_print_line`
+// for the digits and the newline -- so every line is three writes and the panel names
+// the last one that landed by its number. The count is deliberately more than a screen
+// row's worth of attempts and less than a scroll: at ~120 text rows on this panel, and
+// with the boot's own log above it, 24 lines cannot push A's `msg=` half line off the
+// top, which would have destroyed the comparison this round is drawn against.
+//
+// The loop bounds are 1..24 inclusive and the counter never restarts, so a half-written
+// `b1` followed by nothing is distinguishable from a return to the top of the loop.
+_prober:
+  mov x20, #0
+_prober_loop:
+  add x20, x20, #1
+  cmp x20, #25
+  b.hs _prober_done
+  adrp x1, _prober_mark@PAGE
+  add x1, x1, _prober_mark@PAGEOFF
+  adrp x2, _prober_mark_end@PAGE
+  add x2, x2, _prober_mark_end@PAGEOFF
+  sub x2, x2, x1
+  bl _puts
+  mov x0, x20
+  bl _print_line
+  b _prober_loop
+_prober_done:
+  // 5, not 0: the parent prints this number through the console, and a code that some
+  // other path could also produce would make "B wrote all twenty-four" depend on which
+  // stage failed instead of on the count on the panel.
+  mov x0, #5
+  mov x16, #1                         // SYS_exit
+  svc #0x80
+  b _checkpoint
+
 _exit_now:
   mov x0, x23
   mov x16, #1
@@ -1448,6 +1595,15 @@ _forked_end:
 _forked_mid:
   .ascii " x1="
 _forked_mid_end:
+// Round 124's two additions. `_prober_mark` is the line head B writes before each of its
+// twenty-four numbers, and `_prober_status` is the parent's one line about B. Neither sits
+// between a label and its `_end`, so no computed write length changes.
+_prober_mark:
+  .ascii "[clover] b"
+_prober_mark_end:
+_prober_status:
+  .ascii "[clover] el0 init: prober status="
+_prober_status_end:
 _alive:
   .ascii "[clover] el0 child: alive\n"
 _alive_end:

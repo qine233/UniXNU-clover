@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover el0: six-rung reboot ladder prints the last write that returned"
+title = "clover el0: prober B writes the console while A stays wedged"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -968,7 +968,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 #   0x1000007f0  "clover-el0: after write probe-done"   _w_probe_done  0x100004241
 # panic() keeps the first panic it is given, so the drawn string is the name of the last write that
 # came back; a rung that returned an errno simply falls through to the next write.
-trust_cache_sha256 = ["dcf66eeaa2f1bb95fc68856578b562d15e1f98104b35d5caadd019e874d91b29"]
+trust_cache_sha256 = ["32508dc51db446a3a16fcba6f239107cd6234c5a0131145d63f9faf0fbeda89c"]
 kernel_args = [
   "-v",
   "serial=3",
@@ -1577,8 +1577,27 @@ kernel_args = [
   # -- RA = ArmCpu::interrupt().cold.2+0, LR = ArmCpu::interrupt()+0x280, fmt = the watchdog's own format
   # cstring at __TEXT+0x12a7ec, irq=0x13/phase=3 = the branch taken right after rtclock_intr() returned.
   # cnt0=124f800 cnt1=0 freq=124f800 reproduces the round82 defect verbatim, so the tick period is still
-  # unmeasured. See README's round123 second-frame section for the full transcription and the round124 plan
-  # (parent polls with an EL0 `mrs cntvct_el0` deadline, which is also the first way to time a tick).
+  # unmeasured. See README's round123 second-frame section for the full transcription.
+  # Round 124 keeps this deadline and does not compete with it: no reboot(2) is on any path this round
+  # -- A's six rungs stay exactly where they are, and the new process B writes and then exits -- so the
+  # watchdog is still the panic that claims the screen, and an unclaimed panel gets a second reading for
+  # free. The plan this round replaced ("parent polls with an EL0 `mrs cntvct_el0` deadline") is dead on
+  # two counts found before coding: syscall 326 is `nosys` in this tree's bsd/kern/syscalls.master, so a
+  # yielding poll cannot be written, and CNTKCTL_EL1.PL0VCTEN is set only inside
+  # _enable_timebase_event_stream() (machine_routines.c:2380) when user_timebase_type() is not
+  # USER_TIMEBASE_NONE (:488-497), which this board's dtb does not reach. Round 124 therefore asks the
+  # console question directly, with a second writer: pid 1 forks B after its banner, B prints
+  # `[clover] b1`..`b24` and exits 5, and the parent -- blocking in wait4 the whole time, which is what
+  # rounds 70-74 proved lets other processes run -- prints B's raw wait status and then waits for A.
+  # b1..b24 plus `prober status=1280` means the wedge is per-call, not per-console. Nothing at all, with
+  # only the watchdog frame, is what a ticket lock held across A's blocked write looks like. The decode
+  # table for this image: _parent 0x100000a18, _prober_report 0xae4, _wait_error 0xb68, _wait_reaped
+  # 0xb70, _prober 0xbc8, _prober_loop 0xbcc, _prober_done 0xbfc, _exit_now 0xc0c, _checkpoint 0xc1c,
+  # _fail 0xc20, _write_console 0xc30 (its svc at 0xc38), _print_dec 0xc40, _puts 0xc7c, _print_line
+  # 0xc8c, _mheader 0xcbc -- helpers moved +0xe8 from round123, A's rungs 0x620..0x7f0 did not move.
+  # Beware that this file's `_puts` and `_print_line` test the carry against a hardcoded stage of 224, so
+  # B's write failures exit with 224+errno: on the parent's line that reads (224+errno)<<8, e.g. 59904
+  # for ENAMETOECOPY-free plain EIO(5) -> 229<<8 = 58880. A clean run is 5<<8 = 1280.
   "armcpu-clock-panic=60000",
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board runs one CPU (no sheng-smp), while the driver's
