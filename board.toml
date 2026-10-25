@@ -1349,8 +1349,13 @@ kernel_args = [
   # stops building a second tree: it waits up to one second for the automatic pass, finds the
   # partition by "BSD Name" == disk0s39, and continues with that media. rd= stays md0 and nothing
   # is written to logfs.
-  # One line on success, "CloverBlock r116: auto p=<n> disk0s39 <maj>:<min> bd=1 map=1"; every
-  # failure panics as "CloverBlock r116: <step> <value>". "auto <n>" means no named partition
+  # Round116 got through that find, the property casts, IOBSDNameMatching and waitForService, then
+  # data-aborted at pc 0xfffffff00799238c (esr 0x96000028) while releasing the matching dictionary.
+  # IOService::waitForService() already releases that dictionary -- IOFindBSDRoot() retains it once
+  # per wait for exactly this reason. Round117 does the same, so the run reaches root-match,
+  # bdevvp and the offset comparison.
+  # One line on success, "CloverBlock r117: auto p=<n> disk0s39 <maj>:<min> bd=1 map=1"; every
+  # failure panics as "CloverBlock r117: <step> <value>". "auto <n>" means no named partition
   # appeared in time: the value is 0x10000 if the whole disk itself was named, plus the number of
   # named partitions seen. "notify 0/1" means the IOBSD matching dictionary or the notification
   # itself could not be installed. No CloverBlock line at all means the notification never fired.

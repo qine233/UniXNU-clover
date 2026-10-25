@@ -28,6 +28,13 @@
 // building a second tree: it waits for the automatic one to finish, finds the partition by the
 // "BSD Name" the kernel itself wrote, and continues with that media.
 //
+// Round 116 got through that find, the property casts, IOBSDNameMatching and waitForService, then
+// data-aborted at 0xfffffff00799238c. That instruction reads the vtable of the matching dictionary
+// to release it; IOService::waitForService() had already released it, and IOFindBSDRoot() retains
+// the dictionary once per wait for exactly this reason. Round 117 retains it the same way and
+// releases it once after the wait, so the run can reach the root-match check, bdevvp and the
+// offset comparison.
+//
 // The class has to be hand-written. IOStorageFamily is loaded at runtime from the boot kext
 // collection (kernel.macho exports no IOBlockStorageDevice, IOMedia or IOBlockStorageDriver
 // symbol), so the standard OSDefineMetaClass* macros cannot be used: they would take the
@@ -44,7 +51,7 @@
 // an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
 // attached for start (startCandidate() attaches again after the matching loop's detach).
 //
-// A failure panics with one short CloverBlock r116 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r117 line naming the step; success prints one line
 // and lets the boot continue, because there is nothing left to photograph.
 #define IOKIT_ENABLE_SHARED_PTR 1
 #include <IOKit/IOLib.h>
@@ -434,7 +441,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r116: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r117: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 // The mask's job is done: round115 showed that the names this file wants are taken by the tree
@@ -595,11 +602,18 @@ extern "C" void clover_block_run(void)
     fail("bsd-type", 0);
   }
 
-  // 6. The exact discovery setconf() performs for rd=<bsd name>.
+  // 6. The exact discovery setconf() performs for rd=<bsd name>. waitForService() releases the
+  // matching dictionary itself before it returns -- IOFindBSDRoot() retains once per wait for the
+  // same reason. Round116 released it a second time on return and faulted reading the freed
+  // dictionary's vtable at 0xfffffff00799238c.
   OSDictionary *matching = IOBSDNameMatching(bsdName->getCStringNoCopy());
   mach_timespec_t timeout = { 1, 0 };
-  IOService *matched = matching ? IOService::waitForService(matching, &timeout) : nullptr;
-  OSSafeReleaseNULL(matching);
+  IOService *matched = nullptr;
+  if (matching) {
+    matching->retain();
+    matched = IOService::waitForService(matching, &timeout);
+    OSSafeReleaseNULL(matching);
+  }
   if (matched != target) {
     fail("root-match", reinterpret_cast<uint64_t>(matched));
   }
@@ -647,7 +661,7 @@ extern "C" void clover_block_run(void)
     fail("map", 0);
   }
 
-  IOLog("CloverBlock r116: auto p=%u %s %u:%u bd=1 map=1\n", partitions,
+  IOLog("CloverBlock r117: auto p=%u %s %u:%u bd=1 map=1\n", partitions,
         bsdName->getCStringNoCopy(), bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue());
 }

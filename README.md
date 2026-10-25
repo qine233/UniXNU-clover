@@ -6337,6 +6337,95 @@ fastboot reboot
 
 **一次刷机只回答一个问题：不手工建第二棵树时，自动树会不会在 1 秒内交出 `disk0s39`，并让 `IOBSDNameMatching` → `bdevvp` → 偏移比较一路走通。** 成功之后，下一轮才把 `rd=` 换成 `disk0s39`，去碰真正的根挂载。
 
+## round116 读数（v0.2.88 实机）：自动树交出了 `disk0s39`，崩在字典的第二次释放
+
+照片是内核自己的数据异常，不是 `fail()`：
+
+```text
+Kernel data abort, at pc 0xfffffff00799238c, lr 0xfffffff007992384
+(saved state: 0xfffffffbd980b890)
+... x26: 0xfffffff946e66cb8 ...
+esr: 0x96000028
+```
+
+反汇编 round116 自己的内核，这一小段正好对上 `pc`/`lr`：
+
+```text
+0x...2378  add  x1, sp, #0x38
+0x...237c  mov  x26, x0           ; x26 = IOBSDNameMatching() 的字典
+0x...2380  bl   IOService::waitForService
+0x...2384  mov  x25, x0           ; lr：等待的返回地址
+0x...2388  ldr  x8, [x26]         ; 取字典的 isa
+0x...238c  ldr  x8, [x8, #0x28]   ; pc：取 vtable 里的 release 槽
+0x...2390  mov  x0, x26
+0x...2394  blr  x8
+```
+
+`pc 0x...238c` 就是第二次释放字典时读 vtable 的那一条，`lr 0x...2384` 是它前一条 `waitForService` 的返回地址。
+
+原因在 `IOService::waitForService()` 本身：
+
+```cpp
+result = waitForMatchingService(matching, timeoutNS);
+matching->release();      // 调用者的字典在这里被释放一次
+if (result) result->release();
+```
+
+而 `IOFindBSDRoot()` 在每次等待前都 `matching->retain()`，等完再统一释放，正是为了抵掉这一下。round116 先 `waitForService()`、又 `OSSafeReleaseNULL(matching)`，把字典释放了两次；第二次读到的 vtable 已经不是 `OSDictionary`，于是数据异常。
+
+这条读数的价值在于**它前面的每一步都过了**：
+
+- 自动树在 1 秒内给出了名为 `disk0s39` 的 `IOMedia`（否则 `auto` 就 panic 了）；
+- 三个属性都能转成 `OSString`/`OSNumber`（否则 `bsd-type`）；
+- `IOBSDNameMatching()` 返回了非空字典（否则 `root-match 0`）；
+- `waitForService()` 正常返回（否则走不到释放）。
+
+所以 v0.2.88 的设计成立，只是收尾多释放了一次。块栈、自动分区方案、BSD 命名都没有问题。
+
+## v0.2.89（round117）：匹配字典只释放一次
+
+只改第 6 步：拿到 `IOBSDNameMatching()` 的字典后先 `retain()`，`waitForService()` 返回后再 `OSSafeReleaseNULL()` 一次，与 `IOFindBSDRoot()` 的用法逐字对应。其余步骤、超时、日志格式都不动。
+
+这一轮剩下的问题是 `waitForService()` 的返回值和后面的两步：
+
+| 失败行 | 含义 |
+| --- | --- |
+| `root-match <ptr>` | 名字匹配等到的不是这个媒体。`0` = 1 秒超时没人应答；非 0 = 等到了另一个服务，指针就是它 |
+| `bdevvp <err>` | `bdevvp(major << 24 | minor)` 失败，`err` 是返回的错误码 |
+| `buffer` / `open-whole` / `read-whole` / `open-part` / `read-part` / `map` | 读块或偏移比较失败；`map` 是整盘@base 与分区@0 的内容不一致 |
+| `auto <n>` / `bsd-type` | 与上一轮相同 |
+
+成功行：
+
+```text
+CloverBlock r117: auto p=39 disk0s39 1:39 bd=1 map=1
+```
+
+`rd=` 仍是 `md0`。`CloverPMGR` 只把行首标签升到 `r117`，参数行内容不变。
+
+产物（内核与 payload 变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round117-payload.img` | 58720256 B | `77d50eb25da74658c578d78224e6baef88d0990e2502fd88da6c47c36b2d5882` |
+| `round117-kernel.macho`（构建产物） | 51974144 B | `aabc5143c4983310f195147978e86997f298d5efd469cc555bc071a4948560b4` |
+| `round117-in-volume-kernel.macho`（卷内副本） | 51974144 B | `d1ad310ca5fadc97d4b0edfac5a615b118f6b68a203714242f35c5ca312f3e17` |
+| `round117-kernel.macho.adt` | 13476 B | `3a8227d6aa6e55015e0aad1f29760c60695282213c8bf3e1ce4b9278b9692685` |
+| `round117-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round117-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round117-unixnu.toml` | 558 B | `1b0367775cecd587d0ab8a6f22527a1e5c7585736aa17c0dfd225458f8e8e148` |
+
+校验器：`check-clover.py` 通过（ADT 13476 字节、8 核、splash `0x9d400000-0x9f800000`、FD `0x9fc00000-0x9ff00000`、`clover_defconfig`、`CLOVERESP`、模块可见）；`verify-clover-payload.py` 通过（probe 补丁只落在本地化、PMGR 绑定仍在、CloverSdhci 已链接）；`CloverBlock` 导入与 vtable 审计通过（264584 字节、190 个槽、26 个覆写）。卷内 boot-args 末尾仍是 `… clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`；卷内内核只有 r117 字符串，没有 r116 残留。反汇编确认新序列先 `matching->retain()` 再 `waitForService`，返回后才释放。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_run` `0xfffffff00797231c`、`_clover_block_run` `0xfffffff007992054`、`_clover_block_request` `0xfffffff007992894`。boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round117-payload.img
+fastboot reboot
+```
+
+**一次刷机只回答一个问题：只释放一次匹配字典之后，`waitForService` 会不会返回的正是 `disk0s39`，并让 `bdevvp` 与偏移比较都通过。** 三条验证都通过后，下一轮才把 `rd=` 换成 `disk0s39` 去碰真正的根挂载。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
