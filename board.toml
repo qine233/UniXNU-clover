@@ -988,11 +988,32 @@ kernel_args = [
   # ENOTSUP (vfs_support.c:279) -> `panic("rootvp not authenticated after mounting")` (bsd_init.c
   # :1098). The owner-trust escape hatch is not compiled on this board (clover_defconfig leaves
   # OWNER_* off), so that panic is the expected best-case reading and it means the mount worked.
+  # Round120 read that best case on the device: `rootvp not authenticated after mounting
+  # @bsd_init.c:1098`, whose fmt (0xfffffff0070bc5cd) is the literal itself at __TEXT file offset
+  # 0xb85cd and whose RA (0xfffffff0079f02c4) is _bsd_init.cold.5+0, the panic call site. The root
+  # search answered at ticks=0xd3 (211 counts) rather than round119's ten timeouts, and the mounted
+  # device is the eMMC media, not the RAMDisk: this partition's node holds bdevsw major 1
+  # (`BSD root: disk0s39, major 1, minor 39`) while mdevadd's ramdisk sits at major 3 minor 0
+  # (`BSD root: md0, major 3, minor 0` in every round up to v0.2.91; memdev.c:665 takes that major
+  # from bdevsw_add(-1, &mdevbdevsw), so the two are different slots by construction). Therefore
+  # mockfs's buf_meta_bread(rvp, 0, 4096) did travel IOMediaBSDClient -> IOBlockStorageDriver ->
+  # drivers/CloverSdhci's PIO read, returned success, and the mount completed over eMMC.
+  # Only the seal check is left, and this tree has exactly two ways past it. The first is the name
+  # test: bsd_rooted_ramdisk() (bsd_init.c:450) is true when `rd` starts with RAMDEV, "md0"
+  # (bsd_init.c:447), and IOFindBSDRoot's md shortcut additionally requires rdBootVar[3]==0 (:849),
+  # so a name like md0s39 keeps the real BSD-name match while the prefix skips rootauth -- and
+  # exclaves_storage.c:219 is the only other reader of that test. The second is the owner chain in
+  # patches/xnu/offline-owner-root-binding-audit.patch: XNU_OWNER_ROOT_TRUST admits the mount when
+  # native_verified_block_root_authorized(device) says yes, but that function exists only in
+  # drivers/NativeVirtioBlock (which the build script gates behind VERIFIED_ROOT_PROBE,
+  # SOURCE_CORECRYPTO14 and NATIVE_VIRTIO_BLOCK) and it walks the media's providers looking for a
+  # NativeVirtioBlock instance, so it cannot answer for this eMMC device without touching upstream
+  # driver code this repository does not own.
   # Readings, in the order they now become distinguishable:
   #   `Waiting on <dict ... BSD Name=disk0s39>` + `Got boot device = <path>` + `BSD root: disk0s39,
   #     major 1, minor 39` = the ADT is out of the way and the match answered;
   #   `rootvp not authenticated after mounting` = root mounted over eMMC, authentication is the next
-  #     and only wall;
+  #     and only wall -- this is the line round120 printed;
   #   `Failed to mount root device` again = something else still pre-empts `rd=`;
   #   `CloverBlock r120: <step> <value>` = the block stack itself broke;
   #   no new line and the clock watchdog = the buffer-cache read hung, which the tick panic localises.
@@ -1409,6 +1430,9 @@ kernel_args = [
   # root-matching filled IOFindBSDRoot's matching dictionary first (:790-797, and the rd= branch is
   # guarded by `!matching` at :888), so the ten waits ran against the stock volume UUID. Round120
   # deletes that property (see [payload.adt]), which leaves rd=disk0s39 as the only root contract.
+  # Round120's photograph carried this driver's own line unchanged and went past it: the root mounted
+  # on this partition and the boot died at bsd_init.c:1098's seal check. The reading and the two ways
+  # past that check are written out above, on the `rd=` argument they belong to.
   # One line on success, "CloverBlock r120: auto p=<n> disk0s39 <maj>:<min> bd=1 map=1 fires=<k>"
   # (fires=1 on the run that succeeded); each refire prints "CloverBlock r120: refire n=<k> (already
   # ran)". Every failure panics as "CloverBlock r120: <step> <value>". "auto <n>" means no named

@@ -6678,6 +6678,33 @@ fastboot reboot
 
 **一次刷机只回答一个问题：把 ADT 让开之后，`rd=disk0s39` 能不能让内核走到那个 vnode 上，经缓冲区缓存读 eMMC 的头 4096 字节并把 mockfs 根挂上。** 看到 `rootvp not authenticated after mounting` 就算通——那时挂载已经完成，下一轮单独问认证；还看到 `Failed to mount root device` 就说明另有东西抢在前面。
 
+## round120 读数（v0.2.92 实机）：根挂在 eMMC 上了，只差认证
+
+照片第一行就是本轮要的那一条：`rootvp not authenticated after mounting @bsd_init.c:1098`。
+
+地址逐个钉回内核：
+
+| 屏上的值 | 内核里的位置 | 含义 |
+| --- | --- | --- |
+| `RA=0xfffffff0079f02c4` | `_bsd_init.cold.5+0x0` | panic 的返回地址落在 `bsd_init` 的冷段里，也就是 :1098 那一句自己 |
+| `fmt=0xfffffff0070bc5cd` | `__TEXT` 文件偏移 `0xb85cd` | 这颗指针指向的字面量逐字是 `rootvp not authenticated after mounting @%s:%d`，与屏上第一行对齐 |
+| `LR=0xfffffff0076ac294` | `_bsd_autoconf+0x0` | 这是从栈帧 `+8` 槽里读出来的旧值，正好是函数入口，不是调用点，本轮不解释它 |
+| `ticks=0xd3` | 211 | round119 是 `0xb0c`=2820（十次超时）。等待被立刻回答，正是「媒体早就在」的那个时序 |
+
+排他的证据在主设备号上，而它已经在上一轮的照片里了。round118 的日志里，`CloverBlock r118: auto p=39 disk0s39 1:39` 与 `Adding ramdisk device md0/rdmd0 … BSD root: md0, major 3, minor 0` 出现在同一次启动里：内存盘拿到的主号是 `mdevadd()` 用 `bdevsw_add(-1, &mdevbdevsw)` 动态要的（memdev.c:665），跟 IOMediaBSDClient 的槽位不是同一个。所以本轮 `rootdev = makedev(1, 39)` 那个 vnode 只可能是 eMMC 分区的节点，不可能是内存盘 —— `vfs_mountroot()` 交给 mockfs 的 `buf_meta_bread(rvp, 0, 4096)` 确实走了缓冲区缓存 → `VOP_STRATEGY` → IOMediaBSDClient → IOBlockStorageDriver → CloverSdhci 的 PIO，并且返回了成功，挂载走完了。这是本板第一次由内核自己发起、而不是由 `CloverBlock.cpp` 里的调用发起的读。
+
+屏上滚过的日志还留了两条边角事实：`using 4980 buffer headers and 4582 cluster 10 buffer headers`（缓冲池起来了，这条读要有它才有意义），以及 `No BMST boot_arg set` / `BootBMSTManifest: Error: Failed to find entry /chosen/boot-manifest-hash`（owner 的启动清单在这块板上确实不存在，见下）。`CloverPMGR r120: args [… rd=disk0s39 … armcpu-clock-panic=60000)` 自证了镜像身份；`pmgr=0x5 status=0 mode=0x2`、`nub=… attached=1 registered=2`、`aon=0xffffffff=>0xffffffff` 与上一轮一致，PMGR 那条路没被本轮动过。
+
+于是墙只剩一道，而这一道墙在源码里只有两个门。
+
+第一个门是名字。`bsd_init.c:1057` 用 `bsd_rooted_ramdisk()` 决定要不要认证，那个函数只看 `rd` 是否以 `RAMDEV` 开头，而 `RAMDEV` 是 `bsd_init.c:447` 的 `"md0"`。`IOFindBSDRoot` 的 `md?` 捷径另有形状要求 `rdBootVar[3] == 0`（:849），所以像 `md0s39` 这样的名字**不会**走内存盘捷径，仍然按 BSD 名字匹配到我们发布的媒体、拿到 `1:39`，却让前缀检查把整段认证跳过。`grep -rn bsd_rooted_ramdisk` 全树另一个读者只有 `exclaves_storage.c:219`。代价是要 `CloverBlock` 在媒体上多发布一个 `BSD Name`，全在板内代码，不碰上游。
+
+第二个门是上游自己的 owner 链：`patches/xnu/offline-owner-root-binding-audit.patch` 里 `XNU_OWNER_ROOT_TRUST` 认 `native_verified_block_root_authorized(device)`。那个函数只在 `drivers/NativeVirtioBlock` 有定义，构建脚本又把它锁在 `XNU_VERIFIED_ROOT_PROBE` + `XNU_SOURCE_CORECRYPTO14` + `XNU_NATIVE_VIRTIO_BLOCK` 三道门后（build-xnu-4k-baseline.sh:252-269），而它的实现是沿 provider 链找 `NativeVirtioBlock` 实例（NativeVirtioBlock.cpp:285-303）——本板的 provider 链是 CloverBlockDevice 与 CloverSdhci，除非改上游驱动，它永远回答「不认」。sheng 能挂真根，靠的是这一整套（`docs/zh/devices/sheng.md` 的 defconfig 段：`CONFIG_XNU_OWNER_ROOT_AUDIT=y`、`CONFIG_XNU_OWNER_ROOT_TRUST=y`、`CONFIG_XNU_NATIVE_UFS=y`、`CONFIG_XNU_SOURCE_CORECRYPTO14=y`）加上真 userdata 上的 APFS 卷，不是 mockfs 镜像。
+
+本轮不改代码：读数落盘，`v0.2.92` 的产物继续有效。下一轮在两个门里选一个 —— 这是方向决定，单独问一次，不替用户挑。
+
+还有第三条看着最短的路，先在这里判死：在设备仓放 `patches/xnu/*.patch`，直接改 `bsd_init.c` 的判定或 mockfs 的 ioctl 表。`tree/patches/xnu` 是指向基仓的软链，`feeds.py` 按 `(kind, name)` 取第一个存在的路径，所以设备仓一建 `patches/xnu` 就会整体顶掉上游上百个补丁 —— v0.2.58 那轮已经为这件事付过学费，仪器因此才进设备仓已拥有的 `drivers/ArmCpu`。这条路不在候选里。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
