@@ -28,6 +28,9 @@ fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustC
 # The Data window is mmcblk0p64 as the unit reports it (15795488 + 106347199 sectors of a
 # 122142720-sector disk), so last_lba leaves the backup GPT alone. A different ROM can
 # lay the GPT out differently, which is why the window comes from a dump.
+# These two numbers are also kUserDataFirstLba/kUserDataLastLba in drivers/CloverSdhci, which
+# publishes the window to drivers/CloverBlock only when this boot's card agrees with them: if the
+# two files disagree the boot panics "udwindow 0" rather than describing some other partition.
 [userdata]
 first_lba = 0xf10520
 last_lba = 0x747bfde
@@ -151,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r127: apfs attaches to the logfs window"
+title = "clover r128: apfs reads iPadOS's own container off userdata"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1083,11 +1086,14 @@ kernel_args = [
   # to the RAMDisk and the eMMC is asked a different question. `rd=md0` is the shape every round up to 118
   # booted with: mockfs reads the initrd the payload carries (`--data-ramdisk
   # build/clover-root/launchd.macho`), `bsd_rooted_ramdisk()` is true by the name itself rather than by
-  # step 9's alias, and EL0 runs. With `clover-apfs=1` the block device no longer describes the card -- it
-  # describes logfs's own window, so there is no GPT at its block zero, no IOGUIDPartitionScheme pass over
-  # it, and therefore no disk0s39 for `rd=md0s39` to name: that argument would spend ten timeouts and
-  # panic in `Failed to mount root device` before the probe below finished. Steps 5-9 of the run stay in
-  # the source for a boot without the argument; a boot with it stops after step 4 and reports a depth.
+  # step 9's alias, and EL0 runs. With `clover-apfs` set the block device no longer describes the card --
+  # round127 scoped it to logfs's own window, whose block zero is a container superblock, so there was
+  # no GPT, no IOGUIDPartitionScheme pass over it and no disk0s39 for `rd=md0s39` to name; round128
+  # scopes it to the root image, whose window does carry a partition table, but the run ends inside the
+  # depth probe and never reaches the steps that name a root. Either way an eMMC-named `rd=` would spend
+  # ten timeouts and panic in `Failed to mount root device` before the probe below finished. Steps 5-9
+  # of the run stay in the source for a boot without the argument; a boot with it stops after step 4 and
+  # reports a depth.
   # Readings, in the order they now become distinguishable, all of them drawn on the panic screen:
   #   `CloverBlock r127: window 0` = the card's GPT entry 39 was not the extent drivers/CloverSdhci
   #     publishes, so nothing was described (the same gate every logfs round uses);
@@ -1579,7 +1585,37 @@ kernel_args = [
   # So the open question is no longer whether APFS can be driven from this card. It is whether anything
   # can *mount* what this published: the next probe takes the volume object this walk already finds, asks
   # the vfs for a mount, and reads MARKER.txt back through a vnode.
-  "clover-apfs=1",
+  # Round128 asks the same depth question of Apple's own bytes instead of this port's. `clover-apfs=2`
+  # takes the *userdata* window -- entry 64, first LBA 15795488 and 106347199 sectors, published by
+  # drivers/CloverSdhci only when this boot's card reports exactly that extent -- and reads its first
+  # 4 KiB through the PIO path as the SHNGROOT manifest `./unixnu build userdata` writes there. The
+  # manifest's `OS` entry names a byte offset and a byte size inside the partition, and the media is
+  # re-scoped to that: card LBA 15795488 + 0x100000/512 = 15797536, 6077580800/512 = 11870275 sectors.
+  # What lives at those bytes is not a bare container, and that is the round's one real surprise:
+  # `hdiutil imageinfo` on the IPSW's own 044-76040-038.dmg says "已压缩为UDIF只读(lzfse)" holding a whole
+  # GPT disk (MBR, Primary GPT Header, Primary GPT Table, one Apple_APFS partition of type
+  # 7C3457EF-0000-11AA-AA11-00306543ECAC at LBA 34..11870241, backup), and the host-side copy of the
+  # flashed bytes confirms it: `EFI PART` at 0x200 of the window and `NXSB` 34 blocks past that. So byte
+  # zero of this media is an MBR, `m=` now means "the GPT header is where the manifest says it is", and
+  # the slicing is left to IOKit: IOBlockStorageDriver registers the whole media asynchronously and
+  # round116 read what follows (its hand-built second tree lost every name to EEXIST because the
+  # automatic pass had already named disk0s1...s39). Letting Apple's own IOGUIDPartitionScheme scan
+  # Apple's own partition table means the APFS stack this round measures is attached two levels below
+  # anything this file wrote, which is why the walk's depth cap went 4 -> 7 and its service cap 64 -> 256.
+  # The manifest's own SHA-256 (byte 4064 of the same block) is deliberately *not* verified: this file
+  # links no hash, and the bounds and attribute checks refuse a torn or foreign manifest on their own.
+  # Every refusal is its own panic step, and the step name is the reading: "root-read n" (fewer than
+  # eight blocks came back over the PIO path), "root-magic <first word>" (nothing was flashed there --
+  # on a stock card that word is Android's ext4 superblock region, not "SHNG"), "root-version",
+  # "root-count", "root-attr i", "root-bounds <offset>", "root-geometry <sectors>", "root-name <count>"
+  # (a manifest with no OS window), and "udwindow 0" (entry 64 was not the recorded extent, so this is a
+  # different card than the one board.toml describes).
+  # Two budgets had to grow with the image, and both are the same instrument's numbers: at round127's
+  # measured pace -- 56 blocks in the 295 ticks that this board's own counter calls about a second, so
+  # roughly 20 ms per 512-byte block and 164 ms per 4 KiB APFS block -- a real container's first pages
+  # are tens of seconds, so the poll is 12000 turns of IOSleep(10) rather than 3000. The watchdog is
+  # raised to match below, because the answer this round wants is the probe's panic, not the timer's.
+  "clover-apfs=2",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
@@ -1755,7 +1791,13 @@ kernel_args = [
   # still costs the deadline. The parent's waits are swapped to wait4(A)-then-B so the exit-code branch
   # is actually reportable; round124 put the blocking wait on B and A's _fail exit would have been
   # invisible forever.
-  "armcpu-clock-panic=60000",
+  # Round128 triples it, and only for the storage probe's benefit: 60000 ticks is about 210 s at this
+  # board's own ~282 ticks/s, and a real iPadOS container read through a 512-byte PIO path that moves
+  # one block every ~20 ms can spend most of that before apfs.kext has finished its first pages. The
+  # panic the round wants is CloverBlock's, with the depth in it; the watchdog's is the same board
+  # answering a different question. At 180000 ticks (~10.6 minutes) the probe's own 12000-turn poll
+  # always reports first, and a boot that answers nothing at all is still bounded.
+  "armcpu-clock-panic=180000",
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board has never had its online-CPU count measured (round70's panel
   # read as the child being picked up by a second core, so "one CPU" below is an assumption, not a

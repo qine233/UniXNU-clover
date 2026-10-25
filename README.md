@@ -7547,6 +7547,87 @@ r=56 w=0 @CloverBlock.cpp:767
 
 本轮不改代码，读数落盘；`v0.2.99` 的产物继续有效（`~/clover-out/round127-*`）。
 
+## v0.3.0（round128）：把量测对象换成 iPadOS 自己的容器字节
+
+round127 通了，但它通的是**本端口喂给 apfs 的那 8 MiB** —— 宿主机 `diskutil apfs createContainer` 造出来
+的一颗裸容器 + 一个 `MARKER.txt`。iOS-first 路线上真正的问号在别处：Apple 自己的 apfs.kext，面对
+Apple 自己发布的那颗容器，在一颗本移植做的盘上，能爬到多深。所以这一格先把「真容器」搬上卡，mount
+那一步留给 round129（`root_match_volume_uuid` + 读回文件字节）。
+
+三处改动，加一份镜像：
+
+1. **镜像**：`[userdata]` 就是这颗卡的 Data 分区（`mmcblk0p64`：首 LBA 15795488、末 LBA 122142686、
+   512 字节扇区，单位自己在 sysfs 上报的那段），`./unixnu build userdata` 按 `drivers/NativeUfs/RootLayout.h`
+   的 SHNGROOT 布局写出一张 9382658048 字节的镜像：第 0 块是 4 KiB 清单，1 MiB 对齐之后依次放
+   IPSW 里**原封不动**的两张盘 —— `OS`（`044-76040-038.dmg`，6077580800 B，落在 0x100000）和
+   `Cryptex1,SystemOS`（`044-76034-038.dmg`，3303014400 B，落在 0x16a600000）。两个 DMG 的 sha256 钉在
+   `[ipsw.sha256]`，写进镜像的字节是解包后的原像，不是重新组装的东西。
+2. `drivers/CloverSdhci` 把 Data 窗口也端出来：mode 14 那条 GPT 表项走查原本在认到表项 39 就 `break`，
+   现在改成 39 与 64 都找、两个都找到才停；表项 64 必须恰好是 `15795488..122142686`（round101 从卡上
+   自己读到的那段）才把首 LBA 和扇区数 release-store 进 `gBlockUserData*`，新导出
+   `clover_emmc_block_userdata_window(&first, &sectors)`。`scripts/build-clover-block.py` 的符号清单同步
+   加了 `_clover_emmc_block_userdata_window` —— 那张清单必须**正好**等于 `.a` 真正引用的东西，所以驱动
+   和脚本只能一起改。
+3. `drivers/CloverBlock` 的 `clover-apfs=2` 分支：先用 PIO 读分区头 8 个块（4 KiB）当 SHNGROOT 清单解析，
+   取名为 `OS` 的那条项目的 `offset`/`size`，把媒体的几何改成它 —— 卡 LBA `15795488 + 0x100000/512 =
+   15797536`，`6077580800/512 = 11870275` 扇区。清单里那颗 SHA-256（同块第 4064 字节）**故意不验**：这个
+   文件没链任何哈希，而边界、属性、名字三道检查自己就会拒绝撕坏的或外来的清单。每一条拒绝都是独立的
+   panic 步骤，步骤名就是读数：`root-read n`（PIO 没交回八个块）、`root-magic <首字>`（那儿什么都没刷 ——
+   原装卡上这个字是 Android 的 ext4 超级块区域，不是 "SHNG"）、`root-version`、`root-count`、
+   `root-attr i`、`root-bounds <offset>`、`root-geometry <sectors>`、`root-name <count>`（清单里没有 OS 窗口）、
+   `udwindow 0`（表项 64 不是记录的那段，也就是说这不是 board.toml 描述的那颗卡）。
+
+这一格唯一的真意外是**那 6 GiB 不是裸容器**：宿主机 `hdiutil imageinfo` 对 IPSW 自带的
+`044-76040-038.dmg` 说「已压缩为UDIF只读(lzfse)」，里面装着**一整张带 GPT 的盘**（MBR、主 GPT 头、主
+GPT 表、一条 `Apple_APFS`（类型 GUID `7C3457EF-0000-11AA-AA11-00306543ECAC`，LBA 34..11870241）、备份表），
+而宿主上对将要刷进卡的那段字节的复核也确认了：窗口 +0x200 是 `EFI PART`，再往后 34 块才是 `NXSB`。
+所以媒体的第 0 字节是 MBR，`m=` 的含义随之改成「GPT 头在清单说的位置上」，而**切盘交给 IOKit 自己**：
+`IOBlockStorageDriver` 是异步注册整媒体的，round116 已经读过后面会发生什么 —— 那棵手工搭的第二棵树被
+自动那一趟抢光了名字、每一颗都撞 EEXIST。让 Apple 的 `IOGUIDPartitionScheme` 去扫 Apple 的分区表，意味着
+这轮量的 apfs 栈挂在本文件写过的任何东西下面**两层**，于是走查的深度上限 4 → 7、每层服务数 64 → 256。
+
+两份预算得跟着镜像长，而且用的是同一件仪器的数：按 round127 量到的节奏 —— 56 个块花掉这块板自己的
+计数器称为「约一秒」的 295 个 tick ⇒ 约 20 ms/512 B ⇒ 约 164 ms/4 KiB APFS 块 —— 真容器的头几页就是几十秒，
+所以轮询从 3000 轮改成 12000 轮 × `IOSleep(10)`；看门狗跟着抬到 `armcpu-clock-panic=180000`（≈10.6 分钟），
+因为这一轮要的答案是探针自己的 panic，不是定时器的。根仍然 `rd=md0`：这轮不在乎根挂在哪儿。
+`scripts/check-clover.py` 现在要求 `clover-apfs=2` 与 `clover-emmc=21` 同时在场、`rd=md0` 在场、
+`rd=md0s39`/`rd=disk0s39` 缺席，并且 `[userdata]` 必须真的带 `windows`。
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build userdata kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && scripts/verify-clover-payload.py
+```
+
+两个驱动都在 `[kernel] archives` 里，所以 `kernel` 这一格不能省。本轮链接出的内核 sha256 `38e19577…`（本地）
+/ 卷内 `d743631c…`（打补丁后，探针偏移 6680 字节分布在 35 段里，其余逐字节相同）；`payload.img` `441a3169…`
+（56 MiB）；ADT `bd6969f5…`、信任缓存 `c3ed2152…`、`scratch-data.img` `614b8356…` 这轮都没动。
+`userdata-root.img` 是 `fd43ee70…`。归档在 `~/clover-out/round128-*`（`round128-SHA256SUMS`）。
+
+**本轮刷两格：`userdata`（第 64 格，9382658048 字节）和 `cache`（负载）。** 两条命令都写 eMMC 分区，
+请你自己确认后执行 —— 其中 **`fastboot flash userdata` 会抹掉平板上 Android 的 `/data`**（ contacts、微信记录、
+登录态、下载的 App 数据全没，等价于恢复出厂设置），而且**之后如果再把原装 Android 引导起来，它很可能
+重新初始化 `/data`，这张镜像就白刷了**；这一轮之后请一直冷刷我们的负载，别回头开 Android。
+`cache` 与 `boot` 之外什么都不碰（`logfs` 里还是 round127 那颗 8 MiB 裸容器，本轮 `clover-apfs=2` 不看它）：
+
+```
+fastboot flash userdata /Users/zhouzhou/clover-out/round128-userdata-root.img   # 8.74 GiB，fd43ee70…，要刷很久
+fastboot flash cache    /Users/zhouzhou/clover-out/round128-payload.img         # 56 MiB，441a3169…
+```
+
+冷刷，不用 `fastboot boot`。菜单第一行应认得 `clover r128: apfs reads iPadOS's own container off userdata`。
+读数还是同一行形状 `CloverBlock r128: apfs f=… n=… m=… l=… d=… s=… c=… v=… r=… w=…`：
+
+- `f=15797536 n=11870275` —— 清单里的 OS 窗口被闩进了媒体几何；`f` 不对就是偏移链或清单读错了。
+- 任何 `root-*` / `udwindow` 步骤名 —— 见上面那张表，每个都自证是哪一道门拦的。
+- `m=1` —— 窗口 +512 处是 `EFI PART`：Apple 的 GPT 在预期地址上，媒体确实是一张整盘。`m=0` 则 `s/c/v` 全 0 不构成 apfs 的结论。
+- `l=` 非 0 —— apfs.kext 没加载，后面的 0 是必然。
+- `s=1 c=1 v=1` —— Apple 的容器字节在自己的 `IOGUIDPartitionScheme` 切出来的那片上被认出来了，**这才是「真容器」的答案**；`s=0` 而 `d>0` 说明分区那趟没把 APFS 切片交上去。
+- `d=`/`r=` —— 这轮要多穿两层，`d=` 该比 round127 的 7 大；`r=` 是这段里经过这颗媒体读掉的 512 字节块数，真容器的头几页应当远大于 56。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

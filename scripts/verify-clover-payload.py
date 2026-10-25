@@ -120,16 +120,18 @@ def check_sdhci(kernel: bytes) -> bool:
 
 def check_block(kernel: bytes) -> bool:
     """drivers/CloverBlock is the other plain archive in the link, kept alive only because
-    CloverSdhci's mode 21 tail names clover_block_run(). Round127's probe is three strings and one
-    import: the boot argument that selects the logfs window, the panic line that carries the depth,
-    the container-scheme class name it walks the registry for, and the window accessor CloverSdhci
-    has to have linked in for the geometry to exist at all. Any of the four going missing means the
-    round silently asks nothing -- the failure shape check-clover.py refuses to let the archives
-    have."""
+    CloverSdhci's mode 21 tail names clover_block_run(). Round128's probe is the same shape one
+    partition over: the boot argument that selects the root image, the panic line that carries the
+    depth, the container-scheme class name it walks the registry for, both window accessors
+    CloverSdhci has to have linked in for the geometry to exist at all, and the two magics it reads
+    (the SHNGROOT manifest and the GPT header the window turns out to carry). Any of them going
+    missing means the round silently asks nothing -- the failure shape check-clover.py refuses to let
+    the archives have."""
     label = "kernel.macho: CloverBlock linked"
     found = {name: name.encode() in kernel
-             for name in ("clover-apfs", "CloverBlock r127: apfs",
+             for name in ("clover-apfs", "CloverBlock r128: apfs",
                           "AppleAPFSContainerScheme", "_clover_emmc_block_window",
+                          "_clover_emmc_block_userdata_window", "SHNGROOT", "EFI PART",
                           "_clover_block_run")}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())

@@ -123,7 +123,7 @@
 // an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
 // attached for start (startCandidate() attaches again after the matching loop's detach).
 //
-// A failure panics with one short CloverBlock r127 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r128 line naming the step; success prints one line
 // and lets the boot continue, except under clover-apfs=1, where the depth itself is the report and
 // the run always panics with it. A refire of the IOBSD notification prints one counted line and
 // returns, so the photograph shows both that the run completed and how many times it was offered.
@@ -154,6 +154,10 @@ void clover_block_static_init (void) __asm__ ("__GLOBAL__sub_I_CloverBlock.cpp")
 uint32_t clover_emmc_block_ready (void);
 uint32_t clover_emmc_block_sectors (void);
 void clover_emmc_block_window (uint32_t *first, uint32_t *sectors);
+// Round128: userdata's own window (GPT entry 64), zero until this boot's card reported that entry as
+// the extent board.toml recorded. The root image is flashed at its byte zero, and the first 4 KiB of
+// the partition is the SHNGROOT manifest that says where the disk images inside it are.
+void clover_emmc_block_userdata_window (uint32_t *first, uint32_t *sectors);
 uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint32_t blocks);
 uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words, uint32_t blocks);
 // The kernel's own block-device vnode constructor (bsd/vfs/vfs_subr.c). dev_t is the composite
@@ -183,11 +187,23 @@ static volatile uint32_t gWindowSectors = 0;
 // reports is traffic the storage stack above it asked for, not the probe's.
 static volatile uint32_t gBlocksRead = 0;
 static volatile uint32_t gBlocksWritten = 0;
-// The APFS container superblock: nxs_magic is the fourth field of nx_super_block, 32 bytes of
-// reserved space into the 4096-byte block, and its bytes spell NXSB. Byte zero of the window is
-// byte zero of the container, which is the whole reason the window is what this round describes.
-static const uint32_t kNxsbOffset = 0x20;
-static const uint8_t kNxsbMagic[4] = { 'N', 'X', 'S', 'B' };
+// Round128's manifest: the first 4 KiB of userdata, as `./unixnu build userdata` writes it and as
+// drivers/NativeUfs/RootLayout.h reads it. 4096 bytes is eight of this device's 512-byte blocks,
+// and it is read through the PIO path in one request rather than eight. Entry i starts at byte 24 +
+// 128 i: name[32], u64 offset, u64 size, u32 block size, u32 flags, sha256[32]. The digest at byte
+// 4064 is deliberately not checked -- this file links no hash, and what a torn image would change is
+// the offsets, which the bounds below refuse on their own.
+static const uint32_t kRootManifestBlocks = 8;
+static const uint32_t kRootManifestBytes = kRootManifestBlocks * kBlockBytes;
+static const uint8_t kRootMagic[8] = { 'S', 'H', 'N', 'G', 'R', 'O', 'O', 'T' };
+static const char kRootWindowName[3] = { 'O', 'S', 0 };
+// The OS window is a whole GPT disk, not a bare container: `hdiutil imageinfo` on the IPSW's own
+// 044-76040-038.dmg reports MBR, Primary GPT Header, Primary GPT Table, one Apple_APFS partition and
+// the backup, and the host-side copy of the flashed bytes says the same. So byte zero of the media
+// this round describes is an MBR, and the reading that matters is the partition header one block in.
+static const uint8_t kEfiPartMagic[8] = { 'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T' };
+static const uint32_t kGptHeaderOffset = kBlockBytes;
+static uint32_t gRootManifest[kRootManifestBytes / 4];
 static const char kApfsKext[] = "com.apple.filesystems.apfs";
 // The three classes whose appearance under this media is the depth, in the order a successful
 // attach produces them. Names are compared by metaCast, not by a matching dictionary: the walk only
@@ -571,7 +587,70 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r127: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r128: %s %llu", step, static_cast<unsigned long long>(value));
+}
+
+static uint32_t le32At(const uint8_t *at)
+{
+  return static_cast<uint32_t>(at[0]) | (static_cast<uint32_t>(at[1]) << 8) |
+         (static_cast<uint32_t>(at[2]) << 16) | (static_cast<uint32_t>(at[3]) << 24);
+}
+
+static uint64_t le64At(const uint8_t *at)
+{
+  return static_cast<uint64_t>(le32At(at)) | (static_cast<uint64_t>(le32At(at + 4)) << 32);
+}
+
+// Latch the media to the OS window inside the flashed root image. Everything the manifest holds is
+// bytes and names, and each refusal is its own panic step, so a photograph can tell "nothing was
+// flashed" (magic) from "a different release's manifest" (version) from "this partition is not the
+// one the image was sized for" (bounds). The window is published relative to the card: the offset in
+// the manifest is relative to the start of userdata, and drivers/CloverSdhci's own read path only
+// takes card LBAs.
+static void rootWindowFromManifest(uint32_t partitionFirst, uint32_t partitionSectors)
+{
+  const uint32_t got = clover_emmc_block_read(partitionFirst, gRootManifest, kRootManifestBlocks);
+  if (got != kRootManifestBlocks) {
+    fail("root-read", got);
+  }
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(gRootManifest);
+  if (memcmp(bytes, kRootMagic, sizeof(kRootMagic)) != 0) {
+    fail("root-magic", le32At(bytes));
+  }
+  const uint32_t version = le32At(bytes + 8);
+  const uint32_t count = le32At(bytes + 12);
+  if (version != 1) {
+    fail("root-version", version);
+  }
+  if (!count || count > 4) {
+    fail("root-count", count);
+  }
+  const uint64_t partitionBytes = static_cast<uint64_t>(partitionSectors) * kBlockBytes;
+  for (uint32_t index = 0; index < count; index++) {
+    const uint8_t *entry = bytes + 24 + 128 * index;
+    if (memcmp(entry, kRootWindowName, sizeof(kRootWindowName)) != 0) {
+      continue;
+    }
+    const uint64_t offset = le64At(entry + 32);
+    const uint64_t size = le64At(entry + 40);
+    if (le32At(entry + 48) != kBlockBytes || le32At(entry + 52) != 1) {
+      fail("root-attr", index);
+    }
+    if (offset < kRootManifestBytes || (offset % kBlockBytes) || size < kBlockBytes ||
+        (size % kBlockBytes) || offset > partitionBytes || size > partitionBytes - offset) {
+      fail("root-bounds", offset);
+    }
+    const uint64_t first = partitionFirst + offset / kBlockBytes;
+    const uint64_t sectors = size / kBlockBytes;
+    if (sectors > UINT32_MAX || first > UINT32_MAX || first + sectors >
+        static_cast<uint64_t>(clover_emmc_block_sectors())) {
+      fail("root-geometry", sectors);
+    }
+    __atomic_store_n(&gWindowFirst, static_cast<uint32_t>(first), __ATOMIC_RELEASE);
+    __atomic_store_n(&gWindowSectors, static_cast<uint32_t>(sectors), __ATOMIC_RELEASE);
+    return;
+  }
+  fail("root-name", count);
 }
 
 // The mask's job is done: round115 showed that the names this file wants are taken by the tree
@@ -662,6 +741,11 @@ static IOReturn readMediaBytes(IOMedia *media, IOService *client, IOMemoryDescri
 // the container object parses it, a volume appears only for a filesystem it can name -- and `seen`
 // says how many services hung off the media at all, which tells "apfs never came" from "something
 // came and stopped".
+//
+// Round128's tree is two levels deeper than round127's, and deliberately so: the partition scheme and
+// the slice media are IOKit's own work between this media and the APFS scheme, so the walk has to
+// reach past them. The cap on `seen` grew with it, because a partitioned disk carries a BSD client
+// per partition as well.
 struct ApfsDepth {
   uint32_t seen;
   uint32_t scheme;
@@ -675,7 +759,7 @@ static void measureApfsDepth(IORegistryEntry *entry, ApfsDepth *depth, uint32_t 
   if (!children.get()) {
     return;
   }
-  while (depth->seen < 64) {
+  while (depth->seen < 256) {
     OSObject *object = children->getNextObject();
     if (!object) {
       break;
@@ -694,19 +778,21 @@ static void measureApfsDepth(IORegistryEntry *entry, ApfsDepth *depth, uint32_t 
     if (child->metaCast(kApfsVolumeClass)) {
       depth->volume = 1;
     }
-    if (level < 4) {
+    if (level < 7) {
       measureApfsDepth(child, depth, level + 1);
     }
   }
 }
 
-// The whole of round127, and it never returns: the console is the thing this board cannot trust this
-// late, so the depth is drawn on the panic screen like every other reading since round121.
+// The whole of rounds 127 and 128, and it never returns: the console is the thing this board cannot
+// trust this late, so the depth is drawn on the panic screen like every other reading since round121.
 __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *client)
 {
-  // 1. Whether the container is where the window says it is, seen through IOMedia rather than
-  // through this port's own PIO: byte zero of the media is block zero of logfs, and NXSB sits 32
-  // bytes into that block.
+  // 1. Whether the bytes the window claims are the bytes that are there, seen through IOMedia rather
+  // than through this port's own PIO. Under round127 that question was NXSB 32 bytes into block zero,
+  // because the window was a bare container. Under round128 the window is a real GPT disk, so the
+  // question is the partition header one block in: `m=1` means the flashed image landed where the
+  // manifest says and read back with the magic a GPT has, and nothing below this line is about bytes.
   OSSharedPtr<IOBufferMemoryDescriptor> first =
       IOBufferMemoryDescriptor::withCapacity(kBlockBytes, kIODirectionIn, true);
   if (!first.get()) {
@@ -715,13 +801,13 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
   if (!whole->open(client, 0, kIOStorageAccessReader)) {
     fail("open", 0);
   }
-  IOReturn status = readMediaBytes(whole, client, first.get(), 0, &gMediaOp);
+  IOReturn status = readMediaBytes(whole, client, first.get(), kGptHeaderOffset, &gMediaOp);
   whole->close(client);
   if (status != kIOReturnSuccess) {
     fail("first-read", static_cast<uint32_t>(status));
   }
   const uint8_t *bytes = static_cast<const uint8_t *>(first->getBytesNoCopy());
-  uint32_t magic = bytes && memcmp(bytes + kNxsbOffset, kNxsbMagic, sizeof(kNxsbMagic)) == 0 ? 1u : 0u;
+  uint32_t magic = bytes && memcmp(bytes, kEfiPartMagic, sizeof(kEfiPartMagic)) == 0 ? 1u : 0u;
 
   // 2. The media has to be free before anyone above it can claim it: the container scheme opens its
   // provider, and a probe that still held the read open would be measuring its own lease. The close
@@ -730,18 +816,26 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
   // apfs.kext is in the boot kext collection, not the linked kernel, exactly like IOStorageFamily --
   // and nothing in the boot asks for a filesystem on a disk that only just appeared. Loading it is
   // also what schedules matching for its personalities, which is why this happens before the wait.
+  //
+  // What is *not* done here is slicing the disk. IOBlockStorageDriver registers the whole media with
+  // kIOServiceAsynchronous, and round116 read the consequence: IOKit's own configuration threads
+  // matched IOGUIDPartitionScheme and IOMediaBSDClient onto it and named every partition before a
+  // hand-built tree could. A window that carries a partition table lets that pass do the work, so the
+  // APFS slice this round measures is Apple's scan of Apple's bytes, not this file's.
   kern_return_t loaded = OSKextLoadKextWithIdentifier(kApfsKext);
 
   // 3. Poll, do not block on a semaphore: the attach this is waiting for is performed by the same
   // configuration machinery that is running this handler, so the wait has to keep handing control
-  // back. Step 5 of the partition path has been doing exactly this since round116, and the budget
-  // here is the same shape -- 30 s at 10 ms a turn, which fits long before the tick watchdog's
-  // 60000 ticks. The counters start now, so what they report is the storage stack's traffic and not
-  // the one read taken above.
+  // back. Step 5 of the partition path has been doing exactly this since round116. The budget is four
+  // times round127's because a real container is read, not just recognised: at the pace the PIO path
+  // moves (round127's 56 blocks in the 295 ticks this board's own counter calls about one second) a
+  // few thousand blocks is tens of seconds, and the panic that follows has to be the probe's answer
+  // rather than the watchdog's. board.toml raises armcpu-clock-panic to match. The counters start now,
+  // so what they report is the storage stack's traffic and not the one read taken above.
   __atomic_store_n(&gBlocksRead, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&gBlocksWritten, 0, __ATOMIC_RELEASE);
   ApfsDepth best = { 0, 0, 0, 0 };
-  for (uint32_t attempt = 0; attempt < 3000 && !best.volume; attempt++) {
+  for (uint32_t attempt = 0; attempt < 12000 && !best.volume; attempt++) {
     ApfsDepth now = { 0, 0, 0, 0 };
     measureApfsDepth(whole, &now, 0);
     if (now.seen > best.seen) {
@@ -759,7 +853,7 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
     IOSleep(10);
   }
 
-  panic("CloverBlock r127: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u r=%u w=%u",
+  panic("CloverBlock r128: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u r=%u w=%u",
         __atomic_load_n(&gWindowFirst, __ATOMIC_ACQUIRE),
         __atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE), magic,
         static_cast<uint32_t>(loaded), best.seen, best.scheme, best.container, best.volume,
@@ -780,7 +874,7 @@ extern "C" void clover_block_run(void)
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    IOLog("CloverBlock r127: refire n=%u (already ran)\n", fires);
+    IOLog("CloverBlock r128: refire n=%u (already ran)\n", fires);
     return;
   }
 
@@ -790,23 +884,35 @@ extern "C" void clover_block_run(void)
   }
 
   // 1b. Which geometry to describe. `clover-apfs=1` asks for logfs's own window, and the window only
-  // exists if this boot's card reported GPT entry 39 as exactly the extent drivers/CloverSdhci reads:
-  // a media that claimed a partition the partition table does not describe would be a second card,
-  // and every filesystem above it would be reading the wrong bytes. Latched here, before the device
-  // is published, because reportMaxValidBlock() is what IOBlockStorageDriver builds the media from
-  // and the size has to be right the first time anything reads it.
+  // exists if this boot's card reported GPT entry 39 as exactly the extent drivers/CloverSdhci reads.
+  // `clover-apfs=2` asks for the root image instead: entry 64's window is read for its SHNGROOT
+  // manifest, and the media becomes the OS disk the manifest points at. A media that claimed a
+  // partition the partition table does not describe would be a second card, and every filesystem above
+  // it would be reading the wrong bytes. Latched here, before the device is published, because
+  // reportMaxValidBlock() is what IOBlockStorageDriver builds the media from and the size has to be
+  // right the first time anything reads it.
   uint32_t apfs = 0;
   if (PE_parse_boot_argn("clover-apfs", &apfs, sizeof(apfs)) && apfs) {
-    uint32_t first = 0;
-    uint32_t sectors = 0;
-    clover_emmc_block_window(&first, &sectors);
-    if (!first || !sectors) {
-      // The printed value is the sector count. Zero means the entry never matched; a matching entry with
-      // first LBA zero is not a thing a GPT can hold, so the two cases do not need separating.
-      fail("window", sectors);
+    if (apfs == 2) {
+      uint32_t first = 0;
+      uint32_t sectors = 0;
+      clover_emmc_block_userdata_window(&first, &sectors);
+      if (!first || !sectors) {
+        fail("udwindow", sectors);
+      }
+      rootWindowFromManifest(first, sectors);
+    } else {
+      uint32_t first = 0;
+      uint32_t sectors = 0;
+      clover_emmc_block_window(&first, &sectors);
+      if (!first || !sectors) {
+        // The printed value is the sector count. Zero means the entry never matched; a matching entry with
+        // first LBA zero is not a thing a GPT can hold, so the two cases do not need separating.
+        fail("window", sectors);
+      }
+      __atomic_store_n(&gWindowFirst, first, __ATOMIC_RELEASE);
+      __atomic_store_n(&gWindowSectors, sectors, __ATOMIC_RELEASE);
     }
-    __atomic_store_n(&gWindowFirst, first, __ATOMIC_RELEASE);
-    __atomic_store_n(&gWindowSectors, sectors, __ATOMIC_RELEASE);
   }
 
   // 2. IOStorageFamily plus the exact original class size: every override in CloverBlockDevice
@@ -852,10 +958,11 @@ extern "C" void clover_block_run(void)
     fail("media", 0);
   }
 
-  // 4b. Under the window this is where the run ends, and deliberately so: steps 5-9 below are the
-  // partition-named root's measurements, and a window has no GPT at its block zero, hence no
-  // IOGUIDPartitionScheme, no disk0s39, no root dictionary and no bdevvp. What round127 is asking
-  // instead is whether Apple's own filesystem lives on top of this tree.
+  // 4b. Under a window this is where the run ends, and deliberately so: steps 5-9 below are the
+  // partition-named root's measurements, and what a window is asking instead is whether Apple's own
+  // filesystem lives on top of this tree. Round127's window was a bare container, so it had no
+  // partition scheme, no disk0s39 and nothing for those steps to measure; round128's does carry a GPT,
+  // and the automatic pass will slice it, but the question stays the same one level up.
   if (__atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE)) {
     apfsProbe(whole, device);
   }
@@ -981,7 +1088,7 @@ extern "C" void clover_block_run(void)
     fail("alias-match", reinterpret_cast<uint64_t>(aliasService));
   }
 
-  IOLog("CloverBlock r127: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
+  IOLog("CloverBlock r128: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
         kRootAlias, bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
 }

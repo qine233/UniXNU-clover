@@ -550,29 +550,34 @@ def check_board(errors: list) -> str:
     if adt.get("packed_data_ramdisk"):
         errors.append("[payload.adt] packed_data_ramdisk is true, but this board's root is the "
                       "dense mockfs image; the payload step would emit PackedRAMDisk")
-    # Round127 asks a different question of the same media, and the answer is on the other side of a
-    # window: drivers/CloverBlock now describes logfs's own partition, whose block zero is an APFS
-    # container superblock instead of a GPT header, so IOGUIDPartitionScheme publishes no disk0s39
-    # under it and the alias step 9 used to write never happens. The root therefore goes back to the
-    # RAMDisk the payload carries, which is the shape every round up to 118 booted with, and stays
-    # out of the way of the probe. Both eMMC-named arguments are refused, because either one would
-    # spend ten timeouts and panic in IOKitBSDInit.cpp:984 before the depth is reported.
+    # Round127 asked a different question of the same media, and the answer was on the other side of a
+    # window: drivers/CloverBlock described logfs's own partition, whose block zero is an APFS container
+    # superblock instead of a GPT header. Round128 moved to userdata, whose window *does* carry a GPT --
+    # the root image's OS window is a whole disk -- so the automatic partition pass has work to do again.
+    # The root still has to stay off that disk: the run ends inside apfsProbe, which never returns, so
+    # steps 5-9 (the wait for a named partition, the alias) do not happen, and a rd= that named a slice
+    # would have IOKitBSDInit waiting for a tree the config thread is busy building. The RAMDisk is the
+    # shape every round up to 118 booted with, and it stays out of the way of the probe.
     if "rd=md0" not in board["payload"]["kernel_args"]:
-        errors.append('[payload] kernel_args has no rd=md0: round127 wants the RAMDisk root, because '
-                      'the window CloverBlock publishes has no partition table under it and nothing '
-                      'named disk0s39 or md0s39 exists to mount')
+        errors.append('[payload] kernel_args has no rd=md0: round128 wants the RAMDisk root, because '
+                      'the probe that runs under clover-apfs never returns and nothing publishes an '
+                      'eMMC-named root for the kernel to mount')
     for retired in ("rd=md0s39", "rd=disk0s39"):
         if retired in board["payload"]["kernel_args"]:
             errors.append(f'[payload] {retired} names a media that only the whole-card description '
-                          'publishes; round127 re-scopes it to logfs\'s window, so that root search '
-                          'would time out')
-    if "clover-apfs=1" not in board["payload"]["kernel_args"]:
-        errors.append('[payload] kernel_args has no clover-apfs=1: without it CloverBlock keeps the '
-                      'whole-card geometry and never reaches the apfs depth probe')
+                          'publishes; round127 re-scoped it to logfs\'s window and round128 to the '
+                          'root image, so that root search would time out')
+    if "clover-apfs=2" not in board["payload"]["kernel_args"]:
+        errors.append('[payload] kernel_args has no clover-apfs=2: without it CloverBlock keeps the '
+                      'whole-card geometry (or logfs under =1) and never reads the SHNGROOT manifest')
     if "clover-emmc=21" not in board["payload"]["kernel_args"]:
-        errors.append('[payload] clover-apfs=1 is set but clover-emmc=21 is not: the logfs window is '
-                      "published by the same mode 21 run that reads EXT_CSD, so the probe would stop "
-                      'at "window 0"')
+        errors.append('[payload] clover-apfs=2 is set but clover-emmc=21 is not: both windows are '
+                      "published by the same mode 21 run that reads EXT_CSD and walks the GPT, so the "
+                      'probe would stop at "udwindow 0"')
+    userdata = board.get("userdata")
+    if not userdata or not userdata.get("windows"):
+        errors.append('[userdata] is missing or declares no windows: ./unixnu build userdata has '
+                      'nothing to write, and CloverBlock would read an empty partition as a manifest')
     if not board["payload"].get("trust_cache_sha256"):
         errors.append("[payload] trust_cache_sha256 is empty: the mockfs init program would "
                       "have no offline trust, and the exec of /sbin/launchd is a panic")

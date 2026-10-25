@@ -233,6 +233,11 @@ static uint32_t gReadBlock[128];
 static uint32_t gExtCsd[128];
 static const uint32_t kLogfsFirstLba = 12320768u;
 static const uint32_t kLogfsLastLba = 12337151u;   // sysfs: start 12320768, 16384 sectors
+// The Data partition as the unit numbers it (mmcblk0p64), from the same dump the logfs extent came
+// from: 106347199 sectors, ending 33 sectors short of the card so the backup GPT stays outside it.
+// Round128 puts the iPadOS root image here, so its entry is a window the way logfs's is.
+static const uint32_t kUserDataFirstLba = 15795488u;
+static const uint32_t kUserDataLastLba = 122142686u;
 static volatile uint32_t gBlockReady = 0;
 static volatile uint32_t gBlockSectors = 0;
 static volatile uint32_t gBlockGuard = 0;
@@ -244,6 +249,11 @@ static volatile uint32_t gBlockGuard = 0;
 // partition table being touched. Zero until the entry walk says the extent is exactly right.
 static volatile uint32_t gBlockWindowFirst = 0;
 static volatile uint32_t gBlockWindowSectors = 0;
+// Round128's third export, same shape for userdata (entry 64). The image this port writes at the
+// partition's byte zero is a manifest, not a filesystem: drivers/CloverBlock reads the first 4 KiB
+// through the window below, finds the OS window inside it, and re-scopes the media to that.
+static volatile uint32_t gBlockUserDataFirst = 0;
+static volatile uint32_t gBlockUserDataSectors = 0;
 
 // Mode 17 stores the report as text, so the first bytes of the block identify it when read on
 // another OS. The newline is part of the stored length: the block reads as a small text file.
@@ -955,7 +965,7 @@ static bool readPioBlock (uint32_t lba, uint32_t *words, uint32_t &wordCount,
   return readDataBlock (MMC_READ_SINGLE_BLOCK, lba, words, wordCount, status);
 }
 
-// The three symbols drivers/CloverBlock links against. Ready and the sector count are only what
+// The symbols drivers/CloverBlock links against. Ready and the sector count are only what
 // mode 21 published after a clean EXT_CSD read whose SEC_COUNT contains the logfs extent, so the
 // block device can never describe a card this port has not measured. A block read is gated on
 // that geometry, on the same single-block PIO path, and on a guard that keeps a second caller out
@@ -983,6 +993,20 @@ extern "C" void clover_emmc_block_window (uint32_t *first, uint32_t *sectors)
   }
   if (sectors) {
     *sectors = __atomic_load_n (&gBlockWindowSectors, __ATOMIC_ACQUIRE);
+  }
+}
+
+// Round128's counterpart: userdata (entry 64) as a window, zero until this boot's card reports that
+// entry as exactly the extent board.toml recorded. The geometry above the logfs one is a separate
+// pair rather than a replacement, so a release that asks for the wrong window reads the wrong bytes
+// and says so, instead of silently describing a different partition.
+extern "C" void clover_emmc_block_userdata_window (uint32_t *first, uint32_t *sectors)
+{
+  if (first) {
+    *first = __atomic_load_n (&gBlockUserDataFirst, __ATOMIC_ACQUIRE);
+  }
+  if (sectors) {
+    *sectors = __atomic_load_n (&gBlockUserDataSectors, __ATOMIC_ACQUIRE);
   }
 }
 
@@ -1747,10 +1771,11 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   uint32_t word6_12 = 0, word18_12 = 0, word20_12 = 0, word21_12 = 0;
 
   // Mode 14: the header's entry-array pointer, count and size drive a walk over the entry blocks,
-  // and the partition whose name is exactly "logfs" is reported by its GPT index and extent.
+  // and the partitions named "logfs" and "userdata" are reported by their GPT index and extent.
   uint32_t entryEl14 = 0, entryEn14 = 0, entryEs14 = 0;
   uint32_t entryBlocks14 = 0, entryFail14 = 0, entryGot14 = 0;
   uint32_t entryFound14 = 0, entryFirst14 = 0, entryLast14 = 0;
+  uint32_t entryUdFound = 0, entryUdFirst = 0, entryUdLast = 0;
   uint32_t entryType14 = 0, entryTypeB14 = 0;
   uint32_t entryFirstIdx15 = 0, entryFirstA15 = 0, entryFirstW15[3] = { 0, 0, 0 };
   bool entryOk14 = false, entryBad14 = false;
@@ -2403,10 +2428,18 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                   entryLast14 = entry[10];
                   entryType14 = entry[0];
                   entryTypeB14 = ((entry[1] & 0xffffu) << 16) | (entry[2] & 0xffffu);
-                  break;
+                }
+                // "userdata", the same UTF-16LE encoding: eight characters span words 14..17 and
+                // word 18 is the terminator. Round128 needs both names, and logfs (entry 39) comes
+                // first, so the loop no longer stops at the one it used to find.
+                if (entryWords >= 19 && entry[14] == 0x00730075u && entry[15] == 0x00720065u &&
+                    entry[16] == 0x00610064u && entry[17] == 0x00610074u && entry[18] == 0) {
+                  entryUdFound = index;
+                  entryUdFirst = entry[8];
+                  entryUdLast = entry[10];
                 }
               }
-              if (entryFound14) {
+              if (entryFound14 && entryUdFound) {
                 break;
               }
             }
@@ -2419,6 +2452,12 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
               entryLast14 == kLogfsLastLba) {
             __atomic_store_n (&gBlockWindowFirst, entryFirst14, __ATOMIC_RELEASE);
             __atomic_store_n (&gBlockWindowSectors, entryLast14 - entryFirst14 + 1,
+                              __ATOMIC_RELEASE);
+          }
+          if (entryUdFound != 0 && entryUdFirst == kUserDataFirstLba &&
+              entryUdLast == kUserDataLastLba) {
+            __atomic_store_n (&gBlockUserDataFirst, entryUdFirst, __ATOMIC_RELEASE);
+            __atomic_store_n (&gBlockUserDataSectors, entryUdLast - entryUdFirst + 1,
                               __ATOMIC_RELEASE);
           }
           if (probeMode == 16 && entryFound14 != 0) {
