@@ -4952,6 +4952,143 @@ logfs 首两块的那条；只要中间没有别的系统写过 logfs，`n=343 s
 原样出现。再刷一次同一颗 payload 再拍一张，如果两次数值相同，就说明读的是盘，
 不是这一次启动的内存。
 
+## round104 读数：记录跨启动还在，这一轮一个字也没写
+
+照片（节选）：
+
+```text
+lg i=39 a=12320768 b=12337151
+bk m=554e5855 31474f4c n=343 s=000059b2 c=1
+bt unixnu clover emmc log|g cfg=00002017 m=01 n=fc
+@CloverSdhci.cpp:3269
+```
+
+这是第一次「上一次启动写、这一次启动读」的闭环，而且四层证据互相对得上：
+
+1. **`c=1` 只能来自卡。** mode 18 的整条链里没有一次 `writePioBlock`，缓冲区块 1
+   是这次启动刚从盘上读出来的；它对前 343 字节重新求和，等于头块里上次写下的
+   `000059b2`。内存里没有任何东西能提供这个等式。
+2. **头没变。** `m0=554e5855`、`m1=31474f4c`、`n=343`，与 round103 写下的完全一致；
+   `s` 也还是 `000059b2`。`lg` 那行同时给出坐标 `12320768..12337151`，说明读的仍是
+   `mmcblk0p39`，不是别处碰巧同样带 magic 的块。
+3. **`bt` 是肉眼证据。** 前 48 字节打印出来是 23 字节前缀
+   `unixnu clover emmc log\n`（换行印成 `|`）加上正文的头 25 字节
+   `g cfg=00002017 m=01 n=fc`（第 48 个字节是 `d=` 前的空格，照片上看不见）——
+   正是 round103 报告的第一行。也就是说盘上躺着的不只是数字，是那一轮屏幕上
+   报告的原文。
+4. **窗口只有 48 字节。** 23 + 25 正好截在第一行中间，所以 `bt` 故意不打全；
+   要读全文用 Linux 侧 `dd`。
+
+结论：一条自描述记录能在两次冷启动之间存活，读回路径不依赖写路径的内存副本。
+还没证的是「下一条能不能写在不覆盖它的地方」。mode 19 只改选址，不改写/读本身。
+
+## v0.2.77（round105）：不再覆盖首块，改为追加到下一个空槽
+
+mode 19 = mode 15 的整条链 + mode 18 的只读检查 + mode 17 的记录布局，多出的一步是
+**先找空位**。logfs 开头按固定的两块一格划分，共 16 格：
+
+| 格 | LBA | 内容 |
+| --- | --- | --- |
+| 0 | `a+0`、`a+1` | 已有记录（round103 写的） |
+| 1 | `a+2`、`a+3` | 本轮的记录 |
+| … | … | … |
+| 15 | `a+30`、`a+31` | 最后一格 |
+
+`a` 仍是 logfs 首 LBA（`12320768`）。扫描从格 0 开始逐格读头块：头两个字仍是
+`554e5855`/`31474f4c` 就认为这一格被占，继续下一格；第一格读不到 magic 就是空位。
+扫描最多 16 格，满了只打 `ap f=`，绝不回绕到格 0——后一次启动不能悄悄吃掉最老的记录。
+
+找到空位 `k` 后，写头块（`[5]=19`、`[6]=正文长度`、`[7]=k`）与文本块，节奏与
+mode 17 完全相同（CMD24 → 同节奏 FIFO → CMD13 等 `READY_FOR_DATA`），每块写完
+立刻读回，数 `hc=`/`tc=`。报告追加两行：
+
+```text
+ap s=1 ss=2 a=12320770 n=343 h=1 t=1 hc=128 tc=343
+bta unixnu clover emmc log|g cfg=...
+```
+
+`s` 是落盘的格号，`ss` 是这次一共读了几次头块（含发现空位的那一次；`s=1 ss=2`
+表示格 0 已占、格 1 是空位），`a` 是新记录的头块 LBA，`n` 是文本总字节数，
+`h`/`t` 是两次写的判定，`hc`/`tc` 是两次读回的相同数，`bta` 是从盘上读回的新记录
+前 48 字节。
+
+预期（上一轮 round103 的记录仍在格 0，round104 只读没写；`bk`/`bt` 是 mode 18
+那一段对格 0 的复读，`ap`/`bta` 是本轮新写的格 1）：
+
+```text
+bk m=554e5855 31474f4c n=343 s=000059b2 c=1
+bt unixnu clover emmc log|...
+ap s=1 ss=2 a=12320770 n=343 h=1 t=1 hc=128 tc=343
+bta unixnu clover emmc log|...
+```
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `ap s=1 ss=2 a=12320770 n=343 h=1 t=1 hc=128 tc=343` + `bta unixnu clover emmc log\|…` | 格 0 被正确认成已占，新记录写在格 1 并原样读回；旧记录没被碰 | 再刷一次：`s` 应变成 2、`a` 变成 `12320772`，格 1 的记录仍在 |
+| `ap s=0 ss=1 …` | 格 0 的头没认出来，本轮覆盖了旧记录 | 查 magic 比较与 `bk` 那条链；旧记录可能已丢 |
+| `ap s=1 … h=1 t=1` 但 `hc<128` 或 `tc<343` | 格找对了，回读不完整 | 对照 round103 的 `hc=128 tc=343` 查数据机 |
+| `ap f=16 ss=16` | 16 格全被占，什么都没写 | 用 Linux 侧把 logfs 前 64 KB 清掉，或扩大格数 |
+| `ap r=<k> st=…` | 扫描第 k 格头块读失败 | 看状态字，对照 round102 的 `int=` 序列 |
+| `ap i=0` / `ap g=1` | 没找到 logfs 或坐标不符 | 回 mode 15 看 `lg` |
+
+产物（内核变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round105-payload.img` | 58720256 B | `ff695c1b9041b08dd9496b3a93e4f578da6cbf5e11a5886b1a36112d9a28fc63` |
+| `round105-kernel.macho`（构建产物） | 51965952 B | `15fafb114b7f06b9ca87ac402834fb6469ef9f39dd7179b631a35a745d67e7a5` |
+| `round105-in-volume-kernel.macho`（卷内副本） | 51965952 B | `31a434da698fa2a97b8fc3724f95f32b868efc14dbd6c417e97800687878ac5a` |
+| `round105-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round105-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round105-kernel.macho.adt` | 13476 B | `c3d41454c34072c1a7c4ad621b989b4201f547e1fe8dff67447ddd08e75a6295` |
+| `round105-unixnu.toml` | 573 B | `f3c8442cb439a2c56ddc68f1cdd74ad46b086f2d38739f0f1780a5d4c2613ac3` |
+
+校验器：探针 35 处 5960 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在。
+反汇编自查（对象 `CloverSdhci.o`）：
+
+- 扫描循环：起点 LBA `0xbc0000`，`add w22, w22, #2` 在 `0x1c27c`，上限
+  `cmp w20, #0x10` 在 `0x1c280`/`0x1c344`；扫描头块读在 `0x1c260`。
+- magic 常量 `55 58 4e 55 4c 4f 47 31` 在 `__TEXT,__literal8` `0x1f638`
+  （`UXNULOG1`），mode 17/19 共用。
+- 头块构造：magic 8 字节在 `0x1c75c`，`[2..3]` 在 `0x1c760`，`[4..5]`
+  在 `0x1c768`（`mov w10,#0x13` 在 `0x1c764`，即 `[5]=19`），`[6..7]`
+  在 `0x1c76c`（`w20` 是格号）。
+- PIO 调用对：头块 `0x1c77c`/`0x1c790`/`0x1c7a8`，文本块
+  `0x1d01c`/`0x1d030`/`0x1d04c`。
+- 字面量逐字符发射：`\nap s=` 在 `0x1d220` 起，`\nbta ` 在 `0x1d7a4` 起，
+  后接 `emitDec`/`emitByte` 与 `.`=`0x2e`、`|`=`0x7c` 的映射
+  （`0x1d84c`/`0x1d850`）。
+
+内核符号：`coldBringUp` `0xfffffff00797ba50`、
+`readPioBlock` `0xfffffff007990610`、`writePioBlock` `0xfffffff00799085c`、
+`waitCardReady` `0xfffffff007990aa8`；编译进的 panic 行号是 3418
+（`mov w8,#0xd5a` 在 `0x1f530`）。门是 `mode != 19`，分发器
+`mode >= 7 && mode <= 19`。卷内 boot-args 末尾是
+`… clover-pmgr=2 clover-emmc=19 armcpu-clock-panic=60000`。
+boot 仍是 `round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round105-payload.img
+fastboot reboot
+```
+
+**拍一张就够。这一轮只写格 1，格 0 应保持 round103 的原样。** 如果还想证追加，
+再刷一次同一颗 payload：`s` 应变成 2、`a=12320772`，而格 0、格 1 两条旧记录
+仍然在盘上（Linux 侧 `dd` 可读）。
+
+Linux 侧取日志（设备已 root；现在 logfs 开头是两格连续记录）：
+
+```sh
+adb shell su -c 'dd if=/dev/block/by-name/logfs bs=512 count=4' > logfs.bin
+xxd logfs.bin | head
+# 格 0 的文本（round103）
+dd if=logfs.bin bs=512 skip=1 count=1 2>/dev/null | tr -d '\0'
+# 格 1 的文本（本轮）
+dd if=logfs.bin bs=512 skip=3 count=1 2>/dev/null | tr -d '\0'
+```
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -4982,8 +5119,10 @@ logfs 首两块的那条；只要中间没有别的系统写过 logfs，`n=343 s
   两块的布局存进 logfs（头块 `UXNU`/`LOG1` + 长度 + 字节和，文本块前缀 + 正文）
   并逐块读回比对（round103 读回 `n=343`、`hc=128 tc=343`，和 `0x59b2` 与离线重算
   一致），`v0.2.76` 起只读不写，下一次启动从 logfs 取回上一轮存下的记录、
-  校验 magic/长度/字节和并打出前 48 字节，用来证明它跨启动存活，
-  仍然不发布
+  校验 magic/长度/字节和并打出前 48 字节（round104 读回 `c=1`，`bt` 正是上一轮
+  报告的第一行），用来证明它跨启动存活，`v0.2.77` 起把 logfs 开头当成 16 个固定
+  两块格，扫描到第一格没有 magic 就写那一格（头块多一个格号字），不再覆盖格 0，
+  读完逐字/逐字节比对新记录，仍然不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令、数据阶段能不能自己走完」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，

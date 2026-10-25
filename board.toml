@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: read back the record a previous boot stored in logfs"
+title = "clover emmc: append this boot's record beside the last one"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1233,7 +1233,17 @@ kernel_args = [
   # wrote, and the bytes came off the card rather than out of this run's memory. "c=0" with the
   # right magic is a length or sum mismatch worth reading; a different magic means the block
   # holds something else and the record is not where mode 17 put it.
-  "clover-emmc=18",
+  # Round104's photograph: "bk m=554e5855 31474f4c n=343 s=000059b2 c=1" and
+  # "bt unixnu clover emmc log|g cfg=00002017 m=01 n=fc". The record was written by round103 and
+  # read by a later boot that wrote nothing, and the 25 body bytes in the preview are exactly the
+  # first line of round103's report. Persistence is closed.
+  # Mode 19 makes that record survive the next boot instead of being rewritten: logfs start is a
+  # sequence of two-block slots (header at 2k, text at 2k+1), and the first header without the
+  # magic is the next free one. The scan is bounded at 16 slots. "ap s=1 ss=2 a=12320770 n=343
+  # h=1 t=1 hc=128 tc=343" plus "bta unixnu clover emmc log|..." is the positive: slot 0 was
+  # recognised as occupied, so this boot appended to slot 1 and read it back. "ap f=16" means the
+  # window is full and nothing was written; "ap r=<slot> st=..." names a header read that failed.
+  "clover-emmc=19",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

@@ -224,9 +224,17 @@ static uint32_t gReadBlock[128];
 // Mode 17 stores the report as text, so the first bytes of the block identify it when read on
 // another OS. The newline is part of the stored length: the block reads as a small text file.
 // Mode 18 only reads that record: the magic and the byte sum decide whether this boot can see
-// what a previous one wrote, without writing anything itself.
+// what a previous one wrote, without writing anything itself. Mode 19 appends: slot k is two
+// blocks at 2k, and the scan stops at the first header without the magic, so each boot's record
+// lands beside the last one instead of on top of it.
 static const char kLogPrefix[] = "unixnu clover emmc log\n";
 static const uint32_t kLogPrefixLength = sizeof (kLogPrefix) - 1;
+// Mode 19 treats logfs start as a sequence of fixed two-block slots: header at 2k, text at 2k+1.
+// The scan is bounded, so a partition whose slots are all taken reports "ap f=" instead of
+// quietly wrapping onto the oldest record.
+static const uint32_t kLogMagic0 = 0x554e5855u;
+static const uint32_t kLogMagic1 = 0x31474f4cu;
+static const uint32_t kLogSlots = 16;
 
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
@@ -1621,6 +1629,23 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   uint32_t logSum18 = 0;
   bool logHeaderOk18 = false, logTextOk18 = false, logCheck18 = false;
 
+  // Mode 19 appends the report to the next free two-block slot instead of rewriting slot 0, so
+  // one boot's record cannot destroy the previous one. The scan is the whole experiment: if it
+  // stops at slot 1 because slot 0 already carries the magic, then the card kept what the last
+  // boot wrote, and the write below lands somewhere new.
+  uint32_t logSlot19 = 0, logScan19 = 0, logSlotLba19 = 0;
+  uint32_t logFindWords19 = 0, logFindStatus19 = 0;
+  bool logFindOk19 = true;
+  uint32_t logLen19 = 0, logChecksum19 = 0;
+  uint32_t logHeaderWords19 = 0, logTextWords19 = 0;
+  uint32_t logHeaderStatus19 = 0, logTextStatus19 = 0;
+  uint32_t logReadyRsp19 = 0, logReadyStatus19 = 0, logReadyPolls19 = 0;
+  uint32_t logHeaderReadWords19 = 0, logTextReadWords19 = 0;
+  uint32_t logHeaderReadStatus19 = 0, logTextReadStatus19 = 0;
+  uint32_t logHeaderEqual19 = 0, logTextEqual19 = 0;
+  bool logHeaderOk19 = false, logTextOk19 = false;
+  bool logHeaderReadOk19 = false, logTextReadOk19 = false;
+
   bool cmd2Ok = false;
   if (probeMode == 0) {
     if (ready) {
@@ -2960,6 +2985,130 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
               }
             }
           }
+
+          if (probeMode >= 19) {
+            // Append rather than overwrite. Slot k is two blocks at logfs start + 2k, and the
+            // first header that does not carry this driver's magic is free. The loop is bounded
+            // at kLogSlots: a full window is printed as `ap f=`, never wrapped onto slot 0, so a
+            // later boot cannot eat the oldest record by accident.
+            if (entryFound14 == 0) {
+              emitText ("\nap i=0");
+            } else if (!(entryFirst14 == 12320768u && entryLast14 == 12337151u)) {
+              emitText ("\nap g=1");
+            } else {
+              logFindOk19 = true;
+              for (logSlot19 = 0; logSlot19 < kLogSlots; logSlot19++) {
+                logFindOk19 = readPioBlock (entryFirst14 + 2 * logSlot19, gReadBlock,
+                                            logFindWords19, logFindStatus19);
+                if (!logFindOk19 ||
+                    (gReadBlock[0] != kLogMagic0 || gReadBlock[1] != kLogMagic1)) {
+                  break;
+                }
+              }
+              logScan19 = (logSlot19 < kLogSlots) ? logSlot19 + 1 : kLogSlots;
+              if (!logFindOk19) {
+                emitText ("\nap r=");
+                emitDec (logSlot19);
+                emitText (" st=");
+                emitHex (logFindStatus19, 8);
+              } else if (logSlot19 >= kLogSlots) {
+                emitText ("\nap f=");
+                emitDec (logSlot19);
+                emitText (" ss=");
+                emitDec (logScan19);
+              } else {
+                logSlotLba19 = entryFirst14 + 2 * logSlot19;
+                logLen19 = kLogPrefixLength + gReportLength + 1;
+                logChecksum19 = 0;
+                for (uint32_t i = 0; i < kLogPrefixLength; i++) {
+                  logChecksum19 += static_cast<uint8_t> (kLogPrefix[i]);
+                }
+                for (uint32_t i = 0; i < gReportLength; i++) {
+                  logChecksum19 += static_cast<uint8_t> (clover_emmc_report[i]);
+                }
+                logChecksum19 += static_cast<uint8_t> ('\n');
+                for (uint32_t i = 0; i < kBlockWords; i++) {
+                  gWriteBlock[i] = 0;
+                }
+                gWriteBlock[0] = kLogMagic0;
+                gWriteBlock[1] = kLogMagic1;
+                gWriteBlock[2] = logSlotLba19;
+                gWriteBlock[3] = logLen19;
+                gWriteBlock[4] = logChecksum19;
+                gWriteBlock[5] = 19;
+                gWriteBlock[6] = gReportLength;
+                gWriteBlock[7] = logSlot19;
+                logHeaderOk19 = writePioBlock (logSlotLba19, gWriteBlock, logHeaderWords19,
+                                               logHeaderStatus19);
+                waitCardReady (logReadyRsp19, logReadyStatus19, logReadyPolls19);
+                logHeaderReadOk19 = readPioBlock (logSlotLba19, gReadBlock, logHeaderReadWords19,
+                                                  logHeaderReadStatus19);
+                if (logHeaderReadOk19) {
+                  for (uint32_t i = 0; i < kBlockWords; i++) {
+                    if (gReadBlock[i] == gWriteBlock[i]) {
+                      logHeaderEqual19++;
+                    }
+                  }
+                }
+                uint8_t *text = reinterpret_cast<uint8_t *> (gWriteBlock);
+                for (uint32_t i = 0; i < 512; i++) {
+                  text[i] = 0;
+                }
+                for (uint32_t i = 0; i < kLogPrefixLength; i++) {
+                  text[i] = static_cast<uint8_t> (kLogPrefix[i]);
+                }
+                for (uint32_t i = 0; i < gReportLength; i++) {
+                  text[kLogPrefixLength + i] = static_cast<uint8_t> (clover_emmc_report[i]);
+                }
+                text[kLogPrefixLength + gReportLength] = '\n';
+                logTextOk19 = writePioBlock (logSlotLba19 + 1, gWriteBlock, logTextWords19,
+                                             logTextStatus19);
+                waitCardReady (logReadyRsp19, logReadyStatus19, logReadyPolls19);
+                logTextReadOk19 = readPioBlock (logSlotLba19 + 1, gReadBlock, logTextReadWords19,
+                                                logTextReadStatus19);
+                if (logTextReadOk19) {
+                  const uint8_t *readBack = reinterpret_cast<const uint8_t *> (gReadBlock);
+                  for (uint32_t i = 0; i < logLen19; i++) {
+                    if (readBack[i] == text[i]) {
+                      logTextEqual19++;
+                    }
+                  }
+                }
+                emitText ("\nap s=");
+                emitDec (logSlot19);
+                emitText (" ss=");
+                emitDec (logScan19);
+                emitText (" a=");
+                emitDec (logSlotLba19);
+                emitText (" n=");
+                emitDec (logLen19);
+                emitText (" h=");
+                emitDec (logHeaderOk19 ? 1 : 0);
+                emitText (" t=");
+                emitDec (logTextOk19 ? 1 : 0);
+                emitText (" hc=");
+                emitDec (logHeaderEqual19);
+                emitText (" tc=");
+                emitDec (logTextEqual19);
+                if (!logHeaderOk19) {
+                  emitText (" hs=");
+                  emitHex (logHeaderStatus19, 8);
+                }
+                if (!logTextOk19) {
+                  emitText (" ts=");
+                  emitHex (logTextStatus19, 8);
+                }
+                if (logTextReadOk19) {
+                  emitText ("\nbta ");
+                  const uint8_t *readBack = reinterpret_cast<const uint8_t *> (gReadBlock);
+                  for (uint32_t i = 0; i < logLen19 && i < 48; i++) {
+                    uint8_t c = readBack[i];
+                    emitByte (c == '\n' ? '|' : (c >= 0x20 && c < 0x7f) ? static_cast<char> (c) : '.');
+                  }
+                }
+              }
+            }
+          }
         } else {
           emitText ("\ndt f=");
           emitDec (firstUs12);
@@ -3238,7 +3387,7 @@ extern "C" void clover_emmc_run (void)
   // the storage instrument it was asked for.
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
       mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12 && mode != 13 &&
-      mode != 14 && mode != 15 && mode != 16 && mode != 17 && mode != 18) {
+      mode != 14 && mode != 15 && mode != 16 && mode != 17 && mode != 18 && mode != 19) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -3259,7 +3408,7 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp (mode == 5, (mode >= 7 && mode <= 18) ? mode : 0);
+    coldBringUp (mode == 5, (mode >= 7 && mode <= 19) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.
