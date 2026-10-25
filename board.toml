@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: CMD9's CRC gate, then the first selection"
+title = "clover emmc: the selected card reads LBA 1"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1131,7 +1131,21 @@ kernel_args = [
   # R2 fails the gate; if "c7" still works, later rounds can keep the check off for CMD9 only,
   # and if "c7" times out too, the post-CRC path is the thing to fix first. "c7 to"/"crc" with
   # "c13 ok" => the selection itself failed; "c13b st=4" is the proof the card is in transfer.
-  "clover-emmc=9",
+  #
+  # Round95's photograph took the first reading: c2 ok, c3 ok st=2, c13 ok st=3, c9 ok, c7 ok,
+  # c13b ok st=4. The CSD, shifted left 8 bits because the host drops the CRC byte of a 136-bit
+  # response, is bit-identical to the stock dump in facts/81ffcaaa-20261022-210928/mmc_device.txt;
+  # the CID differs in exactly one bit (0xb6 vs 0x36 at byte 5). So the gate is right and the CID
+  # is the one frame that never matches -- and nothing after selection needs it.
+  #
+  # Mode 10 (this round) is mode 9 without CMD9, plus the port's first data command: CMD16 with
+  # 512 (non-fatal, 512 is already the reset length), then CMD17 with the data bit, one 512-byte
+  # PIO block at byte 512 -- eMMC is byte addressed, and byte 512 is GPT LBA 1. The report keeps
+  # the first two FIFO words and an efi flag, and drains the rest because DATA_END waits for an
+  # empty buffer. "c17 ok" + "efi 1" => the data path works and the partition table is readable;
+  # "c17 ok" + "efi 0" => the transfer works but the bytes are elsewhere, and hdr says where to
+  # look. "c17 dto"/"dcrc"/"dend" => the data phase itself is the question next.
+  "clover-emmc=10",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

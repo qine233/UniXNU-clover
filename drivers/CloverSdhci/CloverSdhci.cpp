@@ -128,6 +128,20 @@
 // to see transfer. Each step is gated on the one before it, so the first failure names the next
 // question.
 //
+// Mode 9's photograph answered the whole chain: c2 ok, c3 ok st=2, c13 ok st=3, c9 ok (CSD with the
+// check on), c7 ok, c13b ok st=4 -- the card is in transfer for the first time. Against the stock
+// dump in facts/81ffcaaa-20261022-210928/mmc_device.txt, the captured CSD shifted left 8 bits
+// (SDHCI drops the CRC byte of a 136-bit response) is bit-identical to the card's real CSD, and the
+// captured CID differs in exactly one bit (0xb6 where the stock CID has 0x36). So the gate is
+// right, the CID is the only frame that ever mismatches, and the data commands do not need it.
+//
+// Mode 10 is therefore mode 9 minus CMD9, plus the first data command this port has ever sent:
+// CMD16 (SET_BLOCKLEN 512, non-fatal -- 512 is already the reset length), then CMD17 READ with
+// PIO and a single 512-byte block from byte 512, which on a GPT disk is LBA 1: the header that
+// starts with "EFI PART". Two words of the FIFO and an efi flag are the reading; the rest is
+// drained because the card will not report DATA_END with a full buffer. The data phase at 392 kHz
+// lasts about 10 ms, hence the same bounded polls as everywhere else.
+//
 // Every path that is not the success path panics, because on this board silence is not a reading.
 // Round87's photograph also settled what the watchdog is worth here: ticks=0 at this scheduling
 // point. sheng_pmgr_run() runs right after bsd_bufferinit, about ten seconds of boot before
@@ -804,6 +818,38 @@ static const char *probeVerdict (uint32_t status, bool sent)
   return "ok";
 }
 
+// Mode 10's verdict, which has to separate a command that failed from a command that worked and
+// a data phase that did not finish. The command bits come first because a data error can only be
+// real once the card accepted READ_SINGLE_BLOCK.
+static const char *dataVerdict (uint32_t status, bool sent)
+{
+  if (!sent) {
+    return "busy";
+  }
+  if (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX)) {
+    return probeVerdict (status, sent);
+  }
+  if (status & SDHCI_INT_DATA_TIMEOUT) {
+    return "dto";
+  }
+  if (status & SDHCI_INT_DATA_CRC) {
+    return "dcrc";
+  }
+  if (status & SDHCI_INT_DATA_END_BIT) {
+    return "dend";
+  }
+  if (status & SDHCI_INT_ADMA_ERROR) {
+    return "adma";
+  }
+  if (!(status & SDHCI_INT_RESPONSE)) {
+    return "noev";
+  }
+  if (!(status & SDHCI_INT_DATA_END)) {
+    return "nodata";
+  }
+  return "ok";
+}
+
 // Linux resets the command circuit before issuing the next command after a command error
 // (sdhci_reset_for_error -> SDHCI_RESET_CMD). Round90 saw this mask self-clear; the bound stays
 // because "it did last time" is not a promise on this board.
@@ -1192,6 +1238,21 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   const char *verdictCid = "skip", *verdictAddr = "skip", *verdictCsd = "skip";
   const char *verdictState = "skip", *verdictSel = "skip", *verdictState2 = "skip";
 
+  // Mode 10's chain: mode 9's path up to the selection, with the CID and CSD reads dropped because
+  // round95 measured both and only the selection is needed here, and then the first data command
+  // this port has ever sent.
+  bool sentId10 = false, sentAddr10 = false, sentSel10 = false, sentState10 = false;
+  bool sentBlk = false, sentRead = false, drained = false;
+  uint32_t idStatus10 = 0, addrStatus10 = 0, selStatus10 = 0, stateStatus10 = 0;
+  uint32_t blkStatus = 0, readStatus = 0;
+  uint32_t idRsp10 = 0, idRsp1 = 0, addrRsp10 = 0, addrRsp1b10 = 0;
+  uint32_t selRsp10 = 0, selRsp1b10 = 0, stateRsp10 = 0, stateRsp1b10 = 0;
+  uint32_t spinsId10 = 0, spinsAddr10 = 0, spinsSel10 = 0, spinsState10 = 0, spinsBlk = 0;
+  uint32_t blkRsp0 = 0, blkRsp1 = 0, hdr0 = 0, hdr1 = 0;
+  bool idOk10 = false, addrOk10 = false, selOk10 = false, stateOk10 = false, blkOk = false;
+  const char *verdictId10 = "skip", *verdictAddr10 = "skip", *verdictSel10 = "skip";
+  const char *verdictState10 = "skip", *verdictBlk = "skip", *verdictRead = "skip";
+
   bool cmd2Ok = false;
   if (probeMode == 0) {
     if (ready) {
@@ -1372,6 +1433,126 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
         verdictState2 = probeVerdict (state2Status, sentState2);
       }
     }
+  } else if (probeMode == 10 && hostReady && ready) {
+    // Mode 9's path with the CSD read removed: identification with the check off, the address this
+    // port assigns, the selection, and one R1 to confirm transfer. Round95 measured every one of
+    // these, so the gate here is a regression check, not a question.
+    idStatus10 = runCommand (SDHCI_MAKE_CMD (2, SDHCI_CMD_RESP_LONG), 0,
+                             sentId10, idRsp10, idRsp1, spinsId10);
+    verdictId10 = probeVerdict (idStatus10, sentId10);
+    idOk10 = sentId10 && (idStatus10 & SDHCI_INT_RESPONSE) &&
+             !(idStatus10 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                             SDHCI_INT_INDEX));
+    if (idOk10) {
+      addrStatus10 = runCommand (SDHCI_MAKE_CMD (3, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                 SDHCI_CMD_INDEX), kProbeRca << 16,
+                                 sentAddr10, addrRsp10, addrRsp1b10, spinsAddr10);
+      verdictAddr10 = probeVerdict (addrStatus10, sentAddr10);
+      addrOk10 = sentAddr10 && (addrStatus10 & SDHCI_INT_RESPONSE) &&
+                 !(addrStatus10 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                   SDHCI_INT_INDEX));
+    }
+    if (addrOk10) {
+      selStatus10 = runCommand (SDHCI_MAKE_CMD (7, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                SDHCI_CMD_INDEX), kProbeRca << 16,
+                                sentSel10, selRsp10, selRsp1b10, spinsSel10);
+      verdictSel10 = probeVerdict (selStatus10, sentSel10);
+      selOk10 = sentSel10 && (selStatus10 & SDHCI_INT_RESPONSE) &&
+                !(selStatus10 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                 SDHCI_INT_INDEX));
+    }
+    if (selOk10) {
+      stateStatus10 = runCommand (SDHCI_MAKE_CMD (13, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                   SDHCI_CMD_INDEX), kProbeRca << 16,
+                                  sentState10, stateRsp10, stateRsp1b10, spinsState10);
+      verdictState10 = probeVerdict (stateStatus10, sentState10);
+      // State 4 is the precondition for every data command. Round95 read 0x00000900 here.
+      stateOk10 = sentState10 && (stateStatus10 & SDHCI_INT_RESPONSE) &&
+                  !(stateStatus10 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                     SDHCI_INT_INDEX)) &&
+                  (((stateRsp10 >> 9) & 0xfu) == 4);
+    }
+    if (stateOk10) {
+      // SET_BLOCKLEN: the card's block length is 512 after reset, so a rejection is not fatal --
+      // the data command runs either way, and a failed CMD16 is printed as its own reading.
+      blkStatus = runCommand (SDHCI_MAKE_CMD (16, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                              SDHCI_CMD_INDEX), 512,
+                              sentBlk, blkRsp0, blkRsp1, spinsBlk);
+      verdictBlk = probeVerdict (blkStatus, sentBlk);
+      blkOk = sentBlk && (blkStatus & SDHCI_INT_RESPONSE) &&
+              !(blkStatus & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                             SDHCI_INT_INDEX));
+      bool canRead = blkOk ? true : resetCommandCircuit ();
+      if (canRead && !waitCommandSlot ()) {
+        // The command line is still busy: no command was written, and saying so is the reading.
+        verdictRead = "busy";
+      } else if (canRead) {
+        // One 512-byte block, PIO (the transfer-mode DMA bit clear), read. The card is byte
+        // addressed, so LBA 1 is byte 512. The card clock is 392 kHz here, so the data phase
+        // lasts about 10 ms; every wait below is bounded because interrupts are off at this
+        // scheduling point and a lost completion would otherwise be silence.
+        write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
+        write16 (SDHCI_BLOCK_SIZE, 512);
+        write16 (SDHCI_BLOCK_COUNT, 1);
+        write16 (SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ);
+        write32 (SDHCI_INT_STATUS, 0xffffffffu);
+        write32 (SDHCI_ARGUMENT, 512);
+        write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (17, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                 SDHCI_CMD_INDEX | SDHCI_CMD_DATA));
+        sentRead = true;
+        uint32_t status = 0;
+        for (uint32_t guard = 0;; guard++) {
+          status = read32 (SDHCI_INT_STATUS);
+          if (status & SDHCI_INT_CMD_MASK) {
+            break;
+          }
+          if (guard >= kCommandSpinLimit) {
+            break;
+          }
+        }
+        bool cmdOk = (status & SDHCI_INT_RESPONSE) &&
+                     !(status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                 SDHCI_INT_INDEX));
+        if (cmdOk) {
+          for (uint32_t guard = 0;; guard++) {
+            status = read32 (SDHCI_INT_STATUS);
+            if (status & (SDHCI_INT_DATA_AVAIL | SDHCI_INT_DATA_END |
+                          SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
+                          SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR)) {
+              break;
+            }
+            if (guard >= kCommandSpinLimit) {
+              break;
+            }
+          }
+          // Buffer Read Ready means one whole block is in the FIFO, so the drain needs no
+          // per-word state check; only the two words the report keeps are stored.
+          if ((status & SDHCI_INT_DATA_AVAIL) &&
+              !(status & (SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
+                          SDHCI_INT_DATA_END_BIT))) {
+            hdr0 = read32 (SDHCI_BUFFER);
+            hdr1 = read32 (SDHCI_BUFFER);
+            for (unsigned i = 2; i < 128; i++) {
+              (void) read32 (SDHCI_BUFFER);
+            }
+            drained = true;
+            for (uint32_t guard = 0;; guard++) {
+              status = read32 (SDHCI_INT_STATUS);
+              if (status & (SDHCI_INT_DATA_END | SDHCI_INT_DATA_TIMEOUT |
+                            SDHCI_INT_DATA_CRC | SDHCI_INT_DATA_END_BIT |
+                            SDHCI_INT_ADMA_ERROR)) {
+                break;
+              }
+              if (guard >= kCommandSpinLimit) {
+                break;
+              }
+            }
+          }
+        }
+        readStatus = status;
+        verdictRead = dataVerdict (readStatus, sentRead);
+      }
+    }
   }
 
   clover_emmc_observation[0] = cfgBefore;
@@ -1425,6 +1606,17 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
     // CMD13's status beside CMD7's, then the second CMD13's status beside its R1.
     clover_emmc_observation[14] = (static_cast<uint64_t> (stateStatus) << 32) | selStatus;
     clover_emmc_observation[15] = (static_cast<uint64_t> (state2Status) << 32) | state2Rsp0;
+  } else if (probeMode == 10) {
+    // The chain's statuses in order, then the two header words the data path returned.
+    clover_emmc_observation[7] = idStatus10;
+    clover_emmc_observation[8] = addrStatus10;
+    clover_emmc_observation[9] = selStatus10;
+    clover_emmc_observation[10] = stateStatus10;
+    clover_emmc_observation[11] = blkStatus;
+    clover_emmc_observation[12] = readStatus;
+    clover_emmc_observation[13] = hdr0;
+    clover_emmc_observation[14] = hdr1;
+    clover_emmc_observation[15] = read32 (SDHCI_PRESENT_STATE);
   }
 
   gReportLength = 0;
@@ -1614,7 +1806,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
       emitText (" rsp=");
       emitHex (rspD0, 8);
     }
-  } else {
+  } else if (probeMode == 9) {
     // Mode 9: the identification round94 proved (check off), the address it assigns, the first R1
     // at that address, the second 136-bit response with the check on, then the selection.
     emitText ("\nc2 ");
@@ -1668,6 +1860,64 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
       emitDec ((state2Rsp0 >> 9) & 0xfu);
       emitText (" rsp=");
       emitHex (state2Rsp0, 8);
+    }
+  } else {
+    // Mode 10: the same chain without the CID or CSD lines, plus the data command and the first
+    // two words of what it returned. `efi 1` means those bytes are "EFI PART", i.e. LBA 1 really
+    // is the GPT header and the data path works; `efi 0` with `c17 ok` means the transfer
+    // completed but the bytes are not a GPT header, and the hdr line is what decoding starts on.
+    emitText ("\nc2 ");
+    emitText (verdictId10);
+    emitText (" int=");
+    emitHex (idStatus10, 8);
+    emitText ("\nc3 ");
+    emitText (verdictAddr10);
+    if (sentAddr10) {
+      emitText (" st=");
+      emitDec ((addrRsp10 >> 9) & 0xfu);
+      emitText (" int=");
+      emitHex (addrStatus10, 8);
+    }
+    emitText ("\nc7 ");
+    emitText (verdictSel10);
+    if (sentSel10) {
+      emitText (" int=");
+      emitHex (selStatus10, 8);
+    }
+    emitText ("\nc13 ");
+    emitText (verdictState10);
+    if (sentState10) {
+      emitText (" st=");
+      emitDec ((stateRsp10 >> 9) & 0xfu);
+      emitText (" rsp=");
+      emitHex (stateRsp10, 8);
+    }
+    emitText ("\nc16 ");
+    emitText (verdictBlk);
+    if (sentBlk) {
+      emitText (" int=");
+      emitHex (blkStatus, 8);
+    }
+    emitText ("\nc17 ");
+    emitText (verdictRead);
+    if (sentRead) {
+      emitText (" int=");
+      emitHex (readStatus, 8);
+      emitText (" ps=");
+      emitHex (read32 (SDHCI_PRESENT_STATE), 8);
+      emitText (" bs=");
+      emitHex (read16 (SDHCI_BLOCK_SIZE), 4);
+      // The two words are printed exactly as the FIFO returned them; the efi flag, not the word
+      // order, is what says whether they are the signature. Without a transfer there is no hdr
+      // line, so zeros can never be mistaken for the first block's contents.
+      emitText ("\nhdr ");
+      emitHex (hdr0, 8);
+      emitText (" ");
+      emitHex (hdr1, 8);
+      // "EFI PART" as the FIFO's little-endian words: 'E','F','I',' ' then 'P','A','R','T'.
+      bool efi = drained && hdr0 == 0x20494645u && hdr1 == 0x54524150u;
+      emitText ("\nefi ");
+      emitDec (efi ? 1 : 0);
     }
   }
   emitByte ('\n');
@@ -1873,7 +2123,7 @@ extern "C" void clover_emmc_run (void)
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
   // the storage instrument it was asked for.
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
-      mode != 8 && mode != 9) {
+      mode != 8 && mode != 9 && mode != 10) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -1894,7 +2144,8 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp (mode == 5, (mode == 7 || mode == 8 || mode == 9) ? mode : 0);
+    coldBringUp (mode == 5,
+                 (mode == 7 || mode == 8 || mode == 9 || mode == 10) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.

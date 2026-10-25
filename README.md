@@ -4025,6 +4025,96 @@ fastboot reboot
 | `c2 to`/`crc` 或 `c0`/`c1` 退步 | bring-up 退化（round94 之后不该发生） | 对照 round94 的表头与 `c0`/`c1` |
 | 只有 `CloverSdhci: failed at stage …` | 主机侧初始化失败 | 按 stage 查对应的寄存器 |
 
+## round95 读数：整条识别链通了，卡第一次在 transfer
+
+round95 的照片一次把 mode 9 走完：`c2 ok`、`c3 ok st=2`、`c13 ok st=3 rsp=00000700`、
+`c9 ok int=00000001`、`c7 ok`、`c13b ok st=4 rsp=00000900`。表头与 `c0`/`c1` 和 round94
+逐字相同（`cfg=00002017`、`up=1`、`c1 ok t=3 rsp=c0ff8080`），所以 bring-up 没有退化。
+
+照片里另外两个事实，决定了 round96 不再问识别：
+
+1. **CSD 是干净的。** SDHCI 捕获 136 位响应时会丢掉 CRC 字节，把 `csd` 左移 8 位后与
+   `facts/81ffcaaa-20261022-210928/mmc_device.txt` 的真 CSD（`d02701320f5903fff6dbffef8e404000`）
+   **逐位相同** ⇒ 主机的 CRC7 门算得对，`c9 ok` 不是偶然。
+2. **CID 只差一位。** 同一比较下 `cid` 的 byte 5 读到 `0xb6`，真值是 `0x36`（bit 87），
+   其余全部一致。带着关掉的校验读一次是 `41420281…` 里的同一段，两次启动也一样 ⇒ 不是时钟
+   或采样抖动，而是这颗控制器对 CMD2 响应某一位的固定偏差。CID 之后不再需要：容量从 CSD
+   来，地址用 CMD3 分配的，选中用 CMD7。
+
+## v0.2.68（round96）：第一颗数据命令 —— CMD16 + CMD17 读 LBA 1
+
+mode 10 = mode 9 去掉 CMD9，然后第一次碰 Data：
+
+1. **CMD2** `LONG`（关 CRC）→ **CMD3**（RCA 1）→ **CMD7**（RCA 1）→ **CMD13** 要求
+   `st=4`。这四步 round95 已经证明过，这里只当回归门；任何一步失败，后面的数据命令不发。
+2. **CMD16** `SHORT|CRC|INDEX`，arg=512（SET_BLOCKLEN）。失败不致命（复位后的块长本来就是
+   512），先 `RESET_CMD` 再继续；`c16` 那一行是独立读数。
+3. 数据设置：`TIMEOUT_CONTROL=0x0e`、`BLOCK_SIZE=512`、`BLOCK_COUNT=1`、
+   `TRANSFER_MODE=0x10`（READ，DMA 位为 0 ⇒ PIO）、清 `INT_STATUS`、`ARGUMENT=512`。
+   eMMC 按**字节**寻址，所以 LBA 1 = byte 512。
+4. **CMD17** = `0x113a`（`index 17 | SHORT | CRC | INDEX | DATA`）。先等槽位（
+   `CMD_INHIBIT|DATA_INHIBIT`），再等 CMD 组，再把 FIFO 前两个字存下来、排空剩余 126 个字
+   （缓冲不空 `DATA_END` 不报），最后等 `DATA_END`。392 kHz 下一个块约 10 ms，所有等待都带
+   `1<<22` 上限——这个调度点上中断没开，丢掉的完成事件就是永远的沉默。
+5. **`efi 1`** 当且仅当那两个字是 `0x20494645 0x54524150`——"EFI PART" 的小端 32 位字。
+
+报告形状（示意；`rsp`/`int` 都是占位）：
+
+```text
+g cfg=00002017 m=01 n=fc d=fb up=1 br=00004221 ab=20008001
+h clk=0007 rst=1 clr=0002 pw=0b vs 00000a0e vs3 02626440
+c0 ok c1 ok t=3 to=0 rsp=c0ff8080
+c2 ok int=00000001
+c3 ok st=2 int=00000001
+c7 ok int=00000001
+c13 ok st=4 rsp=00000900
+c16 ok int=00000001
+c17 ok int=00000023 ps=01f800f0 bs=0200
+hdr 20494645 54524150
+efi 1
+```
+
+没有发生传输时（`c16` 失败且复位没自清）不打印 `hdr`/`efi` 两行，避免把零当成块内容。
+最坏情况约 430 字节，仍在面板的 512 字节以内。
+
+产物（内核变了；root / trust cache 仍未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round96-payload.img` | 58720256 B | `4dcb915b1f555ede4cd0b5705710cb79d3ce4848bf310a34bee9a26db5ab1e87` |
+| `round96-kernel.macho`（构建产物） | 51933184 B | `5730ddb094a8f1a18d8f78c9fe7642c423ba5132fc5510bc762b14f717fb2b70` |
+| `round96-in-volume-kernel.macho`（卷内副本） | 51933184 B | `d1093dd7d8a725365e18b0e907ffc4158a453ac9bb6b65023decd21568af2998` |
+| `round96-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round96-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round96-kernel.macho.adt` | 13476 B | `822b2883c5d63273d8a15161f354fd4967604ffb5242eb791cab46f5b397e948` |
+| `round96-unixnu.toml` | 557 B | `d7acc34856707c34a2d47d87124a267e7c75ff7466e69b33ce9725a1be7b874b` |
+
+校验器：探针 35 处 5959 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在；反汇编
+`__ZL11coldBringUpbj` 里各有一条 `#0x113a`（CMD17）与 `#0x101a`（CMD16），两条 `#0x909`
+（mode 8/9 的 CMD9）和两条 `#0x71a`（CMD7）；`0x20494645`/`0x54524150` 的立即数对也在。
+卷内 boot-args 末尾是 `… clover-pmgr=2 clover-emmc=10 armcpu-clock-panic=60000`。boot 仍是
+`round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round96-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `c17 ok` + `efi 1` | 数据通路工作、块寻址正确、LBA 1 真是 GPT 头 | 读 GPT 分区表 → 找目标分区 → 写/读日志块 |
+| `c17 ok` + `efi 0` + `hdr` 非零 | 传输完成但字节不同：地址单位（块 vs 字节）或 FIFO 字序 | 用 `hdr` 前几字节对照「块寻址 = 0 号块」的假设，必要时改 `ARGUMENT` |
+| `c17 ok` + `hdr 00000000 00000000` | 事件到了、FIFO 没内容（数据通路没真正搬数） | 查 `TRANSFER_MODE` 的 DMA 位、`BLOCK_COUNT` 与主机 `HOST_CONTROL` 的 DMA 选择 |
+| `c17 dto` | 卡收了命令但不发数据：数据阶段超时 | 查卡状态（`c13 st=`）、块长与 `TIMEOUT_CONTROL` |
+| `c17 dcrc` / `dend` | 数据到了但 CRC/结束位错 | 400 kHz 下不太可能是信号问题，先查总线宽度（应为 1-bit）与电源 |
+| `c17 to` / `crc` 而 `c13 st=4` | 卡拒绝了读命令 | 看 `c16` 的结果与卡当前状态；可能需要先 CMD16 成功 |
+| `c16` 不是 `ok`，`c17` 仍 `ok` | SET_BLOCKLEN 被拒但读照常（块长本就 512） | 把 `c16` 记成卡的怪癖，继续 |
+| `c16`/`c17` = `busy` | 命令槽一直不空 | 数据/命令状态机卡住；下一轮先 `RESET_CMD|RESET_DATA` 再问 |
+| `c2`/`c3`/`c7`/`c13` 任何一步退步 | bring-up 退化（round95 之后不该发生） | 对照 round95 的表头与 `c0`/`c1` |
+| 只有 `CloverSdhci: failed at stage …` | 主机侧初始化失败 | 按 stage 查对应的寄存器 |
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -4039,9 +4129,10 @@ fastboot reboot
   `v0.2.65` 起把 CMD2 发两遍（一遍带 CRC、一遍关掉 CRC，中间 CMD0+CMD1 重武装），
   `v0.2.66` 起把 CRC 开关与重武装的先后对调（先关 CRC 的首槽位，再带 CRC 的重武装后槽位，
   并补上 CMD9/CMD13），`v0.2.67` 起不再走带校验的 CMD2，改用 CMD2(关校验)/CMD3/CMD13/CMD9/CMD7
-  把卡第一次送进 transfer，仍然不碰 Data、不发布
+  把卡第一次送进 transfer，`v0.2.68` 起发第一颗数据命令（CMD16 设块长 + CMD17 PIO 单块读
+  byte 512，前五个字节应是 `EFI PART`），仍然不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
-  时钟是不是还在移命令」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
+  时钟是不是还在移命令、数据阶段能不能自己走完」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，
   再由 mockfs 把它当作整个 `/`，`root-matching` 那条 UUID 匹配表还留在
   `/chosen` 里（`rd=md0` 会在等待循环之前就 `goto iofrootx`，所以它不参与）。
