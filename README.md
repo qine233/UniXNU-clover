@@ -4645,6 +4645,107 @@ fastboot reboot
 
 **拍一张就够。**
 
+## round101 读数：logfs 就在第 39 项，首末 LBA 与 sysfs 独立吻合
+
+照片里转述来的这一行：
+
+```text
+lg i=39 a=12320768 b=12337151
+```
+
+这一行同时钉住三件事：
+
+1. **名字按整字比之后命中了。** round100 的 `lg i=0` 确实是常量把高半字节挤掉，
+   不是读错；改回 UTF-16LE 的三个整字后，同一段表项数组立刻对上了。
+2. **序号与 Linux 的编号一致。** `i=39` 就是 `mmcblk0p39`，说明这台设备的 GPT 里
+   没有空项把编号顶偏。
+3. **范围是独立吻合的。** `a=12320768`、`b=12337151` 与 sysfs 的
+   `start=12320768`、`size=16384` 个 512 字节扇区（末 LBA 12337151）一字不差。
+   读到的 GPT 和内核眼中的分区表是同一张。
+
+读通路和定位这一步到此结束。logfs 的坐标不再需要推导：接下来的写实验直接用它。
+
+## v0.2.74（round102）：往 logfs 首块写一块再读回
+
+mode 16 = mode 15 的整条链，在扫描命中之后多走一段。这一段就是整条 eMMC 链一直
+在准备的那件事：**卡能不能写**。
+
+1. **先按坐标设门。** 只有 `a=12320768` 且 `b=12337151` 才继续；坐标不对就只打
+   `wr g=1`，一个字也不写。这样即使解析出错，写也落不到 logfs 外面。编译后调用点
+   的参数被窄化成 `w0=0xbc0000`（= 12320768），这本身也是一道静态校验。
+2. **先读一遍旧内容。** 用 mode 15 证明过的 `readPioBlock` 读首块，记下 128 字的
+   和与第一个字（`old <sum> <w0>`）。没有这一步，读回不一致时分不清「原来就有别的
+   东西」和「读坏了」。
+3. **造一块能自证的载荷。** 128 字先填 `0x554e5855 + i×0x01000193`，再覆盖头部：
+   `w0 = 554e5855`（内存序的 `"UXNU"`）、`w1 = 首 LBA`、`w2 = 16`（mode 号）、
+   `w3 = 第 4..127 字的和`。既不是全零也不是全一，写错了或没写都能从读回里看出来。
+4. **CMD24 写入。** `writePioBlock` 与读路径同形：`TIMEOUT 0x0e`、块大小 512、
+   块计数 1、`TRANSFER_MODE = BLK_CNT_EN`（READ 位为 0 = 主机到卡）、
+   `COMMAND = 0x183a`（CMD24 + R1 + CRC + INDEX + DATA）。FIFO 侧仍然用
+   `CNTFRQ/6250`（160 µs）的节奏、200 ms 期限，门控位换成 `SPACE_AVAILABLE`；
+   结尾再按电平补排空。比卡写得慢是安全的：缓冲区空时 SDHCI 会停卡钟。
+5. **等卡编程完。** 写完立刻打 CMD13，直到 R1 的 `READY_FOR_DATA`（bit 8）置位；
+   最多 100 次，`p=` 就是实际问了几次。卡一直不 ready 本身也是读数。
+6. **读回逐字比。** 再走一次 `readPioBlock`，数出 128 字里有多少字与载荷相同
+   （`cmp=`），并记下读回的和（`sum=`）。最后 `w0` 打读回的头三个字，用来直接
+   认出 `554e5855` / `00bc0000` / 校验和。
+
+报告在 mode 16 里省掉 `sc` 与 `ty`（坐标已知），保留 `lg`、`ps e=`、`clk=`、`efi`：
+
+```text
+lg i=39 a=12320768 b=12337151
+wr a=12320768 n=128 ok=1 int=00000003
+st 00000900 s=4 p=1
+old 00000000 00000000
+rd ok=1 cmp=128 sum=...
+w0 554e5855 00bc0000 ...
+ps e=01f800f0 clk=0007
+efi 1
+```
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `wr … n=128 ok=1` + `rd ok=1 cmp=128` + `w0 554e5855 00bc0000` | 写、编程、读回整条链路都对 | 把真正的日志文本按同一路径写进 logfs，再读回解码 |
+| `wr g=1` | 扫描给的坐标不是 12320768/12337151，门主动拦住 | 回到 mode 15 看 `lg`，先修定位再放开 |
+| `wr … ok=0 int=…` | 写命令本身没干净结束，`int` 指到哪一段 | 按 `int` 的位查命令/数据阶段；`n=` 说明递了几个字 |
+| `wr ok=1` 但 `n` 小于 128 | 命令结束了，FIFO 没喂满 | 查 `SPACE_AVAILABLE` 与卡钟；这句本身说明主机侧有停滞 |
+| `st … s=` 不是 4、`p=100` | 卡一直没回到 transfer/ready | 卡把写当成失败或忙在内部；先看 `wr int` |
+| `rd ok=0` 或 `cmp<128`，但 `w0` 以 `554e5855` 开头 | 写进去了，读回不完整 | 读路径回归；对照 round99 的 `int=00000003` |
+| `rd ok=1 cmp=128` 但 `old` 与上次不同 | logfs 首块内容变了（或本来就非零） | 正常：每次写都会改它；只要 `w0` 对就行 |
+| `efi 0` | LBA 1 的回归坏了 | 先修读通路 |
+
+产物（内核变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round102-payload.img` | 58720256 B | `cf4dfd1ac8246fda06255b8aed24060c1e1a098d25265df7ee636bdd53ac6ebc` |
+| `round102-kernel.macho`（构建产物） | 51949568 B | `9740967661e5b926611f50c8421a4efc5febf5654ae70bdd7169f78cc1a0a619` |
+| `round102-in-volume-kernel.macho`（卷内副本） | 51949568 B | `d0fac878e1c3886472a208cb327cb88aebd7d1ad0f6742e98572b41f88251341` |
+| `round102-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round102-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round102-kernel.macho.adt` | 13476 B | `7fdafb898b82076a1380169492d0bb273a5884cec30734e0ce09620e06708dc6` |
+| `round102-unixnu.toml` | 574 B | `ab259d48009a91e042f646cf47429c26f829f5e71f0f7950a8aa48520d9d9161` |
+
+校验器：探针 35 处 5960 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在。
+反汇编：`writePioBlock` 在对象里按 `0x0e`/`0x200`/`1`/`0xffffffff`/arg/`0x2`/`0x183a`
+的顺序写寄存器，调用点是 `mov w0,#0xbc0000; bl __ZL13writePioBlockjPKjRjS1_`；
+内核里 `coldBringUp` 在 `0xfffffff00797ba50`、`readPioBlock` 在
+`0xfffffff00798e610`、`writePioBlock` 在 `0xfffffff00798e85c`。报告侧逐字符发射的
+`\nwr a=`、`\nst `、`\nold `、`\nrd ok=`、`\nw0 ` 分别在对象 `0x15f34`、`0x16160`、
+`0x162a8`、`0x1636c`、`0x16570`。门是 `mode != 16`，分发器
+`mode >= 7 && mode <= 16`。卷内 boot-args 末尾是
+`… clover-pmgr=2 clover-emmc=16 armcpu-clock-panic=60000`。
+boot 仍是 `round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round102-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 这一块写的是 logfs 的首块；`old` 行会记下它原来的样子。
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -4667,7 +4768,10 @@ fastboot reboot
   是端口本身不前进），`v0.2.72` 起按 GPT 头的 `el/en/es` 逐块读表项数组、按 UTF-16LE 名字
   找 `logfs` 并报出它的序号与首末 LBA，`v0.2.73` 起把名字比较改成 UTF-16 整字
   （round100 的 `lg i=0` 是常量把高半字节挤掉，不是读失败），并在没命中时打出一行
-  首项标定 `e0` 来区分「编码错」与「确实没有」，
+  首项标定 `e0` 来区分「编码错」与「确实没有」（round101 命中
+  `lg i=39 a=12320768 b=12337151`，与 sysfs 的 `mmcblk0p39` 独立吻合），
+  `v0.2.74` 起按这个坐标往 logfs 首块写一块自证载荷（CMD24 + 同节奏 FIFO +
+  CMD13 等 `READY_FOR_DATA`）再读回逐字比，写前先读旧内容、写错位置则一个字不写，
   仍然不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令、数据阶段能不能自己走完」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用

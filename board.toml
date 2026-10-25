@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: the logfs entry, with the name read as UTF-16"
+title = "clover emmc: one log block written into logfs and read back"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1201,7 +1201,16 @@ kernel_args = [
   # and start LBA: "e0 i=1 w=00620078 0000006c 00000000 a=131072" is xbl on this board, and that
   # line calibrates the encoding and the entry-array origin without trusting the string under
   # test. "lg i=39 a=12320768 b=12337151" is still the expected positive.
-  "clover-emmc=15",
+  # Round101's photograph: "lg i=39 a=12320768 b=12337151". The name matched and the extent is
+  # exactly what sysfs reports for mmcblk0p39, so the read chain and the GPT walk are closed.
+  # Mode 16 spends the same chain on the question the partition exists for: it reads the logfs
+  # start block once, writes a self-identifying 512-byte block there with CMD24 and the FIFO
+  # paced like the read path, polls CMD13 until the card reports READY_FOR_DATA, then reads the
+  # block back and counts equal words. "wr ok=1 ... rd ok=1 cmp=128" is the positive. The write
+  # is gated on the extent matching 12320768/12337151, so a parse mistake cannot write outside
+  # logfs. "old <sum> <w0>" records what the block held before, so a failed write and a broken
+  # read are distinguishable.
+  "clover-emmc=16",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

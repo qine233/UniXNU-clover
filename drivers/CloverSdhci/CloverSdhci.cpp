@@ -215,8 +215,11 @@ volatile uint32_t clover_emmc_stage = 0;
 }
 
 // One 512-byte PIO block at a time, in BSS rather than on a kernel stack: mode 14 reads the GPT
-// entry array block by block and inspects each entry before issuing the next command.
+// entry array block by block and inspects each entry before issuing the next command. Mode 16
+// needs the written block and the block read back side by side, so it gets its own two buffers.
 static uint32_t gEntryBlock[128];
+static uint32_t gWriteBlock[128];
+static uint32_t gReadBlock[128];
 
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
@@ -898,6 +901,80 @@ static bool readPioBlock (uint32_t lba, uint32_t *words, uint32_t &wordCount,
   return (status & SDHCI_INT_DATA_END) && wordCount == kBlockWords;
 }
 
+// One whole 512-byte block, written the mirror image of readPioBlock: CMD24 with the block count
+// enabled and the direction bit clear, the same 160 us counter gap between FIFO words, the same
+// 200 ms deadline, and a final level-gated sweep so a controller that still had room takes the
+// rest. Writing slower than the card consumes is safe -- SDHCI stops the card clock while the
+// buffer is empty -- so the read path's pace is reused rather than guessed at. `wordCount` is how
+// many words were handed to the data port; the return value is true only for a clean command
+// response, DATA_END and all 128 words handed over.
+static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCount,
+                           uint32_t &status)
+{
+  wordCount = 0;
+  status = 0;
+  if (!waitCommandSlot ()) {
+    return false;
+  }
+  write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
+  write16 (SDHCI_BLOCK_SIZE, 512);
+  write16 (SDHCI_BLOCK_COUNT, 1);
+  write32 (SDHCI_INT_STATUS, 0xffffffffu);
+  write32 (SDHCI_ARGUMENT, lba);
+  write16 (SDHCI_TRANSFER_MODE, SDHCI_TRNS_BLK_CNT_EN);   // READ clear: host to card
+  write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (MMC_WRITE_BLOCK, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                          SDHCI_CMD_INDEX | SDHCI_CMD_DATA));
+  uint32_t spins = 0;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & SDHCI_INT_CMD_MASK) {
+      break;
+    }
+    if (++spins >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  if (!(status & SDHCI_INT_RESPONSE) ||
+      (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+    return false;
+  }
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint64_t gap = frequency / 6250ULL;        // 160 us, the read path's pace
+  const uint64_t deadline = frequency / 5ULL;      // 200 ms
+  const uint64_t start = readCounter ();
+  uint64_t lastWrite = start;
+  bool haveWritten = false;
+  uint32_t guard = 0;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & (SDHCI_INT_DATA_END | SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
+                  SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR)) {
+      break;
+    }
+    uint64_t now = readCounter ();
+    if (now - start > deadline) {
+      break;
+    }
+    if (wordCount < kBlockWords && (!haveWritten || now - lastWrite >= gap) &&
+        (read32 (SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE)) {
+      write32 (SDHCI_BUFFER, words[wordCount++]);
+      haveWritten = true;
+      lastWrite = now;
+    }
+    if (++guard >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  while (wordCount < kBlockWords &&
+         (read32 (SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE)) {
+    write32 (SDHCI_BUFFER, words[wordCount++]);
+  }
+  return (status & SDHCI_INT_DATA_END) && wordCount == kBlockWords;
+}
+
 // Returns the command group of INT_STATUS. `sent` is false when the register was never written,
 // which is a host verdict, not a card one. The response words are read even after an error: a CRC
 // error still leaves the bits that arrived in the register, and that is evidence.
@@ -1478,6 +1555,17 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   uint32_t entryType14 = 0, entryTypeB14 = 0;
   uint32_t entryFirstIdx15 = 0, entryFirstA15 = 0, entryFirstW15[3] = { 0, 0, 0 };
   bool entryOk14 = false, entryBad14 = false;
+
+  // Mode 16: mode 15's scan, then the logfs partition's first block is written with a
+  // self-identifying payload and read back. The write is gated on the extent round101 confirmed
+  // against sysfs, so a parse mistake cannot put a write outside the partition this round is
+  // about. `old`/`new` sums are plain 32-bit additions, enough to tell "the block changed" from
+  // "the read path returned something else" without a checksum library.
+  uint32_t writeWords16 = 0, writeStatus16 = 0;
+  uint32_t readWords16 = 0, readStatus16 = 0;
+  uint32_t equalWords16 = 0, oldSum16 = 0, oldWord16 = 0, newSum16 = 0;
+  uint32_t stateRsp16 = 0, stateStatus16 = 0, statePolls16 = 0;
+  bool writeOk16 = false, readOk16 = false, writeGated16 = false;
 
   bool cmd2Ok = false;
   if (probeMode == 0) {
@@ -2064,6 +2152,64 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
               }
             }
           }
+          if (probeMode >= 16 && entryFound14 != 0) {
+            // Writing into logfs is the step this whole chain has been for: the block carries
+            // its own identity and a checksum, so a stale block, an erased block and a correct
+            // write are three different photographs.
+            writeGated16 = !(entryFirst14 == 12320768u && entryLast14 == 12337151u);
+            if (!writeGated16) {
+              // Read the block once before writing: if the read-back later differs from the
+              // payload, this says whether the block held something else or the read is broken.
+              uint32_t oldWords = 0, oldStatus = 0;
+              bool oldOk = readPioBlock (entryFirst14, gReadBlock, oldWords, oldStatus);
+              if (oldOk) {
+                for (uint32_t i = 0; i < kBlockWords; i++) {
+                  oldSum16 += gReadBlock[i];
+                }
+                oldWord16 = gReadBlock[0];
+              }
+              // "UXNU" in memory order, the LBA, the mode, a checksum over the rest, and a
+              // sequence that is neither all zeros nor all ones in between.
+              for (uint32_t i = 0; i < kBlockWords; i++) {
+                gWriteBlock[i] = 0x554e5855u + i * 0x01000193u;
+              }
+              gWriteBlock[0] = 0x554e5855u;
+              gWriteBlock[1] = entryFirst14;
+              gWriteBlock[2] = 16;
+              uint32_t checksum = 0;
+              for (uint32_t i = 4; i < kBlockWords; i++) {
+                checksum += gWriteBlock[i];
+              }
+              gWriteBlock[3] = checksum;
+              writeOk16 = writePioBlock (entryFirst14, gWriteBlock, writeWords16, writeStatus16);
+              // After a write the card programs, and its R1 says READY_FOR_DATA only when that
+              // is done. CMD13 goes out on the command line alone, so the DAT busy state must
+              // not keep it from being asked; the loop is bounded because a card that never
+              // reports ready is itself the reading.
+              for (statePolls16 = 0; statePolls16 < 100; statePolls16++) {
+                bool sentState16 = false;
+                uint32_t stateRsp16b = 0, spinsState16 = 0;
+                stateStatus16 = runCommandBusy (SDHCI_MAKE_CMD (13, SDHCI_CMD_RESP_SHORT |
+                                                                SDHCI_CMD_CRC | SDHCI_CMD_INDEX),
+                                                kProbeRca << 16, sentState16, stateRsp16,
+                                                stateRsp16b, spinsState16);
+                if (!sentState16 ||
+                    (stateStatus16 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_INDEX)) ||
+                    (stateRsp16 & R1_READY_FOR_DATA)) {
+                  break;
+                }
+              }
+              readOk16 = readPioBlock (entryFirst14, gReadBlock, readWords16, readStatus16);
+              if (readOk16) {
+                for (uint32_t i = 0; i < kBlockWords; i++) {
+                  if (gReadBlock[i] == gWriteBlock[i]) {
+                    equalWords16++;
+                  }
+                  newSum16 += gReadBlock[i];
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -2520,24 +2666,30 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
           // the three header fields the walk used and how many entry blocks were read, `lg` the
           // matching index (0 = no entry is named logfs) and its LBA extent, `ty` the type GUID
           // as the first 32-bit field plus fields 2-3. `efi` stays as the header regression.
-          emitText ("\nsc el=");
-          emitDec (entryEl14);
-          emitText (" en=");
-          emitDec (entryEn14);
-          emitText (" es=");
-          emitDec (entryEs14);
-          emitText (" b=");
-          emitDec (entryBlocks14);
-          emitText (" ok=");
-          emitDec (entryOk14 ? 1 : 0);
-          if (entryBad14) {
-            emitText (" hd=1");
-          }
-          if (!entryOk14) {
-            emitText (" st=");
-            emitHex (entryFail14, 8);
-            emitText (" w=");
-            emitDec (entryGot14);
+          // Mode 16 already knows the extent, so it spends that space on the write/read-back:
+          // `wr` the command's verdict and words handed over, `st` the card's own R1 after
+          // programming, `old` the block's content before the write, `rd`/`w0` the read-back's
+          // equality count and the words that identify the payload.
+          if (probeMode < 16) {
+            emitText ("\nsc el=");
+            emitDec (entryEl14);
+            emitText (" en=");
+            emitDec (entryEn14);
+            emitText (" es=");
+            emitDec (entryEs14);
+            emitText (" b=");
+            emitDec (entryBlocks14);
+            emitText (" ok=");
+            emitDec (entryOk14 ? 1 : 0);
+            if (entryBad14) {
+              emitText (" hd=1");
+            }
+            if (!entryOk14) {
+              emitText (" st=");
+              emitHex (entryFail14, 8);
+              emitText (" w=");
+              emitDec (entryGot14);
+            }
           }
           emitText ("\nlg i=");
           emitDec (entryFound14);
@@ -2546,10 +2698,48 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             emitDec (entryFirst14);
             emitText (" b=");
             emitDec (entryLast14);
-            emitText ("\nty ");
-            emitHex (entryType14, 8);
-            emitText (" ");
-            emitHex (entryTypeB14, 8);
+            if (probeMode < 16) {
+              emitText ("\nty ");
+              emitHex (entryType14, 8);
+              emitText (" ");
+              emitHex (entryTypeB14, 8);
+            }
+          }
+          if (probeMode >= 16 && entryFound14) {
+            if (writeGated16) {
+              emitText ("\nwr g=1");
+            } else {
+              emitText ("\nwr a=");
+              emitDec (entryFirst14);
+              emitText (" n=");
+              emitDec (writeWords16);
+              emitText (" ok=");
+              emitDec (writeOk16 ? 1 : 0);
+              emitText (" int=");
+              emitHex (writeStatus16, 8);
+              emitText ("\nst ");
+              emitHex (stateRsp16, 8);
+              emitText (" s=");
+              emitDec ((stateRsp16 >> 9) & 0xfu);
+              emitText (" p=");
+              emitDec (statePolls16);
+              emitText ("\nold ");
+              emitHex (oldSum16, 8);
+              emitText (" ");
+              emitHex (oldWord16, 8);
+              emitText ("\nrd ok=");
+              emitDec (readOk16 ? 1 : 0);
+              emitText (" cmp=");
+              emitDec (equalWords16);
+              emitText (" sum=");
+              emitHex (newSum16, 8);
+              emitText ("\nw0 ");
+              emitHex (readOk16 ? gReadBlock[0] : 0, 8);
+              emitText (" ");
+              emitHex (readOk16 ? gReadBlock[1] : 0, 8);
+              emitText (" ");
+              emitHex (readOk16 ? gReadBlock[3] : 0, 8);
+            }
           }
           if (probeMode >= 15 && entryFound14 == 0 && entryFirstIdx15) {
             // Calibration: raw words 14..16 and the start LBA of the first used entry. On this
@@ -2850,7 +3040,7 @@ extern "C" void clover_emmc_run (void)
   // the storage instrument it was asked for.
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
       mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12 && mode != 13 &&
-      mode != 14 && mode != 15) {
+      mode != 14 && mode != 15 && mode != 16) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -2871,7 +3061,7 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp (mode == 5, (mode >= 7 && mode <= 15) ? mode : 0);
+    coldBringUp (mode == 5, (mode >= 7 && mode <= 16) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.
