@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: the report itself stored in logfs and read back"
+title = "clover emmc: read back the record a previous boot stored in logfs"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1221,7 +1221,19 @@ kernel_args = [
   # body and a newline -- and reads both blocks back. "tx a=... n=... h=1 t=1 hc=128 tc=n" with
   # "txh 554e5855 31474f4c <n> <sum>" is the positive. The record stays in logfs, so the same
   # text can be taken from another OS with dd.
-  "clover-emmc=17",
+  # Round103's photograph: "tx a=12320768 n=343 h=1 t=1 hc=128 tc=343",
+  # "txh 554e5855 31474f4c 00000157 000059b2". 343 is 23 bytes of prefix, 319 of report body and
+  # the newline; 0x59b2 is the sum an offline recomputation of that exact text gives, and 0x157
+  # is 343. Both blocks were rewritten and read back word for word.
+  # Mode 18 asks the one question mode 17 cannot ask about itself: does the record survive a
+  # reboot? It writes nothing. It reads logfs block 0, checks "UXNU"/"LOG1" and the stored
+  # length, reads block 1, recomputes the byte sum over that many bytes and prints the first 48
+  # of them. "bk m=554e5855 31474f4c n=343 s=000059b2 c=1" followed by
+  # "bt unixnu clover emmc log|..." is the positive: what this boot reads is what the last boot
+  # wrote, and the bytes came off the card rather than out of this run's memory. "c=0" with the
+  # right magic is a length or sum mismatch worth reading; a different magic means the block
+  # holds something else and the record is not where mode 17 put it.
+  "clover-emmc=18",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

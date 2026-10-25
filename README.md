@@ -4856,6 +4856,102 @@ xxd logfs.bin | head
 dd if=logfs.bin bs=512 skip=1 count=1 2>/dev/null | tr -d '\0'
 ```
 
+## round103 读数：343 字节的原样记录，从卡上读了回来
+
+照片：
+
+```text
+tx a=12320768 n=343 h=1 t=1 hc=128 tc=343
+txh 554e5855 31474f4c 00000157 000059b2
+```
+
+这一次把「写」和「读」都走完了，而且每一层都有独立对证：
+
+1. **两块都写干净、读干净。** `h=1 t=1`：头块与文本块的 CMD24 都以 DATA_END 结束，
+   中间那次 CMD13 也没报错。`hc=128` 是头块读回后逐字相同 128/128；`tc=343` 是
+   文本块在实际长度内逐字节相同 343/343。
+2. **长度自洽。** `n=343`，头块里存的是 `00000157`，`0x157` 就是 343。前缀
+   `unixnu clover emmc log\n` 占 23 字节，报告正文 319 字节，末尾换行 1 字节。
+3. **校验和自洽。** 头块里存的是 `000059b2`。把落盘的那段文本（前缀 + 正文 +
+   换行，恰好 343 字节）离线逐字节相加，结果就是 `0x59b2`。这不是回读循环的副产品：
+   回读只数「哪些字节相同」，而 `txh` 里的和是写之前另外算的。
+4. **所以盘上现在有一条自描述记录。** 头 8 字节是 `UXNU`/`LOG1`，之后是起始 LBA、
+   总字节数、字节和、mode 号。任何能读 logfs 的系统都能先认头、再取文本。
+
+还没证的是它能不能跨启动。`hc`/`tc` 都是同一次启动里写的、同一次启动里读的，
+缓冲区可能只是内存里的副本。mode 18 只读不写，就是来把这条缝补上。
+
+## v0.2.76（round104）：下一次启动，只把上一轮存下的记录读回来
+
+mode 18 = mode 15 的整条链，之后**一个字也不写**：
+
+1. GPT 扫描仍按 UTF-16 整字找 `logfs`，坐标仍必须是 `12320768..12337151`；
+   不满足就只打 `bk i=0` 或 `bk g=1`，不碰任何块。
+2. 读块 0（`a`），取出 `m0=entry[0]`、`m1=entry[1]`、`n=entry[3]`、`s=entry[4]`。
+   只有 `m0=554e5855`、`m1=31474f4c` 且 `n<=512` 时才读块 1（`a+1`）；
+   否则不动块 1，`n` 与 `s` 原样打出来，错的头也是读数。
+3. 读回块 1 后，对前 `n` 字节重新求和，与头里的 `s` 比，得到 `c=`。
+4. 再打前 48 个字节：换行印成 `|`，不可打印字印成 `.`，其余原样。这一段是
+   「读到的确实是文本」的肉眼证据，不依赖任何数值。
+
+预期（上一轮 round103 写下的记录仍在）：
+
+```text
+bk m=554e5855 31474f4c n=343 s=000059b2 c=1
+bt unixnu clover emmc log|...
+```
+
+`c=1` 的意思是：这次启动从盘上读到的 343 字节，其和等于上一次启动写进头块的数。
+它没有写任何东西，所以这个等式只可能来自卡上的记录。
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `bk m=554e5855 31474f4c n=343 s=000059b2 c=1` + `bt unixnu clover emmc log\|…` | 记录跨启动存活，读回的字节与上一轮写下的相同 | 把真正的内核/panic 日志接到这条记录路径上 |
+| `bk … n=343 s=… c=1` 但 `n`/`s` 与 round103 的 `343`/`000059b2` 不同 | 有记录，但不是上一轮那条（有人重跑过 mode 17 或改过盘） | 先看 `bt` 是否仍是本项目的文本，再决定 |
+| `bk m=554e5855 31474f4c … c=0` | 头是对的，文本字节与头里的和不一致 | 读 `bt` 看坏在哪一段；若全为零，说明块 1 没写进去 |
+| `bk m=00000000 00000000 n=0 …` | 块 0 不是本项目的头（空块或别的数据） | 回 mode 17 重新写一遍，或检查 `a` 是否仍是 logfs 首块 |
+| `bk m=` 是别的值 | 块 0 有数据但不是本项目的记录 | 记下这两个字，它说明 logfs 首块被别的系统用过 |
+| `bk i=0` / `bk g=1` | 没找到 logfs 或坐标不符，什么都没读 | 回 mode 15 查 `lg` |
+| 有 `hs=`/`ts=` | 某次读没干净结束，状态字直接打出来 | 对照 round102/103 的 `int=00000003` |
+
+产物（内核变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round104-payload.img` | 58720256 B | `6d566aeef7de7b8dc18716816755dc41f274b0d3aea2313a068405a58fc5625f` |
+| `round104-kernel.macho`（构建产物） | 51965952 B | `ac916c15fdaf68771e1eadabdad9cb19c292262403d02ea2ed6f5083dfb9332e` |
+| `round104-in-volume-kernel.macho`（卷内副本） | 51965952 B | `255cbc1042e48b34232045eb2bc8feb4d45a3fe9ba41a71d8a7de3725dace346` |
+| `round104-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round104-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round104-kernel.macho.adt` | 13476 B | `f32ab7fb67eaf9007acaa5dfc0cb10ed7a80f4f74de3e7577ae0a656b19aa84f` |
+| `round104-unixnu.toml` | 580 B | `c3b56e3ce263c71e3ae25540bf67b804da8d50032f94558586115296b5ab560f` |
+
+校验器：探针 35 处 5960 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在。
+反汇编自查：mode 18 只有两次 `readPioBlock` 调用，在对象 `0x15e6c`（头块）与
+`0x15ec0`（文本块，参数 `mov w0,#1; movk w0,#0xbc,lsl#16`），这一区没有任何
+`writePioBlock`；magic 比较是 `mov w27,#0x5855; movk w27,#0x554e,lsl#16` 与
+`mov w26,#0x4f4c; movk w26,#0x3147,lsl#16`，长度上限 `cmp w19,#0x200`。
+`\nbk i=0`/`\nbk g=1` 的逐字符发射在 `0x15fb4`/`0x16078` 起，`\nbk m=` 在
+`0x1ba40` 起，`\nbt ` 在 `0x1bccc` 起，字节映射常量 `.`=`0x2e`、`|`=`0x7c` 在
+`0x1bd4c`/`0x1bd50`。内核符号：`coldBringUp` `0xfffffff00797ba50`、
+`readPioBlock` `0xfffffff00798f214`、`writePioBlock` `0xfffffff00798f460`、
+`waitCardReady` `0xfffffff00798f6ac`；编译进的 panic 行号是 3269。
+门是 `mode != 18`，分发器 `mode >= 7 && mode <= 18`。卷内 boot-args 末尾是
+`… clover-pmgr=2 clover-emmc=18 armcpu-clock-panic=60000`。
+boot 仍是 `round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round104-payload.img
+fastboot reboot
+```
+
+**拍一张就够。这一轮什么都不写。** 它读的记录应该是你上一次刷 round103 后留在
+logfs 首两块的那条；只要中间没有别的系统写过 logfs，`n=343 s=000059b2` 就应当
+原样出现。再刷一次同一颗 payload 再拍一张，如果两次数值相同，就说明读的是盘，
+不是这一次启动的内存。
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -4884,7 +4980,10 @@ dd if=logfs.bin bs=512 skip=1 count=1 2>/dev/null | tr -d '\0'
   CMD13 等 `READY_FOR_DATA`）再读回逐字比，写前先读旧内容、写错位置则一个字不写
   （round102 读回 `cmp=128`、`sum` 与离线重算一致），`v0.2.75` 起把报告本身按固定
   两块的布局存进 logfs（头块 `UXNU`/`LOG1` + 长度 + 字节和，文本块前缀 + 正文）
-  并逐块读回比对，仍然不发布
+  并逐块读回比对（round103 读回 `n=343`、`hc=128 tc=343`，和 `0x59b2` 与离线重算
+  一致），`v0.2.76` 起只读不写，下一次启动从 logfs 取回上一轮存下的记录、
+  校验 magic/长度/字节和并打出前 48 字节，用来证明它跨启动存活，
+  仍然不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令、数据阶段能不能自己走完」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，

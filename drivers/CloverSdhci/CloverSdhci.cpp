@@ -223,6 +223,8 @@ static uint32_t gReadBlock[128];
 
 // Mode 17 stores the report as text, so the first bytes of the block identify it when read on
 // another OS. The newline is part of the stored length: the block reads as a small text file.
+// Mode 18 only reads that record: the magic and the byte sum decide whether this boot can see
+// what a previous one wrote, without writing anything itself.
 static const char kLogPrefix[] = "unixnu clover emmc log\n";
 static const uint32_t kLogPrefixLength = sizeof (kLogPrefix) - 1;
 
@@ -1609,6 +1611,16 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   bool logGated17 = false, logHeaderOk17 = false, logTextOk17 = false;
   bool logHeaderReadOk17 = false, logTextReadOk17 = false;
 
+  // Mode 18 reads a record written by an earlier boot and writes nothing, so what the line says
+  // is what survived on the card rather than what this run just put there. The length comes from
+  // the header, so it is clamped before it drives a loop, and the byte sum is recomputed from the
+  // text block instead of trusted.
+  uint32_t logHeaderWords18 = 0, logTextWords18 = 0;
+  uint32_t logHeaderStatus18 = 0, logTextStatus18 = 0;
+  uint32_t logMagic0_18 = 0, logMagic1_18 = 0, logLen18 = 0, logSumStored18 = 0;
+  uint32_t logSum18 = 0;
+  bool logHeaderOk18 = false, logTextOk18 = false, logCheck18 = false;
+
   bool cmd2Ok = false;
   if (probeMode == 0) {
     if (ready) {
@@ -2789,7 +2801,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
           emitText ("\nefi ");
           emitDec (drained11 && hdr11a == 0x20494645u && hdr11b == 0x54524150u ? 1 : 0);
 
-          if (probeMode >= 17) {
+          if (probeMode == 17) {
             // The body is complete, so its length and byte sum are the record's. The header block
             // makes the record findable without this screen; the text block is what the screen
             // showed. Both are read back, so the line below reports what the card kept.
@@ -2893,6 +2905,59 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
               emitHex (logRb3_17, 8);
               emitText (" ");
               emitHex (logRb4_17, 8);
+            }
+          }
+
+          if (probeMode >= 18) {
+            // Read the record a previous boot left behind. Nothing here writes, so a clean `c=1`
+            // is evidence that logfs kept the text across the reboot, not that this run rebuilt
+            // it. The header's length is clamped before use; a stale or foreign block shows up as
+            // `c=0` with its own magic, which is a reading rather than a fault.
+            if (entryFound14 == 0) {
+              emitText ("\nbk i=0");
+            } else if (!(entryFirst14 == 12320768u && entryLast14 == 12337151u)) {
+              emitText ("\nbk g=1");
+            } else {
+              logHeaderOk18 = readPioBlock (entryFirst14, gReadBlock, logHeaderWords18,
+                                            logHeaderStatus18);
+              if (logHeaderOk18) {
+                logMagic0_18 = gReadBlock[0];
+                logMagic1_18 = gReadBlock[1];
+                logLen18 = gReadBlock[3];
+                logSumStored18 = gReadBlock[4];
+              }
+              if (logMagic0_18 == 0x554e5855u && logMagic1_18 == 0x31474f4cu && logLen18 <= 512) {
+                logTextOk18 = readPioBlock (entryFirst14 + 1, gReadBlock, logTextWords18,
+                                            logTextStatus18);
+              }
+              const uint8_t *stored = reinterpret_cast<const uint8_t *> (gReadBlock);
+              if (logTextOk18) {
+                for (uint32_t i = 0; i < logLen18; i++) {
+                  logSum18 += stored[i];
+                }
+                logCheck18 = logSum18 == logSumStored18;
+              }
+              emitText ("\nbk m=");
+              emitHex (logMagic0_18, 8);
+              emitText (" ");
+              emitHex (logMagic1_18, 8);
+              emitText (" n=");
+              emitDec (logLen18);
+              emitText (" s=");
+              emitHex (logSumStored18, 8);
+              emitText (" c=");
+              emitDec (logCheck18 ? 1 : 0);
+              if (!logHeaderOk18) {
+                emitText (" hs=");
+                emitHex (logHeaderStatus18, 8);
+              }
+              if (logTextOk18) {
+                emitText ("\nbt ");
+                for (uint32_t i = 0; i < logLen18 && i < 48; i++) {
+                  uint8_t c = stored[i];
+                  emitByte (c == '\n' ? '|' : (c >= 0x20 && c < 0x7f) ? static_cast<char> (c) : '.');
+                }
+              }
             }
           }
         } else {
@@ -3173,7 +3238,7 @@ extern "C" void clover_emmc_run (void)
   // the storage instrument it was asked for.
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
       mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12 && mode != 13 &&
-      mode != 14 && mode != 15 && mode != 16 && mode != 17) {
+      mode != 14 && mode != 15 && mode != 16 && mode != 17 && mode != 18) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -3194,7 +3259,7 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp (mode == 5, (mode >= 7 && mode <= 17) ? mode : 0);
+    coldBringUp (mode == 5, (mode >= 7 && mode <= 18) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.
