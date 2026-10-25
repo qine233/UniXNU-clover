@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover el0: panic before the write that swallowed msg="
+title = "clover el0: six-rung reboot ladder prints the last write that returned"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -952,11 +952,23 @@ panic_screen = true
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The cdhash of scripts/clover-el0-init.S, signed static, passed as the md0/mockfs
 # root and published to AMFI through this bundle (scripts/make-clover-root.py).
-# Round122 replaces the image that lives here twice over -- as this RAMDisk and as the bytes flashed
-# into logfs, which is the one actually exec'd -- so the cdhash moves with it: `clover-el0: before
-# write` now precedes the `msg=` label write. 769d413c00980dc4f745be7f67c57c13122f4c13, 35488 bytes,
-# sha256 890e94417bf79dfd. The kernel is byte-for-byte round121's, so nothing else in the volume moves.
-trust_cache_sha256 = ["6062a6a45c2ff822563a3c6ef698fdef8222f13e4800a1cf02ec93818709a434"]
+# Round123 replaces the image that lives here twice over -- as this RAMDisk and as the bytes flashed
+# into logfs, which is the one actually exec'd -- so the cdhash moves with it: round122's single
+# pre-write panic and round85's single post-write panic are gone, and six reboot(2) rungs now sit one
+# write apart. 422d125bc557cd0e662314bdcf6ad49b06a99c99, 35648 bytes, sha256 90d6c8fb689acb50. The
+# kernel is byte-for-byte round121's, so nothing else in the volume moves.
+#
+# The six svc sites, for reading a photograph against the disassembly (the image does not slide, so
+# these are the addresses a watchdog-era `elr` would have shown had this round needed it):
+#   0x100000620  "clover-el0: after write msg-label"    _w_msg_label   0x100004192
+#   0x10000063c  "clover-el0: after write msg-line"     _w_msg_line    0x1000041b4
+#   0x100000668  "clover-el0: after write m2-presend"   _w_m2_presend  0x1000041d5
+#   0x1000006d0  "clover-el0: after write m2-send-line" _w_m2_send     0x1000041f8
+#   0x100000778  "clover-el0: after write m2-rcv-line"  _w_m2_rcv      0x10000421d
+#   0x1000007f0  "clover-el0: after write probe-done"   _w_probe_done  0x100004241
+# panic() keeps the first panic it is given, so the drawn string is the name of the last write that
+# came back; a rung that returned an errno simply falls through to the next write.
+trust_cache_sha256 = ["dcf66eeaa2f1bb95fc68856578b562d15e1f98104b35d5caadd019e874d91b29"]
 kernel_args = [
   "-v",
   "serial=3",
@@ -1538,6 +1550,12 @@ kernel_args = [
   # EL0 reaches panic_kernel() (RA/LR = _panic_kernel+0xf0, fmt = the "userspace panic: %s" cstring at
   # __TEXT+0xc044f), so the missing round85 panic means that svc was never executed, and the watchdog's
   # single `_puts + 4` sample is the half of round121's frame that has to carry the doubt now.
+  # Round123 spends that proven channel on the question instead of the sentinel: both single panics are
+  # deleted from the path and six reboot(2) rungs now sit one write apart, each naming the line whose
+  # write it follows, so the one string panic() draws is the last write that returned. The sample above
+  # decodes against round122's image; against round123's the same helpers moved +0x40 -- _puts
+  # 0x100000b94, _write_console 0x100000b48, _print_dec 0x100000b58 -- and the rungs are the six svc
+  # sites listed by the [payload] trust_cache comment.
   "armcpu-clock-panic=60000",
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board runs one CPU (no sheng-smp), while the driver's

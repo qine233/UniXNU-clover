@@ -602,30 +602,37 @@ _start:
   // and nothing else. They stay filled anyway, because the receive copies its
   // result back over them and the legacy test needs to know it is being handed
   // the header it expects rather than the kernel's leftovers.
-  // Round 122 moves this probe in front of the write it used to follow. That is the cut the comment
-  // below already prescribed, and it is the only thing round121's second frame left unresolved: the
-  // clock watchdog's entry sample was `_puts + 4` -- the instruction after `bl _write_console`
-  // returned, taken in EL0, since spsr's mode field is 0 -- and every `_puts` call site sits behind
-  // `b.eq _skip_mach`, so the interrupted thread is this child. Yet the panic the call below raises
-  // never appeared, and the panic screen keeps the first panic it is given. Those two cannot both be
-  // a linear boot, and nothing that sits after the `_puts` can say which half is lying. So the call
-  // moves ahead of it. The child reaches this point on every frame since round 84 (the `reply=` line
-  // before it always prints), which makes the reading two-valued: a panic screen here proves
-  // reboot(2) from EL0 is a working channel at all -- the premise round85 bought and never tested --
-  // and a watchdog-only frame proves the child never reaches the call, wherever the sample says it
-  // is.
-  adrp x1, _panic_msg_before@PAGE
-  add x1, x1, _panic_msg_before@PAGEOFF
-  mov x0, #0xc00                      // RB_PANIC | RB_QUICK
-  mov x16, #55                        // reboot(int opt, char *msg)
-  svc #0x80
-
-  // Only reachable if reboot(2) came back with an errno. 450 rather than 449 so the parent's code
-  // names this call site, and the message it would have carried.
-  mov x23, #450
-  b _exit_now
-
-  // Not reached this round: the label write, and the panic that used to sit behind it.
+  // Round 123 turns the panic screen from a sentinel into a printer. Round 122 closed the question it
+  // asked -- `userspace panic: clover-el0: before write` came back on the panel, with RA decoding to
+  // panic_kernel + 0xf0 and the format string to "userspace panic: %s", so reboot(2) from an EL0
+  // process reaches the screen in about ten seconds -- and that makes the channel usable as an output
+  // device rather than only as a last words. What is still open is round 85's question, which round
+  // 122 deliberately left unasked: which of this tail's writes is the last one to return.
+  //
+  // So the two single panics that used to bracket the first write are gone (round 122's pre-write call
+  // and its exit(450), round 85's post-write call and its exit(449); both are in git), and in their
+  // place there is now a ladder. Immediately after each write site below sits one
+  // reboot(RB_PANIC|RB_QUICK, <a string naming the line that write belongs to>). panic() keeps the
+  // first panic it is handed and stops the boot there, so exactly one string is ever drawn, and it
+  // names the last write that came back. Six rungs, in program order:
+  //
+  //   after write msg-label      the `msg=` label write came back and nothing after it did -- the
+  //                              write the round121 watchdog sample (`_puts + 4`) pointed at.
+  //   after write msg-line       the buffer address and its newline too, so the whole `msg=` line is
+  //                              on the panel: rounds 78-83's suspect is cleared.
+  //   after write m2-presend     and the presend line; the child is standing at the msg2 send.
+  //   after write m2-send-line   and the send's return code: mach_msg2_trap answered.
+  //   after write m2-rcv-line    and the rcv/size line: both traps are done with.
+  //   after write probe-done     every line of the probe, legacy send included.
+  //
+  // No rung is followed by an exit code: a reboot that came back with an errno simply falls through
+  // into the next write, and if all six came back the child reaches _mach_done and exits 11, which the
+  // parent's wait4 line reports. That split is worth having -- exit(11) with no panic screen at all
+  // would mean reboot(2) itself had become inert, which round 122 says it has not.
+  //
+  // And the empty reading is still on the table: no panic screen, only the clock watchdog, means the
+  // first write of the ladder never returned. That is what round121's sample said, and with the
+  // pre-write panic deleted it is now the only thing left standing.
   // "[clover] el0 mach: msg=<address>": where the buffer actually is.
   adrp x1, _mach_msg@PAGE
   add x1, x1, _mach_msg@PAGEOFF
@@ -633,6 +640,13 @@ _start:
   add x2, x2, _mach_msg_end@PAGEOFF
   sub x2, x2, x1
   bl _puts
+
+  // Rung 1: the label write -- the write every round from 74 on has been about -- came back.
+  adrp x1, _w_msg_label@PAGE
+  add x1, x1, _w_msg_label@PAGEOFF
+  mov x0, #0xc00                      // RB_PANIC | RB_QUICK
+  mov x16, #55                        // reboot(int opt, char *msg)
+  svc #0x80
 
   // Round 85's single change, and it is a change of channel rather than of question. Round 84
   // came back as the last row of its table -- `msg=` painted, no panic screen, nothing added after
@@ -655,7 +669,7 @@ _start:
   // woken. Round 70's parent-waking child was fork-without-exec, so whether exec keeps childproc
   // attached is genuinely untested here.
   //
-  // So the child now panics the kernel itself, which needs neither the tty nor the parent:
+  // So round 85 had the child panic the kernel itself, which needs neither the tty nor the parent:
   // reboot(2), syscall 55 (syscalls.master:109, `int reboot(int opt, char *msg)`), with
   // RB_PANIC|RB_QUICK = 0x800|0x400. kern_xxx.c:182 tests exactly that pair and calls
   // panic_kernel() straight away, which is panic_with_options(.., "userspace panic: %s", message)
@@ -667,29 +681,23 @@ _start:
   // (:116) and the MACF reboot check (:142) are skipped for RB_PANIC, so the call needs no grant
   // -- which matters because a grant is exactly the kind of thing this port keeps getting wrong.
   //
-  //   panic `userspace panic: clover-el0: write returned`   the label write came back, and so does
-  //       a child's syscall after exec. Every suspect moves to the exit/wait4 wake-up side.
-  //   panic `initproc exited ... exit status 1`             the write came back and reboot(2)
-  //       returned an error, which the child reports by leaving with 449 -- the parent's
-  //       "exited, but not with our exit(448)" code. Not expected; would name a policy layer.
-  //   no panic screen, ever                                 the write never returned, or reboot(2)
-  //       itself blocked inside the kernel. Those two are still one reading, and the next cut
-  //       separates them by calling reboot before the write instead of after it.
-  adrp x1, _panic_msg@PAGE
-  add x1, x1, _panic_msg@PAGEOFF
-  mov x0, #0xc00                      // RB_PANIC | RB_QUICK
-  mov x16, #55                        // reboot(int opt, char *msg)
-  svc #0x80
-
-  // Reached only if reboot(2) came back, which means the write came back first. 449 is deliberately
-  // not 448 so the parent reports 1 rather than 0.
-  mov x23, #449
-  b _exit_now
-
-  // Not reached this round: the two instructions below are what rounds 78-83 hung
-  // on, and they stay in place so the next round only has to delete the block above.
+  // Round 123 deleted the single panic that used to sit here and its exit(449). The ladder above and
+  // below asks round 85's question in six rungs instead of one: each rung names the line whose write it
+  // follows, so the panel does not have to be worked out from which lines are missing.
+  //
+  // The address half of the `msg=` line, and its newline. These two instructions are what rounds 78
+  // through 83 hung on; they are live again.
   mov x0, x20
   bl _print_line
+
+  // Rung 2: the whole `msg=<address>` line came back, so the console took a second write after the one
+  // the round121 watchdog sample pointed at. Rounds 78-83's suspect is cleared, and what is left is
+  // everything after it.
+  adrp x1, _w_msg_line@PAGE
+  add x1, x1, _w_msg_line@PAGEOFF
+  mov x0, #0xc00
+  mov x16, #55
+  svc #0x80
 
   // ---- the question of this round: mach_msg2_trap, index 47 ----
   //
@@ -702,6 +710,14 @@ _start:
   add x2, x2, _m2_presend_end@PAGEOFF
   sub x2, x2, x1
   bl _puts
+
+  // Rung 3: the "presend" line came back. The next instruction is the msg2 send itself, so this rung
+  // is the last statement that can be made before the trap that killed round 73.
+  adrp x1, _w_m2_presend@PAGE
+  add x1, x1, _w_m2_presend@PAGEOFF
+  mov x0, #0xc00
+  mov x16, #55
+  svc #0x80
 
   mov x0, x20                         // data: the message buffer
   mov x1, #1                          // MACH_SEND_MSG
@@ -735,6 +751,14 @@ _start:
   bl _puts
   mov x0, x21
   bl _print_line
+
+  // Rung 4: the send's return code line came back, which means mach_msg2_trap answered instead of
+  // killing the thread, and the write that carries the answer returned with it.
+  adrp x1, _w_m2_send@PAGE
+  add x1, x1, _w_m2_send@PAGEOFF
+  mov x0, #0xc00
+  mov x16, #55
+  svc #0x80
 
   adrp x1, _m2_prercv@PAGE
   add x1, x1, _m2_prercv@PAGEOFF
@@ -786,6 +810,14 @@ _start:
   mov x0, x24
   bl _print_line
 
+  // Rung 5: "rcv=<code> size=<n>" and its newline came back, so both traps and the five writes that
+  // report them are done with. What is left is the legacy send.
+  adrp x1, _w_m2_rcv@PAGE
+  add x1, x1, _w_m2_rcv@PAGEOFF
+  mov x0, #0xc00
+  mov x16, #55
+  svc #0x80
+
   // ---- the second question, asked last because only its death is informative
   //
   // The legacy trap, index 31, with the same header and the same destination as
@@ -822,6 +854,15 @@ _start:
   bl _puts
   mov x0, x21
   bl _print_line
+
+  // Rung 6: every line of the probe, legacy send included, came back. This is the rung that would
+  // contradict round 84's photograph -- and if it is the one drawn, the writes were never the problem
+  // and the parent's wait4 is.
+  adrp x1, _w_probe_done@PAGE
+  add x1, x1, _w_probe_done@PAGEOFF
+  mov x0, #0xc00
+  mov x16, #55
+  svc #0x80
 
 _mach_done:
   // Leave, so the parent's wait4 line confirms the probe ran to the end rather
@@ -1453,9 +1494,27 @@ _panic_msg:
   .asciz "clover-el0: write returned"
 // Round 122's report, and the whole of its change: the same reboot(2) asked in front of the write it
 // used to follow, so a panic screen carrying this string says the channel works and says nothing about
-// the console -- which is the thing round85's reading could not conclude either way.
+// the console -- which is the thing round85's reading could not conclude either way. Both strings above
+// are the archived reports of rounds 85 and 122; no rung of round123's ladder uses them.
 _panic_msg_before:
   .asciz "clover-el0: before write"
+// Round 123's ladder: the six reports, each handed to the reboot(2) that sits directly after the write
+// it names. The panic screen draws the first one the boot produces, so the string that comes back is
+// the name of the last write that returned. These sit after `_mach_msg_end` on purpose -- the `msg=`
+// label's length is the distance between `_mach_msg` and `_mach_msg_end`, so nothing may be placed
+// between them.
+_w_msg_label:
+  .asciz "clover-el0: after write msg-label"
+_w_msg_line:
+  .asciz "clover-el0: after write msg-line"
+_w_m2_presend:
+  .asciz "clover-el0: after write m2-presend"
+_w_m2_send:
+  .asciz "clover-el0: after write m2-send-line"
+_w_m2_rcv:
+  .asciz "clover-el0: after write m2-rcv-line"
+_w_probe_done:
+  .asciz "clover-el0: after write probe-done"
 _m2_presend:
   .ascii "[clover] el0 m2: presend\n"
 _m2_presend_end:

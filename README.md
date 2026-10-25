@@ -6978,6 +6978,107 @@ args=0xfffffff70bf53cc0
 
 **下一题（round123，仍然只改 EL0 镜像）：** 既然 panic 屏已经是一条能印字的通道，就别再拿它只当哨兵 —— 在孩子尾段每一次 write **之后**各放一颗 `reboot(2)`，各带一句不同的串（`w1`／`w2`／`w3`…）。panic 屏只保留第一个 panic，所以画出来的那句就指名「最后一次返回的 write」是哪一次，一次刷机多值。这样 `msg=` 那次 write 到底回没回来，就不再需要靠看门狗的单点样本去猜。
 
+## v0.2.95（round123）：把 panic 屏从哨兵改成打印机 —— 尾段六档 reboot 阶梯
+
+round122 结掉的是前提（EL0 的 `reboot(2)` 能在约 10 秒内把一句话送上 panic 屏），留下的是 round85 那一题：孩子尾段那几次 write，最后一次「回来了」的是哪一次。上一轮的读数表里，这一题只能靠看门狗那一个采样点去猜。既然通道已经证明能印字，本轮就不再用它当哨兵，而是当打印机。
+
+**改动全部在 `scripts/clover-el0-init.S`，只删只加，不动任何驱动与内核。**
+
+1. 删掉路径上那两颗孤立 panic：round122 放在 `msg=` 标签 write **之前**的 `reboot(2)` 和它的 `mov x23, #450 / b _exit_now`，round85 放在那次 write **之后**的 `reboot(2)` 和它的 `mov x23, #449 / b _exit_now`。两句旧报告串（`"clover-el0: write returned"`、`"clover-el0: before write"`）留在 `__DATA` 当存档，没有档位再用它们。
+2. 在孩子尾段每一次 write 落地之后立刻放一颗 `reboot(2)`，各带一句指名「它紧跟哪一行」的串。六档，按程序顺序：
+
+```
+  sub x2, x2, x1
+  bl _puts                        // 刚写完 "[clover] el0 mach: msg="
+  adrp x1, _w_msg_label@PAGE      // 档 1：紧跟这次 write
+  add x1, x1, _w_msg_label@PAGEOFF
+  mov x0, #0xc00                  // RB_PANIC | RB_QUICK
+  mov x16, #55                    // reboot(int opt, char *msg)
+  svc #0x80
+```
+
+档位是六条而不是十一条，因为 `_puts` 只写半行、`_print_line` 补数字和换行，真正有意义的边界是「这一行的最后一个 write 也回来了」；`_m2_prercv` 那半行不单独立档，它被下一档（rcv 整行）覆盖。`_mach_done` 前面那档例外，它是「整段探测全部返回」。
+
+| 屏上出现 | 含义 |
+| --- | --- |
+| `userspace panic: clover-el0: after write msg-label` | `msg=` 那半行的 write 回来了，此后没有任何 write 回来 —— 也正是 round121 看门狗样本 `_puts + 4` 指的那一次 |
+| `… after write msg-line` | 完整一行 `msg=<address>\n` 都回来了：round78–83 的嫌疑人洗清，问题在它之后 |
+| `… after write m2-presend` | 而且 `presend` 行也回来了 ⇒ 孩子正站在 msg2 send 那条 `svc` 前面 |
+| `… after write m2-send-line` | 而且 send 的返回码行也回来了 ⇒ `mach_msg2_trap` 应答了，没杀线程 |
+| `… after write m2-rcv-line` | 而且 `rcv=<code> size=<n>` 整行回来了 ⇒ 两次 trap 都过 |
+| `… after write probe-done` | 整段探测（含 legacy send）每一次 write 都回来了 —— 这一档直接反驳 round84 那张照片 |
+| 只有看门狗、没有 panic 屏 | 阶梯第一档那次 write 根本没返回。round121 的样本说的就是这句话，本轮把它单独切出来了 |
+| 父亲那行的 `exit status` 对应 11<<8 | 六颗 `reboot(2)` 全都带 errno 返回了（否则 panic 会终止启动）⇒ `reboot(2)` 本身失效；round122 已排除，这条只作兜底 |
+
+每档后面**不再跟 exit 码**：一颗返回了 errno 的 `reboot(2)` 就直接落到下一次 write，六颗全返回则孩子走到 `_mach_done` 以 11 退出，由父亲的 `wait4` 行报出来。这样「panic 屏画了 probe-done 同屏还有父亲的 wait 行」不可能出现（panic 终止启动），而只出现 wait 行则是上面那条兜底读数。
+
+**构建**（EL0-only 轮，内核不动，无需 `build kernel`）：
+
+```
+cd /Users/zhouzhou/UniXNU-clover && /opt/homebrew/bin/python3.13 scripts/make-clover-root.py
+cd /Users/zhouzhou/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" /opt/homebrew/bin/python3.13 ./unixnu build payload \
+  --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd /Users/zhouzhou/UniXNU-clover && /opt/homebrew/bin/python3.13 scripts/check-clover.py && /opt/homebrew/bin/python3.13 scripts/verify-clover-payload.py
+```
+
+`check-clover` 通过（ADT 13268 字节、8 核、splash `0x9d400000-0x9f800000`）；`verify-clover-payload` 全绿：卷内 `scratch-data.img` 与签名根逐字节相同、trustcache 与发布的 bundle 相同、内核探测补丁与 original-PMGR 绑定与 CloverSdhci 链接都在。boot-args 一字未动。
+
+| 产物（`~/clover-out/`） | 字节 | SHA-256 |
+| --- | --- | --- |
+| `round123-payload.img` | 58720256 | `f2b05de704f24835091ce579bdb63995553fbd9a5a9ce5a0180b0418e2a0c241` |
+| `round123-scratch-data.img` = `launchd.macho` | 35648 | `90d6c8fb689acb503e4367f9356ae53bd67906283219708a83e1366157d476c3` |
+| `round123-in-volume-kernel.macho.trustcache` | 56 | `dcf66eeaa2f1bb95fc68856578b562d15e1f98104b35d5caadd019e874d91b29` |
+| `round123-in-volume-kernel.macho` | 51974144 | `559ab0323052b3eec4fa6c33e3177f660ec34174a436ff164e9c93430d3ee6e8`（与 round121/122 逐字节相同） |
+| `round123-in-volume-kernel.macho.adt` | 13268 | `1e9a52d2d417f6af06388abba3ba10733aa26aff6fdeded609db7c2694e6d431` |
+| `round123-in-volume-unixnu.toml` | 588 | `c463cac60b843b240ae954e950cdfaad42827c555b631f8b906d177fd9e24b63` |
+| `round123-SHA256SUMS` | — | 七项全部 `OK` |
+
+ADT 换了哈希但不是改动：与 round122 的 ADT 逐字节比对只差 **一段 64 字节、偏移 352–415** 的数据，即 `/chosen` 的 `random-seed` —— 每次构建重掷，所以 ADT 哈希从来不是跨轮不变量。体积（13268）与 `check-clover.py` 的断言都没动。`round123-unixnu.toml` 从 572 变 588 字节同样只是 `[entry] title` 变长。
+
+**新符号表**（`__TEXT` 基址 `0x100000000`、不 slide，屏上地址直接减基址；相对 round122，`_start` 之后所有东西整齐上移 `0x40` = 删 14 条指令、加 30 条）：
+
+| 符号 | round123 | round122 |
+| --- | --- | --- |
+| `_start` | `0x100000380` | 同 |
+| `_mach_done` | `0x1000007f4` | `0x7b4` |
+| `_skip_mach` | `0x100000800` | `0x7c0` |
+| `_parent` | `0x100000a18` | `0x9d8` |
+| `_wait_error` / `_wait_reaped` | `0x100000ac4` / `0x100000acc` | `0xa84` / `0xa8c` |
+| `_exited_other` / `_not_exited` / `_signaled` | `0x100000af8` / `0x100000b00` / `0x100000b18` | `0xab8` / `0xac0` / `0xad8` |
+| `_exit_now` / `_checkpoint` / `_fail` | `0x100000b24` / `0x100000b34` / `0x100000b38` | `0xae4` / `0xaf4` / `0xaf8` |
+| `_write_console` / `_print_dec` | `0x100000b48` / `0x100000b58` | `0xb08` / `0xb18` |
+| `_puts` / `_print_line` / `_mheader` | `0x100000b94` / `0x100000ba4` / `0x100000bd4` | `0xb54` / `0xb64` / `0xb94` |
+
+六档 `svc` 站点与串地址（已用 `objdump` 逐个对着 `__DATA` 偏移核过顺序，也在 `board.toml` 的 `trust_cache_sha256` 注释里留了同一张表）：
+
+| 档 | `svc` | 串地址 | 串 |
+| --- | --- | --- | --- |
+| 1 | `0x100000620` | `0x100004192` | `clover-el0: after write msg-label` |
+| 2 | `0x10000063c` | `0x1000041b4` | `clover-el0: after write msg-line` |
+| 3 | `0x100000668` | `0x1000041d5` | `clover-el0: after write m2-presend` |
+| 4 | `0x1000006d0` | `0x1000041f8` | `clover-el0: after write m2-send-line` |
+| 5 | `0x100000778` | `0x10000421d` | `clover-el0: after write m2-rcv-line` |
+| 6 | `0x1000007f0` | `0x100004241` | `clover-el0: after write probe-done` |
+
+**三个仍然开着的缺陷**（本轮都不动，理由各自不同）：
+
+- 父亲的 `cmp x24, #448`（.S:1254-1263 一带）：`WEXITSTATUS` 只留 8 位，而 448 = `0x1c0` 需要第 9 位，所以「孩子以 448 退出」这条永远读不出来。本轮删掉了档位上的 exit 码，这条缺陷不影响读数，但下一轮想让孩子用退出码说话之前必须修。
+- 镜像 35648 字节躺在 8 MiB 的 `logfs` 里，mockfs 的 legacy 视图把整个分区当 `/sbin/launchd` 读，所以文件尾后面是上一轮的残留字节。exec 只用前面的真字节，本轮仍然没踩到，但阶梯把镜像又推大了一点。
+- `cnt0 == freq`、`cnt1 == 0`：tick 周期还是量不出来，`ticks=` 继续只当启动进度坐标。
+
+**上机**（冷刷，绝不 `fastboot boot`；这里会写两个 eMMC 分区 —— `cache` 装 payload ESP、`logfs` 装被真正 exec 的根镜像，写分区是破坏性操作，确认设备在 fastbootd 且你同意覆盖这两个分区再跑）：
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round123-payload.img
+fastboot flash logfs /Users/zhouzhou/clover-out/round123-scratch-data.img
+fastboot reboot
+```
+
+`Warning: skip copying logfs image avb footer (logfs partition size: 0, …)` 仍然是分区表缺条目、不是写失败。一次刷机只回答一个问题：屏上那一句 `after write <名字>` 就是最后一次返回的 write 的名字。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
