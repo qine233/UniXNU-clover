@@ -17,12 +17,16 @@
 // at the end of bsd_autoconf(), after vfsinit(); clover_block_request() at the bottom explains why
 // that is the only post-vfsinit hook this repository owns.
 //
-// Round 114 still stopped at bsd-props, so the ordering was not the only obstacle: either
-// createNodes() fails somewhere else, or devfs refuses the node for another reason. start() hides
-// which one. Round 115 keeps the same run and replaces the bare "bsd-props 0" with a bitmask read
-// from the same media objects (README v0.2.87 lists the bits), plus a devfs_make_node/remove probe
-// for a private name and for the four names the client would have used. The probe proves devfs is
-// ready regardless of what the client did; the name probes show whether a node already existed.
+// Round 115's mask (0x5abc7) answered that. devfs was ready, the whole media already carried a BSD
+// name before the manual client ran, and both "disk0" and "disk0s39" already existed while our
+// logfs media had no properties. The boot log says where they came from: a column of
+// "disk0sN: name slot allocation failed (Errno=17)" from the duplicate tree this file built by
+// hand. Starting the driver's media calls registerService(); IOKit's config thread matches
+// IOGUIDPartitionScheme and IOMediaBSDClient for it, and those clients name the whole disk and
+// every partition before this run reaches its own scheme. The hand-built second scheme then loses
+// every name to EEXIST, and its partition is the media this file was reading. Round 116 stops
+// building a second tree: it waits for the automatic one to finish, finds the partition by the
+// "BSD Name" the kernel itself wrote, and continues with that media.
 //
 // The class has to be hand-written. IOStorageFamily is loaded at runtime from the boot kext
 // collection (kernel.macho exports no IOBlockStorageDevice, IOMedia or IOBlockStorageDriver
@@ -40,7 +44,7 @@
 // an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
 // attached for start (startCandidate() attaches again after the matching loop's detach).
 //
-// A failure panics with one short CloverBlock r115 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r116 line naming the step; success prints one line
 // and lets the boot continue, because there is nothing left to photograph.
 #define IOKIT_ENABLE_SHARED_PTR 1
 #include <IOKit/IOLib.h>
@@ -72,17 +76,10 @@ uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words, uint32_t 
 // major<<24|minor this file passes; the vnode is never touched, and it stays for boot lifetime
 // exactly as it would when it becomes the root vnode.
 int bdevvp (int32_t dev, void **vpp);
-// bsd/miscfs/devfs/devfs_tree.c. The probe only needs the entry to be accepted and removed, so
-// dev_t is passed as the same 32-bit word the C prototype uses. DEVFS_BLOCK is 1.
-void *devfs_make_node (uint32_t dev, int chrblk, uint32_t uid, uint32_t gid, int perms,
-                       const char *fmt, ...);
-void devfs_remove (void *node);
 }
 
 static const uint32_t kBlockBytes = 512;
 static const uint32_t kBlockWords = kBlockBytes / 4;
-static const uint32_t kLogfsPartitionId = 39;   // GPT index, from the round101 entry walk
-static const char kPartitionIdKey[] = "Partition ID";
 static const char kBSDNameKey[] = "BSD Name";
 static const char kBSDMajorKey[] = "BSD Major";
 static const char kBSDMinorKey[] = "BSD Minor";
@@ -437,88 +434,47 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r115: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r116: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
-// The bsd-props mask has 19 bits, so decimal is unreadable on a photographed panic screen.
-__attribute__((noreturn)) static void failMask(const char *step, uint64_t mask)
+// The mask's job is done: round115 showed that the names this file wants are taken by the tree
+// IOKit builds on its own. This walk finds the media the kernel itself named, and counts the named
+// partitions under the whole disk, so a timeout says whether matching never ran or only got
+// partway. gIOServicePlane children of the whole media are the partition scheme, whose children
+// are the partition media; the depth limit only guards against a malformed tree.
+static IOMedia *findNamedMedia(IORegistryEntry *root, const char *name,
+                               uint32_t *partitions, uint32_t depth)
 {
-  char value[24];
-  snprintf(value, sizeof(value), "0x%llx", static_cast<unsigned long long>(mask));
-  panic("CloverBlock r115: %s %s", step, value);
-}
-
-// Round115 instrument. createNodes() is the only place that writes the BSD properties, and
-// IOMediaBSDClient::start() ignores its answer, so bsd-whole/bsd-root prove nothing about them.
-// The client fails for one of two reasons: devfs_make_node() returns NULL (devfs not ready, or the
-// name is already taken), or the anchor/minor table rejects the media before that. These bits have
-// to be read before the client objects are released, and the name probes are exactly the names the
-// client would have requested: "disk0"/"disk1" for a whole media whose anchor ID is 0 or 1, and
-// "disk0s39"/"disk1s39" for the logfs partition off the same anchor.
-static bool devfsProbe(const char *name)
-{
-  void *node = devfs_make_node(/* dev */ 0x7e00007eu, /* DEVFS_BLOCK */ 1,
-                               /* uid */ 0, /* gid (GID_OPERATOR) */ 5, /* perms */ 0640,
-                               /* name */ "%s", name);
-  if (!node) {
-    return false;
+  OSSharedPtr<OSIterator> children = root->getChildIterator(gIOServicePlane);
+  if (!children.get()) {
+    return nullptr;
   }
-  devfs_remove(node);
-  return true;
-}
-
-enum BsdPropsBit {
-  kWholeNameBit   = 1u << 0,   // whole media has "BSD Name"
-  kWholeMajorBit  = 1u << 1,   // whole media has "BSD Major"
-  kWholeMinorBit  = 1u << 2,   // whole media has "BSD Minor"
-  kTargetNameBit  = 1u << 3,   // logfs partition has "BSD Name"
-  kTargetMajorBit = 1u << 4,   // logfs partition has "BSD Major"
-  kTargetMinorBit = 1u << 5,   // logfs partition has "BSD Minor"
-  kLocationBit    = 1u << 6,   // partition "Location" is exactly "39"
-  kTargetProvBit  = 1u << 7,   // partition has a provider
-  kWholeProvBit   = 1u << 8,   // whole media has a provider
-  kWholeFlagBit   = 1u << 9,   // whole media reports isWhole()
-  kTargetWholeBit = 1u << 10,  // partition reports isWhole() (must stay clear)
-  kProbeNameBit   = 1u << 11,  // devfs accepted a private name: devfs is ready and writable
-  kProbeDisk0Bit  = 1u << 12,  // "disk0" was still free after the clients ran
-  kProbeDisk1Bit  = 1u << 13,  // "disk1" was still free
-  kProbeS39Bit    = 1u << 14,  // "disk0s39" was still free
-  kProbeS39AltBit = 1u << 15,  // "disk1s39" was still free
-  kWholeEarlyBit  = 1u << 16,  // whole media already had a BSD name before its client started
-  kTargetEarlyBit = 1u << 17,  // partition already had a BSD name before its client started
-  kTargetBaseBit  = 1u << 18,  // partition base is non-zero
-};
-
-static uint64_t bsdPropsMask(IOMedia *whole, IOMedia *target, bool wholeEarly, bool targetEarly)
-{
-  uint64_t mask = 0;
-  const char *location = target->getLocation();
-
-  if (property(whole, kBSDNameKey))   mask |= kWholeNameBit;
-  if (property(whole, kBSDMajorKey))  mask |= kWholeMajorBit;
-  if (property(whole, kBSDMinorKey))  mask |= kWholeMinorBit;
-  if (property(target, kBSDNameKey))  mask |= kTargetNameBit;
-  if (property(target, kBSDMajorKey)) mask |= kTargetMajorBit;
-  if (property(target, kBSDMinorKey)) mask |= kTargetMinorBit;
-  if (location && strcmp(location, "39") == 0) mask |= kLocationBit;
-  if (target->getProvider())          mask |= kTargetProvBit;
-  if (whole->getProvider())           mask |= kWholeProvBit;
-  if (whole->isWhole())               mask |= kWholeFlagBit;
-  if (target->isWhole())              mask |= kTargetWholeBit;
-  if (wholeEarly)                     mask |= kWholeEarlyBit;
-  if (targetEarly)                    mask |= kTargetEarlyBit;
-  if (target->getBase() != 0)         mask |= kTargetBaseBit;
-
-  // The probes come last: each successful one creates and removes a node, and the four client
-  // names are probed after the clients so a taken name means the client (or an automatic one)
-  // actually got there.
-  if (devfsProbe("cloverbdprobe"))  mask |= kProbeNameBit;
-  if (devfsProbe("disk0"))          mask |= kProbeDisk0Bit;
-  if (devfsProbe("disk1"))          mask |= kProbeDisk1Bit;
-  if (devfsProbe("disk0s39"))       mask |= kProbeS39Bit;
-  if (devfsProbe("disk1s39"))       mask |= kProbeS39AltBit;
-
-  return mask;
+  IOMedia *found = nullptr;
+  while (!found) {
+    OSObject *object = children->getNextObject();
+    if (!object) {
+      break;
+    }
+    IORegistryEntry *entry = OSDynamicCast(IORegistryEntry, object);
+    if (!entry) {
+      continue;
+    }
+    IOMedia *media = static_cast<IOMedia *>(entry->metaCast("IOMedia"));
+    if (media) {
+      OSString *bsdName = OSDynamicCast(OSString, property(media, kBSDNameKey));
+      if (bsdName) {
+        (*partitions)++;
+        if (strcmp(bsdName->getCStringNoCopy(), name) == 0) {
+          found = media;
+          break;
+        }
+      }
+    }
+    if (depth < 3) {
+      found = findNamedMedia(entry, name, partitions, depth + 1);
+    }
+  }
+  return found;
 }
 
 struct MediaOp {
@@ -558,24 +514,6 @@ static IOReturn readMediaBytes(IOMedia *media, IOService *client, IOMemoryDescri
     return static_cast<IOReturn>(op->status);
   }
   return kIOReturnSuccess;
-}
-
-// Hand-start an IOStorageFamily service by name. Round109 showed the synchronous catalogue match
-// never returns on this boot path, so each object is allocated from its metaclass and driven
-// through attach/start directly. The objects are never released: the registry, the media tree
-// and the BSD minor table all keep pointing at them for the rest of the boot.
-static IOService *startService(const char *className, IOService *provider)
-{
-  const OSMetaClass *meta = lookupMetaClass(className);
-  if (!meta) {
-    return nullptr;
-  }
-  IOService *service = static_cast<IOService *>(meta->alloc());
-  if (!service || !service->init(nullptr) || !service->attach(provider) ||
-      !service->start(provider)) {
-    return nullptr;
-  }
-  return service;
 }
 
 extern "C" void clover_block_run(void)
@@ -628,71 +566,36 @@ extern "C" void clover_block_run(void)
     fail("media", 0);
   }
 
-  // 5. The real partition table reader. probe() opens the media, reads LBA 0/1 and the entry
-  // array and keeps one media object per entry; start() attaches and registers each of them.
-  const OSMetaClass *schemeMeta = lookupMetaClass("IOGUIDPartitionScheme");
-  IOService *scheme = schemeMeta ? static_cast<IOService *>(schemeMeta->alloc()) : nullptr;
-  if (!scheme || !scheme->init(nullptr)) {
-    fail("gpt", 0);
-  }
-  // probeCandidates() attaches a candidate before probe(), and scan() starts with
-  // getProvider() without checking it, so an unattached probe faults on a null media.
-  if (!scheme->attach(whole)) {
-    fail("gpt-attach", 0);
-  }
-  SInt32 score = 0;
-  if (!scheme->probe(whole, &score)) {
-    fail("gpt-probe", static_cast<uint32_t>(score));
-  }
-  if (!scheme->start(whole)) {
-    fail("gpt-start", 0);
-  }
-
-  // 6. The logfs entry the round101 walk named. The count is the scheme's own published total,
-  // so a wrong number is visible without another hand-rolled GPT parse.
+  // 5. The tree is not built here. The driver's own registerService() on this media is what makes
+  // IOKit start IOGUIDPartitionScheme and IOMediaBSDClient for it, and those clients name the
+  // whole disk and every partition. Round115's hand-built scheme was a second tree and lost every
+  // name to EEXIST. Wait for the automatic pass, then take the logfs partition from it by the name
+  // the kernel wrote.
   uint32_t partitions = 0;
   IOMedia *target = nullptr;
-  OSSharedPtr<OSIterator> children = scheme->getChildIterator(gIOServicePlane);
-  if (!children.get()) {
-    fail("gpt-children", 0);
-  }
-  // IOMedia's metaclass symbol belongs to IOStorageFamily, not the kernel, so the cast is by
-  // name: the only class this scheme publishes children of is IOMedia.
-  while (OSObject *object = children->getNextObject()) {
-    IOMedia *partition = static_cast<IOMedia *>(object->metaCast("IOMedia"));
-    if (!partition) {
-      continue;
-    }
-    partitions++;
-    OSNumber *id = OSDynamicCast(OSNumber, property(partition, kPartitionIdKey));
-    if (id && id->unsigned32BitValue() == kLogfsPartitionId) {
-      target = partition;
+  bool wholeNamed = false;
+  for (uint32_t attempt = 0; attempt < 100 && !target; attempt++) {
+    partitions = 0;
+    target = findNamedMedia(whole, "disk0s39", &partitions, 0);
+    wholeNamed = property(whole, kBSDNameKey) != nullptr;
+    if (!target) {
+      IOSleep(10);
     }
   }
-  if (!target) {
-    fail("gpt-target", partitions);
+  // The high half says whether the whole disk itself was named when the wait ended; the low half
+  // is the number of partition media under it that carry a BSD name.
+  if (!target || !wholeNamed) {
+    fail("auto", (wholeNamed ? 0x10000u : 0) | (partitions & 0xffff));
   }
 
-  // 7. BSD nodes. The whole disk is started first so the anchor is unit 0 and the partition is
-  // named disk0s39 by the same code that names every disk in a normal boot. The two early reads
-  // record whether IOKit's own asynchronous match already published a client before this run:
-  // that is the difference between "nobody created a node" and "a node already existed".
-  bool wholeEarly = property(whole, kBSDNameKey) != nullptr;
-  bool targetEarly = property(target, kBSDNameKey) != nullptr;
-  if (!startService("IOMediaBSDClient", whole)) {
-    fail("bsd-whole", 0);
-  }
-  if (!startService("IOMediaBSDClient", target)) {
-    fail("bsd-root", 0);
-  }
   OSString *bsdName = OSDynamicCast(OSString, property(target, kBSDNameKey));
   OSNumber *bsdMajor = OSDynamicCast(OSNumber, property(target, kBSDMajorKey));
   OSNumber *bsdMinor = OSDynamicCast(OSNumber, property(target, kBSDMinorKey));
   if (!bsdName || !bsdMajor || !bsdMinor) {
-    failMask("bsd-props", bsdPropsMask(whole, target, wholeEarly, targetEarly));
+    fail("bsd-type", 0);
   }
 
-  // 8. The exact discovery setconf() performs for rd=<bsd name>.
+  // 6. The exact discovery setconf() performs for rd=<bsd name>.
   OSDictionary *matching = IOBSDNameMatching(bsdName->getCStringNoCopy());
   mach_timespec_t timeout = { 1, 0 };
   IOService *matched = matching ? IOService::waitForService(matching, &timeout) : nullptr;
@@ -701,7 +604,7 @@ extern "C" void clover_block_run(void)
     fail("root-match", reinterpret_cast<uint64_t>(matched));
   }
 
-  // 9. bdevvp() is what vfs_mountroot() calls on that dev_t. It opens the minor through the
+  // 7. bdevvp() is what vfs_mountroot() calls on that dev_t. It opens the minor through the
   // bdevsw IOMediaBSDClient installed, so this both proves the number and leaves the vnode the
   // root mount would use.
   int32_t rootdev = (static_cast<int32_t>(bsdMajor->unsigned32BitValue()) << 24) |
@@ -712,7 +615,7 @@ extern "C" void clover_block_run(void)
     fail("bdevvp", static_cast<uint32_t>(error));
   }
 
-  // 10. The partition's offset mapping: the same block read through the whole media at the
+  // 8. The partition's offset mapping: the same block read through the whole media at the
   // partition's base and through the partition at byte zero has to be identical.
   OSSharedPtr<IOBufferMemoryDescriptor> wholeBlock =
       IOBufferMemoryDescriptor::withCapacity(kBlockBytes, kIODirectionIn, true);
@@ -744,7 +647,7 @@ extern "C" void clover_block_run(void)
     fail("map", 0);
   }
 
-  IOLog("CloverBlock r115: post-vfsinit p=%u %s %u:%u bd=1 map=1\n", partitions,
+  IOLog("CloverBlock r116: auto p=%u %s %u:%u bd=1 map=1\n", partitions,
         bsdName->getCStringNoCopy(), bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue());
 }
@@ -764,15 +667,16 @@ extern "C" void clover_block_run(void)
 // device patches/xnu would shadow the base repository's whole patch set (CloverSdhci.cpp explains
 // that wall at length), and bsd_init.c itself is out of reach.
 //
-// Round114's bsd-props showed this hook is not sufficient by itself: either the handler still runs
-// before devfs is usable (an earlier "IOBSD" publication in the boot kext collection), or
-// createNodes() fails on the media tree. Round115 does not change the hook; it makes bsd-props say
-// which of the two it is, because a mask is cheaper to photograph than a reordering guess.
+// Round114's bsd-props showed this hook is not sufficient by itself, and round115's mask found out
+// why: the hook is fine and devfs is ready, but the names are taken before this run asks for them.
+// The handler runs on a config thread, and by the time it reaches its own scheme, other config
+// threads have already started the automatic partition scheme and BSD clients for the same media.
+// Round116 therefore stops hand-building the tree and waits for the automatic one to name the
+// partition, then uses that media.
 //
-// The handler runs on IOKit's config thread, the same kind of thread probeCandidates() uses for a
-// normal personality match, so the work is no longer on the boot thread. The boot does not wait for
-// it: rd= is still md0 and this round only asks whether the device side completes. When a later
-// round points rd= at disk0s39, setconf()'s IOFindBSDRoot() supplies the wait.
+// The boot does not wait for any of this: rd= is still md0 and round116 only asks whether the
+// device side completes. When a later round points rd= at disk0s39, setconf()'s IOFindBSDRoot()
+// supplies the wait.
 static bool cloverBlockIOBSD(void *, void *, IOService *, IONotifier *)
 {
   clover_block_run();

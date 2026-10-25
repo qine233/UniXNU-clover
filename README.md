@@ -6257,6 +6257,86 @@ fastboot reboot
 **一次刷机只回答一个问题：`bsd-props` 的失败发生在整盘、分区，还是 devfs 本身。**
 掩码会指出唯一的一段，下一轮只改那一段；之后才把 `rd=` 换成 `disk0s39`。
 
+实机掩码是 `0x5abc7`，答案见下一节。
+
+## v0.2.88（round116）：接住内核自己建好的那棵树
+
+round115 的照片给出的掩码是 `0x5abc7`，开机日志里还有一整列
+
+```text
+devfs: disk0s39: name slot allocation failed (Errno=17)
+```
+
+（从 `disk0s1` 到 `disk0s39` 各一行）。两者合起来只指向一个结论：**IOKit 的自动匹配已经把这棵树建完了，手工方案建的是一棵重复的树。**
+
+掩码逐位读（位号沿用上一节的表）：
+
+| 位 | 读数 | 说明 |
+| --- | --- | --- |
+| 0–2 | 1 | 整盘 `IOMedia` 已经有 `BSD Name/Major/Minor` |
+| 3–5 | 0 | 手工方案发布的那个 logfs 分区一个属性也没有 |
+| 6,7,8,9,18 | 1 | 目标分区 Location 是 `"39"`、有 provider；整盘有 provider、`isWhole`；分区 base 非 0 |
+| 10 | 0 | 目标分区没有被误判成整盘 |
+| 11 | 1 | 私有探针名被 devfs 接受：devfs 就绪且可写 |
+| 12,14 | 0 | `disk0` 与 `disk0s39` 已经被占用 |
+| 13,15 | 1 | `disk1` 与 `disk1s39` 空闲 |
+| 16 | 1 | 手工整盘客户端启动之前，整盘就有 BSD 名字 |
+| 17 | 0 | 手工分区客户端之前，我们的分区没有名字 |
+
+所以 devfs 不是问题，手工方案的解析也不是问题（39、provider、base 都对），失败只在于「名字已经被别人占掉」。日志说明了是谁：`IOBlockStorageDriver` 在 `acceptNewMedia` 里用 `kIOServiceAsynchronous` 注册整盘，IOKit 的配置线程随即自动匹配 `IOGUIDPartitionScheme` 与 `IOMediaBSDClient`；`pingConfig` 按 `gMaxConfigThreads` 会起多条配置线程，自动树与本处理器（同样跑在配置线程上）是并发的。自动树先一步把 `disk0`、`disk0s1…s39` 全部命名，本轮再手工建的 39 个分区与客户端只能一个个撞 `EEXIST`，那一列日志就是这么来的。
+
+round116 因此不再建第二棵树：
+
+1. 手工的部分只到整盘为止：设备 → `IOBlockStorageDriver` → 整盘 `IOMedia`，并核对整盘大小等于 `clover_emmc_block_sectors() * 512`。
+2. 不再 attach/probe 分区方案，也不再手工启动任何 `IOMediaBSDClient`。
+3. 在整盘的子树里轮询（`IOSleep(10)`，最多 100 次，共 1 秒），按内核自己写下的 `BSD Name` 找 `disk0s39`，同时统计带名字的分区数。
+4. 找到后只做验证：`IOBSDNameMatching` + `waitForService`（`setconf()` 对 `rd=` 用的就是这两步），`bdevvp(major << 24 | minor)`，再比较「整盘在分区 base 处读一块」与「分区在 0 处读一块」，两者必须逐字节相等。
+5. 成功打印一行：
+
+```text
+CloverBlock r116: auto p=39 disk0s39 1:39 bd=1 map=1
+```
+
+`rd=` 本轮仍是 `md0`。这一轮不问根挂载，只问自动树能不能独立长到 `disk0s39`，以及从它出发的 `bdevvp` 与偏移映射成不成立。
+
+失败行：
+
+| 失败行 | 含义 |
+| --- | --- |
+| `auto <n>` | 1 秒内没找到 `disk0s39`，或整盘没有名字。高 16 位 `0x10000` 表示整盘已命名；低 16 位是最后一轮看到的有名字分区数。只有 `0x10000` = 整盘命了名但分区树没长出来；`0` = 自动树完全没动 |
+| `bsd-type` | 找到了 `disk0s39`，但三个属性不是 `OSString`/`OSNumber` |
+| `root-match <ptr>` | 名字匹配等到的不是这个媒体（`0` = 超时没人应答） |
+| `bdevvp <err>` | `bdevvp` 失败，`err` 是它返回的错误码 |
+| `buffer` / `open-whole` / `read-whole` / `open-part` / `read-part` / `map` | 读块或偏移比较失败；`map` 是两处内容不一致 |
+| `ready` / `storage` / `modload` / `postload` / `device` / `attach` / `driver` / `media` | 与上一轮相同的前置步骤 |
+
+轮询必须让出 CPU（`IOSleep`），否则自动树没有机会被别的配置线程推进；`waitMatchIdle()` 不能在这里调用，它等的是 `gNumConfigThreads` 归零，而调用者自己就是一条配置线程。
+
+`CloverPMGR` 本轮只把行首标签改成 `r116`，参数行内容不变，便于和上一张照片逐字对照。
+
+产物（内核与 payload 变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round116-payload.img` | 58720256 B | `a24b1c511822b0a8a95852a58170a03648934370e38c45b7c780123aa1d08250` |
+| `round116-kernel.macho`（构建产物） | 51974144 B | `2a9e065bd341265e986b80896255e8338e6a15d0f930829e8c3a19bec7ca5467` |
+| `round116-in-volume-kernel.macho`（卷内副本） | 51974144 B | `54d5f05526a7c0586a084c7021c71b6400579458808334a1d9669e3c4a90cca7` |
+| `round116-kernel.macho.adt` | 13476 B | `d1ccad298d3101f6c2dfeb3b876a729b91f40b20917dee158b3f76a9832948c8` |
+| `round116-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round116-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round116-unixnu.toml` | 558 B | `1b0367775cecd587d0ab8a6f22527a1e5c7585736aa17c0dfd225458f8e8e148` |
+
+校验器：`check-clover.py` 通过（ADT 13476 字节、8 核、splash `0x9d400000-0x9f800000`、FD `0x9fc00000-0x9ff00000`、`clover_defconfig`、`CLOVERESP`、模块可见）；`verify-clover-payload.py` 通过（probe 补丁只落在本地化、PMGR 绑定仍在、CloverSdhci 已链接）。`CloverBlock` 的导入与 vtable 审计通过（264544 字节、190 个槽、26 个覆写，导入全部有来源；本轮去掉了 `_devfs_make_node` / `_devfs_remove`）。卷内 boot-args 末尾仍是 `… clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`；卷内内核只有 r116 字符串（`CloverPMGR r116: args [%s]`、`CloverBlock r116: %s %llu`、`CloverBlock r116: auto p=%u %s %u:%u bd=1 map=1`），没有 r115 残留。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_run` `0xfffffff00797231c`、`_clover_block_run` `0xfffffff007992054`、`_clover_block_request` `0xfffffff007992884`。boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round116-payload.img
+fastboot reboot
+```
+
+**一次刷机只回答一个问题：不手工建第二棵树时，自动树会不会在 1 秒内交出 `disk0s39`，并让 `IOBSDNameMatching` → `bdevvp` → 偏移比较一路走通。** 成功之后，下一轮才把 `rd=` 换成 `disk0s39`，去碰真正的根挂载。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
