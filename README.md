@@ -6931,6 +6931,53 @@ fastboot reboot                                                # 冷刷
 
 **一次刷机只回答一个问题：从 EL0 发一颗 `reboot(2)`，panic 屏收不收得到它。** 收到，就证明 round85 之后所有「孩子没走到」的推断都得推翻，`msg=` 那次 write 重新变成活题；收不到而看门狗照旧，就把 `elr` 交出来，按它重解孩子究竟卡在哪。
 
+## round122 读数（v0.2.94 实机）：panic 屏收到了 EL0 的 reboot(2)
+
+第一行就是本轮要的 pass line：
+
+```
+[9.941193]: OSMC subsystem is initialized
+[9.942761]: debug_log_init: Error!! gPanicBase is still not initialized
+userspace panic: clover-el0: before write
+pages=0x000000000003af7c
+free=0x00000000000394ad
+ticks=0x0000000000000229
+ipi=0x0000000000000000 sent=0x0000000000000000
+irq=0x00000000000003ff phase=0x0000000000000000 intid=0x0000000000000013 typer=0x000000000007b04f3
+pmgr=0x0000000000000005 status=0x0000000000000000 mode=0x0000000000000002
+nub=0xfffffff1c8bdf800 attached=0x0000000000000001 registered=0x0000000000000002
+aon=0x00000000fffffffc=>0x00000000ffffffff
+RA=0xfffffff0079f539c
+FP=0xfffffff70bf53cb0
+LR=0xfffffff0079f539c
+fmt=0xfffffff0070c444f
+args=0xfffffff70bf53cc0
+…a1=0xfffffff0079f539c   …a2=0xfffffff56256b000   …a3=0xfffffff0073e0b60
+```
+
+**通道是活的。** 两值读数落在第一支：EL0 的 `svc #0x80`（x16=55、x0=`RB_PANIC|RB_QUICK`、x1 指向自己 `__DATA` 里那句 `"clover-el0: before write"`）确实把内核 panic 了，而且 panic 屏把那句话原样画了出来。round85 买来没验的前提，到此结掉。
+
+而且这一帧把整条链在中核那一侧也钉死了 —— panic 屏自己交出的寄存器逐个能解：
+
+| 屏上的数 | 解出来 | 依据 |
+| --- | --- | --- |
+| `RA` = `LR` = `0xfffffff0079f539c` | `_panic_kernel + 0xf0` | `nm` 给 `_panic_kernel` = `0xfffffff0079f52ac`（下一个符号 `_reboot_kernel.cold.1` 在 `0xfffffff0079f53f0`，所以确实落在它体内）。`panic_kernel()` 在 kern_shutdown.c:153-168，`+0xf0` 就是 :167 那句 `panic_with_options(...)` 的返回地址 |
+| `fmt` = `0xfffffff0070c444f` | 字符串 `userspace panic: %s` | `__TEXT` 的 `vmaddr` 是 `0xfffffff007004000`、`fileoff` 0 ⇒ 文件偏移 `0xc044f`，那里逐字节是 `\0userspace panic: %s\0Killing all processes ` |
+| `FP` = `0xfffffff70bf53cb0`、`args` = `0xfffffff70bf53cc0` | 同一帧内核栈，`args = FP + 0x10` | `0xfffffff70b…` 是线程内核栈区，正是 `panic_with_options` 的 va_list 落点 |
+| `a1` = `0xfffffff0079f539c`、`a3` = `0xfffffff0073e0b60` | panic 上下文的后续参数槽 | 与 `RA` 同值即返回地址被原样带进 panic record，属常态 |
+
+顺带把源码那三处「为什么非 root 的 EL0 也能 panic」变成实测：`reboot()` 在 `suser()` 失败后有一段 `#if (DEVELOPMENT \|\| DEBUG)` 专门把 `error` 清零（kern_xxx.c:114-125），MACF 的 `mac_system_check_reboot` 在同一条件里被 `goto skip_cred_check` 跳过（:140-150），而 `kern_reboot()` 见 `(howto & (RB_PANIC\|RB_QUICK)) == (RB_PANIC\|RB_QUICK)` 直接调 `panic_kernel(howto, message)`（kern_shutdown.c:182-183）。我们传的 `0xc00` 正是这一对，且不含 `RB_PANIC_ZPRINT`(0x1000)/`RB_PANIC_FORCERESET`(0x2000)，所以 `opts` 保持 `DEBUGGER_OPTION_NONE` —— 屏上没有 zprint 段，与此一致。
+
+**看门狗这次没参与。** `ticks=0x229` = 553，而 deadline 是 60000 —— panic 比看门狗早约 108 倍，所以 panic 屏没有「被看门狗抢先占位」的可能，round121 那帧「屏上只有看门狗」不能拿 deadline 当解释。
+
+这一帧还第一次让 tick 数跟一个独立时钟同框：紧挨 panic 行上面的两条 IOKit 日志带绝对时间戳 `9.941193` / `9.942761` 秒。553 tick 对 9.94 秒 ⇒ **候选 tick 周期 ≈ 18 ms（约 55.6 Hz）**，那么 60000 tick ≈ 18 分钟 —— 与 round121 那两帧之间「等了很久才拍到第二帧」的经过时间相符。但这条只能当候选：round82 在 exec 内部 AMFI 检查处读到的是 `ticks=0x14e5`=5349，那是 initproc 进 EL0 的**前一步**，按 55.6 Hz 就是 96 秒，比本轮的 10 秒晚 —— 要么那轮启动真的慢一个数量级，要么这个计数器的速率不恒定。`cnt0 == freq`、`cnt1 == 0` 的缺陷仍然挡着直接测量，所以 tick 数继续只当启动进度坐标用。
+
+其余读数与既往 panic 屏同类：`pages=0x3af7c` 三轮未变（总页数当然不变）；`free=0x394ad`，介于 round121 第一帧的 `0x3a121` 与第二帧的 `0x39530` 之间；`irq=0x3ff`（1023 = 没有中断在处理中）、`phase=0`、`intid=0x13`、`typer=0x7b04f3`、`pmgr=0x5 status=0x0 mode=0x2`、`nub=0xfffffff1c8bdf800 attached=0x1 registered=0x2`、`aon=0xfffffffc=>0xffffffff`，都是常态噪声。屏底部寄存器 dump 与 boot-args 回显那几行**互相压字**（画到屏子末尾了），只能勉强认出 `…zones=120 boot-progress=2 rd=md0s39 allow_legacy_mach_msg=1 armcpu-timer-intid=19 clover-pmgr=…`，本轮不需要它们。屏顶已滚掉，所以这张照片没有重读 `reply=` 那行 —— 但 panic 串本身就是孩子走到 `0x100000604` 的证据。
+
+**于是 round121 那处矛盾换了嫌疑人。** `reboot(2)` 从 EL0 到 panic 屏只要约 10 秒，那么 round85 放在 `msg=` write 之后的那颗 `reboot(2)` 若被执行，屏上必然先有 `userspace panic: clover-el0: write returned`；它没出现 ⇒ 孩子没执行那条 `svc`。而看门狗那一帧的单点样本说孩子正停在 `_puts + 4`。两者之间现在只剩一个能活：**要么那次 write 根本没返回（样本不可信），要么 `elr` 不是「孩子此刻在哪」的忠实读数**。round121 那节里我按后者推，本轮的结果把它压回到前者一侧，但一次刷机只能结一题，所以这一题留给下一轮用通道本身来量。
+
+**下一题（round123，仍然只改 EL0 镜像）：** 既然 panic 屏已经是一条能印字的通道，就别再拿它只当哨兵 —— 在孩子尾段每一次 write **之后**各放一颗 `reboot(2)`，各带一句不同的串（`w1`／`w2`／`w3`…）。panic 屏只保留第一个 panic，所以画出来的那句就指名「最后一次返回的 write」是哪一次，一次刷机多值。这样 `msg=` 那次 write 到底回没回来，就不再需要靠看门狗的单点样本去猜。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
