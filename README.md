@@ -3704,6 +3704,115 @@ fastboot reboot
 **这轮之后仍然没有块设备。** 若识别通过，还差 CMD9/CMD7/CMD16/CMD17 与 Data 通路
 （`SDHCI_BUFFER` 32-bit 或 ADMA64 表）和 `IOBlockStorageDevice`。
 
+### round92 读数（v0.2.64 已发布）：主机活了，卡答了，CMD2 倒在 CRC
+
+照片上的报告（面板宽度会折行，数值以这里为准）：
+
+```text
+CloverSdhci: gcc0 cmd=00000000 cfg=0000050f br=00004221 ahb=20008001
+gcc1 cfg=00002017 m=01 n=fc d=fb up=1 br=00004221
+sdh0 clk=0007 rst=1 clr=0002 vs3 02626440
+sdh1 clk=0005 pw=0b hc=00 h2=0000 vs 00000a0e ps 01f800f0
+cmd0 ok int=00010000
+cmd1 ok t=3 to=0 rsp=c0ff8080
+cmd2 crc rsp=00000000
+cmd3 skip
+```
+
+这一轮把「主机能不能动」和「卡还认不认我们」一起答完了：
+
+- **停卡时钟是那把钥匙。** `clk=0007`（`INT_EN|INT_STABLE|CARD_EN`）写 0 之后读回
+  `clr=0002`：`INT_EN` 与 `CARD_EN` 都清了，只剩 `INT_STABLE` 常 1。随后
+  `RESET_CMD|RESET_DATA` 一次就自清（`rst=1`）——round91 卡住的从来不是那个小复位，
+  而是仍在跑的 HS200 卡时钟。
+- **GCC 半边没被这轮改动碰坏。** `cfg=00002017`、`m=01 n=fc d=fb`、`up=1`、门控开着，
+  与 round91 逐位相同。
+- **主机真的上电、真的有时钟。** `sdh1 clk=0005` 是 `INT_EN|CARD_EN`（`INT_STABLE`
+  在上电切换后被清掉，正是 EDK2 那套顺序的结果），`pw=0b`（1.8 V + 开），
+  `hc=00`（1-bit、legacy），`h2=0000`，vendor mux 回到 MCLK 默认
+  （`vs=00000a0e`：`SELECT_IN_EN` 与 bits 21:19 都清了）。
+- **卡在 400 kHz 上认出了自己。** `cmd0 ok` 说明命令还在往外移；`cmd1 ok t=3 to=0
+  rsp=c0ff8080` 是卡自己的 OCR，bit31 在第三次轮询时置起——前两次是「上电中」，
+  不是超时。**48 位响应的采样通路是对的**（CRC 也过了）。
+- **CMD2 是第一颗要求主机校验响应的命令，它倒了。** `cmd2 crc` 且 `rsp=00000000`：
+  136 位响应一个字节都没被接受，`commandVerdict` 把 `CRC|END_BIT|INDEX` 合成一个
+  `crc`，所以这张照片还分不出是哪一位说的。CMD3 因此在设计里被跳过。
+
+一个必须记住的卡侧事实：**CMD2 只在 ready 态合法，而卡一旦收到 CMD2 就进入
+identification，无论主机是否接受那个响应**。所以「再发一次 CMD2」不能直接发，
+必须先 CMD0 + CMD1 轮询把卡放回 ready。
+
+### v0.2.65（round93）：CMD2 发两次，一次带 CRC、一次不带
+
+mode 7 保留 mode 6 的整套 bring-up（停时钟 → 小复位 → GCC → legacy 上电 → CMD0 →
+CMD1），只改 CMD2 这一段。两个答案指向不同的硬件，所以这一轮把两种都问：
+
+1. **A = mode 6 的命令逐字节不变**（`LONG|CRC`），但报告打印原始 `INT_STATUS` 与
+   **四个响应字**，不再只给一个合成的判定。
+2. A 成功 → 直接发 CMD3。
+3. A 失败 → 先 `RESET_CMD` 清命令电路，再 **CMD0 + 完整的 CMD1 轮询**把卡重新武装
+   回 ready（这一段有自己的报告行）。
+4. **B = 同一条 CMD2，但关掉 CRC 门**（只有 `LONG`）。CID 完整到达 ⇒ 坏的是主机的
+   CRC 校验；B 也失败 ⇒ 坏的是 136 位响应的采样/锁存通路。B 之后立刻读一次
+   `PRESENT_STATE`，让「响应到了但报错」与「线仍是静的」多一条旁证。
+5. 只要有一次 CMD2 到达了卡，就发 **CMD3**（`CRC|INDEX`）：一条干净的 R1 把
+   「响应通路是坏的」和「只有 136 位 CRC 不同意」分开。
+
+报告是下面这个形状（A 成功时没有 `reinit`/`cmd2b`/`cidB` 三行）：
+
+```text
+gcc0 cmd=00000000 cfg=0000050f br=00004221 ahb=20008001
+gcc1 cfg=00002017 m=01 n=fc d=fb up=1 br=00004221
+sdh0 clk=0007 rst=1 clr=0002 vs3 02626440
+sdh1 clk=0005 pw=0b hc=00 h2=0000 vs 00000a0e ps 01f800f0
+cmd0 ok int=00010000
+cmd1 ok t=3 to=0 rsp=c0ff8080
+cmd2 a=crc int=00008004
+cidA 00000000 00000000 00000000 00000000
+reinit r=1 c0=ok c1=1 t=3 to=0
+cmd2b ok int=00010000 ps 01f800f0
+cidB 15010044 334d4331 0042e3b3 1ecaf6ff
+cmd3 ok rca=1 st=2 int=00010000
+```
+
+（格式示意，不是读数。）`cidA`/`cidB` 是 MSB 字在前，与 `RESPONSE[0x1c]→[0x10]`
+的存放顺序一致；CID 的第一个字节是 Manufacturer ID（`15` Samsung、`45` SanDisk、
+`90` SK Hynix、`11` Toshiba/Kioxia、`13` Micron）。
+
+产物（内核又变了，root / trust cache 仍未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round93-payload.img` | 58720256 B | `822b7dca29d2ced8b2e7bcc46a3350a30d52747ae932faa32ca69de96d858cb7` |
+| `round93-kernel.macho`（构建产物） | 51900416 B | `5fcfad1aa73d78a79ce05601d22e5958c22006c04dbff4eb51af57c49092b17c` |
+| `round93-in-volume-kernel.macho`（卷内副本） | 51900416 B | `47558b35816509dd9b49f35c5a7a88869d82b0598a4c95cb1795155502c0d8dd` |
+| `round93-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round93-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round93-kernel.macho.adt` | 13476 B | `88159e46a0289421dcb502047bb96f71522e10e151abb0af6042a8286f4faaa5` |
+| `round93-unixnu.toml` | 563 B | `fad0de6ebb97116a0c054e1b634b20a3b7e218adbe77e783139263b8dadf5ea8` |
+
+校验器：探针 35 处 5959 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在。卷内
+boot-args 末尾是 `… clover-pmgr=2 clover-emmc=7 armcpu-clock-panic=60000`。boot 仍是
+`round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round93-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `cmd2 a=ok` + 合理的 `cidA` + `cmd3 ok` | round92 的 CRC 是一次性的；识别可以继续 | CMD9 读 CSD → CMD7 选中 → CMD16 设块长 → CMD17 读 LBA 1，前五字节应是 `EFI PART` |
+| `cmd2 a=crc`、`reinit c1=1`、`cmd2b ok` + 合理 `cidB` + `cmd3 ok` | **只有 R2 的 CRC 门不同意**，CID 本身是好的 | 后续只读命令关掉 CRC 校验并逐字记录响应；R2 的 CRC 差异单独查（采样边沿/延迟） |
+| `cmd2b end` 或 `cmd2b crc` | 关掉 CRC 门后仍报错 ⇒ 响应通路本身有问题 | 查 136 位锁存与 DLL：下一轮改采样点/关 DLL、或把 4 个响应字在两次读里各取一遍 |
+| `cmd2b to` | 卡在 400 kHz 上根本不答 CMD2，可它给的 OCR 是真的 | 下一步查 CMD1 的 `ARGUMENT`（sector-mode/access-mode 位）与卡侧状态，不再查响应通路 |
+| `reinit c1=0` | 连重武装都没成功，`int=`/`rsp=` 在那一行上说出是 CMD0 还是 CMD1 停的 | 按那一行的位先修 CMD0/CMD1 |
+| `cmd3 crc`/`idx` 而两次 CMD2 都 `ok` | 136 位响应能用、48 位 R1 反而不能用 | 矛盾点集中在响应长度切换（R2→R1）上，下一轮在 CMD2 之后先复位命令电路再发 CMD3 |
+| 只有 `CloverSdhci: failed at stage 4` | GCC 窗口映射失败 | 窗口地址/大小 |
+| **什么 panic 屏都没有** | 某次寄存器写把互联挂住（`ticks` 不涨） | 把 A/B 拆成两轮单写 |
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -3715,6 +3824,7 @@ fastboot reboot
   逐个问同一颗命令，`v0.2.62` 起改成从 CMD0 重头识别（CMD0/CMD1/CMD2/CMD3，降低时钟），
   `v0.2.63` 起把卡时钟改到 GCC 的 `sdcc1_apps_clk_src`（400 kHz）再重做整套识别，
   `v0.2.64` 起先停卡时钟、只复位命令/数据状态机（`RESET_ALL` 会把主机卡住），
+  `v0.2.65` 起把 CMD2 发两遍（一遍带 CRC、一遍关掉 CRC，中间 CMD0+CMD1 重武装），
   仍然不碰 Data、不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用

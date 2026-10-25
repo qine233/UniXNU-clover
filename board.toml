@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: stop the clock first, then identify"
+title = "clover emmc: ask CMD2 twice, with and without CRC"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1064,7 +1064,7 @@ kernel_args = [
   # HS200 card clock was still running -- so the legacy init and all four commands were skipped
   # (cmd0..cmd3 skip), and clk=0003 pw=00 are just the state that write left behind.
   #
-  # Mode 6 (this round) changes only the host entry. It writes CLOCK_CONTROL = 0 and waits for
+  # Mode 6 (round92) changed only the host entry. It writes CLOCK_CONTROL = 0 and waits for
   # INT_EN and CARD_EN to clear ("clr=" is the read-back), then resets CMD+DATA (0x06, the pair
   # round90 already saw self-clear) instead of RESET_ALL. GCC programming and the legacy order
   # (timeout 0x0e, 1-bit, vendor mux back to MCLK 2 with SELECT_IN cleared, 1.8 V power toggle,
@@ -1076,7 +1076,35 @@ kernel_args = [
   # powered and clocked; clk=0003 is a controller still refusing CARD_EN. Then "cmd1 ok" with
   # CMD2/CMD3 is identification at 400 kHz; "cmd1 to ... to=200" moves the question to
   # power/reset/CMD-line wiring.
-  "clover-emmc=6",
+  #
+  # The round92 photograph settled all of that: clk=0007 -> clr=0002 -> rst=1, GCC still
+  # cfg=00002017 m=01 n=fc d=fb up=1, sdh1 clk=0005 pw=0b hc=00 h2=0000, "cmd0 ok", and
+  # "cmd1 ok t=3 to=0 rsp=c0ff8080" -- the card's own OCR, bit 31 raised on the third poll. The
+  # HS200 card clock was exactly what had been holding RESET_ALL, the legacy bring-up works, and
+  # 400 kHz is an identification clock the card answers. CMD2, the first command whose response
+  # the host checks, came back "crc" with RESPONSE[0] = 0, and CMD3 was skipped.
+  #
+  # Mode 7 (this round) sends CMD2 twice, because the two answers point at different hardware.
+  # A is mode 6's command byte for byte (LONG|CRC), and its raw INT_STATUS and all four response
+  # words are printed instead of a lumped verdict. B is the same command with the CRC gate off
+  # (LONG only): a CID that arrives intact puts the fault in the host's CRC check, a B that also
+  # fails puts it in the response path, where the next round is about sampling and the DLL. CMD2
+  # is legal only in ready, and A moves the card to identification even when the host rejects the
+  # answer, so B is preceded by CMD0 and the CMD1 poll loop again; that re-arm has its own report
+  # line. CMD3 goes out whenever a CMD2 reached the card -- a clean R1 separates "the response
+  # path is corrupt" from "only the 136-bit CRC check disagrees".
+  #
+  # Readings: "cmd2 a=ok" + a plausible cidA (the first word 15xx or 45xx) + "cmd3 ok" means the
+  # crc in round92 was a one-off and identification can continue with CMD9/CMD7/CMD16/CMD17.
+  # "cmd2 a=crc" + "reinit ... c1=1" + "cmd2b ok" + cidB + "cmd3 ok" means only the R2 CRC gate
+  # disagrees: the next round turns that check off for the read-only identification commands and
+  # records every response word. "cmd2b end" or "cmd2b crc" moves the question into the response
+  # sampling path itself (R2 is 136 bits, i.e. 17 bytes, and this host reads it as four latched
+  # words). "cmd2b to" says the card does not answer CMD2 at all even at 400 kHz: then the OCR it
+  # gave was real but its identification entry is not, and the next step is the CMD1 argument
+  # (sector-mode and access-mode bits) rather than the response path. "reinit ... c1=0" means the
+  # re-arm itself failed and the two numbers on that line say whether it was CMD0 or the CMD1 poll.
+  "clover-emmc=7",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

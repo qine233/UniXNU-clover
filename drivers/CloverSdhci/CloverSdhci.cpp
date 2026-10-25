@@ -84,6 +84,22 @@
 // bring-up unchanged. `rst=` and `clr=` in the report are the two readings that separate
 // "the reset bit is the problem" from "the clock will not stop".
 //
+// Mode 6's photograph is the first one with a live card: `clk=0007` before, `clr=0002` after the
+// stop (INT_EN and CARD_EN both clear, so the HS200 card clock really was what held RESET_ALL),
+// `rst=1`, GCC still at 400 kHz, `cmd0 ok`, and `cmd1 ok t=3 to=0 rsp=c0ff8080` -- the card's own
+// OCR, bit 31 raised on the third poll. CMD2, the first command whose response the host checks,
+// came back as `crc` with RESPONSE[0] = 0, and CMD3 was skipped.
+//
+// Mode 7 asks CMD2 twice, because the two answers point at different hardware. A is mode 6's
+// command byte for byte, and its raw INT_STATUS and all four response words are printed instead
+// of a lumped verdict. B is the same command with the CRC check off: if the CID arrives intact,
+// the host's CRC gate is what failed and identification can go on; if B also fails, the response
+// path itself is broken and the next round is about sampling, not about CMD2. CMD2 is legal only
+// in the ready state, and A moves the card to identification even when the host rejects the
+// answer, so B is preceded by CMD0 and the CMD1 poll loop again. CMD3 is sent whenever either
+// attempt reached the card: an R1 that passes index+CRC checks separates "the response path is
+// corrupt" from "only the 136-bit CRC check disagrees".
+//
 // Every path that is not the success path panics, because on this board silence is not a reading.
 // Round87's photograph also settled what the watchdog is worth here: ticks=0 at this scheduling
 // point. sheng_pmgr_run() runs right after bsd_bufferinit, about ten seconds of boot before
@@ -391,6 +407,9 @@ static const uint32_t kProbeRca = 1;
 // timeout would be reported as our loop giving up. Interrupts are masked this early, so this loop
 // is the only clock there is: a bound, not a duration.
 static const uint32_t kCommandSpinLimit = 1u << 22;
+// The pause between two CMD1 polls while a card powers up. It is a spin, so it is a lower bound
+// and not 10 ms; EDK2's equivalent is a real timer stall.
+static const uint32_t kCmd1Gap = 1u << 18;
 
 static void cmd13Probe (void)
 {
@@ -732,6 +751,148 @@ static const char *commandVerdict (uint32_t status, bool sent)
   return "ok";
 }
 
+// Same question as commandVerdict, but names which of the three response checks spoke. Mode 7
+// prints the raw INT_STATUS next to it, so this only saves the reader from decoding bits.
+static const char *probeVerdict (uint32_t status, bool sent)
+{
+  if (!sent) {
+    return "busy";
+  }
+  if (status & SDHCI_INT_TIMEOUT) {
+    return "to";
+  }
+  if (status & SDHCI_INT_END_BIT) {
+    return "end";
+  }
+  if (status & SDHCI_INT_CRC) {
+    return "crc";
+  }
+  if (status & SDHCI_INT_INDEX) {
+    return "idx";
+  }
+  if (!(status & SDHCI_INT_RESPONSE)) {
+    return "noev";
+  }
+  return "ok";
+}
+
+// Linux resets the command circuit before issuing the next command after a command error
+// (sdhci_reset_for_error -> SDHCI_RESET_CMD). Round90 saw this mask self-clear; the bound stays
+// because "it did last time" is not a promise on this board.
+static bool resetCommandCircuit (void)
+{
+  write8 (SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD);
+  uint32_t guard = 0;
+  while (guard++ < kCommandSpinLimit) {
+    if (!(read8 (SDHCI_SOFTWARE_RESET) & SDHCI_RESET_CMD)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// A 136-bit response lives in all four words; the two-word reader above cannot see a CID.
+static uint32_t runCommand4 (uint16_t command, uint32_t argument, bool &sent,
+                             uint32_t *response, uint32_t &spins)
+{
+  sent = waitCommandSlot ();
+  if (!sent) {
+    for (unsigned i = 0; i < 4; i++) {
+      response[i] = 0;
+    }
+    spins = 0;
+    return 0;
+  }
+  write32 (SDHCI_INT_STATUS, 0xffffffffu);
+  write32 (SDHCI_ARGUMENT, argument);
+  write16 (SDHCI_COMMAND, command);
+  uint32_t status = 0;
+  spins = 0;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & SDHCI_INT_CMD_MASK) {
+      break;
+    }
+    if (++spins >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  for (unsigned i = 0; i < 4; i++) {
+    response[i] = read32 (SDHCI_RESPONSE + 4 * i);
+  }
+  return status;
+}
+
+// CMD0 plus the CMD1 poll loop: the pair that puts any card back in the ready state. Mode 7 needs
+// it between its two CMD2 attempts, and its readings are printed so a silent card is separable
+// from a card that simply was not re-armed.
+struct CardRearm {
+  bool sent0;
+  bool sent1;
+  bool ready;
+  uint32_t status0;
+  uint32_t status1;
+  uint32_t rsp1;
+  uint32_t tries;
+  uint32_t timeouts;
+};
+
+static CardRearm rearmCard (void)
+{
+  CardRearm r;
+  r.sent0 = false;
+  r.sent1 = false;
+  r.ready = false;
+  r.status0 = 0;
+  r.status1 = 0;
+  r.rsp1 = 0;
+  r.tries = 0;
+  r.timeouts = 0;
+
+  uint32_t rsp0 = 0, rsp1 = 0, spins = 0;
+  r.status0 = runCommand (SDHCI_MAKE_CMD (0, SDHCI_CMD_RESP_NONE), 0,
+                          r.sent0, rsp0, rsp1, spins);
+  if (!r.sent0) {
+    return r;
+  }
+  for (r.tries = 1; r.tries <= kCmd1Retries; r.tries++) {
+    r.status1 = runCommand (SDHCI_MAKE_CMD (1, SDHCI_CMD_RESP_SHORT), kEmmcOcr,
+                            r.sent1, rsp0, rsp1, spins);
+    r.rsp1 = rsp0;
+    if (!r.sent1) {
+      break;
+    }
+    if (r.status1 & SDHCI_INT_TIMEOUT) {
+      r.timeouts++;
+      continue;
+    }
+    if (r.status1 & (SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX)) {
+      break;
+    }
+    if (!(r.status1 & SDHCI_INT_RESPONSE)) {
+      break;
+    }
+    if (rsp0 & 0x80000000u) {
+      r.ready = true;
+      break;
+    }
+    for (volatile uint32_t spin = 0; spin < kCmd1Gap; spin = spin + 1) {
+    }
+  }
+  return r;
+}
+
+// MSB word first, the order the 136-bit response sits in 0x1c..0x10.
+static void emitCid (const uint32_t *response)
+{
+  for (unsigned i = 0; i < 4; i++) {
+    if (i) {
+      emitByte (' ');
+    }
+    emitHex (response[3 - i], 8);
+  }
+}
+
 // ------------------------------------------------------------------- mode 5: a real card clock
 //
 // Round90 wrote the SDHCI 10-bit divider and CMD1 still timed out. sdhci-msm.c:1766 says why:
@@ -763,7 +924,6 @@ static const uint32_t kGccCfg400k = 0x00002017u;
 static const uint32_t kGccCfgMask = 0x0010371fu;
 static const uint32_t kGccM = 0x01u, kGccN = 0xfcu, kGccD = 0xfbu;
 static const uint32_t kRcgUpdateLimit = 1u << 16;
-static const uint32_t kCmd1Gap = 1u << 18;
 // Vendor clock mux (sdhci-msm.c:78-85): 10:8 select the MCLK, bit18 enables the HS400-only
 // selector, 21:19 name it. Default is 2, the free-running MCLK.
 static const unsigned kSdhciVendorSpec = 0x20c;
@@ -806,7 +966,7 @@ static bool gateOn (unsigned offset)
   return false;
 }
 
-static void coldBringUp (bool fullReset)
+static void coldBringUp (bool fullReset, bool probeCid)
 {
   clover_emmc_stage = 4;
   uint32_t gateBefore = readGcc32 (kGccAppsGate);
@@ -969,18 +1129,77 @@ static void coldBringUp (bool fullReset)
     }
   }
 
+  // Mode 7's two CMD2 attempts. Filled only on that path; on every other mode these stay zero
+  // and the report never reads them.
+  bool sentA = false, sentB = false, sentC = false;
+  uint32_t statusA = 0, statusB = 0, statusC = 0;
+  uint32_t rspA[4] = { 0, 0, 0, 0 }, rspB[4] = { 0, 0, 0, 0 }, rspC[4] = { 0, 0, 0, 0 };
+  uint32_t spinsA = 0, spinsB = 0, spinsC = 0;
+  uint32_t presentAfterB = 0;
+  bool resetA = false;
+  CardRearm rearm = {};
+  const char *verdictA = "skip", *verdictB = "skip", *verdictC = "skip";
+
   bool cmd2Ok = false;
-  if (ready) {
-    status2 = runCommand (SDHCI_MAKE_CMD (2, SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC), 0,
-                          sent2, rsp20, rsp21, spins);
-    cmd2Ok = sent2 && (status2 & SDHCI_INT_RESPONSE) &&
-             !(status2 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
-                          SDHCI_INT_INDEX));
-  }
-  if (cmd2Ok) {
-    status3 = runCommand (SDHCI_MAKE_CMD (3, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
-                                             SDHCI_CMD_INDEX),
-                          kProbeRca << 16, sent3, rsp30, rsp31, spins);
+  if (!probeCid) {
+    if (ready) {
+      status2 = runCommand (SDHCI_MAKE_CMD (2, SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC), 0,
+                            sent2, rsp20, rsp21, spins);
+      cmd2Ok = sent2 && (status2 & SDHCI_INT_RESPONSE) &&
+               !(status2 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                            SDHCI_INT_INDEX));
+    }
+    if (cmd2Ok) {
+      status3 = runCommand (SDHCI_MAKE_CMD (3, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                               SDHCI_CMD_INDEX),
+                            kProbeRca << 16, sent3, rsp30, rsp31, spins);
+    }
+  } else if (hostReady && ready) {
+    // A: mode 6's command, unchanged, so its verdict is comparable with that photograph.
+    statusA = runCommand4 (SDHCI_MAKE_CMD (2, SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC), 0,
+                           sentA, rspA, spinsA);
+    verdictA = probeVerdict (statusA, sentA);
+    bool aOk = sentA && (statusA & SDHCI_INT_RESPONSE) &&
+               !(statusA & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                            SDHCI_INT_INDEX));
+    if (aOk) {
+      statusC = runCommand4 (SDHCI_MAKE_CMD (3, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                             SDHCI_CMD_INDEX), kProbeRca << 16,
+                             sentC, rspC, spinsC);
+    } else {
+      // B: the same CMD2 with the CRC check off. CMD2 is legal only in ready, and A moved the
+      // card to identification even though the host rejected the answer, so the card is put
+      // back through CMD0 and the CMD1 poll loop first.
+      resetA = resetCommandCircuit ();
+      bool rearmed = false;
+      if (resetA) {
+        rearm = rearmCard ();
+        rearmed = rearm.sent0 && rearm.ready;
+      }
+      if (rearmed) {
+        statusB = runCommand4 (SDHCI_MAKE_CMD (2, SDHCI_CMD_RESP_LONG), 0,
+                               sentB, rspB, spinsB);
+        presentAfterB = read32 (SDHCI_PRESENT_STATE);
+        verdictB = probeVerdict (statusB, sentB);
+      }
+      // CMD3 is legal in identification state, which is where the card is whether or not the
+      // host accepted the CID. Sending it after a rejected answer turns "the responses are
+      // corrupt" and "only the 136-bit CRC check disagrees" into different photographs.
+      if (sentB) {
+        bool bOk = sentB && (statusB & SDHCI_INT_RESPONSE) &&
+                   !(statusB & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                                SDHCI_INT_INDEX));
+        bool canSend = bOk ? true : resetCommandCircuit ();
+        if (canSend) {
+          statusC = runCommand4 (SDHCI_MAKE_CMD (3, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                 SDHCI_CMD_INDEX), kProbeRca << 16,
+                                 sentC, rspC, spinsC);
+        }
+      }
+    }
+    if (sentC) {
+      verdictC = probeVerdict (statusC, sentC);
+    }
   }
 
   clover_emmc_observation[0] = cfgBefore;
@@ -1000,6 +1219,18 @@ static void coldBringUp (bool fullReset)
   clover_emmc_observation[14] = (static_cast<uint64_t> (tries) << 16) | timeouts;
   clover_emmc_observation[15] = (static_cast<uint64_t> (clockBefore) << 32) |
                                 (static_cast<uint64_t> (clockCleared) << 16) | clockAfter;
+  if (probeCid) {
+    clover_emmc_observation[7] = statusA;
+    clover_emmc_observation[8] = rspA[0];
+    clover_emmc_observation[9] = rspA[3];
+    clover_emmc_observation[10] = statusB;
+    clover_emmc_observation[11] = rspB[0];
+    clover_emmc_observation[12] = statusC;
+    clover_emmc_observation[13] = rspC[0];
+    // The re-arm's own readings, which otherwise only exist as a report line.
+    clover_emmc_observation[14] = (static_cast<uint64_t> (presentAfterB) << 32) |
+                                  (static_cast<uint64_t> (rearm.tries) << 16) | rearm.timeouts;
+  }
 
   gReportLength = 0;
   emitText ("gcc0 cmd=");
@@ -1060,22 +1291,79 @@ static void coldBringUp (bool fullReset)
   emitText (" rsp=");
   emitHex (rsp10, 8);
 
-  emitText ("\ncmd2 ");
-  emitText (ready ? commandVerdict (status2, sent2) : "skip");
-  if (ready) {
-    emitText (" rsp=");
-    emitHex (rsp20, 8);
-  }
+  if (!probeCid) {
+    emitText ("\ncmd2 ");
+    emitText (ready ? commandVerdict (status2, sent2) : "skip");
+    if (ready) {
+      emitText (" rsp=");
+      emitHex (rsp20, 8);
+    }
 
-  emitText ("\ncmd3 ");
-  emitText (cmd2Ok ? commandVerdict (status3, sent3) : "skip");
-  if (cmd2Ok) {
-    emitText (" rca=");
-    emitDec ((rsp30 >> 16) & 0xffffu);
-    emitText (" st=");
-    emitDec ((rsp30 >> 9) & 0xfu);
-    emitText (" rsp=");
-    emitHex (rsp30, 8);
+    emitText ("\ncmd3 ");
+    emitText (cmd2Ok ? commandVerdict (status3, sent3) : "skip");
+    if (cmd2Ok) {
+      emitText (" rca=");
+      emitDec ((rsp30 >> 16) & 0xffffu);
+      emitText (" st=");
+      emitDec ((rsp30 >> 9) & 0xfu);
+      emitText (" rsp=");
+      emitHex (rsp30, 8);
+    }
+  } else {
+    // Every value below is a raw register, not a derived one: mode 6's `crc` is one bit of one
+    // word, and this round exists to see the rest of that word set.
+    emitText ("\ncmd2 a=");
+    emitText (verdictA);
+    emitText (" int=");
+    emitHex (statusA, 8);
+    if (sentA) {
+      emitText ("\ncidA ");
+      emitCid (rspA);
+    } else {
+      emitText ("\ncidA none");
+    }
+    // Printed whenever B was attempted, including when the re-arm itself stopped short: in that
+    // case `c1=0` and the two numbers behind it say whether the card or the host gave up.
+    if (resetA) {
+      emitText ("\nreinit r=1 c0=");
+      emitText (commandVerdict (rearm.status0, rearm.sent0));
+      emitText (" c1=");
+      emitDec (rearm.ready ? 1 : 0);
+      emitText (" t=");
+      emitDec (rearm.tries);
+      emitText (" to=");
+      emitDec (rearm.timeouts);
+      if (!rearm.ready) {
+        emitText (" int=");
+        emitHex (rearm.status1, 8);
+        emitText (" rsp=");
+        emitHex (rearm.rsp1, 8);
+      }
+    } else {
+      emitText ("\nreinit r=0");
+    }
+    if (sentB) {
+      emitText ("\ncmd2b ");
+      emitText (verdictB);
+      emitText (" int=");
+      emitHex (statusB, 8);
+      emitText (" ps ");
+      emitHex (presentAfterB, 8);
+      emitText ("\ncidB ");
+      emitCid (rspB);
+    } else if (resetA) {
+      emitText ("\ncmd2b skip");
+    }
+    emitText ("\ncmd3 ");
+    emitText (sentC ? verdictC : "skip");
+    if (sentC) {
+      emitText (" rca=");
+      emitDec ((rspC[0] >> 16) & 0xffffu);
+      emitText (" st=");
+      emitDec ((rspC[0] >> 9) & 0xfu);
+      emitText (" int=");
+      emitHex (statusC, 8);
+    }
   }
   emitByte ('\n');
   clover_emmc_stage = 8;
@@ -1279,7 +1567,7 @@ extern "C" void clover_emmc_run (void)
   clover_emmc_stage = 1;
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
   // the storage instrument it was asked for.
-  if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6) {
+  if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -1300,7 +1588,7 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp (mode == 5);
+    coldBringUp (mode == 5, mode == 7);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.
