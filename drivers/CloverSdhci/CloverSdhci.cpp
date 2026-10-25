@@ -221,6 +221,11 @@ static uint32_t gEntryBlock[128];
 static uint32_t gWriteBlock[128];
 static uint32_t gReadBlock[128];
 
+// Mode 17 stores the report as text, so the first bytes of the block identify it when read on
+// another OS. The newline is part of the stored length: the block reads as a small text file.
+static const char kLogPrefix[] = "unixnu clover emmc log\n";
+static const uint32_t kLogPrefixLength = sizeof (kLogPrefix) - 1;
+
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
 static uintptr_t gHost = 0;
@@ -1024,6 +1029,27 @@ static uint32_t runCommandBusy (uint16_t command, uint32_t argument, bool &sent,
   return runCommandWith (command, argument, sent, response0, response1, spins, true);
 }
 
+// After a write the card programs, and its R1 says READY_FOR_DATA only when that is done. CMD13
+// uses the command line alone, so the DAT busy state must not keep it from being asked; the loop
+// is bounded because a card that never reports ready is itself the reading. `polls` is 0 when the
+// first answer was already ready, which is the expected shape after a clean DATA_END.
+static void waitCardReady (uint32_t &response, uint32_t &status, uint32_t &polls)
+{
+  response = 0;
+  status = 0;
+  for (polls = 0; polls < 100; polls++) {
+    bool sent = false;
+    uint32_t response1 = 0, spins = 0;
+    status = runCommandBusy (SDHCI_MAKE_CMD (13, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                             SDHCI_CMD_INDEX),
+                             kProbeRca << 16, sent, response, response1, spins);
+    if (!sent || (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_INDEX)) ||
+        (response & R1_READY_FOR_DATA)) {
+      break;
+    }
+  }
+}
+
 static const char *commandVerdict (uint32_t status, bool sent)
 {
   if (!sent) {
@@ -1566,6 +1592,22 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   uint32_t equalWords16 = 0, oldSum16 = 0, oldWord16 = 0, newSum16 = 0;
   uint32_t stateRsp16 = 0, stateStatus16 = 0, statePolls16 = 0;
   bool writeOk16 = false, readOk16 = false, writeGated16 = false;
+
+  // Mode 17: the report, once assembled, is the record. A header block at logfs start says where
+  // the text is, how long it is and what it should sum to; the next block holds the text itself.
+  // Both go out through the round102 write path and both are read back for a byte count, so the
+  // photograph says whether the card kept the text, not whether a write was issued.
+  uint32_t logLen17 = 0, logChecksum17 = 0;
+  uint32_t logHeaderWords17 = 0, logTextWords17 = 0;
+  uint32_t logHeaderStatus17 = 0, logTextStatus17 = 0;
+  uint32_t logReadyRspA17 = 0, logReadyStatusA17 = 0, logReadyPollsA17 = 0;
+  uint32_t logReadyRspB17 = 0, logReadyStatusB17 = 0, logReadyPollsB17 = 0;
+  uint32_t logHeaderReadWords17 = 0, logTextReadWords17 = 0;
+  uint32_t logHeaderReadStatus17 = 0, logTextReadStatus17 = 0;
+  uint32_t logHeaderEqual17 = 0, logTextEqual17 = 0;
+  uint32_t logRb0_17 = 0, logRb1_17 = 0, logRb3_17 = 0, logRb4_17 = 0;
+  bool logGated17 = false, logHeaderOk17 = false, logTextOk17 = false;
+  bool logHeaderReadOk17 = false, logTextReadOk17 = false;
 
   bool cmd2Ok = false;
   if (probeMode == 0) {
@@ -2152,7 +2194,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
               }
             }
           }
-          if (probeMode >= 16 && entryFound14 != 0) {
+          if (probeMode == 16 && entryFound14 != 0) {
             // Writing into logfs is the step this whole chain has been for: the block carries
             // its own identity and a checksum, so a stale block, an erased block and a correct
             // write are three different photographs.
@@ -2182,23 +2224,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
               }
               gWriteBlock[3] = checksum;
               writeOk16 = writePioBlock (entryFirst14, gWriteBlock, writeWords16, writeStatus16);
-              // After a write the card programs, and its R1 says READY_FOR_DATA only when that
-              // is done. CMD13 goes out on the command line alone, so the DAT busy state must
-              // not keep it from being asked; the loop is bounded because a card that never
-              // reports ready is itself the reading.
-              for (statePolls16 = 0; statePolls16 < 100; statePolls16++) {
-                bool sentState16 = false;
-                uint32_t stateRsp16b = 0, spinsState16 = 0;
-                stateStatus16 = runCommandBusy (SDHCI_MAKE_CMD (13, SDHCI_CMD_RESP_SHORT |
-                                                                SDHCI_CMD_CRC | SDHCI_CMD_INDEX),
-                                                kProbeRca << 16, sentState16, stateRsp16,
-                                                stateRsp16b, spinsState16);
-                if (!sentState16 ||
-                    (stateStatus16 & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_INDEX)) ||
-                    (stateRsp16 & R1_READY_FOR_DATA)) {
-                  break;
-                }
-              }
+              waitCardReady (stateRsp16, stateStatus16, statePolls16);
               readOk16 = readPioBlock (entryFirst14, gReadBlock, readWords16, readStatus16);
               if (readOk16) {
                 for (uint32_t i = 0; i < kBlockWords; i++) {
@@ -2705,7 +2731,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
               emitHex (entryTypeB14, 8);
             }
           }
-          if (probeMode >= 16 && entryFound14) {
+          if (probeMode == 16 && entryFound14) {
             if (writeGated16) {
               emitText ("\nwr g=1");
             } else {
@@ -2762,6 +2788,113 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
           emitHex (read16 (SDHCI_CLOCK_CONTROL), 4);
           emitText ("\nefi ");
           emitDec (drained11 && hdr11a == 0x20494645u && hdr11b == 0x54524150u ? 1 : 0);
+
+          if (probeMode >= 17) {
+            // The body is complete, so its length and byte sum are the record's. The header block
+            // makes the record findable without this screen; the text block is what the screen
+            // showed. Both are read back, so the line below reports what the card kept.
+            if (entryFound14 == 0) {
+              logGated17 = true;
+            } else {
+              logGated17 = !(entryFirst14 == 12320768u && entryLast14 == 12337151u);
+            }
+            if (!logGated17) {
+              logLen17 = kLogPrefixLength + gReportLength + 1;
+              logChecksum17 = 0;
+              for (uint32_t i = 0; i < kLogPrefixLength; i++) {
+                logChecksum17 += static_cast<uint8_t> (kLogPrefix[i]);
+              }
+              for (uint32_t i = 0; i < gReportLength; i++) {
+                logChecksum17 += static_cast<uint8_t> (clover_emmc_report[i]);
+              }
+              logChecksum17 += static_cast<uint8_t> ('\n');
+              for (uint32_t i = 0; i < kBlockWords; i++) {
+                gWriteBlock[i] = 0;
+              }
+              gWriteBlock[0] = 0x554e5855u;   // "UXNU" in memory order
+              gWriteBlock[1] = 0x31474f4cu;   // "LOG1"
+              gWriteBlock[2] = entryFirst14;
+              gWriteBlock[3] = logLen17;
+              gWriteBlock[4] = logChecksum17;
+              gWriteBlock[5] = 17;
+              gWriteBlock[6] = gReportLength;
+              logHeaderOk17 = writePioBlock (entryFirst14, gWriteBlock, logHeaderWords17,
+                                             logHeaderStatus17);
+              waitCardReady (logReadyRspA17, logReadyStatusA17, logReadyPollsA17);
+              logHeaderReadOk17 = readPioBlock (entryFirst14, gReadBlock, logHeaderReadWords17,
+                                                logHeaderReadStatus17);
+              if (logHeaderReadOk17) {
+                logRb0_17 = gReadBlock[0];
+                logRb1_17 = gReadBlock[1];
+                logRb3_17 = gReadBlock[3];
+                logRb4_17 = gReadBlock[4];
+                for (uint32_t i = 0; i < kBlockWords; i++) {
+                  if (gReadBlock[i] == gWriteBlock[i]) {
+                    logHeaderEqual17++;
+                  }
+                }
+              }
+              uint8_t *text = reinterpret_cast<uint8_t *> (gWriteBlock);
+              for (uint32_t i = 0; i < 512; i++) {
+                text[i] = 0;
+              }
+              for (uint32_t i = 0; i < kLogPrefixLength; i++) {
+                text[i] = static_cast<uint8_t> (kLogPrefix[i]);
+              }
+              for (uint32_t i = 0; i < gReportLength; i++) {
+                text[kLogPrefixLength + i] = static_cast<uint8_t> (clover_emmc_report[i]);
+              }
+              text[kLogPrefixLength + gReportLength] = '\n';
+              logTextOk17 = writePioBlock (entryFirst14 + 1, gWriteBlock, logTextWords17,
+                                           logTextStatus17);
+              waitCardReady (logReadyRspB17, logReadyStatusB17, logReadyPollsB17);
+              logTextReadOk17 = readPioBlock (entryFirst14 + 1, gReadBlock, logTextReadWords17,
+                                              logTextReadStatus17);
+              if (logTextReadOk17) {
+                const uint8_t *readBack = reinterpret_cast<const uint8_t *> (gReadBlock);
+                for (uint32_t i = 0; i < logLen17; i++) {
+                  if (readBack[i] == text[i]) {
+                    logTextEqual17++;
+                  }
+                }
+              }
+            }
+
+            if (entryFound14 == 0) {
+              emitText ("\ntx i=0");
+            } else if (logGated17) {
+              emitText ("\ntx g=1");
+            } else {
+              emitText ("\ntx a=");
+              emitDec (entryFirst14);
+              emitText (" n=");
+              emitDec (logLen17);
+              emitText (" h=");
+              emitDec (logHeaderOk17 ? 1 : 0);
+              emitText (" t=");
+              emitDec (logTextOk17 ? 1 : 0);
+              emitText (" hc=");
+              emitDec (logHeaderEqual17);
+              emitText (" tc=");
+              emitDec (logTextEqual17);
+              if (!logHeaderOk17) {
+                emitText (" hs=");
+                emitHex (logHeaderStatus17, 8);
+              }
+              if (!logTextOk17) {
+                emitText (" ts=");
+                emitHex (logTextStatus17, 8);
+              }
+              emitText ("\ntxh ");
+              emitHex (logRb0_17, 8);
+              emitText (" ");
+              emitHex (logRb1_17, 8);
+              emitText (" ");
+              emitHex (logRb3_17, 8);
+              emitText (" ");
+              emitHex (logRb4_17, 8);
+            }
+          }
         } else {
           emitText ("\ndt f=");
           emitDec (firstUs12);
@@ -3040,7 +3173,7 @@ extern "C" void clover_emmc_run (void)
   // the storage instrument it was asked for.
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
       mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12 && mode != 13 &&
-      mode != 14 && mode != 15 && mode != 16) {
+      mode != 14 && mode != 15 && mode != 16 && mode != 17) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -3061,7 +3194,7 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp (mode == 5, (mode >= 7 && mode <= 16) ? mode : 0);
+    coldBringUp (mode == 5, (mode >= 7 && mode <= 17) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.

@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: one log block written into logfs and read back"
+title = "clover emmc: the report itself stored in logfs and read back"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1210,7 +1210,18 @@ kernel_args = [
   # is gated on the extent matching 12320768/12337151, so a parse mistake cannot write outside
   # logfs. "old <sum> <w0>" records what the block held before, so a failed write and a broken
   # read are distinguishable.
-  "clover-emmc=16",
+  # Round102's photograph: "wr a=12320768 n=128 ok=1 int=00000003", "st 00000900 s=4 p=0",
+  # "old 00000000 00000000", "rd ok=1 cmp=128 sum=6e53ce59",
+  # "w0 554e5855 00bc0000 0c24bafa". The write ended cleanly, the card's own R1 said
+  # READY_FOR_DATA on the first CMD13, and the read-back matched all 128 words with a sum that
+  # an offline recomputation of the payload formula also gives. Writing is closed.
+  # Mode 17 answers the question the partition exists for: it stores the report itself. After
+  # the text is assembled it writes a two-block record -- a header saying "UXNU"/"LOG1", the
+  # start LBA, the byte count and a byte sum, then a text block holding a prefix, the report
+  # body and a newline -- and reads both blocks back. "tx a=... n=... h=1 t=1 hc=128 tc=n" with
+  # "txh 554e5855 31474f4c <n> <sum>" is the positive. The record stays in logfs, so the same
+  # text can be taken from another OS with dd.
+  "clover-emmc=17",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

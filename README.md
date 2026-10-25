@@ -4746,6 +4746,116 @@ fastboot reboot
 
 **拍一张就够。** 这一块写的是 logfs 的首块；`old` 行会记下它原来的样子。
 
+## round102 读数：写进去、等它编程完、原样读回来
+
+照片：
+
+```text
+lg i=39 a=12320768 b=12337151
+wr a=12320768 n=128 ok=1 int=00000003
+st 00000900 s=4 p=0
+old 00000000 00000000
+rd ok=1 cmp=128 sum=6e53ce59
+w0 554e5855 00bc0000 0c24bafa
+ps e=01f800f0 clk=0007
+efi 1
+```
+
+这一张把写通路整段闭合了，而且每个数都能独立复算：
+
+1. **写命令干净结束。** `wr … n=128 ok=1 int=00000003`：RESPONSE|DATA_END，
+   128 个字全部递给数据口，没有超时/CRC。
+2. **卡自己说它编程完了。** `st 00000900 s=4 p=0`：R1 的 bit 8
+   （`READY_FOR_DATA`）置位、状态机在 transfer（4）；`p=0` 说明第一次 CMD13
+   就问到了，不需要第二轮。
+3. **读回是逐字一致的，不是「看着像」。** `rd ok=1 cmp=128`，并且
+   `sum=6e53ce59` 与按载荷公式（`0x554e5855 + i×0x01000193`，头四个字被覆盖）
+   独立算出的和完全相同。
+4. **头部字段也都对得上。** `w0 554e5855 00bc0000 0c24bafa`：`"UXNU"`、
+   首 LBA 12320768（`0x00bc0000`）、以及第 4..127 字的和——这个校验和同样是
+   离线算好后与照片逐位相同的。
+5. **旧内容是零。** `old 00000000 00000000`：写之前 logfs 首块是空白的，
+   所以这次读回的一致只能来自刚写进去的那一块。
+6. **回归没动。** `ps e=01f800f0 clk=0007`、`efi 1`、`v3 6440 6040` 与 round99
+   一致。
+
+写通路不再有未知项。下一件事不是再证明能写，而是写**有意义的内容**：把这份报告
+本身作为文本存进 logfs，再从盘上读回来。这样日志才真正「存在分区里」，Linux
+侧 `dd` 就能取走。
+
+## v0.2.75（round103）：把报告文本本身存进 logfs 再读回
+
+mode 17 = mode 15 的整条链，跳过 mode 16 的测试块，改成在报告拼完之后把它自己
+写进盘。盘上是一条两块的记录，布局固定：
+
+| LBA | 内容 |
+| --- | --- |
+| `a`（12320768） | 头块，128 个字：`[0]=554e5855`（"UXNU"）、`[1]=31474f4c`（"LOG1"）、`[2]=a`、`[3]=总字节数`、`[4]=字节和`、`[5]=17`、`[6]=正文长度`，其余为零 |
+| `a+1` | 文本块：`unixnu clover emmc log\n` + 报告正文 + 一个换行，后面补零到 512 字节 |
+
+写入顺序与 round102 完全相同（CMD24、同节奏 FIFO、`READY_FOR_DATA` 轮询），两块
+各做一次；每块写完立刻读回：头块数 128 个字里有多少字相同（`hc=`），文本块数
+实际长度内有多少字节相同（`tc=`）。报告追加两行：
+
+```text
+tx a=12320768 n=343 h=1 t=1 hc=128 tc=343
+txh 554e5855 31474f4c 00000157 <checksum>
+```
+
+`n` 是盘上文本的总字节数（前缀 + 正文 + 换行；按 round102 那张照片的行宽算是 343），
+`0x157` 就是 343，`h`/`t` 是两次写的判定，
+`hc`/`tc` 是两次读回的逐字/逐字节相同数，`txh` 是从盘上读回的头四个关键字段。
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `tx … h=1 t=1 hc=128 tc=n` + `txh 554e5855 31474f4c <n> <sum>` | 报告文本已按固定布局落盘并能原样读回 | Linux 侧 `dd` 取 logfs 前两块，读同一段文本 |
+| `tx g=1` | 坐标门拦住，没写 | 回到 mode 15 看 `lg` |
+| `tx i=0` | 扫描没找到 logfs | 回到 mode 15 查名字比较 |
+| `h=1 t=1` 但 `hc<128` 或 `tc<n` | 读回不完整 | 对照 round102 的 `rd ok=1 cmp=128` 查数据机 |
+| `h=0` 或 `t=0` | 某一次写没干净结束 | 报表里补打 `hs=`/`ts=` 的 INT_STATUS |
+
+产物（内核变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round103-payload.img` | 58720256 B | `13b67e16c9200ffa1f90d7e17bdf716b26ac17efdf90479f7750ff8fc38bbea9` |
+| `round103-kernel.macho`（构建产物） | 51949568 B | `07850bad3663b3634f9dc5d2c469b8f7d79eb6a41892493b96742aa71406d835` |
+| `round103-in-volume-kernel.macho`（卷内副本） | 51949568 B | `61418591efc7b2fbc026594d83aff6a8cd65d29ef59b32b6102b43de5c73e6db` |
+| `round103-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round103-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round103-kernel.macho.adt` | 13476 B | `d82c818dd60a84f4fdcc5931d9ceeab438fe56386b5cc6ba1617bcb925269c78` |
+| `round103-unixnu.toml` | 575 B | `dcd9c79ef24d26dfd2d4ab75817c0d0e0554a19dce5c2058528de43b4b07eb60` |
+
+校验器：探针 35 处 5959 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在。
+反汇编自查：对象里 `writePioBlock`/`waitCardReady`/`readPioBlock` 的调用对一共四组——
+mode 17 的头块 `0x19fc4/0x19fd8/0x19ff4`、文本块 `0x1a12c/0x1a140/0x1a160`，mode 16 的
+旧块读 `0x1c4f4`、写 `0x1cc60/0x1cc74`、读回 `0x1c644`；头块常量 8 字节
+`55 58 4e 55 4c 4f 47 31` 在对象里可查，文本块参数是 `mov w0,#1; movk w0,#0xbc,lsl#16`
+（= 12320769）；`\ntx a=` 的逐字符发射在对象 `0x1a72c` 起，`\ntxh ` 在 `0x1ab00` 起，
+后接 `emitHex`。内核符号：`coldBringUp` `0xfffffff00797ba50`、
+`readPioBlock` `0xfffffff00798ebf4`、`writePioBlock` `0xfffffff00798ee40`、
+`waitCardReady` `0xfffffff00798f08c`。门是 `mode != 17`，分发器
+`mode >= 7 && mode <= 17`。卷内 boot-args 末尾是
+`… clover-pmgr=2 clover-emmc=17 armcpu-clock-panic=60000`。
+boot 仍是 `round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round103-payload.img
+fastboot reboot
+```
+
+**拍一张就够。** 这一轮会覆盖 logfs 的首两块：块 0 是新的头块，块 1 是报告文本。
+
+Linux 侧取日志（设备已 root；这也是「日志真的存在分区里」的独立验证）：
+
+```sh
+adb shell su -c 'dd if=/dev/block/by-name/logfs bs=512 count=2' > logfs.bin
+xxd logfs.bin | head
+dd if=logfs.bin bs=512 skip=1 count=1 2>/dev/null | tr -d '\0'
+```
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -4771,8 +4881,10 @@ fastboot reboot
   首项标定 `e0` 来区分「编码错」与「确实没有」（round101 命中
   `lg i=39 a=12320768 b=12337151`，与 sysfs 的 `mmcblk0p39` 独立吻合），
   `v0.2.74` 起按这个坐标往 logfs 首块写一块自证载荷（CMD24 + 同节奏 FIFO +
-  CMD13 等 `READY_FOR_DATA`）再读回逐字比，写前先读旧内容、写错位置则一个字不写，
-  仍然不发布
+  CMD13 等 `READY_FOR_DATA`）再读回逐字比，写前先读旧内容、写错位置则一个字不写
+  （round102 读回 `cmp=128`、`sum` 与离线重算一致），`v0.2.75` 起把报告本身按固定
+  两块的布局存进 logfs（头块 `UXNU`/`LOG1` + 长度 + 字节和，文本块前缀 + 正文）
+  并逐块读回比对，仍然不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令、数据阶段能不能自己走完」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，
