@@ -1636,6 +1636,53 @@ kernel_args = [
   # reflashing; the payload title ("clover r125: …") is the only visible thing that separates this photo
   # from round124's. kernel.macho.adt's hash changes every build for an unrelated reason: make-clover-adt.py
   # writes a fresh os.urandom(64) /chosen random-seed.
+  # Round 125 came back and every one of the twelve new cells is live -- none printed `----------`, so
+  # `readable()` passed twelve times and all twelve offsets landed inside a section. The console layer and
+  # the tty layer are both VACANT at tick 60000, which kills the model that organized rounds 75-125:
+  #   ring len=0x1000 used=0 nres=0, buf=0xfffffffbffda4000 wr=rd=0xfffffffbffda48d8
+  #   fl=0 wt=0x22220144 dis=0 susp=0
+  #   tty=0xfffffff3883d5800 state=0x20028 cc=0, low=0x100 hi=0x4e0 to=0 owner=0, "OLOWAT no"
+  # Each reading closes a park site by its precondition, not by a side effect: TS_CARR_ON is set so
+  # tty.c:2489's "ttydcd" branch was never entered; TS_SO_OLOWAT is clear and tty.c:2655 sets it on the
+  # line above the "ttywri" ttysleep, so that park never happened either; owner=0 is stronger than it
+  # sounds because tty_lock() stores t_locked_thread AFTER acquiring t_lock (tty.c:275-281) and
+  # tty_unlock() clears it BEFORE releasing (:333) -- a zero owner means nobody holds it, and nobody can
+  # be queued behind nobody; used/nres/wr-rd say the ring holds nothing and no reservation is outstanding;
+  # fl/wt say neither console lock is taken; dis/susp say no bytes are being dropped after a return.
+  # The offsets are validated by the photo itself, not by my arithmetic: low=0x100=256 is exactly the
+  # t_lowat computed from kmopen's TTYDEF_SPEED through ttsetwater, hi=0x4e0=1248 (my 1440 was wrong --
+  # I took the roundup modulus off by one), tty= is a real heap address, and state's three bits
+  # (TS_CARR_ON|TS_ISOPEN|TS_CONNECTED) are the shape of an open console tty. This is a live tty, not a
+  # zero page. And wr-buf=0x8d8=2264 bytes is about what the visible panel holds, so nobody is spinning
+  # in EL0 redrawing -- one subtraction closes that branch.
+  # So "A's write never returned" and "the write path is empty" are both true, and the first is not an
+  # inference: the rung immediately after the `msg=` label write is
+  # reboot(RB_PANIC|RB_QUICK, "clover-el0: after write msg-label") (scripts/clover-el0-init.S:659-663, the
+  # svc at 0x100000620), reboot_kernel goes straight to panic_kernel for that exact option pair
+  # (kern_shutdown.c:182-184, __abortlike; RB_PANIC=0x800, RB_QUICK=0x400 per reboot.h:89-90), and round85
+  # proved the channel paints `userspace panic: ...`. It painted nothing, because the watchdog won
+  # first-panic-wins. A is inside write(2) but in the segment ABOVE the tty: vn_write/VNOP_WRITE's vnode
+  # lock, spec_write's cdevsw dispatch, or a uiomove page fault -- none of which touches t_locked_thread
+  # or the ring, which is precisely the photographed shape.
+  # elr=100000c80 is demoted accordingly. It equals _puts+4 of this image (scratch-data.img is byte-identical
+  # to round124, efb2cd85...), i.e. the return point after `bl _write_console`, and it does name the
+  # label write -- _print_dec tail-branches, so the digit write would have read _print_line+4 (0xc90). But
+  # its partner spsr=0xfffffff16eb44d50 fills SPSR_EL1[63:32], which is RES0, and no mrs can produce that;
+  # round121/123 show the same shape. At least one of the pair is a stale frame-derived value, so elr is
+  # usable as a LABEL and not as a coordinate.
+  # Cost of a 19-line panic block: it covers the older log and the EL0 tail, and the photo's bottom edge
+  # cuts two more rows, so this round cannot read A's last line. Shorten the block or frame the whole
+  # panel next time.
+  # That closes the tty/console question and opens the one round126 asks: put a syscall on the same fd
+  # that never enters the tty -- fstat64(fd, buf), number 339 (syscalls.master:520), which goes through
+  # specfs' VNOP_GETATTR -- behind its own reboot rung, ahead of the suspect write, because the ladder is
+  # one-shot and the first rung reached ends the boot. `after fstat` on screen means the vnode answers
+  # outside write and the card is the write chain itself; `exit status <N>` means it came back with an
+  # errno and nobody is wedged; neither, only the watchdog, means fstat64 is stuck in the same place.
+  # Two of the three read out in seconds, which is the answer to "18 minutes is too long" -- the third
+  # still costs the deadline. The parent's waits are swapped to wait4(A)-then-B so the exit-code branch
+  # is actually reportable; round124 put the blocking wait on B and A's _fail exit would have been
+  # invisible forever.
   "armcpu-clock-panic=60000",
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board has never had its online-CPU count measured (round70's panel

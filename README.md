@@ -7337,6 +7337,70 @@ fastboot flash cache ~/clover-out/round125-payload.img
 
 冷刷，不用 `fastboot boot`。开机认出菜单第一行的 `clover r125:`，然后让 A 照旧卡在 `msg=`，等 ≈18 分钟看门狗自己占屏 —— 那一帧就是本轮的全部答案，读上面六行。第一帧（引导日志停在 `msg=` 那张）也顺手拍，用来确认 `r125` 与 A 的位置没变。
 
+## round125 读数（v0.2.97 实机）：写路径整条是空的 —— 「卡在 tty/console」这条模型死了
+
+一帧，全部读数都在那张照片里（照片是竖屏拍的，`sips -r 270` 转正；`-r 90` 会得到一张上下倒过来的）。逐字：
+
+```
+ArmCpu: clock watchdog at 60000 ticks (elr=100000c80 spsr=fffffff1
+6eb44d50 elr2=100000c80 cnt0=124f800 cnt1=0 freq=124f800) @ArmCpu.
+cpp:632
+ring len=0x0000000000001000 used=0x0000000000000000 nres=0x00000000
+00000000
+buf=0xfffffffbffda4000 wr=0xfffffffbffda48d8 rd=0xfffffffbffda48d8
+fl=0x0000000000000000 wt=0x0000000022220144 dis=0x0000000000000000
+susp=0x0000000000000000
+tty=0xfffffff3883d5800 state=0x0000000000020028 cc=0x0000000000000
+000
+low=0x0000000000000100 hi=0x00000000000004e0 to=0x0000000000000000
+ owner=0x0000000000000000
+OLOWAT no
+pages=0x000000000003af7c
+free=0x00000000000394ff
+ticks=0x000000000000ea60
+ipi=0x0000000000000000 sent=0x0000000000000000
+irq=0x0000000000000013 phase=0x0000000000000003 intid=0x000000000000
+0013 typer=0x00000000007b04f3
+```
+
+先看仪器自己有没有说谎：`ticks=0xea60`=60000 与 `armcpu-clock-panic=60000` 对上，`phase=3` 是 `rtclock_intr()` 已返回、正走到看门狗判断（ArmCpu.cpp:621），`intid=0x13` 与 `armcpu-timer-intid=19` 一致，`typer=0x7b04f3` 三轮不变，`ipi=0 sent=0` 照旧 —— 这块板上一个 IPI 都没到过。新增的十二格全部有效，没有一格画成 `----------------`，也就是 `readable()` 十二次全过、偏移全落在段内。
+
+**主问题（那次 write 停在 tty 层还是 console 层）的答案是：都不在。** 十二格里有六格，每一格恰好关掉一个睡眠点，而且关的都是「必要条件」而不是「侧面迹象」：
+
+| 读数 | 关掉的分支 | 依据 |
+|---|---|---|
+| `state=0x20028` 含 `TS_CARR_ON`(0x8) | `ttwrite` 的 "ttydcd" 永久睡 | tty.c:2489 那一支的前提是载体位**不在** |
+| `OLOWAT no`、`cc=0` | "ttywri" 水位睡 | tty.c:2655 紧挨在 `ttysleep` 上面一行做 `SET(tp->t_state, TS_SO_OLOWAT)`；这一位不在，说明它没进过那一支 |
+| `owner=0` | 有人持 tty_lock / 有人排在 tty_lock 上 | `tty_lock()` 是先 `lck_mtx_lock` **后**才 `os_atomic_store(&tp->t_locked_thread, current_thread())`（tty.c:275-281），`tty_unlock` 在释放**前**清成 NULL（:333）。所以「持锁者为 0」不是「没记录」而是「没人持锁」；没人持锁就不可能有人在等锁 |
+| `used=0`、`nres=0`、`wr==rd` | ring 里压着没排的字节 / 有人 reserve 之后没归还 | `serial_console.c` 的 `while (reserve == NULL)` 只在 ring 满时才进；ring 空 |
+| `fl=0`、`wt=0x22220144` | `flush_lock` / `write_lock` 被谁带走 | `_lck_mtx_try_lock` 把持有者的 cpu 号写进 arg+8，0 是自由（除「cpu 0 持有」这一支分不开，但 `nres=0` 已独立排掉冲空者）；`wt` 是 ticket，`[23:16]==[31:24]`（0x22==0x22）即自由，第 0 字节还是标签 `'D'`(0x44) |
+| `dis=0`、`susp=0` | write 返回了但字被静默丢掉 | `console_write` 那两处直接 `return` 的出口 |
+
+偏移这套东西不是猜的，照片自己证了：`low=0x100`=256 正是上一轮从 `kmopen`（`t_ospeed = TTYDEF_SPEED`）经 `ttsetwater` 算出来的 `t_lowat`；`hi=0x4e0`=1248（我算成 1440，错了，`roundup` 的模子取错）；`tty=0xfffffff3883d5800` 是个真堆地址；`state` 那三位（`TS_CARR_ON|TS_ISOPEN|TS_CONNECTED`）正是一个开着的控制台该有的形状。**读的是一个真 tty，不是零页。**
+
+顺手记一笔：`wr - buf = 0x8d8` = 2264 字节，是这次启动里所有 write 进 ring 的字节总数。屏上那几十行按一行四十字算正好两千字上下 —— **没有任何人在自旋重画**，「A 在 EL0 里绕圈」这一支被这一个减法排掉了。
+
+于是「write 没返回」和「写路径是空的」必须同时成立。前者不是推测：A 在 `msg=` 那行标签之后紧接的就是第一档 `reboot(RB_PANIC|RB_QUICK, "clover-el0: after write msg-label")`（`scripts/clover-el0-init.S:659-663`，镜像里 `0x100000620` 那颗 `svc`），而 `reboot_kernel` 对 `RB_PANIC|RB_QUICK` 是**进门就 `panic_kernel`**（kern_shutdown.c:182-184，`__abortlike`，`RB_PANIC`=0x800、`RB_QUICK`=0x400 见 reboot.h:89-90），round85 已经证明这条通道画得出 `userspace panic: …`。它没画，看门狗才占屏（first-panic-wins）。所以 A 既没走出那次 write，也没死（rounds 78-81 父亲阻塞 `wait4(A)` 时从来没有 `exit status` 屏）。
+
+**两条合起来只剩一个落点：`write(2)` 里在 tty 之前的那一段** —— `vn_write`/`VNOP_WRITE` 那颗 vnode 锁、`spec_write` 到 `cdevsw` 的派发，或者 `uiomove` 触发的缺页。这一段既不碰 `t_locked_thread`，也不碰 ring，正好就是照片读出来的形状。
+
+`elr=100000c80` 要跟着降级。它等于本轮镜像（`scratch-data.img` 与 round124 逐字节相同，`efb2cd85…`）的 `_puts + 4`，也就是 `bl _write_console` 的返回点，和 round121/123 那两帧一样「恰好」落在同一个符号偏移上；而 `_print_dec` 是 `b _write_console` 尾调用的，数字那一次 write 的返回点是 `_print_line + 4`(`0xc90`)，所以这一格确实指名「标签那一次 write」。可疑的是它的搭档：同一对 `mrs` 读出的 `spsr=0xfffffff16eb44d50` 把 `SPSR_EL1[63:32]` 这段 RES0 读满了，`mrs` 不可能读出这种值，round121/123 两帧同格也是这个形状。**这一对里至少有一格是帧里带出来的陈旧值，不能当活样本用**；上一轮我把它读成「被阻塞那次调用的返回地址」，本轮的直接测量说：就算它指的是那次调用，那次调用也不在 tty 里。它的正确用法到此为止 —— 是一个**标签**，不是**坐标**。
+
+一处本轮的代价，写下来免得下次再踩：panic 块连标题占了 19 行，把屏上半截的旧日志和 EL0 尾部一起盖掉，照片底边又切掉最后两三行，**本轮读不到 A 的最后一行**。EL0 镜像与 round124 相同，所以尾部按 round124 那张照片算；下一轮要么把块缩短，要么拍照时把屏挪全。
+
+### round126 的问题：同一颗 fd 上，一颗不进 tty 的 syscall 回不回得来
+
+上面那张表把 tty 和 console 都排掉了，但排掉的方式是「读状态位」，状态位只能说明「那一刻没人在这」。要钉死，得从**另一侧**再切一次：让 A 在 `msg=` 标签 write 之后、第一档 `reboot` 之前，插一颗 `fstat64(1, buf)`（`syscalls.master:520` 的 339 号；`specfs` 的 `VNOP_GETATTR`，全程不进 `kmwrite`、不进 tty、不进 ring）。
+
+读数三值，互斥，而且**两值几秒就能拍**，正好接住「等十八分钟太久了」：
+
+- 屏上出现 `userspace panic: clover-el0: after fstat` ⇒ `fstat64` 回来了 ⇒ 这颗 vnode 在 write 之外是活的 ⇒ 卡点确实只在 write 自己那条链上，**那就要回头怀疑本轮这套状态位的读法**。
+- 屏上出现 `exit status <N>` ⇒ A 带着 errno 退出了（`_fail` 那条路），没有任何人卡住，是**字在被丢/在报错**，不是被堵住。这一支要父亲先等 A 才报得出来，见下。
+- 两者都没有，只有看门狗那一帧 ⇒ `fstat64` 也停在里面 ⇒ **卡点在 tty 之前**，就是那颗 vnode 锁或者它的派发链。
+
+配套只改一处：父亲现在先 `wait4(B)`（`_parent` 里 round124 加的那颗），A 万一从 `_fail` 退出，父亲永远看不见 —— 第二值就废了。所以本轮把顺序倒回来：**先等 A**（醒来照 round80 的老规矩一颗字都不写、直接 `exit`，让 panic 屏去报 `exit status`），再等 B。B 的二十四行 `[clover] b<n>` 留在原位当**对照组**：`b1..b24` 全上屏就说明控制台在 A 停住之后仍然答了二十四次。
+
+## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
   sheng 那条"直接从 userdata 读 APFS 卷"的路走不通。clover 走 gta4l 的形状：
