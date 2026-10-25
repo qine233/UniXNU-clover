@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: run the block stack after vfsinit"
+title = "clover emmc: name the block stack failure"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1341,10 +1341,16 @@ kernel_args = [
   # shadow the base repository's patch set, so this notification is the post-vfsinit hook the
   # device repo owns. The handler runs on IOKit's config thread; rd= stays md0 and nothing is
   # written to logfs.
-  # One line on success, "CloverBlock r114: post-vfsinit p=<n> disk0s39 <maj>:<min> bd=1 map=1";
-  # every failure panics as "CloverBlock r114: <step> <value>". "notify 0/1" means the IOBSD
-  # matching dictionary or the notification itself could not be installed. No CloverBlock line at
-  # all means the notification never fired.
+  # Round114's photograph still stopped at "bsd-props 0", so the ordering was not the only
+  # obstacle. Round115 keeps the run and replaces that value with a bitmask read from the same
+  # two media objects, plus a devfs_make_node/remove probe for a private name and for disk0,
+  # disk1, disk0s39 and disk1s39. It answers, in one photograph, whether devfs was usable and
+  # whether a node name already existed; see README v0.2.87 for the bit table.
+  # One line on success, "CloverBlock r115: post-vfsinit p=<n> disk0s39 <maj>:<min> bd=1 map=1";
+  # every failure panics as "CloverBlock r115: <step> <value>", except bsd-props, which prints
+  # "CloverBlock r115: bsd-props 0x<mask>". "notify 0/1" means the IOBSD matching dictionary or
+  # the notification itself could not be installed. No CloverBlock line at all means the
+  # notification never fired.
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under

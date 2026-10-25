@@ -6153,6 +6153,110 @@ fastboot reboot
 **一次刷机只回答一个问题：把块栈放到 `vfsinit()` 之后，BSD 命名、属性和 `bdevvp` 能不能一次走完。**
 看到成功行，`rd=md0` 就可以换成 `disk0s39`，下一轮问的是根挂载本身。
 
+## v0.2.87（round115）：把 bsd-props 拆成掩码
+
+round114 的照片仍是 `CloverBlock r114: bsd-props 0`。这行本身就否掉了上一轮的结论：
+
+- 屏幕上出现了 CloverBlock 行，说明 `IOBSD` 通知确实触发了，处理器跑在 IOKit 配置线程上。
+- 链路走到了最后一步，说明 GPT 解析、39 号分区查找、整盘与目标分区上两个
+  `IOMediaBSDClient::start()` 都返回了 true。
+
+也就是说「放到 `vfsinit()` 之后」不是全部原因。`start()` 把 `createNodes()` 的失败整个吞掉了
+（`IOMediaBSDClient.cpp:351` 不看返回值，`:362-364` 照样 `registerService()` 并返回 true），
+剩下的可能都长成同一行：
+
+- 整盘那一步就失败：`getWholeMedia()` 走不到 `isWhole()`，或 `whole->getProvider()` 为空，
+  或 `AnchorTable` / `MinorTable` 插入失败；
+- 只在分区那一步失败：`getWholeMedia()` 路过某个中间 `IOMedia` 时 `getLocation()` 为空而返回
+  NULL，或 `slicePath` 不是 `s39`，或 minor 表插入失败；
+- devfs 在这个时刻仍不可用，或客户端要用的名字已经被别人占了——`devfs_make_node()` 返回 NULL
+  同样只表现为缺少属性。
+
+round115 不改流程，只改这一行的内容：在同一次运行里读两个媒体对象的属性，得到一个 19 位掩码；
+再用 `devfs_make_node()` / `devfs_remove()` 探一个私有名字和客户端本来会用的四个名字。掩码以
+十六进制打印，因为 19 位十进制在照片上读不出来。
+
+```text
+CloverPMGR r115: args [-v serial=3 debug=0x14e kt_fixed_zones=120 boot-progress=2
+ rd=md0 allow_legacy_mach_msg=1 armcpu-timer-intid=19 clover-pmgr=2 clover-emmc=21
+ armcpu-clock-panic=60000]
+...
+CloverBlock r115: post-vfsinit p=<n> disk0s39 <maj>:<min> bd=1 map=1
+```
+
+失败仍是 panic 一行：`CloverBlock r115: bsd-props 0x<mask>`；其它 step 的格式不变。
+
+掩码位（`0x` 后从低位读）：
+
+| 位 | 值 | 含义 |
+| --- | --- | --- |
+| 0 | `0x00001` | 整盘媒体有 `BSD Name` |
+| 1 | `0x00002` | 整盘媒体有 `BSD Major` |
+| 2 | `0x00004` | 整盘媒体有 `BSD Minor` |
+| 3 | `0x00008` | 目标分区有 `BSD Name` |
+| 4 | `0x00010` | 目标分区有 `BSD Major` |
+| 5 | `0x00020` | 目标分区有 `BSD Minor` |
+| 6 | `0x00040` | 目标分区 `getLocation()` 正好是 `"39"` |
+| 7 | `0x00080` | 目标分区有 provider |
+| 8 | `0x00100` | 整盘媒体有 provider |
+| 9 | `0x00200` | 整盘媒体 `isWhole()` 为真 |
+| 10 | `0x00400` | 目标分区 `isWhole()` 为真（正常必须为 0） |
+| 11 | `0x00800` | 私有名 `cloverbdprobe` 被 devfs 接受：devfs 就绪且可写 |
+| 12 | `0x01000` | 探针之后 `disk0` 仍空闲（即没有这个节点） |
+| 13 | `0x02000` | `disk1` 仍空闲 |
+| 14 | `0x04000` | `disk0s39` 仍空闲 |
+| 15 | `0x08000` | `disk1s39` 仍空闲 |
+| 16 | `0x10000` | 手动启动整盘客户端之前，整盘就已有 `BSD Name` |
+| 17 | `0x20000` | 手动启动分区客户端之前，分区就已有 `BSD Name` |
+| 18 | `0x40000` | 目标分区 `getBase()` 非 0 |
+
+名字探针只说明「这个名字此刻能不能建」，建完立刻 `devfs_remove()`，不改动任何已有节点。
+位 12–15 为 1 表示名字空闲；为 0 表示已经存在同名节点（`dev_add_name` 的 `EEXIST`），
+这正好回答「是不是自动匹配的 BSD 客户端先占了名字」。
+
+判定：
+
+| 掩码 | 结论 | 下一步 |
+| --- | --- | --- |
+| 位 11 为 0 | devfs 在此刻仍不可用，位 12–15 一并无意义 | 说明通知在 `vfsinit()` 之前就发了，或 `devfs_init()` 没跑到；改为核对通知来源，而不是继续动 `IOMediaBSDClient` |
+| 位 11 为 1，位 0–2 为 0 | 整盘的 `createNodes()` 失败：问题在锚点/整盘定位 | 看位 8（provider）、位 9（`isWhole`）、位 12/13（名字是否被占） |
+| 位 0–2 为 1，位 3–5 为 0 | 整盘已命名，只有 39 号分区失败 | 看位 6（location）、位 7（provider）、位 10（被误判 whole）、位 18（base）、位 14/15（名字） |
+| 位 3–5 为 1 | 属性其实都在，失败来自类型转换 | 查 `BSD Name/Major/Minor` 是否被写成非 `OSString`/`OSNumber` |
+| 位 16 / 17 为 1 | IOKit 自动匹配已经给媒体起过 BSD 客户端 | 手动再起一次只会撞名；改为直接读已有名字继续 |
+| 位 18 为 0 | 分区 `base` 是 0，偏移映射不可能成立 | 查 `IOGUIDPartitionScheme::scan` 是否给媒体设了起始块 |
+
+产物（内核与 payload 变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round115-payload.img` | 58720256 B | `8a215e2533e775987fa73655134cea6d011b1d1286e14e5e2c6cd0f2658ce7ee` |
+| `round115-kernel.macho`（构建产物） | 51974144 B | `a7978a14053e0c7a018705f1077a541d479c1da45e04c3754f08e464afc037fe` |
+| `round115-in-volume-kernel.macho`（卷内副本） | 51974144 B | `6cbece2ce054fb6ee538e6f046c7a4d73db7db5c214af85cbfadd545e9a51d00` |
+| `round115-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round115-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round115-kernel.macho.adt` | 13476 B | `81a95fe1a9dda238778356fafe829fca12aba59554ca19e9d9b09aa012bbd1bd` |
+| `round115-unixnu.toml` | 556 B | `9cc24899eaca80856244483463cee6ba1a086d6286c77d3358c2bfb3d49aa387` |
+
+校验器：`check-clover.py` 通过（ADT 13476 字节、8 核、splash `0x9d400000-0x9f800000`、
+FD `0x9fc00000-0x9ff00000`、`clover_defconfig`、`CLOVERESP`、模块可见）。卷内 boot-args
+末尾仍是 `… clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`。两条 r115 字符串都在
+卷内内核里：`CloverPMGR r115: args [%s]`、`CloverBlock r115: post-vfsinit p=%u %s %u:%u bd=1 map=1`。
+`CloverBlock` 的导入与 vtable 审计仍通过（190 个槽、26 个覆写）；本轮新增的导入只有
+`_devfs_make_node` 与 `_devfs_remove`，两者都是内核自身导出的符号。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_run`
+`0xfffffff00797231c`、`_clover_block_run` `0xfffffff007992054`、`_clover_block_request`
+`0xfffffff007992d60`、`_devfs_make_node` `0xfffffff0074a5e58`、`_devfs_remove`
+`0xfffffff0074a4e24`。boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round115-payload.img
+fastboot reboot
+```
+
+**一次刷机只回答一个问题：`bsd-props` 的失败发生在整盘、分区，还是 devfs 本身。**
+掩码会指出唯一的一段，下一轮只改那一段；之后才把 `rd=` 换成 `disk0s39`。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
