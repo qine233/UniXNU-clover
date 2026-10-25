@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: let the kernel's own rd= name the root"
+title = "clover emmc: name the eMMC root md0s39 and skip the seal"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1009,15 +1009,28 @@ kernel_args = [
   # SOURCE_CORECRYPTO14 and NATIVE_VIRTIO_BLOCK) and it walks the media's providers looking for a
   # NativeVirtioBlock instance, so it cannot answer for this eMMC device without touching upstream
   # driver code this repository does not own.
+  # Round121 takes the first door. CloverBlock's new step 9 writes `BSD Name` = "md0s39" onto the very
+  # media it matched as disk0s39 -- after every measurement above is taken, so the block numbers in the
+  # success line are still the storage family's own -- and this argument follows the rename. The prefix
+  # makes bsd_rooted_ramdisk() true, the whole FSIOC_KERNEL_ROOTAUTH block is skipped, and the mockfs
+  # root reaches bsd_init()'s exec of /sbin/launchd. The number is unchanged for the reason written
+  # above: IOFindBSDRoot still takes the BSD-name branch, still matches by this property, and still
+  # reads the media's own major and minor, so the root is dev_t 1:39 on eMMC. What this buys is the
+  # name of the next wall, and the cost is that the kernel is told a lie about where its root lives.
   # Readings, in the order they now become distinguishable:
-  #   `Waiting on <dict ... BSD Name=disk0s39>` + `Got boot device = <path>` + `BSD root: disk0s39,
-  #     major 1, minor 39` = the ADT is out of the way and the match answered;
-  #   `rootvp not authenticated after mounting` = root mounted over eMMC, authentication is the next
-  #     and only wall -- this is the line round120 printed;
-  #   `Failed to mount root device` again = something else still pre-empts `rd=`;
-  #   `CloverBlock r120: <step> <value>` = the block stack itself broke;
+  #   `BSD root: md0s39, major 1, minor 39` = the alias matched and the numbering held;
+  #   `Process 1 exec of /sbin/launchd failed, errno <n>` @kern_exec.c:8104 = this round's pass line:
+  #     rootauth was skipped and the boot ran past it to the exec, where there is still no real image
+  #     on the partition;
+  #   `rootvp not authenticated after mounting` a second time = the prefix test did not see the name,
+  #     so `rd=` and the property disagree;
+  #   `Failed to mount root device` @IOKitBSDInit.cpp:984 = nothing carries "md0s39", the rename or the
+  #     match failed;
+  #   `CloverBlock r121: alias|alias-read|alias-match <value>` = step 9 itself broke (property write,
+  #     read-back, or the fresh dictionary not resolving to this media);
+  #   `CloverBlock r121: <any other step>` = the block stack broke before step 9;
   #   no new line and the clock watchdog = the buffer-cache read hung, which the tick panic localises.
-  "rd=disk0s39",
+  "rd=md0s39",
   # Round 72 died with SIGKILL (parent's wait4 read status 9) inside its first
   # mach_msg; round 73 bracketed that call with markers and added this boot-arg,
   # and the panel looked exactly the same: presend, no send=. So the boot-arg did
@@ -1433,9 +1446,16 @@ kernel_args = [
   # Round120's photograph carried this driver's own line unchanged and went past it: the root mounted
   # on this partition and the boot died at bsd_init.c:1098's seal check. The reading and the two ways
   # past that check are written out above, on the `rd=` argument they belong to.
-  # One line on success, "CloverBlock r120: auto p=<n> disk0s39 <maj>:<min> bd=1 map=1 fires=<k>"
-  # (fires=1 on the run that succeeded); each refire prints "CloverBlock r120: refire n=<k> (already
-  # ran)". Every failure panics as "CloverBlock r120: <step> <value>". "auto <n>" means no named
+  # Round121 takes the naming door, and step 9 is where this driver pays for it: after the two reads and
+  # the offset comparison, it writes "md0s39" over this media's BSD Name, reads the property back, and
+  # re-matches the alias through a fresh IOBSDNameMatching dictionary, which must resolve to the same
+  # object. Nothing else in the run changes: steps 1-8 still look the partition up as disk0s39 and still
+  # measure major 1 minor 39, so a step-9 failure cannot be mistaken for a block-stack failure.
+  # One line on success, "CloverBlock r121: auto p=<n> disk0s39>md0s39 <maj>:<min> bd=1 map=1 fires=<k>"
+  # (fires=1 on the run that succeeded); each refire prints "CloverBlock r121: refire n=<k> (already
+  # ran)". Every failure panics as "CloverBlock r121: <step> <value>", where "alias", "alias-read" and
+  # "alias-match" are step 9's property write, its read-back, and the alias dictionary resolving to
+  # something other than this media (alias-match carries the object it found). "auto <n>" means no named
   # partition appeared in time: the value is 0x10000 if the whole disk itself was named, plus the
   # number of named partitions seen. "notify 0/1" means the IOBSD matching dictionary or the
   # notification itself could not be installed. No CloverBlock line at all means it never fired.

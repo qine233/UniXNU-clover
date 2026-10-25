@@ -6705,6 +6705,50 @@ fastboot reboot
 
 还有第三条看着最短的路，先在这里判死：在设备仓放 `patches/xnu/*.patch`，直接改 `bsd_init.c` 的判定或 mockfs 的 ioctl 表。`tree/patches/xnu` 是指向基仓的软链，`feeds.py` 按 `(kind, name)` 取第一个存在的路径，所以设备仓一建 `patches/xnu` 就会整体顶掉上游上百个补丁 —— v0.2.58 那轮已经为这件事付过学费，仪器因此才进设备仓已拥有的 `drivers/ArmCpu`。这条路不在候选里。
 
+## v0.2.93（round121）：给 eMMC 上的根起个内核不用验证的名字
+
+round120 把墙量清楚了：根确实挂在 eMMC 分区上，拦路的只有 `bsd_init.c:1098` 那颗认证。这轮走的是**改名**这条路：CloverBlock 在第 9 步把这块媒体的 `BSD Name` 从存储族自己写的 `disk0s39` 改写成 `md0s39`，`rd=` 跟着改成同一个名字。`bsd_rooted_ramdisk()`（bsd_init.c:450）只比 `rd` 的前三个字符和 `RAMDEV`（:447，就是 "md0"），于是 `require_rootauth` 那一整块被跳过；而 `IOFindBSDRoot` 的内存盘短路要求 `rdBootVar[3] == 0`（:849），`md0s39` 过不了这条，所以根的来路一点没变：仍然走 :888 的 BSD 名分支、仍然按这块媒体自己的 `BSD Major`/`BSD Minor` 凑出 `makedev(1, 39)`。字节仍然出自 eMMC，变的只是内核被告知「这是个内存盘」。
+
+**这是绕过，不是通过。** 代价写在这里：内核被谎报了根的位置，而 mockfs 那份镜像本来就没有封条可验。第 9 步要问的是谎报之后前面是什么——按源码推断是 exec：`init_programs[]`（kern_exec.c:7977-7985）里 `/sbin/launchd` 全load不动时，:8104 会 panic `Process 1 exec of %s failed, errno %d`。分区头 4096 字节现在还是没有镜像，所以那一步大概率失败，但那正是下一个可量的东西。
+
+改动四处：`drivers/CloverBlock/CloverBlock.cpp` 加第 9 步（快照旧名 → `setProperty("BSD Name", "md0s39")` → 读回比对 → 用新名字现造一颗 `IOBSDNameMatching` 字典、`retain()` 后 `waitForService()` 一秒，要求解出的对象就是这块媒体）；`board.toml` 的 `rd=` 与菜单标题；`scripts/check-clover.py` 的根契约改成要求 `rd=md0s39` 并禁止残留的 `rd=disk0s39`；驱动身份串 `r120` → `r121`（`CloverBlock` 四处、`CloverPMGR` 一处）。前八步一行未动，第 5 步仍按 `disk0s39` 找媒体、第 8 步仍按原名比对，所以第 9 步的失败不会被误读成块栈的问题。
+
+这轮另外读了三处源码，都是「改名到底动了谁」的前置：`bsd_rooted_ramdisk()` 在全树只有两个读者（bsd_init.c:1057 与 exclaves_storage.c:219），本板走不到 exclaves 那条；`FSIOC_KERNEL_ROOTAUTH` 连同那颗 panic 整体都在 `if (!bsd_rooted_ramdisk())` 的花括号里（:1057-1098），所以前缀命中是真的能整个跳过而不是少跳一段；`IOFindBSDRoot` 匹配成功之后从服务上取 `kIOBSDNameKey`/`kIOBSDMajorKey`/`kIOBSDMinorKey` 再 `makedev`（:1013-1042），不查 `/dev` 节点名，所以 devfs 里那个仍叫 `disk0s39` 的节点不会来搅局。`mdevadd(-1, …, 0)`（:843）的设备号是显式传参、不读 `rd=`，RAMDisk 占位符照旧。
+
+| 屏幕上的行 | 含义 |
+| --- | --- |
+| `CloverBlock r121: auto p=39 disk0s39>md0s39 1:39 bd=1 map=1 fires=1` | 第 9 步写完、读回、别名匹配三关全过 |
+| `BSD root: md0s39, major 1, minor 39` | 别名被根搜到，编号还是 eMMC 那一套 |
+| `Process 1 exec of /sbin/launchd failed, errno <n>` | **本轮想要的读数**：认证跳过去了，boot 跑到 exec，卡在分区里还没有镜像 |
+| `rootvp not authenticated after mounting` | 前缀测试没看见这个名字，`rd=` 与属性不一致 |
+| `Failed to mount root device` | 没有任何服务带 `md0s39`：改名或别名匹配没成 |
+| `CloverBlock r121: alias / alias-read / alias-match <值>` | 第 9 步自己出问题（写属性、读回、别名解出别的对象；最后一行带解到的指针） |
+| `CloverBlock r121: <其它步骤>` | 块栈在第 9 步之前就出问题 |
+| 只有看门狗（60000 tick） | 缓冲区缓存那条读挂住了；`elr=` 就是挂点的地址 |
+
+产物（内核、payload、ADT、unixnu.toml 变了；root / trust cache / scratch / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round121-payload.img` | 58720256 B | `d3ee588f31058d8eea3ee50dce5cc878addfdc886cf77dbb928791eb5b766ee5` |
+| `round121-kernel.macho`（构建产物） | 51974144 B | `48a52153232c9e9160bf93e34d378993f98079d342f86ac57d11d3240dea338e` |
+| `round121-in-volume-kernel.macho`（卷内副本） | 51974144 B | `559ab0323052b3eec4fa6c33e3177f660ec34174a436ff164e9c93430d3ee6e8` |
+| `round121-kernel.macho.adt` | 13268 B | `7769674295e62a47145613378da156ac1d1699a6a4d6425c5c790fb811812a88` |
+| `round121-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round121-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round121-unixnu.toml` | 574 B | `450ca56000c0472d1ab7f4a82aa668c10f2c31358960e54a8c46b2ec6ac5e8e3` |
+
+ADT 字节数仍是 13268、`root-matching` 仍出现 0 次，只有 `random-seed` 变了对应哈希。校验器：`check-clover.py` 通过（`clover ok: ADT 13268 bytes`，根契约要求 `rd=md0s39`、见到 `rd=disk0s39` 直接报错）；`verify-clover-payload.py` 通过；`CloverBlock` 审计通过（`libCloverBlock.a` 268216 B、190 个槽、26 个覆写，比上一轮大的就是第 9 步）。卷内 `args` 是 `… rd=md0s39 … armcpu-clock-panic=60000`，内核只有 r121 字符串 4 处、r120 残留 0 处。菜单标题改成「clover emmc: name the eMMC root md0s39 and skip the seal」。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_run` `0xfffffff00797231c`、`_clover_block_run` `0xfffffff007992054` 与上一轮逐个相同，`_clover_block_request` 从 `0xfffffff0079928e8` 移到 `0xfffffff007992a0c`（+0x124，第 9 步的代码就插在它前面）。boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round121-payload.img
+fastboot reboot
+```
+
+**一次刷机只回答一个问题：把根的名字报成 `md0s39`，`bsd_init.c` 的认证块跳过去之后，boot 能不能走到 exec。** 看到 `Process 1 exec of /sbin/launchd failed, errno <n>` 就算通——那时根、挂载、认证三关都在身后，下一轮单独问分区里的镜像；再看到 `rootvp not authenticated after mounting` 就说明前缀测试根本没看见这个名字。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

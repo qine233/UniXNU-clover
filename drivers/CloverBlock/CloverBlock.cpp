@@ -65,6 +65,21 @@
 // at :781, ignored, and ten waits ran against a stock volume UUID no service here carries. Round 120 takes
 // that property out of the device tree, which leaves step 6's dictionary as the only root contract and is
 // the same wait round 118 already showed answering on this board.
+// Round 120's photograph read the best case: `rootvp not authenticated after mounting @bsd_init.c:1098`,
+// and the root it authenticated was this partition's -- the initrd's ramdisk sits at major 3, this media
+// at major 1 (memdev.c:665 takes md's major from bdevsw_add(-1, &mdevbdevsw), a different slot), so
+// mockfs's buf_meta_bread(rvp, 0, 4096) came back from a real PIO read. The mount works. Only the seal
+// check refuses it, and a mockfs image has no seal to check. Round 121 therefore adds step 9: rename this
+// media's "BSD Name" to "md0s39" once every measurement above has been taken under the name the storage
+// family wrote. bsd_rooted_ramdisk() (bsd_init.c:450) tests only the RAMDEV prefix "md0" (bsd_init.c:447),
+// so that name makes bsd_init skip the FSIOC_KERNEL_ROOTAUTH block entirely -- the other reader of that
+// test in the whole tree is exclaves_storage.c:219. IOFindBSDRoot's own memory-device shortcut still
+// refuses the name, because it requires rdBootVar[3] == 0 (:849), so the root search keeps taking the
+// BSD-name branch at :888 and keeps matching this media by the property written here, with this media's
+// own numbers. The bytes still come from eMMC; what changes is that the kernel is told to believe an
+// unsealed image on a real partition is a ramdisk. That is a bypass, not a pass, and step 9's whole point
+// is to ask what lies past it: the exec of /sbin/launchd should now fail on the partition's contents
+// (kern_exec.c:8104, `Process 1 exec of /sbin/launchd failed, errno N`) instead of on authentication.
 //
 // The class has to be hand-written. IOStorageFamily is loaded at runtime from the boot kext
 // collection (kernel.macho exports no IOBlockStorageDevice, IOMedia or IOBlockStorageDriver
@@ -82,7 +97,7 @@
 // an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
 // attached for start (startCandidate() attaches again after the matching loop's detach).
 //
-// A failure panics with one short CloverBlock r120 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r121 line naming the step; success prints one line
 // and lets the boot continue. A refire of the IOBSD notification prints one counted line and
 // returns, so the photograph shows both that the run completed and how many times it was offered.
 #define IOKIT_ENABLE_SHARED_PTR 1
@@ -122,6 +137,12 @@ static const uint32_t kBlockWords = kBlockBytes / 4;
 static const char kBSDNameKey[] = "BSD Name";
 static const char kBSDMajorKey[] = "BSD Major";
 static const char kBSDMinorKey[] = "BSD Minor";
+// Step 9's rename target. The prefix is what matters: bsd_init.c's bsd_rooted_ramdisk() compares only
+// the first strlen(RAMDEV) == 3 characters of rd= against "md0", while IOFindBSDRoot's memory-device
+// shortcut demands the name end after its third character (rdBootVar[3] == 0), so this string clears
+// the first test and fails the second -- rootauth gets skipped, the root still comes from the BSD-name
+// match, and the trailing s39 keeps naming the same slice the storage family named disk0s39.
+static const char kRootAlias[] = "md0s39";
 
 // The IOBSD publish notification is delivered on the persistent gIOResources service, whose
 // doServiceMatch re-invokes every still-matching gIOPublishNotification on each pass and ignores the
@@ -483,7 +504,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r120: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r121: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 // The mask's job is done: round115 showed that the names this file wants are taken by the tree
@@ -578,7 +599,7 @@ extern "C" void clover_block_run(void)
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    IOLog("CloverBlock r120: refire n=%u (already ran)\n", fires);
+    IOLog("CloverBlock r121: refire n=%u (already ran)\n", fires);
     return;
   }
 
@@ -718,8 +739,41 @@ extern "C" void clover_block_run(void)
     fail("map", 0);
   }
 
-  IOLog("CloverBlock r120: auto p=%u %s %u:%u bd=1 map=1 fires=%u\n", partitions,
-        bsdName->getCStringNoCopy(), bsdMajor->unsigned32BitValue(),
+  // 9. Hand the root a name the kernel mounts without a seal. Everything above was measured under the
+  // name the storage family wrote; this is the last thing the run does, and it is what round121 asks.
+  // bsd_rooted_ramdisk() (bsd_init.c:450) is the only gate between a mounted root and the exec of
+  // /sbin/launchd here: it is true when rd= begins with RAMDEV, "md0" (bsd_init.c:447), and for such a
+  // root bsd_init skips the FSIOC_KERNEL_ROOTAUTH block that round120 died in. The number the root
+  // gets is unaffected -- IOFindBSDRoot still takes its BSD-name branch (:888, the memory shortcut
+  // wants rdBootVar[3] == 0 at :849), still matches this media by the property written here, and still
+  // reads this media's own major and minor. The bytes stay eMMC's; only the authentication is bypassed.
+  // Snapshot the old name first: setProperty() replaces the registry value, and bsdName is a borrowed
+  // pointer into it.
+  char foundName[32];
+  strlcpy(foundName, bsdName->getCStringNoCopy(), sizeof(foundName));
+  if (!target->setProperty(kBSDNameKey, kRootAlias)) {
+    fail("alias", 0);
+  }
+  OSString *renamed = OSDynamicCast(OSString, property(target, kBSDNameKey));
+  if (!renamed || strcmp(renamed->getCStringNoCopy(), kRootAlias) != 0) {
+    fail("alias-read", 0);
+  }
+  // And that the name the root search will look for is the one a fresh dictionary matches, the same way
+  // step 6 checked the name it was given: waitForService releases the dictionary, so retain for it.
+  OSDictionary *aliasMatch = IOBSDNameMatching(kRootAlias);
+  IOService *aliasService = nullptr;
+  if (aliasMatch) {
+    mach_timespec_t oneSecond = { 1, 0 };
+    aliasMatch->retain();
+    aliasService = IOService::waitForService(aliasMatch, &oneSecond);
+    OSSafeReleaseNULL(aliasMatch);
+  }
+  if (aliasService != target) {
+    fail("alias-match", reinterpret_cast<uint64_t>(aliasService));
+  }
+
+  IOLog("CloverBlock r121: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
+        kRootAlias, bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
 }
 
