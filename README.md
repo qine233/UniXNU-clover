@@ -7521,6 +7521,32 @@ fastboot flash cache /Users/zhouzhou/clover-out/round127-payload.img  # 56 MiB�
 - `v=1` —— 通了，卷都出来了（等待会提前结束，`r=` 是它读过的块数）。
 - `r=`/`w=` —— 那 30 秒里存储栈经过这颗媒体读/写了多少块；全 0 说明 attach 之后根本没人来读。
 
+## round127 读数（v0.2.99 实机）：apfs 挂上了这颗媒体，一路发布出卷
+
+开机 **9.8 秒**，panic 屏第一行就是本轮要的那一句：
+
+```
+CloverBlock r127: apfs f=12320768 n=16384 m=1 l=0 d=7 s=1 c=1 v=1
+r=56 w=0 @CloverBlock.cpp:767
+```
+
+逐字段：
+
+- `f=12320768 n=16384` —— 卡自己报的表项 39 恰好是 round101 量到的那段，窗口闩上了，媒体**就是** logfs。
+- `m=1` —— `NXSB` 在 0x20。这一格最值钱：那次读是 `whole->open` + `IOMedia::read` 走的，不是本移植自己的 PIO，所以「媒体第 0 字节 → 卡 LBA 12320768 → 容器超级块」这条偏移链是端到端验过的。
+- `l=0` —— `OSKextLoadKextWithIdentifier("com.apple.filesystems.apfs")` 返回 `KERN_SUCCESS`。
+- `s=1 c=1 v=1` —— `Whole=Yes` 那条 personality 真的在**没有分区图的整媒体**上开了：容器方案 attach 上、容器对象解析了超级块、并且发布出了一个卷。Apple 自己的 apfs.kext 驱动了一块本移植做出来的盘。
+- `d=7` —— 媒体下面一共 7 个服务，三个是 apfs 的类，另外四个是 `IOMediaBSDClient` 这一路的常规乘客。
+- `r=56 w=0` —— 那 30 秒窗口里上面的栈经过这颗媒体读了 56×512 = 28 KiB，**一个字都没写**（挂载前的读阶段不需要写）。
+
+30 秒预算一秒都没花：`v=1` 让轮询在头几轮就短路退出，同帧 `ticks=0x127`=295 —— 按 round119 标定的 ≈282 tick/秒算约 1.0 秒，这是那个数字的第二次独立印证（一次 attach 全程 ≈1 秒，合理）。
+
+有一栏必须和 rounds 122-126 分开读：这一帧的 tty 段**全是零**（`state=0`、`low=hi=0`、`owner=0`、`OLOWAT no`、`used=nres=0`、`wr==rd=0xfffffffbbfda43a2`、`fl=0`、`wt` 的两个锁字节 0x38==0x38 自由）。原因不是「write 卡住了」也不是「console 废了」，而是**这次 panic 取在 EL1、EL0 还不存在、`kmopen` 从来没跑过**。所以它是那六个字段在开机 9.8 秒时的一个下界，不是写路径的第四次读数；顺带也说明屏上那些引导日志并不是从这颗 tty 出去的（控制台优先的内核直接画帧缓冲）。`pages=0x3af7e`/`free=0x3a222`（≈941/907 MiB）与 `irq=0x3ff phase=0 intid=0` 是同一帧的其余栏位，本轮不作结论。
+
+**这一格把 iOS 路线最关键的前提立住了**：块设备 → `IOBlockStorageDriver` → `IOMedia` → apfs.kext → 发布出卷，全通。问题从「能不能挂上这颗盘」变成「挂上之后能不能真的 mount 并读出文件字节」—— 下一格就在同一个探针里再走一步：拿 `measureApfsDepth` 已经找到的那个卷对象，向 vfs 要一次挂载，然后把容器里那颗 `MARKER.txt` 通过 vnode 读回来，读数照旧画在 panic 屏上。
+
+本轮不改代码，读数落盘；`v0.2.99` 的产物继续有效（`~/clover-out/round127-*`）。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

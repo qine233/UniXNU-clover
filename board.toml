@@ -1560,6 +1560,25 @@ kernel_args = [
   # boot has a reason to ask for a filesystem on a disk that only just appeared. `r=`/`w=` reset after
   # the probe's own read, so they are the stack above this device talking, and `w=` also says whether
   # APFS wanted to write its container. The pass line is `v=1`.
+  # Round127's photograph came back a pass on every field this design asked for:
+  # "CloverBlock r127: apfs f=12320768 n=16384 m=1 l=0 d=7 s=1 c=1 v=1 r=56 w=0 @CloverBlock.cpp:767".
+  # f/n are the extent itself, so this boot's card reported entry 39 as logfs and the media really was
+  # the partition; m=1 says NXSB sat at 0x20 in a block read *through IOMedia*, which is the window's
+  # offset arithmetic proven end to end (media byte 0 -> card LBA 12320768 -> the container); l=0 is
+  # KERN_SUCCESS for the kext; and s/c/v together say the Whole=Yes personality fired, the container was
+  # parsed and a volume was published -- Apple's own apfs.kext drove a disk this port made. d=7 counts
+  # every service under the media, so four came alongside the three APFS classes (IOMediaBSDClient and
+  # friends). r=56 is the 28 KiB the stack above read, w=0 that it wrote nothing.
+  # The 30 s budget was never spent: `v=1` short-circuits the poll and the frame reads ticks=0x127 (295,
+  # about a second at round119's ~282 ticks/s -- a second, independent confirmation of that number) under
+  # boot-log timestamps of 9.81 s. One field must be kept apart from rounds 122-126: this frame's tty
+  # block is all zeros (state=0, low=hi=0, owner=0, OLOWAT no, used=nres=0, wr==rd) because the panic is
+  # taken in EL1 while EL0 does not exist yet and kmopen has never run. It is a lower bound on those six
+  # fields at 9.8 s, not a fourth reading of the write path -- and it says the boot log on the panel does
+  # not come through that tty at all, which is what a console-first kernel is for.
+  # So the open question is no longer whether APFS can be driven from this card. It is whether anything
+  # can *mount* what this published: the next probe takes the volume object this walk already finds, asks
+  # the vfs for a mount, and reads MARKER.txt back through a vnode.
   "clover-apfs=1",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
