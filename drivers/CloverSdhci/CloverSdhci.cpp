@@ -214,6 +214,10 @@ char clover_emmc_report[512];
 volatile uint32_t clover_emmc_stage = 0;
 }
 
+// One 512-byte PIO block at a time, in BSS rather than on a kernel stack: mode 14 reads the GPT
+// entry array block by block and inspects each entry before issuing the next command.
+static uint32_t gEntryBlock[128];
+
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
 static uintptr_t gHost = 0;
@@ -820,6 +824,80 @@ static bool waitCommandSlot (void)
   return waitCommandSlot (false);
 }
 
+// One whole 512-byte block, read the way mode 12's drain proved works: CMD17 with the block
+// count enabled and the card's own addressing, then one FIFO word per counter gap and a final
+// level-gated sweep for whatever DATA_END raced with. Mode 14 uses this to walk the GPT entry
+// array block by block; the first block (LBA 1) keeps its own inline path, so the sequence that
+// round99 proved is not disturbed. `status` is the INT_STATUS group the data phase ended on,
+// `wordCount` how many words were stored, and the return value is true only for a clean command
+// response, DATA_END and all 128 words.
+static bool readPioBlock (uint32_t lba, uint32_t *words, uint32_t &wordCount,
+                          uint32_t &status)
+{
+  wordCount = 0;
+  status = 0;
+  if (!waitCommandSlot ()) {
+    return false;
+  }
+  write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
+  write16 (SDHCI_BLOCK_SIZE, 512);
+  write16 (SDHCI_BLOCK_COUNT, 1);
+  write32 (SDHCI_INT_STATUS, 0xffffffffu);
+  write32 (SDHCI_ARGUMENT, lba);
+  write16 (SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN);
+  write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (17, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                          SDHCI_CMD_INDEX | SDHCI_CMD_DATA));
+  uint32_t spins = 0;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & SDHCI_INT_CMD_MASK) {
+      break;
+    }
+    if (++spins >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  if (!(status & SDHCI_INT_RESPONSE) ||
+      (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+    return false;
+  }
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint64_t gap = frequency / 6250ULL;        // 160 us, mode 12's pace
+  const uint64_t deadline = frequency / 5ULL;      // 200 ms
+  const uint64_t start = readCounter ();
+  uint64_t lastRead = start;
+  bool haveWord = false;
+  uint32_t guard = 0;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & (SDHCI_INT_DATA_END | SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
+                  SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR)) {
+      break;
+    }
+    uint64_t now = readCounter ();
+    if (now - start > deadline) {
+      break;
+    }
+    if (wordCount < kBlockWords && (!haveWord || now - lastRead >= gap) &&
+        (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
+      words[wordCount++] = read32 (SDHCI_BUFFER);
+      haveWord = true;
+      lastRead = now;
+    }
+    if (++guard >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  while (wordCount < kBlockWords &&
+         (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
+    words[wordCount++] = read32 (SDHCI_BUFFER);
+  }
+  return (status & SDHCI_INT_DATA_END) && wordCount == kBlockWords;
+}
+
 // Returns the command group of INT_STATUS. `sent` is false when the register was never written,
 // which is a host verdict, not a card one. The response words are read even after an error: a CRC
 // error still leaves the bits that arrived in the register, and that is evidence.
@@ -1392,6 +1470,14 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   uint32_t distinct12 = 0, firstUs12 = 0, lastUs12 = 0;
   uint32_t word6_12 = 0, word18_12 = 0, word20_12 = 0, word21_12 = 0;
 
+  // Mode 14: the header's entry-array pointer, count and size drive a walk over the entry blocks,
+  // and the partition whose name is exactly "logfs" is reported by its GPT index and extent.
+  uint32_t entryEl14 = 0, entryEn14 = 0, entryEs14 = 0;
+  uint32_t entryBlocks14 = 0, entryFail14 = 0, entryGot14 = 0;
+  uint32_t entryFound14 = 0, entryFirst14 = 0, entryLast14 = 0;
+  uint32_t entryType14 = 0, entryTypeB14 = 0;
+  bool entryOk14 = false, entryBad14 = false;
+
   bool cmd2Ok = false;
   if (probeMode == 0) {
     if (ready) {
@@ -1911,6 +1997,58 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                                            afterRsp11b, spinsAfter11);
           verdictAfter11 = probeVerdict (afterStatus11, sentAfter11);
         }
+        // Mode 14: the header just read says where the entry array is (`el`), how many entries
+        // (`en`) and how large each one is (`es`). Walk those blocks with the same paced PIO and
+        // report the GPT index and extent of the partition whose name is exactly "logfs" -- the
+        // one this board's firmware calls LOGFS and Linux exposes as mmcblk0p39. Its extent is
+        // independently known from sysfs (start 12320768, 16384 sectors), so the reading can be
+        // checked against a source that did not come through this driver.
+        if (probeMode >= 14 && (readStatus11 & SDHCI_INT_DATA_END) && drained11) {
+          entryEl14 = word18_12;
+          entryEn14 = word20_12;
+          entryEs14 = word21_12;
+          if (entryEl14 == 0 || entryEn14 == 0 || entryEs14 < 128 || entryEs14 > 512 ||
+              (entryEs14 % 4) != 0 || (512 % entryEs14) != 0) {
+            entryBad14 = true;
+          } else {
+            const uint32_t perBlock = 512 / entryEs14;
+            const uint32_t entryWords = entryEs14 / 4;
+            uint32_t blocks = (entryEn14 + perBlock - 1) / perBlock;
+            if (blocks > 16) {
+              blocks = 16;
+            }
+            entryOk14 = true;
+            for (uint32_t b = 0; b < blocks; b++) {
+              uint32_t got = 0;
+              uint32_t st = 0;
+              bool blockOk = readPioBlock (entryEl14 + b, gEntryBlock, got, st);
+              entryBlocks14 = b + 1;
+              if (!blockOk) {
+                entryOk14 = false;
+                entryFail14 = st;
+                entryGot14 = got;
+                break;
+              }
+              for (uint32_t e = 0; e < perBlock && (b * perBlock + e) < entryEn14; e++) {
+                const uint32_t *entry = &gEntryBlock[e * entryWords];
+                // Name is UTF-16LE at byte 56: "logfs" plus its terminator is exactly words
+                // 14..16 of a 128-byte entry. Matching the terminator too keeps "logfsx" out.
+                if (entryWords >= 17 && entry[14] == 0x6f6cu && entry[15] == 0x6667u &&
+                    entry[16] == 0x0073u) {
+                  entryFound14 = b * perBlock + e + 1;   // 1-based, the way the kernel names it
+                  entryFirst14 = entry[8];
+                  entryLast14 = entry[10];
+                  entryType14 = entry[0];
+                  entryTypeB14 = ((entry[1] & 0xffffu) << 16) | (entry[2] & 0xffffu);
+                  break;
+                }
+              }
+              if (entryFound14) {
+                break;
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -2361,36 +2499,80 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
           emitText (" ");
           emitHex (read16 (SDHCI_HOST_CONTROL2), 4);
         }
-        emitText ("\ndt f=");
-        emitDec (firstUs12);
-        emitText (" l=");
-        emitDec (lastUs12);
-        emitText (" nw=");
-        emitDec (drainWords11);
-        emitText (" nd=");
-        emitDec (distinct12);
-        emitText ("\nps a=");
-        emitHex (psCmd11, 8);
-        emitText (" e=");
-        emitHex (psEnd11, 8);
-        emitText (" clk=");
-        emitHex (read16 (SDHCI_CLOCK_CONTROL), 4);
-        emitText ("\nhdr ");
-        emitHex (hdr11a, 8);
-        emitText (" ");
-        emitHex (hdr11b, 8);
-        emitText (" sm=");
-        emitHex (drainSum11, 8);
-        emitText ("\ngpt lba=");
-        emitDec (word6_12);
-        emitText (" el=");
-        emitDec (word18_12);
-        emitText (" en=");
-        emitDec (word20_12);
-        emitText (" es=");
-        emitDec (word21_12);
-        emitText ("\nefi ");
-        emitDec (drained11 && hdr11a == 0x20494645u && hdr11b == 0x54524150u ? 1 : 0);
+        if (probeMode >= 14) {
+          // Mode 14 replaces the timing/header lines with the scan's own readings. `sc` carries
+          // the three header fields the walk used and how many entry blocks were read, `lg` the
+          // matching index (0 = no entry is named logfs) and its LBA extent, `ty` the type GUID
+          // as the first 32-bit field plus fields 2-3. `efi` stays as the header regression.
+          emitText ("\nsc el=");
+          emitDec (entryEl14);
+          emitText (" en=");
+          emitDec (entryEn14);
+          emitText (" es=");
+          emitDec (entryEs14);
+          emitText (" b=");
+          emitDec (entryBlocks14);
+          emitText (" ok=");
+          emitDec (entryOk14 ? 1 : 0);
+          if (entryBad14) {
+            emitText (" hd=1");
+          }
+          if (!entryOk14) {
+            emitText (" st=");
+            emitHex (entryFail14, 8);
+            emitText (" w=");
+            emitDec (entryGot14);
+          }
+          emitText ("\nlg i=");
+          emitDec (entryFound14);
+          if (entryFound14) {
+            emitText (" a=");
+            emitDec (entryFirst14);
+            emitText (" b=");
+            emitDec (entryLast14);
+            emitText ("\nty ");
+            emitHex (entryType14, 8);
+            emitText (" ");
+            emitHex (entryTypeB14, 8);
+          }
+          emitText ("\nps e=");
+          emitHex (psEnd11, 8);
+          emitText (" clk=");
+          emitHex (read16 (SDHCI_CLOCK_CONTROL), 4);
+          emitText ("\nefi ");
+          emitDec (drained11 && hdr11a == 0x20494645u && hdr11b == 0x54524150u ? 1 : 0);
+        } else {
+          emitText ("\ndt f=");
+          emitDec (firstUs12);
+          emitText (" l=");
+          emitDec (lastUs12);
+          emitText (" nw=");
+          emitDec (drainWords11);
+          emitText (" nd=");
+          emitDec (distinct12);
+          emitText ("\nps a=");
+          emitHex (psCmd11, 8);
+          emitText (" e=");
+          emitHex (psEnd11, 8);
+          emitText (" clk=");
+          emitHex (read16 (SDHCI_CLOCK_CONTROL), 4);
+          emitText ("\nhdr ");
+          emitHex (hdr11a, 8);
+          emitText (" ");
+          emitHex (hdr11b, 8);
+          emitText (" sm=");
+          emitHex (drainSum11, 8);
+          emitText ("\ngpt lba=");
+          emitDec (word6_12);
+          emitText (" el=");
+          emitDec (word18_12);
+          emitText (" en=");
+          emitDec (word20_12);
+          emitText (" es=");
+          emitDec (word21_12);
+          emitText ("\nefi ");
+          emitDec (drained11 && hdr11a == 0x20494645u && hdr11b == 0x54524150u ? 1 : 0);
+        }
       } else {
         emitText ("\nev nc=");
         emitDec (spinsCmd11);
@@ -2636,7 +2818,8 @@ extern "C" void clover_emmc_run (void)
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
   // the storage instrument it was asked for.
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
-      mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12 && mode != 13) {
+      mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12 && mode != 13 &&
+      mode != 14) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -2657,7 +2840,7 @@ extern "C" void clover_emmc_run (void)
     if (!gGcc) {
       emmcFail (4, kGccPhys);
     }
-    coldBringUp (mode == 5, (mode >= 7 && mode <= 13) ? mode : 0);
+    coldBringUp (mode == 5, (mode >= 7 && mode <= 14) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.

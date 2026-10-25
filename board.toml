@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: LBA 1, on the SDHCI FIFO instead of the alternate one"
+title = "clover emmc: the GPT entry array, looking for logfs"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1176,7 +1176,21 @@ kernel_args = [
   # unchanged. "v3 <before> <after>" replaces "hc" (which has not moved since round92) and shows
   # the low 16 bits around the write; "c17 ok" + "nd=127" + "efi 1" => the SDHCI FIFO was the
   # whole difference; nd=0 again => the port stays the question and the next round is ADMA.
-  "clover-emmc=13",
+  # Round99's photograph closed the FIFO question: "v3 6440 6040" (bit 10 cleared),
+  # "c17 ok int=00000003" (RESPONSE|DATA_END, no CMD12 needed), "dt f=10416 l=30748 nw=128
+  # nd=23", "hdr 20494645 54524150", "gpt lba=1 el=2 en=64 es=128", "efi 1". The whole block
+  # arrived through the SDHCI FIFO; 23 distinct words is exactly the 92-byte header followed by
+  # zeros. Mode 14 asks the next question: can this driver find the partition the firmware calls
+  # LOGFS and Linux mounts as mmcblk0p39? It reads the entry array from the header's el/en/es
+  # (LBA 2, 64 entries of 128 bytes = 16 blocks), block by block through the same paced PIO,
+  # and matches the UTF-16LE name "logfs" including its terminator. "sc" names the fields the
+  # walk used, the blocks read and whether every block ended cleanly; "lg i=" is the GPT index
+  # (1-based, 0 = nothing matched) with the entry's first/last LBA; "ty" is the type GUID's
+  # first field plus fields 2-3; "efi" stays as the header regression. sysfs says logfs starts
+  # at 12320768 and is 16384 sectors long, so "lg i=39 a=12320768 b=12337151" would be an
+  # independent confirmation; a clean scan with "i=0" means the name is not where the header
+  # points, and "ok=0" names the block that failed.
+  "clover-emmc=14",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

@@ -4441,6 +4441,117 @@ fastboot reboot
 
 **拍一张就够。**
 
+## round99 读数：清掉备用 FIFO 之后，整块 LBA 1 一次到齐
+
+照片（相机转了 90°，`sips -r -90` 之后读到的就是下面这个顺序；末尾
+`@CloverSdhci.cpp:2667` 是 panic 调用点）：
+
+```text
+g cfg=00002017 m=01 n=fc d=fb up=1 br=00004221 ab=20008001
+h clk=0007 rst=1 clr=0002 pw=0b
+c0 ok c1 ok t=3 to=0 rsp=c0ff8080
+c2 ok int=00000001
+c3 ok st=2
+c7 ok int=00000001
+c13 ok st=4
+c16 ok int=00000001 r=00000900
+c17 ok int=00000003 ar=1 tm=12
+v3 6440 6040
+dt f=10416 l=30748 nw=128 nd=23
+ps a=01f802f6 e=01f800f0 clk=0007
+hdr 20494645 54524150 sm=e853917c
+gpt lba=1 el=2 en=64 es=128
+efi 1
+```
+
+这一张把三件事同时钉住：
+
+1. **备用 FIFO 选择位就是 round98 的堵点。** `v3 6440 6040`：写前低 16 位是
+   `0x6440`（bit 10 = `CORE_FIFO_ALT_EN` 置位，和 round87 读到的 `02626440` 的低半
+   一致），写后是 `0x6040`，位清掉、别的一个都没动。写进去之后端口立刻开始前进。
+2. **数据阶段自己走完了。** `c17 ok int=00000003` = RESPONSE|DATA_END，所以这次没有
+   `c12`/`c13b`（那条只在 DATA_END 不来时才发）。`dt f=10416` 是第一个字到达的时刻，
+   和 400 kHz 单线下 512 字节的 10.24 ms 对得上；`dt l=30748` 约等于 128 × 160 µs 加
+   10 ms，读数侧没有比卡快。`nd=23`：92 字节的 GPT 头后面全是零，正好在这个形状里。
+3. **主机认得出这张表。** `hdr 20494645 54524150` = `"EFI PART"`，`gpt lba=1 el=2
+   en=64 es=128`：当前 LBA 1、表项数组从 LBA 2 开始、64 项、每项 128 字节。
+   `efi 1`。`ps a=01f802f6` 的 bit11 在命令刚发完时还是 0（缓冲区空），
+   `ps e=01f800f0` 是整块读完之后的数据机状态，`clk=0007` 说明读的过程中卡钟没停。
+
+到此为止 eMMC 的读通路不再有未知项。下一件事不是再证明它能读，而是用它读一张
+有名字的表：GPT 表项数组里应该有一个 `logfs`，固件把它叫作 `LOGFS:`，Linux 把它
+暴露成 `mmcblk0p39`（sysfs：`start=12320768`、`size=16384` 个 512 字节扇区，
+即首 LBA 12320768、末 LBA 12337151）。
+
+## v0.2.72（round100）：读 GPT 表项数组，按名字找 logfs
+
+mode 14 = mode 13 的整条链，在 LBA 1 读完之后多走一段：
+
+1. 用刚读到的头字段决定表项在哪里：`el`（表项数组首 LBA，2）、`en`（项数，64）、
+   `es`（每项字节数，128）。每个 512 字节块装 `512/es` 项，一共要读
+   `ceil(en/(512/es))` 块；上限 16 块，正好覆盖 64 项 × 128 字节。
+2. 每块都走同一套 PIO：CMD17、`TRANSFER_MODE=0x12`、`CNTVCT_EL0` 的 160 µs 节奏、
+   每块 200 ms 期限、DATA_END 之后再按电平位补排空。这条路径就是 round99 证明过的那条，
+   只是循环了十次。第一块仍然是 LBA 1 自己的内联路径，没有改成通用函数。
+3. 对每一项，名字在偏移 56 的 UTF-16LE：`"logfs"` 加结尾零正好是 128 字节表项里的
+   word 14/15/16（`0x6f6c`、`0x6667`、`0x0073`）。连结尾零一起比，
+   `logfsx` 这类名字不会误中。
+4. 报告换成扫描自己的读数：
+   - `sc el= en= es= b= ok=`：表项数组的位置、项数、项大小、实际读了几块、每块是否
+     都干净地 DATA_END 且收满 128 字。头部字段不可用时另有 `hd=1`；某块失败时补
+     `st=<INT_STATUS> w=<该块收到几个字>`。
+   - `lg i= a= b=`：命中的 GPT 序号（1 起，0 = 没找到）、该项的首 LBA 与末 LBA。
+   - `ty <word0> <fields 2-3>`：类型 GUID 的第一个 32 位字与第二、三字段的合并值，
+     用来确认它是不是 Linux 文件系统类型（`0FC63DAF-8483-4772-8E79-3D69D8477DE4`
+     在盘上读成 `0fc63daf` / `47728483`）。
+   - `ps e=` 与 `clk=` 保留，`efi` 保留为 LBA 1 的回归；`dt`/`ps a`/`hdr`/`gpt lba`
+     在 mode 14 里省掉，`gpt` 的三个字段已经在 `sc` 里。
+5. `v3` 仍然打印，清位这一步在 mode 14 也照做。
+
+报告最坏约 440 字节，仍在 511 字节以内（`emitByte` 在上限处会丢字符，所以留了余量）。
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `sc … ok=1` + `lg i=39 a=12320768 b=12337151` | 名字找到了，范围与 sysfs 独立吻合 | 往 logfs 首块写一段日志再读回 |
+| `sc … ok=1` + `lg i=0` | 十块都读干净，但没有这一项叫 `logfs` | 先按 `ty` 与相邻项的名字校准，再决定写哪里 |
+| `lg i=` 不是 39 但 `a=12320768` | 名字对、编号假设错（GPT 有空项） | 以 `a/b` 为准，不动 Linux 的编号 |
+| `sc … ok=0 st=… w=…` | 某一块没读完，`st`/`w` 指到那一块 | 对照 round99 的 `int=00000003`，查块号与数据机 |
+| `sc … hd=1` | 头字段不是 2/64/128，LBA 1 的回归坏了 | 回到 mode 13 看 `gpt`/`efi` |
+| `sc … b=` 小于 10 且 `i=0` | 扫描被 16 块上限或 `en` 截断 | 用 `el/en/es` 重算块数 |
+| `efi 0` | LBA 1 不再是 GPT 头 | 先修 round99 这条读通路 |
+
+产物（内核变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round100-payload.img` | 58720256 B | `9f490ddf540e3ae86a2ad1624345abff0f5da75e04ed5ec742035e2dbb8c7cd4` |
+| `round100-kernel.macho`（构建产物） | 51949568 B | `61f47bb47f9b9cc901b40951688cd49906fc0f071f62b722e52bfef4759a47b7` |
+| `round100-in-volume-kernel.macho`（卷内副本） | 51949568 B | `aae92753b50c87a10ef296a090e56695f32914fd9da02028f88d578b78d52ae6` |
+| `round100-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round100-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round100-kernel.macho.adt` | 13476 B | `787e27233760b4a1884b9e4e75a2eda8fc96f46474139806fff5b92f6af7a05f` |
+| `round100-unixnu.toml` | 566 B | `24b620712f7ee18ce996bad9cbf54f622077d82adfce9eb479349f1541a25cae` |
+
+校验器：探针 35 处 5960 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在。
+反汇编 `__ZL11coldBringUpbj`：mode 13/14 共用的清位门仍是 `cmp w1,#0xd; b.lo`
+（对象 `0xa50c`），随后 `and w10,w9,#0xfffffbff`、`str w10,[x11,#0x250]`；
+扫描循环在对象 `0x1ab3c` 调 `__ZL12readPioBlockjPjRjS0_`（内核里
+`0xfffffff00798ccdc`），名字比较的三条立即数是 `0x6f6c`/`0x6667`/`0x73`；
+报告侧按顺序能找到逐字符写出的 `\nsc el=`、`\nlg i=`、`\nty `、`\nps e=`、`\nefi `。
+`readPioBlock` 用 `CNTFRQ/6250`（160 µs）与 `CNTFRQ/5`（200 ms），结尾再按
+`PRESENT_STATE[11]` 补满，和 mode 12 的排空策略一致。卷内 boot-args 末尾是
+`… clover-pmgr=2 clover-emmc=14 armcpu-clock-panic=60000`。
+boot 仍是 `round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round100-payload.img
+fastboot reboot
+```
+
+**拍一张就够。**
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -4460,7 +4571,8 @@ fastboot reboot
   使能、并按 OCR bit 30 改用扇区号，`v0.2.70` 起用 `CNTVCT_EL0` 把 FIFO 读速降到卡的节奏以下
   （round97 的 128 次读全是同一个字：主机比卡快了一个数量级），并把 GPT 头的四个字段解出来，
   `v0.2.71` 起在传输前清掉 `VENDOR_SPEC3` 的备用 FIFO 选择位（round98 证明节奏已经对了，
-  是端口本身不前进），
+  是端口本身不前进），`v0.2.72` 起按 GPT 头的 `el/en/es` 逐块读表项数组、按 UTF-16LE 名字
+  找 `logfs` 并报出它的序号与首末 LBA，
   仍然不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令、数据阶段能不能自己走完」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
