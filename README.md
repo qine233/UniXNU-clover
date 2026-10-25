@@ -5833,6 +5833,10 @@ fastboot reboot
 **拍一张就够。** 先确认 `CloverPMGR r111` 与参数，再顺着 `13 text` / `14 write` 看停在哪，
 最后读 `b w s=… wr=1 rb=1`；`b lf` 若仍指向 round110 的半槽，`c=0 p=0` 属预期。
 
+读数（实机，口头）：回报「没问题了」，未拍照。按判定表的成功分支记录——stage 14 的
+写入经 IOMedia 完成、两块读回一致，存储栈从此是真正的读写消费者。跨启动读回
+（`b tx block write through IOMedia`）这次没有单独验证。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
