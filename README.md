@@ -5937,6 +5937,103 @@ fastboot reboot
 **一次刷机只回答一个问题：GPT 发布和根设备发现是否由 XNU 自己走通。** 成功行出现后，
 本轮结论就成立；下一轮才把 `rd=` 从 `md0` 换成这个 BSD 名。
 
+## v0.2.85（round113）：分区方案先 attach 再 probe
+
+round112 的照片是 `Kernel data abort.`，pc `0xfffffff0049754ec`、lr `0xfffffff0049754e8`，
+两个地址都落在 `IOStorageFamily` 的 `IOGUIDPartitionScheme::scan()` 里。把反汇编对到源码：
+
+```cpp
+IOMedia *media = getProvider();               // ldr x8,[x0]; ldr x8,[x8,#0x370]; blr x8
+UInt64 mediaBlockSize = media->getPreferredBlockSize();   // ← 这里取到了 NULL
+```
+
+`getProvider()` 返回 `NULL`，`scan()` 没有检查就继续取块大小，所以是零地址数据异常
+（`far=0`、`x22=0` 与照片一致）。原因不在存储栈，而在调用顺序：round112 对一个**从未
+attach 过**的 scheme 直接调了 `probe()`。`IOService::probeCandidates()` 的顺序是
+alloc → init → **attach** → probe → detach，`startCandidate()` 在 start 前还会再 attach
+一次；`getProvider()` 读的就是 attach 时挂在 service plane 上的那层父子关系。少了这一步，
+probe 里的 `scan()` 看不到整盘媒体。
+
+round113 只补顺序，不改后面任何一步：
+
+1. `scheme->init(nullptr)` 之后先 `scheme->attach(whole)`，失败即 `gpt-attach`。
+2. 再 `probe()` / `start()`；对象在 `start()` 期间保持 attach，与 `startCandidate()` 一致。
+3. 其余链路（找 `Partition ID 39`、整盘与目标分区各起 `IOMediaBSDClient`、读 BSD 属性、
+   `IOBSDNameMatching` + `waitForService` 找根设备、`bdevvp(major << 24 | minor)`、
+   整盘 `base` 处与分区 0 处的 512 字节比较）与 round112 相同。
+
+boot 仍是 `rd=md0`，不写任何分区。成功时仍是一行，随后继续引导到 EL0：
+
+```text
+CloverPMGR r113: args [-v serial=3 debug=0x14e kt_fixed_zones=120 boot-progress=2
+ rd=md0 allow_legacy_mach_msg=1 armcpu-timer-intid=19 clover-pmgr=2 clover-emmc=21
+ armcpu-clock-panic=60000]
+...
+CloverBlock r113: p=<n> disk0s39 <maj>:<min> bd=1 map=1
+...
+initproc failed to start ...
+```
+
+失败一律 panic，一行一段，格式 `CloverBlock r113: <step> <value>`：
+
+| 停在哪 | 含义 |
+| --- | --- |
+| `ready` / `storage` / `abi` | PIO 未就绪、`IOStorageFamily` 未加载、类大小不是 0x90 |
+| `modload` / `postload` | 自己的 metaclass 没注册上 |
+| `device` / `attach` / `driver` / `media` | 设备、驱动或整盘 IOMedia 没起来 |
+| `gpt` / `gpt-attach` | scheme 没分配到；或 attach 到整盘失败 |
+| `gpt-probe <score>` / `gpt-start` | 已 attach 但没认出 GPT、或没启动 |
+| `gpt-children` / `gpt-target <n>` | 没有子节点；或 `n` 个分区里没有 `Partition ID 39` |
+| `bsd-whole` / `bsd-root` | BSD 客户端在整盘或目标分区上没启动 |
+| `bsd-props` | 目标分区缺 `BSD Name` / `BSD Major` / `BSD Minor` |
+| `root-match <ptr>` | `IOBSDNameMatching` + `waitForService` 没返回目标分区 |
+| `bdevvp <err>` | `dev_t` 打不开，返回 XNU 的 errno |
+| `buffer` / `open-whole` / `read-whole` / `open-part` / `read-part` | 缓冲区或读路径失败，值为 IOReturn |
+| `map` | 整盘 `base` 处与分区 0 处的内容不同 |
+| 没有 `CloverPMGR r113` | 固件启动的不是这份 payload |
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| 成功行 + 走到 `initproc failed to start` | attach 顺序对了，`scan()` 读到整盘媒体；GPT 发布、BSD 命名、根设备发现、`bdevvp`、偏移映射全部由 XNU 自己走通 | 把 `rd=` 指向这个 BSD 名做真正的根挂载 |
+| 仍是 `Kernel data abort`，pc 在 `IOGUIDPartitionScheme` | attach 没生效，`getProvider()` 仍为空 | 核对 `attach()` 的 provider 是否为 scheme 将要使用的那个整盘对象 |
+| 停在 `gpt-attach` | 对象拒绝 attach 到整盘 | 查整盘 `IOMedia` 是否已 `registerService` 且在同一 plane |
+| 停在 `gpt-probe`，`score` 为 0 | scheme 能拿到媒体但没接受整盘（GPT 读不到或 `isFormatted` 不成立） | 用已知 LBA 核对整盘媒体大小与读路径 |
+| `gpt-target <n>`，`n>0` | scheme 能读表，但没有 39 号分区 | 核对读到的是哪一份 GPT |
+| `bsd-props` / `root-match 0` / `bdevvp <err>` | 命名或 `bdevsw` 登记失败 | 按 step 名回看 `IOMediaBSDClient::start` |
+| `map` | 分区偏移映射不一致 | 查 `getBase()` 与 PIO 的 LBA 换算 |
+| 停在更早的步骤 | 存储栈出现回归 | 按 step 名回看该阶段 |
+
+产物（内核与 payload 变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round113-payload.img` | 58720256 B | `904235f7fe323ac5e6d463aa61033cd2a7c755a7cabed5b8884f2db4a0960a50` |
+| `round113-kernel.macho`（构建产物） | 51974144 B | `2d6587c1356d182c2eaae6f7759072045e7a0743e2d44a4c63f847dcf0382d00` |
+| `round113-in-volume-kernel.macho`（卷内副本） | 51974144 B | `e4472e8aca238436358c29971b1b974177dac30197304247f9ddfa092f9d5165` |
+| `round113-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round113-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round113-kernel.macho.adt` | 13476 B | `35b5b94ec009db29c8e4c2aa076ad0fd6b15ed2ef95afccf45b4e61f0feec788` |
+| `round113-unixnu.toml` | 567 B | `a90aca6f64ad7b692bfbec586f7ab5c69d5c312ec38ea73e4ad4c645f06ac05d` |
+
+校验器：`check-clover.py` 通过（ADT 13476 字节、8 核、splash `0x9d400000-0x9f800000`、
+FD `0x9fc00000-0x9ff00000`、`clover_defconfig`、`CLOVERESP`、模块可见）。卷内 boot-args
+末尾仍是 `… clover-pmgr=2 clover-emmc=21 armcpu-clock-panic=60000`。两条 r113 字符串都在
+卷内内核里：`CloverPMGR r113: args [%s]`、`CloverBlock r113: p=%u %s %u:%u bd=1 map=1`。
+
+内核符号：`_sheng_pmgr_run` `0xfffffff007971274`、`_clover_emmc_block_write`
+`0xfffffff007971a30`、`_clover_emmc_run` `0xfffffff00797231c`、`_clover_block_run`
+`0xfffffff007992054`。boot 仍是 `round87-boot.img`（`196b284f…`）。
+
+```sh
+fastboot flash cache ~/clover-out/round113-payload.img
+fastboot reboot
+```
+
+**一次刷机只回答一个问题：补上 attach 之后，`IOGUIDPartitionScheme::scan()` 能不能看到整盘。**
+看到成功行，根设备这条链就由 XNU 自己闭合了；下一轮才把 `rd=` 从 `md0` 换成这个 BSD 名。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

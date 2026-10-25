@@ -151,7 +151,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: publish GPT partitions and find logfs as a BSD disk"
+title = "clover emmc: attach the GPT scheme before probing it"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1327,8 +1327,13 @@ kernel_args = [
   # then repeats setconf()'s rd= discovery: IOBSDNameMatching + waitForService must return the
   # partition, bdevvp(major << 24 | minor) must open it, and a block read at the partition's
   # base through the whole media must equal the same block read at zero through the partition.
-  # One line on success, "CloverBlock r112: p=<n> disk0s39 <maj>:<min> bd=1 map=1"; every
-  # failure panics as "CloverBlock r112: <step> <value>". boot stays rd=md0 and nothing is
+  # Round112's photograph was a data abort inside IOStorageFamily at pc 0xfffffff0049754ec:
+  # getProvider() returned null and scan() dereferenced it. The scheme had never been attached;
+  # IOService::probeCandidates attaches before probing, and this file had called probe() first.
+  # Round113 attaches the scheme before probe(), keeps it attached for start, and adds "gpt-attach"
+  # as a failure step.
+  # One line on success, "CloverBlock r113: p=<n> disk0s39 <maj>:<min> bd=1 map=1"; every
+  # failure panics as "CloverBlock r113: <step> <value>". boot stays rd=md0 and nothing is
   # written to logfs.
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the

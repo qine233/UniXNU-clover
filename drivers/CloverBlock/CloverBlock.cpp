@@ -21,7 +21,12 @@
 // destructor (IOBlockStorageDevice's are not exported either) are aliased by name to IOService's
 // in scripts/build-clover-block.py, where that alias is audited together with every import.
 //
-// A failure panics with one short CloverBlock r112 line naming the step; success prints one line
+// A hand-driven service still has to see the same attach/probe/start order IOService::probeCandidates
+// uses: IOGUIDPartitionScheme::scan() starts with getProvider() and dereferences it, so probe() on
+// an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
+// attached for start (startCandidate() attaches again after the matching loop's detach).
+//
+// A failure panics with one short CloverBlock r113 line naming the step; success prints one line
 // and lets the boot continue, because there is nothing left to photograph.
 #define IOKIT_ENABLE_SHARED_PTR 1
 #include <IOKit/IOLib.h>
@@ -413,7 +418,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r112: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r113: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 struct MediaOp {
@@ -530,11 +535,16 @@ extern "C" void clover_block_run(void)
   if (!scheme || !scheme->init(nullptr)) {
     fail("gpt", 0);
   }
+  // probeCandidates() attaches a candidate before probe(), and scan() starts with
+  // getProvider() without checking it, so an unattached probe faults on a null media.
+  if (!scheme->attach(whole)) {
+    fail("gpt-attach", 0);
+  }
   SInt32 score = 0;
   if (!scheme->probe(whole, &score)) {
     fail("gpt-probe", static_cast<uint32_t>(score));
   }
-  if (!scheme->attach(whole) || !scheme->start(whole)) {
+  if (!scheme->start(whole)) {
     fail("gpt-start", 0);
   }
 
@@ -630,7 +640,7 @@ extern "C" void clover_block_run(void)
     fail("map", 0);
   }
 
-  IOLog("CloverBlock r112: p=%u %s %u:%u bd=1 map=1\n", partitions,
+  IOLog("CloverBlock r113: p=%u %s %u:%u bd=1 map=1\n", partitions,
         bsdName->getCStringNoCopy(), bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue());
 }
