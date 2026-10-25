@@ -150,7 +150,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover emmc: LBA 1, block count enabled"
+title = "clover emmc: LBA 1, drained at the card's pace"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1148,10 +1148,24 @@ kernel_args = [
   # the card block-addressed, so LBA 1 is argument 1, not 512 (ds-mmc.c:2092, ds-block.c:1661).
   # Mode 11 applies both, drains only while PRESENT_STATE's live FIFO level says so, prints the
   # word count and sum ("nw="/"sm="), and asks CMD12 then CMD13 if DATA_END still does not arrive.
-  # "c17 ok" + "efi 1" => the GPT is readable; "c17 ok" + "efi 0" => the data path works and the
-  # bytes are elsewhere; "c17 dto/dcrc/dend" => the data phase itself is the question; "c17
-  # nodata" with "nw=0" => the card still sends nothing, and c12/c13b say what state it is in.
-  "clover-emmc=11",
+  # Round97's photograph: c16 ok, "c17 nodata int=00000021 ar=1 tm=12" -- but the first word was
+  # 0x20494645, "EFI ", and sm=24a32280 is exactly 128 times it, so all 128 reads returned the
+  # same word. PRESENT_STATE went 01f802f6 (level clear, no data yet) -> 01f80af6 (level still
+  # set); CMD12 timed out (00018000) and CMD13 said st=4 with READY_FOR_DATA, i.e. the card
+  # finished the block. The loop read faster than the card: at 400 kHz single-bit a word arrives
+  # every ~80 us, and the first 128 reads were done in the microseconds after the level first
+  # rose, so 127 of them read an empty buffer.
+  #
+  # Mode 12 keeps the chain and paces the drain by CNTVCT_EL0: one word per 160 us, which is
+  # slower than any arrival rate here and therefore cannot lose data (a full buffer stops the
+  # card clock). "dt f=" is when the first word arrived and "dt l=" when the last did, both in
+  # us; "nd" counts words that differed from the one before, so a block reads as nd=127 and one
+  # word repeated 128 times as nd=0. "hc" is HOST_CONTROL/HOST_CONTROL2 (bus width, DMA select),
+  # "clk=" the final clock control, and "gpt" decodes current LBA, partition-entry LBA, entry
+  # count and entry size from the header. "c17 ok" + "efi 1" + "nd=127" => the data path works
+  # and the partition table is on the screen; "efi 0" with nd=127 => bytes but not a GPT header;
+  # nd=0 with nw=128 => the card still delivers one word; nw<128 => the deadline fired.
+  "clover-emmc=12",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

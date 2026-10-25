@@ -157,6 +157,24 @@
 // is the one command Linux lets past DATA_INHIBIT (sdhci.c:1675). The data phase at 392 kHz lasts
 // about 10 ms, hence the same bounded polls as everywhere else.
 //
+// Mode 11's photograph moved the failure to this driver's own pace. c17 came back `nodata` again
+// (int=00000021), but the first word was 0x20494645 -- "EFI " -- so sector 1 and BLK_CNT_EN are
+// both right and the card did start the block. The other 127 words were 0x20494645 as well:
+// sm=24a32280 is exactly 128 times that word. PRESENT_STATE was 01f802f6 when the command
+// completed (level bit clear: no data yet) and 01f80af6 at the end (level bit still set), so the
+// loop had read 128 words in the first microseconds after the level first rose, while the card at
+// 400 kHz single-bit delivers one word every ~80 us. 127 of those reads hit a buffer that was
+// already empty -- and a full buffer is the only thing that stops this card. CMD12 then timed out
+// (0x00018000, command timeout) and CMD13 said st=4 with READY_FOR_DATA: the card had finished the
+// block, so the stall is entirely on the host side.
+//
+// Mode 12 keeps the chain and replaces only the drain: each FIFO read waits on CNTVCT_EL0 for
+// 160 us (twice the 80 us a word takes at 400 kHz, and a slower reader can never lose data -- a
+// full buffer backpressures the card), records when the first and last words arrived, counts how
+// many words differed from the one before (`nd`, so one word read 128 times reads as 0), and
+// decodes the GPT header's own fields. It also prints HOST_CONTROL, HOST_CONTROL2 and the final
+// CLOCK_CONTROL, so a stopped clock or an unexpected bus width is visible on the same photograph.
+//
 // Every path that is not the success path panics, because on this board silence is not a reading.
 // Round87's photograph also settled what the watchdog is worth here: ticks=0 at this scheduling
 // point. sheng_pmgr_run() runs right after bsd_bufferinit, about ten seconds of boot before
@@ -750,6 +768,26 @@ static const uint32_t kCmd1Retries = 200;
 // One 512-byte block is 128 32-bit FIFO words; the buffer register is 32-bit access only.
 static const uint32_t kBlockWords = 128;
 
+// The generic counter, used to pace the FIFO drain. Round97 read the buffer port as fast as the
+// loop could run: the first word was the real first word ("EFI ") but the other 127 reads came
+// back identical, because the card delivers one word every ~80 us at 400 kHz single-bit while
+// the loop emptied the controller's buffer in a few microseconds. Reading slower than the card
+// can never lose data -- a full buffer backpressures the card -- so mode 12 waits on this clock
+// instead of trusting the level bit to mean "another word is really here".
+static inline uint64_t readCounter (void)
+{
+  uint64_t value;
+  __asm__ volatile ("mrs %0, cntvct_el0" : "=r" (value));
+  return value;
+}
+
+static inline uint64_t counterFrequency (void)
+{
+  uint64_t value;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (value));
+  return value;
+}
+
 static bool waitCommandSlot (bool ignoreDataInhibit)
 {
   uint32_t guard = 0;
@@ -1317,6 +1355,11 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   const char *verdictState11 = "skip", *verdictBlk11 = "skip", *verdictRead11 = "skip";
   const char *verdictStop11 = "skip", *verdictAfter11 = "skip";
 
+  // Mode 12: mode 11's chain with the drain paced by the counter above. `nd` counts the words
+  // that differed from the one before, so one real word followed by 127 repeats reads as
+  // nd=0 rather than as a block; the gpt fields are where a header says the entries live.
+  uint32_t distinct12 = 0, firstUs12 = 0, lastUs12 = 0;
+  uint32_t word6_12 = 0, word18_12 = 0, word20_12 = 0, word21_12 = 0;
 
   bool cmd2Ok = false;
   if (probeMode == 0) {
@@ -1618,7 +1661,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
         verdictRead = dataVerdict (readStatus, sentRead);
       }
     }
-  } else if (probeMode == 11 && hostReady && ready) {
+  } else if ((probeMode == 11 || probeMode == 12) && hostReady && ready) {
     // Round96 accepted CMD17 (RESPONSE|DATA_AVAIL) but never saw DATA_END, and the FIFO returned
     // zeros. Two host-side differences from Linux's path on this exact controller are repaired
     // here, and every step is kept as a reading so a remaining failure names itself:
@@ -1713,18 +1756,97 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
         if (cmdOk11) {
           // The FIFO's own level bit is PRESENT_STATE[11], not INT_STATUS[DATA_AVAIL]: the status
           // bit is a sticky event that this driver never acknowledges, which is why round96's
-          // `int=00000021` still carried it after two words had been read. One bounded loop reads
-          // a word whenever the live level says one is there and stops on DATA_END or a data
-          // error, so a card that stops mid-block produces a report instead of a silent hang.
-          for (spinsBrr11 = 0;; spinsBrr11++) {
-            status = read32 (SDHCI_INT_STATUS);
-            if (status & (SDHCI_INT_DATA_END | SDHCI_INT_DATA_TIMEOUT |
-                          SDHCI_INT_DATA_CRC | SDHCI_INT_DATA_END_BIT |
-                          SDHCI_INT_ADMA_ERROR)) {
-              break;
+          // `int=00000021` still carried it after two words had been read. Round97 gated on the
+          // level bit and read 128 words as fast as the loop ran, and 127 of them were the first
+          // word again: the level says "the buffer has data", not "another word has arrived".
+          if (probeMode == 12) {
+            // Paced drain. At 400 kHz single-bit a 32-bit word takes ~80 us, so one read every
+            // 160 us is slower than any arrival rate this link can produce; a buffer that fills
+            // up simply stops the card clock until the next read. The deadline bounds the whole
+            // block well below SDHCI's own data timeout.
+            uint64_t frequency = counterFrequency ();
+            if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+              frequency = 19200000ULL;   // the counter's measured rate on this board
             }
-            if ((read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE) &&
-                drainWords11 < kBlockWords) {
+            const uint64_t gap = frequency / 6250ULL;        // 160 us
+            const uint64_t deadline = frequency / 5ULL;      // 200 ms
+            uint64_t start = readCounter ();
+            uint64_t lastRead = start;
+            bool haveWord = false;
+            uint32_t previous = 0;
+            for (spinsBrr11 = 0;; spinsBrr11++) {
+              status = read32 (SDHCI_INT_STATUS);
+              if (status & (SDHCI_INT_DATA_END | SDHCI_INT_DATA_TIMEOUT |
+                            SDHCI_INT_DATA_CRC | SDHCI_INT_DATA_END_BIT |
+                            SDHCI_INT_ADMA_ERROR)) {
+                break;
+              }
+              uint64_t now = readCounter ();
+              if (now - start > deadline) {
+                break;
+              }
+              if (drainWords11 < kBlockWords && (!haveWord || now - lastRead >= gap) &&
+                  (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
+                uint32_t word = read32 (SDHCI_BUFFER);
+                uint32_t index = drainWords11;
+                if (index == 0) {
+                  hdr11a = word;
+                } else if (index == 1) {
+                  hdr11b = word;
+                }
+                if (index >= 1 && word != previous) {
+                  distinct12++;
+                }
+                if (index == 6) {
+                  word6_12 = word;
+                } else if (index == 18) {
+                  word18_12 = word;
+                } else if (index == 20) {
+                  word20_12 = word;
+                } else if (index == 21) {
+                  word21_12 = word;
+                }
+                previous = word;
+                drainSum11 += word;
+                drainWords11++;
+                lastRead = now;
+                lastUs12 = static_cast<uint32_t> ((now - start) * 1000000ULL / frequency);
+                if (!haveWord) {
+                  haveWord = true;
+                  firstUs12 = lastUs12;
+                }
+              }
+              if (spinsBrr11 >= kCommandSpinLimit) {
+                break;
+              }
+            }
+          } else {
+            for (spinsBrr11 = 0;; spinsBrr11++) {
+              status = read32 (SDHCI_INT_STATUS);
+              if (status & (SDHCI_INT_DATA_END | SDHCI_INT_DATA_TIMEOUT |
+                            SDHCI_INT_DATA_CRC | SDHCI_INT_DATA_END_BIT |
+                            SDHCI_INT_ADMA_ERROR)) {
+                break;
+              }
+              if ((read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE) &&
+                  drainWords11 < kBlockWords) {
+                uint32_t word = read32 (SDHCI_BUFFER);
+                if (drainWords11 == 0) {
+                  hdr11a = word;
+                } else if (drainWords11 == 1) {
+                  hdr11b = word;
+                }
+                drainSum11 += word;
+                drainWords11++;
+              }
+              if (spinsBrr11 >= kCommandSpinLimit) {
+                break;
+              }
+            }
+            // DATA_END can set in the same read that the last word lands, so what is still in
+            // the FIFO is taken here; the cap is one block either way.
+            while (drainWords11 < kBlockWords &&
+                   (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
               uint32_t word = read32 (SDHCI_BUFFER);
               if (drainWords11 == 0) {
                 hdr11a = word;
@@ -1734,22 +1856,6 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
               drainSum11 += word;
               drainWords11++;
             }
-            if (spinsBrr11 >= kCommandSpinLimit) {
-              break;
-            }
-          }
-          // DATA_END can set in the same read that the last word lands, so what is still in the
-          // FIFO is taken here; the cap is one block either way.
-          while (drainWords11 < kBlockWords &&
-                 (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
-            uint32_t word = read32 (SDHCI_BUFFER);
-            if (drainWords11 == 0) {
-              hdr11a = word;
-            } else if (drainWords11 == 1) {
-              hdr11b = word;
-            }
-            drainSum11 += word;
-            drainWords11++;
           }
           drained11 = drainWords11 > 0;
           statusEnd11 = status;
@@ -1838,7 +1944,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
     clover_emmc_observation[13] = hdr0;
     clover_emmc_observation[14] = hdr1;
     clover_emmc_observation[15] = read32 (SDHCI_PRESENT_STATE);
-  } else if (probeMode == 11) {
+  } else if (probeMode == 11 || probeMode == 12) {
     // The chain, then the data phase's three statuses and the R1 the card gave CMD17, then the
     // two header words and the checksum of the whole drained block.
     clover_emmc_observation[7] = idStatus11;
@@ -1883,7 +1989,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   // Mode 11's data phase needs five more lines than mode 10's, and the report buffer is 511
   // bytes. The two vendor selectors have been stable since round92 and are only needed when the
   // clock itself is in question, which `clk=` and the CMD0/CMD1 row already answer.
-  if (probeMode != 11) {
+  if (probeMode != 11 && probeMode != 12) {
     emitText (" vs ");
     emitHex (vendorAfter, 8);
     emitText (" vs3 ");
@@ -2157,11 +2263,14 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
       emitText ("\nefi ");
       emitDec (efi ? 1 : 0);
     }
-  } else if (probeMode == 11) {
+  } else if (probeMode == 11 || probeMode == 12) {
     // Mode 11: mode 10's chain, then the same read with BLK_CNT_EN set and the card's own
     // addressing. `nw` is how many FIFO words actually arrived and `sm` their 32-bit sum, so a
     // block of zeros and a block that was never sent cannot be read alike. `ev` carries the
     // command-completion spins/status and the whole data-phase poll count.
+    // Mode 12 keeps the chain and replaces the burst with a paced drain: `dt f=` is when the
+    // first word arrived, `dt l=` when the last did (both in us), and `nd` counts the words that
+    // differed from the one before, which separates a real block from one word read 128 times.
     emitText ("\nc2 ");
     emitText (verdictId11);
     emitText (" int=");
@@ -2201,26 +2310,65 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
       emitDec (readArg11);
       emitText (" tm=");
       emitHex (transferMode11, 2);
-      emitText ("\nev nc=");
-      emitDec (spinsCmd11);
-      emitText (" ia=");
-      emitHex (statusCmd11, 8);
-      emitText (" ns=");
-      emitDec (spinsBrr11);
-      emitText (" nw=");
-      emitDec (drainWords11);
-      emitText ("\nps a=");
-      emitHex (psCmd11, 8);
-      emitText (" e=");
-      emitHex (psEnd11, 8);
-      emitText ("\nhdr ");
-      emitHex (hdr11a, 8);
-      emitText (" ");
-      emitHex (hdr11b, 8);
-      emitText (" sm=");
-      emitHex (drainSum11, 8);
-      emitText ("\nefi ");
-      emitDec (drained11 && hdr11a == 0x20494645u && hdr11b == 0x54524150u ? 1 : 0);
+      if (probeMode == 12) {
+        // The bus width and the DMA selector the data phase actually ran with, then the timing,
+        // the final clock control, the header words and where that header says the entries are.
+        emitText ("\nhc ");
+        emitHex (read8 (SDHCI_HOST_CONTROL), 2);
+        emitText (" ");
+        emitHex (read16 (SDHCI_HOST_CONTROL2), 4);
+        emitText ("\ndt f=");
+        emitDec (firstUs12);
+        emitText (" l=");
+        emitDec (lastUs12);
+        emitText (" nw=");
+        emitDec (drainWords11);
+        emitText (" nd=");
+        emitDec (distinct12);
+        emitText ("\nps a=");
+        emitHex (psCmd11, 8);
+        emitText (" e=");
+        emitHex (psEnd11, 8);
+        emitText (" clk=");
+        emitHex (read16 (SDHCI_CLOCK_CONTROL), 4);
+        emitText ("\nhdr ");
+        emitHex (hdr11a, 8);
+        emitText (" ");
+        emitHex (hdr11b, 8);
+        emitText (" sm=");
+        emitHex (drainSum11, 8);
+        emitText ("\ngpt lba=");
+        emitDec (word6_12);
+        emitText (" el=");
+        emitDec (word18_12);
+        emitText (" en=");
+        emitDec (word20_12);
+        emitText (" es=");
+        emitDec (word21_12);
+        emitText ("\nefi ");
+        emitDec (drained11 && hdr11a == 0x20494645u && hdr11b == 0x54524150u ? 1 : 0);
+      } else {
+        emitText ("\nev nc=");
+        emitDec (spinsCmd11);
+        emitText (" ia=");
+        emitHex (statusCmd11, 8);
+        emitText (" ns=");
+        emitDec (spinsBrr11);
+        emitText (" nw=");
+        emitDec (drainWords11);
+        emitText ("\nps a=");
+        emitHex (psCmd11, 8);
+        emitText (" e=");
+        emitHex (psEnd11, 8);
+        emitText ("\nhdr ");
+        emitHex (hdr11a, 8);
+        emitText (" ");
+        emitHex (hdr11b, 8);
+        emitText (" sm=");
+        emitHex (drainSum11, 8);
+        emitText ("\nefi ");
+        emitDec (drained11 && hdr11a == 0x20494645u && hdr11b == 0x54524150u ? 1 : 0);
+      }
     }
     if (attemptedStop11) {
       emitText ("\nc12 ");
@@ -2444,7 +2592,7 @@ extern "C" void clover_emmc_run (void)
   // One question at a time: an unimplemented mode has to say so rather than boot quietly without
   // the storage instrument it was asked for.
   if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6 && mode != 7 &&
-      mode != 8 && mode != 9 && mode != 10 && mode != 11) {
+      mode != 8 && mode != 9 && mode != 10 && mode != 11 && mode != 12) {
     emmcFail (2, mode);
   }
   clover_emmc_stage = 2;
@@ -2466,7 +2614,8 @@ extern "C" void clover_emmc_run (void)
       emmcFail (4, kGccPhys);
     }
     coldBringUp (mode == 5,
-                 (mode == 7 || mode == 8 || mode == 9 || mode == 10 || mode == 11) ? mode : 0);
+                 (mode == 7 || mode == 8 || mode == 9 || mode == 10 || mode == 11 ||
+                  mode == 12) ? mode : 0);
   }
   // The report is one pointer argument; if the panic screen cannot read it, it prints the
   // address in angle brackets instead of faulting, and the raw slots above still name the call.

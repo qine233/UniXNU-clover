@@ -4243,6 +4243,106 @@ fastboot reboot
 
 **拍一张就够。**
 
+## round97 读数：卡把整块送完了，是主机读得太快
+
+照片（`sips -r -90` 之后正是正向；末尾 `@CloverSdhci.cpp:2476` 是 panic 调用点）：
+
+```text
+g cfg=00002017 m=01 n=fc d=fb up=1 br=00004221 ab=20000001
+h clk=0007 rst=1 clr=0002 pw=0b
+c0 ok cl ok t=3 to=0 rsp=c0ff8080
+c2 ok int=00000001
+c3 ok st=2
+c7 ok int=00000001
+c13 ok st=4
+c16 ok int=00000001 r=00000900
+c17 nodata int=00000021 ar=1 tm=12
+ev nc=517 ia=00000001 ns=4194304 nw=128
+ps a=01f802f6 e=01f80af6
+hdr 20494645 20494645 sm=24a32280
+efi 0
+c12 to st=4 int=00018000
+c13b ok st=4 r=00400900
+```
+
+三件事同时被这张照片钉住：
+
+1. **地址和块计数是对的。** `ar=1`、`tm=12`，FIFO 第一字是 `0x20494645`，小端即 `"EFI "`；
+   LBA 1 的头五个字节正是 GPT 签名。
+2. **128 次读回的是同一个字。** `sm = 0x24a32280 = 128 × 0x20494645`，一字节不差；
+   `hdr` 前后两字相同也是同一事实。卡没有送 128 遍，是主机在卡送到第一个字之后
+   又读了 127 次空端口。
+3. **卡把整块送完并且回到了 idle。** `c13b ok st=4 r=00400900`：state 4 (tran) +
+   `READY_FOR_DATA`（`0x100`）。`c12 to` 的 `int=00018000` 是主机的
+   ERROR|TIMEOUT：命令阶段 200 ms 内没等到 CC，不是卡的问题。
+
+`ps a=01f802f6` 是 CMD17 刚发完时读的：bit11（BUFFER_READ_ENABLE）= 0，DOING_READ=1，
+DAT_ACTIVE=1 ⇒ 那一刻还没有一个字到达。`ps e=01f80af6` 的 bit11 = 1，是末尾电平仍高
+（最后那次读已经把缓冲清空，电平位是上次事件留下的），所以「按电平排空」在 400 kHz 上
+等于「在头几微秒里把 128 次读全花掉」。
+
+算一下：400 kHz 单线，512 字节 = 4096 bit = 10.24 ms，平均每个 32 位字约 80 µs；
+而 `ns=4194304` 说明排空循环在几个毫秒内就跑满了上限。读得比卡快不会丢数据——
+缓冲满了会反压卡的时钟——**所以修法不是等事件，而是读得慢一点**。
+
+## v0.2.70（round98）：按卡的节奏排空 FIFO
+
+mode 12 = mode 11 的整条链，只换排空策略，并补三组读数：
+
+1. **用 `CNTVCT_EL0` 给每次 FIFO 读定节奏**：`gap = CNTFRQ_EL0 / 6250`（19.2 MHz 下
+   160 µs，是 400 kHz 下每字 80 µs 的两倍），整体期限 `CNTFRQ_EL0 / 5`（200 ms）。
+   读数侧先看 `DATA_END`/数据错误，再看期限，最后才在 `PRESENT_STATE` bit11 为真且
+   **距上次读已过一个 gap** 时读一个字。
+2. **报告 `nd=`**：逐字与上一字比较、不同的次数。一个字后面跟 127 个重复读成 `nd=0`，
+   真的一整块读成 `nd=127`（第一字没有前驱，所以是 127 而不是 128）。
+3. **报告 `dt f=/l=`**：第一字与最后一字落在块内第几微秒，直接量出这张卡的取数速度；
+   `hc`/`HC2`、末尾 `CLOCK_CONTROL` 也照原样印出来，用来排除「读的过程中总线被降宽/停钟」。
+4. **解 GPT 头**：`gpt lba=`（当前 LBA，偏移 24）、`el=`（分区表 LBA，偏移 72）、
+   `en=`（表项数，偏移 80）、`es=`（表项大小，偏移 84），各取一个小端 32 位字。
+
+`efi 1` 仍要求头两字是 `"EFI PART"`。报告比 mode 11 多两行，最坏约 400 字节。
+
+判定：
+
+| 看到 | 结论 | 下一步 |
+| --- | --- | --- |
+| `c17 ok` + `efi 1` + `nd=127` | 数据通路通，GPT 头在屏上 | 读分区表项，找可写的日志分区 |
+| `c17 ok` + `efi 1` + `nd<127` | 头对了，后半段有重复或跳过 | 看 `dt l=` 与 `ps e=` 判断节奏是否仍然太快 |
+| `c17 ok` + `efi 0` + `nd=127` | 整块到了，但内容不是 GPT 头 | 用 `gpt` 四字段与 `hdr` 校准地址/字节序 |
+| `c17 nodata` + `nd=0` + `nw=128` | 卡仍旧只给一个字 | 数据机在等一个我们没给的条件：查 `hc`/`HC2`、块长、`TIMEOUT_CONTROL` |
+| `nw<128` | 200 ms 期限先到 | `dt f=` 说明第一个字什么时候来；`ns=` 说明循环跑了几次 |
+| `dt f=` 很小、`dt l=` 接近 10 ms | 节奏正确，按理论速度在走 | 可以进入分区表读取 |
+| `c17 dto`/`dcrc`/`dend` | 数据阶段自己报错 | 仍先查总线宽度与电源 |
+| `c12`/`c13b` 变化 | 数据机不再卡住 | 对照 round97 的 `st=4`/`READY_FOR_DATA` |
+
+产物（内核变了；root / trust cache / boot 未动）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `round98-payload.img` | 58720256 B | `4fd012a054ac2ebd77cddf46eb6db5f5e9e154da807d5669d452fecb42349197` |
+| `round98-kernel.macho`（构建产物） | 51949568 B | `2f9e2b9d0bcc36203a33bbf2bbbe76f0e6ec927f7c29ada3c491117d6d5bc590` |
+| `round98-in-volume-kernel.macho`（卷内副本） | 51949568 B | `6f51135a0adbfa3f17f7be6e96b744e70ebd22a59ed1aa5e239120fe10d6e00e` |
+| `round98-scratch-data.img` | 35456 B | `fe27be32fd5d9443cb516d16a55b8cb7ab48c5c30175ca61f320b80c36a2d084` |
+| `round98-kernel.macho.trustcache` | 56 B | `d310ae35d7a7e1d5aa23bcbce2c872405abb94e3bed349bfd71bc05ac9c314b4` |
+| `round98-kernel.macho.adt` | 13476 B | `d920d0eca4597abffbf7a5c253c1c6a38aa47bae0aa951018f8badff324041d5` |
+| `round98-unixnu.toml` | 561 B | `2ecd39111f54668be1a886282e6e9f1d03b3a7e59cc638149ee8ea26c285ca70` |
+
+校验器：探针 35 处 5959 字节、PMGR 5 条绑定 0 位移、CloverSdhci 六条串全在。反汇编
+`__ZL11coldBringUpbj`：`mrs x8, CNTFRQ_EL0`（对象 `0x192f4`）、两处 `mrs x2, CNTVCT_EL0`；
+`freq/6250` 走 `umulh 0x29f16b11c6d1e109, lsr #9`，`freq/5` 走 `umulh 0xcccccccccccccccd, lsr #2`；
+读字路径在 `0x195e0`（对象）读 `[host,#0x20]`，`ccmp`+`cset ne` 累加 `nd`，`mul 1000000`
+后 `udiv` 出微秒、`csel` 保住第一次的 `firstUs`。卷内核里
+`\ngpt lba=` 的逐字符 `strb` 序列后面紧跟 `bl emitDec`，四个字段偏移对得上。
+卷内 boot-args 末尾是 `… clover-pmgr=2 clover-emmc=12 armcpu-clock-panic=60000`。
+boot 仍是 `round87-boot.img`（`196b284f…`）：
+
+```sh
+fastboot flash cache ~/clover-out/round98-payload.img
+fastboot reboot
+```
+
+**拍一张就够。**
+
 ## 有意省略的部分
 
 - **没有块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -4259,7 +4359,9 @@ fastboot reboot
   并补上 CMD9/CMD13），`v0.2.67` 起不再走带校验的 CMD2，改用 CMD2(关校验)/CMD3/CMD13/CMD9/CMD7
   把卡第一次送进 transfer，`v0.2.68` 起发第一颗数据命令（CMD16 设块长 + CMD17 PIO 单块读
   byte 512，前五个字节应是 `EFI PART`），`v0.2.69` 起按 Linux 的 MSM 路径给单块传输置块计数
-  使能、并按 OCR bit 30 改用扇区号，数据阶段把实际取到的字数与校验和写进报告，仍然不发布
+  使能、并按 OCR bit 30 改用扇区号，`v0.2.70` 起用 `CNTVCT_EL0` 把 FIFO 读速降到卡的节奏以下
+  （round97 的 128 次读全是同一个字：主机比卡快了一个数量级），并把 GPT 头的四个字段解出来，
+  仍然不发布
   `IOBlockStorageDevice`，目的是把「固件留下的 SDHCI 窗口活不活、卡还答不答、在哪个地址答、
   时钟是不是还在移命令、数据阶段能不能自己走完」逐件事量出来。根设备因此仍然不走磁盘：`v0.2.35` 用
   `rd=md0` 把 payload 里的 initrd 变成内存盘，
