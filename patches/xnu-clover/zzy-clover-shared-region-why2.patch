@@ -1,0 +1,68 @@
+diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
+--- a/bsd/vfs/vfs_vnops.c
++++ b/bsd/vfs/vfs_vnops.c
+@@ -372,7 +372,7 @@
+  *		in the code they originated.
+  */
+ int
+-vn_open_auth(struct nameidata *ndp, int *fmodep, struct vnode_attr *vap, vnode_t authvp)
++vn_open_auth_internal(struct nameidata *ndp, int *fmodep, struct vnode_attr *vap, vnode_t authvp)
+ {
+ 	struct vnode *vp;
+ 	struct vnode *dvp;
+@@ -757,5 +757,53 @@
+ out:
+ 	return error;
+ }
+ 
++/*
++ * clover r151: dyld's verdict is "no shared cache" and it never reaches the map
++ * syscall, so watch what it does to the cache files instead of guessing at the
++ * step in between. vn_open_auth is the single tail of open(2), openat(2) and
++ * vn_open(), and the syscall has already copied the path into cn_pnbuf by the
++ * time it returns. With dyld_flags bit 3 set, CacheFinder opens the directory
++ * first and everything after it is opened relative to that fd, so the two
++ * prefixes below are the whole question: did the directory open, and did the
++ * file inside it open. A successful open then reads the first sixteen bytes
++ * through the same vnode -- the header dyld's preflight checks before asking
++ * for a region -- so an open that succeeds but cannot be read says so here
++ * instead of turning into a silent preflight failure.
++ */
++int
++vn_open_auth(struct nameidata *ndp, int *fmodep, struct vnode_attr *vap, vnode_t authvp)
++{
++	static const char clover_cache_dir[] = "/System/Library/Caches/com.apple.dyld";
++	static const char clover_cache_file[] = "dyld_shared_cache";
++	const char *path = ndp->ni_cnd.cn_pnbuf;
++	vnode_t vp;
++	int error;
++
++	error = vn_open_auth_internal(ndp, fmodep, vap, authvp);
++	if (path == NULL ||
++	    (strncmp(path, clover_cache_dir, sizeof(clover_cache_dir) - 1) != 0 &&
++	    strncmp(path, clover_cache_file, sizeof(clover_cache_file) - 1) != 0)) {
++		return error;
++	}
++	printf("clover r151: open %s fmode=0x%x err=%d", path, *fmodep, error);
++	vp = error ? NULLVP : ndp->ni_vp;
++	if (vp != NULLVP) {
++		struct mount *mp = vnode_mount(vp);
++		printf(" fl=0x%llx vt=%d fs=%s", vfs_flags(mp), vnode_vtype(vp),
++		    vfs_statfs(mp)->f_fstypename);
++	}
++	printf("\n");
++	if (vp != NULLVP && vnode_vtype(vp) == VREG) {
++		char header[17] = {0};
++		int residual = 0;
++		int read_error = vn_rdwr(UIO_READ, vp, header, 16, 0, UIO_SYSSPACE,
++		    IO_NODELOCKED | IO_NOAUTH, kauth_cred_get(), &residual,
++		    current_proc());
++		printf("clover r151: read err=%d resid=%d hdr=%s\n",
++		    read_error, residual, header);
++	}
++	return error;
++}
++
+ #if vn_access_DEPRECATED
+ /*
+  * Authorize an action against a vnode.  This has been the canonical way to

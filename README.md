@@ -10569,6 +10569,88 @@ owner 查找、两窗口闩锁都按 r145 的设计走通了，剩下的唯一�
 第 6,079,643,648 字节起的 3,303,014,400 字节就能回答；带，说明 union 没把下层
 露出来（方向/时机）；不带，说明 dyld 缓存根本不在这个卷里，得去 Data 侧找。
 
+## v0.5.4（round151）：看 dyld 自己去开那个文件
+
+### 宿主先回答的那半个问题
+
+把 SystemOS 窗口从 `userdata-root.img` 里切出来挂上，`/System/Library/Caches/
+com.apple.dyld/` 里躺着 `dyld_shared_cache_arm64`（491,520 字节的主桩）、
+`.01`…`.52` 子缓存和一份 `.symbols`。文件头是 `dyld_v1   arm64\0`。
+
+**名字是 `arm64`，不是 `arm64e`。** r146 的 `cache err=2` 查的是
+`dyld_shared_cache_arm64e`，那是一份不存在的文件——它回答的不是 dyld 的问题，
+是探针自己的拼写错误。这一轮不能再用同一句话下结论。
+
+### dyld 在这条路上的真实顺序
+
+用 OS 卷里的 `/usr/lib/dyld`（21H461）反汇编对出来：
+
+1. `dyld::CacheFinder`（0x32c58）读 `dyld_flags`，`tbnz w8,#0x3` 跳到 0x32e28；
+   `dyld_flags` 第 3 位正是 r150 已经置上的那一位，所以这里不再 ignite cryptex，
+   而是 `SyscallDelegate::open("/System/Library/Caches/com.apple.dyld/")`。
+2. `mapSplitCacheSystemWide` → `preflightMainCacheFile`（0x4e578）：对这个 fd
+   `fstatat("dyld_shared_cache_arm64")`、再 `stat("enable-dylibs-to-override-cache")`、
+   再 `openat(dirfd, "dyld_shared_cache_arm64")`。
+3. `preflightCacheFile`（0x4d…）对这个新 fd：`fstat64`、`pread` 16 字节比 magic，
+   然后校验 mappings / platform / linkedit / 签名长度。
+4. 全部过了才分配 dynamic config 的地址，并在 0x4e488 调 syscall 536。
+
+r150 的 `map enter` 从未出现，说明卡在第 2–3 步。第 2 步的第一步是 dyld 自己的
+`open`：目录开不开、文件开不开，r146 一个字都没看到。
+
+### 改了什么：一个包装，两行读数
+
+新补丁 `zzy-clover-shared-region-why2.patch` 只碰 `bsd/vfs/vfs_vnops.c`：
+
+- `vn_open_auth` 是 `open(2)`、`openat(2)` 和 `vn_open()` 的唯一汇合点，把它改名
+  成 `vn_open_auth_internal`，外面套一层同名包装。打开结束后 `cn_pnbuf` 里就是
+  内核已拷好的路径，只对两个前缀出声（`/System/Library/Caches/com.apple.dyld`
+  和 `dyld_shared_cache`），其余 open 原样返回。
+- 每次命中打印 `clover r151: open <path> fmode=… err=…`；成功时加上
+  `fl=/vt=/fs=`（vnode 所在挂载的 flags、vnode 类型、文件系统名）。
+- 若是普通文件，再用同一个 vnode `vn_rdwr` 读 16 字节，打印
+  `clover r151: read err=… resid=… hdr=…`——这一行是 dyld 的 `pread` 在内核侧
+  的等价物，头部读不出来就不必再猜 preflight 的校验。
+
+包装不改任何已有补丁的新增行，r146 的反向检查仍然成立。
+
+### 屏上三种读数
+
+- 目录 open 报错（例如 `err=2`/`13`）：union 这一层根本没把 SystemOS 的
+  `/System/Library` 露出来，问题回到挂载方向，而不是缓存文件本身。
+- 目录 open 成功、`dyld_shared_cache_arm64` 的 open 报错：目录里的文件对内核
+  不可见，下一刀查目录项或权限。
+- 两个 open 都成功：看 `read` 行。`hdr=dyld_v1   arm64` 说明内核读得到，
+  卡点在 16 字节之后的头部校验或 dynamic config 的 `vm_allocate`。
+
+### 构建、校验与本轮该刷哪一格
+
+```sh
+cd ~/UniXNU-clover && python3 scripts/check-clover.py
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" ./unixnu build kernel
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH ./unixnu tree
+cd ~/UniXNU-clover && python3 scripts/verify-clover-payload.py
+```
+
+刷写仍然只写 cache，冷启动：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round151-payload.img
+fastboot reboot
+```
+
+菜单第一行应当是 `clover r151: dyld opens its own cache, the frame says which step`。
+
+这一帧只问一个问题：**dyld 打开目录和打开 `dyld_shared_cache_arm64` 时，
+内核分别给了什么 errno；打开成功的那一份，16 字节头读不读得出来。**
+
+产物归档在 `~/clover-out/round151-*`，`shasum -a 256 -c round151-SHA256SUMS` 七项全 OK：
+`payload.img` 58,720,256 B（`a6ef5930…`）、本地 `kernel.macho` 51,998,720 B
+（`0e79fb40…`）、卷内 `kernel.macho`（`a975a97f…`，入口探针仍在）、卷内
+`unixnu.toml` 601 B（`f775e0ce…`）、ADT 13,516 B（`4f0ea293…`）、`scratch-data.img`
+35,888 B（`614b8356…`，即 launchd 数据盘）、`trustcache` 61,408 B（`7c369ce0…`）。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

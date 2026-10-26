@@ -281,6 +281,29 @@ def check_shared_region_probe(kernel: bytes) -> bool:
     return ok
 
 
+def check_cache_open_probe(kernel: bytes) -> bool:
+    """Round151 stops guessing where dyld loses the cache and watches dyld's own opens. The
+    wrapper around vn_open_auth prints the path, the mode and the errno for the cache directory
+    and for anything named dyld_shared_cache, adds the backing mount on success, and reads the
+    sixteen-byte header through the same vnode. r146's namei asked for a file that does not
+    exist, so this check also requires the corrected name: the probe must not carry arm64e.
+    None of it adds a symbol, so these three format strings are the image's only evidence."""
+    label = "kernel.macho: cache open probe linked"
+    found = {"open": b"clover r151: open %s fmode=0x%x err=%d" in kernel,
+             "mount": b" fl=0x%llx vt=%d fs=%s" in kernel,
+             "read": b"clover r151: read err=%d resid=%d hdr=%s" in kernel}
+    ok = all(found.values())
+    if b"dyld_shared_cache" not in kernel or b"/System/Library/Caches/com.apple.dyld" not in kernel:
+        found["prefixes"] = False
+        ok = False
+    else:
+        found["prefixes"] = True
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def macho_symbols(kernel: bytes) -> tuple[list[tuple[str, int, int, int, int]], dict[str, int]]:
     """(segments, symbols): segments as (name, vmaddr, vmsize, fileoff, filesize), symbols as name -> va."""
     ncmds = struct.unpack_from("<I", kernel, 16)[0]
@@ -457,6 +480,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_owner_root_trust(kernel)
         ok &= check_root_mount_probe(kernel)
         ok &= check_shared_region_probe(kernel)
+        ok &= check_cache_open_probe(kernel)
         ok &= check_mac_probe(kernel)
         ok &= check_unattended(kernel)
         ok &= check_inline_asm_tails(kernel)

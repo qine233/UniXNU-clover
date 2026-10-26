@@ -765,6 +765,39 @@ def check_board(errors: list) -> str:
             errors.append(f"{region.name} lacks {needle!r}: that half of the shared-region question "
                           "would come back blank")
 
+    # Round151. r150's frame says dyld reaches shared_region_check_np, gets ENOMEM, and then never
+    # enters _shared_region_map_and_slide: `map enter` is absent. The host's copy of dyld puts the
+    # remaining steps in order -- CacheFinder opens /System/Library/Caches/com.apple.dyld/ when
+    # dyld_flags bit 3 is set, preflight fstat64()s and openat()s dyld_shared_cache_arm64 inside that
+    # fd, and only then does anything call syscall 536. r146's namei asked for dyld_shared_cache_arm64e,
+    # which does not exist, so its err=2 answered a question nobody asked. This probe watches the
+    # opens dyld itself makes: vn_open_auth is the single tail of open(2), openat(2) and vn_open(),
+    # and a successful open also reads the sixteen-byte header through the same vnode. A frame that
+    # lacks either print cannot say whether the cache is reachable, and the next round would guess.
+    cache_probe = next((base / "patches/xnu-clover/zzy-clover-shared-region-why2.patch"
+                        for base in (REPO, pathlib.Path.cwd())
+                        if (base / "patches/xnu-clover/zzy-clover-shared-region-why2.patch").is_file()), None)
+    if cache_probe is None:
+        errors.append("patches/xnu-clover/zzy-clover-shared-region-why2.patch is missing: without it "
+                      "the frame cannot say whether dyld opened the cache file at all")
+    else:
+        text = cache_probe.read_text()
+        missing = [needle for needle in
+                   ("bsd/vfs/vfs_vnops.c",
+                    "vn_open_auth_internal(struct nameidata *ndp",
+                    "+int\n+vn_open_auth(struct nameidata *ndp",
+                    "clover r151: open %s fmode=0x%x err=%d",
+                    "\"/System/Library/Caches/com.apple.dyld\"",
+                    "\"dyld_shared_cache\"",
+                    "clover r151: read err=%d resid=%d hdr=%s")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"{cache_probe.name} lacks {needle!r}: the open and the header read are the "
+                          "two halves of the cache-reachability question")
+        if "+#include" in text or "-vn_open_auth(struct nameidata *ndp" not in text:
+            errors.append(f"{cache_probe.name} does not rename vn_open_auth to vn_open_auth_internal: "
+                          "the probe would replace the open path instead of watching it")
+
     # Round148. Round147 shipped an unattended deadline that fired on the very first timer tick, with
     # a garbage counter in the message. The cause was not the arithmetic: the Darwin arm64 assembler
     # reads `;` as the comment character, so every multi-instruction asm string kept only its first
@@ -795,8 +828,8 @@ def check_board(errors: list) -> str:
     # Round150. Round149 removed the deadline and left the r146 wall untouched, so this round stops
     # probing that wall and adopts the sheng property it was skipping: the root is accepted by owner
     # trust, not by an rd= alias. The menu has to name that round.
-    if not board["payload"]["title"].startswith("clover r150:"):
-        errors.append('[payload] title is not "clover r150: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r151:"):
+        errors.append('[payload] title is not "clover r151: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",
