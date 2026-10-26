@@ -1,0 +1,111 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 470ff47..cab4b13 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1032,6 +1032,38 @@ bsd_init(void)
+ 
+ 	IOSecureBSDRoot(rootdevice);
+ 
++	/*
++	 * Round 144 (clover): r143's second whole-disk window left this point with
++	 * an empty mountlist although vfs_mountroot() had returned 0, so the
++	 * MNT_ROOTFS write below became a data abort at FAR 0x70 (_bsd_init+0x79c).
++	 * Report which return-0 path ran (vfs_subr.c records it), ask for the
++	 * mount once more, and only then give up -- with the numbers on the panel.
++	 */
++	if (mountlist.tqh_first == NULL) {
++		extern volatile int clover_root_probe_tag, clover_root_probe_num;
++		extern volatile int clover_root_probe_inshut, clover_root_probe_dev;
++		extern volatile unsigned long clover_root_probe_mountroot;
++		extern volatile unsigned long clover_root_probe_first;
++		int first_tag = clover_root_probe_tag;
++		int first_num = clover_root_probe_num;
++		int first_inshut = clover_root_probe_inshut;
++		int first_dev = clover_root_probe_dev;
++		unsigned long first_mountroot = clover_root_probe_mountroot;
++		unsigned long first_first = clover_root_probe_first;
++		int second = vfs_mountroot();
++
++		if (mountlist.tqh_first == NULL) {
++			panic("clover r144: mountlist empty after vfs_mountroot()==0"
++			    " p1 tag=%d mr=%lx first=%lx n=%d inshut=%d dev=%d"
++			    " p2 err=%d tag=%d first=%lx n=%d",
++			    first_tag, first_mountroot, first_first, first_num,
++			    first_inshut, first_dev, second, clover_root_probe_tag,
++			    clover_root_probe_first, clover_root_probe_num);
++		}
++		printf("clover r144: root mount recovered on retry p1tag=%d p2err=%d first=%p\n",
++		    first_tag, second, (void *)mountlist.tqh_first);
++	}
++
+ 	mountlist.tqh_first->mnt_flag |= MNT_ROOTFS;
+ 
+ 	bsd_init_kprintf("calling VFS_ROOT\n");
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+index 57aece6..d813757 100644
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -1206,6 +1206,31 @@ vfs_rootmountalloc(const char *fstypename, const char *devname, mount_t *mpp)
+  */
+ extern int (*mountroot)(void);
+ 
++/*
++ * Round 144 (clover): bsd_init() reached mountlist.tqh_first right after this
++ * function returned 0 for an empty list, and the deref became a data abort at
++ * FAR 0x70. Every "return 0" below happens after mount_list_add(), so the tag
++ * says which one ran and the snapshot says what the list held at that instant;
++ * bsd_init() prints both instead of taking the fault.
++ */
++volatile int clover_root_probe_tag = -1;
++volatile int clover_root_probe_num = -1;
++volatile int clover_root_probe_inshut = -1;
++volatile int clover_root_probe_dev = -1;
++volatile unsigned long clover_root_probe_mountroot = 0;
++volatile unsigned long clover_root_probe_first = 0;
++
++static void
++clover_root_probe(int tag)
++{
++	clover_root_probe_tag = tag;
++	clover_root_probe_mountroot = (unsigned long)(uintptr_t)mountroot;
++	clover_root_probe_first = (unsigned long)(uintptr_t)mountlist.tqh_first;
++	clover_root_probe_num = nummounts;
++	clover_root_probe_inshut = get_system_inshutdown();
++	clover_root_probe_dev = (int)rootdev;
++}
++
+ int
+ vfs_mountroot(void)
+ {
+@@ -1235,6 +1260,7 @@ vfs_mountroot(void)
+ 		error = (*mountroot)();
+ 
+ 		KDBG_RELEASE(DBG_MOUNTROOT | DBG_FUNC_END, error, 0);
++		clover_root_probe(0);
+ 		return error;
+ 	}
+ 	if ((error = bdevvp(rootdev, &rootvp))) {
+@@ -1360,6 +1386,7 @@ vfs_mountroot(void)
+ #if CONFIG_MACF
+ 			if ((vfs_flags(mp) & MNT_MULTILABEL) == 0) {
+ 				KDBG_RELEASE(DBG_MOUNTROOT | DBG_FUNC_END, 0, 2);
++				clover_root_probe(1);
+ 				return 0;
+ 			}
+ 
+@@ -1384,6 +1411,7 @@ vfs_mountroot(void)
+ 			}
+ #endif
+ 			KDBG_RELEASE(DBG_MOUNTROOT | DBG_FUNC_END, 0, 3);
++			clover_root_probe(2);
+ 			return 0;
+ 		}
+ 		vfs_rootmountfailed(mp);
+@@ -1395,6 +1423,7 @@ fail:
+ 		}
+ 	}
+ 	KDBG_RELEASE(DBG_MOUNTROOT | DBG_FUNC_END, error ? error : ENODEV, 4);
++	clover_root_probe(3);
+ 	return ENODEV;
+ }
+ 

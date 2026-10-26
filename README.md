@@ -9660,6 +9660,89 @@ cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-p
 4. **没有 r143 行、仍是旧名字** —— 先核对菜单标题确实是 `r143`，确认刷进 `cache`
    的是这一格，再往补丁是否被 `kern_exec.o` 的编译命令覆盖方向查。
 
+## v0.4.7（round144）：先问清楚根挂载表为什么是空的
+
+r143 的帧不是 dyld，也不是挂载失败，而是 `_bsd_init+0x79c` 的 data abort：
+
+```
+ESR 0x96000004 (translation fault level 0, read)   FAR 0x70
+pc  fffffff0076ac00c   ldr w8,[x20,#0x70]
+x20 0                  <-- mountlist.tqh_first
+```
+
+那一行就是 `mountlist.tqh_first->mnt_flag |= MNT_ROOTFS;`，紧跟在
+`IOSecureBSDRoot(rootdevice)` 之后；而 `vfs_mountroot()` 刚刚返回 0（否则
+`bsd_init()` 的 `while (TRUE)` 不会 `break`）。静态检查把这个矛盾夹死在一个很窄的范围里：
+
+- `vfs_mountroot()` 的 `return 0` 只有三处（`mountroot` 钩子路径、
+  MACF 的 `MNT_MULTILABEL` 提前返回、正常收尾），三处都在内联的
+  `mount_list_add()` 之后；唯一的跳过条件是 `get_system_inshutdown()`；
+- 这个标志只由 `reboot_kernel()` 置 1，而它唯一的非 panic 调用者是 `reboot(2)`；
+- 从挂载返回到 `bsd_init()` 解引用之间，没有 `dounmount()` / `vfs_unmountall()` 的调用者；
+  `IOSecureBSDRoot` 的失败分支只调 `mdevremoveall()`，动的只是 devfs 的 md 节点；
+- r142 和 r143 的 `_bsd_init` / `_vfs_mountroot` 字节相同，不是编译差异。
+
+所以剩下的是运行时事实，而不是再读一遍源码能回答的。这一轮不单独刷探针，
+把读数直接嵌进这次启动：
+
+1. 内核侧 `bsd/vfs/vfs_subr.c` 在四个出口各记一次快照
+   （tag 0/1/2 = 三处 return 0，tag 3 = `return ENODEV`），内容为
+   `mountroot` 指针、`mountlist.tqh_first`、`nummounts`、`get_system_inshutdown()`、`rootdev`；
+2. `bsd/kern/bsd_init.c` 在同样的位置先看表：若为空，把快照取走，再调一次
+   `vfs_mountroot()`；仍然为空才 `panic`，并把两次的 tag/快照一起打出来；
+   重试成功则打一行 `clover r144: root mount recovered on retry …` 继续走
+   `MNT_ROOTFS` 与 `VFS_ROOT`。
+
+改动落在基础仓的 `patches/xnu/zzy-clover-root-mount-why.patch`（契约与 r143 的板级补丁
+同形：`check-clover.py` 要求四个 tag 与两条 r144 字符串都在补丁里，
+`verify-clover-payload.py` 要求卷内内核确实带着这两条字符串——后者是「补丁真的编进来」的
+唯一直接证据）。两个 checker 全绿。
+
+### 构建、校验与本轮该刷哪一格
+
+```
+# 内核必须重建：vfs_subr.c 与 bsd_init.c 都被新补丁改过（本轮 drivers 未动）
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+产物归档在 `~/clover-out/round144-*`，`shasum -a 256 -c round144-SHA256SUMS` 七项全 OK：
+`payload.img` 58,720,256 B（`cecaf4e5…`）、本地 `kernel.macho` 51,998,720 B（`afefcb3d…`）、
+卷内 `kernel.macho`（`9ad76c4b…`，与本地只差 entry 探针补丁）、卷内 `unixnu.toml` 608 B
+（`36ded5b3…`，args 与 r143 逐字相同，只有 title 换成 r144）、ADT 13,516 B（`d471ed6b…`，未变）、
+`scratch-data.img` 35,888 B（`614b8356…`，未变）、trustcache 61,408 B（`7c369ce0…`，未变）。
+**本轮没有新的 eMMC 分区写入**，刷写范围仍然只有 `cache`。
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round144-payload.img
+fastboot reboot
+```
+
+菜单第一行应当是 `clover r144: ask why the root mount list was empty`，冷启动
+（不要 `fastboot boot`）。
+
+这一帧只问一个问题：**空表现在有没有第二次机会，以及第一次是哪个出口留下的。**
+
+1. **`clover r144: root mount recovered on retry p1tag=… p2err=0 first=…`** ——
+   重试把卷挂上了，启动继续过 `MNT_ROOTFS`/`VFS_ROOT`。`p1tag` 就是第一次成功返回
+   的那个出口，下一轮按它把「第一次为什么没进表」修掉（而不是靠重试兜底）。
+2. **仍然是 `_bsd_init+0x79c` 的 data abort** —— 补丁没进内核。先核对菜单标题是 `r144`，
+   再跑 `verify-clover-payload.py` 看两条 r144 字符串是否在卷内内核里。
+3. **`clover r144: mountlist empty after vfs_mountroot()==0 p1 tag=… mr=… first=… n=… inshut=… dev=… p2 err=… tag=… first=… n=…`** ——
+   按字段读：
+   - `tag=0`：走的是预选 `mountroot` 钩子（`mr=` 是它的地址；全 0 表示没有钩子，那就不该是 0）；
+   - `tag=1`：MACF 的 `MNT_MULTILABEL` 提前返回；`tag=2`：正常收尾。两者都说明
+     `vfs_mountroot()` 自己认为挂上了；
+   - `first=0 n=0 inshut=0` 而 `tag=1/2`：入表那一步被跳过或表被清空，`inshut` 为 0
+     排除了关机标志，下一轮在 `mount_list_add()` 前后各加一个记录点；
+   - `first` 非 0 而第二次仍空：有东西在返回后把节点摘了，按 `dev` 去查 `dounmount` 路径；
+   - `p2 err` 非 0：重试自己失败（`err` 是 errno），空表只是它的后果；
+   - `inshut=1`：`system_inshutdown` 被置上了，回头查是谁在根挂载前调了 `reboot(2)`。
+
 
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

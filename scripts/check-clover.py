@@ -659,6 +659,32 @@ def check_board(errors: list) -> str:
         errors.append('[userdata] windows[1].component is not Cryptex1,SystemOS: the manifest slot '
                       "is the dyld cache volume sheng union-mounts, not the OS snapshot")
 
+    # Round144. r143's frame was a data abort at _bsd_init+0x79c, `ldr w8,[x20,#0x70]` with
+    # x20 = mountlist.tqh_first = 0, on the MNT_ROOTFS write right after IOSecureBSDRoot(). It
+    # followed a vfs_mountroot() that returned 0, and every return-0 in that function sits after
+    # mount_list_add(), so a static walk cannot name the branch. The probe patch therefore records
+    # which of the four exits ran and what the list held at that instant, retries the mount once in
+    # bsd_init(), and only panics with the readings. Like r143's board patch it has to be carried in
+    # this repository and copied into the base tree's patches/xnu for the build.
+    probe = next((base / "patches/xnu-clover/zzy-clover-root-mount-why.patch"
+                  for base in (REPO, pathlib.Path.cwd())
+                  if (base / "patches/xnu-clover/zzy-clover-root-mount-why.patch").is_file()), None)
+    if probe is None:
+        errors.append("patches/xnu-clover/zzy-clover-root-mount-why.patch is missing: without it a "
+                      "second empty mountlist faults at the MNT_ROOTFS write with no numbers")
+    else:
+        text = probe.read_text()
+        missing = [needle for needle in
+                   ("clover_root_probe(0)", "clover_root_probe(1)",
+                    "clover_root_probe(2)", "clover_root_probe(3)",
+                    "clover_root_probe_tag", "clover_root_probe_inshut",
+                    "clover r144: mountlist empty after vfs_mountroot()==0",
+                    "clover r144: root mount recovered on retry")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"{probe.name} lacks {needle!r}: that exit would report no tag, or the "
+                          "panic would lose the snapshot it exists to print")
+
     splash = [entry for entry in board.get("bootimg", {}).get("dtb_node", [])
               if "splash" in entry["path"]]
     if splash:

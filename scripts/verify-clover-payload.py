@@ -210,6 +210,27 @@ def check_mac_probe(kernel: bytes) -> bool:
     return ok
 
 
+def check_root_mount_probe(kernel: bytes) -> bool:
+    """Round144 asks why r143 left bsd_init() with an empty mountlist although vfs_mountroot()
+    returned 0. The probe leaves no symbol of its own -- vfs_subr.c records which return-0 branch
+    ran in six volatiles and bsd_init.c reads them back -- so the image's only evidence is the two
+    lines it can print: the retry that recovered, and the panic that carries both snapshots. Losing
+    either means a boot that faults at the same MNT_ROOTFS write with no numbers, exactly the frame
+    this round exists to replace."""
+    label = "kernel.macho: root mount probe linked"
+    found = {name: name.encode() in kernel
+             for name in ("clover r144: mountlist empty after vfs_mountroot()==0"
+                          " p1 tag=%d mr=%lx first=%lx n=%d inshut=%d dev=%d"
+                          " p2 err=%d tag=%d first=%lx n=%d",
+                          "clover r144: root mount recovered on retry p1tag=%d p2err=%d"
+                          " first=%p\n")}
+    ok = all(found.values())
+    detail = ", ".join(f"{name.split(':')[1].strip()[:28]} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def report(image: pathlib.Path) -> int:
     print(f"== {image}")
     ok = True
@@ -281,6 +302,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_sdhci(kernel)
         ok &= check_block(kernel)
         ok &= check_owner_mount(kernel)
+        ok &= check_root_mount_probe(kernel)
         ok &= check_mac_probe(kernel)
     return 0 if ok else 1
 
