@@ -1639,10 +1639,10 @@ kernel_args = [
   # ladder (bsd/vfs/vfs_subr.c:1240-1294) on it -- bdevvp, vfs_rootmountalloc("apfs"), VFS_MOUNT with
   # no data argument, vfs_unbusy + mount_list_add, VFS_START, then VFS_ROOT, four one-component
   # vnode_lookupat() steps down System/Library/CoreServices/SystemVersion.plist and one vn_rdwr() of
-  # 1024 bytes. mp->mnt_devvp and vfs_init_io_attributes are the two steps it cannot copy: struct
-  # mount is only laid out in a header this archive does not compile against. It is the same ladder
-  # round120 proved this board can climb (that frame's panic came from *after* a successful root
-  # mount), just aimed at a volume instead of at mockfs.
+  # 1024 bytes. mp->mnt_devvp and vfs_init_io_attributes are the two steps it cannot copy: this probe
+  # is not compiled against bsd/sys/mount_internal.h, so the struct mount layout is not a name it can
+  # write. It is the same ladder round120 proved this board can climb (that frame's panic came from
+  # *after* a successful root mount), just aimed at a volume instead of at mockfs.
   # Nothing on that ladder panics: every rung's errno lands on one line, because one flash is one
   # photograph and a mount that dies at the third component still has to show the first two.
   # "CloverBlock r129: apfs f= n= m= l= d= s= c= v= dv=major:minor bd= al= mt= st= rt= k=a/b/c/d "
@@ -1656,6 +1656,41 @@ kernel_args = [
   # thread. At the measured ~20 ms per 512-byte block a container's first pages are tens of seconds and
   # 180000 watchdog ticks is still eleven times round128's frame, so if this round ends on the timer
   # instead of on the line, elr= is the read that is slow and not a bug.
+  # Round129's photograph came back and stopped one rung past where round128 could see:
+  # "CloverBlock r129: apfs f=15797536 n=11870275 m=1 l=0 d=10 s=1 c=1 v=1 dv=1:3 bd=0 al=0 mt=13
+  # st=65535 rt=65535 k=65535/65535/65535/65535 rd=65535 g=0 x=0x0 y=0x0 r=464 w=0 @CloverBlock.cpp:1082"
+  # (ticks=0x8b4=2228, pages=0x3af7b free=0x3a21f, tty fields empty as an EL1 panic must have them).
+  # bd=0 says bdevvp took the volume's dev_t; al=0 says "apfs" really is on the vfsconf list, so
+  # round128's kext load registered a filesystem and a mount struct was allocated. mt=13 is EACCES,
+  # and it cannot be the KPI wrapper: VFS_MOUNT (kpi_vfs.c:192-213) only ever returns ENOTSUP, so 13
+  # came out of apfs's own vfs_mount slot. r=464 is byte-for-byte round128's count, meaning the mount
+  # attempt read no new block at all -- a parameter-level rejection, not a container parse. The two
+  # suspects the host could clear without burning a flash did not: hdiutil + diskutil apfs list on
+  # 044-76040-038.dmg give one volume, role System, Sealed: No, FileVault: No, and the credential is
+  # root by construction (vfs_context0.vc_ucred = posix_cred_create(&kernel_cred_template),
+  # kern_credential.c:3415). What is left is the one rung this probe could not copy: vfs_mountroot
+  # writes mp->mnt_devvp = rootvp at vfs_subr.c:1259, *before* the mount call, and apfs.kext is
+  # closed source and outside this archive, so "nothing in the tree reads it" never covered it.
+  # A dead route worth recording: the boot root's own loop (vfs_subr.c:1251-1266) calls
+  # (*vfsp->vfc_mountroot)(mp, rootvp, ctx) when a vfstable has one, and only falls back to VFS_MOUNT
+  # when it is NULL. vfs_add hard-codes newvfstbl->vfc_mountroot = NULL (kpi_vfs.c:985), so a
+  # kext-registered filesystem can only ever be mounted through VFS_MOUNT -- which is exactly the
+  # shape copied here, and closes that question without a flash. (mockfs is the odd one out:
+  # vfs_conf.c:204 gives it mockfs_mountroot, which is why rounds 119-120's root looked different.)
+  # Round130 keeps the geometry, the boot args and the flash command again, and copies the rung it
+  # skipped. The offsets come from the build's own DWARF -- the dSYM beside the linked kernel has 63
+  # copies of struct mount and every one of them agrees: mnt_vfsstat at 0x84, mnt_devvp at 0x980, size
+  # 0xa08; inside vfsstatfs, f_fstypename at +0x50, f_mntfromname at +0x460 (also 63 agreeing copies).
+  # The line grows t=/fm=/dp= and the ladder gates on the proof rather than trusting the measurement:
+  # "vfs_rootmountalloc_internal() strlcpy()s vfc_name into f_fstypename (vfs_subr.c:1161) and
+  #  copystr()s the devname into f_mntfromname (:1164), so if the layout is right the 16 bytes at
+  #  mp+0xd4 must read "apfs" -- 0x73667061 followed by three zero words -- and the four bytes at
+  #  mp+0x4e4 must be the volume's own BSD name. Only when t='s first word says apfs does the probe
+  #  write mp+0x980 = the bdevvp vnode, and dp= then reads that pointer back out of the struct.
+  #  SI_MOUNTEDON (:1282) goes through the exported vnode_setmountedon() (kpi_vfs.c:2257) instead of a
+  #  third offset, and only after the mount returns 0. One flash, one question: does the device vnode
+  #  change apfs's answer. mt= is the question, t=/fm=/dp= are the proof that the question was asked
+  #  with the right struct under it.
   "clover-apfs=2",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the

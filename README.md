@@ -7780,6 +7780,54 @@ fastboot reboot
 如果 `mt=` 非 0，下一格是把 `mnt_devvp` 那块布局补上；如果 `g=1024 x=0x696c7062 y=0x30307473` 真到了屏上，下一格就不再需要
 探针 —— 该把 `rd=` 指向这颗卷、让内核拿它当根，走 `/sbin/launchd` 那条路。
 
+## round129 读数（v0.3.2 实机）：apfs 认下了 `"apfs"` 这个名字，然后在挂载那一步回了 EACCES
+
+屏上是完整的一行，八个 r128 字段一位没变，后面全部读到了值：
+
+```
+CloverBlock r129: apfs f=15797536 n=11870275 m=1 l=0 d=10 s=1 c=1 v=1 dv=1:3 bd=0 al=0 mt=13
+st=65535 rt=65535 k=65535/65535/65535/65535 rd=65535 g=0 x=0x0 y=0x0 r=464 w=0 @CloverBlock.cpp:1082
+```
+
+伴生读数：`ticks=0x8b4`（2228，round128 是 2194）、`pages=0x3af7b free=0x3a21f`、tty 字段全空（EL1 的 panic，本该如此），
+引导日志把这一帧落在 8.082 s 的 AMFI 初始化之后。
+
+**第一个 65535 在 `st=`，所以失败点是 `mt=13`。** 逐栏读：
+
+- `@CloverBlock.cpp:1082` —— `panic(` 从 :1073 起，宏报的是调用的收尾行，和 round128 的 `:861` 同一个约定。这句话的用处是
+  证明刷进去的确实是补了 `vfs_unbusy` + `mount_list_add` 的那份 v0.3.2，而不是更早的 `f9c4a9d9…` 内核。
+- `bd=0` —— `bdevvp(1<<24 | 3)` 收下了这颗卷的 dev_t，设备 vnode 建出来了。
+- `al=0` —— `vfs_rootmountalloc("apfs", …)` 成功，也就是 **`"apfs"` 这个名字真的在 `vfsconf` 链上**（`vfs_subr.c:1181` 比的
+  就是 `vfc_name`）。这是 round128 那次 kext 加载的后续：apfs.kext 不只被 load 了，它把文件系统注册进去了。
+  `mp` 也分配成功（`ENOMEM` 会是 12 而不是 0），`MNT_RDONLY|MNT_ROOTFS` 也照 :1153 设上了。
+- `mt=13` = **EACCES，而且只能是 apfs 自己回的**。`VFS_MOUNT` 的 KPI 壳（`kpi_vfs.c:192-213`）只有三种出口：
+  `dead_mountp`、没有 `vfs_mount` 槽、`!vfs_64bitready` —— 三种都回 `ENOTSUP`(45)。除此之外它尾调
+  `(*mp->mnt_op->vfs_mount)(mp, devvp, data, ctx)`。13 是那颗函数指针返回的。
+- `r=464` **和 round128 一字不差** —— 也就是这次挂载尝试**一个字节的新块都没从卡上读**。这条最值钱：它把「apfs 读了容器头、
+  读完觉得不对」和「apfs 看都没看容器就拒了」切开，剩下的是前者之外的另一种 —— 一次参数/状态层面的拒绝。
+- `st=` 往后全 65535，`g=0 x=0x0 y=0x0 w=0`：没有任何文件被读，也没有任何东西被写。
+
+**宿主机上拆掉的两条嫌疑（没花刷机）**：`hdiutil attach -nomount -readonly out/ipsw/21H461/044-76040-038.dmg` 之后
+`diskutil apfs list disk31` 给出容器 `50F8A67F-…`、**只有一个卷** `disk31s1 = 04769D26-…`、role **System**、卷名
+`DawnUpdate21H461.J120J121J207J208OS`（区分大小写）、**Sealed: No、FileVault: No**。所以 SSV 封印和加密都解释不了
+这次 EACCES；读完 `diskutil` 就把镜像卸了。同一趟还校准了 BSD 编号：宿主 `rdisk30`→`0x1000042` … `rdisk31s1`→`0x1000045`，
+major 恒为 1、minor 顺序分配 —— `dv=1:3` 的形状和那颗卷对象对得上，但**「这个 1:3 就是那颗卷」本身还没证死**。
+
+**凭据不是问题**（源码层面关掉的第三条）：`vfs_context_kernel()` 返回的就是 `&vfs_context0`（`kpi_vfs.c:1601`），
+`vfs_context_ucred()` 只是 `ctx->vc_ucred`（:1624），而 `vfs_context0.vc_ucred = posix_cred_create(&kernel_cred_template)`
+（`kern_credential.c:3415`）—— 是 root 凭据，任何 `suser` 式的检查都该过。
+
+**本轮读源码读出来的一条新事实**：真正的引导根并不总是 `VFS_MOUNT`。`vfs_subr.c:1251-1266` 是遍历 `vfsconf`，
+`vfc_mountroot == NULL` 且没有 `VFC_VFSCANMOUNTROOT` 的直接跳过，命中的文件系统走
+`(*vfsp->vfc_mountroot)(mp, rootvp, ctx)`，只有它为空才退到 `VFS_MOUNT`。而 kext 注册文件系统走的 `vfs_add` 在
+`kpi_vfs.c:985` 把 `newvfstbl->vfc_mountroot` **硬性置 NULL**。所以对 apfs 这种 kext 文件系统，内核自己会走的正是我们抄的
+那条 `VFS_MOUNT` —— 这条疑路可以关掉了（内置的 mockfs 不一样：`vfs_conf.c:204` 给它填了 `mockfs_mountroot`，那才是
+round119/120 那次根挂载的形状）。
+
+**之前那句「树里没人读 `mnt_devvp`，跳过不付代价」有个洞，这里补上**：那份枚举只覆盖了**这份归档里的源码**，而
+apfs.kext 是闭源的、不在这棵树里。现在 `bd=0 al=0 mt=13 r=464` 的形状 —— 设备 vnode 建好了、名字认下了、一次块都没读就回
+EACCES —— 和「mount 例程先看 `mp->mnt_devvp`，看到 NULL 就把这颗挂载点当成不可信来源」是同一句话。`mnt_devvp` 是头号嫌疑。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
