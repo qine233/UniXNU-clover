@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r139: disable AMFI enforcement in the kernel and in the kext that refused launchd"
+title = "clover r140: publish /chosen/debug-enabled so AMFI stops panicking on cs_enforcement_disable"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1906,6 +1906,15 @@ kernel_args = [
   # no second copy of the `amfi_get_out_of_my_way` string, so that older argument reaches only
   # XNU and not the hook that actually killed initproc. One flash, one argument, one question:
   # does AMFI's label-update hook stop at the same point once enforcement is off.
+  # Round140 keeps this argument and changes the device tree instead. Round139's frame is AMFI's
+  # own refusal at start(), not the exec: `can't has cs_enforcement_disable`
+  # @AppleMobileFileIntegrity.cpp:5261, at ticks=0. The prelinked kext parses this name, logs
+  # `cs_enforcement disabled by boot-arg`, then calls PE_i_can_has_debugger(NULL) and panics when
+  # it returns false. That function's only state is debug_enabled (pexpert/arm/pe_init.c:598-611),
+  # and the only writer of debug_enabled is /chosen's 4-byte "debug-enabled" (:467-481). This ADT
+  # never published it, so the value stayed FALSE. scripts/make-clover-adt.py now emits
+  # debug-enabled=1 and check-clover.py asserts it; the argument itself is unchanged, so the only
+  # variable this flash moves is the property AMFI's guard reads.
   "cs_enforcement_disable=1",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under

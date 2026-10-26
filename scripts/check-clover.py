@@ -185,6 +185,15 @@ def check_adt(errors: list) -> str:
         # node!", AppleMobileFileIntegrity.cpp:5025) unless it is a 4-byte property.
         if len(chosen["properties"].get("amfi-only-platform-code", b"")) != 4:
             errors.append("/chosen/amfi-only-platform-code is missing or is not a 4-byte integer")
+        # Round140. Round139's frame is AMFI's own "can't has cs_enforcement_disable"
+        # (AppleMobileFileIntegrity.cpp:5261): start() logs the boot arg, then panics when
+        # PE_i_can_has_debugger() is false. That function returns debug_enabled, whose only
+        # writer is /chosen's "debug-enabled" (pexpert/arm/pe_init.c:467-481). A 4-byte 1 is
+        # the development-fused value; anything else leaves the r139 panic in place.
+        if chosen["properties"].get("debug-enabled") != struct.pack("<I", 1):
+            errors.append("/chosen/debug-enabled is not a 4-byte 1: PE_i_can_has_debugger() "
+                          "would return false and AMFI would keep panicking on "
+                          "cs_enforcement_disable")
 
         memory_map = chosen["children"].get("memory-map")
         if memory_map is None:

@@ -127,14 +127,16 @@ Xcode 27 的 clang 在设备仓重建归档时不带 `-isysroot`，会拿 macOS 
 `scripts/check-clover.py` 就是 `[firmware] preflight`。它把 ADT 生成到临时文件，
 再把 Apple 的节点编码解回来，断言 `/chosen`（64 字节 `random-seed`、CHRP
 NVRAM proxy、`dram-base`、`crypto-hash-method`、`root-matching`、`display-base`、
-4 字节的 `amfi-only-platform-code`）、`/chosen/memory-map` 里恰好只有 `RAMDisk`
+4 字节的 `amfi-only-platform-code`、4 字节且为 1 的 `debug-enabled`）、`/chosen/memory-map` 里恰好只有 `RAMDisk`
 和 `TrustCache` 两个占位（出现 `PackedRAMDisk` 就报错：DarwinBoot 不接受两个
 ramdisk 槽）、
 带八个 MPIDR 值的 `/cpus`、`/psci`、带 `ranges` 与 GICv3 节点的 `/arm-io`、
-`/defaults`、`/options` 和 `/product`。board 一段钉住 `v0.4.2` 的根契约：
+`/defaults`、`/options` 和 `/product`。board 一段钉住 `v0.4.3` 的根契约：
 `packed_data_ramdisk` 必须为假，`kernel_args` 必须且只能有一个 `rd=md0s39`
 （四字符别名只喂给 `bsd_rooted_ramdisk()` 的前缀比较，不参与根声明），必须有
 `cs_enforcement_disable=1`（r138 的 exec 拒绝点在 AMFI 的 label-update 钩子），
+`/chosen/debug-enabled` 必须存在且为 4 字节 1（AMFI 只在
+`PE_i_can_has_debugger()` 为真时才接受那个参数，r139 的 panic 就出在这里），
 `/chosen/root-matching` 必须是对 OS 卷 UUID 的 `IOMedia` 属性匹配，
 `clover-apfs` 必须为 `3`，`trust_cache_sha256` 必须非空。
 
@@ -9276,6 +9278,103 @@ trustcache 56 B（`c3ed2152…`）。两个 checker 全绿。
    下一轮把探针的 `[clover] ... returned` 标记移到 exec 前后，定位新墙。
 5. **`armcpu-clock-panic=180000` 到点** —— 启动整体被兜底，按前四条的日志尾段判读。
 
+## round139 读数（v0.4.2 实机，2026-10-26）：参数送到了，但 AMFI 自己先 panic
+
+实机第一帧没有出现 `cs_enforcement disabled by boot-arg`，也没有第二次 launchd 的
+SIGKILL。屏上第一行是：
+
+```
+panic: "can't has cs_enforcement_disable" @AppleMobileFileIntegrity.cpp:5261
+```
+
+`ticks=0`，`BC=0xfffffff007a4a3b4`，整帧的时间戳落在启动约 0.32 s，比 r138 的 exec
+拒绝更早。这条 panic 不是 XNU 的 CS 核心打的，是 AMFI kext 自己的初始化路径打的。
+把预链接镜像里那个字符串的引用点找出来，整段逻辑只有六条指令：
+
+```asm
+0x4ab4ba8  adrp x0, 0x42df000 ; add x0,x0,#0xe5a   ; "cs_enforcement_disable"
+0x4ab4bb8  bl   PE_parse_boot_argn
+0x4ab4bbc  cbz  w0, 0x4ab4bec                       ; 没传 → 跳过
+0x4ab4bc0  ldr  w8,[sp,#0x20] ; cbz w8, 0x4ab4bec   ; 传了 0 → 跳过
+0x4ab4bdc  bl   IOLog("%s: cs_enforcement disabled by boot-arg\n", "AMFI")
+0x4ab4be4  bl   0x4ac9bd4                            ; 单参数守卫
+0x4ab4be8  cbz  w0, 0x4ab4fa4                        ; 返回 0 → panic thunk
+```
+
+`0x4ac9bd4` 是一个 import stub，GOT 槽在 `0x5cfaba8`。读出来的绑定目标是
+`0xfffffff007944964`，dSYM 里正是 `PE_i_can_has_debugger`：
+
+```
+PE_i_can_has_debugger(uint32_t *flags)
+  return debug_enabled;              // pexpert/arm/pe_init.c:598-611
+```
+
+也就是说 AMFI 的条件是：**只要传了 `cs_enforcement_disable`，板子就必须是“可调试”的，
+否则宁可 panic 也不许关执行策略。** 这与参数有没有送达是两个问题。r139 的帧同时证明
+了两件事：boot-arg 确实进了 kext（否则不会走到这条分支），以及我们从来没有满足它的
+前置条件。
+
+`debug_enabled` 不是 boot-arg，也没有第二个写手：`pe_arm_init()` 在
+`SecureDTLookupEntry(NULL, "/chosen")` 之后读 4 字节的 `debug-enabled`，原样拷进这个
+变量（`pexpert/arm/pe_init.c:467-481`）。开发熔断的 iBoot 会发布它；clover 的 ADT
+从 `v0.2.x` 起就没有这个属性，所以它一直是 `FALSE`。这一轮的问题因此从“AMFI 的钩子
+认不认参数”改成了“板子有没有告诉内核自己可调试”。
+
+## v0.4.3（round140）：发布 `/chosen/debug-enabled`，让 AMFI 接受那个参数
+
+改动只有一个 ADT 属性，`kernel_args` 一个字符不动：
+
+```python
+# scripts/make-clover-adt.py，/chosen 里
+("debug-enabled", u32(1)),
+```
+
+`PE_i_can_has_debugger()` 是 AMFI 在 `start()` 里唯一读取的状态，而它的唯一写手就是
+这个属性。发布 4 字节的 1 等价于告诉内核“这台设备是开发熔断的”，也正是 r139 缺的那一格。
+`scripts/check-clover.py` 新增断言：`/chosen/debug-enabled` 必须存在、必须是 4 字节、
+必须等于 1；ADT 因此从 13,476 B 增到 13,516 B（32 字节名字 + 4 字节长度 + 4 字节值）。
+board 标题升到 r140。
+
+构建命令不变：
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+**刷写范围只有 `cache` 一个分区，没有新的 eMMC 分区写入**：`fastboot flash cache
+/Users/zhouzhou/clover-out/round140-payload.img`，然后 `fastboot reboot` 冷启动。
+
+产物归档在 `~/clover-out/round140-*`，`shasum -a 256 -c round140-SHA256SUMS` 七项全部 OK：
+`payload.img` 58,720,256 B（`dd5b5b46…`）、本地 `kernel.macho` `446fe0d7…`、卷内
+`kernel.macho` 51,994,624 B（`7b702371…`，probe patch localized 成 6,680 B / 35 runs）、
+卷内 `unixnu.toml` 650 B（`aedb1c3f…`，args 末尾是
+`… rd=md0s39 cs_enforcement_disable=1 armcpu-clock-panic=180000`）、ADT 13,516 B
+（`ba88bcd6…`，比 r139 多一条 4 字节的 `debug-enabled`）、`scratch-data.img` 35,888 B
+（`614b8356…`）、trustcache 56 B（`c3ed2152…`）。两个 checker 全绿。
+
+这一帧只问一个问题：**`PE_i_can_has_debugger()` 为真之后，AMFI 会不会放过 launchd
+的第一次 exec。** 读帧顺序：
+
+1. **屏上出现 `AMFI: cs_enforcement disabled by boot-arg` 且没有 panic** —— 前置条件
+   过了，参数被接受；接着看有没有 launchd 的 SIGKILL 行。
+2. **同一条 `can't has cs_enforcement_disable` 再次出现** —— `debug-enabled` 没有到达
+   `debug_enabled`。先看 PMGR 的 args 行（确认 `cs_enforcement_disable=1` 还在），
+   再核对 ADT 里属性是否被别处覆盖；下一格是 kext 读取的 `/chosen` 与我们的 ADT 不是
+   同一个节点。
+3. **`namespace 9 code 0x8` 再次出现，且已有 `cs_enforcement disabled` 行** —— 参数与
+   前置条件都过了，拒绝仍在 MAC 钩子。下一格转去量 AMFI 的 profile region 与
+   `amfi-only-platform-code`（我们的 ADT 给的是 1，kext 把它变成
+   “不允许非平台代码”，这可能是第二道门），不再是换 boot-arg。
+4. **reason 变成带描述的一种** —— 签名校验路径开始说话（`ip_cs_error` 支路），
+   下一格是补 launchd 的 cdhash 到 trust cache。
+5. **不再有 SIGKILL，但停在 launchd 之后某处** —— 根、授权、AMFI 三层已过；
+   下一轮把探针标记移到 exec 前后，定位新墙。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -9325,7 +9424,11 @@ trustcache 56 B（`c3ed2152…`）。两个 checker 全绿。
   `bsd_rooted_ramdisk()` 读到 `md0` 前缀而跳过 ROOTAUTH。`v0.4.2` 起再加
   `cs_enforcement_disable=1`：r138 的 launchd SIGKILL 是 AMFI 的 label-update 钩子
   （`EXEC_EXIT_REASON_SECURITY_POLICY`，无描述），而这个参数是 XNU 的 CS 核心与
-  AMFI kext 自己都会读的唯一开关。payload 里仍带
+  AMFI kext 自己都会读的唯一开关。`v0.4.3` 起 ADT 再发布
+  `/chosen/debug-enabled = 1`：r139 的帧证明 AMFI 在 `start()` 里先认这个参数、随后
+  用 `PE_i_can_has_debugger()` 做前置检查，返回假就 panic
+  （`can't has cs_enforcement_disable` @AppleMobileFileIntegrity.cpp:5261），而这个
+  函数的值只由这个属性写入（`pexpert/arm/pe_init.c:467-481`）。payload 里仍带
   `scratch-data.img` 作为 `initrd`，内核会把它挂成 `md0`，但它不再是根。
   round119-121 试过把根指向 eMMC 上的 `disk0s39`/`md0s39`，round127-136 的探针证明
   「卷发布、身份、几何、读路径都正常，唯独本驱动手工 `VFS_MOUNT` 一律回 13」，

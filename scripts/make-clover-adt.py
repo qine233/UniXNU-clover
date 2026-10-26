@@ -228,6 +228,15 @@ def generate_adt(args) -> bytes:
         # code is declared. This is the same property the QEMU fixture
         # publishes, as a u32 one under /chosen.
         ("amfi-only-platform-code", u32(1)),
+        # Round140. AMFI's start() refuses to honor cs_enforcement_disable=1 unless
+        # PE_i_can_has_debugger() is true: round139's frame is its own panic,
+        # "can't has cs_enforcement_disable" @AppleMobileFileIntegrity.cpp:5261.
+        # PE_i_can_has_debugger() returns debug_enabled, and the only writer of that
+        # variable is this property -- pe_init.c:467 copies /chosen's "debug-enabled"
+        # over it (pexpert/arm/pe_init.c:55, 467-481, 598-611). A development-fused
+        # iBoot publishes it; this ADT never has, so the value stayed FALSE and the
+        # guard read zero.
+        ("debug-enabled", u32(1)),
         ("unique-chip-id", u64(args.unique_chip_id)),
         ("chip-id", u32(int(args.chip_id, 0))),
         *empty_nvram_proxy(),
