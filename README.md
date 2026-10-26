@@ -8074,6 +8074,80 @@ fastboot reboot
 dp=0x..:0x.. fl=0x.. fc=0x.. fk=0x.. op=0x..:0x.. mm=0x..:0x.. mt= st= rt= k=a/b/c/d rd= g= x=0x.. y=0x.. r= w=`
 里前九栏与 round130 逐字相同（同一颗容器、同一颗卷、同一棵树、同一个 `mnt_devvp`），新增的就是上面那五栏。
 
+## round131 读数（v0.3.4 实机）：根标志不是理由 —— 把 `mm=` 摊开之后，函数里回 13 的只有两处，两处都不是标志
+
+屏上这一行（`@CloverBlock.cpp:1192`，和发布前预测的收尾行一致，所以镜像身份无需再验）：
+
+```
+CloverBlock r131: apfs f=15797536 n=11870275 m=1 l=0 d=10 s=1 c=1 v=1 dv=1:3 bd=0 al=0
+t=0x73667061/0x0/0x0/0x0 on=0x2f fm=0x6b736964 dp=0xffffffff:0xa6dc9e20
+fl=0x4005001 fc=0x4001001 fk=0x0 op=0xfffffff0:0x05f2b3c8 mm=0xfffffff0:0x056c5fac
+mt=13 st=65535 rt=65535 k=65535/65535/65535/65535 rd=65535 g=0 x=0x0 y=0x0 r=464 w=0
+```
+
+照片把 `dp=`/`op=`/`mm=` 的高半字糊成 9 位（和 round130 一样），这一格在宿主上判定而不是靠再数一遍像素：
+`op` 落进 `__PLK_DATA_CONST`、`mm` 落进 `__PLK_TEXT_EXEC`，而且 **`op` 槽 0 读回来正好等于 `mm`**，
+所以两者的高半字是 `0xfffffff0`；`dp` 是一颗内核数据里的 vnode，取 `0xffffffff`（和同一屏控制台段那些
+`0xffffffff…` 指针同形）。
+
+**本轮那一件事的答案**：
+
+- `fl=0x4005001` 含 `0x4001` —— `mnt_flag`（`mp+0x70`）确实是 :1153 写出来的形状，这是这颗 `mount` 的第四颗布局钉子。
+- `fc=0x4001001` 恰等于 `fl & ~0x4000` —— `MNT_ROOTFS` 真的被清掉了，一位不多一位不少。
+- `mt=13`、`r=464` 一个字没变 —— 于是**启动根声明也被排除**。三个假设到此全没了：round129 之前挂在宿主上的
+  密封/非 root 凭据、round130 的 `mnt_devvp`、round131 的 `MNT_ROOTFS`。
+
+**`mm=` 白送的那一格立刻兑现**（不花刷机）：`0xfffffff0056c5fac` 在 `kernel.macho` 的文件偏移是 `0x268dfac`，
+落在 apfs.kext 的 `__PLK_TEXT_EXEC`。Xcode 的 objdump 不认这段（fileset 里它只是裸的段数据，既没有节头，
+`--section=` 报 not found，`-b binary`/`--file-type=obj` 也不接），所以按 `otool -l` 的段表用 capstone 手工走。
+函数自己报了名字：`apfs_vfsops.c` 的 **`apfs_vfsop_mount`**。它确认 `VFS_MOUNT(mp, devvp, 0, ctx)` 的
+`(*mnt_op->vfs_mount)(mp, devvp, data, ctx)` 四参形状（`kpi_vfs.c:193`），也确认 `data=0` 时它把那份
+0x144 字节的挂载参数**全清零**再往下走。
+
+整颗函数（约 1400 条指令，覆盖到 `0x56c758c` 之后的收尾）里 `mov w?, #0xd` **只有一处**：
+
+- `0xfffffff0056c69c8`，前面六条指令引用 `handle_crypto_mount`，日志格式在 `0xfffffff0045d04e9`：
+  `"%s:%d: rejecting crypto mount: OS variant is not recovery"`（`apfs_vfsops.c:1540`）。它的闸门在
+  `0xfffffff0056eb540`：读 boot-arg `rd`（没有再退 `rootdev`），要求值是 `md?` 三个字符 —— 「根是内存盘」。
+  **我们的 `rd=md0` 满足它**（`getenv` 两种返回约定下都返回 1），所以这道门按宿主推断是开的；屏上没有直接证据。
+
+第二处拒绝在同一颗函数后半，走的不是硬编码常量而是同一句 `return`：快照查找返回空（`cbz x25` @`0x56c7b5c`）、
+且卷对象 `+0x38` 那颗字节的 bit5 置位时，跳到 `0xfffffff0056c81c8`，画的是 `0xfffffff0045d009d`：
+
+```
+"Failed to find the root snapshot: %s (%d). Rooting from the live fs of a sealed volume is not allowed on a RELEASE build"
+```
+
+（`apfs_vfsops.c:2829`。）而快照名从哪来，同一段文本旁边就写着：**`/chosen` 的 `root-snapshot-name`**，
+读点在 `0xfffffff005651a54`，且只在块大小 4096 那条路上读。周边还能挖出几颗板级开关：
+`/chosen` 的 `boot-uuid`/`apfs-preboot-uuid`、`/options` 的 `enable-remap-mode`、`/defaults` 的
+`no-effaceable-storage`、`/filesystems` 的 **`DoNotUseSEP`**（`0xfffffff0056d1f14`）。我们的 ADT 一颗都没发布。
+
+**这一条主干里有现成对照**，而且 checker 的名字就叫「保留密封根的拒绝」——
+`~/UniXNU/scripts/check-original-apfs-root-checkpoints.py`：
+
+- `:51` 记录真 iPadOS 镜像里那颗 OS 卷的属性：`Status=Online`、**`Sealed=No`**、
+  `FullName=DawnUpdate21H461.J120J121J207J208OS`、`BSD Name=disk1s1`。
+- `:56-60`：挂这颗**没密封**的 OS 卷，`vfs_mount` 在同一颗栈上回 **0**，167 次读、0 次失败。
+- `:66-68`：**SystemCryptex** 那颗卷挂的时候确实是被上面那句拒的（`sealed_cryptex_root_refused=True`），
+  主干把它当负对照钉住。
+- `:104-118`：根的选择走 ADT `/chosen` 的 `root-matching` = `{IOProviderClass: IOMedia,
+  IOPropertyMatch: {UUID: <卷的 UUID>}}`，那一轮 `rd=` 与 `boot-uuid=` 都不写。
+- `:84-90`：挂上之后还有下一颗钉子 `rootvp not authenticated after mounting` —— 那是 `mt=0` 之后的事。
+
+**而我们从头到尾不知道自己在挂哪一颗卷。** `measureApfsDepth()` 是第一颗 `AppleAPFSVolume` 赢
+（`if (!depth->volumeMedia)`），`dv=1:3` 只是主次设备号，帧里没有一个字说这颗卷叫什么、密封不密封。
+上游的对照恰好是：同一颗 apfs、同一个内核，对没密封的 OS 卷回 0，对密封的 Cryptex 回这句 EACCES。
+**`mt=13` 与「我们挑中的是那颗密封的卷」完全一致，而且这是第一个不用猜标志位的解释。**
+
+**下一格的候选**（排序短清单，都只动一件事）：
+
+1. **选卷，不改挂载**：挂之前把卷的身份画出来，并挑那颗 `Sealed=No` 的 OS 卷。新增三栏自带证明 ——
+   卷的 `FullName` 前两字、`UUID` 前两字、`Sealed` 读回来的值。上游的期望是 `mt=0`。
+2. 若仍 13：**ADT 加 `/chosen { root-snapshot-name = <快照名>; }`**，给密封卷一个根快照名（宿主先解析
+   容器里到底有没有快照，这一步不花刷机就能先证伪）。
+3. `mt=0` 之后：**`/filesystems { DoNotUseSEP; }`** 与 `rootvp not authenticated` 那颗钉子。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

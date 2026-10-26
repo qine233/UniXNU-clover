@@ -1726,6 +1726,31 @@ kernel_args = [
   # from "cleared and refused anyway"), fk= is mnt_kern_flag drawn but never written, op= is
   # *(mp+0x28) and mm= is *op -- the address of the function that has been answering 13, which
   # disassembles on the host whichever way mt= goes.
+  # Round131's photograph answered it: fl=0x4005001 carries 0x4001, fc=0x4001001 is exactly fl & ~0x4000, and
+  # mt=13 / r=464 did not move -- so the boot-root declaration joins the sealed-credential (pre-round129) and
+  # mnt_devvp (round130) hypotheses as disproved. What mm= was for is now paid out: 0xfffffff0056c5fac is
+  # apfs_vfsop_mount in apfs.kext's __PLK_TEXT_EXEC (file offset 0x268dfac of kernel.macho; objdump cannot walk
+  # a fileset segment, so this was read with capstone over the segment map). Inside it, in ~1400 instructions,
+  # `mov w?, #0xd` appears once -- at 0xfffffff0056c69c8, six instructions after the "handle_crypto_mount"
+  # reference, logging "rejecting crypto mount: OS variant is not recovery" (apfs_vfsops.c:1540). Its guard,
+  # 0xfffffff0056eb540, reads boot-arg "rd" (then "rootdev") and wants a three-character "md?" -- a RAMDisk
+  # root -- which rd=md0 satisfies, so on host reasoning that gate is open. The second refusal sits later in
+  # the same function: when the root-snapshot lookup returns nothing (cbz x25 at 0xfffffff0056c7b5c) and bit 5
+  # of the volume's flag byte at +0x38 is set, it logs "Failed to find the root snapshot: %s (%d). Rooting from
+  # the live fs of a sealed volume is not allowed on a RELEASE build" (apfs_vfsops.c:2829). apfs learns that
+  # name from the device tree -- /chosen's "root-snapshot-name", read at 0xfffffff005651a54 -- and this board's
+  # ADT publishes none of the knobs that region names (boot-uuid, apfs-preboot-uuid, /options
+  # enable-remap-mode, /defaults no-effaceable-storage, /filesystems DoNotUseSEP).
+  # The base repository already carries the control for exactly that second message:
+  # scripts/check-original-apfs-root-checkpoints.py records the real iPadOS OS volume as Sealed=No
+  # (FullName DawnUpdate21H461.J120J121J207J208OS, disk1s1) and mounts it with vfs_mount returning 0 after 167
+  # reads, while retaining the sealed refusal as a negative control for the SystemCryptex volume
+  # (sealed_cryptex_root_refused=True) -- and it selects the root through /chosen's root-matching on the
+  # volume's UUID rather than through rd=. Meanwhile measureApfsDepth() takes the *first* AppleAPFSVolume it
+  # sees, and no field on this line says which volume that was. So the first explanation that does not need a
+  # guessed flag is that we have been mounting the sealed one. See README's round131 reading section for the
+  # ranked next rung (pick the unsealed volume and draw its FullName/UUID/Sealed, then root-snapshot-name,
+  # then DoNotUseSEP).
   "clover-apfs=2",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
