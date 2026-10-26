@@ -10019,6 +10019,150 @@ fastboot reboot
 4. **`map exit err=0 kr=0`** —— 缓存已映射，r145 的墙过去了；下一帧要问的是 dyld
    在拿到共享区之后停在哪，这一轮的五个打印就不再是主线。
 
+## v0.5.0（round147）：无人值守——墙上的死线、IMEM 里的原因、复位进 fastboot、宿主读卡
+
+r146 之前，每一轮都要有人守着：等屏、拍照、长按电源、再来一次。这一轮把「守」
+拆成三段可以各自检查的代码：
+
+1. **内核里的死线**（`drivers/ArmCpu`）。boot-arg `clover-unattended=<秒>`，
+   从第一个 timer tick 起按 CNTVCT/CNTFRQ 计墙钟；到点就 `panic("clover r147:
+   unattended deadline …")`。它替换了 r128 起用的 `armcpu-clock-panic=180000`：
+   那个数的是**中断次数**，只有在这颗板子的时钟周期刚好和预期一致时才是时间；
+   而无人值守要的承诺是「N 秒没有进展」，所以这一轮改数寄存器。
+   180 秒是本轮给的值：比 r145 那帧从 exec 到共享区报错长得多，又短到一帧
+   冷启动加拍照来得及。
+2. **panic 屏记因并复位**（`scripts/xnu-panic-screen.c`）。以前 panic 屏画完就
+   停在那里等人；现在它先把文本写进 logfs（kind 20，r123 起就有），然后向
+   IMEM 的 restart-reason 单元写 `0x77665501`（”bootloader”），读回确认，
+   等 20 秒走 PSCI `SYSTEM_RESET`。XBL 在下次启动时看到这个值，直接进 fastboot。
+   屏上多一行 `fb=1`（或 `0`）——这就是「原因到底写没写进去」的读数。
+3. **宿主脚本**（`scripts/run-clover-unattended.sh` + `scripts/read-clover-log.py`）。
+   等 fastboot、按需冷刷 cache、请求 recovery、等 TWRP 的 adb、从
+   `/dev/block/by-name/logfs`（带两个后备路径）读前 64 个扇区，按 16 个槽解码。
+
+### 为什么记因用 IMEM，不用 `misc`
+
+restart reason 在 clover.dtb 里是 `qcom,msm-imem@146bf000` 下的
+`restart_reason@65c`：物理 `0x146bf65c`，一个 32 位单元。IMEM 是电源域内的
+SRAM，**复位不清、掉电清**。写它既不是 eMMC 写入，也不需要 `misc` 的 BCB；
+电源键长按断电后就自然消失，没有副作用要善后。
+
+`drivers/CloverSdhci` 在这一轮多做一件事：`clover_unattended_begin()` 在
+CloverPMGR 发布完 nub 之后、eMMC 探测之前调用一次，把 IMEM 映射进来，先写
+`0x77665501` 再读回，**只有读回一致才把单元地址发布给 panic 屏**
+（`_clover_fastboot_reason`）。这样 panic 屏不必自己再去 map 一块它不认识的
+物理内存，也顺手在正常启动的 IOLog 里留下一行
+`clover r147: unattended mark 77665501 -> 77665501 deadline=180s`。
+
+代价要说清楚：**开了 `clover-unattended` 之后，原因在启动早期就写上了**，
+所以这一次启动如果成功，之后任何一次重启（包括正常 `reboot`）也会落进
+fastboot。这本就是无人值守想要的——下一轮还要读卡——但如果这轮要正常用机，
+把 boot-arg 去掉即可；不带这个参数的 panic 屏仍然只画屏、写 logfs，20 秒后
+照常复位（原因没写，XBL 走正常启动）。
+
+### 死线为什么放在 tick 里，而不是单独一个线程
+
+clover 没有 Gunyah，也没有可用的 SError/NMI 通道；能定时执行的内核上下文只有
+timer 中断。把死线挂在 tick 上意味着它和现有的 clock watchdog 用同一个观察点：
+只要这行 panic 出现了，至少有一个核还在收中断、内核还能 panic。反过来，
+**屏蔽了 IRQ 的上下文同时逃过两者**——没有 tick，也没有死线。所以主路径不是
+这个定时器，而是 panic 屏 + 宿主端的 fastboot 监视：真的完全静默时，脚本的
+`--wait` 到点退出，人再断电重启，IMEM 里的原因已经没了，走正常启动；下一次
+`panic` 仍会被屏抓住。
+
+### 宿主脚本怎么走
+
+```
+# 平板自己从 panic 复位进 fastboot 后：
+cd ~/UniXNU-clover
+scripts/run-clover-unattended.sh --allow-misc-bcb
+```
+
+它按顺序做这些事，每一步都在 stderr 说话：
+
+1. `fastboot devices` 轮询（默认 900 秒）；已有一个 adb 设备时按「已经在 TWRP」
+   处理，跳到第 4 步。
+2. `--flash-cache IMG` 可选：冷刷 cache 分区。这是**一次新的 eMMC 分区写入**，
+   脚本会在执行前把目标分区、镜像和大小打印出来；不加这个选项就不写。
+3. `fastboot reboot recovery`。这条命令可能把启动命令写进 `misc` 分区的 BCB，
+   所以要有 `--allow-misc-bcb`；没有这个参数时脚本只打印说明并退出 3，
+   不发命令。bootloader 拒绝时给出两条手动后备：断电清 IMEM 后按音量下进
+   fastboot，或者先进 TWRP 再用 `--skip-recovery`。
+4. 等 adb（默认 180 秒），确认 `ro.twrp.version` / `ro.product.device`。
+5. 依次尝试 `/dev/block/bootdevice/by-name/logfs`、`/dev/block/by-name/logfs`、
+   `/dev/block/mmcblk0p39`，用 `adb exec-out dd bs=512 count=64` 取 32 KiB，
+   校验长度和 `UXNU`/`LOG1` 魔数，落盘到 `~/clover-out/clover-logfs.bin`。
+6. 调 `read-clover-log.py --count` 解码；每个槽打印 kind、长度、校验和是否
+   对得上，正文缩进展开。退出码 0 = 读到了记录，1 = 存了 dump 但没有记录，
+   2 = 没等到 fastboot，3 = 缺 BCB 同意，4 = bootloader 拒绝 recovery，
+   5 = recovery 里没有 adb。
+
+解码器本身不依赖设备：给一个 32 KiB 的 dump 就能在宿主上读，半写的记录
+（头对、正文和不符）也会打出来——半张 panic 也是读数。整个脚本**没有一处
+`fastboot boot`**，每次启动镜像都是冷启动，`check-clover.py` 逐行断言这一点。
+
+### 构建、校验与本轮该刷哪一格
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+两个 checker 都增加了本轮契约：`check-clover.py` 断言 boot-arg 是
+`clover-unattended=180`、旧参数不在了、标题是 r147，并逐条检查驱动里的 IMEM
+常量、`PE_parse_boot_argn("clover-unattended")`、三行 IOLog、panic 屏的
+`FASTBOOT_WORD`/`fastboot_mark`/`fb=`/`reset_after`、补丁的
+`-DFASTBOOT_REASON`，以及宿主脚本的 BCB 门和两个日志路径；
+`verify-clover-payload.py` 在卷内 `kernel.macho` 里找五条格式串
+（`kernel.macho: unattended watchdog linked OK`）。这一条不是形式：patcher 现在把
+`_clover_fastboot_reason` 当成**必需符号**，缺失就构建失败（r147 之前是可选，
+静默编进 `FASTBOOT_REASON=0`，`fb=` 永远 0，和「板子拒绝记因」同形——多花一次刷机
+才分得开）。所以这份归档案存在，就说明指针在链接期解析到了。
+
+产物归档在 `~/clover-out/round147-*`，`shasum -a 256 -c round147-SHA256SUMS`
+七项全 OK：`payload.img` 58,720,256 B（`3cf89255…`）、本地 `kernel.macho`
+51,998,720 B（`a8a062c7…`）、卷内 `kernel.macho`（`5bc366ce…`，与本地只差
+entry 探针补丁，6,838 字节、35 段）、卷内 `unixnu.toml` 611 B（`6abbda6c…`，
+args 里 `armcpu-clock-panic` 已换成 `clover-unattended=180`）、ADT 13,516 B
+（`503f690a…`；`chosen/random-seed` 每次构建随机，其余未变）、
+`scratch-data.img` 35,888 B（`614b8356…`，未变）、trustcache 61,408 B
+（`7c369ce0…`，未变）。
+
+**本轮有两处 eMMC 写入，各自需要同意：**
+
+1. 刷 payload 到 `cache`（与之前每一轮相同，手动执行，只覆盖 `cache` 这一格）：
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round147-payload.img
+fastboot reboot
+```
+
+2. 宿主脚本里的 `fastboot reboot recovery` 可能写 `misc` 的 BCB，只有带上
+`--allow-misc-bcb` 才会发；不带就退出 3，一个字节都不写。
+
+菜单第一行应当是 `clover r147: mark the restart reason, reset into fastboot`，
+冷启动（不要 `fastboot boot`）。
+
+这一帧只问一个问题：**这块板子能不能在没人碰它的时候把 panic 变成一次
+可读的复位，并让宿主在 fastboot 里接住它。**
+
+1. **屏上出现 `clover r147: unattended deadline …`，`fb=1`，20 秒后黑屏复位，
+   宿主 `fastboot devices` 里出现设备** —— 三段都通了；之后 `run-clover-unattended.sh`
+   读出的 kind 20 记录就是这一帧的全文，下一轮起可以整夜跑。
+2. **出现死线 panic 但 `fb=0`** —— 屏在了，原因没写进去：看 IOLog 里
+   `unattended mark … read back …`/`imem map failed` 那行的地址，说明是 map
+   还是写回读的问题；这一帧不会自己进 fastboot，但仍然存了 logfs 记录。
+3. **没有死线 panic，只有 r146 那种静默** —— 当前上下文屏蔽了 IRQ（或时钟早
+   就停了）：定时器这条路走不到，按上面说的断电重来；这本身就把「静默发生在
+   屏蔽中断的上下文」钉死了。
+4. **panic 屏出现但 20 秒内没复位** —— PSCI 这台固件没接受 `SYSTEM_RESET`；
+   下一轮该查 UEFI 侧的 PSCI conduit（`psci-method smc` 已在 ADT 里），
+   而不是内核。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

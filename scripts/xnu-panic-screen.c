@@ -1,4 +1,5 @@
-/* Draw a kernel panic message, with its arguments, on the frame buffer, then stop.
+/* Draw a kernel panic message, with its arguments, on the frame buffer, mark the
+ * board's restart reason so XBL comes back up in fastboot, then reset.
  * With no usable vinfo yet (panic before the video console exists) there is
  * nothing to draw on, so that case resets after twelve seconds instead; a panic
  * after arm_vm_init dropped the bootstrap identity map, where the seeded vinfo
@@ -68,6 +69,22 @@ struct ctx {
 #endif
 #define PANIC_LOG_BYTES 480
 
+/* Round147: the unattended contract. drivers/CloverSdhci maps IMEM once per boot
+ * (clover-unattended=<seconds>), proves the restart-reason cell reads back, and
+ * publishes its address through this global. The patcher resolves the global's
+ * address here, not the cell's: the cell is volatile (never written to eMMC) and
+ * only exists once that driver has run, so a panic before it leaves the pointer
+ * zero and the board resets normally instead of writing to a guess.
+ * 0x77665501 is "bootloader" in the low cell XBL reads on this board; the stock
+ * kernel writes the same word for `reboot bootloader`. */
+#ifndef FASTBOOT_REASON
+#define FASTBOOT_REASON 0UL
+#endif
+#define FASTBOOT_WORD 0x77665501u
+/* How long the finished screen stays up before PSCI SYSTEM_RESET. The record is
+ * already on the card by then; this is time for a photograph. */
+#define PANIC_RESET_SECONDS 20
+
 /* Round125 asks the panic screen what the console itself was doing. The patcher resolves these four
  * kernel addresses the same way it resolves the counters above; a kernel whose symbol table lacks one
  * leaves the macro at 0 and the corresponding line is drawn as dashes. */
@@ -131,10 +148,39 @@ static void clean_seeded (volatile struct vc_info *v)
   __asm__ volatile ("dsb sy" : : : "memory");
 }
 
-/* Wait `seconds` (on the 19.2 MHz counter) and reboot through PSCI. */
+static int mapped (u64 a);
+
+/* Ask the board for fastboot on the next reset: write FASTBOOT_WORD into the
+ * restart-reason cell the driver published, then read it back. Returns 1 only
+ * when the cell actually holds the word afterwards, which is what the screen's
+ * fb= line reports. Both addresses are queried first: FASTBOOT_REASON lives in
+ * the driver's data, which may not be mapped if the panic happened before that
+ * driver initialized the VM, and the cell lives in IMEM outside the kernel map. */
+static int fastboot_mark (void)
+{
+  volatile u32 *cell;
+
+  if (FASTBOOT_REASON == 0UL || !mapped (FASTBOOT_REASON)) {
+    return 0;
+  }
+  cell = *(volatile u32 *volatile *)FASTBOOT_REASON;
+  if ((u64)cell == 0 || !mapped ((u64)cell)) {
+    return 0;
+  }
+  *cell = FASTBOOT_WORD;
+  __asm__ volatile ("dsb sy" : : : "memory");
+  __asm__ volatile ("dmb sy" : : : "memory");
+  return *cell == FASTBOOT_WORD;
+}
+
+/* Wait `seconds` (on the 19.2 MHz counter) and reboot through PSCI. The reason
+ * is marked before the wait, so the reset that follows is a fastboot reset even
+ * when the caller could not draw (reset_unseen/reset_unmapped). */
 __attribute__((noreturn)) static void reset_after (u64 seconds)
 {
   u64 deadline;
+
+  (void)fastboot_mark ();
   __asm__ volatile ("mrs %0, cntpct_el0" : "=r" (deadline));
   deadline += seconds * 19200000ULL;
   for (;;) {
@@ -396,7 +442,7 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   volatile struct vc_info *v = (volatile struct vc_info *)VINFO;
   struct ctx g;
   u8 logbuf[PANIC_LOG_BYTES + 1];
-  u32 row, col;
+  u32 row, col, fb;
 
   __asm__ volatile ("msr daifset, #15");
   g.base = (u8 *)v->v_baseaddr;
@@ -409,12 +455,16 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   if (!mapped ((u64)g.base)) {
     reset_unmapped ();
   }
+  /* Mark before drawing anything: a fault later in this function must still
+   * leave the board pointed at fastboot, and the reset paths below mark again. */
+  fb = fastboot_mark () ? 1 : 0;
 
   /* First panic wins: a marker in the last row's first two pixels means a panic already drew
-   * the screen; a later panic (another thread or exception) must not overwrite it. */
+   * the screen; a later panic (another thread or exception) must not overwrite it -- but it
+   * must not freeze the board either, so it only brings the reset forward. */
   volatile u32 *mark = (volatile u32 *)(g.base + (u64)(g.h - 1) * g.rb);
   if (mark[0] == 0xC0FFEE11u && mark[1] == 0x5CEEDA7Au) {
-    park ();
+    reset_after (PANIC_RESET_SECONDS);
   }
   g.x = 0;
   g.y = g.h / 8;
@@ -558,6 +608,12 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
     text (&g, "\nelog=");
     number (&g, written, 10, 0, 0);
   }
+  /* Whether the reset that follows will land in fastboot. 1 means the reason
+   * cell read back FASTBOOT_WORD, 0 means no cell this boot (the driver did not
+   * run) and the reset is an ordinary one. Drawn after the sink so the record on
+   * the card does not contain it, like elog=. */
+  text (&g, "\nfb=");
+  number (&g, fb, 10, 0, 0);
   /* The raw argument slots are not dumped: the formatted message above already carries them (room for the PANIC_TEXT copy). */
   mark[0] = 0xC0FFEE11u;
   mark[1] = 0x5CEEDA7Au;
@@ -565,7 +621,7 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   if (v->v_type == VINFO_SEED) {
     clean_seeded (v);
   }
-  park ();
+  reset_after (PANIC_RESET_SECONDS);
 }
 
 /* Entry from panic(): keep the stack pointer, which addresses the variadic

@@ -260,6 +260,30 @@ def check_shared_region_probe(kernel: bytes) -> bool:
     return ok
 
 
+def check_unattended(kernel: bytes) -> bool:
+    """Round147 makes a boot answer without anyone watching: ArmCpu panics at a wall-clock
+    deadline, the panic screen marks the board's restart reason for fastboot and resets,
+    CloverSdhci publishes the IMEM cell and marks it as soon as PMGR runs. All three live
+    behind format strings -- the deadline's panic, the driver's three IOLog lines, and the
+    screen's `fb=` row -- because none of them can add a symbol the layout file lacks. A
+    frame that stops at a parked panic screen looks exactly like a solved round, so the
+    image has to carry all five."""
+    label = "kernel.macho: unattended watchdog linked"
+    found = {name: name.encode() in kernel
+             for name in ("clover r147: unattended deadline %llu s (elr=%llx spsr=%llx"
+                          " ticks=%llu cnt0=%llx cnt1=%llx freq=%llx)",
+                          "clover r147: unattended mark %x -> %x deadline=%us\n",
+                          "clover r147: unattended mark %x read back %x\n",
+                          "clover r147: unattended imem map failed %llx\n",
+                          "\nfb=")}
+    ok = all(found.values())
+    detail = ", ".join(f"{(name.split(':', 1)[1] if ':' in name else name).strip()[:28]}"
+                       f" {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def report(image: pathlib.Path) -> int:
     print(f"== {image}")
     ok = True
@@ -334,6 +358,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_root_mount_probe(kernel)
         ok &= check_shared_region_probe(kernel)
         ok &= check_mac_probe(kernel)
+        ok &= check_unattended(kernel)
     return 0 if ok else 1
 
 

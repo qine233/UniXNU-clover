@@ -38,8 +38,13 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         so time is the signal.
   panic screen (--panic-screen)         panic() and its common panic funnel draw
                                         their format string on the kernel's own
-                                        frame buffer mapping and stops
-                                        (scripts/xnu-panic-screen.c).
+                                        frame buffer mapping
+                                        (scripts/xnu-panic-screen.c), mark the
+                                        board's restart reason through the
+                                        pointer CloverSdhci exports, and reset
+                                        into fastboot 20 s later. A panic before
+                                        that driver ran has no pointer and gets
+                                        the plain reset.
                                         --no-reset leaves out stages 3 and 4.
   stage 4 (--reset-after SYMBOL)        the same wait and reset, but placed after
                                         the call to SYMBOL in --in FUNCTION (the
@@ -898,6 +903,18 @@ def assemble_c(source, va, workdir, symbols):
         if not any(base <= sink and sink + 4 <= base + size for base, size, _, _ in SEGMENTS):
             raise SystemExit('Invalid _clover_emmc_panic_append')
         definitions.append(f'-DPANIC_SINK={sink:#x}UL')
+    # Round147: the same driver maps IMEM's restart-reason cell and exports its address through this
+    # pointer. The screen resolves the pointer's own address (SEGMENTS containment, 8-byte aligned)
+    # and writes "bootloader" through it just before PSCI SYSTEM_RESET, so the reset lands in
+    # fastboot. This symbol is required rather than optional: a kernel whose driver lost it would
+    # still build and still show `fb=0`, which reads like a board that refuses the mark and costs a
+    # flash to tell apart. The failure belongs here, where it names the missing symbol.
+    reason = symbols.get('_clover_fastboot_reason')
+    if reason is None:
+        raise SystemExit('Missing _clover_fastboot_reason: the panic screen could not mark fastboot')
+    if reason % 8 or not any(base <= reason and reason + 8 <= base + size for base, size, _, _ in SEGMENTS):
+        raise SystemExit('Invalid _clover_fastboot_reason')
+    definitions.append(f'-DFASTBOOT_REASON={reason:#x}UL')
     # Round125 puts the console itself on the panic screen: the ring buffer's three counters, the flags
     # that make console_write() drop bytes silently, and the one tty this board has. `console_ring` is
     # file-static in osfmk/console/serial_console.c, but this kernel carries STABS, so llvm-nm still

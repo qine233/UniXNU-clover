@@ -119,6 +119,15 @@ static uint64_t gClockPanic = 0;
 static uint64_t gTick0Counter = 0;
 static uint64_t gTickCounterFrequency = 0;
 
+// Round147 (boot-arg clover-unattended=<seconds>, 0 = never): a wall-clock deadline, not a tick
+// count. gClockPanic counts interrupts, which is the same thing only while the clock is the one
+// this board expects; the unattended contract promises "no progress for N seconds -> fastboot", so
+// it measures CNTVCT against CNTFRQ from the first tick. CloverSdhci marks the restart reason at
+// the same argument, so the panic this raises resets into fastboot instead of sitting on a screen.
+// A context that masks IRQs still escapes both: no tick, no deadline. That is why the panic screen
+// and not this timer is the primary path, and why the host also watches for fastboot.
+static uint64_t gUnattendedSeconds = 0;
+
 static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
 
 static uint32_t read32 (uintptr_t base, unsigned offset)
@@ -403,6 +412,9 @@ bool ArmCpu::start (IOService *provider)
   unsigned clockPanic = 0;
   PE_parse_boot_argn ("armcpu-clock-panic", &clockPanic, sizeof (clockPanic));
   gClockPanic = clockPanic;
+  unsigned unattended = 0;
+  PE_parse_boot_argn ("clover-unattended", &unattended, sizeof (unattended));
+  gUnattendedSeconds = unattended;
   unsigned diagnostic = 0;
   PE_parse_boot_argn("armcpu-diagnostics", &diagnostic, sizeof(diagnostic));
   diagnosePower=diagnostic==1;
@@ -606,7 +618,7 @@ void ArmCpu::interrupt (void)
     if ((id & 0xffffff) >= 1020) { armcpu_irq_phase=0;break; }
     if(diagnosePower && ++drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
     if ((id & 0xffffff) == armcpu_timer_intid) {
-      if (gClockPanic != 0 && armcpu_timer_interrupts == 0) {
+      if ((gClockPanic != 0 || gUnattendedSeconds != 0) && armcpu_timer_interrupts == 0) {
         // The first tick is the start of the ruler: everything between this counter value and the
         // watchdog's, divided by the ticks in between, is the timer period in counter units, and
         // CNTFRQ turns that into seconds. Read once, here, so a trapped CNTFRQ could not disturb a
@@ -619,6 +631,19 @@ void ArmCpu::interrupt (void)
       armcpu_irq_phase=2;
       rtclock_intr (0);
       armcpu_irq_phase=3;
+      // Round147 comes first: it is a wall-clock promise, and its message names the contract rather
+      // than a tick count. The deadline is measured from the first tick, so it describes silence
+      // after the clock started, not time spent in arm_init before that.
+      if (gUnattendedSeconds != 0 && gTickCounterFrequency != 0) {
+        const uint64_t now = counter ();
+        if (now - gTick0Counter >= gUnattendedSeconds * gTickCounterFrequency) {
+          uint64_t elr = 0, spsr = 0;
+          __asm__ volatile ("mrs %0, elr_el1; mrs %1, spsr_el1" : "=r" (elr), "=r" (spsr));
+          panic ("clover r147: unattended deadline %llu s (elr=%llx spsr=%llx ticks=%llu cnt0=%llx cnt1=%llx freq=%llx)",
+                 gUnattendedSeconds, entryElr, entrySpsr, armcpu_timer_interrupts, gTick0Counter, now,
+                 gTickCounterFrequency);
+        }
+      }
       // Closer the clock can be observed without any process cooperating: reaching the count is itself the reading, and the panic screen
       // keeps the first panic, so a probe that finished earlier is not overwritten by this one.
       if (gClockPanic != 0 && armcpu_timer_interrupts >= gClockPanic) {

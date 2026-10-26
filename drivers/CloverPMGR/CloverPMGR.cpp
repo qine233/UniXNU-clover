@@ -45,6 +45,10 @@ __attribute__((noinline)) void clover_pmgr_checkpoint(void) { __asm__ volatile("
 // IOKit personality (see that file's header comment). It is opt-in through its own boot argument
 // and returns without touching anything when `clover-emmc` is absent.
 void clover_emmc_run(void);
+// Round147: same driver, same schedule point. Maps IMEM's restart-reason cell, proves it reads
+// back and publishes it for the panic screen, so every later reset lands in fastboot. Returns at
+// once when `clover-unattended` is absent.
+void clover_unattended_begin(void);
 }
 
 // The panic screen prints these lines, so the reading survives even when the console is the
@@ -200,6 +204,12 @@ extern "C" void sheng_pmgr_run(void)
   OSSafeReleaseNULL(matched);
   OSSafeReleaseNULL(description);
   clover_pmgr_checkpoint();
+  // Round147: arm the reset path before the eMMC bring-up, the next thing in this boot that can
+  // panic. It maps IMEM, writes the restart reason XBL reads and publishes the cell only if the
+  // read-back agreed; CloverSdhci keeps the mapping alive for the panic screen. Absent
+  // `clover-unattended`, this returns immediately. A panic in the PMGR steps above still resets,
+  // just not into fastboot: there is no cell to mark until this line has run.
+  clover_unattended_begin();
   // Only once the publication above held, so an eMMC reading and a failed PMGR step can never
   // share a photograph: CloverPMGR's own panic comes first and names its own stage.
   clover_emmc_run();

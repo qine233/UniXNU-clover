@@ -746,6 +746,112 @@ def check_board(errors: list) -> str:
             errors.append(f"{region.name} lacks {needle!r}: that half of the shared-region question "
                           "would come back blank")
 
+    # Round147. Every previous round ended in a state the host had to look at: a panic screen that
+    # parks, a tick-count watchdog, and no way back in without a hand on the tablet. The unattended
+    # contract makes the board answer by itself: ArmCpu turns clover-unattended=<seconds> into a
+    # CNTVCT deadline, CloverSdhci marks IMEM's restart-reason cell at boot and publishes it to the
+    # panic screen, the panic screen writes "bootloader" and resets through PSCI after 20 s, and the
+    # host waits for fastboot, asks for recovery and decodes logfs. Any missing link turns
+    # "unattended" back into "silent until someone picks it up", which is the failure this round
+    # exists to remove, so each link is named here rather than discovered on the panel.
+    kernel_args = board["payload"]["kernel_args"]
+    if "clover-unattended=180" not in kernel_args:
+        errors.append('[payload] kernel_args has no clover-unattended=180: the unattended deadline '
+                      "would be off")
+    if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
+        errors.append("[payload] kernel_args still carries armcpu-clock-panic=: round147 replaces "
+                      "the tick count with the wall-clock deadline, and two deadlines would race")
+    if not board["payload"]["title"].startswith("clover r147:"):
+        errors.append('[payload] title is not "clover r147: ...": the menu would not name this round')
+
+    links = [
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         "volatile uint32_t *clover_fastboot_reason = nullptr;",
+         "the panic screen would have no cell to mark"),
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         "static const uint64_t kImemPhys = 0x146bf000ULL;",
+         "IMEM would not be mapped at this board's restart-reason base"),
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         "static const uint32_t kRestartReasonOffset = 0x65c;",
+         "the cell would not be the one clover.dtb's restart_reason@65c names"),
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         "static const uint32_t kRestartFastboot = 0x77665501u;",
+         "the word would not be the one the stock kernel writes for reboot bootloader"),
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         'PE_parse_boot_argn ("clover-unattended"',
+         "the driver would never arm from the round's own boot argument"),
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         'IOLog ("clover r147: unattended mark %x -> %x deadline=%us\\n"',
+         "a boot would not say on the panel that the mark was accepted"),
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         "clover_fastboot_reason = cell;",
+         "the cell would never be published, so every reset would be an ordinary one"),
+        ("drivers/CloverPMGR/CloverPMGR.cpp",
+         "clover_unattended_begin();",
+         "nothing would call the ARM step, so the cell would stay unmarked"),
+        ("drivers/ArmCpu/ArmCpu.cpp",
+         'PE_parse_boot_argn ("clover-unattended", &unattended, sizeof (unattended));',
+         "the watchdog would not see the round's deadline argument"),
+        ("drivers/ArmCpu/ArmCpu.cpp",
+         "clover r147: unattended deadline %llu s",
+         "the deadline panic would be indistinguishable from the old tick watchdog"),
+        ("scripts/xnu-panic-screen.c",
+         "#define FASTBOOT_WORD 0x77665501u",
+         "the screen would mark the cell with something XBL does not read as fastboot"),
+        ("scripts/xnu-panic-screen.c",
+         "#define PANIC_RESET_SECONDS 20",
+         "the screen would keep parking instead of resetting after a bounded wait"),
+        ("scripts/xnu-panic-screen.c",
+         "static int fastboot_mark (void)",
+         "no code path would write the reason before PSCI"),
+        ("scripts/xnu-panic-screen.c",
+         'text (&g, "\\nfb=");',
+         "a photograph could not say whether the reset would land in fastboot"),
+        ("scripts/xnu-panic-screen.c",
+         "reset_after (PANIC_RESET_SECONDS);",
+         "the screen would never leave the panel by itself"),
+        ("scripts/patch-xnu-entry-probe.py",
+         "raise SystemExit('Missing _clover_fastboot_reason: the panic screen could not mark fastboot')",
+         "a kernel without the pointer would build a screen whose fb= is always 0"),
+        ("scripts/patch-xnu-entry-probe.py",
+         "-DFASTBOOT_REASON={reason:#x}UL",
+         "the resolved cell pointer would not reach the screen's compiler"),
+        ("scripts/run-clover-unattended.sh",
+         "fastboot reboot recovery",
+         "the host half would have no way from fastboot to recovery"),
+        ("scripts/run-clover-unattended.sh",
+         "--allow-misc-bcb",
+         "the BCB write the bootloader may perform would happen without declared consent"),
+        ("scripts/run-clover-unattended.sh",
+         "read-clover-log.py",
+         "the dump would never be decoded"),
+        ("scripts/read-clover-log.py",
+         "0x554E5855",
+         "the decoder would not recognize the writer's magic"),
+        ("scripts/read-clover-log.py",
+         "unixnu clover emmc log",
+         "the decoder would not recognize the prefix the driver stores"),
+        ("scripts/read-clover-log.py",
+         "--count",
+         "run-clover-unattended.sh would have no machine-readable record count"),
+    ]
+    for relative, needle, why in links:
+        path = REPO / relative
+        if not path.is_file():
+            errors.append(f"{relative} is missing: {why}")
+            continue
+        if needle not in path.read_text():
+            errors.append(f"{relative} lacks {needle!r}: {why}")
+    host = REPO / "scripts/run-clover-unattended.sh"
+    if host.is_file():
+        # `fastboot boot` is forbidden everywhere in this port: the image must be cold-booted from
+        # a partition, never handed to the bootloader from the host. The script's own header names
+        # the rule, so only lines that would execute it count.
+        for line in host.read_text().splitlines():
+            if line.strip().startswith("fastboot boot"):
+                errors.append("run-clover-unattended.sh invokes `fastboot boot`: this port boots "
+                              "images only from a partition")
+
     splash = [entry for entry in board.get("bootimg", {}).get("dtb_node", [])
               if "splash" in entry["path"]]
     if splash:

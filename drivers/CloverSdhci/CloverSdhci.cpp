@@ -212,6 +212,11 @@ volatile uint64_t clover_emmc_observation[16];
 // The formatted report, one %s argument, so the panic screen's argument list cannot shift.
 char clover_emmc_report[512];
 volatile uint32_t clover_emmc_stage = 0;
+// Round147: the restart-reason cell, once clover_unattended_begin() has mapped IMEM and proved the
+// cell reads back. The panic screen resolves this pointer's own address (patch-xnu-entry-probe.py
+// passes it as FASTBOOT_REASON) and writes the word through it just before PSCI SYSTEM_RESET.
+// Null means the cell is not available this boot: the screen then resets normally.
+volatile uint32_t *clover_fastboot_reason = nullptr;
 // drivers/CloverBlock's entry points: mode 21 asks for the boot's block device, and the block run
 // itself is deferred to the IOBSD resource publication because it needs devfs and the vnode tables
 // vfsinit() builds (round113 proved the early run gets no devfs node at all).
@@ -254,6 +259,18 @@ static volatile uint32_t gBlockWindowSectors = 0;
 // through the window below, finds the OS window inside it, and re-scopes the media to that.
 static volatile uint32_t gBlockUserDataFirst = 0;
 static volatile uint32_t gBlockUserDataSectors = 0;
+
+// Round147, unattended boot. clover.dtb has restart_reason@65c under qcom,msm-imem@146bf000, and
+// the stock kernel's `reboot bootloader` writes 0x77665501 there before its PSCI reset; XBL reads
+// that word on the way up and comes back in fastboot instead of Android. IMEM is SRAM, so arming
+// the cell touches no partition and no card: unlike a `misc` BCB it costs nothing and cannot be
+// left half-written. This driver owns the mapping because the panic screen is freestanding and
+// cannot map anything; it publishes the cell's address only after the read-back below agrees.
+static const uint64_t kImemPhys = 0x146bf000ULL;
+static const uint64_t kImemSize = 0x1000ULL;
+static const uint32_t kRestartReasonOffset = 0x65c;
+static const uint32_t kRestartFastboot = 0x77665501u;
+static OSSharedPtr<IOMemoryMap> gImemMap;
 
 // Mode 17 stores the report as text, so the first bytes of the block identify it when read on
 // another OS. The newline is part of the stored length: the block reads as a small text file.
@@ -3798,6 +3815,43 @@ extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int
     return 5;
   }
   return 100 + slot;
+}
+
+// Round147: arm the unattended contract. Called from CloverPMGR right after it publishes its nub,
+// which is the first point in this boot with working IOKit mapping -- before launchd and before
+// anything that can panic for a reason worth reading. This half only makes resets land in fastboot;
+// the deadline itself lives in ArmCpu, which measures clover-unattended=<seconds> on CNTVCT from
+// the first timer tick and panics when it expires. Both parse the same argument, so one boot arg
+// turns on the pair. Silent when the argument is absent; a mapping or read-back failure prints one
+// line and leaves the pointer null, which makes the panic screen's reset an ordinary one.
+extern "C" void clover_unattended_begin (void)
+{
+  unsigned seconds = 0;
+  if (!PE_parse_boot_argn ("clover-unattended", &seconds, sizeof (seconds)) || !seconds) {
+    // Not asked for. ArmCpu arms no deadline for the same argument, so nothing is pending.
+    return;
+  }
+  if (gImemMap) {
+    return;
+  }
+  const uintptr_t base = mapRange (gImemMap, kImemPhys, kImemSize);
+  if (!base) {
+    IOLog ("clover r147: unattended imem map failed %llx\n",
+           static_cast<unsigned long long> (kImemPhys));
+    return;
+  }
+  volatile uint32_t *cell = reinterpret_cast<volatile uint32_t *> (base + kRestartReasonOffset);
+  cell[0] = kRestartFastboot;
+  __asm__ volatile ("dsb sy" ::: "memory");
+  const uint32_t readback = cell[0];
+  if (readback != kRestartFastboot) {
+    // A cell that does not hold the word is not a cell the panic screen should write either.
+    IOLog ("clover r147: unattended mark %x read back %x\n", kRestartFastboot, readback);
+    return;
+  }
+  clover_fastboot_reason = cell;
+  IOLog ("clover r147: unattended mark %x -> %x deadline=%us\n",
+         kRestartFastboot, readback, seconds);
 }
 
 extern "C" void clover_emmc_run (void)
