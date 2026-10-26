@@ -139,10 +139,14 @@ def check_block(kernel: bytes) -> bool:
     three public state answers (mo=/mc=/mw=). Any of them going missing means the round silently asks
     nothing -- the failure shape check-clover.py refuses to let the archives have. Round136 corrects that
     request to min(media size, 512) and adds the media's own geometry (ms=/bs=/mb=), the request it really
-    made (ml=/md=), and the media the mount's own dev_t resolves to (xm=/xe=/xs=/xo=/xw=/xr=/xa=/wo=)."""
+    made (ml=/md=), and the media the mount's own dev_t resolves to (xm=/xe=/xs=/xo=/xw=/xr=/xa=/wo=).
+    Round137 adds the boot path beside it: `CloverBlock r137: boot` is the line that names the volume the
+    kernel's own root search will mount, its `vu=%s bsd=%s %u:%u p=%u` format is what carries the UUID and
+    dev_t to the photograph, and the probe's panic line stays because clover-apfs=2 is still compiled in."""
     label = "kernel.macho: CloverBlock linked"
     found = {name: name.encode() in kernel
-             for name in ("clover-apfs", "CloverBlock r136: apfs",
+             for name in ("clover-apfs", "CloverBlock r137: apfs",
+                          "CloverBlock r137: boot", "vu=%s bsd=%s %u:%u p=%u",
                           "fl=0x%x fc=0x%x fk=0x%x", "op=0x%x:0x%x mm=0x%x:0x%x",
                           "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x",
                           "dr=%u db=%u dx=0x%x dy=0x%x na=%u ir=0x%x ia=%u "
@@ -186,6 +190,21 @@ def report(image: pathlib.Path) -> int:
         same = inside == disk.read_bytes()
         ok &= same
         print(f"{label:42} {'OK' if same else 'DIFFERS'}")
+
+    # Round137's root is not the initrd; it is the APFS volume /chosen names. A payload whose ADT
+    # lost the dictionary boots nothing, and the kernel would wait at IOFindBSDRoot for ten timeouts.
+    adt = blobs.get("kernel.macho.adt")
+    label = "ADT: root-matching names the OS volume"
+    wanted = b"root-matching"
+    uuid = b"04769D26-2CA0-4825-B443-E2E5F88300F2"
+    if adt is None:
+        print(f"{label:42} SKIPPED")
+        ok = False
+    else:
+        present = wanted in adt and uuid in adt and b"IOMedia" in adt
+        ok &= present
+        print(f"{label:42} {'OK' if present else 'FAIL'} "
+              f"({'UUID present' if uuid in adt else 'UUID ABSENT'})")
 
     # The kernel slot cannot be a byte-equality check: `unixnu build payload`
     # writes the entry probes from board.toml (entry_probe_reset_*) into the

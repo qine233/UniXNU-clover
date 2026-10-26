@@ -131,7 +131,7 @@
 // Nothing else about the mount moves, so the frame either shows the identity the host already read out of
 // the flashed bytes and still says 13, or it says something the host did not predict.
 //
-// A failure panics with one short CloverBlock r136 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r137 line naming the step; success prints one line
 // and lets the boot continue, except under a window (clover-apfs=1 or =2), where the APFS depth and
 // what the vfs made of it are the report and the run always panics with them. A refire of the IOBSD
 // notification prints one counted line and returns, so the photograph shows both that the run
@@ -697,7 +697,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r136: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r137: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 static uint32_t le32At(const uint8_t *at)
@@ -1492,6 +1492,59 @@ static void volumeMountLadder(IOMedia *whole, IOMedia *volume, IOService *client
   vnode_put(dir);
 }
 
+// Round 137 stops asking and starts booting. Whatever produced the 13 that this file's own VFS_MOUNT
+// kept getting, vfs_mountroot() does not call that rung for apfs: it calls the filesystem's
+// vfc_mountroot when the vfstable registers one (bsd/vfs/vfs_subr.c:1247-1255), and the root it hands
+// over is the IOMedia whose UUID /chosen's root-matching names. So this function mounts nothing. It
+// loads apfs.kext, waits until the volume exists and IOMediaBSDClient has named it, prints which
+// volume it is, and returns; IOFindBSDRoot's wait and vfs_mountroot() run immediately after this
+// handler returns, still inside the same bsd_autoconf.
+static void prepareApfsBoot(IOMedia *whole)
+{
+  kern_return_t loaded = OSKextLoadKextWithIdentifier(kApfsKext);
+  if (loaded) {
+    fail("apfsload", static_cast<uint32_t>(loaded));
+  }
+  ApfsDepth found{};
+  uint32_t passes = 0;
+  for (; passes < 12000 && !found.volumeMedia; passes++) {
+    ApfsDepth now{};
+    measureApfsDepth(whole, &now, 0);
+    if (now.volumeMedia) {
+      found.volumeMedia = now.volumeMedia;
+      found.identity = now.identity;
+      found.volumeCount = now.volumeCount;
+      found.unsealedCount = now.unsealedCount;
+    }
+    IOSleep(10);
+  }
+  if (!found.volumeMedia) {
+    fail("apfsvol", passes);
+  }
+  // The UUID is what root-matching matches, and the BSD name/major/minor are what IOFindBSDRoot turns
+  // into rootdev. They are published by different clients after the media exists, so returning as soon
+  // as the node appears would race the naming; the wait is for the pair.
+  const char *devname = nullptr;
+  uint32_t major = 0xffffffff;
+  uint32_t minor = 0xffffffff;
+  bool named = false;
+  for (uint32_t attempt = 0; attempt < 1000; attempt++) {
+    if (volumeBsd(found.volumeMedia, &devname, &major, &minor)) {
+      named = true;
+      break;
+    }
+    IOSleep(10);
+  }
+  const char *uuid = stringProperty(found.volumeMedia, kVolumeUuidKey);
+  IOLog("CloverBlock r137: boot v=%u un=%u vu=%s bsd=%s %u:%u p=%u\n",
+        found.volume, found.unsealedCount, uuid ? uuid : "?",
+        devname ? devname : "?", major, minor, passes);
+  found.volumeMedia->release();
+  if (!named) {
+    fail("apfsbsd", passes);
+  }
+}
+
 // The whole of rounds 127 and 128, and it never returns: the console is the thing this board cannot
 // trust this late, so the depth is drawn on the panic screen like every other reading since round121.
 __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *client)
@@ -1628,7 +1681,7 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
     volumeMountLadder(whole, best.volumeMedia, client, &report);
   }
 
-  panic("CloverBlock r136: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u "
+  panic("CloverBlock r137: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u "
         "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x vn=0x%x/0x%x/0x%x/0x%x dv=%u:%u bd=%u al=%u "
         "t=0x%x/0x%x/0x%x/0x%x on=0x%x fm=0x%x dp=0x%x:0x%x fl=0x%x fc=0x%x fk=0x%x "
         "op=0x%x:0x%x mm=0x%x:0x%x mt=%u st=%u rt=%u k=%u/%u/%u/%u "
@@ -1679,7 +1732,7 @@ extern "C" void clover_block_run(void)
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    IOLog("CloverBlock r136: refire n=%u (already ran)\n", fires);
+    IOLog("CloverBlock r137: refire n=%u (already ran)\n", fires);
     return;
   }
 
@@ -1698,7 +1751,7 @@ extern "C" void clover_block_run(void)
   // right the first time anything reads it.
   uint32_t apfs = 0;
   if (PE_parse_boot_argn("clover-apfs", &apfs, sizeof(apfs)) && apfs) {
-    if (apfs == 2) {
+    if (apfs == 2 || apfs == 3) {
       uint32_t first = 0;
       uint32_t sectors = 0;
       clover_emmc_block_userdata_window(&first, &sectors);
@@ -1768,7 +1821,15 @@ extern "C" void clover_block_run(void)
   // filesystem lives on top of this tree. Round127's window was a bare container, so it had no
   // partition scheme, no disk0s39 and nothing for those steps to measure; round128's does carry a GPT,
   // and the automatic pass will slice it, but the question stays the same one level up.
+  //
+  // Round137 splits the two jobs the window was doing. `clover-apfs=2` keeps the probe (and its
+  // never-returning panic); `clover-apfs=3` is the boot: make the volume exist and return, so the
+  // kernel's own root search and mount run with the standard apfs mountroot instead of this file's.
   if (__atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE)) {
+    if (apfs == 3) {
+      prepareApfsBoot(whole);
+      return;
+    }
     apfsProbe(whole, device);
   }
 
@@ -1893,7 +1954,7 @@ extern "C" void clover_block_run(void)
     fail("alias-match", reinterpret_cast<uint64_t>(aliasService));
   }
 
-  IOLog("CloverBlock r136: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
+  IOLog("CloverBlock r137: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
         kRootAlias, bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
 }

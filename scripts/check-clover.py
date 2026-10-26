@@ -45,19 +45,18 @@ TIMEBASE_HZ = 19200000
 
 REQUIRED_CHOSEN = ["random-seed", "nvram-proxy-data", "nvram-bank-size", "dram-base",
                    "dram-size", "crypto-hash-method", "display-base",
-                   "unique-chip-id", "amfi-only-platform-code"]
-# /chosen/root-matching is the round119 failure and must stay absent. IOFindBSDRoot
-# (IOKitBSDInit.cpp:790-797) deserializes it into its `matching` dictionary and `continue`s, so the
-# `rd=` branch at :888 -- which is the only thing that turns `rd=md0s39` into a wait on the media
-# CloverBlock publishes -- never runs; the kernel then waits on a volume UUID no service here
-# carries and panics at :984. It has exactly one reader in the tree, so nothing else loses it.
-FORBIDDEN_CHOSEN = ["root-matching"]
-# One RAMDisk placeholder, no PackedRAMDisk: the mockfs image (scripts/make-clover-root.py)
-# is what gets mounted as /, DarwinBoot hands it over dense, and its AdtNode refuses a
-# memory-map that declares a ramdisk twice. Since round119 `rd=` names the eMMC partition rather
-# than the RAMDisk, but the RAMDisk slot stays: mdevadd runs at IOKitBSDInit.cpp:826-843, before any
-# of the root-matching or rd= branches and with its unit passed explicitly, so md0 keeps existing
-# and keeps the payload byte-identical for the rounds that come after the partition root works.
+                   "unique-chip-id", "amfi-only-platform-code", "root-matching"]
+# The volume /chosen names. It is the unsealed OS volume inside the iPadOS container the board's
+# OS window carries: UUID 04769D26-2CA0-4825-B443-E2E5F88300F2, role System, Sealed=No. Round119
+# copied a dictionary naming a volume no service here carried; that was a wrong target, not a
+# reason for root-matching to be absent. Round137 names the service CloverBlock actually publishes.
+ROOT_VOLUME_UUID = "04769D26-2CA0-4825-B443-E2E5F88300F2"
+FORBIDDEN_CHOSEN: list[str] = []
+# One RAMDisk placeholder, no PackedRAMDisk: the payload still carries the mockfs image
+# (scripts/make-clover-root.py) so the memory map stays the shape DarwinBoot handed over in every
+# earlier round, but since round137 nothing mounts it as / -- the root is the APFS volume named by
+# /chosen/root-matching. mdevadd runs at IOKitBSDInit.cpp:826-843 before either root branch and
+# with its unit passed explicitly, so md0 exists and is simply unused.
 REQUIRED_MEMORY_MAP = ["RAMDisk", "TrustCache"]
 
 
@@ -93,6 +92,7 @@ def adt_command(output: pathlib.Path):
             "--dram-size", hex(DRAM_SIZE), "--owned-memory-size", "0x40000000",
             "--chip-id", hex(MSM_ID), "--cpu-regs", ",".join(hex(v) for v in CPU_REGS),
             "--psci-method", "smc", "--unique-chip-id", "0x0123456789ab",
+            "--root-match-volume-uuid", ROOT_VOLUME_UUID,
             "--data-ramdisk", "--trust-cache", "--ipad-identity"]
 
 
@@ -171,7 +171,12 @@ def check_adt(errors: list) -> str:
                 errors.append(f"/chosen is missing {prop}")
         for prop in FORBIDDEN_CHOSEN:
             if prop in chosen["properties"]:
-                errors.append(f"/chosen carries {prop}, which makes IOFindBSDRoot ignore the board's rd=")
+                errors.append(f"/chosen carries {prop}, which this round does not want")
+        root_matching = chosen["properties"].get("root-matching", b"")
+        if (b"IOProviderClass" not in root_matching or b"IOMedia" not in root_matching
+                or ROOT_VOLUME_UUID.encode() not in root_matching):
+            errors.append("/chosen/root-matching must be an IOMedia IOPropertyMatch on UUID "
+                          f"{ROOT_VOLUME_UUID}; IOFindBSDRoot deserializes it verbatim")
         if len(chosen["properties"].get("random-seed", b"")) != 64:
             errors.append("/chosen/random-seed is not 64 bytes")
         if chosen["properties"].get("dram-base") != struct.pack("<Q", DRAM_BASE):
@@ -521,59 +526,32 @@ def check_board(errors: list) -> str:
         if not re.fullmatch(r"[A-Za-z0-9_.\-]+(=[A-Za-z0-9_.,\-]+)?", argument):
             errors.append(f"kernel argument {argument} fails the payload pattern")
 
-    # The root contract. Two halves: the payload still carries the mockfs image as initrd and
-    # the ADT still carries its plain RAMDisk placeholder, so md0 exists either way; what `rd=`
-    # names decides which one becomes /. Since round119 it names the eMMC partition published by
-    # drivers/CloverBlock (major 1 minor 39), which is only possible because that driver's run is
-    # triggered by publishResource("IOBSD") inside IOKitBSDInit(), before IOFindBSDRoot waits.
-    # Since round121 that name is the alias CloverBlock writes over the storage family's own:
-    # disk0s39 is what the media is found and measured under, md0s39 is what the root search asks
-    # for. bsd_rooted_ramdisk() (bsd_init.c:450) only compares the first three characters against
-    # RAMDEV, so the alias skips the FSIOC_KERNEL_ROOTAUTH block that round120 died in, while
-    # IOFindBSDRoot's memory-device shortcut (rdBootVar[3] == 0 at :849) still rejects it and the
-    # BSD-name branch at :888 still numbers the root from the media's own properties. mdevadd(-1,
-    # ..., 0) at :843 takes its unit explicitly, so the placeholder ramdisk is unaffected.
-    # Since round127 it is md0 again, for a reason that has nothing to do with authentication: the
-    # same driver now describes logfs's own window under clover-apfs=1, so no IOGUIDPartitionScheme
-    # runs over it, no disk0s39 is ever named, and a root that asked for one would only time out.
-    # The pinned trust cache carries the init program's cdhash so exec can validate it whatever the
-    # backing device is. A packed placeholder would mean the Data-seed shape instead, which needs
-    # NativeRamBlock.
-    # The `rd=` half only holds if nothing else claims the root first: round119 proved
-    # /chosen/root-matching wins that race (IOKitBSDInit.cpp:790-797 versus the guard at :888),
-    # so the ADT must not carry it, and neither may the board table that feeds the generator
-    # (scripts/unixnu/payload.py:150 turns the key into --root-match-volume-uuid).
-    if adt.get("root_match_volume_uuid"):
-        errors.append('[payload.adt] root_match_volume_uuid is set: the generator would emit '
-                      '/chosen/root-matching, IOFindBSDRoot would wait on that dictionary and '
-                      'never read rd= at all -- the round119 panic')
+    # The root contract, round137. The kernel's own vfs_mountroot() is the only mounter. The board
+    # declares the root once, in /chosen/root-matching (IOFindBSDRoot deserializes it at
+    # IOKitBSDInit.cpp:790-797 and waits for that IOMedia), and carries no `rd=` at all: with a
+    # dictionary present the rd= branch at :888 is dead text, and keeping both would be two
+    # declarations of the same root. drivers/CloverBlock makes the service exist before that wait
+    # because its run is triggered by the earlier publishResource("IOBSD") inside IOKitBSDInit; under
+    # clover-apfs=3 it returns instead of mounting anything itself.
+    # Round119's failure was a dictionary naming a volume no service here carried, not the mechanism.
+    if str(adt.get("root_match_volume_uuid", "")).upper() != ROOT_VOLUME_UUID:
+        errors.append(f"[payload.adt] root_match_volume_uuid must be {ROOT_VOLUME_UUID}: "
+                      "/chosen/root-matching is the only root declaration this board has")
     if adt.get("packed_data_ramdisk"):
-        errors.append("[payload.adt] packed_data_ramdisk is true, but this board's root is the "
-                      "dense mockfs image; the payload step would emit PackedRAMDisk")
-    # Round127 asked a different question of the same media, and the answer was on the other side of a
-    # window: drivers/CloverBlock described logfs's own partition, whose block zero is an APFS container
-    # superblock instead of a GPT header. Round128 moved to userdata, whose window *does* carry a GPT --
-    # the root image's OS window is a whole disk -- so the automatic partition pass has work to do again.
-    # The root still has to stay off that disk: the run ends inside apfsProbe, which never returns, so
-    # steps 5-9 (the wait for a named partition, the alias) do not happen, and a rd= that named a slice
-    # would have IOKitBSDInit waiting for a tree the config thread is busy building. The RAMDisk is the
-    # shape every round up to 118 booted with, and it stays out of the way of the probe.
-    if "rd=md0" not in board["payload"]["kernel_args"]:
-        errors.append('[payload] kernel_args has no rd=md0: round136 wants the RAMDisk root, because '
-                      'the probe that runs under clover-apfs never returns and nothing publishes an '
-                      'eMMC-named root for the kernel to mount')
-    for retired in ("rd=md0s39", "rd=disk0s39"):
-        if retired in board["payload"]["kernel_args"]:
-            errors.append(f'[payload] {retired} names a media that only the whole-card description '
-                          'publishes; round127 re-scoped it to logfs\'s window and round128 to the '
-                          'root image, so that root search would time out')
-    if "clover-apfs=2" not in board["payload"]["kernel_args"]:
-        errors.append('[payload] kernel_args has no clover-apfs=2: without it CloverBlock keeps the '
-                      'whole-card geometry (or logfs under =1) and never reads the SHNGROOT manifest')
+        errors.append("[payload.adt] packed_data_ramdisk is true, but this board's RAMDisk is the "
+                      "unchanged mockfs image; the payload step would emit PackedRAMDisk")
+    if any(argument == "rd" or argument.startswith("rd=")
+           for argument in board["payload"]["kernel_args"]):
+        errors.append("[payload] kernel_args still carries rd=: root-matching wins the race and the "
+                      "argument is dead text, so a boot that failed over to it would be misread")
+    if "clover-apfs=3" not in board["payload"]["kernel_args"]:
+        errors.append('[payload] kernel_args has no clover-apfs=3: without it CloverBlock keeps the '
+                      'whole-card geometry, never reads the SHNGROOT manifest, and the APFS volume '
+                      'the root search wants is never published')
     if "clover-emmc=21" not in board["payload"]["kernel_args"]:
-        errors.append('[payload] clover-apfs=2 is set but clover-emmc=21 is not: both windows are '
+        errors.append('[payload] clover-apfs=3 is set but clover-emmc=21 is not: both windows are '
                       "published by the same mode 21 run that reads EXT_CSD and walks the GPT, so the "
-                      'probe would stop at "udwindow 0"')
+                      'boot would stop at "udwindow 0"')
     userdata = board.get("userdata")
     if not userdata or not userdata.get("windows"):
         errors.append('[userdata] is missing or declares no windows: ./unixnu build userdata has '

@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r136: ask the volume media for its own geometry, then follow the dev_t to the media it names"
+title = "clover r137: let the kernel mount the APFS root it was pointed at"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1108,7 +1108,14 @@ kernel_args = [
   #     blocks, and how many bytes were served, is `r=`;
   #   `... v=1` = a volume object exists, i.e. Apple's own filesystem found a mountable volume on a
   #     device this port wrote by hand. That is the pass line for an iOS boot.
-  "rd=md0",
+  #
+  # Round137 removes `rd=md0`. The root is the APFS volume this driver publishes, selected by the
+  # /chosen root-matching dictionary in [payload.adt] below, and mounted by the kernel's own
+  # vfs_mountroot(). `rd=md0` would be a second declaration of the root and root-matching wins the
+  # race anyway (IOKitBSDInit.cpp:790-797 before :888); without it, a root search that cannot find
+  # the volume ends in the standard "Failed to mount root device" panic rather than silently
+  # mounting the RAMDisk. The RAMDisk placeholder stays in the memory map, unused, because the
+  # payload still carries the mockfs image and its trust cache.
   # Round 72 died with SIGKILL (parent's wait4 read status 9) inside its first
   # mach_msg; round 73 bracketed that call with markers and added this boot-arg,
   # and the panel looked exactly the same: presend, no send=. So the boot-arg did
@@ -1856,7 +1863,11 @@ kernel_args = [
   # xr=/xa= -- a byte-zero read of the media the mount's dev_t really names. wo= is the whole disk's open
   # state, the fallback reading if no media carries the minor. r= has stayed 464 for seven rounds, so the
   # mount's read reaches none of this driver's blocks; this round is about which layer above it refuses.
-  "clover-apfs=2",
+  # Round137 turns the window into a boot instead of a reading: `clover-apfs=3` publishes the same
+  # OS window, loads apfs.kext, waits for the volume media and its BSD name, and returns. The private
+  # mount ladder and its never-returning panic stay behind `clover-apfs=2` for future measurements;
+  # the boot no longer runs either of them.
+  "clover-apfs=3",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
@@ -2054,17 +2065,21 @@ chip_id = "0x13d"
 # The low bank is 0x80000000-0x100000000; PIL, venus, the splash and the firmware FD
 # leave 0xa0000000-0x100000000, so 1 GiB is the largest obviously free request.
 owned_memory_size = "0x40000000"
-# Deliberately absent: root_match_volume_uuid, and with it /chosen's `root-matching`.
-# IOFindBSDRoot deserializes that property into its `matching` dictionary at
-# IOKitBSDInit.cpp:790-797 and `continue`s, which is what made round119's `rd=disk0s39` dead
-# text -- the branch at :888 that would turn `rd=` into IOBSDNameMatching only runs when
-# `matching` is still NULL. The kernel's own `rd=` is now the only root contract on this board,
-# and scripts/check-clover.py asserts the property stays absent.
+# Round137 puts the root back into /chosen, and this time names a service the board really
+# publishes: the unsealed OS volume inside the APFS container (System role, host copy
+# 04769D26-2CA0-4825-B443-E2E5F88300F2). IOFindBSDRoot deserializes this into its matching
+# dictionary and waits for exactly that IOMedia; CloverBlock's run, triggered by the earlier
+# publishResource("IOBSD") in IOKitBSDInit, is what makes the media appear before the wait.
+# The round119 panic this comment used to record was a dictionary naming a UUID no service on this
+# board carried; it was not a reason for root-matching to be absent. scripts/check-clover.py now
+# asserts this key is present, and that `rd=md0` is gone.
+root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 cpu_regs = "0x0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"
 psci_method = "smc"
-# False means the --data-ramdisk image gets one plain RAMDisk placeholder, which is
-# what the md0/mockfs root needs; a packed one would add PackedRAMDisk and
-# ephemeral-storage, i.e. the Data-seed shape this board has no driver for.
+# False means the --data-ramdisk image gets one plain RAMDisk placeholder. Since round137 that
+# image is no longer anyone's root -- the APFS OS volume is -- but md0 is still built from it, and
+# a packed one would add PackedRAMDisk and ephemeral-storage, i.e. the Data-seed shape this board
+# has no driver for.
 packed_data_ramdisk = false
 ipad_identity = true
 unique_chip_id = "required"

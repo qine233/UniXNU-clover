@@ -131,9 +131,10 @@ NVRAM proxy、`dram-base`、`crypto-hash-method`、`root-matching`、`display-ba
 和 `TrustCache` 两个占位（出现 `PackedRAMDisk` 就报错：DarwinBoot 不接受两个
 ramdisk 槽）、
 带八个 MPIDR 值的 `/cpus`、`/psci`、带 `ranges` 与 GICv3 节点的 `/arm-io`、
-`/defaults`、`/options` 和 `/product`。board 一段还钉住 `v0.2.35` 的根契约：
-`packed_data_ramdisk` 必须为假，`kernel_args` 必须有 `rd=md0`，
-`trust_cache_sha256` 必须非空。
+`/defaults`、`/options` 和 `/product`。board 一段钉住 `v0.4.0` 的根契约：
+`packed_data_ramdisk` 必须为假，`kernel_args` 不许出现任何 `rd=`，
+`/chosen/root-matching` 必须是对 OS 卷 UUID 的 `IOMedia` 属性匹配，
+`clover-apfs` 必须为 `3`，`trust_cache_sha256` 必须非空。
 
 ## dump 回答了什么
 
@@ -8954,6 +8955,124 @@ trustcache 56 B（`c3ed2152…`）。两个 checker 全绿。
 4. **ADT `/chosen { root-snapshot-name }` / `/filesystems { DoNotUseSEP }` /
    `allow-root-hash-mismatch`** —— 仍然只在 `mt=` 过了 13 之后才排队。
 
+## round136 读数（v0.3.9 实机，2026-10-26）：几何不是理由 —— 6.08 GB 的卷读 512 B 仍回 BadArgument
+
+末行 `@CloverBlock.cpp:1666`，逐字段：
+
+- **卷身份没动**：`v=1 vt=1 un=1`，`vs=0x6f4e`（`packedHead("No")`，未封存），
+  `vo=0x696c6e4f`（`"Onli"`，Status 是 Online），`vu=0x01d874fd`、`vc=0xa7dd292a`
+  （卷 UUID 与容器 UUID 的 FNV-1a），`vn=0x6e776144/0x61647055/0x31326574/0x00363448`
+  拼出 `"Dawn"/"Upda"/"te21"/"H46"` —— FullName 头 15 字节。挂载指向的还是那颗唯一的
+  未封存 OS 卷。
+- **挂载阶梯**：`mt=13`，`st=rt=k=65535` —— `VFS_MOUNT` 仍是 EACCES，后面三级从未执行。
+  挂载失败后的两刀：`dr=13 db=0 dx=0 dy=0`（对同一 devvp 的独立 `vn_rdwr` 仍是 13），
+  `na=13`（同一个读加上 `IO_NOAUTH`，一位没变）。round135 的结论在这一帧上复现：
+  **授权门不是作者**。
+- **媒体账**：`ms=xs=0x1:0x6a400000` = 6,077,546,496 B（1,483,776 × 4096），`bs=4096`，
+  `mb=0x0:0x0`；`ml=512 md=0x1` —— 请求确实是 512 B、方向 In。`xm=1 xe=1`：`dv=1:3`
+  找到的那颗媒体就是被采样的这颗卷媒体本身。`xo=1 xw=1 mo=1 mc=0 mw=1` —— 它开着、可写，
+  开它的不是本驱动。
+- **直接读的答复**：`ir=0xe00002c2 ia=0` —— 绕过 vnode、buffer cache 和 BSD，对这颗
+  6.08 GB 媒体读 512 B，得到的仍是 `kIOReturnBadArgument`、0 字节。`r=464 w=0` ——
+  块驱动自己的读计数在采样前后没涨。
+
+这一帧推翻了 round135 唯一还站着的几何推断：**`ms<512` 不成立**，媒体远大于请求，
+`min(ms,512)` 的请求合法到不能再合法，`IOMedia::read()` 还是回 BadArgument。也就是说
+`ir=` 描述的是这颗卷媒体自己的状态，而不是挂载失败的原因；`dr=`/`na=` 又证明 13 不在
+vnode 授权门；round133 的两次 `vnode_open` 是 ENOENT、round134 的 devvp 读也是 13 ——
+**13 的七个候选层全部被孤立复现排除，测量已经不再产生新信息**。
+
+## v0.4.0（round137）：不再自己挂 —— 把根交回 `/chosen`，让 `vfs_mountroot()` 去挂
+
+七轮 `mt=13 r=464` 一字未动之后，这一轮不再加字段，改的是**谁去挂**。两条依据都来自
+内核源码，不是猜测：
+
+- `IOFindBSDRoot()`（`iokit/bsddev/IOKitBSDInit.cpp:958`）等的就是 `/chosen` 的
+  `root-matching` 字典指向的那颗 `IOMedia`；`ROOTDEVICETIMEOUT` 在 DEBUG 构建下是
+  120 秒，匹配成功后从 service 读 `BSD Name`/`major`/`minor` 拼出 `makedev`（:940-975）。
+- `vfs_mountroot()`（`bsd/vfs/vfs_subr.c:1210+`）先 `bdevvp(rootdev)`，再遍历 `vfsconf`：
+  **`vfsp->vfc_mountroot` 非空就调用它**（:1247-1255），只有为空才落到
+  `VFS_MOUNT(mp, rootvp, 0, ctx)`。round129-136 手工调的一直是后者；标准路径至少多出
+  一条 apfs 自己注册的 mountroot 入口。
+
+所以本轮的动作是：**驱动只负责让卷出现，挂载交给内核。**
+
+```cpp
+// clover-apfs=3：加载 apfs.kext，等卷节点和 BSD 名，然后返回
+static void prepareApfsBoot(IOMedia *whole)
+{
+  kern_return_t loaded = OSKextLoadKextWithIdentifier(kApfsKext);
+  ...
+  for (; passes < 12000 && !found.volumeMedia; passes++) {   // 最多 120 s
+    ApfsDepth now{};
+    measureApfsDepth(whole, &now, 0);
+    ...
+    IOSleep(10);
+  }
+  for (uint32_t attempt = 0; attempt < 1000; attempt++) {     // 最多 10 s
+    if (volumeBsd(found.volumeMedia, &devname, &major, &minor)) { named = true; break; }
+    IOSleep(10);
+  }
+  IOLog("CloverBlock r137: boot v=%u un=%u vu=%s bsd=%s %u:%u p=%u\n", ...);
+}
+```
+
+- 等 BSD 名不是仪式：`IOFindBSDRoot()` 在匹配成功后立刻读同一颗 service 的
+  `BSD Name`/`major`/`minor`，卷节点出现而命名未完成时返回，会抢出一个 `makedev(0,0)`。
+- `clover-apfs=2` 原样保留为探针（`apfsProbe()`，仍然只测量、最后 panic）；
+  `clover-apfs=3` 走启动分支，**不 mount、不 panic**。
+- `board.toml`：删除 `rd=md0`，加回
+  `root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"`（未封存 OS 卷，
+  role System），`clover-apfs=3`；`userdata` 窗口与 `clover-emmc=21` 不变。
+- `scripts/check-clover.py`：`/chosen/root-matching` 必须是 `IOProviderClass=IOMedia` +
+  `IOPropertyMatch/UUID=<上面的 UUID>`，任何 `rd=` 都报错，`clover-apfs` 必须是 3。
+- `scripts/verify-clover-payload.py`：新增 `ADT: root-matching names the OS volume`
+  （在卷内 ADT 里直接找 `root-matching` + UUID + `IOMedia`），`check_block()` 身份串
+  升到 `CloverBlock r137: apfs` / `CloverBlock r137: boot`。
+
+内核侧接下来的顺序（同一轮启动内，不再有驱动介入）：`IOFindBSDRoot` 匹配 → `makedev`
+→ `vfs_mountroot()` → 成功则 `mount_list_add`/`VFS_START` → `bsd_init.c:880-960` 做
+`FSIOC_KERNEL_ROOTAUTH` → `_bsd_utaskbootstrap` exec `/sbin/launchd`。ADT 与 uint 参数
+一切不变（`armcpu-clock-panic=180000` 仍是兜底），没有新的 eMMC 写入，全程只读。
+
+构建命令不变：
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+产物归档在 `~/clover-out/round137-*`，`shasum -a 256 -c round137-SHA256SUMS` 七项全部 OK：
+`payload.img` 58,720,256 B（`ba5fa957…`）、本地 `kernel.macho` `41892154…`、卷内
+`kernel.macho` 51,994,624 B（`ab0290db…`，probe patch localized 成 6,680 B / 35 runs）、
+卷内 `unixnu.toml` 588 B（`7d563204…`，args 里已无 `rd=md0`）、ADT 13,476 B
+（`f9af6316…`，含 root-matching）、`scratch-data.img` 35,888 B（`614b8356…`）、
+trustcache 56 B（`c3ed2152…`）。两个 checker 全绿。
+
+**刷写范围只有 `cache` 一个分区，没有新的 eMMC 分区写入**：`fastboot flash cache
+/Users/zhouzhou/clover-out/round137-payload.img`，然后 `fastboot reboot` 冷启动。
+
+这一帧要看的不是一条末行，而是**控制台停在哪**（console 已由探针挂上，内核文字会留在
+屏上）：
+
+1. **`CloverBlock r137: boot … bsd=disk0sN M:N`** —— 驱动侧完成，卷与 BSD 名都在。
+   下一行应是内核自己的 `Got boot device = …` / `BSD root: disk0sN, major …, minor …`。
+2. **`panic("Failed to mount root device")`（`IOKitBSDInit.cpp:984`）** —— 120 秒内没有
+   任何 `IOMedia` 携带 `root-matching` 的 UUID。此时回看 `vu=` 的哈希与宿主对
+   `04769D26-…` 算出的 FNV-1a 是否一致（大小写/字符串差异会直接表现为匹配不到）。
+3. **`cannot mount root, errno = 13`（`bsd_init` 的循环）** —— 匹配到了，但标准路径仍然
+   拿到 13。这会把「13 在 apfs 的 `vfs_mount` 里」这一格钉死；同帧若有
+   `[clover] vfs_mountroot returned` 标记，说明 apfs 没有注册 `vfc_mountroot`，标准路径
+   落回了 `VFS_MOUNT`。
+4. **`rootvp not authenticated after mounting`** —— 挂上了，墙变成
+   `FSIOC_KERNEL_ROOTAUTH`（根清单/封存那一层），下一格转向根授权而不是挂载。
+5. **exec 阶段的 AMFI 拒绝** —— 根挂载与 `/sbin/launchd` 的查找都过了，墙是
+   owner trust cache 里没有它的 cdhash；下一格补信任，不再是挂载问题。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -8995,12 +9114,14 @@ trustcache 56 B（`c3ed2152…`）。两个 checker 全绿。
   缺 `clover-emmc` 改为 panic、块栈每个阶段先打一行标记（见上一节）。这些轮次量的是
   「固件留下的 SDHCI 窗口活不活、
   卡还答不答、在哪个地址答、时钟是不是还在移命令、数据阶段能不能自己走完」。
-  根设备目前不从磁盘挂：`v0.2.35` 用
-  `rd=md0` 把 payload 里的 initrd 变成内存盘，再由 mockfs 把它当作整个 `/`。
-  `root-matching` 已经从 `/chosen` 删掉（round120；它会赢下与 `rd=` 的竞争，
-  `scripts/check-clover.py` 现在反向断言它缺席）。round119-121 试过把根指向 eMMC
-  上的 `disk0s39`/`md0s39` 并真的挂上了，round127 为了让 CloverBlock 跑到 apfs
-  探针把根改回 `rd=md0`。
+  根设备从 `v0.4.0` 起交回内核：`/chosen/root-matching` 指向 eMMC 上那颗未封存 OS 卷的
+  UUID，`CloverBlock` 只把卷发布出来并等 BSD 名，`IOFindBSDRoot()` + `vfs_mountroot()`
+  走标准路径去挂；`rd=` 已从 `kernel_args` 删除（round120 删过 `root-matching`，round127
+  把根改回 `rd=md0`，都是为了让探针能跑；`v0.4.0` 两者对调）。payload 里仍带
+  `scratch-data.img` 作为 `initrd`，内核会把它挂成 `md0`，但它不再是根。
+  round119-121 试过把根指向 eMMC 上的 `disk0s39`/`md0s39`，round127-136 的探针证明
+  「卷发布、身份、几何、读路径都正常，唯独本驱动手工 `VFS_MOUNT` 一律回 13」，
+  round137 因此改用标准挂载入口。
 - **没有 GPU。** `NativeAdreno` 面向 Adreno 740；这块板子是 Adreno 512。
   所以显示栈缺席，`scripts/build-clover-display-stub.py` 只提供
   DEVELOPMENT-only XNU 补丁无条件调用的那一个空符号。首次启动的目标是 UEFI
