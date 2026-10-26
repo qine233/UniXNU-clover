@@ -10651,6 +10651,72 @@ fastboot reboot
 `unixnu.toml` 601 B（`f775e0ce…`）、ADT 13,516 B（`4f0ea293…`）、`scratch-data.img`
 35,888 B（`614b8356…`，即 launchd 数据盘）、`trustcache` 61,408 B（`7c369ce0…`）。
 
+## v0.5.5（round152）：把 r146 撤掉，让这一帧只剩 dyld 自己
+
+### 上一帧的两个事实
+
+r151 的帧上，r146 的五行都在（两次 `clover r146: check err=12` 和
+`cache err=2 …`），`clover r151:` 一行都没有。镜像本身没有问题：卷内内核里
+`vn_open_auth_internal` 出现 9 次，两条 r151 格式串各 1 次——探针确实编进去了。
+
+所以这一轮只改一个变量：**把 r146 的探针全部撤掉**。
+
+### 为什么先撤 r146
+
+r146 的 `vnode_lookup` 跑在 `shared_region_check_np` 里面——那正是 dyld 在找缓存
+之前调用的那个 syscall。从 union 挂好到 dyld 打开缓存之间，它是唯一一处我们插进
+VFS 的调用。而 r151 的包装只在 `vn_open_auth` 返回之后打印：如果 dyld 的 open 在
+调用里停住，屏上同样什么都不会出现。把 r146 拿掉，下一帧就是干净的对照——
+那个时刻只剩 dyld 自己的 open。
+
+### 改了什么
+
+- 删除 `zzy-clover-shared-region-why.patch`（vm_unix.c 的五个读数：
+  check / cache / map enter / map setup / map exit），构建树已反向撤净。
+- `zzy-clover-shared-region-why2.patch`（r151 的 `vn_open_auth` 包装）原样保留。
+- `check-clover.py` 的契约从“五针必须在”改成“r146 补丁必须不在”；
+  `verify-clover-payload.py` 断言镜像里不再有 `clover r146:`，也不再有
+  `dyld_shared_cache_arm64e` 这个名字。
+- 标题 `clover r152: r146 comes out, and dyld gets the frame to itself`。
+
+### 构建与刷写
+
+```sh
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+只写 `cache`，冷启动：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round152-payload.img
+fastboot reboot
+```
+
+### 这一帧怎么读
+
+- 出现 `clover r151: open …`：r146 的探针确实压住了 dyld 的路径，按那几行
+  继续分目录、文件、头三步。
+- 仍然没有任何 `clover r151:`，但 `shared_region` 那两行还在：dyld 在
+  `vn_open_auth` 返回前就停了，或根本没有调 open。下一轮把打印挪到进入 open
+  之前，用 enter/exit 两行把它切开。
+- 连 `shared_region` 都没有：对照没有成立，先查刷入的是不是这一格。
+
+这一帧只问一个问题：**撤掉 r146 之后，dyld 会不会自己走到 open，屏上出现
+`clover r151:`。**
+
+产物归档在 `~/clover-out/round152-*`，`shasum -a 256 -c round152-SHA256SUMS` 七项全 OK：
+`payload.img` 58,720,256 B（`f9a6ee2d…`）、本地 `kernel.macho` 51,998,720 B
+（`83ec1fd6…`）、卷内 `kernel.macho`（`a48ecd2e…`，入口探针仍在）、卷内
+`unixnu.toml` 599 B（`88dc8758…`）、ADT 13,516 B（`9b5b8659…`）、`scratch-data.img`
+35,888 B（`614b8356…`，即 launchd 数据盘）、`trustcache` 61,408 B（`7c369ce0…`）。
+ADT 每轮都会变一次 64 字节：`/chosen/random-seed` 是 `os.urandom(64)`，其余字节
+与上一轮逐字节相同。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

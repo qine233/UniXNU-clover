@@ -737,33 +737,19 @@ def check_board(errors: list) -> str:
             errors.append("CloverBlock.cpp's boot line has no deferred=1: the frame would not say "
                           "that only one window was published")
 
-    # Round146. r145's frame ends after two `shared_region: ... [1(launchd)] check_np(...)
-    # vm_shared_region_start_address() failed` lines: the root is up, SystemOS is union-mounted over
-    # "/" at exec, launchd passes the MAC checks, and the shared region is still empty. That frame
-    # cannot say whether the cache is visible through the union, whether dyld asked for the map next,
-    # or what the map answered. The board patch puts all five prints on the vm_unix.c path -- the
-    # namei check runs at the same moment dyld decides -- so a frame missing any of them silently
-    # asks less.
-    region = next((base / "patches/xnu-clover/zzy-clover-shared-region-why.patch"
-                   for base in (REPO, pathlib.Path.cwd())
-                   if (base / "patches/xnu-clover/zzy-clover-shared-region-why.patch").is_file()), None)
-    if region is None:
-        errors.append("patches/xnu-clover/zzy-clover-shared-region-why.patch is missing: without it "
-                      "the next frame again stops at the empty shared region with no map answer")
-    else:
-        text = region.read_text()
-        missing = [needle for needle in
-                   ("bsd/vm/vm_unix.c",
-                    "clover r146: check err=%d start=%llx",
-                    "clover r146: cache err=%d size=%lld mnt=%p rmnt=%p fl=0x%llx rfl=0x%llx",
-                    "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
-                    "clover r146: map enter files=%u maps=%u",
-                    "clover r146: map setup err=%d",
-                    "clover r146: map exit err=%d kr=0x%x")
-                   if needle not in text]
-        for needle in missing:
-            errors.append(f"{region.name} lacks {needle!r}: that half of the shared-region question "
-                          "would come back blank")
+    # Round152. Round151 shipped the open probe, and the frame that came back carried the r146 lines
+    # but none of the r151 ones. r146's probe was the only VFS caller between the union mount and
+    # dyld: it ran a vnode_lookup inside shared_region_check_np itself, the syscall dyld makes just
+    # before it looks for the cache. This round removes it, so the next frame is a clean control:
+    # dyld's own calls at that moment, and nothing of ours. The patch is gone, so the contract is
+    # its absence -- and a frame that still prints "clover r146:" was built from an older tree.
+    r146 = next((base / "patches/xnu-clover/zzy-clover-shared-region-why.patch"
+                 for base in (REPO, pathlib.Path.cwd())
+                 if (base / "patches/xnu-clover/zzy-clover-shared-region-why.patch").is_file()), None)
+    if r146 is not None:
+        errors.append("patches/xnu-clover/zzy-clover-shared-region-why.patch is back: its namei ran "
+                      "inside shared_region_check_np, right before dyld looks for the cache, and "
+                      "Round152 removes it so the next frame shows dyld's own calls only")
 
     # Round151. r150's frame says dyld reaches shared_region_check_np, gets ENOMEM, and then never
     # enters _shared_region_map_and_slide: `map enter` is absent. The host's copy of dyld puts the
@@ -828,8 +814,8 @@ def check_board(errors: list) -> str:
     # Round150. Round149 removed the deadline and left the r146 wall untouched, so this round stops
     # probing that wall and adopts the sheng property it was skipping: the root is accepted by owner
     # trust, not by an rd= alias. The menu has to name that round.
-    if not board["payload"]["title"].startswith("clover r151:"):
-        errors.append('[payload] title is not "clover r151: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r152:"):
+        errors.append('[payload] title is not "clover r152: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",
