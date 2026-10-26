@@ -129,13 +129,16 @@ def check_block(kernel: bytes) -> bool:
     to vfs_rootmountalloc() and the path it walks once the mount is up. Round130 adds the one rung
     that needed a struct field -- the exported vnode_setmountedon() it links against. Round131 adds no
     import and no symbol: it works straight off measured offsets, so the only way to see that it asks
-    its question is the flag and vfsops slots on its panic line. Any of them going
-    missing means the round silently asks nothing -- the failure shape check-clover.py refuses to let
-    the archives have."""
+    its question is the flag and vfsops slots on its panic line. Round132 adds neither an import nor an
+    offset: it reads four registry strings off the volume node and the container above it, so its
+    evidence is the identity keys in the string table and the seven volume fields on the same line. Any
+    of them going missing means the round silently asks nothing -- the failure shape check-clover.py
+    refuses to let the archives have."""
     label = "kernel.macho: CloverBlock linked"
     found = {name: name.encode() in kernel
-             for name in ("clover-apfs", "CloverBlock r131: apfs",
+             for name in ("clover-apfs", "CloverBlock r132: apfs",
                           "fl=0x%x fc=0x%x fk=0x%x", "op=0x%x:0x%x mm=0x%x:0x%x",
+                          "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x", "FullName", "Sealed",
                           "AppleAPFSContainerScheme", "AppleAPFSVolume",
                           "SystemVersion.plist", "_clover_emmc_block_window",
                           "_clover_emmc_block_userdata_window", "SHNGROOT", "EFI PART",

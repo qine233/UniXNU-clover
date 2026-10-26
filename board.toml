@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r131: clear the boot-root flag and draw the function that refuses"
+title = "clover r132: draw which volume the mount was aimed at, and prefer the unsealed one"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1732,9 +1732,19 @@ kernel_args = [
   # apfs_vfsop_mount in apfs.kext's __PLK_TEXT_EXEC (file offset 0x268dfac of kernel.macho; objdump cannot walk
   # a fileset segment, so this was read with capstone over the segment map). Inside it, in ~1400 instructions,
   # `mov w?, #0xd` appears once -- at 0xfffffff0056c69c8, six instructions after the "handle_crypto_mount"
-  # reference, logging "rejecting crypto mount: OS variant is not recovery" (apfs_vfsops.c:1540). Its guard,
-  # 0xfffffff0056eb540, reads boot-arg "rd" (then "rootdev") and wants a three-character "md?" -- a RAMDisk
-  # root -- which rd=md0 satisfies, so on host reasoning that gate is open. The second refusal sits later in
+  # reference, logging "rejecting crypto mount: OS variant is not recovery" (apfs_vfsops.c:1540). Round132's
+  # host pass re-read that region and two of the claims above were wrong. (1) The guard's direction is the
+  # opposite: the refusal is taken when 0xfffffff0056eb540 returns FALSE (tbz w0,#0 at 0xfffffff0056c6898), and
+  # that predicate wants a three-character "md?" -- our rd=md0s39 is four characters, so it is false; but the
+  # whole arm sits behind mode>=4 (ldrh [x19,#8]; cmp #4 at 0xfffffff0056c64bc) and mode 0 is the only mode this
+  # probe ever asks for, so the crypto mount is not our path at all. (2) 0xd has exactly one producer in the
+  # function, it is unreachable from mode 0, and the callee the mode-0 arm actually returns 13 from --
+  # 0xfffffff00567fa0c, container_rootmount -- contains no #0xd either: our errno is propagated from deeper in.
+  # What did hold up: the cold blocks after the epilogue (0x56c7608..0x56c81ec) share the 0x820 frame and branch
+  # back into the body, so the sealed-root-snapshot refusal really is inside apfs_vfsop_mount, and apfs's own
+  # flag mask is 0xdff0f7ff (~0x200f0800), which preserves MNT_ROOTFS -- so round131's cleared bit did reach
+  # the function.
+  # The second refusal sits later in
   # the same function: when the root-snapshot lookup returns nothing (cbz x25 at 0xfffffff0056c7b5c) and bit 5
   # of the volume's flag byte at +0x38 is set, it logs "Failed to find the root snapshot: %s (%d). Rooting from
   # the live fs of a sealed volume is not allowed on a RELEASE build" (apfs_vfsops.c:2829). apfs learns that
@@ -1747,10 +1757,18 @@ kernel_args = [
   # reads, while retaining the sealed refusal as a negative control for the SystemCryptex volume
   # (sealed_cryptex_root_refused=True) -- and it selects the root through /chosen's root-matching on the
   # volume's UUID rather than through rd=. Meanwhile measureApfsDepth() takes the *first* AppleAPFSVolume it
-  # sees, and no field on this line says which volume that was. So the first explanation that does not need a
-  # guessed flag is that we have been mounting the sealed one. See README's round131 reading section for the
-  # ranked next rung (pick the unsealed volume and draw its FullName/UUID/Sealed, then root-snapshot-name,
-  # then DoNotUseSEP).
+  # sees, and no field on this line says which volume that was. Round132 attached the exact bytes this board
+  # mounts -- the round128 manifest's OS window, offset 1048576, 6077580800 bytes, sha
+  # e5634d04a8ac35f024845f583394e0a35deb26a04cb0c00286a8674e25a9a4f2 -- read-only through diskutil, and the
+  # answer is that there is one APFS volume in it and it is unsealed: the "mounting the sealed one" reading is
+  # not the explanation. It is still not disproved on the device, because this board's AppleAPFSVolume
+  # enumeration has never been drawn, so round132 (v0.3.5) keeps the mount call byte-identical and does two
+  # things: draw each volume's identity (FullName/UUID/Sealed/Status plus the container's UUID, as string hashes
+  # and packed heads) and prefer the Sealed=No volume when more than one IOMedia shows up. Host expectation from
+  # the attached image is vt=1 un=1 vs=0x6f4e ("No") vo=0x696c6e4f ("Online") vu=0x01d874fd
+  # vc=0xa7dd292a vn=0x6e776144/0x61647055/0x31326574/0x31363448 ("Dawn"/"Upda"/"te21"/"H461"). If the device
+  # agrees, the selection question is closed and the next rung is /chosen's root-snapshot-name, then
+  # DoNotUseSEP.
   "clover-apfs=2",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the

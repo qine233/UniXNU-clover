@@ -8109,7 +8109,8 @@ mt=13 st=65535 rt=65535 k=65535/65535/65535/65535 rd=65535 g=0 x=0x0 y=0x0 r=464
 - `0xfffffff0056c69c8`，前面六条指令引用 `handle_crypto_mount`，日志格式在 `0xfffffff0045d04e9`：
   `"%s:%d: rejecting crypto mount: OS variant is not recovery"`（`apfs_vfsops.c:1540`）。它的闸门在
   `0xfffffff0056eb540`：读 boot-arg `rd`（没有再退 `rootdev`），要求值是 `md?` 三个字符 —— 「根是内存盘」。
-  **我们的 `rd=md0` 满足它**（`getenv` 两种返回约定下都返回 1），所以这道门按宿主推断是开的；屏上没有直接证据。
+  ~~**我们的 `rd=md0` 满足它**，所以这道门按宿主推断是开的~~ —— 这一句写错了，两个错：我们的 `rd=` 是 `md0s39`
+  不是 `md0`，而且这道门是「谓词**为假**才拒」。见下一节的复核，它连我们这条路都不在。
 
 第二处拒绝在同一颗函数后半，走的不是硬编码常量而是同一句 `return`：快照查找返回空（`cbz x25` @`0x56c7b5c`）、
 且卷对象 `+0x38` 那颗字节的 bit5 置位时，跳到 `0xfffffff0056c81c8`，画的是 `0xfffffff0045d009d`：
@@ -8140,13 +8141,109 @@ mt=13 st=65535 rt=65535 k=65535/65535/65535/65535 rd=65535 g=0 x=0x0 y=0x0 r=464
 上游的对照恰好是：同一颗 apfs、同一个内核，对没密封的 OS 卷回 0，对密封的 Cryptex 回这句 EACCES。
 **`mt=13` 与「我们挑中的是那颗密封的卷」完全一致，而且这是第一个不用猜标志位的解释。**
 
+**这一句在 round132 的宿主预检里被推翻了。** 我们把这一轮真正要挂的那段字节挂上去只读了一遍：
+round128 manifest 里的 OS 窗口（偏移 1048576、长 6077580800、sha `e5634d04a8ac…`）用 `hdiutil attach -readonly`
+挂起来，`diskutil apfs list` 报出来的只有**一颗卷，而且它就是没密封的那颗**。也就是说「挑错了卷」在宿主上不成立；
+它唯一还没被证掉的地方是**实机的 IOKit 到底枚举出什么** —— 这台板子的 `AppleAPFSVolume` 从来没有被画过。
+所以它仍然值得刷一次，但它是「把未知画成已知」，不是「答案找到了」。下一节把预检读到的东西全部记下来。
+
 **下一格的候选**（排序短清单，都只动一件事）：
 
-1. **选卷，不改挂载**：挂之前把卷的身份画出来，并挑那颗 `Sealed=No` 的 OS 卷。新增三栏自带证明 ——
-   卷的 `FullName` 前两字、`UUID` 前两字、`Sealed` 读回来的值。上游的期望是 `mt=0`。
+1. ~~**选卷，不改挂载**：挂之前把卷的身份画出来，并挑那颗 `Sealed=No` 的 OS 卷。~~ —— round132（v0.3.5）就是这一格，
+   已按原话实现：新增 `vt=/un=/vs=/vo=/vu=/vc=/vn=` 七栏身份，选中规则改成优先 `Sealed=No`，`VFS_MOUNT` 调用一个字节没动。
+   宿主对它的期望是 `vt=1 un=1 vs=0x6f4e`（"No"）—— 也就是身份应当**和今天一样**，这一轮买的是实机的证明。
 2. 若仍 13：**ADT 加 `/chosen { root-snapshot-name = <快照名>; }`**，给密封卷一个根快照名（宿主先解析
    容器里到底有没有快照，这一步不花刷机就能先证伪）。
 3. `mt=0` 之后：**`/filesystems { DoNotUseSEP; }`** 与 `rootvp not authenticated` 那颗钉子。
+
+## round132 的宿主复核：`apfs_vfsop_mount` 到底怎么走到 13 的
+
+round131 交出 `mm=0xfffffff0056c5fac`，就是 `apfs.kext` 的 `apfs_vfsop_mount`（`kernel.macho` 里的文件偏移
+`0x268dfac`，段 `__PLK_TEXT_EXEC`；objdump 走不了 fileset 段，所以用 capstone 按段映射反汇编）。
+复核把上一条主干里我自己讲错的两处纠正了，也把「密封根那句确实在这颗函数里」这一条钉住了。
+
+**函数边界。** 序言 `stp x28,x27,[sp,#-0x60]!` 在 `0x56c5fac`；热路径上的金丝雀检查 + `add sp,sp,#0x820` + `ldp…` + `ret`
+在 `0x56c7604` —— 但这**不是**结尾。`0x56c7608..0x56c81ec` 那些冷块用的是同一套 0x820 帧槽（`[sp,#0x370]`、`[sp,#0x60]`、
+`[sp,#0xd8]`、`[sp,#0x44]`），并且分支回到函数体内部的地址（`0x56c7570` / `0x56c71d8` / `0x56c6554`）。
+`0x56c81f0..0x56c8210` 是 mode 跳转表的字（capstone 把它们渲染成 `udf #0x454/#0x368/#0x10`），下一颗函数的
+`sub sp,sp,#0x110` 要到 `0x56c8214` 才出现。**结论：那句「从密封卷的 live fs 起根是不允许的」（log 行 `0xac0`=2752、
+字符串 `0xfffffff0045d009d`）就在 `apfs_vfsop_mount` 里面**（`container_mount` 被内联了）。上一节发布的那句成立。
+
+**mode 开关，以及我们其实走哪条路。** 参数是一块 zone 分配的 0x144 字节 `mount_apfs`；`data != NULL` 走 copyin
+（`bl 0x576847c`），`data == NULL` 走 `memset`（`0x56c60f4..0x56c6118` 那串 stp q0）再填 `-1` 哨兵
+（`movi v0.2d,#-1; str d0,[x21,#0x28]`）。`mode` 是 `args+8` 处的 u16：`ldrh w8,[x19,#8]; cmp w8,#8; b.hi`，
+表基 `adr x10,#0x56c6388` ⇒ mode0→`0x56c67dc`，mode1/8→`0x56c66f0`，mode2/3→`0x56c66ec`，**mode4..7→`0x56c6398`**。
+我们调的是 `VFS_MOUNT(mp, devvp, 0, ctx)` ⇒ **mode 0，args 全零**。
+
+**那颗函数里唯一硬编码的 EACCES 不在我们这条路上。** `mov w26,#0xd` 在 `0x56c69c8` —— 4000 条指令里只出现这一次 ——
+而它只从 **mode 4..7** 那条臂可达：门在 `0x56c64bc ldrh w8,[x19,#8]; cmp w8,#4; b.ne 0x56c6888`，
+然后 `0x56c6894 bl 0x56eb540` → `0x56c6898 tbz w0,#0, 0x56c69ac`（log `handle_crypto_mount` 行 `0x604`，
+`"rejecting crypto mount: OS variant is not recovery"`）。**方向也讲反了：谓词为假才拒。**
+`0x56eb540` 读 boot-arg `"rd"`（退回 `"rootdev"`），要求恰好三个字符 `md?`（`buf[0]=='m'`、`buf[1]=='d'`、`buf[3]==0`）；
+我们的 alias 是 `rd=md0s39`，四个字符 ⇒ 谓词为假 ⇒ 会被拒。**但那一整条臂 mode 0 根本到不了**，所以它不是我们的 13。
+
+**mode 0（我们）的路线。** 本地标志 `orr w8,w26,#0x20; strh w8,[sp,#0xb8]`，`args+4 |= 1`；
+然后 `bl 0x576859c`（`current_proc`）与 kernel_task 全局 `0xfffffff005f25978` 比 —— 不等就 `w26=1`（EPERM，log `0x9a4`）。
+这是**一颗还没被排除、但我们应当能过的门**：探针跑在内核线程上。再往后是 `cbz x22,0x56c6d0c`（x22 = devvp），
+然后 `bl 0x567fa0c` 且 `cbz w0,0x56c6ef0`，否则打 log `0x9af` 并**把被调者的 errno 原样返回**。
+`0x567fa0c` 是 `container_rootmount`（串：`AppleAPFSContainer`、`AppleAPFSContainerScheme`、`AppleAPFSMedia`、
+`IOMedia`、`BSD Name`、`BSD Major`、`/dev/`、`%s%s`）。它里面**没有 `#0xd`**（自己的常量只有 2、15、79），
+但它同样在普通（非 RAMDisk）那侧用 `0x567fa84` 重测同一个 `md?` 谓词。**⇒ 我们的 13 是从更深处传上来的。**
+
+**顺带把 round131 的另一件事查实了。** apfs 自己的标志掩码在 `0x56c6130`：`mov w24,#0xf7fe; movk w24,#0xdff0,lsl #16`
+（=`0xdff0f7fe`）→ `orr w8,w24,#1`（=**`0xdff0f7ff`**）→ `and w24,w23,w8`，`~0xdff0f7ff = 0x200f0800` ⇒
+**bit `0x4000`（`MNT_ROOTFS`）是被保留的**。也就是说 round131 清掉的那一位确实送到了函数面前 —— 这条不能反过来发。
+
+**宿主把卷的数量与身份也读了。** 就是上面那段挂载的 OS 窗口：`diskutil apfs list` 只有**一颗**卷、`Sealed` 是 `No`。
+于是 round132 的帧有了具体期望（FNV-1a 32 哈希 + 短串小端打包）：
+`vt=1`（卷数）、`un=1`（`Sealed=No` 的颗数）、`vs=0x6f4e`（"No"）、`vo=0x696c6e4f`（"Online"）、
+`vu=0x01d874fd`、`vc=0xa7dd292a`（容器 UUID）、`vn=0x6e776144/0x61647055/0x31326574/0x31363448`
+（`Dawn` / `Upda` / `te21` / `H461`）。
+
+## v0.3.5（round132）：把挂的那颗卷画出来，并优先没密封的那颗
+
+**这一轮只改两件事，按原话：把扫到的每颗 `AppleAPFSVolume` 的身份画出来，并把挂载对象换成那颗 `Sealed=No` 的 OS 卷，其余一律不动。**
+
+- `drivers/CloverBlock/CloverBlock.cpp`（现在 1652 行）新增 `kFullNameKey`/`kVolumeUuidKey`/`kSealedKey`/`kStatusKey`
+  四把键（注释里点明出处是 `check-original-apfs-root-checkpoints.py:50-56`），以及 `stringProperty()`、`packedHead()`、
+  `fnv1a()` 三个小工具。只读**字符串**属性 —— 驱动那份 include 树里没有 `libkern/c++/OSBoolean.h`，而上游自己就把
+  `Sealed`/`Status` 当字符串读（它的 `registry_string_events` 证明了这一点）。
+- 新的 `VolumeIdentity{name[4], uuid, sealed, status}` 与 `readVolumeIdentity()`：`FullName` 头 15 个字符按四个
+  `le32At` 字取，`UUID`/`Sealed`/`Status` 走 FNV-1a；缺串 ⇒ `0xffff`（`kNoProperty`）。
+- `measureApfsDepth()` 里 `volumeCount` 逐颗累加（封顶 255），`unsealedCount` 数 `Sealed=="No"`，容器的 `UUID` 哈希一次；
+  选卷规则从「第一颗 IOMedia 赢」改成「**手里是密封卷、来了颗没密封的就换**」，换掉的旧 media 立即 `release()`。
+- **没动的部分**：`VFS_MOUNT(mp, devvp, 0, ctx)` 一个字节没改，flags、`mnt_devvp`、`data` 全部照 round131；读块预算不变，
+  身份是注册表属性，**零次新读**，`r=` 应当仍是 464。
+
+**产物**（`~/clover-out/round132-*`，`round132-SHA256SUMS`）：payload `round132-payload.img` 58,720,256 B
+`353770b70331e7b48d833cd4ba81ff5f0f5c43498c6d3154a7e4b317c6c1bd54`；内核 `round132-kernel.macho`
+`147d5090bd972240da401116f79ff65a03eba31c188b6d46e21dd1c76b642690`；卷内内核
+`round132-in-volume-kernel.macho` 51,994,624 B `c3788ad230843b1cbf4044b1c83f5b877119a62d0388d07d0da0848646facd17`；
+ADT 13,268 B `427b6b1579f2…`；trustcache 与 scratch-data 沿用 round128（`c3ed2152…` / `614b8356…`）。
+`scripts/check-clover.py` 与 `scripts/verify-clover-payload.py` 都过（后者的 found 集加了 `CloverBlock r132: apfs`、
+`vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x`、`FullName`、`Sealed`）。
+
+**这一轮只写 `cache` 一个分区，没有新的 eMMC 分区。** `userdata` 保持 round128 的镜像（`be354a4a…`）不动，
+`logfs`、`boot`、GPT 一概不碰 —— 身份是 IORegistry 里的属性，读它不需要改盘。
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round132-payload.img
+fastboot reboot
+```
+
+（冷刷，绝不用 `fastboot boot`。）
+
+**屏幕上应当读到**：菜单首行（`board.toml` 的 `payload.title`）`clover r132: draw which volume the mount was aimed
+at, and prefer the unsealed one`，帧尾部 `@CloverBlock.cpp:1369`，新七栏的期望就是上一节那串（`vt=1 un=1 vs=0x6f4e vo=0x696c6e4f vu=0x01d874fd
+vc=0xa7dd292a vn=0x6e776144/0x61647055/0x31326574/0x31363448`），`mt=` 与 `r=` 沿用 round131（13 与 464）。
+
+**三种读法**：
+
+1. **身份与宿主一致（`vt=1 un=1 vs=0x6f4e`），`mt` 仍 13** —— 选卷这一格在实机上关闭，13 与「挂错卷」无关。
+   下一格是候选 2：`/chosen { root-snapshot-name = …; }`，并在宿主先把容器里的快照名解析出来。
+2. **`vt` 或 `un` 不是 1，或者 `vs=` 读回 `0x736559`（"Yes"）/`0xffff`（没有这个属性）** —— 这台板子的 IOKit 枚举和宿主
+   看到的不是一回事，`vn=` 前两字会直接告诉我们是哪颗；那时先修枚举，别急着改挂载参数。
+3. **`mt=0`** —— 那就跳过了这一格，直接进 `rootvp not authenticated after mounting` 那颗钉子（候选 3）。
 
 ## 有意省略的部分
 

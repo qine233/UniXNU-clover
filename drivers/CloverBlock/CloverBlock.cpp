@@ -123,7 +123,15 @@
 // an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
 // attached for start (startCandidate() attaches again after the matching loop's detach).
 //
-// A failure panics with one short CloverBlock r131 line naming the step; success prints one line
+// Rounds 129-131 aimed the mount at the first volume the registry walk reached and each got the same errno
+// 13 back for a different guess about the caller's state. Round132 aims it at a volume it can name: the
+// walk now reads each AppleAPFSVolume's own FullName/UUID/Sealed/Status and the container's UUID, counts
+// how many volumes were published and how many of them are unsealed, and prefers an unsealed volume over a
+// sealed one -- the same preference the base repository's qualified run expresses as a root-matching UUID.
+// Nothing else about the mount moves, so the frame either shows the identity the host already read out of
+// the flashed bytes and still says 13, or it says something the host did not predict.
+//
+// A failure panics with one short CloverBlock r132 line naming the step; success prints one line
 // and lets the boot continue, except under a window (clover-apfs=1 or =2), where the APFS depth and
 // what the vfs made of it are the report and the run always panics with them. A refire of the IOBSD
 // notification prints one counted line and returns, so the photograph shows both that the run
@@ -234,6 +242,24 @@ static const char kApfsKext[] = "com.apple.filesystems.apfs";
 static const char kApfsSchemeClass[] = "AppleAPFSContainerScheme";
 static const char kApfsContainerClass[] = "AppleAPFSContainer";
 static const char kApfsVolumeClass[] = "AppleAPFSVolume";
+// The four properties that say *which* volume a node is. Rounds 128-131 counted volume nodes and
+// mounted the first one the walk reached, and not one word of what that node calls itself ever came
+// back on the screen -- so "we have been mounting the sealed volume" was an interpretation nobody could
+// check, only assume. These are the names apfs publishes on its own AppleAPFSVolume objects, and they are
+// the same four the base repository's own original-OS checkpoint reads out of IOKit's registry string log
+// (scripts/check-original-apfs-root-checkpoints.py:50-56: UUID, Status, Sealed, FullName for the volume it
+// mounts with return 0). Reading them as OSString is therefore not a guess about the type either.
+static const char kFullNameKey[] = "FullName";
+static const char kVolumeUuidKey[] = "UUID";
+static const char kSealedKey[] = "Sealed";
+static const char kStatusKey[] = "Status";
+// 'N','o' little-endian -- what the unsealed volume the base repository mounts publishes. The same field
+// on a sealed volume reads "Yes", and on a broken seal the head of "Broken"; anything else is its own
+// reading, which is why the word itself is drawn rather than a yes/no bit.
+static const uint32_t kSealedNo = 0x6f4e;
+// A property that was not there, or was not a string. The mount ladder already prints 0xffff for "this
+// rung never ran", so an absence here does not masquerade as a zero value.
+static const uint32_t kNoProperty = 0xffff;
 // The name vfs_rootmountalloc() looks a vfstable up by: bsd/vfs/vfs_subr.c:1181 compares it against
 // `vfc_name`, which is what apfs.kext registered when round128's OSKextLoadKextWithIdentifier ran.
 static const char kApfsFsName[] = "apfs";
@@ -655,7 +681,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r131: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r132: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 static uint32_t le32At(const uint8_t *at)
@@ -667,6 +693,41 @@ static uint32_t le32At(const uint8_t *at)
 static uint64_t le64At(const uint8_t *at)
 {
   return static_cast<uint64_t>(le32At(at)) | (static_cast<uint64_t>(le32At(at + 4)) << 32);
+}
+
+// A registry string, or nothing. Same wrapper every other property read in this file uses -- the
+// non-deprecated form wants an OSString key and an option mask -- and the object getProperty() retains is
+// left where it is on purpose: this runs once, at boot, on objects the registry keeps for the life of the
+// machine, which is the trade round129 already made when it retained the volume's media.
+static const char *stringProperty(IORegistryEntry *entry, const char *key)
+{
+  OSString *text = OSDynamicCast(OSString, property(entry, key));
+  return text ? text->getCStringNoCopy() : nullptr;
+}
+
+// The first four bytes of a string, packed little-endian, so 'N','o' is 0x6f4e and 'O','n','l','i' is
+// 0x696c6e4f. This is the shape the mount ladder already prints for "apfs" (0x73667061), so the frame has
+// one way of showing a short word, not two.
+static uint32_t packedHead(const char *text)
+{
+  uint32_t word = 0;
+  for (uint32_t index = 0; index < 4 && text[index]; index++) {
+    word |= static_cast<uint32_t>(static_cast<unsigned char>(text[index])) << (8 * index);
+  }
+  return word;
+}
+
+// FNV-1a over an ASCII string. The two strings this hashes are 36 and 16+ characters, far too long for a
+// frame that already carries 44 numbers, and the point of drawing them is not to read them but to say "the
+// registry on this card holds the same value the host reads out of the same bytes". A 32-bit hash proves
+// that as exactly as the text does, and the host can compute the expected number before the photo is taken.
+static uint32_t fnv1a(const char *text)
+{
+  uint32_t hash = 0x811c9dc5u;
+  for (const char *at = text; *at; at++) {
+    hash = (hash ^ static_cast<uint32_t>(static_cast<unsigned char>(*at))) * 0x010000193u;
+  }
+  return hash;
 }
 
 // Latch the media to the OS window inside the flashed root image. Everything the manifest holds is
@@ -802,6 +863,44 @@ static IOReturn readMediaBytes(IOMedia *media, IOService *client, IOMemoryDescri
 
 // ---------------------------------------------------------------- round127's apfs depth
 
+// What one volume calls itself, in the four words the frame can hold. `name` is the head of FullName and
+// is drawn as text rather than hashed because it is the field whose spelling has to be pointable at: the
+// host copy of the bytes this window carries says `DawnUpdate21H461.J120J121J207J208OS`, and the first 16
+// bytes of that are four words. `uuid` and `sealed` are what the base repository's root selection matches
+// on and what the disassembled mount reads as its seal, respectively.
+struct VolumeIdentity {
+  uint32_t name[4];
+  uint32_t uuid;
+  uint32_t sealed;
+  uint32_t status;
+};
+
+// Read the identity off the volume node itself. Every field is a registry string, and a missing one is
+// drawn as kNoProperty so "apfs published nothing here" cannot be read as "it published a zero".
+static void readVolumeIdentity(IORegistryEntry *volume, VolumeIdentity *identity)
+{
+  for (uint32_t index = 0; index < 4; index++) {
+    identity->name[index] = 0;
+  }
+  const char *name = stringProperty(volume, kFullNameKey);
+  if (name) {
+    char head[16] = { 0 };
+    for (uint32_t index = 0; index + 1 < sizeof(head) && name[index]; index++) {
+      head[index] = name[index];
+    }
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(head);
+    for (uint32_t index = 0; index < 4; index++) {
+      identity->name[index] = le32At(bytes + 4 * index);
+    }
+  }
+  const char *uuid = stringProperty(volume, kVolumeUuidKey);
+  identity->uuid = uuid ? fnv1a(uuid) : 0;
+  const char *sealed = stringProperty(volume, kSealedKey);
+  identity->sealed = sealed ? packedHead(sealed) : kNoProperty;
+  const char *status = stringProperty(volume, kStatusKey);
+  identity->status = status ? packedHead(status) : kNoProperty;
+}
+
 // Every service that descends from this media in the IOService plane attached to it, so a class name
 // found here is attached to *this* disk, not to somebody else's reader: no matching dictionary (and
 // so none of round116's double-release), no provider comparison, no second tree. The three flags are
@@ -825,6 +924,15 @@ struct ApfsDepth {
   // device), otherwise its parent entry -- retained here because the walk's iterator is the only thing
   // keeping it alive otherwise.
   IOMedia *volumeMedia;
+  // Round132's additions, and they are the answer to the question the mount ladder has been unable to
+  // ask: `volumeCount` is how many volumes this container published at all, `unsealedCount` how many of
+  // them say they are not sealed, `containerUuid` identifies the container they were published under, and
+  // `identity` is the identity of whichever volume `volumeMedia` points at. Together they turn "apfs said
+  // EACCES" into "apfs said EACCES about this volume, whose name is this".
+  uint32_t volumeCount;
+  uint32_t unsealedCount;
+  uint32_t containerUuid;
+  VolumeIdentity identity;
 };
 
 static void measureApfsDepth(IORegistryEntry *entry, ApfsDepth *depth, uint32_t level)
@@ -848,18 +956,51 @@ static void measureApfsDepth(IORegistryEntry *entry, ApfsDepth *depth, uint32_t 
     }
     if (child->metaCast(kApfsContainerClass)) {
       depth->container = 1;
+      if (!depth->containerUuid) {
+        const char *uuid = stringProperty(child, kVolumeUuidKey);
+        if (uuid) {
+          depth->containerUuid = fnv1a(uuid);
+        }
+      }
     }
     if (child->metaCast(kApfsVolumeClass)) {
       depth->volume = 1;
-      if (!depth->volumeMedia) {
-        IOMedia *media = static_cast<IOMedia *>(child->metaCast("IOMedia"));
-        if (!media) {
-          IORegistryEntry *parent = child->getParentEntry(gIOServicePlane);
-          media = parent ? static_cast<IOMedia *>(parent->metaCast("IOMedia")) : nullptr;
-        }
-        if (media) {
-          media->retain();
+      if (depth->volumeCount < 255) {
+        depth->volumeCount++;
+      }
+      VolumeIdentity found{};
+      readVolumeIdentity(child, &found);
+      const bool unsealed = found.sealed == kSealedNo;
+      if (unsealed) {
+        depth->unsealedCount++;
+      }
+      // Round132's selection rule, and the reason this file reads an identity at all. Through round131 the
+      // walk kept the *first* volume it reached -- `if (!depth->volumeMedia)` -- whatever that volume was,
+      // so the mount was aimed at whichever node IOKit happened to attach first rather than at a volume
+      // this file can name. The rule now is the one the base repository's qualified run uses (its root
+      // matching is an IOPropertyMatch on a UUID that names the unsealed OS volume, and the sealed
+      // SystemCryptex beside it is kept as the *negative* control -- that mount is expected to be refused
+      // with the seal sentence), transcribed into the property that distinguishes the two here: an
+      // unsealed volume wins, and a sealed one is mounted only when the container published nothing else.
+      // With one volume on the container this changes nothing -- which is exactly what vt= and un= are
+      // drawn to establish, because the frame will say whether there was ever a second volume to choose
+      // between.
+      IOMedia *media = static_cast<IOMedia *>(child->metaCast("IOMedia"));
+      if (!media) {
+        IORegistryEntry *parent = child->getParentEntry(gIOServicePlane);
+        media = parent ? static_cast<IOMedia *>(parent->metaCast("IOMedia")) : nullptr;
+      }
+      if (media) {
+        media->retain();
+        const bool holdsSealed = depth->volumeMedia && depth->identity.sealed != kSealedNo;
+        if (!depth->volumeMedia || (unsealed && holdsSealed)) {
+          if (depth->volumeMedia) {
+            depth->volumeMedia->release();
+          }
           depth->volumeMedia = media;
+          depth->identity = found;
+        } else {
+          media->release();
         }
       }
     }
@@ -1128,9 +1269,9 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
   // so what they report is the storage stack's traffic and not the one read taken above.
   __atomic_store_n(&gBlocksRead, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&gBlocksWritten, 0, __ATOMIC_RELEASE);
-  ApfsDepth best = { 0, 0, 0, 0, nullptr };
+  ApfsDepth best{};
   for (uint32_t attempt = 0; attempt < 12000 && !best.volumeMedia; attempt++) {
-    ApfsDepth now = { 0, 0, 0, 0, nullptr };
+    ApfsDepth now{};
     measureApfsDepth(whole, &now, 0);
     if (now.seen > best.seen) {
       best.seen = now.seen;
@@ -1144,24 +1285,56 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
     if (now.volume) {
       best.volume = 1;
     }
-    // The walk retained whatever volume it found, and the loop ends on the first one that comes back
-    // with a media, so the transfer below has no second owner; the release is for the one case where
-    // a later pass finds a volume media and an earlier pass already had one -- which the loop
-    // condition makes impossible, and an unbalanced retain on a boot-lifetime object would be.
+    // The counts are maxima rather than sums: a pass that ran before the container finished publishing
+    // sees fewer volumes than the one after it, and the frame wants the fullest picture the tree ever
+    // gave, not the number of times this file walked it.
+    if (now.volumeCount > best.volumeCount) {
+      best.volumeCount = now.volumeCount;
+    }
+    if (now.unsealedCount > best.unsealedCount) {
+      best.unsealedCount = now.unsealedCount;
+    }
+    if (!best.containerUuid) {
+      best.containerUuid = now.containerUuid;
+    }
+    // The walk retained whatever volume it chose, and the loop ends on the first pass that comes back
+    // with a media, so the transfer below has no second owner; the release is for the one case where a
+    // later pass finds a volume media and an earlier pass already had one -- which the loop condition
+    // makes impossible, and an unbalanced retain on a boot-lifetime object would be.
     if (now.volumeMedia) {
       if (best.volumeMedia) {
         now.volumeMedia->release();
       } else {
         best.volumeMedia = now.volumeMedia;
+        best.identity = now.identity;
       }
     }
     IOSleep(10);
+  }
+  // Nothing was ever chosen: the identity fields stay 0, but the two string fields that would read as a
+  // zero byte say "absent" instead, so an empty frame cannot be misread as a volume whose Sealed is "".
+  if (!best.volumeMedia) {
+    best.identity.sealed = kNoProperty;
+    best.identity.status = kNoProperty;
   }
 
   // 4. Round129's question, asked of the object the walk above was only counting: can the kernel mount
   // the volume Apple's own stack published on top of this PIO-backed disk, and can it read a file out
   // of it. Every field of the answer is on the same line as the depth that made it possible, so one
   // photograph says both whether the tree grew and what the vfs made of it.
+  //
+  // Round132 asks the half of that this file has never been able to answer: *which* volume the mount was
+  // aimed at. Rounds 129-131 each changed one field of the mount struct and each got the same 13 back with
+  // the same 464 blocks read -- three guesses about the caller's state, and not one word about the object
+  // being mounted. The host has meanwhile read the flashed bytes (the window is the OS slice of the same
+  // image the base repository mounts with return 0) and found exactly one volume in it, the unsealed one,
+  // so the guess that survived round131 -- "we have been mounting the sealed volume" -- is already wrong
+  // before this boot. What is still unproven is the device side of that claim: that the volume *this*
+  // board's IOKit published, the one whose BSD name went into vfs_rootmountalloc() and whose devvp went
+  // into the mount, carries the same name and the same seal. vt=/un= say whether there was ever more than
+  // one to choose from, vs=/vo=/vu=/vc=/vn= name the one that was chosen, and the mount ladder below runs
+  // unchanged -- same flags, same devvp, same data=0 -- so a 13 next to an expected identity is a 13 about
+  // the right volume, and not an aim that never left the sealed one.
   MountReport report = { kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached,
                          { 0, 0, 0, 0 }, 0, 0, 0,
                          0, 0, 0, 0, 0,
@@ -1172,13 +1345,17 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
     volumeMountLadder(best.volumeMedia, &report);
   }
 
-  panic("CloverBlock r131: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u dv=%u:%u bd=%u al=%u "
+  panic("CloverBlock r132: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u "
+        "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x vn=0x%x/0x%x/0x%x/0x%x dv=%u:%u bd=%u al=%u "
         "t=0x%x/0x%x/0x%x/0x%x on=0x%x fm=0x%x dp=0x%x:0x%x fl=0x%x fc=0x%x fk=0x%x "
         "op=0x%x:0x%x mm=0x%x:0x%x mt=%u st=%u rt=%u k=%u/%u/%u/%u "
         "rd=%u g=%u x=0x%x y=0x%x r=%u w=%u",
         __atomic_load_n(&gWindowFirst, __ATOMIC_ACQUIRE),
         __atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE), magic,
         static_cast<uint32_t>(loaded), best.seen, best.scheme, best.container, best.volume,
+        best.volumeCount, best.unsealedCount, best.identity.sealed, best.identity.status,
+        best.identity.uuid, best.containerUuid,
+        best.identity.name[0], best.identity.name[1], best.identity.name[2], best.identity.name[3],
         report.major, report.minor, report.bdev, report.alloc,
         report.name[0], report.name[1], report.name[2], report.name[3], report.on, report.from,
         static_cast<uint32_t>(report.devvp >> 32), static_cast<uint32_t>(report.devvp),
@@ -1205,7 +1382,7 @@ extern "C" void clover_block_run(void)
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    IOLog("CloverBlock r131: refire n=%u (already ran)\n", fires);
+    IOLog("CloverBlock r132: refire n=%u (already ran)\n", fires);
     return;
   }
 
@@ -1419,7 +1596,7 @@ extern "C" void clover_block_run(void)
     fail("alias-match", reinterpret_cast<uint64_t>(aliasService));
   }
 
-  IOLog("CloverBlock r131: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
+  IOLog("CloverBlock r132: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
         kRootAlias, bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
 }
