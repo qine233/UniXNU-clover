@@ -526,13 +526,17 @@ def check_board(errors: list) -> str:
         if not re.fullmatch(r"[A-Za-z0-9_.\-]+(=[A-Za-z0-9_.,\-]+)?", argument):
             errors.append(f"kernel argument {argument} fails the payload pattern")
 
-    # The root contract, round137. The kernel's own vfs_mountroot() is the only mounter. The board
+    # The root contract, round138. The kernel's own vfs_mountroot() is the only mounter. The board
     # declares the root once, in /chosen/root-matching (IOFindBSDRoot deserializes it at
-    # IOKitBSDInit.cpp:790-797 and waits for that IOMedia), and carries no `rd=` at all: with a
-    # dictionary present the rd= branch at :888 is dead text, and keeping both would be two
-    # declarations of the same root. drivers/CloverBlock makes the service exist before that wait
-    # because its run is triggered by the earlier publishResource("IOBSD") inside IOKitBSDInit; under
-    # clover-apfs=3 it returns instead of mounting anything itself.
+    # IOKitBSDInit.cpp:790-797 and waits for that IOMedia). One `rd=` remains, `rd=md0s39`, and it is
+    # not a second declaration: the root search never reaches its rd= branch (:888 is guarded by
+    # !matching) and the md shortcut demands a three-character mdX (:849, :1080). Its only reader is
+    # bsd_rooted_ramdisk() (bsd_init.c:450-466), which matches the "md0" prefix and skips the
+    # FSIOC_KERNEL_ROOTAUTH block -- the gate round137 died at (bsd_init.c:1098) because an unsealed
+    # APFS copy cannot pass it. Any other rd= would still declare a root, so it is refused.
+    # drivers/CloverBlock makes the service exist before that wait because its run is triggered by the
+    # earlier publishResource("IOBSD") inside IOKitBSDInit; under clover-apfs=3 it returns instead of
+    # mounting anything itself.
     # Round119's failure was a dictionary naming a volume no service here carried, not the mechanism.
     if str(adt.get("root_match_volume_uuid", "")).upper() != ROOT_VOLUME_UUID:
         errors.append(f"[payload.adt] root_match_volume_uuid must be {ROOT_VOLUME_UUID}: "
@@ -540,10 +544,12 @@ def check_board(errors: list) -> str:
     if adt.get("packed_data_ramdisk"):
         errors.append("[payload.adt] packed_data_ramdisk is true, but this board's RAMDisk is the "
                       "unchanged mockfs image; the payload step would emit PackedRAMDisk")
-    if any(argument == "rd" or argument.startswith("rd=")
-           for argument in board["payload"]["kernel_args"]):
-        errors.append("[payload] kernel_args still carries rd=: root-matching wins the race and the "
-                      "argument is dead text, so a boot that failed over to it would be misread")
+    rd_args = [argument for argument in board["payload"]["kernel_args"]
+               if argument == "rd" or argument.startswith("rd=")]
+    if rd_args != ["rd=md0s39"]:
+        errors.append('[payload] kernel_args must carry exactly one rd=, "rd=md0s39": four characters '
+                      "keep it out of IOFindBSDRoot's root declaration (root-matching is the root) "
+                      "while bsd_rooted_ramdisk() matches its md0 prefix and skips ROOTAUTH")
     if "clover-apfs=3" not in board["payload"]["kernel_args"]:
         errors.append('[payload] kernel_args has no clover-apfs=3: without it CloverBlock keeps the '
                       'whole-card geometry, never reads the SHNGROOT manifest, and the APFS volume '

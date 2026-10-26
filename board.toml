@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r137: let the kernel mount the APFS root it was pointed at"
+title = "clover r138: keep the mounted APFS root and skip the rootauth gate it cannot pass"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1109,13 +1109,14 @@ kernel_args = [
   #   `... v=1` = a volume object exists, i.e. Apple's own filesystem found a mountable volume on a
   #     device this port wrote by hand. That is the pass line for an iOS boot.
   #
-  # Round137 removes `rd=md0`. The root is the APFS volume this driver publishes, selected by the
+  # Round137 removed `rd=md0`. The root is the APFS volume this driver publishes, selected by the
   # /chosen root-matching dictionary in [payload.adt] below, and mounted by the kernel's own
   # vfs_mountroot(). `rd=md0` would be a second declaration of the root and root-matching wins the
   # race anyway (IOKitBSDInit.cpp:790-797 before :888); without it, a root search that cannot find
   # the volume ends in the standard "Failed to mount root device" panic rather than silently
   # mounting the RAMDisk. The RAMDisk placeholder stays in the memory map, unused, because the
-  # payload still carries the mockfs image and its trust cache.
+  # payload still carries the mockfs image and its trust cache. Round138 re-adds an `rd=` below, but
+  # a four-character one that the root search cannot use -- it exists only for bsd_init's gate.
   # Round 72 died with SIGKILL (parent's wait4 read status 9) inside its first
   # mach_msg; round 73 bracketed that call with markers and added this boot-arg,
   # and the panel looked exactly the same: presend, no send=. So the boot-arg did
@@ -1869,6 +1870,20 @@ kernel_args = [
   # the boot no longer runs either of them.
   "clover-apfs=3",
   "clover-emmc=21",
+  # Round138 puts `rd=` back, but not as a root declaration. Round137's frame was `rootvp not
+  # authenticated after mounting`, which is drawn from bsd_init.c:1098 -- inside the block that runs
+  # only after vfs_mountroot() returned 0. The APFS volume from round137 was mounted; what failed was
+  # the FSIOC_KERNEL_ROOTAUTH ioctl the non-macOS build issues next, because the copy is unsealed.
+  # That block is gated by bsd_rooted_ramdisk() (bsd_init.c:450-466), which reads exactly one thing:
+  # the `rd` boot-arg, compared by its first three characters against RAMDEV "md0" (:447-459). It
+  # never resolves the name, so `md0s39` is enough -- and the name no longer exists in round138's
+  # device tree anyway, since CloverBlock publishes the APFS volume under its own BSD name.
+  # This cannot capture the root: root-matching wins first (IOKitBSDInit.cpp:790-797 sets `matching`
+  # and `continue`s, and the BSD-name branch at :888 requires `!matching`), and the md memory-device
+  # shortcut requires a three-character `mdX` -- `rdBootVar[3] == 0` at IOKitBSDInit.cpp:849 and
+  # :1080 -- which a four-character alias fails. Round121 already measured this exact prefix trick
+  # on hardware: `BSD root: md0s39, major 1, minor 39` with the rootauth block skipped.
+  "rd=md0s39",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)
@@ -2072,7 +2087,8 @@ owned_memory_size = "0x40000000"
 # publishResource("IOBSD") in IOKitBSDInit, is what makes the media appear before the wait.
 # The round119 panic this comment used to record was a dictionary naming a UUID no service on this
 # board carried; it was not a reason for root-matching to be absent. scripts/check-clover.py now
-# asserts this key is present, and that `rd=md0` is gone.
+# asserts this key is present. `rd=md0` stays gone; round138's `rd=md0s39` is a prefix alias for
+# bsd_init's ramdisk check, not a root declaration (see the argument's own comment).
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 cpu_regs = "0x0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"
 psci_method = "smc"

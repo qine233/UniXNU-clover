@@ -131,8 +131,9 @@ NVRAM proxy、`dram-base`、`crypto-hash-method`、`root-matching`、`display-ba
 和 `TrustCache` 两个占位（出现 `PackedRAMDisk` 就报错：DarwinBoot 不接受两个
 ramdisk 槽）、
 带八个 MPIDR 值的 `/cpus`、`/psci`、带 `ranges` 与 GICv3 节点的 `/arm-io`、
-`/defaults`、`/options` 和 `/product`。board 一段钉住 `v0.4.0` 的根契约：
-`packed_data_ramdisk` 必须为假，`kernel_args` 不许出现任何 `rd=`，
+`/defaults`、`/options` 和 `/product`。board 一段钉住 `v0.4.1` 的根契约：
+`packed_data_ramdisk` 必须为假，`kernel_args` 必须且只能有一个 `rd=md0s39`
+（四字符别名只喂给 `bsd_rooted_ramdisk()` 的前缀比较，不参与根声明），
 `/chosen/root-matching` 必须是对 OS 卷 UUID 的 `IOMedia` 属性匹配，
 `clover-apfs` 必须为 `3`，`trust_cache_sha256` 必须非空。
 
@@ -9073,6 +9074,102 @@ trustcache 56 B（`c3ed2152…`）。两个 checker 全绿。
 5. **exec 阶段的 AMFI 拒绝** —— 根挂载与 `/sbin/launchd` 的查找都过了，墙是
    owner trust cache 里没有它的 cdhash；下一格补信任，不再是挂载问题。
 
+## round137 读数（v0.4.0 实机，2026-10-26）：APFS 根挂上了，墙是 ROOTAUTH
+
+第一帧末行是 `rootvp not authenticated after mounting`。这一句不是挂载失败，恰好相反：
+它只出现在 `bsd_init.c` 的挂载成功分支里——`vfs_mountroot()` 返回 0、`VFS_ROOT` 拿到
+根 vnode、`set_rootvnode()` 完成之后，非 macOS 构建把 `require_rootauth` 置为真，
+对根 vnode 发 `FSIOC_KERNEL_ROOTAUTH`（`bsd/sys/fsctl.h:476`），ioctl 返回错误且没有
+owner 授权时才在 `bsd_init.c:1098` panic。也就是说：
+
+- `/chosen/root-matching` 的 UUID 匹配到了本驱动发布的 OS 卷；
+- `IOFindBSDRoot()` 从 service 读到了 BSD 名与 major/minor，`makedev` 成立；
+- 内核自己的 `vfs_mountroot()` 把 APFS 卷挂上了，round129-136 手工 `VFS_MOUNT`
+  的 13 没有出现；
+- 墙是根授权：这颗卷是未封存的复制卷，`FSIOC_KERNEL_ROOTAUTH` 不会给它认证。
+
+round137 同时证明了 `v0.4.0` 把挂载交回内核是正确方向：驱动只需让卷出现，根发现、
+`bdevvp`、`vfs_mountroot` 都由 XNU 自己完成。
+
+## v0.4.1（round138）：用四个字符的 `rd=` 跳过根授权门
+
+`bsd_rooted_ramdisk()`（`bsd_init.c:450-466`）就是那道门的开关：
+
+```c
+#define RAMDEV "md0"                                   /* :447 */
+...
+if (PE_parse_boot_argn("rd", dev_path, MAXPATHLEN)) {
+    if (strncmp(dev_path, RAMDEV, strlen(RAMDEV)) == 0) {
+        is_ramdisk = true;
+    }
+}
+```
+
+它只读 boot-arg `rd`，只比前三个字符，从不解析设备名；`bsd_init.c:1057` 的
+`if (!bsd_rooted_ramdisk())` 是它在整个内核里唯一的使用点。所以 `rd=md0s39`
+让整段授权块不执行，同时不会夺走根：
+
+- root-matching 先赢：`IOFindBSDRoot()` 在 `IOKitBSDInit.cpp:790-797` 把字典装进
+  `matching` 就 `continue`，`:888` 的 BSD 名支路要求 `!matching`；
+- md 内存设备捷径要求 `mdX` 正好三字符（`rdBootVar[3] == 0`，`:849`/`:1080`），
+  `md0s39` 四字符不满足；
+- 这个名字在本轮设备树里也不再存在：CloverBlock 发布的是 APFS 卷自己的 BSD 名。
+
+round121 已在实机量过同一形状：`BSD root: md0s39, major 1, minor 39`，根授权块被跳过。
+
+改动只有启动参数与 checker，驱动与内核二进制不动：
+
+- `board.toml`：`kernel_args` 加回 `"rd=md0s39"`，标题升到 r138。
+- `scripts/check-clover.py`：根契约从「任何 `rd=` 都报错」改为「必须且只能有一个
+  `rd=md0s39`」，其他 rd 值继续报错。
+- `scripts/verify-clover-payload.py`：无需改动（驱动身份串仍是 `CloverBlock r137`）。
+
+内核侧接下来的顺序（同一轮启动内）：`IOFindBSDRoot` 匹配 → `makedev` →
+`vfs_mountroot()` → 跳过 ROOTAUTH → `/sbin/launchd` 的 path 查找与 exec。
+ADT 不变（13,476 B），uint 参数不变（`armcpu-clock-panic=180000` 仍是兜底），
+没有新的 eMMC 写入，全程只读。
+
+构建命令不变：
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+**刷写范围只有 `cache` 一个分区，没有新的 eMMC 分区写入**：`fastboot flash cache
+/Users/zhouzhou/clover-out/round138-payload.img`，然后 `fastboot reboot` 冷启动。
+
+产物归档在 `~/clover-out/round138-*`，`shasum -a 256 -c round138-SHA256SUMS` 七项全部 OK：
+`payload.img` 58,720,256 B（`d5f0d63d…`）、本地 `kernel.macho` `a8e50254…`、卷内
+`kernel.macho` 51,994,624 B（`73ec05ba…`，probe patch localized 成 6,680 B / 35 runs）、
+卷内 `unixnu.toml` 614 B（`155aaa73…`，args 末尾是
+`… rd=md0s39 armcpu-clock-panic=180000`）、ADT 13,476 B（`f258f237…`，含 root-matching）、
+`scratch-data.img` 35,888 B（`614b8356…`）、trustcache 56 B（`c3ed2152…`）。两个 checker 全绿。
+
+这一帧只问一个问题：**跳过 ROOTAUTH 之后，`bsd_init` 会不会继续走到
+`_bsd_utaskbootstrap` exec `/sbin/launchd`，以及第一颗被拒的 exec 是不是它。**
+控制台仍由探针挂在前面，内核文字会留在屏上：
+
+1. **不再出现 `rootvp not authenticated after mounting`，末行走过
+   `siginit returned, execing init` 之后停在 launchd 的某处** —— 根授权门已跳过，
+   下一格是 launchd 的加载与 AMFI。若停住时屏上没有任何 panic，说明内核在
+   exec 前/中挂住，下一轮把标记移到 exec 前后。
+2. **再次出现 `rootvp not authenticated after mounting`** —— `rd=md0s39` 没进内核
+   命令行（先看 `v0.2.80` 起 PMGR 打出的完整 args 行），或 `PE_parse_boot_argn`
+   没读到它；这不是机制失败，是参数没送达。
+3. **`panic("Failed to mount root device")`（`IOKitBSDInit.cpp:984`）** —— 根声明被
+   `rd=` 抢走了，属回归；检查 `rd=` 是否被拼成正好三字符的 `md?`。
+4. **`[clover] ... returned` 标记停在 exec 前** —— 内核走到了 exec，墙在
+   Mach-O/AMFI 一侧，下一轮补 launchd 的 cdhash 或检查 `OSKextLoadKextWithIdentifier`
+   之后的 kext 状态。
+5. **`cannot mount root, errno = N`** —— 根挂载又失败了，回看 `vu=` 与
+   `root-matching` 的 UUID 是否仍一致；这一格与 round137 的成功读数相矛盾，
+   优先怀疑 payload 里混进了旧参数。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -9116,8 +9213,10 @@ trustcache 56 B（`c3ed2152…`）。两个 checker 全绿。
   卡还答不答、在哪个地址答、时钟是不是还在移命令、数据阶段能不能自己走完」。
   根设备从 `v0.4.0` 起交回内核：`/chosen/root-matching` 指向 eMMC 上那颗未封存 OS 卷的
   UUID，`CloverBlock` 只把卷发布出来并等 BSD 名，`IOFindBSDRoot()` + `vfs_mountroot()`
-  走标准路径去挂；`rd=` 已从 `kernel_args` 删除（round120 删过 `root-matching`，round127
-  把根改回 `rd=md0`，都是为了让探针能跑；`v0.4.0` 两者对调）。payload 里仍带
+  走标准路径去挂；round120 删过 `root-matching`，round127 把根改回 `rd=md0`，都是为了让
+  探针能跑。`v0.4.1` 起 `kernel_args` 里保留一个 `rd=md0s39`，但它不是根声明：四字符
+  进不了 `IOFindBSDRoot` 的根选择（`matching` 优先、md 捷径要求三字符），只让
+  `bsd_rooted_ramdisk()` 读到 `md0` 前缀而跳过 ROOTAUTH。payload 里仍带
   `scratch-data.img` 作为 `initrd`，内核会把它挂成 `md0`，但它不再是根。
   round119-121 试过把根指向 eMMC 上的 `disk0s39`/`md0s39`，round127-136 的探针证明
   「卷发布、身份、几何、读路径都正常，唯独本驱动手工 `VFS_MOUNT` 一律回 13」，
