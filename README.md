@@ -10318,6 +10318,96 @@ fastboot reboot
 不是第一个 tick，而是真的 180 秒；若屏上再次出现死线 panic，`cnt1-cnt0`
 和 `spsr` 必须自洽。
 
+## v0.5.2（round149）：去掉死线——iOS 能自己走多远，由屏回答
+
+r148 的死线是修好了的，但修好的死线仍然是死线：`clover-unattended=180` 让每
+一次启动都在 180 秒处结束，不管 iOS 当时正走到哪。这一轮的问题不是「panic 能
+不能被接住」，而是**没人打断时它能走到哪**，所以只从 shipped boot 里摘掉这
+一个参数。
+
+r148 刷入后的观察（2026-10-26）：22:03–22:09 的几轮 `fastboot devices` /
+`adb devices` 都是空的，22:10:48 板子自己出现在 fastboot（`81ffcaaa  fastboot`，
+`product: clover`），到 22:11:06 仍稳定。这与 r147 设计的「panic → 写 IMEM
+原因 → PSCI 复位 → XBL 落 fastboot」一致；要把它确认为死线 panic 而不是别的
+复位，需要进 recovery 读 kind 20 记录，本轮没有做。
+
+### 改了什么：一个参数，一条反向断言
+
+`board.toml` 的 `kernel_args` 删掉 `"clover-unattended=180"`，标题换成
+`clover r149: no deadline; the screen is the only stop`。驱动和内核一行没动：
+`ArmCpu` 仍然解析这个参数，`CloverSdhci::clover_unattended_begin()` 仍然按它
+映射 IMEM，宿主脚本 `run-clover-unattended.sh` 也保持原样——把参数传回去就
+恢复 r148 的全部行为。
+
+`check-clover.py` 的断言随之反向：`kernel_args` **不得**含
+`clover-unattended=`，也不得含 `armcpu-clock-panic=`，标题必须是
+`clover r149: ...`。源码侧那些「链路还在」的断言（IMEM 常量、三行 IOLog、
+panic 屏的 `fastboot_mark`、`clover_fastboot_reason`）一条没删，因为代码确实
+还在，只是没有参数去武装它。
+
+### 行为上差在哪
+
+- ArmCpu：`gUnattendedSeconds = 0`，每个 tick 的那次比较不再进入；真正的
+  hang 不会被任何计时器打断。
+- CloverSdhci：没有参数就立即返回，IMEM 不映射，`clover_fastboot_reason`
+  保持空。panic 屏照旧打印、照旧在 20 秒后走 PSCI `SYSTEM_RESET`，但
+  `fastboot_mark()` 没有单元可写，所以复位回到普通启动路径，**不再自动停在
+  fastboot**。
+- 两个计数看门狗都不在（`armcpu-clock-panic` 本来就没传）。所以「停住」只剩
+  一种表现：屏上最后一帧不动；要再来一次，得手动进 fastboot。
+
+### 构建、校验与本轮该刷哪一格
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+构建 `~/clover-out/round149-build.log`，退出码 0。两个 checker：
+
+```
+[check-clover] clover ok: ADT 13516 bytes, 8 cores; splash 0x9d400000-0x9f800000,
+FD 0x9fc00000-0x9ff00000; board clover_defconfig, CLOVERESP;
+75 inline asm statements separated; modules visible
+kernel.macho: unattended watchdog linked   OK (unattended deadline %llu s ( present,
+unattended mark %x -> %x dea present, unattended mark %x read back present,
+unattended imem map failed % present, fb= present)
+kernel.macho: asm tails survived the assembler OK
+(mrs SPSR_EL1 in interrupt 1, mrs CNTVCT_EL0 in interrupt 2, msr ICC_SGI1R_EL1 in signalCPU 1)
+```
+
+死线代码仍被链进来（那些格式串还在），所以 `unattended watchdog linked OK` 不
+矛盾；它证明的是「把参数传回去就能用」，而不是「这一轮用了它」。卷内
+`unixnu.toml` 的 args 已确认同时不含 `clover-unattended=` 与
+`armcpu-clock-panic=`。
+
+产物在 `~/clover-out/round149-*`，`shasum -a 256 -c round149-SHA256SUMS`
+七项全 OK：`payload.img` 58,720,256 B（`b6a4a076…`）、本地 `kernel.macho`
+51,998,720 B（`6f7faa78…`）、卷内 `kernel.macho`（`799cba51…`，与本地只差
+entry 探针补丁，6,838 字节、35 段）、卷内 `unixnu.toml` 585 B（`324676c8…`）、
+ADT 13,516 B（`88355906…`；`chosen/random-seed` 每次构建随机，其余未变）、
+`scratch-data.img` 35,888 B（`614b8356…`，未变）、trustcache 61,408 B
+（`7c369ce0…`，未变）。
+
+**本轮有一处 eMMC 写入：** payload 刷到 `cache`（与之前每一轮相同，只覆盖
+`cache` 这一格）：
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round149-payload.img
+fastboot reboot
+```
+
+菜单第一行应当是 `clover r149: no deadline; the screen is the only stop`，冷
+启动（不要 `fastboot boot`）。
+
+这一帧只问一个问题：**没人打断时，iOS 从菜单一路能走到哪一步、最后停在哪一帧。**
+屏上的最后一帧就是答案；若 20 秒后自己重启，那次是 panic，而不是 hang。没有
+自动回 fastboot 的兜底。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

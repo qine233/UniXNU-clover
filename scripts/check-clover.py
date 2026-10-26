@@ -752,25 +752,29 @@ def check_board(errors: list) -> str:
     # instruction -- the CNTVCT read, the SPSR_EL1 read, the IPI send, the PAR_EL1 read and the
     # panic screen's CNTPCT wait were all silently dropped. This round separates those sequences
     # with newlines and makes check_inline_asm keep them that way. Round147's contract, meanwhile,
-    # still has to hold: an emergency exit the host can find on its own.
+    # still has to hold: the emergency exit the host can find on its own.
     #
     # Every previous round ended in a state the host had to look at: a panic screen that
     # parks, a tick-count watchdog, and no way back in without a hand on the tablet. The unattended
     # contract makes the board answer by itself: ArmCpu turns clover-unattended=<seconds> into a
     # CNTVCT deadline, CloverSdhci marks IMEM's restart-reason cell at boot and publishes it to the
     # panic screen, the panic screen writes "bootloader" and resets through PSCI after 20 s, and the
-    # host waits for fastboot, asks for recovery and decodes logfs. Any missing link turns
-    # "unattended" back into "silent until someone picks it up", which is the failure this round
-    # exists to remove, so each link is named here rather than discovered on the panel.
+    # host waits for fastboot, asks for recovery and decodes logfs. Round149 keeps every link but
+    # disarms it in the shipped boot, so the links are still asserted as source below.
+    # Round149. Round148's deadline works, but it also caps every observation at 180 s, and this
+    # round's question is how far iPadOS gets when nothing interrupts it. So the argument is gone
+    # from the shipped boot while the code that reads it stays: a panic still prints and its screen
+    # still resets after 20 s, but with no IMEM mark that reset goes through the ordinary path.
+    # "How far" is then answered by the panel, and nothing else, which is the contract asserted here.
     kernel_args = board["payload"]["kernel_args"]
-    if "clover-unattended=180" not in kernel_args:
-        errors.append('[payload] kernel_args has no clover-unattended=180: the unattended deadline '
-                      "would be off")
+    if any(argument.startswith("clover-unattended=") for argument in kernel_args):
+        errors.append("[payload] kernel_args still carries clover-unattended=: round149 removes the "
+                      "deadline so the screen, not a timer, is the stop")
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
-        errors.append("[payload] kernel_args still carries armcpu-clock-panic=: round147 replaces "
-                      "the tick count with the wall-clock deadline, and two deadlines would race")
-    if not board["payload"]["title"].startswith("clover r148:"):
-        errors.append('[payload] title is not "clover r148: ...": the menu would not name this round')
+        errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
+                      "watchdog would also cut the observation short")
+    if not board["payload"]["title"].startswith("clover r149:"):
+        errors.append('[payload] title is not "clover r149: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",

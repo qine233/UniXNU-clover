@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r148: the deadline waits 180 s, not one tick"
+title = "clover r149: no deadline; the screen is the only stop"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2103,13 +2103,14 @@ kernel_args = [
   # panic the round wants is CloverBlock's, with the depth in it; the watchdog's is the same board
   # answering a different question. At 180000 ticks (~10.6 minutes) the probe's own 12000-turn poll
   # always reports first, and a boot that answers nothing at all is still bounded.
-  # Round147 replaces that tick count with a wall-clock contract: clover-unattended=180 panics once
-  # 180 s of CNTVCT time have passed since the first timer tick, and CloverSdhci marks IMEM's
-  # restart reason at the same argument, so both this deadline and every panic screen reset come
-  # back up in fastboot instead of stopping on a screen nobody is watching. The tick-count watchdog
-  # stays in ArmCpu for A/B diagnostics (`armcpu-clock-panic`), but the shipped boot no longer
-  # passes it: one deadline, one meaning. scripts/run-clover-unattended.sh is the host half.
-  "clover-unattended=180",
+  # Round149 removes that wall-clock deadline from the shipped boot on purpose. The question this
+  # boot answers is how far iPadOS gets when nothing interrupts it, and round147's 180 s cap made
+  # every answer stop at 180 s. The code stays in ArmCpu and CloverSdhci behind
+  # `clover-unattended=<seconds>` for A/B rounds; with the argument absent nothing arms it, and the
+  # tick-count watchdog stays off too. A hang is therefore silent and the panel is the only stop. A
+  # panic still prints and its screen still resets after 20 s, but with no IMEM mark that reset
+  # returns through the ordinary boot path rather than into fastboot. scripts/run-clover-unattended.sh
+  # is unchanged and still works when the argument is passed back in.
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board has never had its online-CPU count measured (round70's panel
   # read as the child being picked up by a second core, so "one CPU" below is an assumption, not a
