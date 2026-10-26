@@ -10717,6 +10717,97 @@ fastboot reboot
 ADT 每轮都会变一次 64 字节：`/chosen/random-seed` 是 `os.urandom(64)`，其余字节
 与上一轮逐字节相同。
 
+## v0.5.6（round153）：探针先看再比，顺带问 dyld_flags
+
+### r152 的帧说了什么
+
+r146 的五行走干净了（镜像刷对了），可 `clover r151:` 还是一行都没有，屏上仍是
+两遍：
+
+```
+shared_region: … [1(launchd)] check_np(0x16ed25150) vm_shared_region_start_address() failed
+```
+
+上一轮据此准备“把打印挪到进入 open 之前”。核对源码后，这个方向错了：**问题在
+探针自己身上**。
+
+### 根因：`NDINIT` 从不初始化 `cn_pnbuf`
+
+`NDINIT`（`bsd/sys/namei.h:202`）只设 `ni_dirp`、`cn_flags` 等字段，`cn_pnbuf`
+留给 `namei()` 第一次 copyin 时填。`openat_internal` 用
+`kalloc_type(..., Z_WAITOK)` 分配 `nameidata`，不置零。r151 的包装在调用
+`vn_open_auth_internal` **之前**就读 `ndp->ni_cnd.cn_pnbuf`，拿到的是未初始化的
+垃圾（大概率是 NULL），于是每次都在前缀比较处提前 `return error`。
+
+也就是说：r151 和 r152 的沉默只证明探针没跑，**完全不能**用来判断 dyld 有没有
+调 open。上一轮把“dyld 没 open”当成结论，是错的。
+
+`nameidone()`（`vfs_lookup.c:1949`）只在路径超过 `ni_pathbuf`（`HASBUF`）时
+`zfree` 并把指针置 NULL；dyld 的目录名和文件名都远短于 1024 字节，**调用内部函数
+之后**再读这个字段是有效的。
+
+### 改了什么
+
+- `zzy-clover-shared-region-why2.patch`（只剩两个文件）：
+  - `bsd/vfs/vfs_vnops.c`：包装改为先 `error = vn_open_auth_internal(...)`，
+    再 `path = ndp->ni_cnd.cn_pnbuf;` 做前缀匹配；三条读数（open / 挂载 / 头）不变，
+    前缀仍是 `/System/Library/Caches/com.apple.dyld` 与 `dyld_shared_cache`。
+  - `bsd/vm/vm_unix.c`：在 `shared_region_check_np` 开头打印一行
+    `clover r153: check_np dyld_flags=0x%llx`。板级 owner chain 在 exec 时置
+    `dyld_flags |= 8`（bit 3 = 从磁盘找缓存），这行直接回答“发问的进程拿到的是
+    什么值”。
+- `check-clover.py`：断言补丁必须是“调用后读路径”的形状（`error = …internal`
+  出现在 `path = ndp->ni_cnd.cn_pnbuf` 之前），且补丁与镜像都不许再有
+  `clover r151:`；标题 `clover r153:`。
+- `verify-clover-payload.py`：镜像里必须有四条 r153 串（open / mount / read /
+  flags）和两个前缀，且 `clover r146:`、`dyld_shared_cache_arm64e`、
+  `clover r151:` 都不在。
+
+构建坑：`./unixnu build` 读的是 `~/UniXNU/patches/xnu/*.patch`，不是
+`~/UniXNU-clover/patches/xnu-clover/`。改完补丁必须把新文件同步过去，否则构建
+会拿旧副本去 apply 并失败（本轮第一次构建就死在这里）。
+
+### 构建与刷写
+
+```sh
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+只写 `cache`，冷启动：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round153-payload.img
+fastboot reboot
+```
+
+### 这一帧怎么读
+
+1. `clover r153: check_np dyld_flags=0x0`：launchd 没拿到 bit 3，dyld 不会去磁盘
+   缓存目录。先修 owner chain 的 exec 路径 / `dyld_flags=0x…` 字符串注入，别碰
+   VFS。
+2. `dyld_flags=0x8` 且出现 `clover r153: open …`：探针终于说话，按目录 → 文件 →
+   头三步读。目录 err=0、文件 err=2 说明缓存不在预期卷；文件 err=0 但头读失败，
+   说明 vnode 读通路有问题；头以 `dyld_v1` 开头则缓存可达，墙在别处。
+3. `dyld_flags=0x8` 且仍无任何 `clover r153: open`：dyld 在
+   `shared_region_check_np` 失败（ENOMEM）后就放弃了找缓存。下一轮攻
+   `shared_region_check_np` 的 ENOMEM，而不是文件系统。
+
+这一帧只问一个问题：**把探针的“先读后调”改成“先调后读”之后，dyld 会不会在屏上
+留下它自己的 open，以及它拿到的 dyld_flags 是多少。**
+
+产物归档在 `~/clover-out/round153-*`，`round153-SHA256SUMS` 八项：
+`payload.img` 58,720,256 B（`deeadfff…`）、本地 `kernel.macho` 51,998,720 B
+（`ccb3dbd3…`）、卷内 `kernel.macho`（`2554dbbc…`，入口探针仍在）、卷内
+`unixnu.toml` 610 B（`c6584c01…`）、ADT 13,516 B（`a8eb00da…`）、`scratch-data.img`
+35,888 B（`614b8356…`）、`trustcache` 61,408 B（`7c369ce0…`）、构建日志
+（`804c2d79…`）。两个 checker 的结果：`r146 probe removed OK`、`cache open probe
+linked OK (open/mount/read/flags/prefixes present, r151 form absent)`。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

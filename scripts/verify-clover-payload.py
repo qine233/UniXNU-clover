@@ -259,12 +259,10 @@ def check_root_mount_probe(kernel: bytes) -> bool:
 
 
 def check_shared_region_probe_removed(kernel: bytes) -> bool:
-    """Round152 takes r146's five vm_unix.c probes out. The one that matters is the namei in
-    shared_region_check_np: it ran inside the syscall dyld makes just before it looks for the
-    cache, and it was the only VFS caller of ours at that moment. The panel that came back for
-    r151 had those lines and none of r151's, so this round removes them and asks the same frame
-    again. The image's evidence is absence: no r146 format string may survive, and the wrong
-    cache name it looked up must not either."""
+    """Round152 took r146's five vm_unix.c probes out, and Round153 keeps them out: the namei ran
+    inside shared_region_check_np, the syscall dyld makes just before it looks for the cache, and
+    it was the only VFS caller of ours at that moment. The image's evidence is absence: no r146
+    format string may survive, and the wrong cache name it looked up must not either."""
     label = "kernel.macho: r146 probe removed"
     found = {"prefix": b"clover r146:" in kernel,
              "arm64e": b"dyld_shared_cache_arm64e" in kernel}
@@ -276,24 +274,29 @@ def check_shared_region_probe_removed(kernel: bytes) -> bool:
 
 
 def check_cache_open_probe(kernel: bytes) -> bool:
-    """Round151 stops guessing where dyld loses the cache and watches dyld's own opens. The
-    wrapper around vn_open_auth prints the path, the mode and the errno for the cache directory
-    and for anything named dyld_shared_cache, adds the backing mount on success, and reads the
-    sixteen-byte header through the same vnode. r146's namei asked for a file that does not
-    exist, so this check also requires the corrected name: the probe must not carry arm64e.
-    None of it adds a symbol, so these three format strings are the image's only evidence."""
+    """Round153 fixes the probe r151 shipped: that one read cn_pnbuf before vn_open_auth_internal
+    ran, but NDINIT never initializes the field -- namei's first copyin fills it -- so the read was
+    always garbage and the frame stayed silent for its own reasons. The image must now carry the
+    post-call form: the path print, the mount print, the header read, and the dyld_flags value that
+    says whether the process asking was ever told to use the on-disk cache. The r151 prefix must be
+    gone, and r146's wrong name with it. None of it adds a symbol, so these strings are the only
+    evidence."""
     label = "kernel.macho: cache open probe linked"
-    found = {"open": b"clover r151: open %s fmode=0x%x err=%d" in kernel,
+    found = {"open": b"clover r153: open %s fmode=0x%x err=%d" in kernel,
              "mount": b" fl=0x%llx vt=%d fs=%s" in kernel,
-             "read": b"clover r151: read err=%d resid=%d hdr=%s" in kernel}
+             "read": b"clover r153: read err=%d resid=%d hdr=%s" in kernel,
+             "flags": b"clover r153: check_np dyld_flags=0x%llx" in kernel}
     ok = all(found.values())
     if b"dyld_shared_cache" not in kernel or b"/System/Library/Caches/com.apple.dyld" not in kernel:
         found["prefixes"] = False
         ok = False
     else:
         found["prefixes"] = True
+    r151 = b"clover r151:" in kernel
+    ok = ok and not r151
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
+    detail += f", r151 form {'STILL PRESENT' if r151 else 'absent'}"
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
     return ok
 

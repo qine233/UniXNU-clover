@@ -737,29 +737,28 @@ def check_board(errors: list) -> str:
             errors.append("CloverBlock.cpp's boot line has no deferred=1: the frame would not say "
                           "that only one window was published")
 
-    # Round152. Round151 shipped the open probe, and the frame that came back carried the r146 lines
-    # but none of the r151 ones. r146's probe was the only VFS caller between the union mount and
-    # dyld: it ran a vnode_lookup inside shared_region_check_np itself, the syscall dyld makes just
-    # before it looks for the cache. This round removes it, so the next frame is a clean control:
-    # dyld's own calls at that moment, and nothing of ours. The patch is gone, so the contract is
-    # its absence -- and a frame that still prints "clover r146:" was built from an older tree.
+    # Round153. r152's frame carried neither the r146 lines (the removal worked) nor a single r151
+    # line, and that silence turned out to be the probe's own bug: NDINIT never initializes
+    # cn_pnbuf, and r151 read it before vn_open_auth_internal ran, so the saved pointer was the
+    # freshly allocated nameidata's garbage (usually NULL) and every call returned early. This
+    # round reads the path *after* the call, when namei has filled it, and prints the dyld_flags
+    # the asking process was handed, because dyld only looks in the on-disk cache directory when
+    # bit 3 is set. The r146 patch still has to stay gone: a frame that prints "clover r146:" was
+    # built from an older tree.
     r146 = next((base / "patches/xnu-clover/zzy-clover-shared-region-why.patch"
                  for base in (REPO, pathlib.Path.cwd())
                  if (base / "patches/xnu-clover/zzy-clover-shared-region-why.patch").is_file()), None)
     if r146 is not None:
         errors.append("patches/xnu-clover/zzy-clover-shared-region-why.patch is back: its namei ran "
                       "inside shared_region_check_np, right before dyld looks for the cache, and "
-                      "Round152 removes it so the next frame shows dyld's own calls only")
+                      "Round152 removed it so the frame shows dyld's own calls only")
 
-    # Round151. r150's frame says dyld reaches shared_region_check_np, gets ENOMEM, and then never
-    # enters _shared_region_map_and_slide: `map enter` is absent. The host's copy of dyld puts the
-    # remaining steps in order -- CacheFinder opens /System/Library/Caches/com.apple.dyld/ when
-    # dyld_flags bit 3 is set, preflight fstat64()s and openat()s dyld_shared_cache_arm64 inside that
-    # fd, and only then does anything call syscall 536. r146's namei asked for dyld_shared_cache_arm64e,
-    # which does not exist, so its err=2 answered a question nobody asked. This probe watches the
-    # opens dyld itself makes: vn_open_auth is the single tail of open(2), openat(2) and vn_open(),
-    # and a successful open also reads the sixteen-byte header through the same vnode. A frame that
-    # lacks either print cannot say whether the cache is reachable, and the next round would guess.
+    # Round153. The probe must be the post-call form: the wrapper calls vn_open_auth_internal
+    # first, then reads ndp->ni_cnd.cn_pnbuf. nameidone() only frees that pointer for paths longer
+    # than ni_pathbuf (HASBUF), and dyld's two names are short, so the read is valid here. The
+    # contract also forbids the r151 strings, since a conditional compiled from r151 would repeat
+    # the early return, and requires the dyld_flags line that separates "dyld never asked" from
+    # "dyld was never told where to look".
     cache_probe = next((base / "patches/xnu-clover/zzy-clover-shared-region-why2.patch"
                         for base in (REPO, pathlib.Path.cwd())
                         if (base / "patches/xnu-clover/zzy-clover-shared-region-why2.patch").is_file()), None)
@@ -770,19 +769,34 @@ def check_board(errors: list) -> str:
         text = cache_probe.read_text()
         missing = [needle for needle in
                    ("bsd/vfs/vfs_vnops.c",
+                    "bsd/vm/vm_unix.c",
                     "vn_open_auth_internal(struct nameidata *ndp",
                     "+int\n+vn_open_auth(struct nameidata *ndp",
-                    "clover r151: open %s fmode=0x%x err=%d",
+                    "-vn_open_auth(struct nameidata *ndp",
+                    "error = vn_open_auth_internal(ndp, fmodep, vap, authvp);",
+                    "path = ndp->ni_cnd.cn_pnbuf;",
+                    "clover r153: open %s fmode=0x%x err=%d",
                     "\"/System/Library/Caches/com.apple.dyld\"",
                     "\"dyld_shared_cache\"",
-                    "clover r151: read err=%d resid=%d hdr=%s")
+                    "clover r153: read err=%d resid=%d hdr=%s",
+                    "clover r153: check_np dyld_flags=0x%llx")
                    if needle not in text]
         for needle in missing:
-            errors.append(f"{cache_probe.name} lacks {needle!r}: the open and the header read are the "
-                          "two halves of the cache-reachability question")
+            errors.append(f"{cache_probe.name} lacks {needle!r}: the open, the header read and the "
+                          "dyld_flags line are the three halves of the cache-reachability question")
+        if "clover r151:" in text:
+            errors.append(f"{cache_probe.name} still carries a 'clover r151:' string: that form read "
+                          "cn_pnbuf before NDINIT's copyin filled it, so the probe returned early "
+                          "on every open and the frame stayed silent for the wrong reason")
         if "+#include" in text or "-vn_open_auth(struct nameidata *ndp" not in text:
             errors.append(f"{cache_probe.name} does not rename vn_open_auth to vn_open_auth_internal: "
                           "the probe would replace the open path instead of watching it")
+        source = cache_probe.read_text()
+        call = source.find("error = vn_open_auth_internal(ndp, fmodep, vap, authvp);")
+        read = source.find("path = ndp->ni_cnd.cn_pnbuf;")
+        if call < 0 or read < 0 or read < call:
+            errors.append(f"{cache_probe.name} reads cn_pnbuf before the internal call runs: "
+                          "NDINIT leaves the field uninitialized, so that read is always garbage")
 
     # Round148. Round147 shipped an unattended deadline that fired on the very first timer tick, with
     # a garbage counter in the message. The cause was not the arithmetic: the Darwin arm64 assembler
@@ -811,11 +825,11 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round150. Round149 removed the deadline and left the r146 wall untouched, so this round stops
-    # probing that wall and adopts the sheng property it was skipping: the root is accepted by owner
-    # trust, not by an rd= alias. The menu has to name that round.
-    if not board["payload"]["title"].startswith("clover r152:"):
-        errors.append('[payload] title is not "clover r152: ...": the menu would not name this round')
+    # Round153. r152's frame proved the removal but not the probe, because the probe itself was
+    # reading a field NDINIT never sets. This round prints the path after the call and the
+    # dyld_flags value beside it, so the menu has to name that round.
+    if not board["payload"]["title"].startswith("clover r153:"):
+        errors.append('[payload] title is not "clover r153: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",

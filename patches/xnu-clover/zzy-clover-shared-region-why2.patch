@@ -1,4 +1,3 @@
-diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
 --- a/bsd/vfs/vfs_vnops.c
 +++ b/bsd/vfs/vfs_vnops.c
 @@ -372,7 +372,7 @@
@@ -10,40 +9,44 @@ diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
  {
  	struct vnode *vp;
  	struct vnode *dvp;
-@@ -757,5 +757,53 @@
- out:
- 	return error;
- }
+@@ -755,6 +755,56 @@
+ 	}
  
+ out:
++	return error;
++}
++
 +/*
-+ * clover r151: dyld's verdict is "no shared cache" and it never reaches the map
-+ * syscall, so watch what it does to the cache files instead of guessing at the
-+ * step in between. vn_open_auth is the single tail of open(2), openat(2) and
-+ * vn_open(), and the syscall has already copied the path into cn_pnbuf by the
-+ * time it returns. With dyld_flags bit 3 set, CacheFinder opens the directory
-+ * first and everything after it is opened relative to that fd, so the two
-+ * prefixes below are the whole question: did the directory open, and did the
-+ * file inside it open. A successful open then reads the first sixteen bytes
-+ * through the same vnode -- the header dyld's preflight checks before asking
-+ * for a region -- so an open that succeeds but cannot be read says so here
-+ * instead of turning into a silent preflight failure.
++ * clover r153: r151 and r152 read cn_pnbuf *before* vn_open_auth_internal ran,
++ * but NDINIT never initializes that field -- namei's first copyin is what fills
++ * it. The saved pointer was therefore whatever the freshly allocated nameidata
++ * held (usually NULL), so both frames returned early on every open and their
++ * silence said nothing about dyld. Read the field after the call instead: by
++ * then namei has pointed it at the kernel copy of the path. nameidone() frees
++ * it only when the path was longer than ni_pathbuf (HASBUF), and dyld's two
++ * names are far shorter, so the pointer here is valid for exactly the opens
++ * this probe watches. The three readings are unchanged: did the directory
++ * open, did the file inside it open, and can this kernel read the sixteen-byte
++ * header of the file that did.
 + */
 +int
 +vn_open_auth(struct nameidata *ndp, int *fmodep, struct vnode_attr *vap, vnode_t authvp)
 +{
 +	static const char clover_cache_dir[] = "/System/Library/Caches/com.apple.dyld";
 +	static const char clover_cache_file[] = "dyld_shared_cache";
-+	const char *path = ndp->ni_cnd.cn_pnbuf;
++	const char *path;
 +	vnode_t vp;
 +	int error;
 +
 +	error = vn_open_auth_internal(ndp, fmodep, vap, authvp);
++	path = ndp->ni_cnd.cn_pnbuf;
 +	if (path == NULL ||
 +	    (strncmp(path, clover_cache_dir, sizeof(clover_cache_dir) - 1) != 0 &&
 +	    strncmp(path, clover_cache_file, sizeof(clover_cache_file) - 1) != 0)) {
 +		return error;
 +	}
-+	printf("clover r151: open %s fmode=0x%x err=%d", path, *fmodep, error);
++	printf("clover r153: open %s fmode=0x%x err=%d", path,
++	    error == 0 ? *fmodep : 0, error);
 +	vp = error ? NULLVP : ndp->ni_vp;
 +	if (vp != NULLVP) {
 +		struct mount *mp = vnode_mount(vp);
@@ -57,12 +60,26 @@ diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
 +		int read_error = vn_rdwr(UIO_READ, vp, header, 16, 0, UIO_SYSSPACE,
 +		    IO_NODELOCKED | IO_NOAUTH, kauth_cred_get(), &residual,
 +		    current_proc());
-+		printf("clover r151: read err=%d resid=%d hdr=%s\n",
++		printf("clover r153: read err=%d resid=%d hdr=%s\n",
 +		    read_error, residual, header);
 +	}
-+	return error;
-+}
+ 	return error;
+ }
+ 
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -2107,6 +2107,14 @@
+ 		proc_getpid(p), p->p_comm,
+ 		(uint64_t)uap->start_address));
+ 
++	/* clover r153: dyld decides where to look for the cache from this value;
++	 * the owner-chain exec sets bit 3 and appends it as "dyld_flags=0x...".
++	 * Printing it here says what the process that is asking was handed. */
++	{
++		extern uint64_t dyld_flags;
++		printf("clover r153: check_np dyld_flags=0x%llx\n", dyld_flags);
++	}
 +
- #if vn_access_DEPRECATED
- /*
-  * Authorize an action against a vnode.  This has been the canonical way to
+ 	/*
+ 	 * Special value of start_address used to indicate that map_with_linking() should
+ 	 * no longer be allowed in this process
