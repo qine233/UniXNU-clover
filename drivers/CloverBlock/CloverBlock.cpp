@@ -131,7 +131,7 @@
 // Nothing else about the mount moves, so the frame either shows the identity the host already read out of
 // the flashed bytes and still says 13, or it says something the host did not predict.
 //
-// A failure panics with one short CloverBlock r135 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r136 line naming the step; success prints one line
 // and lets the boot continue, except under a window (clover-apfs=1 or =2), where the APFS depth and
 // what the vfs made of it are the report and the run always panics with them. A refire of the IOBSD
 // notification prints one counted line and returns, so the photograph shows both that the run
@@ -697,7 +697,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r135: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r136: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 static uint32_t le32At(const uint8_t *at)
@@ -849,6 +849,50 @@ static MediaOp gMediaOp;
 // Round135's direct read of the volume's own media gets its own completion slot rather than reusing
 // gMediaOp, so the number drawn can never be the residue of the whole-disk GPT read above it.
 static MediaOp gVolumeOp;
+
+// Round136's read of the media the mount's dev_t actually names gets a third slot for the same reason,
+// one level stronger: it runs after the volume read in the same function, and reusing gVolumeOp there
+// would let a deferred completion overwrite ir= after it had been copied into the report.
+static MediaOp gMinorOp;
+
+// Round136: the dev_t VFS_MOUNT is handed names a (major, minor) pair, not an object. IOMediaBSDClient
+// stamps both numbers on the media it registers, so a walk of the same subtree the depth pass walks can
+// name the object that pair resolves to -- and comparing its address with the media this file mounted is
+// the only way to tell "the volume we measured" from "whatever disk0s3 happens to be". Not retained, for
+// the same reason findNamedMedia does not retain: the registry owns these for boot lifetime.
+static IOMedia *findMediaByMinor(IORegistryEntry *root, uint32_t major, uint32_t minor,
+                                 uint32_t depth)
+{
+  OSSharedPtr<OSIterator> children = root->getChildIterator(gIOServicePlane);
+  if (!children.get()) {
+    return nullptr;
+  }
+  IOMedia *found = nullptr;
+  while (!found) {
+    OSObject *object = children->getNextObject();
+    if (!object) {
+      break;
+    }
+    IORegistryEntry *entry = OSDynamicCast(IORegistryEntry, object);
+    if (!entry) {
+      continue;
+    }
+    IOMedia *media = static_cast<IOMedia *>(entry->metaCast("IOMedia"));
+    if (media) {
+      OSNumber *mediaMajor = OSDynamicCast(OSNumber, property(media, kBSDMajorKey));
+      OSNumber *mediaMinor = OSDynamicCast(OSNumber, property(media, kBSDMinorKey));
+      if (mediaMajor && mediaMinor && mediaMajor->unsigned32BitValue() == major &&
+          mediaMinor->unsigned32BitValue() == minor) {
+        found = media;
+        break;
+      }
+    }
+    if (depth < 8) {
+      found = findMediaByMinor(entry, major, minor, depth + 1);
+    }
+  }
+  return found;
+}
 
 static void mediaOpDone(void *target, void *, IOReturn status, UInt64 actualByteCount)
 {
@@ -1083,6 +1127,32 @@ struct MountReport {
   uint32_t openAny;
   uint32_t openUs;
   uint32_t writable;
+  // Round136 starts from what round135's BadArgument necessarily means if the shipped kext matches its
+  // feed: with a non-null, In-direction buffer at byte zero, the only IOMedia::read() arm that can return
+  // BadArgument is `_mediaSize - byteStart < buffer->getLength()` -- that is, the 512-byte probe was
+  // longer than the media. ms= is that _mediaSize read back through the public getter, bs= its preferred
+  // block size and mb= its base, all sampled before the mount so a later failure cannot hide them. ml=
+  // is the length this round actually asks for, min(ms, 512), and md= that buffer's direction; asking for
+  // no more than the media claims is what lets the request pass the same geometry test the mount's
+  // (clipped) request passes and reach the media's provider, which the round135 probe never did.
+  uint64_t mediaSize;
+  uint32_t preferredBlock;
+  uint64_t mediaBase;
+  uint32_t bufferLength;
+  uint32_t bufferDirection;
+  // Round136's second half: the dev_t handed to VFS_MOUNT names a minor. xm= says a media carrying
+  // (dv's major, dv's minor) was found in this disk's subtree, xe= that it is the very object sampled
+  // above, xs=/xo=/xw= that media's size, isOpen(NULL) and isWritable(), and xr=/xa= a byte-zero read of
+  // it with the same min(size, 512) rule, drawn only when xe=0 (when xe=1 the read above is that read).
+  // wo= is the whole-disk media's isOpen(NULL), the fallback reading if no media carries the minor.
+  uint32_t minorFound;
+  uint32_t minorSame;
+  uint64_t minorSize;
+  uint32_t minorOpen;
+  uint32_t minorWritable;
+  uint32_t minorRead;
+  uint32_t minorActual;
+  uint32_t wholeOpen;
 };
 
 static const uint32_t kRungNotReached = 0xffff;
@@ -1130,8 +1200,15 @@ static bool volumeBsd(IOMedia *media, const char **name, uint32_t *major, uint32
 // happened to reach first.
 //
 // Every rung returns rather than panicking, so the caller can draw the rungs that ran.
-static void volumeMountLadder(IOMedia *volume, IOService *client, MountReport *report)
+static void volumeMountLadder(IOMedia *whole, IOMedia *volume, IOService *client,
+                              MountReport *report)
 {
+  // Round136's geometry, read first and through public getters only. It is a property of the object, not
+  // of the ladder, so it is drawn even on a run that stops before bdevvp or vfs_rootmountalloc.
+  report->mediaSize = volume->getSize();
+  report->preferredBlock = volume->getPreferredBlockSize();
+  report->mediaBase = volume->getBase();
+
   // The device number and name still come from the AppleAPFSVolume's own IOMedia. Round133 proved that
   // parsing rd=md0 says nothing about the loader when devvp is non-null, so this round leaves the boot
   // argument alone and measures the device vnode that VFS_MOUNT actually received.
@@ -1265,35 +1342,48 @@ static void volumeMountLadder(IOMedia *volume, IOService *client, MountReport *r
         vn_rdwr(kUIORead, devvp, noAuth->getBytesNoCopy(), static_cast<int>(kDeviceReadBytes), 0,
                 kUIOSysSpace, kIOUnit | kIOFlagNoAuth, vfs_context_ucred(ctx), &noAuthResid, nullptr));
 
-    // Round135, part two: with the vnode out of the way, ask the media object this volume actually is.
-    // IOMedia::read() tests its own open level before it reaches any provider and answers
-    // kIOReturnNotOpen (0xe00002cd) when nothing holds it open, and that is one of the six IOReturns
-    // errnoFromReturn() maps to EACCES -- and the only one a media can produce on its own, without a
-    // provider or a driver agreeing to it. dkreadwrite() cannot author a 13 at all: its own early exits
-    // are ENXIO for a missing or orphaned minor, kIOReturnUnformattedMedia (ENXIO), NotAligned (EINVAL),
-    // NoMemory (ENOMEM) and VMError (EFAULT). So the number drawn here says which of the two layers the
-    // refusal lives in: ir=0xe00002cd with mo=0 is a media nobody ever opened, ir=0 with ia=512 says this
-    // media reads fine and the 13 is made above it, and NoMedia (0xe00002e4), UnformattedMedia
-    // (0xe00002e5) or BadArgument (0xe00002c2) each name their own cause. One block at byte zero, through
-    // the same asynchronous overload the storage family's own read path uses, completing inline as every
-    // readMediaBytes() request on this board has since round111 -- a deferred completion is the reading
-    // kIOReturnTimeout (0xe00002bf), not a hang.
-    OSSharedPtr<IOBufferMemoryDescriptor> raw =
-        IOBufferMemoryDescriptor::withCapacity(kBlockBytes, kIODirectionIn, true);
-    if (!raw.get()) {
-      fail("media-read-buffer", 0);
+    // Round135, part two, read through round136's correction: ask the media object this volume actually
+    // is, but ask it for no more bytes than the media claims to have. Round135 asked for a fixed 512 and
+    // the shipped stack answered kIOReturnBadArgument with nothing moved. In the feed's IOMedia::read()
+    // the inactive/open/zero-size arms come first and the four BadArgument arms last; with a non-null
+    // In-direction buffer at byte start zero, the only one left is `_mediaSize - byteStart <
+    // buffer->getLength()`. So that frame is itself the measurement that _mediaSize < 512 (the host's
+    // copy of this container says a ~5.3 GiB quota, so this is a surprise worth drawing rather than
+    // deducing), and the 512-byte probe died in geometry without ever reaching the media's provider.
+    // dkreadwrite() clips every request to mediaSize before calling this same read, which means the
+    // mount's own request would NOT have died on that arm -- it would have reached the provider and taken
+    // whatever that layer says. min(ms, 512) makes this probe take exactly that path. ms= itself is drawn
+    // before the mount; ml=/md= prove the request this field describes.
+    uint32_t requestBytes = 0;
+    if (report->mediaSize) {
+      requestBytes = report->mediaSize < kBlockBytes
+          ? static_cast<uint32_t>(report->mediaSize) : kBlockBytes;
     }
-    gVolumeOp.done = 0;
-    gVolumeOp.status = static_cast<uint32_t>(kIOReturnNotReady);
-    gVolumeOp.actual = 0;
-    IOStorageCompletion completion;
-    completion.target = &gVolumeOp;
-    completion.action = mediaOpDone;
-    completion.parameter = nullptr;
-    volume->read(client, 0, raw.get(), nullptr, &completion);
-    report->mediaRead =
-        gVolumeOp.done ? gVolumeOp.status : static_cast<uint32_t>(kIOReturnTimeout);
-    report->mediaActual = static_cast<uint32_t>(gVolumeOp.actual);
+    if (requestBytes) {
+      OSSharedPtr<IOBufferMemoryDescriptor> raw =
+          IOBufferMemoryDescriptor::withCapacity(requestBytes, kIODirectionIn, true);
+      if (!raw.get()) {
+        fail("media-read-buffer", requestBytes);
+      }
+      // The two inputs the BadArgument arms test, read back off the descriptor rather than assumed:
+      // bl= is its length (it must equal requestBytes) and md= its direction (kIODirectionIn = 1).
+      report->bufferLength = static_cast<uint32_t>(raw->getLength());
+      report->bufferDirection = static_cast<uint32_t>(raw->getDirection());
+      gVolumeOp.done = 0;
+      gVolumeOp.status = static_cast<uint32_t>(kIOReturnNotReady);
+      gVolumeOp.actual = 0;
+      IOStorageCompletion completion;
+      completion.target = &gVolumeOp;
+      completion.action = mediaOpDone;
+      completion.parameter = nullptr;
+      volume->read(client, 0, raw.get(), nullptr, &completion);
+      report->mediaRead =
+          gVolumeOp.done ? gVolumeOp.status : static_cast<uint32_t>(kIOReturnTimeout);
+      report->mediaActual = static_cast<uint32_t>(gVolumeOp.actual);
+    }
+    // ms=0 is the one size that cannot be read at all; it is drawn by ms= and by ir= staying at
+    // kRungNotReached. The feed would have answered UnformattedMedia before any geometry check, so a
+    // zero here is a statement about the media rather than about this request.
     // The three public state answers, read after the request so they describe the state the read saw.
     // IOMedia overrides handleIsOpen() to consult its own client dictionary (IOMedia.cpp:486-505), so
     // mo= is "someone has this media open" and mc= is "this driver does" -- and since dkopen() calls
@@ -1302,6 +1392,46 @@ static void volumeMountLadder(IOMedia *volume, IOService *client, MountReport *r
     report->openAny = volume->isOpen(nullptr) ? 1u : 0u;
     report->openUs = volume->isOpen(client) ? 1u : 0u;
     report->writable = volume->isWritable() ? 1u : 0u;
+
+    // Round136, part three: follow the dev_t instead of the object. dv= came from this volume's registry
+    // properties, but a BSD name is a claim the client makes, and the read that actually refuses the
+    // mount is dkreadwrite() on the minor that number resolves to. Walk the same disk subtree the APFS
+    // scan walks, take the media whose BSD Major/Minor equal dv=, and record whether it is this pointer.
+    // If it is not, xs=/xo=/xw= describe the object the mount really reads, and xr= is a byte-zero read
+    // of that object with the same min(size, 512) rule. If it is the same object, ir=/ia= above already
+    // is that read and xr= stays at kRungNotReached rather than issuing a duplicate.
+    IOMedia *minorMedia = findMediaByMinor(whole, report->major, report->minor, 0);
+    if (minorMedia) {
+      report->minorFound = 1;
+      report->minorSame = minorMedia == volume ? 1u : 0u;
+      report->minorSize = minorMedia->getSize();
+      report->minorOpen = minorMedia->isOpen(nullptr) ? 1u : 0u;
+      report->minorWritable = minorMedia->isWritable() ? 1u : 0u;
+      if (!report->minorSame && report->minorSize) {
+        uint32_t length = report->minorSize < kBlockBytes
+            ? static_cast<uint32_t>(report->minorSize) : kBlockBytes;
+        OSSharedPtr<IOBufferMemoryDescriptor> other =
+            IOBufferMemoryDescriptor::withCapacity(length, kIODirectionIn, true);
+        if (!other.get()) {
+          fail("minor-read-buffer", length);
+        }
+        gMinorOp.done = 0;
+        gMinorOp.status = static_cast<uint32_t>(kIOReturnNotReady);
+        gMinorOp.actual = 0;
+        IOStorageCompletion minorCompletion;
+        minorCompletion.target = &gMinorOp;
+        minorCompletion.action = mediaOpDone;
+        minorCompletion.parameter = nullptr;
+        minorMedia->read(client, 0, other.get(), nullptr, &minorCompletion);
+        report->minorRead =
+            gMinorOp.done ? gMinorOp.status : static_cast<uint32_t>(kIOReturnTimeout);
+        report->minorActual = static_cast<uint32_t>(gMinorOp.actual);
+      }
+    }
+    // The whole media is what the GPT and the APFS scan were read through, so its open state is the
+    // fallback reading if no media carries the minor: a whole disk that is still open cannot be the
+    // source of a NotOpen, one that is not open can.
+    report->wholeOpen = whole->isOpen(nullptr) ? 1u : 0u;
     return;
   }
   // vfs_subr.c:1282, through the exported helper rather than a third measured offset:
@@ -1478,25 +1608,34 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
   // one to choose from, vs=/vo=/vu=/vc=/vn= name the one that was chosen, and the mount ladder below runs
   // unchanged -- same flags, same devvp, same data=0 -- so a 13 next to an expected identity is a 13 about
   // the right volume, and not an aim that never left the sealed one.
-  MountReport report = { kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached,
-                         { 0, 0, 0, 0 }, 0, 0, 0,
-                         0, 0, 0, 0, 0,
-                         kRungNotReached, kRungNotReached, kRungNotReached,
-                         { kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached },
-                         kRungNotReached, 0, 0, 0,
-                         kRungNotReached, 0, 0, 0,
-                         kRungNotReached, kRungNotReached, 0,
-                         kRungNotReached, kRungNotReached, kRungNotReached };
+  MountReport report = {
+    kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached,  // major minor bdev alloc
+    { 0, 0, 0, 0 },                                                     // name
+    0, 0, 0,                                                            // on from devvp
+    0, 0, 0, 0, 0,                                                      // flag cleared kernFlag ops mountFn
+    kRungNotReached, kRungNotReached, kRungNotReached,                  // mount start root
+    { kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached },  // lookup
+    kRungNotReached, 0, 0, 0,                                           // read bytes word0 word1
+    kRungNotReached, 0, 0, 0,                                           // deviceRead .. word1
+    kRungNotReached, kRungNotReached, 0,                                // noAuthRead mediaRead mediaActual
+    kRungNotReached, kRungNotReached, kRungNotReached,                  // openAny openUs writable
+    0, 0, 0,                                                            // mediaSize preferredBlock mediaBase
+    0, 0,                                                               // bufferLength bufferDirection
+    kRungNotReached, kRungNotReached, 0,                                // minorFound minorSame minorSize
+    kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached,
+  };                                                                    // minorOpen minorWritable minorRead minorActual wholeOpen
   if (best.volumeMedia) {
-    volumeMountLadder(best.volumeMedia, client, &report);
+    volumeMountLadder(whole, best.volumeMedia, client, &report);
   }
 
-  panic("CloverBlock r135: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u "
+  panic("CloverBlock r136: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u "
         "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x vn=0x%x/0x%x/0x%x/0x%x dv=%u:%u bd=%u al=%u "
         "t=0x%x/0x%x/0x%x/0x%x on=0x%x fm=0x%x dp=0x%x:0x%x fl=0x%x fc=0x%x fk=0x%x "
         "op=0x%x:0x%x mm=0x%x:0x%x mt=%u st=%u rt=%u k=%u/%u/%u/%u "
         "rd=%u g=%u x=0x%x y=0x%x dr=%u db=%u dx=0x%x dy=0x%x "
-        "na=%u ir=0x%x ia=%u mo=%u mc=%u mw=%u r=%u w=%u",
+        "na=%u ir=0x%x ia=%u mo=%u mc=%u mw=%u "
+        "ms=0x%x:0x%x bs=%u mb=0x%x:0x%x ml=%u md=0x%x "
+        "xm=%u xe=%u xs=0x%x:0x%x xo=%u xw=%u xr=0x%x xa=%u wo=%u r=%u w=%u",
         __atomic_load_n(&gWindowFirst, __ATOMIC_ACQUIRE),
         __atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE), magic,
         static_cast<uint32_t>(loaded), best.seen, best.scheme, best.container, best.volume,
@@ -1515,6 +1654,14 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
         report.deviceRead, report.deviceBytes, report.deviceWord0, report.deviceWord1,
         report.noAuthRead, report.mediaRead, report.mediaActual,
         report.openAny, report.openUs, report.writable,
+        static_cast<uint32_t>(report.mediaSize >> 32), static_cast<uint32_t>(report.mediaSize),
+        report.preferredBlock,
+        static_cast<uint32_t>(report.mediaBase >> 32), static_cast<uint32_t>(report.mediaBase),
+        report.bufferLength, report.bufferDirection,
+        report.minorFound, report.minorSame,
+        static_cast<uint32_t>(report.minorSize >> 32), static_cast<uint32_t>(report.minorSize),
+        report.minorOpen, report.minorWritable, report.minorRead, report.minorActual,
+        report.wholeOpen,
         __atomic_load_n(&gBlocksRead, __ATOMIC_ACQUIRE),
         __atomic_load_n(&gBlocksWritten, __ATOMIC_ACQUIRE));
 }
@@ -1532,7 +1679,7 @@ extern "C" void clover_block_run(void)
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    IOLog("CloverBlock r135: refire n=%u (already ran)\n", fires);
+    IOLog("CloverBlock r136: refire n=%u (already ran)\n", fires);
     return;
   }
 
@@ -1746,7 +1893,7 @@ extern "C" void clover_block_run(void)
     fail("alias-match", reinterpret_cast<uint64_t>(aliasService));
   }
 
-  IOLog("CloverBlock r135: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
+  IOLog("CloverBlock r136: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
         kRootAlias, bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
 }

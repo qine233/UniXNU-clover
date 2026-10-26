@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r135: after the devvp read fails, repeat it without the auth gate and read the media itself"
+title = "clover r136: ask the volume media for its own geometry, then follow the dev_t to the media it names"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1836,6 +1836,26 @@ kernel_args = [
   # the author, na=13 sends the pass to spec_read/buf_bread; ir=0xe00002cd with mo=0 says nobody has this
   # media open, which would mean the FREAD open that bdevvp() performs unconditionally (vfs_subr.c:2106-2170,
   # no alias short-circuit, failure panics) never reached this minor or was rolled back by dkopen().
+  #
+  # Round135's photograph (v0.3.8, @CloverBlock.cpp:1519) answered the layer question and raised a sharper
+  # one. na=13 -- the same 4 KiB read with IO_NOAUTH added is refused identically, so the MACF read gate is
+  # not the author. ir=0xe00002c2 (kIOReturnBadArgument) with ia=0: the volume's own media refused the
+  # 512-byte request in geometry, before any provider, and mo=1 mc=0 mw=1 say the media is open (by the BSD
+  # client's dkopen, which passes minor->client, not this driver) and writable, so NotOpen is excluded. In
+  # the feed's IOMedia::read(), with a non-null In-direction buffer at byte zero, the only reachable
+  # BadArgument arm is `_mediaSize - byteStart < buffer->getLength()` -- the request was longer than the
+  # media, i.e. ms < 512, while the host copy of the same container says a ~5.3 GiB volume quota. That
+  # cannot be assumed: round136 draws ms=, bs= and mb= to measure it. More important, dkreadwrite() clips
+  # every request to the media size before calling that same read, so the mount's own request would not
+  # have failed that arm -- it would have reached the media's provider. Round135's oversized probe never
+  # did. So round136 asks for min(ms, 512) bytes instead (ml=/md= prove the request), and the answer of
+  # that read (ir=/ia=) is the provider chain's, which is the layer capable of returning the NotReadable
+  # that maps to EACCES. Finally, dv= came from this volume's registry properties, but a BSD name is a
+  # claim, so round136 walks the same disk subtree for the media carrying exactly (dv's major, minor) and
+  # draws xm=/xe= (found, and is it this same object), xs=/xo=/xw= and, when it is a different object,
+  # xr=/xa= -- a byte-zero read of the media the mount's dev_t really names. wo= is the whole disk's open
+  # state, the fallback reading if no media carries the minor. r= has stayed 464 for seven rounds, so the
+  # mount's read reaches none of this driver's blocks; this round is about which layer above it refuses.
   "clover-apfs=2",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the

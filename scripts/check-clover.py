@@ -559,7 +559,7 @@ def check_board(errors: list) -> str:
     # would have IOKitBSDInit waiting for a tree the config thread is busy building. The RAMDisk is the
     # shape every round up to 118 booted with, and it stays out of the way of the probe.
     if "rd=md0" not in board["payload"]["kernel_args"]:
-        errors.append('[payload] kernel_args has no rd=md0: round135 wants the RAMDisk root, because '
+        errors.append('[payload] kernel_args has no rd=md0: round136 wants the RAMDisk root, because '
                       'the probe that runs under clover-apfs never returns and nothing publishes an '
                       'eMMC-named root for the kernel to mount')
     for retired in ("rd=md0s39", "rd=disk0s39"):

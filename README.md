@@ -8796,6 +8796,164 @@ checker 增量：`verify-clover-payload.py` 的 `check_block()` 把身份串升�
 4. **ADT `/chosen { root-snapshot-name }` / `/filesystems { DoNotUseSEP }` / `allow-root-hash-mismatch`**
    —— 仍然只在 `mt=` 过了 13 之后才排队。
 
+## round135 读数（v0.3.8 实机，2026-10-26）：授权门不是作者，512 B 的探针死在几何上
+
+屏上末帧原文（`@CloverBlock.cpp:1519`）：
+
+```
+CloverBlock r135: apfs f=15797536 n=11870275 m=1 l=0 d=10 s=1 c=1 v=1 vt=1 un=1 vs=0x6f4e vo=0x696c6e4f
+vu=0x1d874fd vc=0xa7dd292a vn=0x6e776144/0x61647055/0x31326574/0x363448 dv=1:3 bd=0 al=0
+t=0x73667061/0x0/0x0/0x0 on=0x2f fm=0x6b736964 dp=0xfffffffa:0xcbe833d0 fl=0x4005001 fc=0x4001001 fk=0x0
+op=0xfffffff0:0x5f2b3c8 mm=0xfffffff0:0x56c5fac mt=13 st=65535 rt=65535 k=65535/65535/65535/65535
+rd=65535 g=0 x=0x0 y=0x0 dr=13 db=0 dx=0x0 dy=0x0 na=13 ir=0xe00002c2 ia=0 mo=1 mc=0 mw=1 r=464 w=0
+```
+
+身份与选择依旧逐格不变（`t=0x73667061` = "apfs"、`fm=0x6b736964` = "disk"、`vs=0x6f4e` = "No"、
+`dv=1:3`、`mt=13`、`r=464`），新格只有七格：
+
+| 字段 | 读数 | 含义 |
+|---|---|---|
+| `dr=` / `db=` / `dx=` / `dy=` | 13 / 0 / 0x0 / 0x0 | 与 round134 完全相同：挂载失败后同一 devvp 的 4 KiB 读仍是 13，一个字节没搬 |
+| `na=` | 13 | **同一把读、只多 `IO_NOAUTH`，结果不变** ⇒ `mac_vnode_check_read` 那道门不是作者 |
+| `ir=` | `0xe00002c2` | 卷的 `IOMedia::read()` 返回 `kIOReturnBadArgument`，不是 13 |
+| `ia=` | 0 | 它自己的 completion 报回 0 字节 |
+| `mo=` | 1 | `isOpen(nullptr)` —— 这颗媒体**有人开着** |
+| `mc=` | 0 | `isOpen(client)` —— 不是我们开的 |
+| `mw=` | 1 | 可写 |
+
+**这一格确认的事**：13 不是授权层写的。`IO_NOAUTH` 在整条 `vn_rdwr` 里只跳过
+`mac_vnode_check_read` 一处，门关了读数一点没变，所以作者在 `VNOP_READ` 之下。
+同时 `ir=BadArgument` 说明这颗卷媒体的读**根本没到 provider**：按 `IOMedia::read()` 的早退顺序
+（inactive → openLevel → 零尺寸 → 空缓冲 → 方向 → 两个几何臂），在非空、`kIODirectionIn`、`byteStart=0`
+的前提下，只剩 `_mediaSize - byteStart < buffer->getLength()` 一臂 —— 也就是那次请求 512 B 的探针
+**自己**证明了 `_mediaSize < 512`。这不是「读坏了」，是「问得太长」。
+
+**这一格推翻的一句，以及由此改的口径**：round135 的 `ir=` 描述的是探针，不是挂载。`dkreadwrite()`
+在调 `media->read()` 之前会把请求裁到 `mediaSize - byteStart`（`IOMediaBSDClient.cpp` 的
+`dkreadwrite`），所以挂载自己的读**不可能**死在 `_mediaSize < length` 那一臂：它会带着合法长度
+一路走到 provider。能对挂载回 EACCES 的 `NotReadable` 也正好在 provider 那一侧。
+换句话说，round135 只证明了「我们直接读这颗媒体时，请求长度太大」，还没证明这颗媒体读不通；
+round136 把请求改成 `min(ms, 512)`，让它走过同一道几何门，去拿 provider 的答复。
+
+`mo=1 mc=0` 另有一层信息：这颗媒体是被 BSD 的 `dkopen` 开的（`dkopen` 传的是 `minor->client`，
+不是我们），所以 `NotOpen` 这一支在挂载路径上已经被排除；`mw=1` 也让 `dkopen` 里
+FWRITE+EACCES 那一臂不可能命中。`r=464` 不涨与几何早退完全一致 —— 请求没出 `IOMedia`。
+
+（顺带修掉 round134 读数里的一处落盘笔误：那一帧的 `dp=` 高半截多打了一位，写成
+`0xffffffff2`；低半截 `0x352524c0` 与判读都不受影响。以后 `dp=` 一律按 `0x%x:0x%x` 的
+两段原样抄。）
+
+## v0.3.9（round136）：向卷的媒体要它自己的几何，再顺着 dev_t 找到它真正指的那颗媒体
+
+一句话的问题：**那颗卷媒体的真实几何是多少，以及挂载真正读的是不是它。** 挂载调用依旧逐字节不变，
+所有测量仍在 `VFS_MOUNT` 返回失败之后，全程只读。
+
+```cpp
+  // 请求长度改成 min(mediaSize, 512)，与 dkreadwrite 裁剪后的挂载请求走同一道几何门
+  uint32_t requestBytes = 0;
+  if (report->mediaSize) {
+    requestBytes = report->mediaSize < kBlockBytes
+        ? static_cast<uint32_t>(report->mediaSize) : kBlockBytes;
+  }
+  ...
+  volume->read(client, 0, raw.get(), nullptr, &completion);
+  report->mediaRead = gVolumeOp.done ? gVolumeOp.status : kIOReturnTimeout;
+  report->mediaActual = gVolumeOp.actual;
+
+  // 顺着 dv= 的 minor 走一遍我们发布的 disk 子树，看它落到哪颗 IOMedia
+  IOMedia *minorMedia = findMediaByMinor(whole, report->major, report->minor, 0);
+  if (minorMedia) {
+    report->minorFound  = 1;
+    report->minorSame   = minorMedia == volume;
+    report->minorSize   = minorMedia->getSize();
+    report->minorOpen   = minorMedia->isOpen(nullptr);
+    report->minorWritable = minorMedia->isWritable();
+    if (!report->minorSame && report->minorSize) {
+      ... 同一把 min(minorSize, 512) 读 ...
+    }
+  }
+  report->wholeOpen = whole->isOpen(nullptr);
+```
+
+`bs=`/`mb=` 是 `getPreferredBlockSize()`/`getBase()`：`IOMedia::read()` 在调 provider 之前会把
+`byteStart` 加上 `_mediaBase`，所以 provider 看到的是「卷内偏移 + 基址」；`mb=` 是这一跳的账。
+
+新字段：
+
+| 字段 | 是什么 |
+|---|---|
+| `ms=` | 卷媒体的 `getSize()` —— round135 只是推出它 <512，这一格直接画出来 |
+| `bs=` | 卷媒体的 `getPreferredBlockSize()` |
+| `mb=` | 卷媒体的 `getBase()`（provider 看到的偏移 = `mb= + byteStart`） |
+| `ml=` / `md=` | 这次请求的缓冲长度 / 方向，从 descriptor 读回，证明请求就是 `min(ms,512)`、方向是 In |
+| `xm=` | 我们发布的 disk 子树里，有没有一颗媒体的 BSD Major/Minor 等于 `dv=` |
+| `xe=` | 找到的那颗是不是 `volume` 本身 |
+| `xs=` | 找到的那颗的尺寸（`xm=0` 时停在 `65535`） |
+| `xo=` / `xw=` | 它的 `isOpen(nullptr)` / `isWritable()` |
+| `xr=` / `xa=` | 对它的同一把自适应读的原始 IOReturn / 字节数；`xe=1` 时不重复读，保持 `65535` |
+| `wo=` | 整盘媒体的 `isOpen(nullptr)`（GPT 与 APFS 扫描都从它读） |
+
+读法（按证据分叉）：
+
+- **`ms>=512` 且 `ir=0 ia=ml`** ⇒ 这颗卷媒体读得通。13 在它**上面**（`dkreadwrite` 的
+  `prepare()`/对齐、或 `buf_bread` 的 16 KiB 请求在 512 B 媒体上失败）。
+  此时再看 `r=`：这次读在采样之前，若 `r=464` 仍不涨，说明 provider 没落到
+  `CloverBlockDevice`（走了缓存或别的对象），下一格改 `VNOP_STRATEGY`。
+- **`ms<512`** ⇒ kernel 眼里的这颗「卷媒体」不是容器声明的 5.3 GiB 卷。`xe=1` 表示
+  `dv=1:3` 就是它，那么整条挂载链从 bdevvp 起就指错了对象；`xe=0` 时 `xs=`/`xo=`/`xw=`/`xr=`
+  才描述挂载真正读的那颗媒体，`xr=` 是它自己的答复。
+- **`ir=0xe00002cd`（NotOpen）** ⇒ 现在请求长度已合法，NotOpen 才第一次可信；与
+  `mo=`/`mc=`/`xo=` 一起判断是谁没开够。round135 的 `mo=1` 已先把这一支压得很小。
+- **`ir=` 是 EACCES 家族里其余那几个**（NotReadable / NotPrivileged / ExclusiveAccess /
+  LockedRead / LockedWrite）⇒ provider 明确拒绝，且挂载会拿到同一个 13；这时「为什么拒绝」变成
+  provider 的问题，而不是几何的问题。
+- **`ms=0`** ⇒ `ir=` 停在 `65535`（没发请求）；feed 的 `IOMedia::read()` 会先回
+  UnformattedMedia，所以这个零是媒体的状态，不是请求的错。
+- **`xm=0`** ⇒ `dv=1:3` 在我们的 disk 子树里找不到任何媒体：BSD 号是客户端登记的，而挂载走的是
+  另一个 minor 槽；下一格量注册表里 `dv=` 的属主。
+
+**预算**：最多两次 512 B 读（卷一次、若 `xe=0` 则 minor 一次），都在挂载失败之后；`rd=md0`、
+`clover-apfs=2`、`clover-emmc=21`、`armcpu-clock-panic=180000` 全部原样。没有新的 eMMC 写入，
+`userdata` 不重建。
+
+构建命令与上一轮相同：
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+checker 增量：`verify-clover-payload.py` 的 `check_block()` 身份串升到 `CloverBlock r136: apfs`，
+尾段断言换成连续的 `dr=%u … ms=0x%x:0x%x bs=%u mb=0x%x:0x%x ml=%u md=0x%x xm=%u xe=%u
+xs=0x%x:0x%x xo=%u xw=%u xr=0x%x xa=%u wo=%u r=%u w=%u`；`check-clover.py` 的 `rd=md0`
+那条只把轮次号抬到 round136。
+
+产物归档在 `~/clover-out/round136-*`，`shasum -a 256 -c round136-SHA256SUMS` 七项全部 OK：
+`payload.img` 58,720,256 B（`5835bc6f…`）、本地 `kernel.macho` `88a47806…`、卷内 `kernel.macho`
+51,994,624 B（`bfed3887…`，probe patch localized 成 6,678 B / 35 runs）、卷内 `unixnu.toml`
+629 B（`ab5b4d30…`）、ADT 13,268 B（`7d77ddd1…`）、`scratch-data.img` 35,888 B（`614b8356…`）、
+trustcache 56 B（`c3ed2152…`）。两个 checker 全绿。
+
+**刷写范围只有 `cache` 一个分区，没有新的 eMMC 分区写入**：`fastboot flash cache
+/Users/zhouzhou/clover-out/round136-payload.img`，然后 `fastboot reboot` 冷启动。末行预告
+**`@CloverBlock.cpp:1666`**（`panic()` 调用的收尾 `);` 那一行）。
+
+下一格候选（要等这一帧，排序按当前证据）：
+
+1. **`ms>=512` 且 `ir=0 ia=ml`**：媒体读得通，13 在 `dkreadwrite`/`buf_bread` 这一层。改问
+   `VNOP_STRATEGY`，把 buffer cache 的 16 KiB 请求与 `dkstrategy` 的错误通道切开；同时看 `r=`
+   这次为什么没涨。
+2. **`ms<512` 且 `xe=0`**：挂载读的媒体不是我们留着的那颗。下一轮直接以 `xs=/xo=/xw=` 那颗为对象，
+   量它的开合与读（`xr=` 本轮已经先给了一次答复）。
+3. **`ir=NotOpen`（`0xe00002cd`）**：请求长度合法之后第一次可信，回到 open 账本：`mo=/mc=/xo=`
+   谁开着、`dkopen` 给的是哪个 client。
+4. **ADT `/chosen { root-snapshot-name }` / `/filesystems { DoNotUseSEP }` /
+   `allow-root-hash-mismatch`** —— 仍然只在 `mt=` 过了 13 之后才排队。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

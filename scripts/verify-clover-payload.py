@@ -137,14 +137,18 @@ def check_block(kernel: bytes) -> bool:
     must be in the line. Round135 adds the two fields that say which layer made that 13: the same read
     again behind IO_NOAUTH (na=) and one raw IOMedia::read of the volume's own media (ir=/ia=) beside its
     three public state answers (mo=/mc=/mw=). Any of them going missing means the round silently asks
-    nothing -- the failure shape check-clover.py refuses to let the archives have."""
+    nothing -- the failure shape check-clover.py refuses to let the archives have. Round136 corrects that
+    request to min(media size, 512) and adds the media's own geometry (ms=/bs=/mb=), the request it really
+    made (ml=/md=), and the media the mount's own dev_t resolves to (xm=/xe=/xs=/xo=/xw=/xr=/xa=/wo=)."""
     label = "kernel.macho: CloverBlock linked"
     found = {name: name.encode() in kernel
-             for name in ("clover-apfs", "CloverBlock r135: apfs",
+             for name in ("clover-apfs", "CloverBlock r136: apfs",
                           "fl=0x%x fc=0x%x fk=0x%x", "op=0x%x:0x%x mm=0x%x:0x%x",
                           "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x",
                           "dr=%u db=%u dx=0x%x dy=0x%x na=%u ir=0x%x ia=%u "
-                          "mo=%u mc=%u mw=%u r=%u w=%u",
+                          "mo=%u mc=%u mw=%u ms=0x%x:0x%x bs=%u mb=0x%x:0x%x "
+                          "ml=%u md=0x%x xm=%u xe=%u xs=0x%x:0x%x xo=%u xw=%u "
+                          "xr=0x%x xa=%u wo=%u r=%u w=%u",
                           "FullName", "Sealed",
                           "AppleAPFSContainerScheme", "AppleAPFSVolume",
                           "SystemVersion.plist", "_clover_emmc_block_window",
