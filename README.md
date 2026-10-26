@@ -9375,6 +9375,99 @@ cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-p
 5. **不再有 SIGKILL，但停在 launchd 之后某处** —— 根、授权、AMFI 三层已过；
    下一轮把探针标记移到 exec 前后，定位新墙。
 
+## v0.4.4（round141）：让 MAC 层自己说出是谁拒绝了 launchd
+
+r140 的帧只证明了一件事：AMFI 不再 panic 在 `can't has cs_enforcement_disable` 上，
+并且 `Guarded vnode policy (vnguard)` 第一次出现——`debug-enabled` 让 vnguard 完成了
+注册。帧上那两行 `AppleARMBootPerf: … Error` 与签名无关：它是 `/chosen/iboot-profile-data`
+缺失时打出的性能配置读取失败，属于背景噪声。真正的死因仍是
+`namespace 9 code 0x8`，即 `OS_REASON_EXEC` 的 `EXEC_EXIT_REASON_SECURITY_POLICY`。
+
+这个理由只有一个产者。`kern_exec.c:8541` 的 `if (imgp->ip_mac_return != 0)` 是唯一
+kill 点，而 `ip_mac_return` 只在 `kauth_proc_label_update_execve()` 返回非零时被写入，
+即 `security/mac_vfs.c` 的 `mac_cred_label_update_execve()`。它把每个策略的结果用
+`mac_error_select(hookret, error)` 合并；同一文件里还有 `mac_cred_check_label_update_execve()`
+（`result = result || hookret`），它在标签更新之前跑，同样能把 exec 挡下。
+
+这一轮不改任何行为，只把合并前的 `hookret` 打出来。补丁是
+`patches/xnu-clover/zzz-clover-mac-exec-probe.patch`（工作副本在
+`~/UniXNU/patches/xnu/`，构建脚本按文件名顺序应用），只动 `security/mac_vfs.c`：
+
+```c
+hookret = hook(cred, new, vfs_context_proc(ctx), vp, offset, scriptvp,
+    mac_vnode_label(vp), scriptvnodelabel, execl, csflags, spawnattr, spawnattrlen, disjoint);
+if (hookret != 0 && proc_getpid(vfs_context_proc(ctx)) == 1) {
+    printf("clover-mac: label-update %s (%s) -> %d disjoint=%d\n",
+        mpc->mpc_name ? mpc->mpc_name : "?",
+        mpc->mpc_fullname ? mpc->mpc_fullname : "?", hookret, *disjoint);
+}
+error = mac_error_select(hookret, error);
+```
+
+静态与动态两段列表（`staticmax` 和 `mac_policy_list_conditional_busy()` 之后）各一遍；
+check 函数的两个循环同理，行首是 `clover-mac: label-check`。三个约束：只对 pid 1、
+只在非零时打印、返回值原样交回 `mac_error_select`/`||`。所以探针不会改变拒绝者，也
+不会改变拒绝码；它只在同一帧里多出一行策略名。
+
+为什么不去改 `kern_exec.c`：那段代码的上下文被 `zzz-boot-progress.patch` 的 hunk
+覆盖，任何插入都会让 boot-progress 的反向重放失败，进而拖垮后面依赖它的 root-binding
+补丁。MAC 层已经能给出策略名，`kern_exec` 只能重复一次“有人拒绝了”，不值得冒这个险。
+
+静态枚举的结论是：这份内核里真正安装 exec 标签钩子的只剩 **Sandbox**。
+`mpo_cred_check_label_update_execve` 在它的 kext 里是 `mov w0,#1; ret`
+（`0x5a0d204`），`mpo_cred_label_update_execve` 在 `0x5a0d20c`；两者的拒绝都走
+`os_log`，所以 r139/r140 的 panic 帧上看不到它说话。AMFI 的每个拒绝分支都会上屏
+（unsigned code、Legacy VPN、dyld 签名、`AMFI: hook..execve() killing pid %u: %s`），
+帧上没有这些行，因此 AMFI 已放行。候选只剩 Sandbox，这一轮就是让它在拒绝时留下名字。
+
+构建命令不变：
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+`verify-clover-payload.py` 新增一条断言：卷内内核必须同时含
+`clover-mac: label-update %s (%s) -> %d disjoint=%d\n` 与
+`clover-mac: label-check %s (%s) -> %d\n` 两条格式串。少了任一条，就说明这个镜像
+没有带探针，帧拍回来也无法归因。board 标题升到 r141。
+
+**刷写范围只有 `cache`，没有新的 eMMC 分区写入**：`fastboot flash cache
+/Users/zhouzhou/clover-out/round141-payload.img`，然后 `fastboot reboot` 冷启动。
+
+产物归档在 `~/clover-out/round141-*`，`shasum -a 256 -c round141-SHA256SUMS` 七项全部 OK：
+`payload.img` 58,720,256 B（`a98f6a92…`）、本地 `kernel.macho` `c241d778…`、卷内
+`kernel.macho` 51,994,624 B（`908018e8…`，probe patch localized 成 6,680 B / 35 runs）、
+卷内 `unixnu.toml` 624 B（`274e3be2…`，args 末尾仍是
+`… rd=md0s39 cs_enforcement_disable=1 armcpu-clock-panic=180000`）、ADT 13,516 B
+（`b1510f88…`；与 r140 的 64 字节差异全部落在 `/chosen/random-seed`，每次构建重新生成，
+其余节点不变）、`scratch-data.img` 35,888 B（`614b8356…`，与 r140 相同）、trustcache
+56 B（`c3ed2152…`，与 r140 相同）。两个 checker 全绿。
+
+这一帧只问一个问题：**launchd 第一次 exec 时，是哪一个 MAC 策略返回了非零。**
+读帧顺序：
+
+1. **出现 `clover-mac: label-update Sandbox (…) -> 1 disjoint=…`** —— 命中。
+   拒绝者是 Sandbox 的标签更新；下一轮去量它的 profile 与 launchd 的 entitlements
+   （`com.apple.private.*`、`platform-application`），或者给根卷上的 launchd 补一个
+   可被 Sandbox 接受的标签，不再动 boot-arg。
+2. **同一行里是别的策略名** —— 按名字定点。`mpc_fullname` 在括号里，能区分同名实例；
+   下一轮直接读那个策略的 `mpo_cred_label_update_execve`。
+3. **只有 `clover-mac: label-check …`，没有 `label-update`** —— 拒绝发生在标签更新
+   之前：check 钩子先返回了 1，`kauth_proc_label_update_execve()` 根本不会走到 update。
+   按 check 行里的名字查它的 `mpo_cred_check_label_update_execve`。
+4. **仍是 `namespace 9 code 0x8`，但一条 `clover-mac` 都没有** —— `printf` 没到帧上。
+   先确认这是内核行而不是用户态输出：`printf` 走 kernel console，和之前 PMGR/SDHCI
+   那些行同一条路；若确实被吞，下一格改用 panic 前追加一条 logfs 记录或直接
+   `panic()` 带策略名，不再靠 console。
+5. **reason 不再是 `namespace 9 code 0x8`** —— MAC 层已经放行，墙换了位置。若变成
+   带描述的签名失败，看 `ip_cs_error` 支路；若没有 panic 而是停在 launchd 之后，
+   下一轮把探针标记移到 exec 完成之后。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

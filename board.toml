@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r140: publish /chosen/debug-enabled so AMFI stops panicking on cs_enforcement_disable"
+title = "clover r141: name the MAC policy that refuses launchd's first exec"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

@@ -1,0 +1,86 @@
+diff --git a/security/mac_vfs.c b/security/mac_vfs.c
+index 91376bf..aac25c8 100644
+--- a/security/mac_vfs.c
++++ b/security/mac_vfs.c
+@@ -829,6 +829,7 @@ mac_cred_label_update_execve(vfs_context_t ctx, kauth_cred_t new, struct vnode *
+ 	{
+ 		struct mac_policy_conf *mpc;
+ 		u_int i;
++		int hookret;
+ 
+ 		error = 0;
+ 		for (i = 0; i < mac_policy_list.staticmax; i++) {
+@@ -845,9 +846,14 @@ mac_cred_label_update_execve(vfs_context_t ctx, kauth_cred_t new, struct vnode *
+ 			size_t spawnattrlen = 0;
+ 			void *spawnattr = exec_spawnattr_getmacpolicyinfo(macextensions, mpc->mpc_name, &spawnattrlen);
+ 
+-			error = mac_error_select(hook(cred, new, vfs_context_proc(ctx), vp, offset, scriptvp,
+-			    mac_vnode_label(vp), scriptvnodelabel, execl, csflags, spawnattr, spawnattrlen, disjoint),
+-			    error);
++			hookret = hook(cred, new, vfs_context_proc(ctx), vp, offset, scriptvp,
++			    mac_vnode_label(vp), scriptvnodelabel, execl, csflags, spawnattr, spawnattrlen, disjoint);
++			if (hookret != 0 && proc_getpid(vfs_context_proc(ctx)) == 1) {
++				printf("clover-mac: label-update %s (%s) -> %d disjoint=%d\n",
++				    mpc->mpc_name ? mpc->mpc_name : "?",
++				    mpc->mpc_fullname ? mpc->mpc_fullname : "?", hookret, *disjoint);
++			}
++			error = mac_error_select(hookret, error);
+ 		}
+ 		if (mac_policy_list_conditional_busy() != 0) {
+ 			for (; i <= mac_policy_list.maxindex; i++) {
+@@ -864,9 +870,14 @@ mac_cred_label_update_execve(vfs_context_t ctx, kauth_cred_t new, struct vnode *
+ 				size_t spawnattrlen = 0;
+ 				void *spawnattr = exec_spawnattr_getmacpolicyinfo(macextensions, mpc->mpc_name, &spawnattrlen);
+ 
+-				error = mac_error_select(hook(cred, new, vfs_context_proc(ctx), vp, offset, scriptvp,
+-				    mac_vnode_label(vp), scriptvnodelabel, execl, csflags, spawnattr, spawnattrlen, disjoint),
+-				    error);
++				hookret = hook(cred, new, vfs_context_proc(ctx), vp, offset, scriptvp,
++				    mac_vnode_label(vp), scriptvnodelabel, execl, csflags, spawnattr, spawnattrlen, disjoint);
++				if (hookret != 0 && proc_getpid(vfs_context_proc(ctx)) == 1) {
++					printf("clover-mac: label-update %s (%s) -> %d disjoint=%d\n",
++					    mpc->mpc_name ? mpc->mpc_name : "?",
++					    mpc->mpc_fullname ? mpc->mpc_fullname : "?", hookret, *disjoint);
++				}
++				error = mac_error_select(hookret, error);
+ 			}
+ 			mac_policy_list_unbusy();
+ 		}
+@@ -901,6 +912,7 @@ mac_cred_check_label_update_execve(vfs_context_t ctx, struct vnode *vp, off_t of
+ 	{
+ 		struct mac_policy_conf *mpc;
+ 		u_int i;
++		int hookret;
+ 
+ 		for (i = 0; i < mac_policy_list.staticmax; i++) {
+ 			mpc = mac_policy_list.entries[i].mpc;
+@@ -916,7 +928,13 @@ mac_cred_check_label_update_execve(vfs_context_t ctx, struct vnode *vp, off_t of
+ 			size_t spawnattrlen = 0;
+ 			void *spawnattr = exec_spawnattr_getmacpolicyinfo(macextensions, mpc->mpc_name, &spawnattrlen);
+ 
+-			result = result || hook(cred, vp, offset, scriptvp, mac_vnode_label(vp), scriptvnodelabel, execlabel, p, spawnattr, spawnattrlen);
++			hookret = hook(cred, vp, offset, scriptvp, mac_vnode_label(vp), scriptvnodelabel, execlabel, p, spawnattr, spawnattrlen);
++			if (hookret != 0 && p != NULL && proc_getpid(p) == 1) {
++				printf("clover-mac: label-check %s (%s) -> %d\n",
++				    mpc->mpc_name ? mpc->mpc_name : "?",
++				    mpc->mpc_fullname ? mpc->mpc_fullname : "?", hookret);
++			}
++			result = result || hookret;
+ 		}
+ 		if (mac_policy_list_conditional_busy() != 0) {
+ 			for (; i <= mac_policy_list.maxindex; i++) {
+@@ -933,7 +951,13 @@ mac_cred_check_label_update_execve(vfs_context_t ctx, struct vnode *vp, off_t of
+ 				size_t spawnattrlen = 0;
+ 				void *spawnattr = exec_spawnattr_getmacpolicyinfo(macextensions, mpc->mpc_name, &spawnattrlen);
+ 
+-				result = result || hook(cred, vp, offset, scriptvp, mac_vnode_label(vp), scriptvnodelabel, execlabel, p, spawnattr, spawnattrlen);
++				hookret = hook(cred, vp, offset, scriptvp, mac_vnode_label(vp), scriptvnodelabel, execlabel, p, spawnattr, spawnattrlen);
++				if (hookret != 0 && p != NULL && proc_getpid(p) == 1) {
++					printf("clover-mac: label-check %s (%s) -> %d\n",
++					    mpc->mpc_name ? mpc->mpc_name : "?",
++					    mpc->mpc_fullname ? mpc->mpc_fullname : "?", hookret);
++				}
++				result = result || hookret;
+ 			}
+ 			mac_policy_list_unbusy();
+ 		}

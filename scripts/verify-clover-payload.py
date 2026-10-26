@@ -165,6 +165,24 @@ def check_block(kernel: bytes) -> bool:
     return ok
 
 
+def check_mac_probe(kernel: bytes) -> bool:
+    """Round141's probe lives in security/mac_vfs.c, which the link can keep without any symbol
+    naming it: the hooks still dispatch through the same vtables and only two printf() calls were
+    added inside those loops. So the only proof the probe is in this image is its two format
+    strings. Each one carries the policy name and the hook's return, which is the whole answer the
+    round asks for; losing either means the panic frame would come back with no attribution and the
+    round would silently ask nothing."""
+    label = "kernel.macho: MAC exec probe linked"
+    found = {name: name.encode() in kernel
+             for name in ("clover-mac: label-update %s (%s) -> %d disjoint=%d\n",
+                          "clover-mac: label-check %s (%s) -> %d\n")}
+    ok = all(found.values())
+    detail = ", ".join(f"{name.split(':')[1].strip()} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def report(image: pathlib.Path) -> int:
     print(f"== {image}")
     ok = True
@@ -235,6 +253,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_pmgr(kernel)
         ok &= check_sdhci(kernel)
         ok &= check_block(kernel)
+        ok &= check_mac_probe(kernel)
     return 0 if ok else 1
 
 
