@@ -8370,6 +8370,15 @@ XNU 导出的 `vnode_open` 是**按路径**开文件的（`bsd/sys/vnode.h:2143`
    `vr=0 vw=13` ⇒ 生产者当场抓获，下一格就变成「让那颗节点允许带写打开」（我们发布的媒体属性 / 上下文 cred）；
    `vr=2` ⇒ `/dev` 里根本没有这颗节点（devfs 还没造出来），13 来自别处；
    `vr=vw=0` ⇒ 我们的线程能过而 apfs 不能，差别在它自己的 `w19`/flags，那时再量 mode。
+   **可行性已在宿主核过**：`_vnode_open` 在 `round132-kernel.macho` 的 nlist 里是 `0xfffffff0074735cc`，
+   和已经在用的 `_vnode_lookupat`（`0xfffffff00746d0d8`）、`_vnode_put`（`0xfffffff00746add8`）同一片
+   `kpi_vfs.c` 区域；它的序言 `mov x23,x5; mov x19,x4; mov x25,x3; mov x21,x2; mov x22,x1; mov x24,x0` 再加
+   `cbnz x5 → bl _vfs_context_current`（`0xfffffff0074917cc`）证的就是 `vnode.h:2143` 那个原型
+   `(path, fmode, cmode, flags, vpp, ctx)`；`FREAD`/`FWRITE` = 1/2（`bsd/sys/fcntl.h:112-113`），
+   `_kauth_cred_getuid` = `0xfffffff0076b7810`。⇒ 这一格只需要沿用手写 KPI 声明那套，不需要新偏移。
+   另外一条旧证据把 `vr=2` 那一岔收紧了：`v0.2.36` 起 EL0 的 `open("/dev/console")` 是成功的
+   （见 README 的 v0.2.36 节，`devfs_kernel_mount("/dev")` 走过），devfs 确实挂在 `/dev` 上；
+   所以 `vr=2` 从此只意味着「我们这颗媒体没被 devfs 造成节点」，而不是「devfs 压根没挂」。
 2. **ADT 加 `/chosen { root-snapshot-name = <快照名>; }`** —— 现在排在 1 后面：它治的是快照/密封，
    而这一轮的宿主证据把问题挪到了「带写按路径打开 `/dev` 节点」。
 3. **`/filesystems { DoNotUseSEP; }`** 与 **`allow-root-hash-mismatch`** —— 同属认证类，等 `mt=0` 之后再动才有意义。
