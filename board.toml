@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r141: name the MAC policy that refuses launchd's first exec"
+title = "clover r142: boot with the three-module trust cache sheng boots with"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -971,7 +971,14 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 #   0x1000007f0  "clover-el0: after write probe-done"   _w_probe_done  0x100004241
 # panic() keeps the first panic it is given, so the drawn string is the name of the last write that
 # came back; a rung that returned an errno simply falls through to the next write.
-trust_cache_sha256 = ["c3ed2152acaa1fba2bbbe78922e58a7be474ee4f2fa0ba490721876b705bbd9b"]
+# Round142 stops trusting only this board's own init. The boot trust cache is now the same
+# three-module bundle sheng boots with: clover's owner module first, then the two original Apple
+# modules of the target IPSW byte for byte -- StaticTrustCache (2478 entries, the OS volume this
+# board's rd=md0s39 mounts) and Cryptex1,SystemTrustCache (76 entries). r138-r141's SIGKILL of
+# launchd was a MAC label-update refusal on a root whose /sbin/launchd had no cdhash in the
+# 56-byte one-module bundle; scripts/make-clover-trust-bundle.py joins them and pins the
+# originals by the sha256 of their unwrapped IM4P payloads.
+trust_cache_sha256 = ["7c369ce09adb8caf2549454b0cdf1abf43b0fe96a850b694288ee59a9c893950"]
 kernel_args = [
   "-v",
   "serial=3",

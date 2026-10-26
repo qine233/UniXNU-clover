@@ -18,6 +18,7 @@ Exit status is 1 when any group reports an error.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import pathlib
 import re
@@ -51,6 +52,9 @@ REQUIRED_CHOSEN = ["random-seed", "nvram-proxy-data", "nvram-bank-size", "dram-b
 # copied a dictionary naming a volume no service here carried; that was a wrong target, not a
 # reason for root-matching to be absent. Round137 names the service CloverBlock actually publishes.
 ROOT_VOLUME_UUID = "04769D26-2CA0-4825-B443-E2E5F88300F2"
+# The two original Apple trust modules the boot bundle carries unchanged (scripts/make-clover-trust-bundle.py).
+STATIC_MODULE_SHA256 = "da88460e6e513438d5307e5c526f76497a74754476a24da29f239f0c90120fc2"
+SYSTEM_MODULE_SHA256 = "d121ba89167e03aafd00fa687c30cd8ebc4ccafd10c1408adb2ba3de12403651"
 FORBIDDEN_CHOSEN: list[str] = []
 # One RAMDisk placeholder, no PackedRAMDisk: the payload still carries the mockfs image
 # (scripts/make-clover-root.py) so the memory map stays the shape DarwinBoot handed over in every
@@ -578,9 +582,48 @@ def check_board(errors: list) -> str:
     if not userdata or not userdata.get("windows"):
         errors.append('[userdata] is missing or declares no windows: ./unixnu build userdata has '
                       'nothing to write, and CloverBlock would read an empty partition as a manifest')
-    if not board["payload"].get("trust_cache_sha256"):
+    pins = board["payload"].get("trust_cache_sha256")
+    if not pins:
         errors.append("[payload] trust_cache_sha256 is empty: the mockfs init program would "
                       "have no offline trust, and the exec of /sbin/launchd is a panic")
+    else:
+        # Round142: the boot trust cache is three modules -- clover's owner module, then the two
+        # original Apple modules (StaticTrustCache, Cryptex1,SystemTrustCache). launchd's cdhash
+        # 1d52c697… is entry 279 of the static one; the 56-byte one-module bundle of r141 carried
+        # only the mockfs init, so the APFS root's launchd had no offline trust at all.
+        bundle_path = next((base / "build/clover-trust/trustcache.bundle"
+                            for base in (REPO, pathlib.Path.cwd())
+                            if (base / "build/clover-trust/trustcache.bundle").is_file()), None)
+        if bundle_path is None:
+            print("[check-clover] notice: build/clover-trust/trustcache.bundle is not built; "
+                  "run scripts/make-clover-trust-bundle.py", file=sys.stderr)
+        elif hashlib.sha256(bundle_path.read_bytes()).hexdigest() not in pins:
+            errors.append(f"{bundle_path} differs from [payload] trust_cache_sha256: the payload "
+                          "step would refuse it or ship a bundle nobody pinned")
+        else:
+            data = bundle_path.read_bytes()
+            count = struct.unpack_from("<I", data)[0]
+            if count != 3 or len(data) < 4 + 4 * count:
+                errors.append(f"{bundle_path} carries {count} modules, not owner + static + system")
+            else:
+                starts = [struct.unpack_from("<I", data, 4 + 4 * i)[0] for i in range(count)]
+                ends = starts[1:] + [len(data)]
+                structural = True
+                for index, (start, end) in enumerate(zip(starts, ends)):
+                    module = data[start:end]
+                    if len(module) < 24 or struct.unpack_from("<I", module)[0] != 2:
+                        errors.append(f"{bundle_path} module {index} is not version 2")
+                        structural = False
+                    elif len(module) != 24 + struct.unpack_from("<I", module, 20)[0] * 24:
+                        errors.append(f"{bundle_path} module {index} is truncated")
+                        structural = False
+                if structural:
+                    static = data[starts[1]:ends[1]]
+                    system = data[starts[2]:ends[2]]
+                    if hashlib.sha256(static).hexdigest() != STATIC_MODULE_SHA256:
+                        errors.append(f"{bundle_path} module 1 is not the IPSW's StaticTrustCache")
+                    if hashlib.sha256(system).hexdigest() != SYSTEM_MODULE_SHA256:
+                        errors.append(f"{bundle_path} module 2 is not the IPSW's System trust cache")
 
     splash = [entry for entry in board.get("bootimg", {}).get("dtb_node", [])
               if "splash" in entry["path"]]

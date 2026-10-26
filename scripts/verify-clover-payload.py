@@ -25,7 +25,7 @@ import sys
 
 XNU_PAYLOAD = pathlib.Path("/Users/zhouzhou/UniXNU/out/clover/payload/payload.img")
 LOCAL_ROOT = pathlib.Path("/Users/zhouzhou/UniXNU-clover/build/clover-root/launchd.macho")
-LOCAL_CACHE = pathlib.Path("/Users/zhouzhou/UniXNU-clover/build/clover-root/trustcache.bundle")
+LOCAL_CACHE = pathlib.Path("/Users/zhouzhou/UniXNU-clover/build/clover-trust/trustcache.bundle")
 LOCAL_KERNEL = pathlib.Path("/Users/zhouzhou/UniXNU/out/clover/kernel/kernel.macho")
 # The assembled build tree: scripts/build-clover-pmgr.py records the original-PMGR addresses it
 # audited here, and kits/NativePrelink (a symlink into the UniXNU base) parses Mach-O for it.

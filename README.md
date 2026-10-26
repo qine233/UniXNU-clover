@@ -9468,6 +9468,100 @@ cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-p
    带描述的签名失败，看 `ip_cs_error` 支路；若没有 panic 而是停在 launchd 之后，
    下一轮把探针标记移到 exec 完成之后。
 
+## v0.4.5（round142）：照 sheng 的信任缓存布局，把原始 Apple 模块接上
+
+r138–r141 一直把 `namespace 9 code 0x8` 当成一个"策略问题"去追：先跳过 ROOTAUTH，
+再关 `cs_enforcement_disable`，再补 `/chosen/debug-enabled`，最后在 MAC 层装探针。
+sheng（Xiaomi Pad 6S Pro，同一个 `ipados-17.7.11-21H461` 目标）在同一段路上没有遇到
+这个 panic，差别不在策略，而在**启动信任缓存本身**：
+
+它的启动卷里是**一个三模块 bundle**——先放自己的 owner 模块，再把目标 IPSW 的两份
+原始 Apple 模块逐字节接在后面：
+
+```
+<count=3, offsets[3]> <owner 模块> <StaticTrustCache 模块> <Cryptex1,SystemTrustCache 模块>
+模块 = <version=2, uuid[16], n> <n × (cdhash[20], type, 3 pad)>
+```
+
+clover 从 round123 起只有 56 字节的**单模块** bundle（`scripts/make-clover-root.py`
+签出的 mockfs init，cdhash `4f63be63…`）。可 round137 起根已经换成了 APFS 上的 OS 卷
+（`rd=md0s39`），内核第一次 exec 的是根卷上那颗真正的 `/sbin/launchd`。宿主侧已经量过：
+
+```
+$ codesign -dvvv /Volumes/DawnUpdate21H461…/sbin/launchd
+CDHash=1d52c69747dffc4b1937d241bdbc9cee3b22df18
+Signature=adhoc
+```
+
+这颗 cdhash 在 r141 的 56 字节 bundle 里不存在，在 IPSW 的 `StaticTrustCache` 里是
+**第 279 条**（2478 条中的一条）。也就是说 r141 的 launchd 在 AMFI 眼里没有任何离线
+信任，`amfi-only-platform-code=1` 又要求它只能信平台码——标签更新钩子返回非零、
+`ip_mac_return != 0`、无描述的 `namespace 9 code 0x8`，整条链完全吻合。探针没打出来
+是因为帧拍在 r140 的内核上（r141 的 payload 只换了内核文本，未确认帧里的构建号）。
+
+这一轮**只改一个变量：信任缓存**。内核与 r141 逐字节相同（本地 `kernel.macho`
+`c241d778…`），boot-args、ADT 结构、根镜像、SDHCI/CloverBlock 全部不动。
+
+新增 `scripts/make-clover-trust-bundle.py`，模型就是 sheng 的
+`scripts/make-owner-trust-bundle.py`：
+
+- owner 模块取自 `build/clover-root/trustcache.bundle`（必须恰好 1 个模块）；
+- `StaticTrustCache` 从 IPSW 成员 `Firmware/044-76040-038.dmg.trustcache` 解 IM4P，
+  解开后的模块 sha256 必须是 `da88460e…`，59,496 字节 / 2478 条；
+- `Cryptex1,SystemTrustCache` 从 `Firmware/044-76034-038.dmg.trustcache` 解出，
+  sha256 必须是 `d121ba89…`，1,848 字节 / 76 条；
+- 两份原始模块**逐字节不改**，并按 DarwinBoot `ValidTrustCaches` 的同一套结构规则
+  （模块数 ≤128、offset 对齐递增、version=2、`24 + n*24` 精确、type 1..4、
+  模块内 cdhash 严格升序）自检后才写盘。
+
+产物：`build/clover-trust/trustcache.bundle`，61,408 字节（16 头 + 48 + 59,496 + 1,848），
+sha256 `7c369ce0…`。`board.toml [payload] trust_cache_sha256` 钉住它，
+`verify-clover-payload.py` 改成对这颗 bundle 做逐字节比对，`check-clover.py` 增加
+三条断言（模块数=3、两份原始模块 sha256、版本 2 与长度），在产物存在时执行。
+
+IPSW 成员不用整包下载：用框架 `scripts/unixnu/ipsw.py` 的 HTTP Range 读取器，
+只取这两个成员（59,519 B 与 1,871 B），落在 `out/clover/ipsw/21H461/`，并各自带
+sha256 记录。
+
+### 构建、校验与本轮该刷哪一格
+
+```
+# 只重打 payload；内核不重建
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+产物归档在 `~/clover-out/round142-*`，`shasum -a 256 -c round142-SHA256SUMS` 七项全 OK：
+`payload.img` 58,720,256 B（`0b03fbaa…`）、本地 `kernel.macho` `c241d778…`（与 r141 相同）、
+卷内 `kernel.macho` 51,994,624 B（`908018e8…`，探针补丁仍在）、卷内 `unixnu.toml`
+626 B（`72f78109…`，args 与 r141 逐字相同）、ADT 13,516 B（`ded422cc…`；差异只来自
+每次构建新生成的 `/chosen/random-seed`）、`scratch-data.img` 35,888 B（`614b8356…`）、
+**trustcache 61,408 B（`7c369ce0…`，r141 是 56 B 的 `c3ed2152…`）**。两个 checker 全绿。
+
+**刷写范围只有 `cache`，没有新的 eMMC 分区写入**：`fastboot flash cache
+/Users/zhouzhou/clover-out/round142-payload.img`，然后 `fastboot reboot` 冷启动。
+菜单第一行应当是 `clover r142: boot with the three-module trust cache sheng boots with`。
+
+这一帧只问一个问题：**launchd 的 cdhash 现在在启动信任缓存里了，AMFI 还挡不挡。**
+
+1. **不再有 `namespace 9 code 0x8`，launchd 之后的内核日志继续往下走** —— 墙从
+   exec 信任挪到了用户态启动（缺 Data 卷、缺服务、缺文件系统上的配置）。下一轮去读
+   launchd 停在哪一条，不再动信任缓存。
+2. **仍是 `namespace 9 code 0x8`，且出现 `clover-mac: label-update AMFI (…) -> 非零`** ——
+   探针这次把拒绝者点名了；但 cdhash 已经确认在 bundle 里，下一刀要查的是**挂载的根卷
+   是不是这颗 launchd 所在的卷**（卷 UUID/角色/Named 对不上时会 exec 到别的副本），
+   以及 AMFI 是否因为 `cs_enforcement_disable=1` 走了另一条判定支路。
+3. **`clover-mac` 里是别的策略名（Sandbox 等）** —— 信任这一关已经过了，拒绝发生在
+   策略标签上，按名字去读那个钩子；不再怀疑 bundle。
+4. **仍是 `namespace 9 code 0x8`，一条 `clover-mac` 都没有** —— 要么 `printf` 被吞
+   （r141 未解释的那件事），要么拒绝不经这两个钩子。先核对菜单标题确实是 `r142`，
+   确认刷进 `cache` 的是这一格；然后按 r141 第 4 条的办法改走 logfs 或直接 `panic()`
+   带策略名，不再靠 console。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -9535,8 +9629,10 @@ cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-p
 - **没有 Data 卷。** `[payload.adt]` 现在是 `packed_data_ramdisk = false`：本机没有
   `NativeRamBlock`，`--data-ramdisk` 后面那颗镜像不是内核要写的 Data 种子，而是
   `md0`/mockfs 的根（`scripts/make-clover-root.py`）。`/chosen` 因此保持普通
-  main boot，不加 `ephemeral-storage`，也不加 `PackedRAMDisk` 槽。owner bundle
-  由 `scripts/make-clover-root.py` 自己生成，`trust_cache_sha256` 钉住它。
+  main boot，不加 `ephemeral-storage`，也不加 `PackedRAMDisk` 槽。启动信任缓存是
+  `scripts/make-clover-trust-bundle.py` 拼的三模块 bundle（clover owner 模块 +
+  IPSW 的 `StaticTrustCache` + `Cryptex1,SystemTrustCache` 原始模块），
+  `trust_cache_sha256` 钉住合并后的整包。
 
 ## 许可证
 

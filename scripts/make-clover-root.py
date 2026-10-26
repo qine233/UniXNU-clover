@@ -117,18 +117,17 @@ def main():
         'launchd_bytes': len(image),
         'cdhash': cdhash.hex(),
         'trust_module_uuid': str(module_id),
-        'trustcache_sha256': hashlib.sha256(bundle).hexdigest(),
-        'trustcache_bytes': len(bundle),
+        'own_bundle_sha256': hashlib.sha256(bundle).hexdigest(),
+        'own_bundle_bytes': len(bundle),
         'signing_page_size': PAGE_SIZE,
         'ios_min_version': IOS_MIN,
-        'board_toml_line': f'trust_cache_sha256 = ["{hashlib.sha256(bundle).hexdigest()}"]',
         'apple_trust_chain_verified': False,
     }
     (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     print(f'launchd.macho {len(image)} bytes sha256 {report["launchd_sha256"][:16]}… '
           f'cdhash {cdhash.hex()}')
-    print(f'trustcache.bundle {len(bundle)} bytes sha256 {report["trustcache_sha256"][:16]}…')
-    print('board.toml [payload]: ' + report['board_toml_line'])
+    print(f'own trust module bundle {len(bundle)} bytes sha256 {report["own_bundle_sha256"][:16]}…')
+    print('boot trust cache: python3 scripts/make-clover-trust-bundle.py')
     return 0
 
 
