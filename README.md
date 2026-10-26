@@ -131,9 +131,10 @@ NVRAM proxy、`dram-base`、`crypto-hash-method`、`root-matching`、`display-ba
 和 `TrustCache` 两个占位（出现 `PackedRAMDisk` 就报错：DarwinBoot 不接受两个
 ramdisk 槽）、
 带八个 MPIDR 值的 `/cpus`、`/psci`、带 `ranges` 与 GICv3 节点的 `/arm-io`、
-`/defaults`、`/options` 和 `/product`。board 一段钉住 `v0.4.1` 的根契约：
+`/defaults`、`/options` 和 `/product`。board 一段钉住 `v0.4.2` 的根契约：
 `packed_data_ramdisk` 必须为假，`kernel_args` 必须且只能有一个 `rd=md0s39`
-（四字符别名只喂给 `bsd_rooted_ramdisk()` 的前缀比较，不参与根声明），
+（四字符别名只喂给 `bsd_rooted_ramdisk()` 的前缀比较，不参与根声明），必须有
+`cs_enforcement_disable=1`（r138 的 exec 拒绝点在 AMFI 的 label-update 钩子），
 `/chosen/root-matching` 必须是对 OS 卷 UUID 的 `IOMedia` 属性匹配，
 `clover-apfs` 必须为 `3`，`trust_cache_sha256` 必须非空。
 
@@ -9170,6 +9171,111 @@ cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-p
    `root-matching` 的 UUID 是否仍一致；这一格与 round137 的成功读数相矛盾，
    优先怀疑 payload 里混进了旧参数。
 
+## round138 读数（v0.4.1 实机，2026-10-26）：根授权过了，墙是 AMFI 的 exec 策略
+
+第一帧末行是 `unexpected SIGKILL of launchd with reason -- namespace 9 code 0x8`，
+下一行 `description none`。这一帧同时回答了两件事。
+
+**`rd=md0s39` 生效了。** 屏上没有 `rootvp not authenticated after mounting`，也没有
+`cannot mount root`：根挂载保持成功，`FSIOC_KERNEL_ROOTAUTH` 整段没有执行，
+`bsd_init` 一路走到 `_bsd_utaskbootstrap` 的 exec。这一格从此不再是问题。
+
+**墙在 exec 的安全策略上，且不是签名校验。** 拆开那行 reason：
+
+- `namespace 9` 是 `OS_REASON_EXEC`（`bsd/sys/reason.h:87-127`），
+  `code 0x8` 是 `EXEC_EXIT_REASON_SECURITY_POLICY`（`:255`）；
+- initproc 收到 SIGKILL 后由 `psignal_internal()` 直接 panic
+  （`bsd/kern/kern_sig.c:2072-2078`），所以这就是 launchd 第一次 exec 被拒；
+- `description none` 是关键判别位。`process_signature()` 只在
+  `ip_mac_return != 0` 的分支（`kern_exec.c:8541-8546`）创建不带描述的
+  `os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_SECURITY_POLICY)`；
+  带描述的两条支路分别是 `proc_process_signature()`（`:8476`）和
+  `ip_cs_error`（`:8549-8553`）。这一帧落在前者，说明拒绝来自 MAC 策略的
+  label-update 钩子，而不是签名校验本身；
+- `ip_mac_return` 由 `kauth_proc_label_update_execve()` 的 `label_update_return`
+  赋值（`kern_exec.c:6751`），值由每个 MAC 策略的 `mpo_cred_label_update_execve`
+  合成（`security/mac_vfs.c:840-870`）。这里已加载、且会在这个钩子里拒绝的只有 AMFI；
+- AMFI 是 Apple 自己的 kext，构建日志第 31 行的
+  `--root com.apple.driver.AppleMobileFileIntegrity` 与 `--early-security-init`
+  证明它来自 stock 21H461 kernelcache；同一帧上
+  `Security policy loaded: Apple Mobile File Integrity (AMFI)` 与
+  `AppleMobileFileIntegrity: Starting` 说明它已经起来；
+- `attempting to load 1 external trust cache modules` / `loaded external trust cache
+  module: 0` 是我们那 56 B 的 mockfs 信任模块（`c3ed2152…`），里面没有 launchd 的
+  cdhash。卷上的 launchd 对这颗 AMFI 来说既不是 platform binary，也不在信任表里。
+
+同一帧上的 `AppleImage4: root power domain not yet available: 19`、
+`RPI: ignored model name from device tree: iPad7,1`、
+`AppleMobileFileIntegrity: Error: Profile handler? region not found (?)` 都发生在
+`Starting` 之前或之外，是 profile 数据缺失的旁证，不是这次拒绝的直接原因：
+拒绝点是由 `description none` 钉住的 label-update 钩子，而不是某个签名 verdict。
+
+## v0.4.2（round139）：关掉 AMFI 的执行策略，只加一个 boot-arg
+
+这一轮的假设只有一句：**如果 r138 的拒绝来自 AMFI 的 label-update 钩子，那么
+`cs_enforcement_disable=1` 应该让同一次 exec 通过。** 依据是两处独立读同一名字的代码：
+
+```c
+/* bsd/kern/kern_codesigning.c:242-289（#if DEVELOPMENT || DEBUG） */
+PE_parse_boot_argn("cs_enforcement_disable", &cs_enforcement_disabled, ...);
+...
+else if (cs_enforcement_disabled) config |= CS_CONFIG_ALLOW_ANY_SIGNATURE;
+if (cs_enforcement_disabled) config |= CS_CONFIG_ENFORCEMENT_DISABLED;
+else if (cs_enforcement_disabled) config |= CS_CONFIG_GET_OUT_OF_MY_WAY;
+```
+
+XNU 侧这三位置是 `amfi_get_out_of_my_way` 的严格超集；AMFI 的 kext 在 `start()` 里
+另读一次同名参数，并打印 `%s: cs_enforcement disabled by boot-arg`。预链接镜像里
+`amfi_get_out_of_my_way` 只有 XNU 解析器那一份字符串，没有 AMFI 的副本，所以那个
+经典越狱参数够不到真正拒绝 launchd 的钩子；这一轮只加 `cs_enforcement_disable=1`，
+把「一次刷机只回答一个问题」保持在单变量上。
+
+改动只有一处参数与 checker，内核与驱动二进制不动：
+
+- `board.toml`：`kernel_args` 在 `rd=md0s39` 之后加 `"cs_enforcement_disable=1"`，
+  标题升到 r139。
+- `scripts/check-clover.py`：新增断言，`kernel_args` 必须包含
+  `cs_enforcement_disable=1`；`rd=md0s39` 的唯一性断言原样保留。
+- `scripts/verify-clover-payload.py`：无需改动（驱动身份串仍是 `CloverBlock r137`）。
+
+构建命令不变：
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+**刷写范围只有 `cache` 一个分区，没有新的 eMMC 分区写入**：`fastboot flash cache
+/Users/zhouzhou/clover-out/round139-payload.img`，然后 `fastboot reboot` 冷启动。
+
+产物归档在 `~/clover-out/round139-*`，`shasum -a 256 -c round139-SHA256SUMS` 七项全部 OK：
+`payload.img` 58,720,256 B（`59c10e5a…`）、本地 `kernel.macho` `e6683d30…`、卷内
+`kernel.macho` 51,994,624 B（`7272a92b…`，probe patch localized 成 6,680 B / 35 runs）、
+卷内 `unixnu.toml` 646 B（`7fa57db2…`，args 末尾是
+`… rd=md0s39 cs_enforcement_disable=1 armcpu-clock-panic=180000`）、ADT 13,476 B
+（`959cb293…`，含 root-matching）、`scratch-data.img` 35,888 B（`614b8356…`）、
+trustcache 56 B（`c3ed2152…`）。两个 checker 全绿。
+
+这一帧只问一个问题：**`cs_enforcement_disable=1` 送达后，AMFI 会不会放过 launchd 的
+第一次 exec。** 读帧顺序：
+
+1. **屏上出现 `cs_enforcement disabled by boot-arg`** —— AMFI 自己的 `start()` 认了
+   这个参数，这是参数送达的最强证据；紧随其后若没有同一条 SIGKILL 行，说明钩子放行，
+   启动进入 launchd 的 dyld/库加载。
+2. **同一行 `namespace 9 code 0x8` 再次出现，且没有 `cs_enforcement disabled` 行**
+   —— 参数没有送到 kext。先看 PMGR 打出的完整 args 行是否含
+   `cs_enforcement_disable=1`；若含而 kext 没认，下一格是 AMFI 的 profile region
+   缺失（同一帧已有 `Profile handler? region not found`），转向补 profile 而不是再换参数。
+3. **reason 变成带描述的一种** —— 签名校验路径开始说话（`ip_cs_error` 支路），
+   下一格是补 launchd 的 cdhash 到 trust cache 或继续放开签名检查，不再是 MAC 钩子。
+4. **不再有 SIGKILL，但停在 launchd 之后某处** —— 根、授权、AMFI 三层已过；
+   下一轮把探针的 `[clover] ... returned` 标记移到 exec 前后，定位新墙。
+5. **`armcpu-clock-panic=180000` 到点** —— 启动整体被兜底，按前四条的日志尾段判读。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
@@ -9216,7 +9322,10 @@ cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-p
   走标准路径去挂；round120 删过 `root-matching`，round127 把根改回 `rd=md0`，都是为了让
   探针能跑。`v0.4.1` 起 `kernel_args` 里保留一个 `rd=md0s39`，但它不是根声明：四字符
   进不了 `IOFindBSDRoot` 的根选择（`matching` 优先、md 捷径要求三字符），只让
-  `bsd_rooted_ramdisk()` 读到 `md0` 前缀而跳过 ROOTAUTH。payload 里仍带
+  `bsd_rooted_ramdisk()` 读到 `md0` 前缀而跳过 ROOTAUTH。`v0.4.2` 起再加
+  `cs_enforcement_disable=1`：r138 的 launchd SIGKILL 是 AMFI 的 label-update 钩子
+  （`EXEC_EXIT_REASON_SECURITY_POLICY`，无描述），而这个参数是 XNU 的 CS 核心与
+  AMFI kext 自己都会读的唯一开关。payload 里仍带
   `scratch-data.img` 作为 `initrd`，内核会把它挂成 `md0`，但它不再是根。
   round119-121 试过把根指向 eMMC 上的 `disk0s39`/`md0s39`，round127-136 的探针证明
   「卷发布、身份、几何、读路径都正常，唯独本驱动手工 `VFS_MOUNT` 一律回 13」，

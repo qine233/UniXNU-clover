@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r138: keep the mounted APFS root and skip the rootauth gate it cannot pass"
+title = "clover r139: disable AMFI enforcement in the kernel and in the kext that refused launchd"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1884,6 +1884,29 @@ kernel_args = [
   # :1080 -- which a four-character alias fails. Round121 already measured this exact prefix trick
   # on hardware: `BSD root: md0s39, major 1, minor 39` with the rootauth block skipped.
   "rd=md0s39",
+  # Round139 answers round138's frame instead of guessing at it. The panel carried
+  # `unexpected SIGKILL of launchd with reason -- namespace 9 code 0x8`, which is
+  # os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_SECURITY_POLICY) (bsd/sys/reason.h:255)
+  # being raised by psignal_internal's initproc arm (kern_sig.c:2072-2078). Its partner line
+  # `description none` is the discriminator: process_signature() creates that exact reason with
+  # no description only on the `ip_mac_return != 0` branch (kern_exec.c:8541-8546). The branches
+  # that carry a description are proc_process_signature (:8476) and ip_cs_error (:8549-8553), so
+  # launchd was not refused by a signature verdict -- a MAC policy's label-update hook said no.
+  # That value is kauth_proc_label_update_execve()'s return (kern_exec.c:6751), synthesized from
+  # every loaded policy's mpo_cred_label_update_execve in mac_error_select (mac_vfs.c:840-870);
+  # AMFI is the policy that refuses here, and it is Apple's own kext, prelinked from the stock
+  # 21H461 kernelcache (`--root com.apple.driver.AppleMobileFileIntegrity` in the build log), not
+  # something this port compiled. Its console lines in the same frame (`Security policy loaded:
+  # Apple Mobile File Integrity (AMFI)`, `...: Starting`) mark it started before the exec.
+  # cs_enforcement_disable is the one switch both halves read. XNU's parser (kern_codesigning.c
+  # :242-289, inside `#if DEVELOPMENT || DEBUG`, which this kernel is) turns it into
+  # CS_CONFIG_ALLOW_ANY_SIGNATURE | CS_CONFIG_ENFORCEMENT_DISABLED | CS_CONFIG_GET_OUT_OF_MY_WAY
+  # -- a strict superset of amfi_get_out_of_my_way's two bits. AMFI's kext parses the same name
+  # at start() and logs `%s: cs_enforcement disabled by boot-arg`; the prelinked image contains
+  # no second copy of the `amfi_get_out_of_my_way` string, so that older argument reaches only
+  # XNU and not the hook that actually killed initproc. One flash, one argument, one question:
+  # does AMFI's label-update hook stop at the same point once enforcement is off.
+  "cs_enforcement_disable=1",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
   # louder channel; rounds 78-85 then showed the EL0 report is exactly the thing under
   # examination, and every one of its four exits (write returning, exit, kill, reboot->panic)

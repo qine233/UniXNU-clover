@@ -550,6 +550,13 @@ def check_board(errors: list) -> str:
         errors.append('[payload] kernel_args must carry exactly one rd=, "rd=md0s39": four characters '
                       "keep it out of IOFindBSDRoot's root declaration (root-matching is the root) "
                       "while bsd_rooted_ramdisk() matches its md0 prefix and skips ROOTAUTH")
+    # Round139. Round138's frame was `namespace 9 code 0x8` with `description none`, i.e.
+    # EXEC_EXIT_REASON_SECURITY_POLICY created on process_signature()'s ip_mac_return branch
+    # (kern_exec.c:8541-8546) -- a MAC label-update denial, which here is AMFI's hook. Both readers
+    # of this name honor it: XNU's CS core (kern_codesigning.c:242-289) and AMFI's own start().
+    if "cs_enforcement_disable=1" not in board["payload"]["kernel_args"]:
+        errors.append('[payload] kernel_args has no cs_enforcement_disable=1: round138 died in '
+                      "AMFI's label-update hook, and this is the only bypass the kext itself reads")
     if "clover-apfs=3" not in board["payload"]["kernel_args"]:
         errors.append('[payload] kernel_args has no clover-apfs=3: without it CloverBlock keeps the '
                       'whole-card geometry, never reads the SHNGROOT manifest, and the APFS volume '
