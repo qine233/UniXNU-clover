@@ -136,13 +136,16 @@ def check_block(kernel: bytes) -> bool:
     refuses to let the archives have."""
     label = "kernel.macho: CloverBlock linked"
     found = {name: name.encode() in kernel
-             for name in ("clover-apfs", "CloverBlock r132: apfs",
+             for name in ("clover-apfs", "CloverBlock r133: apfs",
                           "fl=0x%x fc=0x%x fk=0x%x", "op=0x%x:0x%x mm=0x%x:0x%x",
-                          "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x", "FullName", "Sealed",
+                          "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x",
+                          "rdb=%u rda=0x%x/0x%x/0x%x/0x%x", "vr=%u vw=%u cr=%u", "/dev/",
+                          "FullName", "Sealed",
                           "AppleAPFSContainerScheme", "AppleAPFSVolume",
                           "SystemVersion.plist", "_clover_emmc_block_window",
                           "_clover_emmc_block_userdata_window", "SHNGROOT", "EFI PART",
-                          "_clover_block_run", "_vnode_setmountedon")}
+                          "_clover_block_run", "_vnode_setmountedon", "_vnode_open", "_vnode_close",
+                          "_kauth_cred_getuid", "_vfs_context_current", "_PE_parse_boot_argn")}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")

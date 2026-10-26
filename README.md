@@ -8331,9 +8331,21 @@ round129 那一档自己就在驱动里调 `bdevvp((major<<24)|minor, &devvp)`�
 
 XNU 导出的 `vnode_open` 是**按路径**开文件的（`bsd/sys/vnode.h:2143`：
 `vnode_open(const char *path, int fmode, int cmode, int flags, vnode_t *vpp, vfs_context_t ctx)`），六个槽位与这里一一对上；
-而 `container_rootmount` 的另一半正好用 `snprintf("/dev/", …)` 造过同类名字 ⇒ **apfs 是在对 `/dev/<那颗媒体的 BSD Name>`
-做一次按路径的打开，并把它的 errno 交回 `container_rootmount` 的返回值，也就是我们画了四轮的那个数。**
+而 `container_rootmount` 的另一半正好用 `snprintf("/dev/", …)` 造过同类名字 ⇒ apfs 是在对一颗 `/dev/` 路径
+做一次按路径的打开，并把它的 errno 交回 `container_rootmount` 的返回值，也就是我们画了四轮的那个数。
 （`w19` 的来源我没追到底；若它是 0，这次就是 FREAD-only、轮不到写授权 —— 这恰好就是 `vw=`/`vr=` 要一刀切开的东西。）
+
+> **round133 宿主更正（2026-10-26）**：上一版在这里写的是「`/dev/<那颗媒体的 BSD Name>`」，那句是错的，
+> 而且错在决定探针开哪颗节点的地方。`container_rootmount+0x78`（`0x567fa84`）调的 helper `0x56eb540`
+> 先 `PE_parse_boot_argn("rd", buf, 0x20)`，再用 `cmp #0x6d` / `cmp #0x64` / `ccmp w9,#0`（`0x56eb5a4-0x56eb5c0`）
+> 判 `buf[0]=='m' && buf[1]=='d' && buf[3]==0`；成立就 `snprintf("/dev/%s", buf)` 并返回 1，
+> `cbz w0,0x567fb0c` **不跳**，`0x567faac` 直接拿这颗串去调 `container_load_with_callback`。
+> 本板 boot-arg 是 **`rd=md0`**（三位，`md0s39` 只是媒体的 `BSD Name` 属性，是 step 9 为 `bsd_init` 的
+> RAMDEV 前缀测试写的别名），谓词成立 ⇒ **apfs 实际打开的是 `/dev/md0`，即 RAMDisk，而不是 eMMC 卷的节点。**
+> 走匹配器 `0x5671c78` 的那条媒体臂（`0x567fb0c`）在本板根本不会进。这一更正同时解释了
+> round129–132 为什么连着四轮改「卷的挂载状态」都纹丝不动：那个调用方压根没在开那颗节点。
+> `w19` 也已定位：`0x56708f4-0x5670900` 对入参 `x2` 指向的字节做 `tst #1` 后 `cset w19,eq`，
+> 即 **bit0 为 0 ⇒ w19=1 ⇒ fmode=0x13（带写）**。
 
 ### 13 从哪来：`vnode_authorize` 把 EPERM 翻成 EACCES
 
@@ -8362,26 +8374,67 @@ XNU 导出的 `vnode_open` 是**按路径**开文件的（`bsd/sys/vnode.h:2143`
   （`0x56809a0`）和它前面两处 `copyin`（`0x56c6bdc`、`0x56c6bf0`）都在门后 ⇒ **mode 0 到不了**。
   `handle_crypto_mount` 那句 `#0xd` 也一样，只在 mode 4..7 那条臂上。
 
-**下一格的候选**（排序短清单）：
+## v0.3.6（round133）：在驱动里复现 apfs 那句 `vnode_open`，开的必须是它真正开的那颗节点
 
-1. **在驱动里替 apfs 把它那句 `vnode_open` 复现一遍**（推荐）：拿 `volumeBsd()` 已经在手的 `devname`，
-   `snprintf` 成 `/dev/<name>`，先用 `FREAD` 开一次、再用 `FREAD|FWRITE` 开一次，画 `nd=`（那颗名字本身，四个 `le32`）、
-   `vr=`、`vw=`，再加 `cr=` = `kauth_cred_getuid(vfs_context_ucred(ctx))`。读法：
-   `vr=0 vw=13` ⇒ 生产者当场抓获，下一格就变成「让那颗节点允许带写打开」（我们发布的媒体属性 / 上下文 cred）；
-   `vr=2` ⇒ `/dev` 里根本没有这颗节点（devfs 还没造出来），13 来自别处；
-   `vr=vw=0` ⇒ 我们的线程能过而 apfs 不能，差别在它自己的 `w19`/flags，那时再量 mode。
-   **可行性已在宿主核过**：`_vnode_open` 在 `round132-kernel.macho` 的 nlist 里是 `0xfffffff0074735cc`，
-   和已经在用的 `_vnode_lookupat`（`0xfffffff00746d0d8`）、`_vnode_put`（`0xfffffff00746add8`）同一片
-   `kpi_vfs.c` 区域；它的序言 `mov x23,x5; mov x19,x4; mov x25,x3; mov x21,x2; mov x22,x1; mov x24,x0` 再加
-   `cbnz x5 → bl _vfs_context_current`（`0xfffffff0074917cc`）证的就是 `vnode.h:2143` 那个原型
-   `(path, fmode, cmode, flags, vpp, ctx)`；`FREAD`/`FWRITE` = 1/2（`bsd/sys/fcntl.h:112-113`），
-   `_kauth_cred_getuid` = `0xfffffff0076b7810`。⇒ 这一格只需要沿用手写 KPI 声明那套，不需要新偏移。
-   另外一条旧证据把 `vr=2` 那一岔收紧了：`v0.2.36` 起 EL0 的 `open("/dev/console")` 是成功的
-   （见 README 的 v0.2.36 节，`devfs_kernel_mount("/dev")` 走过），devfs 确实挂在 `/dev` 上；
-   所以 `vr=2` 从此只意味着「我们这颗媒体没被 devfs 造成节点」，而不是「devfs 压根没挂」。
-2. **ADT 加 `/chosen { root-snapshot-name = <快照名>; }`** —— 现在排在 1 后面：它治的是快照/密封，
-   而这一轮的宿主证据把问题挪到了「带写按路径打开 `/dev` 节点」。
-3. **`/filesystems { DoNotUseSEP; }`** 与 **`allow-root-hash-mismatch`** —— 同属认证类，等 `mt=0` 之后再动才有意义。
+这一格只做一件事：把 `container_load_with_callback` 在 `0x5670bd0` 那句 `vnode_open` 在我们自己的线程上
+照原样跑两遍（`FREAD` 一次、`FREAD|FWRITE` 一次），把两个 errno 画出来。`VFS_MOUNT` 调用本身第五轮保持
+逐字节不变，`mt=`/`r=` 应当仍是 `13`/`464`，这样新读数和旧读数可以放在同一帧里对照。
+
+**但开哪颗节点，是这一轮在宿主上改掉的关键。** 上一节末尾的更正已经写了推导，这里只给结论：
+`rd=md0` 让 `0x56eb540` 的 `md?` 谓词成立，`container_rootmount` 走的是「直接用 `rd=` 拼 `/dev/%s`」那条臂，
+所以 apfs 开的是 **`/dev/md0`（RAMDisk）**，不是 eMMC 卷的 `/dev/md0s39`。round132 及之前记的「媒体臂」作废。
+驱动不再替它猜：自己 `PE_parse_boot_argn("rd", buf, 0x20)`，套同一个三字节谓词，成立就用 `rd=` 的值、
+不成立才退回媒体的 `BSD Name`，再拼 `/dev/`。因此 `nd=` 既是路径、也是「走了哪条臂」的自证。
+
+新增的六个字段：`rdb=`（`PE_parse_boot_argn` 的返回）、`rda=`（`rd=` 值的前 16 字节，四个 `le32`）、
+`nd=`（真正被打开的路径前 16 字节）、`vr=`/`vw=`（两次 `vnode_open` 的返回）、
+`cr=`（`kauth_cred_getuid(vfs_context_ucred(vfs_context_current()))`）。上下文用 `vfs_context_current()`，
+因为 `container_load_with_callback` 序言里存的正是它（`0x56708e0`），不是 `VFS_MOUNT` 传下来的那个；
+两次打开的节点都在 `VFS_MOUNT` 之前用 `vnode_close` 关掉了，不给 apfs 留下「设备被我们占着」的借口。
+
+预期帧（末行 `@CloverBlock.cpp:1508`）里新段的形状：
+
+```
+rdb=1 rda=0x30646d/0x0/0x0/0x0 nd=0x7665642f/0x30646d2f/0x0/0x0 vr=<a> vw=<b> cr=0
+```
+
+`rda=` 解出来是 `md0`，`nd=` 解出来是 `/dev/md0`。若 `rda=` 拼出的不是 `md0`，说明 boot-arg 没按预期传下去，
+后面所有关于路径的推导都要先停下来重看。
+
+读法（`vr`/`vw` 是 errno，2=ENOENT、6=ENXIO、1=EPERM、16=EBUSY、13=EACCES）：
+
+- **`vr=0 vw=13`** —— 最想要的一帧：这颗节点只读开得了、带写被拒。apfs 的 `w19` 在其标志字节 bit0 为 0 时
+  取 1，对应 fmode `0x13`，正好落在被拒的那一侧 ⇒ `mt=13` 的生产者当场抓获，而且问题被改写成
+  「`rd=` 把 apfs 指到了 RAMDisk 上」，与卷的密封、快照、`MNT_ROOTFS` 全都无关。
+- **`vr=13 vw=13`** —— 连只读都被拒，那是 kauth/MACF 一层的拒绝（`vn_authorize_open_existing` 在
+  `VNOP_OPEN` 之前，`CONFIG_MACF` 下 `mac_vnode_check_open` 也能拒读）。`cr=` 非 0 会先解释它。
+- **`vr=2`** —— `/dev` 里没有这颗节点。v0.2.36 起 EL0 的 `open("/dev/console")` 是成功的，devfs 确实挂着，
+  所以 2 只说明「这颗设备没被 devfs 造成节点」。若此时 `mt=` 仍是 13，则本格的路径推导与实测矛盾，
+  先查推导，不要急着改 `rd=`。
+- **`vr=vw=0`** —— 同一个调用在我们线程上两次都过，13 就是 apfs 自己决定的（它的 `w19`/mode/另一处写槽），
+  下一格回到 `container_rootmount` 内部，而不是内核授权。
+- **`vw=1` / `vw=16`** —— 分别指向 `spec_open` 的 `securelevel>=2 && FWRITE && D_DISK` 那一条
+  （`bsd/miscfs/specfs/spec_vnops.c:436-457`）和 `vfs_mountedon` 的 `SI_MOUNTEDON`
+  （`bsd/vfs/vfs_subr.c:4125`）。后者还可能睡在 `vnode_waitformounting` 上：那时这一格不出新行，
+  由 tick 看门狗报点，同样是有效读数。
+
+归档在 `~/clover-out/round133-*`：`payload.img` 58,720,256 B（`bc6a0f7f…`）、本地 `kernel.macho`
+`cf0ecb40…`、卷内 `kernel.macho` 51,994,624 B（`8d0951be…`）、ADT 13,268 B（`019e04b5…`）、
+trustcache 56 B（`c3ed2152…`），另附 `round133-SHA256SUMS`。`check-clover.py` 与
+`verify-clover-payload.py` 全绿（probe patch 6678 B / 35 runs，CloverBlock 的 r133 身份串、
+`rdb=/rda=`、`vr=/vw=/cr=`、`/dev/` 与 `_vnode_open`、`_vnode_close`、`_kauth_cred_getuid`、
+`_vfs_context_current`、`_PE_parse_boot_argn` 均在）。
+
+**刷写范围只有 `cache` 一个分区，没有新的 eMMC 分区写入**：`fastboot flash cache
+/Users/zhouzhou/clover-out/round133-payload.img`，然后 `fastboot reboot` 冷启动。
+
+下一格候选（要等这一帧，排序按当前证据）：
+
+1. **若 `vw=13`：把 `rd=` 不再指向 RAMDisk 这件事拆开做** —— 它是 round121 为绕 `rootvp not authenticated`
+   而撒的谎，现在证明这句谎同时被 apfs 的 `container_rootmount` 当真了。要先决定的是「`rd=` 写真名之后
+   用什么代替 RAMDEV 前缀来跳过 rootauth」，而不是直接改字符串。
+2. **ADT 加 `/chosen { root-snapshot-name = …; }`** —— 只有在 `mt=` 过了 13 之后才轮得到快照这一层。
+3. **`/filesystems { DoNotUseSEP; }` 与 `allow-root-hash-mismatch`** —— 同属认证类，同样往后排。
 
 ## 有意省略的部分
 
