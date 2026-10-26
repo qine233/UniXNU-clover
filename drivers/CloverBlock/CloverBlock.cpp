@@ -131,7 +131,7 @@
 // Nothing else about the mount moves, so the frame either shows the identity the host already read out of
 // the flashed bytes and still says 13, or it says something the host did not predict.
 //
-// A failure panics with one short CloverBlock r133 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r134 line naming the step; success prints one line
 // and lets the boot continue, except under a window (clover-apfs=1 or =2), where the APFS depth and
 // what the vfs made of it are the report and the run always panics with them. A refire of the IOBSD
 // notification prints one counted line and returns, so the photograph shows both that the run
@@ -195,20 +195,6 @@ int vn_rdwr (int rw, void *vp, void *base, int len, int64_t offset, int seg, int
              int *resid, void *p);
 void *vfs_context_kernel (void);
 void *vfs_context_ucred (void *ctx);
-// The context apfs's own callback uses: container_load_with_callback's prologue stores
-// vfs_context_current() (0xfffffff0074917cc) in its frame and hands that to vnode_open, not the context
-// VFS_MOUNT passed down. Reproducing the open therefore has to ask the same question of the same context.
-void *vfs_context_current (void);
-// Round133's two, declared the same way. vnode_open is bsd/sys/vnode.h:2143 --
-// vnode_open(const char *path, int fmode, int cmode, int flags, vnode_t *vpp, vfs_context_t ctx) -- and it
-// is *path*-based, which is what apfs calls (see the comment at the probe below). vnode_close is the
-// counterpart that drops the open reference vnode_open took: the kernel's own body (0xfffffff0074736a8)
-// is `mov x19,x0` then _vn_close (0xfffffff00748eaec) and a vnode release, so closing without it would
-// leave the device open and contaminate the very state the next line measures. kauth_cred_getuid is
-// bsd/sys/kauth.h:309 and returns uid_t.
-int vnode_open (const char *path, int fmode, int cmode, int flags, void **vpp, void *ctx);
-int vnode_close (void *vp, int fmode, void *ctx);
-uint32_t kauth_cred_getuid (void *cred);
 // apfs's own boot-arg reader, the stub at 0xfffffff005767e1c which resolves to _PE_parse_boot_argn
 // (0xfffffff00794209c). It returns nonzero when the argument was present, and this file asks for the same
 // key, the same buffer size (0x20) and the same call apfs makes at 0xfffffff0056eb580.
@@ -323,27 +309,10 @@ static const uint32_t kMntOp = 0x28;
 static const uint32_t kMntRdonly = 0x1;
 static const uint32_t kMntRootfs = 0x4000;
 static const uint32_t kRootMountFlags = kMntRdonly | kMntRootfs;
-// Round133's two open modes, bsd/sys/fcntl.h:112-113. The loader's arm that reaches the open builds its
-// fmode with `cmp w19,#0; mov w8,#0x13; csinc w1,w8,wzr,ne` (0xfffffff005670bb0), i.e. FREAD|FWRITE when
-// that flag is set and FREAD alone when it is not, so the pair this file opens with is that same pair and
-// nothing else -- one of the two answers is the answer apfs got.
-static const int kFRead = 0x1;
-static const int kFWrite = 0x2;
-// The prefix apfs's own matcher helper writes in front of the matched media's BSD Name: container_rootmount
-// calls 0xfffffff005671c78(dev, name_out, 0x40, flag_out) at 0x567fb20, and inside it 0x5671df0 is
-// `snprintf(name_out, len, "/dev/%s", <that object's "BSD Name">)`. The same helper also returns one flag
-// byte -- 0x5671e58 stores `metaCast("AppleAPFSVolume") != NULL` -- and container_rootmount branches on it at
-// 0x567fb30, but both arms hand a path that starts this way to container_load_with_callback, whose no-vnode
-// arm (0x5670bb0) is the one whose vnode_open return lands in the errno slot we draw as mt=.
-static const char kDevPathPrefix[] = "/dev/";
-static const uint32_t kDevPathBytes = 0x40;
-// The boot arg the earlier branch reads: 0xfffffff0056eb540 asks PE_parse_boot_argn for "rd", falls back to
-// "rootdev", and only builds "/dev/<that string>" when the string is exactly three characters and starts
-// "md" (buf[0]=='m', buf[1]=='d', buf[3]==0). board.toml passes rd=md0, which is exactly that shape, so this
-// boot takes the rd arm and apfs opens /dev/md0 -- the RAMDisk. Drawing the parsed string is what turns that
-// derivation into a reading rather than another assumption.
-static const char kRdArgKey[] = "rd";
-static const uint32_t kRdArgBytes = 0x20;
+// Round134 reads the block-special vnode itself after a failed mount. Four KiB is the same block-0
+// request size nx_mount makes, and offset zero is aligned for spec_read's VBLK path. This is a new
+// measurement after VFS_MOUNT has returned, not a pre-read that could change the mount result.
+static const uint32_t kDeviceReadBytes = 4096;
 
 // The IOBSD publish notification is delivered on the persistent gIOResources service, whose
 // doServiceMatch re-invokes every still-matching gIOPublishNotification on each pass and ignores the
@@ -720,7 +689,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r133: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r134: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 static uint32_t le32At(const uint8_t *at)
@@ -1078,18 +1047,13 @@ struct MountReport {
   uint32_t bytes;  // what that read actually filled
   uint32_t word0;
   uint32_t word1;
-  // Round133's six, and they are the same question mt= has been answering for four rounds, asked of the
-  // kernel rather than of apfs: container_rootmount's errno slot ([sp,#0x50], zeroed by
-  // `stp xzr,xzr,[sp,#0x50]` at 0x567fa54 and loaded into w19 at both exits) has exactly four writers, three
-  // of them bdevvp -- excluded by our own bd=0 -- and the fourth is container_load_with_callback storing
-  // vnode_open's return into it verbatim (0x5670bd0, `str w0,[x8]` with x8 = the saved out param).
-  uint32_t rdFound;   // PE_parse_boot_argn("rd", buf, 0x20), the test at 0x567fa84 that picks the branch
-  uint32_t rdArg[4];  // the first 16 bytes of that string: "md0" here, which is what makes apfs open /dev/md0
-  uint32_t node[4];   // the path this file built and opened: "/dev/" plus rd= when the md? test holds, else
-                      // the media's BSD Name -- the same choice container_rootmount makes at 0x567fa88
-  uint32_t openRead;  // vnode_open(node, FREAD) -- one of the two fmodes the csinc at 0x5670bb8 can pick
-  uint32_t openWrite; // vnode_open(node, FREAD|FWRITE) -- the other, 0x13, materialised at 0x5670bb4
-  uint32_t uid;       // kauth_cred_getuid(vfs_context_ucred(vfs_context_current())), the cred judged
+  // Round134's one new question, asked only after VFS_MOUNT has failed: does this exact devvp also
+  // return EACCES for an independent 4 KiB read at offset zero? dr= is vn_rdwr's errno, db= the byte
+  // count, and dx=/dy= the first eight bytes. A successful mount leaves dr= at kRungNotReached.
+  uint32_t deviceRead;
+  uint32_t deviceBytes;
+  uint32_t deviceWord0;
+  uint32_t deviceWord1;
 };
 
 static const uint32_t kRungNotReached = 0xffff;
@@ -1139,25 +1103,9 @@ static bool volumeBsd(IOMedia *media, const char **name, uint32_t *major, uint32
 // Every rung returns rather than panicking, so the caller can draw the rungs that ran.
 static void volumeMountLadder(IOMedia *volume, MountReport *report)
 {
-  // Asked before anything else, because it costs no I/O and it decides which of container_rootmount's two
-  // arms this boot is in: 0x567fa84 calls the helper at 0x56eb540, whose first act is
-  // PE_parse_boot_argn("rd", buf, 0x20) (0x56eb580) with a "rootdev" fallback, and whose whole return is a
-  // test on what came back -- 'm','d' and a NUL at [3] (0x56eb5a4-0x56eb5c0: cmp #0x6d, cmp #0x64, ccmp #0).
-  // When that holds it snprintf()s "/dev/%s" over the caller's buffer and returns 1, so `cbz w0,0x567fb0c`
-  // does NOT branch and 0x567faac calls container_load_with_callback with x0 = that string. Only when the
-  // test fails does the media arm at 0x567fb0c run the matcher (0x5671c78) that builds "/dev/<BSD Name>".
-  // board.toml passes rd=md0 -- three characters, so buf[3] is the NUL and the predicate holds. md0s39 is
-  // only the *media's* `BSD Name` property (step 9's alias, which exists to satisfy bsd_init's own
-  // RAMDEV-prefix test); it is not the boot argument. The expectation is therefore rdb=1 with rda= spelling
-  // "md0", and the open apfs performs is on /dev/md0 -- the RAMDisk, not the eMMC volume this file mounted.
-  // Round132's notes said the media arm; the instructions above say otherwise, and the probe below follows
-  // the instructions rather than the notes.
-  char rdArg[kRdArgBytes] = { 0 };
-  report->rdFound = static_cast<uint32_t>(PE_parse_boot_argn(kRdArgKey, rdArg, kRdArgBytes));
-  for (uint32_t index = 0; index < 4; index++) {
-    report->rdArg[index] = le32At(reinterpret_cast<const uint8_t *>(rdArg) + 4 * index);
-  }
-
+  // The device number and name still come from the AppleAPFSVolume's own IOMedia. Round133 proved that
+  // parsing rd=md0 says nothing about the loader when devvp is non-null, so this round leaves the boot
+  // argument alone and measures the device vnode that VFS_MOUNT actually received.
   const char *devname = nullptr;
   for (uint32_t attempt = 0; attempt < 1000 && report->major == kRungNotReached; attempt++) {
     if (!volumeBsd(volume, &devname, &report->major, &report->minor)) {
@@ -1227,71 +1175,44 @@ static void volumeMountLadder(IOMedia *volume, MountReport *report)
     report->mountFn = le64At(reinterpret_cast<const uint8_t *>(report->ops));
   }
 
-  // The rung this round exists for. apfs reaches its refusal without reading a block (r=464, unchanged
-  // through rounds 129-132), and the host pass says the only number it can be propagating is the errno slot
-  // container_load_with_callback fills from vnode_open -- so the same path, built the same way, is opened here
-  // twice, once with each fmode its `mov w8,#0x13; csinc w1,w8,wzr,ne` at 0x5670bb4-0x5670bb8 can produce:
-  // FREAD|FWRITE when w19 is nonzero and FREAD when it is zero, where w19 itself is `cset eq` of a bit-0 test
-  // on the byte at its x2 (0x56708f4-0x5670900), i.e. a cleared bit asks for the writable open. Whichever of
-  // vr=/vw= is 13 names the caller that
-  // produced mt=13, and if neither is, the 13 is something apfs does with its own w19 rather than an errno the
-  // kernel handed it. The node is closed again with vnode_close before VFS_MOUNT runs -- the kernel's own
-  // vnode_close (0xfffffff0074736a8) is `_vn_close` plus the release -- so nothing this file opened is still
-  // held when apfs is asked, and the mount call below stays byte-identical to round132's.
+  // Keep the mount itself byte-identical to rounds 129-133. Round133's path-open instrument is withdrawn:
+  // container_load_with_callback skips its path vnode_open when the devvp argument is non-null, which is
+  // exactly the case here, so opening /dev/md0 could never have measured the producer of mt=13. Nor is that
+  // path the errno slot's only writer: nx_mount can propagate an error from its block-0 device read.
   //
-  // What the path is on this board is the part round132 had wrong: rd=md0 makes the answer /dev/md0, so a
-  // 13 here is the RAMDisk's node refusing, and the eMMC volume's own node is never opened by this caller
-  // at all. That would also explain why four rounds of changing the *volume's* mount state moved nothing.
-  //
-  // What else a nonzero answer can mean, from the same source tree. A path open goes namei ->
-  // vn_authorize_open_existing -> VNOP_OPEN (bsd/vfs/vfs_vnops.c:631 then :661), and for a block special node
-  // VNOP_OPEN is spec_open's VBLK arm (bsd/miscfs/specfs/spec_vnops.c:436-457), which can only answer ENXIO(6)
-  // when the major is past nblkdev, EPERM(1) at securelevel >= 2 with a non-FSCRED cred and FWRITE on a D_DISK
-  // major, EBUSY(16) from vfs_mountedon (bsd/vfs/vfs_subr.c:4125, and it can also *sleep* on "vnode_waitformounting"
-  // if some other thread set SI_MOUNTING), or whatever the block switch's d_open says. 2 (ENOENT) would come
-  // from namei itself: no such node in /dev. None of those is 13, which is why cr= rides along.
-  // The path is chosen by apfs's own predicate, not by which node this file happens to be holding. The
-  // helper's test is on the parsed rd= value: bytes 'm','d' and a NUL at [3]. If it holds, the name is the
-  // rd= value itself (this board: "md0"); otherwise it is the media's BSD name, which is what the matcher
-  // at 0x5671c78 copies out before its "/dev/%s". Either way nd= draws the first sixteen bytes of what was
-  // actually opened, so the photograph itself says which arm the probe reproduced -- no separate flag to
-  // believe, and no way for the two to disagree silently.
-  const bool ramdiskName = rdArg[0] == 'm' && rdArg[1] == 'd' && rdArg[3] == 0;
-  const char *openName = ramdiskName ? rdArg : devname;
-  char node[kDevPathBytes] = { 0 };
-  uint32_t filled = 0;
-  for (const char *cursor = kDevPathPrefix; *cursor && filled + 1 < kDevPathBytes; cursor++) {
-    node[filled++] = *cursor;
-  }
-  for (const char *cursor = openName; cursor && *cursor && filled + 1 < kDevPathBytes; cursor++) {
-    node[filled++] = *cursor;
-  }
-  node[filled] = 0;
-  for (uint32_t index = 0; index < 4; index++) {
-    report->node[index] = le32At(reinterpret_cast<const uint8_t *>(node) + 4 * index);
-  }
-  void *probeCtx = vfs_context_current();
-  void *readOnly = nullptr;
-  report->openRead = static_cast<uint32_t>(vnode_open(node, kFRead, 0, 0, &readOnly, probeCtx));
-  if (readOnly) {
-    vnode_close(readOnly, kFRead, probeCtx);
-  }
-  void *writable = nullptr;
-  report->openWrite = static_cast<uint32_t>(vnode_open(node, kFRead | kFWrite, 0, 0, &writable, probeCtx));
-  if (writable) {
-    vnode_close(writable, kFRead | kFWrite, probeCtx);
-  }
-  // The cred kauth would judge the write request against, taken from the same context the two opens above
-  // used. The chain, from this tree's own source: vn_open_common runs vn_authorize_open_existing before it
-  // ever reaches VNOP_OPEN (bsd/vfs/vfs_vnops.c:631, then :661), that function asks for
-  // KAUTH_VNODE_WRITE_DATA exactly when fmode carries FWRITE or O_TRUNC (bsd/vfs/vfs_subr.c:8228-8240), and
-  // vnode_authorize maps a plain EPERM from the authorizer chain onto the EACCES we draw (:8766-8770). A
-  // nonzero cr= therefore says "this context is not root", which is the one shape of answer that would make
-  // 13 a sensible reply to a read-only open as well as to a write one -- and it is free to measure.
-  report->uid = kauth_cred_getuid(vfs_context_ucred(probeCtx));
-
+  // The candidate chain for that read is concrete. spec_strategy has no permission gate; dkstrategy reaches
+  // IOMedia::read, whose early kIOReturnNotOpen/NotReadable-style failures are converted by
+  // IOService::errnoFromReturn to EACCES, stored in the buffer by dkreadwritecompletion, returned by
+  // buf_biowait, and propagated through _vnode_dev_read and nx_mount into the loader's errno out parameter.
+  // That chain is a candidate, not a proven runtime cause: bdevvp already performed VNOP_OPEN(FREAD), so a
+  // bare "the device was never opened" explanation would contradict bd=0.
   report->mount = static_cast<uint32_t>(VFS_MOUNT(mp, devvp, 0, ctx));
   if (report->mount) {
+    // One question, after the mount can no longer be perturbed by it: can the same block-special vnode be
+    // read independently? spec_read's VBLK arm uses buf_getblk/VNOP_STRATEGY, the same dkstrategy/buffer
+    // error channel as nx_mount. dr=13 supports a persistent device-side refusal; dr=0 says that explanation
+    // does not hold after the mount and sends the host pass back to APFS's internal/container-reuse paths.
+    // r= is deliberately sampled only in the panic call, after this read, so it includes any new media I/O.
+    OSSharedPtr<IOBufferMemoryDescriptor> device =
+        IOBufferMemoryDescriptor::withCapacity(kDeviceReadBytes, kIODirectionIn, true);
+    if (!device.get()) {
+      fail("device-read-buffer", 0);
+    }
+    int deviceResid = 0;
+    report->deviceRead = static_cast<uint32_t>(
+        vn_rdwr(kUIORead, devvp, device->getBytesNoCopy(), static_cast<int>(kDeviceReadBytes), 0,
+                kUIOSysSpace, kIOUnit, vfs_context_ucred(ctx), &deviceResid, nullptr));
+    if (deviceResid < 0) {
+      deviceResid = 0;
+    } else if (deviceResid > static_cast<int>(kDeviceReadBytes)) {
+      deviceResid = static_cast<int>(kDeviceReadBytes);
+    }
+    report->deviceBytes = kDeviceReadBytes - static_cast<uint32_t>(deviceResid);
+    const uint8_t *deviceHead = static_cast<const uint8_t *>(device->getBytesNoCopy());
+    if (deviceHead) {
+      report->deviceWord0 = le32At(deviceHead);
+      report->deviceWord1 = le32At(deviceHead + 4);
+    }
     return;
   }
   // vfs_subr.c:1282, through the exported helper rather than a third measured offset:
@@ -1474,18 +1395,16 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
                          kRungNotReached, kRungNotReached, kRungNotReached,
                          { kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached },
                          kRungNotReached, 0, 0, 0,
-                         kRungNotReached, { 0, 0, 0, 0 }, { 0, 0, 0, 0 },
-                         kRungNotReached, kRungNotReached, kRungNotReached };
+                         kRungNotReached, 0, 0, 0 };
   if (best.volumeMedia) {
     volumeMountLadder(best.volumeMedia, &report);
   }
 
-  panic("CloverBlock r133: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u "
+  panic("CloverBlock r134: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u "
         "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x vn=0x%x/0x%x/0x%x/0x%x dv=%u:%u bd=%u al=%u "
         "t=0x%x/0x%x/0x%x/0x%x on=0x%x fm=0x%x dp=0x%x:0x%x fl=0x%x fc=0x%x fk=0x%x "
         "op=0x%x:0x%x mm=0x%x:0x%x mt=%u st=%u rt=%u k=%u/%u/%u/%u "
-        "rd=%u g=%u x=0x%x y=0x%x r=%u w=%u "
-        "rdb=%u rda=0x%x/0x%x/0x%x/0x%x nd=0x%x/0x%x/0x%x/0x%x vr=%u vw=%u cr=%u",
+        "rd=%u g=%u x=0x%x y=0x%x dr=%u db=%u dx=0x%x dy=0x%x r=%u w=%u",
         __atomic_load_n(&gWindowFirst, __ATOMIC_ACQUIRE),
         __atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE), magic,
         static_cast<uint32_t>(loaded), best.seen, best.scheme, best.container, best.volume,
@@ -1501,9 +1420,7 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
         report.mount, report.start,
         report.root, report.lookup[0], report.lookup[1], report.lookup[2], report.lookup[3],
         report.read, report.bytes, report.word0, report.word1,
-        report.rdFound, report.rdArg[0], report.rdArg[1], report.rdArg[2], report.rdArg[3],
-        report.node[0], report.node[1], report.node[2], report.node[3],
-        report.openRead, report.openWrite, report.uid,
+        report.deviceRead, report.deviceBytes, report.deviceWord0, report.deviceWord1,
         __atomic_load_n(&gBlocksRead, __ATOMIC_ACQUIRE),
         __atomic_load_n(&gBlocksWritten, __ATOMIC_ACQUIRE));
 }
@@ -1521,7 +1438,7 @@ extern "C" void clover_block_run(void)
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    IOLog("CloverBlock r133: refire n=%u (already ran)\n", fires);
+    IOLog("CloverBlock r134: refire n=%u (already ran)\n", fires);
     return;
   }
 
@@ -1735,7 +1652,7 @@ extern "C" void clover_block_run(void)
     fail("alias-match", reinterpret_cast<uint64_t>(aliasService));
   }
 
-  IOLog("CloverBlock r133: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
+  IOLog("CloverBlock r134: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
         kRootAlias, bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
 }

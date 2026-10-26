@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r133: open the /dev node apfs opens, read-only and write, and draw both"
+title = "clover r134: after mount fails, read the same devvp and draw errno and bytes"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1776,50 +1776,37 @@ kernel_args = [
   # unsealed, and still answers mt=13 with r=464 for the fourth consecutive round. That r=464 is the
   # stronger half of the frame now: no media block has been read when the refusal is taken, so the
   # answer cannot be in the bytes we selected and the selection question is closed on the device.
-  # What mt= actually is, from the host pass over container_rootmount (0xfffffff00567fa0c, frame 0x160):
-  # `stp xzr,xzr,[sp,#0x50]` reserves its errno out slot, both exits load it into w19, and apfs_vfsop_mount's
-  # mode-0 arm stores its return verbatim -- so mt= is not a code apfs invents, it is a number somebody else
-  # handed back. Only four sites in that function write a foreign return into the slot: three bdevvp calls and
-  # container_load_with_callback (0xfffffff005670890, x4 = sp+0x50). Our own bd=0 kills bdevvp on the spot --
-  # the kernel's bdevvp opens with FREAD through VNOP_OPEN and panics on its ref failures, so it cannot be
-  # quietly returning 13 -- which leaves the loader. In its no-vnode path that function does
-  # `cmp w19,#0; mov w8,#0x13; csinc w1,w8,wzr,ne` (fmode = FREAD|FWRITE when w19 is set, plain FREAD when it
-  # is not), passes the name buffer from its caller as x0, and stores vnode_open's return straight into the saved
-  # errno pointer. XNU's exported vnode_open is path-based (bsd/sys/vnode.h:2143), and the sibling branch in
-  # container_rootmount snprintf()s "/dev/" in front of a BSD name, so the sentence we have been waiting for is
-  # simply: apfs opens /dev/<that media's BSD Name>, and its errno is the 13 we draw. The kernel's own EACCES
-  # census (/tmp/eacces2.py over __TEXT_EXEC: 336 `mov w?,#0xd` sites, attributed by nearest symbol) leaves one
-  # candidate that fits this path -- vnode_authorize (bsd/vfs/vfs_subr.c:8753), whose `if (result == EPERM)
-  # result = EACCES;` at :8768 is the flip -- reached from vn_authorize_open_existing (:8160) when the open
-  # asks for KAUTH_VNODE_WRITE_DATA, which explains how bd=0 and mt=13 coexist: the read-only open never touches
-  # kauth. Two temptations fell away on the way: the loader's "refusing exclusive access ... other clients are
-  # actively accessing the container device" writes 16 (EBUSY), not 13, so our still-open devvp is not the
-  # reason; and the AppleImage4 root-authorization gate sits behind a dispatch that only passes mode 3 and mode
-  # 8, so it is unreachable in mode 0 and round131's Image4 hypothesis is retracted.
-  # Round133 (v0.3.6) asks that question of the kernel rather than of apfs, and the host pass that wrote this
-  # paragraph corrected which node the question is about. container_rootmount calls 0xfffffff0056eb540 at
-  # 0x567fa84; that helper parses rd= (rootdev fallback) and returns 1 exactly when the value is three
-  # characters starting "md" -- cmp #0x6d, cmp #0x64, ccmp #0 on buf[3] at 0x56eb5a4-0x56eb5c0 -- having first
-  # snprintf()ed "/dev/%s" over the caller's buffer. A 1 means `cbz w0,0x567fb0c` falls through, and 0x567faac
-  # calls container_load_with_callback with x0 = that string. board.toml passes rd=md0, so the path apfs opens
-  # is /dev/md0, the RAMDisk, and NOT the eMMC volume's node: md0s39 is only the media's `BSD Name` property,
-  # the alias step 9 writes for bsd_init's RAMDEV-prefix test, and it is not the boot argument. The media arm
-  # at 0x567fb0c, with its matcher 0x5671c78 and the "/dev/%s" at 0x5671df0, is the arm this board does not
-  # take. Round132's notes had that backwards; the disassembly above is what reversed it, and it also explains
-  # why four rounds of editing the volume's mount state never moved mt=13.
-  # The driver therefore reproduces the choice instead of assuming it: it parses rd= itself, applies the same
-  # three-byte predicate, and opens "/dev/<rd>" when it holds and "/dev/<BSD Name>" otherwise -- so nd= on the
-  # screen names the arm as well as the node. It then calls vnode_open twice on the context apfs itself uses
-  # (vfs_context_current(), stored by container_load_with_callback's prologue at 0x56708e0), once with FREAD
-  # and once with FREAD|FWRITE, the two values `mov w8,#0x13; csinc w1,w8,wzr,ne` at 0x5670bb4 can put in w1.
-  # vr=/vw= are the two errnos, nd= is the path's own bytes, cr= is kauth_cred_getuid of that context's cred.
-  # Reading the frame: vw=13 catches the producer on the spot -- apfs's fmode is the writable one whenever its
-  # flag byte's bit 0 is clear -- and the next rung is then about rd= pointing at the RAMDisk, not about the
-  # volume; vr=2 means /dev holds no such node at all, and since v0.2.36 EL0's open("/dev/console") succeeds,
-  # devfs is really mounted and a 2 is about this node, not about the filesystem; vr=vw=0 says the same call
-  # passes on our thread and the 13 is something apfs decides for itself. rdb=/rda= draw the parsed boot arg so
-  # the derivation is measured rather than asserted. The mount call itself is untouched for the fifth round:
-  # same flags, same devvp, same data=0.
+  # What mt= actually is: container_rootmount reserves an errno out slot and both exits load it into w19;
+  # apfs_vfsop_mount's mode-0 arm returns that number verbatim. It is therefore propagated, not necessarily
+  # invented by apfs. The host census that once claimed one remaining foreign-return writer was wrong: the
+  # loader also stores nx_mount's return into the slot after its block-0 device read (0x5670e74-0x5670e80).
+  # The literal EACCES at 0x56c69c8 is on a different mode arm and is unreachable with data=0; the Image4
+  # hypothesis remains retracted as well.
+  #
+  # Round133 (v0.3.6) tested the old path-open theory and disproved the instrument rather than the errno.
+  # The photograph, after undoing two misplaced printf arguments, says rdFound=1, rdArg="md0",
+  # node="/dev/md0", openRead=2, openWrite=2, uid=0, mt=13, blocksRead=464, blocksWritten=0. Both path opens
+  # returned ENOENT, not EACCES. More decisively, container_load_with_callback skips its path vnode_open when
+  # devvp is non-null -- precisely this call's state -- so the probe never could have observed mt's producer.
+  # The claims "apfs opens /dev/md0 here" and "vnode_open is the only remaining writer" are withdrawn. rd=md0
+  # stays unchanged: changing it or manufacturing that node cannot repair an errno from an unexecuted path.
+  #
+  # The replacement host candidate follows the device read: nx_mount -> default devops -> _vnode_dev_read ->
+  # buf_getblk/VNOP_STRATEGY -> spec_strategy -> dkstrategy/dkreadwrite -> IOMedia::read. spec_strategy itself
+  # has no permission gate, and buf_biowait only returns b_error. IOMedia can complete kIOReturnNotOpen before
+  # calling CloverBlockDevice, and IOService::errnoFromReturn maps NotOpen, LockedRead, LockedWrite and
+  # NotReadable to EACCES; dkreadwritecompletion writes that errno into the buffer. This would explain mt=13
+  # with no increment in r=, but it is not yet the proven cause: bdevvp already does VNOP_OPEN(FREAD), so bd=0
+  # rules out the simplistic "the vnode was never opened" explanation.
+  #
+  # Round134 (v0.3.7) asks one question only after VFS_MOUNT has returned failure: does the exact same devvp
+  # independently return 13 for a 4 KiB vn_rdwr at offset zero? dr= is errno, db= actual bytes, dx=/dy= the
+  # first eight bytes; r=/w= are sampled after the read. The old rd/node/open probes are deleted, and the two
+  # block counters now occupy their actual format positions (round133's labels trailed their values by three
+  # slots: r= printed rdFound, vw= printed gBlocksRead). dr=13
+  # supports a persistent device-side refusal; dr=0 rules out that simple explanation and sends analysis to
+  # APFS's internal/container-reuse paths. A zero increment in r= alone does not prove no I/O, because the
+  # buffer cache can satisfy a read. The mount call itself remains unchanged: same flags, devvp and data=0.
   "clover-apfs=2",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the

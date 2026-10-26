@@ -8436,6 +8436,202 @@ trustcache 56 B（`c3ed2152…`），另附 `round133-SHA256SUMS`。`check-clove
 2. **ADT 加 `/chosen { root-snapshot-name = …; }`** —— 只有在 `mt=` 过了 13 之后才轮得到快照这一层。
 3. **`/filesystems { DoNotUseSEP; }` 与 `allow-root-hash-mismatch`** —— 同属认证类，同样往后排。
 
+## round133 读数（v0.3.6 实机，2026-10-26）：两次 open 都是 ENOENT —— 这一格问的根本不是本次挂载会走的路
+
+先把仪器自己的毛病交代掉：这一帧的**末段标签比参数表快四格**。格式串在 `k=…` 之后排的是
+`rd=%u g=%u x=0x%x y=0x%x r=%u w=%u rdb=%u …`，而参数表在这个位置给的是
+`read, bytes, word0, word1`（阶梯那四格，占了 `rd=/g=/x=/y=` 的标签），新探针的
+`rdFound, rdArg[0..3], node[0..3], openRead, openWrite, uid` 与两个块计数器只能从 `r=` 那格开始顺延。
+所以屏上那几行**不能按标签读**，必须按参数序还原。屏上打出的是：
+
+```
+r=1 w=3171437 rdb=0
+rda=0x0/0x0/0x7665642f/0x30646d2f
+nd=0x0/0x0/0x2/0x2 vr=0 vw=464 cr=0
+```
+
+按参数序无损还原之后的真实字段：
+
+| 字段 | 值 | 解出来 |
+| --- | --- | --- |
+| `rdFound` | 1 | `PE_parse_boot_argn("rd", …)` 命中 |
+| `rdArg[0..3]` | 0x0030646d / 0 / 0 / 0 | `"md0"` |
+| `node[0..3]` | 0x7665642f / 0x30646d2f / 0 / 0 | `"/dev/md0"` |
+| `openRead` | **2 = ENOENT** | FREAD 开不到 |
+| `openWrite` | **2 = ENOENT** | FREAD\|FWRITE 同样开不到 |
+| `uid` | 0 | root |
+| `gBlocksRead` | 464 | 屏上错显成 `vw=464` |
+| `gBlocksWritten` | 0 | |
+
+而 `mt=13 r=464` 与 round129–132 一样纹丝不动。这一格读法里写「`vr=2` ⇒ `/dev` 里没有这颗节点；
+若此时 `mt=` 仍是 13，则本格的路径推导与实测矛盾，先查推导，不要急着改 `rd=`」—— 现在正是这一条。
+
+**于是 round132 末尾那条「13 追到了一句 `vnode_open`」的推导正式撤回，两处都不成立：**
+
+1. **那句 `vnode_open` 本次根本不可达。** `container_load_with_callback` 里按路径 open 的那一臂，
+   前提是调用方没给它 devvp；我们走的是 `VFS_MOUNT(mp, devvp, 0, ctx)`，`bd=0` 意味着 `bdevvp()`
+   已经交出一颗真 vnode，加载器拿着它就走设备臂，不会再按 `/dev/%s` 去 open。所以 round133 复现的
+   那次 open 是**本次挂载不会执行的路径**，它的 `ENOENT` 与 `mt=13` 没有因果关系 ——
+   也说明 `vr=2` 不是「devfs 没造节点」，是根本没人需要这颗节点。
+   ⚠️ 顺带把上一节末尾候选 ①（「若 `vw=13` 就处理 `rd=` 那句谎」）一并作废：`vw` 真实值是 2，
+   不是 13，`rd=md0` 不需要为这 13 负责，`kernel_args` 保持原样。
+2. **「errno 槽只有一个外来返回值写手」也撤回。** 上一轮只查了 `bdevvp` 与
+   `container_load_with_callback`；这次把 `container_rootmount` 到 `nx_mount` 整条链上写 `[sp, #0x58]`
+   （保存下来的 errno 出参）的点全部列出来，`nx_mount` 返回之后就是其中之一。
+
+`bdevvp` 那条反证仍然有效，而且比之前更关键：`bsd/vfs/vfs_subr.c` 的 `bdevvp()` 自己就做了
+`VNOP_OPEN(nvp, FREAD, &context)`，并且失败是 panic 而不是静默 13 —— 所以「设备侧压根没打开」不成立，
+但**打开之后**的读取是另一回事。
+
+## round133 读数之后：errno 槽的另一个写手是 `nx_mount` 自己，13 的新候选是设备读路径
+
+宿主反汇编（`/tmp/cst/bin/python` + `/tmp/kdisasm.py`，`__PLK_TEXT_EXEC` vmaddr `0xFFFFFFF004920000`）
+落在这一处：
+
+```
+0xfffffff005670e74  bl  #0xfffffff005738928   ; nx_mount
+0xfffffff005670e78  mov x28, x0
+0xfffffff005670e7c  ldr x8, [sp, #0x58]
+0xfffffff005670e80  str w0, [x8]
+```
+
+`x8` 就是 `container_rootmount` 那个 errno 出参槽 —— **`nx_mount` 的返回值原样变成 `mt=`**。
+于是问题从「谁在授权层拒绝」变成「`nx_mount` 为什么要 13」，而它进门第一件事就是读块 0：
+
+```
+nx_mount
+  -> 默认设备操作表 +0x18
+  -> _vnode_dev_read
+  -> buf_getblk / VNOP_STRATEGY
+  -> spec_strategy
+  -> dkstrategy / dkreadwrite
+  -> IOMedia::read
+  -> provider / IOBlockStorageDriver
+  -> CloverBlockDevice::doAsyncReadWrite
+```
+
+这条链上每一环都不会自己发明权限错误，但有一处会把 IOKit 的返回码翻成 13。
+`spec_strategy`（`bsd/miscfs/specfs/spec_vnops.c`）没有权限门；`buf_biowait` 只回 buffer 里已有的
+`b_error`；而 `iokit/Kernel/IOService.cpp` 的 `errnoFromReturn` 里：
+
+```cpp
+case kIOReturnNotPermitted:   return EPERM;
+case kIOReturnNotPrivileged:  return EACCES;
+case kIOReturnExclusiveAccess:
+case kIOReturnLockedRead:
+case kIOReturnLockedWrite:
+case kIOReturnNotOpen:
+case kIOReturnNotReadable:    return EACCES;
+```
+
+`IOMediaBSDClient` 的 completion 正是用它把 IOReturn 写成 errno 再 `buf_seterror`，
+`IOMedia::read()` 里还有一条**根本不下到 provider** 的早退：
+
+```cpp
+if (_openLevel == kIOStorageAccessNone) { complete(completion, kIOReturnNotOpen); return; }
+```
+
+`NotOpen → EACCES(13) → dkreadwritecompletion → buf_biowait → _vnode_dev_read → nx_mount → mt=13`，
+这是目前唯一一条**既能产出 13、又能解释 `r=464` 四轮不涨**的链：`CloverBlockDevice::doAsyncReadWrite`
+只有真读了块才加 `gBlocksRead`，如果 `IOMedia` 在到达它之前就早退，块计数当然一动不动。
+
+同时把不成立的候选钉死：`0x56c69c8` 那句 `#0xd` 属于 `handle_crypto_mount` 的 mode≥4 臂，
+mode 0 的跳转表进不去；`nx_dev_init` 相关的直接错误值只有 12 与 22；`0x566b968` 只回 0 或 12。
+
+⚠️ 这条链**目前只是候选**，不是结论：`bdevvp` 已经 `VNOP_OPEN(FREAD)` 过，
+所以「`_openLevel` 为 None」需要有别的解释（比如它开的是媒体客户端的另一种 level，或者 apfs 在
+`nx_mount` 里用了另一个上下文）。这一点必须由实机读数决定，不能靠推导收工。
+
+## v0.3.7（round134）：撤掉路径仪器，挂载失败后用同一个 devvp 读 4 KiB
+
+**这一轮只问一个问题：`mt=` 失败之后，那颗已经交到 apfs 手上的 devvp 还能不能读出块。**
+
+做法上刻意保持「不改变被测量」：新增的读**只在 `VFS_MOUNT` 返回失败之后**执行，用的就是刚才传给
+`VFS_MOUNT` 的那一颗 `devvp`、同一次 `ctx` 的 `vfs_context_ucred(ctx)`，读 4 KiB 到
+`IOBufferMemoryDescriptor`。挂载调用本身一字未改（`flags=0`、同一个 devvp、同一个 vfsops）。
+
+```cpp
+report->mount = static_cast<uint32_t>(VFS_MOUNT(mp, devvp, 0, ctx));
+if (report->mount) {
+  OSSharedPtr<IOBufferMemoryDescriptor> device =
+      IOBufferMemoryDescriptor::withCapacity(kDeviceReadBytes, kIODirectionIn, true);
+  if (!device.get()) { fail("device-read-buffer", 0); }
+  int deviceResid = 0;
+  report->deviceRead = static_cast<uint32_t>(
+      vn_rdwr(kUIORead, devvp, device->getBytesNoCopy(),
+              static_cast<int>(kDeviceReadBytes), 0,
+              kUIOSysSpace, kIOUnit, vfs_context_ucred(ctx), &deviceResid, nullptr));
+  ...
+}
+```
+
+删掉的是 round133 那套已证伪的仪器：`PE_parse_boot_argn("rd", …)` 解析、`/dev/` 拼路径、
+两次 `vnode_open`/`vnode_close`、`kauth_cred_getuid`，以及随之不再需要的
+`vfs_context_current`/`vnode_open`/`vnode_close`/`kauth_cred_getuid` 声明与 `kFRead`/`kFWrite` 常量
+（`PE_parse_boot_argn` 保留 —— `clover-apfs` 这些真实功能还在用它）。
+**顺手修掉本轮开头那张帧暴露的错位**：`r=`/`w=` 两个块计数器现在排在新增字段之后，
+参数表与格式串一一对应，`dr=` 之后每格都能直接读。
+
+新字段：`dr=`（`vn_rdwr` 的返回，`65535` = 没走到这一步，即挂载成功或更早的档没到）、
+`db=`（实际读到的字节数，`4096 - resid`，夹在 0..4096）、
+`dx=`/`dy=`（读出内容的前两个 `le32`）。末行 **`@CloverBlock.cpp:1403`**。
+
+`dx=`/`dy=` **本轮不预设常量**：`dv=1:3` 是那颗 `AppleAPFSVolume` 的媒体，它的块 0 是卷的超级块，
+而容器的 `NXSB` magic 在偏移 `0x20` 而不是 0（`scripts/make-clover-apfs-container.py:45` 钉过这件事），
+所以前 8 个字节是 ablock 头一类的对象号/事务号，具体值取决于卷的状态。这两个字段的用途只有一个：
+**分辨「真读到了内容」与「拿到一块全零缓冲」** —— 任何非零都算读通了，`dr=0` 配全零才可疑。
+
+读法（`dr=` 是 errno）：
+
+- **`dr=13`** —— 同一个设备 vnode 在挂载之后仍然被持续拒绝：`mt=13` 是**设备侧**的，与授权层、
+  密封、快照无关。`db=0` 且 `dx=dy=0`（内容全空）＋ `r=` 不涨 ⇒ 支持「`IOMedia` 在到达
+  `CloverBlockDevice` 之前就早退」；`db=4096` 却 `dr=13` 则是另一回事（读成功但被改写）。
+- **`dr=0`（`db=4096`，`dx`/`dy` 非零）** —— 这条链当场断掉：设备读得通，
+  `13` 不是从块读取路径来的，得回到 `nx_mount` 内部或容器复用（`nx_mount` 会先找已存在的容器，
+  那里另有写槽）。`r=` 这一轮才可能第一次真正涨。
+- **`dr=6`（ENXIO）/ `dr=16`（EBUSY）/ `dr=2`（ENOENT）** —— 分别指向设备节点已失效、
+  媒体被别的客户端占着（`kIOReturnExclusiveAccess` 也映射 13，但 `dkreadwrite` 自己会先回 16）、
+  vnode 已回收。任何一种都比 13 好读，因为它们是明确的对象状态而不是权限。
+- **`dr=5`（EIO）** —— 卡/驱动真的答不上来，此时 `r=` 应当有变化，`CloverSdhci` 那侧接手。
+- 注意 `r=` 是在新读**之后**采样的，所以它包含这次 4 KiB 造成的实际媒体 I/O；
+  但**`r=` 不涨不能反过来证明没有读** —— buffer cache 可能命中（块 0 之前已被 `bdevvp`/挂载路径读过）。
+  本轮不预读，就是为了不把这笔账搅浑。
+
+**预算**：一次 4 KiB 读最多一块；`rd=md0`、`clover-apfs=2`、`clover-emmc=21`、
+`armcpu-clock-panic=180000` 全部原样。如果这轮死在定时器上而不是死在这行上，`elr=` 是那笔慢读，不是 bug。
+
+构建命令与上一轮相同（两个驱动都在 `[kernel] archives` 里，`kernel` 那格照旧不能省），本轮 `userdata`
+不重建 —— 镜像一个字节都没变：
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+产物归档在 `~/clover-out/round134-*`，`shasum -a 256 -c round134-SHA256SUMS` 七项全部 OK：
+`payload.img` 58,720,256 B（`d84480e6…`）、本地 `kernel.macho` `f60360af…`、卷内 `kernel.macho`
+51,994,624 B（`8ddbd3e0…`）、卷内 `unixnu.toml` 606 B（`6de8b37d…`）、ADT 13,268 B（`e1c29f6a…`）、
+`scratch-data.img` 35,888 B（`614b8356…`）、trustcache 56 B（`c3ed2152…`）。两个 checker 全绿：
+probe patch  localize 成 6680 B / 35 runs，CloverBlock 的 `r134` 身份串、
+`dr=%u db=%u dx=0x%x dy=0x%x r=%u w=%u`、`_vn_rdwr`、`_vfs_context_kernel` 全部在位，
+旧的 `rdb=`/`vr=`/`_vnode_open` 已从 checker 里删掉（防止仪器被静默换掉）。
+
+**刷写范围只有 `cache` 一个分区，没有新的 eMMC 分区写入**：`fastboot flash cache
+/Users/zhouzhou/clover-out/round134-payload.img`，然后 `fastboot reboot` 冷启动。
+
+下一格候选（等这一帧，排序按当前证据）：
+
+1. **`dr=13` ⇒ 把 `_openLevel` 量出来**：在驱动里对这颗媒体的 `IOMedia`/客户端对象问出它的
+   open level 与 owner，决定是「我们没开够」还是「apfs 用了另一个客户端」。
+2. **`dr=0` ⇒ 回到 `nx_mount` 内部**：它先查已存在的容器（`nx_mount` 的复用臂），那里的写槽是新的嫌疑；
+   此时才轮到 mode 1 对照（fixture 的普通 APFS 数据挂载用 mode 1 是成功的）。
+3. **ADT 加 `/chosen { root-snapshot-name = …; }`** 与
+   **`/filesystems { DoNotUseSEP; }` / `allow-root-hash-mismatch`** —— 依旧只在 `mt=` 过了之后才排队。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

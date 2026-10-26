@@ -131,21 +131,23 @@ def check_block(kernel: bytes) -> bool:
     import and no symbol: it works straight off measured offsets, so the only way to see that it asks
     its question is the flag and vfsops slots on its panic line. Round132 adds neither an import nor an
     offset: it reads four registry strings off the volume node and the container above it, so its
-    evidence is the identity keys in the string table and the seven volume fields on the same line. Any
-    of them going missing means the round silently asks nothing -- the failure shape check-clover.py
-    refuses to let the archives have."""
+    evidence is the identity keys in the string table and the seven volume fields on the same line.
+    Round133's path-open probe is gone: a non-null devvp makes that loader arm unreachable. Round134
+    reuses vn_rdwr after a failed mount to read the same devvp, so its identity and dr/db/dx/dy fields
+    must be in the line. Any of them going missing means the round silently asks nothing -- the failure
+    shape check-clover.py refuses to let the archives have."""
     label = "kernel.macho: CloverBlock linked"
     found = {name: name.encode() in kernel
-             for name in ("clover-apfs", "CloverBlock r133: apfs",
+             for name in ("clover-apfs", "CloverBlock r134: apfs",
                           "fl=0x%x fc=0x%x fk=0x%x", "op=0x%x:0x%x mm=0x%x:0x%x",
                           "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x",
-                          "rdb=%u rda=0x%x/0x%x/0x%x/0x%x", "vr=%u vw=%u cr=%u", "/dev/",
+                          "dr=%u db=%u dx=0x%x dy=0x%x r=%u w=%u",
                           "FullName", "Sealed",
                           "AppleAPFSContainerScheme", "AppleAPFSVolume",
                           "SystemVersion.plist", "_clover_emmc_block_window",
                           "_clover_emmc_block_userdata_window", "SHNGROOT", "EFI PART",
-                          "_clover_block_run", "_vnode_setmountedon", "_vnode_open", "_vnode_close",
-                          "_kauth_cred_getuid", "_vfs_context_current", "_PE_parse_boot_argn")}
+                          "_clover_block_run", "_vnode_setmountedon", "_vn_rdwr",
+                          "_vfs_context_kernel", "_PE_parse_boot_argn")}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
