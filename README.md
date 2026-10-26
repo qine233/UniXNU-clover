@@ -10517,6 +10517,58 @@ fastboot reboot
 这一帧只问一个问题：**把假名拿掉、让根授权真正执行之后，屏上读到的还是不是
 那句 “rootvp not authenticated after mounting”。**
 
+### 读数（2026-10-26 冷启动）
+
+答案是第 2 种：**审计接受了根，假名本来就不必要。** 屏上依次是
+
+```
+[clover] vfs_mountroot returned
+[clover] root_mount_authorization_request:d753: disk1s1 Root Volume, Root hash authorization is required
+[clover] devfs_kernel_mount returned
+[clover] siginit returned, exec'ing init
+load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+load_init_program: attempting to load /sbin/launchd
+clover-mac: label-check AMFI (Apple Mobile File Integrity) -> 1
+clover-mac: label-check Sandbox (Seatbelt sandbox policy) -> 1
+```
+
+`root_mount_authorization_request` 这句说明 `FSIOC_KERNEL_ROOTAUTH` 这次真的进了
+`bsd_init.c` 的审计块（r138–r149 的 `rd=md0s39` 会整块跳过它），而后面没有
+`rootvp not authenticated after mounting`：`vfs_devvp(root_mount)` 的
+`vnode_specrdev()` 落在 `gOsVolumeDev` 上，只读检查也通过。SIGINIT 之后
+launchd 被 exec，两个 MAC 标签检查都返回 1。
+
+墙没有后退，但这一帧第一次把墙量了出来（同一帧里 launchd 重试，一模一样的
+两遍）：
+
+```
+shared_region: 0xfffffe2da3f40fdf [1(launchd)] check_np(0x16f3ddb0) va_shared_region_start_address() failed
+clover r146: check err=12 start=0
+clover r146: cache err=2 size=0 mnt=0x0 rmnt=0x8c8ba2d95933a3e7 fl=0x0 rfl=0x14089821
+```
+
+- `check err=12` 是 `shared_region_check_np` 的 ENOMEM：共享区不存在，起点为 0。
+  dyld 在拿到空答案后就停了，下一行的 `map enter` 从未出现。
+- `cache err=2` 是 `vnode_lookup("/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e", …)`
+  的 ENOENT：`size=0`、`mnt=0x0`，路径没有落到任何挂载点上。
+- `rfl=0x14089821` 是根挂载的 `vfs_flags`，包含 `MNT_RDONLY`（0x1）和
+  `MNT_UNION`（0x20）——union 层在根挂载上，不是没挂上。`rmnt` 是
+  `VM_KERNEL_ADDRPERM` 过的指针（没开 `-show_pointers`），只有比较意义，不
+  是地址。
+
+同一帧还确认了 SystemOS 这一侧的形状：卷名
+`DawnUpdate21H461.J120J121J207J200SSystemCryptex`，UUID `8846FE78-2910-4297-AF97-0D9BB6FC16`，
+`disk3s1`、`1:6`、`p=96`，由 `init (pid 1)` 请求挂载并 `mount-complete`，
+`884608` 个 4 KiB 块、`unencrypted`、`features: 28.0`；OS 侧的卷名是
+`DawnUpdate21H461.J120J121J207J200S`（`disk1s1`）。也就是说 exec 路径、
+owner 查找、两窗口闩锁都按 r145 的设计走通了，剩下的唯一缺口是**名字查找**
+：`/System/Library/Caches/com.apple.dyld/…` 在这个 union 里看不见。
+
+这给了下一轮一个不用刷机的问题：**SystemOS 窗口里的那份 APFS 卷，自己带不带
+这条路径？** 宿主上直接读 `~/UniXNU/out/clover/userdata/userdata-root.img`
+第 6,079,643,648 字节起的 3,303,014,400 字节就能回答；带，说明 union 没把下层
+露出来（方向/时机）；不带，说明 dyld 缓存根本不在这个卷里，得去 Data 侧找。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自
