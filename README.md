@@ -7928,6 +7928,72 @@ dp=0x..:0x.. mt= st= rt= k=a/b/c/d rd= g= x=0x.. y=0x.. r= w=` 里新增的四�
 也就是 `MNT_ROOTFS`/`mnt_kern_flag` 那一族状态位，或者 apfs 需要先挂容器再挂卷；届时最省事的一步是先让探针把
 `mnt_data`（`mp+0x8f8`，挂载成功才会被文件系统填非 0）和 `vfc_flags` 画出来，而不是再猜一个 errno 的理由。
 
+## round130 读数（v0.3.3 实机）：结构体自己作了证，`mnt_devvp` 于是被排除
+
+```
+CloverBlock r130: apfs f=15797536 n=11870275 m=1 l=0 d=10 s=1 c=1
+v=1 dv=1:3 bd=0 al=0 t=0x73667061/0x0/0x0/0x0 on=0x2f fm=0x6b736964
+dp=0x?????????:0xa004dc30 mt=13 st=65535 rt=65535 k=65535/65535/65535/65535
+rd=65535 g=0 x=0x0 y=0x0 r=464 w=0 @CloverBlock.cpp:1137
+```
+
+`pages=0x3af7b free=0x3a25f`，`@CloverBlock.cpp:1137` —— 正是发布前算好的收尾行，所以这一帧确定是 round130 的负载。
+前八字段与 round128/129 一字不差（同一颗容器、同一颗卷、同一棵树）。`dp=` 的高 32 位在照片上糊了，低位是
+`0xa004dc30`；本轮的结论不依赖那半格，因为要读的是「非 0 与否」。
+
+三件事一次做完了：
+
+1. **dSYM 量出来的布局在这台机器上是对的。** `t=0x73667061/0x0/0x0/0x0`、`on=0x2f`、`fm=0x6b736964` —— 内核自己写进
+   这颗 `mount` 的三个标记全部落在量出来的字节上：`mp+0xd4` 拼出 `apfs`，`mp+0xe4` 是那个 `/`，`mp+0x4e4` 是 `disk`。
+   闸门因此放行，这是「让结构体自己作证」这一手第一次真的作成了证 —— 它同时也把 `dv=1:3` 从「某个被 BSD 客户端命名的
+   媒体」钉成了「这颗名字叫 `disk…` 的卷」。
+2. **`mnt_devvp` 这一档确实补上了。** `dp=` 非 0，是从 `mp+0x980` 读回来的值，不是我们手里的局部变量。
+3. **`mt=13` 一个字节都没变，`r=464` 也一个字节都没变。** apfs 拿到设备 vnode 之后，仍然在没有从卡上读一个新块的情况
+   下回了 EACCES。
+
+于是被排除的是本轮的假设本身：**apfs 不是因为 `mnt_devvp` 空着才拒这次挂载。** 这是能解释 13 的假设里被证伪的第二个
+（第一个是「卷被 sealed / 加密」和「凭据不是 root」，round129 之前就在宿主上用 `hdiutil` + `diskutil apfs list` 和
+`vfs_context0.vc_ucred` 排掉了）。剩下的候选全在参数与状态这一层 —— 因为零读盘意味着它连容器头都没去看：
+
+- `data` 传的是 0。真机上这颗文件系统是被 `mount_apfs()` 挂上来的，那里有一份 `apfs` 私有的挂载选项结构（卷的角色、
+  快照、钥匙串引用都在里面），我们什么都没给。
+- iOS 上 apfs 挂载要拿 keybag（即便卷是 no-protection 的），拿不到 `AppleKeyStore` 就是 EACCES，而且不读盘。
+- 顺序：可能要求先挂容器再挂卷，或者要求 `devvp` 是整盘/容器媒体而不是卷。
+- 状态位一族（`MNT_RDONLY|MNT_ROOTFS` 由 `vfs_rootmountalloc_internal()` 写好了，所以这条最弱）。
+
+**方法上的转折**：到这一帧为止，我们唯一没做过的事就是**去看那个回了 13 的函数**。前面三轮的问法都是「把内核的梯子
+抄全一点，看它会不会点头」，而它每轮只是把同一个 13 再画一次。下一步应该换成读它，而不是猜它 —— 而且这件事大部分可以
+在宿主上做，不花刷机：apfs.kext 的代码就在链接好的 `kernel.macho` 里（`nm` 里 67,964 个符号没有一个是它的内部函数，
+Apple 的 kernelcache 同样只剩 `kern_apfs_reflock_*` 这十个，所以内部符号是剥掉的），但 `struct mount` 里存着走到那个
+函数入口的路径，全部量得出：`mnt_op` 在 `mp+0x28`（`vfs_rootmountalloc_internal()` 在 `vfs_subr.c:1151` 就是照着
+`vfsp->vfc_vfsops` 填的），`struct vfsops` 大小 0xa0、**第一格就是 `vfs_mount`**（同一份 dSYM，63 份一致）。所以
+`op=*(mp+0x28)`、`mm=*op` 两个字画出来，就是「谁回了 13」的地址，回到宿主上直接反汇编那个函数。
+
+**同一份 dSYM 顺手量出的另外三格**（本轮没用到，是下一格的候选）：`mnt_flag` 在 `0x70`、`mnt_kern_flag` 在 `0x74`、
+`mnt_data` 在 `0x8f8`。`mnt_flag` 这一格值得单独说：`vfs_rootmountalloc_internal()` 在 :1153 写的是
+`MNT_RDONLY | MNT_ROOTFS`（`0x1 | 0x4000 = 0x4001`，`bsd/sys/mount.h:296` 与 :326），再 `|=` 上 vfstable 的可见标志。
+也就是说**我们这颗 mount 从分配的那一刻起就自称是根文件系统**，而这正是内核自己走 `vfs_mountroot()` 时才有的形状。
+
+**上游仓库里有一条现成的证据说这件事有分量**（本轮才发现，出处都是 UniXNU 主干，不是猜测）：
+`scripts/qemu-entry/native-apfs-mount.inc` 是一份**在 QEMU 里真挂成功过**的 apfs 数据挂载 —— 它走 `mount(2)`
+（`"apfs"`、挂载点、`MNT_RDONLY`、一份 0x150 字节的 `mount_apfs`），那份参数的形状在 :45-47 写得很清楚：
+`fspec` 在 0（一个 `/dev/disk…` 路径字符串）、`MNT_RDONLY` 在 8、**`mode` 在 0x10，`1` 是普通数据挂载，`0` 是「请求当启动根」**，
+`0x144/0x148` 是显式的 uid/gid 99。`scripts/check-native-apfs-file-checkpoints.py:115` 断言那次挂载的返回是
+`mount_results=(0,0,0,0,2)`（挂载 errno 0，走到了第 2 档），而 `:122` 记的是 `original_user_root_mount_mode_refused=True`
+—— **mode 0 那种「把我当根挂」的请求，apfs 是拒的**。`scripts/build-native-user-fixture.py:23` 的 `--apfs-mount-mode`
+只有 `(0,1)` 两个取值、默认 1，第 32 行还硬性要求做缓存探针时 mode 必须是 1。
+
+把这两边对上，本轮剩下的候选就排出了顺序，而且第一条便宜到可以立刻问：**我们交给 apfs 的那颗 `mount` 带着
+`MNT_ROOTFS`，而 `MNT_ROOTFS` 形状的唯一合法来源是 `vfs_mountroot()` 自己**。清掉这一位再挂一次，是同一个「结构体自己
+作证」的套路（`mnt_flag` 在 :1153 之后应该正好是 `0x4001 | vfc_flags`，期望值本身就是偏移正确的证明），一次刷机一个变量。
+
+顺带记一笔抄漏的差别：内核在 :1254 传给 `vfs_rootmountalloc_internal()` 的 devname 是字面量 `"root_device"`，
+不是 BSD 名；我们传的是 `"disk0s64"`（`fm=0x6b736964` 证的就是这一格真的写进去了）。这条不是本轮的假设，只是抄的时候
+和原作不一样的一处，画在这里免得以后当成别的证据读。
+
+**下一格按读数分支**（本轮的分支）：`mt=13` 且 `t=`/`on=`/`fm=` 全对 —— 走「读那个函数 + 清 `MNT_ROOTFS`」这条路，
+不再猜它。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

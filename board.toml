@@ -1694,6 +1694,32 @@ kernel_args = [
   #  third offset, and only after the mount returns 0. One flash, one question: does the device vnode
   #  change apfs's answer. mt= is the question, t=/fm=/dp= are the proof that the question was asked
   #  with the right struct under it.
+  # Round130's photograph: the proof held and the answer did not change.
+  # "CloverBlock r130: apfs f=15797536 n=11870275 m=1 l=0 d=10 s=1 c=1 v=1 dv=1:3 bd=0 al=0
+  #  t=0x73667061/0x0/0x0/0x0 on=0x2f fm=0x6b736964 dp=0x?????????:0xa004dc30 mt=13 st=65535 rt=65535
+  #  k=65535/65535/65535/65535 rd=65535 g=0 x=0x0 y=0x0 r=464 w=0 @CloverBlock.cpp:1137"
+  # (the high half of dp= is blurred in the photo; the reading is whether it is non-zero, and it is).
+  # All three marks the kernel writes itself landed on the measured bytes -- "apfs" at mp+0xd4, the
+  # single '/' at mp+0xe4, "disk" at mp+0x4e4 -- so the dSYM layout is right on this machine, the gate
+  # opened, and mp+0x980 holds a vnode that this file put there and read back. mt= is still 13 and r=
+  # is still 464: apfs took the device vnode and refused the mount without reading one new block,
+  # exactly as it did without it. That closes the rung. It is the second of the three explanations for
+  # 13 to be disproved (sealed/encrypted and a non-root credential went on the host before round129),
+  # and what is left is all parameter- and state-level, because zero reads means it never looked at
+  # the container: data=0 where mount_apfs() would pass apfs's private options blob, a keybag it
+  # cannot ask AppleKeyStore for, or a container-before-volume order. The next round stops copying
+  # the ladder and reads the function that answered: mnt_op is mp+0x28 (vfs_subr.c:1151 fills it
+  # from vfsp->vfc_vfsops) and struct vfsops is 0xa0 bytes with vfs_mount as its first slot -- so
+  # op=*(mp+0x28) and mm=*op name the function that returned 13, and that address disassembles on
+  # the host. The same dSYM pass gives mnt_flag 0x70, mnt_kern_flag 0x74 and mnt_data 0x8f8, and
+  # mnt_flag is where the cheapest remaining question is: vfs_rootmountalloc_internal() sets
+  # MNT_RDONLY|MNT_ROOTFS (:1153, 0x1|0x4000), so every mount this probe ever asks for declares
+  # itself a boot root. The base repository has a data mount that really worked --
+  # scripts/qemu-entry/native-apfs-mount.inc, mount("apfs", mp, MNT_RDONLY, args) over a 0x150-byte
+  # mount_apfs whose mode at +0x10 is 1 for a data mount and 0 to "request a boot root" -- and
+  # scripts/check-native-apfs-file-checkpoints.py records mount_results=(0,0,0,0,2) for mode 1 and
+  # original_user_root_mount_mode_refused=True for mode 0. Clearing MNT_ROOTFS and asking again is
+  # one variable, and the expected 0x4001|vfc_flags in mnt_flag is its own layout proof.
   "clover-apfs=2",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the
