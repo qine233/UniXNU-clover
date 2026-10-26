@@ -718,6 +718,34 @@ def check_board(errors: list) -> str:
             errors.append("CloverBlock.cpp's boot line has no deferred=1: the frame would not say "
                           "that only one window was published")
 
+    # Round146. r145's frame ends after two `shared_region: ... [1(launchd)] check_np(...)
+    # vm_shared_region_start_address() failed` lines: the root is up, SystemOS is union-mounted over
+    # "/" at exec, launchd passes the MAC checks, and the shared region is still empty. That frame
+    # cannot say whether the cache is visible through the union, whether dyld asked for the map next,
+    # or what the map answered. The board patch puts all five prints on the vm_unix.c path -- the
+    # namei check runs at the same moment dyld decides -- so a frame missing any of them silently
+    # asks less.
+    region = next((base / "patches/xnu-clover/zzy-clover-shared-region-why.patch"
+                   for base in (REPO, pathlib.Path.cwd())
+                   if (base / "patches/xnu-clover/zzy-clover-shared-region-why.patch").is_file()), None)
+    if region is None:
+        errors.append("patches/xnu-clover/zzy-clover-shared-region-why.patch is missing: without it "
+                      "the next frame again stops at the empty shared region with no map answer")
+    else:
+        text = region.read_text()
+        missing = [needle for needle in
+                   ("bsd/vm/vm_unix.c",
+                    "clover r146: check err=%d start=%llx",
+                    "clover r146: cache err=%d size=%lld mnt=%p rmnt=%p fl=0x%llx rfl=0x%llx",
+                    "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
+                    "clover r146: map enter files=%u maps=%u",
+                    "clover r146: map setup err=%d",
+                    "clover r146: map exit err=%d kr=0x%x")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"{region.name} lacks {needle!r}: that half of the shared-region question "
+                          "would come back blank")
+
     splash = [entry for entry in board.get("bootimg", {}).get("dtb_node", [])
               if "splash" in entry["path"]]
     if splash:

@@ -9910,6 +9910,115 @@ fastboot reboot
   IPSW 的 `StaticTrustCache` + `Cryptex1,SystemTrustCache` 原始模块），
   `trust_cache_sha256` 钉住合并后的整包。
 
+## v0.4.9（round146）：共享缓存那一问——可见吗、谁来挂的、内核怎么答
+
+r145 的帧把根的问题结掉了：根挂上了（`disk1s1`，UUID
+`04769D26-2CA0-4825-B443-E2E5F88300F2`），SystemOS 在 exec 时发布
+（`CloverBlock r145: system vu=8D4FE78D-… bsd=disk3s1`），owner 契约把它找了出来
+（`owner system disk3s1 dev=16777223`），`SystemCryptex` 由 init 挂上，launchd 的
+exec 过了两道 MAC（`label-check AMFI -> 1`、`Sandbox -> 1`）。然后帧里只剩两行
+
+```
+shared_region: … [1(launchd)] check_np(0x…) vm_shared_region_start_address() failed
+```
+
+没有 panic，也没有 `offline owner SystemOS mount failed`。这两行不是错误：共享区此刻
+是空的，`shared_region_check_np()` 就是在这条路上把 `ENOMEM` 交给 dyld 的——**空区是
+dyld 期待的第一种答案**，它接下来应该调 `_shared_region_map_and_slide()` 去挂共享缓存。
+帧到这里就没了，于是有三个可能挤在一起：缓存文件在 union 过的 `/` 下面根本看不见；
+dyld 看见了却没走到 map；或者走到了，内核在某个门里回了错，而那一行没被看见。
+这一轮只把这三个可能拆开，不加任何新机制。
+
+### 探针放在 `vm_unix.c`，不放在 `kern_exec.c`
+
+原本想在 owner mount 之后顺手问一次缓存路径，但那是 `kern_exec.c` 里
+`offline-owner-systemos-mount.patch` **新增块**的内部。构建脚本会先反向检查、
+再按名字顺序应用 `patches/xnu/*.patch`；往一个更早补丁的新增行里再插探针，
+那个补丁的 `git apply --reverse --check` 就不再原子，第一次 r146 构建正是这样
+在 `kern_exec.c:183` 失败的（详见提交信息）。所以这一轮的五个探针全部落在
+`bsd/vm/vm_unix.c`：这个文件只被本轮的新板级补丁
+`zzy-clover-shared-region-why.patch` 碰，不破坏任何既有补丁的反向检查。
+`zzy-clover-systemos-mount.patch` 因此保持 r143 的 25 行原样，一行未动。
+
+### 五个打印各自回答什么
+
+1. `clover r146: check err=%d start=%llx` —— `check_np` 的返回值。12（`ENOMEM`）
+   是「有共享区但空」，22（`EINVAL`）是「连共享区都没有」，0 且 `start` 非零则是
+   「已经挂好了」。r145 的两行对应 12。
+2. `clover r146: cache err=%d size=%lld mnt=%p rmnt=%p fl=0x%llx rfl=0x%llx` ——
+   在 dyld 做决定的**同一时刻**，用它将用的同一条绝对路径
+   `/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e` 做一次
+   `vnode_lookup()`，再取文件大小和它背后的挂载点。
+   - `err=0`、`size` 是几十 MB 量级 → 缓存透过 union 可见。
+   - `err=2`（`ENOENT`）→ 上层（OS 快照）没有这个文件，union 没把 SystemOS 的内容
+     叠上来，或者在错的位置上。
+   - `mnt == rmnt` 且 `fl & 0x21 == 0x21` → 文件确实来自叠在 `/` 上的那次
+     `MNT_RDONLY|MNT_UNION`（`MNT_RDONLY=0x1`、`MNT_UNION=0x20`，
+     `bsd/sys/mount.h`），也就是 sheng 想要的形状。
+   - `mnt != rmnt` → 名字解析落在了 SystemOS 自己的挂载点上，不是 `/` 的那一层；
+     非 CSR 的 `srfmp->vp->v_mount != rdir_vp->v_mount` 门随后会拒绝它
+     （`bsd/vm/vm_unix.c` 里那句 trace 是 `not on process' root volume nor preboot
+     volume`），除非 owner carrier 判定通过。
+3. `clover r146: map enter files=%u maps=%u` —— dyld 是否真的跟进了 map 调用。
+   它不出现，说明 dyld 在 `check_np` 之后改走了 `mmap()` 路径或直接放弃，
+   下一轮该查 dyld 的分支选择，而不是内核的门。
+4. `clover r146: map setup err=%d` —— setup 的 errno。此时它上面那行
+   `SHARED_REGION_TRACE_ERROR` 会指出是哪道门（`shared_region_trace_level`
+   默认就是 error 级，`osfmk/vm/vm_shared_region.c:140`），常见的是 1（`EPERM`，
+   「不在进程根卷也不在 preboot 卷」或 `scdir` 目录门）和 22（`EINVAL`，参数形状
+   不对）。本打印只把 errno 钉在行上，省得从 trace 的措辞倒推。
+5. `clover r146: map exit err=%d kr=0x%x` —— map 的最终结果。
+   `err=0 kr=0` 表示缓存已映射、共享区不再为空，墙已经移到这次调用之后
+   （下一个要问的就是 dyld 在那之后停在哪）；非零时 `kr` 是 `vm_shared_region_map_file()`
+   的原始 `kern_return_t`，和 errno 的换算关系在同一函数里（`KERN_NO_SPACE` → 12 等）。
+
+### 构建、校验与本轮该刷哪一格
+
+```
+# 只有内核补丁变了；payload 仍要重建，因为它在卷内放一份改过的内核
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+两个 checker 都增加了本轮契约：`check-clover.py` 要求板级补丁包含五个
+`clover r146:` 串，`verify-clover-payload.py` 在卷内 `kernel.macho` 里逐条找五个
+格式串（`kernel.macho: shared-region probe linked OK`），少一条就 FAIL——否则那一半
+问题会以「没有输出」的形式回来。
+
+产物归档在 `~/clover-out/round146-*`，`shasum -a 256 -c round146-SHA256SUMS` 七项全 OK：
+`payload.img` 58,720,256 B（`dc0285b5…`）、本地 `kernel.macho` 51,998,720 B（`a9197a0e…`）、
+卷内 `kernel.macho`（`e39ec24a…`，与本地只差 entry 探针补丁）、卷内 `unixnu.toml` 608 B
+（`3c43e756…`，args 与 r145 逐字相同，只有 title 换成 r146）、ADT 13,516 B
+（`ce429eb9…`；其中 `chosen/random-seed` 每次构建随机，其余属性未变）、
+`scratch-data.img` 35,888 B（`614b8356…`，未变）、trustcache 61,408 B
+（`7c369ce0…`，未变）。**本轮没有新的 eMMC 分区写入**，刷写范围仍然只有 `cache`。
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round146-payload.img
+fastboot reboot
+```
+
+菜单第一行应当是 `clover r146: ask the shared cache what it answered`，
+冷启动（不要 `fastboot boot`）。
+
+这一帧只问一个问题：**空共享区之后，dyld 看到的缓存文件是谁挂的，它有没有去 map，
+内核怎么答。**
+
+1. **`cache err=0`、`mnt == rmnt`、`fl` 带 `0x21`，且出现 `map enter`** ——
+   union 是对的，问题在 map 的门或参数；按 `map setup err` / `map exit err` 的数值
+   对照上面的表，下一轮直接修那一处。
+2. **`cache err=2` 或 `mnt != rmnt`** —— 共享缓存在 `/` 下面不可见（或来自错误的挂载点），
+   SystemOS 的 union 还没覆盖到 `System/Library/Caches`；下一轮查 union 的层次与
+   目录门的授权，不再碰 dyld。
+3. **`cache err=0` 但只有 `check` 行、没有 `map enter`** —— 内核这边缓存是好的，
+   是 dyld 在空区之后没走 map；下一轮转到 dyld 的共享缓存选择逻辑。
+4. **`map exit err=0 kr=0`** —— 缓存已映射，r145 的墙过去了；下一帧要问的是 dyld
+   在拿到共享区之后停在哪，这一轮的五个打印就不再是主线。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

@@ -1,0 +1,70 @@
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+index dcebcb8..214f0e5 100644
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -2185,6 +2185,36 @@ shared_region_check_np(
+ 		proc_getpid(p), p->p_comm,
+ 		(uint64_t)uap->start_address, (uint64_t)start_address, error));
+ 
++	/* clover r146: error 12 (ENOMEM) is the empty-region answer dyld acts on. */
++	printf("clover r146: check err=%d start=%llx\n",
++	    error, (uint64_t)start_address);
++
++	{
++		/*
++		 * clover r146: the moment dyld decides whether to map, ask the same
++		 * namei it will use whether the cache is there and whose mount backs it.
++		 * A union over "/" should give cache mount == root mount, MNT_UNION set.
++		 */
++		vnode_t cache_vp = NULLVP;
++		off_t cache_size = 0;
++		int cache_lookup = vnode_lookup(
++		    "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
++		    0, &cache_vp, vfs_context_current());
++		struct mount *cache_mount = cache_vp != NULLVP ? cache_vp->v_mount : NULL;
++		struct mount *root_mount = rootvnode != NULL ? rootvnode->v_mount : NULL;
++		uint64_t cache_flags = cache_mount ? vfs_flags(cache_mount) : (uint64_t)0;
++		if (cache_vp != NULLVP) {
++			(void)vnode_size(cache_vp, &cache_size, vfs_context_current());
++			vnode_put(cache_vp);
++		}
++		printf("clover r146: cache err=%d size=%lld mnt=%p rmnt=%p fl=0x%llx rfl=0x%llx\n",
++		    cache_lookup, (long long)cache_size,
++		    cache_mount ? (void *)VM_KERNEL_ADDRPERM(cache_mount) : NULL,
++		    root_mount ? (void *)VM_KERNEL_ADDRPERM(root_mount) : NULL,
++		    cache_flags,
++		    root_mount ? vfs_flags(root_mount) : (uint64_t)0);
++	}
++
+ 	return error;
+ }
+ 
+@@ -2794,6 +2824,9 @@ _shared_region_map_and_slide(
+ 	struct vnode                    *rdir_vp = NULL;
+ 	struct vm_shared_region         *shared_region = NULL;
+ 
++	/* clover r146: does dyld follow the empty-region answer with a map request? */
++	printf("clover r146: map enter files=%u maps=%u\n", files_count, mappings_count);
++
+ 	/*
+ 	 * Get a reference to the current proc's root dir.
+ 	 * Need this to prevent racing with chroot.
+@@ -2814,6 +2847,8 @@ _shared_region_map_and_slide(
+ 	    files, mappings_count, mappings,
+ 	    &sr_file_mappings, &shared_region, rdir_vp);
+ 	if (error != 0) {
++		/* clover r146: the setup trace above names the gate; this names the code. */
++		printf("clover r146: map setup err=%d\n", error);
+ 		vnode_put(rdir_vp);
+ 		return error;
+ 	}
+@@ -2863,6 +2898,9 @@ _shared_region_map_and_slide(
+ 		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		proc_getpid(p), p->p_comm));
+ 
++	/* clover r146: 0 here means the cache is mapped and the wall is past this call. */
++	printf("clover r146: map exit err=%d kr=0x%x\n", error, kr);
++
+ 	return error;
+ }
+ 

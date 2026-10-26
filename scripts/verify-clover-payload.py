@@ -237,6 +237,29 @@ def check_root_mount_probe(kernel: bytes) -> bool:
     return ok
 
 
+def check_shared_region_probe(kernel: bytes) -> bool:
+    """Round146 asks what the dyld shared-cache path answered after r145's empty-region check.
+    The probes live in vm_unix.c: the check's answer, a namei of the cache taken at that same
+    moment (the file's size and the mounts behind it, which is how a union over "/" shows up),
+    the map call's entry, its setup error, and its final errno. None of them adds a symbol, so
+    the image's only evidence is these five format strings; losing one turns that part of the
+    question back into silence."""
+    label = "kernel.macho: shared-region probe linked"
+    found = {name: name.encode() in kernel
+             for name in ("clover r146: check err=%d start=%llx\n",
+                          "clover r146: cache err=%d size=%lld mnt=%p rmnt=%p"
+                          " fl=0x%llx rfl=0x%llx\n",
+                          "clover r146: map enter files=%u maps=%u\n",
+                          "clover r146: map setup err=%d\n",
+                          "clover r146: map exit err=%d kr=0x%x\n")}
+    ok = all(found.values())
+    detail = ", ".join(f"{(name.split(':', 1)[1] if ':' in name else name).strip()[:28]}"
+                       f" {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def report(image: pathlib.Path) -> int:
     print(f"== {image}")
     ok = True
@@ -309,6 +332,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_block(kernel)
         ok &= check_owner_mount(kernel)
         ok &= check_root_mount_probe(kernel)
+        ok &= check_shared_region_probe(kernel)
         ok &= check_mac_probe(kernel)
     return 0 if ok else 1
 
