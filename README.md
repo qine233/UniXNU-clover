@@ -10163,6 +10163,161 @@ fastboot reboot
    下一轮该查 UEFI 侧的 PSCI conduit（`psci-method smc` 已在 ADT 里），
    而不是内核。
 
+## v0.5.1（round148）：分号不是分隔符——汇编器把每条 asm 的后半句当注释吃掉了
+
+r147 刷进去之后，第一帧就是死线 panic，但它出现在**第一个** timer tick 上：
+
+```
+clover r147: unattended deadline 180 s (elr=fffffff007968c84 spsr=fffffff208a69d50
+ ticks=1 cnt0=124f800 cnt1=fffffff5eeea86f8 freq=124f800) @ArmCpu.cpp:544
+```
+
+数字自己就打架：`cnt0` 恰好等于 `freq`（`0x124f800` = 19,200,000 = 1 秒的
+计数），`cnt1 - cnt0` 按无符号是天文数字、按有符号读是 −15.9 秒，`spsr` 也
+不是一个合法的 PSTATE（`0x600003c5` 那一类）。算术没有错——**读寄存器的那几条
+指令根本不在二进制里**。
+
+### 反汇编怎么说
+
+`round147-kernel.macho` 的 `ArmCpu::interrupt`（`0xfffffff007969718`）：
+
+```
+969828: mrs  x8, CNTFRQ_EL0
+969834: str  x8, [gTickCounterFrequency]
+969838: isb
+96983c: str  x8, [gTick0Counter]        ; 这里本该是 mrs x8, CNTVCT_EL0
+...
+969888: isb
+96988c: ldp  x10, x8, [gTick0Counter]   ; freq 与 cnt0
+969890: sub  x8, x2, x8                 ; now 用的是 x2：函数入口的第三个参数
+```
+
+函数入口也少一条：`mrs x9, ELR_EL1` 在，紧跟的 `mrs x8, SPSR_EL1` 不在，
+`entrySpsr` 存进去的是未初始化的 x8。整个 `ArmCpu::interrupt` 里
+`MRS <Xt>, SPSR_EL1` 的编码一条都没有（镜像里另有一条在 xnu 自己的异常码
+里，位置 0x3e64e0，与本函数无关，也是整镜像计数不可用的原因）。
+
+### 根因：Darwin arm64 的 `;` 是注释
+
+clang 把内联汇编的字符串原样交给汇编器，而 **Darwin 的 arm64 汇编器用 `;`
+作注释起始符**（GNU/ELF 用 `//`）。于是
+
+```c
+__asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (value));
+```
+
+只汇编了 `isb`：`mrs` 连同它的输出约束一起落进注释，编译器不报错，`value`
+只是一个没被写过的寄存器。本机最小复现（Xcode clang，`-O2`）：
+
+| 写法 | 反汇编 |
+| --- | --- |
+| `"isb; mrs %0, cntvct_el0"` | `isb` |
+| `"isb\n\tmrs %0, cntvct_el0"` | `isb`，`mrs x8, CNTVCT_EL0` |
+| `"mrs %0, elr_el1; mrs %1, spsr_el1"` | `mrs x8, ELR_EL1` |
+| `"mrs %0, elr_el1\n\tmrs %1, spsr_el1"` | `mrs x8, ELR_EL1`，`mrs x9, SPSR_EL1` |
+
+### 影响面：不止看门狗
+
+内核（Darwin 目标）里一共 20 条这样的字符串，全在 `ArmCpu.cpp`。按后果排：
+
+| 位置 | 原意 | 实际执行 |
+| --- | --- | --- |
+| `counter()` | 读 CNTVCT | 只有 `isb` |
+| `interrupt()` 入口 | 读 ELR + SPSR | 只有 `mrs elr` |
+| `signalCPU()` | `dsb ishst; msr icc_sgi1r_el1` | 只有 `dsb ishst`——**SGI 从未发出** |
+| `armcpu_sgi_selfprobe()` | `mrs daif; msr daifset, #2` | 只有 `mrs`——中断没关 |
+| `waitClear()`、GIC 的三处屏障 | 操作后 `isb`/`dsb sy` | 顺序不完整 |
+
+panic 屏里也有 3 处同样的半角分号写法，但它不是内核的一部分：`assemble_c()`
+用 `--target=aarch64-none-elf` 编译它，ELF 汇编器把 `;` 当**语句分隔符**，
+所以那 3 处（`reset_after` 的等待、`mapped()`/`readable()` 的 PAR 读取）一直
+是好的，r147 的 panic 屏也确实正常画出帧、正常等满 20 秒。这一轮仍把它们统一
+成 `\n\t`（两种汇编器都接受），但**不算故障**。同一条源码换一个目标就换一套
+注释规则，这正是这轮最值得记住的一点。
+
+「`fb=0`、复位后还是回到 payload」也在这里：死线在第一个 tick 就到了，
+CloverPMGR 还没跑，`_clover_fastboot_reason` 尚未发布，panic 屏走「没有单元」
+的路径，做的是普通复位，XBL 于是又启动了同一个 payload。屏本身工作正常，
+缺的是它要写的那个单元。
+
+`@ArmCpu.cpp:544` 这个行号与源码里的 642 不符，但反汇编与当前源码逐条吻合
+（ruler、比较、panic 的七个参数），所以编译的就是这份源码；行号怎么来的另说，
+不该从它推结论。
+
+### 这一轮改了什么
+
+- `ArmCpu.cpp` 的 20 处全部改成 `\n\t` 分隔；panic 屏 3 处顺手统一（本就没坏）；
+  身份串、菜单标题、panic 文案升到 `r148`。
+- `scripts/check-clover.py` 新增 `check_inline_asm`：扫 `drivers/**` 的每条内联
+  汇编，字符串里只要还有 `;` 就报错并写明原因。只扫 `drivers/` 是因为
+  `scripts/xnu-panic-screen.c` 走 ELF 目标，不该被这条规则误伤。现在输出
+  `75 inline asm statements separated`。
+- `scripts/verify-clover-payload.py` 新增 `check_inline_asm_tails`：从 Mach-O
+  符号表定位 `ArmCpu::interrupt` 与 `ArmCpu::signalCPU`，在各自函数体内数编码：
+  `MRS <Xt>, SPSR_EL1`（`0xd5384000｜Rt`）、`MRS <Xt>, CNTVCT_EL0`
+  （`0xd53be040｜Rt`）、`MSR ICC_SGI1R_EL1, <Xt>`（`0xd518cba0｜Rt`）。字符串
+  证明不了指令真的在，编码能；整镜像计数又会被 xnu 自带的同类指令凑够，所以
+  必须按符号限定范围。r147 的旧镜像是 0/0/0，FAIL；这一轮是 1/2/1，OK。
+- 旁支也一并修好：IPI 现在会真的发出去、DAIF 会真的关、`waitClear` 的超时
+  真的按 CNTFRQ 的 10% 计。这些过去都是「写了但没执行」——这一帧如果出现
+  从未见过的现象，先查这里。
+
+### 下一帧该看到什么
+
+死线仍然只在「180 秒没有进展」时出现，但这一次数字要能自证：
+
+- `ticks=` 是这 180 秒里收到的 timer 中断次数；
+- `cnt1 - cnt0` ≈ 180 × `0x124f800` = `0xCDFE6000` 左右，且 `cnt1 > cnt0`；
+- `spsr` 是 `0x600003c5` 一类合法的 PSTATE，不再像内核指针；
+- `fb=1`（IMEM 在启动早期已由 CloverSdhci 写好），20 秒后复位进 fastboot；
+- 宿主 `run-clover-unattended.sh` 接住设备、请求 recovery、读 logfs。
+
+如果 180 秒内没有 hang，那就什么都不会发生——这本身也是答案：误触发没了。
+`elr=` 在那种情况下不出现，比出现一个假死线更有信息量。
+
+### 本轮产物与自检
+
+构建 `~/clover-out/round148-build.log`，退出码 0。两个 checker：
+
+```
+[check-clover] clover ok: ADT 13516 bytes, 8 cores; splash 0x9d400000-0x9f800000,
+FD 0x9fc00000-0x9ff00000; board clover_defconfig, CLOVERESP;
+75 inline asm statements separated; modules visible
+kernel.macho: asm tails survived the assembler OK
+(mrs SPSR_EL1 in interrupt 1, mrs CNTVCT_EL0 in interrupt 2, msr ICC_SGI1R_EL1 in signalCPU 1)
+```
+
+反向对照（同一命令跑 r147 的旧卷）是 `FAIL (… in interrupt 0, … in interrupt 0,
+… in signalCPU 0)`，说明这条检查真的会抓住这个 bug，而不是恒绿。
+
+产物在 `~/clover-out/round148-*`，`shasum -a 256 -c round148-SHA256SUMS`
+七项全 OK：`payload.img` 58,720,256 B（`b6864724…`）、本地 `kernel.macho`
+51,998,720 B（`98571fab…`）、卷内 `kernel.macho`（`2db8a3fd…`，与本地只差
+entry 探针补丁，6,838 字节、35 段）、卷内 `unixnu.toml` 605 B（`1fbb3ef8…`，
+args 仍是 `clover-unattended=180`）、ADT 13,516 B（`9f64dbb1…`；
+`chosen/random-seed` 每次构建随机，其余未变）、`scratch-data.img` 35,888 B
+（`614b8356…`，未变）、trustcache 61,408 B（`7c369ce0…`，未变）。
+
+**本轮有一处 eMMC 写入，需要同意：**
+
+刷 payload 到 `cache`（与之前每一轮相同，手动执行，只覆盖 `cache` 这一格）：
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round148-payload.img
+fastboot reboot
+```
+
+宿主脚本里的 `fastboot reboot recovery` 可能写 `misc` 的 BCB，只有带上
+`--allow-misc-bcb` 才会发；不带就退出 3，一个字节都不写。
+
+菜单第一行应当是 `clover r148: the deadline waits 180 s, not one tick`，
+冷启动（不要 `fastboot boot`）。
+
+这一帧仍然只问一个问题：**这块板子能不能在没人碰它的时候把 panic 变成一次
+可读的复位，并让宿主在 fastboot 里接住它。** 与 r147 不同的是，这次的窗口
+不是第一个 tick，而是真的 180 秒；若屏上再次出现死线 panic，`cnt1-cnt0`
+和 `spsr` 必须自洽。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

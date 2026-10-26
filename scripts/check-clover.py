@@ -746,7 +746,15 @@ def check_board(errors: list) -> str:
             errors.append(f"{region.name} lacks {needle!r}: that half of the shared-region question "
                           "would come back blank")
 
-    # Round147. Every previous round ended in a state the host had to look at: a panic screen that
+    # Round148. Round147 shipped an unattended deadline that fired on the very first timer tick, with
+    # a garbage counter in the message. The cause was not the arithmetic: the Darwin arm64 assembler
+    # reads `;` as the comment character, so every multi-instruction asm string kept only its first
+    # instruction -- the CNTVCT read, the SPSR_EL1 read, the IPI send, the PAR_EL1 read and the
+    # panic screen's CNTPCT wait were all silently dropped. This round separates those sequences
+    # with newlines and makes check_inline_asm keep them that way. Round147's contract, meanwhile,
+    # still has to hold: an emergency exit the host can find on its own.
+    #
+    # Every previous round ended in a state the host had to look at: a panic screen that
     # parks, a tick-count watchdog, and no way back in without a hand on the tablet. The unattended
     # contract makes the board answer by itself: ArmCpu turns clover-unattended=<seconds> into a
     # CNTVCT deadline, CloverSdhci marks IMEM's restart-reason cell at boot and publishes it to the
@@ -761,8 +769,8 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: round147 replaces "
                       "the tick count with the wall-clock deadline, and two deadlines would race")
-    if not board["payload"]["title"].startswith("clover r147:"):
-        errors.append('[payload] title is not "clover r147: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r148:"):
+        errors.append('[payload] title is not "clover r148: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",
@@ -781,7 +789,7 @@ def check_board(errors: list) -> str:
          'PE_parse_boot_argn ("clover-unattended"',
          "the driver would never arm from the round's own boot argument"),
         ("drivers/CloverSdhci/CloverSdhci.cpp",
-         'IOLog ("clover r147: unattended mark %x -> %x deadline=%us\\n"',
+         'IOLog ("clover r148: unattended mark %x -> %x deadline=%us\\n"',
          "a boot would not say on the panel that the mark was accepted"),
         ("drivers/CloverSdhci/CloverSdhci.cpp",
          "clover_fastboot_reason = cell;",
@@ -793,8 +801,25 @@ def check_board(errors: list) -> str:
          'PE_parse_boot_argn ("clover-unattended", &unattended, sizeof (unattended));',
          "the watchdog would not see the round's deadline argument"),
         ("drivers/ArmCpu/ArmCpu.cpp",
-         "clover r147: unattended deadline %llu s",
+         "clover r148: unattended deadline %llu s",
          "the deadline panic would be indistinguishable from the old tick watchdog"),
+        ("drivers/ArmCpu/ArmCpu.cpp",
+         '"isb\\n\\tmrs %0, cntvct_el0"',
+         "the counter read is what a semicolon swallowed; it must stay on its own line"),
+        ("drivers/ArmCpu/ArmCpu.cpp",
+         '"mrs %0, elr_el1\\n\\tmrs %1, spsr_el1"',
+         "the interrupted mode is what a semicolon swallowed"),
+        ("drivers/ArmCpu/ArmCpu.cpp",
+         '"dsb ishst\\n\\tmsr icc_sgi1r_el1, %0\\n\\tisb"',
+         "the IPI send is what a semicolon swallowed"),
+        ("scripts/xnu-panic-screen.c",
+         '"isb\\n\\tmrs %0, cntpct_el0"',
+         "the 20 s wait must read CNTPCT; this file's ELF assembler always kept it, "
+         "so it was never round147's fault"),
+        ("scripts/xnu-panic-screen.c",
+         '"at s1e1w, %1\\n\\tisb\\n\\tmrs %0, par_el1"',
+         "mapped() must read PAR_EL1 after the translation; kept as one statement, "
+         "not as the semicolon form that only Darwin would cut"),
         ("scripts/xnu-panic-screen.c",
          "#define FASTBOOT_WORD 0x77665501u",
          "the screen would mark the cell with something XBL does not read as fastboot"),
@@ -888,6 +913,47 @@ def check_board(errors: list) -> str:
     return f"{defconfig_name}, {volume}"
 
 
+def check_inline_asm(errors: list) -> str:
+    """Inline asm on this target must not use `;` as an instruction separator.
+
+    The Darwin arm64 assembler reads `;` as the comment character, so
+    "isb; mrs %0, cntvct_el0" assembles to just `isb` and the counter read is
+    silently gone.  Round147 shipped 20 such sequences in ArmCpu.cpp; that is why
+    its deadline fired on the first tick with a garbage counter.  Sequences have
+    to be separated by newlines.  Only drivers/ is scanned: those sources are
+    built for Darwin.  scripts/xnu-panic-screen.c is built for
+    aarch64-none-elf, whose assembler treats `;` as a statement separator, so
+    its sequences never lost an instruction and it must not be flagged here.
+    """
+    root = pathlib.Path(REPO / "drivers")
+    sources = sorted(root.rglob("*.cpp")) + sorted(root.rglob("*.h"))
+    start = re.compile(r"\b(__asm__|asm)\s*(volatile\s*)?\(")
+    literal = re.compile(r'"((?:[^"\\]|\\.)*)"')
+    statements = 0
+    for path in sources:
+        lines = path.read_text(errors="replace").splitlines()
+        index = 0
+        while index < len(lines):
+            if not start.search(lines[index]):
+                index += 1
+                continue
+            end, block = index, ""
+            while end < len(lines) and end < index + 12:
+                block += lines[end] + "\n"
+                if ");" in lines[end]:
+                    break
+                end += 1
+            statements += 1
+            for text in literal.findall(block):
+                if ";" in text:
+                    errors.append(
+                        f"{path.relative_to(REPO)}:{index + 1}: inline asm keeps ';' inside "
+                        f"\"{text}\": this assembler reads it as a comment, so every instruction "
+                        "after it is dropped; separate the sequence with \\n")
+            index = end + 1
+    return f"{statements} inline asm statements separated"
+
+
 def check_tree(errors: list) -> str:
     """The kernel and firmware steps expect these modules in the assembled tree.
 
@@ -915,13 +981,14 @@ def main() -> int:
     adt_summary = check_adt(errors)
     region_summary = check_regions(errors)
     board_summary = check_board(errors)
+    asm_summary = check_inline_asm(errors)
     tree_summary = check_tree(errors)
     for error in errors:
         print(f"[check-clover] {error}", file=sys.stderr)
     if errors:
         return 1
     print(f"[check-clover] clover ok: ADT {adt_summary}; {region_summary}; "
-          f"board {board_summary}; {tree_summary}")
+          f"board {board_summary}; {asm_summary}; {tree_summary}")
     return 0
 
 

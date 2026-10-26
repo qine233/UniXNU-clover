@@ -3836,7 +3836,7 @@ extern "C" void clover_unattended_begin (void)
   }
   const uintptr_t base = mapRange (gImemMap, kImemPhys, kImemSize);
   if (!base) {
-    IOLog ("clover r147: unattended imem map failed %llx\n",
+    IOLog ("clover r148: unattended imem map failed %llx\n",
            static_cast<unsigned long long> (kImemPhys));
     return;
   }
@@ -3846,11 +3846,11 @@ extern "C" void clover_unattended_begin (void)
   const uint32_t readback = cell[0];
   if (readback != kRestartFastboot) {
     // A cell that does not hold the word is not a cell the panic screen should write either.
-    IOLog ("clover r147: unattended mark %x read back %x\n", kRestartFastboot, readback);
+    IOLog ("clover r148: unattended mark %x read back %x\n", kRestartFastboot, readback);
     return;
   }
   clover_fastboot_reason = cell;
-  IOLog ("clover r147: unattended mark %x -> %x deadline=%us\n",
+  IOLog ("clover r148: unattended mark %x -> %x deadline=%us\n",
          kRestartFastboot, readback, seconds);
 }
 

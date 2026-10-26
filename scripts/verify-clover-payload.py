@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import struct
 import subprocess
 import sys
 
@@ -260,6 +261,84 @@ def check_shared_region_probe(kernel: bytes) -> bool:
     return ok
 
 
+def macho_symbols(kernel: bytes) -> tuple[list[tuple[str, int, int, int, int]], dict[str, int]]:
+    """(segments, symbols): segments as (name, vmaddr, vmsize, fileoff, filesize), symbols as name -> va."""
+    ncmds = struct.unpack_from("<I", kernel, 16)[0]
+    offset = 32
+    segments = []
+    table = None
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from("<II", kernel, offset)
+        if cmd == 0x19 and size >= 72:
+            name = kernel[offset + 8:offset + 24].rstrip(b"\0").decode(errors="replace")
+            vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", kernel, offset + 24)
+            segments.append((name, vmaddr, vmsize, fileoff, filesize))
+        elif cmd == 0x2:
+            table = struct.unpack_from("<IIII", kernel, offset + 8)
+        offset += size
+    symbols: dict[str, int] = {}
+    if table is not None:
+        symoff, nsyms, stroff, _ = table
+        for i in range(nsyms):
+            base = symoff + 16 * i
+            strx, _, _, _ = struct.unpack_from("<IBBh", kernel, base)
+            va = struct.unpack_from("<Q", kernel, base + 8)[0]
+            if not strx or not va:
+                continue
+            end = kernel.index(b"\0", stroff + strx)
+            symbols.setdefault(kernel[stroff + strx:end].decode(errors="replace"), va)
+    return segments, symbols
+
+
+def check_inline_asm_tails(kernel: bytes) -> bool:
+    """Round148: the assembler was cutting every inline asm at its first `;`.
+
+    Darwin's arm64 assembler reads `;` as the comment character, so
+    "isb; mrs %0, cntvct_el0" assembled to just `isb`, and round147's watchdog
+    read a garbage counter and fired on its first tick.  Source strings cannot
+    prove the tail survived -- the text is in the image either way -- and a
+    whole-image count is useless because CNTVCT/SPSR instructions exist in the
+    kernel's own exception code.  So this resolves the three board functions by
+    symbol and counts inside each one: the interrupt entry must read both
+    ELR_EL1 and SPSR_EL1 and call counter(), and signalCPU() must write
+    ICC_SGI1R_EL1.  Round147's image has 0/0/0 there; this round has 1/2/1.
+
+    The panic screen is not covered here on purpose: it is built for
+    aarch64-none-elf, whose assembler treats `;` as a statement separator, so
+    those three sequences never lost an instruction."""
+    label = "kernel.macho: asm tails survived the assembler"
+    wanted = {
+        "__ZN6ArmCpu9interruptEv": (("mrs SPSR_EL1", 0xd5384000),
+                                    ("mrs CNTVCT_EL0", 0xd53be040)),
+        "__ZN6ArmCpu9signalCPUEP5IOCPU": (("msr ICC_SGI1R_EL1", 0xd518cba0),),
+    }
+    try:
+        segments, symbols = macho_symbols(kernel)
+        va_order = sorted(set(symbols.values()))
+        counts: dict[str, int] = {}
+        for symbol, opcodes in wanted.items():
+            start = symbols.get(symbol)
+            if start is None:
+                print(f"{label:42} FAIL ({symbol} is not in this image's symbol table)")
+                return False
+            end = next((va for va in va_order if va > start), None)
+            seg = next((s for s in segments if s[1] <= start < s[1] + s[2]), None)
+            end = min(end or seg[1] + seg[2], seg[1] + seg[2])
+            file_start = seg[3] + (start - seg[1])
+            body = kernel[file_start:file_start + (end - start)]
+            words = [word for (word,) in struct.iter_unpack("<I", body[:len(body) - len(body) % 4])]
+            for tag, base in opcodes:
+                counts[f"{tag} in {symbol.split('ArmCpu9')[1][:9]}"] = sum(
+                    1 for word in words if (word & 0xffffffe0) == base)
+    except (struct.error, ValueError):
+        print(f"{label:42} FAIL (the kernel is not a parseable Mach-O)")
+        return False
+    ok = all(count > 0 for count in counts.values())
+    detail = ", ".join(f"{tag} {count}" for tag, count in counts.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_unattended(kernel: bytes) -> bool:
     """Round147 makes a boot answer without anyone watching: ArmCpu panics at a wall-clock
     deadline, the panic screen marks the board's restart reason for fastboot and resets,
@@ -270,11 +349,11 @@ def check_unattended(kernel: bytes) -> bool:
     image has to carry all five."""
     label = "kernel.macho: unattended watchdog linked"
     found = {name: name.encode() in kernel
-             for name in ("clover r147: unattended deadline %llu s (elr=%llx spsr=%llx"
+             for name in ("clover r148: unattended deadline %llu s (elr=%llx spsr=%llx"
                           " ticks=%llu cnt0=%llx cnt1=%llx freq=%llx)",
-                          "clover r147: unattended mark %x -> %x deadline=%us\n",
-                          "clover r147: unattended mark %x read back %x\n",
-                          "clover r147: unattended imem map failed %llx\n",
+                          "clover r148: unattended mark %x -> %x deadline=%us\n",
+                          "clover r148: unattended mark %x read back %x\n",
+                          "clover r148: unattended imem map failed %llx\n",
                           "\nfb=")}
     ok = all(found.values())
     detail = ", ".join(f"{(name.split(':', 1)[1] if ':' in name else name).strip()[:28]}"
@@ -359,6 +438,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_shared_region_probe(kernel)
         ok &= check_mac_probe(kernel)
         ok &= check_unattended(kernel)
+        ok &= check_inline_asm_tails(kernel)
     return 0 if ok else 1
 
 

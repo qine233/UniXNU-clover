@@ -185,7 +185,7 @@ __attribute__((noreturn)) static void reset_after (u64 seconds)
   deadline += seconds * 19200000ULL;
   for (;;) {
     u64 now;
-    __asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r" (now));
+    __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (now));
     if (now >= deadline) {
       break;
     }
@@ -213,7 +213,7 @@ __attribute__((noreturn)) static void reset_unseen (void)
 static int mapped (u64 a)
 {
   u64 par;
-  __asm__ volatile ("at s1e1w, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (a) : "memory");
+  __asm__ volatile ("at s1e1w, %1\n\tisb\n\tmrs %0, par_el1" : "=r" (par) : "r" (a) : "memory");
   return !(par & 1);
 }
 
@@ -302,7 +302,7 @@ static int readable (const char *s, const u64 *args)
   u64 a = (u64)s, par;
   (void)args;
   if (a < 0xffff000000000000UL) return 0;
-  __asm__ volatile ("at s1e1r, %1; isb; mrs %0, par_el1" : "=r" (par) : "r" (a) : "memory");
+  __asm__ volatile ("at s1e1r, %1\n\tisb\n\tmrs %0, par_el1" : "=r" (par) : "r" (a) : "memory");
   return !(par & 1) && ((par >> 60) != 0);
 }
 
