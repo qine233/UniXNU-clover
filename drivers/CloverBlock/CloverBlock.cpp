@@ -1670,7 +1670,7 @@ static void prepareApfsBoot(IOMedia *whole)
   if (named) {
     gOsVolumeDev = volumeDev(major, minor);
   }
-  IOLog("CloverBlock r143: os vu=%s bsd=%s %u:%u p=%u\n", kRootVolumeUuid,
+  IOLog("CloverBlock r145: os vu=%s bsd=%s %u:%u p=%u\n", kRootVolumeUuid,
         devname ? devname : "?", major, minor, passes);
   volume->release();
   if (!named) {
@@ -1678,13 +1678,31 @@ static void prepareApfsBoot(IOMedia *whole)
   }
 }
 
-// The second window's half. SystemOS is a sealed cryptex volume, so nothing here mounts it: the owner
-// mount in bsd/kern/kern_exec.c does that at launchd's exec with MNT_RDONLY|MNT_UNION on "/", after
-// asking native_verified_block_volume_device() for the device named by this UUID. What this function
-// owes that call is the volume's existence and its IOMediaBSDClient name, and it keeps the media
-// retained because the call happens long after this run returns.
-static void prepareSystemOs(IOMedia *whole)
+// The second window's half, at sheng's moment. SystemOS is a sealed cryptex volume, so nothing here
+// mounts it: the owner mount in bsd/kern/kern_exec.c does that at launchd's exec with
+// MNT_RDONLY|MNT_UNION on "/", after asking native_verified_block_volume_device() for the device
+// named by this UUID. On sheng that lookup is answered by walking IOMedia of the one disk published
+// at boot, so no board code runs before the root is mounted. clover's image keeps SystemOS in a
+// second window of userdata rather than in a partition of the boot disk, so the window is still this
+// file's to publish -- but at the same moment sheng looks the volume up (exec, after bsd_init has
+// mounted the root), not from clover_block_run(). Round143 published it at boot and both boots after
+// that left bsd_init() with an empty mountlist; rounds 137-142, which published only the OS window,
+// mounted the same root. The media is retained because the owner mount reads it long after this run.
+static IOMedia *publishWindow(uint32_t first, uint32_t sectors, bool writeProtected,
+                              CloverBlockDevice **clientOut);
+
+static IOMedia *publishSystemOs(void)
 {
+  if (gSystemVolumeMedia) {
+    return gSystemVolumeMedia;
+  }
+  const uint32_t first = __atomic_load_n(&gSystemWindowFirst, __ATOMIC_ACQUIRE);
+  const uint32_t sectors = __atomic_load_n(&gSystemWindowSectors, __ATOMIC_ACQUIRE);
+  if (!first || !sectors) {
+    return nullptr;
+  }
+  CloverBlockDevice *device = nullptr;
+  IOMedia *whole = publishWindow(first, sectors, true, &device);
   IOMedia *volume = nullptr;
   uint32_t passes = 0;
   for (; passes < 12000 && !volume; passes++) {
@@ -1707,7 +1725,7 @@ static void prepareSystemOs(IOMedia *whole)
     }
     IOSleep(10);
   }
-  IOLog("CloverBlock r143: system vu=%s bsd=%s %u:%u p=%u\n", kSystemOsVolumeUuid,
+  IOLog("CloverBlock r145: system vu=%s bsd=%s %u:%u p=%u\n", kSystemOsVolumeUuid,
         devname ? devname : "?", major, minor, passes);
   if (!named) {
     volume->release();
@@ -1715,6 +1733,7 @@ static void prepareSystemOs(IOMedia *whole)
   }
   gSystemVolumeDev = volumeDev(major, minor);
   gSystemVolumeMedia = volume;
+  return volume;
 }
 
 // The whole of rounds 127 and 128, and it never returns: the console is the thing this board cannot
@@ -2016,12 +2035,16 @@ extern "C" void clover_block_run(void)
     if (!osSectors || !systemSectors) {
       fail(!osSectors ? "rootwin" : "systemwin", 0);
     }
+    // Round145: sheng's boot order. One disk is published and only the root volume is named before
+    // bsd_init() mounts it; the SystemOS volume is left to native_verified_block_volume_device(),
+    // which the owner mount calls at launchd's exec -- that is when sheng's registry walk answers,
+    // and it is when this board publishes the second window. Round143 moved that publication here,
+    // ahead of the root mount, and r143/r144 both ended in bsd_init() with an empty mountlist;
+    // r137-r142 published this one window and mounted the same root. The window's geometry is still
+    // read and bounds-checked here, so a manifest without SystemOS fails before the root mount.
     whole = publishWindow(osFirst, osSectors, true, &device);
     prepareApfsBoot(whole);
-    CloverBlockDevice *systemDevice = nullptr;
-    IOMedia *systemWhole = publishWindow(systemFirst, systemSectors, true, &systemDevice);
-    prepareSystemOs(systemWhole);
-    IOLog("CloverBlock r143: windows os=%u+%u system=%u+%u fires=%u\n", osFirst, osSectors,
+    IOLog("CloverBlock r145: boot os=%u+%u system=%u+%u fires=%u deferred=1\n", osFirst, osSectors,
           systemFirst, systemSectors, fires);
     return;
   }
@@ -2220,10 +2243,10 @@ extern "C" void clover_block_request(void)
 
 // bsd/kern/kern_exec.c's offline owner mount -- sheng's SystemOS step, enabled on this board by
 // patches/xnu-clover/zzy-clover-systemos-mount.patch -- validates the block stack through these two
-// symbols. drivers/NativeVirtioBlock supplies them on sheng from a signed manifest; this board
-// supplies them from the SHNGROOT manifest it just read off userdata, and the answer is the pair of
-// volumes the boot latched: the OS volume root-matching hands the kernel, and the SystemOS cryptex
-// volume the union mount is about. Nothing else can answer yes.
+// symbols. drivers/NativeVirtioBlock supplies them on sheng by walking the IOMedia the boot disk
+// published; this board supplies the same answers from the SHNGROOT manifest it read off userdata.
+// Round145 keeps sheng's timing: the OS volume is the one root-matching handed the kernel, and the
+// SystemOS volume is published only when this lookup runs, at launchd's exec.
 extern "C" int native_verified_block_root_authorized(dev_t device)
 {
   if (device == kNoDevice) {
@@ -2234,14 +2257,16 @@ extern "C" int native_verified_block_root_authorized(dev_t device)
 
 // The owner mount asks for the SystemOS volume by UUID, then opens the returned /dev path. Both have
 // to name the same volume this boot found: the dev_t is the media's own BSD major/minor, and the path
-// is the devfs node IOMediaBSDClient published for it -- `/dev/<bsd name>`, not a guess.
+// is the devfs node IOMediaBSDClient published for it -- `/dev/<bsd name>`, not a guess. On sheng the
+// volume is already attached and this is a registry lookup; here the same lookup first has to publish
+// the window the volume lives in, which is why it happens now and not in clover_block_run().
 extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *device, char *path,
                                                    size_t size)
 {
   if (!uuid || !device || !path || !size || strcmp(uuid, kSystemOsVolumeUuid) != 0) {
     return 0;
   }
-  IOMedia *media = gSystemVolumeMedia;
+  IOMedia *media = publishSystemOs();
   if (!media) {
     return 0;
   }
@@ -2255,6 +2280,7 @@ extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *devi
   if (candidate != gSystemVolumeDev || !native_verified_block_root_authorized(candidate)) {
     return 0;
   }
+  IOLog("CloverBlock r145: owner system %s dev=%d\n", name, static_cast<int>(candidate));
   snprintf(path, size, "/dev/%s", name);
   *device = candidate;
   return 1;

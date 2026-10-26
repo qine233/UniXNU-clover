@@ -9743,7 +9743,102 @@ fastboot reboot
    - `p2 err` 非 0：重试自己失败（`err` 是 errno），空表只是它的后果；
    - `inshut=1`：`system_inshutdown` 被置上了，回头查是谁在根挂载前调了 `reboot(2)`。
 
+## v0.4.8（round145）：把 SystemOS 窗口挪到 sheng 的时刻——exec 时再发布
 
+r143 和 r144 是同一个回归的两次复现：只要启动时（`clover_block_run()` 的
+`clover-apfs=3` 分支）把 userdata 的第二个窗口也发布出去，`bsd_init()` 就会在
+`mountlist.tqh_first->mnt_flag |= MNT_ROOTFS` 上以空表 fault；而 r137–r142 只发布
+OS 那一个窗口，同一颗根卷每次都挂上了。这已经不是「哪一行代码写错」，而是
+**发布时刻**的问题：r143 让第二颗 APFS 在根挂载前就 attach 完成（它的卷节点、
+BSD 名和 devfs 节点都先于根出现），根挂载紧接着在这套已经变化过的 IOKit 树上跑。
+
+r144 读数把这件事进一步夹窄，也留下一个矛盾：帧里 `p1 tag=3`、`mr=0`、`first=0`、
+`n=0`、`inshut=0`、`p2 err=19`（`ENODEV`）——第二次调用自己就没挂上，可第一次
+那一轮却带着 `tag=3`（`vfstable` 循环走完、`return ENODEV`），和「返回 0 后表却是
+空的」对不上。这说明 r144 的单张快照抓到的可能不是 `bsd_init()` 里那一次调用，
+而是同一轮启动里另一次（`imageboot` 的两处调用也在 `bsd_init()` 里）。单张快照
+无法区分，所以 round145 顺便把探针升级成**每次调用一行历史**，而不是再猜一遍源码。
+
+sheng 的顺序不是这样。sheng 的 `NativeVirtioBlock::native_verified_block_volume_device`
+在 **exec 时**才 `IOService::serviceMatching("IOMedia")` + `IOPropertyMatch/UUID`
+去遍历注册表，把 SystemOS 卷找出来交给 `bsd/kern/kern_exec.c` 的 owner mount；
+启动阶段只挂根。clover 的镜像把 SystemOS 放在 userdata 的第二个窗口而不是启动盘的
+分区里，所以「发布窗口」这一步仍然只能是板级代码，但**可以放在 sheng 的同一时刻**：
+根挂载之后、launchd exec 时，由 owner 契约的查找顺手发布。
+
+这一轮因此不新造流程，只把 r143 那一步从 boot 移到 sheng 本来就在的地方：
+
+1. `drivers/CloverBlock/CloverBlock.cpp`
+   - `publishSystemOs()`：从 `gSystemWindowFirst/gSystemWindowSectors` 读出窗口，
+     调 `publishWindow(first, sectors, /*writeProtected=*/true, …)`，用
+     `findVolumeByUuid(whole, kSystemOsVolumeUuid, 0)` 等卷出现（12000 × 10 ms），
+     再等 `volumeBsd()` 给出 BSD 名，记下 `gSystemVolumeDev` / `gSystemVolumeMedia`。
+     媒体被 retain，因为 owner mount 会在这之后很久还读它。
+   - `native_verified_block_volume_device()`：进入后先 `publishSystemOs()`；
+     之后仍是 sheng 的形状——按 UUID 校验、`candidate != gSystemVolumeDev` 拒绝、
+     `native_verified_block_root_authorized(candidate)` 校验、给出 `/dev/<名>`。
+   - `clover-apfs=3` 的启动分支只发布 OS 窗口（`publishWindow(osFirst, osSectors, true, …)`），
+     读完两个窗口的几何并做上界检查后就返回，**不再调用 `prepareSystemOs()`**；
+     日志改为 `CloverBlock r145: boot os=…+… system=…+… fires=… deferred=1`。
+     清单里没有 SystemOS 时仍会在根挂载前 `fail("systemwin")`。
+2. 板级内核补丁 `zzy-clover-root-mount-why.patch`（r144 的探针升级，不是新机制）
+   - `vfs_subr.c` 每次进 `clover_root_probe()` 写一格 8 项环形历史：
+     `clover_root_phase`（1 循环、2 重试、3/4 `imageboot`、10 快照点）、tag、`rootdev`、
+     `nummounts`、`mountlist.tqh_first`；并给 `mount_list_add()` / `mount_list_remove()`
+     各加一个计数（`clover_mount_adds/removes`）。
+   - `bsd_init.c` 在快照点先 `clover_root_dump()` 把整圈历史打出来，再重试、再 dump，
+     仍为空才 panic；两条 panic/恢复串与 r144 同形，但多了 `hist`/`call` 两组行。
+     `imageboot.c` 两处 `vfs_mountroot()` 前各写一个 phase（3/4），让历史能指出是谁调的。
+
+行为上的预期：启动日志里 `boot os=… system=… deferred=1` 之后**不应**再看到
+`system vu=`；根挂上、`launchd` exec 时才会出现 `CloverBlock r145: system vu=… bsd=…`
+与 `CloverBlock r145: owner system … dev=…`，随后是 sheng 的
+`offline owner SystemOS mount`（`MNT_RDONLY|MNT_UNION` 叠到 `/`）与
+`dyld_flags |= 8`。
+
+### 构建、校验与本轮该刷哪一格
+
+```
+# CloverBlock 与内核补丁都变了，kernel + payload 一起重建
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+产物归档在 `~/clover-out/round145-*`，`shasum -a 256 -c round145-SHA256SUMS` 七项全 OK：
+`payload.img` 58,720,256 B（`435db7f1…`）、本地 `kernel.macho` 51,998,720 B（`5e3a1027…`）、
+卷内 `kernel.macho`（`fde13a88…`，与本地只差 entry 探针补丁）、卷内 `unixnu.toml` 617 B
+（`8ff23b3d…`，args 与 r144 逐字相同，只有 title 换成 r145）、ADT 13,516 B
+（`388a7f7b…`；其中 `chosen/random-seed` 每次构建随机，所以与 r144 的 `d471ed6b…`
+不同，其余属性未变）、`scratch-data.img` 35,888 B（`614b8356…`，未变）、
+trustcache 61,408 B（`7c369ce0…`，未变）。**本轮没有新的 eMMC 分区写入**，
+刷写范围仍然只有 `cache`。
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round145-payload.img
+fastboot reboot
+```
+
+菜单第一行应当是 `clover r145: SystemOS window moves to exec time, like sheng`，
+冷启动（不要 `fastboot boot`）。
+
+这一帧只问一个问题：**去掉启动时的第二窗口之后，根挂载是否回到 r137–r142 的样子，
+以及 exec 时的 owner 查找能否把 SystemOS 挂上。**
+
+1. **根挂上、日志出现 `system vu=…` 与 `owner system … dev=…`，然后停在 dyld/共享缓存** ——
+   发布时刻就是回归原因，上一轮的空表只是 r143 的副作用；下一轮按 sheng 的
+   `dyld_flags`/共享缓存路径继续。
+2. **根挂上，但 exec 时没有 `system vu=`（或 `systemvol`/`systembsd` 的 fail 行）** ——
+   窗口几何或 UUID 没进 manifest，按 fail 的 stage 名查 SHNGROOT 里的 `SystemOS`。
+3. **仍然是空表 panic（`clover r145: mountlist empty after vfs_mountroot()==0 …`）** ——
+   这次历史行会指出调用者：`ph=1` 是 `bsd_init()` 的循环、`ph=2` 是重试、`ph=3/4`
+   是 `imageboot`。同时看 `add=`/`del=`：`add=0` 说明根本没入表（`tag` 指向那条出口），
+   `add>0 del>0` 说明入表后又被摘掉，`n`/`first` 与 `add` 之差就是被摘掉的节点数。
+4. **仍然是 `_bsd_init+0x79c` 的 data abort 且没有任何 `clover r145` 行** ——
+   补丁没进内核；先核对菜单标题是 `r145`，再跑 `verify-clover-payload.py`。
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
   sheng 那条"直接从 userdata 读 APFS 卷"的路走不通。clover 走 gta4l 的形状：

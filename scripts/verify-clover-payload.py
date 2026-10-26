@@ -150,9 +150,10 @@ def check_block(kernel: bytes) -> bool:
     label = "kernel.macho: CloverBlock linked"
     found = {name: name.encode() in kernel
              for name in ("clover-apfs", "CloverBlock r137: apfs",
-                          "CloverBlock r143: os vu=%s bsd=%s %u:%u p=%u",
-                          "CloverBlock r143: system vu=%s bsd=%s %u:%u p=%u",
-                          "CloverBlock r143: windows os=%u+%u system=%u+%u fires=%u",
+                          "CloverBlock r145: os vu=%s bsd=%s %u:%u p=%u",
+                          "CloverBlock r145: system vu=%s bsd=%s %u:%u p=%u",
+                          "CloverBlock r145: boot os=%u+%u system=%u+%u fires=%u deferred=1",
+                          "CloverBlock r145: owner system %s dev=%d",
                           "fl=0x%x fc=0x%x fk=0x%x", "op=0x%x:0x%x mm=0x%x:0x%x",
                           "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x",
                           "dr=%u db=%u dx=0x%x dy=0x%x na=%u ir=0x%x ia=%u "
@@ -216,16 +217,21 @@ def check_root_mount_probe(kernel: bytes) -> bool:
     ran in six volatiles and bsd_init.c reads them back -- so the image's only evidence is the two
     lines it can print: the retry that recovered, and the panic that carries both snapshots. Losing
     either means a boot that faults at the same MNT_ROOTFS write with no numbers, exactly the frame
-    this round exists to replace."""
+    this round exists to replace. Round145 adds the per-call history (caller phase, tag, device,
+    list head) and the mount-list add/remove counts that one snapshot could not carry."""
     label = "kernel.macho: root mount probe linked"
     found = {name: name.encode() in kernel
-             for name in ("clover r144: mountlist empty after vfs_mountroot()==0"
+             for name in ("clover r145: mountlist empty after vfs_mountroot()==0"
                           " p1 tag=%d mr=%lx first=%lx n=%d inshut=%d dev=%d"
                           " p2 err=%d tag=%d first=%lx n=%d",
-                          "clover r144: root mount recovered on retry p1tag=%d p2err=%d"
-                          " first=%p\n")}
+                          "clover r145: root mount recovered on retry p1tag=%d p2err=%d"
+                          " first=%p\n",
+                          "clover r145 hist calls=%d add=%d del=%d now ph=%d tag=%d dev=%d"
+                          " n=%d first=%lx\n",
+                          "clover r145 call %d ph=%d tag=%d dev=%d n=%d first=%lx\n")}
     ok = all(found.values())
-    detail = ", ".join(f"{name.split(':')[1].strip()[:28]} {'present' if yes else 'ABSENT'}"
+    detail = ", ".join(f"{(name.split(':', 1)[1] if ':' in name else name).strip()[:28]}"
+                       f" {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
     return ok

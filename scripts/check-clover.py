@@ -666,6 +666,9 @@ def check_board(errors: list) -> str:
     # which of the four exits ran and what the list held at that instant, retries the mount once in
     # bsd_init(), and only panics with the readings. Like r143's board patch it has to be carried in
     # this repository and copied into the base tree's patches/xnu for the build.
+    # Round145 adds the part one snapshot cannot say: every call in order with the caller phase
+    # (1 loop, 2 retry, 3/4 imageboot) plus mount_list_add/remove counts, so the next frame splits
+    # "never added" from "added then unmounted" from "a later call ran".
     probe = next((base / "patches/xnu-clover/zzy-clover-root-mount-why.patch"
                   for base in (REPO, pathlib.Path.cwd())
                   if (base / "patches/xnu-clover/zzy-clover-root-mount-why.patch").is_file()), None)
@@ -678,12 +681,42 @@ def check_board(errors: list) -> str:
                    ("clover_root_probe(0)", "clover_root_probe(1)",
                     "clover_root_probe(2)", "clover_root_probe(3)",
                     "clover_root_probe_tag", "clover_root_probe_inshut",
-                    "clover r144: mountlist empty after vfs_mountroot()==0",
-                    "clover r144: root mount recovered on retry")
+                    "clover_root_phase", "clover_root_dump",
+                    "clover_mount_adds", "clover_mount_removes",
+                    "clover r145 hist calls=%d add=%d del=%d now ph=%d tag=%d dev=%d n=%d first=%lx",
+                    "clover r145: mountlist empty after vfs_mountroot()==0",
+                    "clover r145: root mount recovered on retry")
                    if needle not in text]
         for needle in missing:
             errors.append(f"{probe.name} lacks {needle!r}: that exit would report no tag, or the "
                           "panic would lose the snapshot it exists to print")
+
+    # Round145. Round143 published both windows from clover_block_run(), before bsd_init() had
+    # mounted anything; r143 and r144 then both left mountlist empty, while r137-r142 -- one window
+    # -- mounted the same root. sheng never publishes SystemOS at boot: its owner mount looks the
+    # volume up after the root is up, at load_init_program(). The board copies that order: boot
+    # publishes the OS window only, and native_verified_block_volume_device() publishes the second
+    # window when the owner mount asks at exec. These three source facts are the whole change; a
+    # regression that puts the publication back before the root mount must fail this checker.
+    block = REPO / "drivers/CloverBlock/CloverBlock.cpp"
+    if not block.is_file():
+        errors.append("drivers/CloverBlock/CloverBlock.cpp is missing: the boot window policy "
+                      "cannot be checked")
+    else:
+        source = block.read_text()
+        if "static IOMedia *publishSystemOs(void)" not in source:
+            errors.append("CloverBlock.cpp has no publishSystemOs(): the SystemOS window must be "
+                          "published on demand, not from a boot-time prepare step")
+        if "publishWindow(systemFirst" in source:
+            errors.append("CloverBlock.cpp still publishes the SystemOS window from "
+                          "clover_block_run(): that is r143's shape, which r143/r144 proved leaves "
+                          "bsd_init() with an empty mountlist")
+        if "IOMedia *media = publishSystemOs();" not in source:
+            errors.append("native_verified_block_volume_device() does not call publishSystemOs(): "
+                          "the owner mount would get no device at exec time")
+        if "deferred=1" not in source:
+            errors.append("CloverBlock.cpp's boot line has no deferred=1: the frame would not say "
+                          "that only one window was published")
 
     splash = [entry for entry in board.get("bootimg", {}).get("dtb_node", [])
               if "splash" in entry["path"]]
