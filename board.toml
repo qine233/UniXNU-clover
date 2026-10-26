@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r134: after mount fails, read the same devvp and draw errno and bytes"
+title = "clover r135: after the devvp read fails, repeat it without the auth gate and read the media itself"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1807,6 +1807,35 @@ kernel_args = [
   # supports a persistent device-side refusal; dr=0 rules out that simple explanation and sends analysis to
   # APFS's internal/container-reuse paths. A zero increment in r= alone does not prove no I/O, because the
   # buffer cache can satisfy a read. The mount call itself remains unchanged: same flags, devvp and data=0.
+  #
+  # Round134's photograph (v0.3.7, @CloverBlock.cpp:1425) read dr=13 db=0 dx=0x0 dy=0x0 with mt=13, dv=1:3,
+  # bd=0, r=464 w=0 and the round132 identity unchanged -- the same single Sealed=No volume. So an ordinary
+  # vn_rdwr of the very vnode apfs was handed does fail with 13 too, moves no bytes, and leaves the media
+  # block counters flat. What that establishes is narrow: the refusal is a property of reading this vnode, it
+  # is not invented by the mount's argument state, and it is taken before any block this driver serves. What
+  # it does not establish is the layer. vn_rdwr_64() (bsd/vfs/vfs_vnops.c:995-998) calls
+  # mac_vnode_check_read() before VNOP_READ unless the caller sets IO_NOAUTH (0x8000, bsd/sys/vnode.h:174),
+  # and this probe passed kIOUnit (IO_UNIT, 0x0001, :154) -- so an authorization denial and a device refusal
+  # both print 13, and _mac_vnode_check_read is present in this kernel's symbol table (nm round134-kernel),
+  # so CONFIG_MACF is on and that gate really runs. dr=13 therefore had two candidate authors, and the
+  # reading "the refusal happens above CloverBlockDevice" was one inference too many.
+  #
+  # Round135 (v0.3.8) asks the one question that separates them, still strictly after VFS_MOUNT and with no
+  # writes and no state change anywhere. First, na= re-runs the identical 4 KiB read with IO_NOAUTH added;
+  # that flag skips exactly the gate above and nothing else on the path. Second, ir= is the raw IOReturn from
+  # one asynchronous 512-byte read of the volume's own IOMedia at byte zero, with ia= the bytes its own
+  # completion reported, and mo=/mc=/mw= are isOpen(NULL), isOpen(this driver) and isWritable(). The reason
+  # to trust ir= as the decisive field: dkreadwrite()'s own early exits are ENXIO (missing or orphaned
+  # minor), kIOReturnUnformattedMedia (also ENXIO), NotAligned (EINVAL), NoMemory (ENOMEM) and VMError
+  # (EFAULT) -- none of them maps to 13 -- so a 13 seen through BSD is authored either by media->read()
+  # itself or above it, and IOMedia::read()'s own gates are isInactive (NoMedia), _openLevel == None
+  # (NotOpen 0xe00002cd), zero size or zero block size (UnformattedMedia) and four BadArgument geometry
+  # tests. Of those only NotOpen reaches EACCES, and IOMedia::handleIsOpen (IOMedia.cpp:486-505) consults
+  # its client dictionary, so mo= is the same question asked a second way. Read together: ir=0 with ia=512
+  # says the media serves this read and the 13 is made above it -- na=0 then names the authorization gate as
+  # the author, na=13 sends the pass to spec_read/buf_bread; ir=0xe00002cd with mo=0 says nobody has this
+  # media open, which would mean the FREAD open that bdevvp() performs unconditionally (vfs_subr.c:2106-2170,
+  # no alias short-circuit, failure panics) never reached this minor or was rolled back by dkopen().
   "clover-apfs=2",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the

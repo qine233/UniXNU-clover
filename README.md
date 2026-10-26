@@ -8574,7 +8574,10 @@ if (report->mount) {
 
 新字段：`dr=`（`vn_rdwr` 的返回，`65535` = 没走到这一步，即挂载成功或更早的档没到）、
 `db=`（实际读到的字节数，`4096 - resid`，夹在 0..4096）、
-`dx=`/`dy=`（读出内容的前两个 `le32`）。末行 **`@CloverBlock.cpp:1403`**。
+`dx=`/`dy=`（读出内容的前两个 `le32`）。末行当时写的是 **`@CloverBlock.cpp:1403`**，实机读回来是
+**`@CloverBlock.cpp:1425`** —— 差的那 22 行不是内容变了，是我把行号规则猜错了：`panic()` 是跨行调用，
+屏上打的是**这个调用的收尾 `);` 那一行**，不是 `panic(` 起手的行（1403 是 `panic(`，1425 正是 `);`）。
+以后预告末行号一律按「`);` 的行」算。
 
 `dx=`/`dy=` **本轮不预设常量**：`dv=1:3` 是那颗 `AppleAPFSVolume` 的媒体，它的块 0 是卷的超级块，
 而容器的 `NXSB` magic 在偏移 `0x20` 而不是 0（`scripts/make-clover-apfs-container.py:45` 钉过这件事），
@@ -8631,6 +8634,167 @@ probe patch  localize 成 6680 B / 35 runs，CloverBlock 的 `r134` 身份串、
    此时才轮到 mode 1 对照（fixture 的普通 APFS 数据挂载用 mode 1 是成功的）。
 3. **ADT 加 `/chosen { root-snapshot-name = …; }`** 与
    **`/filesystems { DoNotUseSEP; }` / `allow-root-hash-mismatch`** —— 依旧只在 `mt=` 过了之后才排队。
+
+## round134 读数（v0.3.7 实机，2026-10-26）：那颗 devvp 独立读也回 13，一格字节都没动
+
+屏上末帧原文（`@CloverBlock.cpp:1425`）：
+
+```
+CloverBlock r134: apfs f=15797536 n=11870275 m=1 l=0 d=10 s=1 c=1 v=1 vt=1 un=1 vs=0x6f4e vo=0x696c6e4f
+vu=0x1d874fd vc=0xa7dd292a vn=0x6e776144/0x61647055/0x31326574/0x363448 dv=1:3 bd=0 al=0
+t=0x73667061/0x0/0x0/0x0 on=0x2f fm=0x6b736964 dp=0xffffffff2:0x352524c0 fl=0x4005001 fc=0x4001001 fk=0x0
+op=0xfffffff0:0x5f2b3c8 mm=0xfffffff0:0x56c65fac mt=13 st=65535 rt=65535 k=65535/65535/65535/65535
+rd=65535 g=0 x=0x0 y=0x0 dr=13 db=0 dx=0x0 dy=0x0 r=464 w=0
+```
+
+本轮的新格只有四格，其余全部与 round132 逐格相同（身份、选卷、`dv=1:3`、`bd=0`、`mt=13`）：
+
+| 字段 | 读数 | 含义 |
+|---|---|---|
+| `dr=` | 13 | 挂载失败之后，对**同一个 devvp** 做一次独立 4 KiB `vn_rdwr`，errno 还是 13 |
+| `db=` | 0 | 一个字节都没搬（`resid` 等于请求长度） |
+| `dx=` / `dy=` | 0x0 / 0x0 | 缓冲没被填 |
+| `r=` / `w=` | 464 / 0 | 与 round132 完全相同，**这次读没有让块计数器涨一格** |
+
+`t=0x73667061` 是 "apfs"、`fm=0x6b736964` 是 "disk"、`vn=` 拼起来是 "DawnUpdate12H46…"、
+`vs=0x6f4e` 是 "No" —— 这些都还是 round132 那一颗未封存卷，六轮没换过目标。
+
+**这一格确认的事**：13 不是挂载调用的参数状态造出来的。清掉 `MNT_ROOTFS`（round131）、挑未封存卷
+（round132）、去掉路径 open 仪器（round133）都动不了它；现在连「根本不调 apfs，只对这个 vnode 做一次
+普通读」也是同一个 13。而且它发生在**我们的块驱动之上**：`r=` 不涨说明请求没落到
+`CloverBlockDevice` 手里，而 apfs 在拒绝挂载**之前**明明已经用同一颗驱动读过 464 块（计数器是在
+`measureApfsDepth` 前才清零的），所以「这台设备的读通路是坏的」不成立 —— 坏的只有这条 vnode 读。
+
+**这一格没确认的事，以及要撤回的一句**：落盘时我写过「`mt=13` 与 `dr=13` 是同一种失败，因此拒绝发生在
+`CloverBlockDevice` 之上」。前半句成立，后半句是我又往前走了一步 —— 因为 `dr=` 是 `vn_rdwr` 的返回值，
+而 `vn_rdwr` 在做真正的读之前有一道授权门，这道门和设备读都会打出 13。宿主四条证据：
+
+1. `vn_rdwr_64()`（`xnu-0b4b910d/bsd/vfs/vfs_vnops.c:995-998`）：`if ((ioflg & IO_NOAUTH) == 0)` 就先
+   `error = mac_vnode_check_read(&context, cred, vp)`，只有它返回 0 才轮到 `VNOP_READ`。`IO_NOAUTH`
+   是 `0x8000`（`bsd/sys/vnode.h:174`），而我们传的 `kIOUnit` 是 `IO_UNIT = 0x0001`（`:154`）——
+   **授权门是开着的**。
+2. `nm ~/clover-out/round134-kernel.macho` 里有 `_mac_vnode_check_read`，`CONFIG_MACF` 是 1，
+   那道门在我们这颗内核里确实编译进去了。
+3. `bdevvp()`（`bsd/vfs/vfs_subr.c:2106-2170`）没有 alias 短路：`vnode_create` → `VNOP_FSYNC` →
+   `buf_invalidateblks` → `VNOP_OPEN(nvp, FREAD)` 是无条件顺序，且 open 失败直接 `panic("bdevvp failed:
+   open")`。所以 `bd=0` 且没 panic ⇒ `spec_open` 走到 `dkopen(dev, FREAD, S_IFBLK)` 并返回 0；
+   `dkopen` 里唯一的 EACCES 需要 `flags & FWRITE` 且 `media->isWritable()==false`，FREAD 开不到那一臂。
+4. `dkreadwrite()`（`IOStorageFamily-ad2e13e0/IOMediaBSDClient.cpp:2900-3126`）的全部早退是：缺 minor 或
+   orphaned → `ENXIO`；`isFormatted()==false` → `kIOReturnUnformattedMedia`（映射也是 ENXIO）；
+   `byteStart >= mediaSize` 的读 → **Success 且不搬数据**；raw 未对齐 → `NotAligned`(EINVAL)；
+   无缓冲 → `NoMemory`(ENOMEM)；`prepare()` 失败 → `VMError`(EFAULT)。最后统一
+   `return minor->media->errnoFromReturn(status)`。**它自己写不出 13。**
+
+把 4 和 `errnoFromReturn`（`xnu-0b4b910d/iokit/Kernel/IOService.cpp:8160-8232`）合起来看，13 只可能来自
+两处：`media->read()` 的返回，或 `VNOP_READ` 之上那层授权。而 `IOMedia::read()` 的早退清单里
+（`IOMedia.cpp` 的异步 `read`，逐条读过）只有 `_openLevel == kIOStorageAccessNone → kIOReturnNotOpen
+(0xe00002cd)` 会映射成 13，其余 `isInactive → NoMedia`、`_mediaSize==0 || _preferredBlockSize==0 →
+UnformattedMedia`、四个几何/方向检查 → `BadArgument` 分别映射 ENXIO/ENXIO/EINVAL。
+`IOMedia::read()` **完全不看调用者的 `client` 参数**，也不验证调用者开没开过。
+`IOMedia::handleIsOpen()`（`IOMedia.cpp:486-505`）查的是它自己的 `_openClients` 字典，
+所以 `isOpen()` 是同一个问题的第二种问法，不需要任何结构体偏移。
+
+## v0.3.8（round135）：把这 13 的层切开 —— 去掉授权门再读一次，然后直接读卷的 IOMedia
+
+一句话的问题：**这个 13 是哪一层写的**。挂载调用依旧逐字节不变，本轮所有测量都在 `VFS_MOUNT`
+返回之后，全程只读、不改任何状态、不开也不关任何媒体。
+
+```cpp
+  report->mount = static_cast<uint32_t>(VFS_MOUNT(mp, devvp, 0, ctx));
+  if (report->mount) {
+    ... round134 那次 vn_rdwr(kUIORead, devvp, ..., kIOUnit, ...) 原样保留 ...
+
+    // (1) 同一把 4 KiB 读再来一次，只多加 IO_NOAUTH
+    report->noAuthRead = static_cast<uint32_t>(
+        vn_rdwr(kUIORead, devvp, noAuth->getBytesNoCopy(), static_cast<int>(kDeviceReadBytes), 0,
+                kUIOSysSpace, kIOUnit | kIOFlagNoAuth, vfs_context_ucred(ctx), &noAuthResid, nullptr));
+
+    // (2) 绕过 vnode、绕过 buffer cache、绕过 BSD，直接读这颗卷自己的 IOMedia
+    gVolumeOp.done = 0;
+    gVolumeOp.status = static_cast<uint32_t>(kIOReturnNotReady);
+    gVolumeOp.actual = 0;
+    IOStorageCompletion completion;
+    completion.target = &gVolumeOp;
+    completion.action = mediaOpDone;
+    completion.parameter = nullptr;
+    volume->read(client, 0, raw.get(), nullptr, &completion);
+    report->mediaRead = gVolumeOp.done ? gVolumeOp.status : static_cast<uint32_t>(kIOReturnTimeout);
+    report->mediaActual = static_cast<uint32_t>(gVolumeOp.actual);
+    report->openAny  = volume->isOpen(nullptr) ? 1u : 0u;
+    report->openUs   = volume->isOpen(client)  ? 1u : 0u;
+    report->writable = volume->isWritable()    ? 1u : 0u;
+    return;
+  }
+```
+
+新字段（`65535` = 没走到；`volumeMountLadder()` 现在多收一个 `IOService *client`，就是 CloverBlock
+自己在整盘媒体上开合 GPT 时用的那个客户端）：
+
+| 字段 | 是什么 |
+|---|---|
+| `na=` | 同样的 4 KiB 读、同样 offset 0、同样 cred，**只多 `IO_NOAUTH`**；这个 flag 在整个 `vn_rdwr` 里只跳过 `mac_vnode_check_read` 那一处 |
+| `ir=` | 直接 `IOMedia::read()` 的**原始 IOReturn**（十六进制），不是 errno |
+| `ia=` | 它自己的 completion 报回来的字节数（请求 512） |
+| `mo=` | `isOpen(nullptr)` —— 这颗媒体此刻被**任何人**开着吗 |
+| `mc=` | `isOpen(client)` —— 是不是我们开着 |
+| `mw=` | `isWritable()` —— 与 `dkopen` 的 FWRITE+EACCES 那一臂直接相关 |
+
+读法（`ir=` 是决定性的那格，因为 `dkreadwrite` 写不出 13）：
+
+- `ir=0x0 ia=512` ⇒ 这颗媒体读得通，13 是在它**上面**造的。此时看 `na=`：`na=0` 而 `dr=13` ⇒
+  作者是 `vn_rdwr` 那道授权门，round134 的「设备侧持续拒绝」整条撤回，下一步改 apfs 之前先改我们
+  自己的读标志；`na=13` ⇒ 门不是作者，去 `spec_read` / `buf_bread` 那一层找（`_vnode_dev_read` 与
+  `vn_rdwr` 走的是不同臂，这一支还留着一格余地）。
+- `ir=0xe00002cd`（NotOpen）配 `mo=0` ⇒ 这颗卷媒体根本没人开着，问题变成「`bdevvp` 那句无条件
+  `VNOP_OPEN(FREAD)` 为什么没把它的 `_openLevel` 抬起来」—— 而 `dv=1:3` 的 minor 3 与 `volume` 是不是
+  同一个 `MinorSlot` 也第一次成了可问的问题。
+- `ir=0xe00002e4`（NoMedia）⇒ `isInactive()`，这颗媒体在挂载失败时已被注销；
+  `ir=0xe00002e5`（UnformattedMedia）⇒ 它的 `_mediaSize` 或 `_preferredBlockSize` 是 0；
+  `ir=0xe00002c2`（BadArgument）⇒ 几何不匹配（`_mediaSize < 512` 或方向不对）。
+- `ir=0xe00002bf`（`kIOReturnTimeout`）⇒ 请求被排出去且没在本线程内联完成；自 round111 起这块板的
+  `IOBlockStorageDriver` 都是内联完成，所以这本身是一条新信息，不是失败。
+- `mc=1` 且 `mo=1` 且 `ir=0` ⇒ 我们没开错客户端，媒体也开着，那 13 与 open 状态无关。
+
+`dx=`/`dy=`/`na=` 一律**不预设常量**，理由同 round134：容器 `NXSB` 在偏移 `0x20`，块 0 前 8 字节没有
+可预测的东西；`na=` 的两种可能（0 或 13）都是答案。
+
+**预算**：一次 512 B + 两次 4 KiB 读，全部在挂载失败之后；`rd=md0`、`clover-apfs=2`、`clover-emmc=21`、
+`armcpu-clock-panic=180000` 一个都没动。
+
+构建命令与上一轮相同（两个驱动都在 `[kernel] archives` 里，`kernel` 那格照旧不能省），`userdata`
+不重建 —— 镜像一个字节都没变：
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+checker 增量：`verify-clover-payload.py` 的 `check_block()` 把身份串升到 `CloverBlock r135: apfs`，尾段
+断言换成完整的 `dr=%u db=%u dx=0x%x dy=0x%x na=%u ir=0x%x ia=%u mo=%u mc=%u mw=%u r=%u w=%u`（这是编译器
+拼接后的**一段连续字面量**，所以一次断言就覆盖了六个新字段全在位）；`check-clover.py` 的 `rd=md0`
+那条只把轮次号从 round134 抬到 round135，理由一字未改。
+
+产物归档在 `~/clover-out/round135-*`，`shasum -a 256 -c round135-SHA256SUMS`。
+
+**刷写范围只有 `cache` 一个分区，没有新的 eMMC 分区写入**：`fastboot flash cache
+/Users/zhouzhou/clover-out/round135-payload.img`，然后 `fastboot reboot` 冷启动。末行预告
+**`@CloverBlock.cpp:1519`**（按 round134 学到的规则：`panic()` 调用的收尾 `);` 那一行）。
+
+下一格候选（要等这一帧，排序按当前证据）：
+
+1. **`na=0` 且 `dr=13`**：13 的作者是我们自己那两次 `vn_rdwr` 都带着的授权门，`mt=13` 是不是同一处写的
+   要重新问一次 —— apfs 的读走 `_vnode_dev_read`/`vn_rdwr`，它传不传 `IO_NOAUTH` 得回宿主对着
+   `mm=0xfffffff0056c65fac` 那段反汇编数一遍。
+2. **`ir=NotOpen` 且 `mo=0`**：把 `dv=1:3` 的 minor 与这颗 `IOMedia` 的对应关系量出来（`_openClients`
+   里是谁），并第一次认真问 `rd=md0` 那句谎是不是把 root 的 open 落在了另一颗媒体上。
+3. **`ir=0 ia=512` 且 `na=13`**：换 `spec_read` 层 —— 同一个 vnode 改用 `VNOP_STRATEGY` 直接下一块
+   buffer，把 `buf_bread` 的缓存与 `dkstrategy` 的错误通道切开。
+4. **ADT `/chosen { root-snapshot-name }` / `/filesystems { DoNotUseSEP }` / `allow-root-hash-mismatch`**
+   —— 仍然只在 `mt=` 过了 13 之后才排队。
 
 ## 有意省略的部分
 

@@ -134,14 +134,17 @@ def check_block(kernel: bytes) -> bool:
     evidence is the identity keys in the string table and the seven volume fields on the same line.
     Round133's path-open probe is gone: a non-null devvp makes that loader arm unreachable. Round134
     reuses vn_rdwr after a failed mount to read the same devvp, so its identity and dr/db/dx/dy fields
-    must be in the line. Any of them going missing means the round silently asks nothing -- the failure
-    shape check-clover.py refuses to let the archives have."""
+    must be in the line. Round135 adds the two fields that say which layer made that 13: the same read
+    again behind IO_NOAUTH (na=) and one raw IOMedia::read of the volume's own media (ir=/ia=) beside its
+    three public state answers (mo=/mc=/mw=). Any of them going missing means the round silently asks
+    nothing -- the failure shape check-clover.py refuses to let the archives have."""
     label = "kernel.macho: CloverBlock linked"
     found = {name: name.encode() in kernel
-             for name in ("clover-apfs", "CloverBlock r134: apfs",
+             for name in ("clover-apfs", "CloverBlock r135: apfs",
                           "fl=0x%x fc=0x%x fk=0x%x", "op=0x%x:0x%x mm=0x%x:0x%x",
                           "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x",
-                          "dr=%u db=%u dx=0x%x dy=0x%x r=%u w=%u",
+                          "dr=%u db=%u dx=0x%x dy=0x%x na=%u ir=0x%x ia=%u "
+                          "mo=%u mc=%u mw=%u r=%u w=%u",
                           "FullName", "Sealed",
                           "AppleAPFSContainerScheme", "AppleAPFSVolume",
                           "SystemVersion.plist", "_clover_emmc_block_window",

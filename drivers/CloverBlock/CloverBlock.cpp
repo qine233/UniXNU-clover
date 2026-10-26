@@ -131,7 +131,7 @@
 // Nothing else about the mount moves, so the frame either shows the identity the host already read out of
 // the flashed bytes and still says 13, or it says something the host did not predict.
 //
-// A failure panics with one short CloverBlock r134 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r135 line naming the step; success prints one line
 // and lets the boot continue, except under a window (clover-apfs=1 or =2), where the APFS depth and
 // what the vfs made of it are the report and the run always panics with them. A refire of the IOBSD
 // notification prints one counted line and returns, so the photograph shows both that the run
@@ -313,6 +313,14 @@ static const uint32_t kRootMountFlags = kMntRdonly | kMntRootfs;
 // request size nx_mount makes, and offset zero is aligned for spec_read's VBLK path. This is a new
 // measurement after VFS_MOUNT has returned, not a pre-read that could change the mount result.
 static const uint32_t kDeviceReadBytes = 4096;
+// Round135's second half of the same question. vn_rdwr_64() (bsd/vfs/vfs_vnops.c:995-998) runs
+// mac_vnode_check_read() before VNOP_READ unless the caller sets IO_NOAUTH, and IO_NOAUTH is 0x8000
+// (bsd/sys/vnode.h:174) while IO_UNIT, the flag rounds 129-134 passed, is 0x0001 (:154). So round134's
+// dr=13 has two producers in front of the media, and only one of them is the device: an authorization
+// denial in the MAC framework and a refusal from underneath VNOP_READ look the same number. Repeating
+// the identical read with IO_NOAUTH added separates them without touching any state -- na=0 with dr=13
+// names the authorization layer, and na=13 says the refusal is below it.
+static const int kIOFlagNoAuth = 0x8000;
 
 // The IOBSD publish notification is delivered on the persistent gIOResources service, whose
 // doServiceMatch re-invokes every still-matching gIOPublishNotification on each pass and ignores the
@@ -689,7 +697,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r134: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r135: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 static uint32_t le32At(const uint8_t *at)
@@ -837,6 +845,10 @@ struct MediaOp {
 };
 
 static MediaOp gMediaOp;
+
+// Round135's direct read of the volume's own media gets its own completion slot rather than reusing
+// gMediaOp, so the number drawn can never be the residue of the whole-disk GPT read above it.
+static MediaOp gVolumeOp;
 
 static void mediaOpDone(void *target, void *, IOReturn status, UInt64 actualByteCount)
 {
@@ -1054,6 +1066,23 @@ struct MountReport {
   uint32_t deviceBytes;
   uint32_t deviceWord0;
   uint32_t deviceWord1;
+  // Round135 asks which layer refuses, because dr=13 alone cannot say: the read that produced it went
+  // through vn_rdwr_64(), and that function runs an authorization check before VNOP_READ unless the
+  // caller sets IO_NOAUTH. na= is the same read with IO_NOAUTH added -- the only difference between dr=
+  // and na= is that gate. ir= is the raw IOReturn from IOMedia::read() on the volume's own media object,
+  // with ia= the bytes it says it moved, bypassing the vnode, the buffer cache and BSD entirely;
+  // dkreadwrite()'s own early exits map to ENXIO/EINVAL/ENOMEM/EFAULT and can never be 13, so if a
+  // number has to explain this, ir= is the field that carries it. mo=/mc=/mw= are the media's three
+  // public state answers: isOpen(NULL), isOpen(this driver) and isWritable(), and IOMedia::read() gates
+  // on its own open level -- kIOReturnNotOpen (0xe00002cd) is the one value in ir= that EACCES maps from
+  // which the media itself can produce without a provider. All six stay at kRungNotReached if the mount
+  // succeeds or the buffer allocation fails.
+  uint32_t noAuthRead;
+  uint32_t mediaRead;
+  uint32_t mediaActual;
+  uint32_t openAny;
+  uint32_t openUs;
+  uint32_t writable;
 };
 
 static const uint32_t kRungNotReached = 0xffff;
@@ -1101,7 +1130,7 @@ static bool volumeBsd(IOMedia *media, const char **name, uint32_t *major, uint32
 // happened to reach first.
 //
 // Every rung returns rather than panicking, so the caller can draw the rungs that ran.
-static void volumeMountLadder(IOMedia *volume, MountReport *report)
+static void volumeMountLadder(IOMedia *volume, IOService *client, MountReport *report)
 {
   // The device number and name still come from the AppleAPFSVolume's own IOMedia. Round133 proved that
   // parsing rd=md0 says nothing about the loader when devvp is non-null, so this round leaves the boot
@@ -1184,8 +1213,13 @@ static void volumeMountLadder(IOMedia *volume, MountReport *report)
   // IOMedia::read, whose early kIOReturnNotOpen/NotReadable-style failures are converted by
   // IOService::errnoFromReturn to EACCES, stored in the buffer by dkreadwritecompletion, returned by
   // buf_biowait, and propagated through _vnode_dev_read and nx_mount into the loader's errno out parameter.
-  // That chain is a candidate, not a proven runtime cause: bdevvp already performed VNOP_OPEN(FREAD), so a
-  // bare "the device was never opened" explanation would contradict bd=0.
+  // That chain is a candidate, not a proven runtime cause, and the host read the reason this round:
+  // bdevvp() has no alias short-circuit in front of its open -- vnode_create(), VNOP_FSYNC(),
+  // buf_invalidateblks() and VNOP_OPEN(nvp, FREAD) run in that order on every call (vfs_subr.c:2106-2170),
+  // and a failed open panics. So bd=0 with no panic means spec_open() ran dkopen(dev, FREAD, S_IFBLK) and
+  // dkopen's only EACCES is the FWRITE-and-!isWritable() arm, which a FREAD open cannot reach. Round135
+  // therefore measures both ends of that chain instead of assuming either: the same read with the vnode's
+  // one authorization gate removed, and one read of the media object itself.
   report->mount = static_cast<uint32_t>(VFS_MOUNT(mp, devvp, 0, ctx));
   if (report->mount) {
     // One question, after the mount can no longer be perturbed by it: can the same block-special vnode be
@@ -1193,6 +1227,8 @@ static void volumeMountLadder(IOMedia *volume, MountReport *report)
     // error channel as nx_mount. dr=13 supports a persistent device-side refusal; dr=0 says that explanation
     // does not hold after the mount and sends the host pass back to APFS's internal/container-reuse paths.
     // r= is deliberately sampled only in the panic call, after this read, so it includes any new media I/O.
+    // Round134 read this as "the refusal happens above CloverBlockDevice", which is only true if the 13 came
+    // from underneath VNOP_READ -- the two rounds below are what separates that from the alternative.
     OSSharedPtr<IOBufferMemoryDescriptor> device =
         IOBufferMemoryDescriptor::withCapacity(kDeviceReadBytes, kIODirectionIn, true);
     if (!device.get()) {
@@ -1213,6 +1249,59 @@ static void volumeMountLadder(IOMedia *volume, MountReport *report)
       report->deviceWord0 = le32At(deviceHead);
       report->deviceWord1 = le32At(deviceHead + 4);
     }
+
+    // Round135, part one: the identical 4 KiB read again, with IO_NOAUTH added to ioflg. That flag skips
+    // exactly one thing -- the mac_vnode_check_read() at the head of vn_rdwr_64() -- and VNOP_READ and
+    // everything under it then run byte-for-byte as before. na=13 beside dr=13 puts the refusal below the
+    // authorization layer; na=0 beside dr=13 means round134 measured its own gate rather than the media,
+    // and the device-read theory goes back on the shelf unexamined.
+    OSSharedPtr<IOBufferMemoryDescriptor> noAuth =
+        IOBufferMemoryDescriptor::withCapacity(kDeviceReadBytes, kIODirectionIn, true);
+    if (!noAuth.get()) {
+      fail("noauth-read-buffer", 0);
+    }
+    int noAuthResid = 0;
+    report->noAuthRead = static_cast<uint32_t>(
+        vn_rdwr(kUIORead, devvp, noAuth->getBytesNoCopy(), static_cast<int>(kDeviceReadBytes), 0,
+                kUIOSysSpace, kIOUnit | kIOFlagNoAuth, vfs_context_ucred(ctx), &noAuthResid, nullptr));
+
+    // Round135, part two: with the vnode out of the way, ask the media object this volume actually is.
+    // IOMedia::read() tests its own open level before it reaches any provider and answers
+    // kIOReturnNotOpen (0xe00002cd) when nothing holds it open, and that is one of the six IOReturns
+    // errnoFromReturn() maps to EACCES -- and the only one a media can produce on its own, without a
+    // provider or a driver agreeing to it. dkreadwrite() cannot author a 13 at all: its own early exits
+    // are ENXIO for a missing or orphaned minor, kIOReturnUnformattedMedia (ENXIO), NotAligned (EINVAL),
+    // NoMemory (ENOMEM) and VMError (EFAULT). So the number drawn here says which of the two layers the
+    // refusal lives in: ir=0xe00002cd with mo=0 is a media nobody ever opened, ir=0 with ia=512 says this
+    // media reads fine and the 13 is made above it, and NoMedia (0xe00002e4), UnformattedMedia
+    // (0xe00002e5) or BadArgument (0xe00002c2) each name their own cause. One block at byte zero, through
+    // the same asynchronous overload the storage family's own read path uses, completing inline as every
+    // readMediaBytes() request on this board has since round111 -- a deferred completion is the reading
+    // kIOReturnTimeout (0xe00002bf), not a hang.
+    OSSharedPtr<IOBufferMemoryDescriptor> raw =
+        IOBufferMemoryDescriptor::withCapacity(kBlockBytes, kIODirectionIn, true);
+    if (!raw.get()) {
+      fail("media-read-buffer", 0);
+    }
+    gVolumeOp.done = 0;
+    gVolumeOp.status = static_cast<uint32_t>(kIOReturnNotReady);
+    gVolumeOp.actual = 0;
+    IOStorageCompletion completion;
+    completion.target = &gVolumeOp;
+    completion.action = mediaOpDone;
+    completion.parameter = nullptr;
+    volume->read(client, 0, raw.get(), nullptr, &completion);
+    report->mediaRead =
+        gVolumeOp.done ? gVolumeOp.status : static_cast<uint32_t>(kIOReturnTimeout);
+    report->mediaActual = static_cast<uint32_t>(gVolumeOp.actual);
+    // The three public state answers, read after the request so they describe the state the read saw.
+    // IOMedia overrides handleIsOpen() to consult its own client dictionary (IOMedia.cpp:486-505), so
+    // mo= is "someone has this media open" and mc= is "this driver does" -- and since dkopen() calls
+    // media->open() the moment VNOP_OPEN(FREAD) reaches it, mo=0 would mean the FREAD open that bdevvp()
+    // performs unconditionally either never reached this minor or was rolled back.
+    report->openAny = volume->isOpen(nullptr) ? 1u : 0u;
+    report->openUs = volume->isOpen(client) ? 1u : 0u;
+    report->writable = volume->isWritable() ? 1u : 0u;
     return;
   }
   // vfs_subr.c:1282, through the exported helper rather than a third measured offset:
@@ -1395,16 +1484,19 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
                          kRungNotReached, kRungNotReached, kRungNotReached,
                          { kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached },
                          kRungNotReached, 0, 0, 0,
-                         kRungNotReached, 0, 0, 0 };
+                         kRungNotReached, 0, 0, 0,
+                         kRungNotReached, kRungNotReached, 0,
+                         kRungNotReached, kRungNotReached, kRungNotReached };
   if (best.volumeMedia) {
-    volumeMountLadder(best.volumeMedia, &report);
+    volumeMountLadder(best.volumeMedia, client, &report);
   }
 
-  panic("CloverBlock r134: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u "
+  panic("CloverBlock r135: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u "
         "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x vn=0x%x/0x%x/0x%x/0x%x dv=%u:%u bd=%u al=%u "
         "t=0x%x/0x%x/0x%x/0x%x on=0x%x fm=0x%x dp=0x%x:0x%x fl=0x%x fc=0x%x fk=0x%x "
         "op=0x%x:0x%x mm=0x%x:0x%x mt=%u st=%u rt=%u k=%u/%u/%u/%u "
-        "rd=%u g=%u x=0x%x y=0x%x dr=%u db=%u dx=0x%x dy=0x%x r=%u w=%u",
+        "rd=%u g=%u x=0x%x y=0x%x dr=%u db=%u dx=0x%x dy=0x%x "
+        "na=%u ir=0x%x ia=%u mo=%u mc=%u mw=%u r=%u w=%u",
         __atomic_load_n(&gWindowFirst, __ATOMIC_ACQUIRE),
         __atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE), magic,
         static_cast<uint32_t>(loaded), best.seen, best.scheme, best.container, best.volume,
@@ -1421,6 +1513,8 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
         report.root, report.lookup[0], report.lookup[1], report.lookup[2], report.lookup[3],
         report.read, report.bytes, report.word0, report.word1,
         report.deviceRead, report.deviceBytes, report.deviceWord0, report.deviceWord1,
+        report.noAuthRead, report.mediaRead, report.mediaActual,
+        report.openAny, report.openUs, report.writable,
         __atomic_load_n(&gBlocksRead, __ATOMIC_ACQUIRE),
         __atomic_load_n(&gBlocksWritten, __ATOMIC_ACQUIRE));
 }
@@ -1438,7 +1532,7 @@ extern "C" void clover_block_run(void)
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    IOLog("CloverBlock r134: refire n=%u (already ran)\n", fires);
+    IOLog("CloverBlock r135: refire n=%u (already ran)\n", fires);
     return;
   }
 
@@ -1652,7 +1746,7 @@ extern "C" void clover_block_run(void)
     fail("alias-match", reinterpret_cast<uint64_t>(aliasService));
   }
 
-  IOLog("CloverBlock r134: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
+  IOLog("CloverBlock r135: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
         kRootAlias, bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
 }
