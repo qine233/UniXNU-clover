@@ -9562,7 +9562,105 @@ cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-p
    确认刷进 `cache` 的是这一格；然后按 r141 第 4 条的办法改走 logfs 或直接 `panic()`
    带策略名，不再靠 console。
 
-## 有意省略的部分
+## v0.4.6（round143）：照 sheng 的做法把 SystemOS 卷 union 挂到根上，给 dyld 找回共享缓存
+
+r142 的帧换了名字：`namespace 6 subcode 0xd` 是 `OS_REASON_DYLD`，正文是
+
+```
+Library not loaded: /usr/lib/libSystem.B.dylib
+  Referenced from: <…> /sbin/launchd
+  Reason: tried: '/usr/lib/libSystem.B.dylib' (no such file, no dylib cache)
+```
+
+AMFI/MAC 这一关已经过了（r142 里没有任何 `namespace 9` 帧）。dyld 不是被策略挡住，
+而是**在根卷上找不到共享缓存**。宿主侧对两个卷的核对：
+
+```
+OS      04769D26-2CA0-4825-B443-E2E5F88300F2   /usr/lib/libSystem.B.dylib     不存在
+                                             System/Library/Caches/com.apple.dyld/  不存在
+SystemOS 8846FE78-2910-4297-AF97-D59BB6F8FC16  usr/ 与 com.apple.dyld/ 都在
+```
+
+OS 卷是封印快照，`usr/` 与 dyld 缓存都在旁边的 `Cryptex1,SystemOS` 卷上。sheng 在同一段
+路上就是这么过的：`patches/xnu/offline-owner-systemos-mount.patch` 在
+`load_init_program()` 里、exec init 之前调 `native_owner_cache_prepare()`，把 SystemOS
+卷以 `MNT_RDONLY|MNT_UNION` 挂到 `/`：
+
+1. 先验证根：`vfs_flags(root_mount) & MNT_RDONLY` 且
+   `native_verified_block_root_authorized(root_device)`（UUID `8846FE78…` 也写死在这份补丁里）；
+2. 用 `native_verified_block_volume_device(uuid, &selected, path, size)` 取卷的 `dev_t` 与
+   `/dev/…` 路径，`mount()` 之后复查 `actual == selected`、`f_fstypename == "apfs"`、
+   `vnode_mountedhere(original_os_root) == cache_mount && rootvnode == mounted_root`；
+3. 成功后 `dyld_flags |= 8; commpage_update_dyld_flags(dyld_flags)`，让 dyld 认这份共享缓存。
+
+失败一律 `panic("offline owner SystemOS mount failed: %d")`。
+
+基础树里这份补丁**已经应用但被编译掉**：`scripts/build-xnu-4k-baseline.sh` 给
+`kern_exec.o` 传 `-DXNU_OWNER_CACHE_MOUNT=0 -DXNU_OWNER_CACHE_STARTUP=0
+-DXNU_OWNER_UNION_SYSTEMOS=0`，并且 OWNER_* 的开关门会连带要求 VERIFIED_ROOT_PROBE 和
+`NativeVirtioBlock`（clover 没有 virtio 块设备，会重复定义
+`native_verified_block_root_authorized`）。所以这一轮**不动 defconfig**，板级补丁
+`patches/xnu-clover/zzy-clover-systemos-mount.patch` 在 `kern_exec.c` 顶部
+`#undef` 再 `#define` 这三个宏为 1——`kern_exec.c` 是唯一读它们的编译单元，命令行的
+`=0` 因此被覆盖。补丁按名字排序落在 `zzz-boot-progress.patch` 之前。
+
+`drivers/CloverBlock` 这一轮把「两个窗口」做出来（r142 只发布 OS 窗口）：
+
+- 从 SHNGROOT 清单里一次读出 `OS` 与 `SystemOS` 两个窗口，`clover-apfs=3` 时缺任何一个都在
+  清单校验处 panic；
+- 先 `publishWindow(OS)` → 等 apfs 卷命名、闩住 `gOsVolumeDev`，再发布 `SystemOS` 窗口并
+  闩住 `gSystemVolumeDev`/`gSystemVolumeMedia`。顺序固定，是因为 `CloverSdhci` 的 PIO
+  单调用者卫兵不允许两个窗口的请求重叠；
+- 导出 `native_verified_block_root_authorized(dev_t)` 与
+  `native_verified_block_volume_device(uuid, dev_t *, char *, size_t)`，后者只认
+  `8846FE78…`，与内核侧补丁的契约逐字段对齐。两个符号在 `kernel.macho` 里都已解析
+  （`native_verified_block_root_authorized` @ `fffffff007994a48`）。
+
+两个 checker 都加了 r143 契约：`check-clover.py` 要求板级补丁存在且三个宏都是
+`#undef` + `#define … 1`，`[userdata] windows` 必须恰好是 `OS` / `SystemOS`（后者
+`component = Cryptex1,SystemOS`）；`verify-clover-payload.py` 要求卷内内核同时带
+`CloverBlock r143: os|system vu=…`、`windows os=… system=…`、两个 owner 导出，以及
+补丁独有的 `offline owner SystemOS mount failed: %d`——最后这条是「补丁真的被编进来」
+的唯一直接证据。
+
+### 构建、校验与本轮该刷哪一格
+
+```
+# 内核必须重建：kern_exec.c 被板级补丁改过，libCloverBlock.a 多了两个导出
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+产物归档在 `~/clover-out/round143-*`，`shasum -a 256 -c round143-SHA256SUMS` 八项全 OK：
+`payload.img` 58,720,256 B（`6ec7f421…`）、本地 `kernel.macho` `64ffdf08…`（r142 是
+`c241d778…`，本轮重建）、卷内 `kernel.macho` 51,994,624 B（`cbebc08e…`）、卷内
+`unixnu.toml` 626 B（`72f78109…`，args 与 r142 逐字相同）、ADT 13,516 B（`15d0436e…`）、
+`scratch-data.img` 35,888 B（`614b8356…`）、trustcache 61,408 B（`7c369ce0…`，未变）。
+两个 checker 全绿；`userdata` 清单里两个窗口早已写好，**本轮没有新的 eMMC 分区写入**。
+
+**刷写范围仍然只有 `cache`**：`fastboot flash cache
+/Users/zhouzhou/clover-out/round143-payload.img`，然后 `fastboot reboot` 冷启动。
+菜单第一行应当是 `clover r143: union-mount SystemOS over the OS root for dyld`。
+
+这一帧只问一个问题：**共享缓存挂上之后，launchd 能不能被 dyld 装起来。**
+
+1. **`/sbin/launchd` 起来并继续往下走** —— dyld 这一关过了；下一轮读 launchd 在用户态
+   停在哪（缺 Data 卷、缺服务、缺文件系统配置），不再动缓存与挂载。
+2. **`offline owner SystemOS mount failed: N`** —— 挂载本身失败，N 是 `mount()` 的 errno
+   或补丁内部的 EAUTH。先对 N 去 `kern_return`/errno 表里定位；若为 EAUTH（`native_verified_*`
+   返回 0），说明 `CloverBlock` 闩住的卷 `dev_t` 与内核侧取到的不一致（窗口顺序或卷命名）。
+3. **还是一条 `namespace 6 subcode 0xd`，但这次看得到 `CloverBlock r143: os/system vu=…`**
+   —— 两个窗口都发布了，挂载却没改变 dyld 的结果；查 union 是否真的生效
+   （`mnt_flag` 里 `MNT_UNION`、`vnode_mountedhere(root)`），以及 `dyld_flags` 是否被
+   commpage 更新。
+4. **没有 r143 行、仍是旧名字** —— 先核对菜单标题确实是 `r143`，确认刷进 `cache`
+   的是这一格，再往补丁是否被 `kern_exec.o` 的编译命令覆盖方向查。
+
+
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
   sheng 那条"直接从 userdata 读 APFS 卷"的路走不通。clover 走 gta4l 的形状：

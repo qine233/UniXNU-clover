@@ -151,6 +151,7 @@
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
+#include <sys/types.h>
 
 extern "C" {
 extern kmod_info_t g_kernel_kmod_info;
@@ -232,6 +233,17 @@ static const uint32_t kRootManifestBlocks = 8;
 static const uint32_t kRootManifestBytes = kRootManifestBlocks * kBlockBytes;
 static const uint8_t kRootMagic[8] = { 'S', 'H', 'N', 'G', 'R', 'O', 'O', 'T' };
 static const char kRootWindowName[3] = { 'O', 'S', 0 };
+// Round143's second window, entry 1 of the same manifest: the SystemOS cryptex volume. Round142's
+// launchd died inside dyld (`namespace 6 subcode 0xd`, `/usr/lib/libSystem.B.dylib ... no such file,
+// no dylib cache`), and the host says why: the OS volume carries neither that dylib nor
+// System/Library/Caches/com.apple.dyld, and this volume carries the shared cache. sheng boots the
+// same image by union-mounting this volume on "/" before launchd's exec, so the window is published
+// and the two UUIDs below are the selection the owner mount reads.
+static const char kSystemWindowName[] = "SystemOS";
+static const char kRootVolumeUuid[] = "04769D26-2CA0-4825-B443-E2E5F88300F2";
+static const char kSystemOsVolumeUuid[] = "8846FE78-2910-4297-AF97-D59BB6F8FC16";
+static volatile uint32_t gSystemWindowFirst = 0;
+static volatile uint32_t gSystemWindowSectors = 0;
 // The OS window is a whole GPT disk, not a bare container: `hdiutil imageinfo` on the IPSW's own
 // 044-76040-038.dmg reports MBR, Primary GPT Header, Primary GPT Table, one Apple_APFS partition and
 // the backup, and the host-side copy of the flashed bytes says the same. So byte zero of the media
@@ -516,13 +528,51 @@ IOReturn CloverBlockDevice::reportEjectability(bool *isEjectable)
   return kIOReturnSuccess;
 }
 
-// The capacity this device claims: the window under round127, the whole card otherwise. Both are
-// what the card reported to drivers/CloverSdhci, so a description here can still only be as good as
-// a measurement made on this boot.
-static uint32_t mediaSectors (void)
+// Each published media is one extent of the card, and round143 publishes two of them. The class
+// layout is pinned to IOBlockStorageDevice's 0x90 bytes (the static_assert above), so the extent
+// lives beside the object in this table rather than inside it. The lookup runs on every request and
+// at media-build time, so it never allocates; a slot is claimed once, before attach, and the device
+// pointer is the key.
+struct DeviceWindow {
+  const void *device;
+  uint32_t first;
+  uint32_t sectors;
+  bool writeProtected;
+};
+
+static const uint32_t kDeviceWindowSlots = 4;
+static DeviceWindow gDeviceWindows[kDeviceWindowSlots];
+
+static void registerWindow(const void *device, uint32_t first, uint32_t sectors,
+                           bool writeProtected)
 {
-  uint32_t window = __atomic_load_n (&gWindowSectors, __ATOMIC_ACQUIRE);
-  return window ? window : clover_emmc_block_sectors ();
+  for (uint32_t slot = 0; slot < kDeviceWindowSlots; slot++) {
+    if (!gDeviceWindows[slot].device || gDeviceWindows[slot].device == device) {
+      gDeviceWindows[slot] = DeviceWindow{ device, first, sectors, writeProtected };
+      return;
+    }
+  }
+  panic("CloverBlock r143: window-slot %u", kDeviceWindowSlots);
+}
+
+static const DeviceWindow *windowFor(const void *device)
+{
+  for (uint32_t slot = 0; slot < kDeviceWindowSlots; slot++) {
+    if (gDeviceWindows[slot].device == device) {
+      return &gDeviceWindows[slot];
+    }
+  }
+  return nullptr;
+}
+
+// The capacity this device claims: its window, the whole card otherwise. Both are what the card
+// reported to drivers/CloverSdhci, so a description here can still only be as good as a measurement
+// made on this boot.
+static uint32_t mediaSectors (const CloverBlockDevice *device)
+{
+  const DeviceWindow *window = windowFor (device);
+  uint32_t sectors = window ? window->sectors : 0;
+  return sectors ? sectors : clover_emmc_block_sectors ();
 }
 
 IOReturn CloverBlockDevice::reportMaxValidBlock(UInt64 *maxBlock)
@@ -530,7 +580,7 @@ IOReturn CloverBlockDevice::reportMaxValidBlock(UInt64 *maxBlock)
   if (!maxBlock) {
     return kIOReturnBadArgument;
   }
-  uint32_t sectors = mediaSectors();
+  uint32_t sectors = mediaSectors(this);
   if (!sectors) {
     return kIOReturnNotReady;
   }
@@ -564,9 +614,12 @@ IOReturn CloverBlockDevice::reportWriteProtection(bool *isWriteProtected)
   if (!isWriteProtected) {
     return kIOReturnBadArgument;
   }
-  // Round109 only read. Stage 14 now writes one logfs record through IOMedia, so the media has
-  // to be genuinely writable; IOBlockStorageDriver builds its media from this answer.
-  *isWriteProtected = false;
+  // Round109 only read, and Stage 14 writes one logfs record through IOMedia, so the logfs device
+  // has to be genuinely writable. Round143's two boot windows are not: they are the flashed images
+  // the kernel mounts, and sheng's own block devices answer read-only here too. IOBlockStorageDriver
+  // builds its media from this answer.
+  const DeviceWindow *window = windowFor(this);
+  *isWriteProtected = window ? window->writeProtected : false;
   return kIOReturnSuccess;
 }
 
@@ -591,8 +644,11 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
 {
   IOReturn status = kIOReturnSuccess;
   UInt64 done = 0;
-  uint32_t sectors = mediaSectors();
-  uint32_t windowFirst = __atomic_load_n (&gWindowFirst, __ATOMIC_ACQUIRE);
+  // The caller's block numbers are relative to what this device claims, and the card's are
+  // absolute; this device's window first LBA is the only difference between the two.
+  const DeviceWindow *window = windowFor(this);
+  uint32_t sectors = window && window->sectors ? window->sectors : clover_emmc_block_sectors();
+  uint32_t windowFirst = window ? window->first : 0;
   const IODirection direction = buffer ? buffer->getDirection() : kIODirectionNone;
 
   if (!buffer || (direction != kIODirectionIn && direction != kIODirectionOut)) {
@@ -746,13 +802,15 @@ static uint32_t fnv1a(const char *text)
   return hash;
 }
 
-// Latch the media to the OS window inside the flashed root image. Everything the manifest holds is
+// Latch the media to the windows inside the flashed root image. Everything the manifest holds is
 // bytes and names, and each refusal is its own panic step, so a photograph can tell "nothing was
 // flashed" (magic) from "a different release's manifest" (version) from "this partition is not the
-// one the image was sized for" (bounds). The window is published relative to the card: the offset in
-// the manifest is relative to the start of userdata, and drivers/CloverSdhci's own read path only
-// takes card LBAs.
-static void rootWindowFromManifest(uint32_t partitionFirst, uint32_t partitionSectors)
+// one the image was sized for" (bounds). The windows are published relative to the card: the offset
+// in the manifest is relative to the start of userdata, and drivers/CloverSdhci's own read path only
+// takes card LBAs. Round143 reads both entries in one pass: the OS window is what root-matching
+// hands the kernel, and the SystemOS window is the cryptex volume the union mount on "/" needs.
+static void windowsFromManifest(uint32_t partitionFirst, uint32_t partitionSectors,
+                                bool requireSystem)
 {
   const uint32_t got = clover_emmc_block_read(partitionFirst, gRootManifest, kRootManifestBlocks);
   if (got != kRootManifestBlocks) {
@@ -771,31 +829,47 @@ static void rootWindowFromManifest(uint32_t partitionFirst, uint32_t partitionSe
     fail("root-count", count);
   }
   const uint64_t partitionBytes = static_cast<uint64_t>(partitionSectors) * kBlockBytes;
+  bool rootFound = false;
+  bool systemFound = false;
   for (uint32_t index = 0; index < count; index++) {
     const uint8_t *entry = bytes + 24 + 128 * index;
-    if (memcmp(entry, kRootWindowName, sizeof(kRootWindowName)) != 0) {
+    const bool root = memcmp(entry, kRootWindowName, sizeof(kRootWindowName)) == 0;
+    const bool system = memcmp(entry, kSystemWindowName, sizeof(kSystemWindowName)) == 0;
+    if (!root && !system) {
       continue;
     }
     const uint64_t offset = le64At(entry + 32);
     const uint64_t size = le64At(entry + 40);
     if (le32At(entry + 48) != kBlockBytes || le32At(entry + 52) != 1) {
-      fail("root-attr", index);
+      fail(root ? "root-attr" : "system-attr", index);
     }
     if (offset < kRootManifestBytes || (offset % kBlockBytes) || size < kBlockBytes ||
         (size % kBlockBytes) || offset > partitionBytes || size > partitionBytes - offset) {
-      fail("root-bounds", offset);
+      fail(root ? "root-bounds" : "system-bounds", offset);
     }
     const uint64_t first = partitionFirst + offset / kBlockBytes;
     const uint64_t sectors = size / kBlockBytes;
     if (sectors > UINT32_MAX || first > UINT32_MAX || first + sectors >
         static_cast<uint64_t>(clover_emmc_block_sectors())) {
-      fail("root-geometry", sectors);
+      fail(root ? "root-geometry" : "system-geometry", sectors);
     }
-    __atomic_store_n(&gWindowFirst, static_cast<uint32_t>(first), __ATOMIC_RELEASE);
-    __atomic_store_n(&gWindowSectors, static_cast<uint32_t>(sectors), __ATOMIC_RELEASE);
-    return;
+    if (root) {
+      __atomic_store_n(&gWindowFirst, static_cast<uint32_t>(first), __ATOMIC_RELEASE);
+      __atomic_store_n(&gWindowSectors, static_cast<uint32_t>(sectors), __ATOMIC_RELEASE);
+      rootFound = true;
+    } else {
+      __atomic_store_n(&gSystemWindowFirst, static_cast<uint32_t>(first), __ATOMIC_RELEASE);
+      __atomic_store_n(&gSystemWindowSectors, static_cast<uint32_t>(sectors), __ATOMIC_RELEASE);
+      systemFound = true;
+    }
+    // Keep looking for the other entry; the manifest has one of each and either order is valid.
   }
-  fail("root-name", count);
+  if (!rootFound) {
+    fail("root-name", count);
+  }
+  if (requireSystem && !systemFound) {
+    fail("systemwin", count);
+  }
 }
 
 // The mask's job is done: round115 showed that the names this file wants are taken by the tree
@@ -1175,6 +1249,64 @@ static bool volumeBsd(IOMedia *media, const char **name, uint32_t *major, uint32
   return true;
 }
 
+// The volume whose UUID names it, reached through the same walk and with the same parent fallback
+// measureApfsDepth uses. The returned media is retained. Selection by UUID rather than by "the first
+// unsealed volume" is what makes round143's two windows addressable: root-matching hands the kernel
+// the volume with kRootVolumeUuid, and the owner mount asks for the one with kSystemOsVolumeUuid, so
+// both sides must be looking at the same node this file latched.
+static IOMedia *findVolumeByUuid(IORegistryEntry *root, const char *wanted, uint32_t level)
+{
+  OSSharedPtr<OSIterator> children = root->getChildIterator(gIOServicePlane);
+  if (!children.get()) {
+    return nullptr;
+  }
+  IOMedia *found = nullptr;
+  while (!found) {
+    OSObject *object = children->getNextObject();
+    if (!object) {
+      break;
+    }
+    IORegistryEntry *child = OSDynamicCast(IORegistryEntry, object);
+    if (!child) {
+      continue;
+    }
+    if (child->metaCast(kApfsVolumeClass)) {
+      const char *uuid = stringProperty(child, kVolumeUuidKey);
+      if (uuid && strcmp(uuid, wanted) == 0) {
+        IOMedia *media = static_cast<IOMedia *>(child->metaCast("IOMedia"));
+        if (!media) {
+          IORegistryEntry *parent = child->getParentEntry(gIOServicePlane);
+          media = parent ? static_cast<IOMedia *>(parent->metaCast("IOMedia")) : nullptr;
+        }
+        if (media) {
+          media->retain();
+          found = media;
+        }
+      }
+    }
+    if (!found && level < 7) {
+      found = findVolumeByUuid(child, wanted, level + 1);
+    }
+  }
+  return found;
+}
+
+// The dev_t IOMediaBSDClient stamped on a volume's media: the number bdevvp() opens for the root and
+// the one vnode_specrdev() reports for a mounted volume. Same packing as the root ladder's dv=.
+static dev_t volumeDev(uint32_t major, uint32_t minor)
+{
+  return static_cast<dev_t>((static_cast<int32_t>(major) << 24) | static_cast<int32_t>(minor));
+}
+
+static const dev_t kNoDevice = static_cast<dev_t>(-1);
+
+// The volumes the two windows produced, latched for boot lifetime. The owner mount at exec reads
+// them long after this run returns, so the SystemOS media is retained; the OS volume is only needed
+// as a number because root-matching already holds its media.
+static volatile dev_t gOsVolumeDev = kNoDevice;
+static volatile dev_t gSystemVolumeDev = kNoDevice;
+static IOMedia *gSystemVolumeMedia = nullptr;
+
 // vfs_mountroot(), transcribed: bsd/vfs/vfs_subr.c:1240 (bdevvp), :1258 (vfs_rootmountalloc), :1259
 // (mnt_devvp), :1265 (VFS_MOUNT with no data argument), :1282 (SI_MOUNTEDON), :1284 and :1286
 // (vfs_unbusy, mount_list_add) -- then the first lookup and the first read a mounted filesystem ever
@@ -1496,29 +1628,29 @@ static void volumeMountLadder(IOMedia *whole, IOMedia *volume, IOService *client
 // kept getting, vfs_mountroot() does not call that rung for apfs: it calls the filesystem's
 // vfc_mountroot when the vfstable registers one (bsd/vfs/vfs_subr.c:1247-1255), and the root it hands
 // over is the IOMedia whose UUID /chosen's root-matching names. So this function mounts nothing. It
-// loads apfs.kext, waits until the volume exists and IOMediaBSDClient has named it, prints which
-// volume it is, and returns; IOFindBSDRoot's wait and vfs_mountroot() run immediately after this
-// handler returns, still inside the same bsd_autoconf.
+// loads apfs.kext, waits for the volume with that UUID, waits until IOMediaBSDClient has named it,
+// latches its dev_t, prints which volume it is, and returns; IOFindBSDRoot's wait and vfs_mountroot()
+// run immediately after this handler returns, still inside the same bsd_autoconf.
+//
+// Round143 selects by UUID instead of taking whichever volume the depth walk preferred: the owner
+// mount at exec re-checks the root device against native_verified_block_root_authorized(), so the
+// number latched here has to be the number the root search will mount, not merely a volume in the
+// same container.
 static void prepareApfsBoot(IOMedia *whole)
 {
   kern_return_t loaded = OSKextLoadKextWithIdentifier(kApfsKext);
   if (loaded) {
     fail("apfsload", static_cast<uint32_t>(loaded));
   }
-  ApfsDepth found{};
+  IOMedia *volume = nullptr;
   uint32_t passes = 0;
-  for (; passes < 12000 && !found.volumeMedia; passes++) {
-    ApfsDepth now{};
-    measureApfsDepth(whole, &now, 0);
-    if (now.volumeMedia) {
-      found.volumeMedia = now.volumeMedia;
-      found.identity = now.identity;
-      found.volumeCount = now.volumeCount;
-      found.unsealedCount = now.unsealedCount;
+  for (; passes < 12000 && !volume; passes++) {
+    volume = findVolumeByUuid(whole, kRootVolumeUuid, 0);
+    if (!volume) {
+      IOSleep(10);
     }
-    IOSleep(10);
   }
-  if (!found.volumeMedia) {
+  if (!volume) {
     fail("apfsvol", passes);
   }
   // The UUID is what root-matching matches, and the BSD name/major/minor are what IOFindBSDRoot turns
@@ -1529,20 +1661,60 @@ static void prepareApfsBoot(IOMedia *whole)
   uint32_t minor = 0xffffffff;
   bool named = false;
   for (uint32_t attempt = 0; attempt < 1000; attempt++) {
-    if (volumeBsd(found.volumeMedia, &devname, &major, &minor)) {
+    if (volumeBsd(volume, &devname, &major, &minor)) {
       named = true;
       break;
     }
     IOSleep(10);
   }
-  const char *uuid = stringProperty(found.volumeMedia, kVolumeUuidKey);
-  IOLog("CloverBlock r137: boot v=%u un=%u vu=%s bsd=%s %u:%u p=%u\n",
-        found.volume, found.unsealedCount, uuid ? uuid : "?",
+  if (named) {
+    gOsVolumeDev = volumeDev(major, minor);
+  }
+  IOLog("CloverBlock r143: os vu=%s bsd=%s %u:%u p=%u\n", kRootVolumeUuid,
         devname ? devname : "?", major, minor, passes);
-  found.volumeMedia->release();
+  volume->release();
   if (!named) {
     fail("apfsbsd", passes);
   }
+}
+
+// The second window's half. SystemOS is a sealed cryptex volume, so nothing here mounts it: the owner
+// mount in bsd/kern/kern_exec.c does that at launchd's exec with MNT_RDONLY|MNT_UNION on "/", after
+// asking native_verified_block_volume_device() for the device named by this UUID. What this function
+// owes that call is the volume's existence and its IOMediaBSDClient name, and it keeps the media
+// retained because the call happens long after this run returns.
+static void prepareSystemOs(IOMedia *whole)
+{
+  IOMedia *volume = nullptr;
+  uint32_t passes = 0;
+  for (; passes < 12000 && !volume; passes++) {
+    volume = findVolumeByUuid(whole, kSystemOsVolumeUuid, 0);
+    if (!volume) {
+      IOSleep(10);
+    }
+  }
+  if (!volume) {
+    fail("systemvol", passes);
+  }
+  const char *devname = nullptr;
+  uint32_t major = 0xffffffff;
+  uint32_t minor = 0xffffffff;
+  bool named = false;
+  for (uint32_t attempt = 0; attempt < 1000; attempt++) {
+    if (volumeBsd(volume, &devname, &major, &minor)) {
+      named = true;
+      break;
+    }
+    IOSleep(10);
+  }
+  IOLog("CloverBlock r143: system vu=%s bsd=%s %u:%u p=%u\n", kSystemOsVolumeUuid,
+        devname ? devname : "?", major, minor, passes);
+  if (!named) {
+    volume->release();
+    fail("systembsd", passes);
+  }
+  gSystemVolumeDev = volumeDev(major, minor);
+  gSystemVolumeMedia = volume;
 }
 
 // The whole of rounds 127 and 128, and it never returns: the console is the thing this board cannot
@@ -1719,6 +1891,38 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
         __atomic_load_n(&gBlocksWritten, __ATOMIC_ACQUIRE));
 }
 
+// Publish one extent of the card as an IOBlockStorageDevice and start the one IOBlockStorageDriver
+// it is for. The window is registered before attach because start() is where the stack asks for the
+// media's geometry; the size check is the same proof round127 wrote -- the media the driver built has
+// to describe exactly the sectors this window claims.
+static IOMedia *publishWindow(uint32_t first, uint32_t sectors, bool writeProtected,
+                              CloverBlockDevice **clientOut)
+{
+  CloverBlockDevice *device = new CloverBlockDevice;
+  IOPlatformExpert *platform = IOService::getPlatform();
+  if (!device || !device->init(nullptr)) {
+    fail("device", 0);
+  }
+  registerWindow(device, first, sectors, writeProtected);
+  if (!platform || !device->attach(platform) || !device->start(platform)) {
+    fail("attach", 0);
+  }
+  const OSMetaClass *driverMeta = lookupMetaClass("IOBlockStorageDriver");
+  IOService *driver = driverMeta ? static_cast<IOService *>(driverMeta->alloc()) : nullptr;
+  if (!driver || !driver->init(nullptr) || !driver->attach(device) || !driver->start(device)) {
+    fail("driver", 0);
+  }
+  IORegistryEntry *mediaEntry = driver->getChildEntry(gIOServicePlane);
+  IOMedia *whole = mediaEntry
+      ? static_cast<IOMedia *>(mediaEntry->metaCast("IOMedia")) : nullptr;
+  const uint32_t expected = sectors ? sectors : clover_emmc_block_sectors();
+  if (!whole || whole->getSize() / kBlockBytes != expected) {
+    fail("media", 0);
+  }
+  *clientOut = device;
+  return whole;
+}
+
 extern "C" void clover_block_run(void)
 {
   // 0. Latch. The IOBSD publish notification is re-delivered on the persistent gIOResources service
@@ -1758,7 +1962,8 @@ extern "C" void clover_block_run(void)
       if (!first || !sectors) {
         fail("udwindow", sectors);
       }
-      rootWindowFromManifest(first, sectors);
+      // Only the boot mode needs the second window; the probe modes read the OS entry alone.
+      windowsFromManifest(first, sectors, apfs == 3);
     } else {
       uint32_t first = 0;
       uint32_t sectors = 0;
@@ -1795,26 +2000,32 @@ extern "C" void clover_block_run(void)
     fail("postload", 0);
   }
 
-  // 4. Publish the block device and start the one driver it is for.
-  CloverBlockDevice *device = new CloverBlockDevice;
-  IOPlatformExpert *platform = IOService::getPlatform();
-  if (!device || !device->init(nullptr)) {
-    fail("device", 0);
+  // 4. Publish the device(s) this mode asks for. `clover-apfs=3` is the boot and publishes two
+  // windows, strictly in order: the OS window, then -- only after its volume exists and
+  // IOMediaBSDClient has named it -- the SystemOS window. drivers/CloverSdhci serves one caller at a
+  // time through a two-second hand-over, so two APFS attaches running at once would make the loser
+  // fail a read. Both boot windows are read-only; the logfs and probe modes keep the writable device
+  // Stage 14 writes through.
+  const uint32_t osFirst = __atomic_load_n(&gWindowFirst, __ATOMIC_ACQUIRE);
+  const uint32_t osSectors = __atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE);
+  CloverBlockDevice *device = nullptr;
+  IOMedia *whole = nullptr;
+  if (apfs == 3) {
+    const uint32_t systemFirst = __atomic_load_n(&gSystemWindowFirst, __ATOMIC_ACQUIRE);
+    const uint32_t systemSectors = __atomic_load_n(&gSystemWindowSectors, __ATOMIC_ACQUIRE);
+    if (!osSectors || !systemSectors) {
+      fail(!osSectors ? "rootwin" : "systemwin", 0);
+    }
+    whole = publishWindow(osFirst, osSectors, true, &device);
+    prepareApfsBoot(whole);
+    CloverBlockDevice *systemDevice = nullptr;
+    IOMedia *systemWhole = publishWindow(systemFirst, systemSectors, true, &systemDevice);
+    prepareSystemOs(systemWhole);
+    IOLog("CloverBlock r143: windows os=%u+%u system=%u+%u fires=%u\n", osFirst, osSectors,
+          systemFirst, systemSectors, fires);
+    return;
   }
-  if (!platform || !device->attach(platform) || !device->start(platform)) {
-    fail("attach", 0);
-  }
-  const OSMetaClass *driverMeta = lookupMetaClass("IOBlockStorageDriver");
-  IOService *driver = driverMeta ? static_cast<IOService *>(driverMeta->alloc()) : nullptr;
-  if (!driver || !driver->init(nullptr) || !driver->attach(device) || !driver->start(device)) {
-    fail("driver", 0);
-  }
-  IORegistryEntry *mediaEntry = driver->getChildEntry(gIOServicePlane);
-  IOMedia *whole = mediaEntry
-      ? static_cast<IOMedia *>(mediaEntry->metaCast("IOMedia")) : nullptr;
-  if (!whole || whole->getSize() / kBlockBytes != mediaSectors()) {
-    fail("media", 0);
-  }
+  whole = publishWindow(osFirst, osSectors, false, &device);
 
   // 4b. Under a window this is where the run ends, and deliberately so: steps 5-9 below are the
   // partition-named root's measurements, and what a window is asking instead is whether Apple's own
@@ -1822,14 +2033,10 @@ extern "C" void clover_block_run(void)
   // partition scheme, no disk0s39 and nothing for those steps to measure; round128's does carry a GPT,
   // and the automatic pass will slice it, but the question stays the same one level up.
   //
-  // Round137 splits the two jobs the window was doing. `clover-apfs=2` keeps the probe (and its
-  // never-returning panic); `clover-apfs=3` is the boot: make the volume exist and return, so the
-  // kernel's own root search and mount run with the standard apfs mountroot instead of this file's.
-  if (__atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE)) {
-    if (apfs == 3) {
-      prepareApfsBoot(whole);
-      return;
-    }
+  // Round137 split the two jobs the window was doing. `clover-apfs=2` keeps the probe (and its
+  // never-returning panic); `clover-apfs=3` is the boot, and it returned above so the kernel's own
+  // root search and mount run with the standard apfs mountroot instead of this file's.
+  if (osSectors) {
     apfsProbe(whole, device);
   }
 
@@ -2008,3 +2215,47 @@ extern "C" void clover_block_request(void)
   }
 }
 
+
+// ---------------------------------------------------------------- the owner mount's contract
+
+// bsd/kern/kern_exec.c's offline owner mount -- sheng's SystemOS step, enabled on this board by
+// patches/xnu-clover/zzy-clover-systemos-mount.patch -- validates the block stack through these two
+// symbols. drivers/NativeVirtioBlock supplies them on sheng from a signed manifest; this board
+// supplies them from the SHNGROOT manifest it just read off userdata, and the answer is the pair of
+// volumes the boot latched: the OS volume root-matching hands the kernel, and the SystemOS cryptex
+// volume the union mount is about. Nothing else can answer yes.
+extern "C" int native_verified_block_root_authorized(dev_t device)
+{
+  if (device == kNoDevice) {
+    return 0;
+  }
+  return device == gOsVolumeDev || device == gSystemVolumeDev;
+}
+
+// The owner mount asks for the SystemOS volume by UUID, then opens the returned /dev path. Both have
+// to name the same volume this boot found: the dev_t is the media's own BSD major/minor, and the path
+// is the devfs node IOMediaBSDClient published for it -- `/dev/<bsd name>`, not a guess.
+extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *device, char *path,
+                                                   size_t size)
+{
+  if (!uuid || !device || !path || !size || strcmp(uuid, kSystemOsVolumeUuid) != 0) {
+    return 0;
+  }
+  IOMedia *media = gSystemVolumeMedia;
+  if (!media) {
+    return 0;
+  }
+  const char *name = nullptr;
+  uint32_t major = 0xffffffff;
+  uint32_t minor = 0xffffffff;
+  if (!volumeBsd(media, &name, &major, &minor)) {
+    return 0;
+  }
+  const dev_t candidate = volumeDev(major, minor);
+  if (candidate != gSystemVolumeDev || !native_verified_block_root_authorized(candidate)) {
+    return 0;
+  }
+  snprintf(path, size, "/dev/%s", name);
+  *device = candidate;
+  return 1;
+}

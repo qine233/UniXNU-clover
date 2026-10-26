@@ -625,6 +625,40 @@ def check_board(errors: list) -> str:
                     if hashlib.sha256(system).hexdigest() != SYSTEM_MODULE_SHA256:
                         errors.append(f"{bundle_path} module 2 is not the IPSW's System trust cache")
 
+    # Round143. Round142's frame was `namespace 6 subcode 0xd` -- OS_REASON_DYLD, dyld's
+    # "Library not loaded: /usr/lib/libSystem.B.dylib ... (no such file, no dylib cache)" while
+    # launching /sbin/launchd. The OS volume is the sealed snapshot and carries neither
+    # /usr/lib/libSystem.B.dylib nor System/Library/Caches/com.apple.dyld/; the dyld cache and usr/
+    # live on the Cryptex1,SystemOS volume beside it. sheng mounts that volume over "/" with
+    # MNT_RDONLY|MNT_UNION from load_init_program(), and the board copies that path: the base repo
+    # already has offline-owner-systemos-mount.patch applied but compiled out, and
+    # scripts/build-xnu-4k-baseline.sh passes -DXNU_OWNER_CACHE_MOUNT=0 (plus STARTUP/UNION_SYSTEMOS)
+    # to kern_exec.o, so the only place the macros can be turned back on is the translation unit
+    # that reads them. Flip any of them in clover_defconfig instead and the builder's gates pull in
+    # OWNER_ROOT_TRUST/VERIFIED_ROOT_PROBE + NativeVirtioBlock, which this board has no use for.
+    patch = next((base / "patches/xnu-clover/zzy-clover-systemos-mount.patch"
+                  for base in (REPO, pathlib.Path.cwd())
+                  if (base / "patches/xnu-clover/zzy-clover-systemos-mount.patch").is_file()), None)
+    if patch is None:
+        errors.append("patches/xnu-clover/zzy-clover-systemos-mount.patch is missing: without it "
+                      "kern_exec.o stays compiled with -DXNU_OWNER_CACHE_MOUNT=0 and launchd dies "
+                      "again at OS_REASON_DYLD for want of the shared cache")
+    else:
+        text = patch.read_text()
+        for macro in ("XNU_OWNER_CACHE_MOUNT", "XNU_OWNER_CACHE_STARTUP",
+                      "XNU_OWNER_UNION_SYSTEMOS"):
+            if f"#undef {macro}" not in text or f"#define {macro} 1" not in text:
+                errors.append(f"{patch.name} does not #undef then #define {macro} 1: the command "
+                              "line's =0 would win and the SystemOS union mount would not run")
+    windows = (userdata or {}).get("windows") or []
+    if [window.get("name") for window in windows] != ["OS", "SystemOS"]:
+        errors.append('[userdata] windows must be OS then SystemOS: CloverBlock publishes them in '
+                      'that order so the OS volume is attached and named before the SystemOS window '
+                      'is handed to a driver whose single-caller guard forbids overlap')
+    if len(windows) == 2 and windows[1].get("component") != "Cryptex1,SystemOS":
+        errors.append('[userdata] windows[1].component is not Cryptex1,SystemOS: the manifest slot '
+                      "is the dyld cache volume sheng union-mounts, not the OS snapshot")
+
     splash = [entry for entry in board.get("bootimg", {}).get("dtb_node", [])
               if "splash" in entry["path"]]
     if splash:

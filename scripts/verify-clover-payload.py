@@ -140,13 +140,19 @@ def check_block(kernel: bytes) -> bool:
     nothing -- the failure shape check-clover.py refuses to let the archives have. Round136 corrects that
     request to min(media size, 512) and adds the media's own geometry (ms=/bs=/mb=), the request it really
     made (ml=/md=), and the media the mount's own dev_t resolves to (xm=/xe=/xs=/xo=/xw=/xr=/xa=/wo=).
-    Round137 adds the boot path beside it: `CloverBlock r137: boot` is the line that names the volume the
-    kernel's own root search will mount, its `vu=%s bsd=%s %u:%u p=%u` format is what carries the UUID and
-    dev_t to the photograph, and the probe's panic line stays because clover-apfs=2 is still compiled in."""
+    Round137 adds the boot path beside it: `CloverBlock r137: apfs` is the probe's own panic line and
+    stays because clover-apfs=2 is still compiled in. Round143 moves the boot line to the two windows:
+    the OS volume and the SystemOS cryptex volume are published one after the other, each named by its
+    own `CloverBlock r143: os|system vu=%s bsd=%s %u:%u p=%u` line, and `windows os=%u+%u system=%u+%u
+    fires=%u` is the one line that proves both windows came from the manifest. The two owner exports
+    are what kern_exec.o's offline-owner patch links against; without them the archive member would
+    not be pulled in at all and the mount would have no volume to ask for."""
     label = "kernel.macho: CloverBlock linked"
     found = {name: name.encode() in kernel
              for name in ("clover-apfs", "CloverBlock r137: apfs",
-                          "CloverBlock r137: boot", "vu=%s bsd=%s %u:%u p=%u",
+                          "CloverBlock r143: os vu=%s bsd=%s %u:%u p=%u",
+                          "CloverBlock r143: system vu=%s bsd=%s %u:%u p=%u",
+                          "CloverBlock r143: windows os=%u+%u system=%u+%u fires=%u",
                           "fl=0x%x fc=0x%x fk=0x%x", "op=0x%x:0x%x mm=0x%x:0x%x",
                           "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x",
                           "dr=%u db=%u dx=0x%x dy=0x%x na=%u ir=0x%x ia=%u "
@@ -158,7 +164,28 @@ def check_block(kernel: bytes) -> bool:
                           "SystemVersion.plist", "_clover_emmc_block_window",
                           "_clover_emmc_block_userdata_window", "SHNGROOT", "EFI PART",
                           "_clover_block_run", "_vnode_setmountedon", "_vn_rdwr",
+                          "_native_verified_block_root_authorized",
+                          "_native_verified_block_volume_device",
                           "_vfs_context_kernel", "_PE_parse_boot_argn")}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
+def check_owner_mount(kernel: bytes) -> bool:
+    """Round143 compiles sheng's offline SystemOS union mount back in. The base tree already carries
+    offline-owner-systemos-mount.patch, but scripts/build-xnu-4k-baseline.sh passes
+    -DXNU_OWNER_CACHE_MOUNT=0 (and STARTUP/UNION_SYSTEMOS) to kern_exec.o, so the block only exists
+    if the board patch won. The panic line is unique to that block and names the failure the round
+    is asking about; `commpage_update_dyld_flags` is the call the dyld-flag arm makes, and the
+    device-path buffer is the one piece of state the mount hands to the photograph."""
+    label = "kernel.macho: owner SystemOS mount compiled in"
+    found = {name: name.encode() in kernel
+             for name in ("offline owner SystemOS mount failed: %d",
+                          "_commpage_update_dyld_flags",
+                          "native_owner_cache_device_path",
+                          "native_owner_cache_native_union")}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
@@ -253,6 +280,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_pmgr(kernel)
         ok &= check_sdhci(kernel)
         ok &= check_block(kernel)
+        ok &= check_owner_mount(kernel)
         ok &= check_mac_probe(kernel)
     return 0 if ok else 1
 

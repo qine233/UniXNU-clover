@@ -1,0 +1,25 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -82,6 +82,22 @@
+ #include <machine/reg.h>
+ #include <machine/cpu_capabilities.h>
+ 
++/*
++ * clover: the offline owner SystemOS mount. drivers/CloverBlock exports the same
++ * native_verified_block_* contract that drivers/NativeVirtioBlock supplies on sheng, so the semantic
++ * gate the build script enforces with XNU_OWNER_ROOT_TRUST (an independently authorized read-only
++ * root plus a named, read-only SystemOS volume) is what those two symbols answer here. The literal
++ * virtio archive that switch would drag in does not exist on this board and is not needed: the block
++ * stack is CloverBlock's. These defines follow the command line's -DXNU_OWNER_*=0 for this
++ * translation unit, which is the only unit that reads them.
++ */
++#undef XNU_OWNER_CACHE_MOUNT
++#undef XNU_OWNER_CACHE_STARTUP
++#undef XNU_OWNER_UNION_SYSTEMOS
++#define XNU_OWNER_CACHE_MOUNT 1
++#define XNU_OWNER_CACHE_STARTUP 1
++#define XNU_OWNER_UNION_SYSTEMOS 1
++
+ #include <sys/cdefs.h>
+ #include <sys/param.h>
+ #include <sys/systm.h>
