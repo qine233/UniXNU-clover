@@ -123,7 +123,7 @@
 // an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
 // attached for start (startCandidate() attaches again after the matching loop's detach).
 //
-// A failure panics with one short CloverBlock r129 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r130 line naming the step; success prints one line
 // and lets the boot continue, except under a window (clover-apfs=1 or =2), where the APFS depth and
 // what the vfs made of it are the report and the run always panics with them. A refire of the IOBSD
 // notification prints one counted line and returns, so the photograph shows both that the run
@@ -170,8 +170,8 @@ int bdevvp (int32_t dev, void **vpp);
 // compiled against. Each signature is copied from the source the boot links against
 // (out/feeds/xnu-0b4b910d): vfs_rootmountalloc is vfs_subr.c:1176, VFS_MOUNT is kpi_vfs.c:193,
 // VFS_ROOT is kpi_vfs.c:260, VFS_START is kpi_vfs.c:215, vfs_unbusy is vfs_subr.c:1088,
-// mount_list_add is vfs_subr.c:7551, vnode_lookupat is vfs_subr.c:7641, vn_rdwr is vfs_vnops.c:915.
-// The opaque handle types (mount_t,
+// mount_list_add is vfs_subr.c:7551, vnode_lookupat is vfs_subr.c:7641, vn_rdwr is vfs_vnops.c:915 and
+// vnode_setmountedon is kpi_vfs.c:2257. The opaque handle types (mount_t,
 // vnode_t, vfs_context_t, kauth_cred_t, proc_t) are all pointers, so void*; VFS_MOUNT's `data` is a
 // user_addr_t, which is 64-bit; the two enum parameters are passed as ints.
 int vfs_rootmountalloc (const char *fsname, const char *devname, void **mpp);
@@ -182,6 +182,7 @@ void vfs_unbusy (void *mp);
 int mount_list_add (void *mp);
 int vnode_lookupat (const char *path, int flags, void **vpp, void *ctx, void *start_dvp);
 int vnode_put (void *vp);
+void vnode_setmountedon (void *vp);
 int vn_rdwr (int rw, void *vp, void *base, int len, int64_t offset, int seg, int ioflg, void *cred,
              int *resid, void *p);
 void *vfs_context_kernel (void);
@@ -250,6 +251,21 @@ static const int kIOUnit = 0x0001;
 // first eight bytes have a magic worth printing), and it is small enough to read in one request.
 static const char *const kVolumePath[4] = { "System", "Library", "CoreServices", "SystemVersion.plist" };
 static const uint32_t kFileBytes = 1024;
+// struct mount and struct vfsstatfs as *this* build lays them out. The numbers are measured, not
+// guessed: the dSYM beside kernel.macho carries 63 copies of struct mount (one per translation unit),
+// all of them agreeing on mnt_vfsstat at 0x84 and mnt_devvp at 0x980 in a 0xa08-byte struct, and the
+// same 63 copies of vfsstatfs agree on f_fstypename at +0x50 and f_mntfromname at +0x460. The probe
+// still refuses to trust the measurement: vfs_rootmountalloc_internal() strlcpy()s vfc_name into
+// f_fstypename (bsd/vfs/vfs_subr.c:1161) and copystr()s the devname it was given into f_mntfromname
+// (:1164), so the struct it just allocated has to spell "apfs" at mp+0xd4 before this file writes a
+// pointer at mp+0x980. Both are little-endian, and MFSTYPENAMELEN is 16, so a correct read is
+// 0x73667061 ('a','p','f','s') followed by three zero words.
+static const uint32_t kMntDevvp = 0x980;
+static const uint32_t kFsTypeName = 0x84 + 0x50;
+static const uint32_t kMntOnName = 0x84 + 0x60;
+static const uint32_t kMntFromName = 0x84 + 0x460;
+static const uint32_t kApfsNameWord = 0x73667061;
+static const uint32_t kMountPointSlash = 0x2f;
 
 // The IOBSD publish notification is delivered on the persistent gIOResources service, whose
 // doServiceMatch re-invokes every still-matching gIOPublishNotification on each pass and ignores the
@@ -626,7 +642,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r129: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r130: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 static uint32_t le32At(const uint8_t *at)
@@ -840,7 +856,7 @@ static void measureApfsDepth(IORegistryEntry *entry, ApfsDepth *depth, uint32_t 
   }
 }
 
-// ---------------------------------------------------------------- round129's mount ladder
+// ------------------------------------------------- round129-130's mount ladder
 
 // One rung per field, and a field that was never reached says so. The reason the errnos are collected
 // instead of panicking at the first non-zero one is that this board gets exactly one photo per flash:
@@ -852,6 +868,10 @@ struct MountReport {
   uint32_t minor;
   uint32_t bdev;   // bdevvp() on the volume's own dev_t
   uint32_t alloc;  // vfs_rootmountalloc("apfs", <the volume's BSD name>)
+  uint32_t name[4];  // the 16 bytes at mp+kFsTypeName -- "apfs" is 0x73667061, 0, 0, 0
+  uint32_t on;     // the word at mp+kMntOnName: the kernel puts a single '/' there (vfs_subr.c:1162)
+  uint32_t from;   // the first 4 bytes at mp+kMntFromName, the volume's own BSD name
+  uint64_t devvp;  // what mp+kMntDevvp reads back, 0 if the layout proof refused the write
   uint32_t mount;  // VFS_MOUNT(mp, devvp, 0) -- the boot root's argument shape
   uint32_t start;  // VFS_START(mp, 0)
   uint32_t root;   // VFS_ROOT(mp)
@@ -882,15 +902,25 @@ static bool volumeBsd(IOMedia *media, const char **name, uint32_t *major, uint32
   return true;
 }
 
-// vfs_mountroot(), transcribed: bsd/vfs/vfs_subr.c:1240 (bdevvp), :1258 (vfs_rootmountalloc and
-// mnt_devvp), :1265 (VFS_MOUNT with no data argument), :1284 and :1286 (vfs_unbusy, mount_list_add)
-// -- then the first lookup and the first read a mounted filesystem ever gets. Two of the root's steps
-// are not transcribed: mp->mnt_devvp = rootvp with the SI_MOUNTEDON that follows it, and
-// vfs_init_io_attributes (:1294). The first needs struct mount and struct vnode laid out, which live
-// only in bsd/sys/mount_internal.h and are not headers this archive compiles against, so the device
-// vnode reaches the filesystem through VFS_MOUNT's argument and nowhere else; if that is not enough
-// for apfs, the mount rung is where it will say so. The second only tunes I/O sizes for the root's
-// paging, and this probe reads one file through the buffer cache.
+// vfs_mountroot(), transcribed: bsd/vfs/vfs_subr.c:1240 (bdevvp), :1258 (vfs_rootmountalloc), :1259
+// (mnt_devvp), :1265 (VFS_MOUNT with no data argument), :1282 (SI_MOUNTEDON), :1284 and :1286
+// (vfs_unbusy, mount_list_add) -- then the first lookup and the first read a mounted filesystem ever
+// gets. Round129 could not copy the two struct-field rungs because this archive compiles no
+// mount_internal.h, and its frame came back `bd=0 al=0 mt=13`: apfs knew the name, took the device
+// vnode, and refused the mount without reading one new block off the card (r=464, round128's count to
+// the byte). The only rung still missing after this round is vfs_init_io_attributes (:1294), which
+// tunes the root's paging I/O sizes and has nothing to do with a mount that has not happened.
+//
+// The field writes are gated on a proof rather than on the measurement. vfs_rootmountalloc_internal
+// strlcpy()s the vfstable's name into f_fstypename, puts a single '/' at the head of f_mntonname
+// (:1162) and copystr()s the devname into f_mntfromname (:1164) -- three marks the kernel writes
+// itself, in three places, and none of them is the place this file is about to write into. So the
+// gate is: mp+0xd4 must spell "apfs" (0x73667061 and three zero words) and mp+0xe4 must be 0x2f. Only
+// then does this file put the device vnode at mp+0x980, and the frame shows what it wrote read back
+// out of the struct -- which lets one photograph tell "the layout was wrong" from "the layout was
+// right and mnt_devvp was not the reason". mp+0x4e4 is drawn as well, so dv=major:minor can be read
+// as a statement about this volume's BSD name rather than about whichever media the BSD client
+// happened to reach first.
 //
 // Every rung returns rather than panicking, so the caller can draw the rungs that ran.
 static void volumeMountLadder(IOMedia *volume, MountReport *report)
@@ -919,10 +949,30 @@ static void volumeMountLadder(IOMedia *volume, MountReport *report)
     return;
   }
 
+  // mp+0xd4 is the name the kernel just strlcpy()ed in, and mp+0x4e4 the devname it just copystr()ed
+  // in. Drawing both is the self-proof: the first has to be "apfs" for the struct to be the struct this
+  // file thinks it is, and the second is what makes dv=major:minor a statement about this volume rather
+  // than about whichever media the BSD client got to first.
+  const uint8_t *mountBytes = reinterpret_cast<const uint8_t *>(mp);
+  for (uint32_t index = 0; index < 4; index++) {
+    report->name[index] = le32At(mountBytes + kFsTypeName + 4 * index);
+  }
+  report->on = le32At(mountBytes + kMntOnName);
+  report->from = le32At(mountBytes + kMntFromName);
+  if (report->name[0] == kApfsNameWord && !report->name[1] && !report->name[2] && !report->name[3] &&
+      report->on == kMountPointSlash) {
+    void **slot = reinterpret_cast<void **>(const_cast<uint8_t *>(mountBytes) + kMntDevvp);
+    *slot = devvp;
+    report->devvp = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(*slot));
+  }
+
   report->mount = static_cast<uint32_t>(VFS_MOUNT(mp, devvp, 0, ctx));
   if (report->mount) {
     return;
   }
+  // vfs_subr.c:1282, through the exported helper rather than a third measured offset:
+  // v_specflags is v_specinfo->si_flags (bsd/miscfs/specfs/specdev.h:100), which is two layouts deep.
+  vnode_setmountedon(devvp);
   // The two bookkeeping calls the boot root makes the moment its mount returns 0. Both matter for
   // what happens after this line: vfs_rootmountalloc_internal() busy()s the mount (vfs_subr.c:1146)
   // and only vfs_unbusy() drops that shared hold, and a mount that is not on the mountlist is
@@ -1063,6 +1113,7 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
   // of it. Every field of the answer is on the same line as the depth that made it possible, so one
   // photograph says both whether the tree grew and what the vfs made of it.
   MountReport report = { kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached,
+                         { 0, 0, 0, 0 }, 0, 0, 0,
                          kRungNotReached, kRungNotReached, kRungNotReached,
                          { kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached },
                          kRungNotReached, 0, 0, 0 };
@@ -1070,12 +1121,16 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
     volumeMountLadder(best.volumeMedia, &report);
   }
 
-  panic("CloverBlock r129: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u dv=%u:%u bd=%u al=%u "
-        "mt=%u st=%u rt=%u k=%u/%u/%u/%u rd=%u g=%u x=0x%x y=0x%x r=%u w=%u",
+  panic("CloverBlock r130: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u dv=%u:%u bd=%u al=%u "
+        "t=0x%x/0x%x/0x%x/0x%x on=0x%x fm=0x%x dp=0x%x:0x%x mt=%u st=%u rt=%u k=%u/%u/%u/%u "
+        "rd=%u g=%u x=0x%x y=0x%x r=%u w=%u",
         __atomic_load_n(&gWindowFirst, __ATOMIC_ACQUIRE),
         __atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE), magic,
         static_cast<uint32_t>(loaded), best.seen, best.scheme, best.container, best.volume,
-        report.major, report.minor, report.bdev, report.alloc, report.mount, report.start,
+        report.major, report.minor, report.bdev, report.alloc,
+        report.name[0], report.name[1], report.name[2], report.name[3], report.on, report.from,
+        static_cast<uint32_t>(report.devvp >> 32), static_cast<uint32_t>(report.devvp),
+        report.mount, report.start,
         report.root, report.lookup[0], report.lookup[1], report.lookup[2], report.lookup[3],
         report.read, report.bytes, report.word0, report.word1,
         __atomic_load_n(&gBlocksRead, __ATOMIC_ACQUIRE),
@@ -1095,7 +1150,7 @@ extern "C" void clover_block_run(void)
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    IOLog("CloverBlock r129: refire n=%u (already ran)\n", fires);
+    IOLog("CloverBlock r130: refire n=%u (already ran)\n", fires);
     return;
   }
 
@@ -1309,7 +1364,7 @@ extern "C" void clover_block_run(void)
     fail("alias-match", reinterpret_cast<uint64_t>(aliasService));
   }
 
-  IOLog("CloverBlock r129: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
+  IOLog("CloverBlock r130: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
         kRootAlias, bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
 }

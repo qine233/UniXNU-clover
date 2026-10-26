@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r129: mount iPadOS's published APFS volume and read a file back"
+title = "clover r130: hand apfs the device vnode and ask the mount again"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1685,8 +1685,11 @@ kernel_args = [
   # "vfs_rootmountalloc_internal() strlcpy()s vfc_name into f_fstypename (vfs_subr.c:1161) and
   #  copystr()s the devname into f_mntfromname (:1164), so if the layout is right the 16 bytes at
   #  mp+0xd4 must read "apfs" -- 0x73667061 followed by three zero words -- and the four bytes at
-  #  mp+0x4e4 must be the volume's own BSD name. Only when t='s first word says apfs does the probe
-  #  write mp+0x980 = the bdevvp vnode, and dp= then reads that pointer back out of the struct.
+  #  mp+0x4e4 must be the volume's own BSD name. The gate uses the two words the kernel writes and
+  #  never the one this probe writes: f_fstypename plus f_mntonname[0], the single '/' the kernel puts
+  #  there at :1162. Only when both say so does the probe write mp+0x980 = the bdevvp vnode, and dp=
+  #  then reads that pointer back out of the struct. A wrong offset cannot survive both markers, and
+  #  a right offset that still gets EACCES is a different answer from the same photograph.
   #  SI_MOUNTEDON (:1282) goes through the exported vnode_setmountedon() (kpi_vfs.c:2257) instead of a
   #  third offset, and only after the mount returns 0. One flash, one question: does the device vnode
   #  change apfs's answer. mt= is the question, t=/fm=/dp= are the proof that the question was asked

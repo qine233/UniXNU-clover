@@ -7828,6 +7828,106 @@ round119/120 那次根挂载的形状）。
 apfs.kext 是闭源的、不在这棵树里。现在 `bd=0 al=0 mt=13 r=464` 的形状 —— 设备 vnode 建好了、名字认下了、一次块都没读就回
 EACCES —— 和「mount 例程先看 `mp->mnt_devvp`，看到 NULL 就把这颗挂载点当成不可信来源」是同一句话。`mnt_devvp` 是头号嫌疑。
 
+## v0.3.3（round130）：把 `mnt_devvp` 那一档补上，并且让结构体自己先作证
+
+round129 的框停在 `mt=13`：`bd=0`、`al=0`、`r=464` 一个字节没涨。那一行把「apfs 读了容器再拒」和「apfs 看都没看就拒」
+分开了，剩下能解释它的只有本轮唯一没抄的那一档 —— `vfs_mountroot()` 在调 mount 之前先写了 `mp->mnt_devvp = rootvp`
+（`bsd/vfs/vfs_subr.c:1259`），而 apfs.kext 是闭源的，「树里没人读这个字段」那句话从来没覆盖过它。本轮就补这一档，
+而且**不信自己的测量**：先让内核自己写进这颗 `mount` 的三个标记说话，证对了才往 `0x980` 写指针。
+
+**偏移是从这次构建自己的 DWARF 里量出来的**，不是猜的，也不是抄别处的头文件：链接后的内核不带 DWARF，但构建目录里
+有 `mach.development.bcm2837.dSYM`，`llvm-dwarfdump --name=mount --show-children` 在里面打出 **63 份** `struct mount`
+（每个编译单元一份），63 份全部一致：
+
+| 字段 | 偏移 | 出处 |
+| --- | --- | --- |
+| `mnt_list` | 0x00 | `mount_internal.h:109`，`mount_list_add()` 写的就是它 |
+| `mnt_vfsstat` | 0x84 | :123 |
+| `mnt_devvp` | 0x980 | :146，本轮要写的这一格 |
+| `struct mount` 大小 | 0xa08 | —— |
+
+`struct vfsstatfs` 同样是 63 份全一致：`f_fstypename` 在 +0x50、`f_mntonname` 在 +0x60、`f_mntfromname` 在 +0x460。
+换算到 `mp` 的绝对偏移是 `0xd4` / `0xe4` / `0x4e4`。
+
+**自证用的是内核自己写进去的三个标记**，都在 `vfs_rootmountalloc_internal()` 里，一个都不归我们填：
+`strlcpy(mp->mnt_vfsstat.f_fstypename, vfsp->vfc_name, MFSTYPENAMELEN)`（:1161）、
+`mp->mnt_vfsstat.f_mntonname[0] = '/'`（:1162）、`copystr(devname, ...f_mntfromname, ...)`（:1164）。
+所以布局对的话，`mp+0xd4` 的 16 个字节必须是 `apfs` —— 按小端两个字读就是 `0x73667061` 后面跟三个 0 —— 紧挨着的
+`mp+0xe4` 必须是 `0x2f`，`mp+0x4e4` 应该是这颗卷自己的 BSD 名前四个字节（`disk` ⇒ `0x6b736964`）。
+**闸门是前两个**（名字 + `/`），第三个只是画出来给人看：它把 `dv=1:3` 从「某个被 BSD 客户端命名的媒体」变成
+「这个名字的这颗卷」。三个标记是内核写的、而且没有一个是本轮要写的那一格，所以证的是整颗布局，不是自说自话。
+
+**写与不写的话都落在同一行上**：证过了才 `*(void **)((uint8_t *)mp + 0x980) = devvp`，然后立刻把 `0x980` 读回来画进
+`dp=高:低`。如果 `t=` 不是 `apfs`，`dp=` 就还是 `0x0:0x0`，`mt=` 依然有值 —— 那一帧说的是「布局没证成立，所以这一档
+仍然没补」，而不是「补了还是被拒」。
+
+**`SI_MOUNTEDON` 走导出符号，不再量第二个布局**：:1282 那句 `mp->mnt_devvp->v_specflags |= SI_MOUNTEDON` 里的
+`v_specflags` 是 `v_specinfo->si_flags`（`bsd/miscfs/specfs/specdev.h:100`），比的是 `struct vnode` 和 `struct specinfo`
+两颗结构，等于再赌两份偏移。内核导出了做同一件事的 `vnode_setmountedon()`（`bsd/vfs/kpi_vfs.c:2257`，它自己
+`vnode_lock_spin()` 再置位），所以本轮调它，一个偏移都不多量。它在 `kernel.macho` 的导出表里（`nm` 里 `S`），
+`build-clover-block.py` 的导入审计直接放行 —— 这也是把它加进 `verify-clover-payload.py` 断言的原因。
+
+**顺序照内核**：`:1258` 分配 → `:1259` 写 `mnt_devvp` → `:1265` `VFS_MOUNT` → `:1282` `SI_MOUNTEDON` → `:1284`
+`vfs_unbusy` → `:1286` `mount_list_add` → `VFS_START` → `VFS_ROOT` → 四级 `vnode_lookupat` → `vn_rdwr`。
+本轮仍然没抄两件事：`vfs_init_io_attributes()`（:1294，只给根的换页调 I/O 尺寸）和 :1268-1279 那段
+「`vfc_mountroot` 可能换掉 rootvp」的引用重算 —— 上一轮已经从源码关掉了前者的可能性：`vfs_add` 把
+`newvfstbl->vfc_mountroot` 硬写成 NULL（`kpi_vfs.c:985`），kext 注册的文件系统只会走 `VFS_MOUNT`。
+
+**预算没变**：round129 那次挂载尝试读的块数是 0（`r=464` 与 round128 一字不差），所以这一轮只要 `mt=` 还是非 0，
+代价和上一帧同级；真过了 `mt=`，后面的路径查找才会开始花钱。`rd=md0`、`clover-apfs=2`、`clover-emmc=21`、
+12000 轮 × `IOSleep(10)` 的等待与 `armcpu-clock-panic=180000` 全部原样。**如果这轮死在定时器上而不是死在这行上，
+`elr=` 是那笔慢读，不是 bug。**
+
+构建与上一轮同一条命令（两个驱动都在 `[kernel] archives` 里，`kernel` 这格照旧不能省），本轮 `userdata` 不重建 ——
+镜像一个字节都没变：
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && scripts/verify-clover-payload.py
+```
+
+产物：内核本地 `dfbf2bca…` / 卷内 `1fa6c496…`（51,994,624 B，探针偏移 6680 字节分布在 35 段里，其余逐字节相同）；
+`payload.img` `45961b9e…`（58,720,256 B = 56 MiB）；ADT `3ef0309d…`（13,268 B，`[payload] title` 进了 ADT，所以每轮都换）；
+`unixnu.toml` `70185d82…`（593 B）；`libCloverBlock.a` 301,936 字节。根镜像 `614b8356…` 与信任缓存 `c3ed2152…` 没动，
+boot 仍是 round87 那份 `196b284f…`，`userdata` 仍是 `round128-userdata-root.sparse.img` `be354a4a…`。
+归档在 `~/clover-out/round130-*`（`round130-SHA256SUMS`）。
+
+checker 增量：`verify-clover-payload.py` 的 `check_block()` 把身份串断言升到 `CloverBlock r130: apfs`，并新增
+`_vnode_setmountedon` —— 本轮那一档是靠这个符号接上的，它要是没链进来，这轮问的就不是它。`check-clover.py` 的根契约
+文案升到 round130，断言不变。
+
+**本轮只刷一格：`cache`（负载）。** 这是有意声明的：**本轮不写任何新的 eMMC 分区** —— `userdata` 保持 round128 刷进去
+的那张 iPadOS 容器镜像，`logfs` 与 `boot` 也不碰。
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round130-payload.img   # 56 MiB，45961b9e…
+fastboot reboot
+```
+
+冷刷，不用 `fastboot boot`。菜单第一行应认得 `clover r130: hand apfs the device vnode and ask the mount again`。
+一次刷机只回答一个问题：**把 `mnt_devvp` 交回去以后，apfs 还拒不拒这次挂载**（`panic` 调用在 `CloverBlock.cpp:1124`，
+屏上按惯例报收尾行 `:1137`）。
+
+`CloverBlock r130: apfs f= n= m= l= d= s= c= v= dv=major:minor bd= al= t=0x../0x../0x../0x.. on=0x.. fm=0x..
+dp=0x..:0x.. mt= st= rt= k=a/b/c/d rd= g= x=0x.. y=0x.. r= w=` 里新增的四栏：
+
+- `t=` —— `mp+0xd4` 的 16 个字节。**期望 `0x73667061/0x0/0x0/0x0`**；不是这个样子就说明 dSYM 量出来的布局在这台机器
+  上不适用，那 `dp=` 一定是 `0x0:0x0`，本轮结论退回「布局没证成立」，`mt=` 不再是答案。
+- `on=` —— `mp+0xe4`。**期望 `0x2f`**，内核在 :1162 写的那一个 `/`。它挨着 `f_fstypename`，等于在另一个字节上再证一次。
+- `fm=` —— `mp+0x4e4` 的前四个字节，也就是我们交给 `vfs_rootmountalloc()` 的那颗卷的 BSD 名。期望是 `disk…`
+  （`0x6b736964`）。这一栏是 `dv=major:minor` 的身份证明。
+- `dp=` —— 写完立刻从 `mp+0x980` 读回来的指针，高 32 位:低 32 位。非 0 说明这一档真的补上了；它和 `mt=` 一起读，
+  才能把「补了还是被拒」和「没补成所以还是被拒」分开。
+
+**下一格的问题**（拿到答案之后）：`mt=0` 就往 `st=`/`rt=`/`k=`/`g=` 走，第一个非 65535 的字段是下一条要问的东西；
+`mt` 仍是 13 而 `t=`/`on=` 都对，那 `mnt_devvp` 就被排除，下一格该问的是「内核自己在这种情形下还会先做什么」——
+也就是 `MNT_ROOTFS`/`mnt_kern_flag` 那一族状态位，或者 apfs 需要先挂容器再挂卷；届时最省事的一步是先让探针把
+`mnt_data`（`mp+0x8f8`，挂载成功才会被文件系统填非 0）和 `vfc_flags` 画出来，而不是再猜一个 errno 的理由。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

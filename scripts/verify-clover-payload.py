@@ -126,16 +126,17 @@ def check_block(kernel: bytes) -> bool:
     CloverSdhci has to have linked in for the geometry to exist at all, and the two magics it reads
     (the SHNGROOT manifest and the GPT header the window turns out to carry). Round129 adds the
     second half of the same line: the volume class whose media it mounts, the filesystem name handed
-    to vfs_rootmountalloc() and the path it walks once the mount is up. Any of them going
+    to vfs_rootmountalloc() and the path it walks once the mount is up. Round130 adds the one rung
+    that needed a struct field -- the exported vnode_setmountedon() it links against. Any of them going
     missing means the round silently asks nothing -- the failure shape check-clover.py refuses to let
     the archives have."""
     label = "kernel.macho: CloverBlock linked"
     found = {name: name.encode() in kernel
-             for name in ("clover-apfs", "CloverBlock r129: apfs",
+             for name in ("clover-apfs", "CloverBlock r130: apfs",
                           "AppleAPFSContainerScheme", "AppleAPFSVolume",
                           "SystemVersion.plist", "_clover_emmc_block_window",
                           "_clover_emmc_block_userdata_window", "SHNGROOT", "EFI PART",
-                          "_clover_block_run")}
+                          "_clover_block_run", "_vnode_setmountedon")}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
