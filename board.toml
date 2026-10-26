@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r149: no deadline; the screen is the only stop"
+title = "clover r150: the root is authorized, not aliased"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1890,7 +1890,17 @@ kernel_args = [
   # shortcut requires a three-character `mdX` -- `rdBootVar[3] == 0` at IOKitBSDInit.cpp:849 and
   # :1080 -- which a four-character alias fails. Round121 already measured this exact prefix trick
   # on hardware: `BSD root: md0s39, major 1, minor 39` with the rootauth block skipped.
-  "rd=md0s39",
+  # Round150 stops using the alias. sheng never renames its root: bsd_init.c's audit block asks
+  # native_verified_block_root_authorized() whether the mounted read-only root is one of its own
+  # media, and drivers/CloverBlock answers yes for the OS and SystemOS devices. r145 already ran the
+  # same check at exec (native_owner_cache_prepare() would have panicked otherwise), so the owner
+  # path is proven on this board. The audit is compiled into bsd_init.o by
+  # patches/xnu-clover/zzy-clover-owner-root-trust.patch, because the upstream build script gates
+  # the switch behind NativeVirtioBlock, which would define these symbols a second time.
+  # With no `rd=` there is no lie left: the root is the one /chosen/root-matching names, ROOTAUTH
+  # runs, and the answer is sheng's answer. If the owner audit refuses, the panel says
+  # `rootvp not authenticated after mounting` -- the same line r137 read, now from the honest path.
+  "-no_slto_panic",
   # Round139 answers round138's frame instead of guessing at it. The panel carried
   # `unexpected SIGKILL of launchd with reason -- namespace 9 code 0x8`, which is
   # os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_SECURITY_POLICY) (bsd/sys/reason.h:255)

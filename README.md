@@ -10408,6 +10408,115 @@ fastboot reboot
 屏上的最后一帧就是答案；若 20 秒后自己重启，那次是 panic，而不是 hang。没有
 自动回 fastboot 的兜底。
 
+## v0.5.3（round150）：根是授权来的，不是改名骗来的
+
+r146 的墙（`shared_region` 空、`check_np` ENOMEM 之后无声）这一轮没有继续拆。
+按「照搬 sheng」的要求，这一轮搬的是 sheng 与 clover 之间**唯一一处还没搬的
+启动关键差异**：sheng 从不给自己根改假名，它让 `bsd_init.c` 的
+`FSIOC_KERNEL_ROOTAUTH` 真正执行，然后在 owner 信任下接受这个根。
+
+### 改了什么
+
+1. `board.toml` 删掉 `rd=md0s39`，补上 sheng 的 `-no_slto_panic`；标题换成
+   `clover r150: the root is authorized, not aliased`。
+2. 新板级补丁 `patches/xnu-clover/zzy-clover-owner-root-trust.patch`：在
+   `bsd_init.c` 里 `#undef` 再 `#define XNU_OWNER_ROOT_AUDIT 1` 与
+   `XNU_OWNER_ROOT_TRUST 1`。上游 `offline-owner-root-binding-audit.patch`
+   本来就在树里，但 `build-xnu-4k-baseline.sh` 把这两个开关关着——它们被
+   `XNU_NATIVE_VIRTIO_BLOCK` 门控，而那个归档会和 CloverBlock 重复定义
+   `native_verified_block_*`。所以还是老办法：只在读它们的 translation unit
+   里覆盖命令行，和 r143 的 `zzy-clover-systemos-mount.patch` 同一形状。
+3. `check-clover.py` 的根契约整体反向：`kernel_args` **不得**含 `rd` /
+   `rd=`；标题必须是 `clover r150:`；新补丁必须存在且四个
+   `#undef`/`#define` 都在；必须有 `-no_slto_panic`。
+4. `verify-clover-payload.py` 新增 `owner root trust compiled in`：查
+   `native_owner_root_checkpoint`、`native_owner_root_accepted`、
+   `native_owner_root_selected_device` 三个符号（审计块引用它们，链接器丢
+   不掉），并确认 `rootvp not authenticated after mounting` 这句还在——它
+   证明的是「如果没编译进去，窗口会读到什么」。
+
+补丁插入点有一个实况：第一版把它放在文件第一行，和
+`zzz-boot-progress.patch` 的首行 `#include` 插入撞在一起。`git apply` 对
+「声明在第 1 行、没有前置上下文」的 hunk 不做向下的偏移搜索，`zzz` 的
+`bsd_init.c` hunk 因此失败，内核构建在补丁阶段就退出（`line 44: apply
+--check failed`）。改到 license 头之后、`#include <sys/param.h>` 之前后，
+两个补丁互不相干，先应用哪个都能过 `--check`。
+
+### ROOTAUTH 现在会做什么
+
+r138 起，`rd=md0s39` 让 `bsd_rooted_ramdisk()` 的前缀判断为真，整个
+`FSIOC_KERNEL_ROOTAUTH` 块被跳过。现在它会被执行：取
+`vfs_devvp(root_mount)` 的 `vnode_specrdev()`，检查根挂载带 `MNT_RDONLY`，
+再问 `drivers/CloverBlock` 的 `native_verified_block_root_authorized(device)`。
+CloverBlock 对 `gOsVolumeDev` 与 `gSystemVolumeDev` 答 yes——r145 的 exec
+路径 `native_owner_cache_prepare()` 已经在实机上走过同一个函数。两问都真，
+`owner_authorized = 1`，ioctl 的失败被接受；否则原来的
+`panic("rootvp not authenticated after mounting")` 照旧。
+
+`-no_slto_panic` 是 sheng 的启动参数，`osfmk/kern/startup.c:476` 把它变成
+`spinlock_timeout_panic = FALSE`。r146 的静默里没有自旋锁报告，但计时器还
+没到点；这一轮先按 sheng 的方式把它摘掉，免得下一帧被一个无关的 panic
+打断。
+
+### 屏上三种读数
+
+1. `rootvp not authenticated after mounting`：审计拒绝了（根不是只读，或
+   `device` 不是 CloverBlock 的两个卷之一）。这说明别名之外还有一层没对齐，
+   下一轮就查 `native_owner_root_decision` / `native_owner_root_readonly`
+   这两个全局值。
+2. 过了 `bsd_init`、继续 exec `/sbin/launchd`：说明假名本来就不是 r146 墙
+   的原因，墙还在更上面，`shared_region` 那条线重新成为唯一嫌疑。
+3. 其它新帧：按原话记录。
+
+### 构建、校验与本轮该刷哪一格
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+构建日志 `~/clover-out/round150-build.log`，退出码 0。两个 checker：
+
+```
+[check-clover] clover ok: ADT 13516 bytes, 8 cores; splash 0x9d400000-0x9f800000,
+FD 0x9fc00000-0x9ff00000; board clover_defconfig, CLOVERESP;
+75 inline asm statements separated; modules visible
+kernel.macho: owner root trust compiled in OK (native_owner_root_checkpoint present,
+native_owner_root_accepted present, native_owner_root_selected_device present,
+rootvp not authenticated after mounting present)
+kernel.macho: asm tails survived the assembler OK
+(mrs SPSR_EL1 in interrupt 1, mrs CNTVCT_EL0 in interrupt 2, msr ICC_SGI1R_EL1 in signalCPU 1)
+```
+
+卷内 `unixnu.toml` 的 args 已确认没有任何 `rd=`，同时带着 `-no_slto_panic`
+与 `cs_enforcement_disable=1`。
+
+产物在 `~/clover-out/round150-*`，`shasum -a 256 -c round150-SHA256SUMS`
+七项全 OK：`payload.img` 58,720,256 B（`7047d320…`）、本地 `kernel.macho`
+51,998,720 B（`611f6a17…`）、卷内 `kernel.macho`（`cb14b125…`，与本地只差
+entry 探针补丁，6,838 字节、35 段）、卷内 `unixnu.toml` 585 B（`a1398d2b…`）、
+ADT 13,516 B（`5a4e70ef…`；`chosen/random-seed` 每次构建随机，其余未变）、
+`scratch-data.img` 35,888 B（`614b8356…`，未变）、trustcache 61,408 B
+（`7c369ce0…`，未变）。
+
+**本轮有一处 eMMC 写入：** payload 刷到 `cache`（与之前每一轮相同，只覆盖
+`cache` 这一格）：
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round150-payload.img
+fastboot reboot
+```
+
+菜单第一行应当是 `clover r150: the root is authorized, not aliased`，冷启动
+（不要 `fastboot boot`）。
+
+这一帧只问一个问题：**把假名拿掉、让根授权真正执行之后，屏上读到的还是不是
+那句 “rootvp not authenticated after mounting”。**
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

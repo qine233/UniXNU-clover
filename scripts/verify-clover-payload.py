@@ -194,6 +194,26 @@ def check_owner_mount(kernel: bytes) -> bool:
     return ok
 
 
+def check_owner_root_trust(kernel: bytes) -> bool:
+    """Round150 removes `rd=md0s39`, so bsd_init.c's FSIOC_KERNEL_ROOTAUTH block is reached and
+    must accept the root on owner grounds instead of skipping the check. The base tree carries
+    offline-owner-root-binding-audit.patch, but scripts/build-xnu-4k-baseline.sh leaves
+    XNU_OWNER_ROOT_AUDIT/TRUST undefined unless NativeVirtioBlock is on, so only the board patch can
+    put the block back. Its evidence is the three globals the audit writes and the checkpoint the
+    audited arm calls; all three are referenced by that arm and cannot be dropped by the linker.
+    The panic text is asserted too: if the audit were compiled out, the boot would reach it."""
+    label = "kernel.macho: owner root trust compiled in"
+    found = {name: name.encode() in kernel
+             for name in ("native_owner_root_checkpoint",
+                          "native_owner_root_accepted",
+                          "native_owner_root_selected_device",
+                          "rootvp not authenticated after mounting")}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_mac_probe(kernel: bytes) -> bool:
     """Round141's probe lives in security/mac_vfs.c, which the link can keep without any symbol
     naming it: the hooks still dispatch through the same vtables and only two printf() calls were
@@ -434,6 +454,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_sdhci(kernel)
         ok &= check_block(kernel)
         ok &= check_owner_mount(kernel)
+        ok &= check_owner_root_trust(kernel)
         ok &= check_root_mount_probe(kernel)
         ok &= check_shared_region_probe(kernel)
         ok &= check_mac_probe(kernel)

@@ -1,0 +1,24 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -79,6 +79,21 @@
+  * Version 2.0.
+  */
+ 
++/*
++ * clover r150: sheng's owner root trust, compiled for this board.
++ *
++ * configs/clover_defconfig cannot switch XNU_OWNER_ROOT_AUDIT/TRUST on: build-xnu-4k-baseline.sh
++ * gates them behind XNU_VERIFIED_ROOT_PROBE and XNU_NATIVE_VIRTIO_BLOCK, and the virtio archive it
++ * would force-load defines the same native_verified_block_* symbols drivers/CloverBlock supplies
++ * for this board's eMMC. The two switches only steer this translation unit, so the board patch
++ * overrides its command line. drivers/CloverBlock answers native_verified_block_root_authorized()
++ * for the OS and SystemOS media, which is the whole contract the audit block asks for.
++ */
++#undef XNU_OWNER_ROOT_AUDIT
++#undef XNU_OWNER_ROOT_TRUST
++#define XNU_OWNER_ROOT_AUDIT 1
++#define XNU_OWNER_ROOT_TRUST 1
++
+ #include <sys/param.h>
+ #include <sys/filedesc.h>
+ #include <sys/kernel.h>

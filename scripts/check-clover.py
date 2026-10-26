@@ -539,18 +539,18 @@ def check_board(errors: list) -> str:
         if not re.fullmatch(r"[A-Za-z0-9_.\-]+(=[A-Za-z0-9_.,\-]+)?", argument):
             errors.append(f"kernel argument {argument} fails the payload pattern")
 
-    # The root contract, round138. The kernel's own vfs_mountroot() is the only mounter. The board
+    # The root contract, round150. The kernel's own vfs_mountroot() is the only mounter. The board
     # declares the root once, in /chosen/root-matching (IOFindBSDRoot deserializes it at
-    # IOKitBSDInit.cpp:790-797 and waits for that IOMedia). One `rd=` remains, `rd=md0s39`, and it is
-    # not a second declaration: the root search never reaches its rd= branch (:888 is guarded by
-    # !matching) and the md shortcut demands a three-character mdX (:849, :1080). Its only reader is
-    # bsd_rooted_ramdisk() (bsd_init.c:450-466), which matches the "md0" prefix and skips the
-    # FSIOC_KERNEL_ROOTAUTH block -- the gate round137 died at (bsd_init.c:1098) because an unsealed
-    # APFS copy cannot pass it. Any other rd= would still declare a root, so it is refused.
-    # drivers/CloverBlock makes the service exist before that wait because its run is triggered by the
-    # earlier publishResource("IOBSD") inside IOKitBSDInit; under clover-apfs=3 it returns instead of
-    # mounting anything itself.
-    # Round119's failure was a dictionary naming a volume no service here carried, not the mechanism.
+    # IOKitBSDInit.cpp:790-797 and waits for that IOMedia). Round138-149 carried `rd=md0s39` as a
+    # four-character alias whose only job was to make bsd_rooted_ramdisk() (bsd_init.c:450-466)
+    # match its "md0" prefix and skip the FSIOC_KERNEL_ROOTAUTH block. Round150 removes the alias:
+    # the ROOTAUTH block now runs, and under XNU_OWNER_ROOT_AUDIT/TRUST it accepts the root when
+    # drivers/CloverBlock's native_verified_block_root_authorized() answers for the mounted device
+    # (offline-owner-root-binding-audit.patch). That is sheng's own path, not a lie, so no rd= is
+    # allowed -- any rd= would declare a second root before the block is reached.
+    # The switches are compiled into bsd_init.o by the board patch below, because
+    # scripts/build-xnu-4k-baseline.sh gates them behind XNU_NATIVE_VIRTIO_BLOCK, whose archive
+    # defines the same native_verified_block_* symbols CloverBlock supplies for this board's eMMC.
     if str(adt.get("root_match_volume_uuid", "")).upper() != ROOT_VOLUME_UUID:
         errors.append(f"[payload.adt] root_match_volume_uuid must be {ROOT_VOLUME_UUID}: "
                       "/chosen/root-matching is the only root declaration this board has")
@@ -559,10 +559,29 @@ def check_board(errors: list) -> str:
                       "unchanged mockfs image; the payload step would emit PackedRAMDisk")
     rd_args = [argument for argument in board["payload"]["kernel_args"]
                if argument == "rd" or argument.startswith("rd=")]
-    if rd_args != ["rd=md0s39"]:
-        errors.append('[payload] kernel_args must carry exactly one rd=, "rd=md0s39": four characters '
-                      "keep it out of IOFindBSDRoot's root declaration (root-matching is the root) "
-                      "while bsd_rooted_ramdisk() matches its md0 prefix and skips ROOTAUTH")
+    if rd_args:
+        errors.append(f"[payload] kernel_args carries {rd_args}: round150 removes rd= entirely; the "
+                      "root is authorized by owner trust, so no alias may declare a ramdisk root "
+                      "and skip the ROOTAUTH block")
+    trust_patch = next((base / "patches/xnu-clover/zzy-clover-owner-root-trust.patch"
+                        for base in (REPO, pathlib.Path.cwd())
+                        if (base / "patches/xnu-clover/zzy-clover-owner-root-trust.patch").is_file()),
+                       None)
+    if trust_patch is None:
+        errors.append("patches/xnu-clover/zzy-clover-owner-root-trust.patch is missing: bsd_init.o "
+                      "would compile with XNU_OWNER_ROOT_AUDIT/TRUST undefined and the now-unskipped "
+                      "ROOTAUTH block would refuse this board's unsealed root")
+    else:
+        text = trust_patch.read_text()
+        for macro in ("XNU_OWNER_ROOT_AUDIT", "XNU_OWNER_ROOT_TRUST"):
+            if f"#undef {macro}" not in text or f"#define {macro} 1" not in text:
+                errors.append(f"{trust_patch.name} does not #undef then #define {macro} 1: the audit "
+                              "block would leave owner_authorized FALSE and the boot would stop at "
+                              '"rootvp not authenticated after mounting"')
+    if "-no_slto_panic" not in board["payload"]["kernel_args"]:
+        errors.append('[payload] kernel_args has no -no_slto_panic: sheng boots with spinlock timeout '
+                      "panics disarmed (osfmk/kern/startup.c:476), and the r146 silence includes no "
+                      "spinlock report only because the timer has not fired yet")
     # Round139. Round138's frame was `namespace 9 code 0x8` with `description none`, i.e.
     # EXEC_EXIT_REASON_SECURITY_POLICY created on process_signature()'s ip_mac_return branch
     # (kern_exec.c:8541-8546) -- a MAC label-update denial, which here is AMFI's hook. Both readers
@@ -773,8 +792,11 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    if not board["payload"]["title"].startswith("clover r149:"):
-        errors.append('[payload] title is not "clover r149: ...": the menu would not name this round')
+    # Round150. Round149 removed the deadline and left the r146 wall untouched, so this round stops
+    # probing that wall and adopts the sheng property it was skipping: the root is accepted by owner
+    # trust, not by an rd= alias. The menu has to name that round.
+    if not board["payload"]["title"].startswith("clover r150:"):
+        errors.append('[payload] title is not "clover r150: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",
