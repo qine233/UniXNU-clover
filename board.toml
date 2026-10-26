@@ -1769,6 +1769,33 @@ kernel_args = [
   # vc=0xa7dd292a vn=0x6e776144/0x61647055/0x31326574/0x31363448 ("Dawn"/"Upda"/"te21"/"H461"). If the device
   # agrees, the selection question is closed and the next rung is /chosen's root-snapshot-name, then
   # DoNotUseSEP.
+  # Round132's photograph agreed, and closed it. vt=1 un=1 vs=0x6f4e vo=0x696c6e4f vu=0x1d874fd
+  # vc=0xa7dd292a vn=0xbe776144/0x61647055/0x31326574/0x363448 all hit (the three apparent digit
+  # differences -- 0xbe vs 0x6e, the dropped leading zero on vu=, and the missing 6 in 0x363448 -- are
+  # photo blur, and dv=1:3 is the disk1s1 the host attached) -- and the board reaches this one volume,
+  # unsealed, and still answers mt=13 with r=464 for the fourth consecutive round. That r=464 is the
+  # stronger half of the frame now: no media block has been read when the refusal is taken, so the
+  # answer cannot be in the bytes we selected and the selection question is closed on the device.
+  # What mt= actually is, from the host pass over container_rootmount (0xfffffff00567fa0c, frame 0x160):
+  # `stp xzr,xzr,[sp,#0x50]` reserves its errno out slot, both exits load it into w19, and apfs_vfsop_mount's
+  # mode-0 arm stores its return verbatim -- so mt= is not a code apfs invents, it is a number somebody else
+  # handed back. Only four sites in that function write a foreign return into the slot: three bdevvp calls and
+  # container_load_with_callback (0xfffffff005670890, x4 = sp+0x50). Our own bd=0 kills bdevvp on the spot --
+  # the kernel's bdevvp opens with FREAD through VNOP_OPEN and panics on its ref failures, so it cannot be
+  # quietly returning 13 -- which leaves the loader. In its no-vnode path that function does
+  # `cmp w19,#0; mov w8,#0x13; csinc w1,w8,wzr,ne` (fmode = FREAD|FWRITE when w19 is set, plain FREAD when it
+  # is not), passes the name buffer from its caller as x0, and stores vnode_open's return straight into the saved
+  # errno pointer. XNU's exported vnode_open is path-based (bsd/sys/vnode.h:2143), and the sibling branch in
+  # container_rootmount snprintf()s "/dev/" in front of a BSD name, so the sentence we have been waiting for is
+  # simply: apfs opens /dev/<that media's BSD Name>, and its errno is the 13 we draw. The kernel's own EACCES
+  # census (/tmp/eacces2.py over __TEXT_EXEC: 336 `mov w?,#0xd` sites, attributed by nearest symbol) leaves one
+  # candidate that fits this path -- vnode_authorize (bsd/vfs/vfs_subr.c:8753), whose `if (result == EPERM)
+  # result = EACCES;` at :8768 is the flip -- reached from vn_authorize_open_existing (:8160) when the open
+  # asks for KAUTH_VNODE_WRITE_DATA, which explains how bd=0 and mt=13 coexist: the read-only open never touches
+  # kauth. Two temptations fell away on the way: the loader's "refusing exclusive access ... other clients are
+  # actively accessing the container device" writes 16 (EBUSY), not 13, so our still-open devvp is not the
+  # reason; and the AppleImage4 root-authorization gate sits behind a dispatch that only passes mode 3 and mode
+  # 8, so it is unreachable in mode 0 and round131's Image4 hypothesis is retracted.
   "clover-apfs=2",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the

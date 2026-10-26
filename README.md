@@ -8245,6 +8245,135 @@ vc=0xa7dd292a vn=0x6e776144/0x61647055/0x31326574/0x31363448`），`mt=` 与 `r=
    看到的不是一回事，`vn=` 前两字会直接告诉我们是哪颗；那时先修枚举，别急着改挂载参数。
 3. **`mt=0`** —— 那就跳过了这一格，直接进 `rootvp not authenticated after mounting` 那颗钉子（候选 3）。
 
+## round132 读数（v0.3.5 实机，2026-10-26）
+
+一帧，逐字对上了宿主的预测：
+
+```
+f=15797536 n=11870275 m=1 l=0 d=10 s=1 c=1 v=1
+vt=1 un=1 vs=0x6f4e vo=0x696c6e4f vu=0x1d874fd vc=0xa7dd292a
+vn=0xbe776144/0x61647055/0x31326574/0x363448
+dv=1:3 bd=0 al=0 t=0x73667061/0x0/0x0/0x0 on=0x2f fm=0x6b736964
+dp=0xffffffff:0x107bd5b0 fl=0x4005001 fc=0x4001001 fk=0x0
+op=0xfffffff0:0x5f2b3c8 mm=0xfffffff0:0x56c5fac mt=13
+st=65535 rt=65535 k=65535/65535/65535/65535 rd=65535 g=0 x=0x0 y=0x0 r=464 w=0
+@CloverBlock.cpp:1369
+```
+
+- **新七栏全部命中**：`vt=1`（实机只扫到一颗卷）、`un=1`（它就是一颗 `Sealed=No`）、`vs=0x6f4e`（"No"）、
+  `vo=0x696c6e4f`（"Online"）、`vu=0x1d874fd`（宿主的 `0x01d874fd`，前导零是打印/照片的事）、
+  `vc=0xa7dd292a`（容器 UUID）、`vn=` 四字的期望是 `0x6e776144/0x61647055/0x31326574/0x31363448`
+  （`Dawn`/`Upda`/`te21`/`H461`），照片里首字读成 `0xbe776144`、末字读成 `0x363448` 少一位 —— 都是拍照糊掉的位，
+  不是字段的差别（`0x6e776144` 与 `0xbe776144` 只差最高字节，`w`/`a`/`n` 三字节完全一致）。
+  **⇒ 这台板子的 IOKit 枚举和宿主 `diskutil apfs list` 看到的是同一颗卷：`DawnUpdate21H461`，没密封、在线。**
+- **旧栏一个没动**：`dv=1:3`、`bd=0`、`al=0`、`t=` 拼出 "apfs"、`on=0x2f`、`fl=0x4005001 → fc=0x4001001`
+  （`MNT_ROOTFS` 0x4000 被清掉了，且只清了它）、`mm=0xfffffff0056c5fac`、**`mt=13`、`r=464`（连续第四轮一字不差）**。
+- **帧尾 `@CloverBlock.cpp:1369` 命中** —— `panic()` 那串格式符跨到 1369 行的预测成立，行的映射可信。
+
+**这一格关闭了。** 挂错卷这个假设到此为止：我们挂的就是那颗 `Sealed=No` 的 OS 卷，身份和宿主一致，
+`VFS_MOUNT` 还是回 13。`r=464` 不变还多tell一件事：**拒绝发生在读任何媒体块之前**（464 块全是自己扫描时读的），
+13 不是「容器超级块读不出来」。
+
+## round132 读数之后：13 追到了一句 `vnode_open`
+
+### 新仪器：apfs 的每一处外呼现在都有名字
+
+apfs 调内核走的是 12 字节桩：`adrp x16, #page; ldr x16, [x16, #off]; br x16`。关键是**那些槽位（段
+`__PLK_DATA_CONST`）在文件里就烤着内核 vmaddr**，而 `round132-kernel.macho` 带着 276,972 条 nlist。
+`/tmp/namestubs.py` 于是能把每条桩解析成符号（`/tmp/stubs.json`，**2813 条**），`/tmp/dfun2.py` 在反汇编里
+同时内联符号和 `adrp/add` 指向的 C 串。这条路上一口气有了名字的是：`current_task`、`copyin`、**`bdevvp`**、
+`vnode_specrdev`、`vnode_open`、`vnode_mount`、`vfs_context_current`、`vfs_context_kernel`、`vfs_context_suser`、
+`proc_selfpid`、`proc_selfname`、`OSMetaClassBase::metaCast`/`safeMetaCast`、`snprintf`、`strlcpy`、`strncpy_chk`、
+`VNOP_IOCTL`、`lck_mtx_unlock`、`IOBSDNameMatching`、`IOService::copyMatchingService`。
+
+两条踩坑值得记：`LC_SEGMENT_64` 是 `<4Q4I>`，不是 `<4Q6I>`；`ldr` 的位移要信 capstone，别自己抠 imm10 ——
+拿槽 `0x5f25440` 的值验的，它正好等于 `_bdevvp` 的地址。
+
+### `mt=` 就是 `container_rootmount` 的 errno 出参
+
+`apfs_vfsop_mount` 的 mode 0 那条臂 `bl 0x567fa0c` 之后 `str w0,[sp,#0xec]; mov x26,x0` ⇒ 被调者的非零返回值**原样**
+变成挂载的返回值。`container_rootmount`（`0x567fa0c..0x5680344`，帧 0x160）的 `stp xzr,xzr,[sp,#0x50]` 就是那颗 errno 槽，
+而它的出口有两条 `ldr w19,[sp,#0x50]`（`0x567fcdc`、`0x5680214`）—— **函数返回的数就是槽里的数**。
+整段里没有 `#0xd`；往槽里写硬编码常量的站点只有 79、16、2、12、15。能往槽里写「别人的返回值」的只有四处：
+三处 `bdevvp`（`0x567fc3c`、`0x567fea4`、`0x56800b4`，每处后面都跟着 `str w0,[sp,#0x50]`）和一处
+`container_load_with_callback`（`0x5670890`，`x4 = sp+0x50`）。
+
+### `bd=0` 当场把 `bdevvp` 排除掉了
+
+round129 那一档自己就在驱动里调 `bdevvp((major<<24)|minor, &devvp)`，画的就是 `bd=`。这帧 `dv=1:3 bd=0` ⇒
+内核给我们这颗卷的 dev_t 造得出 vnode、也开得起（`bdevvp` 内部是 `VNOP_OPEN(vp, FREAD)`；源码里 NODEV 之外唯一的
+静默非零返回来自 `vnode_create_internal`，而它的区间 `0x7472018..0x7472a00` 里也没有 `#0xd`）。
+
+顺手把 dev 的拼法和真机对齐了：`ls -l /dev/disk0s3` = `0x1000003`、`/dev/disk1s1` = `0x1000006`
+（major 恒为 1，minor 是全局分片计数），而 apfs 在 `0x567fc34` 拼的是 `orr w0, w0, w25, lsl #24`
+（w25 取自 `BSD Major`、低字取自 `BSD Minor`）—— **就是 XNU 的 `major<<24|minor`，我们报的和它算的是同一个 dev_t，
+没有串位。**
+
+### 剩下那处：加载器里有一句按路径的 `vnode_open`，它的返回值直接进 errno 槽
+
+`container_load_with_callback`（`0x5670890`，帧 0x4d0）自己也没有 `#0xd`，但它把入参 `x4` 存成 `[sp,#0x58]` 当 errno
+出参用，并且在「手上没有现成 vnode」（`cbz x24, 0x5670bb0`）这条路上：
+
+```
+0x5670bb0  cmp   w19, #0
+0x5670bb4  mov   w8, #0x13
+0x5670bb8  csinc w1, w8, wzr, ne      ; w19!=0 → 0x13 = FREAD|FWRITE；w19==0 → 1 = FREAD
+0x5670bc0  mov   x0, x27              ; = 入参 x0，那颗名字缓冲
+0x5670bc4  mov   w2, #0
+0x5670bc8  mov   w3, #0
+0x5670bbc  add   x4, sp, #0xb0
+0x5670bcc  ldr   x5, [sp, #0x50]      ; 上下文：0x56708e0 bl vfs_context_current
+0x5670bd0  bl    vnode_open           ; 桩 0x5769394
+0x5670bd4  ldr   x8, [sp, #0x58]
+0x5670bd8  str   w0, [x8]             ; *** 返回值原样写进那颗 errno 出参 ***
+0x5670bdc  cbnz  w0, 0x567135c
+```
+
+XNU 导出的 `vnode_open` 是**按路径**开文件的（`bsd/sys/vnode.h:2143`：
+`vnode_open(const char *path, int fmode, int cmode, int flags, vnode_t *vpp, vfs_context_t ctx)`），六个槽位与这里一一对上；
+而 `container_rootmount` 的另一半正好用 `snprintf("/dev/", …)` 造过同类名字 ⇒ **apfs 是在对 `/dev/<那颗媒体的 BSD Name>`
+做一次按路径的打开，并把它的 errno 交回 `container_rootmount` 的返回值，也就是我们画了四轮的那个数。**
+（`w19` 的来源我没追到底；若它是 0，这次就是 FREAD-only、轮不到写授权 —— 这恰好就是 `vw=`/`vr=` 要一刀切开的东西。）
+
+### 13 从哪来：`vnode_authorize` 把 EPERM 翻成 EACCES
+
+`vn_open` → `vn_authorize_open_existing`（`bsd/vfs/vfs_subr.c:8160`）：`fmode & (FWRITE | O_TRUNC)` 时请求
+`KAUTH_VNODE_WRITE_DATA`（:8228-8240），再 `vnode_authorize`（:8753）：
+
+```c
+	result = kauth_authorize_action(vnode_scope, vfs_context_ucred(ctx), action, ...);
+	if (result == EPERM) {          /* traditional behaviour */
+		result = EACCES;
+	}
+```
+
+全内核 `__TEXT_EXEC` 的 `mov wN,#0xd` 普查（`/tmp/eacces2.py`，336 处）里，`vnode_authorize+0x74` 那一处对上的就是
+这句 EPERM→EACCES（:8768-8770）。而 `bdevvp` 走的是 `VNOP_OPEN`，**根本不经过 kauth** —— 这就是 `bd=0` 和 `mt=13`
+能同时成立的机制：同一颗设备，绕过授权开得了，带着写按路径开就被拒。
+
+### 同时排除掉的两处诱人文案
+
+- `container_load_with_callback` 里那句 `"refusing exclusive access to pid <%d (%s)> as other clients <%d> are
+  actively accessing the container device = %s"`（`0x5670c38`）之后写的是 `mov w20, #0x10` ⇒ **EBUSY(16)**，不是 13。
+  同一颗函数里另一处 `"container already loaded by pid <%d> in exclusive mode…"` 同理。**「我们已经把 devvp 开着，
+  占住了设备」这条路排除了**（真要说，它许的是 16）。
+- **round131/132 心里挂着的「Image4 根认证那道门」正式作废。** 那道门在 `0x56c6a7c` 的第二次分发之后，而那次分发
+  只放 **mode 3 与 mode 8** 过去（mode 0/1/2/4..7 一律从 `0x56c6ab4` 离开），`validate_payload_and_manifest`
+  （`0x56809a0`）和它前面两处 `copyin`（`0x56c6bdc`、`0x56c6bf0`）都在门后 ⇒ **mode 0 到不了**。
+  `handle_crypto_mount` 那句 `#0xd` 也一样，只在 mode 4..7 那条臂上。
+
+**下一格的候选**（排序短清单）：
+
+1. **在驱动里替 apfs 把它那句 `vnode_open` 复现一遍**（推荐）：拿 `volumeBsd()` 已经在手的 `devname`，
+   `snprintf` 成 `/dev/<name>`，先用 `FREAD` 开一次、再用 `FREAD|FWRITE` 开一次，画 `nd=`（那颗名字本身，四个 `le32`）、
+   `vr=`、`vw=`，再加 `cr=` = `kauth_cred_getuid(vfs_context_ucred(ctx))`。读法：
+   `vr=0 vw=13` ⇒ 生产者当场抓获，下一格就变成「让那颗节点允许带写打开」（我们发布的媒体属性 / 上下文 cred）；
+   `vr=2` ⇒ `/dev` 里根本没有这颗节点（devfs 还没造出来），13 来自别处；
+   `vr=vw=0` ⇒ 我们的线程能过而 apfs 不能，差别在它自己的 `w19`/flags，那时再量 mode。
+2. **ADT 加 `/chosen { root-snapshot-name = <快照名>; }`** —— 现在排在 1 后面：它治的是快照/密封，
+   而这一轮的宿主证据把问题挪到了「带写按路径打开 `/dev` 节点」。
+3. **`/filesystems { DoNotUseSEP; }`** 与 **`allow-root-hash-mismatch`** —— 同属认证类，等 `mt=0` 之后再动才有意义。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以
