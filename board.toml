@@ -154,7 +154,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r130: hand apfs the device vnode and ask the mount again"
+title = "clover r131: clear the boot-root flag and draw the function that refuses"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1720,6 +1720,12 @@ kernel_args = [
   # scripts/check-native-apfs-file-checkpoints.py records mount_results=(0,0,0,0,2) for mode 1 and
   # original_user_root_mount_mode_refused=True for mode 0. Clearing MNT_ROOTFS and asking again is
   # one variable, and the expected 0x4001|vfc_flags in mnt_flag is its own layout proof.
+  # Round131 (v0.3.4) is that variable, drawn on the same line: fl= is mnt_flag as the kernel left it,
+  # fc= is the same slot read back after MNT_ROOTFS came off (the clear only happens when fl= really
+  # carries 0x4001 and round130's name markers still hold, so fc= alone separates "not there to clear"
+  # from "cleared and refused anyway"), fk= is mnt_kern_flag drawn but never written, op= is
+  # *(mp+0x28) and mm= is *op -- the address of the function that has been answering 13, which
+  # disassembles on the host whichever way mt= goes.
   "clover-apfs=2",
   "clover-emmc=21",
   # Passed again, for the opposite reason. Round82 removed it because the EL0 report was the

@@ -123,7 +123,7 @@
 // an unattached candidate faults inside the kext. Attach happens before probe, and the object stays
 // attached for start (startCandidate() attaches again after the matching loop's detach).
 //
-// A failure panics with one short CloverBlock r130 line naming the step; success prints one line
+// A failure panics with one short CloverBlock r131 line naming the step; success prints one line
 // and lets the boot continue, except under a window (clover-apfs=1 or =2), where the APFS depth and
 // what the vfs made of it are the report and the run always panics with them. A refire of the IOBSD
 // notification prints one counted line and returns, so the photograph shows both that the run
@@ -266,6 +266,19 @@ static const uint32_t kMntOnName = 0x84 + 0x60;
 static const uint32_t kMntFromName = 0x84 + 0x460;
 static const uint32_t kApfsNameWord = 0x73667061;
 static const uint32_t kMountPointSlash = 0x2f;
+// Round131's three, from the same dSYM pass and the same 63 agreeing copies: mnt_flag at 0x70,
+// mnt_kern_flag at 0x74 and mnt_op at 0x28. mnt_op is what vfs_rootmountalloc_internal() fills from
+// vfsp->vfc_vfsops (bsd/vfs/vfs_subr.c:1151), struct vfsops is 0xa0 bytes, and its first member is
+// vfs_mount -- so *mnt_op is the address of the function that has been answering 13. The flag pair is
+// the other half of this round: :1153 writes MNT_RDONLY | MNT_ROOTFS into mnt_flag, which means every
+// mount this probe has ever asked for declared itself a boot root. MNT_RDONLY is bsd/sys/mount.h:296
+// and MNT_ROOTFS is :326.
+static const uint32_t kMntFlag = 0x70;
+static const uint32_t kMntKernFlag = 0x74;
+static const uint32_t kMntOp = 0x28;
+static const uint32_t kMntRdonly = 0x1;
+static const uint32_t kMntRootfs = 0x4000;
+static const uint32_t kRootMountFlags = kMntRdonly | kMntRootfs;
 
 // The IOBSD publish notification is delivered on the persistent gIOResources service, whose
 // doServiceMatch re-invokes every still-matching gIOPublishNotification on each pass and ignores the
@@ -642,7 +655,7 @@ static OSObject *property(IORegistryEntry *entry, const char *key)
 
 __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 {
-  panic("CloverBlock r130: %s %llu", step, static_cast<unsigned long long>(value));
+  panic("CloverBlock r131: %s %llu", step, static_cast<unsigned long long>(value));
 }
 
 static uint32_t le32At(const uint8_t *at)
@@ -856,7 +869,7 @@ static void measureApfsDepth(IORegistryEntry *entry, ApfsDepth *depth, uint32_t 
   }
 }
 
-// ------------------------------------------------- round129-130's mount ladder
+// ------------------------------------------------- round129-131's mount ladder
 
 // One rung per field, and a field that was never reached says so. The reason the errnos are collected
 // instead of panicking at the first non-zero one is that this board gets exactly one photo per flash:
@@ -872,6 +885,11 @@ struct MountReport {
   uint32_t on;     // the word at mp+kMntOnName: the kernel puts a single '/' there (vfs_subr.c:1162)
   uint32_t from;   // the first 4 bytes at mp+kMntFromName, the volume's own BSD name
   uint64_t devvp;  // what mp+kMntDevvp reads back, 0 if the layout proof refused the write
+  uint32_t flag;   // mp+kMntFlag as the kernel left it; 0x4001|vfc_flags is what :1153 should write
+  uint32_t cleared;  // mp+kMntFlag after MNT_ROOTFS came off, 0 when the flag proof refused the edit
+  uint32_t kernFlag;  // mp+kMntKernFlag, drawn but never written
+  uint64_t ops;    // mp+kMntOp: the filesystem's struct vfsops
+  uint64_t mountFn;  // *ops, which is vfs_mount -- the function that has been returning 13
   uint32_t mount;  // VFS_MOUNT(mp, devvp, 0) -- the boot root's argument shape
   uint32_t start;  // VFS_START(mp, 0)
   uint32_t root;   // VFS_ROOT(mp)
@@ -910,6 +928,10 @@ static bool volumeBsd(IOMedia *media, const char **name, uint32_t *major, uint32
 // vnode, and refused the mount without reading one new block off the card (r=464, round128's count to
 // the byte). The only rung still missing after this round is vfs_init_io_attributes (:1294), which
 // tunes the root's paging I/O sizes and has nothing to do with a mount that has not happened.
+// Round130 copied the mnt_devvp rung and its frame came back with the layout proven and mt=13
+// unchanged, so that rung is now disproved rather than missing; what round131 adds is not another
+// transcription but the one thing the ladder had no answer for -- what the mount struct declares
+// itself to be, and which function has been saying no.
 //
 // The field writes are gated on a proof rather than on the measurement. vfs_rootmountalloc_internal
 // strlcpy()s the vfstable's name into f_fstypename, puts a single '/' at the head of f_mntonname
@@ -964,6 +986,34 @@ static void volumeMountLadder(IOMedia *volume, MountReport *report)
     void **slot = reinterpret_cast<void **>(const_cast<uint8_t *>(mountBytes) + kMntDevvp);
     *slot = devvp;
     report->devvp = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(*slot));
+  }
+
+  // Round131's rung, and it is a question rather than a transcription: vfs_rootmountalloc_internal()
+  // writes MNT_RDONLY | MNT_ROOTFS into mnt_flag (bsd/vfs/vfs_subr.c:1153) and only then ORs in the
+  // vfstable's visible flags, so a mount struct that came out of that allocator has to carry both
+  // bits -- which makes the expected value this field's own layout proof, in the same shape as the
+  // three name markers above. Only when both are where :1153 puts them does this file drop
+  // MNT_ROOTFS, and fc= is the field read back after the edit, so one frame still separates "the flag
+  // was not there to clear" from "it was cleared and apfs refused anyway". Why ask it at all: the
+  // base repository's own APFS fixture mounts a volume successfully with a mount_apfs whose mode is
+  // 1 (an ordinary data mount) and records that mode 0 -- a request to serve as the boot root -- is
+  // refused, and every mount this port has asked for has declared itself a boot root by construction.
+  //
+  // ops and mountFn are pure observation. mnt_op is the vfstable's vfsops table, struct vfsops is
+  // 0xa0 bytes with vfs_mount as its first member, and this build stores those pointers unsigned, so
+  // mountFn is the address of the very function that answered 13 in rounds 129, 130 and this one.
+  // Drawing it costs nothing and turns the next refusal into a disassembly instead of a guess.
+  uint32_t *flagSlot = reinterpret_cast<uint32_t *>(const_cast<uint8_t *>(mountBytes) + kMntFlag);
+  report->flag = *flagSlot;
+  report->kernFlag = le32At(mountBytes + kMntKernFlag);
+  if (report->name[0] == kApfsNameWord && !report->name[1] && !report->name[2] && !report->name[3] &&
+      report->on == kMountPointSlash && (report->flag & kRootMountFlags) == kRootMountFlags) {
+    *flagSlot = report->flag & ~kMntRootfs;
+    report->cleared = *flagSlot;
+  }
+  report->ops = le64At(mountBytes + kMntOp);
+  if (report->ops) {
+    report->mountFn = le64At(reinterpret_cast<const uint8_t *>(report->ops));
   }
 
   report->mount = static_cast<uint32_t>(VFS_MOUNT(mp, devvp, 0, ctx));
@@ -1114,6 +1164,7 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
   // photograph says both whether the tree grew and what the vfs made of it.
   MountReport report = { kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached,
                          { 0, 0, 0, 0 }, 0, 0, 0,
+                         0, 0, 0, 0, 0,
                          kRungNotReached, kRungNotReached, kRungNotReached,
                          { kRungNotReached, kRungNotReached, kRungNotReached, kRungNotReached },
                          kRungNotReached, 0, 0, 0 };
@@ -1121,8 +1172,9 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
     volumeMountLadder(best.volumeMedia, &report);
   }
 
-  panic("CloverBlock r130: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u dv=%u:%u bd=%u al=%u "
-        "t=0x%x/0x%x/0x%x/0x%x on=0x%x fm=0x%x dp=0x%x:0x%x mt=%u st=%u rt=%u k=%u/%u/%u/%u "
+  panic("CloverBlock r131: apfs f=%u n=%u m=%u l=%u d=%u s=%u c=%u v=%u dv=%u:%u bd=%u al=%u "
+        "t=0x%x/0x%x/0x%x/0x%x on=0x%x fm=0x%x dp=0x%x:0x%x fl=0x%x fc=0x%x fk=0x%x "
+        "op=0x%x:0x%x mm=0x%x:0x%x mt=%u st=%u rt=%u k=%u/%u/%u/%u "
         "rd=%u g=%u x=0x%x y=0x%x r=%u w=%u",
         __atomic_load_n(&gWindowFirst, __ATOMIC_ACQUIRE),
         __atomic_load_n(&gWindowSectors, __ATOMIC_ACQUIRE), magic,
@@ -1130,6 +1182,9 @@ __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *clien
         report.major, report.minor, report.bdev, report.alloc,
         report.name[0], report.name[1], report.name[2], report.name[3], report.on, report.from,
         static_cast<uint32_t>(report.devvp >> 32), static_cast<uint32_t>(report.devvp),
+        report.flag, report.cleared, report.kernFlag,
+        static_cast<uint32_t>(report.ops >> 32), static_cast<uint32_t>(report.ops),
+        static_cast<uint32_t>(report.mountFn >> 32), static_cast<uint32_t>(report.mountFn),
         report.mount, report.start,
         report.root, report.lookup[0], report.lookup[1], report.lookup[2], report.lookup[3],
         report.read, report.bytes, report.word0, report.word1,
@@ -1150,7 +1205,7 @@ extern "C" void clover_block_run(void)
   uint32_t expected = 0;
   if (!__atomic_compare_exchange_n(&gCloverBlockRan, &expected, 1u, false,
                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    IOLog("CloverBlock r130: refire n=%u (already ran)\n", fires);
+    IOLog("CloverBlock r131: refire n=%u (already ran)\n", fires);
     return;
   }
 
@@ -1364,7 +1419,7 @@ extern "C" void clover_block_run(void)
     fail("alias-match", reinterpret_cast<uint64_t>(aliasService));
   }
 
-  IOLog("CloverBlock r130: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
+  IOLog("CloverBlock r131: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
         kRootAlias, bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
 }

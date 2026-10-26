@@ -7994,6 +7994,86 @@ Apple 的 kernelcache 同样只剩 `kern_apfs_reflock_*` 这十个，所以内�
 **下一格按读数分支**（本轮的分支）：`mt=13` 且 `t=`/`on=`/`fm=` 全对 —— 走「读那个函数 + 清 `MNT_ROOTFS`」这条路，
 不再猜它。
 
+## v0.3.4（round131）：清掉 `MNT_ROOTFS` 再问一次，并把那个回 13 的函数地址画在同行
+
+**一次刷机问一件事**：这颗 `mount` 自称是启动根（`mnt_flag` 里的 `MNT_ROOTFS`），apfs 是不是就为这个说不。
+同一个变量之外，本轮顺手做一件一直没做的事 —— 把「谁在回答」的地址取出来：`mnt_op` 在 `mp+0x28`，`struct vfsops`
+第一格就是 `vfs_mount`，所以 `mm=` 那两个字就是过去三轮一直回 `13` 的那个函数的地址。它不改变任何行为，纯观察，
+而且无论这轮的 `mt=` 是 0 还是 13 都不亏 —— 前者说明根标志就是理由，后者给下一格一份能直接反汇编的目标。
+
+**为什么值得问这一位**（两条都是量出来或抄来的，不是猜的）：
+
+- `vfs_rootmountalloc_internal()` 在 `bsd/vfs/vfs_subr.c:1153` 写死 `mp->mnt_flag = MNT_RDONLY | MNT_ROOTFS`
+  （`0x1 | 0x4000 = 0x4001`，`bsd/sys/mount.h:296` 与 `:326`），再 `|=` 上 vfstable 的可见标志。也就是说凡是走这个
+  分配器出来的 `mount`，都带「我是启动根」的形状 —— 而这正是只有 `vfs_mountroot()` 才该有的形状。
+- 主干里有一份**真挂成功过**的 apfs 数据挂载：`scripts/qemu-entry/native-apfs-mount.inc` 走 `mount(2)`，参数
+  0x150 字节，`mode` 在 +0x10，`:45-47` 写得很明白 —— 1 是普通数据挂载，**0 是「请求当启动根」**；
+  `scripts/check-native-apfs-file-checkpoints.py:115` 断言 mode 1 那次 `mount_results=(0,0,0,0,2)`（errno 0），
+  `:122` 记的是 `original_user_root_mount_mode_refused=True`。apfs 对「把我当根挂」这种请求是拒的。
+
+**布局证明照旧，而且这一位自带期望值**：写之前仍然要求 round130 那两个内核自己写的标记成立（`t=` 拼出 `apfs`、
+`on=0x2f`），再加第三条 —— `(fl & 0x4001) == 0x4001`。`mnt_flag` 的期望值本身就是这一格偏移正确的证明，形状和
+上一轮的三颗名字标记一样。闸门过了才做 `*flagSlot = fl & ~MNT_ROOTFS`，并且**立刻把这个槽读回来**画进 `fc=`。
+`fk=`（`mnt_kern_flag`，`mp+0x74`）只画不写，`op=`/`mm=` 也只读不写：这一轮一共只动了一个位。
+
+新的五栏这样读：
+
+- `fl=0x..` —— `mnt_flag` 在内核手里时的原值。至少该含 `0x4001`；若不含，说明这颗 `mount` 不是 :1153 那条路填的，
+  本轮的清除没发生，`fc=` 会是 `0x0`。
+- `fc=0x..` —— 清完立刻读回来的值。期望 `fl & ~0x4000`。它是「清掉了」的凭证：`fc=0x0` 配 `fl` 正常，就是闸门没放行，
+  结论退回「这一位没得清」而不是「清了还被拒」。
+- `fk=0x..` —— `mnt_kern_flag`，本轮没有依据去动它，画出来只为下一格留一份基线。
+- `op=0x..:0x..` —— `*(mp+0x28)`，这颗文件系统 vtable 里的 `struct vfsops` 指针；非 0 才谈得上下一栏。
+- `mm=0x..:0x..` —— `*op`，也就是 `vfs_mount` 的地址。减去内核的加载偏移就是 `kernel.macho` 里的文件偏移，
+  在宿主上 `objdump --start-address=` 直接读那个函数。
+
+**`mt=` 的三种分岔**：`0` —— 根标志就是理由，本轮之后按 `st=`/`rt=`/`k=`/`g=` 往下走；仍是 `13` —— 停止猜它，
+下一格拿 `mm=` 反汇编，看它到底查哪一样（`mnt_data`/keybag/容器顺序都会在那里露头）；`fc=0x0` —— 布局或被写入的
+那一格和预期不符，`fl=` 是答案。
+
+**预算不变**：清除一个标志位不花钱，本轮仍然大概率零新读块（`r=464` 是上一帧的数）。`rd=md0`、`clover-apfs=2`、
+`clover-emmc=21`、等待轮数与 `armcpu-clock-panic=180000` 全部原样；真过了 `mt=`，后面的查找才开始花钱。
+**如果这轮死在定时器上而不是死在这行上，`elr=` 是那笔慢读，不是 bug。**
+
+构建命令与上一轮相同（两个驱动都在 `[kernel] archives` 里，`kernel` 那格照旧不能省），本轮 `userdata` 不重建 ——
+镜像一个字节都没变：
+
+```
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-root/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+产物：内核本地 `07ef9d17…` / 卷内 `b5580172…`（51,994,624 B，探针偏移仍是 6680 字节分布在 35 段里，其余逐字节相同）；
+`payload.img` `c269a2eb…`（58,720,256 B = 56 MiB）；ADT `3b0af500…`（13,268 B，`[payload] title` 进了 ADT，所以每轮都换）；
+`unixnu.toml` `24ddb306…`（602 B）；`libCloverBlock.a` 307,400 字节。根镜像 `614b8356…` 与信任缓存 `c3ed2152…` 没动，
+boot 仍是 round87 那份 `196b284f…`，`userdata` 仍是 `round128-userdata-root.sparse.img` `be354a4a…`。
+归档在 `~/clover-out/round131-*`（`round131-SHA256SUMS`）。
+
+checker 增量：`check_block()` 的身份串升到 `CloverBlock r131: apfs`，并新增两条 panic 行片段断言
+`fl=0x%x fc=0x%x fk=0x%x` 与 `op=0x%x:0x%x mm=0x%x:0x%x` —— 本轮一个新导入符号都没有，全靠量出来的偏移，
+所以格式串里的这五个字段是「这轮真的在问这件事」的唯一可见证据。`check-clover.py` 的根契约文案升到 round131，
+断言不变。
+
+**本轮只刷一格：`cache`（负载）。** 这是有意声明的：**本轮不写任何新的 eMMC 分区** —— `userdata` 保持 round128 刷进去
+的那张 iPadOS 容器镜像，`logfs` 与 `boot` 也不碰。
+
+```
+fastboot flash cache /Users/zhouzhou/clover-out/round131-payload.img   # 56 MiB，c269a2eb…
+fastboot reboot
+```
+
+冷刷，不用 `fastboot boot`。菜单第一行应认得 `clover r131: clear the boot-root flag and draw the function that refuses`。
+一次刷机只回答一个问题：**把 `MNT_ROOTFS` 清掉之后，apfs 还拒不拒这次挂载**（`panic` 调用从 `CloverBlock.cpp:1175` 起，
+屏上按惯例报收尾行 `:1192`）。
+
+`CloverBlock r131: apfs f= n= m= l= d= s= c= v= dv=major:minor bd= al= t=0x../0x../0x../0x.. on=0x.. fm=0x..
+dp=0x..:0x.. fl=0x.. fc=0x.. fk=0x.. op=0x..:0x.. mm=0x..:0x.. mt= st= rt= k=a/b/c/d rd= g= x=0x.. y=0x.. r= w=`
+里前九栏与 round130 逐字相同（同一颗容器、同一颗卷、同一棵树、同一个 `mnt_devvp`），新增的就是上面那五栏。
+
 ## 有意省略的部分
 
 - **内核里没有现成的块设备驱动。** XNU 有 UFS 的 `NativeUfs`，但没有 eMMC/SDHCI 的，所以

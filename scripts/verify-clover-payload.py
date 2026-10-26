@@ -127,12 +127,15 @@ def check_block(kernel: bytes) -> bool:
     (the SHNGROOT manifest and the GPT header the window turns out to carry). Round129 adds the
     second half of the same line: the volume class whose media it mounts, the filesystem name handed
     to vfs_rootmountalloc() and the path it walks once the mount is up. Round130 adds the one rung
-    that needed a struct field -- the exported vnode_setmountedon() it links against. Any of them going
+    that needed a struct field -- the exported vnode_setmountedon() it links against. Round131 adds no
+    import and no symbol: it works straight off measured offsets, so the only way to see that it asks
+    its question is the flag and vfsops slots on its panic line. Any of them going
     missing means the round silently asks nothing -- the failure shape check-clover.py refuses to let
     the archives have."""
     label = "kernel.macho: CloverBlock linked"
     found = {name: name.encode() in kernel
-             for name in ("clover-apfs", "CloverBlock r130: apfs",
+             for name in ("clover-apfs", "CloverBlock r131: apfs",
+                          "fl=0x%x fc=0x%x fk=0x%x", "op=0x%x:0x%x mm=0x%x:0x%x",
                           "AppleAPFSContainerScheme", "AppleAPFSVolume",
                           "SystemVersion.plist", "_clover_emmc_block_window",
                           "_clover_emmc_block_userdata_window", "SHNGROOT", "EFI PART",
