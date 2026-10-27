@@ -421,6 +421,25 @@ def check_read_integrity(kernel: bytes) -> bool:
     return ok
 
 
+# Round178 changes who owns the block host, not what crosses it, and that is exactly the kind of change
+# a payload can silently drop: the menu would still say r178 while the driver kept the guard for a whole
+# request. The one string the round adds names both halves of the reading -- the cuts this request made
+# and the waits the boot accumulated -- so its presence in the shipped image is the assertion.
+GUARD_HANDOFF = ("CloverSdhci r178: %s handoff lba=%u blocks=%u done=%u cuts=%u waits=%u worst=%llu ms",)
+
+
+def check_guard_handoff(kernel: bytes) -> bool:
+    """Round178 releases the block guard between chunks of one request, so a page fault at the other
+    volume is queued behind a chunk rather than behind a 102-second transaction flush. The round's only
+    new string is the hand-off report, and it is compiled in on both paths -- a payload without it is
+    the round171 driver wearing a round178 label."""
+    label = "kernel.macho: block guard hand-off"
+    missing = [name for name in GUARD_HANDOFF if name.encode() not in kernel]
+    ok = not missing
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({'present' if ok else missing[0]})")
+    return ok
+
+
 def check_verdict_ring(kernel: bytes) -> bool:
     """Round174 writes every CloverSdhci verdict line to logfs as a record of its own, round175 feeds
     the kernel's own log lines in, and round176 gives that second producer its own ring so the first one
@@ -811,6 +830,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_amfi_allow(kernel)
         ok &= check_dyld_cache_skip(kernel)
         ok &= check_read_integrity(kernel)
+        ok &= check_guard_handoff(kernel)
         ok &= check_verdict_ring(kernel)
         ok &= check_exec_sig_dump(kernel)
         ok &= check_kernel_normalized(kernel)

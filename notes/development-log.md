@@ -12837,3 +12837,163 @@ KCID 各只有一处；于是「忘了归一化就进 payload」的构建会在�
 fastboot flash cache /Users/zhouzhou/clover-out/round177-payload.img
 fastboot reboot
 ```
+
+## round178（v0.5.34）：块守卫在请求中途换手
+
+### 读数
+
+本轮没有新照片，用的是 round170 那一帧——它已经在 round171 一节抄全，这里只取与本轮
+直接有关的三行事实：
+
+```
+CloverSdhci r169: read guard lba=16526882 blocks=1 done=0 st=00000000   （同形状共 8 条）
+tx_flush:1173: disk5 tx xid 526 took 102001275 us to flush
+tx_flush:1173: disk5 tx xid 527 took 120000602 us to flush
+```
+
+再加上 pid 1 自己的死法：`initproc exited -- exit reason namespace 2 subcode 0xa`，
+namespace 2 = `OS_REASON_SIGNAL`、subcode 0xa = SIGBUS，也就是「已经映射进来的页读不出
+来」。同一帧里 launchd 是在往前走（comm 在换、pid 在铺、`t=` 从 29 涨到 66、`ns=-1`
+不是崩溃），所以这不是循环，是一次页调入拿不到字节。
+
+`st=00000000` 是本轮的落点：`PRESENT_STATE` 一个位都没举——卡不忙、FIFO 不忙、线路
+不忙。这些读不是被介质拒绝的，是被**前一个持锁者**拒绝的。round171 把「抢不到就拒」
+改成「抢不到就等」（`gBlockLock = IOLockAlloc()`，形状照 sheng `NativeUfs` 的每设备一
+把锁），那一步是对的，但它只改了**等待的地点**，没改**所有权的大小**：等待仍然只发生
+在请求的开头，一旦某个请求拿到守卫，它就一直握着到最后一个块段结束。
+
+于是这一帧的算术是：一次握着多久？读请求的死线基数是 `frequency * 5`（5 秒）加每块
+20 ms；写请求是 `frequency * 30`（30 秒）加每块 200 ms，`writeSettled` 单批上限也是
+30 秒。round167 之后 EXT_CSD 的 `CACHE_CTRL` 是开着的（r171 起还会显式提交），但
+APFS 一次 checkpoint 是几千次「发写—等落盘」，串起来就是那两条 102/120 秒的
+`tx_flush`。对页调入而言，它能等的上限从「一次请求」变成「一次请求 × 卡的忙」，而
+r169 那 30 秒的有界自旋正是被这个上限杀死的。
+
+### 结论
+
+等待的地点已经对了，剩下的问题单位错了：**所有权该按块段计，而不是按请求计**。把
+守卫的换手点放进读写两条循环内部，一个页调入最长等的就只剩「一个块段 + 它的落盘」，
+而请求仍然可以在自己活着的时候跑完几千块。
+
+两条被明确否掉的替代方案，记在这里免得下一轮重走：
+
+- **缩短写的死线**。round167 帧已经证明代价：一次被判失败的写直接长成
+  `Container corruption detected by apfs_scan_verify`。写必须等卡把块落到介质上，
+  这是数据完整性的要求，不是可以调的参数。
+- **在 flush 中途放手**。`clover_emmc_flush_cache` 是第三处握守卫的区域，本轮故意
+  不动它：它等的是卡自己的缓存编程（CMD6 关→提交→开，两步各一条 R1b 忙线），DAT 线
+  此刻本来就是忙的，插进来的读只会停在同一个 `DATA_INHIBIT` 位上，换手只换来一次
+  「等得更久的人」。
+
+### 改动
+
+**一、`handOffBlockGuard`。** 在 `releaseBlockGuard` 之后：
+
+```cpp
+static bool handOffBlockGuard (uint64_t &frequency, uint64_t &start, uint64_t &owned)
+{
+  owned += readCounter () - start;
+  releaseBlockGuard ();
+  if (!acquireBlockGuard (frequency, start)) {
+    return false;
+  }
+  __atomic_add_fetch (&gGuardHandoffs, 1u, __ATOMIC_RELAXED);
+  return true;
+}
+```
+
+重新排队抢不到时**不是**危险状态：`acquireBlockGuard` 只在 `gBlockLock` 为空时失败，
+而 `releaseBlockGuard` 在完全相同的条件下什么都不做，所以「没握锁却去解锁」不可能发生。
+调用侧因此带一个 `held` 标志，抢不到就把这一次传输按 `guard` 档报失败并结束请求，
+尾巴上的 `teeKernelLog`/`flushVerdictRing`/`releaseBlockGuard` 一起跳过。
+
+**二、死线改成只计握着的时长。** 两处的判断从 `readCounter () - start > deadline`
+改成
+
+```cpp
+if (owned + readCounter () - start > deadline) {
+```
+
+`acquireBlockGuard` 在返回前把 `start` 重置到自己抢到之后的那一 tick，所以没有
+`owned` 累加的话，一个反复排队的请求会把自己的死线烧成「周围所有人花掉的时间」，
+那就不再是「这次传输太慢」的界。r169/r171 的 deadline 基数、每块份额一档都没改。
+
+**三、读写两条循环各插入一个换手点。** 每交付满一段就放一次手：
+
+```cpp
+done += moved;
+sinceCut += moved;
+if (done < blocks && sinceCut >= kReadChunkBlocks) {
+  sinceCut = 0;
+  if (!handOffBlockGuard (frequency, start, owned)) {
+    reportReadFailure ("guard", lba + done, blocks, done, 0);
+    held = false;
+    break;
+  }
+  cutIn = true;
+}
+```
+
+`moved` 是这一段真的走了多少块——批量成功是 128，退到单块是 1。这个形状是故意的：
+批量被判不可信、整轮走单块的启动，照样每 128 块放一次手，而不是每请求一次。写侧
+（`clover_emmc_block_write`）同一形状，只是失败档归到写自己的 `write gave up`，
+r167/r168 的 `write not ready`、`write settle took` 三行一字未动。
+
+**四、三个新读数与最多四行报告。** `gGuardWaits` 在每次 `acquireBlockGuard` 里用
+`__atomic_add_fetch` 计数（顺手记一个 `gGuardWorstWait`，跨线程竞争取最大值，丢了只会
+少报，因为它是读数不是判据）；`gGuardHandoffs` 每次换手 +1。尾巴上最多四行：
+
+```
+CloverSdhci r178: %s handoff lba=%u blocks=%u done=%u cuts=%u waits=%u worst=%llu ms
+```
+
+`%s` 是 `read`/`write`。r168 那句 `block guard waited %llu ms`（每启动一次）保留，
+两句一起才是完整答案：一句说最长等了多久，一句说换手真的发生过几次。
+
+### 契约与构建
+
+`board.toml` 标题升到 `clover r178: the block guard changes hands between chunks`；
+`check-clover.py` 钉 `gGuardHandoffs`/`gGuardWorstWait` 两颗全局、两个新函数签名、
+r178 格式串、`if (owned + readCounter () - start > deadline) {`、
+`if (done < blocks && sinceCut >= kReadChunkBlocks) {`，并要求
+`handOffBlockGuard (frequency, start, owned)` **出现两次以上**（只插一条循环等于没修），
+`acquireBlockGuard` 体内必须有 `gGuardWaits = __atomic_add_fetch`。
+`verify-clover-payload.py` 多一项 `kernel.macho: block guard hand-off`，共 25 项。
+
+驱动改动也要整趟 `build kernel`（它是链进 prelink 集合的），本轮是增量：十二颗板级归档
+加 XNU 加 prelink。构建前照惯例在 `.cache/xnu-work` 里逆掉
+`zzy-clover-dyld-cache-skip.patch`。一处编译期教训记在源码里：`gGuardWaits++` 在这种
+`volatile uint32_t` 上会被 `-Werror,-Wdeprecated-volatile` 打死，本板驱动一律用
+`__atomic_*`。
+
+产物：round178 prelink `b8e194b6dc91d4258fc950c99e766436e97bce7e0eeee60c44ad90046b9622f1`
+（52,043,776 字节）、归一化交付内核 `fb2946ae602fb5af409ff29fcf02e796acd86e99b704056c8028bff03ec2dcde`
+（AMFI 两处命中 file `0x1a880e4`/`0x1a8816c`，字照旧 `0x34000229 -> 0x14000011`、
+`0x36000520 -> 0xd503201f`）、payload `283243792154097e31a3476e6bf3c5d94cae5ece33ae354683f08d3cc8fe35fd`
+（58,720,256 字节）、卷内 kernel `2a5cea30d54838c84c904747674828a3f5b9f0dbf057923747c4c2346f4cb200`、
+`unixnu.toml` `96817875…`、ADT `732a9815…`、`scratch-data.img` `614b8356…`（未变）、
+trustcache `7c369ce0…`（未变）。入口探针 `6844 bytes in 37 runs`，另有
+`3860 outside executable text ignored`——那批字节就是归一化动过的三处字段（962 颗
+mtime + `LC_UUID` + KCID），round177 起它成为常驻计数。
+`check-clover.py`、`normalize-kernel-macho.py --selftest`、
+`check-cs-blob-structure.py --selftest`、`read-clover-log.py --selftest`、
+`verify-clover-payload.py` 25 项全 OK。
+
+### 这一帧问什么
+
+三个新数在驱动环（kind 21）里，一次 `dd` 全拿：
+
+- `cuts=` 大于零——守卫确实在请求中途放过手；
+- `worst=` 给出这一条启动里最长的一次排队是多少毫秒。判据是一句话：**如果 pid 1 的
+  SIGBUS 消失而 `tx_flush … took … us` 仍然是百秒量级**，那页调入不是被写请求挡死的，
+  下一格该改的是段长（128 块 → 更小）而不是放手的时机；**如果 `worst=` 自己就涨到秒
+  级**，那是卡的忙在排队，本轮只把它摊平了，真正要动的是写路径的吞吐（排期 7）。
+- 同一条启动里 `load code signature error 4` 是否还从内核环（kind 22）里出现——r170
+  那一帧它被挤掉了，两个环分开之后这一格第一次能给出确定答案。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round178-payload.img
+fastboot reboot
+```

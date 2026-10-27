@@ -268,6 +268,17 @@ static volatile uint32_t gBlockSectors = 0;
 // puts the waiter to sleep instead of into a loop. This is the same instrument, on the one host
 // these reads share. Allocated at bring-up; the device is not published if it is missing.
 static IOLock *gBlockLock = nullptr;
+// Round178: what round171's lock made possible but did not itself do -- give a waiter a turn *during*
+// a request, not only between requests. The r170 frame measured the cost of owning the host for a
+// whole request: `tx_flush: disk5 tx xid 526 took 102001275 us to flush` on one volume, and on the
+// other eight reads that failed with `st=00000000`, no host error bit at all, because they never got
+// the guard. pid 1 then died of SIGBUS in a page-in. Waiting is not the same as being refused, so
+// round171 removed the refusal; a waiter still sleeps for the holder's whole run, and a run is 128
+// blocks at a time. These counters are the hand-off below's own readings: how many times a holder
+// gave the lock away mid-request, how many waits that produced, and the longest of them.
+static volatile uint32_t gGuardHandoffs = 0;
+static volatile uint32_t gGuardWaits = 0;
+static volatile uint64_t gGuardWorstWait = 0;   // ticks, the worst wait any caller has measured
 // Round127's second export: the logfs partition as a window, first LBA and length, taken from the
 // GPT entry this boot read rather than from the constants above -- those two only decide whether
 // the entry is the one this port has been reading. A block device described as this window has
@@ -1493,6 +1504,14 @@ static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start)
   const uint64_t waitStart = readCounter ();
   IOLockLock (gBlockLock);
   const uint64_t waited = readCounter () - waitStart;
+  // Round178: every wait is counted, and the worst one kept, so the hand-off report at the tail of a
+  // request can say what the lock actually did rather than what it was expected to do. This is a
+  // racy maximum across the boot's threads and that is fine: it is a reading, and an occasional lost
+  // increment only understates it. The wait is measured before the holder's deadline starts.
+  gGuardWaits = __atomic_add_fetch (&gGuardWaits, 1u, __ATOMIC_RELAXED);
+  if (waited > __atomic_load_n (&gGuardWorstWait, __ATOMIC_RELAXED)) {
+    __atomic_store_n (&gGuardWorstWait, waited, __ATOMIC_RELAXED);
+  }
   // Round168: one line, once per boot. A frame that shows a long wait next to the APFS errors
   // proves contention; a frame with no line and the same errors moves the wall back into the card.
   static bool guardReported = false;
@@ -1510,6 +1529,44 @@ static void releaseBlockGuard (void)
   if (gBlockLock) {
     IOLockUnlock (gBlockLock);
   }
+}
+
+// Round178: hand the host to whoever is waiting, then take it back for the rest of this request.
+// Called between chunks, so a request that needs eight 64 KiB runs is eight owners rather than one
+// owner for the whole transfer -- which is what a page fault at the other volume needs. `owned`
+// accumulates guarded time so the request keeps round169's deadline (a bound on the transfer, not on
+// how long the rest of the boot took around it) while no single hold outlives one chunk. Losing the
+// re-acquire is not a hazard: acquireBlockGuard fails only when gBlockLock is null, and
+// releaseBlockGuard does nothing in exactly the same case, so the tail of a request can never unlock
+// a lock nobody holds.
+static bool handOffBlockGuard (uint64_t &frequency, uint64_t &start, uint64_t &owned)
+{
+  owned += readCounter () - start;
+  releaseBlockGuard ();
+  if (!acquireBlockGuard (frequency, start)) {
+    return false;
+  }
+  __atomic_add_fetch (&gGuardHandoffs, 1u, __ATOMIC_RELAXED);
+  return true;
+}
+
+// Round178: the hand-off says so, a few times per boot, from the holder that did it. The number this
+// frame has to answer is whether a reader ever cut in between two chunks of someone else's request
+// and what it waited: `handoff` rows plus the r168 `block guard waited` row are the two sides of it.
+static void reportGuardHandoff (const char *dir, uint32_t lba, uint32_t blocks, uint32_t done)
+{
+  static uint32_t reported = 0;
+  if (reported >= 4) {
+    return;
+  }
+  reported++;
+  const uint64_t frequency = counterFrequency ();
+  const uint64_t worst = __atomic_load_n (&gGuardWorstWait, __ATOMIC_RELAXED);
+  sdhciSay ("CloverSdhci r178: %s handoff lba=%u blocks=%u done=%u cuts=%u waits=%u worst=%llu ms\n",
+         dir, lba, blocks, done,
+         __atomic_load_n (&gGuardHandoffs, __ATOMIC_RELAXED),
+         __atomic_load_n (&gGuardWaits, __ATOMIC_RELAXED),
+         static_cast<unsigned long long> (frequency ? worst * 1000ULL / frequency : 0));
 }
 
 // Round165's second half: the device itself proves the two read paths agree. The first multi-block
@@ -2060,6 +2117,13 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   }
   // Round169: the request deadline covers the transfer, not the wait above or the one-shot check.
   start = readCounter ();
+  // Round178: `owned` is the guarded time already spent, so the deadline below means the same thing
+  // it did when one owner held the host for the whole run -- but the clock stops while the host is
+  // with somebody else. `cutIn` records that this request gave its host away at least once.
+  uint64_t owned = 0;
+  uint32_t sinceCut = 0;
+  bool cutIn = false;
+  bool held = true;
   // Round167: the whole-request deadline scales with the run. A flat two seconds was sized for a
   // batch that finishes in milliseconds; a request that falls back to single blocks over a large
   // APFS or dyld read can exceed it, and a truncated read is an EIO the filesystem reports as
@@ -2070,7 +2134,7 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
                             static_cast<uint64_t>(blocks) * (frequency / 50ULL);
   uint32_t done = 0;
   while (done < blocks) {
-    if (readCounter () - start > deadline) {
+    if (owned + readCounter () - start > deadline) {
       reportReadFailure ("deadline", lba, blocks, done, 0);
       break;
     }
@@ -2121,32 +2185,54 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
         chunkRead = readMultiBlock (lba + done, target, chunk, got, status);
       }
     }
+    uint32_t moved = 0;
     if (chunkRead) {
-      done += chunk;
-      continue;
+      moved = chunk;
+    } else {
+      // Round168: one block, three attempts, each from a reset data circuit. The old shape reported
+      // EIO after the first refusal, and APFS re-read the same block forever.
+      bool blockRead = false;
+      uint32_t lastStatus = 0;
+      for (uint32_t attempt = 0; attempt < 3 && !blockRead; attempt++) {
+        uint32_t got = 0;
+        uint32_t status = 0;
+        blockRead = readPioBlock (lba + done, target, got, status);
+        lastStatus = status;
+      }
+      if (!blockRead) {
+        reportReadFailure ("gave up", lba + done, blocks, done, lastStatus);
+        break;
+      }
+      moved = 1;
     }
-    // Round168: one block, three attempts, each from a reset data circuit. The old shape reported
-    // EIO after the first refusal, and APFS re-read the same block forever.
-    bool blockRead = false;
-    uint32_t lastStatus = 0;
-    for (uint32_t attempt = 0; attempt < 3 && !blockRead; attempt++) {
-      uint32_t got = 0;
-      uint32_t status = 0;
-      blockRead = readPioBlock (lba + done, target, got, status);
-      lastStatus = status;
+    done += moved;
+    sinceCut += moved;
+    // Round178: a full chunk of progress is the unit of ownership. Release the host here and a page
+    // fault at the other volume gets its read in the middle of this run instead of after it -- the
+    // r170 frame's `read guard ... st=00000000` rows are reads that were never refused by the card,
+    // only by the holder ahead of them. Falling back to single blocks counts the same way, so a boot
+    // whose batch is untrusted still cuts every 128 blocks instead of every request.
+    if (done < blocks && sinceCut >= kReadChunkBlocks) {
+      sinceCut = 0;
+      if (!handOffBlockGuard (frequency, start, owned)) {
+        reportReadFailure ("guard", lba + done, blocks, done, 0);
+        held = false;
+        break;
+      }
+      cutIn = true;
     }
-    if (!blockRead) {
-      reportReadFailure ("gave up", lba + done, blocks, done, lastStatus);
-      break;
-    }
-    done++;
+  }
+  if (cutIn) {
+    reportGuardHandoff ("read", lba, blocks, done);
   }
   // Round174: this is one of the places the guard is held and the card is idle, so it is also where
   // pending verdict lines get written out. Four records per pass; the rest wait for the next request.
   // Round175: the kernel log tee runs first, so a line it accepts here can be flushed in this pass.
-  teeKernelLog ();
-  flushVerdictRing ();
-  releaseBlockGuard ();
+  if (held) {
+    teeKernelLog ();
+    flushVerdictRing ();
+    releaseBlockGuard ();
+  }
   return done;
 }
 
@@ -3224,8 +3310,18 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
   }
   uint32_t done = 0;
   bool settleReported = false;
+  // Round178: same ownership accounting as the read path. The write path is the one the r170 frame
+  // caught holding the host -- one APFS transaction flush ran 102 seconds and 120 seconds on the two
+  // samples, and every read at the other volume failed with no error bit because it never got the
+  // guard. A flush is not one request, so a per-request bound would not have touched it; cutting at
+  // chunk boundaries means the longest a holder can keep a reader waiting is one chunk plus its
+  // settle wait, and the reader goes between the chunks of the next one.
+  uint64_t owned = 0;
+  uint32_t sinceCut = 0;
+  bool cutIn = false;
+  bool held = true;
   while (done < blocks) {
-    if (readCounter () - start > deadline) {
+    if (owned + readCounter () - start > deadline) {
       break;
     }
     // Round159: one CMD25 for a run of blocks. The pointer arithmetic is 64-bit for the same reason
@@ -3301,45 +3397,64 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
         }
       }
     }
+    uint32_t moved = 0;
     if (chunkWritten) {
-      done += chunk;
-      continue;
-    }
-    bool blockWritten = false;
-    for (uint32_t attempt = 0; attempt < 2 && !blockWritten; attempt++) {
-      uint32_t handed = 0;
-      uint32_t status = 0;
-      if (!writePioBlock (lba + done, target, handed, status)) {
-        continue;
+      moved = chunk;
+    } else {
+      bool blockWritten = false;
+      for (uint32_t attempt = 0; attempt < 2 && !blockWritten; attempt++) {
+        uint32_t handed = 0;
+        uint32_t status = 0;
+        if (!writePioBlock (lba + done, target, handed, status)) {
+          continue;
+        }
+        uint32_t rsp = 0, settleStatus = 0, polls = 0;
+        if (writeSettled (rsp, settleStatus, polls)) {
+          blockWritten = true;
+          break;
+        }
+        resetReadPath ();
+        waitCardIdle (frequency);
+        if (!settleReported) {
+          settleReported = true;
+          sdhciSay ("CloverSdhci r167: write not ready lba=%u blocks=1 rsp=%08x st=%08x "
+               "polls=%u\n", lba + done, rsp, settleStatus, polls);
+        }
       }
-      uint32_t rsp = 0, settleStatus = 0, polls = 0;
-      if (writeSettled (rsp, settleStatus, polls)) {
-        blockWritten = true;
+      if (!blockWritten) {
+        static bool giveUpReported = false;
+        if (!giveUpReported) {
+          giveUpReported = true;
+          sdhciSay ("CloverSdhci r168: write gave up lba=%u blocks=%u done=%u\n",
+               lba + done, blocks, done);
+        }
         break;
       }
-      resetReadPath ();
-      waitCardIdle (frequency);
-      if (!settleReported) {
-        settleReported = true;
-        sdhciSay ("CloverSdhci r167: write not ready lba=%u blocks=1 rsp=%08x st=%08x "
-               "polls=%u\n", lba + done, rsp, settleStatus, polls);
-      }
+      moved = 1;
     }
-    if (!blockWritten) {
-      static bool giveUpReported = false;
-      if (!giveUpReported) {
-        giveUpReported = true;
-        sdhciSay ("CloverSdhci r168: write gave up lba=%u blocks=%u done=%u\n",
-               lba + done, blocks, done);
+    done += moved;
+    sinceCut += moved;
+    // Round178: hand the host over after a chunk of progress, exactly as the read side does. Nothing
+    // is left half-sent: every branch above ended with the card saying READY_FOR_DATA for the blocks
+    // it took, so the card is in TRAN and a reader that comes in next meets an idle bus.
+    if (done < blocks && sinceCut >= kReadChunkBlocks) {
+      sinceCut = 0;
+      if (!handOffBlockGuard (frequency, start, owned)) {
+        held = false;
+        break;
       }
-      break;
+      cutIn = true;
     }
-    done++;
+  }
+  if (cutIn) {
+    reportGuardHandoff ("write", lba, blocks, done);
   }
   // Round175: same as the read tail -- collect from the kernel log, then spend the guard on the card.
-  teeKernelLog ();
-  flushVerdictRing ();   // Round174: same reason as the read tail
-  releaseBlockGuard ();
+  if (held) {
+    teeKernelLog ();
+    flushVerdictRing ();   // Round174: same reason as the read tail
+    releaseBlockGuard ();
+  }
   return done;
 }
 

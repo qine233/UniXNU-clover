@@ -36,7 +36,10 @@ checkpoint flush 握着块守卫，把另一颗卷上的每一次读判成 EIO�
 round176 拆掉那一轮自己的代价：两个说话人不再抢同一圈 32 槽，内核的话有 kind-22 的
 512 槽，驱动的判断有 kind-21 的 64 槽，一次 `dd` 还是全拿。round177 不看机器，只看
 构建本身：那三处「重建一定不一样」的字段被改写成文件自己算出来的值，于是同一棵树的
-两次构建交付同一个内核镜像。
+两次构建交付同一个内核镜像。round178 回到那张卡：pid 1 的死因已经读成一次页调入读不
+到字节——round171 让抢不到守卫的读去等，但等只发生在请求开头，于是一个 128 块的写
+占住守卫多久，页就等多久。这轮把守卫的持有单位从「一个请求」改成「一个块段」，
+读写两条循环每交付满一段就放一次手再排队。
 
 ### 已完成（都有真机读数）
 
@@ -71,6 +74,7 @@ round176 拆掉那一轮自己的代价：两个说话人不再抢同一圈 32 �
 | round175（v0.5.31） | 内核自己已经说过的那句话，也搬到卡上：**一个探针都不加**。驱动在每个已经握着块守卫的尾巴上调用 `teeKernelLog`，按字节游标读内核的 `msgbuf`（`subr_prf.c:388` 把每条 `TOLOG` 字符交给 `log_putc`，`subr_log.c:554` 就是往 `msgbufp->msg_bufc` 环形写），四个字段每趟重读因为那块缓冲在 `subr_log.c:622` 之后可能被换掉；一次最多扫 4096 字节、最多落 8 条（round176 起的额度，那时是两个说话人共用一圈）。只有命中白名单的行才留（`clover r`、`CloverBlock`、`apfs`、`decmpfs`、`load code signature`、`AMFI`、`launchd`、`vm_fault`、`shared_region`、`panic`，round176 又补 `cs_blob`、`dyld`、`mountroot`、`rootvp`——四条都在 XNU 源码里逐字核过），驱动自己的 `CloverSdhci ` 行直接跳过。抄进来的行走 `ringPush(kRingKernel)`，驱动自己的状态行走 `ringPush(kRingDriver)`，**都不过 `IOLog`**：守卫里再拿一次 `bsd_log_lock` 是给自己造死锁机会，而且抄进来的话再打印出去会被自己再抄一遍。校验（magic/size/bufx/必须落在内核 VA 之上）不过就只报一次 `tee refuses reason=`，缓冲搬家报 `tee buffer moved`，每 256 行报一次 `tee seen= kept= throttled= lap=`（round176 起最多 12 次）。宿主侧 `read-clover-log.py` 按行首前缀分 `driver`/`kernel` 两种来源，`--tee` 与 `--driver` 各取一边 | 改动全部在 round176 镜像里，与下一行同一帧读 |
 | round176（v0.5.32） | 拆掉 round175 自己记下的那笔代价：**一圈 32 槽、两个说话人**——`load code signature error 4` 每次 exec 一行，一个忙着起不来的守护进程能在卡看见之前把驱动的判据挤出环。改的是几何而不是指针：驱动环 kind 21 从 logfs 第 64 扇区起 64 槽、每趟最多落 4 条，内核日志环 kind 22 从第 192 扇区接上、512 槽、每趟最多落 8 条，RAM 侧一圈 128 槽暂存、序号各自从 0 走。tee 自己的状态行（`tee armed`、`tee seen=`、`tee refuses`）故意留在驱动环，于是内核环的意思唯一：里面只有 kernel 说的话，宿主可以反问 `--tee --driver` 必须为 0，非 0 就是 tee 在抄自己。两圈首尾相接（64 + 2×64 = 192、192 + 2×512 = 1216），`run-clover-unattended.sh` 一次 `dd` 1216 个扇区仍然只拉一次 | **已构建**，待冷刷 |
 | round177（v0.5.33） | 结掉排期里的「内核构建不可逐字节复现」：镜像现在是这棵树的纯函数。`scripts/normalize-kernel-macho.py` 把三处链接不可复现的字段——ld 每次链接生成的 `LC_UUID`、962 个 object-path 调试符号 `n_value` 里那个 `.o` mtime、`emit_prelink.py` 用前两者哈希出来的 `_PrelinkKCID`——改写成「文件其余内容 sha256 的派生值」，长度一字不差、幂等。同一棵树两次独立构建（`a307b5b0…` 与 round176 的 `d274a15e…`）归一化后是同一个 `86273887…`，两份真正交付的**打过 AMFI** 的拷贝同样收敛到 `f9966b72…`。本轮不动驱动、不动 XNU 补丁，所以帧上读的还是round171–176 那一整套判据；`check-cs-blob-structure.py` 的 `cs_validate_csblob` 宿主复刻也进了闸门（14 条拒绝规则 + 真机 `launchd.macho` 必须被接受），round162 那条 `cs_blob … 85` 至此在主机侧结掉 | **已构建**，待冷刷 |
+| round178（v0.5.34） | 块守卫的持有单位从「一个请求」改成「一个块段」：round171 把「抢不到就拒」变成「抢不到就等」，但等仍然只发生在请求的**开头**，一个 128 块的写在卡上要占住守卫多久，页故障就最多等多久——round170 帧里 pid 1 正是这样死于一次页调入（`namespace 2 subcode 0xa` = SIGBUS），旁边摆着 8 条 `read guard … done=0 st=00000000`（主机一个错误位都没 raise，是这些读根本没拿到守卫）和两条 `tx_flush … took 102001275/120000602 us`。本轮在读写两条循环里，每交付满一段（`kReadChunkBlocks`）就 `handOffBlockGuard`：记下已占用时长、放行、重新排队，抢到才继续，队没排上就按 `guard` 报失败并结束本请求。死线随之改成 `owned + readCounter () - start`，**换手期间不计时**，所以卡的忙不再被算成驱动的死线（r167/r168 的 `write not ready`/`write gave up` 与 30 s 基数一字未动）。新增 `cuts=`/`waits=`/`worst=` 三个数与最多四行 `CloverSdhci r178: %s handoff …`；flush 那段不加换手——它等的是卡自己的缓存编程，任何锁策略都缩不了 | **已构建**，待冷刷 |
 
 round171 + round172 + round173 一帧问九件事：`read guard` 是否整批消失（守卫只等、
 不拒），
@@ -103,6 +107,12 @@ signature error 4` 每次 exec 一行，一个起不来的守护进程能在卡�
 反问 `--tee --driver` 必须数到 0，数到别的就说明 tee 在把抄来的东西再抄一遍。至于
 「tee 没读到」还是「读到了但白名单没命中」，由驱动环里那行 `tee seen=/kept=/
 throttled=` 回答，它自己不再被挤。
+
+round178 要读的是三个新数，都在驱动环里：`cuts=` 说明守卫真的在请求中途放过手，
+`waits=` 与 `worst=` 给出这一条启动里最长的一次排队是多少毫秒。判据是一句话——如果
+pid 1 的 SIGBUS 消失而 `tx_flush … took … us` 仍在，那页调入不是被写请求挡死的，
+下一格该改的是写段的长度而不是放手的时机；如果 `worst=` 自己就涨到秒级，那是卡的忙
+在排队，本轮的换手只是把它摊平了。
 
 ### 排期（未开始 · 已知限制）
 

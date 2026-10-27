@@ -1187,10 +1187,10 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round176. The menu has to name the round under test: the payload and its readings have to agree
+    # Round178. The menu has to name the round under test: the payload and its readings have to agree
     # about which round is on the card, or an image would be claiming a round it does not run.
-    if not board["payload"]["title"].startswith("clover r177:"):
-        errors.append('[payload] title is not "clover r177: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r178:"):
+        errors.append('[payload] title is not "clover r178: ...": the menu would not name this round')
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -1871,6 +1871,46 @@ def check_board(errors: list) -> str:
             if needle not in text:
                 errors.append(f"{verifier.name} lacks {needle}: the release could ship with an "
                               "unchecked kernel half")
+
+    # Round178. The r170 frame named the mechanism in two lines that had never been read together: a
+    # checkpoint flush that took 102 and 120 seconds, and eight reads at the other volume that failed
+    # with st=00000000 -- no host error bit, because the card never saw them. Round171 turned a
+    # refusal into a wait, which was right, but a wait behind a whole request is still a wait measured
+    # in flushes. What this round owns is the *unit of ownership*: the guard is handed over at chunk
+    # boundaries, so the longest a reader can be kept out is one chunk, and the request deadline keeps
+    # its old meaning because it is charged only the time the holder actually had the host.
+    sdhci = REPO / "drivers/CloverSdhci/CloverSdhci.cpp"
+    if not sdhci.is_file():
+        errors.append("drivers/CloverSdhci/CloverSdhci.cpp is missing: there is no guard hand-off "
+                      "to verify")
+    else:
+        text = sdhci.read_text()
+        for needle in ("static volatile uint32_t gGuardHandoffs = 0;",
+                       "static volatile uint64_t gGuardWorstWait = 0;",
+                       "static bool handOffBlockGuard (uint64_t &frequency, uint64_t &start, uint64_t &owned)",
+                       "static void reportGuardHandoff (const char *dir, uint32_t lba, uint32_t blocks, uint32_t done)",
+                       "CloverSdhci r178: %s handoff lba=%u blocks=%u done=%u cuts=%u waits=%u worst=%llu ms",
+                       "if (owned + readCounter () - start > deadline) {",
+                       "if (!handOffBlockGuard (frequency, start, owned)) {",
+                       "if (done < blocks && sinceCut >= kReadChunkBlocks) {"):
+            if needle not in text:
+                errors.append(f"{sdhci.name} lacks {needle[:44]}...: round178's chunk-boundary hand-off "
+                              "would not exist on both paths, or the deadline would have gone back to "
+                              "counting the wait")
+        # Both directions, or the fix only covers half the frame: the r170 reads were starved by a
+        # writer, and a reader holding the host for a 1 GiB dyld run starves the checkpoint flush.
+        if text.count("handOffBlockGuard (frequency, start, owned)") < 2:
+            errors.append(f"{sdhci.name} hands the guard off on fewer than two paths: the write loop "
+                          "and the read loop each have to cut, or one of them still owns the bus for "
+                          "the whole request")
+        # A hand-off is only fair if the holder that comes back is not the same thread's next request
+        # with a queued waiter skipped -- which is why the deadline is charged `owned` and the wait is
+        # counted, not assumed. The counters have to be fed from inside acquireBlockGuard.
+        acquire_start = text.find("static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start)")
+        acquire_body = text[acquire_start:acquire_start + 2600] if acquire_start >= 0 else ""
+        if "gGuardWaits = __atomic_add_fetch" not in acquire_body:
+            errors.append("acquireBlockGuard does not count the wait it measures: the hand-off report "
+                          "would quote cuts and waits nobody observed")
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",
