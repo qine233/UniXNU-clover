@@ -28,9 +28,11 @@
 
 ## 当前进度：已解决 / 待解决
 
-最后一次上机是 round154（v0.5.7）：屏上没有一条 `clover r154:`，也就是 syscall
-536 没被进入。round155–round160 的内核、payload 与 userdata 镜像都只过了宿主
-校验，还没有冷刷。所以下面把「真机读到过」「已实现、等一帧」「还没解决」分开写。
+最新一帧来自 round159（v0.5.12）的镜像：Data 卷发布并挂上，`init` 走到
+`load_init_program`，dyld 打开主缓存与 `.01` 后正在逐个缓存文件注册签名。屏还
+在滚，但底行的 `vp=` 与 `blob=` 一直在变——那是新的文件，不是同一行重印。此前
+round155–round158、round160 都没有独立的真机帧。所以下面把「真机读到过」
+「已实现、等下一帧」「还没解决」分开写。
 
 ### 已经解决（有真机读数）
 
@@ -43,39 +45,41 @@
 | EL0 与 syscall | mockfs 根 `rd=md0` 上 pid 1 跑进用户态；`getpid`、`open("/dev/console")`、`write`、`fork`、`wait4`、`execve` 都有读数 |
 | APFS 根 | round137 挂上 OS 卷；round150 owner 审计接受未封印的根，三模块信任缓存放行 |
 | SystemOS | round143/145 在 exec 时把 SystemOS 卷 union 到 `/`；round153 dyld 打开缓存目录、主缓存和 `.01`，三处 err=0，两个头都是 `dyld_v1   arm64` |
-| eMMC 读 | GPT 窗口发布、LBA 1 自检、单块读与单块写都在这块卡上工作过；CMD18 批量读从 round156 起才实现，尚未上机 |
+| eMMC 高速读 | round159 帧：`CloverBlock r159:` 的三条 manifest/data 行都在；签名块 16 KiB 读 7 ms、224 KiB 读 105–189 ms，约 1–2 MB/s，比 round156 之前的 25 KB/s 快 40–80 倍；CMD6 高速链路、8 线与 CMD18 批量成立 |
+| Data 卷 | round159 帧：`seed data … bytes=33554432`，`bsd=disk5s1`；APFS `mount-complete volume DawnData`，卷 UUID `FC1A580E-2D67-48FC-B8CF-87422A319340` 与钉住的种子一致；owner 的 `/private/var` 有卡背书，且失败行没有出现 |
+| dyld 缓存打开与预检 | round159 帧：`open /System/Library/Caches/com.apple.dyld`、主缓存、`dyld_shared_cache_arm64.01` 全 err=0；`.01` 头 `len≈1.07 GiB sig=11491332+229376`、`err=0/0`，224 KiB 签名 blob 一次读完 189 ms；随后每个子缓存的 `F_ADDFILESIGS` 都是 `err=0 resid=0` |
 | 诊断通道 | panic 屏直写 framebuffer（不经过 tty）、无人值守的 IMEM `0x77665501` + PSCI 复位、`read-clover-log.py` 取 logfs、`decode-clover-address.py` 把地址翻成函数 |
 
-### 已实现，等一帧（round155–round160）
+### 已实现，等下一帧（round154/157/158/160）
 
 | 轮次 | 内容 | 状态 |
 | --- | --- | --- |
-| round155（v0.5.8） | `.01` 头字段与签名 blob 的读数探针 | 未上机 |
-| round156（v0.5.9） | 读路径改 level-gated、CMD18 32 块批量、CloverBlock 16 KiB 批量 | 未上机 |
-| round157（v0.5.10） | CMD12 改 R1b、拒收 CRC/TIMEOUT/END_BIT/ADMA 损坏块 | 未上机 |
+| round154（v0.5.7） | syscall 536 的入口/返回值、setup 阶梯与 `mapfile` 探针 | 探针仍在镜像里；round159 帧还没滚到 536，尚无读数 |
+| round157（v0.5.10） | CMD12 改 R1b、拒收 CRC/TIMEOUT/END_BIT/ADMA 损坏块 | 读路径工作；错误分支尚未被触发过 |
 | round158（v0.5.11） | 照 sheng 对齐 `porting.toml`/`AGENTS.md`/工作流，锁超时放宽到约 21 s | 契约层，无需上机 |
-| round159（v0.5.12） | CMD6 `HS_TIMING=1` + 8 线 + 50 MHz；第三扇 SHNGROOT `Data` 窗与 owner `/private/var` 挂载 | 未上机 |
 | round160（v0.5.13） | 宿主闸门 `verify-userdata-window.py`；镜像与内核一字未动 | 无需上机 |
 
 ### 还没解决
 
-1. **dyld 共享缓存的预检**——`dyld_flags=0x0`，syscall 536 从未进入，`.01` 的
-   头字段、签名注册、映射三段还没有分开。这是现在唯一挡住 iOS 用户态的墙；
-   round155–round157 的读数就是为切它准备的。
-2. **launchd 没有执行过**——至今跑在用户态的只有探针 init；没有 launchd、没有
-   用户态守护进程。
+1. **共享区映射（syscall 536）没有读数**——`.01` 的头字段与签名注册两段已经被
+   这一帧关掉；剩下的未知是 dyld 是否走到 536、映射是否成功。屏上仍有两行
+   `check_np … vm_shared_region_start_address() failed`，那是 exec 建的空区，
+   不是文件问题。
+2. **launchd 没有真正起步**——这一帧只到
+   `load_init_program: attempting to load /sbin/launchd` 和两行 MAC
+   `label-check … -> 1`；没有 launchd 自己的输出，也没有用户态守护进程。
 3. **完整 `/data` 没有解决**——现在只是 32 MiB 的 APFS scratch 种子，追加在
    userdata 分区的两个 GPT 副本之间，不在 GPT 里；原 54.4 GB 的 userdata 内容
-   没有迁移。9.4 GB 的镜像里，OS/SystemOS 占满，Data 只有末尾的 32 MiB。
-4. **r155–round160 没有真机帧**——链路是否成立、Data 是否挂上、dyld 是否越过
-   `.01`，都要等一次冷刷。userdata 是破坏性写入，按约定需要逐次同意。
+   没有迁移。这一帧的 Data 挂载只证明那块种子可用。
+4. **这一帧还没滚完**——fsig 流是每个缓存文件四行，文件之间 `vp=`/`blob=` 会
+   变；若底行长时间不动才是卡住。需要停下来的那一帧才能读 536 与映射结果。
 5. **显示与 GPU**——没有 MDP5/DSI 驱动，屏幕只服务于启动诊断；Adreno 512 没有
    驱动，没有 iOS 显示栈。
 6. **输入**——触摸（`edt-ft5406` / focaltech `fts`）没有驱动。
 7. **网络、音频、USB**——WCN3990 WiFi/蓝牙、WCD 音频、USB device 模式都没有。
 8. **电源管理**——除 AMFI 需要的那颗 nub 外，充电、电池、PMIC 都没有真正的驱动。
-9. **eMMC 高速写**——写仍是单块 160 µs/word 的 PIO 节奏；HS400、CQE、DMA 都
-   没用上，读也还是 PIO。
+9. **eMMC 高速写**——读已经快了两个数量级，写仍是单块 160 µs/word 的 PIO 节奏；
+   HS400、CQE、DMA 都没用上。
 10. **内核构建不可逐字节复现**——每次 prelink UUID 不同；`verify-clover-payload.py`
     只比较两个可执行段。
 11. **存储栈形态**——没有 UFS、virtio-block 或 native verified-root；sheng 的
@@ -83,10 +87,11 @@
 
 ### 下一步（按顺序）
 
-1. 冷刷 round159 的 cache payload，只问一个问题：在 50 MHz / 8 线和 Data 窗下，
-   启动走到哪一行。链路、Data、dyld 三种读数各自独立。
-2. 若链路成立、Data 挂上而 dyld 仍停在 `.01`，round161 用单变量切预检的三段。
-3. dyld 通过后再谈完整 `/data` 迁移；显示、输入、网络排在用户态启动之后。
+1. 让这一帧滚完，拍最后几行：`clover r154:`（536）、映射错误、panic 屏，或者
+   launchd 的第一行输出。这一次刷机只回答这一个问题。
+2. 若 fsig 流之后直接静默，round161 在 536 入口前加一条「即将调用」标记，并让
+   fsig 每个文件只打最后一行，单变量切开「没进 536」与「进了但没返回」。
+3. 536 通过后再谈完整 `/data` 迁移；显示、输入、网络排在用户态启动之后。
 
 ## 这里用到的硬件事实
 
@@ -11621,7 +11626,62 @@ fastboot reboot
 with this change`。这一版只补 `firmware` 的 `findings`：闸门脚本丢了钉住的
 种子或三窗规则，应当让固件构建失败，而不是等到破坏性的刷写之后才发现。
 
-镜像与哈希仍未变，round155–round160 也都还没有上机；最后一帧还是 r153。
+这一版没有重编镜像。它发布时 round155–round160 都还没上机；此后 round159 的
+镜像已经冷刷过（见下面 v0.5.15 那一帧），round155–round158、round160 仍然没有
+独立的真机帧。
+
+## v0.5.15（round159 的第一帧）：Data 挂上了，dyld 在读整组缓存
+
+这一帧来自 round159（v0.5.12）的 cache payload 与 userdata 镜像。屏幕从 APFS
+挂载开始，关键行按顺序是（部分数字被照片边缘切掉，用 `…` 表示）：
+
+```
+CloverBlock r159: manifest os vp=… uuid=… off=1048576 size=…
+CloverBlock r159: manifest system vp=… uuid=… off=8077… size=…
+apfs_vfsop_mount:3091: disk5t mount-complete volume DawnData, requested by: init (pid 1)
+load_init_program: attempting to load /sbin/launchd
+clover_mac: label-check 881 (Apple Mobile File Integrity) -> 1
+clover_mac: label-check Sanctum (Sandbox, sandbox policy) -> 1
+clover r153: check_np dyld_flags=0x0
+shared_region: … check_np(…) vm_shared_region_start_address() failed
+clover r153: open /System/Library/Caches/com.apple.dyld mode=0x1 err=0 … fs=apfs
+clover r153: open dyld_shared_cache_arm64 mode=0x1 err=0 … fs=apfs
+clover r153: read err=0 resid=0 hdr=dyld_v1   arm64
+clover r155: hdr main … sig=475136+16384 err=0/0
+clover r155: fsig vp=… start=0 blob=475136 size=16384
+clover r155: fsig rd <- err=0 resid=0 ms=7
+clover r153: open dyld_shared_cache_arm64.01 mode=0x1 err=0 … fs=apfs
+clover r155: hdr .01 … len≈1.07 GiB sig=11491332+229376 err=0/0
+clover r155: fsig rd off=11491332 len=229376
+clover r155: fsig rd <- err=0 resid=0 ms=189
+（之后每个子缓存一组：fsig vp= / mem= / rd off=… len=… / rd <- err=0 resid=0）
+```
+
+读法：
+
+- `CloverBlock r159: seed data … bsd=disk5s1 … bytes=33554432` 加
+  `mount-complete volume DawnData`，再对卷 UUID
+  `FC1A580E-2D67-48FC-B8CF-87422A319340`，三件事一起证明 Data 窗、种子与
+  owner `/private/var` 挂载全对；`offline scratch Data mount failed` 没有出现。
+- 主缓存和 `.01` 的 open 都是 `err=0`，两个头都是 `dyld_v1   arm64`；`.01`
+  的签名偏移 `11491332` 与 224 KiB 长度，和宿主上的量法一致。
+- 之后每四行一组是一个缓存文件的 `F_ADDFILESIGS_RETURN`。`err=0 resid=0`
+  表示这一组的签名 blob 读成功；`vp=` 与 `blob=` 每组都在变，说明在换文件，
+  不是同一行重印或重试。
+- 16 KiB 读 7 ms、224 KiB 读 105–189 ms，约 1–2 MB/s，比 round156 之前的
+  25 KB/s 快 40–80 倍。round159 的高速链路、8 线与 CMD18 批量就是被这组数
+  证明的。
+
+还没看到的是 syscall 536 与映射结果。屏上两行
+`check_np … vm_shared_region_start_address() failed` 是 exec 建的空区
+（`sr_first_mapping=-1`），r153 就解释过，不是新错误。
+
+怎么判断「在走」还是「卡住」：看最新一行的 `vp=` 与 `blob=`。变了就是在处理
+下一个缓存文件；同一组 `fsig` 连续几分钟不动，才是卡在某次读或锁上。这一帧
+的 fsig 组数上限就是缓存文件数（宿主上 21H461 的缓存目录是 54 个文件），按上面
+的速率应是秒到几十秒级；控制台逐行打印会让它看起来比实际慢。
+
+这一帧没有重编任何东西，`~/clover-out/round159-*` 的十一项哈希不变。
 
 ## 许可证
 
