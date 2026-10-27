@@ -323,23 +323,25 @@ def check_dyld_cache_skip(kernel: bytes) -> bool:
 
 # Round165's driver change leaves two strings in the kernel: the one-shot A/B result and the line
 # that says the batch is not trusted. Round167 keeps the A/B row as evidence and adds the three-way
-# agreement. Round168 adds the two giving-up lines and the long guard wait, so the image proves the
-# wait bounds were widened and a refused block is retried before EIO. A payload built from an older
-# CloverSdhci would carry the earlier pair instead.
+# agreement. Round168 left the giving-up lines and the long guard wait. Round169 adds the two
+# strings that only exist if a failed read stops the card and a blocked read names its stage, so a
+# payload built from an older CloverSdhci is caught here rather than in a boot frame.
 READ_INTEGRITY = (
     "CloverSdhci r167: readcheck lba=",
     "CloverSdhci r167: single-block reads for this boot",
     "CloverSdhci r167: batch reads trusted for this boot",
     "CloverSdhci r168: block guard waited %llu ms",
-    "CloverSdhci r168: read gave up lba=%u blocks=%u done=%u st=%08x",
+    "CloverSdhci r169: card busy %llu ms",
+    "CloverSdhci r169: read %s lba=%u blocks=%u done=%u st=%08x",
 )
 
 # Round167's write half: the cache is turned off and every counted write waits for the card.
-# Round168 widens that wait and reports the card's own programming time, plus the give-up line.
+# Round168 widened that wait and reports the card's own programming time, plus the give-up line.
+# Round169 raises settlement to thirty seconds and reuses its prefix, so that string moved too.
 WRITE_INTEGRITY = (
     "CloverSdhci r167: write cache size=",
     "CloverSdhci r167: write not ready lba=",
-    "CloverSdhci r168: write settle took %llu ms polls=%u",
+    "CloverSdhci r169: write settle took %llu ms polls=%u",
     "CloverSdhci r168: write gave up lba=%u blocks=%u done=%u",
 )
 

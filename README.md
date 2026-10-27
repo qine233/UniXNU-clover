@@ -28,33 +28,31 @@
 
 ## 当前进度：已解决 / 待解决
 
-最新一帧是 r167 的冷刷。这一帧第一次没有 panic：`launchd` 的 exec 循环照旧
-（满屏 `clover r153: check_np dyld_flags=0x0` 与缓存目录 `err=0`），但块层开始
-自己报错——`disk5: general error.` 反复出现，接着
-`tx_flush:1173: disk5 tx xid 531 took 22708252 us to flush`（一次 APFS 事务
-落盘花了 **22.7 秒**），然后是 `disk1: general error.`、
-`apfs: buf_bread(0x20): disk1 buf_bread() failed, error = 5`、
-`ctx->dev_read(507): disk1 dev_get err 5 reading blkno 31134`（以及 `91811`）和
-`apfs_fs.c:1033: apfs_fs_read_tree … (gr=1074)`。`error = 5` 是块设备交给 APFS
-的 EIO，而两块盘的 EIO 落在固定块号上：介质不可能在同一时刻于两块盘上坏掉同一
-组块，APFS 只是在重问同一个块。
+最新一帧是 r168 的冷刷。这一帧仍没有 panic，而且 **r167 的写墙已经过了**：
+`disk5` 不再 `general error`，`tx_flush` 的 22.7 秒也没有再出现，说明 persona
+的写入被卡真正收下了。墙上出现的是读：`disk1: general error.` 反复出现，
+`apfs: buf_bread(0x20): disk1 buf_bread() failed, error = 5`，
+`ctx->dev_read(507): disk1 dev_get err 5 reading blkno 580`（随后
+`108169`、`91610`、`102029`，`num read errs` 从 0 涨到 6），
+`apfs_ntree_read(805): … readdesc(1) err … retval 5`，以及每个守护进程解压
+自身二进制时的 `decmpfs_fetch_uncompressed_data err 5`、
+`ChunkCompression.cpp:298: /usr/libexec/{logd,thermald,rapportd,tptpd,fseventsd,
+tccd,locationd,tzdata}: WEP_GETNTRC(264,0): errno 5`。所有失败都是 16 KiB
+（`buf_bread(0x20)`）读，块号彼此无关；这是级联，不是某个块坏了。
 
-这些 EIO 是本驱动自己判的。r167 的 `writeSettled` 只给卡 **200 ms** 落盘，而一
-次 checkpoint flush 实际要 22.7 秒；同一时刻另一个调用者等块层 guard 的上限是
-**2 秒**。两者都会把一个仍然健康的传输判成失败：写批次没等到 `READY_FOR_DATA`
-就被丢掉，APFS 记 `disk5: general error` 并重发；读请求等不到 guard 就返回 0，
-块设备把它变成 `disk1` 上的 EIO。r167 的两条读数行（`write cache … off=` 与
-`readcheck … trusted=`）已经滚出画面，这张照片不能断言它们执行到哪一步。
+驱动的不对称在写和读之间：写批次失败会发 CMD12 把卡送回 TRAN，单块读失败只
+复位主机数据通路。卡停在数据态时主机复位对它无效，之后每个 CMD17 都被它忽略，
+块设备就连续交出 EIO。r168 的读数行（`block guard waited`、`write settle took`、
+`read gave up`）每启动只打一次，已滚出这张照片，不能据此断言它们执行到哪一步。
 
-v0.5.22（round168）把这三处耐心值一起改掉：写落盘闸门 200 ms → 4 秒（并发一
-条 `write settle took … ms` 读数）；块层 guard 等待 2 秒 → 30 秒（超过 250 ms
-打一行 `block guard waited … ms`）；读、写请求死线改为 5 秒 / 10 秒基数加每块
-20 ms / 200 ms；批量读与单块读失败后各自从复位的数据通路重试（批量一次、单块
-三次），写批次在落盘超时后复位并重发一次。只有全部重试都失败才返回 EIO，并打
-`CloverSdhci r168: read gave up lba=… st=…` / `write gave up …` 各一次。这一
-轮的问题是：**这些 EIO 是不是我们自己的超时造成的**——如果是，下一帧同两个块号
-的 `dev_get err 5` 应该消失；如果仍在，那行 `gave up` 会带着块号和 INT_STATUS
-把它挪回卡上。
+v0.5.23（round169）修这条读路径：**所有读失败先发 CMD12 再复位主机**；每个读
+请求在第一条命令前等卡 `DATA_INHIBIT` 落下、CMD13 报 `READY_FOR_DATA|TRAN`
+（上限 30 秒，超时就再发一次 CMD12）；写落盘闸门从 4 秒提到 30 秒，写批次重试
+前也等卡空闲；读失败按阶段打点（`guard` / `idle` / `deadline` / `gave up`，
+最多八行），并新增 `CloverSdhci r169: card busy … ms`。这一轮的问题是：
+**级联 EIO 是不是读失败后没停卡造成的**——如果是，下一帧 `dev_get err 5`
+应显著减少；如果仍成串出现，`read <stage> … st=…` 会指出第一处失败发生在
+等卡、死线还是传输本身。
 
 ### 已经解决（有真机读数）
 
@@ -84,7 +82,8 @@ v0.5.22（round168）把这三处耐心值一起改掉：写落盘闸门 200 ms 
 | round165（v0.5.19） | 读前清 FIFO、失败复位数据通路、首次满批 A/B 对照并可按结果禁用批量读 | 已并入 round166/167 |
 | round166（v0.5.20） | 整轮单块读、补上命令响应失败的复位、exec 侧打印前八个签名 blob 的头四字 | r166 帧：单块读没有消掉故障；APFS 报 `disk0s1 failed to read` 与 `Container corruption detected by apfs_scan_verify`，故障落在可写的 Data 卷 |
 | round167（v0.5.21） | 写完成必须 CMD13 确认 `READY_FOR_DATA|TRAN`、停命令失败复位数据通路、写节奏改 level-gated、两条请求死线随块数缩放、EXT_CSD `CACHE_CTRL` 清零；批量读须三份样本一致才信任 | r167 帧：没有 panic，APFS 在两块盘上返回 EIO（`dev_get err 5`），一次 `tx_flush` 用 22.7 秒；EIO 落在我们自己的 200 ms/2 秒超时上 |
-| round168（v0.5.22） | 写落盘闸门 4 秒、guard 等待 30 秒、读写死线与每块份额放宽、批量/单块失败各自重试、写批次超时后重发一次；放弃时上屏块号与 INT_STATUS | 等冷刷；读数行 `CloverSdhci r168: block guard waited …`、`write settle took …`、`read gave up …` |
+| round168（v0.5.22） | 写落盘闸门 4 秒、guard 等待 30 秒、读写死线与每块份额放宽、批量/单块失败各自重试、写批次超时后重发一次；放弃时上屏块号与 INT_STATUS | r168 帧：写墙过了（无 `tx_flush` 长行、`disk5` 不再 general error），但 16 KiB 读级联 EIO；驱动只在写失败时停卡，读失败不停 |
+| round169（v0.5.23） | 读失败先 CMD12 再复位主机；读前等卡 `DATA_INHIBIT` 落下 + CMD13 `READY_FOR_DATA|TRAN`（30 秒）；写落盘 30 秒、写重试前等卡；读失败按 `guard/idle/deadline/gave up` 分阶段打点 | 等冷刷；读数行 `CloverSdhci r169: card busy … ms`、`read <stage> … st=…`、`write settle took …` |
 
 ### 还没解决
 
@@ -106,7 +105,9 @@ v0.5.22（round168）把这三处耐心值一起改掉：写落盘闸门 200 ms 
    设备读这一层，所以 v0.5.20 直接退掉 CMD18，并在 exec 侧把坏 blob 的头
    四字印出来。r167 帧把同一层又推了一步：两块盘同时、反复在固定块号上
    返回 EIO，而一次 checkpoint flush 要 22.7 秒——这更像我们自己的超时，
-   不像介质。v0.5.22 用放宽的等待与重试直接检验它。
+   不像介质。v0.5.22 用放宽的等待与重试直接检验它。r168 帧给出了答案：写墙
+   过了，读从第一个 16 KiB 请求起就级联失败，而读路径失败后从不发 CMD12；
+   v0.5.23 补上停卡、读前等卡与分阶段读数，继续把这条读路径收干净。
 3. **完整 `/data` 没有解决**——现在只是 32 MiB 的 APFS scratch 种子，追加在
    userdata 分区的两个 GPT 副本之间，不在 GPT 里；原 54.4 GB 的 userdata 内容
    没有迁移。这一帧的 Data 挂载只证明那块种子可用。
@@ -12233,6 +12234,82 @@ fastboot reboot
 是否消失，`tx_flush` 的耗时是否降到秒级以下。若同两个块号仍失败，那行
 `read gave up … st=…` 会带上块号和 INT_STATUS，把问题挪回卡或总线；若它
 一次都不出现而同处仍报 EIO，剩下的就是 `CloverBlock` 窗口映射而不是 SDHCI。
+
+## v0.5.23（round169）：读失败要停卡，失败要说清阶段
+
+r168 的冷刷回答了 r167 的问题：写落盘闸门放宽之后，`disk5` 不再
+`general error`，22.7 秒的 `tx_flush` 也不再出现。但同一帧里 `disk1` 从第一个
+16 KiB 请求起就连续报错，块号互不相关：
+
+```
+apfs: buf_bread(0x20): disk1 buf_bread() failed, error = 5
+ctx->dev_read(507): disk1 dev_get err 5 reading blkno 580 (108169, 91610, 102029)
+apfs_ntree_read(805): disk1:1 readdesc(1) err … retval 5
+decmpfs_read_compressed: decmpfs_fetch_uncompressed_data err 5
+ChunkCompression.cpp:298: /usr/libexec/logd: WEP_GETNTRC(264,0): errno 5
+```
+
+同一时刻 SystemOS 的缓存读取仍是 `err=0`，所以介质与高速链路没有坏；坏的是
+读失败之后的状态。写批次失败从 r157 起就发 CMD12，把卡送回 TRAN；单块读失败
+只做 `resetReadPath()`（主机 `SDHCI_RESET_DATA`）。卡停在数据态时主机复位对它
+没有意义，之后发给它的每个 CMD17 都被忽略，块设备就把一次失败放大成一串 EIO。
+
+本轮改四处：
+
+1. `abortReadTransfer()`：先 `sendStopCommand()`（CMD12 R1b）再复位主机。
+   `readDataBlock` 的两条失败分支（命令被拒、数据相位不干净）都改走它。
+2. `waitCardIdle()`：每个读请求在第一条命令前等主机 `DATA_INHIBIT` 落下，再用
+   CMD13 确认 `R1_READY_FOR_DATA` 且状态为 `TRAN`，上限 30 秒；超时先发一次
+   CMD12 再报失败。等卡时间不计入请求死线（拿到 guard 后重新起算）。
+   超过 250 ms 打一行 `CloverSdhci r169: card busy %llu ms`，每次启动最多一行。
+3. 写路径：`writeSettled` 的上限 4 秒 → 30 秒；写请求死线基数 10 秒 → 30 秒；
+   批次或单块落盘失败后、重发前也调用 `waitCardIdle()`，不再把同一批写进一张
+   还在编程的卡。
+4. `reportReadFailure()`：读失败按 `guard` / `idle` / `deadline` / `gave up`
+   四个阶段打点，最多八行；每行都带 `lba`、`blocks`、`done` 与 `st`。
+   r168 那条每启动一次的 `read gave up` 被它取代（`block guard waited` 与
+   `write gave up` 保留）。
+
+构建链与 round168 相同（先内核、再 payload；内核构建前在
+`out/clover/tree/.cache/xnu-work` 里反向撤掉 `zzy-clover-dyld-cache-skip.patch`）：
+
+```sh
+cd ~/UniXNU && /opt/homebrew/bin/python3.13 ./unixnu build kernel --device ../UniXNU-clover
+/opt/homebrew/bin/python3.13 ~/UniXNU-clover/scripts/patch-clover-amfi.py \
+  ~/UniXNU/out/clover/kernel/kernel.macho ~/clover-out/round169-kernel-amfi.macho
+/opt/homebrew/bin/python3.13 ./unixnu build payload --device ../UniXNU-clover \
+  --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --kernel /Users/zhouzhou/clover-out/round169-kernel-amfi.macho \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+```
+
+产物：prelink 内核 `c5e70a3b…`；打过 AMFI 的拷贝 `f5f1db9e…`
+（`0x1a830e4` 与 `0x1a8316c` 两处补丁照旧）；payload `db15478e…`（56 MiB，
+58,720,256 字节），卷内 kernel `52ef7cf4…`、`unixnu.toml` `76ca3839…`、
+ADT `34b08b2b…`、`scratch-data.img` `614b8356…`、trustcache `7c369ce0…`。
+入口探针 `6845 bytes in 37 runs`；`verify-clover-payload.py` 全项 OK，
+`kernel.macho: eMMC read/write integrity` 现在要求 r169 的 `card busy`、
+`read <stage>` 与 `write settle took` 串。归档在 `~/clover-out/round169-*`，
+清单 `round169-SHA256SUMS`。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round169-payload.img
+fastboot reboot
+```
+
+`userdata` 不动，round159 的 Data 窗口仍在；这是冷刷，不用 `fastboot boot`。
+
+这一刷回答一个问题：**r168 帧里成串的 16 KiB EIO 是不是「读失败没停卡」造成的**。
+读数顺序：先看 `CloverSdhci r169: card busy … ms`（是否真有一次长时间忙卡），
+再看 `CloverSdhci r169: read <stage> … st=…`（第一处失败发生在等卡、死线还是
+传输），然后看 `disk1: general error`、`dev_get err 5`、`buf_bread … failed`
+是否从「每个请求都失败」变为「不再出现」或「只在特定块出现」。若 `read idle`
+出现且 `st=00000000`，说明卡在第一条命令前就没准备好，问题在写后恢复；若
+`read gave up … st=` 带 CRC/超时位，问题回到传输本身；若 EIO 消失而守护进程
+仍报 `errno 5`，剩下的就是 CloverBlock 的窗口与 APFS 的一致性问题。
 
 ## 许可证
 

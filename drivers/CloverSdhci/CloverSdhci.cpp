@@ -950,6 +950,19 @@ static bool resetReadPath (void)
   return false;
 }
 
+// Round169: resetting the host does not tell the card anything. A CMD17 that ended on a data
+// error, or on a refused response, can leave the card in the data state, and from then on it
+// ignores the commands that follow -- which reads as a cascade of EIO at unrelated block numbers.
+// CMD12 is the only command that returns the card itself to TRAN; the write batch has sent it on
+// every failure since r157, the single-block read never did.
+static bool sendStopCommand (void);
+
+static void abortReadTransfer (void)
+{
+  sendStopCommand ();
+  resetReadPath ();
+}
+
 static bool prepareReadPath (void)
 {
   drainReadFifo ();
@@ -1001,8 +1014,9 @@ static bool readDataBlock (uint16_t command, uint32_t argument, uint32_t *words,
   if (!(status & SDHCI_INT_RESPONSE) ||
       (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
     // Round166: a refused command can leave the data path mid-transfer; the next block must not
-    // start on top of it. This was the only refusal that skipped the reset.
-    resetReadPath ();
+    // start on top of it. This was the only refusal that skipped the reset. Round169 also stops
+    // the card, not just the host.
+    abortReadTransfer ();
     return false;
   }
   uint64_t frequency = counterFrequency ();
@@ -1043,8 +1057,10 @@ static bool readDataBlock (uint16_t command, uint32_t argument, uint32_t *words,
   }
   if (!((status & SDHCI_INT_DATA_END) && !(status & kDataErrorMask) &&
         wordCount == kBlockWords)) {
-    // Round165: leave the data path clean for whoever retries this block.
-    resetReadPath ();
+    // Round165: leave the data path clean for whoever retries this block. Round169 also stops
+    // the card: a card left in the data state ignores the retry, which turns one bad block into
+    // EIO at every block that follows.
+    abortReadTransfer ();
     return false;
   }
   return true;
@@ -1388,6 +1404,67 @@ static void checkReadPath (uint32_t lba)
   }
 }
 
+static void waitCardReady (uint32_t &response, uint32_t &status, uint32_t &polls);
+
+// Round169: the r168 frame turned the write-path wall into a read-path cascade -- APFS read 16 KiB
+// buffers from every daemon it decompressed and each one came back as EIO, while the card was
+// still working off the persona writes. A write is counted as stored when CMD13 reports
+// READY_FOR_DATA in TRAN, but the card can pull DAT0 busy again for its own housekeeping right
+// after; a read issued in that window is refused or answered late. Before the first command of a
+// read, wait for the host to drop DATA_INHIBIT and for CMD13 to say the card is ready, bounded by
+// the same thirty seconds the guard hand-over uses. A healthy card pays one CMD13. The same wait
+// runs before re-sending a write batch whose settlement timed out.
+static bool waitCardIdle (uint64_t frequency)
+{
+  const uint64_t start = readCounter ();
+  const uint64_t bound = frequency * 30ULL;
+  static bool reported = false;
+  while (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_INHIBIT) {
+    const uint64_t waited = readCounter () - start;
+    if (!reported && waited > frequency / 4ULL) {
+      reported = true;
+      IOLog ("CloverSdhci r169: card busy %llu ms\n",
+             static_cast<unsigned long long> (waited * 1000ULL / frequency));
+    }
+    if (waited > bound) {
+      return false;
+    }
+  }
+  for (;;) {
+    uint32_t response = 0;
+    uint32_t status = 0;
+    uint32_t polls = 0;
+    waitCardReady (response, status, polls);
+    const uint64_t waited = readCounter () - start;
+    if (!reported && waited > frequency / 4ULL) {
+      reported = true;
+      IOLog ("CloverSdhci r169: card busy %llu ms\n",
+             static_cast<unsigned long long> (waited * 1000ULL / frequency));
+    }
+    if ((response & R1_READY_FOR_DATA) && R1_CURRENT_STATE (response) == R1_STATE_TRAN) {
+      return true;
+    }
+    if (waited > bound) {
+      return false;
+    }
+  }
+}
+
+// Round169: the r168 give-up line was once per boot, so a frame that showed a cascade of EIO
+// could not say which stage produced the first one or whether later ones differed. Eight lines
+// are enough for a frame and bounded enough for a boot.
+static void reportReadFailure (const char *stage, uint32_t lba, uint32_t blocks,
+                               uint32_t done, uint32_t status)
+{
+  static uint32_t reported = 0;
+  if (reported >= 8) {
+    return;
+  }
+  reported++;
+  IOLog ("CloverSdhci r169: read %s lba=%u blocks=%u done=%u st=%08x\n",
+         stage, lba, blocks, done, status);
+}
+
 extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint32_t blocks)
 {
   if (!words || !blocks) {
@@ -1401,6 +1478,16 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   uint64_t frequency = 0;
   uint64_t start = 0;
   if (!acquireBlockGuard (frequency, start)) {
+    reportReadFailure ("guard", lba, blocks, 0, 0);
+    return 0;
+  }
+  // Round169: the card can still be programming after the write that owned the guard was counted
+  // as stored; a read that starts then is refused. Wait for the card, then start the deadline.
+  if (!waitCardIdle (frequency)) {
+    // The card never said ready. Stop it explicitly, or every later read inherits the same state.
+    abortReadTransfer ();
+    reportReadFailure ("idle", lba, blocks, 0, 0);
+    __atomic_store_n (&gBlockGuard, 0, __ATOMIC_RELEASE);
     return 0;
   }
   // Round165: the first request that is one full batch long proves batch and single-block reads
@@ -1408,6 +1495,8 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   if (!gReadCheckDone && blocks >= kReadChunkBlocks) {
     checkReadPath (lba);
   }
+  // Round169: the request deadline covers the transfer, not the wait above or the one-shot check.
+  start = readCounter ();
   // Round167: the whole-request deadline scales with the run. A flat two seconds was sized for a
   // batch that finishes in milliseconds; a request that falls back to single blocks over a large
   // APFS or dyld read can exceed it, and a truncated read is an EIO the filesystem reports as
@@ -1419,6 +1508,7 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   uint32_t done = 0;
   while (done < blocks) {
     if (readCounter () - start > deadline) {
+      reportReadFailure ("deadline", lba, blocks, done, 0);
       break;
     }
     uint32_t chunk = blocks - done;
@@ -1460,13 +1550,7 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
       lastStatus = status;
     }
     if (!blockRead) {
-      // One line per direction per boot: the block that ends the request and the state it ended in.
-      static bool giveUpReported = false;
-      if (!giveUpReported) {
-        giveUpReported = true;
-        IOLog ("CloverSdhci r168: read gave up lba=%u blocks=%u done=%u st=%08x\n",
-               lba + done, blocks, done, lastStatus);
-      }
+      reportReadFailure ("gave up", lba + done, blocks, done, lastStatus);
       break;
     }
     done++;
@@ -1495,9 +1579,11 @@ static bool writeSettled (uint32_t &response, uint32_t &status, uint32_t &polls)
   // Round168: 200 ms was the smallest wait that covered a batch on a fast link, and the r167 frame
   // showed the card taking far longer than that for a whole checkpoint (tx_flush 22.7 s). A batch
   // that is still programming is not a failed write -- aborting it was what turned the same blocks
-  // into "disk5: general error" and made APFS re-send them. Four seconds is beyond any working
-  // card's programming time for 16 KiB; only a stalled card reaches it.
-  const uint64_t deadline = frequency * 4ULL;      // 4 s
+  // into "disk5: general error" and made APFS re-send them. Round169 raises the bound to thirty
+  // seconds, the same bound the guard and the read pre-wait use: the r168 frame showed the card
+  // still busy long after four seconds, and every early abort left a card programming while the
+  // host was already rewriting the same blocks.
+  const uint64_t deadline = frequency * 30ULL;      // 30 s
   const uint64_t start = readCounter ();
   while (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_INHIBIT) {
     if (readCounter () - start > deadline) {
@@ -1515,7 +1601,7 @@ static bool writeSettled (uint32_t &response, uint32_t &status, uint32_t &polls)
       const uint64_t elapsed = readCounter () - start;
       if (!slowReported && elapsed > frequency / 2ULL) {
         slowReported = true;
-        IOLog ("CloverSdhci r168: write settle took %llu ms polls=%u\n",
+        IOLog ("CloverSdhci r169: write settle took %llu ms polls=%u\n",
                static_cast<unsigned long long> (elapsed * 1000ULL / frequency), polls);
       }
       return true;
@@ -1711,10 +1797,11 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
   }
   // Round167: the request deadline scales with the run. A flat two seconds was sized for one APFS
   // burst; a single-block fallback over 32 blocks, at the 400 kHz timing this card may still be
-  // on, can exceed it, and a short write is a torn checkpoint. Round168 raises the base to ten
-  // seconds and the per-block share to 200 ms because a batch now waits for the card to finish
-  // programming, which the r167 frame measured in seconds, not milliseconds.
-  const uint64_t deadline = frequency * 10ULL +
+  // on, can exceed it, and a short write is a torn checkpoint. Round168 raised the base to ten
+  // seconds and the per-block share to 200 ms. Round169 raises the base to the same thirty seconds
+  // the settle wait uses: one chunk may legitimately spend that long in the card's programming
+  // phase, and the second chunk of the request must not be cut off for it.
+  const uint64_t deadline = frequency * 30ULL +
                             static_cast<uint64_t>(blocks) * (frequency / 5ULL);
   uint32_t done = 0;
   bool settleReported = false;
@@ -1749,6 +1836,9 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
           break;
         }
         resetReadPath ();
+        // Round169: a batch that is still programming cannot accept its replacement; wait for
+        // the card to report ready before sending the same blocks again.
+        waitCardIdle (frequency);
         if (!settleReported) {
           settleReported = true;
           IOLog ("CloverSdhci r167: write not ready lba=%u blocks=%u rsp=%08x st=%08x "
@@ -1773,6 +1863,7 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
         break;
       }
       resetReadPath ();
+      waitCardIdle (frequency);
       if (!settleReported) {
         settleReported = true;
         IOLog ("CloverSdhci r167: write not ready lba=%u blocks=1 rsp=%08x st=%08x "

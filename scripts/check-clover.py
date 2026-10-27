@@ -1170,19 +1170,20 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round168. The menu has to name the round under test: a busy card is waited for, and every
-    # refused block is retried before the filesystem is told the read failed.
-    if not board["payload"]["title"].startswith("clover r168:"):
-        errors.append('[payload] title is not "clover r168: ...": the menu would not name this round')
-    # Round168. The r167 frame moved the wall onto our own timeouts: APFS reported "disk5: general
-    # error" repeatedly and EIO on disk1 at two fixed block numbers, while a single checkpoint
-    # flush took 22.7 seconds. Nothing on the media changed between those reads, so the block layer
-    # was giving up while the card was programming:
-    #   * the guard hand-over was 2 s, shorter than a legitimate write burst or the read check;
-    #   * write settlement was 200 ms, and a batch that was still programming was counted as failed;
-    #   * a refused block returned EIO on the first attempt, which APFS only re-sent.
-    # Every one of those is now a wait with a bound far past the card's own time, the batch and the
-    # single block each get a clean retry, and the give-up carries the block number and INT_STATUS.
+    # Round169. The menu has to name the round under test: a read that fails stops the card, and
+    # every read failure names the stage that produced it.
+    if not board["payload"]["title"].startswith("clover r169:"):
+        errors.append('[payload] title is not "clover r169: ...": the menu would not name this round')
+    # Round169. The r168 frame answered the write question and asked a read one: the card stored
+    # the writes (no tx_flush wall, no "general error" on disk5), but every 16 KiB APFS buffer came
+    # back EIO at block numbers nothing had complained about, and decompressing any daemon's file
+    # failed with errno 5. The driver was asymmetric: a failed write sends CMD12 and returns the
+    # card to TRAN, while a failed single-block read only reset the host. A card left in the data
+    # state ignores the reads that follow, which is exactly a cascade at unrelated blocks. Every
+    # read failure now sends CMD12 before the host reset, the wait before a write retry and before
+    # the first read is the same thirty-second ready-wait the guard uses, and eight stage-tagged
+    # lines ("guard", "idle", "deadline", "gave up") replace the once-per-boot line so a frame says
+    # where the first EIO came from.
     sdhci = next((base / "drivers/CloverSdhci/CloverSdhci.cpp"
                   for base in (REPO, pathlib.Path.cwd())
                   if (base / "drivers/CloverSdhci/CloverSdhci.cpp").is_file()), None)
@@ -1196,11 +1197,14 @@ def check_board(errors: list) -> str:
                        "CloverSdhci r167: write cache size=",
                        "CloverSdhci r167: write not ready lba=",
                        "CloverSdhci r168: block guard waited %llu ms",
-                       "CloverSdhci r168: write settle took %llu ms polls=%u",
-                       "CloverSdhci r168: read gave up lba=%u blocks=%u done=%u st=%08x",
                        "CloverSdhci r168: write gave up lba=%u blocks=%u done=%u",
+                       "CloverSdhci r169: card busy %llu ms",
+                       "CloverSdhci r169: read %s lba=%u blocks=%u done=%u st=%08x",
+                       "CloverSdhci r169: write settle took %llu ms polls=%u",
                        "const uint64_t handover = frequency * 30ULL;",
-                       "const uint64_t deadline = frequency * 4ULL;      // 4 s",
+                       "const uint64_t deadline = frequency * 30ULL;      // 30 s",
+                       "static void abortReadTransfer (void)",
+                       "abortReadTransfer ();",
                        "static bool writeSettled (uint32_t &response, uint32_t &status, uint32_t &polls)",
                        "static const uint32_t kExtCsdCacheCtrl = 33u;",
                        "const bool stopped = sendStopCommand ();",
@@ -1220,6 +1224,12 @@ def check_board(errors: list) -> str:
         # Round168: the two-second hand-over is what turned a wait into "general error".
         if "const uint64_t handover = frequency * 2ULL;" in text:
             errors.append(f"{sdhci.name} still gives up the block guard after two seconds")
+        # Round169: four seconds is shorter than the card's own housekeeping after a persona write,
+        # and a read give-up that only prints once per boot cannot say where a cascade started.
+        if "const uint64_t deadline = frequency * 4ULL;" in text:
+            errors.append(f"{sdhci.name} still aborts write settlement after four seconds")
+        if "CloverSdhci r168: read gave up" in text:
+            errors.append(f"{sdhci.name} still prints the read give-up once per boot")
         # The batch is only trusted on a three-way agreement, never unconditionally.
         if "gReadBatchTrusted = false;\n  IOLog (\"CloverSdhci r167: readcheck" in text:
             errors.append(f"{sdhci.name} still retires the batch unconditionally: r166 proved the "
