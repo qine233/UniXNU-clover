@@ -1170,9 +1170,9 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round159. The menu has to name the round under test: the fast link and the Data volume.
-    if not board["payload"]["title"].startswith("clover r159:"):
-        errors.append('[payload] title is not "clover r159: ...": the menu would not name this round')
+    # Round163. The menu has to name the round under test: the AMFI exec-hook bypass.
+    if not board["payload"]["title"].startswith("clover r163:"):
+        errors.append('[payload] title is not "clover r163: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",

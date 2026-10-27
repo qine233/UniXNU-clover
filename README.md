@@ -35,6 +35,11 @@ signature error 4` → AMFI 以「dyld signature cannot be verified」杀掉）�
 一路涨——是循环，不是慢。此前 round155–round158、round160 都没有独立的真机帧。
 所以下面把「真机读到过」「已实现、等下一帧」「还没解决」分开写。
 
+v0.5.17（round163）不再问「读到了什么」，而是直接把 AMFI 那个 exec 钩子的
+4 个字节改掉（`cbz` → `b`，永远走放行），只重建 payload，等下一次冷刷
+`cache` 的帧。它不修根因（blob 的 85 还在），只是把循环从 AMFI 这一层挪开；
+墙可能移动到 dyld 的共享区映射。
+
 ### 已经解决（有真机读数）
 
 | 事项 | 读到的证据 |
@@ -71,7 +76,8 @@ signature error 4` → AMFI 以「dyld signature cannot be verified」杀掉）�
    结构校验里就返回 `EBADEXEC`（85），拿不到 `CS_PLATFORM_BINARY`，随后被
    AMFI 的 exec 钩子杀掉，`launchd` 再拉一遍。宿主上这四个文件的 cdhash 全在
    2478 条 static 信任缓存里，blob 也合法——所以可疑的是内核读回来的字节或
-   load command 给的偏移/长度，不是信任决策。round163 的探针只问这个。
+   load command 给的偏移/长度，不是信任决策。v0.5.17 不再测量，先把这个钩子
+   改成永远放行（见该小节）；85 本身仍未解释。
 3. **完整 `/data` 没有解决**——现在只是 32 MiB 的 APFS scratch 种子，追加在
    userdata 分区的两个 GPT 副本之间，不在 GPT 里；原 54.4 GB 的 userdata 内容
    没有迁移。这一帧的 Data 挂载只证明那块种子可用。
@@ -11735,6 +11741,67 @@ AMFI: hook..execve() killing pid 13662: dyld signature cannot be verified. …
 看内核到底读到了什么。一个镜像，一个问题。
 
 这一帧同样没有重编任何东西，`~/clover-out/round159-*` 的十一项哈希不变。
+
+## v0.5.17（round163）：把 AMFI 的 exec 钩子改成永远放行
+
+上一帧把问题切得很干净：内核自己的签名校验失败（85）之后，exec 仍然走到了
+AMFI，是 AMFI 的 exec 钩子按「dyld signature cannot be verified」把进程杀掉。
+既然 `cs_enforcement_disable=1` 已经让内核不计较签名，剩下的唯一闸门就是
+kext 里那一个分支。`amfi_get_out_of_my_way` 到不了它——AMFI 是 stock kext，
+没有解析这个参数的代码（round139 的注释）；所以这一轮直接改它的指令。
+
+钩子的形状（`__PLK_TEXT_EXEC`，VA `0xfffffff004ab40d0` 起）：
+
+```
+fffffff004ab40d0  ldr  x24, [x29, #0x18]      ; cs flags
+fffffff004ab40d4  bl   <check>                ; w0 = 结果
+fffffff004ab40d8  ldr  w8, [x24]
+fffffff004ab40dc  and  w9, w8, #0x2000        ; CS_REQUIRE_LV
+fffffff004ab40e0  orr  w9, w0, w9
+fffffff004ab40e4  cbz  w9, 0xfffffff004ab4128 ; ← 放行
+fffffff004ab40e8  tbnz w8, #0x19, allow       ; CS_NO_UNTRUSTED_HELPERS
+…                  打印 kill 原因，返回
+fffffff004ab4128  …                            ; 放行后的普通路径
+```
+
+把 `cbz`（`34 00 02 29`）换成 `b`（`11 00 00 14`），等于把 `check` 的结果和
+`CS_REQUIRE_LV` 一起忽略，永远跳到 `0xfffffff004ab4128`。映射关系：
+`__PLK_TEXT_EXEC` 的 VA `0xfffffff004920000` 对应文件 `0x18ef000`，所以
+VA `0xfffffff004ab40e4` 是 `kernel.macho` 的文件偏移 **`0x1a830e4`**（改前
+字节 `29 02 00 34 e8 00 c8 37 e0 03 14 aa bd 58 00 94`，改后
+`11 00 00 14 …`）。
+
+只改 payload，不重编内核：
+
+```sh
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  /opt/homebrew/bin/python3.13 ./unixnu build payload --unique-chip-id 0x81ffcaaa \
+  --uefi ../mu-clover --kernel /Users/zhouzhou/clover-out/round163-kernel-amfi.macho \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+```
+
+`--kernel` 指向的是 prelink 输出的一份拷贝（`out/clover/kernel/kernel.macho`
+→ 改 4 字节），payload 步骤仍照常在它的副本上打入口探针，所以两道校验都能
+过：`probe patch localized` 报 `6841 bytes in 36 runs`（比上一轮多一个 run，
+就是这 4 个字节），其余契约全 OK。菜单标题同时升到
+`clover r163: the AMFI exec hook always takes the allow path`，产物：
+`~/clover-out/round163-payload.img`（56 MiB，sha256 `c6efe71a…`）。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round163-payload.img
+fastboot reboot
+```
+
+`userdata` 不动——round159 的 Data 窗口仍在。这是冷刷，不用 `fastboot boot`。
+
+这一轮预期看到的是：同样的 85 / `load code signature error 4` 还会印（根因没
+修），但 AMFI 的 kill 行应该消失，`launchd` 的子进程不再被立刻杀掉。如果之后
+出现 dyld 自己的错误或直接回到 fastboot，那就说明墙已经从 AMFI 移到共享区
+映射；如果屏幕停在某个 daemon 的日志上，那 exec 这一层就通了。
 
 ## 许可证
 
