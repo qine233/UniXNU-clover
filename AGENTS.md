@@ -34,9 +34,14 @@ Run from the UniXNU checkout:
 ./unixnu build kernel --device ../UniXNU-clover
 ./unixnu build payload --device ../UniXNU-clover --unique-chip-id HEX \
   --uefi ../mu-clover \
+  --kernel PATH/roundNNN-kernel-amfi.macho \
   --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
   --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
 ```
+
+Build the kernel before the payload, and pass the kernel re-patched by
+`scripts/patch-clover-amfi.py`: every fresh prelink restores the two AMFI
+branches to stock, so the plain kernel would ship the wrong policy.
 
 After changing the board description or a driver, run both checks:
 
@@ -68,5 +73,16 @@ Every porting area is present even when this board does not implement it.
 `display`, `input`, `gpu`, `network`, and `audio` are `planned`, because the
 components sheng uses for them are SM8550-specific (MDP/DPU, Novatek touch,
 Adreno 740, ath12k, ADSP) and cannot be selected here. `storage` is the active
-area: `CloverSdhci` and `CloverBlock` own the eMMC path, and the current wall is
-dyld's shared-cache preflight.
+area: `CloverSdhci` and `CloverBlock` own the eMMC path, and reads and writes
+both have device readings that are clean. The remaining wall is upstream of
+storage: whether the daemons launchd execs survive.
+
+XNU patches are replayed by filename order, `git apply --reverse --check` first
+and `set -e`. A new probe must never be inserted inside a block added by a
+patch that sorts earlier: reversing that patch then fails and the build aborts.
+Regenerate the earlier patch itself with `scripts/save-xnu-patch.py` after
+reversing the later patches that touch the same file.
+
+`README.md` carries the current status only. The round-by-round log of what each
+boot frame showed and what was inferred from it lives in
+`notes/development-log.md`; it is history and is not appended to.
