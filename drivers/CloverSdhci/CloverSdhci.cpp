@@ -204,6 +204,13 @@
 #include <pexpert/pexpert.h>
 #include <kern/debug.h>
 #include <stdarg.h>
+// Round175: the kernel log buffer. printf() and IOLog() both end in log_putc() ->
+// log_putc_locked(msgbufp, c) (bsd/kern/subr_prf.c:388, bsd/kern/subr_log.c:554), so everything this
+// boot prints is already sitting in one circular buffer that the driver can read. The header is
+// exported to drivers (EXPORT_HDRS/bsd/sys/msgbuf.h) and msgbufp is declared under
+// XNU_KERNEL_PRIVATE, which the kernel's own compile record for this driver already defines -- which
+// is why this round needs no XNU patch at all.
+#include <sys/msgbuf.h>
 #include "SdhciRegs.h"
 
 extern "C" {
@@ -334,11 +341,69 @@ static uint32_t gVerdictSeq = 0;        // stamped in header word 8 so a wrapped
 static uint32_t gVerdictWritten = 0;
 static volatile uint32_t gVerdictBusy = 0;
 
+// Round175: the tee. The verdict ring made the driver's own readings survive the panel; the readings
+// that actually decide the next round are printed by other people -- the r153/r155 shared-region
+// probes, APFS's jhash and ntree errors, the code-signing line that kills every process, the r170
+// exec/exit pairs -- and those go to printf, which has always ended on the panel and nowhere else.
+// They do have one home the driver can reach: msgbufp, the circular kernel log buffer that
+// printf/IOLog already append to. So instead of patching XNU again (and fighting the rule that a
+// probe may not be inserted inside an earlier patch's own added block), this round just reads the
+// buffer the kernel already keeps and copies the interesting lines into the ring that already writes
+// to the card. Nothing new is measured; nothing new has to be linked.
+//
+// The whole buffer is not copied. A 1 MiB log at 25 KB/s of card would be a boot-long file transfer,
+// and most of it is noise, so the tee consumes bytes from its own cursor and keeps only lines that
+// contain one of a few strings the port is currently trying to learn about. The cursor is a byte
+// index, not a line number, because the producer wraps the buffer out from under it; anything the tee
+// has not reached before the writer laps it is gone, which is why it is worth reading a chunk per
+// request rather than one line.
+static const uint32_t kTeeScanPerPass = 4096;   // bytes read per pass; a chunk, not the whole buffer
+static const uint32_t kTeePushPerPass = 4;      // matching lines handed to the ring per pass
+static const uint32_t kTeeLineBytes = kVerdictTextBytes;   // a longer line is truncated, not split
+// What a kernel line has to contain before it is worth two block writes. Ordered by what this port is
+// blocked on right now, and deliberately short: every extra entry spends ring slots that the driver's
+// own verdicts could have used.
+static const char *const kTeeAllowlist[] = {
+  "clover r",             // this port's own probes (r151/r153/r155/r170), whatever they print
+  "CloverBlock",          // the volume/owner driver
+  "apfs", "APFS",         // container scan, jhash, ntree reads
+  "decmpfs",              // compressed-data read failures
+  "load code signature",  // the error 4 that has been killing every process since r162
+  "AMFI", "amfi",         // who actually decided to kill it
+  "launchd", "initproc",  // pid 1, and what happened to it
+  "vm_fault", "shared_region",   // the empty shared region this boot still dies in
+  "panic",                // the panic string, if a panic got here first
+};
+static const uint32_t kTeeAllowlistCount =
+    sizeof (kTeeAllowlist) / sizeof (kTeeAllowlist[0]);
+
+static volatile uint32_t gTeeReady = 0;         // armed together with the verdict ring
+static uint32_t gTeeIndex = 0;                  // next byte of msgbuf to consume
+static uintptr_t gTeeBuffer = 0;                // msg_bufc the cursor belongs to
+static uint32_t gTeePartial = 0;                // bytes held for a line that has not ended yet
+static char gTeeLine[kTeeLineBytes];
+static uint32_t gTeeSeen = 0;                   // complete lines examined
+static uint32_t gTeeKept = 0;                   // lines put into the ring
+static uint32_t gTeeThrottled = 0;              // matches dropped by the per-pass cap
+static uint32_t gTeeLap = 0;                    // passes where the writer was behind our cursor
+static uint32_t gTeeRefused = 0;                // reason code: see teeValidate below
+static uint32_t gTeeRefusedShown = 0;
+static uint32_t gTeeNextReport = 256;           // emit a tee census every this many lines examined
+// Kernel virtual addresses on this board all sit above the Darwin arm64e base (the kernel links at
+// VM_KERNEL_LINK_ADDRESS, 0xfffffff007004000). A msg_bufc below it is not a kernel pointer at all, and
+// following it would take a data abort in the middle of a block tail -- which is the one place in this
+// driver that must not fault, because the card is holding the caller's I/O.
+static const uint64_t kTeeKernelVaBase = 0xfffffff000000000ull;
+
 // Both are declared here because the first verdict line is printed well below the definition; the
 // round174 section installs them. sdhciSay is the driver's only way of speaking to a reading: it
 // formats once and hands the same string to the panel and to the RAM ring.
 static void sdhciSay (const char *fmt, ...);
+static void verdictPush (const char *line, uint32_t length);
 static void flushVerdictRing (void);
+// Round175: drain the kernel log buffer into that ring. Declared with the ring it feeds because every
+// call site is a line above its own flush, in the same guarded tail.
+static void teeKernelLog (void);
 
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
@@ -2050,6 +2115,8 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   }
   // Round174: this is one of the places the guard is held and the card is idle, so it is also where
   // pending verdict lines get written out. Four records per pass; the rest wait for the next request.
+  // Round175: the kernel log tee runs first, so a line it accepts here can be flushed in this pass.
+  teeKernelLog ();
   flushVerdictRing ();
   releaseBlockGuard ();
   return done;
@@ -2357,21 +2424,15 @@ static uint32_t verdictFormat (char *out, uint32_t cap, const char *fmt, va_list
   return length > cap ? cap : static_cast<uint32_t> (length);
 }
 
-// The driver's voice. Same string to the panel and to the ring, so a frame and a dd can never
-// disagree about what was measured. The trailing newline is dropped before storing: the record
-// writer adds exactly one, and the host decoder strips it.
-static void sdhciSay (const char *fmt, ...)
+// Put one finished line into the RAM ring without printing it. sdhciSay uses this after IOLog; the
+// msgbuf tee uses it alone, because the tee's input is the very buffer IOLog writes into -- printing a
+// line it just read would append a second copy of itself, and the tee would then match its own echo
+// forever. The trailing newline is dropped by both callers: the record writer adds exactly one.
+static void verdictPush (const char *line, uint32_t length)
 {
-  char line[kVerdictTextBytes + 1];
-  va_list args;
-  va_start (args, fmt);
-  uint32_t length = verdictFormat (line, kVerdictTextBytes, fmt, args);
-  va_end (args);
-  while (length && line[length - 1] == '\n') {
-    length--;
+  if (length > kVerdictTextBytes) {
+    length = kVerdictTextBytes;
   }
-  line[length] = '\0';
-  IOLog ("%s\n", line);
   if (gVerdictPending == kVerdictSlots) {
     // Full: the oldest unread verdict gives its slot to the newest one. Which reading was dropped is
     // counted, so a frame whose ring wrapped says so instead of looking like a quiet boot.
@@ -2386,6 +2447,23 @@ static void sdhciSay (const char *fmt, ...)
   gVerdictLength[slot] = length;
   gVerdictWrite++;
   gVerdictPending++;
+}
+
+// The driver's voice. Same string to the panel and to the ring, so a frame and a dd can never
+// disagree about what was measured.
+static void sdhciSay (const char *fmt, ...)
+{
+  char line[kVerdictTextBytes + 1];
+  va_list args;
+  va_start (args, fmt);
+  uint32_t length = verdictFormat (line, kVerdictTextBytes, fmt, args);
+  va_end (args);
+  while (length && line[length - 1] == '\n') {
+    length--;
+  }
+  line[length] = '\0';
+  IOLog ("%s\n", line);
+  verdictPush (line, length);
 }
 
 // One LOG1 record, same shape as mode 17 and the panic writer: header block then text block, byte
@@ -2470,6 +2548,204 @@ static void flushVerdictRing (void)
     flushed++;
   }
   gVerdictBusy = 0;
+}
+
+// ------------------------------------------------------------------ round175: the kernel log tee
+static uint32_t teeStringLength (const char *s)
+{
+  uint32_t length = 0;
+  while (s[length]) {
+    length++;
+  }
+  return length;
+}
+
+static bool teeHasPrefix (const char *line, uint32_t length, const char *prefix)
+{
+  const uint32_t width = teeStringLength (prefix);
+  if (width > length) {
+    return false;
+  }
+  for (uint32_t i = 0; i < width; i++) {
+    if (line[i] != prefix[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Substring test, not prefix test, because the interesting lines are written by other people with
+// their own leading text -- "[apfs_jhash:146] ...", "AMFI: ...", "load code signature error 4" behind a
+// mount name. Cost is one pass per short line per allowlist entry; the lines are capped at
+// kTeeLineBytes, so this is bounded without needing to be clever about it.
+static bool teeLineMatches (const char *line, uint32_t length)
+{
+  for (uint32_t entry = 0; entry < kTeeAllowlistCount; entry++) {
+    const uint32_t width = teeStringLength (kTeeAllowlist[entry]);
+    if (!width || width > length) {
+      continue;
+    }
+    for (uint32_t at = 0; at + width <= length; at++) {
+      uint32_t i = 0;
+      while (i < width && line[at + i] == kTeeAllowlist[entry][i]) {
+        i++;
+      }
+      if (i == width) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// The tee's own voice: format and put in the ring, nothing else. sdhciSay cannot be used here,
+// because teeKernelLog runs at the tails of block requests -- inside the block guard -- and sdhciSay
+// calls IOLog, which takes bsd_log_lock. Taking a kernel lock while holding the guard is a lock order
+// this driver has no business inventing: a logger that holds bsd_log_lock and then issues disk I/O
+// would wait for the guard we hold, and we would wait for the lock it holds. A tee state line is
+// still a reading, so it still goes to the card; only the panel copy is given up.
+static void teeSay (const char *fmt, ...)
+{
+  char line[kVerdictTextBytes + 1];
+  va_list args;
+  va_start (args, fmt);
+  uint32_t length = verdictFormat (line, kVerdictTextBytes, fmt, args);
+  va_end (args);
+  while (length && line[length - 1] == '\n') {
+    length--;
+  }
+  line[length] = '\0';
+  verdictPush (line, length);
+}
+
+// One complete line out of the buffer. Leading blanks and the '\b' progress dots the boot writer
+// emits are cut, an all-blank line is dropped, and anything this driver said is skipped: it went into
+// the ring already, through sdhciSay, in the same boot.
+static void teeConsumeLine (uint32_t &pushed)
+{
+  uint32_t length = gTeePartial;
+  gTeePartial = 0;
+  uint32_t start = 0;
+  while (start < length && (gTeeLine[start] == ' ' || gTeeLine[start] == '\t' ||
+                            gTeeLine[start] == '\b' || gTeeLine[start] == '\r')) {
+    start++;
+  }
+  while (length > start && (gTeeLine[length - 1] == ' ' || gTeeLine[length - 1] == '\r')) {
+    length--;
+  }
+  if (length == start) {
+    return;
+  }
+  gTeeSeen++;
+  if (teeHasPrefix (gTeeLine + start, length - start, "CloverSdhci ")) {
+    return;
+  }
+  if (!teeLineMatches (gTeeLine + start, length - start)) {
+    return;
+  }
+  if (pushed >= kTeePushPerPass) {
+    // The ring is shared with the driver's own verdicts and the card only takes four records per
+    // request, so a chatty boot gets its surplus counted rather than queued forever.
+    gTeeThrottled++;
+    return;
+  }
+  verdictPush (gTeeLine + start, length - start);
+  gTeeKept++;
+  pushed++;
+}
+
+// Drain the kernel log buffer into the verdict ring. Called from the same three guarded tails as
+// flushVerdictRing, immediately before it, so a line the tee accepts in this pass can reach the card
+// in the same pass. Nothing here is safe to call from an interrupt-stopped context or without the
+// block guard; it only touches memory and the ring, and the writes happen in the flush.
+static void teeKernelLog (void)
+{
+  if (!gTeeReady) {
+    return;
+  }
+  // Re-read msgbufp every pass: XNU can reallocate the log (bsd/kern/subr_log.c:622 reassigns
+  // msg_bufc and rewrites both pointers), so nothing about this buffer may be cached across calls.
+  struct msgbuf *buffer = msgbufp;
+  const int magic = buffer ? buffer->msg_magic : 0;
+  const int size = buffer ? buffer->msg_size : 0;
+  const int bufx = buffer ? buffer->msg_bufx : -1;
+  char *raw = buffer ? buffer->msg_bufc : nullptr;
+  const uint64_t base = static_cast<uint64_t> (reinterpret_cast<uintptr_t> (raw));
+
+  uint32_t reason = 0;
+  if (!buffer) {
+    reason = 1;              // no log buffer this boot
+  } else if (magic != MSG_MAGIC) {
+    reason = 2;              // not a msgbuf
+  } else if (size <= 0 || size > MAX_MSG_BSIZE) {
+    reason = 3;              // implausible geometry
+  } else if (bufx < 0 || bufx >= size) {
+    reason = 4;              // write pointer outside the buffer
+  } else if (base < kTeeKernelVaBase) {
+    reason = 5;              // not a kernel address; reading it would fault
+  }
+  if (reason) {
+    gTeeRefused = reason;
+    if (!gTeeRefusedShown) {
+      gTeeRefusedShown = 1;
+      teeSay ("CloverSdhci r175: tee refuses reason=%u magic=0x%x size=%d bufx=%d bufc=%p\n",
+                reason, magic, size, bufx, reinterpret_cast<void *> (base));
+    }
+    return;
+  }
+  gTeeRefused = 0;
+
+  const uint32_t sizeu = static_cast<uint32_t> (size);
+  uint32_t index = gTeeIndex;
+  if (gTeeBuffer && gTeeBuffer != base) {
+    // The buffer moved under the cursor. Restart at zero: two copies of a line is a readable card,
+    // a cursor into freed memory is not.
+    teeSay ("CloverSdhci r175: tee buffer moved old=%p new=%p idx=%u\n",
+              reinterpret_cast<void *> (gTeeBuffer), reinterpret_cast<void *> (base), index);
+    index = 0;
+    gTeePartial = 0;
+  }
+  gTeeBuffer = base;
+  if (index >= sizeu) {
+    index = static_cast<uint32_t> (bufx);
+  }
+  const uint32_t stop = static_cast<uint32_t> (bufx);
+  if (stop < index) {
+    // The writer wrapped past our cursor since the last pass, so the oldest unread bytes are the ones
+    // it has not reached yet. Counting it is the point: a frame with a high lap number is a boot whose
+    // log outran the card, and its gaps are explained.
+    gTeeLap++;
+  }
+
+  volatile char *data = reinterpret_cast<volatile char *> (base);
+  uint32_t scanned = 0;
+  uint32_t pushed = 0;
+  while (index != stop && scanned < kTeeScanPerPass) {
+    const char c = data[index];
+    index++;
+    if (index >= sizeu) {
+      index = 0;
+    }
+    scanned++;
+    if (c == '\n') {
+      teeConsumeLine (pushed);
+    } else if (gTeePartial < kTeeLineBytes) {
+      gTeeLine[gTeePartial] = c;
+      gTeePartial++;
+    } else {
+      // A line longer than a record: hand over what fits and start the next one. Splitting it would
+      // put half a message on the card twice, which reads like two different events.
+      teeConsumeLine (pushed);
+      gTeePartial = 0;
+    }
+  }
+  gTeeIndex = index;
+
+  if (gTeeSeen >= gTeeNextReport) {
+    gTeeNextReport = gTeeSeen + 256;
+    teeSay ("CloverSdhci r175: tee seen=%u kept=%u throttled=%u lap=%u idx=%u size=%u\n",
+              gTeeSeen, gTeeKept, gTeeThrottled, gTeeLap, gTeeIndex, sizeu);
+  }
 }
 
 // Round159: the write mirror of readMultiBlock. One CMD25 for several consecutive blocks, then// CMD12 with the busy spelling. The FIFO is level-gated rather than paced: below 26 MHz the card
@@ -3010,6 +3286,8 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
     }
     done++;
   }
+  // Round175: same as the read tail -- collect from the kernel log, then spend the guard on the card.
+  teeKernelLog ();
   flushVerdictRing ();   // Round174: same reason as the read tail
   releaseBlockGuard ();
   return done;
@@ -3493,6 +3771,8 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
   } else {
     __atomic_add_fetch (&gCacheFlushes, 1u, __ATOMIC_RELAXED);
   }
+  // Round175: same as the read tail -- collect from the kernel log, then spend the guard on the card.
+  teeKernelLog ();
   flushVerdictRing ();   // Round174: same reason as the read tail
   releaseBlockGuard ();
   return (flushed && reenabled) ? 1u : 0u;
@@ -5603,6 +5883,16 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                 // armed, or armed and then never flushed by a request that finished.
                 sdhciSay ("CloverSdhci r174: verdict ring armed lba=%u slots=%u\n",
                           gVerdictFirst + kVerdictOffset, kVerdictSlots);
+                // Round175: the tee is armed with the ring because it has nowhere to put a line
+                // without it. gTeeIndex stays at zero on purpose: the lines this port needs most --
+                // the shared-region probes, the root mount verdict -- were printed before now, and
+                // they are still in the buffer. bufx= in this reading is how much history the first
+                // passes are about to replay.
+                gTeeReady = 1;
+                sdhciSay ("CloverSdhci r175: tee armed bufc=%p size=%d bufx=%d\n",
+                          msgbufp ? msgbufp->msg_bufc : nullptr,
+                          msgbufp ? msgbufp->msg_size : 0,
+                          msgbufp ? msgbufp->msg_bufx : -1);
               }
             }
           }

@@ -175,7 +175,9 @@ device=$(adb shell getprop ro.product.device 2>/dev/null | tr -d '\r')
 say "recovery: device=${device:-?} twrp=${twrp:-?}"
 
 # Round174 reads 128 sectors, not 64: the first 32 blocks are the report/panic slots, and the
-# driver's verdict ring starts at sector 64. One dd brings back everything the card was told.
+# driver's verdict ring starts at sector 64. One dd brings back everything the card was told -- and
+# from round175 "everything" includes the kernel's own log lines, which the driver copies into that
+# ring out of msgbuf, so this single dump is now the whole reading of a boot.
 dump_ok=0
 for source in /dev/block/bootdevice/by-name/logfs /dev/block/by-name/logfs /dev/block/mmcblk0p39; do
   say "reading $source"
@@ -201,12 +203,19 @@ decoder="$(cd "$(dirname "$0")" && pwd)/read-clover-log.py"
 {
   echo "== report and panic window"
   python3 "$decoder" "$OUT"
-  echo "== verdict ring (round174)"
+  echo "== verdict ring (round174 driver lines + round175 kernel log lines)"
   python3 "$decoder" --verdict "$OUT" 2>/dev/null || echo "    no verdict records: this boot predates round174"
 } | tee "$OUT.txt"
 count=$(python3 "$decoder" --count "$OUT" 2>/dev/null || echo 0)
 verdicts=$(python3 "$decoder" --verdict --count "$OUT" 2>/dev/null || echo 0)
-say "decoded: $OUT.txt ($count report record(s), $verdicts verdict line(s))"
+# Round175 counts the kernel's own lines separately, because zero of them means two different things
+# and the ring cannot tell them apart on its own: the tee never armed (no verdict lines either), or it
+# armed and nothing in msgbuf matched the allowlist this boot.
+tee_lines=$(python3 "$decoder" --tee --count "$OUT" 2>/dev/null || echo 0)
+say "decoded: $OUT.txt ($count report record(s), $verdicts verdict line(s), $tee_lines of them from the kernel log)"
+if [ "$verdicts" -gt 0 ] && [ "$tee_lines" = 0 ]; then
+  warn "the ring armed but brought no kernel lines: the tee ran and msgbuf held nothing it keeps"
+fi
 
 if [ "$REBOOT_BOOTLOADER" = 1 ]; then
   say "returning to fastboot (adb reboot bootloader)"

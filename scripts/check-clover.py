@@ -1187,10 +1187,10 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round174. The menu has to name the round under test: the payload and its readings have to agree
+    # Round175. The menu has to name the round under test: the payload and its readings have to agree
     # about which round is on the card, or an image would be claiming a round it does not run.
-    if not board["payload"]["title"].startswith("clover r174:"):
-        errors.append('[payload] title is not "clover r174: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r175:"):
+        errors.append('[payload] title is not "clover r175: ...": the menu would not name this round')
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -1555,6 +1555,73 @@ def check_board(errors: list) -> str:
         if "gVerdictBusy" not in text:
             errors.append(f"{sdhci_r174.name} lost the re-entrancy flag: a nested flush would write one "
                           "record twice from two owners of the same scratch block")
+
+    # Round175. The ring only carries what this driver says itself, and the readings that decide the
+    # next round are printed by other people: the r151/r153/r155 shared-region probes and the r170
+    # exec/exit pairs are printf() calls in XNU, APFS's jhash and ntree errors come from the filesystem,
+    # and the `load code signature error 4` line that has killed every process since r162 comes from
+    # the kernel's loader. All of them already land in one place the driver can reach: msgbufp, the
+    # circular log buffer that printf/IOLog append to (bsd/kern/subr_prf.c:388 -> log_putc ->
+    # log_putc_locked(msgbufp, c)). So this round reads that buffer and copies the lines the port is
+    # blocked on into the same ring -- with no new XNU patch, which matters because a probe may not be
+    # inserted inside an earlier patch's own added block without breaking the build's reverse-check.
+    # The tee consumes a chunk per guarded pass from its own byte cursor, keeps only allowlisted lines,
+    # and never re-prints one: sdhciSay would IOLog the line straight back into the buffer it is
+    # reading, and the tee would match its own echo forever. Hence verdictPush, which fills the ring.
+    if sdhci_r174 is not None:
+        text = sdhci_r174.read_text()
+        for needle in ("#include <sys/msgbuf.h>",
+                       "struct msgbuf *buffer = msgbufp;",
+                       "static const uint32_t kTeeScanPerPass = 4096;",
+                       "static const uint32_t kTeePushPerPass = 4;",
+                       'static const char *const kTeeAllowlist[] = {',
+                       '"clover r",',
+                       "if (magic != MSG_MAGIC)",
+                       "static void teeKernelLog (void)",
+                       "static void verdictPush (const char *line, uint32_t length)",
+                       "verdictPush (gTeeLine + start, length - start);",
+                       "gTeeReady = 1;",
+                       '"CloverSdhci r175: tee armed bufc=%p size=%d bufx=%d\\n"'):
+            if needle not in text:
+                errors.append(f"{sdhci_r174.name} lacks {needle[:44]}...: round175's kernel log tee, "
+                              "its validation, or the ring-only push it depends on is gone")
+        if text.count("teeKernelLog ();") < 3:
+            errors.append(f"{sdhci_r174.name} drains the kernel log from fewer than three guarded "
+                          "request tails: the tee would run where a card write is not allowed")
+        # The echo check: everything between the tee's line consumer and its next function must be
+        # silent. One IOLog in there and the ring fills with copies of copies.
+        consume_start = text.find("static void teeConsumeLine (uint32_t &pushed)")
+        consume_end = (text.find("static void teeKernelLog (void)", consume_start)
+                       if consume_start >= 0 else -1)
+        consume = text[consume_start:consume_end] if consume_end > consume_start else ""
+        if not consume:
+            errors.append(f"{sdhci_r174.name} lost teeConsumeLine: the tee's line filter cannot be "
+                          "audited, so an echo back into msgbuf would go unnoticed")
+        for loud in ("IOLog", "sdhciSay"):
+            if loud in consume:
+                errors.append(f"{sdhci_r174.name} has the tee call {loud} per line: printing a line the "
+                              "tee just read appends it to msgbuf again, and the tee matches its own echo")
+        # ... and the whole drain must be silent, for a second reason: teeKernelLog runs at the tails of
+        # block requests, inside the block guard. IOLog takes bsd_log_lock, and a logger that holds
+        # bsd_log_lock and then issues disk I/O would wait for the guard this thread already holds.
+        tee_start = text.find("static void teeKernelLog (void)\n{")
+        tee_end = text.find("\n}\n", tee_start) if tee_start >= 0 else -1
+        tee_body = text[tee_start:tee_end] if tee_end > tee_start else ""
+        if not tee_body:
+            errors.append(f"{sdhci_r174.name} lost teeKernelLog: the drain that reads msgbuf is gone")
+        for loud in ("IOLog", "sdhciSay"):
+            if loud in tee_body:
+                errors.append(f"{sdhci_r174.name} has the tee call {loud} while holding the block "
+                              "guard: that is a lock order between bsd_log_lock and the guard, and a "
+                              "logger doing I/O under the log lock would deadlock on it")
+        if "static void teeSay (const char *fmt, ...)" not in text:
+            errors.append(f"{sdhci_r174.name} lost teeSay: the tee's own state lines have no ring-only "
+                          "way to speak, which is the only reason the drain is safe to run in a tail")
+        # The cursor is a byte index into a buffer the kernel can reallocate; anything cached across
+        # passes but not revalidated is a pointer into freed memory.
+        if "if (gTeeBuffer && gTeeBuffer != base)" not in text:
+            errors.append(f"{sdhci_r174.name} does not notice msg_bufc moving: kern.msgbuf can grow the "
+                          "log, and a cursor into the old buffer reads freed memory")
     reader = next((base / "scripts/read-clover-log.py"
                    for base in (REPO, pathlib.Path.cwd())
                    if (base / "scripts/read-clover-log.py").is_file()), None)
@@ -1568,6 +1635,14 @@ def check_board(errors: list) -> str:
             if needle not in text:
                 errors.append(f"{reader.name} lacks {needle[:40]}...: the ring's slots, its sequence "
                               "order after a wrap, or its own round-trip test would be missing")
+        # Round175: the ring now holds two producers, and the host has to be able to ask them apart --
+        # "the tee never ran" and "the tee ran and msgbuf matched nothing" are different answers.
+        for needle in ('DRIVER_PREFIX = b"CloverSdhci "', "def producer(content)",
+                       '"--tee"', '"--driver"', 'said == ["driver", "driver", "kernel", "driver", '
+                       '"kernel"]'):
+            if needle not in text:
+                errors.append(f"{reader.name} lacks {needle[:40]}...: a dump could not say which of "
+                              "its ring lines came from the kernel log, so round175 would be unreadable")
         if reader.is_file():
             check = subprocess.run([sys.executable, str(reader), "--selftest"],
                                    capture_output=True, text=True)
@@ -1583,6 +1658,13 @@ def check_board(errors: list) -> str:
             if needle not in text:
                 errors.append(f"{unattended.name} lacks {needle[:32]}...: the dd would stop short of "
                               "sector 64 and the verdict ring would never be read")
+        # Round175: the script reports the tee's yield, because a ring of only driver lines is a
+        # different finding from a ring that also carried kernel lines.
+        for needle in ("--tee --count", "from the kernel log",
+                       "brought no kernel lines"):
+            if needle not in text:
+                errors.append(f"{unattended.name} lacks {needle[:32]}...: the host would not count "
+                              "the kernel lines the tee brought back")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())

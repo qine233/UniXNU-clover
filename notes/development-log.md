@@ -12567,3 +12567,108 @@ fastboot reboot
 
 刷完不再拍照读面板：设备进 recovery 后 `scripts/run-clover-unattended.sh` 把 128 个
 logfs 扇区拉回宿主，`read-clover-log.py --verdict` 按先后给出这一整轮启动的判据。
+
+## round175（v0.5.31）：内核已经说过的那句话，也搬进卡上的环
+
+round174 之后驱动自己的判据在卡上了，但这一轮真正要读的那些话仍然不在：`clover r151:`
+的缓存 open 三行、`clover r153: check_np dyld_flags=`、`clover r154:` 的 syscall 536
+阶梯、`clover r155:` 的头字段与 `fsig` 读数、`clover r166: sig`、round170 那对
+`exec`/`exit`、APFS 的 `jhash … hash mismatch`、`load code signature error 4`、
+launchd 自己的抱怨。它们全都已经进了内核日志——`printf`/`IOLog` 最后都落在
+`log_putc`，也就是那块 1 MiB 的 `msgbuf` 上；只是这台板子没有串口，也没有 `syslog`
+读者，所以它写进内存就没人再读。面板只是它路过的一站。
+
+按 sheng 的做法继续加探针是走不通的一条路：本轮的墙在 `vm_unix.c`、`kern_exec.c`
+的哪些行，已经被 round170 那条硬规则钉死——**探针绝不能插进排序在前的补丁自己新增的
+块**，否则那条补丁的 `--reverse --check` 失效、构建重放中止。所以这一轮一个 XNU 补丁
+都不加，改让块设备驱动去读内核自己那份缓冲。
+
+内核侧的事实全部来自本树的源码，没有一条是猜的：
+
+- `bsd/sys/msgbuf.h`：`MAX_MSG_BSIZE (1*1024*1024)`，`struct msgbuf { int msg_magic;
+  int msg_size; int msg_bufx; int msg_bufr; char *msg_bufc; }`，`MSG_MAGIC 0x063061`，
+  `extern struct msgbuf *msgbufp;`（在 `XNU_KERNEL_PRIVATE` 下，驱动正好定义它）。
+- `bsd/kern/subr_prf.c:387`：`if ((pca->flags & TOLOG) && c != '\0' && c != '\r' &&
+  c != 0177) log_putc((char)c);` —— 每条 `IOLog` 的字符都会走到这里。
+- `bsd/kern/subr_log.c:552`：`log_putc_locked` 就是 `mbp->msg_bufc[mbp->msg_bufx++] = c;
+  if (mbp->msg_bufx >= mbp->msg_size) mbp->msg_bufx = 0;` —— 一个单游标环，`bufx` 是写点。
+- `bsd/kern/subr_log.c:117`：`char smsg_bufc[CONFIG_MSG_BSIZE]; struct msgbuf msgbuf = …`
+  加 `msgbufp __attribute__((used))`，所以链接期就有；`subr_log.c:622` 之后还可能在运行时
+  重分配 `msg_bufc` —— **这就是每次路过都把四个字段重新读一遍的理由，不能缓存。**
+
+驱动侧的形状：
+
+- **只在已经握着块守卫的地方读**。`teeKernelLog()` 接在 round174 那三个尾巴上（读、
+  写、cache flush），排在 `flushVerdictRing()` 之前：先收新的，再把攒下的花在这张卡上。
+  一次最多扫 `kTeeScanPerPass = 4096` 字节、最多落 `kTeePushPerPass = 4` 条，所以一个
+  本来就慢的尾巴不会因为这轮多背一层活。
+- **只留有意义的行，且不回声**。`kTeeAllowlist` 十二项（`clover r`、`CloverBlock`、
+  `apfs`、`APFS`、`decmpfs`、`load code signature`、`AMFI`、`amfi`、`launchd`、
+  `initproc`、`vm_fault`、`shared_region`、`panic`），行首是 `CloverSdhci ` 的直接跳过
+  ——那些话环里已经有了。留下之行走 `teeSay`→`verdictPush`，**不走 `IOLog`**：一来
+  `teeKernelLog` 在守卫里，而 `IOLog` 拿 `bsd_log_lock`，「持日志锁去做块 I/O」的 anyone
+  就会和守卫互为等待；二来抄进来的话若再打印出去，就会被自己再抄一遍。
+- **读之前先验，验不过只说一次**。`magic != MSG_MAGIC`、`size <= 0`、`bufx` 越界、
+  `msg_bufc` 不在内核 VA（`0xfffffff000000000` 之下）四种各给一个 `reason=`，首次不过
+  打一条 `CloverSdhci r175: tee refuses reason=%u magic=0x%x size=%d bufx=%d bufc=%p`，
+  之后只更新计数。缓冲搬家（`gTeeBuffer != base`）报 `tee buffer moved old= new= idx=`
+  并把游标归零，因为旧偏移在新缓冲里没有意义。
+- **转圈知道自己转了几圈**。`bufx < index` 就是一次回绕，`gTeeLap++`；每攒够 256 行
+  扫过就打一条普查 `tee seen=%u kept=%u throttled=%u lap=%u idx=%u size=%u`。
+  `seen` 与 `kept` 的差把「内核没说话」和「说了但不在白名单」分开，`lap` 把「环太快、
+  游标追不上」这件事量出来——它是这条通道唯一的失真来源。
+- **武装那行照旧上屏**，因为它就是判据：`CloverSdhci r175: tee armed bufc=%p size=%d
+  bufx=%d`，和 round174 的 `verdict ring armed lba=` 同一个位置、同一个理由。
+
+宿主侧跟着分两种来源。`read-clover-log.py` 用行首是不是 `CloverSdhci ` 判
+`producer()`，kind-21 每条多打一行 `said by driver|kernel`，并新增 `--tee`（只看内核
+搬来的）与 `--driver`（只看驱动自己的），两者都隐含取 verdict 窗口；`--selftest` 现在
+往环里交替写五条（两条驱动、两条内核、一条驱动判据），断言 `said` 序列与
+`producer(None) == "-"`。`check-clover.py` 把这道自测当闸门执行，并额外断言两件事：
+`teeConsumeLine` 到 `teeKernelLog` 之间不许出现 `IOLog`/`sdhciSay`（防止哪天有人把回声
+加回来），以及 `static void teeSay (const char *fmt, ...)` 确实存在。
+`run-clover-unattended.sh` 的总结现在写「N 条，其中 M 条来自内核日志」，并在环有内容、
+内核行却是零时 `warn`——那是「tee 跑了但 msgbuf 里没有它要留的东西」，不是「设备没起来」。
+
+构建：先逆撤 `zzy-clover-dyld-cache-skip`，`python3 scripts/build-arm-driver.py
+CloverSdhci` 过 `-Werror` 与 ARM64/iOS 17 目标文件审计（文件现在 6348 行，38 句
+`sdhciSay`、3 句 `teeSay`）；内核 `78740e492dbd6dcf…`（52,043,776 字节），AMFI 拷贝
+`fd6536ad874e0561…`（站点仍是 `0x1a880e4` → `0x14000011`、`0x1a8816c` → `0xd503201f`），
+payload `f0db9e5dc89f4efb…`（56 MiB，58,720,256 字节），卷内 kernel `ab4b66b6771241f3…`、
+`unixnu.toml` `c711f4d54b3c8b82…`（标题变了所以变了）、ADT `525cf81620262b31…`、
+`scratch-data.img` `614b8356…`（未变）、trustcache `7c369ce0…`（未变）。入口探针
+`6844 bytes in 37 runs`——本轮没往内核加探针，与 round170–174 一致。两个 checker 与
+`verify-clover-payload.py` 23 项全 OK，其中 verify 那一栏本轮改名
+`kernel.macho: verdict ring and log tee linked`，同时要求 `verdict ring armed lba=` 和
+`tee armed bufc=` 都在。
+
+这里记一条踩过的坑，因为它会复发：`build-xnu-4k-baseline.sh` 的补丁循环用
+「`--reverse --check` 通不通」判断一条补丁是否已打。`zzy-clover-dyld-cache-skip` 叠在
+`native-4k-signature-hash-cache` 自己新增的 struct 字段与函数体上（`ubc_internal.h:165`
+那个 `csb_native4k_skipped`、`ubc_subr.c:5786` 那个提前返回），所以只要前者还挂着，
+后者的逆撤检查就必然失败 → 循环转去正向 `apply --check` → 同一处冲突 → `set -e` 中止，
+报的是 `patch failed: bsd/sys/ubc_internal.h:158`，看上去像补丁坏了，其实是顺序坏了。
+结论两条：**每次构建前逆撤 `zzy-clover-dyld-cache-skip`**（本轮已照做），以及别用
+`… | tail` 包住构建命令——第一次踩到时退出码被 `tail` 吃掉，日志看着像成功。顺带纠正
+一处早前的记法：循环在名字序里会把这条 skip 补丁重新打上，所以出厂内核**是**带它的，
+`verify-clover-payload.py` 的 `dyld cache hash skip` 一栏断言的正是它在；逆撤只是为了
+让循环过关，不是为了把它摘出去。
+
+代价写清楚：环只有 32 槽，内核行和驱动判据共用，满了覆盖最旧一条——守护进程一多，
+`readcheck`/`wrcheck` 那几行可能被挤出。两个封顶（每趟 4 条、每次扫描 4096 字节）就是
+为此而设；`throttled=` 与 `lap=` 会把「放不下」和「追不上」分开报出来。真要更宽的
+通道，下一步是把环开在 logfs 的另一段而不是加指针。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round175-payload.img
+fastboot reboot
+```
+
+刷完进 recovery，`scripts/run-clover-unattended.sh` 一次拉 128 个 logfs 扇区。这一帧
+第一次不需要人在机器旁边：`--tee` 给 dyld/exec/exit/APFS/AMFI 的原话，`--driver` 给
+round171–174 那九件判据，两边都有 `seq`，所以先后仍在。要看的是——`tee refuses` 有没有
+出现（没出现就是通道活着）；`seen=/kept=/lap=` 三个数的比例；环里到底有没有
+`clover r154:` 或 `clover r166:` 这两种至今一次没读到的行；以及 launchd 那对
+`exec`/`exit` 在环转圈的节奏里是**继续铺开**还是反复同一批 comm。

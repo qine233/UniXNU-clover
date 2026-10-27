@@ -30,7 +30,9 @@ checkpoint flush 握着块守卫，把另一颗卷上的每一次读判成 EIO�
 事本身：读通路现在有一条 ADMA2，靠逐字比较挣到信任。round173 把同一条通路交给写，
 但它只准重写自己刚读到的字节——先用 PIO 读回、再用 ADMA 写回同一批、再用 PIO 读回
 比对，而且只在 logfs 那 8 MiB 里做。round174 不改通路，只改记录：驱动的每一句
-判据现在同时上屏和写进卡上的 verdict 环，读数不再依赖拍照的时机。
+判据现在同时上屏和写进卡上的 verdict 环，读数不再依赖拍照的时机。round175 把这条
+通道交给别人的话：驱动直接读内核自己那份 `msgbuf`，把 dyld、exec/exit、APFS、AMFI
+那些已经打印出来的行滤进同一个环——一轮新探针都不用加，屏幕滚没滚过都不再重要。
 
 ### 已完成（都有真机读数）
 
@@ -61,7 +63,8 @@ checkpoint flush 握着块守卫，把另一颗卷上的每一次读判成 EIO�
 | round171（v0.5.27） | 批量读按「交付字数 + 内容错误位」判定（`st=0x21 w=1024/1024` 那种全量交付不再被丢回单块）；卡的写缓存打开并显式提交（CMD6 关→提交→开）；块守卫与批量缓冲从有界自旋改成 `IOLock`；批量 32 → 128 块，可信性闸门改为按请求取样 | 改动全部在 round172 镜像里，与下一行同一帧读 |
 | round172（v0.5.28） | 读通路加一条 ADMA2：描述符形状逐字节抄自本板 4.19 CAF 树（12 字节项、`cmd` 在前 `len` 在后、末项带 END 不加 NOP），数据落在本驱动自有的 64 KiB 连续 bounce（照 sheng `NativeUfs` 的四条物理地址检查与 `dc civac`/`dc ivac` 节奏）；同一个请求先走已信任的批量 PIO、再走 ADMA，**逐字相同才准用**，失败八次整轮退役 | 改动全部在 round173 镜像里，与下一行同一帧读 |
 | round173（v0.5.29） | 写通路也上 ADMA2，但只准重写自己刚读到的字节：闸门取 logfs 窗内第 4096 个扇区起的 16 块（离 panic 槽占的前 32 块很远），PIO 读回原字节 → 同样字节走 PIO 写一遍当对照 → ADMA 写回同一批 → PIO 再读回逐字比对，三份都对才 `trusted=1`；此后每个 ≥4 块的写请求先走 DMA，被拒就落回 r171 的 PIO 批量，八次退役。panic 屏与 bring-up 报告的两块写仍走 `writePioBlock`，不依赖本轮任何标志 | 改动全部在 round174 镜像里；r173 那些上不了屏的判据，这一轮起会写进卡上的环 |
-| round174（v0.5.30） | 判据写进卡上，不再只留在屏上：驱动里每一句 `CloverSdhci r…` 改走 `sdhciSay`——照常 `IOLog`，同时存进一个 32 槽 RAM 环；`flushVerdictRing` 在每个已经握着块守卫的传输尾巴上最多落 4 条（每条两个 512 字节 LOG1 块），写进 logfs 第 64 扇区起、离 panic 槽很远的 kind-21 环，头字段第 8 个字带序号，所以环转完一圈宿主仍能按先后读出。环满就覆盖最旧一条并计数，绝不阻塞；写用不加守卫的单块原语，因此不可能在失败的传输里再套一层等待。宿主侧 `read-clover-log.py` 解两个窗口、`--selftest` 与驱动逐字节往返，`check-clover.py` 把它当构建闸门 | **已构建**，待冷刷 |
+| round174（v0.5.30） | 判据写进卡上，不再只留在屏上：驱动里每一句 `CloverSdhci r…` 改走 `sdhciSay`——照常 `IOLog`，同时存进一个 32 槽 RAM 环；`flushVerdictRing` 在每个已经握着块守卫的传输尾巴上最多落 4 条（每条两个 512 字节 LOG1 块），写进 logfs 第 64 扇区起、离 panic 槽很远的 kind-21 环，头字段第 8 个字带序号，所以环转完一圈宿主仍能按先后读出。环满就覆盖最旧一条并计数，绝不阻塞；写用不加守卫的单块原语，因此不可能在失败的传输里再套一层等待。宿主侧 `read-clover-log.py` 解两个窗口、`--selftest` 与驱动逐字节往返，`check-clover.py` 把它当构建闸门 | 改动全部在 round175 镜像里，与下一行同一帧读 |
+| round175（v0.5.31） | 内核自己已经说过的那句话，也搬到卡上：**一个探针都不加**。驱动在每个已经握着块守卫的尾巴上调用 `teeKernelLog`，按字节游标读内核的 `msgbuf`（`subr_prf.c:388` 把每条 `TOLOG` 字符交给 `log_putc`，`subr_log.c:554` 就是往 `msgbufp->msg_bufc` 环形写），四个字段每趟重读因为那块缓冲在 `subr_log.c:622` 之后可能被换掉；一次最多扫 4096 字节、最多落 4 条进环。只有命中白名单的行才留（`clover r`、`CloverBlock`、`apfs`、`decmpfs`、`load code signature`、`AMFI`、`launchd`、`vm_fault`、`shared_region`、`panic`），驱动自己的 `CloverSdhci ` 行直接跳过——环里本来就有。留下的行走 `teeSay`→`verdictPush`，**不过 `IOLog`**：守卫里再拿一次 `bsd_log_lock` 是给自己造死锁机会，而且抄进来的话再打印出去会被自己再抄一遍。校验（magic/size/bufx/必须落在内核 VA 之上）不过就只报一次 `tee refuses reason=`，缓冲搬家报 `tee buffer moved`，每 256 行报一次 `tee seen= kept= throttled= lap=`。宿主侧 `read-clover-log.py` 按行首前缀分 `driver`/`kernel` 两种来源，`--tee` 与 `--driver` 各取一边 | **已构建**，待冷刷 |
 
 round171 + round172 + round173 一帧问九件事：`read guard` 是否整批消失（守卫只等、
 不拒），
@@ -77,10 +80,20 @@ round174 之后，这九件事不再取决于照片：`run-clover-unattended.sh`
 128 个扇区，`read-clover-log.py --verdict` 按先后打印环里的判据。同一次冷刷里，
 panic 尾巴（前 32 扇区）和它之前的判据（第 64 扇区起）来自同一条启动，读的是同一张卡。
 
+round175 之后，环里不再只有驱动自己的话。dyld 的 `shared_region` 探针、r170 那对
+`exec`/`exit`、APFS 的 jhash 与 ntree 错、`load code signature error 4`、launchd
+的抱怨——这些从 round146 起就只能在「恰好滚到面板上那一秒」被拍到的行，现在和驱动
+的判据排在同一个环里，按序号先后给宿主。于是排期第 1 条（536 与空共享区）第一次变成
+一个不需要人在机器旁边蹲着的问题：刷完、回 recovery、拉一次 logfs 就是一整条启动的
+文本。代价写在驱动的形状里——环还是那 32 槽，内核行和白名单之外的行了不留，
+`tee seen=/kept=/throttled=` 三个数负责说明「没读到」和「读到了但没地方放」的分别是哪种。
+
 ### 排期（未开始 · 已知限制）
 
 1. **共享区映射（syscall 536）** — 头字段与签名注册两段已被 round159 帧关掉，
-   映射这一格还空着；排在守护进程起来之后。
+   映射这一格还空着；排在守护进程起来之后。round175 起这一格的读法变了：
+   `clover r154:` 的 536 三行、`mapfile kr=`、`clover r166: sig` 与 r170 的
+   `exec`/`exit` 都从卡上的环里读，不再等谁恰好拍到面板。
 2. **完整 `/data`** — 现在只是 32 MiB 的 APFS scratch 种子，追加在 userdata 的
    两个 GPT 副本之间、不进 GPT；原 54.4 GB userdata 内容没有迁移。
 3. **显示与 GPU** — 没有 MDP5/DSI 驱动，屏幕只服务于启动诊断；Adreno 512 无驱动，
@@ -232,7 +245,8 @@ python3 scripts/verify-userdata-window.py  # 刷 userdata 前的宿主闸门（�
 `packed_data_ramdisk` 为假，`trust_cache_sha256` 非空并与 bundle 文件一致；
 最后断言当前轮次的 `clover rNNN:` 探针形状与旧轮次复读形态的缺席，并真的执行一遍
 `read-clover-log.py --selftest`——驱动写环的形状和宿主解环的形状必须在同一道闸门
-上互相咬住，否则「卡上有记录」和「宿主读得出」会是两套说法。
+上互相咬住，否则「卡上有记录」和「宿主读得出」会是两套说法。自测里的环同时装驱动
+自己写的行和 tee 从内核日志搬来的行，`--tee`/`--driver` 的分流也在这一道上验一次。
 
 ## 上机
 
@@ -263,6 +277,11 @@ fastboot reboot
 - **verdict 环**（round174 起）：同一张卡的 logfs 第 64 扇区起是 32 槽 kind-21 环，
   驱动每句判据都落一份；头字段第 8 个字的序号让转圈的环仍按先后读，`--verdict`
   打印，环满覆盖最旧一条并计数。屏会滚，卡不会。
+- **环里的内核日志**（round175 起）：同一个环有两种来源。驱动在每个握着块守卫的
+  尾巴上按字节游标读 `msgbufp`，白名单命中的行（dyld 探针、`exec`/`exit`、APFS 错、
+  `load code signature error`、launchd、panic）照 kind-21 落卡，**不回声给 `IOLog`**。
+  `read-clover-log.py` 按行首是不是 `CloverSdhci ` 判来源并打印 `said by driver/kernel`，
+  `--tee` 只看内核行、`--driver` 只看驱动行。
 - **地址翻译**：`scripts/decode-clover-address.py --suspects` 出本镜像的
   tty/console 区间表。
 - **无人值守**：`clover-unattended=N` 的墙钟死线，把 panic 写进 IMEM

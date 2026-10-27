@@ -386,7 +386,11 @@ EXEC_SIG_DUMP = "clover r166: sig n=%u mo=%lld off=%u size=%u w=%08x/%08x/%08x/%
 # kind 21 records, so a dd of logfs sector 64 upwards answers the round even if the screen scrolled
 # twelve lines ago. The armed line is the only string that round added, and it is the one the host
 # needs -- a dump with no verdict records has to say whether the ring was ever armed or never flushed.
-VERDICT_RING = ("CloverSdhci r174: verdict ring armed lba=",)
+# Round175 arms a second thing on the same card: the tee that drains the kernel's own log buffer into
+# that ring, which is how the probes printed by XNU (shared_region, exec/exit, APFS, the loader's
+# signature error) reach the dump instead of the panel. Its armed line is checked for the same reason.
+VERDICT_RING = ("CloverSdhci r174: verdict ring armed lba=",
+                "CloverSdhci r175: tee armed bufc=")
 
 
 def check_read_integrity(kernel: bytes) -> bool:
@@ -409,10 +413,11 @@ def check_read_integrity(kernel: bytes) -> bool:
 
 
 def check_verdict_ring(kernel: bytes) -> bool:
-    """Round174 writes every CloverSdhci verdict line to logfs as a record of its own. Without the
-    armed line in the image, a host-side dd that finds no records cannot tell an unarmed ring from a
-    ring that armed and never got a request to finish."""
-    label = "kernel.macho: verdict ring linked"
+    """Round174 writes every CloverSdhci verdict line to logfs as a record of its own, and round175
+    feeds the kernel's own log lines into the same ring. Without those armed strings in the image, a
+    host-side dd that finds no records cannot tell an unarmed ring from a ring that armed and never got
+    a request to finish."""
+    label = "kernel.macho: verdict ring and log tee linked"
     found = {name: name.encode() in kernel for name in VERDICT_RING}
     ok = all(found.values())
     detail = ", ".join(f"{name.split(':')[1].strip()} {'present' if yes else 'ABSENT'}"
