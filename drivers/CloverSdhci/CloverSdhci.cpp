@@ -1562,10 +1562,10 @@ static void reportReadFailure (const char *stage, uint32_t lba, uint32_t blocks,
 //
 // WHAT THIS ROUND DOES NOT TOUCH
 //
-// Writes. They stay on the PIO path r171 fixed, because a DMA write that is wrong does not read back
-// as an EIO -- it changes the card. Once the read path has a frame behind it, the write path gets the
-// same gate with a pattern written to a scratch run and read back through PIO; that is the next item,
-// not this one.
+// Writes. They stay on the PIO path r171 fixed here, because a DMA write that is wrong does not read
+// back as an EIO -- it changes the card. The write version of this path is round173, and it is the
+// same file, below writeMultiBlock(): it rewrites a run inside the logfs window with the bytes it
+// just read from that run and only trusts ADMA when the partition reads back exactly as it was.
 static const uint32_t kAdmaEntryBytes = SDHCI_ADMA2_64_DESC_SZ;
 // 32 KiB per descriptor, not the field's own 64 KiB: 65536 is the length field's zero spelling, and
 // a table whose every entry is a plain byte count is one that can be checked on the host.
@@ -2242,6 +2242,296 @@ static bool writeMultiBlock (uint32_t lba, const uint32_t *words, uint32_t block
   return multiFailure (1, lba, blocks, status, wordCount, totalWords);
 }
 
+// ----------------------------------------------------------------- round173: the ADMA2 write path
+//
+// WHY THERE IS ONE
+//
+// The same ceiling as the read side, but costing the other thing: hold time on the block guard. A
+// 64 KiB chunk goes to the card one word per SPACE_AVAILABLE poll, and while it is going nothing else
+// can touch this host -- the r170 frame showed what a long write sequence does to the other volume's
+// reads. The host can empty its own buffer without the CPU, which is what ADMA2 is.
+//
+// WHY IT IS ALLOWED TO TOUCH THE CARD AT ALL
+//
+// A wrong DMA read costs an EIO; a wrong DMA write changes what is on the eMMC. So this path does not
+// get to write bytes anyone invented. checkWriteDmaPath() takes a run inside the logfs window -- the
+// one partition this port may damage without damaging anything, because its contents are only the
+// bring-up reports it rewrites every boot -- reads it through PIO, and writes those same bytes back
+// through ADMA2. If the host delivered exactly what the CPU handed it, the partition reads back byte
+// for byte as it was found and the flag is set; if the table was wrong, the run now holds wrong bytes
+// in a log area, which is the entire blast radius. Before that, the identical bytes go through the PIO
+// write and read back as a control: a medium that will not round-trip its own bytes through PIO cannot
+// produce a DMA verdict either, and the gate refuses instead of printing a meaningless zero.
+//
+// WHAT STAYS ON PIO
+//
+// The panic screen's own two-block writes (clover_emmc_panic_append) and the bring-up report's logfs
+// writes never see this path: they call writePioBlock directly, and they are the last thing a dying
+// boot does. Nothing about them should depend on a flag this round introduced.
+static const uint32_t kWriteDmaFailureLimit = 8;
+static bool gWriteDmaTrusted = false;
+static bool gWriteDmaCheckDone = false;
+static uint32_t gWriteDmaFailures = 0;
+
+// The run the gate may rewrite. logfs is 16384 sectors and the panic writer owns the first 32 of them
+// (16 slots, two blocks each); 4096 sectors in is neither the header array nor the tail it appends to,
+// and 16 blocks is four times the minimum a batch is, so the sample itself is a real batch.
+static const uint32_t kWriteCheckBlocks = 16;
+static const uint32_t kWriteCheckWords = kWriteCheckBlocks * kBlockWords;
+static const uint32_t kWriteCheckLba = kLogfsFirstLba + 4096u;
+
+// Which part of a DMA write refused, with the same eight-line bound the read reporter uses. The
+// ADMA_ERROR byte names the descriptor the host gave up on; HOST_CONTROL is printed because a DMA
+// scheme bit that did not stick looks different from a table the bus refused to read.
+static void reportWriteDmaFailure (const char *stage, uint32_t lba, uint32_t blocks, uint32_t status)
+{
+  static uint32_t reported = 0;
+  if (reported >= 8) {
+    return;
+  }
+  reported++;
+  IOLog ("CloverSdhci r173: dma write %s lba=%u blocks=%u st=%08x err8=%02x hctl=%02x\n",
+         stage, lba, blocks, status, read8 (SDHCI_ADMA_ERROR), read8 (SDHCI_HOST_CONTROL));
+}
+
+// One block run read straight through PIO, block by block. The verification reads of this round's
+// gate deliberately use the single-block path and not the batch: the batch is r171's subject, the DMA
+// path is r173's, and a comparison is only worth printing if the thing it measures with is the oldest
+// proved path in the file.
+static bool readRunPio (uint32_t lba, uint32_t *dst, uint32_t blocks)
+{
+  for (uint32_t block = 0; block < blocks; block++) {
+    uint32_t got = 0;
+    uint32_t status = 0;
+    if (!readPioBlock (lba + block, dst + static_cast<uint64_t> (block) * kBlockWords, got, status)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// One CMD25 with the data phase handed to the host. The bytes are copied into the bounce first because
+// the caller's buffer is whoever's -- an IOMemoryDescriptor's staging array, a vnode pager's page --
+// and none of it has to be physically contiguous for this path to work. Everything else is the r172
+// read run mirrored: the same table, the same scheme bits, the same explicit CMD12, the same
+// per-block share of the deadline. The difference is one bit in TRANSFER_MODE (READ clear) and the
+// direction of the cache operation: here the CPU cleans the bounce before the host reads it, and
+// there is nothing to invalidate afterwards.
+static bool writeAdmaRun (uint32_t lba, const uint32_t *src, uint32_t blocks, uint32_t &status,
+                          uint64_t &ticks)
+{
+  status = 0;
+  ticks = 0;
+  if (!dmaBringUp () || !blocks || blocks * 512u > kAdmaDataBytes) {
+    return false;
+  }
+  // Round173: a DMA write pushes whatever the buffer holds out in order, so words left in the FIFO by
+  // a refused read would shift the whole run toward the card without a single error bit moving. The
+  // PIO batch has always been immune to this (the CPU writes each word when it is asked), the host is
+  // not, so the drain that r165 added for reads is the first thing this path does.
+  if (!prepareReadPath ()) {
+    reportWriteDmaFailure ("path", lba, blocks, 0);
+    return false;
+  }
+  if (!waitCommandSlot ()) {
+    reportWriteDmaFailure ("slot", lba, blocks, 0);
+    return false;
+  }
+  const uint32_t bytes = blocks * 512u;
+  const uint32_t words = bytes / 4u;
+  uint32_t *bounce = reinterpret_cast<uint32_t *> (gAdma.dataVirt);
+  for (uint32_t word = 0; word < words; word++) {
+    bounce[word] = src[word];
+  }
+  admaBuildTable (bytes);
+  // The host will fetch these lines over the bus; anything still dirty only in the CPU's cache would
+  // be bytes the card never sees.
+  cacheCleanInvalidate (gAdma.dataVirt, bytes);
+  uint8_t control = read8 (SDHCI_HOST_CONTROL);
+  control &= static_cast<uint8_t> (~SDHCI_CTRL_DMA_MASK);
+  control |= static_cast<uint8_t> (gAdma.wide ? SDHCI_CTRL_ADMA64 : SDHCI_CTRL_ADMA32);
+  write8 (SDHCI_HOST_CONTROL, control);
+  write32 (SDHCI_ADMA_ADDRESS, static_cast<uint32_t> (gAdma.tablePhys & 0xffffffffULL));
+  if (gAdma.wide) {
+    write32 (SDHCI_ADMA_ADDRESS_HI, static_cast<uint32_t> (gAdma.tablePhys >> 32));
+  }
+  write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
+  write16 (SDHCI_BLOCK_SIZE, 512);
+  write16 (SDHCI_BLOCK_COUNT, static_cast<uint16_t> (blocks));
+  write32 (SDHCI_INT_STATUS, 0xffffffffu);
+  write32 (SDHCI_ARGUMENT, lba);
+  // READ stays clear: this is the only bit that says which way the words go.
+  write16 (SDHCI_TRANSFER_MODE, SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_MULTI | SDHCI_TRNS_DMA);
+  write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (MMC_WRITE_MULTIPLE_BLOCK, SDHCI_CMD_RESP_SHORT |
+                                          SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA));
+  uint32_t spins = 0;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & SDHCI_INT_CMD_MASK) {
+      break;
+    }
+    if (++spins >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  if (!(status & SDHCI_INT_RESPONSE) ||
+      (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+    // Round167's rule for the write side: a refused command still has to be stopped, or the card is
+    // left in data mode and the next request inherits it.
+    sendStopCommand ();
+    resetReadPath ();
+    reportWriteDmaFailure ("cmd", lba, blocks, status);
+    return false;
+  }
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint64_t deadline = frequency / 5ULL +
+                            static_cast<uint64_t> (blocks) * (frequency / 20ULL);
+  const uint64_t start = readCounter ();
+  bool ended = false;
+  uint32_t guard = 0;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & (kContentErrorMask | SDHCI_INT_ADMA_ERROR)) {
+      break;
+    }
+    if (status & SDHCI_INT_DATA_END) {
+      ended = true;
+      break;
+    }
+    if (readCounter () - start > deadline) {
+      break;
+    }
+    if (++guard >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  ticks = readCounter () - start;
+  status = read32 (SDHCI_INT_STATUS);
+  const bool stopped = sendStopCommand ();
+  if (!ended || (status & (kContentErrorMask | SDHCI_INT_ADMA_ERROR)) || !stopped) {
+    resetReadPath ();
+    reportWriteDmaFailure (ended ? (stopped ? "error" : "stop") : "deadline", lba, blocks, status);
+    return false;
+  }
+  return true;
+}
+
+// The verdict this round exists to produce, in the only order that makes it mean something: read what
+// is there, prove the PIO path round-trips those bytes, then prove ADMA2 delivers the same round trip,
+// and time both. Everything prints on one line either way, including the refusal reasons, because
+// "the gate never ran" and "the gate said no" have to be tellable apart from a single frame.
+static void checkWriteDmaPath (void)
+{
+  gWriteDmaCheckDone = true;
+  const uint32_t sectors = __atomic_load_n (&gBlockSectors, __ATOMIC_ACQUIRE);
+  if (kWriteCheckLba < kLogfsFirstLba ||
+      kWriteCheckLba + kWriteCheckBlocks - 1 > kLogfsLastLba ||
+      kWriteCheckLba + kWriteCheckBlocks > sectors) {
+    IOLog ("CloverSdhci r173: write gate refuses, logfs window lba=%u blocks=%u sectors=%u\n",
+           kWriteCheckLba, kWriteCheckBlocks, sectors);
+    return;
+  }
+  if (!dmaBringUp ()) {
+    // dmaBringUp printed its own refusal reason.
+    return;
+  }
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  uint32_t firstPio = kWriteCheckWords;
+  uint32_t firstDma = kWriteCheckWords;
+  uint32_t diffPio = kWriteCheckWords;
+  uint32_t diffDma = kWriteCheckWords;
+  uint32_t pioStatus = 0;
+  uint32_t dmaStatus = 0;
+  uint32_t settleStatus = 0;
+  uint32_t rsp = 0;
+  uint32_t polls = 0;
+  uint64_t pioTicks = 0;
+  uint64_t dmaTicks = 0;
+
+  const bool originalRead = readRunPio (kWriteCheckLba, gCheckBatchA, kWriteCheckBlocks);
+  if (!originalRead) {
+    IOLog ("CloverSdhci r173: write gate stops, the logfs run would not read back lba=%u\n",
+           kWriteCheckLba);
+    return;
+  }
+  // Control run: the same bytes, through the path every earlier round proved, with the card's own
+  // settle inside the timing so the number is comparable with the DMA run below.
+  uint64_t start = readCounter ();
+  bool pioWrite = false;
+  for (uint32_t attempt = 0; attempt < 2 && !pioWrite; attempt++) {
+    uint32_t handed = 0;
+    if (!writeMultiBlock (kWriteCheckLba, gCheckBatchA, kWriteCheckBlocks, handed, pioStatus)) {
+      continue;
+    }
+    if (writeSettled (rsp, settleStatus, polls)) {
+      pioWrite = true;
+      break;
+    }
+    resetReadPath ();
+    waitCardIdle (frequency);
+  }
+  pioTicks = readCounter () - start;
+  const bool pioRead = readRunPio (kWriteCheckLba, gCheckBatchB, kWriteCheckBlocks);
+  if (pioRead) {
+    diffPio = countWordDiff (gCheckBatchA, gCheckBatchB, kWriteCheckWords, firstPio);
+  }
+  // The DMA run only gets asked once the control proved the medium round-trips this run at all.
+  bool dmaWrite = false;
+  const bool controlHeld = pioWrite && pioRead && diffPio == 0;
+  if (controlHeld) {
+    start = readCounter ();
+    for (uint32_t attempt = 0; attempt < 2 && !dmaWrite; attempt++) {
+      uint64_t ticks = 0;
+      if (!writeAdmaRun (kWriteCheckLba, gCheckBatchA, kWriteCheckBlocks, dmaStatus, ticks)) {
+        continue;
+      }
+      if (writeSettled (rsp, settleStatus, polls)) {
+        dmaWrite = true;
+        dmaTicks = ticks;
+        break;
+      }
+      resetReadPath ();
+      waitCardIdle (frequency);
+    }
+  }
+  bool dmaRead = false;
+  if (controlHeld) {
+    dmaRead = readRunPio (kWriteCheckLba, gCheckSingle, kWriteCheckBlocks);
+    if (dmaRead) {
+      diffDma = countWordDiff (gCheckBatchA, gCheckSingle, kWriteCheckWords, firstDma);
+    }
+  }
+  gWriteDmaTrusted = controlHeld && dmaWrite && dmaRead && diffDma == 0;
+  const uint64_t bytes = static_cast<uint64_t> (kWriteCheckBlocks) * 512ULL;
+  const uint64_t pioMs = pioTicks * 1000ULL / frequency;
+  const uint64_t dmaMs = dmaTicks * 1000ULL / frequency;
+  const uint64_t pioRate = pioMs > 0 ? (bytes / 1024ULL) * 1000ULL / pioMs : 0;
+  const uint64_t dmaRate = dmaMs > 0 ? (bytes / 1024ULL) * 1000ULL / dmaMs : 0;
+  IOLog ("CloverSdhci r173: wrcheck lba=%u blocks=%u control=%d dma=%d diff=%u/%u first=%u/%u "
+         "w=%08x/%08x g=%08x/%08x st=%08x/%08x ms=%llu/%llu kbs=%llu/%llu trusted=%d\n",
+         kWriteCheckLba, kWriteCheckBlocks, controlHeld ? 1 : 0, dmaWrite ? 1 : 0,
+         diffPio, diffDma, firstPio, firstDma,
+         gCheckBatchA[firstPio < kWriteCheckWords ? firstPio : 0],
+         gCheckBatchA[firstDma < kWriteCheckWords ? firstDma : 0],
+         gCheckBatchB[firstPio < kWriteCheckWords ? firstPio : 0],
+         gCheckSingle[firstDma < kWriteCheckWords ? firstDma : 0],
+         pioStatus, dmaStatus,
+         static_cast<unsigned long long> (pioMs), static_cast<unsigned long long> (dmaMs),
+         static_cast<unsigned long long> (pioRate), static_cast<unsigned long long> (dmaRate),
+         gWriteDmaTrusted ? 1 : 0);
+  if (!gWriteDmaTrusted) {
+    IOLog ("CloverSdhci r173: writes stay on the PIO path for this boot\n");
+  } else {
+    IOLog ("CloverSdhci r173: ADMA2 writes trusted for this boot\n");
+  }
+}
+
 // The write half of the pair above. Same gate: ready, measured geometry, one caller at a time with
 // the same bounded hand-over, and the counter deadline, because at this point in boot no scheduler
 // timer will rescue a stuck host. Callers hand it whole 512-byte blocks; nothing here touches the
@@ -2270,6 +2560,14 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
   // phase, and the second chunk of the request must not be cut off for it.
   const uint64_t deadline = frequency * 30ULL +
                             static_cast<uint64_t>(blocks) * (frequency / 5ULL);
+  // Round173: the write gate, once, on the first request long enough to be a batch. It rewrites
+  // nothing but bytes it read a moment earlier and only inside logfs, so a boot that ends up not
+  // trusting DMA is a boot whose logfs is exactly what it was. The request deadline is re-stamped
+  // afterwards: the gate is not the request's fault.
+  if (!gWriteDmaCheckDone && blocks >= 4) {
+    checkWriteDmaPath ();
+    start = readCounter ();
+  }
   uint32_t done = 0;
   bool settleReported = false;
   while (done < blocks) {
@@ -2285,7 +2583,43 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
     uint32_t *target = const_cast<uint32_t *>(words) +
                        static_cast<uint64_t>(done) * kBlockWords;
     bool chunkWritten = false;
-    if (chunk >= 4) {
+    // Round173: the DMA path first, once the read-back gate proved it delivers what it was handed. A
+    // refused DMA chunk costs one report and falls through to the PIO batch below, so the worst case
+    // here is round172's behaviour with a line beside it; eight failures retire DMA writes for the
+    // boot. A chunk whose data phase ended but whose card never settled is not charged to the DMA
+    // path -- that is the card's programming time, and the PIO batch below waits on it too.
+    if (chunk >= 4 && gWriteDmaTrusted) {
+      uint32_t dmaStatus = 0;
+      uint64_t dmaTicks = 0;
+      if (writeAdmaRun (lba + done, target, chunk, dmaStatus, dmaTicks)) {
+        uint32_t rsp = 0, settleStatus = 0, polls = 0;
+        if (writeSettled (rsp, settleStatus, polls)) {
+          chunkWritten = true;
+          static bool writeTimingReported = false;
+          if (!writeTimingReported) {
+            writeTimingReported = true;
+            IOLog ("CloverSdhci r173: first dma write lba=%u blocks=%u ms=%llu\n", lba + done,
+                   chunk, static_cast<unsigned long long> (dmaTicks * 1000ULL / frequency));
+          }
+        } else {
+          resetReadPath ();
+          waitCardIdle (frequency);
+          if (!settleReported) {
+            settleReported = true;
+            IOLog ("CloverSdhci r173: dma write not ready lba=%u blocks=%u rsp=%08x st=%08x "
+                   "polls=%u\n", lba + done, chunk, rsp, settleStatus, polls);
+          }
+        }
+      } else {
+        gWriteDmaFailures++;
+        if (gWriteDmaFailures >= kWriteDmaFailureLimit && gWriteDmaTrusted) {
+          gWriteDmaTrusted = false;
+          IOLog ("CloverSdhci r173: dma writes failed %u times, writes go back to the PIO path\n",
+                 gWriteDmaFailures);
+        }
+      }
+    }
+    if (!chunkWritten && chunk >= 4) {
       // Round168: a batch whose data phase completed but whose card never settled is re-sent once
       // from a reset circuit. Writing the same blocks twice is harmless; abandoning them was what
       // APFS saw as "disk5: general error" and re-sent itself.

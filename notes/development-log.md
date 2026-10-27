@@ -12427,3 +12427,75 @@ fastboot reboot
 而没有这一行，说明信任拿到了但请求没走到批量长度。round171 的三问（`read
 guard` 是否整批消失、`tx_flush` 是否掉回毫秒、`readcheck … trusted=1`）在同一
 帧里一起读。
+
+## round173（v0.5.29）：写通路也上 ADMA2，但只准重写自己刚读到的字节
+
+round172 把读交给 DMA 时留了一句话：写不跟着上，因为一次写错不会以 EIO 回来，而是改卡。
+这一轮把那句话变成一条可以过的闸门。
+
+问题不是「能不能让这颗主机 DMA 写」，`cap=0x742dc8b2` 与固件留下的 `hcl=38` 早就说明这是
+它自己在用的通路；问题是「怎么证明写下去的字节就是我要写的字节」。PIO 写的信任是靠 CMD13
+确认落盘挣来的（round167），那只能证明卡接了，不能证明线上走对。所以 round173 的闸门不
+是新写的通路做验证，而是让新通路只准重写它刚刚读到的字节：
+
+- 取样位置 `kWriteCheckLba = kLogfsFirstLba + 4096`、长度 16 块，整个窗口先用
+  `kLogfsFirstLba`/`kLogfsLastLba` 反查一遍，越界直接打 `write gate refuses, logfs window
+  lba=… blocks=… sectors=…` 然后整轮退役。4096 扇区离 panic 槽占的前 32 块很远。
+- 四步：`readRunPio` 读回原字节进 `gCheckBatchA` → 同样字节走**已信任的 PIO 批量**
+  `writeMultiBlock` + `writeSettled`（最多两次，中间 `resetReadPath` + `waitCardIdle`）→
+  `readRunPio` 读回进 `gCheckBatchB`，`diffPio` 必须为 0 → 只有 `controlHeld` 成立才问
+  DMA：`writeAdmaRun` 写回同一批 + `writeSettled` → 再用单块 `readPioBlock` 读回进
+  `gCheckSingle`，`diffDma` 必须为 0。
+- `gWriteDmaTrusted = controlHeld && dmaWrite && dmaRead && diffDma == 0`。对照先跑，
+  是为了把「卡不认这个 LBA」和「DMA 通路不对」分开：`control=0` 是介质或 PIO 的结论，
+  跟 DMA 无关。
+- 验证读全部用 `readPioBlock` 逐块，不用批量：这条是最老、已被真机读数证明过的通路，闸门
+  不能拿一个还没被信任的通路去证明另一个。
+- 通过后，每个 ≥4 块的写请求先走 `writeAdmaRun`；被拒就落回 round171 的 PIO 批量，
+  `chunkWritten` 保持 false 时那批字节仍然会被 PIO 写一遍，所以一次 DMA 失败不会丢数据。
+  八次退役，和读侧同一条规矩。落盘确认（`writeSettled`）失败不计进这八次——那是卡的编程
+  时间，PIO 批量从来也没把它算作自己的失败。
+- `writeAdmaRun` 第一件事是 `prepareReadPath()`：DMA 写按顺序推 buffer，被拒的读留在 FIFO
+  里的字会把整批往卡里挪而没有一个错误位跟着动。PIO 写天然免疫（每个字是 CPU 在请求时
+  写的），主机不免疫。这一点 round165 只在读侧补过。
+- panic 屏与 bring-up 报告那两处 logfs 写仍然直接调 `writePioBlock`，不经
+  `clover_emmc_block_write`：最后那句话不该依赖本轮任何标志。
+
+契约这一侧同步换向。`check-clover.py` 撤掉 round172 里「任何写 transfer mode 都不许带
+`SDHCI_TRNS_DMA`」这条反向断言（它挡的正是本轮要装的东西），改成钉形状：
+`kWriteCheckLba` 常量、`kWriteCheckLba + kWriteCheckBlocks - 1 > kLogfsLastLba` 的窗口拒绝、
+`gWriteDmaTrusted = controlHeld && dmaWrite && dmaRead && diffDma == 0;`、写侧 transfer mode
+那一行、以及 `clover_emmc_panic_append` 里仍然有 `writePioBlock (`。它同时拒绝
+`gWriteDmaTrusted = true;`——闸门只能被读回来，不能被设上去。`verify-clover-payload.py` 新增
+`WRITE_DMA_INTEGRITY` 四个串（`wrcheck lba=`、两条 trusted/stay 结论、`first dma write lba=`）
+并入 `eMMC read/write integrity`。r171 遗留的一处形状也跟着改：批量写那行现在是
+`if (!chunkWritten && chunk >= 4) {`。
+
+构建：先逆撤 `zzy-clover-dyld-cache-skip`，`python3 scripts/build-arm-driver.py CloverSdhci`
+过 `-Werror` 与 ARM64/iOS 17 目标文件审计；内核 `a7dc24c633f3bc8c…`（52,043,776 字节），
+AMFI 拷贝 `3775b39790216d68…`（站点 `0x1a880e4` → `0x14000011`、`0x1a8816c` → `0xd503201f`，
+与 round171/172 同两处），payload `a52e233da9e91a05…`（56 MiB，58,720,256 字节），卷内
+kernel `7881ca5cef6e08a0…`、`unixnu.toml` `72fe52170435dd26…`、ADT `c83f7affe6a93ad4…`、
+`scratch-data.img` `614b8356…`（未变）、trustcache `7c369ce0…`（未变）。入口探针
+`6843 bytes in 37 runs`——这一轮没往内核里加探针，字节数与 round172 一致。
+`verify-clover-payload.py` 全项 OK；镜像里同时能数到 `CloverSdhci r172:` 与
+`CloverSdhci r173:` 两组串，`clover r173:` 标题一颗，所以这一刷一次答 round171、172、173 三问。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round173-payload.img
+fastboot reboot
+```
+
+冷刷，不用 `fastboot boot`；`userdata` 不动。
+
+这一帧按顺序读九件事。round171 三件：`read guard` 是否整批消失、`tx_flush … took … us to
+flush` 是否从 102/120 秒掉回毫秒、`multi read fail … st=0x21 w=1024/1024` 是否被
+`readcheck … trusted=1` 取代。round172 三件：`dma up data=` 有没有出现（没有就看四条物理
+地址检查哪一条先拒）、`dmacheck … trusted=`、`ms=…/…` 与 `kbs=…/…` 那两个速率数和
+`first dma read … ms=`。round173 三件：`wrcheck lba=12324864 blocks=16` 有没有出现——整行
+缺席说明这一boot 的第一个写请求就没到 4 块，闸门根本没跑，不能读成失败；`control=` 与
+`dma=` 哪个是 0，决定下一步是修介质还是修通路；`trusted=1` 之后 `first dma write … ms=` 与
+`wrcheck … kbs=` 是本端口第一份诚实的写吞吐。前五件成立，launchd 的页才继续映射得进来；
+后四件给出 536 与 `/data` 之前是否要先重排吞吐这一格的答案。

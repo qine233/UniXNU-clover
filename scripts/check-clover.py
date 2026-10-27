@@ -953,12 +953,12 @@ def check_board(errors: list) -> str:
                     "SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN |",
                     "SDHCI_TRNS_MULTI",
                     "MMC_READ_MULTIPLE_BLOCK",
-                    "if (chunk >= 4) {",
+                    "if (!chunkWritten && chunk >= 4) {",
                     "readMultiBlock (lba + done, target, chunk, got, status)")
                    if needle not in text]
         for needle in missing:
             errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp lacks {needle!r}: without the "
-                          "multi-block read the cache costs one command per 512 bytes")
+                          "multi-block read and write the cache costs one command per 512 bytes")
         # The read path must not carry the counter gap any more. The write path and
         # mode 11's identification drain still use it, so only the read function is
         # isolated and searched.
@@ -1187,10 +1187,10 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round172. The menu has to name the round under test: this round's whole result is one line the
+    # Round173. The menu has to name the round under test: this round's whole result is one line the
     # frame either has or does not have.
-    if not board["payload"]["title"].startswith("clover r172:"):
-        errors.append('[payload] title is not "clover r172: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r173:"):
+        errors.append('[payload] title is not "clover r173: ...": the menu would not name this round')
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -1439,6 +1439,10 @@ def check_board(errors: list) -> str:
         if re.search(r"SDHCI_TRNS_WRITE[^;]*SDHCI_TRNS_DMA", text):
             errors.append(f"{sdhci.name} puts the write path on DMA before the read path has a "
                           "frame behind it: a wrong DMA write changes the card rather than erroring")
+        # Writes were not this round's, and the only difference between a read descriptor and a write
+        # one is a bit the write path must not have yet. Round173 is the round that earns the write
+        # path, with its own gate and its own contract below; this assertion is its history: the read
+        # gate existed alone first, and a frame has to be able to say which round it is running.
         regs = regs_r172.read_text()
         for needle in ("#define SDHCI_ADMA2_64_DESC_SZ",
                        "#define SDHCI_ADMA2_TRAN_VALID",
@@ -1448,6 +1452,61 @@ def check_board(errors: list) -> str:
             if needle not in regs:
                 errors.append(f"{regs_r172.name} lacks {needle}: the descriptor layout would be "
                               "recalled rather than transcribed from this board's own CAF tree")
+
+    # Round173. The write side gets the same transport, and the same rule can only be the same rule
+    # with one extra step: a wrong DMA read costs an EIO, a wrong DMA write changes what is on the
+    # card. So the gate rewrites a run inside the logfs window -- the partition whose only contents are
+    # this port's own bring-up reports -- with bytes it read from that run a moment earlier, and the
+    # flag is set only when the run reads back through PIO exactly as it was found. The PIO write of
+    # the same bytes runs first as a control: a medium that will not round-trip its own bytes through
+    # the proven path cannot produce a DMA verdict, and the gate says so rather than printing a zero.
+    sdhci_r173 = next((base / "drivers/CloverSdhci/CloverSdhci.cpp"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "drivers/CloverSdhci/CloverSdhci.cpp").is_file()), None)
+    if sdhci_r173 is None:
+        errors.append("drivers/CloverSdhci/CloverSdhci.cpp is missing: there is no ADMA2 write "
+                      "gate to verify")
+    else:
+        text = sdhci_r173.read_text()
+        for needle in ("static bool writeAdmaRun (uint32_t lba, const uint32_t *src, uint32_t blocks,",
+                       "static void checkWriteDmaPath (void)",
+                       "static bool readRunPio (uint32_t lba, uint32_t *dst, uint32_t blocks)",
+                       "static const uint32_t kWriteCheckLba = kLogfsFirstLba + 4096u;",
+                       "if (!gWriteDmaCheckDone && blocks >= 4) {",
+                       "if (chunk >= 4 && gWriteDmaTrusted) {",
+                       "gWriteDmaTrusted = controlHeld && dmaWrite && dmaRead && diffDma == 0;",
+                       "write16 (SDHCI_TRANSFER_MODE, SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_MULTI | SDHCI_TRNS_DMA);",
+                       "countWordDiff (gCheckBatchA, gCheckSingle, kWriteCheckWords, firstDma)",
+                       "kWriteCheckLba + kWriteCheckBlocks - 1 > kLogfsLastLba",
+                       "CloverSdhci r173: wrcheck lba=",
+                       "CloverSdhci r173: ADMA2 writes trusted for this boot",
+                       "CloverSdhci r173: writes stay on the PIO path for this boot",
+                       "CloverSdhci r173: first dma write lba=",
+                       "CloverSdhci r173: dma writes failed %u times, writes go back to the PIO path"):
+            if needle not in text:
+                errors.append(f"{sdhci_r173.name} lacks {needle[:44]}...: round173's DMA write path, "
+                              "the logfs run it is confined to, or the read-back that earns it would "
+                              "be missing")
+        # Earned, not assumed -- the same rule the read path lives under.
+        if "gWriteDmaTrusted = true;" in text:
+            errors.append(f"{sdhci_r173.name} trusts DMA writes without reading them back: the card "
+                          "would be changed by a descriptor nobody compared")
+        # The gate's sample has to stay inside logfs. 4096 sectors past the first LBA, sixteen blocks
+        # long, and the window's own bounds are what the refusal reads -- a sample that drifted into
+        # userdata would be a port rewriting APFS with an unproven transport.
+        sample_start = text.find("static const uint32_t kWriteCheckLba =")
+        sample_end = text.find("static void reportWriteDmaFailure", sample_start)
+        sample = text[sample_start:sample_end] if sample_start >= 0 and sample_end > sample_start else ""
+        if "kLogfsFirstLba + 4096u" not in sample:
+            errors.append("the write gate's sample LBA is no longer kLogfsFirstLba + 4096: it has to "
+                          "stay past the sixteen panic slots and inside the logfs window")
+        # The last thing a dying boot does must not depend on a flag this round introduced: the panic
+        # screen and the bring-up report keep their own two-block PIO writes.
+        panic_start = text.find("extern \"C\" unsigned int clover_emmc_panic_append")
+        panic_body = text[panic_start:panic_start + 4000] if panic_start >= 0 else ""
+        if panic_body.count("writePioBlock (") < 2:
+            errors.append("clover_emmc_panic_append no longer writes its two blocks through PIO: "
+                          "the last line of a dying boot would depend on this round's flag")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())
@@ -1509,6 +1568,7 @@ def check_board(errors: list) -> str:
                        "check_read_integrity", "CloverSdhci r167: readcheck",
                        "CloverSdhci r171: write cache size=",
                        "CloverSdhci r172: dmacheck lba=", "DMA_INTEGRITY",
+                       "CloverSdhci r173: wrcheck lba=", "WRITE_DMA_INTEGRITY",
                        "check_exec_sig_dump", "clover r166: sig n=%u"):
             if needle not in text:
                 errors.append(f"{verifier.name} lacks {needle}: the release could ship with an "

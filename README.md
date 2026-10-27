@@ -27,7 +27,9 @@
 `identityservicesd` 都被 exec 起来过），卡住它的是驱动自己——一次 102 秒的
 checkpoint flush 握着块守卫，把另一颗卷上的每一次读判成 EIO，pid 1 最终在
 映射页时 SIGBUS。round171 修那一次 flush，round172 修「每个字节都过 CPU」这件
-事本身：读通路现在有一条 ADMA2，靠逐字比较挣到信任。
+事本身：读通路现在有一条 ADMA2，靠逐字比较挣到信任。round173 把同一条通路交给写，
+但它只准重写自己刚读到的字节——先用 PIO 读回、再用 ADMA 写回同一批、再用 PIO 读回
+比对，而且只在 logfs 那 8 MiB 里做。
 
 ### 已完成（都有真机读数）
 
@@ -56,15 +58,18 @@ checkpoint flush 握着块守卫，把另一颗卷上的每一次读判成 EIO�
 | round154（v0.5.7） | syscall 536 入口/返回、setup 阶梯与 `mapfile` 探针 | 探针仍在镜像里，至今没有 `map2` 读数 |
 | round166（v0.5.20） | exec 侧打印前八个签名 blob 的 `mo/off/size` 与头四字 | `clover r166: sig` 尚未上屏 |
 | round171（v0.5.27） | 批量读按「交付字数 + 内容错误位」判定（`st=0x21 w=1024/1024` 那种全量交付不再被丢回单块）；卡的写缓存打开并显式提交（CMD6 关→提交→开）；块守卫与批量缓冲从有界自旋改成 `IOLock`；批量 32 → 128 块，可信性闸门改为按请求取样 | 改动全部在 round172 镜像里，与下一行同一帧读 |
-| round172（v0.5.28） | 读通路加一条 ADMA2：描述符形状逐字节抄自本板 4.19 CAF 树（12 字节项、`cmd` 在前 `len` 在后、末项带 END 不加 NOP），数据落在本驱动自有的 64 KiB 连续 bounce（照 sheng `NativeUfs` 的四条物理地址检查与 `dc civac`/`dc ivac` 节奏）；同一个请求先走已信任的批量 PIO、再走 ADMA，**逐字相同才准用**，失败八次整轮退役 | **已构建**，待冷刷 |
+| round172（v0.5.28） | 读通路加一条 ADMA2：描述符形状逐字节抄自本板 4.19 CAF 树（12 字节项、`cmd` 在前 `len` 在后、末项带 END 不加 NOP），数据落在本驱动自有的 64 KiB 连续 bounce（照 sheng `NativeUfs` 的四条物理地址检查与 `dc civac`/`dc ivac` 节奏）；同一个请求先走已信任的批量 PIO、再走 ADMA，**逐字相同才准用**，失败八次整轮退役 | 改动全部在 round173 镜像里，与下一行同一帧读 |
+| round173（v0.5.29） | 写通路也上 ADMA2，但只准重写自己刚读到的字节：闸门取 logfs 窗内第 4096 个扇区起的 16 块（离 panic 槽占的前 32 块很远），PIO 读回原字节 → 同样字节走 PIO 写一遍当对照 → ADMA 写回同一批 → PIO 再读回逐字比对，三份都对才 `trusted=1`；此后每个 ≥4 块的写请求先走 DMA，被拒就落回 r171 的 PIO 批量，八次退役。panic 屏与 bring-up 报告的两块写仍走 `writePioBlock`，不依赖本轮任何标志 | **已构建**，待冷刷 |
 
-round171 + round172 一帧问六件事：`read guard` 是否整批消失（守卫只等、不拒），
+round171 + round172 + round173 一帧问九件事：`read guard` 是否整批消失（守卫只等、
+不拒），
 `tx_flush … took … us to flush` 是否从 102/120 秒掉回毫秒量级，
 `multi read fail … st=0x21 w=1024/1024` 是否不再出现且 `readcheck … trusted=1`
 上屏；再加上 `CloverSdhci r172: dma up data=…` 有没有出现、
 `dmacheck … trusted=` 与 `kbs=…/…` 那两个速率数、`first dma read … ms=` 有没有
-落地。前五件成立，launchd 的页才继续映射得进来；第六件给出 536 与 `/data` 之前
-是否要先重排吞吐这一格的答案。
+落地；最后 `CloverSdhci r173: wrcheck … control=… dma=… diff=…/… trusted=` 与
+`first dma write … ms=`。前五件成立，launchd 的页才继续映射得进来；后四件给出
+536 与 `/data` 之前是否要先重排吞吐这一格的答案。
 
 ### 排期（未开始 · 已知限制）
 
@@ -77,12 +82,14 @@ round171 + round172 一帧问六件事：`read guard` 是否整批消失（守�
 4. **输入** — 触摸（`edt-ft5406` / focaltech `fts`）没有驱动。
 5. **网络、音频、USB** — WCN3990 WiFi/蓝牙、WCD 音频、USB device 模式都没有。
 6. **电源管理** — 除 AMFI 需要的那颗 nub 外，充电、电池、PMIC 都没有真驱动。
-7. **eMMC 写通路仍是 PIO** — 读的那条 ADMA2 已在 round172 镜像里（描述符抄自
-   本板 CAF 树，数据走自有连续 bounce，且必须与批量 PIO 逐字相同才准用），
-   `cap=742dc8b2` / `hcl=38` 证明这本来就是固件自己在用的通路。写不跟着上 DMA：
-   一次写错不会以 EIO 回来，而是改卡。下一格是「往暂存区写模式、用 PIO 读回来
-   比」的写/读回闸门，过了才谈 DMA 写。`write settle took … ms` 至今没被读到
-   过，HS400/CQE 等这一行真的上屏再定。
+7. **eMMC 数据通路已上 DMA，速度还没量到** — 读的那条 ADMA2 在 round172 镜像里，
+   写的那条在 round173 镜像里（描述符抄自本板 CAF 树，数据走自有连续 bounce；
+   读要批量 PIO 逐字相同才准用，写要 logfs 那 16 块读回原样才准用），
+   `cap=742dc8b2` / `hcl=38` 证明这本来就是固件自己在用的通路。剩下的事实只有帧
+   能给：`dmacheck … kbs=` 与 `wrcheck … kbs=` 那两对速率、
+   `write settle took … ms` 至今没被读到过，HS400/CQE 等这几行真的上屏再定。
+   被闸门挡在 DMA 之外的还有 panic 屏与 bring-up 报告的两块写：最后那句话不该
+   依赖本轮任何标志。
 8. **内核构建不可逐字节复现** — 每次 prelink UUID 不同；`verify-clover-payload.py`
    只比较两个可执行段。
 9. **存储栈形态** — 没有 UFS、virtio-block 或 native verified-root；sheng 的存储栈
