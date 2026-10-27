@@ -1,0 +1,182 @@
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -2320,6 +2320,8 @@
+ 	uint32_t                        i;
+ 	struct vm_shared_region         *shared_region = NULL;
+ 	boolean_t                       is_driverkit = task_is_driver(current_task());
++	int                             clover_stage = 0;
++	uint32_t                        clover_at = 0;
+ 
+ 	SHARED_REGION_TRACE_DEBUG(
+ 		("shared_region: %p [%d(%s)] -> map\n",
+@@ -2334,6 +2336,7 @@
+ 		error = EINVAL;
+ 		goto done;
+ 	}
++	clover_stage = 1;
+ 	*sr_file_mappings = kalloc_type(struct _sr_file_mappings, files_count,
+ 	    Z_WAITOK | Z_ZERO);
+ 	if (*sr_file_mappings == NULL) {
+@@ -2353,6 +2356,7 @@
+ 		}
+ 		srfmp->slide = files[i].sf_slide;
+ 	}
++	clover_stage = 2;
+ 
+ 	/* get the process's shared region (setup in vm_map_exec()) */
+ 	shared_region = vm_shared_region_trim_and_get(current_task());
+@@ -2381,11 +2385,13 @@
+ 		error = EPERM;
+ 		goto done;
+ 	}
++	clover_stage = 3;
+ 
+ 
+ 	for (srfmp = &(*sr_file_mappings)[0];
+ 	    srfmp < &(*sr_file_mappings)[files_count];
+ 	    srfmp++) {
++		clover_at = (uint32_t)(srfmp - &(*sr_file_mappings)[0]);
+ 		if (srfmp->mappings_count == 0) {
+ 			/* no mappings here... */
+ 			continue;
+@@ -2442,6 +2448,7 @@
+ 				proc_getpid(p), p->p_comm, srfmp->fd, error));
+ 			goto done;
+ 		}
++		clover_stage = 4;
+ 
+ 		/* we need at least read permission on the file */
+ 		if (!(srfmp->fp->fp_glob->fg_flag & FREAD)) {
+@@ -2453,6 +2460,7 @@
+ 			error = EPERM;
+ 			goto done;
+ 		}
++		clover_stage = 5;
+ 
+ 		/* get vnode from file structure */
+ 		error = vnode_getwithref((vnode_t)fp_get_data(srfmp->fp));
+@@ -2478,6 +2486,7 @@
+ 			error = EINVAL;
+ 			goto done;
+ 		}
++		clover_stage = 6;
+ 
+ #if CONFIG_MACF
+ 		/* pass in 0 for the offset argument because AMFI does not need the offset
+@@ -2488,6 +2497,7 @@
+ 			goto done;
+ 		}
+ #endif /* MAC */
++		clover_stage = 7;
+ 
+ #if XNU_TARGET_OS_OSX && defined(__arm64__)
+ 		/*
+@@ -2577,6 +2587,7 @@
+ 			error = EPERM;
+ 			goto done;
+ 		}
++		clover_stage = 8;
+ 
+ #if XNU_TARGET_OS_OSX && defined(__arm64__)
+ after_root_check:
+@@ -2705,6 +2716,7 @@
+ 			goto done;
+ 		}
+ scdir_ok:
++		clover_stage = 9;
+ 
+ 		/* get vnode size */
+ 		error = vnode_size(srfmp->vp, &fs, vfs_context_current());
+@@ -2720,6 +2732,7 @@
+ 			goto done;
+ 		}
+ 		srfmp->file_size = fs;
++		clover_stage = 10;
+ 
+ 		/* get the file's memory object handle */
+ 		srfmp->file_control = ubc_getobject(srfmp->vp, UBC_HOLDOBJECT);
+@@ -2734,6 +2747,7 @@
+ 			error = EINVAL;
+ 			goto done;
+ 		}
++		clover_stage = 11;
+ 
+ 		/* check that the mappings are properly covered by code signatures */
+ 		if (!cs_system_enforcement()) {
+@@ -2768,8 +2782,15 @@
+ 				goto done;
+ 			}
+ 		}
++		clover_stage = 12;
+ 	}
+ done:
++	if (error != 0) {
++		/* clover r154: stage is the last gate that passed (0 = entry),
++		 * at is the file index the loop was on. */
++		printf("clover r154: setup err=%d stage=%d at=%u files=%u mappings=%u\n",
++		    error, clover_stage, clover_at, files_count, mappings_count);
++	}
+ 	if (error != 0) {
+ 		shared_region_map_and_slide_cleanup(p, files_count, *sr_file_mappings, shared_region);
+ 		*sr_file_mappings = NULL;
+@@ -2822,12 +2843,24 @@
+ 	    files, mappings_count, mappings,
+ 	    &sr_file_mappings, &shared_region, rdir_vp);
+ 	if (error != 0) {
++		printf("clover r154: map setup <- err=%d\n", error);
+ 		vnode_put(rdir_vp);
+ 		return error;
+ 	}
+ 
+ 	/* map the file(s) into that shared region's submap */
+ 	kr = vm_shared_region_map_file(shared_region, files_count, sr_file_mappings);
++#if defined(XNU_OWNER_CACHE_CARRIER) && XNU_OWNER_CACHE_CARRIER && !CONFIG_CSR
++	{
++		extern unsigned long native_owner_cache_carrier_accepts;
++		extern unsigned long native_owner_cache_carrier_rejects;
++		printf("clover r154: mapfile kr=0x%x carrier=%lu/%lu\n",
++		    kr, native_owner_cache_carrier_accepts,
++		    native_owner_cache_carrier_rejects);
++	}
++#else
++	printf("clover r154: mapfile kr=0x%x\n", kr);
++#endif
+ 	if (kr != KERN_SUCCESS) {
+ 		SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] map(): "
+ 		    "vm_shared_region_map_file() failed kr=0x%x\n",
+@@ -2981,6 +3014,12 @@
+ 	files_count = uap->files_count;
+ 	mappings_count = uap->mappings_count;
+ 
++	/* clover r154: dyld's next step after reading the cache headers is this
++	 * syscall. Printing the entry separates "dyld never asked" from "the
++	 * kernel refused": everything below runs in the caller's context. */
++	printf("clover r154: map2 enter files=%u mappings=%u\n",
++	    files_count, mappings_count);
++
+ 	if (files_count == 0) {
+ 		SHARED_REGION_TRACE_INFO(
+ 			("shared_region: %p [%d(%s)] map(): "
+@@ -3040,6 +3079,12 @@
+ 	if (kr != KERN_SUCCESS) {
+ 		goto done;
+ 	}
++
++	/* clover r154: the first file's descriptor and mapping count say whether
++	 * this call carries the cache itself or a single subcache. */
++	printf("clover r154: map2 fd0=%d m0=%u slide0=%u\n",
++	    shared_files[0].sf_fd, shared_files[0].sf_mappings_count,
++	    shared_files[0].sf_slide);
+ 
+ 	uint32_t max_slide = shared_files[0].sf_slide;
+ 	uint32_t random_val;
+@@ -3084,6 +3129,9 @@
+ 	}
+ 
+ 	kr = _shared_region_map_and_slide(p, files_count, shared_files, mappings_count, mappings);
++	/* clover r154: the value is an errno on this path (see the switch in
++	 * _shared_region_map_and_slide), so 0 means the region now exists. */
++	printf("clover r154: map2 <- err=%d\n", (int)kr);
+ done:
+ 	kfree_data(shared_files, files_count * sizeof(shared_files[0]));
+ 	kfree_data(mappings, mappings_count * sizeof(mappings[0]));

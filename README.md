@@ -10808,6 +10808,111 @@ fastboot reboot
 （`804c2d79…`）。两个 checker 的结果：`r146 probe removed OK`、`cache open probe
 linked OK (open/mount/read/flags/prefixes present, r151 form absent)`。
 
+## v0.5.7（round154）：读完头之后，dyld 到底有没有进 syscall 536
+
+### r153 的帧说了什么（2026-10-27 冷启动）
+
+探针修好了，屏上第一次出现 dyld 自己的两条路径：
+
+```
+clover r153: check_np dyld_flags=0x0
+shared_region: … [1(launchd)] check_np(0x16fac5150) vm_shared_region_start_address() failed
+clover r153: open /System/Library/Caches/com.apple.dyld fmode=0x1 err=0 fl=0x14089821 vt=2 fs=apfs
+clover r153: open dyld_shared_cache_arm64 fmode=0x1 err=0 fl=0x14089821 vt=1 fs=apfs
+clover r153: read err=0 resid=0 hdr=dyld_v1   arm64
+clover r153: open dyld_shared_cache_arm64.01 fmode=0x1 err=0 fl=0x14089821 vt=1 fs=apfs
+clover r153: read err=0 resid=0 hdr=dyld_v1   arm64
+```
+
+三条结论：
+
+1. **缓存路径完全可达**：目录、主文件、`.01` 都是 `err=0`，两个头都读回
+   `dyld_v1   arm64`。文件系统、APFS、只读挂载这一层没有墙。
+2. **`dyld_flags=0x0`，dyld 仍然自己去磁盘找了缓存**。这说明板级 owner chain 的
+   bit 3 注入没有发生，但不影响 dyld 走 `open`；它只是不把“磁盘上有缓存”当既定
+   事实而已。这一项先记账，不是当前的墙。
+3. **`check_np` 的 ENOMEM 不是文件问题**：只有任务已有共享区、而
+   `vm_shared_region_start_address()` 又失败（`sr_first_mapping == -1`，空区）时才
+   打印这句。空区是每次 exec 的 `vm_map_exec` → `vm_shared_region_enter` 建出来
+   的，首进程本来就是这个状态。dyld 的本职就是随后用 syscall 536 把它填满。
+
+屏上的输出停在 `.01` 的头读之后。**不能**据此断言 dyld 没进 syscall 536：控制台
+输出可能止于下一个探针之前，也可能 dyld 真的停在映射之前。r153 的问句到此为止，
+r154 接着问下一句。
+
+### 改了什么
+
+只加 `patches/xnu-clover/zzy-clover-shared-region-why3.patch`（**只动
+`bsd/vm/vm_unix.c`**，why2 原样保留）：
+
+- `shared_region_map_and_slide_2_np`（syscall 536 入口）三行：
+  `map2 enter files=/mappings=`、`map2 fd0=/m0=/slide0=`（copyin 之后才读，文件数
+  与映射数都已校验非零）、`map2 <- err=`（`_shared_region_map_and_slide` 在这条
+  路径上返回的是 errno）。
+- `shared_region_map_and_slide_setup` 的阶梯：`clover_stage = 1 + n;` 每过一道闸
+  就加一（1 文件数、2 分配与填充、3 共享区与 root_dir、4 fd、5 可读、6 vnode 类型、
+  7 MAC、8 root uid、9 跨卷/scdir、10 文件大小、11 memory object、12 codesign），
+  循环顶部记 `clover_at`；`done:` 处失败时打印
+  `setup err=%d stage=%d at=%u files=%u mappings=%u`。
+- `_shared_region_map_and_slide` 里：setup 失败打印 `map setup <- err=`；`map_file`
+  之后打印 `mapfile kr=0x%x`。源码里另有一条带 `carrier=<accepts>/<rejects>` 的
+  形式，但本板构建没有导出 `XNU_OWNER_CACHE_CARRIER`（默认为 0，
+  `zzy-clover-systemos-mount.patch` 只强开 `XNU_OWNER_CACHE_MOUNT` /
+  `XNU_OWNER_UNION_SYSTEMOS`），所以镜像里只有不带计数的短行；计数器要等真的
+  打开 carrier 才存在。这几行刻意**不**插进 carrier 补丁自己的新增块：那样会让它
+  的 `--reverse --check` 失效，构建脚本会以为补丁没打过并再次正向 apply（本轮
+  第一次构建就死在这里）。
+
+- `check-clover.py`：why3 必须存在、只含 `bsd/vm/vm_unix.c`、含六条 r154 串与
+  阶梯的关键档位；不许出现 `clover r146:` / `clover r151:`；标题 `clover r154:`；
+  why2 的存在性断言不变。
+- `verify-clover-payload.py`：新增 `check_map_slide_probe`，镜像里必须有五条 r154
+  串（entry / fd0 / return / setup / mapfile 短行），且 r153 的 open 串仍在（这一
+  轮是加问句，不是替换上一句）。
+
+### 构建与刷写
+
+```sh
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+只写 `cache`，冷启动：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round154-payload.img
+fastboot reboot
+```
+
+### 这一帧怎么读
+
+1. 有 `map2 enter`、没有 `map2 <-`：dyld 进来了，卡在映射内部。看有没有
+   `setup err=… stage=… at=…`；有 stage 就按档位查，没 stage 说明卡在
+   `vm_shared_region_map_file` 里（那时只有 `mapfile kr=` 之前的部分）。
+2. `map2 <- err=0`：共享区填好了，墙在 dyld 的下一段（后续 `mmap`/绑定）。
+3. `map2 <- err≠0` 或 `setup err=…`：按 errno 与 stage 定位。常见组合：
+   stage=3 → 共享区/root_dir 不匹配；stage=9 → 跨卷/scdir 被拒（本板 carrier
+   宏为 0，跨卷时只能靠 preboot 卷命中；若这里报 EPERM，下一轮就得打开
+   `XNU_OWNER_CACHE_CARRIER`）；stage=12 → codesign 覆盖。
+4. 一条 `clover r154:` 都没有：dyld 在 `.01` 头读之后、syscall 536 之前就停了，
+   下一轮转查 dyld 侧（缓存结构校验、映射尺寸），不再碰 VFS。
+
+这一帧只问一个问题：**dyld 读完两个缓存头之后，有没有进入
+`shared_region_map_and_slide_np`；若进了，内核在哪一道关卡回答它。**
+
+产物归档在 `~/clover-out/round154-*`，`round154-SHA256SUMS` 八项：
+`payload.img` 58,720,256 B（`d3e58c00…`）、本地 `kernel.macho` 51,998,720 B
+（`0ad2579e…`）、卷内 `kernel.macho`（`3da6b675…`，入口探针仍在）、卷内
+`unixnu.toml` 618 B（`778d27ef…`）、ADT 13,516 B（`27ff8bc1…`）、`scratch-data.img`
+35,888 B（`614b8356…`）、`trustcache` 61,408 B（`7c369ce0…`）、构建日志
+（`59845e62…`）。两个 checker 的结果：`r146 probe removed OK`、`cache open probe
+linked OK`、`map-and-slide probe linked OK (enter/fd0/return/setup/mapfile present,
+r153 form kept)`。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

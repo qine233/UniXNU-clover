@@ -301,6 +301,28 @@ def check_cache_open_probe(kernel: bytes) -> bool:
     return ok
 
 
+def check_map_slide_probe(kernel: bytes) -> bool:
+    """Round154 asks what happened after the .01 header read. r153's frame ended there, with both
+    cache files opened and both headers read, so the next call is syscall 536
+    (shared_region_map_and_slide_np). The image must carry the entry line, the first descriptor, the
+    return value, the setup stage ladder and the carrier print. r153's strings must survive: this
+    round adds a question, it does not replace the previous one."""
+    label = "kernel.macho: map-and-slide probe linked"
+    found = {"enter": b"clover r154: map2 enter files=%u mappings=%u" in kernel,
+             "fd0": b"clover r154: map2 fd0=%d m0=%u slide0=%u" in kernel,
+             "return": b"clover r154: map2 <- err=%d" in kernel,
+             "setup": b"clover r154: setup err=%d stage=%d at=%u files=%u mappings=%u" in kernel,
+             "mapfile": b"clover r154: mapfile kr=0x%x" in kernel}
+    ok = all(found.values())
+    kept = b"clover r153: open %s fmode=0x%x err=%d" in kernel
+    ok = ok and kept
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    detail += f", r153 form {'kept' if kept else 'GONE'}"
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def macho_symbols(kernel: bytes) -> tuple[list[tuple[str, int, int, int, int]], dict[str, int]]:
     """(segments, symbols): segments as (name, vmaddr, vmsize, fileoff, filesize), symbols as name -> va."""
     ncmds = struct.unpack_from("<I", kernel, 16)[0]
@@ -478,6 +500,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_root_mount_probe(kernel)
         ok &= check_shared_region_probe_removed(kernel)
         ok &= check_cache_open_probe(kernel)
+        ok &= check_map_slide_probe(kernel)
         ok &= check_mac_probe(kernel)
         ok &= check_unattended(kernel)
         ok &= check_inline_asm_tails(kernel)

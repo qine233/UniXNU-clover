@@ -798,6 +798,45 @@ def check_board(errors: list) -> str:
             errors.append(f"{cache_probe.name} reads cn_pnbuf before the internal call runs: "
                           "NDINIT leaves the field uninitialized, so that read is always garbage")
 
+    # Round154. r153's frame ended right after the second header read: dyld had found
+    # the cache, opened it and read "dyld_v1   arm64" from both files, then went
+    # quiet. The next thing dyld should do is syscall 536,
+    # shared_region_map_and_slide_np. This round prints that entry, the first file's
+    # descriptor and the return value, and walks a stage ladder inside
+    # shared_region_map_and_slide_setup, so the frame separates "dyld never asked"
+    # from "the kernel refused, at this gate". why3 is vm_unix.c only; why2 must
+    # stay, since its open/read lines are how the next frame shows how far dyld got.
+    map_probe = next((base / "patches/xnu-clover/zzy-clover-shared-region-why3.patch"
+                      for base in (REPO, pathlib.Path.cwd())
+                      if (base / "patches/xnu-clover/zzy-clover-shared-region-why3.patch").is_file()), None)
+    if map_probe is None:
+        errors.append("patches/xnu-clover/zzy-clover-shared-region-why3.patch is missing: without it "
+                      "the frame cannot say whether dyld ever entered syscall 536")
+    else:
+        text = map_probe.read_text()
+        missing = [needle for needle in
+                   ("bsd/vm/vm_unix.c",
+                    "clover r154: map2 enter files=%u mappings=%u",
+                    "clover r154: map2 fd0=%d m0=%u slide0=%u",
+                    "clover r154: map2 <- err=%d",
+                    "clover r154: setup err=%d stage=%d at=%u files=%u mappings=%u",
+                    "clover r154: mapfile kr=0x%x carrier=%lu/%lu",
+                    "clover_stage = 12;")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"{map_probe.name} lacks {needle!r}: entry, descriptor, return value and "
+                          "and the stage ladder are what the map-and-slide question needs")
+        if "vfs_vnops.c" in text:
+            errors.append(f"{map_probe.name} touches vfs_vnops.c: why3 is a vm_unix.c-only probe and "
+                          "must not disturb why2's wrapper")
+        if "clover r146:" in text or "clover r151:" in text:
+            errors.append(f"{map_probe.name} carries an old round's string: r146 and r151 are gone "
+                          "from the tree and must stay gone")
+        for stage in ("clover_stage = 3;", "clover_stage = 9;", "clover_stage = 11;"):
+            if stage not in text:
+                errors.append(f"{map_probe.name} has no {stage!r}: the ladder would not reach the "
+                              "mount, size or memory-object gates")
+
     # Round148. Round147 shipped an unattended deadline that fired on the very first timer tick, with
     # a garbage counter in the message. The cause was not the arithmetic: the Darwin arm64 assembler
     # reads `;` as the comment character, so every multi-instruction asm string kept only its first
@@ -825,11 +864,11 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round153. r152's frame proved the removal but not the probe, because the probe itself was
-    # reading a field NDINIT never sets. This round prints the path after the call and the
-    # dyld_flags value beside it, so the menu has to name that round.
-    if not board["payload"]["title"].startswith("clover r153:"):
-        errors.append('[payload] title is not "clover r153: ...": the menu would not name this round')
+    # Round154. r153's frame showed dyld reading both cache headers and then going
+    # quiet, so this round asks whether it enters syscall 536 and which gate answers.
+    # The menu has to name that round.
+    if not board["payload"]["title"].startswith("clover r154:"):
+        errors.append('[payload] title is not "clover r154: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",
