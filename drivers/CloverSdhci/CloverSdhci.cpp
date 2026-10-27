@@ -209,6 +209,11 @@ extern "C" {
 // Raw readings, for the offline decoder and for any later panic screen line. The order is
 // documented at the fill site; slots stay zero if the run stopped before reaching them.
 volatile uint64_t clover_emmc_observation[16];
+// Round159's link readings, in the order fastMode() fills them: HS_TIMING verdict/status/response/
+// polls, BUS_WIDTH the same four, then the raised clock, HOST_CONTROL, the verification header's
+// two words, and a stage word that says which step the sequence stopped at. Zero means the fast
+// path never ran, which is the shape of a boot that fell back to 400 kHz 1-bit.
+volatile uint64_t clover_emmc_link[16];
 // The formatted report, one %s argument, so the panic screen's argument list cannot shift.
 char clover_emmc_report[512];
 volatile uint32_t clover_emmc_stage = 0;
@@ -1048,6 +1053,23 @@ static bool sendStopCommand (void)
   return false;
 }
 
+// Round159's batch paths fall back to the single-block commands the earlier rounds proved, so a
+// refused CMD18/CMD25 costs speed but never data. That silence is exactly the r156 failure mode:
+// the batch could be failing on every chunk and the boot would look merely slow. Report the first
+// refusal of each direction, once, with the evidence needed to tell a command refusal from a data
+// one; later refusals stay quiet so a 32 MiB walk cannot flood the log.
+static bool multiFailure (unsigned which, uint32_t lba, uint32_t blocks, uint32_t status,
+                          uint32_t words, uint32_t total)
+{
+  static bool reported[2];
+  if (!reported[which]) {
+    reported[which] = true;
+    IOLog ("CloverSdhci r159: multi %s fail lba=%u blocks=%u st=0x%x w=%u/%u (once)\n",
+           which ? "write" : "read", lba, blocks, status, words, total);
+  }
+  return false;
+}
+
 static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
                             uint32_t &wordCount, uint32_t &status)
 {
@@ -1055,7 +1077,7 @@ static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
   wordCount = 0;
   status = 0;
   if (!waitCommandSlot ()) {
-    return false;
+    return multiFailure (0, lba, blocks, status, 0, totalWords);
   }
   write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
   write16 (SDHCI_BLOCK_SIZE, 512);
@@ -1080,7 +1102,7 @@ static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
   if (!(status & SDHCI_INT_RESPONSE) ||
       (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
     sendStopCommand ();
-    return false;
+    return multiFailure (0, lba, blocks, status, 0, totalWords);
   }
   uint64_t frequency = counterFrequency ();
   if (frequency < 1000000ULL || frequency > 1000000000ULL) {
@@ -1116,7 +1138,10 @@ static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
     words[wordCount++] = read32 (SDHCI_BUFFER);
   }
   sendStopCommand ();
-  return clean && wordCount == totalWords;
+  if (clean && wordCount == totalWords) {
+    return true;
+  }
+  return multiFailure (0, lba, blocks, status, wordCount, totalWords);
 }
 
 // The symbols drivers/CloverBlock links against. Ready and the sector count are only what
@@ -1317,10 +1342,87 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
          wordCount == kBlockWords;
 }
 
+// Round159: the write mirror of readMultiBlock. One CMD25 for several consecutive blocks, then
+// CMD12 with the busy spelling. The FIFO is level-gated rather than paced: below 26 MHz the card
+// clocks the host down whenever the buffer is empty, so SPACE_AVAILABLE alone can never overrun it,
+// and at 50 MHz the 160 us gap would make a 32-block write cost 1.3 ms of dead time per block.
+// CMD24 stays the single-block fallback; every DATA_* error bit still refuses the transfer.
+static bool writeMultiBlock (uint32_t lba, const uint32_t *words, uint32_t blocks,
+                             uint32_t &wordCount, uint32_t &status)
+{
+  const uint32_t totalWords = blocks * kBlockWords;
+  wordCount = 0;
+  status = 0;
+  if (!waitCommandSlot ()) {
+    return multiFailure (1, lba, blocks, status, 0, totalWords);
+  }
+  write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
+  write16 (SDHCI_BLOCK_SIZE, 512);
+  write16 (SDHCI_BLOCK_COUNT, static_cast<uint16_t>(blocks));
+  write32 (SDHCI_INT_STATUS, 0xffffffffu);
+  write32 (SDHCI_ARGUMENT, lba);
+  write16 (SDHCI_TRANSFER_MODE, SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_MULTI);
+  write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (MMC_WRITE_MULTIPLE_BLOCK,
+                                          SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                          SDHCI_CMD_INDEX | SDHCI_CMD_DATA));
+  uint32_t spins = 0;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & SDHCI_INT_CMD_MASK) {
+      break;
+    }
+    if (++spins >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  if (!(status & SDHCI_INT_RESPONSE) ||
+      (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+    sendStopCommand ();
+    return multiFailure (1, lba, blocks, status, 0, totalWords);
+  }
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint64_t deadline = frequency / 5ULL +
+                            static_cast<uint64_t>(blocks) * (frequency / 100ULL);
+  const uint64_t start = readCounter ();
+  uint32_t guard = 0;
+  bool clean = false;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & (SDHCI_INT_DATA_END | SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
+                  SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR)) {
+      clean = (status & SDHCI_INT_DATA_END) && !(status & kDataErrorMask);
+      break;
+    }
+    if (readCounter () - start > deadline) {
+      break;
+    }
+    if (wordCount < totalWords &&
+        (read32 (SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE)) {
+      write32 (SDHCI_BUFFER, words[wordCount++]);
+    }
+    if (++guard >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  while (wordCount < totalWords &&
+         (read32 (SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE)) {
+    write32 (SDHCI_BUFFER, words[wordCount++]);
+  }
+  sendStopCommand ();
+  if (clean && wordCount == totalWords) {
+    return true;
+  }
+  return multiFailure (1, lba, blocks, status, wordCount, totalWords);
+}
+
 // The write half of the pair above. Same gate: ready, measured geometry, one caller at a time with
 // the same bounded hand-over, and the counter deadline, because at this point in boot no scheduler
 // timer will rescue a stuck host. Callers hand it whole 512-byte blocks; nothing here touches the
-// logfs format.
+// logfs format. Round159 batches up to kReadChunkBlocks per CMD25, exactly as the read path does,
+// and falls back to the single-block CMD24 the earlier rounds proved when a batch fails.
 extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words, uint32_t blocks)
 {
   if (!words || !blocks) {
@@ -1338,17 +1440,32 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
   }
   const uint64_t deadline = frequency * 2ULL;
   uint32_t done = 0;
-  for (; done < blocks; done++) {
+  while (done < blocks) {
     if (readCounter () - start > deadline) {
       break;
     }
+    // Round159: one CMD25 for a run of blocks. The pointer arithmetic is 64-bit for the same reason
+    // the read side's is: the caller may hand a Data volume past 16 GiB.
+    uint32_t chunk = blocks - done;
+    if (chunk > kReadChunkBlocks) {
+      chunk = kReadChunkBlocks;
+    }
+    uint32_t *target = const_cast<uint32_t *>(words) +
+                       static_cast<uint64_t>(done) * kBlockWords;
+    if (chunk >= 4) {
+      uint32_t handed = 0;
+      uint32_t status = 0;
+      if (writeMultiBlock (lba + done, target, chunk, handed, status)) {
+        done += chunk;
+        continue;
+      }
+    }
     uint32_t handed = 0;
     uint32_t status = 0;
-    if (!writePioBlock (lba + done,
-                        words + static_cast<uint64_t>(done) * kBlockWords,
-                        handed, status)) {
+    if (!writePioBlock (lba + done, target, handed, status)) {
       break;
     }
+    done++;
   }
   __atomic_store_n (&gBlockGuard, 0, __ATOMIC_RELEASE);
   return done;
@@ -1624,7 +1741,7 @@ static void emitCid (const uint32_t *response)
 //
 // 400 kHz is the table's own row for sdcc1_apps_clk_src (gcc-sdm660.c:735): XO 19.2 MHz / 12 *
 // 1/4. clk-rcg.h:10 stores a divider h as 2h-1, so h=12 is 23 (0x17) in CFG[4:0]; the MND fields
-// are M=1, N=~3=0xfc, D=~4=0xfb, with CFG mode bit12 set (clk-rcg2.c:290-333).
+// are M=1, N=~3=0xfc, D=~4=0xfb, with CFG[13:12] = 2 selecting the MND path (clk-rcg2.c:290-333).
 //
 // Mode 5's photograph proved every one of those GCC writes (cfg=00002017, m=01 n=fc d=fb, up=1)
 // and then stopped at the host: RESET_ALL never self-cleared, so the legacy init and all four
@@ -1646,6 +1763,19 @@ static const uint32_t kGccCfg400k = 0x00002017u;
 static const uint32_t kGccCfgMask = 0x0010371fu;
 static const uint32_t kGccM = 0x01u, kGccN = 0xfcu, kGccD = 0xfbu;
 static const uint32_t kRcgUpdateLimit = 1u << 16;
+// Round159: after identification the card runs high-speed SDR. The 50 MHz row of the same table is
+// F(50000000, P_GPLL0_EARLY_DIV, 6, 0, 0): src 6, divider h=6 => CFG[4:0]=2h-1=11 (0x0b), and no
+// MND (m=n=0), so M/N/D are cleared and CFG[13:12]=0. 50 MHz SDR is the fastest timing that needs
+// neither tuning nor the DLL, and the HS_TIMING SWITCH below declares it to the card.
+static const uint32_t kGccCfg50m = 0x0000060bu;
+// CMD6 SWITCH, write-byte access: (3 << 24) | (EXT_CSD byte << 16) | (value << 8) | cmd_set.
+// This is Linux's mmc_switch() spelling (mmc_ops.c), i.e. 0x03B90100 for HS_TIMING=1 and
+// 0x03B70200 for BUS_WIDTH=8-bit. EXT_CSD bytes: 185 HS_TIMING, 183 BUS_WIDTH.
+static const uint32_t kSwitchWriteByte = 3u << 24;
+static const uint32_t kExtCsdHsTiming = 185u;
+static const uint32_t kExtCsdBusWidth = 183u;
+static const uint32_t kHsTimingHighSpeed = 1u;
+static const uint32_t kBusWidth8Bit = 2u;
 // Vendor clock mux (sdhci-msm.c:78-85): 10:8 select the MCLK, bit18 enables the HS400-only
 // selector, 21:19 name it. Default is 2, the free-running MCLK.
 static const unsigned kSdhciVendorSpec = 0x20c;
@@ -1690,6 +1820,161 @@ static bool gateOn (unsigned offset)
       return true;
     }
   } while (++guard < kCommandSpinLimit);
+  return false;
+}
+
+// ------------------------------------------------------ round159: the link after identification
+//
+// CMD1 only answers at 400 kHz, so every boot still identifies there. Up to round158 the driver
+// then served the whole boot at 400 kHz on one lane, which is 200 KB/s at best and made the APFS
+// mount and dyld's multi-gigabyte cache a multi-hour read. The card is the firmware's HS200 part,
+// and high-speed SDR needs no tuning: two SWITCH writes and the root clock. The order is the
+// standard init order -- timing, width, then the clock -- and every step is gated on the answer
+// before it. A failure leaves the host at the last clock and width the card agreed to, which is
+// the mode the previous rounds already proved.
+
+struct FastLink {
+  uint32_t hsStatus;
+  uint32_t hsResponse;
+  uint32_t hsPolls;
+  uint32_t bwStatus;
+  uint32_t bwResponse;
+  uint32_t bwPolls;
+  bool highSpeed;
+  bool width8;
+  bool raised;
+  bool verified;
+  uint16_t clockAfter;
+  uint8_t hostControl;
+  uint32_t header0;
+  uint32_t header1;
+  uint32_t stateStatus;
+  uint32_t stateResponse;
+  uint32_t statePolls;
+};
+
+// One CMD6 in write-byte access. The argument is Linux's mmc_switch() spelling: access 3 in
+// [31:26], the EXT_CSD byte in [23:16], the value in [15:8]. R1b's busy signal is on DAT0, and
+// the caller's CMD13 is what proves the card came back to transfer, so this only asks for the
+// response and lets the next step decide.
+static bool switchExtCsd (uint32_t index, uint32_t value, uint32_t &response, uint32_t &status)
+{
+  bool sent = false;
+  uint32_t response1 = 0;
+  uint32_t spins = 0;
+  const uint32_t argument = kSwitchWriteByte | ((index & 0xffu) << 16) | ((value & 0xffu) << 8);
+  status = runCommandBusy (SDHCI_MAKE_CMD (MMC_SWITCH, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                           SDHCI_CMD_INDEX),
+                           argument, sent, response, response1, spins);
+  return sent && (status & SDHCI_INT_RESPONSE) &&
+         !(status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX));
+}
+
+// CMD13 until the card says transfer and ready-for-data. A SWITCH that the card is still
+// programming looks exactly like one that finished until this answers.
+static bool cardInTransfer (uint32_t &response, uint32_t &status, uint32_t &polls)
+{
+  waitCardReady (response, status, polls);
+  return (response & R1_READY_FOR_DATA) &&
+         R1_CURRENT_STATE (response) == R1_STATE_TRAN;
+}
+
+// Stop the card clock, program the SDCC1 root clock, bring the card clock back and wait for the
+// new rate to stabilise. `mnd` selects the table's divided rows (400 kHz); false is the plain
+// divider the 50 MHz row uses, whose M/N/D fields are cleared.
+static bool programRootClock (bool mnd, uint32_t cfg, uint16_t &clockAfter, bool &updated,
+                              bool &stable)
+{
+  write16 (SDHCI_CLOCK_CONTROL, 0x0000);
+  uint32_t stopGuard = 0;
+  while ((read16 (SDHCI_CLOCK_CONTROL) & (SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_CARD_EN)) &&
+         ++stopGuard < kCommandSpinLimit) {
+  }
+  gateOn (kGccAppsGate);
+  gateOn (kGccAhbGate);
+  const uint32_t m = mnd ? kGccM : 0u;
+  const uint32_t n = mnd ? kGccN : 0u;
+  const uint32_t d = mnd ? kGccD : 0u;
+  writeGcc32 (kGccAppsM, (readGcc32 (kGccAppsM) & ~0xffu) | m);
+  writeGcc32 (kGccAppsN, (readGcc32 (kGccAppsN) & ~0xffu) | n);
+  writeGcc32 (kGccAppsD, (readGcc32 (kGccAppsD) & ~0xffu) | d);
+  const uint32_t before = readGcc32 (kGccAppsCfg);
+  writeGcc32 (kGccAppsCfg, (before & ~kGccCfgMask) | cfg);
+  writeGcc32 (kGccAppsCmd, readGcc32 (kGccAppsCmd) | 1u);
+  updated = false;
+  uint32_t updateGuard = 0;
+  while (updateGuard++ < kRcgUpdateLimit) {
+    if (!(readGcc32 (kGccAppsCmd) & 1u)) {
+      updated = true;
+      break;
+    }
+  }
+  write16 (SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_EN);
+  stable = false;
+  uint32_t stableGuard = 0;
+  while (stableGuard++ < kCommandSpinLimit) {
+    if (read16 (SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_INT_STABLE) {
+      stable = true;
+      break;
+    }
+  }
+  if (stable) {
+    write16 (SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_CARD_EN);
+  }
+  clockAfter = read16 (SDHCI_CLOCK_CONTROL);
+  return updated && stable;
+}
+
+// The whole step, called once after EXT_CSD has been read and the sector count is known. The
+// verification read is LBA 1 of the window this boot is about to hand the block stack: its first
+// two words are the GPT's "EFI PART", so a clock the host accepted but the card cannot actually
+// drive is a refused verification, not a later filesystem error.
+static bool fastMode (FastLink &link)
+{
+  link = FastLink{};
+  if (!switchExtCsd (kExtCsdHsTiming, kHsTimingHighSpeed, link.hsResponse, link.hsStatus)) {
+    return false;
+  }
+  if (!cardInTransfer (link.hsResponse, link.hsStatus, link.hsPolls)) {
+    return false;
+  }
+  link.highSpeed = true;
+  // The host is still on one lane while CMD6 asks the card to widen. Switching it here, after
+  // the response, is the order Linux uses: the card's answer travels on DAT0 either way.
+  if (switchExtCsd (kExtCsdBusWidth, kBusWidth8Bit, link.bwResponse, link.bwStatus) &&
+      cardInTransfer (link.bwResponse, link.bwStatus, link.bwPolls)) {
+    link.width8 = true;
+  }
+  link.hostControl = static_cast<uint8_t> (SDHCI_CTRL_HISPD |
+                                           (link.width8 ? SDHCI_CTRL_8BITBUS : 0));
+  write8 (SDHCI_HOST_CONTROL, link.hostControl);
+  bool updated = false;
+  bool stable = false;
+  link.raised = programRootClock (false, kGccCfg50m, link.clockAfter, updated, stable);
+  if (link.raised) {
+    if (cardInTransfer (link.stateResponse, link.stateStatus, link.statePolls)) {
+      uint32_t words = 0;
+      uint32_t status = 0;
+      if (readPioBlock (1, gReadBlock, words, status)) {
+        link.header0 = gReadBlock[0];
+        link.header1 = gReadBlock[1];
+        link.verified = link.header0 == 0x20494645u && link.header1 == 0x54524150u;
+      }
+    }
+    if (link.verified) {
+      return true;
+    }
+  }
+  // Fall back to the clock and timing every previous round proved. The card keeps HS_TIMING and
+  // the lane count it already accepted -- both are legal at 400 kHz -- but the host drops HISPD,
+  // because high-speed signalling below 26 MHz is out of spec.
+  link.hostControl = static_cast<uint8_t> (link.width8 ? SDHCI_CTRL_8BITBUS : 0);
+  write8 (SDHCI_HOST_CONTROL, link.hostControl);
+  bool backUpdated = false;
+  bool backStable = false;
+  programRootClock (true, kGccCfg400k, link.clockAfter, backUpdated, backStable);
+  link.raised = false;
+  link.verified = false;
   return false;
 }
 
@@ -2027,6 +2312,8 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   // header. Its SEC_COUNT is what the block device publishes and what gates every read it serves.
   bool extOk21 = false;
   uint32_t extWords21 = 0, extStatus21 = 0, extSectors21 = 0;
+  FastLink link21 = {};
+  bool fastOk21 = false;
 
   bool cmd2Ok = false;
   if (probeMode == 0) {
@@ -2692,6 +2979,31 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             extOk21 = false;
           } else {
             gBlockSectors = extSectors21;
+            // Round159, after the geometry is known and before the device is handed up: switch
+            // the link to high-speed 8-bit 50 MHz and prove it with LBA 1. A failure here is a
+            // reading, not a boot failure -- the same card then serves the same reads at the
+            // 400 kHz 1-bit the previous rounds measured, only slower.
+            fastOk21 = fastMode (link21);
+            clover_emmc_link[0] = link21.hsStatus;
+            clover_emmc_link[1] = link21.hsResponse;
+            clover_emmc_link[2] = link21.hsPolls;
+            clover_emmc_link[3] = link21.bwStatus;
+            clover_emmc_link[4] = link21.bwResponse;
+            clover_emmc_link[5] = link21.bwPolls;
+            clover_emmc_link[6] = (link21.highSpeed ? 1u : 0u) | (link21.width8 ? 2u : 0u) |
+                                  (link21.raised ? 4u : 0u) | (link21.verified ? 8u : 0u);
+            clover_emmc_link[7] = link21.clockAfter;
+            clover_emmc_link[8] = link21.hostControl;
+            clover_emmc_link[9] = link21.header0;
+            clover_emmc_link[10] = link21.header1;
+            clover_emmc_link[11] = link21.stateStatus;
+            clover_emmc_link[12] = link21.stateResponse;
+            clover_emmc_link[13] = link21.statePolls;
+            IOLog ("CloverSdhci r159: link hs=%d/%x bw=%d/%x clk=%x hc=%x hdr=%x/%x ok=%d\n",
+                   link21.highSpeed ? 1 : 0, link21.hsStatus,
+                   link21.width8 ? 1 : 0, link21.bwStatus,
+                   link21.clockAfter, link21.hostControl,
+                   link21.header0, link21.header1, fastOk21 ? 1 : 0);
             __atomic_store_n (&gBlockReady, 1, __ATOMIC_RELEASE);
           }
         }

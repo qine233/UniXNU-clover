@@ -146,6 +146,7 @@
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <IOKit/storage/IOMedia.h>
 #include <libkern/libkern.h>
+#include <libkern/crypto/sha2.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSObject.h>
 #include <libkern/c++/OSSymbol.h>
@@ -252,6 +253,27 @@ static const char kRootVolumeUuid[] = "04769D26-2CA0-4825-B443-E2E5F88300F2";
 static const char kSystemOsVolumeUuid[] = "8846FE78-2910-4297-AF97-D59BB6F8FC16";
 static volatile uint32_t gSystemWindowFirst = 0;
 static volatile uint32_t gSystemWindowSectors = 0;
+
+// Round159: the mutable Data window. sheng seeds its Data volume from a RAM disk and lets the
+// owner mount at launchd's exec attach it read-write; clover has no RAM block device, so the seed
+// is a third SHNGROOT window on the card -- the 32 MiB APFS container scripts/append-data-window.py
+// appends after SystemOS. The access path is the same one the owner mount asks sheng for: the
+// kernel patch's native_ram_block_volume_seed() contract is answered here by a window provider
+// instead of a memory disk, so kern_exec.c itself is not touched.
+static const char kDataWindowName[] = "Data";
+static const char kDataVolumeUuid[] = "FC1A580E-2D67-48FC-B8CF-87422A319340";
+static volatile uint32_t gDataWindowFirst = 0;
+static volatile uint32_t gDataWindowSectors = 0;
+// Each entry's own identity, kept so native_verified_block_manifest_sha384() can name the exact
+// bytes the manifest declared rather than rehashing a multi-gigabyte window at every exec.
+struct ManifestEntry {
+  uint8_t sha256[32];
+  uint64_t offset;
+  uint64_t size;
+};
+static ManifestEntry gOsEntry;
+static ManifestEntry gSystemEntry;
+static ManifestEntry gDataEntry;
 // The OS window is a whole GPT disk, not a bare container: `hdiutil imageinfo` on the IPSW's own
 // 044-76040-038.dmg reports MBR, Primary GPT Header, Primary GPT Table, one Apple_APFS partition and
 // the backup, and the host-side copy of the flashed bytes says the same. So byte zero of the media
@@ -871,6 +893,15 @@ static uint32_t fnv1a(const char *text)
   return hash;
 }
 
+// One entry's declared identity. The bytes stay in gRootManifest for the life of the boot, so this is
+// a copy of the three fields the manifest digest has to name exactly, not a pointer into the window.
+static void rememberEntry(ManifestEntry *slot, const uint8_t *entry)
+{
+  memcpy(slot->sha256, entry + 56, sizeof(slot->sha256));
+  slot->offset = le64At(entry + 32);
+  slot->size = le64At(entry + 40);
+}
+
 // Latch the media to the windows inside the flashed root image. Everything the manifest holds is
 // bytes and names, and each refusal is its own panic step, so a photograph can tell "nothing was
 // flashed" (magic) from "a different release's manifest" (version) from "this partition is not the
@@ -878,8 +909,9 @@ static uint32_t fnv1a(const char *text)
 // in the manifest is relative to the start of userdata, and drivers/CloverSdhci's own read path only
 // takes card LBAs. Round143 reads both entries in one pass: the OS window is what root-matching
 // hands the kernel, and the SystemOS window is the cryptex volume the union mount on "/" needs.
+// Round159 adds the third: Data, the only window whose entry must not claim write protection.
 static void windowsFromManifest(uint32_t partitionFirst, uint32_t partitionSectors,
-                                bool requireSystem)
+                                bool requireSystem, bool requireData)
 {
   const uint32_t got = clover_emmc_block_read(partitionFirst, gRootManifest, kRootManifestBlocks);
   if (got != kRootManifestBlocks) {
@@ -900,44 +932,60 @@ static void windowsFromManifest(uint32_t partitionFirst, uint32_t partitionSecto
   const uint64_t partitionBytes = static_cast<uint64_t>(partitionSectors) * kBlockBytes;
   bool rootFound = false;
   bool systemFound = false;
+  bool dataFound = false;
   for (uint32_t index = 0; index < count; index++) {
     const uint8_t *entry = bytes + 24 + 128 * index;
     const bool root = memcmp(entry, kRootWindowName, sizeof(kRootWindowName)) == 0;
     const bool system = memcmp(entry, kSystemWindowName, sizeof(kSystemWindowName)) == 0;
-    if (!root && !system) {
+    const bool data = memcmp(entry, kDataWindowName, sizeof(kDataWindowName)) == 0;
+    if (!root && !system && !data) {
       continue;
     }
+    // Both sealed windows are read-only images and say so in their entries. Data is the first window
+    // the owner mount attaches for writing: a read-only entry there would mount, then fail at the
+    // first write, so the manifest is refused here instead -- with its own tag.
+    const uint32_t expectFlags = data ? 0u : 1u;
     const uint64_t offset = le64At(entry + 32);
     const uint64_t size = le64At(entry + 40);
-    if (le32At(entry + 48) != kBlockBytes || le32At(entry + 52) != 1) {
-      fail(root ? "root-attr" : "system-attr", index);
+    if (le32At(entry + 48) != kBlockBytes || le32At(entry + 52) != expectFlags) {
+      fail(root ? "root-attr" : system ? "system-attr" : "data-attr", index);
     }
     if (offset < kRootManifestBytes || (offset % kBlockBytes) || size < kBlockBytes ||
         (size % kBlockBytes) || offset > partitionBytes || size > partitionBytes - offset) {
-      fail(root ? "root-bounds" : "system-bounds", offset);
+      fail(root ? "root-bounds" : system ? "system-bounds" : "data-bounds", offset);
     }
     const uint64_t first = partitionFirst + offset / kBlockBytes;
     const uint64_t sectors = size / kBlockBytes;
     if (sectors > UINT32_MAX || first > UINT32_MAX || first + sectors >
         static_cast<uint64_t>(clover_emmc_block_sectors())) {
-      fail(root ? "root-geometry" : "system-geometry", sectors);
+      fail(root ? "root-geometry" : system ? "system-geometry" : "data-geometry", sectors);
     }
+    // The entry copy happens-before the release stores of its window below, so a reader that
+    // acquires the window's sector count also sees the declared offset, size and digest.
+    rememberEntry(root ? &gOsEntry : system ? &gSystemEntry : &gDataEntry, entry);
     if (root) {
       __atomic_store_n(&gWindowFirst, static_cast<uint32_t>(first), __ATOMIC_RELEASE);
       __atomic_store_n(&gWindowSectors, static_cast<uint32_t>(sectors), __ATOMIC_RELEASE);
       rootFound = true;
-    } else {
+    } else if (system) {
       __atomic_store_n(&gSystemWindowFirst, static_cast<uint32_t>(first), __ATOMIC_RELEASE);
       __atomic_store_n(&gSystemWindowSectors, static_cast<uint32_t>(sectors), __ATOMIC_RELEASE);
       systemFound = true;
+    } else {
+      __atomic_store_n(&gDataWindowFirst, static_cast<uint32_t>(first), __ATOMIC_RELEASE);
+      __atomic_store_n(&gDataWindowSectors, static_cast<uint32_t>(sectors), __ATOMIC_RELEASE);
+      dataFound = true;
     }
-    // Keep looking for the other entry; the manifest has one of each and either order is valid.
+    // Keep looking for the other entries; the manifest has one of each and any order is valid.
   }
   if (!rootFound) {
     fail("root-name", count);
   }
   if (requireSystem && !systemFound) {
     fail("systemwin", count);
+  }
+  if (requireData && !dataFound) {
+    fail("datawin", count);
   }
 }
 
@@ -1375,6 +1423,10 @@ static const dev_t kNoDevice = static_cast<dev_t>(-1);
 static volatile dev_t gOsVolumeDev = kNoDevice;
 static volatile dev_t gSystemVolumeDev = kNoDevice;
 static IOMedia *gSystemVolumeMedia = nullptr;
+// Round159's Data volume. Unlike SystemOS this one is attached read-write, so its media has to stay
+// alive for the life of the mount; the number alone is not enough to keep the tree that owns it up.
+static volatile dev_t gDataVolumeDev = kNoDevice;
+static IOMedia *gDataVolumeMedia = nullptr;
 
 // vfs_mountroot(), transcribed: bsd/vfs/vfs_subr.c:1240 (bdevvp), :1258 (vfs_rootmountalloc), :1259
 // (mnt_devvp), :1265 (VFS_MOUNT with no data argument), :1282 (SI_MOUNTEDON), :1284 and :1286
@@ -1805,6 +1857,56 @@ static IOMedia *publishSystemOs(void)
   return volume;
 }
 
+// Round159's third window, and the only writable one the boot publishes. The owner mount's Data step
+// asks native_ram_block_volume_seed() at the same exec as the SystemOS lookup; on sheng that answer
+// is a RAM disk, here it is a window on the card, so this is where the window is attached and the
+// container's own volume is named. The media is retained because the read-write mount outlives this
+// call, and because the Data window's blocks are the only ones the running system may write.
+static IOMedia *publishDataVolume(void)
+{
+  if (gDataVolumeMedia) {
+    return gDataVolumeMedia;
+  }
+  const uint32_t first = __atomic_load_n(&gDataWindowFirst, __ATOMIC_ACQUIRE);
+  const uint32_t sectors = __atomic_load_n(&gDataWindowSectors, __ATOMIC_ACQUIRE);
+  if (!first || !sectors) {
+    return nullptr;
+  }
+  CloverBlockDevice *device = nullptr;
+  IOMedia *whole = publishWindow(first, sectors, false, &device);
+  IOMedia *volume = nullptr;
+  uint32_t passes = 0;
+  for (; passes < 12000 && !volume; passes++) {
+    volume = findVolumeByUuid(whole, kDataVolumeUuid, 0);
+    if (!volume) {
+      IOSleep(10);
+    }
+  }
+  if (!volume) {
+    fail("datavol", passes);
+  }
+  const char *devname = nullptr;
+  uint32_t major = 0xffffffff;
+  uint32_t minor = 0xffffffff;
+  bool named = false;
+  for (uint32_t attempt = 0; attempt < 1000; attempt++) {
+    if (volumeBsd(volume, &devname, &major, &minor)) {
+      named = true;
+      break;
+    }
+    IOSleep(10);
+  }
+  IOLog("CloverBlock r159: data vu=%s bsd=%s %u:%u p=%u\n", kDataVolumeUuid,
+        devname ? devname : "?", major, minor, passes);
+  if (!named) {
+    volume->release();
+    fail("databsd", passes);
+  }
+  gDataVolumeDev = volumeDev(major, minor);
+  gDataVolumeMedia = volume;
+  return volume;
+}
+
 // The whole of rounds 127 and 128, and it never returns: the console is the thing this board cannot
 // trust this late, so the depth is drawn on the panic screen like every other reading since round121.
 __attribute__((noreturn)) static void apfsProbe(IOMedia *whole, IOService *client)
@@ -2050,8 +2152,8 @@ extern "C" void clover_block_run(void)
       if (!first || !sectors) {
         fail("udwindow", sectors);
       }
-      // Only the boot mode needs the second window; the probe modes read the OS entry alone.
-      windowsFromManifest(first, sectors, apfs == 3);
+      // Only the boot mode needs the other windows; the probe modes read the OS entry alone.
+      windowsFromManifest(first, sectors, apfs == 3, apfs == 3);
     } else {
       uint32_t first = 0;
       uint32_t sectors = 0;
@@ -2101,8 +2203,10 @@ extern "C" void clover_block_run(void)
   if (apfs == 3) {
     const uint32_t systemFirst = __atomic_load_n(&gSystemWindowFirst, __ATOMIC_ACQUIRE);
     const uint32_t systemSectors = __atomic_load_n(&gSystemWindowSectors, __ATOMIC_ACQUIRE);
-    if (!osSectors || !systemSectors) {
-      fail(!osSectors ? "rootwin" : "systemwin", 0);
+    const uint32_t dataFirst = __atomic_load_n(&gDataWindowFirst, __ATOMIC_ACQUIRE);
+    const uint32_t dataSectors = __atomic_load_n(&gDataWindowSectors, __ATOMIC_ACQUIRE);
+    if (!osSectors || !systemSectors || !dataSectors) {
+      fail(!osSectors ? "rootwin" : !systemSectors ? "systemwin" : "datawin", 0);
     }
     // Round145: sheng's boot order. One disk is published and only the root volume is named before
     // bsd_init() mounts it; the SystemOS volume is left to native_verified_block_volume_device(),
@@ -2111,10 +2215,15 @@ extern "C" void clover_block_run(void)
     // ahead of the root mount, and r143/r144 both ended in bsd_init() with an empty mountlist;
     // r137-r142 published this one window and mounted the same root. The window's geometry is still
     // read and bounds-checked here, so a manifest without SystemOS fails before the root mount.
+    //
+    // Round159's Data window is not published here either: the owner mount asks for its seed at the
+    // same exec, through native_ram_block_volume_seed(), and that call is what attaches it. Only its
+    // geometry is proven above, because a manifest without Data has to stop before the root mount
+    // rather than mount a root whose /private/var can never be seeded.
     whole = publishWindow(osFirst, osSectors, true, &device);
     prepareApfsBoot(whole);
-    IOLog("CloverBlock r145: boot os=%u+%u system=%u+%u fires=%u deferred=1\n", osFirst, osSectors,
-          systemFirst, systemSectors, fires);
+    IOLog("CloverBlock r159: boot os=%u+%u system=%u+%u data=%u+%u fires=%u deferred=1\n",
+          osFirst, osSectors, systemFirst, systemSectors, dataFirst, dataSectors, fires);
     return;
   }
   whole = publishWindow(osFirst, osSectors, false, &device);
@@ -2311,17 +2420,137 @@ extern "C" void clover_block_request(void)
 // ---------------------------------------------------------------- the owner mount's contract
 
 // bsd/kern/kern_exec.c's offline owner mount -- sheng's SystemOS step, enabled on this board by
-// patches/xnu-clover/zzy-clover-systemos-mount.patch -- validates the block stack through these two
+// patches/xnu-clover/zzy-clover-systemos-mount.patch -- validates the block stack through these
 // symbols. drivers/NativeVirtioBlock supplies them on sheng by walking the IOMedia the boot disk
 // published; this board supplies the same answers from the SHNGROOT manifest it read off userdata.
 // Round145 keeps sheng's timing: the OS volume is the one root-matching handed the kernel, and the
-// SystemOS volume is published only when this lookup runs, at launchd's exec.
+// SystemOS volume is published only when this lookup runs, at launchd's exec. Round159 adds the two
+// symbols the authenticated boot manifest and the scratch Data mount ask for, and both answer from
+// the same third window: Data is published read-write when its seed is requested, never before.
 extern "C" int native_verified_block_root_authorized(dev_t device)
 {
   if (device == kNoDevice) {
     return 0;
   }
+  // Data is deliberately absent: it is mounted read-write at /private/var and is never a root,
+  // never a shared-cache cache, and never the SystemOS volume the owner mount unions onto "/".
   return device == gOsVolumeDev || device == gSystemVolumeDev;
+}
+
+static void le64Store(uint8_t *at, uint64_t value)
+{
+  for (unsigned shift = 0; shift < 64; shift += 8) {
+    *at++ = static_cast<uint8_t>(value >> shift);
+  }
+}
+
+// The digest a boot manifest records for one window. sheng hashes the authenticated envelope of its
+// own block format; clover has no per-block envelope, so the identity hashed here is exactly the
+// claim the flashed SHNGROOT manifest made about this window: its role, the UUID the kernel matched,
+// the byte extent the driver read, and the seed digest the image was built with. Everything comes
+// from this boot's own manifest read, so the number changes when any of those change.
+extern "C" int native_verified_block_manifest_sha384(dev_t device, const char *uuid,
+                                                     uint8_t digest[48])
+{
+  if (!digest) {
+    return 0;
+  }
+  memset(digest, 0, 48);
+  if (!uuid || strlen(uuid) != 36) {
+    return 0;
+  }
+  const bool os = device != kNoDevice && device == gOsVolumeDev &&
+                  strcmp(uuid, kRootVolumeUuid) == 0;
+  const bool system = device != kNoDevice && device == gSystemVolumeDev &&
+                      strcmp(uuid, kSystemOsVolumeUuid) == 0;
+  if (!os && !system) {
+    return 0;
+  }
+  // Pair with the release store in windowsFromManifest before reading the entry it latched.
+  (void)__atomic_load_n(os ? &gWindowSectors : &gSystemWindowSectors, __ATOMIC_ACQUIRE);
+  const ManifestEntry *entry = os ? &gOsEntry : &gSystemEntry;
+  static const char domain[] = "VerifiedRoot.CloverBlockWindow.v1";
+  uint8_t role = os ? 1 : 2;
+  uint8_t extent[16];
+  le64Store(extent, entry->offset);
+  le64Store(extent + 8, entry->size);
+  SHA384_CTX context;
+  SHA384_Init(&context);
+  SHA384_Update(&context, domain, sizeof(domain));
+  SHA384_Update(&context, &role, sizeof(role));
+  SHA384_Update(&context, uuid, 36);
+  SHA384_Update(&context, extent, sizeof(extent));
+  SHA384_Update(&context, entry->sha256, sizeof(entry->sha256));
+  SHA384_Final(digest, &context);
+  IOLog("CloverBlock r159: manifest %s vu=%s off=%llu size=%llu\n", os ? "os" : "system", uuid,
+        static_cast<unsigned long long>(entry->offset),
+        static_cast<unsigned long long>(entry->size));
+  return 1;
+}
+
+// kern_exec.c compiles its GPU-addon step under the same switch that turns the Data mount on, and
+// that step references native_ram_block_gpu_addon() as a weak import. A static kernel link resolves
+// every undefined reference, so the weak attribute does not let this symbol stay absent -- the link
+// asks CloverBlock for it exactly as it asks for the seed below. The step itself returns at once
+// unless the boot carries `sheng-gpu-addon=1`, which this board never passes, and even if it ran the
+// answer here is "no addon": the caller returns before touching the Data image, and /private/var
+// stays exactly the seed's bytes.
+extern "C" int native_ram_block_gpu_addon(const uint8_t **addon, uint64_t *bytes)
+{
+  if (addon) {
+    *addon = nullptr;
+  }
+  if (bytes) {
+    *bytes = 0;
+  }
+  return 0;
+}
+
+// The seed of the read-write Data volume. On sheng this answer comes from NativeRamBlock's memory
+// disk; the owner Data step in bsd/kern/kern_exec.c does not care which backend answered, only that
+// the device, path, byte count and seed digest name the same volume it is about to mount. Here the
+// backend is the third SHNGROOT window, so publishing it is what answers the question, and the
+// digest is the manifest's own record of the 32 MiB image that was appended to userdata.
+extern "C" int native_ram_block_volume_seed(const char *uuid, dev_t *device, char *path,
+                                            size_t size, uint64_t *base, uint64_t *bytes,
+                                            uint8_t *digest)
+{
+  if (!uuid || !device || !path || size < 6 || !base || !bytes || !digest ||
+      strcmp(uuid, kDataVolumeUuid) != 0) {
+    return 0;
+  }
+  *device = kNoDevice;
+  path[0] = 0;
+  IOMedia *media = publishDataVolume();
+  if (!media) {
+    return 0;
+  }
+  const char *name = nullptr;
+  uint32_t major = 0xffffffff;
+  uint32_t minor = 0xffffffff;
+  if (!volumeBsd(media, &name, &major, &minor)) {
+    return 0;
+  }
+  const dev_t candidate = volumeDev(major, minor);
+  if (candidate == kNoDevice || candidate != gDataVolumeDev) {
+    return 0;
+  }
+  const uint32_t sectors = __atomic_load_n(&gDataWindowSectors, __ATOMIC_ACQUIRE);
+  if (!sectors) {
+    return 0;
+  }
+  // A window's seed is addressed by the block device, not by a kernel virtual range, so the logical
+  // base is zero and the length is the window's own byte count. The Data mount checks both are
+  // page-aligned and refuses a zero length.
+  *base = 0;
+  *bytes = static_cast<uint64_t>(sectors) * kBlockBytes;
+  memcpy(digest, gDataEntry.sha256, sizeof(gDataEntry.sha256));
+  snprintf(path, size, "/dev/%s", name);
+  *device = candidate;
+  IOLog("CloverBlock r159: seed data %s dev=%d bytes=%llu off=%llu\n", name,
+        static_cast<int>(candidate), static_cast<unsigned long long>(*bytes),
+        static_cast<unsigned long long>(gDataEntry.offset));
+  return 1;
 }
 
 // The owner mount asks for the SystemOS volume by UUID, then opens the returned /dev path. Both have

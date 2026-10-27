@@ -678,11 +678,24 @@ def check_board(errors: list) -> str:
                       "again at OS_REASON_DYLD for want of the shared cache")
     else:
         text = patch.read_text()
+        # Round159 turns on the same file's Data half and the manifest publisher, and the
+        # publisher lives in IOKitBSDInit.cpp rather than kern_exec.c. All six switches are
+        # still flipped inside the translation unit that reads them, for the reason above.
         for macro in ("XNU_OWNER_CACHE_MOUNT", "XNU_OWNER_CACHE_STARTUP",
-                      "XNU_OWNER_UNION_SYSTEMOS"):
+                      "XNU_OWNER_UNION_SYSTEMOS", "XNU_OWNER_BOOT_MANIFEST",
+                      "XNU_OWNER_DATA_MOUNT", "XNU_NATIVE_RAM_BLOCK"):
             if f"#undef {macro}" not in text or f"#define {macro} 1" not in text:
                 errors.append(f"{patch.name} does not #undef then #define {macro} 1: the command "
                               "line's =0 would win and the SystemOS union mount would not run")
+        for needle in ("#define XNU_OWNER_DATA_VOLUME_UUID "
+                       '"FC1A580E-2D67-48FC-B8CF-87422A319340"',
+                       "IOKitBSDInit.cpp",
+                       "a redefinition with a",
+                       "#undef XNU_OWNER_BOOT_MANIFEST"):
+            if needle not in text:
+                errors.append(f"{patch.name} lacks {needle!r}: the Data mount would ask for a UUID "
+                              "CloverBlock never publishes, or the manifest publisher would be "
+                              "compiled out by the builder's -DXNU_OWNER_BOOT_MANIFEST=0")
     windows = (userdata or {}).get("windows") or []
     if [window.get("name") for window in windows] != ["OS", "SystemOS"]:
         errors.append('[userdata] windows must be OS then SystemOS: CloverBlock publishes them in '
@@ -1002,6 +1015,102 @@ def check_board(errors: list) -> str:
         if "done += written;" not in text:
             errors.append("CloverBlock lost the count of whole blocks a failed write did commit")
 
+    # Round159. The user's request for this round was two-part -- finish the eMMC driver,
+    # then mount the Data volume -- and both halves fail silently when a step is skipped,
+    # so the assertions are shape.
+    #
+    # The link. Round156 removed the read pacing but the card still ran the whole boot at the
+    # identification clock on one lane: nothing had ever sent CMD6. fastMode() performs the
+    # standard init order (HS_TIMING=1, BUS_WIDTH=8, then the 50 MHz row of sdcc1_apps_clk_src),
+    # gates every step on the card's own answer, and proves the result by reading LBA 1 --
+    # "EFI PART" -- before gBlockReady is raised. A refused step falls back to the 400 kHz
+    # settings the earlier rounds proved; a slow card must not become a dead boot.
+    #
+    # The volume. The owner Data mount is sheng's code, unchanged. What this board supplies is
+    # the block device behind it: a third SHNGROOT entry appended by
+    # scripts/append-data-window.py, published writable (flags 0, unlike the packer's read-only
+    # entries), and answered by native_ram_block_volume_seed() for
+    # native_owner_data_prepare() to mount on /private/var.
+    sdhci = REPO / "drivers/CloverSdhci/CloverSdhci.cpp"
+    if sdhci.is_file():
+        text = sdhci.read_text()
+        missing = [needle for needle in
+                   ("static bool fastMode (FastLink &link)",
+                    "static const uint32_t kGccCfg50m = 0x0000060bu;",
+                    "kExtCsdHsTiming = 185u",
+                    "kExtCsdBusWidth = 183u",
+                    "kHsTimingHighSpeed = 1u",
+                    "kBusWidth8Bit = 2u",
+                    "SDHCI_CTRL_HISPD",
+                    "link.header0 == 0x20494645u && link.header1 == 0x54524150u",
+                    "programRootClock (true, kGccCfg400k, link.clockAfter, backUpdated, backStable);",
+                    "clover_emmc_link[6] = (link21.highSpeed ? 1u : 0u) | (link21.width8 ? 2u : 0u) |",
+                    "CloverSdhci r159: link hs=%d/%x bw=%d/%x clk=%x hc=%x hdr=%x/%x ok=%d",
+                    "readMultiBlock (lba + done, target, chunk, got, status)",
+                    "writeMultiBlock (lba + done, target, chunk, handed, status)",
+                    "CloverSdhci r159: multi %s fail lba=%u blocks=%u st=0x%x w=%u/%u (once)")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp lacks {needle!r}: the card would "
+                          "stay at the identification clock, or a fast link that lied would be "
+                          "handed to the filesystem")
+        if "static const uint32_t kGccCfg400k" not in text:
+            errors.append("CloverSdhci lost its 400 kHz row: fastMode() would have nothing to fall "
+                          "back to and a refused CMD6 would leave the card unusable")
+
+    block = REPO / "drivers/CloverBlock/CloverBlock.cpp"
+    if block.is_file():
+        text = block.read_text()
+        missing = [needle for needle in
+                   ('static const char kDataWindowName[] = "Data";',
+                    'static const char kDataVolumeUuid[] = "FC1A580E-2D67-48FC-B8CF-87422A319340";',
+                    "static ManifestEntry gDataEntry;",
+                    "static volatile uint32_t gDataWindowFirst = 0;",
+                    "static volatile uint32_t gDataWindowSectors = 0;",
+                    "const uint32_t expectFlags = data ? 0u : 1u;",
+                    "windowsFromManifest(first, sectors, apfs == 3, apfs == 3);",
+                    "static IOMedia *publishDataVolume(void)",
+                    "IOMedia *media = publishDataVolume();",
+                    "CloverBlock r159: boot os=%u+%u system=%u+%u data=%u+%u fires=%u deferred=1",
+                    "CloverBlock r159: data vu=%s bsd=%s %u:%u p=%u",
+                    "CloverBlock r159: seed data %s dev=%d bytes=%llu off=%llu",
+                    "native_ram_block_volume_seed(const char *uuid, dev_t *device, char *path,",
+                    "native_ram_block_gpu_addon(const uint8_t **addon, uint64_t *bytes)",
+                    "native_verified_block_manifest_sha384(dev_t device, const char *uuid,",
+                    "return device == gOsVolumeDev || device == gSystemVolumeDev;")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"drivers/CloverBlock/CloverBlock.cpp lacks {needle!r}: the Data window "
+                          "would not be parsed, published or answered, and the owner Data mount "
+                          "would fall back to a scratch disk")
+        for tag in ("root-attr", "system-attr", "data-attr", "data-bounds", "data-geometry",
+                    "\"datawin\""):
+            if tag not in text:
+                errors.append(f"CloverBlock has no {tag!r} verdict: a malformed {tag[:-1]} entry "
+                              "would be published instead of named")
+        if "rememberEntry(root ? &gOsEntry : system ? &gSystemEntry : &gDataEntry, entry);" not in text:
+            errors.append("CloverBlock does not keep the Data entry's offset/size/sha256: the "
+                          "manifest digest and native_ram_block_volume_seed() would describe "
+                          "different extents")
+
+    append = REPO / "scripts/append-data-window.py"
+    if not append.is_file():
+        errors.append("scripts/append-data-window.py is missing: the flashed image would carry no "
+                      "Data window and the owner mount would panic 'offline scratch Data mount failed'")
+    else:
+        text = append.read_text()
+        for needle in ('SEED_BYTES = 32 * MIB',
+                       'SEED_SHA256 = "ef00c083fc54453c4ff6062c2e6947ddbba63e96aabcfd27d2273a53e4d3918c"',
+                       'SEED_UUID = "FC1A580E-2D67-48FC-B8CF-87422A319340"',
+                       'NAME = "Data"',
+                       'BLOCK_BYTES, 0, digest',
+                       'if size + SEED_BYTES > MAX_BYTES',
+                       'if size % MIB'):
+            if needle not in text:
+                errors.append(f"scripts/append-data-window.py lacks {needle!r}: the appended entry "
+                              "would not match the seed, the UUID CloverBlock answers, or the "
+                              "writable flags rule")
+
     # Round148. Round147 shipped an unattended deadline that fired on the very first timer tick, with
     # a garbage counter in the message. The cause was not the arithmetic: the Darwin arm64 assembler
     # reads `;` as the comment character, so every multi-instruction asm string kept only its first
@@ -1029,9 +1138,9 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round158. The menu has to name the round that aligned the repository contract.
-    if not board["payload"]["title"].startswith("clover r158:"):
-        errors.append('[payload] title is not "clover r158: ...": the menu would not name this round')
+    # Round159. The menu has to name the round under test: the fast link and the Data volume.
+    if not board["payload"]["title"].startswith("clover r159:"):
+        errors.append('[payload] title is not "clover r159: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",

@@ -34,6 +34,16 @@ fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustC
 # These two numbers are also kUserDataFirstLba/kUserDataLastLba in drivers/CloverSdhci, which
 # publishes the window to drivers/CloverBlock only when this boot's card agrees with them: if the
 # two files disagree the boot panics "udwindow 0" rather than describing some other partition.
+#
+# Round159 adds a third window to the image this driver flashes, and it is not listed below on
+# purpose: the list is the upstream packer's declaration of what an IPSW restore put there, while
+# the scratch Data volume is this port's own. scripts/append-data-window.py appends 32 MiB of seed
+# (scripts/prepare-owner-data-fixture.py, volume UUID FC1A580E-2D67-48FC-B8CF-87422A319340, sha256
+# ef00c083...) to the end of the image and writes a third SHNGROOT entry named "Data" with flags 0
+# (writable; the packer's own entries carry 1). CloverBlock parses it the same way, publishes it
+# writable, and answers native_ram_block_volume_seed() with that window, so the kernel's owner Data
+# mount gets /private/var on this card instead of a RAM scratch disk. The window lies between the
+# two GPT copies, so the backup GPT is still the last thing on the partition.
 [userdata]
 first_lba = 0xf10520
 last_lba = 0x747bfde
@@ -157,7 +167,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r158: sheng's porting record, and 21 seconds for a slow lock"
+title = "clover r159: the card runs at 50 MHz, and it carries a Data volume"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

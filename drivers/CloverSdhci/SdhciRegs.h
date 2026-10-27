@@ -270,6 +270,7 @@
 #define MMC_READ_SINGLE_BLOCK     17   /* adtc [31:0] address     R1 */
 #define MMC_READ_MULTIPLE_BLOCK   18   /* adtc [31:0] address     R1 */
 #define MMC_WRITE_BLOCK           24   /* adtc [31:0] address     R1 */
+#define MMC_WRITE_MULTIPLE_BLOCK  25   /* adtc [31:0] address     R1 */
 #define MMC_APP_CMD               55   /* ac   [31:16] RCA        R1 */
 
 // The R1 response's own fields (mmc.h:154-168): the current state is five bits at 9:13.

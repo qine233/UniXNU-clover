@@ -11340,6 +11340,134 @@ modules visible`、`probe patch localized OK (6838 bytes in 35 runs)`、
 `owner SystemOS mount compiled in OK`、`owner root trust compiled in OK`；
 `porting.toml` 另经上游校验器：`clover: 13 structured areas checked`。
 
+## v0.5.12（round159）：卡跑在 50 MHz，并且带上 Data 卷
+
+### 这一轮为什么是两件事
+
+要求是先把 eMMC 驱动写完，再把 Data 卷一起解决。前几轮已经能读能写，但整场
+启动都停在识别时钟、1 条数据线上——从来没有发过 CMD6；Data 卷则完全缺一块
+可写的底层设备。两件事都必须在同一个内核里成立，因为 Data 的挂载要经过
+eMMC 的批量读。
+
+### eMMC：先让卡按它自己的速度跑
+
+`CloverSdhci` 在 EXT_CSD 与几何读出之后、`gBlockReady` 抬起之前调用
+`fastMode()`，按标准顺序做三步，每步都以卡的回答为门：
+
+1. CMD6 SWITCH `HS_TIMING = 1`（EXT_CSD 字节 185），进入高速时序；
+2. CMD6 SWITCH `BUS_WIDTH = 2`（字节 183），切到 8 条数据线；
+3. `HOST_CONTROL` 置 `HISPD | 8BITBUS`，并把 GCC 的 `sdcc1_apps_clk_src`
+   写成 50 MHz 那一行（`src 6, divider 11`，`kGccCfg50m = 0x0000060b`）。
+
+最后读 LBA 1，要求两个 32 位字是 `0x20494645` / `0x54524150`（"EFI PART"），
+才认为链路成立。任何一步被拒就 `programRootClock(true, kGccCfg400k, …)` 并
+清掉 HISPD，退回前几轮验证过的 400 kHz 1 线——慢卡不能变成死启动。读数在
+`CloverSdhci r159: link hs=… bw=… clk=… hc=… hdr=…/%x ok=…`。
+
+批量路径同样是这一轮补的：读走 CMD18、写走 CMD25，一次 32 块（16 KiB），
+收尾 CMD12 用 R1b 的忙线、200 ms 或 10 ms/块的死线；`kDataErrorMask` 把
+`DATA_END` 同字里的 CRC/TIMEOUT/END_BIT/ADMA 与成功区分开。任何批量失败都
+退回前几轮的单块 CMD17/CMD24，并且**每个方向只报一次**
+`CloverSdhci r159: multi read|write fail lba=… blocks=… st=… w=…/…`，不再像
+r156 那样静默降速。
+
+顺带修了一处构建期问题：`drivers/CloverPMGR` 的 `clover_pmgr_observation`
+标成 `alignas(128)`。panic 屏的探针脚本要求这个数组 128 字节对齐，本轮新增
+代码改变了链接顺序，把它从对齐位置上挤开，`patch-xnu-entry-probe.py` 因此
+拒绝内核。把对齐写进声明，就不再依赖链接器的运气。
+
+### Data：第三扇窗，交给 owner 去挂
+
+boot 用的 userdata GPT 里原本只有本仓自己声明的两颗分区（OS、SystemOS）。
+`scripts/append-data-window.py` 在镜像尾部追加 32 MiB 种子
+（`owner-data-32.cdr`，sha256 `ef00c083…`，卷 UUID
+`FC1A580E-2D67-48FC-B8CF-87422A319340`），作为 SHNGROOT 的第三条 `Data`，
+`flags = 0`（可写；打包器自带的条目都是 1）。它落在两份 GPT 之间；`[userdata]
+windows` 仍只列 OS 与 SystemOS，因为那是上游打包器的声明，不是本板自己的。
+
+`CloverBlock` 识别第三条目后，以 `windowsFromManifest(…, apfs == 3, apfs == 3)`
+发布可写窗口，按 UUID 找到卷、等 BSD 名，导出
+`native_ram_block_volume_seed()`：设备路径 `/dev/<bsd>`、字节数等于窗口大小、
+digest 取条目里的 sha256；同时导出 manifest sha384。日志依次是
+`CloverBlock r159: boot os=…+… system=…+… data=…+…`、`data vu=… bsd=…`、
+`manifest …`、`seed data …`。
+
+owner 侧保持 sheng 的原代码：`native_owner_data_prepare()` 校验尺寸、4096
+对齐，以匿名 owner 99 把 apfs 挂到 `/private/var`；失败则
+`offline scratch Data mount failed: %d` panic。`kern_exec.c` 的 GPU addon 是
+弱引用，静态内核链接仍要求定义，因此 `CloverBlock` 同时提供
+`native_ram_block_gpu_addon()`；没有 `sheng-gpu-addon=1` 时它立即回答“无
+addon”，不碰 Data 镜像。
+
+32 MiB 是 scratch，不是完整 `/data`；原用户数据分区不在这轮范围。
+
+### 构建与刷写
+
+内核变了，`build payload` 不会重编内核，必须先跑 `build kernel`：
+
+```sh
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" ./unixnu build kernel
+PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+这一轮要动两个分区。`userdata` 是破坏性写入：整段替换为稀疏镜像，Data 的
+写入只会落在追加的 32 MiB 窗口内，但原分区的其余内容会按种子重建。命令先
+记录在这里，**尚未执行**；按长期约定，写入前需要明确同意：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round159-payload.img
+fastboot flash userdata /Users/zhouzhou/clover-out/round159-userdata-root.sparse.img
+fastboot reboot
+```
+
+### 这一帧怎么读
+
+主问题是：50 MHz / 8 线是否真的成立，以及 Data 卷能不能挂上。
+
+- `link hs=1/… bw=1/… hc=… hdr=20494645/54524150 ok=1`：快链路成立
+  （`hs`/`bw` 的第二个数是那条 CMD6 的 INT_STATUS，非零表示命令确实回来过）。
+- `ok=0`：已回退 400 kHz，启动继续，只是速度仍是旧值；此时 `hdr` 不再有
+  意义。
+- `CloverBlock r159: boot … data=<非零>+<非零>`：第三扇窗已被识别；
+  `data vu=… bsd=…`：卷已找到并拿到设备名；`seed data … dev=N`：owner 拿到
+  的种子；随后若挂载失败会 panic 并打印
+  `offline scratch Data mount failed: <errno>`。
+- `multi read fail` / `multi write fail` 每个方向最多一行；出现即表示批量被
+  拒、已退单块，数据仍然正确。
+- dyld 共享缓存那堵墙不在本轮解决；若仍走到同一条 `shared_region` 墙，属
+  预期。
+
+### 内核构建不是逐字节可复现
+
+两次 `build kernel` 会得到不同的哈希：`emit_prelink` 每次生成新的 prelink
+UUID，落在 `LC_UUID`、`__PRELINK_INFO` 与少量 `__LINKEDIT` 记录里。本轮两次
+构建相差 81 字节，所有符号地址一致。因此
+`verify-clover-payload.py` 的“探针补丁只落在本地”改为只在
+`__TEXT_EXEC` 与 `__PLK_TEXT_EXEC` 两个可执行段里比较字节（补丁实测 6838
+字节、35 段），可执行段之外的差异计数后忽略。归档里的本地 `kernel.macho`
+是 payload 的精确输入（`8d24b98c…`）；重编得到 `948ecc1f…` 属正常。
+
+产物归档在 `~/clover-out/round159-*`，`round159-SHA256SUMS` 十一项：
+`payload.img` 58,720,256 B（`b77e7368…`）、本地 `kernel.macho` 51,998,720 B
+（`8d24b98c…`）、卷内 `kernel.macho`（`82c35e51…`）、卷内 `unixnu.toml`
+634 B（`8e5d6481…`）、ADT 13,516 B（`2555023c…`）、`scratch-data.img`
+35,888 B（`614b8356…`）、`trustcache` 61,408 B（`7c369ce0…`）、userdata
+稀疏镜像 9,416,215,880 B（`60a86a38…`）、构建日志 3,840 B
+（`9659c2f3…`）、payload 补丁日志 777 B（`d4275ce6…`）、双 checker 日志
+5,346 B（`277fcf0a…`）。两个 checker 的结果：`clover ok: ADT 13516 bytes,
+8 cores; … 75 inline asm statements separated; modules visible`、
+`probe patch localized OK (6838 bytes in 35 runs, 81 outside executable text
+ignored)`、`CloverSdhci linked OK`、`CloverBlock linked OK`、
+`owner SystemOS mount compiled in OK`（含新的
+`offline scratch Data mount failed: %d` 与 `native_ram_block_volume_seed`）、
+`owner root trust compiled in OK`。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

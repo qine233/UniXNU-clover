@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -82,6 +82,22 @@
+@@ -82,6 +82,39 @@
  #include <machine/reg.h>
  #include <machine/cpu_capabilities.h>
  
@@ -12,14 +12,47 @@
 + * virtio archive that switch would drag in does not exist on this board and is not needed: the block
 + * stack is CloverBlock's. These defines follow the command line's -DXNU_OWNER_*=0 for this
 + * translation unit, which is the only unit that reads them.
++ *
++ * Round159 adds the authenticated boot manifest and the scratch Data mount to the same gate. Both
++ * ask their block questions of CloverBlock: the manifest digest names the OS and SystemOS windows the
++ * flashed SHNGROOT declares, and the Data seed is the third window, published writable at exec. The
++ * RAM block switch is defined here rather than on the command line on purpose -- the build switch
++ * would force-load drivers/NativeRamBlock's archive, whose native_ram_block_volume_seed would then
++ * collide with CloverBlock's, and whose memory disk is the very backend this board replaces. Only
++ * this translation unit's #if reads the define. The boot-manifest define is repeated at the
++ * head of IOKitBSDInit.cpp below, because that is where its publisher compiles.
 + */
 +#undef XNU_OWNER_CACHE_MOUNT
 +#undef XNU_OWNER_CACHE_STARTUP
 +#undef XNU_OWNER_UNION_SYSTEMOS
++#undef XNU_OWNER_BOOT_MANIFEST
++#undef XNU_OWNER_DATA_MOUNT
++#undef XNU_NATIVE_RAM_BLOCK
 +#define XNU_OWNER_CACHE_MOUNT 1
 +#define XNU_OWNER_CACHE_STARTUP 1
 +#define XNU_OWNER_UNION_SYSTEMOS 1
++#define XNU_OWNER_BOOT_MANIFEST 1
++#define XNU_OWNER_DATA_MOUNT 1
++#define XNU_NATIVE_RAM_BLOCK 1
++/* The Data volume UUID of build/owner-data/seed.json (scripts/prepare-owner-data-fixture.py). */
++#define XNU_OWNER_DATA_VOLUME_UUID "FC1A580E-2D67-48FC-B8CF-87422A319340"
 +
  #include <sys/cdefs.h>
  #include <sys/param.h>
  #include <sys/systm.h>
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -26,3 +26,13 @@
+  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
+  */
++/*
++ * clover r159: the boot-manifest publisher lives in this file, and the build driver keeps
++ * IOKitBSDInit.cpo_CFLAGS_ADD at -DXNU_OWNER_BOOT_MANIFEST=0 unless the whole sheng virtio owner
++ * stack is configured. This board answers the same contract from CloverBlock, so the switch is
++ * turned on for this translation unit only. Undo the command line first: a redefinition with a
++ * different value is a hard error.
++ */
++#undef XNU_OWNER_BOOT_MANIFEST
++#define XNU_OWNER_BOOT_MANIFEST 1
++
+ #include <IOKit/IOBSD.h>

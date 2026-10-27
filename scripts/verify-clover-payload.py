@@ -95,6 +95,29 @@ def check_pmgr(kernel: bytes) -> bool:
     return ok
 
 
+def exec_text_ranges(blob: bytes) -> list[tuple[int, int]]:
+    """File ranges of the executable text segments in a Mach-O kernel.
+
+    Two independent `build kernel` runs do not produce identical files: emit_prelink mints a fresh
+    prelink UUID, which lands in LC_UUID, in __PRELINK_INFO, and in a few __LINKEDIT records. The
+    entry-probe patch, by contrast, only writes code, and it lands in __TEXT_EXEC and
+    __PLK_TEXT_EXEC (measured against the archived pre-patch kernel: 6838 bytes, 35 runs, nothing
+    outside those two). Keeping the byte comparison inside them is what makes "the patch stayed
+    local" a statement about code rather than about a UUID the next build is free to change."""
+    if len(blob) < 32 or struct.unpack_from("<I", blob, 0)[0] != 0xFEEDFACF:
+        return []
+    ncmds = struct.unpack_from("<I", blob, 16)[0]
+    offset, ranges = 32, []
+    for _ in range(ncmds):
+        command, size = struct.unpack_from("<II", blob, offset)
+        if command == 0x19 and size >= 72:
+            name, _va, _vs, fileoff, filesize = struct.unpack_from("<16sQQQQ", blob, offset + 8)
+            if name.rstrip(b"\0") in (b"__TEXT_EXEC", b"__PLK_TEXT_EXEC"):
+                ranges.append((fileoff, fileoff + filesize))
+        offset += size
+    return ranges
+
+
 def check_sdhci(kernel: bytes) -> bool:
     """drivers/CloverSdhci is linked as a plain archive, not with -force_load (see
     configs/clover_defconfig), so nothing but a reference keeps it: the link would silently drop
@@ -111,6 +134,8 @@ def check_sdhci(kernel: bytes) -> bool:
     found = {name: name.encode() in kernel
              for name in ("clover-emmc", "look-only dump of c0c4000",
                           "no pwr", "CloverSdhci: failed at stage",
+                          "CloverSdhci r159: link hs=%d/%x bw=%d/%x clk=%x hc=%x hdr=%x/%x ok=%d",
+                          "CloverSdhci r159: multi %s fail lba=%u blocks=%u st=0x%x w=%u/%u (once)",
                           "_clover_emmc_run", "_clover_emmc_block_read",
                           "_clover_emmc_block_write", "_clover_emmc_panic_append")}
     ok = all(found.values())
@@ -153,7 +178,10 @@ def check_block(kernel: bytes) -> bool:
              for name in ("clover-apfs", "CloverBlock r137: apfs",
                           "CloverBlock r145: os vu=%s bsd=%s %u:%u p=%u",
                           "CloverBlock r145: system vu=%s bsd=%s %u:%u p=%u",
-                          "CloverBlock r145: boot os=%u+%u system=%u+%u fires=%u deferred=1",
+                          "CloverBlock r159: boot os=%u+%u system=%u+%u data=%u+%u fires=%u deferred=1",
+                          "CloverBlock r159: data vu=%s bsd=%s %u:%u p=%u",
+                          "CloverBlock r159: seed data %s dev=%d bytes=%llu off=%llu",
+                          "CloverBlock r159: manifest %s vu=%s off=%llu size=%llu",
                           "CloverBlock r145: owner system %s dev=%d",
                           "fl=0x%x fc=0x%x fk=0x%x", "op=0x%x:0x%x mm=0x%x:0x%x",
                           "vt=%u un=%u vs=0x%x vo=0x%x vu=0x%x vc=0x%x",
@@ -168,6 +196,9 @@ def check_block(kernel: bytes) -> bool:
                           "_clover_block_run", "_vnode_setmountedon", "_vn_rdwr",
                           "_native_verified_block_root_authorized",
                           "_native_verified_block_volume_device",
+                          "_native_verified_block_manifest_sha384",
+                          "_native_ram_block_volume_seed",
+                          "_native_ram_block_gpu_addon",
                           "_vfs_context_kernel", "_PE_parse_boot_argn")}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())
@@ -185,9 +216,11 @@ def check_owner_mount(kernel: bytes) -> bool:
     label = "kernel.macho: owner SystemOS mount compiled in"
     found = {name: name.encode() in kernel
              for name in ("offline owner SystemOS mount failed: %d",
+                          "offline scratch Data mount failed: %d",
                           "_commpage_update_dyld_flags",
                           "native_owner_cache_device_path",
-                          "native_owner_cache_native_union")}
+                          "native_owner_cache_native_union",
+                          "native_ram_block_volume_seed")}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}" for name, yes in found.items())
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
@@ -500,8 +533,10 @@ def report(image: pathlib.Path) -> int:
     # copy it places on the volume, so the in-volume kernel is the locally built
     # kernel plus a few dozen patched words. What proves the round is that the
     # patch stayed local: same length, and the differing bytes confined to small
-    # runs. A whole-file rewrite here would mean the kernel itself changed under
-    # the payload build, which is a different round's business.
+    # runs inside the executable text. A whole-file rewrite here would mean the
+    # kernel itself changed under the payload build, which is a different round's
+    # business. Differences outside executable text are counted and ignored:
+    # they are the prelink UUID, which every `build kernel` run mints anew.
     kernel = blobs.get("kernel.macho")
     label = "kernel.macho: probe patch localized"
     if kernel is None or not LOCAL_KERNEL.exists():
@@ -509,16 +544,22 @@ def report(image: pathlib.Path) -> int:
         ok = False
     else:
         disk = LOCAL_KERNEL.read_bytes()
+        ranges = exec_text_ranges(kernel)
         if len(kernel) != len(disk):
             print(f"{label:42} FAIL (length {len(kernel)} vs {len(disk)})")
             ok = False
+        elif not ranges:
+            print(f"{label:42} FAIL (no executable text segments found)")
+            ok = False
         else:
-            offs = [i for i in range(len(kernel)) if kernel[i] != disk[i]]
+            differing = [i for i in range(len(kernel)) if kernel[i] != disk[i]]
+            offs = [i for i in differing if any(lo <= i < hi for lo, hi in ranges)]
+            outside = len(differing) - len(offs)
             runs = 1 + sum(1 for a, b in zip(offs, offs[1:]) if b - a > 64) if offs else 0
-            localized = len(offs) <= 20000 and runs <= 64
+            localized = bool(offs) and len(offs) <= 20000 and runs <= 64
             print(f"{label:42} {'OK' if localized else 'FAIL'} "
-                  f"({len(offs)} bytes in {runs} runs, "
-                  f"sha256 {hashlib.sha256(kernel).hexdigest()})")
+                  f"({len(offs)} bytes in {runs} runs, {outside} outside executable text "
+                  f"ignored, sha256 {hashlib.sha256(kernel).hexdigest()})")
             ok &= localized
     if kernel is not None:
         ok &= check_pmgr(kernel)

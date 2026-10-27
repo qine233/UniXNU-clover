@@ -39,7 +39,11 @@ uint32_t clover_original_pmgr_nub_read(IOService *);
 void clover_original_pmgr_nub_write(IOService *, uint64_t);
 // stage,status,parent-size,own-size,provider,nub,bound-provider,read-before,
 // read-after,own-before,own-after,nub-before,nub-after,attached,registered,mode.
-volatile uint64_t clover_pmgr_observation[16];
+// The panic screen resolves this array and its patch script insists on 128-byte alignment, because
+// the whole block is copied out with two 64-byte loads. A plain uint64_t array only promises 8;
+// it happened to be aligned until round159 added code and moved the link order, which made
+// patch-xnu-entry-probe.py refuse the kernel. Say the alignment here instead of relying on luck.
+alignas(128) volatile uint64_t clover_pmgr_observation[16];
 __attribute__((noinline)) void clover_pmgr_checkpoint(void) { __asm__ volatile("" ::: "memory"); }
 // drivers/CloverSdhci, scheduled from here because a device repository has no patch slot for an
 // IOKit personality (see that file's header comment). It is opt-in through its own boot argument

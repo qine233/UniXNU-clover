@@ -54,7 +54,14 @@ CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-display-stub/libCloverDisplayS
 #   NATIVE_ADRENO       — the sheng driver targets Adreno 740; clover has Adreno 512.
 #   NATIVE_MOBILE_DISPLAY / NATIVE_LEGACY_DISPLAY — no MDP5/EVB bring-up yet.
 #   ARMVIRT_PLATFORM    — the DT platform expert owns the tree; the virt platform would shadow it.
-#   OWNER_*             — sheng's verified-root and Data-volume stack needs the userdata block driver.
+#   OWNER_*             — not defconfig switches on this board. build-xnu-4k-baseline.sh gates
+#                         OWNER_ROOT_TRUST on NATIVE_VIRTIO_BLOCK, which clover does not have;
+#                         patches/xnu-clover/zzy-clover-systemos-mount.patch turns CACHE_MOUNT,
+#                         CACHE_STARTUP, UNION_SYSTEMOS, BOOT_MANIFEST, DATA_MOUNT and the RAM-block
+#                         seed path on inside kern_exec.c and IOKitBSDInit.cpp instead, where
+#                         CloverBlock answers every block question from the card. Round159 appends
+#                         the scratch Data volume (UUID FC1A580E-2D67-48FC-B8CF-87422A319340) as the
+#                         third SHNGROOT window; scripts/append-data-window.py writes it.
 #   BOOT_PROGRESS       — build-xnu-4k-baseline.sh only runs the layer when NATIVE_UFS, NATIVE_VIRTIO_BLOCK,
 #                         OWNER_ROOT_AUDIT and SOURCE_CORECRYPTO14 are all set, because its checkpoints sit in the
 #                         audited block path; clover has nothing on that path yet, and scripts/build-boot-progress.py
