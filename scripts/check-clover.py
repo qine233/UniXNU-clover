@@ -911,13 +911,13 @@ def check_board(errors: list) -> str:
         text = sdhci.read_text()
         missing = [needle for needle in
                    ("static const uint32_t kReadChunkBlocks = 32;",
-                    "static void sendStopCommand (void)",
+                    "static bool sendStopCommand (void)",
                     "static bool readMultiBlock (uint32_t lba",
                     "SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN |",
                     "SDHCI_TRNS_MULTI",
                     "MMC_READ_MULTIPLE_BLOCK",
                     "if (chunk >= 4) {",
-                    "readMultiBlock (lba + done, words + done * kBlockWords, chunk, got, status)")
+                    "readMultiBlock (lba + done, target, chunk, got, status)")
                    if needle not in text]
         for needle in missing:
             errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp lacks {needle!r}: without the "
@@ -960,6 +960,34 @@ def check_board(errors: list) -> str:
             errors.append("CloverBlock lost the per-block fallback: a second caller would have "
                           "no staging buffer and the request would fail")
 
+    # Round157. r156 made the card fast but left four ways for the fast path to report
+    # something that was not true: a stop command whose failure was invisible, DATA_END
+    # accepted next to a CRC/timeout bit, a 32-bit word offset that wraps past 16 GiB, and
+    # a CloverBlock completion that counted blocks the caller never received. These are
+    # source-shape assertions because each one is silent on a happy path.
+    sdhci = REPO / "drivers/CloverSdhci/CloverSdhci.cpp"
+    if sdhci.is_file():
+        text = sdhci.read_text()
+        if "SDHCI_CMD_RESP_SHORT_BUSY" not in text:
+            errors.append("the stop command is not issued as R1b: CMD12's busy period would be "
+                          "unobserved and the card could stay in data mode")
+        if "kDataErrorMask" not in text:
+            errors.append("the block paths do not mask data errors: DATA_END beside a CRC or "
+                          "timeout would be reported as a clean transfer")
+        if "!(status & kDataErrorMask)" not in text:
+            errors.append("kDataErrorMask is declared but never applied to a transfer verdict")
+        if "words + static_cast<uint64_t>(done) * kBlockWords" not in text:
+            errors.append("the block pointer is still computed in 32 bits: a run past 16 GiB "
+                          "would wrap to the start of the caller's buffer")
+    block = REPO / "drivers/CloverBlock/CloverBlock.cpp"
+    if block.is_file():
+        text = block.read_text()
+        if "done += read;" in text:
+            errors.append("CloverBlock counts blocks the failed card read never delivered: the "
+                          "completion would claim bytes that never reached the caller")
+        if "done += written;" not in text:
+            errors.append("CloverBlock lost the count of whole blocks a failed write did commit")
+
     # Round148. Round147 shipped an unattended deadline that fired on the very first timer tick, with
     # a garbage counter in the message. The cause was not the arithmetic: the Darwin arm64 assembler
     # reads `;` as the comment character, so every multi-instruction asm string kept only its first
@@ -987,10 +1015,9 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round156. r155's frame never ran, because the card was being read at 25 KB/s.
-    # The menu has to name the round that removed that pace.
-    if not board["payload"]["title"].startswith("clover r156:"):
-        errors.append('[payload] title is not "clover r156: ...": the menu would not name this round')
+    # Round157. The menu has to name the round that fixed the fast path's silent failures.
+    if not board["payload"]["title"].startswith("clover r157:"):
+        errors.append('[payload] title is not "clover r157: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",

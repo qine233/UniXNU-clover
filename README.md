@@ -11161,6 +11161,91 @@ modules visible`、`kernel.macho: probe patch localized OK (6838 bytes in 35 run
 `cache gate probe linked OK (… fsig_add present, r153/r154 forms kept)`、
 `map-and-slide probe linked OK`、`cache open probe linked OK`。
 
+## v0.5.10（round157）：让 fast path 的每句话都是真的
+
+### 为什么这一轮只修 bug
+
+r156 把 25 KB/s 的读节奏拿掉了，但那条新路有几处只在**出错时**才暴露的“读数
+说谎”。面板上的帧就是这些路径写的；如果它们把失败报成成功，下一帧会把判断带到
+错误的地方。这一轮不加探针，只把四个判断改成真的。
+
+1. **CMD12 的失败不可见**：r156 的 `sendStopCommand()` 发完 CMD12 就清中断，
+   不看响应。停止没完成时卡会留在 data mode，之后每次块读都超时，而帧上没有任何
+   一行解释。现在 CMD12 按规范用 R1b（busy-check）发，等
+   `SDHCI_INT_CMD_MASK`、检查 `SDHCI_INT_RESPONSE` 与超时/CRC/INDEX 位，
+   200 ms counter 死线，失败重试一次，返回值交给调用者。
+2. **`DATA_END` 旁边的错误位被忽略**：r156 的返回式只看 `DATA_END` 与字数。
+   同一个 `INT_STATUS` 里若同时有 `DATA_CRC` / `DATA_TIMEOUT` / `DATA_END_BIT`
+   / `ADMA_ERROR`，损坏的 512 B 会被当成干净数据交给上层。新增
+   `kDataErrorMask`，任何错误位都否决这次传输；`readDataBlock`、
+   `readMultiBlock`、`writePioBlock` 三处都过它。
+3. **块偏移在 32 位里回绕**：`done * kBlockWords` 是 uint32 乘法，合法请求一旦
+   超过 16 GiB，指针会折回缓冲区开头。改成
+   `static_cast<uint64_t>(done) * kBlockWords`。当前调用者最多 32 块，但导出
+   函数自己的契约允许整段卡。
+4. **CloverBlock 的完成长度多报**：批量分支在读命令只读到一半、或
+   `writeBytes` 失败时执行 `done += read` / `done += chunk`，把从未交给调用者的
+   块算进 completion 的字节数。现在只有真正交付的读块才计入；写方向仍保留
+   已落卡的 `written` 块，那些确实到了介质。
+
+写路径（`writePioBlock`、mode 11 的识别 drain）仍保留 160 µs 节奏：写只发生在
+logfs，量小，且单块写序列是前几轮逐一验证过的。
+
+### 契约
+
+- `check-clover.py` 把新的形状写死：`sendStopCommand` 的返回类型、
+  `SDHCI_CMD_RESP_SHORT_BUSY`、`kDataErrorMask` 的使用、64 位偏移；反向断言
+  CloverBlock 里不许再出现 `done += read;`。标题改为 `clover r157:`。
+- `verify-clover-payload.py` 不需要新串：内核探针与 r153–r156 完全一致，这一轮
+  只改驱动；`cache gate probe linked` 仍要求八条 r155 串与 r156 的
+  `fsig add` 在场。
+
+### 构建与刷写
+
+```sh
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+只写 `cache`，冷启动：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round157-payload.img
+fastboot reboot
+```
+
+### 这一帧怎么读
+
+打印与 r156 完全相同，问题也不变：**`.01` 打开之后，dyld 是被头字段拒、被签名块
+读拖住，还是已经跨进 syscall 536。** 这一轮保证的是：帧上的每一行现在都能自证。
+
+1. `open .01 err=0` → `hdr .01` 三行 → `fsig rd off/len` → `fsig rd <- ms=`：
+   缓存 preflight 正常前进；`ms` 是这段 blob 的真实耗时。
+2. 有 `fsig rd off/len` 而没有 `fsig rd <-`：读仍卡住；`len` 是卡住的字节数。
+   如果在 r156 帧里这里很快、而这一帧反而出现长时间停顿，先怀疑这块控制器对
+   R1b 的完成时机；下一步把 CMD12 降回 R1 并只保留响应检查（`waitCommandSlot`
+   本来就会等 DAT inhibit）。
+3. `fsig add err=N`：blob 被内核拒，`N` 是 errno。
+4. `fsig hit=1`：这段 blob 已注册，签名不是墙。
+5. `map2 enter files=… mappings=…`：`.01` 整段 preflight 通过，dyld 进入了
+   syscall 536；`map2 <- err=0` 表示映射成功。
+6. 既没有 `fsig` 也没有 `map2`，但有 `open … err≠0`：失败的那个子缓存被点名。
+
+产物归档在 `~/clover-out/round157-*`，`round157-SHA256SUMS` 八项：
+`payload.img` 58,720,256 B（`263fa94c…`）、本地 `kernel.macho` 51,998,720 B
+（`ec6149bc…`）、卷内 `kernel.macho`（`670ed61a…`）、卷内 `unixnu.toml` 615 B
+（`aee4d4c5…`）、ADT 13,516 B（`b739a7ce…`）、`scratch-data.img` 35,888 B
+（`614b8356…`）、`trustcache` 61,408 B（`7c369ce0…`）、构建日志 4,641 B
+（`1f47b6f7…`）。两个 checker 的结果：
+`clover ok: ADT 13516 bytes, 8 cores; … 75 inline asm statements separated;
+modules visible`、`probe patch localized OK (6838 bytes in 35 runs)`、
+`cache gate probe linked OK (… fsig_add present, r153/r154 forms kept)`、
+`map-and-slide probe linked OK`、`cache open probe linked OK`。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

@@ -700,6 +700,9 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
           uint32_t written = clover_emmc_block_write(cardBlock, gBatchWords, chunk);
           __atomic_add_fetch(&gBlocksWritten, written, __ATOMIC_RELAXED);
           if (written != chunk) {
+            // The card took `written` whole blocks before the command failed;
+            // those did reach the media, so they are the only part of this chunk
+            // that is done. The rest is left for the caller to retry.
             done += written;
             status = kIOReturnError;
             break;
@@ -709,13 +712,14 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
           uint32_t read = clover_emmc_block_read(cardBlock, gBatchWords, chunk);
           __atomic_add_fetch(&gBlocksRead, read, __ATOMIC_RELAXED);
           if (read != chunk) {
-            done += read;
+            // Round157: none of these words reached the caller's buffer -- the
+            // read failed before writeBytes ran -- so r156's `done += read` told
+            // the completion that data had been delivered when it had not.
             status = kIOReturnError;
             break;
           }
           if (buffer->writeBytes(done * kBlockBytes, gBatchWords, bytes) != bytes) {
-            // The card data is already here; count the blocks that reached the caller.
-            done += chunk;
+            // Same rule: a failed copy delivers no block of this chunk.
             status = kIOReturnNoSpace;
             break;
           }

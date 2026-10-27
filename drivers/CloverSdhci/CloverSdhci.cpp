@@ -866,6 +866,12 @@ static const uint32_t kBlockWords = 128;
 // staging, large enough that a shared-cache read is 32 commands instead of 32 blocks'
 // worth of per-command overhead. SDHCI's block-count register is 16 bit, so 32 fits.
 static const uint32_t kReadChunkBlocks = 32;
+// Round157: DATA_END can be set in the same INT_STATUS word as a CRC, end-bit or
+// timeout error. r156's return expressions only asked for DATA_END, so a transfer
+// that ended in error could be reported as a clean one and the corrupt words went
+// on to the caller. Any error bit overrides the end bit.
+static const uint32_t kDataErrorMask = SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
+                                       SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR;
 
 // The generic counter, used to pace the FIFO drain. Round97 read the buffer port as fast as the
 // loop could run: the first word was the real first word ("EFI ") but the other 127 reads came
@@ -980,7 +986,8 @@ static bool readDataBlock (uint16_t command, uint32_t argument, uint32_t *words,
          (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
     words[wordCount++] = read32 (SDHCI_BUFFER);
   }
-  return (status & SDHCI_INT_DATA_END) && wordCount == kBlockWords;
+  return (status & SDHCI_INT_DATA_END) && !(status & kDataErrorMask) &&
+         wordCount == kBlockWords;
 }
 
 static bool readPioBlock (uint32_t lba, uint32_t *words, uint32_t &wordCount,
@@ -995,23 +1002,50 @@ static bool readPioBlock (uint32_t lba, uint32_t *words, uint32_t &wordCount,
 // card out of data mode. AUTO_CMD12 is deliberately not used: this host's vendor
 // state was left by the firmware and has never been asked to issue it, whereas
 // CMD12 is the same command shape every earlier round already proved.
-static void sendStopCommand (void)
+//
+// Round157: CMD12's response is R1b, so the command is issued with the busy-check
+// spelling and its completion is waited for with the same counter bound the other
+// commands use. r156 sent it, ignored the response and cleared the interrupt bits,
+// which meant a stop that never completed -- the one failure that leaves the card
+// in data mode and makes every later block read time out -- looked exactly like a
+// clean stop. One retry covers the ordinary case where the card was still busy at
+// the first attempt; if both fail the caller learns it.
+static bool sendStopCommand (void)
 {
-  if (!waitCommandSlot (true)) {
-    return;
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
   }
-  write32 (SDHCI_INT_STATUS, 0xffffffffu);
-  write32 (SDHCI_ARGUMENT, 0);
-  write16 (SDHCI_TRANSFER_MODE, 0);
-  write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (MMC_STOP_TRANSMISSION,
-                                          SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
-                                          SDHCI_CMD_INDEX));
-  for (uint32_t spins = 0; spins < kCommandSpinLimit; spins++) {
-    if (read32 (SDHCI_INT_STATUS) & SDHCI_INT_CMD_MASK) {
-      break;
+  const uint64_t deadline = frequency / 5ULL;      // 200 ms, busy period included
+  for (uint32_t attempt = 0; attempt < 2; attempt++) {
+    if (!waitCommandSlot (true)) {
+      return false;
+    }
+    write32 (SDHCI_INT_STATUS, 0xffffffffu);
+    write32 (SDHCI_ARGUMENT, 0);
+    write16 (SDHCI_TRANSFER_MODE, 0);
+    write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (MMC_STOP_TRANSMISSION,
+                                            SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC |
+                                            SDHCI_CMD_INDEX));
+    uint32_t status = 0;
+    const uint64_t start = readCounter ();
+    for (;;) {
+      status = read32 (SDHCI_INT_STATUS);
+      if (status & SDHCI_INT_CMD_MASK) {
+        break;
+      }
+      if (readCounter () - start > deadline) {
+        break;
+      }
+    }
+    write32 (SDHCI_INT_STATUS, 0xffffffffu);
+    if ((status & SDHCI_INT_RESPONSE) &&
+        !(status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT |
+                    SDHCI_INT_INDEX))) {
+      return true;
     }
   }
-  write32 (SDHCI_INT_STATUS, 0xffffffffu);
+  return false;
 }
 
 static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
@@ -1063,7 +1097,7 @@ static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
     status = read32 (SDHCI_INT_STATUS);
     if (status & (SDHCI_INT_DATA_END | SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
                   SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR)) {
-      clean = (status & SDHCI_INT_DATA_END) != 0;
+      clean = (status & SDHCI_INT_DATA_END) && !(status & kDataErrorMask);
       break;
     }
     if (readCounter () - start > deadline) {
@@ -1182,20 +1216,24 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
     if (chunk > kReadChunkBlocks) {
       chunk = kReadChunkBlocks;
     }
+    // Round157: `done * kBlockWords` was a 32-bit product, so past 16 GiB the
+    // staging pointer wrapped. The caller's contract allows any run the card
+    // owns; compute the word offset wide.
+    uint32_t *target = words + static_cast<uint64_t>(done) * kBlockWords;
     // One CMD18 for the chunk; a failed multi-block attempt falls back to the
     // single-block sequence every earlier round proved, so the device can never
     // become less readable than it was before this change.
     if (chunk >= 4) {
       uint32_t got = 0;
       uint32_t status = 0;
-      if (readMultiBlock (lba + done, words + done * kBlockWords, chunk, got, status)) {
+      if (readMultiBlock (lba + done, target, chunk, got, status)) {
         done += chunk;
         continue;
       }
     }
     uint32_t got = 0;
     uint32_t status = 0;
-    if (!readPioBlock (lba + done, words + done * kBlockWords, got, status)) {
+    if (!readPioBlock (lba + done, target, got, status)) {
       break;
     }
     done++;
@@ -1275,7 +1313,8 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
          (read32 (SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE)) {
     write32 (SDHCI_BUFFER, words[wordCount++]);
   }
-  return (status & SDHCI_INT_DATA_END) && wordCount == kBlockWords;
+  return (status & SDHCI_INT_DATA_END) && !(status & kDataErrorMask) &&
+         wordCount == kBlockWords;
 }
 
 // The write half of the pair above. Same gate: ready, measured geometry, one caller at a time with
@@ -1305,7 +1344,9 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
     }
     uint32_t handed = 0;
     uint32_t status = 0;
-    if (!writePioBlock (lba + done, words + done * kBlockWords, handed, status)) {
+    if (!writePioBlock (lba + done,
+                        words + static_cast<uint64_t>(done) * kBlockWords,
+                        handed, status)) {
       break;
     }
   }
