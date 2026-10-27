@@ -223,6 +223,14 @@ static volatile uint32_t gWindowSectors = 0;
 // reports is traffic the storage stack above it asked for, not the probe's.
 static volatile uint32_t gBlocksRead = 0;
 static volatile uint32_t gBlocksWritten = 0;
+// Round156's staging buffer: one doAsyncReadWrite call moves up to 32 blocks (16 KiB)
+// through it, so the card sees one CMD18 instead of 32 CMD17s. It is static because
+// this kernel's stack cannot hold it, and gBatchBusy is what keeps two requests from
+// sharing it -- a caller that cannot take the flag falls back to the per-block path.
+static const uint32_t kBatchBlocks = 32;
+static const uint32_t kBatchWords = kBatchBlocks * kBlockWords;
+static uint32_t gBatchWords[kBatchWords];
+static volatile uint32_t gBatchBusy = 0;
 // Round128's manifest: the first 4 KiB of userdata, as `./unixnu build userdata` writes it and as
 // drivers/NativeUfs/RootLayout.h reads it. 4096 bytes is eight of this device's 512-byte blocks,
 // and it is read through the PIO path in one request rather than eight. Entry i starts at byte 24 +
@@ -660,31 +668,88 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
     if (nblks > fitting) {
       nblks = fitting;
     }
-    uint32_t words[kBlockWords];
-    for (; done < nblks; done++) {
-      // The caller's block numbers are relative to what this device claims, and the card's are
-      // absolute; the window's first LBA is the only difference between the two.
-      uint32_t cardBlock = windowFirst + static_cast<uint32_t>(block + done);
-      if (direction == kIODirectionOut) {
-        if (buffer->readBytes(done * kBlockBytes, words, kBlockBytes) != kBlockBytes) {
-          status = kIOReturnNoSpace;
-          break;
+    // Round156: hand the card a run of blocks per call instead of one. The single-block
+    // FIFO path costs a command, a response wait and a deadline check per 512 bytes;
+    // dyld's shared cache is 3.7 GiB, so that overhead is most of what the read spends
+    // its time on. The staging buffer is static because a 16 KiB array does not belong
+    // on this kernel's stack, and the busy flag keeps two callers from sharing it.
+    // A caller that loses the flag keeps the old per-block path, so this can only make
+    // the device faster, never less able to complete a request.
+    bool batched = false;
+    for (uint32_t spins = 0; spins < 1024; spins++) {
+      uint32_t expected = 0;
+      if (__atomic_compare_exchange_n(&gBatchBusy, &expected, 1u, false,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        batched = true;
+        break;
+      }
+    }
+    if (batched) {
+      while (done < nblks) {
+        uint32_t chunk = static_cast<uint32_t>(nblks - done);
+        if (chunk > kBatchBlocks) {
+          chunk = kBatchBlocks;
         }
-        if (clover_emmc_block_write(cardBlock, words, 1) != 1) {
-          status = kIOReturnError;
-          break;
+        uint32_t cardBlock = windowFirst + static_cast<uint32_t>(block + done);
+        const uint32_t bytes = chunk * kBlockBytes;
+        if (direction == kIODirectionOut) {
+          if (buffer->readBytes(done * kBlockBytes, gBatchWords, bytes) != bytes) {
+            status = kIOReturnNoSpace;
+            break;
+          }
+          uint32_t written = clover_emmc_block_write(cardBlock, gBatchWords, chunk);
+          __atomic_add_fetch(&gBlocksWritten, written, __ATOMIC_RELAXED);
+          if (written != chunk) {
+            done += written;
+            status = kIOReturnError;
+            break;
+          }
+          done += chunk;
+        } else {
+          uint32_t read = clover_emmc_block_read(cardBlock, gBatchWords, chunk);
+          __atomic_add_fetch(&gBlocksRead, read, __ATOMIC_RELAXED);
+          if (read != chunk) {
+            done += read;
+            status = kIOReturnError;
+            break;
+          }
+          if (buffer->writeBytes(done * kBlockBytes, gBatchWords, bytes) != bytes) {
+            // The card data is already here; count the blocks that reached the caller.
+            done += chunk;
+            status = kIOReturnNoSpace;
+            break;
+          }
+          done += chunk;
         }
-        __atomic_add_fetch(&gBlocksWritten, 1u, __ATOMIC_RELAXED);
-      } else {
-        if (clover_emmc_block_read(cardBlock, words, 1) != 1) {
-          status = kIOReturnError;
-          break;
+      }
+      __atomic_store_n(&gBatchBusy, 0, __ATOMIC_RELEASE);
+    } else {
+      uint32_t words[kBlockWords];
+      for (; done < nblks; done++) {
+        // The caller's block numbers are relative to what this device claims, and the card's are
+        // absolute; the window's first LBA is the only difference between the two.
+        uint32_t cardBlock = windowFirst + static_cast<uint32_t>(block + done);
+        if (direction == kIODirectionOut) {
+          if (buffer->readBytes(done * kBlockBytes, words, kBlockBytes) != kBlockBytes) {
+            status = kIOReturnNoSpace;
+            break;
+          }
+          if (clover_emmc_block_write(cardBlock, words, 1) != 1) {
+            status = kIOReturnError;
+            break;
+          }
+          __atomic_add_fetch(&gBlocksWritten, 1u, __ATOMIC_RELAXED);
+        } else {
+          if (clover_emmc_block_read(cardBlock, words, 1) != 1) {
+            status = kIOReturnError;
+            break;
+          }
+          if (buffer->writeBytes(done * kBlockBytes, words, kBlockBytes) != kBlockBytes) {
+            status = kIOReturnNoSpace;
+            break;
+          }
+          __atomic_add_fetch(&gBlocksRead, 1u, __ATOMIC_RELAXED);
         }
-        if (buffer->writeBytes(done * kBlockBytes, words, kBlockBytes) != kBlockBytes) {
-          status = kIOReturnNoSpace;
-          break;
-        }
-        __atomic_add_fetch(&gBlocksRead, 1u, __ATOMIC_RELAXED);
       }
     }
   }

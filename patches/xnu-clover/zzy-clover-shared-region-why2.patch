@@ -1,5 +1,5 @@
 diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
-index eae8459..9b4e662 100644
+index eae8459..54e24fb 100644
 --- a/bsd/vfs/vfs_vnops.c
 +++ b/bsd/vfs/vfs_vnops.c
 @@ -372,7 +372,7 @@ out:
@@ -11,7 +11,7 @@ index eae8459..9b4e662 100644
  {
  	struct vnode *vp;
  	struct vnode *dvp;
-@@ -758,6 +758,147 @@ out:
+@@ -758,6 +758,182 @@ out:
  	return error;
  }
  
@@ -55,6 +55,16 @@ index eae8459..9b4e662 100644
 +	    strchr(clover_digits, path[plen - 2]) != NULL &&
 +	    strchr(clover_digits, path[plen - 1]) != NULL) {
 +		tag = path + plen - 3;
++	}
++	/*
++	 * clover r156: dump only the main cache and .01. r155 printed all 54
++	 * files, which is six lines each -- enough to push the tail of the
++	 * frame (the 536 entry and the map2 lines) off the screen, and the
++	 * other 52 files repeat .01's verdict anyway. The r153 open/read line
++	 * still prints for every file, so preflight order stays visible.
++	 */
++	if (strcmp(tag, "main") != 0 && strcmp(tag, ".01") != 0) {
++		return;
 +	}
 +
 +	memset(hdr, 0, sizeof(hdr));
@@ -106,6 +116,26 @@ index eae8459..9b4e662 100644
 +}
 +
 +/*
++ * clover r156: the console keeps only the tail of a long frame, and 54 cache files
++ * at two lines each would push the verdict off the panel. The main cache and .01
++ * are the two whose fate this round reads; any other file is named only when its
++ * open failed, so the first failing subcache still speaks.
++ */
++static int
++clover_cache_focus(const char *path)
++{
++	static const char clover_digits[] = "0123456789";
++	size_t length = strlen(path);
++
++	if (length >= 3 && path[length - 3] == '.' &&
++	    strchr(clover_digits, path[length - 2]) != NULL &&
++	    strchr(clover_digits, path[length - 1]) != NULL) {
++		return path[length - 2] == '0' && path[length - 1] == '1';
++	}
++	return 1;
++}
++
++/*
 + * clover r153: r151 and r152 read cn_pnbuf *before* vn_open_auth_internal ran,
 + * but NDINIT never initializes that field -- namei's first copyin is what fills
 + * it. The saved pointer was therefore whatever the freshly allocated nameidata
@@ -126,12 +156,17 @@ index eae8459..9b4e662 100644
 +	const char *path;
 +	vnode_t vp;
 +	int error;
++	int focus;
 +
 +	error = vn_open_auth_internal(ndp, fmodep, vap, authvp);
 +	path = ndp->ni_cnd.cn_pnbuf;
 +	if (path == NULL ||
 +	    (strncmp(path, clover_cache_dir, sizeof(clover_cache_dir) - 1) != 0 &&
 +	    strncmp(path, clover_cache_file, sizeof(clover_cache_file) - 1) != 0)) {
++		return error;
++	}
++	focus = clover_cache_focus(path);
++	if (!focus && error == 0) {
 +		return error;
 +	}
 +	printf("clover r153: open %s fmode=0x%x err=%d", path,

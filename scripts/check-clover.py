@@ -781,6 +781,9 @@ def check_board(errors: list) -> str:
                     "clover r153: read err=%d resid=%d hdr=%s",
                     "clover r153: check_np dyld_flags=0x%llx",
                     "clover_cache_header(vnode_t vp, const char *path)",
+                    "clover_cache_focus(const char *path)",
+                    "if (!focus && error == 0) {",
+                    'if (strcmp(tag, "main") != 0 && strcmp(tag, ".01") != 0) {',
                     "clover r155: hdr %s vp=%p len=%lld sig=%llu+%llu err=%d/%d",
                     "clover r155: hdr %s off=%u n=%u ty=%llu/%u plat=%u/%u fl=%x",
                     "clover r155: hdr %s m0=%llu/%x ml=%llu/%x subs=%u@%u")
@@ -871,6 +874,7 @@ def check_board(errors: list) -> str:
                     "clover r155: fsig mem=%p/%llu",
                     "clover r155: fsig rd off=%llu len=%llu",
                     "clover r155: fsig rd <- err=%d resid=%d ms=%llu",
+                    "clover r156: fsig add err=%d",
                     "mach_absolute_time()",
                     "(uint64_t)kernel_blob_size")
                    if needle not in text]
@@ -888,6 +892,73 @@ def check_board(errors: list) -> str:
         if read < 0 or timing < 0 or timing < read:
             errors.append(f"{fsig_probe.name} starts the clock before it prints the read: the frame "
                           "would lose the offset/length line that names the blob")
+
+    # Round156. The host measured the shipped 21H461 caches: 54 files, 3.71 GiB, a
+    # 480 KiB main stub and a .01 whose signature is 224 KiB. Reading that at the
+    # driver's old pace -- one FIFO word every 160 us, a habit from mode 12's
+    # 400 kHz identification clock -- is 25 KB/s, so what looked like a hang was
+    # the block layer itself. This round removes the pace from the read path, gives
+    # the card CMD18 runs of 32 blocks, and lets CloverBlock hand whole 16 KiB runs
+    # down instead of 512 bytes at a time. The write path keeps its proven pace:
+    # writes are rare (logfs) and the single-block sequence is what every earlier
+    # round validated. The assertions are shape, not speed: a future edit must not
+    # quietly restore the read-side gap or drop the multi-block stop command.
+    sdhci = REPO / "drivers/CloverSdhci/CloverSdhci.cpp"
+    if not sdhci.is_file():
+        errors.append("drivers/CloverSdhci/CloverSdhci.cpp is missing: the block device would "
+                      "have no FIFO path to pace")
+    else:
+        text = sdhci.read_text()
+        missing = [needle for needle in
+                   ("static const uint32_t kReadChunkBlocks = 32;",
+                    "static void sendStopCommand (void)",
+                    "static bool readMultiBlock (uint32_t lba",
+                    "SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN |",
+                    "SDHCI_TRNS_MULTI",
+                    "MMC_READ_MULTIPLE_BLOCK",
+                    "if (chunk >= 4) {",
+                    "readMultiBlock (lba + done, words + done * kBlockWords, chunk, got, status)")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp lacks {needle!r}: without the "
+                          "multi-block read the cache costs one command per 512 bytes")
+        # The read path must not carry the counter gap any more. The write path and
+        # mode 11's identification drain still use it, so only the read function is
+        # isolated and searched.
+        start = text.find("static bool readDataBlock (")
+        end = text.find("static bool readPioBlock (", start)
+        body = text[start:end] if start >= 0 and end > start else ""
+        if "const uint64_t gap" in body or "lastRead" in body:
+            errors.append("readDataBlock still paces on the counter: 160 us per FIFO word is "
+                          "25 KB/s, which is what made the 3.71 GiB cache look hung")
+        if "SDHCI_DATA_AVAILABLE" not in body:
+            errors.append("readDataBlock does not gate on SDHCI_DATA_AVAILABLE: the fast drain "
+                          "needs the level bit, not a timer")
+
+    block = REPO / "drivers/CloverBlock/CloverBlock.cpp"
+    if not block.is_file():
+        errors.append("drivers/CloverBlock/CloverBlock.cpp is missing: nothing would publish "
+                      "the card to the storage stack")
+    else:
+        text = block.read_text()
+        missing = [needle for needle in
+                   ("static const uint32_t kBatchBlocks = 32;",
+                    "static const uint32_t kBatchWords = kBatchBlocks * kBlockWords;",
+                    "static uint32_t gBatchWords[kBatchWords];",
+                    "static volatile uint32_t gBatchBusy = 0;",
+                    "__atomic_compare_exchange_n(&gBatchBusy, &expected, 1u, false,",
+                    "clover_emmc_block_read(cardBlock, gBatchWords, chunk)",
+                    "clover_emmc_block_write(cardBlock, gBatchWords, chunk)",
+                    "__atomic_store_n(&gBatchBusy, 0, __ATOMIC_RELEASE);")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"drivers/CloverBlock/CloverBlock.cpp lacks {needle!r}: the block layer "
+                          "would keep asking the card for one 512-byte block at a time")
+        # A caller that loses the busy flag must still have a path. The per-block loop
+        # is the old, proven one and its buffer is on the stack.
+        if "uint32_t words[kBlockWords];" not in text:
+            errors.append("CloverBlock lost the per-block fallback: a second caller would have "
+                          "no staging buffer and the request would fail")
 
     # Round148. Round147 shipped an unattended deadline that fired on the very first timer tick, with
     # a garbage counter in the message. The cause was not the arithmetic: the Darwin arm64 assembler
@@ -916,11 +987,10 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round155. r154's frame answered its own question with a blank: no map2 line at
-    # all, so dyld never reached syscall 536. This round asks what stopped it at
-    # .01, and the menu has to name that round.
-    if not board["payload"]["title"].startswith("clover r155:"):
-        errors.append('[payload] title is not "clover r155: ...": the menu would not name this round')
+    # Round156. r155's frame never ran, because the card was being read at 25 KB/s.
+    # The menu has to name the round that removed that pace.
+    if not board["payload"]["title"].startswith("clover r156:"):
+        errors.append('[payload] title is not "clover r156: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",

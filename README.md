@@ -11050,6 +11050,117 @@ modules visible`、`kernel.macho: probe patch localized OK (6836 bytes in 35 run
 fsig_read/fsig_done present, r153/r154 forms kept)`、`map-and-slide probe linked
 OK`、`cache open probe linked OK`。
 
+## v0.5.9（round156）：让 FIFO 按卡的速度跑
+
+### 为什么这一轮先修速度
+
+r155 的探针还没上机，用户要求不再一轮一个探针地等。宿主上能确认的事实已经足够回答
+上半截问题：把 21H461 的 `Cryptex1,SystemOS` 卷挂起来，`/System/Library/Caches/
+com.apple.dyld/` 里是 **54 个文件、3,987,406,848 B（3.71 GiB）**，`sharedRegionStart
+= 0x180000000`、`sharedRegionSize = 3,428,777,984`、`maxSlide = 0x20000000`；
+`cacheType = 2`（universal）、`cacheSubType = 1`（production）、`platform = 2`（iOS）、
+`altPlatform = 0`、`simulator = 0`。主缓存 `dyld_shared_cache_arm64` 只有 **480 KiB**
+（一个 mapping、475,136 B 的桩），`.01` 是 **114,720,768 B**，签名块
+**224 KiB**（`sig=114,491,392+229,376`）。逐字段核对过头与 SuperBlob：CD
+（`0xfade0c02`）的 `codeLimit == sigOffset`、hashType 2（SHA-256）、ident
+`com.apple.dyld.cache.arm64.universal`，全部合规——**dyld 的头部检查没有理由拒绝
+`.01`**。
+
+于是“`.01` 打开之后停住”只剩一个解释，而且不在 dyld 里：在我们自己的块设备。
+`drivers/CloverSdhci/CloverSdhci.cpp` 的 `readDataBlock` 每读一个 FIFO 字等
+`frequency / 6250`（160 µs）。这个节奏来自 round98 的 mode 12——当时卡还在
+400 kHz 的单比特识别时钟上，一个字确实要 80 µs；可实机参数是 `clover-emmc=21`，
+不做识别、不改时钟，固件把卡留在 **HS200、8-bit、200 MHz**。在这个时钟上继续
+每字等 160 µs，一个 512 B 块就是 **20.5 ms**，折算 **25 KB/s**；`.01` 的 224 KiB
+签名块要读 **9 秒**，54 个文件的签名注册是分钟级。面板看起来“停了”，其实就是
+数据在一字一字地爬。
+
+### 改了什么
+
+读路径（写路径不动，见下）：
+
+- **`readDataBlock` 去掉 counter gap**：只在 `SDHCI_PRESENT_STATE` 的
+  `DATA_AVAILABLE` 置位时从 `SDHCI_BUFFER` 取字，行尾再按同一个 level 位补扫一遍。
+  SDHCI 在 FIFO 满时会对卡反压，所以按 level 位读永远不会跑过卡；200 ms 的
+  counter deadline 保留，超时仍然返回失败。
+- **新增 `sendStopCommand()`（CMD12）与 `readMultiBlock()`（CMD18）**：
+  `BLOCK_COUNT=blocks`、`TRANSFER_MODE = READ | BLK_CNT_EN | MULTI`，数据相位
+  的 deadline 是 200 ms + 10 ms/块，收尾**总是**发 CMD12。没有用 AUTO_CMD12：
+  这块卡的 vendor 状态从来没被要求自动发过它，而 CMD12 的命令形状是前面每一轮
+  都验证过的。
+- **`clover_emmc_block_read` 改为分块**：每次最多 `kReadChunkBlocks = 32` 块
+  （16 KiB）；`chunk >= 4` 先走 CMD18，失败就退回单块 CMD17。最坏情况与改动前
+  完全一样，设备只会更能读。
+- **`CloverBlock::doAsyncReadWrite` 批量下发**：静态 16 KiB `gBatchWords`，一次
+  32 块；`gBatchBusy` 用原子 compare-exchange 保证两个调用者不共用缓冲区，抢不到
+  的调用者继续走原来的逐块路径（栈上 512 B），所以并发时不会退化成失败。
+  读、写、`gBlocksRead/Written` 的计数都保留。
+
+诊断（不增加新的问题，只把 r155 的帧缩到屏幕装得下）：
+
+- **why2 的 hdr dump 只留 main 与 `.01`**：54 个文件各六行会把帧尾的
+  `map2 enter` / `fsig add` 顶出屏幕。新增 `clover_cache_focus()`，非重点文件的
+  open 行只在**失败**时打印——第一个失败的子缓存仍会被点名。r153 的
+  `open`/`read` 格式串原样保留。
+- **why4 增加一行**：`ubc_cs_blob_add` 失败时打印
+  `clover r156: fsig add err=%d`。以前 blob 被拒只会让帧静默，与“dyld 没问”
+  无法区分。
+- `check-clover.py` 新增两组形状断言：SDHCI 的读函数里不许再出现
+  `const uint64_t gap` / `lastRead`、必须有 `SDHCI_DATA_AVAILABLE`、
+  `readMultiBlock`/`sendStopCommand`/`kReadChunkBlocks`；CloverBlock 必须有
+  批量缓冲、busy flag 和逐块回退。标题改为 `clover r156:`。
+- `verify-clover-payload.py` 的 `check_cache_gate_probe` 增加 `fsig_add` 一条。
+
+写路径（`writePioBlock`、mode 11 的识别 drain）**保留** 160 µs 节奏：写只发生在
+logfs，量小，且单块写序列是前几轮逐一验证过的；这一轮只动读。
+
+### 构建与刷写
+
+```sh
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+只写 `cache`，冷启动：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round156-payload.img
+fastboot reboot
+```
+
+### 这一帧怎么读
+
+先看**速度**，再看门：
+
+1. `open …dyld_shared_cache_arm64.01 … err=0`、`hdr .01` 三行、`fsig` 行在几秒内
+   连续出现：节流已经去掉，缓存 preflight 在正常前进。
+2. 出现 `fsig vp=… rd off=… len=…` 却迟迟没有 `fsig rd <-`：签名块读仍然卡。
+   现在 `len` 与 `ms` 会给出一手读数；如果 `ms` 仍是几十秒，瓶颈就不在我们的
+   PIO 循环，下一轮转查卡侧或签名 blob 的尺寸分布。
+3. `clover r156: fsig add err=N`：blob 被内核拒，墙在签名结构，`N` 就是 errno。
+4. `fsig hit=1`：这段 blob 已经注册过，签名不是墙。
+5. `clover r154: map2 enter files=55 mappings=…`：`.01` 整段 preflight 通过，
+   dyld 走进了 syscall 536；`map2 <- err=0` 表示映射成功，墙在 dyld 之后。
+6. 既没有 `fsig` 也没有 `map2`，但有一条 `open … err≠0`：就是那个子缓存打不开；
+   非重点文件只有失败时才打印，所以这条失败行不会被刷掉。
+
+这一帧同时回答两件事：**读得有多快**，以及 **`.01` 之后是签名、blob 还是 536**。
+
+产物归档在 `~/clover-out/round156-*`，`round156-SHA256SUMS` 八项：
+`payload.img` 58,720,256 B（`dbe05f34…`）、本地 `kernel.macho` 51,998,720 B
+（`b60664a1…`）、卷内 `kernel.macho`（`a4eb4758…`，r153/r154/r155/r156 四类探针
+都在）、卷内 `unixnu.toml` 622 B（`f7b160f2…`）、ADT 13,516 B（`53328fa7…`）、
+`scratch-data.img` 35,888 B（`614b8356…`）、`trustcache` 61,408 B
+（`7c369ce0…`）、构建日志（`024631bb…`）。两个 checker 的结果：
+`clover ok: ADT 13516 bytes, 8 cores; … 75 inline asm statements separated;
+modules visible`、`kernel.macho: probe patch localized OK (6838 bytes in 35 runs)`、
+`cache gate probe linked OK (… fsig_add present, r153/r154 forms kept)`、
+`map-and-slide probe linked OK`、`cache open probe linked OK`。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

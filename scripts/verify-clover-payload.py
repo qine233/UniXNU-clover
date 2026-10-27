@@ -328,8 +328,9 @@ def check_cache_gate_probe(kernel: bytes) -> bool:
     so dyld never reached syscall 536, and the two remaining shapes are a header field that
     preflightCacheFile rejected silently and a code-signature read still in progress. The image must
     carry the header dump (fields plus vnode_size) and the F_ADDFILESIGS_RETURN trace (entry, hit,
-    allocation, read, duration). r153's open and r154's map2 strings must survive: this round adds a
-    question, it does not replace the earlier ones."""
+    allocation, read, duration). Round156 adds one line: the blob-add failure, which is what a
+    rejected signature blob would otherwise do in silence. r153's open and r154's map2 strings must
+    survive: this round adds a question, it does not replace the earlier ones."""
     label = "kernel.macho: cache gate probe linked"
     found = {"hdr_size": b"clover r155: hdr %s vp=%p len=%lld sig=%llu+%llu err=%d/%d" in kernel,
              "hdr_layout": b"clover r155: hdr %s off=%u n=%u ty=%llu/%u plat=%u/%u fl=%x" in kernel,
@@ -338,7 +339,8 @@ def check_cache_gate_probe(kernel: bytes) -> bool:
              "fsig_hit": b"clover r155: fsig hit=1" in kernel,
              "fsig_mem": b"clover r155: fsig mem=%p/%llu" in kernel,
              "fsig_read": b"clover r155: fsig rd off=%llu len=%llu" in kernel,
-             "fsig_done": b"clover r155: fsig rd <- err=%d resid=%d ms=%llu" in kernel}
+             "fsig_done": b"clover r155: fsig rd <- err=%d resid=%d ms=%llu" in kernel,
+             "fsig_add": b"clover r156: fsig add err=%d" in kernel}
     ok = all(found.values())
     kept = (b"clover r153: open %s fmode=0x%x err=%d" in kernel and
             b"clover r154: map2 enter files=%u mappings=%u" in kernel)

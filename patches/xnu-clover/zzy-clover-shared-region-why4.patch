@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/kern_descrip.c b/bsd/kern/kern_descrip.c
-index c966085..e87ea94 100644
+index c966085..a9b7350 100644
 --- a/bsd/kern/kern_descrip.c
 +++ b/bsd/kern/kern_descrip.c
 @@ -3951,10 +3951,28 @@ sys_fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
@@ -77,3 +77,20 @@ index c966085..e87ea94 100644
  			}
  
  			if (error) {
+@@ -4036,6 +4079,16 @@ sys_fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
+ 			    blob_add_flags,
+ 			    &blob);
+ 
++			/*
++			 * clover r156: if the blob itself is rejected, every
++			 * earlier line says the read succeeded and the gate
++			 * is silent -- that silence was indistinguishable
++			 * from dyld never asking. Name the errno instead.
++			 */
++			if (error && cmd == F_ADDFILESIGS_RETURN) {
++				printf("clover r156: fsig add err=%d\n", error);
++			}
++
+ 			/* ubc_blob_add() has consumed "kernel_blob_addr" if it is zeroed */
+ 			if (error) {
+ 				if (kernel_blob_addr) {

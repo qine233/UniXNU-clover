@@ -861,6 +861,11 @@ static const uint32_t kIdentifyDivider = 255;
 static const uint32_t kCmd1Retries = 200;
 // One 512-byte block is 128 32-bit FIFO words; the buffer register is 32-bit access only.
 static const uint32_t kBlockWords = 128;
+// Round156: how many blocks one CMD18 asks for. 32 blocks is 16 KiB -- small enough
+// that the FIFO drain stays inside a single deadline and the caller's buffer needs no
+// staging, large enough that a shared-cache read is 32 commands instead of 32 blocks'
+// worth of per-command overhead. SDHCI's block-count register is 16 bit, so 32 fits.
+static const uint32_t kReadChunkBlocks = 32;
 
 // The generic counter, used to pace the FIFO drain. Round97 read the buffer port as fast as the
 // loop could run: the first word was the real first word ("EFI ") but the other 127 reads came
@@ -943,11 +948,8 @@ static bool readDataBlock (uint16_t command, uint32_t argument, uint32_t *words,
   if (frequency < 1000000ULL || frequency > 1000000000ULL) {
     frequency = 19200000ULL;
   }
-  const uint64_t gap = frequency / 6250ULL;        // 160 us, mode 12's pace
   const uint64_t deadline = frequency / 5ULL;      // 200 ms
   const uint64_t start = readCounter ();
-  uint64_t lastRead = start;
-  bool haveWord = false;
   uint32_t guard = 0;
   for (;;) {
     status = read32 (SDHCI_INT_STATUS);
@@ -955,15 +957,20 @@ static bool readDataBlock (uint16_t command, uint32_t argument, uint32_t *words,
                   SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR)) {
       break;
     }
-    uint64_t now = readCounter ();
-    if (now - start > deadline) {
+    if (readCounter () - start > deadline) {
       break;
     }
-    if (wordCount < kBlockWords && (!haveWord || now - lastRead >= gap) &&
+    // Round156: drain as fast as the level bit allows. The 160 us gap this loop
+    // used to keep came from mode 12's 400 kHz identification clock, where one
+    // word really did arrive every 80 us; it made a 512-byte block cost 20.5 ms
+    // (25 KB/s) at every later clock too. The firmware leaves this card at
+    // HS200, 8-bit, 200 MHz, and SDHCI backpressures the card whenever the
+    // buffer is full, so reading only while DATA_AVAILABLE is set can never
+    // outrun it. This is the same rule the final level-gated sweep already
+    // used -- the gap was the only thing making it slow.
+    if (wordCount < kBlockWords &&
         (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
       words[wordCount++] = read32 (SDHCI_BUFFER);
-      haveWord = true;
-      lastRead = now;
     }
     if (++guard >= kCommandSpinLimit) {
       break;
@@ -980,6 +987,102 @@ static bool readPioBlock (uint32_t lba, uint32_t *words, uint32_t &wordCount,
                           uint32_t &status)
 {
   return readDataBlock (MMC_READ_SINGLE_BLOCK, lba, words, wordCount, status);
+}
+
+// Round156: one command for several consecutive blocks. The data path is the same
+// level-gated FIFO drain readDataBlock now uses; the only new pieces are the block
+// count, the multi-block transfer mode bit and the explicit CMD12 that takes the
+// card out of data mode. AUTO_CMD12 is deliberately not used: this host's vendor
+// state was left by the firmware and has never been asked to issue it, whereas
+// CMD12 is the same command shape every earlier round already proved.
+static void sendStopCommand (void)
+{
+  if (!waitCommandSlot (true)) {
+    return;
+  }
+  write32 (SDHCI_INT_STATUS, 0xffffffffu);
+  write32 (SDHCI_ARGUMENT, 0);
+  write16 (SDHCI_TRANSFER_MODE, 0);
+  write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (MMC_STOP_TRANSMISSION,
+                                          SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                          SDHCI_CMD_INDEX));
+  for (uint32_t spins = 0; spins < kCommandSpinLimit; spins++) {
+    if (read32 (SDHCI_INT_STATUS) & SDHCI_INT_CMD_MASK) {
+      break;
+    }
+  }
+  write32 (SDHCI_INT_STATUS, 0xffffffffu);
+}
+
+static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
+                            uint32_t &wordCount, uint32_t &status)
+{
+  const uint32_t totalWords = blocks * kBlockWords;
+  wordCount = 0;
+  status = 0;
+  if (!waitCommandSlot ()) {
+    return false;
+  }
+  write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
+  write16 (SDHCI_BLOCK_SIZE, 512);
+  write16 (SDHCI_BLOCK_COUNT, static_cast<uint16_t>(blocks));
+  write32 (SDHCI_INT_STATUS, 0xffffffffu);
+  write32 (SDHCI_ARGUMENT, lba);
+  write16 (SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN |
+                                SDHCI_TRNS_MULTI);
+  write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (MMC_READ_MULTIPLE_BLOCK,
+                                          SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                          SDHCI_CMD_INDEX | SDHCI_CMD_DATA));
+  uint32_t spins = 0;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & SDHCI_INT_CMD_MASK) {
+      break;
+    }
+    if (++spins >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  if (!(status & SDHCI_INT_RESPONSE) ||
+      (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+    sendStopCommand ();
+    return false;
+  }
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  // 200 ms plus 10 ms per block: the data phase of one block at the slowest
+  // identification clock is 10.4 ms, and this bound only has to outlast the card.
+  const uint64_t deadline = frequency / 5ULL +
+                            static_cast<uint64_t>(blocks) * (frequency / 100ULL);
+  const uint64_t start = readCounter ();
+  uint32_t guard = 0;
+  bool clean = false;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & (SDHCI_INT_DATA_END | SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
+                  SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR)) {
+      clean = (status & SDHCI_INT_DATA_END) != 0;
+      break;
+    }
+    if (readCounter () - start > deadline) {
+      break;
+    }
+    if (wordCount < totalWords &&
+        (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
+      words[wordCount++] = read32 (SDHCI_BUFFER);
+    }
+    if (++guard >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  while (wordCount < totalWords &&
+         (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
+    words[wordCount++] = read32 (SDHCI_BUFFER);
+  }
+  sendStopCommand ();
+  return clean && wordCount == totalWords;
 }
 
 // The symbols drivers/CloverBlock links against. Ready and the sector count are only what
@@ -1071,15 +1174,31 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   }
   const uint64_t deadline = frequency * 2ULL;   // 2 s for the whole request
   uint32_t done = 0;
-  for (; done < blocks; done++) {
+  while (done < blocks) {
     if (readCounter () - start > deadline) {
       break;
+    }
+    uint32_t chunk = blocks - done;
+    if (chunk > kReadChunkBlocks) {
+      chunk = kReadChunkBlocks;
+    }
+    // One CMD18 for the chunk; a failed multi-block attempt falls back to the
+    // single-block sequence every earlier round proved, so the device can never
+    // become less readable than it was before this change.
+    if (chunk >= 4) {
+      uint32_t got = 0;
+      uint32_t status = 0;
+      if (readMultiBlock (lba + done, words + done * kBlockWords, chunk, got, status)) {
+        done += chunk;
+        continue;
+      }
     }
     uint32_t got = 0;
     uint32_t status = 0;
     if (!readPioBlock (lba + done, words + done * kBlockWords, got, status)) {
       break;
     }
+    done++;
   }
   __atomic_store_n (&gBlockGuard, 0, __ATOMIC_RELEASE);
   return done;
@@ -1126,7 +1245,7 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
   if (frequency < 1000000ULL || frequency > 1000000000ULL) {
     frequency = 19200000ULL;
   }
-  const uint64_t gap = frequency / 6250ULL;        // 160 us, the read path's pace
+  const uint64_t gap = frequency / 6250ULL;        // 160 us; writes are rare, keep the proven pace
   const uint64_t deadline = frequency / 5ULL;      // 200 ms
   const uint64_t start = readCounter ();
   uint64_t lastWrite = start;
