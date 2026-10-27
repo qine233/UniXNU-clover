@@ -26,6 +26,68 @@
 
 上面这张表之外，不做任何额外声称。
 
+## 当前进度：已解决 / 待解决
+
+最后一次上机是 round154（v0.5.7）：屏上没有一条 `clover r154:`，也就是 syscall
+536 没被进入。round155–round160 的内核、payload 与 userdata 镜像都只过了宿主
+校验，还没有冷刷。所以下面把「真机读到过」「已实现、等一帧」「还没解决」分开写。
+
+### 已经解决（有真机读数）
+
+| 事项 | 读到的证据 |
+| --- | --- |
+| 固件与菜单 | `uefi-clover` v0.3.10 渲染 UniXNU 菜单、读到 payload，3 秒后默认进 XNU |
+| XNU 引导链 | 内核经 `arm_init`、`machine_startup`、`vm_mem_bootstrap` 走到 `_bsd_init`；v0.2.34 的九个 `[clover] … returned` 标记里前八个逐条印出，`vfs_mountroot` 当时停在 `IOFindBSDRoot`，eMMC 驱动接上后根挂载已经通了（round137） |
+| 时钟与抢占 | round82 起 INTID 19 真的来 tick（`ticks=0x14e5`）；`select` 期限、`wait4` 唤醒和抢占第一次有依据 |
+| AMFI | `amfi-only-platform-code` 加上 `CloverPMGR` 发布的 `ApplePMGRNub` 后，AMFI 的 `No PMGR?` panic 消失，`PMGRAON` 走完读写（round83） |
+| EL0 与 syscall | mockfs 根 `rd=md0` 上 pid 1 跑进用户态；`getpid`、`open("/dev/console")`、`write`、`fork`、`wait4`、`execve` 都有读数 |
+| APFS 根 | round137 挂上 OS 卷；round150 owner 审计接受未封印的根，三模块信任缓存放行 |
+| SystemOS | round143/145 在 exec 时把 SystemOS 卷 union 到 `/`；round153 dyld 打开缓存目录、主缓存和 `.01`，三处 err=0，两个头都是 `dyld_v1   arm64` |
+| eMMC 读 | GPT 窗口发布、LBA 1 自检、单块读与单块写都在这块卡上工作过；CMD18 批量读从 round156 起才实现，尚未上机 |
+| 诊断通道 | panic 屏直写 framebuffer（不经过 tty）、无人值守的 IMEM `0x77665501` + PSCI 复位、`read-clover-log.py` 取 logfs、`decode-clover-address.py` 把地址翻成函数 |
+
+### 已实现，等一帧（round155–round160）
+
+| 轮次 | 内容 | 状态 |
+| --- | --- | --- |
+| round155（v0.5.8） | `.01` 头字段与签名 blob 的读数探针 | 未上机 |
+| round156（v0.5.9） | 读路径改 level-gated、CMD18 32 块批量、CloverBlock 16 KiB 批量 | 未上机 |
+| round157（v0.5.10） | CMD12 改 R1b、拒收 CRC/TIMEOUT/END_BIT/ADMA 损坏块 | 未上机 |
+| round158（v0.5.11） | 照 sheng 对齐 `porting.toml`/`AGENTS.md`/工作流，锁超时放宽到约 21 s | 契约层，无需上机 |
+| round159（v0.5.12） | CMD6 `HS_TIMING=1` + 8 线 + 50 MHz；第三扇 SHNGROOT `Data` 窗与 owner `/private/var` 挂载 | 未上机 |
+| round160（v0.5.13） | 宿主闸门 `verify-userdata-window.py`；镜像与内核一字未动 | 无需上机 |
+
+### 还没解决
+
+1. **dyld 共享缓存的预检**——`dyld_flags=0x0`，syscall 536 从未进入，`.01` 的
+   头字段、签名注册、映射三段还没有分开。这是现在唯一挡住 iOS 用户态的墙；
+   round155–round157 的读数就是为切它准备的。
+2. **launchd 没有执行过**——至今跑在用户态的只有探针 init；没有 launchd、没有
+   用户态守护进程。
+3. **完整 `/data` 没有解决**——现在只是 32 MiB 的 APFS scratch 种子，追加在
+   userdata 分区的两个 GPT 副本之间，不在 GPT 里；原 54.4 GB 的 userdata 内容
+   没有迁移。9.4 GB 的镜像里，OS/SystemOS 占满，Data 只有末尾的 32 MiB。
+4. **r155–round160 没有真机帧**——链路是否成立、Data 是否挂上、dyld 是否越过
+   `.01`，都要等一次冷刷。userdata 是破坏性写入，按约定需要逐次同意。
+5. **显示与 GPU**——没有 MDP5/DSI 驱动，屏幕只服务于启动诊断；Adreno 512 没有
+   驱动，没有 iOS 显示栈。
+6. **输入**——触摸（`edt-ft5406` / focaltech `fts`）没有驱动。
+7. **网络、音频、USB**——WCN3990 WiFi/蓝牙、WCD 音频、USB device 模式都没有。
+8. **电源管理**——除 AMFI 需要的那颗 nub 外，充电、电池、PMIC 都没有真正的驱动。
+9. **eMMC 高速写**——写仍是单块 160 µs/word 的 PIO 节奏；HS400、CQE、DMA 都
+   没用上，读也还是 PIO。
+10. **内核构建不可逐字节复现**——每次 prelink UUID 不同；`verify-clover-payload.py`
+    只比较两个可执行段。
+11. **存储栈形态**——没有 UFS、virtio-block 或 native verified-root；sheng 的
+    存储栈是 SM8550 专有的，不能照搬。
+
+### 下一步（按顺序）
+
+1. 冷刷 round159 的 cache payload，只问一个问题：在 50 MHz / 8 线和 Data 窗下，
+   启动走到哪一行。链路、Data、dyld 三种读数各自独立。
+2. 若链路成立、Data 挂上而 dyld 仍停在 `.01`，round161 用单变量切预检的三段。
+3. dyld 通过后再谈完整 `/data` 迁移；显示、输入、网络排在用户态启动之后。
+
 ## 这里用到的硬件事实
 
 大部分常量来自公开的设备树，在 `feeds.toml` 里钉住版本，`unixnu fetch`
@@ -11467,6 +11529,85 @@ ignored)`、`CloverSdhci linked OK`、`CloverBlock linked OK`、
 `owner SystemOS mount compiled in OK`（含新的
 `offline scratch Data mount failed: %d` 与 `native_ram_block_volume_seed`）、
 `owner root trust compiled in OK`。
+
+## v0.5.13（round160）：刷 userdata 之前，先在宿主上把它读一遍
+
+### 为什么这一轮只动宿主
+
+`fastboot flash userdata` 是这台板子上唯一会整段覆盖 54.4 GB 分区的动作，而
+round159 的镜像是 9.4 GB 的 all-RAW 稀疏文件：三扇窗（OS、SystemOS、Data）写在
+一个 SHNGROOT 清单里，Data 的 32 MiB 种子是事后追加的，清单也是事后重写的。
+清单少一条、`flags` 不是 0、种子被改过、镜像超出分区——这几种错误 fastboot 都
+会照写不误，要等内核 panic 时才知道。所以这一轮不刷机、不重编内核，也不重打
+镜像，只补一个「写之前先读一遍」的宿主闸门。
+
+### 它检查什么
+
+`scripts/verify-userdata-window.py` 按 flasher 的方式展开稀疏容器（28 字节文件
+头 + 每段 12 字节块头，只接受 `RAW`），然后检查：
+
+- 容器：magic、版本 1、头尺寸 28/12、4096 字节块、各段展开后与头部声明的
+  `total_blks` 一致、文件长度恰好等于各段之和；
+- 清单：`SHNGROOT`、版本 1、条目恰好是 `OS` + `SystemOS` + `Data`、清单自己在
+  第 4064 字节的 sha256；每条 512 字节块、扇区对齐、落在镜像内；
+- Data 这一条：`flags = 0`（可写，另外两条是 1）、32 MiB、sha256 等于钉住的
+  种子，并且必须是最后一扇窗（后面只剩备份 GPT 与卡尾）；
+- 种子本身：偏移处字节的 sha256、块 0 偏移 32 的 `NXSB`、页对齐的 APFS 块大小；
+- `--crc`：对展开后的 9.4 GB 重算 CRC-32，与稀疏头里的值比对；
+- `--apfs`：把种子落到临时文件，`hdiutil` 只读挂上，再向 `diskutil` 要
+  `VolumeUUID`，证明内核要搜的那个 UUID 真在这串字节里，而不是只在 seed.json 里。
+
+`PARTITION_BYTES` 由 `board.toml` 的 `[userdata]` 推出：
+`(0x747bfde - 0xf10520 + 1) * 512 = 54,449,765,888`，镜像超过它就拒绝。
+
+### 实跑结果
+
+对 round159 的归档跑 `--crc --apfs`：
+
+```
+verify-userdata-window: crc32 0x6c29b693 over 9416212480 bytes
+verify-userdata-window: APFS volume UUID FC1A580E-2D67-48FC-B8CF-87422A319340
+verify-userdata-window: PASS: 9416212480 bytes, 3 windows, Data 33554432 bytes at 0x22f400000, seed sha256 ef00c083fc54453c...
+```
+
+也就是：稀疏文件 9,416,215,880 B、281 个 RAW 段，展开后 9,416,212,480 B；三扇
+窗；Data 33,554,432 B 起于 `0x22f400000`；种子 sha256 `ef00c083…`；容器
+CRC-32 `0x6c29b693` 与头部一致；只读挂载得到卷 UUID `FC1A580E-…`。四项都与
+round159 构建时的记录相符。
+
+### 怎么跑
+
+```sh
+cd ~/UniXNU-clover
+scripts/verify-userdata-window.py \
+  --image ~/clover-out/round159-userdata-root.sparse.img --crc --apfs
+```
+
+`--crc` 要顺序读 9.4 GB（几十秒），`--apfs` 需要宿主允许 `hdiutil` 挂载；不加
+这两个开关时只做清单与种子的原地检查，秒级完成。`--json <path>` 可以把验证过的
+事实写成文件。
+
+### 这一轮不动镜像
+
+内核、payload、根镜像、trustcache、userdata 稀疏镜像、ADT 都没有重编，
+`~/clover-out/round159-*` 的十一项哈希与 v0.5.12 相同。`scripts/check-clover.py`
+新增一条 Round160 检查：闸门脚本必须在，且必须钉住 32 MiB、种子 sha256、卷
+UUID，必须拒绝非 RAW 段，必须要求 `Data/OS/SystemOS` 三窗，必须要求 Data 是
+最后一扇窗，必须复核 CRC 与 UUID。`porting.toml` 的 storage 区把脚本列进
+`paths` 与 `procedure`，并在 `findings` 里记下本轮的宿主读数。
+
+### 下一帧仍然只问一件事
+
+冷刷 round159 的 cache payload，读三种行：`CloverSdhci r159: link …` 证明 50 MHz
+8 线是否被卡接受，`CloverBlock r159: data vu=… bsd=…` / `seed data …` 证明 Data
+窗与 owner 种子是否到位，以及 dyld 是否越过 `.01` 预检。userdata 的写入是破坏性
+动作，命令仍只记录、未执行，需要单独同意：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round159-payload.img
+fastboot flash userdata /Users/zhouzhou/clover-out/round159-userdata-root.sparse.img
+fastboot reboot
+```
 
 ## 许可证
 

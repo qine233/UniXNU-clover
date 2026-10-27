@@ -1111,6 +1111,38 @@ def check_board(errors: list) -> str:
                               "would not match the seed, the UUID CloverBlock answers, or the "
                               "writable flags rule")
 
+    # Round160. The userdata flash is the one destructive step in this port, and it writes 9.4 GB
+    # over a 54 GB partition. The manifest, the seed and the sparse container were each checked by
+    # the builder that wrote them; the host gate has to read the container the flasher will read.
+    # scripts/verify-userdata-window.py is that gate: it expands the all-RAW sparse file by header,
+    # refuses anything but OS + SystemOS + Data with the writable flag, and hashes the Data bytes
+    # in place. The needles below are the checks that make it a gate rather than a printout.
+    verifier = REPO / "scripts/verify-userdata-window.py"
+    if not verifier.is_file():
+        errors.append("scripts/verify-userdata-window.py is missing: the 9.4 GB userdata image "
+                      "would be flashed with no host check of its manifest or Data seed")
+    else:
+        text = verifier.read_text()
+        for needle, why in (
+                ("PARTITION_BYTES = (0x747BFDE - 0xF10520 + 1) * BLOCK_BYTES",
+                 "the capacity check would not use board.toml's own partition extent"),
+                ('DATA_SHA256 = "ef00c083fc54453c4ff6062c2e6947ddbba63e96aabcfd27d2273a53e4d3918c"',
+                 "the seed bytes would not be compared with the pinned 32 MiB image"),
+                ('DATA_UUID = "FC1A580E-2D67-48FC-B8CF-87422A319340"',
+                 "the APFS volume the kernel searches for would not be named"),
+                ('if ctype != CHUNK_TYPE_RAW:',
+                 "a DONT_CARE chunk would be accepted, but the device would skip its bytes"),
+                ('if sorted(found) != ["Data", "OS", "SystemOS"]:',
+                 "a missing or extra window would pass instead of being refused"),
+                ('if data["offset"] + data["size"] != image_bytes:',
+                 "a Data window that is not last would overwrite the backup GPT's region"),
+                ('if actual != image.checksum:',
+                 "the --crc pass would not compare the container's own CRC-32"),
+                ('if uuid != DATA_UUID:',
+                 "the optional APFS check would not compare the mounted volume's UUID")):
+            if needle not in text:
+                errors.append(f"scripts/verify-userdata-window.py lacks {needle!r}: {why}")
+
     # Round148. Round147 shipped an unattended deadline that fired on the very first timer tick, with
     # a garbage counter in the message. The cause was not the arithmetic: the Darwin arm64 assembler
     # reads `;` as the comment character, so every multi-instruction asm string kept only its first
