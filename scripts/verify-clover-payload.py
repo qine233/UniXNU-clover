@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import pathlib
 import struct
@@ -32,6 +33,10 @@ LOCAL_KERNEL = pathlib.Path("/Users/zhouzhou/UniXNU/out/clover/kernel/kernel.mac
 # audited here, and kits/NativePrelink (a symlink into the UniXNU base) parses Mach-O for it.
 TREE = pathlib.Path("/Users/zhouzhou/UniXNU/out/clover/tree")
 PMGR_REPORT = TREE / "build/clover-pmgr/build-report.json"
+# Round177: the tool that turns the three fields a link cannot reproduce into functions of the rest of
+# the kernel, so two builds of one tree are one file. Imported by path, not copied, so the checker and
+# the round flow can never drift apart.
+NORMALIZER = pathlib.Path(__file__).with_name("normalize-kernel-macho.py")
 
 PAYLOADS = "Payloads"
 FILES = ["unixnu.toml", "kernel.macho", "scratch-data.img", "kernel.macho.adt",
@@ -440,6 +445,39 @@ def check_exec_sig_dump(kernel: bytes) -> bool:
     return present
 
 
+def check_kernel_normalized(kernel: bytes) -> bool:
+    """Round177 (schedule item 8): a rebuild of this tree is one image, not a near-miss.
+
+    Three fields cannot survive a link: the LC_UUID ld mints per link, the mtime a rebuild writes into
+    every object-path debug symbol's n_value, and the _PrelinkKCID that hashes the first two into
+    submission. normalize-kernel-macho.py rewrites all three as functions of the rest of the file, and
+    two real builds of the identical tree converge on sha256 86273887... The payload's copy is that
+    kernel plus the entry probes this build writes into executable text -- a step the rewrite never
+    touches -- so what is checkable on the shipped artifact is that the stamps are blank and that the
+    file still parses as the prelinked kernel the normalizer accepts rather than a stranger it refuses.
+    A payload built from an unnormalised kernel would be a file no rebuild can name."""
+    label = "kernel.macho: build-varying fields normalized"
+    if not NORMALIZER.is_file():
+        print(f"{label:42} SKIPPED (normalize-kernel-macho.py absent)")
+        return False
+    spec = importlib.util.spec_from_file_location("normalize_kernel_macho", NORMALIZER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        fields, _rest = module.collect_fields(kernel)
+    except ValueError as error:
+        print(f"{label:42} FAIL (refused: {error})")
+        return False
+    stamps = [field for field in fields if field.kind == "stamp"]
+    blank = sum(1 for field in stamps if kernel[field.start:field.end] == bytes(field.width()))
+    uuids = sum(1 for field in fields if field.kind == "uuid")
+    kcids = sum(1 for field in fields if field.kind == "kcid")
+    ok = bool(stamps) and blank == len(stamps) and uuids == 1 and kcids == 1
+    print(f"{label:42} {'OK' if ok else 'FAIL'} "
+          f"({blank}/{len(stamps)} object stamps blank, {uuids} LC_UUID, {kcids} KCID)")
+    return ok
+
+
 def check_root_mount_probe(kernel: bytes) -> bool:
     """Round144 asks why r143 left bsd_init() with an empty mountlist although vfs_mountroot()
     returned 0. The probe leaves no symbol of its own -- vfs_subr.c records which return-0 branch
@@ -775,6 +813,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_read_integrity(kernel)
         ok &= check_verdict_ring(kernel)
         ok &= check_exec_sig_dump(kernel)
+        ok &= check_kernel_normalized(kernel)
         ok &= check_unattended(kernel)
         ok &= check_inline_asm_tails(kernel)
     return 0 if ok else 1

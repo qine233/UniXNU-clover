@@ -34,7 +34,9 @@ checkpoint flush 握着块守卫，把另一颗卷上的每一次读判成 EIO�
 通道交给别人的话：驱动直接读内核自己那份 `msgbuf`，把 dyld、exec/exit、APFS、AMFI
 那些已经打印出来的行滤进同一个环——一轮新探针都不用加，屏幕滚没滚过都不再重要。
 round176 拆掉那一轮自己的代价：两个说话人不再抢同一圈 32 槽，内核的话有 kind-22 的
-512 槽，驱动的判断有 kind-21 的 64 槽，一次 `dd` 还是全拿。
+512 槽，驱动的判断有 kind-21 的 64 槽，一次 `dd` 还是全拿。round177 不看机器，只看
+构建本身：那三处「重建一定不一样」的字段被改写成文件自己算出来的值，于是同一棵树的
+两次构建交付同一个内核镜像。
 
 ### 已完成（都有真机读数）
 
@@ -68,6 +70,7 @@ round176 拆掉那一轮自己的代价：两个说话人不再抢同一圈 32 �
 | round174（v0.5.30） | 判据写进卡上，不再只留在屏上：驱动里每一句 `CloverSdhci r…` 改走 `sdhciSay`——照常 `IOLog`，同时存进 RAM 环（round176 起 128 槽暂存、卡上 64 槽）；`flushVerdictRing` 在每个已经握着块守卫的传输尾巴上最多落 4 条（每条两个 512 字节 LOG1 块），写进 logfs 第 64 扇区起、离 panic 槽很远的 kind-21 环，头字段第 8 个字带序号，所以环转完一圈宿主仍能按先后读出。环满就覆盖最旧一条并计数，绝不阻塞；写用不加守卫的单块原语，因此不可能在失败的传输里再套一层等待。宿主侧 `read-clover-log.py` 解两个窗口、`--selftest` 与驱动逐字节往返，`check-clover.py` 把它当构建闸门 | 改动全部在 round176 镜像里，与下两行同一帧读 |
 | round175（v0.5.31） | 内核自己已经说过的那句话，也搬到卡上：**一个探针都不加**。驱动在每个已经握着块守卫的尾巴上调用 `teeKernelLog`，按字节游标读内核的 `msgbuf`（`subr_prf.c:388` 把每条 `TOLOG` 字符交给 `log_putc`，`subr_log.c:554` 就是往 `msgbufp->msg_bufc` 环形写），四个字段每趟重读因为那块缓冲在 `subr_log.c:622` 之后可能被换掉；一次最多扫 4096 字节、最多落 8 条（round176 起的额度，那时是两个说话人共用一圈）。只有命中白名单的行才留（`clover r`、`CloverBlock`、`apfs`、`decmpfs`、`load code signature`、`AMFI`、`launchd`、`vm_fault`、`shared_region`、`panic`，round176 又补 `cs_blob`、`dyld`、`mountroot`、`rootvp`——四条都在 XNU 源码里逐字核过），驱动自己的 `CloverSdhci ` 行直接跳过。抄进来的行走 `ringPush(kRingKernel)`，驱动自己的状态行走 `ringPush(kRingDriver)`，**都不过 `IOLog`**：守卫里再拿一次 `bsd_log_lock` 是给自己造死锁机会，而且抄进来的话再打印出去会被自己再抄一遍。校验（magic/size/bufx/必须落在内核 VA 之上）不过就只报一次 `tee refuses reason=`，缓冲搬家报 `tee buffer moved`，每 256 行报一次 `tee seen= kept= throttled= lap=`（round176 起最多 12 次）。宿主侧 `read-clover-log.py` 按行首前缀分 `driver`/`kernel` 两种来源，`--tee` 与 `--driver` 各取一边 | 改动全部在 round176 镜像里，与下一行同一帧读 |
 | round176（v0.5.32） | 拆掉 round175 自己记下的那笔代价：**一圈 32 槽、两个说话人**——`load code signature error 4` 每次 exec 一行，一个忙着起不来的守护进程能在卡看见之前把驱动的判据挤出环。改的是几何而不是指针：驱动环 kind 21 从 logfs 第 64 扇区起 64 槽、每趟最多落 4 条，内核日志环 kind 22 从第 192 扇区接上、512 槽、每趟最多落 8 条，RAM 侧一圈 128 槽暂存、序号各自从 0 走。tee 自己的状态行（`tee armed`、`tee seen=`、`tee refuses`）故意留在驱动环，于是内核环的意思唯一：里面只有 kernel 说的话，宿主可以反问 `--tee --driver` 必须为 0，非 0 就是 tee 在抄自己。两圈首尾相接（64 + 2×64 = 192、192 + 2×512 = 1216），`run-clover-unattended.sh` 一次 `dd` 1216 个扇区仍然只拉一次 | **已构建**，待冷刷 |
+| round177（v0.5.33） | 结掉排期里的「内核构建不可逐字节复现」：镜像现在是这棵树的纯函数。`scripts/normalize-kernel-macho.py` 把三处链接不可复现的字段——ld 每次链接生成的 `LC_UUID`、962 个 object-path 调试符号 `n_value` 里那个 `.o` mtime、`emit_prelink.py` 用前两者哈希出来的 `_PrelinkKCID`——改写成「文件其余内容 sha256 的派生值」，长度一字不差、幂等。同一棵树两次独立构建（`a307b5b0…` 与 round176 的 `d274a15e…`）归一化后是同一个 `86273887…`，两份真正交付的**打过 AMFI** 的拷贝同样收敛到 `f9966b72…`。本轮不动驱动、不动 XNU 补丁，所以帧上读的还是round171–176 那一整套判据；`check-cs-blob-structure.py` 的 `cs_validate_csblob` 宿主复刻也进了闸门（14 条拒绝规则 + 真机 `launchd.macho` 必须被接受），round162 那条 `cs_blob … 85` 至此在主机侧结掉 | **已构建**，待冷刷 |
 
 round171 + round172 + round173 一帧问九件事：`read guard` 是否整批消失（守卫只等、
 不拒），
@@ -124,9 +127,7 @@ throttled=` 回答，它自己不再被挤。
    verdict 环里读出来，而不是等一张恰好拍到它的照片。HS400/CQE 等这几数真的落地再定。
    被闸门挡在 DMA 之外的还有 panic 屏与 bring-up 报告的两块写：最后那句话不该
    依赖本轮任何标志。
-8. **内核构建不可逐字节复现** — 每次 prelink UUID 不同；`verify-clover-payload.py`
-   只比较两个可执行段。
-9. **存储栈形态** — 没有 UFS、virtio-block 或 native verified-root；sheng 的存储栈
+8. **存储栈形态** — 没有 UFS、virtio-block 或 native verified-root；sheng 的存储栈
    是 SM8550 专有的，不能照搬。
 
 ## 关键硬件事实
@@ -199,6 +200,10 @@ SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" ./unixnu build kernel
 ./unixnu build package
 cd ../UniXNU-clover && python3 scripts/make-clover-root.py   # md0/mockfs 根 + trust cache
 cd ../UniXNU
+python3 ../UniXNU-clover/scripts/patch-clover-amfi.py \
+  out/clover/kernel/kernel.macho ~/clover-out/roundNNN-kernel-amfi.macho
+python3 ../UniXNU-clover/scripts/normalize-kernel-macho.py \
+  ~/clover-out/roundNNN-kernel-amfi.macho
 ./unixnu build payload --unique-chip-id 0x<device seed> --uefi ../mu-clover \
   --kernel ~/clover-out/roundNNN-kernel-amfi.macho \
   --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
@@ -207,7 +212,7 @@ cd ../UniXNU
   --dtb ../mu-clover/Resources/DTBs/clover.dtb --ramdisk none
 ```
 
-四条必须照办，否则构建会静默产出错的镜像：
+五条必须照办，否则构建会静默产出错的镜像：
 
 1. **先 kernel，再 payload。** payload 里那两半都从内核产物取。
 2. **payload 必须带 `--kernel …-kernel-amfi.macho`。** 每次重建内核，AMFI 的两处
@@ -220,6 +225,12 @@ cd ../UniXNU
    塞进 boot 镜像，而这块板子的固件根本看不见 ramdisk 里的卷。产物是
    `out/clover/boot/boot.img`，它是 boot 分区唯一需要的命令（`unixnu` 没有
    `build boot`）。
+5. **打完 AMFI 补丁、进 payload 之前，归一化一次。** round177 起
+   `scripts/normalize-kernel-macho.py` 把链接产物里那三处「重建不复现」的字段——
+   ld 每次链接生成的 `LC_UUID`、每个 object-path 调试符号 `n_value` 里那个 `.o`
+   mtime、以及 `emit_prelink.py` 用前两者哈希出来的 `_PrelinkKCID`——改写成「文件
+   其余内容的纯函数」。顺序是有意义的：先归一化再打 AMFI，那 8 个指令字节就落在
+   身份字段已经哈希过的范围之外。它不改任何可执行段，也不动长度。
 
 补丁层的硬规则：`build-xnu-4k-baseline.sh` 按文件名排序逐个
 `git apply --reverse --check`（已在树上就跳过），否则 `--check` + `apply`，
@@ -241,7 +252,7 @@ Xcode 的 clang 在重建归档时不带 `-isysroot` 会拿 macOS SDK 编 iOS �
 
 ```sh
 python3 scripts/check-clover.py            # 板级预检（= [firmware] preflight）
-python3 scripts/verify-clover-payload.py   # 归档对镜像：23 项形状与探针断言
+python3 scripts/verify-clover-payload.py   # 归档对镜像：24 项形状与探针断言
 python3 scripts/verify-userdata-window.py  # 刷 userdata 前的宿主闸门（展开 sparse、SHNGROOT、APFS 只读挂载）
 ```
 
@@ -262,6 +273,16 @@ python3 scripts/verify-userdata-window.py  # 刷 userdata 前的宿主闸门（�
 上互相咬住，否则「卡上有记录」和「宿主读得出」会是两套说法。自测里两圈各装各的
 行——驱动环只有 `CloverSdhci ` 开头的，内核环只有不是的——并按序号还原转完一圈的
 先后，`--tee`/`--driver` 的分流与「读错圈要报错」也在这一道上验一次。
+
+round177 起同一道闸门还咬住两件宿主侧的事。`check-clover.py` 现在会真的执行
+`normalize-kernel-macho.py --selftest`（同内容的两份合成构建必须收敛、三处字段之外
+一个字节都不许动、形状变了的内核必须被拒绝而不是被顺手改写）和
+`check-cs-blob-structure.py --selftest`（宿主复刻的那条 `cs_validate_csblob` 必须按
+`ubc_subr.c` 的行号顺序拒绝，并且真机要交给 launchd 的那份 `launchd.macho` 必须被
+它接受）；`verify-clover-payload.py` 的新项则用同一个解析器把**卷内**内核的字段表
+再走一遍，要求 962 个 object-path 时间戳全为零、`LC_UUID` 与 `_PrelinkKCID` 各只
+有一处——于是一个没归一化就进 payload 的构建会在这里失败，而不是等下一轮才发现两
+次构建对不上。
 
 ## 上机
 

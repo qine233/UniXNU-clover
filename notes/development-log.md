@@ -12758,3 +12758,82 @@ ADT `14009426ad2d2c54…`、`scratch-data.img` `614b8356…`（未变）、trust
 fastboot flash cache /Users/zhouzhou/clover-out/round176-payload.img
 fastboot reboot
 ```
+
+## round177（v0.5.33）：内核镜像是它源码的纯函数
+
+排期里那条「内核构建不可逐字节复现」长期只有一句解释：每次 prelink UUID 不同，所以
+`verify-clover-payload.py` 只能比两个可执行段。本轮先把它量出来。同一棵树、两次独立
+构建——round176 归档里那份 shipped prelink 内核，和本轮重编的一份——各
+**52,043,776 字节**，尺寸一字不差，`cmp -l` 报 **3,861 字节**不同。差异不是散在镜像里，
+而是三类字段：
+
+- **962 个 object-path 调试符号（`n_type` 0x66）的 `n_value` 低半字**。链接器把每个
+  `.o` 的 mtime 写进 nlist；两份构建的样本是 1793140327 与 1793138688，差 1,639 秒，
+  正好是两次构建之间的间隔。962 颗里真正变过的只有 50 颗——重编只重做十二颗板级归档
+  和被板级补丁改写的 XNU 文件，其余 `.o` 保住了自己的章。这解释了一个反直觉的数：
+  277,620 个符号只产生 50 处差异。
+- **16 字节的 `LC_UUID`**：ld 每次链接生成，A 那份是
+  `3970E02D-EBB8-3997-BA72-EED46D95770C`。
+- **22+2 字节的 `<key>_PrelinkKCID</key><data>`**，在 `__PRELINK_INFO` 里，由
+  `kits/NativePrelink/emit_prelink.py` 算 `sha256(native + original)[:16]`。它本身是
+  确定性的**函数**，之所以跟着动，只因为上面两项进了它的哈希。
+
+上游早就知道这三兄弟：`scripts/check-prelink-rebuild-equivalence.py` 归零的正好就是
+这三类，然后比较，结论是「保留执行过的那份镜像」。那句话回答的是「重建改变行为了吗」，
+它没有回答「重建能不能产出同一个文件」——本轮补的是后者。
+
+**配方**（`scripts/normalize-kernel-macho.py`，顺序自洽）：把 962 个 nlist 时间戳、
+`LC_UUID` 的 16 字节、KCID 的 base64 串全部归零取 preimage；`digest = sha256(preimage)`；
+`LC_UUID = digest[0:16]` 并把版本位置成 3、variant 位置成 10（保持 ld 写出的形状，因为
+一个会拒 UUID 的消费者不是我们能把内核交出去的消费者）；`KCID = base64(digest[16:32])`
+——22 个字符加 `==`，与被替换那串同宽，所以整趟改写一个字节载荷都不移动。归一化后的
+文件是自身归一化的不动点，因此 `--check` 就是全部闸门。
+
+**为什么这三处可以动**：kernelcollection 的信任是可对可执行段（`__TEXT_EXEC`、
+`__PLK_TEXT_EXEC`）算的 cdhash，ADT 不看 Mach-O 身份字段，设备从不解析自己的符号表——
+那些 stab 是给「手上有 `.o` 的宿主」用的，而重建恰恰让这句话不再成立。`board.toml`
+里唯一的内核哈希钉的是苹果原生 kernelcache 的 `kernelcache_sha256`，不是我们这份。
+
+**结果**：`--prove` 两份 prelink 构建 → `normalized sha256 86273887…`，
+`PROVE PASS: both builds of this tree are one image of 52043776 bytes`。更关键的是交付件
+本身：round176 打过 AMFI 的拷贝（`a8e32ccd…`）与本轮打过 AMFI 的拷贝（`0a4e6886…`）
+也收敛到同一个 `f9966b72…`——AMFI 补丁按签名字节搜索，本轮命中的是
+file `0x1a880e4`/`0x1a8816c`（round163 时是 `0x1a830e4`，链接布局挪过），两处字照旧
+`0x34000229 -> 0x14000011`、`0x36000520 -> 0xD503201F`。所以「树 → 内核镜像」整条是纯
+函数，除了 payload 构建那次可执行段内的探针涂写。
+
+顺带把 round162 那条线在主机侧结掉：`scripts/check-cs-blob-structure.py` 是
+`cs_validate_csblob` 的逐行复刻（494 长度、383 页位移、572 槽偏移、619 签名槽 magic
+都按 `ubc_subr.c` 的行号报），`--selftest` 14 条规则全中，四个真实二进制——launchd、
+logd、dasd、mount——全部被接受。也就是说当初那句 `validated cs_blob object: 85`
+不是宿主判据看错了 blob 的形状，帧里真正的墙是 flush 与读路径，那部分从 round171 起
+已经在改。
+
+**契约与构建。** 归一化排在 `patch-clover-amfi.py` 之后、`build payload` 之前，
+`AGENTS.md` 与 README 的构建块都写进去了，checker 反向钉这个顺序（先归一化再打补丁，
+那 8 个指令字节就落在身份字段已经哈希过的范围之外）。`check-clover.py` 新增一节：
+断言 `normalize-kernel-macho.py` 有 `zeroed`/`derived_uuid`/`is_normalised`/三处拒绝分支，
+并真的执行它的 `--selftest`；`check-cs-blob-structure.py --selftest` 同样被当闸门执行，
+且要求真机那份 `build/clover-root/launchd.macho` 被复刻接受。
+`verify-clover-payload.py` 多一项 `kernel.macho: build-varying fields normalized`——
+用同一个解析器把**卷内**内核的字段表再走一遍，要求 962 个时间戳全零、`LC_UUID` 与
+KCID 各只有一处；于是「忘了归一化就进 payload」的构建会在这里失败。
+
+产物：round177 prelink `a307b5b0…`（对照 round176 的 `d274a15e…`）、归一化交付内核
+`f9966b72…`、payload `5d86bbaa…`（58,720,256 字节）、卷内 kernel `348049f1…`、
+`unixnu.toml` `d53c37e3…`（标题变所以变）、ADT `4113f39c…`、`scratch-data.img`
+`614b8356…`（未变）、trustcache `7c369ce0…`（未变）。入口探针仍是
+`6844 bytes in 37 runs`，另有 `3861 outside executable text ignored`——那个数正是本轮
+归一化前的构建差异数，两项在同一行里对上了。`check-clover.py`、
+`read-clover-log.py --selftest`、`normalize-kernel-macho.py --selftest`、
+`check-cs-blob-structure.py --selftest`、`verify-clover-payload.py` 24 项全 OK。
+
+本轮不含任何驱动或 XNU 补丁改动，所以这一帧要读的还是 round171–176 那九件判据加两圈
+环的内容，没有新问题要问；它只是让「刷进去的这份内核」第一次可以用一次重建来核对。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round177-payload.img
+fastboot reboot
+```

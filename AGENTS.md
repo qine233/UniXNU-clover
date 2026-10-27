@@ -32,6 +32,10 @@ Run from the UniXNU checkout:
 ./unixnu defconfig clover_defconfig --device ../UniXNU-clover
 ./unixnu status --device ../UniXNU-clover --json
 ./unixnu build kernel --device ../UniXNU-clover
+python3 ../UniXNU-clover/scripts/patch-clover-amfi.py \
+  out/clover/kernel/kernel.macho ~/clover-out/roundNNN-kernel-amfi.macho
+python3 ../UniXNU-clover/scripts/normalize-kernel-macho.py \
+  ~/clover-out/roundNNN-kernel-amfi.macho
 ./unixnu build payload --device ../UniXNU-clover --unique-chip-id HEX \
   --uefi ../mu-clover \
   --kernel PATH/roundNNN-kernel-amfi.macho \
@@ -42,6 +46,17 @@ Run from the UniXNU checkout:
 Build the kernel before the payload, and pass the kernel re-patched by
 `scripts/patch-clover-amfi.py`: every fresh prelink restores the two AMFI
 branches to stock, so the plain kernel would ship the wrong policy.
+
+Normalise that patched kernel before the payload build. A link cannot reproduce
+three fields: the `LC_UUID` the linker mints, the mtime each object-path debug
+symbol carries in `n_value`, and the `_PrelinkKCID` that hashes the first two.
+Two builds of this identical tree differ in exactly those -- 3,861 bytes of
+52,043,776 -- and after this step they are one file. Nothing in the boot
+contract reads them: kernelcollection trust is a cdhash over the executable
+segments, and the device never parses its own symbol table. The step goes after
+`patch-clover-amfi.py`, because the patcher moves bytes the identity fields
+would otherwise have to describe; `--check` verifies without rewriting and
+`--prove A B` asserts two builds of one tree converge.
 
 After changing the board description or a driver, run both checks:
 

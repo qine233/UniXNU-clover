@@ -1189,8 +1189,8 @@ def check_board(errors: list) -> str:
                       "watchdog would also cut the observation short")
     # Round176. The menu has to name the round under test: the payload and its readings have to agree
     # about which round is on the card, or an image would be claiming a round it does not run.
-    if not board["payload"]["title"].startswith("clover r176:"):
-        errors.append('[payload] title is not "clover r176: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r177:"):
+        errors.append('[payload] title is not "clover r177: ...": the menu would not name this round')
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -1772,6 +1772,83 @@ def check_board(errors: list) -> str:
             if needle not in text:
                 errors.append(f"{amfi_patch.name} lacks {needle[:16]}...: one AMFI deny branch "
                               "would survive the payload build")
+    # Round177 (schedule item 8): a rebuild of this tree is now a byte-for-byte repeat, because the
+    # three fields a link cannot reproduce -- the linker's LC_UUID, one mtime per object-path debug
+    # symbol, and the kernel-collection id that hashes those two -- are rewritten as functions of the
+    # rest of the file.  Measured on two real builds of the identical tree: 52,043,776 bytes each, 3,861
+    # of them build-varying, and after normalisation one image (sha256 86273887...).
+    normalizer = next((base / "scripts/normalize-kernel-macho.py"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "scripts/normalize-kernel-macho.py").is_file()), None)
+    if normalizer is None:
+        errors.append("scripts/normalize-kernel-macho.py is missing: the round's kernel would stay "
+                      "a file two builds of one tree cannot agree on")
+    else:
+        text = normalizer.read_text()
+        for needle in ("N_SO = 0x66", "LC_UUID = 0x1B", "KCID_PATTERN", "def zeroed(",
+                       "def derived_uuid(", "def is_normalised(", "def collect_fields(",
+                       "--prove", "--check", "--selftest", "STAMP_WIDTH",
+                       "expected exactly one _PrelinkKCID", "normalisation moved the file length"):
+            if needle not in text:
+                errors.append(f"{normalizer.name} lacks {needle[:28]}: the rewrite would no longer be "
+                              "the three fields, their ordering or its own idempotence")
+        # Refusing a kernel whose metadata moved shape is the whole safety argument: a silent
+        # short read would normalise a stranger and hand it to the boot contract.
+        for needle in ("not an ARM64 Mach-O", "runs past the file", "width changed"):
+            if needle not in text:
+                errors.append(f"{normalizer.name} lacks the refusal {needle[:20]}: a malformed kernel "
+                              "would be rewritten instead of rejected")
+        check = subprocess.run([sys.executable, str(normalizer), "--selftest"],
+                               capture_output=True, text=True)
+        if check.returncode:
+            errors.append("normalize-kernel-macho.py --selftest failed: two builds of one tree would "
+                          "not converge\n" + (check.stdout + check.stderr)[-700:])
+    # Round177 also closes the round162 thread on the host: cs_blob … 85 was read as a signature the
+    # kernel refused, and the replica of ubc_subr.c's structure walk says the shipped validator accepts
+    # the binaries on this card. Keep the replica under test, or the next round mistakes a host that
+    # agrees with itself for a host that agrees with XNU.
+    csblob = next((base / "scripts/check-cs-blob-structure.py"
+                   for base in (REPO, pathlib.Path.cwd())
+                   if (base / "scripts/check-cs-blob-structure.py").is_file()), None)
+    if csblob is None:
+        errors.append("scripts/check-cs-blob-structure.py is missing: nothing would separate a refused "
+                      "code directory from the reads that round164 blamed on it")
+    else:
+        text = csblob.read_text()
+        for needle in ("def validate_csblob(", "def validate_codedirectory(", "Reject(494,",
+                       "Reject(383,", "Reject(572,", 'ubc_subr.c:%d', "CSSLOT_CODEDIRECTORY",
+                       "native4k", "--selftest", "% len(replayed)"):
+            if needle not in text:
+                errors.append(f"{csblob.name} lacks {needle[:28]}: the replica would no longer be the "
+                              "walk the kernel performs, at the lines that walk performs")
+        check = subprocess.run([sys.executable, str(csblob), "--selftest"],
+                               capture_output=True, text=True)
+        if check.returncode:
+            errors.append("check-cs-blob-structure.py --selftest failed: the host replica and "
+                          "ubc_subr.c's order of rejection no longer agree\n"
+                          + (check.stdout + check.stderr)[-700:])
+        root = REPO / "build/clover-root/launchd.macho"
+        if root.is_file():
+            check = subprocess.run([sys.executable, str(csblob), str(root)],
+                                   capture_output=True, text=True)
+            if check.returncode:
+                errors.append("the shipped launchd.macho would be refused by the validator's own "
+                              "structure rules, so 'cs_blob 85' is not a host replica problem\n"
+                              + (check.stdout + check.stderr)[-500:])
+    # The step has to sit in the recipe between the AMFI patch and the payload build: normalising
+    # first would let the patcher move bytes the identity fields had already hashed, and the shipped
+    # image would be its own normalisation's neighbour again.
+    recipe = REPO / "AGENTS.md"
+    if recipe.is_file():
+        agent_text = recipe.read_text()
+        for needle in ("normalize-kernel-macho.py", "roundNNN-kernel-amfi.macho"):
+            if needle not in agent_text:
+                errors.append(f"AGENTS.md lacks {needle[:24]}...: the build order would live only in "
+                              "the log, and the next round would skip the normalisation")
+        if "normalize-kernel-macho.py" in agent_text and not (
+                agent_text.find("normalize-kernel-macho.py") < agent_text.find("build payload")):
+            errors.append("AGENTS.md does not put the normalisation before the payload build: "
+                          "a payload built from an unnormalised kernel is not reproducible")
     verifier = next((base / "scripts/verify-clover-payload.py"
                      for base in (REPO, pathlib.Path.cwd())
                      if (base / "scripts/verify-clover-payload.py").is_file()), None)
@@ -1785,7 +1862,12 @@ def check_board(errors: list) -> str:
                        "CloverSdhci r171: write cache size=",
                        "CloverSdhci r172: dmacheck lba=", "DMA_INTEGRITY",
                        "CloverSdhci r173: wrcheck lba=", "WRITE_DMA_INTEGRITY",
-                       "check_exec_sig_dump", "clover r166: sig n=%u"):
+                       "check_exec_sig_dump", "clover r166: sig n=%u",
+                       # Round177: the verifier has to look at the shipped kernel's identity fields,
+                       # not only at the round's strings, or a payload built from a plain kernel would
+                       # still pass every needle here.
+                       "check_kernel_normalized", "normalize_kernel_macho",
+                       "object stamps blank"):
             if needle not in text:
                 errors.append(f"{verifier.name} lacks {needle}: the release could ship with an "
                               "unchecked kernel half")
