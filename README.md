@@ -238,7 +238,7 @@ fastboot reboot
 ## 相关文档
 
 - [`notes/development-log.md`](notes/development-log.md) — v0.1 起逐轮的改动、
-  照片读数与推理，完整历史。
+  照片读数与推理，完整历史；新的轮次追加在文件末尾。
 - [`notes/clover-device-tree-sources.md`](notes/clover-device-tree-sources.md) —
   每个常量的来源清单，含 splash 地址的推翻过程。
 - [`porting.toml`](porting.toml) — 上游要求的 13 个 area 覆盖与证据。

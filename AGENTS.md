@@ -85,4 +85,5 @@ reversing the later patches that touch the same file.
 
 `README.md` carries the current status only. The round-by-round log of what each
 boot frame showed and what was inferred from it lives in
-`notes/development-log.md`; it is history and is not appended to.
+`notes/development-log.md`; new frames are appended there, and the README's
+progress tables are edited in place.
