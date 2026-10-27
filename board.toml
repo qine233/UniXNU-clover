@@ -167,7 +167,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r167: writes wait for the card, the cache is off, and two batches must agree before reads trust one"
+title = "clover r168: a busy card is waited for, and a refused block is retried before EIO"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

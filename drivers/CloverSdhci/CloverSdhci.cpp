@@ -1169,10 +1169,12 @@ static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
   if (frequency < 1000000ULL || frequency > 1000000000ULL) {
     frequency = 19200000ULL;
   }
-  // 200 ms plus 10 ms per block: the data phase of one block at the slowest
-  // identification clock is 10.4 ms, and this bound only has to outlast the card.
+  // 200 ms plus 50 ms per block: one block at the slowest identification clock is 10.4 ms, and a
+  // card that just finished programming can hold the data line busy before the first token. r168
+  // widened the per-block share so a busy card finishes the batch instead of falling back to a
+  // single-block sequence that meets the same delay once per block.
   const uint64_t deadline = frequency / 5ULL +
-                            static_cast<uint64_t>(blocks) * (frequency / 100ULL);
+                            static_cast<uint64_t>(blocks) * (frequency / 20ULL);
   const uint64_t start = readCounter ();
   uint32_t guard = 0;
   bool clean = false;
@@ -1268,8 +1270,15 @@ static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start)
   if (frequency < 1000000ULL || frequency > 1000000000ULL) {
     frequency = 19200000ULL;
   }
-  const uint64_t handover = frequency * 2ULL;
+  // Round168: the hand-over bound was two seconds, which this card's own write phase can exceed.
+  // The r167 frame showed APFS reporting "disk5/disks: general error" and EIO on disk1 at fixed
+  // block numbers while a single checkpoint flush took 22.7 seconds: the waiting side was giving up
+  // and turning a healthy transfer into an error. The holder's own request deadline is bounded, so
+  // a waiter only has to outlast it; thirty seconds also covers the three-sample read check.
+  const uint64_t handover = frequency * 30ULL;
   const uint64_t waitStart = readCounter ();
+  static bool guardReported = false;
+  bool reported = false;
   for (;;) {
     uint32_t expected = 0;
     if (__atomic_compare_exchange_n (&gBlockGuard, &expected, 1u, false,
@@ -1277,7 +1286,16 @@ static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start)
       start = readCounter ();
       return true;
     }
-    if (readCounter () - waitStart > handover) {
+    const uint64_t waited = readCounter () - waitStart;
+    // Round168: one line, once per boot. A frame that shows a long wait next to the APFS errors
+    // proves contention; a frame with no line and the same errors moves the wall back into the card.
+    if (!reported && !guardReported && waited > frequency / 4ULL) {
+      reported = true;
+      guardReported = true;
+      IOLog ("CloverSdhci r168: block guard waited %llu ms\n",
+             static_cast<unsigned long long> (waited * 1000ULL / frequency));
+    }
+    if (waited > handover) {
       return false;
     }
   }
@@ -1317,16 +1335,28 @@ static void checkReadPath (uint32_t lba)
   gReadCheckDone = true;
   const uint32_t words = kReadChunkBlocks * kBlockWords;
   uint32_t gotA = 0, statusA = 0, gotB = 0, statusB = 0;
-  const bool batchA = readMultiBlock (lba, gCheckBatchA, kReadChunkBlocks, gotA, statusA);
-  const bool batchB = readMultiBlock (lba, gCheckBatchB, kReadChunkBlocks, gotB, statusB);
+  // Round168: the check runs on the first 16 KiB request of the boot, which can now arrive while
+  // the card is still programming. A single refusal here must not retire the batch for the whole
+  // boot, so each sample gets the same one clean retry the read loop uses.
+  bool batchA = readMultiBlock (lba, gCheckBatchA, kReadChunkBlocks, gotA, statusA);
+  if (!batchA) {
+    batchA = readMultiBlock (lba, gCheckBatchA, kReadChunkBlocks, gotA, statusA);
+  }
+  bool batchB = readMultiBlock (lba, gCheckBatchB, kReadChunkBlocks, gotB, statusB);
+  if (!batchB) {
+    batchB = readMultiBlock (lba, gCheckBatchB, kReadChunkBlocks, gotB, statusB);
+  }
   bool single = true;
   uint32_t blocks = 0;
   for (; blocks < kReadChunkBlocks; blocks++) {
     uint32_t got = 0, status = 0;
-    if (!readPioBlock (lba + blocks, gCheckSingle + blocks * kBlockWords, got, status) ||
-        got != kBlockWords) {
-      single = false;
-      break;
+    bool ok = readPioBlock (lba + blocks, gCheckSingle + blocks * kBlockWords, got, status);
+    if (!ok || got != kBlockWords) {
+      ok = readPioBlock (lba + blocks, gCheckSingle + blocks * kBlockWords, got, status);
+      if (!ok || got != kBlockWords) {
+        single = false;
+        break;
+      }
     }
   }
   uint32_t first = 0, firstB = 0;
@@ -1381,9 +1411,11 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   // Round167: the whole-request deadline scales with the run. A flat two seconds was sized for a
   // batch that finishes in milliseconds; a request that falls back to single blocks over a large
   // APFS or dyld read can exceed it, and a truncated read is an EIO the filesystem reports as
-  // "failed to read". Five milliseconds per block on top of the two seconds is still a timeout.
-  const uint64_t deadline = frequency * 2ULL +
-                            static_cast<uint64_t>(blocks) * (frequency / 200ULL);
+  // "failed to read". Round168 widens the base to five seconds and the per-block share to 20 ms:
+  // the r167 frame showed both disks returning EIO at fixed block numbers while a checkpoint flush
+  // held the card for 22.7 seconds, and these are the blocks APFS re-asked for.
+  const uint64_t deadline = frequency * 5ULL +
+                            static_cast<uint64_t>(blocks) * (frequency / 50ULL);
   uint32_t done = 0;
   while (done < blocks) {
     if (readCounter () - start > deadline) {
@@ -1401,18 +1433,40 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
     // single-block sequence every earlier round proved, so the device can never
     // become less readable than it was before this change. Round165 adds the
     // trusted flag: the self-check above disables the batch for this boot if
-    // batch and single-block reads disagree.
+    // batch and single-block reads disagree. Round168 gives the batch one clean
+    // retry (readMultiBlock resets the data circuit on failure) before the
+    // single-block fallback, because a card that was programming when CMD18
+    // arrived refuses once and answers the second time.
+    bool chunkRead = false;
     if (chunk >= 4 && gReadBatchTrusted) {
-      uint32_t got = 0;
-      uint32_t status = 0;
-      if (readMultiBlock (lba + done, target, chunk, got, status)) {
-        done += chunk;
-        continue;
+      for (uint32_t attempt = 0; attempt < 2 && !chunkRead; attempt++) {
+        uint32_t got = 0;
+        uint32_t status = 0;
+        chunkRead = readMultiBlock (lba + done, target, chunk, got, status);
       }
     }
-    uint32_t got = 0;
-    uint32_t status = 0;
-    if (!readPioBlock (lba + done, target, got, status)) {
+    if (chunkRead) {
+      done += chunk;
+      continue;
+    }
+    // Round168: one block, three attempts, each from a reset data circuit. The old shape reported
+    // EIO after the first refusal, and APFS re-read the same block forever.
+    bool blockRead = false;
+    uint32_t lastStatus = 0;
+    for (uint32_t attempt = 0; attempt < 3 && !blockRead; attempt++) {
+      uint32_t got = 0;
+      uint32_t status = 0;
+      blockRead = readPioBlock (lba + done, target, got, status);
+      lastStatus = status;
+    }
+    if (!blockRead) {
+      // One line per direction per boot: the block that ends the request and the state it ended in.
+      static bool giveUpReported = false;
+      if (!giveUpReported) {
+        giveUpReported = true;
+        IOLog ("CloverSdhci r168: read gave up lba=%u blocks=%u done=%u st=%08x\n",
+               lba + done, blocks, done, lastStatus);
+      }
       break;
     }
     done++;
@@ -1438,7 +1492,12 @@ static bool writeSettled (uint32_t &response, uint32_t &status, uint32_t &polls)
   if (frequency < 1000000ULL || frequency > 1000000000ULL) {
     frequency = 19200000ULL;
   }
-  const uint64_t deadline = frequency / 5ULL;      // 200 ms
+  // Round168: 200 ms was the smallest wait that covered a batch on a fast link, and the r167 frame
+  // showed the card taking far longer than that for a whole checkpoint (tx_flush 22.7 s). A batch
+  // that is still programming is not a failed write -- aborting it was what turned the same blocks
+  // into "disk5: general error" and made APFS re-send them. Four seconds is beyond any working
+  // card's programming time for 16 KiB; only a stalled card reaches it.
+  const uint64_t deadline = frequency * 4ULL;      // 4 s
   const uint64_t start = readCounter ();
   while (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_INHIBIT) {
     if (readCounter () - start > deadline) {
@@ -1450,6 +1509,15 @@ static bool writeSettled (uint32_t &response, uint32_t &status, uint32_t &polls)
     waitCardReady (response, status, cardPolls);
     polls += cardPolls;
     if ((response & R1_READY_FOR_DATA) && R1_CURRENT_STATE (response) == R1_STATE_TRAN) {
+      // Round168: the card's own programming time, once per boot. A number here explains a slow
+      // flush without another measurement round.
+      static bool slowReported = false;
+      const uint64_t elapsed = readCounter () - start;
+      if (!slowReported && elapsed > frequency / 2ULL) {
+        slowReported = true;
+        IOLog ("CloverSdhci r168: write settle took %llu ms polls=%u\n",
+               static_cast<unsigned long long> (elapsed * 1000ULL / frequency), polls);
+      }
       return true;
     }
     if (readCounter () - start > deadline) {
@@ -1577,8 +1645,11 @@ static bool writeMultiBlock (uint32_t lba, const uint32_t *words, uint32_t block
   if (frequency < 1000000ULL || frequency > 1000000000ULL) {
     frequency = 19200000ULL;
   }
+  // Round168: 10 ms per block was the 400 kHz data time, but not the time a card needs to accept
+  // words while it is still programming the previous batch. 50 ms per block keeps one slow batch a
+  // batch instead of a fallback into 32 single-block writes that each hit the same wall.
   const uint64_t deadline = frequency / 5ULL +
-                            static_cast<uint64_t>(blocks) * (frequency / 100ULL);
+                            static_cast<uint64_t>(blocks) * (frequency / 20ULL);
   const uint64_t start = readCounter ();
   uint32_t guard = 0;
   bool clean = false;
@@ -1640,10 +1711,11 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
   }
   // Round167: the request deadline scales with the run. A flat two seconds was sized for one APFS
   // burst; a single-block fallback over 32 blocks, at the 400 kHz timing this card may still be
-  // on, can exceed it, and a short write is a torn checkpoint. Five milliseconds per block on top
-  // of the two seconds covers the slowest path the driver ever takes.
-  const uint64_t deadline = frequency * 2ULL +
-                            static_cast<uint64_t>(blocks) * (frequency / 200ULL);
+  // on, can exceed it, and a short write is a torn checkpoint. Round168 raises the base to ten
+  // seconds and the per-block share to 200 ms because a batch now waits for the card to finish
+  // programming, which the r167 frame measured in seconds, not milliseconds.
+  const uint64_t deadline = frequency * 10ULL +
+                            static_cast<uint64_t>(blocks) * (frequency / 5ULL);
   uint32_t done = 0;
   bool settleReported = false;
   while (done < blocks) {
@@ -1658,36 +1730,61 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
     }
     uint32_t *target = const_cast<uint32_t *>(words) +
                        static_cast<uint64_t>(done) * kBlockWords;
+    bool chunkWritten = false;
     if (chunk >= 4) {
-      uint32_t handed = 0;
-      uint32_t status = 0;
-      if (writeMultiBlock (lba + done, target, chunk, handed, status)) {
+      // Round168: a batch whose data phase completed but whose card never settled is re-sent once
+      // from a reset circuit. Writing the same blocks twice is harmless; abandoning them was what
+      // APFS saw as "disk5: general error" and re-sent itself.
+      for (uint32_t attempt = 0; attempt < 2 && !chunkWritten; attempt++) {
+        uint32_t handed = 0;
+        uint32_t status = 0;
+        if (!writeMultiBlock (lba + done, target, chunk, handed, status)) {
+          continue;
+        }
         // Round167: DATA_END is not durability. The card says READY_FOR_DATA in TRAN only after
         // the block reached its media, and a batch that never gets there is not counted as done.
         uint32_t rsp = 0, settleStatus = 0, polls = 0;
         if (writeSettled (rsp, settleStatus, polls)) {
-          done += chunk;
-          continue;
+          chunkWritten = true;
+          break;
         }
+        resetReadPath ();
         if (!settleReported) {
           settleReported = true;
           IOLog ("CloverSdhci r167: write not ready lba=%u blocks=%u rsp=%08x st=%08x "
                  "polls=%u\n", lba + done, chunk, rsp, settleStatus, polls);
         }
-        break;
       }
     }
-    uint32_t handed = 0;
-    uint32_t status = 0;
-    if (!writePioBlock (lba + done, target, handed, status)) {
-      break;
+    if (chunkWritten) {
+      done += chunk;
+      continue;
     }
-    uint32_t rsp = 0, settleStatus = 0, polls = 0;
-    if (!writeSettled (rsp, settleStatus, polls)) {
+    bool blockWritten = false;
+    for (uint32_t attempt = 0; attempt < 2 && !blockWritten; attempt++) {
+      uint32_t handed = 0;
+      uint32_t status = 0;
+      if (!writePioBlock (lba + done, target, handed, status)) {
+        continue;
+      }
+      uint32_t rsp = 0, settleStatus = 0, polls = 0;
+      if (writeSettled (rsp, settleStatus, polls)) {
+        blockWritten = true;
+        break;
+      }
+      resetReadPath ();
       if (!settleReported) {
         settleReported = true;
         IOLog ("CloverSdhci r167: write not ready lba=%u blocks=1 rsp=%08x st=%08x "
                "polls=%u\n", lba + done, rsp, settleStatus, polls);
+      }
+    }
+    if (!blockWritten) {
+      static bool giveUpReported = false;
+      if (!giveUpReported) {
+        giveUpReported = true;
+        IOLog ("CloverSdhci r168: write gave up lba=%u blocks=%u done=%u\n",
+               lba + done, blocks, done);
       }
       break;
     }

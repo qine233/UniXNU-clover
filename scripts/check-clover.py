@@ -1170,20 +1170,19 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round167. The menu has to name the round under test: writes that wait for the card, the
-    # card's write cache off, and batch reads back only once three samples agree.
-    if not board["payload"]["title"].startswith("clover r167:"):
-        errors.append('[payload] title is not "clover r167: ...": the menu would not name this round')
-    # Round167. The r166 frame moved the wall from the read path to the writable container: APFS
-    # reported "disk0s1 failed to read" and "Container corruption detected by apfs_scan_verify"
-    # after persona setup, which is the volume this driver writes. Three concrete write defects
-    # are fixed here, and the batch read returns only behind the three-way agreement:
-    #   * a completed write is confirmed with CMD13 READY_FOR_DATA in TRAN before it is counted;
-    #   * a batch whose CMD12 fails resets the data circuit instead of leaving the card in data
-    #     mode for the next request;
-    #   * single-block writes are level-gated instead of keeping the 400 kHz 160 us pace, and both
-    #     request deadlines scale with the block count;
-    #   * EXT_CSD CACHE_CTRL is turned off, because nothing here ever issues FLUSH_CACHE.
+    # Round168. The menu has to name the round under test: a busy card is waited for, and every
+    # refused block is retried before the filesystem is told the read failed.
+    if not board["payload"]["title"].startswith("clover r168:"):
+        errors.append('[payload] title is not "clover r168: ...": the menu would not name this round')
+    # Round168. The r167 frame moved the wall onto our own timeouts: APFS reported "disk5: general
+    # error" repeatedly and EIO on disk1 at two fixed block numbers, while a single checkpoint
+    # flush took 22.7 seconds. Nothing on the media changed between those reads, so the block layer
+    # was giving up while the card was programming:
+    #   * the guard hand-over was 2 s, shorter than a legitimate write burst or the read check;
+    #   * write settlement was 200 ms, and a batch that was still programming was counted as failed;
+    #   * a refused block returned EIO on the first attempt, which APFS only re-sent.
+    # Every one of those is now a wait with a bound far past the card's own time, the batch and the
+    # single block each get a clean retry, and the give-up carries the block number and INT_STATUS.
     sdhci = next((base / "drivers/CloverSdhci/CloverSdhci.cpp"
                   for base in (REPO, pathlib.Path.cwd())
                   if (base / "drivers/CloverSdhci/CloverSdhci.cpp").is_file()), None)
@@ -1196,6 +1195,12 @@ def check_board(errors: list) -> str:
                        "CloverSdhci r167: single-block reads for this boot",
                        "CloverSdhci r167: write cache size=",
                        "CloverSdhci r167: write not ready lba=",
+                       "CloverSdhci r168: block guard waited %llu ms",
+                       "CloverSdhci r168: write settle took %llu ms polls=%u",
+                       "CloverSdhci r168: read gave up lba=%u blocks=%u done=%u st=%08x",
+                       "CloverSdhci r168: write gave up lba=%u blocks=%u done=%u",
+                       "const uint64_t handover = frequency * 30ULL;",
+                       "const uint64_t deadline = frequency * 4ULL;      // 4 s",
                        "static bool writeSettled (uint32_t &response, uint32_t &status, uint32_t &polls)",
                        "static const uint32_t kExtCsdCacheCtrl = 33u;",
                        "const bool stopped = sendStopCommand ();",
@@ -1209,6 +1214,12 @@ def check_board(errors: list) -> str:
         # in milliseconds and turn a slow fallback into a short read the filesystem reports as EIO.
         if "const uint64_t deadline = frequency * 2ULL;   // 2 s for the whole request" in text:
             errors.append(f"{sdhci.name} still gives the whole read request a flat two seconds")
+        if "const uint64_t deadline = frequency * 2ULL +" in text:
+            errors.append(f"{sdhci.name} still scales a request from a flat two-second base: the "
+                          "r167 frame showed both disks erroring while a flush held the card")
+        # Round168: the two-second hand-over is what turned a wait into "general error".
+        if "const uint64_t handover = frequency * 2ULL;" in text:
+            errors.append(f"{sdhci.name} still gives up the block guard after two seconds")
         # The batch is only trusted on a three-way agreement, never unconditionally.
         if "gReadBatchTrusted = false;\n  IOLog (\"CloverSdhci r167: readcheck" in text:
             errors.append(f"{sdhci.name} still retires the batch unconditionally: r166 proved the "
