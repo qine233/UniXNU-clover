@@ -12672,3 +12672,89 @@ round171–174 那九件判据，两边都有 `seq`，所以先后仍在。要�
 出现（没出现就是通道活着）；`seen=/kept=/lap=` 三个数的比例；环里到底有没有
 `clover r154:` 或 `clover r166:` 这两种至今一次没读到的行；以及 launchd 那对
 `exec`/`exit` 在环转圈的节奏里是**继续铺开**还是反复同一批 comm。
+
+## round176（v0.5.32）：内核的话和驱动的话各自一圈
+
+round175 自己在结尾记下了它的代价：一圈 32 槽、两个说话人。这不是理论上的顾虑——
+`load code signature error 4` 从 round162 起每次 exec 一行，`ubc_subr.c:4702` 那句
+`unable to create a validated cs_blob object: %d` 每个进程一行，launchd 在拉、
+dasd 在拉、AMFI 在杀，pid 一路涨（r164 帧数到过 `Too many corpses`）。这条通道越
+接近它要回答的问题，就越先把自己的判据挤出去：驱动那九条 `readcheck`/`wrcheck`/
+`block guard waited` 里最后一条上卡的，可能正是被一轮签名错误洪流顶掉的那条。
+「谁在循环」答出来了、「驱动认为这张卡怎么样」丢掉了，这是同一圈缓冲区两侧的账。
+
+所以这一轮不加指针、不加节流，改的是几何：**两个环，各自的语言**。
+
+- **驱动环**：kind 21，logfs 第 64 扇区起，卡上 64 槽（128 个扇区，到第 191），
+  每趟尾巴最多落 4 条。这是 round174 那圈的位置和节奏，槽数从 32 翻倍，因为 tee
+  自己的状态行仍然归它。
+- **内核日志环**：kind 22，第 192 扇区接上，卡上 512 槽（1024 个扇区，到第 1215），
+  每趟最多落 8 条。512 是「一整条启动的白名单文本」的量级：r164 那种洪流里 pid 涨到
+  两百多，每进程两三行也放得下。
+- **RAM 侧**一圈 128 槽暂存、两个说话人各自的 `pending/write/cursor/seq/dropped`
+  数组，`kRingCardSlots = {64, 512}`、`kRingOffset = {64, 192}`、
+  `kRingFlushPerPass = {4, 8}`。两圈首尾相接是断言出来的，不是算出来好看的：
+  `64 + 2*64 == 192`、`192 + 2*512 == 1216`，`read-clover-log.py --selftest` 现在就
+  带着这两条 assert。
+- **`gRingBlock[5] = (which == kRingKernel) ? 22 : 21;`**——头的第 6 个字是这一圈
+  的身份。形状相同、位置相邻，kind 是宿主唯一分得开的东西，所以 decode 现在接受
+  `expect_kind`，读错一圈会报 `kind 21 != 22` 而不是安静地把驱动判据当内核文本打印出来。
+
+tee 自己的话（`tee armed`、`tee refuses`、`tee buffer moved`、每 256 行一次的
+`tee seen= kept= throttled= lap=`）**故意留在驱动环**：那是驱动在报告自己看到了什么，
+不是 kernel 说的话。这一条决定了一个可以在宿主上反问的不变量——`--tee --driver`
+必须数到 0。非 0 就意味着 tee 把 `CloverSdhci` 开头的行抄进了内核日志环，也就是它
+在抄自己；`run-clover-unattended.sh` 现在真去数它，数到就 `warn`。普查本身也加了
+封顶 `kTeeCensusMax = 12`：普查是关于 tee 的一行，不封顶就会在新环里重演 round169
+和 round170 被自己复读占满面板那件事。
+
+白名单能加了，而且加的就是那些一直只能靠照片的东西：`cs_blob`（`ubc_subr.c:4702`）、
+`dyld`、`mountroot`（`vfs_subr.c:1468` 的 `%s_mountroot failed: %d`）、`rootvp`
+（round144 那四个出口里的空表重试与认证失败措辞）。四条都是在本树源码里 grep 到
+`printf` 原句才写进去的，不是按意思猜的——猜错一个字母，这一格就永远显示「内核没说话」。
+
+代码的形状：`verdictPush` 改名 `ringPush (uint32_t which, …)`，`flushVerdictRing`
+变成 `flushRing (uint32_t which)` 的两行包装（`flushRing (kRingDriver);
+flushRing (kRingKernel);`），三个尾巴一处未动——tee 与刷环仍然只发生在已经握着块守卫
+的地方。`sdhciSay` 的尾巴是 `ringPush (kRingDriver, line, length)`，`teeConsumeLine`
+是全场唯一一句 `ringPush (kRingKernel, …)`，这条也在 checker 里数着（`!= 1` 就报错）。
+武装那行现在两句：round174 的 `verdict ring armed lba= slots=64` 之后紧跟
+`CloverSdhci r176: kernel ring armed lba=12320960 slots=512`，再是 tee 自己那句。
+
+宿主侧：`DUMP_SECTORS = 1216`（622,592 字节），`--verdict` 取 kind 21、`--tee` 取
+kind 22、`--driver` 在哪一圈上都是过滤；`run-clover-unattended.sh` 一次 `dd` 之后分
+两段解（`== verdict ring (driver lines, sectors 64..191)` 与 `== kernel-log ring (lines
+the tee copied out of msgbuf, sectors 192..1215)`），后者读空时说「这条启动早于
+round176」而不是「没有记录」。自测把两圈都造出来：驱动圈五条（含两条 tee 普查与 r176
+武装行）、内核圈四条真实形态（`load code signature error 4`、`apfs_jhash` 的 hash
+mismatch、`clover r170: check_np pid=12 comm=launchd dyld_flags=0x0`、
+`apfs_mountroot failed: 19`），断言每圈各自的生产者、断言内核圈里 `driver` 为空、
+断言读错一圈会报错、断言坏记录（和不对、前缀丢）在两圈上都仍然打印。
+
+构建：先逆撤 `zzy-clover-dyld-cache-skip`，`build-arm-driver.py CloverSdhci` 过
+`-Werror` 与 ARM64/iOS 17 目标文件审计（文件现在 6402 行，39 句走 `sdhciSay` 的判据、
+4 处 `teeSay`、5 处 `ringPush`）；内核 prelink `d274a15e7fa183b2…`（52,043,776 字节），
+AMFI 拷贝 `a8e32ccd028d947b…`（站点 `0x1a880e4` → `0x14000011`、`0x1a8816c` →
+`0xd503201f`，与 round175 同），payload `9cb713d7c603e7a6…`（56 MiB，58,720,256 字节），
+卷内 kernel `b49ee423f9cb711d…`、`unixnu.toml` `6ab0d58525faa6ff…`（标题变所以变）、
+ADT `14009426ad2d2c54…`、`scratch-data.img` `614b8356…`（未变）、trustcache
+`7c369ce0…`（未变）。入口探针 `6844 bytes in 37 runs`，与 round170 起一致——本轮没往
+内核加探针。`check-clover.py`、`read-clover-log.py --selftest`、
+`verify-clover-payload.py` 23 项全 OK；verify 那一栏改名
+`kernel.macho: verdict rings and log tee linked`，现在同时要求 `verdict ring armed lba=`、
+`kernel ring armed lba=`、`tee armed bufc=` 三句都在。checker 另外反向断言
+`verdictPush`、`gVerdictBlock`、`kVerdictSlots`、`kVerdictOffset` 四个旧名字已经不在
+驱动里——单环的形状留着当注释会变成一条没人刷的环。
+
+要读的还是 round171–175 那九件判据加一句新的：这一帧两圈都得有内容。驱动圈给
+`readcheck`/`wrcheck`/`dmacheck`/`block guard waited`/`tee seen=`；内核圈给 dyld 的
+`check_np`、r170 的 `exec`/`exit`、`cs_blob` 与 `mountroot` 的原话。分家之后第一次可以
+把两边对照着读——同一秒 launchd 在 exec 什么、同一秒驱动认为这张卡是什么状态。
+`--tee --driver` 必须为 0；不是 0 就是 tee 在抄自己，那一帧的 kernel 圈全部不可信。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round176-payload.img
+fastboot reboot
+```

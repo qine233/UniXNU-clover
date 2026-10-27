@@ -1187,10 +1187,10 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round175. The menu has to name the round under test: the payload and its readings have to agree
+    # Round176. The menu has to name the round under test: the payload and its readings have to agree
     # about which round is on the card, or an image would be claiming a round it does not run.
-    if not board["payload"]["title"].startswith("clover r175:"):
-        errors.append('[payload] title is not "clover r175: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r176:"):
+        errors.append('[payload] title is not "clover r176: ...": the menu would not name this round')
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -1512,11 +1512,11 @@ def check_board(errors: list) -> str:
     # photograph of a panel that had already scrolled: r167 lost `write cache ... off=`, r169 lost the
     # `read <stage>` lines, r170 exists because one probe's own repetition filled the screen and left a
     # whole frame unable to say whether launchd was looping. So this round gives every line the driver
-    # measures a second copy on the card -- kind 21 records in a 32-slot ring at logfs sector 64, clear
-    # of the 32 blocks the panic writer owns -- and `read-clover-log.py --verdict` reads them back from
-    # the same dd that brings the panic text. Saying something costs a format plus a memcpy: the card
+    # measures a second copy on the card -- kind 21 records in a ring at logfs sector 64, clear of the
+    # 32 blocks the panic writer owns -- and `read-clover-log.py --verdict` reads them back from the
+    # same dd that brings the panic text. Saying something costs a format plus a memcpy: the card
     # write happens only from the three request tails that already hold the block guard with an idle
-    # card, four records at a time, because a flush that held the guard is the failure r167 r168 r169
+    # card, a few records at a time, because a flush that held the guard is the failure r167 r168 r169
     # spent themselves removing. One formatter runs, and the screen and the card cannot disagree.
     sdhci_r174 = next((base / "drivers/CloverSdhci/CloverSdhci.cpp"
                        for base in (REPO, pathlib.Path.cwd())
@@ -1524,16 +1524,16 @@ def check_board(errors: list) -> str:
     if sdhci_r174 is not None:
         text = sdhci_r174.read_text()
         for needle in ("#include <stdarg.h>",
-                       "static const uint32_t kVerdictSlots = 32;",
-                       "static const uint32_t kVerdictOffset = 64;",
-                       "static const uint32_t kVerdictFlushPerPass = 4;",
+                       "static const uint32_t kRingCardSlots[kRingCount] = {64, 512};",
+                       "static const uint32_t kRingOffset[kRingCount] = {64, 192};",
+                       "static const uint32_t kRingFlushPerPass[kRingCount] = {4, 8};",
                        "static uint32_t verdictFormat (char *out, uint32_t cap, const char *fmt, va_list args)",
                        "static void sdhciSay (const char *fmt, ...)",
-                       "static bool verdictWriteRecord (const char *text, uint32_t length)",
+                       "static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length)",
                        "static void flushVerdictRing (void)",
-                       "gVerdictBlock[5] = 21;",
-                       "gVerdictBlock[8] = gVerdictSeq;",
-                       "const uint32_t lba = gVerdictFirst + kVerdictOffset +",
+                       "gRingBlock[5] = (which == kRingKernel) ? 22 : 21;",
+                       "gRingBlock[8] = gRingSeq[which];",
+                       "const uint32_t lba = gVerdictFirst + kRingOffset[which] +",
                        'IOLog ("%s\\n", line);',
                        "gVerdictFirst = entryFirst14;",
                        "gVerdictReady = 1;"):
@@ -1552,7 +1552,7 @@ def check_board(errors: list) -> str:
         if text.count("flushVerdictRing ();") < 3:
             errors.append(f"{sdhci_r174.name} flushes the verdict ring from fewer than three guarded "
                           "request tails: a boot that never reaches them keeps its readings in RAM only")
-        if "gVerdictBusy" not in text:
+        if "gRingBusy[which]" not in text:
             errors.append(f"{sdhci_r174.name} lost the re-entrancy flag: a nested flush would write one "
                           "record twice from two owners of the same scratch block")
 
@@ -1567,19 +1567,22 @@ def check_board(errors: list) -> str:
     # inserted inside an earlier patch's own added block without breaking the build's reverse-check.
     # The tee consumes a chunk per guarded pass from its own byte cursor, keeps only allowlisted lines,
     # and never re-prints one: sdhciSay would IOLog the line straight back into the buffer it is
-    # reading, and the tee would match its own echo forever. Hence verdictPush, which fills the ring.
+    # reading, and the tee would match its own echo forever. Hence ringPush, which fills a ring without
+    # speaking: the tee's yield goes into round176's kernel ring, its own state lines into the driver's.
     if sdhci_r174 is not None:
         text = sdhci_r174.read_text()
         for needle in ("#include <sys/msgbuf.h>",
                        "struct msgbuf *buffer = msgbufp;",
                        "static const uint32_t kTeeScanPerPass = 4096;",
-                       "static const uint32_t kTeePushPerPass = 4;",
+                       "static const uint32_t kTeePushPerPass = 8;",
                        'static const char *const kTeeAllowlist[] = {',
                        '"clover r",',
+                       '"cs_blob",',
+                       '"mountroot",',
                        "if (magic != MSG_MAGIC)",
                        "static void teeKernelLog (void)",
-                       "static void verdictPush (const char *line, uint32_t length)",
-                       "verdictPush (gTeeLine + start, length - start);",
+                       "static void ringPush (uint32_t which, const char *line, uint32_t length)",
+                       "ringPush (kRingKernel, gTeeLine + start, length - start);",
                        "gTeeReady = 1;",
                        '"CloverSdhci r175: tee armed bufc=%p size=%d bufx=%d\\n"'):
             if needle not in text:
@@ -1622,6 +1625,48 @@ def check_board(errors: list) -> str:
         if "if (gTeeBuffer && gTeeBuffer != base)" not in text:
             errors.append(f"{sdhci_r174.name} does not notice msg_bufc moving: kern.msgbuf can grow the "
                           "log, and a cursor into the old buffer reads freed memory")
+
+    # Round176. Round175 documented its own cost: one ring, two producers. A busy daemon prints kernel
+    # lines by the thousand -- `load code signature error 4` for every exec since r162 -- and each one
+    # evicted a driver verdict that the card had not seen yet, so the tee could answer the question and
+    # destroy the readings that decided the next round. The fix is geometric, not another pointer: two
+    # rings with their own kind, offset and per-pass budget (driver kind 21 at sector 64 with 64 slots,
+    # kernel kind 22 at sector 192 with 512), so the only thing they share is the one dd that reads both.
+    # The tee's own state lines deliberately stay in the driver ring, which makes the kernel ring mean
+    # exactly one thing and gives the host a falsifiable claim: --tee --driver must count zero.
+    if sdhci_r174 is not None:
+        text = sdhci_r174.read_text()
+        for needle in ("static const uint32_t kRingDriver = 0;",
+                       "static const uint32_t kRingKernel = 1;",
+                       "static const uint32_t kRingRamSlots = 128;",
+                       "static char gRingText[kRingCount][kRingRamSlots][kVerdictTextBytes];",
+                       "gRingBlock[7] = gRingCursor[which] % kRingCardSlots[which];",
+                       "static void flushRing (uint32_t which)",
+                       "flushRing (kRingDriver);",
+                       "flushRing (kRingKernel);",
+                       "ringPush (kRingDriver, line, length);",
+                       '"CloverSdhci r176: kernel ring armed lba=%u slots=%u\\n"',
+                       "static const uint32_t kTeeCensusMax = 12;"):
+            if needle not in text:
+                errors.append(f"{sdhci_r174.name} lacks {needle[:44]}...: round176's ring split, its "
+                              "per-ring flush budget, or the arming that lets kernel text reach the card is gone")
+        # One ring per producer means the ring is no longer single-indexed anywhere: the round174/175
+        # names have to be gone, or a line would be pushed to a buffer nothing flushes.
+        for stale in ("static void verdictPush (", "gVerdictBlock", "kVerdictSlots", "kVerdictOffset"):
+            if stale in text:
+                errors.append(f"{sdhci_r174.name} still refers to {stale}: the single-ring shape is gone, "
+                              "and a leftover of it is a ring that silently never flushes")
+        # The kernel ring must be the kernel's. teeConsumeLine is the only push with kRingKernel in it.
+        if text.count("ringPush (kRingKernel,") != 1:
+            errors.append(f"{sdhci_r174.name} pushes kernel text from {text.count('ringPush (kRingKernel,')} "
+                          "places: exactly teeConsumeLine may fill the kernel ring, or the host cannot read "
+                          "it as what the kernel said")
+        # The census is capped, because the census itself is a line the tee writes about itself and an
+        # uncapped one repeats the r169/r170 failure inside the new ring.
+        if "if (gTeeCensus < kTeeCensusMax)" not in text:
+            errors.append(f"{sdhci_r174.name} reports the tee census without a cap: a boot would fill the "
+                          "driver ring with its own bookkeeping, which is why round174 throttled the panel")
+
     reader = next((base / "scripts/read-clover-log.py"
                    for base in (REPO, pathlib.Path.cwd())
                    if (base / "scripts/read-clover-log.py").is_file()), None)
@@ -1629,20 +1674,25 @@ def check_board(errors: list) -> str:
         errors.append("scripts/read-clover-log.py is missing: nothing would read the verdict ring back")
     else:
         text = reader.read_text()
-        for needle in ('21: "verdict-21"', "VERDICT_OFFSET = 64", "VERDICT_SLOTS = 32",
+        for needle in ('21: "verdict-21"', '22: "kernel-22"', "VERDICT_OFFSET = 64",
+                       "VERDICT_SLOTS = 64", "KERNEL_OFFSET = 192", "KERNEL_SLOTS = 512",
+                       "DUMP_SECTORS = KERNEL_OFFSET + 2 * KERNEL_SLOTS",
                        '"--verdict"', 'struct.unpack_from("<9I", block)',
-                       "order_by_seq=args.verdict", "def selftest()"):
+                       "order_by_seq=kind is not None", "def selftest()"):
             if needle not in text:
-                errors.append(f"{reader.name} lacks {needle[:40]}...: the ring's slots, its sequence "
-                              "order after a wrap, or its own round-trip test would be missing")
-        # Round175: the ring now holds two producers, and the host has to be able to ask them apart --
-        # "the tee never ran" and "the tee ran and msgbuf matched nothing" are different answers.
+                errors.append(f"{reader.name} lacks {needle[:40]}...: a ring's slots, its place in the "
+                              "dump, its kind or its sequence order after a wrap would be missing")
+        # Round175: the host has to be able to ask the two producers apart -- "the tee never ran" and
+        # "the tee ran and msgbuf matched nothing" are different answers. Round176: they no longer share
+        # a ring, so what is asserted is that each ring holds only its own kind, and that reading a
+        # driver record from the kernel ring is reported rather than silently trusted.
         for needle in ('DRIVER_PREFIX = b"CloverSdhci "', "def producer(content)",
-                       '"--tee"', '"--driver"', 'said == ["driver", "driver", "kernel", "driver", '
-                       '"kernel"]'):
+                       '"--tee"', '"--driver"', "expect_kind is not None and kind != expect_kind",
+                       'assert all(producer(record[2]) == "kernel" for record in kernel), kernel',
+                       'assert [record for record in kernel if producer(record[2]) == "driver"] == [], kernel'):
             if needle not in text:
-                errors.append(f"{reader.name} lacks {needle[:40]}...: a dump could not say which of "
-                              "its ring lines came from the kernel log, so round175 would be unreadable")
+                errors.append(f"{reader.name} lacks {needle[:40]}...: a dump could not say which ring a "
+                              "line came from, so round176's split would be unreadable")
         if reader.is_file():
             check = subprocess.run([sys.executable, str(reader), "--selftest"],
                                    capture_output=True, text=True)
@@ -1654,17 +1704,25 @@ def check_board(errors: list) -> str:
                        if (base / "scripts/run-clover-unattended.sh").is_file()), None)
     if unattended is not None:
         text = unattended.read_text()
-        for needle in ("bs=512 count=128", "--verdict", "verdict line(s)"):
+        for needle in ("bs=512 count=1216", "622592", "--verdict", "verdict line(s)"):
             if needle not in text:
-                errors.append(f"{unattended.name} lacks {needle[:32]}...: the dd would stop short of "
-                              "sector 64 and the verdict ring would never be read")
+                errors.append(f"{unattended.name} lacks {needle[:32]}...: the dd would stop short of one "
+                              "of the two rings and that ring would never be read")
         # Round175: the script reports the tee's yield, because a ring of only driver lines is a
         # different finding from a ring that also carried kernel lines.
-        for needle in ("--tee --count", "from the kernel log",
+        for needle in ("--tee --count", "kernel log line(s)",
                        "brought no kernel lines"):
             if needle not in text:
                 errors.append(f"{unattended.name} lacks {needle[:32]}...: the host would not count "
                               "the kernel lines the tee brought back")
+        # Round176: both rings get their own heading, and the kernel ring is checked for the one thing
+        # that would mean the tee is copying its own readings -- an impossible count, so a nonzero one is
+        # a finding rather than a curiosity.
+        for needle in ("== kernel-log ring", "predates round176", "--tee --driver --count",
+                       "the tee is echoing"):
+            if needle not in text:
+                errors.append(f"{unattended.name} lacks {needle[:32]}...: round176's second ring would not "
+                              "be decoded, or its echo invariant would not be checked")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())

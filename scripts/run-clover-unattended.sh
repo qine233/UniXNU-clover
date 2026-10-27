@@ -18,8 +18,9 @@
 #      (a declared eMMC write, off unless asked for);
 #   3. ask the bootloader for recovery; this may write the boot command into the
 #      misc partition (BCB), which is why it needs --allow-misc-bcb;
-#   4. wait for TWRP's adb, dump the first 64 sectors of logfs through /dev/block,
-#      and decode the 16 record slots;
+#   4. wait for TWRP's adb, dump the first 1216 sectors of logfs through /dev/block,
+#      and decode the 16 report slots plus both rings in it (the driver's verdicts
+#      and, since round176, the kernel-log lines the tee copied onto the card);
 #   5. optionally return to fastboot.
 #
 # Nothing here uses `fastboot boot`: every boot of an image is a cold boot from a
@@ -174,16 +175,17 @@ twrp=$(adb shell getprop ro.twrp.version 2>/dev/null | tr -d '\r')
 device=$(adb shell getprop ro.product.device 2>/dev/null | tr -d '\r')
 say "recovery: device=${device:-?} twrp=${twrp:-?}"
 
-# Round174 reads 128 sectors, not 64: the first 32 blocks are the report/panic slots, and the
-# driver's verdict ring starts at sector 64. One dd brings back everything the card was told -- and
-# from round175 "everything" includes the kernel's own log lines, which the driver copies into that
-# ring out of msgbuf, so this single dump is now the whole reading of a boot.
+# Round176 reads 1216 sectors. The first 32 blocks are the report/panic slots, the driver's verdict
+# ring runs 64..191, and round176's kernel-log ring -- the lines the tee copies out of msgbuf, so the
+# APFS, code-signing, shared-region and exec/exit readings that used to share 32 records with the
+# driver -- runs 192..1215. One dd still brings back everything the card was told, which is the point
+# of the round: a boot's whole story, not the last 32 lines of it.
 dump_ok=0
 for source in /dev/block/bootdevice/by-name/logfs /dev/block/by-name/logfs /dev/block/mmcblk0p39; do
   say "reading $source"
-  if adb exec-out "dd if=$source bs=512 count=128" > "$OUT" 2>/dev/null; then
+  if adb exec-out "dd if=$source bs=512 count=1216" > "$OUT" 2>/dev/null; then
     size=$(wc -c < "$OUT" | tr -d ' ')
-    if [ "$size" = 65536 ] && [ "$(head -c 8 "$OUT")" = "UXNULOG1" ]; then
+    if [ "$size" = 622592 ] && [ "$(head -c 8 "$OUT")" = "UXNULOG1" ]; then
       dump_ok=1
       break
     fi
@@ -203,8 +205,10 @@ decoder="$(cd "$(dirname "$0")" && pwd)/read-clover-log.py"
 {
   echo "== report and panic window"
   python3 "$decoder" "$OUT"
-  echo "== verdict ring (round174 driver lines + round175 kernel log lines)"
+  echo "== verdict ring (driver lines, sectors 64..191)"
   python3 "$decoder" --verdict "$OUT" 2>/dev/null || echo "    no verdict records: this boot predates round174"
+  echo "== kernel-log ring (lines the tee copied out of msgbuf, sectors 192..1215)"
+  python3 "$decoder" --tee "$OUT" 2>/dev/null || echo "    no kernel-log records: this boot predates round176"
 } | tee "$OUT.txt"
 count=$(python3 "$decoder" --count "$OUT" 2>/dev/null || echo 0)
 verdicts=$(python3 "$decoder" --verdict --count "$OUT" 2>/dev/null || echo 0)
@@ -212,9 +216,16 @@ verdicts=$(python3 "$decoder" --verdict --count "$OUT" 2>/dev/null || echo 0)
 # and the ring cannot tell them apart on its own: the tee never armed (no verdict lines either), or it
 # armed and nothing in msgbuf matched the allowlist this boot.
 tee_lines=$(python3 "$decoder" --tee --count "$OUT" 2>/dev/null || echo 0)
-say "decoded: $OUT.txt ($count report record(s), $verdicts verdict line(s), $tee_lines of them from the kernel log)"
+# Round176's invariant: the tee drops every line that starts with the driver's name, so the kernel
+# ring has exactly one producer in it. A nonzero count here means the tee is copying its own readings
+# out of msgbuf -- which it can only do if a line the driver said reached the kernel log at all.
+echo_lines=$(python3 "$decoder" --tee --driver --count "$OUT" 2>/dev/null || echo 0)
+say "decoded: $OUT.txt ($count report record(s), $verdicts driver verdict line(s), $tee_lines kernel log line(s))"
 if [ "$verdicts" -gt 0 ] && [ "$tee_lines" = 0 ]; then
   warn "the ring armed but brought no kernel lines: the tee ran and msgbuf held nothing it keeps"
+fi
+if [ "$echo_lines" != 0 ]; then
+  warn "the kernel-log ring holds $echo_lines driver line(s): the tee is echoing what it also wrote itself"
 fi
 
 if [ "$REBOOT_BOOTLOADER" = 1 ]; then
@@ -222,5 +233,5 @@ if [ "$REBOOT_BOOTLOADER" = 1 ]; then
   adb reboot bootloader >/dev/null 2>&1 || warn "adb reboot bootloader failed"
 fi
 
-[ "$count" -gt 0 ] || [ "$verdicts" -gt 0 ] || exit 1
+[ "$count" -gt 0 ] || [ "$verdicts" -gt 0 ] || [ "$tee_lines" -gt 0 ] || exit 1
 exit 0

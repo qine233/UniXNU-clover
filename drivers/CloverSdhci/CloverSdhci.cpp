@@ -317,29 +317,45 @@ static const uint32_t kLogSlots = 16;
 // panic writer owns -- and `read-clover-log.py` reads the whole window in one dd. The ring is 32
 // records, so a boot that reaches every verdict still fits, and the writer wraps rather than
 // refusing: the newest line is the one that matters, and a wrap is visible as a slot index jump.
-// The RAM ring is what a verdict line goes to first. Writing the card from the place that decided
+// The RAM ring is what a line goes to first. Writing the card from the place that decided
 // the line would mean issuing two block writes in the middle of the failed transfer that produced
 // it -- a second owner for a host with one command engine, and a new way to hang a boot. So saying
 // something costs a memcpy, and the card is written only from a path that already holds the block
 // guard (the tails of the read, write and cache-flush requests). Until that happens the reading
 // lives in memory, which is also where the panel-less panic screen reads nothing but the host sees
-// it anyway. The ring is 32 records of 320 bytes and overwrites its oldest entry, so the newest
-// verdict is never the one that gets dropped.
-static const uint32_t kVerdictSlots = 32;
+// it anyway. Each ring overwrites its oldest entry, so the newest line is never the one that gets
+// dropped.
+//
+// Round176: two rings, because one was not a channel, it was a queue for whoever talked last. The
+// 32 records round174 sized for nine verdict lines are shared with round175's tee since last round,
+// and a chatty daemon evicts the driver's reading before the card ever sees it -- the exact failure
+// this ring exists to prevent, reintroduced by its own second producer. logfs has 16384 sectors and
+// the two rings together now use 1216 of them, so widening is a matter of geometry, not of a second
+// pointer fighting for the same 32 slots: the driver keeps its own ring (grown to 64 records, since
+// the tee's state lines are still said there), and the kernel log gets a ring of its own 512 records
+// deep at sector 192. A whole boot's allowlisted kernel text is a few hundred lines, which fits;
+// the driver's readings cannot be pushed out of them any more, and the host reads both with one dd.
+static const uint32_t kRingDriver = 0;   // what CloverSdhci measured (round174's ring)
+static const uint32_t kRingKernel = 1;   // what the kernel said (round175's tee, round176's ring)
+static const uint32_t kRingCount = 2;
 static const uint32_t kVerdictTextBytes = 320;
-static const uint32_t kVerdictOffset = 64;   // sectors past logfs start, clear of the panic blocks
-static const uint32_t kVerdictFlushPerPass = 4;   // two blocks each; a flush must not hold the guard long
-static char gVerdictText[kVerdictSlots][kVerdictTextBytes];
-static uint32_t gVerdictLength[kVerdictSlots];
-static volatile uint32_t gVerdictReady = 0;
-static uint32_t gVerdictFirst = 0;
-static uint32_t gVerdictWrite = 0;      // next RAM slot to fill
-static uint32_t gVerdictPending = 0;    // RAM slots holding text not yet on the card
-static uint32_t gVerdictDropped = 0;    // records the ring overwrote before they could flush
-static uint32_t gVerdictCursor = 0;     // card slot counter; card slot = cursor % kVerdictSlots
-static uint32_t gVerdictSeq = 0;        // stamped in header word 8 so a wrapped ring stays ordered
-static uint32_t gVerdictWritten = 0;
-static volatile uint32_t gVerdictBusy = 0;
+static const uint32_t kRingRamSlots = 128;   // staging depth; deeper than either card ring
+static const uint32_t kRingCardSlots[kRingCount] = {64, 512};
+static const uint32_t kRingOffset[kRingCount] = {64, 192};   // sectors past logfs start
+// Records flushed per guarded pass, per ring. Two block writes each, and a flush must not hold the
+// guard long: eight is 16 writes, which at the round159 rates is a few milliseconds.
+static const uint32_t kRingFlushPerPass[kRingCount] = {4, 8};
+static char gRingText[kRingCount][kRingRamSlots][kVerdictTextBytes];
+static uint32_t gRingLength[kRingCount][kRingRamSlots];
+static uint32_t gVerdictFirst = 0;       // the logfs window's first LBA; both rings live in it
+static uint32_t gRingWrite[kRingCount];     // next RAM slot to fill
+static uint32_t gRingPending[kRingCount];   // RAM slots holding text not yet on the card
+static uint32_t gRingDropped[kRingCount];   // records the ring overwrote before they could flush
+static uint32_t gRingCursor[kRingCount];    // card slot counter; slot = cursor % kRingCardSlots
+static uint32_t gRingSeq[kRingCount];       // stamped in word 8 so a wrapped ring stays ordered
+static uint32_t gRingWritten[kRingCount];
+static volatile uint32_t gRingBusy[kRingCount];
+static volatile uint32_t gVerdictReady = 0;   // driver ring: armed with the logfs window
 
 // Round175: the tee. The verdict ring made the driver's own readings survive the panel; the readings
 // that actually decide the next round are printed by other people -- the r153/r155 shared-region
@@ -358,26 +374,32 @@ static volatile uint32_t gVerdictBusy = 0;
 // has not reached before the writer laps it is gone, which is why it is worth reading a chunk per
 // request rather than one line.
 static const uint32_t kTeeScanPerPass = 4096;   // bytes read per pass; a chunk, not the whole buffer
-static const uint32_t kTeePushPerPass = 4;      // matching lines handed to the ring per pass
+static const uint32_t kTeePushPerPass = 8;      // matching lines handed to the kernel ring per pass
 static const uint32_t kTeeLineBytes = kVerdictTextBytes;   // a longer line is truncated, not split
-// What a kernel line has to contain before it is worth two block writes. Ordered by what this port is
-// blocked on right now, and deliberately short: every extra entry spends ring slots that the driver's
-// own verdicts could have used.
+// What a kernel line has to contain before it is worth two block writes. Round176 grows this on
+// purpose: the tee used to spend the driver's 32 records, so every entry here cost a verdict line,
+// and the list was kept short for that reason alone. Now it has its own 512-record ring, and the
+// entries below are the three families the port is actually blocked on -- the code signature that
+// returns 85 (ubc_subr.c:4702 prints `cs_blob`), the root mount (`mountroot`, vfs_subr.c:1468), and
+// anything that names dyld, which is where the shared cache story lives.
 static const char *const kTeeAllowlist[] = {
   "clover r",             // this port's own probes (r151/r153/r155/r170), whatever they print
   "CloverBlock",          // the volume/owner driver
   "apfs", "APFS",         // container scan, jhash, ntree reads
   "decmpfs",              // compressed-data read failures
   "load code signature",  // the error 4 that has been killing every process since r162
+  "cs_blob",              // the validation call that returns 85 before anyone can kill a process
   "AMFI", "amfi",         // who actually decided to kill it
   "launchd", "initproc",  // pid 1, and what happened to it
+  "dyld",                 // shared cache loader, by name or in a path
   "vm_fault", "shared_region",   // the empty shared region this boot still dies in
+  "mountroot", "rootvp",  // whether the root was accepted, and by which filesystem
   "panic",                // the panic string, if a panic got here first
 };
 static const uint32_t kTeeAllowlistCount =
     sizeof (kTeeAllowlist) / sizeof (kTeeAllowlist[0]);
 
-static volatile uint32_t gTeeReady = 0;         // armed together with the verdict ring
+static volatile uint32_t gTeeReady = 0;         // arms round176's kernel-log ring
 static uint32_t gTeeIndex = 0;                  // next byte of msgbuf to consume
 static uintptr_t gTeeBuffer = 0;                // msg_bufc the cursor belongs to
 static uint32_t gTeePartial = 0;                // bytes held for a line that has not ended yet
@@ -389,6 +411,12 @@ static uint32_t gTeeLap = 0;                    // passes where the writer was b
 static uint32_t gTeeRefused = 0;                // reason code: see teeValidate below
 static uint32_t gTeeRefusedShown = 0;
 static uint32_t gTeeNextReport = 256;           // emit a tee census every this many lines examined
+static uint32_t gTeeCensus = 0;                 // census lines said so far this boot
+// The census is the tee talking about itself, so it lands in the driver's ring -- which round176 grew
+// to 64 records, but still only holds the readings this driver made. Twelve is enough to see the
+// counters climb across a boot and is the difference between that ring holding the nine verdicts and
+// holding thirty copies of the same four numbers.
+static const uint32_t kTeeCensusMax = 12;
 // Kernel virtual addresses on this board all sit above the Darwin arm64e base (the kernel links at
 // VM_KERNEL_LINK_ADDRESS, 0xfffffff007004000). A msg_bufc below it is not a kernel pointer at all, and
 // following it would take a data abort in the middle of a block tail -- which is the one place in this
@@ -399,10 +427,10 @@ static const uint64_t kTeeKernelVaBase = 0xfffffff000000000ull;
 // round174 section installs them. sdhciSay is the driver's only way of speaking to a reading: it
 // formats once and hands the same string to the panel and to the RAM ring.
 static void sdhciSay (const char *fmt, ...);
-static void verdictPush (const char *line, uint32_t length);
+static void ringPush (uint32_t which, const char *line, uint32_t length);
 static void flushVerdictRing (void);
-// Round175: drain the kernel log buffer into that ring. Declared with the ring it feeds because every
-// call site is a line above its own flush, in the same guarded tail.
+// Round175: drain the kernel log buffer into the kernel ring. Declared with the rings it feeds
+// because every call site is a line above its own flush, in the same guarded tail.
 static void teeKernelLog (void);
 
 // ------------------------------------------------------------------ the window and its reads
@@ -2283,10 +2311,10 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
 // second owner around the failing request and add a new way to hang the boot. So saying something
 // only fills a RAM slot, and the ring is written to the card from the tails of the read, write and
 // cache-flush requests -- places that already hold the block guard, own an idle card, and run
-// repeatedly. Four records per pass keeps a flush from becoming the long guard hold this driver has
-// spent three rounds removing.
+// repeatedly. Records per pass are capped per ring (four for the driver's, eight for the kernel's),
+// because a flush must not become the long guard hold this driver has spent three rounds removing.
 
-static uint32_t gVerdictBlock[kBlockWords];
+static uint32_t gRingBlock[kBlockWords];
 
 // One byte at a time, clamped: a verdict that overruns its slot is truncated rather than written
 // past the array, and the cursor stops advancing so the reported length is the stored length.
@@ -2424,29 +2452,31 @@ static uint32_t verdictFormat (char *out, uint32_t cap, const char *fmt, va_list
   return length > cap ? cap : static_cast<uint32_t> (length);
 }
 
-// Put one finished line into the RAM ring without printing it. sdhciSay uses this after IOLog; the
+// Put one finished line into a RAM ring without printing it. sdhciSay uses this after IOLog; the
 // msgbuf tee uses it alone, because the tee's input is the very buffer IOLog writes into -- printing a
 // line it just read would append a second copy of itself, and the tee would then match its own echo
 // forever. The trailing newline is dropped by both callers: the record writer adds exactly one.
-static void verdictPush (const char *line, uint32_t length)
+// `which` is the ring, not the producer: round176's two card rings are the same record shape with
+// different geometry, and the only difference in behaviour is which one gets to be crowded out.
+static void ringPush (uint32_t which, const char *line, uint32_t length)
 {
   if (length > kVerdictTextBytes) {
     length = kVerdictTextBytes;
   }
-  if (gVerdictPending == kVerdictSlots) {
-    // Full: the oldest unread verdict gives its slot to the newest one. Which reading was dropped is
+  if (gRingPending[which] == kRingRamSlots) {
+    // Full: the oldest unread line gives its slot to the newest one. Which reading was dropped is
     // counted, so a frame whose ring wrapped says so instead of looking like a quiet boot.
-    gVerdictWrite++;
-    gVerdictPending--;
-    gVerdictDropped++;
+    gRingWrite[which]++;
+    gRingPending[which]--;
+    gRingDropped[which]++;
   }
-  const uint32_t slot = gVerdictWrite % kVerdictSlots;
+  const uint32_t slot = gRingWrite[which] % kRingRamSlots;
   for (uint32_t i = 0; i < length; i++) {
-    gVerdictText[slot][i] = line[i];
+    gRingText[which][slot][i] = line[i];
   }
-  gVerdictLength[slot] = length;
-  gVerdictWrite++;
-  gVerdictPending++;
+  gRingLength[which][slot] = length;
+  gRingWrite[which]++;
+  gRingPending[which]++;
 }
 
 // The driver's voice. Same string to the panel and to the ring, so a frame and a dd can never
@@ -2463,13 +2493,16 @@ static void sdhciSay (const char *fmt, ...)
   }
   line[length] = '\0';
   IOLog ("%s\n", line);
-  verdictPush (line, length);
+  ringPush (kRingDriver, line, length);
 }
 
 // One LOG1 record, same shape as mode 17 and the panic writer: header block then text block, byte
 // sum over prefix + body + newline. Word 8 carries the sequence number, which is what makes a
-// wrapped ring orderable: slot index alone stops being time after the 33rd record.
-static bool verdictWriteRecord (const char *text, uint32_t length)
+// wrapped ring orderable: slot index alone stops being time once a ring has more records than slots.
+// Word 5 carries the ring's own kind -- 21 for the driver's verdicts, 22 for the kernel lines the tee
+// lifted -- because the host reads two rings out of one dd and a record has to say which one it came
+// from before anything else about it is trusted.
+static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length)
 {
   const uint32_t body = length > 480 ? 480 : length;
   const uint32_t total = kLogPrefixLength + body + 1;
@@ -2482,28 +2515,28 @@ static bool verdictWriteRecord (const char *text, uint32_t length)
   }
   sum += static_cast<uint8_t> ('\n');
 
-  const uint32_t lba = gVerdictFirst + kVerdictOffset +
-                       2 * (gVerdictCursor % kVerdictSlots);
+  const uint32_t lba = gVerdictFirst + kRingOffset[which] +
+                       2 * (gRingCursor[which] % kRingCardSlots[which]);
   uint32_t words = 0, status = 0;
   for (uint32_t i = 0; i < kBlockWords; i++) {
-    gVerdictBlock[i] = 0;
+    gRingBlock[i] = 0;
   }
-  gVerdictBlock[0] = kLogMagic0;
-  gVerdictBlock[1] = kLogMagic1;
-  gVerdictBlock[2] = lba;
-  gVerdictBlock[3] = total;
-  gVerdictBlock[4] = sum;
-  gVerdictBlock[5] = 21;   // a verdict line, not a bring-up report and not the panic screen
-  gVerdictBlock[6] = body;
-  gVerdictBlock[7] = gVerdictCursor % kVerdictSlots;
-  gVerdictBlock[8] = gVerdictSeq;
+  gRingBlock[0] = kLogMagic0;
+  gRingBlock[1] = kLogMagic1;
+  gRingBlock[2] = lba;
+  gRingBlock[3] = total;
+  gRingBlock[4] = sum;
+  gRingBlock[5] = (which == kRingKernel) ? 22 : 21;
+  gRingBlock[6] = body;
+  gRingBlock[7] = gRingCursor[which] % kRingCardSlots[which];
+  gRingBlock[8] = gRingSeq[which];
   uint32_t rsp = 0, rstatus = 0, polls = 0;
-  if (!writePioBlock (lba, gVerdictBlock, words, status)) {
+  if (!writePioBlock (lba, gRingBlock, words, status)) {
     return false;
   }
   waitCardReady (rsp, rstatus, polls);
 
-  uint8_t *block = reinterpret_cast<uint8_t *> (gVerdictBlock);
+  uint8_t *block = reinterpret_cast<uint8_t *> (gRingBlock);
   for (uint32_t i = 0; i < 512; i++) {
     block[i] = 0;
   }
@@ -2517,37 +2550,48 @@ static bool verdictWriteRecord (const char *text, uint32_t length)
                     : (c >= 0x20 && c < 0x7f) ? c : static_cast<uint8_t> ('.');
   }
   block[kLogPrefixLength + body] = '\n';
-  if (!writePioBlock (lba + 1, gVerdictBlock, words, status)) {
+  if (!writePioBlock (lba + 1, gRingBlock, words, status)) {
     return false;
   }
   waitCardReady (rsp, rstatus, polls);
-  gVerdictCursor++;
-  gVerdictSeq++;
-  gVerdictWritten++;
+  gRingCursor[which]++;
+  gRingSeq[which]++;
+  gRingWritten[which]++;
   return true;
 }
 
-// Called only from paths that hold the block guard with an idle card. A refused write stops this
-// pass rather than retrying: the record stays pending, the next request tries again, and a card that
-// is really gone costs four block writes per request instead of a hang.
-static void flushVerdictRing (void)
+// One ring's share of a pass: at most kRingFlushPerPass[which] records, oldest first, and a refused
+// write stops this ring for this pass rather than retrying. Called only from paths that hold the
+// block guard with an idle card, so a card that is really gone costs writes per request instead of a
+// hang -- and the cost is bounded per ring, which is the point of having two of them: a kernel log
+// that outruns the flush cannot delay the driver's own verdicts, and vice versa.
+static void flushRing (uint32_t which)
 {
-  if (!gVerdictReady || !gHost || !gVerdictFirst || !gVerdictPending) {
+  if (!gVerdictFirst || !gHost || !gRingPending[which] || gRingBusy[which]) {
     return;
   }
-  if (gVerdictBusy) {
+  if (which == kRingKernel ? !gTeeReady : !gVerdictReady) {
     return;
   }
-  gVerdictBusy = 1;
-  for (uint32_t flushed = 0; flushed < kVerdictFlushPerPass && gVerdictPending; ) {
-    const uint32_t slot = (gVerdictWrite - gVerdictPending) % kVerdictSlots;
-    if (!verdictWriteRecord (gVerdictText[slot], gVerdictLength[slot])) {
+  gRingBusy[which] = 1;
+  for (uint32_t flushed = 0; flushed < kRingFlushPerPass[which] && gRingPending[which]; ) {
+    const uint32_t slot = (gRingWrite[which] - gRingPending[which]) % kRingRamSlots;
+    if (!ringWriteRecord (which, gRingText[which][slot], gRingLength[which][slot])) {
       break;
     }
-    gVerdictPending--;
+    gRingPending[which]--;
     flushed++;
   }
-  gVerdictBusy = 0;
+  gRingBusy[which] = 0;
+}
+
+// The single entry point the three guarded tails call. Both rings drain here, driver first: on a
+// card that is only occasionally idle, the readings that explain the card go before the readings
+// that came out of it.
+static void flushVerdictRing (void)
+{
+  flushRing (kRingDriver);
+  flushRing (kRingKernel);
 }
 
 // ------------------------------------------------------------------ round175: the kernel log tee
@@ -2598,12 +2642,14 @@ static bool teeLineMatches (const char *line, uint32_t length)
   return false;
 }
 
-// The tee's own voice: format and put in the ring, nothing else. sdhciSay cannot be used here,
-// because teeKernelLog runs at the tails of block requests -- inside the block guard -- and sdhciSay
-// calls IOLog, which takes bsd_log_lock. Taking a kernel lock while holding the guard is a lock order
-// this driver has no business inventing: a logger that holds bsd_log_lock and then issues disk I/O
-// would wait for the guard we hold, and we would wait for the lock it holds. A tee state line is
-// still a reading, so it still goes to the card; only the panel copy is given up.
+// The tee's own voice: format and put in the driver's ring, nothing else. sdhciSay cannot be used
+// here, because teeKernelLog runs at the tails of block requests -- inside the block guard -- and
+// sdhciSay calls IOLog, which takes bsd_log_lock. Taking a kernel lock while holding the guard is a
+// lock order this driver has no business inventing: a logger that holds bsd_log_lock and then issues
+// disk I/O would wait for the guard we hold, and we would wait for the lock it holds. A tee state
+// line is still a reading, so it still goes to the card; only the panel copy is given up. It goes to
+// the driver ring rather than the kernel ring because the kernel ring is the answer to "what did the
+// kernel say", and a line in it that the tee said about itself would make that question ambiguous.
 static void teeSay (const char *fmt, ...)
 {
   char line[kVerdictTextBytes + 1];
@@ -2615,12 +2661,13 @@ static void teeSay (const char *fmt, ...)
     length--;
   }
   line[length] = '\0';
-  verdictPush (line, length);
+  ringPush (kRingDriver, line, length);
 }
 
 // One complete line out of the buffer. Leading blanks and the '\b' progress dots the boot writer
 // emits are cut, an all-blank line is dropped, and anything this driver said is skipped: it went into
-// the ring already, through sdhciSay, in the same boot.
+// the driver's own ring already, through sdhciSay or teeSay, in the same boot. That exclusion is what
+// makes round176's kernel ring mean something -- every record in it is a line the kernel said.
 static void teeConsumeLine (uint32_t &pushed)
 {
   uint32_t length = gTeePartial;
@@ -2644,20 +2691,20 @@ static void teeConsumeLine (uint32_t &pushed)
     return;
   }
   if (pushed >= kTeePushPerPass) {
-    // The ring is shared with the driver's own verdicts and the card only takes four records per
-    // request, so a chatty boot gets its surplus counted rather than queued forever.
+    // Eight lines per guarded pass is sixteen block writes on a card that is also trying to serve the
+    // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.
     gTeeThrottled++;
     return;
   }
-  verdictPush (gTeeLine + start, length - start);
+  ringPush (kRingKernel, gTeeLine + start, length - start);
   gTeeKept++;
   pushed++;
 }
 
-// Drain the kernel log buffer into the verdict ring. Called from the same three guarded tails as
-// flushVerdictRing, immediately before it, so a line the tee accepts in this pass can reach the card
-// in the same pass. Nothing here is safe to call from an interrupt-stopped context or without the
-// block guard; it only touches memory and the ring, and the writes happen in the flush.
+// Drain the kernel log buffer into round176's kernel ring. Called from the same three guarded tails
+// as flushVerdictRing, immediately before it, so a line the tee accepts in this pass can reach the
+// card in the same pass. Nothing here is safe to call from an interrupt-stopped context or without
+// the block guard; it only touches memory and the ring, and the writes happen in the flush.
 static void teeKernelLog (void)
 {
   if (!gTeeReady) {
@@ -2743,8 +2790,11 @@ static void teeKernelLog (void)
 
   if (gTeeSeen >= gTeeNextReport) {
     gTeeNextReport = gTeeSeen + 256;
-    teeSay ("CloverSdhci r175: tee seen=%u kept=%u throttled=%u lap=%u idx=%u size=%u\n",
-              gTeeSeen, gTeeKept, gTeeThrottled, gTeeLap, gTeeIndex, sizeu);
+    if (gTeeCensus < kTeeCensusMax) {
+      gTeeCensus++;
+      teeSay ("CloverSdhci r175: tee seen=%u kept=%u throttled=%u lap=%u idx=%u size=%u\n",
+                gTeeSeen, gTeeKept, gTeeThrottled, gTeeLap, gTeeIndex, sizeu);
+    }
   }
 }
 
@@ -5882,13 +5932,17 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                 // comes back with no verdict records has to be able to say whether the ring was ever
                 // armed, or armed and then never flushed by a request that finished.
                 sdhciSay ("CloverSdhci r174: verdict ring armed lba=%u slots=%u\n",
-                          gVerdictFirst + kVerdictOffset, kVerdictSlots);
+                          gVerdictFirst + kRingOffset[kRingDriver], kRingCardSlots[kRingDriver]);
                 // Round175: the tee is armed with the ring because it has nowhere to put a line
                 // without it. gTeeIndex stays at zero on purpose: the lines this port needs most --
                 // the shared-region probes, the root mount verdict -- were printed before now, and
                 // they are still in the buffer. bufx= in this reading is how much history the first
                 // passes are about to replay.
                 gTeeReady = 1;
+                // Round176: the tee's lines get their own 512 records at sector 192, so the size of
+                // the dd that reads them back is a promise the driver has to say out loud.
+                sdhciSay ("CloverSdhci r176: kernel ring armed lba=%u slots=%u\n",
+                          gVerdictFirst + kRingOffset[kRingKernel], kRingCardSlots[kRingKernel]);
                 sdhciSay ("CloverSdhci r175: tee armed bufc=%p size=%d bufx=%d\n",
                           msgbufp ? msgbufp->msg_bufc : nullptr,
                           msgbufp ? msgbufp->msg_size : 0,

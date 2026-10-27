@@ -386,10 +386,14 @@ EXEC_SIG_DUMP = "clover r166: sig n=%u mo=%lld off=%u size=%u w=%08x/%08x/%08x/%
 # kind 21 records, so a dd of logfs sector 64 upwards answers the round even if the screen scrolled
 # twelve lines ago. The armed line is the only string that round added, and it is the one the host
 # needs -- a dump with no verdict records has to say whether the ring was ever armed or never flushed.
-# Round175 arms a second thing on the same card: the tee that drains the kernel's own log buffer into
-# that ring, which is how the probes printed by XNU (shared_region, exec/exit, APFS, the loader's
-# signature error) reach the dump instead of the panel. Its armed line is checked for the same reason.
+# Round175 arms a second thing on the same card: the tee that drains the kernel's own log buffer, which
+# is how the probes printed by XNU (shared_region, exec/exit, APFS, the loader's signature error) reach
+# the dump instead of the panel. Round176 gives that text its own ring -- kind 22 at sector 192, 512
+# slots -- because sharing 64 slots with the driver's verdicts meant a busy daemon could evict a reading
+# before the card saw it. Each armed line is checked for the same reason a dump needs it: no records in
+# a ring has to say whether that ring was ever armed, and after round176 the two answers are separate.
 VERDICT_RING = ("CloverSdhci r174: verdict ring armed lba=",
+                "CloverSdhci r176: kernel ring armed lba=",
                 "CloverSdhci r175: tee armed bufc=")
 
 
@@ -413,11 +417,11 @@ def check_read_integrity(kernel: bytes) -> bool:
 
 
 def check_verdict_ring(kernel: bytes) -> bool:
-    """Round174 writes every CloverSdhci verdict line to logfs as a record of its own, and round175
-    feeds the kernel's own log lines into the same ring. Without those armed strings in the image, a
-    host-side dd that finds no records cannot tell an unarmed ring from a ring that armed and never got
-    a request to finish."""
-    label = "kernel.macho: verdict ring and log tee linked"
+    """Round174 writes every CloverSdhci verdict line to logfs as a record of its own, round175 feeds
+    the kernel's own log lines in, and round176 gives that second producer its own ring so the first one
+    cannot be evicted by it. Without those armed strings in the image, a host-side dd that finds no
+    records cannot tell an unarmed ring from a ring that armed and never got a request to finish."""
+    label = "kernel.macho: verdict rings and log tee linked"
     found = {name: name.encode() in kernel for name in VERDICT_RING}
     ok = all(found.values())
     detail = ", ".join(f"{name.split(':')[1].strip()} {'present' if yes else 'ABSENT'}"
