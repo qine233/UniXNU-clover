@@ -265,6 +265,62 @@ def check_mac_probe(kernel: bytes) -> bool:
     return ok
 
 
+AMFI_SITES = (
+    ("r163 cs_require_lv",
+     bytes.fromhex("e00300f940c1fff00014259157000014b80f40f995570094080340b9090113120900092a"),
+     0x14000011),
+    ("r164 signature",
+     bytes.fromhex("ff7f01a9e0630091e3430091e10316aae20315aaa9000094"),
+     0xD503201F),
+)
+
+
+def check_amfi_allow(kernel: bytes) -> bool:
+    """Rounds163-164 replace the two deny branches of AMFI's exec hook in the prelinked
+    kext. Neither branch has a symbol the link keeps, so the only evidence is the
+    instruction after each exact signature: the payload image must carry the allow-path
+    word, not the stock cbz/tbz. A missing signature means the payload was built from a
+    kernel this patcher never touched, which is exactly the r163 frame's kill loop."""
+    label = "kernel.macho: AMFI exec hook allows"
+    found = {}
+    for name, signature, want in AMFI_SITES:
+        at = kernel.find(signature)
+        unique = at >= 0 and kernel.find(signature, at + 1) < 0
+        word = struct.unpack_from("<I", kernel, at + len(signature))[0] if unique else None
+        found[name] = unique and word == want
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'allow-path' if yes else 'stock'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
+# Round164's source concession has no string and no symbol naming it, so the image's evidence is
+# the three instruction groups the patch adds: the branch that recognises a 16K-signed blob on a
+# 4K kernel, the store that marks it skipped, and the early accept inside cs_validate_hash. Each
+# pattern is unique in the 52 MiB prelink. Losing any one means the payload was built from a tree
+# without zzy-clover-dyld-cache-skip.patch, which is exactly the tens-of-minutes preflight walk.
+NATIVE4K_SKIP = (
+    ("prepare branch", bytes.fromhex("1f39007120094c7ae0020054")),
+    ("skipped store", bytes.fromhex("2800805228400339")),
+    ("hash accept", bytes.fromhex("0b40433974d1ffd0948204918a0240b9cb010036")),
+)
+
+
+def check_dyld_cache_skip(kernel: bytes) -> bool:
+    """Round164 stops deriving 4K page hashes for the 16K-signed dyld caches. The compiler may
+    move the three groups within their functions, but each group's bytes survive; requiring all
+    three means both halves are present -- skipping the derivation without accepting the faulted
+    subranges would reject every page instead of accepting it."""
+    label = "kernel.macho: dyld cache hash skip"
+    found = {name: kernel.count(pattern) == 1 for name, pattern in NATIVE4K_SKIP}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_root_mount_probe(kernel: bytes) -> bool:
     """Round144 asks why r143 left bsd_init() with an empty mountlist although vfs_mountroot()
     returned 0. The probe leaves no symbol of its own -- vfs_subr.c records which return-0 branch
@@ -573,6 +629,8 @@ def report(image: pathlib.Path) -> int:
         ok &= check_map_slide_probe(kernel)
         ok &= check_cache_gate_probe(kernel)
         ok &= check_mac_probe(kernel)
+        ok &= check_amfi_allow(kernel)
+        ok &= check_dyld_cache_skip(kernel)
         ok &= check_unattended(kernel)
         ok &= check_inline_asm_tails(kernel)
     return 0 if ok else 1

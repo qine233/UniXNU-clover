@@ -1,0 +1,55 @@
+--- a/bsd/sys/ubc_internal.h
++++ b/bsd/sys/ubc_internal.h
+@@ -165,6 +165,7 @@
+ 	const uint8_t   *csb_native4k_hashes;
+ 	vm_size_t       csb_native4k_hashes_size;
+ 	vm_size_t       csb_native4k_hash_count;
++	bool            csb_native4k_skipped;
+ };
+ 
+ /*
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -5755,6 +5755,7 @@
+ unsigned long cs_native4k_full_blocks = 0;
+ unsigned long cs_native4k_page_checks = 0;
+ unsigned long cs_native4k_ready_blobs = 0;
++unsigned long cs_native4k_skipped_blobs = 0;
+ /* The boot cost, for a board's diagnostics: mach_absolute_time ticks in vn_rdwr (the storage driver's work included) and in the
+  * hashing, and the bytes read. */
+ uint64_t cs_native4k_read_ticks = 0, cs_native4k_hash_ticks = 0, cs_native4k_bytes = 0;
+@@ -5785,6 +5786,19 @@
+ 	kern_return_t kr;
+ 
+ 	if (blob->csb_hash_pageshift <= PAGE_SHIFT) {
++		return 0;
++	}
++	/* Boot concession: deriving 4K authenticators from a 16K signature
++	 * means reading the whole file before its first page can be mapped.
++	 * The dyld shared caches are several gigabytes, and at this port's
++	 * storage rate that read alone is tens of minutes. Skip the derivation
++	 * and let cs_validate_hash accept the faulted subranges; every other
++	 * signature check on this board is already bypassed with
++	 * cs_enforcement_disable=1.
++	 */
++	if (PAGE_SHIFT == 12 && blob->csb_hash_pageshift == 14) {
++		blob->csb_native4k_skipped = true;
++		os_atomic_inc(&cs_native4k_skipped_blobs, relaxed);
+ 		return 0;
+ 	}
+ 	if (PAGE_SHIFT != 12 || blob->csb_hash_pageshift != 14 || cd == NULL || md == NULL ||
+@@ -5950,6 +5964,14 @@
+ 			}
+ 			codeLimit = ntohl(cd->codeLimit);
+ #if defined(XNU_NATIVE_CS_HASH_CACHE) && XNU_NATIVE_CS_HASH_CACHE
++			if (blob->csb_native4k_skipped) {
++				/* cs_native4k_prepare deliberately skipped the whole-file
++				 * derivation; accept the faulted page as it stands. */
++				*bytes_processed = PAGE_SIZE;
++				*tainted = 0;
++				os_atomic_inc(&cs_native4k_page_checks, relaxed);
++				return TRUE;
++			}
+ 			if (PAGE_SHIFT == 12 && blob->csb_hash_pageshift == 14) {
+ 				vm_size_t index = (vm_size_t)offset >> PAGE_SHIFT;
+ 				if ((offset & PAGE_MASK) || offset >= codeLimit ||

@@ -28,17 +28,18 @@
 
 ## 当前进度：已解决 / 待解决
 
-最新一帧还是 round159（v0.5.12）的镜像，但这次是同一个启动跑了一个多小时之后的
-屏幕：`launchd` 已经起来并在拉守护进程，每个子进程却死在 exec 的代码签名结构
-校验上（`unable to create a validated cs_blob object: 85` → `load code
-signature error 4` → AMFI 以「dyld signature cannot be verified」杀掉），pid
-一路涨——是循环，不是慢。此前 round155–round158、round160 都没有独立的真机帧。
-所以下面把「真机读到过」「已实现、等下一帧」「还没解决」分开写。
+最新一帧是 round163（v0.5.17）的冷刷读数：AMFI 那个 `cbz` 改掉之后，
+`launchd` 拉起的每个守护进程**仍然**死在 exec 上（`unable to create a
+validated cs_blob object: 85` → `load code signature error 4` → AMFI 以
+「dyld signature cannot be verified」杀掉），pid 一路涨——改掉的那条是
+`CS_REQUIRE_LV` 分支，真正杀人的是它后面那条「签名检查结果」分支。
 
-v0.5.17（round163）不再问「读到了什么」，而是直接把 AMFI 那个 exec 钩子的
-4 个字节改掉（`cbz` → `b`，永远走放行），只重建 payload，等下一次冷刷
-`cache` 的帧。它不修根因（blob 的 85 还在），只是把循环从 AMFI 这一层挪开；
-墙可能移动到 dyld 的共享区映射。
+v0.5.18（round164）因此一次改两处：内核里让 16 KiB 签名的 blob 不再在
+映射第一页之前把整个文件读完（`csb_native4k_skipped`，
+`cs_validate_hash` 直接接受已缺页的子区间），并把 AMFI 钩子的第二条拒绝
+分支 NOP 掉。它仍然不解释 85；目标是把「exec 直接被杀」这一层拿掉，
+让 dyld 拿到控制权。下一个读数只有三种：dyld 自己报错、536/共享区映射、
+或者用户态日志继续往下走。
 
 ### 已经解决（有真机读数）
 
@@ -56,7 +57,7 @@ v0.5.17（round163）不再问「读到了什么」，而是直接把 AMFI 那�
 | dyld 缓存打开与预检 | round159 帧：`open /System/Library/Caches/com.apple.dyld`、主缓存、`dyld_shared_cache_arm64.01` 全 err=0；`.01` 头 `len≈1.07 GiB sig=11491332+229376`、`err=0/0`，224 KiB 签名 blob 一次读完 189 ms；随后每个子缓存的 `F_ADDFILESIGS` 都是 `err=0 resid=0` |
 | 诊断通道 | panic 屏直写 framebuffer（不经过 tty）、无人值守的 IMEM `0x77665501` + PSCI 复位、`read-clover-log.py` 取 logfs、`decode-clover-address.py` 把地址翻成函数 |
 
-### 已实现，等下一帧（round154/157/158/160）
+### 已实现，等下一帧（round154/157/158/160/164）
 
 | 轮次 | 内容 | 状态 |
 | --- | --- | --- |
@@ -64,6 +65,7 @@ v0.5.17（round163）不再问「读到了什么」，而是直接把 AMFI 那�
 | round157（v0.5.10） | CMD12 改 R1b、拒收 CRC/TIMEOUT/END_BIT/ADMA 损坏块 | 读路径工作；错误分支尚未被触发过 |
 | round158（v0.5.11） | 照 sheng 对齐 `porting.toml`/`AGENTS.md`/工作流，锁超时放宽到约 21 s | 契约层，无需上机 |
 | round160（v0.5.13） | 宿主闸门 `verify-userdata-window.py`；镜像与内核一字未动 | 无需上机 |
+| round163/164（v0.5.17/18） | AMFI 两条拒绝分支 + 16 KiB 签名的 dyld 缓存跳过整文件哈希 | r163 帧证明只改第一条不够；r164 等冷刷 |
 
 ### 还没解决
 
@@ -76,14 +78,17 @@ v0.5.17（round163）不再问「读到了什么」，而是直接把 AMFI 那�
    结构校验里就返回 `EBADEXEC`（85），拿不到 `CS_PLATFORM_BINARY`，随后被
    AMFI 的 exec 钩子杀掉，`launchd` 再拉一遍。宿主上这四个文件的 cdhash 全在
    2478 条 static 信任缓存里，blob 也合法——所以可疑的是内核读回来的字节或
-   load command 给的偏移/长度，不是信任决策。v0.5.17 不再测量，先把这个钩子
-   改成永远放行（见该小节）；85 本身仍未解释。
+   load command 给的偏移/长度，不是信任决策。r163 改的 `CS_REQUIRE_LV`
+   分支不是杀人点；v0.5.18 把第二条拒绝分支也拿掉，并把 16 KiB 签名的整文件
+   哈希跳过。85 本身仍未解释；最像的形态是一次被截断的 blob 读（`logd` 的
+   签名在文件偏移 224912、长 21120 字节，跨 16 KiB 批次边界）。
 3. **完整 `/data` 没有解决**——现在只是 32 MiB 的 APFS scratch 种子，追加在
    userdata 分区的两个 GPT 副本之间，不在 GPT 里；原 54.4 GB 的 userdata 内容
    没有迁移。这一帧的 Data 挂载只证明那块种子可用。
 4. **这个循环不会自己停**——每一环都是「exec 主程序 → 启动 dyld → 把整组共享缓存
    签名注册一遍（第一帧那串 `fsig`）→ 主程序的签名结构校验失败 → AMFI 杀掉」，
-   所以一小时只涨了几十个 pid，536 的读数一直被挡在这个循环后面。只能断电；
+   所以一小时只涨了几十个 pid，536 的读数一直被挡在这个循环后面。v0.5.18 只
+   拆掉最后一环；若 dyld 自己仍以签名失败拒绝，循环的形状不变。只能断电；
    断电后回到 fastboot，不需要再刷任何分区。
 5. **显示与 GPU**——没有 MDP5/DSI 驱动，屏幕只服务于启动诊断；Adreno 512 没有
    驱动，没有 iOS 显示栈。
@@ -99,10 +104,11 @@ v0.5.17（round163）不再问「读到了什么」，而是直接把 AMFI 那�
 
 ### 下一步（按顺序）
 
-1. 让这一帧滚完，拍最后几行：`clover r154:`（536）、映射错误、panic 屏，或者
-   launchd 的第一行输出。这一次刷机只回答这一个问题。
-2. 若 fsig 流之后直接静默，round161 在 536 入口前加一条「即将调用」标记，并让
-   fsig 每个文件只打最后一行，单变量切开「没进 536」与「进了但没返回」。
+1. 冷刷 `round164-payload.img`，读 AMFI 的 kill 行是否消失。三种结果：dyld
+   自己报签名错误 / 出现 `clover r154:` 或共享区映射读数 / 用户态日志继续。
+   这一次刷机只回答这一个问题。
+2. 若 dyld 仍以签名失败拒绝，下一轮不碰 AMFI，直接量 `ubc_cs_blob_add` 读回
+   的 blob 长度（期望 21120，若只到 16384 就是批量读尾块），修读路径。
 3. 536 通过后再谈完整 `/data` 迁移；显示、输入、网络排在用户态启动之后。
 
 ## 这里用到的硬件事实
@@ -11802,6 +11808,75 @@ fastboot reboot
 修），但 AMFI 的 kill 行应该消失，`launchd` 的子进程不再被立刻杀掉。如果之后
 出现 dyld 自己的错误或直接回到 fastboot，那就说明墙已经从 AMFI 移到共享区
 映射；如果屏幕停在某个 daemon 的日志上，那 exec 这一层就通了。
+
+## v0.5.18（round164）：16 KiB 签名的缓存不再整文件哈希，AMFI 第二条拒绝分支 NOP
+
+r163 的冷刷读数是：85 和 `load code signature error 4` 照旧，AMFI 的 kill
+行也照旧，pid 继续涨。回看那段钩子才发现改错了分支：`0xab40e4` 的 `cbz`
+只合并 `check` 的结果与 `CS_REQUIRE_LV`；当 `check` 失败且没有
+`CS_REQUIRE_LV` 时 `w9 = check | 0` 并不为零，`cbz` 不会跳。真正决定生死
+的是后面 `0xab416c` 的 `tbz w0, #0, allow`——`w0` 就是签名检查的结果，
+0 表示「没有有效签名」，于是它反而落到 `0xab4210` 的 kill 路径。
+
+这一轮改两处：
+
+1. AMFI 钩子 `0xab416c`：`tbz w0,#0`（`20 05 00 36`）→ `nop`
+   （`1f 20 03 d5`），文件偏移 `0x1a8316c`。两条拒绝分支现在都不成立，
+   剩下的 `cbz x20` 出口（`0xab4254`/`0xab428c`）都走到
+   `0xab43d4`/`0xab43f0` 并把 `w0` 置 0，也就是放行。
+2. 内核 `patches/xnu-clover/zzy-clover-dyld-cache-skip.patch`：在
+   `cs_native4k_prepare` 里，当 `PAGE_SHIFT == 12` 且 blob 的 hash
+   pageshift 为 14 时置 `csb_native4k_skipped` 并返回 0，不再用 `vn_rdwr`
+   把整个 `codeLimit` 读一遍；`cs_validate_hash` 对标记过的 blob 把缺页
+   直接当作已处理（`bytes_processed = PAGE_SIZE`、`tainted = 0`）。共享缓存
+   是 3.7 GiB，在这块板 1–2 MB/s 的读速下，整文件哈希是分钟级，而且每次
+   exec 都可能重来。
+
+两处改动的源码都在板级仓库里：补丁同时抄到 `~/UniXNU/patches/xnu/`，否则
+内核构建读不到；AMFI 的两条分支由 `scripts/patch-clover-amfi.py` 按唯一
+签名定位，`--check` 可以只读复验。编译后的镜像里能读到三段证据（
+`prepare` 的 `cmp/ccmp/b.eq` + `strb [x1,#0xd0]`、`validate_hash` 的
+`ldrb [x0,#0xd0]` + `tbz` + 接受体），`verify-clover-payload.py` 现在把
+这三段一起断言，`check-clover.py` 也反向断言补丁、patcher、verifier 三份
+源码都在。
+
+构建链（先内核、再 payload）：
+
+```sh
+cd ~/UniXNU && PATH=/tmp/clover-bin:$PATH \
+  /opt/homebrew/bin/python3.13 ./unixnu build kernel --device ../UniXNU-clover -j 8
+PATH=/tmp/clover-bin:$PATH /opt/homebrew/bin/python3.13 \
+  ~/UniXNU-clover/scripts/patch-clover-amfi.py \
+  ~/UniXNU/out/clover/kernel/kernel.macho \
+  ~/clover-out/round164-kernel-amfi.macho
+PATH=/tmp/clover-bin:$PATH \
+  /opt/homebrew/bin/python3.13 ./unixnu build payload --unique-chip-id 0x81ffcaaa \
+  --uefi ../mu-clover --kernel /Users/zhouzhou/clover-out/round164-kernel-amfi.macho \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+```
+
+产物与读数：prelink 内核 `0f28d236…`；打过 AMFI 的拷贝 `bd7ce2dc…`
+（`0x1a830e4`：`29 02 00 34` → `11 00 00 14`；`0x1a8316c`：
+`20 05 00 36` → `1f 20 03 d5`）；payload `2ec8a37d…`（56 MiB），卷内
+kernel `aa53af16…`、`unixnu.toml` `3b57cedc…`、ADT `89f425cb…`、
+`scratch-data.img` `614b8356…`、trustcache `7c369ce0…`。入口探针仍然是
+`6845 bytes in 37 runs`；菜单标题 `clover r164: the dyld caches skip the
+whole-file hash, AMFI allows exec`。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round164-payload.img
+fastboot reboot
+```
+
+`userdata` 不动，round159 的 Data 窗口仍在；这是冷刷，不用 `fastboot boot`。
+
+预期读数：AMFI 的 kill 行消失，85 仍在（根因未修）。之后要么是 dyld 自己
+的签名错误，要么是 536/共享区映射的读数，要么用户态日志继续往下走。若
+dyld 仍以签名失败拒绝，下一轮直接量 `ubc_cs_blob_add` 读回的 blob 长度
+（`logd` 期望 21120；只到 16384 就是 16 KiB 批量读的尾块问题）。
 
 ## 许可证
 

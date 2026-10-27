@@ -1170,9 +1170,55 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round163. The menu has to name the round under test: the AMFI exec-hook bypass.
-    if not board["payload"]["title"].startswith("clover r163:"):
-        errors.append('[payload] title is not "clover r163: ...": the menu would not name this round')
+    # Round164. The menu has to name the round under test: the dyld-cache skip and the AMFI allow path.
+    if not board["payload"]["title"].startswith("clover r164:"):
+        errors.append('[payload] title is not "clover r164: ...": the menu would not name this round')
+    # Round164. Both halves of this round are source, and the kernel half cannot be read off the
+    # payload: a 16K-signed blob must not walk the whole file before its first page, and AMFI's
+    # second deny branch must not survive the payload build.
+    cache_patch = next((base / "patches/xnu-clover/zzy-clover-dyld-cache-skip.patch"
+                        for base in (REPO, pathlib.Path.cwd())
+                        if (base / "patches/xnu-clover/zzy-clover-dyld-cache-skip.patch").is_file()),
+                       None)
+    if cache_patch is None:
+        errors.append("patches/xnu-clover/zzy-clover-dyld-cache-skip.patch is missing: every "
+                      "16 KiB-signed dyld cache would still read itself whole before its first page")
+    else:
+        text = cache_patch.read_text()
+        for needle in ("csb_native4k_skipped", "cs_native4k_skipped_blobs",
+                       "blob->csb_native4k_skipped = true;"):
+            if needle not in text:
+                errors.append(f"{cache_patch.name} lacks {needle}: the 16K-signed blob would walk "
+                              "the whole-file hash again")
+        if "if (blob->csb_native4k_skipped) {" not in text:
+            errors.append(f"{cache_patch.name} does not accept faulted pages of a skipped blob: "
+                          "the first 4K fault would still be refused")
+    amfi_patch = next((base / "scripts/patch-clover-amfi.py"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "scripts/patch-clover-amfi.py").is_file()), None)
+    if amfi_patch is None:
+        errors.append("scripts/patch-clover-amfi.py is missing: the prelinked AMFI kext would keep "
+                      "its second deny branch and launchd's children would still be killed")
+    else:
+        text = amfi_patch.read_text()
+        for needle in ("e00300f940c1fff00014259157000014b80f40f995570094080340b9090113120900092a",
+                       "ff7f01a9e0630091e3430091e10316aae20315aaa9000094",
+                       "0x34000229, 0x14000011", "0x36000520, 0xD503201F"):
+            if needle not in text:
+                errors.append(f"{amfi_patch.name} lacks {needle[:16]}...: one AMFI deny branch "
+                              "would survive the payload build")
+    verifier = next((base / "scripts/verify-clover-payload.py"
+                     for base in (REPO, pathlib.Path.cwd())
+                     if (base / "scripts/verify-clover-payload.py").is_file()), None)
+    if verifier is None:
+        errors.append("scripts/verify-clover-payload.py is missing: nothing would prove either "
+                      "r164 half reached the payload")
+    else:
+        text = verifier.read_text()
+        for needle in ("NATIVE4K_SKIP", "check_dyld_cache_skip", "check_amfi_allow"):
+            if needle not in text:
+                errors.append(f"{verifier.name} lacks {needle}: the release could ship with an "
+                              "unchecked kernel half")
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",
