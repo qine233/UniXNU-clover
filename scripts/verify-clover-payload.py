@@ -323,6 +323,33 @@ def check_map_slide_probe(kernel: bytes) -> bool:
     return ok
 
 
+def check_cache_gate_probe(kernel: bytes) -> bool:
+    """Round155 asks what stopped dyld after the .01 open. r154's frame carried no map2 line at all,
+    so dyld never reached syscall 536, and the two remaining shapes are a header field that
+    preflightCacheFile rejected silently and a code-signature read still in progress. The image must
+    carry the header dump (fields plus vnode_size) and the F_ADDFILESIGS_RETURN trace (entry, hit,
+    allocation, read, duration). r153's open and r154's map2 strings must survive: this round adds a
+    question, it does not replace the earlier ones."""
+    label = "kernel.macho: cache gate probe linked"
+    found = {"hdr_size": b"clover r155: hdr %s vp=%p len=%lld sig=%llu+%llu err=%d/%d" in kernel,
+             "hdr_layout": b"clover r155: hdr %s off=%u n=%u ty=%llu/%u plat=%u/%u fl=%x" in kernel,
+             "hdr_maps": b"clover r155: hdr %s m0=%llu/%x ml=%llu/%x subs=%u@%u" in kernel,
+             "fsig": b"clover r155: fsig vp=%p start=%llu blob=%llu size=%llu" in kernel,
+             "fsig_hit": b"clover r155: fsig hit=1" in kernel,
+             "fsig_mem": b"clover r155: fsig mem=%p/%llu" in kernel,
+             "fsig_read": b"clover r155: fsig rd off=%llu len=%llu" in kernel,
+             "fsig_done": b"clover r155: fsig rd <- err=%d resid=%d ms=%llu" in kernel}
+    ok = all(found.values())
+    kept = (b"clover r153: open %s fmode=0x%x err=%d" in kernel and
+            b"clover r154: map2 enter files=%u mappings=%u" in kernel)
+    ok = ok and kept
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    detail += f", r153/r154 forms {'kept' if kept else 'GONE'}"
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def macho_symbols(kernel: bytes) -> tuple[list[tuple[str, int, int, int, int]], dict[str, int]]:
     """(segments, symbols): segments as (name, vmaddr, vmsize, fileoff, filesize), symbols as name -> va."""
     ncmds = struct.unpack_from("<I", kernel, 16)[0]
@@ -501,6 +528,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_shared_region_probe_removed(kernel)
         ok &= check_cache_open_probe(kernel)
         ok &= check_map_slide_probe(kernel)
+        ok &= check_cache_gate_probe(kernel)
         ok &= check_mac_probe(kernel)
         ok &= check_unattended(kernel)
         ok &= check_inline_asm_tails(kernel)

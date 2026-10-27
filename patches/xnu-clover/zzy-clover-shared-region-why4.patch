@@ -1,0 +1,79 @@
+diff --git a/bsd/kern/kern_descrip.c b/bsd/kern/kern_descrip.c
+index c966085..e87ea94 100644
+--- a/bsd/kern/kern_descrip.c
++++ b/bsd/kern/kern_descrip.c
+@@ -3951,10 +3951,28 @@ sys_fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
+ 			goto outdrop;
+ 		}
+ 
++		/*
++		 * clover r155: dyld registers each shared cache file's code
++		 * signature here, with fs_blob_size taken from the header's
++		 * codeSignatureSize. Printing the arguments and the length the
++		 * kernel ends up reading says whether the .01 file reached this
++		 * gate at all; a second line below says whether the blob was
++		 * already attached (a hit skips the disk) and how long the read
++		 * of a fresh blob took.
++		 */
++		if (cmd == F_ADDFILESIGS_RETURN) {
++			printf("clover r155: fsig vp=%p start=%llu blob=%llu size=%llu\n",
++			    vp, (uint64_t)fs.fs_file_start,
++			    (uint64_t)fs.fs_blob_start, (uint64_t)fs.fs_blob_size);
++		}
++
+ 		/*
+ 		 * First check if we have something loaded a this offset
+ 		 */
+ 		blob = ubc_cs_blob_get(vp, CPU_TYPE_ANY, CPU_SUBTYPE_ANY, fs.fs_file_start);
++		if (cmd == F_ADDFILESIGS_RETURN && blob != NULL) {
++			printf("clover r155: fsig hit=1\n");
++		}
+ 		if (blob != NULL) {
+ 			/* If this is for dyld_sim revalidate the blob */
+ 			if (cmd == F_ADDFILESIGS_FOR_DYLD_SIM) {
+@@ -3993,6 +4011,11 @@ sys_fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
+ 				vnode_put(vp);
+ 				goto outdrop;
+ 			}
++			if (cmd == F_ADDFILESIGS_RETURN) {
++				printf("clover r155: fsig mem=%p/%llu\n",
++				    (void *)kernel_blob_addr,
++				    (uint64_t)kernel_blob_size);
++			}
+ 
+ 			if (cmd == F_ADDSIGS) {
+ 				error = copyin(fs.fs_blob_start,
+@@ -4000,6 +4023,19 @@ sys_fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
+ 				    fs.fs_blob_size);
+ 			} else { /* F_ADDFILESIGS || F_ADDFILESIGS_RETURN || F_ADDFILESIGS_FOR_DYLD_SIM || F_ADDFILESIGS_INFO */
+ 				int resid;
++				uint64_t clover_start = 0;
++				uint64_t clover_ns = 0;
++				extern uint64_t mach_absolute_time(void);
++				extern void absolutetime_to_nanoseconds(uint64_t,
++				    uint64_t *);
++
++				if (cmd == F_ADDFILESIGS_RETURN) {
++					printf("clover r155: fsig rd off=%llu len=%llu\n",
++					    (uint64_t)(fs.fs_file_start +
++					    fs.fs_blob_start),
++					    (uint64_t)kernel_blob_size);
++					clover_start = mach_absolute_time();
++				}
+ 
+ 				error = vn_rdwr(UIO_READ,
+ 				    vp,
+@@ -4015,6 +4051,13 @@ sys_fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
+ 					/* kernel_blob_size rounded to a page size, but signature may be at end of file */
+ 					memset((void *)(kernel_blob_addr + (kernel_blob_size - resid)), 0x0, resid);
+ 				}
++				if (cmd == F_ADDFILESIGS_RETURN) {
++					absolutetime_to_nanoseconds(
++					    mach_absolute_time() - clover_start,
++					    &clover_ns);
++					printf("clover r155: fsig rd <- err=%d resid=%d ms=%llu\n",
++					    error, resid, clover_ns / 1000000);
++				}
+ 			}
+ 
+ 			if (error) {

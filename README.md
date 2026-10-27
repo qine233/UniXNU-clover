@@ -10913,6 +10913,143 @@ fastboot reboot
 linked OK`、`map-and-slide probe linked OK (enter/fd0/return/setup/mapfile present,
 r153 form kept)`。
 
+### r154 的帧说了什么（2026-10-27 冷启动）
+
+屏上依次是 `load_init_program` → `/usr/appleinternal/sbin/launchd.development` →
+`/sbin/launchd`、两条 `clover-mac: label-check …-> 1`，然后是：
+
+```
+clover r153: check_np dyld_flags=0x0
+shared_region: … [1(launchd)] check_np(0x16ea0bbb0) vm_shared_region_start_address() failed
+clover r153: open /System/Library/Caches/com.apple.dyld fmode=0x1 err=0 fl=0x14089821 vt=2 fs=apfs
+clover r153: check_np dyld_flags=0x0
+shared_region: … [1(launchd)] check_np(0x16ea0b150) vm_shared_region_start_address() failed
+clover r153: open dyld_shared_cache_arm64 fmode=0x1 err=0 fl=0x14089821 vt=1 fs=apfs
+clover r153: read err=0 resid=0 hdr=dyld_v1   arm64
+clover r153: open dyld_shared_cache_arm64.01 fmode=0x1 err=0 fl=0x14089821 vt=1 fs=apfs
+clover r153: read err=0 resid=0 hdr=dyld_v1   arm64
+```
+
+之后屏幕结束，**没有一条 `clover r154:`，也没有 panic**。三条结论：
+
+1. **syscall 536 没有进来**：`map2 enter` 是 536 入口的第一句，缺它即未进。
+   r154 的四种读法落到第 4 种，墙在 dyld 侧，不在 VFS 也不在映射阶梯。
+2. **`.01` 的 open 反证主缓存 preflight 全过**。按 dyld 源码，
+   `openSubSharedCacheFile(".01")` 只在 `preflightMainCacheFile` 返回真之后发生；
+   而主缓存的 preflight 已经包含 `fstat`、`pread(0x4000)`、magic、
+   `validPlatform`、mappingCount、`mappings[0].fileOffset==0`、
+   `codeSignatureOffset+codeSignatureSize==st_size`、maxProt、映射不重叠，以及
+   **`F_ADDFILESIGS_RETURN` 的整段签名块注册**。也就是说：签名块从 APFS 读进
+   UBC、并挂到 vnode 上，这条链在 r154 已经走通；`.01` 只是复用了同一份文件系统
+   与同一套 preflight 代码。
+3. **`dyld_flags=0x0` 与映射无关**。它只说明板级 owner chain 的 exec 成功块没跑到
+   （bit 3 没置），dyld 因此不把“磁盘上有缓存”当既定事实、自己去 open；这条路径
+   在 r153 已证明可达。r154 再次确认：flags 为 0 时 dyld 照样走到了 `.01`。
+
+剩下两种形态，这一帧无法区分：
+
+- **`.01` 的头字段被 dyld 静默拒绝**（`preflightCacheFile(…, nullptr)` 对子缓存
+  不做签名注册，但同样校验 platform/mapping/`st_size`；任一失败只是 `return
+  false`，没有日志）。
+- **卡在 `.01` 的签名块读**（`fcntl` 里 `vn_rdwr` 一次拉满整段 blob；若这段 blob
+  有几十 MB，APFS 冷读在 25 KB/s 量级下就是分钟级，屏幕在此期间停住，看起来和
+  “静默拒绝”一样）。
+
+r155 就是为了把这两种形态分开，并顺带回答“如果都过了，会不会直接走进 536”。
+
+## v0.5.8（round155）：`.01` 打开之后，dyld 停在哪道门
+
+### 改了什么
+
+两个补丁，各管一面，互不越界：
+
+- **`zzy-clover-shared-region-why2.patch` 扩写**（`bsd/vfs/vfs_vnops.c`）。在 r153
+  的 `read` 之后调用新的静态辅助函数
+  `clover_cache_header(vnode_t vp, const char *path)`：用 `vn_rdwr` 读 512 字节头
+  和 `map_count*32` 字节映射数组，把 dyld 自己马上要校验的字段原样打到屏上——
+  `len`/`sig`（`codeSignatureOffset+Size` 与 `st_size` 的对照）、
+  `off`/`n`/`ty`/`plat`/`fl`、`m0`/`ml`（首末 mapping 的 fileOffset 与 maxProt）、
+  `subs`（子缓存数组位置）。tag 取路径末三字符（`.01`）或 `"main"`，行首统一
+  `clover r155: hdr …`，**每行自带本轮身份**，避免再出现 r154 那种“帧无法自证镜子
+  是哪一版”的情况。只用 `IO_NODELOCKED | IO_NOAUTH`，不触发签名路径。
+- **`zzy-clover-shared-region-why4.patch`**（新建，**只动
+  `bsd/kern/kern_descrip.c`**）。在 `F_ADDFILESIGS_RETURN` 的内联分支里打四针：
+  `fsig vp=… start=… blob=… size=…`（copyin 之后，dyld 实际要求注册的范围）、
+  `fsig hit=1`（`ubc_cs_blob_get` 命中已有 blob，说明没重读）、
+  `fsig mem=…/…`（`ubc_cs_blob_allocate` 成功，给出内核 blob 地址与大小）、
+  `fsig rd off=… len=…` 与 `fsig rd <- err=… resid=… ms=…`
+  （`vn_rdwr` 前置时间戳 `mach_absolute_time()`，回来后换算成毫秒）。这样“签名块
+  读慢”就有了直接证据：`len` 是这段 blob 的真实尺寸，`ms` 是它花的时间。
+
+另外三处配套：
+
+- `check-clover.py`：why2 必须含 `clover_cache_header(vnode_t vp, const char *path)`
+  与三条 hdr 格式串，并**反向断言不许含 `clover r154:`**；why4 必须存在、只含
+  `bsd/kern/kern_descrip.c`、含五条 fsig 串与 `mach_absolute_time()`、断言
+  `rd off` 出现在 `mach_absolute_time() - clover_start` 之前；标题以
+  `clover r155:` 开头。
+- `verify-clover-payload.py`：新增 `check_cache_gate_probe`，镜像里必须同时有八条
+  r155 串（`hdr_size` / `hdr_layout` / `hdr_maps` / `fsig` / `fsig_hit` /
+  `fsig_mem` / `fsig_read` / `fsig_done`），且 r153 的 open 串仍在。
+- `board.toml` 的 `title`。
+
+一个必须记住的构建陷阱：`scripts/save-xnu-patch.py` 以“HEAD + 名字排序在目标之前
+的补丁”为基线，而工作区里**同时**存在 why3 的 r154 改动。直接重新生成 why2 会把
+r154 的行吸进 why2。正确顺序是先 `git apply --reverse` why3 → 生成 why2 → 再
+`git apply` why3；checker 里那条“why2 不许含 r154”就是防这个回归的。
+
+### 构建与刷写
+
+```sh
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build kernel payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+只写 `cache`，冷启动：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round155-payload.img
+fastboot reboot
+```
+
+### 这一帧怎么读
+
+先看 `hdr .01`（或 `hdr main`）那三行，再看 `fsig`：
+
+1. `hdr .01` 的 `plat` 不等于进程平台（arm64 / 非 simulator），或 `m0`/`ml` 的
+   `maxProt` 不含读执行，或 `sig` 加起来不等于 `len`：dyld 会在该字段静默
+   `return false`。这就是“头字段被拒”的形态，墙在缓存文件本身。
+2. `hdr .01` 全部合规，随后出现 `fsig vp=… rd off=… len=…` 但**没有**
+   `fsig rd <-`：签名块读卡住了。`len` 就是卡住的字节数。
+3. `fsig rd <- … ms=` 的 `ms` 很大（几十秒级）而同一条后面还有输出：只是慢，
+   不是卡；下一帧应该在 `ms` 之后继续走。
+4. `fsig hit=1` 且没有 `fsig rd`：这份 blob 已经注册过（主缓存注册的同一段），
+   签名注册不是墙。
+5. 头合规、签名也过了，紧接着出现 `map2 enter`：`.01` 整段 preflight 通过，
+   dyld 往下走到 536，墙在映射阶梯（回到 r154 的读法 1–3）。
+6. 头合规、签名过了、但既没有 `map2 enter` 也没有更多 `fsig`：dyld 在子缓存的
+   后续校验（mapping 与主缓存重叠、subcache 数组一致性）里停下，下一轮转查
+   dyld 的 `mapSplitCacheSystemWide`。
+
+这一帧只问一个问题：**`.01` 打开之后，dyld 是被头字段拒、被签名块读拖住，还是
+已经跨进 syscall 536。**
+
+产物归档在 `~/clover-out/round155-*`，`round155-SHA256SUMS` 八项：
+`payload.img` 58,720,256 B（`6b5a15f4…`）、本地 `kernel.macho` 51,998,720 B
+（`0ee70622…`）、卷内 `kernel.macho`（`4bb7dcf2…`，r153/r154/r155 三类探针都
+在）、卷内 `unixnu.toml` 620 B（`22c9b271…`）、ADT 13,516 B（`6d1acfdb…`）、
+`scratch-data.img` 35,888 B（`614b8356…`）、`trustcache` 61,408 B
+（`7c369ce0…`）、构建日志（`03cba9db…`）。两个 checker 的结果：
+`clover ok: ADT 13516 bytes, 8 cores; … 75 inline asm statements separated;
+modules visible`、`kernel.macho: probe patch localized OK (6836 bytes in 35 runs)`、
+`cache gate probe linked OK (hdr_size/hdr_layout/hdr_maps/fsig/fsig_hit/fsig_mem/
+fsig_read/fsig_done present, r153/r154 forms kept)`、`map-and-slide probe linked
+OK`、`cache open probe linked OK`。
+
 ## 许可证
 
 BSD-2-Clause-Patent，与 UniXNU 一致。`scripts/build-arm-driver.py` 移植自

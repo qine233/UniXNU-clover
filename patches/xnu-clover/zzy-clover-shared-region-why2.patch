@@ -1,6 +1,8 @@
+diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
+index eae8459..9b4e662 100644
 --- a/bsd/vfs/vfs_vnops.c
 +++ b/bsd/vfs/vfs_vnops.c
-@@ -372,7 +372,7 @@
+@@ -372,7 +372,7 @@ out:
   *		in the code they originated.
   */
  int
@@ -9,11 +11,98 @@
  {
  	struct vnode *vp;
  	struct vnode *dvp;
-@@ -755,6 +755,56 @@
- 	}
+@@ -758,6 +758,147 @@ out:
+ 	return error;
+ }
  
- out:
-+	return error;
++/*
++ * clover r155: dyld's own preflight reads 0x4000 bytes of a cache file and then
++ * accepts or rejects it on header fields alone, without printing anything. Dump
++ * those fields -- and the length vnode_size() reports, which the signature check
++ * compares against -- so each frame carries the verdict for each file. The .01
++ * open proves the main cache already passed the same checks; these readings say
++ * which check the subcache would fail, if dyld never asks the kernel for more.
++ * The mapping array lives past the 512-byte first read, so it gets a second one.
++ */
++static void
++clover_cache_header(vnode_t vp, const char *path)
++{
++	static const char clover_digits[] = "0123456789";
++	uint8_t hdr[512];
++	uint8_t maps[8 * 32];
++	off_t length = 0;
++	size_t plen = strlen(path);
++	const char *tag = "main";
++	uint64_t sig_offset = 0;
++	uint64_t sig_size = 0;
++	uint64_t cache_type = 0;
++	uint32_t map_offset = 0;
++	uint32_t map_count = 0;
++	uint32_t platform = 0;
++	uint32_t flags_word = 0;
++	uint32_t alt_platform = 0;
++	uint32_t sub_offset = 0;
++	uint32_t sub_count = 0;
++	uint32_t sub_type = 0;
++	uint64_t m0_offset = 0;
++	uint64_t ml_offset = 0;
++	uint32_t m0_max = 0;
++	uint32_t ml_max = 0;
++	int hdr_resid = 0;
++	int hdr_error;
++
++	if (plen >= 3 && path[plen - 3] == '.' &&
++	    strchr(clover_digits, path[plen - 2]) != NULL &&
++	    strchr(clover_digits, path[plen - 1]) != NULL) {
++		tag = path + plen - 3;
++	}
++
++	memset(hdr, 0, sizeof(hdr));
++	hdr_error = vn_rdwr(UIO_READ, vp, hdr, sizeof(hdr), 0, UIO_SYSSPACE,
++	    IO_NODELOCKED | IO_NOAUTH, kauth_cred_get(), &hdr_resid,
++	    current_proc());
++	(void)vnode_size(vp, &length, vfs_context_current());
++	if (hdr_error == 0) {
++		memcpy(&map_offset, hdr + 16, sizeof(map_offset));
++		memcpy(&map_count, hdr + 20, sizeof(map_count));
++		memcpy(&sig_offset, hdr + 40, sizeof(sig_offset));
++		memcpy(&sig_size, hdr + 48, sizeof(sig_size));
++		memcpy(&cache_type, hdr + 104, sizeof(cache_type));
++		memcpy(&platform, hdr + 216, sizeof(platform));
++		memcpy(&flags_word, hdr + 220, sizeof(flags_word));
++		memcpy(&alt_platform, hdr + 368, sizeof(alt_platform));
++		memcpy(&sub_offset, hdr + 392, sizeof(sub_offset));
++		memcpy(&sub_count, hdr + 396, sizeof(sub_count));
++		memcpy(&sub_type, hdr + 456, sizeof(sub_type));
++	}
++	printf("clover r155: hdr %s vp=%p len=%lld sig=%llu+%llu err=%d/%d\n",
++	    tag, vp, (long long)length, sig_offset, sig_size, hdr_error,
++	    hdr_resid);
++	printf("clover r155: hdr %s off=%u n=%u ty=%llu/%u plat=%u/%u fl=%x\n",
++	    tag, map_offset, map_count, cache_type, sub_type, platform,
++	    alt_platform, flags_word);
++	if (hdr_error == 0 && map_count != 0 && map_count <= 8) {
++		int map_resid = 0;
++		int map_error = vn_rdwr(UIO_READ, vp, maps, map_count * 32,
++		    map_offset, UIO_SYSSPACE, IO_NODELOCKED | IO_NOAUTH,
++		    kauth_cred_get(), &map_resid, current_proc());
++
++		if (map_error == 0) {
++			uint32_t last = map_count - 1;
++
++			memcpy(&m0_offset, maps + 16, sizeof(m0_offset));
++			memcpy(&m0_max, maps + 24, sizeof(m0_max));
++			memcpy(&ml_offset, maps + last * 32 + 16,
++			    sizeof(ml_offset));
++			memcpy(&ml_max, maps + last * 32 + 24, sizeof(ml_max));
++			printf("clover r155: hdr %s m0=%llu/%x ml=%llu/%x subs=%u@%u\n",
++			    tag, m0_offset, m0_max, ml_offset, ml_max,
++			    sub_count, sub_offset);
++		} else {
++			printf("clover r155: hdr %s map err=%d resid=%d\n", tag,
++			    map_error, map_resid);
++		}
++	}
 +}
 +
 +/*
@@ -62,13 +151,19 @@
 +		    current_proc());
 +		printf("clover r153: read err=%d resid=%d hdr=%s\n",
 +		    read_error, residual, header);
++		clover_cache_header(vp, path);
 +	}
- 	return error;
- }
- 
++	return error;
++}
++
+ #if vn_access_DEPRECATED
+ /*
+  * Authorize an action against a vnode.  This has been the canonical way to
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+index dcebcb8..2ecf713 100644
 --- a/bsd/vm/vm_unix.c
 +++ b/bsd/vm/vm_unix.c
-@@ -2107,6 +2107,14 @@
+@@ -2107,6 +2107,14 @@ shared_region_check_np(
  		proc_getpid(p), p->p_comm,
  		(uint64_t)uap->start_address));
  

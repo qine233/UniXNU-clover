@@ -779,15 +779,24 @@ def check_board(errors: list) -> str:
                     "\"/System/Library/Caches/com.apple.dyld\"",
                     "\"dyld_shared_cache\"",
                     "clover r153: read err=%d resid=%d hdr=%s",
-                    "clover r153: check_np dyld_flags=0x%llx")
+                    "clover r153: check_np dyld_flags=0x%llx",
+                    "clover_cache_header(vnode_t vp, const char *path)",
+                    "clover r155: hdr %s vp=%p len=%lld sig=%llu+%llu err=%d/%d",
+                    "clover r155: hdr %s off=%u n=%u ty=%llu/%u plat=%u/%u fl=%x",
+                    "clover r155: hdr %s m0=%llu/%x ml=%llu/%x subs=%u@%u")
                    if needle not in text]
         for needle in missing:
             errors.append(f"{cache_probe.name} lacks {needle!r}: the open, the header read and the "
-                          "dyld_flags line are the three halves of the cache-reachability question")
+                          "dyld_flags line are the three halves of the cache-reachability question, "
+                          "and the r155 hdr lines are the verdict dyld never prints")
         if "clover r151:" in text:
             errors.append(f"{cache_probe.name} still carries a 'clover r151:' string: that form read "
                           "cn_pnbuf before NDINIT's copyin filled it, so the probe returned early "
                           "on every open and the frame stayed silent for the wrong reason")
+        if "clover r154:" in text:
+            errors.append(f"{cache_probe.name} carries a 'clover r154:' string: why2 is the "
+                          "open/header probe, why3 is the map-and-slide probe, and a rebuild made "
+                          "while why3 was applied would fold r154 into this file")
         if "+#include" in text or "-vn_open_auth(struct nameidata *ndp" not in text:
             errors.append(f"{cache_probe.name} does not rename vn_open_auth to vn_open_auth_internal: "
                           "the probe would replace the open path instead of watching it")
@@ -837,6 +846,49 @@ def check_board(errors: list) -> str:
                 errors.append(f"{map_probe.name} has no {stage!r}: the ladder would not reach the "
                               "mount, size or memory-object gates")
 
+    # Round155. r154's frame carried no "clover r154:" line at all, so dyld stopped
+    # between the .01 open and syscall 536. There are two shapes the frame cannot
+    # tell apart: dyld's own preflight rejected a .01 header field and returned
+    # without printing, or it reached the code-signature registration and is sitting
+    # in the kernel reading a multi-megabyte blob at this board's block speed. why2
+    # now dumps the header fields preflightCacheFile checks plus vnode_size, and why4
+    # watches F_ADDFILESIGS_RETURN -- dyld's signature registration for cache files --
+    # printing the request, the allocation, the read and its wall time. The header
+    # verdict says whether .01 should have reached the fcntl; the fsig lines say
+    # whether it did and what the kernel answered.
+    fsig_probe = next((base / "patches/xnu-clover/zzy-clover-shared-region-why4.patch"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "patches/xnu-clover/zzy-clover-shared-region-why4.patch").is_file()), None)
+    if fsig_probe is None:
+        errors.append("patches/xnu-clover/zzy-clover-shared-region-why4.patch is missing: without it "
+                      "the frame cannot tell a rejected .01 header from a slow signature read")
+    else:
+        text = fsig_probe.read_text()
+        missing = [needle for needle in
+                   ("bsd/kern/kern_descrip.c",
+                    "clover r155: fsig vp=%p start=%llu blob=%llu size=%llu",
+                    "clover r155: fsig hit=1",
+                    "clover r155: fsig mem=%p/%llu",
+                    "clover r155: fsig rd off=%llu len=%llu",
+                    "clover r155: fsig rd <- err=%d resid=%d ms=%llu",
+                    "mach_absolute_time()",
+                    "(uint64_t)kernel_blob_size")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"{fsig_probe.name} lacks {needle!r}: the entry, the hit, the allocation, "
+                          "the read and its duration are what separate a refusal from a stall")
+        if "vfs_vnops.c" in text or "vm_unix.c" in text:
+            errors.append(f"{fsig_probe.name} touches another file: why4 is the fcntl-side probe "
+                          "and must leave why2's wrapper and why3's ladder alone")
+        if "clover r153:" in text or "clover r154:" in text:
+            errors.append(f"{fsig_probe.name} carries another round's string: r153 lives in why2 "
+                          "and r154 in why3")
+        read = text.find("clover r155: fsig rd off=%llu len=%llu")
+        timing = text.find("mach_absolute_time() - clover_start")
+        if read < 0 or timing < 0 or timing < read:
+            errors.append(f"{fsig_probe.name} starts the clock before it prints the read: the frame "
+                          "would lose the offset/length line that names the blob")
+
     # Round148. Round147 shipped an unattended deadline that fired on the very first timer tick, with
     # a garbage counter in the message. The cause was not the arithmetic: the Darwin arm64 assembler
     # reads `;` as the comment character, so every multi-instruction asm string kept only its first
@@ -864,11 +916,11 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round154. r153's frame showed dyld reading both cache headers and then going
-    # quiet, so this round asks whether it enters syscall 536 and which gate answers.
-    # The menu has to name that round.
-    if not board["payload"]["title"].startswith("clover r154:"):
-        errors.append('[payload] title is not "clover r154: ...": the menu would not name this round')
+    # Round155. r154's frame answered its own question with a blank: no map2 line at
+    # all, so dyld never reached syscall 536. This round asks what stopped it at
+    # .01, and the menu has to name that round.
+    if not board["payload"]["title"].startswith("clover r155:"):
+        errors.append('[payload] title is not "clover r155: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",
