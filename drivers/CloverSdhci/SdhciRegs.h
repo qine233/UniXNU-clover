@@ -177,6 +177,34 @@
 #define SDHCI_CMD_ABORTCMD      0xC0
 #define SDHCI_MAKE_CMD(index, flags) ((((index) & 0xff) << 8) | ((flags) & 0xff))
 
+// ------------------------------------------------------------------ ADMA2 descriptors (r172)
+//
+// Byte-for-byte the shape Xiaomi's own tree for this tablet used, which is the strongest reference
+// this port has: the CAF 4.19 `drivers/mmc/host/sdhci.h` (saved as
+// /tmp/sdhci-research/v419-host-sdhci.h) lines 287-322 define the descriptor, and
+// `drivers/mmc/host/sdhci.c` (v419-sdhci.c) lines 557-575 write it:
+//
+//   struct sdhci_adma2_64_desc { __le16 cmd; __le16 len; __le32 addr_lo; __le32 addr_hi; }
+//   #define SDHCI_ADMA2_64_DESC_SZ  12
+//   #define ADMA2_TRAN_VALID        0x21
+//   #define ADMA2_NOP_END_VALID     0x3
+//   #define ADMA2_END               0x2
+//
+// The `cmd` u16 comes first and the 16-byte-count `len` second, both little-endian -- that is what
+// Linux guesses the spec's byte order to be, and what this controller's Linux driver shipped to
+// millions of these units. A `len` of 65536 truncates to 0, and 0 is the spec's own "65536", so the
+// writer needs no special case.
+//
+// Whether the table ends with a NOP+END descriptor or marks the last transfer entry as END is
+// decided by SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC, and sdhci-msm.c:5646 sets that quirk unconditionally
+// for this controller family -- so the last transfer entry takes ADMA2_END (0x2) in its `cmd` and no
+// NOP entry follows it.
+#define SDHCI_ADMA2_64_DESC_SZ    12     // bytes per descriptor in 64-bit addressing mode
+#define SDHCI_ADMA2_TRAN_VALID    0x0021 // "transport, valid" -- every data descriptor
+#define SDHCI_ADMA2_NOP_END_VALID 0x0003 // "nop, end, valid" -- only without the MSM quirk
+#define SDHCI_ADMA2_END           0x0002 // OR-ed into the last descriptor's cmd
+#define SDHCI_ADMA2_MAX_DATA      65536u // the length field's own ceiling, 0 spelling included
+
 // SDHCI_HOST_CONTROL2 (0x3E, u16)
 #define SDHCI_CTRL_UHS_MASK     0x0007
 #define  SDHCI_CTRL_UHS_SDR12   0x0000

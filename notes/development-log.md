@@ -12326,3 +12326,104 @@ fastboot reboot
 落盘由一次 commit 承担）；`multi read fail … st=0x21 w=1024/1024` 是否不再出现、
 `readcheck … trusted=1` 是否上屏（判据认交付字数之后，批量读该被信任了）。
 三件都成立的话，launchd 的页就能继续映射进来，下一格才轮到 536 与 `/data`。
+
+## v0.5.28（round172）：读通路交给主机自己搬，逐字相同才准用
+
+round171 把写的那堵墙拆掉了（批量判据、写缓存开与提交、`IOLock`、批量 128
+块），但它没动「每个字节都过 CPU」这件事。r156 在批量路径上量到 16 KiB /
+7 ms，约 2 MB/s；dyld 共享缓存实测 3.71 GiB，按这个速率光是读进来就是几十
+分钟，而 launchd 之后每个守护进程都要再读一遍自己的签名块。这一轮只解决速度，
+不解决任何正确性——正确性由一个逐字比较的闸门来保证。
+
+**一、依据是固件自己的读数。** `cap=0x742dc8b2` 里 `SDHCI_CAN_DO_ADMA2`
+（0x00080000）与 `SDHCI_CAN_64BIT`（0x10000000）都置位、`SDHCI_CAN_DO_SDMA`
+（0x00400000）为空；验证头留下的最后一个 `HOST_CONTROL` 是 `hcl=38`，也就是
+ADMA64（0x18）加 8 线（0x20）；`en=07ff003f` 说明 `DATA_END`、`DMA_END` 和全
+部错误位本来就是使能的，`INT_STATUS` 轮询不需要再写 0x34。所以这条通路不是
+新硬件假设，是把 boot loader 已经在用的东西接回来。
+
+**二、描述符形状是抄的，不是回忆的。** 从小米自家 4.19 CAF 树（留存于
+`/tmp/sdhci-research/`）逐字节转录进 `SdhciRegs.h`：`v419-host-sdhci.h:287-322`
+的 `struct sdhci_adma2_64_desc` 是 `cmd` u16 在前、字节数 `len` u16 在后、
+`addr_lo`/`addr_hi` 各 u32，小端，共 12 字节（`host->desc_sz = 12`），
+`ADMA2_TRAN_VALID` 0x21、`ADMA2_END` 0x02、`SDHCI_ADMA2_DESC_ALIGN` 8；
+`sdhci-msm.c:5646` 对本家族无条件设 `SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC`，
+所以传输表的最后一项自己带 END，**不追加 NOP 终止项**。顺带纠正一处一开始的
+误读：`HOST_CONTROL` 的 0x20 是 `SDHCI_CTRL_8BITBUS`，不是「64-bit 系统总线」；
+`sdhci.c:330-356` 的 `sdhci_init` 里 64 位 ADMA 完全由 DMA 字段（ADMA32/ADMA64）
+决定，`SDHCI_CTRL_64BIT_ADDR` 只在 v4 mode 才出现在 HOST_CONTROL2。代码按这个
+来写，`checker` 按这个来断言。
+
+**三、实现。** 数据不落调用方的缓冲区：一块本驱动自己分配、整 boot 不释放的
+bounce（64 KiB，正好一个 128 块读）加一页描述符表，`inTaskWithOptions(kernel_task,
+kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryMapperNone, …, 4096)`，
+并按 sheng `drivers/NativeUfs/NativeUfs.cpp` 的四条检查裁决（虚拟地址可得、物理
+地址存在且页对齐、整段一个连续 `getPhysicalSegment`、非 64 位主机时不得跨过
+4 GiB）。缓存维护也照 sheng 的 848-868 行形状：设备要写之前 `dc civac` 整段、
+落地之后 `dsb sy; dc ivac` 整段。表每项不超过 32 KiB（65536 在长度字段里是
+「0」的写法，宁可让每项都是看得懂的字节数），写完表再 `dc civac`。命令侧就是
+`readMultiBlock` 的同一条 CMD18，只在 `TRANSFER_MODE` 多一个 `SDHCI_TRNS_DMA`，
+等 `DATA_END` 对内容错误位与 `ADMA_ERROR`，CMD12 收尾，成功才逐字拷出。
+
+**四、闸门。** `checkDmaPath()` 对同一个 LBA、同一样本跑两遍——一遍 r171 已
+信任的批量 PIO，一遍 ADMA——逐字数差异，只有两边都完成、字数齐、差异为 0 才
+`gDmaTrusted = true`；它排在 `checkReadPath` 之后且要求 `gReadBatchTrusted`，
+因为 ADMA2 骑的就是那条多块命令。任何一次 DMA 失败都落回 PIO 批量，累计八次
+退役整轮，退役与拒绝都各有上限的行。于是本机的最坏情况就是 round171 加几行
+读数，而不是一个坏掉的读。**写通路本轮一律不动**：DMA 写错了不会以 EIO 回来，
+它会改卡；写的那道闸门是「往暂存区写模式、再用 PIO 读回来比」，排在读通路拿到
+帧之后。
+
+**契约与构建。** `check-clover.py` 新增 Round172 一节：断言 `AdmaPath` /
+`dmaBringUp` / `admaWriteEntry` / `admaBuildTable` / `readAdmaRun` /
+`checkDmaPath` 的形状、两道闸门的先后、`SDHCI_TRNS_DMA` 只出现在读模式那一行、
+五条新读数，以及 `SdhciRegs.h` 里的 CAF 出处；反向断言 `gDmaTrusted = true`
+这种无条件信任、描述符表里的 NOP 终止项、以及任何 `SDHCI_TRNS_WRITE …
+SDHCI_TRNS_DMA` 组合都不能存在。`verify-clover-payload.py` 加 `DMA_INTEGRITY`
+五条串并入 `eMMC read/write integrity` 一项。驱动在树内 `-Wall -Wextra
+-Werror` 单编通过，两个 checker 全绿。本轮 XNU 补丁一颗不动，构建前照例在
+`out/clover/tree/.cache/xnu-work` 里逆撤 `zzy-clover-dyld-cache-skip.patch`
+（否则 `native-4k-signature-hash-cache.patch` 正反都校验不过），先内核、再
+payload：
+
+```sh
+cd ~/UniXNU && /opt/homebrew/bin/python3.13 ./unixnu build kernel --device ../UniXNU-clover
+/opt/homebrew/bin/python3.13 ~/UniXNU-clover/scripts/patch-clover-amfi.py \
+  ~/UniXNU/out/clover/kernel/kernel.macho ~/clover-out/round172-kernel-amfi.macho
+/opt/homebrew/bin/python3.13 ./unixnu build payload --device ../UniXNU-clover \
+  --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --kernel /Users/zhouzhou/clover-out/round172-kernel-amfi.macho \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+```
+
+产物：prelink 内核 `eab0f2f7…`；打过 AMFI 的拷贝 `a04ae602…`（两处站点
+`0x1a870e4` / `0x1a8716c` 与 round171 相同）；payload `b517d165…`（56 MiB，
+58,720,256 字节），卷内 kernel `74abdd25…`、`unixnu.toml` `28f3cc2a…`、
+ADT `4d39aa25…`、`scratch-data.img` `614b8356…`（未变）、trustcache
+`7c369ce0…`（未变）。入口探针 `6843 bytes in 37 runs`；`verify-clover-payload.py`
+全项 OK，`eMMC read/write integrity` 现在多要求 `dma up data=`、
+`dmacheck lba=`、两条 trusted/stay 结论与 `first dma read lba=`。归档在
+`~/clover-out/round172-*`，清单 `round172-SHA256SUMS`。round171 的改动全部在
+这颗镜像里，所以这一刷同时是 round171 的那三问。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round172-payload.img
+fastboot reboot
+```
+
+冷刷，不用 `fastboot boot`；`userdata` 不动。
+
+这一刷按顺序读四件事。第一，有没有 `CloverSdhci r172: dma up data=… wide=1`：
+有就说明 bounce 过了那四条检查，没有（或换成 `unusable DMA addresses` /
+`bounce allocation failed`）就说明这颗主机给不出可用的物理段。第二，
+`dmacheck … trusted=1` 还是 `trusted=0`：`trusted=0` 时看 `diff=`/`first=`/
+`st=`/`err8=`，这同时是「ICE 或固件留下的 SMMU 上下文是否允许这颗主机 DMA 到
+原始 DDR 地址」的答案，而不是一个含糊的失败。第三，`ms=…/…` 与
+`kbs=…/…` 两个数：DMA 相对 PIO 到底快多少倍，直接决定 536 那一格要不要重排。
+第四，`first dma read lba=… blocks=… ms=…` 有没有出现——有 writes、有 dmacheck
+而没有这一行，说明信任拿到了但请求没走到批量长度。round171 的三问（`read
+guard` 是否整批消失、`tx_flush` 是否掉回毫秒、`readcheck … trusted=1`）在同一
+帧里一起读。

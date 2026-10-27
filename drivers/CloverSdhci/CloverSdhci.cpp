@@ -1533,6 +1533,361 @@ static void reportReadFailure (const char *stage, uint32_t lba, uint32_t blocks,
          stage, lba, blocks, done, status);
 }
 
+// ---------------------------------------------------------------- round172: the ADMA2 read path
+//
+// WHY THERE IS ONE
+//
+// Every byte this port has read out of the card has been carried by the CPU: read32 (SDHCI_BUFFER)
+// into a word, one word at a time, with the level bit saying when the next is there. That ceiling is
+// what makes a 3.7 GiB dyld shared cache unreadable at boot -- r156 measured 16 KiB in 7 ms on the
+// batch path (about 2 MB/s), and the same card on the same link moves far more when the host empties
+// its own FIFO into memory. The controller says it can do exactly that: `cap=0x742dc8b2` has
+// SDHCI_CAN_DO_ADMA2 (0x00080000) and SDHCI_CAN_64BIT (0x10000000) set and SDHCI_CAN_DO_SDMA
+// (0x00400000) clear, and the firmware's own last HOST_CONTROL was `hcl=38`, which is ADMA64 (0x18)
+// plus the 8-bit bus (0x20). The path this round adds is the one the boot loader was already using.
+//
+// WHAT MAKES IT SAFE TO ADD AT ALL
+//
+// Three things, in this order. The descriptor layout is transcribed from the tablet's own 4.19 CAF
+// tree rather than recalled (see SdhciRegs.h); the DMA reads into a bounce buffer that this driver
+// allocated itself, is page-aligned, physically contiguous and used by nothing else, so no caller's
+// buffer has to be walkable by the bus; and the path is only used after the device has proved it.
+// checkDmaPath() reads the same run twice -- once through the batch PIO path the r167 gate already
+// trusted, once through ADMA -- and compares every word. ADMA is used for the rest of the boot only
+// when the two agree word for word; anything else and the boot reads exactly as it did in round171.
+// That also means an unknown in this round is answered rather than suffered: if the ICE or an SMMU
+// translation the firmware left behind sits between this host and raw DDR addresses, the ADMA read
+// comes back wrong or with ADMA_ERROR, the gate says so on the screen, and the DMA verdict is one
+// number in the frame instead of a corrupted read.
+//
+// WHAT THIS ROUND DOES NOT TOUCH
+//
+// Writes. They stay on the PIO path r171 fixed, because a DMA write that is wrong does not read back
+// as an EIO -- it changes the card. Once the read path has a frame behind it, the write path gets the
+// same gate with a pattern written to a scratch run and read back through PIO; that is the next item,
+// not this one.
+static const uint32_t kAdmaEntryBytes = SDHCI_ADMA2_64_DESC_SZ;
+// 32 KiB per descriptor, not the field's own 64 KiB: 65536 is the length field's zero spelling, and
+// a table whose every entry is a plain byte count is one that can be checked on the host.
+static const uint32_t kAdmaEntryMaxBytes = 32768u;
+static const uint32_t kAdmaDataBytes = kReadChunkBlocks * 512u;   // 65536, one whole chunk
+static const uint32_t kAdmaTableBytes = 4096u;                    // 5 entries' worth, one page
+static const uint64_t kAdmaAlign = 4096ULL;
+
+struct AdmaPath {
+  // One retained reference each, held for the whole boot: this driver is never unloaded, and the
+  // bus master can be mid-descriptor-fetch when a later round would otherwise free it. sheng's
+  // NativeUfs keeps its DMA buffer the same way (its UfsHost::dma is a raw IOBufferMemoryDescriptor).
+  IOBufferMemoryDescriptor *data = nullptr;
+  IOBufferMemoryDescriptor *table = nullptr;
+  uint8_t *dataVirt = nullptr;
+  uint8_t *tableVirt = nullptr;
+  uint64_t dataPhys = 0;
+  uint64_t tablePhys = 0;
+  uint64_t dataContiguous = 0;
+  bool wide = false;
+  bool tried = false;
+  bool available = false;
+};
+static AdmaPath gAdma;
+static bool gDmaTrusted = false;
+static bool gDmaCheckDone = false;
+static uint32_t gDmaFailures = 0;
+
+// The two cache operations a bus master makes the CPU care about, taken from sheng's NativeUfs
+// (drivers/NativeUfs/NativeUfs.cpp:848-868) because that is the shape this codebase already trusts:
+// clean-and-invalidate over the range before the device writes it, invalidate after it lands, each
+// bounded by dsb sy. 64-byte lines are the smallest line any arm64 core in this family has, and the
+// bounce is page-aligned with transfers that are whole multiples of 512, so no line here is shared
+// with anything the CPU also wants.
+static void cacheCleanInvalidate (const void *start, uint32_t length)
+{
+  uintptr_t address = reinterpret_cast<uintptr_t> (start) & ~uintptr_t (63);
+  const uintptr_t end = reinterpret_cast<uintptr_t> (start) + length;
+  for (; address < end; address += 64) {
+    __asm__ volatile ("dc civac, %0" :: "r" (address) : "memory");
+  }
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void cacheInvalidate (const void *start, uint32_t length)
+{
+  __asm__ volatile ("dsb sy" ::: "memory");
+  uintptr_t address = reinterpret_cast<uintptr_t> (start);
+  const uintptr_t end = address + length;
+  for (; address < end; address += 64) {
+    __asm__ volatile ("dc ivac, %0" :: "r" (address) : "memory");
+  }
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+// The buffers the host will read and write, and the address it will read them from. Every refusal is
+// a reason printed once, because "the DMA path never came up" has to be distinguishable from "the
+// DMA path came up and lost the comparison" without another round.
+static bool dmaBringUp (void)
+{
+  if (gAdma.tried) {
+    return gAdma.available;
+  }
+  gAdma.tried = true;
+  const uint32_t cap = read32 (SDHCI_CAPABILITIES);
+  if (!(cap & SDHCI_CAN_DO_ADMA2)) {
+    IOLog ("CloverSdhci r172: host has no ADMA2, cap=%08x\n", cap);
+    return false;
+  }
+  gAdma.wide = (cap & SDHCI_CAN_64BIT) != 0;
+  const IOOptionBits options = static_cast<IOOptionBits> (kIODirectionInOut) |
+                               static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
+                               static_cast<IOOptionBits> (kIOMemoryMapperNone);
+  gAdma.data = IOBufferMemoryDescriptor::inTaskWithOptions (kernel_task, options,
+                                                            kAdmaDataBytes, kAdmaAlign);
+  gAdma.table = IOBufferMemoryDescriptor::inTaskWithOptions (kernel_task, options,
+                                                             kAdmaTableBytes, kAdmaAlign);
+  if (!gAdma.data || !gAdma.table) {
+    IOLog ("CloverSdhci r172: bounce allocation failed data=%p table=%p\n",
+           (void *) gAdma.data, (void *) gAdma.table);
+    return false;
+  }
+  gAdma.dataVirt = static_cast<uint8_t *> (gAdma.data->getBytesNoCopy ());
+  gAdma.tableVirt = static_cast<uint8_t *> (gAdma.table->getBytesNoCopy ());
+  IOByteCount contiguous = 0;
+  gAdma.dataPhys = gAdma.data->getPhysicalSegment (0, &contiguous, kIOMemoryMapperNone);
+  gAdma.dataContiguous = static_cast<uint64_t> (contiguous);
+  IOByteCount tableContiguous = 0;
+  gAdma.tablePhys = gAdma.table->getPhysicalSegment (0, &tableContiguous, kIOMemoryMapperNone);
+  // The same four checks sheng applies to its own DMA buffer: a virtual address the CPU can use, a
+  // physical one the bus can use, the whole run in one segment, and no address above 4 GiB unless the
+  // host is the 64-bit kind. A bounce that is not contiguous would need one descriptor per segment,
+  // which is a different round.
+  if (!gAdma.dataVirt || !gAdma.tableVirt || !gAdma.dataPhys || !gAdma.tablePhys ||
+      (gAdma.dataPhys & (kAdmaAlign - 1ULL)) ||
+      gAdma.dataContiguous < kAdmaDataBytes ||
+      static_cast<IOByteCount> (tableContiguous) < kAdmaTableBytes ||
+      (!gAdma.wide && gAdma.dataPhys + kAdmaDataBytes > 0x100000000ULL)) {
+    IOLog ("CloverSdhci r172: unusable DMA addresses data=%llx contig=%llu table=%llx wide=%d\n",
+           static_cast<unsigned long long> (gAdma.dataPhys),
+           static_cast<unsigned long long> (gAdma.dataContiguous),
+           static_cast<unsigned long long> (gAdma.tablePhys), gAdma.wide ? 1 : 0);
+    return false;
+  }
+  gAdma.available = true;
+  IOLog ("CloverSdhci r172: dma up data=%llx table=%llx cap=%08x en=%08x hctl=%02x wide=%d\n",
+         static_cast<unsigned long long> (gAdma.dataPhys),
+         static_cast<unsigned long long> (gAdma.tablePhys), cap,
+         read32 (SDHCI_INT_ENABLE), read8 (SDHCI_HOST_CONTROL), gAdma.wide ? 1 : 0);
+  return true;
+}
+
+// One ADMA2 descriptor, in the CAF 4.19 byte order: cmd u16, length u16, address low u32, address
+// high u32. Written as bytes rather than through a struct because the layout is the host's, not the
+// CPU's, and this way the six stores are the documentation.
+static void admaWriteEntry (uint32_t index, uint64_t address, uint32_t length, uint16_t cmd)
+{
+  uint8_t *entry = gAdma.tableVirt + static_cast<uint64_t> (index) * kAdmaEntryBytes;
+  entry[0] = static_cast<uint8_t> (cmd & 0xff);
+  entry[1] = static_cast<uint8_t> (cmd >> 8);
+  entry[2] = static_cast<uint8_t> (length & 0xff);
+  entry[3] = static_cast<uint8_t> ((length >> 8) & 0xff);
+  for (unsigned byte = 0; byte < 8; byte++) {
+    entry[4 + byte] = static_cast<uint8_t> ((address >> (byte * 8)) & 0xff);
+  }
+}
+
+// The whole table for one run of bytes, and how many entries it took. sdhci-msm.c:5646 sets
+// SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC for this controller family, so the last transfer entry carries
+// the END attribute itself and there is no terminating NOP.
+static uint32_t admaBuildTable (uint32_t bytes)
+{
+  uint32_t entries = 0;
+  uint32_t left = bytes;
+  uint64_t address = gAdma.dataPhys;
+  while (left > 0) {
+    const uint32_t chunk = left > kAdmaEntryMaxBytes ? kAdmaEntryMaxBytes : left;
+    const bool last = (chunk == left);
+    admaWriteEntry (entries, address, chunk,
+                    static_cast<uint16_t> (SDHCI_ADMA2_TRAN_VALID |
+                                           (last ? SDHCI_ADMA2_END : 0)));
+    entries++;
+    address += chunk;
+    left -= chunk;
+  }
+  // The host fetches this table over the bus, so its dirty lines have to be in memory first.
+  cacheCleanInvalidate (gAdma.tableVirt, entries * kAdmaEntryBytes);
+  return entries;
+}
+
+// Which part of a DMA read refused. Eight lines is the r169 rule: enough for a frame, bounded enough
+// for a boot. The ADMA_ERROR byte is printed because it names the descriptor the host gave up on --
+// a zero-length or misaligned table looks different from an address the bus refused.
+static void reportDmaFailure (const char *stage, uint32_t lba, uint32_t blocks, uint32_t status)
+{
+  static uint32_t reported = 0;
+  if (reported >= 8) {
+    return;
+  }
+  reported++;
+  IOLog ("CloverSdhci r172: dma %s lba=%u blocks=%u st=%08x err8=%02x hctl=%02x\n",
+         stage, lba, blocks, status, read8 (SDHCI_ADMA_ERROR), read8 (SDHCI_HOST_CONTROL));
+}
+
+// One CMD18 with the data phase handed to the host: same command, same block count, same explicit
+// CMD12 as readMultiBlock -- the only difference is SDHCI_TRNS_DMA in the transfer mode and the
+// descriptor table the host reads instead of the FIFO the CPU drains. On success the bytes are in the
+// bounce and copied out; `ticks` carries the transfer's own length so the caller can print a rate.
+static bool readAdmaRun (uint32_t lba, uint32_t *dst, uint32_t blocks, uint32_t &status,
+                         uint64_t &ticks)
+{
+  status = 0;
+  ticks = 0;
+  if (!dmaBringUp () || !blocks || blocks * 512u > kAdmaDataBytes) {
+    return false;
+  }
+  const uint32_t bytes = blocks * 512u;
+  // Round165's rule holds for the DMA path too: words left in the buffer by a refused transfer would
+  // be the first thing this transfer writes into memory.
+  if (!prepareReadPath ()) {
+    reportDmaFailure ("path", lba, blocks, 0);
+    return false;
+  }
+  if (!waitCommandSlot ()) {
+    reportDmaFailure ("slot", lba, blocks, 0);
+    return false;
+  }
+  admaBuildTable (bytes);
+  // Tell the host which scheme ADMA_ADDRESS means, keeping the link's own HISPD and bus-width bits
+  // (sdhci.c's sdhci_init: ctrl &= ~DMA_MASK, then ADMA32, then ADMA64 when the DMA is 64-bit).
+  uint8_t control = read8 (SDHCI_HOST_CONTROL);
+  control &= static_cast<uint8_t> (~SDHCI_CTRL_DMA_MASK);
+  control |= static_cast<uint8_t> (gAdma.wide ? SDHCI_CTRL_ADMA64 : SDHCI_CTRL_ADMA32);
+  write8 (SDHCI_HOST_CONTROL, control);
+  write32 (SDHCI_ADMA_ADDRESS, static_cast<uint32_t> (gAdma.tablePhys & 0xffffffffULL));
+  if (gAdma.wide) {
+    write32 (SDHCI_ADMA_ADDRESS_HI, static_cast<uint32_t> (gAdma.tablePhys >> 32));
+  }
+  // Nothing the CPU wrote to the bounce should survive into the read it is about to receive.
+  cacheCleanInvalidate (gAdma.dataVirt, bytes);
+  write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
+  write16 (SDHCI_BLOCK_SIZE, 512);
+  write16 (SDHCI_BLOCK_COUNT, static_cast<uint16_t> (blocks));
+  write32 (SDHCI_INT_STATUS, 0xffffffffu);
+  write32 (SDHCI_ARGUMENT, lba);
+  write16 (SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_MULTI |
+                                SDHCI_TRNS_DMA);
+  write16 (SDHCI_COMMAND, SDHCI_MAKE_CMD (MMC_READ_MULTIPLE_BLOCK, SDHCI_CMD_RESP_SHORT |
+                                          SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA));
+  uint32_t spins = 0;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & SDHCI_INT_CMD_MASK) {
+      break;
+    }
+    if (++spins >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  if (!(status & SDHCI_INT_RESPONSE) ||
+      (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+    abortReadTransfer ();
+    reportDmaFailure ("cmd", lba, blocks, status);
+    return false;
+  }
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  // The same per-block share readMultiBlock uses: the card may hold the data line busy before the
+  // first block, and a batch that is merely slow has to stay a batch.
+  const uint64_t deadline = frequency / 5ULL +
+                            static_cast<uint64_t> (blocks) * (frequency / 20ULL);
+  const uint64_t start = readCounter ();
+  bool ended = false;
+  uint32_t guard = 0;
+  for (;;) {
+    status = read32 (SDHCI_INT_STATUS);
+    if (status & (kContentErrorMask | SDHCI_INT_ADMA_ERROR)) {
+      break;
+    }
+    if (status & SDHCI_INT_DATA_END) {
+      ended = true;
+      break;
+    }
+    if (readCounter () - start > deadline) {
+      break;
+    }
+    if (++guard >= kCommandSpinLimit) {
+      break;
+    }
+  }
+  ticks = readCounter () - start;
+  status = read32 (SDHCI_INT_STATUS);
+  const bool stopped = sendStopCommand ();
+  if (!ended || (status & (kContentErrorMask | SDHCI_INT_ADMA_ERROR)) || !stopped) {
+    abortReadTransfer ();
+    reportDmaFailure (ended ? (stopped ? "error" : "stop") : "deadline", lba, blocks, status);
+    return false;
+  }
+  // The host wrote these lines behind the CPU's back; drop whatever the cache still holds of them.
+  cacheInvalidate (gAdma.dataVirt, bytes);
+  const uint32_t *source = reinterpret_cast<const uint32_t *> (gAdma.dataVirt);
+  const uint32_t words = bytes / 4u;
+  for (uint32_t word = 0; word < words; word++) {
+    dst[word] = source[word];
+  }
+  return true;
+}
+
+// The verdict this round exists to produce: the same run through the path the r167 gate already
+// trusted, and through ADMA, compared word for word. Both timings print, which is the number the
+// schedule asked for -- 64 KiB per request at the PIO rate measured two bytes at a time against the
+// same request when the host empties its own FIFO.
+static void checkDmaPath (uint32_t lba, uint32_t sample)
+{
+  gDmaCheckDone = true;
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint32_t words = sample * kBlockWords;
+  const uint32_t bytes = words * 4u;
+  uint32_t got = 0, status = 0;
+  uint64_t pioStart = readCounter ();
+  bool pio = readMultiBlock (lba, gCheckBatchB, sample, got, status);
+  if (!pio) {
+    pio = readMultiBlock (lba, gCheckBatchB, sample, got, status);
+  }
+  const uint64_t pioTicks = readCounter () - pioStart;
+  uint32_t dmaStatus = 0;
+  uint64_t dmaTicks = 0;
+  bool dma = readAdmaRun (lba, gCheckSingle, sample, dmaStatus, dmaTicks);
+  if (!dma) {
+    dma = readAdmaRun (lba, gCheckSingle, sample, dmaStatus, dmaTicks);
+  }
+  uint32_t first = 0;
+  const uint32_t diff = (pio && dma && got == words)
+                        ? countWordDiff (gCheckBatchB, gCheckSingle, words, first)
+                        : words;
+  gDmaTrusted = pio && dma && got == words && diff == 0;
+  const uint64_t pioMs = pioTicks * 1000ULL / frequency;
+  const uint64_t dmaMs = dmaTicks * 1000ULL / frequency;
+  // KB/s from a run that took at least a millisecond; a zero-ms transfer is a rate this line cannot
+  // state honestly, so it prints the milliseconds and lets the reader divide.
+  const uint64_t pioRate = pioMs > 0 ? (bytes / 1024ULL) * 1000ULL / pioMs : 0;
+  const uint64_t dmaRate = dmaMs > 0 ? (bytes / 1024ULL) * 1000ULL / dmaMs : 0;
+  IOLog ("CloverSdhci r172: dmacheck lba=%u sample=%u pio=%d dma=%d got=%u diff=%u first=%u "
+         "m=%08x s=%08x ms=%llu/%llu kbs=%llu/%llu trusted=%d\n",
+         lba, sample, pio ? 1 : 0, dma ? 1 : 0, got, diff, first,
+         gCheckBatchB[first < words ? first : 0],
+         gCheckSingle[first < words ? first : 0],
+         static_cast<unsigned long long> (pioMs), static_cast<unsigned long long> (dmaMs),
+         static_cast<unsigned long long> (pioRate), static_cast<unsigned long long> (dmaRate),
+         gDmaTrusted ? 1 : 0);
+  if (!gDmaTrusted) {
+    IOLog ("CloverSdhci r172: reads stay on the PIO path for this boot\n");
+  } else {
+    IOLog ("CloverSdhci r172: ADMA2 reads trusted for this boot\n");
+  }
+}
+
 extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint32_t blocks)
 {
   if (!words || !blocks) {
@@ -1564,6 +1919,12 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   // 16 KiB still gets its one check instead of waiting forever for a 64 KiB one.
   if (!gReadCheckDone && blocks >= 4) {
     checkReadPath (lba, blocks > kReadChunkBlocks ? kReadChunkBlocks : blocks);
+  }
+  // Round172: the second gate, one run later. It only opens once the first has proved the multi-block
+  // command itself, because ADMA2 rides on exactly that command with one bit added -- a boot whose
+  // batch reads are untrusted has no business comparing a DMA read against anything.
+  if (!gDmaCheckDone && gReadBatchTrusted && blocks >= 4 && dmaBringUp ()) {
+    checkDmaPath (lba, blocks > kReadChunkBlocks ? kReadChunkBlocks : blocks);
   }
   // Round169: the request deadline covers the transfer, not the wait above or the one-shot check.
   start = readCounter ();
@@ -1598,7 +1959,30 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
     // single-block fallback, because a card that was programming when CMD18
     // arrived refuses once and answers the second time.
     bool chunkRead = false;
-    if (chunk >= 4 && gReadBatchTrusted) {
+    // Round172: the DMA path first, once the device has said its words agree with the PIO path's.
+    // A refused DMA chunk costs one report and falls through to the PIO batch below, so the worst
+    // case is the round171 behaviour with a line next to it; eight failures retire DMA for the boot.
+    if (chunk >= 4 && gDmaTrusted) {
+      uint32_t dmaStatus = 0;
+      uint64_t dmaTicks = 0;
+      if (readAdmaRun (lba + done, target, chunk, dmaStatus, dmaTicks)) {
+        chunkRead = true;
+        static bool timingReported = false;
+        if (!timingReported) {
+          timingReported = true;
+          IOLog ("CloverSdhci r172: first dma read lba=%u blocks=%u ms=%llu\n", lba + done, chunk,
+                 static_cast<unsigned long long> (dmaTicks * 1000ULL / frequency));
+        }
+      } else {
+        gDmaFailures++;
+        if (gDmaFailures >= 8 && gDmaTrusted) {
+          gDmaTrusted = false;
+          IOLog ("CloverSdhci r172: dma failed %u times, reads go back to the PIO path\n",
+                 gDmaFailures);
+        }
+      }
+    }
+    if (!chunkRead && chunk >= 4 && gReadBatchTrusted) {
       for (uint32_t attempt = 0; attempt < 2 && !chunkRead; attempt++) {
         uint32_t got = 0;
         uint32_t status = 0;

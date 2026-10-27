@@ -352,6 +352,19 @@ WRITE_INTEGRITY = (
     "CloverSdhci r168: write gave up lba=%u blocks=%u done=%u",
 )
 
+# Round172's read path is a second transport, not a tweak: ADMA2 descriptors the host fetches over
+# the bus, a bounce buffer this driver allocated, and one comparison against the PIO path that
+# decides for the whole boot. Each of these lines only exists if that code is compiled in, and the
+# first two are the pair the frame needs -- "dma up" says the path came at all, "dmacheck" is the
+# verdict. Reads staying on PIO is also a real result, so its line is here too.
+DMA_INTEGRITY = (
+    "CloverSdhci r172: dma up data=",
+    "CloverSdhci r172: dmacheck lba=",
+    "CloverSdhci r172: ADMA2 reads trusted for this boot",
+    "CloverSdhci r172: reads stay on the PIO path for this boot",
+    "CloverSdhci r172: first dma read lba=",
+)
+
 # Round166's kernel half prints the first words of every code-signature blob the exec path loads,
 # which is how the next frame tells a wrong read from a validation gate. The string is the only
 # evidence that the patch reached the prelink.
@@ -362,11 +375,13 @@ def check_read_integrity(kernel: bytes) -> bool:
     """Every block read drains the FIFO first and resets the data path on failure; the batch is
     trusted only behind a three-way agreement and is now judged on delivered words rather than an end
     bit this host never raises; every counted write is confirmed ready by the card, the card's write
-    cache is on and is committed by an explicit flush. All facts compile to the strings above;
+    cache is on and is committed by an explicit flush; and the ADMA2 path exists as a second
+    transport whose own verdict line is compiled in. All facts compile to the strings above;
     requiring them keeps a payload from shipping the old read or write path while the menu still
     claims this round."""
     label = "kernel.macho: eMMC read/write integrity"
-    found = {name: name.encode() in kernel for name in READ_INTEGRITY + WRITE_INTEGRITY}
+    found = {name: name.encode() in kernel
+             for name in READ_INTEGRITY + WRITE_INTEGRITY + DMA_INTEGRITY}
     ok = all(found.values())
     detail = ", ".join(f"{name.split(':')[1].strip()} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())

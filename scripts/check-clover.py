@@ -1187,10 +1187,10 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round170. The menu has to name the round under test: the frame is no longer about the card,
-    # it is about who is spawning and who is dying.
-    if not board["payload"]["title"].startswith("clover r171:"):
-        errors.append('[payload] title is not "clover r171: ...": the menu would not name this round')
+    # Round172. The menu has to name the round under test: this round's whole result is one line the
+    # frame either has or does not have.
+    if not board["payload"]["title"].startswith("clover r172:"):
+        errors.append('[payload] title is not "clover r172: ...": the menu would not name this round')
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -1261,7 +1261,7 @@ def check_board(errors: list) -> str:
                        "const bool stopped = sendStopCommand ();",
                        "static bool prepareReadPath (void)",
                        "SDHCI_RESET_DATA",
-                       "if (chunk >= 4 && gReadBatchTrusted) {"):
+                       "if (!chunkRead && chunk >= 4 && gReadBatchTrusted) {"):
             if needle not in text:
                 errors.append(f"{sdhci.name} lacks {needle[:28]}...: a write could still be counted "
                               "before the card stored it, or a batch read would be unguarded")
@@ -1380,6 +1380,75 @@ def check_board(errors: list) -> str:
             if needle not in text:
                 errors.append(f"{block_build.name} does not audit {needle}: the archive would build "
                               "and the kernel link would fail")
+
+    # Round172. Every byte this port has read has crossed the CPU: one word out of the FIFO at a
+    # time, which is a 2 MB/s ceiling (r156's own measurement) against a 3.7 GiB dyld shared cache.
+    # The controller's capability word and the firmware's last HOST_CONTROL both already say ADMA64,
+    # so the round adds the transport the boot loader was using. The contract is the *gate*: a DMA
+    # read is only used after it returned the same words as the PIO batch, on the same request, twice
+    # through -- which is also what makes an unknown (ICE, an SMMU context the firmware left behind)
+    # an answer on the panel rather than a corrupted filesystem. Writes stay on PIO: a wrong DMA write
+    # is not an EIO, it is a changed card.
+    sdhci_r172 = next((base / "drivers/CloverSdhci/CloverSdhci.cpp"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "drivers/CloverSdhci/CloverSdhci.cpp").is_file()), None)
+    regs_r172 = next((base / "drivers/CloverSdhci/SdhciRegs.h"
+                      for base in (REPO, pathlib.Path.cwd())
+                      if (base / "drivers/CloverSdhci/SdhciRegs.h").is_file()), None)
+    if sdhci_r172 is None or regs_r172 is None:
+        errors.append("drivers/CloverSdhci is missing: there is no ADMA2 path to verify")
+    else:
+        text = sdhci_r172.read_text()
+        for needle in ("struct AdmaPath",
+                       "static AdmaPath gAdma;",
+                       "static bool dmaBringUp (void)",
+                       "static void admaWriteEntry (uint32_t index, uint64_t address, uint32_t length, uint16_t cmd)",
+                       "static uint32_t admaBuildTable (uint32_t bytes)",
+                       "static bool readAdmaRun (uint32_t lba, uint32_t *dst, uint32_t blocks,",
+                       "static void checkDmaPath (uint32_t lba, uint32_t sample)",
+                       "if (!gDmaCheckDone && gReadBatchTrusted && blocks >= 4 && dmaBringUp ()) {",
+                       "if (chunk >= 4 && gDmaTrusted) {",
+                       "gDmaTrusted = pio && dma && got == words && diff == 0;",
+                       "dst[word] = source[word];",
+                       "write16 (SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_MULTI |",
+                       "SDHCI_TRNS_DMA",
+                       "kIOMemoryPhysicallyContiguous",
+                       "kIOMemoryMapperNone",
+                       "getPhysicalSegment",
+                       "cacheCleanInvalidate (gAdma.dataVirt, bytes);",
+                       "cacheInvalidate (gAdma.dataVirt, bytes);",
+                       "CloverSdhci r172: dma up data=",
+                       "CloverSdhci r172: dmacheck lba=",
+                       "CloverSdhci r172: ADMA2 reads trusted for this boot",
+                       "CloverSdhci r172: reads stay on the PIO path for this boot",
+                       "CloverSdhci r172: first dma read lba=",
+                       "CloverSdhci r172: dma failed %u times, reads go back to the PIO path"):
+            if needle not in text:
+                errors.append(f"{sdhci_r172.name} lacks {needle[:44]}...: round172's DMA read path, "
+                              "its bounce buffer, or the comparison that earns it would be missing")
+        # The path has to be *earned*: nothing may set the flag except the word-for-word agreement,
+        # and a boot whose multi-block command is untrusted may not compare against it at all.
+        if "gDmaTrusted = true;" in text:
+            errors.append(f"{sdhci.name} trusts the DMA path without comparing it to the PIO path")
+        if "SDHCI_ADMA2_NOP_END_VALID" in text:
+            errors.append(f"{sdhci.name} terminates the descriptor table with a NOP: this "
+                          "controller family sets NO_ENDATTR_IN_NOPDESC, so the last transfer entry "
+                          "carries END and a NOP entry would be read as a zero-length transfer")
+        # Writes are not this round's, and the only difference between a read descriptor and a write
+        # one is a bit the write path must not have yet.
+        if re.search(r"SDHCI_TRNS_WRITE[^;]*SDHCI_TRNS_DMA", text):
+            errors.append(f"{sdhci.name} puts the write path on DMA before the read path has a "
+                          "frame behind it: a wrong DMA write changes the card rather than erroring")
+        regs = regs_r172.read_text()
+        for needle in ("#define SDHCI_ADMA2_64_DESC_SZ",
+                       "#define SDHCI_ADMA2_TRAN_VALID",
+                       "#define SDHCI_ADMA2_END",
+                       "sdhci-msm.c:5646",
+                       "v419-host-sdhci.h"):
+            if needle not in regs:
+                errors.append(f"{regs_r172.name} lacks {needle}: the descriptor layout would be "
+                              "recalled rather than transcribed from this board's own CAF tree")
+
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())
                       if (base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch").is_file()),
@@ -1439,6 +1508,7 @@ def check_board(errors: list) -> str:
         for needle in ("NATIVE4K_SKIP", "check_dyld_cache_skip", "check_amfi_allow",
                        "check_read_integrity", "CloverSdhci r167: readcheck",
                        "CloverSdhci r171: write cache size=",
+                       "CloverSdhci r172: dmacheck lba=", "DMA_INTEGRITY",
                        "check_exec_sig_dump", "clover r166: sig n=%u"):
             if needle not in text:
                 errors.append(f"{verifier.name} lacks {needle}: the release could ship with an "
