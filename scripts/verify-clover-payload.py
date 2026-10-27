@@ -417,29 +417,31 @@ def check_shared_region_probe_removed(kernel: bytes) -> bool:
 
 
 def check_cache_open_probe(kernel: bytes) -> bool:
-    """Round153 fixes the probe r151 shipped: that one read cn_pnbuf before vn_open_auth_internal
-    ran, but NDINIT never initializes the field -- namei's first copyin fills it -- so the read was
-    always garbage and the frame stayed silent for its own reasons. The image must now carry the
-    post-call form: the path print, the mount print, the header read, and the dyld_flags value that
-    says whether the process asking was ever told to use the on-disk cache. The r151 prefix must be
-    gone, and r146's wrong name with it. None of it adds a symbol, so these strings are the only
-    evidence."""
+    """Round153 fixed the probe r151 shipped -- that one read cn_pnbuf before
+    vn_open_auth_internal ran, so the read was garbage and the frame stayed silent for its own
+    reasons. Round170 keeps the post-call form but throttles it: r169's frame spent the whole boot
+    writing the same two lines, because every process that runs dyld init re-opens the cache
+    directory and re-asks shared_region_check_np. The image must carry the throttled prints -- the
+    path print, the mount print, the header read, and the per-pid dyld_flags line -- and the old
+    uncapped r153 forms must be gone."""
     label = "kernel.macho: cache open probe linked"
-    found = {"open": b"clover r153: open %s fmode=0x%x err=%d" in kernel,
+    found = {"open": b"clover r170: open %s fmode=0x%x err=%d" in kernel,
              "mount": b" fl=0x%llx vt=%d fs=%s" in kernel,
              "read": b"clover r153: read err=%d resid=%d hdr=%s" in kernel,
-             "flags": b"clover r153: check_np dyld_flags=0x%llx" in kernel}
+             "flags": b"clover r170: check_np pid=%d comm=%s dyld_flags=0x%llx" in kernel}
     ok = all(found.values())
     if b"dyld_shared_cache" not in kernel or b"/System/Library/Caches/com.apple.dyld" not in kernel:
         found["prefixes"] = False
         ok = False
     else:
         found["prefixes"] = True
-    r151 = b"clover r151:" in kernel
-    ok = ok and not r151
+    stale = (b"clover r151:" in kernel or
+             b"clover r153: check_np dyld_flags=0x%llx" in kernel or
+             b"clover r153: open %s fmode=0x%x err=%d" in kernel)
+    ok = ok and not stale
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
-    detail += f", r151 form {'STILL PRESENT' if r151 else 'absent'}"
+    detail += f", r151/r153 uncapped form {'STILL PRESENT' if stale else 'absent'}"
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
     return ok
 
@@ -457,11 +459,11 @@ def check_map_slide_probe(kernel: bytes) -> bool:
              "setup": b"clover r154: setup err=%d stage=%d at=%u files=%u mappings=%u" in kernel,
              "mapfile": b"clover r154: mapfile kr=0x%x" in kernel}
     ok = all(found.values())
-    kept = b"clover r153: open %s fmode=0x%x err=%d" in kernel
+    kept = b"clover r170: open %s fmode=0x%x err=%d" in kernel
     ok = ok and kept
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
-    detail += f", r153 form {'kept' if kept else 'GONE'}"
+    detail += f", r170 open form {'kept' if kept else 'GONE'}"
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
     return ok
 
@@ -485,12 +487,31 @@ def check_cache_gate_probe(kernel: bytes) -> bool:
              "fsig_done": b"clover r155: fsig rd <- err=%d resid=%d ms=%llu" in kernel,
              "fsig_add": b"clover r156: fsig add err=%d" in kernel}
     ok = all(found.values())
-    kept = (b"clover r153: open %s fmode=0x%x err=%d" in kernel and
+    kept = (b"clover r170: open %s fmode=0x%x err=%d" in kernel and
             b"clover r154: map2 enter files=%u mappings=%u" in kernel)
     ok = ok and kept
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
-    detail += f", r153/r154 forms {'kept' if kept else 'GONE'}"
+    detail += f", r170/r154 forms {'kept' if kept else 'GONE'}"
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
+def check_spawn_probe(kernel: bytes) -> bool:
+    """Round170 asks who is running and who is dying. r169's frame had no panic, no EIO and no
+    signature line: the console held only the shared-cache probe's own two lines, repeated, and
+    launchd's restore event. That tells us the read path is no longer the wall but not where the
+    process tree went, because XNU only prints an exit reason for the critical processes -- a normal
+    child's death is silent. The image must carry one exec line and one exit line, each with pid,
+    parent, boot-relative seconds and the exit namespace/code, and each capped at 256 lines so the
+    panel keeps up with the boot instead of repeating one line forever."""
+    label = "kernel.macho: exec/exit probe linked"
+    found = {"exec": b"clover r170: exec pid=%d ppid=%d t=%llus comm=%s" in kernel,
+             "exit": (b"clover r170: exit pid=%d ppid=%d t=%llus "
+                      b"rv=0x%x ns=%d code=0x%llx comm=%s") in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
     return ok
 
@@ -682,6 +703,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_cache_open_probe(kernel)
         ok &= check_map_slide_probe(kernel)
         ok &= check_cache_gate_probe(kernel)
+        ok &= check_spawn_probe(kernel)
         ok &= check_mac_probe(kernel)
         ok &= check_amfi_allow(kernel)
         ok &= check_dyld_cache_skip(kernel)

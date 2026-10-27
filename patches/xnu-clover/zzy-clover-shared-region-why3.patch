@@ -1,6 +1,8 @@
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+index 6051694..204772c 100644
 --- a/bsd/vm/vm_unix.c
 +++ b/bsd/vm/vm_unix.c
-@@ -2320,6 +2320,8 @@
+@@ -2332,6 +2332,8 @@ shared_region_map_and_slide_setup(
  	uint32_t                        i;
  	struct vm_shared_region         *shared_region = NULL;
  	boolean_t                       is_driverkit = task_is_driver(current_task());
@@ -9,7 +11,7 @@
  
  	SHARED_REGION_TRACE_DEBUG(
  		("shared_region: %p [%d(%s)] -> map\n",
-@@ -2334,6 +2336,7 @@
+@@ -2346,6 +2348,7 @@ shared_region_map_and_slide_setup(
  		error = EINVAL;
  		goto done;
  	}
@@ -17,7 +19,7 @@
  	*sr_file_mappings = kalloc_type(struct _sr_file_mappings, files_count,
  	    Z_WAITOK | Z_ZERO);
  	if (*sr_file_mappings == NULL) {
-@@ -2353,6 +2356,7 @@
+@@ -2365,6 +2368,7 @@ shared_region_map_and_slide_setup(
  		}
  		srfmp->slide = files[i].sf_slide;
  	}
@@ -25,7 +27,7 @@
  
  	/* get the process's shared region (setup in vm_map_exec()) */
  	shared_region = vm_shared_region_trim_and_get(current_task());
-@@ -2381,11 +2385,13 @@
+@@ -2393,11 +2397,13 @@ shared_region_map_and_slide_setup(
  		error = EPERM;
  		goto done;
  	}
@@ -39,7 +41,7 @@
  		if (srfmp->mappings_count == 0) {
  			/* no mappings here... */
  			continue;
-@@ -2442,6 +2448,7 @@
+@@ -2454,6 +2460,7 @@ shared_region_map_and_slide_setup(
  				proc_getpid(p), p->p_comm, srfmp->fd, error));
  			goto done;
  		}
@@ -47,7 +49,7 @@
  
  		/* we need at least read permission on the file */
  		if (!(srfmp->fp->fp_glob->fg_flag & FREAD)) {
-@@ -2453,6 +2460,7 @@
+@@ -2465,6 +2472,7 @@ shared_region_map_and_slide_setup(
  			error = EPERM;
  			goto done;
  		}
@@ -55,7 +57,7 @@
  
  		/* get vnode from file structure */
  		error = vnode_getwithref((vnode_t)fp_get_data(srfmp->fp));
-@@ -2478,6 +2486,7 @@
+@@ -2490,6 +2498,7 @@ shared_region_map_and_slide_setup(
  			error = EINVAL;
  			goto done;
  		}
@@ -63,7 +65,7 @@
  
  #if CONFIG_MACF
  		/* pass in 0 for the offset argument because AMFI does not need the offset
-@@ -2488,6 +2497,7 @@
+@@ -2500,6 +2509,7 @@ shared_region_map_and_slide_setup(
  			goto done;
  		}
  #endif /* MAC */
@@ -71,7 +73,7 @@
  
  #if XNU_TARGET_OS_OSX && defined(__arm64__)
  		/*
-@@ -2577,6 +2587,7 @@
+@@ -2589,6 +2599,7 @@ root_check:
  			error = EPERM;
  			goto done;
  		}
@@ -79,7 +81,7 @@
  
  #if XNU_TARGET_OS_OSX && defined(__arm64__)
  after_root_check:
-@@ -2705,6 +2716,7 @@
+@@ -2717,6 +2728,7 @@ after_root_check:
  			goto done;
  		}
  scdir_ok:
@@ -87,7 +89,7 @@
  
  		/* get vnode size */
  		error = vnode_size(srfmp->vp, &fs, vfs_context_current());
-@@ -2720,6 +2732,7 @@
+@@ -2732,6 +2744,7 @@ scdir_ok:
  			goto done;
  		}
  		srfmp->file_size = fs;
@@ -95,7 +97,7 @@
  
  		/* get the file's memory object handle */
  		srfmp->file_control = ubc_getobject(srfmp->vp, UBC_HOLDOBJECT);
-@@ -2734,6 +2747,7 @@
+@@ -2746,6 +2759,7 @@ scdir_ok:
  			error = EINVAL;
  			goto done;
  		}
@@ -103,7 +105,7 @@
  
  		/* check that the mappings are properly covered by code signatures */
  		if (!cs_system_enforcement()) {
-@@ -2768,8 +2782,15 @@
+@@ -2780,8 +2794,15 @@ scdir_ok:
  				goto done;
  			}
  		}
@@ -119,7 +121,7 @@
  	if (error != 0) {
  		shared_region_map_and_slide_cleanup(p, files_count, *sr_file_mappings, shared_region);
  		*sr_file_mappings = NULL;
-@@ -2822,12 +2843,24 @@
+@@ -2834,12 +2855,24 @@ _shared_region_map_and_slide(
  	    files, mappings_count, mappings,
  	    &sr_file_mappings, &shared_region, rdir_vp);
  	if (error != 0) {
@@ -144,7 +146,7 @@
  	if (kr != KERN_SUCCESS) {
  		SHARED_REGION_TRACE_ERROR(("shared_region: %p [%d(%s)] map(): "
  		    "vm_shared_region_map_file() failed kr=0x%x\n",
-@@ -2981,6 +3014,12 @@
+@@ -2993,6 +3026,12 @@ shared_region_map_and_slide_2_np(
  	files_count = uap->files_count;
  	mappings_count = uap->mappings_count;
  
@@ -157,20 +159,20 @@
  	if (files_count == 0) {
  		SHARED_REGION_TRACE_INFO(
  			("shared_region: %p [%d(%s)] map(): "
-@@ -3040,6 +3079,12 @@
- 	if (kr != KERN_SUCCESS) {
+@@ -3053,6 +3092,12 @@ shared_region_map_and_slide_2_np(
  		goto done;
  	}
-+
+ 
 +	/* clover r154: the first file's descriptor and mapping count say whether
 +	 * this call carries the cache itself or a single subcache. */
 +	printf("clover r154: map2 fd0=%d m0=%u slide0=%u\n",
 +	    shared_files[0].sf_fd, shared_files[0].sf_mappings_count,
 +	    shared_files[0].sf_slide);
- 
++
  	uint32_t max_slide = shared_files[0].sf_slide;
  	uint32_t random_val;
-@@ -3084,6 +3129,9 @@
+ 	uint32_t slide_amount;
+@@ -3096,6 +3141,9 @@ shared_region_map_and_slide_2_np(
  	}
  
  	kr = _shared_region_map_and_slide(p, files_count, shared_files, mappings_count, mappings);

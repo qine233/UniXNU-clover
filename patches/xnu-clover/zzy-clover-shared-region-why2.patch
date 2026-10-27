@@ -1,5 +1,5 @@
 diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
-index eae8459..54e24fb 100644
+index eae8459..8585b0c 100644
 --- a/bsd/vfs/vfs_vnops.c
 +++ b/bsd/vfs/vfs_vnops.c
 @@ -372,7 +372,7 @@ out:
@@ -11,7 +11,7 @@ index eae8459..54e24fb 100644
  {
  	struct vnode *vp;
  	struct vnode *dvp;
-@@ -758,6 +758,182 @@ out:
+@@ -758,6 +758,195 @@ out:
  	return error;
  }
  
@@ -169,7 +169,20 @@ index eae8459..54e24fb 100644
 +	if (!focus && error == 0) {
 +		return error;
 +	}
-+	printf("clover r153: open %s fmode=0x%x err=%d", path,
++	/* clover r170: every process that runs dyld init opens this directory
++	 * again, even when reuseExistingCache() then leaves the files alone -- the
++	 * r169 frame was mostly that one line. Keep the first sixteen as proof of
++	 * reuse; a failed open is never capped, and the main cache and .01 are the
++	 * files whose opens matter, so they stay uncapped. */
++	if (error == 0 && strcmp(path, clover_cache_dir) == 0) {
++		static uint32_t clover_cache_dir_prints;
++
++		if (clover_cache_dir_prints >= 16) {
++			return error;
++		}
++		clover_cache_dir_prints++;
++	}
++	printf("clover r170: open %s fmode=0x%x err=%d", path,
 +	    error == 0 ? *fmodep : 0, error);
 +	vp = error ? NULLVP : ndp->ni_vp;
 +	if (vp != NULLVP) {
@@ -195,19 +208,31 @@ index eae8459..54e24fb 100644
  /*
   * Authorize an action against a vnode.  This has been the canonical way to
 diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
-index dcebcb8..2ecf713 100644
+index dcebcb8..6051694 100644
 --- a/bsd/vm/vm_unix.c
 +++ b/bsd/vm/vm_unix.c
-@@ -2107,6 +2107,14 @@ shared_region_check_np(
+@@ -2107,6 +2107,26 @@ shared_region_check_np(
  		proc_getpid(p), p->p_comm,
  		(uint64_t)uap->start_address));
  
-+	/* clover r153: dyld decides where to look for the cache from this value;
-+	 * the owner-chain exec sets bit 3 and appends it as "dyld_flags=0x...".
-+	 * Printing it here says what the process that is asking was handed. */
++	/* clover r153 and r170: dyld decides where to look for the cache from this
++	 * value; the owner-chain exec sets bit 3 and appends it as "dyld_flags=0x...",
++	 * so printing it says what the asking process was handed. r153 printed it on
++	 * every call -- three times per process, for every process -- and the console
++	 * spent the whole boot writing that one line. r170 prints it when the value
++	 * changes and for the earliest pids, and stops at 48 lines. */
 +	{
 +		extern uint64_t dyld_flags;
-+		printf("clover r153: check_np dyld_flags=0x%llx\n", dyld_flags);
++		static uint64_t clover_last_dyld_flags = ~(uint64_t)0;
++		static uint32_t clover_check_np_prints;
++
++		if ((dyld_flags != clover_last_dyld_flags || proc_getpid(p) <= 8) &&
++		    clover_check_np_prints < 48) {
++			clover_last_dyld_flags = dyld_flags;
++			clover_check_np_prints++;
++			printf("clover r170: check_np pid=%d comm=%s dyld_flags=0x%llx\n",
++			    proc_getpid(p), p->p_comm, dyld_flags);
++		}
 +	}
 +
  	/*

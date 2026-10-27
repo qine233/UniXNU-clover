@@ -1,0 +1,80 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index fe56111..6a18923 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -137,6 +137,7 @@
+ #include <kern/sched_prim.h> /* thread_wakeup() */
+ #include <kern/affinity.h>
+ #include <kern/assert.h>
++#include <kern/clock.h> /* clock_get_uptime() for the clover r170 exec line */
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <kern/coalition.h>
+@@ -2000,6 +2001,24 @@ cleanup_rosetta_fp:
+ 
+ 	set_proc_name(imgp, p);
+ 
++	/* clover r170: one line per exec names every spawn and its parent, so a
++	 * loop says which process is looping instead of leaving a row of pids.
++	 * The seconds-since-boot field separates "spinning" from "merely slow".
++	 * The console tail is short, so stop after 256 lines. */
++	{
++		static uint32_t clover_exec_prints;
++
++		if (clover_exec_prints < 256) {
++			uint64_t clover_now = 0;
++
++			clock_get_uptime(&clover_now);
++			clover_exec_prints++;
++			printf("clover r170: exec pid=%d ppid=%d t=%llus comm=%s\n",
++			    proc_getpid(p), p->p_ppid,
++			    clover_now / 1000000000ULL, p->p_comm);
++		}
++	}
++
+ #if CONFIG_SECLUDED_MEMORY
+ 	if (secluded_for_apps &&
+ 	    load_result.platform_binary) {
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index 11a8212..d1c59a8 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -111,6 +111,8 @@
+ #include <sys/ubc.h>
+ #include <sys/code_signing.h>
+ 
++#include <kern/clock.h> /* clock_get_uptime() for the clover r170 exit line */
++
+ #include <security/audit/audit.h>
+ #include <bsm/audit_kevents.h>
+ 
+@@ -1503,6 +1505,29 @@ exit_with_reason(proc_t p, int rv, int *retval, boolean_t thread_can_terminate,
+ 	int error = 0;
+ 	bool proc_exiting = false;
+ 
++	/* clover r170: a child's death is otherwise silent -- only the critical
++	 * processes print through proc_handle_critical_exit. One line per exit
++	 * pairs with the exec line, so the frame shows which process came back
++	 * and with what status, and the timestamp says how fast the loop runs. */
++	{
++		static uint32_t clover_exit_prints;
++
++		if (clover_exit_prints < 256) {
++			uint64_t clover_now = 0;
++
++			clock_get_uptime(&clover_now);
++			clover_exit_prints++;
++			printf("clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx comm=%s\n",
++			    proc_getpid(p), p->p_ppid,
++			    clover_now / 1000000000ULL, rv,
++			    exit_reason != OS_REASON_NULL ?
++			    exit_reason->osr_namespace : -1,
++			    exit_reason != OS_REASON_NULL ?
++			    (unsigned long long)exit_reason->osr_code : 0ULL,
++			    p->p_comm);
++		}
++	}
++
+ #if DEVELOPMENT || DEBUG
+ 	/*
+ 	 * Debug boot-arg: panic here if matching process is exiting with non-zero code.

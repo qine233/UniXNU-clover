@@ -28,31 +28,36 @@
 
 ## 当前进度：已解决 / 待解决
 
-最新一帧是 r168 的冷刷。这一帧仍没有 panic，而且 **r167 的写墙已经过了**：
-`disk5` 不再 `general error`，`tx_flush` 的 22.7 秒也没有再出现，说明 persona
-的写入被卡真正收下了。墙上出现的是读：`disk1: general error.` 反复出现，
-`apfs: buf_bread(0x20): disk1 buf_bread() failed, error = 5`，
-`ctx->dev_read(507): disk1 dev_get err 5 reading blkno 580`（随后
-`108169`、`91610`、`102029`，`num read errs` 从 0 涨到 6），
-`apfs_ntree_read(805): … readdesc(1) err … retval 5`，以及每个守护进程解压
-自身二进制时的 `decmpfs_fetch_uncompressed_data err 5`、
-`ChunkCompression.cpp:298: /usr/libexec/{logd,thermald,rapportd,tptpd,fseventsd,
-tccd,locationd,tzdata}: WEP_GETNTRC(264,0): errno 5`。所有失败都是 16 KiB
-（`buf_bread(0x20)`）读，块号彼此无关；这是级联，不是某个块坏了。
+最新一帧是 r169 的冷刷，它把 r168 提的那个问题答掉了：**这一帧屏上没有 EIO**。
+`disk1: general error.` 不再出现，`apfs: buf_bread(0x20): … failed, error = 5`、
+`ctx->dev_read(507): disk1 dev_get err 5 reading blkno …`、
+`apfs_ntree_read(805): … retval 5` 这一整套级联全部消失，r164/r166 那两轮的
+APFS jhash 自我校验错（`Data hash mismatch for 16384 bytes …`）也没有再出现，
+而且没有 panic。唯一一条驱动读数是 `CloverSdhci r169: block guard waited 31 ms`
+——等锁 31 毫秒，不是三十秒，也没有 `card busy`、没有 `read <stage>`：读路径这
+一次根本没走到失败分支。r169 加的「读失败先发 CMD12 再复位主机」+「每个读请求
+在第一条命令前等卡 `DATA_INHIBIT` 落下、CMD13 报 `READY_FOR_DATA|TRAN`」把
+r168 那条不对称补上了，级联因此断根。
 
-驱动的不对称在写和读之间：写批次失败会发 CMD12 把卡送回 TRAN，单块读失败只
-复位主机数据通路。卡停在数据态时主机复位对它无效，之后每个 CMD17 都被它忽略，
-块设备就连续交出 EIO。r168 的读数行（`block guard waited`、`write settle took`、
-`read gave up`）每启动只打一次，已滚出这张照片，不能据此断言它们执行到哪一步。
+但这一帧同时暴露了我们自己的仪器问题：**屏被自家探针占满**。照片上几乎只有
+`clover r153: check_np dyld_flags=0x0` 这一行在重复，另有一条
+`clover r153: open /System/Library/Caches/com.apple.dyld … err=0`，尾部还有
+`launchd [Event: finish-restore] during boot task`。`shared_region_check_np` 每
+颗进程都会调、而且调好几次（dyld 的 `reuseExistingCache` 与后面的映射都走它），
+r153 那版探针一次都不节流，于是这一行把整块面板刷成了同字复读。这条读数还留着
+一个我们读不出来的洞：**这一行不带 pid**，所以「重复很多次」既可能是几颗进程
+各调几次，也可能是一百颗进程各调一次；而 exec 出去的守护进程死掉时，XNU 只对
+critical process 打印原因，普通子进程的死亡在控制台上是完全静默的。r162/r164
+那种「launchd 反复拉、pid 一路涨」的循环，在这一帧里根本没法判读。
 
-v0.5.23（round169）修这条读路径：**所有读失败先发 CMD12 再复位主机**；每个读
-请求在第一条命令前等卡 `DATA_INHIBIT` 落下、CMD13 报 `READY_FOR_DATA|TRAN`
-（上限 30 秒，超时就再发一次 CMD12）；写落盘闸门从 4 秒提到 30 秒，写批次重试
-前也等卡空闲；读失败按阶段打点（`guard` / `idle` / `deadline` / `gave up`，
-最多八行），并新增 `CloverSdhci r169: card busy … ms`。这一轮的问题是：
-**级联 EIO 是不是读失败后没停卡造成的**——如果是，下一帧 `dev_get err 5`
-应显著减少；如果仍成串出现，`read <stage> … st=…` 会指出第一处失败发生在
-等卡、死线还是传输本身。
+所以 v0.5.24（round170）只做两件事，都不动存储栈：**给缓存探针加节流**
+（`check_np` 只在值变化或 pid≤8 时打，总上限 48 行；缓存目录的 open 上限 16 行，
+失败与主缓存/`.01` 永不封顶），**以及让每颗进程的生与死出声**——`exec` 一行带
+pid/ppid/秒/comm，`exit` 一行带 pid/ppid/秒/退出码/`osr_namespace`/`osr_code`/
+comm，各上限 256 行。这一轮的问题是：**launchd 是在反复拉同一批死掉的子进程，
+还是在往前走**。如果 `clover r170: exit … rv=… ns=… code=…` 成串回来、comm 换来
+换去，问题在退出原因那一列；如果只有 `exec` 没有 `exit`、时间戳 `t=` 一路拉长，
+问题在「谁还没跑完」。
 
 ### 已经解决（有真机读数）
 
@@ -66,15 +71,16 @@ v0.5.23（round169）修这条读路径：**所有读失败先发 CMD12 再复�
 | APFS 根 | round137 挂上 OS 卷；round150 owner 审计接受未封印的根，三模块信任缓存放行 |
 | SystemOS | round143/145 在 exec 时把 SystemOS 卷 union 到 `/`；round153 dyld 打开缓存目录、主缓存和 `.01`，三处 err=0，两个头都是 `dyld_v1   arm64` |
 | eMMC 高速读 | round159 帧：`CloverBlock r159:` 的三条 manifest/data 行都在；签名块 16 KiB 读 7 ms、224 KiB 读 105–189 ms，约 1–2 MB/s，比 round156 之前的 25 KB/s 快 40–80 倍；CMD6 高速链路、8 线与 CMD18 批量成立 |
+| eMMC 读路径（不再级联失败） | round169 帧：`general error`、`buf_bread … error = 5`、`dev_get err 5`、`apfs_ntree_read … retval 5`、decmpfs/`WEP_GETNTRC errno 5` 与 APFS 的 jhash 校验错在同一次冷刷里全部消失，唯一驱动读数是 `block guard waited 31 ms`；读失败现在先 CMD12 停卡再复位主机，读前等卡空闲 |
 | Data 卷 | round159 帧：`seed data … bytes=33554432`，`bsd=disk5s1`；APFS `mount-complete volume DawnData`，卷 UUID `FC1A580E-2D67-48FC-B8CF-87422A319340` 与钉住的种子一致；owner 的 `/private/var` 有卡背书，且失败行没有出现 |
 | dyld 缓存打开与预检 | round159 帧：`open /System/Library/Caches/com.apple.dyld`、主缓存、`dyld_shared_cache_arm64.01` 全 err=0；`.01` 头 `len≈1.07 GiB sig=11491332+229376`、`err=0/0`，224 KiB 签名 blob 一次读完 189 ms；随后每个子缓存的 `F_ADDFILESIGS` 都是 `err=0 resid=0` |
 | 诊断通道 | panic 屏直写 framebuffer（不经过 tty）、无人值守的 IMEM `0x77665501` + PSCI 复位、`read-clover-log.py` 取 logfs、`decode-clover-address.py` 把地址翻成函数 |
 
-### 已实现，等下一帧（round154/157/158/160/164/165）
+### 已实现，等下一帧（round154/157/158/160/164/165/169/170）
 
 | 轮次 | 内容 | 状态 |
 | --- | --- | --- |
-| round154（v0.5.7） | syscall 536 的入口/返回值、setup 阶梯与 `mapfile` 探针 | 探针仍在镜像里；round159 帧还没滚到 536，尚无读数 |
+| round154（v0.5.7） | syscall 536 的入口/返回值、setup 阶梯与 `mapfile` 探针 | 探针仍在镜像里；r169 帧被自家 `check_np` 刷屏，仍无 `map2` 读数 |
 | round157（v0.5.10） | CMD12 改 R1b、拒收 CRC/TIMEOUT/END_BIT/ADMA 损坏块 | 读路径工作；错误分支尚未被触发过 |
 | round158（v0.5.11） | 照 sheng 对齐 `porting.toml`/`AGENTS.md`/工作流，锁超时放宽到约 21 s | 契约层，无需上机 |
 | round160（v0.5.13） | 宿主闸门 `verify-userdata-window.py`；镜像与内核一字未动 | 无需上机 |
@@ -83,48 +89,42 @@ v0.5.23（round169）修这条读路径：**所有读失败先发 CMD12 再复�
 | round166（v0.5.20） | 整轮单块读、补上命令响应失败的复位、exec 侧打印前八个签名 blob 的头四字 | r166 帧：单块读没有消掉故障；APFS 报 `disk0s1 failed to read` 与 `Container corruption detected by apfs_scan_verify`，故障落在可写的 Data 卷 |
 | round167（v0.5.21） | 写完成必须 CMD13 确认 `READY_FOR_DATA|TRAN`、停命令失败复位数据通路、写节奏改 level-gated、两条请求死线随块数缩放、EXT_CSD `CACHE_CTRL` 清零；批量读须三份样本一致才信任 | r167 帧：没有 panic，APFS 在两块盘上返回 EIO（`dev_get err 5`），一次 `tx_flush` 用 22.7 秒；EIO 落在我们自己的 200 ms/2 秒超时上 |
 | round168（v0.5.22） | 写落盘闸门 4 秒、guard 等待 30 秒、读写死线与每块份额放宽、批量/单块失败各自重试、写批次超时后重发一次；放弃时上屏块号与 INT_STATUS | r168 帧：写墙过了（无 `tx_flush` 长行、`disk5` 不再 general error），但 16 KiB 读级联 EIO；驱动只在写失败时停卡，读失败不停 |
-| round169（v0.5.23） | 读失败先 CMD12 再复位主机；读前等卡 `DATA_INHIBIT` 落下 + CMD13 `READY_FOR_DATA|TRAN`（30 秒）；写落盘 30 秒、写重试前等卡；读失败按 `guard/idle/deadline/gave up` 分阶段打点 | 等冷刷；读数行 `CloverSdhci r169: card busy … ms`、`read <stage> … st=…`、`write settle took …` |
+| round169（v0.5.23） | 读失败先 CMD12 再复位主机；读前等卡 `DATA_INHIBIT` 落下 + CMD13 `READY_FOR_DATA\|TRAN`（30 秒）；写落盘 30 秒、写重试前等卡；读失败按 `guard/idle/deadline/gave up` 分阶段打点 | r169 帧：EIO 与 jhash 错全消失、无 panic、`block guard waited 31 ms`；读路径收干净。副作用是同帧被 `check_np` 复读刷屏，进程生死读不出 |
+| round170（v0.5.24） | 缓存探针节流（`check_np` 48 行、目录 open 16 行，失败与主缓存/`.01` 不封顶）；`kern_exec.c`/`kern_exit.c` 各加一行 `clover r170: exec`/`exit`，带 pid、ppid、开机秒数与退出 namespace/code，各 256 行封顶 | 等冷刷；读数是 exec/exit 的配对与 `rv`/`ns`/`code` 三列 |
 
 ### 还没解决
 
-1. **共享区映射（syscall 536）没有读数**——`.01` 的头字段与签名注册两段已经被
-   这一帧关掉；剩下的未知是 dyld 是否走到 536、映射是否成功。屏上仍有两行
-   `check_np … vm_shared_region_start_address() failed`，那是 exec 建的空区，
-   不是文件问题。
-2. **守护进程过不了 exec 的签名结构校验，且读回的字节不对**——`launchd` 起来了，
-   也会拉 `logd`、`dasd`，但每个子进程的 `LC_CODE_SIGNATURE` blob 在
-   `ubc_cs_blob_add` 的结构校验里就返回 `EBADEXEC`（85）。round164 帧第一次
-   证明问题不只在签名层：APFS 对 `disk0s1` inode 162、压缩流 102、偏移
-   12128256 的 16 KiB 做 jhash 校验，期望 `2e6c78f0…`、实得 `0d13…`，
-   `Verification failed with error 94`、`Corrupt read data`。块层交出的字节与
-   盘上不一致，这条自我校验把「读路径错」从推测变成了读数。宿主上相关文件的
-   cdhash 全在 2478 条信任缓存里、blob 也合法，所以 85 最可能就是同一种截断
-   或错位读的结果。v0.5.19 修的就是这条读路径。**round166 之前的宿主复查又
-   把源镜像排除掉**：整个 OS 窗口挂载后逐文件读通，三颗关键二进制的
-   `fa de 0c c0` 都在，fastboot 的 sparse CRC 也逐段核过——错只可能发生在
-   设备读这一层，所以 v0.5.20 直接退掉 CMD18，并在 exec 侧把坏 blob 的头
-   四字印出来。r167 帧把同一层又推了一步：两块盘同时、反复在固定块号上
-   返回 EIO，而一次 checkpoint flush 要 22.7 秒——这更像我们自己的超时，
-   不像介质。v0.5.22 用放宽的等待与重试直接检验它。r168 帧给出了答案：写墙
-   过了，读从第一个 16 KiB 请求起就级联失败，而读路径失败后从不发 CMD12；
-   v0.5.23 补上停卡、读前等卡与分阶段读数，继续把这条读路径收干净。
+1. **共享区映射（syscall 536）仍没有读数**——`.01` 的头字段与签名注册两段已经被
+   r159 帧关掉；r169 帧上只有 `check_np` 在重复，看不到 `map2`。按 dyld 的
+   `reuseExistingCache()`，`__shared_region_check_np` 命中且头部有效时根本不会再
+   打开缓存文件，这一帧「只有一条目录 open、没有文件 open」的形状与它一致，但
+   面板只留尾部、复读行会把别的字挤出去，所以这仍不是结论。r170 的节流就是为
+   了把这一格变成可读的：封顶之后，屏上剩下的才是 open/map2/exit。
+2. **守护进程能不能起来还不知道**——r162/r164 帧的形态是每个子进程在
+   `ubc_cs_blob_add` 的结构校验里返回 `EBADEXEC`（85），round164 帧第一次证明
+   那来自读回的字节不对（APFS jhash 期望 `2e6c78f0…`、实得 `0d13…`）。r169 帧
+   把 jhash 错和 `errno 5` 一起消掉了，照片上也没有 85 行，但同一帧被 `check_np`
+   占满，尾部之外不能算数——所以 85 是消失还是被挤掉，本轮还判不了。r170 的
+   `clover r170: exec pid=… comm=…` 直接给出「哪些二进制真的换进去了」。
 3. **完整 `/data` 没有解决**——现在只是 32 MiB 的 APFS scratch 种子，追加在
    userdata 分区的两个 GPT 副本之间，不在 GPT 里；原 54.4 GB 的 userdata 内容
-   没有迁移。这一帧的 Data 挂载只证明那块种子可用。
-4. **这个循环不会自己停**——每一环都是「exec 主程序 → 启动 dyld → 把整组共享缓存
-   签名注册一遍（第一帧那串 `fsig`）→ 主程序的签名结构校验失败 → 85」，pid
-   继续涨，最后 `mediaserverd` 以 `Too many corpses being created` 收场。
-   v0.5.19 直接改读路径；若 jhash 错消失、85 仍在，下一步才是 blob 偏移/长度。
-   只能断电；断电后回到 fastboot，不需要再刷任何分区。
+   没有迁移。r159 帧的 Data 挂载只证明那块种子可用。
+4. **launchd 到底在循环还是在前进**——r159 帧之前看到的循环是「exec 主程序 →
+   dyld → 注册整组共享缓存签名 → 主程序签名结构校验失败 → 85」，pid 一路涨，
+   `mediaserverd` 以 `Too many corpses being created` 收场。r169 帧看不到这条
+   链的任何一环，因为普通子进程退出不出声。r170 就是问这一件事：exec 与 exit
+   成对出现、comm 在换 = 在前进；只有 exec 没有 exit、`t=` 一路拉长 = 有东西
+   堵在里面；exit 成串带同一个 comm = 还在循环。只能断电；断电后回到 fastboot，
+   不需要再刷任何分区。
 5. **显示与 GPU**——没有 MDP5/DSI 驱动，屏幕只服务于启动诊断；Adreno 512 没有
    驱动，没有 iOS 显示栈。
 6. **输入**——触摸（`edt-ft5406` / focaltech `fts`）没有驱动。
 7. **网络、音频、USB**——WCN3990 WiFi/蓝牙、WCD 音频、USB device 模式都没有。
 8. **电源管理**——除 AMFI 需要的那颗 nub 外，充电、电池、PMIC 都没有真正的驱动。
-9. **eMMC 高速写**——读已经快了两个数量级；写已改成 level-gated 加批量，但
-   r167 帧里一次 checkpoint flush 仍要 22.7 秒。落盘闸门现在是 4 秒，下一次
-   `CloverSdhci r168: write settle took … ms` 会给出卡自己的编程时间，再决定
-   是否要换 HS400/CQE/DMA。
+9. **eMMC 高速写的绝对速度还没量到**——读已经快了两个数量级，写从 r168 帧起不
+   再是墙（22.7 秒的 `tx_flush` 消失）。但 r169 帧上没有 `write settle took … ms`
+   的可见读数（每启动只打一次，被复读挤出面板），卡自己的编程时间仍然未知；要
+   不要换 HS400/CQE/DMA，等这一行真的被读到再定。
 10. **内核构建不可逐字节复现**——每次 prelink UUID 不同；`verify-clover-payload.py`
     只比较两个可执行段。
 11. **存储栈形态**——没有 UFS、virtio-block 或 native verified-root；sheng 的
@@ -132,13 +132,16 @@ v0.5.23（round169）修这条读路径：**所有读失败先发 CMD12 再复�
 
 ### 下一步（按顺序）
 
-1. 冷刷 `round165-payload.img`，只问一件事：屏上的
-   `CloverSdhci r165: readcheck` 一行里两次 CMD18 与 32 次 CMD17 的结果是否
-   一致（`diff=0/0`），以及 APFS 的 jhash 错和 85 是否随之消失。若 A/B 一致
-   但错误仍在，说明不是批量读，下一轮才量 blob 读回的偏移/长度。
-2. 若批量读被自动禁用（`batch reads disabled for this boot`），且 jhash 错
-   消失，下一轮把单块路径的节奏也调快，再重回批量。
-3. 536 通过后再谈完整 `/data` 迁移；显示、输入、网络排在用户态启动之后。
+1. 冷刷 `round170-payload.img`，只问一件事：`clover r170: exec` 与
+   `clover r170: exit` 的配对形状——comm 是否在换、`rv`/`ns`/`code` 报的是什么、
+   `t=` 走了多远。附带读数：节流之后，`check_np` 只在该轮出现 48 行以内，屏上
+   应该重新看得见 open/map2 与任何一条 APFS 或签名错误。
+2. 如果 exec 一路铺开、exit 带着 `ns=`（签名或 AMFI 的退出原因）成串回来，下一轮
+   就按 r166 那条 `clover r166: sig` 的头四字继续量 blob；如果 exec 停在某颗
+   comm 上不再出现新的，问题在 exec 内部而不是循环。
+3. 如果 `clover r154: map2` 在节流后出现，共享区映射（536）这一格同时打开；否则
+   536 排在用户态起来之后。完整 `/data` 迁移、显示、输入、网络都排在它后面。
+
 
 ## 这里用到的硬件事实
 
@@ -12310,6 +12313,118 @@ fastboot reboot
 出现且 `st=00000000`，说明卡在第一条命令前就没准备好，问题在写后恢复；若
 `read gave up … st=` 带 CRC/超时位，问题回到传输本身；若 EIO 消失而守护进程
 仍报 `errno 5`，剩下的就是 CloverBlock 的窗口与 APFS 的一致性问题。
+
+## v0.5.24（round170）：缓存探针封顶，exec 与 exit 各出一声
+
+r169 的冷刷答掉了 r168 提的问题。**这一帧上没有 EIO**：`disk1: general error.`
+不再出现，`apfs: buf_bread(0x20): disk1 buf_bread() failed, error = 5`、
+`ctx->dev_read(507): disk1 dev_get err 5 reading blkno …`、
+`apfs_ntree_read(805): … retval 5`、每个守护进程解压自身二进制时的
+`decmpfs_fetch_uncompressed_data err 5` 与
+`ChunkCompression.cpp:298: … WEP_GETNTRC(264,0): errno 5` 全部消失，r164/r166
+两轮的 APFS jhash 自校验错（`apfs_jhash.c:146: Data hash mismatch for 16384
+bytes at offset …`）也没有再来一次，而且没有 panic。驱动唯一的读数是
+
+```
+CloverSdhci r169: block guard waited 31 ms
+```
+
+31 毫秒，不是 30 秒；`card busy` 一行都没打，`read guard/idle/deadline/gave up`
+一条都没有——读路径这一次根本没进失败分支。所以级联的成因确认了：不是卡坏，
+是 r168 之前「读失败不停卡」，卡留在数据态之后把每个 CMD17 都当成噪声。r169
+补上 CMD12 与读前等卡，这条就断了。
+
+同一帧也暴露了仪器自己的毛病。照片上能读的行几乎只有一条
+
+```
+clover r153: check_np dyld_flags=0x0
+```
+
+在重复，另有一条 `clover r153: open /System/Library/Caches/com.apple.dyld …
+err=0` 和 `launchd [Event: finish-restore] during boot task`。
+`shared_region_check_np` 每颗进程都会调好几次（dyld 的 `reuseExistingCache()`
+先调它，后面映射时还要调），r153 那版一次都不节流，于是这一行把整块面板刷成
+同字复读。两个后果：
+
+1. 这一行不带 pid。「重复很多次」到底是几颗进程各调几次，还是一百颗进程各调
+   一次，照片分不开；
+2. XNU 只对 critical process 打印退出原因（`proc_handle_critical_exit`），普通
+   子进程的死在控制台上完全静默。r162/r164 那种「launchd 反复拉、pid 一路涨」
+   的循环，在这一帧里没有可判读的形状。
+
+按 dyld 源码，「只有目录 open、没有主缓存与 `.01` 的 open」与 `reuseExistingCache()`
+命中已有共享区、不再去开文件是一致的；但面板只留尾部，复读行会把别的字挤出去，
+所以这只能算待验的形状，不能写进已解决。
+
+本轮不动存储栈，只改可观测性，共三处：
+
+1. `check_np` 节流（`zzy-clover-shared-region-why2.patch` 里的 `bsd/vm/vm_unix.c`）：
+   只在 `dyld_flags` 变化时、或 pid ≤ 8 时打印，整启动上限 48 行，标签升到
+   `clover r170: check_np pid=%d comm=%s dyld_flags=0x%llx`。pid 与 comm 是这一行
+   本来就缺的东西。
+2. 缓存目录 open 封顶（同一补丁的 `bsd/vfs/vfs_vnops.c`）：`err=0` 的
+   `/System/Library/Caches/com.apple.dyld` 只报前 16 次；失败的 open 永不封顶，
+   主缓存与 `.01` 的 open 也不封顶，因为那两条是这道题的正文。r153 的
+   `read err=… resid=… hdr=…` 与 r155 的 `hdr`/`fsig` 系列标签保持不变。
+3. 新增 `zzy-clover-shared-region-why5.patch`（只碰 `bsd/kern/kern_exec.c` 与
+   `bsd/kern/kern_exit.c`，两颗都不在 why2 的文件里）：`set_proc_name(imgp, p)`
+   之后打一行 `clover r170: exec pid=%d ppid=%d t=%llus comm=%s`，
+   `exit_with_reason` 之后打一行
+   `clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx comm=%s`，
+   `t=` 是 `clock_get_uptime()` 的整秒，`ns`/`code` 取自 `exit_reason` 的
+   `osr_namespace`/`osr_code`（无 reason 时 `ns=-1`），各 256 行封顶。
+
+补丁层这件事值得记下来：探针**不能插进 why2 已经新增的块里**，因为
+`build-xnu-4k-baseline.sh` 按文件名顺序重放 `patches/xnu/*.patch`，靠
+`git apply --reverse --check` 判断某颗补丁是否已在树上；改了前面补丁的新增行，
+它会逆撤失败、正打也失败，构建直接中止。所以 why2 的节流是**重生成 why2 自身**
+（`cd ~/UniXNU/out/clover/tree && python3 scripts/save-xnu-patch.py …`，生成前先把
+排序在后的 why3 逆撤），why5 只碰 why2 未涉及的两个文件。`check-clover.py` 与
+`verify-clover-payload.py` 都对此加了断言：why5 里不得出现 `bsd/vm/vm_unix.c` 或
+`vfs_vnops.c`，且 r153 的两条复读串必须从镜像里消失。
+
+构建链与 round169 相同（先内核、再 payload；内核构建前在
+`out/clover/tree/.cache/xnu-work` 里反向撤掉 `zzy-clover-dyld-cache-skip.patch`，
+它会盖住上游 `native-4k-signature-hash-cache.patch` 的行）：
+
+```sh
+cd ~/UniXNU && /opt/homebrew/bin/python3.13 ./unixnu build kernel --device ../UniXNU-clover
+/opt/homebrew/bin/python3.13 ~/UniXNU-clover/scripts/patch-clover-amfi.py \
+  ~/UniXNU/out/clover/kernel/kernel.macho ~/clover-out/round170-kernel-amfi.macho
+/opt/homebrew/bin/python3.13 ./unixnu build payload --device ../UniXNU-clover \
+  --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --kernel /Users/zhouzhou/clover-out/round170-kernel-amfi.macho \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+```
+
+产物：prelink 内核 `98f2e5e1…`；打过 AMFI 的拷贝 `a100d479…`
+（`0x1a830e4` 与 `0x1a8316c` 两处补丁照旧）；payload `00510286…`（56 MiB，
+58,720,256 字节），卷内 kernel `27e95ca6…`、`unixnu.toml` `6df3a99e…`、
+ADT `d8de9a71…`、`scratch-data.img` `614b8356…`、trustcache `7c369ce0…`。
+入口探针 `6844 bytes in 37 runs`；`verify-clover-payload.py` 全项 OK，新增的
+`kernel.macho: exec/exit probe linked` 要求 r170 的 exec/exit 两串，
+`cache open probe linked` 现在要求 r170 的节流串、并反向断言 r153 的两条复读串
+不在镜像里。归档在 `~/clover-out/round170-*`，清单 `round170-SHA256SUMS`。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round170-payload.img
+fastboot reboot
+```
+
+`userdata` 不动，round159 的 Data 窗口仍在；这是冷刷，不用 `fastboot boot`。
+
+这一刷回答一个问题：**launchd 是在反复拉同一批死掉的子进程，还是在往前走**。
+读数顺序：先看 `clover r170: exec` 的 comm 集合——`/sbin/launchd` 之后有没有
+铺开出一串 `/usr/libexec/…`；再看 `clover r170: exit` 有没有与之配对，`ns=` 是
+哪个域（`OS_REASON_DYLD` 是 6）、`code=` 是什么、`rv=` 折出哪个信号；最后看
+`t=` 有没有在推进。只有 exec 没有 exit 且 `t=` 一路拉长 = 有东西堵在里面；
+exec/exit 成对但 comm 总是同一颗 = 还在循环；exec 铺开、exit 缺席 = 守护进程
+活下来了，下一格才轮到 536 与 `/data`。附带读数：`check_np` 封顶之后，屏上应该
+重新看得见 `clover r153: read`、`clover r155: hdr`、任何一条 APFS 或签名错误，
+以及 `clover r154: map2` 到底有没有出现。
 
 ## 许可证
 

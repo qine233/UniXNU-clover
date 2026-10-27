@@ -802,11 +802,13 @@ def check_board(errors: list) -> str:
                     "-vn_open_auth(struct nameidata *ndp",
                     "error = vn_open_auth_internal(ndp, fmodep, vap, authvp);",
                     "path = ndp->ni_cnd.cn_pnbuf;",
-                    "clover r153: open %s fmode=0x%x err=%d",
+                    "clover r170: open %s fmode=0x%x err=%d",
                     "\"/System/Library/Caches/com.apple.dyld\"",
                     "\"dyld_shared_cache\"",
                     "clover r153: read err=%d resid=%d hdr=%s",
-                    "clover r153: check_np dyld_flags=0x%llx",
+                    "clover r170: check_np pid=%d comm=%s dyld_flags=0x%llx",
+                    "clover_check_np_prints < 48",
+                    "clover_cache_dir_prints >= 16",
                     "clover_cache_header(vnode_t vp, const char *path)",
                     "clover_cache_focus(const char *path)",
                     "if (!focus && error == 0) {",
@@ -827,6 +829,14 @@ def check_board(errors: list) -> str:
             errors.append(f"{cache_probe.name} carries a 'clover r154:' string: why2 is the "
                           "open/header probe, why3 is the map-and-slide probe, and a rebuild made "
                           "while why3 was applied would fold r154 into this file")
+        # Round170: the unthrottled form is what filled the r169 frame. Three check_np lines per
+        # process, for every process, spent the console budget on a value that stops changing.
+        if 'printf("clover r153: check_np dyld_flags=' in text:
+            errors.append(f"{cache_probe.name} still prints check_np on every call: the r169 frame "
+                          "was that one line repeated, and the boot had no console time left")
+        if "clover r153: open " in text:
+            errors.append(f"{cache_probe.name} still prints every cache-directory open: dyld reopens "
+                          "it per process even when it reuses the mapped cache")
         if "+#include" in text or "-vn_open_auth(struct nameidata *ndp" not in text:
             errors.append(f"{cache_probe.name} does not rename vn_open_auth to vn_open_auth_internal: "
                           "the probe would replace the open path instead of watching it")
@@ -1170,10 +1180,45 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round169. The menu has to name the round under test: a read that fails stops the card, and
-    # every read failure names the stage that produced it.
-    if not board["payload"]["title"].startswith("clover r169:"):
-        errors.append('[payload] title is not "clover r169: ...": the menu would not name this round')
+    # Round170. The menu has to name the round under test: the frame is no longer about the card,
+    # it is about who is spawning and who is dying.
+    if not board["payload"]["title"].startswith("clover r170:"):
+        errors.append('[payload] title is not "clover r170: ...": the menu would not name this round')
+    # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
+    # dyld's check_np line three times per process until the console ran out, and nothing at all
+    # about the processes themselves. A child's exit is silent by design -- only critical processes
+    # print through proc_handle_critical_exit -- so a spawn loop and a dying daemon look the same.
+    # This round puts one line at each end of a process's life: exec names the pid, the parent and
+    # the command; exit adds the wait status and the exit-reason namespace and code. Both carry
+    # seconds since boot, which is what separates a loop from a machine that is merely slow.
+    life_probe = next((base / "patches/xnu-clover/zzy-clover-shared-region-why5.patch"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "patches/xnu-clover/zzy-clover-shared-region-why5.patch").is_file()), None)
+    if life_probe is None:
+        errors.append("patches/xnu-clover/zzy-clover-shared-region-why5.patch is missing: without it "
+                      "the frame cannot say which process is looping or how it left")
+    else:
+        text = life_probe.read_text()
+        missing = [needle for needle in
+                   ("bsd/kern/kern_exec.c",
+                    "bsd/kern/kern_exit.c",
+                    "clover r170: exec pid=%d ppid=%d t=%llus comm=%s",
+                    "clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx comm=%s",
+                    "clock_get_uptime(&clover_now);",
+                    "clover_exec_prints < 256",
+                    "clover_exit_prints < 256",
+                    "exit_reason->osr_namespace",
+                    "+#include <kern/clock.h>")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"{life_probe.name} lacks {needle!r}: the exec line, the exit line and the "
+                          "uptime stamp are the three halves of the spawn question")
+        if "set_proc_name(imgp, p);" not in text:
+            errors.append(f"{life_probe.name} does not cut in right after set_proc_name(): p_comm is "
+                          "still the inherited name before that call, so the line would name the parent")
+        if "bsd/vm/vm_unix.c" in text or "vfs_vnops.c" in text:
+            errors.append(f"{life_probe.name} touches a file why2 owns: editing inside an earlier "
+                          "patch's added block breaks that patch's idempotent reverse check")
     # Round169. The r168 frame answered the write question and asked a read one: the card stored
     # the writes (no tx_flush wall, no "general error" on disk5), but every 16 KiB APFS buffer came
     # back EIO at block numbers nothing had complained about, and decompressing any daemon's file
