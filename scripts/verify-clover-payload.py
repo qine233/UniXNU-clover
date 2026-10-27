@@ -324,11 +324,18 @@ def check_dyld_cache_skip(kernel: bytes) -> bool:
 # Round165's driver change leaves two strings in the kernel: the one-shot A/B result and the line
 # that says the batch is not trusted. Round166 keeps the A/B row as evidence but retires the batch
 # for the whole boot, so the second string changes with it. Their presence is the only image-level
-# evidence that the clean-FIFO policy and the single-block decision survived the link; a payload
-# built from an older CloverSdhci would carry the r165 pair instead.
+# evidence that the clean-FIFO policy and the confirmed-write policy survived the link; a payload
+# built from an older CloverSdhci would carry the r166 pair instead.
 READ_INTEGRITY = (
-    "CloverSdhci r166: readcheck lba=",
-    "CloverSdhci r166: single-block reads for this boot",
+    "CloverSdhci r167: readcheck lba=",
+    "CloverSdhci r167: single-block reads for this boot",
+    "CloverSdhci r167: batch reads trusted for this boot",
+)
+
+# Round167's write half: the cache is turned off and every counted write waits for the card.
+WRITE_INTEGRITY = (
+    "CloverSdhci r167: write cache size=",
+    "CloverSdhci r167: write not ready lba=",
 )
 
 # Round166's kernel half prints the first words of every code-signature blob the exec path loads,
@@ -338,13 +345,12 @@ EXEC_SIG_DUMP = "clover r166: sig n=%u mo=%lld off=%u size=%u w=%08x/%08x/%08x/%
 
 
 def check_read_integrity(kernel: bytes) -> bool:
-    """Every block read now drains the FIFO first and resets the data path on failure, and every
-    read this boot takes the single-block sequence while the first full-batch request still
-    compares two CMD18 batches with 32 CMD17 blocks. Both facts compile to the strings above;
-    requiring both keeps a payload from shipping the old read path while the menu still claims
-    this round."""
-    label = "kernel.macho: eMMC read integrity"
-    found = {name: name.encode() in kernel for name in READ_INTEGRITY}
+    """Every block read drains the FIFO first and resets the data path on failure; the batch is
+    back only behind a three-way agreement; and every counted write is confirmed ready by the
+    card, with its cache turned off. All facts compile to the strings above; requiring them keeps
+    a payload from shipping the old read or write path while the menu still claims this round."""
+    label = "kernel.macho: eMMC read/write integrity"
+    found = {name: name.encode() in kernel for name in READ_INTEGRITY + WRITE_INTEGRITY}
     ok = all(found.values())
     detail = ", ".join(f"{name.split(':')[1].strip()} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())

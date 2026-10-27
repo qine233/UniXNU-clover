@@ -1170,16 +1170,20 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round166. The menu has to name the round under test: single-block reads for the whole boot,
-    # with the batch kept only as the A/B row's second sample.
-    if not board["payload"]["title"].startswith("clover r166:"):
-        errors.append('[payload] title is not "clover r166: ...": the menu would not name this round')
-    # Round166. The r165 frame retired the clean-FIFO doubt but not the wall: every exec still
-    # ends in 85, and the failed APFS chunks are exactly one 16 KiB CMD18 batch. The driver now
-    # starts untrusted, so every read is the single-block sequence every round before r156 used;
-    # the once-per-boot A/B row stays as evidence about the one sample it compares. The kernel
-    # half prints the header words of the first eight signature blobs so a wrong read and a
-    # validation gate stop looking alike.
+    # Round167. The menu has to name the round under test: writes that wait for the card, the
+    # card's write cache off, and batch reads back only once three samples agree.
+    if not board["payload"]["title"].startswith("clover r167:"):
+        errors.append('[payload] title is not "clover r167: ...": the menu would not name this round')
+    # Round167. The r166 frame moved the wall from the read path to the writable container: APFS
+    # reported "disk0s1 failed to read" and "Container corruption detected by apfs_scan_verify"
+    # after persona setup, which is the volume this driver writes. Three concrete write defects
+    # are fixed here, and the batch read returns only behind the three-way agreement:
+    #   * a completed write is confirmed with CMD13 READY_FOR_DATA in TRAN before it is counted;
+    #   * a batch whose CMD12 fails resets the data circuit instead of leaving the card in data
+    #     mode for the next request;
+    #   * single-block writes are level-gated instead of keeping the 400 kHz 160 us pace, and both
+    #     request deadlines scale with the block count;
+    #   * EXT_CSD CACHE_CTRL is turned off, because nothing here ever issues FLUSH_CACHE.
     sdhci = next((base / "drivers/CloverSdhci/CloverSdhci.cpp"
                   for base in (REPO, pathlib.Path.cwd())
                   if (base / "drivers/CloverSdhci/CloverSdhci.cpp").is_file()), None)
@@ -1187,15 +1191,32 @@ def check_board(errors: list) -> str:
         errors.append("drivers/CloverSdhci/CloverSdhci.cpp is missing: no read path to verify")
     else:
         text = sdhci.read_text()
-        for needle in ("CloverSdhci r166: readcheck lba=",
-                       "CloverSdhci r166: single-block reads for this boot",
-                       "static bool gReadBatchTrusted = false;",
+        for needle in ("CloverSdhci r167: readcheck lba=",
+                       "CloverSdhci r167: batch reads trusted for this boot",
+                       "CloverSdhci r167: single-block reads for this boot",
+                       "CloverSdhci r167: write cache size=",
+                       "CloverSdhci r167: write not ready lba=",
+                       "static bool writeSettled (uint32_t &response, uint32_t &status, uint32_t &polls)",
+                       "static const uint32_t kExtCsdCacheCtrl = 33u;",
+                       "const bool stopped = sendStopCommand ();",
                        "static bool prepareReadPath (void)",
                        "SDHCI_RESET_DATA",
                        "if (chunk >= 4 && gReadBatchTrusted) {"):
             if needle not in text:
-                errors.append(f"{sdhci.name} lacks {needle[:28]}...: a read could still take the "
-                              "batch, or the single-block decision would not survive")
+                errors.append(f"{sdhci.name} lacks {needle[:28]}...: a write could still be counted "
+                              "before the card stored it, or a batch read would be unguarded")
+        # The old flat request deadlines must be gone: they were sized for a batch that finishes
+        # in milliseconds and turn a slow fallback into a short read the filesystem reports as EIO.
+        if "const uint64_t deadline = frequency * 2ULL;   // 2 s for the whole request" in text:
+            errors.append(f"{sdhci.name} still gives the whole read request a flat two seconds")
+        # The batch is only trusted on a three-way agreement, never unconditionally.
+        if "gReadBatchTrusted = false;\n  IOLog (\"CloverSdhci r167: readcheck" in text:
+            errors.append(f"{sdhci.name} still retires the batch unconditionally: r166 proved the "
+                          "batch was not the corrupt reader")
+        # The 160 us pacing must not survive in the write path (mode 12's identification read
+        # keeps its own copy, which is where the constant came from).
+        if "gap = frequency / 6250ULL;        // 160 us; writes are rare" in text:
+            errors.append(f"{sdhci.name} still paces writes at the 400 kHz 160 us gap")
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())
                       if (base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch").is_file()),
@@ -1253,7 +1274,8 @@ def check_board(errors: list) -> str:
     else:
         text = verifier.read_text()
         for needle in ("NATIVE4K_SKIP", "check_dyld_cache_skip", "check_amfi_allow",
-                       "check_read_integrity", "CloverSdhci r166: readcheck",
+                       "check_read_integrity", "CloverSdhci r167: readcheck",
+                       "CloverSdhci r167: write cache size=",
                        "check_exec_sig_dump", "clover r166: sig n=%u"):
             if needle not in text:
                 errors.append(f"{verifier.name} lacks {needle}: the release could ship with an "

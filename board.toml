@@ -167,7 +167,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r166: every read is single-block, and the exec path prints the signature's words"
+title = "clover r167: writes wait for the card, the cache is off, and two batches must agree before reads trust one"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

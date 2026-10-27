@@ -28,29 +28,30 @@
 
 ## 当前进度：已解决 / 待解决
 
-最新一帧仍是同一类读数（r164 或 r165 的冷刷，屏上没有 `CloverSdhci r165:
-readcheck` 那一行——它只在第一次满批读时打印，早已滚出画面）：`launchd`
-拉起的每个子进程都停在 `unable to create a validated cs_blob object: 85`
-→ `load code signature error 4`（`collectd`、`trustd`、`replayd`、
-`backboardd`……），APFS 同一形态的 jhash 错这次落在
-`disk3s1` inode 182/182、压缩流 103、偏移 11747328 的 16384 字节上，
-随后 `Corrupt read data … file size 0 error 91 (clone)`，
-`Too many corpses being created`。
+最新一帧是 r166 的冷刷：`launchd_cache_loader[22]` 以 `namespace 2 subcode 0xa`
+（SIGBUS）退出，initproc 一死就触发 panic，所以屏上只剩这行和它前面的 APFS
+读数。那些读数换了一个位置：不再是文件数据的 jhash 错，而是
+`apfs_scan_verify:2467: disk0s1 failed to read …` 反复出现，紧接着
+`Container corruption detected by apfs_scan_verify`，中间夹着
+`Persona 1000 not loaded, loading…` 和 `Failed to …` 的 persona 行。也就是说，
+**失败的是可写的那颗容器**（Data 卷，本驱动唯一会写的窗口），而且 APFS 说的是
+「读失败」，不是「校验和不符」。
 
-这一帧之后，宿主侧把 OS 窗口整段切开挂载复查：`launchd`（536128+25728）、
-`dyld`（911680+25376）、`trustd`（708384+25936）的 `LC_CODE_SIGNATURE`
-偏移上都是 `fa de 0c c0` 的合法 SuperBlob，而且约 6 GB 文件逐个读通
-（含 decmpfs 压缩文件），没有一次 jhash/EIO/解压失败。**源镜像和
-fastboot 写进去的字节都不是问题，错在设备侧的读。**
+由此可以排除 r164/r165 的两条读路径假说：r166 整轮单块读，jhash 错并没有因此
+消失；同一次启动里 dyld 读 SystemOS 的缓存目录和主缓存仍然 `err=0`。真正与
+r161（同一驱动、能读完 3.7 GiB 缓存）不同的，是 Data 卷在 persona 阶段被**写**
+过。写路径上有三处实打实的缺陷：写完从不发 CMD13 确认卡已 `READY_FOR_DATA`；
+CMD25 的 CMD12 停命令失败被忽略、卡可能留在 data 模式；单块写仍按 400 kHz 的
+160 µs/字节奏，整请求死线也不随块数缩放。再加上 eMMC 自己的写缓存从未关过、
+本驱动也从不发 `FLUSH_CACHE`，每次开机都是一次硬断电——一条撕裂的 checkpoint
+足以让下一次 `apfs_scan_verify` 判容器损坏。
 
-v0.5.19（round165）修读路径：每次读命令前排空 SDHCI FIFO，任何一次
-传输失败都 `SDHCI_RESET_DATA`；第一次满批读做 A/B 对照。
-
-v0.5.20（round166）把这条路走到底：**整轮不再用 CMD18 批量读**，每块都
-走 r156 之前的单块序列（A/B 行仍打印，作为那一个采样点的证据）；同时补上
-`readDataBlock` 里唯一漏掉复位的分支（命令响应被拒），并在内核
-`load_code_signature` 里打印前八个签名 blob 的 `dataoff/datasize` 与前四个
-字——下一帧就能把「读回来的字节不对」和「校验器自己的门」一眼分开。
+v0.5.21（round167）就修这三处：每次算作完成的写都要等 CMD13 的
+`READY_FOR_DATA|TRAN`；停命令失败或数据相位不干净就 `SDHCI_RESET_DATA`；
+单块写改 level-gated、两条请求死线都随块数缩放；启动时把 EXT_CSD 的
+`CACHE_CTRL` 清零。同时把批量读放回来——r166 已经证明它不是坏读的来源，而
+3.7 GiB 的 dyld 缓存若一直按单块读要按小时计——但只有在两个 CMD18 批量与
+32 块逐块读三份样本逐字相同时才信任，否则整轮退回单块。
 
 ### 已经解决（有真机读数）
 
@@ -77,8 +78,9 @@ v0.5.20（round166）把这条路走到底：**整轮不再用 CMD18 批量读**
 | round158（v0.5.11） | 照 sheng 对齐 `porting.toml`/`AGENTS.md`/工作流，锁超时放宽到约 21 s | 契约层，无需上机 |
 | round160（v0.5.13） | 宿主闸门 `verify-userdata-window.py`；镜像与内核一字未动 | 无需上机 |
 | round163/164（v0.5.17/18） | AMFI 两条拒绝分支 + 16 KiB 签名的 dyld 缓存跳过整文件哈希 | r164 帧：AMFI kill 消失；85 与 APFS jhash 错仍在，根因指到读路径 |
-| round165（v0.5.19） | 读前清 FIFO、失败复位数据通路、首次满批 A/B 对照并可按结果禁用批量读 | 已并入 round166 |
-| round166（v0.5.20） | 整轮单块读、补上命令响应失败的复位、exec 侧打印前八个签名 blob 的头四字 | 等冷刷；读数行 `CloverSdhci r166: readcheck` 与 `clover r166: sig …` |
+| round165（v0.5.19） | 读前清 FIFO、失败复位数据通路、首次满批 A/B 对照并可按结果禁用批量读 | 已并入 round166/167 |
+| round166（v0.5.20） | 整轮单块读、补上命令响应失败的复位、exec 侧打印前八个签名 blob 的头四字 | r166 帧：单块读没有消掉故障；APFS 报 `disk0s1 failed to read` 与 `Container corruption detected by apfs_scan_verify`，故障落在可写的 Data 卷 |
+| round167（v0.5.21） | 写完成必须 CMD13 确认 `READY_FOR_DATA|TRAN`、停命令失败复位数据通路、写节奏改 level-gated、两条请求死线随块数缩放、EXT_CSD `CACHE_CTRL` 清零；批量读须三份样本一致才信任 | 等冷刷；读数行 `CloverSdhci r167: write cache …`、`CloverSdhci r167: readcheck … trusted=…` |
 
 ### 还没解决
 
@@ -12060,6 +12062,93 @@ CMD18 一起消失；如果它还在，而且 `sig` 行也不对，那读路径�
 坏源（PIO 单块本身或块层拷贝），下一轮就量单块读自己的 A/B。若 jhash
 消失、`sig` 行正确，85 仍在，则签名结构校验的输入没问题，下一刀落在
 `ubc_subr.c` 的判定，而不是存储。
+
+## v0.5.21（round167）：写要等卡说完成，写缓存关掉，批量读必须三份样本一致
+
+r166 的冷刷把故障面从「读回错字节」挪到了「可写容器的 I/O」。这一帧里
+`launchd_cache_loader[22]` 以 `namespace 2 subcode 0xa`（SIGBUS）退出，
+initproc 一死就 panic；屏上 APFS 反复报
+`apfs_scan_verify:2467: disk0s1 failed to read …`，随后
+`Container corruption detected by apfs_scan_verify`，中间是 persona 1000
+的加载行。与此前的 jhash 错不同，这次 APFS 说的是**读失败**，不是校验和
+不符；而 r166 已经整轮走单块读，dyld 读 SystemOS 缓存依旧 `err=0`。
+r161 与 r166 用的是同一份驱动，唯一的差别是 Data 卷在 persona 阶段被写过。
+
+写路径上有四处缺陷，本轮一并修掉：
+
+1. **写完从不确认**。`writePioBlock`/`writeMultiBlock` 只要命令响应、
+   DATA_END 和字数对就返回成功，从不发 CMD13 看卡是否已
+   `READY_FOR_DATA` 且处于 TRAN。新增 `writeSettled()`：先等
+   `SDHCI_DATA_INHIBIT` 落掉（200 ms 上限），再轮询 CMD13，只有
+   `R1_READY_FOR_DATA` 且 `R1_CURRENT_STATE == TRAN` 才算这块写完；
+   未就绪的批次不计入 `done`，并打印一次
+   `CloverSdhci r167: write not ready lba=%u blocks=%u rsp=%08x st=%08x polls=%u`。
+2. **停命令失败被忽略**。`writeMultiBlock` 现在检查 `sendStopCommand()`
+   的返回值；数据相位不干净或停命令失败，一律 `SDHCI_RESET_DATA`，
+   不让卡留在 data 模式去污染后续读。
+3. **写节奏还是 400 kHz 的旧账**。单块写删掉每字 160 µs 的间隔，改成与读
+   相同的 level-gated：`SPACE_AVAILABLE` 就交一个字。SDHCI 在缓冲满时
+   自己背压，不会跑过卡。两条整请求死线也改为随块数缩放：
+   `frequency * 2 + blocks * (frequency / 200)`。
+4. **写缓存从未关过**。每次开机都是硬断电，而 eMMC 的写缓存里可能还躺着
+   没落盘的块。mode 21 读完 EXT_CSD 之后、`fastMode` 之前，按
+   `CACHE_CTRL`（字节 33）把写缓存关掉（已经是 0 就跳过），并打印
+   `CloverSdhci r167: write cache size=%u ctrl=%u off=%d rsp=%08x st=%08x`。
+
+读这一侧把批量读放回来，但不再无条件信任：`checkReadPath` 对首个 ≥32 块
+的请求读三份 16 KiB——两次 CMD18 批量、一次 32 块逐块——三份逐字相同
+（`diff=0/0`、长度都等于请求）才 `gReadBatchTrusted = true`，否则整轮退回
+单块。无论哪种都先打
+`CloverSdhci r167: readcheck lba=… batch=…/… single=… diff=…/… trusted=…`，
+再打 `batch reads trusted for this boot` 或
+`single-block reads for this boot`。理由是 3.7 GiB 的 dyld 缓存按单块读要
+按小时计，而 r166 已证明批量读不是坏读的来源；三份对照保留为一道闸。
+
+构建链与 round166 相同（先内核、再 payload）：
+
+```sh
+cd ~/UniXNU && /opt/homebrew/bin/python3.13 ./unixnu build kernel --device ../UniXNU-clover
+/opt/homebrew/bin/python3.13 ~/UniXNU-clover/scripts/patch-clover-amfi.py \
+  ~/UniXNU/out/clover/kernel/kernel.macho ~/clover-out/round167-kernel-amfi.macho
+/opt/homebrew/bin/python3.13 ./unixnu build payload --device ../UniXNU-clover \
+  --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --kernel /Users/zhouzhou/clover-out/round167-kernel-amfi.macho \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+```
+
+内核构建前同样要把 `out/clover/tree/.cache/xnu-work` 里的
+`zzy-clover-dyld-cache-skip.patch` 反向撤掉，否则
+`native-4k-signature-hash-cache.patch` 正反都校验不过。`--trust-cache`
+仍必须是 `build/clover-trust/trustcache.bundle`（`7c369ce0…`）。
+
+产物：prelink 内核 `248e7c58…`；打过 AMFI 的拷贝 `f15625be…`
+（`0x1a830e4` 与 `0x1a8316c` 两处补丁照旧）；payload `2017f236…`（56 MiB），
+卷内 kernel `b87480e5…`、`unixnu.toml` `4cdbd9c7…`、ADT `5b328b26…`、
+`scratch-data.img` `614b8356…`、trustcache `7c369ce0…`。入口探针
+`6845 bytes in 37 runs`；`verify-clover-payload.py` 全项 OK，新增
+`kernel.macho: eMMC read/write integrity`（readcheck、trusted/single 两行、
+write cache 与 write not ready）。归档在 `~/clover-out/round167-*`，清单
+`round167-SHA256SUMS`。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round167-payload.img
+fastboot reboot
+```
+
+`userdata` 不动，round159 的 Data 窗口仍在；这是冷刷，不用 `fastboot boot`。
+
+这一刷回答一个问题：可写的 Data 容器是否还会在读回时报 I/O 失败。
+读数顺序：`CloverSdhci r167: write cache … off=1`（缓存确实关了）、
+`CloverSdhci r167: readcheck … trusted=1` 与 `batch reads trusted`（批量读
+恢复且三份一致）、persona 阶段之后 `apfs_scan_verify` 的
+`failed to read` 与 `Container corruption detected` 是否消失、
+`launchd_cache_loader` 的 SIGBUS 与那条 85 是否随之前进。若写缓存关掉后
+APFS 仍然判容器损坏，下一次启动前应先在宿主上对 Data 种子做一次
+fsck 级检查，再决定是否需要重建那 32 MiB 种子；那属于对 userdata 窗口的
+破坏性写入，会单独声明。
 
 ## 许可证
 

@@ -1292,8 +1292,9 @@ static uint32_t gCheckBatchA[kReadChunkBlocks * kBlockWords];
 static uint32_t gCheckBatchB[kReadChunkBlocks * kBlockWords];
 static uint32_t gCheckSingle[kReadChunkBlocks * kBlockWords];
 static bool gReadCheckDone = false;
-// Round166: starts untrusted. Every read this boot takes the single-block sequence that every round
-// before r156 used, and checkReadPath only reports what the batch would have returned at one sample.
+// Round167: starts untrusted; checkReadPath promotes it only when two CMD18 batches and the
+// block-by-block sequence agree over the same 16 KiB, so the first real request still reads
+// exactly like every round before r156.
 static bool gReadBatchTrusted = false;
 
 static uint32_t countWordDiff (const uint32_t *a, const uint32_t *b, uint32_t words,
@@ -1335,18 +1336,26 @@ static void checkReadPath (uint32_t lba)
   const uint32_t diffB = (batchA && batchB)
                          ? countWordDiff (gCheckBatchA, gCheckBatchB, words, firstB)
                          : words;
-  // Round166: r165 let one matching sample promote the batch for the whole boot. The boot after it
-  // still handed APFS and the code-signature loader wrong bytes, and the failed 16 KiB APFS chunks
-  // are exactly one CMD18 batch, so the batch is retired rather than trusted: the row below is
-  // evidence about this LBA only, never permission to use the batch.
-  gReadBatchTrusted = false;
-  IOLog ("CloverSdhci r166: readcheck lba=%u batch=%d/%d single=%d diff=%u/%u first=%u/%u "
-         "m=%08x s=%08x\n",
+  // Round167: r166 ran the whole boot on single blocks to rule the batch out, and the next frame
+  // still failed inside APFS. The batch therefore stays -- without it the 3.7 GiB dyld cache is
+  // hours of reads at 512 bytes per command. It is trusted only when all three samples of this
+  // 16 KiB run agree word for word: two CMD18 batches and the 32 CMD17 blocks every earlier round
+  // used. Any difference retires it for the boot, exactly as r165 did.
+  const bool trusted = batchA && batchB && single &&
+                       gotA == words && gotB == words && diff == 0 && diffB == 0;
+  gReadBatchTrusted = trusted;
+  IOLog ("CloverSdhci r167: readcheck lba=%u batch=%d/%d single=%d diff=%u/%u first=%u/%u "
+         "m=%08x s=%08x trusted=%d\n",
          lba, batchA ? gotA : 0, batchB ? gotB : 0, single ? blocks : 0,
          diff, diffB, first, firstB,
          gCheckBatchA[first < words ? first : 0],
-         gCheckSingle[first < words ? first : 0]);
-  IOLog ("CloverSdhci r166: single-block reads for this boot\n");
+         gCheckSingle[first < words ? first : 0],
+         trusted ? 1 : 0);
+  if (trusted) {
+    IOLog ("CloverSdhci r167: batch reads trusted for this boot\n");
+  } else {
+    IOLog ("CloverSdhci r167: single-block reads for this boot\n");
+  }
 }
 
 extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint32_t blocks)
@@ -1369,7 +1378,12 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   if (!gReadCheckDone && blocks >= kReadChunkBlocks) {
     checkReadPath (lba);
   }
-  const uint64_t deadline = frequency * 2ULL;   // 2 s for the whole request
+  // Round167: the whole-request deadline scales with the run. A flat two seconds was sized for a
+  // batch that finishes in milliseconds; a request that falls back to single blocks over a large
+  // APFS or dyld read can exceed it, and a truncated read is an EIO the filesystem reports as
+  // "failed to read". Five milliseconds per block on top of the two seconds is still a timeout.
+  const uint64_t deadline = frequency * 2ULL +
+                            static_cast<uint64_t>(blocks) * (frequency / 200ULL);
   uint32_t done = 0;
   while (done < blocks) {
     if (readCounter () - start > deadline) {
@@ -1407,19 +1421,59 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   return done;
 }
 
+// After a write the card programs, and its R1 reports READY_FOR_DATA in TRAN only when the block
+// is actually stored. Nothing above this layer retries a write it was told succeeded, and every
+// boot here ends in a hard reset, so the confirmation is part of the write. DATA_INHIBIT first
+// covers the data line the card holds busy while programming; CMD13 then names the state. The
+// whole wait is bounded by the same 200 ms counter the other post-command waits use, and `polls`
+// counts the CMD13s that said "still programming" so a slow card reads as a number, not a hang.
+static void waitCardReady (uint32_t &response, uint32_t &status, uint32_t &polls);
+
+static bool writeSettled (uint32_t &response, uint32_t &status, uint32_t &polls)
+{
+  response = 0;
+  status = 0;
+  polls = 0;
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint64_t deadline = frequency / 5ULL;      // 200 ms
+  const uint64_t start = readCounter ();
+  while (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_INHIBIT) {
+    if (readCounter () - start > deadline) {
+      return false;
+    }
+  }
+  for (;;) {
+    uint32_t cardPolls = 0;
+    waitCardReady (response, status, cardPolls);
+    polls += cardPolls;
+    if ((response & R1_READY_FOR_DATA) && R1_CURRENT_STATE (response) == R1_STATE_TRAN) {
+      return true;
+    }
+    if (readCounter () - start > deadline) {
+      return false;
+    }
+  }
+}
+
 // One whole 512-byte block, written the mirror image of readPioBlock: CMD24 with the block count
-// enabled and the direction bit clear, the same 160 us counter gap between FIFO words, the same
-// 200 ms deadline, and a final level-gated sweep so a controller that still had room takes the
-// rest. Writing slower than the card consumes is safe -- SDHCI stops the card clock while the
-// buffer is empty -- so the read path's pace is reused rather than guessed at. `wordCount` is how
-// many words were handed to the data port; the return value is true only for a clean command
-// response, DATA_END and all 128 words handed over.
+// enabled and the direction bit clear, a 200 ms deadline and a final level-gated sweep so a
+// controller that still had room takes the rest. Round167 drops the 160 us gap between words that
+// was copied from mode 12's 400 kHz identification clock: at 50 MHz it made a block cost 20.5 ms
+// for no reason, and SDHCI backpressures the card whenever the buffer is full, so writing only
+// while SPACE_AVAILABLE can never outrun it. A refused command or a failed data phase resets the
+// data circuit, because a half-written block left active would wedge the card for the reads that
+// follow. `wordCount` is how many words were handed to the data port; the return value is true
+// only for a clean command response, DATA_END and all 128 words handed over.
 static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCount,
                            uint32_t &status)
 {
   wordCount = 0;
   status = 0;
   if (!waitCommandSlot ()) {
+    resetReadPath ();
     return false;
   }
   write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
@@ -1442,17 +1496,15 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
   }
   if (!(status & SDHCI_INT_RESPONSE) ||
       (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+    resetReadPath ();
     return false;
   }
   uint64_t frequency = counterFrequency ();
   if (frequency < 1000000ULL || frequency > 1000000000ULL) {
     frequency = 19200000ULL;
   }
-  const uint64_t gap = frequency / 6250ULL;        // 160 us; writes are rare, keep the proven pace
   const uint64_t deadline = frequency / 5ULL;      // 200 ms
   const uint64_t start = readCounter ();
-  uint64_t lastWrite = start;
-  bool haveWritten = false;
   uint32_t guard = 0;
   for (;;) {
     status = read32 (SDHCI_INT_STATUS);
@@ -1460,15 +1512,12 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
                   SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR)) {
       break;
     }
-    uint64_t now = readCounter ();
-    if (now - start > deadline) {
+    if (readCounter () - start > deadline) {
       break;
     }
-    if (wordCount < kBlockWords && (!haveWritten || now - lastWrite >= gap) &&
+    if (wordCount < kBlockWords &&
         (read32 (SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE)) {
       write32 (SDHCI_BUFFER, words[wordCount++]);
-      haveWritten = true;
-      lastWrite = now;
     }
     if (++guard >= kCommandSpinLimit) {
       break;
@@ -1478,8 +1527,12 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
          (read32 (SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE)) {
     write32 (SDHCI_BUFFER, words[wordCount++]);
   }
-  return (status & SDHCI_INT_DATA_END) && !(status & kDataErrorMask) &&
-         wordCount == kBlockWords;
+  if ((status & SDHCI_INT_DATA_END) && !(status & kDataErrorMask) &&
+      wordCount == kBlockWords) {
+    return true;
+  }
+  resetReadPath ();
+  return false;
 }
 
 // Round159: the write mirror of readMultiBlock. One CMD25 for several consecutive blocks, then
@@ -1551,9 +1604,16 @@ static bool writeMultiBlock (uint32_t lba, const uint32_t *words, uint32_t block
          (read32 (SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE)) {
     write32 (SDHCI_BUFFER, words[wordCount++]);
   }
-  sendStopCommand ();
-  if (clean && wordCount == totalWords) {
+  // Round167: a stop that never completed leaves the card in data mode, and every later command
+  // would look like a fresh refusal. The old shape ignored this return value, so a wedged card
+  // read exactly like a clean one until the next request timed out. Both a refused stop and a
+  // dirty data phase now reset the host's data circuit before the caller retries.
+  const bool stopped = sendStopCommand ();
+  if (clean && stopped && wordCount == totalWords) {
     return true;
+  }
+  if (!clean || !stopped) {
+    resetReadPath ();
   }
   return multiFailure (1, lba, blocks, status, wordCount, totalWords);
 }
@@ -1578,8 +1638,14 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
   if (!acquireBlockGuard (frequency, start)) {
     return 0;
   }
-  const uint64_t deadline = frequency * 2ULL;
+  // Round167: the request deadline scales with the run. A flat two seconds was sized for one APFS
+  // burst; a single-block fallback over 32 blocks, at the 400 kHz timing this card may still be
+  // on, can exceed it, and a short write is a torn checkpoint. Five milliseconds per block on top
+  // of the two seconds covers the slowest path the driver ever takes.
+  const uint64_t deadline = frequency * 2ULL +
+                            static_cast<uint64_t>(blocks) * (frequency / 200ULL);
   uint32_t done = 0;
+  bool settleReported = false;
   while (done < blocks) {
     if (readCounter () - start > deadline) {
       break;
@@ -1596,13 +1662,33 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
       uint32_t handed = 0;
       uint32_t status = 0;
       if (writeMultiBlock (lba + done, target, chunk, handed, status)) {
-        done += chunk;
-        continue;
+        // Round167: DATA_END is not durability. The card says READY_FOR_DATA in TRAN only after
+        // the block reached its media, and a batch that never gets there is not counted as done.
+        uint32_t rsp = 0, settleStatus = 0, polls = 0;
+        if (writeSettled (rsp, settleStatus, polls)) {
+          done += chunk;
+          continue;
+        }
+        if (!settleReported) {
+          settleReported = true;
+          IOLog ("CloverSdhci r167: write not ready lba=%u blocks=%u rsp=%08x st=%08x "
+                 "polls=%u\n", lba + done, chunk, rsp, settleStatus, polls);
+        }
+        break;
       }
     }
     uint32_t handed = 0;
     uint32_t status = 0;
     if (!writePioBlock (lba + done, target, handed, status)) {
+      break;
+    }
+    uint32_t rsp = 0, settleStatus = 0, polls = 0;
+    if (!writeSettled (rsp, settleStatus, polls)) {
+      if (!settleReported) {
+        settleReported = true;
+        IOLog ("CloverSdhci r167: write not ready lba=%u blocks=1 rsp=%08x st=%08x "
+               "polls=%u\n", lba + done, rsp, settleStatus, polls);
+      }
       break;
     }
     done++;
@@ -1914,6 +2000,10 @@ static const uint32_t kGccCfg50m = 0x0000060bu;
 static const uint32_t kSwitchWriteByte = 3u << 24;
 static const uint32_t kExtCsdHsTiming = 185u;
 static const uint32_t kExtCsdBusWidth = 183u;
+// Round167: CACHE_CTRL lives in byte 33 and CACHE_SIZE in bytes 249..252. This driver never issues
+// FLUSH_CACHE, so a cache left enabled is write-back storage nobody ever commits, and every boot
+// here ends in a hard reset.
+static const uint32_t kExtCsdCacheCtrl = 33u;
 static const uint32_t kHsTimingHighSpeed = 1u;
 static const uint32_t kBusWidth8Bit = 2u;
 // Vendor clock mux (sdhci-msm.c:78-85): 10:8 select the MCLK, bit18 enables the HS400-only
@@ -3119,6 +3209,24 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             extOk21 = false;
           } else {
             gBlockSectors = extSectors21;
+            // Round167: the card's own write cache is the one place a completed write can sit
+            // without having reached the media, and nothing in this driver issues FLUSH_CACHE.
+            // Every boot here ends in a hard reset, so a checkpoint APFS believed durable could
+            // be torn; disabling the cache makes READY_FOR_DATA mean what writeSettled reads it
+            // as. A card with CACHE_SIZE zero has none, and one that already reports it off is
+            // left alone. The answer stays on the frame either way.
+            const uint32_t cacheSize = (gExtCsd[62] >> 8) | (gExtCsd[63] << 24);
+            const uint32_t cacheCtrlBefore = (gExtCsd[8] >> 8) & 0xffu;
+            uint32_t cacheRsp = 0, cacheStatus = 0, cachePolls = 0;
+            bool cacheOff = cacheCtrlBefore == 0;
+            if (cacheSize && !cacheOff) {
+              cacheOff = switchExtCsd (kExtCsdCacheCtrl, 0, cacheRsp, cacheStatus) &&
+                         cardInTransfer (cacheRsp, cacheStatus, cachePolls);
+            }
+            IOLog ("CloverSdhci r167: write cache size=%u ctrl=%u off=%d rsp=%08x st=%08x\n",
+                   cacheSize, cacheCtrlBefore, cacheOff ? 1 : 0, cacheRsp, cacheStatus);
+            clover_emmc_link[14] = cacheSize;
+            clover_emmc_link[15] = (cacheCtrlBefore << 8) | (cacheOff ? 1u : 0u);
             // Round159, after the geometry is known and before the device is handed up: switch
             // the link to high-speed 8-bit 50 MHz and prove it with LBA 1. A failure here is a
             // reading, not a boot failure -- the same card then serves the same reads at the
