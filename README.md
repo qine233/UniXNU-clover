@@ -16,6 +16,7 @@
 | 层 | 状态 |
 | --- | --- |
 | 板级描述 | `board.toml` 可解析；`scripts/check-clover.py` 把它与 defconfig 和 payload 契约交叉核对 |
+| 移植记录 | `porting.toml`（`schema_version = 1`）按上游要求的 13 个 area 记录覆盖与证据；`.github/workflows/porting-record.yml` 调用 UniXNU 的 `porting-record.yml@main` 跑同一份校验；`AGENTS.md` 写明仓库边界与当前活跃的 area |
 | ADT | `scripts/make-clover-adt.py` 为 8 个 Kryo 260 核生成 13,880 字节；检查器会把编码读回来，并断言 `ArmDTPlatform` 和 DarwinBoot 需要的节点 |
 | 内核 | 已构建：`DEVELOPMENT_ARM64_BCM2837` 的 51.8 MB `kernel.macho` |
 | payload / boot.img | 已构建：56 MiB Fat32 payload 卷，以及 kernel 段就是固件的 boot 镜像；payload **不**走 ramdisk（见下文）。`v0.2.13` 起 payload 里的 `kernel.macho` 是一份打了探针的副本：入口色带、panic 屏幕，以及 `arm_init` 某个调用返回后触发的定时复位；`v0.2.16` 起在开 MMU 前调用一个 mapper 洞穴，把 framebuffer 恒等映射进 TTBR0（与窗口同槽就复用 L2 表，否则用窗口最后一页新建一张），并预先填好 `_vinfo`；mapper 失败会涂一条白色诊断带；`v0.2.17` 改成用自身 PC 定位引导页表（`boot_args.physBase` 落在 `__PRELINK_TEXT` 上、本身没有被映射），并在 MMU 打开后立刻涂第 4 条青色带；`v0.2.18` 再加一条独立的橙色带（第 12 条），在 `arm_init` 的第一条调用处直接从 `boot_args` 涂，不依赖栈、AT 和 `_vinfo`；`v0.2.19` 修掉种子守卫写反的 bug（`cbz x8` 在 mapper 成功时跳过种子，`_vinfo` 因此一直是 0，黄带从 `v0.2.15` 起从未画出来过），并在第一条调用返回后再涂一条红带（第 13 条）；`v0.2.20` 修掉 ADT 里 `cluster-type` 的尺寸契约（字符串改为 4 字节整数 `'E'` / `'P'`）；`v0.2.21` 又因为这份内核只支持单簇而移除该属性，让 8 个核落在一个 `CLUSTER_TYPE_SMP` 平坦簇里；`v0.2.22` 关掉 `CONFIG_XNU_NATIVE_PAN` 并重建内核（Kryo 260 是 ARMv8.0，没有 PAN），这是本轮第一次改内核构建配置，探针脚本不变；`v0.2.23` 换回定时信号：`arm_vm_init` 返回后 10 秒复位，panic 屏幕在 framebuffer 不再翻译时 3 秒复位；`v0.2.24` 把复位点移到第二次 `PE_init_platform(TRUE)` 返回后 15 秒，这一段跨过 `serial_init`、`kernel_startup_initialize_upto(KPRINTF)` 和 `PE_create_console`，后者会重新映射 framebuffer，成功的话 panic 屏幕又能画字（见"菜单之后看什么"）；`v0.2.25` 修掉 `PE_create_console` 开头内联的 panic-log 探测（这份 BCM2837 内核读树莓派地址 `0x3c0fc000`，在 clover 上是外部异常），复位点不变；`v0.2.26` 把 `arm_init` 后段五个调用各接一个涂色洞穴（第 6–10 条带），复位点移到 `_machine_startup` 调用处，复位洞穴先涂第 11 条红带再等 15 秒；`v0.2.27` 把刻度带移到第 10–14 条、控制带移到第 15 条（都在 panic 屏不清的下半屏），并让 panic 屏印出 RA/FP/LR、fmt/args 和 va_list 前后各槽，用于从照片定位断言调用点；`v0.2.28` 修掉刻度洞穴的 4 字节对齐缺陷（第 14 条洞穴整体左移、`bl` 落到 `_fiq_context_init - 4`，`v0.2.27` 的白字是探针自己的误报），并在打洞时校验每条 `_start` 与每个 `bl` 目标；`v0.2.29` 把检查点从 `_machine_startup` 调用前推进到交接之后：第 15 带表示进入 `_machine_startup`，随后 9/8/7/6 带依次覆盖 `_machine_conf` 返回、`_kernel_bootstrap` 入口、首条 `printf` 返回和 `vm_mem_bootstrap` 调用点，复位也移到最后一档；`v0.2.30` 把第 10–14 条带从 `arm_init` 改标 `vm_mem_bootstrap` 里的五个调用（`vm_page_bootstrap`、`zone_bootstrap`、`vm_object_bootstrap`、`vm_map_init`、`kmem_init`），第 5 条红带表示 `kmem_init` 返回、随后 15 秒复位；`v0.2.31` 把已经证明返回的五个调用摘掉，第 5 条红带保留为前半段的收尾，第 10–14 条带改标后段（`kernel_startup_initialize_upto(KMEM)`、`vm_fault_init`、`kernel_startup_initialize_upto(ZALLOC)`、最后那条 `kprintf` 的进入与返回），返回后 15 秒复位；`v0.2.32` 在 `vm_mem_bootstrap` 返回后直接调用 `_vcattach`，第 15 条带从红改涂绿表示调用返回，控制台接上后屏幕交给内核文字，本轮不再定时复位；`v0.2.33` 在 ADT 的 `/chosen` 发布 `amfi-only-platform-code = <1>`（AMFI 启动的前置），并让控制台洞穴先调 `initialize_screen(NULL, kPETextMode)` 再调 `_vcattach`（单独 `vcattach` 在本机是空操作：`PE_create_console` 选了图形模式，`gc_graphics_boot` 为真）；`v0.2.34` 不再画带，改为在 `_bsd_init` 的九个无条件调用（`vfsinit`、自动配置前的初始化块、`kminit`、`IOKitBSDInit`、`loopattach`、`ether_family_init`、`net_init_run`、`vfs_mountroot`、`devfs_kernel_mount`）返回后各印一行 `[clover] … returned`，最后一行标记直接指出没返回的调用；`v0.2.35` 起 payload 多了两个文件，`Payloads/scratch-data.img`（签过名的静态 EL0 init，DarwinBoot 把它放进窗口并填 `/chosen/memory-map/RAMDisk`，内核当 `md0` 挂成 mockfs 根）和 `Payloads/kernel.macho.trustcache`（那颗 cdhash 的离线信任），`unixnu.toml` 里因此有 `initrd` 和 `rd=md0`，ADT 只有一个 `RAMDisk` 槽、不再有 `PackedRAMDisk`；`v0.2.36` 只换根镜像里的 init 程序（它自己 `open("/dev/console")`，退出码按「阶段 × 32 + errno」编码），`kernel.macho` 与探针逐字节不变 ；`v0.2.37` 把退出改成失败通道：四步全通就把 banner 连写 240 遍（两整屏）并停在 EL0，让活控制台当读数，只有失败才 `exit(阶段 × 32 + errno)` ；`v0.2.38` 花掉洪水、改问多进程：banner 一遍后 `fork`，子进程印自己的 pid/ppid 后 `exit(7)`，父进程 `wait4` 后印 reaped pid 与原始 status 再停住；`v0.2.39` 仍只换那颗根镜像：父进程 `fork` 一返回就印 `forked pid=`，子进程第一条指令先印 `alive`，把 round68「banner 之后什么都没有」的三义性切成三个独立读数；`v0.2.40` 仍只换那颗根镜像：按 Darwin arm64 的 fork ABI 用 `x1` 分流（孩子拿到 `x0=自己 pid, x1=1`），两边各印自己拿到的 `x0/x1`，`_fail` 从 `ret` 改成直接 `exit`，失败不再可能变成静默自旋；`v0.2.41` 仍只换这颗根镜像：只有 pid 1 才 fork，孩子印完自己的行就 `execve("/sbin/launchd", argv, envp)`（syscall 59，`syscalls.master` 抄的；`argv`/`envp` 运行时填进 `__DATA`，因为 `-static` PIE 的数据段放不了绝对地址），exec 成功就等于屏幕上出现第二份这个程序、且它的 `console fd=1`；`v0.2.42` 仍只换这颗根镜像：exec 出来的那份副本改发 mach trap（x16 = 表下标的相反数：`thread_self` -27、`task_self` -28、`host_self` -29、`mach_reply_port` -26、`mach_msg` -31；返回只写 x0、不碰 carry），三个 self 端口 + 一个 reply 端口 + 一条 24 字节消息自己发给自己再收回来，跑完 `exit(11)`；`v0.2.43` 仍只换这颗根镜像：mach 探针在 send 前后、receive 前后各加一次出声打印，并把消息缓冲区的地址也印出来，把 round72「`send=` 那行没出现」这一张图能做的两种解释切分开；`v0.2.44` 仍只换这颗根镜像：消息改走 `mach_msg2_trap`（x16 = -47，八个打包参数，发送腿带 `MACH64_SEND_MQ_CALL`），缓冲区指针从 x7 挪到 x20（x7 现在是 msg2 的 timeout 实参），末尾再用 legacy `mach_msg` 重放一次作为 boot-arg 对照；`v0.2.45` 仍只换这颗根镜像：孩子那一路一条指令不改，父亲把阻塞的 `wait4` 换成 `WNOHANG` 轮询、每轮烧几十毫秒计数并印一行，用来把「孩子挂在里面」「孩子已死但父亲被堵在悼词写」「tty 写路径自己死了」这三种共用一张照片的情况切开；`v0.2.46` 仍只换这颗根镜像，且孩子那一路一条指令不改：父亲把轮询期间的打印**全部拿掉**（一个字符都不写），200 轮之后用 `exit(384)` 报超时，因为 panic 屏是直写 framebuffer 的、不经过 `vcputc`，是这台板子上唯一不受被测控制台影响的通道 |
@@ -11245,6 +11246,99 @@ fastboot reboot
 modules visible`、`probe patch localized OK (6838 bytes in 35 runs)`、
 `cache gate probe linked OK (… fsig_add present, r153/r154 forms kept)`、
 `map-and-slide probe linked OK`、`cache open probe linked OK`。
+
+## v0.5.11（round158）：照 sheng 对齐仓库契约，补一条锁超时安全网
+
+### 这一轮改的是仓库，不是启动路径
+
+把 `~/UniXNU-sheng` 近四十个提交逐条看过：除了仓库契约，其余几乎全是 SM8550
+专属（Adreno 740、ath12k、ADSP、Novatek、sheng-* 启动参数、Data 卷）。真正
+与 SoC 无关、clover 也该有的只有四份文件和一项配置：
+
+1. **`porting.toml`**：上游 `scripts/porting-record.py`（CI 实际执行的那份）要求
+   `schema_version = 1`、固定 13 个 area 全部存在、`device.name/soc/os_profile`
+   与 `board.toml [board]` 对应键相等、每个 area 的七组字段都是非空字符串列表；
+   `implemented` 必须有 evidence，`host-verified`/`device-verified` 必须有带
+   40 位 revision 与 command 的同类 evidence，非 https 的 reference 必须是仓库
+   内存在的文件。clover 的 13 个 area 里 configuration、firmware、cpu、memory、
+   storage、power、packaging、diagnostics 记为 `implemented`；display、input、
+   gpu、network、audio 记为 `planned`（sheng 的 SM8550 组件不能选，clover 还没
+   有对应驱动）。planned area 也要显式写 `evidence = []`：校验器直接下标
+   `area['evidence']`，缺键会抛 `porting record: 'evidence'`。
+2. **`AGENTS.md`**：仓库所有权（`board.toml`、eMMC 存储、固件选择、ADT、
+   payload 归本仓；共享 XNU 与组件目录归 UniXNU；固件仓是 `uefi-clover`）、
+   必读文档、构建与双 checker、trust cache 只有三模块 bundle 被接受、只冷刷
+   cache、绝不 `fastboot boot`、以及「storage 是当前活跃 area、墙是 dyld 共享
+   缓存 preflight」。
+3. **`.github/workflows/porting-record.yml`**：与 sheng 相同的四行 job，调用
+   `UniXNU/UniXNU/.github/workflows/porting-record.yml@main`。
+4. **`.gitattributes`**：照 sheng 的 LF 与二进制清单，补丁文件
+   `-whitespace`，避免 CI 或编辑器改写 hunk。
+5. **`[board] os_profile = "ipados-17.7.11-21H461"`**：校验器要求它与
+   `porting.toml [device]` 相等，这不是新的构建输入，只是把两处已有的 IPSW
+   标识写进板级描述。`check-clover.py` 现在断言这个值。
+
+### `ml-timeout-lock-panic-scale=40` 不是 sheng 专属
+
+`osfmk/arm/locks_arm.c:106` 声明
+`MACHINE_TIMEOUT(lock_panic_timeout, "lock-panic", 0xc00000, …)`，`0xc00000`
+个 24 MHz timebase tick 约 **524 ms**；`osfmk/kern/machine.c:1331-1345` 用
+`"ml-timeout-" + name + suffix + "-scale"` 组 boot-arg 名，所以 40 把死线拉到
+约 **21 s**。理由是本板 r156 自己的测量：CloverBlock 一次把 16 KiB（32 块）
+交给控制器，在旧的逐字等待节奏（25 KB/s）下这次调用持缓冲区锁 **655 ms**，
+已经超过默认死线——慢读会被报成死锁。sheng 出于同样原因传同一个值，内核其他
+东西不变。`check-clover.py` 反向要求 shipped boot 必须带这一项。
+
+### 不适用的 sheng 差异
+
+- `sheng-*`（WiFi/GPU/CPU governor/touch/AKS/banner/vsync）：由 sheng 的板级
+  驱动消费，clover 没有这些驱动。
+- `offline-legacy-*`、`offline-hid-*`、`offline-key-events`：sheng 的
+  `LegacyDisplayProbe.cpp`、`HidInputProbe.cpp`、`KeyStoreProbe.cpp` 消费。
+- `-apfs_shared_datavolume`、`[payload.install]`：都需要 Data seed / Data 卷，
+  clover 现在只有 OS + SystemOS。
+- `CONFIG_XNU_NATIVE_UFS`、`VIRTIO_BLOCK`、`VERIFIED_ROOT`、
+  `OWNER_DATA_MOUNT`、`BOOT_MANIFEST`、`DT_PANIC_REGION`、`ZONE_PGZ`：
+  clover 走 `CloverSdhci` + `CloverBlock` 与自己的 owner 契约。
+- `[components] include`：clover 用 archives + prelink roots。
+
+### 构建与刷写
+
+内核没有变，只重建 payload：
+
+```sh
+cd ~/UniXNU && PATH=$HOME/UniXNU-clover/build/shim:$PATH \
+  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  ./unixnu build payload --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+cd ~/UniXNU-clover && scripts/check-clover.py && python3 scripts/verify-clover-payload.py
+```
+
+只写 `cache`，冷启动：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round158-payload.img
+fastboot reboot
+```
+
+### 这一帧怎么读
+
+与 r157 相同，这一轮不动探针，问题仍是：**`.01` 打开之后，dyld 是被头字段
+拒、被签名块读拖住，还是已经跨进 syscall 536。** 与 r157 唯一的差别是锁死线
+从 524 ms 变成 21 s，慢读不会再以 panic 的形式污染帧。
+
+产物归档在 `~/clover-out/round158-*`，`round158-SHA256SUMS` 八项：
+`payload.img` 58,720,256 B（`0fbb7e67…`）、本地 `kernel.macho` 51,998,720 B
+（`ec6149bc…`）、卷内 `kernel.macho`（`670ed61a…`）、卷内 `unixnu.toml` 635 B
+（`6514717a…`）、ADT 13,516 B（`049c8dbd…`）、`scratch-data.img` 35,888 B
+（`614b8356…`）、`trustcache` 61,408 B（`7c369ce0…`）、构建日志 885 B
+（`d6521036…`）。两个 checker 的结果：
+`clover ok: ADT 13516 bytes, 8 cores; … 75 inline asm statements separated;
+modules visible`、`probe patch localized OK (6838 bytes in 35 runs)`、
+`cache gate probe linked OK (… fsig_add present, r153/r154 forms kept)`、
+`owner SystemOS mount compiled in OK`、`owner root trust compiled in OK`；
+`porting.toml` 另经上游校验器：`clover: 13 structured areas checked`。
 
 ## 许可证
 

@@ -440,6 +440,12 @@ def check_board(errors: list) -> str:
 
     if board["board"]["name"] != "clover" or board["board"]["soc"] != "SDM660":
         errors.append("board.toml does not describe clover / SDM660")
+    # Round158. scripts/porting-record.py (the required CI check sheng runs) compares
+    # device.os_profile in porting.toml with board.toml [board] os_profile and fails when
+    # either is absent. The value is the IPSW profile both files already describe.
+    if board["board"].get("os_profile") != "ipados-17.7.11-21H461":
+        errors.append('[board] os_profile is not "ipados-17.7.11-21H461": porting.toml would '
+                      "fail the upstream Porting record check")
     if board["board"].get("example"):
         errors.append("board.toml still marks the board as an example")
 
@@ -582,6 +588,14 @@ def check_board(errors: list) -> str:
         errors.append('[payload] kernel_args has no -no_slto_panic: sheng boots with spinlock timeout '
                       "panics disarmed (osfmk/kern/startup.c:476), and the r146 silence includes no "
                       "spinlock report only because the timer has not fired yet")
+    # Round158. The lock timeout is a generic XNU machine timeout (osfmk/arm/locks_arm.c:106,
+    # 0xc00000 ticks = 524 ms at 24 MHz), overridden as ml-timeout-<name>-scale
+    # (osfmk/kern/machine.c:1331-1345). Round156 measured a 16 KiB CloverBlock batch holding
+    # a buffer lock for 655 ms at 25 KB/s, so the shipped boot must carry the same 40x scale
+    # sheng uses; otherwise a slow read is indistinguishable from a dead lock.
+    if "ml-timeout-lock-panic-scale=40" not in board["payload"]["kernel_args"]:
+        errors.append('[payload] kernel_args has no ml-timeout-lock-panic-scale=40: the 524 ms '
+                      "lock deadline is shorter than one 16 KiB read on this board's PIO path")
     # Round139. Round138's frame was `namespace 9 code 0x8` with `description none`, i.e.
     # EXEC_EXIT_REASON_SECURITY_POLICY created on process_signature()'s ip_mac_return branch
     # (kern_exec.c:8541-8546) -- a MAC label-update denial, which here is AMFI's hook. Both readers
@@ -1015,9 +1029,9 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round157. The menu has to name the round that fixed the fast path's silent failures.
-    if not board["payload"]["title"].startswith("clover r157:"):
-        errors.append('[payload] title is not "clover r157: ...": the menu would not name this round')
+    # Round158. The menu has to name the round that aligned the repository contract.
+    if not board["payload"]["title"].startswith("clover r158:"):
+        errors.append('[payload] title is not "clover r158: ...": the menu would not name this round')
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",

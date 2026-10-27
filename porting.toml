@@ -1,0 +1,280 @@
+schema_version = 1
+
+[device]
+name = "clover"
+soc = "SDM660"
+os_profile = "ipados-17.7.11-21H461"
+summary = "Xiaomi Mi Pad 4 8\" LTE uses a board-owned eMMC path, an Apple device tree generated from two device trees, uefi-clover firmware and an ESP payload. This record describes implementation coverage and the evidence required for each milestone."
+
+[[area]]
+id = "configuration"
+status = "implemented"
+components = []
+paths = ["board.toml", "feeds.toml", "configs/**", ".gitattributes", ".github/**", "unixnu.lock", "AGENTS.md"]
+inputs = ["SDM660 board facts, iPadOS 17.7.11 build 21H461, clover defconfig, pinned XNU and firmware sources.", "Two device trees pinned as refer sources in feeds.toml and the unit's own facts/ dump."]
+configuration = ["board.name = clover; board.soc = SDM660; board.os_profile = ipados-17.7.11-21H461.", "The kernel arguments are the board contract: serial=3, debug=0x14e, boot-progress=2, clover-pmgr=2, clover-apfs=3, clover-emmc=21, cs_enforcement_disable=1, -no_slto_panic and ml-timeout-lock-panic-scale=40.", "This repository owns no submodules. ArmCpu, CloverSdhci, CloverBlock and CloverPMGR are in-tree drivers; shared XNU sources and the component catalog come from UniXNU."]
+procedure = ["Read https://unixnu.com/porting/device-repository and https://unixnu.com/porting/records.", "Run ./unixnu defconfig clover_defconfig --device ../UniXNU-clover from UniXNU.", "Run ./unixnu status --json --device ../UniXNU-clover and review the defconfig, archives and patch order.", "Run scripts/check-clover.py; the firmware step runs the same checker from the assembled tree."]
+findings = ["sheng selects SM8550 components through [components] include. clover instead names explicit archive builders in [kernel] archives and keeps an Apple-style prelink root list, because the clover drivers are board-local rather than catalog components.", "sheng's OWNER_* and BOOT_PROGRESS switches cannot be enabled from clover_defconfig: build-xnu-4k-baseline.sh gates them behind NATIVE_VIRTIO_BLOCK, whose archive would define the native_verified_block_* symbols a second time. patches/xnu-clover/zzy-clover-owner-root-trust.patch and zzy-clover-systemos-mount.patch set the two object-local macros instead.", "The porting record is the same schema sheng maintains; .github/workflows/porting-record.yml runs the shared validator on every push."]
+completion = ["board.toml parses, every pinned source resolves, two checkers pass, and the record names each area this board implements or plans."]
+limits = ["A local source override can differ from the published pin; record the effective source with the verification result.", "The record describes this repository. The uefi-clover repository owns its firmware implementation."]
+next_action = ["Compare the effective status output whenever a defconfig, source pin or patch changes, and update the affected area's findings."]
+
+[[area.evidence]]
+kind = "source"
+reference = "board.toml"
+result = "Board description, kernel arguments, payload contract and ADT inputs"
+
+[[area.evidence]]
+kind = "source"
+reference = ".github/workflows/porting-record.yml"
+result = "Shared Porting record validation on every push and pull request"
+
+[[area]]
+id = "firmware"
+status = "implemented"
+components = []
+paths = ["board.toml", "scripts/check-clover.py", "scripts/dump-clover-facts.sh"]
+inputs = ["uefi-clover firmware, stock firmware DTB, ABL handoff at 0x80000000, PSCI SMC interface and the unit's UEFI platform configuration.", "Framebuffer at 0x9D400000 with a 0x02400000 reservation, 1200x1920 panel."]
+configuration = ["firmware.config = clover; firmware.dsc = Platforms/Xiaomi/cloverPkg/clover.dsc.", "bootimg.image uses header version 0, 4096-byte pages and base-relative load offsets; the ABL adds the DRAM base.", "No [[bootimg.dtb_node]]: the stock tree already carries the splash node, and the firmware patches it in place."]
+procedure = ["Build uefi-clover separately and pass it as --uefi when the payload or boot image is assembled.", "Inspect the firmware memory map against facts/ before changing a reservation.", "Cold-flash the cache partition and read the panel; there is no serial console after the menu."]
+findings = ["The firmware publishes a GOP framebuffer, but this XNU kernel learns about it through /chosen and the entry probe, not through a platform display driver.", "The payload does not travel in a ramdisk: this firmware has no ramdisk filesystem driver, so UniXNU reads it from the cache partition.", "The firmware DTB is an input to the boot image; the separately generated ADT is the tree XNU consumes."]
+completion = ["Firmware builds and enters UniXNU, publishes the framebuffer, and boots the payload from the cache partition."]
+limits = ["Firmware sources and Binaries/clover blobs live outside this repository; the record cannot substitute for them."]
+next_action = ["Record the firmware revision and handoff memory map with the next image build."]
+
+[[area.evidence]]
+kind = "source"
+reference = "board.toml"
+result = "Firmware, boot-image and payload declarations"
+
+[[area.evidence]]
+kind = "source"
+reference = "notes/clover-device-tree-sources.md"
+result = "Device-verified constants and the two source trees they come from"
+
+[[area]]
+id = "cpu"
+status = "implemented"
+components = []
+paths = ["drivers/ArmCpu/**", "scripts/make-clover-adt.py", "scripts/build-arm-driver.py"]
+inputs = ["Eight Kryo 260 cores: cpu0 to cpu3 at MPIDR 0x0..0x3 (A53), cpu4 to cpu7 at 0x100..0x103 (A73).", "GIC distributor and CPU interface on SDM660; timer INTID 19; PSCI method SMC."]
+configuration = ["The ADT enables all eight CPUs with cpu_regs = 0x0,0x1,0x2,0x3,0x100,0x101,0x102,0x103.", "kernel_args selects armcpu-timer-intid=19. armcpu-spi-ipi and armcpu-self-ipi are deliberately absent: they exist for the multi-core case, the online-CPU count has not been measured, and the driver's SPI numbers are hardcoded for a GIC with more INTIDs.", "The tick-count watchdog that ships with ArmCpu is disarmed unless clover-unattended= is passed."]
+procedure = ["Regenerate the ADT with scripts/make-clover-adt.py and read the encoding back with the checker.", "Record per-CPU entry, timer interrupts and inter-processor interrupt delivery on a boot that reaches them."]
+findings = ["The kernel builds ARM64_BOARD_CONFIG_BCM2837 with MAX_CPU_CLUSTERS 1. A cluster-type property with two clusters fails machine_routines.c:1099, so the ADT omits cluster-type and the eight cores form one flat SMP cluster.", "armcpu-spi-ipi is sheng's GICv3 shape, not a generic switch; clover's GIC uses SGIs for IPIs.", "Round82 measured the timer INTID and the tick; later rounds use the tick as the panic screen's coordinate."]
+completion = ["Every enabled CPU reaches its entry point and timer handling runs on the boot CPU."]
+limits = ["A faithful two-cluster description needs a kernel with MAX_CPU_CLUSTERS >= 2; this kernel does not have one.", "The online-CPU count is an assumption until a frame reports it."]
+next_action = ["Measure secondary-CPU entry and IPI delivery after the root and dyld path are resolved."]
+
+[[area.evidence]]
+kind = "source"
+reference = "drivers/ArmCpu/ArmCpu.cpp"
+result = "Board CPU driver with the timer INTID and the optional unattended deadline"
+
+[[area.evidence]]
+kind = "source"
+reference = "scripts/make-clover-adt.py"
+result = "Eight-core ADT generation and checker-readable encoding"
+
+[[area]]
+id = "memory"
+status = "implemented"
+components = []
+paths = ["board.toml", "scripts/make-clover-adt.py", "scripts/build-clover-display-stub.py", "drivers/ArmCpu/**"]
+inputs = ["DRAM at 0x80000000 with size 0x80000000 (2 GiB).", "ABL framebuffer at 0x9D400000 with size 0x02400000; reserved carve-outs for PIL, venus and the firmware FD.", "Payload owned-memory request 0x40000000 (1 GiB), the largest obviously free low-bank request."]
+configuration = ["The payload declares owned_memory_size = 0x40000000 and dram_size = 0x80000000.", "The entry probe identity-maps the framebuffer into TTBR0 before the MMU is enabled, then seeds _vinfo for the panic screen."]
+procedure = ["Compare facts/ memory dumps, the firmware map, the ADT and the splash reservation before changing a range.", "Run the region checks in scripts/check-clover.py, which reject overlapping windows."]
+findings = ["The DarwinBoot window cannot start below 0x9D400000 and the framebuffer lies outside it, so the bootstrap map never reaches the framebuffer. The mapper in the probe builds the missing TTBR0 entries explicitly.", "The kernel switches TTBR0 to its own tables in arm_vm_init; after that point the probe can no longer paint, which is why later frames are timed resets.", "There is no SMMU driver; none of this board's enabled DMA engines is programmed by XNU."]
+completion = ["The ADT memory map, the firmware reservations and the owned range do not overlap, and the boot reaches the root mount with the framebuffer mapped."]
+limits = ["The record covers the handoff window and the splash region; DRAM sizing beyond those comes from the firmware map.", "No DMA engine is validated through an SMMU."]
+next_action = ["Attach the firmware memory map and each DMA consumer when a driver starts using one."]
+
+[[area.evidence]]
+kind = "source"
+reference = "scripts/make-clover-adt.py"
+result = "ADT memory nodes, 1 GiB owned range and the 8-core CPU list"
+
+[[area.evidence]]
+kind = "source"
+reference = "scripts/build-clover-display-stub.py"
+result = "Prelink stub that keeps Apple's display families linked without a driver"
+
+[[area]]
+id = "storage"
+status = "implemented"
+components = []
+paths = ["drivers/CloverSdhci/**", "drivers/CloverBlock/**", "scripts/make-clover-root.py", "scripts/make-clover-apfs-container.py", "scripts/make-clover-sparse.py", "scripts/make-clover-trust-bundle.py", "scripts/seed-data-skip-setup.py", "patches/xnu-clover/**"]
+inputs = ["SDHCI host at 0xc0c4000, eMMC card left by firmware in HS200, 8-bit, 200 MHz.", "GPT windows: OS and Cryptex1,SystemOS inside the userdata partition; cache is the payload partition.", "APFS container on the OS window; mockfs root image and a three-module trust cache."]
+configuration = ["drivers/CloverSdhci publishes the eMMC windows and drivers/CloverBlock exposes them to IOStorageFamily.", "clover-emmc=21 reads EXT_CSD and walks the GPT; clover-apfs=3 loads apfs.kext and publishes the OS volume; no rd= argument exists.", "patches/xnu-clover/zzy-clover-owner-root-trust.patch makes the root audit accept the owner-provided media."]
+procedure = ["Verify GPT windows and APFS container layout on the host before flashing.", "Cold-flash cache only, then read the panel; the root, SystemOS union mount and dyld cache path are separate checkpoints.", "Run scripts/check-clover.py and scripts/verify-clover-payload.py after changing the driver or the payload."]
+findings = ["Round137 mounted the APFS root; round143 union-mounts the SystemOS volume at exec; round150 accepts the unsealed root through the owner audit instead of an rd= alias.", "The SystemOS volume carries the dyld shared cache. Round153 read a directory open, the main cache and .01 with err=0 and both header words dyld_v1 arm64, but dyld_flags=0x0 and syscall 536 is not entered.", "Round156 removed the 160 us per-word FIFO wait: reads are level-gated, use CMD18 in 32-block batches and CloverBlock hands over 16 KiB at a time. Round157 makes CMD12 R1b-complete and rejects DATA_CRC, DATA_TIMEOUT, DATA_END_BIT and ADMA_ERROR instead of accepting a damaged block.", "The slow PIO path still measures about 25 KB/s, so a 16 KiB batch holds a buffer lock longer than XNU's 524 ms lock timeout. ml-timeout-lock-panic-scale=40 raises that deadline to about 21 s."]
+completion = ["The OS root mounts, the SystemOS volume is union-mounted, launchd executes, and dyld maps the shared cache without a MAC or signature refusal."]
+limits = ["No Data volume and no persistent write path; the SystemOS window is read-only.", "The remaining wall is dyld's .01 preflight: head rejection, signature registration or the shared-region mapping syscall.", "There is no UFS, virtio-block or native verified-root component; sheng's storage stack is SM8550-specific."]
+next_action = ["Read the r157 frame: whether .01 header fields, the signature blob or syscall 536 stops the preflight."]
+
+[[area.evidence]]
+kind = "source"
+reference = "drivers/CloverSdhci/CloverSdhci.cpp"
+result = "SDHCI command/data path, fast reads, and the eMMC window publication"
+
+[[area.evidence]]
+kind = "source"
+reference = "drivers/CloverBlock/CloverBlock.cpp"
+result = "IOBlockStorageDevice adapter, APFS depth probe and owner export"
+
+[[area.evidence]]
+kind = "source"
+reference = "patches/xnu-clover/zzy-clover-systemos-mount.patch"
+result = "SystemOS union mount at exec through the owner cache contract"
+
+[[area.evidence]]
+kind = "device"
+reference = "README.md"
+command = "fastboot flash cache ~/clover-out/round153-payload.img; fastboot reboot"
+revision = "12abb75d1eafd0e4b9f1c906bc4e4a9b0454dfd0"
+result = "Root and SystemOS mounted; dyld opened the cache directory, the main cache and .01 with err=0 and read dyld_v1 arm64 from both headers; dyld_flags=0x0 and no syscall 536. The r154 frame added no syscall-536 line, so the wall is before the mapping call."
+
+[[area]]
+id = "display"
+status = "planned"
+components = []
+paths = ["scripts/build-clover-display-stub.py", "scripts/xnu-panic-screen.c", "scripts/patch-xnu-entry-probe.py"]
+inputs = ["UEFI GOP framebuffer at 0x9D400000, 1200x1920, stride and pixel format published by uefi-clover.", "No MDP5 or DSI driver is selected."]
+configuration = ["The payload links a display stub so Apple's display families resolve without a native driver.", "The panic screen and entry probe paint directly through the framebuffer mapping."]
+procedure = ["Qualify GOP geometry before adding a display driver.", "Read a frame with the panic screen or the probe; there is no iOS display stack yet."]
+findings = ["sheng's display area uses GopFramebuffer, AppleARMBacklight and the SM8550 DPU. None of those describes this board's MDP5/DSI path.", "clover's framebuffer is used only for boot diagnostics, not for iOS presentation."]
+completion = ["A known frame appears with correct geometry and colors, then userland presentation works."]
+limits = ["No display driver, backlight control or frame timing is implemented."]
+next_action = ["Choose an MDP5/DSI bring-up path before claiming display support."]
+evidence = []
+
+[[area]]
+id = "input"
+status = "planned"
+components = []
+paths = ["board.toml"]
+inputs = ["edt-ft5406 touch controller and the board's volume/power buttons."]
+configuration = ["No HID or touch driver is selected."]
+procedure = ["Enumerate the touch controller from the device tree before selecting a transport.", "Record contact tracking and button events separately."]
+findings = ["sheng's input area uses ShengHidInput, ShengNovatekTouch and QcomGeniSpi for an SM8550 Novatek sensor. Those drivers do not match this board's controller."]
+completion = ["Touches map to the display, contacts keep stable IDs, releases arrive, and buttons produce HID reports."]
+limits = ["No input device is published to iOS."]
+next_action = ["Add an I2C/HID transport for the edt-ft5406 sensor."]
+evidence = []
+
+[[area]]
+id = "gpu"
+status = "planned"
+components = []
+paths = ["board.toml"]
+inputs = ["Adreno 512 GPU, its GMU and firmware, and the MDP5 display path."]
+configuration = ["No GPU component is selected."]
+procedure = ["Qualify power, firmware and memory mapping before command submission.", "Record the working Metal library set for the selected OS ABI."]
+findings = ["sheng's GPU area targets Adreno 740 with AdrenoMetal, AirNir and the SM8550 platform. The register layout, GMU firmware and submission format are different on Adreno 512."]
+completion = ["GPU submissions complete and a known image renders through the selected Metal client."]
+limits = ["No GPU driver, firmware or renderer is present."]
+next_action = ["Evaluate whether the Adreno 512 ISA can reuse any sheng component before starting a driver."]
+evidence = []
+
+[[area]]
+id = "network"
+status = "planned"
+components = []
+paths = ["board.toml"]
+inputs = ["The board's Wi-Fi/BT combo device and its firmware."]
+configuration = ["No network driver is selected."]
+procedure = ["Identify the transport and firmware before selecting a stack.", "Record association and packet delivery separately."]
+findings = ["sheng's network area is an ath12k PCIe device with MHI and QRTR. clover has neither the same device nor the same transport."]
+completion = ["Scan, association, address configuration and sustained traffic pass."]
+limits = ["No network interface is published."]
+next_action = ["Read the stock device tree for the Wi-Fi node and choose a transport."]
+evidence = []
+
+[[area]]
+id = "audio"
+status = "planned"
+components = []
+paths = ["board.toml"]
+inputs = ["SDM660 ADSP, LPASS and the board's codec/amplifier wiring."]
+configuration = ["No audio driver is selected."]
+procedure = ["Bring up the DSP transport before the codec.", "Record playback and capture separately."]
+findings = ["sheng's audio area depends on its SM8550 ADSP firmware, GLINK/QRTR services and CS35L43 amplifiers. None of those descriptions applies here."]
+completion = ["A declared route plays or captures the selected format and handles start/stop."]
+limits = ["No audio device is published."]
+next_action = ["Inventory the board's codec and DSP firmware from the stock device tree."]
+evidence = []
+
+[[area]]
+id = "power"
+status = "implemented"
+components = []
+paths = ["drivers/CloverPMGR/**", "scripts/build-clover-pmgr.py", "configs/clover_defconfig"]
+inputs = ["PM660/PM660L PMIC, SDM660 clock and power domains, PSCI SMC."]
+configuration = ["CONFIG_XNU_SHENG_PMGR=y reuses sheng's PMGR hook; clover-pmgr=2 selects the board integration.", "drivers/CloverPMGR publishes ApplePMGRNub so AMFI's PMGR lookup succeeds."]
+procedure = ["Document each clock, regulator and firmware-owned state before enabling a transition.", "Read the AMFI start lines and the PMGR observation cell from a frame."]
+findings = ["AMFI waits for a service matching ApplePMGRNub and panics when none exists. The board driver publishes that service without owning a real PMGR.", "No battery, charger, CPU-frequency or suspend policy is implemented."]
+completion = ["AMFI reaches its start path and the board's declared power controls respond."]
+limits = ["The PMGR service is a compatibility publication, not a full PMGR implementation.", "No battery or charging data is published."]
+next_action = ["Add a battery/charger source only after the boot path is resolved."]
+
+[[area.evidence]]
+kind = "source"
+reference = "drivers/CloverPMGR/CloverPMGR.cpp"
+result = "ApplePMGRNub publication and the PMGR observation cell"
+
+[[area.evidence]]
+kind = "source"
+reference = "scripts/build-clover-pmgr.py"
+result = "Platform-power archive built at the path the kernel link expects"
+
+[[area]]
+id = "packaging"
+status = "implemented"
+components = []
+paths = ["board.toml", "scripts/build-clover-block.py", "scripts/patch-xnu-entry-probe.py", "scripts/xnu-panic-screen.c", "scripts/verify-clover-payload.py", "patches/xnu-clover/**"]
+inputs = ["Prelinked kernel, generated ADT, three-module trust cache, mockfs root image, platform seed and uefi-clover firmware."]
+configuration = ["The payload volume is 56 MiB, FAT with 512-byte clusters; loader = firmware.", "patches/xnu-clover/*.patch are applied to the shared XNU tree before the kernel build; they are not applied by the payload step.", "panic_screen = true and entry_probe_reset_delay = 15 patch the payload copy of the kernel with the panic screen and the timed reset."]
+procedure = ["Build kernel and payload with the seed, root image and trust cache named explicitly.", "Run scripts/check-clover.py and scripts/verify-clover-payload.py; the second reads probe strings back from the payload image.", "Flash only the cache partition and keep a recovery image available."]
+findings = ["The payload builder rejects a trust cache that does not match the trust_cache_sha256 pin; the three-module bundle is the only accepted one.", "The build reads ~/UniXNU/patches/xnu/*.patch, not patches/xnu-clover directly, so a patch change must be copied into the shared tree before the kernel build.", "sheng's [payload.install] needs a Data seed and a persistent Data volume. clover has neither, so no install menu is declared."]
+completion = ["Kernel and payload succeed, the payload contains every declared input, and the boot image matches the firmware's load format."]
+limits = ["Image output depends on the firmware and the platform seed; neither is stored in this repository.", "The payload is not a ramdisk."]
+next_action = ["Attach artifact paths and exact revisions to the next image record."]
+
+[[area.evidence]]
+kind = "source"
+reference = "scripts/verify-clover-payload.py"
+result = "Payload byte checks and probe-string assertions"
+
+[[area.evidence]]
+kind = "source"
+reference = "scripts/patch-xnu-entry-probe.py"
+result = "Entry probe, panic screen and reset cave placement"
+
+[[area]]
+id = "diagnostics"
+status = "implemented"
+components = []
+paths = ["scripts/check-clover.py", "scripts/read-clover-log.py", "scripts/run-clover-unattended.sh", "scripts/decode-clover-address.py", "scripts/dump-clover-facts.sh", "board.toml"]
+inputs = ["Panel output after the boot menu, logfs slots in the eMMC, IMEM restart-reason cell at 0x146bf000+0x65c.", "Panic screen and entry probe as the only reporters."]
+configuration = ["boot-progress=2 and debug-enabled in /chosen enable the checkpoints.", "clover-unattended=<seconds> arms the ArmCpu deadline and the panic-screen reset into fastboot; the shipped boot leaves it out.", "read-clover-log.py reads logfs on the host; decode-clover-address.py maps a kernel address to a symbol."]
+procedure = ["Run the checker for the changed area and keep its command and output.", "Read the last completed checkpoint and the first failing operation from the panel; link the captured frame.", "If a probe is silent, state whether it was not reached or was reached and printed nothing."]
+findings = ["Three evidence levels are different facts: source shape, host check and device frame.", "r151's silence came from reading cn_pnbuf before vn_open_auth initialized it; r153 moved the read after the call. A silent probe is never proof that the code did not run.", "The r154 syscall-536 probe printed nothing even though .01 opened, which places the wall before the mapping syscall.", "The 524 ms lock timeout can fire during a slow 16 KiB read; ml-timeout-lock-panic-scale=40 is part of the shipped diagnostic frame."]
+completion = ["Every claimed milestone has a reproducible command, a matching source revision and an accessible result."]
+limits = ["Source references describe implemented behavior; host and device status need their own evidence.", "There is no serial console after the menu, so a frame is a photograph or a logfs read."]
+next_action = ["Add the r157 frame reading and the first distinguishing observation after the dyld preflight."]
+
+[[area.evidence]]
+kind = "source"
+reference = "scripts/check-clover.py"
+result = "Board, defconfig, payload and probe-shape checks"
+
+[[area.evidence]]
+kind = "source"
+reference = "scripts/read-clover-log.py"
+result = "Host reader for the logfs slots"
+
+[[area.evidence]]
+kind = "device"
+reference = "README.md"
+command = "fastboot flash cache ~/clover-out/round153-payload.img; fastboot reboot"
+revision = "12abb75d1eafd0e4b9f1c906bc4e4a9b0454dfd0"
+result = "The r153 frame printed the cache open/read rows and both dyld_v1 arm64 headers, then stopped after the .01 header; the r154 build printed no syscall-536 row."

@@ -6,6 +6,9 @@
 [board]
 name = "clover"
 soc = "SDM660"
+# Round158. scripts/porting-record.py requires this key to equal device.os_profile in
+# porting.toml; it is the OS profile the board is built against, not a new build input.
+os_profile = "ipados-17.7.11-21H461"
 description = "Xiaomi Mi Pad 4 8\" LTE (2018)"
 kit = "clover"
 
@@ -154,7 +157,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r157: a fast read that stops cleanly -- CMD12 busy, error bits, offsets"
+title = "clover r158: sheng's porting record, and 21 seconds for a slow lock"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -1901,6 +1904,15 @@ kernel_args = [
   # runs, and the answer is sheng's answer. If the owner audit refuses, the panel says
   # `rootvp not authenticated after mounting` -- the same line r137 read, now from the honest path.
   "-no_slto_panic",
+  # Round158. This one is not sheng-specific: osfmk/arm/locks_arm.c:106 declares the lock
+  # timeout as MACHINE_TIMEOUT(lock_panic_timeout, "lock-panic", 0xc00000, ...), and 0xc00000
+  # timebase ticks are 524 ms at this board's 24 MHz. machine.c:1331-1345 builds the override
+  # name as "ml-timeout-" + name + "-scale", so 40 turns the deadline into about 21 s. The
+  # reason is round156's own measurement: CloverBlock hands the controller 16 KiB (32 blocks)
+  # in one call, and at the 25 KB/s the old per-word wait produced that call holds its buffer
+  # lock for 655 ms. A slow read must not be reported as a dead lock. sheng passes the same
+  # value for the same reason; nothing else in the kernel changes.
+  "ml-timeout-lock-panic-scale=40",
   # Round139 answers round138's frame instead of guessing at it. The panel carried
   # `unexpected SIGKILL of launchd with reason -- namespace 9 code 0x8`, which is
   # os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_SECURITY_POLICY) (bsd/sys/reason.h:255)
