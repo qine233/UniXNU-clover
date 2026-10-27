@@ -28,11 +28,12 @@
 
 ## 当前进度：已解决 / 待解决
 
-最新一帧来自 round159（v0.5.12）的镜像：Data 卷发布并挂上，`init` 走到
-`load_init_program`，dyld 打开主缓存与 `.01` 后正在逐个缓存文件注册签名。屏还
-在滚，但底行的 `vp=` 与 `blob=` 一直在变——那是新的文件，不是同一行重印。此前
-round155–round158、round160 都没有独立的真机帧。所以下面把「真机读到过」
-「已实现、等下一帧」「还没解决」分开写。
+最新一帧还是 round159（v0.5.12）的镜像，但这次是同一个启动跑了一个多小时之后的
+屏幕：`launchd` 已经起来并在拉守护进程，每个子进程却死在 exec 的代码签名结构
+校验上（`unable to create a validated cs_blob object: 85` → `load code
+signature error 4` → AMFI 以「dyld signature cannot be verified」杀掉），pid
+一路涨——是循环，不是慢。此前 round155–round158、round160 都没有独立的真机帧。
+所以下面把「真机读到过」「已实现、等下一帧」「还没解决」分开写。
 
 ### 已经解决（有真机读数）
 
@@ -65,14 +66,19 @@ round155–round158、round160 都没有独立的真机帧。所以下面把「�
    这一帧关掉；剩下的未知是 dyld 是否走到 536、映射是否成功。屏上仍有两行
    `check_np … vm_shared_region_start_address() failed`，那是 exec 建的空区，
    不是文件问题。
-2. **launchd 没有真正起步**——这一帧只到
-   `load_init_program: attempting to load /sbin/launchd` 和两行 MAC
-   `label-check … -> 1`；没有 launchd 自己的输出，也没有用户态守护进程。
+2. **守护进程过不了 exec 的签名结构校验**——`launchd` 起来了，也会拉 `logd`、
+   `dasd`，但每个子进程的 `LC_CODE_SIGNATURE` blob 在 `ubc_cs_blob_add` 的
+   结构校验里就返回 `EBADEXEC`（85），拿不到 `CS_PLATFORM_BINARY`，随后被
+   AMFI 的 exec 钩子杀掉，`launchd` 再拉一遍。宿主上这四个文件的 cdhash 全在
+   2478 条 static 信任缓存里，blob 也合法——所以可疑的是内核读回来的字节或
+   load command 给的偏移/长度，不是信任决策。round163 的探针只问这个。
 3. **完整 `/data` 没有解决**——现在只是 32 MiB 的 APFS scratch 种子，追加在
    userdata 分区的两个 GPT 副本之间，不在 GPT 里；原 54.4 GB 的 userdata 内容
    没有迁移。这一帧的 Data 挂载只证明那块种子可用。
-4. **这一帧还没滚完**——fsig 流是每个缓存文件四行，文件之间 `vp=`/`blob=` 会
-   变；若底行长时间不动才是卡住。需要停下来的那一帧才能读 536 与映射结果。
+4. **这个循环不会自己停**——每一环都是「exec 主程序 → 启动 dyld → 把整组共享缓存
+   签名注册一遍（第一帧那串 `fsig`）→ 主程序的签名结构校验失败 → AMFI 杀掉」，
+   所以一小时只涨了几十个 pid，536 的读数一直被挡在这个循环后面。只能断电；
+   断电后回到 fastboot，不需要再刷任何分区。
 5. **显示与 GPU**——没有 MDP5/DSI 驱动，屏幕只服务于启动诊断；Adreno 512 没有
    驱动，没有 iOS 显示栈。
 6. **输入**——触摸（`edt-ft5406` / focaltech `fts`）没有驱动。
@@ -11682,6 +11688,53 @@ clover r155: fsig rd <- err=0 resid=0 ms=189
 的速率应是秒到几十秒级；控制台逐行打印会让它看起来比实际慢。
 
 这一帧没有重编任何东西，`~/clover-out/round159-*` 的十一项哈希不变。
+
+## v0.5.16（round159 的第二帧）：launchd 起来了，守护进程在 AMFI 上循环
+
+同一个 round159 镜像继续跑了一个多小时之后的屏幕（照片是竖着拍的，行按阅读顺序
+转正；部分数字被边缘切掉）：
+
+```
+unable to create a validated cs_blob object: 85
+proc 13675: load code signature error 4 for file "logd"
+AMFI: hook..execve() killing pid 13675: dyld signature cannot be verified. You either have a corrupt system image or are trying to run an unsigned application outside of a supported development configuration.
+…
+proc 13662: load code signature error 4 for file "dasd"
+AMFI: hook..execve() killing pid 13662: dyld signature cannot be verified. …
+```
+
+照片里那个数字的末两位是 `05`，斜着看不排除首位被挡住。这条 printf 只有一个
+来源（`ubc_subr.c:4687` 打印 `cs_blob_init_validated()` 的返回值），而它的两条
+校验路径（`cs_validate_csblob` / `cs_validate_codedirectory`）只可能返回
+`EBADEXEC`（85）。所以读数按 85 记。
+
+读法：
+
+- `launchd` 不再停在 `load_init_program`：它在跑，而且会拉子进程（`logd`、
+  `dasd`）。这是第一帧没有的东西。
+- 每个子进程的 exec 都在同一个地方断：主二进制的 `LC_CODE_SIGNATURE` blob 读进
+  来后结构校验失败（85），`ubc_cs_blob_add` 返回，`load_code_signature` 报
+  `LOAD_FAILURE`（4）；进程因此没有 `CS_PLATFORM_BINARY`，AMFI 的 exec 钩子在
+  后面按「dyld signature cannot be verified」杀掉它，`launchd` 再拉，pid 一路
+  上涨（13621 → 13662 → 13673 → 13675）。**这是循环，不是慢，不会自己结束。**
+- 这一轮在宿主上把四个 cdhash 对了一遍（都从 `044-76040-038.dmg` 的 OS 卷算）：
+  `logd 4882a798…`、`dasd db318f4f…`、`dyld b479f90e…`、`launchd 1d52c697…`。
+  四个全在 2478 条的 static 信任缓存里，也都在
+  `build/clover-trust/trustcache.bundle` 里。所以**不是信任决策的问题**：
+  `ubc_subr.c:4685` 的结构校验在 `mac_vnode_check_signature`（4756）之前，
+  信任缓存还没轮到。
+- 同一个宿主上这些 blob 都合法：logd 的签名在文件偏移 224912、长 21120，头是
+  `fade0cc0`、内部长度 3108、5 个索引；dasd、dyld、launchd 形状相同。内核读回来
+  却过不了同一段校验，说明**读到的字节，或者 load command 给的偏移/长度**不对，
+  不是签名本身不对。
+- 每环都很贵：exec 会先启动 dyld、把整组共享缓存签名注册一遍（就是第一帧那串
+  `fsig`），然后才轮到 AMFI 杀。所以一小时只涨了几十个 pid。
+
+下一轮（round163）只问一件事：在 `load_code_signature` 的 `vn_rdwr` 之后打印
+`v_name`、`macho_offset`、`dataoff`、`datasize`、`error/resid` 和缓冲区头 16 字节，
+看内核到底读到了什么。一个镜像，一个问题。
+
+这一帧同样没有重编任何东西，`~/clover-out/round159-*` 的十一项哈希不变。
 
 ## 许可证
 
