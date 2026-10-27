@@ -28,21 +28,29 @@
 
 ## 当前进度：已解决 / 待解决
 
-最新一帧是 round164（v0.5.18）的冷刷读数：AMFI 的 kill 行**消失**了，
-说明第二条拒绝分支的 NOP 生效；但 `launchd` 拉起的每个子进程仍然卡在
-`unable to create a validated cs_blob object: 85` → `load code signature
-error 4`，pid 继续涨。这一帧第一次给出会自我校验的读证据——APFS 自己报
-`apfs_jhash.c:146: disk0s1 Data hash mismatch for 16384 bytes at offset
-12128256 in compressed data stream 102 of inode 162: expected jhash
-2e6c78f0…, got 0d13…`，随后 `Verification failed with error 94`、
-`apfs_pagein_with_verification: Corrupt read data …`，`mediaserverd` 崩，
-`Too many corpses being created`。也就是说块层交上来的 16 KiB 和盘上的
-不一样；85 很可能同源（签名 blob 读回的内容结构不对）。
+最新一帧仍是同一类读数（r164 或 r165 的冷刷，屏上没有 `CloverSdhci r165:
+readcheck` 那一行——它只在第一次满批读时打印，早已滚出画面）：`launchd`
+拉起的每个子进程都停在 `unable to create a validated cs_blob object: 85`
+→ `load code signature error 4`（`collectd`、`trustd`、`replayd`、
+`backboardd`……），APFS 同一形态的 jhash 错这次落在
+`disk3s1` inode 182/182、压缩流 103、偏移 11747328 的 16384 字节上，
+随后 `Corrupt read data … file size 0 error 91 (clone)`，
+`Too many corpses being created`。
 
-v0.5.19（round165）因此只修读路径，不再碰 AMFI：每次读命令前排空 SDHCI
-FIFO，任何一次传输失败都 `SDHCI_RESET_DATA`；第一次满批读做 A/B 对照
-（两次 CMD18 与 32 次 CMD17 读同一 16 KiB），不一致就整轮禁用批量读。
-它同时是修复和读数：屏上会有一行 `CloverSdhci r165: readcheck …`。
+这一帧之后，宿主侧把 OS 窗口整段切开挂载复查：`launchd`（536128+25728）、
+`dyld`（911680+25376）、`trustd`（708384+25936）的 `LC_CODE_SIGNATURE`
+偏移上都是 `fa de 0c c0` 的合法 SuperBlob，而且约 6 GB 文件逐个读通
+（含 decmpfs 压缩文件），没有一次 jhash/EIO/解压失败。**源镜像和
+fastboot 写进去的字节都不是问题，错在设备侧的读。**
+
+v0.5.19（round165）修读路径：每次读命令前排空 SDHCI FIFO，任何一次
+传输失败都 `SDHCI_RESET_DATA`；第一次满批读做 A/B 对照。
+
+v0.5.20（round166）把这条路走到底：**整轮不再用 CMD18 批量读**，每块都
+走 r156 之前的单块序列（A/B 行仍打印，作为那一个采样点的证据）；同时补上
+`readDataBlock` 里唯一漏掉复位的分支（命令响应被拒），并在内核
+`load_code_signature` 里打印前八个签名 blob 的 `dataoff/datasize` 与前四个
+字——下一帧就能把「读回来的字节不对」和「校验器自己的门」一眼分开。
 
 ### 已经解决（有真机读数）
 
@@ -69,7 +77,8 @@ FIFO，任何一次传输失败都 `SDHCI_RESET_DATA`；第一次满批读做 A/
 | round158（v0.5.11） | 照 sheng 对齐 `porting.toml`/`AGENTS.md`/工作流，锁超时放宽到约 21 s | 契约层，无需上机 |
 | round160（v0.5.13） | 宿主闸门 `verify-userdata-window.py`；镜像与内核一字未动 | 无需上机 |
 | round163/164（v0.5.17/18） | AMFI 两条拒绝分支 + 16 KiB 签名的 dyld 缓存跳过整文件哈希 | r164 帧：AMFI kill 消失；85 与 APFS jhash 错仍在，根因指到读路径 |
-| round165（v0.5.19） | 读前清 FIFO、失败复位数据通路、首次满批 A/B 对照并可按结果禁用批量读 | 等冷刷；读数行 `CloverSdhci r165: readcheck` |
+| round165（v0.5.19） | 读前清 FIFO、失败复位数据通路、首次满批 A/B 对照并可按结果禁用批量读 | 已并入 round166 |
+| round166（v0.5.20） | 整轮单块读、补上命令响应失败的复位、exec 侧打印前八个签名 blob 的头四字 | 等冷刷；读数行 `CloverSdhci r166: readcheck` 与 `clover r166: sig …` |
 
 ### 还没解决
 
@@ -85,7 +94,11 @@ FIFO，任何一次传输失败都 `SDHCI_RESET_DATA`；第一次满批读做 A/
    `Verification failed with error 94`、`Corrupt read data`。块层交出的字节与
    盘上不一致，这条自我校验把「读路径错」从推测变成了读数。宿主上相关文件的
    cdhash 全在 2478 条信任缓存里、blob 也合法，所以 85 最可能就是同一种截断
-   或错位读的结果。v0.5.19 修的就是这条读路径。
+   或错位读的结果。v0.5.19 修的就是这条读路径。**round166 之前的宿主复查又
+   把源镜像排除掉**：整个 OS 窗口挂载后逐文件读通，三颗关键二进制的
+   `fa de 0c c0` 都在，fastboot 的 sparse CRC 也逐段核过——错只可能发生在
+   设备读这一层，所以 v0.5.20 直接退掉 CMD18，并在 exec 侧把坏 blob 的头
+   四字印出来。
 3. **完整 `/data` 没有解决**——现在只是 32 MiB 的 APFS scratch 种子，追加在
    userdata 分区的两个 GPT 副本之间，不在 GPT 里；原 54.4 GB 的 userdata 内容
    没有迁移。这一帧的 Data 挂载只证明那块种子可用。
@@ -11969,6 +11982,84 @@ fastboot reboot
 出现 `batch reads disabled for this boot` 则说明批量读确实在交坏字节，
 本轮后面的读已经全部退回单块，APFS 的 jhash 错应当随之改变。无论哪种，
 `unable to create a validated cs_blob object: 85` 是否消失就是这一刷的答案。
+
+## v0.5.20（round166）：整轮单块读，exec 侧直接打印签名 blob 的头四字
+
+第二帧把读路径的嫌疑收窄到了一个尺寸：APFS 的 jhash 错这次落在
+`disk3s1` inode 182/182、压缩流 103、偏移 `11747328`，同样是 16 KiB，
+`11747328 = 717 × 16384`，正好是一条 32 块 CMD18 的边界。两次错都
+出现在 16 KiB 整数倍上，而不是任意偏移，说明坏字节更可能来自批量读，
+而不是签名层。宿主复查已经把镜像这一侧排除：OS 窗口能挂载，六个卷
+读出约 6 GB，`launchd`（536128+25728）、dyld（911680+25376）、trustd
+（708384+25936）的 `LC_CODE_SIGNATURE` 都以 `fa de 0c c0` 开头且长度
+自洽；所以这一轮只做两件事：
+
+1. **整轮不再用 CMD18**：`gReadBatchTrusted` 初值改为 `false`，boot
+   全程走 r156 之前的单块 CMD17 序列。r165 的 A/B 对照保留，但只作为
+   一次性读数：`CloverSdhci r166: readcheck lba=… batch=…/… single=…`，
+   随后打印 `CloverSdhci r166: single-block reads for this boot`，不再
+   因为对照一致就把批量读打开。
+2. **补上最后一个漏掉的复位**：`readDataBlock` 的命令响应被拒
+   （TIMEOUT/CRC/END_BIT/INDEX 或没有 RESPONSE）时也调用
+   `resetReadPath()`；之前这条拒绝路径直接返回，下一条命令可能落在
+   半截数据通路上。
+3. **exec 侧读数**：新补丁 `zzy-clover-exec-sig-bytes.patch` 在
+   `load_code_signature` 的 `vn_rdwr` 成功之后、`ubc_cs_blob_add` 之前，
+   打印前八个签名 blob 的 `macho_offset`、`dataoff`、`datasize` 和头四
+   个 32 位字：`clover r166: sig n=%u mo=%lld off=%u size=%u
+   w=%08x/%08x/%08x/%08x`。若头字是 `fade0cc0` 且长度自洽而 85 仍在，
+   墙就在 `cs_validate_csblob` 的判定上，下一轮改 `ubc_subr.c`；若头字
+   不是 `fade0cc0` 或长度对不上，读路径仍然是根因。
+
+构建链（先内核、再 payload）：
+
+```sh
+cd ~/UniXNU && PATH=/tmp/clover-bin:$PATH \
+  /opt/homebrew/bin/python3.13 ./unixnu build kernel --device ../UniXNU-clover -j 8
+PATH=/tmp/clover-bin:$PATH /opt/homebrew/bin/python3.13 \
+  ~/UniXNU-clover/scripts/patch-clover-amfi.py \
+  ~/UniXNU/out/clover/kernel/kernel.macho \
+  ~/clover-out/round166-kernel-amfi.macho
+PATH=/tmp/clover-bin:$PATH \
+  /opt/homebrew/bin/python3.13 ./unixnu build payload --unique-chip-id 0x81ffcaaa \
+  --uefi ../mu-clover --kernel /Users/zhouzhou/clover-out/round166-kernel-amfi.macho \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+```
+
+构建坑与 round165 相同：归档步骤要求整棵 `xnu-work` 已打全补丁，而内核
+步骤要求 `native-4k-signature-hash-cache.patch` 可反向校验，所以先把
+`zzy-clover-dyld-cache-skip.patch` 反向撤掉再跑内核；payload 的
+`--trust-cache` 必须用 `build/clover-trust/trustcache.bundle`
+（`7c369ce0…`），`build/clover-root/trustcache.bundle` 是 56 字节单模块，
+会被 board.toml 的哈希闸门拒绝。`--kernel` 同理指向打过 AMFI 的拷贝，
+否则新 prelink 会把 r163/r164 的两处分支恢复成 stock。
+
+产物与读数：prelink 内核 `e8b6570c…`；打过 AMFI 的拷贝 `986d6ab2…`
+（`0x1a830e4`：`29 02 00 34` → `11 00 00 14`；`0x1a8316c`：
+`20 05 00 36` → `1f 20 03 d5`）；payload `9092782b…`（56 MiB），卷内
+kernel `b897038d…`、`unixnu.toml` `dac1ddfc…`、ADT `7645659b…`、
+`scratch-data.img` `614b8356…`、trustcache `7c369ce0…`。入口探针
+`6844 bytes in 37 runs`；`verify-clover-payload.py` 21 项全 OK，包括
+`kernel.macho: AMFI exec hook allows`、`eMMC read integrity` 和新的
+`exec signature dump`。归档在 `~/clover-out/round166-*`，清单
+`round166-SHA256SUMS`。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round166-payload.img
+fastboot reboot
+```
+
+`userdata` 不动，round159 的 Data 窗口仍在；这是冷刷，不用 `fastboot boot`。
+
+这一刷回答一个问题：`clover r166: sig` 的头四字是不是 `fade0cc0`、
+`size` 是否等于 blob 自己的长度字段。APFS 的 16 KiB jhash 错应当随
+CMD18 一起消失；如果它还在，而且 `sig` 行也不对，那读路径里还有第二个
+坏源（PIO 单块本身或块层拷贝），下一轮就量单块读自己的 A/B。若 jhash
+消失、`sig` 行正确，85 仍在，则签名结构校验的输入没问题，下一刀落在
+`ubc_subr.c` 的判定，而不是存储。
 
 ## 许可证
 

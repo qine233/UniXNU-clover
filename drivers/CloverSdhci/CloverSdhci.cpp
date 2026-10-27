@@ -1000,6 +1000,9 @@ static bool readDataBlock (uint16_t command, uint32_t argument, uint32_t *words,
   }
   if (!(status & SDHCI_INT_RESPONSE) ||
       (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+    // Round166: a refused command can leave the data path mid-transfer; the next block must not
+    // start on top of it. This was the only refusal that skipped the reset.
+    resetReadPath ();
     return false;
   }
   uint64_t frequency = counterFrequency ();
@@ -1289,7 +1292,9 @@ static uint32_t gCheckBatchA[kReadChunkBlocks * kBlockWords];
 static uint32_t gCheckBatchB[kReadChunkBlocks * kBlockWords];
 static uint32_t gCheckSingle[kReadChunkBlocks * kBlockWords];
 static bool gReadCheckDone = false;
-static bool gReadBatchTrusted = true;
+// Round166: starts untrusted. Every read this boot takes the single-block sequence that every round
+// before r156 used, and checkReadPath only reports what the batch would have returned at one sample.
+static bool gReadBatchTrusted = false;
 
 static uint32_t countWordDiff (const uint32_t *a, const uint32_t *b, uint32_t words,
                                uint32_t &first)
@@ -1330,16 +1335,18 @@ static void checkReadPath (uint32_t lba)
   const uint32_t diffB = (batchA && batchB)
                          ? countWordDiff (gCheckBatchA, gCheckBatchB, words, firstB)
                          : words;
-  gReadBatchTrusted = batchA && batchB && single && diff == 0 && diffB == 0;
-  IOLog ("CloverSdhci r165: readcheck lba=%u batch=%d/%d single=%d diff=%u/%u first=%u/%u "
+  // Round166: r165 let one matching sample promote the batch for the whole boot. The boot after it
+  // still handed APFS and the code-signature loader wrong bytes, and the failed 16 KiB APFS chunks
+  // are exactly one CMD18 batch, so the batch is retired rather than trusted: the row below is
+  // evidence about this LBA only, never permission to use the batch.
+  gReadBatchTrusted = false;
+  IOLog ("CloverSdhci r166: readcheck lba=%u batch=%d/%d single=%d diff=%u/%u first=%u/%u "
          "m=%08x s=%08x\n",
          lba, batchA ? gotA : 0, batchB ? gotB : 0, single ? blocks : 0,
          diff, diffB, first, firstB,
          gCheckBatchA[first < words ? first : 0],
          gCheckSingle[first < words ? first : 0]);
-  if (!gReadBatchTrusted) {
-    IOLog ("CloverSdhci r165: batch reads disabled for this boot\n");
-  }
+  IOLog ("CloverSdhci r166: single-block reads for this boot\n");
 }
 
 extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint32_t blocks)

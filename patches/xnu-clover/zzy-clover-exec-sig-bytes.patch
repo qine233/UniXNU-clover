@@ -1,0 +1,30 @@
+diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
+index 665536f..f7e87c7 100644
+--- a/bsd/kern/mach_loader.c
++++ b/bsd/kern/mach_loader.c
+@@ -3536,6 +3536,25 @@ load_code_signature(
+ 		goto out;
+ 	}
+ 
++	/*
++	 * clover r166: the host's copy of every one of these blobs is a valid SuperBlob, so the
++	 * words below tell the two remaining failures apart: a buffer that does not start with
++	 * 0xfade0cc0 and its own length means the read handed the kernel the wrong bytes; a valid
++	 * header that still fails validation is the validator's own gate. Bounded, because a boot
++	 * that spawns corpses can call this hundreds of times.
++	 */
++	{
++		static uint32_t clover_sig_dumps = 0;
++		if (clover_sig_dumps < 8) {
++			const uint32_t *sig = (const uint32_t *)(uintptr_t)addr;
++			clover_sig_dumps++;
++			printf("clover r166: sig n=%u mo=%lld off=%u size=%u w=%08x/%08x/%08x/%08x\n",
++			    clover_sig_dumps, (long long)macho_offset,
++			    (uint32_t)lcp->dataoff, (uint32_t)lcp->datasize,
++			    sig[0], sig[1], sig[2], sig[3]);
++		}
++	}
++
+ 	if (ubc_cs_blob_add(vp,
+ 	    result->ip_platform,
+ 	    cputype,

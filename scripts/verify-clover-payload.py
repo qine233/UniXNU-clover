@@ -322,20 +322,27 @@ def check_dyld_cache_skip(kernel: bytes) -> bool:
 
 
 # Round165's driver change leaves two strings in the kernel: the one-shot A/B result and the line
-# that says the batch is not trusted. Their presence is the only image-level evidence that the
-# clean-FIFO policy and the self-check survived the link; a payload built from an older CloverSdhci
-# would carry neither, and the r164 frame's APFS jhash mismatch would have no counterpart.
+# that says the batch is not trusted. Round166 keeps the A/B row as evidence but retires the batch
+# for the whole boot, so the second string changes with it. Their presence is the only image-level
+# evidence that the clean-FIFO policy and the single-block decision survived the link; a payload
+# built from an older CloverSdhci would carry the r165 pair instead.
 READ_INTEGRITY = (
-    "CloverSdhci r165: readcheck lba=",
-    "CloverSdhci r165: batch reads disabled for this boot",
+    "CloverSdhci r166: readcheck lba=",
+    "CloverSdhci r166: single-block reads for this boot",
 )
+
+# Round166's kernel half prints the first words of every code-signature blob the exec path loads,
+# which is how the next frame tells a wrong read from a validation gate. The string is the only
+# evidence that the patch reached the prelink.
+EXEC_SIG_DUMP = "clover r166: sig n=%u mo=%lld off=%u size=%u w=%08x/%08x/%08x/%08x"
 
 
 def check_read_integrity(kernel: bytes) -> bool:
-    """Every block read now drains the FIFO first and resets the data path on failure, and the
-    first full-batch read compares two CMD18 batches with 32 CMD17 blocks. Both facts compile to
-    the strings above; requiring both keeps a payload from shipping the old read path while the
-    menu still claims this round."""
+    """Every block read now drains the FIFO first and resets the data path on failure, and every
+    read this boot takes the single-block sequence while the first full-batch request still
+    compares two CMD18 batches with 32 CMD17 blocks. Both facts compile to the strings above;
+    requiring both keeps a payload from shipping the old read path while the menu still claims
+    this round."""
     label = "kernel.macho: eMMC read integrity"
     found = {name: name.encode() in kernel for name in READ_INTEGRITY}
     ok = all(found.values())
@@ -343,6 +350,16 @@ def check_read_integrity(kernel: bytes) -> bool:
                        for name, yes in found.items())
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
     return ok
+
+
+def check_exec_sig_dump(kernel: bytes) -> bool:
+    """Round166 prints the header words of the first eight code-signature blobs the loader reads.
+    A payload without the string cannot answer whether the exec path was handed the right bytes."""
+    label = "kernel.macho: exec signature dump"
+    present = EXEC_SIG_DUMP.encode() in kernel
+    print(f"{label:42} {'OK' if present else 'FAIL'} "
+          f"({'present' if present else 'ABSENT'})")
+    return present
 
 
 def check_root_mount_probe(kernel: bytes) -> bool:
@@ -656,6 +673,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_amfi_allow(kernel)
         ok &= check_dyld_cache_skip(kernel)
         ok &= check_read_integrity(kernel)
+        ok &= check_exec_sig_dump(kernel)
         ok &= check_unattended(kernel)
         ok &= check_inline_asm_tails(kernel)
     return 0 if ok else 1
