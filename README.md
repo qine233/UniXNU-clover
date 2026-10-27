@@ -11593,8 +11593,9 @@ scripts/verify-userdata-window.py \
 `~/clover-out/round159-*` 的十一项哈希与 v0.5.12 相同。`scripts/check-clover.py`
 新增一条 Round160 检查：闸门脚本必须在，且必须钉住 32 MiB、种子 sha256、卷
 UUID，必须拒绝非 RAW 段，必须要求 `Data/OS/SystemOS` 三窗，必须要求 Data 是
-最后一扇窗，必须复核 CRC 与 UUID。`porting.toml` 的 storage 区把脚本列进
-`paths` 与 `procedure`，并在 `findings` 里记下本轮的宿主读数。
+最后一扇窗（`offset + size` 必须正好落在镜像末尾，备份 GPT 的区域不许被覆
+盖）。`porting.toml` 的 storage 区把脚本列进 `paths` 与 `procedure`，并在
+`findings` 里记下本轮的宿主读数。
 
 ### 下一帧仍然只问一件事
 
@@ -11608,6 +11609,19 @@ fastboot flash cache /Users/zhouzhou/clover-out/round159-payload.img
 fastboot flash userdata /Users/zhouzhou/clover-out/round159-userdata-root.sparse.img
 fastboot reboot
 ```
+
+## v0.5.14（round160 修订）：命中的每个 area 都要记录
+
+上游 `scripts/porting-record.py check --base` 有一条容易漏的规则：一个改动的
+文件如果同时匹配多个 area 的 `paths`，**每个** 命中的 area 的 `findings` 或
+`evidence` 都必须相对 base 有变化。`scripts/check-clover.py` 同时属于
+`firmware` 与 `diagnostics`——v0.5.13 只在 `diagnostics` 里写了 Round160 的
+句子，于是 main 上的 `Device documentation` 报
+`porting record: scripts/check-clover.py: update firmware findings or evidence
+with this change`。这一版只补 `firmware` 的 `findings`：闸门脚本丢了钉住的
+种子或三窗规则，应当让固件构建失败，而不是等到破坏性的刷写之后才发现。
+
+镜像与哈希仍未变，round155–round160 也都还没有上机；最后一帧还是 r153。
 
 ## 许可证
 
