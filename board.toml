@@ -167,7 +167,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r170: every exec and every exit speaks, and the cache probe stops shouting"
+title = "clover r171: the batch counts delivered words, and the card's cache is committed"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

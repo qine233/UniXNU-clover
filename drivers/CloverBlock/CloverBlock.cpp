@@ -171,6 +171,13 @@ void clover_emmc_block_window (uint32_t *first, uint32_t *sectors);
 void clover_emmc_block_userdata_window (uint32_t *first, uint32_t *sectors);
 uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint32_t blocks);
 uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words, uint32_t blocks);
+// Round171: the card's write cache is on, so a filesystem flush has to be a real commit. The host
+// driver owns EXT_CSD and the command engine, so it owns the flush too: writing zero to CACHE_CTRL
+// is what makes the card put its cached blocks on media, and writing one back is what lets the next
+// batch be cached. One is success, zero a refusal; the cache statistics say whether the switch ever
+// took on this card.
+uint32_t clover_emmc_flush_cache (void);
+void clover_emmc_cache_stats (uint32_t *size, uint32_t *on, uint32_t *flushes);
 // The kernel's own block-device vnode constructor (bsd/vfs/vfs_subr.c). dev_t is the composite
 // major<<24|minor this file passes; the vnode is never touched, and it stays for boot lifetime
 // exactly as it would when it becomes the root vnode.
@@ -224,14 +231,26 @@ static volatile uint32_t gWindowSectors = 0;
 // reports is traffic the storage stack above it asked for, not the probe's.
 static volatile uint32_t gBlocksRead = 0;
 static volatile uint32_t gBlocksWritten = 0;
-// Round156's staging buffer: one doAsyncReadWrite call moves up to 32 blocks (16 KiB)
-// through it, so the card sees one CMD18 instead of 32 CMD17s. It is static because
-// this kernel's stack cannot hold it, and gBatchBusy is what keeps two requests from
-// sharing it -- a caller that cannot take the flag falls back to the per-block path.
-static const uint32_t kBatchBlocks = 32;
+// Round156's staging buffer: one doAsyncReadWrite call moves a run of blocks through it, so the
+// card sees one CMD18 instead of one per 512 bytes. It is static because this kernel's stack
+// cannot hold it.
+// Round171: the run is 128 blocks (64 KiB), matching CloverSdhci's kReadChunkBlocks so a caller's
+// request reaches the card as one command instead of four, and the busy flag is replaced by an
+// IOLock. The r156 CAS only ever tried 1024 spins and then dropped the loser to the per-block path,
+// which on a boot where APFS reads through several threads is how a 64 KiB request became 128 CMD17s
+// at 1-2 MB/s. drivers/NativeUfs/NativeUfs.cpp is the reference here: `windowLock` with
+// IOLockLock/IOLockUnlock around the window copy, allocated up front, and the completion callback
+// run outside the guard -- every caller waits for the buffer instead of abandoning it, so every
+// caller gets the batch path.
+static const uint32_t kBatchBlocks = 128;
 static const uint32_t kBatchWords = kBatchBlocks * kBlockWords;
 static uint32_t gBatchWords[kBatchWords];
-static volatile uint32_t gBatchBusy = 0;
+static IOLock *gBatchLock = nullptr;
+// Writes this device has handed the card since the last committed flush. Round171 switches the
+// card's write cache on, so a sync only has to spend a CMD6/CMD13 round trip when there is actually
+// something to commit; without this counter every filesystem sync (and every requestIdle before a
+// power transition) paid for a cache that might already be empty.
+static volatile uint64_t gWritesSinceFlush = 0;
 // Round128's manifest: the first 4 KiB of userdata, as `./unixnu build userdata` writes it and as
 // drivers/NativeUfs/RootLayout.h reads it. 4096 bytes is eight of this device's 512-byte blocks,
 // and it is read through the PIO path in one request rather than eight. Entry i starts at byte 24 +
@@ -402,6 +421,10 @@ public:
 
   virtual IOReturn doEjectMedia(void) APPLE_KEXT_OVERRIDE;
   virtual IOReturn doFormatMedia(UInt64 byteCapacity) APPLE_KEXT_OVERRIDE;
+  // Round171: one place decides whether the card's write cache has anything to commit. A flush is
+  // two CMD6 switches and two CMD13 waits, so a filesystem that syncs a clean volume gets the answer
+  // for free, and the first flush after a write is the one that costs the card its programming time.
+  IOReturn commitCache(void);
   virtual UInt32 doGetFormatCapacities(UInt64 *capacities,
                                        UInt32 capacitiesMaxCount) const APPLE_KEXT_OVERRIDE;
 #pragma clang diagnostic push
@@ -481,6 +504,13 @@ bool CloverBlockDevice::init(OSDictionary *properties)
   if (!IOService::init(properties)) {
     return false;
   }
+  // Round171: the batch staging buffer's lock, allocated here rather than on first request the way
+  // drivers/NativeUfs allocates `windowLock` before the device serves anything. init runs once,
+  // before the device is published, so there is no race on the pointer; if it fails the batch path
+  // is simply never taken (see doAsyncReadWrite) and every request goes one block at a time.
+  if (!gBatchLock) {
+    gBatchLock = IOLockAlloc();
+  }
   return setProperty(kIOBlockStorageDeviceTypeKey, kIOBlockStorageDeviceTypeGeneric);
 }
 
@@ -515,9 +545,64 @@ UInt32 CloverBlockDevice::doGetFormatCapacities(UInt64 *capacities,
   return 0;   // no format capacity is offered
 }
 
+IOReturn CloverBlockDevice::commitCache(void)
+{
+  // One counter for the whole driver, and one cache for the whole card: the logfs window and the two
+  // boot windows are partitions of the same device, so whichever instance commits first empties the
+  // queue for all of them. gWritesSinceFlush counts blocks rather than requests because a partial
+  // batch that failed mid-chunk still left `written` blocks on the card.
+  if (!__atomic_load_n(&gWritesSinceFlush, __ATOMIC_RELAXED)) {
+    return kIOReturnSuccess;   // nothing has been written since the last commit
+  }
+  if (!clover_emmc_flush_cache()) {
+    return kIOReturnError;
+  }
+  // The first commit of the boot is the line that says the write-back path is real: it names how
+  // many blocks the card had been holding, and the driver-side counter says how many times the
+  // cache has been switched off and back on. A frame with writes and no line here is a frame where
+  // nothing ever synced, which is a different problem from a flush that failed.
+  static bool committed = false;
+  if (!committed) {
+    committed = true;
+    uint32_t size = 0;
+    uint32_t on = 0;
+    uint32_t flushes = 0;
+    clover_emmc_cache_stats(&size, &on, &flushes);
+    IOLog("CloverBlock r171: first commit blocks=%llu cache=%u on=%u flushes=%u\n",
+          static_cast<unsigned long long>(__atomic_load_n(&gWritesSinceFlush, __ATOMIC_RELAXED)),
+          size, on, flushes);
+  }
+  __atomic_store_n(&gWritesSinceFlush, 0, __ATOMIC_RELAXED);
+  return kIOReturnSuccess;
+}
+
 IOReturn CloverBlockDevice::doSynchronizeCache(void)
 {
-  return kIOReturnSuccess;   // nothing is cached: every read goes straight to the card
+  // Round171: the card's write cache is switched on by the host driver, so this is no longer a
+  // no-op. A flush that was refused is reported as such -- the filesystem's own sync error is the
+  // reading that says the commit did not happen, and pretending otherwise is how a torn checkpoint
+  // reaches a frame two boots later.
+  return commitCache();
+}
+
+// Round171: the one writer that has no filesystem above it to issue a sync. logfs records go straight
+// to the card through IOMedia, and the boot that wrote the last one is the boot that is ending -- in
+// a panic and a hard reset, with no unmount and therefore no synchronize call-out. A cache holding
+// that record loses the frame this port reads its results from, so a write whose blocks fall inside
+// the logfs window is committed here instead of waiting for a sync that is never coming. Writes
+// anywhere else -- the Data volume's APFS -- keep the cache and let the filesystem sync it, which is
+// the whole point of r171: r167's write-through made every block wait for its own programming, and
+// that is what grew the checkpoint flush from 22.7 s to 102 s.
+static bool overlapsLogfsWindow(uint64_t first, uint64_t count)
+{
+  uint32_t windowFirst = 0;
+  uint32_t windowSectors = 0;
+  clover_emmc_block_window(&windowFirst, &windowSectors);
+  if (!windowSectors || !count) {
+    return false;
+  }
+  return first < static_cast<uint64_t>(windowFirst) + windowSectors &&
+         first + count > windowFirst;
 }
 
 char *CloverBlockDevice::getVendorString(void)
@@ -658,13 +743,32 @@ IOReturn CloverBlockDevice::getWriteCacheState(bool *enabled)
   if (!enabled) {
     return kIOReturnBadArgument;
   }
-  *enabled = false;
+  // Round171: the answer is the card's, not a constant. r167 switched EXT_CSD CACHE_CTRL off and
+  // paid for it with a 102 s tx_flush -- every write had to program to the media before the command
+  // completed -- so the host driver now leaves the cache on and commits it on the filesystem's own
+  // sync. Reporting that truth is what lets IOBlockStorageDriver keep its write-back behaviour
+  // instead of adding a synchronous flush to every request.
+  uint32_t size = 0;
+  uint32_t on = 0;
+  uint32_t flushes = 0;
+  clover_emmc_cache_stats(&size, &on, &flushes);
+  *enabled = on != 0;
   return kIOReturnSuccess;
 }
 
 IOReturn CloverBlockDevice::setWriteCacheState(bool enabled)
 {
-  return enabled ? kIOReturnUnsupported : kIOReturnSuccess;
+  // Same rule: the request is granted only if that is what the card is actually doing. Asking for
+  // the cache off is refused rather than quietly ignored, because a caller that believes it turned
+  // the cache off stops issuing syncs, and that is how uncommitted data survives a hard reset.
+  uint32_t size = 0;
+  uint32_t on = 0;
+  uint32_t flushes = 0;
+  clover_emmc_cache_stats(&size, &on, &flushes);
+  if (enabled == (on != 0)) {
+    return kIOReturnSuccess;
+  }
+  return kIOReturnUnsupported;
 }
 
 IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
@@ -693,20 +797,13 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
     // Round156: hand the card a run of blocks per call instead of one. The single-block
     // FIFO path costs a command, a response wait and a deadline check per 512 bytes;
     // dyld's shared cache is 3.7 GiB, so that overhead is most of what the read spends
-    // its time on. The staging buffer is static because a 16 KiB array does not belong
-    // on this kernel's stack, and the busy flag keeps two callers from sharing it.
-    // A caller that loses the flag keeps the old per-block path, so this can only make
-    // the device faster, never less able to complete a request.
-    bool batched = false;
-    for (uint32_t spins = 0; spins < 1024; spins++) {
-      uint32_t expected = 0;
-      if (__atomic_compare_exchange_n(&gBatchBusy, &expected, 1u, false,
-                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-        batched = true;
-        break;
-      }
-    }
+    // its time on. The staging buffer is static because a 64 KiB array does not belong
+    // on this kernel's stack, and Round171's IOLock is what keeps callers from sharing it.
+    // A caller that cannot allocate the lock keeps the old per-block path, so this can only
+    // make the device faster, never less able to complete a request.
+    bool batched = gBatchLock != nullptr;
     if (batched) {
+      IOLockLock(gBatchLock);
       while (done < nblks) {
         uint32_t chunk = static_cast<uint32_t>(nblks - done);
         if (chunk > kBatchBlocks) {
@@ -726,10 +823,12 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
             // those did reach the media, so they are the only part of this chunk
             // that is done. The rest is left for the caller to retry.
             done += written;
+            __atomic_add_fetch(&gWritesSinceFlush, written, __ATOMIC_RELAXED);
             status = kIOReturnError;
             break;
           }
           done += chunk;
+          __atomic_add_fetch(&gWritesSinceFlush, chunk, __ATOMIC_RELAXED);
         } else {
           uint32_t read = clover_emmc_block_read(cardBlock, gBatchWords, chunk);
           __atomic_add_fetch(&gBlocksRead, read, __ATOMIC_RELAXED);
@@ -748,7 +847,7 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
           done += chunk;
         }
       }
-      __atomic_store_n(&gBatchBusy, 0, __ATOMIC_RELEASE);
+      IOLockUnlock(gBatchLock);
     } else {
       uint32_t words[kBlockWords];
       for (; done < nblks; done++) {
@@ -765,6 +864,7 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
             break;
           }
           __atomic_add_fetch(&gBlocksWritten, 1u, __ATOMIC_RELAXED);
+          __atomic_add_fetch(&gWritesSinceFlush, 1u, __ATOMIC_RELAXED);
         } else {
           if (clover_emmc_block_read(cardBlock, words, 1) != 1) {
             status = kIOReturnError;
@@ -780,6 +880,13 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
     }
   }
 
+  // Round171: a write that landed in logfs's own extent is committed before the caller hears about
+  // it. Only successful blocks are in the card, so the range checked is the range actually written.
+  if (direction == kIODirectionOut && done &&
+      overlapsLogfsWindow(static_cast<uint64_t>(windowFirst) + block, done)) {
+    commitCache();
+  }
+
   // IOBlockStorageDriver::executeRequest completes the request itself whenever this returns
   // anything but success, so a request handled here always completes exactly once, inline, and
   // the buffer and `this` are not touched afterwards.
@@ -792,7 +899,11 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
 
 IOReturn CloverBlockDevice::requestIdle(void)
 {
-  return kIOReturnSuccess;
+  // The driver's idle call-out is the other place a write-back cache has to be committed: it is
+  // what runs before a power state change, and an uncommitted cache across a hard reset is the
+  // exact failure r167 was afraid of. commitCache() answers the same way a sync does -- quiet card,
+  // nothing pending, success -- and only pays for the CMD6 round trip when writes are outstanding.
+  return commitCache();
 }
 
 IOReturn CloverBlockDevice::doUnmap(IOBlockStorageDeviceExtent *extents,
@@ -812,7 +923,15 @@ IOReturn CloverBlockDevice::doSetPriority(IOBlockStorageDeviceExtent *extents,
 IOReturn CloverBlockDevice::doSynchronize(UInt64 block, UInt64 nblks,
                                           IOStorageSynchronizeOptions options)
 {
-  return kIOReturnSuccess;
+  // Round171: IOBlockStorageDriver::synchronize() ends here, and the base class documents a barrier
+  // synchronize as a full flush, so this is the path a filesystem's sync_fsk takes on its way to the
+  // card. It is the same commit doSynchronizeCache() does -- which range is being synced makes no
+  // difference to an eMMC write cache, whose flush is whole-device by definition (EXT_CSD
+  // CACHE_CTRL=0 programs every block the card is holding).
+  (void) block;
+  (void) nblks;
+  (void) options;
+  return commitCache();
 }
 
 IOReturn CloverBlockDevice::doGetProvisionStatus(UInt64 block, UInt64 nblks,

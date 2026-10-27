@@ -12116,3 +12116,213 @@ exec/exit 成对但 comm 总是同一颗 = 还在循环；exec 铺开、exit 缺
 重新看得见 `clover r153: read`、`clover r155: hdr`、任何一条 APFS 或签名错误，
 以及 `clover r154: map2` 到底有没有出现。
 
+
+## v0.5.27（round171）：批量读按交付字数判定，卡的写缓存打开并显式提交
+
+### 读数（round170 帧，两张照片）
+
+这一帧比上一轮的预期走得远得多，r170 加的两颗探针都说话了。
+
+面板顶部：
+
+```
+[System Event] [t=158374553] [INFO] [Subsystem: launchd] [Event: init-execvekit]
+  boot task com.apple.xpc.launchd(1969-12-31 16:01:56.72995 <boot>) <Notice>:
+  Early boot complete. Continuing system boot.
+[System Event] [t=2173993685] [INFO] [Subsystem: launchd] [Event: boot] <INFO>:
+  Early boot complete. Continuing system boot.
+```
+
+同一行出现两次，`t=` 从 0.158 秒跳到 2173.99 秒 —— launchd 至少重新初始化过一次。
+r170 想问的那一个问题，exec/exit 两行直接答了：
+
+```
+clover r170: exec pid=38 ppid=1 t=66 comm=accessoryupdater
+Clover r170: exit pid=54 ppid=1 t=29 rv=0x4000 ns=-1 code=0x0 comm=zproxy
+```
+
+comm 在换（`zproxy`、`accessoryupdater`、`identityservicesd`、`thermalhand`、
+`di-workerld`），pid 在铺（38、54、541），`t=` 在推进（29 → 66），`ns=-1` 是
+「没有 exit reason」而不是崩溃。所以 launchd **不是在循环拉同一批死掉的进程，
+是在往前走**——只是走不动了。第二张照片给出走不动的那一下：
+
+```
+initproc exited -- exit reason namespace 2 subcode 0xa description: none
+```
+
+namespace 2 = `OS_REASON_SIGNAL`，subcode 0xa = SIGBUS。死的是 pid 1 自己，
+后面是 panic 屏的寄存器面板（`pages=0x3af53 free=0x2f8d8 ticks=0x19d59`、
+`ipi=0 sent=0`、`irq=0x3ff phase=0 intid=0`），底部两行：
+
+```
+coredump_launchd: pid 1) core dump failed errno 3
+Failed to generate core file for pid: 1) error 2, took 12.711 seconds
+```
+
+SIGBUS 是「映射进来的页读不出来」的标准形状，所以真正的墙还是 I/O。这一帧里
+驱动自己把话说全了，一共三类读数：
+
+**一、失败的读全部停在同一档，而且卡是干净的。**
+
+```
+CloverSdhci r169: read guard lba=16526882 blocks=1 done=0 st=00000000
+CloverSdhci r169: read guard lba=16532074 blocks=1 done=0 st=00000000
+CloverSdhci r169: read guard lba=16340454 blocks=1 done=0 st=00000000
+CloverSdhci r169: read guard lba=237314810 blocks=1 done=0 st=00000000
+CloverSdhci r169: read guard lba=20359946 blocks=1 done=0 st=00000000
+CloverSdhci r169: read guard lba=16662060 blocks=1 done=0 st=00000000
+CloverSdhci r169: read guard lba=26512314 blocks=1 done=0 st=00000000
+CloverSdhci r169: read guard lba=24576060 blocks=1 done=0 st=00000000
+```
+
+r169 的 `reportReadFailure` 把失败分成 guard / idle / deadline / gave up 四档，
+这一帧全部落在 **guard**，而且 `st=00000000` —— 主机侧一个错误位都没举，
+`PRESENT_STATE` 全零，卡不忙、FIFO 不忙、线路不忙。这些读不是被介质拒绝的，
+是**没排到块守卫**：r169 的守卫是 30 秒有界自旋，超时即失败返回。
+
+**二、谁握着守卫不放。**
+
+```
+tx_flush:1173: disk5 tx xid 526 took 102001275 us to flush
+tx_flush:1173: disk5 tx xid 527 took 120000602 us to flush
+```
+
+102.0 秒和 120.0 秒。同一条 `tx_flush` 在 round168 帧是 22.7 秒 —— 三帧连起来
+是一条上升曲线。r167 把 EXT_CSD 的 `CACHE_CTRL` 清零以后，每一次写都要等卡
+自己把块落到介质上才计数，一个 checkpoint 就是几千次串行的「发写—等落盘」，
+而这段等待从头到尾握着块守卫。守卫一被握过 30 秒，别的卷的读就整批失败。
+
+**三、批量读仍然被自己的判据丢掉。**
+
+```
+CloverSdhci r159: multi read fail lba=29165200 blocks=8 st=0x21 w=1024/1024 (once)
+```
+
+`w=1024/1024` 是 8 块 = 1024 个字，**一个不少全部交到了**；`st=0x21` 是
+`SDHCI_INT_DATA_AVAIL | SDHCI_INT_RESPONSE`，没有 `DATA_END`。r157 起的判据把
+`DATA_END` 当必要条件，于是这批被判失败、丢回单块路径。`0x21` 恰好是「这颗
+主机对多块 PIO 只在停命令之后才举 DATA_END」的形状——判据问错了问题。
+
+中间那串 `disk1: general error` → `nx_buf_bread:620 … error = 5` →
+`_vn_rdwr_dev_read:907: disk1 *** got err 5 reading blknum 96950 (num read errs: 1)`
+（一路涨到 23）→ `apfs_nstream_read:885: disk1s1 namedstream *** obj-id
+1152921500312246012/… retval 5 filesize 662143 offset 264 resid 0` →
+`decmpfs.c:1031 … decmpfs_fetch_uncompressed_data err 5` →
+`ChunkCompression.cpp:290: /usr/libexec/thermalhand: … errno 5`，最后到
+
+```
+com.apple.xpc.launchd(...) <Error>): Missing executable detected.
+  Job: 'com.apple.identityservicesd'
+  Executable: '/System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app/identityservicesd'
+```
+
+就是这条链的下游：可执行文件的页读不出来，launchd 以为文件不存在。
+
+### 结论
+
+同一启动里 SystemOS 缓存的读仍然 err=0、`disk5` 这一帧也不再 `general error`
+（写已经通了），所以介质没坏、批量读本身没错。**这一帧的 EIO 全部是驱动自己
+造成的**：一个 102 秒的 checkpoint flush 握着守卫，把另一颗卷上的每一次读判死。
+四处要修，都在 CloverSdhci / CloverBlock 里。
+
+### 改动
+
+**一、批量读的判据改成「交付字数 + 内容错误位」。** 新增
+`kContentErrorMask = DATA_CRC | DATA_END_BIT | ADMA_ERROR` 与
+`batchDelivered(status, words, total)`：字数凑满且没举内容错误位，就算交付。
+两条排空循环先按内容位分流，`DATA_END` 只在「FIFO 里已经没有字」时才当结束
+（读看 `DATA_AVAILABLE`、写看 `SPACE_AVAILABLE`），否则继续等——短批不再把
+整个死线烧完。读侧接受一次被拒的停命令（每启动一行
+`CloverSdhci r171: batch stop refused lba=%u blocks=%u (once)`）并重试；
+写侧仍然要 `delivered && stopped`，因为写没停就等于卡还在编程，下一批会撞上去。
+
+**二、卡的写缓存打开，并显式提交。** bring-up 把 EXT_CSD 字节 33 写成 1，
+读数是 `CloverSdhci r171: write cache size=%u ctrl=%u on=%d rsp=%08x st=%08x`；
+新增 `extern "C" uint32_t clover_emmc_flush_cache (void)`：JEDEC 不给 flush 单独
+的命令，写 0 提交（R1b 忙线）→ `cardInTransfer` → 再写 1 放回，两步都成才算
+提交，失败每启动打一行 `CloverSdhci r171: flush failed flushed=%d back=%d …`。
+提交走 `acquireBlockGuard`，和读写串行。CloverBlock 侧 `commitCache()` 只在
+`gWritesSinceFlush` 非零时付这次 CMD6 往返，第一次提交打
+`CloverBlock r171: first commit blocks=%llu cache=%u on=%u flushes=%u`；
+`doSynchronizeCache`、`requestIdle`、`doSynchronize` 三处都改走它，
+`getWriteCacheState` 报卡的真实状态而不是硬编码 false。
+ durability 的缺口补在 `doAsyncReadWrite`：落在 logfs 窗口内的写当场提交
+（`overlapsLogfsWindow`），因为 logfs 上面没有文件系统会替它 sync，而写最后一条
+记录的那次启动正是以硬复位结束的那次。
+
+**三、守卫与批量缓冲从自旋改成 IOLock。** `gBlockGuard` 的 CAS 自旋换成
+`gBlockLock = IOLockAlloc()`，第二个调用者**等**而不是失败——这是这一帧那
+二十几条 `read guard` 的直接解药；等待仍然测时，超过 250 ms 打一次
+`CloverSdhci r168: block guard waited %llu ms`（保留 r168 的串）。锁没有超时，
+上界由持有者自己的请求死线给出，每条拿锁的路径都以释放收尾。CloverBlock 的
+16 KiB 批量缓冲同理，`gBatchBusy` 换成 `gBatchLock`，抢不到不再悄悄降级成逐块；
+`init()` 里分配一次（init 早于发布，没有竞争；分配失败就退回逐块路径）。
+两处都照 sheng 的 `drivers/NativeUfs`：它的块设备也是每设备一把 `IOLock` 加
+bounce buffer，回调在锁外跑。
+
+**四、批量提到 128 块。** `kReadChunkBlocks` 32 → 128（64 KiB 一次 CMD18 /
+CMD25），调用方要多少给多少。顺带修掉一个宿主上发现的自伤：r167 的「批量是否
+可信」闸门原来写死 `blocks >= kReadChunkBlocks`，把常量抬到 128 之后，APFS 的
+16 KiB（32 块）读永远不会再触发它——闸门改成按请求取样
+（`checkReadPath(lba, sample)`，`sample = min(blocks, 128)`，门槛 `blocks >= 4`），
+`readcheck` 那行多带一个 `sample=%u`。
+
+### 契约与构建
+
+`check-clover.py` 新增 Round171 一节：SDHCI 侧断言 `batchDelivered`、
+`kContentErrorMask`、`if (delivered && stopped)`、带 `sample` 的 `checkReadPath`、
+两个 flush 导出、CACHE_CTRL 的开与关、两条 r171 读数、`gBlockLock` 与
+`releaseBlockGuard`，并反向断言 `gBlockGuard` 已不在、flush 不能只关不开；
+CloverBlock 侧断言 `commitCache` 的声明/定义/三处调用、`gWritesSinceFlush` 的
+自增、`overlapsLogfsWindow`、`clover_emmc_cache_stats` 的取数、r171 的首次提交
+读数，以及 `*enabled = false` 这种硬编码不再存在；r169 一节里那条
+`const uint64_t handover = frequency * 30ULL` 随自旋一起删掉。
+`verify-clover-payload.py` 的 `READ_INTEGRITY` 加 `batch stop refused lba=`，
+`WRITE_INTEGRITY` 换成 r171 的 `write cache size=` / `flush failed flushed=` /
+`CloverBlock r171: first commit blocks=`（`write not ready`、`write settle took`、
+`write gave up` 保留）。`build-clover-block.py` 的 `EMMC_IMPORTS` 加
+`_clover_emmc_flush_cache`、`_clover_emmc_cache_stats`。`board.toml` 标题
+`clover r171: the batch counts delivered words, and the card's cache is committed`。
+两套驱动在树内 `-Wall -Wextra -Werror` 通过，190 项 vtable / 26 项必需 override
+审计通过，两个 checker 全绿。
+
+本轮 XNU 补丁一颗不动，构建前照例在 `out/clover/tree/.cache/xnu-work` 里逆撤
+`zzy-clover-dyld-cache-skip.patch`，先内核、再 payload：
+
+```sh
+cd ~/UniXNU && /opt/homebrew/bin/python3.13 ./unixnu build kernel --device ../UniXNU-clover
+/opt/homebrew/bin/python3.13 ~/UniXNU-clover/scripts/patch-clover-amfi.py \
+  ~/UniXNU/out/clover/kernel/kernel.macho ~/clover-out/round171-kernel-amfi.macho
+/opt/homebrew/bin/python3.13 ./unixnu build payload --device ../UniXNU-clover \
+  --unique-chip-id 0x81ffcaaa --uefi ../mu-clover \
+  --kernel /Users/zhouzhou/clover-out/round171-kernel-amfi.macho \
+  --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
+  --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
+```
+
+产物：prelink 内核 `076f1542…`；打过 AMFI 的拷贝 `616f1b38…`（新 prelink 把两处
+分支挪到 `0x1a870e4` / `0x1a8716c`，脚本按符号自己找到，两处补丁照旧）；
+payload `093fafdd…`（56 MiB，58,720,256 字节），卷内 kernel `6cfebbef…`、
+`unixnu.toml` `1333bed1…`、ADT `2dd487f5…`、`scratch-data.img` `614b8356…`
+（未变）、trustcache `7c369ce0…`（未变）。入口探针 `6844 bytes in 37 runs`；
+`verify-clover-payload.py` 全项 OK，`eMMC read/write integrity` 现在要求
+`batch stop refused`、`write cache size=`、`flush failed`、`first commit blocks=`
+四条新串；`verify-userdata-window.py` 对 round159 的归档镜像重跑 PASS
+（9,416,212,480 字节、3 扇窗、Data 33,554,432 字节 @ `0x22f400000`、
+seed sha256 `ef00c083…`），本轮不动 userdata。归档在 `~/clover-out/round171-*`，
+清单 `round171-SHA256SUMS`。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round171-payload.img
+fastboot reboot
+```
+
+冷刷，不用 `fastboot boot`；`userdata` 不动，round159 的 Data 窗口仍在。
+
+这一刷问三件事：`read guard` 这一档是否整批消失（守卫不再拒绝，只等）；
+`tx_flush … took … us to flush` 是否从 102/120 秒掉回毫秒量级（写进缓存即返回，
+落盘由一次 commit 承担）；`multi read fail … st=0x21 w=1024/1024` 是否不再出现、
+`readcheck … trusted=1` 是否上屏（判据认交付字数之后，批量读该被信任了）。
+三件都成立的话，launchd 的页就能继续映射进来，下一格才轮到 536 与 `/data`。

@@ -947,7 +947,7 @@ def check_board(errors: list) -> str:
     else:
         text = sdhci.read_text()
         missing = [needle for needle in
-                   ("static const uint32_t kReadChunkBlocks = 32;",
+                   ("static const uint32_t kReadChunkBlocks = 128;",
                     "static bool sendStopCommand (void)",
                     "static bool readMultiBlock (uint32_t lba",
                     "SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN |",
@@ -979,18 +979,25 @@ def check_board(errors: list) -> str:
     else:
         text = block.read_text()
         missing = [needle for needle in
-                   ("static const uint32_t kBatchBlocks = 32;",
+                   ("static const uint32_t kBatchBlocks = 128;",
                     "static const uint32_t kBatchWords = kBatchBlocks * kBlockWords;",
                     "static uint32_t gBatchWords[kBatchWords];",
-                    "static volatile uint32_t gBatchBusy = 0;",
-                    "__atomic_compare_exchange_n(&gBatchBusy, &expected, 1u, false,",
+                    "static IOLock *gBatchLock = nullptr;",
+                    "gBatchLock = IOLockAlloc();",
+                    "IOLockLock(gBatchLock);",
+                    "IOLockUnlock(gBatchLock);",
                     "clover_emmc_block_read(cardBlock, gBatchWords, chunk)",
-                    "clover_emmc_block_write(cardBlock, gBatchWords, chunk)",
-                    "__atomic_store_n(&gBatchBusy, 0, __ATOMIC_RELEASE);")
+                    "clover_emmc_block_write(cardBlock, gBatchWords, chunk)")
                    if needle not in text]
         for needle in missing:
             errors.append(f"drivers/CloverBlock/CloverBlock.cpp lacks {needle!r}: the block layer "
                           "would keep asking the card for one 512-byte block at a time")
+        # Round171: the batch is shared, so it is owned by a lock. A CAS retry loop that gives up
+        # after a thousand spins hands the loser the per-block path, which on a contended boot is
+        # every read.
+        if "gBatchBusy" in text:
+            errors.append("drivers/CloverBlock/CloverBlock.cpp still arbitrates the staging buffer "
+                          "with a spin flag: a waiter that loses the race degrades to single blocks")
         # A caller that loses the busy flag must still have a path. The per-block loop
         # is the old, proven one and its buffer is on the stack.
         if "uint32_t words[kBlockWords];" not in text:
@@ -1182,8 +1189,8 @@ def check_board(errors: list) -> str:
                       "watchdog would also cut the observation short")
     # Round170. The menu has to name the round under test: the frame is no longer about the card,
     # it is about who is spawning and who is dying.
-    if not board["payload"]["title"].startswith("clover r170:"):
-        errors.append('[payload] title is not "clover r170: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r171:"):
+        errors.append('[payload] title is not "clover r171: ...": the menu would not name this round')
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -1239,14 +1246,13 @@ def check_board(errors: list) -> str:
         for needle in ("CloverSdhci r167: readcheck lba=",
                        "CloverSdhci r167: batch reads trusted for this boot",
                        "CloverSdhci r167: single-block reads for this boot",
-                       "CloverSdhci r167: write cache size=",
+                       "CloverSdhci r171: write cache size=",
                        "CloverSdhci r167: write not ready lba=",
                        "CloverSdhci r168: block guard waited %llu ms",
                        "CloverSdhci r168: write gave up lba=%u blocks=%u done=%u",
                        "CloverSdhci r169: card busy %llu ms",
                        "CloverSdhci r169: read %s lba=%u blocks=%u done=%u st=%08x",
                        "CloverSdhci r169: write settle took %llu ms polls=%u",
-                       "const uint64_t handover = frequency * 30ULL;",
                        "const uint64_t deadline = frequency * 30ULL;      // 30 s",
                        "static void abortReadTransfer (void)",
                        "abortReadTransfer ();",
@@ -1283,6 +1289,97 @@ def check_board(errors: list) -> str:
         # keeps its own copy, which is where the constant came from).
         if "gap = frequency / 6250ULL;        // 160 us; writes are rare" in text:
             errors.append(f"{sdhci.name} still paces writes at the 400 kHz 160 us gap")
+
+    # Round171. The r169 and r170 frames said the read path was healthy and slow: no EIO, no
+    # cascade, no jhash complaint -- and one command per 512 bytes, because the r167 batch gate
+    # reported "multi read fail ... st=0x21 w=1024/1024". 0x21 is SDHCI_INT_DATA_AVAIL |
+    # SDHCI_INT_RESPONSE and 1024/1024 is a whole 32-block batch delivered, so the verdict the code
+    # demanded -- SDHCI_INT_DATA_END -- is one this host only raises once a stop puts the bus idle.
+    # The criterion therefore became a permanent failure of a successful transfer, the batch never
+    # became trusted, and every read ran the single-block sequence. Three things change together:
+    # the batch is judged on delivered words beside the content-error bits (and the trust check now
+    # runs on the request size the filesystem actually asks for), callers wait on an IOLock instead
+    # of spinning out a retry budget and losing the batch path, and the card's write cache is
+    # switched on and committed by an explicit EXT_CSD CACHE_CTRL flush -- because the r170 frames
+    # also showed the synchronous programming r167 chose had grown the checkpoint flush from 22.7 s
+    # to 102 s and 122 s.
+    sdhci = next((base / "drivers/CloverSdhci/CloverSdhci.cpp"
+                  for base in (REPO, pathlib.Path.cwd())
+                  if (base / "drivers/CloverSdhci/CloverSdhci.cpp").is_file()), None)
+    if sdhci is not None:
+        text = sdhci.read_text()
+        for needle in ("static bool batchDelivered (uint32_t status, uint32_t words, uint32_t total)",
+                       "return words == total && !(status & kContentErrorMask);",
+                       "static const uint32_t kContentErrorMask = SDHCI_INT_DATA_CRC",
+                       "const bool delivered = clean || batchDelivered (status, wordCount, totalWords);",
+                       "if (delivered && stopped) {",
+                       "static void checkReadPath (uint32_t lba, uint32_t sample)",
+                       "if (!gReadCheckDone && blocks >= 4) {",
+                       "extern \"C\" uint32_t clover_emmc_flush_cache (void)",
+                       "extern \"C\" void clover_emmc_cache_stats (uint32_t *size, uint32_t *on, uint32_t *flushes)",
+                       "switchExtCsd (kExtCsdCacheCtrl, 0, response, status)",
+                       "switchExtCsd (kExtCsdCacheCtrl, 1, backResponse, backStatus)",
+                       "CloverSdhci r171: write cache size=",
+                       "CloverSdhci r171: flush failed flushed=",
+                       "static IOLock *gBlockLock = nullptr;",
+                       "gBlockLock = IOLockAlloc ();",
+                       "IOLockLock (gBlockLock);",
+                       "static void releaseBlockGuard (void)"):
+            if needle not in text:
+                errors.append(f"{sdhci.name} lacks {needle[:40]}...: r171's batch verdict, cache "
+                              "commit or host serialization would be incomplete")
+        # A spin-flag guard is what made a contended request degrade: the loser fell out of the
+        # batch path and the winner kept the only core busy.
+        if "gBlockGuard" in text:
+            errors.append(f"{sdhci.name} still arbitrates the host with a spin flag: the batch path "
+                          "the flag protects is the one the frame shows is missing")
+        if "__atomic_store_n (&gBlockReady, 1, __ATOMIC_RELEASE);" in text and \
+                "if (gBlockLock) {" not in text:
+            errors.append(f"{sdhci.name} publishes the block device without proving the host lock "
+                          "exists: an unsynchronized card engine is worse than no device")
+        # The cache-flush pair must be a commit *and* a re-enable: leaving CACHE_CTRL at 0 after a
+        # sync is r167's write-through with a different name.
+        if "switchExtCsd (kExtCsdCacheCtrl, 0" in text and \
+                "switchExtCsd (kExtCsdCacheCtrl, 1, backResponse" not in text:
+            errors.append(f"{sdhci.name} flushes the write cache without switching it back on")
+
+    block = next((base / "drivers/CloverBlock/CloverBlock.cpp"
+                  for base in (REPO, pathlib.Path.cwd())
+                  if (base / "drivers/CloverBlock/CloverBlock.cpp").is_file()), None)
+    if block is not None:
+        text = block.read_text()
+        for needle in ("IOReturn commitCache(void);",
+                       "IOReturn CloverBlockDevice::commitCache(void)",
+                       "return commitCache();",
+                       "static volatile uint64_t gWritesSinceFlush = 0;",
+                       "__atomic_add_fetch(&gWritesSinceFlush",
+                       "static bool overlapsLogfsWindow(uint64_t first, uint64_t count)",
+                       "overlapsLogfsWindow(static_cast<uint64_t>(windowFirst) + block, done)",
+                       "clover_emmc_cache_stats(&size, &on, &flushes);",
+                       'IOLog("CloverBlock r171: first commit blocks='):
+            if needle not in text:
+                errors.append(f"{block.name} lacks {needle[:40]}...: the write cache would be "
+                              "enabled without anything committing it, or logfs data would be left "
+                              "in a cache the panic reset never flushes")
+        # getWriteCacheState has to answer with the card's state; a constant `false` while the host
+        # driver is caching is how the stack above stops issuing the syncs that make it durable.
+        if "*enabled = false;" in text:
+            errors.append(f"{block.name} still reports the write cache as off whatever the card says")
+
+    # Round171's contract: the archive audit that resolves CloverBlock's imports has to know the two
+    # new entry points, or the kernel link is the first place that discovers them.
+    block_build = next((base / "scripts/build-clover-block.py"
+                        for base in (REPO, pathlib.Path.cwd())
+                        if (base / "scripts/build-clover-block.py").is_file()), None)
+    if block_build is None:
+        errors.append("scripts/build-clover-block.py is missing: nothing would audit the block "
+                      "device's bindings")
+    else:
+        text = block_build.read_text()
+        for needle in ("'_clover_emmc_flush_cache'", "'_clover_emmc_cache_stats'"):
+            if needle not in text:
+                errors.append(f"{block_build.name} does not audit {needle}: the archive would build "
+                              "and the kernel link would fail")
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())
                       if (base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch").is_file()),
@@ -1341,7 +1438,7 @@ def check_board(errors: list) -> str:
         text = verifier.read_text()
         for needle in ("NATIVE4K_SKIP", "check_dyld_cache_skip", "check_amfi_allow",
                        "check_read_integrity", "CloverSdhci r167: readcheck",
-                       "CloverSdhci r167: write cache size=",
+                       "CloverSdhci r171: write cache size=",
                        "check_exec_sig_dump", "clover r166: sig n=%u"):
             if needle not in text:
                 errors.append(f"{verifier.name} lacks {needle}: the release could ship with an "

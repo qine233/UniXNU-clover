@@ -23,7 +23,10 @@
 ## 开发进度
 
 现在的形态：整条内核引导链、根挂载、EL0 与多进程、eMMC 读写都已经有真机读数
-并且通了；卡住的最后一格是 launchd 拉起来的守护进程能不能活下来。
+并且通了；launchd 已经在拉守护进程（`zproxy`、`accessoryupdater`、
+`identityservicesd` 都被 exec 起来过），卡住它的是驱动自己——一次 102 秒的
+checkpoint flush 握着块守卫，把另一颗卷上的每一次读判成 EIO，pid 1 最终在
+映射页时 SIGBUS。round171 修的就是这一格。
 
 ### 已完成（都有真机读数）
 
@@ -37,8 +40,9 @@
 | APFS 根 | round137 挂上 OS 卷；round150 owner 审计接受未封印的根，三模块信任缓存放行 |
 | SystemOS | round143/145 在 exec 时把 SystemOS 卷 union 到 `/`；round153 dyld 打开缓存目录、主缓存、`.01` 三处 err=0，两个头都是 `dyld_v1   arm64` |
 | eMMC 高速读 | round159 帧：16 KiB 读 7 ms、224 KiB 读 189 ms（约 1–2 MB/s，比 round156 前的 25 KB/s 快 40–80 倍）；CMD6 高速链路、8 线、CMD18 批量成立 |
-| eMMC 读不再级联失败 | round169 帧：`general error`、`buf_bread … error = 5`、`dev_get err 5`、decmpfs `errno 5`、APFS jhash 校验错在同一次冷刷里全部消失，唯一驱动读数 `block guard waited 31 ms` |
-| eMMC 写 | round168 帧起 22.7 秒的 `tx_flush` 与 `disk5: general error` 消失；写完成需 CMD13 确认、`CACHE_CTRL` 清零、批量读须三份样本一致才信任 |
+| eMMC 读不再级联失败 | round169 帧：卡停在数据态那一类级联消失——`buf_bread … error = 5`、`dev_get err 5`、APFS jhash 校验错在同一次冷刷里全部消失，唯一驱动读数 `block guard waited 31 ms`。**但 round170 帧暴露出另一类级联**：`read guard … st=00000000`，读不是被介质拒绝，是没排到块守卫；由 round171 修 |
+| eMMC 写 | 写完成需 CMD13 确认、批量读须三份样本一致才信任（round167）；`disk5: general error` 自 round168 帧起未再出现。代价被 round170 帧量出来：`CACHE_CTRL` 清零之后 `tx_flush` 从 22.7 秒涨到 **102.0 / 120.0 秒**，握死块守卫；round171 改为开缓存 + 显式提交 |
+| launchd 与守护进程是死是活可读 | round170 帧：`clover r170: exec pid=38 ppid=1 t=66 comm=accessoryupdater`、`exit pid=54 ppid=1 t=29 rv=0x4000 ns=-1 code=0x0 comm=zproxy`——comm 在换、pid 在铺、`t=` 在推进，`Early boot complete` 出现两次；结论是**在往前走而不是在循环**，直到 pid 1 自己 `initproc exited -- exit reason namespace 2 subcode 0xa`（SIGBUS） |
 | Data 卷 | round159 帧：`seed data … bytes=33554432`、`bsd=disk5s1`、APFS `mount-complete volume DawnData`，UUID `FC1A580E-2D67-48FC-B8CF-87422A319340` 与钉住的种子一致，owner 的 `/private/var` 挂载失败行没有出现 |
 | dyld 缓存预检 | round159 帧：目录 / 主缓存 / `.01` 全 err=0，`.01` 头 `len≈1.07 GiB sig=11491332+229376`，随后每颗子缓存的 `F_ADDFILESIGS` 都 `err=0 resid=0` |
 | 诊断通道 | panic 屏直写 framebuffer（不经 tty）、无人值守的 IMEM `0x77665501` + PSCI 复位、`read-clover-log.py` 取 logfs、`decode-clover-address.py` 把地址翻成函数 |
@@ -50,12 +54,12 @@
 | --- | --- | --- |
 | round154（v0.5.7） | syscall 536 入口/返回、setup 阶梯与 `mapfile` 探针 | 探针仍在镜像里，至今没有 `map2` 读数 |
 | round166（v0.5.20） | exec 侧打印前八个签名 blob 的 `mo/off/size` 与头四字 | `clover r166: sig` 尚未上屏 |
-| round170（v0.5.24） | 缓存探针节流（`check_np` 48 行、目录 open 16 行，失败与主缓存/`.01` 不封顶）；`kern_exec.c`/`kern_exit.c` 各加一行带 pid、ppid、开机秒数、退出 namespace/code 的生与死，各 256 行封顶 | **已冷刷**（2026-10-28，只写 `cache`，userdata 不动），等第一帧 |
+| round171（v0.5.27） | 批量读按「交付字数 + 内容错误位」判定（`st=0x21 w=1024/1024` 那种全量交付不再被丢回单块）；卡的写缓存打开并显式提交（CMD6 关→提交→开）；块守卫与批量缓冲从有界自旋改成 `IOLock`；批量 32 → 128 块，可信性闸门改为按请求取样 | **已构建**，待冷刷 |
 
-round170 只问一件事：**launchd 是在反复拉同一批死掉的子进程，还是在往前走**。
-exec/exit 成对且 comm 在换 = 在前进；只有 exec、`t=` 一路拉长 = 有东西堵在里面；
-exit 成串同一 comm = 还在循环。节流之后屏上应该重新看得见 `clover r153: read`、
-`clover r155: hdr`、`clover r154: map2` 与任何一条 APFS 或签名错误。
+round171 只问三件事：`read guard` 这一档是否整批消失（守卫只等、不拒），
+`tx_flush … took … us to flush` 是否从 102/120 秒掉回毫秒量级，
+`multi read fail … st=0x21 w=1024/1024` 是否不再出现且 `readcheck … trusted=1`
+上屏。三件都成立，launchd 的页才继续映射得进来，下一格才轮到 536 与 `/data`。
 
 ### 排期（未开始 · 已知限制）
 
@@ -68,8 +72,11 @@ exit 成串同一 comm = 还在循环。节流之后屏上应该重新看得见 
 4. **输入** — 触摸（`edt-ft5406` / focaltech `fts`）没有驱动。
 5. **网络、音频、USB** — WCN3990 WiFi/蓝牙、WCD 音频、USB device 模式都没有。
 6. **电源管理** — 除 AMFI 需要的那颗 nub 外，充电、电池、PMIC 都没有真驱动。
-7. **eMMC 高速写的绝对速度** — 写不再是墙，但 `write settle took … ms` 还没被读到
-   过；要不要换 HS400/CQE/DMA，等这一行真的上屏再定。
+7. **eMMC 数据通路仍是 PIO** — 写不再是墙，但吞吐还受「每字一次轮询」的上限
+   约束；`cap=742dc8b2` 说明这颗主机支持 ADMA2、`hcl=38` 说明固件自己就用过
+   ADMA64。round172 计划加一条 DMA 通路，并且用同一份内容检查裁决：DMA 读回来
+   的字必须与 PIO 逐字相同才允许走 DMA。`write settle took … ms` 至今没被读到
+   过，HS400/CQE 等这一行真的上屏再定。
 8. **内核构建不可逐字节复现** — 每次 prelink UUID 不同；`verify-clover-payload.py`
    只比较两个可执行段。
 9. **存储栈形态** — 没有 UFS、virtio-block 或 native verified-root；sheng 的存储栈
@@ -220,7 +227,8 @@ fastboot reboot
 
 **永远冷刷**：设备先关机，再用「音量减 + 电源」进 fastboot，绝不用
 `fastboot boot`。只写 `cache`，不碰 `userdata`；要写别的分区，动手前必须说清
-哪个分区、为什么，并取得同意。一轮刷机只回答一个问题。
+哪个分区、为什么，并取得同意。每一刷要问的问题写在轮次日志末尾，排期攒够时
+一刷可以同时回答几件。
 
 ## 读数通道
 

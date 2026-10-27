@@ -73,9 +73,13 @@ Every porting area is present even when this board does not implement it.
 `display`, `input`, `gpu`, `network`, and `audio` are `planned`, because the
 components sheng uses for them are SM8550-specific (MDP/DPU, Novatek touch,
 Adreno 740, ath12k, ADSP) and cannot be selected here. `storage` is the active
-area: `CloverSdhci` and `CloverBlock` own the eMMC path, and reads and writes
-both have device readings that are clean. The remaining wall is upstream of
-storage: whether the daemons launchd execs survive.
+area: `CloverSdhci` and `CloverBlock` own the eMMC path. The r170 frame showed
+the wall is still inside storage, not upstream of it: launchd does reach
+`Early boot complete` and execs real daemons, and pid 1 then dies of SIGBUS
+because a 102-second checkpoint flush on the Data volume held the block guard
+while every other read reported `read guard ... st=00000000` -- contention, not
+media. Read a driver failure line by its stage before blaming the card, the
+filesystem, or dyld.
 
 XNU patches are replayed by filename order, `git apply --reverse --check` first
 and `set -e`. A new probe must never be inserted inside a block added by a

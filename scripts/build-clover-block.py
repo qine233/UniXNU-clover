@@ -50,6 +50,10 @@ EMMC_IMPORTS = {
     '_clover_emmc_block_userdata_window',
     '_clover_emmc_block_read',
     '_clover_emmc_block_write',
+    # Round171: the card's write cache is on, so the device's sync and idle call-outs commit it
+    # through these two entry points instead of pretending the media is synchronous.
+    '_clover_emmc_flush_cache',
+    '_clover_emmc_cache_stats',
 }
 # Everything IOBlockStorageDevice owns on iOS: the four macOS-only deprecated virtuals are
 # compiled out by TARGET_OS_OSX, and APPLE_KEXT_VTABLE_PADDING is 0, so the slot list is exactly

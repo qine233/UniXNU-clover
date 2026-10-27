@@ -250,7 +250,16 @@ static const uint32_t kUserDataFirstLba = 15795488u;
 static const uint32_t kUserDataLastLba = 122142686u;
 static volatile uint32_t gBlockReady = 0;
 static volatile uint32_t gBlockSectors = 0;
-static volatile uint32_t gBlockGuard = 0;
+// Round171: one command engine and one FIFO, so a request owns the host from its first command to
+// its last. What the ownership is made of changed. Until now it was a flag and a compare-and-swap
+// retry loop: a second caller spun, and on this board -- where the boot-time readers are APFS and
+// the daemon pager threads, and where a spinning caller does not hand the core back -- a waiter
+// burned the cycles the holder needed to finish, so every contended request made every other
+// request slower. sheng's own block device does not do that: NativeUfs allocates an IOLock per
+// window and takes it around the whole read (its RootWindowRead.h guard is the same shape), which
+// puts the waiter to sleep instead of into a loop. This is the same instrument, on the one host
+// these reads share. Allocated at bring-up; the device is not published if it is missing.
+static IOLock *gBlockLock = nullptr;
 // Round127's second export: the logfs partition as a window, first LBA and length, taken from the
 // GPT entry this boot read rather than from the constants above -- those two only decide whether
 // the entry is the one this port has been reading. A block device described as this window has
@@ -866,17 +875,44 @@ static const uint32_t kIdentifyDivider = 255;
 static const uint32_t kCmd1Retries = 200;
 // One 512-byte block is 128 32-bit FIFO words; the buffer register is 32-bit access only.
 static const uint32_t kBlockWords = 128;
-// Round156: how many blocks one CMD18 asks for. 32 blocks is 16 KiB -- small enough
-// that the FIFO drain stays inside a single deadline and the caller's buffer needs no
-// staging, large enough that a shared-cache read is 32 commands instead of 32 blocks'
-// worth of per-command overhead. SDHCI's block-count register is 16 bit, so 32 fits.
-static const uint32_t kReadChunkBlocks = 32;
+// Round156: how many blocks one CMD18 asks for. It used to be 32 -- 16 KiB, small enough that the
+// FIFO drain stays inside a single deadline. Round171 raises it to 128 once the batch is usable:
+// the r169 and r170 frames show the batch never being trusted, so every read runs the single-block
+// sequence and pays one command, one response and one FIFO service loop per 512 bytes. SDHCI's
+// block-count register is 16 bit, so 128 fits and a 64 KiB run costs one command where it used to
+// cost four.
+static const uint32_t kReadChunkBlocks = 128;
 // Round157: DATA_END can be set in the same INT_STATUS word as a CRC, end-bit or
 // timeout error. r156's return expressions only asked for DATA_END, so a transfer
 // that ended in error could be reported as a clean one and the corrupt words went
 // on to the caller. Any error bit overrides the end bit.
 static const uint32_t kDataErrorMask = SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
                                        SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR;
+// Round171: the subset of those bits that says the bytes themselves are suspect. A data timeout
+// cannot say that once the word count is complete -- see batchDelivered().
+static const uint32_t kContentErrorMask = SDHCI_INT_DATA_CRC | SDHCI_INT_DATA_END_BIT |
+                                          SDHCI_INT_ADMA_ERROR;
+
+// Round171: the end-of-transfer test for a multi-block command. The two batch paths used to demand
+// SDHCI_INT_DATA_END, and this host does not raise it for a multi-block PIO transfer: the
+// controller's notion of "transfer complete" is the bus going idle, and an eMMC that never got a
+// stop keeps clocking DAT0 after the last block. So the drain ends on the deadline or the spin
+// bound with the status register holding SDHCI_INT_RESPONSE | SDHCI_INT_DATA_AVAIL -- the reading
+// the r165 gate reported as "multi read fail lba=... st=0x21 w=1024/1024". All the words arrived.
+// The batch was nonetheless judged a failure, fell back to single blocks, and never got trusted,
+// which is why the r169 and r170 frames read the card one 512-byte block at a time.
+//
+// What replaces the end bit is the word count plus the content-error bits, which is the same
+// evidence the single-block path has been using: the controller checks the block CRC on the bus,
+// and DATA_CRC / DATA_END_BIT / ADMA_ERROR would name a bad transfer. A data timeout with a
+// complete word count is this host waiting for a bus idle that CMD12 has not yet produced, so it
+// does not veto the batch -- and CMD12 is sent before this returns, which puts the card back in
+// TRAN. Durability is still proved separately: writeSettled() asks CMD13, and the r167 three-sample
+// gate still compares a batch against the single-block sequence at the same LBA before trusting it.
+static bool batchDelivered (uint32_t status, uint32_t words, uint32_t total)
+{
+  return words == total && !(status & kContentErrorMask);
+}
 
 // The generic counter, used to pace the FIFO drain. Round97 read the buffer port as fast as the
 // loop could run: the first word was the real first word ("EFI ") but the other 127 reads came
@@ -1196,16 +1232,28 @@ static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
   bool clean = false;
   for (;;) {
     status = read32 (SDHCI_INT_STATUS);
-    if (status & (SDHCI_INT_DATA_END | SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
-                  SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR)) {
-      clean = (status & SDHCI_INT_DATA_END) && !(status & kDataErrorMask);
+    if (status & kContentErrorMask) {
+      // INT_STATUS is write-1-to-clear and nothing here clears it during the drain, so this read
+      // still holds every fault bit the transfer raised at any point.
+      break;
+    }
+    if (wordCount >= totalWords) {
+      if (status & SDHCI_INT_DATA_END) {
+        clean = true;
+      }
+      break;
+    }
+    // Round171: a host that says the transfer is finished while its FIFO is handing over nothing
+    // has nothing left to give. Without this the drain would spin out the whole request deadline --
+    // seconds -- on a batch that is already short, and the failure reading would arrive late.
+    if ((status & SDHCI_INT_DATA_END) &&
+        !(read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
       break;
     }
     if (readCounter () - start > deadline) {
       break;
     }
-    if (wordCount < totalWords &&
-        (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
+    if (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE) {
       words[wordCount++] = read32 (SDHCI_BUFFER);
     }
     if (++guard >= kCommandSpinLimit) {
@@ -1216,8 +1264,23 @@ static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
          (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
     words[wordCount++] = read32 (SDHCI_BUFFER);
   }
-  sendStopCommand ();
-  if (clean && wordCount == totalWords) {
+  // Round171: take the verdict from the register as it stands at the end of the drain, before the
+  // stop command clears it.
+  status = read32 (SDHCI_INT_STATUS);
+  const bool delivered = clean || batchDelivered (status, wordCount, totalWords);
+  const bool stopped = sendStopCommand ();
+  if (delivered) {
+    if (!stopped) {
+      // The words are usable but the card may still be driving DAT0. Give the stop another try
+      // from here rather than handing the next caller a card in data mode; the next read also
+      // waits on waitCardIdle() before its first command.
+      static bool stopReported = false;
+      if (!stopReported) {
+        stopReported = true;
+        IOLog ("CloverSdhci r171: batch stop refused lba=%u blocks=%u (once)\n", lba, blocks);
+      }
+      sendStopCommand ();
+    }
     // A clean transfer should have no tail, but the stop command is where a vendor controller
     // could still hand back the last word; drop anything left so the next read starts empty.
     drainReadFifo ();
@@ -1274,61 +1337,66 @@ extern "C" void clover_emmc_block_userdata_window (uint32_t *first, uint32_t *se
   }
 }
 
-// One command engine and one FIFO: the guard has to be held for the whole request. What changed for
-// round127 is the second caller's fate. It used to be refused, and a refused read is not a retry
-// for a filesystem -- it is a mount failure -- so it waits now. The wait is bounded by the same
-// two-second counter deadline the request itself gets, because a host stuck on someone else's
-// transfer has to stay a timeout rather than become a hang, and no timer runs here to wake anyone.
-// On success the caller gets the tick to measure its own deadline from, after the wait.
+// One command engine and one FIFO: the guard has to be held for the whole request. Round171 changes
+// how a second caller waits. It used to be refused (round126 and earlier), then it was a bounded
+// spin (round127 through round170) -- and the spin was the wrong instrument: a caller holding this
+// core's only running thread does not help its holder finish, and a request that loses a spin race
+// silently degrades to single-block I/O. It now blocks on an IOLock, the same way sheng's NativeUfs
+// block device serializes its window reads.
+//
+// The bound is kept as a reading rather than as a refusal: the wait is measured, and the first long
+// one is reported once per boot, because "a read was waiting on a write" is exactly the fact the
+// r167 and r168 frames needed. A lock has no timeout, so the holder's own request deadline is what
+// bounds the wait -- every path that takes the lock ends by releasing it, including the ones that
+// fail. On success the caller gets the tick to measure its own deadline from, after the wait.
 static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start)
 {
   frequency = counterFrequency ();
   if (frequency < 1000000ULL || frequency > 1000000000ULL) {
     frequency = 19200000ULL;
   }
-  // Round168: the hand-over bound was two seconds, which this card's own write phase can exceed.
-  // The r167 frame showed APFS reporting "disk5/disks: general error" and EIO on disk1 at fixed
-  // block numbers while a single checkpoint flush took 22.7 seconds: the waiting side was giving up
-  // and turning a healthy transfer into an error. The holder's own request deadline is bounded, so
-  // a waiter only has to outlast it; thirty seconds also covers the three-sample read check.
-  const uint64_t handover = frequency * 30ULL;
+  if (!gBlockLock) {
+    return false;
+  }
   const uint64_t waitStart = readCounter ();
+  IOLockLock (gBlockLock);
+  const uint64_t waited = readCounter () - waitStart;
+  // Round168: one line, once per boot. A frame that shows a long wait next to the APFS errors
+  // proves contention; a frame with no line and the same errors moves the wall back into the card.
   static bool guardReported = false;
-  bool reported = false;
-  for (;;) {
-    uint32_t expected = 0;
-    if (__atomic_compare_exchange_n (&gBlockGuard, &expected, 1u, false,
-                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-      start = readCounter ();
-      return true;
-    }
-    const uint64_t waited = readCounter () - waitStart;
-    // Round168: one line, once per boot. A frame that shows a long wait next to the APFS errors
-    // proves contention; a frame with no line and the same errors moves the wall back into the card.
-    if (!reported && !guardReported && waited > frequency / 4ULL) {
-      reported = true;
-      guardReported = true;
-      IOLog ("CloverSdhci r168: block guard waited %llu ms\n",
-             static_cast<unsigned long long> (waited * 1000ULL / frequency));
-    }
-    if (waited > handover) {
-      return false;
-    }
+  if (!guardReported && waited > frequency / 4ULL) {
+    guardReported = true;
+    IOLog ("CloverSdhci r168: block guard waited %llu ms\n",
+           static_cast<unsigned long long> (waited * 1000ULL / frequency));
+  }
+  start = readCounter ();
+  return true;
+}
+
+static void releaseBlockGuard (void)
+{
+  if (gBlockLock) {
+    IOLockUnlock (gBlockLock);
   }
 }
 
-// Round165's second half: the device itself proves the two read paths agree. The first 16 KiB
-// request reads the same run three ways -- two CMD18 batches and 32 CMD17 blocks -- and compares
-// the words. If the batch and the single-block path disagree, or two batches disagree with each
-// other, the batch is not trusted for the rest of the boot and every later read uses the
-// single-block sequence. The check costs one extra 32 KiB read and runs once per boot.
+// Round165's second half: the device itself proves the two read paths agree. The first multi-block
+// request reads the same run three ways -- two CMD18 batches and the same number of CMD17 blocks --
+// and compares the words. If the batch and the single-block path disagree, or two batches disagree
+// with each other, the batch is not trusted for the rest of the boot and every later read uses the
+// single-block sequence. The check costs one extra double read and runs once per boot.
+//
+// Round171 sizes the sample from the request that triggered it instead of from kReadChunkBlocks.
+// The r170 frame's reads are 16 KiB -- that is what APFS asks for -- and a gate that only opened on
+// a whole 64 KiB batch would never open, leaving the batch untrusted and the boot back on one
+// command per 512 bytes, which is the failure this round exists to remove.
 static uint32_t gCheckBatchA[kReadChunkBlocks * kBlockWords];
 static uint32_t gCheckBatchB[kReadChunkBlocks * kBlockWords];
 static uint32_t gCheckSingle[kReadChunkBlocks * kBlockWords];
 static bool gReadCheckDone = false;
 // Round167: starts untrusted; checkReadPath promotes it only when two CMD18 batches and the
-// block-by-block sequence agree over the same 16 KiB, so the first real request still reads
-// exactly like every round before r156.
+// block-by-block sequence agree word for word over the same run, so the first real request still
+// reads exactly like every round before r156.
 static bool gReadBatchTrusted = false;
 
 static uint32_t countWordDiff (const uint32_t *a, const uint32_t *b, uint32_t words,
@@ -1346,25 +1414,25 @@ static uint32_t countWordDiff (const uint32_t *a, const uint32_t *b, uint32_t wo
   return diff;
 }
 
-static void checkReadPath (uint32_t lba)
+static void checkReadPath (uint32_t lba, uint32_t sample)
 {
   gReadCheckDone = true;
-  const uint32_t words = kReadChunkBlocks * kBlockWords;
+  const uint32_t words = sample * kBlockWords;
   uint32_t gotA = 0, statusA = 0, gotB = 0, statusB = 0;
-  // Round168: the check runs on the first 16 KiB request of the boot, which can now arrive while
-  // the card is still programming. A single refusal here must not retire the batch for the whole
-  // boot, so each sample gets the same one clean retry the read loop uses.
-  bool batchA = readMultiBlock (lba, gCheckBatchA, kReadChunkBlocks, gotA, statusA);
+  // Round168: the check runs on the first multi-block request of the boot, which can now arrive
+  // while the card is still programming. A single refusal here must not retire the batch for the
+  // whole boot, so each sample gets the same one clean retry the read loop uses.
+  bool batchA = readMultiBlock (lba, gCheckBatchA, sample, gotA, statusA);
   if (!batchA) {
-    batchA = readMultiBlock (lba, gCheckBatchA, kReadChunkBlocks, gotA, statusA);
+    batchA = readMultiBlock (lba, gCheckBatchA, sample, gotA, statusA);
   }
-  bool batchB = readMultiBlock (lba, gCheckBatchB, kReadChunkBlocks, gotB, statusB);
+  bool batchB = readMultiBlock (lba, gCheckBatchB, sample, gotB, statusB);
   if (!batchB) {
-    batchB = readMultiBlock (lba, gCheckBatchB, kReadChunkBlocks, gotB, statusB);
+    batchB = readMultiBlock (lba, gCheckBatchB, sample, gotB, statusB);
   }
   bool single = true;
   uint32_t blocks = 0;
-  for (; blocks < kReadChunkBlocks; blocks++) {
+  for (; blocks < sample; blocks++) {
     uint32_t got = 0, status = 0;
     bool ok = readPioBlock (lba + blocks, gCheckSingle + blocks * kBlockWords, got, status);
     if (!ok || got != kBlockWords) {
@@ -1390,9 +1458,9 @@ static void checkReadPath (uint32_t lba)
   const bool trusted = batchA && batchB && single &&
                        gotA == words && gotB == words && diff == 0 && diffB == 0;
   gReadBatchTrusted = trusted;
-  IOLog ("CloverSdhci r167: readcheck lba=%u batch=%d/%d single=%d diff=%u/%u first=%u/%u "
-         "m=%08x s=%08x trusted=%d\n",
-         lba, batchA ? gotA : 0, batchB ? gotB : 0, single ? blocks : 0,
+  IOLog ("CloverSdhci r167: readcheck lba=%u sample=%u batch=%d/%d single=%d diff=%u/%u "
+         "first=%u/%u m=%08x s=%08x trusted=%d\n",
+         lba, sample, batchA ? gotA : 0, batchB ? gotB : 0, single ? blocks : 0,
          diff, diffB, first, firstB,
          gCheckBatchA[first < words ? first : 0],
          gCheckSingle[first < words ? first : 0],
@@ -1487,13 +1555,15 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
     // The card never said ready. Stop it explicitly, or every later read inherits the same state.
     abortReadTransfer ();
     reportReadFailure ("idle", lba, blocks, 0, 0);
-    __atomic_store_n (&gBlockGuard, 0, __ATOMIC_RELEASE);
+    releaseBlockGuard ();
     return 0;
   }
-  // Round165: the first request that is one full batch long proves batch and single-block reads
-  // agree before any caller relies on the batch.
-  if (!gReadCheckDone && blocks >= kReadChunkBlocks) {
-    checkReadPath (lba);
+  // Round165: the first request long enough to be a batch proves batch and single-block reads agree
+  // before any caller relies on the batch. Round171: "long enough" is the same four blocks the batch
+  // path itself demands, and the sample is the request's own length, so a boot whose biggest read is
+  // 16 KiB still gets its one check instead of waiting forever for a 64 KiB one.
+  if (!gReadCheckDone && blocks >= 4) {
+    checkReadPath (lba, blocks > kReadChunkBlocks ? kReadChunkBlocks : blocks);
   }
   // Round169: the request deadline covers the transfer, not the wait above or the one-shot check.
   start = readCounter ();
@@ -1555,7 +1625,7 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
     }
     done++;
   }
-  __atomic_store_n (&gBlockGuard, 0, __ATOMIC_RELEASE);
+  releaseBlockGuard ();
   return done;
 }
 
@@ -1741,16 +1811,25 @@ static bool writeMultiBlock (uint32_t lba, const uint32_t *words, uint32_t block
   bool clean = false;
   for (;;) {
     status = read32 (SDHCI_INT_STATUS);
-    if (status & (SDHCI_INT_DATA_END | SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
-                  SDHCI_INT_DATA_END_BIT | SDHCI_INT_ADMA_ERROR)) {
-      clean = (status & SDHCI_INT_DATA_END) && !(status & kDataErrorMask);
+    if (status & kContentErrorMask) {
+      break;
+    }
+    if (wordCount >= totalWords) {
+      if (status & SDHCI_INT_DATA_END) {
+        clean = true;
+      }
+      break;
+    }
+    // Round171: same early exit as the read drain -- an end bit beside an empty buffer port means
+    // the card stopped taking words, and the remaining deadline would be spent proving it.
+    if ((status & SDHCI_INT_DATA_END) &&
+        !(read32 (SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE)) {
       break;
     }
     if (readCounter () - start > deadline) {
       break;
     }
-    if (wordCount < totalWords &&
-        (read32 (SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE)) {
+    if (read32 (SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE) {
       write32 (SDHCI_BUFFER, words[wordCount++]);
     }
     if (++guard >= kCommandSpinLimit) {
@@ -1761,17 +1840,21 @@ static bool writeMultiBlock (uint32_t lba, const uint32_t *words, uint32_t block
          (read32 (SDHCI_PRESENT_STATE) & SDHCI_SPACE_AVAILABLE)) {
     write32 (SDHCI_BUFFER, words[wordCount++]);
   }
+  status = read32 (SDHCI_INT_STATUS);
+  const bool delivered = clean || batchDelivered (status, wordCount, totalWords);
   // Round167: a stop that never completed leaves the card in data mode, and every later command
   // would look like a fresh refusal. The old shape ignored this return value, so a wedged card
   // read exactly like a clean one until the next request timed out. Both a refused stop and a
   // dirty data phase now reset the host's data circuit before the caller retries.
+  //
+  // Round171 keeps the stop in the verdict: a batch whose words all went out but whose CMD12 was
+  // refused is a card still holding DAT0, and the caller would then be told "stored" about blocks
+  // the card may still be mid-stream on. The caller retries such a chunk from a reset circuit.
   const bool stopped = sendStopCommand ();
-  if (clean && stopped && wordCount == totalWords) {
+  if (delivered && stopped) {
     return true;
   }
-  if (!clean || !stopped) {
-    resetReadPath ();
-  }
+  resetReadPath ();
   return multiFailure (1, lba, blocks, status, wordCount, totalWords);
 }
 
@@ -1881,7 +1964,7 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
     }
     done++;
   }
-  __atomic_store_n (&gBlockGuard, 0, __ATOMIC_RELEASE);
+  releaseBlockGuard ();
   return done;
 }
 
@@ -2295,6 +2378,91 @@ static bool cardInTransfer (uint32_t &response, uint32_t &status, uint32_t &poll
   waitCardReady (response, status, polls);
   return (response & R1_READY_FOR_DATA) &&
          R1_CURRENT_STATE (response) == R1_STATE_TRAN;
+}
+
+// Round171: the two numbers bring-up reads from EXT_CSD and the block layer needs afterwards.
+// gCacheSize is the card's own write cache in 512-byte units (zero means the card has none, and a
+// flush of nothing is a success); gCacheOn records whether bring-up managed to switch it on, which
+// is what makes clover_emmc_flush_cache() a real commit rather than a command sent to a card that
+// was never caching.
+static volatile uint32_t gCacheSize = 0;
+static volatile uint32_t gCacheOn = 0;
+// How many commits actually completed this boot. CloverBlock prints it in its own reading line; a
+// frame that shows writes and zero flushes is a frame where the cache was never on.
+static volatile uint32_t gCacheFlushes = 0;
+
+// Round171: flush the card's write cache, then put it back on.
+//
+// r167 switched CACHE_CTRL off for the one reason it had: this driver never issued a flush, so a
+// cache left enabled was storage nobody committed, and every boot here ends in a hard reset. The
+// cost of that choice showed up in the r168 and later frames as the card's own programming time
+// landing inside every write -- the checkpoint flush r167 measured at 22.7 seconds had grown to
+// 102 and 122 seconds by r170, because with the cache off each 512-byte block is programmed before
+// the command that wrote it is answered. That is what an eMMC flush is *for*: the card batches the
+// writes and commits them while the host is doing something else.
+//
+// JEDEC gives the flush no command of its own. Writing zero to EXT_CSD byte 33 commits the cache
+// contents to media (R1b's DAT0 busy is the card doing it), which is why this function writes 0,
+// waits for the card to come back to transfer, and writes 1 again. The two CMD13 waits are the
+// proof; without them a switch the card is still working on looks like one that finished.
+//
+// Returns 1 when there was nothing to do or the commit completed, 0 when a step was refused. The
+// caller is CloverBlock::synchronize(), which turns that into the filesystem's sync error, so a
+// failure here has to be a number the frame can see rather than a silent success; the first one
+// prints.
+extern "C" uint32_t clover_emmc_flush_cache (void)
+{
+  if (!__atomic_load_n (&gBlockReady, __ATOMIC_ACQUIRE)) {
+    return 0;
+  }
+  if (!__atomic_load_n (&gCacheSize, __ATOMIC_ACQUIRE) ||
+      !__atomic_load_n (&gCacheOn, __ATOMIC_ACQUIRE)) {
+    return 1;
+  }
+  uint64_t frequency = 0;
+  uint64_t start = 0;
+  if (!acquireBlockGuard (frequency, start)) {
+    return 0;
+  }
+  uint32_t response = 0;
+  uint32_t status = 0;
+  uint32_t polls = 0;
+  const bool flushed = switchExtCsd (kExtCsdCacheCtrl, 0, response, status) &&
+                       cardInTransfer (response, status, polls);
+  uint32_t backResponse = 0;
+  uint32_t backStatus = 0;
+  uint32_t backPolls = 0;
+  const bool reenabled = switchExtCsd (kExtCsdCacheCtrl, 1, backResponse, backStatus) &&
+                         cardInTransfer (backResponse, backStatus, backPolls);
+  if (!flushed || !reenabled) {
+    static bool reported = false;
+    if (!reported) {
+      reported = true;
+      IOLog ("CloverSdhci r171: flush failed flushed=%d back=%d rsp=%08x st=%08x "
+             "polls=%u rsp2=%08x st2=%08x (once)\n",
+             flushed ? 1 : 0, reenabled ? 1 : 0, response, status, polls,
+             backResponse, backStatus);
+    }
+  } else {
+    __atomic_add_fetch (&gCacheFlushes, 1u, __ATOMIC_RELAXED);
+  }
+  releaseBlockGuard ();
+  return (flushed && reenabled) ? 1u : 0u;
+}
+
+// What CloverBlock prints next to its own read and write counts, so one frame can say "the cache
+// was on and committed N times" instead of leaving the reader to guess whether the switch took.
+extern "C" void clover_emmc_cache_stats (uint32_t *size, uint32_t *on, uint32_t *flushes)
+{
+  if (size) {
+    *size = __atomic_load_n (&gCacheSize, __ATOMIC_ACQUIRE);
+  }
+  if (on) {
+    *on = __atomic_load_n (&gCacheOn, __ATOMIC_ACQUIRE);
+  }
+  if (flushes) {
+    *flushes = __atomic_load_n (&gCacheFlushes, __ATOMIC_ACQUIRE);
+  }
 }
 
 // Stop the card clock, program the SDCC1 root clock, bring the card clock back and wait for the
@@ -3397,24 +3565,35 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             extOk21 = false;
           } else {
             gBlockSectors = extSectors21;
-            // Round167: the card's own write cache is the one place a completed write can sit
-            // without having reached the media, and nothing in this driver issues FLUSH_CACHE.
-            // Every boot here ends in a hard reset, so a checkpoint APFS believed durable could
-            // be torn; disabling the cache makes READY_FOR_DATA mean what writeSettled reads it
-            // as. A card with CACHE_SIZE zero has none, and one that already reports it off is
-            // left alone. The answer stays on the frame either way.
+            // Round167 switched the card's write cache off because nothing in this driver issued a
+            // flush, and every boot here ends in a hard reset: an uncommitted cache was storage
+            // nobody owned. Round171 pays for the flush instead of giving up the cache, because the
+            // reading that justified r167's caution turned out to be the cost of it -- the checkpoint
+            // flush that measured 22.7 s in the r167 frame measured 102 s and 122 s in r170's, each
+            // 512-byte block being programmed before its own write command is answered.
+            //
+            // The rule is unchanged in the one place that matters: a write is only counted as stored
+            // after writeSettled() sees READY_FOR_DATA in TRAN, and the cache is now committed at
+            // every CloverBlock::synchronize() and requestIdle(). A card that reports no
+            // CACHE_SIZE has nothing to switch and is left alone; one that already reports the
+            // cache on does not get switched a second time. Either way the answer stays on the
+            // frame.
             const uint32_t cacheSize = (gExtCsd[62] >> 8) | (gExtCsd[63] << 24);
             const uint32_t cacheCtrlBefore = (gExtCsd[8] >> 8) & 0xffu;
             uint32_t cacheRsp = 0, cacheStatus = 0, cachePolls = 0;
-            bool cacheOff = cacheCtrlBefore == 0;
-            if (cacheSize && !cacheOff) {
-              cacheOff = switchExtCsd (kExtCsdCacheCtrl, 0, cacheRsp, cacheStatus) &&
-                         cardInTransfer (cacheRsp, cacheStatus, cachePolls);
+            bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;
+            if (cacheSize && cacheCtrlBefore == 0) {
+              cacheOn = switchExtCsd (kExtCsdCacheCtrl, 1, cacheRsp, cacheStatus) &&
+                        cardInTransfer (cacheRsp, cacheStatus, cachePolls);
             }
-            IOLog ("CloverSdhci r167: write cache size=%u ctrl=%u off=%d rsp=%08x st=%08x\n",
-                   cacheSize, cacheCtrlBefore, cacheOff ? 1 : 0, cacheRsp, cacheStatus);
+            __atomic_store_n (&gCacheSize, cacheSize, __ATOMIC_RELEASE);
+            __atomic_store_n (&gCacheOn, cacheOn ? 1u : 0u, __ATOMIC_RELEASE);
+            IOLog ("CloverSdhci r171: write cache size=%u ctrl=%u on=%d rsp=%08x st=%08x\n",
+                   cacheSize, cacheCtrlBefore, cacheOn ? 1 : 0, cacheRsp, cacheStatus);
             clover_emmc_link[14] = cacheSize;
-            clover_emmc_link[15] = (cacheCtrlBefore << 8) | (cacheOff ? 1u : 0u);
+            // Bit 0 of this slot used to spell "the cache is off"; r171 flips the switch, so it now
+            // spells "the cache is on". The card's own previous setting stays in [15:8].
+            clover_emmc_link[15] = (cacheCtrlBefore << 8) | (cacheOn ? 1u : 0u);
             // Round159, after the geometry is known and before the device is handed up: switch
             // the link to high-speed 8-bit 50 MHz and prove it with LBA 1. A failure here is a
             // reading, not a boot failure -- the same card then serves the same reads at the
@@ -3440,7 +3619,17 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                    link21.width8 ? 1 : 0, link21.bwStatus,
                    link21.clockAfter, link21.hostControl,
                    link21.header0, link21.header1, fastOk21 ? 1 : 0);
-            __atomic_store_n (&gBlockReady, 1, __ATOMIC_RELEASE);
+            // Round171: the host is shared, and the sharing is now a lock rather than a spin flag.
+            // Allocate it before the device is published: a block device that cannot serialize its
+            // callers is worse than no block device, so the publication is what is gated here.
+            if (!gBlockLock) {
+              gBlockLock = IOLockAlloc ();
+            }
+            if (gBlockLock) {
+              __atomic_store_n (&gBlockReady, 1, __ATOMIC_RELEASE);
+            } else {
+              IOLog ("CloverSdhci r171: host lock allocation failed\n");
+            }
           }
         }
       }
