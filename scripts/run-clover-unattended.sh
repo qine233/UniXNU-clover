@@ -174,15 +174,14 @@ twrp=$(adb shell getprop ro.twrp.version 2>/dev/null | tr -d '\r')
 device=$(adb shell getprop ro.product.device 2>/dev/null | tr -d '\r')
 say "recovery: device=${device:-?} twrp=${twrp:-?}"
 
-# The log window is the first 64 sectors of logfs: 16 slots of two 512-byte blocks.
-# TWRP names partitions several ways across versions, so try the by-name links
-# and then the raw partition number the card reports (logfs = mmcblk0p39).
+# Round174 reads 128 sectors, not 64: the first 32 blocks are the report/panic slots, and the
+# driver's verdict ring starts at sector 64. One dd brings back everything the card was told.
 dump_ok=0
 for source in /dev/block/bootdevice/by-name/logfs /dev/block/by-name/logfs /dev/block/mmcblk0p39; do
   say "reading $source"
-  if adb exec-out "dd if=$source bs=512 count=64" > "$OUT" 2>/dev/null; then
+  if adb exec-out "dd if=$source bs=512 count=128" > "$OUT" 2>/dev/null; then
     size=$(wc -c < "$OUT" | tr -d ' ')
-    if [ "$size" = 32768 ] && [ "$(head -c 8 "$OUT")" = "UXNULOG1" ]; then
+    if [ "$size" = 65536 ] && [ "$(head -c 8 "$OUT")" = "UXNULOG1" ]; then
       dump_ok=1
       break
     fi
@@ -199,14 +198,20 @@ if [ "$DECODE" = 0 ]; then
 fi
 
 decoder="$(cd "$(dirname "$0")" && pwd)/read-clover-log.py"
-python3 "$decoder" "$OUT" | tee "$OUT.txt"
+{
+  echo "== report and panic window"
+  python3 "$decoder" "$OUT"
+  echo "== verdict ring (round174)"
+  python3 "$decoder" --verdict "$OUT" 2>/dev/null || echo "    no verdict records: this boot predates round174"
+} | tee "$OUT.txt"
 count=$(python3 "$decoder" --count "$OUT" 2>/dev/null || echo 0)
-say "decoded: $OUT.txt ($count record(s))"
+verdicts=$(python3 "$decoder" --verdict --count "$OUT" 2>/dev/null || echo 0)
+say "decoded: $OUT.txt ($count report record(s), $verdicts verdict line(s))"
 
 if [ "$REBOOT_BOOTLOADER" = 1 ]; then
   say "returning to fastboot (adb reboot bootloader)"
   adb reboot bootloader >/dev/null 2>&1 || warn "adb reboot bootloader failed"
 fi
 
-[ "$count" -gt 0 ] || exit 1
+[ "$count" -gt 0 ] || [ "$verdicts" -gt 0 ] || exit 1
 exit 0

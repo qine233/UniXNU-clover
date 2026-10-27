@@ -29,7 +29,8 @@ checkpoint flush 握着块守卫，把另一颗卷上的每一次读判成 EIO�
 映射页时 SIGBUS。round171 修那一次 flush，round172 修「每个字节都过 CPU」这件
 事本身：读通路现在有一条 ADMA2，靠逐字比较挣到信任。round173 把同一条通路交给写，
 但它只准重写自己刚读到的字节——先用 PIO 读回、再用 ADMA 写回同一批、再用 PIO 读回
-比对，而且只在 logfs 那 8 MiB 里做。
+比对，而且只在 logfs 那 8 MiB 里做。round174 不改通路，只改记录：驱动的每一句
+判据现在同时上屏和写进卡上的 verdict 环，读数不再依赖拍照的时机。
 
 ### 已完成（都有真机读数）
 
@@ -59,7 +60,8 @@ checkpoint flush 握着块守卫，把另一颗卷上的每一次读判成 EIO�
 | round166（v0.5.20） | exec 侧打印前八个签名 blob 的 `mo/off/size` 与头四字 | `clover r166: sig` 尚未上屏 |
 | round171（v0.5.27） | 批量读按「交付字数 + 内容错误位」判定（`st=0x21 w=1024/1024` 那种全量交付不再被丢回单块）；卡的写缓存打开并显式提交（CMD6 关→提交→开）；块守卫与批量缓冲从有界自旋改成 `IOLock`；批量 32 → 128 块，可信性闸门改为按请求取样 | 改动全部在 round172 镜像里，与下一行同一帧读 |
 | round172（v0.5.28） | 读通路加一条 ADMA2：描述符形状逐字节抄自本板 4.19 CAF 树（12 字节项、`cmd` 在前 `len` 在后、末项带 END 不加 NOP），数据落在本驱动自有的 64 KiB 连续 bounce（照 sheng `NativeUfs` 的四条物理地址检查与 `dc civac`/`dc ivac` 节奏）；同一个请求先走已信任的批量 PIO、再走 ADMA，**逐字相同才准用**，失败八次整轮退役 | 改动全部在 round173 镜像里，与下一行同一帧读 |
-| round173（v0.5.29） | 写通路也上 ADMA2，但只准重写自己刚读到的字节：闸门取 logfs 窗内第 4096 个扇区起的 16 块（离 panic 槽占的前 32 块很远），PIO 读回原字节 → 同样字节走 PIO 写一遍当对照 → ADMA 写回同一批 → PIO 再读回逐字比对，三份都对才 `trusted=1`；此后每个 ≥4 块的写请求先走 DMA，被拒就落回 r171 的 PIO 批量，八次退役。panic 屏与 bring-up 报告的两块写仍走 `writePioBlock`，不依赖本轮任何标志 | **已构建**，待冷刷 |
+| round173（v0.5.29） | 写通路也上 ADMA2，但只准重写自己刚读到的字节：闸门取 logfs 窗内第 4096 个扇区起的 16 块（离 panic 槽占的前 32 块很远），PIO 读回原字节 → 同样字节走 PIO 写一遍当对照 → ADMA 写回同一批 → PIO 再读回逐字比对，三份都对才 `trusted=1`；此后每个 ≥4 块的写请求先走 DMA，被拒就落回 r171 的 PIO 批量，八次退役。panic 屏与 bring-up 报告的两块写仍走 `writePioBlock`，不依赖本轮任何标志 | 改动全部在 round174 镜像里；r173 那些上不了屏的判据，这一轮起会写进卡上的环 |
+| round174（v0.5.30） | 判据写进卡上，不再只留在屏上：驱动里每一句 `CloverSdhci r…` 改走 `sdhciSay`——照常 `IOLog`，同时存进一个 32 槽 RAM 环；`flushVerdictRing` 在每个已经握着块守卫的传输尾巴上最多落 4 条（每条两个 512 字节 LOG1 块），写进 logfs 第 64 扇区起、离 panic 槽很远的 kind-21 环，头字段第 8 个字带序号，所以环转完一圈宿主仍能按先后读出。环满就覆盖最旧一条并计数，绝不阻塞；写用不加守卫的单块原语，因此不可能在失败的传输里再套一层等待。宿主侧 `read-clover-log.py` 解两个窗口、`--selftest` 与驱动逐字节往返，`check-clover.py` 把它当构建闸门 | **已构建**，待冷刷 |
 
 round171 + round172 + round173 一帧问九件事：`read guard` 是否整批消失（守卫只等、
 不拒），
@@ -70,6 +72,10 @@ round171 + round172 + round173 一帧问九件事：`read guard` 是否整批消
 落地；最后 `CloverSdhci r173: wrcheck … control=… dma=… diff=…/… trusted=` 与
 `first dma write … ms=`。前五件成立，launchd 的页才继续映射得进来；后四件给出
 536 与 `/data` 之前是否要先重排吞吐这一格的答案。
+
+round174 之后，这九件事不再取决于照片：`run-clover-unattended.sh` 一次拉 logfs 的
+128 个扇区，`read-clover-log.py --verdict` 按先后打印环里的判据。同一次冷刷里，
+panic 尾巴（前 32 扇区）和它之前的判据（第 64 扇区起）来自同一条启动，读的是同一张卡。
 
 ### 排期（未开始 · 已知限制）
 
@@ -87,7 +93,8 @@ round171 + round172 + round173 一帧问九件事：`read guard` 是否整批消
    读要批量 PIO 逐字相同才准用，写要 logfs 那 16 块读回原样才准用），
    `cap=742dc8b2` / `hcl=38` 证明这本来就是固件自己在用的通路。剩下的事实只有帧
    能给：`dmacheck … kbs=` 与 `wrcheck … kbs=` 那两对速率、
-   `write settle took … ms` 至今没被读到过，HS400/CQE 等这几行真的上屏再定。
+   以及至今没被读到过的 `write settle took … ms`——round174 起这几行会从卡上的
+   verdict 环里读出来，而不是等一张恰好拍到它的照片。HS400/CQE 等这几数真的落地再定。
    被闸门挡在 DMA 之外的还有 panic 屏与 bring-up 报告的两块写：最后那句话不该
    依赖本轮任何标志。
 8. **内核构建不可逐字节复现** — 每次 prelink UUID 不同；`verify-clover-payload.py`
@@ -207,7 +214,7 @@ Xcode 的 clang 在重建归档时不带 `-isysroot` 会拿 macOS SDK 编 iOS �
 
 ```sh
 python3 scripts/check-clover.py            # 板级预检（= [firmware] preflight）
-python3 scripts/verify-clover-payload.py   # 归档对镜像：21 项形状与探针断言
+python3 scripts/verify-clover-payload.py   # 归档对镜像：23 项形状与探针断言
 python3 scripts/verify-userdata-window.py  # 刷 userdata 前的宿主闸门（展开 sparse、SHNGROOT、APFS 只读挂载）
 ```
 
@@ -223,7 +230,9 @@ python3 scripts/verify-userdata-window.py  # 刷 userdata 前的宿主闸门（�
 `cs_enforcement_disable=1` 与 `debug-enabled = <1>` 必须在（AMFI 只在
 `PE_i_can_has_debugger()` 为真时接受那个参数），`clover-apfs = 3`，
 `packed_data_ramdisk` 为假，`trust_cache_sha256` 非空并与 bundle 文件一致；
-最后断言当前轮次的 `clover rNNN:` 探针形状与旧轮次复读形态的缺席。
+最后断言当前轮次的 `clover rNNN:` 探针形状与旧轮次复读形态的缺席，并真的执行一遍
+`read-clover-log.py --selftest`——驱动写环的形状和宿主解环的形状必须在同一道闸门
+上互相咬住，否则「卡上有记录」和「宿主读得出」会是两套说法。
 
 ## 上机
 
@@ -251,6 +260,9 @@ fastboot reboot
 - **`clover rNNN:` 内核 printf 探针**：每轮换号，`verify-clover-payload.py`
   断言新号在、旧号的复读形态不在。
 - **logfs**：`scripts/read-clover-log.py` 把内核环形缓冲拉回宿主。
+- **verdict 环**（round174 起）：同一张卡的 logfs 第 64 扇区起是 32 槽 kind-21 环，
+  驱动每句判据都落一份；头字段第 8 个字的序号让转圈的环仍按先后读，`--verdict`
+  打印，环满覆盖最旧一条并计数。屏会滚，卡不会。
 - **地址翻译**：`scripts/decode-clover-address.py --suspects` 出本镜像的
   tty/console 区间表。
 - **无人值守**：`clover-unattended=N` 的墙钟死线，把 panic 写进 IMEM

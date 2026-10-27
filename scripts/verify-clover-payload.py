@@ -382,6 +382,13 @@ WRITE_DMA_INTEGRITY = (
 EXEC_SIG_DUMP = "clover r166: sig n=%u mo=%lld off=%u size=%u w=%08x/%08x/%08x/%08x"
 
 
+# Round174 moves the reading off the panel: the driver's own verdict lines are written to the card as
+# kind 21 records, so a dd of logfs sector 64 upwards answers the round even if the screen scrolled
+# twelve lines ago. The armed line is the only string that round added, and it is the one the host
+# needs -- a dump with no verdict records has to say whether the ring was ever armed or never flushed.
+VERDICT_RING = ("CloverSdhci r174: verdict ring armed lba=",)
+
+
 def check_read_integrity(kernel: bytes) -> bool:
     """Every block read drains the FIFO first and resets the data path on failure; the batch is
     trusted only behind a three-way agreement and is now judged on delivered words rather than an end
@@ -394,6 +401,19 @@ def check_read_integrity(kernel: bytes) -> bool:
     label = "kernel.macho: eMMC read/write integrity"
     found = {name: name.encode() in kernel
              for name in READ_INTEGRITY + WRITE_INTEGRITY + DMA_INTEGRITY + WRITE_DMA_INTEGRITY}
+    ok = all(found.values())
+    detail = ", ".join(f"{name.split(':')[1].strip()} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
+def check_verdict_ring(kernel: bytes) -> bool:
+    """Round174 writes every CloverSdhci verdict line to logfs as a record of its own. Without the
+    armed line in the image, a host-side dd that finds no records cannot tell an unarmed ring from a
+    ring that armed and never got a request to finish."""
+    label = "kernel.macho: verdict ring linked"
+    found = {name: name.encode() in kernel for name in VERDICT_RING}
     ok = all(found.values())
     detail = ", ".join(f"{name.split(':')[1].strip()} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
@@ -744,6 +764,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_amfi_allow(kernel)
         ok &= check_dyld_cache_skip(kernel)
         ok &= check_read_integrity(kernel)
+        ok &= check_verdict_ring(kernel)
         ok &= check_exec_sig_dump(kernel)
         ok &= check_unattended(kernel)
         ok &= check_inline_asm_tails(kernel)

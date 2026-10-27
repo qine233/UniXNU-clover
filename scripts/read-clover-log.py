@@ -1,25 +1,38 @@
 #!/usr/bin/env python3
-"""Decode the clover logfs record window into readable text.
+"""Decode the clover logfs record windows into readable text.
 
 clover has no serial console, so the driver (drivers/CloverSdhci) and the panic
-screen keep their text on the card: drivers/CloverSdhci writes two 512-byte
-blocks per record at logfs start, and slot k lives at LBA first + 2k. The header
-block carries a magic, the LBA, the total byte count, a byte sum and the kind;
-the second block carries `PREFIX + body + "\\n"` as plain text, so the record can
-also be read on a machine that has never heard of this format.
+screen keep their text on the card: each record is two 512-byte blocks, a header
+and a text block that carries `PREFIX + body + "\\n"`, so the record can also be
+read on a machine that has never heard of this format.
+
+Two windows live in the partition:
+
+  report / panic window   sectors 0..31, 16 slots at first + 2k
+      kinds 17 (report overwrite), 19 (report append), 20 (panic screen)
+  verdict ring            sectors 64..127, 32 slots at first + 64 + 2k
+      kind 21, written by round174: the driver's own measurement lines, so a
+      reading no longer has to still be on the panel when the photo is taken.
+
+Header words:
 
   words[0] 0x554e5855  "UXNU"
   words[1] 0x31474f4c  "LOG1"
   words[2] absolute LBA of the header block
   words[3] total bytes of the text block: prefix + body + newline
   words[4] byte sum of those bytes, low 32 bits
-  words[5] kind: 17 = report (overwrite), 19 = report (append), 20 = panic screen
+  words[5] kind: 17, 19, 20 above, 21 = driver verdict line
   words[6] body length
   words[7] slot index
+  words[8] sequence number (kind 21 only; 0 in the report/panic records)
 
-Input is the first 64 sectors of logfs, which is what the recovery-side dd in
-scripts/run-clover-unattended.sh reads. A record whose header is present but
-whose text does not sum is still printed: a half-written panic is a reading.
+The sequence number is what makes a wrapped ring orderable: after the 33rd
+verdict, slot index and time diverge, so `--verdict` sorts by seq.
+
+Input is a dd of logfs from the card. The default window needs the first 64
+sectors; `--verdict` needs 128, which is what scripts/run-clover-unattended.sh
+now reads. A record whose header is present but whose text does not sum is still
+printed: a half-written record is a reading.
 """
 import argparse
 import struct
@@ -28,34 +41,41 @@ from pathlib import Path
 
 PREFIX = b"unixnu clover emmc log\n"
 MAGIC = (0x554E5855, 0x31474F4C)  # "UXNU", "LOG1" in memory order
-SLOTS = 16
-SLOT_BYTES = 1024
-KINDS = {17: "report-17", 19: "report-19", 20: "panic-20"}
+SECTOR = 512
+SLOT_BYTES = 2 * SECTOR
+REPORT_SLOTS = 16
+VERDICT_SLOTS = 32
+VERDICT_OFFSET = 64   # sectors past logfs start, clear of the report/panic blocks
+KINDS = {17: "report-17", 19: "report-19", 20: "panic-20", 21: "verdict-21"}
 
 
-def decode(data, first_lba):
-    """[(slot, header dict, text bytes or None, problems [str])] in slot order."""
+def decode(data, first_lba, slots=REPORT_SLOTS, base_sector=0):
+    """[(slot, header dict, text bytes or None, problems [str])] in slot order.
+
+    The writers scan forward and stop at the first header without the magic, so a
+    gap ends the window: later slots are not records of this boot.
+    """
     records = []
-    for slot in range(SLOTS):
-        base = slot * SLOT_BYTES
+    for slot in range(slots):
+        base = (base_sector + 2 * slot) * SECTOR
         block = data[base:base + SLOT_BYTES]
         if len(block) < SLOT_BYTES:
             break
-        magic0, magic1, lba, total, checksum, kind, body, slot_word = struct.unpack_from("<8I", block)
+        magic0, magic1, lba, total, checksum, kind, body, slot_word, seq = \
+            struct.unpack_from("<9I", block)
         if (magic0, magic1) != MAGIC:
-            # The writer scans forward and stops at the first header without the
-            # magic, so a gap ends the window: later slots are not records.
             break
         problems = []
-        if lba != first_lba + 2 * slot:
-            problems.append(f"lba {lba} != {first_lba + 2 * slot}")
+        want_lba = first_lba + base_sector + 2 * slot
+        if lba != want_lba:
+            problems.append(f"lba {lba} != {want_lba}")
         if slot_word != slot:
             problems.append(f"slot word {slot_word} != {slot}")
         if body > 480:
             problems.append(f"body {body} > 480")
         if total != len(PREFIX) + body + 1:
             problems.append(f"total {total} != {len(PREFIX) + body + 1}")
-        text = block[512:]
+        text = block[SECTOR:]
         text_ok = True
         if not text.startswith(PREFIX):
             text_ok = False
@@ -77,6 +97,7 @@ def decode(data, first_lba):
             "sum": checksum,
             "kind": kind,
             "body": body,
+            "seq": seq,
             "text_ok": text_ok,
         }, content, problems))
     return records
@@ -88,38 +109,17 @@ def text_of(content):
     return bytes(byte if 0x09 <= byte < 0x7F else 0x2E for byte in content).decode("ascii")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("dump", nargs="?", default="clover-logfs.bin",
-                        help="first 64 sectors of logfs (default: clover-logfs.bin)")
-    parser.add_argument("--first-lba", type=lambda value: int(value, 0), default=12320768,
-                        help="logfs first LBA (default 12320768, the card's p39)")
-    parser.add_argument("--count", action="store_true",
-                        help="print the number of records and exit (for scripts)")
-    parser.add_argument("--newest", action="store_true",
-                        help="print only the newest record")
-    args = parser.parse_args()
-
-    path = Path(args.dump)
-    if not path.is_file():
-        raise SystemExit(f"no dump at {path}")
-    data = path.read_bytes()
-    if len(data) < SLOT_BYTES:
-        raise SystemExit(f"{path} is {len(data)} bytes; the first slot alone is {SLOT_BYTES}")
-    records = decode(data, args.first_lba)
-    if args.count:
-        print(len(records))
-        return 0 if records else 1
-    if not records:
-        print(f"{path}: no records (no LOG1 magic at slot 0)", file=sys.stderr)
-        return 1
-    if args.newest:
+def report(records, newest_only=False, order_by_seq=False):
+    """Print records the way both windows are read. Returns the number printed."""
+    if order_by_seq and records:
+        # A ring that wrapped has its oldest record at the highest slot and the
+        # newest at the lowest; the sequence stamp is the only time order left.
+        records = sorted(records, key=lambda record: record[1]["seq"])
+    if newest_only:
         records = records[-1:]
-
     for slot, header, content, problems in records:
         verdict = "ok" if not problems else "BAD (" + "; ".join(problems) + ")"
-        print(f"slot {slot}  lba {header['lba']}  kind {header['kind']} "
+        print(f"slot {slot}  lba {header['lba']}  seq {header['seq']}  kind {header['kind']} "
               f"({KINDS.get(header['kind'], 'unknown')})  body {header['body']}  "
               f"sum {header['sum']:#010x}  {verdict}")
         if content is not None:
@@ -129,6 +129,107 @@ def main():
         else:
             print("    <no readable text block>")
         print()
+    return len(records)
+
+
+def build_record(kind, slot, lba, body_text, seq=0):
+    """One two-block record exactly as the driver lays it out, for selftest."""
+    body = body_text.encode("ascii")
+    total = len(PREFIX) + len(body) + 1
+    checksum = (sum(PREFIX) + sum(body) + ord("\n")) & 0xFFFFFFFF
+    header = struct.pack("<9I", MAGIC[0], MAGIC[1], lba, total, checksum, kind,
+                         len(body), slot, seq) + bytes(SECTOR - 36)
+    text = PREFIX + body + b"\n"
+    return header + text.ljust(SECTOR, b"\0")
+
+
+def selftest():
+    """Round-trip both windows, including a wrapped verdict ring. The ring is new
+    in round174 and its reader is the only thing that turns a boot into a number,
+    so the shape is asserted here rather than trusted from a device frame."""
+    first_lba = 12320768
+    dump = bytearray()
+    dump += build_record(19, 0, first_lba, "bring-up report")
+    dump += build_record(20, 1, first_lba + 2, "panic line")
+    dump += bytes((VERDICT_OFFSET - 4) * SECTOR)          # gap before the ring: not records
+    expected = ["wrcheck lba=12324864 blocks=16 trusted=1",
+                "readcheck lba=12320768 sample=32 trusted=1",
+                "block guard waited 31 ms"]
+    for index, line in enumerate(expected):
+        # Slots 0..2 with seq 5..7: a ring that wrapped, so slot order is not time order.
+        slot = index
+        lba = first_lba + VERDICT_OFFSET + 2 * slot
+        dump += build_record(21, slot, lba, line, seq=5 + index)
+    data = bytes(dump)
+
+    reports = decode(data, first_lba)
+    assert len(reports) == 2, reports
+    assert [r[1]["kind"] for r in reports] == [19, 20], reports
+    assert all(not r[3] for r in reports), reports
+    assert text_of(reports[0][2]) == "bring-up report", reports[0]
+
+    verdicts = decode(data, first_lba, slots=VERDICT_SLOTS, base_sector=VERDICT_OFFSET)
+    assert len(verdicts) == 3, verdicts
+    assert all(v[1]["kind"] == 21 for v in verdicts), verdicts
+    assert all(not v[3] for v in verdicts), verdicts
+    ordered = sorted(verdicts, key=lambda v: v[1]["seq"])
+    assert [text_of(v[2]) for v in ordered] == expected, ordered
+    assert ordered[0][1]["seq"] == 5, ordered[0]
+
+    # A record that does not sum is still printed, with the mismatch named -- and so is a
+    # half-written one whose text block lost the prefix, because both are readings.
+    for offset, expect in ((SECTOR + len(PREFIX) + 1, "sum"), (SECTOR, "prefix missing")):
+        broken = bytearray(bytes(VERDICT_OFFSET * SECTOR) +
+                           build_record(21, 0, first_lba + VERDICT_OFFSET, "line", seq=1))
+        broken[VERDICT_OFFSET * SECTOR + offset] = ord("X")
+        problems = decode(bytes(broken), first_lba,
+                          slots=VERDICT_SLOTS, base_sector=VERDICT_OFFSET)[0][3]
+        assert any(problem.startswith(expect) for problem in problems), (expect, problems)
+    print("read-clover-log selftest: report window, verdict ring, wrap order and bad records all ok")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("dump", nargs="?", default="clover-logfs.bin",
+                        help="logfs sectors from the card (default: clover-logfs.bin)")
+    parser.add_argument("--first-lba", type=lambda value: int(value, 0), default=12320768,
+                        help="logfs first LBA (default 12320768, the card's p39)")
+    parser.add_argument("--verdict", action="store_true",
+                        help="read the round174 verdict ring instead (sectors 64..127)")
+    parser.add_argument("--count", action="store_true",
+                        help="print the number of records and exit (for scripts)")
+    parser.add_argument("--newest", action="store_true",
+                        help="print only the newest record")
+    parser.add_argument("--selftest", action="store_true",
+                        help="round-trip both windows in memory and exit (no card needed)")
+    args = parser.parse_args()
+
+    if args.selftest:
+        return selftest()
+
+    path = Path(args.dump)
+    if not path.is_file():
+        raise SystemExit(f"no dump at {path}")
+    data = path.read_bytes()
+    if len(data) < SLOT_BYTES:
+        raise SystemExit(f"{path} is {len(data)} bytes; the first slot alone is {SLOT_BYTES}")
+    if args.verdict:
+        need = (VERDICT_OFFSET + 2 * VERDICT_SLOTS) * SECTOR
+        if len(data) < need:
+            raise SystemExit(f"{path} is {len(data)} bytes; the verdict ring needs {need}")
+        records = decode(data, args.first_lba, slots=VERDICT_SLOTS, base_sector=VERDICT_OFFSET)
+    else:
+        records = decode(data, args.first_lba)
+    if args.count:
+        print(len(records))
+        return 0 if records else 1
+    if not records:
+        window = "verdict ring" if args.verdict else "report window"
+        print(f"{path}: no records ({window} slot 0 has no LOG1 magic)", file=sys.stderr)
+        return 1
+    report(records, newest_only=args.newest, order_by_seq=args.verdict)
     return 0
 
 

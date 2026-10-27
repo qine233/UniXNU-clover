@@ -12499,3 +12499,71 @@ flush` 是否从 102/120 秒掉回毫秒、`multi read fail … st=0x21 w=1024/1
 `dma=` 哪个是 0，决定下一步是修介质还是修通路；`trusted=1` 之后 `first dma write … ms=` 与
 `wrcheck … kbs=` 是本端口第一份诚实的写吞吐。前五件成立，launchd 的页才继续映射得进来；
 后四件给出 536 与 `/data` 之前是否要先重排吞吐这一格的答案。
+
+## round174（v0.5.30）：判据写进卡上，不再只留在屏上
+
+round171、172、173 一帧要问九件事，但连着三轮的照片都在同一处失信：决定性的那一行
+滚出了面板。round167 丢了 `write cache … off=`，round169 丢了整套 `read <stage>`，
+round170 的面板被 `clover r153: check_np` 的复读占满，于是「launchd 在循环还是在前进」
+只能靠 pid 和 `t=` 猜。这一轮不动通路、不动时序、不动几何，只把记录这件事做对：
+驱动说的每一句话，屏上一份，卡上一份。
+
+写卡的位置不能随地说。块守卫 `gBlockLock` 是一把 `IOLock`，而判据恰恰是在一次失败的
+传输里产生的——在持锁的路径上再套一次块读写，等于给这一轮新增一种挂法。所以形态是：
+
+- **RAM 环先接住**。`sdhciSay` 把格式化好的行 `IOLog` 出去，同时存进 32 槽
+  `gVerdictText`；环满就覆盖最旧一条并把 `gVerdictDropped` 加一，记录本身不阻塞、
+  不等卡、不拿锁。
+- **尾巴上落盘**。`flushVerdictRing` 只在已经握着块守卫的三个尾巴上调用（读尾巴、
+  写尾巴、cache flush 尾巴），每次最多写 4 条（`kVerdictFlushPerPass`），每条两个
+  512 字节块。写用的是不加守卫的 `writePioBlock`——和 `clover_emmc_panic_append`
+  同一个理由：这条路已经在守卫里，不能反过来再要守卫。
+- **窗口不抢**。kind-21 环从 logfs 第 64 个扇区起（`kVerdictOffset`），panic 槽占的是
+  前 32 块，round173 的写闸门取样在第 4096 扇区，三者互不相干。头字段第 8 个字是序号
+  `gVerdictSeq`，所以环转过一圈之后宿主仍能按先后排。
+- **一条格式化器，两个去处**。这套驱动头里没有 `vsnprintf` 的声明，sheng 也没先例，
+  所以 `verdictFormat` 手写：只支持实际用到的 `%s %p %d %u %x`（含 `%08x`、`%02x`、
+  `%llx`、`%llu`）与 `l`/`ll` 宽度和 `0` 填充，不认的说明符原样吐出。`verdictPut`
+  写满时返回原指针而不是 `p + 1`，否则游标会一路越过 `end`。
+
+驱动里 36 处 `IOLog ("CloverSdhci r…` 全部换成 `sdhciSay`；`check-clover.py` 现在
+反向断言「`IOLog ("CloverSdhci r` 一句不许有」，并要求 `sdhciSay ("CloverSdhci r`
+至少 30 处——判据要么两路都走，要么就别算是判据。`IOLog ("clover r148: unattended…`
+那三行是无人值守的，故意不动。
+
+宿主侧同步换向。`read-clover-log.py` 现在解两个窗口：`decode(data, first_lba, slots,
+base_sector)` 按 `<9I>`  unpack 并逐条核对 LBA，`--verdict` 只打环、按序号排 oldest
+first，坏和成不丢弃而是点名（字节和不对是 `sum`，文本块首字节不对是 `prefix missing`）。
+`--selftest` 用驱动完全一样的头布局造记录，往返报告窗、verdict 环、跨圈顺序和被弄坏的
+两条，`check-clover.py` 把它当闸门真的执行一遍——否则「卡上写得出」和「宿主读得回」
+会是两套各说各话的形状。`run-clover-unattended.sh` 一次 `dd bs=512 count=128`，
+分两节打印，`no verdict records` 从此只意味着这条启动早于 round174。
+
+`verify-clover-payload.py` 新增 `kernel.macho: verdict ring linked`：镜像里必须有
+`CloverSdhci r174: verdict ring armed lba=`——这条串是装弹的自证，环没armed 就等于
+这一轮的记录通道根本没开。`board.toml` 标题升到
+`clover r174: the readings go on the card, not just the panel`。
+
+构建：先逆撤 `zzy-clover-dyld-cache-skip`，`python3 scripts/build-arm-driver.py
+CloverSdhci` 过 `-Werror` 与 ARM64/iOS 17 目标文件审计（文件现在 6057 行）；内核
+`d9190906d5be49b5…`（52,043,776 字节），AMFI 拷贝 `0147cae2e9de200a…`（站点
+`0x1a880e4` → `0x14000011`、`0x1a8816c` → `0xd503201f`，仍是 round171 起那两处），
+payload `680d3b3b10c4ae67…`（56 MiB，58,720,256 字节），卷内 kernel `c8dfe827296fde13…`、
+`unixnu.toml` `06b38464b859b61e…`（标题变了所以变了）、ADT `2a125a477576c539…`、
+`scratch-data.img` `614b8356…`（未变）、trustcache `7c369ce0…`（未变）。入口探针
+`6843 bytes in 37 runs`——本轮没往内核加探针，与 round172/173 一致。两个 checker
+与 `verify-clover-payload.py` 23 项全 OK。
+
+代价写在 `porting.toml` 的 storage `limits` 里：一次尾巴最多八个块写，所以一次请求都
+没走到尾巴的启动不会往卡上写任何东西（armed 那行仍在屏上，是判据）；环满丢最旧一条，
+丢的是行不是卡。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round174-payload.img
+fastboot reboot
+```
+
+刷完不再拍照读面板：设备进 recovery 后 `scripts/run-clover-unattended.sh` 把 128 个
+logfs 扇区拉回宿主，`read-clover-log.py --verdict` 按先后给出这一整轮启动的判据。

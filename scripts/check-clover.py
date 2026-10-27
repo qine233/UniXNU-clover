@@ -1187,10 +1187,10 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round173. The menu has to name the round under test: this round's whole result is one line the
-    # frame either has or does not have.
-    if not board["payload"]["title"].startswith("clover r173:"):
-        errors.append('[payload] title is not "clover r173: ...": the menu would not name this round')
+    # Round174. The menu has to name the round under test: the payload and its readings have to agree
+    # about which round is on the card, or an image would be claiming a round it does not run.
+    if not board["payload"]["title"].startswith("clover r174:"):
+        errors.append('[payload] title is not "clover r174: ...": the menu would not name this round')
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -1282,7 +1282,7 @@ def check_board(errors: list) -> str:
         if "CloverSdhci r168: read gave up" in text:
             errors.append(f"{sdhci.name} still prints the read give-up once per boot")
         # The batch is only trusted on a three-way agreement, never unconditionally.
-        if "gReadBatchTrusted = false;\n  IOLog (\"CloverSdhci r167: readcheck" in text:
+        if "gReadBatchTrusted = false;\n  sdhciSay (\"CloverSdhci r167: readcheck" in text:
             errors.append(f"{sdhci.name} still retires the batch unconditionally: r166 proved the "
                           "batch was not the corrupt reader")
         # The 160 us pacing must not survive in the write path (mode 12's identification read
@@ -1507,6 +1507,82 @@ def check_board(errors: list) -> str:
         if panic_body.count("writePioBlock (") < 2:
             errors.append("clover_emmc_panic_append no longer writes its two blocks through PIO: "
                           "the last line of a dying boot would depend on this round's flag")
+
+    # Round174. The reading is the deliverable, and for nine rounds the deliverable has been a
+    # photograph of a panel that had already scrolled: r167 lost `write cache ... off=`, r169 lost the
+    # `read <stage>` lines, r170 exists because one probe's own repetition filled the screen and left a
+    # whole frame unable to say whether launchd was looping. So this round gives every line the driver
+    # measures a second copy on the card -- kind 21 records in a 32-slot ring at logfs sector 64, clear
+    # of the 32 blocks the panic writer owns -- and `read-clover-log.py --verdict` reads them back from
+    # the same dd that brings the panic text. Saying something costs a format plus a memcpy: the card
+    # write happens only from the three request tails that already hold the block guard with an idle
+    # card, four records at a time, because a flush that held the guard is the failure r167 r168 r169
+    # spent themselves removing. One formatter runs, and the screen and the card cannot disagree.
+    sdhci_r174 = next((base / "drivers/CloverSdhci/CloverSdhci.cpp"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "drivers/CloverSdhci/CloverSdhci.cpp").is_file()), None)
+    if sdhci_r174 is not None:
+        text = sdhci_r174.read_text()
+        for needle in ("#include <stdarg.h>",
+                       "static const uint32_t kVerdictSlots = 32;",
+                       "static const uint32_t kVerdictOffset = 64;",
+                       "static const uint32_t kVerdictFlushPerPass = 4;",
+                       "static uint32_t verdictFormat (char *out, uint32_t cap, const char *fmt, va_list args)",
+                       "static void sdhciSay (const char *fmt, ...)",
+                       "static bool verdictWriteRecord (const char *text, uint32_t length)",
+                       "static void flushVerdictRing (void)",
+                       "gVerdictBlock[5] = 21;",
+                       "gVerdictBlock[8] = gVerdictSeq;",
+                       "const uint32_t lba = gVerdictFirst + kVerdictOffset +",
+                       'IOLog ("%s\\n", line);',
+                       "gVerdictFirst = entryFirst14;",
+                       "gVerdictReady = 1;"):
+            if needle not in text:
+                errors.append(f"{sdhci_r174.name} lacks {needle[:44]}...: round174's formatter, its "
+                              "kind 21 record, or the arming that lets a verdict reach the card is gone")
+        # A verdict printed only to the panel is a verdict that has to win a race with the next line.
+        if "IOLog (\"CloverSdhci r" in text:
+            errors.append(f"{sdhci_r174.name} still prints a CloverSdhci reading to the panel alone: "
+                          "the line would exist in one place only, which is the failure this round ends")
+        ring_lines = text.count('sdhciSay ("CloverSdhci r')
+        if ring_lines < 30:
+            errors.append(f"{sdhci_r174.name} routes only {ring_lines} "
+                          "verdict lines through the ring; every line the driver measures has to go")
+        # Three tails, and only tails that already hold the guard.
+        if text.count("flushVerdictRing ();") < 3:
+            errors.append(f"{sdhci_r174.name} flushes the verdict ring from fewer than three guarded "
+                          "request tails: a boot that never reaches them keeps its readings in RAM only")
+        if "gVerdictBusy" not in text:
+            errors.append(f"{sdhci_r174.name} lost the re-entrancy flag: a nested flush would write one "
+                          "record twice from two owners of the same scratch block")
+    reader = next((base / "scripts/read-clover-log.py"
+                   for base in (REPO, pathlib.Path.cwd())
+                   if (base / "scripts/read-clover-log.py").is_file()), None)
+    if reader is None:
+        errors.append("scripts/read-clover-log.py is missing: nothing would read the verdict ring back")
+    else:
+        text = reader.read_text()
+        for needle in ('21: "verdict-21"', "VERDICT_OFFSET = 64", "VERDICT_SLOTS = 32",
+                       '"--verdict"', 'struct.unpack_from("<9I", block)',
+                       "order_by_seq=args.verdict", "def selftest()"):
+            if needle not in text:
+                errors.append(f"{reader.name} lacks {needle[:40]}...: the ring's slots, its sequence "
+                              "order after a wrap, or its own round-trip test would be missing")
+        if reader.is_file():
+            check = subprocess.run([sys.executable, str(reader), "--selftest"],
+                                   capture_output=True, text=True)
+            if check.returncode:
+                errors.append("read-clover-log.py --selftest failed: the decoder and the driver's "
+                              "record layout no longer agree\n" + (check.stdout + check.stderr)[-700:])
+    unattended = next((base / "scripts/run-clover-unattended.sh"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "scripts/run-clover-unattended.sh").is_file()), None)
+    if unattended is not None:
+        text = unattended.read_text()
+        for needle in ("bs=512 count=128", "--verdict", "verdict line(s)"):
+            if needle not in text:
+                errors.append(f"{unattended.name} lacks {needle[:32]}...: the dd would stop short of "
+                              "sector 64 and the verdict ring would never be read")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())

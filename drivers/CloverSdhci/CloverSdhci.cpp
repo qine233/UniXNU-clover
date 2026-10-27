@@ -203,6 +203,7 @@
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 #include <kern/debug.h>
+#include <stdarg.h>
 #include "SdhciRegs.h"
 
 extern "C" {
@@ -300,6 +301,44 @@ static const uint32_t kLogPrefixLength = sizeof (kLogPrefix) - 1;
 static const uint32_t kLogMagic0 = 0x554e5855u;
 static const uint32_t kLogMagic1 = 0x31474f4cu;
 static const uint32_t kLogSlots = 16;
+// Round174: the verdict ring. Every round since r165 has had the same ending -- the one line that
+// decides the next round was on the screen for a moment and then scrolled off, so a frame came back
+// with `disk5: general error` but not `write cache ... off=`, or with the panic but not the
+// `dmacheck` that would have explained it. The card already has a place for text (the two-block
+// records above), so this round stops asking the panel to hold a reading: the driver's verdict lines
+// are written as records of their own, in a ring that starts at sector 64 -- past the 32 blocks the
+// panic writer owns -- and `read-clover-log.py` reads the whole window in one dd. The ring is 32
+// records, so a boot that reaches every verdict still fits, and the writer wraps rather than
+// refusing: the newest line is the one that matters, and a wrap is visible as a slot index jump.
+// The RAM ring is what a verdict line goes to first. Writing the card from the place that decided
+// the line would mean issuing two block writes in the middle of the failed transfer that produced
+// it -- a second owner for a host with one command engine, and a new way to hang a boot. So saying
+// something costs a memcpy, and the card is written only from a path that already holds the block
+// guard (the tails of the read, write and cache-flush requests). Until that happens the reading
+// lives in memory, which is also where the panel-less panic screen reads nothing but the host sees
+// it anyway. The ring is 32 records of 320 bytes and overwrites its oldest entry, so the newest
+// verdict is never the one that gets dropped.
+static const uint32_t kVerdictSlots = 32;
+static const uint32_t kVerdictTextBytes = 320;
+static const uint32_t kVerdictOffset = 64;   // sectors past logfs start, clear of the panic blocks
+static const uint32_t kVerdictFlushPerPass = 4;   // two blocks each; a flush must not hold the guard long
+static char gVerdictText[kVerdictSlots][kVerdictTextBytes];
+static uint32_t gVerdictLength[kVerdictSlots];
+static volatile uint32_t gVerdictReady = 0;
+static uint32_t gVerdictFirst = 0;
+static uint32_t gVerdictWrite = 0;      // next RAM slot to fill
+static uint32_t gVerdictPending = 0;    // RAM slots holding text not yet on the card
+static uint32_t gVerdictDropped = 0;    // records the ring overwrote before they could flush
+static uint32_t gVerdictCursor = 0;     // card slot counter; card slot = cursor % kVerdictSlots
+static uint32_t gVerdictSeq = 0;        // stamped in header word 8 so a wrapped ring stays ordered
+static uint32_t gVerdictWritten = 0;
+static volatile uint32_t gVerdictBusy = 0;
+
+// Both are declared here because the first verdict line is printed well below the definition; the
+// round174 section installs them. sdhciSay is the driver's only way of speaking to a reading: it
+// formats once and hands the same string to the panel and to the RAM ring.
+static void sdhciSay (const char *fmt, ...);
+static void flushVerdictRing (void);
 
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
@@ -1171,7 +1210,7 @@ static bool multiFailure (unsigned which, uint32_t lba, uint32_t blocks, uint32_
   static bool reported[2];
   if (!reported[which]) {
     reported[which] = true;
-    IOLog ("CloverSdhci r159: multi %s fail lba=%u blocks=%u st=0x%x w=%u/%u (once)\n",
+    sdhciSay ("CloverSdhci r159: multi %s fail lba=%u blocks=%u st=0x%x w=%u/%u (once)\n",
            which ? "write" : "read", lba, blocks, status, words, total);
   }
   return false;
@@ -1277,7 +1316,7 @@ static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
       static bool stopReported = false;
       if (!stopReported) {
         stopReported = true;
-        IOLog ("CloverSdhci r171: batch stop refused lba=%u blocks=%u (once)\n", lba, blocks);
+        sdhciSay ("CloverSdhci r171: batch stop refused lba=%u blocks=%u (once)\n", lba, blocks);
       }
       sendStopCommand ();
     }
@@ -1366,7 +1405,7 @@ static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start)
   static bool guardReported = false;
   if (!guardReported && waited > frequency / 4ULL) {
     guardReported = true;
-    IOLog ("CloverSdhci r168: block guard waited %llu ms\n",
+    sdhciSay ("CloverSdhci r168: block guard waited %llu ms\n",
            static_cast<unsigned long long> (waited * 1000ULL / frequency));
   }
   start = readCounter ();
@@ -1458,7 +1497,7 @@ static void checkReadPath (uint32_t lba, uint32_t sample)
   const bool trusted = batchA && batchB && single &&
                        gotA == words && gotB == words && diff == 0 && diffB == 0;
   gReadBatchTrusted = trusted;
-  IOLog ("CloverSdhci r167: readcheck lba=%u sample=%u batch=%d/%d single=%d diff=%u/%u "
+  sdhciSay ("CloverSdhci r167: readcheck lba=%u sample=%u batch=%d/%d single=%d diff=%u/%u "
          "first=%u/%u m=%08x s=%08x trusted=%d\n",
          lba, sample, batchA ? gotA : 0, batchB ? gotB : 0, single ? blocks : 0,
          diff, diffB, first, firstB,
@@ -1466,9 +1505,9 @@ static void checkReadPath (uint32_t lba, uint32_t sample)
          gCheckSingle[first < words ? first : 0],
          trusted ? 1 : 0);
   if (trusted) {
-    IOLog ("CloverSdhci r167: batch reads trusted for this boot\n");
+    sdhciSay ("CloverSdhci r167: batch reads trusted for this boot\n");
   } else {
-    IOLog ("CloverSdhci r167: single-block reads for this boot\n");
+    sdhciSay ("CloverSdhci r167: single-block reads for this boot\n");
   }
 }
 
@@ -1491,7 +1530,7 @@ static bool waitCardIdle (uint64_t frequency)
     const uint64_t waited = readCounter () - start;
     if (!reported && waited > frequency / 4ULL) {
       reported = true;
-      IOLog ("CloverSdhci r169: card busy %llu ms\n",
+      sdhciSay ("CloverSdhci r169: card busy %llu ms\n",
              static_cast<unsigned long long> (waited * 1000ULL / frequency));
     }
     if (waited > bound) {
@@ -1506,7 +1545,7 @@ static bool waitCardIdle (uint64_t frequency)
     const uint64_t waited = readCounter () - start;
     if (!reported && waited > frequency / 4ULL) {
       reported = true;
-      IOLog ("CloverSdhci r169: card busy %llu ms\n",
+      sdhciSay ("CloverSdhci r169: card busy %llu ms\n",
              static_cast<unsigned long long> (waited * 1000ULL / frequency));
     }
     if ((response & R1_READY_FOR_DATA) && R1_CURRENT_STATE (response) == R1_STATE_TRAN) {
@@ -1529,7 +1568,7 @@ static void reportReadFailure (const char *stage, uint32_t lba, uint32_t blocks,
     return;
   }
   reported++;
-  IOLog ("CloverSdhci r169: read %s lba=%u blocks=%u done=%u st=%08x\n",
+  sdhciSay ("CloverSdhci r169: read %s lba=%u blocks=%u done=%u st=%08x\n",
          stage, lba, blocks, done, status);
 }
 
@@ -1632,7 +1671,7 @@ static bool dmaBringUp (void)
   gAdma.tried = true;
   const uint32_t cap = read32 (SDHCI_CAPABILITIES);
   if (!(cap & SDHCI_CAN_DO_ADMA2)) {
-    IOLog ("CloverSdhci r172: host has no ADMA2, cap=%08x\n", cap);
+    sdhciSay ("CloverSdhci r172: host has no ADMA2, cap=%08x\n", cap);
     return false;
   }
   gAdma.wide = (cap & SDHCI_CAN_64BIT) != 0;
@@ -1644,7 +1683,7 @@ static bool dmaBringUp (void)
   gAdma.table = IOBufferMemoryDescriptor::inTaskWithOptions (kernel_task, options,
                                                              kAdmaTableBytes, kAdmaAlign);
   if (!gAdma.data || !gAdma.table) {
-    IOLog ("CloverSdhci r172: bounce allocation failed data=%p table=%p\n",
+    sdhciSay ("CloverSdhci r172: bounce allocation failed data=%p table=%p\n",
            (void *) gAdma.data, (void *) gAdma.table);
     return false;
   }
@@ -1664,14 +1703,14 @@ static bool dmaBringUp (void)
       gAdma.dataContiguous < kAdmaDataBytes ||
       static_cast<IOByteCount> (tableContiguous) < kAdmaTableBytes ||
       (!gAdma.wide && gAdma.dataPhys + kAdmaDataBytes > 0x100000000ULL)) {
-    IOLog ("CloverSdhci r172: unusable DMA addresses data=%llx contig=%llu table=%llx wide=%d\n",
+    sdhciSay ("CloverSdhci r172: unusable DMA addresses data=%llx contig=%llu table=%llx wide=%d\n",
            static_cast<unsigned long long> (gAdma.dataPhys),
            static_cast<unsigned long long> (gAdma.dataContiguous),
            static_cast<unsigned long long> (gAdma.tablePhys), gAdma.wide ? 1 : 0);
     return false;
   }
   gAdma.available = true;
-  IOLog ("CloverSdhci r172: dma up data=%llx table=%llx cap=%08x en=%08x hctl=%02x wide=%d\n",
+  sdhciSay ("CloverSdhci r172: dma up data=%llx table=%llx cap=%08x en=%08x hctl=%02x wide=%d\n",
          static_cast<unsigned long long> (gAdma.dataPhys),
          static_cast<unsigned long long> (gAdma.tablePhys), cap,
          read32 (SDHCI_INT_ENABLE), read8 (SDHCI_HOST_CONTROL), gAdma.wide ? 1 : 0);
@@ -1726,7 +1765,7 @@ static void reportDmaFailure (const char *stage, uint32_t lba, uint32_t blocks, 
     return;
   }
   reported++;
-  IOLog ("CloverSdhci r172: dma %s lba=%u blocks=%u st=%08x err8=%02x hctl=%02x\n",
+  sdhciSay ("CloverSdhci r172: dma %s lba=%u blocks=%u st=%08x err8=%02x hctl=%02x\n",
          stage, lba, blocks, status, read8 (SDHCI_ADMA_ERROR), read8 (SDHCI_HOST_CONTROL));
 }
 
@@ -1873,7 +1912,7 @@ static void checkDmaPath (uint32_t lba, uint32_t sample)
   // state honestly, so it prints the milliseconds and lets the reader divide.
   const uint64_t pioRate = pioMs > 0 ? (bytes / 1024ULL) * 1000ULL / pioMs : 0;
   const uint64_t dmaRate = dmaMs > 0 ? (bytes / 1024ULL) * 1000ULL / dmaMs : 0;
-  IOLog ("CloverSdhci r172: dmacheck lba=%u sample=%u pio=%d dma=%d got=%u diff=%u first=%u "
+  sdhciSay ("CloverSdhci r172: dmacheck lba=%u sample=%u pio=%d dma=%d got=%u diff=%u first=%u "
          "m=%08x s=%08x ms=%llu/%llu kbs=%llu/%llu trusted=%d\n",
          lba, sample, pio ? 1 : 0, dma ? 1 : 0, got, diff, first,
          gCheckBatchB[first < words ? first : 0],
@@ -1882,9 +1921,9 @@ static void checkDmaPath (uint32_t lba, uint32_t sample)
          static_cast<unsigned long long> (pioRate), static_cast<unsigned long long> (dmaRate),
          gDmaTrusted ? 1 : 0);
   if (!gDmaTrusted) {
-    IOLog ("CloverSdhci r172: reads stay on the PIO path for this boot\n");
+    sdhciSay ("CloverSdhci r172: reads stay on the PIO path for this boot\n");
   } else {
-    IOLog ("CloverSdhci r172: ADMA2 reads trusted for this boot\n");
+    sdhciSay ("CloverSdhci r172: ADMA2 reads trusted for this boot\n");
   }
 }
 
@@ -1970,14 +2009,14 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
         static bool timingReported = false;
         if (!timingReported) {
           timingReported = true;
-          IOLog ("CloverSdhci r172: first dma read lba=%u blocks=%u ms=%llu\n", lba + done, chunk,
+          sdhciSay ("CloverSdhci r172: first dma read lba=%u blocks=%u ms=%llu\n", lba + done, chunk,
                  static_cast<unsigned long long> (dmaTicks * 1000ULL / frequency));
         }
       } else {
         gDmaFailures++;
         if (gDmaFailures >= 8 && gDmaTrusted) {
           gDmaTrusted = false;
-          IOLog ("CloverSdhci r172: dma failed %u times, reads go back to the PIO path\n",
+          sdhciSay ("CloverSdhci r172: dma failed %u times, reads go back to the PIO path\n",
                  gDmaFailures);
         }
       }
@@ -2009,6 +2048,9 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
     }
     done++;
   }
+  // Round174: this is one of the places the guard is held and the card is idle, so it is also where
+  // pending verdict lines get written out. Four records per pass; the rest wait for the next request.
+  flushVerdictRing ();
   releaseBlockGuard ();
   return done;
 }
@@ -2055,7 +2097,7 @@ static bool writeSettled (uint32_t &response, uint32_t &status, uint32_t &polls)
       const uint64_t elapsed = readCounter () - start;
       if (!slowReported && elapsed > frequency / 2ULL) {
         slowReported = true;
-        IOLog ("CloverSdhci r169: write settle took %llu ms polls=%u\n",
+        sdhciSay ("CloverSdhci r169: write settle took %llu ms polls=%u\n",
                static_cast<unsigned long long> (elapsed * 1000ULL / frequency), polls);
       }
       return true;
@@ -2143,8 +2185,294 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
   return false;
 }
 
-// Round159: the write mirror of readMultiBlock. One CMD25 for several consecutive blocks, then
-// CMD12 with the busy spelling. The FIFO is level-gated rather than paced: below 26 MHz the card
+// ------------------------------------------------- round174: the verdicts outlive the panel
+//
+// WHY THE PANEL IS NOT ENOUGH
+//
+// Every round since round165 has ended the same way: the one line that decides the next round was
+// on the screen for a fraction of a second and then scrolled under the lines it was supposed to
+// explain. Round167 lost `write cache ... off=` next to `disk5: general error`; round169 lost the
+// driver's own `read <stage>` verdicts behind the panic; round170 exists because r153's line
+// repacked the panel so completely that a whole frame could not say whether launchd was looping.
+// This round stops asking the panel to hold a reading. The card already stores text records the
+// host can dd back (mode 17 wrote the first one), so the driver now writes its verdict lines there
+// too, in kind 21 records in a 32-slot ring at `logfs start + 64` -- past the 32 blocks the panic
+// writer owns, and well inside the 16384-sector window round127 matched. One `dd` reads them all.
+//
+// WHY THE FORMATTER IS HAND-WRITTEN
+//
+// `vsnprintf` is not declared in the header set this driver is compiled against (IOLib.h,
+// libkern.h, pexpert.h, debug.h), and no sheng driver has a precedent for pulling in libc's. The
+// alternative -- calling IOLog and reconstructing the text from a second argument list -- would
+// need the same formatter anyway and give the screen and the card two chances to disagree. So one
+// formatter runs once, and its single string goes to both. It covers exactly the specifiers this
+// driver's lines use: %s, %u, %d, %x, %08x, %02x, %llu, %llx, %p. Anything else is copied verbatim,
+// which is the wrong-but-visible answer, and better than silently dropping a reading.
+//
+// WHY THE CARD WRITE IS NOT AT THE DECISION POINT
+//
+// A verdict is usually produced *inside* a transfer that just failed, on a host with one command
+// engine and a caller that is about to retry. Starting two more block writes there would nest a
+// second owner around the failing request and add a new way to hang the boot. So saying something
+// only fills a RAM slot, and the ring is written to the card from the tails of the read, write and
+// cache-flush requests -- places that already hold the block guard, own an idle card, and run
+// repeatedly. Four records per pass keeps a flush from becoming the long guard hold this driver has
+// spent three rounds removing.
+
+static uint32_t gVerdictBlock[kBlockWords];
+
+// One byte at a time, clamped: a verdict that overruns its slot is truncated rather than written
+// past the array, and the cursor stops advancing so the reported length is the stored length.
+static char *verdictPut (char *p, char *end, char c)
+{
+  if (p < end) {
+    *p = c;
+    return p + 1;
+  }
+  return p;
+}
+
+static char *verdictPutText (char *p, char *end, const char *s)
+{
+  while (s && *s) {
+    p = verdictPut (p, end, *s++);
+  }
+  return p;
+}
+
+// Digits are produced least significant first into a stack buffer, then reversed, so padding can be
+// appended to the high end and lands in front. No division library: 64-bit div is native on arm64.
+static char *verdictPutNumber (char *p, char *end, unsigned long long value, unsigned base,
+                               unsigned width, bool zeroPad)
+{
+  const char *set = "0123456789abcdef";
+  char digits[24];
+  uint32_t count = 0;
+  if (!value) {
+    digits[count++] = set[0];
+  }
+  while (value) {
+    digits[count++] = set[value % base];
+    value /= base;
+  }
+  while (count < width && count < sizeof (digits)) {
+    digits[count++] = zeroPad ? set[0] : ' ';
+  }
+  while (count) {
+    p = verdictPut (p, end, digits[--count]);
+  }
+  return p;
+}
+
+static uint32_t verdictFormat (char *out, uint32_t cap, const char *fmt, va_list args)
+{
+  char *p = out;
+  char *end = out + cap;
+  while (*fmt) {
+    char c = *fmt++;
+    if (c != '%') {
+      p = verdictPut (p, end, c);
+      continue;
+    }
+    c = *fmt++;
+    if (c == '%') {
+      p = verdictPut (p, end, '%');
+      continue;
+    }
+    bool zeroPad = false;
+    unsigned width = 0;
+    while (c == '0' || (c >= '1' && c <= '9')) {
+      if (c == '0' && !width) {
+        zeroPad = true;
+      } else {
+        width = width * 10u + (unsigned) (c - '0');
+      }
+      c = *fmt++;
+    }
+    bool wide = false;
+    if (c == 'l') {
+      if (*fmt == 'l') {
+        fmt++;
+      }
+      wide = true;
+      c = *fmt++;
+    }
+    if (c == 's') {
+      p = verdictPutText (p, end, va_arg (args, const char *));
+      continue;
+    }
+    if (c == 'p') {
+      const void *pointer = va_arg (args, const void *);
+      if (!pointer) {
+        p = verdictPutText (p, end, "nil");
+      } else {
+        p = verdictPutNumber (p, end,
+                              static_cast<unsigned long long> (reinterpret_cast<uintptr_t> (pointer)),
+                              16u, wide ? 16u : 0u, false);
+      }
+      continue;
+    }
+    unsigned long long value = 0;
+    bool negative = false;
+    if (c == 'd') {
+      if (wide) {
+        const long long signedValue = va_arg (args, long long);
+        if (signedValue < 0) {
+          negative = true;
+        }
+        value = negative ? static_cast<unsigned long long> (-signedValue)
+                         : static_cast<unsigned long long> (signedValue);
+      } else {
+        const int signedValue = va_arg (args, int);
+        if (signedValue < 0) {
+          negative = true;
+        }
+        value = negative ? static_cast<unsigned long long> (-static_cast<long long> (signedValue))
+                         : static_cast<unsigned long long> (signedValue);
+      }
+      if (negative) {
+        p = verdictPut (p, end, '-');
+      }
+      p = verdictPutNumber (p, end, value, 10u, width, zeroPad);
+      continue;
+    }
+    if (c == 'u') {
+      value = wide ? va_arg (args, unsigned long long)
+                   : static_cast<unsigned long long> (va_arg (args, unsigned int));
+      p = verdictPutNumber (p, end, value, 10u, width, zeroPad);
+      continue;
+    }
+    if (c == 'x' || c == 'X') {
+      value = wide ? va_arg (args, unsigned long long)
+                   : static_cast<unsigned long long> (va_arg (args, unsigned int));
+      p = verdictPutNumber (p, end, value, 16u, width, zeroPad);
+      continue;
+    }
+    // Unknown specifier: print it as written. A dropped argument would shift every later number on
+    // the line, which turns one bad reading into a page of plausible wrong ones.
+    p = verdictPut (p, end, '%');
+    p = verdictPut (p, end, c);
+  }
+  uint64_t length = static_cast<uint64_t> (p - out);
+  return length > cap ? cap : static_cast<uint32_t> (length);
+}
+
+// The driver's voice. Same string to the panel and to the ring, so a frame and a dd can never
+// disagree about what was measured. The trailing newline is dropped before storing: the record
+// writer adds exactly one, and the host decoder strips it.
+static void sdhciSay (const char *fmt, ...)
+{
+  char line[kVerdictTextBytes + 1];
+  va_list args;
+  va_start (args, fmt);
+  uint32_t length = verdictFormat (line, kVerdictTextBytes, fmt, args);
+  va_end (args);
+  while (length && line[length - 1] == '\n') {
+    length--;
+  }
+  line[length] = '\0';
+  IOLog ("%s\n", line);
+  if (gVerdictPending == kVerdictSlots) {
+    // Full: the oldest unread verdict gives its slot to the newest one. Which reading was dropped is
+    // counted, so a frame whose ring wrapped says so instead of looking like a quiet boot.
+    gVerdictWrite++;
+    gVerdictPending--;
+    gVerdictDropped++;
+  }
+  const uint32_t slot = gVerdictWrite % kVerdictSlots;
+  for (uint32_t i = 0; i < length; i++) {
+    gVerdictText[slot][i] = line[i];
+  }
+  gVerdictLength[slot] = length;
+  gVerdictWrite++;
+  gVerdictPending++;
+}
+
+// One LOG1 record, same shape as mode 17 and the panic writer: header block then text block, byte
+// sum over prefix + body + newline. Word 8 carries the sequence number, which is what makes a
+// wrapped ring orderable: slot index alone stops being time after the 33rd record.
+static bool verdictWriteRecord (const char *text, uint32_t length)
+{
+  const uint32_t body = length > 480 ? 480 : length;
+  const uint32_t total = kLogPrefixLength + body + 1;
+  uint32_t sum = 0;
+  for (uint32_t i = 0; i < kLogPrefixLength; i++) {
+    sum += static_cast<uint8_t> (kLogPrefix[i]);
+  }
+  for (uint32_t i = 0; i < body; i++) {
+    sum += static_cast<uint8_t> (text[i]);
+  }
+  sum += static_cast<uint8_t> ('\n');
+
+  const uint32_t lba = gVerdictFirst + kVerdictOffset +
+                       2 * (gVerdictCursor % kVerdictSlots);
+  uint32_t words = 0, status = 0;
+  for (uint32_t i = 0; i < kBlockWords; i++) {
+    gVerdictBlock[i] = 0;
+  }
+  gVerdictBlock[0] = kLogMagic0;
+  gVerdictBlock[1] = kLogMagic1;
+  gVerdictBlock[2] = lba;
+  gVerdictBlock[3] = total;
+  gVerdictBlock[4] = sum;
+  gVerdictBlock[5] = 21;   // a verdict line, not a bring-up report and not the panic screen
+  gVerdictBlock[6] = body;
+  gVerdictBlock[7] = gVerdictCursor % kVerdictSlots;
+  gVerdictBlock[8] = gVerdictSeq;
+  uint32_t rsp = 0, rstatus = 0, polls = 0;
+  if (!writePioBlock (lba, gVerdictBlock, words, status)) {
+    return false;
+  }
+  waitCardReady (rsp, rstatus, polls);
+
+  uint8_t *block = reinterpret_cast<uint8_t *> (gVerdictBlock);
+  for (uint32_t i = 0; i < 512; i++) {
+    block[i] = 0;
+  }
+  for (uint32_t i = 0; i < kLogPrefixLength; i++) {
+    block[i] = static_cast<uint8_t> (kLogPrefix[i]);
+  }
+  for (uint32_t i = 0; i < body; i++) {
+    uint8_t c = static_cast<uint8_t> (text[i]);
+    block[kLogPrefixLength + i] =
+        (c == '\n') ? static_cast<uint8_t> ('\n')
+                    : (c >= 0x20 && c < 0x7f) ? c : static_cast<uint8_t> ('.');
+  }
+  block[kLogPrefixLength + body] = '\n';
+  if (!writePioBlock (lba + 1, gVerdictBlock, words, status)) {
+    return false;
+  }
+  waitCardReady (rsp, rstatus, polls);
+  gVerdictCursor++;
+  gVerdictSeq++;
+  gVerdictWritten++;
+  return true;
+}
+
+// Called only from paths that hold the block guard with an idle card. A refused write stops this
+// pass rather than retrying: the record stays pending, the next request tries again, and a card that
+// is really gone costs four block writes per request instead of a hang.
+static void flushVerdictRing (void)
+{
+  if (!gVerdictReady || !gHost || !gVerdictFirst || !gVerdictPending) {
+    return;
+  }
+  if (gVerdictBusy) {
+    return;
+  }
+  gVerdictBusy = 1;
+  for (uint32_t flushed = 0; flushed < kVerdictFlushPerPass && gVerdictPending; ) {
+    const uint32_t slot = (gVerdictWrite - gVerdictPending) % kVerdictSlots;
+    if (!verdictWriteRecord (gVerdictText[slot], gVerdictLength[slot])) {
+      break;
+    }
+    gVerdictPending--;
+    flushed++;
+  }
+  gVerdictBusy = 0;
+}
+
+// Round159: the write mirror of readMultiBlock. One CMD25 for several consecutive blocks, then// CMD12 with the busy spelling. The FIFO is level-gated rather than paced: below 26 MHz the card
 // clocks the host down whenever the buffer is empty, so SPACE_AVAILABLE alone can never overrun it,
 // and at 50 MHz the 160 us gap would make a 32-block write cost 1.3 ms of dead time per block.
 // CMD24 stays the single-block fallback; every DATA_* error bit still refuses the transfer.
@@ -2290,7 +2618,7 @@ static void reportWriteDmaFailure (const char *stage, uint32_t lba, uint32_t blo
     return;
   }
   reported++;
-  IOLog ("CloverSdhci r173: dma write %s lba=%u blocks=%u st=%08x err8=%02x hctl=%02x\n",
+  sdhciSay ("CloverSdhci r173: dma write %s lba=%u blocks=%u st=%08x err8=%02x hctl=%02x\n",
          stage, lba, blocks, status, read8 (SDHCI_ADMA_ERROR), read8 (SDHCI_HOST_CONTROL));
 }
 
@@ -2430,7 +2758,7 @@ static void checkWriteDmaPath (void)
   if (kWriteCheckLba < kLogfsFirstLba ||
       kWriteCheckLba + kWriteCheckBlocks - 1 > kLogfsLastLba ||
       kWriteCheckLba + kWriteCheckBlocks > sectors) {
-    IOLog ("CloverSdhci r173: write gate refuses, logfs window lba=%u blocks=%u sectors=%u\n",
+    sdhciSay ("CloverSdhci r173: write gate refuses, logfs window lba=%u blocks=%u sectors=%u\n",
            kWriteCheckLba, kWriteCheckBlocks, sectors);
     return;
   }
@@ -2456,7 +2784,7 @@ static void checkWriteDmaPath (void)
 
   const bool originalRead = readRunPio (kWriteCheckLba, gCheckBatchA, kWriteCheckBlocks);
   if (!originalRead) {
-    IOLog ("CloverSdhci r173: write gate stops, the logfs run would not read back lba=%u\n",
+    sdhciSay ("CloverSdhci r173: write gate stops, the logfs run would not read back lba=%u\n",
            kWriteCheckLba);
     return;
   }
@@ -2513,7 +2841,7 @@ static void checkWriteDmaPath (void)
   const uint64_t dmaMs = dmaTicks * 1000ULL / frequency;
   const uint64_t pioRate = pioMs > 0 ? (bytes / 1024ULL) * 1000ULL / pioMs : 0;
   const uint64_t dmaRate = dmaMs > 0 ? (bytes / 1024ULL) * 1000ULL / dmaMs : 0;
-  IOLog ("CloverSdhci r173: wrcheck lba=%u blocks=%u control=%d dma=%d diff=%u/%u first=%u/%u "
+  sdhciSay ("CloverSdhci r173: wrcheck lba=%u blocks=%u control=%d dma=%d diff=%u/%u first=%u/%u "
          "w=%08x/%08x g=%08x/%08x st=%08x/%08x ms=%llu/%llu kbs=%llu/%llu trusted=%d\n",
          kWriteCheckLba, kWriteCheckBlocks, controlHeld ? 1 : 0, dmaWrite ? 1 : 0,
          diffPio, diffDma, firstPio, firstDma,
@@ -2526,9 +2854,9 @@ static void checkWriteDmaPath (void)
          static_cast<unsigned long long> (pioRate), static_cast<unsigned long long> (dmaRate),
          gWriteDmaTrusted ? 1 : 0);
   if (!gWriteDmaTrusted) {
-    IOLog ("CloverSdhci r173: writes stay on the PIO path for this boot\n");
+    sdhciSay ("CloverSdhci r173: writes stay on the PIO path for this boot\n");
   } else {
-    IOLog ("CloverSdhci r173: ADMA2 writes trusted for this boot\n");
+    sdhciSay ("CloverSdhci r173: ADMA2 writes trusted for this boot\n");
   }
 }
 
@@ -2598,7 +2926,7 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
           static bool writeTimingReported = false;
           if (!writeTimingReported) {
             writeTimingReported = true;
-            IOLog ("CloverSdhci r173: first dma write lba=%u blocks=%u ms=%llu\n", lba + done,
+            sdhciSay ("CloverSdhci r173: first dma write lba=%u blocks=%u ms=%llu\n", lba + done,
                    chunk, static_cast<unsigned long long> (dmaTicks * 1000ULL / frequency));
           }
         } else {
@@ -2606,7 +2934,7 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
           waitCardIdle (frequency);
           if (!settleReported) {
             settleReported = true;
-            IOLog ("CloverSdhci r173: dma write not ready lba=%u blocks=%u rsp=%08x st=%08x "
+            sdhciSay ("CloverSdhci r173: dma write not ready lba=%u blocks=%u rsp=%08x st=%08x "
                    "polls=%u\n", lba + done, chunk, rsp, settleStatus, polls);
           }
         }
@@ -2614,7 +2942,7 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
         gWriteDmaFailures++;
         if (gWriteDmaFailures >= kWriteDmaFailureLimit && gWriteDmaTrusted) {
           gWriteDmaTrusted = false;
-          IOLog ("CloverSdhci r173: dma writes failed %u times, writes go back to the PIO path\n",
+          sdhciSay ("CloverSdhci r173: dma writes failed %u times, writes go back to the PIO path\n",
                  gWriteDmaFailures);
         }
       }
@@ -2642,7 +2970,7 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
         waitCardIdle (frequency);
         if (!settleReported) {
           settleReported = true;
-          IOLog ("CloverSdhci r167: write not ready lba=%u blocks=%u rsp=%08x st=%08x "
+          sdhciSay ("CloverSdhci r167: write not ready lba=%u blocks=%u rsp=%08x st=%08x "
                  "polls=%u\n", lba + done, chunk, rsp, settleStatus, polls);
         }
       }
@@ -2667,7 +2995,7 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
       waitCardIdle (frequency);
       if (!settleReported) {
         settleReported = true;
-        IOLog ("CloverSdhci r167: write not ready lba=%u blocks=1 rsp=%08x st=%08x "
+        sdhciSay ("CloverSdhci r167: write not ready lba=%u blocks=1 rsp=%08x st=%08x "
                "polls=%u\n", lba + done, rsp, settleStatus, polls);
       }
     }
@@ -2675,13 +3003,14 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
       static bool giveUpReported = false;
       if (!giveUpReported) {
         giveUpReported = true;
-        IOLog ("CloverSdhci r168: write gave up lba=%u blocks=%u done=%u\n",
+        sdhciSay ("CloverSdhci r168: write gave up lba=%u blocks=%u done=%u\n",
                lba + done, blocks, done);
       }
       break;
     }
     done++;
   }
+  flushVerdictRing ();   // Round174: same reason as the read tail
   releaseBlockGuard ();
   return done;
 }
@@ -3156,7 +3485,7 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
     static bool reported = false;
     if (!reported) {
       reported = true;
-      IOLog ("CloverSdhci r171: flush failed flushed=%d back=%d rsp=%08x st=%08x "
+      sdhciSay ("CloverSdhci r171: flush failed flushed=%d back=%d rsp=%08x st=%08x "
              "polls=%u rsp2=%08x st2=%08x (once)\n",
              flushed ? 1 : 0, reenabled ? 1 : 0, response, status, polls,
              backResponse, backStatus);
@@ -3164,6 +3493,7 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
   } else {
     __atomic_add_fetch (&gCacheFlushes, 1u, __ATOMIC_RELAXED);
   }
+  flushVerdictRing ();   // Round174: same reason as the read tail
   releaseBlockGuard ();
   return (flushed && reenabled) ? 1u : 0u;
 }
@@ -4306,7 +4636,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             }
             __atomic_store_n (&gCacheSize, cacheSize, __ATOMIC_RELEASE);
             __atomic_store_n (&gCacheOn, cacheOn ? 1u : 0u, __ATOMIC_RELEASE);
-            IOLog ("CloverSdhci r171: write cache size=%u ctrl=%u on=%d rsp=%08x st=%08x\n",
+            sdhciSay ("CloverSdhci r171: write cache size=%u ctrl=%u on=%d rsp=%08x st=%08x\n",
                    cacheSize, cacheCtrlBefore, cacheOn ? 1 : 0, cacheRsp, cacheStatus);
             clover_emmc_link[14] = cacheSize;
             // Bit 0 of this slot used to spell "the cache is off"; r171 flips the switch, so it now
@@ -4332,7 +4662,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             clover_emmc_link[11] = link21.stateStatus;
             clover_emmc_link[12] = link21.stateResponse;
             clover_emmc_link[13] = link21.statePolls;
-            IOLog ("CloverSdhci r159: link hs=%d/%x bw=%d/%x clk=%x hc=%x hdr=%x/%x ok=%d\n",
+            sdhciSay ("CloverSdhci r159: link hs=%d/%x bw=%d/%x clk=%x hc=%x hdr=%x/%x ok=%d\n",
                    link21.highSpeed ? 1 : 0, link21.hsStatus,
                    link21.width8 ? 1 : 0, link21.bwStatus,
                    link21.clockAfter, link21.hostControl,
@@ -4346,7 +4676,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             if (gBlockLock) {
               __atomic_store_n (&gBlockReady, 1, __ATOMIC_RELEASE);
             } else {
-              IOLog ("CloverSdhci r171: host lock allocation failed\n");
+              sdhciSay ("CloverSdhci r171: host lock allocation failed\n");
             }
           }
         }
@@ -5264,6 +5594,15 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                 // stops being the driver's own report.
                 gPanicLogFirst = entryFirst14;
                 gPanicLogReady = 1;
+                // Round174: the same matched window the panic screen may write, offset clear of the
+                // blocks it owns. From here on, every verdict line has somewhere to land.
+                gVerdictFirst = entryFirst14;
+                gVerdictReady = 1;
+                // Said out loud because it is the precondition of every reading after it: a dd that
+                // comes back with no verdict records has to be able to say whether the ring was ever
+                // armed, or armed and then never flushed by a request that finished.
+                sdhciSay ("CloverSdhci r174: verdict ring armed lba=%u slots=%u\n",
+                          gVerdictFirst + kVerdictOffset, kVerdictSlots);
               }
             }
           }
