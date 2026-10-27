@@ -917,6 +917,48 @@ static bool waitCommandSlot (void)
   return waitCommandSlot (false);
 }
 
+// Round165: a transfer that ends early leaves words in the controller FIFO. The next command
+// then reads those stale words ahead of its own first word, and every later word is shifted by
+// however many were left. The controller's CRC does not catch this: it checks the bits on the
+// bus, not the words we assembled afterwards. APFS found exactly this shape on the device --
+// "Data hash mismatch ... expected jhash ..., got ..." -- so every read now starts from a
+// proven-empty FIFO and every failed transfer resets the data path before the caller retries.
+//
+// drainReadFifo is bounded: the level bit is the only source of truth, and a stuck level would
+// otherwise spin forever with interrupts masked at this point in the boot.
+static uint32_t drainReadFifo (void)
+{
+  uint32_t words = 0;
+  while ((read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE) && words < 65536) {
+    (void) read32 (SDHCI_BUFFER);
+    words++;
+  }
+  return words;
+}
+
+// SDHCI_RESET_DATA self-clears when the controller has dropped the data phase and the FIFO.
+// Like every other wait in this file, the bound is a counter and not a timer.
+static bool resetReadPath (void)
+{
+  write8 (SDHCI_SOFTWARE_RESET, SDHCI_RESET_DATA);
+  for (uint32_t guard = 0; guard < kCommandSpinLimit; guard++) {
+    if (!(read8 (SDHCI_SOFTWARE_RESET) & SDHCI_RESET_DATA)) {
+      write32 (SDHCI_INT_STATUS, 0xffffffffu);
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool prepareReadPath (void)
+{
+  drainReadFifo ();
+  if (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE) {
+    return resetReadPath ();
+  }
+  return true;
+}
+
 // One whole 512-byte block, read the way mode 12's drain proved works: an adtc command with a
 // short R1 and the block count enabled, then one FIFO word per counter gap and a final level-gated
 // sweep for whatever DATA_END raced with. Mode 14 uses this to walk the GPT entry array block by
@@ -930,6 +972,11 @@ static bool readDataBlock (uint16_t command, uint32_t argument, uint32_t *words,
 {
   wordCount = 0;
   status = 0;
+  // Round165: the previous transfer may have stopped with words still queued; starting here
+  // with them in the FIFO would shift this block without any error bit moving.
+  if (!prepareReadPath ()) {
+    return false;
+  }
   if (!waitCommandSlot ()) {
     return false;
   }
@@ -991,8 +1038,13 @@ static bool readDataBlock (uint16_t command, uint32_t argument, uint32_t *words,
          (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_AVAILABLE)) {
     words[wordCount++] = read32 (SDHCI_BUFFER);
   }
-  return (status & SDHCI_INT_DATA_END) && !(status & kDataErrorMask) &&
-         wordCount == kBlockWords;
+  if (!((status & SDHCI_INT_DATA_END) && !(status & kDataErrorMask) &&
+        wordCount == kBlockWords)) {
+    // Round165: leave the data path clean for whoever retries this block.
+    resetReadPath ();
+    return false;
+  }
+  return true;
 }
 
 static bool readPioBlock (uint32_t lba, uint32_t *words, uint32_t &wordCount,
@@ -1076,6 +1128,11 @@ static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
   const uint32_t totalWords = blocks * kBlockWords;
   wordCount = 0;
   status = 0;
+  // Round165: same rule as readDataBlock. A refused command can still have queued words from an
+  // earlier transfer, and the single-block fallback must not inherit them.
+  if (!prepareReadPath ()) {
+    return multiFailure (0, lba, blocks, status, 0, totalWords);
+  }
   if (!waitCommandSlot ()) {
     return multiFailure (0, lba, blocks, status, 0, totalWords);
   }
@@ -1102,6 +1159,7 @@ static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
   if (!(status & SDHCI_INT_RESPONSE) ||
       (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
     sendStopCommand ();
+    resetReadPath ();
     return multiFailure (0, lba, blocks, status, 0, totalWords);
   }
   uint64_t frequency = counterFrequency ();
@@ -1139,8 +1197,14 @@ static bool readMultiBlock (uint32_t lba, uint32_t *words, uint32_t blocks,
   }
   sendStopCommand ();
   if (clean && wordCount == totalWords) {
+    // A clean transfer should have no tail, but the stop command is where a vendor controller
+    // could still hand back the last word; drop anything left so the next read starts empty.
+    drainReadFifo ();
     return true;
   }
+  // Round165: the fallback single-block read that follows must not see the words this failed
+  // transfer left behind, or it will assemble a shifted block that still looks clean.
+  resetReadPath ();
   return multiFailure (0, lba, blocks, status, wordCount, totalWords);
 }
 
@@ -1216,6 +1280,68 @@ static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start)
   }
 }
 
+// Round165's second half: the device itself proves the two read paths agree. The first 16 KiB
+// request reads the same run three ways -- two CMD18 batches and 32 CMD17 blocks -- and compares
+// the words. If the batch and the single-block path disagree, or two batches disagree with each
+// other, the batch is not trusted for the rest of the boot and every later read uses the
+// single-block sequence. The check costs one extra 32 KiB read and runs once per boot.
+static uint32_t gCheckBatchA[kReadChunkBlocks * kBlockWords];
+static uint32_t gCheckBatchB[kReadChunkBlocks * kBlockWords];
+static uint32_t gCheckSingle[kReadChunkBlocks * kBlockWords];
+static bool gReadCheckDone = false;
+static bool gReadBatchTrusted = true;
+
+static uint32_t countWordDiff (const uint32_t *a, const uint32_t *b, uint32_t words,
+                               uint32_t &first)
+{
+  uint32_t diff = 0;
+  for (uint32_t i = 0; i < words; i++) {
+    if (a[i] != b[i]) {
+      if (diff == 0) {
+        first = i;
+      }
+      diff++;
+    }
+  }
+  return diff;
+}
+
+static void checkReadPath (uint32_t lba)
+{
+  gReadCheckDone = true;
+  const uint32_t words = kReadChunkBlocks * kBlockWords;
+  uint32_t gotA = 0, statusA = 0, gotB = 0, statusB = 0;
+  const bool batchA = readMultiBlock (lba, gCheckBatchA, kReadChunkBlocks, gotA, statusA);
+  const bool batchB = readMultiBlock (lba, gCheckBatchB, kReadChunkBlocks, gotB, statusB);
+  bool single = true;
+  uint32_t blocks = 0;
+  for (; blocks < kReadChunkBlocks; blocks++) {
+    uint32_t got = 0, status = 0;
+    if (!readPioBlock (lba + blocks, gCheckSingle + blocks * kBlockWords, got, status) ||
+        got != kBlockWords) {
+      single = false;
+      break;
+    }
+  }
+  uint32_t first = 0, firstB = 0;
+  const uint32_t diff = (batchA && single)
+                        ? countWordDiff (gCheckBatchA, gCheckSingle, words, first)
+                        : words;
+  const uint32_t diffB = (batchA && batchB)
+                         ? countWordDiff (gCheckBatchA, gCheckBatchB, words, firstB)
+                         : words;
+  gReadBatchTrusted = batchA && batchB && single && diff == 0 && diffB == 0;
+  IOLog ("CloverSdhci r165: readcheck lba=%u batch=%d/%d single=%d diff=%u/%u first=%u/%u "
+         "m=%08x s=%08x\n",
+         lba, batchA ? gotA : 0, batchB ? gotB : 0, single ? blocks : 0,
+         diff, diffB, first, firstB,
+         gCheckBatchA[first < words ? first : 0],
+         gCheckSingle[first < words ? first : 0]);
+  if (!gReadBatchTrusted) {
+    IOLog ("CloverSdhci r165: batch reads disabled for this boot\n");
+  }
+}
+
 extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint32_t blocks)
 {
   if (!words || !blocks) {
@@ -1230,6 +1356,11 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   uint64_t start = 0;
   if (!acquireBlockGuard (frequency, start)) {
     return 0;
+  }
+  // Round165: the first request that is one full batch long proves batch and single-block reads
+  // agree before any caller relies on the batch.
+  if (!gReadCheckDone && blocks >= kReadChunkBlocks) {
+    checkReadPath (lba);
   }
   const uint64_t deadline = frequency * 2ULL;   // 2 s for the whole request
   uint32_t done = 0;
@@ -1247,8 +1378,10 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
     uint32_t *target = words + static_cast<uint64_t>(done) * kBlockWords;
     // One CMD18 for the chunk; a failed multi-block attempt falls back to the
     // single-block sequence every earlier round proved, so the device can never
-    // become less readable than it was before this change.
-    if (chunk >= 4) {
+    // become less readable than it was before this change. Round165 adds the
+    // trusted flag: the self-check above disables the batch for this boot if
+    // batch and single-block reads disagree.
+    if (chunk >= 4 && gReadBatchTrusted) {
       uint32_t got = 0;
       uint32_t status = 0;
       if (readMultiBlock (lba + done, target, chunk, got, status)) {

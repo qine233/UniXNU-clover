@@ -321,6 +321,30 @@ def check_dyld_cache_skip(kernel: bytes) -> bool:
     return ok
 
 
+# Round165's driver change leaves two strings in the kernel: the one-shot A/B result and the line
+# that says the batch is not trusted. Their presence is the only image-level evidence that the
+# clean-FIFO policy and the self-check survived the link; a payload built from an older CloverSdhci
+# would carry neither, and the r164 frame's APFS jhash mismatch would have no counterpart.
+READ_INTEGRITY = (
+    "CloverSdhci r165: readcheck lba=",
+    "CloverSdhci r165: batch reads disabled for this boot",
+)
+
+
+def check_read_integrity(kernel: bytes) -> bool:
+    """Every block read now drains the FIFO first and resets the data path on failure, and the
+    first full-batch read compares two CMD18 batches with 32 CMD17 blocks. Both facts compile to
+    the strings above; requiring both keeps a payload from shipping the old read path while the
+    menu still claims this round."""
+    label = "kernel.macho: eMMC read integrity"
+    found = {name: name.encode() in kernel for name in READ_INTEGRITY}
+    ok = all(found.values())
+    detail = ", ".join(f"{name.split(':')[1].strip()} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_root_mount_probe(kernel: bytes) -> bool:
     """Round144 asks why r143 left bsd_init() with an empty mountlist although vfs_mountroot()
     returned 0. The probe leaves no symbol of its own -- vfs_subr.c records which return-0 branch
@@ -631,6 +655,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_mac_probe(kernel)
         ok &= check_amfi_allow(kernel)
         ok &= check_dyld_cache_skip(kernel)
+        ok &= check_read_integrity(kernel)
         ok &= check_unattended(kernel)
         ok &= check_inline_asm_tails(kernel)
     return 0 if ok else 1

@@ -1170,9 +1170,31 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round164. The menu has to name the round under test: the dyld-cache skip and the AMFI allow path.
-    if not board["payload"]["title"].startswith("clover r164:"):
-        errors.append('[payload] title is not "clover r164: ...": the menu would not name this round')
+    # Round165. The menu has to name the round under test: the clean-FIFO read path and the
+    # once-per-boot batch/single comparison.
+    if not board["payload"]["title"].startswith("clover r165:"):
+        errors.append('[payload] title is not "clover r165: ...": the menu would not name this round')
+    # Round165. The r164 frame named the wall: APFS says the bytes it read back do not match the
+    # stream's jhash, and the exec path still rejects the same 85. Both are reads whose words can
+    # only be wrong if the FIFO was not empty when the command started. This round adds that
+    # guarantee and a one-shot proof that CMD18 and 32 CMD17s return the same 16 KiB. These are
+    # driver sources, so the assertions live on the source that the kernel archive compiles.
+    sdhci = next((base / "drivers/CloverSdhci/CloverSdhci.cpp"
+                  for base in (REPO, pathlib.Path.cwd())
+                  if (base / "drivers/CloverSdhci/CloverSdhci.cpp").is_file()), None)
+    if sdhci is None:
+        errors.append("drivers/CloverSdhci/CloverSdhci.cpp is missing: no read path to verify")
+    else:
+        text = sdhci.read_text()
+        for needle in ("CloverSdhci r165: readcheck lba=",
+                       "CloverSdhci r165: batch reads disabled for this boot",
+                       "static bool prepareReadPath (void)",
+                       "SDHCI_RESET_DATA",
+                       "gReadBatchTrusted = batchA && batchB && single && diff == 0 && diffB == 0;",
+                       "if (chunk >= 4 && gReadBatchTrusted) {"):
+            if needle not in text:
+                errors.append(f"{sdhci.name} lacks {needle[:28]}...: a read could still start on "
+                              "stale FIFO words, or the batch would stay trusted without proof")
     # Round164. Both halves of this round are source, and the kernel half cannot be read off the
     # payload: a 16K-signed blob must not walk the whole file before its first page, and AMFI's
     # second deny branch must not survive the payload build.
@@ -1215,7 +1237,8 @@ def check_board(errors: list) -> str:
                       "r164 half reached the payload")
     else:
         text = verifier.read_text()
-        for needle in ("NATIVE4K_SKIP", "check_dyld_cache_skip", "check_amfi_allow"):
+        for needle in ("NATIVE4K_SKIP", "check_dyld_cache_skip", "check_amfi_allow",
+                       "check_read_integrity", "CloverSdhci r165: readcheck"):
             if needle not in text:
                 errors.append(f"{verifier.name} lacks {needle}: the release could ship with an "
                               "unchecked kernel half")
