@@ -64,7 +64,7 @@ archives = [
   "build-native-aes-bindings.py",
   "build-mockfs-fixture.py",
   "build-libpthread-kernel.py",
-  "build-clover-display-stub.py",
+  "build-clover-gop-legacy-display.py",
   "build-clover-pmgr.py",
   "build-arm-driver.py CloverSdhci",
   "build-clover-block.py",
@@ -167,7 +167,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r178: the block guard changes hands between chunks"
+title = "clover r180: the display stack stops being a stub"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2150,6 +2150,32 @@ kernel_args = [
   # software-IPI SPI numbers are hardcoded at 1008..1015 -- tb128fu had to move its base
   # to 536 because its GIC implements fewer INTIDs. typer= on the panic screen is this
   # board's GICD_TYPER, and until it is read, 1008 is a guess.
+  # Round180 asks the display stack its first question on hardware, and these three arguments are one
+  # chain rather than three switches. native_mobile_graphics_load_probe() (bsd_init.c, compiled in only
+  # because CONFIG_XNU_NATIVE_LEGACY_DISPLAY is on) returns without touching anything unless
+  # offline-mobile-graphics-load=1 parses, and calls native_legacy_display_probe() only when
+  # offline-legacy-register=1 parses too. Phase 1 is the narrowest phase the probe has: it registers the
+  # class, constructs one IOMobileFramebufferLegacy, metaCast()s it, calls init(), says what
+  # PE_current_console handed this kernel, and releases the object. It never attaches or starts it, so
+  # no display backend slot is reached and the seven still-guarded abstract leaves stay untouched. That
+  # is deliberate: the first reading is class identity plus console geometry, not a frame.
+  # What comes back, in the order it lands on the card's kernel-log ring (round176's tee keeps every
+  # line whose text contains "clover r", so this needs no allowlist change):
+  #   `clover r180: probe: console 1200x1920 row=4800 depth=32 display=<n> rotate=0 scale=<n>
+  #    base=9d400000 length=9216000` -- the ABL/GOP handoff as the kernel itself sees it, including the
+  #    v_display word the vendored driver's `primary=video.v_display!=0` change depends on;
+  #   `clover r180: probe: object=... size=6304 parent=1 init=<IOReturn>` -- 6304 is 0x18A0, the
+  #    instance size scripts/audit-clover-mobile-graphics-legacy.py derives from this image's own
+  #    registration instructions, and parent=1 is the three-level metaCast against the original class;
+  #   a refusal line instead (preModLoad refused / postModLoad=<n> / no console descriptor / console
+  #    rejected / allocation failed) names the exact step the class does not survive.
+  # Phases 2, 3 and 4 -- the IOSurface root wait, the GOP nub, attaching and starting the display, the
+  # presenter hand-off -- stay unpassed until phase 1 reads back, because each of them can reach the
+  # backend this board has not qualified. Same for offline-legacy-validate/transfer/retire/pm and
+  # sheng-fb-gpu: they are the swap path, and there is no swap until there is a started display.
+  "offline-mobile-graphics-load=1",
+  "offline-legacy-register=1",
+  "offline-legacy-phase=1",
 ]
 
 [payload.adt]

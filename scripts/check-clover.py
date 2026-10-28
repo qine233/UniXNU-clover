@@ -465,9 +465,42 @@ def check_board(errors: list) -> str:
             if flags.get(forbidden, "n").strip('"') in ("y", "1"):
                 errors.append(f"{defconfig_name} enables CONFIG_XNU_{forbidden}, "
                               "for which clover has no driver")
-        if "libCloverDisplayStub.a" in text and \
-                not any("build-clover-display-stub.py" in entry for entry in board["kernel"]["archives"]):
-            errors.append("the defconfig links the display stub but [kernel] archives omits its builder")
+        # Round180 replaces the display stub with the driver. The archive is deliberately absent from
+        # CONFIG_XNU_EXTRA_LD_ARCHIVES: build-xnu-4k-baseline.sh force-loads its exact path itself when
+        # XNU_NATIVE_LEGACY_DISPLAY is 1, after re-hashing that archive and every source its
+        # build-report.json names. The three halves that have to agree are therefore the switch, the
+        # builder in [kernel] archives, and the boot arguments that reach the probe the switch compiles
+        # into bsd_init.o. Flip the switch off and the link stops asking for the archive; leave the
+        # builder out and the link's `test -f` stops the build by name; drop either argument and the
+        # class is linked and never constructed -- which, on a board whose readings come off a card, is
+        # the same silence as having no display work at all.
+        legacy_builder = any("build-clover-gop-legacy-display.py" in entry
+                             for entry in board["kernel"]["archives"])
+        stub_builder = any("build-clover-display-stub.py" in entry for entry in board["kernel"]["archives"])
+        if "libCloverDisplayStub.a" in text or stub_builder:
+            errors.append("the display stub is still wired (defconfig archive or [kernel] archives): "
+                          "round180 replaced it with build/native-legacy-display/"
+                          "libNativeLegacyDisplay.late.a")
+        if flags.get("NATIVE_LEGACY_DISPLAY", "n") in ("y", "1"):
+            if not legacy_builder:
+                errors.append("CONFIG_XNU_NATIVE_LEGACY_DISPLAY is on but [kernel] archives omits "
+                              "build-clover-gop-legacy-display.py, so the archive the link force-loads "
+                              "does not exist")
+            for argument in ("offline-mobile-graphics-load=1", "offline-legacy-register=1"):
+                if argument not in board["payload"]["kernel_args"]:
+                    errors.append(f"CONFIG_XNU_NATIVE_LEGACY_DISPLAY is on but kernel_args omits "
+                                  f"{argument}: native_legacy_display_probe() is never called")
+            if "offline-legacy-phase=1" not in board["payload"]["kernel_args"]:
+                errors.append("kernel_args does not pin offline-legacy-phase=1: the probe's own default "
+                              "is 1, so a shipped boot that later drifts to phase 2/3/4 would attach and "
+                              "start a display whose backend slots this board has never qualified")
+            if flags.get("NATIVE_MOBILE_DISPLAY", "n") in ("y", "1"):
+                errors.append("CONFIG_XNU_NATIVE_MOBILE_DISPLAY is on as well: that switch asks the "
+                              "link for libNativeMobileDisplay.late.a, which this board does not build, "
+                              "and the MDP5 driver has no hardware here")
+        elif legacy_builder:
+            errors.append("[kernel] archives builds the Legacy display archive but the defconfig leaves "
+                          "CONFIG_XNU_NATIVE_LEGACY_DISPLAY off, so nothing calls into it")
         # round83, the AMFI PMGR contract. Three facts have to agree or the board ships a kernel
         # that silently has no power manager again: the defconfig switch (which both compiles the
         # sheng_pmgr_run() call into bsd_init.o and makes the link force-load
@@ -1187,10 +1220,11 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round178. The menu has to name the round under test: the payload and its readings have to agree
-    # about which round is on the card, or an image would be claiming a round it does not run.
-    if not board["payload"]["title"].startswith("clover r178:"):
-        errors.append('[payload] title is not "clover r178: ...": the menu would not name this round')
+    # Round178 introduced the rule; round180 keeps it. The menu has to name the round under test: the
+    # payload and its readings have to agree about which round is on the card, or an image would be
+    # claiming a round it does not run.
+    if not board["payload"]["title"].startswith("clover r180:"):
+        errors.append('[payload] title is not "clover r180: ...": the menu would not name this round')
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -1857,7 +1891,14 @@ def check_board(errors: list) -> str:
                       "r164 half reached the payload")
     else:
         text = verifier.read_text()
-        for needle in ("NATIVE4K_SKIP", "check_dyld_cache_skip", "check_amfi_allow",
+        for needle in ("NATIVE4K_SKIP", "check_dyld_cache_skip",
+                       # The r164 fingerprint is an instruction group, and two of its bytes encode an
+                       # address rather than a decision -- the round180 archive grew the kernel by a
+                       # page and an exact-byte match reported a patch that was present. The masked
+                       # form is the contract; a return to whole-group byte equality would make every
+                       # future kernel growth look like a lost signature concession.
+                       "len(re.findall(pattern, kernel)) == 1",
+                       "check_amfi_allow",
                        "check_read_integrity", "CloverSdhci r167: readcheck",
                        "CloverSdhci r171: write cache size=",
                        "CloverSdhci r172: dmacheck lba=", "DMA_INTEGRITY",
@@ -1867,7 +1908,13 @@ def check_board(errors: list) -> str:
                        # not only at the round's strings, or a payload built from a plain kernel would
                        # still pass every needle here.
                        "check_kernel_normalized", "normalize_kernel_macho",
-                       "object stamps blank"):
+                       "object stamps blank",
+                       # Round180: the display stack is now code, and code only reaches the payload
+                       # through the link. The verifier is the only place that can say the archive and
+                       # the probe were there.
+                       "check_legacy_display", "LEGACY_DISPLAY",
+                       "probe: console %ux%u row=%u depth=%u display=%llu "
+                       "rotate=%u scale=%u base=%llx length=%llx"):
             if needle not in text:
                 errors.append(f"{verifier.name} lacks {needle}: the release could ship with an "
                               "unchecked kernel half")
@@ -1949,6 +1996,79 @@ def check_board(errors: list) -> str:
             if overclaim in script:
                 errors.append(f"{audit.name} asserts {overclaim}: nothing in this round runs the "
                               "kernel, so the ABI JSON would be quoting an outcome nobody observed")
+
+    # Round180. The archive that replaces the stub is the part of this port that must not be able to
+    # lie: every original-class binding is an address inside Apple's family text, and an address that
+    # moved is a driver running into whatever lives there now. scripts/build-clover-gop-legacy-display.py
+    # therefore re-reads out/clover/kernel/kernel.macho at each pinned site and refuses the archive on a
+    # single differing instruction, and it only runs against the device-local copy of
+    # drivers/NativeMobileDisplay -- the base module is a driver that still claims v_display == 1. CI has
+    # no built kernel, so the gate here is the shape that makes those checks happen: the force-load path,
+    # the staging that keeps the two module initializers from running twice, the self-containment of the
+    # archive, and the honesty flags of its report.
+    retired = REPO / "scripts/build-clover-display-stub.py"
+    if retired.is_file():
+        errors.append("scripts/build-clover-display-stub.py is still in the repo: `unixnu tree` copies "
+                      "scripts/ from the device repo, so the stub builder would reach the build and a "
+                      "reader could not tell which display archive this board ships")
+    builder = REPO / "scripts/build-clover-gop-legacy-display.py"
+    if not builder.is_file():
+        errors.append("scripts/build-clover-gop-legacy-display.py is missing: [kernel] archives names a "
+                      "builder that does not exist, so the force-loaded display archive never appears")
+    else:
+        builder_text = builder.read_text()
+        for needle in ("OUT = ROOT / 'build/native-legacy-display'",
+                       "archive = OUT / 'libNativeLegacyDisplay.late.a'",
+                       "require(DRIVER.is_relative_to(DEVICE.resolve()),",
+                       "require(audit['kernel_sha256'] == sha(KERNEL),",
+                       "legacy_ctor = base + 0x1A5CC; legacy_dtor = base + 0x1A618",
+                       "require(owned == sorted(own + pure), 'Exact owned method set')",
+                       "'--remove-section=__DATA,__mod_init_func'",
+                       "duplicate definition of ",
+                       "is defined by no archive member",
+                       "'_native_legacy_gpu_complete' in contract",
+                       "static_assert(sizeof(IOMobileFramebufferLegacy)==0x18a0",
+                       "original_instructions_modified=False, driver_initialized=False, display_presented=False"):
+            if needle not in builder_text:
+                errors.append(f"{builder.name} lacks {needle[:48]}: the archive could be linked without "
+                              "the check that keeps its bindings, its owned method set or its "
+                              "self-containment true for this kernel")
+        if "device_observed=True" in builder_text:
+            errors.append(f"{builder.name} asserts device_observed=True: no frame from this archive has "
+                          "been read back off a card yet")
+
+    # The board-local instrument is the other half of the same claim: it owns 18 of the driver's 27
+    # undefined _native_legacy_* hooks, bounds its own log budget so the shared kernel-log ring cannot be
+    # flooded, and stops at phase 1 on hardware. Two words in particular have to stay declarations rather
+    # than definitions -- the driver defines them, and a duplicate symbol in a force-loaded archive is a
+    # link failure that would have looked like a display problem.
+    probe = REPO / "package/CloverLegacyDisplayProbe.cpp"
+    if not probe.is_file():
+        errors.append("package/CloverLegacyDisplayProbe.cpp is missing: the driver's 18 probe hooks and "
+                      "both bsd_init/bsd_autoconf entry points would be undefined")
+    else:
+        probe_text = probe.read_text()
+        for needle in ('static char cloverRound[]="clover r180:";',
+                       "enum {kCloverLogBudget=96};",
+                       '"probe: console %ux%u row=%u depth=%u display=%llu rotate=%u scale=%u base=%llx length=%llx"',
+                       "if(native_legacy_init_result && (phase==2 || phase==3 || phase==4))",
+                       'extern "C" volatile uint64_t native_legacy_early_retires,native_legacy_early_failures;',
+                       'IOLog("%s %s unwound\\n",cloverRound,report);'):
+            if needle not in probe_text:
+                errors.append(f"{probe.name} lacks {needle[:52]}: round180's reading would be missing, "
+                              "unbounded, or the object would be kept past a phase this board has not "
+                              "qualified")
+
+    # The single behavioural change inside the vendored driver, asserted here because feeds.py lets the
+    # device copy shadow the base one. If it ever goes missing the archive silently rebuilds Apple's
+    # module: that one tests v_display == 1, a PowerPC-era graphics-mode enum this firmware never sets.
+    display_driver = REPO / "drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp"
+    if not display_driver.is_file():
+        errors.append("drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp is missing: the device-local "
+                      "display module this archive is built from would not exist")
+    elif "primary=video.v_display!=0;" not in display_driver.read_text():
+        errors.append("the vendored driver lost its board-local v_display claim: the base module tests "
+                      "v_display==1, and this firmware hands over a nonzero display descriptor")
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",

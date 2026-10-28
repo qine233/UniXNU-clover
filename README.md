@@ -41,7 +41,9 @@ round176 拆掉那一轮自己的代价：两个说话人不再抢同一圈 32 �
 占住守卫多久，页就等多久。这轮把守卫的持有单位从「一个请求」改成「一个块段」，
 读写两条循环每交付满一段就放一次手再排队。round179 不动 shipped 字节，改的是显示
 那一格的起点：原始 `IOMobileFramebufferLegacy` 在**本板自己的内核**里被逐槽资格化，
-类身份从注册指令推出来，不再借用别人在虚拟机里观测的那四个数。
+类身份从注册指令推出来，不再借用别人在虚拟机里观测的那四个数。round180 接着把那一格
+从 stub 换成真代码：真的原始 Legacy 档案链接进内核，phase 1 第一次在硬件上问「这个类
+还认不认得自己、console 交到内核手里是什么几何」。
 
 ### 已完成（都有真机读数）
 
@@ -78,6 +80,7 @@ round176 拆掉那一轮自己的代价：两个说话人不再抢同一圈 32 �
 | round177（v0.5.33） | 结掉排期里的「内核构建不可逐字节复现」：镜像现在是这棵树的纯函数。`scripts/normalize-kernel-macho.py` 把三处链接不可复现的字段——ld 每次链接生成的 `LC_UUID`、962 个 object-path 调试符号 `n_value` 里那个 `.o` mtime、`emit_prelink.py` 用前两者哈希出来的 `_PrelinkKCID`——改写成「文件其余内容 sha256 的派生值」，长度一字不差、幂等。同一棵树两次独立构建（`a307b5b0…` 与 round176 的 `d274a15e…`）归一化后是同一个 `86273887…`，两份真正交付的**打过 AMFI** 的拷贝同样收敛到 `f9966b72…`。本轮不动驱动、不动 XNU 补丁，所以帧上读的还是round171–176 那一整套判据；`check-cs-blob-structure.py` 的 `cs_validate_csblob` 宿主复刻也进了闸门（14 条拒绝规则 + 真机 `launchd.macho` 必须被接受），round162 那条 `cs_blob … 85` 至此在主机侧结掉 | **已构建**，待冷刷 |
 | round178（v0.5.34） | 块守卫的持有单位从「一个请求」改成「一个块段」：round171 把「抢不到就拒」变成「抢不到就等」，但等仍然只发生在请求的**开头**，一个 128 块的写在卡上要占住守卫多久，页故障就最多等多久——round170 帧里 pid 1 正是这样死于一次页调入（`namespace 2 subcode 0xa` = SIGBUS），旁边摆着 8 条 `read guard … done=0 st=00000000`（主机一个错误位都没 raise，是这些读根本没拿到守卫）和两条 `tx_flush … took 102001275/120000602 us`。本轮在读写两条循环里，每交付满一段（`kReadChunkBlocks`）就 `handOffBlockGuard`：记下已占用时长、放行、重新排队，抢到才继续，队没排上就按 `guard` 报失败并结束本请求。死线随之改成 `owned + readCounter () - start`，**换手期间不计时**，所以卡的忙不再被算成驱动的死线（r167/r168 的 `write not ready`/`write gave up` 与 30 s 基数一字未动）。新增 `cuts=`/`waits=`/`worst=` 三个数与最多四行 `CloverSdhci r178: %s handoff …`；flush 那段不加换手——它等的是卡自己的缓存编程，任何锁策略都缩不了 | **已构建**，待冷刷；本轮不改 shipped 字节，屏上读的就是这一行 |
 | round179（v0.5.35） | 显示排期第一格：本板自己的内核被资格化，不再借别人的结论。`scripts/audit-clover-mobile-graphics-legacy.py` 在 `out/clover/kernel/kernel.macho` 里逐槽审计原始 `IOMobileFramebufferLegacy`——family `__TEXT_EXEC` 的 sha256 与 sheng 钉住的 `2e044ee6…` 一致（所以那六个构造函数站点是同一批指令）、vtable 262/262/358、抽象叶 `[211,213,245,246,306,307,337,338,345]`、service 相对 base 只加 `[0,1,7]`、103 处覆盖、`newUserClient` 落在 141（四参数原生 ABI）。**类身份是新的**：meta class 记录在文件里是零（装载时才填），所以身份不能读、只能推——family 文本里 `mov w3,#0x18a0` 只有一处，它前后的 ADRP/ADD 给出名字与父记录，紧挨着注册壳的那个 getter 物化记录本身。推出来 `record=0xfffffff006b35940`、`parent=0xfffffff006b31400`、`size=0x18a0`、`name=IOMobileFramebufferLegacy`，与 sheng 只能从 QEMU 里观测的四个数逐字相同，而这里一次运行都没有 | 本轮不改 shipped 字节：内核与负载哈希仍是 round178 的 `28324379…`，屏上读的仍是 r178 那三个数；`check-clover.py` 把脚本的常量与「不许把静态推断说成运行观测」当闸门，产出的 `build/display-analysis/clover-mobile-graphics-legacy-abi.json` 是 round180 生成 ABI 头与原始绑定表的输入 |
+| round180（v0.5.36） | 显示那一格不再是 stub。`scripts/build-clover-gop-legacy-display.py` 把 round179 的 ABI JSON 翻成本板自己的 `OriginalLegacyFramebufferABI.h` 与 `original-bindings.S`，编 `drivers/NativeMobileDisplay/`（板内检出，不是上游那份仍宣称 `v_display == 1` 的驱动）出真的 `NativeLegacyDisplay`/`NativeGOPPresenter` 档案；`[kernel].archives` 里 `build-clover-display-stub.py` 换成它，`CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y` 让基座构建 `-force_load` 那个 `.late.a`。档案的每条原始绑定都是 Apple family 文本里的一个地址，所以出档案前逐条重读 `out/clover/kernel/kernel.macho` 那一条指令，**一条不同就拒绝**；构造/析构走 `base + 0x1A5CC`/`base + 0x1A618`，`__mod_init_func` 被剥掉以免两个模块初始化器跑两遍。板级探针 `package/CloverLegacyDisplayProbe.cpp` 在 `_bsd_init` 里登记类、构造一个实例、`metaCast`、`init()`，说出它看到的 console 几何就收手——phase 1 不 attach 也不 start，七个仍未资格化的抽象叶一个不碰 | **已构建**，待冷刷；本轮没有一帧来自这份档案，`original_instructions_modified`/`driver_initialized`/`display_presented`/`device_observed` 四个标志都仍是 False |
 
 round171 + round172 + round173 一帧问九件事：`read guard` 是否整批消失（守卫只等、
 不拒），
@@ -117,6 +120,18 @@ pid 1 的 SIGBUS 消失而 `tx_flush … took … us` 仍在，那页调入不�
 下一格该改的是写段的长度而不是放手的时机；如果 `worst=` 自己就涨到秒级，那是卡的忙
 在排队，本轮的换手只是把它摊平了。
 
+round180 要读的是三行，都在卡上的内核日志环里（kind 22；round176 的白名单本来就含
+`clover r`，本轮没为它加任何东西）。`probe: console 1200x1920 row=… depth=… display=…
+rotate=… scale=… base=9d400000 length=…` 是固件把屏交出去之后**内核自己**看到的形状，
+也是板内驱动那句 `primary = video.v_display != 0` 唯一能依据的数；
+`probe: object=… size=6304 parent=1 init=<IOReturn>` 里的 6304 就是 round179 从本板注册
+指令推出来的 `0x18a0`，`parent=1` 是三级 `metaCast` 打中了原类；否则回来的是一条拒绝行
+（`preModLoad refused`、`postModLoad=<n>`、`no console descriptor`、`console rejected`、
+`allocation failed`），它直接说这个类死在哪一步。判据是顺序的：phase 1 三行齐了才准开
+phase 2（等 IOSurface 根）和 phase 3（GOP nub、attach/start），因为那两格会真的落到本板
+还没资格化的 backend 槽位上；`offline-legacy-validate/transfer/retire/pm` 与
+`sheng-fb-gpu` 是换手通路，屏还没开始呈现就没有换手，本轮一概没传。
+
 ### 排期（未开始 · 已知限制）
 
 1. **共享区映射（syscall 536）** — 头字段与签名注册两段已被 round159 帧关掉，
@@ -128,9 +143,10 @@ pid 1 的 SIGBUS 消失而 `tx_flush … took … us` 仍在，那页调入不�
    两个 GPT 副本之间、不进 GPT；原 54.4 GB userdata 内容没有迁移。
 3. **显示与 GPU** — 原始 `IOMobileFramebufferLegacy` 已在板内内核逐槽资格化
    （round179，`build/display-analysis/clover-mobile-graphics-legacy-abi.json`），
-   下一格是照 sheng 的 `build-gop-legacy-display.py` 为本板生成 ABI 头与原始绑定表、
-   编出真的 `NativeLegacyDisplay`/`NativeGOPPresenter` 档案，换掉现在链接进来的
-   `libCloverDisplayStub.a`。MDP5/DSI 的硬件通路仍未开始；Adreno 512 无驱动，
+   round180 起链接进来的已经是真档案（`build/native-legacy-display/libNativeLegacyDisplay.late.a`）
+   而不是 `libCloverDisplayStub.a`，phase 1 的登记与构造已在镜像里等读数。剩下的依次是
+   phase 2（IOSurface 根）、phase 3（GOP nub、attach/start）、phase 4（presenter 换手），
+   每一格都要上一格的读数才准放开。MDP5/DSI 的硬件通路仍未开始；Adreno 512 无驱动，
    没有 iOS 显示栈。
 4. **输入** — 触摸（`edt-ft5406` / focaltech `fts`）没有驱动。
 5. **网络、音频、USB** — WCN3990 WiFi/蓝牙、WCD 音频、USB device 模式都没有。
@@ -177,7 +193,8 @@ pid 1 的 SIGBUS 消失而 `tx_flush … took … us` 仍在，那页调入不�
 board.toml                    板级描述
 configs/clover_defconfig      内核配置
 feeds.toml                    每个常量所依据的两棵设备树
-drivers/                      板级 XNU 驱动（ArmCpu、CloverPMGR、CloverSdhci、CloverBlock …）
+drivers/                      板级 XNU 驱动（ArmCpu、CloverPMGR、CloverSdhci、CloverBlock、NativeMobileDisplay …）
+package/                      链接进内核但不属于任何驱动的板级代码（显示探针）
 patches/xnu-clover/           板级 XNU 补丁（探针与板级行为）
 scripts/                      ADT 生成器、预检与校验、事实采集、归档构建、md0/mockfs 根镜像
 notes/                        调研笔记 + development-log.md（逐轮流水）

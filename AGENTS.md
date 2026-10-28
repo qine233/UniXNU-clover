@@ -31,6 +31,8 @@ Run from the UniXNU checkout:
 ```sh
 ./unixnu defconfig clover_defconfig --device ../UniXNU-clover
 ./unixnu status --device ../UniXNU-clover --json
+git -C out/clover/tree/.cache/xnu-work apply -R \
+  ../../patches/xnu/zzy-clover-dyld-cache-skip.patch   # see the note below
 ./unixnu build kernel --device ../UniXNU-clover
 python3 ../UniXNU-clover/scripts/patch-clover-amfi.py \
   out/clover/kernel/kernel.macho ~/clover-out/roundNNN-kernel-amfi.macho
@@ -42,6 +44,17 @@ python3 ../UniXNU-clover/scripts/normalize-kernel-macho.py \
   --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
   --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
 ```
+
+`build-xnu-4k-baseline.sh` replays `patches/xnu/*.patch` in name order and skips
+a patch whose `--reverse --check` passes, which is what makes a rebuild of one
+tree one run. `zzy-clover-dyld-cache-skip.patch` edits the same `ubc_subr.c` and
+`ubc_internal.h` context as the earlier `native-4k-signature-hash-cache.patch`,
+so once it is in the tree the earlier patch is neither forward- nor
+reverse-appliable and the replay stops with `patch does not apply`. Reversing it
+first is the same convention the script already uses for the three base patches
+that overlap root/exec context -- reverse the newest, let the loop re-apply in
+name order -- and it is not a source change: the patch comes back on the same
+run, in the same order, in the same bytes.
 
 Build the kernel before the payload, and pass the kernel re-patched by
 `scripts/patch-clover-amfi.py`: every fresh prelink restores the two AMFI
@@ -57,6 +70,16 @@ segments, and the device never parses its own symbol table. The step goes after
 `patch-clover-amfi.py`, because the patcher moves bytes the identity fields
 would otherwise have to describe; `--check` verifies without rewriting and
 `--prove A B` asserts two builds of one tree converge.
+
+The display archive is built before that link, so within one run it audits the
+kernel the previous round shipped. Re-run it once the new kernel exists --
+`python3 scripts/build-clover-gop-legacy-display.py` inside `out/clover/tree` --
+and read the two object hashes in `build/native-legacy-display/build-report.json`
+before trusting the image: every pinned binding is an address inside Apple's
+family text, and the rebuild is what proves the archive now linked into this
+kernel is still qualified against this kernel. `archive_sha256` is not that
+evidence; `ar` stamps members with their mtime, so it moves on every run while
+the objects stay identical.
 
 After changing the board description or a driver, run both checks:
 

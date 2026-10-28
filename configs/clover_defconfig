@@ -4,8 +4,10 @@
 #
 # The list follows the board that has the same structural problem — an eMMC device with a
 # GPU that no native driver supports (UniXNU-gta4l, SM6115). clover keeps that shape:
-# no CONFIG_XNU_NATIVE_UFS, no CONFIG_XNU_NATIVE_ADRENO, no mobile display stack. The first
-# goal is stage 5 of the bring-up order: XNU reaching the platform expert and the console.
+# no CONFIG_XNU_NATIVE_UFS, no CONFIG_XNU_NATIVE_ADRENO. The first goal is stage 5 of
+# the bring-up order: XNU reaching the platform expert and the console. Round180 breaks
+# from gta4l on one item: the display stack is not stubbed any more, it is the original
+# Legacy framebuffer class built against this board's own kernel.
 
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
 # The kernel link needs the archives listed in [kernel] archives of board.toml, and the driver
@@ -28,6 +30,21 @@ CONFIG_XNU_NATIVE_ARCH_TIMER=y
 # so scripts/build-clover-pmgr.py writes our archive there. Requires SOURCE_CORECRYPTO14, which
 # is on above; the mode stamp at .sheng-pmgr-mode rebuilds bsd_init.o when it flips.
 CONFIG_XNU_SHENG_PMGR=y
+# Round180 replaces the display stub with the real thing. This one switch does four separate jobs in
+# the base build (build-xnu-4k-baseline.sh), and all four have to land together:
+#   * -DXNU_NATIVE_LEGACY_DISPLAY=1 into bsd_init.o and IOUserClient.cpo, which is what compiles the
+#     calls to native_legacy_display_probe() (behind offline-mobile-graphics-load=1 +
+#     offline-legacy-register=1) and native_legacy_display_late_probe() into the kernel;
+#   * a force-load of the exact path build/native-legacy-display/libNativeLegacyDisplay.late.a, after
+#     re-hashing that archive and every source named in its build-report.json against the tree, so a
+#     stale archive stops the build by name rather than linking an old driver;
+#   * a mode stamp, so bsd_init.o and IOUserClient.o actually recompile when the value flips;
+#   * the flag that makes the archive meaningful at all: without the probe calls the class is linked
+#     and never constructed.
+# The archive itself is written by scripts/build-clover-gop-legacy-display.py (listed in
+# [kernel] archives), which regenerates the ABI header from scripts/audit-clover-mobile-graphics-legacy.py
+# and pins every original-class binding to instructions it re-reads out of out/clover/kernel/kernel.macho.
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 # Kryo 260 (Cortex-A73/A53 derivatives) is ARMv8.0 and has no PSTATE.PAN: with
 # this on, the kernel's first `msr pan, #1` in arm_init raises an undefined
 # instruction at 0x79aff58, before arm_vm_init.
@@ -35,24 +52,32 @@ CONFIG_XNU_NATIVE_PAN=n
 
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 
-# The prelink roots in board.toml keep Apple's original display and GPU families, so the
-# link needs the stub archive that stands in for a driver clover does not have yet
-# (scripts/build-clover-display-stub.py, listed in [kernel] archives).
+# The prelink roots in board.toml keep Apple's original display and GPU families. Until round180 that
+# meant the link needed a stub standing in for a driver clover did not have yet
+# (scripts/build-clover-display-stub.py, now retired). The display archive is real now, and it is not
+# listed here on purpose: CONFIG_XNU_NATIVE_LEGACY_DISPLAY above makes build-xnu-4k-baseline.sh
+# force-load its exact path itself, after re-hashing the archive and its sources.
 #
-# The second entry is drivers/CloverSdhci (round87). Neither one uses -Wl,-force_load, and that
-# is deliberate: this variable is appended to the link line as a plain archive path, and both
-# archives define exactly the symbols something else in the kernel already references
-# (native_legacy_display_probe from the DEVELOPMENT patch, clover_emmc_run from
-# drivers/CloverPMGR/CloverPMGR.cpp), so ordinary archive resolution pulls the member in.
+# The two entries below are drivers/CloverSdhci (round87) and drivers/CloverBlock (round107). Neither
+# one uses -Wl,-force_load, and that is deliberate: this variable is appended to the link line as a
+# plain archive path, and both archives define exactly the symbols something else in the kernel
+# already references (clover_emmc_run from drivers/CloverPMGR/CloverPMGR.cpp, clover_block_run from
+# drivers/CloverSdhci's mode 21 tail), so ordinary archive resolution pulls the member in.
 # force_load would additionally keep anything unreferenced, which here means nothing.
-CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-display-stub/libCloverDisplayStub.a {tree}/build/clover-sdhci/libCloverSdhci.a {tree}/build/clover-block/libCloverBlock.a"
+CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-sdhci/libCloverSdhci.a {tree}/build/clover-block/libCloverBlock.a"
 
 # Not set, on purpose, and each one is a real porting task rather than a switch to flip:
 #   NATIVE_UFS          — clover boots from eMMC (sdhc_1 at 0xc0c4000), not UFS; there is no XNU SDHCI
 #                         driver to configure. drivers/CloverSdhci is this board's own, and round87 is
 #                         its first round: a read-only register dump, no commands, no block device.
 #   NATIVE_ADRENO       — the sheng driver targets Adreno 740; clover has Adreno 512.
-#   NATIVE_MOBILE_DISPLAY / NATIVE_LEGACY_DISPLAY — no MDP5/EVB bring-up yet.
+#   NATIVE_MOBILE_DISPLAY — that is the MDP5/EVB platform driver, and clover's panel is driven by an
+#                         Adreno 512 behind a Qualcomm display subsystem that no XNU driver speaks to.
+#                         What round180 turns on instead is NATIVE_LEGACY_DISPLAY: the original
+#                         IOMobileFramebufferLegacy class, which needs no vendor display hardware
+#                         because the GOP framebuffer the firmware hands over is its scanout memory.
+#                         Flipping NATIVE_MOBILE_DISPLAY would ask the base build for
+#                         libNativeMobileDisplay.late.a, an archive this board does not build.
 #   ARMVIRT_PLATFORM    — the DT platform expert owns the tree; the virt platform would shadow it.
 #   OWNER_*             — not defconfig switches on this board. build-xnu-4k-baseline.sh gates
 #                         OWNER_ROOT_TRUST on NATIVE_VIRTIO_BLOCK, which clover does not have;

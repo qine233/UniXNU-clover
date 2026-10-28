@@ -13083,3 +13083,103 @@ kit 的目录名是上游的 `kits/NativePrelink`，sheng 那份叫 `kits/XnuPre
 
 本轮无需刷机。
 
+
+## round180（v0.5.36）：显示那一格从 stub 换成真代码
+
+排期第 3 条的第二格。round179 把「这颗类是不是被资格化过的原始类」在宿主上回答完，
+本轮把它变成链接进内核的东西：`libCloverDisplayStub.a` 不再出现在这快板上，
+`[kernel].archives` 里那行换成了 `build-clover-gop-legacy-display.py`，产出的
+`build/native-legacy-display/libNativeLegacyDisplay.late.a` 由基座构建在
+`CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y` 下 `-force_load`。
+
+四件事各占一块：`drivers/NativeMobileDisplay/` 是板内检出的驱动（不是上游那份——
+上游的 `NativeMobileDisplay.cpp` 仍按 `v_display == 1` 认领主屏，而 ARM 端那个字段是
+Text/Graphics 标志不是模式枚举，所以本板这份改成 `video.v_display != 0` 并在调用点写了
+出处）；`package/CloverLegacyDisplayProbe.cpp` 是板级仪器，只占 27 个
+`_native_legacy_*` 钩子里的 18 个，另 9 个由驱动自己定义，所以它们在探针里必须保持
+**声明**而不是定义——力加载的档案里出现重复符号，报错会长得像一个显示问题；
+`scripts/build-clover-gop-legacy-display.py` 是这份档案的生成器；defconfig、
+board.toml 的三个 boot-args 与两个 checker 是接线。
+
+`CONFIG_XNU_NATIVE_LEGACY_DISPLAY` 这一个开关在基座构建里干四件事，缺一件都不成立：
+给 `bsd_init.o`/`IOUserClient.cpo` 加 `-DXNU_NATIVE_LEGACY_DISPLAY=1`（这是那两个
+probe 调用被编译进去的唯一原因）、按精确路径 force-load 那个 `.late.a` 并在加载前把档案
+和 `build-report.json` 里点名的每份源码对着树重哈希（陈旧档案会以名字拒绝构建而不是
+悄悄链进旧驱动）、留一个 mode stamp 让那两个 .o 真的重编、以及让档案有意义的那个前提
+（没有 probe 调用，类被链进来却永远不会构造）。
+
+### phase 1 只问两件事
+
+三个 boot-args 是一条链而不是三个开关：`offline-mobile-graphics-load=1` 让
+`native_mobile_graphics_load_probe()` 直接返回而什么都不碰；再加上
+`offline-legacy-register=1` 它才调 `native_legacy_display_probe()`；
+`offline-legacy-phase=1` 是最窄的那一档——登记类、构造一个实例、`metaCast`、`init()`，
+把 `PE_current_console` 交给内核的东西说出来，然后释放对象。它不 attach 也不 start，
+所以七个仍被挡着的 backend 叶一个都到不了。第一格的读数因此是类身份加 console 几何，
+不是一帧画面。`offline-legacy-validate/transfer/retire/pm`、`sheng-fb-gpu` 与
+phase 2/3/4 一概没传：那是换手通路，屏还没开始呈现就没有换手。
+
+### 本轮踩到的三处结构性坑
+
+**一、补丁重放的幂等会被后打的补丁打断。** `build-xnu-4k-baseline.sh` 靠
+「`--reverse --check` 过了就跳过」来让同一棵树跑一遍。`zzy-clover-dyld-cache-skip.patch`
+（round164）和前它的 `native-4k-signature-hash-cache.patch` 改的是同一段 `ubc_subr.c`
+与 `ubc_internal.h` 上下文，于是片已在树里时，前一片既不能正打也不能反打，重放停在
+`patch does not apply`。做法和脚本自己对那三片重叠 root/exec 上下文的基础补丁一样：
+先把最新那片反掉，让循环按名字顺序重新打上——不是改源码。已经写进 AGENTS.md 的构建序列。
+顺带记一次假警报：`git -C <dir> apply --check <相对路径>` 是按工作树解析补丁路径的，
+不是按调用者的 cwd，用相对路径探补丁状态会把每片都读成「没打上」。
+
+**二、逐字节的指令指纹会被布局打死。** 负载校验器里 round164 那三条签名让步的指纹
+（`NATIVE4K_SKIP`）原本是整组字节的相等。本轮链接进显示档案，内核文本长了一页，
+`hash accept` 那一组里有一个字节变了——那是 ADRP 的 `immlo`，编码的是**页差**，
+也就是这条指令离它的目标有多远，跟「跳过 16K 签名缓存在 4K 内核上的哈希推导」这个决定
+毫无关系。指纹于是报 ABSENT，而补丁明明在树里。改成带掩码的正则：把编码地址的字节
+换成 `.`，把 `b.cond` 的 19 位字偏移同样遮掉，只留寄存器号、立即数和条件这种真正说明
+决定的位；三条模式仍要求各自在 52 MiB 里恰好出现一次（在新内核、round178 内核和
+AMFI 拷贝上都数过一遍）。`check-clover.py` 现在钉住 `len(re.findall(pattern, kernel)) == 1`
+这个形状，回到整组字节相等会让未来每一次内核长大都看起来像丢了签名让步。
+（同一文件里还有两处整字节指纹也含 adrp/b 立即数，本轮没动，是下一格该顺手遮的。）
+
+**三、档案在内核链接之前构建，它审计的是上一轮 shipped 的内核。**
+`build-report.json` 里的 `kernel_sha256` 因此是 `b8e194b6…`（round178），不是本轮的
+`c3a5051d…`。这条顺序本身不是错——档案必须存在于链接之前——但它意味着「每条原始绑定
+都在这份内核里重新读过」这句承诺要对**已发布的镜像**再验一遍，于是本轮把审计和构建脚本
+对着 `out/clover/kernel/kernel.macho`（round180 自己）重跑：family `__TEXT_EXEC` 仍是
+`0xfffffff00576c000` 上的同 225140 字节同 sha，193 条绑定**一条都没动**，
+`NativeLegacyDisplay.o` 与 `.late.o` 逐字节相同。审计 JSON 里确实有 160 个槽的落点变了，
+它们全是 `inherited_native_entries` 和九个抽象叶——那是别的 kext 的文本和
+`___cxa_pure_virtual`，本来就会随内核长大而搬家，不在 Legacy 的 family 文本里。
+这条重验已经写进 AGENTS.md：链接之后重跑一次构建器，读那两个 object 哈希。
+
+同一趟把 `archive_sha256` 的疑点结掉了：连跑两次、四个成员逐字节相同、档案哈希不同
+（`b56ed261…` → `4b949b0a…`）——`ar` 把 mtime 写进成员头，所以档案哈希从来不是
+复现性的证据，`compiled_object_sha256`/`late_object_sha256` 才是；链接读的是 object
+字节，round177 那条「内核是这棵树的纯函数」不受影响。这段区别现在写在构建器
+写报告的那几行上面。
+
+### checker 与产物
+
+`check-clover.py` 本轮加四类断言：构建器必须在、它的关键形状必须在（板内路径强制、
+`kernel_sha256` 一致才出档案、构造/析构站点、精确的自有方法集、剥掉 `__mod_init_func`
+以免两个模块初始化器跑两遍、自包含符号合同、四个诚实标志），`device_observed=True`
+必须不出现；`scripts/build-clover-display-stub.py` **必须不在仓库里**（`unixnu tree`
+会照原样拷 `scripts/`，留着它就没人说清这块板子链的是哪份档案）；校验器那边新增
+`check_legacy_display`/`LEGACY_DISPLAY` 六条 needles（三个 gate 串、`clover r180:`
+stamp、console 行与 IOSurface 行），因为从这一轮起「显示是代码」这件事只能在负载里查。
+两个 checker 都过（exit 0）。
+
+产物：内核 prelink `c3a5051daf16…`、AMFI 归一化后 `fadb893d589c…`（965 个 object stamp
+抹平）、卷内内核 `46483bc9d56e…`、payload 56 MiB `b453884d54fa…`，三份都在
+`~/clover-out/round180-*`，哈希记在 `round180-SHA256SUMS`。
+
+### 下一格
+
+phase 1 的三行回来才谈 phase 2（等 IOSurface 根）与 phase 3（GOP nub、attach/start）。
+屏幕真的呈现之后，才是 Adreno 512 那格的问题——现在那份档案里 MDP5/DSI 一个字节都没有，
+它读的是固件交下来的 splash 区间。另外两处该顺手做的：`verify-clover-payload.py` 里还剩
+两条整字节指纹含地址编码，同样会在下一次内核长大时假报；触摸（`edt-ft5406` @ `blsp_i2c3`）
+本轮仍未碰。
+
+本轮不需要人在机器旁边：刷完回 recovery，`run-clover-unattended.sh` 拉一次 logfs，
+`read-clover-log.py --tee` 就给出这三行。

@@ -21,6 +21,7 @@ import hashlib
 import importlib.util
 import json
 import pathlib
+import re
 import struct
 import subprocess
 import sys
@@ -303,22 +304,33 @@ def check_amfi_allow(kernel: bytes) -> bool:
 # Round164's source concession has no string and no symbol naming it, so the image's evidence is
 # the three instruction groups the patch adds: the branch that recognises a 16K-signed blob on a
 # 4K kernel, the store that marks it skipped, and the early accept inside cs_validate_hash. Each
-# pattern is unique in the 52 MiB prelink. Losing any one means the payload was built from a tree
-# without zzy-clover-dyld-cache-skip.patch, which is exactly the tens-of-minutes preflight walk.
+# group has to stay unique in the 52 MiB prelink. Losing any one means the payload was built from a
+# tree without zzy-clover-dyld-cache-skip.patch, which is exactly the tens-of-minutes preflight walk.
+#
+# Three of the twenty bytes here are wildcarded, and each for a reason that is not taste: they encode
+# an address, not a decision. `b.cond` carries its target as a 19-bit word offset, and `adrp` carries a
+# 21-bit page difference -- both change when unrelated code in another file grows and moves the target
+# a page. That is what happened in round180: the display archive is ~30 KB of new kernel text, the
+# ADRP byte for the cs_validate_hash guard went 0x74 to 0x54, and an exact-byte fingerprint reported a
+# missing patch that is in the source and in the image. Every byte that names a register, a struct
+# offset or a tested bit stays pinned, so what is being asserted is still the instruction, not an
+# address: load w11 from the blob flags, materialise the guard's page (page number free), add #0x120,
+# load the counter, and test bit 0 of w11 with the branch that accepts the faulted subrange.
 NATIVE4K_SKIP = (
-    ("prepare branch", bytes.fromhex("1f39007120094c7ae0020054")),
-    ("skipped store", bytes.fromhex("2800805228400339")),
-    ("hash accept", bytes.fromhex("0b40433974d1ffd0948204918a0240b9cb010036")),
+    ("prepare branch", rb"\x1f\x39\x00\x71\x20\x09\x4c\x7a...(\x54)"),
+    ("skipped store", rb"\x28\x00\x80\x52\x28\x40\x03\x39"),
+    ("hash accept", rb"\x0b\x40\x43\x39.\xd1\xff\xd0\x94\x82\x04\x91\x8a\x02\x40\xb9\xcb\x01\x00\x36"),
 )
 
 
 def check_dyld_cache_skip(kernel: bytes) -> bool:
     """Round164 stops deriving 4K page hashes for the 16K-signed dyld caches. The compiler may
-    move the three groups within their functions, but each group's bytes survive; requiring all
-    three means both halves are present -- skipping the derivation without accepting the faulted
-    subranges would reject every page instead of accepting it."""
+    move the three groups within their functions, and the linker may move their targets between
+    pages, but the instructions themselves survive; requiring all three means both halves are
+    present -- skipping the derivation without accepting the faulted subranges would reject every
+    page instead of accepting it."""
     label = "kernel.macho: dyld cache hash skip"
-    found = {name: kernel.count(pattern) == 1 for name, pattern in NATIVE4K_SKIP}
+    found = {name: len(re.findall(pattern, kernel)) == 1 for name, pattern in NATIVE4K_SKIP}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
@@ -449,6 +461,37 @@ def check_verdict_ring(kernel: bytes) -> bool:
     found = {name: name.encode() in kernel for name in VERDICT_RING}
     ok = all(found.values())
     detail = ", ".join(f"{name.split(':')[1].strip()} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
+# Round180 is the first round whose display stack is real code rather than a stub, and the payload is
+# the only place that claim can be checked: the defconfig says the link force-loads
+# build/native-legacy-display/libNativeLegacyDisplay.late.a, but a stale archive, a stripped probe or a
+# kernel built before the switch flip would all still leave the menu reading "r180". Each string below
+# exists in exactly one of the two halves this round adds -- drivers/NativeMobileDisplay (the original
+# Legacy framebuffer class, rebuilt against this kernel) and package/CloverLegacyDisplayProbe.cpp (the
+# registration and construction probe) -- and none of them appears in the shipped image today, so their
+# presence is the evidence that both halves crossed the link. The names are pairs because the reading
+# has to be legible in the verifier's own line: a format string is not something to print as a label.
+LEGACY_DISPLAY = (("legacy boot args", "offline-legacy-transfer"),
+                  ("cpu-present gate", "offline-legacy-cpu-present"),
+                  ("gpu hand-off gate", "sheng-fb-gpu"),
+                  ("probe round stamp", "clover r180:"),
+                  ("console reading", "probe: console %ux%u row=%u depth=%u display=%llu rotate=%u scale=%u base=%llx length=%llx"),
+                  ("IOSurface root reading", "late: IOSurface load=%d root found=%u"))
+
+
+def check_legacy_display(kernel: bytes) -> bool:
+    """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
+    registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
+    except its own strings, so a payload that ships without them boots the round179 display stack while
+    the menu, the boot args and this verifier all say otherwise."""
+    label = "kernel.macho: legacy display archive linked"
+    found = {name: needle.encode() in kernel for name, needle in LEGACY_DISPLAY}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
     print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
     return ok
@@ -836,6 +879,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_kernel_normalized(kernel)
         ok &= check_unattended(kernel)
         ok &= check_inline_asm_tails(kernel)
+        ok &= check_legacy_display(kernel)
     return 0 if ok else 1
 
 
