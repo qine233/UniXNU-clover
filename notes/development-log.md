@@ -14012,3 +14012,50 @@ fastboot。等不到就以 exit 6 结束，话里说清两种可能（死线没�
 round147 时期）都停在 `waiting up to 900s for fastboot` 那一行，`~/clover-out/` 里也没有
 任何一份 `clover-logfs.bin`，所以「卡是读数的地方」这件事到目前为止只有驱动侧的一半是真的，
 宿主侧那一半（recovery 里 `dd`）在这台主机上还没被任何一次运行证明过。
+
+## round184 刷写测试·第二次（2026-10-29）：卡真的读回来了，卡上一个字节都不是我们写的
+
+第一次尝试死于宿主脚本少认一个 adb 状态（见上一节）。补完 `--boot-after-flash` 之后重跑：
+`cache` 分区里那份 58720256 字节的 payload 冷引导起来了，板子跑了大约死线那一段自己重启。
+用户给的是这一轮唯一的一句板上观测：
+
+> 并不会到 fastboot，它重启了
+
+这句话把 round147 立起来的那条自动通道打断在半途：死线（`clover-unattended=300`）确实烧到了
+ArmCpu 那侧的墙钟，但 panic→IMEM `0x146bf65c = 0x77665501`→PSCI 复位→下一棒固件进 fastboot 这
+一段没有走完，或者走完了而 `fastboot devices` 里那一行恰好在这台主机重新枚举之前消失。重启之后
+这台 Mac 的 USB 拓扑里连平板本身都看不到——跑到我们内核里的板子本来就没有 USB device mode，
+所以「看不到」不能反过来当证据。结论只能写成中性的一句：**IMEM→fastboot 这一棒在这台机器上仍然
+是未证，不是被否**。
+
+读的那一侧这轮是真的通了，而且通了之后立刻推翻了一件被写进 README 十几轮的事。
+
+第一处缺陷在 `adb_serial()`：它只认 `device`，而 TWRP 的 adbd 报的状态名是 `recovery`。
+所以 round147 到 round184 之间每一次「等不到 recovery」都是假阴性——上一节里那句「这台 Mac 的
+USB 拓扑里完全看不到平板」有一半是这台主机自己没认出来。放宽之后同一秒就取到了序列号，
+`ro.product.device=clover`、`ro.twrp.version=3.7.1_12-1-clover-th3fron3` 两个身份都读得到。
+
+第二处在读窗口本身。旧代码要求文件偏移 0 处出现 `UXNULOG1`，长度不符就判失败。这里有两层错：
+TWRP 的 adbd 会把 `dd` 自己的统计和块数据挤在同一条流上——脚本依次试的三个 by-name 路径每次都回来
+622677 字节，多出的 85 字节正是那句统计；而偏移 0 有 magic 从来不是「logfs 窗口」的属性，它只是「槽 0
+恰好装着一条活记录」的属性。改成设备侧 `dd ... 2>/dev/null` + 只校验 622592 字节，窗口里到底有没有记录交给
+解码器判。修完之后手工一次 `dd if=/dev/block/mmcblk0p39 bs=512 count=16384 2>/dev/null` 稳定回
+来 8388608 字节（脚本自己那一趟没有端到端重跑过：板子在几分钟后就离开了 USB 总线，要再跑得手把
+它按回 recovery，所以这轮证的是脚本现在发出的那条命令，不是脚本的一次干净退出），整段分区与 `~/clover-out/round127-logfs.img` 逐字节相同，`grep -c UXNU` = 0。
+
+也就是说：**驱动写了十几轮，卡上一次都没落。**这不是「写丢了」，而是写从来没有被允许开始。
+`gVerdictReady`/`gTeeReady`/`gPanicLogReady` 三个上膛位只在一条分支里置位，而那条分支的入口条件是
+`logNewestFound20 != 0`——本次启动先从报告窗（前 32 扇区）里读到过一条既有记录
+（`drivers/CloverSdhci/CloverSdhci.cpp:6110-6118`）。round127 把 logfs 分区刷成了 8 MiB 裸 APFS
+容器，唯一的既有记录就是在那一次被抹掉的，此后每一条启动都读不到记录、于是不上膛、于是不落卡、
+于是下一条启动照样读不到。环把自己锁死了，而且锁是自我维持的：光靠重启解不开。
+
+顺带否掉一个自己猜的机制：「eMMC 按 4 KiB 块寻址，所以写被整体位移 8 倍」。recovery 的 sysfs 三个数
+都是 512（`logical/physical/hw_sector_size`），`blockdev --getbsz` 的 4096 是 Linux 自己的缓冲区块
+大小，不是卡的地址粒度。驱动里 `kLogfsFirstLba = 12320768u` 和 sysfs 报的 p39 `start` 是同一个数，
+窗口位置也没错。
+
+排期第 5 条因此换了一格，而且换成了 iOS 到桌面这一格的前置：卡上的读数通道要能用，先得让它上膛。
+下一轮只问一件事——把上膛条件从「读到过旧记录」改成「GPT 里认出了 logfs 分区」（`arming on the GPT
+match alone`），并顺带回答窗口该不该继续放在被内核当根挂载的那块分区上（p39 扇区 0 属于容器超块区，
+宿主种一条假记录只会写进 APFS 元数据）。在此之前，所有「卡上的读数」仍然只是照片。

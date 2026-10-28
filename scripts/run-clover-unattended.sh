@@ -97,7 +97,11 @@ fastboot_serial() {
   fastboot devices 2>/dev/null | awk '$2 == "fastboot" {print $1; exit}'
 }
 adb_serial() {
-  adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" {print $1; exit}'
+  # TWRP's adbd reports the state as "recovery", not "device". Round147 through round184 matched only
+  # "device" here, so a board sitting in TWRP looked like a board that never booted recovery -- the
+  # 180 s wait in the first round184 flash test timed out with recovery already on the USB bus. Both
+  # states mean the same thing to this script: there is a shell to dd the log window through.
+  adb devices 2>/dev/null | awk 'NR > 1 && ($2 == "device" || $2 == "recovery") {print $1; exit}'
 }
 wait_fastboot() {
   local deadline=$(( $(date +%s) + WAIT ))
@@ -201,13 +205,21 @@ say "recovery: device=${device:-?} twrp=${twrp:-?}"
 dump_ok=0
 for source in /dev/block/bootdevice/by-name/logfs /dev/block/by-name/logfs /dev/block/mmcblk0p39; do
   say "reading $source"
-  if adb exec-out "dd if=$source bs=512 count=1216" > "$OUT" 2>/dev/null; then
+  # Two host-side traps, both found by the first real run of this script against a board sitting in
+  # TWRP. (1) TWRP's adbd puts dd's own statistics on the same stream as the block data, so a plain
+  # `adb exec-out dd` came back 85 bytes long and no length check could be trusted; redirecting dd's
+  # stderr inside the shell command keeps the stream at exactly 1216 sectors. (2) This used to require
+  # "UXNULOG1" at file offset 0, which is not a property of a logfs window -- it is a property of slot
+  # 0 holding a live record. The report window appends (slot k at sector 2k), so the newest record sits
+  # wherever the cursor reached, and the card's first sectors can legitimately hold anything. Whether
+  # this window carries records is a question for the decoder below, not for a magic number.
+  if adb exec-out "dd if=$source bs=512 count=1216 2>/dev/null" > "$OUT" 2>/dev/null; then
     size=$(wc -c < "$OUT" | tr -d ' ')
-    if [ "$size" = 622592 ] && [ "$(head -c 8 "$OUT")" = "UXNULOG1" ]; then
+    if [ "$size" = 622592 ]; then
       dump_ok=1
       break
     fi
-    say "  $source: $size bytes, magic absent"
+    say "  $source: $size bytes, expected 622592"
   else
     say "  $source: read failed"
   fi
