@@ -13183,3 +13183,38 @@ phase 1 的三行回来才谈 phase 2（等 IOSurface 根）与 phase 3（GOP nu
 
 本轮不需要人在机器旁边：刷完回 recovery，`run-clover-unattended.sh` 拉一次 logfs，
 `read-clover-log.py --tee` 就给出这三行。
+
+### 文档闸门：改一次 board.toml 要过九个区
+
+v0.5.36 推上去，tag 那条 run 绿，main 那条 run 红：
+
+```
+porting record: board.toml: update audio findings or evidence with this change
+```
+
+上游 `scripts/porting-record.py` 的 `check_changes()` 对每个改动文件做
+`fnmatch`，owner 是「当前或基线 `paths` 里出现这个文件」的**全部**区，然后逐区要求
+`findings` 或 `evidence` 相对基线真的变了；`need()` 一抛就退出，所以它一次只报第一个。
+按本地复刻跑一遍，本轮 `board.toml` 的 owner 是九个区，缺六个：
+
+| 区 | 基线到 r180 | 缺什么 |
+| --- | --- | --- |
+| audio | 无 | 一句本轮事实 |
+| configuration | 停在 r178 | 新开关 + 三条 boot arg |
+| diagnostics | 已更新 | — |
+| firmware | 停在 r179 | 检查器新增的三向互锁 |
+| gpu | 已更新 | — |
+| input | 已更新 | — |
+| memory | evidence 变了 | 补一句 boot 时多了什么 |
+| network | 停在 r178 | 一句本轮事实 |
+| packaging | 停在 r178 | 本轮哈希 + ar mtime 结论 |
+| power | 无 | defconfig 那行改了但不碰电源 |
+
+补完这六条，本地同一条命令 exit 0（`clover: 13 structured areas checked`）。
+以后别再靠 CI 报：`AGENTS.md` 的 Porting record 一节现在写清楚这条闸门是 fail-fast、
+`board.toml` 被九个区认领、以及本地怎么跑（上游脚本要和它同级的 `components.toml`，
+要 python 3.11+ 才有 `tomllib`；它读工作区的 `porting.toml`，但改动清单来自
+`git diff base HEAD`，所以未提交的记录改动能对着已推的那一轮验）。
+
+同一段还顺手改了一处过期陈述：`display` 早已不在 `planned` 那串里，round180 之后它是
+`implemented` —— 结掉的是原始 Legacy 类的契约，不是它背后的 MDP5/DSI 硬件。

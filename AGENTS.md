@@ -108,9 +108,12 @@ documentation site renders this same record. Follow its schema and completion
 levels for both maintainer and agent work.
 
 Every porting area is present even when this board does not implement it.
-`display`, `input`, `gpu`, `network`, and `audio` are `planned`, because the
+`input`, `gpu`, `network`, and `audio` are `planned`, because the
 components sheng uses for them are SM8550-specific (MDP/DPU, Novatek touch,
-Adreno 740, ath12k, ADSP) and cannot be selected here. `storage` is the active
+Adreno 740, ath12k, ADSP) and cannot be selected here. `display` left that list
+in round180: the original `IOMobileFramebufferLegacy` is now linked and
+constructed at phase 1, which is implementation of the class contract, not of
+the MDP5/DSI hardware behind it. `storage` is the active
 area: `CloverSdhci` and `CloverBlock` own the eMMC path. The r170 frame showed
 the wall is still inside storage, not upstream of it: launchd does reach
 `Early boot complete` and execs real daemons, and pid 1 then dies of SIGBUS
@@ -118,6 +121,26 @@ because a 102-second checkpoint flush on the Data volume held the block guard
 while every other read reported `read guard ... st=00000000` -- contention, not
 media. Read a driver failure line by its stage before blaming the card, the
 filesystem, or dyld.
+
+The upstream gate that enforces the sentence above is fail-fast and it is
+wider than it looks: it matches every changed file against *each* area whose
+`paths` name it, and `board.toml` alone is owned by nine areas (`audio`,
+`configuration`, `diagnostics`, `firmware`, `gpu`, `input`, `memory`,
+`network`, `packaging`). Editing `board.toml` therefore means saying something
+in all nine, or CI stops at the first one and hides the rest. Run the same check
+locally before pushing -- it needs python 3.11 or newer for `tomllib`, and it
+reads `components.toml` from the directory above the script:
+
+```
+mkdir -p /tmp/tools/scripts
+gh api repos/UniXNU/UniXNU/contents/scripts/porting-record.py --jq .content | base64 -d > /tmp/tools/scripts/porting-record.py
+gh api repos/UniXNU/UniXNU/contents/components.toml --jq .content | base64 -d > /tmp/tools/components.toml
+/opt/homebrew/bin/python3.13 /tmp/tools/scripts/porting-record.py check --device . --base <previous round's commit>
+```
+
+It reads `porting.toml` from the working tree but the changed-file list from
+`git diff base HEAD`, so a not-yet-committed record edit can be validated
+against the round that is already pushed.
 
 XNU patches are replayed by filename order, `git apply --reverse --check` first
 and `set -e`. A new probe must never be inserted inside a block added by a
