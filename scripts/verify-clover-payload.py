@@ -616,6 +616,23 @@ def check_log_window(kernel: bytes) -> bool:
     return ok
 
 
+def check_spawn_why(kernel: bytes) -> bool:
+    """Round186 asks which path launchd's posix_spawn() failed to resolve. The image has to carry both
+    ENOENT producers' lines: the program-path walk (with the component that stopped, the mount behind
+    the deepest prefix that resolved, and whether a retry fails the same way) and the dylinker lookup.
+    A payload with only one of them cannot tell "the executable is not there" from "dyld is not
+    there" -- and launchd panics on either with the same five words."""
+    label = "kernel.macho: spawn ENOENT probe linked"
+    found = {"spawn-why": (b"clover r186: spawn-why err=%d n=%d path=%s stop=%s good=%s "
+                           b"fs=%s on=%s mflags=%lx retry=%d\n") in kernel,
+             "loader-why": b"clover r186: loader-why n=%d err=%d path=%s pid=%d\n" in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -1018,6 +1035,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_clover_dsp(kernel)
         ok &= check_panic_drain(kernel)
         ok &= check_log_window(kernel)
+        ok &= check_spawn_why(kernel)
     return 0 if ok else 1
 
 

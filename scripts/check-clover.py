@@ -1514,9 +1514,10 @@ def check_board(errors: list) -> str:
     # probe still says r180, drivers/CloverInput says r181, drivers/CloverPower says r182 and
     # drivers/CloverDsp says r183 -- because the tee on the card filters the shared "clover r"
     # prefix, not a round number. Round185 moves the log window to logdump and arms the rings from the
-    # GPT walk, so the SDHCI driver now carries its own r185 stamp for the arming line.
-    if not board["payload"]["title"].startswith("clover r185:"):
-        errors.append('[payload] title is not "clover r185: ...": the menu would not name this round')
+    # GPT walk, so the SDHCI driver carries its own r185 stamp for the arming line; round186 changes no
+    # driver at all, so that stamp stays and only the menu moves.
+    if not board["payload"]["title"].startswith("clover r186:"):
+        errors.append('[payload] title is not "clover r186: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2152,6 +2153,47 @@ def check_board(errors: list) -> str:
                 errors.append(f"{unattended.name} lacks {needle[:40]}...: the host would wait for the "
                               "wrong adb state, gate a good dump on dd's own stderr, or read the "
                               "partition the kernel mounted instead of the log window")
+
+    # Round186. launchd panics with "required boot task executable not found" and neither the panel nor
+    # the card says which path its posix_spawn() looked up. The kernel is the only place that knows, and
+    # it has exactly two producers of that errno on the spawn path: the program-path namei() in
+    # exec_activate_image() and the dylinker namei() in get_macho_vnode() -- load_return_to_errno() maps
+    # every other kernel return to EBADARCH/EBADMACHO/EACCES/EAUTH. So the probe re-resolves the failing
+    # path one component at a time and prints the component that stopped, the filesystem and mount point
+    # behind the deepest prefix that resolved, and whether retrying the same path fails the same way.
+    # That is the difference between "this file is not in the volume", "the volume under launchd lost its
+    # contents" and "one lookup failed once".
+    spawn_probe = next((base / "patches/xnu-clover/zzzz-clover-spawn-why.patch"
+                        for base in (REPO, pathlib.Path.cwd())
+                        if (base / "patches/xnu-clover/zzzz-clover-spawn-why.patch").is_file()), None)
+    if spawn_probe is None:
+        errors.append("patches/xnu-clover/zzzz-clover-spawn-why.patch is missing: the next frame would "
+                      "name only the fact that a boot task was not found, not the path that stopped "
+                      "resolving or the mount behind it")
+    else:
+        text = spawn_probe.read_text()
+        for needle in ("bsd/kern/kern_exec.c", "bsd/kern/mach_loader.c",
+                       "clover r186: spawn-why err=%d n=%d path=%s stop=%s good=%s fs=%s on=%s "
+                       "mflags=%lx retry=%d\\n",
+                       "clover r186: loader-why n=%d err=%d path=%s pid=%d\\n",
+                       "proc_getpid(vfs_context_proc(ctx)) != 1", "#define CLOVER_SPAWN_WHY_LIMIT  24",
+                       "vfs_name(mp, fsname)", "vfs_statfs(mp)->f_mntonname", "vnode_mount(vp)"):
+            if needle not in text:
+                errors.append(f"{spawn_probe.name} lacks {needle[:44]}...: without the component walk, "
+                              "the mount behind the deepest good prefix, the pid-1 gate, the cap and "
+                              "the retry line the probe cannot answer the question round186 asks")
+        # Print-only is the whole safety argument: the probe runs after the kernel has already decided
+        # the errno, and it may not change what userland sees. So the patch may delete no source line --
+        # and it must not touch the dylinker's LOAD_ENOENT conversion either, which is the other place
+        # a well-meant fix would silently change behavior.
+        removed = [line for line in text.splitlines() if line.startswith("-") and not
+                   line.startswith("---")]
+        if removed:
+            errors.append(f"{spawn_probe.name} deletes {removed[0][:60]!r}: the spawn probe prints and "
+                          "returns, and a line it removes is a change in what launchd is told")
+        if "clover r185:" in text or "clover r170:" in text:
+            errors.append(f"{spawn_probe.name} carries an older round's string: its own lines are the "
+                          "only new readings this round produces")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())

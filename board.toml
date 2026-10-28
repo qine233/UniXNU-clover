@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r185: the log window moves to logdump and the rings arm from the card's own GPT"
+title = "clover r186: the kernel says which path a failed boot-task spawn resolved up to"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

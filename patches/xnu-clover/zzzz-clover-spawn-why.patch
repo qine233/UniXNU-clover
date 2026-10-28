@@ -1,0 +1,135 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 9945020..4ee80a4 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2232,6 +2232,86 @@ struct execsw {
+ };
+ 
+ 
++/*
++ * Clover (round186): launchd turns a posix_spawn() that returns exactly ENOENT
++ * into "required boot task executable not found" and panics a required boot
++ * task, and neither the console nor the card says which path it looked up or
++ * how far that lookup got.  The only ENOENT producers on this path are the
++ * namei() in exec_activate_image() (program path) and the one in
++ * get_macho_vnode() (dylinker path) -- load_return_to_errno() maps everything
++ * else to EBADARCH/EBADMACHO/EACCES/EAUTH -- so re-resolving the path one
++ * component at a time names the component that stops, and one retry says
++ * whether it stopped for good.  Print only: the errno returned to userland is
++ * never touched, and launchd is the only process examined.
++ */
++#define CLOVER_SPAWN_WHY_LIMIT  24
++static int clover_spawn_why_count;
++
++static void
++clover_spawn_why(const char *path, int error, vfs_context_t ctx)
++{
++	char prefix[128], stop[128], good[128], fsname[MFSNAMELEN], onname[MNAMELEN];
++	struct nameidata *walk;
++	struct vnode *vp = NULL;
++	mount_t mp = NULL;
++	unsigned long mflags = 0;
++	size_t len, i;
++	int retry, err;
++
++	if (path == NULL || proc_getpid(vfs_context_proc(ctx)) != 1 ||
++	    clover_spawn_why_count >= CLOVER_SPAWN_WHY_LIMIT) {
++		return;
++	}
++	clover_spawn_why_count++;
++
++	len = strlen(path);
++	if (len == 0 || len >= sizeof(prefix)) {
++		return;
++	}
++	memcpy(prefix, path, len + 1);
++	stop[0] = good[0] = '\0';
++	strlcpy(fsname, "-", sizeof(fsname));
++	strlcpy(onname, "-", sizeof(onname));
++
++	walk = kalloc_type(struct nameidata, Z_WAITOK | Z_ZERO | Z_NOFAIL);
++	for (i = 1; i <= len; i++) {
++		if (i != len && prefix[i] != '/') {
++			continue;
++		}
++		prefix[i] = '\0';
++		NDINIT(walk, LOOKUP, OP_LOOKUP, FOLLOW | LOCKLEAF, UIO_SYSSPACE, CAST_USER_ADDR_T(prefix), ctx);
++		err = namei(walk);
++		nameidone(walk);
++		if (err != 0) {
++			strlcpy(stop, prefix, sizeof(stop));
++			break;
++		}
++		vp = walk->ni_vp;
++		strlcpy(good, prefix, sizeof(good));
++		mp = vnode_mount(vp);
++		vnode_put(vp);
++		prefix[i] = '/';
++	}
++
++	/* Same path again: a sticky failure and a one-off look different here. */
++	NDINIT(walk, LOOKUP, OP_LOOKUP, FOLLOW | LOCKLEAF, UIO_SYSSPACE, CAST_USER_ADDR_T(path), ctx);
++	retry = namei(walk);
++	nameidone(walk);
++	if (retry == 0) {
++		vnode_put(walk->ni_vp);
++	}
++	if (mp != NULL) {
++		vfs_name(mp, fsname);
++		strlcpy(onname, vfs_statfs(mp)->f_mntonname, sizeof(onname));
++		mflags = (unsigned long)vfs_flags(mp);
++	}
++	kfree_type(struct nameidata, walk);
++
++	printf("clover r186: spawn-why err=%d n=%d path=%s stop=%s good=%s fs=%s on=%s mflags=%lx retry=%d\n",
++	    error, clover_spawn_why_count, path, stop[0] ? stop : "-", good[0] ? good : "-", fsname, onname,
++	    mflags, retry);
++}
++
+ /*
+  * exec_activate_image
+  *
+@@ -2304,6 +2384,7 @@ again:
+ 		if (error == ERESTART) {
+ 			error = EINTR;
+ 		}
++		clover_spawn_why(excpath, error, imgp->ip_vfs_context);
+ 		goto bad_notrans;
+ 	}
+ 	imgp->ip_ndp = ndp;     /* successful namei(); call nameidone() later */
+diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
+index f7e87c7..a1c852f 100644
+--- a/bsd/kern/mach_loader.c
++++ b/bsd/kern/mach_loader.c
+@@ -3764,6 +3764,13 @@ remap_now:
+ 
+ #endif
+ 
++/*
++ * Clover (round186): bounds the loader-why line below; see
++ * clover_spawn_why_count in bsd/kern/kern_exec.c for why this is worth printing.
++ */
++#define CLOVER_SPAWN_WHY_LIMIT  24
++static int clover_loader_why_count;
++
+ /*
+  * This routine exists to support the load_dylinker().
+  *
+@@ -3809,6 +3816,17 @@ get_macho_vnode(
+ 	NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | LOCKLEAF, UIO_SYSSPACE, CAST_USER_ADDR_T(path), ctx);
+ 
+ 	if ((error = namei(ndp)) != 0) {
++		/*
++		 * Clover (round186): this is the second of the two ENOENT producers a
++		 * posix_spawn() can see (the other is the namei() in
++		 * exec_activate_image()); it says which dylinker path was looked for.
++		 */
++		if (clover_loader_why_count < CLOVER_SPAWN_WHY_LIMIT) {
++			clover_loader_why_count++;
++			printf("clover r186: loader-why n=%d err=%d path=%s pid=%d\n",
++			    clover_loader_why_count, error, path,
++			    proc_getpid(vfs_context_proc(ctx)));
++		}
+ 		if (error == ENOENT) {
+ 			error = LOAD_ENOENT;
+ 		} else {

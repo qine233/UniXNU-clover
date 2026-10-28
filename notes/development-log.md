@@ -14156,3 +14156,117 @@ shipped 的 mode 21 不碰。
 另记一笔 tee 竞态痕迹：keybagd 退出行被叠了一笔 `(1) syscall-unix 55`（slot 349），
 `(apply-protobox)`（slot 347）同源——tee 从 msgbuf 拷贝时内核还在写同一行。判读不受影响，
 但这说明 tee 的行边界在并发下并不原子。
+
+## round186（v0.5.46）：内核自己说出「哪个路径查不下去」
+
+### 排期仍然没动，因为桌面这一格还没过
+
+三件仪器（触摸 / PMIC 轨 / ADSP）照旧停在 boot args 之外，`clover-unattended=300` 照旧在最后一
+行。本轮一行驱动代码没写，做的还是「让下一次冷刷自己回答一个问题」这件事——上一帧把墙收窄成两
+条（launchd 报 required boot task 找不到可执行文件、keybagd `rv=0x4700`），而这两条里第一条在现
+有的通道上是**读不出内容**的：屏上那句 `boot task failure: … - required boot task executable not
+found` 是 launchd 自己拼的，卡上内核环里的 exec/exit 行只到 `exec pid=12 comm=usermanagerd` 为
+止，没有任何一处说过它要 spawn 的是哪个路径、那个路径查到第几段断掉。
+
+### 前置调查：清单、判据与 ENOENT 的两个生产者
+
+- launchd 的清单不在文件系统上，是**嵌在 `/sbin/launchd` 里的 XML plist**：偏移 426879、9237 字
+  节，`Boot` 表 34 条任务。宿主侧把它读出来逐条对着 root 卷和 staged 卷走过一遍（任务 314、315）。
+- panic 串的产地在 plist 消费之后：required 任务的 spawn 失败值被拿来和 `#0x2` 比，等于 2（也就是
+  ENOENT）就走到那句「executable not found」。清单里真正**既 required 又没有任何 gate**、而卷上又
+  不存在的那一条是 `/usr/libexec/darwinos-boot-task`（`Boot` 第 23 条，`RequireSuccess`）。
+- 但「它不存在」这件事在板子上有三种截然不同的成因——压根没 stage、stage 在另一个卷上而挂载顺序
+  不对、或者查的时候那个卷还没挂上——而内核返回给用户态的只有一个 errno。所以本轮不猜，插桩。
+
+### 插桩的形状：只有两个生产者值得问
+
+这条路上能产生 ENOENT 的地点恰好两处，这是能插桩的前提：`exec_activate_image()` 里对**程序路径**
+的 `namei()`，和 `get_macho_vnode()` 里对**dyld 路径**的 `namei()`。`load_return_to_errno()` 把
+其它一切失败映射成 EBADARCH/EBADMACHO/EACCES/EAUTH/EIO/EBADEXEC，不会伪装成 2。于是
+`patches/xnu-clover/zzzz-clover-spawn-why.patch` 只做三件事：
+
+1. `exec_activate_image()` 失败分支里（`goto bad_notrans` 之前）调 `clover_spawn_why(excpath,
+   error, imgp->ip_vfs_context)`。它只理 pid 1、每处最多 24 条，把路径按 `/` 切段，每段一次
+   `NDINIT(..., FOLLOW | LOCKLEAF, UIO_SYSSPACE, ...)` + `namei()`，打印
+   `err=/n=/path=/stop=/good=/fs=/on=/mflags=/retry=`。
+2. `get_macho_vnode()` 的失败 namei 分支里（ENOENT 转 `LOAD_ENOENT` 之前）打一行
+   `clover r186: loader-why n=%d err=%d path=%s pid=%d`——dyld 那一侧的 2 和程序那一侧的 2 必须
+   能被分开，否则「缺 dyld」会被读成「缺 boot task」。
+3. 同一整条路径紧接着再 `namei()` 一次（`retry=`），粘住的失败和偶发的失败在这里分家。
+
+**只加日志，不改行为**：返回用户态的 errno 一个字节都没动，checker 把这条写成硬断言（补丁里除了
+`---` 头不许出现任何以 `-` 开头的行）。135 行补丁、99 条新增、0 条删除。
+
+### 三个实现细节，每一个都能让下一轮白费一次冷刷
+
+- **`nameidone()` 在这份 XNU 里只放 pnbuf，不放 `ni_vp`**（`bsd/vfs/vfs_lookup.c:1949`）。逐段走
+  查里每成功一段都得自己 `vnode_put()`；本轮需要先取 `vnode_mount(vp)` 再放，因为 `fs=`/`on=`/
+  `mflags=` 这三个字段正是「最后成功那一段挂在哪个卷上」的答案。
+- **NDINIT 的路径参数是 `user_addr_t`**，`char[128]` 直接传进 Darwin 构建是 `-Wint-conversion` 硬
+  错误（本轮第一次编译就死在两行上），必须包 `CAST_USER_ADDR_T()`。
+- **板级补丁的名字就是它的排序契约**。`save-xnu-patch.py` 生成的补丁是「pinned HEAD + 所有名字排在
+  它之前且碰同一批文件的补丁」与工作树之间的 diff，所以新补丁一旦排在别人前面，就会把别人已经进树
+  的编辑算成自己的内容——第一次生成的那份 878 行里同时出现 `boot_progress` 与 `XNU_OWNER_*`，就是这
+  个原因，不是工作树脏。改名为 `zzzz-clover-spawn-why.patch`（晚于所有碰 `kern_exec.c` 的
+  `zzy-*`/`zzz-*`，也晚于碰 `mach_loader.c` 的两个）之后才是这 135 行。这条与 round170/185 记下的
+  「不许把探针插进排序在前的补丁自己新增的块」是同一件事的两面。
+
+### 构建侧：一条被绕过的死结，没修
+
+`unixnu` 的 kernel 步骤先跑 `[kernel].archives` 再跑 XNU，而档案里 `build-corecrypto-14.py` 要用
+`nm` 读 `link.filelist` 上每一个 object。身份戳（`.boot-progress-mode`）在上一轮编译失败时已经把
+`bsd/DEVELOPMENT/kern_exec.o` 删掉且从未重编，于是本轮第一次构建死在档案步骤：
+`nm: error: …/kern_exec.o: No such file or directory`。本轮用一份一次性的预 pass 脚本把 object 先
+编出来（`r186: kern_exec.o is missing; running an object pass before the archive builders`），**这是
+绕过不是修复**——驱动里那两步的顺序仍然反着，任何一次「object 被删但树没脏」的构建都会再撞上它；
+下一轮要么在驱动里加一个 object pass，要么让 `kernel_names()` 跳过缺席的 object。
+
+### 契约与闸门
+
+`check-clover.py` 新增一节（排在 exec 签名补丁那节之前）：补丁必须在、九条针必须在（两条格式串的
+原文、`proc_getpid(vfs_context_proc(ctx)) != 1`、`#define CLOVER_SPAWN_WHY_LIMIT  24`、
+`vfs_name(mp, fsname)`、`vfs_statfs(mp)->f_mntonname`、`vnode_mount(vp)`）、只加日志的反向断言、
+以及不许出现旧轮次串（`clover r185:` / `clover r170:`）。标题断言升到 `clover r186:`，而驱动侧的
+r185 戳照旧——本轮没动任何驱动。`verify-clover-payload.py` 新增
+`kernel.macho: spawn ENOENT probe linked`，在成品镜像里读那两条编码后的格式串。全链绿：
+`check-clover.py`、`verify-clover-payload.py`（32 条 OK）、`normalize-kernel-macho.py --selftest`
+（17 条）、`check-cs-blob-structure.py --selftest`（14 条）、`read-clover-log.py --selftest`、
+`test-clover-power.py`、`test-clover-dsp.py`。
+
+### 产物
+
+两次独立内核 pass 原始哈希不同（`55ec10fe…` 与 `dfe149c3…`，正是 round177 说的那三处随链接变化的
+字段），归一化后是同一个 `b4f898c9…`——这同时也是补丁链第二次在同一棵树上干净重放的证据。AMFI 两
+处命中随文本增长（+0x4000）挪到 file `0x1aad0e4`/`0x1aad16c`，虚拟地址一字未动
+（`0xfffffff004ab40e4`/`0xfffffff004ab416c`），object 时间戳仍是 968。payload `f7c130ea…`（56 MiB），
+卷内内核 `426201d7…`、`unixnu.toml` `c5272a2b…`、ADT `1ecd4345…`（13516 字节）、入口探针 6857 字节 /
+37 段、`scratch-data.img` `614b8356…` 与 trustcache `7c369ce0…` 均未变。`boot.img` `196b284f…` 与
+round183/184/185 逐字节相同（本轮没动固件）。显示档案闭环重审通过：`kernel_sha256` 是本轮内核，
+两个 object 哈希 `1b6c134e…`/`a061787e…` 与 round183–185 逐字相同，193 条原始绑定一条没动，
+`family_text_sha256` 仍是 sheng 钉住的 `2e044ee6…`。归档 `~/clover-out/round186-*`，清单
+`round186-SHA256SUMS`。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round186-payload.img
+fastboot reboot
+```
+
+### 这一帧问什么
+
+读数仍在卡上的内核日志环（kind 22），一次 `scripts/run-clover-unattended.sh` 就够。看四件事：
+
+1. **有没有 `clover r186: spawn-why err=2 …` 这一行。** 没有就是这一轮的插桩没被执行到——那
+   launchd 那句「executable not found」根本不是从 `exec_activate_image()` 的 namei 出来的，本轮
+   的结论是「生产者另有其人」，下一格回炉找 launchd 自己的 access/stat。
+2. **`stop=` 与 `good=` 的边界。** `stop=/usr/libexec`（`good` 停在 `/usr`）说明连目录都没有，那是
+   staging 的问题；`stop=/usr/libexec/darwinos-boot-task` 说明目录在、叶子不在，那是清单与卷内容的
+   差集。两种答案指向的修法完全不同。
+3. **`fs=`/`on=`/`mflags=` 说的是最后成功那一段挂在哪个卷上。** 如果 `/usr/libexec` 报在根卷而不是
+   报在 staged 的 System 卷上，本轮读到的就不是「缺文件」而是「挂载并集的顺序」——那正好是
+   round143 那条 owner SystemOS mount 的续集。
+4. **`retry=`。** `retry=0` 而 `err=2` 说明同一条件再查一次就通了，是竞态；`retry=2` 说明粘住。
+
+`clover r186: loader-why` 的行如果先出现，说明断的是 dyld 而不是 boot task，此时上面四问全部按
+dyld 路径重读。两处各 24 条上限，只理 pid 1，因此不会把环刷满。
