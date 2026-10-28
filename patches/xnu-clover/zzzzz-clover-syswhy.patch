@@ -1,0 +1,115 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 8a1ec42..2dd5ab8 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -79,6 +79,52 @@ __XNU_PRIVATE_EXTERN    int             syscalls_log[SYS_MAXSYSCALL];
+ extern int mach_trap_count;
+ #endif
+ 
++/*
++ * Clover (round187): the round186 frame ends with usermanagerd opening the dyld
++ * shared cache and printing nothing for the rest of the capture, while launchd
++ * waits for it as a boot task (keybagd had just exited with EX_OSERR).  Nothing
++ * in the frame says whether that process is inside a unix syscall or a mach
++ * trap, so every entry into either is printed for those two names and every
++ * failing unix syscall is printed with its errno.  The entry lines are the
++ * reading: the last one before the silence names the call that never returned,
++ * and a heartbeat after the budget says the process is still making calls.
++ * Nothing is changed -- no argument, no return value, no errno -- and the budget
++ * keeps one boot task from filling the ring this is read from.
++ */
++#define CLOVER_SYS_WHY_ENTRY_LIMIT  512
++#define CLOVER_SYS_WHY_FAIL_LIMIT   128
++#define CLOVER_SYS_WHY_HEARTBEAT    128
++
++static int clover_sys_why_unix_entries;
++static int clover_sys_why_unix_fails;
++static int clover_sys_why_mach_entries;
++
++static int
++clover_sys_why_watched(const char *comm)
++{
++	return strcmp(comm, "usermanagerd") == 0 || strcmp(comm, "keybagd") == 0;
++}
++
++/* Called from handle_svc() for every mach trap (trap_no < 0). */
++void
++clover_sys_why_mach(int trap_no, arm_saved_state_t *state)
++{
++	struct proc *p = get_bsdthreadtask_info(current_thread());
++
++	if (p == NULL || !clover_sys_why_watched(p->p_comm)) {
++		return;
++	}
++	clover_sys_why_mach_entries++;
++	if (clover_sys_why_mach_entries > CLOVER_SYS_WHY_ENTRY_LIMIT &&
++	    (clover_sys_why_mach_entries % CLOVER_SYS_WHY_HEARTBEAT) != 0) {
++		return;
++	}
++	printf("clover r187: mach-in n=%d pid=%d tid=%lld comm=%s trap=%d a0=%lx a1=%lx\n",
++	    clover_sys_why_mach_entries, proc_pid(p), thread_tid(current_thread()), p->p_comm,
++	    trap_no, (unsigned long)saved_state64(state)->x[0],
++	    (unsigned long)saved_state64(state)->x[1]);
++}
++
+ /*
+  * Function:	unix_syscall
+  *
+@@ -150,6 +196,17 @@ unix_syscall(
+ #endif
+ 	pid = proc_pid(proc);
+ 
++	if (clover_sys_why_watched(proc->p_comm)) {
++		clover_sys_why_unix_entries++;
++		if (clover_sys_why_unix_entries <= CLOVER_SYS_WHY_ENTRY_LIMIT ||
++		    (clover_sys_why_unix_entries % CLOVER_SYS_WHY_HEARTBEAT) == 0) {
++			printf("clover r187: unix-in n=%d pid=%d tid=%lld comm=%s code=%d a0=%lx a1=%lx\n",
++			    clover_sys_why_unix_entries, pid, thread_tid(current_thread()), proc->p_comm,
++			    code, (unsigned long)saved_state64(state)->x[0],
++			    (unsigned long)saved_state64(state)->x[1]);
++		}
++	}
++
+ #ifdef CONFIG_IOCOUNT_TRACE
+ 	uthread->uu_iocount = 0;
+ 	uthread->uu_vpindex = 0;
+@@ -185,6 +242,17 @@ unix_syscall(
+ skip_syscall:
+ #endif /* CONFIG_MACF */
+ 
++	if (error != 0 && error != EJUSTRETURN && error != ERESTART &&
++	    clover_sys_why_watched(proc->p_comm)) {
++		clover_sys_why_unix_fails++;
++		if (clover_sys_why_unix_fails <= CLOVER_SYS_WHY_FAIL_LIMIT ||
++		    (clover_sys_why_unix_fails % CLOVER_SYS_WHY_HEARTBEAT) == 0) {
++			printf("clover r187: unix-fail n=%d pid=%d tid=%lld comm=%s code=%d err=%d a0=%lx\n",
++			    clover_sys_why_unix_fails, pid, thread_tid(current_thread()), proc->p_comm,
++			    code, error, (unsigned long)saved_state64(state)->x[0]);
++		}
++	}
++
+ 	unix_syscall_kprintf("code %d, error %d, results %x, %x (pid %d - %s, tid %lld)\n", code, error,
+ 	    uthread->uu_rval[0], uthread->uu_rval[1],
+ 	    pid, get_bsdtask_info(current_task()) ? proc->p_comm : "unknown", thread_tid(current_thread()));
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index ae94c7e..704e0d0 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -191,6 +191,9 @@ static void handle_simd_trap(arm_saved_state_t *, uint32_t esr) __dead2;
+ 
+ extern void current_cached_proc_cred_update(void);
+ void   mach_syscall_trace_exit(unsigned int retval, unsigned int call_number);
++/* Clover (round187): the mach-trap half of the syscall-entry probe; the body
++ * lives in bsd/dev/arm/systemcalls.c, where the process name is reachable. */
++extern void clover_sys_why_mach(int trap_no, arm_saved_state_t *state);
+ 
+ struct proc;
+ 
+@@ -1921,6 +1924,7 @@ handle_svc(arm_saved_state_t *state)
+ 
+ 		/* Counting perhaps better in the handler, but this is how it's been done */
+ 		thread->syscalls_mach++;
++		clover_sys_why_mach(trap_no, state);
+ 		mach_syscall(state);
+ 	} else {
+ 		/* Counting perhaps better in the handler, but this is how it's been done */

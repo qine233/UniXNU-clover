@@ -14270,3 +14270,93 @@ fastboot reboot
 
 `clover r186: loader-why` 的行如果先出现，说明断的是 dyld 而不是 boot task，此时上面四问全部按
 dyld 路径重读。两处各 24 条上限，只理 pid 1，因此不会把环刷满。
+
+## round186 读数（v0.5.46 实机，2026-10-29）：探针只响在 init 的回退路径上，墙是 usermanagerd
+
+全帧只有一条 r186 行，而且它证明的是「探针能用」，不是「boot task 缺文件」：
+
+```
+clover r186: spawn-why err=2 n=1 path=/usr/appleinternal/sbin/launchd.development
+  stop=/usr/appleinternal good=/usr fs=apfs on=/ mflags=14809021 retry=2
+```
+
+`path` 是 `load_init_program` 先试的开发版 launchd，`stop=/usr/appleinternal good=/usr` 说明卷上
+连这个目录都没有，`retry=2` 说明同一条件再查一次仍然粘住——这正是那张照片想要的那类读数，只是它
+发生在 init 的正常回退上，不是 boot task。**没有任何一条 `loader-why`，也没有任何 boot task 的
+spawn 返回 ENOENT**：上一帧照片里那句 `required boot task executable not found` 在这一轮没有复现。
+
+内核环这一次从 8.66 s 连续写到 37.23 s（352 条），启动其实走得很远：`fsck`、`mount`、`seputil`、
+`mobile_obliterator`、`apfs_boot_util`、`MSUEarlyBootTask`、`cc_fips_test` 全部 `rv=0x0`；
+`keybagd` 是唯一非零退出的，`rv=0x4700`（71 = `EX_OSERR`）。环的最后一条是
+
+```
+[   37.233612]: clover r170: open /System/Library/Caches/com.apple.dyld fmode=0x1 err=0 fl=0x14809021 vt=2 fs=apfs
+```
+
+它属于 37.193360 被 exec 的 `usermanagerd`（pid 12）——之后到抓帧为止 34 秒，整个内核日志环一条新行
+都没有。launchd 是**在等**这个 boot task，不是找不到它：墙从「缺一个可执行文件」换成了「一个 boot
+task 打开共享缓存之后不再返回」。上一轮据此给出的两条修法（改 launchd plist / 裁 `Boot` 表）在这帧
+上没有证据支持，先不动。
+
+verdict 环 17 条、报告窗空（没有 kind-20 记录），说明这一轮没有 panic，也没有走到 panic 排干那条路。
+环里 `(1) syscall-unix 55` 与 `(apply-protobox)` 两处叠字与 round185 同源，是 tee 复制 msgbuf 时
+行边界不原子，不是新的生产者。下一格要问的是：usermanagerd 最后进去没出来的那个 syscall / mach trap
+是几号。
+
+## round187（v0.5.47）：两个卡住的 boot task 说出它们进了哪个调用、没从哪出来
+
+### 排期照旧不动，这一格仍然是「让下一帧自己回答一个问题」
+
+三件仪器（触摸 / PMIC 轨 / ADSP）照旧停在 boot args 之外，`clover-unattended=300` 照旧在最后一行，
+本轮一行驱动代码没写。round186 那一帧把墙从「缺一个可执行文件」换成了「一个 boot task 打开共享缓存
+之后不再返回」，于是本轮只问一件事：**usermanagerd 最后进去没出来的那个调用是几号**，以及它前面有
+没有一次调用返回过 errno。
+
+### 两种「停住」，帧上必须分得开
+
+一个进程停在 `usermanagerd --init` 里，成因至少两类，而它们在用户态看起来完全一样：
+
+- 调用**返回了**一个 errno，进程拿着它继续走，走了几步之后某个状态不对，卡在别处（或反复重试）；
+- 调用**根本没返回**，进程的线程还挂在那个 syscall 里，时间停在进入点。
+
+第一种下应该能看见一串失败行并带出 errno；第二种下只会看见进入行，没有对应的出口。这就是
+`unix-fail` 那一行存在的理由——它不是诊断，它是把「返回了错」和「没返回」分开的判据。
+
+另一半是通路的划分：`handle_svc()` 在 `trap_no < 0` 时直接 `mach_syscall(state)`，**根本不进
+`unix_syscall()`**。只挂在 BSD 那一侧，mach trap 那半张表在帧上就是空的，读帧的人会把「没进 BSD」
+误读成「没有活动」。所以探针有两条入口：`unix_*` 在 `bsd/dev/arm/systemcalls.c`，`mach_*` 由
+`osfmk/arm64/sleh.c` 在 `mach_syscall()` 之前调一个 extern，函数体仍在 systemcalls.c 里，因为只有
+那里能拿到 `struct proc *` 和 `p_comm`。
+
+### 过滤键与预算
+
+- 按 `comm`（`usermanagerd` / `keybagd`）而不是按 pid：pid 每次开机都会漂，而 `fsck`/`mount`/
+  `seputil` 会在同一秒里把 512 行的环刷满；按 `comm` 过滤，环里留下的每一行都属于一个可复现的角色。
+- `keybagd` 也在名单里，因为它是上一帧唯一的非零退出（`rv=0x4700` = `EX_OSERR` 71），而现在没有
+  任何一行说过它是在哪个调用上拿到这个错误的。
+- entry 512 条、fail 128 条，之后每 128 条打一次心跳。**预算用尽后的沉默和进程挂死的沉默必须在帧上
+  可区分**，否则下一位读帧的人会把探针自己的上限误读成新的墙。
+
+`patches/xnu-clover/zzzzz-clover-syswhy.patch` 于是只有三条打印：`unix-in`、`unix-fail`、`mach-in`。
+**只加日志**：两处插入都不改任何返回值、不删任何已有行（补丁 115 行、72 条新增、0 条删除，
+checker 仍把「不许出现以 `-` 开头的行」写成硬断言）。驱动戳一律不动（display r180 / input r181 /
+power r182 / dsp r183），`board.toml` 标题升到 `clover r187:`。
+
+### 构建与闸门
+
+- 构建侧还是那条一次性 object 预 pass：`unixnu` 先跑 `[kernel].archives` 再跑 XNU 的死结本轮没修，
+  不在优先级上。
+- 内核 `5c07c1e1…`，三条 r187 格式串在 Mach-O 里逐字可读；AMFI 两刀落在 file `0x1aad0e4`/
+  `0x1aad16c`（与 round186 同址，虚拟地址未动）；归一化 `e4a929b8…`（968 个 object 戳全清）。
+- payload `fc04f57e…`（56 MiB，入口探针 6857 字节 / 37 段仍成立）；`boot.img` `196b284f…` 与
+  round183–186 逐字节相同——本轮没动固件。
+- `check-clover.py` 绿（标题、补丁在场、十条针、只加日志反断言、旧轮串缺席）；
+  `verify-clover-payload.py` 读到 `syscall-in probe linked OK`（unix-in / unix-fail / mach-in /
+  comm-filter 四项全 present）；五道宿主自测全 PASS。
+
+### 下一帧要读什么
+
+冷刷只写 cache，跑无人值守脚本读回 logdump。这一帧要看 `usermanagerd` 停住前最后一条
+`unix-in` / `mach-in`，以及它前面最近的一条 `unix-fail`；如果 mach 那侧一条都没有，墙就被完整划到
+BSD 那半，下一次只需要在那一半里继续收窄。
+

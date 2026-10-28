@@ -633,6 +633,27 @@ def check_spawn_why(kernel: bytes) -> bool:
     return ok
 
 
+def check_sys_why(kernel: bytes) -> bool:
+    """Round187 asks where usermanagerd and keybagd stop inside the kernel. The image has to carry the
+    entry line for each half of the syscall surface -- mach traps, which sleh.c routes before BSD ever
+    sees them, and unix calls -- plus the failure line that names the errno a call left behind. All
+    three are filtered to the two boot-task names, so a missing one means a whole half of the surface
+    would be silent on the next card read."""
+    label = "kernel.macho: syscall-in probe linked"
+    found = {"unix-in": (b"clover r187: unix-in n=%d pid=%d tid=%lld comm=%s code=%d a0=%lx a1=%lx\n")
+             in kernel,
+             "unix-fail": (b"clover r187: unix-fail n=%d pid=%d tid=%lld comm=%s code=%d err=%d "
+                           b"a0=%lx\n") in kernel,
+             "mach-in": (b"clover r187: mach-in n=%d pid=%d tid=%lld comm=%s trap=%d a0=%lx a1=%lx\n")
+             in kernel,
+             "comm-filter": b"usermanagerd" in kernel and b"keybagd" in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -1036,6 +1057,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_panic_drain(kernel)
         ok &= check_log_window(kernel)
         ok &= check_spawn_why(kernel)
+        ok &= check_sys_why(kernel)
     return 0 if ok else 1
 
 

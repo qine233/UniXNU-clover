@@ -1514,10 +1514,10 @@ def check_board(errors: list) -> str:
     # probe still says r180, drivers/CloverInput says r181, drivers/CloverPower says r182 and
     # drivers/CloverDsp says r183 -- because the tee on the card filters the shared "clover r"
     # prefix, not a round number. Round185 moves the log window to logdump and arms the rings from the
-    # GPT walk, so the SDHCI driver carries its own r185 stamp for the arming line; round186 changes no
-    # driver at all, so that stamp stays and only the menu moves.
-    if not board["payload"]["title"].startswith("clover r186:"):
-        errors.append('[payload] title is not "clover r186: ...": the menu would not name this round')
+    # GPT walk, so the SDHCI driver carries its own r185 stamp for the arming line; round186 and
+    # round187 change no driver at all, so that stamp stays and only the menu moves.
+    if not board["payload"]["title"].startswith("clover r187:"):
+        errors.append('[payload] title is not "clover r187: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2193,6 +2193,44 @@ def check_board(errors: list) -> str:
                           "returns, and a line it removes is a change in what launchd is told")
         if "clover r185:" in text or "clover r170:" in text:
             errors.append(f"{spawn_probe.name} carries an older round's string: its own lines are the "
+                          "only new readings this round produces")
+
+    # Round187: the r186 frame showed the spawn probe answering a question nobody asked -- the only
+    # line it printed was load_init_program falling back from the development launchd -- and the boot
+    # instead stopped 34 s into usermanagerd, after it opened the dyld shared cache and before it
+    # printed anything else, while launchd waited for it as a boot task. So this patch counts entries,
+    # not failures: unix_syscall() and the mach-trap branch of handle_svc() print the code/trap of every
+    # entry for the two names the frame left unexplained, and every failing unix syscall prints its
+    # errno. The last line before the silence is the answer, so the patch has to keep the entry print
+    # ahead of the call itself, must not delete a source line, and must leave the watched names and the
+    # heartbeat visible for the checker to pin.
+    sys_probe = next((base / "patches/xnu-clover/zzzzz-clover-syswhy.patch"
+                      for base in (REPO, pathlib.Path.cwd())
+                      if (base / "patches/xnu-clover/zzzzz-clover-syswhy.patch").is_file()), None)
+    if sys_probe is None:
+        errors.append("patches/xnu-clover/zzzzz-clover-syswhy.patch is missing: the next frame would "
+                      "end at usermanagerd opening the dyld shared cache again, with nothing saying "
+                      "whether it is inside a unix syscall or a mach trap")
+    else:
+        text = sys_probe.read_text()
+        for needle in ("bsd/dev/arm/systemcalls.c", "osfmk/arm64/sleh.c",
+                       "clover r187: unix-in n=%d pid=%d tid=%lld comm=%s code=%d a0=%lx a1=%lx\\n",
+                       "clover r187: unix-fail n=%d pid=%d tid=%lld comm=%s code=%d err=%d a0=%lx\\n",
+                       "clover r187: mach-in n=%d pid=%d tid=%lld comm=%s trap=%d a0=%lx a1=%lx\\n",
+                       'strcmp(comm, "usermanagerd") == 0 || strcmp(comm, "keybagd") == 0',
+                       "#define CLOVER_SYS_WHY_ENTRY_LIMIT  512", "#define CLOVER_SYS_WHY_HEARTBEAT    128",
+                       "clover_sys_why_mach(trap_no, state);", "error != EJUSTRETURN"):
+            if needle not in text:
+                errors.append(f"{sys_probe.name} lacks {needle[:44]}...: without the entry print, the "
+                              "watched names, the fail filter and the heartbeat the probe cannot say "
+                              "which call usermanagerd never returned from")
+        removed = [line for line in text.splitlines() if line.startswith("-") and not
+                   line.startswith("---")]
+        if removed:
+            errors.append(f"{sys_probe.name} deletes {removed[0][:60]!r}: the syscall probe prints and "
+                          "returns, and a line it removes is a change in what the boot task is told")
+        if "clover r186:" in text or "clover r185:" in text or "clover r170:" in text:
+            errors.append(f"{sys_probe.name} carries an older round's string: its own lines are the "
                           "only new readings this round produces")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
