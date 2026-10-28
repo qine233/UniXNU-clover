@@ -625,6 +625,37 @@ def check_board(errors: list) -> str:
                 errors.append(f"clover-power={mode} names a mode CloverPower does not implement "
                               "(1 arbiter, 2 revid, 3 rails); it would report and return")
 
+        # round183, the SMEM heap, the ADSP's doorbell and the two carve-outs. The same four halves,
+        # for the same reason: libCloverDsp.a is pulled in only because sheng_pmgr_run() calls
+        # clover_dsp_run(), and that call maps nothing until a clover-dsp= argument reaches it. What
+        # is different here is what the round is *for* -- 排期 5 forks on its answer (protocol job or
+        # bring-up job), and a boot that silently skips it looks exactly like a boot that answered the
+        # empty way, which is the one reading this whole round exists to obtain.
+        dsp_builder = any("CloverDsp" in entry for entry in board["kernel"]["archives"])
+        dsp_arg = any(argument.startswith("clover-dsp=")
+                      for argument in board["payload"]["kernel_args"])
+        if "libCloverDsp.a" in text and not dsp_builder:
+            errors.append("the defconfig links libCloverDsp.a but [kernel] archives omits "
+                          "build-arm-driver.py CloverDsp, so that archive does not exist")
+        if dsp_builder and "libCloverDsp.a" not in text:
+            errors.append("[kernel] archives builds CloverDsp but the defconfig does not link "
+                          "libCloverDsp.a, so clover_dsp_run() is undefined")
+        if dsp_builder and not dsp_arg:
+            errors.append("[kernel] archives builds CloverDsp but no clover-dsp= boot arg reaches it: "
+                          "clover_dsp_run() returns without mapping SMEM")
+        if dsp_arg and not dsp_builder:
+            errors.append("kernel_args passes clover-dsp= but [kernel] archives does not build "
+                          "CloverDsp, so the arg is noise")
+        if dsp_builder and flags.get("SHENG_PMGR", "n") not in ("y", "1"):
+            errors.append("CloverDsp is scheduled from sheng_pmgr_run(), which CONFIG_XNU_SHENG_PMGR="
+                          f"{flags.get('SHENG_PMGR', 'n')} does not compile into the kernel")
+        if dsp_arg:
+            mode = [argument.split("=", 1)[1] for argument in board["payload"]["kernel_args"]
+                    if argument.startswith("clover-dsp=")]
+            if any(value not in ("1", "2", "3") for value in mode):
+                errors.append(f"clover-dsp={mode} names a mode CloverDsp does not implement "
+                              "(1 heap, 2 edges, 3 images); it would report and return")
+
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
     if cores != CPU_REGS:
@@ -1214,6 +1245,93 @@ def check_board(errors: list) -> str:
                               "the burst byte order is not what round182's report will claim it is\n"
                               + (check.stdout + check.stderr)[-700:])
 
+    # Round183, drivers/CloverDsp. What is asserted here is the shape of a walk over a structure whose
+    # every pointer was written by another processor: magics compared as one little-endian word (the
+    # vendor declares u8[4] and memcmps it, and the two forms differ -- a byte-order transcription error
+    # makes a live heap read as "no partition table"), bounds taken subtractively so an offset and a
+    # size that overflow cannot pass (`entry.data + entry.size > smem.size`), the cached list walked
+    # down from the partition's end with a cacheline that has to be a power of two, "$SMP" accepted only
+    # with version 1, sixteen entries and both pid fields naming the edge it was read for, and the
+    # global path refusing an item whose aux_base says it lives in another region. Second, the
+    # read-only promise, asserted by absence: this round does not even issue a command, so the only
+    # thing that may appear is a load. Third, the model -- DspCore.h's header says the bounds decisions
+    # "are testable there and nowhere else", so the checker runs it rather than trusting the file to
+    # exist.
+    core = REPO / "drivers/CloverDsp/DspCore.h"
+    regs = REPO / "drivers/CloverDsp/DspRegs.h"
+    dsp = REPO / "drivers/CloverDsp/CloverDsp.cpp"
+    if not core.is_file() or not regs.is_file() or not dsp.is_file():
+        errors.append("drivers/CloverDsp/{DspCore.h,DspRegs.h,CloverDsp.cpp} is missing: the SMEM and "
+                      "doorbell round, and with it 排期 5's fork between a protocol job and a bring-up "
+                      "job, does not exist")
+    else:
+        text = core.read_text()
+        missing = [needle for needle in
+                   ("if (!smem.base || smem.size < kSmemToc)",
+                    "if (entry.data + entry.size > smem.size) {",
+                    "if (cacheline & (cacheline - 1)) {",
+                    "if (item.magic != kSmp2pMagic) {",
+                    "if (item.total_entries != kSmp2pMaxEntries",
+                    "item.local_pid != expect_local",
+                    "if (entry.aux_base) {",
+                    "return at == end ? DS_OK : DS_E_CANARY;",
+                    "DS_E_RANGE")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"drivers/CloverDsp/DspCore.h lacks {needle!r}: the walk would stop being the "
+                          "one the host model proves -- every clause above is a bounds or identity "
+                          "decision that a board cannot distinguish from a corrupt heap afterwards")
+        constants = parse_defines(regs.read_text())
+        for name, want in (("kSmemPtableMagic", 0x434f5424), ("kSmemPartMagic", 0x54525024),
+                           ("kSmemInfoMagic", 0x49494953), ("kSmp2pMagic", 0x504d5324)):
+            if name not in constants:
+                errors.append(f"drivers/CloverDsp/DspRegs.h does not define {name}")
+            elif constants[name] != want:
+                errors.append(f"drivers/CloverDsp/DspRegs.h:{name} is {constants[name]:#x}, not "
+                              f"{want:#x}: that is the vendor's byte-array order, and a word-read "
+                              "walker wearing it reports a live heap as an empty one")
+        source = dsp.read_text()
+        missing = [needle for needle in
+                   ("extern \"C\" void clover_dsp_run (void)",
+                    "PE_parse_boot_argn (\"clover-dsp\"",
+                    "clover_emmc_flush_cache ();",
+                    "clover_dsp_observation[15]",
+                    "kApcsIpcPhys",
+                    "ds_smp2p_head",
+                    "ds_find_item_global",
+                    "kSmemItemAdspSmp2pOut",
+                    "kWlanMsaPhys")
+                   if needle not in source]
+        for needle in missing:
+            errors.append(f"drivers/CloverDsp/CloverDsp.cpp lacks {needle!r}: the report would not say "
+                          "which window, which item path or which failure it read")
+        # Read-only, and this time the risk is not a transaction but an MPU denial -- which is why the
+        # mapping is done before any read and why nothing here may grow a store. SMEM is Device-ish
+        # memory another processor owns; a write to it is not a report that happens to be wrong.
+        for forbidden in ("windowWrite", "ds_write", "kSmp2pSet", "IOMemoryDescriptor::withAddress"):
+            if forbidden in source:
+                errors.append(f"drivers/CloverDsp grew {forbidden}: round183 is a load and nothing "
+                              "else; enabling the doorbell, SSR or PIL is the round after this one")
+        # The model is the evidence for every bounds decision above, so it is run here. DspCore.h claims
+        # the walk is "testable there and nowhere else", and a claim the checker does not keep is how a
+        # driver ends up tested only by an ADSP that cannot answer.
+        harness = REPO / "drivers/CloverDsp/tests/clover_dsp_host.cpp"
+        runner = next((base / "scripts/test-clover-dsp.py"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "scripts/test-clover-dsp.py").is_file()), None)
+        if runner is None:
+            errors.append("scripts/test-clover-dsp.py is missing: the SMEM walk's bounds would be "
+                          "proven only on a heap this port does not control")
+        elif not harness.is_file():
+            errors.append("drivers/CloverDsp/tests/clover_dsp_host.cpp is missing: the host model has "
+                          "nothing to drive DspCore.h against")
+        else:
+            check = subprocess.run([sys.executable, str(runner)], capture_output=True, text=True)
+            if check.returncode:
+                errors.append("the SMEM host model failed: the magic word form, a bound, or the SMP2P "
+                              "identity check is not what round183's report will claim it is\n"
+                              + (check.stdout + check.stderr)[-700:])
+
     # Round157. r156 made the card fast but left four ways for the fast path to report
     # something that was not true: a stop command whose failure was invisible, DATA_END
     # accepted next to a CRC/timeout bit, a 32-bit word offset that wraps past 16 GiB, and
@@ -1400,22 +1518,24 @@ def check_board(errors: list) -> str:
     # Round178 introduced the rule; each round since keeps it. The menu has to name the round under
     # test: the payload and its readings have to agree about which round is on the card, or an image
     # would be claiming a round it does not run. The drivers keep their own stamps -- the display
-    # probe still says r180, drivers/CloverInput says r181 and drivers/CloverPower says r182 --
-    # because the tee on the card filters the shared "clover r" prefix, not a round number.
-    if not board["payload"]["title"].startswith("clover r182:"):
-        errors.append('[payload] title is not "clover r182: ...": the menu would not name this round')
+    # probe still says r180, drivers/CloverInput says r181, drivers/CloverPower says r182 and
+    # drivers/CloverDsp says r183 -- because the tee on the card filters the shared "clover r"
+    # prefix, not a round number.
+    if not board["payload"]["title"].startswith("clover r183:"):
+        errors.append('[payload] title is not "clover r183: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
-    # the four tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
+    # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
     unattended = pmgr_source.find("clover_unattended_begin();")
     emmc = pmgr_source.find("clover_emmc_run();")
     touch = pmgr_source.find("clover_input_run();")
     power = pmgr_source.find("clover_power_run();")
-    if not (0 <= unattended < emmc < touch < power):
+    dsp = pmgr_source.find("clover_dsp_run();")
+    if not (0 <= unattended < emmc < touch < power < dsp):
         errors.append("drivers/CloverPMGR/CloverPMGR.cpp does not call unattended_begin(), then "
-                      "emmc_run(), then input_run(), then power_run(): the power report would precede "
-                      "either the ring that carries it off the device or the touch readings it exists "
-                      "to explain")
+                      "emmc_run(), then input_run(), then power_run(), then dsp_run(): the power and "
+                      "dsp reports would precede either the ring that carries them off the device or "
+                      "the touch readings they exist to explain")
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -2435,6 +2555,16 @@ DT_BASE_CONTRACT = [
     ("qcom,spmi@800f000", 7, "drivers/CloverPower/PowerRegs.h", "kSpmiIntrSize"),
     ("qcom,spmi@800f000", 8, "drivers/CloverPower/PowerRegs.h", "kSpmiCnfgPhys"),
     ("qcom,spmi@800f000", 9, "drivers/CloverPower/PowerRegs.h", "kSpmiCnfgSize"),
+    # Round183. The SMEM node's first cells are the region this driver maps whole, and the second pair
+    # is the doorbell word it reads -- both transcribed from this unit's own tree, which is also the
+    # only place the 2 MiB size is stated as a fact rather than as an assumption. kApcsPhys itself is
+    # not listed: apcs_glb is the CAF tree's mailbox node and the shipped DTB does not carry it, so
+    # the number checked here is the one the shipped tree really names, 0x17911008, which the driver
+    # reaches as kApcsPhys + kApcsIpcOffset and prints on the card as `doorbell 17911008+04`.
+    ("qcom,smem@86000000", 0, "drivers/CloverDsp/DspRegs.h", "kSmemPhys"),
+    ("qcom,smem@86000000", 1, "drivers/CloverDsp/DspRegs.h", "kSmemSize"),
+    ("qcom,smp2p-adsp@17911008", 0, "drivers/CloverDsp/DspRegs.h", "kApcsIpcPhys"),
+    ("qcom,smp2p-modem@17911008", 0, "drivers/CloverDsp/DspRegs.h", "kApcsIpcPhys"),
 ]
 
 # (node leaf name, span index, header, base macro, size macro).  A driver may map only part of a
@@ -2469,13 +2599,20 @@ def parse_defines(text: str) -> dict:
     Hex literals are converted first, so the only bare identifiers left are references to defines
     earlier in the same file -- which is how kPinGpio66Phys, written as
     (kTlmmPhys + 66ULL * kTlmmPinStride), reaches a number the dump can be compared with.
+
+    Round183 adds the second form because drivers/CloverDsp/DspRegs.h is written with `static const`
+    rather than `#define`: SMEM's offsets are relative to kSmemPhys, so the header's own arithmetic
+    (`kSmemSize - 0x1000`, `kSmemToc + kSmemItemCount * kSmemTocEntrySize`) is the thing under test,
+    and a transcription check that only saw #defines would have nothing to say about it.
     """
     values: dict = {}
     for raw in text.splitlines():
         line = raw.split("//", 1)[0].strip()
         match = re.match(r"^#define\s+([A-Za-z_]\w*)\s+(\S.*)$", line)
         if not match:
-            continue
+            match = re.match(r"^static\s+const\s+\S+\s+([A-Za-z_]\w*)\s*=\s*(.+);$", line)
+            if not match:
+                continue
         name, expr = match.group(1), match.group(2)
         expr = re.sub(r"0[xX][0-9a-fA-F]+", lambda found: str(int(found.group(0), 16)), expr)
         expr = re.sub(r"(\d)[uUlL]+(?![0-9A-Za-z_])", r"\1", expr)

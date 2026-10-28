@@ -58,14 +58,16 @@ CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 # listed here on purpose: CONFIG_XNU_NATIVE_LEGACY_DISPLAY above makes build-xnu-4k-baseline.sh
 # force-load its exact path itself, after re-hashing the archive and its sources.
 #
-# The four entries below are drivers/CloverSdhci (round87), drivers/CloverBlock (round107),
-# drivers/CloverInput (round181) and drivers/CloverPower (round182). None uses -Wl,-force_load, and that
+# The five entries below are drivers/CloverSdhci (round87), drivers/CloverBlock (round107),
+# drivers/CloverInput (round181), drivers/CloverPower (round182) and drivers/CloverDsp (round183).
+# None uses -Wl,-force_load, and that
 # is deliberate: this variable is appended to the link line as a plain archive path, and each archive
 # defines exactly the symbol something else in the kernel already references (clover_emmc_run from
 # drivers/CloverPMGR/CloverPMGR.cpp, clover_block_run from drivers/CloverSdhci's mode 21 tail,
-# clover_input_run and clover_power_run from CloverPMGR again), so ordinary archive resolution pulls the
+# clover_input_run, clover_power_run and clover_dsp_run from CloverPMGR again), so ordinary archive
+# resolution pulls the
 # member in. force_load would additionally keep anything unreferenced, which here means nothing.
-CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-sdhci/libCloverSdhci.a {tree}/build/clover-block/libCloverBlock.a {tree}/build/clover-input/libCloverInput.a {tree}/build/clover-power/libCloverPower.a"
+CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-sdhci/libCloverSdhci.a {tree}/build/clover-block/libCloverBlock.a {tree}/build/clover-input/libCloverInput.a {tree}/build/clover-power/libCloverPower.a {tree}/build/clover-dsp/libCloverDsp.a"
 
 # Not set, on purpose, and each one is a real porting task rather than a switch to flip:
 #   NATIVE_UFS          — clover boots from eMMC (sdhc_1 at 0xc0c4000), not UFS; there is no XNU SDHCI

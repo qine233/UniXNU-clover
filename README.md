@@ -86,6 +86,7 @@ round176 拆掉那一轮自己的代价：两个说话人不再抢同一圈 32 �
 | round180 补（v0.5.37） | shipped 字节一个没动，补的是记录。上游文档闸门对每个改动文件找**所有** `paths` 认领它的区，`board.toml` 被九个区认领，而它一次只报第一个——v0.5.36 因此红在 `audio`。本地复刻同一条闸门跑通后才补满九区（`configuration` 写新开关与三条 boot arg、`packaging` 写本轮三份哈希与「`ar` 的 mtime 让 `archive_sha256` 每跑必动，对象哈希才是复现证据」、`memory` 写 boot 时多出的那个 0x18a0 实例、`power`/`network`/`firmware` 各自写清本轮没碰什么）；`AGENTS.md` 的 Porting record 一节留下这条闸门的本地跑法，并改掉「display 是 planned」这句 round180 之后就不再成立的话 | `porting-record.py check` 本地 exit 0（13 个区），`check-clover.py` 仍绿；镜像仍是 payload `b453884d…`，屏上读的仍是 r178 那三个数 |
 | round181（v0.5.38） | 排期第 4 格第一次有代码：`drivers/CloverInput` 在 QUP v2 的 BLSP1 I2C-3（`0xc177000`，DT 声明 `0x600`，映射整页）上问两个候选——Goodix `gt9xx@5d` 的 `0x8040`、EDT/FocalTech `@38` 的寄存器 `0x00` 与 `0xBB` 名字——各问它们**自己的上游驱动开机必问的那一读**，因为 NACK 只有对着真实寄存器才有意思。寄存器与位全部从三个具名来源抄（本板 DT、mainline 7.2.y `i2c-qup.c`/`gcc-sdm660.c`/`pinctrl-sdm660.c`、小米 4.19 CAF 的 `i2c-msm-v2.c`/`gt9xx_zql6019/`），唯一真分歧是位时钟字段打包，取可手推的 mainline；Goodix 复位用厂商时序与 `clover.dts` 里 `ts_int_defalut` 声明的 16 mA，身份解码按 `gtp_get_fw_info()` 的字节布局。三档 `clover-input=1/2/3`（纯读对照 / bring-up 不出 SCL 边沿 / 问地址），每趟传输头部一次 SW_RESET、FIFO 模式零 MX 计数 + `REPACK_EN`、rx tag 写进输出 FIFO，完成判据比上游更严（done 位与字节数必须同时到位，否则算超时而不是短数据）。排在 PMGR 尾部、eMMC 之后，因为读数唯一的出路是卡上的内核日志环；任何路径都不 panic | **已构建**，待冷刷；内核 `09fea490…` → 归一化交付 `2f13ca62…`（AMFI 命中点随链接布局挪到 `0x1aa80e4`/`0x1aa816c`，object 时间戳 962→966）→ payload `887043d3…`（探针 6857 字节 / 37 段）；`verify-clover-payload.py` 新增 `touch instrument linked`，显示档案闭环重审通过（193 绑定、两个 object 哈希与上一轮逐字相同） |
 | round182（v0.5.39） | 排期第 6 格第一步，也是 round181 最后一行 `rails unproven` 的回答：`drivers/CloverPower` 打开内核通往 PMIC 的唯一一扇门——SPMI PMIC Arbiter v5。五个窗口逐格钉在 `qcom,spmi@800f000/reg`（core `0x0800f000+0x1000`、chnls `0x08400000+0x1000000`、obsrvr `0x09400000+0x1000000`、intr `0x0a400000+0x220000`、cnfg `0x0800a000+0x3000`），读版本号并按 v5 带宽拒绝（低于 `0x50000000` 是 v2/v3 的 `0x800` 地图基址，达到 `0x60000000` 是 sheng v7 的 `0x2000/0x20` 布局），走 `core+0x900` 的 448 项 APID→PPID 地图（平局取第一条、但被本 EE 拥有的后来者顶替，IRQ 另按「最后一个带 bit24 的」），把 `cnfg+0x700+4*apid` 的写归属**在任何人写之前**量出来——这就是排期 4 第二道闸的数；再问 PM660/PM660L 的 revid 身份（`0x51` 不对就不报身份），最后读触摸面板声明的两条轨 `ldo-a11`（PPID `0x04a`）/`ldo-b3`（`0x242`）的 `0x40/0x41` 电压原始字节与 `0x46` enable。**只读**：每笔事务都是 *observer* 通道上的 `EXT_READL`，chnls 窗只按页读自己那页的 `ACC_ENABLE`/`IRQ_STATUS`，一次 CMD 都不往里写，这条由 checker 反向钉死（源码里不许出现 `windowWrite`/`kPmicArbWriteOp`）。三档 `clover-power=1/2/3`；事务逻辑拆在 `PowerArb.h`，宿主模型 `tests/clover_power_host.cpp` + `scripts/test-clover-power.py` 用 pthread 假设备逐条重解码命令并断言它是读，超时那一档故意不带服务线程跑，证明轮询真有界。排在 PMGR 尾部、CloverInput 之后，任何路径都不 panic | **已构建**，待冷刷；内核 `7305d191…` → 归一化交付 `37c3f260…`（AMFI 两站点照旧 `0x1aa80e4`/`0x1aa816c`，object 时间戳 966→967）→ payload `0ee08570…`（卷内内核 `3efd9089…`，入口探针 6857 字节 / 37 段）；`verify-clover-payload.py` 新增 `pmic arbiter instrument linked`（七条串全在），仲裁器宿主模型接进 `check-clover.py` 闸门；显示档案闭环重审通过（`kernel_sha256` 是本轮内核，两个 object 哈希与上一轮逐字相同、193 绑定未动） |
+| round183（v0.5.40） | 排期第 5 格的第一步问的不是「怎么讲 APR」，是「对面是不是已经有人」：`drivers/CloverDsp` 只读两块区域——`qcom,smem@86000000` 那 2 MiB 共享堆（头字段含 `reserved` 必须为 0 这条厂商约束、512 项全局 TOC 的有界走查、离区域末尾一页的 `$TOC` 分区表，且每行再对着它自己的 `$PRT` 头逐项校验两个 host id 与声明尺寸）和 `0x17911008` 那个 doorbell 字（按本机 DT 声明的七个掩码解码），然后按 `427 + remote_pid` **推导**出的编号找 adsp/modem/cdsp 的出、入 SMP2P 项（`$SMP` v1 + 十六项 + 两个 pid 全部相对上才算一条边），最后扫 ADSP 的 `removed-dma-pool` carve-out `0x92a00000` 与 Wi-Fi MSA `0x85700000` 各 16 页：见到几页、非零几页、第一页非零在哪、有没有字读起来像 ELF 魔数。三档 `clover-dsp=1/2/3` 逐档累加；**一个字节都不写**，因为在 APCS 上写就是中断本身，这条由 checker 反向钉死（不许出现 `windowWrite`/`ds_write`/`kSmp2pSet`/`IOMemoryDescriptor::withAddress`）。解码全在 `DspCore.h`，宿主模型 `tests/clover_dsp_host.cpp`（合成 128 KiB 堆、189 条断言）被 `check-clover.py` 当闸门跑，专挡「魔数按厂商 `u8 magic[4]` 的字面顺序抄」这一类在板子上看不见的字节序错——它会让一块活堆报成「没有分区表」，而报告里没有任何线索说原因是字节序。结尾那句 `verdict adsp_edge=… adsp_loaded=…` 就是排期 5 的分叉：有边又有镜像，第 5 格是协议轮（开 GLINK、讲 APR）；空堆加空 carve-out，第 5 格的第一步其实是排期 6 的——`qcom,pas-id = <1>` 得先压在 round182 已经量到归属的 `vdd_cx` 上 | **已构建**，待冷刷；内核 `1c48bac7…` → 归一化交付 `acc94982…`（AMFI 两处命中随 0x4000 的文本增长挪到 `0x1aac0e4`/`0x1aac16c`，虚拟地址一字未动；object 时间戳 967→**968**）→ payload `839543a8…`（入口探针仍是 6857 字节 / 37 段）；`verify-clover-payload.py` 新增 `smem and adsp instrument linked`（九条串全在），DSP 宿主模型接进 `check-clover.py` 闸门，DT 常量审计从 26 个地址涨到 **30** 个；本轮另外修掉两处只在「新增档案后第一次全量重建内核」才暴露的构建基础设施缺陷——`.config` 里那份 `CONFIG_XNU_EXTRA_LD_ARCHIVES` 缓存，和不带 `-isysroot` 的共享编译记录（详见流水日志） |
 
 round171 + round172 + round173 一帧问九件事：`read guard` 是否整批消失（守卫只等、
 不拒），
@@ -169,8 +170,20 @@ gcc=100000+94000 intid=129`——让读数对着 DT 的声明比，而不是对�
    Goodix 复位时序、两个候选各自的第一读），但它止步于此：电源轨（SPMI/PMI632）未证、
    触摸中断（gpio67，DT 声明 INTID 129）未接、上报协议未解。下一格取决于这一帧的答案是
    ACK 还是 `no address ACKed`。
-5. **网络、音频、USB** — WCN3990 WiFi/蓝牙、WCD 音频、USB device 模式都没有。
+5. **网络、音频、USB** — WCN3990 WiFi/蓝牙、WCD 音频、USB device 模式都没有驱动。
+   这三件事的答案都跑在同一颗处理器上（ADSP），所以 round183 起
+   `drivers/CloverDsp` 先读那两块共用区域——SMEM `0x86000000` 与 APCS doorbell
+   `0x17911008`——并扫 ADSP 的 carve-out `0x92a00000` 与 Wi-Fi MSA `0x85700000`，
+   专门用来分叉这一格：`verdict adsp_edge=yes adsp_loaded=yes` 就是协议轮
+   （开 GLINK、讲 APR、走 QRTR），`no/no` 就是这一格的第一步其实是第 6 格的
+   `qcom,pas-id = <1>`。GLINK/APR/QRTR 一个包都没发，`qcom,icnss@18800000` 的
+   寄存器一次都没读。
 6. **电源管理** — 除 AMFI 需要的那颗 nub 外，充电、电池、PMIC 都没有真驱动。
+   round182 起 `drivers/CloverPower` 能**问**了：SPMI PMIC Arbiter v5 的 APID 地图、
+   每条轨的写归属 EE、PM660/PM660L 的 revid、`ldo-a11`/`ldo-b3` 的 enable 原始字节，
+   全走 *observer* 通道的 `EXT_READL`，一笔写事务都不发起。写一条轨是这一格的下一格，
+   而它等的是那帧的 `write-owner` 读数；第 5 格要是落在「ADSP 从没被装载」那一侧，
+   它压的 `vdd_cx`（pm660l L9，RPM 级 TURBO）也归这一格管。
 7. **eMMC 数据通路已上 DMA，速度还没量到** — 读的那条 ADMA2 在 round172 镜像里，
    写的那条在 round173 镜像里（描述符抄自本板 CAF 树，数据走自有连续 bounce；
    读要批量 PIO 逐字相同才准用，写要 logfs 那 16 块读回原样才准用），
@@ -213,7 +226,7 @@ gcc=100000+94000 intid=129`——让读数对着 DT 的声明比，而不是对�
 board.toml                    板级描述
 configs/clover_defconfig      内核配置
 feeds.toml                    每个常量所依据的两棵设备树
-drivers/                      板级 XNU 驱动（ArmCpu、CloverPMGR、CloverSdhci、CloverBlock、NativeMobileDisplay …）
+drivers/                      板级 XNU 驱动（ArmCpu、CloverPMGR、CloverSdhci、CloverBlock、CloverInput、CloverPower、CloverDsp、NativeMobileDisplay …）
 package/                      链接进内核但不属于任何驱动的板级代码（显示探针）
 patches/xnu-clover/           板级 XNU 补丁（探针与板级行为）
 scripts/                      ADT 生成器、预检与校验、事实采集、归档构建、md0/mockfs 根镜像
@@ -266,7 +279,7 @@ python3 ../UniXNU-clover/scripts/normalize-kernel-macho.py \
   --dtb ../mu-clover/Resources/DTBs/clover.dtb --ramdisk none
 ```
 
-五条必须照办，否则构建会静默产出错的镜像：
+六条必须照办，否则构建会静默产出错的镜像：
 
 1. **先 kernel，再 payload。** payload 里那两半都从内核产物取。
 2. **payload 必须带 `--kernel …-kernel-amfi.macho`。** 每次重建内核，AMFI 的两处
@@ -285,6 +298,13 @@ python3 ../UniXNU-clover/scripts/normalize-kernel-macho.py \
    mtime、以及 `emit_prelink.py` 用前两者哈希出来的 `_PrelinkKCID`——改写成「文件
    其余内容的纯函数」。顺序是有意义的：先归一化再打 AMFI，那 8 个指令字节就落在
    身份字段已经哈希过的范围之外。它不改任何可执行段，也不动长度。
+6. **改过 `configs/clover_defconfig` 就要重新选一次 defconfig。** `unixnu status` 里那行
+   `config …/out/clover/.config` 是真正的读取来源：`cmd_defconfig` 只是把
+   `configs/<name>_defconfig` **复制**过去，`build kernel` 不会替你再复制。所以往
+   `CONFIG_XNU_EXTRA_LD_ARCHIVES` 里加一份新档案之后，如果跳过这步，档案会照常编出来、
+   链接却仍按上一轮那份 `.config` 走，报错是 `Undefined symbols "_clover_dsp_run"`
+   这种「档案明明存在」的样子。参数要写全名：`./unixnu defconfig clover_defconfig
+   --device ../UniXNU-clover`，写 `clover` 会报 `configs/clover not found`。
 
 补丁层的硬规则：`build-xnu-4k-baseline.sh` 按文件名排序逐个
 `git apply --reverse --check`（已在树上就跳过），否则 `--check` + `apply`，
@@ -302,11 +322,23 @@ Xcode 的 clang 在重建归档时不带 `-isysroot` 会拿 macOS SDK 编 iOS �
 `-Wincompatible-sysroot` 当错误，上面显式指定 iPhoneOS SDK 就是为了绕开它；
 只重打 payload 不需要这一步。
 
+round183 起这一步不再靠人记：`build-xnu-4k-baseline.sh` 是一次**全量** pass，它把
+iokit 那份共享编译记录 `build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/
+IOPlatformExpert.cpo.json` 重写成了不带 `-isysroot` 的样子（内核自己无所谓，因为它带
+`-nostdlibinc` 且 `BUILD_WERROR=0`），而板上那四个「按记录复编驱动」的脚本
+（`build-arm-driver.py`、`build-clover-block.py`、`build-clover-pmgr.py`、
+`build-clover-gop-legacy-display.py`）会照抄那份记录再补 `-Wall -Wextra -Werror`，
+于是新档案第一次构建就全体停在一条与驱动无关的报错上。四个脚本现在都做同一件条件
+判断：记录里已经有 `-isysroot`/`--sysroot` 就原样用（保住它当初真的编过的那个 SDK），
+一个都没有才补 `xcrun --sdk iphoneos --show-sdk-path`。
+`scripts` 目录是按大小和 mtime **复制**进 `out/clover/tree` 的（`drivers`/`kits`/
+`patches`/`refer` 才是软链），所以改了设备仓的脚本要等下一次 `unixnu tree` 才生效。
+
 ## 校验
 
 ```sh
 python3 scripts/check-clover.py            # 板级预检（= [firmware] preflight）
-python3 scripts/verify-clover-payload.py   # 归档对镜像：24 项形状与探针断言
+python3 scripts/verify-clover-payload.py   # 归档对镜像：卷内形状 + 逐轮新增的探针断言（本轮 29 条）
 python3 scripts/verify-userdata-window.py  # 刷 userdata 前的宿主闸门（展开 sparse、SHNGROOT、APFS 只读挂载）
 ```
 
@@ -337,6 +369,13 @@ round177 起同一道闸门还咬住两件宿主侧的事。`check-clover.py` �
 再走一遍，要求 962 个 object-path 时间戳全为零、`LC_UUID` 与 `_PrelinkKCID` 各只
 有一处——于是一个没归一化就进 payload 的构建会在这里失败，而不是等下一轮才发现两
 次构建对不上。
+
+round182 起同一道闸门还跑**驱动自己的宿主模型**：凡是能在宿主上判对错的东西都不许等到
+板子上才发现。`check-clover.py` 依次执行 `scripts/test-clover-power.py`（SPMI 仲裁器：
+pthread 假设备逐条重解码命令并断言它是读）与 `scripts/test-clover-dsp.py`（SMEM/SMP2P：
+合成 128 KiB 堆，189 条断言，含「四个魔数按小端字读」这条只有宿主能挡的字节序检查），
+两者非零返回都算本轮失败。被闸门跑的那些逻辑因此必须留在 `PowerArb.h`/`DspCore.h` 这种
+纯 inline 头里，驱动的 `.cpp` 只留映射、解码、打印和观测数组——这条同样有正反钉子。
 
 ## 上机
 

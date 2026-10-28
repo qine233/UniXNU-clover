@@ -17,7 +17,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('component', choices=['ArmVirtPlatform', 'ArmDTPlatform', 'ArmCpu', 'NativeAES', 'NativeVirtioBlock', 'NativeRamBlock', 'NativeMobileDisplay', 'NativeVirtioConsole', 'NativeLegacyDisplay', 'NativeGOPPresenter', 'NativeOfflineGPU', 'NativeOfflineAccelerator', 'NativeIOGPUProviderProbe', 'NativeUfs', 'NativeHidInput', 'NativeKeyStoreEvents', 'NativeAdreno', 'CloverSdhci', 'CloverInput', 'CloverPower'])
+parser.add_argument('component', choices=['ArmVirtPlatform', 'ArmDTPlatform', 'ArmCpu', 'NativeAES', 'NativeVirtioBlock', 'NativeRamBlock', 'NativeMobileDisplay', 'NativeVirtioConsole', 'NativeLegacyDisplay', 'NativeGOPPresenter', 'NativeOfflineGPU', 'NativeOfflineAccelerator', 'NativeIOGPUProviderProbe', 'NativeUfs', 'NativeHidInput', 'NativeKeyStoreEvents', 'NativeAdreno', 'CloverSdhci', 'CloverInput', 'CloverPower', 'CloverDsp'])
 parser.add_argument('--negative-aes-kat', action='store_true', help='Isolated own-source wrong-answer refusal control; never changes original inputs')
 parser.add_argument('--verified-root', action='store_true', help='Authenticate all actual disk reads against an independently signed immutable policy')
 parser.add_argument('--verified-root-bundle', action='store_true', help='Select exactly one capacity-matching policy per device, then independently authenticate it')
@@ -38,7 +38,7 @@ source = ROOT / 'drivers' / ('NativeMobileDisplay' if component in ('NativeLegac
 out = ROOT / 'build' / {'ArmVirtPlatform': 'armvirt-platform', 'ArmDTPlatform': 'armdt-platform', 'ArmCpu': 'armcpu', 'NativeAES': 'native-aes',
                         'NativeVirtioBlock': 'native-virtio-block', 'NativeRamBlock': 'native-ram-block',
                         'NativeMobileDisplay': 'native-mobile-display', 'NativeVirtioConsole': 'native-virtio-console',
-                        'NativeLegacyDisplay': 'native-legacy-display', 'NativeGOPPresenter': 'native-gop-presenter', 'NativeOfflineGPU':'native-offline-gpu','NativeOfflineAccelerator':'native-offline-accelerator','NativeIOGPUProviderProbe':'native-original-provider', 'NativeUfs':'native-ufs', 'NativeHidInput':'native-hid-input', 'NativeKeyStoreEvents':'native-keystore-events', 'NativeAdreno':'native-adreno', 'CloverSdhci':'clover-sdhci', 'CloverInput':'clover-input', 'CloverPower':'clover-power'}[component]
+                        'NativeLegacyDisplay': 'native-legacy-display', 'NativeGOPPresenter': 'native-gop-presenter', 'NativeOfflineGPU':'native-offline-gpu','NativeOfflineAccelerator':'native-offline-accelerator','NativeIOGPUProviderProbe':'native-original-provider', 'NativeUfs':'native-ufs', 'NativeHidInput':'native-hid-input', 'NativeKeyStoreEvents':'native-keystore-events', 'NativeAdreno':'native-adreno', 'CloverSdhci':'clover-sdhci', 'CloverInput':'clover-input', 'CloverPower':'clover-power', 'CloverDsp':'clover-dsp'}[component]
 if args.verified_root:
     out = ROOT / ('build/native-virtio-block-verified-fault' if args.negative_verified_block else 'build/native-virtio-block-verified')
     if args.verified_root_bundle:
@@ -75,6 +75,17 @@ while index < len(arguments):
 command.extend(['-Wall', '-Wextra', '-Werror', '-Wno-error=unknown-warning-option', '-Wno-unused-parameter',
                 '-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
                 '-Wno-unnecessary-virtual-specifier', '-I', str(ROOT / '.cache/xnu-work/osfmk')])
+# Whether this record carries a sysroot depends on which pass wrote it, and the difference is invisible
+# to the kernel and fatal here. A full pass compiles iokit/Kernel/IOPlatformExpert.cpp with -nostdlibinc
+# and BUILD_WERROR=0, so clang's host-SDK default costs that pass nothing and the record has no
+# -isysroot at all; an incremental pass leaves the record a previous SDKROOT-resolved pass wrote, which
+# does. This script adds -Werror to the same arguments, and the default -- the macOS SDK on this host --
+# against the record's own arm64-apple-ios target is incompatible-sysroot, so every driver here would
+# stop compiling on the first full kernel rebuild for a reason that has nothing to do with the driver.
+# Pin the iOS SDK only when the record did not: a record that already names one keeps the build it built.
+if not any(str(value).startswith(('-isysroot', '--sysroot')) for value in command):
+    command += ['-isysroot', subprocess.run(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'],
+                                            capture_output=True, text=True, check=True).stdout.strip()]
 if component in ('NativeVirtioBlock', 'NativeRamBlock', 'NativeUfs'):
     command += ['-I', str(ROOT / 'build/storage-abi/include')]
     if args.verified_root:

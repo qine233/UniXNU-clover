@@ -63,6 +63,13 @@ void clover_input_run(void);
 // the PMIC arbiter and the two LDOs the touch panel declares as supplies. Read-only against the
 // PMIC, opt-in through `clover-power`, and it returns without touching a register when absent.
 void clover_power_run(void);
+// Round183: drivers/CloverDsp, the same schedule point for the same reason. It runs after
+// clover_power_run() on purpose: round182 prints the two rails' enable bytes and their owner-EE
+// table, and this round's answer to "was the ADSP ever loaded" only becomes a plan when it is read
+// next to "is vdd_cx on" -- an unloaded ADSP plus an off L9 is a two-step job with the rail first,
+// not a PIL attempt that hangs on an unpowered CX domain. Read-only against SMEM and one APCS
+// register, opt-in through `clover-dsp`, and absent means not a byte is read.
+void clover_dsp_run(void);
 }
 
 // The panic screen prints these lines, so the reading survives even when the console is the
@@ -236,4 +243,8 @@ extern "C" void sheng_pmgr_run(void)
   // last line, and both leave through the same card-backed ring, so their order on the card is the
   // order they were asked. Absent `clover-power`, this starts no PMIC transaction at all.
   clover_power_run();
+  // Last, and after the rail report: this round's question is whether 排期 5 is a protocol job or a
+  // bring-up job, and the second answer only means something next to the first. `clover-dsp` absent
+  // means SMEM is not mapped and the doorbell register is not read.
+  clover_dsp_run();
 }

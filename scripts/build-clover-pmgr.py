@@ -138,6 +138,12 @@ while i < len(arguments):
 command += ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-c99-designator',
             '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
             '-Wno-unnecessary-virtual-specifier', '-I', OUT, '-I', ROOT / '.cache/xnu-work/osfmk']
+# A full kernel pass writes this record without -isysroot (it compiles with -nostdlibinc and
+# BUILD_WERROR=0, so the host SDK default costs it nothing); with -Werror added here that default becomes
+# incompatible-sysroot against the record's own arm64-apple-ios target. Pin the iOS SDK when the record
+# did not. See scripts/build-arm-driver.py for the long form of this note.
+if not any(str(arg).startswith(('-isysroot', '--sysroot')) for arg in command):
+    command += ['-isysroot', run(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).stdout.strip()]
 run(command, cwd=record['directory'])
 raw = obj.read_bytes()
 info = macho(raw)

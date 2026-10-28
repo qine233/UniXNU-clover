@@ -70,6 +70,7 @@ archives = [
   "build-clover-block.py",
   "build-arm-driver.py CloverInput",
   "build-arm-driver.py CloverPower",
+  "build-arm-driver.py CloverDsp",
 ]
 
 [kernel.prelink]
@@ -169,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r182: the PMIC arbiter answers and says who owns the rails"
+title = "clover r183: the shared heap is read and says whether the DSP is already up"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2225,6 +2226,51 @@ kernel_args = [
   # It runs last in the PMGR tail, after CloverInput, because its report is what tells the round181
   # readings whether the panel's rails were ever on. It never panics.
   "clover-power=3",
+  # Round183 puts drivers/CloverDsp on the SMEM heap, and mode 3 is the one worth booting for: it is
+  # mode 1 (the heap) plus mode 2 (who is on the other side of it) plus the two image scans, and the
+  # question 排期 5 was blocked on -- is the ADSP already up? -- only has an answer when all three are
+  # read in the same boot. Mode 1 maps 0x86000000+2 MiB and reads the header, the 512-entry global
+  # TOC and the partition table one page from the region's end. Mode 2 adds the doorbell word at
+  # 0x17911008 and the SMP2P candidates. Mode 3 adds the ADSP carve-out at 0x92a00000 and the Wi-Fi
+  # MSA at 0x85700000, sixteen pages each, mapped a page at a time.
+  # NOTHING HERE WRITES ANYTHING, AND THAT IS NOT THE WHOLE RISK. Reading SMEM is a load and reading
+  # the APCS word is a load, so there is not even a command to issue -- but the SMEM node declares
+  # `qcom,mpu-enabled` (clover.dts:4692), a permission the shipping kernel's ADSP driver granted and
+  # a boot chain that never ran one may not. That is why the mapping happens before any read, why
+  # every offset the walk follows is bounded against the span it came from, and why mode 1 begins
+  # with the lowest-addressed word of the region: if a denial happens it happens on the first read,
+  # with the mode, the phys and the slot array already printed.
+  # What comes back, through round176's tee (`clover r` is already allowlisted):
+  #   `clover r183: smem initialized=.. free=.. available=.. reserved=.. sbl=.. pc=../..` -- and
+  #    `reserved` is the validity check on the whole decode, because the vendor requires it to be zero;
+  #   `clover r183: global toc scanned=512 allocated=.. highest=..` then `toc[i] off=.. size=..
+  #    in_span=.. aux=.. phys=..`, up to 24 of them, and `beyond_declared=` says whether the heap holds
+  #    more items than its own SIII record advertises;
+  #   `clover r183: ptable at .. magic=$TOC version=.. entries=.. info=.. num_items=.. capacity=..` --
+  #    a magic that is not $TOC read as one little-endian word is the legacy layout, and the report says
+  #    so rather than concluding the heap is empty;
+  #   `clover r183: part[i] hosts=0:2 off=.. size=.. cacheline=.. hdr=$PRT ok=1 hosts_ok=..` -- the row
+  #    followed to its own partition header and checked against it, which is the difference between a
+  #    table and a table that lies;
+  #   `clover r183: doorbell 17911008+04 = ..` and per edge `set=1`, plus `out=429 pred=429 law=1` --
+  #    the item this port looks for, the one the CAF tree's arithmetic predicts, and whether this
+  #    board's shipped DTB says anything about that edge at all;
+  #   `clover r183: adsp-out item=429 path=private data=.. hdr magic=$SMP ver=1 lpid=0 rpid=2 total=16`,
+  #    with each refusal named separately (`absent`, `rejected rc=DS_E_PID`), because "no such item" and
+  #    "an item for a different pair of processors" are different answers to 排期 5;
+  #   `clover r183: image adsp-fw 92a00000+1f00000 pages=16 nonzero=.. first=.. elf_at=..` and the same
+  #    for wlan-msa -- a presence claim, not an identity claim, since a PIL loader copies segments to
+  #    their p_paddr and need not leave the .mdt's ELF magic at offset 0;
+  #   `clover r183: verdict adsp_edge=seen|not seen adsp_loaded=pages nonzero|pages zero`.
+  # That last line is the fork 排期 5 has been waiting on. An edge and a loaded carve-out make item 5 a
+  # protocol job -- open a GLINK channel, speak APR -- with no PIL, no SCM, no rail vote. An empty heap
+  # and an empty carve-out make its first step 排期 6's: `qcom,pas-id = <1>` over a `vdd_cx` that is
+  # pm660l L9 at RPM level TURBO, which is exactly the gate round182 measured the owner of.
+  # It runs last in the PMGR tail, after CloverPower on purpose, because "the ADSP was never loaded"
+  # combined with "L9 is off" is what turns a PIL attempt into a two-step plan with the rail first. It
+  # never panics: an empty SMEM is a reading, and a boot that finds one still reaches launchd with the
+  # emptiness recorded.
+  "clover-dsp=3",
 ]
 
 [payload.adt]

@@ -13531,3 +13531,294 @@ fastboot reboot
 enable 成立才准谈电压与设置。本轮止步于 enable。它不动任何已经存在的格子——显示 phase 2/3/4、
 536 共享区、`/data` 仍按原顺序排着；排期里下一格是「拿到归属之后，第一次写一条轨」，那道闸
 必须等这帧的 `write-owner` 读数落地才准开工。
+
+## round183（v0.5.40）：共享堆被人读过了，它说 ADSP 到底起没起
+
+### 这一轮问什么
+
+排期第 5 格（网络、音频、USB）。这一格此前的写法是「WCN3990 WiFi/蓝牙、WCD 音频、USB device
+模式都没有」，三件事各自像一格，其实共用一颗处理器：本板的音频在 AP 侧根本没有寄存器——
+`clover.dts` 里每个 `asoc-cpu` 名字都是 `msm-dai-q6-*`，WCD9335 那张声卡是
+`status = "disabled"`，`qcom,msm-audio-apr` 底下只有一个 dummy 子节点（:13988-14035）；
+Wi-Fi 是 `qcom,icnss@18800000`（:5833），而它的 modem 侧那一半是跑**在 ADSP 上**的 WCN 固件，
+轨和 MSA 区域都由 ADSP 的 SSR 管。所以第 5 格的第一步不是「怎么讲 APR」，是「对面是不是
+已经有人」：ADSP 若已经起来，它的 SMP2P 边就在 SMEM 里分了项、它的固件页非零，下一轮就是
+协议轮（开 GLINK、讲 APR）；若这条引导链里它从没被装载过，同一轮就会把时间花在一头-empty
+的传输上，而真正该先做的是排期 6 的事——一次 PIL 载入（`qcom,pas-id = <1>`）压在 round182
+已经量到归属的那条 `vdd_cx` 上。
+
+这两条路在帧上是能分开的，因为答案是硬件写在共享内存里的：AP 和 DSP 寻址同一段 2 MiB
+窗口，引导在其中放了一张目录表，而这颗 SoC 的每一条核间通道要么是表里的一项，要么是
+`0x17911008` 那一个 32 位寄存器里的一位。于是本轮读四样东西——SMEM 的 `initialized` 字、
+SMP2P 项的魔数与项名、doorbell 的活位、ADSP carve-out 里的非零页——**四样都能读，一样都不
+必写**。
+
+### 前置（#295）：DT 把 ADSP 通路的每一块都点了名
+
+`~/uefi-clover/Resources/DTBs/clover.dts` 对本轮这四个问题各自给了唯一的地址：
+
+- `qcom,smem@86000000`（:4687-4692）的 `reg` 有八个 cell，`reg-names` 逐个报名：
+  `smem` = `0x86000000+0x200000`、`irq-reg-base` = `0x17911008+0x04`、`aux-mem1` =
+  `0x778000+0x7000`、`smem_targ_info_reg` = `0x1fd4000+0x08`；节点还带
+  `qcom,mpu-enabled`——这条决定了本轮的风险形状（下面单说）。
+- 同一个 doorbell 字被七个节点各自写明：`:354`、`:362`、`:370`、`:4811`、`:4820`、`:4841`、
+  `:4850`，SMEM 节点自己再写一次（:4689）。`qcom,smp2p-adsp@17911008` 带
+  `qcom,irq-bitmask = <0x400>`（:360-364），GLINK 传输用 `reg-names = "smem\0irq-reg-base"`
+  把同一对地址再带一遍（:4818-4821）。
+- ADSP 的载入方 `qcom,lpass@15700000`（:5854-5879）：`compatible = "qcom,pil-tz-generic"`、
+  `qcom,pas-id = <1>`、`qcom,smem-id = <0x1a7>`（=423）、`qcom,sysmon-id = <1>`、
+  `qcom,ssctl-instance-id = <0x14>`、`qcom,firmware-name = "adsp"`，proxy 轨 `vdd_cx` =
+  pm660l L9，`qcom,vdd_cx-uV-uA = <0x180 0x186a0>` 即 RPM 级 TURBO + 100 mA。
+- 两块 `removed-dma-pool` + `no-map`：`adsp_fw_region@92a00000`（phandle 0xfc，被
+  `qcom,lpass` 的 `memory-region` 指认，:16459-16464 与 :5872）与
+  `wlan_msa_mem@85700000` + 1 MiB（phandle 0xfa，`qcom,icnss` 的
+  `qcom,wlan-msa-fixed-region`，:16437-16443 与 :5850-5851），外加它下面那块 guard 页
+  `0x85600000+0x100000`（:16431-16435，读，因为 guard 非零意味着有东西写过 carve-out 之外）。
+
+一处**只有本板才知道**的几何：`adsp_fw_region` 在 SoC 级 `sdm660.dtsi`（VEND :360-363）里是
+`0x1e00000`，小米的 `clover-overlay.dtsi:8` 把它重写成 `0x1f00000`，设备上那份合并 DTB 带的
+是后者。31 MiB 不是 30。这条不是本轮的边角料，而是这块板子的提问方式：**SoC 树给默认值，
+板级 overlay 才是事实，两边都要拿机器上采下来的 DTB 对一遍**，所以 `check-clover.py` 的常量
+审计读的是 `facts/81ffcaaa-20261022-210928/dt/` 里那份原始字节。
+
+`qcom,icnss@18800000` 的 `membase`（`0x18800000+0x800000`）本轮**不映射**：在不带轨、不带时钟
+的情况下去读 Wi-Fi 块的寄存器，是造 bus hang 的标准做法，而这里一次 hang 要赔上引导后面所有
+的行。地址记下来是因为它是下一轮的窗口，而它下面那块 MSA 内存本轮就读——那是内存问题，不是
+寄存器问题。
+
+### 硬件事实怎么钉的（四个具名来源，逐条引行号）
+
+`drivers/CloverDsp/DspRegs.h`（406 行）每个常量都报名出处：
+
+- **DTB** = 本机 `clover.dts`，上面那节的全部地址与掩码。
+- **VEND** = `https://github.com/E7G/clover-sdm660-ksb` @ `5c81a3faf37e…`（小米给这块平板自己的
+  4.19 CAF 树）的 `drivers/soc/qcom/smem.c`、`include/soc/qcom/smem.h`、
+  `drivers/soc/qcom/smp2p.c`、`arch/arm64/boot/dts/vendor/qcom/sdm660.dtsi` 与
+  `xiaomi/mi/clover/clover-overlay.dtsi`：SMEM 头的字段顺序在 smem.c:138-146，TOC 项在 :120-125，
+  `SMEM_ITEM_COUNT 512` 在 :78，分区表与分区头在 :176-186 与 :158-170，项头 16 字节与金丝雀
+  `0xa5a5` 在 :232-240，`aux_base` 低两位保留在 :126，分区表「离末尾一页」在 :1096，
+  host 编号（AP=0、GLOBAL=0xfffe）在 :81/:84，SMP2P 项的 `__packed` 布局在 smp2p.c:75-89
+  （魔数 :57、版本 :58、SSR_ACK :49、RESTART_DONE/ACK :47-48、16 项上限 :50-51）；
+  条目编号在 smem.h:155-177（`SMP2P_APPS_BASE 427`、`IMAGE_VERSION_TABLE 469`、
+  `GLINK_NATIVE_XPRT_DESCRIPTOR/FIFO_0/FIFO_1` = 478/479/480、`NUM_ITEMS 498`）。
+- **MAIN** = `https://github.com/sdm660-mainline/linux` @ `dd1ed52c8ceef…`（qcom-sdm660-7.2.y）
+  的同一对 `smem.c`/`smp2p.c`，只当第二意见用。
+- **SHENG** = `~/UniXNU-sheng/package/QcomSmem.c`、`QcomSmp2p.{h,c}`、`AdspProbe.cpp`。
+  这三块在 SM8550 上跑通过并真的读到过一颗答话的 DSP，所以**走查的形状**照它，**数字只引用
+  不抄**：sheng 的 SMEM 是 `0x81d00000` 不是 `0x86000000`，它的 doorbell 是一整块 IPCC
+  （`0x408000`）而不是一个寄存器，它的音频协议是 GPR/AudioReach——本板的 GLINK 子节点名字还
+  叫 `apr_audio_svc`（VEND sdm660.dtsi:1526-1529），那套不适用。SHENG 唯一被直接采用的是
+  「按字索引走 16 字节项」的写法（QcomSmem.c:13-20）与 `PART_HEADER 32`、`TOC_HEADER 32`、
+  `TOC_ENTRY 48` 三个数，因为本板两份树在这里和它逐字一致。
+
+### 三处分歧，都留在报告里、没有靠猜解决
+
+**doorbell 有两种绑定。** CAF 树走 mailbox 索引（`mboxes = <&apcs_glb 10>`，VEND :1748，
+`apcs_glb` = `mailbox@17911000` 且 `#mbox-cells = <1>`，:1445-1450），本机树根本不带 mailbox
+phandle、直接给寄存器和掩码。两者说的是同一件事：10 变 `BIT(10)` = `0x400`，正是本机节点里那个
+`qcom,irq-bitmask`。这个对应关系是**六条边各自**证出来的——adsp glink 9=0x200、adsp smp2p
+10=0x400、modem smp2p 14=0x4000、modem glink 15=0x8000、cdsp glink 29=0x20000000、cdsp smp2p
+30=0x40000000（VEND :1475/:1511/:1548/:1710/:1748/:1790 对 DTB :349/:357/:365/:4815/:4825/
+:4845）——再加本机树独有、CAF 没放进这个寄存器的第七条 RPM 边（掩码 `0x01`，DTB :4846）。
+所以那张表是「两种绑定 + 七个样本」，不是一条推出来的规律。
+
+**429 这个编号是推出来的，不是抄来的。** 本机树**删掉了** CAF 用来定位 SMP2P 项的那条属性：
+`qcom,smem = <443>, <429>`（VEND :1746）在 DTB 的 `qcom,smp2p-adsp` 里不存在，
+`qcom,local-pid` 和 entry 子节点也不在。只读本机节点的驱动不可能知道哪条边装着哪个 SMEM 项。
+`kSmemSmp2pAppsBase = 427` 是按 CAF 那三个出站编号（429/428/432 = 427 + pid 2/1/5）反推的
+算法，而且这条算法自己就有反例：cdsp 的**入站**项是 94（VEND :1787），不在任何 base+8 规则里。
+所以本轮把它当**候选**而不是定律——驱动仍然去读那个项，但要求布局自证：`$SMP` 魔数、版本 1、
+`total_entries` 16、以及 `local_pid`/`remote_pid` 两个字段都对得上，才算「这是一条边」。
+一个只能靠魔数而不是靠编号认出来的项，断言比厂商驱动弱，但对一棵什么都没说清楚的树，这才是
+诚实的那一句。报告里因此同时给 `out=`（本端口找的）、`pred=`（规律预测的）和 `law=`（两者是否
+一致）。
+
+**厂商自己的映射规则是矛盾的，端口故意不照抄。** VEND smem.c:1094 只给 SMEM 头映射一页
+（"map starting 4K for smem header"），而按 :138-146 那个 struct 展开、把 `SMEM_ITEM_COUNT 512`
+代进去，头是 `0x20D0` 字节：查 429 号项要读 `toc[429]`，落在 `0x1B50`——在它自己那张映射之外。
+本端口整段 2 MiB 都映射，所以每个 TOC 项和它指向的数据都在同一跨度里。记下来是因为会有人拿
+这份文件对着厂商源码找一个**故意没跟**的规则。
+
+### 三档，和那条「只读」的硬保证——风险不是事务，是 MPU
+
+`clover-dsp=1/2/3` 逐档累加：1 只读堆——头字段（`initialized`/`free_offset`/`available`/
+`reserved`/SBL 版本槽/遗留 proc_comm 那一对）、512 项全局 TOC 的有界走查加一项普查，再加末尾
+一页的 `$TOC` 分区表，每条分区行都顺着走到它自己的 `$PRT` 头，逐项校验两个 host id、声明尺寸
+与分区自己的魔数；2 再加 doorbell 读一次并按七个掩码解码，然后查 adsp/modem/cdsp 的出入共
+六个 SMP2P 候选项，每个候选都验完才打印；3 再加 ADSP 的 SSR 项（423）、三条 GLINK
+native-transport 项（478/479/480）与镜像版本表（469）的原始字节，最后扫 ADSP carve-out 与
+Wi-Fi MSA 各 16 页——见到几页、非零几页、第一页非零在哪、有没有哪个字读起来像 ELF 魔数。
+`reserved` 必须是 0，这是厂商对合法引导的约束（VEND smem.c 的检查），所以它是整套解码的
+有效性校验；`num_items` 从 `SIII` 记录里读，不假设 512，因为那个数才是给走查定界的。
+
+只读在这块硬件上不是措辞问题，是两条不同的原因：**APCS 上写就是中断本身**——sheng 那边对应
+的那句是 `regmap_write(ipc_regmap, ipc_offset, BIT(ipc_bit))`（AdspProbe.cpp:190 复述的厂商
+驱动），所以「叫醒它」和「问它在不在」用的是同一个寄存器，本轮只能读；**SMEM 节点声明
+`qcom,mpu-enabled`**（DTB:4692），那是 shipping 内核的 ADSP 驱动配置过的权限，而一条从没跑过
+那种驱动的引导链未必配。因此三条规矩挡住唯一能让本轮赔掉整次引导的东西：先映射后读（两个窗口
+都在第一个字节被读之前映射好）、每个跟随的偏移都对着它的来源跨度做减法定界、拒绝是一个有名字
+的返回码（`DS_E_SPAN` … `DS_E_PID`）而不是一次 fault。这条同样是机器查的：`check-clover.py`
+见到 `windowWrite`、`ds_write`、`kSmp2pSet`、`IOMemoryDescriptor::withAddress` 中任何一个就
+失败，并要求 `DspCore.h` 里那五条定界语句（`smem.size < kSmemToc`、
+`entry.data + entry.size > smem.size`、`item.total_entries != kSmp2pMaxEntries`、
+`if (entry.aux_base)`、`DS_E_RANGE`）一条条都还在。
+
+镜像那一档只报存在性不报身份：`removed-dma-pool` 非零页说明有 PIL 复制过段，但复制段的加载器
+把段写到各自的 `p_paddr`，**不保证**在偏移 0 留下 `.mdt` 的 ELF 魔数，所以扫描打的是
+`elf_at=`/`elf words= at+… phys=…`，而不是「开头应该有」。
+
+### 把可测逻辑拆出去：`DspCore.h` + 一块合成的 128 KiB 堆
+
+和 round182 同一个理由，但这次要挡的东西更隐蔽。本轮的报告完全由五个决定派生，而其中一个在
+板子上**看不见**：魔数的字形式。厂商把四个魔数声明成 `u8 magic[4]` 并用 `memcmp` 比
+（smem.c:838、:915），源码里写的是 `{0x24,0x54,0x4f,0x43}`；一次对齐的字加载读到的却是
+`0x434f5424`。抄成源码那四个字节，得到的是一块活的 2 MiB 堆报「这里没有分区表」——地址全对，
+帧上没有任何线索说原因是字节序，而且要一次完整刷写才试得出来。
+
+于是解码全在 `DspCore.h`（706 行）里，是对裸 span 的 inline 函数：头走查、TOC 普查、分区行、
+两条项表（非缓存的那条向上长，缓存的那条从 `size - align_up(16, cacheline)` 向下长）、金丝雀、
+SMP2P 校验、七个 doorbell 掩码、页/ELF 扫描。`drivers/CloverDsp/CloverDsp.cpp` 只留真正需要
+内核的东西。宿主上 `tests/clover_dsp_host.cpp`（646 行）拿一块合成的 128 KiB 堆驱动**同一批**
+函数，`scripts/test-clover-dsp.py` 用 `-Wall -Wextra -Werror` 编它跑它，`check-clover.py` 把
+非零返回当本轮失败。189 条断言里，四条是魔数（`wordOf(mTOC) == kSmemPtableMagic` 等，专给
+「以后有人照着厂商源码把它改回去」那类提交准备的），四条是结构尺寸（TOC  extent `0x20D0`、
+`kSmp2pItemBytes == 340 == 20 + 20*16`）；十一种失败——`DS_E_SPAN`/`RANGE`/`ALIGN`/`CANARY`/
+`COUNT`/`MAGIC`/`VERSION`/`PID`/`SIZE`/`PART`/`ITEM`——各造一块区域把它逼出来，所以拒绝路径是
+被测过的而不是被论证过的。模型故意不复现真实对齐（SMEM 偏移 8 字节对齐、尺寸向上取整）也不复现
+几十对分区，因为被测代码定界于头里声明的那些数，数对上了，形状不是行为差异。
+
+### 接线与契约
+
+`scripts/build-arm-driver.py` 的 choices 加 `CloverDsp`，输出目录 `build/clover-dsp`；
+`configs/clover_defconfig` 的 `CONFIG_XNU_EXTRA_LD_ARCHIVES` 变成五份档案（仍是普通档案路径，
+不用 `force_load`——`_clover_dsp_run` 被 CloverPMGR 引用，普通解析就会拉进来）；`board.toml`
+的 `[kernel].archives` 加一行（第 15 份）、`kernel_args` 末尾加 `"clover-dsp=3"`、标题升到
+`clover r183: the shared heap is read and says whether the DSP is already up`。
+`drivers/CloverPMGR/CloverPMGR.cpp` 在 `clover_power_run()` **之后**加 `clover_dsp_run()`：
+「ADSP 从没被装载」要和「`vdd_cx` 是 off」并排出现才变成一个两步计划，顺序反了就只能各自猜。
+
+`check-clover.py` 新增：档案/defconfig/boot arg/`CONFIG_XNU_SHENG_PMGR` 四者一致（mode 只许
+1/2/3，别的值直接报错）、`DspCore.h`/`DspRegs.h`/`CloverDsp.cpp` 的正反钉、上面说的只读反向钉、
+四个魔数的字形式、DT 基址审计新增 `qcom,smem@86000000` 的两对 cell 与两个 smp2p 节点的寄存器
+（**26 个地址 → 30 个**，仍对 230 个节点），以及宿主模型闸门。这里还补了一条解析器的能力：
+`parse_defines()` 以前只认 `#define`，现在也认 `static const`——因为 `DspRegs.h` 的偏移全是
+`kSmemPhys` 的相对算术（`kSmemSize - 0x1000`、
+`kSmemToc + kSmemItemCount * kSmemTocEntrySize`），那些表达式本身就是被测对象，一个只看
+`#define` 的审计对它们无话可说。`verify-clover-payload.py` 新增
+`kernel.macho: smem and adsp instrument linked` 九条串：轮次戳、堆头、全局 TOC 走查、分区表、
+分区行校验、doorbell 字、SMP2P 身份、镜像存在性、以及那句分叉（verdict）。
+
+### 构建基础设施：两处只在「新增档案后第一次全量重建内核」才露面的缺陷
+
+这两条都不是本轮代码的错，但都会让下一轮以为新增档案这件事本身有风险，所以逐条记下来，并已
+写进 README 的构建一节。
+
+其一，**`out/clover/.config` 是缓存，不是每次读的 `configs/clover_defconfig`。**
+`cmd_defconfig` 只做一件事：把 `configs/<name>_defconfig` **复制**到
+`out/clover/.config`（`unixnu status` 里那行 `config …` 就是真正的读取来源）。所以往
+`CONFIG_XNU_EXTRA_LD_ARCHIVES` 加了第五份档案之后，如果跳过重新选 defconfig 这步，档案照常
+编出来、链接却仍按上一轮那份 `.config` 走，症状是
+`Undefined symbols "_clover_dsp_run" … CloverPlatformPower.late.o`——一个「档案明明在」的
+链接失败。命令的参数必须是全名：`./unixnu defconfig clover_defconfig --device ../UniXNU-clover`，
+写 `clover` 会报 `configs/clover not found; available: clover_defconfig`。已加成 README 的第 6
+条硬规则。
+
+其二，**一次全量 pass 会把共享编译记录里的 `-isysroot` 洗掉。** 板上所有驱动档案都复用
+`build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json`
+那 479 个参数。增量 pass 里那份记录是上一次 SDKROOT-resolved pass 写的，带 `-isysroot`；
+本轮这种全量 pass 用 `-nostdlibinc` 且 `BUILD_WERROR=0` 重编它，写出来的记录**一个字都不带
+sysroot**——对内核无害，因为 clang 的宿主 SDK 默认在这个配置里不被当真。但四个「按记录复编」
+的驱动脚本会照抄记录再补 `-Wall -Wextra -Werror`，于是新档案第一次构建就全体停在
+`-Wincompatible-sysroot`（拿 MacOSX27.0.sdk 编 `arm64-apple-ios17.0.0`）上，报错内容与被编的
+驱动毫无关系。修法不是把 `-Werror` 摘掉，而是四个脚本（`build-arm-driver.py`、
+`build-clover-block.py`、`build-clover-pmgr.py`、`build-clover-gop-legacy-display.py`）各加同
+一条条件：记录里已经有 `-isysroot`/`--sysroot` 就原样用（保住它当初真的编过的那个 SDK），一个
+都没有才补 `xcrun --sdk iphoneos --show-sdk-path`。顺带在这条上撞了一个小坑：
+`build-clover-pmgr.py` 的 command 里混着 `Path` 对象，判断要写 `str(x).startswith(...)`。
+
+另记两条流程事实：`unixnu tree` 把 `scripts/` 按大小和 mtime **复制**进树（`drivers`/`kits`/
+`patches`/`refer` 才是软链），所以改脚本要过一遍 tree 才生效；本轮内核是在补丁链干净重放之后
+构建的——`out/clover/tree/.cache/xnu-work` 先 reset、按文件名顺序全放（72 个文件被改、0 次
+失败），再逆撤 `zzy-clover-dyld-cache-skip.patch`，构建脚本自己的循环会把它放回去。这里要
+纠正 round182 之后那次临时排查留下的一个误判：我当时以为 `zzy-staged-system-apps.patch`
+「正反两个方向都逆不掉」是补丁重叠，干净重放证明那是我自己分几次部分逆撤造出来的假象；
+`zzz-clover-mac-exec-probe.patch` 根本不碰 `kern_exec.c`。这条值得留着，因为「新探针能不能插进
+排序在前的补丁自己新增的块」这道判断全靠它。
+
+### 产物
+
+15/15 份档案，`CloverDsp` 是最后一份，树内 `-Wall -Wextra -Werror` 与 ARM64/iOS 17 object 审计
+一次通过。本轮内核 `1c48bac7b81b735d1c4923b2c7f6b70a5120e6f7aeda7dcb994dc142a6ae996e`；
+AMFI 两处命中随 0x4000 的文本增长**换了 file 偏移、虚拟地址一字未动**：
+`0x1aa80e4 -> 0x1aac0e4`、`0x1aa816c -> 0x1aac16c`，VA 仍是
+`0xfffffff004ab40e4`/`0xfffffff004ab416c`，字照旧 `0x34000229 -> 0x14000011`、
+`0x36000520 -> 0xD503201F`（打补丁后 `6dbc8e88…`）；归一化后交付内核
+`acc94982a28ccd29967793d449b7bee83ed0e3eda34655fb7e9470abe6bc96c6`，object 时间戳从 967 个变成
+**968** 个；payload `839543a839bb3d19bd9371170daa94ae1c658bffbc76886b7a23c8e8449d1bc7`
+（56 MiB），卷内内核 `565d8fce…`、`unixnu.toml` `e8a0fd98…`、ADT `79adf49c…`（13516 字节）、
+`scratch-data.img` `614b8356…`（未变）、trustcache `7c369ce0…`（未变）；入口探针
+**6857 字节 / 37 段**，另有 3905 处位于可执行文本之外被忽略。`boot.img`
+`196b284fc15119610260480c767a5d0a14bf18b4eed31d2e267548be1ba7d00b`（1613824 字节，
+`--ramdisk none`）。
+
+链接之前编的那批档案里，显示档案的 `reference_sha256` 仍指上一轮内核——「档案排在链接之前，
+所以同一次运行审计的是上一轮内核」那条已知行为。照 round181/182 的做法在链接完成后于树内重跑
+一次 `build-clover-gop-legacy-display.py`：`kernel_sha256` 拿到 **本轮内核 `1c48bac7…`**，
+`compiled_object_sha256 = 1b6c134e…`、`late_object_sha256 = a061787e…` 与上一轮逐字相同，
+193 条原始绑定一条没动，`family_text_sha256` 仍是 sheng 钉住的 `2e044ee6…`。这件事本轮比
+round182 更要紧，因为链接布局确实动了（文本 +0x4000）：重审通过证明 `IOMobileGraphicsFamily`
+的 `record=0xfffffff006b35940`、`parent=…b31400`、`size=0x18a0` 没有跟着挪， shipped payload
+里那份档案就是这份审计认过的字节。
+
+闸门：`check-clover.py`（含新接进去的 SMEM/SMP2P 宿主模型与仲裁器模型）、
+`normalize-kernel-macho.py --selftest`（17 条规则）、`check-cs-blob-structure.py --selftest`
+（14 条）、`test-clover-power.py`、`read-clover-log.py --selftest`、
+`verify-clover-payload.py` 全绿（29 条断言 + 5 行卷内形状，本轮新增的那条正是
+`smem and adsp instrument linked`）。归档在 `~/clover-out/round183-*`，清单
+`round183-SHA256SUMS`（另含 `round183-boot.img`）。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round183-payload.img
+fastboot reboot
+```
+
+### 这一帧问什么
+
+全部读数仍在卡上的内核日志环（kind 22）里，一次 `scripts/run-clover-unattended.sh` 就够：
+
+1. `clover r183: mode 3 smem=86000000+200000 apcs=17911000+1000`。这一行之后必须还有别的行；
+   只有这一行就是映射成功、第一个读被 MPU 拒了，那本轮仍然有答案（权限确实没配），只是答案
+   在 `map … failed` / `smem header rc=` 那一句里。
+2. `smem initialized=… free=… available=… reserved=… sbl=… pc=…/…`。`reserved` 不是 0，或者
+   `initialized=0` 又没有后面那句 `note initialized=0; continuing`，整套分区查询就要按「这颗
+   SoC 的堆不是这个布局」读，而不是按「ADSP 没起」读。
+3. `global toc scanned=512 allocated=… highest=…` 与 `toc allocated=… listed=…
+   beyond_declared=… declared=…`。`beyond_declared` 非零说明 `SIII` 报的项数小于真正在用的编号，
+   那是引导自己的账对不上，不是本端口读错。
+4. `ptable at … magic=$TOC version=… entries=… info=… num_items=… capacity=…`。出现
+   `magic=… rc=-4` 而不是这一行，**不要**读成「没有分区表」：那正是四种字节序里的那一种，
+   宿主模型挡的就是它；本轮把 `magic=` 原样打出来，就是为了在这种情况下还能自证。
+5. `part[i] hosts=0:2 … hdr=$PRT ok=1 hosts_ok=… rc=…`。只有 `hosts` 里带 0（本 AP）的行才是
+   ADSP 那条边可能在的地方；`ok=0` 是行跟它自己的头对不上，那是布局问题，不是空堆。
+6. `doorbell 17911008+04 = …`。`00000000` 是「本次引导没有任何边发过信号」，同时它证明那个
+   寄存器答了话——这一行本身就是 MPU 权限的读数。
+7. `edge[i] … set=… out=429 pred=429 law=1` 之后那两行 `adsp-out item=…` / `adsp-in item=…`：
+   `path=private` 还是 `path=global`、`hdr magic=$SMP ver=1 lpid=0 rpid=2 total=16` 是否成立。
+   `absent rc=-9 (item)` 和 `rejected rc=-11 (pid)` 是两个不同的回答——前者是「没有这个项」，
+   后者是「有项但它报的是另一对处理器」，只有后者才允许谈编号规律。
+8. `image adsp-fw 92a00000+1f00000 pages=16 nonzero=… first=… elf_at=…` 与
+   `image wlan-msa …`、`wlan-guard …`。`nonzero=0` 是这条引导链从没往那儿复制过段；
+   `nonzero≠0` 且 `elf_at=none` 是「有内容，但不是开头那份 ELF」——有 loader 复制过段并继续，
+   或者那些字节归别人。`wlan-guard` 非零优先当作越界写来读，别当噪声。
+9. 最后一行 `verdict adsp_edge=seen|not seen adsp_loaded=pages nonzero|pages zero`。这是本轮
+   唯一的目的：`seen` + `nonzero` 就是排期 5 是协议轮（下一轮开 GLINK 通道、讲 APR，不需要
+   PIL、不需要 SCM、不需要投轨）；`not seen` + `zero` 就是第 5 格的第一步其实是排期 6 的
+   `qcom,pas-id = <1>`，而那个顺序是被 `vdd_cx` = pm660l L9 的 enable 字节钉死的——它同时
+   要 round182 那条 `write-owner` 的答案才准开工。
+
+判据还是顺序的：映射过闸才准读头，头的 `reserved`/`initialized` 过闸才准信分区表，表里属于本
+AP 的行才准谈边，边自己认出 `$SMP` 才算一条边，页非零才准谈镜像。本轮一个寄存器都不写、一个
+包都不发，也不动任何已经存在的格子——显示 phase 2/3/4、536 共享区、`/data`、触摸、PMIC 归属
+仍按原顺序排着；排期里下一格是「按这帧的分叉选一条路」，而两条路的入口都已经在这帧里量好了。

@@ -538,6 +538,37 @@ def check_clover_power(kernel: bytes) -> bool:
     return ok
 
 
+# Round183 is linked the same plain-archive way as the two rounds above, and its strings are the ones
+# only a walker over a real SMEM heap can emit: the header line is the four words whose agreement makes
+# every later offset believable, the ptable line is the `$TOC` magic read as one little-endian word (the
+# byte-order form of that same magic is the bug the host model exists to catch), the part line is a table
+# entry confirmed against the partition header it points at, the item line is an SMP2P candidate judged
+# by "$SMP", version, sixteen entries and both pids, and the image line is the presence claim 排期 5 is
+# chosen from. The verdict line is the last one because it is the reading this round exists to produce.
+CLOVER_DSP = (("dsp round stamp", "clover r183:"),
+              ("heap header", "smem initialized=%08x free=%u available=%u reserved=%08x sbl=%08x pc=%08x/%08x"),
+              ("global toc walk", "global toc scanned=%u allocated=%u highest=%u"),
+              ("partition table", "ptable at %08x magic=$TOC version=%u entries=%u info=%08x num_items=%u capacity=%u"),
+              ("partition row check", "part[%u] hosts=%u:%u off=%u size=%u cacheline=%u hdr=%08x ok=%d hosts_ok=%d rc=%d (%s)"),
+              ("doorbell word", "doorbell %llx+04 = %08x"),
+              ("smp2p identity", "item=%u path=%s data=%llx phys=%llx size=%u hdr magic=%08x ver=%u pids=%u:%u total=%u valid=%u flags=%08x"),
+              ("image presence", "image %s %llx+%u pages=%u nonzero=%u first=%u elf_at=%s head0=%08x"),
+              ("the fork", "verdict adsp_edge=%s adsp_loaded=%s (mode 3 done)"))
+
+
+def check_clover_dsp(kernel: bytes) -> bool:
+    """Round183 answers whether 排期 5 is a protocol job or a bring-up job, and only the archive's own
+    strings prove the walk crossed the link: a payload built without it boots the r183 menu and reads
+    nothing, which on this round looks exactly like an empty heap."""
+    label = "kernel.macho: smem and adsp instrument linked"
+    found = {name: needle.encode() in kernel for name, needle in CLOVER_DSP}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -937,6 +968,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_legacy_display(kernel)
         ok &= check_clover_input(kernel)
         ok &= check_clover_power(kernel)
+        ok &= check_clover_dsp(kernel)
     return 0 if ok else 1
 
 
