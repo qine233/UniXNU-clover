@@ -569,6 +569,29 @@ def check_clover_dsp(kernel: bytes) -> bool:
     return ok
 
 
+# Round184 puts the deadline back, and a deadline is only worth having if what happened before it
+# survives the reset it causes. The panel cannot be the reading any more: round183's photograph has the
+# kernel's own version banner on its first row and the DSP instrument's `part(3)` on its last, so the
+# screen filled and every line after it was drawn nowhere. The two RAM rings are memory-only until a
+# driver tail flushes them, and a boot that panics never reaches another tail. So the panic sink drains
+# them, and the drain's own line is the proof it is in the image -- a payload without it boots the r184
+# menu, panics, resets and leaves a card that says nothing about the panic it just had.
+CLOVER_PANIC_DRAIN = (("panic drain line", "CloverSdhci r184: panic drain wrote=%u dropped=%u "
+                                           "tee_passes=%u\n"),)
+
+
+def check_panic_drain(kernel: bytes) -> bool:
+    """Round184's reading is the card, and the card only gets the reading if the sink drains the
+    rings; this string is the one thing in the image that says the drain was linked."""
+    label = "kernel.macho: panic ring drain linked"
+    found = {name: needle.encode() in kernel for name, needle in CLOVER_PANIC_DRAIN}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -969,6 +992,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_clover_input(kernel)
         ok &= check_clover_power(kernel)
         ok &= check_clover_dsp(kernel)
+        ok &= check_panic_drain(kernel)
     return 0 if ok else 1
 
 

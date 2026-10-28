@@ -13822,3 +13822,162 @@ fastboot reboot
 AP 的行才准谈边，边自己认出 `$SMP` 才算一条边，页非零才准谈镜像。本轮一个寄存器都不写、一个
 包都不发，也不动任何已经存在的格子——显示 phase 2/3/4、536 共享区、`/data`、触摸、PMIC 归属
 仍按原顺序排着；排期里下一格是「按这帧的分叉选一条路」，而两条路的入口都已经在这帧里量好了。
+
+## round183 读数（v0.5.40 实机，2026-10-29）：共享堆读出来了，屏在分区表的第四行上画满
+
+### 这一帧拍到什么
+
+照片是竖着拍的。转 270° 再放大之后是能逐字读的。面板的**第一行仍是内核自己的版本横幅**（BSD
+版权那两行），**最后一行是 `clover r183: part(3) …`**，它下面只剩一个光标格。这两件事合起来把
+「控制台会滚动」这个解释排除了：滚过的屏不会还留着第一行。所以这块面板是一台打印机，画满就停——
+round123 给 panic 屏定的那条行为，引导控制台这边同样成立。
+
+逐行转录（十进制末位在这种照片里有 1 的误差空间，本轮的读法不依赖末位；每条的字段顺序都对着
+`drivers/CloverInput`、`drivers/CloverPower`、`drivers/CloverDsp` 里的 `IOLog` 格式串核过）：
+
+```
+clover r181: no address ACKed; rails unproven, sda=00000001 scl=00000001 status=0c000000 op=000000c0
+clover r181: done xfers=4 nack=4 timeout=0 state=0000001c
+CloverSdhci r171: flush failed flushed=0 back=0 rsp=00000e00 st=00000001 polls=100 rsp2=00000e00 st2=00010000 (once)
+clover r182: declared core=800f000+4096 chnls=8400000+16777216 obsrvr=9400000+16777216 intr=a400000+2228224 cnfg=800a000+3200
+clover r182: calibrate 2048 core reads=32006 ticks, budget=50ms -> polls=59930
+clover r182: mode 3 windows up, tps=19200 polls=59930
+clover r182: core=03000000 ee=0 chan=0 intid=350 | cnfg700=00000000 obs00=00000100 intr00=00000000
+clover r182: core+0004=00000003 vend_int_en=3 main_apids=3 (mask 7ff)
+clover r182: below V5_MIN 50000000: map base would be v2/v3's 0x800, not 0x900
+clover r182: scan pm660-revid ppid=0x001 rc=1(version) ver=30000000 words=0 mapped=0 span=0
+clover r182: scan pm660-revid apid=-1 owner=0 irq_owner=0 candidates=0 irq_apid=-1 ee0=0 ee1=0 ee2=0 ee3=0 ee4=0 ee5=0
+clover r182: pm660-revid ppid=0x001 has no APID; not reachable this boot
+clover r182: not a v5 arbiter (03000000); stopping, the map layout is unknown
+clover r183: mode 3 smem=8c000000+2077152 apcs=17911000+1000
+clover r183: smem initialized=00000001 free=4096 available=0 reserved=00000000 sbl=000c0000 pc=00000000/00000000
+clover r183: global toc scanned=512 allocated=24 highest=512
+clover r183: ptable at 001f7000 magic=$TOC version=1 entries=0 info=49494953 num_items=063 capacity=04
+clover r183: part(0) hosts=65535:65535 off=2093056 size=4096   cacheLine=0  hdr=43476424 ok=0 hosts_ok=0 rc=0 (ok)
+clover r183: part(1) hosts=0:2 off=1896448 size=196608 cacheLine=32 hdr=54525024 ok=1 hosts_ok=1 rc=0 (ok)
+clover r183: part(2) hosts=0:5 off=1765376 size=131072 cacheLine=32 hdr=54525024 ok=1 hosts_ok=1 rc=0 (ok)
+clover r183: part(3) hosts=0:1 off=1199168 size=606208 cacheLine=32 hdr=54525024 ok=1 hosts_ok=1 rc=0 (ok)
+```
+
+### 顺带：这一帧也是 round181 与 round182 的第一帧实机读数
+
+它们各自的完整解码属于各自的轮，这里只把这一帧确实说出口的记下来：
+
+- **触摸总线上没有人在应答。** `no address ACKed` 加 `done xfers=4 nack=4 timeout=0`：四趟传输全部
+  NACK、零超时——电气上是通的（有 NACK 就说明 SCL/SDA 被驱动回了话），只是 `gt9xx@5d` 与 `@38`
+  两个地址都没醒。round181 结尾那句 `rails unproven` 因此不是推论而是本轮的读数：面板没上电，
+  而它声明的两条轨正是 round182 要问的东西。
+- **PMIC 那扇门这一帧没有开成。** `core=` 是仲裁器核心版本寄存器（`PowerArb.h:148` 读
+  `core + kPmicArbVersion`，`dumpVersion` 与 `scan` 两处打的是同一个字）。照片放大后首位零的个数
+  仍分不清，两个候选是 `0x03000000` 与 `0x30000000`——**本轮的读法不依赖是哪一个**，两者都低于
+  v5 的下限，所以 `below V5_MIN 50000000`（这一行打的是下限常量，不是读数）与
+  `not a v5 arbiter (…)` 是仪器自己下的判语：它按 v5 的资格拒绝对这张地图做任何解释，也没有去
+  猜它是 v2/v3。`obs00=00000100` 说明 observer 通道本身答了话（映射与读通路是好的），
+  `cnfg700=00000000` 与 `apid=-1 … candidates=0` 说明在拒绝解释之前它一个 APID 都没敢认。所以
+  排期 6 的下一步不是「读轨」，是先回答这个版本字到底是什么——它要么是基址差了一格，要么是这颗
+  SoC 的仲裁器不是 v5，而这两种都会让后面每一条偏移「自信地错」。
+- **eMMC 那一行 `CloverSdhci r171: flush failed … (once)` 是驱动自己的环**，不是内核的：
+  `rsp=00000e00 st=00000001` 与重试的 `rsp2/st2` 都在，说明 round171 那条写后 flush 仍按 (once)
+  的口径在报同一件事，本轮没有新的卡行为。
+
+### 逐条
+
+1. `mode 3 smem=…` 之后还有行 → 映射过了闸，第一个读没有被 MPU 拒。round183 自己列的那条判据
+   （只有这一行才是「权限没配」）没有触发。
+2. 堆头是「已初始化、零保留」的形状：`initialized=1`、`free=4096`、`available=0`、`reserved=0`。
+   本轮预留的两种「这堆不是这个布局」的读法（`reserved≠0`；`initialized=0` 又没有那句 note）
+   都没触发，所以分区查询可以照这个布局往下走。
+3. `global toc scanned=512 allocated=24 highest=512`：512 项整张扫完，24 项被分配；
+   `highest=512` 说明扫到了表尾，不是提前退出。
+4. `ptable … magic=$TOC` 认了。`info=49494953` 就是 `SIII` 那四个字节按小端打印
+   （`0x53494953`）。`entries=0` 与 `num_items=063` 不一致——**这正是 round183「三处分歧」里预留
+   的那一种**：头里的项数字段没填，真正在用的是 SIII 侧的计数。本轮把 `info=` 和 `entries=`
+   原样打出来，就是为了在这种情况下还能自证；宿主模型挡的也是它。
+5. `part(0)` 的头不是 `$PRT`：`hdr=54525024` 才是（小端字节 `$PRT`），`43476424` 不是；
+   `hosts=65535:65535` 两端都是 0xFFFF，即没填。所以 `ok=0 hosts_ok=0` 是这一行该有的判据，
+   第 0 行不能用来谈边。
+6. `part(1..3)` 三行 `hdr=$PRT ok=1 hosts_ok=1`，hosts 分别是 0:2、0:5、0:1。host 0 是本 AP；
+   按 DT 的 `qcom,remote-pid`，pid 1 = ADSP。也就是说 **`part(3) hosts=0:1` 就是本轮要的那条边
+   的候选行，它已经在屏上了**。
+7. 再往后没有了：`toc allocated/listed`、`doorbell`、`edge[i]`、`image …`，以及那句判决
+   `verdict adsp_edge=… adsp_loaded=…` 全在屏外。
+
+### 结
+
+- 排期 5 的那一句判决没拿到。但这一帧把「什么都没读到」的解释排除了三种：不是 MPU 挡路（第 1
+  条），不是空堆（第 2、3 条），也不是分区表没认（第 4 条）。剩下的分歧是「ADSP 那条边到底在不在」，
+  而它的候选行（`hosts=0:1`）已经在数据里。
+- 判决行没到屏，原因现在钉在面板上而不是引导上：**屏满了**，不是引导死在 `part(3)`。
+- 诚实的限制：这一帧只有照片。round183 没有死线，主机进不了 fastboot，卡上 kind 22 那个环这次
+  也没被读过，所以 `part(3)` 之后内核到底还说了什么、有没有再说，本轮无从知道。round184 就是把
+  这种「无从知道」接掉的那一轮。
+
+## round184（v0.5.41）：仪器停在原地，引导把「读得回来」这条路接上
+
+### 这一轮问什么
+
+不再问硬件。上一轮的话是「暂停关于大部分的驱动的开发，现在优先把 iOS 启动到桌面」，那这一轮要结
+的是流程上的两个洞：一个自己回不到 fastboot 的引导没法无人值守地读；读到了也只在屏上，而屏会满。
+两个洞都是 round183 那一帧露出来的，而且第二个洞把第一个洞的必要性说得比任何论证都清楚。
+
+### 三件仪器是「停」，不是「删」
+
+board.toml 里 `clover-input=` / `clover-power=` / `clover-dsp=` 三条参数注释掉，`[kernel]
+archives` 仍构建三个档案、`SHENG_PMGR` 仍开着、`sheng_pmgr_run()` 里的调用点仍在。checker 把
+「停」做成一等状态而不是「从来没接过」：档案在、参数不在 → 合法；档案不在、参数在 → 报错；参数
+回来时，模式仍要落在 {1, 2, 3} 里。这样下一轮把参数放回最后一行就是恢复，不需要重新接线。
+
+### 死线回来，300 秒
+
+`clover-unattended=300` 重新出现在 kernel_args 末尾。round149 拆它是为了问「没人打断时 iPadOS 能
+走多远」，这个问题已经答完了（答案是：走不到有人能读它的地方）。契约现在反过来：参数必须在场、
+必须是纯秒数、必须落在 60..1800——上界是宿主脚本自己的 `WAIT=900` 还能等得住。
+`armcpu-clock-panic=` 仍然必须缺席：按 tick 到点的那把刀量的是调度器，不是引导。
+
+### panic 时把两个环排干到卡上
+
+kind 21 与 kind 22 两个环只在驱动尾部那个块守卫下才落卡，而 panic 恰恰是永远等不到下一个尾部的
+那种收尾。所以 `clover_emmc_panic_append`（patcher 的 PANIC_SINK 契约，名字和签名不能动）现在在
+**自己的函数体里**调 `panicDrainRings ()`：原来那段写 logfs 的逻辑挪进 `panicAppendText`，外壳先
+写自己那条 panic 记录、再排干。排干本身是最多 8 趟 tee（把内核 msgbuf 榨进 kind 22）、两个环各自
+48 条上限、超了从最旧开始丢、`gRingBusy` 先置起、逐条 `ringWriteRecord` 且卡一拒写就停；最后把
+tee 自己那句 `CloverSdhci r184: panic drain wrote=%u dropped=%u tee_passes=%u` 连同它刚排干的
+kind 21 再走一遍。这条串既是读数也是链接证明——verify 里新增的那条断言查的就是它。
+
+### 契约与产物
+
+`check-clover.py` 绿（含新的 parked 段、死线在场段、以及把 PIO 断言重新锚到
+`panicAppendText` 上并加了一条「外壳必须同时含 `panicAppendText (` 与 `panicDrainRings ()`」）；
+`verify-clover-payload.py` 28 条断言全 OK，新增的 `kernel.macho: panic ring drain linked` 在内。
+显示档案按本轮内核重审：`kernel_sha256 = c523b080…`（就是归档里那份），
+`compiled_object_sha256 = 1b6c134e…`、`late_object_sha256 = a061787e…` 与 round183 逐字相同，
+193 条原始绑定、`family_text_sha256 = 2e044ee6…` 都没动。
+
+```
+c523b080cc1846759da16e310e2968d401044603a68f62a660ac333a092be5c8  round184-kernel.macho
+166b827d841ae9ae1f1df63fd515cb151f9463c8f671997f95567adb33ca8407  round184-kernel-amfi.macho
+954ac76a900a331c3ebc4da5a5002e0e2721e4c81aec9adcdd6d6290470b82f6  round184-payload.img
+196b284fc15119610260480c767a5d0a14bf18b4eed31d2e267548be1ba7d00b  round184-boot.img
+```
+
+`round184-boot.img` 与 round183 那份逐字节相同——本轮没动固件，符合预期。归档在
+`~/clover-out/round184-*`，清单 `round184-SHA256SUMS`。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round184-payload.img
+fastboot reboot
+```
+
+### 这一帧问什么
+
+读数不该再用眼睛。`scripts/run-clover-unattended.sh` 等 fastboot、要 recovery、一次 `dd` 取回
+1216 个扇区，`scripts/read-clover-log.py` 把 kind 20/21/22 三条流摊平。要检查的是：
+
+1. 板子自己在 300 秒后回到 fastboot——这是本轮的最低要求，也是 round149 之后第一次能无人值守地
+   拿到答案。
+2. 卡上有 panic 记录（kind 20），并且 kind 22 里有 panic 那一刻的尾部行——`verdict adsp_edge=`
+   如果说过，它现在应该在卡上而不是屏外。
+3. `CloverSdhci r184: panic drain wrote=… dropped=… tee_passes=…` 自己：`wrote=0` 且
+   `dropped>0` 是排干了但卡拒收，`wrote` 正常而 `dropped>0` 是 48 条上限不够本轮用。

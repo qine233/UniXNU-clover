@@ -443,6 +443,12 @@ static void flushVerdictRing (void);
 // Round175: drain the kernel log buffer into the kernel ring. Declared with the rings it feeds
 // because every call site is a line above its own flush, in the same guarded tail.
 static void teeKernelLog (void);
+// Round184: the panic sink drains both RAM rings before the board resets itself into fastboot.
+// Defined below the tee it calls, used by `clover_emmc_panic_append` at the bottom of this file.
+static void panicDrainRings (void);
+static uint32_t gPanicDrained = 0;              // one drain per boot; the sink can be called again
+static uint32_t gPanicDrainWritten = 0;         // records this drain put on the card
+static uint32_t gPanicDrainDropped = 0;         // oldest records it gave up to keep the newest
 
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
@@ -2881,6 +2887,71 @@ static void teeKernelLog (void)
       teeSay ("CloverSdhci r175: tee seen=%u kept=%u throttled=%u lap=%u idx=%u size=%u\n",
                 gTeeSeen, gTeeKept, gTeeThrottled, gTeeLap, gTeeIndex, sizeu);
     }
+  }
+}
+
+// Round184: the panic screen's sink is the last writer this boot gets, and it is called at a moment
+// chosen by the failure rather than by the card. Everything the tee lifted since the last block
+// request -- which, on a boot that hung, is the entire part worth reading -- is still in the RAM
+// rings, and the board resets 20 s after that screen finishes drawing. So the sink drains the rings
+// itself, with the same unguarded single-block primitive its own two writes already use and no lock:
+// at panic time the block guard may be held by a thread that is no longer running, and waiting on it
+// would trade a reading for a hang. That is the bargain round147 already struck for the panic text;
+// this widens it from two blocks to as many records as the rings hold, and it is why this round puts
+// `clover-unattended=` back into the boot -- a deadline is only useful if what happened before it
+// survives the reset the deadline causes.
+//
+// Three bounds, because the reset clock is running. The tee gets kPanicTeePasses passes to catch up
+// on the log buffer; each ring keeps its newest kPanicDrainCap records, dropping the oldest first,
+// because the oldest are the ones an ordinary pass already had its chance at; and a refused write
+// stops the drain rather than retrying it. Worst case here is 2 * 48 records at two blocks each on a
+// card that costs ~20 ms a block, about four seconds, inside a twenty second window.
+static const uint32_t kPanicTeePasses = 8;      // 8 * kTeeScanPerPass = 32 KiB of log buffer
+static const uint32_t kPanicDrainCap = 48;      // newest records kept, per ring
+
+static void panicDrainRings (void)
+{
+  if (gPanicDrained || !gVerdictFirst || !gHost) {
+    return;
+  }
+  gPanicDrained = 1;
+  for (uint32_t pass = 0; pass < kPanicTeePasses; pass++) {
+    teeKernelLog ();
+  }
+  for (uint32_t which = 0; which < kRingCount; which++) {
+    if (which == kRingKernel ? !gTeeReady : !gVerdictReady) {
+      continue;
+    }
+    while (gRingPending[which] > kPanicDrainCap) {
+      // Oldest first is the read order (slot = gRingWrite - gRingPending), so shrinking the pending
+      // count from the front is what drops the front.
+      gRingPending[which]--;
+      gPanicDrainDropped++;
+    }
+    gRingBusy[which] = 1;
+    while (gRingPending[which]) {
+      const uint32_t slot = (gRingWrite[which] - gRingPending[which]) % kRingRamSlots;
+      if (!ringWriteRecord (which, gRingText[which][slot], gRingLength[which][slot])) {
+        break;
+      }
+      gRingPending[which]--;
+      gPanicDrainWritten++;
+    }
+    gRingBusy[which] = 0;
+  }
+  // The drain has to be readable as a drain: a host that finds a quiet ring cannot otherwise tell "it
+  // was empty" from "it ran and the card said no". teeSay only queues, and the ring it queues into was
+  // drained above, so the one record is written here rather than left for a flush that will not come.
+  teeSay ("CloverSdhci r184: panic drain wrote=%u dropped=%u tee_passes=%u\n",
+          gPanicDrainWritten, gPanicDrainDropped, kPanicTeePasses);
+  while (gRingPending[kRingDriver]) {
+    const uint32_t slot = (gRingWrite[kRingDriver] - gRingPending[kRingDriver]) % kRingRamSlots;
+    if (!ringWriteRecord (kRingDriver, gRingText[kRingDriver][slot],
+                          gRingLength[kRingDriver][slot])) {
+      break;
+    }
+    gRingPending[kRingDriver]--;
+    gPanicDrainWritten++;
   }
 }
 
@@ -6355,7 +6426,7 @@ static void reidentify (void)
 //
 // Body is capped at 480 bytes so prefix + body + newline fits one block. Returns 100 + slot after
 // both blocks were written, or 1..5 naming the stage that refused.
-extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int length)
+static unsigned int panicAppendText (const char *text, unsigned int length)
 {
   if (!gPanicLogReady || !gHost || !gPanicLogFirst || !text) {
     return 1;
@@ -6428,6 +6499,20 @@ extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int
     return 5;
   }
   return 100 + slot;
+}
+
+// The symbol the entry-probe patcher resolves and hands to the panic screen as PANIC_SINK, so the
+// name and the signature are part of the contract and stay exactly as they were. Round184 only adds
+// what happens after the panic's own sentence is on the card: the two rings the boot was still
+// holding get written out too, because the reason a boot ended and the sentences that led to it are
+// two halves of one reading. It runs whatever the append returned -- a full log slot area (3) or a
+// card that refused (2, 4, 5) is still a boot whose last words are in RAM, and the drain decides for
+// itself whether the rings are armed.
+extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int length)
+{
+  const unsigned int rc = panicAppendText (text, length);
+  panicDrainRings ();
+  return rc;
 }
 
 // Round147: arm the unattended contract. Called from CloverPMGR right after it publishes its nub,

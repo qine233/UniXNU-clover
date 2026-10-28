@@ -560,101 +560,88 @@ def check_board(errors: list) -> str:
             errors.append("[kernel] archives builds CloverBlock but kernel_args does not select "
                           "clover-emmc=21, the only mode that publishes the block device")
 
-        # round181, the touch instrument. Same three halves, same failure shape: libCloverInput.a is
-        # a plain archive path in the defconfig, kept alive only because CloverPMGR's
-        # sheng_pmgr_run() calls clover_input_run() -- and that call does nothing at all unless a
-        # clover-input= argument reaches it. Drop any half and the bus is never driven, while the
-        # menu, the archives and the defconfig all still claim it was.
-        input_builder = any("CloverInput" in entry for entry in board["kernel"]["archives"])
-        input_arg = any(argument.startswith("clover-input=")
-                        for argument in board["payload"]["kernel_args"])
-        if "libCloverInput.a" in text and not input_builder:
-            errors.append("the defconfig links libCloverInput.a but [kernel] archives omits "
-                          "build-arm-driver.py CloverInput, so that archive does not exist")
-        if input_builder and "libCloverInput.a" not in text:
-            errors.append("[kernel] archives builds CloverInput but the defconfig does not link "
-                          "libCloverInput.a, so clover_input_run() is undefined")
-        if input_builder and not input_arg:
-            errors.append("[kernel] archives builds CloverInput but no clover-input= boot arg reaches "
-                          "it: clover_input_run() returns without mapping a single window")
-        if input_arg and not input_builder:
-            errors.append("kernel_args passes clover-input= but [kernel] archives does not build "
-                          "CloverInput, so the arg is noise")
-        if input_builder and flags.get("SHENG_PMGR", "n") not in ("y", "1"):
-            errors.append("CloverInput is scheduled from sheng_pmgr_run(), which CONFIG_XNU_SHENG_PMGR="
-                          f"{flags.get('SHENG_PMGR', 'n')} does not compile into the kernel")
-        # The instrument reads its own readings off the card, so it has to run after the eMMC driver
-        # that creates that ring. Order in board.toml is not the evidence -- the call site in
-        # CloverPMGR is -- but an argument that selects a mode the driver refuses is.
-        if input_arg:
-            mode = [argument.split("=", 1)[1] for argument in board["payload"]["kernel_args"]
-                    if argument.startswith("clover-input=")]
-            if any(value not in ("1", "2", "3") for value in mode):
-                errors.append(f"clover-input={mode} names a mode CloverInput does not implement "
-                              "(1 dump, 2 bring-up, 3 probe); it would report and return")
+        # round184 parks the three instruments. The goal moved: the question is no longer what the
+        # touch bus, the PMIC rails or the shared heap say, it is how to get iPadOS onto its own
+        # screen. Each of these three spends boot time and bus risk on a question that is not that
+        # one, so their arguments leave the shipped boot -- while their archives stay built and
+        # linked, so a round that resumes them changes one line rather than re-deriving the whole
+        # stack. The contract therefore inverts: the argument must be *absent*, and the build+link
+        # half still has to agree with itself, because "parked" and "silently never existed" must not
+        # be the same reading.
+        parked = (("round181", "CloverInput", "libCloverInput.a", "clover-input=",
+                   "clover_input_run()", ("1", "2", "3")),
+                  ("round182", "CloverPower", "libCloverPower.a", "clover-power=",
+                   "clover_power_run()", ("1", "2", "3")),
+                  ("round183", "CloverDsp", "libCloverDsp.a", "clover-dsp=",
+                   "clover_dsp_run()", ("1", "2", "3")))
+        for _label, driver, archive, argument, entry_point, modes in parked:
+            built = any(driver in item for item in board["kernel"]["archives"])
+            passed = [item.split("=", 1)[1] for item in board["payload"]["kernel_args"]
+                      if item.startswith(argument)]
+            if archive in text and not built:
+                errors.append(f"the defconfig links {archive} but [kernel] archives omits "
+                              f"build-arm-driver.py {driver}, so that archive does not exist")
+            if built and archive not in text:
+                errors.append(f"[kernel] archives builds {driver} but the defconfig does not link "
+                              f"{archive}, so {entry_point} is undefined")
+            # Built and linked, but not scheduled: the archive survives the link only because
+            # sheng_pmgr_run() names its entry point, so this half is what keeps a parked driver
+            # restorable rather than already dead.
+            if built and flags.get("SHENG_PMGR", "n") not in ("y", "1"):
+                errors.append(f"{driver} is scheduled from sheng_pmgr_run(), which "
+                              f"CONFIG_XNU_SHENG_PMGR={flags.get('SHENG_PMGR', 'n')} does not "
+                              "compile into the kernel")
+            # The park itself. An argument that comes back has to be deliberate: it is asserted
+            # here, not left to whatever the last round wrote.
+            if built and not passed:
+                continue
+            if passed and not built:
+                errors.append(f"kernel_args passes {argument} but [kernel] archives does not build "
+                              f"{driver}, so the arg is noise")
+            if passed and any(value not in modes for value in passed):
+                errors.append(f"{argument}{passed} names a mode {driver} does not implement "
+                              f"({', '.join(modes)}); it would report and return")
 
-        # round182, the SPMI arbiter and the PMIC rails. The same four halves again, and the same
-        # silence if one of them goes missing: libCloverPower.a is only pulled in because
-        # sheng_pmgr_run() calls clover_power_run(), and that call maps nothing until a
-        # clover-power= argument reaches it. What is different about this one is what it costs to be
-        # wrong -- every later round that turns a rail on reads this round's owner and enable
-        # numbers first, so an archive that is built but not linked, or linked and never scheduled,
-        # produces a boot that simply does not answer rather than one that says it is not supported.
-        power_builder = any("CloverPower" in entry for entry in board["kernel"]["archives"])
-        power_arg = any(argument.startswith("clover-power=")
-                        for argument in board["payload"]["kernel_args"])
-        if "libCloverPower.a" in text and not power_builder:
-            errors.append("the defconfig links libCloverPower.a but [kernel] archives omits "
-                          "build-arm-driver.py CloverPower, so that archive does not exist")
-        if power_builder and "libCloverPower.a" not in text:
-            errors.append("[kernel] archives builds CloverPower but the defconfig does not link "
-                          "libCloverPower.a, so clover_power_run() is undefined")
-        if power_builder and not power_arg:
-            errors.append("[kernel] archives builds CloverPower but no clover-power= boot arg reaches "
-                          "it: clover_power_run() returns without mapping a single window")
-        if power_arg and not power_builder:
-            errors.append("kernel_args passes clover-power= but [kernel] archives does not build "
-                          "CloverPower, so the arg is noise")
-        if power_builder and flags.get("SHENG_PMGR", "n") not in ("y", "1"):
-            errors.append("CloverPower is scheduled from sheng_pmgr_run(), which CONFIG_XNU_SHENG_PMGR="
-                          f"{flags.get('SHENG_PMGR', 'n')} does not compile into the kernel")
-        if power_arg:
-            mode = [argument.split("=", 1)[1] for argument in board["payload"]["kernel_args"]
-                    if argument.startswith("clover-power=")]
-            if any(value not in ("1", "2", "3") for value in mode):
-                errors.append(f"clover-power={mode} names a mode CloverPower does not implement "
-                              "(1 arbiter, 2 revid, 3 rails); it would report and return")
+        # round184, the unattended deadline returns. Everything above is parked *because* the
+        # critical path is the boot itself, and a boot nobody can read is not an answer: round149
+        # removed the deadline to let the panel be the stop, and round183 found out what that cost --
+        # a boot that gets anywhere never comes back to fastboot, and the panel is a printer that
+        # stops drawing when the screen is full -- round183's frame still had the kernel's own version
+        # banner on row one and the instrument's `part(3)` on its last row, so nothing after that row
+        # was drawn anywhere. So the deadline is back, and the assert is its mirror image:
+        # the argument must be present, in a numeric form ArmCpu can turn into a CNTVCT deadline, with
+        # a ceiling the host script's own wait can still outlast.
+        unattended_args = [argument.split("=", 1)[1] for argument in board["payload"]["kernel_args"]
+                           if argument.startswith("clover-unattended=")]
+        if not unattended_args:
+            errors.append("kernel_args carries no clover-unattended=: round184 wants the board to "
+                          "come back to fastboot by itself, and with no deadline a boot that reaches "
+                          "userland never does")
+        for value in unattended_args:
+            if not value.isdigit():
+                errors.append(f"clover-unattended={value} is not a plain second count; ArmCpu's "
+                              "deadline would not parse")
+            elif not 60 <= int(value) <= 1800:
+                errors.append(f"clover-unattended={value} is outside the 60..1800 s window: below it "
+                              "the deadline cuts off the boot it exists to read, above it the host "
+                              "wait gives up before the board does")
 
-        # round183, the SMEM heap, the ADSP's doorbell and the two carve-outs. The same four halves,
-        # for the same reason: libCloverDsp.a is pulled in only because sheng_pmgr_run() calls
-        # clover_dsp_run(), and that call maps nothing until a clover-dsp= argument reaches it. What
-        # is different here is what the round is *for* -- 排期 5 forks on its answer (protocol job or
-        # bring-up job), and a boot that silently skips it looks exactly like a boot that answered the
-        # empty way, which is the one reading this whole round exists to obtain.
-        dsp_builder = any("CloverDsp" in entry for entry in board["kernel"]["archives"])
-        dsp_arg = any(argument.startswith("clover-dsp=")
-                      for argument in board["payload"]["kernel_args"])
-        if "libCloverDsp.a" in text and not dsp_builder:
-            errors.append("the defconfig links libCloverDsp.a but [kernel] archives omits "
-                          "build-arm-driver.py CloverDsp, so that archive does not exist")
-        if dsp_builder and "libCloverDsp.a" not in text:
-            errors.append("[kernel] archives builds CloverDsp but the defconfig does not link "
-                          "libCloverDsp.a, so clover_dsp_run() is undefined")
-        if dsp_builder and not dsp_arg:
-            errors.append("[kernel] archives builds CloverDsp but no clover-dsp= boot arg reaches it: "
-                          "clover_dsp_run() returns without mapping SMEM")
-        if dsp_arg and not dsp_builder:
-            errors.append("kernel_args passes clover-dsp= but [kernel] archives does not build "
-                          "CloverDsp, so the arg is noise")
-        if dsp_builder and flags.get("SHENG_PMGR", "n") not in ("y", "1"):
-            errors.append("CloverDsp is scheduled from sheng_pmgr_run(), which CONFIG_XNU_SHENG_PMGR="
-                          f"{flags.get('SHENG_PMGR', 'n')} does not compile into the kernel")
-        if dsp_arg:
-            mode = [argument.split("=", 1)[1] for argument in board["payload"]["kernel_args"]
-                    if argument.startswith("clover-dsp=")]
-            if any(value not in ("1", "2", "3") for value in mode):
-                errors.append(f"clover-dsp={mode} names a mode CloverDsp does not implement "
-                              "(1 heap, 2 edges, 3 images); it would report and return")
+        # round184, the panic-time ring drain. The deadline is only useful if the reading survives
+        # it, and the two RAM rings do not: kind 21 and kind 22 hold their slots in kernel memory and
+        # only reach the card when a driver tail flushes them, so a panic -- which is exactly what the
+        # deadline produces -- reset the board with the last lines still in RAM. The drain is asserted
+        # as source, not as an argument: it is a property of the sink the panic path already calls.
+        sdhci_source = (REPO / "drivers/CloverSdhci/CloverSdhci.cpp").read_text()
+        sink = sdhci_source.find("extern \"C\" unsigned int clover_emmc_panic_append "
+                                 "(const char *text, unsigned int length)")
+        if sink < 0:
+            errors.append("drivers/CloverSdhci no longer defines clover_emmc_panic_append(const char "
+                          "*, unsigned int): that name and signature are the patcher's PANIC_SINK "
+                          "contract")
+        elif "panicDrainRings ();" not in sdhci_source[sink:sink + 600]:
+            errors.append("the panic sink does not call panicDrainRings () from its own body: the drain "
+                          "has to run on the path the panic takes, not on a driver tail the boot that "
+                          "panicked never reaches")
 
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
@@ -1503,15 +1490,21 @@ def check_board(errors: list) -> str:
     # panic screen, the panic screen writes "bootloader" and resets through PSCI after 20 s, and the
     # host waits for fastboot, asks for recovery and decodes logfs. Round149 keeps every link but
     # disarms it in the shipped boot, so the links are still asserted as source below.
-    # Round149. Round148's deadline works, but it also caps every observation at 180 s, and this
-    # round's question is how far iPadOS gets when nothing interrupts it. So the argument is gone
-    # from the shipped boot while the code that reads it stays: a panic still prints and its screen
-    # still resets after 20 s, but with no IMEM mark that reset goes through the ordinary path.
-    # "How far" is then answered by the panel, and nothing else, which is the contract asserted here.
+    # Round149 disarmed the deadline because its own question was "how far does iPadOS get when
+    # nothing interrupts it". Round184 arms it again, and the reason is on the card rather than in
+    # this file: a boot that gets anywhere never comes back to fastboot by itself, so the host waits
+    # for a device that will never appear -- and the panel it leaves behind is a printer, not a
+    # scrolling console, that stops drawing when the screen is full. round183's frame is the proof:
+    # its first row is still the kernel's own version banner and its last row is the DSP instrument's
+    # `part(3)`. Both halves of the reading were lost that way. The argument's presence and its range
+    # are asserted above, next to the archives that schedule it; what stays here is the rule that the
+    # *tick-count* watchdog must not come back with it, because a clock that panics at N ticks
+    # measures the scheduler rather than the boot.
     kernel_args = board["payload"]["kernel_args"]
-    if any(argument.startswith("clover-unattended=") for argument in kernel_args):
-        errors.append("[payload] kernel_args still carries clover-unattended=: round149 removes the "
-                      "deadline so the screen, not a timer, is the stop")
+    if not any(argument.startswith("clover-unattended=") for argument in kernel_args):
+        errors.append("[payload] kernel_args has no clover-unattended=: round184 wants the board to "
+                      "return to fastboot on its own, and with no deadline a boot that reaches "
+                      "userland never does")
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
@@ -1521,8 +1514,8 @@ def check_board(errors: list) -> str:
     # probe still says r180, drivers/CloverInput says r181, drivers/CloverPower says r182 and
     # drivers/CloverDsp says r183 -- because the tee on the card filters the shared "clover r"
     # prefix, not a round number.
-    if not board["payload"]["title"].startswith("clover r183:"):
-        errors.append('[payload] title is not "clover r183: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r184:"):
+        errors.append('[payload] title is not "clover r184: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -1846,12 +1839,21 @@ def check_board(errors: list) -> str:
             errors.append("the write gate's sample LBA is no longer kLogfsFirstLba + 4096: it has to "
                           "stay past the sixteen panic slots and inside the logfs window")
         # The last thing a dying boot does must not depend on a flag this round introduced: the panic
-        # screen and the bring-up report keep their own two-block PIO writes.
-        panic_start = text.find("extern \"C\" unsigned int clover_emmc_panic_append")
+        # screen and the bring-up report keep their own two-block PIO writes. Round184 split the sink
+        # in two -- the exported entry point now runs the ring drain, and the two PIO writes moved into
+        # panicAppendText just above it -- so the rule is checked on the function that holds the writes,
+        # with the exported name asserted separately because that is the patcher's contract.
+        panic_start = text.find("static unsigned int panicAppendText")
         panic_body = text[panic_start:panic_start + 4000] if panic_start >= 0 else ""
         if panic_body.count("writePioBlock (") < 2:
             errors.append("clover_emmc_panic_append no longer writes its two blocks through PIO: "
                           "the last line of a dying boot would depend on this round's flag")
+        wrapper_start = text.find("extern \"C\" unsigned int clover_emmc_panic_append")
+        wrapper = text[wrapper_start:wrapper_start + 600] if wrapper_start >= 0 else ""
+        if "panicAppendText (" not in wrapper or "panicDrainRings ()" not in wrapper:
+            errors.append("the exported clover_emmc_panic_append no longer both writes its own record "
+                          "and drains the rings: round184's reading would stop at the panic line and "
+                          "leave everything before it in memory to be reset away")
 
     # Round174. The reading is the deliverable, and for nine rounds the deliverable has been a
     # photograph of a panel that had already scrolled: r167 lost `write cache ... off=`, r169 lost the

@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r183: the shared heap is read and says whether the DSP is already up"
+title = "clover r184: the instruments are parked and the boot comes back with its log on the card"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2146,6 +2146,12 @@ kernel_args = [
   # panic still prints and its screen still resets after 20 s, but with no IMEM mark that reset
   # returns through the ordinary boot path rather than into fastboot. scripts/run-clover-unattended.sh
   # is unchanged and still works when the argument is passed back in.
+  # Round184 passes it back in, at the end of this list. "Nothing interrupts it" turned out to have a
+  # cost round149 did not pay: a boot that gets anywhere never comes back to fastboot by itself, and
+  # the panel it leaves behind is a printer rather than a scrolling console. round183's photograph is
+  # the proof: its first row is still the kernel's own version banner and its last row is the DSP
+  # instrument's `part(3)`, so the screen filled and nothing after that was drawn anywhere -- the
+  # reading has to come off the card, and off the card before the reset takes the board.
   # Deliberately not passed: armcpu-self-ipi and armcpu-spi-ipi exist in the driver for
   # the multi-core case, and this board has never had its online-CPU count measured (round70's panel
   # read as the child being picked up by a second core, so "one CPU" below is an assumption, not a
@@ -2179,6 +2185,11 @@ kernel_args = [
   "offline-mobile-graphics-load=1",
   "offline-legacy-register=1",
   "offline-legacy-phase=1",
+  # Round184 parks 排期 4, 5 and 6. The three instrument arguments below are deliberately NOT passed
+  # any more: the goal moved to getting iPadOS onto its own screen, and each of these three spends
+  # boot time and bus risk on a question that is not that one. The drivers stay linked, their modes
+  # stay reachable by argument, and the designs below stay here unchanged for the round that resumes
+  # them. Two of the three already have their reading recorded in notes/development-log.md.
   # Round181 puts drivers/CloverInput on the bus, and mode 3 is the one worth booting for. Mode 1
   # is a pure read (map the QUP/GCC/TLMM windows, dump them, write nothing) and stays the control;
   # mode 2 stops after bring-up, before any SCL edge. Mode 3 then asks both candidates the smallest
@@ -2198,7 +2209,7 @@ kernel_args = [
   # It runs last in the PMGR tail, after the eMMC, because its only way off the device is the
   # card-backed kernel-log ring CloverSdhci sets up. It never panics: once the readings are the
   # product, stopping the boot is losing them.
-  "clover-input=3",
+  # "clover-input=3",
   # Round182 puts drivers/CloverPower on the SPMI arbiter, and mode 3 is the one worth booting for.
   # Mode 1 is the pure-read control: map core/chnls-cnfg/obsrvr/intr, decode the version and walk the
   # 448-entry APID map, start no transaction at all. Mode 2 stops after the two revid blocks. Mode 3
@@ -2225,7 +2236,7 @@ kernel_args = [
   #    i2c probe NACKed.
   # It runs last in the PMGR tail, after CloverInput, because its report is what tells the round181
   # readings whether the panel's rails were ever on. It never panics.
-  "clover-power=3",
+  # "clover-power=3",
   # Round183 puts drivers/CloverDsp on the SMEM heap, and mode 3 is the one worth booting for: it is
   # mode 1 (the heap) plus mode 2 (who is on the other side of it) plus the two image scans, and the
   # question 排期 5 was blocked on -- is the ADSP already up? -- only has an answer when all three are
@@ -2270,7 +2281,25 @@ kernel_args = [
   # combined with "L9 is off" is what turns a PIL attempt into a two-step plan with the rail first. It
   # never panics: an empty SMEM is a reading, and a boot that finds one still reaches launchd with the
   # emptiness recorded.
-  "clover-dsp=3",
+  # "clover-dsp=3",
+  # Round184 puts round147's wall-clock deadline back into the shipped boot, and it is the whole point
+  # of this round. A boot nobody can read is not an answer, and every reading this board has collected
+  # since round171 has needed someone to stand next to the tablet with a camera: round149 removed the
+  # deadline on purpose ("how far does iPadOS get when nothing interrupts it"), and the price of that
+  # is that a boot that gets far never comes back by itself -- round183's flash proved it, waiting on a
+  # fastboot device the deadline would have produced in five minutes. With `clover-unattended=300` the
+  # ArmCpu timer handler panics 300 s after the first tick (drivers/ArmCpu/ArmCpu.cpp:637, message
+  # `clover r148: unattended deadline ...`), the panic screen prints and marks IMEM 0x146bf65c, and 20 s
+  # later the board resets into fastboot, where scripts/run-clover-unattended.sh is already waiting to
+  # pull the card. 300 s is five minutes of uninterrupted iPadOS boot -- long enough that the question
+  # this round asks, whether pid 1 still dies of SIGBUS in a page-in after round171-178 rebuilt the
+  # block path under it, is answered by whatever the boot reached rather than by the deadline.
+  # The deadline is also the reason this round adds the one thing the panic path never had: the kernel
+  # log lines and driver verdicts that were still sitting in the RAM rings when the panic came are
+  # written to the card by CloverSdhci's panic sink, newest kept, before the reset. Without it the
+  # reading stops at the last block request that finished, which on a hung boot is exactly the part
+  # that is missing.
+  "clover-unattended=300",
 ]
 
 [payload.adt]
