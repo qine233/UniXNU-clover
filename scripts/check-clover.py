@@ -1912,6 +1912,44 @@ def check_board(errors: list) -> str:
             errors.append("acquireBlockGuard does not count the wait it measures: the hand-off report "
                           "would quote cuts and waits nobody observed")
 
+    # Round179. The display schedule item started with a question that sheng could only answer by
+    # booting a VM: is the original IOMobileFramebufferLegacy in *this* kernel the class that its
+    # qualification was done against? The family's meta class records are load-time fixups, so the
+    # answer is not readable in __PRELINK_DATA -- but the registration thunk is code, and exactly one
+    # site in the family carries its instance size. scripts/audit-clover-mobile-graphics-legacy.py
+    # derives the identity from those instructions and replays every structural judgement against our
+    # own image. CI has no built kernel, so the gate here is the script's shape: the pinned constants
+    # have to stay pinned, and the script has to refuse a missing kernel rather than guess one.
+    audit = REPO / "scripts/audit-clover-mobile-graphics-legacy.py"
+    if not audit.is_file():
+        errors.append("scripts/audit-clover-mobile-graphics-legacy.py is missing: the original "
+                      "Legacy class would be unqualified in this board's own kernel")
+    else:
+        script = audit.read_text()
+        for needle in ('FAMILY_TEXT_SHA = "2e044ee68c1650397e1435234ca6459206262e4c7ed709cb7131c6f664f9bd9b"',
+                       '"legacy_constructor": 0x1A5D8',
+                       "ABSTRACT_SLOTS = [211, 213, 245, 246, 306, 307, 337, 338, 345]",
+                       "OWN_OVERRIDES = [0, 1, 7, 14, 84, 86, 87, 141, 155, 184, 188, 288, 290, 296, 301]",
+                       'require(record == 0xFFFFFFF006B35940 and parent == 0xFFFFFFF006B31400,',
+                       'require(name == b"IOMobileFramebufferLegacy\\0"',
+                       'require(KERNEL.exists() and PLAN.exists(), "build the kernel first: "',
+                       'sys.path.insert(0, str(BASE / "kits/NativePrelink"))',
+                       'identity_source="static registration site in this kernel"'):
+            if needle not in script:
+                errors.append(f"{audit.name} lacks {needle[:56]}: the qualification would no longer be "
+                              "the one the original family was audited with, or a missing kernel would "
+                              "be read as a passing audit")
+        # The identity has to come from instructions, not from a DATA read: meta class records are
+        # zeros in the file, and an audit that "found" them by scanning __DATA found nothing. The
+        # script says which of its claims are static and which would need a running system, so the
+        # honesty flags have to stay false -- the docstring is allowed to name QEMU, that is where
+        # sheng got its numbers, and this round is what replaces it.
+        for overclaim in ("legacy_runtime_instance_created=True", "backend_contract_complete=True",
+                          "device_observed=True", "original_instructions_modified=True"):
+            if overclaim in script:
+                errors.append(f"{audit.name} asserts {overclaim}: nothing in this round runs the "
+                              "kernel, so the ABI JSON would be quoting an outcome nobody observed")
+
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",
          "volatile uint32_t *clover_fastboot_reason = nullptr;",

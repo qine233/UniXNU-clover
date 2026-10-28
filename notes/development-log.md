@@ -12997,3 +12997,89 @@ mtime + `LC_UUID` + KCID），round177 起它成为常驻计数。
 fastboot flash cache /Users/zhouzhou/clover-out/round178-payload.img
 fastboot reboot
 ```
+
+## round179（v0.5.35）：原始显示类在本板内核里被资格化
+
+排期第 3 条（显示与 GPU）一直卡在一个没法问机器的地方：要接 iOS 的显示栈，就得
+让本板内核里那颗原始的 `IOMobileFramebufferLegacy` 冒充我们自己的类；而「它是不是
+那一颗被资格化过的原始类」这件事，sheng 是靠 QEMU 停下来读内存回答的——本板没有
+QEMU，也不该为了一组常量去搭一个跑不动的机器。
+
+本轮把这个问题在宿主上结掉。`scripts/audit-clover-mobile-graphics-legacy.py` 读的
+是 `~/UniXNU/out/clover/kernel/kernel.macho` 和它的 `kernel.json`，一个字节都不改、
+一次都不运行。判据全部来自 `~/UniXNU/scripts/audit-mobile-graphics-legacy.py`，
+逐条在我们自己的镜像上重放：
+
+1. family `com.apple.iokit.IOMobileGraphicsFamily` 的 `__TEXT_EXEC` 扩展
+   （`0xfffffff00576c000` + 225140 字节）sha256 等于 sheng 钉住的
+   `2e044ee68c1650397e1435234ca6459206262e4c7ed709cb7131c6f664f9bd9b`。这一条成立，
+   下面那六个构造函数站点才是同一批指令，而不是「碰巧数字对得上」。
+2. 三处受保护构造函数的序言都是 `adrp`/`add`/`add #0x10` 取 vtable，
+   base/service/legacy 分别落在 `0xfffffff005f35da0`、`0xfffffff005f36680`、
+   `0xfffffff005f38570`；Legacy→Service→Framebuffer 的 `bl` 目标确实是原始的
+   base 调用点。
+3. vtable 形状：262/262/358。service 相对 base 只改 `[0, 1, 7]`（构造、赋值、析构），
+   没有偷偷加运行期覆盖；Legacy 留空的正好是文档里那九个抽象叶
+   `[211, 213, 245, 246, 306, 307, 337, 338, 345]`，它们指向内核导出的
+   `___cxa_pure_virtual`；相对 base 改动 103 槽，168 之前那 13 个
+   `[0, 1, 7, 14, 21, 44, 79, 85, 86, 87, 111, 141, 155]` 一字不差；
+   `IOService::newUserClient(task_t,void*,UInt32,IOUserClient**)` 就是第 141 槽——
+   四参数原生 ABI 这一格从此不是猜的。168 之后每一槽的落点都在 family 文本内。
+4. 类身份——sheng 只能运行观测的那部分，这里改成静态推断。meta class 记录活在
+   `__PRELINK_DATA`，文件里读出来是零（装载时才填），所以身份不能读，只能推：
+   注册壳是 `OSMetaClass` 的四参数构造——三个 ADRP/ADD 对、一个立即数、一次直接调用，
+   顺序固定。整段 family 文本里 `mov w3, #0x18a0`（字 `0x52831403`）**只有一处**，
+   所以实例大小本身就是证据而不是假设。它前两条是父记录、再前一条是类名，
+   解出来正是 `b"IOMobileFramebufferLegacy\0"`；紧随其后的 `bl` 是 `OSMetaClass`
+   构造。记录本身在注册壳之前那个 getter 里物化（IOKit 生成的类代码把 meta class
+   getter 紧挨着 initializer 放），那个块是一段纯粹的 `sub sp,sp,#0x10`/ADRP+ADD/
+   `ret`，只交出一个值 `0xfffffff006b35940`，并且在同一颗类里被访问器再用一次——
+   「物化了两次」正是「记录被使用」的证据。
+
+推出来的四个数与 sheng 从 QEMU 里读到的逐字相同：
+`record=0xfffffff006b35940`、`parent=0xfffffff006b31400`、`size=0x18a0`、
+`name=IOMobileFramebufferLegacy`。两边独立，一个是运行时、一个是静态推断，
+落在同一个类上。
+
+### 本轮踩到的编码坑
+
+ARM64 的 ADD（immediate）字段顺序：固定位在 31–22，**Rn 在 4–0，Rd 在 9–5，
+立即数在 21–10**（shift 在 23–22）。我第一版把它记反，于是 `adrp x1 / add x1,x1,#0xc47`
+被判定不是配对；同时 ADRP 的检测掩码写成 `0x9F00001F == 0x90000008` 把 `x8`
+钉死在指令里——那是 sheng 只在构造函数序言上用的形状，通用配对必须是
+`a & 0x9F000000 == 0x90000000`。还有一处是把字面量放进掩码里比较
+（`words[i] & 0xFFC003FF == 0xD100C3FF`：`0xC3FF` 的位正好在被遮掉的位置上），
+应当直接与字面量相等。找帧设置的位置时也是先差一格：getter 块的
+`sub sp,sp,#0x10` 在 `ret` 前第 5 条，字是 `0xD10043FF`（`0x10 << 10`）。
+kit 的目录名是上游的 `kits/NativePrelink`，sheng 那份叫 `kits/XnuPrelink`。
+
+### 与 shipped 字节的关系
+
+本轮不动内核、不动负载：产物哈希仍是 round178 的（payload `28324379…`），
+`board.toml` 的标题也就仍写 `clover r178:`——屏幕上要读的仍是 r178 那三个数，
+`check-clover.py` 里那条标题断言因此不变。这是 round160（v0.5.13）定下的做法：
+纯宿主闸门不改身份串，免得一张帧被拿去对一份没变过的镜像。
+
+闸门落在 `check-clover.py` 的 Round179 段：脚本必须在、六个钉住的常量必须在
+（family 文本 sha、`legacy_constructor` 站点、九个抽象叶、15 个自有覆盖槽、
+记录与父记录的绝对值、类名串），缺内核时必须拒绝而不是硬跑，kit 路径必须是
+`kits/NativePrelink`；反向断言它不许把静态推断写成运行观测——
+`legacy_runtime_instance_created`、`backend_contract_complete`、`device_observed`、
+`original_instructions_modified` 四个标志必须保持 False（docstring 里提 QEMU 是
+允许的，那是说明出处，不是宣称观测）。CI 上没有构建好的内核，所以闸门查的是
+脚本的形状，不执行审计本身。
+
+### 下一格
+
+产出的 `build/display-analysis/clover-mobile-graphics-legacy-abi.json`
+（358 个槽的逐槽地址、抽象标记、身份四元组、注册壳与 getter 地址）是 round180 的
+输入：照 sheng 的 `scripts/build-gop-legacy-display.py` 为本板生成
+`OriginalLegacyFramebufferABI.h` 与 `original-bindings.S`，编
+`drivers/NativeMobileDisplay/` 里的 `NativeLegacyDisplay`/`NativeGOPPresenter`，
+把 `[kernel].archives` 里的 `libCloverDisplayStub.a` 换成真档案。sheng 那份脚本
+钉住的非 family 绝对地址（IOSurface 取值器、vsync 发送点、第 301 槽、
+`setDisplayRefreshProperties`）要在我们镜像里逐个复核，不能照抄；它引用的
+`drivers/GopFramebuffer/` 在上游已经改名成 `drivers/NativeMobileDisplay/`。
+
+本轮无需刷机。
+
