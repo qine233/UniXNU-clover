@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r184: the instruments are parked and the boot comes back with its log on the card"
+title = "clover r185: the log window moves to logdump and the rings arm from the card's own GPT"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2299,6 +2299,25 @@ kernel_args = [
   # written to the card by CloverSdhci's panic sink, newest kept, before the reset. Without it the
   # reading stops at the last block request that finished, which on a hung boot is exactly the part
   # that is missing.
+  # Round185 moves where all of that lands, because two rounds of empty cards had an ordinary cause in
+  # this driver. The arming sat inside the `probeMode == 20` report block while the shipped boot has been
+  # mode 21 since round137, and it armed only after reading an existing record out of a partition that had
+  # never been written -- so no normal boot could reach it, and the panel-only readings kept being filed
+  # as a broken write path. Arming now runs from the GPT entry walk, and the only precondition is that
+  # this card names a `logdump` entry at 13320216..13451287 (mmcblk0p56, 131072 sectors, 64 MiB, from the
+  # same sysfs dump as the logfs and userdata extents --
+  # facts/81ffcaaa-20261022-210928/mmc_partitions.txt). The window is logdump and not logfs because logfs
+  # has been the root APFS container since round127: report slot 0 sat in the superblock's own region, the
+  # verdict ring's sector 64 and the tee ring's sector 192 were mounted filesystem space, and the round173
+  # write gate rewrote sixteen blocks at +4096 -- inside the root, with a transport whose whole purpose is
+  # proving itself. The geometry is unchanged, only the base: report/panic slots 0..31, driver kind 21 at
+  # sector 64 with 64 slots, kernel kind 22 at sector 192 with 512 slots, so one dd of 1216 sectors still
+  # reaches the end of both. scripts/run-clover-unattended.sh now dumps
+  # /dev/block/bootdevice/by-name/logdump into ~/clover-out/clover-log-window.bin, and
+  # scripts/read-clover-log.py's default --first-lba is 13320216 (pass 12320768 to read a card flashed
+  # before this round). Both refusal paths say so on the card -- `logdump entry too small` and
+  # `no logdump entry at ...` -- because "never armed" and "armed and never flushed" are different answers
+  # and a dump has to be able to tell them apart.
   "clover-unattended=300",
 ]
 

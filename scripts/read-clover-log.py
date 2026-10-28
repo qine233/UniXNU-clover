@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Decode the clover logfs record windows into readable text.
+"""Decode the clover log-window records into readable text.
+
+Since round185 the window is the `logdump` partition (the card's p56, 64 MiB). Before that it was
+`logfs` (p39), which the shipped boot now mounts as the root APFS container, so the driver has no
+business writing into it.
 
 clover has no serial console, so the driver (drivers/CloverSdhci) and the panic
 screen keep their text on the card: each record is two 512-byte blocks, a header
@@ -42,7 +46,8 @@ contradiction worth naming -- the tee drops those lines on purpose, because
 they are already on the card through the driver's own ring -- so `--driver`
 over `--tee` counts zero, and a nonzero count means the tee started echoing.
 
-Input is a dd of logfs from the card. The default window needs the first 64
+Input is a dd of the log window from the card -- logdump since round185. The default window needs
+the first 64
 sectors; the verdict ring needs 192 and the kernel ring needs 1216, which is
 what scripts/run-clover-unattended.sh now reads. A record whose header is
 present but whose text does not sum is still printed: a half-written record is
@@ -59,9 +64,10 @@ SECTOR = 512
 SLOT_BYTES = 2 * SECTOR
 REPORT_SLOTS = 16
 VERDICT_SLOTS = 64    # round174's ring, grown by round176 because the tee no longer shares it
-VERDICT_OFFSET = 64   # sectors past logfs start, clear of the report/panic blocks
+VERDICT_OFFSET = 64   # sectors past the log window start, clear of the report/panic blocks
 KERNEL_SLOTS = 512    # round176's ring: a whole boot of allowlisted kernel text
 KERNEL_OFFSET = 192   # 64 + 2 * VERDICT_SLOTS: immediately after the driver's ring
+LOG_WINDOW_FIRST_LBA = 13320216   # the card's p56 (logdump) since round185; p39 logfs is the root now
 DUMP_SECTORS = KERNEL_OFFSET + 2 * KERNEL_SLOTS   # one dd that reaches the end of both rings
 KINDS = {17: "report-17", 19: "report-19", 20: "panic-20",
          21: "verdict-21", 22: "kernel-22"}
@@ -195,7 +201,7 @@ def selftest():
     into kind 21 at sector 64, kernel text the tee lifted out of msgbuf into kind 22 at sector 192 --
     so the per-ring kind check and the empty-intersection rule (--driver over --tee is zero) are both
     asserted here."""
-    first_lba = 12320768
+    first_lba = LOG_WINDOW_FIRST_LBA
     # The two rings have to tile the partition with no overlap: the driver ring ends exactly where
     # the kernel ring starts, and a dd of DUMP_SECTORS reaches the last slot of the second one.
     assert VERDICT_OFFSET + 2 * VERDICT_SLOTS == KERNEL_OFFSET, KERNEL_OFFSET
@@ -205,9 +211,9 @@ def selftest():
     dump += build_record(19, 0, first_lba, "bring-up report")
     dump += build_record(20, 1, first_lba + 2, "panic line")
     dump += bytes((VERDICT_OFFSET - 4) * SECTOR)          # gap before the driver ring: not records
-    driver_lines = ["CloverSdhci r174: verdict ring armed lba=12320832 slots=64",
-                    "CloverSdhci r176: kernel ring armed lba=12320960 slots=512",
-                    "CloverSdhci r166: readcheck lba=12320768 sample=32 trusted=1",
+    driver_lines = ["CloverSdhci r174: verdict ring armed lba=13320280 slots=64",
+                    "CloverSdhci r176: kernel ring armed lba=13320408 slots=512",
+                    "CloverSdhci r166: readcheck lba=13320216 sample=32 trusted=1",
                     "CloverSdhci r175: tee seen=512 kept=300 throttled=12 lap=0 idx=8192 size=65536",
                     "CloverSdhci r169: block guard waited 31 ms"]
     for index, line in enumerate(driver_lines):
@@ -290,10 +296,14 @@ def selftest():
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("dump", nargs="?", default="clover-logfs.bin",
-                        help="logfs sectors from the card (default: clover-logfs.bin)")
-    parser.add_argument("--first-lba", type=lambda value: int(value, 0), default=12320768,
-                        help="logfs first LBA (default 12320768, the card's p39)")
+    parser.add_argument("dump", nargs="?", default="clover-log-window.bin",
+                        help="the log window dumped from the card -- logdump since round185 "
+                             "(default: clover-log-window.bin)")
+    parser.add_argument("--first-lba", type=lambda value: int(value, 0),
+                        default=LOG_WINDOW_FIRST_LBA,
+                        help="log window first LBA (default 13320216, the card's p56 logdump; "
+                             "pass 12320768 to read a card flashed before round185, whose rings "
+                             "would sit at the start of p39 logfs)")
     parser.add_argument("--verdict", action="store_true",
                         help="read the driver's verdict ring instead (kind 21, sectors 64..191)")
     parser.add_argument("--tee", action="store_true",

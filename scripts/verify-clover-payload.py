@@ -592,6 +592,30 @@ def check_panic_drain(kernel: bytes) -> bool:
     return ok
 
 
+# Round185 arms the rings from the GPT entry walk. The arming round174..176 relied on sat inside the
+# mode-20 report block while the shipped boot has been mode 21 since round137, and it also waited for a
+# record read back out of a partition that had never been written -- so a normal boot could not arm
+# anything, which is the plainest reading of the round184 card coming back byte-identical to the one
+# before it. These two lines are the image's own statement of which happened, armed or refused with the
+# entry it looked for, and they are what lets an empty dump still be read as a finding.
+CLOVER_LOG_WINDOW = (("log window armed", "CloverSdhci r185: log window armed from GPT first=%u "
+                                          "sectors=%u report=%u driver=%u kernel=%u\n"),
+                     ("log window refusal", "CloverSdhci r185: no logdump entry at %u..%u found=%u "
+                                            "first=%u last=%u, rings stay disarmed\n"))
+
+
+def check_log_window(kernel: bytes) -> bool:
+    """Round185's reading only exists if a mode-21 boot armed the rings; this is the string that says
+    the arming moved into the entry walk and was linked with it."""
+    label = "kernel.macho: logdump rings armed from GPT"
+    found = {name: needle.encode() in kernel for name, needle in CLOVER_LOG_WINDOW}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -993,6 +1017,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_clover_power(kernel)
         ok &= check_clover_dsp(kernel)
         ok &= check_panic_drain(kernel)
+        ok &= check_log_window(kernel)
     return 0 if ok else 1
 
 

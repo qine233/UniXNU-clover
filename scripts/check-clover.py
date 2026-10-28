@@ -1513,9 +1513,10 @@ def check_board(errors: list) -> str:
     # would be claiming a round it does not run. The drivers keep their own stamps -- the display
     # probe still says r180, drivers/CloverInput says r181, drivers/CloverPower says r182 and
     # drivers/CloverDsp says r183 -- because the tee on the card filters the shared "clover r"
-    # prefix, not a round number.
-    if not board["payload"]["title"].startswith("clover r184:"):
-        errors.append('[payload] title is not "clover r184: ...": the menu would not name this round')
+    # prefix, not a round number. Round185 moves the log window to logdump and arms the rings from the
+    # GPT walk, so the SDHCI driver now carries its own r185 stamp for the arming line.
+    if not board["payload"]["title"].startswith("clover r185:"):
+        errors.append('[payload] title is not "clover r185: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -1793,8 +1794,9 @@ def check_board(errors: list) -> str:
 
     # Round173. The write side gets the same transport, and the same rule can only be the same rule
     # with one extra step: a wrong DMA read costs an EIO, a wrong DMA write changes what is on the
-    # card. So the gate rewrites a run inside the logfs window -- the partition whose only contents are
-    # this port's own bring-up reports -- with bytes it read from that run a moment earlier, and the
+    # card. So the gate rewrites a run inside the log window -- since round185 the logdump partition,
+    # which nothing mounts and whose only contents are this port's own records -- with bytes it read
+    # from that run a moment earlier, and the
     # flag is set only when the run reads back through PIO exactly as it was found. The PIO write of
     # the same bytes runs first as a control: a medium that will not round-trip its own bytes through
     # the proven path cannot produce a DMA verdict, and the gate says so rather than printing a zero.
@@ -1809,13 +1811,14 @@ def check_board(errors: list) -> str:
         for needle in ("static bool writeAdmaRun (uint32_t lba, const uint32_t *src, uint32_t blocks,",
                        "static void checkWriteDmaPath (void)",
                        "static bool readRunPio (uint32_t lba, uint32_t *dst, uint32_t blocks)",
-                       "static const uint32_t kWriteCheckLba = kLogfsFirstLba + 4096u;",
+                       "static const uint32_t kWriteCheckOffset = 4096u;",
+                       "const uint32_t checkLba = windowFirst + kWriteCheckOffset;",
                        "if (!gWriteDmaCheckDone && blocks >= 4) {",
                        "if (chunk >= 4 && gWriteDmaTrusted) {",
                        "gWriteDmaTrusted = controlHeld && dmaWrite && dmaRead && diffDma == 0;",
                        "write16 (SDHCI_TRANSFER_MODE, SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_MULTI | SDHCI_TRNS_DMA);",
                        "countWordDiff (gCheckBatchA, gCheckSingle, kWriteCheckWords, firstDma)",
-                       "kWriteCheckLba + kWriteCheckBlocks - 1 > kLogfsLastLba",
+                       "checkLba + kWriteCheckBlocks - 1 > windowFirst + sectors - 1",
                        "CloverSdhci r173: wrcheck lba=",
                        "CloverSdhci r173: ADMA2 writes trusted for this boot",
                        "CloverSdhci r173: writes stay on the PIO path for this boot",
@@ -1823,21 +1826,27 @@ def check_board(errors: list) -> str:
                        "CloverSdhci r173: dma writes failed %u times, writes go back to the PIO path"):
             if needle not in text:
                 errors.append(f"{sdhci_r173.name} lacks {needle[:44]}...: round173's DMA write path, "
-                              "the logfs run it is confined to, or the read-back that earns it would "
-                              "be missing")
+                              "the log-window run it is confined to, or the read-back that earns it "
+                              "would be missing")
         # Earned, not assumed -- the same rule the read path lives under.
         if "gWriteDmaTrusted = true;" in text:
             errors.append(f"{sdhci_r173.name} trusts DMA writes without reading them back: the card "
                           "would be changed by a descriptor nobody compared")
-        # The gate's sample has to stay inside logfs. 4096 sectors past the first LBA, sixteen blocks
-        # long, and the window's own bounds are what the refusal reads -- a sample that drifted into
-        # userdata would be a port rewriting APFS with an unproven transport.
-        sample_start = text.find("static const uint32_t kWriteCheckLba =")
-        sample_end = text.find("static void reportWriteDmaFailure", sample_start)
-        sample = text[sample_start:sample_end] if sample_start >= 0 and sample_end > sample_start else ""
-        if "kLogfsFirstLba + 4096u" not in sample:
-            errors.append("the write gate's sample LBA is no longer kLogfsFirstLba + 4096: it has to "
-                          "stay past the sixteen panic slots and inside the logfs window")
+        # The gate's sample has to stay inside the log window. Round185 moved it: 4096 sectors past the
+        # window's first LBA, sixteen blocks long, and since logfs became this boot's root container a
+        # sample anchored on kLogfsFirstLba would be an unproven transport rewriting APFS.
+        sample_start = text.find("static void checkWriteDmaPath (void)\n{")
+        sample_end = text.find("\n}\n", sample_start) if sample_start >= 0 else -1
+        sample = text[sample_start:sample_end] if sample_end > sample_start else ""
+        if not sample:
+            errors.append(f"{sdhci_r173.name} lost the body of checkWriteDmaPath: the gate that earns "
+                          "DMA writes could not be read at all")
+        if "windowFirst + kWriteCheckOffset" not in sample:
+            errors.append("the write gate's sample LBA is no longer the log window plus 4096: it has to "
+                          "stay past the report slots and inside the logdump window")
+        if "kLogfsFirstLba" in sample or "kLogfsLastLba" in sample:
+            errors.append("the write gate bounds its sample on logfs again: that partition is the root "
+                          "APFS container now, and a DMA write verdict is not permission to modify it")
         # The last thing a dying boot does must not depend on a flag this round introduced: the panic
         # screen and the bring-up report keep their own two-block PIO writes. Round184 split the sink
         # in two -- the exported entry point now runs the ring drain, and the two PIO writes moved into
@@ -1859,8 +1868,9 @@ def check_board(errors: list) -> str:
     # photograph of a panel that had already scrolled: r167 lost `write cache ... off=`, r169 lost the
     # `read <stage>` lines, r170 exists because one probe's own repetition filled the screen and left a
     # whole frame unable to say whether launchd was looping. So this round gives every line the driver
-    # measures a second copy on the card -- kind 21 records in a ring at logfs sector 64, clear of the
-    # 32 blocks the panic writer owns -- and `read-clover-log.py --verdict` reads them back from the
+    # measures a second copy on the card -- kind 21 records in a ring at sector 64 of the log window,
+    # clear of the 32 blocks the panic writer owns -- and `read-clover-log.py --verdict` reads them
+    # back from the
     # same dd that brings the panic text. Saying something costs a format plus a memcpy: the card
     # write happens only from the three request tails that already hold the block guard with an idle
     # card, a few records at a time, because a flush that held the guard is the failure r167 r168 r169
@@ -1882,7 +1892,7 @@ def check_board(errors: list) -> str:
                        "gRingBlock[8] = gRingSeq[which];",
                        "const uint32_t lba = gVerdictFirst + kRingOffset[which] +",
                        'IOLog ("%s\\n", line);',
-                       "gVerdictFirst = entryFirst14;",
+                       "gVerdictFirst = entryLdFirst;",
                        "gVerdictReady = 1;"):
             if needle not in text:
                 errors.append(f"{sdhci_r174.name} lacks {needle[:44]}...: round174's formatter, its "
@@ -2014,6 +2024,56 @@ def check_board(errors: list) -> str:
             errors.append(f"{sdhci_r174.name} reports the tee census without a cap: a boot would fill the "
                           "driver ring with its own bookkeeping, which is why round174 throttled the panel")
 
+    # Round185. Two independent reasons made every card since round174 come back with no records at all,
+    # and neither was the write path: the arming lived inside the `probeMode == 20` report block while
+    # the shipped boot has been mode 21 since round137, and it armed only after reading an existing
+    # record out of a partition that had never been written. So arming now runs from the GPT entry walk,
+    # which every mode >= 14 boot reaches, and its only precondition is this card's own entry naming
+    # `logdump` at the extent sysfs reports. The window itself moved because logfs became the root APFS
+    # container in round127 -- report slot 0 is inside the superblock's own region -- and a diagnostic
+    # that overwrites the filesystem it is diagnosing is not a diagnostic. The card has a partition named
+    # for logs that this boot uses for nothing.
+    if sdhci_r174 is not None:
+        text = sdhci_r174.read_text()
+        for needle in ("static const uint32_t kLogDumpFirstLba = 13320216u;",
+                       "static const uint32_t kLogDumpLastLba = 13451287u;",
+                       "static volatile uint32_t gLogWindowFirst = 0;",
+                       "static volatile uint32_t gLogWindowSectors = 0;",
+                       "if (entryWords >= 19 && entry[14] == 0x006f006cu && entry[15] == 0x00640067u &&",
+                       "entry[16] == 0x006d0075u && entry[17] == 0x00000070u && entry[18] == 0) {",
+                       "__atomic_store_n (&gLogWindowFirst, entryLdFirst, __ATOMIC_RELEASE);",
+                       "__atomic_store_n (&gLogWindowSectors, logSectors, __ATOMIC_RELEASE);",
+                       "const uint32_t needed = kRingOffset[kRingKernel] +",
+                       '"CloverSdhci r185: log window armed from GPT first=%u sectors=%u report=%u driver=%u kernel=%u\\n"',
+                       '"CloverSdhci r185: logdump entry too small, rings stay disarmed first=%u sectors=%u needed=%u\\n"',
+                       '"CloverSdhci r185: no logdump entry at %u..%u found=%u first=%u last=%u, rings stay disarmed\\n"',
+                       "gPanicLogFirst = entryLdFirst;",
+                       "gPanicLogReady = 1;",
+                       "gVerdictReady = 1;",
+                       "gTeeReady = 1;"):
+            if needle not in text:
+                errors.append(f"{sdhci_r174.name} lacks {needle[:44]}...: round185's logdump window, the "
+                              "GPT name match that finds it, or the arming that makes any of the rings "
+                              "writable is gone")
+        # The position is the whole point: arming has to be in the entry walk, ahead of the instrument
+        # modes it used to sit inside. An arming that moved somewhere mode-dependent would reproduce the
+        # round184 reading -- a card with nothing on it and a driver that never said it had armed.
+        armed = text.find('"CloverSdhci r185: log window armed from GPT')
+        mode16 = text.find("if (probeMode == 16 && entryFound14 != 0) {")
+        if armed < 0 or mode16 < 0 or armed > mode16:
+            errors.append(f"{sdhci_r174.name} no longer arms the rings from the GPT walk: the arming is "
+                          "at " + (f"offset {armed}" if armed >= 0 else "nowhere") +
+                          " and the mode-16 branch at " + (f"offset {mode16}" if mode16 >= 0 else "nowhere"))
+        # The two shapes that made a boot unable to arm are forbidden, not merely unused: arming off the
+        # logfs entry, and arming behind a record read back from a partition that has never been written.
+        for stale in ("gPanicLogFirst = entryFirst14;", "gVerdictFirst = entryFirst14;"):
+            if stale in text:
+                errors.append(f"{sdhci_r174.name} still has {stale}: logfs is the root container, and a "
+                              "window armed from it writes diagnostics over the filesystem they describe")
+        if "CloverSdhci r185: log window armed" in text and "if (entryLdFound != 0 && entryLdFirst == kLogDumpFirstLba &&" not in text:
+            errors.append(f"{sdhci_r174.name} arms a window the card's own entry did not report: the "
+                          "logdump extent has to be matched before anything is armed on it")
+
     reader = next((base / "scripts/read-clover-log.py"
                    for base in (REPO, pathlib.Path.cwd())
                    if (base / "scripts/read-clover-log.py").is_file()), None)
@@ -2023,12 +2083,21 @@ def check_board(errors: list) -> str:
         text = reader.read_text()
         for needle in ('21: "verdict-21"', '22: "kernel-22"', "VERDICT_OFFSET = 64",
                        "VERDICT_SLOTS = 64", "KERNEL_OFFSET = 192", "KERNEL_SLOTS = 512",
+                       "LOG_WINDOW_FIRST_LBA = 13320216",
+                       'default="clover-log-window.bin"', "default=LOG_WINDOW_FIRST_LBA",
                        "DUMP_SECTORS = KERNEL_OFFSET + 2 * KERNEL_SLOTS",
                        '"--verdict"', 'struct.unpack_from("<9I", block)',
                        "order_by_seq=kind is not None", "def selftest()"):
             if needle not in text:
                 errors.append(f"{reader.name} lacks {needle[:40]}...: a ring's slots, its place in the "
                               "dump, its kind or its sequence order after a wrap would be missing")
+        # Round185: the host's defaults have to name logdump, not the partition the kernel mounted. The
+        # driver arms from the card's GPT, so the numbers here only say where a dump that came from the
+        # default path came from -- and if they still said logfs, every record would decode with the
+        # wrong absolute LBA and be reported as a mismatch.
+        if "12320768" in text.split("def main()")[0]:
+            errors.append(f"{reader.name} still hard-codes the logfs extent ahead of main(): a dump of "
+                          "logdump would decode every header as having the wrong LBA")
         # Round175: the host has to be able to ask the two producers apart -- "the tee never ran" and
         # "the tee ran and msgbuf matched nothing" are different answers. Round176: they no longer share
         # a ring, so what is asserted is that each ring holds only its own kind, and that reading a
@@ -2070,6 +2139,19 @@ def check_board(errors: list) -> str:
             if needle not in text:
                 errors.append(f"{unattended.name} lacks {needle[:32]}...: round176's second ring would not "
                               "be decoded, or its echo invariant would not be checked")
+        # Round184, the two host-side defects that made a readable card look empty: TWRP's adbd reports
+        # the state as `recovery` and not `device`, so the wait gave up before it ever asked; and dd's
+        # "1216+0 records ..." on stderr lands inside the adb stdout stream unless the device redirects
+        # it, so a gate that compared the first bytes against the record magic rejected a good dump.
+        # Round185 adds the third: the window is logdump now, and logfs stays in the list only because
+        # the point of reading it is to show that nothing was ever written there.
+        for needle in ('$2 == "recovery"', "dd if=$source bs=512 count=1216 2>/dev/null",
+                       "/dev/block/bootdevice/by-name/logdump", "/dev/block/mmcblk0p56",
+                       "clover-log-window.bin", "no readable log window"):
+            if needle not in text:
+                errors.append(f"{unattended.name} lacks {needle[:40]}...: the host would wait for the "
+                              "wrong adb state, gate a good dump on dd's own stderr, or read the "
+                              "partition the kernel mounted instead of the log window")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())

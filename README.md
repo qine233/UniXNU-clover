@@ -68,7 +68,7 @@ round176 拆掉那一轮自己的代价：两个说话人不再抢同一圈 32 �
 | launchd 与守护进程是死是活可读 | round170 帧：`clover r170: exec pid=38 ppid=1 t=66 comm=accessoryupdater`、`exit pid=54 ppid=1 t=29 rv=0x4000 ns=-1 code=0x0 comm=zproxy`——comm 在换、pid 在铺、`t=` 在推进，`Early boot complete` 出现两次；结论是**在往前走而不是在循环**，直到 pid 1 自己 `initproc exited -- exit reason namespace 2 subcode 0xa`（SIGBUS） |
 | Data 卷 | round159 帧：`seed data … bytes=33554432`、`bsd=disk5s1`、APFS `mount-complete volume DawnData`，UUID `FC1A580E-2D67-48FC-B8CF-87422A319340` 与钉住的种子一致，owner 的 `/private/var` 挂载失败行没有出现 |
 | dyld 缓存预检 | round159 帧：目录 / 主缓存 / `.01` 全 err=0，`.01` 头 `len≈1.07 GiB sig=11491332+229376`，随后每颗子缓存的 `F_ADDFILESIGS` 都 `err=0 resid=0` |
-| 诊断通道 | panic 屏直写 framebuffer（不经 tty）、无人值守的 IMEM `0x77665501` + PSCI 复位、`read-clover-log.py` 取 logfs、`decode-clover-address.py` 把地址翻成函数 |
+| 诊断通道 | panic 屏直写 framebuffer（不经 tty）、无人值守的 IMEM `0x77665501` + PSCI 复位、`read-clover-log.py` 取 logdump（round185 起；此前是 logfs）、`decode-clover-address.py` 把地址翻成函数 |
 | 仓库契约 | `porting.toml`（`schema_version = 1`，上游 13 area 校验通过）、`AGENTS.md`、`.github/workflows/porting-record.yml`；CI Device documentation 在 main 与 tag 双绿 |
 
 ### 进行中（代码已在镜像里，等实机读数）
@@ -92,6 +92,7 @@ round176 拆掉那一轮自己的代价：两个说话人不再抢同一圈 32 �
 | round182（v0.5.39） | 排期第 6 格第一步，也是 round181 最后一行 `rails unproven` 的回答：`drivers/CloverPower` 打开内核通往 PMIC 的唯一一扇门——SPMI PMIC Arbiter v5。五个窗口逐格钉在 `qcom,spmi@800f000/reg`（core `0x0800f000+0x1000`、chnls `0x08400000+0x1000000`、obsrvr `0x09400000+0x1000000`、intr `0x0a400000+0x220000`、cnfg `0x0800a000+0x3000`），读版本号并按 v5 带宽拒绝（低于 `0x50000000` 是 v2/v3 的 `0x800` 地图基址，达到 `0x60000000` 是 sheng v7 的 `0x2000/0x20` 布局），走 `core+0x900` 的 448 项 APID→PPID 地图（平局取第一条、但被本 EE 拥有的后来者顶替，IRQ 另按「最后一个带 bit24 的」），把 `cnfg+0x700+4*apid` 的写归属**在任何人写之前**量出来——这就是排期 4 第二道闸的数；再问 PM660/PM660L 的 revid 身份（`0x51` 不对就不报身份），最后读触摸面板声明的两条轨 `ldo-a11`（PPID `0x04a`）/`ldo-b3`（`0x242`）的 `0x40/0x41` 电压原始字节与 `0x46` enable。**只读**：每笔事务都是 *observer* 通道上的 `EXT_READL`，chnls 窗只按页读自己那页的 `ACC_ENABLE`/`IRQ_STATUS`，一次 CMD 都不往里写，这条由 checker 反向钉死（源码里不许出现 `windowWrite`/`kPmicArbWriteOp`）。三档 `clover-power=1/2/3`；事务逻辑拆在 `PowerArb.h`，宿主模型 `tests/clover_power_host.cpp` + `scripts/test-clover-power.py` 用 pthread 假设备逐条重解码命令并断言它是读，超时那一档故意不带服务线程跑，证明轮询真有界。排在 PMGR 尾部、CloverInput 之后，任何路径都不 panic | **已上机**（v0.5.40 那一帧）：仲裁器核心版本字不在 v5 带内，仪器按自己定的规矩 `not a v5 arbiter` 收手——`obs00=00000100` 证明映射与读通路是好的，`cnfg700=00000000`、`apid=-1 candidates=0` 证明它一个 APID 都没敢认，两条轨因此没读。下一步不是读轨，是先回答那个版本字到底是什么（照片首位零的个数分不清，`0x03000000` 与 `0x30000000` 都在「低于 V5_MIN」这一侧）。构建侧：内核 `7305d191…` → 归一化交付 `37c3f260…`（AMFI 两站点照旧 `0x1aa80e4`/`0x1aa816c`，object 时间戳 966→967）→ payload `0ee08570…`（卷内内核 `3efd9089…`，入口探针 6857 字节 / 37 段）；`verify-clover-payload.py` 新增 `pmic arbiter instrument linked`（七条串全在），仲裁器宿主模型接进 `check-clover.py` 闸门；显示档案闭环重审通过（`kernel_sha256` 是本轮内核，两个 object 哈希与上一轮逐字相同、193 绑定未动） |
 | round183（v0.5.40） | 排期第 5 格的第一步问的不是「怎么讲 APR」，是「对面是不是已经有人」：`drivers/CloverDsp` 只读两块区域——`qcom,smem@86000000` 那 2 MiB 共享堆（头字段含 `reserved` 必须为 0 这条厂商约束、512 项全局 TOC 的有界走查、离区域末尾一页的 `$TOC` 分区表，且每行再对着它自己的 `$PRT` 头逐项校验两个 host id 与声明尺寸）和 `0x17911008` 那个 doorbell 字（按本机 DT 声明的七个掩码解码），然后按 `427 + remote_pid` **推导**出的编号找 adsp/modem/cdsp 的出、入 SMP2P 项（`$SMP` v1 + 十六项 + 两个 pid 全部相对上才算一条边），最后扫 ADSP 的 `removed-dma-pool` carve-out `0x92a00000` 与 Wi-Fi MSA `0x85700000` 各 16 页：见到几页、非零几页、第一页非零在哪、有没有字读起来像 ELF 魔数。三档 `clover-dsp=1/2/3` 逐档累加；**一个字节都不写**，因为在 APCS 上写就是中断本身，这条由 checker 反向钉死（不许出现 `windowWrite`/`ds_write`/`kSmp2pSet`/`IOMemoryDescriptor::withAddress`）。解码全在 `DspCore.h`，宿主模型 `tests/clover_dsp_host.cpp`（合成 128 KiB 堆、189 条断言）被 `check-clover.py` 当闸门跑，专挡「魔数按厂商 `u8 magic[4]` 的字面顺序抄」这一类在板子上看不见的字节序错——它会让一块活堆报成「没有分区表」，而报告里没有任何线索说原因是字节序。结尾那句 `verdict adsp_edge=… adsp_loaded=…` 就是排期 5 的分叉：有边又有镜像，第 5 格是协议轮（开 GLINK、讲 APR）；空堆加空 carve-out，第 5 格的第一步其实是排期 6 的——`qcom,pas-id = <1>` 得先压在 round182 已经量到归属的 `vdd_cx` 上 | **已上机**（v0.5.40 那一帧）：共享堆读通了——`initialized=00000001 free=4096 reserved=00000000`、全局 TOC `scanned=512 allocated=24`、离末尾一页的分区表认出来 `magic=$TOC version=1`，`part(1..3)` 都对着自己的 `$PRT` 头校验通过，其中 `part(3) hosts=0:1` 里那个 `1` 就是 ADSP，是排期 5 判决行等的候选边；`part(0) hosts=65535:65535 hdr=43476424` 被正确拒掉（头不是 `$PRT`）。判决行 `verdict adsp_edge=… adsp_loaded=…` 没上屏，原因不在引导而在屏——那一帧第一行仍是内核自己的版本横幅、最后一行正是 `part(3)`，屏在它之后画满了。构建侧：内核 `1c48bac7…` → 归一化交付 `acc94982…`（AMFI 两处命中随 0x4000 的文本增长挪到 `0x1aac0e4`/`0x1aac16c`，虚拟地址一字未动；object 时间戳 967→**968**）→ payload `839543a8…`（入口探针仍是 6857 字节 / 37 段）；`verify-clover-payload.py` 新增 `smem and adsp instrument linked`（九条串全在），DSP 宿主模型接进 `check-clover.py` 闸门，DT 常量审计从 26 个地址涨到 **30** 个；本轮另外修掉两处只在「新增档案后第一次全量重建内核」才暴露的构建基础设施缺陷——`.config` 里那份 `CONFIG_XNU_EXTRA_LD_ARCHIVES` 缓存，和不带 `-isysroot` 的共享编译记录（详见流水日志） |
 | round184（v0.5.41） | 优先级的轮，不是硬件的轮：驱动开发停在原地，把「引导能自己回到 fastboot、panic 前把日志落到卡上」这条路接上——因为 round183 那一帧证明屏是一台画满就停的打印机，读它等于没读。三件事：① `clover-input`/`clover-power`/`clover-dsp` 三个 boot arg 从 `board.toml` 注释掉，**档案照旧构建、`SHENG_PMGR` 门照旧开**，只是这一轮不跑——是「停」不是「删」，checker 把「档案在、开关在、参数不在」写成一种一等状态而不是失败；② `clover-unattended=300` 回到 `boot_args` 末尾，round149 当年砍掉它换的是「什么都不打断引导」，代价是走得到的引导永远不会自己回 fastboot；③ panic 出口接上卡——导出的 sink `clover_emmc_panic_append` 在追加 panic 记录之后调用 `panicDrainRings()`，把 RAM 侧两个环（kind 21 驱动判据、kind 22 内核 tee）排干进 logfs，`kPanicTeePasses=8`、`kPanicDrainCap=48`，并报一行 `CloverSdhci r184: panic drain wrote=… dropped=… tee_passes=…`。写用不加守卫的单块原语，因此不可能在 panic 里再造一层等待 | **已构建**，待冷刷；内核 `c523b080…` → 归一化交付 → AMFI 命中 `166b827d…` → payload `954ac76a…`（入口探针仍 6857 字节 / 37 段），`boot.img` 与 round183 逐字节相同（本轮没动固件）；`check-clover.py` 绿（含死线存在/数字/60–1800 区间、sink 签名、体内 `panicDrainRings ()` 调用），`verify-clover-payload.py` 28 条断言含新增 `panic ring drain linked`；显示档案闭环重审通过（`kernel_sha256` 是本轮内核、两个 object 哈希与上一轮逐字相同、193 绑定未动）
+| round185（v0.5.44） | 还是优先级的轮，这一轮补的是 round174 自己记下的那把锁：日志窗口从 logfs（p39，shipped 引导如今把它挂成根 APFS 容器）挪到 **logdump**（p56，`13320216..13451287`，131072 个扇区 / 64 MiB，量自卡自己的 GPT），三个就绪位 `gPanicLogReady`/`gVerdictReady`/`gTeeReady` 从此只看一件事——GPT 里有没有 `logdump` 这条 entry——不再要求「这一条启动已经从报告窗里读到过一条既有记录」，环因此不可能再把自己锁死。上膛前加一道尺寸闸门：`needed = 192 + 2*512 = 1216` 扇区，entry 不够长就整批不上膛并报 `logdump entry too small`，找不到 entry 报 `no logdump entry at …, rings stay disarmed`。记录格式、两环几何（kind 21 第 64 扇区 64 槽、kind 22 第 192 扇区 512 槽）、`panicDrainRings()` 与 round184 那条排干一个字没动，搬的只有窗口起点；唯一跟着搬家的是 r173 写闸门的取样，它现在以 logdump 窗口为界，拒写时报 `write gate refuses, log window first=%u blocks=%u sectors=%u`。宿主两条路同步：`read-clover-log.py --first-lba` 默认换成 13320216（旧卡要显式传 12320768），`run-clover-unattended.sh` 先试 `by-name/logdump` 再落回 logfs，拉的仍是那 1216 个扇区；三件仪器照旧停在 boot args 之外 | **已构建**，待冷刷——**环到底上没上膛，要这一刷自己回答**；内核 `dae8a8c2…` → 归一化交付 → AMFI 命中 `51a12944…`（两处站点仍是 `0x1aac0e4`/`0x1aac16c`、object 时间戳仍是 968，本轮驱动文本没长过一页）→ payload `6b73e99b…`（入口探针 6857 字节 / 37 段，卷内内核 `d9634f42…`），`boot.img` `196b284f…` 与 round184 逐字节相同（本轮没动固件）。构建侧修掉一条真缺陷：补丁回放不幂等——`zzy-clover-dyld-cache-skip.patch` 一进树，`native-4k-signature-hash-cache.patch` 就既不可正向应用也不可反向撤销，同一棵树的第二次构建必然停在 `apply --check`；按脚本已有的约定把它加进「先反向」名单（`../UniXNU/scripts/build-xnu-4k-baseline.sh:38`），同一份树连跑三遍幂等。顺带查出一件更要紧的事：工作树里 `kern_exec.c`/`kern_exit.c`/`vfs_vnops.c`/`vm_unix.c` 缺 `zzy-clover-shared-region-why5.patch` 的全部内容，而上一轮的镜像里那些串都在——它们是靠从没重编过的 object 进镜像的；本轮是第一份「源码状态与补丁集相符」的内核。`check-clover.py` 绿（含写闸门不得再以 logfs 为界的反向断言、`gVerdictFirst = entryLdFirst;` 的位置断言、旧的 mode-20 上膛块必须消失），`verify-clover-payload.py` 新增并读到 `logdump rings armed from GPT OK`；显示档案闭环重审通过（`kernel_sha256` 是本轮内核、两个 object 哈希 `1b6c134e…`/`a061787e…` 与 round183/184 逐字相同、193 绑定未动）
 
 round171 + round172 + round173 一帧问九件事：`read guard` 是否整批消失（守卫只等、
 不拒），
@@ -114,7 +115,7 @@ round127 刷进去的那 8 MiB 裸 APFS 容器逐字节相同，一个 `UXNU` �
 一条既有记录」的分支里置位，而 round127 那次刷写把唯一的既有记录抹掉了，于是此后每一条启动
 都读不到记录、于是不上膛、于是不落卡、于是下一条启动照样读不到——环把自己锁死了。
 所以现在的任务不是「读得再快一点」，而是先把锁解开：让环在 GPT 认出 logfs 分区时就上膛，
-或者把窗口挪出根容器所在的那块分区。
+或者把窗口挪出根容器所在的那块分区。（这一句 round185 兑现了，两半都做：见下面 round185 那段。）
 
 round175 之后，环里不再只有驱动自己的话。dyld 的 `shared_region` 探针、r170 那对
 `exec`/`exit`、APFS 的 jhash 与 ntree 错、`load code signature error 4`、launchd
@@ -161,6 +162,34 @@ gcc=100000+94000 intid=129`——让读数对着 DT 的声明比，而不是对�
 要说清这一点靠 `no address ACKed; rails unproven, sda=… scl=… status=… op=…` 那四个字：
 线被压在低电平说明有芯片卡在传输中途，那是下一格（电源轨）的证据，不是这一格（总线）的失败。
 顺序仍然是闸：bring-up 齐了才准问地址，地址 ACK 了才准谈配置下发，配置下发才准谈多点上报。
+
+round185 做两件 round174 那段欠下的事，都只动窗口的位置和上膛的条件，不动卡的格式。第一件：
+日志窗口从 logfs 挪到 **logdump**——卡上的 p56，`13320216..13451287`，131072 个扇区、64 MiB，
+量自 `facts/81ffcaaa-20261022-210928/mmc_partitions.txt`。logfs（p39）如今是 shipped 引导挂上去的
+根 APFS 容器，驱动继续往里写就是往别人的文件系统里涂字节：报告槽 0 落在超级块那一段，两个环
+落在已挂载的空间里，round173 那道写闸门取样的 +4096 扇区那 16 块也在根里——三处都得搬家，
+连 r173 的取样窗一起搬。第二件：上膛不再要求「本板已从报告窗里读到过一条既有记录」，改成
+**GPT 里认得出 logdump 这一条、且这条的跨度装得下三个环**（`64 + 2×64` 到 `192 + 2×512` = 1216 扇区）；
+两个拒绝分支各自往卡上说一句（`logdump entry too small` / `no logdump entry at %u..%u`），
+所以下一帧要么看见 `CloverSdhci r185: log window armed from GPT first=… sectors=…`，
+要么看见它为什么没上膛，不会有第三种沉默。格式一字未改：报告/panic 槽 0..31 在窗口开头、
+kind-21 驱动环在第 64 扇区、kind-22 内核环在第 192 扇区，宿主仍是一次 `dd bs=512 count=1216`。
+`run-clover-unattended.sh` 先试 `/dev/block/bootdevice/by-name/logdump`（再 `logfs`、`mmcblk0p39`
+作为旧卡的退路），`read-clover-log.py` 的 `--first-lba` 默认改成 13320216。
+**环到底上没上膛，要等这一刷自己回答**——本轮只做到「镜像里那两句话在、闸门挪了家」。
+
+同一轮里冒出来的是构建侧的缺陷，值得单独记：`build-xnu-4k-baseline.sh` 的补丁循环只保证
+**从干净树**跑通，第二次构建会断在 `native-4k-signature-hash-cache.patch`——`zzy-clover-dyld-cache-skip.patch`
+往这块补丁自己新加的结构体字段里又插了一行，于是前面那条既 `--reverse --check` 不过（上下文已经不是它自己写的样子）
+也正向 `--check` 不过（字段已经在了），脚本按规矩停在「宁可半途不装」的那一步。修法用的是脚本自己
+为这类重叠准备的名单：把 `zzy-clover-dyld-cache-skip.patch` 加进开头那段「先反掉」的 late 补丁里
+（UniXNU/scripts/build-xnu-4k-baseline.sh:38），同一棵工作树连跑三遍幂等。顺手把 `.cache/xnu-work`
+复位重放时还查出一件更要紧的：`kern_exec.c`、`kern_exit.c`、`vfs_vnops.c`、`vm_unix.c` 四个文件里
+`zzy-clover-shared-region-why5.patch`（round170 那对 `exec`/`exit` 行、缓存目录复读的限流）**根本没在树上**，
+而镜像里那些 `clover r170:` 字符串是靠没有重编的旧目标文件混进链接的——也就是说上一轮跑在板子上的
+内核，源码状态和补丁集合并不一致。本轮的内核是先把 `.cache/xnu-work` 复位到 `d8b8029` 的干净树、
+再按名序重放全部补丁编出来的（72 个文件被改，另有两个由补丁新建），
+读回来的 `exec`/`exit` 行第一次真的对应一份可复现的源码。
 
 ### 排期（未开始 · 已知限制）
 
@@ -211,7 +240,8 @@ gcc=100000+94000 intid=129`——让读数对着 DT 的声明比，而不是对�
    它压的 `vdd_cx`（pm660l L9，RPM 级 TURBO）也归这一格管。
 7. **eMMC 数据通路已上 DMA，速度还没量到** — 读的那条 ADMA2 在 round172 镜像里，
    写的那条在 round173 镜像里（描述符抄自本板 CAF 树，数据走自有连续 bounce；
-   读要批量 PIO 逐字相同才准用，写要 logfs 那 16 块读回原样才准用），
+   读要批量 PIO 逐字相同才准用，写要日志窗那 16 块读回原样才准用——窗在 round185 起是
+   logdump，此前是 logfs），
    `cap=742dc8b2` / `hcl=38` 证明这本来就是固件自己在用的通路。剩下的事实只有帧
    能给：`dmacheck … kbs=` 与 `wrcheck … kbs=` 那两对速率、
    以及至今没被读到过的 `write settle took … ms`——round174 起这几行会从卡上的
@@ -427,11 +457,14 @@ fastboot reboot
   影响的通道；读数在前、寄存器证据在后。
 - **`clover rNNN:` 内核 printf 探针**：每轮换号，`verify-clover-payload.py`
   断言新号在、旧号的复读形态不在。
-- **logfs**：`scripts/read-clover-log.py` 把内核环形缓冲拉回宿主。
-- **verdict 环**（round174 起）：同一张卡的 logfs 第 64 扇区起是 kind-21 环（round176
+- **日志窗（logdump）**：`scripts/read-clover-log.py` 把整段窗口拉回宿主并解码。窗口
+  在 round185 从 logfs 挪到 logdump（p56，起始 LBA `13320216`）；旧卡上的记录仍在
+  logfs，读它要显式 `--first-lba 12320768`。
+- **verdict 环**（round174 起）：窗口第 64 扇区起是 kind-21 环（round176
   起 64 槽，每槽两个 512 字节块），驱动每句判据都落一份——**但这一句在 2026-10-29 之前只是
   代码里的意图**：环只在「本次启动从报告窗里读到过一条既有记录」时才上膛，而 round127 把
-  那个窗口刷成了裸 APFS 容器，所以这台板子上的卡里从来没有过一帧；上膛条件是第一件要改的事。
+  那个窗口刷成了裸 APFS 容器，所以这台板子上的卡里从来没有过一帧；上膛条件是第一件要改的事
+  （round185 改了：只看 GPT 里有没有 logdump 这条 entry）。
   头字段第 8 个字的序号让转圈的
   环仍按先后读，`--verdict` 打印，环满覆盖最旧一条并计数。屏会滚，卡不会——而且 round183
   那一帧证明屏连滚都不会：它是一台画满就停的打印机。
@@ -452,9 +485,12 @@ fastboot reboot
   以前只认 `device`，而 TWRP 的 adbd 报的是 `recovery`，所以 round147 到 round184 之间每一次
   「等不到 recovery」都是假阴性；把状态放宽、再把 `dd` 的 stderr 在设备侧丢掉（TWRP 会把它
   和块数据挤在同一条流上，多出来的 85 字节让任何长度校验都不可信）之后，一次 `dd` 稳定回
-  622592 字节。反过来说，驱动侧那一半还没证：拉回来的窗口与 round127 的镜像逐字节相同，
+  622592 字节，拉的源从 logfs 换成 logdump（round185 起，先 `by-name/logdump`，落回才试
+  logfs）。反过来说，驱动侧那一半还没证：拉回来的窗口与 round127 的镜像逐字节相同，
   卡上从来没有过一帧 CloverSdhci 的记录，因为环的上膛要先看上一条启动留下的记录，而那条记录
-  已经被 round127 的刷写抹了（见上面 round174 那段）。同一个晚上板子被死线打断后**自己重启了，
+  已经被 round127 的刷写抹了（见上面 round174 那段）。round185 改的就是这一条——上膛只看
+  GPT 里的 `logdump` entry，窗口也不压在根容器上——**但它上没上膛要这一刷自己回答**。
+  同一个晚上板子被死线打断后**自己重启了，
   没有回到 fastboot**——跑到我们内核里的板子在 USB 上是隐形的，所以 IMEM→fastboot 这一棒
   在这台机器上仍然只是「未证」，不是「被否」。
 

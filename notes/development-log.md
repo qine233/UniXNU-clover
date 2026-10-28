@@ -14059,3 +14059,76 @@ TWRP 的 adbd 会把 `dd` 自己的统计和块数据挤在同一条流上——
 下一轮只问一件事——把上膛条件从「读到过旧记录」改成「GPT 里认出了 logfs 分区」（`arming on the GPT
 match alone`），并顺带回答窗口该不该继续放在被内核当根挂载的那块分区上（p39 扇区 0 属于容器超块区，
 宿主种一条假记录只会写进 APFS 元数据）。在此之前，所有「卡上的读数」仍然只是照片。
+
+## round185（v0.5.44）：日志窗换到 logdump，环的上膛只看卡自己的 GPT
+
+### 这一轮修的是上一轮自己写下的那把锁
+
+round184 的刷写测试（2026-10-29 第二次）把一件事钉死了：从 TWRP 一次 `dd` 能稳定回 622592
+字节，但拉回来的窗口与 round127 刷进去的裸 APFS 容器逐字节相同，一个 `UXNU` 都没有。也就是说
+这台板子的卡上从来没有过一帧我们写的记录。原因不在写通路，在驱动自己的上膛条件——
+`gVerdictReady`/`gTeeReady`/`gPanicLogReady` 只在「这一条启动已经从报告窗里读到过一条既有记录」
+的分支里置位；round127 那次刷写把唯一的既有记录抹掉了，于是每条启动都读不到记录、于是不上膛、
+于是不落卡、于是下一条照样读不到。这是一个自锁，不需要任何硬件失败就能永远成立。
+
+排期 4 的第二个问题（轨道）和这一条无关，所以这一轮仍然不动仪器：`clover-input`/`clover-power`/
+`clover-dsp` 三条参数照旧注释在 `board.toml` 外，`clover-unattended=300` 照旧在最后一行。
+
+### 为什么是 logdump，而不是「把锁的判据改一改」就行
+
+logfs（p39）现在是 shipped 引导挂上去的根 APFS 容器（`rd=md0s39`）。在它上面写日志，等于在
+「这一轮真正要读的那个东西」上写日志——两个后果都不可接受：一是任何一次落卡都可能改动引导要
+挂载的字节，写闸门（r173）要求「先 PIO 读回原样」正好把这条路堵死；二是刷容器 = 抹记录 = 重新
+自锁。卡上还有另一块 64 MiB 的分区从来没被我们碰过，量自
+`facts/81ffcaaa-20261022-210928/mmc_partitions.txt`：
+
+- logdump 是 p56，`first=13320216`、`size=131072` 个扇区，最后一个 LBA `13451287`；
+- 我们的整个窗口需要 `192 + 2*512 = 1216` 个扇区（panic 槽在前 32 块之外，kind 21 环从第 64
+  扇区起 64 槽，kind 22 内核环从第 192 扇区起 512 槽），logdump 富余五十多倍。
+
+所以窗口挪走，同时上膛判据换成**只看 GPT**：模式 ≥14 那段逐条目走查里新增 `logdump` 的匹配
+（UTF-16LE 名字第 14..17 个字，需要 `entryWords >= 19`），三条 entry 都认到就 break。上膛前先量
+尺寸，够才发布：
+
+```
+CloverSdhci r185: log window armed from GPT first=%u sectors=%u report=%u driver=%u kernel=%u
+```
+
+不够或找不到各有一条拒绝行，两条都明确写 `rings stay disarmed`——上膛失败必须是一条能被读到的
+判据，而不是「什么都不打印」。原来的 28 行 mode-20 上膛块删掉了；checker 现在反向钉它不许回来。
+
+记录格式、两个环的相对几何、`panicDrainRings()` 与 round184 那条 `panic drain wrote=… dropped=…
+tee_passes=…` 一个字没动。本轮唯一跟着搬家的旧判据是 r173 的写闸门取样：它原本以 logfs 窗口为界，
+现在以 logdump 为界（`kWriteCheckOffset = 4096`、16 块），拒写时那行报
+`write gate refuses, log window first=%u blocks=%u sectors=%u`，`first=` 报的就是本轮实际窗口。
+
+### 宿主侧两条路同步
+
+`read-clover-log.py` 的 `LOG_WINDOW_FIRST_LBA = 13320216` 成了 `--first-lba` 的默认值，帮助文本
+直接写「round185 之前的卡请传 12320768」，`--selftest` 的三个 LBA 也跟着重定基；默认落盘文件名
+改成 `clover-log-window.bin`，因为「logfs.bin」这个名字现在会指错东西。
+`run-clover-unattended.sh` 的取源顺序变成
+`bootdevice/by-name/logdump` → `by-name/logdump` → `mmcblk0p56`，之后才落回 logfs 的两条旧路径，
+长度校验仍是 622592 字节。旧仪器模式 16/17/18/19/20 仍会碰 logfs——这是明知的一处不一致，
+shipped 的 mode 21 不碰。
+
+### 构建侧：一条真缺陷，和一件比缺陷更要紧的事
+
+同一棵树的第二次构建停在 `apply --check native-4k-signature-hash-cache.patch`。原因是回放循环不
+幂等：`zzy-clover-dyld-cache-skip.patch` 在 `native-4k-signature-hash-cache.patch` 自己新增的块里
+追加字段，于是这个较新的补丁一进树，较早那个就既不可正向应用（它记的上下文已经变了）也不可反向
+撤销（它加的那段被改过）。脚本对这种重叠早有约定——把重叠的最新那个先反向，让名字顺序的循环重新
+应用——只是名单里漏了 clover 这一条。加进去（`../UniXNU/scripts/build-xnu-4k-baseline.sh:38`），
+同一份工作树连跑三遍，每遍都是同样的 72 个文件被修改，幂等成立。
+
+更要紧的是被这件事照出来的东西：重置这份工作树时发现 `bsd/kern/kern_exec.c`、`bsd/kern/kern_exit.c`、
+`bsd/vfs/vfs_vnops.c`、`bsd/vm/vm_unix.c` 里 **`zzy-clover-shared-region-why5.patch` 的全部内容都不在**
+——r170 那对 `exec`/`exit` 行、16 次的 `clover_cache_dir` 上限、限流的 `check_np` 都没了，可上一轮的
+`kernel.macho` 里那些字符串都在。它们是靠从没重编过的 object 文件进镜像的。本轮是第一份「源码状态与
+补丁集相符」的内核；这条对 round177 的逐字节可复现主张有直接影响——那个主张的前提是工作树被重置后
+能重放出同一棵树，而这次证明它当时并没有重放出「打过全部补丁」的源码。
+
+### 读数
+
+**尚未上机。** 这一轮唯一的新判据是 `CloverSdhci r185: log window armed …` 那行到底出不出现、
+`first=` 是不是 13320216；它出现而卡上仍没有记录，和它根本没出现，是两个不同的答案。

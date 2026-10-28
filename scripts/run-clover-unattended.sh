@@ -9,8 +9,10 @@
 #     writes 0x77665501 ("bootloader") and publishes it to the panic screen only
 #     after the read-back agreed. Every panic screen therefore marks the cell and
 #     resets through PSCI after 20 s, and XBL comes back up in fastboot.
-#   * The panic screen still writes its text to logfs first (kind 20), so what it
-#     showed is on the card even though the panel is gone after the reset.
+#   * The panic screen still writes its text to its own log window first (kind 20), so
+#     what it showed is on the card even though the panel is gone after the reset. Since
+#     round185 that window is the partition named logdump, not logfs -- logfs is this
+#     boot's root container and nothing of ours is written into it.
 #
 # This script does the host half, in order:
 #   1. wait for the tablet to appear in fastboot (it returns there by itself);
@@ -18,11 +20,12 @@
 #      (a declared eMMC write, off unless asked for). With --boot-after-flash it
 #      then reboots normally, so the firmware boots that payload from the partition
 #      and the deadline brings the board back to fastboot on its own; without it the
-#      card is read as it stands, which is the *previous* boot's logfs, not the one
+#      card is read as it stands, which is the *previous* boot's log window, not the one
 #      just written;
 #   3. ask the bootloader for recovery; this may write the boot command into the
 #      misc partition (BCB), which is why it needs --allow-misc-bcb;
-#   4. wait for TWRP's adb, dump the first 1216 sectors of logfs through /dev/block,
+#   4. wait for TWRP's adb, dump the first 1216 sectors of the log window (logdump)
+#      through /dev/block,
 #      and decode the 16 report slots plus both rings in it (the driver's verdicts
 #      and, since round176, the kernel-log lines the tee copied onto the card);
 #   5. optionally return to fastboot.
@@ -39,7 +42,7 @@ set -u
 
 WAIT=900
 ADB_WAIT=180
-OUT="$HOME/clover-out/clover-logfs.bin"
+OUT="$HOME/clover-out/clover-log-window.bin"
 FLASH_CACHE=""
 ALLOW_BCB=0
 SKIP_RECOVERY=0
@@ -58,7 +61,7 @@ usage() {
 Options:
   --wait SECONDS         how long to wait for fastboot (default 900)
   --adb-wait SECONDS     how long to wait for recovery adb (default 180)
-  --out PATH             dump file (default ~/clover-out/clover-logfs.bin)
+  --out PATH             dump file (default ~/clover-out/clover-log-window.bin)
   --flash-cache IMG      cold-flash IMG to the cache partition before recovery;
                          this is an eMMC write and is printed before it runs
   --boot-after-flash     after flashing, reboot normally and wait for the board to
@@ -203,7 +206,12 @@ say "recovery: device=${device:-?} twrp=${twrp:-?}"
 # driver -- runs 192..1215. One dd still brings back everything the card was told, which is the point
 # of the round: a boot's whole story, not the last 32 lines of it.
 dump_ok=0
-for source in /dev/block/bootdevice/by-name/logfs /dev/block/by-name/logfs /dev/block/mmcblk0p39; do
+# Round185: the window is logdump. logfs stays in the list because a card flashed before
+# round185 has its rings -- if any had ever been written -- at the start of logfs, and the
+# point of reading that partition is now to show it is empty.
+for source in /dev/block/bootdevice/by-name/logdump /dev/block/by-name/logdump \
+              /dev/block/mmcblk0p56 /dev/block/bootdevice/by-name/logfs \
+              /dev/block/mmcblk0p39; do
   say "reading $source"
   # Two host-side traps, both found by the first real run of this script against a board sitting in
   # TWRP. (1) TWRP's adbd puts dd's own statistics on the same stream as the block data, so a plain
@@ -224,7 +232,7 @@ for source in /dev/block/bootdevice/by-name/logfs /dev/block/by-name/logfs /dev/
     say "  $source: read failed"
   fi
 done
-[ "$dump_ok" = 1 ] || die 1 "no readable logfs window (last file: $OUT)"
+[ "$dump_ok" = 1 ] || die 1 "no readable log window (last file: $OUT)"
 
 say "dump: $OUT ($(wc -c < "$OUT" | tr -d ' ') bytes)"
 if [ "$DECODE" = 0 ]; then

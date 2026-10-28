@@ -256,6 +256,15 @@ static const uint32_t kLogfsLastLba = 12337151u;   // sysfs: start 12320768, 163
 // Round128 puts the iPadOS root image here, so its entry is a window the way logfs's is.
 static const uint32_t kUserDataFirstLba = 15795488u;
 static const uint32_t kUserDataLastLba = 122142686u;
+// Round185: the log window is a different partition from the root window. Everything this driver
+// writes for the host to read -- the panic report slots, the verdict ring, the kernel tee ring and
+// the write gate's sample run -- sat at the start of logfs, which since round127 is the partition
+// XNU mounts as root: report slot 0 is the container superblock's own region and the ring offsets
+// are not free space either. The card has a partition named for logs that this boot uses for
+// nothing: "logdump", mmcblk0p56, 131072 sectors from 13320216 (64 MiB), from the same sysfs dump
+// the logfs and userdata extents came from -- facts/81ffcaaa-20261022-210928/mmc_partitions.txt.
+static const uint32_t kLogDumpFirstLba = 13320216u;
+static const uint32_t kLogDumpLastLba = 13451287u;   // start + 131072 - 1
 static volatile uint32_t gBlockReady = 0;
 static volatile uint32_t gBlockSectors = 0;
 // Round171: one command engine and one FIFO, so a request owns the host from its first command to
@@ -292,6 +301,11 @@ static volatile uint32_t gBlockWindowSectors = 0;
 // through the window below, finds the OS window inside it, and re-scopes the media to that.
 static volatile uint32_t gBlockUserDataFirst = 0;
 static volatile uint32_t gBlockUserDataSectors = 0;
+// Round185's fourth window, and the only one this driver writes into. CloverBlock never sees it:
+// it is the panic report's slots 0..31, the two rings and the write gate's run, all of it at these
+// same offsets from a base the card itself reported. Zero until the entry walk names logdump.
+static volatile uint32_t gLogWindowFirst = 0;
+static volatile uint32_t gLogWindowSectors = 0;
 
 // Round147, unattended boot. clover.dtb has restart_reason@65c under qcom,msm-imem@146bf000, and
 // the stock kernel's `reboot bootloader` writes 0x77665501 there before its PSCI reset; XBL reads
@@ -3065,10 +3079,10 @@ static bool writeMultiBlock (uint32_t lba, const uint32_t *words, uint32_t block
 // WHY IT IS ALLOWED TO TOUCH THE CARD AT ALL
 //
 // A wrong DMA read costs an EIO; a wrong DMA write changes what is on the eMMC. So this path does not
-// get to write bytes anyone invented. checkWriteDmaPath() takes a run inside the logfs window -- the
-// one partition this port may damage without damaging anything, because its contents are only the
-// bring-up reports it rewrites every boot -- reads it through PIO, and writes those same bytes back
-// through ADMA2. If the host delivered exactly what the CPU handed it, the partition reads back byte
+// get to write bytes anyone invented. checkWriteDmaPath() takes a run inside the log window -- since
+// round185 the one partition this port may damage without damaging anything, because nothing mounts
+// it -- reads it through PIO, and writes those same bytes back through ADMA2. If the host delivered
+// exactly what the CPU handed it, the partition reads back byte
 // for byte as it was found and the flag is set; if the table was wrong, the run now holds wrong bytes
 // in a log area, which is the entire blast radius. Before that, the identical bytes go through the PIO
 // write and read back as a control: a medium that will not round-trip its own bytes through PIO cannot
@@ -3084,12 +3098,16 @@ static bool gWriteDmaTrusted = false;
 static bool gWriteDmaCheckDone = false;
 static uint32_t gWriteDmaFailures = 0;
 
-// The run the gate may rewrite. logfs is 16384 sectors and the panic writer owns the first 32 of them
-// (16 slots, two blocks each); 4096 sectors in is neither the header array nor the tail it appends to,
-// and 16 blocks is four times the minimum a batch is, so the sample itself is a real batch.
+// The run the gate may rewrite. Round185 moved it: the reasoning that made logfs safe to scribble --
+// "its contents are only the bring-up reports it rewrites every boot" -- stopped being true the day
+// logfs became this boot's root container, and the gate has been sitting 4096 sectors inside a
+// filesystem it must not damage. The log window is now 64 MiB of partition nobody mounts, so the
+// blast radius is what the comment always claimed it was. Offset 4096 in is clear of the report
+// slots and both rings, and 16 blocks is four times the minimum a batch is, so the sample itself is
+// still a real batch.
 static const uint32_t kWriteCheckBlocks = 16;
 static const uint32_t kWriteCheckWords = kWriteCheckBlocks * kBlockWords;
-static const uint32_t kWriteCheckLba = kLogfsFirstLba + 4096u;
+static const uint32_t kWriteCheckOffset = 4096u;
 
 // Which part of a DMA write refused, with the same eight-line bound the read reporter uses. The
 // ADMA_ERROR byte names the descriptor the host gave up on; HOST_CONTROL is printed because a DMA
@@ -3237,12 +3255,14 @@ static bool writeAdmaRun (uint32_t lba, const uint32_t *src, uint32_t blocks, ui
 static void checkWriteDmaPath (void)
 {
   gWriteDmaCheckDone = true;
-  const uint32_t sectors = __atomic_load_n (&gBlockSectors, __ATOMIC_ACQUIRE);
-  if (kWriteCheckLba < kLogfsFirstLba ||
-      kWriteCheckLba + kWriteCheckBlocks - 1 > kLogfsLastLba ||
-      kWriteCheckLba + kWriteCheckBlocks > sectors) {
-    sdhciSay ("CloverSdhci r173: write gate refuses, logfs window lba=%u blocks=%u sectors=%u\n",
-           kWriteCheckLba, kWriteCheckBlocks, sectors);
+  const uint32_t sectors = __atomic_load_n (&gLogWindowSectors, __ATOMIC_ACQUIRE);
+  const uint32_t windowFirst = __atomic_load_n (&gLogWindowFirst, __ATOMIC_ACQUIRE);
+  const uint32_t checkLba = windowFirst + kWriteCheckOffset;
+  if (windowFirst == 0 ||
+      checkLba + kWriteCheckBlocks - 1 > windowFirst + sectors - 1 ||
+      checkLba + kWriteCheckBlocks > __atomic_load_n (&gBlockSectors, __ATOMIC_ACQUIRE)) {
+    sdhciSay ("CloverSdhci r173: write gate refuses, log window first=%u blocks=%u sectors=%u\n",
+           windowFirst, kWriteCheckBlocks, sectors);
     return;
   }
   if (!dmaBringUp ()) {
@@ -3265,10 +3285,10 @@ static void checkWriteDmaPath (void)
   uint64_t pioTicks = 0;
   uint64_t dmaTicks = 0;
 
-  const bool originalRead = readRunPio (kWriteCheckLba, gCheckBatchA, kWriteCheckBlocks);
+  const bool originalRead = readRunPio (checkLba, gCheckBatchA, kWriteCheckBlocks);
   if (!originalRead) {
-    sdhciSay ("CloverSdhci r173: write gate stops, the logfs run would not read back lba=%u\n",
-           kWriteCheckLba);
+    sdhciSay ("CloverSdhci r173: write gate stops, the log window run would not read back lba=%u\n",
+           checkLba);
     return;
   }
   // Control run: the same bytes, through the path every earlier round proved, with the card's own
@@ -3277,7 +3297,7 @@ static void checkWriteDmaPath (void)
   bool pioWrite = false;
   for (uint32_t attempt = 0; attempt < 2 && !pioWrite; attempt++) {
     uint32_t handed = 0;
-    if (!writeMultiBlock (kWriteCheckLba, gCheckBatchA, kWriteCheckBlocks, handed, pioStatus)) {
+    if (!writeMultiBlock (checkLba, gCheckBatchA, kWriteCheckBlocks, handed, pioStatus)) {
       continue;
     }
     if (writeSettled (rsp, settleStatus, polls)) {
@@ -3288,7 +3308,7 @@ static void checkWriteDmaPath (void)
     waitCardIdle (frequency);
   }
   pioTicks = readCounter () - start;
-  const bool pioRead = readRunPio (kWriteCheckLba, gCheckBatchB, kWriteCheckBlocks);
+  const bool pioRead = readRunPio (checkLba, gCheckBatchB, kWriteCheckBlocks);
   if (pioRead) {
     diffPio = countWordDiff (gCheckBatchA, gCheckBatchB, kWriteCheckWords, firstPio);
   }
@@ -3299,7 +3319,7 @@ static void checkWriteDmaPath (void)
     start = readCounter ();
     for (uint32_t attempt = 0; attempt < 2 && !dmaWrite; attempt++) {
       uint64_t ticks = 0;
-      if (!writeAdmaRun (kWriteCheckLba, gCheckBatchA, kWriteCheckBlocks, dmaStatus, ticks)) {
+      if (!writeAdmaRun (checkLba, gCheckBatchA, kWriteCheckBlocks, dmaStatus, ticks)) {
         continue;
       }
       if (writeSettled (rsp, settleStatus, polls)) {
@@ -3313,7 +3333,7 @@ static void checkWriteDmaPath (void)
   }
   bool dmaRead = false;
   if (controlHeld) {
-    dmaRead = readRunPio (kWriteCheckLba, gCheckSingle, kWriteCheckBlocks);
+    dmaRead = readRunPio (checkLba, gCheckSingle, kWriteCheckBlocks);
     if (dmaRead) {
       diffDma = countWordDiff (gCheckBatchA, gCheckSingle, kWriteCheckWords, firstDma);
     }
@@ -3326,7 +3346,7 @@ static void checkWriteDmaPath (void)
   const uint64_t dmaRate = dmaMs > 0 ? (bytes / 1024ULL) * 1000ULL / dmaMs : 0;
   sdhciSay ("CloverSdhci r173: wrcheck lba=%u blocks=%u control=%d dma=%d diff=%u/%u first=%u/%u "
          "w=%08x/%08x g=%08x/%08x st=%08x/%08x ms=%llu/%llu kbs=%llu/%llu trusted=%d\n",
-         kWriteCheckLba, kWriteCheckBlocks, controlHeld ? 1 : 0, dmaWrite ? 1 : 0,
+         checkLba, kWriteCheckBlocks, controlHeld ? 1 : 0, dmaWrite ? 1 : 0,
          diffPio, diffDma, firstPio, firstDma,
          gCheckBatchA[firstPio < kWriteCheckWords ? firstPio : 0],
          gCheckBatchA[firstDma < kWriteCheckWords ? firstDma : 0],
@@ -4388,6 +4408,7 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
   uint32_t entryBlocks14 = 0, entryFail14 = 0, entryGot14 = 0;
   uint32_t entryFound14 = 0, entryFirst14 = 0, entryLast14 = 0;
   uint32_t entryUdFound = 0, entryUdFirst = 0, entryUdLast = 0;
+  uint32_t entryLdFound = 0, entryLdFirst = 0, entryLdLast = 0;
   uint32_t entryType14 = 0, entryTypeB14 = 0;
   uint32_t entryFirstIdx15 = 0, entryFirstA15 = 0, entryFirstW15[3] = { 0, 0, 0 };
   bool entryOk14 = false, entryBad14 = false;
@@ -5052,8 +5073,18 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                   entryUdFirst = entry[8];
                   entryUdLast = entry[10];
                 }
+                // "logdump", round185's log window: seven characters span words 14..17, with 'p'
+                // alone in word 17 and the terminator landing in word 18. It is the third name this
+                // walk needs, and it is entry 56 on this card, inside the 16 blocks the walk is
+                // allowed to read (entryEs14 = 128 gives four entries per block, so 64 entries).
+                if (entryWords >= 19 && entry[14] == 0x006f006cu && entry[15] == 0x00640067u &&
+                    entry[16] == 0x006d0075u && entry[17] == 0x00000070u && entry[18] == 0) {
+                  entryLdFound = index;
+                  entryLdFirst = entry[8];
+                  entryLdLast = entry[10];
+                }
               }
-              if (entryFound14 && entryUdFound) {
+              if (entryFound14 && entryUdFound && entryLdFound) {
                 break;
               }
             }
@@ -5073,6 +5104,59 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             __atomic_store_n (&gBlockUserDataFirst, entryUdFirst, __ATOMIC_RELEASE);
             __atomic_store_n (&gBlockUserDataSectors, entryUdLast - entryUdFirst + 1,
                               __ATOMIC_RELEASE);
+          }
+          // Round185: the log window, and the arming that used to live inside the mode-20 report.
+          // It was unreachable there for two independent reasons and both are gone. (1) The block it
+          // sat in ran only when probeMode == 20, and the boot path has been mode 21 since
+          // round137 -- a normal boot walked the GPT, published the root window and never reached
+          // the code that arms the rings. (2) It armed only after the boot read an existing record
+          // out of the window, which a partition that has never been written to cannot produce, so
+          // even a mode-20 boot after round127's flash stayed disarmed forever. What has to be true
+          // now is only that this card's own GPT names logdump at the extent measured from sysfs.
+          // Nothing about the partition's contents is a precondition: the first boot writes the
+          // first record, and every later one reads what it finds.
+          if (entryLdFound != 0 && entryLdFirst == kLogDumpFirstLba &&
+              entryLdLast == kLogDumpLastLba) {
+            const uint32_t logSectors = entryLdLast - entryLdFirst + 1;
+            __atomic_store_n (&gLogWindowFirst, entryLdFirst, __ATOMIC_RELEASE);
+            __atomic_store_n (&gLogWindowSectors, logSectors, __ATOMIC_RELEASE);
+            // The tee ring is the deepest user: 512 records at two blocks each, from sector 192.
+            const uint32_t needed = kRingOffset[kRingKernel] +
+                                    2 * kRingCardSlots[kRingKernel];
+            if (logSectors >= needed) {
+              gPanicLogFirst = entryLdFirst;
+              gPanicLogReady = 1;
+              gVerdictFirst = entryLdFirst;
+              gVerdictReady = 1;
+              gTeeReady = 1;
+              // Said out loud because it is the precondition of every reading after it: a dd that
+              // comes back with no verdict records has to be able to tell "never armed" from
+              // "armed and then never flushed by a request that finished".
+              sdhciSay ("CloverSdhci r185: log window armed from GPT first=%u sectors=%u report=%u driver=%u kernel=%u\n",
+                        entryLdFirst, logSectors, entryLdFirst,
+                        entryLdFirst + kRingOffset[kRingDriver],
+                        entryLdFirst + kRingOffset[kRingKernel]);
+              // The three lines every earlier round's reader looks for, said from here rather than
+              // from the report they used to sit in: the ring addresses they name are now logdump's,
+              // and they are armed on a mode-21 boot for the first time.
+              sdhciSay ("CloverSdhci r174: verdict ring armed lba=%u slots=%u\n",
+                        gVerdictFirst + kRingOffset[kRingDriver], kRingCardSlots[kRingDriver]);
+              sdhciSay ("CloverSdhci r176: kernel ring armed lba=%u slots=%u\n",
+                        gVerdictFirst + kRingOffset[kRingKernel], kRingCardSlots[kRingKernel]);
+              // gTeeIndex stays at zero on purpose: the lines this port needs most -- the
+              // shared-region probes, the root mount verdict -- were printed before now, and they
+              // are still in the buffer. bufx= says how much history the first passes replay.
+              sdhciSay ("CloverSdhci r175: tee armed bufc=%p size=%d bufx=%d\n",
+                        msgbufp ? msgbufp->msg_bufc : nullptr,
+                        msgbufp ? msgbufp->msg_size : 0,
+                        msgbufp ? msgbufp->msg_bufx : -1);
+            } else {
+              sdhciSay ("CloverSdhci r185: logdump entry too small, rings stay disarmed first=%u sectors=%u needed=%u\n",
+                        entryLdFirst, logSectors, needed);
+            }
+          } else {
+            sdhciSay ("CloverSdhci r185: no logdump entry at %u..%u found=%u first=%u last=%u, rings stay disarmed\n",
+                      kLogDumpFirstLba, kLogDumpLastLba, entryLdFound, entryLdFirst, entryLdLast);
           }
           if (probeMode == 16 && entryFound14 != 0) {
             // Writing into logfs is the step this whole chain has been for: the block carries
@@ -6105,34 +6189,10 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                     emitByte (c == '\n' ? '|' : (c >= 0x20 && c < 0x7f) ? static_cast<char> (c) : '.');
                   }
                 }
-                // Only a boot that found and read a record arms the panic hook. Its first job is
-                // to append the text the panic screen formats, which is where a crash log first
-                // stops being the driver's own report.
-                gPanicLogFirst = entryFirst14;
-                gPanicLogReady = 1;
-                // Round174: the same matched window the panic screen may write, offset clear of the
-                // blocks it owns. From here on, every verdict line has somewhere to land.
-                gVerdictFirst = entryFirst14;
-                gVerdictReady = 1;
-                // Said out loud because it is the precondition of every reading after it: a dd that
-                // comes back with no verdict records has to be able to say whether the ring was ever
-                // armed, or armed and then never flushed by a request that finished.
-                sdhciSay ("CloverSdhci r174: verdict ring armed lba=%u slots=%u\n",
-                          gVerdictFirst + kRingOffset[kRingDriver], kRingCardSlots[kRingDriver]);
-                // Round175: the tee is armed with the ring because it has nowhere to put a line
-                // without it. gTeeIndex stays at zero on purpose: the lines this port needs most --
-                // the shared-region probes, the root mount verdict -- were printed before now, and
-                // they are still in the buffer. bufx= in this reading is how much history the first
-                // passes are about to replay.
-                gTeeReady = 1;
-                // Round176: the tee's lines get their own 512 records at sector 192, so the size of
-                // the dd that reads them back is a promise the driver has to say out loud.
-                sdhciSay ("CloverSdhci r176: kernel ring armed lba=%u slots=%u\n",
-                          gVerdictFirst + kRingOffset[kRingKernel], kRingCardSlots[kRingKernel]);
-                sdhciSay ("CloverSdhci r175: tee armed bufc=%p size=%d bufx=%d\n",
-                          msgbufp ? msgbufp->msg_bufc : nullptr,
-                          msgbufp ? msgbufp->msg_size : 0,
-                          msgbufp ? msgbufp->msg_bufx : -1);
+                // Round185: nothing arms here any more. The panic hook, the verdict ring and the
+                // tee are armed by the GPT walk above, on this card's own entry for logdump, so a
+                // mode-21 boot arms them and a mode-20 boot reads this window for the panel without
+                // deciding anything about it.
               }
             }
           }
