@@ -69,6 +69,7 @@ archives = [
   "build-arm-driver.py CloverSdhci",
   "build-clover-block.py",
   "build-arm-driver.py CloverInput",
+  "build-arm-driver.py CloverPower",
 ]
 
 [kernel.prelink]
@@ -168,7 +169,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r181: the touch bus gets its first transaction"
+title = "clover r182: the PMIC arbiter answers and says who owns the rails"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2197,6 +2198,33 @@ kernel_args = [
   # card-backed kernel-log ring CloverSdhci sets up. It never panics: once the readings are the
   # product, stopping the boot is losing them.
   "clover-input=3",
+  # Round182 puts drivers/CloverPower on the SPMI arbiter, and mode 3 is the one worth booting for.
+  # Mode 1 is the pure-read control: map core/chnls-cnfg/obsrvr/intr, decode the version and walk the
+  # 448-entry APID map, start no transaction at all. Mode 2 stops after the two revid blocks. Mode 3
+  # adds the LDOs the touch panel is waiting on -- A11 (vcc_i2c) and B3 (vdd) -- read through their
+  # own APIDs.
+  # NOTHING HERE WRITES A PMIC. The arbiter's observer channel is written because that is how a read
+  # is requested (a CMD word is the request), and there is no write opcode and no windowWrite in the
+  # driver. The chnls window -- the one a real write goes through -- is mapped only so its
+  # ACC_ENABLE/IRQ_STATUS/CLEAR words can be reported, never programmed.
+  # What comes back, through round176's tee (`clover r` is already allowlisted):
+  #   `clover r182: core=.. ee=.. chan=.. intid=.. | cnfg700=.. obs00=.. intr00=..` -- the arbiter's
+  #    own identity registers, plus `core+0004` decoded both ways (VEND's interrupt-enable reading and
+  #    MAIN's APID-count reading), because those two interpretations disagree and only the board says
+  #    which one this silicon means;
+  #   `clover r182: scan ldo-a11 ppid=0x04a ... apid=.. owner=.. irq_owner=..` -- and the line that
+  #    decides 排期 4's second gate: `write-owner is EE n, this EE is 0: reads ok, writes denied`,
+  #    which is the same answer the vendor driver would give back as -EPERM;
+  #   `clover r182: pm660 rev2=.. type=51 want=51 subtype=1b want=1b` and `is QPNP, subtype matches
+  #    the DTB` -- the revid as MAIN's spmi_regulator_match() asks it, one 5-byte burst, falling back
+  #    to five singles and saying `burst no, singles yes` out loud if the burst is the thing that
+  #    failed, because that answer gates every later multi-byte SPMI read;
+  #   `clover r182: ldo-a11 enable=.. state=ON follow=..` and `0x40/0x41 raw=.. dt=1780000-1950000` --
+  #    register 0x46 is the enable, and a rail the panel needs but that reads OFF is the reason the
+  #    i2c probe NACKed.
+  # It runs last in the PMGR tail, after CloverInput, because its report is what tells the round181
+  # readings whether the panel's rails were ever on. It never panics.
+  "clover-power=3",
 ]
 
 [payload.adt]

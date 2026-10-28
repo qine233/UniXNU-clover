@@ -486,7 +486,7 @@ LEGACY_DISPLAY = (("legacy boot args", "offline-legacy-transfer"),
 # Round181's instrument is the other half of the board's input story, and it is linked the same way
 # the two block drivers are -- a plain archive path in CONFIG_XNU_EXTRA_LD_ARCHIVES, kept alive only
 # because CloverPMGR calls clover_input_run(). A payload built before the archive was added, or after
-# the boot arg was dropped, still prints "clover r181" in the menu title, so the strings below are the
+# the boot arg was dropped, still prints the current menu title, so the strings below are the
 # evidence. Each one is a line the driver can only emit by driving the bus: the divisor word is what it
 # writes to I2C_CLK_CTL, the declared-geometry line is the device tree's own numbers, and the two
 # candidate readings are the smallest real read each upstream driver asks.
@@ -504,6 +504,33 @@ def check_clover_input(kernel: bytes) -> bool:
     output is a reading."""
     label = "kernel.macho: touch instrument linked"
     found = {name: needle.encode() in kernel for name, needle in CLOVER_INPUT}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
+# Round182 is linked the same way as round181 -- a plain archive, pulled in only because CloverPMGR
+# references clover_power_run() -- and the same silence-on-absence applies. The strings below are the
+# lines that can only be emitted by a driver that walked the APID map and put a read command on the
+# arbiter: the declared five-window geometry comes out of PowerRegs.h bound to the DTB, the scan line
+# is the map walk's summary, the owner line is 排期 4's second gate, and the enable line is the reason
+# round181's `rails unproven` was written.
+CLOVER_POWER = (("power round stamp", "clover r182:"),
+                ("declared windows", "declared core=%llx+%u chnls=%llx+%llu obsrvr=%llx+%llu"),
+                ("map walk", "scan %s ppid=0x%03x rc=%d(%s) ver=%08x words=%u mapped=%u span=%u"),
+                ("ownership gate", "write-owner is EE %u, this EE is %u: reads ok, writes denied"),
+                ("identity refusal", "type is not PMIC_TYPE_VALUE; identity NOT established"),
+                ("burst question", "burst no, singles yes: sequential reads unproven on this arbiter"),
+                ("enable reading", "enable=%02x state=%s follow=%02x"))
+
+
+def check_clover_power(kernel: bytes) -> bool:
+    """Round182's arbiter report is the only answer this board has to "which EE owns the rail the
+    touch panel needs", so a payload without the archive boots claiming a power round it never runs."""
+    label = "kernel.macho: pmic arbiter instrument linked"
+    found = {name: needle.encode() in kernel for name, needle in CLOVER_POWER}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
@@ -909,6 +936,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_inline_asm_tails(kernel)
         ok &= check_legacy_display(kernel)
         ok &= check_clover_input(kernel)
+        ok &= check_clover_power(kernel)
     return 0 if ok else 1
 
 

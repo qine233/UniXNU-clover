@@ -58,6 +58,11 @@ void clover_unattended_begin(void);
 // be reached from code that is. Like the two above it, it is opt-in through its own boot
 // argument (`clover-input`) and returns without touching anything when that argument is absent.
 void clover_input_run(void);
+// Round182: drivers/CloverPower, the same schedule point for the same reason. It answers the
+// question round181 left open on the last line of its own report -- `rails unproven` -- by reading
+// the PMIC arbiter and the two LDOs the touch panel declares as supplies. Read-only against the
+// PMIC, opt-in through `clover-power`, and it returns without touching a register when absent.
+void clover_power_run(void);
 }
 
 // The panic screen prints these lines, so the reading survives even when the console is the
@@ -227,4 +232,8 @@ extern "C" void sheng_pmgr_run(void)
   // Running it before that would spend the readings on a msgbuf nobody can read. Absent
   // `clover-input`, it returns without touching a register.
   clover_input_run();
+  // After the touch instrument, not before: CloverPower's report is the explanation of CloverInput's
+  // last line, and both leave through the same card-backed ring, so their order on the card is the
+  // order they were asked. Absent `clover-power`, this starts no PMIC transaction at all.
+  clover_power_run();
 }

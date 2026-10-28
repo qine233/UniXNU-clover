@@ -13360,3 +13360,174 @@ fastboot reboot
 判据是顺序的：bring-up 齐了才准问地址，地址有人 ACK 才准谈配置下发，配置下发才准谈多点上报。
 本轮止步于第一、二问之间。它也不修任何已经存在的格子——显示 phase 2/3/4、536 共享区、完整
 `/data` 仍然按原顺序排着。
+
+## round182（v0.5.39）：仲裁器答了话，还说清了这些轨归谁写
+
+### 这一轮问什么
+
+排期第 6 格（电源）的第一步，同时是 round181 最后一行 `rails unproven` 的回答。问的仍是一件比
+「电源能用吗」小得多的事：**这个内核能不能问一颗 PMIC 某条轨现在是什么状态，以及那个回答告不
+告诉它「你根本不许写」**。两块 DT 触摸节点都声明了 supplies，而 NACK 只有在地芯片有电时才是
+「地址上没人」；否则「触摸芯片不存在」和「没人给它上电」是同一条观测，一轮分不清二者的排期
+会把下一轮派去找一个幽灵。
+
+另一头，这轮顺手把排期 4 的第二道闸的量先取回来：那道闸是「XNU 到底能不能拨一条轨」，答案不
+在命令编码里，在 `cnfg + 0x700 + 4*apid`——它写的是允许写这个 APID 的执行环境（VEND:50-51，
+:920-922 读）。那个数若不是 0，XNU（EE 0，DTB `qcom,ee = <0x00>`）的命令再正确也会被硬件判成
+denied，端口就得改去问 RPM。所以本轮的顺序是：**先拿到归属，再谈任何写**。
+
+### 前置（#290）：先把一个七位写成六位的基址结掉
+
+`drivers/CloverInput/InputRegs.h` 的 `kQupPhys` 出厂时是 `0x00c17700`——和下面那几个 GCC 宏一样
+是六位形状，实际是 `0xc17700`，只有正确地址的百分之一，落在一个根本没有 QUP 的区域。本轮把
+它改成 `0x0c177000`，并按本机 facts 里那份 `/proc/device-tree` 的原始字节
+（`facts/81ffcaaa-20261022-210928/dt/soc-reg.txt`，`i2c@c177000/reg 0070170c 00060000`，四字节一
+组小端）解出 `0x0c177000/0x600`。更要紧的是把这类笔误变成构建期失败：`check-clover.py` 的
+`check_device_tree_constants()` 现在把驱动头文件里的物理基址逐个钉到设备树节点上，本轮新增
+`qcom,spmi@800f000` 的十个 cell 对应 `kSpmiCorePhys/Size`、`kSpmiChnlsPhys/Size`、
+`kSpmiObsrvrPhys/Size`、`kSpmiIntrPhys/Size`、`kSpmiCnfgPhys/Size`，另加一条窗口合同
+（obsrvr 基址 + `kPmicArbObsBlockMapSize` 不许越过 DT 声明的那 0x1000000）。审计面现在是
+26 个地址对 230 个节点。
+
+### 硬件事实怎么钉的（三个具名来源，逐条引行号）
+
+`drivers/CloverPower/PowerRegs.h`（870 行）里每个偏移、每个位、每个尺寸都从具名文件抄：
+
+- **DT** = `~/uefi-clover/Resources/DTBs/clover.dts` 的 `qcom,spmi@800f000`：reg 的十一个
+  cell 给出五个窗口——core `0x0800f000+0x1000`、chnls `0x08400000+0x1000000`、
+  obsrvr `0x09400000+0x1000000`、intr `0x0a400000+0x220000`、cnfg `0x0800a000+0x3000`；
+  `qcom,ee = <0x00>` 决定本内核是 EE 0；两颗 PMIC 的 `reg` 给出 SID（pm660=0、pm660l=2）。
+- **VEND** = 小米 4.19 CAF 的 `spmi-pmic-arb.c`：版本分支在 :1210，APID 地图基址 `+0x900` 与
+  按 core 窗口尺寸定界在 :1113-1116 与 :910-911，平局与归属规则在 :920-932，IRQ 那条独立规则
+  在 :936+，命令重解码在 :1025-1028，读/写基址的分别在 :124-125（v2 起 rd_base 是 obsrvr、
+  wr_base 是 chnls），`pmic_arb_set_rd_cmd()` 在 :370，STATUS 四个位的语义在 :261-278，
+  单笔最长 8 字节在 :94，enable 的 0x80 在 :212-214。
+- **MAIN** = `sdm660-mainline/linux`：`qcom-spmi-pmic.c` 的 revid 逐字节顺序与 `PMIC_TYPE_VALUE`
+  （:26、:169-198）、`qcom-spmi-regulator.c` 的 dig-LDO 寄存器（0x01/0x04/0x05/0x40/0x41/0x45/
+  0x46/0x48）、L660 那批 subtype 绑 FTSMPS426 布局（:147-153、:1623-1637）、
+  `spmi_regulator_match()` 的五字节身份突发（:1696）、两字节电压读法（:942）。
+- **SHENG** = `~/UniXNU-sheng` 的 arbiter 驱动：v7 用 `0x2000/0x20` 的布局，正是本轮版本带宽要
+  挡住的那一侧；而它那份 read-write-read 证明真实 v5 每笔命令都要重新武装，所以宿主模型故意
+  **不**照抄这个行为（下面单说）。
+
+一处真分歧留在那里、没有靠猜解决：**读操作码**。VEND 用 EXT_READL，MAIN 的读路径用 READL；
+`PowerRegs.h` 把两条都记下来，取有证据的 `kPmicArbReadOp = kPmicArbOpExtReadl`，并在报告里把
+命令字原样打出来（`cmd=%08x`），这样如果本机认的是另一个操作码，帧里看得见。同样的处理用在
+`core + 0x0004`：一次读、两种解码都打（VEND:24 当 `PMIC_ARB_INT_EN`，MAIN:34 当
+`PMIC_ARB_FEATURES` 并把 bits 10:0 当 APID 数量），因为软件解决不了这个争论，而一条同时给出两
+个数的读数可以。
+
+### 三档，和那条「只读」的硬保证
+
+`clover-power=1/2/3`，逐档累加：1 只问仲裁器自己（映射、版本、`+0x0004` 双解码、走 448 项地图
+并按写归属做直方图、列出本板两颗 PMIC 的条目），**一笔事务都不发起**；2 再加两颗 PMIC 的
+revid 身份；3 再加两条轨——`ldo-a11-vcc_i2c`（PPID `0x04a`，sid 0，DT 1.78–1.95 V）与
+`ldo-b3-vdd`（PPID `0x242`，sid 2，DT 3.0 V 固定）的五字节身份突发、`0x40` 的两字节电压、
+`0x45` 模式、`0x46` enable。
+
+只读不是口头承诺，是结构：每笔事务都是 *observer* 通道（`0x10000*ee + 0x80*apid`）上的
+`EXT_READL`，读不到 PMIC 的输入侧；chnls 窗——v5 的**写**命令该去的地方（VEND:1013）——只按
+每条轨的 APID 映射一页，且只读那页的 `ACC_ENABLE`/`IRQ_STATUS`（VEND:1067-1069、:1085-1087），
+一次 CMD 都不往里写。本驱动唯一的写是把读命令写进自己通道的 CMD，那就是「读」这个动作本身
+（VEND:370）。`check-clover.py` 反向钉住它：`CloverPower.cpp` 里出现 `windowWrite` 或
+`kPmicArbWriteOp` 就失败。
+
+微伏只在证据齐全时才报：只有 MAIN 那批 L660 subtype 才用 FTSMPS426 的 `raw * 1000`（范围
+320000..1352000、步进 4000）；其他 subtype 的 `0x40` 是量程选择、`0x41` 是一张本端口没证过的表
+的索引，于是读数只给原始字节并说明为什么不给结论。DT 给 A11/B3 声明的范围本来就落在 L660 那条
+直线之外，所以 MAIN 的选择器算法是**故意**跳过的。
+
+### 把可测逻辑拆出去：`PowerArb.h` + 一个 pthread 假设备
+
+照 sheng 的形状（`package/BootResetCore.h` + `package/tests/boot_reset_host.c`）：APID 走图、归
+属查询、有界读全部是 `PowerArb.h` 里对裸 `volatile uint32_t *` 的 inline 函数，`CloverPower.cpp`
+只留真正需要内核的东西（映射、解码、打印、观测数组）。于是宿主上有一份仲裁器模型
+（`drivers/CloverPower/tests/clover_power_host.cpp`，pthread 扮演 PMIC 设备线程），
+`scripts/test-clover-power.py` 用 `-Wall -Wextra -Werror` 编它、跑它，`check-clover.py` 把它当成
+闸门——非零返回就是本轮失败。
+
+十档用例覆盖的都是本轮报告要引用的判断：`kPpidOf` 的身份；命令字编码与地址屏蔽；v2/v3 与
+v6/v7 两侧的拒绝；地图全空（`PA_E_NOENTRY`）对「有地图但没人映射这个 PPID」（`PA_E_PPID`）；
+平局（第一条胜出、被本 EE 拥有的后来者顶替）、IRQ 规则（最后一个带 bit24 的 APID）、归属表的
+步长与每 EE 计数；通道与 observer 块的边界；长度与 APID 的守卫；跨 RDATA0/RDATA1 的**小端
+5 字节突发**逐字节序；denied / failed / dropped 三分（以及 DONE 同时带失败位时仍是错，且那次事
+务没写过的数据不许被当读数交回）；最后一档**不带服务线程**跑，专证 `pa_wait()` 的轮询真有界。
+模型在 `serve()` 里按 VEND:1025-1028 重解码命令并 `assert` 它是读操作码，所以任何写路径都会在
+宿主上被抓住。模型故意不复现真硬件的「每笔命令重新武装」——那是 SHENG 的 read-write-read 证明
+了的行为，这里靠 `rearm()` 显式调用，为的是把「忘记重武装」这种错误留在模型可读的范围内。
+
+### 接线与契约
+
+`scripts/build-arm-driver.py` 的 choices 加 `CloverPower`，输出目录 `build/clover-power`；
+`configs/clover_defconfig` 的 `CONFIG_XNU_EXTRA_LD_ARCHIVES` 变成四份档案（仍是普通档案路径，不
+用 `force_load`——`_clover_power_run` 被 CloverPMGR 引用，普通解析就会拉进来）；`board.toml` 的
+`[kernel].archives` 加一行、`kernel_args` 末尾加 `"clover-power=3"`、标题升到
+`clover r182: the PMIC arbiter answers and says who owns the rails`。
+`drivers/CloverPMGR/CloverPMGR.cpp` 在 `clover_input_run()` 之后加 `clover_power_run()`：本轮的
+报告是上一轮最后一行的解释，两者走同一条卡上日志环，所以卡上的顺序就是我们提问的顺序。
+
+`check-clover.py` 新增：档案/defconfig/boot arg/`CONFIG_XNU_SHENG_PMGR` 四者一致（mode 只许
+1/2/3，别的值直接报错）、驱动与核心的形状正反钉子（正：命令字装配、版本拒绝、长度守卫、两个
+数据字、denied 分支、`PA_BARRIER ()`、`clover_power_run`、boot arg、链尾 flush、
+`kPmicTypeValue`/`kLdoRegEnable`/`kPmicArbOwnerTable`；反：`windowWrite`、`kPmicArbWriteOp`）、
+PMGR 尾部四个调用的**先后位置**、上面说的 DT 基址与窗口合同、以及宿主模型的闸门。
+`verify-clover-payload.py` 新增 `kernel.macho: pmic arbiter instrument linked` 七条串：轮次戳、
+声明几何行、地图走查行、归属结论行、身份拒绝行、突发那句诚实的读数、enable 读数。
+### 产物
+
+本轮内核 `7305d19140e4e1da68d1ee86bac46d68d4e45624cdb9e32ff120b050fe619ae0`（14/14 档案，
+CloverPower 是最后一个，树内 `-Wall -Wextra -Werror` 与 ARM64/iOS 17 object 审计一次通过）；
+AMFI 两处命中的 file 偏移与 round181 相同（`0x1aa80e4`/`0x1aa816c`，字照旧
+`0x34000229 -> 0x14000011`、`0x36000520 -> 0xD503201F`）；归一化后交付内核
+`37c3f2606f10614707d8c62be6777fa9be485d2620f36a2dba3f47ebfd733b3c`，object 时间戳从 966 个变成
+**967** 个（新档案带来的符号）；payload `0ee0857007cfce35b67c7221a1bdac24c193863a3c6f42db170a917d7ddbf09b`
+（56 MiB），卷内内核 `3efd9089…`、`unixnu.toml` `133af168…`、ADT `9bf49840…`（13516 字节）、
+`scratch-data.img` `614b8356…`（未变）、trustcache `7c369ce0…`（未变）；入口探针
+**6857 字节 / 37 段**，另有 3880 处位于可执行文本之外被忽略。
+
+链接之前构建的那批档案里，`clover-block` 与 `clover-pmgr` 的 `reference_sha256` 仍指上一轮内核
+`09fea490…`——这是「档案排在链接之前，所以同一次运行审计的是上一轮内核」那条已知行为，不是
+新问题：本轮由 `verify-clover-payload.py` 直接对 shipped 字节复核，
+`original-PMGR bindings alive OK (5 bindings, 0 moved)`。显示档案照 round181 的做法在链接完成后
+于树内重跑一次，拿到 `kernel_sha256 = 7305d191…`——正是本轮内核——而
+`compiled_object_sha256 = 1b6c134e…`、`late_object_sha256 = a061787e…` 与上一轮逐字相同，193 条
+原始绑定一条没动。
+
+闸门：`check-clover.py`（含新接进去的仲裁器宿主模型）、`normalize-kernel-macho.py --selftest`
+（17 条规则）、`check-cs-blob-structure.py --selftest`（14 条）、`read-clover-log.py --selftest`、
+`verify-clover-payload.py` 全绿（31 项）。归档在 `~/clover-out/round182-*`，清单
+`round182-SHA256SUMS`。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round182-payload.img
+fastboot reboot
+```
+
+### 这一帧问什么
+
+全部读数仍在卡上的内核日志环（kind 22）里，一次 `scripts/run-clover-unattended.sh` 就够：
+
+1. `clover r182: declared core=800f000+1000 chnls=8400000+1000000 obsrvr=9400000+1000000
+   intr=a400000+220000 cnfg=800a000+3000`。这一行的用处还是让读数对着**声明**比。
+2. `core=` 后那个版本字是否落在 `0x5000xxxx`。若打出 `below V5_MIN` 或 `at or above V6_MIN`，
+   本轮到此为止是正确答案——地图基址与通道步长在那两种布局下不是这组数，继续读只会读到幻影。
+3. `mode 1 started no transaction; mapped=%u listed=%u other_sid=%u ee0=%u`。`mapped` 是 boot 留下
+   了几条 APID 映射；`ee0` 是其中归本 EE 写的条数。`mapped=0` 意味着 XBL 没给这个 EE 装地图，
+   那是固件侧的问题，后面两档问不出身份。
+4. `write-owner is EE %u, this EE is %u: reads ok, writes denied` 是否出现、出现在哪条轨上。这
+   就是排期 4 第二道闸的那个数；两条轨都写成 `EE 0` 才允许下一轮谈 enable。
+5. `pm660`/`pm660l` 两行 `rev2=… minor=… major=… type=51 want=51 subtype=1b want=1b`（或 `1a`）
+   是否成立。`type is not PMIC_TYPE_VALUE; identity NOT established` 是有答案的失败：事务成了，
+   但那个外设不是 DT 说的东西。
+6. `burst no, singles yes: sequential reads unproven on this arbiter` 有没有出现。出现即：本仲裁器
+   的多字节突发不可靠，之后所有读数（包括触摸配置下发）都得按单字节排。
+7. 最后两行 `ldo-a11-vcc_i2c enable=… state=…` 与 `ldo-b3-vdd enable=… state=…`。这一条直接改写
+   round181 那句 `rails unproven`：两边都 `state=off` 且 I2C 全 NACK，说明是软件没上电；
+   `state=on` 而仍 NACK，才该回到总线与复位时序那一侧去找。
+
+判据是顺序的：版本过闸才准走地图，地图有本 EE 的条目才准发起事务，身份成立才准解 enable，
+enable 成立才准谈电压与设置。本轮止步于 enable。它不动任何已经存在的格子——显示 phase 2/3/4、
+536 共享区、`/data` 仍按原顺序排着；排期里下一格是「拿到归属之后，第一次写一条轨」，那道闸
+必须等这帧的 `write-owner` 读数落地才准开工。

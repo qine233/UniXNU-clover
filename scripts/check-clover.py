@@ -12,6 +12,8 @@ every check works from either location. Three groups run independently:
          a built-in subset reader otherwise, so it runs on the Python macOS ships.
   region compares the windows the board spec declares: the splash region, the firmware volume,
          the described DRAM and the stock reserved carve-outs must not lie on each other.
+  dt     re-reads /proc/device-tree/soc/*/reg from this unit's own facts dump and holds every
+         physical address in the driver headers against it.
   tree   reports the modules the kernel and firmware steps expect.
 
 Exit status is 1 when any group reports an error.
@@ -591,6 +593,38 @@ def check_board(errors: list) -> str:
                 errors.append(f"clover-input={mode} names a mode CloverInput does not implement "
                               "(1 dump, 2 bring-up, 3 probe); it would report and return")
 
+        # round182, the SPMI arbiter and the PMIC rails. The same four halves again, and the same
+        # silence if one of them goes missing: libCloverPower.a is only pulled in because
+        # sheng_pmgr_run() calls clover_power_run(), and that call maps nothing until a
+        # clover-power= argument reaches it. What is different about this one is what it costs to be
+        # wrong -- every later round that turns a rail on reads this round's owner and enable
+        # numbers first, so an archive that is built but not linked, or linked and never scheduled,
+        # produces a boot that simply does not answer rather than one that says it is not supported.
+        power_builder = any("CloverPower" in entry for entry in board["kernel"]["archives"])
+        power_arg = any(argument.startswith("clover-power=")
+                        for argument in board["payload"]["kernel_args"])
+        if "libCloverPower.a" in text and not power_builder:
+            errors.append("the defconfig links libCloverPower.a but [kernel] archives omits "
+                          "build-arm-driver.py CloverPower, so that archive does not exist")
+        if power_builder and "libCloverPower.a" not in text:
+            errors.append("[kernel] archives builds CloverPower but the defconfig does not link "
+                          "libCloverPower.a, so clover_power_run() is undefined")
+        if power_builder and not power_arg:
+            errors.append("[kernel] archives builds CloverPower but no clover-power= boot arg reaches "
+                          "it: clover_power_run() returns without mapping a single window")
+        if power_arg and not power_builder:
+            errors.append("kernel_args passes clover-power= but [kernel] archives does not build "
+                          "CloverPower, so the arg is noise")
+        if power_builder and flags.get("SHENG_PMGR", "n") not in ("y", "1"):
+            errors.append("CloverPower is scheduled from sheng_pmgr_run(), which CONFIG_XNU_SHENG_PMGR="
+                          f"{flags.get('SHENG_PMGR', 'n')} does not compile into the kernel")
+        if power_arg:
+            mode = [argument.split("=", 1)[1] for argument in board["payload"]["kernel_args"]
+                    if argument.startswith("clover-power=")]
+            if any(value not in ("1", "2", "3") for value in mode):
+                errors.append(f"clover-power={mode} names a mode CloverPower does not implement "
+                              "(1 arbiter, 2 revid, 3 rails); it would report and return")
+
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
     if cores != CPU_REGS:
@@ -1110,6 +1144,76 @@ def check_board(errors: list) -> str:
             errors.append("CloverInput puts a tag vector in the wrong FIFO: both counter registers "
                           "are written from the output side, and only MX_READ_CNT adds rx_tag_len")
 
+    # Round182, drivers/CloverPower. Two different things are asserted here, and both are things a
+    # driver that still compiles can silently lose. First, the v5 transaction shape: the command word
+    # is (op << 27) | ((addr & 0xff) << 4) | (bc & 7) with no SID in it, DONE/FAILURE/DENIED/DROPPED
+    # are four different answers, the bytes come out of RDATA0 low-byte-first and spill into RDATA1
+    # past four, and a version outside the v5 band has to be refused rather than walked with v5
+    # offsets (a v7 map at 0x2000 would otherwise yield a confident, wrong APID). Second, the
+    # read-only promise, which is the reason this round is allowed to touch a PMIC at all -- so it is
+    # asserted by absence: no write helper, no write opcode.
+    arb = REPO / "drivers/CloverPower/PowerArb.h"
+    power = REPO / "drivers/CloverPower/CloverPower.cpp"
+    if not arb.is_file() or not power.is_file():
+        errors.append("drivers/CloverPower/{PowerArb.h,CloverPower.cpp} is missing: the SPMI arbiter "
+                      "round, and with it the answer to who owns the touch panel's rails, does not exist")
+    else:
+        text = arb.read_text()
+        missing = [needle for needle in
+                   ("(op << kPmicArbCmdOpShift)",
+                    "return PA_E_VERSION;",
+                    "if (len < 1 || len > kPmicArbMaxTransBytes) {",
+                    "word = ch[kPmicArbRdata0 / 4];",
+                    "word = ch[kPmicArbRdata1 / 4];",
+                    "if (status & kPmicArbStatusDenied) {",
+                    "PA_BARRIER ();")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"drivers/CloverPower/PowerArb.h lacks {needle!r}: the v5 transaction it "
+                          "describes would not be the one the vendor driver sends")
+        source = power.read_text()
+        missing = [needle for needle in
+                   ("extern \"C\" void clover_power_run (void)",
+                    "PE_parse_boot_argn (\"clover-power\"",
+                    "clover_emmc_flush_cache ();",
+                    "clover_power_observation[15]",
+                    "kPmicTypeValue",
+                    "kLdoRegEnable",
+                    "kPmicArbOwnerTable")
+                   if needle not in source]
+        for needle in missing:
+            errors.append(f"drivers/CloverPower/CloverPower.cpp lacks {needle!r}: the report would "
+                          "not say which step, which identity or which enable it read")
+        # The guarantee is structural, not a promise in a comment. If either of these appears, the
+        # round is no longer the one that can only be wrong in its report.
+        if "windowWrite" in source:
+            errors.append("CloverPower grew a write path to a register window: this round is read-only, "
+                          "and the only word it may put on the bus is a read command on the observer "
+                          "channel")
+        if "kPmicArbWriteOp" in source:
+            errors.append("CloverPower builds a write command word: pa_read() is the only transaction "
+                          "this round is allowed to start")
+        # The model of the arbiter is the evidence for everything above, so it is run, not just
+        # asserted to exist: the file's own header promises the logic lives in PowerArb.h "where
+        # scripts/test-clover-power.py can exercise it", and a promise the checker does not keep is
+        # how a driver ends up tested only by the board.
+        harness = REPO / "drivers/CloverPower/tests/clover_power_host.cpp"
+        runner = next((base / "scripts/test-clover-power.py"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "scripts/test-clover-power.py").is_file()), None)
+        if runner is None:
+            errors.append("scripts/test-clover-power.py is missing: the v5 arbiter logic would be "
+                          "proven only on a PMIC that cannot be un-broken")
+        elif not harness.is_file():
+            errors.append("drivers/CloverPower/tests/clover_power_host.cpp is missing: the host model "
+                          "has nothing to drive PowerArb.h against")
+        else:
+            check = subprocess.run([sys.executable, str(runner)], capture_output=True, text=True)
+            if check.returncode:
+                errors.append("the arbiter host model failed: the APID tie-break, the bounded poll or "
+                              "the burst byte order is not what round182's report will claim it is\n"
+                              + (check.stdout + check.stderr)[-700:])
+
     # Round157. r156 made the card fast but left four ways for the fast path to report
     # something that was not true: a stop command whose failure was invisible, DATA_END
     # accepted next to a CRC/timeout bit, a 32-bit word offset that wraps past 16 GiB, and
@@ -1296,20 +1400,22 @@ def check_board(errors: list) -> str:
     # Round178 introduced the rule; each round since keeps it. The menu has to name the round under
     # test: the payload and its readings have to agree about which round is on the card, or an image
     # would be claiming a round it does not run. The drivers keep their own stamps -- the display
-    # probe still says r180, and drivers/CloverInput says r181 -- because the tee on the card filters
-    # the shared "clover r" prefix, not a round number.
-    if not board["payload"]["title"].startswith("clover r181:"):
-        errors.append('[payload] title is not "clover r181: ...": the menu would not name this round')
+    # probe still says r180, drivers/CloverInput says r181 and drivers/CloverPower says r182 --
+    # because the tee on the card filters the shared "clover r" prefix, not a round number.
+    if not board["payload"]["title"].startswith("clover r182:"):
+        errors.append('[payload] title is not "clover r182: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
-    # the three tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
+    # the four tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
     unattended = pmgr_source.find("clover_unattended_begin();")
     emmc = pmgr_source.find("clover_emmc_run();")
     touch = pmgr_source.find("clover_input_run();")
-    if not (0 <= unattended < emmc < touch):
+    power = pmgr_source.find("clover_power_run();")
+    if not (0 <= unattended < emmc < touch < power):
         errors.append("drivers/CloverPMGR/CloverPMGR.cpp does not call unattended_begin(), then "
-                      "emmc_run(), then input_run(): the touch report would precede the ring that "
-                      "carries it off the device")
+                      "emmc_run(), then input_run(), then power_run(): the power report would precede "
+                      "either the ring that carries it off the device or the touch readings it exists "
+                      "to explain")
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -2296,6 +2402,186 @@ def check_board(errors: list) -> str:
     return f"{defconfig_name}, {volume}"
 
 
+# --------------------------------------------------------------------------- driver addresses
+#
+# Every driver header names physical register windows, and every one of those numbers is a
+# transcription of the device tree.  Round181 shipped kQupPhys as 0x00c17700 -- the correct value is
+# 0x0c177000 -- because the transcription copied the digit count of the GCC defines sitting beneath
+# it.  A page mapped at the wrong address reads back as whatever the SMMU hands out there, which on
+# this board is nothing, and the driver then reports a dead bus rather than a wrong base.  The only
+# thing that settles this is the unit's own tree: scripts/dump-clover-facts.sh read
+# /proc/device-tree/soc/*/reg into facts/<serial>-<stamp>/dt/soc-reg.txt, printing each 32-bit cell
+# as four hex byte pairs in little-endian storage order, which is why "i2c@c177000/reg 0070170c
+# 00060000" means base 0x0c177000, size 0x600.
+DT_REG_DUMP = "facts/81ffcaaa-20261022-210928/dt/soc-reg.txt"
+
+# (node leaf name, index of the cell inside its reg property, header, macro).  The macro has to
+# equal that cell.
+DT_BASE_CONTRACT = [
+    ("i2c@c177000", 0, "drivers/CloverInput/InputRegs.h", "kQupPhys"),
+    ("i2c@c177000", 1, "drivers/CloverInput/InputRegs.h", "kQupDtSize"),
+    ("clock-controller@100000", 0, "drivers/CloverInput/InputRegs.h", "kGccPhys"),
+    ("clock-controller@100000", 1, "drivers/CloverInput/InputRegs.h", "kGccSize"),
+    ("sdhci@c0c4000", 0, "drivers/CloverSdhci/SdhciRegs.h", "kSdhciHostPhys"),
+    ("sdhci@c0c4000", 2, "drivers/CloverSdhci/SdhciRegs.h", "kSdhciCmdqPhys"),
+    ("sdcc1ice@c0c8000", 0, "drivers/CloverSdhci/SdhciRegs.h", "kSdhciIcePhys"),
+    ("qcom,spmi@800f000", 0, "drivers/CloverPower/PowerRegs.h", "kSpmiCorePhys"),
+    ("qcom,spmi@800f000", 1, "drivers/CloverPower/PowerRegs.h", "kSpmiCoreSize"),
+    ("qcom,spmi@800f000", 2, "drivers/CloverPower/PowerRegs.h", "kSpmiChnlsPhys"),
+    ("qcom,spmi@800f000", 3, "drivers/CloverPower/PowerRegs.h", "kSpmiChnlsSize"),
+    ("qcom,spmi@800f000", 4, "drivers/CloverPower/PowerRegs.h", "kSpmiObsrvrPhys"),
+    ("qcom,spmi@800f000", 5, "drivers/CloverPower/PowerRegs.h", "kSpmiObsrvrSize"),
+    ("qcom,spmi@800f000", 6, "drivers/CloverPower/PowerRegs.h", "kSpmiIntrPhys"),
+    ("qcom,spmi@800f000", 7, "drivers/CloverPower/PowerRegs.h", "kSpmiIntrSize"),
+    ("qcom,spmi@800f000", 8, "drivers/CloverPower/PowerRegs.h", "kSpmiCnfgPhys"),
+    ("qcom,spmi@800f000", 9, "drivers/CloverPower/PowerRegs.h", "kSpmiCnfgSize"),
+]
+
+# (node leaf name, span index, header, base macro, size macro).  A driver may map only part of a
+# node -- TLMM is one node whose north tile the driver addresses, GCC is one node whose three
+# page-sized windows the driver maps -- so every sub-window has to be provably inside what the tree
+# declares, or the mapping is outside the hardware the driver claims to talk to.
+DT_WINDOW_CONTRACT = [
+    ("clock-controller@100000", 0, "drivers/CloverInput/InputRegs.h", "kGccAhbHaltPhys", "kGccWindowSize"),
+    ("clock-controller@100000", 0, "drivers/CloverInput/InputRegs.h", "kGccI2cPhys", "kGccWindowSize"),
+    ("clock-controller@100000", 0, "drivers/CloverInput/InputRegs.h", "kGccAhbVotePhys", "kGccWindowSize"),
+    ("pinctrl@03000000", 0, "drivers/CloverInput/InputRegs.h", "kTlmmPhys", "kTlmmTileSize"),
+    ("pinctrl@03000000", 0, "drivers/CloverInput/InputRegs.h", "kPinGpio10Phys", "kPinPairSize"),
+    ("pinctrl@03000000", 0, "drivers/CloverInput/InputRegs.h", "kPinGpio11Phys", "kPinPairSize"),
+    ("pinctrl@03000000", 0, "drivers/CloverInput/InputRegs.h", "kPinGpio66Phys", "kPinPairSize"),
+    ("pinctrl@03000000", 0, "drivers/CloverInput/InputRegs.h", "kPinGpio67Phys", "kPinPairSize"),
+    # Round182 maps one EE's observer block, not the whole obsrvr span: 0x10000 * ee is this board's
+    # block (ee = 0 per the DTB's qcom,ee), and a 64 KiB window inside a 16 MiB one only means
+    # anything if the tree agrees it is inside. The chnls pages CloverPower maps for the two rails are
+    # not listed because their base is 0x10000 * apid for an APID the arbiter only names at run time.
+    ("qcom,spmi@800f000", 4, "drivers/CloverPower/PowerRegs.h", "kSpmiObsrvrPhys", "kSpmiObsBlockMapSize"),
+]
+# kTlmmTileSize is the north tile's own span, which the tree does not declare -- pinctrl@03000000 is
+# the whole 12 MiB register block and the tile is a third of it.  pinctrl-sdm660.c:1419 gives the
+# north tile ngpios = 114 pins at 0x1000 each, so the tile is 0x72000 wide and the value below is
+# derived rather than transcribed.
+DT_DERIVED_SIZES = {"kTlmmTileSize": (114, 0x1000)}
+
+
+def parse_defines(text: str) -> dict:
+    """Integer #defines in declaration order, with C integer suffixes stripped.
+
+    Hex literals are converted first, so the only bare identifiers left are references to defines
+    earlier in the same file -- which is how kPinGpio66Phys, written as
+    (kTlmmPhys + 66ULL * kTlmmPinStride), reaches a number the dump can be compared with.
+    """
+    values: dict = {}
+    for raw in text.splitlines():
+        line = raw.split("//", 1)[0].strip()
+        match = re.match(r"^#define\s+([A-Za-z_]\w*)\s+(\S.*)$", line)
+        if not match:
+            continue
+        name, expr = match.group(1), match.group(2)
+        expr = re.sub(r"0[xX][0-9a-fA-F]+", lambda found: str(int(found.group(0), 16)), expr)
+        expr = re.sub(r"(\d)[uUlL]+(?![0-9A-Za-z_])", r"\1", expr)
+        if not re.fullmatch(r"[A-Za-z_0-9\s+\-*/%()]+", expr):
+            continue
+        if any(token not in values for token in re.findall(r"[A-Za-z_]\w*", expr)):
+            continue
+        try:
+            value = eval(expr, {"__builtins__": {}}, dict(values))    # noqa: S307
+        except Exception:
+            continue
+        if isinstance(value, int) and not isinstance(value, bool):
+            values[name] = value
+    return values
+
+
+def check_device_tree_constants(errors: list) -> str:
+    """Compare the addresses the driver headers use against the unit's own device-tree dump."""
+    dump = REPO / DT_REG_DUMP
+    if not dump.is_file():
+        print(f"[check-clover] notice: {DT_REG_DUMP} is absent, so the driver base addresses are "
+              "not being checked against the device's own tree", file=sys.stderr)
+        return "no facts dump"
+    cells: dict = {}
+    for line in dump.read_text(errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].startswith("/proc/device-tree/soc/"):
+            continue
+        leaf, prop = parts[0].split("/")[-2], parts[0].split("/")[-1]
+        if prop != "reg" or leaf in cells:
+            continue
+        words = []
+        for group in parts[1:]:
+            if not re.fullmatch(r"[0-9a-fA-F]{8}", group):
+                words = []
+                break
+            words.append(struct.unpack("<I", bytes.fromhex(group))[0])
+        if words:
+            cells[leaf] = words
+    if not cells:
+        errors.append(f"{DT_REG_DUMP} has no parsable /proc/device-tree/soc/*/reg lines")
+        return "dump unreadable"
+
+    headers: dict = {}
+    announced: set = set()
+    checked = 0
+    for contract in (DT_BASE_CONTRACT, DT_WINDOW_CONTRACT):
+        for entry in contract:
+            relative = entry[2]
+            if relative not in headers:
+                path = REPO / relative
+                if not path.is_file():
+                    headers[relative] = None
+                    continue
+                headers[relative] = parse_defines(path.read_text(errors="replace"))
+            defines = headers[relative]
+            if defines is None:
+                # drivers/CloverPower is scheduled for round182; a header that does not exist yet
+                # must not look like a passing check.
+                if relative not in announced:
+                    announced.add(relative)
+                    print(f"[check-clover] notice: {relative} does not exist yet, its addresses are "
+                          "unchecked", file=sys.stderr)
+                continue
+            leaf, index = entry[0], entry[1]
+            if leaf not in cells:
+                errors.append(f"{DT_REG_DUMP} has no /proc/device-tree/soc/{leaf}/reg, so "
+                              f"{relative} cannot be checked")
+                continue
+            if index >= len(cells[leaf]):
+                errors.append(f"/proc/device-tree/soc/{leaf}/reg has {len(cells[leaf])} cells, "
+                              f"contract wants cell {index}")
+                continue
+            expected = cells[leaf][index]
+            if len(entry) == 4:
+                name = entry[3]
+                if name not in defines:
+                    errors.append(f"{relative} does not define {name}")
+                    continue
+                if defines[name] != expected:
+                    errors.append(f"{relative}:{name} is {defines[name]:#x} but this unit's "
+                                  f"/proc/device-tree/soc/{leaf}/reg cell {index} is {expected:#x}")
+                checked += 1
+                continue
+            base_name, size_name = entry[3], entry[4]
+            if base_name not in defines:
+                errors.append(f"{relative} does not define {base_name}")
+                continue
+            if size_name in DT_DERIVED_SIZES:
+                count, stride = DT_DERIVED_SIZES[size_name]
+                size = count * stride
+            elif size_name in defines:
+                size = defines[size_name]
+            else:
+                errors.append(f"{relative} does not define {size_name}")
+                continue
+            span_base, span_size = cells[leaf][index], cells[leaf][index + 1]
+            lo, hi = defines[base_name], defines[base_name] + size
+            if lo < span_base or hi > span_base + span_size:
+                errors.append(f"{relative}:{base_name} spans {lo:#x}-{hi:#x}, outside "
+                              f"/proc/device-tree/soc/{leaf}/reg span "
+                              f"{span_base:#x}-{span_base + span_size:#x}")
+            checked += 1
+    return f"{checked} addresses against {len(cells)} device-tree nodes"
+
+
 def check_inline_asm(errors: list) -> str:
     """Inline asm on this target must not use `;` as an instruction separator.
 
@@ -2364,6 +2650,7 @@ def main() -> int:
     adt_summary = check_adt(errors)
     region_summary = check_regions(errors)
     board_summary = check_board(errors)
+    dt_summary = check_device_tree_constants(errors)
     asm_summary = check_inline_asm(errors)
     tree_summary = check_tree(errors)
     for error in errors:
@@ -2371,7 +2658,7 @@ def main() -> int:
     if errors:
         return 1
     print(f"[check-clover] clover ok: ADT {adt_summary}; {region_summary}; "
-          f"board {board_summary}; {asm_summary}; {tree_summary}")
+          f"board {board_summary}; DT {dt_summary}; {asm_summary}; {tree_summary}")
     return 0
 
 

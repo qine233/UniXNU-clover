@@ -43,7 +43,14 @@
 // (gpio11), status = "ok". The register block really is 0x600 bytes; the driver maps a whole
 // 4 KiB page because IODeviceMemory::map() works at page granularity, and the same page shape is
 // what round87 proved maps on this board for the eMMC host.
-#define kQupPhys            0x00c17700ULL
+//
+// The literal is seven hex digits, not six. Round181 shipped it as 0x00c17700 -- the same six-digit
+// shape as the GCC defines below -- which is a base 0xc17700, a hundredth of the way there, and
+// lands in a region that has no QUP at all. The facts dump for this exact board
+// (facts/81ffcaaa-20261022-210928/dt/soc-reg.txt, `i2c@c177000/reg 0070170c 00060000`, little-endian
+// groups of four bytes) decodes to 0x0c177000/0x600 and is what scripts/check-clover.py's
+// check_device_tree_constants() now asserts, so this class of typo fails at build time.
+#define kQupPhys            0x0c177000ULL
 #define kQupSize            0x1000U
 #define kQupDtSize          0x600U          // what the DT declares, for the report
 #define kQupIntid           129U            // SPI 97 + 32
