@@ -53,6 +53,11 @@ void clover_emmc_run(void);
 // back and publishes it for the panic screen, so every later reset lands in fastboot. Returns at
 // once when `clover-unattended` is absent.
 void clover_unattended_begin(void);
+// Round181: drivers/CloverInput, the same schedule point and the same reason -- a device
+// repository has no IOKit personality slot, so an instrument that is not a driver still has to
+// be reached from code that is. Like the two above it, it is opt-in through its own boot
+// argument (`clover-input`) and returns without touching anything when that argument is absent.
+void clover_input_run(void);
 }
 
 // The panic screen prints these lines, so the reading survives even when the console is the
@@ -217,4 +222,9 @@ extern "C" void sheng_pmgr_run(void)
   // Only once the publication above held, so an eMMC reading and a failed PMGR step can never
   // share a photograph: CloverPMGR's own panic comes first and names its own stage.
   clover_emmc_run();
+  // Last, and after the eMMC on purpose: the touch instrument reports through IOLog, and the only
+  // way those lines leave the device is the card-backed kernel-log ring that CloverSdhci sets up.
+  // Running it before that would spend the readings on a msgbuf nobody can read. Absent
+  // `clover-input`, it returns without touching a register.
+  clover_input_run();
 }

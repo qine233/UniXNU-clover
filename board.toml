@@ -68,6 +68,7 @@ archives = [
   "build-clover-pmgr.py",
   "build-arm-driver.py CloverSdhci",
   "build-clover-block.py",
+  "build-arm-driver.py CloverInput",
 ]
 
 [kernel.prelink]
@@ -167,7 +168,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r180: the display stack stops being a stub"
+title = "clover r181: the touch bus gets its first transaction"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2176,6 +2177,26 @@ kernel_args = [
   "offline-mobile-graphics-load=1",
   "offline-legacy-register=1",
   "offline-legacy-phase=1",
+  # Round181 puts drivers/CloverInput on the bus, and mode 3 is the one worth booting for. Mode 1
+  # is a pure read (map the QUP/GCC/TLMM windows, dump them, write nothing) and stays the control;
+  # mode 2 stops after bring-up, before any SCL edge. Mode 3 then asks both candidates the smallest
+  # real read their own upstream drivers ask -- 0x8040 for Goodix (2-byte big-endian register),
+  # register 0x00 for EDT/FocalTech (1 byte) -- because a NACK to one of those means the address is
+  # empty, while a NACK to a made-up probe would mean nothing.
+  # What comes back, again through round176's tee (`clover r` needs no allowlist change):
+  #   `clover r181: declared qup=... dt_size=600 gcc=100000+94000 intid=129` -- the DT's own
+  #    geometry, printed so a reading is compared with a declaration rather than with memory;
+  #   `clover r181: goodix gt9xx @5d ACK reg0=..` plus, if it answers, the two 0x8140 reads,
+  #    their agreement count, the product-id and firmware version the vendor's gtp_get_fw_info()
+  #    would print, and sensor_id with its `valid` bit (>= 6 means "no config was sent");
+  #   `clover r181: no address ACKed; rails unproven, sda=.. scl=.. status=.. op=..` -- which is a
+  #    real answer too: it says the bus was tried, and the four words say whether SDA/SCL are even
+  #    released. Both DT touch nodes declare supplies, and this driver never touches SPMI, so a
+  #    dead panel is expected until the rails are proven; that is what the line is for.
+  # It runs last in the PMGR tail, after the eMMC, because its only way off the device is the
+  # card-backed kernel-log ring CloverSdhci sets up. It never panics: once the readings are the
+  # product, stopping the boot is losing them.
+  "clover-input=3",
 ]
 
 [payload.adt]

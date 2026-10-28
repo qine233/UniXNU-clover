@@ -13,6 +13,7 @@ Read the following before editing:
 | Hardware | [Device trees](https://unixnu.com/porting/device-tree), [matching](https://unixnu.com/drivers/device-tree-matching), `notes/clover-device-tree-sources.md`, `facts/<serial>-<stamp>/` |
 | Kernel | Selected OS profile, XNU source, [patch reference](https://unixnu.com/xnu/source-and-patches), `patches/xnu-clover/` |
 | Storage | [Bring-up](https://unixnu.com/porting/bring-up), `drivers/CloverSdhci/`, `drivers/CloverBlock/` |
+| Input | `drivers/CloverInput/InputRegs.h` (three named sources per constant; do not add an offset that is not transcribed from one of them), `drivers/CloverInput/`, `notes/clover-device-tree-sources.md` |
 | Images | [Prelink](https://unixnu.com/concepts/prelink), [payload](https://unixnu.com/concepts/payload), [UEFI firmware](https://unixnu.com/porting/uefi-firmware) |
 | Verification | [Building](https://unixnu.com/building), `scripts/check-clover.py`, `scripts/verify-clover-payload.py` |
 
@@ -108,12 +109,16 @@ documentation site renders this same record. Follow its schema and completion
 levels for both maintainer and agent work.
 
 Every porting area is present even when this board does not implement it.
-`input`, `gpu`, `network`, and `audio` are `planned`, because the
+`gpu`, `network`, and `audio` are `planned`, because the
 components sheng uses for them are SM8550-specific (MDP/DPU, Novatek touch,
 Adreno 740, ath12k, ADSP) and cannot be selected here. `display` left that list
 in round180: the original `IOMobileFramebufferLegacy` is now linked and
 constructed at phase 1, which is implementation of the class contract, not of
-the MDP5/DSI hardware behind it. `storage` is the active
+the MDP5/DSI hardware behind it. `input` left it in round181 for the same
+reason: `drivers/CloverInput` drives this board's own QUP v2 I2C-3 and asks the
+two device-tree candidates for an ACK, which is implementation of the transport
+-- no IOKit input service is published, no rail is proven, and the gpio67
+interrupt is named but never enabled. `storage` is the active
 area: `CloverSdhci` and `CloverBlock` own the eMMC path. The r170 frame showed
 the wall is still inside storage, not upstream of it: launchd does reach
 `Early boot complete` and execs real daemons, and pid 1 then dies of SIGBUS

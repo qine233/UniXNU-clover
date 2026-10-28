@@ -43,7 +43,9 @@ round176 拆掉那一轮自己的代价：两个说话人不再抢同一圈 32 �
 那一格的起点：原始 `IOMobileFramebufferLegacy` 在**本板自己的内核**里被逐槽资格化，
 类身份从注册指令推出来，不再借用别人在虚拟机里观测的那四个数。round180 接着把那一格
 从 stub 换成真代码：真的原始 Legacy 档案链接进内核，phase 1 第一次在硬件上问「这个类
-还认不认得自己、console 交到内核手里是什么几何」。
+还认不认得自己、console 交到内核手里是什么几何」。round181 开的是排期第 4 格：触摸总线上
+第一次有事务——QUP v2 I2C-3 被按上游的形状带上电，两个候选控制器各被问一次它们自己驱动
+开机必问的那一读，答案不论 ACK 还是 NACK 都从卡上的日志环里读回来。
 
 ### 已完成（都有真机读数）
 
@@ -82,6 +84,7 @@ round176 拆掉那一轮自己的代价：两个说话人不再抢同一圈 32 �
 | round179（v0.5.35） | 显示排期第一格：本板自己的内核被资格化，不再借别人的结论。`scripts/audit-clover-mobile-graphics-legacy.py` 在 `out/clover/kernel/kernel.macho` 里逐槽审计原始 `IOMobileFramebufferLegacy`——family `__TEXT_EXEC` 的 sha256 与 sheng 钉住的 `2e044ee6…` 一致（所以那六个构造函数站点是同一批指令）、vtable 262/262/358、抽象叶 `[211,213,245,246,306,307,337,338,345]`、service 相对 base 只加 `[0,1,7]`、103 处覆盖、`newUserClient` 落在 141（四参数原生 ABI）。**类身份是新的**：meta class 记录在文件里是零（装载时才填），所以身份不能读、只能推——family 文本里 `mov w3,#0x18a0` 只有一处，它前后的 ADRP/ADD 给出名字与父记录，紧挨着注册壳的那个 getter 物化记录本身。推出来 `record=0xfffffff006b35940`、`parent=0xfffffff006b31400`、`size=0x18a0`、`name=IOMobileFramebufferLegacy`，与 sheng 只能从 QEMU 里观测的四个数逐字相同，而这里一次运行都没有 | 本轮不改 shipped 字节：内核与负载哈希仍是 round178 的 `28324379…`，屏上读的仍是 r178 那三个数；`check-clover.py` 把脚本的常量与「不许把静态推断说成运行观测」当闸门，产出的 `build/display-analysis/clover-mobile-graphics-legacy-abi.json` 是 round180 生成 ABI 头与原始绑定表的输入 |
 | round180（v0.5.36） | 显示那一格不再是 stub。`scripts/build-clover-gop-legacy-display.py` 把 round179 的 ABI JSON 翻成本板自己的 `OriginalLegacyFramebufferABI.h` 与 `original-bindings.S`，编 `drivers/NativeMobileDisplay/`（板内检出，不是上游那份仍宣称 `v_display == 1` 的驱动）出真的 `NativeLegacyDisplay`/`NativeGOPPresenter` 档案；`[kernel].archives` 里 `build-clover-display-stub.py` 换成它，`CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y` 让基座构建 `-force_load` 那个 `.late.a`。档案的每条原始绑定都是 Apple family 文本里的一个地址，所以出档案前逐条重读 `out/clover/kernel/kernel.macho` 那一条指令，**一条不同就拒绝**；构造/析构走 `base + 0x1A5CC`/`base + 0x1A618`，`__mod_init_func` 被剥掉以免两个模块初始化器跑两遍。板级探针 `package/CloverLegacyDisplayProbe.cpp` 在 `_bsd_init` 里登记类、构造一个实例、`metaCast`、`init()`，说出它看到的 console 几何就收手——phase 1 不 attach 也不 start，七个仍未资格化的抽象叶一个不碰 | **已构建**，待冷刷；本轮没有一帧来自这份档案，`original_instructions_modified`/`driver_initialized`/`display_presented`/`device_observed` 四个标志都仍是 False |
 | round180 补（v0.5.37） | shipped 字节一个没动，补的是记录。上游文档闸门对每个改动文件找**所有** `paths` 认领它的区，`board.toml` 被九个区认领，而它一次只报第一个——v0.5.36 因此红在 `audio`。本地复刻同一条闸门跑通后才补满九区（`configuration` 写新开关与三条 boot arg、`packaging` 写本轮三份哈希与「`ar` 的 mtime 让 `archive_sha256` 每跑必动，对象哈希才是复现证据」、`memory` 写 boot 时多出的那个 0x18a0 实例、`power`/`network`/`firmware` 各自写清本轮没碰什么）；`AGENTS.md` 的 Porting record 一节留下这条闸门的本地跑法，并改掉「display 是 planned」这句 round180 之后就不再成立的话 | `porting-record.py check` 本地 exit 0（13 个区），`check-clover.py` 仍绿；镜像仍是 payload `b453884d…`，屏上读的仍是 r178 那三个数 |
+| round181（v0.5.38） | 排期第 4 格第一次有代码：`drivers/CloverInput` 在 QUP v2 的 BLSP1 I2C-3（`0xc177000`，DT 声明 `0x600`，映射整页）上问两个候选——Goodix `gt9xx@5d` 的 `0x8040`、EDT/FocalTech `@38` 的寄存器 `0x00` 与 `0xBB` 名字——各问它们**自己的上游驱动开机必问的那一读**，因为 NACK 只有对着真实寄存器才有意思。寄存器与位全部从三个具名来源抄（本板 DT、mainline 7.2.y `i2c-qup.c`/`gcc-sdm660.c`/`pinctrl-sdm660.c`、小米 4.19 CAF 的 `i2c-msm-v2.c`/`gt9xx_zql6019/`），唯一真分歧是位时钟字段打包，取可手推的 mainline；Goodix 复位用厂商时序与 `clover.dts` 里 `ts_int_defalut` 声明的 16 mA，身份解码按 `gtp_get_fw_info()` 的字节布局。三档 `clover-input=1/2/3`（纯读对照 / bring-up 不出 SCL 边沿 / 问地址），每趟传输头部一次 SW_RESET、FIFO 模式零 MX 计数 + `REPACK_EN`、rx tag 写进输出 FIFO，完成判据比上游更严（done 位与字节数必须同时到位，否则算超时而不是短数据）。排在 PMGR 尾部、eMMC 之后，因为读数唯一的出路是卡上的内核日志环；任何路径都不 panic | **已构建**，待冷刷；内核 `09fea490…` → 归一化交付 `2f13ca62…`（AMFI 命中点随链接布局挪到 `0x1aa80e4`/`0x1aa816c`，object 时间戳 962→966）→ payload `887043d3…`（探针 6857 字节 / 37 段）；`verify-clover-payload.py` 新增 `touch instrument linked`，显示档案闭环重审通过（193 绑定、两个 object 哈希与上一轮逐字相同） |
 
 round171 + round172 + round173 一帧问九件事：`read guard` 是否整批消失（守卫只等、
 不拒），
@@ -133,6 +136,17 @@ phase 2（等 IOSurface 根）和 phase 3（GOP nub、attach/start），因为�
 还没资格化的 backend 槽位上；`offline-legacy-validate/transfer/retire/pm` 与
 `sheng-fb-gpu` 是换手通路，屏还没开始呈现就没有换手，本轮一概没传。
 
+round181 也只问一件事：**这条总线上有没有人在应答**。读数同样全在卡上的内核日志环里，
+一次 `run-clover-unattended.sh` 就够。第一件是 `declared qup=c17700 size=1000 dt_size=600
+gcc=100000+94000 intid=129`——让读数对着 DT 的声明比，而不是对着记忆比；第二件是
+`bring-up ok fifo out=… in=… clk=…`，它出现才说明 AHB 投票、RCG 换源、分支使能和 core 出复位
+这四步都过了，`out` 为 0 则说明那次 `IO_MODE` 读回来的不是硬件自己的尺寸描述；第三件把
+「地址上没人」和「总线被拉住」切开——`xfer … NACK` 是有答案，`xfer … timeout` 才是问题。
+若两个候选都不 ACK，本轮预期如此（两个 DT 触摸节点都声明了 supplies，而驱动一次都没碰 SPMI），
+要说清这一点靠 `no address ACKed; rails unproven, sda=… scl=… status=… op=…` 那四个字：
+线被压在低电平说明有芯片卡在传输中途，那是下一格（电源轨）的证据，不是这一格（总线）的失败。
+顺序仍然是闸：bring-up 齐了才准问地址，地址 ACK 了才准谈配置下发，配置下发才准谈多点上报。
+
 ### 排期（未开始 · 已知限制）
 
 1. **共享区映射（syscall 536）** — 头字段与签名注册两段已被 round159 帧关掉，
@@ -149,7 +163,11 @@ phase 2（等 IOSurface 根）和 phase 3（GOP nub、attach/start），因为�
    phase 2（IOSurface 根）、phase 3（GOP nub、attach/start）、phase 4（presenter 换手），
    每一格都要上一格的读数才准放开。MDP5/DSI 的硬件通路仍未开始；Adreno 512 无驱动，
    没有 iOS 显示栈。
-4. **输入** — 触摸（`edt-ft5406` / focaltech `fts`）没有驱动。
+4. **输入** — 触摸（`edt-ft5406` / focaltech `fts` / `gt9xx`）没有能上报的驱动。
+   round181 起 `drivers/CloverInput` 已经在总线上问地址（QUP v2 I2C-3 的 bring-up、
+   Goodix 复位时序、两个候选各自的第一读），但它止步于此：电源轨（SPMI/PMI632）未证、
+   触摸中断（gpio67，DT 声明 INTID 129）未接、上报协议未解。下一格取决于这一帧的答案是
+   ACK 还是 `no address ACKed`。
 5. **网络、音频、USB** — WCN3990 WiFi/蓝牙、WCD 音频、USB device 模式都没有。
 6. **电源管理** — 除 AMFI 需要的那颗 nub 外，充电、电池、PMIC 都没有真驱动。
 7. **eMMC 数据通路已上 DMA，速度还没量到** — 读的那条 ADMA2 在 round172 镜像里，

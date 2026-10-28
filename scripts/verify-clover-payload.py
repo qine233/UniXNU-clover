@@ -483,6 +483,34 @@ LEGACY_DISPLAY = (("legacy boot args", "offline-legacy-transfer"),
                   ("IOSurface root reading", "late: IOSurface load=%d root found=%u"))
 
 
+# Round181's instrument is the other half of the board's input story, and it is linked the same way
+# the two block drivers are -- a plain archive path in CONFIG_XNU_EXTRA_LD_ARCHIVES, kept alive only
+# because CloverPMGR calls clover_input_run(). A payload built before the archive was added, or after
+# the boot arg was dropped, still prints "clover r181" in the menu title, so the strings below are the
+# evidence. Each one is a line the driver can only emit by driving the bus: the divisor word is what it
+# writes to I2C_CLK_CTL, the declared-geometry line is the device tree's own numbers, and the two
+# candidate readings are the smallest real read each upstream driver asks.
+CLOVER_INPUT = (("input round stamp", "clover r181:"),
+                ("400 kHz divisor", "bring-up ok fifo out=%u in=%u clk=%08x"),
+                ("declared geometry", "declared qup=%llx size=%u dt_size=%u gcc=%llx+%u intid=%u"),
+                ("goodix candidate", "goodix gt9xx @5d"),
+                ("focaltech candidate", "edt/focaltech @38"),
+                ("no-answer reading", "no address ACKed; rails unproven, sda=%08x scl=%08x status=%08x op=%08x"))
+
+
+def check_clover_input(kernel: bytes) -> bool:
+    """Round181 puts a QUP v2 I2C instrument in the kernel. It is a plain archive, so nothing about
+    the link fails when it is absent -- the bus simply never gets driven, on a board whose only
+    output is a reading."""
+    label = "kernel.macho: touch instrument linked"
+    found = {name: needle.encode() in kernel for name, needle in CLOVER_INPUT}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -880,6 +908,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_unattended(kernel)
         ok &= check_inline_asm_tails(kernel)
         ok &= check_legacy_display(kernel)
+        ok &= check_clover_input(kernel)
     return 0 if ok else 1
 
 

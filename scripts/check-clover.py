@@ -558,6 +558,39 @@ def check_board(errors: list) -> str:
             errors.append("[kernel] archives builds CloverBlock but kernel_args does not select "
                           "clover-emmc=21, the only mode that publishes the block device")
 
+        # round181, the touch instrument. Same three halves, same failure shape: libCloverInput.a is
+        # a plain archive path in the defconfig, kept alive only because CloverPMGR's
+        # sheng_pmgr_run() calls clover_input_run() -- and that call does nothing at all unless a
+        # clover-input= argument reaches it. Drop any half and the bus is never driven, while the
+        # menu, the archives and the defconfig all still claim it was.
+        input_builder = any("CloverInput" in entry for entry in board["kernel"]["archives"])
+        input_arg = any(argument.startswith("clover-input=")
+                        for argument in board["payload"]["kernel_args"])
+        if "libCloverInput.a" in text and not input_builder:
+            errors.append("the defconfig links libCloverInput.a but [kernel] archives omits "
+                          "build-arm-driver.py CloverInput, so that archive does not exist")
+        if input_builder and "libCloverInput.a" not in text:
+            errors.append("[kernel] archives builds CloverInput but the defconfig does not link "
+                          "libCloverInput.a, so clover_input_run() is undefined")
+        if input_builder and not input_arg:
+            errors.append("[kernel] archives builds CloverInput but no clover-input= boot arg reaches "
+                          "it: clover_input_run() returns without mapping a single window")
+        if input_arg and not input_builder:
+            errors.append("kernel_args passes clover-input= but [kernel] archives does not build "
+                          "CloverInput, so the arg is noise")
+        if input_builder and flags.get("SHENG_PMGR", "n") not in ("y", "1"):
+            errors.append("CloverInput is scheduled from sheng_pmgr_run(), which CONFIG_XNU_SHENG_PMGR="
+                          f"{flags.get('SHENG_PMGR', 'n')} does not compile into the kernel")
+        # The instrument reads its own readings off the card, so it has to run after the eMMC driver
+        # that creates that ring. Order in board.toml is not the evidence -- the call site in
+        # CloverPMGR is -- but an argument that selects a mode the driver refuses is.
+        if input_arg:
+            mode = [argument.split("=", 1)[1] for argument in board["payload"]["kernel_args"]
+                    if argument.startswith("clover-input=")]
+            if any(value not in ("1", "2", "3") for value in mode):
+                errors.append(f"clover-input={mode} names a mode CloverInput does not implement "
+                              "(1 dump, 2 bring-up, 3 probe); it would report and return")
+
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
     if cores != CPU_REGS:
@@ -1037,6 +1070,46 @@ def check_board(errors: list) -> str:
             errors.append("CloverBlock lost the per-block fallback: a second caller would have "
                           "no staging buffer and the request would fail")
 
+    # Round181, drivers/CloverInput. What is asserted here is the shape of the QUP v2 transaction,
+    # because every one of these is invisible on a bus that happens to work and fatal on one that
+    # does not: rx tags go out through the OUTPUT FIFO (i2c-qup.c:1305-1312, called from 1426), so a
+    # read that wrote them to MX_INPUT_CNT would time out with the FIFO empty; a tag length of 0
+    # means 256, not nothing (:607), so an "address ping" is not expressible and the smallest real
+    # read is what the probe asks for instead; SW_RESET has to precede every transfer (:1584) or the
+    # done flags from the previous one are still set; and after the first sub-transfer the counters
+    # are reprogrammed while RUNNING only through BIT(31). They are source-shape assertions because
+    # a driver that loses one still compiles.
+    touch = REPO / "drivers/CloverInput/CloverInput.cpp"
+    if not touch.is_file():
+        errors.append("drivers/CloverInput/CloverInput.cpp is missing: the touch instrument, and "
+                      "with it the only reading of blsp_i2c3, would not exist")
+    else:
+        text = touch.read_text()
+        missing = [needle for needle in
+                   ("qupWrite (kQupSwReset, 1);",
+                    "clover_input_observation[15] = kStepResetCore",
+                    "qupWrite (kQupI2cClkCtl, kQupI2cClk400k);",
+                    "uint8_t tags[kQupMaxTagsLen]",
+                    "(address << 1) | 1",
+                    "kQupTagV2DataRdStop",
+                    "return finishTransfer ();",
+                    "extern \"C\" void clover_input_run (void)",
+                    "PE_parse_boot_argn (\"clover-input\"",
+                    "clover_emmc_flush_cache ();")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"drivers/CloverInput/CloverInput.cpp lacks {needle!r}: the QUP v2 "
+                          "transaction it describes would not be the one upstream sends")
+        # A 0-length v2 data tag is 256 bytes, not an empty write, so the driver must not offer a
+        # bare address ping. Same for writing rx tags into the input counter, which is the shape a
+        # reader of the register names would naturally produce.
+        if "chipWriteOnly" in text:
+            errors.append("CloverInput has a write-only transaction again: a v2 tag length of 0 "
+                          "encodes 256, so there is no such thing as a zero-length probe")
+        if "kQupMxInputCnt, txLen" in text or "qupWrite (kQupMxOutputCnt, rxLen" in text:
+            errors.append("CloverInput puts a tag vector in the wrong FIFO: both counter registers "
+                          "are written from the output side, and only MX_READ_CNT adds rx_tag_len")
+
     # Round157. r156 made the card fast but left four ways for the fast path to report
     # something that was not true: a stop command whose failure was invisible, DATA_END
     # accepted next to a CRC/timeout bit, a 32-bit word offset that wraps past 16 GiB, and
@@ -1220,11 +1293,23 @@ def check_board(errors: list) -> str:
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
-    # Round178 introduced the rule; round180 keeps it. The menu has to name the round under test: the
-    # payload and its readings have to agree about which round is on the card, or an image would be
-    # claiming a round it does not run.
-    if not board["payload"]["title"].startswith("clover r180:"):
-        errors.append('[payload] title is not "clover r180: ...": the menu would not name this round')
+    # Round178 introduced the rule; each round since keeps it. The menu has to name the round under
+    # test: the payload and its readings have to agree about which round is on the card, or an image
+    # would be claiming a round it does not run. The drivers keep their own stamps -- the display
+    # probe still says r180, and drivers/CloverInput says r181 -- because the tee on the card filters
+    # the shared "clover r" prefix, not a round number.
+    if not board["payload"]["title"].startswith("clover r181:"):
+        errors.append('[payload] title is not "clover r181: ...": the menu would not name this round')
+    # The instrument's readings only leave the device if the card-backed ring exists, so the order of
+    # the three tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
+    pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
+    unattended = pmgr_source.find("clover_unattended_begin();")
+    emmc = pmgr_source.find("clover_emmc_run();")
+    touch = pmgr_source.find("clover_input_run();")
+    if not (0 <= unattended < emmc < touch):
+        errors.append("drivers/CloverPMGR/CloverPMGR.cpp does not call unattended_begin(), then "
+                      "emmc_run(), then input_run(): the touch report would precede the ring that "
+                      "carries it off the device")
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes

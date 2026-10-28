@@ -13218,3 +13218,145 @@ porting record: board.toml: update audio findings or evidence with this change
 
 同一段还顺手改了一处过期陈述：`display` 早已不在 `planned` 那串里，round180 之后它是
 `implemented` —— 结掉的是原始 Legacy 类的契约，不是它背后的 MDP5/DSI 硬件。
+
+## round181（v0.5.38）：触摸总线上的第一次事务
+
+### 这一轮问什么
+
+排期第 4 格（输入）第一次有代码。不问「触摸能用吗」，只问一件更小的事：**这条 I2C 总线上
+有没有人在应答**。板上的两个候选各被问一次它们自己的上游驱动开机必问的那一读，因为
+一个 NACK 只有对着真实寄存器才有意思——对着一个编出来的探针，NACK 什么也不说。
+
+### 硬件事实怎么钉的（三源，逐条具名）
+
+`drivers/CloverInput/InputRegs.h` 里每个偏移、每个位都从具名文件抄来，不靠记忆，三个来源：
+
+- **DT** = 平板自己的 `/proc/device-tree`，即 `~/uefi-clover/Resources/DTBs/clover.dts`。
+  用到的节点：`i2c@c177000`（11766 行）与它的两个孩子 `focaltech@38`、`gt9xx@5d`，
+  `i2c_3_active`/`i2c_3_sleep`（9643 行），触摸 pinctrl 下的 `ts_mux` 状态（11458 行）。
+- **MAIN** = `sdm660-mainline/linux @ dd1ed52c…`（board.toml 的 `clover-mainline-dts`）。
+  这棵树被证明真的驱动这块平板的显示与触摸，所以**读数以它的编码来解释**：
+  `gcc-sdm660.c`、`pinctrl-sdm660.c`、`i2c-qup.c`、`clk-rcg2.c`、`clk-branch.c`、`edt-ft5x06.c`。
+- **VEND** = 小米自己的 4.19 CAF 树 `E7G/clover-sdm660-ksb @ 5c81a3fa…`：
+  `i2c-msm-v2.c`、装入的 Goodix 驱动 `drivers/input/touchscreen/gt9xx_zql6019/`（按面板控制器
+  变体命名）、它的 `edt-ft5x06.c` 与 `pinctrl-sdm660.c`。
+
+MAIN 与 VEND 只在一处真的对不上：**I2C 位时钟字段的打包**。而 vendor 树自己的
+`i2c-msm-v2.c`、它的 dt-bindings 头和 4.19 clk 驱动在三处互不一致，所以取 MAIN——它的算术
+可以在主机上手推。分歧写在常量旁边，不做和稀泥处理。
+
+DT 声明与驱动实际用的形状之间那道缝，本轮由读数自己说：QUP 寄存器块真实只有 `0x600`，
+驱动映射整页 4 KiB，因为 `IODeviceMemory::map()` 的粒度就是页，而这个页形状是 round87 在
+这块板上验证过的；GCC 需要的三个寄存器相隔 0x3b000，DT 把整个节点写成
+`<0x100000 0x94000>` 一段，驱动仍拆成三个页对齐窗口，而不是伸手要 600 KiB。中断号
+SPI 97 ⇒ INTID 129 具名报出，但一次都没用——这里每趟传输都是轮询。
+
+### 驱动形状
+
+`drivers/CloverInput/CloverInput.cpp`，约 1010 行、37 条 `clover r181:` 读数。三档，
+`clover-input=` 选：1 = 纯读（映射 QUP/GCC/TLMM 三扇窗口，dump，一字不写，作为对照）；
+2 = 到 bring-up 为止，SCL 一个边沿都不出；3 = 真的问地址。boot arg 缺失就原样返回，
+**任何路径都不 panic**：读数是产品本身，停下就是失去它。
+
+上电次序按上游的形状来：`voteAhb()`（`0x117004` 的 AHB 投票，halt 卡住就报 `ahb halt stuck`）
+→ `programRcg()`（`0x11d008`/`0x11d020`/`0x11d024`，GCC 宏 `GCC_REG_OFFSET(reg) = 0x100000+reg`
+逐字对上 DT 的 `clock-controller@100000`）→ `enableBranch()` → `programI2cPins()`（gpio10/11
+切到 BLSP I2C 功能，DT `qcom,i2c-dat = <0xe8 0x0a 0x00>` / `qcom,i2c-clk = <0xe8 0x0b 0x00>`）
+→ `bringUpCore()`（每趟传输头部一次 SW_RESET，这是 `i2c-qup.c` 自己的做法，也顺手抹掉上一趟
+的陈旧 done 位；然后轮询 master-gen 且要求 `STATE_VALID`）。轮询一律是有限自旋 65536 次，
+不用 `udelay`——这个执行上下文里没有可靠的延时原语。
+
+传输体按 FIFO 模式：out/in FIFO 尺寸从块自己的字段读出来，`IO_MODE = QUP_REPACK_EN`，
+MX 计数器为零；tx tag 写 `{START, addr<<1, DATAWR|DATAWR_STOP, len}`，rx tag 写
+`{START, (addr<<1)|1, DATARD…STOP, len}`，而 **rx tag 落在输出 FIFO** 里——这两处形状都在
+`i2c-qup.c` 里逐字核过。读端 `drainRx` 自己拼字、自己数剩余 tag 长度；完成判据比上游 FIFO
+路径更严：done 位**和**字节数必须同时到位，`got == rxLen && sent == txLen`，否则算超时，
+不能把一段提前结束的短数据当成真数据交出去。位时钟取 MAIN 的 `0x00000315`（400 kHz），
+vendor 的 `0x000e001c` 只作为分歧留在头文件里。
+
+Goodix 那次复位用厂商自己的时序（`gt9xx.c:532-561`：T2 20 ms、T3 2 ms、T4 6 ms，再 50 ms
+int-sync），gpio66 拉复位、gpio67 交回输入。驱动强度不猜：`clover.dts` 的 `ts_int_defalut`
+状态把 gpio67 写成 16 mA，照抄。身份解码按厂商 `gtp_get_fw_info()`（1222-1258）——它读 8 字节，
+答案落在 buf[2..7]，本驱动的数据因此是 [0..5]；产品 ID 长度看首字节（`first[3] ? 4 : 3`），
+版本是 `(first[5] << 8) | first[4]`，`sensor_id >= 0x06` 意思是「配置没送下去」。EDT 那边问
+寄存器 0x00 与 0xBB 的 22 字节名字，M06/M12 的猜测按 `edt-ft5x06.c` 的形状分档。
+
+### 接线
+
+设备仓库没有 IOKit personality 槽，所以照 PMGR/eMMC 的老办法导出 C 入口
+`clover_input_run()`，排在 `sheng_pmgr_run()` 的**最后、eMMC 之后**：它的读数只有一条路离开
+设备——CloverSdhci 建的卡上内核日志环（kind 22）。tee 的白名单本来就有 `clover r`，本轮没为
+它加任何条目，也不需要加：前缀是共享的，各驱动的轮次戳允许不同（显示探针仍是 `clover r180:`）。
+`scripts/build-arm-driver.py` 的 choices 加 `CloverInput`，输出目录 `build/clover-input`；
+不给 `-mgeneral-regs-only`（那是 CloverSdhci 的 panic 屏路径专用的约束），不给额外 `-I`
+（`#include "InputRegs.h"` 在源码旁边就解析）。`configs/clover_defconfig` 的
+`CONFIG_XNU_EXTRA_LD_ARCHIVES` 变成三份档案，`board.toml` 的 `[kernel].archives` 加一行、
+`kernel_args` 末尾加 `"clover-input=3"`。
+
+### 本轮踩到的两处坑
+
+1. **符号链接不是目录。** 组装树里 `drivers/*` 全是指向设备/基座仓库的符号链接。我先前为编译
+   试跑把驱动 `cp -R` 进 `out/clover/tree/drivers/CloverInput`，留下一个真目录；下一次内核构建
+   在重链时 `PermissionError: Operation not permitted`，而且那趟中止还删掉了别的驱动符号链接。
+   删掉拷贝目录、重跑，组装器把所有链接重建回来。规则：**永远不要在组装树里放实物**。
+2. **补丁重放顺序。** 每次内核构建前要在 `.cache/xnu-work` 反向应用
+   `zzy-clover-dyld-cache-skip.patch`，否则 `native-4k-signature-hash-cache.patch` 正向、反向
+   都过不了。本轮第二次构建就是忘了这一步才报错，第三次补上才干净。
+
+### 显示档案的闭环（本轮顺手结掉的一个方法论缺口）
+
+AGENTS.md 记着：显示档案排在链接**之前**构建，所以同一次运行里它审计的是上一轮的内核。本轮
+链接完成后在树内重跑 `scripts/build-clover-gop-legacy-display.py`，拿到
+`kernel_sha256 = 09fea490…`——正是本轮内核——而 `compiled_object_sha256 = 1b6c134e…`、
+`late_object_sha256 = a061787e…` 与上一轮逐字相同，193 条原始绑定一条没动。这才是「链进去的
+档案确实被同一个内核审计过」的证据；`archive_sha256` 不能当证据，`ar` 的 mtime 让它每跑必动。
+
+### 契约与产物
+
+`check-clover.py` 新增三节：档案/defconfig/boot arg/`SHENG_PMGR` 四者一致（mode 必须是 1/2/3）；
+驱动源码形状的正反钉子（正：`qupWrite (kQupSwReset, 1);`、`kStepResetCore`、
+`qupWrite (kQupI2cClkCtl, kQupI2cClk400k);`、`uint8_t tags[kQupMaxTagsLen]`、
+`(address << 1) | 1`、`kQupTagV2DataRdStop`、`return finishTransfer ();`、
+`PE_parse_boot_argn ("clover-input"`、`clover_emmc_flush_cache ();`；反：纯写路径
+`chipWriteOnly` 必须缺席，FIFO 模式下不许写 `kQupMxInputCnt, txLen` 或
+`kQupMxOutputCnt, rxLen`）；标题必须是 `clover r181:`，并断言 PMGR 尾部三个调用的**先后位置**。
+`verify-clover-payload.py` 新增 `kernel.macho: touch instrument linked`，钉轮次戳、400 kHz 分频、
+声明几何行、两个候选名、以及那句诚实的失败读数。
+
+产物：本轮内核 `09fea490076491072add0645793ce026e1e66c6394282a0ccce57f45a7a44978`（13/13 档案，
+CloverInput 是最后一个）；AMFI 两处命中的 file 偏移从 round177 的 `0x1a880e4` 挪到
+**`0x1aa80e4`/`0x1aa816c`**（链接布局移动，两处字照旧 `0x34000229 -> 0x14000011`、
+`0x36000520 -> 0xD503201F`），归一化后交付内核 `2f13ca628598be118edf16969ffbd255b10f94ba19f65382b946ef8a1e5d8bf3`，
+object 时间戳从 962 个变成 **966** 个（新增档案带来的符号）；payload `887043d3bb44d99e0cc1521adacd4dbeb136426c0e1e7b26861e9196e96b1825`
+（56 MiB 容器，卷内内核 `21210bc5…`，入口探针 **6857 字节 / 37 段**，另有 3877 处位于可执行文本
+之外被忽略）。`check-clover.py`、`normalize-kernel-macho.py --selftest`、
+`check-cs-blob-structure.py --selftest`、`read-clover-log.py --selftest`、
+`verify-clover-payload.py` 全绿（27 项）。
+
+写入只有一个分区，cache：
+
+```sh
+fastboot flash cache /Users/zhouzhou/clover-out/round181-payload.img
+fastboot reboot
+```
+
+### 这一帧问什么
+
+全部读数都在卡上的内核日志环里（kind 22），一次 `run-clover-unattended.sh` 就够，不需要照片：
+
+1. `clover r181: declared qup=c17700 size=1000 dt_size=600 gcc=100000+94000 intid=129`。
+   这一行的用处是让读数对着**声明**比，而不是对着记忆比。
+2. `bring-up ok fifo out=%u in=%u clk=%08x` 是否出现。出现即：AHB 投票成了、RCG 换了、分支
+   开了、core 从复位里出来了；`out` 为 0 意味着那次 `IO_MODE` 读回来的不是硬件自己的尺寸描述。
+3. 有没有任何 `xfer … ok` / `xfer … NACK` / `xfer … timeout`。**NACK 是有答案**，超时才是
+   问题——它把「地址上没人」和「总线被拉住」切开。
+4. `goodix gt9xx @5d ACK reg0=…` 之后有没有 `goodix agree=%u/6 pid=… ver=%04x` 与
+   `goodix sensor_id=%02x valid=%u`；两次 0x8140 读的 `agree` 不满 6 就说明读回来的不是同一份。
+5. 若四问皆空：`no address ACKed; rails unproven, sda=… scl=… status=… op=…` 这四个字。
+   这是本轮预期里的答案——两个 DT 触摸节点都声明了 supplies，而本驱动一次都没碰 SPMI，所以
+    rail 未证、屏不亮是**正常**。要读的是 `sda`/`scl` 是否被拉低：线被压在低电平，说明有芯片
+   卡在传输中途，那是下一格（电源轨）的证据，不是这一格（总线）的失败。
+
+判据是顺序的：bring-up 齐了才准问地址，地址有人 ACK 才准谈配置下发，配置下发才准谈多点上报。
+本轮止步于第一、二问之间。它也不修任何已经存在的格子——显示 phase 2/3/4、536 共享区、完整
+`/data` 仍然按原顺序排着。
