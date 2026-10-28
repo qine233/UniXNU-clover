@@ -103,10 +103,12 @@ round171 + round172 + round173 一帧问九件事：`read guard` 是否整批消
 `first dma write … ms=`。前五件成立，launchd 的页才继续映射得进来；后四件给出
 536 与 `/data` 之前是否要先重排吞吐这一格的答案。
 
-round174 之后，这九件事不再取决于照片：`run-clover-unattended.sh` 一次拉 logfs 的
+round174 之后，这九件事**可以**不再取决于照片：`run-clover-unattended.sh` 一次拉 logfs 的
 1216 个扇区（round176 起两圈相接要这么多），`read-clover-log.py --verdict` 按先后
 打印驱动环里的判据。同一次冷刷里，panic 尾巴（前 32 扇区）、驱动判据（第 64 扇区
-起）和内核日志（第 192 扇区起）来自同一条启动，读的是同一张卡。
+起）和内核日志（第 192 扇区起）来自同一条启动，读的是同一张卡。写这一侧每一帧都在真的
+落卡；**读这一侧到 round184 为止还没在这台主机上证过一次**（见上面「读数通道」那条限制），
+所以本轮把它当成一等目标，而不是当成已经完成的事。
 
 round175 之后，环里不再只有驱动自己的话。dyld 的 `shared_region` 探针、r170 那对
 `exec`/`exit`、APFS 的 jhash 与 ntree 错、`load code signature error 4`、launchd
@@ -420,9 +422,10 @@ fastboot reboot
 - **`clover rNNN:` 内核 printf 探针**：每轮换号，`verify-clover-payload.py`
   断言新号在、旧号的复读形态不在。
 - **logfs**：`scripts/read-clover-log.py` 把内核环形缓冲拉回宿主。
-- **verdict 环**（round174 起）：同一张卡的 logfs 第 64 扇区起是 32 槽 kind-21 环，
-  驱动每句判据都落一份；头字段第 8 个字的序号让转圈的环仍按先后读，`--verdict`
-  打印，环满覆盖最旧一条并计数。屏会滚，卡不会。
+- **verdict 环**（round174 起）：同一张卡的 logfs 第 64 扇区起是 kind-21 环（round176
+  起 64 槽，每槽两个 512 字节块），驱动每句判据都落一份；头字段第 8 个字的序号让转圈的
+  环仍按先后读，`--verdict` 打印，环满覆盖最旧一条并计数。屏会滚，卡不会——而且 round183
+  那一帧证明屏连滚都不会：它是一台画满就停的打印机。
 - **环里的内核日志**（round175 起）：同一个环有两种来源。驱动在每个握着块守卫的
   尾巴上按字节游标读 `msgbufp`，白名单命中的行（dyld 探针、`exec`/`exit`、APFS 错、
   `load code signature error`、launchd、panic）照 kind-21 落卡，**不回声给 `IOLog`**。
@@ -431,7 +434,13 @@ fastboot reboot
 - **地址翻译**：`scripts/decode-clover-address.py --suspects` 出本镜像的
   tty/console 区间表。
 - **无人值守**：`clover-unattended=N` 的墙钟死线，把 panic 写进 IMEM
-  `0x77665501` 再 PSCI 复位（当前 shipped 的 boot-arg 不带它）。
+  `0x77665501` 再 PSCI 复位（round184 起 shipped 的 boot-arg 带它，`N = 300`）。
+  宿主侧 `scripts/run-clover-unattended.sh` 接住回 fastboot 的板子、进 recovery、一次
+  `dd` 拉回 1216 个扇区；刷完新 payload 要读它自己那一帧的话加 `--boot-after-flash`，
+  否则拉回来的是刷之前那次引导的日志。**诚实的限制**：这条通道到目前为止只有驱动侧
+  一半被证过——宿主上留下的三次运行日志（`~/clover-out/unattended-run*.log`）都停在
+  `waiting for fastboot` 那一行，这台主机上也没有任何一次成功的 `clover-logfs.bin`，
+  所以迄今所有「卡上的读数」其实都还是照片，写进去是真的、读回来还没证过。
 
 ## 相关文档
 

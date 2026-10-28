@@ -15,7 +15,11 @@
 # This script does the host half, in order:
 #   1. wait for the tablet to appear in fastboot (it returns there by itself);
 #   2. --flash-cache IMG optionally cold-flashes the payload to the cache partition
-#      (a declared eMMC write, off unless asked for);
+#      (a declared eMMC write, off unless asked for). With --boot-after-flash it
+#      then reboots normally, so the firmware boots that payload from the partition
+#      and the deadline brings the board back to fastboot on its own; without it the
+#      card is read as it stands, which is the *previous* boot's logfs, not the one
+#      just written;
 #   3. ask the bootloader for recovery; this may write the boot command into the
 #      misc partition (BCB), which is why it needs --allow-misc-bcb;
 #   4. wait for TWRP's adb, dump the first 1216 sectors of logfs through /dev/block,
@@ -28,7 +32,8 @@
 # host-supplied image.
 #
 # Exit codes: 0 records decoded, 1 dump saved but no records, 2 no fastboot, 3
-# consent missing, 4 recovery reboot refused, 5 no adb in recovery.
+# consent missing, 4 recovery reboot refused, 5 no adb in recovery, 6 the flashed
+# payload never came back to fastboot.
 
 set -u
 
@@ -38,6 +43,7 @@ OUT="$HOME/clover-out/clover-logfs.bin"
 FLASH_CACHE=""
 ALLOW_BCB=0
 SKIP_RECOVERY=0
+BOOT_AFTER_FLASH=0
 REBOOT_BOOTLOADER=0
 DECODE=1
 
@@ -55,6 +61,9 @@ Options:
   --out PATH             dump file (default ~/clover-out/clover-logfs.bin)
   --flash-cache IMG      cold-flash IMG to the cache partition before recovery;
                          this is an eMMC write and is printed before it runs
+  --boot-after-flash     after flashing, reboot normally and wait for the board to
+                         come back to fastboot by itself, so the log window read in
+                         step 4 is the one this payload wrote
   --allow-misc-bcb       consent to the misc-partition BCB write that
                          `fastboot reboot recovery` may perform
   --skip-recovery        the tablet is already in TWRP; just dump and decode
@@ -70,6 +79,7 @@ while [ $# -gt 0 ]; do
     --adb-wait) ADB_WAIT=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     --flash-cache) FLASH_CACHE=$2; shift 2 ;;
+    --boot-after-flash) BOOT_AFTER_FLASH=1; shift ;;
     --allow-misc-bcb) ALLOW_BCB=1; shift ;;
     --skip-recovery) SKIP_RECOVERY=1; shift ;;
     --reboot-bootloader) REBOOT_BOOTLOADER=1; shift ;;
@@ -136,6 +146,14 @@ if [ "$SKIP_RECOVERY" = 0 ] && [ -n "$FLASH_CACHE" ]; then
   wait_fastboot || die 2 "no fastboot; nothing was flashed"
   say "declared eMMC write: fastboot flash cache $FLASH_CACHE ($(wc -c < "$FLASH_CACHE" | tr -d ' ') bytes into the cache partition only)"
   fastboot flash cache "$FLASH_CACHE" || die 2 "fastboot flash cache failed"
+  if [ "$BOOT_AFTER_FLASH" = 1 ]; then
+    say "booting the payload just written: fastboot reboot (the firmware enters XNU after its 3 s default)"
+    fastboot reboot >/dev/null 2>&1 || die 2 "fastboot reboot failed"
+    wait_fastboot || die 6 "the board did not come back to fastboot within ${WAIT}s: either the unattended deadline did not fire or its reset does not reach this host"
+    say "the board returned to fastboot by itself, so the deadline fired"
+  else
+    warn "the card still holds the boot that ran BEFORE this flash; pass --boot-after-flash to read the payload just written"
+  fi
 fi
 
 if [ "$SKIP_RECOVERY" = 0 ]; then

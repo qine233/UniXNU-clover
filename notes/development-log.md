@@ -13981,3 +13981,34 @@ fastboot reboot
    如果说过，它现在应该在卡上而不是屏外。
 3. `CloverSdhci r184: panic drain wrote=… dropped=… tee_passes=…` 自己：`wrote=0` 且
    `dropped>0` 是排干了但卡拒收，`wrote` 正常而 `dropped>0` 是 48 条上限不够本轮用。
+
+## round184 刷写测试（2026-10-29）：第一次尝试没测到死线，因为宿主脚本少了一步
+
+刷写本身成功：
+
+```
+[unattended] declared eMMC write: fastboot flash cache /Users/zhouzhou/clover-out/round184-payload.img (58720256 bytes into the cache partition only)
+Sending 'cache' (57344 KB)                         OKAY [  1.328s]
+Writing 'cache'                                    OKAY [  0.416s]
+[unattended] declared eMMC write: bootloader writes the recovery boot command into misc (BCB)
+[unattended] waiting up to 180s for recovery adb
+[unattended] no adb in recovery after 180s
+```
+
+这一跑**没有**读到本轮要读的东西，原因在宿主脚本而不是板子上：`--flash-cache` 之后它直接
+`fastboot reboot recovery`，所以刚刷进去的那份 payload 根本没被引导过——就算 recovery 的 adb
+起来了，`dd` 拉回来的也是**上一次引导**留在卡上的 logfs（也就是 round183 那一帧的），而不是
+round184 的。round147 写这个脚本的时候手里还没有「刷进去的东西要先自己跑一遍再回 fastboot」
+这条路，因为那时死线还在、刷完就得读数；本轮把它变成契约的一半，脚本却没跟上。
+
+补的是 `--boot-after-flash`：刷完 → `fastboot reboot`（固件 3 秒默认进 XNU）→ 等板子**自己**回
+fastboot。等不到就以 exit 6 结束，话里说清两种可能（死线没响，或它触发的复位到这个主机不可见）。
+不带这个开关时脚本现在会先 `warn` 一句「卡上还是刷之前那次引导的」，避免下一次又读到旧帧。
+
+第二个观察也记在这里，因为它决定了本轮真正的产出是什么：脚本死掉之后，这台 Mac 的 USB 拓扑里
+**完全看不到平板**——`fastboot devices` 空、`adb devices` 空、`ioreg -p IOUSB` 里只有麦克风、
+耳机、接收器和几个 hub。也就是说这次尝试连「进 recovery」这一步是否真的发生都无法从主机侧证实，
+更不用说读屏。这台主机上留下的三份运行日志（`~/clover-out/unattended-run*.log`，
+round147 时期）都停在 `waiting up to 900s for fastboot` 那一行，`~/clover-out/` 里也没有
+任何一份 `clover-logfs.bin`，所以「卡是读数的地方」这件事到目前为止只有驱动侧的一半是真的，
+宿主侧那一半（recovery 里 `dd`）在这台主机上还没被任何一次运行证明过。
