@@ -14130,5 +14130,29 @@ shipped 的 mode 21 不碰。
 
 ### 读数
 
-**尚未上机。** 这一轮唯一的新判据是 `CloverSdhci r185: log window armed …` 那行到底出不出现、
-`first=` 是不是 13320216；它出现而卡上仍没有记录，和它根本没出现，是两个不同的答案。
+**已上机（2026-10-29 第三次冷刷，logdump 窗口读回 622592 字节）。** 三个问题各有答案：
+
+1. **环上膛了。** kind-21 环 slot 0（lba 13320280，seq 0）就是那行原文：
+   `CloverSdhci r185: log window armed from GPT first=13320216 sectors=131072 report=13320216 driver=13320280 kernel=13320408`——
+   五个数值与设计逐项一致。round174 以来的自锁第一次解开，卡上第一次真正持有我们的记录：
+   verdict 环 17 条（r159 链路、r167 readcheck `diff=0/0 trusted=1`、r172 dmacheck
+   `got=1024 kbs=2000/0 trusted=1`、r173 wrcheck `control=1 dma=1 diff=0/0 trusted=1`、
+   r174/r175/r176 的上膛行、tee 两笔 census、首 DMA 读写在 15795488/34124296），
+   内核环 352 条连续无缺。
+2. **panic 报告窗是空的。** 前 32 块没有任何 kind-20 记录。屏上那个 userspace panic
+   （`boot task failure: … - required boot task executable not found`）没有走到卡上——
+   `clover_emmc_panic_append` 是内核 panic 的出口，boot task 失败走的是另一条路，
+   或者发生在捕获窗之后。这是个诚实记下的盲区，不是这一轮的失败。
+3. **launchd 走得比想象的深。** 内核环是 8.66s → 34.28s 的连续时间线：根卷、
+   SystemCryptex、OwnerData 全部挂载；`exec pid=1 comm=launchd`；dyld 共享缓存
+   `map2 <- err=0`（r155 全段 fsig 读 `err=0`）；然后真正的早期守护进程在跑——
+   fsck(0)、mount(0)、seputil(0)、mobile_obliterator(0)、apfs_boot_util(0)、
+   MSUEarlyBootTask(0)、cc_fips_test(0) 全部退出正常，**keybagd 例外：
+   `exit pid=11 rv=0x4700`**；日志停在 34.28s，pid=12 usermanagerd 的 exec 中途
+   （`open /System/Library/Caches/com.apple.dyld`）。屏上照片里那个被拍花的名字不可信，
+   但时间线把下一轮的问题收窄成两件：主机侧把卷里 staged 的 boot-task 可执行文件与
+   launchd 的清单对一遍、找出缺的那个；keybagd 的 0x4700 到底卡在哪一步。
+
+另记一笔 tee 竞态痕迹：keybagd 退出行被叠了一笔 `(1) syscall-unix 55`（slot 349），
+`(apply-protobox)`（slot 347）同源——tee 从 msgbuf 拷贝时内核还在写同一行。判读不受影响，
+但这说明 tee 的行边界在并发下并不原子。
