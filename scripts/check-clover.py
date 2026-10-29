@@ -1521,8 +1521,8 @@ def check_board(errors: list) -> str:
     # block driver, which carries its own r190 stamps and also leaves the arming lines alone.
     # Round191 splits that bracket into stages and moves the commit's wait onto the host's busy bit,
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
-    if not board["payload"]["title"].startswith("clover r191:"):
-        errors.append('[payload] title is not "clover r191: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r192:"):
+        errors.append('[payload] title is not "clover r192: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2487,6 +2487,29 @@ def check_board(errors: list) -> str:
     if "cardInTransfer (" in tail:
         errors.append("clover_emmc_flush_cache still waits with cardInTransfer: a hundred CMD13s at a "
                       "card that is holding DAT0 is the silence the r190 frame shows")
+
+    # Round192. The r191 frame ends at flush-go: the commit was started, and then the card held DAT0
+    # long enough that no stage record -- all of which leave through a block write -- could be
+    # delivered. A commit that cannot report and cannot finish is given back to the card, which means
+    # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
+    # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
+    # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
+    if not board["payload"]["title"].startswith("clover r192:"):
+        errors.append('[payload] title is not "clover r192: ...": the menu would not name this round')
+    for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
+                   "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
+        if needle not in block_source:
+            errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp lacks {needle[:44]}...: the frame "
+                          "could not tell a commit that was skipped from one that never reported")
+    if "if (cacheSize && cacheCtrlBefore == 0) {" in block_source:
+        errors.append("CloverSdhci.cpp still enables the card's write cache at bring-up: r191 showed "
+                      "that the first commit after that enable never returns and cannot report")
+    skip_at = block_source.find("CloverSdhci r192: commit skipped")
+    guard_at = block_source.find("acquireBlockGuard (frequency, start)",
+                                 block_source.find("extern \"C\" uint32_t clover_emmc_flush_cache"))
+    if not (0 <= skip_at < guard_at):
+        errors.append("clover_emmc_flush_cache records the skipped commit after taking the block "
+                      "guard: the record would wait for the writer it exists to avoid")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())

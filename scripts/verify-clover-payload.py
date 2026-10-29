@@ -740,6 +740,24 @@ def check_flush_stages(kernel: bytes) -> bool:
     return ok
 
 
+def check_cache_ownership(kernel: bytes) -> bool:
+    """Round192 hands the write cache back to the card. The r191 frame's last record is flush-go and
+    nothing follows it, including the r184 panic drain: every in-commit record leaves through a block
+    write, and a card holding DAT0 for the commit refuses those too. So the image has to carry the
+    line that says the commit was skipped on purpose, and it has to keep the r171 line -- that one is
+    what reports ctrl=0/on=0 in the next frame."""
+    label = "kernel.macho: cache ownership reading linked"
+    found = {"skipped": (b"CloverSdhci r192: commit skipped size=%u on=%u (once)\n") in kernel,
+             "kept-r171": (b"CloverSdhci r171: write cache size=%u ctrl=%u on=%d rsp=%08x st=%08x "
+                           b"cf=%u\n") in kernel,
+             "kept-r191": b"CloverSdhci r191: flush-go cf=%u bound=%u ps=%08x inh=%u\n" in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -1148,6 +1166,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_sys_why3(kernel)
         ok &= check_sys_why4(kernel)
         ok &= check_flush_stages(kernel)
+        ok &= check_cache_ownership(kernel)
     return 0 if ok else 1
 
 

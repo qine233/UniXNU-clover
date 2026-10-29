@@ -4099,6 +4099,16 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
   }
   if (!__atomic_load_n (&gCacheSize, __ATOMIC_ACQUIRE) ||
       !__atomic_load_n (&gCacheOn, __ATOMIC_ACQUIRE)) {
+    // Round192: this is now the expected answer on this card, so it gets a line rather than a silent
+    // success. A frame that shows sync-out with no flush-in beside it says the barrier had nothing to
+    // commit, not that the flush path went missing.
+    static bool skippedReported = false;
+    if (!skippedReported) {
+      skippedReported = true;
+      sdhciSay ("CloverSdhci r192: commit skipped size=%u on=%u (once)\n",
+                __atomic_load_n (&gCacheSize, __ATOMIC_RELAXED),
+                __atomic_load_n (&gCacheOn, __ATOMIC_RELAXED));
+    }
     return 1;
   }
   uint64_t frequency = 0;
@@ -5385,29 +5395,29 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             gBlockSectors = extSectors21;
             // Round167 switched the card's write cache off because nothing in this driver issued a
             // flush, and every boot here ends in a hard reset: an uncommitted cache was storage
-            // nobody owned. Round171 pays for the flush instead of giving up the cache, because the
+            // nobody owned. Round171 paid for the flush instead of giving up the cache, because the
             // reading that justified r167's caution turned out to be the cost of it -- the checkpoint
             // flush that measured 22.7 s in the r167 frame measured 102 s and 122 s in r170's, each
             // 512-byte block being programmed before its own write command is answered.
             //
-            // The rule is unchanged in the one place that matters: a write is only counted as stored
-            // after writeSettled() sees READY_FOR_DATA in TRAN, and the cache is now committed at
-            // every CloverBlock::synchronize() and requestIdle(). A card that reports no
-            // CACHE_SIZE has nothing to switch and is left alone; one that already reports the
-            // cache on does not get switched a second time. Either way the answer stays on the
-            // frame.
+            // Round192 gives the cache back to the card, and the reason is a frame rather than a
+            // preference: r191 turned the cache on here (ctrl=0 came from the card itself) and the
+            // first commit never returned. That frame's last driver record is flush-go, and nothing
+            // after it could reach the card either -- every r191 stage record is mirrored through a
+            // block write, and a card still holding DAT0 for the commit refuses those too. So the
+            // commit is not only unbounded, it is unobservable. The write path already waits for
+            // READY_FOR_DATA in TRAN after every chunk, which is the same rule r167 ran on and the
+            // same 102 s r170 measured; paying that again is cheaper than a barrier that never
+            // returns. A card that ships with its cache already on still commits, so the flush path
+            // stays live rather than dead.
             const uint32_t cacheSize = (gExtCsd[62] >> 8) | (gExtCsd[63] << 24);
             const uint32_t cacheCtrlBefore = (gExtCsd[8] >> 8) & 0xffu;
             // Round191: byte 246 is CACHE_FLUSH_TIMEOUT, the /10 ms the card may take to commit its
             // cache. The flush's wait is set from this number instead of from a guess, so the r171
             // line now carries it.
             const uint32_t cacheFlushUnits = (gExtCsd[61] >> 16) & 0xffu;
-            uint32_t cacheRsp = 0, cacheStatus = 0, cachePolls = 0;
-            bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;
-            if (cacheSize && cacheCtrlBefore == 0) {
-              cacheOn = switchExtCsd (kExtCsdCacheCtrl, 1, cacheRsp, cacheStatus) &&
-                        cardInTransfer (cacheRsp, cacheStatus, cachePolls);
-            }
+            uint32_t cacheRsp = 0, cacheStatus = 0;
+            const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;
             __atomic_store_n (&gCacheSize, cacheSize, __ATOMIC_RELEASE);
             __atomic_store_n (&gCacheOn, cacheOn ? 1u : 0u, __ATOMIC_RELEASE);
             __atomic_store_n (&gCacheFlushUnits, cacheFlushUnits, __ATOMIC_RELEASE);

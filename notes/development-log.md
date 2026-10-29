@@ -14710,3 +14710,39 @@ flush-in 后面有没有 `flush-out` 与 `CloverBlock r190: sync-out ok=`：有 
 读法：`flush-w1 busy=0` 说明卡根本没握总线、那我们在瞎等；`busy=` 是秒级且 `mark` 跟着涨说明卡真的
 在写 cache，只是慢；`to=1` 说明卡超过了它自己声明的上限，那才是卡坏了。若最后一条停在 `flush-c1`，
 墙就在 CMD6 本身（看 `spins=`）；停在 `flush-go`，说明加记录这一步就没过去。
+
+## round191 读数（v0.5.51 实机，2026-10-29）
+
+五条分段记录只到了一条第（0 条）就停了，这一帧把问题问穿，同时暴露了一个更硬的约束：
+
+1. 驱动环最后一条是 `CloverSdhci r191: flush-go cf=0 bound=30000 ps=01f800f0 inh=0`，
+   `flush-c1` 之后一条都没有。
+2. `cf=0`：卡自己没声明 `CACHE_FLUSH_TIMEOUT`（EXT_CSD byte 246 = 0），所以 `bound` 退到 30 s。
+3. `inh=0`、`ps=01f800f0`：第一次 CMD6 之前主机不忙、`DATA_INHIBIT` 也未立——卡在这之前一切正常，
+   停点就在提交命令本身。
+4. 内核环止于 `CloverBlock r190: sync-in pending=144`，没有 `sync-out`；也没有 r184 的 `panic drain`。
+5. 卡上这一帧的沉默有两层原因。第二层是结构性的：r191 之后每条分段记录都经
+   `flushVerdictRing()` → `writePioBlock()` **写回同一张卡**，卡为提交握住 DAT0 时这些写全部被拒，
+   记录只能留在 DRAM 里；panic 环的排干打在同一个接口上，也一样出不去。所以这次提交不仅没有上限，
+   而且**不可观测**。再往里加读数只会多一条运不下来的行。
+
+## round192（v0.5.52）：把写缓存交还给卡
+
+既然提交既不可等也不可看，就不提交：
+
+- bring-up 里删掉 `switchExtCsd (kExtCsdCacheCtrl, 1)` 与 `cachePolls`，`cacheOn` 改为
+  `cacheSize != 0 && cacheCtrlBefore != 0`，即**卡是什么就是什么**。这台卡报 `ctrl=0`，于是缓存保持
+  关闭、写穿。r159–r170 跑的就是这条路径，每写一块已经在 TRAN 里等 `READY_FOR_DATA`，r167 的量法、
+  r170 量到的 102 s / 122 s 这笔账本来就在付；换来的是一次立即返回的 `F_BARRIERFSYNC`。
+- r171 那行照旧打印（`rsp=`、`st=` 现在恒为 0，因为不再发命令），它会读出 `ctrl=0 on=0`，这正是
+  「缓存交还」的证据。
+- r191 的五段 flush 代码整段保留：卡若出厂就开着缓存，`cacheOn` 仍为真、提交路径仍然是活的。
+- 早退（没有缓存可提交）改成一次性出声：
+  `CloverSdhci r192: commit skipped size=%u on=%u (once)`。此前这里是静默成功，一帧里看到
+  `sync-out` 却没有 `flush-in` 会读成「flush 路径丢了」。
+- 契约：`check-clover.py` 反向断言 bring-up 里不再有 `if (cacheSize && cacheCtrlBefore == 0) {`，
+  并要求跳过记录早于 `acquireBlockGuard`（它必须避开那把锁）；`verify-clover-payload.py` 新增
+  `cache ownership reading linked`（r192 串 + r171 串 + r191 串同在三项）。
+
+读法：`r171: write cache … ctrl=0 on=0`、`commit skipped`、`CloverBlock r190: sync-out ok=1` 三者同在，
+就说明 barrier 这次真的过去了；此后如果 usermanagerd 继续走出新记录，优先级这条线就结了。
