@@ -2927,23 +2927,23 @@ def check_board(errors: list) -> str:
          "-DFASTBOOT_REASON={reason:#x}UL",
          "the resolved cell pointer would not reach the screen's compiler"),
         ("scripts/run-clover-unattended.sh",
-         "fastboot reboot recovery",
-         "the host half would have no way from fastboot to recovery"),
+         "fastboot flash misc",
+         "the only route into recovery this bootloader was measured to honour would be gone"),
         ("scripts/run-clover-unattended.sh",
-         "fastboot oem reboot-recovery",
-         "the second recovery-only spelling would be gone, and a bootloader that does "
-         "not answer the first one would be left with no way in"),
+         'BCB_COMMAND="boot-recovery"',
+         "the bootloader would get a BCB with the wrong command word, and its recovery "
+         "path would not know to enter TWRP"),
         ("scripts/run-clover-unattended.sh",
-         "came out as an ordinary reboot",
-         "a recovery reboot that the bootloader turned into an ordinary reboot would "
-         "pass as success and the window read would belong to another boot"),
+         "the BCB did not take",
+         "a BCB the bootloader ignored would pass as success and the window read would "
+         "belong to the payload's own boot"),
         ("scripts/run-clover-unattended.sh",
          "wait_leave_fastboot",
          "a board still enumerated a moment after 'fastboot reboot' would count as "
          "having come back by itself, so the payload would never be seen to boot"),
         ("scripts/run-clover-unattended.sh",
          "--allow-misc-bcb",
-         "the BCB write the bootloader may perform would happen without declared consent"),
+         "the BCB write into misc would happen without declared consent"),
         ("scripts/run-clover-unattended.sh",
          "read-clover-log.py",
          "the dump would never be decoded"),

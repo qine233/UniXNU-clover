@@ -22,13 +22,14 @@
 #      and the deadline brings the board back to fastboot on its own; without it the
 #      card is read as it stands, which is the *previous* boot's log window, not the one
 #      just written;
-#   3. ask the bootloader for recovery; this may write the boot command into the
-#      misc partition (BCB), which is why it needs --allow-misc-bcb. A reboot
-#      command this bootloader does not know is not an error the host can see: the
-#      board performs an ordinary reboot instead, so the step whose only purpose is
-#      to land in TWRP boots XNU and the window read in step 4 belongs to another
-#      boot. The landing is therefore proved by TWRP's adb, and a board that comes
-#      back to fastboot instead is reported as a plain reboot, never retried as one;
+#   3. write the recovery boot command into the misc partition (Android BCB) and
+#      reboot. This bootloader has no working recovery reboot of its own -- measured
+#      on round193: `fastboot reboot recovery` is accepted and performed as an
+#      ordinary reboot, `fastboot oem reboot-recovery` is `unknown command`, and
+#      `fastboot oem help` does not exist -- so the BCB is the only route that was
+#      seen to land in TWRP (14 s, twice). It is an eMMC write to misc alone, which
+#      is why it needs --allow-misc-bcb. The landing is still proved by TWRP's adb,
+#      and a board that comes back to fastboot instead is reported, never retried;
 #   4. wait for TWRP's adb, dump the first 1216 sectors of the log window (logdump)
 #      through /dev/block,
 #      and decode the 16 report slots plus both rings in it (the driver's verdicts
@@ -36,12 +37,12 @@
 #   5. optionally return to fastboot.
 #
 # Nothing here uses `fastboot boot`: every boot of an image is a cold boot from a
-# partition. `fastboot reboot recovery` is a bootloader reboot, not a boot of a
-# host-supplied image.
+# partition. The BCB write is not a boot of a host-supplied image either; it only
+# tells the bootloader which partition to boot next.
 #
 # Exit codes: 0 records decoded, 1 dump saved but no records, 2 no fastboot, 3
-# consent missing, 4 recovery reboot refused, 5 no adb in recovery, 6 the flashed
-# payload never came back to fastboot.
+# consent missing, 4 the board did not land in recovery, 5 no adb in recovery, 6 the
+# board never left fastboot when asked to reboot.
 
 set -u
 
@@ -77,8 +78,10 @@ Options:
   --boot-after-flash     after flashing, reboot normally and wait for the board to
                          come back to fastboot by itself, so the log window read in
                          step 4 is the one this payload wrote
-  --allow-misc-bcb       consent to the misc-partition BCB write that
-                         `fastboot reboot recovery` may perform
+  --allow-misc-bcb       consent to flashing a 2048-byte Android BCB
+                         (command=boot-recovery) into the misc partition so the
+                         bootloader boots recovery next; no other partition is
+                         written
   --skip-recovery        the tablet is already in TWRP; just dump and decode
   --reboot-bootloader    after decoding, `adb reboot bootloader`
   --no-decode            keep the raw dump only
@@ -176,35 +179,26 @@ watch_landing() {
 # was grepped for "unknown": a reboot word this bootloader does not know is not reported
 # there, it performs an ordinary reboot -- the host sees exit 0 and the board leaves
 # fastboot either way, so the step whose only purpose is to land in TWRP booted XNU and
-# the window read afterwards belonged to another boot. Only recovery-only commands are
-# candidates (`fastboot reboot` is never one, it is exactly the ambiguity being removed),
-# and each one's meaning is decided by observation instead of by its exit status.
-try_recovery_command() {
-  local cmd=$1 out st landing
-  say "asking for recovery: $cmd"
-  out=$($cmd 2>&1); st=$?
-  if [ $st -ne 0 ] || printf '%s' "$out" | grep -qiE 'unknown|not support|fail|error'; then
-    say "  refused (exit $st): $(printf '%s' "$out" | tr '\n' ' ')"
-    return 4
-  fi
-  if ! wait_leave_fastboot; then
-    say "  accepted, but the board never left fastboot: the command was not acted on"
-    return 4
-  fi
-  say "  accepted and the board left fastboot; watching up to ${LANDING_WAIT}s for its landing"
-  watch_landing
-  landing=$?
-  case $landing in
-    0) say "  landed in recovery: adb $(adb_serial)"; return 0 ;;
-    1) say "  came out as an ordinary reboot: fastboot came back and no recovery adb did"; return 4 ;;
-    *) say "  neither recovery adb nor fastboot within ${LANDING_WAIT}s"; return 5 ;;
-  esac
+# the window read afterwards belonged to another boot. The vocabulary was then measured
+# on the board: `fastboot reboot recovery` is a plain reboot, `oem reboot-recovery` and
+# `oem help` are unknown commands. What does land in TWRP, in 14 s and reproducibly, is
+# the Android bootloader message the firmware's own recovery path reads.
+#
+# struct bootloader_message is 2048 bytes; only `command` (32 bytes) is used here. The
+# rest stays zero, which is what the two live tests flashed.
+BCB_COMMAND="boot-recovery"
+BCB_SIZE=2048
+make_bcb() {
+  local path=$1
+  { printf '%s' "$BCB_COMMAND"; head -c $(( BCB_SIZE - ${#BCB_COMMAND} )) /dev/zero; } > "$path" \
+    || return 1
+  [ "$(wc -c < "$path" | tr -d ' ')" = "$BCB_SIZE" ]
 }
 
 say "contract: clover-unattended=<s> deadline, panic screen marks IMEM 0x146bf65c and resets after 20 s"
 
 # A device already sitting in TWRP is the shortest path: dump from it. This also
-# covers a rerun after a failed recovery reboot.
+# covers a rerun after a failed recovery entry.
 if [ -n "$(adb_serial)" ]; then
   SKIP_RECOVERY=1
   say "an adb device is already up; treating it as recovery"
@@ -232,31 +226,40 @@ if [ "$SKIP_RECOVERY" = 0 ]; then
   fi
   if [ "$ALLOW_BCB" = 0 ]; then
     cat >&2 <<EOF
-[unattended] refusing to send 'fastboot reboot recovery' without consent.
-[unattended] Declared eMMC write: the bootloader may store the recovery boot
-[unattended] command in the misc partition (BCB, about 1 KiB). No other partition
-[unattended] is touched. Rerun with --allow-misc-bcb to allow exactly that, or
-[unattended] boot TWRP yourself and rerun with --skip-recovery.
+[unattended] refusing to write the recovery boot command without consent.
+[unattended] Declared eMMC write: a 2048-byte Android BCB with command
+[unattended] "$BCB_COMMAND" is flashed into the misc partition, and nothing else.
+[unattended] The bootloader reads it on the next boot and boots recovery instead of
+[unattended] the payload. Rerun with --allow-misc-bcb to allow exactly that, or boot
+[unattended] TWRP yourself and rerun with --skip-recovery.
 EOF
     exit 3
   fi
-  say "declared eMMC write: bootloader may store the recovery boot command in misc (BCB)"
-  for cmd in "fastboot reboot recovery" "fastboot oem reboot-recovery"; do
-    if try_recovery_command "$cmd"; then
-      recovery_ok=1
-      break
-    fi
-  done
-  if [ "${recovery_ok:-0}" = 0 ]; then
-    cat >&2 <<EOF
-[unattended] no recovery entry landed. Fallbacks, in order:
+  BCB="$(dirname "$OUT")/clover-bcb-recovery.img"
+  make_bcb "$BCB" || die 3 "could not write a ${BCB_SIZE}-byte BCB image at $BCB"
+  say "declared eMMC write: fastboot flash misc $BCB (${BCB_SIZE} bytes, command='$BCB_COMMAND', the misc partition only)"
+  fastboot flash misc "$BCB" || die 2 "fastboot flash misc failed: the misc partition may now hold a truncated BCB"
+  say "rebooting into the recovery the BCB names: fastboot reboot"
+  fastboot reboot >/dev/null 2>&1 || die 2 "fastboot reboot failed"
+  wait_leave_fastboot || die 6 "the board never left fastboot after 'fastboot reboot': it is still the same boot, so nothing was read"
+  say "the board left fastboot; watching up to ${LANDING_WAIT}s for TWRP's adb"
+  watch_landing
+  landing=$?
+  case $landing in
+    0) say "landed in recovery: adb $(adb_serial)" ;;
+    1)
+      cat >&2 <<EOF
+[unattended] the BCB did not take: the board came back to fastboot and TWRP's adb
+[unattended] never appeared, so the payload booted and its own deadline reset it.
+[unattended] Nothing was read. Fallbacks, in order:
 [unattended]   1. power-cycle (IMEM is volatile, a power cycle clears the reason),
 [unattended]      hold Vol- while powering on to reach fastboot, then rerun this
 [unattended]      script with --allow-misc-bcb;
 [unattended]   2. boot TWRP from its own partition, then rerun with --skip-recovery.
 EOF
-    exit 4
-  fi
+      exit 4 ;;
+    *) say "neither TWRP's adb nor fastboot within ${LANDING_WAIT}s; the board may be sitting on the panic screen, which resets after 20 s" ;;
+  esac
 fi
 
 wait_adb || die 5 "no adb in recovery after ${ADB_WAIT}s; TWRP has adbd, so check that recovery actually started (the panel shows its splash)"
