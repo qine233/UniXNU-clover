@@ -4,84 +4,26 @@
 ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。
 配套固件仓库 `uefi-clover`（Mu-Silicium 移植），驱动与硬件常量在 `porting.toml`。
 
-现状一句话：**显示链路出帧，SpringBoard 被 backboardd 的看门狗杀掉**——XNU 起来、
-OS/SystemOS/Data 三个卷全挂、launchd 把守护进程拉起来；r202 让
-`IOMobileFramebufferLegacy` attach + start，r205 往 `/chosen` 写了 `display-scale=2`
-解掉 `FBSDisplayMode` 的断言，r206/r207 里 compositor 连续 present（4 帧、每帧 9 216 000
-字节扫上屏、`done/presented=4`）。帧仍是全黑的（2 304 000 像素里 2 262 414 个纯黑），
-因为画 UI 的 SpringBoard 被 backboardd 用 `kill(2)` 杀掉（r207：`_kill+0x140`、
-`ns=-1 code=0`、CS 位不含 `CS_KILLED`；r208/r210 的 `sender upc` 逐位相同）。
-r216 把 r211 那个会打死内核的线程遍历修好了（本靴 panic 回到 900 s 死线），但快照落在
-杀点之后 39.44 s、5 条线程全部 `kin=2 kstk=0`（栈已交出手，`sbthk` 一行也没有），
-保存态落在共享缓存的只读段里——读到的不是 SpringBoard 的代码。r217 改在杀点之前采样。
+现状一句话：**显示链路出帧，SpringBoard 活不下来**——XNU 起来、OS/SystemOS/Data 三个卷全挂、
+launchd 把守护进程拉起来；r202 让 `IOMobileFramebufferLegacy` attach + start，r205 写
+`display-scale=2` 解掉 `FBSDisplayMode` 断言，r206 起 compositor 连续 present
+（`done/presented=4`、每帧 9 216 000 字节），但整屏仍是黑的——SpringBoard 没有把界面画上去，
+约 110 s 后被 backboardd 用 `kill(2)` 杀掉。
 
-r210 把「是不是卡在块 I/O」这条结掉了：那一帧的 flight 区记到死线前最后一笔读
-（`t=900.664 s`、120 块、`ps=0x01f800f0` 无 CMD/DAT inhibit），CPU0 心跳一拍不落地走到
-`t=897.566 s`，panic sink 也写得进去（内核环到 `[911.924696]`）；杀点就在环里：
-`[457.346085]` backboardd(pid 58) 向 SpringBoard(pid 27) 发 SIGKILL（`cs=0x22000301`、
-`ra=fffffff0076ffd7c`），杀之前 SpringBoard 5 条线程全在 TH_WAIT、没有一条 tid 等于 pid。
-桌面就差这一件事：**SpringBoard 在等什么**。r211 想在杀点把每条线程的内核栈打出来，
-这一帧没拿到：flight 区最后一笔是 `t=341.015 s` 的 8 块读（`lba=28308144`，**无后继**），
-最后一拍心跳 `t=340.978 s` 之后再没有一拍——守卫被一笔没回来的读拿住，内核环因此停在
-`[352.186939]`（`sync-out ok=1 pending=152`）。机器活到 913 s，8 颗 CPU 各自在
-`ArmCpu.cpp:644/647` 的死线上落了一条 kind-20 记录（`cnt1≈0x414c…`、`fb=1`），panic 文本和
-4 条驱动记录写上了卡，但 `panicTailRead` **一条也没产出、连状态行都缺席**——它唯一的早退
-路径是 `gTeeReady` 门。于是 352→913 s 的 msgbuf 连同 r211 的线程栈一起丢了。
-r212 让内核 probe 直接把文本推进驱动的 32 槽 RAM 环（不经块路径、不经 msgbuf、不经 tee），
-panic 时随驱动环落卡；每条记录带 boot id、drain 进出各说一行、尾读去掉 `gTeeReady` 门。
+r217 读数（boot 6）：杀点前采样生效（15 条 `sbs`、`sbbusy=0`、5 条 `sbthr` 即时落卡），
+杀点 `[493.244946]` 到退出只隔 18 ms（r216 的 39 s 推迟消失）；5 条线程处于
+`TH_RUN`/`TH_RUN\|TH_IDLE`，用户态 pc 减本靴 slide `0x1050c000` 后全部落进
+`libsystem_kernel` 的 syscall 桩——**内核侧没有死锁**。SpringBoard 从未创建
+`IOMobileFramebufferUserClient`（客户端只有 pid 86/58/97/56/74），backboardd 一直 present 的
+只是 `305x887..755x1029` 的小块黑帧。缺口因此收窄成一句话：**SpringBoard 在启动渲染之前就卡住了**。
 
-r212 的靴号当场关掉了 r211 的歧义：这一帧是 1 号靴，驱动环 36 条里 35 条 boot 1，唯一一条 boot 0
-的 `r184: panic drain wrote=4` 是上一靴的尾巴，report 窗 12 条 kind-20 也全是 boot 0——**本靴的
-panic 一条都没写**。但这一帧没走到杀点：块路径在 `194.18 s` 就停住了，flight 最后一笔是连续
-8 块读里的最后一笔（`t=181885 ms`、`lba=31076656`，Data 卷内 6.08 GiB 处，**无后继**），
-最后一拍心跳比它早 12.99 s（`miss=13`），内核环停在 `[194.181939]`。SpringBoard 152.2 s exec
-之后再无输出，所以 kind-25 probe 行是 0 条——通道没被检验，不是失败。**从 194 s 起就没人能写卡**，
-panic 只是又一个受害者。r213 因此不再加探针，而是把「谁来拿主机」换成有界的票据：
-等待者 60 s 放弃并报 `owner/stage`，持有者每进一段写一个 stage，CPU0 心跳看到 stage 75 s
-没动就软复位、CMD12、清中断并抢回票；被抢的一方在下一个 chunk 头自觉收手。
-一笔坏请求只毁一个请求，不毁整次启动；flight 记录同时补上 stage 与调用线程的 pid/comm。
-
-r213 上机后票确实上了膛（`r213: host ticket armed, wait=60000ms stuck=75000ms`、boot 2），
-但停点只是往后挪到了 **418.465 s**：flight 最后一批入口是 `t=407.460 s` 起 chronod 的连续
-8 块读（`lba=28103552…`、`pid=133`），内核 tee 最后一行是 `[418.465029]`，之后卡上再没有任何
-成功写入——没有 `guard stuck`、没有 `guard wait gave up`、panic 连 `drain enter` 都没写上
-（report 窗 12 条仍是 boot 0）。r213 的看门狗本该在停滞 75 s 后落一行，它没落，说明卡死之后
-连软复位 + CMD12 也救不回来（或看门狗根本没触发）。r214 因此把看门狗升级成完整的卡重初始化
-（关时钟、断电、重新识别、恢复高速），并用 panic 的复位落点做一条不依赖卡的 1 bit 通道，
-回答「看门狗触发过没有」。
-
-r214 的帧把这条线结掉了：票完好（37 条 boot-3 驱动行、`stuck/recov/steal` 全 0），
-最后 12 条请求是 `397.135–397.377 s` 的 8/64/128 块读且全部在 145 ms 内完成，内核 tee
-最后一行是 `[408.1000164] sync-out ok=1 pending=464`；CPU0 心跳停在 `397.084 s`。
-**408 s 之后到 900 s 死线，卡上再没有一条记录**——不是「CPU0 停了所以看门狗没跑」，
-而是卡在 408 s 那次写之后整条路径一起沉默。r214 的阶梯因此没有机会执行：75 s 看门狗
-的结构性前提不成立（每个请求的 deadline 总会先结束持有）。r215 把恢复放到请求自己身上：
-连续 6 次 CMD13 不应答（或 DATA_INHIBIT 超 30 s）就整卡断电重初始化，成功后重试一次；
-有应答但忙的卡不动。冷却 15 s、每靴 16 次封顶。
-
-r215 的帧说明这个方向还没被检验到：这一靴的卡没有沉默——flight 活到 `436.258 s`
-（`read lba=28752264 blocks=8 comm=contexts`）、心跳到 `429.129 s`，`stuck/recov/steal` 全 0，
-窗口里没有一条 `r215: card recover`。**楔死是间歇性的，不是每靴必现**（r214 是 408 s，
-本靴是 436 s 以上）。但这一帧第一次把杀点完整落卡：`448.547 s` backboardd 杀 SpringBoard，
-`r212: drain enter boot=4 … append_rc=112 probe_seen=3`、`r184: panic drain wrote=11 unseen=0`、
-`drain exit … probe=3 probe_drop=0`，r207/r208/r211 三条 probe 全部上卡。代价是 panic 原因换了：
-`Kernel data abort at pc=0xfffffff0072cde20, lr=0xfffffff0072cdd6c`，两者都落在
-`_clover_task_threads`（`+0x180` / `+0xcc`）——**r211 的线程栈回流补丁自己把内核打死了**。
-另外 `skst` 解出来是 backboardd 调 `kill` 的栈（`_psignal_internal → _kill → unix_syscall`），
-抓的是发信者，不是 SpringBoard。r216 因此先修这个数据异常，再按目标 pid 取收信者的线程栈。
-
-r216 把 fault 对到了指令：`+0x180` 是 `ldurb w11, [x10, #-0x68]`，`x10 = thr->kernel_stack +
-kernel_stack_size`——读内核保存状态的第一条指令；而线程的栈在换出/回收时
-（`stack.c` 的 `machine_stack_detach()`）会把 `kernel_stack` 置 0，于是这里读到的是一个未映射的
-低地址。修法是**先检查指针再解引用**：栈为 0 的线程不读保存状态，`kin=2` 标出换出，
-`sbthr` 行加 `kstk=` 原值。下一帧就能拿到 SpringBoard 每个线程的
-`pc/lr/sp/state/wait`（以及栈还在的那些线程的 `sbthk`），而不是再用一次 data abort 换回一张快照。
+更早的逐轮读数在 [`notes/development-log.md`](notes/development-log.md)。
 
 ## 距离 iOS 桌面还差什么
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 被 backboardd 的看门狗杀掉** | r207 读数：`killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58 scomm=backboardd ns=-1 code=0x0 cs=0x22000301 ra=fffffff0076ffd7c`。锚点与 `_psignal_internal` 的链接地址逐位相同（slide=0），`ra` 解成 `_kill+0x140`；CS 位不含 `CS_KILLED`，不是签名校验；backboardd 里有 `_pingSystemShellForCollectiveWatchdog:`、`watchdogPing: system app claims it's no longer alive`、`Killing %{public}@.`。r208 没有复现（环停 `[167.198224]`）；r209 走到死线但 sink 没写进去；r210 块路径健康到死线（flight 到 `t=900.664 s`、心跳到 `t=897.566 s`），sink 写入成功，kill 在 `[457.346085]`，杀前 5 线程全在 TH_WAIT、pc 落在 `DiagnosticRequestService` / `libswift_StringProcessing`，无主线程。r211 在杀点加了内核栈回流，但这一帧的守卫被 `t=341.015 s` 一笔无后继的 8 块读拿住，环停在 `[352.186939]`，panic 时 `panicTailRead` 又被 `gTeeReady` 门挡住——杀点的栈已经打进 msgbuf 却没落卡。r212 给出靴号与 probe 环，但这一帧更早停：flight 最后一笔是 `t=181885 ms` 的 8 块读（`lba=31076656`，Data 卷 6.08 GiB 处，无后继），心跳早 12.99 s 断（`miss=13`），内核环停在 `[194.181939]`；SpringBoard 152.2 s exec 后无输出，杀点（r210 是 457 s）没到，所以 kind 25 是 0 条。r213 的票上了膛且拿到 37 条 boot-2 驱动行，但停点仍被卡写光：flight 最后一批入口是 `t=407.460 s` 起 chronod 的连续 8 块读，tee 最后一行 `[418.465029]`，之后没有 `guard stuck`、没有 drain，panic 没有一条上卡 | r214 读数：票完好、请求全部在 145 ms 内完成，`[408.100]` 最后一次成功写卡后整条路径沉默到 900 s，看门狗一次都没触发。r215 改用「CMD13 不应答」作为沉默判据，由请求自己执行同一套整卡重初始化阶梯（冷却 15 s、每靴 16 次），恢复成功后重试一次。r215 读数：这一靴卡没沉默（flight 到 `436.258 s`、beat 到 `429.129 s`、`stuck/recov/steal=0`，没有 recover 行），所以判据未获检验；但杀点首次完整落卡（`drain enter boot=4 … append_rc=112`、`panic drain wrote=11 unseen=0`、3 条 probe 全上卡），代价是 `Kernel data abort @ _clover_task_threads+0x180`——r211 的栈回流补丁自伤，且 `skst` 抓的是发信者 backboardd 的 `kill` 栈。r216：先修该数据异常，再按目标 pid 取收信者线程栈。r216 读数：数据异常消失（本靴 panic 是 900 s 死线，`drain enter boot=5 … append_rc=113`、`panic drain wrote=13 dropped=0`、`probe_seen=8`、`unseen=0`），5 条 `sbthr` 全 `kin=2 kstk=0`、`sbthk` 零行（栈交出手的线程结构上没有内核栈）；且这 5 行的时间戳是 `[460.2178]`，比杀点 `[420.7734]` 晚 39.44 s，进程到 `[460.3011]` 才退出（r207 那靴只隔 197 ms）。`skst` 与首条 `sbthr` 之间唯一会阻塞的地方是 `task_lock(task)`，同期内核其他行照常落卡，所以是目标任务的锁被按住 39 s。保存态也读不出 SpringBoard 的代码：本靴 `r200` 行是 `start=0x180000000`（slide=0），而这些 pc/lr 全落在共享缓存的只读数据映射 `0x1e638c000+0x531c000` 里——快照读的是一个已经被拆掉的任务 | r217：信号路径里不再阻塞地取 `task_lock`（`task_try_lock` + 记 `busy`），并在杀点之前定期采样 `wait_event`/`wmesg`/`continuation`，先回答 SpringBoard 到底在等什么 |
+| 1 | **SpringBoard 活不下来：不渲染，约 110 s 后被 backboardd 杀掉** | r217 读数（boot 6）：杀点前采样生效（15 条 `sbs`、`sbbusy=0`、5 条 `sbthr` 即时落卡），杀点 `[493.244946]` 到退出只隔 18 ms；5 条线程处于 `TH_RUN`/`TH_RUN\|TH_IDLE`，用户态 pc 减本靴 slide `0x1050c000` 后全部落进 `libsystem_kernel` 的 syscall 桩（+0x18e8/+0x1b58/+0x1970/+0x4bdc），内核侧没有死锁。**SpringBoard 从未创建 `IOMobileFramebufferUserClient`**（客户端只有 pid 86/58/97/56/74），backboardd 连续 present 的全是 `305x887..755x1029` 的小块黑帧；杀点 `ra=fffffff007704d7c` 解到 `_kill+0x140`，CS 位不含 `CS_KILLED` | r218：从杀点取发信者 8 词代码 + `ulr` 定位 backboardd 看门狗的调用点；采样行补 x16（syscall 号）与用户栈帧，回答「SpringBoard 在等谁、为什么不渲染」 |
 | 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |

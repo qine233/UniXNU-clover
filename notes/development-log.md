@@ -16346,5 +16346,44 @@ r216 修好之后，下一帧的 `sbthr` 会给出每个 SpringBoard 线程的 `
 本身的时序否掉——`psignal_internal` 里先阻塞 39 s 再读，读到的必然是尸体。r217 的方向因此
 是两条：信号路径里把 `task_lock` 换成不阻塞的 `task_try_lock`（拿不到就记 `busy` 并立刻
 返回，不再推迟退出），以及把「SpringBoard 在等什么」的采样挪到杀点之前（记录
-`thr->wait_event` / `thr->wmesg` / `thr->continuation` / `parameter`），这样读到的才是
-看门狗判定「它死了」那一刻的真实等待点。
+`state` / `thr->wait_event` / `thr->continuation` / 用户态 `pc`），这样读到的才是
+看门狗判定「它死了」那一刻的真实等待点。（本版 XNU 的 `thread` 没有 `wmesg` 字段，
+采样字段据此定为这四项，每次进 mach trap 触发、8 s 节流、只在状态集合变化时输出，
+另外每 120 s 一条心跳。）
+
+## round217 读数（boot 6）：采样器生效，杀点不再被推迟，缺口收窄到「SpringBoard 不渲染」
+
+这一帧是 r217 产物（`round217-payload.img`，冷刷 cache=mmcblk0p49）跑出来的：
+
+- **trylock 版遍历器**：`sbbusy=0`、`sbthr busy=0` 一路到底；杀点处 5 条 `sbthr` 在
+  `[493.2622]` 立即打出（r216 是 39.44 s 之后），`exit pid=27 … rv=0x9 code=0x9` 在
+  `[493.262803]`——离 kill 只有 18 ms，与 r207 的 197 ms 同量级。**探针不再推迟退出。**
+- **采样行**：`sbs` 共 15 条（`t=384` 起，`c=6` 到 `c=17`），节流 8 s、状态集合变化才输出。
+  最后一条 `t=488.007154` 的 5 组读数是
+  `104:1:0:fffffff00725e2ac:1dbc8cb58`、`31d:65:fffffff474381140:fffffff007739530:1dbc92bdc`、
+  `448:65:fffffff474382100:fffffff007739530:1dbc8c970`、
+  `449:1:fffffff2a6747a30:fffffff0076b8128:1dbc8c8e8`、
+  `4ea:1:fffffff2a67356a8:fffffff0076b8128:1dbc8c8e8`；杀后 `t=496` 起 `n=0`。
+  续点解到 `_ipc_mqueue_receive_continue`、`_workq_unpark_continue`、`_ulock_wait_continue`、
+  `_filt_wlwait_continue`——都是线程在等事件，不是内核互锁。
+- **用户态 pc 全部落在 syscall 桩**：本靴 slide 用 r200 行自证。r200 的
+  `pid=144 … off=0x51e024f8 foff=0x51e024f8` 给出 liveactivitiesd 的 brk 位于
+  `pc=0x1d1e024f8`；同一八字在 `dyld_shared_cache_arm64.21` 里命中 vmaddr `0x1c18f64e8`
+  （brk 在 +0x10），于是 `slide = 0x1d1e024f8 − 0x1c18f64f8 = 0x1050c000`。用
+  `libsystem_kernel`（text vmaddr `0x1cb77f000`）+0x6100 的 `0x540000e3` 与设备 r208 的
+  `uinsn=540000e3` 逐位比对通过。减 slide 后：`1dbc8cb58→+0x1b58`、`1dbc92bdc→+0x4bdc`、
+  `1dbc8c970→+0x1970`、`1dbc8c8e8→+0x18e8`、`lr 1dbc90224→+0x3224`，全部落在
+  `libsystem_kernel` 的 `svc` 桩（返回点后面是 `b.eq` 错误分支 + `stp/mov/bl/ldp/ret` 尾）。
+  **内核侧没有死锁**，SpringBoard 的线程都在跑用户态。
+- **决定性的一条**：本靴 `IOMobileFramebufferUserClient` 的创建者只有 pid 86（`IOMFB_FDR_Loader`）、
+  58（backboardd）、97、56、74，**没有 27**。backboardd 自己 present 出 `frame#0..3`
+  （`box=305x887..755x1029`、`pixels=41586`、绝大多数 `ff000000`），SpringBoard 侧没有任何
+  render server 提交。即：**SpringBoard 在启动渲染之前就停住了**，backboardd 的看门狗因此
+  在 `[493.244946]` 判它「没上报」并发 SIGKILL。
+- 杀点前后相隔 110 s 左右（r210 457 s、r216 420 s、本靴 493 s），看门狗时长本身不固定，
+  但每靴都能抓到 `killsig`，复现稳定。
+
+**结论**：r211–r217 这条线把「内核挂了 / 探针自伤 / 块路径丢了」全部排除。剩下的问题是
+SpringBoard 用户态为什么不起渲染。r218 因此两件事：一是在信号路径里把发信者 `upc` 处的 8 词
+代码与保存态 `lr` 读出来，把 backboardd 看门狗调用点落到具体函数；二是给采样行加 `x16`
+（pc 所在的 syscall 桩对应哪个系统调用）与有界的用户栈帧行，回答「它到底在等谁」。

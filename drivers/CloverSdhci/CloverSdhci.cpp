@@ -634,6 +634,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // into) and one line for the sender's own kernel stack. Twelve lines at most per kill, so 64
   // leaves room for three deaths without letting the class crowd out the exec/exit pairs.
   { "clover r211: ", "r211-kill", 64, 0, 0, 0 },
+  // Round217 stops reading the corpse and samples the living process instead: one line every eight
+  // seconds while SpringBoard's thread states change, then a heartbeat every two minutes. The kernel
+  // caps the changes at 32 and the boot ends by 900 s, so 64 is the whole conversation with room to
+  // spare, and the class cannot crowd the exec/exit pairs.
+  { "clover r217: ", "r217-sbs", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

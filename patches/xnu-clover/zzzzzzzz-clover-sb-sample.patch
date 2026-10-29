@@ -1,0 +1,216 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 9298c33..fbfa2b8 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -234,6 +234,21 @@ clover_sys_why_mach(int trap_no, arm_saved_state_t *state)
+ {
+ 	struct proc *p = get_bsdthreadtask_info(current_thread());
+ 
++	/* Clover (round217): the sample that describes the stop has to be taken
++	 * before the kill, so every mach-trap entry is the clock. SpringBoard's
++	 * own entry names the task once; any later entry, from any process,
++	 * re-reads its threads eight seconds apart. Round216 read the same
++	 * threads from the signal path and found them already torn down. */
++	if (p != NULL) {
++		extern void clover_sb_note_current(void);
++		extern void clover_sb_sample(void);
++
++		if (strncmp(p->p_comm, "SpringBoard", 16) == 0) {
++			clover_sb_note_current();
++		}
++		clover_sb_sample();
++	}
++
+ 	if (p == NULL || !clover_sys_why_watched(p->p_comm)) {
+ 		return;
+ 	}
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 4a12dd9..970e459 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -121,6 +121,7 @@
+ #include <kern/ipc_tt.h>
+ #include <kern/host.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <kern/timer.h>
+ #include <kern/assert.h>
+ #include <kern/affinity.h>
+@@ -10390,8 +10391,25 @@ clover_task_threads(task_t task, uint32_t budget)
+ 	}
+ 	pid = task_pid(task);
+ 	/* Snapshot under the lock and print after it: the console can block
+-	 * and nothing else should wait on task_lock behind a print. */
+-	task_lock(task);
++	 * and nothing else should wait on task_lock behind a print. Round217:
++	 * the lock is taken with try_lock. Round216's frame showed this walk
++	 * delaying the exit by 39 s while the dying task held its own lock, so
++	 * a busy lock is a reading (busy=1) now rather than a wait. */
++	if (!lck_mtx_try_lock(&task->lock)) {
++		extern unsigned int clover_emmc_probe_say(const char *text,
++		    unsigned int length);
++		char busy[96];
++		int len;
++
++		len = snprintf(busy, sizeof(busy),
++		    "clover r217: sbthr busy=1 pid=%d budget=%u\n", pid, budget);
++		if (len > 0) {
++			busy[sizeof(busy) - 1] = '\0';
++			printf("%s", busy);
++			clover_emmc_probe_say(busy, (unsigned int)strlen(busy));
++		}
++		return 0;
++	}
+ 	queue_iterate(&task->threads, thr, thread_t, task_threads) {
+ 		arm_saved_state_t *ss;
+ 		arm_kernel_saved_state_t *ks;
+@@ -10473,4 +10491,149 @@ clover_task_threads(task_t task, uint32_t budget)
+ 	}
+ 	return n;
+ }
++
++/*
++ * Round217. The signal path can only read the task after it was killed, and
++ * round216 showed what that costs: the walker then waited 39 s on the dying
++ * task's own lock, and the saved state it finally read had already been
++ * released. So the reading is taken before the kill instead: every SpringBoard
++ * thread is sampled from whichever process next enters a mach trap, at most
++ * once every eight seconds, and only when the set of thread states changed --
++ * or once every two minutes as a heartbeat. A line that repeats is not a
++ * reading; the line that changes is the moment the process stopped moving,
++ * and its t= names when. The volume stays small enough that the tee's
++ * per-class budget never has to drop the last one, which is the one that
++ * describes the stop.
++ *
++ * The task is captured on SpringBoard's own trap entry, where its task cannot
++ * be deallocating, and one reference is held for the life of the boot: this is
++ * a diagnostic build, and the reference is what lets a sample taken after the
++ * kill read a live object instead of a freed one.
++ */
++static task_t clover_sb_task;
++static volatile uint32_t clover_sb_ready;
++static uint64_t clover_sb_last_secs;
++static uint64_t clover_sb_heartbeat;
++static uint32_t clover_sb_changes;
++static char clover_sb_last[256];
++
++void
++clover_sb_note_current(void)
++{
++	if (__atomic_load_n(&clover_sb_ready, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	task_reference(current_task());
++	clover_sb_task = current_task();
++	__atomic_store_n(&clover_sb_ready, 1, __ATOMIC_RELEASE);
++}
++
++static uint64_t
++clover_now_seconds(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000000ULL;
++}
++
++/*
++ * One line carries every thread: tid:state:wait:continuation:pc per thread.
++ * The continuation is what names a blocked thread's wait -- wait_event is zero
++ * for a thread parked on a mach_msg wait, exactly the case this is read for --
++ * and pc says where in userspace it was when the sample was taken. The line is
++ * kept under the tee's 320-byte record: five threads at roughly fifty bytes a
++ * thread, so the driver never has to truncate the thread that stopped.
++ */
++void
++clover_sb_sample(void)
++{
++	task_t task;
++	thread_t thr;
++	uint64_t secs;
++	char tokens[256];
++	char line[320];
++	int toff = 0;
++	int len;
++	int pid;
++	uint32_t n = 0;
++	uint32_t changed;
++	uint32_t heartbeat;
++
++	if (!__atomic_load_n(&clover_sb_ready, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	secs = clover_now_seconds();
++	if (secs < clover_sb_last_secs + 8) {
++		return;
++	}
++	clover_sb_last_secs = secs;
++	task = clover_sb_task;
++	if (task == TASK_NULL) {
++		return;
++	}
++	if (!lck_mtx_try_lock(&task->lock)) {
++		if (secs >= clover_sb_heartbeat + 120) {
++			clover_sb_heartbeat = secs;
++			printf("clover r217: sbbusy t=%llu\n",
++			    (unsigned long long)secs);
++		}
++		return;
++	}
++	pid = task_pid(task);
++	tokens[0] = '\0';
++	queue_iterate(&task->threads, thr, thread_t, task_threads) {
++		arm_saved_state_t *ss;
++		uint64_t pc = 0;
++		int wrote;
++
++		if (n >= 5 || toff >= (int)sizeof(tokens) - 64) {
++			break;
++		}
++		ss = get_user_regs(thr);
++		if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1) {
++			pc = (uint64_t)get_saved_state_pc(ss);
++		}
++		wrote = snprintf(tokens + toff, sizeof(tokens) - (size_t)toff,
++		    " %llx:%d:%llx:%llx:%llx",
++		    (unsigned long long)thr->thread_id, thr->state,
++		    (unsigned long long)thr->wait_event,
++		    (unsigned long long)(uintptr_t)thr->continuation,
++		    (unsigned long long)pc);
++		if (wrote <= 0 || wrote >= (int)(sizeof(tokens) - (size_t)toff)) {
++			toff = (int)sizeof(tokens) - 1;
++			tokens[toff] = '\0';
++			break;
++		}
++		toff += wrote;
++		n++;
++	}
++	lck_mtx_unlock(&task->lock);
++
++	changed = (strcmp(tokens, clover_sb_last) != 0);
++	heartbeat = (secs >= clover_sb_heartbeat + 120);
++	if (!changed && !heartbeat) {
++		return;
++	}
++	if (changed && clover_sb_changes >= 32) {
++		/* The change budget is spent; the heartbeat carries the rest. */
++		if (!heartbeat) {
++			return;
++		}
++		changed = 0;
++	}
++	clover_sb_heartbeat = secs;
++	if (changed) {
++		clover_sb_changes++;
++		strlcpy(clover_sb_last, tokens, sizeof(clover_sb_last));
++	}
++	len = snprintf(line, sizeof(line),
++	    "clover r217: sbs t=%llu pid=%d n=%u c=%u%s%s\n",
++	    (unsigned long long)secs, pid, n, clover_sb_changes,
++	    changed ? " chg" : "", tokens);
++	if (len > 0) {
++		line[sizeof(line) - 1] = '\0';
++		printf("%s", line);
++	}
++}
+ #endif /* __arm64__ */

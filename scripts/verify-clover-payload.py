@@ -901,6 +901,21 @@ def check_card_recover(kernel: bytes) -> bool:
     return ok
 
 
+def check_sb_sample(kernel: bytes) -> bool:
+    """Round217 samples the living process instead of reading the corpse. The image has to carry
+    the try-locked walk and the sampler line: r216's frame showed the kill-time walk waiting 39 s
+    on the dying task's lock and then reading a state that had already been released, so the next
+    frame is decided by lines printed before the kill."""
+    label = "kernel.macho: r217 sb sample linked"
+    found = {"sbs": (b"clover r217: sbs t=%llu pid=%d n=%u c=%u%s%s\n") in kernel,
+             "busy": (b"clover r217: sbthr busy=1 pid=%d budget=%u\n") in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_flight_region(kernel: bytes) -> bool:
     """Round210 leaves a record before the stop instead of after it. The r209 frame showed the
     kernel alive to the deadline and the card refusing the sink, so the image has to carry the
@@ -1382,6 +1397,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_host_ticket(kernel)
         ok &= check_card_reinit(kernel)
         ok &= check_card_recover(kernel)
+        ok &= check_sb_sample(kernel)
         ok &= check_signal_desc_probe(kernel)
         ok &= check_user_breakpoint_probe(kernel)
     return 0 if ok else 1
