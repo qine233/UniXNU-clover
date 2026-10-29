@@ -2287,8 +2287,8 @@ kernel_args = [
   # since round171 has needed someone to stand next to the tablet with a camera: round149 removed the
   # deadline on purpose ("how far does iPadOS get when nothing interrupts it"), and the price of that
   # is that a boot that gets far never comes back by itself -- round183's flash proved it, waiting on a
-  # fastboot device the deadline would have produced in five minutes. With `clover-unattended=300` the
-  # ArmCpu timer handler panics 300 s after the first tick (drivers/ArmCpu/ArmCpu.cpp:637, message
+  # fastboot device the deadline would have produced in five minutes. With `clover-unattended=<s>` the
+  # ArmCpu timer handler panics <s> s after the first tick (drivers/ArmCpu/ArmCpu.cpp:637, message
   # `clover r148: unattended deadline ...`), the panic screen prints and marks IMEM 0x146bf65c, and 20 s
   # later the board resets into fastboot, where scripts/run-clover-unattended.sh is already waiting to
   # pull the card. 300 s is five minutes of uninterrupted iPadOS boot -- long enough that the question
@@ -2318,7 +2318,15 @@ kernel_args = [
   # before this round). Both refusal paths say so on the card -- `logdump entry too small` and
   # `no logdump entry at ...` -- because "never armed" and "armed and never flushed" are different answers
   # and a dump has to be able to tell them apart.
-  "clover-unattended=300",
+  # Round194 raises it from 300 to 900, and not because the boot needs to be changed: round193's frame
+  # shows the boot still working at 312.9 s, killed 20 s after SpringBoard[27] had been alive for a
+  # hundred seconds (launchd's "Early boot complete" came at 233 s, and xpcproxy/fairplayd were still
+  # being exec'd and reaped at 312.9 s). A deadline that fires while the boot is still moving measures
+  # the deadline, not the boot. 900 s is the same argument as round184's five minutes, restated for a
+  # boot that now gets past launchd: long enough for a service stall to resolve or for the desktop to
+  # present, short enough that a hung boot still comes back and the card can still be read. The
+  # checker's 60..1800 window is the only constraint, so the value is a reading, not a contract.
+  "clover-unattended=900",
   # Round193. Round192's frame ends with `watchdogd[97] exited -- exit reason namespace 2
   # subcode 0x5 description: none` and the panic-path syncs right behind it, after the same job
   # died the same way twice before (pids 52, 92, 97, each `rv=0x5 ns=2 code=0x5`). ns 2 is

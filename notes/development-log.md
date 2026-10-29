@@ -14795,3 +14795,82 @@ barrier 立即返回，启动一路走到 207.93 s，`dyld` 共享缓存已经�
 读法：下一次 watchdogd 死时，应该看到 `clover r193: crit …` 后面紧跟 `panic-on-crash disabled via
 boot-arg`，而不是 panic 槽；启动应越过 208 s。若 `crashbits=0x6`（`PANIC_ON_CRASH|PANIC_ON_CONSECUTIVE_CRASH`）
 与 `sigcrash=1` 同时在，这行也把「为什么第三次才炸」的答案写死在帧里。
+
+## round193 读数（v0.5.53 实机，2026-10-29）：抑制成立，死线成了新的天花板
+
+帧在 `~/clover-out/clover-log-window.bin`（622592 字节），报告窗三条记录、判据环 29 条、内核环 512
+条（满环，seq 2022..2533）。
+
+### 报告窗：两条死线 panic，说明这条卡上有两次 XNU 启动
+
+slot 1 和 slot 2 是同一句话：`clover r148: unattended deadline 300 s (elr=… ticks=47055 cnt0=f001895
+cnt1=1665393a8 freq=124f800)`，第二条 `ticks=47032 … cnt0=ee15961 cnt1=166358e55`。`freq=0x124f800`
+是 CNTFRQ 19200000，(cnt1−cnt0)/freq 分别是 **300.00 s** 和 **300.01 s**——两次都是到点才响，不是提前、
+也不是别的 panic 借了这句话。slot 0 是更早那条 `watchdogd[97] exited …` 的 panic 记录，来自 round192
+那次启动，环没被清过。
+
+### 判据环：卡这条路这一轮没出问题
+
+`log window armed from GPT first=13320216 sectors=131072 report=… driver=… kernel=…` 是第一行，
+`verdict ring armed lba=13320280 slots=64`、`kernel ring armed lba=13320408 slots=512` 跟着；`r171:
+write cache size=65536 ctrl=0 on=0` 与 `r192: commit skipped size=65536 on=0 (once)` 说明写缓存这一轮
+是交给卡的；`r173: wrcheck … diff=0/0 … trusted=1`、`r172: ADMA2 reads trusted` 都在。也就是说
+**这一轮没有一条判据说卡有问题**，问题全在卡之外。
+
+### 内核环：启动被死线砍在「还在动」的时候
+
+环只覆盖 **211.16–312.89 s**，前 2021 条被冲掉——512 槽 ÷ 100 s ≈ 20 条/秒，其中绝大部分是 r187/r189
+的三行一组（`mach-in`/`mach-out`/`unix-in`）。这 101 s 里发生的：
+
+- `SpringBoard[27]` 在 `213.700196` exec 成功，**到最后一帧 312.894 都没有 exit、没有 crit**——UI 进程
+  活着，活了 100 秒；
+- `launchd` 的 `Early boot complete. Continuing system boot.` 在 `233.162665`；
+- `watchdogd` 死了四次（pid 98/100/102/105，`275.60`、`286.81`、`298.68`、`307.98`），每次后面紧跟
+  `panic-on-crash disabled via boot-arg`——**round193 的那半个答案成立**：同一件事这次没有把机器打崩；
+- 同一段时间里 `xpcproxy`、`fairplayd.A2`、`axassetsd`、`mtmergeprops` 不停 exec/exit，
+  `keybagd` 还在走 mach/unix trap（`ret=0`）；
+- `apfsobj_checksum_verify:6621: disk5s1 failed: cksum 0x0000000266778899, oid 0x1,
+  o_xid=0x2f6d65747379532f, o_type=0x7262694c, o_subtype=0x2f797261, size 4096`，
+  那四个字段按小端读是 `"/System/"`、`"Libr"`、`"ary/"`——交到 `apfsobj_checksum_verify` 手里的
+  4096 字节，偏移 16 处是**路径字符串** `"/System/Library/"`，不是 APFS 对象头。
+
+结论：这一帧里的墙不是卡、不是看门狗，而是 **300 秒本身**。启动在 312.9 s 还在前进，被死线砍掉，
+所以「SpringBoard 之后发生了什么」这一整段是空的。
+
+### 宿主侧：脚本为什么没能把板子送进 recovery
+
+同一次运行留下的 `~/clover-out/unattended-r193.log` 里，`fastboot reboot recovery` 打印了
+`came out as an ordinary reboot`，`fastboot oem reboot-recovery` 打印 `unknown command`。实测三件事：
+
+1. `fastboot reboot recovery` 被接受，但执行的是**普通重启**（板子去启动 cache 里的 payload）；
+2. `fastboot oem reboot-recovery` 是 `unknown command`，`fastboot oem help` 也不存在；
+3. **Android BCB 这条路是通的**：2048 字节、`command[32]="boot-recovery"` 写进 misc（p50），
+   `fastboot reboot` 之后 14 s 进 TWRP 3.7.1，两次都成。
+
+前两条解释了用户看到的两半：「panic 后重启了而不是进了 fastboot」与「进了 fastboot 后还是重启，
+没有进 rec」——第一半是板子自己又启动了一次 XNU（所以卡上有两条死线 panic），第二半是脚本用的
+命令这台 bootloader 根本不认。第三条成了脚本的新一棒。
+
+## round194（v0.5.54）：让死线不砍掉还在动的启动，把三件读数补齐
+
+三处改动，都是「让帧回答这一轮的问题」，不碰任何驱动行为：
+
+1. **`clover-unattended=300` → `900`**（`board.toml`）。理由就是上面那句：312.9 s 时启动还在
+   exec/reap，SpringBoard 活了一百秒，砍在这是量死线不是量启动。900 s 让一个停住的服务要么恢复、
+   要么在帧里留下「一直停着」的形状；死线仍然是回到 fastboot 的唯一路。
+2. **panic 记录带上 `fb=`**（`scripts/xnu-panic-screen.c`）。原来 `fb=` 画在 sink 之后，卡上那条记录
+   **不含**它——两次死线 panic 用的是同一份镜像，只有用户看见第二次进了 fastboot，而屏 20 秒后就没了。
+   现在 `fb=` 在 sink 之前画，既是屏上的一行，也是卡上记录的最后一行；`elog=` 留在 sink 之后，
+   因为那一条才是记录对自己的结论。
+3. **r187/r189 的每调用行改成样本**（`drivers/CloverSdhci`）。这两轮的探针已经答完了（环里每一条
+   `mach-out` 都是 `ret=0`），但它们一行调用三行，占了 512 槽里 2021 条的位置，把内核环压成 101 秒。
+   新增 `kTeeProbeTokens`/`kTeeProbeKeepMax = 48`：前 48 条照旧进环，之后只计数；第一次丢时在驱动环
+   说一句 `CloverSdhci r194: syscall probe lines capped at 48, later ones stay out of the kernel ring`。
+   允许清单本身一个字没改。
+
+契约：`check-clover.py` 新增三条——`board.toml` 必须是 `clover-unattended=900`、驱动必须有
+`kTeeProbeKeepMax = 48`、panic 屏的 `text (&g, "\nfb=");` 必须出现在 `if (PANIC_SINK) {` 之前
+（按位置断言，不只是字符串）。
+
+宿主脚本这一轮的修复单独成两个提交：`f08c98b` 把 recovery 一棒换成 BCB，`ff1d14b` 修掉
+「空环计数被接成两行 `0`」的捕获缺陷（`count_records()`）。

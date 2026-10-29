@@ -594,11 +594,20 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
     hex (&g, "\nTCR=", tcr);
     hex (&g, "\nSCTLR=", sctlr);
   }
+  /* Whether the reset that follows will land in fastboot. 1 means the reason
+   * cell read back FASTBOOT_WORD, 0 means no cell this boot (the driver did not
+   * run) and the reset is an ordinary one. Round194 draws it before the sink, so
+   * the record on the card carries it: round193's two deadline panics were the
+   * same image and only the second was reported to have come back to fastboot,
+   * and a reading that exists only on a panel gone twenty seconds later cannot
+   * say which one it was. */
+  text (&g, "\nfb=");
+  number (&g, fb, 10, 0, 0);
   /* Everything above was also copied into logbuf. Hand that copy to the board's sink -- the eMMC
    * driver appends it to a logfs record -- and draw its verdict. 0 means this build has no sink;
    * 1 means the sink declined (the card was never selected); 100 + slot means both blocks of that
-   * slot were written; 2..5 name a scan or write that failed. The line itself is drawn after the
-   * copy is detached, so the log does not contain its own outcome. */
+   * slot were written; 2..5 name a scan or write that failed. elog= is drawn after the copy is
+   * detached, because that one really is the record's outcome about itself. */
   if (PANIC_SINK) {
     u8 *capture = g.log;
     u32 captured = g.logn;
@@ -608,12 +617,6 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
     text (&g, "\nelog=");
     number (&g, written, 10, 0, 0);
   }
-  /* Whether the reset that follows will land in fastboot. 1 means the reason
-   * cell read back FASTBOOT_WORD, 0 means no cell this boot (the driver did not
-   * run) and the reset is an ordinary one. Drawn after the sink so the record on
-   * the card does not contain it, like elog=. */
-  text (&g, "\nfb=");
-  number (&g, fb, 10, 0, 0);
   /* The raw argument slots are not dumped: the formatted message above already carries them (room for the PANIC_TEXT copy). */
   mark[0] = 0xC0FFEE11u;
   mark[1] = 0x5CEEDA7Au;

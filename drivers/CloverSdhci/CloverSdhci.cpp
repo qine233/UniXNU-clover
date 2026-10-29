@@ -429,6 +429,18 @@ static const char *const kTeeAllowlist[] = {
 };
 static const uint32_t kTeeAllowlistCount =
     sizeof (kTeeAllowlist) / sizeof (kTeeAllowlist[0]);
+// Round194: the r187/r189 syscall probes already answered their question -- on round193's frame every
+// mach-out in the ring carried ret=0 -- but they say three lines per call, and 2021 of the kernel
+// ring's 512 records were theirs: the ring covered 101 s of a 313 s boot and nothing before 211 s.
+// They are a sample now, not a transcript. Enough survive to show the last calls before a stop; the
+// rest stay out so the ring spans the boot it describes.
+static const char *const kTeeProbeTokens[] = { "clover r187:", "clover r189:" };
+static const uint32_t kTeeProbeTokenCount =
+    sizeof (kTeeProbeTokens) / sizeof (kTeeProbeTokens[0]);
+static const uint32_t kTeeProbeKeepMax = 48;
+static uint32_t gTeeProbeKept = 0;
+static uint32_t gTeeProbeDropped = 0;
+static uint32_t gTeeProbeReported = 0;
 
 static volatile uint32_t gTeeReady = 0;         // arms round176's kernel-log ring
 static uint32_t gTeeIndex = 0;                  // next byte of msgbuf to consume
@@ -2735,16 +2747,17 @@ static bool teeHasPrefix (const char *line, uint32_t length, const char *prefix)
 // their own leading text -- "[apfs_jhash:146] ...", "AMFI: ...", "load code signature error 4" behind a
 // mount name. Cost is one pass per short line per allowlist entry; the lines are capped at
 // kTeeLineBytes, so this is bounded without needing to be clever about it.
-static bool teeLineMatches (const char *line, uint32_t length)
+static bool teeTokensMatch (const char *line, uint32_t length,
+                            const char *const *tokens, uint32_t count)
 {
-  for (uint32_t entry = 0; entry < kTeeAllowlistCount; entry++) {
-    const uint32_t width = teeStringLength (kTeeAllowlist[entry]);
+  for (uint32_t entry = 0; entry < count; entry++) {
+    const uint32_t width = teeStringLength (tokens[entry]);
     if (!width || width > length) {
       continue;
     }
     for (uint32_t at = 0; at + width <= length; at++) {
       uint32_t i = 0;
-      while (i < width && line[at + i] == kTeeAllowlist[entry][i]) {
+      while (i < width && line[at + i] == tokens[entry][i]) {
         i++;
       }
       if (i == width) {
@@ -2753,6 +2766,11 @@ static bool teeLineMatches (const char *line, uint32_t length)
     }
   }
   return false;
+}
+
+static bool teeLineMatches (const char *line, uint32_t length)
+{
+  return teeTokensMatch (line, length, kTeeAllowlist, kTeeAllowlistCount);
 }
 
 // The tee's own voice: format and put in the driver's ring, nothing else. sdhciSay cannot be used
@@ -2799,6 +2817,16 @@ static void teeConsumeLine (uint32_t &pushed)
   gTeeSeen++;
   if (teeHasPrefix (gTeeLine + start, length - start, "CloverSdhci ")) {
     return;
+  }
+  if (teeTokensMatch (gTeeLine + start, length - start, kTeeProbeTokens, kTeeProbeTokenCount)) {
+    if (gTeeProbeKept >= kTeeProbeKeepMax) {
+      if (gTeeProbeDropped++ == 0 && gTeeProbeReported++ == 0) {
+        teeSay ("CloverSdhci r194: syscall probe lines capped at %u, later ones stay out of the "
+                "kernel ring\n", kTeeProbeKeepMax);
+      }
+      return;
+    }
+    gTeeProbeKept++;
   }
   if (!teeLineMatches (gTeeLine + start, length - start)) {
     return;

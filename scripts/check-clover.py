@@ -2960,6 +2960,14 @@ def check_board(errors: list) -> str:
         ("scripts/read-clover-log.py",
          "--count",
          "run-clover-unattended.sh would have no machine-readable record count"),
+        ("board.toml",
+         '"clover-unattended=900"',
+         "the deadline would cut a boot that round193's frame shows still moving at 312.9 s, "
+         "and the round would be measuring the deadline instead of the boot"),
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         "kTeeProbeKeepMax = 48",
+         "the r187/r189 per-call lines would fill the kernel ring again: they were 2021 of "
+         "its 512 records on round193's frame, which covered 101 s of a 313 s boot"),
     ]
     for relative, needle, why in links:
         path = REPO / relative
@@ -2968,6 +2976,17 @@ def check_board(errors: list) -> str:
             continue
         if needle not in path.read_text():
             errors.append(f"{relative} lacks {needle!r}: {why}")
+    # Round194: the panic record has to carry fb=. Whether the reset lands in fastboot was drawn only
+    # on the panel, so the two deadline panics on round193's card could not be told apart -- and a
+    # panel is gone twenty seconds after it is drawn.
+    screen = REPO / "scripts/xnu-panic-screen.c"
+    if screen.is_file():
+        screen_text = screen.read_text()
+        drawn = screen_text.find('text (&g, "\\nfb=");')
+        sink = screen_text.find("if (PANIC_SINK) {")
+        if drawn < 0 or sink < 0 or drawn > sink:
+            errors.append("xnu-panic-screen.c draws fb= after the sink: the panic record would not say "
+                          "whether its own reset was going to land in fastboot")
     host = REPO / "scripts/run-clover-unattended.sh"
     if host.is_file():
         # `fastboot boot` is forbidden everywhere in this port: the image must be cold-booted from

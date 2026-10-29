@@ -414,6 +414,21 @@ VERDICT_RING = ("CloverSdhci r174: verdict ring armed lba=",
                 "CloverSdhci r175: tee armed bufc=")
 
 
+# Round194 caps the r187/r189 per-call probe lines at 48 in the kernel-ring tee. The r193 dump needed
+# that: 2021 of the ring's 512 surviving records were those two kinds, so the ring only covered 101 s of
+# a 313 s boot and the part after the boot started working was what got evicted. A payload built from a
+# driver without the cap still shows every other string this verifier looks for, so the cap gets its own
+# needle; the line names the number so a reader of the ring knows what 48 means.
+TEE_PROBE_CAP = "CloverSdhci r194: syscall probe lines capped at %u"
+
+
+def check_tee_probe_cap(kernel: bytes) -> bool:
+    label = "kernel.macho: tee probe cap linked"
+    ok = TEE_PROBE_CAP.encode() in kernel
+    print(f"{label:42} {'OK' if ok else 'FAIL'} (probe cap line {'present' if ok else 'ABSENT'})")
+    return ok
+
+
 def check_read_integrity(kernel: bytes) -> bool:
     """Every block read drains the FIFO first and resets the data path on failure; the batch is
     trusted only behind a three-way agreement and is now judged on delivered words rather than an end
@@ -1167,6 +1182,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_read_integrity(kernel)
         ok &= check_guard_handoff(kernel)
         ok &= check_verdict_ring(kernel)
+        ok &= check_tee_probe_cap(kernel)
         ok &= check_exec_sig_dump(kernel)
         ok &= check_kernel_normalized(kernel)
         ok &= check_unattended(kernel)
