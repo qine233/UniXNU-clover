@@ -908,7 +908,10 @@ def check_sb_sample(kernel: bytes) -> bool:
     frame is decided by lines printed before the kill."""
     label = "kernel.macho: r217 sb sample linked"
     found = {"sbs": (b"clover r217: sbs t=%llu pid=%d n=%u c=%u%s%s\n") in kernel,
-             "busy": (b"clover r217: sbthr busy=1 pid=%d budget=%u\n") in kernel}
+             "busy": (b"clover r217: sbthr busy=1 pid=%d budget=%u\n") in kernel,
+             "killsrc": (b"clover r218: killsrc upc=%016llx ulr=%016llx code=") in kernel,
+             "killustk": (b"clover r218: killustk n=%u sp=%016llx fp=%016llx") in kernel,
+             "sbpc": (b"clover r218: sbpc t=%llu tid=0x%llx x16=%llx n=%u") in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())

@@ -24,8 +24,94 @@ index 9298c33..fbfa2b8 100644
  	if (p == NULL || !clover_sys_why_watched(p->p_comm)) {
  		return;
  	}
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+index 98ee874..dfd2a63 100644
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -2155,6 +2155,81 @@ psignal_internal(proc_t p, task_t task, thread_t thread, int flavor, int signum,
+ 			clover_emmc_probe_say(clover_r208_line,
+ 			    (unsigned int)strlen(clover_r208_line));
+ 
++			/* Round218. The sender's user stack says who called kill,
++			 * which the pc alone cannot: at a syscall the pc sits in
++			 * the stub. Eight words at the pc still identify the stub;
++			 * the frame chain names the caller in backboardd. */
++			{
++				extern uint64_t clover_sender_ulr(void);
++				extern uint32_t clover_sender_ufp(uint64_t *fp, uint64_t *sp);
++				uint32_t clover_r218_code[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++				uint64_t clover_r218_f[4] = { 0, 0, 0, 0 };
++				uint64_t clover_r218_fp = 0;
++				uint64_t clover_r218_sp = 0;
++				uint32_t clover_r218_n = 0;
++				char clover_r218_line[320];
++
++				if (clover_r208_upc != 0 &&
++				    copyin((user_addr_t)clover_r208_upc, clover_r218_code,
++				    sizeof(clover_r218_code)) != 0) {
++					memset(clover_r218_code, 0,
++					    sizeof(clover_r218_code));
++				}
++				snprintf(clover_r218_line, sizeof(clover_r218_line),
++				    "clover r218: killsrc upc=%016llx ulr=%016llx code=%08x.%08x.%08x.%08x.%08x.%08x.%08x.%08x\n",
++				    (unsigned long long)clover_r208_upc,
++				    (unsigned long long)clover_sender_ulr(),
++				    clover_r218_code[0], clover_r218_code[1],
++				    clover_r218_code[2], clover_r218_code[3],
++				    clover_r218_code[4], clover_r218_code[5],
++				    clover_r218_code[6], clover_r218_code[7]);
++				clover_r218_line[sizeof(clover_r218_line) - 1] = '\0';
++				printf("%s", clover_r218_line);
++				clover_emmc_probe_say(clover_r218_line,
++				    (unsigned int)strlen(clover_r218_line));
++
++				if (clover_sender_ufp(&clover_r218_fp,
++				    &clover_r218_sp) != 0 && clover_r218_fp != 0) {
++					uint64_t clover_r218_limit = clover_r218_sp + 0x40000;
++					uint64_t clover_r218_wfp = clover_r218_fp;
++
++					while (clover_r218_n < 4 &&
++					    (clover_r218_wfp & 7) == 0 &&
++					    clover_r218_wfp >= clover_r218_sp &&
++					    clover_r218_wfp < clover_r218_limit) {
++						uint64_t clover_r218_pair[2];
++
++						if (copyin((user_addr_t)clover_r218_wfp,
++						    clover_r218_pair,
++						    sizeof(clover_r218_pair)) != 0) {
++							break;
++						}
++						if (clover_r218_pair[1] == 0) {
++							break;
++						}
++						clover_r218_f[clover_r218_n++] =
++						    clover_r218_pair[1];
++						if (clover_r218_pair[0] <= clover_r218_wfp) {
++							break;
++						}
++						clover_r218_wfp = clover_r218_pair[0];
++					}
++				}
++				snprintf(clover_r218_line, sizeof(clover_r218_line),
++				    "clover r218: killustk n=%u sp=%016llx fp=%016llx f0=%016llx f1=%016llx f2=%016llx f3=%016llx\n",
++				    clover_r218_n,
++				    (unsigned long long)clover_r218_sp,
++				    (unsigned long long)clover_r218_fp,
++				    (unsigned long long)clover_r218_f[0],
++				    (unsigned long long)clover_r218_f[1],
++				    (unsigned long long)clover_r218_f[2],
++				    (unsigned long long)clover_r218_f[3]);
++				clover_r218_line[sizeof(clover_r218_line) - 1] = '\0';
++				printf("%s", clover_r218_line);
++				clover_emmc_probe_say(clover_r218_line,
++				    (unsigned int)strlen(clover_r218_line));
++			}
++
+ 			clover_r211_kn = clover_current_kstack(clover_r211_kf, 6);
+ 			snprintf(clover_r211_line, sizeof(clover_r211_line),
+ 			    "clover r211: skst n=%u f0=%016llx f1=%016llx f2=%016llx f3=%016llx f4=%016llx f5=%016llx\n",
 diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
-index 4a12dd9..970e459 100644
+index 4a12dd9..6363bc0 100644
 --- a/osfmk/kern/task.c
 +++ b/osfmk/kern/task.c
 @@ -121,6 +121,7 @@
@@ -36,7 +122,87 @@ index 4a12dd9..970e459 100644
  #include <kern/timer.h>
  #include <kern/assert.h>
  #include <kern/affinity.h>
-@@ -10390,8 +10391,25 @@ clover_task_threads(task_t task, uint32_t budget)
+@@ -10311,6 +10312,79 @@ clover_sender_upc(void)
+ 	return (ss != NULL) ? (uint64_t)get_saved_state_pc(ss) : 0;
+ }
+ 
++/*
++ * Round218. The same delivery, two more readings of the sender. ulr is the
++ * stub's own return address; ufp hands the user frame pointer and stack
++ * pointer to bsd, where copyin is declared, so the kill call site can be
++ * walked on the sender's stack instead of only read at the pc.
++ */
++uint64_t
++clover_sender_ulr(void)
++{
++	thread_t thr = current_thread();
++	arm_saved_state_t *ss;
++
++	if (thr == THREAD_NULL) {
++		return 0;
++	}
++	ss = get_user_regs(thr);
++	return (ss != NULL) ? (uint64_t)get_saved_state_lr(ss) : 0;
++}
++
++uint32_t
++clover_sender_ufp(uint64_t *fp, uint64_t *sp)
++{
++	thread_t thr = current_thread();
++	arm_saved_state_t *ss;
++
++	if (thr == THREAD_NULL || fp == NULL || sp == NULL) {
++		return 0;
++	}
++	ss = get_user_regs(thr);
++	if (ss == NULL) {
++		return 0;
++	}
++	*fp = (uint64_t)get_saved_state_fp(ss);
++	*sp = (uint64_t)get_saved_state_sp(ss);
++	return 1;
++}
++
++/*
++ * Round218. Walk a user stack the same way the kernel walk goes, with the
++ * stack pointer as the floor and a fixed ceiling above it: a chain that
++ * leaves that window is a stale or corrupt fp, not a frame. copyin comes in
++ * as the copyio.h macro, so it is called through the three-argument form.
++ */
++
++static uint32_t
++clover_user_fp_walk(uint64_t fp, uint64_t sp, uint64_t *frames, uint32_t frames_max)
++{
++	uint32_t i = 0;
++	uint64_t limit;
++
++	if (sp == 0) {
++		return 0;
++	}
++	limit = sp + 0x40000;
++	while (i < frames_max && fp != 0 && (fp & 7) == 0 &&
++	    fp >= sp && fp < limit) {
++		uint64_t pair[2];
++
++		if (copyin((user_addr_t)fp, pair, sizeof(pair)) != 0) {
++			break;
++		}
++		if (pair[1] == 0) {
++			break;
++		}
++		frames[i++] = pair[1];
++		if (pair[0] <= fp) {
++			break;
++		}
++		fp = pair[0];
++	}
++	return i;
++}
++
+ /*
+  * Round211. Walk one thread's kernel stack the way kdp does: the kernel
+  * saved state sits at the top of the thread's kernel stack, and each
+@@ -10390,8 +10464,25 @@ clover_task_threads(task_t task, uint32_t budget)
  	}
  	pid = task_pid(task);
  	/* Snapshot under the lock and print after it: the console can block
@@ -64,7 +230,7 @@ index 4a12dd9..970e459 100644
  	queue_iterate(&task->threads, thr, thread_t, task_threads) {
  		arm_saved_state_t *ss;
  		arm_kernel_saved_state_t *ks;
-@@ -10473,4 +10491,149 @@ clover_task_threads(task_t task, uint32_t budget)
+@@ -10473,4 +10564,187 @@ clover_task_threads(task_t task, uint32_t budget)
  	}
  	return n;
  }
@@ -133,11 +299,26 @@ index 4a12dd9..970e459 100644
 +	int toff = 0;
 +	int len;
 +	int pid;
++	uint64_t tids[5];
++	uint64_t x16s[5];
++	uint64_t fps[5];
++	uint64_t sps[5];
 +	uint32_t n = 0;
++	uint32_t i;
 +	uint32_t changed;
 +	uint32_t heartbeat;
 +
 +	if (!__atomic_load_n(&clover_sb_ready, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	task = clover_sb_task;
++	if (task == TASK_NULL) {
++		return;
++	}
++	/* Round218 reads each thread's user stack, and copyin uses the map of
++	 * whoever is trapping, so a sample is only taken when SpringBoard
++	 * itself is the current task. */
++	if (current_task() != task) {
 +		return;
 +	}
 +	secs = clover_now_seconds();
@@ -145,10 +326,6 @@ index 4a12dd9..970e459 100644
 +		return;
 +	}
 +	clover_sb_last_secs = secs;
-+	task = clover_sb_task;
-+	if (task == TASK_NULL) {
-+		return;
-+	}
 +	if (!lck_mtx_try_lock(&task->lock)) {
 +		if (secs >= clover_sb_heartbeat + 120) {
 +			clover_sb_heartbeat = secs;
@@ -168,8 +345,17 @@ index 4a12dd9..970e459 100644
 +			break;
 +		}
 +		ss = get_user_regs(thr);
++		tids[n] = thr->thread_id;
++		x16s[n] = 0;
++		fps[n] = 0;
++		sps[n] = 0;
 +		if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1) {
 +			pc = (uint64_t)get_saved_state_pc(ss);
++			if (!is_saved_state32(ss)) {
++				x16s[n] = (uint64_t)saved_state64(ss)->x[16];
++			}
++			fps[n] = (uint64_t)get_saved_state_fp(ss);
++			sps[n] = (uint64_t)get_saved_state_sp(ss);
 +		}
 +		wrote = snprintf(tokens + toff, sizeof(tokens) - (size_t)toff,
 +		    " %llx:%d:%llx:%llx:%llx",
@@ -211,6 +397,24 @@ index 4a12dd9..970e459 100644
 +	if (len > 0) {
 +		line[sizeof(line) - 1] = '\0';
 +		printf("%s", line);
++	}
++	for (i = 0; i < n; i++) {
++		uint64_t frames[4] = { 0, 0, 0, 0 };
++		uint32_t kn;
++		char extra[224];
++		int elen;
++
++		kn = clover_user_fp_walk(fps[i], sps[i], frames, 4);
++		elen = snprintf(extra, sizeof(extra),
++		    "clover r218: sbpc t=%llu tid=0x%llx x16=%llx n=%u f0=%llx f1=%llx f2=%llx f3=%llx\n",
++		    (unsigned long long)secs, (unsigned long long)tids[i],
++		    (unsigned long long)x16s[i], kn,
++		    (unsigned long long)frames[0], (unsigned long long)frames[1],
++		    (unsigned long long)frames[2], (unsigned long long)frames[3]);
++		if (elen > 0) {
++			extra[sizeof(extra) - 1] = '\0';
++			printf("%s", extra);
++		}
 +	}
 +}
  #endif /* __arm64__ */

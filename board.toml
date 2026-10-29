@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r217: the stop is read while SpringBoard is still alive -- round216 showed the kill-time walker could not take task_lock (39 s) and that the state it finally read was already freed, so the trylock now records busy=1 instead of waiting, and every mach-trap entry samples all SpringBoard threads (tid:state:wait_event:continuation:pc, under the tee's 320 bytes), emitting a line only when the set of states changes"
+title = "clover r218: the kill's sender stack and each sampled thread's syscall number -- round217 denied every kernel-side cause and left SpringBoard stopped in user space before its first render, so the SIGKILL line now carries the sender's user pc, eight code words at it and a four-frame user stack from backboardd's watchdog, and each sampled SpringBoard thread adds its x16 syscall number plus a four-frame user stack, taken only from SpringBoard's own mach traps because copyin uses the trapping task's map"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

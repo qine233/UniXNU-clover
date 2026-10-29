@@ -639,6 +639,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // caps the changes at 32 and the boot ends by 900 s, so 64 is the whole conversation with room to
   // spare, and the class cannot crowd the exec/exit pairs.
   { "clover r217: ", "r217-sbs", 64, 0, 0, 0 },
+  // Round218 adds three lines to a kill (sender code and user stack) and up to four frames of user
+  // chain per sampled thread, five threads at most, every eight seconds while the states change.
+  // The kernel caps the changes at 32, so 32 x 5 + 2 fits in 192: the frame before the kill cannot
+  // be truncated, and the class still stops a looping daemon from pushing the exec/exit pairs out.
+  { "clover r218: ", "r218-sbs", 192, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
