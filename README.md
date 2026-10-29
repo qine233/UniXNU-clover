@@ -12,21 +12,26 @@ OS/SystemOS/Data 三个卷全挂、launchd 把守护进程拉起来；r202 让
 因为画 UI 的 SpringBoard 被 backboardd 用 `kill(2)` 杀掉（r207：`_kill+0x140`、
 `ns=-1 code=0`、CS 位不含 `CS_KILLED`；r208/r210 的 `sender upc` 逐位相同）。
 
-r210 把「是不是卡在块 I/O」这条结掉了：flight 区记到死线前最后一笔读（`seq 184683`、
-`t=900.664 s`、120 块、`ps=0x01f800f0` 无 CMD/DAT inhibit），CPU0 心跳 4 s 一拍走到
-`t=897.566 s`、`miss=46` 恒定、`pend=0/0`——块路径和守卫到死线都健康，r209 的
-「传输卡在飞行中」没复现；panic sink 也证明写得进去（`unseen=0 refused=0 drop=0`，
-内核环写到 `[911.924696]`）。真正的停点就在内核环里：`[457.346085]` backboardd(pid 58)
-向 SpringBoard(pid 27) 发 SIGKILL（`cs=0x22000301`、`ra=fffffff0076ffd7c`），下一秒
-`exit rv=0x9`。杀之前 SpringBoard 只剩 5 条线程、全在 TH_WAIT（两条带 TH_WAIT_REPORT），
-按 dyld 缓存符号化落在 `DiagnosticRequestService` 与 Swift 运行时里，没有一条 tid 等于 pid。
-桌面就差这一件事：**SpringBoard 在等什么**。
+r210 把「是不是卡在块 I/O」这条结掉了：那一帧的 flight 区记到死线前最后一笔读
+（`t=900.664 s`、120 块、`ps=0x01f800f0` 无 CMD/DAT inhibit），CPU0 心跳一拍不落地走到
+`t=897.566 s`，panic sink 也写得进去（内核环到 `[911.924696]`）；杀点就在环里：
+`[457.346085]` backboardd(pid 58) 向 SpringBoard(pid 27) 发 SIGKILL（`cs=0x22000301`、
+`ra=fffffff0076ffd7c`），杀之前 SpringBoard 5 条线程全在 TH_WAIT、没有一条 tid 等于 pid。
+桌面就差这一件事：**SpringBoard 在等什么**。r211 想在杀点把每条线程的内核栈打出来，
+这一帧没拿到：flight 区最后一笔是 `t=341.015 s` 的 8 块读（`lba=28308144`，**无后继**），
+最后一拍心跳 `t=340.978 s` 之后再没有一拍——守卫被一笔没回来的读拿住，内核环因此停在
+`[352.186939]`（`sync-out ok=1 pending=152`）。机器活到 913 s，8 颗 CPU 各自在
+`ArmCpu.cpp:644/647` 的死线上落了一条 kind-20 记录（`cnt1≈0x414c…`、`fb=1`），panic 文本和
+4 条驱动记录写上了卡，但 `panicTailRead` **一条也没产出、连状态行都缺席**——它唯一的早退
+路径是 `gTeeReady` 门。于是 352→913 s 的 msgbuf 连同 r211 的线程栈一起丢了。
+r212 让内核 probe 直接把文本推进驱动的 32 槽 RAM 环（不经块路径、不经 msgbuf、不经 tee），
+panic 时随驱动环落卡；每条记录带 boot id、drain 进出各说一行、尾读去掉 `gTeeReady` 门。
 
 ## 距离 iOS 桌面还差什么
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 被 backboardd 的看门狗杀掉** | r207 读数：`killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58 scomm=backboardd ns=-1 code=0x0 cs=0x22000301 ra=fffffff0076ffd7c`。锚点与 `_psignal_internal` 的链接地址逐位相同（slide=0），`ra` 解成 `_kill+0x140`；CS 位不含 `CS_KILLED`，不是签名校验；backboardd 里有 `_pingSystemShellForCollectiveWatchdog:`、`watchdogPing: system app claims it's no longer alive`、`Killing %{public}@.`。r208 没有复现（环停 `[167.198224]` 后 732 s 无块 I/O）；r209 走到死线但 panic sink 没写进去。r210 反转了后两条：flight 到死线最后一笔读 `t=900.664 s`、心跳 4 s 拍到 `t=897.566 s`（`miss=46` 恒定、`pend=0/0`）⇒ 块路径健康；panic sink 写入成功（`unseen=0`，内核环到 `[911.924696]`）；kill 发生在 `[457.346085]`，之后 `exit rv=0x9`。杀前 SpringBoard 5 线程全在 TH_WAIT，pc 落在 `DiagnosticRequestService` / `libswift_StringProcessing`，无主线程 | r211 在 kill 点对 receiver 每条线程打印 `lr/sp` 加内核栈回流（`kstackptr` 起按 x29 走 6 帧），标出主线程；发送者 backboardd 的当前线程同样走一遍。panic 状态行改推驱动环并带上 `panicAppendText` 的 rc |
+| 1 | **SpringBoard 被 backboardd 的看门狗杀掉** | r207 读数：`killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58 scomm=backboardd ns=-1 code=0x0 cs=0x22000301 ra=fffffff0076ffd7c`。锚点与 `_psignal_internal` 的链接地址逐位相同（slide=0），`ra` 解成 `_kill+0x140`；CS 位不含 `CS_KILLED`，不是签名校验；backboardd 里有 `_pingSystemShellForCollectiveWatchdog:`、`watchdogPing: system app claims it's no longer alive`、`Killing %{public}@.`。r208 没有复现（环停 `[167.198224]`）；r209 走到死线但 sink 没写进去；r210 块路径健康到死线（flight 到 `t=900.664 s`、心跳到 `t=897.566 s`），sink 写入成功，kill 在 `[457.346085]`，杀前 5 线程全在 TH_WAIT、pc 落在 `DiagnosticRequestService` / `libswift_StringProcessing`，无主线程。r211 在杀点加了内核栈回流，但这一帧的守卫被 `t=341.015 s` 一笔无后继的 8 块读拿住，环停在 `[352.186939]`，panic 时 `panicTailRead` 又被 `gTeeReady` 门挡住——杀点的栈已经打进 msgbuf 却没落卡 | r212 把内核 probe 行双投递到驱动的 32 槽 RAM 环（`clover_emmc_probe_say`，不碰块路径），panic drain 时落卡；记录头加 boot id、drain 进出各说一行、尾读去门并扫整个 msgbuf |
 | 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |

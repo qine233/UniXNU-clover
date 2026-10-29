@@ -530,6 +530,10 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // The kernel caps itself at 64 lines, so the class is the same 64 and one SpringBoard death
   // still fits the ring beside r207's line -- and r207's own class of 48 cannot be starved by it.
   { "clover r208: ", "r208-kill", 64, 0, 0, 0 },
+  // Round211 keeps the same delivery but adds a second line per thread (the kernel stack returned
+  // into) and one line for the sender's own kernel stack. Twelve lines at most per kill, so 64
+  // leaves room for three deaths without letting the class crowd out the exec/exit pairs.
+  { "clover r211: ", "r211-kill", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -580,6 +584,10 @@ static unsigned int panicMarkRecovery (void);
 static uint32_t gPanicDrained = 0;              // one drain per boot; the sink can be called again
 static uint32_t gPanicDrainWritten = 0;         // records this drain put on the card
 static uint32_t gPanicDrainDropped = 0;         // oldest records it gave up to keep the newest
+// Round211: the panic text's own return code, carried into the status line. Round210's frame wrote the
+// rings but no kind-20 record, and without this number the reader could not tell a failed slot scan
+// from a write that never got its turn.
+static uint32_t gPanicAppendRc = 0xffffffffu;
 
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
@@ -3224,8 +3232,10 @@ static const uint32_t kPanicTailLines = 24;      // newest complete lines pushed
 static const uint32_t kPanicTailAlways = 3;      // newest lines kept even when their class is noise
 static const uint32_t kPanicTailScanBytes = 16384;
 
-// The panic sink's voice: formats once and pushes the line into the kernel ring, with no IOLog and
-// no driver-ring copy -- what it has to say is about the kernel's own buffer, so it belongs there.
+// The panic sink's voice: formats once and pushes the line into the driver ring. Round209 pushed it
+// into the kernel ring because the line is about the kernel's buffer, but the kernel ring's only
+// producer is the tee -- a line pushed from here made the host read a driver row as a kernel one and
+// report a phantom echo. The driver ring has no such contract: this module owns both halves of it.
 static void panicTailSay (const char *fmt, ...)
 {
   char line[kVerdictTextBytes + 1];
@@ -3233,7 +3243,7 @@ static void panicTailSay (const char *fmt, ...)
   va_start (args, fmt);
   const uint32_t length = verdictFormat (line, kVerdictTextBytes, fmt, args);
   va_end (args);
-  kernelRingPush (line, length);
+  ringPush (kRingDriver, line, length);
 }
 
 static bool panicTailNoise (const char *line, uint32_t length)
@@ -3267,7 +3277,7 @@ static void panicTailRead (void)
     reason = 5;
   }
   if (reason) {
-    panicTailSay ("CloverSdhci r209: panic tail refused reason=%u magic=0x%x size=%d bufx=%d\n",
+    panicTailSay ("CloverSdhci r211: panic tail refused reason=%u magic=0x%x size=%d bufx=%d\n",
                   reason, magic, size, bufx);
     return;
   }
@@ -3331,8 +3341,8 @@ static void panicTailRead (void)
     kernelRingPush (text, lineLength);
   }
 
-  panicTailSay ("CloverSdhci r209: panic tail lines=%u unseen=%u bufx=%d cursor=%u size=%u "
-                "lap=%u refused=%u pend=%u drop=%u guard=%u last=%ums cache=%u\n",
+  panicTailSay ("CloverSdhci r211: panic tail lines=%u unseen=%u bufx=%d cursor=%u size=%u "
+                "lap=%u refused=%u pend=%u drop=%u guard=%u last=%ums cache=%u append_rc=%u\n",
                 taken, unseen, bufx,
                 static_cast<unsigned int> (gTeeIndex), sizeu,
                 static_cast<unsigned int> (gTeeLap), static_cast<unsigned int> (gTeeRefused),
@@ -3340,7 +3350,8 @@ static void panicTailRead (void)
                 static_cast<unsigned int> (gRingDropped[kRingKernel]),
                 static_cast<unsigned int> (__atomic_load_n (&gGuardWaits, __ATOMIC_RELAXED)),
                 static_cast<unsigned int> (__atomic_load_n (&gGuardLastWaitMs, __ATOMIC_RELAXED)),
-                static_cast<unsigned int> (__atomic_load_n (&gCacheOn, __ATOMIC_RELAXED)));
+                static_cast<unsigned int> (__atomic_load_n (&gCacheOn, __ATOMIC_RELAXED)),
+                static_cast<unsigned int> (gPanicAppendRc));
 }
 
 // Round184: the panic screen's sink is the last writer this boot gets, and it is called at a moment
@@ -7254,6 +7265,7 @@ extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int
   // second owner of the card in the middle of the panic's own writes. The first panic owns it.
   __atomic_store_n (&gPanicActive, 1u, __ATOMIC_RELEASE);
   const unsigned int rc = panicAppendText (text, length);
+  gPanicAppendRc = rc;
   panicDrainRings ();
   // Last, because everything above is a reading and this changes what the reset does. The screen
   // wrote its IMEM word before calling here; on this board that word does not survive into XBL's

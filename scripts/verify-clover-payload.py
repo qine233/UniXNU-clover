@@ -786,7 +786,9 @@ def check_critical_exit_probe(kernel: bytes) -> bool:
     """Round193 reads why a crash became critical. The r192 frame ends on the third watchdogd
     SIGTRAP and the panic behind it, so the image has to carry the line that names the
     crash-behavior bits and deadline of every critical exit, and it has to keep the r170 exit line
-    -- that one is what pairs the death with its pid and wait status in the same frame."""
+    -- that one is what pairs the death with its pid and wait status in the same frame. Round211
+    adds the kernel side of the same kill: the sender's own backtrace and, for every receiving
+    thread, the saved user lr/sp plus the kernel frames behind it."""
     label = "kernel.macho: critical exit reading linked"
     found = {"crit": (b"clover r193: crit pid=%d comm=%s rv=0x%x sig=%d fatal=%d sigcrash=%d "
                       b"crashbits=0x%x spawnfail=%d deadline=%llu now=%llu\n") in kernel,
@@ -794,8 +796,12 @@ def check_critical_exit_probe(kernel: bytes) -> bool:
                          b"ns=%d code=0x%llx cs=0x%x ra=%016llx anchor=%016llx\n") in kernel,
              "killupc": (b"clover r208: sender upc=%016llx uinsn=%08x spid=%d scomm=%s\n")
                         in kernel,
-             "sbthr": (b"clover r208: sbthr n=%u tid=0x%llx pc=%016llx cpsr=%08x state=%d "
-                       b"wait=%016llx\n") in kernel,
+             "skst": (b"clover r211: skst n=%u f0=%016llx f1=%016llx f2=%016llx f3=%016llx "
+                      b"f4=%016llx f5=%016llx\n") in kernel,
+             "sbthr": (b"clover r211: sbthr n=%u pid=%d mt=%d tid=0x%llx pc=%016llx lr=%016llx "
+                       b"sp=%016llx cpsr=%08x state=%d kin=%u wait=%016llx\n") in kernel,
+             "sbthk": (b"clover r211: sbthk n=%u ktop=%016llx kfp=%016llx klr=%016llx "
+                       b"kf=%016llx,%016llx,%016llx,%016llx,%016llx,%016llx\n") in kernel,
              "kept-r170": (b"clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx "
                            b"comm=%s\n") in kernel}
     ok = all(found.values())
@@ -810,12 +816,13 @@ def check_panic_tail_read(kernel: bytes) -> bool:
     167.198 s and gains nothing before the deadline, because the tee only runs on block I/O tails;
     the sink is the one writer left, so the image has to carry the backwards scan and its status
     row -- `unseen` is what separates a stopped kernel from a stopped card path. It has to keep the
-    r184 drain line, which is the record that the drain ran at all."""
+    r184 drain line, which is the record that the drain ran at all. Round211 adds `append_rc`: the
+    status row is the only place where the sink's own verdict on the panic sentence survives."""
     label = "kernel.macho: panic-time log tail linked"
-    found = {"tail": (b"CloverSdhci r209: panic tail lines=%u unseen=%u bufx=%d cursor=%u "
-                      b"size=%u lap=%u refused=%u pend=%u drop=%u guard=%u last=%ums cache=%u\n")
-                     in kernel,
-             "refused": (b"CloverSdhci r209: panic tail refused reason=%u magic=0x%x size=%d "
+    found = {"tail": (b"CloverSdhci r211: panic tail lines=%u unseen=%u bufx=%d cursor=%u "
+                      b"size=%u lap=%u refused=%u pend=%u drop=%u guard=%u last=%ums cache=%u "
+                      b"append_rc=%u\n") in kernel,
+             "refused": (b"CloverSdhci r211: panic tail refused reason=%u magic=0x%x size=%d "
                          b"bufx=%d\n") in kernel,
              "kept-r184": (b"CloverSdhci r184: panic drain wrote=%u dropped=%u tee_passes=%u\n")
                           in kernel}

@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r210: record every block request at its entry and beat from CPU0's timer -- r209's kernel ring stops at 357.9 s with the kernel still printing and the card refusing the panic sink too, so the flight region (entries at sector 32..43, four-second beats at 56..59) names the request that never came back and the last time the block guard was free and the controller accepted a command"
+title = "clover r211: at the kill, backtrace the kernel stack of every SpringBoard thread and of backboardd itself -- r210's flight shows every block request retiring within 7 ms and the sink still writing at 911 s, so the boot is not stuck on storage: r207's kill lands at 457.3 s with all five SpringBoard threads in TH_WAIT and no user pc that names a park site, so the kernel return addresses behind each thread say what they are waiting on"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

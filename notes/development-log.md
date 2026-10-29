@@ -15885,3 +15885,53 @@ append 的读被挡住，而随后（tee 8 轮之后）的环写已经能进。*
    调用。预算仍按 SpringBoard 专用槽。
 2. **panic sink 的第一步**：写状态行前先把 `panicAppendText` 的 rc 记下；状态行改走驱动环；
    如果 rc 是读失败，下一轮再决定是否在 append 前 reset 控制器。
+
+## round211 读数（这一帧没拿到杀点，但把 r212 的通道定了）
+
+**先说结论**：r211 想在 kill 点打出来的线程栈**没有落到卡上**，原因不在探针，而在块路径。
+这一帧的守卫在 `t=341.015 s` 被一笔 8 块读（`lba=28308144`）拿住再没放出来，
+内核环停在 `[352.186939]`，tee 因此再也没有机会把 352→913 s 的 msgbuf 抄上卡；
+panic sink 自己会写卡，但它的尾读被 `gTeeReady` 门挡掉了。
+
+- **flight 区**：最后一笔 entry 是 `seq 81254 / slot 2 / t=341015 ms / read / lba=28308144 /
+  blocks=8 / ps=0x01f800f0 / inh=- / ops=81254 / guard=81255 / miss=21 / pend=0/0`，
+  `prev=write/8/0ms/8`，**没有后继**——这就是没回来的那一笔。
+  最后一拍 beat 是 `seq 64 / slot 0 / t=340978 ms / ps=0x01f800f0 / miss=21 / pend=0/0`，
+  与 entry 只差 37 ms；此后再没有 beat。beat 是 CPU0 定时器打的、不依赖块请求，
+  它停住说明**守卫一直被占着**（`IOLockTryLock` 拿不到），不是卡拒绝了命令（`ps` 里
+  CMD/DAT inhibit 都是 0）。中间 `324966→336974 ms` 已经缺了两拍，守卫在那之前就开始被占。
+- **内核环**：512 槽满，`seq 595..1106`，最早 `[142.679842]`，最后
+  `[352.186939] CloverBlock r190: sync-out ok=1 pending=152`，之后一条没有。
+  tee 的驱动环进度行 `r175: tee seen=3194 kept=734 … idx=59557` 说明它是正常跑着的，
+  是块 I/O 先停了，tee 才停。
+- **驱动环**：36 条（`seq 0..35`）。`seq 0..5` 是上膛（`r185` 的 `bufx=12771`、`r174`/`r176`、
+  `r175`、`r198`、`r210`），`seq 6..18` 是一次性判据（cache/link/readcheck/dma/wrcheck），
+  `seq 19..34` 是 tee 进度与五条类配额行，`seq 35` 是
+  `CloverSdhci r184: panic drain wrote=4 dropped=0 tee_passes=8`。
+  **全场没有一条 `CloverSdhci r211` 或 `clover r211` 行**：杀点的 printf 进了 msgbuf，
+  但 tee 在 352 s 就停了，panic 尾读又没跑，所以它谁也没见到。
+- **panic 窗**：16 槽里 12 条，**全是 kind 20**。`slot 0` 是 `watchdogd[97] exited`（更早一靴），
+  `slot 1..3` 是旧的 300 s/900 s 死线行。`slot 4..11` 是**这一帧**的八条：
+  `elr=fffffff0073c5d60/5d94/5ed8/7389058 @ArmCpu.cpp:644/647`，
+  `cnt0≈0xecc0fba..0xf07aeaf`（≈13 s，第一次 tick），
+  `cnt1≈0x414c363c0..0x415005334`（≈913 s）——**八颗 CPU 各自在自己的无人值守死线上 panic**，
+  每条都带 `fb=1`。也就是说这台机器不是死机，是活到死线后按设计复位。
+- **panic 文本确实写进了卡**：`slot 4..11` 的 16 个块全在，校验和全对；`r184` 行也落了卡。
+  所以卡在 panic 时是能写的，`wrote=4` 也说明 drain 至少写了驱动环的 3 条 pending + r184 行。
+- **尾读为什么零输出**：`panicTailRead` 只有一条早退路径 `if (!gTeeReady) return;`，
+  而全集里没有任何地方把 `gTeeReady` 清零；要么 panic 那一刻它读出来是 0（单点状态破坏），
+  要么 `r184` 那条行其实是上一靴洗剩下的。**这一帧分不开**，因为没有任何一条记录带靴子身份。
+
+### 下一步（r212）
+
+1. **probe 中转环**：新增 `clover_emmc_probe_say()`，内核的 kill 探针每行一次 `snprintf`
+   后同时投给 `printf` 与这个入口；入口只往驱动 BSS 里的 32 槽 RAM 环写，不碰卡、不碰守卫、
+   不经 msgbuf。panic drain 先把它推进驱动环再落卡——**这样即使块 I/O 像这一帧一样停住，
+   杀点的线程栈也能到卡上**。
+2. **靴子身份**：上膛时把 `readCounter()` 低 32 位记进 `gBootId`，写进每条记录头的 word 9；
+   arm 行打印 `boot=`，宿主解码器每行打印 `boot=`。从此 stale 尾巴一眼可分。
+3. **drain 进出各一行**：进门无条件推 `drain enter drained= verdict= host= tee= rc=`，
+   出门推 `drain exit wrote= dropped= tee_passes=`；守卫失败也要用 `panicDriverFlush()`
+   把驱动环的 pending 落卡。`panicTailRead` 去掉 `gTeeReady` 门、自己校验 msgbuf、
+   **永远**说状态行，扫描窗口放到整个 msgbuf、取 48 行。
+4. **panic 窗改成带 seq 的轮转**：这一帧八次 append 把窗从 12 槽推到满，再下一靴就写不进去了。

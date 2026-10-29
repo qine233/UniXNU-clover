@@ -88,7 +88,7 @@ diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 --- a/bsd/kern/kern_sig.c
 +++ b/bsd/kern/kern_sig.c
-@@ -2057,6 +2057,92 @@
+@@ -2057,6 +2057,98 @@
  		panic("psignal: bad signal number %d", signum);
  	}
  
@@ -137,29 +137,26 @@ diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 +		}
 +
 +		/*
-+		 * Round208. Round207 named the sender; this says where in the
-+		 * sender the kill was issued, and where every SpringBoard
-+		 * thread was when it arrived. The sender's user PC plus the
-+		 * four bytes at it locate the call site in backboardd without
-+		 * following chained fixups on the host; a collective-watchdog
-+		 * kill usually means the main thread is stuck, so the receiver
-+		 * side matters more than the sender side.
-+		 */
-+		/*
-+		 * Round208. Round207 named the sender; this says where in the
++		 * Round208/211. Round207 named the sender; this says where in the
 +		 * sender the kill was issued. The sender's user pc plus the four
 +		 * bytes at it locate the call site in backboardd without following
 +		 * chained fixups on the host. The receiver side -- every
 +		 * SpringBoard thread at the moment the watchdog fires -- cannot be
 +		 * read here: bsd is built without MACH_KERNEL_PRIVATE, so struct
 +		 * task and struct thread are opaque and get_user_regs() is
-+		 * invisible. That half lives in osfmk/kern/task.c.
++		 * invisible. That half lives in osfmk/kern/task.c. Round211 adds
++		 * the sender's kernel stack for the same reason the receiver's
++		 * stack is read there: the user pc says which call site, the
++		 * kernel frames say what that call was waiting on.
 +		 */
 +		if (signum == SIGKILL && clover_r208_prints < 64) {
 +			extern uint64_t clover_sender_upc(void);
++			extern uint32_t clover_current_kstack(uint64_t *frames, uint32_t n);
 +			extern uint32_t clover_task_threads(task_t task, uint32_t budget);
 +			uint64_t clover_r208_upc = clover_sender_upc();
++			uint64_t clover_r211_kf[6] = { 0, 0, 0, 0, 0, 0 };
 +			uint32_t clover_r208_uinsn = 0;
++			uint32_t clover_r211_kn;
 +
 +			if (clover_r208_upc != 0 &&
 +			    copyin((user_addr_t)clover_r208_upc, &clover_r208_uinsn,
@@ -170,6 +167,15 @@ diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 +			printf("clover r208: sender upc=%016llx uinsn=%08x spid=%d scomm=%s\n",
 +			    (unsigned long long)clover_r208_upc, clover_r208_uinsn,
 +			    proc_getpid(clover_kill_sender), clover_kill_sender->p_comm);
++
++			clover_r211_kn = clover_current_kstack(clover_r211_kf, 6);
++			printf("clover r211: skst n=%u f0=%016llx f1=%016llx f2=%016llx f3=%016llx f4=%016llx f5=%016llx\n",
++			    clover_r211_kn, (unsigned long long)clover_r211_kf[0],
++			    (unsigned long long)clover_r211_kf[1],
++			    (unsigned long long)clover_r211_kf[2],
++			    (unsigned long long)clover_r211_kf[3],
++			    (unsigned long long)clover_r211_kf[4],
++			    (unsigned long long)clover_r211_kf[5]);
 +
 +			if (strncmp(p->p_comm, "SpringBoard", 16) == 0) {
 +				clover_r208_prints += clover_task_threads(proc_task(p),
@@ -196,7 +202,7 @@ diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
  
  #include <corpses/task_corpse.h>
  #if CONFIG_TELEMETRY
-@@ -10285,3 +10290,68 @@
+@@ -10285,3 +10290,161 @@
  	char *name = proc_best_name(task_get_proc_raw(task));
  	strlcpy(buf, name, size);
  }
@@ -221,28 +227,89 @@ diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
 +	return (ss != NULL) ? (uint64_t)get_saved_state_pc(ss) : 0;
 +}
 +
++/*
++ * Round211. Walk one thread's kernel stack the way kdp does: the kernel
++ * saved state sits at the top of the thread's kernel stack, and each
++ * frame from there down keeps {x29, x30} in its first sixteen bytes.
++ * Only addresses inside this thread's own stack are followed, so a
++ * corrupt chain ends the walk instead of faulting the kernel.
++ */
++static uint32_t
++clover_kstack_walk(uint64_t top, uint64_t bottom, uint64_t fp,
++    uint64_t *frames, uint32_t frames_max)
++{
++	uint32_t i = 0;
++
++	while (i < frames_max && fp != 0 && (fp & 7) == 0 &&
++	    fp >= bottom && fp + 16 <= top) {
++		uint64_t *slot = (uint64_t *)(uintptr_t)fp;
++		uint64_t ret = slot[1];
++		uint64_t next = slot[0];
++
++		if (ret == 0) {
++			break;
++		}
++		frames[i++] = ret;
++		if (next <= fp) {
++			break;
++		}
++		fp = next;
++	}
++	return i;
++}
++
++/*
++ * Round211. The sender's own stack, for the same delivery: the user pc
++ * says which call site issued the kill, these frames say what that call
++ * was waiting on. Called from bsd, where struct thread is opaque.
++ */
++uint32_t
++clover_current_kstack(uint64_t *frames, uint32_t frames_max)
++{
++	thread_t thr = current_thread();
++
++	if (thr == THREAD_NULL || frames == NULL || frames_max == 0) {
++		return 0;
++	}
++	return clover_kstack_walk((uint64_t)thr->kernel_stack + kernel_stack_size,
++	    (uint64_t)thr->kernel_stack,
++	    (uint64_t)(uintptr_t)__builtin_frame_address(0), frames, frames_max);
++}
++
 +uint32_t
 +clover_task_threads(task_t task, uint32_t budget)
 +{
 +	struct {
 +		uint64_t tid;
 +		uint64_t pc;
++		uint64_t lr;
++		uint64_t sp;
++		uint64_t ktop;
++		uint64_t kfp;
++		uint64_t klr;
++		uint64_t frames[6];
++		uint32_t nframes;
 +		uint32_t cpsr;
++		uint32_t kin;
 +		int state;
 +		uint64_t wait;
 +	} snap[10];
 +	thread_t thr;
++	int pid;
 +	uint32_t n = 0;
 +	uint32_t i;
++	uint32_t j;
 +
 +	if (task == TASK_NULL || budget == 0) {
 +		return 0;
 +	}
++	pid = task_pid(task);
 +	/* Snapshot under the lock and print after it: the console can block
 +	 * and nothing else should wait on task_lock behind a print. */
 +	task_lock(task);
 +	queue_iterate(&task->threads, thr, thread_t, task_threads) {
 +		arm_saved_state_t *ss;
++		arm_kernel_saved_state_t *ks;
 +
 +		if (n >= 10 || n >= budget) {
 +			break;
@@ -250,17 +317,49 @@ diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
 +		ss = get_user_regs(thr);
 +		snap[n].tid = thr->thread_id;
 +		snap[n].pc = (ss != NULL) ? (uint64_t)get_saved_state_pc(ss) : 0;
++		snap[n].lr = (ss != NULL) ? (uint64_t)get_saved_state_lr(ss) : 0;
++		snap[n].sp = (ss != NULL) ? (uint64_t)get_saved_state_sp(ss) : 0;
 +		snap[n].cpsr = (ss != NULL) ? (uint32_t)get_saved_state_cpsr(ss) : 0;
 +		snap[n].state = thr->state;
 +		snap[n].wait = (uint64_t)thr->wait_event;
++		snap[n].ktop = (uint64_t)thr->kernel_stack + kernel_stack_size;
++		snap[n].kfp = 0;
++		snap[n].klr = 0;
++		snap[n].nframes = 0;
++		snap[n].kin = 0;
++		for (j = 0; j < 6; j++) {
++			snap[n].frames[j] = 0;
++		}
++		ks = &thread_get_kernel_state(thr)->machine.ss;
++		if (!ks->pc_was_in_userspace) {
++			snap[n].kin = 1;
++			snap[n].kfp = ks->fp;
++			snap[n].klr = ks->lr;
++			snap[n].nframes = clover_kstack_walk(snap[n].ktop,
++			    (uint64_t)thr->kernel_stack, ks->fp, snap[n].frames, 6);
++		}
 +		n++;
 +	}
 +	task_unlock(task);
 +	for (i = 0; i < n; i++) {
-+		printf("clover r208: sbthr n=%u tid=0x%llx pc=%016llx cpsr=%08x state=%d wait=%016llx\n",
-+		    i + 1, (unsigned long long)snap[i].tid,
-+		    (unsigned long long)snap[i].pc, snap[i].cpsr, snap[i].state,
++		printf("clover r211: sbthr n=%u pid=%d mt=%d tid=0x%llx pc=%016llx lr=%016llx sp=%016llx cpsr=%08x state=%d kin=%u wait=%016llx\n",
++		    i + 1, pid, (snap[i].tid == (uint64_t)pid) ? 1 : 0,
++		    (unsigned long long)snap[i].tid, (unsigned long long)snap[i].pc,
++		    (unsigned long long)snap[i].lr, (unsigned long long)snap[i].sp,
++		    snap[i].cpsr, snap[i].state, snap[i].kin,
 +		    (unsigned long long)snap[i].wait);
++		if (snap[i].nframes != 0) {
++			printf("clover r211: sbthk n=%u ktop=%016llx kfp=%016llx klr=%016llx kf=%016llx,%016llx,%016llx,%016llx,%016llx,%016llx\n",
++			    i + 1, (unsigned long long)snap[i].ktop,
++			    (unsigned long long)snap[i].kfp,
++			    (unsigned long long)snap[i].klr,
++			    (unsigned long long)snap[i].frames[0],
++			    (unsigned long long)snap[i].frames[1],
++			    (unsigned long long)snap[i].frames[2],
++			    (unsigned long long)snap[i].frames[3],
++			    (unsigned long long)snap[i].frames[4],
++			    (unsigned long long)snap[i].frames[5]);
++		}
 +	}
 +	return n;
 +}

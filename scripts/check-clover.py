@@ -784,9 +784,16 @@ def check_board(errors: list) -> str:
         if '{ "clover r208: ", "r208-kill", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round208's sender-pc and thread lines no tee "
                           "class: the reading the bring-up waits on would land in the ring uncounted")
-        if "CloverSdhci r209: panic tail lines=%u unseen=%u bufx=%d" not in sdhci_source:
-            errors.append("drivers/CloverSdhci has no round209 panic-time tail read: a boot whose "
+        if '{ "clover r211: ", "r211-kill", 64, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round211's stack-backtrace lines no tee class: "
+                          "twelve lines per kill would land in the ring uncounted and could push out "
+                          "the exec/exit pairs")
+        if "CloverSdhci r211: panic tail lines=%u unseen=%u bufx=%d" not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no round211 panic-time tail read: a boot whose "
                           "block path stops would again take the kernel ring with it")
+        if "append_rc=%u\\n" not in sdhci_source:
+            errors.append("the round211 tail status row drops panicAppendText's return code: a sink "
+                          "that could not take the panic's own sentence would look like a silent one")
         if "panicTailRead ();" not in sdhci_source:
             errors.append("drivers/CloverSdhci never calls the round209 tail read from the panic "
                           "drain: the sink would not select it")
@@ -1693,8 +1700,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r210:"):
-        errors.append('[payload] title is not "clover r210: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r211:"):
+        errors.append('[payload] title is not "clover r211: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2691,8 +2698,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r210:"):
-        errors.append('[payload] title is not "clover r210: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r211:"):
+        errors.append('[payload] title is not "clover r211: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -2763,16 +2770,35 @@ def check_board(errors: list) -> str:
         if upc_line not in text:
             errors.append(f"{crit_patch.name} lacks the r208 sender pc and instruction word: the "
                           "host could not locate the kill call site in backboardd")
-        sbthr_line = ("clover r208: sbthr n=%u tid=0x%llx pc=%016llx cpsr=%08x state=%d "
-                      "wait=%016llx")
+        # Round211. Round208 said every SpringBoard thread was in TH_WAIT but not what any of them
+        # was waiting on, because a user-space pc alone cannot show a thread parked in a kevent or
+        # a page fault. The kernel side of each thread still holds the kernel return addresses from
+        # before it last dropped to EL0, so the frame carries lr/sp, a six-deep x29 backtrace, and
+        # a main-thread mark; the sender's own current kernel stack comes along for the same reason.
+        skst_line = ("clover r211: skst n=%u f0=%016llx f1=%016llx f2=%016llx f3=%016llx "
+                     "f4=%016llx f5=%016llx")
+        if skst_line not in text:
+            errors.append(f"{crit_patch.name} lacks the r211 sender kernel backtrace: the kill "
+                          "call site would still be a bare user pc")
+        sbthr_line = ("clover r211: sbthr n=%u pid=%d mt=%d tid=0x%llx pc=%016llx lr=%016llx "
+                      "sp=%016llx cpsr=%08x state=%d kin=%u wait=%016llx")
         if sbthr_line not in text:
-            errors.append(f"{crit_patch.name} lacks the r208 per-thread reading: the frame could "
-                          "not say where SpringBoard was stuck when the watchdog fired")
+            errors.append(f"{crit_patch.name} lacks the r211 per-thread reading: the frame could "
+                          "not pair a parked thread with the kernel call it parked in")
+        sbthk_line = ("clover r211: sbthk n=%u ktop=%016llx kfp=%016llx klr=%016llx "
+                      "kf=%016llx,%016llx,%016llx,%016llx,%016llx,%016llx")
+        if sbthk_line not in text:
+            errors.append(f"{crit_patch.name} lacks the r211 per-thread kernel backtrace: the "
+                          "receiver's park site would still be unread")
+        if "thread_get_kernel_state" not in text:
+            errors.append(f"{crit_patch.name} reads no kernel saved state: the backtrace would "
+                          "have no frame pointer to start from (machine.kpcb is kdp-only)")
         upc_at = text.find("clover r208: sender upc")
-        sbthr_at = text.find("clover r208: sbthr")
-        if not (kill_at < upc_at < sbthr_at):
-            errors.append(f"{crit_patch.name} places the r208 lines outside the r207 delivery: the "
-                          "sender and the threads would not be read at the same kill")
+        skst_at = text.find("clover r211: skst")
+        sbthr_at = text.find("clover r211: sbthr")
+        if not (kill_at < upc_at < skst_at < sbthr_at):
+            errors.append(f"{crit_patch.name} places the r211 lines outside the r207 delivery: the "
+                          "sender stack and the threads would not be read at the same kill")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())
