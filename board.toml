@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r190: the last call is a barrier fsync and nothing follows it, so the barrier says when it starts and when it ends"
+title = "clover r191: the cache commit never returns, so each of its four steps gets a record and the wait moves onto the host's busy bit"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

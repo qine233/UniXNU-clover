@@ -3946,7 +3946,8 @@ struct FastLink {
 // [31:26], the EXT_CSD byte in [23:16], the value in [15:8]. R1b's busy signal is on DAT0, and
 // the caller's CMD13 is what proves the card came back to transfer, so this only asks for the
 // response and lets the next step decide.
-static bool switchExtCsd (uint32_t index, uint32_t value, uint32_t &response, uint32_t &status)
+static bool switchExtCsd (uint32_t index, uint32_t value, uint32_t &response, uint32_t &status,
+                          uint32_t *spinsOut = nullptr)
 {
   bool sent = false;
   uint32_t response1 = 0;
@@ -3955,6 +3956,11 @@ static bool switchExtCsd (uint32_t index, uint32_t value, uint32_t &response, ui
   status = runCommandBusy (SDHCI_MAKE_CMD (MMC_SWITCH, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
                                            SDHCI_CMD_INDEX),
                            argument, sent, response, response1, spins);
+  // Round191: `spins` is how much of kCommandSpinLimit the completion took. A command that never
+  // completed leaves st=0 spins=<limit>, which is a different reading from a timeout or a CRC.
+  if (spinsOut) {
+    *spinsOut = spins;
+  }
   return sent && (status & SDHCI_INT_RESPONSE) &&
          !(status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX));
 }
@@ -3966,6 +3972,94 @@ static bool cardInTransfer (uint32_t &response, uint32_t &status, uint32_t &poll
   waitCardReady (response, status, polls);
   return (response & R1_READY_FOR_DATA) &&
          R1_CURRENT_STATE (response) == R1_STATE_TRAN;
+}
+
+// ------------------------------------------------------ round191: what a cache commit costs
+//
+// The r190 frame ends at `flush-in` with nothing behind it, so the commit is now the wall. The two
+// waits inside it are the ones that can be long: writing zero to CACHE_CTRL is an R1b command, and
+// while the card writes the cache to media it holds DAT0 low and answers nothing. waitCardReady asks
+// CMD13 a hundred times at that card, and each ask that gets no answer burns the whole
+// kCommandSpinLimit on INT_STATUS -- a hundred of those is minutes of silence that reads exactly like
+// a hang, which is what the r190 frame shows. The host's own press on data inhibit needs no answer
+// from the card, so the wait belongs there; CMD13 is only worth asking once the card has let go.
+//
+// The bound is the card's own: EXT_CSD byte 246, CACHE_FLUSH_TIMEOUT, in units of 10 ms, which is
+// how long JEDEC lets a commit run. A card that declares nothing gets the thirty seconds the other
+// waits in this driver use, and the ceiling keeps a misread byte from parking the boot behind one
+// flush.
+static volatile uint32_t gCacheFlushUnits = 0;
+
+static uint32_t flushBoundMs (void)
+{
+  const uint32_t units = __atomic_load_n (&gCacheFlushUnits, __ATOMIC_ACQUIRE);
+  const uint32_t ms = units ? units * 10u : 30000u;
+  if (ms < 1000u) {
+    return 1000u;
+  }
+  return ms > 180000u ? 180000u : ms;
+}
+
+// One commit's wait, measured. `busyMs` is how long the card held the bus, `samples` how often the
+// host looked, `marks` how many five-second marks went by, and `polls` the CMD13s sent after it let
+// go. `timedOut` says the bound ran out with the card still busy, which is the one shape that is a
+// card failure rather than a slow card.
+struct FlushSettle {
+  bool ready;
+  bool timedOut;
+  uint32_t polls;
+  uint32_t response;
+  uint32_t status;
+  uint32_t samples;
+  uint32_t marks;
+  uint32_t present;
+  uint64_t busyMs;
+};
+
+static FlushSettle flushSettle (uint64_t frequency, uint32_t boundMs)
+{
+  FlushSettle out = FlushSettle ();
+  const uint64_t bound = frequency * boundMs / 1000ULL;
+  const uint64_t start = readCounter ();
+  for (;;) {
+    out.present = read32 (SDHCI_PRESENT_STATE);
+    out.samples++;
+    if (!(out.present & SDHCI_DATA_INHIBIT)) {
+      break;
+    }
+    const uint64_t waited = readCounter () - start;
+    if (waited > static_cast<uint64_t> (out.marks + 1) * frequency * 5ULL) {
+      out.marks++;
+    }
+    if (waited > bound) {
+      out.timedOut = true;
+      break;
+    }
+  }
+  out.busyMs = (readCounter () - start) * 1000ULL / frequency;
+  // The card is off the bus; this is the only point where CMD13 has something to answer with. Twelve
+  // asks with a gap is enough for a card that drops busy a moment before it reports TRAN, and few
+  // enough that a card that has stopped answering cannot cost another minute of spins.
+  for (uint32_t tries = 0; !out.timedOut && tries < 12; tries++) {
+    bool sent = false;
+    uint32_t response1 = 0;
+    uint32_t spins = 0;
+    out.status = runCommandBusy (SDHCI_MAKE_CMD (13, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                 SDHCI_CMD_INDEX),
+                                 kProbeRca << 16, sent, out.response, response1, spins);
+    out.polls++;
+    if (sent && !(out.status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_INDEX)) &&
+        (out.response & R1_READY_FOR_DATA) &&
+        R1_CURRENT_STATE (out.response) == R1_STATE_TRAN) {
+      out.ready = true;
+      break;
+    }
+    const uint64_t gap = readCounter () + frequency / 500ULL;    // 2 ms
+    while (readCounter () < gap) {
+    }
+  }
+  out.present = read32 (SDHCI_PRESENT_STATE);
+  return out;
 }
 
 // Round171: the two numbers bring-up reads from EXT_CSD and the block layer needs afterwards.
@@ -4026,16 +4120,62 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
             static_cast<unsigned long long> (__atomic_load_n (&gGuardLastWaitMs, __ATOMIC_RELAXED)));
   teeKernelLog ();
   flushVerdictRing ();
+  // Round191: five records, each naming the step that comes next, each drained to the card before
+  // that step runs -- the tail is exactly what a hang takes away. A frame whose last record is
+  // flush-c1 went quiet inside the commit's own wait; one that stops at flush-go never got a command
+  // out at all; one that stops at flush-w1 hung while the card was writing the cache to media.
+  // `cf` is the card's CACHE_FLUSH_TIMEOUT in 10 ms units, `bound` the millisecond bound this driver
+  // derived from it, and `inh` whether the host was already inhibited before the first CMD6.
+  const uint32_t boundMs = flushBoundMs ();
+  const uint32_t presentBefore = read32 (SDHCI_PRESENT_STATE);
+  teeSay ("CloverSdhci r191: flush-go cf=%u bound=%u ps=%08x inh=%u\n",
+          __atomic_load_n (&gCacheFlushUnits, __ATOMIC_RELAXED), boundMs, presentBefore,
+          (presentBefore & SDHCI_DATA_INHIBIT) ? 1u : 0u);
+  flushVerdictRing ();
   uint32_t response = 0;
   uint32_t status = 0;
-  uint32_t polls = 0;
-  const bool flushed = switchExtCsd (kExtCsdCacheCtrl, 0, response, status) &&
-                       cardInTransfer (response, status, polls);
+  uint32_t spins = 0;
+  const uint64_t commitStart = readCounter ();
+  const bool switchOff = switchExtCsd (kExtCsdCacheCtrl, 0, response, status, &spins);
+  teeSay ("CloverSdhci r191: flush-c1 ok=%d st=%08x rsp=%08x spins=%u ms=%llu\n",
+          switchOff ? 1 : 0, status, response, spins,
+          static_cast<unsigned long long> ((readCounter () - commitStart) * 1000ULL / frequency));
+  flushVerdictRing ();
+  FlushSettle waitOff = FlushSettle ();
+  if (switchOff) {
+    waitOff = flushSettle (frequency, boundMs);
+  }
+  teeSay ("CloverSdhci r191: flush-w1 ready=%d to=%d busy=%llu ms polls=%u rsp=%08x st=%08x "
+          "smp=%u mk=%u ps=%08x ms=%llu\n",
+          waitOff.ready ? 1 : 0, waitOff.timedOut ? 1 : 0,
+          static_cast<unsigned long long> (waitOff.busyMs), waitOff.polls, waitOff.response,
+          waitOff.status, waitOff.samples, waitOff.marks, waitOff.present,
+          static_cast<unsigned long long> ((readCounter () - commitStart) * 1000ULL / frequency));
+  flushVerdictRing ();
+  const bool flushed = switchOff && waitOff.ready;
   uint32_t backResponse = 0;
   uint32_t backStatus = 0;
-  uint32_t backPolls = 0;
-  const bool reenabled = switchExtCsd (kExtCsdCacheCtrl, 1, backResponse, backStatus) &&
-                         cardInTransfer (backResponse, backStatus, backPolls);
+  uint32_t backSpins = 0;
+  const uint64_t backStart = readCounter ();
+  const bool switchOn = switchExtCsd (kExtCsdCacheCtrl, 1, backResponse, backStatus, &backSpins);
+  teeSay ("CloverSdhci r191: flush-c2 ok=%d st=%08x rsp=%08x spins=%u ms=%llu\n",
+          switchOn ? 1 : 0, backStatus, backResponse, backSpins,
+          static_cast<unsigned long long> ((readCounter () - backStart) * 1000ULL / frequency));
+  flushVerdictRing ();
+  FlushSettle waitOn = FlushSettle ();
+  if (switchOn) {
+    waitOn = flushSettle (frequency, boundMs);
+  }
+  teeSay ("CloverSdhci r191: flush-w2 ready=%d to=%d busy=%llu ms polls=%u rsp=%08x st=%08x "
+          "smp=%u mk=%u ps=%08x ms=%llu\n",
+          waitOn.ready ? 1 : 0, waitOn.timedOut ? 1 : 0,
+          static_cast<unsigned long long> (waitOn.busyMs), waitOn.polls, waitOn.response,
+          waitOn.status, waitOn.samples, waitOn.marks, waitOn.present,
+          static_cast<unsigned long long> ((readCounter () - backStart) * 1000ULL / frequency));
+  flushVerdictRing ();
+  const bool reenabled = switchOn && waitOn.ready;
+  const uint32_t polls = waitOff.polls;
+  const uint32_t backPolls = waitOn.polls;
   if (!flushed || !reenabled) {
     static bool reported = false;
     if (!reported) {
@@ -5258,6 +5398,10 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             // frame.
             const uint32_t cacheSize = (gExtCsd[62] >> 8) | (gExtCsd[63] << 24);
             const uint32_t cacheCtrlBefore = (gExtCsd[8] >> 8) & 0xffu;
+            // Round191: byte 246 is CACHE_FLUSH_TIMEOUT, the /10 ms the card may take to commit its
+            // cache. The flush's wait is set from this number instead of from a guess, so the r171
+            // line now carries it.
+            const uint32_t cacheFlushUnits = (gExtCsd[61] >> 16) & 0xffu;
             uint32_t cacheRsp = 0, cacheStatus = 0, cachePolls = 0;
             bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;
             if (cacheSize && cacheCtrlBefore == 0) {
@@ -5266,8 +5410,10 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             }
             __atomic_store_n (&gCacheSize, cacheSize, __ATOMIC_RELEASE);
             __atomic_store_n (&gCacheOn, cacheOn ? 1u : 0u, __ATOMIC_RELEASE);
-            sdhciSay ("CloverSdhci r171: write cache size=%u ctrl=%u on=%d rsp=%08x st=%08x\n",
-                   cacheSize, cacheCtrlBefore, cacheOn ? 1 : 0, cacheRsp, cacheStatus);
+            __atomic_store_n (&gCacheFlushUnits, cacheFlushUnits, __ATOMIC_RELEASE);
+            sdhciSay ("CloverSdhci r171: write cache size=%u ctrl=%u on=%d rsp=%08x st=%08x cf=%u\n",
+                   cacheSize, cacheCtrlBefore, cacheOn ? 1 : 0, cacheRsp, cacheStatus,
+                   cacheFlushUnits);
             clover_emmc_link[14] = cacheSize;
             // Bit 0 of this slot used to spell "the cache is off"; r171 flips the switch, so it now
             // spells "the cache is on". The card's own previous setting stays in [15:8].

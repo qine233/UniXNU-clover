@@ -1519,8 +1519,10 @@ def check_board(errors: list) -> str:
     # push budget, which prints nothing new and leaves the window geometry alone, so the r185 arming
     # stamps still say what happened and only the menu moves. Round190 adds the flush bracket to the
     # block driver, which carries its own r190 stamps and also leaves the arming lines alone.
-    if not board["payload"]["title"].startswith("clover r190:"):
-        errors.append('[payload] title is not "clover r190: ...": the menu would not name this round')
+    # Round191 splits that bracket into stages and moves the commit's wait onto the host's busy bit,
+    # which is still inside the flush path and still leaves the arming lines where r185 put them.
+    if not board["payload"]["title"].startswith("clover r191:"):
+        errors.append('[payload] title is not "clover r191: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -1660,8 +1662,8 @@ def check_board(errors: list) -> str:
                        "if (!gReadCheckDone && blocks >= 4) {",
                        "extern \"C\" uint32_t clover_emmc_flush_cache (void)",
                        "extern \"C\" void clover_emmc_cache_stats (uint32_t *size, uint32_t *on, uint32_t *flushes)",
-                       "switchExtCsd (kExtCsdCacheCtrl, 0, response, status)",
-                       "switchExtCsd (kExtCsdCacheCtrl, 1, backResponse, backStatus)",
+                       "switchExtCsd (kExtCsdCacheCtrl, 0, response, status, &spins)",
+                       "switchExtCsd (kExtCsdCacheCtrl, 1, backResponse, backStatus, &backSpins)",
                        "CloverSdhci r171: write cache size=",
                        "CloverSdhci r171: flush failed flushed=",
                        "static IOLock *gBlockLock = nullptr;",
@@ -2442,6 +2444,49 @@ def check_board(errors: list) -> str:
         if needle not in block_dev_source:
             errors.append(f"drivers/CloverBlock/CloverBlock.cpp lacks {needle[:44]}...: a barrier with "
                           "nothing to commit would read exactly like a barrier that never arrived")
+
+    # Round191. The r190 frame ends at flush-in with nothing behind it, so the commit's own steps
+    # never produced a reading. Five stage records name the step that comes next, each drained to the
+    # card before that step runs; and the commit's wait stops asking CMD13 at a card that is holding
+    # DAT0, because a hundred unanswered asks is exactly what the r190 frame's silence is made of.
+    stage_lines = ("CloverSdhci r191: flush-go cf=%u bound=%u ps=%08x inh=%u\\n",
+                   "CloverSdhci r191: flush-c1 ok=%d st=%08x rsp=%08x spins=%u ms=%llu\\n",
+                   "CloverSdhci r191: flush-w1 ready=%d to=%d busy=%llu ms polls=%u rsp=%08x st=%08x ",
+                   "CloverSdhci r191: flush-c2 ok=%d st=%08x rsp=%08x spins=%u ms=%llu\\n",
+                   "CloverSdhci r191: flush-w2 ready=%d to=%d busy=%llu ms polls=%u rsp=%08x st=%08x ")
+    for needle in stage_lines + ("static FlushSettle flushSettle (uint64_t frequency, uint32_t boundMs)",
+                                 "if (!(out.present & SDHCI_DATA_INHIBIT)) {",
+                                 "const uint32_t cacheFlushUnits = (gExtCsd[61] >> 16) & 0xffu;",
+                                 "return ms > 180000u ? 180000u : ms;",
+                                 "static volatile uint32_t gCacheFlushUnits = 0;"):
+        if needle not in block_source:
+            errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp lacks {needle[:44]}...: the next frame "
+                          "could not say which step of the commit stopped, or how long a card that is "
+                          "still writing its cache is meant to be given")
+    flush191 = block_source.find("CloverSdhci r191: flush-go")
+    go_cmd = block_source.find("switchExtCsd (kExtCsdCacheCtrl, 0")
+    if not (0 <= flush191 < go_cmd):
+        errors.append("clover_emmc_flush_cache pushes flush-go after the first CMD6: the record would "
+                      "not survive the step it exists to bracket")
+    # Every stage line has to reach the card before the next step runs, so its drain must follow it
+    # and precede the next stage.
+    positions = [block_source.find(line) for line in stage_lines]
+    ordered = all(0 <= positions[i] < positions[i + 1] for i in range(len(positions) - 1))
+    out_at = block_source.find("CloverSdhci r190: flush-out")
+    if not ordered or not (positions[-1] < out_at):
+        errors.append("clover_emmc_flush_cache prints the r191 stage lines out of order: the frame "
+                      "would name a step that had not run yet")
+    else:
+        for index, line in enumerate(stage_lines):
+            ends_at = positions[index + 1] if index + 1 < len(positions) else out_at
+            if "flushVerdictRing ();" not in block_source[positions[index]:ends_at]:
+                errors.append(f"clover_emmc_flush_cache does not drain the ring after the stage line "
+                              f"{index + 1} of 5: a hang in the next step would lose the record that "
+                              "names it")
+    tail = block_source[block_source.find("extern \"C\" uint32_t clover_emmc_flush_cache (void)"):out_at]
+    if "cardInTransfer (" in tail:
+        errors.append("clover_emmc_flush_cache still waits with cardInTransfer: a hundred CMD13s at a "
+                      "card that is holding DAT0 is the silence the r190 frame shows")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())

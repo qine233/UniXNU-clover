@@ -718,6 +718,28 @@ def check_sys_why4(kernel: bytes) -> bool:
     return ok
 
 
+def check_flush_stages(kernel: bytes) -> bool:
+    """Round191 splits the r190 bracket. The frame stops at flush-in, so no step of the commit has
+    ever produced a reading: five stage records, each drained to the card before the step that
+    follows it, are what let a frame name the step that hung. The r190 pair stays -- it is the outer
+    bracket this round subdivides."""
+    label = "kernel.macho: cache commit stages linked"
+    found = {name: needle in kernel for name, needle in (
+        ("flush-go", b"CloverSdhci r191: flush-go cf=%u bound=%u ps=%08x inh=%u\n"),
+        ("flush-c1", b"CloverSdhci r191: flush-c1 ok=%d st=%08x rsp=%08x spins=%u ms=%llu\n"),
+        ("flush-w1", b"CloverSdhci r191: flush-w1 ready=%d to=%d busy=%llu ms polls=%u rsp=%08x "
+                     b"st=%08x smp=%u mk=%u ps=%08x ms=%llu\n"),
+        ("flush-c2", b"CloverSdhci r191: flush-c2 ok=%d st=%08x rsp=%08x spins=%u ms=%llu\n"),
+        ("flush-w2", b"CloverSdhci r191: flush-w2 ready=%d to=%d busy=%llu ms polls=%u rsp=%08x "
+                     b"st=%08x smp=%u mk=%u ps=%08x ms=%llu\n"),
+        ("kept-r190", b"CloverSdhci r190: flush-in flushes=%u on=%u size=%u wait=%llu ms\n"))}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -1125,6 +1147,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_sys_why2(kernel)
         ok &= check_sys_why3(kernel)
         ok &= check_sys_why4(kernel)
+        ok &= check_flush_stages(kernel)
     return 0 if ok else 1
 
 

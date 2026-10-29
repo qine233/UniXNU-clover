@@ -14668,3 +14668,45 @@ tee 只在块请求的有守卫尾部（读/写/sync）泵内核日志。也就�
 flush-in 后面有没有 `flush-out` 与 `CloverBlock r190: sync-out ok=`：有 `flush-out` 说明卡收下了
 提交、墙在驱动之上；只有 `sync-in` 没有 `sync-out` 说明 CloverBlock 进了 `commitCache()` 但没出来。
 
+
+## round190 读数（v0.5.50 实机，2026-10-29）：barrier 进了块驱动，cache 提交自己不再出声
+
+这一帧只有 25 个驱动记录和 274 个内核记录，最后一个内核时间戳是 `110.553379`，之后到 300 秒死线
+复位没有任何新行。读出来的是三件事，每一件都比上一轮更进一步：
+
+1. 屏障这次确实回来了两次。`unix-out n=6 code=95 ret=0 err=0`（fsync，`110.326981`）与
+   `unix-out n=7 code=488 ret=0 err=0`（renameatx_np，`110.438917`）都在，说明 r190 加的那条退出行
+   工作正常，`fsync` 与 `rename` 都不是墙。
+2. 墙在 `fcntl(3, 0x55)` 上，而且它**进了我们自己的块驱动**：`110.493599` 的
+   `unix-in code=92 a0=3 a1=55` 之后，`110.553379` 出现 `CloverBlock r190: sync-in pending=144`。
+   后面这一行能出现在卡上，靠的正是 `clover_emmc_flush_cache()` 自己那次 `teeKernelLog()`——r190 的
+   括号第一半如愿以偿。
+3. 驱动环的最后一条是 `CloverSdhci r190: flush-in flushes=0 on=1 size=65536 wait=0 ms`，**没有**
+   `flush-out`，也**没有** `sync-out`。`wait=0 ms` 说明块守卫是空的，不是我们自己那把锁挡住的；
+   `flushes=0` 说明这是本次启动的第一次提交，卡里攒着 144 个块。
+
+于是墙的位置从「一次 fcntl」缩到「一次 CACHE_CTRL 提交」，从「不知道在哪一层」缩到
+`switchExtCsd (kExtCsdCacheCtrl, 0) && cardInTransfer (…)` 这两个调用里的一处。r171 在别的帧里量到过
+真实提交要 102 s 和 122 s，而这台卡的 `runCommandWith()` 在命令不回答时会把 `kCommandSpinLimit`
+（4 M）次 `INT_STATUS` 读完才返回，`waitCardReady()` 又最多问 100 次 CMD13——100 × 4 M 次带
+`dsb sy` 的 MMIO 读，正好是两个分钟量级。所以这一帧的 187 秒静默最可能的形状不是「卡死了」，而是
+**我们在一个正握着 DAT0 忙的卡上反复问 CMD13**。
+
+## round191（v0.5.51）：提交拆成四步各写一条，等待挪到主机自己的忙位
+
+驱动只改 flush 路径，内核补丁不动：
+
+- `flush-go` / `flush-c1` / `flush-w1` / `flush-c2` / `flush-w2` 五条 r191 记录，每条在它**下一步**
+  之前写进卡：`flush-go cf= bound= ps= inh=`、`flush-c1 ok= st= rsp= spins= ms=`、
+  `flush-w1 ready= to= busy= polls= rsp= st= smp= mk= ps= ms=`，第二半同形。每条之后立刻
+  `flushVerdictRing ()`，所以「卡上最后一条是谁」直接就是「停在哪一步」。
+- 两次 `cardInTransfer()` 换成 `flushSettle()`：先只看 `PRESENT_STATE` 的 `DATA_INHIBIT`
+  （主机自己的忙位，不需要卡回答），清掉之后才发 CMD13，最多 12 次、间隔 2 ms；总时间界取卡自己
+  的 `CACHE_FLUSH_TIMEOUT`（EXT_CSD byte 246，10 ms 单位，r171 那行现在也会打印 `cf=`），
+  夹在 [1 s, 180 s]，没声明就用 30 s。
+- `switchExtCsd()` 多一个可选的 `spins` 出参：`st=0 spins=<limit>` 是「命令压根没完成」，与时序
+  超时、CRC 是三种不同的读数。
+
+读法：`flush-w1 busy=0` 说明卡根本没握总线、那我们在瞎等；`busy=` 是秒级且 `mark` 跟着涨说明卡真的
+在写 cache，只是慢；`to=1` 说明卡超过了它自己声明的上限，那才是卡坏了。若最后一条停在 `flush-c1`，
+墙就在 CMD6 本身（看 `spins=`）；停在 `flush-go`，说明加记录这一步就没过去。
