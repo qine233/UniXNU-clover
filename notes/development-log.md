@@ -14961,6 +14961,100 @@ deadline reset`，随后 `recovery: device=clover twrp=3.7.1_12-1-clover-th3fron
    512 行到 909.95 s（panic 后 20 s 复位前仍在进）。`CloverSdhci r184: panic drain wrote=0 dropped=0
    tee_passes=8`——panic 时排干没有新内容可写，环里的行都是 tee 早先抄出来的。
 
-**读法上的一条新经验**：host 镜像的 Data 窗口与设备实际 Data 卷不是同一份 lineages（设备卷在窗口内
-+0xac00 处才见 APFS 容器，且缺 `keybags` 目录；宿主种子有空的 `keybags/`）。这解释了 keybag 的两个
-ENOENT——问题是 persona 清单文件本身缺失，不是路径拼错。
+**读法上的一条更正（round197 推翻 round196 的结论）**：round196 写的「设备卷在窗口内 +0xac00 处才见
+APFS 容器、且缺 keybags」是读错位置得来的：Data 窗口起点是 9382658048 字节（LBA 18,325,504，不是
+18,325,426），按旧 LBA 读到的 40 KB 前自然是零。按正确偏移回读，设备卷与宿主种子同形——容器超块就在
+窗口 +32 字节。r197 帧后的窗口挂载后 `keybags/persona.kb`（1439 B）与 `keybags/usersession.kb`（892 B）
+都在，根目录 32 项。两个 keybag ENOENT 是时序问题：usermanagerd 在 persona 清单被写出来之前就去读它，
+不是卷里没有这个目录，也不是路径拼错。
+
+## round197 读数（v0.5.57 实机，2026-10-29）：238 s 的自复位不是 panic
+
+上一轮末尾那句「panic 自己写 BCB 就能把非 panic 复位也送进 TWRP」停在了一个没验过的前提上。这一帧
+把前提拆开：BCB 写了，落点也确实是 TWRP，但**那一次是 panic 造成的**；用户复测的 r197 帧是另一种
+复位，记录里没有它。
+
+### 读数（`/Users/zhouzhou/clover-out/round197-unattended.log`）
+
+1. **复位形态**：238.238421 s 最后一条内核环是 `CloverBlock r190: sync-in pending=8`，0.2 s 后整机
+   复位；panic 窗口里最新记录仍是 r196 的 900 s 那条（slot 5，ticks=143310，fb=1），本帧
+   **没有新 panic 记录**。misc 回读 1024 字节全零——TWRP 启动时把 BCB 清掉了，所以这份零只说明
+   「上一帧的 BCB 已被消费」，不能反推本帧写没写；但 panic 窗口无记录这一条足以定性：
+   **复位没有走 XNU panic 出口**。
+2. **ENOSPC**：214.668048 s `apfs_make_space_reservation:31636: disk5s1 Cannot join transaction 0 to
+   reserve 256 blocks for inode 266: No space left on device(28)`；220.969096 s
+   `fs_tx_enter_internal:27549: disk5s1 amfid: ENOSPC: ttype INSERT num_blocks 127 free_blocks 221
+   … current xid: 26 threshold_blocks 100`。Data 的 32 MiB 容器在 amfid 写签名缓存时写满，之后的
+   块层写入开始失败，sync-in 是最后一次提交。
+3. **这一帧其实到了更远**：SpringBoard 186.805580 s 起（`clover r170: exec pid=27 ppid=1 … comm=SpringBoard`），
+   `Early boot complete. Continuing system boot.` 186.864360 s；watchdogd 仍每 ~10 s 以
+   `rv=0x5`（SIGTRAP）退一次，r193 的 `panic_on_crash_disabled=1` 让启动继续。238 s 的复位发生在
+   SpringBoard 之后、系统还在写 Data 的时段。
+
+### 结论与对策
+
+- BCB 写在 panic 出口这件事本身没错，错在它只覆盖 panic：**复位若来自 PMIC/硬件/用户空间诱发的
+  硬复位，sink 根本不会跑**。所以 round198 把 BCB 的写入点提前到 log 环上膛那一刻
+  （`gPanicLogReady = 1` 的同一块，卡已选中、块驱动尚未发布），panic sink 仍保留一次幂等调用。
+- Data 32 MiB 已实测写满，round198 把种子换成 **1 GiB**，并且保住原卷 UUID
+  `FC1A580E-2D67-48FC-B8CF-87422A319340`：内核补丁 `XNU_OWNER_DATA_VOLUME_UUID` 与
+  CloverBlock 的 `kDataVolumeUuid` 都按这个串找卷，换 UUID 就得同时改内核。
+
+## round198 读数（v0.5.58 实机，2026-10-29）：非 panic 复位也落 TWRP，新墙是 SpringBoard
+
+round197 得出「BCB 写在 panic 出口只覆盖 panic」，这一轮把写入点提前，并把 Data 种子撑到 1 GiB。
+两件事都在实机上成立，停点换了一个。
+
+### 设计与实现
+
+1. **BCB 提前上膛**：`panicMarkRecovery()` 的前向声明挪到 `panicDrainRings` 旁边，调用点放进
+   `coldBringUp()` 里 GPT 走完、三个日志环刚刚上膛的那一块——`gPanicLogReady`/`gVerdictReady`/
+   `gTeeReady` 置 1 之后、块驱动发布之前。门控原样保留（`gHost`、`gUnattendedArmed`、
+   `gBcbWritten` 一次闩锁），写的是 misc 前两扇区（LBA 13180952，`command[32]="boot-recovery"`，
+   其余清零），控制器上所有能自己复位板子的路径都在它之后。panic sink 里那次调用留着，
+   第二次进入时 `gBcbWritten` 已置位，直接返回 1，不起作用。驱动环里多一条通告：
+   `CloverSdhci r198: recovery BCB pre-armed rc=%u written=%u`。
+2. **Data 1 GiB**：32 MiB 容器在 amfid 写签名缓存时写满（r197 的 214.668 s ENOSPC）。新种子由
+   32 MiB 原种子补零后用 `diskutil apfs resizeContainer disk45 0` 撑大，NXSB `block_size` 4096、
+   `block_count` 262144，卷 UUID 仍是 `FC1A580E-2D67-48FC-B8CF-87422A319340`——内核补丁的
+   `XNU_OWNER_DATA_VOLUME_UUID` 和 CloverBlock 的 `kDataVolumeUuid` 都按这个串找卷，换 UUID 就得
+   同时改两处，所以只撑大不改身份。SHNGROOT 清单跟着重写：Data `size=1073741824`、
+   sha `07f69d31…`，`image_bytes=10456399872`，清单自身 sha `6897945a…`。
+3. **契约**：`check-clover.py` 认 r198 通告串与 `panicMarkRecovery ();` 至少两处，标题断言
+   从 `clover r196:` 升到 `clover r198:`；`board.toml` 的 title 说明这一轮为的是什么。
+
+### 读数（`~/clover-out/round198-unattended.log`、`round198-verdict.txt`、`round198-tee.txt`）
+
+1. **提前上膛生效**：verdict 环 slot 4 是 `CloverSdhci r198: recovery BCB pre-armed rc=100 written=1`，
+   位置在 `write cache size=65536`（slot 5）与 link 速率（slot 6）之前，也就是 bring-up 早段。
+   `rc=100` 是成功码，`written=1` 是写计数。
+2. **整帧无 ENOSPC**：`round198-tee.txt` 1536 行里没有任何 `No space left` / `ENOSPC` / `amfid` 片段；
+   SpringBoard 之后系统仍在写盘，`CloverBlock r190: sync-in pending=8 … sync-out ok=1 pending=8`
+   一路到 909.99 s，pending 值涨到 2944。1 GiB 至少把「写得下」这一层放开了。
+3. **落点是 TWRP**：report slot 6 是 900 s 死线（`ticks=159329`、第二行 `fb=1`），panic 之后板子
+   自己进了 TWRP。宿主那一步报的是 900 s 窗超时——死线 + 复位延迟 + TWRP 起来超过 900 s，不是
+   没落；约 2 min 后 `fastboot devices` 看不到板子、TWRP adb 在。下次把等待窗改成 1200 s。
+4. **新墙：SpringBoard 起来 0.3–0.4 s 就 SIGTRAP**。372.541677 s `clover r170: exit pid=27 ppid=1
+   t=7s rv=0x5 ns=2 code=0x5 comm=SpringBoard`，紧接着 `clover r196: sig pid=27 comm=SpringBoard
+   sig=5 n=1 desc=none`；launchd 每次重拉（`/System/Library/CoreServices/SpringBoard.app/SpringBoard[134] ==> (apply-protobox)`
+   是 r170 exec 行的统一形状，lsd/datamigrator/PowerUIAgent 都带这一段），一帧里共 24 次，pid 从 27 涨到
+   290；每次活 0.35–0.66 s（pid=134 是 373.677→374.025，pid=138 是 379.756→380.416）。`rv=0x5` 是 SIGTRAP、`ns=2` 是
+   信号命名空间、`ns=2` 对应 `os_reason_create(OS_REASON_SIGNAL, signum)` 的命名空间，`code=0x5` 就是信号号
+   5（同 usermanagerd 的 `code=0x6` 是 SIGABRT），`desc=none` 说明这次没有随附描述串——同步陷阱
+   的消息（如 `abort()` 的 reason）会带 desc，usermanagerd 就带着 persona 那条。所以这是
+   **EXC_BREAKPOINT / `brk` 类陷阱**，不是异常终止（6）也不是段错误（11）。
+   watchdogd 也是同一个退出形状，launchd.log 里 `exited due to SIGTRAP | sent by exc handler[301],
+   ran for 1458ms`、`service has crashed 16 times in a row`、`Enabling panic-on-crash due to
+   consecutive crashes`。
+5. **附带读数**：`log/com.apple.xpc.launchd/launchd.log` 里 `com.apple.accessibility.AXSpringBoardServer`
+   的 lookup 全部失败（`requestor = nfcd[53]`），Data 卷的 `logs/CrashReporter` 是空的，
+   `logs/usermanagerd.log.0` 末尾是 `STATFS failed for session 501`。
+
+### 下一步（round199 的候选，按可信度排序）
+
+1. **SIGTRAP 的来源**：`code=0x5` 是断点陷阱，最常见来源是 dyld 的调试/异常端口被自己踩到，或
+   代码里留下的 `brk #1`。先在内核侧把 `proc_prepareexit()` 里 `ns=2 code=0x5` 的退出补一条
+   用户态 PC/LR（`thread_get_state` 或 `uthread` 里的 savestate），把「谁下了断点」变成读数。
+2. **缺 backboardd / 显示服务**：SpringBoard 起来前后有没有 `backboardd` 的 exec/exit，这决定它是
+   「自己崩」还是「没有渲染服务可挂」。
+3. **AXSpringBoardServer 的 lookup 失败**是 launchd 层的旁证，不是根因——nfcd 在桌面上线前就会去问它。

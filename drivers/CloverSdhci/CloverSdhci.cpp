@@ -508,6 +508,9 @@ static void teeKernelLog (void);
 // Round184: the panic sink drains both RAM rings before the board resets itself into fastboot.
 // Defined below the tee it calls, used by `clover_emmc_panic_append` at the bottom of this file.
 static void panicDrainRings (void);
+// Round198: the BCB is written here, at the end of the GPT walk, and only re-checked by the panic
+// sink. Defined further down with the card-write helpers it uses.
+static unsigned int panicMarkRecovery (void);
 static uint32_t gPanicDrained = 0;              // one drain per boot; the sink can be called again
 static uint32_t gPanicDrainWritten = 0;         // records this drain put on the card
 static uint32_t gPanicDrainDropped = 0;         // oldest records it gave up to keep the newest
@@ -5407,6 +5410,15 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                         msgbufp ? msgbufp->msg_bufc : nullptr,
                         msgbufp ? msgbufp->msg_size : 0,
                         msgbufp ? msgbufp->msg_bufx : -1);
+              // Round198. Round197's frame reset itself at 238 s, mid-CloverBlock-write, and left
+              // no panic record: the reset never reached the screen that marks it. So the mark is
+              // written here instead, before anything that can reset the board runs. The card is
+              // selected and no block driver exists yet -- this is the same state the panic sink
+              // writes in -- and clover-unattended is what gates both halves. TWRP clears misc
+              // when it boots, so a frame read from recovery leaves the next boot a clean slot.
+              const unsigned int bcb = panicMarkRecovery ();
+              sdhciSay ("CloverSdhci r198: recovery BCB pre-armed rc=%u written=%u\n",
+                        bcb, gBcbWritten);
             } else {
               sdhciSay ("CloverSdhci r185: logdump entry too small, rings stay disarmed first=%u sectors=%u needed=%u\n",
                         entryLdFirst, logSectors, needed);
