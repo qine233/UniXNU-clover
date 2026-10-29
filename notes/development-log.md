@@ -14874,3 +14874,68 @@ write cache size=65536 ctrl=0 on=0` 与 `r192: commit skipped size=65536 on=0 (o
 
 宿主脚本这一轮的修复单独成两个提交：`f08c98b` 把 recovery 一棒换成 BCB，`ff1d14b` 修掉
 「空环计数被接成两行 `0`」的捕获缺陷（`count_records()`）。
+
+## round195（v0.5.55）：把 `fb=` 塞进 480 字节，按类分配环的槽
+
+round194 那张帧把「死线成立」和「读数不成立」分开了。成立的一半是报告槽 3 里的
+`clover r148: unattended deadline 900 s …`；不成立的一半是 `fb=` 在卡上找不到：`PANIC_LOG_BYTES`
+只有 480 字节，`fb=` 画在整屏最后，console ring、tty、pages/free、ticks、pmgr、寄存器、参数槽、
+TCR/SCTLR 已经把它截掉。内核环也被洪水换了生产者：`fairplayd.A2` 崩溃-respawn 反复重读 dyld 缓存，
+r155 292 条、r153 100 条、`r170: open …dyld_shared_cache_arm64.symbols` 99 条，512 槽按约 4.6 行/秒
+只够 110 秒，SpringBoard（213.70 s）与 `Early boot complete`（233.16 s）都被挤出去。
+
+两处改动：
+
+1. **`fb=` 写进记录正文**（`scripts/xnu-panic-screen.c`）。新增 `logonly()` 通路，`format()` 之后立即把
+   记录第二行追加进 logbuf，必然落在 480 字节内；屏幕底部那行照旧留给拍照。
+2. **tee 按类配额**（`drivers/CloverSdhci`）。r153 24、r155 32、`r170: open ` 32、r187 24、r189 24；
+   每类第一次超限在驱动环写一条 `CloverSdhci r195: <class> probe lines capped at <n>`。r170 的 exec/exit
+   不设限——「谁死了」正是停点要读的东西。配额判断挪到 allowlist 之后，没进环的行不吃预算。
+
+契约：`check-clover.py` 认 `logonly (&g, "\nfb=", fb);` 在 `format()` 之后、`if (PANIC_SINK)` 之前，
+`if (g->only_log) {` 在场，r195 的分类配额串与 `r170-open` 类目；`verify-clover-payload.py` 的
+`tee probe cap linked` 改认 r195 串。
+
+## round196（v0.5.56）：panic 自己写 BCB，IMEM 退成自检
+
+上一轮那句「板子自己回到 fastboot」被用户复测推翻：**还是重启，fastboot 是手动进的**。记录里的
+`fb=1` 只证明 IMEM `0x146bf65c` 写进去又读回，这个 XBL 不据此选启动路径。这一轮不再求引导器。
+
+1. **驱动**（`drivers/CloverSdhci`）：`clover_emmc_panic_append()` 在 `panicDrainRings()` 之后调
+   `panicMarkRecovery()`，往 `misc`（mmcblk0p50，LBA 13180952）只写前 2 个扇区，第一个扇区前 32 字节是
+   `boot-recovery`，其余清零（BCB 的 command/status/recovery/stage 都在前 1 KiB）。三重门
+   `gPanicLogReady && gUnattendedArmed && !gBcbWritten`：卡就绪、只在无人值守契约下、每次启动只写一次。
+2. **宿主脚本**：`--boot-after-flash` 之后不再断言「板子自己回 fastboot」，改成 `watch_after_deadline()`：
+   等 `WAIT` 秒，先见 recovery adb 就 `SKIP_RECOVERY=1`，先见 fastboot 就警告 BCB 没生效并回退到宿主
+   自己 `fastboot flash misc`，两者都不见就 `die 6`。
+3. **内核探针**（r196）：`proc_prepareexit()` 对 `OS_REASON_SIGNAL` 的退出按 comm 各打前 3 条
+   `clover r196: sig pid=… comm=… sig=… n=… desc=…`，desc 来自 `exit_reason_get_string_desc()`（只读
+   kcdata、不分配）；驱动 tee 加 `r196-sig` 类（48 条上限）。目标是 usermanagerd 反复 `SIGABRT
+   (ns=2 code=0x6)` 的原因。
+4. **构建侧**：r196 探针落在 `zzz-boot-progress.patch` 的上下文里，两者互为不可逆，整串补丁卡在
+   `bsd_init.c:987`。把 crash-why 加进 `build-xnu-4k-baseline.sh` 的「先反向」名单最前，重置
+   `.cache/xnu-work` 后按名重放；同时把 crash-why 重建成只含 r193/r196 两个 hunk 的补丁（之前那次
+   从整文件 diff 生成，把 boot_progress include 和 r170 的行也卷了进来）。
+
+契约：`check-clover.py` 认 `kMiscFirstLba = 13180952u`、`"boot-recovery"`、`!gUnattendedArmed`、
+sink 体内 `panicMarkRecovery ();`、脚本必须有 `watch_after_deadline() {`，并反向断言旧句
+`returned to fastboot by itself, so the deadline fired` 不得再出现；`verify-clover-payload.py` 新增
+`signal desc probe linked`。
+
+### 构建与闸门
+
+- 内核 `3ee8e902…` → AMFI 两刀仍落在 file `0x1aad0e4` / `0x1aad16c`（与 round186–195 同址）得
+  `08b9fa5b…` → 归一化 `4234b06f…`（968 个 object 戳全清）→ payload 卷内 kernel `ec8b44ad…`
+  （52195328 字节，入口探针 6986 字节 / 37 段）、`unixnu.toml` `e1674b9e…`（828 字节）、ADT
+  `6622a094…`（13516 字节）、trustcache `7c369ce0…`、data 种子 `614b8356…`；镜像 `aa16f7eb…`。
+  `boot.img` `196b284f…` 与 round183–195 逐字节相同——本轮没动固件，冷刷只写 cache。
+- **`build payload` 不给 `--kernel` 时取的是内核步骤的输出**，即未打 AMFI、未归一化的
+  `out/clover/kernel/kernel.macho`；第一次构建因此两处闸门红（AMFI 两刀是 stock、
+  968 个戳只清了 1 个）。同一处还漏了 `--data-ramdisk` 与 `--trust-cache`，payload 里因此没有
+  `scratch-data.img` 与 `kernel.macho.trustcache`。完整调用是
+  `./unixnu build payload --device ../UniXNU-clover --unique-chip-id 0x81ffcaaa --uefi ../mu-clover
+  --kernel out/clover/kernel/kernel-amfi.macho --data-ramdisk
+  ../UniXNU-clover/build/clover-root/launchd.macho --trust-cache
+  ../UniXNU-clover/build/clover-trust/trustcache.bundle`。
+- `check-clover.py` 绿；`verify-clover-payload.py` 41 项 OK、0 FAIL（含 `AMFI exec hook allows
+  OK`、`build-varying fields normalized OK (968/968 …)`、`signal description probe linked OK`）。

@@ -1,3 +1,4 @@
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
 @@ -1845,6 +1845,38 @@
@@ -39,3 +40,48 @@
  	if (!proc_should_trigger_panic(p, rv)) {
  		// No panic, bail out
  		return;
+@@ -1926,6 +1958,44 @@
+ 	boot_progress_exit(proc_getpid(p),p->p_name,rv,
+ 	    p->p_exit_reason ? p->p_exit_reason->osr_namespace : 0,
+ 	    p->p_exit_reason ? p->p_exit_reason->osr_code : 0);
++
++	/*
++	 * Round196. usermanagerd answers with SIGABRT and the reason buffer
++	 * carries the abort message, but the string only reaches the console
++	 * through the critical path, which these processes never take. Print it
++	 * here instead, three exits per command name and eight names, so a
++	 * single looping daemon cannot flush the ring on its own.
++	 */
++	if (p->p_exit_reason != OS_REASON_NULL &&
++	    p->p_exit_reason->osr_namespace == OS_REASON_SIGNAL) {
++		static char clover_sig_comm[8][17];
++		static uint32_t clover_sig_count[8];
++		static uint32_t clover_sig_used;
++		uint32_t clover_sig_slot = 8;
++		uint32_t clover_sig_i;
++
++		for (clover_sig_i = 0; clover_sig_i < clover_sig_used; clover_sig_i++) {
++			if (strncmp(clover_sig_comm[clover_sig_i], p->p_comm, 16) == 0) {
++				clover_sig_slot = clover_sig_i;
++				break;
++			}
++		}
++		if (clover_sig_slot == 8 && clover_sig_used < 8) {
++			clover_sig_slot = clover_sig_used++;
++			strlcpy(clover_sig_comm[clover_sig_slot], p->p_comm, 17);
++		}
++		if (clover_sig_slot < 8 && clover_sig_count[clover_sig_slot] < 3) {
++			const char *clover_sig_desc =
++			    exit_reason_get_string_desc(p->p_exit_reason);
++
++			clover_sig_count[clover_sig_slot]++;
++			printf("clover r196: sig pid=%d comm=%s sig=%d n=%u desc=%s\n",
++			    proc_getpid(p), p->p_comm,
++			    (int)p->p_exit_reason->osr_code,
++			    clover_sig_count[clover_sig_slot],
++			    clover_sig_desc ? clover_sig_desc : "none");
++		}
++	}
+ 
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);

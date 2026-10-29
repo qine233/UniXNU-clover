@@ -792,6 +792,23 @@ def check_critical_exit_probe(kernel: bytes) -> bool:
     return ok
 
 
+def check_signal_desc_probe(kernel: bytes) -> bool:
+    """Round196 reads what an aborting process said. The r195 frame has usermanagerd answering
+    SIGABRT (namespace 2, code 6) at three-second intervals for the rest of the boot, and the
+    reason buffer carries the abort message -- but only the critical path prints it, and these
+    processes never take that path. The image has to carry the line that prints it from
+    proc_prepareexit instead, and it has to keep r193's critical-exit reading beside it."""
+    label = "kernel.macho: signal description probe linked"
+    found = {"sig": (b"clover r196: sig pid=%d comm=%s sig=%d n=%u desc=%s\n") in kernel,
+             "kept-r193": (b"clover r193: crit pid=%d comm=%s rv=0x%x sig=%d fatal=%d sigcrash=%d "
+                           b"crashbits=0x%x spawnfail=%d deadline=%llu now=%llu\n") in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -1203,6 +1220,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_flush_stages(kernel)
         ok &= check_cache_ownership(kernel)
         ok &= check_critical_exit_probe(kernel)
+        ok &= check_signal_desc_probe(kernel)
     return 0 if ok else 1
 
 

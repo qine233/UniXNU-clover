@@ -643,6 +643,26 @@ def check_board(errors: list) -> str:
                           "has to run on the path the panic takes, not on a driver tail the boot that "
                           "panicked never reaches")
 
+        # round196, the BCB the panic path writes. Round195's frame is what makes this a source
+        # assertion and not a boot-arg one: the panic screen left fb=1 in IMEM's restart-reason
+        # cell, the read-back agreed, and the board still came up in Android -- this XBL does not
+        # consult that word. What it does read is the Android bootloader message in misc, which the
+        # host script already proved lands in TWRP in 14 s. The driver half is the LBA (device
+        # geometry, so it lives here), the command string, the unattended gate and the call from
+        # the sink; without all four the reset after a panic is the ordinary one again.
+        if "static const uint32_t kMiscFirstLba = 13180952u;" not in sdhci_source:
+            errors.append("drivers/CloverSdhci lacks kMiscFirstLba = 13180952: the panic path cannot "
+                          "write the recovery BCB without the misc partition's first LBA")
+        if '"boot-recovery"' not in sdhci_source:
+            errors.append("drivers/CloverSdhci never writes the boot-recovery command: a BCB with an "
+                          "empty command is what the bootloader reads as 'boot normally'")
+        if "!gUnattendedArmed" not in sdhci_source:
+            errors.append("the BCB write is not gated on gUnattendedArmed: a boot without the "
+                          "unattended contract would commit the next reset to recovery")
+        if sink >= 0 and "panicMarkRecovery ();" not in sdhci_source[sink:sink + 900]:
+            errors.append("the panic sink does not call panicMarkRecovery (): the BCB has to be in "
+                          "misc before the screen resets the board")
+
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
     if cores != CPU_REGS:
@@ -1523,8 +1543,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r193:"):
-        errors.append('[payload] title is not "clover r193: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r196:"):
+        errors.append('[payload] title is not "clover r196: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -1538,6 +1558,23 @@ def check_board(errors: list) -> str:
                       "emmc_run(), then input_run(), then power_run(), then dsp_run(): the power and "
                       "dsp reports would precede either the ring that carries them off the device or "
                       "the touch readings they exist to explain")
+
+    # Round196, the host half of the panic's BCB. The step after --boot-after-flash watched only
+    # for fastboot and printed "the board returned to fastboot by itself, so the deadline fired";
+    # round195 read the same landing and the board had come up in Android and been put into
+    # fastboot by hand, so that sentence was true about the deadline and false about its intent.
+    # The wait now answers both landings, TWRP's adb means the panic's own BCB took, and fastboot
+    # means it did not and the host writes its own. Both halves are asserted by name because the
+    # sequence around them is the same reboot-then-watch earlier rounds used.
+    script_text = (REPO / "scripts/run-clover-unattended.sh").read_text()
+    if "watch_after_deadline() {" not in script_text:
+        errors.append("scripts/run-clover-unattended.sh has no watch_after_deadline: after "
+                      "--boot-after-flash the script would again read a fastboot landing as proof "
+                      "of a reset whose recovered landing it never checked")
+    if "returned to fastboot by itself, so the deadline fired" in script_text:
+        errors.append("scripts/run-clover-unattended.sh still says the board 'returned to fastboot "
+                      "by itself, so the deadline fired': round195 showed that sentence on a board "
+                      "that had come up in Android and was put into fastboot by hand")
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -2496,8 +2533,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r193:"):
-        errors.append('[payload] title is not "clover r193: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r196:"):
+        errors.append('[payload] title is not "clover r196: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

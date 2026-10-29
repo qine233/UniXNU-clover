@@ -7,21 +7,29 @@
 #     with "clover r147: unattended deadline".
 #   * CloverSdhci maps IMEM's restart-reason cell at boot (0x146bf000 + 0x65c),
 #     writes 0x77665501 ("bootloader") and publishes it to the panic screen only
-#     after the read-back agreed. Every panic screen therefore marks the cell and
-#     resets through PSCI after 20 s, and XBL comes back up in fastboot.
-#   * The panic screen still writes its text to its own log window first (kind 20), so
-#     what it showed is on the card even though the panel is gone after the reset. Since
-#     round185 that window is the partition named logdump, not logfs -- logfs is this
-#     boot's root container and nothing of ours is written into it.
+#     after the read-back agreed. Round195 proved this XBL does not consult that
+#     word: the panic left fb=1 in SRAM and the board came up in Android. Since
+#     round196 the panic path also writes a boot-recovery BCB into misc, which is
+#     what this bootloader does read, so a panic while the unattended contract is
+#     armed lands in TWRP. The panic screen still writes its text to its own log
+#     window first (kind 20), so what it showed is on the card even though the
+#     panel is gone after the reset. Since round185 that window is the partition
+#     named logdump, not logfs -- logfs is this boot's root container and nothing
+#     of ours is written into it.
 #
 # This script does the host half, in order:
 #   1. wait for the tablet to appear in fastboot (it returns there by itself);
 #   2. --flash-cache IMG optionally cold-flashes the payload to the cache partition
 #      (a declared eMMC write, off unless asked for). With --boot-after-flash it
-#      then reboots normally, so the firmware boots that payload from the partition
-#      and the deadline brings the board back to fastboot on its own; without it the
-#      card is read as it stands, which is the *previous* boot's log window, not the one
-#      just written;
+#      then reboots normally and watches for the landing the deadline produces.
+#      Round196 is why that landing is two-way: the panic path now writes its own
+#      recovery BCB into misc, so the reset lands in TWRP with nothing from the
+#      host. Round195 measured the older shape -- fb=1 in IMEM's restart-reason
+#      cell, and the board still came up in Android -- so an arrival in fastboot
+#      is no longer read as "the deadline fired and its intent was honored": the
+#      script says the BCB did not take and writes the host's own BCB instead.
+#      Without --boot-after-flash the card is read as it stands, which is the
+#      *previous* boot's log window, not the one just written;
 #   3. write the recovery boot command into the misc partition (Android BCB) and
 #      reboot. This bootloader has no working recovery reboot of its own -- measured
 #      on round193: `fastboot reboot recovery` is accepted and performed as an
@@ -75,9 +83,10 @@ Options:
   --out PATH             dump file (default ~/clover-out/clover-log-window.bin)
   --flash-cache IMG      cold-flash IMG to the cache partition before recovery;
                          this is an eMMC write and is printed before it runs
-  --boot-after-flash     after flashing, reboot normally and wait for the board to
-                         come back to fastboot by itself, so the log window read in
-                         step 4 is the one this payload wrote
+  --boot-after-flash     after flashing, reboot normally and watch for the deadline's
+                         landing: TWRP's adb (the panic path wrote its own BCB into
+                         misc) or fastboot (it did not, and this script then writes
+                         the BCB itself so the window is still read)
   --allow-misc-bcb       consent to flashing a 2048-byte Android BCB
                          (command=boot-recovery) into the misc partition so the
                          bootloader boots recovery next; no other partition is
@@ -175,6 +184,28 @@ watch_landing() {
   done
   return 2
 }
+# Round196. After --boot-after-flash the deadline fires inside the payload's own boot, so
+# the landing arrives WAIT seconds after the reboot rather than LANDING_WAIT: this waits
+# as long as wait_fastboot used to and reports which of the two landings happened (0
+# TWRP's adb, 1 fastboot, 2 neither).
+watch_after_deadline() {
+  local deadline=$(( $(date +%s) + WAIT ))
+  local found
+  while :; do
+    found=$(adb_serial)
+    if [ -n "$found" ]; then
+      return 0
+    fi
+    found=$(fastboot_serial)
+    if [ -n "$found" ]; then
+      return 1
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 2
+    fi
+    sleep 2
+  done
+}
 # Round193 flash test. This step used to be one `fastboot reboot recovery` whose output
 # was grepped for "unknown": a reboot word this bootloader does not know is not reported
 # there, it performs an ordinary reboot -- the host sees exit 0 and the board leaves
@@ -195,7 +226,7 @@ make_bcb() {
   [ "$(wc -c < "$path" | tr -d ' ')" = "$BCB_SIZE" ]
 }
 
-say "contract: clover-unattended=<s> deadline, panic screen marks IMEM 0x146bf65c and resets after 20 s"
+say "contract: clover-unattended=<s> deadline, panic writes a boot-recovery BCB into misc and resets after 20 s"
 
 # A device already sitting in TWRP is the shortest path: dump from it. This also
 # covers a rerun after a failed recovery entry.
@@ -213,8 +244,22 @@ if [ "$SKIP_RECOVERY" = 0 ] && [ -n "$FLASH_CACHE" ]; then
     say "booting the payload just written: fastboot reboot (the firmware enters XNU after its 3 s default)"
     fastboot reboot >/dev/null 2>&1 || die 2 "fastboot reboot failed"
     wait_leave_fastboot || die 6 "the board never left fastboot after 'fastboot reboot': it is still the same boot, so nothing was read"
-    wait_fastboot || die 6 "the board did not come back to fastboot within ${WAIT}s: either the unattended deadline did not fire or its reset does not reach this host"
-    say "the board returned to fastboot by itself, so the deadline fired"
+    say "the board left fastboot; watching up to ${WAIT}s for the deadline's landing (TWRP's adb or fastboot)"
+    watch_after_deadline
+    landing=$?
+    case $landing in
+      0)
+        say "the panic path's own BCB took: TWRP adb $(adb_serial) after the deadline reset"
+        SKIP_RECOVERY=1
+        ;;
+      1)
+        say "the board came back to fastboot: its reset ran, but misc held no recovery command"
+        say "writing the host's BCB next so the window is still read from TWRP"
+        ;;
+      *)
+        die 6 "neither TWRP's adb nor fastboot within ${WAIT}s: the deadline did not fire, the panic screen never reset, or the reset does not reach this host"
+        ;;
+    esac
   else
     warn "the card still holds the boot that ran BEFORE this flash; pass --boot-after-flash to read the payload just written"
   fi

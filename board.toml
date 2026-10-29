@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r193: the watchdog's death no longer ends the boot -- the third SIGTRAP from a job that can never find IOWatchdog used to panic an otherwise healthy system"
+title = "clover r196: the panic now leaves a boot-recovery message in misc -- the IMEM word round195 read back was never what this XBL obeyed"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

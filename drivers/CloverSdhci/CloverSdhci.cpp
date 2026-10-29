@@ -323,6 +323,15 @@ static const uint32_t kRestartReasonOffset = 0x65c;
 static const uint32_t kRestartFastboot = 0x77665501u;
 static OSSharedPtr<IOMemoryMap> gImemMap;
 
+// Round196. The IMEM word above reads back on this board but the reset that follows does not
+// consult it: round195's panic left fb=1 in SRAM and the board came up in Android, not fastboot.
+// XBL on clover does honor the Android bootloader control block, so the panic path writes one
+// into `misc` instead. 13180952 is that partition's first LBA in the card's own GPT (2048
+// sectors), and the block is the standard 32-byte command followed by zeros -- the same 2048
+// bytes the host's make_bcb produces and round193 proved lands in TWRP in 14 s.
+static const uint32_t kMiscFirstLba = 13180952u;
+static const uint32_t kBcbBlocks = 2;   // command/status/recovery/stage fit in the first 1 KiB
+
 // Mode 17 stores the report as text, so the first bytes of the block identify it when read on
 // another OS. The newline is part of the stored length: the block reads as a small text file.
 // Mode 18 only reads that record: the magic and the byte sum decide whether this boot can see
@@ -455,6 +464,10 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r170: open ", "r170-open", 32, 0, 0, 0 },
   { "clover r187:",       "r187",      24, 0, 0, 0 },
   { "clover r189:",       "r189",      24, 0, 0, 0 },
+  // Round196's abort descriptions: usermanagerd respawns faster than anything else in the ring, so
+  // its own three lines are the budget this class exists to protect -- a looping daemon must not
+  // push the earlier lines out again.
+  { "clover r196: sig ",  "r196-sig",  48, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -513,6 +526,12 @@ static uintptr_t gGcc = 0;
 // read. A panic before that point writes nothing instead of driving an unselected card.
 static uint32_t gPanicLogFirst = 0;
 static volatile uint32_t gPanicLogReady = 0;
+
+// Round196. The unattended half that makes a panic become a recovery landing: the contract is only
+// on when the boot argument armed it, and the BCB is written at most once per boot so a panic that
+// is reported twice cannot turn two attempts into two rewrites of the same partition.
+static volatile uint32_t gUnattendedArmed = 0;
+static uint32_t gBcbWritten = 0;
 
 static uintptr_t mapRange (OSSharedPtr<IOMemoryMap> &slot, uint64_t phys, uint64_t length)
 {
@@ -6720,6 +6739,40 @@ static void reidentify (void)
   clover_emmc_stage = 6;
 }
 
+// Round196: leave a boot-recovery BCB in `misc` before the panic screen resets. Round195 proved the
+// IMEM word is written but not consulted by this XBL, while the same BCB the host writes makes the
+// board come up in TWRP in 14 s. Only the first two blocks are touched: command[32], status[32],
+// recovery[768] and stage[32] all live in the first 1 KiB, and the rest of the partition stays as it
+// was. Gated exactly like the log append -- a panic that fires before this boot reached logfs must
+// not drive an unselected card -- plus the unattended argument, so a normal boot's panic keeps the
+// reset behavior it had. Two PIO writes and the same paced wait; no read-back, because the next
+// boot's landing is the read-back.
+static unsigned int panicMarkRecovery (void)
+{
+  if (!gPanicLogReady || !gHost || !gUnattendedArmed || gBcbWritten) {
+    return 1;
+  }
+  static const char kCommand[] = "boot-recovery";
+  uint32_t words = 0, status = 0, rsp = 0, rstatus = 0, polls = 0;
+  for (uint32_t block = 0; block < kBcbBlocks; block++) {
+    uint8_t *bytes = reinterpret_cast<uint8_t *> (gWriteBlock);
+    for (uint32_t i = 0; i < 512; i++) {
+      bytes[i] = 0;
+    }
+    if (block == 0) {
+      for (uint32_t i = 0; i < sizeof (kCommand) - 1; i++) {
+        bytes[i] = static_cast<uint8_t> (kCommand[i]);
+      }
+    }
+    if (!writePioBlock (kMiscFirstLba + block, gWriteBlock, words, status)) {
+      return 2;
+    }
+    waitCardReady (rsp, rstatus, polls);
+  }
+  gBcbWritten = 1;
+  return 100;
+}
+
 // Append text that this boot did not assemble -- the panic screen formats the panic message and
 // its readings into a stack buffer and calls this by address (patch-xnu-entry-probe.py resolves
 // the symbol and passes it as PANIC_SINK). No bring-up, no allocation, no locks: the card is
@@ -6816,6 +6869,10 @@ extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int
 {
   const unsigned int rc = panicAppendText (text, length);
   panicDrainRings ();
+  // Last, because everything above is a reading and this changes what the reset does. The screen
+  // wrote its IMEM word before calling here; on this board that word does not survive into XBL's
+  // decision, so the BCB is what carries the intent across the reset.
+  (void)panicMarkRecovery ();
   return rc;
 }
 
@@ -6852,6 +6909,7 @@ extern "C" void clover_unattended_begin (void)
     return;
   }
   clover_fastboot_reason = cell;
+  gUnattendedArmed = 1;
   IOLog ("clover r148: unattended mark %x -> %x deadline=%us\n",
          kRestartFastboot, readback, seconds);
 }
