@@ -1,0 +1,80 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1229,6 +1229,68 @@
+ #undef MSG_FMT
+ }
+ 
++/*
++ * Round199. SpringBoard dies of SIGTRAP 0.35-0.66s after exec and the r170
++ * exit line reports only rv/ns/code, so the frame never says where the trap
++ * fired or who planted it. This runs inside the user breakpoint path itself,
++ * before the exception is triaged, and records the trapping instruction, its
++ * caller, and the BRK comment (ptrauth check failures use 0xC470-0xC47F).
++ * Two lines per pid across at most 24 pids keep one respawning daemon from
++ * flushing the kernel ring, and the total cap makes budget exhaustion
++ * distinguishable from a process that stopped trapping. The BSD headers
++ * cannot be included from an osfmk translation unit, so the two readers are
++ * declared here the way ipc_port.c and vm_protos.h declare theirs.
++ */
++extern int proc_pid(struct proc *);
++extern char *proc_name_address(void *);
++
++static void
++clover_user_breakpoint_why(arm_saved_state_t *state, uint32_t esr)
++{
++	static struct {
++		int pid;
++		unsigned int printed;
++	} clover_ubrk[24];
++	static unsigned int clover_ubrk_used;
++	static unsigned int clover_ubrk_total;
++	struct proc *clover_ubrk_proc = current_proc();
++	int clover_ubrk_pid = clover_ubrk_proc ? proc_pid(clover_ubrk_proc) : -1;
++	unsigned int clover_ubrk_i;
++	unsigned int clover_ubrk_slot = 24;
++
++	if (clover_ubrk_total >= 48) {
++		return;
++	}
++	for (clover_ubrk_i = 0; clover_ubrk_i < clover_ubrk_used; clover_ubrk_i++) {
++		if (clover_ubrk[clover_ubrk_i].pid == clover_ubrk_pid) {
++			clover_ubrk_slot = clover_ubrk_i;
++			break;
++		}
++	}
++	if (clover_ubrk_slot == 24) {
++		if (clover_ubrk_used >= 24) {
++			return;
++		}
++		clover_ubrk_slot = clover_ubrk_used++;
++		clover_ubrk[clover_ubrk_slot].pid = clover_ubrk_pid;
++		clover_ubrk[clover_ubrk_slot].printed = 0;
++	}
++	if (clover_ubrk[clover_ubrk_slot].printed >= 2) {
++		return;
++	}
++	clover_ubrk[clover_ubrk_slot].printed++;
++	clover_ubrk_total++;
++	printf("clover r199: ubrk pid=%d comm=%s n=%u pc=0x%llx lr=0x%llx sp=0x%llx cpsr=0x%x esr=0x%x ec=%u brk=0x%x\n",
++	    clover_ubrk_pid,
++	    clover_ubrk_proc ? proc_name_address(clover_ubrk_proc) : "?",
++	    clover_ubrk[clover_ubrk_slot].printed,
++	    (unsigned long long)get_saved_state_pc(state),
++	    (unsigned long long)get_saved_state_lr(state),
++	    (unsigned long long)get_saved_state_sp(state),
++	    (unsigned int)get_saved_state_cpsr(state),
++	    esr, (unsigned int)ESR_EC(esr), (unsigned int)ISS_BRK_COMMENT(esr));
++}
++
+ static void
+ handle_breakpoint(arm_saved_state_t *state, uint32_t esr __unused)
+ {
+@@ -1237,6 +1299,7 @@
+ 	mach_msg_type_number_t     numcodes  = 2;
+ 
+ 	boot_progress_user_breakpoint(state, esr);
++	clover_user_breakpoint_why(state, esr);
+ #if __has_feature(ptrauth_calls)
+ 	if (ESR_EC(esr) == ESR_EC_BRK_AARCH64 &&
+ 	    brk_comment_is_ptrauth(ISS_BRK_COMMENT(esr))) {

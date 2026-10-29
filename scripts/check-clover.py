@@ -677,6 +677,49 @@ def check_board(errors: list) -> str:
             errors.append("panicMarkRecovery () is called from the sink only: a reset that bypasses "
                           "the panic path leaves misc empty again, which is what round197 saw")
 
+        # round199, the user breakpoint reading. r198's frame ends with SpringBoard dying of SIGTRAP
+        # 0.35-0.66 s after every exec (rv=0x5 ns=2 code=0x5, desc=none) 24 times, and the exit line
+        # names the process but not the instruction: an assert, a ptrauth check and an explicit trap
+        # all arrive as the same SIGTRAP. So the reading moves to the path that delivers it --
+        # handle_breakpoint() in sleh.c, before exception_triage() -- and the driver keeps a class
+        # for it so the tee ring budgets it like every other chatty producer.
+        ubrk_patch = next((base / "patches/xnu-clover/zzzzzzz-clover-user-brk-why.patch"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover/zzzzzzz-clover-user-brk-why.patch").is_file()),
+                          None)
+        if ubrk_patch is None:
+            errors.append("patches/xnu-clover/zzzzzzz-clover-user-brk-why.patch is missing: the next "
+                          "frame would show SpringBoard's SIGTRAP with no trapping instruction again")
+        else:
+            text = ubrk_patch.read_text()
+            added = [line for line in text.splitlines() if line.startswith("+") and
+                     not line.startswith("+++")]
+            removed = [line for line in text.splitlines() if line.startswith("-") and
+                       not line.startswith("---")]
+            joined = "\n".join(added)
+            if removed:
+                errors.append(f"{ubrk_patch.name} deletes {removed[0][:60]!r}: r199 only adds a "
+                              "reading, and the exception path must keep delivering what it delivered")
+            for needle in ('"clover r199: ubrk pid=%d comm=%s n=%u pc=0x%llx lr=0x%llx sp=0x%llx '
+                           'cpsr=0x%x esr=0x%x ec=%u brk=0x%x\\n"',
+                           "clover_user_breakpoint_why(arm_saved_state_t *state, uint32_t esr)",
+                           "clover_ubrk_total >= 48", "printed >= 2",
+                           "clover_user_breakpoint_why(state, esr);"):
+                if needle not in text:
+                    errors.append(f"{ubrk_patch.name} lacks {needle[:52]!r}: the frame could not say "
+                                  "which instruction trapped and on whose behalf")
+            if text.find("clover_user_breakpoint_why(state, esr);") < \
+                    text.find("boot_progress_user_breakpoint(state, esr);"):
+                errors.append(f"{ubrk_patch.name} places the reading before the boot-progress hook "
+                              "inside handle_breakpoint(): the patch would stop applying to the "
+                              "context zzz-boot-progress adds")
+            if "handle_kernel_breakpoint" in joined:
+                errors.append(f"{ubrk_patch.name} touches the kernel breakpoint path: a kernel brk "
+                              "panics by design and must not go through the user reading")
+        if '{ "clover r199: ubrk ", "r199-ubrk", 48, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round199's reading no tee class: the r199 lines "
+                          "would land in the ring uncounted and could push out the exec/exit pairs")
+
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
     if cores != CPU_REGS:
@@ -1557,8 +1600,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r198:"):
-        errors.append('[payload] title is not "clover r198: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r199:"):
+        errors.append('[payload] title is not "clover r199: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2547,8 +2590,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r198:"):
-        errors.append('[payload] title is not "clover r198: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r199:"):
+        errors.append('[payload] title is not "clover r199: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

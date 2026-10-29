@@ -809,6 +809,24 @@ def check_signal_desc_probe(kernel: bytes) -> bool:
     return ok
 
 
+def check_user_breakpoint_probe(kernel: bytes) -> bool:
+    """Round199 reads where a user SIGTRAP came from. The r198 frame has SpringBoard dying of
+    namespace 2, code 5 (OS_REASON_SIGNAL, SIGTRAP) 0.35-0.66 s after every exec, with no reason
+    payload and no line about the instruction. The image has to carry the user breakpoint reading
+    that names the trapping pc, its caller and the BRK comment, and it has to keep the r170 exit
+    line that pairs the same pid with its death."""
+    label = "kernel.macho: user breakpoint reading linked"
+    found = {"ubrk": (b"clover r199: ubrk pid=%d comm=%s n=%u pc=0x%llx lr=0x%llx sp=0x%llx "
+                      b"cpsr=0x%x esr=0x%x ec=%u brk=0x%x\n") in kernel,
+             "kept-r170": (b"clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx "
+                           b"comm=%s\n") in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -1221,6 +1239,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_cache_ownership(kernel)
         ok &= check_critical_exit_probe(kernel)
         ok &= check_signal_desc_probe(kernel)
+        ok &= check_user_breakpoint_probe(kernel)
     return 0 if ok else 1
 
 

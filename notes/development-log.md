@@ -15058,3 +15058,32 @@ round197 得出「BCB 写在 panic 出口只覆盖 panic」，这一轮把写入
 2. **缺 backboardd / 显示服务**：SpringBoard 起来前后有没有 `backboardd` 的 exec/exit，这决定它是
    「自己崩」还是「没有渲染服务可挂」。
 3. **AXSpringBoardServer 的 lookup 失败**是 launchd 层的旁证，不是根因——nfcd 在桌面上线前就会去问它。
+
+## round199（v0.5.59）：在交付 SIGTRAP 的那条路径上打印陷阱现场
+
+r198 的读数把停点定死在「SpringBoard 每次 exec 0.35–0.66 s 后以 SIGTRAP 退出」。r170 的退出行给出
+了 pid、comm、`rv=0x5 ns=2 code=0x5` 与 `desc=none`，但退出的那一刻看不到陷阱指令本身：
+`assert()`、ptrauth 检查失败与显式的 `brk` 在内核眼里是同一个 SIGTRAP。这一轮把读数搬到唯一
+交付它的路径上——`osfmk/arm64/sleh.c` 的 `handle_breakpoint()`，在 `exception_triage()` 之前。
+
+### 设计与实现
+
+1. **落点**：`handle_breakpoint()` 是 EL0 断点到达用户态的必经之路（`ESR_EC_BRK_AARCH64` 且
+   CPSR 不是内核态、`ESR_EC_BKPT_AARCH32`、`ESR_EC_BKPT_REG_MATCH_EL0` 三条都汇进它）。
+   在内核态那条 `handle_kernel_breakpoint()` 上动手没有意义——那条路径本来就 panic by design，
+   补丁也明确不碰它。
+2. **读什么**：一次打印 pid、comm、陷阱 PC、LR（调用者）、SP、CPSR、原始 ESR、`ESR_EC(esr)` 与
+   `ISS_BRK_COMMENT(esr)`。BRK comment 直接区分 `brk #0/#1`（0/1）与 ptrauth 检查失败的
+   0xC470–0xC47F；PC/LR 一起看，才能判断是运行时自己下的断点还是从某个库函数里返回时踩到的。
+3. **预算**：每个 pid 两条、最多 24 个 pid、总数 48 条。SpringBoard 一帧断点 24 次且每次都在
+   重拉，不做预算会把内核环冲掉；总量上限留着，是为了让「预算用尽」与「不再断点」在环里可区分。
+   驱动侧的 tee 类表跟着加 `r199-ubrk`（48 条），环里能放下内核打出的每一行。
+4. **头文件**：不能 `#include <sys/proc.h>`——BSD 头进 osfmk 编译单元会因为 `uid_t`/`gid_t`/
+   `fixpt_t` 未定义而炸（试过，sleh.o 直接编不过）。`proc_pid()`/`proc_name_address()` 用局部
+   `extern` 声明，和 `vm_protos.h`、`ipc_port.c` 里的写法一致。
+5. **补丁排序**：新补丁 `zzzzzzz-clover-user-brk-why.patch` 排在字典序最后，它的落点
+   （`boot_progress_user_breakpoint(state, esr);` 之后）正好是 `zzz-boot-progress.patch` 的上下文，
+   所以它进了 `build-xnu-4k-baseline.sh` 的 LATE 反向名单第一位、**最先**逆撤。
+6. **契约**：`check-clover.py` 认格式串、函数签名、`clover_ubrk_total >= 48`、`printed >= 2`、
+   调用点在场且必须在 boot-progress 钩子之后、不得出现 `handle_kernel_breakpoint`；驱动必须
+   有 `r199-ubrk` 类。`verify-clover-payload.py` 加 `user breakpoint reading linked` 一项。
