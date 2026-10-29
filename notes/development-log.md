@@ -16242,3 +16242,33 @@ r215 只动恢复的触发点与判据，不动块传输：
 - 双闸门：`check-clover.py` 绿；`verify-clover-payload.py` 46 项 OK、0 FAIL（含
   `r215 card recover armed`、`r214 trip counter marker`、`build-varying fields normalized`）。
 - 归档：`~/clover-out/round215-{kernel-amfi.macho,payload.img,kernel-build.log,SHA256SUMS}`。
+
+### 读数（round215-unattended.log，boot 4）
+
+宿主只写 cache。`decoded: … (13 report record(s), 44 driver verdict line(s), 3 probe line(s),
+512 kernel log line(s), boot 4)`；44 条驱动行、13 条 report 全是 boot 4，没有跨靴残留。
+
+- **r215 没有触发，因为这一帧的卡没有沉默**：flight 最后一笔是
+  `seq 137076 t=436258ms read lba=28752264 blocks=8 pid=57 comm=contexts`，心跳最后一拍是
+  `t=429129 ms`，`stuck=0 recov=0 steal=0`；整个窗口没有一条 `r215: card recover`。
+  卡活到了 436 s，比 r214 的 408 s 还晚——**块路径的楔死是间歇性的，不是每靴必现**，
+  所以 r215 的沉默判据这一帧没有机会被检验（既没证明能恢复，也没证明不能）。
+- **这一帧第一次把杀点完整落卡**：`448.547 s` backboardd 杀 SpringBoard，驱动环上是
+  `r212: drain enter boot=4 … append_rc=112 probe_seen=3`、`panic tail lines=3 unseen=0`、
+  `r184: panic drain wrote=11 dropped=0 tee_passes=8`、`drain exit … wrote=11 … probe=3
+  probe_drop=0 probe_pend=1`。r212 起一直问的「杀点的栈有没有写进去」在这一帧有了肯定答案：
+  3 条 kind-25 probe 行（r207/r208/r211）全部上卡。
+- **panic 不是死线，是 `Kernel data abort`**：
+  `Kernel data abort. at pc 0xfffffff0072cde20, lr 0xfffffff0072cdd6c`，两者符号化后都落在
+  `_clover_task_threads`（pc `+0x180`、lr `+0xcc`）——即 r211 的线程栈回流补丁自身在遍历
+  任务线程时发生数据异常，在 448.5 s 杀点附近直接把内核打死。**这条通道现在是自伤的**，
+  r211 的代码要先修，否则每次拿到杀点都会同时拿到一次由它自己造成的 panic。
+- **`skst` 抓的是发信者，不是受害者**：`skst n=6` 解成
+  `_psignal_internal+0x34c → _kill+0x140 → _unix_syscall+0x5f0 → _sleh_synchronous+0x378 →
+  _fleh_synchronous+0x28 → fleh_dispatch64_common+0xa4`，这是 **backboardd 调 kill 的调用栈**，
+  不含 SpringBoard 任何线程。要回答「SpringBoard 在等什么」，下一轮必须抓收信者上下文
+  （或在 `psignal` 里按 pid 匹配目标、取目标任务线程），而不是照搬发信者的内核栈。
+
+**r216 的两件事（按序）**：(a) 修 `_clover_task_threads` 的数据异常——`pc +0x180` 与 `lr +0xcc`
+是补丁自己的地址，先让它遍历任务线程时不炸；(b) 在 `psignal` 路径里按目标 pid 定位
+SpringBoard 的线程并回流栈，回答杀前的等待点。

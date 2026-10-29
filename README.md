@@ -56,11 +56,22 @@ r214 的帧把这条线结掉了：票完好（37 条 boot-3 驱动行、`stuck/
 连续 6 次 CMD13 不应答（或 DATA_INHIBIT 超 30 s）就整卡断电重初始化，成功后重试一次；
 有应答但忙的卡不动。冷却 15 s、每靴 16 次封顶。
 
+r215 的帧说明这个方向还没被检验到：这一靴的卡没有沉默——flight 活到 `436.258 s`
+（`read lba=28752264 blocks=8 comm=contexts`）、心跳到 `429.129 s`，`stuck/recov/steal` 全 0，
+窗口里没有一条 `r215: card recover`。**楔死是间歇性的，不是每靴必现**（r214 是 408 s，
+本靴是 436 s 以上）。但这一帧第一次把杀点完整落卡：`448.547 s` backboardd 杀 SpringBoard，
+`r212: drain enter boot=4 … append_rc=112 probe_seen=3`、`r184: panic drain wrote=11 unseen=0`、
+`drain exit … probe=3 probe_drop=0`，r207/r208/r211 三条 probe 全部上卡。代价是 panic 原因换了：
+`Kernel data abort at pc=0xfffffff0072cde20, lr=0xfffffff0072cdd6c`，两者都落在
+`_clover_task_threads`（`+0x180` / `+0xcc`）——**r211 的线程栈回流补丁自己把内核打死了**。
+另外 `skst` 解出来是 backboardd 调 `kill` 的栈（`_psignal_internal → _kill → unix_syscall`），
+抓的是发信者，不是 SpringBoard。r216 因此先修这个数据异常，再按目标 pid 取收信者的线程栈。
+
 ## 距离 iOS 桌面还差什么
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 被 backboardd 的看门狗杀掉** | r207 读数：`killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58 scomm=backboardd ns=-1 code=0x0 cs=0x22000301 ra=fffffff0076ffd7c`。锚点与 `_psignal_internal` 的链接地址逐位相同（slide=0），`ra` 解成 `_kill+0x140`；CS 位不含 `CS_KILLED`，不是签名校验；backboardd 里有 `_pingSystemShellForCollectiveWatchdog:`、`watchdogPing: system app claims it's no longer alive`、`Killing %{public}@.`。r208 没有复现（环停 `[167.198224]`）；r209 走到死线但 sink 没写进去；r210 块路径健康到死线（flight 到 `t=900.664 s`、心跳到 `t=897.566 s`），sink 写入成功，kill 在 `[457.346085]`，杀前 5 线程全在 TH_WAIT、pc 落在 `DiagnosticRequestService` / `libswift_StringProcessing`，无主线程。r211 在杀点加了内核栈回流，但这一帧的守卫被 `t=341.015 s` 一笔无后继的 8 块读拿住，环停在 `[352.186939]`，panic 时 `panicTailRead` 又被 `gTeeReady` 门挡住——杀点的栈已经打进 msgbuf 却没落卡。r212 给出靴号与 probe 环，但这一帧更早停：flight 最后一笔是 `t=181885 ms` 的 8 块读（`lba=31076656`，Data 卷 6.08 GiB 处，无后继），心跳早 12.99 s 断（`miss=13`），内核环停在 `[194.181939]`；SpringBoard 152.2 s exec 后无输出，杀点（r210 是 457 s）没到，所以 kind 25 是 0 条。r213 的票上了膛且拿到 37 条 boot-2 驱动行，但停点仍被卡写光：flight 最后一批入口是 `t=407.460 s` 起 chronod 的连续 8 块读，tee 最后一行 `[418.465029]`，之后没有 `guard stuck`、没有 drain，panic 没有一条上卡 | r214 读数：票完好、请求全部在 145 ms 内完成，`[408.100]` 最后一次成功写卡后整条路径沉默到 900 s，看门狗一次都没触发。r215 改用「CMD13 不应答」作为沉默判据，由请求自己执行同一套整卡重初始化阶梯（冷却 15 s、每靴 16 次），恢复成功后重试一次 |
+| 1 | **SpringBoard 被 backboardd 的看门狗杀掉** | r207 读数：`killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58 scomm=backboardd ns=-1 code=0x0 cs=0x22000301 ra=fffffff0076ffd7c`。锚点与 `_psignal_internal` 的链接地址逐位相同（slide=0），`ra` 解成 `_kill+0x140`；CS 位不含 `CS_KILLED`，不是签名校验；backboardd 里有 `_pingSystemShellForCollectiveWatchdog:`、`watchdogPing: system app claims it's no longer alive`、`Killing %{public}@.`。r208 没有复现（环停 `[167.198224]`）；r209 走到死线但 sink 没写进去；r210 块路径健康到死线（flight 到 `t=900.664 s`、心跳到 `t=897.566 s`），sink 写入成功，kill 在 `[457.346085]`，杀前 5 线程全在 TH_WAIT、pc 落在 `DiagnosticRequestService` / `libswift_StringProcessing`，无主线程。r211 在杀点加了内核栈回流，但这一帧的守卫被 `t=341.015 s` 一笔无后继的 8 块读拿住，环停在 `[352.186939]`，panic 时 `panicTailRead` 又被 `gTeeReady` 门挡住——杀点的栈已经打进 msgbuf 却没落卡。r212 给出靴号与 probe 环，但这一帧更早停：flight 最后一笔是 `t=181885 ms` 的 8 块读（`lba=31076656`，Data 卷 6.08 GiB 处，无后继），心跳早 12.99 s 断（`miss=13`），内核环停在 `[194.181939]`；SpringBoard 152.2 s exec 后无输出，杀点（r210 是 457 s）没到，所以 kind 25 是 0 条。r213 的票上了膛且拿到 37 条 boot-2 驱动行，但停点仍被卡写光：flight 最后一批入口是 `t=407.460 s` 起 chronod 的连续 8 块读，tee 最后一行 `[418.465029]`，之后没有 `guard stuck`、没有 drain，panic 没有一条上卡 | r214 读数：票完好、请求全部在 145 ms 内完成，`[408.100]` 最后一次成功写卡后整条路径沉默到 900 s，看门狗一次都没触发。r215 改用「CMD13 不应答」作为沉默判据，由请求自己执行同一套整卡重初始化阶梯（冷却 15 s、每靴 16 次），恢复成功后重试一次。r215 读数：这一靴卡没沉默（flight 到 `436.258 s`、beat 到 `429.129 s`、`stuck/recov/steal=0`，没有 recover 行），所以判据未获检验；但杀点首次完整落卡（`drain enter boot=4 … append_rc=112`、`panic drain wrote=11 unseen=0`、3 条 probe 全上卡），代价是 `Kernel data abort @ _clover_task_threads+0x180`——r211 的栈回流补丁自伤，且 `skst` 抓的是发信者 backboardd 的 `kill` 栈。r216：先修该数据异常，再按目标 pid 取收信者线程栈 |
 | 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
