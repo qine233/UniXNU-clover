@@ -14939,3 +14939,28 @@ sink 体内 `panicMarkRecovery ();`、脚本必须有 `watch_after_deadline() {`
   ../UniXNU-clover/build/clover-trust/trustcache.bundle`。
 - `check-clover.py` 绿；`verify-clover-payload.py` 41 项 OK、0 FAIL（含 `AMFI exec hook allows
   OK`、`build-varying fields normalized OK (968/968 …)`、`signal description probe linked OK`）。
+
+### 读数（/Users/zhouzhou/clover-out/round196-unattended.log，113407 字节）
+
+宿主只写 cache：`declared eMMC write: fastboot flash cache …/round196-payload.img (58720256 bytes into
+the cache partition only)`。复位后落点 0：`the panic path's own BCB took: TWRP adb 81ffcaaa after the
+deadline reset`，随后 `recovery: device=clover twrp=3.7.1_12-1-clover-th3fron3`，回退到宿主
+`fastboot flash misc` 的一棒没走。logdump 一次 dd 读回 622592 字节。
+
+1. **纸面读数先立住**：panic 记录 slot 5（lba 13320226，body 480）第二行是 `fb=1`——r195 的目标
+   达成；同一环里还留着前几帧的两条 300 s 记录（`ticks=47055/47032`），900 s 这一条
+   `ticks=143310 cnt0=edde2de cnt1=414d7f39b`。`fb=1` 只说明 IMEM 那块字写进读回，与落点无关。
+2. **停点换到 usermanagerd 的 keybag**：732.27 s 打开 `/private/var//keybags/usersession.kb`（ENOENT），
+   768.19 s 打开 `/private/var/keybags/persona.kb`（ENOENT），773.31 s `exit pid=88 rv=0x6 ns=2 code=0x6`，
+   紧接着 `clover r196: sig pid=88 comm=usermanagerd sig=6 n=1 desc=Daemon failed to load persona
+   manifest.`；890.88 s pid=167 复现同一句（n=2）。r196 探针把 abort 的理由第一次带出了内核环。
+3. **本帧没有 SpringBoard**；`Early boot complete. Continuing system boot.` 在 232.46 s，之后系统一直在
+   动（fairplayd.A2 反复起落、containermanagerd 建容器、keybagd pid 45 到 893.7 s 仍在系统调用），
+   直到 900 s 死线。r193 的 `panic_on_crash_disabled=1` 生效：watchdogd 的 `sig=5` 反复出现而启动没有停。
+4. **tee 侧**：`r170-open` 先在 32 条截住（slot 31），`r153` 在 24 条截住（slot 32），内核环保持约
+   512 行到 909.95 s（panic 后 20 s 复位前仍在进）。`CloverSdhci r184: panic drain wrote=0 dropped=0
+   tee_passes=8`——panic 时排干没有新内容可写，环里的行都是 tee 早先抄出来的。
+
+**读法上的一条新经验**：host 镜像的 Data 窗口与设备实际 Data 卷不是同一份 lineages（设备卷在窗口内
++0xac00 处才见 APFS 容器，且缺 `keybags` 目录；宿主种子有空的 `keybags/`）。这解释了 keybag 的两个
+ENOENT——问题是 persona 清单文件本身缺失，不是路径拼错。
