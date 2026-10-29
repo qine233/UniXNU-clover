@@ -8,14 +8,16 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 launchd 把守护进程拉起来；r202 让 `IOMobileFramebufferLegacy` attach + start，r205 写
 `display-scale=2` 解掉 `FBSDisplayMode` 断言，r206 起 compositor 连续 present
 （`done/presented=4`、每帧 9 216 000 字节），但整屏仍是黑的——SpringBoard 没有把界面画上去，
-约 110 s 后被 backboardd 用 `kill(2)` 杀掉。
+约 535 s 时被 backboardd 的系统 shell 看门狗用 `kill(2)` 杀掉。
 
-r217 读数（boot 6）：杀点前采样生效（15 条 `sbs`、`sbbusy=0`、5 条 `sbthr` 即时落卡），
-杀点 `[493.244946]` 到退出只隔 18 ms（r216 的 39 s 推迟消失）；5 条线程处于
-`TH_RUN`/`TH_RUN\|TH_IDLE`，用户态 pc 减本靴 slide `0x1050c000` 后全部落进
-`libsystem_kernel` 的 syscall 桩——**内核侧没有死锁**。SpringBoard 从未创建
-`IOMobileFramebufferUserClient`（客户端只有 pid 86/58/97/56/74），backboardd 一直 present 的
-只是 `305x887..755x1029` 的小块黑帧。缺口因此收窄成一句话：**SpringBoard 在启动渲染之前就卡住了**。
+r218 读数（boot 7）：杀点 `[536.991377]`。发信者 upc 解到 `___kill+0x8`，`ulr=0x100ce0144` 按
+backboardd slide `0xC6E000` 反推是镜像 `0x100072050` 的批量杀循环——枚举捕获集合、逐元素
+`Killing %{public}@.` 后 `kill(pid,9)`，由 libdispatch block 调起；这就是 BKSystemShellSentinel
+的系统 shell 看门狗。退出行 `[560.121938]`，kill→exit 隔 23.1 s（r217 是 18 ms），原因未证。
+SpringBoard 主线程 t=417–444 的 fp 链停在 `__BKSDisplayGetMainScreenInfo +0xa4` /
+`_BKSDisplayServicesStart +0x78` 的 mach_msg，t=481 起转成 dispatch-mach 接收，t=536（杀前
+0.57 s）落在 `mach_port_mod_refs`；**从未提交渲染**。共享缓存 slide 用 r200 的八字自证为
+`0xa628000`。缺口因此收窄成一句话：**SpringBoard 卡在显示服务握手上，看门狗到点就杀**。
 
 更早的逐轮读数在 [`notes/development-log.md`](notes/development-log.md)。
 
@@ -23,7 +25,7 @@ r217 读数（boot 6）：杀点前采样生效（15 条 `sbs`、`sbbusy=0`、5 
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 活不下来：不渲染，约 110 s 后被 backboardd 杀掉** | r217 读数（boot 6）：杀点前采样生效（15 条 `sbs`、`sbbusy=0`、5 条 `sbthr` 即时落卡），杀点 `[493.244946]` 到退出只隔 18 ms；5 条线程处于 `TH_RUN`/`TH_RUN\|TH_IDLE`，用户态 pc 减本靴 slide `0x1050c000` 后全部落进 `libsystem_kernel` 的 syscall 桩（+0x18e8/+0x1b58/+0x1970/+0x4bdc），内核侧没有死锁。**SpringBoard 从未创建 `IOMobileFramebufferUserClient`**（客户端只有 pid 86/58/97/56/74），backboardd 连续 present 的全是 `305x887..755x1029` 的小块黑帧；杀点 `ra=fffffff007704d7c` 解到 `_kill+0x140`，CS 位不含 `CS_KILLED` | r218：从杀点取发信者 8 词代码 + `ulr` 定位 backboardd 看门狗的调用点；采样行补 x16（syscall 号）与用户栈帧，回答「SpringBoard 在等谁、为什么不渲染」 |
+| 1 | **SpringBoard 活不下来：不渲染，约 535 s 后被 backboardd 的系统 shell 看门狗杀掉** | r218 读数（boot 7）：杀点 `[536.991377]`，发信者 upc 解到 `___kill+0x8`、`ulr=0x100ce0144`，按 backboardd slide `0xC6E000` 反推到镜像 0x72144 —— `0x100072050` 的批量杀循环（枚举捕获集合、逐元素 `Killing %{public}@.` + `kill(pid,9)`，libdispatch block 调起），身份是 BKSystemShellSentinel 的系统 shell 看门狗；退出 `[560.121938]`，kill→exit 23.1 s 原因未证。主线程 t=417–444 停在 `__BKSDisplayGetMainScreenInfo +0xa4` / `_BKSDisplayServicesStart +0x78` 的 mach_msg，t=481 起转 dispatch-mach 接收，t=536（杀前 0.57 s）落 `mach_port_mod_refs`；从未提交渲染。slide 用 r200 八字自证 `0xa628000` | r219：给每次 `mach_msg2` 采样带上用户消息头（`msgh_bits`、`msgh_id`、远端/本地端口名），把「在等谁」从返回地址推断变成直接读数 |
 | 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |

@@ -16387,3 +16387,69 @@ r216 修好之后，下一帧的 `sbthr` 会给出每个 SpringBoard 线程的 `
 SpringBoard 用户态为什么不起渲染。r218 因此两件事：一是在信号路径里把发信者 `upc` 处的 8 词
 代码与保存态 `lr` 读出来，把 backboardd 看门狗调用点落到具体函数；二是给采样行加 `x16`
 （pc 所在的 syscall 桩对应哪个系统调用）与有界的用户栈帧行，回答「它到底在等谁」。
+
+## round218 读数（boot 7）：看门狗身份落地，SpringBoard 卡在显示服务握手上
+
+这一帧是 r218 产物（`round218-payload.img`，冷刷 cache=mmcblk0p49，boot 7）跑出来的。
+
+- **杀点与退出**：`killsig pid=27 comm=SpringBoard sig=9 spid=58 scomm=backboardd` 在
+  `[536.991377]`；`clover r196: sig pid=27 … sig=9`（kern_exit.c）在 `[560.121938]`，
+  即 `kill(2)` 到进程退出隔了 **23.1 s**（r217 是 18 ms）。r218 的 psignal 行本身在
+  `536.9914` 就打完了，延迟发生在投递之后；采样行在 `t=549..553` 仍能看到 5 条线程，
+  与「信号已发、进程还没拆完」一致。这一帧的退出延迟不再与探针阻塞有关，但也没有证据
+  说明原因，只作为观察记录。
+- **本靴 slide 自证**：r200 的 `foff=0x4bf1e4f8` 八字在 `dyld_shared_cache_arm64.21`
+  命中 SessionSyncEngine 的 cache vmaddr `0x1c18f64f8`（另一处 TeaDB 命中被跳过），
+  `slide = 0x1cbf1e4f8 − 0x1c18f64f8 = 0xa628000`。同一 slide 下 SpringBoard 主线程
+  `pc=0x1d5da8b58` 落在 `libsystem_kernel`（text `0x1cb77f000`）的 `mach_msg2` 桩
+  `+0x1b58`，与 r217 的桩偏移逐位一致，自证成立。
+- **killsrc**：`upc=0x1d5dad100`、`ulr=0x100ce0144`、
+  `code=540000e3.a9bf7bfd.910003fd.940004d9.910003bf.a8c17bfd.d65f03c0.d65f03c0`。
+  `upc − slide = 0x1cb785100`，即 `libsystem_kernel` 的 `___kill + 0x8`；八个词就是
+  `kill` 的系统调用桩尾部（`stp/mov/bl/mov/ldp/ret/ret`）。`ulr=0x100ce0144` 属于
+  backboardd 主可执行文件（不在共享缓存里）。
+- **backboardd 看门狗**：整份 binary 只有两处 `bl _kill`——`0x100071ee0`（返回
+  `0x100071ee4`，单杀）与 `0x100072140`（返回 `0x100072144`，批量杀）。只有后者能让
+  `ulr` 落到页对齐的 slide：**backboardd 本靴 slide = 0xC6E000**，`ulr` 对应镜像偏移
+  `0x72144`，即批量杀函数 `0x100072050` 里 `bl _kill` 的返回点。这个函数枚举一个捕获的
+  集合，逐元素先打 `Killing %{public}@.`（日志类别 `_BKLogSystemShell`）再 `kill(pid,9)`；
+  单杀兄弟 `0x100071e5c` 做同一件事。它与 `Blocking system apps.`、
+  `Shell exists; will terminate %{public}@` 相邻，binary 里的字符串把整条链钉在
+  **BKSystemShellSentinel 的系统 shell 看门狗**上：`_pendingCheckIn`、`_finishedStartup`、
+  `_shellsFinishedStartup`、`_collectivePingSystemShellSet`、
+  `_pingSystemShellForCollectiveWatchdog:`、`startSystemAppCheckInServer`、
+  `com.apple.backboard.systemshell`、`com.apple.backboard.oswatchdog`。结论：
+  **SpringBoard 是被「系统 shell 未完成 check-in / startup 上报」的看门狗按超时杀掉的**，
+  不是随机 kill，也不是内核问题。
+- **杀是从 libdispatch 的 block 里发出的**：`killustk n=4 sp=0x16f190860 fp=0x16f190990`，
+  `f0=0x199bddc9c`、`f1=0x199bdecc0`、`f2=0x199b8c548`、`f3=0x199b8c15c` 减 slide 后分别是
+  `libdispatch` 的 `0x18f5b5c9c`、`0x18f5b6cc0`、`0x18f564548`、`0x18f56415c`（含经
+  `blr x8` 调 block 的 thunk）。批量杀函数本身在文件里没有任何原始指针或 chained-fixup
+  引用，符合「它是 block 的 invoke/body、由 libdispatch 调起」这一形态；这里只把它记成
+  dispatch block 的执行体，不强行给它安一个 selector 名字。
+- **SpringBoard 在等什么（本帧第一次有答案）**：主线程 `tid=0x104` 在杀前的
+  `t=417..533` 一直停在 `mach_msg2`（`x16=-47`），fp 链前两帧在 `libsystem_kernel` 的
+  `mach_msg` 包装里，后两帧随阶段变化：
+  - `t=417/434/444`：`f2=0x199c84cac → 0x18f65ccac` 是 BackBoardServices 的
+    `__BKSDisplayGetMainScreenInfo + 0xa4`，`f3=0x199c84b98 → 0x18f65cb98` 是
+    `_BKSDisplayServicesStart + 0x78`。**主线程当时在显示服务的 mach_msg 握手里**。
+  - `t=481..533`：后两帧换成 `libdispatch` 的 dispatch-mach 接收
+    （`_dispatch_mach_msg_get_context` / `_os_release` 一带），是正常的 runloop 收消息。
+  - `t=536`（杀前 0.57 s）：`x16=-19`（`mach_port_mod_refs`），链落在
+    `0x191589b44`/`0x1922fbcc4`，像是连接记账的收尾动作。
+  也就是说：主线程先卡在 BKS 的显示服务握手，之后转入 runloop 收消息；它从未向
+  render server 提交过一帧（r206/r217 的 `IOMobileFramebufferUserClient` 客户端里没有
+  pid 27），backboardd 自己的 `swap#4`/`scanout#4` 在杀后仍在跑。
+- **其余线程**：`sbthr` 5 条与 r217 同形，pc 全部落在 `libsystem_kernel` 的 syscall 桩
+  （`mach_msg2 +0x1b58`、`ulock_wait2 +0x1970`、`ulock_wait +0x7bdc`、
+  `workq_kernreturn +0x18e8`），内核侧无死锁；`x16` 读数在本帧补齐了这些桩的调用号
+  （-47 mach_msg2、170 csops_audittoken、220 getattrlist、203 mlock、-25 mach_port_destruct、
+  -24 mach_port_construct、-19 mach_port_mod_refs、-18 mach_port_deallocate、99 保留）。
+
+**结论**：r218 把「谁杀、从哪杀、为什么杀」三件事都落了地——backboardd 的
+BKSystemShellSentinel 看门狗，从 libdispatch 的 block 里，批量 SIGKILL 未完成 check-in /
+startup 上报的系统 shell；杀点前 SpringBoard 的主线程曾在 `_BKSDisplayServicesStart` /
+`__BKSDisplayGetMainScreenInfo` 的 mach_msg 里等待，之后转回 runloop，始终没有起渲染。
+剩下的唯一问题是：**它到底在等哪个服务、为什么没有走到 check-in/渲染**。r219 因此只做一件事：
+对 SpringBoard 的每次 `mach_msg2` 采样，把用户消息头（`msgh_bits`、`msgh_id`、远端/本地
+端口名）一起记下来，用 `msgh_id` 与端口把「在等谁」从返回地址推断变成直接读数。
