@@ -499,7 +499,12 @@ LEGACY_DISPLAY = (("legacy boot args", "offline-legacy-transfer"),
                   ("gpu hand-off gate", "sheng-fb-gpu"),
                   ("probe round stamp", "clover r180:"),
                   ("console reading", "probe: console %ux%u row=%u depth=%u display=%llu rotate=%u scale=%u base=%llx length=%llx"),
-                  ("IOSurface root reading", "late: IOSurface load=%d root found=%u"))
+                  ("IOSurface root reading", "late: IOSurface load=%d root found=%u"),
+                  # Round202 starts the display, so the four-step line and the driver's own hardware
+                  # gate have to be in the image too: without them phase 4 is a boot argument that
+                  # selects code the payload does not carry.
+                  ("attach reading", "late: dt=%u probe=%u attached=%u started=%u score=%d"),
+                  ("gop gate", "offline-legacy-gop"))
 
 
 # Round181's instrument is the other half of the board's input story, and it is linked the same way

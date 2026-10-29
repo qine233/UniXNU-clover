@@ -15287,3 +15287,96 @@ liveactivitiesd 的八字同时命中 TeaDB 与 SessionSyncEngine 两个 Swift �
 
 r202 起转到显示：把 phase 1 之后的 `IOMobileFramebufferLegacy` 补到 attach + start，
 先让 backboardd 枚举出一个显示器，再看 SpringBoard 是否还停在同一条致命路径。
+
+## round202（v0.5.63）：显示真的 attach + start 了，SpringBoard 的死点挪到 FBSDisplayMode 的模式校验
+
+r201 把 SpringBoard 的 SIGTRAP 读成「找不到主 CADisplay」。这一轮把探针从 phase 1 推到
+phase 4：把 GOP 那段内存发布成 `/arm-io` 下的 `display-subsystem`，让
+`IOMobileFramebufferLegacy` probe/attach/start，并把逻辑电源对与交换路径
+（validate/transfer/retire）一起上膛。读数证明**显示栈第一次走到了用户态**：五个进程在
+326–363 s 之间各开了一个 `IOMobileFramebufferUserClient`，而 SpringBoard 的死点从
+「没有显示器」换成了「`FBSDisplayMode` 有个字段校验不过，且这段把越界当 assert」。
+
+### 改了什么
+
+- `offline-legacy-phase=4` 取代 `=1`；同一条链上必须有
+  `offline-legacy-gop/pm/validate/transfer/retire`——`startHardware()` 没有 `gop` 就返回 false，
+  没有 `pm` 则 selector 6 的等待永远回 Busy，没有 validate/transfer/retire 则
+  `validateSwap()` 那一侧不会跑。`check-clover.py` 把这六个参数当一条链断言，并反向断言
+  `sheng-fb-gpu=1` 与 `offline-legacy-unit-scale=` 不在：Adreno 交接与 `/chosen` 缩放是后面的事，
+  第一次上屏是 CPU 拷贝、原生像素。
+- `verify-clover-payload.py` 加两条镜像内证据：四步行
+  `late: dt=%u probe=%u attached=%u started=%u score=%d`，以及 `offline-legacy-gop` 门本身。
+- 无人值守窗口修正（见下文「窗口差 20 秒」）。
+
+### 读数（冷刷 cache=p49，payload sha256 `ae68e416…adb06f`）
+
+**显示确实 attach + start 了。**直接证据不是那几行 `late:`（它在内核日志环上膛之前就打印，
+落在 logdump 窗口建立之前，所以窗口里见不到），而是客户端本身：没有 `start()` 过的
+`IOService`，`newUserClient` 不会被调到。
+
+```
+clover r180: client#1 pid=58  seen=1  backboardd
+clover r180: client#2 pid=102 seen=2  MobileGestaltHelper
+clover r180: client#3 pid=86  seen=3  IOMFB_FDR_Loader
+clover r180: client#4 pid=56  seen=4  thermalmonitord
+clover r180: client#5 pid=74  seen=5  PerfPowerServices
+```
+
+全部 `type=0 status=00000000 class=IOMobileFramebufferUserClient`。backboardd（pid 58）在
+326 s 就来连，315 s 起它已经 exec。它的 selector 序列里有一行
+`selector 6 0 80000003 0 -> 00000000 done=0 presented=0`：调用成功，但对象里的
+完成/呈现代数（`+5820`/`+5824`）都还是 0，也就是**还没有一帧在飞**。
+
+**没有任何 swap。**32 个 selector 读数里成功的只有 88/8/15/6；其余一律
+`e00002c7`（`kIOReturnUnsupported`：57/22/33/79(args 0/1580)/74(0/64)/12/84(4/0)/50/27(0/3084)），
+28 返回 `e00002f0`（`kIOReturnNotFound`）。`validateSwap()` 从没被调到，所以没有
+`swap#… accepted`、没有 `swap reject`、没有 `frame#`，也就没有色带。
+
+原因不是驱动坏了，而是 compositor 在拿到一个能用的模式之前不交 surface：现在
+`getDisplayDimensions` 走原始实现，报的是 GOP 的 1200x1920 / row 4800 / depth 32；
+`supportedFrameInfo` 与刷新属性只在 `sheng-vsync` 落在 (60,240] 时才发布，本轮没传它，
+所以 backboardd 看到一个「不可交换」的帧信息就停了。
+
+### 新死点：FBSDisplayMode 的模式校验
+
+t=358.392 SpringBoard 先吐三句
+`channel selection => zero-element buffer` / `Could not find subscription buffer` /
+`no subscription to disable`，随后：
+
+```
+clover r199: ubrk pid=27 comm=SpringBoard n=1 pc=0x1a63e0744 lr=0x1a63e0744
+             sp=0x16f5b3bf0 cpsr=0x60000000 esr=0xf2000000 ec=60 brk=0x0
+clover r200: ubrk2 pid=27 ... off=0x263e0744 foff=0x263e0744
+             code=aa1503e0.94241eec.94027801.94241df1.d4200000.d4200020.f1000c1f.1a9f27e0
+```
+
+`0x263e0744` 经 `.09` 分缓存（`code=` 八字自证）换算成
+**`FrontBoardServices 0x19f3d0500 + 0x244`**。这个函数是 `FBSDisplayMode` 的初始化器：先把
+九个参数写进对象（`+8/+0x10/+0x18/+0x20/+0x28/+0x30/+0x38/+0x40/+0x48`），再逐条校验
+（x24 != -1；x25、x26 ∈ {0,1}；class 相等；d9 ≥ 0 且 d8 > 0；x23 < 2、x22 < 3、x21 < 4），
+失败后按第 9 个参数 x28 分派：3 → 照返，2 → 只记日志，**1 → 致命块**。本轮 x28 == 1，
+走的是致命块：拼 `"FBSDisplayMode cannot be configured as requested : %@"`
+（CFString `0x1e7a9b008`，数据 `0x19f4522d4`、长 `0x35`），调一次 BaseBoard 的
+`_CFDebugLogRunLoop`（`+0x7d6bc`，两条指令 `str x0,[0x1ed9f0cb0]; ret`），然后 `brk #0`。
+`code=` 里 pc 前那四条是 `mov x0,x21` / `bl objc_release` / `bl FBS selector stub` /
+`bl BaseBoard+0x7d6bc`，与下一条 `d4200000` 逐字对得上——`lr == pc` 又是「调完返回、
+落到 trap」，不是跳错。
+
+结论：**显示器已经存在**（r201 的「找不到主 CADisplay」这次没再出现），现在卡在
+SpringBoard 构造 `FBSDisplayMode` 时某个字段越界。x19 指向那个对象，下一轮把它 copyin
+出来就能判定是哪条校验。
+
+### 窗口差 20 秒
+
+`--boot-after-flash` 之后脚本用 `watch_after_deadline`（`WAIT=900`）等落点，但死线是
+**内核启动后** 900 s，panic 后再停 20 s 才复位，TWRP 的 adb 还要几秒才起来——900 s 从
+reboot 起算必然差在落点之前。本轮就是这样：21:10 脚本报「neither」，读数几分钟后才从
+TWRP 读回。修正是给这一段加 `DEADLINE_SLACK=120`，`wait_fastboot` 那条路径不变。
+
+### 下一步
+
+r203：扩展 `zzzzzzz-clover-user-brk-why.patch`，把每 pid 上限提到 4 行，新增
+`ubrk3`（x4–x7、x19–x28）与 `ubrk4`（copyin x19 起 64 字节），量出 `FBSDisplayMode`
+的 width/height/scale/refresh 与那几个枚举值，判定哪条校验失败；然后让驱动上报的模式
+落进 SpringBoard 能接受的那一档，再回到第一次 present 与色带。

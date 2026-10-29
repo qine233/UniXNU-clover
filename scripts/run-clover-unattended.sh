@@ -57,6 +57,13 @@ set -u
 WAIT=900
 ADB_WAIT=180
 LANDING_WAIT=420
+# Round202. The payload's deadline is 900 s of its own uptime, not 900 s of the host's
+# wall clock: after the reboot it still has to reach that instant, sit on the panic screen
+# for its reset delay, boot the bootloader and start TWRP's adb. Round202's frame reached
+# SpringBoard at 358 s and the script's plain WAIT window expired before the landing, so
+# the deadline's own reset was read as "nothing came back". The slack covers exactly those
+# three steps and nothing else.
+DEADLINE_SLACK=120
 OUT="$HOME/clover-out/clover-log-window.bin"
 FLASH_CACHE=""
 ALLOW_BCB=0
@@ -74,7 +81,10 @@ usage() {
   cat <<'EOF'
 
 Options:
-  --wait SECONDS         how long to wait for fastboot (default 900)
+  --wait SECONDS         how long to wait for fastboot at the start (default 900;
+                         after --boot-after-flash the same budget is spent waiting
+                         for the deadline's landing, plus a fixed 120 s for the
+                         payload's reset delay and TWRP's adb coming up)
   --adb-wait SECONDS     how long to wait for recovery adb (default 180)
   --landing-wait SECONDS how long to watch for either TWRP's adb or the board
                          returning to fastboot after a recovery reboot (default 420:
@@ -185,11 +195,12 @@ watch_landing() {
   return 2
 }
 # Round196. After --boot-after-flash the deadline fires inside the payload's own boot, so
-# the landing arrives WAIT seconds after the reboot rather than LANDING_WAIT: this waits
-# as long as wait_fastboot used to and reports which of the two landings happened (0
-# TWRP's adb, 1 fastboot, 2 neither).
+# the landing arrives WAIT seconds after the reboot rather than LANDING_WAIT -- plus the
+# reset delay and the bootloader's own path into TWRP, which is what round202's missing
+# landing measured. This reports which of the two landings happened (0 TWRP's adb, 1
+# fastboot, 2 neither).
 watch_after_deadline() {
-  local deadline=$(( $(date +%s) + WAIT ))
+  local deadline=$(( $(date +%s) + WAIT + DEADLINE_SLACK ))
   local found
   while :; do
     found=$(adb_serial)
@@ -257,7 +268,7 @@ if [ "$SKIP_RECOVERY" = 0 ] && [ -n "$FLASH_CACHE" ]; then
         say "writing the host's BCB next so the window is still read from TWRP"
         ;;
       *)
-        die 6 "neither TWRP's adb nor fastboot within ${WAIT}s: the deadline did not fire, the panic screen never reset, or the reset does not reach this host"
+        die 6 "neither TWRP's adb nor fastboot within $(( WAIT + DEADLINE_SLACK ))s: the deadline did not fire, the panic screen never reset, or the reset does not reach this host"
         ;;
     esac
   else

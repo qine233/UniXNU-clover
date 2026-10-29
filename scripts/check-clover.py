@@ -492,10 +492,29 @@ def check_board(errors: list) -> str:
                 if argument not in board["payload"]["kernel_args"]:
                     errors.append(f"CONFIG_XNU_NATIVE_LEGACY_DISPLAY is on but kernel_args omits "
                                   f"{argument}: native_legacy_display_probe() is never called")
-            if "offline-legacy-phase=1" not in board["payload"]["kernel_args"]:
-                errors.append("kernel_args does not pin offline-legacy-phase=1: the probe's own default "
-                              "is 1, so a shipped boot that later drifts to phase 2/3/4 would attach and "
-                              "start a display whose backend slots this board has never qualified")
+            # Round202 moves the probe from phase 1 (register, construct, release) to phase 4 (publish
+            # the GOP range as an /arm-io display subsystem, probe, attach, start) because round201
+            # read SpringBoard's SIGTRAP as FBSDisplayMonitor finding no main CADisplay. Each argument
+            # below is one link of that chain and none is optional: the phase selects the path, gop
+            # lets startHardware() claim the mapping, pm gives selector 6 a non-Busy answer, and
+            # validate/transfer/retire are the swap path without which a started display shows
+            # nothing. The two GPU-era switches stay out on purpose.
+            if "offline-legacy-phase=4" not in board["payload"]["kernel_args"]:
+                errors.append("kernel_args does not pin offline-legacy-phase=4: round202 starts the "
+                              "display, and the probe's default of 1 would ship a boot that only "
+                              "registers the class again")
+            for argument in ("offline-legacy-gop=1", "offline-legacy-pm=1",
+                             "offline-legacy-validate=1", "offline-legacy-transfer=1",
+                             "offline-legacy-retire=1"):
+                if argument not in board["payload"]["kernel_args"]:
+                    errors.append(f"kernel_args omits {argument}: with phase 4 the display attaches "
+                                  f"but never starts, presents or retires a frame, which reads on "
+                                  f"the card as the same silence as having no display")
+            for argument in ("sheng-fb-gpu=1", "offline-legacy-unit-scale="):
+                if any(entry.startswith(argument) for entry in board["payload"]["kernel_args"]):
+                    errors.append(f"kernel_args passes {argument}: the Adreno hand-off and the "
+                                  f"/chosen display-scale policy are later questions, and the first "
+                                  f"present is the CPU copy at native pixels")
             if flags.get("NATIVE_MOBILE_DISPLAY", "n") in ("y", "1"):
                 errors.append("CONFIG_XNU_NATIVE_MOBILE_DISPLAY is on as well: that switch asks the "
                               "link for libNativeMobileDisplay.late.a, which this board does not build, "
@@ -1610,8 +1629,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r200:"):
-        errors.append('[payload] title is not "clover r200: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r202:"):
+        errors.append('[payload] title is not "clover r202: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -1638,6 +1657,14 @@ def check_board(errors: list) -> str:
         errors.append("scripts/run-clover-unattended.sh has no watch_after_deadline: after "
                       "--boot-after-flash the script would again read a fastboot landing as proof "
                       "of a reset whose recovered landing it never checked")
+    # Round202's frame reached SpringBoard at 358 s, the payload's deadline is 900 s of its own
+    # uptime, and the script gave the landing exactly WAIT seconds of host time -- so the board's
+    # own reset landed after the window closed and the run reported "neither". The reset delay and
+    # TWRP's adb coming up have to be inside the same budget.
+    if "DEADLINE_SLACK=120" not in script_text:
+        errors.append("scripts/run-clover-unattended.sh has no DEADLINE_SLACK: the landing budget "
+                      "would again expire before the payload's 900 s deadline plus its reset delay, "
+                      "and a reset that did happen would read as nothing coming back")
     if "returned to fastboot by itself, so the deadline fired" in script_text:
         errors.append("scripts/run-clover-unattended.sh still says the board 'returned to fastboot "
                       "by itself, so the deadline fired': round195 showed that sentence on a board "
@@ -2600,8 +2627,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r200:"):
-        errors.append('[payload] title is not "clover r200: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r202:"):
+        errors.append('[payload] title is not "clover r202: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

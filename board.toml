@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r200: the trap address becomes a file offset -- r199 showed SpringBoard dying of brk #0 at a fixed shared-cache pc with lr==pc, so the kernel now prints the map entry behind that pc, the eight instructions that lead into it, and the registers and message pointers the brk was reached with"
+title = "clover r202: the display attaches and starts -- r201 read SpringBoard's trap as FBSDisplayMonitor finding no main CADisplay, so the phase-1 probe is now phase 4: the GOP range becomes a /arm-io display-subsystem, IOMobileFramebufferLegacy probes, attaches and starts on it, and the logical power pair plus the swap validator, scanout transfer and retirement are passed so a frame can actually land"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2159,32 +2159,52 @@ kernel_args = [
   # software-IPI SPI numbers are hardcoded at 1008..1015 -- tb128fu had to move its base
   # to 536 because its GIC implements fewer INTIDs. typer= on the panic screen is this
   # board's GICD_TYPER, and until it is read, 1008 is a guess.
-  # Round180 asks the display stack its first question on hardware, and these three arguments are one
-  # chain rather than three switches. native_mobile_graphics_load_probe() (bsd_init.c, compiled in only
+  # Round180 asks the display stack its first question on hardware, and these two arguments are one
+  # chain rather than two switches. native_mobile_graphics_load_probe() (bsd_init.c, compiled in only
   # because CONFIG_XNU_NATIVE_LEGACY_DISPLAY is on) returns without touching anything unless
   # offline-mobile-graphics-load=1 parses, and calls native_legacy_display_probe() only when
-  # offline-legacy-register=1 parses too. Phase 1 is the narrowest phase the probe has: it registers the
-  # class, constructs one IOMobileFramebufferLegacy, metaCast()s it, calls init(), says what
-  # PE_current_console handed this kernel, and releases the object. It never attaches or starts it, so
-  # no display backend slot is reached and the seven still-guarded abstract leaves stay untouched. That
-  # is deliberate: the first reading is class identity plus console geometry, not a frame.
+  # offline-legacy-register=1 parses too.
+  # Round202 takes the chain past phase 1. Phase 1 registered the class, constructed one
+  # IOMobileFramebufferLegacy, metaCast()s it, called init(), printed what PE_current_console handed
+  # this kernel, and released the object -- round180's reading came back exactly like that. Round201
+  # then read SpringBoard's SIGTRAP through the same build's dyld shared cache: it is
+  # FBSDisplayMonitor.m printing "failed to find the main CADisplay" and trapping on purpose, so the
+  # question is not why SpringBoard dies but why there is no display for it to find.
+  # Phase 4 is the phase that answers it: the late probe waits for IOSurface's IOCoreSurfaceRoot,
+  # builds an IOPlatformDevice over this board's own GOP range (base 0x9d400000, row 4800, 1200x1920,
+  # depth 32, no rotation -- the numbers round180 printed), publishes it under /arm-io as
+  # device_type="display-subsystem" so the platform code that enumerates a display subsystem's
+  # children can see it, then probes, attaches and starts IOMobileFramebufferLegacy.
+  # offline-legacy-gop=1 is the driver's own gate: startHardware() returns false without it, and an
+  # attached display whose hardware step was skipped would be a lie. offline-legacy-pm=1 is the
+  # logical power-state pair the user client's selector-6 wait reads; without it every wait answers
+  # Busy and the compositor never presents even with the display attached. validate/transfer/retire
+  # are the swap path itself: the validator accepts one full-frame, untransformed, non-planar BGRA
+  # surface, the transfer stores it into the GOP range, and retirement releases the next frame.
+  # A started display with no swap path would present nothing, which is the same picture as no
+  # display at all, so the three travel with the phase that starts it.
+  # sheng-fb-gpu stays off (the Adreno hand-off is a later question and the CPU copy needs no GPU
+  # client) and so does offline-legacy-unit-scale (no /chosen display-scale is published).
   # What comes back, in the order it lands on the card's kernel-log ring (round176's tee keeps every
-  # line whose text contains "clover r", so this needs no allowlist change):
-  #   `clover r180: probe: console 1200x1920 row=4800 depth=32 display=<n> rotate=0 scale=<n>
-  #    base=9d400000 length=9216000` -- the ABL/GOP handoff as the kernel itself sees it, including the
-  #    v_display word the vendored driver's `primary=video.v_display!=0` change depends on;
-  #   `clover r180: probe: object=... size=6304 parent=1 init=<IOReturn>` -- 6304 is 0x18A0, the
-  #    instance size scripts/audit-clover-mobile-graphics-legacy.py derives from this image's own
-  #    registration instructions, and parent=1 is the three-level metaCast against the original class;
-  #   a refusal line instead (preModLoad refused / postModLoad=<n> / no console descriptor / console
-  #    rejected / allocation failed) names the exact step the class does not survive.
-  # Phases 2, 3 and 4 -- the IOSurface root wait, the GOP nub, attaching and starting the display, the
-  # presenter hand-off -- stay unpassed until phase 1 reads back, because each of them can reach the
-  # backend this board has not qualified. Same for offline-legacy-validate/transfer/retire/pm and
-  # sheng-fb-gpu: they are the swap path, and there is no swap until there is a started display.
+  # line whose text contains "clover r"):
+  #   `clover r180: late: IOSurface load=<n> root found=<0|1>` -- whether the display stack reaches a
+  #    surface root at all;
+  #   `clover r180: late: dt=<0|1> probe=<0|1> attached=<0|1> started=<0|1> score=<n>` -- the four
+  #    steps round202 adds; the first zero names the step that refused;
+  #   `clover r180: stage=... start=<0|1> pm=... swap=... accept=... reject=... scanout=...` -- the
+  #    one-line report, now with a non-zero stage, start and pm;
+  #   `clover r180: client#<n> pid=<pid> type=<n> status=<x> class=<name>` -- the first user client to
+  #    find the display, which is what replacing "no CADisplay" looks like;
+  #   `clover r180: swap reject reason=<n> ...` or `frame#0 ...` -- what a swap did with a frame.
+  # A panic instead is the backend guard naming its slot (leaf=<n>), and that is a reading too.
   "offline-mobile-graphics-load=1",
   "offline-legacy-register=1",
-  "offline-legacy-phase=1",
+  "offline-legacy-phase=4",
+  "offline-legacy-gop=1",
+  "offline-legacy-pm=1",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-retire=1",
   # Round184 parks 排期 4, 5 and 6. The three instrument arguments below are deliberately NOT passed
   # any more: the goal moved to getting iPadOS onto its own screen, and each of these three spends
   # boot time and bus risk on a question that is not that one. The drivers stay linked, their modes

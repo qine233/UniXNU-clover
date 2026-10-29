@@ -4,17 +4,18 @@
 ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。
 配套固件仓库 `uefi-clover`（Mu-Silicium 移植），驱动与硬件常量在 `porting.toml`。
 
-现状一句话：**引导链已经通到 SpringBoard**——XNU 起来、OS/SystemOS/Data 三个卷全挂、
-launchd 把守护进程拉起来、SpringBoard 每次 exec 后 0.3–0.5 秒就崩（pid 反复重拉，末帧停在
-`t=7–14 s`）。r201 已把这次崩解到 **`FBSDisplayMonitor` 找不到主 CADisplay**，也就是缺
-下面第 2 项的显示栈。桌面还没出现，缺的是这六件事。
+现状一句话：**引导链已经通到 SpringBoard，显示器也第一次进了内核**——XNU 起来、
+OS/SystemOS/Data 三个卷全挂、launchd 把守护进程拉起来，r202 又把
+`IOMobileFramebufferLegacy` 推到 attach + start（backboardd 等 5 个进程在 326–363 s 各开了
+一个 `IOMobileFramebufferUserClient`）。但还没有一帧上屏（`validateSwap()` 一次没被调），
+SpringBoard 改死在 `FBSDisplayMode` 的参数校验上。桌面还没出现，缺的是这六件事。
 
 ## 距离 iOS 桌面还差什么
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 自己退出** | 每次 exec 后 0.3–0.5 s 以 `SIGTRAP` 死。r201 用同 build（21H461）的 dyld 共享缓存把 r200 的 `foff=0x3a17b2ec` 自证到 `FrontBoardServices`（缓存 vmaddr `0x19f3df2ec`、本帧 slide `0x1ad80000`）：`FBSDisplayMonitor.m` 四个并列致命块之一，引用串是 **`failed to find the main CADisplay`**，记完日志后 `brk #0`；`lr == pc` 是报错函数返回后落到 trap，不是跳错 | 根因是显示栈没交到用户态：转到第 2 项，`IOMobileFramebufferLegacy` attach + start，让 backboardd 枚举出主显示器 |
-| 2 | **屏还没交给内核** | 原始 `IOMobileFramebufferLegacy` 已在自己内核里资格化、真档案链接进镜像，但只到 phase 1：登记类、构造实例、报 console 几何；**不 attach、不 start、不 present** | 资格化剩下七个抽象叶，attach + start + 第一次 present，用色带验几何 |
+| 1 | **SpringBoard 自己退出** | r201 的「找不到主 CADisplay」这次没再出现。新死点是 `FBSDisplayMode` 的初始化器（`FrontBoardServices 0x19f3d0500+0x244`，t=358.4，pid 27）：九个参数里至少一个过不了校验（宽/高/缩放/刷新与几个枚举），而第 9 参为 1 时把越界当断言，拼 **`FBSDisplayMode cannot be configured as requested : %@`** 后 `brk #0`（`code=` 八字已自证） | r203 让内核探针 copyin x19 指向的对象，量出到底是哪个字段，再让驱动上报的模式落进它接受的那一档 |
+| 2 | **屏还没交给内核** | r202 已经 attach + start：GOP 段发布成 `/arm-io` 的 `display-subsystem`，5 个进程各开了一个 `IOMobileFramebufferUserClient`，selector 6 调用成功；但 `validateSwap()` 一次没被调，`done/presented` 都是 0，没有一帧 | 修好上报的模式（第 1 项），让 compositor 肯交 surface，跑通第一次 present 并用色带验几何 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 5 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |
@@ -34,6 +35,7 @@ launchd 把守护进程拉起来、SpringBoard 每次 exec 后 0.3–0.5 秒就�
 | Data 卷 | 1 GiB 种子、UUID 钉住（r198），`ENOSPC` 消失 |
 | eMMC | 高速 8 线 + CMD18 批量；ADMA2 读（逐字比对）、写只准回写自己读到的字节；r192 把 cache flush 交还卡，barrier 不再挂死 |
 | launchd 与守护进程 | `exec`/`exit` 成对、`Early boot complete`、SpringBoard 被反复拉起 |
+| 显示栈 | `IOMobileFramebufferLegacy` 登记、attach、start 都有读数：backboardd 等 5 个进程各拿到一个用户客户端，selector 6 返回成功；`validateSwap()` 还没被调到 |
 | 读数通道 | 两个环落在 **logdump**（p56）：kind-21 驱动判据 64 槽、kind-22 内核日志 512 槽，一次 `dd` 1216 扇区读回；panic 屏把 `fb=` 写进记录 |
 | 无人值守 | `run-clover-unattended.sh`：冷刷 cache → 900 s 死线 → 预置 BCB 落 TWRP → 读回日志，退出码 0（本帧读数即由此而来） |
 | 可复现内核 | 968 个 object 戳、`LC_UUID`、`_PrelinkKCID` 由文件内容派生，同树两次构建收敛到同一镜像 |
