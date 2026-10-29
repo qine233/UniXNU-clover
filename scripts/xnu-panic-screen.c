@@ -53,6 +53,7 @@ struct ctx {
   u8  *log;   /* buffer that also receives the formatted screen text, 0 = none */
   u32 logn;
   u32 logcap;
+  u32 only_log; /* draw into the log copy and skip the panel; used for the record's own preface */
 };
 
 #ifndef PANIC_TEXT
@@ -238,6 +239,9 @@ static void put (struct ctx *g, u8 c)
     g->log[g->logn++] = (c == '\n') ? '\n' : (c >= 32) ? c : ' ';
     g->log[g->logn] = 0;
   }
+  if (g->only_log) {
+    return;
+  }
 
   if (c == '\n') {
     g->x = 0;
@@ -388,6 +392,19 @@ static void text (struct ctx *g, const char *s)
   }
 }
 
+/* Round195: the card keeps only the first PANIC_LOG_BYTES (480) bytes of this text, and the panel's own
+ * fb= row is drawn after every reading -- so round194's deadline record carried no fb= at all, and
+ * whether that reset reached fastboot was again a question only a photograph gone twenty seconds later
+ * could answer. The same reading goes into the log copy as the record's second line, where it fits;
+ * the panel keeps its fb= row at the bottom for a photograph. */
+static void logonly (struct ctx *g, const char *label, u64 v)
+{
+  g->only_log = 1;
+  text (g, label);
+  number (g, v, 10, 0, 0);
+  g->only_log = 0;
+}
+
 static void hex (struct ctx *g, const char *label, u64 v)
 {
   text (g, label);
@@ -471,6 +488,7 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   g.log = logbuf;
   g.logcap = PANIC_LOG_BYTES;
   g.logn = 0;
+  g.only_log = 0;
   /* Clear the middle of the screen only: the entry probe's trace bands live in
    * the lower half and must survive the panic for a photograph. */
   for (row = g.y; row < g.h / 2; row++) {
@@ -486,6 +504,7 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
     g.logcap = PANIC_TEXT_BYTES - 1;
   }
   format (&g, fmt, args);
+  logonly (&g, "\nfb=", fb);
   __asm__ volatile ("dsb sy");
   /* Round125's question, drawn ahead of every other reading: twice in a row the board wedged inside
    * one write(2) to /dev/console and the clock watchdog's panic took the panel, so the screen now

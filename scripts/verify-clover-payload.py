@@ -416,10 +416,12 @@ VERDICT_RING = ("CloverSdhci r174: verdict ring armed lba=",
 
 # Round194 caps the r187/r189 per-call probe lines at 48 in the kernel-ring tee. The r193 dump needed
 # that: 2021 of the ring's 512 surviving records were those two kinds, so the ring only covered 101 s of
-# a 313 s boot and the part after the boot started working was what got evicted. A payload built from a
-# driver without the cap still shows every other string this verifier looks for, so the cap gets its own
-# needle; the line names the number so a reader of the ring knows what 48 means.
-TEE_PROBE_CAP = "CloverSdhci r194: syscall probe lines capped at %u"
+# a 313 s boot and the part after the boot started working was what got evicted. Round195 showed the
+# flood had only moved -- r153, r155 and r170's dyld-cache opens took 491 of 512 -- so each chatty class
+# now has its own budget and its own first-drop line. A payload built from a driver without the cap
+# still shows every other string this verifier looks for, so the cap gets its own needle; the line
+# names the class and the number so a reader of the ring knows what 32 means.
+TEE_PROBE_CAP = "CloverSdhci r195: %s probe lines capped at %u"
 
 
 def check_tee_probe_cap(kernel: bytes) -> bool:

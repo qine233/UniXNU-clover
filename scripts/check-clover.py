@@ -2965,9 +2965,14 @@ def check_board(errors: list) -> str:
          "the deadline would cut a boot that round193's frame shows still moving at 312.9 s, "
          "and the round would be measuring the deadline instead of the boot"),
         ("drivers/CloverSdhci/CloverSdhci.cpp",
-         "kTeeProbeKeepMax = 48",
-         "the r187/r189 per-call lines would fill the kernel ring again: they were 2021 of "
-         "its 512 records on round193's frame, which covered 101 s of a 313 s boot"),
+         'CloverSdhci r195: %s probe lines capped at %u',
+         "the tee would go back to an uncapped transcript: on round194's frame the flood had "
+         "only moved to r153/r155/r170-open, which took 491 of the ring's 512 records and left "
+         "the ring covering 110 s of a 912 s boot"),
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         '{ "clover r170: open ", "r170-open", 32, 0, 0, 0 },',
+         "r170's opens of the dyld cache symbols file were 99 records on round194's frame and "
+         "would spend the whole ring unless they have a class of their own"),
     ]
     for relative, needle, why in links:
         path = REPO / relative
@@ -2987,6 +2992,18 @@ def check_board(errors: list) -> str:
         if drawn < 0 or sink < 0 or drawn > sink:
             errors.append("xnu-panic-screen.c draws fb= after the sink: the panic record would not say "
                           "whether its own reset was going to land in fastboot")
+        # Round195: the panel row was not enough. PANIC_LOG_BYTES is 480 and that row is drawn
+        # after every reading, so round194's deadline record carried no fb= at all. The same
+        # reading now also goes into the log copy right after the panic message.
+        early = screen_text.find('logonly (&g, "\\nfb=", fb);')
+        formatted = screen_text.find("format (&g, fmt, args);")
+        if early < 0 or formatted < 0 or sink < 0 or not (formatted < early < sink):
+            errors.append("xnu-panic-screen.c does not append fb= to the record after the panic "
+                          "message: the card would again not say whether the reset was going to "
+                          "land in fastboot")
+        if "if (g->only_log) {" not in screen_text:
+            errors.append("xnu-panic-screen.c has no log-only path: the record preface would also "
+                          "be painted on the panel")
     host = REPO / "scripts/run-clover-unattended.sh"
     if host.is_file():
         # `fastboot boot` is forbidden everywhere in this port: the image must be cold-booted from

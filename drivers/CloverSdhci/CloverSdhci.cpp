@@ -434,13 +434,30 @@ static const uint32_t kTeeAllowlistCount =
 // ring's 512 records were theirs: the ring covered 101 s of a 313 s boot and nothing before 211 s.
 // They are a sample now, not a transcript. Enough survive to show the last calls before a stop; the
 // rest stay out so the ring spans the boot it describes.
-static const char *const kTeeProbeTokens[] = { "clover r187:", "clover r189:" };
-static const uint32_t kTeeProbeTokenCount =
-    sizeof (kTeeProbeTokens) / sizeof (kTeeProbeTokens[0]);
-static const uint32_t kTeeProbeKeepMax = 48;
-static uint32_t gTeeProbeKept = 0;
-static uint32_t gTeeProbeDropped = 0;
-static uint32_t gTeeProbeReported = 0;
+//
+// Round195 gives every chatty class its own budget instead of one shared one. On round194's frame the
+// flood had simply moved: fairplayd.A2 crash-respawns and re-reads the dyld cache, so r155 (three lines
+// per read), r153 and r170's opens of dyld_shared_cache_arm64.symbols took 292/100/99 of 512 slots and
+// the ring still covered only 110 s of a 912 s boot. Each class reports its own first drop, so a ring
+// that stops early now names which producer filled it. r170's exec/exit lines stay uncapped: a process
+// dying is what a stop is read from.
+struct TeeProbeClass {
+  const char *token;
+  const char *name;
+  uint32_t keep_max;
+  uint32_t kept;
+  uint32_t dropped;
+  uint32_t reported;
+};
+static TeeProbeClass kTeeProbeClasses[] = {
+  { "clover r153:",       "r153",      24, 0, 0, 0 },
+  { "clover r155:",       "r155",      32, 0, 0, 0 },
+  { "clover r170: open ", "r170-open", 32, 0, 0, 0 },
+  { "clover r187:",       "r187",      24, 0, 0, 0 },
+  { "clover r189:",       "r189",      24, 0, 0, 0 },
+};
+static const uint32_t kTeeProbeClassCount =
+    sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
 
 static volatile uint32_t gTeeReady = 0;         // arms round176's kernel-log ring
 static uint32_t gTeeIndex = 0;                  // next byte of msgbuf to consume
@@ -2795,6 +2812,18 @@ static void teeSay (const char *fmt, ...)
   ringPush (kRingDriver, line, length);
 }
 
+// Which chatty class, if any, owns this line. The tokens are substrings for the same reason the
+// allowlist's are: the line may carry a timestamp or a prefix from whoever printed it.
+static TeeProbeClass *teeProbeClass (const char *line, uint32_t length)
+{
+  for (uint32_t entry = 0; entry < kTeeProbeClassCount; entry++) {
+    if (teeTokensMatch (line, length, &kTeeProbeClasses[entry].token, 1)) {
+      return &kTeeProbeClasses[entry];
+    }
+  }
+  return nullptr;
+}
+
 // One complete line out of the buffer. Leading blanks and the '\b' progress dots the boot writer
 // emits are cut, an all-blank line is dropped, and anything this driver said is skipped: it went into
 // the driver's own ring already, through sdhciSay or teeSay, in the same boot. That exclusion is what
@@ -2818,18 +2847,19 @@ static void teeConsumeLine (uint32_t &pushed)
   if (teeHasPrefix (gTeeLine + start, length - start, "CloverSdhci ")) {
     return;
   }
-  if (teeTokensMatch (gTeeLine + start, length - start, kTeeProbeTokens, kTeeProbeTokenCount)) {
-    if (gTeeProbeKept >= kTeeProbeKeepMax) {
-      if (gTeeProbeDropped++ == 0 && gTeeProbeReported++ == 0) {
-        teeSay ("CloverSdhci r194: syscall probe lines capped at %u, later ones stay out of the "
-                "kernel ring\n", kTeeProbeKeepMax);
+  if (!teeLineMatches (gTeeLine + start, length - start)) {
+    return;
+  }
+  TeeProbeClass *probe = teeProbeClass (gTeeLine + start, length - start);
+  if (probe != nullptr) {
+    if (probe->kept >= probe->keep_max) {
+      if (probe->dropped++ == 0 && probe->reported++ == 0) {
+        teeSay ("CloverSdhci r195: %s probe lines capped at %u, later ones stay out of the "
+                "kernel ring\n", probe->name, probe->keep_max);
       }
       return;
     }
-    gTeeProbeKept++;
-  }
-  if (!teeLineMatches (gTeeLine + start, length - start)) {
-    return;
+    probe->kept++;
   }
   if (pushed >= kTeePushPerPass) {
     // Eight lines per guarded pass is sixteen block writes on a card that is also trying to serve the
