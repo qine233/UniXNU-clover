@@ -1763,8 +1763,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r215:"):
-        errors.append('[payload] title is not "clover r215: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r216:"):
+        errors.append('[payload] title is not "clover r216: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2803,8 +2803,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r215:"):
-        errors.append('[payload] title is not "clover r215: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r216:"):
+        errors.append('[payload] title is not "clover r216: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -2886,10 +2886,23 @@ def check_board(errors: list) -> str:
             errors.append(f"{crit_patch.name} lacks the r211 sender kernel backtrace: the kill "
                           "call site would still be a bare user pc")
         sbthr_line = ("clover r211: sbthr n=%u pid=%d mt=%d tid=0x%llx pc=%016llx lr=%016llx "
-                      "sp=%016llx cpsr=%08x state=%d kin=%u wait=%016llx")
+                      "sp=%016llx cpsr=%08x state=%d kin=%u wait=%016llx kstk=%016llx")
         if sbthr_line not in text:
             errors.append(f"{crit_patch.name} lacks the r211 per-thread reading: the frame could "
                           "not pair a parked thread with the kernel call it parked in")
+        # Round216. The boot-4 panic was a Kernel data abort inside this walker at +0x180, the
+        # instruction that reads the saved state at kernel_stack + kernel_stack_size - 0x68. A
+        # thread parked with its kernel stack swapped out has kernel_stack == 0 (stack.c's
+        # machine_stack_detach), so the guard must come before get_kernel_state, and a swapped
+        # thread has to be distinguishable (kin=2) in the line rather than silently absent.
+        stack_at = text.find("if (thr->kernel_stack == NULL)")
+        state_at = text.find("thread_get_kernel_state")
+        if stack_at < 0 or state_at < 0 or stack_at > state_at:
+            errors.append(f"{crit_patch.name} reads the kernel saved state before checking "
+                          "kernel_stack: a swapped thread would fault the kernel again")
+        if "snap[n].kin = 2;" not in text or "snap[n].kstk" not in text:
+            errors.append(f"{crit_patch.name} does not record the swapped-stack case: a frame "
+                          "could not tell a null stack from a thread in user mode")
         sbthk_line = ("clover r211: sbthk n=%u ktop=%016llx kfp=%016llx klr=%016llx "
                       "kf=%016llx,%016llx,%016llx,%016llx,%016llx,%016llx")
         if sbthk_line not in text:

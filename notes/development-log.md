@@ -16272,3 +16272,37 @@ r215 只动恢复的触发点与判据，不动块传输：
 **r216 的两件事（按序）**：(a) 修 `_clover_task_threads` 的数据异常——`pc +0x180` 与 `lr +0xcc`
 是补丁自己的地址，先让它遍历任务线程时不炸；(b) 在 `psignal` 路径里按目标 pid 定位
 SpringBoard 的线程并回流栈，回答杀前的等待点。
+
+## round216：让线程快照不再打死内核
+
+r215 的帧里，panic 不是死线而是 `Kernel data abort at pc=0xfffffff0072cde20, lr=0xfffffff0072cdd6c`，
+两者都落在 `_clover_task_threads`（起点 `0xfffffff0072cdca0`，即 `+0x180` / `+0xcc`）。
+把这一版内核反汇编逐条对上：
+
+- `+0xcc` 是 `bl _get_user_regs` 的返回地址；`+0x180` 是 `ldurb w11, [x10, #-0x68]`，
+  其中 `x10 = thr->kernel_stack + kernel_stack_size`——**读内核保存状态的第一条指令**，
+  `-0x68` 正是 `pc_was_in_userspace`。
+- 栈遍历器（`clover_kstack_walk` 被内联进来）在解引用这个地址之前只检查了 `fp` 在不在栈内，
+  没有检查 `thr->kernel_stack` 本身是不是 0。
+- 而 `osfmk/kern/stack.c` 的 `machine_stack_detach()`（`stack_free()` 调用）会把
+  `thread->kernel_stack` 置 0、`machine.kstackptr` 置 NULL——**内核栈换出/回收的线程
+  在 task->threads 里仍然可见，但 kernel_stack 是 0**。这时 `x10` 等于 `kernel_stack_size`
+  （很小），`[x10-0x68]` 落在未映射的内核低地址，正好是一次 data abort。
+- 换句话说：SpringBoard 的线程在杀点前全部 TH_WAIT，其中至少一个的栈已被换出，
+  r211 的快照在遍历到它时把内核打死了——**它本来要读的那一帧也因此永远拿不到**。
+
+r216 只动这个遍历器：
+
+1. **先看指针再解引用**：`if (thr->kernel_stack == NULL)` 时不读 `thread_get_kernel_state`，
+   这一段放在 `thread_get_kernel_state` 之前（契约断言顺序）。
+2. **换出可区分**：`kin` 取 0（用户态）/1（内核态且有栈）/2（栈已换出），`ktop` 在换出时写 0。
+3. **原始指针上卡**：`sbthr` 行加 `kstk=%016llx`（`thr->kernel_stack` 原值），下一帧即使
+   仍然换出，也能直接从 0 与非 0 分辨是「栈不在」还是「读错字段」。
+4. **契约**：`check-clover.py` 断言 `if (thr->kernel_stack == NULL)` 在
+   `thread_get_kernel_state` 之前、`snap[n].kin = 2;` 与 `snap[n].kstk` 存在，`sbthr` 行新串；
+   `verify-clover-payload.py` 加 `stackguard` 与新的 `sbthr` 串；`board.toml` 标题升 r216。
+
+`skst`（发信者栈）这一轮不再改：它解出来的就是 backboardd 的 `kill` 调用链，不是 SpringBoard。
+r216 修好之后，下一帧的 `sbthr` 会给出每个 SpringBoard 线程的 `pc/lr/sp/state/wait/kin`
+以及（栈还在的那些线程的）`sbthk` 帧；对 `kin=2` 的线程，`wait` 指针和用户态 `pc` 就是
+「它在等什么」的全部可得信息。

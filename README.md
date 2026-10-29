@@ -67,6 +67,13 @@ r215 的帧说明这个方向还没被检验到：这一靴的卡没有沉默—
 另外 `skst` 解出来是 backboardd 调 `kill` 的栈（`_psignal_internal → _kill → unix_syscall`），
 抓的是发信者，不是 SpringBoard。r216 因此先修这个数据异常，再按目标 pid 取收信者的线程栈。
 
+r216 把 fault 对到了指令：`+0x180` 是 `ldurb w11, [x10, #-0x68]`，`x10 = thr->kernel_stack +
+kernel_stack_size`——读内核保存状态的第一条指令；而线程的栈在换出/回收时
+（`stack.c` 的 `machine_stack_detach()`）会把 `kernel_stack` 置 0，于是这里读到的是一个未映射的
+低地址。修法是**先检查指针再解引用**：栈为 0 的线程不读保存状态，`kin=2` 标出换出，
+`sbthr` 行加 `kstk=` 原值。下一帧就能拿到 SpringBoard 每个线程的
+`pc/lr/sp/state/wait`（以及栈还在的那些线程的 `sbthk`），而不是再用一次 data abort 换回一张快照。
+
 ## 距离 iOS 桌面还差什么
 
 | # | 缺口 | 现状（真机读数） | 下一步 |

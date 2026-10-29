@@ -799,7 +799,8 @@ def check_critical_exit_probe(kernel: bytes) -> bool:
              "skst": (b"clover r211: skst n=%u f0=%016llx f1=%016llx f2=%016llx f3=%016llx "
                       b"f4=%016llx f5=%016llx\n") in kernel,
              "sbthr": (b"clover r211: sbthr n=%u pid=%d mt=%d tid=0x%llx pc=%016llx lr=%016llx "
-                       b"sp=%016llx cpsr=%08x state=%d kin=%u wait=%016llx\n") in kernel,
+                       b"sp=%016llx cpsr=%08x state=%d kin=%u wait=%016llx kstk=%016llx\n")
+                      in kernel,
              "sbthk": (b"clover r211: sbthk n=%u ktop=%016llx kfp=%016llx klr=%016llx "
                        b"kf=%016llx,%016llx,%016llx,%016llx,%016llx,%016llx\n") in kernel,
              "kept-r170": (b"clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx "

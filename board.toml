@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r215: the request recovers the card itself -- r214's frame shows the card going quiet at 408 s under an armed ticket with its last block request long since complete, so the watchdog was never going to be reached: a request that gets no answer to CMD13 (or cannot release the data circuit) now stops the machines, powers the card down and up, re-identifies it at 400 kHz and returns it to 50 MHz with the LBA 1 read as proof, then re-asks once; a busy card that keeps answering is left alone, and the per-boot cap plus a 15 s cooldown keep a dead card from costing every request a power cycle"
+title = "clover r216: the kill-point walker stops faulting on a swapped kernel stack -- the boot-4 Kernel data abort is clover_task_threads +0x180, the saved-state read at kernel_stack + kernel_stack_size - 0x68, and a thread parked with its stack swapped out has kernel_stack == 0; the walker now checks the pointer before that read, marks the swapped case kin=2 and records the raw kstk value, so the next frame lands the SpringBoard thread snapshot instead of panicking the kernel on its way to it"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

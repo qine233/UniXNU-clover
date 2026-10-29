@@ -215,21 +215,22 @@ diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
  	prop = sigprop[signum];
  
 diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 5dcf00e..4a12dd9 100644
 --- a/osfmk/kern/task.c
 +++ b/osfmk/kern/task.c
-@@ -129,6 +129,11 @@
- #include <kern/policy_internal.h>
+@@ -130,6 +130,11 @@
  #include <kern/restartable.h>
  #include <kern/ipc_kobject.h>
-+
+ 
 +#if defined(__arm64__)
 +#include <arm/thread.h>
 +#include <mach/machine/thread_status.h>
 +#endif
- 
++
  #include <corpses/task_corpse.h>
  #if CONFIG_TELEMETRY
-@@ -10285,3 +10290,173 @@
+ #include <kern/telemetry.h>
+@@ -10285,3 +10290,187 @@ task_best_name(task_t task, char *buf, size_t size)
  	char *name = proc_best_name(task_get_proc_raw(task));
  	strlcpy(buf, name, size);
  }
@@ -320,6 +321,7 @@ diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
 +		uint32_t kin;
 +		int state;
 +		uint64_t wait;
++		uint64_t kstk;
 +	} snap[10];
 +	thread_t thr;
 +	int pid;
@@ -349,7 +351,9 @@ diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
 +		snap[n].cpsr = (ss != NULL) ? (uint32_t)get_saved_state_cpsr(ss) : 0;
 +		snap[n].state = thr->state;
 +		snap[n].wait = (uint64_t)thr->wait_event;
-+		snap[n].ktop = (uint64_t)thr->kernel_stack + kernel_stack_size;
++		snap[n].kstk = (uint64_t)thr->kernel_stack;
++		snap[n].ktop = (thr->kernel_stack != NULL) ?
++		    (uint64_t)thr->kernel_stack + kernel_stack_size : 0;
 +		snap[n].kfp = 0;
 +		snap[n].klr = 0;
 +		snap[n].nframes = 0;
@@ -357,13 +361,23 @@ diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
 +		for (j = 0; j < 6; j++) {
 +			snap[n].frames[j] = 0;
 +		}
-+		ks = &thread_get_kernel_state(thr)->machine.ss;
-+		if (!ks->pc_was_in_userspace) {
-+			snap[n].kin = 1;
-+			snap[n].kfp = ks->fp;
-+			snap[n].klr = ks->lr;
-+			snap[n].nframes = clover_kstack_walk(snap[n].ktop,
-+			    (uint64_t)thr->kernel_stack, ks->fp, snap[n].frames, 6);
++		/* Round216: a thread parked with its kernel stack swapped out
++		 * has kernel_stack == 0 (machine_stack_detach in stack.c), and
++		 * the saved state read at top-0x68 then faults at a low address.
++		 * That is the boot-4 Kernel data abort at +0x180. kin=2 marks
++		 * the swapped case so the host can tell "no stack" from "user
++		 * mode"; kstk carries the raw pointer either way. */
++		if (thr->kernel_stack == NULL) {
++			snap[n].kin = 2;
++		} else {
++			ks = &thread_get_kernel_state(thr)->machine.ss;
++			if (!ks->pc_was_in_userspace) {
++				snap[n].kin = 1;
++				snap[n].kfp = ks->fp;
++				snap[n].klr = ks->lr;
++				snap[n].nframes = clover_kstack_walk(snap[n].ktop,
++				    (uint64_t)thr->kernel_stack, ks->fp, snap[n].frames, 6);
++			}
 +		}
 +		n++;
 +	}
@@ -374,12 +388,13 @@ diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
 +		char line[256];
 +
 +		snprintf(line, sizeof(line),
-+		    "clover r211: sbthr n=%u pid=%d mt=%d tid=0x%llx pc=%016llx lr=%016llx sp=%016llx cpsr=%08x state=%d kin=%u wait=%016llx\n",
++		    "clover r211: sbthr n=%u pid=%d mt=%d tid=0x%llx pc=%016llx lr=%016llx sp=%016llx cpsr=%08x state=%d kin=%u wait=%016llx kstk=%016llx\n",
 +		    i + 1, pid, (snap[i].tid == (uint64_t)pid) ? 1 : 0,
 +		    (unsigned long long)snap[i].tid, (unsigned long long)snap[i].pc,
 +		    (unsigned long long)snap[i].lr, (unsigned long long)snap[i].sp,
 +		    snap[i].cpsr, snap[i].state, snap[i].kin,
-+		    (unsigned long long)snap[i].wait);
++		    (unsigned long long)snap[i].wait,
++		    (unsigned long long)snap[i].kstk);
 +		line[sizeof(line) - 1] = '\0';
 +		printf("%s", line);
 +		clover_emmc_probe_say(line, (unsigned int)strlen(line));
