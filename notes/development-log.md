@@ -15131,3 +15131,87 @@ panic 自己写的 BCB 接住复位，宿主先见 TWRP adb（`81ffcaaa recovery
    在第一台 SpringBoard 陷阱后打一条 `image=` 就结束了这条线。
 3. **liveactivitiesd 的 `0x1e015e4f8`** 有真实调用者（LR=PC−0x2c），比 SpringBoard 那条更容易先
    落地：同一个解析器拿到偏移即可。
+
+## round200（v0.5.61）：把陷阱地址变成映射偏移与文件偏移，并把 brk 现场取回来
+
+r199 把 `code=0x5` 切开成了三种：SpringBoard 是 `brk #0`（`esr=0xf2000000`），8 次执行全落在
+`0x1bdc472ec` 且 **LR==PC**；liveactivitiesd 是 `brk #1` 且 PC 恒 `0x1e015e4f8`、LR=PC−0x2c；
+watchdogd 的 `brk #1` 在自身可执行文件里。可这三个地址一个都读不出名字：宿主机上没有
+`dyld_shared_cache_arm64*` 可符号化，`round159-userdata-root.sparse.img` 也不是能直接挂的 APFS 容器。
+这一轮不再找符号表，而是**把地址变成不随 slide 变的身份**，同时把现场取回来。
+
+### 设计
+
+同一条路径（`osfmk/arm64/sleh.c` 的 `handle_breakpoint()`，`exception_triage()` 之前），
+`clover_user_breakpoint_why()` 现在每命中一次打两行：
+
+1. 第一行保持 r199 的原样（`clover r199: ubrk pid=… comm=… n=… pc/lr/sp/cpsr/esr/ec/brk`），
+   便于跨轮对比，也让 r199 的格式串继续作为契约存在。
+2. 第二行 `clover r200: ubrk2`：
+   - `x0`–`x3`、`x8`、`x16`、`x17`——`x16/x17` 是长跳 stub 的目标寄存器，`x0`–`x3` 是
+     fatal 路径通常放着要打印的消息指针的地方；
+   - `map=` 后跟 `start=`/`end=`/`off=pc-start`/`foff=`：`foff = VME_OFFSET(entry) + off`，
+     即陷阱地址在**后端文件**里的偏移，不随 ASLR slide 变；
+   - `code=` 8 个字：`pc-16` 起（PC 落在页首 16 字节内时改从 `pc` 起），把跳进 `brk` 的那几条
+     指令原样带回宿主；
+   - `head=` 段首 4 个字：共享缓存的 TEXT 段以 `dyld_v1` 开头，`head=` 里能直接看到这段是不是缓存头；
+   - `s0/s1/s2=`：`x0`–`x2` 若落在用户地址区间（`0x10000 … 0x1000000000000`）就先 `copyin` 40 字节，
+     不可打印字节换成 `.`，作为消息串打出来；取不到就是 `-`。
+
+实现细节：
+- `vm_map_lookup_entry()` 在**读锁**下调用（`vm_map_lock_read`/`vm_map_unlock_read`），
+  出了锁才 `copyin`——`copyin` 会走 `vm_fault`，可能拿写锁，锁内在那里是死锁。
+- `copyin` 从 osfmk 编译单元可用：声明在 `bsd/libkern/copyio.h`（只依赖 `kern/debug.h`），
+  不用碰 `sys/proc.h` 那类会带进 `uid_t`/`fixpt_t` 的头。
+- 预算改成 **24 次陷阱**（每次两行 = 48 行），仍是每 pid 2 次、最多 24 个 pid；驱动 tee 侧
+  `{ "clover r200: ubrk", "r200-ubrk", 64, 0, 0, 0 }`——前缀不带尾空格，两行都归这一类。
+
+### 契约
+
+`check-clover.py` 认：r199 格式串仍在、`clover r200: ubrk2 pid=%d x0=0x%llx x1=0x%llx`、
+`vm_map_lookup_entry(clover_map,`、`clover_foff = (uint64_t)VME_OFFSET(clover_entry) + clover_off;`、
+`clover_ubrk_total >= 24`、`printed >= 2`、调用点在 `boot_progress_user_breakpoint(state, esr);` 之后、
+不得出现 `handle_kernel_breakpoint`、驱动有 `r200-ubrk` 类；标题 `clover r200:`。
+`verify-clover-payload.py` 的 `user breakpoint reading linked` 同时要 r199 行与 r200 行的前缀。
+
+### 读数（v0.5.61 冷刷，2026-10-29）
+
+一次冷刷（只写 cache 58720256 字节，misc 由预置 BCB 写）：`fastboot flash cache` 1.75 s，
+`fastboot reboot` 后 900 s 死线到点（report slot 3–7，last `ticks=159329`），**每条 panic 记录第二行都是 `fb=1`**；
+复位自落 TWRP，宿主 `dd` 回 622592 字节，解码 8 report / 35 verdict / 512 kernel 行，退出码 0。
+verdict 环尾是 `CloverSdhci r195: r153 probe lines capped at 24` 与
+`CloverSdhci r184: panic drain wrote=0 dropped=0 tee_passes=8`：报告窗这一帧没有新条目可写，
+但 tee 的八趟都跑了，内核环 512 条是满的。
+
+**14 条 `clover r200: ubrk2`，就是 14 条 `clover r199: ubrk`，一一配对**（预算 24 未用尽）。
+三类落点各有固定的 `foff`，`map=` 一律为 1：
+
+| comm | 次数 | map start / end | off = foff | pc（本帧） | 进入 brk 的指令 |
+| --- | --- | --- | --- | --- | --- |
+| watchdogd | 4 | 每个 pid 不同（`0x10075b000`、`0x100cb0000`、`0x100d0c000`、`0x101184000`，各 0x10000） | **`0xab0c`** | 各自 base + `0xab0c` | `910003fd 700119a0 d503201f 9400026b` **`d4200020`** `d100c3ff a9014ff4 a9027bfd` |
+| liveactivitiesd | 5 | `0x180000000` – `0x208400000` | **`0x5c6924f8`** | `0x1dc6924f8` | `a9425ff8 a94167fa a8c66ffc d65f03c0` **`d4200020`** `a9bf7bfd 910003fd f9401680` |
+| SpringBoard | 5 | `0x180000000` – `0x208400000` | **`0x3a17b2ec`** | `0x1ba17b2ec` | `aa1503e0 9423e402 94023d17 9423e307` **`d4200000 d4200020`** `f02436e8 f942a100` |
+
+读出来的事：
+
+1. **`foff` 确实是不随 ASLR 变的身份。** watchdogd 的四个进程映射在四个不同的 base，
+   `off` 各不相同，`foff` 与 `code=` 逐字相同——这正是这一轮要证的那条。
+2. **三类陷阱都停在函数之间的填充上，不是停在函数体里。** watchdogd 与 liveactivitiesd 的
+   `pc` 前面分别是 `bl` 与 `ret`，`pc` 后一条就是下一个函数的 `sub sp`/`stp` 序幕；
+   SpringBoard 更直接：`pc` 上是一条 `d4200000`，下一条就是 `d4200020`。三处的
+   **LR 都等于 PC**（watchdogd、SpringBoard）或 PC−0x2c（liveactivitiesd），
+   也就是调用目标本身指在填充上——这更像「目标算错/缺一个函数」，不像「函数里 assert」。
+3. **`head=` 只在独占可执行文件上成立。** watchdogd 的 `head=feedfacf`（`MH_MAGIC_64`），
+   共享缓存那两类的 `head=00000000`——按设计它取的是「段首」，而共享缓存映射的起点
+   不是 Mach-O 头。下一轮要么把取样点改成 `foff` 所在页的段头，要么直接不用 `head=`。
+4. **`code=` 已经够用来对文件。** 三组指令序列在宿主上都是唯一的，拿到缓存文件后
+   先在这四/八个字上自证「找对了偏移」，再去解符号。
+5. 同一 comm 的寄存器签名也很稳定：SpringBoard 五次都是 `x1=0x8000100 x2=1 x8=0x20878c000
+   x16=0x1aa4f86bc x17=0x1a2c3ec78`（`x0` 是每次不同的小对象指针），liveactivitiesd 五次
+   都是 `x1=x2=0x103 x8=0 x16=0x1f830abec`，watchdogd 四次都是 `x0..x3=0 x16=0xfffffffffffffff4`
+   而 `x8` 每次不同。`s0..s2` 一律 `-`：`x0`–`x2` 确实不在可 `copyin` 的用户区间。
+
+留到 round201 的问题：`0x3a17b2ec`（SpringBoard）与 `0x5c6924f8`（liveactivitiesd）
+在哪个缓存文件、哪个符号的边界上。r199 那一帧 SpringBoard 的 PC 是 `0x1bdc472ec`，
+本帧是 `0x1ba17b2ec`，两次差 `0x3ac0000`；r199 没有记录 `start=`，所以现在分不清
+「共享缓存自身换了 slide」和「换了陷阱点」——下一帧的 `start=` 会直接回答。

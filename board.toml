@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r199: the user breakpoint path names the trap -- round198 showed SpringBoard dying of SIGTRAP 0.35-0.66 s after every exec, so the kernel now prints the trapping pc, its caller and the BRK comment"
+title = "clover r200: the trap address becomes a file offset -- r199 showed SpringBoard dying of brk #0 at a fixed shared-cache pc with lr==pc, so the kernel now prints the map entry behind that pc, the eight instructions that lead into it, and the registers and message pointers the brk was reached with"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

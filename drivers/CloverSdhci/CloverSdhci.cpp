@@ -468,10 +468,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // its own three lines are the budget this class exists to protect -- a looping daemon must not
   // push the earlier lines out again.
   { "clover r196: sig ",  "r196-sig",  48, 0, 0, 0 },
-  // Round199's user-breakpoint reading: SpringBoard's trap repeats on every respawn at 24 breaks a
-  // frame, so the producer is as chatty as r196's. The kernel caps itself at 48 lines; this class
-  // keeps the same number, so a ring that shows 48 carries every line the kernel printed.
-  { "clover r199: ubrk ", "r199-ubrk", 48, 0, 0, 0 },
+  // Round200's user-breakpoint reading: every trap prints two lines (r199's identity line and
+  // r200's map/code/register line), SpringBoard alone repeats it eight times a frame, and the
+  // kernel caps itself at 24 traps. 64 lines leave slack for both without letting the producer
+  // push the exec/exit pairs out of the ring.
+  { "clover r200: ubrk", "r200-ubrk", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

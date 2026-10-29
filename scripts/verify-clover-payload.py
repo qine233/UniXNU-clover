@@ -319,7 +319,9 @@ def check_amfi_allow(kernel: bytes) -> bool:
 NATIVE4K_SKIP = (
     ("prepare branch", rb"\x1f\x39\x00\x71\x20\x09\x4c\x7a...(\x54)"),
     ("skipped store", rb"\x28\x00\x80\x52\x28\x40\x03\x39"),
-    ("hash accept", rb"\x0b\x40\x43\x39.\xd1\xff\xd0\x94\x82\x04\x91\x8a\x02\x40\xb9\xcb\x01\x00\x36"),
+    # Round200 grew the text by a page, and the adrp's whole 21-bit page difference moved with it
+    # (0xd0ffd154 -> 0xb0ffd154): all four bytes of that word are address, so all four are free.
+    ("hash accept", rb"\x0b\x40\x43\x39....\x94\x82\x04\x91\x8a\x02\x40\xb9\xcb\x01\x00\x36"),
 )
 
 
@@ -812,12 +814,17 @@ def check_signal_desc_probe(kernel: bytes) -> bool:
 def check_user_breakpoint_probe(kernel: bytes) -> bool:
     """Round199 reads where a user SIGTRAP came from. The r198 frame has SpringBoard dying of
     namespace 2, code 5 (OS_REASON_SIGNAL, SIGTRAP) 0.35-0.66 s after every exec, with no reason
-    payload and no line about the instruction. The image has to carry the user breakpoint reading
-    that names the trapping pc, its caller and the BRK comment, and it has to keep the r170 exit
-    line that pairs the same pid with its death."""
+    payload and no line about the instruction. Round200 adds the map side: the entry that owns the
+    pc, its segment bounds, the file offset and the instructions leading into the brk, because the
+    trapping address lives in the dyld shared cache and cannot be symbolized on the host. The image
+    has to carry both lines, and it has to keep the r170 exit line that pairs the pid with its
+    death."""
     label = "kernel.macho: user breakpoint reading linked"
     found = {"ubrk": (b"clover r199: ubrk pid=%d comm=%s n=%u pc=0x%llx lr=0x%llx sp=0x%llx "
                       b"cpsr=0x%x esr=0x%x ec=%u brk=0x%x\n") in kernel,
+             "ubrk2": (b"clover r200: ubrk2 pid=%d x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx "
+                       b"x8=0x%llx x16=0x%llx x17=0x%llx map=%d start=0x%llx end=0x%llx "
+                       b"off=0x%llx foff=0x%llx code=") in kernel,
              "kept-r170": (b"clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx "
                            b"comm=%s\n") in kernel}
     ok = all(found.values())
