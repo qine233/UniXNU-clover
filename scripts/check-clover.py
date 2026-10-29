@@ -2930,6 +2930,18 @@ def check_board(errors: list) -> str:
          "fastboot reboot recovery",
          "the host half would have no way from fastboot to recovery"),
         ("scripts/run-clover-unattended.sh",
+         "fastboot oem reboot-recovery",
+         "the second recovery-only spelling would be gone, and a bootloader that does "
+         "not answer the first one would be left with no way in"),
+        ("scripts/run-clover-unattended.sh",
+         "came out as an ordinary reboot",
+         "a recovery reboot that the bootloader turned into an ordinary reboot would "
+         "pass as success and the window read would belong to another boot"),
+        ("scripts/run-clover-unattended.sh",
+         "wait_leave_fastboot",
+         "a board still enumerated a moment after 'fastboot reboot' would count as "
+         "having come back by itself, so the payload would never be seen to boot"),
+        ("scripts/run-clover-unattended.sh",
          "--allow-misc-bcb",
          "the BCB write the bootloader may perform would happen without declared consent"),
         ("scripts/run-clover-unattended.sh",

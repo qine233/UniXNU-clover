@@ -23,7 +23,12 @@
 #      card is read as it stands, which is the *previous* boot's log window, not the one
 #      just written;
 #   3. ask the bootloader for recovery; this may write the boot command into the
-#      misc partition (BCB), which is why it needs --allow-misc-bcb;
+#      misc partition (BCB), which is why it needs --allow-misc-bcb. A reboot
+#      command this bootloader does not know is not an error the host can see: the
+#      board performs an ordinary reboot instead, so the step whose only purpose is
+#      to land in TWRP boots XNU and the window read in step 4 belongs to another
+#      boot. The landing is therefore proved by TWRP's adb, and a board that comes
+#      back to fastboot instead is reported as a plain reboot, never retried as one;
 #   4. wait for TWRP's adb, dump the first 1216 sectors of the log window (logdump)
 #      through /dev/block,
 #      and decode the 16 report slots plus both rings in it (the driver's verdicts
@@ -42,6 +47,7 @@ set -u
 
 WAIT=900
 ADB_WAIT=180
+LANDING_WAIT=420
 OUT="$HOME/clover-out/clover-log-window.bin"
 FLASH_CACHE=""
 ALLOW_BCB=0
@@ -61,6 +67,10 @@ usage() {
 Options:
   --wait SECONDS         how long to wait for fastboot (default 900)
   --adb-wait SECONDS     how long to wait for recovery adb (default 180)
+  --landing-wait SECONDS how long to watch for either TWRP's adb or the board
+                         returning to fastboot after a recovery reboot (default 420:
+                         a bootloader that quietly turned it into an ordinary reboot
+                         only shows that once the payload's own deadline resets)
   --out PATH             dump file (default ~/clover-out/clover-log-window.bin)
   --flash-cache IMG      cold-flash IMG to the cache partition before recovery;
                          this is an eMMC write and is printed before it runs
@@ -80,6 +90,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     --wait) WAIT=$2; shift 2 ;;
     --adb-wait) ADB_WAIT=$2; shift 2 ;;
+    --landing-wait) LANDING_WAIT=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     --flash-cache) FLASH_CACHE=$2; shift 2 ;;
     --boot-after-flash) BOOT_AFTER_FLASH=1; shift ;;
@@ -138,6 +149,57 @@ wait_adb() {
     sleep 2
   done
 }
+# A board that was just told to reboot is still enumerated by `fastboot devices` for a
+# moment, and wait_fastboot() answers on its first poll. So "it came back by itself"
+# has to start from a board that was seen to leave.
+wait_leave_fastboot() {
+  local deadline=$(( $(date +%s) + 60 ))
+  while :; do
+    [ -z "$(fastboot_serial)" ] && return 0
+    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    sleep 1
+  done
+}
+# After a reboot command has been accepted and the board has left fastboot, what comes
+# up decides what the command meant: TWRP's adb (0), fastboot again (1, i.e. an ordinary
+# reboot), or nothing at all within LANDING_WAIT (2).
+watch_landing() {
+  local deadline=$(( $(date +%s) + LANDING_WAIT ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ -n "$(adb_serial)" ] && return 0
+    [ -n "$(fastboot_serial)" ] && return 1
+    sleep 2
+  done
+  return 2
+}
+# Round193 flash test. This step used to be one `fastboot reboot recovery` whose output
+# was grepped for "unknown": a reboot word this bootloader does not know is not reported
+# there, it performs an ordinary reboot -- the host sees exit 0 and the board leaves
+# fastboot either way, so the step whose only purpose is to land in TWRP booted XNU and
+# the window read afterwards belonged to another boot. Only recovery-only commands are
+# candidates (`fastboot reboot` is never one, it is exactly the ambiguity being removed),
+# and each one's meaning is decided by observation instead of by its exit status.
+try_recovery_command() {
+  local cmd=$1 out st landing
+  say "asking for recovery: $cmd"
+  out=$($cmd 2>&1); st=$?
+  if [ $st -ne 0 ] || printf '%s' "$out" | grep -qiE 'unknown|not support|fail|error'; then
+    say "  refused (exit $st): $(printf '%s' "$out" | tr '\n' ' ')"
+    return 4
+  fi
+  if ! wait_leave_fastboot; then
+    say "  accepted, but the board never left fastboot: the command was not acted on"
+    return 4
+  fi
+  say "  accepted and the board left fastboot; watching up to ${LANDING_WAIT}s for its landing"
+  watch_landing
+  landing=$?
+  case $landing in
+    0) say "  landed in recovery: adb $(adb_serial)"; return 0 ;;
+    1) say "  came out as an ordinary reboot: fastboot came back and no recovery adb did"; return 4 ;;
+    *) say "  neither recovery adb nor fastboot within ${LANDING_WAIT}s"; return 5 ;;
+  esac
+}
 
 say "contract: clover-unattended=<s> deadline, panic screen marks IMEM 0x146bf65c and resets after 20 s"
 
@@ -156,6 +218,7 @@ if [ "$SKIP_RECOVERY" = 0 ] && [ -n "$FLASH_CACHE" ]; then
   if [ "$BOOT_AFTER_FLASH" = 1 ]; then
     say "booting the payload just written: fastboot reboot (the firmware enters XNU after its 3 s default)"
     fastboot reboot >/dev/null 2>&1 || die 2 "fastboot reboot failed"
+    wait_leave_fastboot || die 6 "the board never left fastboot after 'fastboot reboot': it is still the same boot, so nothing was read"
     wait_fastboot || die 6 "the board did not come back to fastboot within ${WAIT}s: either the unattended deadline did not fire or its reset does not reach this host"
     say "the board returned to fastboot by itself, so the deadline fired"
   else
@@ -177,14 +240,16 @@ if [ "$SKIP_RECOVERY" = 0 ]; then
 EOF
     exit 3
   fi
-  say "declared eMMC write: bootloader writes the recovery boot command into misc (BCB)"
-  reboot_out=$(fastboot reboot recovery 2>&1)
-  reboot_status=$?
-  if [ $reboot_status -ne 0 ] || printf '%s' "$reboot_out" | grep -qiE 'unknown|not support|fail|error'; then
-    printf '%s\n' "$reboot_out" >&2
+  say "declared eMMC write: bootloader may store the recovery boot command in misc (BCB)"
+  for cmd in "fastboot reboot recovery" "fastboot oem reboot-recovery"; do
+    if try_recovery_command "$cmd"; then
+      recovery_ok=1
+      break
+    fi
+  done
+  if [ "${recovery_ok:-0}" = 0 ]; then
     cat >&2 <<EOF
-[unattended] the bootloader did not accept 'reboot recovery' (exit $reboot_status).
-[unattended] Fallbacks, in order:
+[unattended] no recovery entry landed. Fallbacks, in order:
 [unattended]   1. power-cycle (IMEM is volatile, a power cycle clears the reason),
 [unattended]      hold Vol- while powering on to reach fastboot, then rerun this
 [unattended]      script with --allow-misc-bcb;
