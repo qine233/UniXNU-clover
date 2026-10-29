@@ -14,6 +14,9 @@
 // Exact private entry from Darwin 23 arm/rtclock.h. Its full data header is
 // not exported to IOKit; the IRQ path calls the real kernel implementation.
 extern "C" void rtclock_intr (unsigned int);
+// Round210: the storage driver's flight beat. This is the one clock that outlives the block layer,
+// so CPU0's tick is where the controller gets sampled when nothing else is running.
+extern "C" void clover_emmc_flight_beat (void);
 // Kernel-internal entries used for secondary CPU startup (Darwin 23 osfmk).
 extern "C" vm_offset_t ml_static_vtop (vm_offset_t);
 extern "C" char LowResetVectorBase[], LowResetVectorEnd[], ResetHandlerData[], const_boot_args[];
@@ -643,6 +646,13 @@ void ArmCpu::interrupt (void)
                  gUnattendedSeconds, entryElr, entrySpsr, armcpu_timer_interrupts, gTick0Counter, now,
                  gTickCounterFrequency);
         }
+      }
+      // Round210: one CPU writes the beat, and only on a boot that asked for the deadline. The
+      // driver throttles it to one record per four seconds and skips it whenever the block guard is
+      // held, so a healthy boot pays a block write every four seconds and a stalled one pays a
+      // failed TryLock.
+      if ((logicalId & 7) == 0 && gUnattendedSeconds != 0) {
+        clover_emmc_flight_beat ();
       }
       // Closer the clock can be observed without any process cooperating: reaching the count is itself the reading, and the panic screen
       // keeps the first panic, so a probe that finished earlier is not overwritten by this one.

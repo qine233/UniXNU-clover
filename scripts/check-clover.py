@@ -790,6 +790,28 @@ def check_board(errors: list) -> str:
         if "panicTailRead ();" not in sdhci_source:
             errors.append("drivers/CloverSdhci never calls the round209 tail read from the panic "
                           "drain: the sink would not select it")
+        for needle, why in (
+                ("static const uint32_t kFlightEntryOffset = 32;",
+                 "round210's entry region is not at sector 32, where the reader looks"),
+                ("static const uint32_t kFlightBeatOffset = 56;",
+                 "round210's beat region is not at sector 56, where the reader looks"),
+                ("CloverSdhci r210: flight armed entry=%u slots=%u beat=%u slots=%u ",
+                 "no round210 arming line: a dump could not tell 'never armed' from 'armed and quiet'"),
+                ("flightEnter (kFlightEventRead", "no entry record names a block read"),
+                ("flightEnter (kFlightEventWrite", "no entry record names a block write"),
+                ("static void flightExit (uint32_t done)",
+                 "no exit records the result of the request just finished"),
+                ("extern \"C\" void clover_emmc_flight_beat (void)",
+                 "no beat entry point for the timer to call")):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci lacks {needle[:40]}...: {why}")
+        if "if (!IOLockTryLock (gBlockLock))" not in sdhci_source:
+            errors.append("the flight beat does not TryLock the block guard: a beat would wait on "
+                          "or interrupt the transfer it is meant to observe")
+        armcpu_source = (REPO / "drivers/ArmCpu/ArmCpu.cpp").read_text()
+        if "clover_emmc_flight_beat ();" not in armcpu_source:
+            errors.append("drivers/ArmCpu never calls the round210 beat: nothing would sample the "
+                          "controller between block requests")
 
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
@@ -1671,8 +1693,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r209:"):
-        errors.append('[payload] title is not "clover r209: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r210:"):
+        errors.append('[payload] title is not "clover r210: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2669,8 +2691,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r209:"):
-        errors.append('[payload] title is not "clover r209: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r210:"):
+        errors.append('[payload] title is not "clover r210: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

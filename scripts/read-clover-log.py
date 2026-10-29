@@ -23,6 +23,13 @@ Three windows live in the partition:
       used to share the 64 records above with the driver. `--tee` reads this
       ring; the driver's state lines about the tee stay in the ring above, so
       every record here is something the kernel said.
+  flight region           sectors 32..43 and 56..59, one block per record
+      kind 23, written from round210: twelve entry records (sector 32) name
+      the block request that is starting plus the result and duration of the
+      one before it, and four beat records (sector 56) carry CPU0's four-second
+      sample of SDHCI_PRESENT_STATE. `--flight` reads them. A last entry with
+      no successor is the request that never came back; a beat that is absent
+      is a guard that was held or a controller that refused the command.
 
 Header words:
 
@@ -31,7 +38,9 @@ Header words:
   words[2] absolute LBA of the header block
   words[3] total bytes of the text block: prefix + body + newline
   words[4] byte sum of those bytes, low 32 bits
-  words[5] kind: 17, 19, 20 above, 21 = driver verdict line, 22 = kernel log line
+  words[5] kind: 17, 19, 20 above, 21 = driver verdict line, 22 = kernel log line;
+      the flight region uses the same two magic words but one block per record,
+      with kind 23 and its own header words (see decode_flight below)
   words[6] body length
   words[7] slot index
   words[8] sequence number (the two rings only; 0 in the report/panic records)
@@ -67,10 +76,17 @@ VERDICT_SLOTS = 64    # round174's ring, grown by round176 because the tee no lo
 VERDICT_OFFSET = 64   # sectors past the log window start, clear of the report/panic blocks
 KERNEL_SLOTS = 512    # round176's ring: a whole boot of allowlisted kernel text
 KERNEL_OFFSET = 192   # 64 + 2 * VERDICT_SLOTS: immediately after the driver's ring
+FLIGHT_ENTRY_OFFSET = 32   # round210: the gap the report window and the driver's ring leave
+FLIGHT_ENTRY_SLOTS = 12
+FLIGHT_BEAT_OFFSET = 56    # four one-block beats, 4 s apart, at the end of that gap
+FLIGHT_BEAT_SLOTS = 4
+FLIGHT_KIND = 23
 LOG_WINDOW_FIRST_LBA = 13320216   # the card's p56 (logdump) since round185; p39 logfs is the root now
 DUMP_SECTORS = KERNEL_OFFSET + 2 * KERNEL_SLOTS   # one dd that reaches the end of both rings
 KINDS = {17: "report-17", 19: "report-19", 20: "panic-20",
-         21: "verdict-21", 22: "kernel-22"}
+         21: "verdict-21", 22: "kernel-22", 23: "flight-23"}
+FLIGHT_EVENTS = {1: "read", 2: "write", 3: "beat"}
+FLIGHT_DIRS = {0: "read", 1: "write", 2: "beat"}
 DRIVER_PREFIX = b"CloverSdhci "
 
 
@@ -182,6 +198,166 @@ def report(records, newest_only=False, order_by_seq=False):
     return len(records)
 
 
+FLIGHT_WORDS = 22
+
+
+def decode_flight(data, first_lba):
+    """The round210 flight region: {"entries": [...], "beats": [...]} in slot order.
+
+    Each record is one block with FLIGHT_WORDS little-endian words and no text block, so
+    there is no body and no sum -- the header *is* the record. Word order is what
+    flightWrite lays down in CloverSdhci.cpp; a reader that disagrees about one word
+    would print a plausible table of the wrong columns, so the selftest round-trips
+    every field.
+
+    Slots are reused modulo 12 (entries) and modulo 4 (beats) and seq restarts at zero
+    each boot. Walking back from the highest seq therefore stops at the first slot whose
+    stored seq is not the one the walk needs, and never below zero: records of this boot
+    are the contiguous run 0..top, because flightWrite increments seq only after the
+    block it wrote, so a gap means a slot that was never written this boot -- not a
+    sequence number that was skipped.
+
+    What this cannot tell apart is an earlier boot's run that also survives intact and
+    reaches a higher seq than this boot's: every record of every boot is congruent with
+    its own slot, so congruence alone does not name a boot. Round210 is the first boot
+    to write this region, so a fresh partition has no such run; a later round has to
+    stamp a boot id into the record before the chain can be trusted across two r210+
+    boots.
+    """
+    groups = {}
+    for name, base, slots, event in (("entries", FLIGHT_ENTRY_OFFSET, FLIGHT_ENTRY_SLOTS, None),
+                                     ("beats", FLIGHT_BEAT_OFFSET, FLIGHT_BEAT_SLOTS, 3)):
+        records = []
+        for slot in range(slots):
+            sector = base + slot
+            block = data[sector * SECTOR:(sector + 1) * SECTOR]
+            if len(block) < SECTOR:
+                break
+            words = struct.unpack_from(f"<{FLIGHT_WORDS}I", block)
+            if (words[0], words[1]) != MAGIC:
+                break
+            problems = []
+            want_lba = first_lba + sector
+            if words[2] != want_lba:
+                problems.append(f"lba {words[2]} != {want_lba}")
+            if words[3] != FLIGHT_KIND:
+                problems.append(f"kind {words[3]} != {FLIGHT_KIND}")
+            if words[5] != slot:
+                problems.append(f"slot word {words[5]} != {slot}")
+            if words[6] not in FLIGHT_EVENTS:
+                problems.append(f"event {words[6]} unknown")
+            if words[7] not in FLIGHT_DIRS:
+                problems.append(f"dir {words[7]} unknown")
+            if event is not None and words[6] != event:
+                problems.append(f"event {words[6]} is not a beat")
+            record = {
+                "slot": slot, "lba": words[2], "seq": words[4], "event": words[6],
+                "dir": words[7], "op_lba": words[8], "op_blocks": words[9],
+                "t_ms": words[10], "prev_done": words[11], "prev_ms": words[12],
+                "present": words[13], "flags": words[14], "ops": words[15],
+                "guard_waits": words[16], "beat_misses": words[17],
+                "pending_kernel": words[18], "pending_driver": words[19],
+                "prev_dir": words[20], "prev_blocks": words[21],
+            }
+            records.append((slot, record, problems))
+        groups[name] = records
+    return groups
+
+
+def flight_chain(records):
+    """This boot's run, oldest first: walk back from the highest seq whose slot holds
+    that seq, stop at the first slot that does not, and never below seq 0.
+
+    A record whose header is inconsistent is kept in the listing (it is still a reading)
+    but ends the chain, because the slot can no longer be trusted to belong to this run.
+    """
+    by_slot = {slot: record for slot, record, problems in records
+               if not problems}
+    if not by_slot:
+        return []
+    slots = len(records) or 1
+    top = max(record["seq"] for record in by_slot.values()
+              if record["slot"] == record["seq"] % slots)
+    chain = []
+    seq = top
+    while seq >= 0 and seq > top - slots:
+        record = by_slot.get(seq % slots)
+        if record is None or record["seq"] != seq:
+            break
+        chain.append(record)
+        seq -= 1
+    chain.reverse()
+    return chain
+
+
+def flight_report(groups):
+    """Print the two chains and the one conclusion this round is built to support.
+
+    The last entry record names a request whose result word belongs to the request
+    *before* it, so the newest entry is the one with no successor: the request in
+    flight when the writing stopped. The newest beat's time bounds when the guard and
+    the controller were still accepting commands, and a gap between the two is where
+    the stop happened.
+    """
+    entries = flight_chain(groups["entries"])
+    beats = flight_chain(groups["beats"])
+    written = len(groups["entries"]) + len(groups["beats"])
+    if entries:
+        span = f"seq {entries[0]['seq']}..{entries[-1]['seq']}"
+    else:
+        span = "none"
+    print(f"flight: {len(entries)} entry records in this boot's window ({span})")
+    for record in entries:
+        flags = []
+        if record["flags"] & 1:
+            flags.append("cmd")
+        if record["flags"] & 2:
+            flags.append("dat")
+        if record["flags"] & 4:
+            flags.append("beat")
+        print(f"  entry seq {record['seq']:>3} slot {record['slot']:>2} t={record['t_ms']:>8}ms "
+              f"{FLIGHT_EVENTS.get(record['event'], '?')} lba={record['op_lba']} "
+              f"blocks={record['op_blocks']} ps={record['present']:#010x} "
+              f"inh={','.join(flags) or '-'} ops={record['ops']} "
+              f"guard={record['guard_waits']} miss={record['beat_misses']} "
+              f"pend={record['pending_kernel']}/{record['pending_driver']} "
+              f"prev={FLIGHT_DIRS.get(record['prev_dir'], '?')}/{record['prev_blocks']}/"
+              f"{record['prev_ms']}ms/{record['prev_done']}")
+    print(f"flight: {len(beats)} beat records in this boot's window")
+    for record in beats:
+        flags = []
+        if record["flags"] & 1:
+            flags.append("cmd")
+        if record["flags"] & 2:
+            flags.append("dat")
+        print(f"  beat  seq {record['seq']:>3} slot {record['slot']:>2} t={record['t_ms']:>8}ms "
+              f"ps={record['present']:#010x} inh={','.join(flags) or '-'} "
+              f"ops={record['ops']} guard={record['guard_waits']} miss={record['beat_misses']} "
+              f"pend={record['pending_kernel']}/{record['pending_driver']}")
+    if entries and beats:
+        gap = entries[-1]["t_ms"] - beats[-1]["t_ms"]
+        print(f"flight: newest entry seq {entries[-1]['seq']} at t={entries[-1]['t_ms']} ms, "
+              f"newest beat seq {beats[-1]['seq']} at t={beats[-1]['t_ms']} ms, gap {gap} ms")
+    elif entries:
+        print("flight: entries without any beat -- no beat ever found the guard free")
+    elif beats:
+        print("flight: beats without any entry -- no block request started after arming")
+    return written
+
+
+def build_flight_record(lba, seq, event, dir_, op_lba, op_blocks, t_ms=0, present=0,
+                        prev_done=0, prev_ms=0, prev_dir=0, prev_blocks=0, ops=0,
+                        guard_waits=0, beat_misses=0, pending=(0, 0), slot=None, kind=FLIGHT_KIND):
+    """One round210 flight block as flightWrite lays it out, for selftest."""
+    if slot is None:
+        slot = seq % (FLIGHT_BEAT_SLOTS if event == 3 else FLIGHT_ENTRY_SLOTS)
+    flags = ((present & 1) and 1 or 0) | ((present & 2) and 2 or 0) | (4 if event == 3 else 0)
+    return struct.pack(f"<{FLIGHT_WORDS}I", MAGIC[0], MAGIC[1], lba, kind, seq, slot,
+                       event, dir_, op_lba, op_blocks, t_ms, prev_done, prev_ms,
+                       present, flags, ops, guard_waits, beat_misses, pending[0],
+                       pending[1], prev_dir, prev_blocks).ljust(SECTOR, b"\0")
+
+
 def build_record(kind, slot, lba, body_text, seq=0):
     """One two-block record exactly as the driver lays it out, for selftest."""
     body = body_text.encode("ascii")
@@ -206,6 +382,12 @@ def selftest():
     # the kernel ring starts, and a dd of DUMP_SECTORS reaches the last slot of the second one.
     assert VERDICT_OFFSET + 2 * VERDICT_SLOTS == KERNEL_OFFSET, KERNEL_OFFSET
     assert DUMP_SECTORS == KERNEL_OFFSET + 2 * KERNEL_SLOTS, DUMP_SECTORS
+    # Round210's flight region lives in the gap the two windows leave: report 0..31, entries
+    # 32..43, beats 56..59, verdict 64.. -- one block per record, so the whole region fits in
+    # the 1216-sector dump both rings already read and no window moved to make room for it.
+    assert FLIGHT_ENTRY_OFFSET == 2 * REPORT_SLOTS, FLIGHT_ENTRY_OFFSET
+    assert FLIGHT_ENTRY_OFFSET + FLIGHT_ENTRY_SLOTS <= FLIGHT_BEAT_OFFSET, FLIGHT_BEAT_OFFSET
+    assert FLIGHT_BEAT_OFFSET + FLIGHT_BEAT_SLOTS <= VERDICT_OFFSET, FLIGHT_BEAT_OFFSET
 
     dump = bytearray()
     dump += build_record(19, 0, first_lba, "bring-up report")
@@ -288,8 +470,74 @@ def selftest():
             problems = decode(bytes(broken), first_lba, slots=slots,
                               base_sector=base, expect_kind=kind)[0][3]
             assert any(problem.startswith(expect) for problem in problems), (base, expect, problems)
-    print("read-clover-log selftest: report window, both rings, wrap order, ring kinds and bad "
-          "records all ok")
+
+    # Round210's flight region: 14 entries and 6 beats wrap both slot counts, every field is
+    # round-tripped, and the chain walk picks the newest run instead of the largest time stamp --
+    # the stale case below is the one that matters, because a partition is not erased per boot.
+    flight = bytearray((FLIGHT_BEAT_OFFSET + FLIGHT_BEAT_SLOTS) * SECTOR)
+
+    def place(target, block, sector):
+        target[sector * SECTOR:(sector + 1) * SECTOR] = block
+
+    for seq in range(14):
+        event = 1 if seq % 2 == 0 else 2
+        place(flight,
+              build_flight_record(first_lba + FLIGHT_ENTRY_OFFSET + seq % FLIGHT_ENTRY_SLOTS,
+                                  seq, event, 0 if event == 1 else 1, 1000 + seq, 8,
+                                  t_ms=100 * seq, present=3, prev_done=1 if seq else 0,
+                                  prev_ms=40 + seq, prev_dir=1, prev_blocks=8, ops=seq,
+                                  guard_waits=seq // 2, beat_misses=seq // 3,
+                                  pending=(7, 2)),
+              FLIGHT_ENTRY_OFFSET + seq % FLIGHT_ENTRY_SLOTS)
+    for seq in range(6):
+        place(flight,
+              build_flight_record(first_lba + FLIGHT_BEAT_OFFSET + seq % FLIGHT_BEAT_SLOTS,
+                                  seq, 3, 2, 0, 0, t_ms=1000 + 4000 * seq, present=0,
+                                  ops=seq, guard_waits=1, beat_misses=seq, pending=(9, 1)),
+              FLIGHT_BEAT_OFFSET + seq % FLIGHT_BEAT_SLOTS)
+    groups = decode_flight(bytes(flight), first_lba)
+    entries = flight_chain(groups["entries"])
+    beats = flight_chain(groups["beats"])
+    assert [record["seq"] for record in entries] == list(range(2, 14)), entries
+    assert [record["seq"] for record in beats] == [2, 3, 4, 5], beats
+    newest = entries[-1]
+    assert (newest["t_ms"], newest["op_lba"], newest["op_blocks"], newest["event"]) == \
+           (1300, 1013, 8, 2), newest
+    assert (newest["prev_dir"], newest["prev_blocks"], newest["prev_ms"], newest["prev_done"],
+            newest["ops"], newest["guard_waits"], newest["beat_misses"],
+            newest["pending_kernel"], newest["pending_driver"]) == (1, 8, 53, 1, 13, 6, 4, 7, 2), newest
+    assert (beats[-1]["t_ms"], beats[-1]["beat_misses"], beats[-1]["pending_kernel"]) == \
+           (21000, 5, 9), beats[-1]
+    assert all(not problems for _, _, problems in groups["entries"] + groups["beats"])
+    assert flight_report(groups) == len(groups["entries"]) + len(groups["beats"])
+
+    # A boot that stopped after five requests leaves slots 5..11 with whatever was there
+    # before. A slot whose seq word does not name its own slot ends the chain instead of
+    # being printed as this boot's; the congruent case is the one decode_flight's docstring
+    # says a boot id has to settle, and is not asserted as correct here.
+    stale = bytearray(flight)
+    for seq in range(5):
+        place(stale,
+              build_flight_record(first_lba + FLIGHT_ENTRY_OFFSET + seq, seq, 1, 0, 100 + seq, 1,
+                                  t_ms=50 * seq),
+              FLIGHT_ENTRY_OFFSET + seq)
+    for slot in range(5, FLIGHT_ENTRY_SLOTS):
+        place(stale,
+              build_flight_record(first_lba + FLIGHT_ENTRY_OFFSET + slot, 50 + slot, 2, 1, 0, 0,
+                                  t_ms=900000),
+              FLIGHT_ENTRY_OFFSET + slot)
+    stale_entries = flight_chain(decode_flight(bytes(stale), first_lba)["entries"])
+    assert [record["seq"] for record in stale_entries] == [0, 1, 2, 3, 4], stale_entries
+    assert stale_entries[-1]["t_ms"] == 200, stale_entries[-1]
+
+    # A flight block that says some other kind is named, not printed as a r210 record.
+    wrong = bytearray(flight)
+    place(wrong, build_flight_record(first_lba + FLIGHT_ENTRY_OFFSET, 0, 1, 0, 0, 0, kind=21),
+          FLIGHT_ENTRY_OFFSET)
+    problems = decode_flight(bytes(wrong), first_lba)["entries"][0][2]
+    assert any(problem.startswith("kind 21 != 23") for problem in problems), problems
+    print("read-clover-log selftest: report window, both rings, flight region, wrap order, "
+          "ring kinds and bad records all ok")
     return 0
 
 
@@ -309,6 +557,9 @@ def main():
     parser.add_argument("--tee", action="store_true",
                         help="read the kernel-log ring the round175 tee writes (kind 22, "
                              "sectors 192..1215)")
+    parser.add_argument("--flight", action="store_true",
+                        help="read the round210 flight region instead: entry records (kind 23, "
+                             "sectors 32..43) and four-second beats (sectors 56..59)")
     parser.add_argument("--driver", action="store_true",
                         help="of the ring being read, only the lines CloverSdhci said itself; over "
                              "--tee this is expected to be empty, and is a check that the tee is not "
@@ -330,6 +581,21 @@ def main():
     data = path.read_bytes()
     if len(data) < SLOT_BYTES:
         raise SystemExit(f"{path} is {len(data)} bytes; the first slot alone is {SLOT_BYTES}")
+    if args.flight:
+        need = (FLIGHT_BEAT_OFFSET + FLIGHT_BEAT_SLOTS) * SECTOR
+        if len(data) < need:
+            raise SystemExit(f"{path} is {len(data)} bytes; the flight region needs {need}")
+        groups = decode_flight(data, args.first_lba)
+        written = len(groups["entries"]) + len(groups["beats"])
+        if args.count:
+            print(written)
+            return 0 if written else 1
+        if not written:
+            print(f"{path}: no flight records (sector {FLIGHT_ENTRY_OFFSET} has no LOG1 magic)",
+                  file=sys.stderr)
+            return 1
+        flight_report(groups)
+        return 0
     if args.tee:
         slots, base, kind, window = KERNEL_SLOTS, KERNEL_OFFSET, 22, "kernel-log ring"
     elif args.verdict:

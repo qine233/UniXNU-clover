@@ -826,6 +826,22 @@ def check_panic_tail_read(kernel: bytes) -> bool:
     return ok
 
 
+def check_flight_region(kernel: bytes) -> bool:
+    """Round210 leaves a record before the stop instead of after it. The r209 frame showed the
+    kernel alive to the deadline and the card refusing the sink, so the image has to carry the
+    entry writer, the arming line that says where the entries went, and a beat entry the timer can
+    call without waiting on the block guard. The beat's TryLock is the contract: a beat that
+    blocked would be indistinguishable from a stopped card."""
+    label = "kernel.macho: r210 flight region linked"
+    found = {"armed": (b"CloverSdhci r210: flight armed entry=%u slots=%u beat=%u slots=%u "
+                       b"window=%u..%u\n") in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_signal_desc_probe(kernel: bytes) -> bool:
     """Round196 reads what an aborting process said. The r195 frame has usermanagerd answering
     SIGABRT (namespace 2, code 6) at three-second intervals for the rest of the boot, and the
@@ -1286,6 +1302,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_cache_ownership(kernel)
         ok &= check_critical_exit_probe(kernel)
         ok &= check_panic_tail_read(kernel)
+        ok &= check_flight_region(kernel)
         ok &= check_signal_desc_probe(kernel)
         ok &= check_user_breakpoint_probe(kernel)
     return 0 if ok else 1

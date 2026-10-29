@@ -395,6 +395,45 @@ static uint32_t gRingWritten[kRingCount];
 static volatile uint32_t gRingBusy[kRingCount];
 static volatile uint32_t gVerdictReady = 0;   // driver ring: armed with the logfs window
 
+// Round210: the flight region. Round209 proved the kernel was alive at the 900 s deadline while the
+// card accepted nothing -- the report window got no record and the rings got no drain -- so the one
+// question left is which transfer stopped, and whether the controller still held CMD/DAT inhibit
+// when it did. The answer has to be on the card *before* the stop, because everything after it
+// fails. Sectors 32..63 are the gap between the report window and the driver's ring; twelve
+// one-block records there name the last requests, and four at 56..63 carry a beat from CPU0's timer
+// every four seconds. A beat record's own presence says the guard was free and the controller took
+// a command; the beats that stop say it was not. Each entry record carries the previous request's
+// completion count and duration, so a record with no successor names the request that never came
+// back. One block per record, not two: this runs at every block request, and the second text block
+// would double a cost the transfer itself has to absorb.
+//
+// Gated on clover-unattended: a shipped boot pays nothing for a diagnostic this driver does not
+// need after the port reaches the desktop.
+static const uint32_t kFlightEntryOffset = 32;   // sectors past logfs start; 12 one-block records
+static const uint32_t kFlightEntrySlots = 12;
+static const uint32_t kFlightBeatOffset = 56;    // four one-block records, 4 s apart
+static const uint32_t kFlightBeatSlots = 4;
+static const uint32_t kFlightKind = 23;
+static const uint32_t kFlightEventRead = 1;
+static const uint32_t kFlightEventWrite = 2;
+static const uint32_t kFlightEventBeat = 3;
+static volatile uint32_t gFlightArmed = 0;
+static volatile uint32_t gPanicActive = 0;       // the panic sink is writing; no beat may cut in
+static uint32_t gFlightEntrySeq = 0;
+static uint32_t gFlightBeatSeq = 0;
+static uint32_t gFlightPrevDone = 0;             // result of the last finished request
+static uint32_t gFlightPrevMs = 0;
+static uint32_t gFlightPrevDir = 0;
+static uint32_t gFlightPrevBlocks = 0;
+static uint32_t gFlightCurDir = 0;
+static uint32_t gFlightCurBlocks = 0;
+static uint32_t gFlightOps = 0;                  // requests that reached their tail this boot
+static uint32_t gFlightBeats = 0;
+static volatile uint32_t gFlightBeatMisses = 0;  // beats that found the guard held
+static uint64_t gFlightStart = 0;                // counter value when the region was armed
+static uint64_t gFlightOpStart = 0;
+static uint64_t gFlightLastBeat = 0;
+
 // Round175: the tee. The verdict ring made the driver's own readings survive the panel; the readings
 // that actually decide the next round are printed by other people -- the r153/r155 shared-region
 // probes, APFS's jhash and ntree errors, the code-signing line that kills every process, the r170
@@ -1768,6 +1807,11 @@ static void checkReadPath (uint32_t lba, uint32_t sample)
 
 static void waitCardReady (uint32_t &response, uint32_t &status, uint32_t &polls);
 
+// Round210: the flight record of one block request. Defined beside the record writers, below the
+// PIO path they use; the read and write entry points call these before their first command.
+static void flightEnter (uint32_t event, uint32_t dir, uint32_t lba, uint32_t blocks);
+static void flightExit (uint32_t done);
+
 // Round169: the r168 frame turned the write-path wall into a read-path cascade -- APFS read 16 KiB
 // buffers from every daemon it decompressed and each one came back as EIO, while the card was
 // still working off the persona writes. A write is counted as stored when CMD13 reports
@@ -2198,12 +2242,16 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
     reportReadFailure ("guard", lba, blocks, 0, 0);
     return 0;
   }
+  // Round210: the record goes down before the first command this request sends, so a read that
+  // hangs in waitCardIdle or in its transfer still has its own name on the card.
+  flightEnter (kFlightEventRead, 0, lba, blocks);
   // Round169: the card can still be programming after the write that owned the guard was counted
   // as stored; a read that starts then is refused. Wait for the card, then start the deadline.
   if (!waitCardIdle (frequency)) {
     // The card never said ready. Stop it explicitly, or every later read inherits the same state.
     abortReadTransfer ();
     reportReadFailure ("idle", lba, blocks, 0, 0);
+    flightExit (0);
     releaseBlockGuard ();
     return 0;
   }
@@ -2327,6 +2375,7 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
       cutIn = true;
     }
   }
+  flightExit (done);
   if (cutIn) {
     reportGuardHandoff ("read", lba, blocks, done);
   }
@@ -2506,6 +2555,9 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
 // because a flush must not become the long guard hold this driver has spent three rounds removing.
 
 static uint32_t gRingBlock[kBlockWords];
+// Round210: its own block, because a beat may run on top of a request that is halfway through
+// filling gRingBlock at the tail it was interrupted in.
+static uint32_t gFlightBlock[kBlockWords];
 
 // One byte at a time, clamped: a verdict that overruns its slot is truncated rather than written
 // past the array, and the cursor stops advancing so the reported length is the stored length.
@@ -2758,6 +2810,136 @@ static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length)
   gRingSeq[which]++;
   gRingWritten[which]++;
   return true;
+}
+
+// ------------------------------------------------------------- round210: the flight region
+//
+// WHAT IT IS FOR
+//
+// Round208's ring went quiet at 167 s and round209's at 357.9 s, both times with the kernel still
+// printing, and round209 added the fact that the card refused the panic sink too. Two readings fit
+// that shape: a transfer stopped in flight with the controller inhibited, or the block layer parked
+// somewhere that never reaches the controller. The channel that explains it has to be written
+// *before* the stop, because after it nothing reaches the card -- so this round writes a small
+// record at the entry of every block request (kind 23, one block, twelve slots at sector 32) that
+// names the request and the result and duration of the one before it. A boot that stops has, at
+// worst, a last entry record with no successor: that is the request that never came back.
+//
+// The second half is the beat. CPU0's timer calls clover_emmc_flight_beat() every four seconds; it
+// takes the block guard with IOLockTryLock and, when the guard is free, writes a beat record (four
+// slots at sector 56) carrying SDHCI_PRESENT_STATE and the pending counts. The presence of a beat is
+// itself the reading: the guard was free and the controller accepted a command. When the beats stop,
+// the last entry record names the request, and the last beat bounds the time between the two.
+// A beat never writes while the panic sink is running (gPanicActive) or while the guard is held.
+static uint32_t flightCounterMs (uint64_t since)
+{
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint64_t now = readCounter ();
+  if (!since || now <= since) {
+    return 0;
+  }
+  return static_cast<uint32_t> ((now - since) * 1000ULL / frequency);
+}
+
+static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t blocks)
+{
+  if (!__atomic_load_n (&gFlightArmed, __ATOMIC_ACQUIRE) || !gVerdictFirst || !gHost) {
+    return false;
+  }
+  const bool beat = (event == kFlightEventBeat);
+  const uint32_t seq = beat ? gFlightBeatSeq : gFlightEntrySeq;
+  const uint32_t slot = seq % (beat ? kFlightBeatSlots : kFlightEntrySlots);
+  const uint32_t record = gVerdictFirst + (beat ? kFlightBeatOffset : kFlightEntryOffset) + slot;
+  const uint32_t present = read32 (SDHCI_PRESENT_STATE);
+  for (uint32_t i = 0; i < kBlockWords; i++) {
+    gFlightBlock[i] = 0;
+  }
+  gFlightBlock[0] = kLogMagic0;
+  gFlightBlock[1] = kLogMagic1;
+  gFlightBlock[2] = record;
+  gFlightBlock[3] = kFlightKind;
+  gFlightBlock[4] = seq;
+  gFlightBlock[5] = slot;
+  gFlightBlock[6] = event;
+  gFlightBlock[7] = dir;
+  gFlightBlock[8] = lba;
+  gFlightBlock[9] = blocks;
+  gFlightBlock[10] = flightCounterMs (gFlightStart);
+  gFlightBlock[11] = gFlightPrevDone;
+  gFlightBlock[12] = gFlightPrevMs;
+  gFlightBlock[13] = present;
+  gFlightBlock[14] = ((present & SDHCI_CMD_INHIBIT) ? 1u : 0u) |
+                     ((present & SDHCI_DATA_INHIBIT) ? 2u : 0u) |
+                     ((event == kFlightEventBeat) ? 4u : 0u);
+  gFlightBlock[15] = gFlightOps;
+  gFlightBlock[16] = __atomic_load_n (&gGuardWaits, __ATOMIC_RELAXED);
+  gFlightBlock[17] = __atomic_load_n (&gFlightBeatMisses, __ATOMIC_RELAXED);
+  gFlightBlock[18] = gRingPending[kRingKernel];
+  gFlightBlock[19] = gRingPending[kRingDriver];
+  gFlightBlock[20] = gFlightPrevDir;
+  gFlightBlock[21] = gFlightPrevBlocks;
+  uint32_t words = 0, status = 0;
+  if (!writePioBlock (record, gFlightBlock, words, status)) {
+    return false;
+  }
+  // The card may still be programming; a beat does not wait for it, because a beat that spends
+  // 200 ms inside the timer interrupt is its own problem. The next entry record's wait covers it.
+  if (!beat) {
+    uint32_t rsp = 0, rstatus = 0, polls = 0;
+    waitCardReady (rsp, rstatus, polls);
+  }
+  if (beat) {
+    gFlightBeatSeq++;
+    gFlightBeats++;
+  } else {
+    gFlightEntrySeq++;
+  }
+  return true;
+}
+
+static void flightEnter (uint32_t event, uint32_t dir, uint32_t lba, uint32_t blocks)
+{
+  gFlightOpStart = readCounter ();
+  gFlightCurDir = dir;
+  gFlightCurBlocks = blocks;
+  (void)flightWrite (event, dir, lba, blocks);
+}
+
+static void flightExit (uint32_t done)
+{
+  gFlightPrevDone = done;
+  gFlightPrevMs = flightCounterMs (gFlightOpStart);
+  gFlightPrevDir = gFlightCurDir;
+  gFlightPrevBlocks = gFlightCurBlocks;
+  gFlightOps++;
+}
+
+// Called from ArmCpu's timer on CPU0. TryLock is the point: a beat must never wait for a request,
+// and the guard being held is a fact the caller counts rather than a reason to block the interrupt.
+extern "C" void clover_emmc_flight_beat (void)
+{
+  if (!__atomic_load_n (&gFlightArmed, __ATOMIC_ACQUIRE) ||
+      __atomic_load_n (&gPanicActive, __ATOMIC_ACQUIRE) || !gVerdictFirst || !gHost || !gBlockLock) {
+    return;
+  }
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint64_t now = readCounter ();
+  if (gFlightLastBeat && now - gFlightLastBeat < frequency * 4ULL) {
+    return;
+  }
+  gFlightLastBeat = now;
+  if (!IOLockTryLock (gBlockLock)) {
+    __atomic_add_fetch (&gFlightBeatMisses, 1u, __ATOMIC_RELAXED);
+    return;
+  }
+  (void)flightWrite (kFlightEventBeat, 2, 0, 0);
+  IOLockUnlock (gBlockLock);
 }
 
 // One ring's share of a pass: at most kRingFlushPerPass[which] records, oldest first, and a refused
@@ -3643,6 +3825,7 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
   if (!acquireBlockGuard (frequency, start)) {
     return 0;
   }
+  flightEnter (kFlightEventWrite, 1, lba, blocks);
   // Round167: the request deadline scales with the run. A flat two seconds was sized for one APFS
   // burst; a single-block fallback over 32 blocks, at the 400 kHz timing this card may still be
   // on, can exceed it, and a short write is a torn checkpoint. Round168 raised the base to ten
@@ -3797,6 +3980,7 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
       cutIn = true;
     }
   }
+  flightExit (done);
   if (cutIn) {
     reportGuardHandoff ("write", lba, blocks, done);
   }
@@ -5590,6 +5774,22 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
               const unsigned int bcb = panicMarkRecovery ();
               sdhciSay ("CloverSdhci r198: recovery BCB pre-armed rc=%u written=%u\n",
                         bcb, gBcbWritten);
+              // Round210: the flight region sits in the gap the rings leave (sectors 32..63), and
+              // only a boot that asked for the unattended deadline pays for it. The entry records
+              // start with the first block request after this line; a beat starts on CPU0's next
+              // four-second boundary.
+              unsigned unattendedSeconds = 0;
+              if (PE_parse_boot_argn ("clover-unattended", &unattendedSeconds,
+                                      sizeof (unattendedSeconds)) && unattendedSeconds) {
+                gFlightStart = readCounter ();
+                __atomic_store_n (&gFlightArmed, 1u, __ATOMIC_RELEASE);
+                sdhciSay ("CloverSdhci r210: flight armed entry=%u slots=%u beat=%u slots=%u "
+                          "window=%u..%u\n",
+                          entryLdFirst + kFlightEntryOffset, kFlightEntrySlots,
+                          entryLdFirst + kFlightBeatOffset, kFlightBeatSlots,
+                          entryLdFirst + kFlightEntryOffset,
+                          entryLdFirst + kFlightBeatOffset + kFlightBeatSlots - 1);
+              }
             } else {
               sdhciSay ("CloverSdhci r185: logdump entry too small, rings stay disarmed first=%u sectors=%u needed=%u\n",
                         entryLdFirst, logSectors, needed);
@@ -7050,6 +7250,9 @@ static unsigned int panicAppendText (const char *text, unsigned int length)
 // itself whether the rings are armed.
 extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int length)
 {
+  // Round210: the timer keeps running through a panic, and a beat that cut in here would be a
+  // second owner of the card in the middle of the panic's own writes. The first panic owns it.
+  __atomic_store_n (&gPanicActive, 1u, __ATOMIC_RELEASE);
   const unsigned int rc = panicAppendText (text, length);
   panicDrainRings ();
   // Last, because everything above is a reading and this changes what the reset does. The screen

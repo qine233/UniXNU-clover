@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r209: read the kernel log buffer from inside the panic sink -- r208's ring goes silent at 167 s because the tee only runs on block I/O tails, so the deadline panic now walks backwards from msg_bufx, pushes the newest complete lines and a status row (unseen bytes, tee cursor, lap, refused, pending, guard waits, cache) into the kernel ring, and the unseen count is what separates a stopped kernel from a stopped card path"
+title = "clover r210: record every block request at its entry and beat from CPU0's timer -- r209's kernel ring stops at 357.9 s with the kernel still printing and the card refusing the panic sink too, so the flight region (entries at sector 32..43, four-second beats at 56..59) names the request that never came back and the last time the block guard was free and the controller accepted a command"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

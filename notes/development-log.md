@@ -15774,3 +15774,114 @@ panic 时连通道本身都断了。
    心跳（含 present-state、守卫等待、环 pending）。卡从某一刻起不可写，心跳就在那一刻停；
    如果一直有心跳到 900 s，那问题就只在 panic 路径，而不在卡。
 3. 宿主 `read-clover-log.py` 增加 flight 区解码（sectors 32..63）。
+
+## Round 210 — 在停之前把每一笔块请求先写下来
+
+r209 的阴性把「停在哪」缩成一句话：内核活到 900 s，卡从 357.9 s 起一笔块 I/O 都没完成，
+连 panic sink 的单块写入也失败了。这只剩两种形状：一笔传输卡在飞行中、控制器被 inhibit，
+或者块层停在某个永远到不了控制器的地方。两种都不可能事后从卡上读出来——停了以后什么都写不进去。
+所以 r210 改成**在停之前写**.
+
+### 实现
+
+`drivers/CloverSdhci/CloverSdhci.cpp`：
+
+- **flight 区**占日志窗口里两个窗口留下的空隙：entry 记录 12 槽（sector 32..43）、beat 记录
+  4 槽（sector 56..59），每条**一块**、kind 23、22 个小端 32 位词：magic、LBA、kind、seq、slot、
+  event(1 读/2 写/3 beat)、dir、opLba、opBlocks、本 boot 毫秒、上一笔 done/ms/dir/blocks、
+  `SDHCI_PRESENT_STATE`、inhibit 标志、完成计数、守卫等待、beat 缺失、两个环的 pending。
+- `flightEnter()` 在**拿到块守卫之后、发第一条命令之前**调用；读写两条路径都接上。
+  `flightExit()` 在循环结束后记下 done 与耗时，下一笔 entry 会把它们带走——所以
+  **最后一笔 entry 没有后继，就是没回来的那笔请求**。
+- `flightWrite()` 在 `!beat` 时用 `waitCardReady` 等卡编程完，下一笔 entry 的写不会打断上一笔；
+  beat 不等，200 ms 的定时器中断是它自己的问题。
+- CPU0 定时器（`drivers/ArmCpu/ArmCpu.cpp`）每 4 s 调一次 `clover_emmc_flight_beat()`：
+  `IOLockTryLock(gBlockLock)` 失败只把 `gFlightBeatMisses` 加一，**不发命令**——beat 缺失本身
+  就是读数（守卫生被占）；成功则写一拍 PRESENT_STATE。`gPanicActive` 时禁 beat，panic 期间
+  不打断 sink。`clover-unattended` 非零才上膛，并打一行
+  `CloverSdhci r210: flight armed entry=… slots=… beat=… slots=… window=…`。
+- `clover_emmc_panic_append` 入口闩 `gPanicActive`。
+
+宿主 `scripts/read-clover-log.py`：`decode_flight()` 按 22 词解块（没有正文、没有校验和，
+头就是记录），`flight_chain()` 从最高 seq 按 `seq % slots` 往回走，遇到槽里的 seq 对不上就停——
+**这一步把本次启动的链和上一轮留下的记录分开**，因为 seq 每 boot 归零而分区不擦；
+`--flight` 打印两条链与「最新 entry / 最新 beat 的时间差」；selftest 覆盖 14 entry/6 beat 的回绕、
+上一轮残留（时间戳更大但不在链上）、kind 不符，以及 flight 区与 report（0..31）、
+verdict（64..）不重叠的几何断言。
+
+配套：`board.toml` 标题升到 `clover r210:`；`check-clover.py` 断言两处标题、两个区偏移、
+上膛行、读写入口的 `flightEnter`、`flightExit`、beat 入口与 `IOLockTryLock` 的用法、
+ArmCpu 的调用点；`verify-clover-payload.py` 新增 `r210 flight region linked`。
+
+### 构建与闸门
+
+内核 `7380bc90…` → AMFI 两刀落在 file `0x1ab10e4` / `0x1ab116c`（与 r200–209 同址）
+得 `f7040839…` → 归一化 `8862d3e2…`（968 个对象戳全清）→ payload
+`5cb2c653…`（`~/clover-out/round210-payload.img`，56 MiB）。`check-clover.py` 绿；
+`verify-clover-payload.py` 全项 OK（含 `r210 flight region linked OK`）。
+第一次内核构建被 `-Werror,-Wunused-const-variable` 挡住：`kFlightEventFlush` 没有接线
+（flush 本来就有自己的分段记录），已删。
+
+### 读数（2026-10-30 01:29 冷刷，01:46 落地）
+
+**这一帧把 r209 的结论推翻了：卡没有坏，坏的是 SpringBoard 的看门狗。**
+
+- **flight 区**：entry 链 `seq 184672..184683`（12 槽全满），时间 `900482..900664 ms`，
+  全部是读，`lba` 在 24132642..24887098，`blocks` 16/32/64/80/88/96/120/128。
+  每一笔 entry 的 `prev` 都是上一笔的 `done(=blocks)`、`ms` 0..7 ms——**包括 128 块和
+  120 块的多块读**；`ps=0x01f800f0` 在每一条里都一样，CMD/DAT inhibit 两位都是 0。
+  最后一笔是 `t=900664 ms` 的 120 块读，没有后继。
+- **beat 链**：`seq 175..178`，`885557/889559/893564/897566 ms`，每拍 4.0 s，
+  `ps` 同为 `0x01f800f0`，`miss=46` 从头到尾不变（守卫一次都没被占住），
+  `pend=0/0`。到最后一笔 entry 时 `ops=184688`、`guard=184689`。
+- **panic 尾行**：`CloverSdhci r209: panic tail lines=3 unseen=0 bufx=110 cursor=110
+  size=131072 lap=13 refused=0 pend=3 drop=0 guard=184689 last=0ms cache=0`——
+  **`unseen=0`**：tee 在 panic 前已经把 msgbuf 读干净；`guard` 与最后一笔 entry 相同，
+  说明 sink 的三条尾行 + 状态行是走不受守卫约束的单块原语写下去的，而且**写成功了**。
+  内核环因此一直写到 `[911.924696]`（seq 1517），比 r209 的 357.9 s 晚了 554 s。
+
+**推论**：r209 的「卡在飞行中被 inhibit」这一帧没有复现。块路径在死线前一直健康，
+panic sink 也写得进去。r210 与 r209 唯一的差别是每 4 s 一次的 beat 写；它是否让卡免于
+停摆，这一帧分不出来，但**“卡路径坏了”不再是桌面没起来的解释**。
+
+**SpringBoard 仍是停点**：`457.346085` backboardd（pid 58）对 SpringBoard（pid 27）发
+SIGKILL，`cs=0x22000301`（无 CS_KILLED）、`ra=fffffff0076ffd7c`、`anchor=fffffff007700b54`，
+与 r207 的读数逐位相同；`sender upc=0x1da501100 uinsn=540000e3` 也与 r208 相同。
+`sender upc` 的指令是 `b.ne`，落在 backboardd 里 collective-watchdog 的发送路径上。
+紧接着 457.346477 `exit rv=0x9 ns=2 code=0x9`、457.346525 `sig pid=27 ... sig=9 n=1`。
+
+**sbthr 快照（这次是新的）**：SpringBoard 只有 5 条线程，`tid=0x104/0x309/0x3ef/0x3f1/0x3f6`，
+**没有一条 tid 等于 pid 27**；`state` 为 1/1/65/65/1（1=TH_WAIT，65=TH_WAIT|TH_WAIT_REPORT），
+`wait` 是 6 个内核等待事件地址（`0xfffffff61d8283e0`、`0xfffffff4507633e8`、
+`0xfffffff61d8284a0`、`0xfffffff4505c25f8`）。拿 r201 的 dyld 缓存符号化 pc：
+
+- `0x1da4fc970` / `0x1da4fc8e8`（两条线程同 pc）/ `0x1da4fcb58`
+  → `DiagnosticRequestService` 的 `__TEXT`（0x1da46f000+0x8f000）；
+- `0x1da502bdc` → `libswift_StringProcessing.dylib`（0x1da4fe000+0x87ff8）。
+
+也就是说这五条线程停在**用户态代码里被内核等待**（缺页等待或未返回的调用），
+不是停在我们的显示栈（`IOMobileFramebufferLegacy`）里。
+
+**死线之后的画面**：`swap#4`(458.978) → `frame#3`(459.970, t=42s) → `copy#4` 85 ms →
+`scanout#4` → `retire#4 done=4 presented=4`(460.538)。SpringBoard 死后 backboardd 还出过一帧，
+此后 r180 的行不再出现（也可能只是 r180 的 tee 配额用尽，这一帧分不出）。
+
+**panic 屏的 kind 20 一条也没写**：report 窗 12 条全是旧靴的 r148 死线行
+（ticks 47032..175113、300 s/900 s），slot 12 起没有 magic；而同一时刻的内核环排干
+（3 条尾行 + 状态行）却成功了。`panicAppendText` 第一步是**读** 16 个槽找空位，
+失败返回 2/4/5；这一帧的返回码没有落盘。最像 panic 时另一颗 CPU 上还有一笔 120 块读在飞行中，
+append 的读被挡住，而随后（tee 8 轮之后）的环写已经能进。**r211 要把 append 的 rc 写进状态行。**
+
+**解码器的一个设计缺陷**：r209 的 `panicTailSay` 把状态行推进**内核环**，于是
+`producer()` 把它读成 “driver”，`--driver` 计数非零，脚本报 “the tee is echoing”。
+这不是 tee 在回声，是驱动自己越界写了内核环。r211 把状态行改推**驱动环**。
+
+### 下一步（r211）
+
+1. **SpringBoard 卡在哪**：在 r207 的 kill 点，对 receiver 的每条线程打印 `lr/sp` 和
+   **内核栈返回地址**（`machine.kstackptr` 起按 x29 链走 6 帧），并显式标出主线程
+   （tid==pid）；同时把发送者 backboardd 的当前线程也走一遍内核栈。这一帧的 pc 落在
+   `DiagnosticRequestService`/Swift 运行时，只有内核栈能说出是缺页、文件读、还是某个永不返回的
+   调用。预算仍按 SpringBoard 专用槽。
+2. **panic sink 的第一步**：写状态行前先把 `panicAppendText` 的 rc 记下；状态行改走驱动环；
+   如果 rc 是读失败，下一轮再决定是否在 append 前 reset 控制器。
