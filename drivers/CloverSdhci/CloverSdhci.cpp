@@ -288,6 +288,10 @@ static IOLock *gBlockLock = nullptr;
 static volatile uint32_t gGuardHandoffs = 0;
 static volatile uint32_t gGuardWaits = 0;
 static volatile uint64_t gGuardWorstWait = 0;   // ticks, the worst wait any caller has measured
+// Round190: the last wait, in milliseconds, for any caller. The worst of them is already reported at
+// a request's tail, but a tail is exactly what a caller waiting on the guard does not reach -- so the
+// number has to be readable from someone else's record. The flush below prints it before it starts.
+static volatile uint64_t gGuardLastWaitMs = 0;
 // Round127's second export: the logfs partition as a window, first LBA and length, taken from the
 // GPT entry this boot read rather than from the constants above -- those two only decide whether
 // the entry is the one this port has been reading. A block device described as this window has
@@ -1531,6 +1535,7 @@ static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start)
   // racy maximum across the boot's threads and that is fine: it is a reading, and an occasional lost
   // increment only understates it. The wait is measured before the holder's deadline starts.
   gGuardWaits = __atomic_add_fetch (&gGuardWaits, 1u, __ATOMIC_RELAXED);
+  __atomic_store_n (&gGuardLastWaitMs, waited * 1000ULL / frequency, __ATOMIC_RELAXED);
   if (waited > __atomic_load_n (&gGuardWorstWait, __ATOMIC_RELAXED)) {
     __atomic_store_n (&gGuardWorstWait, waited, __ATOMIC_RELAXED);
   }
@@ -4007,6 +4012,20 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
   if (!acquireBlockGuard (frequency, start)) {
     return 0;
   }
+  // Round190: the r189 frame's last call is fcntl(3, F_BARRIERFSYNC) and the kernel ring says nothing
+  // for the 187 s after it. Whether that barrier reached this driver is the first question the next
+  // frame can answer, and the answer has to be on the card before the risky part runs, not after it:
+  // this record and whatever the kernel ring is holding are written out here, ahead of the first
+  // CMD6, so a flush that never returns still leaves the fact that it started. `wait` is the guard
+  // wait that just ended -- a barrier starved by an earlier request reads as a number, not silence.
+  const uint64_t flushStart = readCounter ();
+  sdhciSay ("CloverSdhci r190: flush-in flushes=%u on=%u size=%u wait=%llu ms\n",
+            __atomic_load_n (&gCacheFlushes, __ATOMIC_RELAXED),
+            __atomic_load_n (&gCacheOn, __ATOMIC_RELAXED),
+            __atomic_load_n (&gCacheSize, __ATOMIC_RELAXED),
+            static_cast<unsigned long long> (__atomic_load_n (&gGuardLastWaitMs, __ATOMIC_RELAXED)));
+  teeKernelLog ();
+  flushVerdictRing ();
   uint32_t response = 0;
   uint32_t status = 0;
   uint32_t polls = 0;
@@ -4029,6 +4048,15 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
   } else {
     __atomic_add_fetch (&gCacheFlushes, 1u, __ATOMIC_RELAXED);
   }
+  // Round190's second half: the pair of flush-in and flush-out is what makes the first record
+  // readable. A frame with an entry and no exit names this commit as the call that never came back;
+  // a frame with both says the card took the commit and the wall is above this driver.
+  sdhciSay ("CloverSdhci r190: flush-out flushed=%d back=%d rsp=%08x st=%08x polls=%u "
+            "rsp2=%08x st2=%08x polls2=%u ms=%llu flushes=%u\n",
+            flushed ? 1 : 0, reenabled ? 1 : 0, response, status, polls, backResponse, backStatus,
+            backPolls,
+            static_cast<unsigned long long> ((readCounter () - flushStart) * 1000ULL / frequency),
+            __atomic_load_n (&gCacheFlushes, __ATOMIC_RELAXED));
   // Round175: same as the read tail -- collect from the kernel log, then spend the guard on the card.
   teeKernelLog ();
   flushVerdictRing ();   // Round174: same reason as the read tail

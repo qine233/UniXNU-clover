@@ -695,6 +695,29 @@ def check_sys_why3(kernel: bytes) -> bool:
     return ok
 
 
+def check_sys_why4(kernel: bytes) -> bool:
+    """Round190 brackets the call the r189 frame ends on. fcntl(3, F_BARRIERFSYNC) enters at
+    112.438859 and the ring says nothing for the next 187 s; an entry line alone cannot say whether
+    the call returned, so the image has to carry the exit line for the handful of storage calls, and
+    the driver's cache commit has to carry its own bracket -- written to the card before the first
+    CMD6, so a commit that hangs still leaves the fact that it started."""
+    label = "kernel.macho: barrier bracket linked"
+    found = {"unix-out": (b"clover r190: unix-out n=%d pid=%d tid=%lld comm=%s code=%d ret=%lld "
+                          b"err=%d\n") in kernel,
+             "flush-in": (b"CloverSdhci r190: flush-in flushes=%u on=%u size=%u wait=%llu ms\n")
+             in kernel,
+             "flush-out": (b"CloverSdhci r190: flush-out flushed=%d back=%d rsp=%08x st=%08x "
+                           b"polls=%u rsp2=%08x st2=%08x polls2=%u ms=%llu flushes=%u\n") in kernel,
+             "sync-in": b"CloverBlock r190: sync-in pending=%llu\n" in kernel,
+             "kept-r189": b"clover r189: unix-open n=%d pid=%d tid=%lld comm=%s code=%d fd=%lld "
+                          b"path=%s\n" in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -1101,6 +1124,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_sys_why(kernel)
         ok &= check_sys_why2(kernel)
         ok &= check_sys_why3(kernel)
+        ok &= check_sys_why4(kernel)
     return 0 if ok else 1
 
 

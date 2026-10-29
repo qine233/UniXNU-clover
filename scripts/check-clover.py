@@ -1517,9 +1517,10 @@ def check_board(errors: list) -> str:
     # GPT walk, so the SDHCI driver carries its own r185 stamp for the arming line; round186, round187
     # and round188 change no driver at all. Round189 changes the driver only inside the tee's per-pass
     # push budget, which prints nothing new and leaves the window geometry alone, so the r185 arming
-    # stamps still say what happened and only the menu moves.
-    if not board["payload"]["title"].startswith("clover r189:"):
-        errors.append('[payload] title is not "clover r189: ...": the menu would not name this round')
+    # stamps still say what happened and only the menu moves. Round190 adds the flush bracket to the
+    # block driver, which carries its own r190 stamps and also leaves the arming lines alone.
+    if not board["payload"]["title"].startswith("clover r190:"):
+        errors.append('[payload] title is not "clover r190: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2350,6 +2351,97 @@ def check_board(errors: list) -> str:
             if older in joined:
                 errors.append(f"{sys_probe3.name} adds a {older!r} line: its own r189 lines are the "
                               "only new readings this round produces")
+
+    # Round190: the r189 frame answers both older questions and leaves a narrower one. The protected
+    # opens all named /var/logs/usermanagerd.log.0 (a log directory that does not exist), every mach
+    # trap came back, and usermanagerd walked all the way to saving its session keybag: open .writing,
+    # a 1020-byte bplist, fsync, renameatx_np, then fcntl(3, 0x55 = F_BARRIERFSYNC) at 112.438859 --
+    # after which the kernel ring is silent for 187 s. Nothing says whether that barrier returned, and
+    # nothing says whether it reached the block driver. Round190 therefore adds the exit line for the
+    # handful of calls that can wait on storage, and brackets the driver's cache commit with a record
+    # written to the card *before* the first CMD6, so a commit that never returns still leaves the
+    # fact that it started. Still log-only on the kernel side.
+    sys_probe4 = next((base / "patches/xnu-clover/zzzzz-clover-syswhy4.patch"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "patches/xnu-clover/zzzzz-clover-syswhy4.patch").is_file()), None)
+    if sys_probe4 is None:
+        errors.append("patches/xnu-clover/zzzzz-clover-syswhy4.patch is missing: the next frame would "
+                      "again show the barrier fsync entering and nothing after it, with no way to tell "
+                      "a call that never returned from a ring that had nothing left to tee")
+    else:
+        text = sys_probe4.read_text()
+        added = [line for line in text.splitlines() if line.startswith("+") and
+                 not line.startswith("+++")]
+        removed = [line for line in text.splitlines() if line.startswith("-") and
+                   not line.startswith("---")]
+        joined = "\n".join(added)
+        # A C definition the patch splits over two lines still has to satisfy the needle, so the
+        # whitespace-collapsed copy is searched alongside the raw text.
+        flat = " ".join(" ".join(line[1:] for line in added).split())
+        for needle in ("bsd/dev/arm/systemcalls.c",
+                       "#define CLOVER_SYS_WHY_OUT_LIMIT    128",
+                       "static int clover_sys_why_out_code(int code)",
+                       "case SYS_fcntl:", "case SYS_fcntl_nocancel:",
+                       "case SYS_fsync:", "case SYS_fsync_nocancel:",
+                       "case SYS_renameatx_np:",
+                       '"clover r190: unix-out n=%d pid=%d tid=%lld comm=%s code=%d ret=%lld err=%d\\n"',
+                       "clover_sys_why_out_code(code) && clover_sys_why_watched(proc->p_comm)"):
+            if needle not in text and needle not in flat:
+                errors.append(f"{sys_probe4.name} lacks {needle[:44]}...: without it the frame cannot "
+                              "say whether the barrier fsync came back")
+        if removed:
+            errors.append(f"{sys_probe4.name} deletes {removed[0][:60]!r}: r190 only adds a reading, "
+                          "and a deleted line is a change in what the boot tasks are told")
+        if joined.find("clover r190: unix-out") < 0:
+            errors.append(f"{sys_probe4.name} prints no r190 line: the exit reading is the whole round")
+        if text.rfind("clover_sys_why_out_code(code) &&") < text.rfind("if (error == 0 && clover_sys_why_open_code"):
+            errors.append(f"{sys_probe4.name} prints the exit before the open reader: the lines would "
+                          "not be in call order")
+        for older in ("clover r187:", "clover r188:", "clover r189:"):
+            if older in joined:
+                errors.append(f"{sys_probe4.name} adds a {older!r} line: its own r190 line is the "
+                              "only new reading this round produces")
+
+    # The driver half: the flush bracket and the two sync records. flush-in has to be written to the
+    # card before the first CMD6 -- that ordering is the whole point, since a commit that hangs never
+    # reaches its own tail. Both lines are pinned by their field lists so a later round cannot shrink
+    # a reading the next frame needs.
+    block_source = (REPO / "drivers/CloverSdhci/CloverSdhci.cpp").read_text()
+    flush_start = block_source.find("extern \"C\" uint32_t clover_emmc_flush_cache (void)")
+    flush_end = block_source.find("\n}\n", flush_start) if flush_start >= 0 else -1
+    flush_body = block_source[flush_start:flush_end] if flush_end > flush_start else ""
+    for needle in ("CloverSdhci r190: flush-in flushes=%u on=%u size=%u wait=%llu ms\\n",
+                   "CloverSdhci r190: flush-out flushed=%d back=%d rsp=%08x st=%08x polls=%u ",
+                   "static volatile uint64_t gGuardLastWaitMs = 0;",
+                   "__atomic_store_n (&gGuardLastWaitMs, waited * 1000ULL / frequency,"):
+        if needle not in block_source:
+            errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp lacks {needle[:44]}...: without it the "
+                          "next frame cannot say whether the barrier reached the card or how long it "
+                          "waited for the block guard")
+    if not flush_body:
+        errors.append("drivers/CloverSdhci/CloverSdhci.cpp lost clover_emmc_flush_cache: the barrier "
+                      "has no bracket left to write")
+    else:
+        entry = flush_body.find("CloverSdhci r190: flush-in")
+        first_cmd = flush_body.find("switchExtCsd (kExtCsdCacheCtrl, 0")
+        exit_at = flush_body.find("CloverSdhci r190: flush-out")
+        if not (0 <= entry < first_cmd):
+            errors.append("clover_emmc_flush_cache prints flush-in after the first CMD6: a commit that "
+                          "never returns would leave no record that it started")
+        if not (first_cmd < exit_at):
+            errors.append("clover_emmc_flush_cache prints flush-out before the commit runs: the pair "
+                          "would not bracket it")
+        if flush_body.find("teeKernelLog ();") > first_cmd:
+            errors.append("clover_emmc_flush_cache does not drain the kernel ring before the first "
+                          "CMD6: the r190 exit line would sit in msgbuf through the whole commit")
+    block_dev_source = (REPO / "drivers/CloverBlock/CloverBlock.cpp").read_text()
+    for needle in ("CloverBlock r190: sync pending=0 (once)\\n",
+                   "CloverBlock r190: sync-in pending=%llu\\n",
+                   "CloverBlock r190: sync-out ok=1 pending=%llu\\n",
+                   "CloverBlock r190: sync-out ok=0 pending=%llu\\n"):
+        if needle not in block_dev_source:
+            errors.append(f"drivers/CloverBlock/CloverBlock.cpp lacks {needle[:44]}...: a barrier with "
+                          "nothing to commit would read exactly like a barrier that never arrived")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())

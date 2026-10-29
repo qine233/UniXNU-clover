@@ -14595,3 +14595,76 @@ r189 的补丁改的是 r187 补丁新增的行，r188 的块又落在同一段�
 心跳在这轮从 128 减到 64，`n=4096` 之前每一百来条就有一行，可以把「预算用尽的沉默」和「进程停住
 的沉默」分开。
 
+## round189 读数（v0.5.49 实机，2026-10-29）：会话表写完了，随后是一个 barrier fsync 和 187 秒静默
+
+### 这一帧把「墙在 write 里」彻底推翻
+
+`clover-log-window.bin` 解出 512 个内核环条目，tee 的普查行收在 `seen=2447 kept=1258 throttled=838
+lap=1`。keep 比例比 r188 好（16 条/趟），但仍有三分之一被丢——下一轮若还要看突发，预算还得往上走。
+环里的顺序读下来是：`open_dprotected_np`（`code=216`）12 次失败全部点出了路径
+`/var/logs/usermanagerd.log.0`——一个不存在的目录，这解释了 r189 之前那 12 条空路径；接着
+`/private/var//keybags/usersession.kb.writing` 以 `fd=3` 打开；随后 `unix-write … fd=3 len=1020
+txt=bplist00…` 与 `unix-wrote … code=4 fd=3 ret=1020 err=0` 成对，说明这 1020 字节的会话表**完整
+写进去了**；之后 `fsync`（`code=95`）与 `renameatx_np`（`code=488`）都返回了。最后一条是
+`fcntl(3, 0x55)`，时间戳 `[112.438859]`，`0x55` 就是 `F_BARRIERFSYNC`。此后到 300 秒死线复位，
+环里再没有一行——187 秒的空白，且没有 panic、没有看门狗行。
+
+所以墙不在 write、不在 fsync、不在 rename，而在那次 barrier fsync 之后（或者就在它里面）。
+
+### 为什么内核侧再打一行也不够
+
+tee 只在块请求的有守卫尾部（读/写/sync）泵内核日志。也就是说，内核 `printf` 是否落到卡上，取决于
+**之后还有没有块请求**。如果 barrier 调用挂住，用户态再也不会发出新的块请求，于是即使内核在那条路上
+打了一行，这行也永远留在 msgbuf 里等一趟不存在的泵。这就是为什么 r190 不能只是「再加一条内核打印」：
+内核侧的行只能证明「调用进去了」，不能证明「调用回来了」。
+
+### r190 的两侧括号
+
+- 内核侧仍然需要退出行：`zzzzz-clover-syswhy4.patch` 对 `fcntl`/`fcntl_nocancel`/`fsync`/
+  `fsync_nocancel`/`renameatx_np`（能等存储的那几条）打 `clover r190: unix-out … ret= err=`，
+  预算 128、心跳沿用 64。有进无出 = 调用没回来；有进有出 = 调用回来了，墙在下一次等待。
+- 驱动侧把「开始」写在卡上**先于**第一次 CMD6：`clover_emmc_flush_cache()` 在拿到块守卫之后、
+  `switchExtCsd (kExtCsdCacheCtrl, 0)` 之前 `sdhciSay` 一行 `flush-in`（带 `flushes= on= size=`
+  和守卫等待 `wait= ms`），并立即 `teeKernelLog(); flushVerdictRing();` 把 msgbuf 与判据环先排进
+  logdump；提交完成后再打 `flush-out`（`flushed= back= rsp= st= polls= rsp2= st2= polls2= ms=
+  flushes=`）。`CloverBlock::commitCache()` 另外加 `sync-in`/`sync-out ok=0|1` 与一次性的
+  `sync pending=0`，把「这一次 sync 根本无事可提交」「提交了」「提交失败」分成三种可读状态。
+- 守卫等待的毫秒数从 `acquireBlockGuard()` 里新导出的 `gGuardLastWaitMs` 读到，这样 flush-in
+  那一行同时回答「是不是我们自己那把锁把这个提交挡住的」。
+
+## round190（v0.5.50）：barrier fsync 的两侧括号
+
+### 补丁没进树，内核就会「静默」地少一段
+
+第一次 `unixnu build kernel` 是本轮唯一一次走弯路：设备仓库的补丁放在
+`UniXNU-clover/patches/xnu-clover/`，而构建脚本只读 `$ROOT/patches/xnu/*.patch`（`$ROOT` 是
+`out/clover/tree`）。少了复制这一步，内核照常编完、照常 prelink、照常打 payload，退出码 0，什么都没
+报——`verify-clover-payload.py` 的 `barrier bracket linked` 一行 `unix-out ABSENT` 才把这件事说出来。
+所以现在的顺序是：改设备仓库的补丁 → `cp` 到 `/Users/zhouzhou/UniXNU/patches/xnu/`（即
+`out/clover/tree/patches/xnu/` 的实体）→ 再编。这条写进本节的理由和 r189 那条「反向名单」一样：
+它是构建流程的契约，不是一次性的操作。
+
+### 构建与闸门
+
+- 第一次构建（补丁缺席）内核 `1987076e…`，校验器 `unix-out ABSENT`；补上补丁后重编得
+  `e7d55abb…` → 归一化 `b89f7616…`（968 个 object 戳全清）→ AMFI 两刀仍落在 file
+  `0x1aad0e4` / `0x1aad16c` 得 `23b89e9a…`（文本没长过一页，命中点与 r186–r189 同址）。
+- payload 卷内 kernel `aef349ec…`（52195328 字节，入口探针 6856 字节 / 37 段）、`unixnu.toml`
+  `2050da52…`（791 字节）、ADT `41b3fe98…`（13516 字节）、trustcache `7c369ce0…`、
+  `scratch-data.img` `614b8356…`；镜像 `674c8383…`。`boot.img` `196b284f…` 与 round183–189
+  逐字节相同——本轮没动固件，冷刷只写 cache。
+- `check-clover.py` 绿（标题 `clover r190:`、why4 补丁在场 + 六条针 + 只加日志 + 旧轮串只查新增行、
+  驱动侧 flush-in 早于第一次 CMD6 且 `teeKernelLog ()` 在它之前、四条 `CloverBlock r190:` 串）；
+  为这一轮给 checker 加了一处能力：补丁里的 C 定义分两行写时，针要能在**折叠空白**后的副本上命中，
+  否则「定义在场」会被误报成缺席。`verify-clover-payload.py` 36 条 OK 含新增
+  `barrier bracket linked OK`；五道宿主自测全 PASS；`porting-record.py check` 13 个区 exit 0。
+
+### 下一帧要读什么
+
+冷刷只写 cache，跑无人值守脚本读回 logdump。第一眼看 `fcntl(3, 0x55)` 那条 `unix-in` 之后有没有
+`unix-out … code=92`：有，barrier 回来了、墙在它之后的某次等待；没有，就是这条调用再没回来。第二眼看
+有没有 `CloverSdhci r190: flush-in`：有就说明这次 barrier 真的走到了我们驱动的 cache 提交（`wait=`
+还能说出块守卫等了多久），没有就说明 apfs 在块层之上就挡住了——这两种情况的下一步完全不同。第三眼看
+flush-in 后面有没有 `flush-out` 与 `CloverBlock r190: sync-out ok=`：有 `flush-out` 说明卡收下了
+提交、墙在驱动之上；只有 `sync-in` 没有 `sync-out` 说明 CloverBlock 进了 `commitCache()` 但没出来。
+

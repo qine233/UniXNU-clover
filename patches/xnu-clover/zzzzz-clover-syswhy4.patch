@@ -1,0 +1,63 @@
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -126,11 +126,13 @@
+ #define CLOVER_SYS_WHY_TEXT_BYTES   64
+ #define CLOVER_SYS_WHY_OPEN_LIMIT   128
+ #define CLOVER_SYS_WHY_MACHOUT_LIMIT 512
++#define CLOVER_SYS_WHY_OUT_LIMIT    128
+ 
+ static int clover_sys_why_paths;
+ static int clover_sys_why_writes;
+ static int clover_sys_why_opens;
+ static int clover_sys_why_mach_outs;
++static int clover_sys_why_outs;
+ 
+ static int
+ clover_sys_why_path_code(int code)
+@@ -179,6 +181,29 @@
+ 	}
+ }
+ 
++/*
++ * Clover (round190): the r189 frame ends on fcntl(3, 0x55 = F_BARRIERFSYNC) and
++ * the kernel ring says nothing for the next 187 s.  Every unix entry is already
++ * printed, so the missing half is the return: for the few calls that can wait on
++ * storage, the exit is printed too.  An entry with no exit is a call the task
++ * never came back from, and then the barrier itself is the wall; an entry with
++ * an exit is a call that finished, and whatever the task did next is the wall.
++ */
++static int
++clover_sys_why_out_code(int code)
++{
++	switch (code) {
++	case SYS_fcntl:
++	case SYS_fcntl_nocancel:
++	case SYS_fsync:
++	case SYS_fsync_nocancel:
++	case SYS_renameatx_np:
++		return 1;
++	default:
++		return 0;
++	}
++}
++
+ static user_addr_t
+ clover_sys_why_path_arg(int code, arm_saved_state_t *state)
+ {
+@@ -424,6 +449,16 @@
+ 		}
+ 	}
+ 
++	if (clover_sys_why_out_code(code) && clover_sys_why_watched(proc->p_comm)) {
++		clover_sys_why_outs++;
++		if (clover_sys_why_outs <= CLOVER_SYS_WHY_OUT_LIMIT ||
++		    (clover_sys_why_outs % CLOVER_SYS_WHY_HEARTBEAT) == 0) {
++			printf("clover r190: unix-out n=%d pid=%d tid=%lld comm=%s code=%d ret=%lld err=%d\n",
++			    clover_sys_why_outs, pid, thread_tid(current_thread()), proc->p_comm, code,
++			    (long long)uthread->uu_rval[0], error);
++		}
++	}
++
+ 	unix_syscall_kprintf("code %d, error %d, results %x, %x (pid %d - %s, tid %lld)\n", code, error,
+ 	    uthread->uu_rval[0], uthread->uu_rval[1],
+ 	    pid, get_bsdtask_info(current_task()) ? proc->p_comm : "unknown", thread_tid(current_thread()));

@@ -551,12 +551,25 @@ IOReturn CloverBlockDevice::commitCache(void)
   // boot windows are partitions of the same device, so whichever instance commits first empties the
   // queue for all of them. gWritesSinceFlush counts blocks rather than requests because a partial
   // batch that failed mid-chunk still left `written` blocks on the card.
-  if (!__atomic_load_n(&gWritesSinceFlush, __ATOMIC_RELAXED)) {
+  // Round190: the frame has to tell three states apart -- no barrier reached this driver at all, a
+  // barrier arrived with nothing to commit, and a barrier arrived with blocks and is being committed.
+  // The first needs no code here; the other two do, because "pending=0" returns before the driver is
+  // ever called and would otherwise look exactly like a barrier that never came.
+  const uint64_t pending = __atomic_load_n(&gWritesSinceFlush, __ATOMIC_RELAXED);
+  if (!pending) {
+    static bool emptyReported = false;
+    if (!emptyReported) {
+      emptyReported = true;
+      IOLog("CloverBlock r190: sync pending=0 (once)\n");
+    }
     return kIOReturnSuccess;   // nothing has been written since the last commit
   }
+  IOLog("CloverBlock r190: sync-in pending=%llu\n", static_cast<unsigned long long>(pending));
   if (!clover_emmc_flush_cache()) {
+    IOLog("CloverBlock r190: sync-out ok=0 pending=%llu\n", static_cast<unsigned long long>(pending));
     return kIOReturnError;
   }
+  IOLog("CloverBlock r190: sync-out ok=1 pending=%llu\n", static_cast<unsigned long long>(pending));
   // The first commit of the boot is the line that says the write-back path is real: it names how
   // many blocks the card had been holding, and the driver-side counter says how many times the
   // cache has been switched off and back on. A frame with writes and no line here is a frame where
