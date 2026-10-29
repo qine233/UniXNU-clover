@@ -399,7 +399,9 @@ static volatile uint32_t gVerdictReady = 0;   // driver ring: armed with the log
 // has not reached before the writer laps it is gone, which is why it is worth reading a chunk per
 // request rather than one line.
 static const uint32_t kTeeScanPerPass = 4096;   // bytes read per pass; a chunk, not the whole buffer
-static const uint32_t kTeePushPerPass = 8;      // matching lines handed to the kernel ring per pass
+// Round189 doubles the push budget: the r188 census (seen=1598 throttled=694) says the per-pass cap,
+// not the ring, was dropping the tail of a burst that this boot needs to see.
+static const uint32_t kTeePushPerPass = 16;     // matching lines handed to the kernel ring per pass
 static const uint32_t kTeeLineBytes = kVerdictTextBytes;   // a longer line is truncated, not split
 // What a kernel line has to contain before it is worth two block writes. Round176 grows this on
 // purpose: the tee used to spend the driver's 32 records, so every entry here cost a verdict line,

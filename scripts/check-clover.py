@@ -1515,9 +1515,11 @@ def check_board(errors: list) -> str:
     # drivers/CloverDsp says r183 -- because the tee on the card filters the shared "clover r"
     # prefix, not a round number. Round185 moves the log window to logdump and arms the rings from the
     # GPT walk, so the SDHCI driver carries its own r185 stamp for the arming line; round186, round187
-    # and round188 change no driver at all, so that stamp stays and only the menu moves.
-    if not board["payload"]["title"].startswith("clover r188:"):
-        errors.append('[payload] title is not "clover r188: ...": the menu would not name this round')
+    # and round188 change no driver at all. Round189 changes the driver only inside the tee's per-pass
+    # push budget, which prints nothing new and leaves the window geometry alone, so the r185 arming
+    # stamps still say what happened and only the menu moves.
+    if not board["payload"]["title"].startswith("clover r189:"):
+        errors.append('[payload] title is not "clover r189: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -1927,12 +1929,14 @@ def check_board(errors: list) -> str:
     # and never re-prints one: sdhciSay would IOLog the line straight back into the buffer it is
     # reading, and the tee would match its own echo forever. Hence ringPush, which fills a ring without
     # speaking: the tee's yield goes into round176's kernel ring, its own state lines into the driver's.
+    # Round189 doubles the per-pass push to 16: the r188 census (seen=1598 kept=580 throttled=694) says
+    # the per-pass cap, not the ring, was dropping the tail of a burst this boot has to see.
     if sdhci_r174 is not None:
         text = sdhci_r174.read_text()
         for needle in ("#include <sys/msgbuf.h>",
                        "struct msgbuf *buffer = msgbufp;",
                        "static const uint32_t kTeeScanPerPass = 4096;",
-                       "static const uint32_t kTeePushPerPass = 8;",
+                       "static const uint32_t kTeePushPerPass = 16;",
                        'static const char *const kTeeAllowlist[] = {',
                        '"clover r",',
                        '"cs_blob",',
@@ -2288,6 +2292,63 @@ def check_board(errors: list) -> str:
         for older in ("clover r187:", "clover r186:", "clover r185:"):
             if older in joined:
                 errors.append(f"{sys_probe2.name} adds a {older!r} line: its own r188 lines are the "
+                              "only new readings this round produces")
+
+    # Round189: the r188 frame closes both old questions and leaves one narrow one. keybagd's path is
+    # now spelled out -- there is no data-volume keybag, so its hard-coded fatal branch runs, and the
+    # reboot it substitutes for is denied by Protobox on IOPlatformDevice/auto-boot, which is where
+    # e00002e2 comes from. usermanagerd completes the earlyboot setup, loads the session table, sets
+    # the volume type and writes a 1020-byte bplist to fd 3, and that write is the last kernel line
+    # in the frame. Two defects bound the reading: every open_dprotected_np path line was empty
+    # because the probe took x[1] (that call's flags, 0x701) for the path pointer, and the entry
+    # budget ran out at 67.190 s so the last 13 s are heartbeat-only. Round189 fixes the register,
+    # logs the path and returned fd of every successful open for the two names, raises the entry and
+    # fail budgets to 4096/256, halves the heartbeat to 64, and adds the mach-trap return line so an
+    # entry without a matching return names the trap a task is parked in. Still log-only.
+    sys_probe3 = next((base / "patches/xnu-clover/zzzzz-clover-syswhy3.patch"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "patches/xnu-clover/zzzzz-clover-syswhy3.patch").is_file()), None)
+    if sys_probe3 is None:
+        errors.append("patches/xnu-clover/zzzzz-clover-syswhy3.patch is missing: the next frame "
+                      "would still show empty paths for the protected opens and would stop tracing "
+                      "at the 512th call")
+    else:
+        text = sys_probe3.read_text()
+        for needle in ("bsd/dev/arm/systemcalls.c", "osfmk/arm64/sleh.c",
+                       "#define CLOVER_SYS_WHY_ENTRY_LIMIT  4096",
+                       "#define CLOVER_SYS_WHY_FAIL_LIMIT   256",
+                       "#define CLOVER_SYS_WHY_HEARTBEAT    64",
+                       "#define CLOVER_SYS_WHY_OPEN_LIMIT   128",
+                       "#define CLOVER_SYS_WHY_MACHOUT_LIMIT 512",
+                       "return code == SYS_openat || code == SYS_openat_nocancel;",
+                       "clover_sys_why_path_arg(code, state)",
+                       '"clover r189: unix-open n=%d pid=%d tid=%lld comm=%s code=%d fd=%lld path=%s\\n"',
+                       '"clover r189: mach-out n=%d pid=%d tid=%lld comm=%s trap=%d ret=%d\\n"',
+                       "clover_sys_why_mach_out(trap_no, state);"):
+            if needle not in text:
+                errors.append(f"{sys_probe3.name} lacks {needle[:44]}...: without it the frame still "
+                              "cannot name the protected open's path, the writer's descriptor, or "
+                              "whether a mach trap came back")
+        added = [line for line in text.splitlines() if line.startswith("+") and not
+                 line.startswith("+++")]
+        removed = [line for line in text.splitlines() if line.startswith("-") and not
+                   line.startswith("---")]
+        if any("SYS_open_dprotected_np" in line and "return code ==" in line for line in added):
+            errors.append(f"{sys_probe3.name} still reads x[1] for SYS_open_dprotected_np: that is "
+                          "its flags (0x701), and the path line would come out empty again")
+        if text.find("mach_syscall(state);") > text.find("clover_sys_why_mach_out(trap_no, state);"):
+            errors.append(f"{sys_probe3.name} prints the mach return before the trap runs: the value "
+                          "read would not be the call's return")
+        if len(added) < 40:
+            errors.append(f"{sys_probe3.name} adds only {len(added)} lines: the open reader, the "
+                          "return reader, the register fix and the new limits do not fit in fewer")
+        if any("printf(" in line for line in removed):
+            errors.append(f"{sys_probe3.name} deletes a print: the old readings have to stay "
+                          "readable in the same frame")
+        joined = "\n".join(added)
+        for older in ("clover r187:", "clover r188:", "clover r186:"):
+            if older in joined:
+                errors.append(f"{sys_probe3.name} adds a {older!r} line: its own r189 lines are the "
                               "only new readings this round produces")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"

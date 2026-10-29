@@ -674,6 +674,27 @@ def check_sys_why2(kernel: bytes) -> bool:
     return ok
 
 
+def check_sys_why3(kernel: bytes) -> bool:
+    """Round189 closes the two defects the r188 frame exposed. Every open_dprotected_np path came out
+    empty because the probe read x[1] -- that call's flags, 0x701 -- where the path is x[0], and the
+    entry budget ended at 67.190 s, which left the 13 s before usermanagerd's last write unread. The
+    image has to carry the successful-open line with its returned fd, the mach-trap return line, and
+    the wider budgets behind them; a missing string means the next card read would again show calls
+    without their targets or their returns."""
+    label = "kernel.macho: open/mach-return probe linked"
+    found = {"unix-open": (b"clover r189: unix-open n=%d pid=%d tid=%lld comm=%s code=%d fd=%lld "
+                           b"path=%s\n") in kernel,
+             "mach-out": (b"clover r189: mach-out n=%d pid=%d tid=%lld comm=%s trap=%d ret=%d\n")
+             in kernel,
+             "kept-r188": b"clover r188: unix-path n=%d pid=%d tid=%lld comm=%s code=%d err=%d "
+                          b"path=%s\n" in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -1079,6 +1100,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_spawn_why(kernel)
         ok &= check_sys_why(kernel)
         ok &= check_sys_why2(kernel)
+        ok &= check_sys_why3(kernel)
     return 0 if ok else 1
 
 

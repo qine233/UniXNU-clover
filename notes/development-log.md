@@ -14465,3 +14465,133 @@ write 返回了（`ret=` 是多少就说明它写出去多少字节），墙在�
 第三眼看 19 条 `unix-path … err=2 path=` 是不是同一组路径、属于哪个 boot task 的资源——如果它们
 全是同一个目录前缀，那墙就从「某个调用没回来」变成「某个资源在卷上不存在」。
 
+## round188 读数（v0.5.48 实机，2026-10-29）：1020 字节的会话表真的写进 fd 3，而 12 条受保护 open 的路径全是空的
+
+### 这一帧把「write 没回来」排除了
+
+r187 的停点是一句 `write_nocancel(fd=1, …)` 之后二十秒没有新行，两种解释都成立。r188 的
+write/wrote 成对行直接结掉它：`unix-wrote` 27 条，每一次 write 进入后面都跟着返回，`ret=` 与
+`len=` 逐条相等、`err=0`。usermanagerd（pid 12）从 68.17 s 的 UMD_INIT 起一路走完：
+
+```
+[   68.173280]: clover r188: unix-write n=22 pid=12 tid=232 comm=usermanagerd code=397 fd=1 len=38 txt=UMD_INIT: Device Configuration Type:0.
+[   68.489724]: clover r188: unix-write n=23 pid=12 tid=232 comm=usermanagerd code=397 fd=1 len=28 txt=UMD_INIT: BOOTEDUSER is:501.
+[   78.504119]: clover r188: unix-write n=51 pid=12 tid=232 comm=usermanagerd code=397 fd=1 len=36 txt=UMD_INIT: FOUND NO LRU TABLE UIDS:0.
+[   78.841130]: clover r188: unix-write n=52 pid=12 tid=232 comm=usermanagerd code=397 fd=1 len=54 txt=UMD_INIT: FOUND NO VOLUMETYPE, setting up volume type.
+[   79.239290]: clover r188: unix-write n=53 pid=12 tid=232 comm=usermanagerd code=397 fd=1 len=54 txt=UMD_INIT: Set the new volume type to APFSNativeDevice.
+[   79.618459]: clover r188: unix-write n=54 pid=12 tid=232 comm=usermanagerd code=397 fd=1 len=32 txt=UMD_INIT: SAVING SESSION TODISK.
+[   79.992742]: clover r188: unix-write n=55 pid=12 tid=232 comm=usermanagerd code=397 fd=1 len=32 txt=UMD_INIT: SESSION TABLE TO BLOB.
+[   80.412500]: clover r188: unix-write n=56 pid=12 tid=232 comm=usermanagerd code=397 fd=1 len=42 txt=UMD_INIT: NOTHING TO SAVE IN LRU UID LIST.
+[   80.799902]: clover r188: unix-write n=57 pid=12 tid=232 comm=usermanagerd code=4 fd=3 len=1020 txt=bplist00.........VNUMENTTBLOB\DEVICECONFIGZBOOTEDUSER..O...bplis
+[   80.907886]: clover r188: unix-wrote n=57 pid=12 tid=232 comm=usermanagerd code=4 fd=3 ret=1020 err=0
+```
+
+`code=4` 是 `write`；`len=1020`、`ret=1020`、`err=0` 说明那 1020 字节的 bplist（`VNUMENTTBLOB`、
+`DEVICECONFIG`、`BOOTEDUSER` 三个键）完整写进了 **fd 3**。这是整个内核环的最后一行：此后再到
+300 s 死线复位，环里没有第二行——没有心跳，也没有任何调用。墙因此不是「write 挂住」，而是
+「会话表写完之后这个进程再没有任何内核活动」。
+
+### 12 条受保护 open 的路径全空，因为读错了寄存器
+
+`unix-path` 54 条，其中 `code=216`（`open_dprotected_np`）12 条，每一条都是 `err=2 path=` 后面
+空无一物，时间点 78.458–80.742 s 紧贴上面每一条 UMD_INIT：usermanagerd 在找某个文件，找不到，然后
+往下一步走。三次「没有 VOLUMETYPE / 没有 LRU 表」都发生在这 12 次落空的查找之后，所以这块空白是
+这一帧最贵的一处。
+
+原因在 r188 自己身上：`clover_sys_why_fd_code()` 把 `open_dprotected_np` 归进了 openat 一族，路径
+因此取 `x[1]`。openat 的 `x[1]` 是路径，`open_dprotected_np` 的 `x[1]` 是 **flags**，那一帧里是
+`0x701`——一个解引用必失败的整数，`copyinstr` 返回错，打印空串。这一族里只有 `openat` 与
+`openat_nocancel` 把路径放在 `x[1]`，`open`、`open_nocancel`、`open_dprotected_np` 都在 `x[0]`。
+
+### keybagd：连 r187 那条 exit 也没有了
+
+```
+[   53.233575]: Protobox: keybagd(11) deny(1) iokit-set-properties iokit-class:IOPlatformDevice property:auto-boot
+[   53.267379]: clover r188: unix-write n=14 pid=11 tid=231 comm=keybagd code=397 fd=1 len=40 txt=MKB_INIT: Could not save value:e00002e2.
+[   53.335521]: clover r188: unix-wrote n=14 pid=11 tid=231 comm=keybagd code=397 fd=1 ret=40 err=0
+[   53.436996]: clover r188: unix-write n=15 pid=11 tid=231 comm=keybagd code=397 fd=1 len=23 txt=MKB_INIT: Rebooting....
+[   53.501606]: clover r188: unix-wrote n=15 pid=11 tid=231 comm=keybagd code=397 fd=1 ret=23 err=0
+```
+
+`e00002e2` 是 `kIOReturnNotPermitted`：`auto-boot` 这个属性被 Protobox 拦下。它说 `Rebooting....`
+之后既没有 `reboot(2)`（r187 那一帧有 `code=55 err=1` 被拒），也没有 exit 行——这一支比 r187 更早
+地消失在环外。它要的是 system bag（`/private/var/keybags/systembag.kb` 不存在，
+`Failed to validate keybag file: -1`、`Can't load secure keybag Object: -8`），这条路通向「data 卷
+还不是真的」那一格，仍然不是挡住桌面的那一格。
+
+### 三处缺口 → r189 的三件事
+
+1. **fd 3 是哪个文件**：r188 只打印失败的 open，成功的 open 没有行。要指名 fd 3，必须在成功返回
+   时把 fd 与路径一起打印。
+2. **mach 那侧只有入口**：`mach-in` 打在 `mach_syscall()` 之前，没有返回行，「mach 调用没回来」与
+   「回来了但之后没有 unix 调用」就分不开。
+3. **预算不够**：entry 512 在 67.190819 打满（`unix-in n=512`），71.667986 是 `n=640` 的心跳，此后
+   13 秒的进入全部不可见；fail 128 更早就用尽。tee 统计 `seen=1598 kept=580 throttled=694 lap=4`
+   说明每趟 8 行的放行量本身也在丢尾巴。
+
+## round189（v0.5.49）：把受保护 open 的路径读对，把成功的 open 和 mach 的返回也写出来
+
+### 只动探针，排期照旧不动
+
+三件仪器（触摸 / PMIC 轨 / ADSP）仍在 boot args 之外，`clover-unattended=300` 仍在最后一行，
+驱动代码只改了一处常量（下一节）。探针这一轮只做三件事，全部对应上一帧的缺口：
+
+- **读对寄存器**：`clover_sys_why_path_arg()` 取代原来的三元表达式，只有 `openat` 与
+  `openat_nocancel` 取 `x[1]`，其余取 `x[0]`。路径缓冲从 128 字节涨到 256——帧上最长的一条路径
+  94 字节，128 虽然够，但 `copyinstr` 截断与失败打印的是同一种空串，留一倍余量更省一次冷刷。
+- **成功的 open 也打印**：`unix-open n= pid= tid= comm= code= fd= path=`，预算 128 条。fd 取的是
+  `uthread->uu_rval[0]`，也就是这次 open 真正返回给用户态的描述符。这一行是「fd 3 是哪个文件」的
+  判据，也是「那 12 次 `code=216` 之后紧接着打开了什么」的判据。
+- **mach 的返回**：`clover_sys_why_mach_out()` 在 `mach_syscall(state)` 之后由 `sleh.c` 调用，
+  打印 `trap=` 与 `ret=`（`saved_state64(state)->x[0]` 就是 kern_return_t）。预算 512 条、之后每
+  64 条一次心跳。
+
+预算同步放大：entry 4096、fail 256、心跳 64（原来是 512 / 128 / 128）。r188 的 entry 从 67.190819
+到死线整段时间是盲的，而下一个问题（fd 3 打开之后还做了什么）恰好落在那里，所以先把阅读窗口拉过
+死线，再谈收窄。
+
+### 驱动侧：tee 每趟放行 8 → 16
+
+`kTeePushPerPass` 改成 16。r188 的 `throttled=694` 对 `kept=580`，丢掉的比留下的多，而丢的是突发
+尾巴——正是「打开 fd 3 那一刻」前后的行。这个常量只影响把 msgbuf 搬进 logfs 环的节流，不改任何
+协议或时序；r185 上膛窗口的判据（只看 GPT、窗口在 logdump）一个字没动。
+
+### 构建：补丁链的反向顺序，以及构建树其实不在 `~/UniXNU/.cache/xnu-work`
+
+r189 的补丁改的是 r187 补丁新增的行，r188 的块又落在同一段上下文里。链条的规则是
+`build-xnu-4k-baseline.sh` 先按 LATE 列表反向拆最新的几层，再按文件名顺序正向重放；只把 syswhy3
+放进 LATE 列表不够——r187 的块被 r189 改过之后已经不可逆，循环走到它时 `apply --reverse --check`
+失败，构建停在 `bsd/dev/arm/systemcalls.c:79`。**LATE 列表必须把 syswhy3 与 syswhy2 一起反向**，
+顺序 3 再 2，然后由名字顺序把三个都重放。
+
+另一个坑值得记下来：这轮改完 `~/UniXNU/.cache/xnu-work` 后构建照样报同一个错，因为内核构建实际编译
+的是 `out/clover/tree/.cache/xnu-work`——`scripts/unixnu/tree.py` 把 `patches/` 做成符号链接、把
+`scripts/` 按大小与 mtime 复制，但 `out/clover/tree/.cache/xnu-work` 是另一份独立的 d8b8029 克隆。
+两个目录都要改，或者只改后者再让树同步。
+
+### 构建与闸门
+
+- 内核 `45e591da…`（原始构建输出）→ 归一化 `6bc257d1…`（968 个 object 戳全清）→ AMFI
+  `6b94eb85…`，两刀仍落在 file `0x1aad0e4` / `0x1aad16c`（与 round186–188 同址，虚拟地址未动）。
+- payload 卷内 kernel `8ff9b930…`（52195328 字节，入口探针 6856 字节 / 37 段）、`unixnu.toml`
+  `2b585316…`、ADT `616f48bf…`（13516 字节）、trustcache `7c369ce0…`、`scratch-data.img`
+  `614b8356…`。`boot.img` `196b284f…` 与 round183–188 逐字节相同——本轮没动固件，冷刷只写 cache。
+- **payload 容器不是逐字节可复现的**：同一内核连做两次 `unixnu build payload`，两次镜像差 66 字节，
+  其中 64 字节是 `make-clover-adt.py` 每次构建重新抽取的 `/chosen/random-seed`，另 2 字节在 GPT 区
+  与它同源；卷内 kernel 两次都是 `8ff9b930…`。r177 建立的是**内核**可复现，payload 这一层从未有过
+  这个性质，读校验和时要把两者分开看。本轮归档的 payload 是 `78cfff67…`。
+- `check-clover.py` 绿（`clover r189:` 标题、syswhy3 补丁在场、五条新针 + 格式串、只加日志、
+  open_dprotected_np 不得再读 `x[1]`、mach-out 不得打在 `mach_syscall` 之前、旧轮串只查新增行、
+  tee 预算 16）；`verify-clover-payload.py` 35 条 OK，新增 `open/mach-return probe linked OK`
+  （`unix-open` 在场、`mach-out` 在场、r188 的 `unix-path` 保留）；五道宿主自测全 PASS。
+
+### 下一帧要读什么
+
+冷刷只写 cache，跑无人值守脚本读回 logdump。第一眼看 `unix-wrote … fd=3 ret=1020` 之前最近一条
+`unix-open … fd=3`：它给出的路径就是会话表落在哪个文件上。第二眼看那 12 条 `code=216` 现在打出了
+什么路径（`err=2` 是否仍然、是不是同一个目录前缀），以及它们之后有没有一条成功的 `unix-open`
+指向同一个文件。第三眼看 usermanagerd 最后一条 `mach-in`（`trap=-47`）后面有没有对应的
+`mach-out`：有，说明 mach 调用返回了、墙在用户态的下一次等待；没有，墙就在那次 mach 调用里面。
+心跳在这轮从 128 减到 64，`n=4096` 之前每一百来条就有一行，可以把「预算用尽的沉默」和「进程停住
+的沉默」分开。
+

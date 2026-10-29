@@ -1,0 +1,170 @@
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -89,11 +89,15 @@
+  * reading: the last one before the silence names the call that never returned,
+  * and a heartbeat after the budget says the process is still making calls.
+  * Nothing is changed -- no argument, no return value, no errno -- and the budget
+- * keeps one boot task from filling the ring this is read from.
++ * keeps one boot task from filling the ring this is read from.  Round189 raises
++ * the entry and fail budgets (512/128 -> 4096/256) and halves the heartbeat
++ * (128 -> 64): the r188 frame shows the probes were still working when the entry
++ * budget ran out at 67.190 s, so what was missing past that point was reading
++ * room, not a different probe.
+  */
+-#define CLOVER_SYS_WHY_ENTRY_LIMIT  512
+-#define CLOVER_SYS_WHY_FAIL_LIMIT   128
+-#define CLOVER_SYS_WHY_HEARTBEAT    128
++#define CLOVER_SYS_WHY_ENTRY_LIMIT  4096
++#define CLOVER_SYS_WHY_FAIL_LIMIT   256
++#define CLOVER_SYS_WHY_HEARTBEAT    64
+ 
+ static int clover_sys_why_unix_entries;
+ static int clover_sys_why_unix_fails;
+@@ -120,9 +124,13 @@
+ #define CLOVER_SYS_WHY_PATH_LIMIT   320
+ #define CLOVER_SYS_WHY_WRITE_LIMIT  96
+ #define CLOVER_SYS_WHY_TEXT_BYTES   64
++#define CLOVER_SYS_WHY_OPEN_LIMIT   128
++#define CLOVER_SYS_WHY_MACHOUT_LIMIT 512
+ 
+ static int clover_sys_why_paths;
+ static int clover_sys_why_writes;
++static int clover_sys_why_opens;
++static int clover_sys_why_mach_outs;
+ 
+ static int
+ clover_sys_why_path_code(int code)
+@@ -142,12 +150,41 @@
+ 	}
+ }
+ 
++/*
++ * Clover (round189): round188's path lines for SYS_open_dprotected_np all came
++ * out empty because that call keeps its path in x[0], not x[1]; the 0x701 that
++ * was read as a pointer is its flags argument.  The path is now taken from the
++ * argument the ABI actually uses, the buffer grows to cover the longest path
++ * seen (94 bytes), and a successful open is logged too, with its returned fd,
++ * so the descriptor usermanagerd wrote its session table to can be named.
++ */
+ static int
+ clover_sys_why_fd_code(int code)
+ {
+-	return code == SYS_openat || code == SYS_openat_nocancel || code == SYS_open_dprotected_np;
++	return code == SYS_openat || code == SYS_openat_nocancel;
+ }
+ 
++static int
++clover_sys_why_open_code(int code)
++{
++	switch (code) {
++	case SYS_open:
++	case SYS_open_nocancel:
++	case SYS_openat:
++	case SYS_openat_nocancel:
++	case SYS_open_dprotected_np:
++		return 1;
++	default:
++		return 0;
++	}
++}
++
++static user_addr_t
++clover_sys_why_path_arg(int code, arm_saved_state_t *state)
++{
++	return (user_addr_t)saved_state64(state)->x[clover_sys_why_fd_code(code) ? 1 : 0];
++}
++
+ static void
+ clover_sys_why_text(char *dst, user_addr_t src, size_t srclen)
+ {
+@@ -187,6 +224,30 @@
+ }
+ 
+ /*
++ * Clover (round189): a mach entry line without a matching return says the
++ * process is parked inside the trap; with this line the pair brackets it, and
++ * mach_msg2_trap (-47) is the one that waits.  mach_syscall() leaves its
++ * kern_return_t in x[0], so the return is read from there.
++ */
++void
++clover_sys_why_mach_out(int trap_no, arm_saved_state_t *state)
++{
++	struct proc *p = get_bsdthreadtask_info(current_thread());
++
++	if (p == NULL || !clover_sys_why_watched(p->p_comm)) {
++		return;
++	}
++	clover_sys_why_mach_outs++;
++	if (clover_sys_why_mach_outs > CLOVER_SYS_WHY_MACHOUT_LIMIT &&
++	    (clover_sys_why_mach_outs % CLOVER_SYS_WHY_HEARTBEAT) != 0) {
++		return;
++	}
++	printf("clover r189: mach-out n=%d pid=%d tid=%lld comm=%s trap=%d ret=%d\n",
++	    clover_sys_why_mach_outs, proc_pid(p), thread_tid(current_thread()), p->p_comm,
++	    trap_no, (int)saved_state64(state)->x[0]);
++}
++
++/*
+  * Function:	unix_syscall
+  *
+  * Inputs:	regs	- pointer to Process Control Block
+@@ -327,16 +388,12 @@
+ 			    code, error, (unsigned long)saved_state64(state)->x[0]);
+ 		}
+ 		if (clover_sys_why_path_code(code)) {
+-			char path[128];
+-			user_addr_t upath = (user_addr_t)saved_state64(state)->x[0];
++			char path[256];
+ 			size_t len = 0;
+ 
+ 			clover_sys_why_paths++;
+ 			if (clover_sys_why_paths <= CLOVER_SYS_WHY_PATH_LIMIT) {
+-				if (clover_sys_why_fd_code(code)) {
+-					upath = (user_addr_t)saved_state64(state)->x[1];
+-				}
+-				if (copyinstr(upath, path, sizeof(path), &len) != 0) {
++				if (copyinstr(clover_sys_why_path_arg(code, state), path, sizeof(path), &len) != 0) {
+ 					path[0] = '\0';
+ 				}
+ 				printf("clover r188: unix-path n=%d pid=%d tid=%lld comm=%s code=%d "
+@@ -351,6 +408,20 @@
+ 		printf("clover r188: unix-wrote n=%d pid=%d tid=%lld comm=%s code=%d fd=%d ret=%lld err=%d\n",
+ 		    clover_sys_why_writes, pid, thread_tid(current_thread()), proc->p_comm, code,
+ 		    (int)saved_state64(state)->x[0], (long long)uthread->uu_rval[0], error);
++	}
++	if (error == 0 && clover_sys_why_open_code(code) && clover_sys_why_watched(proc->p_comm)) {
++		char path[256];
++		size_t len = 0;
++
++		clover_sys_why_opens++;
++		if (clover_sys_why_opens <= CLOVER_SYS_WHY_OPEN_LIMIT) {
++			if (copyinstr(clover_sys_why_path_arg(code, state), path, sizeof(path), &len) != 0) {
++				path[0] = '\0';
++			}
++			printf("clover r189: unix-open n=%d pid=%d tid=%lld comm=%s code=%d fd=%lld path=%s\n",
++			    clover_sys_why_opens, pid, thread_tid(current_thread()), proc->p_comm, code,
++			    (long long)uthread->uu_rval[0], path);
++		}
+ 	}
+ 
+ 	unix_syscall_kprintf("code %d, error %d, results %x, %x (pid %d - %s, tid %lld)\n", code, error,
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -194,6 +194,9 @@
+ /* Clover (round187): the mach-trap half of the syscall-entry probe; the body
+  * lives in bsd/dev/arm/systemcalls.c, where the process name is reachable. */
+ extern void clover_sys_why_mach(int trap_no, arm_saved_state_t *state);
++/* Clover (round189): the return half of the same probe, so an entry without a
++ * matching return names the trap the process is parked in. */
++extern void clover_sys_why_mach_out(int trap_no, arm_saved_state_t *state);
+ 
+ struct proc;
+ 
+@@ -1926,6 +1929,7 @@
+ 		thread->syscalls_mach++;
+ 		clover_sys_why_mach(trap_no, state);
+ 		mach_syscall(state);
++		clover_sys_why_mach_out(trap_no, state);
+ 	} else {
+ 		/* Counting perhaps better in the handler, but this is how it's been done */
+ 		thread->syscalls_unix++;
