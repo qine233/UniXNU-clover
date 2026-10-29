@@ -2945,6 +2945,10 @@ def check_board(errors: list) -> str:
          "--allow-misc-bcb",
          "the BCB write into misc would happen without declared consent"),
         ("scripts/run-clover-unattended.sh",
+         "count_records()",
+         "a ring that counted zero would be captured as two lines and every numeric test "
+         "on the decoded counts would fail on an empty ring"),
+        ("scripts/run-clover-unattended.sh",
          "read-clover-log.py",
          "the dump would never be decoded"),
         ("scripts/read-clover-log.py",

@@ -316,16 +316,25 @@ decoder="$(cd "$(dirname "$0")" && pwd)/read-clover-log.py"
   echo "== kernel-log ring (lines the tee copied out of msgbuf, sectors 192..1215)"
   python3 "$decoder" --tee "$OUT" 2>/dev/null || echo "    no kernel-log records: this boot predates round176"
 } | tee "$OUT.txt"
-count=$(python3 "$decoder" --count "$OUT" 2>/dev/null || echo 0)
-verdicts=$(python3 "$decoder" --verdict --count "$OUT" 2>/dev/null || echo 0)
+# The decoder exits 1 when it counts zero records (an empty ring), so "|| echo 0" would
+# capture "0\n0" whenever a ring is empty and every numeric test below would fail on it --
+# found by the round193 leg test, whose kernel ring was full and whose driver filter was
+# correctly empty.
+count_records() {
+  local n
+  n=$(python3 "$decoder" "$@" 2>/dev/null || true)
+  printf '%s' "${n:-0}"
+}
+count=$(count_records --count "$OUT")
+verdicts=$(count_records --verdict --count "$OUT")
 # Round175 counts the kernel's own lines separately, because zero of them means two different things
 # and the ring cannot tell them apart on its own: the tee never armed (no verdict lines either), or it
 # armed and nothing in msgbuf matched the allowlist this boot.
-tee_lines=$(python3 "$decoder" --tee --count "$OUT" 2>/dev/null || echo 0)
+tee_lines=$(count_records --tee --count "$OUT")
 # Round176's invariant: the tee drops every line that starts with the driver's name, so the kernel
 # ring has exactly one producer in it. A nonzero count here means the tee is copying its own readings
 # out of msgbuf -- which it can only do if a line the driver said reached the kernel log at all.
-echo_lines=$(python3 "$decoder" --tee --driver --count "$OUT" 2>/dev/null || echo 0)
+echo_lines=$(count_records --tee --driver --count "$OUT")
 say "decoded: $OUT.txt ($count report record(s), $verdicts driver verdict line(s), $tee_lines kernel log line(s))"
 if [ "$verdicts" -gt 0 ] && [ "$tee_lines" = 0 ]; then
   warn "the ring armed but brought no kernel lines: the tee ran and msgbuf held nothing it keeps"
