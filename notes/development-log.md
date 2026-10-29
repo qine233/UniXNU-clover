@@ -15215,3 +15215,75 @@ verdict 环尾是 `CloverSdhci r195: r153 probe lines capped at 24` 与
 在哪个缓存文件、哪个符号的边界上。r199 那一帧 SpringBoard 的 PC 是 `0x1bdc472ec`，
 本帧是 `0x1ba17b2ec`，两次差 `0x3ac0000`；r199 没有记录 `start=`，所以现在分不清
 「共享缓存自身换了 slide」和「换了陷阱点」——下一帧的 `start=` 会直接回答。
+
+## round201（v0.5.62）：SpringBoard 的 SIGTRAP 落到 FBSDisplayMonitor 的「找不到主 CADisplay」
+
+r200 把三类陷阱换成了不随 ASLR 变的 `foff`，但宿主上没有同名构建的缓存可符号化。这一轮把
+iPadOS 17.7.11（21H461）恢复镜像里的 dyld 共享缓存取出来，用探针带回来的 `code=` 八字在
+缓存里自证偏移，再把地址落到镜像、函数和源码里的格式串上。结论不是「跳错了」，而是
+**SpringBoard 主动走到了一条致命错误路径**：FrontBoardServices 的 `FBSDisplayMonitor.m`
+找不到主 CADisplay，记完日志后 `brk #0`。
+
+### `foff` 的真实语义
+
+`foff = VME_OFFSET(entry) + (pc - vme_start)`，而共享缓存区域在进程里是一个从
+`0x180000000` 起、`0x208400000` 止的条目，`VME_OFFSET == 0`。所以
+**`foff = pc - 0x180000000`，它是共享区偏移，不是文件偏移**。r200 称为「文件偏移」是错的。
+
+缓存文件里的 Mach-O 头地址是**未滑动**的布局；同一帧里各分缓存的内容按本 boot 的 slide
+摆进共享区。SpringBoard 的八字唯一命中 `dyld_shared_cache_arm64.09` 的文件偏移
+`0x62af2ec`，经该分缓存自己的 mapping 表换算出未滑动 vmaddr `0x19f3df2ec`；进程 pc 是
+`0x1ba17b2ec`，两者差 `0x1ad80000`——这就是本帧的 slide。由此：
+
+- `foff` 在同一启动内跨进程稳定（同一帧所有进程共用一个 slide），**跨启动会变**；
+  r199 与 r200 的 pc 差 `0x3ac0000` 就是两次启动的 slide 不同，而不是换了陷阱点。
+- 宿主定位不能把 `foff` 当文件偏移用，必须先用 `code=` 八字自证，再按分缓存 mapping
+  换算到 vmaddr。
+
+### 读数
+
+`scripts/decode-clover-cache-offset.py`（本轮重写）对两处陷阱的输出：
+
+| comm | 镜像 | `__TEXT` | 镜像内偏移 | 函数起点 | 下一个函数起点 |
+| --- | --- | --- | --- | --- | --- |
+| SpringBoard | `FrontBoardServices` | `0x19f3c1000+0xb7000` | `0x1e2ec` | `0x19f3dee70`（+`0x47c`） | `0x19f3df3cc` |
+| liveactivitiesd | `TeaDB` / `SessionSyncEngine`（八字两处都命中） | — | — | 恰在函数尾 | pc+4 |
+
+SpringBoard 那个函数在宿主上反汇编出来是四个并列的致命块，每块形如：
+
+```
+build message (descriptor 0x1e7a9bf28 + 0x20*k)
+bl  log
+bl  ...          ; 报错/托管对象
+brk #0           ; __builtin_unreachable
+brk #1
+```
+
+`pc` 所在的块引用描述符 `0x1e7a9bf68`，记录里的 C 串是
+**`failed to find the main CADisplay`**（`0x19f453ecc`，长 `0x21`），下一条记录是
+**`failed to initialize mainDisplay source -> mainDisplay=%@`**（`0x19f453eee`，长 `0x39`）。
+前一条 `bl` 的返回地址就是 `pc`，所以 `lr == pc` 不是「跳错」，而是**报错函数返回后落到
+`brk #0`**——Apple 在这里用日志 + trap 表示不可继续。
+
+也就是说：**SpringBoard 的 SIGTRAP 是「没有主显示器」的下游症状**，根因是显示栈没交到
+用户态，和 README 表里的第 2 项是同一件事。修 SpringBoard 不能靠改 FrontBoardServices，
+必须让 `IOMobileFramebufferLegacy` attach + start，让 backboardd 有可枚举的显示器。
+
+liveactivitiesd 的八字同时命中 TeaDB 与 SessionSyncEngine 两个 Swift 框架，且都落在
+`ret` 之后的函数尾 `brk #1` 填充上，属于通用尾桩，暂不作为根因追。
+
+### 工具
+
+`scripts/decode-clover-cache-offset.py` 现在的契约：
+
+- `--foff` 按共享区偏移解释，`--code` 八字先在全部 `dyld_shared_cache_arm64*` 里找，
+  多处命中全部列出（拒绝猜）；
+- `--brk` 用 BRK 立即数（编码在 `word >> 5`）挑出哪一条是 pc；
+- 函数起点与导出符号从 `.dyldlinkedit` 分缓存里读：`LC_FUNCTION_STARTS` /
+  `LC_DYLD_EXPORTS_TRIE` 的 data offset 是**该分缓存文件内的偏移**，不是镜像内偏移；
+- 命中失败、链接信息读不动时退出码非零。
+
+### 下一步
+
+r202 起转到显示：把 phase 1 之后的 `IOMobileFramebufferLegacy` 补到 attach + start，
+先让 backboardd 枚举出一个显示器，再看 SpringBoard 是否还停在同一条致命路径。

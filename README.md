@@ -6,21 +6,21 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 
 现状一句话：**引导链已经通到 SpringBoard**——XNU 起来、OS/SystemOS/Data 三个卷全挂、
 launchd 把守护进程拉起来、SpringBoard 每次 exec 后 0.3–0.5 秒就崩（pid 反复重拉，末帧停在
-`t=7–14 s`）。桌面还没出现，
-缺的是下面六件事，前两件是硬门槛。
+`t=7–14 s`）。r201 已把这次崩解到 **`FBSDisplayMonitor` 找不到主 CADisplay**，也就是缺
+下面第 2 项的显示栈。桌面还没出现，缺的是这六件事。
 
 ## 距离 iOS 桌面还差什么
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 自己退出** | 每次 exec 后 0.3–0.5 s 以 `SIGTRAP` 死。r199 的 `ubrk` 定成 `brk #0`、`pc == lr`，落在 dyld 共享缓存里；r200 的 `ubrk2` 把地址换算成不随 ASLR 变的文件偏移 **`foff=0x3a17b2ec`**（映射 `0x180000000–0x208400000`），桩前三条 `bl`、桩体 `d4200000 d4200020` | 认出这个桩：读该 `foff` 前后的 Mach-O 结构与符号。同一帧 `liveactivitiesd` 停在 `foff=0x5c6924f8`（`ret` 后紧跟 `brk #1`，像一次落错地址的返回） |
+| 1 | **SpringBoard 自己退出** | 每次 exec 后 0.3–0.5 s 以 `SIGTRAP` 死。r201 用同 build（21H461）的 dyld 共享缓存把 r200 的 `foff=0x3a17b2ec` 自证到 `FrontBoardServices`（缓存 vmaddr `0x19f3df2ec`、本帧 slide `0x1ad80000`）：`FBSDisplayMonitor.m` 四个并列致命块之一，引用串是 **`failed to find the main CADisplay`**，记完日志后 `brk #0`；`lr == pc` 是报错函数返回后落到 trap，不是跳错 | 根因是显示栈没交到用户态：转到第 2 项，`IOMobileFramebufferLegacy` attach + start，让 backboardd 枚举出主显示器 |
 | 2 | **屏还没交给内核** | 原始 `IOMobileFramebufferLegacy` 已在自己内核里资格化、真档案链接进镜像，但只到 phase 1：登记类、构造实例、报 console 几何；**不 attach、不 start、不 present** | 资格化剩下七个抽象叶，attach + start + 第一次 present，用色带验几何 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 5 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |
 | 6 | watchdogd 每次起就崩 | 自身可执行文件里 `brk #1`（`IOWatchdog` 服务在板上不存在）。r193 的 `panic_on_crash_disabled=1` 已把它从「致命」摘掉，所以它只是噪声 | 写一个最小 `IOWatchdog` 服务，或让 plist 不再要求它 |
 
-1 决定桌面能不能留下，2 决定桌面看不看得见；3–6 是之后要补的板级驱动。
+1 与 2 是一条链：没有屏 → 没有主 CADisplay → SpringBoard 主动 trap；3–6 是之后要补的板级驱动。
 
 ## 已完成（都有真机读数）
 
