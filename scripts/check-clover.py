@@ -1763,8 +1763,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r213:"):
-        errors.append('[payload] title is not "clover r213: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r215:"):
+        errors.append('[payload] title is not "clover r215: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -1943,7 +1943,26 @@ def check_board(errors: list) -> str:
                        "static const uint32_t kStageCommit = 11;",
                        "CloverSdhci r213: guard wait gave up after %llu ms owner=%u stage=%u",
                        "CloverSdhci r213: guard stuck stage=%u dir=%u lba=%u blocks=%u pid=%u "
-                       "held=%llu ms"):
+                       "held=%llu ms",
+                       "static const uint32_t kStageReinit = 12;",
+                       "static CardReinit reinitializeCard (void);",
+                       "const CardReinit re = reinitializeCard ();",
+                       "write8 (SDHCI_POWER_CONTROL, 0x00);",
+                       "static const char kStuck[] __attribute__((used)) = \"clover-stuck=\";",
+                       # Round215: the request brings the card back itself. A busy card keeps its
+                       # own answer (CMD13 responses) and is left alone; only a card that stops
+                       # answering, or one whose data circuit never releases, powers down.
+                       "static volatile uint32_t gIdleFailReason = 0;",
+                       "static const uint32_t kIdleSilent = 2;",
+                       "static const uint32_t kCardRecoverCap = 16;",
+                       "static const uint64_t kCardRecoverCooldownMs = 15000;",
+                       "static bool cardRecoverHeld (const char *why, uint32_t detail);",
+                       "static bool cardRecoverHeld (const char *why, uint32_t detail)",
+                       "__atomic_add_fetch (&gFlightStuck, 1u, __ATOMIC_RELAXED);",
+                       "if (reason != kIdleBusy && cardRecoverHeld (\"idle\", reason)) {",
+                       "(void) cardRecoverHeld (\"stuck\", stage);",
+                       "CloverSdhci r215: card recover why=%s d=%u n=%u stop=%u rst=%u pwr=%u clk=%u ",
+                       "clkst=%u t=%u cmd0=%u cmd1=%u ready=%u cmd2=%u cmd3=%u cmd7=%u hs=%u bw=%u ok=%u\\n"):
             if needle not in text:
                 errors.append(f"{sdhci.name} lacks {needle[:40]}...: r171's batch verdict, cache "
                               "commit or host serialization would be incomplete")
@@ -2378,6 +2397,7 @@ def check_board(errors: list) -> str:
                        "BOOT_OFFSET = KERNEL_OFFSET + 2 * KERNEL_SLOTS",
                        "BOOT_KIND = 24", "PROBE_KIND = 25",
                        '24: "boot-24", 25: "probe-25"',
+                       '12: "reinit"',
                        "def decode_boot(data, first_lba)",
                        '"--boot"', '"--probe"',
                        'struct.unpack_from("<10I", block)',
@@ -2417,7 +2437,7 @@ def check_board(errors: list) -> str:
     if unattended is not None:
         text = unattended.read_text()
         for needle in ("bs=512 count=1217", "623104", "--verdict", "--probe", "--boot",
-                       "verdict line(s)"):
+                       "verdict line(s)", "clover-misc-1024.bin", "misc block 1"):
             if needle not in text:
                 errors.append(f"{unattended.name} lacks {needle[:32]}...: the dd would stop short of one "
                               "of the two rings and that ring would never be read")
@@ -2783,8 +2803,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r213:"):
-        errors.append('[payload] title is not "clover r213: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r215:"):
+        errors.append('[payload] title is not "clover r215: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

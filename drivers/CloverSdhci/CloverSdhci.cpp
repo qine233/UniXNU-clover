@@ -495,16 +495,35 @@ static const uint32_t kStageTail = 8;
 static const uint32_t kStageTee = 9;
 static const uint32_t kStageFlush = 10;
 static const uint32_t kStageCommit = 11;
+// Round214: the watchdog is inside reinitializeCard(). A frame that ends here says the recovery
+// itself did not finish, which is a different reading from one that ends in the request it took
+// the card back from.
+static const uint32_t kStageReinit = 12;
 static volatile uint32_t gFlightStage = kStageIdle;
 static volatile uint64_t gFlightStageSince = 0;
 static volatile uint32_t gFlightStageDir = 0;
 static volatile uint32_t gFlightStageLba = 0;
 static volatile uint32_t gFlightStageBlocks = 0;
 static volatile uint32_t gFlightStagePid = 0;
-static volatile uint32_t gFlightStuck = 0;        // stage watchdog trips this boot
+static volatile uint32_t gFlightStuck = 0;        // recovery attempts this boot, any trigger
 static volatile uint32_t gFlightStuckStage = 0;   // the stage the last trip found
-static volatile uint32_t gFlightRecovered = 0;    // controller recoveries done by the watchdog
+static volatile uint32_t gFlightRecovered = 0;    // recoveries that brought the card back
 static volatile uint32_t gFlightSteals = 0;       // tickets taken back from a stuck holder
+// Round215: r214's frame ended the 75 s watchdog as a theory -- a request's own deadline always ends
+// the hold first, so the beat never saw a stage that old. The card is what goes quiet (the last
+// write lands at 408 s and TWRP then boots from the same card, so the wedge dies with a power
+// cycle). So the trigger moves to the request that met the silence: this records why the last card
+// operation failed (0 ok, 1 DATA_INHIBIT never dropped, 2 CMD13 never answered, 3 card busy past
+// the bound), and a recovery is rate-limited so a card that is really gone costs one ladder per
+// cooldown instead of one per request.
+static volatile uint32_t gIdleFailReason = 0;
+static const uint32_t kIdleOk = 0;
+static const uint32_t kIdleInhibit = 1;
+static const uint32_t kIdleSilent = 2;
+static const uint32_t kIdleBusy = 3;
+static const uint32_t kCardRecoverCap = 16;
+static const uint64_t kCardRecoverCooldownMs = 15000;
+static uint64_t gCardRecoverLastTick = 0;
 static uint32_t gFlightCurLba = 0;
 static uint32_t gFlightCurPid = 0;
 static uint32_t gFlightCurComm0 = 0;
@@ -1993,6 +2012,9 @@ static void waitCardReady (uint32_t &response, uint32_t &status, uint32_t &polls
 // PIO path they use; the read and write entry points call these before their first command.
 static void flightEnter (uint32_t event, uint32_t dir, uint32_t lba, uint32_t blocks);
 static void flightExit (uint32_t done);
+// Round215: the request-context recovery, defined beside reinitializeCard below. The watchdog calls
+// it too, after it has taken the ticket from a holder that stopped.
+static bool cardRecoverHeld (const char *why, uint32_t detail);
 
 // Round169: the r168 frame turned the write-path wall into a read-path cascade -- APFS read 16 KiB
 // buffers from every daemon it decompressed and each one came back as EIO, while the card was
@@ -2007,6 +2029,7 @@ static bool waitCardIdle (uint64_t frequency)
   const uint64_t start = readCounter ();
   const uint64_t bound = frequency * 30ULL;
   static bool reported = false;
+  __atomic_store_n (&gIdleFailReason, kIdleOk, __ATOMIC_RELAXED);
   while (read32 (SDHCI_PRESENT_STATE) & SDHCI_DATA_INHIBIT) {
     const uint64_t waited = readCounter () - start;
     if (!reported && waited > frequency / 4ULL) {
@@ -2015,9 +2038,14 @@ static bool waitCardIdle (uint64_t frequency)
              static_cast<unsigned long long> (waited * 1000ULL / frequency));
     }
     if (waited > bound) {
+      __atomic_store_n (&gIdleFailReason, kIdleInhibit, __ATOMIC_RELAXED);
       return false;
     }
   }
+  // Round215: CMD13 is legal while the card programs, so "no answer" and "still programming" are
+  // different facts. Six unanswered polls in a row is the first; it ends the wait in milliseconds
+  // instead of the thirty seconds the busy bound allows, and the caller's recovery turns on it.
+  uint32_t silent = 0;
   for (;;) {
     uint32_t response = 0;
     uint32_t status = 0;
@@ -2032,7 +2060,16 @@ static bool waitCardIdle (uint64_t frequency)
     if ((response & R1_READY_FOR_DATA) && R1_CURRENT_STATE (response) == R1_STATE_TRAN) {
       return true;
     }
+    if (!response && !(status & SDHCI_INT_RESPONSE)) {
+      if (++silent >= 6) {
+        __atomic_store_n (&gIdleFailReason, kIdleSilent, __ATOMIC_RELAXED);
+        return false;
+      }
+    } else {
+      silent = 0;
+    }
     if (waited > bound) {
+      __atomic_store_n (&gIdleFailReason, kIdleBusy, __ATOMIC_RELAXED);
       return false;
     }
   }
@@ -2431,10 +2468,22 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   // Round169: the card can still be programming after the write that owned the guard was counted
   // as stored; a read that starts then is refused. Wait for the card, then start the deadline.
   flightStage (kStageIdleWait);
-  if (!waitCardIdle (frequency)) {
+  bool cardReady = waitCardIdle (frequency);
+  if (!cardReady) {
     // The card never said ready. Stop it explicitly, or every later read inherits the same state.
+    const uint32_t reason = __atomic_load_n (&gIdleFailReason, __ATOMIC_RELAXED);
     abortReadTransfer ();
     reportReadFailure ("idle", lba, blocks, 0, 0);
+    // Round215: a card that answered CMD13 is busy and will come back on its own; one that did not
+    // answer at all, or a host that never dropped DATA_INHIBIT, is the wedge this round powers out.
+    // The ladder proves itself with LBA 1, so the wait is retried once against a link it verified.
+    if (reason != kIdleBusy && cardRecoverHeld ("idle", reason)) {
+      flightStage (kStageIdleWait);
+      cardReady = waitCardIdle (frequency);
+    }
+  }
+  if (!cardReady) {
+    abortReadTransfer ();
     flightStage (kStageTail);
     flightExit (0);
     releaseBlockGuard (token);
@@ -2464,6 +2513,7 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   uint32_t sinceCut = 0;
   bool cutIn = false;
   bool held = true;
+  bool recovered = false;
   // Round167: the whole-request deadline scales with the run. A flat two seconds was sized for a
   // batch that finishes in milliseconds; a request that falls back to single blocks over a large
   // APFS or dyld read can exceed it, and a truncated read is an EIO the filesystem reports as
@@ -2486,6 +2536,15 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
       // Round213: a request that ran out of time leaves the controller mid-transfer unless it says
       // so; the next reader would then inherit a data state nobody reset.
       abortReadTransfer ();
+      // Round215: the card said it was ready and then moved no block at all. The ladder runs once
+      // per request and the chunk is retried on the link its LBA 1 read just verified; a second
+      // deadline ends the request, so a card that stays gone cannot hold this loop.
+      if (done == 0 && !recovered && cardRecoverHeld ("deadline", 0)) {
+        recovered = true;
+        start = readCounter ();
+        owned = 0;
+        continue;
+      }
       break;
     }
     uint32_t chunk = blocks - done;
@@ -2555,6 +2614,14 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
       if (!blockRead) {
         reportReadFailure ("gave up", lba + done, blocks, done, lastStatus);
         abortReadTransfer ();
+        // Round215: three single-block attempts from a reset circuit all refused. The card is not
+        // slow, it is not there; the ladder runs once and the same block is asked again.
+        if (!recovered && cardRecoverHeld ("gaveup", lastStatus)) {
+          recovered = true;
+          start = readCounter ();
+          owned = 0;
+          continue;
+        }
         break;
       }
       moved = 1;
@@ -3228,13 +3295,42 @@ static void flightExit (uint32_t done)
   gFlightOps++;
 }
 
+// Round214: what the watchdog's card bring-up measured. One of these goes into the beat's report
+// line as a single record: a recovery that stopped before the card answered CMD1 and one that
+// stopped after the 50 MHz verification read refused are different next steps, and the stage word
+// alone cannot tell them apart.
+struct CardReinit {
+  bool clockStopped;
+  bool resetDone;
+  bool clockStable;
+  bool sent0;
+  bool sent1;
+  bool ready;
+  bool cmd2;
+  bool cmd3;
+  bool cmd7;
+  bool hs;
+  bool bw;
+  bool ok;
+  uint32_t tries;
+  uint16_t clockAfter;
+  uint8_t powerAfter;
+};
+
+static CardReinit reinitializeCard (void);
+
 // Round213: the watchdog's whole action, taken from the CPU0 beat when the holder's stage has not
 // moved for kGuardStuckMs. It cannot wait for the holder -- the holder is the thing that stopped --
 // so it stops the transfer the way the driver's own failure paths do: a command and data reset,
-// then CMD12 to put the card back in TRAN, then the status the reset raised is cleared. Only then is
-// the ticket taken back, and only if the owner is still the one this trip found. A holder that
-// returns afterwards finds its ticket gone, fails its guardLost() check at the next chunk, and does
-// not release somebody else's word.
+// then CMD12 to put the card back in TRAN, then the status the reset raised is cleared.
+//
+// Round214: r213's frame says resetting the host around the card is not enough. The last line on the
+// card is at 418 s, no guard reported a trip, and the panic sink never wrote, so the card itself is
+// what stopped answering. This now powers it down and brings it back up: CMD0/CMD1 at 400 kHz, the
+// unchecked CMD2 round94 proved this host accepts, CMD3/CMD7 at kProbeRca, then fastMode's EXT_CSD
+// switches and the LBA 1 read that proves the 50 MHz link is the one the requests above it expect.
+// The ticket is taken before anything is touched and held through the bring-up: two recoveries at
+// once would be one too many, and a holder that returns finds its word gone at its next chunk.
 static void recoverStuckRequest (uint32_t stage, uint32_t owner)
 {
   uint64_t frequency = counterFrequency ();
@@ -3253,22 +3349,24 @@ static void recoverStuckRequest (uint32_t stage, uint32_t owner)
             __atomic_load_n (&gFlightStageBlocks, __ATOMIC_RELAXED),
             __atomic_load_n (&gFlightStagePid, __ATOMIC_RELAXED),
             static_cast<unsigned long long> (held));
-  write8 (SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
-  for (uint32_t guard = 0; guard < kCommandSpinLimit; guard++) {
-    if (!(read8 (SDHCI_SOFTWARE_RESET) & (SDHCI_RESET_CMD | SDHCI_RESET_DATA))) {
-      break;
-    }
+  // Round214: the ticket first. If the holder released or somebody else took the host between the
+  // beat's read and here, there is nothing stuck to recover -- and resetting a request that is
+  // running is the one thing this function must never do.
+  uint32_t ticket = __atomic_add_fetch (&gHostTickets, 1u, __ATOMIC_RELAXED);
+  if (!ticket) {
+    ticket = __atomic_add_fetch (&gHostTickets, 1u, __ATOMIC_RELAXED);
   }
-  (void) sendStopCommand ();
-  write32 (SDHCI_INT_STATUS, 0xffffffffu);
-  (void) resetReadPath ();
   uint32_t expected = owner;
-  if (__atomic_compare_exchange_n (&gHostOwner, &expected, 0u, false,
-                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-    __atomic_add_fetch (&gFlightSteals, 1u, __ATOMIC_RELAXED);
-    flightStage (kStageIdle);
+  if (!__atomic_compare_exchange_n (&gHostOwner, &expected, ticket, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    return;
   }
-  __atomic_add_fetch (&gFlightRecovered, 1u, __ATOMIC_RELAXED);
+  __atomic_add_fetch (&gFlightSteals, 1u, __ATOMIC_RELAXED);
+  // Round215: the ladder itself is shared with the request-context recovery; this path only adds
+  // the steal above, because the holder it is taking the card from is the thing that stopped.
+  (void) cardRecoverHeld ("stuck", stage);
+  flightStage (kStageIdle);
+  dropHostTicket (ticket);
 }
 
 // Called from ArmCpu's timer on CPU0. Taking the host is the point: a beat must never wait for a
@@ -4287,6 +4385,7 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
   uint32_t sinceCut = 0;
   bool cutIn = false;
   bool held = true;
+  bool recovered = false;
   while (done < blocks) {
     // Round213: same rule as the read path -- once the watchdog has taken the host back this
     // request must stop touching the controller.
@@ -4300,6 +4399,14 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
       sdhciSay ("CloverSdhci r213: write deadline lba=%u blocks=%u done=%u\n", lba, blocks, done);
       // Round213: leave the data circuit stopped, not mid-transfer for the next request.
       abortReadTransfer ();
+      // Round215: a run that never moved a block in thirty seconds is not programming time; the
+      // same ladder the read side uses runs once, then the run is re-asked.
+      if (done == 0 && !recovered && cardRecoverHeld ("deadline", 0)) {
+        recovered = true;
+        start = readCounter ();
+        owned = 0;
+        continue;
+      }
       break;
     }
     // Round159: one CMD25 for a run of blocks. The pointer arithmetic is 64-bit for the same reason
@@ -4411,6 +4518,15 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
           giveUpReported = true;
           sdhciSay ("CloverSdhci r168: write gave up lba=%u blocks=%u done=%u\n",
                lba + done, blocks, done);
+        }
+        // Round215: both the batch and the single-block fallback were refused. A card that will not
+        // take a block is the same wedge the read side recovers from; the ladder runs here, and the
+        // caller re-asks for the run it was told was short.
+        if (!recovered && cardRecoverHeld ("write", done)) {
+          recovered = true;
+          start = readCounter ();
+          owned = 0;
+          continue;
         }
         break;
       }
@@ -5239,6 +5355,191 @@ static bool fastMode (FastLink &link)
   link.raised = false;
   link.verified = false;
   return false;
+}
+
+// Round214: the card, not just the controller. r213 reset the command and data machines and sent
+// CMD12, and the frame still shows the card going quiet at 418 s, so this walks the ladder the cold
+// bring-up walked: clock off, machines reset, power cycled, 400 kHz, CMD0/CMD1, identification with
+// the check off (round94's CMD2), CMD3/CMD7 at kProbeRca, then fastMode -- the EXT_CSD switches and
+// the LBA 1 read whose "EFI PART" is the proof that the 50 MHz link every later request assumes is
+// the link the card is actually on. Everything is counter-bounded and nothing sleeps: the beat calls
+// this from the timer interrupt and must come back even when the card is gone for good.
+static CardReinit reinitializeCard (void)
+{
+  CardReinit r = {};
+  // The host the stuck request left behind: 8-bit, high-speed, whatever timeout it had. One lane,
+  // legacy timing and the longest timeout are what identification is specified at.
+  write8 (SDHCI_TIMEOUT_CONTROL, 0x0e);
+  write8 (SDHCI_HOST_CONTROL, 0x00);
+  write16 (SDHCI_HOST_CONTROL2, 0x0000);
+  write16 (SDHCI_CLOCK_CONTROL, 0x0000);
+  for (uint32_t guard = 0; guard < kCommandSpinLimit; guard++) {
+    if (!(read16 (SDHCI_CLOCK_CONTROL) & (SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_CARD_EN))) {
+      r.clockStopped = true;
+      break;
+    }
+  }
+  if (!r.clockStopped) {
+    return r;
+  }
+  const uint8_t mask = SDHCI_RESET_CMD | SDHCI_RESET_DATA;
+  write8 (SDHCI_SOFTWARE_RESET, mask);
+  for (uint32_t guard = 0; guard < kCommandSpinLimit; guard++) {
+    if (!(read8 (SDHCI_SOFTWARE_RESET) & mask)) {
+      r.resetDone = true;
+      break;
+    }
+  }
+  if (!r.resetDone) {
+    return r;
+  }
+  // Power cycle. A card reloads its default state only from a supply it has seen drop; the
+  // 1.8 V -> 0 -> 1.8 V order is coldBringUp's, and the spins stand in for the delays an interrupt
+  // cannot take.
+  write8 (SDHCI_POWER_CONTROL, 0x00);
+  for (volatile uint32_t spin = 0; spin < 1000; spin = spin + 1) {
+  }
+  write8 (SDHCI_POWER_CONTROL, SDHCI_POWER_180);
+  for (volatile uint32_t spin = 0; spin < 1000; spin = spin + 1) {
+  }
+  write8 (SDHCI_POWER_CONTROL, SDHCI_POWER_180 | SDHCI_POWER_ON);
+  bool updated = false;
+  bool stable = false;
+  programRootClock (true, kGccCfg400k, r.clockAfter, updated, stable);
+  r.clockStable = stable;
+  r.powerAfter = read8 (SDHCI_POWER_CONTROL);
+  if (!updated || !stable) {
+    return r;
+  }
+  uint32_t rsp0 = 0, rsp1 = 0, spins = 0;
+  (void)runCommand (SDHCI_MAKE_CMD (0, SDHCI_CMD_RESP_NONE), 0, r.sent0, rsp0, rsp1, spins);
+  if (!r.sent0) {
+    return r;
+  }
+  // CMD1 is the one command that says whether power reached the card at all. The retries are held
+  // to twenty, not the cold path's two hundred: this runs with interrupts off on CPU0, and a card
+  // that has not answered in twenty poll gaps is not about to.
+  for (r.tries = 1; r.tries <= 20; r.tries++) {
+    uint32_t ocr = 0, ocr1 = 0, ocrSpins = 0;
+    const uint32_t status = runCommand (SDHCI_MAKE_CMD (1, SDHCI_CMD_RESP_SHORT), kEmmcOcr,
+                                        r.sent1, ocr, ocr1, ocrSpins);
+    if (!r.sent1) {
+      break;
+    }
+    if (status & SDHCI_INT_TIMEOUT) {
+      continue;
+    }
+    if (status & (SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX)) {
+      break;
+    }
+    if (!(status & SDHCI_INT_RESPONSE)) {
+      break;
+    }
+    if (ocr & 0x80000000u) {
+      r.ready = true;
+      break;
+    }
+    for (volatile uint32_t spin = 0; spin < kCmd1Gap; spin = spin + 1) {
+    }
+  }
+  if (!r.ready) {
+    return r;
+  }
+  // CMD2 with the check off is round94's X: the one CMD2 this host accepts. The card it leaves in
+  // identification is exactly the state CMD3 is legal in.
+  uint32_t cid[4] = { 0, 0, 0, 0 };
+  uint32_t cidSpins = 0;
+  const uint32_t cidStatus = runCommand4 (SDHCI_MAKE_CMD (2, SDHCI_CMD_RESP_LONG), 0,
+                                          r.cmd2, cid, cidSpins);
+  if (!r.cmd2 || !(cidStatus & SDHCI_INT_RESPONSE) ||
+      (cidStatus & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+    r.cmd2 = false;
+    return r;
+  }
+  // CMD3 SET_RELATIVE_ADDR at kProbeRca: the address every request above this one already uses, so
+  // the block path needs no change when the card comes back.
+  uint32_t addr0 = 0, addr1 = 0, addrSpins = 0;
+  const uint32_t addrStatus = runCommand (SDHCI_MAKE_CMD (3, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                          SDHCI_CMD_INDEX),
+                                          kProbeRca << 16, r.cmd3, addr0, addr1, addrSpins);
+  if (!r.cmd3 || !(addrStatus & SDHCI_INT_RESPONSE) ||
+      (addrStatus & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+    r.cmd3 = false;
+    return r;
+  }
+  uint32_t sel0 = 0, sel1 = 0, selSpins = 0;
+  const uint32_t selStatus = runCommand (SDHCI_MAKE_CMD (7, SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC |
+                                                         SDHCI_CMD_INDEX),
+                                         kProbeRca << 16, r.cmd7, sel0, sel1, selSpins);
+  if (!r.cmd7 || !(selStatus & SDHCI_INT_RESPONSE) ||
+      (selStatus & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+    r.cmd7 = false;
+    return r;
+  }
+  FastLink link;
+  (void)fastMode (link);
+  r.hs = link.highSpeed;
+  r.bw = link.width8;
+  r.ok = link.verified;
+  r.clockAfter = link.clockAfter;
+  r.powerAfter = read8 (SDHCI_POWER_CONTROL);
+  return r;
+}
+
+// Round215: the recovery a request runs on itself. r214's frame says the stop is the card going
+// quiet under a request that still owns the ticket -- so this needs no steal, only the same ladder
+// (stop the machines, power the card down and up, identify it, restore the 50 MHz link). The two
+// things that keep a dead card from turning every request into a power cycle are the per-boot cap
+// and the cooldown. On success the tee's backlog goes to the card here, because this context still
+// owns the host and that write is the frame's own proof that the card came back.
+static bool cardRecoverHeld (const char *why, uint32_t detail)
+{
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint64_t now = readCounter ();
+  const uint32_t tries = __atomic_load_n (&gFlightStuck, __ATOMIC_RELAXED);
+  if (tries >= kCardRecoverCap) {
+    return false;
+  }
+  if (gCardRecoverLastTick && now > gCardRecoverLastTick &&
+      now - gCardRecoverLastTick < frequency * kCardRecoverCooldownMs / 1000ULL) {
+    return false;
+  }
+  gCardRecoverLastTick = now;
+  __atomic_add_fetch (&gFlightStuck, 1u, __ATOMIC_RELAXED);
+  __atomic_store_n (&gFlightStuckStage, kStageReinit, __ATOMIC_RELAXED);
+  // The stage is moved by hand: flightStage() would replace the location words with this context's
+  // own, and those words are the last thing that names the request the recovery is about.
+  __atomic_store_n (&gFlightStageSince, readCounter (), __ATOMIC_RELEASE);
+  __atomic_store_n (&gFlightStage, kStageReinit, __ATOMIC_RELEASE);
+  write8 (SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+  for (uint32_t guard = 0; guard < kCommandSpinLimit; guard++) {
+    if (!(read8 (SDHCI_SOFTWARE_RESET) & (SDHCI_RESET_CMD | SDHCI_RESET_DATA))) {
+      break;
+    }
+  }
+  (void) sendStopCommand ();
+  write32 (SDHCI_INT_STATUS, 0xffffffffu);
+  (void) resetReadPath ();
+  const CardReinit re = reinitializeCard ();
+  sdhciSay ("CloverSdhci r215: card recover why=%s d=%u n=%u stop=%u rst=%u pwr=%u clk=%u "
+            "clkst=%u t=%u cmd0=%u cmd1=%u ready=%u cmd2=%u cmd3=%u cmd7=%u hs=%u bw=%u ok=%u\n",
+            why, detail, tries + 1,
+            re.clockStopped ? 1u : 0u, re.resetDone ? 1u : 0u, re.powerAfter,
+            re.clockAfter, re.clockStable ? 1u : 0u, re.tries,
+            re.sent0 ? 1u : 0u, re.sent1 ? 1u : 0u, re.ready ? 1u : 0u,
+            re.cmd2 ? 1u : 0u, re.cmd3 ? 1u : 0u, re.cmd7 ? 1u : 0u,
+            re.hs ? 1u : 0u, re.bw ? 1u : 0u, re.ok ? 1u : 0u);
+  if (re.ok) {
+    __atomic_add_fetch (&gFlightRecovered, 1u, __ATOMIC_RELAXED);
+    __atomic_store_n (&gIdleFailReason, kIdleOk, __ATOMIC_RELAXED);
+    teeKernelLog ();
+    flushVerdictRing ();
+  }
+  flightStage (kStageTail);
+  return re.ok;
 }
 
 static void coldBringUp (bool fullReset, unsigned probeMode)
@@ -7607,6 +7908,30 @@ static void reidentify (void)
   clover_emmc_stage = 6;
 }
 
+// Round214: one decimal number into a byte buffer, for the BCB's second block. The panic path has no
+// formatter it can call without a va_list, and this is the whole of what it needs.
+static uint32_t bcbDecimal (uint8_t *out, uint32_t value)
+{
+  uint8_t digits[10];
+  uint32_t count = 0;
+  do {
+    digits[count++] = static_cast<uint8_t> ('0' + value % 10u);
+    value /= 10u;
+  } while (value);
+  for (uint32_t i = 0; i < count; i++) {
+    out[i] = digits[count - 1 - i];
+  }
+  return count;
+}
+
+// Round214: the BCB's second block is untouched by every reader that boots this board, so the
+// watchdog's two counters go there as text. The host reads them out of TWRP without writing `misc`,
+// which is what keeps `boot-recovery` in block 0 the only thing that lands the board. Both marks sit
+// at file scope and are forced out as data: inside the copy loops the compiler folds them into
+// immediates, and then the payload gate has nothing to look for.
+static const char kStuck[] __attribute__((used)) = "clover-stuck=";
+static const char kRecov[] __attribute__((used)) = " recov=";
+
 // Round196: leave a boot-recovery BCB in `misc` before the panic screen resets. Round195 proved the
 // IMEM word is written but not consulted by this XBL, while the same BCB the host writes makes the
 // board come up in TWRP in 14 s. Only the first two blocks are touched: command[32], status[32],
@@ -7631,6 +7956,20 @@ static unsigned int panicMarkRecovery (void)
       for (uint32_t i = 0; i < sizeof (kCommand) - 1; i++) {
         bytes[i] = static_cast<uint8_t> (kCommand[i]);
       }
+    }
+    // Round214: the watchdog's two counters go to the block's second half as text; the marks
+    // themselves are the file-scope data above.
+    if (block == 1) {
+      uint32_t at = 0;
+      for (uint32_t i = 0; i < sizeof (kStuck) - 1; i++) {
+        bytes[at++] = static_cast<uint8_t> (kStuck[i]);
+      }
+      at += bcbDecimal (bytes + at, __atomic_load_n (&gFlightStuck, __ATOMIC_RELAXED));
+      for (uint32_t i = 0; i < sizeof (kRecov) - 1; i++) {
+        bytes[at++] = static_cast<uint8_t> (kRecov[i]);
+      }
+      at += bcbDecimal (bytes + at, __atomic_load_n (&gFlightRecovered, __ATOMIC_RELAXED));
+      bytes[at++] = static_cast<uint8_t> ('\n');
     }
     if (!writePioBlock (kMiscFirstLba + block, gWriteBlock, words, status)) {
       return 2;

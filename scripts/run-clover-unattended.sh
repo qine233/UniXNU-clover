@@ -324,6 +324,23 @@ twrp=$(adb shell getprop ro.twrp.version 2>/dev/null | tr -d '\r')
 device=$(adb shell getprop ro.product.device 2>/dev/null | tr -d '\r')
 say "recovery: device=${device:-?} twrp=${twrp:-?}"
 
+# Round214: misc, read only. Block 0 holds the BCB the panic path left (the host never writes it
+# here); block 1 holds the watchdog's two counters as text, so a boot whose card stopped answering
+# says whether the watchdog tripped and whether the card came back at all. Two blocks, no writes.
+misc_img="$(dirname "$OUT")/clover-misc-1024.bin"
+if adb exec-out "dd if=/dev/block/bootdevice/by-name/misc bs=512 count=2 2>/dev/null" \
+    > "$misc_img" 2>/dev/null && [ -s "$misc_img" ]; then
+  say "misc (read only, $(wc -c < "$misc_img" | tr -d ' ') bytes): block 0 command='$(head -c 32 "$misc_img" | LC_ALL=C tr -cd '\40-\176')'"
+  misc_mark=$(tail -c 512 "$misc_img" | LC_ALL=C tr -cd '\12\40-\176' | head -1)
+  if [ -n "$misc_mark" ]; then
+    say "misc block 1 (round214 watchdog counters): $misc_mark"
+  else
+    say "misc block 1 is empty: this boot's panic path wrote no watchdog counters"
+  fi
+else
+  say "misc: read failed (read only; nothing was written)"
+fi
+
 # Round176 reads 1216 sectors. The first 32 blocks are the report/panic slots, the driver's verdict
 # ring runs 64..191, and round176's kernel-log ring -- the lines the tee copies out of msgbuf, so the
 # APFS, code-signing, shared-region and exec/exit readings that used to share 32 records with the

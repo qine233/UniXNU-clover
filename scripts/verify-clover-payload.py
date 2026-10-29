@@ -871,6 +871,35 @@ def check_host_ticket(kernel: bytes) -> bool:
     return ok
 
 
+def check_card_reinit(kernel: bytes) -> bool:
+    """Round214 leaves the panic path's trip counters in misc's second block. Round215 moved the
+    report line into the request-context recovery (check_card_recover), so all that remains here is
+    the marker: without it a dump cannot say whether the card ever failed, only that it stopped."""
+    label = "kernel.macho: r214 trip counter marker"
+    found = {"marker": b"clover-stuck=" in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
+def check_card_recover(kernel: bytes) -> bool:
+    """Round215 lets the request bring the card back itself instead of waiting for the watchdog.
+    The image has to carry the ladder's report line and the silence verdict that arms it: r214's
+    frame ended at 408 s with the card quiet and nothing left to say whether the request gave up
+    on a busy card or on one that had stopped answering."""
+    label = "kernel.macho: r215 card recover armed"
+    found = {"line": (b"CloverSdhci r215: card recover why=%s d=%u n=%u stop=%u rst=%u pwr=%u "
+                      b"clk=%u clkst=%u t=%u cmd0=%u cmd1=%u ready=%u cmd2=%u cmd3=%u cmd7=%u "
+                      b"hs=%u bw=%u ok=%u\n") in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_flight_region(kernel: bytes) -> bool:
     """Round210 leaves a record before the stop instead of after it. The r209 frame showed the
     kernel alive to the deadline and the card refusing the sink, so the image has to carry the
@@ -1350,6 +1379,8 @@ def report(image: pathlib.Path) -> int:
         ok &= check_boot_record(kernel)
         ok &= check_flight_region(kernel)
         ok &= check_host_ticket(kernel)
+        ok &= check_card_reinit(kernel)
+        ok &= check_card_recover(kernel)
         ok &= check_signal_desc_probe(kernel)
         ok &= check_user_breakpoint_probe(kernel)
     return 0 if ok else 1

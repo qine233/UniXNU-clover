@@ -16152,3 +16152,93 @@ r213 的看门狗本该在停滞 75 s 之后（约 493 s）把 `guard stuck stag
    等 panic 落卡（若 panic 也写不进，就只剩下面的 1 bit）。
 3. **1 bit 落点通道**：`gFlightStuck` 非零时 `panicMarkRecovery` 改写 `boot-fastboot` 而不是
    `boot-recovery`。宿主脚本本来就会等两个落点，所以「这次落在哪」就是「看门狗触发过没有」。
+
+## round214：看门狗把整张卡重新初始化，而不是只复位控制器
+
+r213 的帧把停点定在「卡不再接受写入」，但分不开两件事：看门狗没触发，还是触发了却没救回来。
+r214 只动恢复路径，不动块传输本身：**停住 75 s 之后，从 CPU0 心跳里把卡断电、重新上电、
+重新识别，一直恢复到 50 MHz 加 LBA 1 自证**；恢复结果写成一行；panic 时把两个计数器
+（stuck / recovered）写进 misc 第 2 块，宿主在 TWRP 只读取回。
+
+### 设计
+
+1. **先抢票，再碰卡**。`recoverStuckRequest()` 先 `__atomic_add_fetch` 取一张新票，再用
+   `compare_exchange(gHostOwner, owner -> ticket)` 把持有者换掉。换不到说明持有者已经返回或
+   别人接手，直接 return——**绝不去复位一笔还在跑的请求**。拿到票之后 stage 手工写成
+   `kStageReinit = 12`（不走 `flightStage()`，它会覆盖 location 词），`gFlightSteals++`。
+2. **恢复阶梯**（`reinitializeCard()`，与 `coldBringUp` 同序）：
+   TIMEOUT=0x0e、HOST_CONTROL=0、HOST_CONTROL2=0 → 停卡时钟并等 `INT_EN|CARD_EN` 落 →
+   RESET CMD|DATA 等自清 → `POWER_CONTROL=0` → 1.8 V → 1.8 V|ON（各带上界 spin）→
+   `programRootClock(true, kGccCfg400k, …)` → CMD0 → CMD1 最多 20 次轮询（`ocr & 0x80000000`
+   为 ready）→ CMD2 `RESP_LONG`（check off，r94 的 X）→ CMD3 → CMD7（`kProbeRca<<16`）→
+   `fastMode(link)`（HS_TIMING / 8 位 / 50 MHz / 读 LBA 1 验 `EFI PART`）。
+   全部等待都是计数器上界、无 `IOSleep`，所以心跳里可以跑。
+3. **恢复成功时当场把积压的日志写下去**：持票上下文里先 `teeKernelLog()` 再
+   `flushVerdictRing()`，418 s 之后的内核行才可能上卡；随后 stage 回 idle、放票、`recovered++`。
+4. **报告行**：`CloverSdhci r214: card reinit stop=.. rst=.. pwr=.. clk=.. clkst=.. t=..
+   cmd0=.. cmd1=.. ready=.. cmd2=.. cmd3=.. cmd7=.. hs=.. bw=.. ok=..`。停在阶梯哪一级就是
+   哪个返回值是 0，不用再靠猜。
+5. **1 bit 通道换成 1 KiB 文本**：`panicMarkRecovery()` 的第 2 块（原本就整块清 0 写）写
+   `clover-stuck=<n> recov=<m>\n`；block 0 仍是 `boot-recovery`，`recovery[768]`/`status[32]`
+   不动，所以 TWRP 落点不受影响。宿主脚本在 TWRP 里只读 `misc` 前 2 块（1024 B）并打印。
+6. **契约**：`read-clover-log.py` 的 stage 表加 `12: "reinit"`；`verify-clover-payload.py` 加
+   `r214 card re-init armed`（报告行 + `clover-stuck=` 标记）；`check-clover.py` 断言新常量、
+   新函数、新串；`board.toml` 标题升 r214。
+
+### 构建
+
+- 内核 → AMFI 两刀（file `0x1ab60e4` / `0x1ab616c`，VA `0xfffffff004ab40e4` /
+  `0xfffffff004ab416c`）→ 归一化（968 个 object 戳全清）→ payload。
+- **短串会被编成立即数**：`kCommand[]`/`kStuck[]` 这种在拷贝循环里逐字节展开的局部数组，
+  编译器直接生成 movz/movk，二进制里根本没有 `boot-recovery`（r196 起就是这样）。
+  r214 把两个标记提到文件作用域并加 `__attribute__((used))`，`clover-stuck=` 与 ` recov=`
+  才作为数据出现在镜像里，payload 闸门才有东西可断言。
+
+### 读数（round214-unattended.log，boot 3）
+
+宿主只写 cache。`decoded: … (12 report record(s), 37 driver verdict line(s), 0 probe line(s),
+512 kernel log line(s), boot 3)`；驱动环 37 条与票的 `r213: host ticket armed` 都是 boot 3。
+
+- **票仍是完好的**：整个窗口没有 `guard stuck`、没有 `guard wait gave up`，`stuck=0 recov=0
+  steal=0` 在最后一条 flight 记录上仍然成立。
+- **停点在卡上，不在票上**：最后 12 条 entry 是 `397.135–397.377 s` 的 8/64/128 块读，
+  `prev=read/…` 全部在 0–145 ms 内完成；此后内核 tee 的最后一条是
+  `[408.1000164] CloverBlock r190: sync-out ok=1 pending=464`。**408 s 之后到 900 s 死线，
+  卡上再没有一条记录**，report 窗里也没有本靴的 panic 记录。
+- **beat 停在 397.084 s**（最后一条 `beat seq 79`，`t=397084 ms`，之后 4 s 一格没有再来），
+  而内核在 408 s 还在成功写卡——所以不是「CPU0 卡住导致看门狗没跑」，而是 408 s 那次写之后
+  整条卡路径一起沉默了。
+- **结论**：r214 的恢复阶梯没有机会执行，因为 75 s 看门狗的结构性前提不成立（请求 deadline
+  总会先结束持有）；真正的现场是「一笔请求在卡不再应答时还占着票，后面的写全部落空」。
+  这直接推出 r215：把恢复放到请求自己身上，用 CMD13 的应答与否分开「忙」和「沉默」。
+
+## round215：请求自己把卡重新初始化
+
+r214 的帧把停点定在 `[408.1]` 之后：卡不再应答，而票、控制器复位、看门狗都没有被触发。
+r215 只动恢复的触发点与判据，不动块传输：
+
+1. **沉默判据**：`waitCardIdle()` 里连续 6 次 CMD13 既无 `SDHCI_INT_RESPONSE` 也无响应字
+   就判 `kIdleSilent` 并立即返回，不再空转 30 s；DATA_INHIBIT 超过 30 s 记 `kIdleInhibit`；
+   有应答但一直不回 TRAN 记 `kIdleBusy`（card 自己在编程，合法）。
+2. **请求上下文的恢复**：`cardRecoverHeld(why, detail)` 与 r214 的心跳共用同一阶梯
+   （软复位 CMD|DATA → CMD12 → 清 INT_STATUS → 复位读通路 → `reinitializeCard()`：断电、
+   重新上电、400 kHz 识别、CMD3/CMD7、50 MHz + LBA 1 自证）。它不需要抢票——调用者本来就
+   持有票；r213 的看门狗抢票后也改为调用它，只多记一次 `gFlightSteals`。
+3. **只在沉默或 inhibit 时掉电**：`kIdleBusy` 直接返回（等它自己回来）；每次请求只恢复一次，
+   成功后重试一次并重置 deadline。冷却 15 s、每靴上限 16 次，防止死卡把每笔请求都变成上电循环。
+4. **恢复成功时先 `teeKernelLog()` 再 `flushVerdictRing()`**：卡回来后的第一笔写就是这条
+   `r215: card recover … ok=1`，宿主读回即证。
+5. **报告行**：`CloverSdhci r215: card recover why=%s d=%u n=%u stop=.. rst=.. pwr=.. clk=..
+   clkst=.. t=.. cmd0=.. cmd1=.. ready=.. cmd2=.. cmd3=.. cmd7=.. hs=.. bw=.. ok=..`。
+6. **契约**：`check-clover.py` 断言新状态/常量/函数/串与五个触发点；`verify-clover-payload.py`
+   新增 `r215 card recover armed`（报告行），r214 一项改为只断言 `clover-stuck=` 标记；
+   `board.toml` 标题升 r215。
+
+### 构建
+
+- prelink `dc55630d…`（第二次重建 `b9249046…`，差异只在未归一的 object 戳）→ AMFI 两刀
+  file `0x1ab60e4` / `0x1ab616c` → 归一化 `6f620ea4…`（968 个戳全清；两次构建归一化后
+  逐字节相同）→ payload `709b777b…`（58,720,256 B）。
+- 双闸门：`check-clover.py` 绿；`verify-clover-payload.py` 46 项 OK、0 FAIL（含
+  `r215 card recover armed`、`r214 trip counter marker`、`build-varying fields normalized`）。
+- 归档：`~/clover-out/round215-{kernel-amfi.macho,payload.img,kernel-build.log,SHA256SUMS}`。

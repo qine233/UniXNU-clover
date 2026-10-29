@@ -110,7 +110,8 @@ FLIGHT_DIRS = {0: "read", 1: "write", 2: "beat"}
 # Round213's holder stages. A beat whose stage word has not moved for 75 s is the request that
 # stopped, so the name is what the dump prints where r212 could only print the request.
 FLIGHT_STAGES = {0: "idle", 1: "entry", 2: "idleWait", 3: "check", 4: "adma", 5: "batch",
-                 6: "single", 7: "settle", 8: "tail", 9: "tee", 10: "flush", 11: "commit"}
+                 6: "single", 7: "settle", 8: "tail", 9: "tee", 10: "flush", 11: "commit",
+                 12: "reinit"}
 DRIVER_PREFIX = b"CloverSdhci "
 
 
