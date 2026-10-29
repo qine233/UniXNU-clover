@@ -16306,3 +16306,45 @@ r216 只动这个遍历器：
 r216 修好之后，下一帧的 `sbthr` 会给出每个 SpringBoard 线程的 `pc/lr/sp/state/wait/kin`
 以及（栈还在的那些线程的）`sbthk` 帧；对 `kin=2` 的线程，`wait` 指针和用户态 `pc` 就是
 「它在等什么」的全部可得信息。
+
+## round216 读数（boot 5）：遍历器不再自伤，但快照落在拆栈之后
+
+这一帧是 r216 产物（`round216-payload.img`，冷刷 cache=mmcblk0p49）跑出来的：
+
+- **panic 回到死线**：report 窗里 12 条 kind-20 全是 `unattended deadline 900 s`
+  （`ArmCpu.cpp:644/647`、`fb=1`），没有 `Kernel data abort`——r215 那个
+  `pc +0x180` 的异常不再出现。drain 也完整：`drain enter boot=5 first=13320216
+  append_rc=113 probe_seen=8 verdict=1`、`panic drain wrote=13 dropped=0 tee_passes=8`、
+  `unseen=0`，5 条 `sbthr` 全部上卡。
+- **5 条线程全 `kin=2 kstk=0000000000000000`**：
+  ```
+  sbthr n=1 tid=0x103 state=1  wait=fffffff2fa937020 kin=2 kstk=0
+  sbthr n=2 tid=0x2f3 state=65 wait=0000000000000000 kin=2 kstk=0
+  sbthr n=3 tid=0x3ed state=65 wait=fffffff2fa937800 kin=2 kstk=0
+  sbthr n=4 tid=0x4f5 state=1  wait=fffffff3e0658cf0 kin=2 kstk=0
+  sbthr n=5 tid=0x5c9 state=1  wait=fffffff3e072b288 kin=2 kstk=0
+  ```
+  `sbthk` 零行。这不是「栈还在但没抓到」，而是结构上没有：`machine_stack_handoff`
+  把旧线程的栈交给新线程之后，`kernel_stack` 在它重新被调度前一直是 0
+  （`osfmk/arm64/pcb.c:443`），栈在 continuation 里阻塞的线程根本没有可走的内核栈。
+- **5 行的时间戳比杀点晚 39.44 s**：killsig/upc/skst 在
+  `[420.773441]`–`[420.773512]`，`sbthr` 头一条在 `[460.217851]`，`exit pid=27` 在
+  `[460.301116]`。r207 那一靴从 kill 到 exit 只隔 197 ms。`skst` 与首条 `sbthr` 之间
+  唯一的阻塞点是 `clover_task_threads` 里的 `task_lock(task)`；同一段 39 s 里内核别的
+  行照常落卡（`[430.4]` ubrk、`[439.7]` r188……），所以不是控制台堵住，而是目标进程的
+  task 锁被按住了整整 39 s，随后进程才退出。**我们自己的探针在杀点把退出推迟了 39 s**，
+  这一点 r207 的 197 ms 与这一帧的 39.5 s 对照即证。
+- **保存态不是 SpringBoard 的代码**：这一靴的 r200 行写着共享区
+  `map=1 start=0x180000000 end=0x20c000000`（slide=0；同靴 liveactivitiesd 的 brk
+  仍解到缓存里），而 5 条线程的 pc/lr 全部落在解包缓存的只读数据映射
+  `0x1e638c000+0x531c000`（`dyld_shared_cache_arm64.33.dylddata`），一条也不在 `__TEXT`。
+  线程的 `machine.upcb` 是 `user_ss_zone` 里的独立块，本可随线程保留；值落进数据段
+  只能说明我们读的时候任务已在拆除流程里，块已被释放/复用。换句话说，`kin=2` 只证明
+  「栈不在」，`pc/lr` 在杀点之后不可信。
+
+**结论**：r216 的目标（不再打死内核）达成；r211 想在杀点读收信者线程这件事，被 kill 路径
+本身的时序否掉——`psignal_internal` 里先阻塞 39 s 再读，读到的必然是尸体。r217 的方向因此
+是两条：信号路径里把 `task_lock` 换成不阻塞的 `task_try_lock`（拿不到就记 `busy` 并立刻
+返回，不再推迟退出），以及把「SpringBoard 在等什么」的采样挪到杀点之前（记录
+`thr->wait_event` / `thr->wmesg` / `thr->continuation` / `parameter`），这样读到的才是
+看门狗判定「它死了」那一刻的真实等待点。
