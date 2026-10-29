@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r218: the kill's sender stack and each sampled thread's syscall number -- round217 denied every kernel-side cause and left SpringBoard stopped in user space before its first render, so the SIGKILL line now carries the sender's user pc, eight code words at it and a four-frame user stack from backboardd's watchdog, and each sampled SpringBoard thread adds its x16 syscall number plus a four-frame user stack, taken only from SpringBoard's own mach traps because copyin uses the trapping task's map"
+title = "clover r219: the mach_msg2 descriptor each stopped SpringBoard thread is waiting on -- round218 showed the main thread parked in the display-services handshake with no reply ever observed, so every sampled thread that sits at a mach_msg2 entry now records the packed request descriptor (msgh_bits, send size, remote and local port names, msgh_id, option64) together with the header words in its receive buffer, printed only when the batch changes so five threads cannot flood the ring"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

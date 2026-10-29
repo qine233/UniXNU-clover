@@ -111,7 +111,7 @@ index 98ee874..dfd2a63 100644
  			snprintf(clover_r211_line, sizeof(clover_r211_line),
  			    "clover r211: skst n=%u f0=%016llx f1=%016llx f2=%016llx f3=%016llx f4=%016llx f5=%016llx\n",
 diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
-index 4a12dd9..6363bc0 100644
+index 4a12dd9..b033867 100644
 --- a/osfmk/kern/task.c
 +++ b/osfmk/kern/task.c
 @@ -121,6 +121,7 @@
@@ -230,7 +230,7 @@ index 4a12dd9..6363bc0 100644
  	queue_iterate(&task->threads, thr, thread_t, task_threads) {
  		arm_saved_state_t *ss;
  		arm_kernel_saved_state_t *ks;
-@@ -10473,4 +10564,187 @@ clover_task_threads(task_t task, uint32_t budget)
+@@ -10473,4 +10564,257 @@ clover_task_threads(task_t task, uint32_t budget)
  	}
  	return n;
  }
@@ -259,6 +259,7 @@ index 4a12dd9..6363bc0 100644
 +static uint64_t clover_sb_heartbeat;
 +static uint32_t clover_sb_changes;
 +static char clover_sb_last[256];
++static char clover_sb_last_m2[1024];
 +
 +void
 +clover_sb_note_current(void)
@@ -303,8 +304,10 @@ index 4a12dd9..6363bc0 100644
 +	uint64_t x16s[5];
 +	uint64_t fps[5];
 +	uint64_t sps[5];
++	uint64_t m2[5][7];
 +	uint32_t n = 0;
 +	uint32_t i;
++	uint32_t j;
 +	uint32_t changed;
 +	uint32_t heartbeat;
 +
@@ -349,10 +352,16 @@ index 4a12dd9..6363bc0 100644
 +		x16s[n] = 0;
 +		fps[n] = 0;
 +		sps[n] = 0;
++		for (j = 0; j < 7; j++) {
++			m2[n][j] = 0;
++		}
 +		if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1) {
 +			pc = (uint64_t)get_saved_state_pc(ss);
 +			if (!is_saved_state32(ss)) {
 +				x16s[n] = (uint64_t)saved_state64(ss)->x[16];
++				for (j = 0; j < 7; j++) {
++					m2[n][j] = (uint64_t)saved_state64(ss)->x[j];
++				}
 +			}
 +			fps[n] = (uint64_t)get_saved_state_fp(ss);
 +			sps[n] = (uint64_t)get_saved_state_sp(ss);
@@ -414,6 +423,67 @@ index 4a12dd9..6363bc0 100644
 +		if (elen > 0) {
 +			extra[sizeof(extra) - 1] = '\0';
 +			printf("%s", extra);
++		}
++	}
++
++	/*
++	 * Round219. A thread parked in mach_msg2 keeps its user registers at the
++	 * trap entry, so the packed request descriptor is still there: x1 carries
++	 * msgh_bits and the send size, x2 the remote and local port names, x3 the
++	 * voucher port and msgh_id, and x6 the option64 word. The receive buffer
++	 * at x0 is copied in as well, because after a completed receive that
++	 * header is the message the thread dequeued. The signature is compared
++	 * without the timestamp so a batch is printed only when something in it
++	 * changes.
++	 */
++	{
++		char m2sig[1024];
++		char m2lines[1024];
++		int soff = 0;
++		int loff = 0;
++
++		m2sig[0] = '\0';
++		m2lines[0] = '\0';
++		for (i = 0; i < n && loff < (int)sizeof(m2lines) - 232; i++) {
++			uint64_t *r = m2[i];
++			uint32_t hdr[6] = { 0, 0, 0, 0, 0, 0 };
++			uint32_t bits, snd, rp, lp, id, ok;
++			int sw, lw;
++
++			if (x16s[i] != (uint64_t)-47 || r[0] == 0) {
++				continue;
++			}
++			bits = (uint32_t)r[1];
++			snd = (uint32_t)(r[1] >> 32);
++			rp = (uint32_t)r[2];
++			lp = (uint32_t)(r[2] >> 32);
++			id = (uint32_t)(r[3] >> 32);
++			ok = (copyin((user_addr_t)r[0], hdr, sizeof(hdr)) == 0);
++			sw = snprintf(m2sig + soff, sizeof(m2sig) - (size_t)soff,
++			    " %llx:%x:%x:%x:%x:%x:%x:%x:%x.%x.%x.%x.%x.%x",
++			    (unsigned long long)tids[i], bits, snd, rp, lp, id,
++			    (uint32_t)r[4], (uint32_t)(r[4] >> 32),
++			    (uint32_t)r[6], hdr[0], hdr[1], hdr[2], hdr[3],
++			    hdr[4], hdr[5]);
++			if (sw <= 0 || sw >= (int)(sizeof(m2sig) - (size_t)soff)) {
++				break;
++			}
++			soff += sw;
++			lw = snprintf(m2lines + loff, sizeof(m2lines) - (size_t)loff,
++			    "clover r219: sbm2 t=%llu tid=0x%llx b=%x ss=%x rp=%x lp=%x id=%x d=%x rn=%x o=%llx h=%x.%x.%x.%x.%x.%x%s\n",
++			    (unsigned long long)secs, (unsigned long long)tids[i],
++			    bits, snd, rp, lp, id, (uint32_t)r[4],
++			    (uint32_t)(r[4] >> 32), (unsigned long long)r[6],
++			    hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5],
++			    ok ? "" : " hf");
++			if (lw <= 0 || lw >= (int)(sizeof(m2lines) - (size_t)loff)) {
++				break;
++			}
++			loff += lw;
++		}
++		if (soff > 0 && strcmp(m2sig, clover_sb_last_m2) != 0) {
++			strlcpy(clover_sb_last_m2, m2sig, sizeof(clover_sb_last_m2));
++			printf("%s", m2lines);
 +		}
 +	}
 +}

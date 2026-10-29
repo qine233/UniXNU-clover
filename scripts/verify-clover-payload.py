@@ -911,7 +911,8 @@ def check_sb_sample(kernel: bytes) -> bool:
              "busy": (b"clover r217: sbthr busy=1 pid=%d budget=%u\n") in kernel,
              "killsrc": (b"clover r218: killsrc upc=%016llx ulr=%016llx code=") in kernel,
              "killustk": (b"clover r218: killustk n=%u sp=%016llx fp=%016llx") in kernel,
-             "sbpc": (b"clover r218: sbpc t=%llu tid=0x%llx x16=%llx n=%u") in kernel}
+             "sbpc": (b"clover r218: sbpc t=%llu tid=0x%llx x16=%llx n=%u") in kernel,
+             "sbm2": (b"clover r219: sbm2 t=%llu tid=0x%llx b=%x ss=%x rp=%x lp=%x id=%x") in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
