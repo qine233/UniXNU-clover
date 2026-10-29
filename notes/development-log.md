@@ -15568,3 +15568,74 @@ r207 在 `psignal_internal` 的投递点打一行：接收者 pid/comm/ppid、`s
 namespace/code、CS 标志，以及**发信者**（`current_proc()`，内核线程记为 pid 0）和调用返回
 地址（配一个已知锚点地址以便在宿主上换算 slide）。这样 launchd 的 `kill(2)`、jetsam、
 CS_KILLED 三条路就能分开。
+
+## round207（v0.5.65）：SpringBoard 的 SIGKILL 是 backboardd 发的；「时基慢 50 倍」是一处读法错误
+
+### 探针
+
+`bsd/kern/kern_sig.c` 的 `psignal_internal` 在坏信号号的 panic 之后、任何锁之前，对
+`SIGKILL`/`SIGTERM` 打一行：接收者 pid/comm/ppid、`signal_reason` 的 namespace/code、
+`proc_getcsflags(p)`、发信者 `current_proc()` 的 pid/comm（内核线程是 `kernproc`，pid 0）、
+`__builtin_return_address(0)`，以及锚点 `&psignal_internal`。预算按接收者 comm 去重
+（8 个名字、每名字 4 条、总共 40 条），所以一个循环退出的守护进程不会把环冲掉。
+
+### 读数：发信者是 backboardd，走的是 `kill(2)`
+
+```
+[351.399202] ... clover r207: killsig pid=27 comm=SpringBoard ppid=1 sig=9
+             spid=58 scomm=backboardd ns=-1 code=0x0 cs=0x22000301
+             ra=fffffff0076ffd7c anchor=fffffff007700b54
+[351.596050] clover r170: exit pid=27 ppid=1 t=6s rv=0x9 ns=2 code=0x9 comm=SpringBoard
+[351.596138] clover r196: sig pid=27 comm=SpringBoard sig=9 n=1 desc=none
+```
+
+- `anchor` 与本内核里 `_psignal_internal` 的链接地址逐位相同，所以 **slide = 0**：宿主可以
+  直接拿链接地址反查符号。`scripts/decode-clover-address.py --kernel <amfi-kernel>` 把
+  `ra=fffffff0076ffd7c` 解成 `_kill + 0x140`（`_kill` 覆盖 `…c3c`–`…e50`）。
+- `ns=-1 code=0`：调用方没带 OS reason，`kill(2)` 就是这么发的；r206 里那条
+  `ns=2 code=0x9` 是内核对 9 号信号自己拼的默认原因，两者并不矛盾。
+- `cs=0x22000301` = `CS_SIGNED | CS_DYLD_PLATFORM | CS_KILL | CS_HARD | CS_VALID`，
+  **没有 `CS_KILLED`（0x01000000）**，所以不是 AMFI 因签名失效杀它；发信者是用户态进程
+  而不是 `kernproc`，所以既不是 jetsam 的 `task_terminate` 也不是内核越界。
+- 三条路只剩一条：**backboardd 主动 `kill(SpringBoard, SIGKILL)`**。宿主从 iPadOS
+  17.7.11 的 OS 卷取出 `/usr/libexec/backboardd`，字符串里有
+  `_pingSystemShellForCollectiveWatchdog:`、`collectiveWatchdogPing`、
+  `watchdogPing: system app claims it's no longer alive`、`Killing %{public}@.`，
+  和「系统外壳集体看门狗判死后杀进程」这条路径对得上。
+- 从信号投递到进程退出 197 ms（`351.399`→`351.596`），SpringBoard 没来得及写任何东西。
+
+### 这一窗的显示：第 4 帧也上屏了，仍然全黑
+
+`frame#0`（`334.3 s`）到 `frame#3`（`353.6 s`）四帧都在，`copy#4 111 ms`、
+`scanout#4 ok bytes=9216000`、`retire#4 done=4 presented=4`；颜色统计仍是
+`ff000000/2262414`，变化像素 41 586，盒子 `305x887..755x1029`。也就是显示链路本身在
+SIGKILL 前后都正常，黑屏的原因就是画 UI 的进程不在。
+
+环里最后一条过滤行是 `[354.398145]`（seq 1194），之后直到 900 s 死线的 panic 记录
+没有任何一条落进环。是预算用尽还是用户态停摆，这一窗分不出来；能确定的是最后一次
+present 是 `frame#3`/`retire#4`。
+
+### 纠正：「内核时基慢约 50 倍」不成立
+
+上一轮把 r170 的 `t=` 当成秒来比环时间，得出 50 倍差。`t=` 的代码是
+`clock_get_uptime(&now); printf("t=%llus", now / 1000000000ULL)`，而
+`clock_get_uptime()` 返回的是 **mach_absolute_time 的原始 tick**，除以 1e9 只是把一个
+CNTVCT 数值当秒打印，并不是秒。用环里自带 CNTVCT 的 r193 行反算：
+
+| 环时间 | `now=`（tick） | ÷19.2 MHz | 比 |
+| --- | --- | --- | --- |
+| 178.177 | 3 420 965 564 | 178.175 s | 1.0000 |
+| 243.477 | 4 674 661 937 | 243.472 s | 1.0000 |
+| 278.481 | 5 346 744 909 | 278.476 s | 1.0000 |
+
+十处全部 1.0000，900 s 死线的 `cnt1−cnt0` 也是 899.5 s。**mach_absolute_time、
+mach_continuous_time 与环时间戳三者一致，时基是准的。** 上一轮 `t=8` 就是
+`417 s × 19.2 MHz / 1e9 = 8.0`，只是基数除错了。这样「时基慢会拖死定时器」这条假设
+也一并去掉，SpringBoard 的死只剩看门狗一条解释。
+
+### 下一步
+
+r208 把这一行再往下钉两格：发信者的**用户态 PC** 与该处指令字（宿主按「页内偏移 +
+指令字」在 backboardd 里找调用点，不需要用户态 slide），以及 SpringBoard 被杀那一刻
+它每个线程的用户态 PC/CPSR/等待事件——被看门狗杀通常意味着主线程卡住，卡在哪一帧
+比谁发的更有用。

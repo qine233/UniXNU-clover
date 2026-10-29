@@ -4,26 +4,31 @@
 ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。
 配套固件仓库 `uefi-clover`（Mu-Silicium 移植），驱动与硬件常量在 `porting.toml`。
 
-现状一句话：**显示链路已经出帧**——XNU 起来、OS/SystemOS/Data 三个卷全挂、launchd 把
-守护进程拉起来；r202 让 `IOMobileFramebufferLegacy` attach + start，r205 往 `/chosen` 写了
-`display-scale=2` 解掉 `FBSDisplayMode` 的断言，r206 里 compositor 第一次真的 present
-（3 帧、每帧 9 216 000 字节扫上屏、`done/presented=3`）。但帧是全黑的（2 304 000 像素里
-2 262 414 个纯黑），因为画 UI 的 SpringBoard 在 417.5 s 被 SIGKILL，之后 490 s 的环里再没
-出现。桌面还差下面几件事。
+现状一句话：**显示链路出帧，SpringBoard 被 backboardd 的看门狗杀掉**——XNU 起来、
+OS/SystemOS/Data 三个卷全挂、launchd 把守护进程拉起来；r202 让
+`IOMobileFramebufferLegacy` attach + start，r205 往 `/chosen` 写了 `display-scale=2`
+解掉 `FBSDisplayMode` 的断言，r206/r207 里 compositor 连续 present（4 帧、每帧 9 216 000
+字节扫上屏、`done/presented=4`）。帧仍是全黑的（2 304 000 像素里 2 262 414 个纯黑），
+因为画 UI 的 SpringBoard 被 backboardd 用 `kill(2)` 杀掉（r207：`_kill+0x140`、
+`ns=-1 code=0`、CS 位不含 `CS_KILLED`）。桌面就差这一件事。
 
 ## 距离 iOS 桌面还差什么
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 被 SIGKILL，发信者未知** | r206 的环里只有一处 SpringBoard：`[417.535062] exit pid=27 ppid=1 t=8s rv=0x9 ns=2 code=0x9`。`ns/code` 是内核在默认致死路径上自己拼的 `build_signal_reason(SIGKILL, NULL)`，不含发信者；r170 的 exec 预算早已用尽，所以没有它的启动记录 | r207 在 `psignal_internal` 的投递点打印接收者、`signal_reason`、CS 标志与**发信者**（内核线程记 pid 0）+ 调用返回地址，把 launchd `kill(2)`、jetsam、CS_KILLED 三条路分开 |
-| 2 | **屏幕上是黑的** | compositor 已 present 三帧：`swap#1/2/3 accepted`、`frame#0/1/2`、`copy#3 93 ms bytes=9216000`、`scanout#3 ok`、`retire#3 done=3 presented=3`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
-| 3 | **内核时基慢约 50 倍** | 环 417.5 s 时 `clock_get_uptime`=8 s，环 758.1 s 时=14 s；`mach_continuous_time` 在环 437.9/600.2 s 读到 8.41/11.52 s。而 900 s 死线按真实时间落在环 909 s。环时间 = 真实时间 | 查 timebase 换算（CNTVCT 频率/换算系数），它会同时影响 launchd 与 compositor 的定时器 |
-| 4 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 5），再问地址 |
-| 5 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
-| 6 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |
-| 7 | watchdogd 每次起就崩 | 自身可执行文件里 `brk #1`（`IOWatchdog` 服务在板上不存在）。r193 的 `panic_on_crash_disabled=1` 已把它从「致命」摘掉，所以它只是噪声 | 写一个最小 `IOWatchdog` 服务，或让 plist 不再要求它 |
+| 1 | **SpringBoard 被 backboardd 的看门狗杀掉** | r207 读数：`killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58 scomm=backboardd ns=-1 code=0x0 cs=0x22000301 ra=fffffff0076ffd7c`。锚点与 `_psignal_internal` 的链接地址逐位相同（slide=0），`ra` 解成 `_kill+0x140`；CS 位不含 `CS_KILLED`，不是签名校验；backboardd 里有 `_pingSystemShellForCollectiveWatchdog:`、`watchdogPing: system app claims it's no longer alive`、`Killing %{public}@.` | r208 取发信者的用户态 PC 与该处指令字钉住调用点，同时抓 SpringBoard 被杀那一刻各线程的 PC/CPSR/等待事件——被看门狗杀通常意味着主线程卡住 |
+| 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
+| 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
+| 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
+| 5 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |
+| 6 | watchdogd 每次起就崩 | 自身可执行文件里 `brk #1`（`IOWatchdog` 服务在板上不存在）。r193 的 `panic_on_crash_disabled=1` 已把它从「致命」摘掉，所以它只是噪声 | 写一个最小 `IOWatchdog` 服务，或让 plist 不再要求它 |
 
-1 与 2 是一条链：SpringBoard 活下来才有 UI，有 UI 桌面才不是黑的；3 影响所有定时器；4–7 是之后要补的板级驱动。
+1 与 2 是一条链：SpringBoard 活下来才有 UI，有 UI 桌面才不是黑的；3–6 是之后要补的板级驱动。
+
+> 时基已核（r207）：r170 的 `t=` 是 `mach_absolute_time()/1e9`，把 CNTVCT 的 tick 数当秒打印，
+> 不是秒。用环里带 CNTVCT 的 r193 行反算，十处比值全是 1.0000，900 s 死线的
+> `cnt1−cnt0` 也是 899.5 s——mach_absolute_time、mach_continuous_time 与环时间戳一致，
+> 时基没有偏慢。上一轮的「慢 50 倍」是基数除错的读法。
 
 ## 已完成（都有真机读数）
 

@@ -778,6 +778,9 @@ def check_board(errors: list) -> str:
         if '{ "clover r204: ", "r204-ubrk", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round204's x19 dump no tee class: the one "
                           "SpringBoard reading the bring-up waits on would land in the ring uncounted")
+        if '{ "clover r207: ", "r207-kill", 48, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round207's sender line no tee class: the one "
+                          "SIGKILL reading the bring-up waits on would land in the ring uncounted")
 
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
@@ -1659,8 +1662,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r206:"):
-        errors.append('[payload] title is not "clover r206: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r207:"):
+        errors.append('[payload] title is not "clover r207: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2657,8 +2660,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r206:"):
-        errors.append('[payload] title is not "clover r206: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r207:"):
+        errors.append('[payload] title is not "clover r207: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -2705,6 +2708,22 @@ def check_board(errors: list) -> str:
         if text.find("proc_handle_critical_exit(proc_t p, int rv)") < 0:
             errors.append(f"{crit_patch.name} does not anchor the probe in "
                           "proc_handle_critical_exit(): the line would not bracket the panic path")
+        # Round207. Round206's SpringBoard exit carried the reason the kernel builds itself on the
+        # default-kill path, so it named no sender. The sender line has to sit in psignal_internal,
+        # above the flavour split, where both the receiver and current_proc() are in scope.
+        kill_line = ("clover r207: killsig pid=%d comm=%s ppid=%d sig=%d spid=%d scomm=%s "
+                     "ns=%d code=0x%llx cs=0x%x ra=%016llx anchor=%016llx")
+        if kill_line not in text:
+            errors.append(f"{crit_patch.name} lacks the r207 sender fields: the frame could not say "
+                          "who kills SpringBoard")
+        # psignal_internal is static and the hunk's context does not reach its signature, so the
+        # anchor is the bad-signal panic that opens it: the probe must follow that line inside the
+        # same delivery, above the flavour split where the sender is still current_proc().
+        kill_at = text.find("clover r207: killsig")
+        open_at = text.find('panic("psignal: bad signal number %d"')
+        if not (0 <= open_at < kill_at):
+            errors.append(f"{crit_patch.name} does not anchor the r207 probe in psignal_internal(): "
+                          "the sender and the receiver would not come from the same delivery")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())

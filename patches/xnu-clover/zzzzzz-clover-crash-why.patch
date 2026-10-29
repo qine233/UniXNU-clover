@@ -85,3 +85,57 @@ diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
  
  	if (p->p_crash_behavior != 0 || p == initproc) {
  		proc_handle_critical_exit(p, rv);
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -2057,6 +2057,50 @@
+ 		panic("psignal: bad signal number %d", signum);
+ 	}
+ 
++	/*
++	 * Round207. Round206 left SpringBoard dead at 417.5 s with rv=0x9 and a
++	 * reason the kernel builds itself on the default-kill path, so the exit
++	 * says nothing about who sent it. Print the receiver and the sender for
++	 * the signals that end a job: current_proc() is the sender for kill(2),
++	 * kernproc (pid 0) for a kernel thread (jetsam, task_terminate), and cs
++	 * says whether the code-signing path flagged the process. ra names the
++	 * psignal wrapper (or the caller it was inlined into); anchor is this
++	 * function's link-time address, so the host recovers the slide.
++	 */
++	if ((signum == SIGKILL || signum == SIGTERM) && (p != PROC_NULL)) {
++		static char clover_kill_comm[8][17];
++		static uint32_t clover_kill_count[8];
++		static uint32_t clover_kill_used;
++		static uint32_t clover_kill_prints;
++		proc_t clover_kill_sender = current_proc();
++		uint32_t clover_kill_slot = 8;
++		uint32_t clover_kill_i;
++
++		for (clover_kill_i = 0; clover_kill_i < clover_kill_used; clover_kill_i++) {
++			if (strncmp(clover_kill_comm[clover_kill_i], p->p_comm, 16) == 0) {
++				clover_kill_slot = clover_kill_i;
++				break;
++			}
++		}
++		if (clover_kill_slot == 8 && clover_kill_used < 8) {
++			clover_kill_slot = clover_kill_used++;
++			strlcpy(clover_kill_comm[clover_kill_slot], p->p_comm, 17);
++		}
++		if (clover_kill_slot < 8 && clover_kill_count[clover_kill_slot] < 4 &&
++		    clover_kill_prints < 40) {
++			clover_kill_count[clover_kill_slot]++;
++			clover_kill_prints++;
++			printf("clover r207: killsig pid=%d comm=%s ppid=%d sig=%d spid=%d scomm=%s ns=%d code=0x%llx cs=0x%x ra=%016llx anchor=%016llx\n",
++			    proc_getpid(p), p->p_comm, p->p_ppid, signum,
++			    proc_getpid(clover_kill_sender), clover_kill_sender->p_comm,
++			    (signal_reason != NULL) ? signal_reason->osr_namespace : -1,
++			    (unsigned long long)((signal_reason != NULL) ? signal_reason->osr_code : 0ULL),
++			    (unsigned int)proc_getcsflags(p),
++			    (unsigned long long)(uintptr_t)__builtin_return_address(0),
++			    (unsigned long long)(uintptr_t)&psignal_internal);
++		}
++	}
++
+ 	mask = sigmask(signum);
+ 	prop = sigprop[signum];
+ 

@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r206: read the FBSDisplayMode frame through x29 -- r205 published /chosen display-scale and the trap stayed at the same pc with the same zero scale, so the probe now prints the entry d9 (scale), x24 (arg3) and the caller's return address to name who passes zero"
+title = "clover r207: name the sender of SpringBoard's SIGKILL -- r206 presented the first frame but SpringBoard died at 417.5 s with a reason the kernel builds itself on the default-kill path, so psignal_internal now prints the receiver, the sender, the reason and the CS flags"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

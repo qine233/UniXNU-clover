@@ -482,6 +482,10 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // lines per pid. It gets eight slots of its own in the kernel, and this class matches the eight of
   // them that can print.
   { "clover r204: ", "r204-ubrk", 64, 0, 0, 0 },
+  // Round207: the sender line prints for SIGKILL/SIGTERM only, at most four per command name and
+  // forty overall. One SpringBoard death is what the ring is read for, so a class of its own keeps
+  // that line from being pushed out by a daemon that is killed in a loop.
+  { "clover r207: ", "r207-kill", 48, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
