@@ -1514,10 +1514,10 @@ def check_board(errors: list) -> str:
     # probe still says r180, drivers/CloverInput says r181, drivers/CloverPower says r182 and
     # drivers/CloverDsp says r183 -- because the tee on the card filters the shared "clover r"
     # prefix, not a round number. Round185 moves the log window to logdump and arms the rings from the
-    # GPT walk, so the SDHCI driver carries its own r185 stamp for the arming line; round186 and
-    # round187 change no driver at all, so that stamp stays and only the menu moves.
-    if not board["payload"]["title"].startswith("clover r187:"):
-        errors.append('[payload] title is not "clover r187: ...": the menu would not name this round')
+    # GPT walk, so the SDHCI driver carries its own r185 stamp for the arming line; round186, round187
+    # and round188 change no driver at all, so that stamp stays and only the menu moves.
+    if not board["payload"]["title"].startswith("clover r188:"):
+        errors.append('[payload] title is not "clover r188: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2232,6 +2232,63 @@ def check_board(errors: list) -> str:
         if "clover r186:" in text or "clover r185:" in text or "clover r170:" in text:
             errors.append(f"{sys_probe.name} carries an older round's string: its own lines are the "
                           "only new readings this round produces")
+
+    # Round188: the r187 frame answered the entry question and left two payloads behind it. keybagd's
+    # last three calls are write(console), close and reboot(0) -- and the host disassembly of its own
+    # binary shows that is its hard-coded fatal path, whose text names the failure and whose exit code
+    # is 71; Protobox denies the reboot, so the task dies instead of rebooting. usermanagerd's last
+    # entry is write_nocancel(1, ...) with no entry after it, so either the write never returned or the
+    # task simply stopped doing I/O. Round188 therefore keeps the r187 prints untouched and adds three
+    # readings around them: the first CLOVER_SYS_WHY_TEXT_BYTES of every write's buffer (the fatal
+    # message), the path behind every failing open/stat/access (the five open_dprotected_np ENOENTs and
+    # the openat one), and the return value of every write. It is still log-only: no argument, no
+    # return value and no errno may change, so the patch may only add lines.
+    sys_probe2 = next((base / "patches/xnu-clover/zzzzz-clover-syswhy2.patch"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "patches/xnu-clover/zzzzz-clover-syswhy2.patch").is_file()), None)
+    if sys_probe2 is None:
+        errors.append("patches/xnu-clover/zzzzz-clover-syswhy2.patch is missing: the next frame would "
+                      "still say keybagd wrote to the console without saying what it wrote, and which "
+                      "path usermanagerd's five ENOENT opens were looking for")
+    else:
+        text = sys_probe2.read_text()
+        for needle in ("bsd/dev/arm/systemcalls.c",
+                       "#define CLOVER_SYS_WHY_PATH_LIMIT   320",
+                       "#define CLOVER_SYS_WHY_WRITE_LIMIT  96",
+                       "#define CLOVER_SYS_WHY_TEXT_BYTES   64",
+                       "case SYS_open_dprotected_np:", "case SYS_openat_nocancel:",
+                       "copyin(src, dst, n) != 0",
+                       "copyinstr(upath, path, sizeof(path), &len) != 0",
+                       "clover_sys_why_text(text, saved_state64(state)->x[1],",
+                       '"clover r188: unix-write n=%d pid=%d tid=%lld comm=%s code=%d "',
+                       '"clover r188: unix-path n=%d pid=%d tid=%lld comm=%s code=%d "',
+                       "clover r188: unix-wrote n=%d pid=%d tid=%lld comm=%s code=%d fd=%d ret=%lld err=%d\\n"):
+            if needle not in text:
+                errors.append(f"{sys_probe2.name} lacks {needle[:44]}...: without it the frame cannot "
+                              "name keybagd's fatal message, the missing path, or whether the last "
+                              "write came back")
+        added = [line for line in text.splitlines() if line.startswith("+") and not
+                 line.startswith("+++")]
+        removed = [line for line in text.splitlines() if line.startswith("-") and not
+                   line.startswith("---")]
+        if removed:
+            errors.append(f"{sys_probe2.name} deletes {removed[0][:60]!r}: r188 only adds readings, "
+                          "and a deleted line is a change in what the boot tasks are told")
+        joined = "\n".join(added)
+        if len(added) < 60:
+            errors.append(f"{sys_probe2.name} adds only {len(added)} lines: the three readers, the "
+                          "two tables and the copy helpers do not fit in fewer")
+        if joined.find("clover_sys_why_text(text,") > joined.find("clover r188: unix-write") or \
+                joined.find("clover r188: unix-write") < 0:
+            errors.append(f"{sys_probe2.name} prints the write before copying the buffer: the text "
+                          "would be read after the call that may have consumed it")
+        if joined.find("clover r188: unix-wrote") < joined.find("clover r188: unix-write"):
+            errors.append(f"{sys_probe2.name} prints the write result before the write entry: the "
+                          "pair would not read as one call")
+        for older in ("clover r187:", "clover r186:", "clover r185:"):
+            if older in joined:
+                errors.append(f"{sys_probe2.name} adds a {older!r} line: its own r188 lines are the "
+                              "only new readings this round produces")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())

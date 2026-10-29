@@ -14360,3 +14360,108 @@ power r182 / dsp r183），`board.toml` 标题升到 `clover r187:`。
 `unix-in` / `mach-in`，以及它前面最近的一条 `unix-fail`；如果 mach 那侧一条都没有，墙就被完整划到
 BSD 那半，下一次只需要在那一半里继续收窄。
 
+## round187 读数（v0.5.47 实机，2026-10-29）：keybagd 走完它自己的 fatal 路径，usermanagerd 停在一次 write 的进入点
+
+logdump 读回 622592 字节，解码 1602 行。kind-20 报告窗是空的（这一轮没有 panic），verdict 环里是
+5 条 tee 统计加上膛那三行；内核环里 r187 的三类行都在：`unix-in` 打印 113 条、`mach-in` 97 条、
+`unix-fail` 38 条，计数器分别走到 768 / 219 / 128。
+
+fail 预算**正好**在 59.792130 打满（`n=128` 是那条第 128 行，也是 `CLOVER_SYS_WHY_FAIL_LIMIT` 的
+值），之后三秒里任何失败都不会再出声——上一轮写下的那种「预算用尽后的沉默」，这一帧真的出现了，
+读帧的人不能把它当成新的墙。entry 两条都没到 512（768 是 256 的整数倍，那是心跳行，不是第 768 次
+打印）。
+
+`keybagd`（pid 11）这一支这次是完整的一条路径，不再是「唯一非零退出的进程」：
+
+```
+[   48.875134]: clover r187: unix-in n=273 pid=11 tid=231 comm=keybagd code=55 a0=0 a1=0
+[   48.905051]: Protobox: keybagd(11) deny(1) syscall-unix 55clover r187: unix-fail n=58 pid=11 tid=231 comm=keybagd code=55 err=1 a0=0
+[   48.934978]: clover r187: unix-in n=274 pid=11 tid=231 comm=keybagd code=1 a0=47 a1=0
+[   48.964586]: clover r170: exit pid=11 ppid=1 t=0s rv=0x4700 ns=-1 code=0x0 comm=keybagd
+```
+
+`code=55` 是 `reboot(2)`（`bsd/kern/syscalls.master:109`），`err=1` 是 EPERM，拒绝者是 Protobox 的
+syscall 过滤器（`deny(1) syscall-unix 55`）；下一行 `code=1` 是 `exit`，`a0=47` 就是 71。这和宿主
+反汇编出的那条唯一路径逐字对上：file `0x100015b24` 的 `bl _reboot` 前面是
+`fopen("/dev/console","a")` → `fprintf("FATAL KEYBAG ERROR: %s\n")` →
+`fwrite("REBOOTING INTO RECOVERY MODE.\n")` → `fclose` → `reboot(0)` → `exit(71)`，而 fatal 那几笔
+就在同一条线程上：`code=398`（`open_nocancel`）打开 `/dev/console`、`code=397`（`write_nocancel`）
+fd=3 写出、`code=399`（`close_nocancel`）收起。所以 `rv=0x4700` 不是崩溃，是它判定自己该进恢复
+模式、被拒绝之后按设计退出。帧上没有说它走的是两个触发点里的哪一个（system bag / data volume），
+两个都指向我们给的 scratch data 卷——这一支属于「data 卷还不是真的」那一格，不是挡住桌面的那格。
+
+`usermanagerd`（pid 12）的最后两条：
+
+```
+[   62.923332]: clover r187: mach-in n=219 pid=12 tid=232 comm=usermanagerd trap=-47 a0=16f54a5c0 a1=404000102
+[   63.066398]: clover r187: unix-in n=768 pid=12 tid=232 comm=usermanagerd code=397 a0=1 a1=12600f400
+```
+
+`trap=-47` 是 `mach_msg2_trap`（`osfmk/kern/syscall_sw.c:154`），`code=397` 是 `write_nocancel`
+（`bsd/kern/syscalls.master:591`），`a0=1` 是 stdout。此后到 300 秒死线复位，环里再没有任何一行：
+不但是 r187 的入口行，白名单里另外十几个族（`launchd` / `apfs` / `dyld` / `AMFI` / `panic` …）也一条
+都没有。环的尾巴是最后一次块请求尾部那一眼看到的位置，所以这段沉默同时说明两件事——usermanagerd
+的线程没有再进内核，卡上也没有新的块 I/O 把 tee 往前推。停点因此从「等某个 mach 消息」收窄成
+「一次 `write(1, …)` 之后什么都不再发生」。
+
+往前翻 `n=60..128` 的那段失败：19 次名字查找落空（`code=5` open 10 条、`code=216`
+`open_dprotected_np` 5 条、`code=463` openat 5 条，全是 `err=2`；另有 1 条 `code=338` `stat64`
+`err=2`）、`code=286` `gettid` ×3 `err=3`、`code=170` `csops_audittoken` `err=34`、`code=550`
+`map_with_linking_np` `err=22`、`code=535` `err=78`——这份内核的 `syscalls.master:847` 把 535 写成
+`enosys` 占位，所以用户态拿到的是 ENOSYS。**这些行只有 `a0=` 指针，没有路径**：指针每次开机都在
+漂，路径才是可复现的读数，这是这一帧留下的唯一一块空白。
+
+## round188（v0.5.48）：让那 19 次落空的查找和那次 write 自己报出内容
+
+### 排期照旧不动，只补 r187 没抄回来的那三样东西
+
+`usermanagerd` 停住前最后一句是 `write_nocancel(fd=1, buf)`。r187 只对**失败**的调用留出口行，所以
+「write 没返回」和「write 返回了、之后再没调用」在那一帧上是同一种沉默；而 r187 也只打印了
+`a0=`，于是 19 次 ENOENT 的路径全部丢在用户态地址里。本轮加的就是这三样：write 进内核时它带着的
+fd/长度/前 64 字节文本，每一次失败的 open/stat/access 返回后把用户态路径抄回来，以及每条 write 的
+返回值。
+
+- `unix-write n= pid= tid= comm= code= fd= len= txt=…`：进入打印，`copyin` 最多 64 字节，非可打印
+  字节换成 `.`，`copyin` 失败就打印空串——打印的是 usermanagerd 最后想说出去的那句话本身。
+- `unix-path n= pid= tid= comm= code= err= path=…`：`open`/`open_nocancel`/`access`/`stat`/`stat64`/
+  `openat`/`openat_nocancel`/`open_dprotected_np` 返回后 `copyinstr` 128 字节。openat 一族的路径在
+  `x[1]` 而不是 `x[0]`，这一处单独列了 `clover_sys_why_fd_code()`，否则前 5 条 openat 会打印成
+  fd 的值。
+- `unix-wrote n= pid= tid= comm= code= fd= ret= err=…`：write 返回后打印 `uu_rval[0]` 与 `error`。
+  这一行是「write 没回来」和「回来了但之后再没调用」之间唯一的判据。
+
+三条打印的预算各自独立：path 320 条（失败最多 128 条，留一倍余量，因为每条失败前面可能还有一次
+成功的 open）、write 96 条（两次都算，进入与返回各占一条）、文本 64 字节。预算必须小于环的 512
+槽、又要在 tee 每趟只放行 8 行之前把最有价值的那几句送出去——节流是丢行不是排队（`throttled=493`
+到 63 秒为止），所以宁少不滥。
+
+`patches/xnu-clover/zzzzz-clover-syswhy2.patch` 因此是 125 行、100 条新增、0 条删除，只碰
+`bsd/dev/arm/systemcalls.c`，排序在 `zzzzz-clover-syswhy.patch` 之后（`.` 0x2e < `2` 0x32），r187
+那三条打印原样留在上下文里。**只加日志**的硬断言照旧：checker 不许出现以 `-` 开头的行；「旧轮串
+缺席」这一条改成只看**新增行**，因为补丁的上下文里本来就带着 r187 的格式串。驱动戳一律不动
+（display r180 / input r181 / power r182 / dsp r183），`board.toml` 标题升到 `clover r188:`。
+
+两处实现细节各能坑掉一次冷刷：`copyinstr()` 的 done 参数是 `size_t *`，`vm_size_t *` 编不过；
+`copyin` 与 `copyinstr` 的声明分别在 `libkern/libkern.h:202` 与 `bsd/libkern/copyio.h:35`，前者经
+`sys/systm.h:113` 已经在场，后者本来就被 `systemcalls.c` 用着。
+
+### 构建与闸门
+
+- 构建侧还是那条一次性 object 预 pass；`archives` 与 XNU 的顺序死结本轮没修，不在优先级上。
+- 内核 `007e0122…`（经过 `normalize-kernel-macho.py`，968 个 object 戳全清）；AMFI 两刀落在 file
+  `0x1aad0e4`/`0x1aad16c`（与 round186/187 同址，虚拟地址未动）得到 `bf50c592…`。
+- payload `bf61bdcc…`（56 MiB），卷内 kernel `c58d218b…`（52195328 字节）、`unixnu.toml`
+  `683c4b4a…`、ADT `dcc620b6…`（13516 字节）、trustcache `7c369ce0…`、`scratch-data.img`
+  `614b8356…`；入口探针 6854 字节 / 37 段。`boot.img` `196b284f…` 与 round183–187 逐字节相同。
+- `check-clover.py` 绿（标题、补丁在场、12 条针、只加日志、旧轮串只查新增行）；
+  `verify-clover-payload.py` 32 条 OK，新增 `write/path contents probe linked OK`；五道宿主自测全
+  PASS。
+
+### 下一帧要读什么
+
+冷刷只写 cache，跑无人值守脚本读回 logdump。第一眼看 `unix-wrote … fd=1` 在不在：在，说明这次
+write 返回了（`ret=` 是多少就说明它写出去多少字节），墙在用户态的下一次等待上；不在，说明 write
+本身没回来。第二眼看 `unix-write … txt=` 那串字，那是 usermanagerd 卡住前最后想说出去的一句话。
+第三眼看 19 条 `unix-path … err=2 path=` 是不是同一组路径、属于哪个 boot task 的资源——如果它们
+全是同一个目录前缀，那墙就从「某个调用没回来」变成「某个资源在卷上不存在」。
+

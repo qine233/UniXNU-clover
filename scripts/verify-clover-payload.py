@@ -654,6 +654,26 @@ def check_sys_why(kernel: bytes) -> bool:
     return ok
 
 
+def check_sys_why2(kernel: bytes) -> bool:
+    """Round188 reads what the two stuck tasks were carrying. r187's frame ends keybagd with a write to
+    the console, a close and a denied reboot(0) -- its own fatal path, whose text names the failure --
+    and usermanagerd with write_nocancel(1, ...) and nothing after it. So the image has to carry the
+    buffer text and the return of every write, and the path behind every failing open/stat/access; a
+    missing string means the next card read would again show the calls without their contents."""
+    label = "kernel.macho: write/path contents probe linked"
+    found = {"unix-write": (b"clover r188: unix-write n=%d pid=%d tid=%lld comm=%s code=%d fd=%d "
+                            b"len=%lu txt=%s\n") in kernel,
+             "unix-path": (b"clover r188: unix-path n=%d pid=%d tid=%lld comm=%s code=%d err=%d "
+                           b"path=%s\n") in kernel,
+             "unix-wrote": (b"clover r188: unix-wrote n=%d pid=%d tid=%lld comm=%s code=%d fd=%d "
+                            b"ret=%lld err=%d\n") in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -1058,6 +1078,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_log_window(kernel)
         ok &= check_spawn_why(kernel)
         ok &= check_sys_why(kernel)
+        ok &= check_sys_why2(kernel)
     return 0 if ok else 1
 
 

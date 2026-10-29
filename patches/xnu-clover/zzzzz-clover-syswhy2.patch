@@ -1,0 +1,125 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 2dd5ab8..16c4270 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -105,6 +105,67 @@ clover_sys_why_watched(const char *comm)
+ 	return strcmp(comm, "usermanagerd") == 0 || strcmp(comm, "keybagd") == 0;
+ }
+ 
++/*
++ * Clover (round188): the round187 frame says which calls the two stuck boot
++ * tasks made but not what they carried.  keybagd's last calls are a write to
++ * the console, a close and reboot(0); keybagd's own code, read on the host,
++ * shows that is its hard-coded fatal path and that the text it writes names
++ * the failure.  usermanagerd's last entry is write_nocancel(1, ...) with
++ * nothing after it, which is either a write that never came back or a process
++ * that stopped doing I/O.  So the same two names get three more readings: the
++ * path behind a failing open/stat/access, the first text of every write, and
++ * the return of every write.  Log only -- no argument, no return value and no
++ * errno is changed anywhere.
++ */
++#define CLOVER_SYS_WHY_PATH_LIMIT   320
++#define CLOVER_SYS_WHY_WRITE_LIMIT  96
++#define CLOVER_SYS_WHY_TEXT_BYTES   64
++
++static int clover_sys_why_paths;
++static int clover_sys_why_writes;
++
++static int
++clover_sys_why_path_code(int code)
++{
++	switch (code) {
++	case SYS_open:
++	case SYS_open_nocancel:
++	case SYS_access:
++	case SYS_stat:
++	case SYS_stat64:
++	case SYS_openat:
++	case SYS_openat_nocancel:
++	case SYS_open_dprotected_np:
++		return 1;
++	default:
++		return 0;
++	}
++}
++
++static int
++clover_sys_why_fd_code(int code)
++{
++	return code == SYS_openat || code == SYS_openat_nocancel || code == SYS_open_dprotected_np;
++}
++
++static void
++clover_sys_why_text(char *dst, user_addr_t src, size_t srclen)
++{
++	size_t n = srclen < CLOVER_SYS_WHY_TEXT_BYTES ? srclen : CLOVER_SYS_WHY_TEXT_BYTES;
++	size_t i;
++
++	if (n == 0 || copyin(src, dst, n) != 0) {
++		dst[0] = '\0';
++		return;
++	}
++	for (i = 0; i < n; i++) {
++		if (dst[i] < 0x20 || dst[i] > 0x7e) {
++			dst[i] = '.';
++		}
++	}
++	dst[n] = '\0';
++}
++
+ /* Called from handle_svc() for every mach trap (trap_no < 0). */
+ void
+ clover_sys_why_mach(int trap_no, arm_saved_state_t *state)
+@@ -205,6 +266,20 @@ unix_syscall(
+ 			    code, (unsigned long)saved_state64(state)->x[0],
+ 			    (unsigned long)saved_state64(state)->x[1]);
+ 		}
++		if (code == SYS_write || code == SYS_write_nocancel) {
++			char text[CLOVER_SYS_WHY_TEXT_BYTES + 1];
++
++			clover_sys_why_writes++;
++			if (clover_sys_why_writes <= CLOVER_SYS_WHY_WRITE_LIMIT) {
++				clover_sys_why_text(text, saved_state64(state)->x[1],
++				    (size_t)saved_state64(state)->x[2]);
++				printf("clover r188: unix-write n=%d pid=%d tid=%lld comm=%s code=%d "
++				    "fd=%d len=%lu txt=%s\n", clover_sys_why_writes, pid,
++				    thread_tid(current_thread()), proc->p_comm, code,
++				    (int)saved_state64(state)->x[0],
++				    (unsigned long)saved_state64(state)->x[2], text);
++			}
++		}
+ 	}
+ 
+ #ifdef CONFIG_IOCOUNT_TRACE
+@@ -251,6 +326,31 @@ skip_syscall:
+ 			    clover_sys_why_unix_fails, pid, thread_tid(current_thread()), proc->p_comm,
+ 			    code, error, (unsigned long)saved_state64(state)->x[0]);
+ 		}
++		if (clover_sys_why_path_code(code)) {
++			char path[128];
++			user_addr_t upath = (user_addr_t)saved_state64(state)->x[0];
++			size_t len = 0;
++
++			clover_sys_why_paths++;
++			if (clover_sys_why_paths <= CLOVER_SYS_WHY_PATH_LIMIT) {
++				if (clover_sys_why_fd_code(code)) {
++					upath = (user_addr_t)saved_state64(state)->x[1];
++				}
++				if (copyinstr(upath, path, sizeof(path), &len) != 0) {
++					path[0] = '\0';
++				}
++				printf("clover r188: unix-path n=%d pid=%d tid=%lld comm=%s code=%d "
++				    "err=%d path=%s\n", clover_sys_why_paths, pid,
++				    thread_tid(current_thread()), proc->p_comm, code, error, path);
++			}
++		}
++	}
++	if ((code == SYS_write || code == SYS_write_nocancel) &&
++	    clover_sys_why_watched(proc->p_comm) &&
++	    clover_sys_why_writes <= CLOVER_SYS_WHY_WRITE_LIMIT) {
++		printf("clover r188: unix-wrote n=%d pid=%d tid=%lld comm=%s code=%d fd=%d ret=%lld err=%d\n",
++		    clover_sys_why_writes, pid, thread_tid(current_thread()), proc->p_comm, code,
++		    (int)saved_state64(state)->x[0], (long long)uthread->uu_rval[0], error);
+ 	}
+ 
+ 	unix_syscall_kprintf("code %d, error %d, results %x, %x (pid %d - %s, tid %lld)\n", code, error,
