@@ -107,6 +107,10 @@ KINDS = {17: "report-17", 19: "report-19", 20: "panic-20",
          24: "boot-24", 25: "probe-25"}
 FLIGHT_EVENTS = {1: "read", 2: "write", 3: "beat"}
 FLIGHT_DIRS = {0: "read", 1: "write", 2: "beat"}
+# Round213's holder stages. A beat whose stage word has not moved for 75 s is the request that
+# stopped, so the name is what the dump prints where r212 could only print the request.
+FLIGHT_STAGES = {0: "idle", 1: "entry", 2: "idleWait", 3: "check", 4: "adma", 5: "batch",
+                 6: "single", 7: "settle", 8: "tail", 9: "tee", 10: "flush", 11: "commit"}
 DRIVER_PREFIX = b"CloverSdhci "
 
 
@@ -271,7 +275,7 @@ def report(records, newest_only=False, order_by_seq=False):
     return len(records)
 
 
-FLIGHT_WORDS = 22
+FLIGHT_WORDS = 35
 
 
 def decode_flight(data, first_lba):
@@ -331,6 +335,11 @@ def decode_flight(data, first_lba):
                 "guard_waits": words[16], "beat_misses": words[17],
                 "pending_kernel": words[18], "pending_driver": words[19],
                 "prev_dir": words[20], "prev_blocks": words[21],
+                "stage": words[22], "stage_ms": words[23],
+                "stuck": words[24], "recovered": words[25], "steals": words[26],
+                "stuck_stage": words[27], "stage_lba": words[28], "stage_blocks": words[29],
+                "stage_pid": words[30], "stage_dir": words[31],
+                "cur_pid": words[32], "comm0": words[33], "comm1": words[34],
             }
             records.append((slot, record, problems))
         groups[name] = records
@@ -361,6 +370,12 @@ def flight_chain(records):
         seq -= 1
     chain.reverse()
     return chain
+
+
+def flight_comm(record):
+    """The caller's name, first eight bytes as flightEnter stores them."""
+    raw = struct.pack("<II", record["comm0"], record["comm1"])
+    return raw.split(b"\0", 1)[0].decode("ascii", "replace") or "-"
 
 
 def flight_report(groups):
@@ -395,7 +410,11 @@ def flight_report(groups):
               f"guard={record['guard_waits']} miss={record['beat_misses']} "
               f"pend={record['pending_kernel']}/{record['pending_driver']} "
               f"prev={FLIGHT_DIRS.get(record['prev_dir'], '?')}/{record['prev_blocks']}/"
-              f"{record['prev_ms']}ms/{record['prev_done']}")
+              f"{record['prev_ms']}ms/{record['prev_done']} "
+              f"stage={FLIGHT_STAGES.get(record['stage'], '?')}({record['stage']})"
+              f"/{record['stage_ms']}ms pid={record['cur_pid']} "
+              f"comm={flight_comm(record)} stuck={record['stuck']} "
+              f"recov={record['recovered']} steal={record['steals']}")
     print(f"flight: {len(beats)} beat records in this boot's window")
     for record in beats:
         flags = []
@@ -406,7 +425,13 @@ def flight_report(groups):
         print(f"  beat  seq {record['seq']:>3} slot {record['slot']:>2} t={record['t_ms']:>8}ms "
               f"ps={record['present']:#010x} inh={','.join(flags) or '-'} "
               f"ops={record['ops']} guard={record['guard_waits']} miss={record['beat_misses']} "
-              f"pend={record['pending_kernel']}/{record['pending_driver']}")
+              f"pend={record['pending_kernel']}/{record['pending_driver']} "
+              f"stage={FLIGHT_STAGES.get(record['stage'], '?')}({record['stage']})"
+              f"/{record['stage_ms']}ms "
+              f"stage_lba={record['stage_lba']} stage_blocks={record['stage_blocks']} "
+              f"stage_pid={record['stage_pid']} "
+              f"stuck={record['stuck']} recov={record['recovered']} steal={record['steals']} "
+              f"stuck_stage={FLIGHT_STAGES.get(record['stuck_stage'], '?')}")
     if entries and beats:
         gap = entries[-1]["t_ms"] - beats[-1]["t_ms"]
         print(f"flight: newest entry seq {entries[-1]['seq']} at t={entries[-1]['t_ms']} ms, "
@@ -420,7 +445,10 @@ def flight_report(groups):
 
 def build_flight_record(lba, seq, event, dir_, op_lba, op_blocks, t_ms=0, present=0,
                         prev_done=0, prev_ms=0, prev_dir=0, prev_blocks=0, ops=0,
-                        guard_waits=0, beat_misses=0, pending=(0, 0), slot=None, kind=FLIGHT_KIND):
+                        guard_waits=0, beat_misses=0, pending=(0, 0), slot=None, kind=FLIGHT_KIND,
+                        stage=0, stage_ms=0, stuck=0, recovered=0, steals=0, stuck_stage=0,
+                        stage_lba=0, stage_blocks=0, stage_pid=0, stage_dir=0,
+                        cur_pid=0, comm=(0, 0)):
     """One round210 flight block as flightWrite lays it out, for selftest."""
     if slot is None:
         slot = seq % (FLIGHT_BEAT_SLOTS if event == 3 else FLIGHT_ENTRY_SLOTS)
@@ -428,7 +456,10 @@ def build_flight_record(lba, seq, event, dir_, op_lba, op_blocks, t_ms=0, presen
     return struct.pack(f"<{FLIGHT_WORDS}I", MAGIC[0], MAGIC[1], lba, kind, seq, slot,
                        event, dir_, op_lba, op_blocks, t_ms, prev_done, prev_ms,
                        present, flags, ops, guard_waits, beat_misses, pending[0],
-                       pending[1], prev_dir, prev_blocks).ljust(SECTOR, b"\0")
+                       pending[1], prev_dir, prev_blocks,
+                       stage, stage_ms, stuck, recovered, steals, stuck_stage,
+                       stage_lba, stage_blocks, stage_pid, stage_dir,
+                       cur_pid, comm[0], comm[1]).ljust(SECTOR, b"\0")
 
 
 def build_record(kind, slot, lba, body_text, seq=0, boot=0):
@@ -606,7 +637,12 @@ def selftest():
                                   t_ms=100 * seq, present=3, prev_done=1 if seq else 0,
                                   prev_ms=40 + seq, prev_dir=1, prev_blocks=8, ops=seq,
                                   guard_waits=seq // 2, beat_misses=seq // 3,
-                                  pending=(7, 2)),
+                                  pending=(7, 2),
+                                  stage=1 + seq % 11, stage_ms=10 * seq, stuck=seq // 4,
+                                  recovered=seq // 5, steals=seq // 6, stuck_stage=seq % 12,
+                                  stage_lba=2000 + seq, stage_blocks=seq % 9,
+                                  stage_pid=100 + seq, stage_dir=1, cur_pid=300 + seq,
+                                  comm=(int.from_bytes(b"apfs", "little"), 0)),
               FLIGHT_ENTRY_OFFSET + seq % FLIGHT_ENTRY_SLOTS)
     for seq in range(6):
         place(flight,
@@ -627,6 +663,13 @@ def selftest():
             newest["pending_kernel"], newest["pending_driver"]) == (1, 8, 53, 1, 13, 6, 4, 7, 2), newest
     assert (beats[-1]["t_ms"], beats[-1]["beat_misses"], beats[-1]["pending_kernel"]) == \
            (21000, 5, 9), beats[-1]
+    # Round213's words 22..34: a misordered pair would print a plausible table of the wrong
+    # columns, and the stage name is the whole reading, so every new field is round-tripped.
+    assert (newest["stage"], newest["stage_ms"], newest["stuck"], newest["recovered"],
+            newest["steals"], newest["stuck_stage"], newest["stage_lba"],
+            newest["stage_blocks"], newest["stage_pid"], newest["stage_dir"],
+            newest["cur_pid"]) == (3, 130, 3, 2, 2, 1, 2013, 4, 113, 1, 313), newest
+    assert flight_comm(newest) == "apfs", newest
     assert all(not problems for _, _, problems in groups["entries"] + groups["beats"])
     assert flight_report(groups) == len(groups["entries"]) + len(groups["beats"])
 

@@ -852,6 +852,25 @@ def check_boot_record(kernel: bytes) -> bool:
     return ok
 
 
+def check_host_ticket(kernel: bytes) -> bool:
+    """Round213 replaces the IOLock with a ticket word. The image has to carry the arming line,
+    the bounded waiter's report, and the watchdog's own report: without all three a dump cannot
+    tell 'the guard was never armed', 'somebody waited out the bound' and 'the beat recovered a
+    stuck holder' apart, and those are the three outcomes this round is decided by."""
+    label = "kernel.macho: r213 host ticket armed"
+    found = {"armed": (b"CloverSdhci r213: host ticket armed, wait=%llums stuck=%llums\n")
+                      in kernel,
+             "waited": (b"CloverSdhci r213: guard wait gave up after %llu ms owner=%u stage=%u\n")
+                       in kernel,
+             "stuck": (b"CloverSdhci r213: guard stuck stage=%u dir=%u lba=%u blocks=%u pid=%u "
+                       b"held=%llu ms\n") in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_flight_region(kernel: bytes) -> bool:
     """Round210 leaves a record before the stop instead of after it. The r209 frame showed the
     kernel alive to the deadline and the card refusing the sink, so the image has to carry the
@@ -1330,6 +1349,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_panic_tail_read(kernel)
         ok &= check_boot_record(kernel)
         ok &= check_flight_region(kernel)
+        ok &= check_host_ticket(kernel)
         ok &= check_signal_desc_probe(kernel)
         ok &= check_user_breakpoint_probe(kernel)
     return 0 if ok else 1

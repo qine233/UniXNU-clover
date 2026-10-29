@@ -859,9 +859,25 @@ def check_board(errors: list) -> str:
                  "no beat entry point for the timer to call")):
             if needle not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci lacks {needle[:40]}...: {why}")
-        if "if (!IOLockTryLock (gBlockLock))" not in sdhci_source:
-            errors.append("the flight beat does not TryLock the block guard: a beat would wait on "
-                          "or interrupt the transfer it is meant to observe")
+        # Round213: the beat must never wait, so it takes the host with one compare-and-swap; and a
+        # holder whose stage has not moved has to be recovered by that same beat, or the one request
+        # that stopped still costs the boot (r212: every later reader and the panic sink queued
+        # behind it). Naming both halves here keeps a later edit from leaving only the sampler.
+        for needle, why in (
+                ("static bool tryTakeHost (uint32_t &token)",
+                 "no lock-free acquire: the beat would have to wait for the request it samples"),
+                ("if (!tryTakeHost (token))",
+                 "the beat does not take the host with the one-shot ticket"),
+                ("static void recoverStuckRequest (uint32_t stage, uint32_t owner)",
+                 "no recovery path: a stuck holder would keep the host until the boot died"),
+                ("recoverStuckRequest (stage, owner);",
+                 "the beat measures a stuck stage and never acts on it"),
+                ("static const uint64_t kGuardStuckMs = 75000;",
+                 "the stuck bound is not the measured 75 s"),
+                ("dropHostTicket (token);",
+                 "the beat releases with the request's release, which would erase the holder's stage")):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci lacks {needle[:44]!r}: {why}")
         armcpu_source = (REPO / "drivers/ArmCpu/ArmCpu.cpp").read_text()
         if "clover_emmc_flight_beat ();" not in armcpu_source:
             errors.append("drivers/ArmCpu never calls the round210 beat: nothing would sample the "
@@ -1747,8 +1763,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r212:"):
-        errors.append('[payload] title is not "clover r212: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r213:"):
+        errors.append('[payload] title is not "clover r213: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -1917,10 +1933,17 @@ def check_board(errors: list) -> str:
                        "switchExtCsd (kExtCsdCacheCtrl, 1, backResponse, backStatus, &backSpins)",
                        "CloverSdhci r171: write cache size=",
                        "CloverSdhci r171: flush failed flushed=",
-                       "static IOLock *gBlockLock = nullptr;",
-                       "gBlockLock = IOLockAlloc ();",
-                       "IOLockLock (gBlockLock);",
-                       "static void releaseBlockGuard (void)"):
+                       "static volatile uint32_t gHostOwner = 0;",
+                       "static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start, "
+                       "uint32_t &token)",
+                       "static void releaseBlockGuard (uint32_t &token)",
+                       "static bool guardLost (uint32_t token)",
+                       "static const uint64_t kGuardWaitMs = 60000;",
+                       "static const uint32_t kStageEntry = 1;",
+                       "static const uint32_t kStageCommit = 11;",
+                       "CloverSdhci r213: guard wait gave up after %llu ms owner=%u stage=%u",
+                       "CloverSdhci r213: guard stuck stage=%u dir=%u lba=%u blocks=%u pid=%u "
+                       "held=%llu ms"):
             if needle not in text:
                 errors.append(f"{sdhci.name} lacks {needle[:40]}...: r171's batch verdict, cache "
                               "commit or host serialization would be incomplete")
@@ -1929,10 +1952,16 @@ def check_board(errors: list) -> str:
         if "gBlockGuard" in text:
             errors.append(f"{sdhci.name} still arbitrates the host with a spin flag: the batch path "
                           "the flag protects is the one the frame shows is missing")
-        if "__atomic_store_n (&gBlockReady, 1, __ATOMIC_RELEASE);" in text and \
-                "if (gBlockLock) {" not in text:
-            errors.append(f"{sdhci.name} publishes the block device without proving the host lock "
-                          "exists: an unsynchronized card engine is worse than no device")
+        # Round213 replaced the IOLock with the ticket on purpose: an IOLock has no timeout, and the
+        # r212 frame is exactly one holder that never returned. Putting a lock back would restore
+        # the boot-killing behaviour, so any IOLock in this driver is a regression here.
+        if "IOLockAlloc" in text or "IOLockLock" in text:
+            errors.append(f"{sdhci.name} allocates or takes an IOLock again: round213's ticket is "
+                          "the bound that keeps one stuck request from stopping every later one")
+        if "__atomic_store_n (&gHostArmed, 1u, __ATOMIC_RELEASE);" not in text or \
+                "__atomic_store_n (&gBlockReady, 1, __ATOMIC_RELEASE);" not in text:
+            errors.append(f"{sdhci.name} publishes the block device without arming its host ticket: "
+                          "an unsynchronized card engine is worse than no device")
         # The cache-flush pair must be a commit *and* a re-enable: leaving CACHE_CTRL at 0 after a
         # sync is r167's write-through with a different name.
         if "switchExtCsd (kExtCsdCacheCtrl, 0" in text and \
@@ -2754,8 +2783,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r212:"):
-        errors.append('[payload] title is not "clover r212: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r213:"):
+        errors.append('[payload] title is not "clover r213: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -2765,7 +2794,7 @@ def check_board(errors: list) -> str:
         errors.append("CloverSdhci.cpp still enables the card's write cache at bring-up: r191 showed "
                       "that the first commit after that enable never returns and cannot report")
     skip_at = block_source.find("CloverSdhci r192: commit skipped")
-    guard_at = block_source.find("acquireBlockGuard (frequency, start)",
+    guard_at = block_source.find("acquireBlockGuard (frequency, start, token)",
                                  block_source.find("extern \"C\" uint32_t clover_emmc_flush_cache"))
     if not (0 <= skip_at < guard_at):
         errors.append("clover_emmc_flush_cache records the skipped commit after taking the block "
@@ -3052,11 +3081,11 @@ def check_board(errors: list) -> str:
         text = sdhci.read_text()
         for needle in ("static volatile uint32_t gGuardHandoffs = 0;",
                        "static volatile uint64_t gGuardWorstWait = 0;",
-                       "static bool handOffBlockGuard (uint64_t &frequency, uint64_t &start, uint64_t &owned)",
+                       "static bool handOffBlockGuard (uint64_t &frequency, uint64_t &start, uint64_t &owned,\n                               uint32_t &token)",
                        "static void reportGuardHandoff (const char *dir, uint32_t lba, uint32_t blocks, uint32_t done)",
                        "CloverSdhci r178: %s handoff lba=%u blocks=%u done=%u cuts=%u waits=%u worst=%llu ms",
                        "if (owned + readCounter () - start > deadline) {",
-                       "if (!handOffBlockGuard (frequency, start, owned)) {",
+                       "if (!handOffBlockGuard (frequency, start, owned, token)) {",
                        "if (done < blocks && sinceCut >= kReadChunkBlocks) {"):
             if needle not in text:
                 errors.append(f"{sdhci.name} lacks {needle[:44]}...: round178's chunk-boundary hand-off "
@@ -3064,18 +3093,24 @@ def check_board(errors: list) -> str:
                               "counting the wait")
         # Both directions, or the fix only covers half the frame: the r170 reads were starved by a
         # writer, and a reader holding the host for a 1 GiB dyld run starves the checkpoint flush.
-        if text.count("handOffBlockGuard (frequency, start, owned)") < 2:
+        if text.count("handOffBlockGuard (frequency, start, owned, token)") < 2:
             errors.append(f"{sdhci.name} hands the guard off on fewer than two paths: the write loop "
                           "and the read loop each have to cut, or one of them still owns the bus for "
                           "the whole request")
         # A hand-off is only fair if the holder that comes back is not the same thread's next request
         # with a queued waiter skipped -- which is why the deadline is charged `owned` and the wait is
         # counted, not assumed. The counters have to be fed from inside acquireBlockGuard.
-        acquire_start = text.find("static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start)")
-        acquire_body = text[acquire_start:acquire_start + 2600] if acquire_start >= 0 else ""
+        acquire_start = text.find("static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start, "
+                                  "uint32_t &token)")
+        acquire_body = text[acquire_start:acquire_start + 3200] if acquire_start >= 0 else ""
         if "gGuardWaits = __atomic_add_fetch" not in acquire_body:
             errors.append("acquireBlockGuard does not count the wait it measures: the hand-off report "
                           "would quote cuts and waits nobody observed")
+        # Round213: the waiter's own bound is the point of the ticket -- a waiter that can only wait
+        # is what r212's frame caught, asleep on an IOLock behind a request that never returned.
+        if "readCounter () - waitStart > waitLimit" not in acquire_body:
+            errors.append("acquireBlockGuard waits without its own bound: one stuck holder would "
+                          "still queue every later reader for the rest of the boot")
 
     # Round179. The display schedule item started with a question that sheng could only answer by
     # booting a VM: is the original IOMobileFramebufferLegacy in *this* kernel the class that its

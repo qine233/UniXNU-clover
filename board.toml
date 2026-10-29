@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r212: give every record a boot id, take the gate off the panic tail read, and relay the kill-point lines through a RAM ring the driver owns -- r211's kill lines never reached the card at all, and the silence could not be told apart from a stale card; the boot counter, the drain enter/exit lines and the ungated tail read now make each boot's silence attributable"
+title = "clover r213: replace the host IOLock with a ticket that has a bound -- r212's frame is one read that entered at 194 s and never returned, and every later reader plus the panic sink queued behind it until the boot died; a waiter now gives up at 60 s, the request stage goes down with its record, and the CPU0 beat recovers a holder whose stage has not moved in 75 s so one bad request costs one request, not the boot"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

@@ -16037,3 +16037,118 @@ kind 25 的写入与 drain 转发要等一帧真的走到杀点。
    如果第 1 项让它活过去，下一帧的 `--probe` 就该非零；若仍为零，那说明杀点后面还有别的墙。
 3. **给没回来的那笔读加身份**：entry 头还有空词，记下调用线程的 `comm`（前 8 字节）与 pid，
    下一帧就能说清是谁在 6.08 GiB 处读——是 dyld 缓存、Data 卷上的系统服务，还是 launchd 的文件加载。
+
+## round213：把守卫从无超时的锁换成有界的票据，并让心跳能抢回停住的持有者
+
+### 设计
+
+r212 那条链已经指向一个具体的形状：**一笔块读在 194.18 s 之后没有回来，守卫还在它手里**。
+此前所有驱动内的等待（`waitCommandSlot`、`readAdmaRun`、`waitCardIdle`、`writeSettled`、
+`flushSettle`、`drainReadFifo`）都是有界的，唯一没有界的是 r171 引入的 `IOLockLock`：
+初始获取和 hand-off 再获取都等无限久。所以 r209/r211/r212 三帧的「卡一条也写不进」不是
+panic 的错，而是**从停住那一刻起，整台机器就再没有块 I/O**。
+
+r213 不改块传输本身，只改「谁来拿主机」这一层：
+
+1. **票据守卫**：`gHostOwner` 是一个原子字，0 表示空闲，非 0 是持有者的票号；票号由
+   `gHostTickets` 单调生成。获取是一次 CAS，等待有界（`kGuardWaitMs = 60 s`），超时就记一行
+   `guard wait gave up ... owner= stage=` 并让这笔请求失败。**等待者第一次有了自己的界。**
+2. **阶段码**：持有者每进入一段就写一个 stage（entry/idleWait/check/adma/batch/single/settle/
+   tail/tee/flush/commit），连同该段开始时刻、lba/blocks/pid/dir 一起存全局；心跳按
+   stage→stamp→stage 三读，避免抓到写一半的过渡。
+3. **看门狗**：CPU0 的 4 s 心跳若看到 owner 存在且 stage 超过 `kGuardStuckMs = 75 s` 没动，
+   判定持有者停了：软复位（CMD+DAT）、等复位位落下、CMD12、清 INT_STATUS、复位读通路，
+   然后**只有 owner 仍是它看到的那个才 CAS 抢票**，并记 `guard stuck stage=... held=... ms`。
+   心跳自己不等待：拿票用一次 `tryTakeHost()`，写完心跳记录用 `dropHostTicket()` 放掉，
+   不碰持有者的 stage。
+4. **失效者自觉退出**：被抢票的持有者在下一个 chunk 头用 `guardLost(token)` 发现票不是自己的，
+   立即停止（不再发命令、不再写 tee/verdict），释放时 CAS 失败也不会清掉新持有者的字。
+   这样「一笔坏请求只毁一个请求」。
+5. **请求身份**：entry 记录补上调用线程的 `comm` 前 8 字节与 pid（`proc_selfname` 为空则不取 pid），
+   flight 记录从 22 词扩到 35 词，新增 stage/stage_ms/stuck/recovered/steals/stuck_stage/
+   stage_lba/stage_blocks/stage_pid/stage_dir/cur_pid/comm0/comm1。
+6. **commit 也算请求**：`clover_emmc_flush_cache` 拿到票后进 `kStageCommit`，四段（c1/w1/c2/w2）
+   各自打点；被抢票后不再发下一条 CMD6，尾部也不再写环。
+
+### 实现
+
+- `drivers/CloverSdhci/CloverSdhci.cpp`：`gBlockLock` 整个删除；新增 `gHostOwner/gHostArmed/
+  gHostTickets`、`flightStage()`、`guardLost()`、`dropHostTicket()`、`tryTakeHost()`、
+  `recoverStuckRequest()`；`acquireBlockGuard/releaseBlockGuard/handOffBlockGuard` 全部改签名带
+  `token`；读、写、commit 三条路径都改为传票、打阶段、被抢后收手；发布点改为
+  `gHostArmed=1` 后再 `gBlockReady=1`。
+- `scripts/check-clover.py`：新增 r213 断言（`tryTakeHost`、`recoverStuckRequest`、
+  `kGuardStuckMs`、两条 r213 报告串、阶段常量、`gHostArmed` 发布），并把「任何 IOLockAlloc/
+  IOLockLock 回到驱动」作为回归错误。
+- `scripts/verify-clover-payload.py`：新增 `check_host_ticket`，要求镜像里同时有上膛、等待放弃、
+  看门狗三条串。
+- `scripts/read-clover-log.py`：flight 解码升到 35 词，打印 stage 名、stage 保持时长、pid/comm
+  与 stuck/recovered/steals；自测把 22..34 每个字段都往返一遍。
+- `board.toml`：菜单标题升 r213。
+
+### 构建与闸门
+
+内核 prelink `2ce6bd02…`（52,215,808 B，15 个归档）→ AMFI 两刀落在 file
+`0x1ab20e4` / `0x1ab216c`（比 r212 后移 0x1000，因为驱动变大了；脚本按签名找，字照旧
+`0x34000229 -> 0x14000011`、`0x36000520 -> 0xd503201f`）得 `84698bc4…` → 归一化
+`968 object stamps zeroed`、`LC_UUID`/`_PrelinkKCID` 由文件派生，`69c72529…`，`--check`
+自证是不动点 → payload `52020dec…`（58,720,256 B；卷内 kernel `913efcf1…`、ADT 13,556 B
+`2166038e…`、trustcache `7c369ce0…` 未变；入口探针 6985 B / 37 runs）。
+
+这一轮的闸门当场抓到一次构建缺陷：第一次 payload 直接用 AMFI 后的内核，没跑归一化，
+`verify-clover-payload.py` 的 `build-varying fields normalized` 报
+`FAIL (1/968 object stamps blank)`——即 968 个时间戳里 967 个还在。按记录的顺序
+（内核 → AMFI → 归一化 → payload）重做后，该项与新增的 `r213 host ticket armed` 全绿；
+`check-clover.py` 也绿（`clover ok: ADT 13556 bytes, 8 cores; …`）。
+
+归档：`~/clover-out/round213-{kernel-amfi.macho,payload.img,kernel-build.log,payload-build.log,SHA256SUMS}`。
+
+### 读数
+
+载荷（`52020dec…`，58,720,256 B）冷刷进 cache（只写 `mmcblk0p49`），上电后按 900 s 死线跑完，
+`~1013 s` 后落到 TWRP（r198 预置的 BCB），dump 前 1217 扇区：
+
+```
+decoded: clover-log-window.bin.txt (12 report record(s), 37 driver verdict line(s),
+         0 probe line(s), 512 kernel log line(s), boot 2)
+```
+
+- **靴号 2**，驱动环 37 条（seq 0..36，64 槽未回卷）**全是 boot 2**，含
+  `r213: host ticket armed, wait=60000ms stuck=75000ms`（seq 9）。这张票在真机上上了膛。
+- **report 窗 12 条 kind-20 全是 boot 0**——和 r211/r212 一样：**本靴的 panic 一条都没写进卡**，
+  连 `r212: drain enter` 也没有。所以本靴的 panic 路径根本没拿到一次成功的卡写。
+- **flight 区**（`--flight`）：12 条 entry（seq 113333..113344，`t=407460..407468 ms`），
+  4 条 beat（最新 seq 74，`t=377047 ms`），entry→beat 的缺口 30,421 ms。入口记录逐条是
+  `read 8 blocks`、`lba=28103552…28103640`（连续）、`pid=133 comm=chronod`、
+  `prev=read/8/0ms/8`、`stage=entry(1)/0ms`、`stuck=0 recov=0 steal=0`、`miss=27`。
+  也就是说：**最后一批块请求是 chronod 的连续 8 块读，从 407.460 s 起每毫秒一笔**，
+  每笔入口时上一笔都是 0 ms 完成。r212 的那笔无后继读是同一个形状（8 块、Data 卷）。
+- **内核 tee** 512 条（seq 686..1189，回卷）从 `[158.693659]` 到 `[418.465029]`
+  （`apfs_trim_to_prev_fsize:180: disk5s1`）。显示帧仍在走：`scanout#2` 在 `[414.324315]`、
+  `copy#3 1423 ms` 在 `[418.219588]`（r206 是 111 ms，本靴慢一个数量级）。
+- **环里没有** `guard stuck`、`guard wait gave up`，也没有 panic 的 drain 行。
+
+读完这三点要放在一起看。tee 的行只有在块请求完成时才会被抄上卡，所以最后一条
+`[418.465029]` 是一个下界：**418.465 s 之前卡还接受写**。而 407.468 s 是最后一笔入口记录，
+它之后没有新的 entry——如果块层还在发请求，entry 只会因为卡拒绝写入而不递增 seq，
+两者在卡上长得一样。结论是**卡在 `[418.465029]` 之后不再接受任何写入，直到死线**，
+和 r209（357.9 s）、r212（194.2 s）同形，只是这次的停点更晚：**这一靴活过了 418 s**。
+
+r213 的看门狗本该在停滞 75 s 之后（约 493 s）把 `guard stuck stage=… pid=… held=…` 写上卡，
+环里没有。两种读法：(a) 看门狗没触发——那笔坏请求并不存在，块层在 418 s 之后自己停了；
+(b) 看门狗触发了，但它的软复位（CMD|DATA）+ CMD12 没把卡救回来，所以它那行也写不进。
+`beat` 的 `miss` 停在 27 是因为 beat 只在票空闲时才写卡、持票时只计 miss，心跳本身是否还活着
+这一帧看不到。要分开这两者，下一轮必须让**卡死之后有一次真正的重初始化**，并且让
+「看门狗是否触发过」有一条不依赖卡的 1 bit 通道（panic 的复位落点）。
+
+### 下一轮（r214）
+
+1. **看门狗升级为完整的卡重初始化**：软复位 → 关时钟（`CLOCK_CONTROL=0` 并等它落下）→
+   断电（`POWER_CONTROL=0`）→ 延迟 → 按原电压重新上电 + 400 kHz → CMD0 → CMD1 轮询 →
+   CMD2/CMD3 → CMD9 → CMD7 → 恢复 50 MHz 高速 → 恢复 ADMA/PIO 配置。r213 只做了 CMD|DATA
+   软复位和 CMD12；卡若已经不理时钟，这两步都不够。
+2. **重初始化结果写成一行**：`r214: card reinit clk=… power=… cmd0=… cmd1=… cmd2=… cmd3=… sel=… hs=… ok=…`，
+   成功就说明卡回来了，之后的 tee 会把 418 s 之后的 msgbuf 带上卡；失败则把这行留在 RAM 环里
+   等 panic 落卡（若 panic 也写不进，就只剩下面的 1 bit）。
+3. **1 bit 落点通道**：`gFlightStuck` 非零时 `panicMarkRecovery` 改写 `boot-fastboot` 而不是
+   `boot-recovery`。宿主脚本本来就会等两个落点，所以「这次落在哪」就是「看门狗触发过没有」。

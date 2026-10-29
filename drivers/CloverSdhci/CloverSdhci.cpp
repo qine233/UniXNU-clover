@@ -276,7 +276,18 @@ static volatile uint32_t gBlockSectors = 0;
 // window and takes it around the whole read (its RootWindowRead.h guard is the same shape), which
 // puts the waiter to sleep instead of into a loop. This is the same instrument, on the one host
 // these reads share. Allocated at bring-up; the device is not published if it is missing.
-static IOLock *gBlockLock = nullptr;
+// Round213: what the ownership is made of changed a second time. Round171 made it an IOLock so a
+// waiter slept instead of burning the holder's core, and that was right until the r212 frame: one
+// read entered at 194.18 s and never came back, so every later reader slept on that lock until the
+// boot died, and the panic sink -- which takes the same guard -- could not write one record at the
+// 900 s deadline. An IOLock has no timeout; a ticket word does. The owner is visible to the CPU0
+// beat, a waiter can bound its own wait, and the beat can take the ticket back from a holder whose
+// stage has not moved. That is what makes a stuck request cost one request instead of the boot.
+static volatile uint32_t gHostOwner = 0;       // 0 is free; anything else is the holder's ticket
+static volatile uint32_t gHostArmed = 0;       // set once the device is published
+static uint32_t gHostTickets = 0;              // ticket generator, unique per acquire
+static const uint64_t kGuardWaitMs = 60000;    // a waiter gives up, reports, and lets APFS retry
+static const uint64_t kGuardStuckMs = 75000;   // a stage that has not moved this long is stuck
 // Round178: what round171's lock made possible but did not itself do -- give a waiter a turn *during*
 // a request, not only between requests. The r170 frame measured the cost of owning the host for a
 // whole request: `tx_flush: disk5 tx xid 526 took 102001275 us to flush` on one volume, and on the
@@ -465,6 +476,44 @@ static volatile uint32_t gFlightBeatMisses = 0;  // beats that found the guard h
 static uint64_t gFlightStart = 0;                // counter value when the region was armed
 static uint64_t gFlightOpStart = 0;
 static uint64_t gFlightLastBeat = 0;
+
+// Round213: the stage the guard holder is in. r212's frame ended with an entry record and no
+// successor, and every wait inside this driver is bounded, so the next question is not "how long"
+// but "where": the last stage a request wrote is the one it did not come back from. Stages are
+// written by the holder only -- a waiter leaves the holder's stage alone -- and the beat compares
+// the stage and its stamp against its own clock: a stage that has not changed for kGuardStuckMs is
+// the evidence that the holder is not progressing.
+static const uint32_t kStageIdle = 0;
+static const uint32_t kStageEntry = 1;
+static const uint32_t kStageIdleWait = 2;
+static const uint32_t kStageCheck = 3;
+static const uint32_t kStageAdma = 4;
+static const uint32_t kStageBatch = 5;
+static const uint32_t kStageSingle = 6;
+static const uint32_t kStageSettle = 7;
+static const uint32_t kStageTail = 8;
+static const uint32_t kStageTee = 9;
+static const uint32_t kStageFlush = 10;
+static const uint32_t kStageCommit = 11;
+static volatile uint32_t gFlightStage = kStageIdle;
+static volatile uint64_t gFlightStageSince = 0;
+static volatile uint32_t gFlightStageDir = 0;
+static volatile uint32_t gFlightStageLba = 0;
+static volatile uint32_t gFlightStageBlocks = 0;
+static volatile uint32_t gFlightStagePid = 0;
+static volatile uint32_t gFlightStuck = 0;        // stage watchdog trips this boot
+static volatile uint32_t gFlightStuckStage = 0;   // the stage the last trip found
+static volatile uint32_t gFlightRecovered = 0;    // controller recoveries done by the watchdog
+static volatile uint32_t gFlightSteals = 0;       // tickets taken back from a stuck holder
+static uint32_t gFlightCurLba = 0;
+static uint32_t gFlightCurPid = 0;
+static uint32_t gFlightCurComm0 = 0;
+static uint32_t gFlightCurComm1 = 0;
+// Round213: who asked for the request. Both live in bsd/kern/kern_proc.c and both are called only
+// from flightEnter(), i.e. from a thread that is about to issue block I/O, never from the beat or
+// the panic sink. proc_selfname is null-safe; the pid is only asked for once the name came back.
+extern "C" int proc_selfpid (void);
+extern "C" void proc_selfname (char *buf, int size);
 
 // Round175: the tee. The verdict ring made the driver's own readings survive the panel; the readings
 // that actually decide the next round are printed by other people -- the r153/r155 shared-region
@@ -1663,32 +1712,114 @@ extern "C" void clover_emmc_block_userdata_window (uint32_t *first, uint32_t *se
   }
 }
 
-// One command engine and one FIFO: the guard has to be held for the whole request. Round171 changes
-// how a second caller waits. It used to be refused (round126 and earlier), then it was a bounded
-// spin (round127 through round170) -- and the spin was the wrong instrument: a caller holding this
-// core's only running thread does not help its holder finish, and a request that loses a spin race
-// silently degrades to single-block I/O. It now blocks on an IOLock, the same way sheng's NativeUfs
-// block device serializes its window reads.
+// One command engine and one FIFO: the guard has to be held for the whole request. Round171 changed
+// how a second caller waits -- from a refusal (round126 and earlier) and a bounded spin (round127
+// through round170) to an IOLock, the same way sheng's NativeUfs block device serializes its window
+// reads. Round213 keeps the sleeping waiter but not the lock: see gHostOwner. What matters here is
+// that every wait now has a bound of its own. The holder's bound is the request deadline plus the
+// stage watchdog; the waiter's bound is kGuardWaitMs. A waiter that runs out reports "guard", the
+// request fails, and APFS asks again -- which is recoverable, unlike a boot that stops reading.
 //
-// The bound is kept as a reading rather than as a refusal: the wait is measured, and the first long
-// one is reported once per boot, because "a read was waiting on a write" is exactly the fact the
-// r167 and r168 frames needed. A lock has no timeout, so the holder's own request deadline is what
-// bounds the wait -- every path that takes the lock ends by releasing it, including the ones that
-// fail. On success the caller gets the tick to measure its own deadline from, after the wait.
-static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start)
+// The wait is still kept as a reading: it is measured, and the first long one is reported once per
+// boot, because "a read was waiting on a write" is exactly the fact the r167 and r168 frames needed.
+// On success the caller gets the ticket it holds and the tick to measure its own deadline from.
+
+// Round213: stage bookkeeping for the guard holder. The stamp is written before the stage, and the
+// beat reads stage, stamp, stage again -- so a beat that catches a transition in progress sees the
+// stage change and does nothing, instead of comparing a new stage with an old stamp.
+static void flightStage (uint32_t stage)
 {
+  if (stage == kStageIdle) {
+    __atomic_store_n (&gFlightStageSince, 0, __ATOMIC_RELEASE);
+    __atomic_store_n (&gFlightStage, kStageIdle, __ATOMIC_RELEASE);
+    return;
+  }
+  __atomic_store_n (&gFlightStageDir, gFlightCurDir, __ATOMIC_RELAXED);
+  __atomic_store_n (&gFlightStageLba, gFlightCurLba, __ATOMIC_RELAXED);
+  __atomic_store_n (&gFlightStageBlocks, gFlightCurBlocks, __ATOMIC_RELAXED);
+  __atomic_store_n (&gFlightStagePid, gFlightCurPid, __ATOMIC_RELAXED);
+  __atomic_store_n (&gFlightStageSince, readCounter (), __ATOMIC_RELEASE);
+  __atomic_store_n (&gFlightStage, stage, __ATOMIC_RELEASE);
+}
+
+// True when this request no longer owns the host: the ticket was taken back by the watchdog (or the
+// request never had one). A request that sees this must stop touching the controller -- somebody
+// else owns it now, and its own release must not clear that owner's word.
+static bool guardLost (uint32_t token)
+{
+  return token == 0 || __atomic_load_n (&gHostOwner, __ATOMIC_ACQUIRE) != token;
+}
+
+// Free the ticket without touching the stage. The beat uses this: it borrows the host for one
+// record and must not erase the stage of whatever it found the host in.
+static void dropHostTicket (uint32_t &token)
+{
+  if (token) {
+    uint32_t expected = token;
+    (void)__atomic_compare_exchange_n (&gHostOwner, &expected, 0u, false,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    token = 0;
+  }
+}
+
+// The beat's acquire: one attempt, no wait. A beat never queues behind a request.
+static bool tryTakeHost (uint32_t &token)
+{
+  token = 0;
+  uint32_t ticket = __atomic_add_fetch (&gHostTickets, 1u, __ATOMIC_RELAXED);
+  if (!ticket) {
+    ticket = __atomic_add_fetch (&gHostTickets, 1u, __ATOMIC_RELAXED);
+  }
+  uint32_t expected = 0;
+  if (!__atomic_compare_exchange_n (&gHostOwner, &expected, ticket, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    return false;
+  }
+  token = ticket;
+  return true;
+}
+
+static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start, uint32_t &token)
+{
+  token = 0;
   frequency = counterFrequency ();
   if (frequency < 1000000ULL || frequency > 1000000000ULL) {
     frequency = 19200000ULL;
   }
-  if (!gBlockLock) {
+  if (!__atomic_load_n (&gHostArmed, __ATOMIC_ACQUIRE)) {
     return false;
   }
   const uint64_t waitStart = readCounter ();
-  IOLockLock (gBlockLock);
+  const uint64_t waitLimit = frequency * kGuardWaitMs / 1000ULL;
+  uint32_t ticket = __atomic_add_fetch (&gHostTickets, 1u, __ATOMIC_RELAXED);
+  if (!ticket) {
+    ticket = __atomic_add_fetch (&gHostTickets, 1u, __ATOMIC_RELAXED);
+  }
+  for (;;) {
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n (&gHostOwner, &expected, ticket, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      token = ticket;
+      break;
+    }
+    if (readCounter () - waitStart > waitLimit) {
+      // One line per boot: a wait this long means a holder did not finish, and the stage word says
+      // which one and where it was. The beat's own trip reports the recovery separately.
+      static bool waitReported = false;
+      if (!waitReported) {
+        waitReported = true;
+        sdhciSay ("CloverSdhci r213: guard wait gave up after %llu ms owner=%u stage=%u\n",
+               static_cast<unsigned long long> (kGuardWaitMs),
+               __atomic_load_n (&gHostOwner, __ATOMIC_ACQUIRE),
+               __atomic_load_n (&gFlightStage, __ATOMIC_ACQUIRE));
+      }
+      return false;
+    }
+    IOSleep (1);
+  }
   const uint64_t waited = readCounter () - waitStart;
   // Round178: every wait is counted, and the worst one kept, so the hand-off report at the tail of a
-  // request can say what the lock actually did rather than what it was expected to do. This is a
+  // request can say what the host actually did rather than what it was expected to do. This is a
   // racy maximum across the boot's threads and that is fine: it is a reading, and an occasional lost
   // increment only understates it. The wait is measured before the holder's deadline starts.
   gGuardWaits = __atomic_add_fetch (&gGuardWaits, 1u, __ATOMIC_RELAXED);
@@ -1708,10 +1839,21 @@ static bool acquireBlockGuard (uint64_t &frequency, uint64_t &start)
   return true;
 }
 
-static void releaseBlockGuard (void)
+// Round213: release is a compare-and-swap on the ticket, not an unlock. A request whose host was
+// taken back by the watchdog must not clear the new owner's word when it finally returns -- that is
+// exactly the case the ticket exists for. The stage only returns to idle when this release was the
+// one that actually freed the host.
+static void releaseBlockGuard (uint32_t &token)
 {
-  if (gBlockLock) {
-    IOLockUnlock (gBlockLock);
+  if (!token) {
+    return;
+  }
+  uint32_t expected = token;
+  const bool owned = __atomic_compare_exchange_n (&gHostOwner, &expected, 0u, false,
+                                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+  token = 0;
+  if (owned) {
+    flightStage (kStageIdle);
   }
 }
 
@@ -1719,15 +1861,15 @@ static void releaseBlockGuard (void)
 // Called between chunks, so a request that needs eight 64 KiB runs is eight owners rather than one
 // owner for the whole transfer -- which is what a page fault at the other volume needs. `owned`
 // accumulates guarded time so the request keeps round169's deadline (a bound on the transfer, not on
-// how long the rest of the boot took around it) while no single hold outlives one chunk. Losing the
-// re-acquire is not a hazard: acquireBlockGuard fails only when gBlockLock is null, and
-// releaseBlockGuard does nothing in exactly the same case, so the tail of a request can never unlock
-// a lock nobody holds.
-static bool handOffBlockGuard (uint64_t &frequency, uint64_t &start, uint64_t &owned)
+// how long the rest of the boot took around it) while no single hold outlives one chunk. Round213:
+// losing the re-acquire no longer means "the guard was never armed" -- it can also mean a waiter
+// that waited kGuardWaitMs -- so the caller now treats it as a failed request and stops.
+static bool handOffBlockGuard (uint64_t &frequency, uint64_t &start, uint64_t &owned,
+                               uint32_t &token)
 {
   owned += readCounter () - start;
-  releaseBlockGuard ();
-  if (!acquireBlockGuard (frequency, start)) {
+  releaseBlockGuard (token);
+  if (!acquireBlockGuard (frequency, start, token)) {
     return false;
   }
   __atomic_add_fetch (&gGuardHandoffs, 1u, __ATOMIC_RELAXED);
@@ -2278,7 +2420,8 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   }
   uint64_t frequency = 0;
   uint64_t start = 0;
-  if (!acquireBlockGuard (frequency, start)) {
+  uint32_t token = 0;
+  if (!acquireBlockGuard (frequency, start, token)) {
     reportReadFailure ("guard", lba, blocks, 0, 0);
     return 0;
   }
@@ -2287,12 +2430,14 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   flightEnter (kFlightEventRead, 0, lba, blocks);
   // Round169: the card can still be programming after the write that owned the guard was counted
   // as stored; a read that starts then is refused. Wait for the card, then start the deadline.
+  flightStage (kStageIdleWait);
   if (!waitCardIdle (frequency)) {
     // The card never said ready. Stop it explicitly, or every later read inherits the same state.
     abortReadTransfer ();
     reportReadFailure ("idle", lba, blocks, 0, 0);
+    flightStage (kStageTail);
     flightExit (0);
-    releaseBlockGuard ();
+    releaseBlockGuard (token);
     return 0;
   }
   // Round165: the first request long enough to be a batch proves batch and single-block reads agree
@@ -2300,12 +2445,14 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   // path itself demands, and the sample is the request's own length, so a boot whose biggest read is
   // 16 KiB still gets its one check instead of waiting forever for a 64 KiB one.
   if (!gReadCheckDone && blocks >= 4) {
+    flightStage (kStageCheck);
     checkReadPath (lba, blocks > kReadChunkBlocks ? kReadChunkBlocks : blocks);
   }
   // Round172: the second gate, one run later. It only opens once the first has proved the multi-block
   // command itself, because ADMA2 rides on exactly that command with one bit added -- a boot whose
   // batch reads are untrusted has no business comparing a DMA read against anything.
   if (!gDmaCheckDone && gReadBatchTrusted && blocks >= 4 && dmaBringUp ()) {
+    flightStage (kStageCheck);
     checkDmaPath (lba, blocks > kReadChunkBlocks ? kReadChunkBlocks : blocks);
   }
   // Round169: the request deadline covers the transfer, not the wait above or the one-shot check.
@@ -2327,8 +2474,18 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
                             static_cast<uint64_t>(blocks) * (frequency / 50ULL);
   uint32_t done = 0;
   while (done < blocks) {
+    // Round213: the watchdog only takes the host back from a holder that has stopped. If it did,
+    // this request must stop too, and must not touch the controller somebody else now owns.
+    if (guardLost (token)) {
+      reportReadFailure ("guard", lba, blocks, done, 0);
+      held = false;
+      break;
+    }
     if (owned + readCounter () - start > deadline) {
       reportReadFailure ("deadline", lba, blocks, done, 0);
+      // Round213: a request that ran out of time leaves the controller mid-transfer unless it says
+      // so; the next reader would then inherit a data state nobody reset.
+      abortReadTransfer ();
       break;
     }
     uint32_t chunk = blocks - done;
@@ -2354,6 +2511,7 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
     if (chunk >= 4 && gDmaTrusted) {
       uint32_t dmaStatus = 0;
       uint64_t dmaTicks = 0;
+      flightStage (kStageAdma);
       if (readAdmaRun (lba + done, target, chunk, dmaStatus, dmaTicks)) {
         chunkRead = true;
         static bool timingReported = false;
@@ -2375,6 +2533,7 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
       for (uint32_t attempt = 0; attempt < 2 && !chunkRead; attempt++) {
         uint32_t got = 0;
         uint32_t status = 0;
+        flightStage (kStageBatch);
         chunkRead = readMultiBlock (lba + done, target, chunk, got, status);
       }
     }
@@ -2389,11 +2548,13 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
       for (uint32_t attempt = 0; attempt < 3 && !blockRead; attempt++) {
         uint32_t got = 0;
         uint32_t status = 0;
+        flightStage (kStageSingle);
         blockRead = readPioBlock (lba + done, target, got, status);
         lastStatus = status;
       }
       if (!blockRead) {
         reportReadFailure ("gave up", lba + done, blocks, done, lastStatus);
+        abortReadTransfer ();
         break;
       }
       moved = 1;
@@ -2407,7 +2568,7 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
     // whose batch is untrusted still cuts every 128 blocks instead of every request.
     if (done < blocks && sinceCut >= kReadChunkBlocks) {
       sinceCut = 0;
-      if (!handOffBlockGuard (frequency, start, owned)) {
+      if (!handOffBlockGuard (frequency, start, owned, token)) {
         reportReadFailure ("guard", lba + done, blocks, done, 0);
         held = false;
         break;
@@ -2415,6 +2576,7 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
       cutIn = true;
     }
   }
+  flightStage (kStageTail);
   flightExit (done);
   if (cutIn) {
     reportGuardHandoff ("read", lba, blocks, done);
@@ -2423,9 +2585,15 @@ extern "C" uint32_t clover_emmc_block_read (uint32_t lba, uint32_t *words, uint3
   // pending verdict lines get written out. Four records per pass; the rest wait for the next request.
   // Round175: the kernel log tee runs first, so a line it accepts here can be flushed in this pass.
   if (held) {
-    teeKernelLog ();
-    flushVerdictRing ();
-    releaseBlockGuard ();
+    // Round213: after a recovered steal this request no longer owns the host, so it must not write
+    // to the card through the tee or the verdict ring; it only gives back its own ticket.
+    if (!guardLost (token)) {
+      flightStage (kStageTee);
+      teeKernelLog ();
+      flightStage (kStageFlush);
+      flushVerdictRing ();
+    }
+    releaseBlockGuard (token);
   }
   return done;
 }
@@ -2985,6 +3153,23 @@ static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t bl
   gFlightBlock[19] = gRingPending[kRingDriver];
   gFlightBlock[20] = gFlightPrevDir;
   gFlightBlock[21] = gFlightPrevBlocks;
+  // Round213: the stage the holder was in when this record went down, how long it had been there,
+  // and the watchdog's counters. A beat whose stage has outlived the next beat is the request that
+  // stopped; the counters say whether the watchdog has already been there.
+  gFlightBlock[22] = __atomic_load_n (&gFlightStage, __ATOMIC_ACQUIRE);
+  gFlightBlock[23] = flightCounterMs (__atomic_load_n (&gFlightStageSince, __ATOMIC_ACQUIRE));
+  gFlightBlock[24] = __atomic_load_n (&gFlightStuck, __ATOMIC_RELAXED);
+  gFlightBlock[25] = __atomic_load_n (&gFlightRecovered, __ATOMIC_RELAXED);
+  gFlightBlock[26] = __atomic_load_n (&gFlightSteals, __ATOMIC_RELAXED);
+  gFlightBlock[27] = __atomic_load_n (&gFlightStuckStage, __ATOMIC_RELAXED);
+  gFlightBlock[28] = __atomic_load_n (&gFlightStageLba, __ATOMIC_RELAXED);
+  gFlightBlock[29] = __atomic_load_n (&gFlightStageBlocks, __ATOMIC_RELAXED);
+  gFlightBlock[30] = __atomic_load_n (&gFlightStagePid, __ATOMIC_RELAXED);
+  gFlightBlock[31] = __atomic_load_n (&gFlightStageDir, __ATOMIC_RELAXED);
+  // Round213: the caller of this record's own request (entry) or of the last one (beat).
+  gFlightBlock[32] = gFlightCurPid;
+  gFlightBlock[33] = gFlightCurComm0;
+  gFlightBlock[34] = gFlightCurComm1;
   uint32_t words = 0, status = 0;
   if (!writePioBlock (record, gFlightBlock, words, status)) {
     return false;
@@ -3008,7 +3193,29 @@ static void flightEnter (uint32_t event, uint32_t dir, uint32_t lba, uint32_t bl
 {
   gFlightOpStart = readCounter ();
   gFlightCurDir = dir;
+  gFlightCurLba = lba;
   gFlightCurBlocks = blocks;
+  // Round213: who asked. The r212 frame knew the request -- 8 blocks from LBA 31076568 -- but not
+  // which thread had asked for them, and the thread is the other half of "why this read and no
+  // other". proc_selfname is null-safe; the pid is only asked once a name came back, so a context
+  // with no process cannot turn into a null dereference here.
+  char comm[16];
+  for (uint32_t i = 0; i < sizeof comm; i++) {
+    comm[i] = 0;
+  }
+  proc_selfname (comm, sizeof comm);
+  gFlightCurPid = comm[0] ? static_cast<uint32_t> (proc_selfpid ()) : 0;
+  const uint32_t c0 = static_cast<unsigned char> (comm[0]);
+  const uint32_t c1 = static_cast<unsigned char> (comm[1]);
+  const uint32_t c2 = static_cast<unsigned char> (comm[2]);
+  const uint32_t c3 = static_cast<unsigned char> (comm[3]);
+  const uint32_t c4 = static_cast<unsigned char> (comm[4]);
+  const uint32_t c5 = static_cast<unsigned char> (comm[5]);
+  const uint32_t c6 = static_cast<unsigned char> (comm[6]);
+  const uint32_t c7 = static_cast<unsigned char> (comm[7]);
+  gFlightCurComm0 = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
+  gFlightCurComm1 = c4 | (c5 << 8) | (c6 << 16) | (c7 << 24);
+  flightStage (kStageEntry);
   (void)flightWrite (event, dir, lba, blocks);
 }
 
@@ -3021,12 +3228,60 @@ static void flightExit (uint32_t done)
   gFlightOps++;
 }
 
-// Called from ArmCpu's timer on CPU0. TryLock is the point: a beat must never wait for a request,
-// and the guard being held is a fact the caller counts rather than a reason to block the interrupt.
+// Round213: the watchdog's whole action, taken from the CPU0 beat when the holder's stage has not
+// moved for kGuardStuckMs. It cannot wait for the holder -- the holder is the thing that stopped --
+// so it stops the transfer the way the driver's own failure paths do: a command and data reset,
+// then CMD12 to put the card back in TRAN, then the status the reset raised is cleared. Only then is
+// the ticket taken back, and only if the owner is still the one this trip found. A holder that
+// returns afterwards finds its ticket gone, fails its guardLost() check at the next chunk, and does
+// not release somebody else's word.
+static void recoverStuckRequest (uint32_t stage, uint32_t owner)
+{
+  uint64_t frequency = counterFrequency ();
+  if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+    frequency = 19200000ULL;
+  }
+  const uint64_t since = __atomic_load_n (&gFlightStageSince, __ATOMIC_ACQUIRE);
+  const uint64_t now = readCounter ();
+  const uint64_t held = (since && now > since) ? (now - since) * 1000ULL / frequency : 0;
+  __atomic_add_fetch (&gFlightStuck, 1u, __ATOMIC_RELAXED);
+  __atomic_store_n (&gFlightStuckStage, stage, __ATOMIC_RELAXED);
+  sdhciSay ("CloverSdhci r213: guard stuck stage=%u dir=%u lba=%u blocks=%u pid=%u held=%llu ms\n",
+            stage,
+            __atomic_load_n (&gFlightStageDir, __ATOMIC_RELAXED),
+            __atomic_load_n (&gFlightStageLba, __ATOMIC_RELAXED),
+            __atomic_load_n (&gFlightStageBlocks, __ATOMIC_RELAXED),
+            __atomic_load_n (&gFlightStagePid, __ATOMIC_RELAXED),
+            static_cast<unsigned long long> (held));
+  write8 (SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+  for (uint32_t guard = 0; guard < kCommandSpinLimit; guard++) {
+    if (!(read8 (SDHCI_SOFTWARE_RESET) & (SDHCI_RESET_CMD | SDHCI_RESET_DATA))) {
+      break;
+    }
+  }
+  (void) sendStopCommand ();
+  write32 (SDHCI_INT_STATUS, 0xffffffffu);
+  (void) resetReadPath ();
+  uint32_t expected = owner;
+  if (__atomic_compare_exchange_n (&gHostOwner, &expected, 0u, false,
+                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    __atomic_add_fetch (&gFlightSteals, 1u, __ATOMIC_RELAXED);
+    flightStage (kStageIdle);
+  }
+  __atomic_add_fetch (&gFlightRecovered, 1u, __ATOMIC_RELAXED);
+}
+
+// Called from ArmCpu's timer on CPU0. Taking the host is the point: a beat must never wait for a
+// request, and the host being held is a fact the caller counts rather than a reason to block the
+// interrupt. Round213 adds the other half -- if the host has been held and the holder's stage has
+// not moved for kGuardStuckMs, the beat is the only context left that can end that request, so it
+// resets the controller and takes the ticket back. `now - since` is compared in counter ticks, not
+// in milliseconds, so the check does not depend on frequency rounding.
 extern "C" void clover_emmc_flight_beat (void)
 {
   if (!__atomic_load_n (&gFlightArmed, __ATOMIC_ACQUIRE) ||
-      __atomic_load_n (&gPanicActive, __ATOMIC_ACQUIRE) || !gVerdictFirst || !gHost || !gBlockLock) {
+      __atomic_load_n (&gPanicActive, __ATOMIC_ACQUIRE) || !gVerdictFirst || !gHost ||
+      !__atomic_load_n (&gHostArmed, __ATOMIC_ACQUIRE)) {
     return;
   }
   uint64_t frequency = counterFrequency ();
@@ -3038,12 +3293,25 @@ extern "C" void clover_emmc_flight_beat (void)
     return;
   }
   gFlightLastBeat = now;
-  if (!IOLockTryLock (gBlockLock)) {
+  const uint32_t owner = __atomic_load_n (&gHostOwner, __ATOMIC_ACQUIRE);
+  if (owner) {
+    const uint32_t stage = __atomic_load_n (&gFlightStage, __ATOMIC_ACQUIRE);
+    const uint64_t since = __atomic_load_n (&gFlightStageSince, __ATOMIC_ACQUIRE);
+    const uint32_t stageAfter = __atomic_load_n (&gFlightStage, __ATOMIC_ACQUIRE);
+    if (stage == stageAfter && since && now > since &&
+        now - since > frequency * kGuardStuckMs / 1000ULL) {
+      recoverStuckRequest (stage, owner);
+    }
+    __atomic_add_fetch (&gFlightBeatMisses, 1u, __ATOMIC_RELAXED);
+    return;
+  }
+  uint32_t token = 0;
+  if (!tryTakeHost (token)) {
     __atomic_add_fetch (&gFlightBeatMisses, 1u, __ATOMIC_RELAXED);
     return;
   }
   (void)flightWrite (kFlightEventBeat, 2, 0, 0);
-  IOLockUnlock (gBlockLock);
+  dropHostTicket (token);
 }
 
 // One ring's share of a pass: at most kRingFlushPerPass[which] records, oldest first, and a refused
@@ -3985,7 +4253,8 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
   }
   uint64_t frequency = 0;
   uint64_t start = 0;
-  if (!acquireBlockGuard (frequency, start)) {
+  uint32_t token = 0;
+  if (!acquireBlockGuard (frequency, start, token)) {
     return 0;
   }
   flightEnter (kFlightEventWrite, 1, lba, blocks);
@@ -4002,6 +4271,7 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
   // trusting DMA is a boot whose logfs is exactly what it was. The request deadline is re-stamped
   // afterwards: the gate is not the request's fault.
   if (!gWriteDmaCheckDone && blocks >= 4) {
+    flightStage (kStageCheck);
     checkWriteDmaPath ();
     start = readCounter ();
   }
@@ -4018,7 +4288,18 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
   bool cutIn = false;
   bool held = true;
   while (done < blocks) {
+    // Round213: same rule as the read path -- once the watchdog has taken the host back this
+    // request must stop touching the controller.
+    if (guardLost (token)) {
+      sdhciSay ("CloverSdhci r213: write lost the host lba=%u blocks=%u done=%u\n", lba, blocks,
+             done);
+      held = false;
+      break;
+    }
     if (owned + readCounter () - start > deadline) {
+      sdhciSay ("CloverSdhci r213: write deadline lba=%u blocks=%u done=%u\n", lba, blocks, done);
+      // Round213: leave the data circuit stopped, not mid-transfer for the next request.
+      abortReadTransfer ();
       break;
     }
     // Round159: one CMD25 for a run of blocks. The pointer arithmetic is 64-bit for the same reason
@@ -4038,8 +4319,10 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
     if (chunk >= 4 && gWriteDmaTrusted) {
       uint32_t dmaStatus = 0;
       uint64_t dmaTicks = 0;
+      flightStage (kStageAdma);
       if (writeAdmaRun (lba + done, target, chunk, dmaStatus, dmaTicks)) {
         uint32_t rsp = 0, settleStatus = 0, polls = 0;
+        flightStage (kStageSettle);
         if (writeSettled (rsp, settleStatus, polls)) {
           chunkWritten = true;
           static bool writeTimingReported = false;
@@ -4073,12 +4356,14 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
       for (uint32_t attempt = 0; attempt < 2 && !chunkWritten; attempt++) {
         uint32_t handed = 0;
         uint32_t status = 0;
+        flightStage (kStageBatch);
         if (!writeMultiBlock (lba + done, target, chunk, handed, status)) {
           continue;
         }
         // Round167: DATA_END is not durability. The card says READY_FOR_DATA in TRAN only after
         // the block reached its media, and a batch that never gets there is not counted as done.
         uint32_t rsp = 0, settleStatus = 0, polls = 0;
+        flightStage (kStageSettle);
         if (writeSettled (rsp, settleStatus, polls)) {
           chunkWritten = true;
           break;
@@ -4102,10 +4387,12 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
       for (uint32_t attempt = 0; attempt < 2 && !blockWritten; attempt++) {
         uint32_t handed = 0;
         uint32_t status = 0;
+        flightStage (kStageSingle);
         if (!writePioBlock (lba + done, target, handed, status)) {
           continue;
         }
         uint32_t rsp = 0, settleStatus = 0, polls = 0;
+        flightStage (kStageSettle);
         if (writeSettled (rsp, settleStatus, polls)) {
           blockWritten = true;
           break;
@@ -4136,22 +4423,27 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
     // it took, so the card is in TRAN and a reader that comes in next meets an idle bus.
     if (done < blocks && sinceCut >= kReadChunkBlocks) {
       sinceCut = 0;
-      if (!handOffBlockGuard (frequency, start, owned)) {
+      if (!handOffBlockGuard (frequency, start, owned, token)) {
         held = false;
         break;
       }
       cutIn = true;
     }
   }
+  flightStage (kStageTail);
   flightExit (done);
   if (cutIn) {
     reportGuardHandoff ("write", lba, blocks, done);
   }
   // Round175: same as the read tail -- collect from the kernel log, then spend the guard on the card.
   if (held) {
-    teeKernelLog ();
-    flushVerdictRing ();   // Round174: same reason as the read tail
-    releaseBlockGuard ();
+    if (!guardLost (token)) {
+      flightStage (kStageTee);
+      teeKernelLog ();
+      flightStage (kStageFlush);
+      flushVerdictRing ();   // Round174: same reason as the read tail
+    }
+    releaseBlockGuard (token);
   }
   return done;
 }
@@ -4711,9 +5003,17 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
   }
   uint64_t frequency = 0;
   uint64_t start = 0;
-  if (!acquireBlockGuard (frequency, start)) {
+  uint32_t token = 0;
+  if (!acquireBlockGuard (frequency, start, token)) {
     return 0;
   }
+  // Round213: a commit is a request too. It lands in the stage table, so a flush that hangs in CMD6
+  // or in the cache-to-media wait is named by the same watchdog that names a block request, instead
+  // of leaving the stage at idle and the card inhibited.
+  gFlightCurDir = 2;
+  gFlightCurLba = 0;
+  gFlightCurBlocks = 0;
+  flightStage (kStageCommit);
   // Round190: the r189 frame's last call is fcntl(3, F_BARRIERFSYNC) and the kernel ring says nothing
   // for the 187 s after it. Whether that barrier reached this driver is the first question the next
   // frame can answer, and the answer has to be on the card before the risky part runs, not after it:
@@ -4744,6 +5044,7 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
   uint32_t status = 0;
   uint32_t spins = 0;
   const uint64_t commitStart = readCounter ();
+  flightStage (kStageCommit);
   const bool switchOff = switchExtCsd (kExtCsdCacheCtrl, 0, response, status, &spins);
   teeSay ("CloverSdhci r191: flush-c1 ok=%d st=%08x rsp=%08x spins=%u ms=%llu\n",
           switchOff ? 1 : 0, status, response, spins,
@@ -4751,6 +5052,7 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
   flushVerdictRing ();
   FlushSettle waitOff = FlushSettle ();
   if (switchOff) {
+    flightStage (kStageCommit);
     waitOff = flushSettle (frequency, boundMs);
   }
   teeSay ("CloverSdhci r191: flush-w1 ready=%d to=%d busy=%llu ms polls=%u rsp=%08x st=%08x "
@@ -4760,11 +5062,19 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
           waitOff.status, waitOff.samples, waitOff.marks, waitOff.present,
           static_cast<unsigned long long> ((readCounter () - commitStart) * 1000ULL / frequency));
   flushVerdictRing ();
+  // Round213: the watchdog may have taken the host back while one of the waits above was stuck. If
+  // it did, this commit is over -- sending the next CMD6 would fight the recovery that is running.
+  if (guardLost (token)) {
+    sdhciSay ("CloverSdhci r213: commit lost the host after c1/w1\n");
+    releaseBlockGuard (token);
+    return 0;
+  }
   const bool flushed = switchOff && waitOff.ready;
   uint32_t backResponse = 0;
   uint32_t backStatus = 0;
   uint32_t backSpins = 0;
   const uint64_t backStart = readCounter ();
+  flightStage (kStageCommit);
   const bool switchOn = switchExtCsd (kExtCsdCacheCtrl, 1, backResponse, backStatus, &backSpins);
   teeSay ("CloverSdhci r191: flush-c2 ok=%d st=%08x rsp=%08x spins=%u ms=%llu\n",
           switchOn ? 1 : 0, backStatus, backResponse, backSpins,
@@ -4772,6 +5082,7 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
   flushVerdictRing ();
   FlushSettle waitOn = FlushSettle ();
   if (switchOn) {
+    flightStage (kStageCommit);
     waitOn = flushSettle (frequency, boundMs);
   }
   teeSay ("CloverSdhci r191: flush-w2 ready=%d to=%d busy=%llu ms polls=%u rsp=%08x st=%08x "
@@ -4806,9 +5117,13 @@ extern "C" uint32_t clover_emmc_flush_cache (void)
             static_cast<unsigned long long> ((readCounter () - flushStart) * 1000ULL / frequency),
             __atomic_load_n (&gCacheFlushes, __ATOMIC_RELAXED));
   // Round175: same as the read tail -- collect from the kernel log, then spend the guard on the card.
-  teeKernelLog ();
-  flushVerdictRing ();   // Round174: same reason as the read tail
-  releaseBlockGuard ();
+  if (!guardLost (token)) {
+    flightStage (kStageTee);
+    teeKernelLog ();
+    flightStage (kStageFlush);
+    flushVerdictRing ();   // Round174: same reason as the read tail
+  }
+  releaseBlockGuard (token);
   return (flushed && reenabled) ? 1u : 0u;
 }
 
@@ -6086,17 +6401,14 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                    link21.width8 ? 1 : 0, link21.bwStatus,
                    link21.clockAfter, link21.hostControl,
                    link21.header0, link21.header1, fastOk21 ? 1 : 0);
-            // Round171: the host is shared, and the sharing is now a lock rather than a spin flag.
-            // Allocate it before the device is published: a block device that cannot serialize its
-            // callers is worse than no block device, so the publication is what is gated here.
-            if (!gBlockLock) {
-              gBlockLock = IOLockAlloc ();
-            }
-            if (gBlockLock) {
-              __atomic_store_n (&gBlockReady, 1, __ATOMIC_RELEASE);
-            } else {
-              sdhciSay ("CloverSdhci r171: host lock allocation failed\n");
-            }
+            // Round213: the host is shared through an atomic ticket, not an IOLock. The ticket needs
+            // no allocation and cannot be lost with its holder, so arming is just publishing it;
+            // a block device that cannot serialize its callers is worse than no block device.
+            __atomic_store_n (&gHostArmed, 1u, __ATOMIC_RELEASE);
+            __atomic_store_n (&gBlockReady, 1, __ATOMIC_RELEASE);
+            sdhciSay ("CloverSdhci r213: host ticket armed, wait=%llums stuck=%llums\n",
+                   static_cast<unsigned long long> (kGuardWaitMs),
+                   static_cast<unsigned long long> (kGuardStuckMs));
           }
         }
       }
