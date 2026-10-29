@@ -16453,3 +16453,51 @@ startup 上报的系统 shell；杀点前 SpringBoard 的主线程曾在 `_BKSDi
 剩下的唯一问题是：**它到底在等哪个服务、为什么没有走到 check-in/渲染**。r219 因此只做一件事：
 对 SpringBoard 的每次 `mach_msg2` 采样，把用户消息头（`msgh_bits`、`msgh_id`、远端/本地
 端口名）一起记下来，用 `msgh_id` 与端口把「在等谁」从返回地址推断变成直接读数。
+
+## round219 读数（boot 8）：mach_msg2 描述符第一次落地，参数映射纠错
+
+本帧三件事：探针链路有效、读数解码时要纠一位、SpringBoard 在杀前一直在做 XPC 而不是卡在
+显示握手。杀点 `[480.159684]`，`killsrc upc=0x1cd981100`（仍是 `___kill+0x8`）、
+`ulr=0x100f78144`——按 r218 在宿主上解出的镜像偏移 `0x72144` 反推，backboardd 这一靴
+可执行文件 slide 是 `0xF06000`，批量杀循环没变。退出 `[480.714504]`，kill→exit 0.55 s
+（r218 是 23.1 s，说明那 23 s 不是探针造成的，也不稳定）。
+
+**先纠一个错**：r219 打印用的标签整体偏了一位。`osfmk/mach/mach_traps.h` 里
+`mach_msg2_trap` 的寄存器约定是
+`x0=data, x1=options64, x2=bits|send_size<<32, x3=remote|local<<32, x4=voucher|id<<32,
+x5=desc_count|rcv_name<<32, x6=rcv_size|priority<<32, x7=timeout`，
+而我按「x1=bits/size、x2=端口、x3=id」去贴标签了。读数的数值是真的，标签错了；用接收缓冲
+头（`h=` 六个字）交叉比对可以确认正确含义：t=412 的 `h[0]=0x131513` 正是 x2 的低 32 位，
+`h[2]=0x3003` 正是 x3 的低 32 位，`h[5]=0x5b9173` 正是 x4 的高 32 位。按正确映射重读：
+
+| 采样 | 线程 | options64 (x1) | bits / send_size (x2) | remote / local (x3) | voucher / id (x4) | rcv_size (x6) |
+| --- | --- | --- | --- | --- | --- | --- |
+| t=412/420 | 0x103（主线程） | `MACH64_SEND_MQ_CALL\|SEND\|RCV\|RCV_SYNC_WAIT\|SEND_SYNC_OVERRIDE\|SEND_PROPAGATE_QOS`（`0x4_00304003`） | `0x00131513` / 24 | `0x3003` / `0xa03` | `0x1d03` / `0x5b9173` | `0x44` |
+| t=438/456 | 0x103（主线程） | `MACH64_SEND_MQ_CALL\|RCV\|RCV_LARGE\|RCV_LARGE_IDENTITY\|MSG_STRICT_REPLY\|RCV_SYNC_WAIT`（`0x4_0700420e`） | 0 / 0（纯接收） | 0 / 0 | 0 / 0 | `0x4000` |
+| t=438 | 0x2fd | `MACH64_SEND_KOBJECT_CALL\|SEND\|RCV`（`0x2_00000003`） | `0x80001513`（复杂）/ 100 | `0x203` / `0x2803` | 0 / `0x12cb` | `0x34` |
+
+- **主线程 412/420 s**：一条 24 字节（只有消息头）的 MQ 调用，发往远端端口 `0x3003`，
+  回复端口 `0xa03`，voucher `0x1d03`，`msgh_id=0x5b9173`，接收缓冲 68 字节，带
+  `RCV_SYNC_WAIT`——典型的同步 XPC 请求。接收头里带回的 `h[1]=0`（发送大小字段为 0）是
+  MQ 调用把大小放在寄存器后的残留，其余五个字与寄存器完全一致。
+- **主线程 438/456 s**：同一条线程已经换成**纯接收**：MQ 调用 + `RCV_LARGE` +
+  `RCV_LARGE_IDENTITY` + `MSG_STRICT_REPLY` + `RCV_SYNC_WAIT`，16 384 字节缓冲，不再发送。
+  也就是 412 s 那条同步请求已经回来了，主线程随后进入另一条接收。缓冲头残留在
+  `remote=0x5d03`（上一次收到的消息的发送端口名）。**438 到 456 s（读数间隔 18 s）这条
+  描述符一个比特都没变**，随后到 480 s 被杀——主线程是在这条 16 KB 接收上等，而不是卡在
+  显示握手那次调用里。
+- **另一条线程 0x2fd 在 438 s**：一条 100 字节的**复杂**消息（`0x80001513`，带端口描述符），
+  kobject 调用，发往 `0x203`，回复端口 `0x2803`，`msgh_id=0x12cb`，接收缓冲 52 字节。
+  它的头与寄存器逐字一致（`h=80001513.64.203.2803.0.12cb`）。同一采样里 0x3bf/0x2fd 在
+  t=412/420 时还在 MQ 纯接收（`RCV_TIMEOUT`，32 字节），说明 SpringBoard 的 XPC 在正常运转。
+
+**结论**：SpringBoard 在杀前 40 s 里一直在收发 XPC，显示服务那次同步调用在 412–438 s 之间
+已经返回；真正没发生的是「创建 `IOMobileFramebufferUserClient`、提交第一帧」——本靴客户端
+仍只有 pid 58/56/160，backboardd 自己 present 了三帧。缺口现在只剩一个问号：端口名
+`0x3003`、`0x5d03`、`0x203` 背后分别是哪个进程/服务。r220 用 IPC 空间把名字翻成属主
+`pid:comm`（`ipc_object_translate` → `ip_port->ip_receiver->is_task`），并补打纯接收的
+`rcv_name`（x5 高 32，本帧漏打）、超时（x7）与描述符个数（x5 低 32）。
+
+补记：r170 的 `t=` 是 `clock_get_uptime()` 的原始 tick 除以 1e9 后当秒打印，这板子的时基是
+19.2 MHz，所以 `t=9s` 对应约 480.7 s 的靴内时间，与本帧采样窗完全一致——上一轮记的
+「t=9s 与采样矛盾」不是矛盾，是把 tick 当秒读了。
