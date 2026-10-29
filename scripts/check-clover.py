@@ -784,6 +784,12 @@ def check_board(errors: list) -> str:
         if '{ "clover r208: ", "r208-kill", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round208's sender-pc and thread lines no tee "
                           "class: the reading the bring-up waits on would land in the ring uncounted")
+        if "CloverSdhci r209: panic tail lines=%u unseen=%u bufx=%d" not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no round209 panic-time tail read: a boot whose "
+                          "block path stops would again take the kernel ring with it")
+        if "panicTailRead ();" not in sdhci_source:
+            errors.append("drivers/CloverSdhci never calls the round209 tail read from the panic "
+                          "drain: the sink would not select it")
 
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
@@ -1665,8 +1671,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r208:"):
-        errors.append('[payload] title is not "clover r208: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r209:"):
+        errors.append('[payload] title is not "clover r209: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2116,7 +2122,7 @@ def check_board(errors: list) -> str:
                        "if (magic != MSG_MAGIC)",
                        "static void teeKernelLog (void)",
                        "static void ringPush (uint32_t which, const char *line, uint32_t length)",
-                       "ringPush (kRingKernel, gTeeLine + start, length - start);",
+                       "kernelRingPush (gTeeLine + start, length - start);",
                        "gTeeReady = 1;",
                        '"CloverSdhci r175: tee armed bufc=%p size=%d bufx=%d\\n"'):
             if needle not in text:
@@ -2663,8 +2669,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r208:"):
-        errors.append('[payload] title is not "clover r208: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r209:"):
+        errors.append('[payload] title is not "clover r209: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

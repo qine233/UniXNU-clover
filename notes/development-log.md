@@ -15699,3 +15699,78 @@ panic 时可用）。r209 就在这个 sink 里**绕开 `gTeeIndex` 游标**，�
 lap、refused、pending、守卫等待次数/最长毫秒、cache 开关与大小）。这样下一次死线时，
 环里会有「panic 那一刻 msgbuf 尾部到底是什么」，能一次判死锁还是停在等待。
 不改任何槽位几何。
+
+## Round 209 — 从 panic sink 里反向读 msgbuf，把「停在哪」变成可读
+
+r208 的阴性把问题收窄成一句话：tee 只挂在块 I/O 的完成尾巴上，盘一停、tee 就停，
+而 tee 是内核环唯一的来源。于是 r209 不再等块 I/O，改在 **panic sink** 里读：panic 屏是
+替换 `vpanic` 的 freestanding 渲染器，panic 时经 `PANIC_SINK` 调
+`clover_emmc_panic_append`，走的是独立单块 PIO，不依赖块层。
+
+### 实现
+
+`drivers/CloverSdhci/CloverSdhci.cpp` 新增 `panicTailRead()`，在 `panicDrainRings()` 的
+八趟 tee 之后、排干之前调用：
+
+- 校验与 tee 同一组判据（`msg_magic`、`msg_size`、`msg_bufx`、`msg_bufc` 高于内核 VA 基址）；
+  拒绝时写一行 `CloverSdhci r209: panic tail refused reason=…`。
+- 从 `msg_bufx` **向回**走最多 16 KiB，按 `\n` 切出完整行；最末那段没有换行的半行跳过
+  （它还在写，起点不可知）。超过一条记录长度的行从头截到 319 字节保留，不整行丢弃。
+- 选择规则：**最新三行无条件保留**（死线时最该知道的是最后一句，而不是它是哪个探针）；
+  再往前的行只收 tee 游标没走到的那段（`unseen`），并跳过 r187/r189 两类噪声。
+- 最多 24 行，按时间顺序用 `kernelRingPush()` 推进内核环；尾部再推一行状态：
+  `lines/unseen/bufx/cursor/size/lap/refused/pend/drop/guard/last/cache`。
+- 内核环的唯一入口收敛成 `kernelRingPush()`：tee 与 panic sink 都走它，
+  checker 仍能断言「环只有一个入口」。
+
+`unseen` 是这一轮真正要读的数：它为 0，说明 msgbuf 自己也停在 167 s —— 内核不是只在卡上安静，
+而是根本没再打印；它很大且尾部行接着走，说明内核还活着、只是块路径停了。
+
+配套：`board.toml` 标题升到 `clover r209:`；`check-clover.py` 断言标题、sink 格式串与调用点；
+`verify-clover-payload.py` 新增 `panic-time log tail linked`，要求两条 r209 格式串与 r184 排干行
+都在内核镜像里；`gCacheSize`/`gCacheOn` 的声明上移到 tee 状态旁（sink 在缓存 bring-up 之前）。
+
+### 读数（2026-10-30 01:14 取回，11 条 report / 35 条判据 / 512 行内核环）
+
+**死线到了，panic 屏也跑了，但 sink 一条都没落盘。**
+
+时间线：脚本 `00:58:40` 冷刷 cache 并启动，`01:14:04` 从 TWRP 读回窗口。死线 900 s +
+panic 屏 15 s 自复位 ⇒ 复位在 `01:13:55` 左右，与读回时间吻合——**这轮确实走到了 900 s
+死线**，也就是说内核的定时器一路活到了 900 s，不是内核早就停了。
+
+窗口内容：
+
+- report 窗 11 条 `kind 20` 全是**旧的**：slot 10 仍是 r208 那次
+  （`ticks=170596 cnt0=ed2faa6 cnt1=414cb588e`），slot 11..15 全空。本次 panic 屏的文字
+  没有写进任何槽。
+- 判据环 35 条，最后一条 seq 34 是 `CloverSdhci r184: panic drain wrote=0 dropped=0
+  tee_passes=8`。但内核环在那之后**一行都没有**：如果这次排干真的跑了，`panicTailRead()`
+  至少会推「最新三行 + 一行状态」，`wrote` 不可能是 0。所以这条 r184 是 r208 的残留，
+  本次 sink 要么没被调到、要么在 append 的扫描读/写上就失败了（`2..5`），排干跟着一起失败。
+- 内核环 512 行 seq 655..1166，最后一行为
+  `[357.924561] clover r180: client pid=58 first selector=68`。这一窗比 r208 走得远得多：
+  `290.9/301.8 s` watchdogd 的 `brk`、`312.1/317.8/321.8 s` liveactivitiesd 的 `brk`、
+  `344.8/345.2 s` bluetoothd 退出、`348.7 s` apfs trim、`355.5 s` 显示器 client 的
+  selector 12/6/27/84/50、`357.9 s` selector 68。r208 的环停在 `167.198 s`。
+- 落地 TWRP **不能**证明 sink 跑过：判据环里有 `CloverSdhci r198: recovery BCB
+  pre-armed rc=100 written=1`，BCB 是 bring-up 时就写好的；即使 panic 路径一个字都没写，
+  板子照样落 recovery。
+
+**推论**：`357.9 s` 之后没有任何块 I/O 完成（内核环因此静默），而 900 s 时卡已经**不能读也
+不能写**（append 与排干都没留下任何记录），可是同一块卡在 r208 的 900 s 上一步是写成功的。
+内核还活着、定时器还在跑，卡却在某个时刻之后不可访问——最像**有一笔传输卡在飞行中，
+控制器被按住**（而不是内核停了，也不是 UEFI 交接的问题）。r209 想读的 `unseen` 因此没读到：
+panic 时连通道本身都断了。
+
+### 下一步（r210）：把「卡什么时候不可写、卡在哪笔 I/O」变成落盘的记录
+
+既然 panic 时卡写不进去，就必须在卡还能写的时候留下线索：
+
+1. **飞行记录**：`clover_emmc_block_read/write` 每次外部 I/O 开始前，往窗口里新增的
+   flight 区（sectors 32..63，16 个槽，`kind 23`）写一条一句话记录（`seq/dir/lba/blocks/
+   上一笔的结果与毫秒`）。卡住的最后一笔 I/O 就是**最后一条没有后继的记录**。
+2. **心跳**：ArmCpu 的定时器（CPU0，每 4 s）调 `clover_emmc_flight_beat()`，先看
+   `SDHCI_PRESENT_STATE` 的 CMD/DAT inhibit 位，再用 `IOLockTryLock` 拿块守卫，空闲时写一条
+   心跳（含 present-state、守卫等待、环 pending）。卡从某一刻起不可写，心跳就在那一刻停；
+   如果一直有心跳到 900 s，那问题就只在 panic 路径，而不在卡。
+3. 宿主 `read-clover-log.py` 增加 flight 区解码（sectors 32..63）。

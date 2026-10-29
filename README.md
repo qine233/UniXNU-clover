@@ -10,16 +10,18 @@ OS/SystemOS/Data 三个卷全挂、launchd 把守护进程拉起来；r202 让
 解掉 `FBSDisplayMode` 的断言，r206/r207 里 compositor 连续 present（4 帧、每帧 9 216 000
 字节扫上屏、`done/presented=4`）。帧仍是全黑的（2 304 000 像素里 2 262 414 个纯黑），
 因为画 UI 的 SpringBoard 被 backboardd 用 `kill(2)` 杀掉（r207：`_kill+0x140`、
-`ns=-1 code=0`、CS 位不含 `CS_KILLED`）。r208 这一窗没有复现那次杀——内核环在
-`167.198 s` 之后再没有新行，直到 900 s 死线：tee 只在块 I/O 完成时泵出，等价于
-那之后一次块 I/O 都没完成，但这一窗分不出是内核停了还是全部进程卡在等待里。
-桌面就差这一件事。
+`ns=-1 code=0`、CS 位不含 `CS_KILLED`）。r208/r209 两窗都没有复现那次杀，但把停点看清了：
+r209 走到 900 s 死线（定时器一直活到死线并触发复位），内核环却停在
+`[357.924561] clover r180: client pid=58 first selector=68`——tee 只在块 I/O 完成时泵出，
+等价于那之后一次块 I/O 都没完成；而 panic 时连 sink 都写不进卡（report 窗一条新记录都没有，
+判据环里那条 `panic drain` 是上一窗的残留），同一块卡在 r208 的 900 s 上一步还是写成功的。
+最像是**有一笔传输卡在飞行中、控制器被按住**，而不是内核停了。桌面就差这一件事。
 
 ## 距离 iOS 桌面还差什么
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 被 backboardd 的看门狗杀掉** | r207 读数：`killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58 scomm=backboardd ns=-1 code=0x0 cs=0x22000301 ra=fffffff0076ffd7c`。锚点与 `_psignal_internal` 的链接地址逐位相同（slide=0），`ra` 解成 `_kill+0x140`；CS 位不含 `CS_KILLED`，不是签名校验；backboardd 里有 `_pingSystemShellForCollectiveWatchdog:`、`watchdogPing: system app claims it's no longer alive`、`Killing %{public}@.`。r208 没有复现：环停在 `[167.198224] fairplayd.A2 exit`，之后 732 s 无块 I/O | r209 在 panic sink 里绕开 `gTeeIndex`，从 `msg_bufx` 反向扫 msgbuf 尾部直写内核环，并附一行驱动状态——下一次死线就能判「内核停了」还是「只是 tee 通道停了」 |
+| 1 | **SpringBoard 被 backboardd 的看门狗杀掉** | r207 读数：`killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58 scomm=backboardd ns=-1 code=0x0 cs=0x22000301 ra=fffffff0076ffd7c`。锚点与 `_psignal_internal` 的链接地址逐位相同（slide=0），`ra` 解成 `_kill+0x140`；CS 位不含 `CS_KILLED`，不是签名校验；backboardd 里有 `_pingSystemShellForCollectiveWatchdog:`、`watchdogPing: system app claims it's no longer alive`、`Killing %{public}@.`。r208 没有复现：环停在 `[167.198224] fairplayd.A2 exit`，之后 732 s 无块 I/O。r209 走到 900 s 死线（定时器活到死线并触发复位），ring 走到 seq 1166 停在 `[357.924561] client pid=58 first selector=68`；但 panic 屏一条记录都没写进 report 窗（11 条全是旧 kind 20，slot 11..15 全 0），判据环的 `panic drain wrote=0` 也是 r208 残留——**panic 时 sink 已写不进卡**；r198 的 BCB 预置让「落进 TWRP」不能当证据 | r210 在块读/写入口写一条 flight 记录（kind 23，窗口 sectors 32..63），CPU0 定时器每 4 s 采一次 `SDHCI_PRESENT_STATE` 的 CMD/DAT inhibit 位并用 `IOLockTryLock` 试守卫——最后一笔飞行记录 + 最后一拍就能判「卡在传输中」还是「内核停了」 |
 | 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |

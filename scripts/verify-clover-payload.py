@@ -805,6 +805,27 @@ def check_critical_exit_probe(kernel: bytes) -> bool:
     return ok
 
 
+def check_panic_tail_read(kernel: bytes) -> bool:
+    """Round209 reads the log buffer from the panic sink. The r208 frame's kernel ring ends at
+    167.198 s and gains nothing before the deadline, because the tee only runs on block I/O tails;
+    the sink is the one writer left, so the image has to carry the backwards scan and its status
+    row -- `unseen` is what separates a stopped kernel from a stopped card path. It has to keep the
+    r184 drain line, which is the record that the drain ran at all."""
+    label = "kernel.macho: panic-time log tail linked"
+    found = {"tail": (b"CloverSdhci r209: panic tail lines=%u unseen=%u bufx=%d cursor=%u "
+                      b"size=%u lap=%u refused=%u pend=%u drop=%u guard=%u last=%ums cache=%u\n")
+                     in kernel,
+             "refused": (b"CloverSdhci r209: panic tail refused reason=%u magic=0x%x size=%d "
+                         b"bufx=%d\n") in kernel,
+             "kept-r184": (b"CloverSdhci r184: panic drain wrote=%u dropped=%u tee_passes=%u\n")
+                          in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_signal_desc_probe(kernel: bytes) -> bool:
     """Round196 reads what an aborting process said. The r195 frame has usermanagerd answering
     SIGABRT (namespace 2, code 6) at three-second intervals for the rest of the boot, and the
@@ -1264,6 +1285,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_flush_stages(kernel)
         ok &= check_cache_ownership(kernel)
         ok &= check_critical_exit_probe(kernel)
+        ok &= check_panic_tail_read(kernel)
         ok &= check_signal_desc_probe(kernel)
         ok &= check_user_breakpoint_probe(kernel)
     return 0 if ok else 1

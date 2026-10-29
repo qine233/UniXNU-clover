@@ -506,6 +506,10 @@ static uint32_t gTeeThrottled = 0;              // matches dropped by the per-pa
 static uint32_t gTeeLap = 0;                    // passes where the writer was behind our cursor
 static uint32_t gTeeRefused = 0;                // reason code: see teeValidate below
 static uint32_t gTeeRefusedShown = 0;
+// Round171's cache state, declared here because round209's panic sink reports it and the sink is
+// emitted above the cache bring-up; both are written once, by that bring-up.
+static volatile uint32_t gCacheSize = 0;        // the card's write cache in 512-byte units
+static volatile uint32_t gCacheOn = 0;          // whether bring-up managed to switch it on
 static uint32_t gTeeNextReport = 256;           // emit a tee census every this many lines examined
 static uint32_t gTeeCensus = 0;                 // census lines said so far this boot
 // The census is the tee talking about itself, so it lands in the driver's ring -- which round176 grew
@@ -2683,6 +2687,15 @@ static void sdhciSay (const char *fmt, ...)
   ringPush (kRingDriver, line, length);
 }
 
+// The one way into the kernel ring. Both producers go through it: the tee, which lifts the kernel's
+// own lines out of msgbuf, and round209's panic sink, which reads the same buffer backwards when no
+// block I/O is left to run the tee. Keeping the raw push in one place is also what lets the checker
+// assert the ring has exactly one entry point.
+static void kernelRingPush (const char *line, uint32_t length)
+{
+  ringPush (kRingKernel, line, length);
+}
+
 // One LOG1 record, same shape as mode 17 and the panic writer: header block then text block, byte
 // sum over prefix + body + newline. Word 8 carries the sequence number, which is what makes a
 // wrapped ring orderable: slot index alone stops being time once a ring has more records than slots.
@@ -2912,7 +2925,7 @@ static void teeConsumeLine (uint32_t &pushed)
     gTeeThrottled++;
     return;
   }
-  ringPush (kRingKernel, gTeeLine + start, length - start);
+  kernelRingPush (gTeeLine + start, length - start);
   gTeeKept++;
   pushed++;
 }
@@ -3014,6 +3027,140 @@ static void teeKernelLog (void)
   }
 }
 
+// Round209: the tee is itself a block I/O tail, so a boot that stops completing block I/O takes the
+// tee with it -- r208's kernel ring simply ends at 167.198 s and the deadline's eight passes find
+// nothing new. The panic sink is the one writer left, so it reads the log buffer directly: walk
+// backwards from msg_bufx over at most kPanicTailScanBytes, keep the newest complete lines, and take
+// the ones the tee cursor never reached. The newest few are kept whatever their class, because at a
+// deadline the question is what the last line was, not which probe printed it.
+//
+// `unseen` in the status line is the measurement that separates the two readings a silent frame
+// cannot: zero means the kernel's own buffer also stopped growing (the kernel is not merely quiet on
+// the card), and a large number with a tail that keeps going means the kernel was still logging and
+// only the card path stopped.
+static const uint32_t kPanicTailLines = 24;      // newest complete lines pushed to the kernel ring
+static const uint32_t kPanicTailAlways = 3;      // newest lines kept even when their class is noise
+static const uint32_t kPanicTailScanBytes = 16384;
+
+// The panic sink's voice: formats once and pushes the line into the kernel ring, with no IOLog and
+// no driver-ring copy -- what it has to say is about the kernel's own buffer, so it belongs there.
+static void panicTailSay (const char *fmt, ...)
+{
+  char line[kVerdictTextBytes + 1];
+  va_list args;
+  va_start (args, fmt);
+  const uint32_t length = verdictFormat (line, kVerdictTextBytes, fmt, args);
+  va_end (args);
+  kernelRingPush (line, length);
+}
+
+static bool panicTailNoise (const char *line, uint32_t length)
+{
+  return teeHasPrefix (line, length, "clover r187") ||
+         teeHasPrefix (line, length, "clover r189");
+}
+
+static void panicTailRead (void)
+{
+  if (!gTeeReady) {
+    return;
+  }
+  struct msgbuf *buffer = msgbufp;
+  const int magic = buffer ? buffer->msg_magic : 0;
+  const int size = buffer ? buffer->msg_size : 0;
+  const int bufx = buffer ? buffer->msg_bufx : -1;
+  char *raw = buffer ? buffer->msg_bufc : nullptr;
+  const uint64_t base = static_cast<uint64_t> (reinterpret_cast<uintptr_t> (raw));
+
+  uint32_t reason = 0;
+  if (!buffer) {
+    reason = 1;
+  } else if (magic != MSG_MAGIC) {
+    reason = 2;
+  } else if (size <= 0 || size > MAX_MSG_BSIZE) {
+    reason = 3;
+  } else if (bufx < 0 || bufx >= size) {
+    reason = 4;
+  } else if (base < kTeeKernelVaBase) {
+    reason = 5;
+  }
+  if (reason) {
+    panicTailSay ("CloverSdhci r209: panic tail refused reason=%u magic=0x%x size=%d bufx=%d\n",
+                  reason, magic, size, bufx);
+    return;
+  }
+
+  const uint32_t sizeu = static_cast<uint32_t> (size);
+  const uint32_t stop = static_cast<uint32_t> (bufx);
+  volatile char *data = reinterpret_cast<volatile char *> (base);
+  uint32_t unseen = 0;
+  if (gTeeBuffer == base && gTeeIndex < sizeu) {
+    unseen = (stop >= gTeeIndex) ? stop - gTeeIndex : sizeu - gTeeIndex + stop;
+  }
+
+  uint32_t start[kPanicTailLines];
+  uint32_t length[kPanicTailLines];
+  uint32_t taken = 0;
+  char text[kVerdictTextBytes + 1];
+  uint32_t pos = stop;
+  uint32_t segEnd = stop;
+  bool newest = true;                 // bytes past the last newline: start is not knowable
+  uint32_t stepped = 0;
+  while (stepped < kPanicTailScanBytes && taken < kPanicTailLines) {
+    if (pos == 0) {
+      pos = sizeu;
+    }
+    pos--;
+    stepped++;
+    if (data[pos] != '\n') {
+      continue;
+    }
+    if (newest) {
+      newest = false;
+    } else {
+      const uint32_t lineStart = (pos + 1) % sizeu;
+      const uint32_t lineLength = (segEnd >= lineStart) ? segEnd - lineStart
+                                                        : sizeu - lineStart + segEnd;
+      if (lineLength) {
+        // A line longer than a ring record is kept from its start, where the timestamp and the
+        // subsystem are, and cut to fit: dropping it whole would lose the one line that mattered.
+        const uint32_t keep = lineLength < kVerdictTextBytes ? lineLength : kVerdictTextBytes - 1;
+        for (uint32_t i = 0; i < keep; i++) {
+          text[i] = data[(lineStart + i) % sizeu];
+        }
+        const uint32_t behind = (stop >= segEnd) ? stop - segEnd : sizeu - segEnd + stop;
+        const bool fresh = behind <= unseen;
+        if (taken < kPanicTailAlways || (fresh && !panicTailNoise (text, keep))) {
+          start[taken] = lineStart;
+          length[taken] = keep;
+          taken++;
+        }
+      }
+    }
+    segEnd = pos;
+  }
+
+  for (uint32_t i = taken; i > 0; i--) {
+    const uint32_t lineStart = start[i - 1];
+    const uint32_t lineLength = length[i - 1];
+    for (uint32_t j = 0; j < lineLength; j++) {
+      text[j] = data[(lineStart + j) % sizeu];
+    }
+    kernelRingPush (text, lineLength);
+  }
+
+  panicTailSay ("CloverSdhci r209: panic tail lines=%u unseen=%u bufx=%d cursor=%u size=%u "
+                "lap=%u refused=%u pend=%u drop=%u guard=%u last=%ums cache=%u\n",
+                taken, unseen, bufx,
+                static_cast<unsigned int> (gTeeIndex), sizeu,
+                static_cast<unsigned int> (gTeeLap), static_cast<unsigned int> (gTeeRefused),
+                static_cast<unsigned int> (gRingPending[kRingKernel]),
+                static_cast<unsigned int> (gRingDropped[kRingKernel]),
+                static_cast<unsigned int> (__atomic_load_n (&gGuardWaits, __ATOMIC_RELAXED)),
+                static_cast<unsigned int> (__atomic_load_n (&gGuardLastWaitMs, __ATOMIC_RELAXED)),
+                static_cast<unsigned int> (__atomic_load_n (&gCacheOn, __ATOMIC_RELAXED)));
+}
+
 // Round184: the panic screen's sink is the last writer this boot gets, and it is called at a moment
 // chosen by the failure rather than by the card. Everything the tee lifted since the last block
 // request -- which, on a boot that hung, is the entire part worth reading -- is still in the RAM
@@ -3042,6 +3189,9 @@ static void panicDrainRings (void)
   for (uint32_t pass = 0; pass < kPanicTeePasses; pass++) {
     teeKernelLog ();
   }
+  // Round209: after the tee has had its passes, read the buffer from the sink's side. On a boot
+  // whose block path stopped, these passes find nothing and this is the only reading left.
+  panicTailRead ();
   for (uint32_t which = 0; which < kRingCount; which++) {
     if (which == kRingKernel ? !gTeeReady : !gVerdictReady) {
       continue;
@@ -4169,9 +4319,7 @@ static FlushSettle flushSettle (uint64_t frequency, uint32_t boundMs)
 // gCacheSize is the card's own write cache in 512-byte units (zero means the card has none, and a
 // flush of nothing is a success); gCacheOn records whether bring-up managed to switch it on, which
 // is what makes clover_emmc_flush_cache() a real commit rather than a command sent to a card that
-// was never caching.
-static volatile uint32_t gCacheSize = 0;
-static volatile uint32_t gCacheOn = 0;
+// was never caching. Both are declared above, beside the tee state round209's sink reads them from.
 // How many commits actually completed this boot. CloverBlock prints it in its own reading line; a
 // frame that shows writes and zero flushes is a frame where the cache was never on.
 static volatile uint32_t gCacheFlushes = 0;
