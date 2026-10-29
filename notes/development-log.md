@@ -15087,3 +15087,47 @@ r198 的读数把停点定死在「SpringBoard 每次 exec 0.35–0.66 s 后以 
 6. **契约**：`check-clover.py` 认格式串、函数签名、`clover_ubrk_total >= 48`、`printed >= 2`、
    调用点在场且必须在 boot-progress 钩子之后、不得出现 `handle_kernel_breakpoint`；驱动必须
    有 `r199-ubrk` 类。`verify-clover-payload.py` 加 `user breakpoint reading linked` 一项。
+
+### 读数（v0.5.59 实机，2026-10-29）
+
+冷刷 cache（mmcblk0p49，58720256 字节）后 `run-clover-unattended.sh --boot-after-flash
+--allow-misc-bcb --wait 1200` 一帧跑完：900 s 死线到点（report slot 6，ticks=159329、`fb=1`），
+panic 自己写的 BCB 接住复位，宿主先见 TWRP adb（`81ffcaaa recovery`）。窗口解码出 7 条 report、
+35 条驱动判据、512 条内核行；`clover r199: ubrk` 共 **23 条**，预算 48 条没用完——每一行都进了环。
+
+1. **SpringBoard 是 `brk #0`，不是断言**。8 次执行（pid 26/137/139/142/147/151/157/166）对应 8 条
+   `esr=0xf2000000 ec=60 brk=0x0`，PC 恒为 `0x1bdc472ec`、**LR 与 PC 相同**、`cpsr=0x60000000`、
+   SP 各不相同（`0x16f…`）。`brk #1` 才是 clang 的 `__builtin_trap()`（断言/abort 走这条），
+   ptrauth 检查失败是 `esr=…f20000c47x` 那一档；`brk #0` 两边都不是。上一次退出行里
+   `rv=0x5 ns=2 code=0x5 desc=none` 的含糊，到这里变成了具体的一条指令。
+2. **地址落在共享缓存里，且同一帧内不随进程变**：`0x1bdc472ec` 与 liveactivitiesd 的
+   `0x1e015e4f8` 都在 `0x18…–0x20…` 这段（这台的缓存是 `dyld_shared_cache_arm64`，不是 arm64e，
+   帧内 r153 的读头行就是这么写的），同一条 0x1bdc472ec 在 8 个 pid 上完全一样——共享缓存按
+   每次启动一个 slide 映射，所以这是「某个库的某个固定位置」，不是 SpringBoard 自己的代码。
+3. **反复重启的每一个都在断点上，且形状分成三类**：
+   - SpringBoard：`brk #0`，PC==LR（`0x1bdc472ec`），8/8 与 exec/exit 成对，exec 到 exit 只隔
+     0.26–0.45 s；
+   - liveactivitiesd：`brk #1`，PC 恒为 `0x1e015e4f8`、LR 恒为 `0x1e015e4cc`（PC−0x2c），5/5 成对；
+   - watchdogd：`brk #1`，但每个进程的 PC 都不同（`0x10012cb0c`、`0x100b82b0c`、`0x1008bfb0c`…），
+     低 12 位恒为 `0xb0c`——同一份可执行文件、按进程 ASLR 滑过页倍数，正是 r193 追的
+     `IOWatchdog` 查找失败那个 `brk`。
+   也就是说这一帧里所有 `rv=0x5` 的退出都是真的 BRK，没有一条来自别的 SIGTRAP 来源。
+4. **r193 的抑制仍然有效**：watchdogd 死了 10 次，`panic-on-crash disabled via boot-arg` 出现 9 次，
+   启动没有被它打崩，一直走到 900 s 死线；r198 的预上膛也仍然成立（verdict slot 4
+   `recovery BCB pre-armed rc=100 written=1`），r171 的 `on=0` 说明缓存还交在卡上。
+5. **这一轮没做到的事**：`0x1bdc472ec` 还没落到符号上。共享缓存文件不在宿主上（本机没有
+   `dyld_shared_cache_arm64*`，`~/ShaLouData/cache/ipsw/x12220000_5_Recovery.ipsw` 是个 36 KB 的
+   2009 年残留包），`round159-userdata-root.sparse.img` 也不是能直接挂的 APFS 容器。下一轮要么把
+   陷阱页的 **vm_map 边界与文件偏移** 打进环（偏移不带 slide，任何一台同款缓存都能对出名字），
+   要么在核内直接把缓存头读出来按 `images[]` 查路径——两者都不需要再猜。
+
+### 下一步（round200 的候选，按可信度排序）
+
+1. **把映射与偏移打出来**：在 r199 的探针里对陷阱 PC 做 `vm_map_lookup_entry()`，打 `start=`/
+   `end=`/`off=pc-start`，顺带 x16/x17（stub 的跳转目标）与 x0–x3、x8。`off` 不随 slide 变，
+   有缓存文件就能唯一对回镜像名与段名。
+2. **核内读缓存头**：`dyld_v1` 头的 `mappings[]`（vmaddr/size/fileOffset）与 `images[]`
+   （textSegment 加 pathOffset）都在缓存文件开头几 MB；把 `vn_rdwr` 与解析放进一个一次性探针，
+   在第一台 SpringBoard 陷阱后打一条 `image=` 就结束了这条线。
+3. **liveactivitiesd 的 `0x1e015e4f8`** 有真实调用者（LR=PC−0x2c），比 SpringBoard 那条更容易先
+   落地：同一个解析器拿到偏移即可。
