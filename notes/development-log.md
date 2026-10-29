@@ -15639,3 +15639,63 @@ r208 把这一行再往下钉两格：发信者的**用户态 PC** 与该处指�
 指令字」在 backboardd 里找调用点，不需要用户态 slide），以及 SpringBoard 被杀那一刻
 它每个线程的用户态 PC/CPSR/等待事件——被看门狗杀通常意味着主线程卡住，卡在哪一帧
 比谁发的更有用。
+
+## Round 208 — 这一窗没有杀进程：167.198 s 之后内核一行都不写了
+
+r208 的探针（发信者用户态 PC 与指令字、SpringBoard 每线程 PC/CPSR/等待事件）在镜像里，
+`strings` 在 `round208-kernel-amfi.macho` 里能看到三处 `clover r208`。但**这一窗一条
+`clover r207:` 或 `clover r208:` 行都没有**：没有 SIGKILL 发生，所以探针没有被触发——
+不是探针坏了，是这一窗根本没走到那一步。
+
+### 环停在哪
+
+512 槽内核环 seq 261..772，最后一行是：
+
+```
+[167.198224] fairplayd.A2 exit
+```
+
+再往前是 `164.26-164.27` 的 dyld 共享缓存 open/read（全 `err=0`）和 `167.015` 的
+`usermanagerd exec pid=90`。之后的 732 秒里环里没有任何新行，直到 900 s 死线 panic：
+
+```
+clover r148: unattended deadline 900 s (elr=fffffff0073c5d60 spsr=204 ticks=170596
+  cnt0=ed2faa6 cnt1=414cb588e freq=124f800)
+fb=1
+ring len=0x1000 used=0x2ef nres=0 buf=0xfffffffbffda4000
+  wr=0xfffffffbffda4c4f rd=0xfffffffbffda4960
+```
+
+`ticks=` 不是秒，是 ArmCpu 的 timer 中断计数：`cnt1−cnt0 = 899.5 s`，按 `freq`
+折算约 5.3 ms 一拍，`ticks=170596` 与 900 s 自洽。环 `wr` 比 `rd` 多 751 字节，
+说明死线时刻 RAM 环里还有没泵出去的行——但 `panic drain wrote=0 dropped=0`，
+`tee_passes=8` 是常量（`kPanicTeePasses`），8 次扫描 32 KiB 也没找到任何一行新的，
+那 751 字节是已经在上一次 tee 里写过的残留。
+
+### 为什么环静默等于「没有块 I/O」
+
+`teeKernelLog()` 只挂在块 I/O 的完成尾巴上（读尾、写尾、flush 与 flush 后各一处，
+panic 一处）。它与 msgbuf 之间的拷贝就是内核环唯一的来源。环里 167.198 s 之后再没有新行，
+等价于**那之后 732 秒里一次块 I/O 都没完成**——不是「tee 预算用尽」，也不是「环太小回卷」：
+seq 只到 772，512 槽一槽没覆盖。
+
+`CloverBlock r190: sync-in pending=512 / sync-out ok=1`（`157.12 s`）是这一窗里最可疑的
+一条：dyld 共享缓存的同步读一度堆到 512 个在途，只有 1 个 sync-out。之后到 167 s 还有
+少量完成（dyld 那两行 `err=0`），然后整体停摆。和 r207 那一窗（SpringBoard 在 `351.4 s`
+被杀、`353.6 s` 还在 present 第 4 帧）相比，这一窗**死得更早**：SpringBoard 在 `144.77 s`
+就已经 exec（pid=27），还没活到被看门狗判死，盘就没有任何流量了。
+
+两种解释这一窗分不开：内核真的停了（死锁/异常），还是所有进程都卡在不可中断的等待里、
+只是内核还在跑但不碰盘。tee 通道两种都表现为静默，所以下一轮必须有一条**不依赖块 I/O**
+的读数。
+
+### 下一步（r209）
+
+panic 屏是替换 `vpanic` 的 freestanding 渲染器，panic 时它自己跑 C，并且能用
+`PANIC_SINK` 调进驱动（`clover_emmc_panic_append` → `panicAppendText` 走独立单块 PIO，
+panic 时可用）。r209 就在这个 sink 里**绕开 `gTeeIndex` 游标**，从 `msg_bufx` 反向扫出
+最新的 N 行（跳过已经泵过的 r187/r189 噪声，但永远保留最新几行），用
+`ringWriteRecord(kRingKernel, …)` 直接写进内核环；再补一行驱动侧状态（`bufx`、游标、
+lap、refused、pending、守卫等待次数/最长毫秒、cache 开关与大小）。这样下一次死线时，
+环里会有「panic 那一刻 msgbuf 尾部到底是什么」，能一次判死锁还是停在等待。
+不改任何槽位几何。

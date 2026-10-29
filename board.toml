@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r207: name the sender of SpringBoard's SIGKILL -- r206 presented the first frame but SpringBoard died at 417.5 s with a reason the kernel builds itself on the default-kill path, so psignal_internal now prints the receiver, the sender, the reason and the CS flags"
+title = "clover r208: locate the kill inside backboardd and read SpringBoard's threads -- r207 named backboardd at _kill+0x140, so the probe now carries the sender's user pc and the four bytes at it for a host-side call-site fingerprint, and dumps every SpringBoard thread's pc/cpsr/state/wait_event at the moment the collective watchdog fires"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

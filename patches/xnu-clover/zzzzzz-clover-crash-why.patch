@@ -88,7 +88,7 @@ diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 --- a/bsd/kern/kern_sig.c
 +++ b/bsd/kern/kern_sig.c
-@@ -2057,6 +2057,50 @@
+@@ -2057,6 +2057,92 @@
  		panic("psignal: bad signal number %d", signum);
  	}
  
@@ -107,6 +107,7 @@ diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 +		static uint32_t clover_kill_count[8];
 +		static uint32_t clover_kill_used;
 +		static uint32_t clover_kill_prints;
++		static uint32_t clover_r208_prints;
 +		proc_t clover_kill_sender = current_proc();
 +		uint32_t clover_kill_slot = 8;
 +		uint32_t clover_kill_i;
@@ -134,8 +135,133 @@ diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 +			    (unsigned long long)(uintptr_t)__builtin_return_address(0),
 +			    (unsigned long long)(uintptr_t)&psignal_internal);
 +		}
++
++		/*
++		 * Round208. Round207 named the sender; this says where in the
++		 * sender the kill was issued, and where every SpringBoard
++		 * thread was when it arrived. The sender's user PC plus the
++		 * four bytes at it locate the call site in backboardd without
++		 * following chained fixups on the host; a collective-watchdog
++		 * kill usually means the main thread is stuck, so the receiver
++		 * side matters more than the sender side.
++		 */
++		/*
++		 * Round208. Round207 named the sender; this says where in the
++		 * sender the kill was issued. The sender's user pc plus the four
++		 * bytes at it locate the call site in backboardd without following
++		 * chained fixups on the host. The receiver side -- every
++		 * SpringBoard thread at the moment the watchdog fires -- cannot be
++		 * read here: bsd is built without MACH_KERNEL_PRIVATE, so struct
++		 * task and struct thread are opaque and get_user_regs() is
++		 * invisible. That half lives in osfmk/kern/task.c.
++		 */
++		if (signum == SIGKILL && clover_r208_prints < 64) {
++			extern uint64_t clover_sender_upc(void);
++			extern uint32_t clover_task_threads(task_t task, uint32_t budget);
++			uint64_t clover_r208_upc = clover_sender_upc();
++			uint32_t clover_r208_uinsn = 0;
++
++			if (clover_r208_upc != 0 &&
++			    copyin((user_addr_t)clover_r208_upc, &clover_r208_uinsn,
++			    sizeof(clover_r208_uinsn)) != 0) {
++				clover_r208_uinsn = 0;
++			}
++			clover_r208_prints++;
++			printf("clover r208: sender upc=%016llx uinsn=%08x spid=%d scomm=%s\n",
++			    (unsigned long long)clover_r208_upc, clover_r208_uinsn,
++			    proc_getpid(clover_kill_sender), clover_kill_sender->p_comm);
++
++			if (strncmp(p->p_comm, "SpringBoard", 16) == 0) {
++				clover_r208_prints += clover_task_threads(proc_task(p),
++				    (clover_r208_prints < 64) ? 64 - clover_r208_prints : 0);
++			}
++		}
 +	}
 +
  	mask = sigmask(signum);
  	prop = sigprop[signum];
  
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -129,6 +129,11 @@
+ #include <kern/policy_internal.h>
+ #include <kern/restartable.h>
+ #include <kern/ipc_kobject.h>
++
++#if defined(__arm64__)
++#include <arm/thread.h>
++#include <mach/machine/thread_status.h>
++#endif
+ 
+ #include <corpses/task_corpse.h>
+ #if CONFIG_TELEMETRY
+@@ -10285,3 +10290,68 @@
+ 	char *name = proc_best_name(task_get_proc_raw(task));
+ 	strlcpy(buf, name, size);
+ }
++
++
++#if defined(__arm64__)
++/*
++ * Round208. bsd/kern is built without MACH_KERNEL_PRIVATE, so the signal
++ * path there cannot see a thread's saved registers or the internal task
++ * fields. These two readings happen here, where both are in scope.
++ */
++uint64_t
++clover_sender_upc(void)
++{
++	thread_t thr = current_thread();
++	arm_saved_state_t *ss;
++
++	if (thr == THREAD_NULL) {
++		return 0;
++	}
++	ss = get_user_regs(thr);
++	return (ss != NULL) ? (uint64_t)get_saved_state_pc(ss) : 0;
++}
++
++uint32_t
++clover_task_threads(task_t task, uint32_t budget)
++{
++	struct {
++		uint64_t tid;
++		uint64_t pc;
++		uint32_t cpsr;
++		int state;
++		uint64_t wait;
++	} snap[10];
++	thread_t thr;
++	uint32_t n = 0;
++	uint32_t i;
++
++	if (task == TASK_NULL || budget == 0) {
++		return 0;
++	}
++	/* Snapshot under the lock and print after it: the console can block
++	 * and nothing else should wait on task_lock behind a print. */
++	task_lock(task);
++	queue_iterate(&task->threads, thr, thread_t, task_threads) {
++		arm_saved_state_t *ss;
++
++		if (n >= 10 || n >= budget) {
++			break;
++		}
++		ss = get_user_regs(thr);
++		snap[n].tid = thr->thread_id;
++		snap[n].pc = (ss != NULL) ? (uint64_t)get_saved_state_pc(ss) : 0;
++		snap[n].cpsr = (ss != NULL) ? (uint32_t)get_saved_state_cpsr(ss) : 0;
++		snap[n].state = thr->state;
++		snap[n].wait = (uint64_t)thr->wait_event;
++		n++;
++	}
++	task_unlock(task);
++	for (i = 0; i < n; i++) {
++		printf("clover r208: sbthr n=%u tid=0x%llx pc=%016llx cpsr=%08x state=%d wait=%016llx\n",
++		    i + 1, (unsigned long long)snap[i].tid,
++		    (unsigned long long)snap[i].pc, snap[i].cpsr, snap[i].state,
++		    (unsigned long long)snap[i].wait);
++	}
++	return n;
++}
++#endif /* __arm64__ */

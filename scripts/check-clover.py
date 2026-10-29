@@ -781,6 +781,9 @@ def check_board(errors: list) -> str:
         if '{ "clover r207: ", "r207-kill", 48, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round207's sender line no tee class: the one "
                           "SIGKILL reading the bring-up waits on would land in the ring uncounted")
+        if '{ "clover r208: ", "r208-kill", 64, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round208's sender-pc and thread lines no tee "
+                          "class: the reading the bring-up waits on would land in the ring uncounted")
 
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
@@ -1662,8 +1665,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r207:"):
-        errors.append('[payload] title is not "clover r207: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r208:"):
+        errors.append('[payload] title is not "clover r208: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2660,8 +2663,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r207:"):
-        errors.append('[payload] title is not "clover r207: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r208:"):
+        errors.append('[payload] title is not "clover r208: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -2724,6 +2727,24 @@ def check_board(errors: list) -> str:
         if not (0 <= open_at < kill_at):
             errors.append(f"{crit_patch.name} does not anchor the r207 probe in psignal_internal(): "
                           "the sender and the receiver would not come from the same delivery")
+        # Round208. Round207 named backboardd but not the call site; the sender's user pc plus the
+        # four bytes at it are what the host fingerprints against the binary, because the chained
+        # fixups leave no constant pointer to search for. The receiver side reads every SpringBoard
+        # thread, since a collective-watchdog kill usually means the main thread is stuck.
+        upc_line = "clover r208: sender upc=%016llx uinsn=%08x spid=%d scomm=%s"
+        if upc_line not in text:
+            errors.append(f"{crit_patch.name} lacks the r208 sender pc and instruction word: the "
+                          "host could not locate the kill call site in backboardd")
+        sbthr_line = ("clover r208: sbthr n=%u tid=0x%llx pc=%016llx cpsr=%08x state=%d "
+                      "wait=%016llx")
+        if sbthr_line not in text:
+            errors.append(f"{crit_patch.name} lacks the r208 per-thread reading: the frame could "
+                          "not say where SpringBoard was stuck when the watchdog fired")
+        upc_at = text.find("clover r208: sender upc")
+        sbthr_at = text.find("clover r208: sbthr")
+        if not (kill_at < upc_at < sbthr_at):
+            errors.append(f"{crit_patch.name} places the r208 lines outside the r207 delivery: the "
+                          "sender and the threads would not be read at the same kill")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())

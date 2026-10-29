@@ -486,6 +486,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // forty overall. One SpringBoard death is what the ring is read for, so a class of its own keeps
   // that line from being pushed out by a daemon that is killed in a loop.
   { "clover r207: ", "r207-kill", 48, 0, 0, 0 },
+  // Round208 adds two lines to the same delivery: the sender's user pc plus the instruction word
+  // at it, and up to ten lines naming every SpringBoard thread's pc, cpsr, state and wait event.
+  // The kernel caps itself at 64 lines, so the class is the same 64 and one SpringBoard death
+  // still fits the ring beside r207's line -- and r207's own class of 48 cannot be starved by it.
+  { "clover r208: ", "r208-kill", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

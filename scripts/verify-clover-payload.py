@@ -792,6 +792,10 @@ def check_critical_exit_probe(kernel: bytes) -> bool:
                       b"crashbits=0x%x spawnfail=%d deadline=%llu now=%llu\n") in kernel,
              "killsig": (b"clover r207: killsig pid=%d comm=%s ppid=%d sig=%d spid=%d scomm=%s "
                          b"ns=%d code=0x%llx cs=0x%x ra=%016llx anchor=%016llx\n") in kernel,
+             "killupc": (b"clover r208: sender upc=%016llx uinsn=%08x spid=%d scomm=%s\n")
+                        in kernel,
+             "sbthr": (b"clover r208: sbthr n=%u tid=0x%llx pc=%016llx cpsr=%08x state=%d "
+                       b"wait=%016llx\n") in kernel,
              "kept-r170": (b"clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx "
                            b"comm=%s\n") in kernel}
     ok = all(found.values())

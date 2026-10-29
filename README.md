@@ -10,13 +10,16 @@ OS/SystemOS/Data 三个卷全挂、launchd 把守护进程拉起来；r202 让
 解掉 `FBSDisplayMode` 的断言，r206/r207 里 compositor 连续 present（4 帧、每帧 9 216 000
 字节扫上屏、`done/presented=4`）。帧仍是全黑的（2 304 000 像素里 2 262 414 个纯黑），
 因为画 UI 的 SpringBoard 被 backboardd 用 `kill(2)` 杀掉（r207：`_kill+0x140`、
-`ns=-1 code=0`、CS 位不含 `CS_KILLED`）。桌面就差这一件事。
+`ns=-1 code=0`、CS 位不含 `CS_KILLED`）。r208 这一窗没有复现那次杀——内核环在
+`167.198 s` 之后再没有新行，直到 900 s 死线：tee 只在块 I/O 完成时泵出，等价于
+那之后一次块 I/O 都没完成，但这一窗分不出是内核停了还是全部进程卡在等待里。
+桌面就差这一件事。
 
 ## 距离 iOS 桌面还差什么
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 被 backboardd 的看门狗杀掉** | r207 读数：`killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58 scomm=backboardd ns=-1 code=0x0 cs=0x22000301 ra=fffffff0076ffd7c`。锚点与 `_psignal_internal` 的链接地址逐位相同（slide=0），`ra` 解成 `_kill+0x140`；CS 位不含 `CS_KILLED`，不是签名校验；backboardd 里有 `_pingSystemShellForCollectiveWatchdog:`、`watchdogPing: system app claims it's no longer alive`、`Killing %{public}@.` | r208 取发信者的用户态 PC 与该处指令字钉住调用点，同时抓 SpringBoard 被杀那一刻各线程的 PC/CPSR/等待事件——被看门狗杀通常意味着主线程卡住 |
+| 1 | **SpringBoard 被 backboardd 的看门狗杀掉** | r207 读数：`killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58 scomm=backboardd ns=-1 code=0x0 cs=0x22000301 ra=fffffff0076ffd7c`。锚点与 `_psignal_internal` 的链接地址逐位相同（slide=0），`ra` 解成 `_kill+0x140`；CS 位不含 `CS_KILLED`，不是签名校验；backboardd 里有 `_pingSystemShellForCollectiveWatchdog:`、`watchdogPing: system app claims it's no longer alive`、`Killing %{public}@.`。r208 没有复现：环停在 `[167.198224] fairplayd.A2 exit`，之后 732 s 无块 I/O | r209 在 panic sink 里绕开 `gTeeIndex`，从 `msg_bufx` 反向扫 msgbuf 尾部直写内核环，并附一行驱动状态——下一次死线就能判「内核停了」还是「只是 tee 通道停了」 |
 | 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
