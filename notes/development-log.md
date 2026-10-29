@@ -14746,3 +14746,52 @@ flush-in 后面有没有 `flush-out` 与 `CloverBlock r190: sync-out ok=`：有 
 
 读法：`r171: write cache … ctrl=0 on=0`、`commit skipped`、`CloverBlock r190: sync-out ok=1` 三者同在，
 就说明 barrier 这次真的过去了；此后如果 usermanagerd 继续走出新记录，优先级这条线就结了。
+
+## round192 读数（v0.5.52 实机，2026-10-29）：卡不再挡路，挡路的是看门狗
+
+这一帧第一次越过了卡：`CloverSdhci r171: write cache size=65536 ctrl=0 on=0 …`、`CloverSdhci r192:
+commit skipped size=65536 on=0 (once)`，之后是一串 `CloverBlock r190: sync-out ok=1`。写缓存交还之后，
+barrier 立即返回，启动一路走到 207.93 s，`dyld` 共享缓存已经映射（`hdr=dyld_v1   arm64`），
+`usermanagerd`（pid 88）、`runningboardd`（26）、`powerd`（40）、`keybagd`、`containermanagerd_system`
+（94）、`ReportCrash`（93）都起来了，`xpcproxy` 不停 exec。
+
+停点是 `watchdogd`，而且是同一件事第三次：
+
+1. pid 52、92、97 分别在 `168.523254`、`197.473130`、`206.919923` exec，随后在 `194.095391`、
+   `198.143657`、`207.910911` 以 `clover r170: exit … rv=0x5 ns=2 code=0x5 comm=watchdogd` 退出。
+2. `ns=2` 是 `OS_REASON_SIGNAL`（`bsd/sys/reason.h:89`），`rv=0x5` 是 `W_EXITCODE(0, SIGTRAP)`
+   （`bsd/sys/wait.h:158`）——不是 `exit(5)`，是被 SIGTRAP 打死。
+3. 第三次退出之后 `207.929`–`207.931` 出现 panic 路径的同步（`sync-in pending=864` /
+   `sync-out ok=1` / `sync-in pending=8` / `sync-out ok=1`），panic 槽 0 上写着
+   `watchdogd[97] exited -- exit reason namespace 2 subcode 0x5 description: none`。
+
+卡上的 job plist 解释了这两半：`com.apple.watchdogd` 的 `LaunchEvents` 按
+`IOProviderClass = IOWatchdog` 匹配，而这块板没有这个服务——上游
+`scripts/check-watchdogd-branches.py` 记录过物理硬件上这个查找失败会让 watchdogd `brk`，即 SIGTRAP；
+同一个 plist 还设了 `PanicOnCrash` 与 `PanicOnConsecutiveCrash`，于是第三次死亡走到
+`proc_handle_critical_exit()`（`bsd/kern/kern_exit.c:1846`）并把机器打崩。
+
+所以这一轮的墙已经不是驱动，是「一个永远找不到的 IOWatchdog 被当成致命崩溃」。优先级是桌面，
+而 IOWatchdog 是驱动，不在这一格里。
+
+## round193（v0.5.53）：看门狗的死不再结束启动
+
+两半，都不碰驱动：
+
+- boot arg 加 `panic_on_crash_disabled=1`。它在 `proc_should_trigger_panic()` 里排在 crash 行为判定
+  之前，直接返回 false；`initproc` 的判定在它之前，所以 launchd 真死仍然 panic。它是
+  `osfmk/kern/startup.h:245` 的普通 TUNABLE，RELEASE 里也真实存在，不是 DEVELOPMENT 专属。
+  clover 的 `CONFIG_XNU_BOOT_PROGRESS=n`，sheng 那条 `disabled.plist` 策略不在本板编译，所以只能从
+  XNU 这一侧关。
+- 新增 `patches/xnu-clover/zzzzzz-clover-crash-why.patch`：在 `proc_handle_critical_exit()` 的
+  **entrance**打印一行
+  `clover r193: crit pid= comm= rv= sig= fatal= sigcrash= crashbits= spawnfail= deadline= now=`。
+  探针在 `proc_should_trigger_panic()` 之前，所以被抑制的那几次也会留下记录；`fatal`/`sigcrash`/
+  `crashbits`/`deadline` 正好是那次判定用到的全部输入。预算 64 行。
+- 契约：`check-clover.py` 要求标题是 `clover r193:`、`kernel_args` 里有
+  `panic_on_crash_disabled=1`、补丁存在且探针在早退之前；`verify-clover-payload.py` 新增
+  `critical exit reading linked`（r193 串 + r170 串同在）。
+
+读法：下一次 watchdogd 死时，应该看到 `clover r193: crit …` 后面紧跟 `panic-on-crash disabled via
+boot-arg`，而不是 panic 槽；启动应越过 208 s。若 `crashbits=0x6`（`PANIC_ON_CRASH|PANIC_ON_CONSECUTIVE_CRASH`）
+与 `sigcrash=1` 同时在，这行也把「为什么第三次才炸」的答案写死在帧里。

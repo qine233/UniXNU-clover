@@ -758,6 +758,23 @@ def check_cache_ownership(kernel: bytes) -> bool:
     return ok
 
 
+def check_critical_exit_probe(kernel: bytes) -> bool:
+    """Round193 reads why a crash became critical. The r192 frame ends on the third watchdogd
+    SIGTRAP and the panic behind it, so the image has to carry the line that names the
+    crash-behavior bits and deadline of every critical exit, and it has to keep the r170 exit line
+    -- that one is what pairs the death with its pid and wait status in the same frame."""
+    label = "kernel.macho: critical exit reading linked"
+    found = {"crit": (b"clover r193: crit pid=%d comm=%s rv=0x%x sig=%d fatal=%d sigcrash=%d "
+                      b"crashbits=0x%x spawnfail=%d deadline=%llu now=%llu\n") in kernel,
+             "kept-r170": (b"clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx "
+                           b"comm=%s\n") in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
 def check_legacy_display(kernel: bytes) -> bool:
     """Round180 replaces the display stub with the original Legacy framebuffer class plus a probe that
     registers, constructs and unwinds it at phase 1. Nothing in the payload proves the class was linked
@@ -1167,6 +1184,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_sys_why4(kernel)
         ok &= check_flush_stages(kernel)
         ok &= check_cache_ownership(kernel)
+        ok &= check_critical_exit_probe(kernel)
     return 0 if ok else 1
 
 

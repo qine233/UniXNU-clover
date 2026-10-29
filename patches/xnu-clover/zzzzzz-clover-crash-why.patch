@@ -1,0 +1,41 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1845,6 +1845,38 @@
+ static void
+ proc_handle_critical_exit(proc_t p, int rv)
+ {
++	/*
++	 * Round193. watchdogd dies with SIGTRAP on this board because the job
++	 * matches an IOWatchdog service that does not exist, and its job plist
++	 * sets PanicOnCrash/PanicOnConsecutiveCrash, so XNU turns the third
++	 * death into a panic. panic_on_crash_disabled=1 in the payload is what
++	 * keeps the boot alive; this line says which decision inputs were live
++	 * when the exit reached this function, so the frame proves the
++	 * suppression ran on the path we think it did. */
++	{
++		static uint32_t clover_crit_prints;
++
++		if (clover_crit_prints < 64) {
++			uint64_t clover_crit_now = mach_continuous_time();
++			os_reason_t clover_crit_reason = p->p_exit_reason;
++			int clover_crit_fatal = (clover_crit_reason != OS_REASON_NULL) ?
++			    (int)_proc_is_fatal_reason(clover_crit_reason) : -1;
++			int clover_crit_sigcrash = (WIFSIGNALED(rv) &&
++			    clover_crit_reason != OS_REASON_NULL &&
++			    clover_crit_reason->osr_namespace == OS_REASON_SIGNAL) ?
++			    (int)_proc_is_crashing_signal((int)clover_crit_reason->osr_code) : -1;
++
++			clover_crit_prints++;
++			printf("clover r193: crit pid=%d comm=%s rv=0x%x sig=%d fatal=%d sigcrash=%d crashbits=0x%x spawnfail=%d deadline=%llu now=%llu\n",
++			    proc_getpid(p), p->p_comm, rv,
++			    WIFSIGNALED(rv) ? WTERMSIG(rv) : -1,
++			    clover_crit_fatal, clover_crit_sigcrash,
++			    p->p_crash_behavior, p->p_posix_spawn_failed,
++			    (unsigned long long)p->p_crash_behavior_deadline,
++			    (unsigned long long)clover_crit_now);
++		}
++	}
++
+ 	if (!proc_should_trigger_panic(p, rv)) {
+ 		// No panic, bail out
+ 		return;

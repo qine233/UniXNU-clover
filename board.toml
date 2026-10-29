@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r192: the card keeps its own write cache -- r191's commit never returned and could not report, so the bring-up stops switching it on"
+title = "clover r193: the watchdog's death no longer ends the boot -- the third SIGTRAP from a job that can never find IOWatchdog used to panic an otherwise healthy system"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2319,6 +2319,23 @@ kernel_args = [
   # `no logdump entry at ...` -- because "never armed" and "armed and never flushed" are different answers
   # and a dump has to be able to tell them apart.
   "clover-unattended=300",
+  # Round193. Round192's frame ends with `watchdogd[97] exited -- exit reason namespace 2
+  # subcode 0x5 description: none` and the panic-path syncs right behind it, after the same job
+  # died the same way twice before (pids 52, 92, 97, each `rv=0x5 ns=2 code=0x5`). ns 2 is
+  # OS_REASON_SIGNAL (bsd/sys/reason.h:89) and 0x5 is W_EXITCODE(0, SIGTRAP) (bsd/sys/wait.h:158),
+  # so this is a trap, not an exit code. The job plist on the card explains both halves:
+  # com.apple.watchdogd is launched by LaunchEvents matching IOProviderClass IOWatchdog, a class this
+  # board has no driver for -- watchdogd traps when the lookup fails, exactly as upstream's
+  # scripts/check-watchdogd-branches.py records for physical hardware -- and the same plist sets
+  # PanicOnCrash and PanicOnConsecutiveCrash, which makes the third death reach
+  # proc_handle_critical_exit (bsd/kern/kern_exit.c:1846) and panic the machine 208 s into a boot
+  # whose daemons were otherwise surviving. With drivers paused until the desktop, the answer is not
+  # an IOWatchdog service but to stop treating this crash as fatal. panic_on_crash_disabled is a
+  # plain RELEASE tunable (osfmk/kern/startup.h:245) that returns false before any crash-behavior
+  # test, and launchd is still exempt because proc_should_trigger_panic checks initproc first, so a
+  # real init death still panics. The r193 kernel line records crashbits/deadline for every
+  # critical exit, so the frame can show the suppression ran on this exact path.
+  "panic_on_crash_disabled=1",
 ]
 
 [payload.adt]

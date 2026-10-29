@@ -1521,8 +1521,10 @@ def check_board(errors: list) -> str:
     # block driver, which carries its own r190 stamps and also leaves the arming lines alone.
     # Round191 splits that bracket into stages and moves the commit's wait onto the host's busy bit,
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
-    if not board["payload"]["title"].startswith("clover r192:"):
-        errors.append('[payload] title is not "clover r192: ...": the menu would not name this round')
+    # Round193 changes no driver at all: it adds one kernel line at the top of
+    # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
+    if not board["payload"]["title"].startswith("clover r193:"):
+        errors.append('[payload] title is not "clover r193: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2494,8 +2496,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r192:"):
-        errors.append('[payload] title is not "clover r192: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r193:"):
+        errors.append('[payload] title is not "clover r193: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -2510,6 +2512,38 @@ def check_board(errors: list) -> str:
     if not (0 <= skip_at < guard_at):
         errors.append("clover_emmc_flush_cache records the skipped commit after taking the block "
                       "guard: the record would wait for the writer it exists to avoid")
+
+    # Round193. The r192 frame ends with the third watchdogd death of the boot and a panic behind
+    # it: namespace 2 is OS_REASON_SIGNAL, 0x5 is W_EXITCODE(0, SIGTRAP), and the job plist's
+    # PanicOnCrash/PanicOnConsecutiveCrash turns that trap into a machine panic. The fix is a boot
+    # argument, not a driver -- drivers are paused until the desktop -- so the contract has two
+    # halves that must stay together: the argument is still in kernel_args, and the kernel line
+    # still prints before the panic decision so a frame can show which decision inputs were live.
+    if "panic_on_crash_disabled=1" not in kernel_args:
+        errors.append("[payload] kernel_args lost panic_on_crash_disabled=1: the third watchdogd "
+                      "SIGTRAP would panic the boot again at ~208 s")
+    crit_patch = next((base / "patches/xnu-clover/zzzzzz-clover-crash-why.patch"
+                       for base in (REPO, pathlib.Path.cwd())
+                       if (base / "patches/xnu-clover/zzzzzz-clover-crash-why.patch").is_file()),
+                      None)
+    if crit_patch is None:
+        errors.append("patches/xnu-clover/zzzzzz-clover-crash-why.patch is missing: the next frame "
+                      "could not tell which crash-behavior bits made the exit critical")
+    else:
+        text = crit_patch.read_text()
+        crit_line = ("clover r193: crit pid=%d comm=%s rv=0x%x sig=%d fatal=%d sigcrash=%d "
+                     "crashbits=0x%x spawnfail=%d deadline=%llu now=%llu")
+        if crit_line not in text:
+            errors.append(f"{crit_patch.name} lacks the r193 critical-exit fields: the frame could "
+                          "not name the inputs of the panic decision")
+        # The probe must sit above the early return, otherwise the suppressed exits -- the ones this
+        # round exists to observe -- would print nothing at all.
+        if not (0 <= text.find("clover r193: crit") < text.find("if (!proc_should_trigger_panic")):
+            errors.append(f"{crit_patch.name} prints the r193 line at or below "
+                          "proc_should_trigger_panic(): a suppressed crash would not be recorded")
+        if text.find("proc_handle_critical_exit(proc_t p, int rv)") < 0:
+            errors.append(f"{crit_patch.name} does not anchor the probe in "
+                          "proc_handle_critical_exit(): the line would not bracket the panic path")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())
