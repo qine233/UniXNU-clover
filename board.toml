@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r202: the display attaches and starts -- r201 read SpringBoard's trap as FBSDisplayMonitor finding no main CADisplay, so the phase-1 probe is now phase 4: the GOP range becomes a /arm-io display-subsystem, IOMobileFramebufferLegacy probes, attaches and starts on it, and the logical power pair plus the swap validator, scanout transfer and retirement are passed so a frame can actually land"
+title = "clover r206: read the FBSDisplayMode frame through x29 -- r205 published /chosen display-scale and the trap stayed at the same pc with the same zero scale, so the probe now prints the entry d9 (scale), x24 (arg3) and the caller's return address to name who passes zero"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2184,7 +2184,11 @@ kernel_args = [
   # A started display with no swap path would present nothing, which is the same picture as no
   # display at all, so the three travel with the phase that starts it.
   # sheng-fb-gpu stays off (the Adreno hand-off is a later question and the CPU copy needs no GPU
-  # client) and so does offline-legacy-unit-scale (no /chosen display-scale is published).
+  # client). offline-legacy-unit-scale stays off too, but for a new reason since round205: the UI
+  # scale is a device-tree fact now -- the ADT publishes /chosen/display-scale = 2 -- and the probe's
+  # publishOrMatchWord would have to agree with the ADT's display-rotation (270) to keep startHardware
+  # alive, which it does not. Round204 read the cost of the missing key on the device: SpringBoard's
+  # FBSDisplayMode arrived with a 0.0 scale at +0x20, refresh 60.0 at +0x28, and trapped.
   # What comes back, in the order it lands on the card's kernel-log ring (round176's tee keeps every
   # line whose text contains "clover r"):
   #   `clover r180: late: IOSurface load=<n> root found=<0|1>` -- whether the display stack reaches a

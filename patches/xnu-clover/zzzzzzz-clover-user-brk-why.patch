@@ -1,36 +1,44 @@
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -1228,8 +1228,166 @@
- 	__builtin_unreachable();
+@@ -1229,6 +1229,348 @@
  #undef MSG_FMT
  }
-+
+ 
 +#include <libkern/copyio.h>
 +#include <vm/vm_map.h>
- 
++
 +/*
-+ * Round199/200. SpringBoard dies of SIGTRAP 0.35-0.66s after exec and the r170
-+ * exit line reports only rv/ns/code, so the frame never says where the trap
-+ * fired or who planted it. This runs inside the user breakpoint path itself,
-+ * before the exception is triaged, and records the trapping instruction, its
-+ * caller, and the BRK comment (ptrauth check failures use 0xC470-0xC47F).
-+ * Round200 adds the part r199 could not answer: the map entry that owns the
-+ * pc, so the trap address becomes a segment offset and a file offset, the
-+ * eight instructions leading into the brk, and the registers it was reached
-+ * with. x0-x3 are where a fatal-error path usually holds the message it is
-+ * about to print, so any that lands in user space and reads as text is copied
-+ * in and shown as a string. Two lines per pid across at most 24 pids keep one
-+ * respawning daemon from flushing the kernel ring; each trap costs two lines,
-+ * and the total cap makes budget exhaustion distinguishable from a process
-+ * that stopped trapping. The BSD headers cannot be included from an osfmk
-+ * translation unit, so the two readers are declared here the way ipc_port.c
-+ * and vm_protos.h declare theirs.
++ * Round199/200/203. SpringBoard dies of SIGTRAP 0.35-0.66s after exec and the
++ * r170 exit line reports only rv/ns/code, so the frame never says where the
++ * trap fired or who planted it. This runs inside the user breakpoint path
++ * itself, before the exception is triaged, and records the trapping
++ * instruction, its caller, and the BRK comment (ptrauth check failures use
++ * 0xC470-0xC47F). Round200 added the map entry that owns the pc, so the trap
++ * address becomes a segment offset and a file offset, the eight instructions
++ * leading into the brk, and the registers it was reached with; r201 turned
++ * that offset into `FrontBoardServices 0x19f3d0500+0x244`, the FBSDisplayMode
++ * initializer that asserts "cannot be configured as requested" and leaves the
++ * request it rejected in its argument registers. Round203 therefore prints
++ * x4-x7 (the arguments past the fourth), x19-x28 (where the failing block kept
++ * the values it compared), the eight stack words that hold the arguments past
++ * the eighth, and the object x0 points at -- the mode being configured, whose
++ * fields are the numbers the initializer refused. Those four lines are printed
++ * only for a trap inside the dyld shared cache, because a daemon that dies in
++ * its own __TEXT brk padding would otherwise spend six lines of the ring per
++ * trap instead of two. One detailed reading per pid and one line budget across
++ * all pids keep a respawning daemon from flushing the kernel ring. Round204
++ * learned that this is exactly what happened to SpringBoard: by the time it
++ * asserted, every slot and every budgeted line had gone to daemons that respawn,
++ * so that process now gets eight slots and a budget of its own, and the mode
++ * object is read from x19 rather than x0, which holds the assert message. The
++ * BSD headers cannot be included from an osfmk translation unit, so the two
++ * readers are declared here the way ipc_port.c and vm_protos.h declare theirs.
 + */
 +extern int proc_pid(struct proc *);
 +extern char *proc_name_address(void *);
 +
- static void
++static void
 +clover_ubrk_sanitize(char *dst, const unsigned char *src, unsigned int len)
 +{
 +	unsigned int i;
@@ -50,21 +58,28 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 +	static struct {
 +		int pid;
 +		unsigned int printed;
-+	} clover_ubrk[24];
-+	static unsigned int clover_ubrk_used;
++		unsigned int detailed;
++	} clover_ubrk[32];
 +	static unsigned int clover_ubrk_total;
++	static unsigned int clover_ubrk_lines;
++	static unsigned int clover_ubrk_sb_total;
++	static unsigned int clover_ubrk_sb_lines;
 +	struct proc *clover_ubrk_proc = current_proc();
 +	int clover_ubrk_pid = clover_ubrk_proc ? proc_pid(clover_ubrk_proc) : -1;
 +	unsigned int clover_ubrk_i;
-+	unsigned int clover_ubrk_slot = 24;
++	unsigned int clover_ubrk_slot = 32;
++	int clover_ubrk_is_sb = 0;
 +	uint64_t clover_pc = get_saved_state_pc(state);
 +	uint64_t clover_lr = get_saved_state_lr(state);
++	uint64_t clover_sp = get_saved_state_sp(state);
 +	vm_map_t clover_map = current_map();
 +	vm_map_entry_t clover_entry = VM_MAP_ENTRY_NULL;
 +	uint64_t clover_start = 0;
 +	uint64_t clover_end = 0;
 +	uint64_t clover_off = 0;
 +	uint64_t clover_foff = 0;
++	uint64_t clover_stk[8];
++	uint64_t clover_obj[8];
 +	uint32_t clover_code[8];
 +	uint32_t clover_head[4];
 +	unsigned char clover_raw[40];
@@ -72,40 +87,11 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 +	int clover_have_map = 0;
 +	int clover_have_code = 0;
 +	int clover_have_head = 0;
++	int clover_have_stk = 0;
++	int clover_have_obj = 0;
 +	int clover_have_str[3] = { 0, 0, 0 };
++	int clover_shared;
 +	int clover_k;
-+
-+	if (clover_ubrk_total >= 24) {
-+		return;
-+	}
-+	for (clover_ubrk_i = 0; clover_ubrk_i < clover_ubrk_used; clover_ubrk_i++) {
-+		if (clover_ubrk[clover_ubrk_i].pid == clover_ubrk_pid) {
-+			clover_ubrk_slot = clover_ubrk_i;
-+			break;
-+		}
-+	}
-+	if (clover_ubrk_slot == 24) {
-+		if (clover_ubrk_used >= 24) {
-+			return;
-+		}
-+		clover_ubrk_slot = clover_ubrk_used++;
-+		clover_ubrk[clover_ubrk_slot].pid = clover_ubrk_pid;
-+		clover_ubrk[clover_ubrk_slot].printed = 0;
-+	}
-+	if (clover_ubrk[clover_ubrk_slot].printed >= 2) {
-+		return;
-+	}
-+	clover_ubrk[clover_ubrk_slot].printed++;
-+	clover_ubrk_total++;
-+	printf("clover r199: ubrk pid=%d comm=%s n=%u pc=0x%llx lr=0x%llx sp=0x%llx cpsr=0x%x esr=0x%x ec=%u brk=0x%x\n",
-+	    clover_ubrk_pid,
-+	    clover_ubrk_proc ? proc_name_address(clover_ubrk_proc) : "?",
-+	    clover_ubrk[clover_ubrk_slot].printed,
-+	    (unsigned long long)clover_pc,
-+	    (unsigned long long)clover_lr,
-+	    (unsigned long long)get_saved_state_sp(state),
-+	    (unsigned int)get_saved_state_cpsr(state),
-+	    esr, (unsigned int)ESR_EC(esr), (unsigned int)ISS_BRK_COMMENT(esr));
 +
 +	if (clover_map != VM_MAP_NULL) {
 +		vm_map_lock_read(clover_map);
@@ -122,6 +108,90 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 +		}
 +		vm_map_unlock_read(clover_map);
 +	}
++	/* Round201 reads the shared cache at 0x180000000..0x208400000; a brk in there is
++	 * a dyld-cache trap, and only those earn the detailed reading. */
++	clover_shared = clover_have_map &&
++	    (clover_start >= 0x180000000ULL) && (clover_end <= 0x208400000ULL);
++	/* Round204 gives SpringBoard its own eight slots and its own line budget:
++	 * the window it asserts in is late (393 s in round203), by which time the
++	 * respawning daemons have taken all 24 shared slots and spent the 48-line
++	 * budget, so the process the display bring-up is waiting on printed nothing. */
++	if (clover_ubrk_proc != NULL) {
++		const char *clover_sb_name = "SpringBoard";
++		const char *clover_ubrk_comm = proc_name_address(clover_ubrk_proc);
++		unsigned int clover_sb_n = 0;
++
++		while ((clover_sb_n < 11) && (clover_ubrk_comm != NULL) &&
++		    (clover_ubrk_comm[clover_sb_n] == clover_sb_name[clover_sb_n])) {
++			clover_sb_n++;
++		}
++		clover_ubrk_is_sb = (clover_sb_n == 11);
++	}
++	if (clover_ubrk_is_sb) {
++		for (clover_ubrk_i = 0; clover_ubrk_i < clover_ubrk_sb_total; clover_ubrk_i++) {
++			if (clover_ubrk[24 + clover_ubrk_i].pid == clover_ubrk_pid) {
++				clover_ubrk_slot = 24 + clover_ubrk_i;
++				break;
++			}
++		}
++		if (clover_ubrk_slot == 32) {
++			if (clover_ubrk_sb_total >= 8) {
++				return;
++			}
++			clover_ubrk_slot = 24 + clover_ubrk_sb_total++;
++			clover_ubrk[clover_ubrk_slot].pid = clover_ubrk_pid;
++			clover_ubrk[clover_ubrk_slot].printed = 0;
++			clover_ubrk[clover_ubrk_slot].detailed = 0;
++		}
++	} else {
++		for (clover_ubrk_i = 0; clover_ubrk_i < clover_ubrk_total; clover_ubrk_i++) {
++			if (clover_ubrk[clover_ubrk_i].pid == clover_ubrk_pid) {
++				clover_ubrk_slot = clover_ubrk_i;
++				break;
++			}
++		}
++		if (clover_ubrk_slot == 32) {
++			if (clover_ubrk_total >= 24) {
++				return;
++			}
++			clover_ubrk_slot = clover_ubrk_total++;
++			clover_ubrk[clover_ubrk_slot].pid = clover_ubrk_pid;
++			clover_ubrk[clover_ubrk_slot].printed = 0;
++			clover_ubrk[clover_ubrk_slot].detailed = 0;
++		}
++	}
++	if (clover_shared) {
++		if (clover_ubrk[clover_ubrk_slot].detailed) {
++			return;
++		}
++	} else if (clover_ubrk[clover_ubrk_slot].printed >= 2) {
++		return;
++	}
++	if (clover_ubrk_is_sb) {
++		if ((clover_ubrk_sb_lines + (clover_shared ? 7 : 2)) > 72) {
++			return;
++		}
++		clover_ubrk_sb_lines += clover_shared ? 7 : 2;
++	} else {
++		if ((clover_ubrk_lines + (clover_shared ? 7 : 2)) > 48) {
++			return;
++		}
++		clover_ubrk_lines += clover_shared ? 7 : 2;
++	}
++	clover_ubrk[clover_ubrk_slot].printed++;
++	if (clover_shared) {
++		clover_ubrk[clover_ubrk_slot].detailed = 1;
++	}
++	printf("clover r199: ubrk pid=%d comm=%s n=%u pc=0x%llx lr=0x%llx sp=0x%llx cpsr=0x%x esr=0x%x ec=%u brk=0x%x\n",
++	    clover_ubrk_pid,
++	    clover_ubrk_proc ? proc_name_address(clover_ubrk_proc) : "?",
++	    clover_ubrk[clover_ubrk_slot].printed,
++	    (unsigned long long)clover_pc,
++	    (unsigned long long)clover_lr,
++	    (unsigned long long)clover_sp,
++	    (unsigned int)get_saved_state_cpsr(state),
++	    esr, (unsigned int)ESR_EC(esr), (unsigned int)ISS_BRK_COMMENT(esr));
++
 +	if (clover_have_map &&
 +	    copyin((user_addr_t)clover_start, clover_head, sizeof(clover_head)) == 0) {
 +		clover_have_head = 1;
@@ -162,13 +232,125 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 +	    clover_have_str[0] ? clover_str[0] : "-",
 +	    clover_have_str[1] ? clover_str[1] : "-",
 +	    clover_have_str[2] ? clover_str[2] : "-");
++
++	if (!clover_shared) {
++		return;
++	}
++	if (copyin((user_addr_t)clover_sp, clover_stk, sizeof(clover_stk)) == 0) {
++		clover_have_stk = 1;
++	}
++	if (((uint64_t)get_saved_state_reg(state, 0) >= 0x10000ULL) &&
++	    ((uint64_t)get_saved_state_reg(state, 0) < 0x0001000000000000ULL) &&
++	    (copyin((user_addr_t)get_saved_state_reg(state, 0),
++	    clover_obj, sizeof(clover_obj)) == 0)) {
++		clover_have_obj = 1;
++	}
++	printf("clover r203: ubrk3 pid=%d x4=%016llx x5=%016llx x6=%016llx x7=%016llx\n",
++	    clover_ubrk_pid,
++	    (unsigned long long)get_saved_state_reg(state, 4),
++	    (unsigned long long)get_saved_state_reg(state, 5),
++	    (unsigned long long)get_saved_state_reg(state, 6),
++	    (unsigned long long)get_saved_state_reg(state, 7));
++	printf("clover r203: ubrk4 pid=%d x19=%016llx x20=%016llx x21=%016llx x22=%016llx x23=%016llx x24=%016llx x25=%016llx x26=%016llx x27=%016llx x28=%016llx\n",
++	    clover_ubrk_pid,
++	    (unsigned long long)get_saved_state_reg(state, 19),
++	    (unsigned long long)get_saved_state_reg(state, 20),
++	    (unsigned long long)get_saved_state_reg(state, 21),
++	    (unsigned long long)get_saved_state_reg(state, 22),
++	    (unsigned long long)get_saved_state_reg(state, 23),
++	    (unsigned long long)get_saved_state_reg(state, 24),
++	    (unsigned long long)get_saved_state_reg(state, 25),
++	    (unsigned long long)get_saved_state_reg(state, 26),
++	    (unsigned long long)get_saved_state_reg(state, 27),
++	    (unsigned long long)get_saved_state_reg(state, 28));
++	printf("clover r203: ubrk5 pid=%d stk=%016llx.%016llx.%016llx.%016llx.%016llx.%016llx.%016llx.%016llx\n",
++	    clover_ubrk_pid,
++	    clover_have_stk ? (unsigned long long)clover_stk[0] : 0ULL,
++	    clover_have_stk ? (unsigned long long)clover_stk[1] : 0ULL,
++	    clover_have_stk ? (unsigned long long)clover_stk[2] : 0ULL,
++	    clover_have_stk ? (unsigned long long)clover_stk[3] : 0ULL,
++	    clover_have_stk ? (unsigned long long)clover_stk[4] : 0ULL,
++	    clover_have_stk ? (unsigned long long)clover_stk[5] : 0ULL,
++	    clover_have_stk ? (unsigned long long)clover_stk[6] : 0ULL,
++	    clover_have_stk ? (unsigned long long)clover_stk[7] : 0ULL);
++	printf("clover r203: ubrk6 pid=%d obj=%016llx.%016llx.%016llx.%016llx.%016llx.%016llx.%016llx.%016llx\n",
++	    clover_ubrk_pid,
++	    clover_have_obj ? (unsigned long long)clover_obj[0] : 0ULL,
++	    clover_have_obj ? (unsigned long long)clover_obj[1] : 0ULL,
++	    clover_have_obj ? (unsigned long long)clover_obj[2] : 0ULL,
++	    clover_have_obj ? (unsigned long long)clover_obj[3] : 0ULL,
++	    clover_have_obj ? (unsigned long long)clover_obj[4] : 0ULL,
++	    clover_have_obj ? (unsigned long long)clover_obj[5] : 0ULL,
++	    clover_have_obj ? (unsigned long long)clover_obj[6] : 0ULL,
++	    clover_have_obj ? (unsigned long long)clover_obj[7] : 0ULL);
++	/* Round204 dumps the object x19 holds instead of the one x0 holds: at the
++	 * assert x0 is the tagged NSString argument, while x19 is the FBSDisplayMode
++	 * being initialized, whose ten words are isa, width, height, scale, the
++	 * computed double, refreshRate, gamut, hdr, rotation and the virtual flag. */
++	{
++		uint64_t clover_obj19[10];
++		uint64_t clover_p19 = (uint64_t)get_saved_state_reg(state, 19);
++		int clover_have_obj19 = 0;
++
++		if ((clover_p19 >= 0x10000ULL) && (clover_p19 < 0x0001000000000000ULL) &&
++		    (copyin((user_addr_t)clover_p19, clover_obj19, sizeof(clover_obj19)) == 0)) {
++			clover_have_obj19 = 1;
++		}
++		printf("clover r204: ubrk7 pid=%d o=%016llx w0=%016llx w1=%016llx w2=%016llx w3=%016llx w4=%016llx w5=%016llx w6=%016llx w7=%016llx w8=%016llx w9=%016llx\n",
++		    clover_ubrk_pid,
++		    (unsigned long long)clover_p19,
++		    clover_have_obj19 ? (unsigned long long)clover_obj19[0] : 0ULL,
++		    clover_have_obj19 ? (unsigned long long)clover_obj19[1] : 0ULL,
++		    clover_have_obj19 ? (unsigned long long)clover_obj19[2] : 0ULL,
++		    clover_have_obj19 ? (unsigned long long)clover_obj19[3] : 0ULL,
++		    clover_have_obj19 ? (unsigned long long)clover_obj19[4] : 0ULL,
++		    clover_have_obj19 ? (unsigned long long)clover_obj19[5] : 0ULL,
++		    clover_have_obj19 ? (unsigned long long)clover_obj19[6] : 0ULL,
++		    clover_have_obj19 ? (unsigned long long)clover_obj19[7] : 0ULL,
++		    clover_have_obj19 ? (unsigned long long)clover_obj19[8] : 0ULL,
++		    clover_have_obj19 ? (unsigned long long)clover_obj19[9] : 0ULL);
++	}
++	/* Round206 locates the initializer's frame through x29 instead of the trapped
++	 * sp: FBSDisplayMode's prologue saves d9/d8 at x29-0x60 and the caller's
++	 * x29/x30 at x29, so these words are the arguments the assert saw -- d9 (the
++	 * scale) at w4, the integer scale argument x24 at w10, height/width at w8/w9,
++	 * and the caller's return address at w17. Round205 published
++	 * /chosen/display-scale and the trap did not move, so this line decides
++	 * whether the caller still passes a zero scale or never reads /chosen. */
++	{
++		uint64_t clover_fp = (uint64_t)get_saved_state_reg(state, 29);
++		uint64_t clover_frame[24];
++		int clover_have_frame = 0;
++		unsigned int clover_fhalf;
++
++		if ((clover_fp >= 0x10000ULL) && (clover_fp < 0x0001000000000000ULL) &&
++		    (copyin((user_addr_t)(clover_fp - 0x80), clover_frame, sizeof(clover_frame)) == 0)) {
++			clover_have_frame = 1;
++		}
++		for (clover_fhalf = 0; clover_fhalf < 2; clover_fhalf++) {
++			unsigned int clover_b = clover_fhalf * 12;
++			printf("clover r206: ubrk%d pid=%d fp=%016llx w0=%016llx w1=%016llx w2=%016llx w3=%016llx w4=%016llx w5=%016llx w6=%016llx w7=%016llx w8=%016llx w9=%016llx w10=%016llx w11=%016llx\n",
++			    8 + (int)clover_fhalf, clover_ubrk_pid, (unsigned long long)clover_fp,
++			    clover_have_frame ? (unsigned long long)clover_frame[clover_b + 0] : 0ULL,
++			    clover_have_frame ? (unsigned long long)clover_frame[clover_b + 1] : 0ULL,
++			    clover_have_frame ? (unsigned long long)clover_frame[clover_b + 2] : 0ULL,
++			    clover_have_frame ? (unsigned long long)clover_frame[clover_b + 3] : 0ULL,
++			    clover_have_frame ? (unsigned long long)clover_frame[clover_b + 4] : 0ULL,
++			    clover_have_frame ? (unsigned long long)clover_frame[clover_b + 5] : 0ULL,
++			    clover_have_frame ? (unsigned long long)clover_frame[clover_b + 6] : 0ULL,
++			    clover_have_frame ? (unsigned long long)clover_frame[clover_b + 7] : 0ULL,
++			    clover_have_frame ? (unsigned long long)clover_frame[clover_b + 8] : 0ULL,
++			    clover_have_frame ? (unsigned long long)clover_frame[clover_b + 9] : 0ULL,
++			    clover_have_frame ? (unsigned long long)clover_frame[clover_b + 10] : 0ULL,
++			    clover_have_frame ? (unsigned long long)clover_frame[clover_b + 11] : 0ULL);
++		}
++	}
 +}
 +
-+static void
+ static void
  handle_breakpoint(arm_saved_state_t *state, uint32_t esr __unused)
  {
- 	exception_type_t           exception = EXC_BREAKPOINT;
-@@ -1237,6 +1395,7 @@
+@@ -1237,6 +1544,7 @@
  	mach_msg_type_number_t     numcodes  = 2;
  
  	boot_progress_user_breakpoint(state, esr);

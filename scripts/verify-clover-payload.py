@@ -821,15 +821,23 @@ def check_user_breakpoint_probe(kernel: bytes) -> bool:
     namespace 2, code 5 (OS_REASON_SIGNAL, SIGTRAP) 0.35-0.66 s after every exec, with no reason
     payload and no line about the instruction. Round200 adds the map side: the entry that owns the
     pc, its segment bounds, the file offset and the instructions leading into the brk, because the
-    trapping address lives in the dyld shared cache and cannot be symbolized on the host. The image
-    has to carry both lines, and it has to keep the r170 exit line that pairs the pid with its
-    death."""
+    trapping address lives in the dyld shared cache and cannot be symbolized on the host. Round203
+    adds the failed assert's inputs -- x4-x7, x19-x28, the stack words past the eighth argument and
+    the object x0 points at -- for traps inside that cache only. The image has to carry all three
+    lines, and it has to keep the r170 exit line that pairs the pid with its death."""
     label = "kernel.macho: user breakpoint reading linked"
     found = {"ubrk": (b"clover r199: ubrk pid=%d comm=%s n=%u pc=0x%llx lr=0x%llx sp=0x%llx "
                       b"cpsr=0x%x esr=0x%x ec=%u brk=0x%x\n") in kernel,
              "ubrk2": (b"clover r200: ubrk2 pid=%d x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx "
                        b"x8=0x%llx x16=0x%llx x17=0x%llx map=%d start=0x%llx end=0x%llx "
                        b"off=0x%llx foff=0x%llx code=") in kernel,
+             "ubrk3": (b"clover r203: ubrk3 pid=%d x4=%016llx x5=%016llx x6=%016llx "
+                       b"x7=%016llx\n") in kernel,
+             "ubrk7": (b"clover r204: ubrk7 pid=%d o=%016llx w0=%016llx w1=%016llx "
+                       b"w2=%016llx w3=%016llx") in kernel,
+             "ubrk8": (b"clover r206: ubrk%d pid=%d fp=%016llx w0=%016llx w1=%016llx "
+                       b"w2=%016llx w3=%016llx w4=%016llx w5=%016llx w6=%016llx "
+                       b"w7=%016llx w8=%016llx w9=%016llx w10=%016llx w11=%016llx\n") in kernel,
              "kept-r170": (b"clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx "
                            b"comm=%s\n") in kernel}
     ok = all(found.values())

@@ -15380,3 +15380,191 @@ r203：扩展 `zzzzzzz-clover-user-brk-why.patch`，把每 pid 上限提到 4 �
 `ubrk3`（x4–x7、x19–x28）与 `ubrk4`（copyin x19 起 64 字节），量出 `FBSDisplayMode`
 的 width/height/scale/refresh 与那几个枚举值，判定哪条校验失败；然后让驱动上报的模式
 落进 SpringBoard 能接受的那一档，再回到第一次 present 与色带。
+
+## round203（v0.5.64 前置）：陷阱现场扩到 x4–x28、栈与 x0 对象
+
+r202 的对照表停在 x0–x3/x8/x16/x17。可 `FBSDisplayMode` 的初始化器是把九个参数写进
+对象、再拿它们逐条比的，只看那七个寄存器说不出「哪条校验不过」。这一轮把用户态断点
+探针扩成四行：
+
+- `ubrk3`：x4–x7（第 5–8 个参数）；
+- `ubrk4`：x19–x28（失败块比较时手里留的那一份）；
+- `ubrk5`：sp 起八个字（第 9 个参数之后落在栈上的那些）；
+- `ubrk6`：x0 起八个字（当时以为 x0 是那个对象）。
+
+四行只在 pc 落在 dyld 共享缓存里（入口 `start >= 0x180000000` 且 `end <= 0x208400000`）
+时才打印——别的进程死在自己 `__TEXT` 的 brk 填充里不该一轮占六行环预算。每个 pid 只取
+一次详细读数，全局另有一条行预算，免得不停重启的守护进程把内核环冲干净。
+
+### 读数（冷刷 cache=p49）
+
+窗口里只有 **liveactivitiesd 的三个 pid**（145/146/147）拿到详细读数，watchdogd 的三个
+pid（124/127/133）只有两条基础行：
+
+```
+clover r199: ubrk pid=145 comm=liveactivitiesd ... esr=0xf2000001 ec=60 brk=0x1
+             pc=0x1d57164f8 lr=0x1d57164cc
+clover r203: ubrk3 pid=145 x4=0000000000000020 x5=000000015dd21180 x6=0000000000000002
+             x7=0000000000000024
+clover r203: ubrk4 pid=145 x19=000000015dd0e0e0 x20=0 x21=000000015dd17560
+             x22=000000015dd211c0 x23=000000016f831440 x24=000000016f831430
+             x25=0000000204593b20 x26=000000020868efd8 x27=0000000209332d28
+             x28=000000020868f390
+clover r203: ubrk5 pid=145 stk=0000000000000003.0.0.00000001953be9d4.0000000000000001
+             .00000001953be9d4.000000016f8314f0.000000020868efc8
+clover r203: ubrk6 pid=145 obj=0.000000015dd211c0.0000000000000003.000000015dd00000
+             .000000015dd20b10.000000015dd21180.0.0
+```
+
+liveactivitiesd 三次读数的形状一模一样（x6/x7 = 0x2 或 0x3 / 0x24，栈上第三、五个字是
+同一个 0x1953be9d4），它死在 SessionCore 里自己的 `brk #1`，和显示无关。watchdogd 的三次
+`brk #1` 的 pc 在各自 `__TEXT` 里的偏移都是 `0xab0c`，逐轮一字不差，旁证探针没退化。
+
+**SpringBoard 一行都没有。** r196 明明按 pid 记下了 `sig=5`，r170 也记下了 `rv=0x5`
+（393–449 s 一共九次）。环里有它的死，没有它的现场——这就是这一轮唯一有用的结论。
+
+## round204：SpringBoard 自己的槽，模式对象从 x19 读
+
+改了三处：
+
+- SpringBoard 单独占 24–31 这八个槽、自己一条 72 行预算，不再和不停重启的守护进程抢
+  通用的 24 槽 / 48 行；
+- `ubrk7` 改读 **x19** 起十个字——assert 那一刻 x0 是那条 tagged NSString
+  （"FBSDisplayMode cannot be configured as requested : <FBSDisplayMode …>"，`ubrk6` 里
+  读出来的 40 字节就是这句），对象本体在 x19。十字按
+  isa / width / height / scale / 计算出的双精度 / refresh / gamut / hdr / rotation / virtual 排；
+- `clover r203:` 与 `clover r204:` 各加一个 tee 类，免得这些行不计数地挤掉 exec/exit 对。
+
+### 读数（389–411 s，五次 exec：pid 173/176/179/184/187）
+
+```
+clover r203: ubrk4 pid=176 x19=000000030112a990 x20=00000001900195b9
+             x21=0000000300029ef0 x22=0 x23=0 x24=0 x25=00000000000004b0
+             x26=0000000000000780 x27=0000000202365d20 x28=1
+clover r204: ubrk7 pid=176 o=000000030112a990 w0=000021a202365d21 w1=00000000000004b0
+             w2=0000000000000780 w3=0 w4=0 w5=404e000000000000 w6=0 w7=0 w8=3 w9=0
+```
+
+五次读数逐字相同，只有对象地址变（0x30112a990 / 0x3030c5450 / 0x30181caf0 /
+0x303029310 / 0x303289b30），说明每次 exec 后都是同一个请求被同一处拒掉：
+
+- w1/w2 = `0x4b0`/`0x780` = **1200x1920**，x25/x26 也是这两个数——宽高就是 GOP 的原始像素；
+- w5 = `0x404e000000000000` = **60.0**，刷新率这一档没有问题；
+- w8 = 3：rotation 枚举（270°）确实进了对象；
+- w3 = 0（整数 scale 参数）与 w4 = 0（初始化器算出的双精度 scale）**都是 0**；
+- x28 = 1：走的是致命块，不是「只记一条日志」的那一档。
+
+所以 "cannot be configured as requested" 指的是 **scale**：宽高和刷新都对，唯独屏幕缩放
+两个字段都是零。下一件要问的是这个零从哪来——按 libMobileGestalt 的读法，
+`FBSDisplayMode` 的 scale 来自 `IODeviceTree:/chosen` 的 `display-scale`，而 ADT 一直没发
+这个键（只发了 display-base/width/height/stride/rotation）。
+
+## round205：ADT 发 `/chosen/display-scale`，把屏幕缩放交给设备树
+
+r204 的对象读数把怀疑收窄到 scale 一项：宽高 1200x1920、刷新 60.0 都对，只有 scale 的两个
+字段是零。这个零的生产者不在 FrontBoard 里，在 MobileGestalt：
+
+```
+dyld_shared_cache_arm64.11 file 0x58a151 vm 0x1a026e151  libMobileGestalt.dylib
+  ctx = b'%s\0IODeviceTree:/chosen\0display-scale\0display-rotation\0/Libra'
+```
+
+三个名字挨在一起，说明 `MGIOMFBSupport` 就是拿 `IODeviceTree:/chosen` 的 `display-scale`
+与 `display-rotation` 回答「屏幕参数」的那一层。而 ADT 从 r180 起只发了
+`display-base/width/height/stride/rotation`，**一直没有 `display-scale`**——键缺席，读出来
+就是 0，`FBSDisplayMode` 的初始化器再把它当越界断言掉。
+
+### 改了什么
+
+- `make-clover-adt.py` 的 framebuffer 规格加 `"scale": 2`，`/chosen` 里多一格 32 位
+  `display-scale`（1200x1920 变成 600x960 点的 iPad 表面）；
+- `check-clover.py` 把 `display-scale` 加进 `REQUIRED_CHOSEN`，值不是 2 或长度不是一格就报错；
+- 同时把「boot args 里不许出现 `offline-legacy-unit-scale=`」的理由改掉：现在缩放归 ADT，
+  探针的 `publishOrMatchWord` 会和 ADT 自己写的 `display-rotation` 打架，`startHardware`
+  反而停住。
+
+### 读数
+
+这一轮冷刷了 `round205-payload.img`，但读回发生在刷写后一分钟，拿回来的是**上一轮的窗口**
+（时间戳与 pid 和 r204 逐个相同，394–411 s 那五次），所以「陷阱没动、scale 仍是零」这句话
+在这一轮**没有真机证据**。与其把上一轮的窗口当成这一轮的读数，r206 改成直接读初始化器的
+帧：入口的 d9（scale）、第 3 参 x24 与调用者的返回地址，一次把「谁传的零」问清楚。
+
+## round206：display-scale 生效，FBS 断言消失，显示栈第一次真的出帧；SpringBoard 在 417.5 s 被 SIGKILL
+
+这一刷的 payload 是 r205 的 ADT（`/chosen/display-scale = 2`）加 r206 的帧探针（从 x29 读
+`fp-0x80` 起 24 字，分 `ubrk8`/`ubrk9` 两条打印）。冷刷 cache=p49，`round206-payload.img`
+sha256 `62f7c00d…5ffa37`，23:13 写卡、23:29 读回。环的 512 条覆盖 **339.95–909.19 s**。
+
+### 断言确实被消掉了
+
+环里没有任何 SpringBoard 的 `r199`/`r200`/`r203`/`r204` 行。命中 `ubrk8`/`ubrk9` 的只有
+liveactivitiesd（pid 144/155，两次），而且它的 w4 是 `0x1cf5b28d8` 这样的指针，不是 60.0
+的双精度字——说明帧探针这条路径本轮根本没被 FBS 初始化器走到。不是探针坏了，是**断言没发生**：
+scale 拿到 2 之后 `FBSDisplayMode` 的九条校验全过。
+
+### 第一次真正 present
+
+```
+[367.389767] swap#1 accepted request=fffffff375e35000 surface=fffffff376823d10
+[368.381464] frame#0 kind=0 t=0s pixels=41586 box=305x887..755x1029
+[369.100625] frame#0 colours ff000000/2261822 00000000/592 ff070707/24 ff464646/14 other=41548
+[370.361711] scanout#1 ok bytes=9216000 retired=0 frames=0
+[370.361775] retire#1 done=1 presented=1 frames=1 current=0 pending=0
+[370.434986] swap#2 accepted request=fffffff375e35000 surface=fffffff3768240c8
+[371.497148] frame#1 kind=0 t=3s pixels=41586 box=305x887..755x1029
+[372.606821] scanout#2 ok bytes=9216000 retired=1 frames=1
+[372.620641] retire#2 done=2 presented=2 frames=2 current=0 pending=0
+[427.793729] swap#3 accepted request=fffffff375e34000 surface=fffffff376823d10
+[428.785146] frame#2 kind=0 t=60s pixels=41586 box=305x887..755x1029
+[429.283198] copy#3 93 ms bytes=9216000 max=360 ms
+[429.285716] retire#3 done=3 presented=3 frames=3 current=0 pending=0
+```
+
+`client pid=58 selector 6` 的 done/presented 也一路跟着 0→1→2→3，selector 6 在第三帧后开始
+按「重传同一 surface」回应（`1 80000000` 收 `e00002d5`，`kIOReturnNotReady` 的常见形态）。
+
+帧内容是**黑的**：2304000 个像素里 2262414 个 `ff000000`、592 个 `00000000`、24 个
+`ff070707`、14 个 `ff464646`、5 个 `ff626262`，变化像素 41586 个全在
+`305x887..755x1029` 那一块。也就是 compositor 真的把 surface 扫上屏了，但没人往上画 UI——
+桌面缺的不是显示链路，是画 UI 的那个进程。
+
+### SpringBoard：417.535 s 被 SIGKILL，之后环里再没出现
+
+```
+[417.535062] clover r170: exit pid=27 ppid=1 t=8s rv=0x9 ns=2 code=0x9 comm=SpringBoard
+[417.535144] clover r196: sig pid=27 comm=SpringBoard sig=9 n=1 desc=none
+```
+
+`ns=2 / code=0x9` 是内核在默认动作致死的路径上自己拼的 `build_signal_reason(SIGKILL, NULL)`，
+它只说明「死于 9 号信号」，不含发信者。r170 的 exec 预算（256 条）在几百个进程之后早就用尽，
+所以窗口里没有它的启动记录；整段 512 条环里 SpringBoard 只有这一处。
+
+### t= 不是进程存活时间（重要纠正）
+
+r170 的 `t=` 是 `clock_get_uptime()` 的秒数。这一轮它和环的时间戳差 **约 50 倍**：
+
+| 环时间 | 内核时钟读数 |
+| --- | --- |
+| 417.5 s | 8 s（r170 exit） |
+| 707.9 s | 13 s（r170 exit） |
+| 758.1 s | 14 s（r170 exit） |
+| 437.9 s | 8.41 s（r193 `now=`，mach_continuous_time） |
+| 600.2 s | 11.52 s（r193 `now=`） |
+
+而 r148 的 900 s 死线落在环 909 s，宿主侧无人值守窗口也跑满了 900 s 真实时间（23:13 刷、
+23:29 读回）。所以**环时间 = 真实时间，XNU 自己的时基慢了约 50 倍**（19.2 MHz 的
+CNTVCT 被当成约 960 MHz 换算，或者时间基挂了另一路计数器）。往后不能用 `t=` 推任何进程
+的存活时长；这条单独列为待查项，它也可能影响 launchd 与 compositor 的定时器行为。
+
+### 其它
+
+watchdogd 仍在 437.9 / 442.1 / 600.2 s 各崩一次（`rv=0x5 sig=5 fatal=1 crashbits=0x1`），
+r193 的 `panic_on_crash_disabled=1` 继续生效，不致命。
+
+### 下一步
+
+r207 在 `psignal_internal` 的投递点打一行：接收者 pid/comm/ppid、`signal_reason` 的
+namespace/code、CS 标志，以及**发信者**（`current_proc()`，内核线程记为 pid 0）和调用返回
+地址（配一个已知锚点地址以便在宿主上换算 slide）。这样 launchd 的 `kill(2)`、jetsam、
+CS_KILLED 三条路就能分开。

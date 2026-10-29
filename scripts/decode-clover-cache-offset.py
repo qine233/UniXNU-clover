@@ -261,21 +261,59 @@ def locate(cache_paths, code, brk_imm):
     return hits
 
 
+def report_vmaddr(cache, vmaddr, linkedit):
+    """Name the image, function and nearest export that owns a cache address."""
+    image = cache.image_for_vmaddr(vmaddr)
+    if image is None:
+        print('    no image __TEXT covers this address')
+        return
+    print(f'    image {image.path}')
+    print(f'    text {image.text_vmaddr:#x}+{image.text_size:#x} '
+          f'offset {vmaddr - image.text_vmaddr:#x}')
+    starts = linkedit.function_starts(image)
+    before = [s for s in starts if s <= vmaddr]
+    if before:
+        print(f'    function start {before[-1]:#x} (+{vmaddr - before[-1]:#x} into it)')
+    later = [s for s in starts if s > vmaddr]
+    if later:
+        print(f'    next start {later[0]:#x} ({later[0] - vmaddr:#x} after)')
+    exports = linkedit.exports(image)
+    named = [e for e in exports if e[0] <= vmaddr]
+    if named:
+        print(f'    nearest export {named[-1][1]} at {named[-1][0]:#x} '
+              f'(+{vmaddr - named[-1][0]:#x})')
+
+
+def symbol_for_address(cache_paths, linkedit, vmaddr):
+    for path in cache_paths:
+        cache = CacheFile(path)
+        for addr, size, file_off, init_prot, max_prot in cache.mappings:
+            if addr <= vmaddr < addr + size:
+                print(f'{vmaddr:#x} falls in {cache.name} mapping {addr:#x}+{size:#x} '
+                      f'(file {file_off:#x}, prot {init_prot:#x})')
+                report_vmaddr(cache, vmaddr, linkedit)
+                return True
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cache', required=True, help='directory holding dyld_shared_cache_arm64*')
-    parser.add_argument('--foff', required=True, help='region offset printed by the probe')
-    parser.add_argument('--code', required=True, help='eight code words, dot separated')
+    parser.add_argument('--foff', help='region offset printed by the probe')
+    parser.add_argument('--code', help='eight code words, dot separated')
+    parser.add_argument('--addr', action='append', default=[],
+                        help='address to name (repeatable). With --foff/--code it is a '
+                             'runtime address and the located pc supplies the slide; alone '
+                             'it is a cache vmaddr')
     parser.add_argument('--brk', type=lambda v: int(v, 0), default=None,
                         help='brk immediate printed by the probe, e.g. 0x0')
     args = parser.parse_args()
-
-    foff = int(args.foff, 16)
-    code = parse_code(args.code)
-    if len(code) != 8:
-        print('code must be eight words', file=sys.stderr)
+    if (args.foff is None) != (args.code is None):
+        print('--foff and --code go together', file=sys.stderr)
         return 2
-    region_pc = SHARED_REGION_START + foff
+    if args.foff is None and not args.addr:
+        print('pass --foff with --code, or --addr', file=sys.stderr)
+        return 2
 
     paths = sorted(glob.glob(os.path.join(args.cache, 'dyld_shared_cache*')))
     paths = [p for p in paths if not p.endswith('.symbols')]
@@ -284,6 +322,21 @@ def main():
         return 2
 
     linkedit = Linkedit([p for p in paths if p.endswith('.dyldlinkedit')])
+    if args.foff is None:
+        misses = 0
+        for text in args.addr:
+            if not symbol_for_address(paths, linkedit, int(text, 0)):
+                print(f'{int(text, 0):#x} is in no cache mapping', file=sys.stderr)
+                misses += 1
+        return 1 if misses else 0
+
+    foff = int(args.foff, 16)
+    code = parse_code(args.code)
+    if len(code) != 8:
+        print('code must be eight words', file=sys.stderr)
+        return 2
+    region_pc = SHARED_REGION_START + foff
+
     hits = locate(paths, code, args.brk)
     if not hits:
         print('no cache file carries the given code words', file=sys.stderr)
@@ -291,6 +344,7 @@ def main():
 
     print(f'region pc {region_pc:#x} (shared start {SHARED_REGION_START:#x} + foff {foff:#x})')
     print(f'{len(hits)} place(s) carry the eight words:')
+    hit_vmaddr = None
     for cache, hit, index in hits:
         pc_in_file = hit + index * 4
         # Which mapping holds this file offset?
@@ -299,6 +353,8 @@ def main():
                 vmaddr = addr + (pc_in_file - file_off)
                 print(f'  {cache.name}: file {pc_in_file:#x} mapping {addr:#x}+{size:#x} '
                       f'prot {init_prot:#x} -> cache vmaddr {vmaddr:#x}')
+                if hit_vmaddr is None:
+                    hit_vmaddr = vmaddr
                 image = cache.image_for_vmaddr(vmaddr)
                 if image is None:
                     print('    no image __TEXT covers this address')
@@ -320,6 +376,23 @@ def main():
                     print(f'    nearest export {named[-1][1]} at {named[-1][0]:#x} '
                           f'(+{vmaddr - named[-1][0]:#x})')
                 break
+
+    if args.addr and hit_vmaddr is not None:
+        # The probe's pc carries the boot's shared-cache slide; the cache words
+        # locate it without one.  The difference is the slide every other
+        # runtime address in that process (a caller's x30, say) needs removed.
+        slide = region_pc - hit_vmaddr
+        print(f'slide {slide:#x} (runtime pc {region_pc:#x} - cache pc {hit_vmaddr:#x})')
+        misses = 0
+        for text in args.addr:
+            runtime = int(text, 0)
+            unslid = runtime - slide
+            print(f'runtime {runtime:#x} -> cache {unslid:#x}')
+            if not symbol_for_address(paths, linkedit, unslid):
+                print(f'  {runtime:#x} unslides to no cache mapping', file=sys.stderr)
+                misses += 1
+        if misses:
+            return 1
     return 0
 
 

@@ -75,6 +75,14 @@ CLOVER_HARDWARE_SPEC = {
         # one framebuffer field the first real UniXNU boot has to confirm -- if
         # the picture comes out upside down, the answer is 90.
         "rotation": 270,
+        # Actual scanout pixels per logical point, published to /chosen as display-scale.
+        # libMobileGestalt's MGIOMFBSupport.c is the reader: it opens IODeviceTree:/chosen and
+        # asks for display-scale and display-rotation by name (both literals sit in that object
+        # next to the IOMobileFramebufferGet* calls). With the key absent the screen scale comes
+        # back 0, and FrontBoardServices' FBSDisplayMode initialiser asserts on a zero scale --
+        # round204 read exactly that as SpringBoard's SIGTRAP (scale at mode+0x20 == 0.0,
+        # refresh at +0x28 == 60.0). 2 keeps 1200x1920 a 600x960-point iPad surface.
+        "scale": 2,
     },
     # Stock carve-outs, recorded so the UEFI memory map and check-clover.py can be reasoned
     # about. XNU learns its DRAM window from /chosen and the splash from display-base; these
@@ -245,6 +253,7 @@ def generate_adt(args) -> bytes:
         ("display-width", u32(spec["framebuffer"]["width"])),
         ("display-height", u32(spec["framebuffer"]["height"])),
         ("display-stride", u32(spec["framebuffer"]["stride"])),
+        ("display-scale", u32(spec["framebuffer"]["scale"])),
         ("display-rotation", u32(spec["framebuffer"]["rotation"])),
     ], [node("memory-map", memory_map_props), node("manifest-properties")])
 

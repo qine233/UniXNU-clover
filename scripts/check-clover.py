@@ -40,6 +40,7 @@ MSM_ID = 0x13D
 CPU_REGS = [0x0, 0x1, 0x2, 0x3, 0x100, 0x101, 0x102, 0x103]
 SPLASH_BASE = 0x9D400000
 SPLASH_SIZE = 0x02400000
+DISPLAY_SCALE = 2
 DRAM_BASE = 0x80000000
 DRAM_SIZE = 0x80000000
 ARM_IO_BASE = 0x17000000
@@ -47,7 +48,7 @@ GICD_PHYS = 0x17A00000
 TIMEBASE_HZ = 19200000
 
 REQUIRED_CHOSEN = ["random-seed", "nvram-proxy-data", "nvram-bank-size", "dram-base",
-                   "dram-size", "crypto-hash-method", "display-base",
+                   "dram-size", "crypto-hash-method", "display-base", "display-scale",
                    "unique-chip-id", "amfi-only-platform-code", "root-matching"]
 # The volume /chosen names. It is the unsealed OS volume inside the iPadOS container the board's
 # OS window carries: UUID 04769D26-2CA0-4825-B443-E2E5F88300F2, role System, Sealed=No. Round119
@@ -272,6 +273,18 @@ def check_adt(errors: list) -> str:
         display = chosen["properties"].get("display-base")
         if display and struct.unpack("<Q", display)[0] != SPLASH_BASE:
             errors.append(f"/chosen/display-base is not the clover splash region 0x{SPLASH_BASE:x}")
+        # Round205. libMobileGestalt's MGIOMFBSupport.c reads IODeviceTree:/chosen's display-scale
+        # and display-rotation to answer the screen parameters UIKit/FrontBoard build FBSDisplayMode
+        # from. Round204 read the scale arriving at that initialiser as 0.0 (mode+0x20) with the key
+        # absent, which is the assert SpringBoard traps on, so the ADT has to carry it.
+        scale = chosen["properties"].get("display-scale")
+        if scale is None:
+            errors.append("/chosen/display-scale is missing: MobileGestalt reports a zero screen "
+                          "scale and FBSDisplayMode's initialiser asserts")
+        elif len(scale) != 4:
+            errors.append("/chosen/display-scale is not one 32-bit cell")
+        elif struct.unpack("<I", scale)[0] != DISPLAY_SCALE:
+            errors.append(f"/chosen/display-scale is not {DISPLAY_SCALE}")
     return f"{len(data)} bytes, {len(cpus)} cores"
 
 
@@ -512,9 +525,10 @@ def check_board(errors: list) -> str:
                                   f"the card as the same silence as having no display")
             for argument in ("sheng-fb-gpu=1", "offline-legacy-unit-scale="):
                 if any(entry.startswith(argument) for entry in board["payload"]["kernel_args"]):
-                    errors.append(f"kernel_args passes {argument}: the Adreno hand-off and the "
-                                  f"/chosen display-scale policy are later questions, and the first "
-                                  f"present is the CPU copy at native pixels")
+                    errors.append(f"kernel_args passes {argument}: the Adreno hand-off is a later "
+                                  f"question, and the UI scale now lives in the ADT (/chosen/"
+                                  f"display-scale), so the probe's publishOrMatchWord would collide "
+                                  f"with the ADT's own display-rotation and stop startHardware")
             if flags.get("NATIVE_MOBILE_DISPLAY", "n") in ("y", "1"):
                 errors.append("CONFIG_XNU_NATIVE_MOBILE_DISPLAY is on as well: that switch asks the "
                               "link for libNativeMobileDisplay.late.a, which this board does not build, "
@@ -709,6 +723,11 @@ def check_board(errors: list) -> str:
         # into the segment, the offset into the backing file, the eight instructions that lead into
         # the brk, x0-x3/x8/x16/x17, the first words of the segment, and any of x0-x3 that reads as
         # a user-space string. Every trap costs two lines, and the kernel caps itself at 24 traps.
+        # round204 answers why round203's SpringBoard lines were missing: SpringBoard asserted at
+        # 393 s, by which time the respawning daemons had taken all 24 slots and spent the 48-line
+        # budget, so the one process the display bring-up waits on printed nothing. SpringBoard now
+        # owns slots 24-31 with a 72-line budget of its own, and the mode object is read from x19
+        # (the FBSDisplayMode under construction) instead of x0, which holds the assert message.
         ubrk_patch = next((base / "patches/xnu-clover/zzzzzzz-clover-user-brk-why.patch"
                            for base in (REPO, pathlib.Path.cwd())
                            if (base / "patches/xnu-clover/zzzzzzz-clover-user-brk-why.patch").is_file()),
@@ -729,10 +748,15 @@ def check_board(errors: list) -> str:
             for needle in ('"clover r199: ubrk pid=%d comm=%s n=%u pc=0x%llx lr=0x%llx sp=0x%llx '
                            'cpsr=0x%x esr=0x%x ec=%u brk=0x%x\\n"',
                            '"clover r200: ubrk2 pid=%d x0=0x%llx x1=0x%llx',
+                           '"clover r203: ubrk3 pid=%d x4=%016llx x5=%016llx x6=%016llx '
+                           'x7=%016llx\\n"',
+                           '"clover r203: ubrk6 pid=%d obj=%016llx',
                            "clover_user_breakpoint_why(arm_saved_state_t *state, uint32_t esr)",
                            "vm_map_lookup_entry(clover_map,",
                            "clover_foff = (uint64_t)VME_OFFSET(clover_entry) + clover_off;",
                            "clover_ubrk_total >= 24", "printed >= 2",
+                           '"clover r204: ubrk7 pid=%d o=%016llx', "clover_ubrk_sb_total >= 8",
+                           "clover_ubrk_sb_lines + (clover_shared ? 7 : 2)) > 72",
                            "clover_user_breakpoint_why(state, esr);"):
                 if needle not in text:
                     errors.append(f"{ubrk_patch.name} lacks {needle[:52]!r}: the frame could not say "
@@ -748,6 +772,12 @@ def check_board(errors: list) -> str:
         if '{ "clover r200: ubrk", "r200-ubrk", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round200's reading no tee class: the r200 lines "
                           "would land in the ring uncounted and could push out the exec/exit pairs")
+        if '{ "clover r203: ", "r203-ubrk", 64, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round203's shared-cache dump no tee class: its "
+                          "four lines per pid would land in the ring uncounted")
+        if '{ "clover r204: ", "r204-ubrk", 64, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round204's x19 dump no tee class: the one "
+                          "SpringBoard reading the bring-up waits on would land in the ring uncounted")
 
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
@@ -1629,8 +1659,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r202:"):
-        errors.append('[payload] title is not "clover r202: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r206:"):
+        errors.append('[payload] title is not "clover r206: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2627,8 +2657,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r202:"):
-        errors.append('[payload] title is not "clover r202: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r206:"):
+        errors.append('[payload] title is not "clover r206: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

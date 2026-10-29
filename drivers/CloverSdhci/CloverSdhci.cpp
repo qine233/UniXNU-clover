@@ -473,6 +473,15 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // kernel caps itself at 24 traps. 64 lines leave slack for both without letting the producer
   // push the exec/exit pairs out of the ring.
   { "clover r200: ubrk", "r200-ubrk", 64, 0, 0, 0 },
+  // Round203's shared-cache half: a trap inside the dyld shared cache prints four more lines (x4-x7,
+  // x19-x28, the stack words, the object x0 points at), once per pid. Four pids' worth of slack over
+  // the two lines that same pid would have spent, and the two classes together stay under a
+  // hundred records of the kernel ring.
+  { "clover r203: ", "r203-ubrk", 64, 0, 0, 0 },
+  // Round204 reads the mode object from x19 instead of x0, so SpringBoard's detailed reading is seven
+  // lines per pid. It gets eight slots of its own in the kernel, and this class matches the eight of
+  // them that can print.
+  { "clover r204: ", "r204-ubrk", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
