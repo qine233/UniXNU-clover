@@ -88,7 +88,7 @@ diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 --- a/bsd/kern/kern_sig.c
 +++ b/bsd/kern/kern_sig.c
-@@ -2057,6 +2057,98 @@
+@@ -2057,6 +2057,125 @@
  		panic("psignal: bad signal number %d", signum);
  	}
  
@@ -124,9 +124,14 @@ diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 +		}
 +		if (clover_kill_slot < 8 && clover_kill_count[clover_kill_slot] < 4 &&
 +		    clover_kill_prints < 40) {
++			extern unsigned int clover_emmc_probe_say(const char *text,
++			    unsigned int length);
++			char clover_r207_line[256];
++
 +			clover_kill_count[clover_kill_slot]++;
 +			clover_kill_prints++;
-+			printf("clover r207: killsig pid=%d comm=%s ppid=%d sig=%d spid=%d scomm=%s ns=%d code=0x%llx cs=0x%x ra=%016llx anchor=%016llx\n",
++			snprintf(clover_r207_line, sizeof(clover_r207_line),
++			    "clover r207: killsig pid=%d comm=%s ppid=%d sig=%d spid=%d scomm=%s ns=%d code=0x%llx cs=0x%x ra=%016llx anchor=%016llx\n",
 +			    proc_getpid(p), p->p_comm, p->p_ppid, signum,
 +			    proc_getpid(clover_kill_sender), clover_kill_sender->p_comm,
 +			    (signal_reason != NULL) ? signal_reason->osr_namespace : -1,
@@ -134,6 +139,14 @@ diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 +			    (unsigned int)proc_getcsflags(p),
 +			    (unsigned long long)(uintptr_t)__builtin_return_address(0),
 +			    (unsigned long long)(uintptr_t)&psignal_internal);
++			clover_r207_line[sizeof(clover_r207_line) - 1] = '\0';
++			printf("%s\n", clover_r207_line);
++			/* Round212: the same line into the driver's probe ring. This
++			 * runs when the kill is issued, which is the one moment the
++			 * reading is complete; by the panic twenty minutes later the
++			 * log buffer has overwritten it. */
++			clover_emmc_probe_say(clover_r207_line,
++			    (unsigned int)strlen(clover_r207_line));
 +		}
 +
 +		/*
@@ -150,6 +163,8 @@ diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 +		 * kernel frames say what that call was waiting on.
 +		 */
 +		if (signum == SIGKILL && clover_r208_prints < 64) {
++			extern unsigned int clover_emmc_probe_say(const char *text,
++			    unsigned int length);
 +			extern uint64_t clover_sender_upc(void);
 +			extern uint32_t clover_current_kstack(uint64_t *frames, uint32_t n);
 +			extern uint32_t clover_task_threads(task_t task, uint32_t budget);
@@ -157,6 +172,8 @@ diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 +			uint64_t clover_r211_kf[6] = { 0, 0, 0, 0, 0, 0 };
 +			uint32_t clover_r208_uinsn = 0;
 +			uint32_t clover_r211_kn;
++			char clover_r208_line[256];
++			char clover_r211_line[256];
 +
 +			if (clover_r208_upc != 0 &&
 +			    copyin((user_addr_t)clover_r208_upc, &clover_r208_uinsn,
@@ -164,18 +181,28 @@ diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 +				clover_r208_uinsn = 0;
 +			}
 +			clover_r208_prints++;
-+			printf("clover r208: sender upc=%016llx uinsn=%08x spid=%d scomm=%s\n",
++			snprintf(clover_r208_line, sizeof(clover_r208_line),
++			    "clover r208: sender upc=%016llx uinsn=%08x spid=%d scomm=%s\n",
 +			    (unsigned long long)clover_r208_upc, clover_r208_uinsn,
 +			    proc_getpid(clover_kill_sender), clover_kill_sender->p_comm);
++			clover_r208_line[sizeof(clover_r208_line) - 1] = '\0';
++			printf("%s", clover_r208_line);
++			clover_emmc_probe_say(clover_r208_line,
++			    (unsigned int)strlen(clover_r208_line));
 +
 +			clover_r211_kn = clover_current_kstack(clover_r211_kf, 6);
-+			printf("clover r211: skst n=%u f0=%016llx f1=%016llx f2=%016llx f3=%016llx f4=%016llx f5=%016llx\n",
++			snprintf(clover_r211_line, sizeof(clover_r211_line),
++			    "clover r211: skst n=%u f0=%016llx f1=%016llx f2=%016llx f3=%016llx f4=%016llx f5=%016llx\n",
 +			    clover_r211_kn, (unsigned long long)clover_r211_kf[0],
 +			    (unsigned long long)clover_r211_kf[1],
 +			    (unsigned long long)clover_r211_kf[2],
 +			    (unsigned long long)clover_r211_kf[3],
 +			    (unsigned long long)clover_r211_kf[4],
 +			    (unsigned long long)clover_r211_kf[5]);
++			clover_r211_line[sizeof(clover_r211_line) - 1] = '\0';
++			printf("%s", clover_r211_line);
++			clover_emmc_probe_say(clover_r211_line,
++			    (unsigned int)strlen(clover_r211_line));
 +
 +			if (strncmp(p->p_comm, "SpringBoard", 16) == 0) {
 +				clover_r208_prints += clover_task_threads(proc_task(p),
@@ -202,7 +229,7 @@ diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
  
  #include <corpses/task_corpse.h>
  #if CONFIG_TELEMETRY
-@@ -10285,3 +10290,161 @@
+@@ -10285,3 +10290,173 @@
  	char *name = proc_best_name(task_get_proc_raw(task));
  	strlcpy(buf, name, size);
  }
@@ -342,14 +369,23 @@ diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
 +	}
 +	task_unlock(task);
 +	for (i = 0; i < n; i++) {
-+		printf("clover r211: sbthr n=%u pid=%d mt=%d tid=0x%llx pc=%016llx lr=%016llx sp=%016llx cpsr=%08x state=%d kin=%u wait=%016llx\n",
++		extern unsigned int clover_emmc_probe_say(const char *text,
++		    unsigned int length);
++		char line[256];
++
++		snprintf(line, sizeof(line),
++		    "clover r211: sbthr n=%u pid=%d mt=%d tid=0x%llx pc=%016llx lr=%016llx sp=%016llx cpsr=%08x state=%d kin=%u wait=%016llx\n",
 +		    i + 1, pid, (snap[i].tid == (uint64_t)pid) ? 1 : 0,
 +		    (unsigned long long)snap[i].tid, (unsigned long long)snap[i].pc,
 +		    (unsigned long long)snap[i].lr, (unsigned long long)snap[i].sp,
 +		    snap[i].cpsr, snap[i].state, snap[i].kin,
 +		    (unsigned long long)snap[i].wait);
++		line[sizeof(line) - 1] = '\0';
++		printf("%s", line);
++		clover_emmc_probe_say(line, (unsigned int)strlen(line));
 +		if (snap[i].nframes != 0) {
-+			printf("clover r211: sbthk n=%u ktop=%016llx kfp=%016llx klr=%016llx kf=%016llx,%016llx,%016llx,%016llx,%016llx,%016llx\n",
++			snprintf(line, sizeof(line),
++			    "clover r211: sbthk n=%u ktop=%016llx kfp=%016llx klr=%016llx kf=%016llx,%016llx,%016llx,%016llx,%016llx,%016llx\n",
 +			    i + 1, (unsigned long long)snap[i].ktop,
 +			    (unsigned long long)snap[i].kfp,
 +			    (unsigned long long)snap[i].klr,
@@ -359,6 +395,9 @@ diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
 +			    (unsigned long long)snap[i].frames[3],
 +			    (unsigned long long)snap[i].frames[4],
 +			    (unsigned long long)snap[i].frames[5]);
++			line[sizeof(line) - 1] = '\0';
++			printf("%s", line);
++			clover_emmc_probe_say(line, (unsigned int)strlen(line));
 +		}
 +	}
 +	return n;

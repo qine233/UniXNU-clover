@@ -30,6 +30,17 @@ Three windows live in the partition:
       sample of SDHCI_PRESENT_STATE. `--flight` reads them. A last entry with
       no successor is the request that never came back; a beat that is absent
       is a guard that was held or a controller that refused the command.
+  boot record             sector 1216, one block
+      kind 24, written from round212: a counter the driver reads back and
+      increments once per boot, so records of two boots are no longer told
+      apart by guessing. `--boot` reads it; every two-block record carries the
+      same number in word 9.
+  probe records           inside the driver ring, kind 25
+      written from round212: the kernel-side lines (killsig, sender pc, thread
+      snapshot) forwarded through clover_emmc_probe_say while the process is
+      still alive. They land in the same slots as the driver's own verdict
+      lines because the panic that follows may be a minute later, after msgbuf
+      and the kernel ring have wrapped. `--probe` reads just these.
 
 Header words:
 
@@ -38,16 +49,21 @@ Header words:
   words[2] absolute LBA of the header block
   words[3] total bytes of the text block: prefix + body + newline
   words[4] byte sum of those bytes, low 32 bits
-  words[5] kind: 17, 19, 20 above, 21 = driver verdict line, 22 = kernel log line;
+  words[5] kind: 17, 19, 20 above, 21 = driver verdict line, 22 = kernel log line,
+      25 = probe line the driver relayed;
       the flight region uses the same two magic words but one block per record,
       with kind 23 and its own header words (see decode_flight below)
   words[6] body length
   words[7] slot index
   words[8] sequence number (the two rings only; 0 in the report/panic records)
+  words[9] boot id (0 in records written before round212, and in the flight
+      region, which has its own words)
 
 The sequence number is what makes a wrapped ring orderable: after a ring has
 more records than slots, the slot index stops being time, so both ring readers
-sort by seq.
+sort by seq. The boot id is what makes a slot knowable at all across boots: a
+stale slot is congruent with its own position, so slot arithmetic alone cannot
+say whether the record there is this boot's.
 
 Producer is read off the text as well as the kind: a line that starts with
 "CloverSdhci " was said by the driver itself. In the kernel ring that is a
@@ -57,8 +73,8 @@ over `--tee` counts zero, and a nonzero count means the tee started echoing.
 
 Input is a dd of the log window from the card -- logdump since round185. The default window needs
 the first 64
-sectors; the verdict ring needs 192 and the kernel ring needs 1216, which is
-what scripts/run-clover-unattended.sh now reads. A record whose header is
+sectors; the verdict ring needs 192 and the kernel ring needs 1216, and round212's boot record
+needs 1217, which is what scripts/run-clover-unattended.sh now reads. A record whose header is
 present but whose text does not sum is still printed: a half-written record is
 a reading.
 """
@@ -81,10 +97,14 @@ FLIGHT_ENTRY_SLOTS = 12
 FLIGHT_BEAT_OFFSET = 56    # four one-block beats, 4 s apart, at the end of that gap
 FLIGHT_BEAT_SLOTS = 4
 FLIGHT_KIND = 23
+BOOT_OFFSET = KERNEL_OFFSET + 2 * KERNEL_SLOTS   # round212: one block after the kernel ring
+BOOT_KIND = 24
+PROBE_KIND = 25
 LOG_WINDOW_FIRST_LBA = 13320216   # the card's p56 (logdump) since round185; p39 logfs is the root now
-DUMP_SECTORS = KERNEL_OFFSET + 2 * KERNEL_SLOTS   # one dd that reaches the end of both rings
+DUMP_SECTORS = BOOT_OFFSET + 1    # round212 adds the boot record past the end of both rings
 KINDS = {17: "report-17", 19: "report-19", 20: "panic-20",
-         21: "verdict-21", 22: "kernel-22", 23: "flight-23"}
+         21: "verdict-21", 22: "kernel-22", 23: "flight-23",
+         24: "boot-24", 25: "probe-25"}
 FLIGHT_EVENTS = {1: "read", 2: "write", 3: "beat"}
 FLIGHT_DIRS = {0: "read", 1: "write", 2: "beat"}
 DRIVER_PREFIX = b"CloverSdhci "
@@ -113,15 +133,24 @@ def decode(data, first_lba, slots=REPORT_SLOTS, base_sector=0, expect_kind=None)
     two rings the same shape in every other field, so the kind is the only thing in a
     record that distinguishes a driver verdict from a kernel line, and a reader that
     did not check it would happily print a stale ring as if it were the new one.
+    Round212 puts the relayed probe lines (kind 25) in the same slots as the driver's
+    verdicts, so the driver ring accepts either and both kinds stay named.
+
+    `boot` is word 9: round212's per-boot counter. It is carried, not checked, because
+    a record written by an earlier build has zero there and is still a reading; what it
+    buys is that a slot whose seq happens to be congruent can be told apart by boot.
     """
+    expects = ()
+    if expect_kind is not None:
+        expects = tuple(expect_kind) if isinstance(expect_kind, (tuple, list, set)) else (expect_kind,)
     records = []
     for slot in range(slots):
         base = (base_sector + 2 * slot) * SECTOR
         block = data[base:base + SLOT_BYTES]
         if len(block) < SLOT_BYTES:
             break
-        magic0, magic1, lba, total, checksum, kind, body, slot_word, seq = \
-            struct.unpack_from("<9I", block)
+        magic0, magic1, lba, total, checksum, kind, body, slot_word, seq, boot = \
+            struct.unpack_from("<10I", block)
         if (magic0, magic1) != MAGIC:
             break
         problems = []
@@ -130,8 +159,9 @@ def decode(data, first_lba, slots=REPORT_SLOTS, base_sector=0, expect_kind=None)
             problems.append(f"lba {lba} != {want_lba}")
         if slot_word != slot:
             problems.append(f"slot word {slot_word} != {slot}")
-        if expect_kind is not None and kind != expect_kind:
-            problems.append(f"kind {kind} != {expect_kind}")
+        if expects and kind not in expects:
+            problems.append(f"kind {kind} != {expects[0]}" if len(expects) == 1
+                            else f"kind {kind} not in {expects}")
         if body > 480:
             problems.append(f"body {body} > 480")
         if total != len(PREFIX) + body + 1:
@@ -159,15 +189,56 @@ def decode(data, first_lba, slots=REPORT_SLOTS, base_sector=0, expect_kind=None)
             "kind": kind,
             "body": body,
             "seq": seq,
+            "boot": boot,
             "text_ok": text_ok,
         }, content, problems))
     return records
+
+
+def decode_boot(data, first_lba):
+    """Round212's boot record at sector 1216: {"boot": n, "problems": [...]} or None.
+
+    One block, the same two magic words as a two-block record, kind 24, and the
+    counter in word 9; words 3, 4, 6, 7 and 8 are zero because there is no text
+    block and no slot. The driver reads this block at arming time, increments the
+    number and writes it back, so the value here is the boot that most recently
+    armed -- which is what every two-block record of that boot carries in word 9.
+    """
+    base = BOOT_OFFSET * SECTOR
+    block = data[base:base + SECTOR]
+    if len(block) < SECTOR:
+        return None
+    magic0, magic1, lba, _total, _sum, kind, _body, _slot, _seq, boot = \
+        struct.unpack_from("<10I", block)
+    if (magic0, magic1) != MAGIC:
+        return None
+    problems = []
+    want_lba = first_lba + BOOT_OFFSET
+    if lba != want_lba:
+        problems.append(f"lba {lba} != {want_lba}")
+    if kind != BOOT_KIND:
+        problems.append(f"kind {kind} != {BOOT_KIND}")
+    return {"boot": boot, "lba": lba, "problems": problems}
 
 
 def text_of(content):
     """The body as text. The writer stores one space for control bytes, so this is
     already printable, but a byte outside ASCII is replaced instead of guessed."""
     return bytes(byte if 0x09 <= byte < 0x7F else 0x2E for byte in content).decode("ascii")
+
+
+def of_kind(records, kinds):
+    """The records whose header kind is one of `kinds`.
+
+    decode() keeps a record whose kind is not the expected one and names the
+    mismatch as a problem, because that is a reading worth printing. A reader
+    that asked for one kind of record still has to drop the others itself:
+    round212's driver ring holds both verdicts (21) and relayed probes (25), and
+    `--probe --count` that counted the whole ring reported 36 probe lines on a
+    boot that had none.
+    """
+    wanted = tuple(kinds) if isinstance(kinds, (tuple, list, set)) else (kinds,)
+    return [record for record in records if record[1]["kind"] in wanted]
 
 
 def report(records, newest_only=False, order_by_seq=False):
@@ -184,8 +255,10 @@ def report(records, newest_only=False, order_by_seq=False):
         records = records[-1:]
     for slot, header, content, problems in records:
         verdict = "ok" if not problems else "BAD (" + "; ".join(problems) + ")"
-        said = f"  said by {producer(content)}" if header["kind"] in (21, 22) else ""
-        print(f"slot {slot}  lba {header['lba']}  seq {header['seq']}  kind {header['kind']} "
+        said = (f"  said by {producer(content)}"
+                if header["kind"] in (21, 22, PROBE_KIND) else "")
+        print(f"slot {slot}  lba {header['lba']}  seq {header['seq']}  boot {header['boot']}  "
+              f"kind {header['kind']} "
               f"({KINDS.get(header['kind'], 'unknown')})  body {header['body']}  "
               f"sum {header['sum']:#010x}{said}  {verdict}")
         if content is not None:
@@ -358,15 +431,21 @@ def build_flight_record(lba, seq, event, dir_, op_lba, op_blocks, t_ms=0, presen
                        pending[1], prev_dir, prev_blocks).ljust(SECTOR, b"\0")
 
 
-def build_record(kind, slot, lba, body_text, seq=0):
+def build_record(kind, slot, lba, body_text, seq=0, boot=0):
     """One two-block record exactly as the driver lays it out, for selftest."""
     body = body_text.encode("ascii")
     total = len(PREFIX) + len(body) + 1
     checksum = (sum(PREFIX) + sum(body) + ord("\n")) & 0xFFFFFFFF
-    header = struct.pack("<9I", MAGIC[0], MAGIC[1], lba, total, checksum, kind,
-                         len(body), slot, seq) + bytes(SECTOR - 36)
+    header = struct.pack("<10I", MAGIC[0], MAGIC[1], lba, total, checksum, kind,
+                         len(body), slot, seq, boot) + bytes(SECTOR - 40)
     text = PREFIX + body + b"\n"
     return header + text.ljust(SECTOR, b"\0")
+
+
+def build_boot(lba, boot, slot=0, seq=0, kind=BOOT_KIND):
+    """One round212 boot block exactly as bootIdClaim lays it out, for selftest."""
+    return struct.pack("<10I", MAGIC[0], MAGIC[1], lba, 0, 0, kind, 0, slot, seq,
+                       boot).ljust(SECTOR, b"\0")
 
 
 def selftest():
@@ -376,12 +455,16 @@ def selftest():
     silently reads one ring as the other. Round176 split the two producers apart -- driver verdicts
     into kind 21 at sector 64, kernel text the tee lifted out of msgbuf into kind 22 at sector 192 --
     so the per-ring kind check and the empty-intersection rule (--driver over --tee is zero) are both
-    asserted here."""
+    asserted here. Round212 adds two shapes to the same dump: the boot counter at sector 1216, and
+    the relayed probe lines (kind 25) that share the driver ring's slots."""
     first_lba = LOG_WINDOW_FIRST_LBA
+    boot_id = 7
     # The two rings have to tile the partition with no overlap: the driver ring ends exactly where
-    # the kernel ring starts, and a dd of DUMP_SECTORS reaches the last slot of the second one.
+    # the kernel ring starts, and a dd of DUMP_SECTORS reaches the boot record one block past the
+    # last slot of the second ring.
     assert VERDICT_OFFSET + 2 * VERDICT_SLOTS == KERNEL_OFFSET, KERNEL_OFFSET
-    assert DUMP_SECTORS == KERNEL_OFFSET + 2 * KERNEL_SLOTS, DUMP_SECTORS
+    assert BOOT_OFFSET == KERNEL_OFFSET + 2 * KERNEL_SLOTS, BOOT_OFFSET
+    assert DUMP_SECTORS == BOOT_OFFSET + 1, DUMP_SECTORS
     # Round210's flight region lives in the gap the two windows leave: report 0..31, entries
     # 32..43, beats 56..59, verdict 64.. -- one block per record, so the whole region fits in
     # the 1216-sector dump both rings already read and no window moved to make room for it.
@@ -390,8 +473,8 @@ def selftest():
     assert FLIGHT_BEAT_OFFSET + FLIGHT_BEAT_SLOTS <= VERDICT_OFFSET, FLIGHT_BEAT_OFFSET
 
     dump = bytearray()
-    dump += build_record(19, 0, first_lba, "bring-up report")
-    dump += build_record(20, 1, first_lba + 2, "panic line")
+    dump += build_record(19, 0, first_lba, "bring-up report", boot=boot_id)
+    dump += build_record(20, 1, first_lba + 2, "panic line", boot=boot_id)
     dump += bytes((VERDICT_OFFSET - 4) * SECTOR)          # gap before the driver ring: not records
     driver_lines = ["CloverSdhci r174: verdict ring armed lba=13320280 slots=64",
                     "CloverSdhci r176: kernel ring armed lba=13320408 slots=512",
@@ -402,8 +485,13 @@ def selftest():
         # Slots 0..4 with seq 5..9: a ring that wrapped, so slot order is not time order.
         slot = index
         lba = first_lba + VERDICT_OFFSET + 2 * slot
-        dump += build_record(21, slot, lba, line, seq=5 + index)
-    dump += bytes((KERNEL_OFFSET - VERDICT_OFFSET - 2 * len(driver_lines)) * SECTOR)
+        dump += build_record(21, slot, lba, line, seq=5 + index, boot=boot_id)
+    # Round212's relayed probe line is a kernel line in the driver ring: same slots, kind 25.
+    probe_line = "clover r208: sender upc=0000000180001234 uinsn=d503201f spid=71 scomm=backboardd"
+    dump += build_record(PROBE_KIND, len(driver_lines),
+                         first_lba + VERDICT_OFFSET + 2 * len(driver_lines), probe_line,
+                         seq=90, boot=boot_id)
+    dump += bytes((KERNEL_OFFSET - VERDICT_OFFSET - 2 * (len(driver_lines) + 1)) * SECTOR)
     kernel_lines = ["load code signature error 4 for file launchd",
                     "[apfs_jhash:146] hash mismatch for 16384 bytes at offset 12128256",
                     "clover r170: check_np pid=12 comm=launchd dyld_flags=0x0",
@@ -411,25 +499,41 @@ def selftest():
     for index, line in enumerate(kernel_lines):
         slot = index
         lba = first_lba + KERNEL_OFFSET + 2 * slot
-        dump += build_record(22, slot, lba, line, seq=17 + index)
+        dump += build_record(22, slot, lba, line, seq=17 + index, boot=boot_id)
+    assert len(dump) == (KERNEL_OFFSET + 2 * len(kernel_lines)) * SECTOR, len(dump)
+    dump += bytes((BOOT_OFFSET - KERNEL_OFFSET - 2 * len(kernel_lines)) * SECTOR)
+    dump += build_boot(first_lba + BOOT_OFFSET, boot_id)
     data = bytes(dump)
-    assert len(data) == (KERNEL_OFFSET + 2 * len(kernel_lines)) * SECTOR, len(data)
+    assert len(data) == DUMP_SECTORS * SECTOR, len(data)
 
     reports = decode(data, first_lba)
     assert len(reports) == 2, reports
     assert [r[1]["kind"] for r in reports] == [19, 20], reports
     assert all(not r[3] for r in reports), reports
+    assert all(r[1]["boot"] == boot_id for r in reports), reports
     assert text_of(reports[0][2]) == "bring-up report", reports[0]
 
     def ring(slots, base, expect_kind):
         return sorted(decode(data, first_lba, slots=slots, base_sector=base,
                              expect_kind=expect_kind), key=lambda v: v[1]["seq"])
 
-    verdicts = ring(VERDICT_SLOTS, VERDICT_OFFSET, 21)
-    assert [text_of(v[2]) for v in verdicts] == driver_lines, verdicts
-    assert all(v[1]["kind"] == 21 for v in verdicts), verdicts
+    # Round212: the driver ring now holds two kinds. Reading it with both accepted is the normal
+    # case; reading it with only kind 21 accepted has to name the probe line rather than drop it.
+    verdicts = ring(VERDICT_SLOTS, VERDICT_OFFSET, (21, PROBE_KIND))
+    assert [text_of(v[2]) for v in verdicts if v[1]["kind"] == 21] == driver_lines, verdicts
+    assert [text_of(v[2]) for v in verdicts if v[1]["kind"] == PROBE_KIND] == [probe_line], verdicts
     assert all(not v[3] for v in verdicts), verdicts
+    assert all(v[1]["boot"] == boot_id for v in verdicts), verdicts
     assert verdicts[0][1]["seq"] == 5, verdicts[0]
+    strict = decode(data, first_lba, slots=VERDICT_SLOTS, base_sector=VERDICT_OFFSET,
+                    expect_kind=21)
+    assert any(problem.startswith(f"kind {PROBE_KIND} != 21")
+               for _, _, _, problems in strict for problem in problems), strict
+    # Asking for the relayed probes alone has to drop the verdicts that share the ring,
+    # which is what --probe --count does.
+    assert of_kind(verdicts, PROBE_KIND) == [v for v in verdicts if v[1]["kind"] == PROBE_KIND], verdicts
+    assert len(of_kind(verdicts, PROBE_KIND)) == 1, verdicts
+    assert of_kind(verdicts, 21) == [v for v in verdicts if v[1]["kind"] == 21], verdicts
 
     kernel = ring(KERNEL_SLOTS, KERNEL_OFFSET, 22)
     assert [text_of(v[2]) for v in kernel] == kernel_lines, kernel
@@ -440,8 +544,12 @@ def selftest():
     # Who said each line, per ring. The driver ring holds the driver's readings plus the tee's state
     # lines about itself; the kernel ring holds kernel text and nothing else, which is the whole point
     # of round176: a busy daemon can no longer evict a verdict, and a --driver filter over --tee that
-    # counts anything means the tee started echoing its own lines onto the card.
-    assert all(producer(record[2]) == "driver" for record in verdicts), verdicts
+    # counts anything means the tee started echoing its own lines onto the card. Round212's relayed
+    # probe line is the one kernel line that is allowed in the driver ring, and it says so by kind.
+    assert all(producer(record[2]) == "driver"
+               for record in verdicts if record[1]["kind"] == 21), verdicts
+    assert [record for record in verdicts if producer(record[2]) == "kernel"] == \
+        [record for record in verdicts if record[1]["kind"] == PROBE_KIND], verdicts
     assert all(producer(record[2]) == "kernel" for record in kernel), kernel
     assert [record for record in kernel if producer(record[2]) == "driver"] == [], kernel
     # A dump with zero kernel lines is still the difference between "the tee ran and nothing matched"
@@ -449,6 +557,17 @@ def selftest():
     assert any("tee seen=" in text_of(record[2]) for record in verdicts), verdicts
     # An unreadable record has no producer to invent.
     assert producer(None) == "-", producer(None)
+
+    # Round212's boot record: one block past the kernel ring, counter in word 9, no text block.
+    boot = decode_boot(data, first_lba)
+    assert boot is not None and not boot["problems"], boot
+    assert boot["boot"] == boot_id, boot
+    wrong_boot = bytearray(data)
+    wrong_boot[BOOT_OFFSET * SECTOR:(BOOT_OFFSET + 1) * SECTOR] = build_boot(
+        first_lba + BOOT_OFFSET, boot_id, kind=21)
+    problems = decode_boot(bytes(wrong_boot), first_lba)["problems"]
+    assert any(problem.startswith("kind 21 != 24") for problem in problems), problems
+    assert decode_boot(bytes(BOOT_OFFSET * SECTOR), first_lba) is None
 
     # A record whose kind does not match the ring it was read from is named, because after round176
     # the two rings are the same shape and the kind is the only thing that tells them apart.
@@ -553,7 +672,13 @@ def main():
                              "pass 12320768 to read a card flashed before round185, whose rings "
                              "would sit at the start of p39 logfs)")
     parser.add_argument("--verdict", action="store_true",
-                        help="read the driver's verdict ring instead (kind 21, sectors 64..191)")
+                        help="read the driver's verdict ring instead (kinds 21 and 25, "
+                             "sectors 64..191)")
+    parser.add_argument("--probe", action="store_true",
+                        help="read only the round212 probe lines the driver relayed from the "
+                             "kernel (kind 25, inside the driver ring)")
+    parser.add_argument("--boot", action="store_true",
+                        help="print the round212 boot counter record (kind 24, sector 1216)")
     parser.add_argument("--tee", action="store_true",
                         help="read the kernel-log ring the round175 tee writes (kind 22, "
                              "sectors 192..1215)")
@@ -565,7 +690,8 @@ def main():
                              "--tee this is expected to be empty, and is a check that the tee is not "
                              "echoing")
     parser.add_argument("--count", action="store_true",
-                        help="print the number of records and exit (for scripts)")
+                        help="print the number of records the chosen window and filters select, "
+                             "and exit (for scripts)")
     parser.add_argument("--newest", action="store_true",
                         help="print only the newest record")
     parser.add_argument("--selftest", action="store_true",
@@ -596,10 +722,26 @@ def main():
             return 1
         flight_report(groups)
         return 0
+    if args.boot:
+        need = DUMP_SECTORS * SECTOR
+        if len(data) < need:
+            raise SystemExit(f"{path} is {len(data)} bytes; the boot record needs {need}")
+        boot = decode_boot(data, args.first_lba)
+        if boot is None:
+            print(f"{path}: no boot record (sector {BOOT_OFFSET} has no LOG1 magic)",
+                  file=sys.stderr)
+            return 1
+        verdict = "ok" if not boot["problems"] else "BAD (" + "; ".join(boot["problems"]) + ")"
+        print(f"boot {boot['boot']}  lba {boot['lba']}  kind {BOOT_KIND} "
+              f"({KINDS[BOOT_KIND]})  {verdict}")
+        return 0
     if args.tee:
         slots, base, kind, window = KERNEL_SLOTS, KERNEL_OFFSET, 22, "kernel-log ring"
+    elif args.probe:
+        slots, base, kind, window = VERDICT_SLOTS, VERDICT_OFFSET, PROBE_KIND, "probe lines"
     elif args.verdict:
-        slots, base, kind, window = VERDICT_SLOTS, VERDICT_OFFSET, 21, "verdict ring"
+        slots, base, kind, window = (VERDICT_SLOTS, VERDICT_OFFSET, (21, PROBE_KIND),
+                                     "verdict ring")
     else:
         slots, base, kind, window = REPORT_SLOTS, 0, None, "report window"
     if kind is not None:
@@ -607,6 +749,8 @@ def main():
         if len(data) < need:
             raise SystemExit(f"{path} is {len(data)} bytes; the {window} needs {need}")
     records = decode(data, args.first_lba, slots=slots, base_sector=base, expect_kind=kind)
+    if args.probe:
+        records = of_kind(records, PROBE_KIND)
     if args.driver:
         records = [record for record in records if producer(record[2]) == "driver"]
     if args.count:

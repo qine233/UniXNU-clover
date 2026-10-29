@@ -15935,3 +15935,105 @@ panic sink 自己会写卡，但它的尾读被 `gTeeReady` 门挡掉了。
    把驱动环的 pending 落卡。`panicTailRead` 去掉 `gTeeReady` 门、自己校验 msgbuf、
    **永远**说状态行，扫描窗口放到整个 msgbuf、取 48 行。
 4. **panic 窗改成带 seq 的轮转**：这一帧八次 append 把窗从 12 槽推到满，再下一靴就写不进去了。
+
+## round212：给每条记录一个靴号，把尾读的门摘掉，让杀点走驱动的 RAM 环
+
+r211 的失败有两层：杀点的行**确实**打过（msgbuf 里有），但块路径在 341 s 停住，
+tee 抄不出来，`panicTailRead` 又被 `gTeeReady` 门挡住；而且**没有任何一条记录带靴子身份**，
+所以「r184 那行 drain wrote=4 是本靴还是上一靴」分不开——整个读数都不可归因。
+r212 先把归因能力建起来，再去追杀点。
+
+### 实现
+
+`drivers/CloverSdhci/CloverSdhci.cpp`：
+
+- **靴号**：上膛时读 sector 1216 的单块记录（kind 24）里的计数，加一写回，存进 `gBootId`；
+  此后每条两块的记录都把它写进头 word 9，上膛行打印
+  `CloverSdhci r212: boot id=%u record=%u probe slots=%u text=%u`。
+  两张表（驱动环、内核环）和 panic 窗从此都能按靴过滤。
+- **panic 窗改成轮转**：word 8 是记录的第几回合；扫到窗满时不再返回 3，而是把回合最小的槽
+  让给这一条（旧记录这里全是 0，所以第一个被换掉的正好是老扫描会拒绝的 slot 0）。
+  返回值因此只剩 1、2、4、5。
+- **drain 进出各行**：进门无条件推
+  `CloverSdhci r212: drain enter boot= panic_first= verdict= tee= append_rc= probe_seen=`，
+  出门推 `drain exit boot= wrote= dropped= tee_passes= probe= probe_drop= probe_pend=`，
+  exit 之后再把驱动环的 pending 冲一遍。**守卫拿不到也照样冲环**，不靠块请求成功。
+- **尾读去门**：`panicTailRead` 删掉 `if (!gTeeReady) return;`，自己校验 msgbuf 头，
+  永远说状态行，扫描窗口放到整个 msgbuf、取 48 行。
+- **probe 中转环**：新增 `clover_emmc_probe_say(text, length)`，只往驱动 BSS 里 32 槽
+  × 256 字节的 RAM 环写一行，不碰卡、不碰守卫、不经 msgbuf；环满就丢并计数。
+  panic drain 先把它推进驱动环（kind 25）再落卡。
+
+内核侧（`zzzzzz-clover-crash-why.patch` 的 `kern_sig.c` / `task.c`）：kill 点的 killsig、
+sender pc、线程快照三组行在 `printf` 之外**同时**投一份给 `clover_emmc_probe_say`，
+所以进程还活着的时候文本就已经在驱动内存里，等到 panic 只是把它抄上卡。
+
+宿主 `scripts/read-clover-log.py`：`--boot` 读 kind-24 记录并校验计数；`--probe` 只留 kind 25；
+每条记录打印 `boot=` 列。顺手修了一个计数缺陷：`decode(expect_kind=25)` 只把 kind 不符记进
+problems、**仍然返回记录**，于是 r212 的第一帧 `--probe --count` 把 36 条 kind-21 全算成 probe 行。
+现在 main 里用 `of_kind()` 先过滤再计数，selftest 断言 `--probe` 只拿 kind 25、`--count` 与列出
+的记录数一致。
+
+配套：`board.toml` 标题升到 `clover r212:`；`check-clover.py` 断言启动记录几何、
+轮转分支、drain 进出、probe 环与上膛行；`verify-clover-payload.py` 新增
+`r212 boot counter armed`。
+
+### 构建与闸门
+
+内核 `7c3cf132…`（52,215,808 B，968 个对象戳全清、1 个 LC_UUID、1 个 KCID）→ AMFI 两刀落在
+file `0x1ab10e4` / `0x1ab116c`（与 r200–r211 同址）得 `e84002dc…` → payload
+`4e142c38…`（`~/clover-out/round212-payload.img`，56 MiB；卷内 kernel `273c486e…`、
+unixnu.toml `bfc7ed8b…` 1183 B、ADT `545cc0af…` 13556 B、trustcache `7c369ce0…`、
+data seed `614b8356…`；入口探针 6985 B / 37 runs）。`check-clover.py` 绿；
+`verify-clover-payload.py` 全项 OK（含 `r212 boot counter armed OK`）。
+
+### 读数（2026-10-30 03:22 冷刷 cache，读回 623104 字节）
+
+**靴号当场把 r211 的歧义关掉了，但这一帧没走到杀点：块路径更早就停住了。**
+
+- **启动记录**：`boot 1 lba 13321432 kind 24 ok`——本次是 1 号靴，上一靴是 0 号。
+  上膛行 `CloverSdhci r212: boot id=1 record=13321432 probe slots=32 text=256`。
+- **驱动环**：36 条，`seq 0..35`，**其中 35 条 boot 1**；唯一一条 boot 0 的是
+  `seq 35 / CloverSdhci r184: panic drain wrote=4 dropped=0 tee_passes=8`——
+  **上一靴留下的尾巴**。所以 r211 那帧「sink 写成功了」的 r184 行确实是真的，
+  而本靴的 drain **一条也没写**（没有 enter、没有 exit、没有 kind 20）。
+- **probe 环**：kind 25 **0 条**。这不是通道失败：本靴 SpringBoard 在
+  `[152.198182] exec pid=27` 之后就没有输出，backboardd 的看门狗杀点（r210 是 457 s）
+  **根本没到**，探针没有东西可投。
+- **内核环**：512 条满，全 boot 1，`seq 289..800`，最后两行是
+  `[194.181911] CloverBlock r190: sync-in pending=8` 和
+  `[194.181939] CloverBlock r190: sync-out ok=1 pending=8`，此后再没有一条。
+- **flight 区**：entry 链 `seq 53675..53686`（12 槽满），`t=181878..181885 ms`，
+  **全部是 8 块读**，`lba` 从 31076568 起每笔加 8，最后一笔
+  `seq 53686 / lba=31076656 / blocks=8 / ps=0x01f800f0 / inh=- / guard=53687 / miss=13`，
+  `prev` 每笔都是 `read/8/0ms/8`，**没有后继**——没回来的就是它。
+  这些 LBA 落在 Data 卷窗口（起点 18,325,504）内偏移 12,751,152 扇区（≈6.08 GiB）。
+  心跳只有 4 条（4 槽）：`seq 29..32`，`128857/132863/136863/168893 ms`，
+  `ps=0x01f800f0`、`miss` 从 3 涨到 10、`pend=0/0`；最后一拍比最后一笔 entry 早
+  **12,992 ms**，按 4 s 一拍算中间缺了三拍，`miss=13` 与 entry 里的读数对上。
+- **时间**：flight 的 `t` 以上膛为零点，最后一笔 entry 对上内核 `[194.18]`，所以上膛在
+  **≈12.3 s**；本靴在 **194.18 s** 停住，比 r211 的 352.19 s、r210 的 911.92 s 都早。
+- **report/panic 窗**：12 条，**全是 boot 0 的 kind 20**，本靴一条没写。
+- **落点**：03:22:04 进 TWRP。r198 预置的 BCB 让任何复位都落 TWRP，所以这只能说明「复位过」；
+  时间与 900 s 死线吻合，但 panic 到底跑没跑，这一帧仍然分不出来——panic 时卡写不进去，
+  连 drain enter 都到不了卡。
+
+**推论**：这仍是 r209/r211 的同一类故障，而且更早——**一笔 8 块读在 194 s 之后没有回来，
+守卫被它拿住，此后所有块 I/O（包括 panic sink）都在无超时的 `IOLockLock` 上排队**。
+驱动在 `acquireBlockGuard()` 的注释里写得很直白："A lock has no timeout"。
+这一帧不是「panic 时写不进卡」，而是「从 194 s 起就没人能写卡」，panic 只是又一个受害者。
+
+**这一帧没证明 probe 通道能用**：靴号只证明了 probe 环本身在（上膛行说 slots=32 text=256），
+kind 25 的写入与 drain 转发要等一帧真的走到杀点。
+
+### 下一步（r213）
+
+1. **给整笔请求加界，超时就复位控制器、放守卫**：现在只有命令阶段有界
+   （`waitCommandSlot`、`readAdmaRun`、`waitCardIdle`），而拿到守卫之后如果完成中断丢失，
+   没有任何一条路径会返回。r213 在请求级别包一层：超时后做 SDHCI 软件复位（CMD/DAT）、
+   重新上时钟与 ADMA 表，把守卫放掉并记下是哪一段超的。**一笔坏请求只该毁掉一个请求，
+   不该毁掉整次启动**——这比继续加探针更接近桌面。
+2. **probe 环加靴号过滤后的真实检验**：只有启动能活过 457 s，杀点的行才有机会进 probe 环。
+   如果第 1 项让它活过去，下一帧的 `--probe` 就该非零；若仍为零，那说明杀点后面还有别的墙。
+3. **给没回来的那笔读加身份**：entry 头还有空词，记下调用线程的 `comm`（前 8 字节）与 pid，
+   下一帧就能说清是谁在 6.08 GiB 处读——是 dyld 缓存、Data 卷上的系统服务，还是 launchd 的文件加载。

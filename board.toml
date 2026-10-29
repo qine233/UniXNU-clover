@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r211: at the kill, backtrace the kernel stack of every SpringBoard thread and of backboardd itself -- r210's flight shows every block request retiring within 7 ms and the sink still writing at 911 s, so the boot is not stuck on storage: r207's kill lands at 457.3 s with all five SpringBoard threads in TH_WAIT and no user pc that names a park site, so the kernel return addresses behind each thread say what they are waiting on"
+title = "clover r212: give every record a boot id, take the gate off the panic tail read, and relay the kill-point lines through a RAM ring the driver owns -- r211's kill lines never reached the card at all, and the silence could not be told apart from a stale card; the boot counter, the drain enter/exit lines and the ungated tail read now make each boot's silence attributable"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

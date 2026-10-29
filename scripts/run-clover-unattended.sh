@@ -38,7 +38,7 @@
 #      seen to land in TWRP (14 s, twice). It is an eMMC write to misc alone, which
 #      is why it needs --allow-misc-bcb. The landing is still proved by TWRP's adb,
 #      and a board that comes back to fastboot instead is reported, never retried;
-#   4. wait for TWRP's adb, dump the first 1216 sectors of the log window (logdump)
+#   4. wait for TWRP's adb, dump the first 1217 sectors of the log window (logdump)
 #      through /dev/block,
 #      and decode the 16 report slots plus both rings in it (the driver's verdicts
 #      and, since round176, the kernel-log lines the tee copied onto the card);
@@ -327,8 +327,10 @@ say "recovery: device=${device:-?} twrp=${twrp:-?}"
 # Round176 reads 1216 sectors. The first 32 blocks are the report/panic slots, the driver's verdict
 # ring runs 64..191, and round176's kernel-log ring -- the lines the tee copies out of msgbuf, so the
 # APFS, code-signing, shared-region and exec/exit readings that used to share 32 records with the
-# driver -- runs 192..1215. One dd still brings back everything the card was told, which is the point
-# of the round: a boot's whole story, not the last 32 lines of it.
+# driver -- runs 192..1215. Round212 adds one more block at 1216: the boot counter the driver reads
+# back and increments, which is what tells this boot's records from the last boot's. One dd still
+# brings back everything the card was told, which is the point of the round: a boot's whole story,
+# not the last 32 lines of it.
 dump_ok=0
 # Round185: the window is logdump. logfs stays in the list because a card flashed before
 # round185 has its rings -- if any had ever been written -- at the start of logfs, and the
@@ -340,18 +342,18 @@ for source in /dev/block/bootdevice/by-name/logdump /dev/block/by-name/logdump \
   # Two host-side traps, both found by the first real run of this script against a board sitting in
   # TWRP. (1) TWRP's adbd puts dd's own statistics on the same stream as the block data, so a plain
   # `adb exec-out dd` came back 85 bytes long and no length check could be trusted; redirecting dd's
-  # stderr inside the shell command keeps the stream at exactly 1216 sectors. (2) This used to require
+  # stderr inside the shell command keeps the stream at exactly 1217 sectors. (2) This used to require
   # "UXNULOG1" at file offset 0, which is not a property of a logfs window -- it is a property of slot
   # 0 holding a live record. The report window appends (slot k at sector 2k), so the newest record sits
   # wherever the cursor reached, and the card's first sectors can legitimately hold anything. Whether
   # this window carries records is a question for the decoder below, not for a magic number.
-  if adb exec-out "dd if=$source bs=512 count=1216 2>/dev/null" > "$OUT" 2>/dev/null; then
+  if adb exec-out "dd if=$source bs=512 count=1217 2>/dev/null" > "$OUT" 2>/dev/null; then
     size=$(wc -c < "$OUT" | tr -d ' ')
-    if [ "$size" = 622592 ]; then
+    if [ "$size" = 623104 ]; then
       dump_ok=1
       break
     fi
-    say "  $source: $size bytes, expected 622592"
+    say "  $source: $size bytes, expected 623104"
   else
     say "  $source: read failed"
   fi
@@ -367,10 +369,14 @@ decoder="$(cd "$(dirname "$0")" && pwd)/read-clover-log.py"
 {
   echo "== report and panic window"
   python3 "$decoder" "$OUT"
-  echo "== verdict ring (driver lines, sectors 64..191)"
+  echo "== verdict ring (driver lines and relayed probe lines, sectors 64..191)"
   python3 "$decoder" --verdict "$OUT" 2>/dev/null || echo "    no verdict records: this boot predates round174"
+  echo "== probe lines (round212 relay from the kernel, kind 25)"
+  python3 "$decoder" --probe "$OUT" 2>/dev/null || echo "    no probe lines: this boot predates round212 or no kill was issued"
   echo "== kernel-log ring (lines the tee copied out of msgbuf, sectors 192..1215)"
   python3 "$decoder" --tee "$OUT" 2>/dev/null || echo "    no kernel-log records: this boot predates round176"
+  echo "== boot counter (round212, sector 1216)"
+  python3 "$decoder" --boot "$OUT" 2>/dev/null || echo "    no boot record: this boot predates round212"
 } | tee "$OUT.txt"
 # The decoder exits 1 when it counts zero records (an empty ring), so "|| echo 0" would
 # capture "0\n0" whenever a ring is empty and every numeric test below would fail on it --
@@ -387,11 +393,15 @@ verdicts=$(count_records --verdict --count "$OUT")
 # and the ring cannot tell them apart on its own: the tee never armed (no verdict lines either), or it
 # armed and nothing in msgbuf matched the allowlist this boot.
 tee_lines=$(count_records --tee --count "$OUT")
+# Round212 counts the relayed probe lines separately: they are the only kernel readings that survive
+# a long boot in the driver's own ring, so a nonzero count here is the kill-point evidence itself.
+probe_lines=$(count_records --probe --count "$OUT")
+boot_id=$(python3 "$decoder" --boot "$OUT" 2>/dev/null | sed -n 's/^boot \([0-9][0-9]*\).*/\1/p' | head -1)
 # Round176's invariant: the tee drops every line that starts with the driver's name, so the kernel
 # ring has exactly one producer in it. A nonzero count here means the tee is copying its own readings
 # out of msgbuf -- which it can only do if a line the driver said reached the kernel log at all.
 echo_lines=$(count_records --tee --driver --count "$OUT")
-say "decoded: $OUT.txt ($count report record(s), $verdicts driver verdict line(s), $tee_lines kernel log line(s))"
+say "decoded: $OUT.txt ($count report record(s), $verdicts driver verdict line(s), $probe_lines probe line(s), $tee_lines kernel log line(s), boot ${boot_id:-?})"
 if [ "$verdicts" -gt 0 ] && [ "$tee_lines" = 0 ]; then
   warn "the ring armed but brought no kernel lines: the tee ran and msgbuf held nothing it keeps"
 fi

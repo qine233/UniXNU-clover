@@ -788,15 +788,62 @@ def check_board(errors: list) -> str:
             errors.append("drivers/CloverSdhci gives round211's stack-backtrace lines no tee class: "
                           "twelve lines per kill would land in the ring uncounted and could push out "
                           "the exec/exit pairs")
-        if "CloverSdhci r211: panic tail lines=%u unseen=%u bufx=%d" not in sdhci_source:
-            errors.append("drivers/CloverSdhci has no round211 panic-time tail read: a boot whose "
-                          "block path stops would again take the kernel ring with it")
+        if "CloverSdhci r212: panic tail lines=%u unseen=%u bufx=%d tee=%u boot=%u" not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no round212 panic-time tail read: a boot whose "
+                          "block path stops would again take the kernel ring with it, and without "
+                          "the boot id a tail line could not be attributed to this boot")
         if "append_rc=%u\\n" not in sdhci_source:
             errors.append("the round211 tail status row drops panicAppendText's return code: a sink "
                           "that could not take the panic's own sentence would look like a silent one")
         if "panicTailRead ();" not in sdhci_source:
             errors.append("drivers/CloverSdhci never calls the round209 tail read from the panic "
                           "drain: the sink would not select it")
+        # Round212. The round209 tail read was gated on gTeeReady, and on the one boot it mattered
+        # the gate explained nothing: the ring was armed, the sink was silent, and the unchanged
+        # card could not say whether the read had even run. Three things replace that silence --
+        # the boot counter (so a record names its boot instead of being inferred), an ungated tail
+        # read, and a probe ring the kernel can reach while the process is still alive.
+        for needle, why in (
+                ("static const uint32_t kBootRecordOffset = 192 + 2 * 512;",
+                 "round212's boot record is not one block past the kernel ring, where the reader "
+                 "looks and where the dump stops"),
+                ("static const uint32_t kBootKind = 24;",
+                 "no kind names the boot record, so a stale counter would read as a record"),
+                ("static const uint32_t kProbeKind = 25;",
+                 "no kind names a relayed probe line, so it could not be told from a verdict"),
+                ("static uint32_t bootIdClaim (uint32_t lba)",
+                 "no boot counter: two boots' records would still be inferred apart by guessing"),
+                ("gBootId = bootIdClaim (entryLdFirst + kBootRecordOffset);",
+                 "the boot counter is not claimed when the window arms, so it would be read "
+                 "before it was ever written"),
+                ("CloverSdhci r212: boot id=%u record=%u probe slots=%u text=%u",
+                 "no arming line names the boot id: a card could not say which boot wrote it"),
+                ("gRingBlock[9] = gBootId;",
+                 "two-block records do not carry the boot id in word 9"),
+                ('extern "C" unsigned int clover_emmc_probe_say (const char *text, unsigned int length)',
+                 "no probe entry point: the kernel's kill-point lines could only reach msgbuf, "
+                 "which the panic a minute later has already overwritten"),
+                ("CloverSdhci r212: drain enter boot=%u first=%u panic_first=%u verdict=%u tee=%u ",
+                 "no drain enter line: a silent panic drain could not be told from one that "
+                 "never ran"),
+                ("CloverSdhci r212: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u ",
+                 "no drain exit line: the flush would not report how much it wrote"),
+                ("panicProbeFlush ()",
+                 "the drain never flushes the probe ring"),
+                ("static uint32_t panicRingFlush (uint32_t which)",
+                 "the drain never flushes a ring directly, so a dead tee takes both rings with it"),
+                ("slot = minSeqSlot;",
+                 "the panic window still refuses when full instead of rotating the oldest slot")):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci lacks {needle[:48]!r}: {why}")
+        # The round209 early return is the specific defect round212 removes; naming it keeps a
+        # future edit from putting the gate back where it hid the one silence that mattered.
+        tail = sdhci_source[sdhci_source.find("static void panicTailRead (void)"):
+                            sdhci_source.find("static void panicTailRead (void)") + 4000]
+        if "if (!gTeeReady)" in tail:
+            errors.append("panicTailRead returns early when the tee is not armed: the round212 "
+                          "tail read is meant to run even then, and the boot id is what the "
+                          "silence is now attributed with")
         for needle, why in (
                 ("static const uint32_t kFlightEntryOffset = 32;",
                  "round210's entry region is not at sector 32, where the reader looks"),
@@ -1700,8 +1747,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r211:"):
-        errors.append('[payload] title is not "clover r211: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r212:"):
+        errors.append('[payload] title is not "clover r212: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2096,9 +2143,10 @@ def check_board(errors: list) -> str:
                        "static const uint32_t kRingFlushPerPass[kRingCount] = {4, 8};",
                        "static uint32_t verdictFormat (char *out, uint32_t cap, const char *fmt, va_list args)",
                        "static void sdhciSay (const char *fmt, ...)",
-                       "static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length)",
+                       "static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length,",
+                       "gRingBlock[9] = gBootId;",
                        "static void flushVerdictRing (void)",
-                       "gRingBlock[5] = (which == kRingKernel) ? 22 : 21;",
+                       "gRingBlock[5] = kind ? kind : ((which == kRingKernel) ? 22 : 21);",
                        "gRingBlock[8] = gRingSeq[which];",
                        "const uint32_t lba = gVerdictFirst + kRingOffset[which] +",
                        'IOLog ("%s\\n", line);',
@@ -2255,7 +2303,7 @@ def check_board(errors: list) -> str:
                        "entry[16] == 0x006d0075u && entry[17] == 0x00000070u && entry[18] == 0) {",
                        "__atomic_store_n (&gLogWindowFirst, entryLdFirst, __ATOMIC_RELEASE);",
                        "__atomic_store_n (&gLogWindowSectors, logSectors, __ATOMIC_RELEASE);",
-                       "const uint32_t needed = kRingOffset[kRingKernel] +",
+                       "const uint32_t needed = kBootRecordOffset + 1;",
                        '"CloverSdhci r185: log window armed from GPT first=%u sectors=%u report=%u driver=%u kernel=%u\\n"',
                        '"CloverSdhci r185: logdump entry too small, rings stay disarmed first=%u sectors=%u needed=%u\\n"',
                        '"CloverSdhci r185: no logdump entry at %u..%u found=%u first=%u last=%u, rings stay disarmed\\n"',
@@ -2297,8 +2345,15 @@ def check_board(errors: list) -> str:
                        "VERDICT_SLOTS = 64", "KERNEL_OFFSET = 192", "KERNEL_SLOTS = 512",
                        "LOG_WINDOW_FIRST_LBA = 13320216",
                        'default="clover-log-window.bin"', "default=LOG_WINDOW_FIRST_LBA",
-                       "DUMP_SECTORS = KERNEL_OFFSET + 2 * KERNEL_SLOTS",
-                       '"--verdict"', 'struct.unpack_from("<9I", block)',
+                       "DUMP_SECTORS = BOOT_OFFSET + 1",
+                       "BOOT_OFFSET = KERNEL_OFFSET + 2 * KERNEL_SLOTS",
+                       "BOOT_KIND = 24", "PROBE_KIND = 25",
+                       '24: "boot-24", 25: "probe-25"',
+                       "def decode_boot(data, first_lba)",
+                       '"--boot"', '"--probe"',
+                       'struct.unpack_from("<10I", block)',
+                       "expects and kind not in expects",
+                       '"--verdict"',
                        "order_by_seq=kind is not None", "def selftest()"):
             if needle not in text:
                 errors.append(f"{reader.name} lacks {needle[:40]}...: a ring's slots, its place in the "
@@ -2315,7 +2370,7 @@ def check_board(errors: list) -> str:
         # a ring, so what is asserted is that each ring holds only its own kind, and that reading a
         # driver record from the kernel ring is reported rather than silently trusted.
         for needle in ('DRIVER_PREFIX = b"CloverSdhci "', "def producer(content)",
-                       '"--tee"', '"--driver"', "expect_kind is not None and kind != expect_kind",
+                       '"--tee"', '"--driver"', "expects and kind not in expects",
                        'assert all(producer(record[2]) == "kernel" for record in kernel), kernel',
                        'assert [record for record in kernel if producer(record[2]) == "driver"] == [], kernel'):
             if needle not in text:
@@ -2332,7 +2387,8 @@ def check_board(errors: list) -> str:
                        if (base / "scripts/run-clover-unattended.sh").is_file()), None)
     if unattended is not None:
         text = unattended.read_text()
-        for needle in ("bs=512 count=1216", "622592", "--verdict", "verdict line(s)"):
+        for needle in ("bs=512 count=1217", "623104", "--verdict", "--probe", "--boot",
+                       "verdict line(s)"):
             if needle not in text:
                 errors.append(f"{unattended.name} lacks {needle[:32]}...: the dd would stop short of one "
                               "of the two rings and that ring would never be read")
@@ -2357,7 +2413,7 @@ def check_board(errors: list) -> str:
         # it, so a gate that compared the first bytes against the record magic rejected a good dump.
         # Round185 adds the third: the window is logdump now, and logfs stays in the list only because
         # the point of reading it is to show that nothing was ever written there.
-        for needle in ('$2 == "recovery"', "dd if=$source bs=512 count=1216 2>/dev/null",
+        for needle in ('$2 == "recovery"', "dd if=$source bs=512 count=1217 2>/dev/null",
                        "/dev/block/bootdevice/by-name/logdump", "/dev/block/mmcblk0p56",
                        "clover-log-window.bin", "no readable log window"):
             if needle not in text:
@@ -2698,8 +2754,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r211:"):
-        errors.append('[payload] title is not "clover r211: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r212:"):
+        errors.append('[payload] title is not "clover r212: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -2799,6 +2855,26 @@ def check_board(errors: list) -> str:
         if not (kill_at < upc_at < skst_at < sbthr_at):
             errors.append(f"{crit_patch.name} places the r211 lines outside the r207 delivery: the "
                           "sender stack and the threads would not be read at the same kill")
+        # Round212. Everything above reaches the card only through msgbuf and the tee, and the boot
+        # that motivated this round killed SpringBoard at 167 s and then sat silent until the 900 s
+        # deadline: by the panic, the ring had wrapped and the tee's tail read said nothing. The
+        # same lines now go to the driver's RAM ring at the moment they are produced, so the panic
+        # is no longer what makes them readable.
+        for needle, why in (
+                ("clover_emmc_probe_say(clover_r207_line",
+                 "the r207 killsig line never reaches the probe ring"),
+                ("clover_emmc_probe_say(clover_r208_line",
+                 "the r208 sender line never reaches the probe ring"),
+                ("clover_emmc_probe_say(clover_r211_line",
+                 "the r211 sender stack line never reaches the probe ring"),
+                ("clover_emmc_probe_say(line, (unsigned int)strlen(line));",
+                 "the per-thread snapshot lines never reach the probe ring"),
+                ("snprintf(clover_r207_line, sizeof(clover_r207_line),",
+                 "the probe line is not bounded, so a long comm could overrun the stack buffer"),
+                ("char clover_r208_line[256];",
+                 "the r208/r211 lines have no bounded buffer to be relayed from")):
+            if needle not in text:
+                errors.append(f"{crit_patch.name} lacks {needle[:44]!r}: {why}")
 
     sig_patch = next((base / "patches/xnu-clover/zzy-clover-exec-sig-bytes.patch"
                       for base in (REPO, pathlib.Path.cwd())

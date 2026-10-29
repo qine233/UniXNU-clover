@@ -380,6 +380,16 @@ static const uint32_t kVerdictTextBytes = 320;
 static const uint32_t kRingRamSlots = 128;   // staging depth; deeper than either card ring
 static const uint32_t kRingCardSlots[kRingCount] = {64, 512};
 static const uint32_t kRingOffset[kRingCount] = {64, 192};   // sectors past logfs start
+// Round212: the boot id's home, one record past the kernel ring (sector 1216). It is not part of
+// either ring: it is rewritten in place once per boot, before any record that carries its number,
+// and the host reads it in the same dd window that reads the rings.
+static const uint32_t kBootRecordOffset = 192 + 2 * 512;
+static const uint32_t kBootKind = 24;
+// Round212: the probe ring's records keep a kind of their own. They share the driver ring's card
+// slots -- 64 records of two blocks -- but not its origin: a kind-21 row is a line the driver said,
+// and telling the host which of the two RAM rings it came from is the difference between "the
+// kernel read this out of msgbuf" and "the kernel wrote this into our BSS before it died".
+static const uint32_t kProbeKind = 25;
 // Records flushed per guarded pass, per ring. Two block writes each, and a flush must not hold the
 // guard long: eight is 16 writes, which at the round159 rates is a few milliseconds.
 static const uint32_t kRingFlushPerPass[kRingCount] = {4, 8};
@@ -394,6 +404,28 @@ static uint32_t gRingSeq[kRingCount];       // stamped in word 8 so a wrapped ri
 static uint32_t gRingWritten[kRingCount];
 static volatile uint32_t gRingBusy[kRingCount];
 static volatile uint32_t gVerdictReady = 0;   // driver ring: armed with the logfs window
+
+// Round212: every record carries the boot that wrote it. Round211's frame could not tell the r184
+// drain line -- which says a drain ran and wrote four records -- from a line an earlier boot left in
+// the same slot, and the two readings lead to opposite next rounds. The id is the low half of the
+// generic counter at the moment the rings were armed: the same number for every line this boot
+// writes, and no other boot's. It is stamped in word 9 of every record, kind 20..23 alike.
+static uint32_t gBootId = 0;
+
+// Round212: where the kernel's probe lines land when the block path is dead. Round211's frame put
+// the SIGKILL at 457 s and the block guard's loss at 341 s, and the panic tail read could not carry
+// the kill forward because a 16 KiB msgbuf holds a few seconds of a chatty boot. So the kernel probe
+// writes straight into this RAM ring (a memcpy into the driver's BSS: no block request, no guard,
+// no msgbuf, no tee), and the panic drain is what puts it on the card. 32 slots of 256 bytes are
+// what a kill's thread list needs; the seal word is written last and compared on read, so a drain
+// that races a writer skips the one record rather than writing half of it.
+static const uint32_t kProbeSlots = 32;
+static const uint32_t kProbeTextBytes = 256;
+static char gProbeText[kProbeSlots][kProbeTextBytes];
+static uint32_t gProbeArm[kProbeSlots];   // slot number + 1; written after the text, read as a seal
+static volatile uint32_t gProbeSeq = 0;   // next slot number to hand out
+static volatile uint32_t gProbeDropped = 0;   // records the ring overwrote before a drain
+static uint32_t gProbeFlushed = 0;        // records this drain put on the card
 
 // Round210: the flight region. Round209 proved the kernel was alive at the 900 s deadline while the
 // card accepted nothing -- the report window got no record and the rings got no drain -- so the one
@@ -2756,13 +2788,42 @@ static void kernelRingPush (const char *line, uint32_t length)
   ringPush (kRingKernel, line, length);
 }
 
+// Round212: the one way into the probe ring. The kernel probe (patched print sites in kern_sig.c
+// and task.c) calls this by name; the driver is linked into the kernel, so there is no address to
+// patch and nothing to keep in sync. A caller can be any thread on any CPU, which is why the only
+// shared state is the slot counter: each caller takes a distinct number, writes its text, then
+// seals the slot with that number. A slot whose seal is not the number the reader expects was
+// overwritten between the two steps, and the drain skips it rather than writing half a line.
+extern "C" unsigned int clover_emmc_probe_say (const char *text, unsigned int length)
+{
+  if (!text || !length) {
+    return 0;
+  }
+  if (length > kProbeTextBytes - 1) {
+    length = kProbeTextBytes - 1;
+  }
+  const uint32_t seq = __atomic_fetch_add (&gProbeSeq, 1u, __ATOMIC_RELAXED);
+  const uint32_t slot = seq % kProbeSlots;
+  if (seq >= kProbeSlots) {
+    __atomic_fetch_add (&gProbeDropped, 1u, __ATOMIC_RELAXED);
+  }
+  for (uint32_t i = 0; i < length; i++) {
+    gProbeText[slot][i] = text[i];
+  }
+  gProbeText[slot][length] = '\0';
+  __atomic_store_n (&gProbeArm[slot], seq + 1, __ATOMIC_RELEASE);
+  return seq + 1;
+}
+
 // One LOG1 record, same shape as mode 17 and the panic writer: header block then text block, byte
 // sum over prefix + body + newline. Word 8 carries the sequence number, which is what makes a
 // wrapped ring orderable: slot index alone stops being time once a ring has more records than slots.
 // Word 5 carries the ring's own kind -- 21 for the driver's verdicts, 22 for the kernel lines the tee
 // lifted -- because the host reads two rings out of one dd and a record has to say which one it came
-// from before anything else about it is trusted.
-static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length)
+// from before anything else about it is trusted. Word 9 is the boot id, so a record left by an
+// earlier boot in a slot this one has not reached is not read as this boot's.
+static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length,
+                             uint32_t kind = 0)
 {
   const uint32_t body = length > 480 ? 480 : length;
   const uint32_t total = kLogPrefixLength + body + 1;
@@ -2786,10 +2847,11 @@ static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length)
   gRingBlock[2] = lba;
   gRingBlock[3] = total;
   gRingBlock[4] = sum;
-  gRingBlock[5] = (which == kRingKernel) ? 22 : 21;
+  gRingBlock[5] = kind ? kind : ((which == kRingKernel) ? 22 : 21);
   gRingBlock[6] = body;
   gRingBlock[7] = gRingCursor[which] % kRingCardSlots[which];
   gRingBlock[8] = gRingSeq[which];
+  gRingBlock[9] = gBootId;
   uint32_t rsp = 0, rstatus = 0, polls = 0;
   if (!writePioBlock (lba, gRingBlock, words, status)) {
     return false;
@@ -2818,6 +2880,40 @@ static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length)
   gRingSeq[which]++;
   gRingWritten[which]++;
   return true;
+}
+
+// Round212: the boot id, one record forward from the last boot's. A counter in RAM cannot survive
+// the reset the port is chasing, and the generic counter's low half wraps every 223 s at 19.2 MHz
+// -- a window two boots in a row can land in. So the previous id is read back from the record past
+// the kernel ring, this boot takes one more, and writes it back before any record carries it. A
+// card that has never held one, or a record that fails its own magic, starts the count at 1. The
+// record is one block and its payload is the number in the header's word 9, which is all a nonzero
+// byte sum needs; a second block would add a write to a boot that already costs one.
+static uint32_t bootIdClaim (uint32_t lba)
+{
+  uint32_t words = 0, status = 0, rsp = 0, rstatus = 0, polls = 0;
+  uint32_t boot = 1;
+  if (readPioBlock (lba, gReadBlock, words, status) &&
+      gReadBlock[0] == kLogMagic0 && gReadBlock[1] == kLogMagic1 &&
+      gReadBlock[5] == kBootKind) {
+    boot = gReadBlock[9] + 1;
+    if (boot == 0) {
+      boot = 1;
+    }
+  }
+  for (uint32_t i = 0; i < kBlockWords; i++) {
+    gRingBlock[i] = 0;
+  }
+  gRingBlock[0] = kLogMagic0;
+  gRingBlock[1] = kLogMagic1;
+  gRingBlock[2] = lba;
+  gRingBlock[5] = kBootKind;
+  gRingBlock[9] = boot;
+  if (!writePioBlock (lba, gRingBlock, words, status)) {
+    return boot;
+  }
+  waitCardReady (rsp, rstatus, polls);
+  return boot;
 }
 
 // ------------------------------------------------------------- round210: the flight region
@@ -3228,9 +3324,8 @@ static void teeKernelLog (void)
 // cannot: zero means the kernel's own buffer also stopped growing (the kernel is not merely quiet on
 // the card), and a large number with a tail that keeps going means the kernel was still logging and
 // only the card path stopped.
-static const uint32_t kPanicTailLines = 24;      // newest complete lines pushed to the kernel ring
+static const uint32_t kPanicTailLines = 48;      // newest complete lines pushed to the kernel ring
 static const uint32_t kPanicTailAlways = 3;      // newest lines kept even when their class is noise
-static const uint32_t kPanicTailScanBytes = 16384;
 
 // The panic sink's voice: formats once and pushes the line into the driver ring. Round209 pushed it
 // into the kernel ring because the line is about the kernel's buffer, but the kernel ring's only
@@ -3254,9 +3349,6 @@ static bool panicTailNoise (const char *line, uint32_t length)
 
 static void panicTailRead (void)
 {
-  if (!gTeeReady) {
-    return;
-  }
   struct msgbuf *buffer = msgbufp;
   const int magic = buffer ? buffer->msg_magic : 0;
   const int size = buffer ? buffer->msg_size : 0;
@@ -3277,8 +3369,11 @@ static void panicTailRead (void)
     reason = 5;
   }
   if (reason) {
-    panicTailSay ("CloverSdhci r211: panic tail refused reason=%u magic=0x%x size=%d bufx=%d\n",
-                  reason, magic, size, bufx);
+    panicTailSay ("CloverSdhci r212: panic tail refused reason=%u magic=0x%x size=%d bufx=%d "
+                  "tee=%u boot=%u\n",
+                  reason, magic, size, bufx,
+                  static_cast<unsigned int> (gTeeReady),
+                  static_cast<unsigned int> (gBootId));
     return;
   }
 
@@ -3298,7 +3393,7 @@ static void panicTailRead (void)
   uint32_t segEnd = stop;
   bool newest = true;                 // bytes past the last newline: start is not knowable
   uint32_t stepped = 0;
-  while (stepped < kPanicTailScanBytes && taken < kPanicTailLines) {
+  while (stepped < sizeu && taken < kPanicTailLines) {
     if (pos == 0) {
       pos = sizeu;
     }
@@ -3341,9 +3436,12 @@ static void panicTailRead (void)
     kernelRingPush (text, lineLength);
   }
 
-  panicTailSay ("CloverSdhci r211: panic tail lines=%u unseen=%u bufx=%d cursor=%u size=%u "
-                "lap=%u refused=%u pend=%u drop=%u guard=%u last=%ums cache=%u append_rc=%u\n",
+  panicTailSay ("CloverSdhci r212: panic tail lines=%u unseen=%u bufx=%d tee=%u boot=%u "
+                "cursor=%u size=%u lap=%u refused=%u pend=%u drop=%u guard=%u last=%ums "
+                "cache=%u append_rc=%u\n",
                 taken, unseen, bufx,
+                static_cast<unsigned int> (gTeeReady),
+                static_cast<unsigned int> (gBootId),
                 static_cast<unsigned int> (gTeeIndex), sizeu,
                 static_cast<unsigned int> (gTeeLap), static_cast<unsigned int> (gTeeRefused),
                 static_cast<unsigned int> (gRingPending[kRingKernel]),
@@ -3373,53 +3471,107 @@ static void panicTailRead (void)
 static const uint32_t kPanicTeePasses = 8;      // 8 * kTeeScanPerPass = 32 KiB of log buffer
 static const uint32_t kPanicDrainCap = 48;      // newest records kept, per ring
 
+// Round212: one ring's records to the card, oldest first, keeping the newest kPanicDrainCap and
+// stopping at the first write the card refuses. Returns what it wrote.
+static uint32_t panicRingFlush (uint32_t which)
+{
+  uint32_t wrote = 0;
+  while (gRingPending[which] > kPanicDrainCap) {
+    // Oldest first is the read order (slot = gRingWrite - gRingPending), so shrinking the pending
+    // count from the front is what drops the front.
+    gRingPending[which]--;
+    gPanicDrainDropped++;
+  }
+  gRingBusy[which] = 1;
+  while (gRingPending[which]) {
+    const uint32_t slot = (gRingWrite[which] - gRingPending[which]) % kRingRamSlots;
+    if (!ringWriteRecord (which, gRingText[which][slot], gRingLength[which][slot])) {
+      break;
+    }
+    gRingPending[which]--;
+    wrote++;
+  }
+  gRingBusy[which] = 0;
+  return wrote;
+}
+
+// Round212: the probe ring straight to the card as driver-ring records. It runs before the RAM
+// rings because these are the lines a dead block path cannot otherwise cost: the kernel wrote them
+// into this driver's BSS, so nothing about them depends on the guard, the msgbuf or the tee. A
+// slot whose seal is not the number this loop expects was overwritten between the writer's text
+// copy and its seal store, and that one record is skipped rather than written half-formed.
+static uint32_t panicProbeFlush (void)
+{
+  const uint32_t seen = __atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED);
+  const uint32_t first = (seen > kProbeSlots) ? seen - kProbeSlots : 0;
+  uint32_t wrote = 0;
+  for (uint32_t seq = first; seq < seen; seq++) {
+    const uint32_t slot = seq % kProbeSlots;
+    if (__atomic_load_n (&gProbeArm[slot], __ATOMIC_ACQUIRE) != seq + 1) {
+      continue;
+    }
+    uint32_t length = 0;
+    while (length < kProbeTextBytes - 1 && gProbeText[slot][length]) {
+      length++;
+    }
+    if (!length) {
+      continue;
+    }
+    if (!ringWriteRecord (kRingDriver, gProbeText[slot], length, kProbeKind)) {
+      break;
+    }
+    wrote++;
+  }
+  gProbeFlushed += wrote;
+  return wrote;
+}
+
 static void panicDrainRings (void)
 {
   if (gPanicDrained || !gVerdictFirst || !gHost) {
     return;
   }
   gPanicDrained = 1;
+  // Round212: the entry is said before anything that can refuse. Round211's frame read an r184
+  // line claiming four records and could not tell whether that drain had run on this boot at all;
+  // this line names every input the drain decides from, and the boot id in its record covers the
+  // rest.
+  panicTailSay ("CloverSdhci r212: drain enter boot=%u first=%u panic_first=%u verdict=%u tee=%u "
+                "append_rc=%u probe_seen=%u\n",
+                static_cast<unsigned int> (gBootId),
+                static_cast<unsigned int> (gVerdictFirst),
+                static_cast<unsigned int> (gPanicLogFirst),
+                static_cast<unsigned int> (gVerdictReady),
+                static_cast<unsigned int> (gTeeReady),
+                static_cast<unsigned int> (gPanicAppendRc),
+                static_cast<unsigned int> (__atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED)));
   for (uint32_t pass = 0; pass < kPanicTeePasses; pass++) {
     teeKernelLog ();
   }
   // Round209: after the tee has had its passes, read the buffer from the sink's side. On a boot
   // whose block path stopped, these passes find nothing and this is the only reading left.
   panicTailRead ();
+  gPanicDrainWritten += panicProbeFlush ();
   for (uint32_t which = 0; which < kRingCount; which++) {
     if (which == kRingKernel ? !gTeeReady : !gVerdictReady) {
       continue;
     }
-    while (gRingPending[which] > kPanicDrainCap) {
-      // Oldest first is the read order (slot = gRingWrite - gRingPending), so shrinking the pending
-      // count from the front is what drops the front.
-      gRingPending[which]--;
-      gPanicDrainDropped++;
-    }
-    gRingBusy[which] = 1;
-    while (gRingPending[which]) {
-      const uint32_t slot = (gRingWrite[which] - gRingPending[which]) % kRingRamSlots;
-      if (!ringWriteRecord (which, gRingText[which][slot], gRingLength[which][slot])) {
-        break;
-      }
-      gRingPending[which]--;
-      gPanicDrainWritten++;
-    }
-    gRingBusy[which] = 0;
+    gPanicDrainWritten += panicRingFlush (which);
   }
   // The drain has to be readable as a drain: a host that finds a quiet ring cannot otherwise tell "it
   // was empty" from "it ran and the card said no". teeSay only queues, and the ring it queues into was
   // drained above, so the one record is written here rather than left for a flush that will not come.
   teeSay ("CloverSdhci r184: panic drain wrote=%u dropped=%u tee_passes=%u\n",
           gPanicDrainWritten, gPanicDrainDropped, kPanicTeePasses);
-  while (gRingPending[kRingDriver]) {
-    const uint32_t slot = (gRingWrite[kRingDriver] - gRingPending[kRingDriver]) % kRingRamSlots;
-    if (!ringWriteRecord (kRingDriver, gRingText[kRingDriver][slot],
-                          gRingLength[kRingDriver][slot])) {
-      break;
-    }
-    gRingPending[kRingDriver]--;
-    gPanicDrainWritten++;
-  }
+  // Round212: the exit line is queued before the last flush so it rides with it, and it repeats the
+  // boot id: a pair of lines with the same id is one boot's drain seen from both ends.
+  panicTailSay ("CloverSdhci r212: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u "
+                "probe=%u probe_drop=%u probe_pend=%u\n",
+                static_cast<unsigned int> (gBootId), gPanicDrainWritten, gPanicDrainDropped,
+                kPanicTeePasses, gProbeFlushed,
+                static_cast<unsigned int> (__atomic_load_n (&gProbeDropped, __ATOMIC_RELAXED)),
+                static_cast<unsigned int> (gRingPending[kRingDriver]));
+  gPanicDrainWritten += panicRingFlush (kRingDriver);
 }
 
 // Round159: the write mirror of readMultiBlock. One CMD25 for several consecutive blocks, then// CMD12 with the busy spelling. The FIFO is level-gated rather than paced: below 26 MHz the card
@@ -5747,14 +5899,19 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
             __atomic_store_n (&gLogWindowFirst, entryLdFirst, __ATOMIC_RELEASE);
             __atomic_store_n (&gLogWindowSectors, logSectors, __ATOMIC_RELEASE);
             // The tee ring is the deepest user: 512 records at two blocks each, from sector 192.
-            const uint32_t needed = kRingOffset[kRingKernel] +
-                                    2 * kRingCardSlots[kRingKernel];
+            // Round212 adds the boot-id record one sector past it, so the window has to cover that
+            // too: a card two sectors short would take the id over the partition's end.
+            const uint32_t needed = kBootRecordOffset + 1;
             if (logSectors >= needed) {
               gPanicLogFirst = entryLdFirst;
               gPanicLogReady = 1;
               gVerdictFirst = entryLdFirst;
               gVerdictReady = 1;
               gTeeReady = 1;
+              // Round212: claimed before the first line this boot writes, and read back from the
+              // card, so no two boots share it and a record left in a ring slot by an earlier boot
+              // cannot pass for this one's.
+              gBootId = bootIdClaim (entryLdFirst + kBootRecordOffset);
               // Said out loud because it is the precondition of every reading after it: a dd that
               // comes back with no verdict records has to be able to tell "never armed" from
               // "armed and then never flushed by a request that finished".
@@ -5776,6 +5933,11 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
                         msgbufp ? msgbufp->msg_bufc : nullptr,
                         msgbufp ? msgbufp->msg_size : 0,
                         msgbufp ? msgbufp->msg_bufx : -1);
+              // Round212: the number every record of this boot carries, so the host can tell this
+              // boot's drain line from one an earlier boot left in the same slot -- the ambiguity
+              // round211's frame ended on.
+              sdhciSay ("CloverSdhci r212: boot id=%u record=%u probe slots=%u text=%u\n",
+                        gBootId, entryLdFirst + kBootRecordOffset, kProbeSlots, kProbeTextBytes);
               // Round198. Round197's frame reset itself at 238 s, mid-CloverBlock-write, and left
               // no panic record: the reset never reached the screen that marks it. So the mark is
               // written here instead, before anything that can reset the board runs. The card is
@@ -7176,7 +7338,8 @@ static unsigned int panicMarkRecovery (void)
 // mode 20 is the reader, and a failure now must not hang the only screen this board has.
 //
 // Body is capped at 480 bytes so prefix + body + newline fits one block. Returns 100 + slot after
-// both blocks were written, or 1..5 naming the stage that refused.
+// both blocks were written, or 1, 2, 4 or 5 naming the stage that refused. (3 used to mean "window
+// full"; round212 rotates instead, so it is never returned.)
 static unsigned int panicAppendText (const char *text, unsigned int length)
 {
   if (!gPanicLogReady || !gHost || !gPanicLogFirst || !text) {
@@ -7184,17 +7347,30 @@ static unsigned int panicAppendText (const char *text, unsigned int length)
   }
   uint32_t slot = 0, words = 0, status = 0;
   bool ok = true;
+  uint32_t maxSeq = 0;
+  uint32_t minSeq = 0xffffffffu, minSeqSlot = 0;
   for (slot = 0; slot < kLogSlots; slot++) {
     ok = readPioBlock (gPanicLogFirst + 2 * slot, gReadBlock, words, status);
     if (!ok || (gReadBlock[0] != kLogMagic0 || gReadBlock[1] != kLogMagic1)) {
       break;
+    }
+    // Round212: the window rotates instead of refusing. Word 8 is the record's turn, so a window
+    // full of earlier panics gives its oldest record to this one rather than returning 3 and
+    // leaving the reading off the card. Records older than round212 all carry 0 here, which makes
+    // slot 0 the first to go, the same slot the old scan would have refused.
+    if (gReadBlock[8] < minSeq) {
+      minSeq = gReadBlock[8];
+      minSeqSlot = slot;
+    }
+    if (gReadBlock[8] > maxSeq) {
+      maxSeq = gReadBlock[8];
     }
   }
   if (!ok) {
     return 2;
   }
   if (slot >= kLogSlots) {
-    return 3;
+    slot = minSeqSlot;
   }
   if (length > 480) {
     length = 480;
@@ -7222,6 +7398,8 @@ static unsigned int panicAppendText (const char *text, unsigned int length)
   gWriteBlock[5] = 20;   // written by the panic screen, not by a report pass
   gWriteBlock[6] = body;
   gWriteBlock[7] = slot;
+  gWriteBlock[8] = maxSeq + 1;   // this record's turn in the rotating window
+  gWriteBlock[9] = gBootId;
 
   uint32_t rsp = 0, rstatus = 0, polls = 0;
   bool headerOk = writePioBlock (lba, gWriteBlock, words, status);

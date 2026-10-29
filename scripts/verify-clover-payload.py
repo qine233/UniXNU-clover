@@ -817,15 +817,34 @@ def check_panic_tail_read(kernel: bytes) -> bool:
     the sink is the one writer left, so the image has to carry the backwards scan and its status
     row -- `unseen` is what separates a stopped kernel from a stopped card path. It has to keep the
     r184 drain line, which is the record that the drain ran at all. Round211 adds `append_rc`: the
-    status row is the only place where the sink's own verdict on the panic sentence survives."""
+    status row is the only place where the sink's own verdict on the panic sentence survives.
+    Round212 adds the two halves that make a silent drain attributable: the enter/exit pair and the
+    boot id in every row, plus the probe ring the kernel's kill-point lines are relayed into."""
     label = "kernel.macho: panic-time log tail linked"
-    found = {"tail": (b"CloverSdhci r211: panic tail lines=%u unseen=%u bufx=%d cursor=%u "
-                      b"size=%u lap=%u refused=%u pend=%u drop=%u guard=%u last=%ums cache=%u "
-                      b"append_rc=%u\n") in kernel,
-             "refused": (b"CloverSdhci r211: panic tail refused reason=%u magic=0x%x size=%d "
-                         b"bufx=%d\n") in kernel,
+    found = {"tail": (b"CloverSdhci r212: panic tail lines=%u unseen=%u bufx=%d tee=%u boot=%u "
+                      b"cursor=%u size=%u lap=%u refused=%u pend=%u drop=%u guard=%u last=%ums "
+                      b"cache=%u append_rc=%u\n") in kernel,
+             "refused": (b"CloverSdhci r212: panic tail refused reason=%u magic=0x%x size=%d "
+                         b"bufx=%d tee=%u boot=%u\n") in kernel,
+             "enter": (b"CloverSdhci r212: drain enter boot=%u first=%u panic_first=%u "
+                       b"verdict=%u tee=%u append_rc=%u probe_seen=%u\n") in kernel,
+             "exit": (b"CloverSdhci r212: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u "
+                      b"probe=%u probe_drop=%u probe_pend=%u\n") in kernel,
              "kept-r184": (b"CloverSdhci r184: panic drain wrote=%u dropped=%u tee_passes=%u\n")
                           in kernel}
+    ok = all(found.values())
+    detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
+                       for name, yes in found.items())
+    print(f"{label:42} {'OK' if ok else 'FAIL'} ({detail})")
+    return ok
+
+
+def check_boot_record(kernel: bytes) -> bool:
+    """Round212's counter is the one reading that survives a card carrying two boots: every
+    two-block record names its boot, so a drain line in a reused slot can be attributed."""
+    label = "kernel.macho: r212 boot counter armed"
+    found = {"boot-id": (b"CloverSdhci r212: boot id=%u record=%u probe slots=%u text=%u\n")
+                        in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
@@ -1309,6 +1328,7 @@ def report(image: pathlib.Path) -> int:
         ok &= check_cache_ownership(kernel)
         ok &= check_critical_exit_probe(kernel)
         ok &= check_panic_tail_read(kernel)
+        ok &= check_boot_record(kernel)
         ok &= check_flight_region(kernel)
         ok &= check_signal_desc_probe(kernel)
         ok &= check_user_breakpoint_probe(kernel)
