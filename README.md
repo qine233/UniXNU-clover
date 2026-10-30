@@ -4,10 +4,25 @@
 ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。
 配套固件仓库 `uefi-clover`（Mu-Silicium 移植），驱动与硬件常量在 `porting.toml`。
 
-现状一句话：**屏幕开始出真正的新帧，SpringBoard 第二代活满了整个观察窗**——XNU 起来、三卷全挂、
-launchd 把守护进程拉起来；boot 17（r228，死线 1800 s）里 pid 213 的 SpringBoard 从 ~500 s 一直
-活着推进到 1771 s：发给 lsd 的请求等到了回信，卡点移到 backboardd；r180 在 1468 s 接受
-`swap#4`、随后两帧全屏 `box=0x0..1199x1919`——653 s 无新帧的旧停滞被翻篇。
+现状一句话：**桌面卡点不是「backboardd 不回信」，而是「backboardd 自己也在等下一跳」**——XNU 起来、
+三卷全挂、launchd 把守护进程拉起来。boot 18（r229，死线 1800 s）里内核第一次读到对面：pid 58
+backboardd 被采样到的 4 个线程全部 `TH_WAIT`、continuation 精确命中
+`_ipc_mqueue_receive_continue`、user pc 与 SpringBoard 卡在同一个 `_mach_msg2_trap` 桩；而
+SpringBoard 发出去的那条消息在它的 port 队列里已经是 `cnt=0`——消息被取走了，接收方转身去等别人。
+
+r229 读数（boot 18）：**两刀都兑现，卡点从「谁不回」变成「它在等谁」。**
+① 环：tee 负过滤报 `fl=233 nag=3166 exit kept=20 dropped=225 comms=16`，512 行窗口从 901 s
+前推到 **779–1812 s**；但新的第一噪声顶了上来——`CloverBlock r190: sync-in/sync-out`
+占 **241/504 行（48%）**。② 对面：`clover r229: bb t=787 pid=58 n=4 sc=0 act=1 k=24 f=24` 四个线程
+`state=1|65`（`thread.h:479` `TH_WAIT=0x01`、`TH_WAIT_REPORT=0x40`）、`wait=0`、
+`continuation=fffffff00725e2ac = _ipc_mqueue_receive_continue`（本轮内核 `nm` 精确 +0）、
+`pc=1eb448b58` 与 SpringBoard 同一个共享缓存 `_mach_msg2_trap` 桩；同拍
+`sbport … bb nm=3703 cnt=0 ql=6` 与发送侧逐字段相同 → **消息不在 backboardd 的队列里，而 backboardd 在等别人**。
+③ 采样器 24 次配额（每拍 +1）在 787 s 前烧光，环里只剩这一行——下一轮改成「批次签名变化才开火」。
+④ 屏：779–1812 s 只有 1728 s 一行 `r180: client#6 pid=87 … seen=6`，**没有任何
+`swap#`/`frame#`**——boot 17 那两帧全屏不是稳态。⑤ 0 代 pid=26 于 517 s 被杀（`rcdump tot=814`，
+`rce … nm=5d17 c=1 q=6 s=1`，被杀时队列还有 1 条）；1 代 pid=263 从 ≥756 s 到 1778 s 停在同一个
+`rem=3703 → 58:backboardd` 未推进；1800.0 s 死线 panic（ticks=345326）。
 
 r228 读数（boot 17）：**三件仪器全部兑现，桌面卡点收窄为「发给 backboardd 的 `nm=3403` 没人回」。**
 0 代 pid 27 在 497 s 被 backboardd `SIGKILL`，这次的 dump 走驱动 probe 环落了卡：
@@ -60,8 +75,8 @@ r227 改成「内核环里记录、kill 时倒出」，不再从收路径实时�
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **发给 backboardd 的 `nm=3403` 没人回——SpringBoard 卡在它上面** | r228 读数（boot 17）：0 代 pid 27 于 497 s 被杀但 dump 落卡（`rcdump t=497 tot=660`，被杀瞬间还在收）；1 代 pid 213 活到 1771 s：lsd 的 `nm=6003` 在 ~1400–1522 s 间**等到回信**，卡点移到 `58:backboardd` 的 `nm=3403`（`sbport cnt=0 ql=6 seq=3`），无人再杀它，1800 s 死线收场 | r229（已刷，boot 18）：驱动 tee 负过滤砍掉 `fl=…apfs`×141 与 exit 循环×97 这半数噪声，让 1482 s 之后的帧可见；内核按 r224 样法采 backboardd（pid 58）线程与其收队列，回答「3403 在不在 58 队里、58 主线程卡在哪」 |
-| 2 | **屏上有帧了，但还不知道是不是桌面** | r228（boot 17）：1468 s `swap#4 accepted`，1472/1482 s `frame#4/#5` 首次全屏（`pixels=2301667 box=0x0..1199x1919`）；r227 之前帧计数停在 653 s。1482 s 后内容被环噪声挤掉，未见后续帧 | 等第 1 项砍掉噪声后读 1482–1800 s 的帧序列；桌面成形前不动几何/色带 |
+| 1 | **backboardd 收到请求后自己在等下一跳——还不知道是谁** | r229 读数（boot 18）：pid 58 被采样的 4 个线程全部 `TH_WAIT` + `_ipc_mqueue_receive_continue` + 与 SpringBoard 同一个 `_mach_msg2_trap` 桩；同拍 `sbport bb nm=3703 cnt=0` 说明消息已被取走。boot 18 的 SpringBoard（pid 263）从 ≥756 s 到 1778 s 停在同一个 `rem=3703→58:backboardd` 未推进 | r230（设计）：对 backboardd 自己的线程跑 r221/r223 那一套（x16==-47 → copyin 消息头 → 在 58 的 port space 解析 owner），问出「backboardd 在等谁」；采样器改为批次签名变化才开火 |
+| 2 | **1482 s 之后屏上还有没有内容** | r229 读数（boot 18）：779–1812 s 全窗口只有 1728 s 一行 `r180: client#6 pid=87 seen=6`，**没有 `swap#`/`frame#`**；`CloverBlock r190: sync-*` 占环 241/504 行（48%） | r230（设计）：把 r190 sync chatter 并进 tee 负过滤，环起点再往前几百秒；桌面成形前不动几何/色带 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 5 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |

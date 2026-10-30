@@ -17093,3 +17093,44 @@ TWRP，panic 自写 BCB，宿主零 misc 写。四个仪器全部兑现：
    **cache = mmcblk0p49**（承载内核日志环与 kill dump 的位置，历来如此），misc 只读不写、BCB 由
    内核自己落。`fastboot flash cache round229-payload.img` → `fastboot reboot`，
    无人值守脚本 `--boot-after-flash --out round229-log-window.bin` 观察 2100 s。
+
+## round229 读数（boot 18）——backboardd 自己也在等同一条链上的下一跳
+
+1. **环真的干净了，但起点只前进 122 s**。512 行窗口这次覆盖 **779.0–1812.1 s**（r228 是
+   901–1813），驱动计数 `CloverSdhci r229: tee filter fl=233 nag=3166 exit kept=20
+   dropped=225 comms=16`、`drain exit wrote=24 dropped=0 tee_passes=8 probe=19
+   probe_drop=0`。省出来的预算立刻被**新的第一噪声**吃掉：`CloverBlock r190:
+   sync-in/sync-out pending=…` **241/504 行（48%）**。其余：r221 66、r218 45、r222 41、
+   r223 37、r217 27、r188 23、r224 11、**r229 只有 2 行**。
+2. **bb 采样器兑现，但 24 次配额在 787 s 前就烧光**。唯一在环里的一行（t=787）：
+   `clover r229: bb t=787 pid=58 n=4 sc=0 act=1 k=24 f=24` 后跟四个线程
+   `14d:1:0:…:1eb448b58`、`323:65:0:…:1eb448b58`、`347:1:…`、`358:1:…`——
+   `bb_fired` 每拍 +1（4 s 节拍），到 787 s 已 24 次封顶，**此后整条链再无声**。
+   这一行本身信息量极大：三个字段全部对齐——
+   - `wait_event=0`，`continuation=fffffff00725e2ac`；用本轮内核 `nm` 精确命中
+     **`_ipc_mqueue_receive_continue`**（+0）；
+   - `pc=1eb448b58` 与 SpringBoard 卡住线程 r221 打印的 `pc=1eb448b58`（缓存偏移
+     `poff=6b448b58`）**同一个共享缓存桩 = `_mach_msg2_trap`**；
+   - `state=1` 与 `65`：`thread.h:479` 定 `TH_WAIT=0x01`、`TH_WAIT_REPORT=0x40`，
+     即四个线程**全部 TH_WAIT**（不是 r217 那种 TH_RUN）。
+   → **backboardd 没有在处理 SpringBoard 的请求，它自己正阻塞在 mach 消息接收上。**
+3. **消息不在背板队列里**。同一拍的 `clover r229: sbport t=787 bb nm=3703 cnt=0 ql=6
+   seq=3 rn=1707 ms=0 sr=1 rcv=fffffff59977…` 与 779 s 那行 SpringBoard 侧 `rem` 读数
+   **逐字段相同**（同一个 port object）：`cnt=0` = 队列空。
+   合起来：**发送已被接收方取走，接收方转身去等别人**——桌面卡点从「backboardd 不回」
+   升级为「backboardd 在等它的下一跳，而我们现在还不知道是谁」。
+4. **本启动的推进比 boot 17 更差**。0 代 pid=26 于 517 s 被杀，dump 落卡
+   （`rcdump t=517 n=64 tot=814`，`rce … nm=5d17 c=1 q=6 s=1`——被杀时队列里还有 1 条）；
+   1 代 pid=263 从 ≥756 s 一直到 1778 s 停在**同一个**请求上
+   （`rem=3703 … op=40700420e id=0 rn=1e03 rs=4000 ro=58:backboardd` 全程未变），
+   boot 17 那种「lsd 回信后换 backboardd」的推进这一轮没有发生。
+5. **1482 s 之后的屏：答案是「没有」**。整个 779–1812 s 窗口只有一行显示探针
+   `clover r180: client#6 pid=87 type=0 status=00000000 class=IOMobileFramebufferUserClient
+   seen=6`（1728 s），**没有 `swap#`/`frame#`/`copy#`/`retire#`**。boot 17 的
+   1468–1482 s 全屏两帧不是稳态，是 backboardd 当时恰好往前走的产物。
+6. **收尾**：1800.0 s 死线 panic（`ticks=345326`，`elr=fffffff0073cdb98`），另有一条
+   新客户端 pid 87 在 1728 s 建帧缓冲连接。
+7. **r230 方向**：① 把 `CloverBlock r190` 的 sync  chatter 也并进 tee 负过滤（保留前几条 +
+   计数尾行），环起点应能再往前推几百秒；② **采样器改为「批次签名变化才开火」**，
+   并**对 backboardd 自己的线程跑 r221/r223 那一套**（x16==-47 → copyin 消息头 →
+   在 58 的 port space 里解析 `rem` 的 owner），直接问出「backboardd 在等谁」。
