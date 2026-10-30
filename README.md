@@ -9,12 +9,21 @@ launchd 把守护进程拉起来；r202 让 `IOMobileFramebufferLegacy` attach +
 `display-scale=2` 解掉 `FBSDisplayMode` 断言，r206 起 compositor 连续 present
 （`done/presented=4`、每帧 9 216 000 字节），但整屏仍是黑的——SpringBoard 没有把界面画上去，
 启动约 8 分钟后（boot 15 是 532 s）被 backboardd 的系统 shell 看门狗用 `kill(2)` 杀掉。
+boot 16（r227）：SpringBoard 换了三代，C 代健康活到 906 s，被自家 900 s 死线 panic 杀掉。
 
-r227（已构建：内核 `8fbd8b43…`、payload 56 MiB）：**收方向不再实时打印，改成内核里留最近 64 次
-阻塞接收（端口 / 端口集 / 消息 id / 序号 / 远端 / 本地 / 凭证 / 前四个消息字），SpringBoard 被
-`SIGKILL` 时在 `psignal_internal` 一次性倒出；`clover_sb_note_current` 从「只锁存第一颗」改为
-跟随 SpringBoard 重启（原子交换、旧 task 释放、每代采样状态清零，打 `sbtask gen=`）。**
-真机读数待 boot 16 回填。
+r227 读数（boot 16）：**环与锁存都工作；SpringBoard 换了三代，C 代健康活到 906 s，是 900 s
+死线把一次可能成功的启动杀掉。**
+第一代 A 出生即卡：~614.7 s 被 `SIGKILL` 触发 dump（`rcvsum`/`rcv0..31`/A 的 `killsig`/`exit`
+都落在 617.04 s 起的可读窗口之外，A 没留下任何收记录）。B=pid 27 接着正常收：`rcv32 t=614
+tid=0x712` 到 `rcv63 t=636 tid=0x748`，随后 636 s 起停在一个等待上 15.5 s，651.53 s 被
+backboardd `SIGKILL`（`exit pid=27 rv=0x9`）。C=pid 229：653.24 s 锁存
+（`sbtask gen=1 pid=229`），906 s 仍活着且在收（`sbm2 t=906 rem=6c03`、`sbport nm=6c03
+…id=40000000`——boot 15 同款消息这次被取走）。但 906 s 仍无新 UI 帧：r180 帧线停在 653.2 s
+（`retire#4 done=4` 之后无新帧，屏上还是 backboardd 进度条 `client pid=58`），随后 912 s
+自家 900 s 死线 panic 收场。两个仪器缺陷：dump 一次性 guard 被 A 代 kill 消耗，B 代被杀时
+无 dump；dump 边打印边读活环（64 条从 ~614.7 s 打到 649.46 s，晚打印的槽已含 B 代新记录，
+且 620→636 s 的 16 s 空档是 printf 本身慢——其间 r217 五线程采样、watchdogd 崩溃、
+r224/r225 每 4 s 节拍一切照常）。
 
 r226 读数（boot 15）：**kill 现场拿到了——backboardd 传的就是 SpringBoard 的 pid，调用点仍是
 「Killing %@」helper；回信在 480 s 停，之后它一直挂在一个等待上。**
@@ -41,7 +50,7 @@ r227 改成「内核环里记录、kill 时倒出」，不再从收路径实时�
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 活不下来：不渲染，约 500 s 被系统 shell 看门狗杀掉** | r226 读数（boot 15）：532.091901 s backboardd（spid 58）向 pid 27 发 `SIGKILL`。发信线程 `x0=0x1b`（27，被杀的 pid）、`x1=0x9`、`x2=0x1`，`pc=0x1d2975100`（`___kill`+0x8 的 `svc`），`lr=0x100763144`、`x20=0x1006f1000`，`lr−x20=0x72144`——与 r218 同一个「Killing %@」helper 的 `bl _kill` 返回点；`sp` 下 16 个原始栈字（`kraw0/1`）在环里。SpringBoard 回信端口 5203 在 472 s `seq=3`、480 s `seq=11`，此后到 532 s 被杀一直 `cnt=0`；r221 发送面 480/508/525 s 见主线程 `0x104` 以 `rem=5903 rn=1d03` 反复进 `mach_msg2`（5903 端口压着 `bits=0x20111211 sz=0x86 id=0x40000000` 的消息）。**回信在 480 s 停了，之后进程只停在一个等待上**；532.120 s `exit t=10s rv=0x9`，536.135 s `sbgone pid=27` | r227：收方向改为「内核环记录最近 64 次阻塞接收、kill 时整段倒出」，并让 `clover_sb_note_current` 跟随 SpringBoard 重启（已构建，待 boot 16 读数） |
+| 1 | **SpringBoard 活不下来：不渲染，约 500 s 被系统 shell 看门狗杀掉** | r227 读数（boot 16）：三代——A ~614.7 s 出生即卡被杀（无收记录）；B=pid 27 正常收 614–636 s（`rcv32..63`）后停等 15.5 s，651.53 s 被 backboardd `SIGKILL`（`exit pid=27 rv=0x9`）；C=pid 229 健康活到 906 s 仍在收（`sbm2 t=906`、`sbport id=40000000`），但 906 s 仍无新 UI 帧（r180 帧停 653 s），912 s 被自家 900 s 死线 panic 杀掉 | r228：死线 900→1800 s 给 C 代留时间；dump 每代一次（guard 跟 `clover_sb_gen` 重置）；环项加 pid/gen 归属；dump 走驱动 probe 环保证落盘 |
 | 2 | **屏幕上是黑的** | compositor 已连续 present：r226（boot 15）`frame#0..#3`、`copy#1..#3 bytes=9216000`、`retire#4 done=presented=4`；但 2 304 000 像素里 2 262 366 个 `ff000000`，只有 `305x887..755x1029` 那块有变化（41 586 个像素）——那是 backboardd 的引导进度条（`client pid=58`，532.91 s 还在 present），不是桌面 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |

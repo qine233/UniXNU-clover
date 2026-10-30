@@ -16920,5 +16920,45 @@ payload 56 MiB。双闸门全过（`check-clover` 打印 ADT 13556 字节 / 8 �
 rcvb present, sbtask present`）。显示归档对新内核复检 PASS（`build-report.json` 的
 `kernel_sha256` 已是新值）。
 
-**待读数（boot 16）**：`sbtask gen=` 是否出现第二代、`rcvsum tot=` 的量级、`rcv0..63`
-里那条 `id=0x40000000` 消息是从哪个端口、什么时候被取的，以及 `rcvb` 前 32 字节。
+## r227 读数（boot 16）
+
+冷刷 cache、900 s 死线、panic 路径自写 BCB 落 TWRP、宿主读回 logdump 窗口（boot 16：
+48 条 kind-21 判据 + 512 条 kind-22 内核日志 + 1 条 kind-24 boot 计数，无 kind-23
+probe——panic 发生在 probe 排空之前，但内核日志由驱动侧按节拍排空，尾段没丢）。
+
+**三代 SpringBoard，前两代死在老地方，第三代健康，是 900 s 死线把它杀了。**
+
+- **A 代（pid 未知）出生即卡**：~614.7 s 被 `SIGKILL` 触发 dump。msgbuf 窗口从
+  617.04 s 起，`rcvsum` / `rcv0..31` / A 的 `killsig` / `exit` 全在窗口外——A 从
+  出生到被杀没有留下任何收记录（一出生就停在某个等待上，连第一帧 XPC 都没收）。
+- **B 代 = pid 27**：`rcv32 t=614 tid=0x712` 到 `rcv63 t=636 tid=0x748`，两个线程
+  （0x712/0x722，与 r217 采样一致）正常收 614–636 s；636 s 后停在一个等待上 15.5 s，
+  651.532774 s 被 backboardd `SIGKILL`（`exit pid=27 ppid=1 t=12s rv=0x9 comm=SpringBoard`）。
+  boot 15 的停点模式复现：收到 480 s 附近停住、看门狗杀。
+- **C 代 = pid 229**：653.236187 s 锁存（`sbtask gen=1 pid=229 t=653`——gen=1 说明
+  B 是首个锁存，A 从未进 mach trap 即被杀）。906 s 仍活着且在收：`sbm2 t=906 tid=0x7b5
+  rem=6c03`、`sbport t=906 rem nm=6c03 cnt=1 ql=6 h=20111211.110.….b03.40000000`——
+  boot 15 卡在 5903 端口的那条 `id=0x40000000` 消息这次在被取走。
+
+**但 906 s 仍无新 UI 帧**：r180 帧线只有 8 条，最后一条 653.209551 s
+（`retire#4 done=4 presented=4`），之后到 912 s 无新帧；屏上仍是 backboardd 的引导
+进度条（`client pid=58`，651.5 s 还在 present）。随后 912.24 s 自家 900 s 死线 panic
+（`unattended deadline 900 s`）把一次可能成功的启动杀掉——C 代健康存活 254 s，桌面上不上屏
+与「SpringBoard 是否活着」已经解开，但还没有 UI。
+
+**两个仪器缺陷（r228 修）**：
+
+1. **dump 一次性 guard 被 A 代消耗**：`clover_r227_dumped` 静态闩在 ~614.7 s 第一次
+   SpringBoard kill 时置位，B 代 651.5 s 被杀时不再 dump。guard 必须跟 `clover_sb_gen`
+   走——每代一次。
+2. **dump 边打印边读活环，不是快照**：`clover_recv_dump` 打印 `rcv32` 是 617.042562 s、
+   `rcv63` 是 649.460404 s——64 条尾段耗时 32 s，槽与槽间隔 0.07~16 s；晚打印的槽
+   装的是 B 代新记录（t=614..636），早打印的 A 代记录反而被顶出窗口。620.17→636.36 s
+   的 16 s 空档不是控制台被占：其间 r217/r218 对 pid 27 的 5 线程采样（0x103/0x309/
+   0x4be/0x712/0x722，全 kin=2 内核等待）、watchdogd（pid 220）623 s 崩溃
+   （rv=0x5 sig=5，panic-on-crash disabled）、r224/r225 每 4 s 节拍一切照常——就是
+   printf/msgbuf 通道吞吐极低。dump 必须走驱动 probe 环（`clover_emmc_probe_say`）
+   直接落盘，且打印前先锁快照。
+
+**r228 方向**：死线 900→1800 s 给 C 代留足时间；dump 每代一次（guard 跟 gen 重置）；
+环项加 pid/gen 归属；dump 精简版写驱动 probe 环；tee 预算 256→320。
