@@ -1,0 +1,212 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index f58a701..336a501 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10852,11 +10852,38 @@ clover_sb_port_state(task_t task, mach_port_name_t name, const char *tag,
+  * a send right at the same port object, so its queue count says whether the
+  * request backboardd never answered is still sitting in its receiver.
+  */
++/*
++ * Round229/230. Round228 narrowed the stall to one send whose remote owner is
++ * backboardd, and round224 already proved the shape of reading a receiver:
++ * sample that task's own threads. The difference is who is asked. A daemon
++ * can exit while this runs, so the proc reference taken here keeps the task
++ * alive across the walk and every early exit drops it; the task lock is
++ * try-locked so a wedged receiver cannot wedge the SpringBoard sampler; and
++ * the port is read in the sender's space: the name there is a send right at
++ * the same port object, so its queue count says whether the request
++ * backboardd never answered is still sitting in its receiver.
++ *
++ * Round230 changes when this speaks and adds the answer boot 18 could not
++ * give. The caller fires it whenever the blocked request changes, and boot 18
++ * printed 24 identical rows that way: the sender's batch moved, the receiver
++ * did not. The row is now emitted only when the receiver's own state -- the
++ * thread tokens, or the destinations its threads are parked on -- differs
++ * from the last row printed, so the ring carries a change instead of a beat.
++ * The destinations are the new part: a thread of backboardd sitting in
++ * mach_msg2_trap with x16 = -47 is a receiver that became a sender, and its
++ * saved registers name the next hop. The header itself cannot be read here
++ * (copyin only sees the current task's address space, and the current task is
++ * SpringBoard), but the registers are kernel-side, and the names resolve in
++ * backboardd's own space, so the question "who is backboardd waiting on" is
++ * answerable without touching a foreign user buffer.
++ */
+ static void
+ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ {
+ 	static uint32_t bb_fired;
+-	static uint32_t bb_beats;
++	static uint32_t bb_same;
++	static char bb_last[224];
++	static char bb_last_hop[192];
+ 	struct proc *p;
+ 	extern struct proc *proc_find(int pid);
+ 	extern task_t proc_task(struct proc *p);
+@@ -10864,53 +10891,74 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 	task_t task;
+ 	thread_t thr;
+ 	char tokens[224];
++	char hopsig[192];
+ 	char line[320];
++	uint64_t htid[4];
++	uint32_t hrem[4];
++	uint32_t hloc[4];
++	uint32_t hid[4];
++	uint64_t hto[4];
++	uint32_t hn = 0;
++	uint32_t n = 0;
++	unsigned int i;
+ 	int toff = 0;
++	int hoff = 0;
+ 	int len;
+ 	int sc;
+ 	int act;
+-	uint32_t n = 0;
++	int same;
+ 
+ 	if (pid <= 0 || sb_task == TASK_NULL) {
+ 		return;
+ 	}
+-	if (bb_fired >= 24) {
++	if (bb_fired >= 16) {
+ 		return;
+ 	}
+-	bb_fired++;
+ 	p = proc_find(pid);
+ 	if (p == NULL) {
+-		printf("clover r229: bb t=%llu pid=%d n=%u gone\n",
++		printf("clover r229: bb t=%llu pid=%d f=%u gone\n",
+ 		    (unsigned long long)secs, pid, bb_fired);
+ 		return;
+ 	}
+ 	task = proc_task(p);
+ 	if (task == TASK_NULL) {
+ 		proc_rele(p);
+-		printf("clover r229: bb t=%llu pid=%d n=%u notask\n",
++		printf("clover r229: bb t=%llu pid=%d f=%u notask\n",
+ 		    (unsigned long long)secs, pid, bb_fired);
+ 		return;
+ 	}
+ 	if (!lck_mtx_try_lock(&task->lock)) {
+ 		proc_rele(p);
+-		printf("clover r229: bb t=%llu pid=%d n=%u busy\n",
++		printf("clover r229: bb t=%llu pid=%d f=%u busy\n",
+ 		    (unsigned long long)secs, pid, bb_fired);
+ 		return;
+ 	}
+ 	sc = task->suspend_count;
+ 	act = task->active;
+ 	tokens[0] = '\0';
++	hopsig[0] = '\0';
+ 	queue_iterate(&task->threads, thr, thread_t, task_threads) {
+ 		arm_saved_state_t *ss;
+ 		uint64_t pc = 0;
++		uint64_t x16 = 0;
++		uint64_t x[8];
+ 		int wrote;
+ 
+ 		if (n >= 4 || toff >= (int)sizeof(tokens) - 64) {
+ 			break;
+ 		}
++		for (i = 0; i < 8; i++) {
++			x[i] = 0;
++		}
+ 		ss = get_user_regs(thr);
+ 		if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1) {
+ 			pc = (uint64_t)get_saved_state_pc(ss);
++			if (!is_saved_state32(ss)) {
++				x16 = (uint64_t)saved_state64(ss)->x[16];
++				for (i = 0; i < 8; i++) {
++					x[i] = (uint64_t)saved_state64(ss)->x[i];
++				}
++			}
+ 		}
+ 		wrote = snprintf(tokens + toff, sizeof(tokens) - (size_t)toff,
+ 		    " %llx:%d:%llx:%llx:%llx",
+@@ -10924,19 +10972,83 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 		}
+ 		toff += wrote;
+ 		n++;
++		if (x16 != (uint64_t)-47 || hn >= 4) {
++			continue;
++		}
++		wrote = snprintf(hopsig + hoff, sizeof(hopsig) - (size_t)hoff,
++		    " %llx:%x:%x:%x:%llx",
++		    (unsigned long long)thr->thread_id, (uint32_t)x[3],
++		    (uint32_t)(x[3] >> 32), (uint32_t)(x[4] >> 32),
++		    (unsigned long long)x[7]);
++		if (wrote <= 0 || wrote >= (int)(sizeof(hopsig) - (size_t)hoff)) {
++			hopsig[hoff] = '\0';
++			break;
++		}
++		hoff += wrote;
++		htid[hn] = thr->thread_id;
++		hrem[hn] = (uint32_t)x[3];
++		hloc[hn] = (uint32_t)(x[3] >> 32);
++		hid[hn] = (uint32_t)(x[4] >> 32);
++		hto[hn] = x[7];
++		hn++;
+ 	}
++	/*
++	 * The reference taken under the lock is what lets the owner lookups
++	 * below run after the proc reference is dropped: backboardd can exit on
++	 * another cpu at any point in here, and its task must stay allocated
++	 * while its ipc space is being walked.
++	 */
++	task_reference(task);
+ 	lck_mtx_unlock(&task->lock);
+ 	proc_rele(p);
+-	bb_beats++;
++
++	same = (strcmp(tokens, bb_last) == 0) && (strcmp(hopsig, bb_last_hop) == 0);
++	if (same) {
++		bb_same++;
++		task_deallocate(task);
++		return;
++	}
++	strlcpy(bb_last, tokens, sizeof(bb_last));
++	strlcpy(bb_last_hop, hopsig, sizeof(bb_last_hop));
++	bb_fired++;
+ 	len = snprintf(line, sizeof(line),
+-	    "clover r229: bb t=%llu pid=%d n=%u sc=%d act=%d k=%u f=%u%s\n",
+-	    (unsigned long long)secs, pid, n, sc, act, bb_beats, bb_fired,
++	    "clover r229: bb t=%llu pid=%d n=%u sc=%d act=%d f=%u s=%u hops=%u%s\n",
++	    (unsigned long long)secs, pid, n, sc, act, bb_fired, bb_same, hn,
+ 	    tokens);
+ 	if (len > 0) {
+ 		line[sizeof(line) - 1] = '\0';
+ 		printf("%s", line);
+ 	}
+ 	clover_sb_port_state(sb_task, name, "bb", secs, "r229");
++
++	/*
++	 * Round230. Every thread of the receiver that is itself parked in the
++	 * trap, with the destination it is parked on translated in the
++	 * receiver's own space. The first hop's queue is read last: it says
++	 * whether backboardd's own request is still sitting where it was sent.
++	 */
++	for (i = 0; i < hn; i++) {
++		char ro[24];
++		char lo[24];
++
++		clover_sb_port_owner(task, (mach_port_name_t)hrem[i], ro, sizeof(ro));
++		clover_sb_port_owner(task, (mach_port_name_t)hloc[i], lo, sizeof(lo));
++		len = snprintf(line, sizeof(line),
++		    "clover r230: bbhop t=%llu pid=%d tid=0x%llx rem=%x loc=%x id=%x"
++		    " to=%llx ro=%s lo=%s\n",
++		    (unsigned long long)secs, pid,
++		    (unsigned long long)htid[i], hrem[i], hloc[i], hid[i],
++		    (unsigned long long)hto[i], ro[0] ? ro : "-", lo[0] ? lo : "-");
++		if (len > 0) {
++			line[sizeof(line) - 1] = '\0';
++			printf("%s", line);
++		}
++	}
++	if (hn > 0 && hrem[0] != 0) {
++		clover_sb_port_state(task, (mach_port_name_t)hrem[0], "bbq", secs,
++		    "r230");
++	}
++	task_deallocate(task);
+ }
+ /*
+  * One line carries every thread: tid:state:wait:continuation:pc per thread.

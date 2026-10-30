@@ -17134,3 +17134,102 @@ TWRP，panic 自写 BCB，宿主零 misc 写。四个仪器全部兑现：
    计数尾行），环起点应能再往前推几百秒；② **采样器改为「批次签名变化才开火」**，
    并**对 backboardd 自己的线程跑 r221/r223 那一套**（x16==-47 → copyin 消息头 →
    在 58 的 port space 里解析 `rem` 的 owner），直接问出「backboardd 在等谁」。
+
+## r230 构建（发布 v0.5.94）
+
+1. **补丁**：`patches/xnu/zzzzzzzzzzzzzz-clover-r230.patch`（212 行，3 个 hunk，只碰
+   `osfmk/kern/task.c`），同一文件同步到 `patches/xnu-clover/`。`build-xnu-4k-baseline.sh`
+   的 LATE_PATCH 仍把它列为**第一项**：它逐行重写了 r229 加进去的那几行，所以反向剥离必须
+   先剥它——实测在 `.cache/xnu-work` 里 r230 正反 `git apply --check` 都过，而 r229 的
+   反剥检查**已经失败**，这正是排序的依据。
+2. **合成方式**：三件事，逐条对上 boot 18 的三个缺陷。
+   - **开火判据换成「接收方自己变了」**。旧判据由发送方（SpringBoard）的批次变化触发，
+     boot 18 因此打了 24 行**逐字节相同**的 `bb`；现在 `clover_bb_sample` 同时比 `tokens`
+     （四线程 `tid:state:wait:continuation:pc`）和新增的 `hopsig`，两者全同就 `bb_same++`
+     直接返回，`bb_fired` 上限也从 24 降到 16。早退三行（`gone`/`notask`/`busy`）改成带
+     `f=%u`——环里要能分清「配额用尽」和「真没人应答」。
+   - **问出下一跳**。遍历 backboardd 线程时，凡是 saved `x16 == (uint64_t)-47`（r220/r221
+     用的同一个 `mach_msg2_trap` 在飞判据）就记下 `x3` 拆出的 `rem|loc`、`x4` 高位的
+     `msgh_id`、`x7` 的 timeout，最多 4 跳；每跳用 **backboardd 自己的 task** 调
+     `clover_sb_port_owner` 把 `rem`/`loc` 翻成 `pid:name`，打
+     `clover r230: bbhop t=… pid=… tid=… rem=… loc=… id=… to=… ro=… lo=…`，再对 `rem[0]`
+     调 `clover_sb_port_state(task, …, "bbq", secs, "r230")` 读它自己收队列的 `cnt/ql/rcv`。
+     `copyin` 在这里用不了（当前任务仍是 SpringBoard，页表是它的），所以只取内核侧寄存器 +
+     owner/queue 翻译，与 r218 划的界一致。
+   - **生命周期**。`task_reference(task)` 在放 `task->lock` 之前取，`proc_rele(p)` 之后仍可
+     安全走 backboardd 的 space；`line[320]` 与 `tokens[224]`、`hopsig[192]` 分开，避免把
+     表头 snprintf 进它自己的 `%s` 源里（本板反复踩过的坑）。
+3. **驱动**：tee 第 4 条负过滤 `CloverBlock r190: sync-in / sync-out`——先 `teeStampSkip` 剥掉
+   行首时间戳再对 body 做前缀匹配，前 `kTeeSyncKeep = 8` 条保留，之后 `gTeeSyncDropped++`
+   丢弃；drain 尾行加 `CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u`，这样「环起点
+   变晚」和「过滤器没跑」仍可区分。probe 类预算加 `{ "clover r230: ", "r230-hop", 96, … }`
+   （16 次开火 × 每次最多 4 hop + 1 queue，96 够且封顶）。
+   `scripts/build-arm-driver.py CloverSdhci` 在组装树 `-Werror` 通过。
+4. **闸门**：`check-clover.py`（title 升 `clover r230:`、r230 补丁 needles 含 `bbhop` 格式串与
+   双重 strcmp 判据、驱动侧 `kTeeSyncKeep`/前缀/尾行 needles、r230 类断言）与
+   `verify-clover-payload.py`（`bb` 改 `f=%u s=%u hops=%u`、新增 `bbhop`/`tee-sync` 两项）
+   在 `out/clover/tree` 全绿：verify 49 OK / 0 FAIL。
+5. **产物**：增量内核 `0865c508c64d29feed8940d821de612fbbebde8ea929c3a56786d8f3669edea9` →
+   `patch-clover-amfi.py` 两刀仍落在与 r186–r229 相同的站点（文件偏移 0x1abf0e4 / 0x1abf16c）→
+   `normalize-kernel-macho.py` 清掉 968 个 build-uuid 戳 →
+   `round230-kernel-amfi.macho` sha256 `4f5145de58c075b1dcde904c2077d840d4ca8ab2905c0baf23d3a28d84229c75`；
+   payload `round230-payload.img` sha256 `dea875053fabdc528f3bfb9bf67ef94af78a340d9e83842ec0ebe53c32cf3b97`
+   （58,720,256 B）。
+6. **冷刷**：设备先在 TWRP，`adb -s 81ffcaaa reboot bootloader` 回 fastboot；唯一主机写入分区是
+   **cache = mmcblk0p49**，misc 仍只由内核自己的 panic 写 BCB，主机只读。
+   `fastboot flash cache round230-payload.img` → `fastboot reboot`，
+   无人值守脚本 `--boot-after-flash --out round230-log-window.bin` 观察 2100 s（boot 19）。
+
+## round230 读数（boot 19）——对面是「纯接收者」，端口名读错了寄存器
+
+1. **环再前进 130 s，且这次没有新噪声顶上来**。512 行窗口覆盖 **648.6–1813.0 s**（r229 是
+   779–1812）。驱动计数 `CloverSdhci r229: tee filter fl=224 nag=3192 exit kept=20
+   dropped=226 comms=16`、新增的 `CloverSdhci r230: tee sync-in=8 sync-out=8 dropped=347`、
+   `drain exit boot=19 wrote=24 dropped=0 tee_passes=8 probe=19 probe_drop=0 probe_pend=3`。
+   r190 的 sync 对（`pending=` 一个数）被丢掉 **347 条**，前 8+8 条保留；环里最大的类变成
+   内核自己的采样行：r218 98、r223 54、r221 51/42、r222 50、r224 39、r217 34——**是读数，不是噪声**。
+2. **开火判据换对了，但配额仍然是短板**。`bb` 行只剩 7 条（f=10…16，s=10…14，hops=2 恒定），
+   同一批签名不再重复打印——boot 18 那 24 行逐字节相同的情况没有了。可是**16 次配额在 838 s
+   烧光**，此后到 1800 s 死线再也没有 bb 行；boot 19 的接收方行只覆盖 740–838 s。
+   签名为何还在变：tid=0x35a 在 `state=4`（`TH_BLOCKING`）与 `state=1`、pc `1d009c8e8` 与
+   `1d009ca5c` 之间来回摆，`tokens` 每拍都不同。**下一次按「hop 集合」而不是整串 token 判变，
+   再加 120 s 心跳，才能把整段 boot 盖住。**
+3. **hop 行给出的是否定答案：backboardd 的等待线程没有发送半边**。两条在飞的线程
+   tid=0x156 / 0x35e，行是
+   `clover r230: bbhop t=740 pid=58 tid=0x156 rem=0 loc=7f03 id=0 to=ffffffff ro=- lo=-`
+   与 `… tid=0x35e rem=0 loc=0 id=0 to=0 ro=- lo=-`——`rem=0` 表示没有 remote（发送目标），
+   所以它们**不是卡住的发送者，是纯接收**。`loc` 取的是 x3 的高半（mach_msg2 的 `local_name`），
+   而**接收端口名一直在 x5 的高半**（r221 的 `rn=b03` 就是从 x5 高半解出来的），r230 没打 x5，
+   所以这 14 行没回答「在等哪个端口」。`ro=- lo=-` 是同一个原因的另一面：
+   `clover_sb_port_owner` 拿 0x7f03 在 58 的 space 里查不到——`local_name` 不是该 space 里的
+   接收名。**这是本轮的成本最低的一处自纠：下一轮只多打 x5/x6 两个字段。**
+4. **目的端口的户口本：接收名 0x2e2b、队列空、一生进过 3 条**。每拍同行的
+   `sbport t=740 bb nm=4503 cnt=0 ql=6 seq=3 rn=2e2b ms=0 sr=1 rcv=fffffff8dbd5fc40/fffffffaa858e010
+   kobj=0 wq=0 km=0 h=0.0.0.0.0.0`（`kern/task.c` 里 `cnt=imq_msgcount`、`ql=imq_qlimit`、
+   `seq=imq_seqno`、`rn=imq_receiver_name`、`wq=waitq.head`）。三件事同时成立：
+   ① `seq=3`——这个端口一生只进过 3 条消息，**SpringBoard 的那条到过**；
+   ② `cnt=0`——此刻队列空，说明被取走了（或者根本没入队，但 seq 否掉了后者）；
+   ③ `wq=0`——**此刻没有线程挂在这个端口的等待队列上**，而 `rn=2e2b` 正是 58 里对应的接收名。
+   于是问题从「它在等谁」变成「**取走消息的那条线程去哪了**」——它取完就不在这个端口的 waitq 上，
+   也没有把回信发回去。
+5. **新线索：每个进程各有一条线程僵在用户态 unfair lock**。`clover r229: bb` 行里 tid=0x336
+   `state=65`（`TH_WAIT|TH_WAIT_REPORT`）、`wait=fffffff9c1c3ea60`、
+   `continuation=fffffff00773cbac`——用本轮内核 `nm` 精确命中 **`_ulock_wait_continue`**（+0），
+   即 `__ulock_wait`（os_unfair_lock / pthread mutex 的争用等待）；SpringBoard 的 0x916 同形
+   （`wait=fffffff9c1c3e9a0`、同一个 continuation）。两个进程各一条、从出生挂到死线，
+   说明这不是偶发争用，而是**某把锁的持有者一直没释放**。这条线 r231 起单独记：
+   打出 ulock 线程的 `x0`（用户态锁地址）和同一进程里持有者的候选。
+6. **代际**：0 代 pid=27 从 659 s 起到 ~730 s 被杀（`r226 kreg0..4` 全寄存器落卡，killsig 走
+   驱动 ring），1 代 **pid=249** 于 732.2 s 出生（`sbtask gen=1 pid=249`），从 740 s 起主线程
+   停在 `rem=4503 → 58:backboardd`，直到 1797 s 最后一拍**一个字没变**。watchdogd 在 701.7 s
+   被 `SIGKILL`（`crit pid=225 comm=watchdogd rv=0x5 sig=5`）；bluetoothd 因
+   `systemgroup.com.apple.logd_helper.FTABHarvest` 容器缺失反复重启 9 次（234→392）。
+   收件环（r227）里只有 gen=0 的 7 条（`rcv57..63 t=567 pid=27`），gen=1 **零条**。
+7. **屏**：648–1813 s 只有 1409 s 一行 `r180: client#6 pid=87 type=0 status=0
+   class=IOMobileFramebufferUserClient seen=6`，**没有 `swap#`/`frame#`/`copy#`/`retire#`**。
+   1800.0 s 死线 panic（`ticks=336256`、`elr=fffffff0073cdd9c`），boot 19。
+8. **r231 设计**：① hop 行加 `rn=x5高半`、`rs=x6低半`（接收端口名与 rcv_size），
+   在 58 的 space 里对该名跑 `clover_sb_port_owner` 并把它的端口对象与发送侧
+   （`nm=4503` 解析出的对象）**比地址**——同一个对象才说明「消息会被这条线程取走」；
+   ② 开火判据换成 hop 集合 + 心跳、配额提到 96；③ ulock 线程单独一行（`x0` 锁地址 +
+   该进程里 `TH_BLOCKING`/`TH_RUN` 的候选持有者 tid）；④ 环过滤冻结，不再动。

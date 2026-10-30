@@ -933,10 +933,13 @@ def check_sb_sample(kernel: bytes) -> bool:
              "rcdump": (b"clover r228: rcdump t=%llu n=%u tot=%u\n") in kernel,
              "rce": (b"clover r228: rce t=%llu pid=%u gen=%u tid=%llx k=%u") in kernel,
              "sbtask": (b"clover r228: sbtask gen=%u pid=%d t=%llu\n") in kernel,
-             "bb": (b"clover r229: bb t=%llu pid=%d n=%u sc=%d act=%d k=%u f=%u%s\n") in kernel,
-             "bbgone": (b"clover r229: bb t=%llu pid=%d n=%u gone\n") in kernel,
+             "bb": (b"clover r229: bb t=%llu pid=%d n=%u sc=%d act=%d f=%u s=%u hops=%u%s\n") in kernel,
+             "bbgone": (b"clover r229: bb t=%llu pid=%d f=%u gone\n") in kernel,
+             "bbhop": (b"clover r230: bbhop t=%llu pid=%d tid=0x%llx rem=%x loc=%x id=%x"
+                       b" to=%llx ro=%s lo=%s\n") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
-                           b"dropped=%u comms=%u\n") in kernel}
+                           b"dropped=%u comms=%u\n") in kernel,
+             "tee-sync": (b"CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n") in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())

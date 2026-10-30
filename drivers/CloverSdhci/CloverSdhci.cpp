@@ -688,6 +688,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // queue line per batch that names backboardd, and the kernel fires it at most 24 times. 64 holds
   // the whole conversation and still bounds a producer that loops harder than a boot does.
   { "clover r229: ", "r229-bb", 64, 0, 0, 0 },
+  // Round230 adds up to four hop lines and one queue line to each receiver reading the kernel is now
+  // willing to print: the kernel only prints when the receiver changed, and it caps itself at 16 of
+  // those. 96 is 16 fires' worth of hops and queues, so the tail of a wedged boot keeps its own hop
+  // lines instead of losing them to the head of the same class.
+  { "clover r230: ", "r230-hop", 96, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -3517,6 +3522,14 @@ static uint32_t gTeeNagDropped = 0;     // nag lines past two per source
 static uint32_t gTeeExitKept = 0;       // exit lines inside the per-comm budget
 static uint32_t gTeeExitDropped = 0;    // exit lines past the per-comm budget
 
+// Round230: boot 18 re-ran the census after the three filters above, and the ring's new largest
+// resident was CloverBlock's own r190 barrier pair -- 241 of 504 records. Every sync is two lines
+// carrying one number, so the ring again held a metronome instead of the boot.
+static uint32_t gTeeSyncInKept = 0;     // sync-in lines inside the budget
+static uint32_t gTeeSyncOutKept = 0;    // sync-out lines inside the budget
+static uint32_t gTeeSyncDropped = 0;    // either direction past the budget
+static const uint32_t kTeeSyncKeep = 8;
+
 struct TeeExitComm {
   char name[32];
   uint32_t kept;
@@ -3824,6 +3837,27 @@ static void teeConsumeLine (uint32_t &pushed)
       }
       comm->kept++;
       gTeeExitKept++;
+    }
+  }
+  // Round230 filter 4: the r190 barrier. Each sync prints an in-line and an out-line whose only
+  // content is the queue depth it waited on; the first kTeeSyncKeep of each direction say the
+  // barrier runs and how deep it went, the rest of a boot's hundreds are a clock.
+  {
+    const uint32_t unstamped = teeStampSkip (gTeeLine + start, length - start);
+    const uint32_t rest = length - start - unstamped;
+    const char *const body = gTeeLine + start + unstamped;
+    uint32_t *kept = nullptr;
+    if (teeHasPrefix (body, rest, "CloverBlock r190: sync-in ")) {
+      kept = &gTeeSyncInKept;
+    } else if (teeHasPrefix (body, rest, "CloverBlock r190: sync-out ")) {
+      kept = &gTeeSyncOutKept;
+    }
+    if (kept != nullptr) {
+      if (*kept >= kTeeSyncKeep) {
+        gTeeSyncDropped++;
+        return;
+      }
+      (*kept)++;
     }
   }
   if (!teeLineMatches (gTeeLine + start, length - start)) {
@@ -4203,6 +4237,8 @@ static void panicDrainRings (void)
   // on purpose, and the whole point of filtering was to make the ring's coverage readable.
   teeSay ("CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u dropped=%u comms=%u\n",
           gTeeFlDropped, gTeeNagDropped, gTeeExitKept, gTeeExitDropped, gTeeExitCommsUsed);
+  teeSay ("CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n",
+          gTeeSyncInKept, gTeeSyncOutKept, gTeeSyncDropped);
   // Round212: the exit line is queued before the last flush so it rides with it, and it repeats the
   // boot id: a pair of lines with the same id is one boot's drain seen from both ends.
   panicTailSay ("CloverSdhci r212: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u "
