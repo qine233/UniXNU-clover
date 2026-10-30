@@ -17021,3 +17021,43 @@ make 没产出 `ipc_mqueue.o`，第二次运行从 archive 1/15 `build-corecrypt
 sha256 `16b309c62704feb485c2ea949ffe2dbab2bffcc7eb8039a7e247f333feb10337`。
 双闸门通过（check-clover：title 两处断言升到 `clover r228:`；verify 全 OK，
 r217 组含 rcdump/rce/sbtask）。冷刷只 cache（`mmcblk0p49`），宿主等 1800 s 死线落 TWRP。
+
+## round228 读数（boot 17，v0.5.90 上机）
+
+冷刷 cache（mmcblk0p49，58720256 B）后 `run-clover-unattended.sh --boot-after-flash` 一帧跑完
+（默认 wait 2100）：16 report、64 驱动判据、20 probe、512 内核行、`boot 17`。死线
+`unattended deadline 1800 s (ticks=335739) @ArmCpu.cpp:647` 在 1800.16 s 抬头，20 s 复位进
+TWRP，panic 自写 BCB，宿主零 misc 写。四个仪器全部兑现：
+
+1. **r228 的 dump 落卡了**。probe 环里 `rcdump t=497 n=64 tot=660` + 3 条 `rce`
+   （`pid=27 gen=0 tid=103 nm=1e03 q=5 s=30`；`tid=45f nm=2503 id=77303074 sz=68 t=496/495`）：
+   0 代 pid 27 在 497 s 被 backboardd（pid 58）`SIGKILL`（r207 killsig 照旧），被杀瞬间它还在收
+   （最后一条 rce 距 kill 不到 1 s），全程 660 条收记录。r227「A 代吃掉 guard、B 代死得无声」
+   的缺陷没有了。
+2. **1800 s 买到了真正的进展，而且是两条**。
+   - **lsd 那条请求等到了回信**。1 代 pid 213（497 s 后出生）主线程 tid=0x6ec 从 901 s 一直卡在
+     `_mach_msg2_trap` 发送（pc `1cdcecb58`）发给 `115:lsd` 的 `nm=6003`；到 1522 s 的采样里，
+     卡点换成了发给 `58:backboardd` 的 `nm=3403`（`sbport rem nm=3403 cnt=0 ql=6 seq=3 rn=2227
+     sr=1`）——lsd 回了信，SpringBoard 发出了**下一个**请求。它一直活着、一直推进到 1771 s 的
+     最后一拍，没有任何进程再杀它（backboardd 自己也被 3403 拖住，发不出新的 Killing）。
+   - **r180 出现了新的全屏帧**。1468.3 s `swap#4 accepted`（r202 以来第一次走到第 4 个 swap），
+     `frame#3 t=1006s pixels=41517 box=305x887..755x1029`（局部更新，约 96% 黑底），
+     `copy#4 217 ms bytes=9216000` → `scanout#4 ok` → `retire#4 done=4 presented=4 frames=4`，
+     随后 **`frame#4 t=1009s` 与 `frame#5 t=1019s` 都是全屏 `box=0x0..1199x1919`
+     pixels=2301667**。r227 停在 653 s 的帧计数第一次翻篇——屏上真的有内容在换。
+3. **环里快一半是噪声**。512 行内核环覆盖 901–1813 s，其中 `fl=0x14809021 vt=1 fs=apfs` 裸行
+   141 条、`r170: exit`（bluetoothd/fairplayd 循环重启）97 条、CoreAnalyticsHub nag 14 条，
+   合计约 50%。1482 s（frame#5）之后屏上还有没有新帧，被这批噪声挤掉了——本轮唯一没收到的
+   答案就是这个。另有 usermanagerd `unix-path … com.apple.defaults.plist err=2`×6、
+   watchdogd `rv=0x5 ns=2` 987 s 退出、尾段 1812.999 s `r155 hdr main len=685817856 err=0/0`。
+4. **判断**：桌面卡点已从「SpringBoard 收不到回信」收窄为「发给 backboardd 的 `nm=3403` 没人回」。
+   pid 213 活着、在推进、屏在出帧；1800 s 死线（ArmCpu 固定 panic 仪器）杀的是一个大好进程。
+
+## r229 设计（两刀）
+
+1. **驱动 tee 负过滤**（CloverSdhci）：丢弃 `fl=0x14809021 vt=` 裸 apfs 事件行；
+   `handleNagTimerExpiry` 每源只留 2 条；`r170: exit` 按 comm 前 4 条 + 一条计数尾行。腾出的
+   ~250 行让内核环回到 ~400 s 起点，1482 s 之后的帧、213 的下一跳全部可见。
+2. **内核：卡住的发送在对面排队**。当 sbm2 当前请求 `ro=58:backboardd` 时，按 r224 的
+   trylock 采样器样法采 backboardd（pid 58）的线程（各 tid:state:wait:pc），并读它收队列的
+   `ql/rcv`——回答「3403 这条在不在 58 的队里、58 的主线程卡在哪」。死线保持 1800 s。

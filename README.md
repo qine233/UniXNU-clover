@@ -4,12 +4,22 @@
 ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。
 配套固件仓库 `uefi-clover`（Mu-Silicium 移植），驱动与硬件常量在 `porting.toml`。
 
-现状一句话：**显示链路出帧，SpringBoard 活不下来**——XNU 起来、OS/SystemOS/Data 三个卷全挂、
-launchd 把守护进程拉起来；r202 让 `IOMobileFramebufferLegacy` attach + start，r205 写
-`display-scale=2` 解掉 `FBSDisplayMode` 断言，r206 起 compositor 连续 present
-（`done/presented=4`、每帧 9 216 000 字节），但整屏仍是黑的——SpringBoard 没有把界面画上去，
-启动约 8 分钟后（boot 15 是 532 s）被 backboardd 的系统 shell 看门狗用 `kill(2)` 杀掉。
-boot 16（r227）：SpringBoard 换了三代，C 代健康活到 906 s，被自家 900 s 死线 panic 杀掉。
+现状一句话：**屏幕开始出真正的新帧，SpringBoard 第二代活满了整个观察窗**——XNU 起来、三卷全挂、
+launchd 把守护进程拉起来；boot 17（r228，死线 1800 s）里 pid 213 的 SpringBoard 从 ~500 s 一直
+活着推进到 1771 s：发给 lsd 的请求等到了回信，卡点移到 backboardd；r180 在 1468 s 接受
+`swap#4`、随后两帧全屏 `box=0x0..1199x1919`——653 s 无新帧的旧停滞被翻篇。
+
+r228 读数（boot 17）：**三件仪器全部兑现，桌面卡点收窄为「发给 backboardd 的 `nm=3403` 没人回」。**
+0 代 pid 27 在 497 s 被 backboardd `SIGKILL`，这次的 dump 走驱动 probe 环落了卡：
+`rcdump t=497 n=64 tot=660` + 3 条 `rce pid=27 gen=0`（最后一条距 kill 不到 1 s，它被杀时还在收，
+全程 660 条）。1 代 pid 213 出生接棒：主线程 tid=0x6ec 从 901 s 卡在 `_mach_msg2_trap` 发给
+`115:lsd` 的 `nm=6003`，到 1522 s 换成发给 `58:backboardd` 的 `nm=3403`（`sbport cnt=0 ql=6
+seq=3 rn=2227`）——lsd 回了信，它发出了下一个请求，此后一直活着到 1771 s 最后一拍，没人再杀它。
+屏上 1468.3 s `swap#4 accepted`、`frame#3 t=1006s pixels=41517`（backboardd 进度条局部）、
+`copy#4 217 ms` → `scanout#4 ok` → `retire#4 presented=4`，**1472/1482 s `frame#4/#5` 两帧全屏
+`pixels=2301667 box=0x0..1199x1919`**。之后 1482 s 到 1800 s 死线之间屏上还有没有新帧被噪声挤掉：
+512 行内核环里 `fl=…fs=apfs` 裸行 141 条 + `r170: exit` 循环重启 97 条占去约一半。watchdogd
+987 s 退出（`rv=0x5 ns=2`）；1800.16 s 死线 panic 照章收场（ticks=335739）。
 
 r227 读数（boot 16）：**环与锁存都工作；SpringBoard 换了三代，C 代健康活到 906 s，是 900 s
 死线把一次可能成功的启动杀掉。**
@@ -50,8 +60,8 @@ r227 改成「内核环里记录、kill 时倒出」，不再从收路径实时�
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 活不下来：不渲染，约 500 s 被系统 shell 看门狗杀掉** | r227 读数（boot 16）：三代——A ~614.7 s 出生即卡被杀（无收记录）；B=pid 27 正常收 614–636 s（`rcv32..63`）后停等 15.5 s，651.53 s 被 backboardd `SIGKILL`（`exit pid=27 rv=0x9`）；C=pid 229 健康活到 906 s 仍在收（`sbm2 t=906`、`sbport id=40000000`），但 906 s 仍无新 UI 帧（r180 帧停 653 s），912 s 被自家 900 s 死线 panic 杀掉 | r228（已发布，待上机）：死线 900→1800 s 给 C 代留时间；dump 每 pid 一次（guard 记 pid，换代即重置）；环项加 pid/gen 归属；dump 先锁快照再打印，摘要经驱动 probe 环保证落盘 |
-| 2 | **屏幕上是黑的** | compositor 已连续 present：r226（boot 15）`frame#0..#3`、`copy#1..#3 bytes=9216000`、`retire#4 done=presented=4`；但 2 304 000 像素里 2 262 366 个 `ff000000`，只有 `305x887..755x1029` 那块有变化（41 586 个像素）——那是 backboardd 的引导进度条（`client pid=58`，532.91 s 还在 present），不是桌面 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
+| 1 | **发给 backboardd 的 `nm=3403` 没人回——SpringBoard 卡在它上面** | r228 读数（boot 17）：0 代 pid 27 于 497 s 被杀但 dump 落卡（`rcdump t=497 tot=660`，被杀瞬间还在收）；1 代 pid 213 活到 1771 s：lsd 的 `nm=6003` 在 ~1400–1522 s 间**等到回信**，卡点移到 `58:backboardd` 的 `nm=3403`（`sbport cnt=0 ql=6 seq=3`），无人再杀它，1800 s 死线收场 | r229（设计）：驱动 tee 负过滤砍掉 `fl=…apfs`×141 与 exit 循环×97 这半数噪声，让 1482 s 之后的帧可见；内核按 r224 样法采 backboardd（pid 58）线程与其收队列，回答「3403 在不在 58 队里、58 主线程卡在哪」 |
+| 2 | **屏上有帧了，但还不知道是不是桌面** | r228（boot 17）：1468 s `swap#4 accepted`，1472/1482 s `frame#4/#5` 首次全屏（`pixels=2301667 box=0x0..1199x1919`）；r227 之前帧计数停在 653 s。1482 s 后内容被环噪声挤掉，未见后续帧 | 等第 1 项砍掉噪声后读 1482–1800 s 的帧序列；桌面成形前不动几何/色带 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 5 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |
