@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r223: the kernel state of both ends of the blocked send -- round222 named the caller as libxpc _xpc_connection_send_message_with_reply_sync waiting on 0xa03 for an answer to the 24-byte request sent to launchd 0x3f07, so each sample now translates both names and prints the port queue count, qlimit, seqno, mscount, srights, receiver task, kobject and waitq head, plus the header of the first queued message: a reply in 0xa03 means the wakeup path lost it, an empty 0xa03 with 0x3f07 still holding the request means launchd never answered"
+title = "clover r224: launchd's own threads at the blocked send -- round223 left the reply port 0xa03 empty and the 24-byte request still sitting at seqno 0 on launchd's port, so every eight seconds the kernel now walks the threads of pid 1 and prints each one's state, wait event, continuation and pc: a thread parked in ipc_mqueue_receive while that port holds messages means the wakeup was lost, and a receiver running anything else means the request was never asked for"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

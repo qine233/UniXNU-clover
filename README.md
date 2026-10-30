@@ -10,24 +10,21 @@ launchd 把守护进程拉起来；r202 让 `IOMobileFramebufferLegacy` attach +
 （`done/presented=4`、每帧 9 216 000 字节），但整屏仍是黑的——SpringBoard 没有把界面画上去，
 450–535 s 时被 backboardd 的系统 shell 看门狗用 `kill(2)` 杀掉。
 
-r223 读数（boot 12）：**回信根本没发出**。主线程（tid `0x104`）在 443.990512 s 仍是一次
-send+receive：`op=400304003 b=131513 sz=18`（24 B）`rem=2e03 loc=1d03 vou=a03 id=5b9173
-rn=1d03 rs=44 ro=1:launchd lo=27:SpringBoard`。同一毫秒读到的内核端口状态把两种可能分开了：
-目标端口（`rem=0x2e03`）`cnt=2 ql=6 seq=0 rn=0x11d03 ms=1 sr=5`，队列首条 kmsg 的
-`msgh_id` 就是 `5b9173`（`h=20111211.20.e35d0b60.e35d5060.a03.5b9173`）；而回信端口（`loc=0x1d03`）
-`cnt=0 ql=5 seq=20 ms=1 sr=1 kobj=…e35d0b60 wq=…e345a580 km=0`——**队列空**。
-464.500653 s 主线程又发了一条 204 B 的同步请求（`sz=cc id=400000cf rem=807`），目标队列
-`cnt=1 ql=128 seq=1386 sr=161`。472.88 s 起主线程转为纯收
-`op=40700420e sz=0 rn=1d03 rs=4000`，可此时 `rem=0x7a03` 端口已经
-`cnt=1 ql=6 seq=0 rn=0 ms=0 sr=2 rcv=0/0 kobj=0`——**端口上没有可送达的接收者，消息却还留在队列里**
-（首条 308 B，`h=20111211.134.e3a53100.e35d5060.a03.40000000`）。
-537–590 s 的请求改发到 lsd（`rem=6003 ro=117:lsd cnt=0 seq=1`，请求被取走），回信端口依旧空。
-整批 20 条 sbport 行里回信端口的 `cnt` 一律是 0，所以**排除「回信躺在队列里没人唤醒」；
-是 launchd 既没取走这条请求、也没回过信**。本靴 `kill(9)` 也不灵：r207 在 498.928036 s 发的
-`killsig`（`ns=-1`）没有生效，SpringBoard 一直活到 599.286642 s 才
-`exit pid=27 rv=0x9 ns=2 code=0x9`；900 s 死线照样 panic（boot 12 slot 4，`@ArmCpu.cpp:647`）进
-TWRP。缺口再收窄：**同步请求压在 launchd（或 lsd）的接收队列里没人处理，回信端口随后被摧毁；
-r224 把采样对象换成 launchd（pid 1）与 lsd，按线程抓栈，并记录目标端 receive 权被 destroy 的时刻。**
+r224 读数（boot 13）：**launchd 的线程从没停在收端口上，但它的端口也不积压**。431–911 s
+共 60 次采样，pid 1 只有 4–5 条线程，全部是停靠态：一条永远在 `_sigsuspend_nocancel`
+（`__sleep_continue`），一到两条在 `_semaphore_wait_trap`（`_semaphore_wait_continue`，
+wait 是 `_semaphore_event` 这个全内核共用哨兵），两到三条在 `___workq_kernreturn`
+（`_workq_unpark_continue`，libdispatch 的工人）；**没有一条在 `ipc_mqueue_receive`**。
+同靴 434.097 s SpringBoard 主线程（tid `0x103`）发 204 B 同步请求（`id=400000cf rem=807
+loc=b03`，体是 `@CPX@|handle|instance`），launchd 端口 `807` 同毫秒 `cnt=0 seq=1372 rn=107
+ms=1 sr=162`——队列空、接收者健在、已收过 1372 条，说明接收是 dispatch 工人按需做的，
+8 s 采样点上看不到常驻 receiver，r223 的「launchd 没取请求」不成立于本靴。447.918 与
+469.247 s 主线程停在 `ipc_mqueue_receive`（`op=40700420e`），等的端口 `7b03`/`1d07` 各有
+1 条 308/272 B 的 `id=40000000` 消息且 `rn=0 ms=0 sr=2 rcv=0/0`——**消息在、接收者不在**；
+475.351 s backboardd（spid=58）`SIGKILL`，475.482 s `exit pid=27 t=9s rv=0x9`，到 912 s
+都没再拉起。缺口再收窄：**launchd 收了请求却始终没往 `b03` 回信（窗口内没有任何一条
+pid 1 发出的 mach 消息）；SpringBoard 随后被看门狗杀。r225 把 r221/r222 的发送与栈探针
+扩到 pid 1，并在每个 beat 读 SpringBoard 回信端口的队列。**
 
 更早的逐轮读数在 [`notes/development-log.md`](notes/development-log.md)。
 
@@ -35,7 +32,7 @@ r224 把采样对象换成 launchd（pid 1）与 lsd，按线程抓栈，并记�
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 活不下来：不渲染，约 450–600 s 后被系统 shell 看门狗杀掉** | r223 读数（boot 12）：443.990512 s 主线程（tid `0x104`）的同步请求（`id=5b9173`，24 B）压在 launchd 端口队列首条（`cnt=2 ql=6 ms=1 sr=5`），回信端口 `0x1d03` 是 `cnt=0`；464.5 s 又一条 204 B 请求（`id=400000cf`）；472.9–507.1 s 转纯收时目标端口变成 `cnt=1 rcv=0/0 kobj=0`——消息滞留但已无可送达的接收者；537 s 起换 `rem=6003`（`ro=117:lsd`），547 s 时队列被取空（`seq=1`）仍无回信；20 条采样里回信端口 `cnt` 全为 0；498.9 s 的 `kill(9)`（`ns=-1`）未生效，599.3 s 才 `exit rv=0x9` | r224：采样对象换成 launchd（pid 1）与 lsd，按线程抓栈，并记录目标端 receive 权被 destroy 的时刻 |
+| 1 | **SpringBoard 活不下来：不渲染，约 475 s 被系统 shell 看门狗杀掉** | r224 读数（boot 13）：launchd（pid 1）在 431–911 s 的 60 次采样里只有 4–5 条线程，全是停靠态（`sigsuspend`、`semaphore_wait`、`workq_unpark`），**没有一条停在 `ipc_mqueue_receive`**；但 434.097 s 它的端口 `807` 是 `cnt=0 seq=1372 rn=107 ms=1 sr=162`——队列空、接收者健在、已收 1372 条，接收由 dispatch 工人按需做。同秒 SpringBoard 主线程发 204 B 同步请求（`id=400000cf rem=807 loc=b03`）。447.918 / 469.247 s 主线程停在 `ipc_mqueue_receive`，所等端口各有 1 条 308/272 B 的 `id=40000000` 消息而 `rn=0 ms=0 sr=2 rcv=0/0`；475.351 s 被 backboardd（spid=58）`SIGKILL`，475.482 s `exit t=9s rv=0x9`，到 912 s 没再拉起 | r225：把 r221/r222 的发送探针与用户栈抓取扩到 pid 1（窗口内没有任何一条 launchd 发出的 mach 消息），并在每个 beat 读 SpringBoard 最后一个回信端口的队列 |
 | 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |

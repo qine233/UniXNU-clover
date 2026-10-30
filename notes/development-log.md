@@ -16674,3 +16674,56 @@ payload 仍是 56 MiB（sha256 `02e552e80679b3c8735f8818299d6fd971c1aa7adb16f81e
 换到 lsd 的 `6003` 后请求被取走（`seq` 从 0 变 1）但照样没有回信。
 **r224 把采样对象换成 launchd（pid 1）与 lsd**：按线程抓栈看它们卡在哪，并在采样 beat 上盯着
 目标端口的 `ip_receivers`/`ip_receiver_name`，记录接收权从有到无的时刻。
+
+## round224 读数（boot 13）
+
+payload 仍是 56 MiB（sha256 `4cd6291609668faccb156c3cd75cc1f97d74cf5eadb7bed39ca33114853dc734`），
+只冷刷 cache（mmcblk0p49），900 s 死线照常 panic（`@ArmCpu.cpp:647`）并把 BCB 写进 TWRP，宿主零 misc 写。
+窗口：report 16 条（boot 13 自己那条在 slot 5，`fb=1`；其余是 boot 0/4–12 的旧记录）、
+判据环 64 槽全满（52 条 kind-21 驱动行 + 12 条 kind-25 probe 中转）、内核环 512 条；
+`drain enter boot=13 append_rc=105 probe_seen=10`、`exit wrote=16 dropped=0`。
+
+1. **这一轮采的是 launchd 自己**：431–911 s 共 60 条 `clover r224: peer`，每 8 s 一条，
+   `n=4/5`、`sc=0 act=1`，行内是至多 5 条线程的 `tid:state:wait_event:continuation:pc`。
+   采样器在 `task->lock` 下遍历 `task->threads`，但 `thread->state/wait_event/continuation`
+   不受这把锁保护，单条样本可能是撕裂的快照——只看多次重复出现的模式，不拿单帧下结论。
+2. **线程画像稳定，且没有一个收端口的人**：
+   - 一条永远在 `___sigsuspend_nocancel`（svc 410 之后；continuation `__sleep_continue`），
+     44/60 条样本可见，wait 是内核堆上的 sleep event；
+   - 一到两条在 `_semaphore_wait_trap`（svc 后 `1ccbccad4`；continuation `_semaphore_wait_continue`），
+     共 72 次出现，wait 恒为 `fffffff00700620c` = `_semaphore_event`——`sync_sema.c` 里那个
+     `static const uint8_t semaphore_event` 哨兵，全内核共用一个，**不能拿它认是哪颗信号量**；
+   - 两到三条在 `___workq_kernreturn`（svc 368 之后；continuation `_workq_unpark_continue`），
+     tid 每几十秒换一批（`2ce/425/395/4eb/578/6a4/785/85c/9f8/a2b`），是 libdispatch 的工人停靠；
+   - 其余是 `state=4`（TH_RUN）的瞬时线程：同一批 pc，另有 `thread_bootstrap_return`
+     （新线程刚起）、`_thread_preempted`、`_ulock_wait_continue`，以及 `_sendto`/`write_nocancel(397)`/
+     全局 `host_self_trap` 这类系统调用的返回点；`state=9/73`（TH_WAIT|TH_UNINT[|TH_IDLE]）也出现过。
+   **60 条样本里没有任何一条 continuation 是 `_ipc_mqueue_receive_continue`，也没有任何 wait
+   事件是端口。**
+3. **端口并不积压，所以 r223 的「launchd 没取请求」不成立于本靴**：434.097429 s SpringBoard
+   主线程（tid `0x103`，state 4）发 204 B 同步请求 `op=403114207 sz=cc rem=807 loc=b03
+   id=400000cf`，体是 `@CPX@|handle|instance`（`ro=1:launchd`）。同毫秒
+   `sbport rem nm=807 cnt=0 ql=128 seq=1372 rn=107 ms=1 sr=162`——**队列空、`imq_seqno` 已经
+   1372、接收者名字与 1 个接收权都在**。接收是由 dispatch 工人在消息到达时临时接手的，
+   8 s 一次的采样点只看到它们停靠后的样子，看不到常驻 receiver——r223 从「没看到接收线程」
+   推「没人取」这一步，被 r224 推翻。
+4. **SpringBoard 这靴死于另一种等待**：447.918542 s 主线程转纯收 `op=40700420e rn=b03 rs=4000`
+   （continuation `_ipc_mqueue_receive_continue`），同毫秒 `sbport rem nm=7b03 cnt=1 seq=0
+   rn=0 ms=0 sr=2 rcv=0/0`，队首 308 B `h=…40000000`；469.247 s 同样纯收 `rem=1d07`，
+   队首 272 B 同 id；另一条线程 `0x430` 在同秒发 28 B `id=ca8 rem=203 loc=5703` 并收到回信。
+   475.350966 s backboardd（`spid=58`）`SIGKILL`，475.481653 s `exit pid=27 t=9s rv=0x9
+   ns=2 code=0x9`，到 912 s 都没再拉起。**`id=40000000` 是 notify 子系统的基址
+   （`notify.defs` 的 `subsystem notify 64`，routine 0），具体是哪条通知仍未定论**；
+   但可以确定：消息躺在 `rn=0 ms=0 sr=2` 的端口上，而 SpringBoard 在等另一个端口。
+5. **窗口里没有任何一条 launchd 发出的 mach 消息**：r221 的 `sbm2` 探针只对
+   `p_comm == "SpringBoard"` 取样，所以本靴只能证明「SpringBoard 没再发」，不能证明
+   「launchd 没回」。r224 的线程画像则说明 launchd 没有卡在收或发里——它只是停靠着。
+   这两条合起来把 r225 的问题定成：**launchd 到底有没有把回信写进 `b03`，如果没有，
+   它的 dispatch 工人把这条请求丢在了哪一步。**
+
+**结论**：r223 的「请求压在 launchd 队列里没人处理」只对 boot 12 的端口成立；boot 13 的
+`807` 队列是空的、接收者健在、已收 1372 条，launchd 的线程也全部停在 sleep/semaphore/workq
+上，没有任何一条在 `ipc_mqueue_receive`。SpringBoard 在 434 s 发出同步请求后，41 s 内
+没有等到回信，475 s 被 backboardd 的 system-shell 看门狗杀掉，之后 launchd 没有重启它。
+r225 要做的是把 r221/r222 的发送探针与用户栈抓取从 SpringBoard 扩到 pid 1，并在每个
+r224 beat 上读 SpringBoard 最后一个回信端口的 `cnt/seq/rn/ms/sr` 与队首消息头。

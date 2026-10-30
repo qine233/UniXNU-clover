@@ -1,0 +1,114 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11195,4 +11195,95 @@
+ 		}
+ 	}
+ }
++/*
++ * Round224. Round223 left one question: the launchd port held two messages
++ * with seqno 0, so the receiver never took them. The receiver is a task, so
++ * sample that task on its own clock and print every thread's state, wait
++ * event, continuation and pc. A thread parked in ipc_mqueue_receive while the
++ * port holds messages means the wakeup was lost; a receiver running anything
++ * else means the request was never asked for. pid 1 never exits, so the proc
++ * reference keeps the task valid across the sample; the task lock is taken
++ * with try_lock so a wedged task cannot wedge the sampler.
++ */
++void
++clover_peer_sample(void)
++{
++	static uint64_t peer_last_secs = 0;
++	static uint32_t peer_beats = 0;
++	struct proc *p;
++	extern struct proc *proc_find(int pid);
++	extern task_t proc_task(struct proc *p);
++	extern int proc_rele(struct proc *p);
++	task_t task;
++	thread_t thr;
++	char tokens[256];
++	char line[320];
++	uint64_t secs;
++	int toff = 0;
++	int len;
++	int pid;
++	int sc;
++	int act;
++	uint32_t n = 0;
++
++	secs = clover_now_seconds();
++	if (secs < peer_last_secs + 8) {
++		return;
++	}
++	peer_last_secs = secs;
++	p = proc_find(1);
++	if (p == NULL) {
++		return;
++	}
++	task = proc_task(p);
++	if (task == TASK_NULL) {
++		proc_rele(p);
++		return;
++	}
++	if (!lck_mtx_try_lock(&task->lock)) {
++		proc_rele(p);
++		printf("clover r224: peer t=%llu busy\n",
++		    (unsigned long long)secs);
++		return;
++	}
++	pid = task_pid(task);
++	sc = task->suspend_count;
++	act = task->active;
++	tokens[0] = '\0';
++	queue_iterate(&task->threads, thr, thread_t, task_threads) {
++		arm_saved_state_t *ss;
++		uint64_t pc = 0;
++		int wrote;
++
++		if (n >= 5 || toff >= (int)sizeof(tokens) - 64) {
++			break;
++		}
++		ss = get_user_regs(thr);
++		if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1) {
++			pc = (uint64_t)get_saved_state_pc(ss);
++		}
++		wrote = snprintf(tokens + toff, sizeof(tokens) - (size_t)toff,
++		    " %llx:%d:%llx:%llx:%llx",
++		    (unsigned long long)thr->thread_id, thr->state,
++		    (unsigned long long)thr->wait_event,
++		    (unsigned long long)(uintptr_t)thr->continuation,
++		    (unsigned long long)pc);
++		if (wrote <= 0 || wrote >= (int)(sizeof(tokens) - (size_t)toff)) {
++			tokens[toff] = '\0';
++			break;
++		}
++		toff += wrote;
++		n++;
++	}
++	lck_mtx_unlock(&task->lock);
++	proc_rele(p);
++	peer_beats++;
++	len = snprintf(line, sizeof(line),
++	    "clover r224: peer t=%llu pid=%d n=%u sc=%d act=%d b=%u%s\n",
++	    (unsigned long long)secs, pid, n, sc, act, peer_beats, tokens);
++	if (len > 0) {
++		line[sizeof(line) - 1] = '\0';
++		printf("%s", line);
++	}
++}
+ #endif /* __arm64__ */
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -242,11 +242,13 @@
+ 	if (p != NULL) {
+ 		extern void clover_sb_note_current(void);
+ 		extern void clover_sb_sample(void);
++		extern void clover_peer_sample(void);
+ 
+ 		if (strncmp(p->p_comm, "SpringBoard", 16) == 0) {
+ 			clover_sb_note_current();
+ 		}
+ 		clover_sb_sample();
++		clover_peer_sample();
+ 	}
+ 
+ 	if (p == NULL || !clover_sys_why_watched(p->p_comm)) {

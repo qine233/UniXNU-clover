@@ -799,6 +799,10 @@ def check_board(errors: list) -> str:
             errors.append("drivers/CloverSdhci gives round223's port-state lines no tee class: two "
                           "lines per picked thread changing thirty-two times would land in the ring "
                           "uncounted")
+        if '{ "clover r224: ", "r224-peer", 192, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round224's launchd sample no tee class: a line "
+                          "every eight seconds for the length of the boot would land in the ring "
+                          "uncounted")
         if '{ "clover r217: ", "r217-sbs", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round217's live sample no tee class: a line "
                           "that changes every eight seconds for the length of the boot would land "
@@ -849,6 +853,24 @@ def check_board(errors: list) -> str:
                 if needle not in sb_text:
                     errors.append(f"{sb_patch.name} lacks {needle[:56]!r}: the next frame could "
                                   "not say which syscall each thread is in or who called kill")
+
+        peer_patch = next((base / "patches/xnu-clover/zzzzzzzzz-clover-peer-sample.patch"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover/zzzzzzzzz-clover-peer-sample.patch").is_file()),
+                          None)
+        if peer_patch is None:
+            errors.append("patches/xnu-clover/zzzzzzzzz-clover-peer-sample.patch is missing: round223 "
+                          "left the reply port empty with the request still at seqno 0, so the next "
+                          "frame would have nothing that says whether launchd ever asked for it")
+        else:
+            peer_text = peer_patch.read_text()
+            for needle in ('"clover r224: peer t=%llu pid=%d n=%u sc=%d act=%d b=%u%s\\n"',
+                           "clover_peer_sample(void)", "proc_find(1)",
+                           "lck_mtx_try_lock(&task->lock)",
+                           "clover_peer_sample();"):
+                if needle not in peer_text:
+                    errors.append(f"{peer_patch.name} lacks {needle[:56]!r}: the sample could not "
+                                  "name what launchd's threads are waiting on")
 
         if "CloverSdhci r212: panic tail lines=%u unseen=%u bufx=%d tee=%u boot=%u" not in sdhci_source:
             errors.append("drivers/CloverSdhci has no round212 panic-time tail read: a boot whose "
@@ -1825,8 +1847,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r223:"):
-        errors.append('[payload] title is not "clover r223: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r224:"):
+        errors.append('[payload] title is not "clover r224: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2865,8 +2887,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r223:"):
-        errors.append('[payload] title is not "clover r223: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r224:"):
+        errors.append('[payload] title is not "clover r224: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

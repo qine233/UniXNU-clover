@@ -659,6 +659,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // picked thread per change (destination and reply port), five threads, so
   // 192 covers the batch and the lines just before the kill.
   { "clover r223: ", "r223-sbs", 192, 0, 0, 0 },
+  // Round224 moves the subject from SpringBoard to launchd: one line every
+  // eight seconds with five threads at most, so a full 900 s boot is at most
+  // ~115 lines. 192 keeps the whole conversation and still bounds a looping
+  // producer.
+  { "clover r224: ", "r224-peer", 192, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
