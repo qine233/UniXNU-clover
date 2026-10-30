@@ -1,0 +1,157 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10747,18 +10747,18 @@
+ 		secs = clover_now_seconds();
+ 		if (last_beat == 0 || secs >= last_beat + 120) {
+ 			last_beat = secs;
+-			printf("clover r233: beat t=%llu pid=%d rn=%x rep=%x\n",
++			printf("clover r234: beat t=%llu pid=%d rn=%x rep=%x\n",
+ 			    (unsigned long long)secs, clover_bb_target_pid,
+ 			    clover_bb_target_name, clover_sb_last_reply);
+ 			/*
+ 			 * Round233. SpringBoard's reply port rides the heartbeat, not
+ 			 * the 20 s beat: four rows a minute is enough to see whether
+-			 * anything is ever queued on it, and the r233 tee class has to
+-			 * hold the member dump too.
++			 * anything is ever queued on it, and round234 gives the set
++			 * rows their own tee class instead of sharing the beat's.
+ 			 */
+ 			if (clover_sb_last_reply != MACH_PORT_NULL) {
+ 				clover_sb_port_state(sb, clover_sb_last_reply,
+-				    "sbrep", secs, "r233");
++				    "sbrep", secs, "r234");
+ 			}
+ 		}
+ 		if (clover_bb_target_pid != 0) {
+@@ -10950,7 +10950,7 @@
+ 		strlcpy(rows[slot].own, own, sizeof(rows[slot].own));
+ 	}
+ 	len = snprintf(line, sizeof(line),
+-	    "clover r233: sbown t=%llu %s nm=%x own=%s\n",
++	    "clover r234: sbown t=%llu %s nm=%x own=%s\n",
+ 	    (unsigned long long)secs, tag, name, own[0] ? own : "-");
+ 	if (len > 0) {
+ 		line[sizeof(line) - 1] = '\0';
+@@ -11003,10 +11003,10 @@
+ 	__block struct clover_bbsep_snap snap;
+ 	__block uint32_t stored = 0;
+ 	__block uint32_t all = 0;
+-	__block uint32_t shown = 0;
+ 	__block uint64_t hash = 1469598103934665603ULL;
+-	__block int off = 0;
+ 	uint64_t mark = __atomic_load_n(&clover_bb_mark_obj, __ATOMIC_ACQUIRE);
++	uint32_t first;
++	uint32_t last;
+ 	uint32_t i;
+ 	int slot = -1;
+ 	int same = 0;
+@@ -11029,15 +11029,6 @@
+ 			snap.rns[stored] = port->ip_messages.imq_receiver_name;
+ 			stored++;
+ 		}
+-		if (shown < 8 && off < (int)sizeof(memb) - 32) {
+-			off += snprintf(mp + off, sizeof(memb) - (size_t)off,
+-			    "%s%llx:%u:%u:%x", shown ? "," : "",
+-			    (unsigned long long)(uintptr_t)port,
+-			    (unsigned)port->ip_messages.imq_msgcount,
+-			    (unsigned)port->ip_messages.imq_seqno,
+-			    port->ip_messages.imq_receiver_name);
+-			shown++;
+-		}
+ 	});
+ 	io_unlock(ips_to_object(pset));
+ 
+@@ -11070,27 +11061,36 @@
+ 		sets[slot].stored = stored;
+ 		sets[slot].all = all;
+ 	}
+-	len = snprintf(line, sizeof(line),
+-	    "clover %s: bbset t=%llu %s nm=%x o=%llx n=%u all=%u m=%s\n",
+-	    rn, (unsigned long long)secs, tag, name,
+-	    (unsigned long long)(uintptr_t)pset, shown, all, memb);
+-	if (len > 0) {
+-		line[sizeof(line) - 1] = '\0';
+-		printf("%s", line);
+-	}
+-	for (i = 0; i < stored; i++) {
++	/*
++	 * Round234 prints the whole set, not its first eight: the line carries
++	 * every member as index:count:sequence:receive-name with a star on the
++	 * member whose object is the blocked destination. A set that does not
++	 * fit one record continues on a bbset+ row rather than dropping members.
++	 */
++	first = 0;
++	while (first < stored) {
++		int off = 0;
++
++		memb[0] = '\0';
++		last = first;
++		while (last < stored && off < (int)sizeof(memb) - 24) {
++			off += snprintf(mp + off, sizeof(memb) - (size_t)off,
++			    "%s%u:%u:%u:%x%s", last > first ? "," : "", last,
++			    snap.cnts[last], snap.seqs[last], snap.rns[last],
++			    ((uint64_t)(uintptr_t)snap.ports[last] == mark) ?
++			    "*" : "");
++			last++;
++		}
+ 		len = snprintf(line, sizeof(line),
+-		    "clover r233: bbsep t=%llu %s nm=%x o=%llx i=%u/%u"
+-		    " m=%llx:%u:%u:%x%s\n",
+-		    (unsigned long long)secs, tag, name,
+-		    (unsigned long long)(uintptr_t)pset, i, all,
+-		    (unsigned long long)(uintptr_t)snap.ports[i], snap.cnts[i],
+-		    snap.seqs[i], snap.rns[i],
+-		    ((uint64_t)(uintptr_t)snap.ports[i] == mark) ? "*" : "");
++		    "clover r234: bbset%s t=%llu %s rn=%s nm=%x o=%llx n=%u"
++		    " all=%u m=%s\n", first ? "+" : "", (unsigned long long)secs,
++		    tag, rn, name, (unsigned long long)(uintptr_t)pset,
++		    last - first, all, memb);
+ 		if (len > 0) {
+ 			line[sizeof(line) - 1] = '\0';
+ 			printf("%s", line);
+ 		}
++		first = last;
+ 	}
+ }
+ 
+@@ -11248,13 +11248,20 @@
+ 	}
+ 	if (copyinmap(task->map, (vm_map_offset_t)(addr & ~3ULL), &word,
+ 	    sizeof(word)) != KERN_SUCCESS) {
+-		printf("clover r233: bblock t=%llu tid=0x%llx op=%llx a=%llx"
++		printf("clover r234: bblock t=%llu tid=0x%llx op=%llx a=%llx"
+ 		    " st=%x rd=err\n", (unsigned long long)secs,
+ 		    (unsigned long long)tid, (unsigned long long)op,
+ 		    (unsigned long long)addr, st);
+ 		return;
+ 	}
+-	own = word & ~1u;
++	/*
++	 * Round234 resolves the owner the way XNU does. The stored value is a
++	 * mach port name with userland flag bits in the low byte and the ipc
++	 * generation bits left unset, so ipc_entry_name_mask() (the same call
++	 * ulock_owner_value_to_port_name() makes) adds 0x03 there: 0x4202 is
++	 * port 0x4203, and the previous word & ~1 only cleared a flag.
++	 */
++	own = (uint32_t)ipc_entry_name_mask((mach_port_name_t)word);
+ 	if (own != 0 && own != (uint32_t)MACH_PORT_DEAD &&
+ 	    task->itk_space != IPC_SPACE_NULL) {
+ 		kr = ipc_object_translate(task->itk_space,
+@@ -11276,7 +11283,7 @@
+ 			io_unlock(obj);
+ 		}
+ 	}
+-	printf("clover r233: bblock t=%llu tid=0x%llx op=%llx a=%llx st=%x"
++	printf("clover r234: bblock t=%llu tid=0x%llx op=%llx a=%llx st=%x"
+ 	    " w=%08x own=%x ow=0x%llx ost=%x\n",
+ 	    (unsigned long long)secs, (unsigned long long)tid,
+ 	    (unsigned long long)op, (unsigned long long)addr, st, word,
+@@ -11608,7 +11615,7 @@
+ 			clover_sb_port_owner(task, (mach_port_name_t)hrem[i],
+ 			    rmo, sizeof(rmo));
+ 			len = snprintf(line, sizeof(line),
+-			    "clover r233: bbhopo t=%llu pid=%d tid=0x%llx"
++			    "clover r234: bbhopo t=%llu pid=%d tid=0x%llx"
+ 			    " rem=%x ro=%s\n",
+ 			    (unsigned long long)secs, pid,
+ 			    (unsigned long long)htid[i], hrem[i],

@@ -4,17 +4,34 @@
 ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。
 配套固件仓库 `uefi-clover`（Mu-Silicium 移植），驱动与硬件常量在 `porting.toml`。
 
-现状一句话：**回信收不到，是因为请求被 backboardd 的 port set 带走；成员表已打全一拍，
-但可能带 `*` 的三个成员被 tee 的单趟 push 限额吞掉，锁的属主又因换算少了一步而没查出来。**
+现状一句话：**SpringBoard 的请求被 backboardd 取走了、回信没有回来；而被阻塞的目的口不属于
+backboardd 的 port set——backboardd 不是在等内核，而是主线程停在用户态一个条件上，
+4 条收件线程和空闲工作队列都不动它。**
 XNU 起来、三卷全挂、launchd 把守护进程拉起来。
-boot 22（r233，死线 1800 s）把采样搬进 20 s 一拍的内核线程，不再依赖任何任务进入 `mach_msg2`：
-`r232 bbset` 一直打到 t=1764（wall 1768.9），证明采样活着。集合 `5903` 有 11 个成员，前 8 个全
-`0:0`；唯一完整落地的一拍里 tee 先有 8 行、再是成员行，16 行/趟的 push 限额把 `i=8..10` 计进
-throttled，而 `*` 只可能落在被吞的三行里。四条等待线程的锁字都读到了
-（`0x4203 / 0x7d0fd50 / 0xffffff00 / 0`），但 r233 用 `word & ~1` 查名字、没走
-`ipc_entry_name_mask()`，`0x4203` 的 gen 字节从 `0x03` 变成 `0x02`，属主解析全部失败。
-SpringBoard 交回的回信名 `4e0f` 在 808 s 已失效（`kr=15`）。r234 三刀：换算、单行成员带 `*`、
-按类拆 tee 预算。
+boot 24（r235，死线 1800 s）没有再踩 753 s 那个 `ipc_space.h:173` 断言，内核环一路写到
+1789.6 s；r234 的一行集合、分账 tee 和 `ipc_entry_name_mask()` 全部兑现（`bbset` 43 条
+848→1786、`all=11` 每次都在，没有一类烧光）。集合 11 个成员里没有 SpringBoard 等的 `4c03`；
+`4c03` 一生只进过 3 条消息、此刻 `cnt=0 seq=3 wq=0`。锁属主的 `own` 已算对，`ow=0x0` 是线程
+端口早已失效——锁这一列结案。死线本身仍然没留 kind-20 记录（卡在末期反复
+`read gave up` + `card recover`），TWRP 由 r198 预置 BCB 落下；r236 要把「死线到点」的证据
+放到不经过 panic 屏的路径上，并把 backboardd 的用户态等待符号化。
+
+r235 读数（boot 24）：**断言不再、采样活到 1789.6 s；被阻塞的口不属于集合，backboardd 卡在
+用户态条件上。**
+① 环：512 行窗口 **848.6–1789.6 s**，全 boot 24，最后一条 `r234 bbset t=1786`；
+`bbspace … dead` 未出现。② r234 三刀兑现：`bbset` 43 条、`sbown` 47、`bblock` 56、`beat` 7、
+`sbport` 7，`r234-own`/`r234-lock`/`r229-bb` 都没到顶。③ 集合
+`o=fffffff59bd739d0` 的 11 个成员为 `5803/5903/5a03/4803/10013/15403/d70b/d40b/7e03/4a17/1103`，
+**没有 `4c03`**；`4c03` 是普通口（`rn=2b2b`、`cnt=0 ql=6 seq=3 wq=0`）。④ 锁属主：`own` 已是
+正名（`1777dc3/ffffff03/3`），`ow=0x0` 说明持有线程已退出，按 `EOWNERDEAD` 处理，不是死锁点。
+⑤ SpringBoard（pid 247、3 条线程）主线程 `op=40700420e` 只有接收位、`STRICT_REPLY`，
+`rem=4c03 rn=a03`；另一条线程向 `203` 发 40 字节（`seq=130`，通路活着）。⑥ backboardd：
+4 条线程在 port set 成员上收，主线程 `0x42d` 停在 `_ulock_wait_continue`
+（`UL_COMPARE_AND_WAIT`、锁 `101691604`、期望 0），其余是 `_workq_unpark_continue` 空闲线程。
+⑦ 屏只有一行 `r180: client#6`，没有 swap/frame/retire。⑧ 死线无记录：无 boot 24 kind-20、
+无 `r212 drain enter`、`misc block 1` 空；驱动环末尾 6 次 `dma deadline`+`read gave up`+
+`card recover`（userdata 高 LBA、8 块读）。r236 三刀：死线标记走飞行区、panic 入口先落一格
+「sink 到了吗」、backboardd 等待线程取用户栈并在宿主按共享缓存符号化。
 
 r233 读数（boot 22）：**成员表出来了、节拍线程活了，但 tee 的类配额和单趟 push 限额先死了；
 锁属主是换算错，不是锁错了。**

@@ -17425,3 +17425,89 @@ r234 三刀：① 锁属主改用 `ipc_entry_name_mask(word)`（照抄 `ulock_ow
 不再先 `& ~1`）；② 集合成员合并成一行、`*` 内联，并排在每拍其他行之前，谁也吞不掉；
 ③ 驱动 tee 把 r233 的行拆成 beat/set/member/owner/lock 各类，各自 30 分钟够用的预算，
 并给 set 行留一趟 push。
+
+## r234 实现与构建（boot 23 前置）
+
+r233 的三刀先把「读数不够」修掉，r234 再把读数变成答案：
+
+1. **锁属主照抄 XNU**。`clover_sb_lock_owner` 不再 `word & ~1`，改调
+   `ipc_entry_name_mask((mach_port_name_t)word)`——`ulock_owner_value_to_port_name()`
+   （`bsd/sys/ulock.h:43`）就是这么做的，`0x4202` 应当读成端口 `0x4203`。解析仍用
+   `ipc_object_translate(SEND)`、失败再试 `RECEIVE`，然后取 `IKOT_THREAD_CONTROL` 的 `thread_id`。
+2. **集合一行打全**。`bpsep` 不再 8 个成员截断，`CLOVER_BBSEP_MAX` 提到 24，一行
+   `m=i:c:s:name` 加 `*` 内联，并且排在每拍其他行之前，`kTeePushPerPass` 吞不掉。
+3. **tee 按 token 分账**。r233 的 oversize 行拆成 beat/set/member/owner/lock 各类
+   （`r234-set` 不限、`r234-own` 192、`r234-lock` 96、`r229-bb` 64、`r231-bb` 192 等），
+   一侧烧光不再拖死另一侧。
+
+内核、AMFI 签名点、归一化、payload 与两个闸门全部通过；冷刷 cache 后读回 **boot 23**。
+
+## r234 读数（boot 23）——753 s 的断言把这一帧截短
+
+1. **环只到 752.65 s**：`ipc_space.h:173 Assertion failed: table != NULL` 是这一 boot 的
+   最后一句，记录落在报告环 slot 12（`append_rc=112`），排干兑现
+   （`r212: drain enter boot=23 … append_rc=112`、`r184: panic drain wrote=51 dropped=0`、
+   `r212: drain exit boot=23 wrote=51`）。报告环从此有了 boot 23 的 kind-20。
+2. **断言是我们自己的探针踩的**：`clover_port_recv_task`（`osfmk/kern/task.c`）取了
+   `is_read_lock(space)` 之后直接 `ipc_entry_lookup`，而 `ipc_entry_lookup` 的契约要求
+   space 是活的（`is_active_table()` 在 `ipc_space.h:173` 断言 `table != NULL`）。
+   fairplayd.A2 在 752.48 s 退出，它的 space 已被 `ipc_space_terminate()` 清表，探针正好
+   在这个窗口里查名字。读锁不会把表救回来；全树只有这一处 `ipc_entry_lookup`，
+   其余探针走 `ipc_object_translate` / `ipc_right_lookup_read`，对空表返回
+   `KERN_INVALID_TASK` 而不断言。r235 就是在同一把读锁下先 `is_active(space)`。
+3. **r234 的采样本身是健康的**：到 753 s 为止 `bbset` 5 条（`all=11`）、`sbown` 62 条、
+   `bblock` 28 条、`sbport` 1 条、`beat` 1 条，没有一条触发 96/192 的类上限；
+   `sbown t=537 sbrep nm=3a03 own=26:SpringBoard` 说明回信口属主这一列也是通的。
+4. **mask 换算生效，但属主仍然是 0**：`bblock … w=ffffff00 own=ffffff03 ow=0x0`、
+   `… w=01777dc0 own=1777dc3 ow=0x0`——名字算对了，`ipc_object_translate` 却在该 task
+   的 space 里找不到右。这与 XNU 自己的 `port_name_to_thread` 语义一致：锁字里的属主是
+   「当时」的线程端口名，持有线程退出后名字自然失效，等待方会按 `EOWNERDEAD` 恢复。
+   **锁属主这一列可以结了，它不是死锁点。**
+5. r235 只改一处：`clover_port_recv_task` 在 `is_read_lock(space)` 之后、
+   `ipc_entry_lookup` 之前加 `if (!is_active(space))`，打印一行
+   `clover r235: bbspace t=… nm=… sp=… dead` 后返回 `TASK_NULL`。同一把读锁内判活，
+   与 `ipc_space_terminate()` 之间没有窗口。`board.toml` 标题、两个 checker 的字符串契约
+   与 LATE_PATCH 顺序（21 个 z，最先应用）一起更新。
+
+## r235 实现与构建
+
+内核 + AMFI 签名点（`0x1ac00e4`、`0x1ac016c`）+ 归一化 + payload 全部重建，
+`check-clover.py` 与 `verify-clover-payload.py` 全过；工作树里 `clover r235: bbspace`
+字符串在 `kernel.macho` 中可见。冷刷 cache，跑满 1800 s 死线，读回 **boot 24**。
+
+## r235 读数（boot 24）——断言不再，采样活到 1789.6 s，死线自己仍不留记录
+
+1. **753 s 的断言没有再来**。`bbspace … dead` 一行未出现，报告环最新仍是 boot 23 的
+   `ipc_space.h:173`；这一 boot 一直跑到 1789.576 s（`r234 bbset t=1786`）才停笔。
+   内核环 512 行窗口 **848.6–1789.6 s**（更早的行被 512 槽环形覆盖），全 boot 24。
+2. **r234 的三刀都兑现**：`bbset` 43 条 848→1786，`all=11` 每次都在，一行打全；
+   `sbown` 47、`bblock` 56、`beat` 7、`sbport` 7，没有任何一类烧光
+   （上限分别 192/96/…）。成员 seq 动得最多的是 `1103`（154→1138），`d40b`（0→9）、
+   `7e03`（0→10）也在动，其余 8 个全 `0:0`。
+3. **r233 的问题有了否定答案：被阻塞的目的口不属于任何集合**。集合
+   `o=fffffff59bd739d0` 的 11 个成员是
+   `5803/5903/5a03/4803/10013/15403/d70b/d40b/7e03/4a17/1103`，SpringBoard 等的
+   `4c03` 不在里面；`4c03` 的户口本是 `cnt=0 ql=6 seq=3 rn=2b2b … wq=0`——
+   一生只进过 3 条消息，此刻队列空、没有线程挂在它上面。**请求被取走了，回信没回来**，
+   与 boot 21 的 `5e03`、boot 20 的 `4503` 是同一个形状。
+4. **锁属主这一列按第 r234 节的结论结掉**：`own` 都算成了正确的名字
+   （`1777dc3`、`ffffff03`、`3`），`ow=0x0` 是这些线程端口早已失效，不是换算错。
+5. **SpringBoard 仍在等回信**（1654 s：pid=247、3 条线程；1782 s 采样）：
+   `sbm2 tid=0x952 op=40700420e rem=4c03 rn=a03 rs=4000`——只有接收位、`STRICT_REPLY`，
+   等的是发往 `4c03` 那笔请求的回信。另一条线程 `0x1364` 发一笔 40 字节（`bits=0x1513`、
+   目的 `203`、本地 `1640b`），目的口 `seq=130` 说明那条通路是活的。
+6. **backboardd 这一侧不是内核阻塞**：4 条线程在 port set 的三组成员上收
+   （`rn=7f03/6103/8203/4507`、`rs=2`、`to=ffffffff`），主线程 `0x42d` 停在
+   `_ulock_wait_continue`（`x0=1000001` = `UL_COMPARE_AND_WAIT|ULF_NO_ERRNO`、
+   锁地址 `101691604`、期望值 0），其余 `st=1` 是 `_workq_unpark_continue` 的空闲工作队列线程。
+   **backboardd 不是在等内核，而是在用户态等一个永远不会被 signal 的条件**。
+7. **屏**：整段只有一行 `r180: client#6 pid=87`（1309 s），没有 `swap#`/`frame#`/`retire#`。
+8. **卡**：驱动环末尾连着 6 次 `r172 dma deadline` + `r169 read gave up` +
+   `r215 card recover why=gaveup … ok=1`（n=6..8），读的是 userdata 区的高 LBA
+   （`30146456`、`33836840`、`27791672` 等，8 块一读），每次整卡重初始化都成功。
+9. **死线又没留记录**：报告环没有 boot 24 的 kind-20，驱动环没有
+   `r212: drain enter` / `panic tail`，`misc block 1` 为空；TWRP 是 r198 预置 BCB
+   落下来的（TWRP 启动即清 misc，事后无法区分哪个 BCB 生效）。和 boot 21/22 同一种缺席。
+   区别在于这一 boot **死线前卡正在反复恢复**：drain 的第一次写就要排干驱动环，
+   卡不在可用状态时它会静默失败，而 `panicAppendText` 与 `drain` 都走同一个 `gHost`。
+   r236 必须把「死线到点」的证据放到不经过 panic 屏的路径上。

@@ -1,0 +1,34 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index f98aa83..df9a93c 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10791,6 +10791,13 @@ clover_bb_start_beat(void)
+  * same question without nursing a right: the entry carries the port object
+  * whatever right the name holds. The space lock keeps the entry alive while
+  * its object is locked and referenced, the same order translate uses.
++ *
++ * Round235. ipc_entry_lookup demands an active space, and is_active() is
++ * exactly the table test its assert makes, minus the panic. Boot 23 tripped
++ * that assert right after fairplayd exited: the sampled task was terminating,
++ * ipc_space_terminate() had cleared the table under the write lock, and the
++ * read lock taken here does not bring a dead space back. The check and the
++ * lookup share one read-locked stretch, so termination cannot slip between.
+  */
+ static task_t
+ clover_port_recv_task(ipc_space_t space, mach_port_name_t name)
+@@ -10800,6 +10807,15 @@ clover_port_recv_task(ipc_space_t space, mach_port_name_t name)
+ 	task_t owner = TASK_NULL;
+ 
+ 	is_read_lock(space);
++	if (!is_active(space)) {
++		uint64_t secs = clover_now_seconds();
++
++		is_read_unlock(space);
++		printf("clover r235: bbspace t=%llu nm=%x sp=%llx dead\n",
++		    (unsigned long long)secs, name,
++		    (unsigned long long)(uintptr_t)space);
++		return TASK_NULL;
++	}
+ 	entry = ipc_entry_lookup(space, name);
+ 	if (entry != NULL && (obj = entry->ie_object) != IPC_OBJECT_NULL) {
+ 		io_lock(obj);

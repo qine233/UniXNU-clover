@@ -707,10 +707,17 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // Round233 asks four questions at once: which member of a named port set is the blocked
   // destination (the star row), who owns each hop and receiver name (the owner rows), whether the
   // kernel is still sampling after the trap goes quiet (the beat thread), and who holds the unfair
-  // lock an idle thread waits on (the word read). The member dump shares the round232 set-row lock,
-  // so 256 keeps a full 12-member set plus its owners without starving the beat rows that prove the
-  // kernel is alive.
-  { "clover r233: ", "r233-bb", 256, 0, 0, 0 },
+  // lock an idle thread waits on (the word read).
+  // Round234 splits what round233 put in one class. Boot 22's r233-bb budget of 256 was spent by
+  // 808 s while the set rows reached t=1764, so the reading that proves the kernel is alive and the
+  // reading that names the blocked member were competing for the same 256 records. Each row gets
+  // its own budget sized for a 30-minute boot, the set row is exempt from the 16-line per-pass
+  // push cap, and the per-member bbsep rows are gone: every member now rides the set row.
+  { "clover r234: bbset", "r234-set", 384, 0, 0, 0 },
+  { "clover r234: bbhop", "r234-hop", 384, 0, 0, 0 },
+  { "clover r234: sbown", "r234-own", 192, 0, 0, 0 },
+  { "clover r234: bblock", "r234-lock", 96, 0, 0, 0 },
+  { "clover r234: beat", "r234-beat", 96, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -3892,8 +3899,14 @@ static void teeConsumeLine (uint32_t &pushed)
     }
     probe->kept++;
   }
-  if (pushed >= kTeePushPerPass) {
-    // Eight lines per guarded pass is sixteen block writes on a card that is also trying to serve the
+  // Round234 reserves one push per pass for the set row. Boot 22 lost members i=8..10 because
+  // eight per-fire rows came first and the sixteenth push was the pass's last; the set row is the
+  // one reading whose absence cannot be told from a set that did not change, so the cap does not
+  // apply to it. Its class budget still bounds it.
+  const bool reserved = probe != nullptr &&
+      teeHasPrefix (probe->name, teeStringLength (probe->name), "r234-set");
+  if (pushed >= kTeePushPerPass && !reserved) {
+    // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.
     gTeeThrottled++;
     return;

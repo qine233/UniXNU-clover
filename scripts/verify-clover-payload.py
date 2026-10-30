@@ -941,15 +941,14 @@ def check_sb_sample(kernel: bytes) -> bool:
              "bbwait": (b"clover r231: bbwait t=%llu pid=%d tid=0x%llx st=%x"
                         b" cont=%llx pc=%llx x0=%llx x1=%llx x2=%llx x3=%llx"
                         b" u=%u run=0x%llx\n") in kernel,
-             "bbset": (b"clover %s: bbset t=%llu %s nm=%x o=%llx n=%u all=%u m=%s\n") in kernel,
-             "bbsep": (b"clover r233: bbsep t=%llu %s nm=%x o=%llx i=%u/%u"
-                       b" m=%llx:%u:%u:%x%s\n") in kernel,
-             "sbown": (b"clover r233: sbown t=%llu %s nm=%x own=%s\n") in kernel,
-             "bbhopo": (b"clover r233: bbhopo t=%llu pid=%d tid=0x%llx rem=%x ro=%s\n") in kernel,
-             "beat": (b"clover r233: beat t=%llu pid=%d rn=%x rep=%x\n") in kernel,
-             "bblock": (b"clover r233: bblock t=%llu tid=0x%llx op=%llx a=%llx st=%x"
+             "bbset": (b"clover r234: bbset%s t=%llu %s rn=%s nm=%x o=%llx n=%u"
+                       b" all=%u m=%s\n") in kernel,
+             "sbown": (b"clover r234: sbown t=%llu %s nm=%x own=%s\n") in kernel,
+             "bbhopo": (b"clover r234: bbhopo t=%llu pid=%d tid=0x%llx rem=%x ro=%s\n") in kernel,
+             "beat": (b"clover r234: beat t=%llu pid=%d rn=%x rep=%x\n") in kernel,
+             "bblock": (b"clover r234: bblock t=%llu tid=0x%llx op=%llx a=%llx st=%x"
                         b" w=%08x own=%x ow=0x%llx ost=%x\n") in kernel,
-             "bblock-err": (b"clover r233: bblock t=%llu tid=0x%llx op=%llx a=%llx"
+             "bblock-err": (b"clover r234: bblock t=%llu tid=0x%llx op=%llx a=%llx"
                             b" st=%x rd=err\n") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
                            b"dropped=%u comms=%u\n") in kernel,

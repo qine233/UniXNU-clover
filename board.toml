@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r233: every port-set member is printed with a star on the blocked destination, every hop and receiver name gets its owner, the sample moves to a kernel thread so a quiet trap no longer ends the reading, and the unfair lock word an idle thread waits on is read out of its own address space"
+title = "clover r235: the receiver-name lookup refuses a space whose entry table ipc_space_terminate already cleared, which is the ipc_space.h:173 assert boot 23 hit right after fairplayd exited, so the sampler no longer kills the boot it is reading"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

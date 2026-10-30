@@ -830,11 +830,20 @@ def check_board(errors: list) -> str:
             errors.append("drivers/CloverSdhci gives round232's port-set member rows no tee class: "
                           "each hop name that resolves as a set adds a row per fire, and over a "
                           "whole boot they would land in the ring uncounted")
-        if '{ "clover r233: ", "r233-bb", 256, 0, 0, 0 },' not in sdhci_source:
-            errors.append("drivers/CloverSdhci gives round233's member dump, owner rows, beat rows "
-                          "and unfair-lock word no tee class: a full set expands to twelve member "
-                          "rows per fire and the beat keeps the class alive after the trap goes "
-                          "quiet, so the rows would land in the ring uncounted")
+        if '{ "clover r234: bbset", "r234-set", 384, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round234's whole-set row no tee class: the row "
+                          "that names the blocked member would land in the ring uncounted")
+        for needle in ('{ "clover r234: bbhop", "r234-hop", 384, 0, 0, 0 },',
+                       '{ "clover r234: sbown", "r234-own", 192, 0, 0, 0 },',
+                       '{ "clover r234: bblock", "r234-lock", 96, 0, 0, 0 },',
+                       '{ "clover r234: beat", "r234-beat", 96, 0, 0, 0 },'):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci lacks round234 tee class {needle[:40]!r}: the "
+                              "beat, owner, hop and lock rows would spend each other's records")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r234-set")' not in sdhci_source:
+            errors.append("drivers/CloverSdhci does not exempt the whole-set row from the per-pass "
+                          "push cap: boot 22 lost members i=8..10 to that cap and a set that did "
+                          "not change would look like a set that was never read")
         if '{ "clover r217: ", "r217-sbs", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round217's live sample no tee class: a line "
                           "that changes every eight seconds for the length of the boot would land "
@@ -1146,6 +1155,64 @@ def check_board(errors: list) -> str:
                     errors.append(f"{r233_patch.name} lacks {needle[:56]!r}: the member dump would "
                                   "again hide the blocked destination, no owner would be named, the "
                                   "beat would die with the trap, or the unfair lock would stay opaque")
+
+        # Round234 is the counter-reading to boot 22: the member dump shared one class with the
+        # beat and ran out at 808 s, the per-member rows lost i=8..10 to the sixteen-push cap, and
+        # every lock word resolved to no owner because the raw ulock value was translated without
+        # ipc_entry_name_mask() -- the call ulock_owner_value_to_port_name() itself makes. The set
+        # now rides one row (continued on bbset+ if it does not fit one record), the row's class is
+        # exempt from the push cap in the driver, and the owner is masked the way XNU masks it.
+        r234_patch = next((base / "patches/xnu-clover/zzzzzzzzzzzzzzzzzzzz-clover-r234.patch"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover/zzzzzzzzzzzzzzzzzzzz-clover-r234.patch").is_file()),
+                          None)
+        if r234_patch is None:
+            errors.append("patches/xnu-clover/zzzzzzzzzzzzzzzzzzzz-clover-r234.patch is missing: boot 22 "
+                          "would again spend the set's budget on the beat, lose members past the push "
+                          "cap, and read 0x4202 as an unowned lock")
+        else:
+            r234_text = r234_patch.read_text()
+            for needle in ('"clover r234: bbset%s t=%llu %s rn=%s nm=%x o=%llx n=%u"',
+                           '((uint64_t)(uintptr_t)snap.ports[last] == mark) ?',
+                           '"*" : "");',
+                           'first ? "+" : ""',
+                           'own = (uint32_t)ipc_entry_name_mask((mach_port_name_t)word);',
+                           'ulock_owner_value_to_port_name() makes) adds 0x03 there'):
+                if needle not in r234_text:
+                    errors.append(f"{r234_patch.name} lacks {needle[:56]!r}: the set could again lose "
+                                  "members, hide the blocked destination, or report an owner that "
+                                  "the kernel itself would resolve")
+            for line in r234_text.splitlines():
+                if line.startswith("+") and "word & ~1u" in line:
+                    errors.append(f"{r234_patch.name} adds 'word & ~1u': clearing bit 0 does not "
+                                  "set the ipc generation bits that ipc_entry_name_mask() adds")
+
+        # Round235 answers boot 23: the receiver-name fallback called ipc_entry_lookup on a space
+        # that was already dead -- ipc_space_terminate() clears is_table under the write lock and the
+        # sampler's read lock does not revive it -- and is_active_table's assert fired right after
+        # fairplayd exited. is_active() is that same table test without the panic, and it has to sit
+        # inside the read-locked stretch, before the lookup it protects.
+        r235_patch = next((base / "patches/xnu-clover/zzzzzzzzzzzzzzzzzzzzz-clover-r235.patch"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover/zzzzzzzzzzzzzzzzzzzzz-clover-r235.patch").is_file()),
+                          None)
+        if r235_patch is None:
+            errors.append("patches/xnu-clover/zzzzzzzzzzzzzzzzzzzzz-clover-r235.patch is missing: "
+                          "the receiver-name fallback would again assert on a terminating space")
+        else:
+            r235_text = r235_patch.read_text()
+            for needle in ('is_read_lock(space);',
+                           'if (!is_active(space)) {',
+                           '"clover r235: bbspace t=%llu nm=%x sp=%llx dead\\n"',
+                           'entry = ipc_entry_lookup(space, name);'):
+                if needle not in r235_text:
+                    errors.append(f"{r235_patch.name} lacks {needle[:56]!r}: a dead space would again "
+                                  "reach is_active_table's assert, or the reading that proves the "
+                                  "guard fired would be gone")
+            if r235_text.find('if (!is_active(space)) {') > \
+                    r235_text.find('entry = ipc_entry_lookup(space, name);'):
+                errors.append(f"{r235_patch.name} checks is_active after the lookup: the assert "
+                              "would still fire first")
 
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
@@ -2144,8 +2211,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r233:"):
-        errors.append('[payload] title is not "clover r233: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r235:"):
+        errors.append('[payload] title is not "clover r235: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3193,8 +3260,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r233:"):
-        errors.append('[payload] title is not "clover r233: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r235:"):
+        errors.append('[payload] title is not "clover r235: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
