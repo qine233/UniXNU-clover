@@ -111,7 +111,7 @@ index 98ee874..dfd2a63 100644
  			snprintf(clover_r211_line, sizeof(clover_r211_line),
  			    "clover r211: skst n=%u f0=%016llx f1=%016llx f2=%016llx f3=%016llx f4=%016llx f5=%016llx\n",
 diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
-index 4a12dd9..9a8bf59 100644
+index 4a12dd9..5fd9344 100644
 --- a/osfmk/kern/task.c
 +++ b/osfmk/kern/task.c
 @@ -103,6 +103,8 @@
@@ -239,7 +239,7 @@ index 4a12dd9..9a8bf59 100644
  	queue_iterate(&task->threads, thr, thread_t, task_threads) {
  		arm_saved_state_t *ss;
  		arm_kernel_saved_state_t *ks;
-@@ -10473,4 +10566,356 @@ clover_task_threads(task_t task, uint32_t budget)
+@@ -10473,4 +10566,468 @@ clover_task_threads(task_t task, uint32_t budget)
  	}
  	return n;
  }
@@ -369,6 +369,8 @@ index 4a12dd9..9a8bf59 100644
 +	int pid;
 +	uint64_t tids[5];
 +	uint64_t x16s[5];
++	uint64_t pcs[5];
++	uint64_t lrs[5];
 +	uint64_t fps[5];
 +	uint64_t sps[5];
 +	uint64_t m2[5][8];
@@ -417,6 +419,8 @@ index 4a12dd9..9a8bf59 100644
 +		ss = get_user_regs(thr);
 +		tids[n] = thr->thread_id;
 +		x16s[n] = 0;
++		pcs[n] = 0;
++		lrs[n] = 0;
 +		fps[n] = 0;
 +		sps[n] = 0;
 +		for (j = 0; j < 8; j++) {
@@ -424,8 +428,10 @@ index 4a12dd9..9a8bf59 100644
 +		}
 +		if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1) {
 +			pc = (uint64_t)get_saved_state_pc(ss);
++			pcs[n] = pc;
 +			if (!is_saved_state32(ss)) {
 +				x16s[n] = (uint64_t)saved_state64(ss)->x[16];
++				lrs[n] = (uint64_t)get_saved_state_lr(ss);
 +				for (j = 0; j < 8; j++) {
 +					m2[n][j] = (uint64_t)saved_state64(ss)->x[j];
 +				}
@@ -494,7 +500,7 @@ index 4a12dd9..9a8bf59 100644
 +	}
 +
 +	/*
-+	 * Round220. Round219 read these words one register off. mach_msg2_trap
++	 * Round220/221. Round219 read these words one register off. mach_msg2_trap
 +	 * takes data in x0, option64 in x1, bits|send_size<<32 in x2,
 +	 * remote|local<<32 in x3, voucher|msgh_id<<32 in x4,
 +	 * desc_count|rcv_name<<32 in x5, rcv_size|priority<<32 in x6 and the
@@ -565,7 +571,7 @@ index 4a12dd9..9a8bf59 100644
 +				    (mach_port_name_t)mhdr[j][2], ho, sizeof(ho));
 +				lw = snprintf(m2lines + loff,
 +				    sizeof(m2lines) - (size_t)loff,
-+				    "clover r220: sbm2 t=%llu tid=0x%llx op=%llx"
++				    "clover r221: sbm2 t=%llu tid=0x%llx op=%llx"
 +				    " b=%x sz=%x rem=%x loc=%x vou=%x id=%x dc=%x"
 +				    " rn=%x rs=%x pr=%x to=%llx ro=%s lo=%s"
 +				    " h=%x.%x.%x.%x.%x.%x ho=%s\n",
@@ -591,6 +597,112 @@ index 4a12dd9..9a8bf59 100644
 +			if (loff > 0) {
 +				m2lines[sizeof(m2lines) - 1] = '\0';
 +				printf("%s", m2lines);
++			}
++
++			/*
++			 * Round221. A name says who is being called; it does not say
++			 * where the caller sits. Each picked thread now carries the
++			 * file offset of its pc and lr inside the dyld shared cache
++			 * -- VME_OFFSET(entry) + pc - vme_start, the round200
++			 * translation -- and the eight instructions at the pc, so
++			 * the host names the libxpc function instead of reading a
++			 * slide. A call that sends a body also passes its first
++			 * 176 bytes through a printable-run filter: the service
++			 * name launchd is asked about is usually plain text there.
++			 */
++			for (j = 0; j < npick; j++) {
++				uint64_t *r = m2[pick[j]];
++				uint64_t pc = pcs[pick[j]];
++				uint64_t lr = lrs[pick[j]];
++				uint64_t poff = 0;
++				uint64_t lroff = 0;
++				uint32_t code[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++				vm_map_entry_t entry = VM_MAP_ENTRY_NULL;
++				vm_map_t map = current_map();
++				uint32_t bits = (uint32_t)r[2];
++				uint32_t ssz = (uint32_t)(r[2] >> 32);
++				char txt[96];
++				int tp = 0;
++				int segs = 0;
++
++				if (map != VM_MAP_NULL) {
++					vm_map_lock_read(map);
++					if (vm_map_lookup_entry(map,
++					    (vm_map_offset_t)(pc & ~0xfffULL),
++					    &entry) && entry != VM_MAP_ENTRY_NULL &&
++					    pc >= (uint64_t)entry->vme_start &&
++					    pc < (uint64_t)entry->vme_end) {
++						poff = (uint64_t)VME_OFFSET(entry) +
++						    (pc - (uint64_t)entry->vme_start);
++					}
++					if (vm_map_lookup_entry(map,
++					    (vm_map_offset_t)(lr & ~0xfffULL),
++					    &entry) && entry != VM_MAP_ENTRY_NULL &&
++					    lr >= (uint64_t)entry->vme_start &&
++					    lr < (uint64_t)entry->vme_end) {
++						lroff = (uint64_t)VME_OFFSET(entry) +
++						    (lr - (uint64_t)entry->vme_start);
++					}
++					vm_map_unlock_read(map);
++				}
++				if (pc != 0 && copyin((user_addr_t)(pc & ~3ULL),
++				    code, sizeof(code)) != KERN_SUCCESS) {
++					memset(code, 0, sizeof(code));
++				}
++				printf("clover r221: sbm2x t=%llu tid=0x%llx pc=%llx"
++				    " lr=%llx poff=%llx loff=%llx"
++				    " c=%08x.%08x.%08x.%08x.%08x.%08x.%08x.%08x\n",
++				    (unsigned long long)secs,
++				    (unsigned long long)tids[pick[j]],
++				    (unsigned long long)pc, (unsigned long long)lr,
++				    (unsigned long long)poff, (unsigned long long)lroff,
++				    code[0], code[1], code[2], code[3],
++				    code[4], code[5], code[6], code[7]);
++				txt[0] = '\0';
++				if (ssz > 0 && (bits & 0xff) != 0 && r[0] != 0) {
++					unsigned char mb[176];
++					uint32_t lim = (ssz < (uint32_t)sizeof(mb)) ?
++					    ssz : (uint32_t)sizeof(mb);
++					int s2 = 0;
++
++					if (copyin((user_addr_t)r[0], mb, lim) ==
++					    KERN_SUCCESS) {
++						while (s2 < (int)lim && segs < 3 &&
++						    tp < (int)sizeof(txt) - 40) {
++							int b = s2;
++							int e;
++							int k;
++
++							while (b < (int)lim &&
++							    (mb[b] < 0x20 || mb[b] >= 0x7f)) {
++								b++;
++							}
++							e = b;
++							while (e < (int)lim && mb[e] >= 0x20 &&
++							    mb[e] < 0x7f) {
++								e++;
++							}
++							if (e - b >= 4) {
++								if (tp > 0) {
++									txt[tp++] = '|';
++								}
++								for (k = b; k < e &&
++								    tp < (int)sizeof(txt) - 2; k++) {
++									txt[tp++] = (char)mb[k];
++								}
++								txt[tp] = '\0';
++								segs++;
++							}
++							s2 = (e > b) ? e : (b + 1);
++						}
++					}
++				}
++				if (txt[0] != '\0') {
++					printf("clover r221: sbmsg t=%llu tid=0x%llx"
++					    " sz=%x txt=%s\n",
++					    (unsigned long long)secs,
++					    (unsigned long long)tids[pick[j]], ssz, txt);
++				}
 +			}
 +		}
 +	}

@@ -10,18 +10,19 @@ launchd 把守护进程拉起来；r202 让 `IOMobileFramebufferLegacy` attach +
 （`done/presented=4`、每帧 9 216 000 字节），但整屏仍是黑的——SpringBoard 没有把界面画上去，
 450–535 s 时被 backboardd 的系统 shell 看门狗用 `kill(2)` 杀掉。
 
-r220 读数（boot 9）：杀点 `[449.509949]`、退出 `[449.514325]`（4.4 ms）；`killsrc` 的 upc 仍是
-`___kill+0x8`，ulr 仍落在镜像偏移 `0x72144` 的批量杀循环。**端口属主把「在等谁」问出了答案**：
-SpringBoard 主线程（tid `0x104`）从 380 s 起就停在同一个 libxpc 函数的 mach_msg2 里——380/401 s
-是 24 字节的同步 MQ/XPC 调用（remote `0x3903`、reply `0x903`、`msgh_id=0x5b9173`、68 B 接收），
-413 s 是 204 字节的同步调用（remote `0x807`、reply `0x903`、`msgh_id=0x400000cf`）；**这些目标
-端口的属主都是 launchd（pid 1），回复端口 `0x903` 的属主是 SpringBoard 自己**。424 s 起同一线程
-换成在 `0x903` 上的 16 384 字节纯接收（`RCV_LARGE|STRICT_REPLY|RCV_SYNC_WAIT`），直到被杀都没
-返回；同一时刻另一条线程（`0x30a`）在 `0x1003` 上做 20 字节纯接收。SpringBoard 仍从未创建
-`IOMobileFramebufferUserClient`（本靴客户端只有 pid 58/56/164）；backboardd 自己 present 了三帧。
-缺口因此收窄成一句话：**主线程卡在向 launchd 发出的同步 XPC 上，在它返回之前不会走到建 FB
-客户端、提交第一帧；那条请求的载荷（很可能带服务名）与阻塞点的函数，r221 从缓存偏移和消息体
-字符串里读。**
+r221 读数（boot 10）：SpringBoard 主线程在 `[479.004840]` 被 backboardd 以 `kill(9)` 杀掉、
+`[479.093986]` 退出（`rv=0x9`），到死都没等到回信。**阻塞点这次有了函数名**：390/413/470 s 三次
+采样（tid `0x102`）的 PC 都是 `0x1d1454b58`、LR 都是 `0x1d1458224`；代码字 `d65f03c0 / mov x16,#0x2f /
+svc #0x80` 在 `dyld_shared_cache_arm64.23` 命中未滑 vm `0x1cb780b58`，定出 slide `0x5CD4000`，
+于是 PC = `libsystem_kernel.dylib` 的 **`_mach_msg2_trap`（+0x8，svc 后的 ret）**、LR =
+**`_mach_msg2_internal`（+0x4c）**——r220 猜的「libxpc」不对，直接调用层在 libsystem_kernel 内部，
+真正的调用者还在更上层。**载荷也读出了明文**：413 s 那条 204 字节同步调用（发往 launchd 的
+`0x807`，reply `0x903`）的发送体里有 `@CPX@`、`handle`、`instance`（`@CPX@` 是 XPC 序列化标记）。
+其余被采线程全部停在 `___workq_kernreturn+0x8`（空转），只有主线程与 470 s 的 tid `0x466` 卡在
+mach_msg2；SpringBoard 始终没建 `IOMobileFramebufferUserClient`（窗口里客户端是 pid 56/168，907 s
+才有 pid 87），backboardd 自己 present 了两帧。缺口收窄成一句话：**主线程卡在一条发给 launchd、
+请求里带 `handle`/`instance` 的同步 XPC 上，直到被杀都没返回；r222 用用户栈回溯找出调用者，并把
+204 字节整段按十六进制读出来，确认它到底在请求什么。**
 
 更早的逐轮读数在 [`notes/development-log.md`](notes/development-log.md)。
 
@@ -29,7 +30,7 @@ SpringBoard 主线程（tid `0x104`）从 380 s 起就停在同一个 libxpc 函
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 活不下来：不渲染，约 450–535 s 后被 backboardd 的系统 shell 看门狗杀掉** | r220 读数（boot 9）：杀点 `[449.509949]`、退出 `[449.514325]`（4.4 ms）；killsrc 的 upc 仍是 `___kill+0x8`、ulr 仍是镜像偏移 `0x72144` 的批量杀循环。**端口属主读数**：主线程从 380 s 起反复做同步 XPC —— 380/401 s 的 24 B 调用（remote `0x3903`、reply `0x903`、id `0x5b9173`、rcv 68 B）与 413 s 的 204 B 调用（remote `0x807`、reply `0x903`、id `0x400000cf`），**目标端口属主全是 launchd（pid 1）**，`0x903` 属主是 SpringBoard 自己；424 s 起转成 `0x903` 上 16 KB 纯接收直到被杀。SpringBoard 仍无 FB 客户端（本靴 pid 58/56/164）；backboardd present 三帧 | r221：打印主线程 PC/LR 的共享缓存偏移（`VME_OFFSET + pc - vme_start`）与 8 个代码字，落到 libxpc 的具体函数；同时抓发送消息体的可打印串，读出服务名 |
+| 1 | **SpringBoard 活不下来：不渲染，约 450–535 s 后被 backboardd 的系统 shell 看门狗杀掉** | r221 读数（boot 10）：杀点 `[479.004840]`、退出 `[479.093986]`（`rv=0x9`）。主线程（tid `0x102`）三次采样 PC `0x1d1454b58`、LR `0x1d1458224`，代码字在缓存里定出 slide `0x5CD4000`，于是落在 **`libsystem_kernel._mach_msg2_trap`（+0x8）**，调用层是 **`_mach_msg2_internal`（+0x4c）**；413 s 的 204 字节同步 XPC（发往 launchd 的 `0x807`）载荷里有 `@CPX@`、`handle`、`instance`。其余 SpringBoard 线程全在 `___workq_kernreturn+0x8` 空转。SpringBoard 到死没建 FB 客户端（窗口内客户端 pid 56/168，907 s 才有 pid 87） | r222：回溯主线程的用户栈，命名 `_mach_msg2_internal` 的调用者（libxpc 的哪次调用）；把 204 字节发送体整段按十六进制读回，确认这条 XPC 的请求类型 |
 | 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |

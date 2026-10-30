@@ -644,12 +644,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // The kernel caps the changes at 32, so 32 x 5 + 2 fits in 192: the frame before the kill cannot
   // be truncated, and the class still stops a looping daemon from pushing the exec/exit pairs out.
   { "clover r218: ", "r218-sbs", 192, 0, 0, 0 },
-  // Round220 adds one line per thread parked in mach_msg2, carrying the
-  // descriptor with the labels mach_traps.h gives it and the owning task of
-  // each port name. It is printed only when that batch changes, so five threads
-  // changing thirty-two times is the worst case and 192 covers it beside
-  // r218's budget.
-  { "clover r220: ", "r220-sbs", 192, 0, 0, 0 },
+  // Round221 keeps round220's one line per thread parked in mach_msg2 and adds
+  // two: the blocked thread's pc/lr translated to dyld shared-cache file
+  // offsets with eight instructions at the pc, and the printable strings of a
+  // send body. One batch is at most three lines per thread, five threads, and
+  // it prints only when the batch changes, so 192 covers a realistic boot with
+  // room to spare.
+  { "clover r221: ", "r221-sbs", 192, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

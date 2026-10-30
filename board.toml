@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r220: the mach_msg2 descriptor in its right registers, and the task each port name belongs to -- round219 printed valid numbers under labels shifted one register, so the descriptor is now read in the order mach_traps.h gives it (data, option64, bits|size, remote|local, voucher|msgh_id, desc_count|rcv_name, rcv_size|priority, timeout) and every name is translated through the sampled task space to the pid and command owning the receive right, which turns 'waiting on 0x3003' into 'waiting on pid 58'"
+title = "clover r221: the blocked thread's pc and lr as dyld shared-cache file offsets, and the service name in its send body -- round220 showed the main thread waiting on launchd (pid 1) in a synchronous XPC, so each sampled mach_msg2 thread now records its trap address translated through its own map entry (VME_OFFSET + pc - vme_start) with eight instructions at the pc, and every call that sends a body prints the printable runs of that body, where launchd's service name is plain text"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

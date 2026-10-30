@@ -16539,3 +16539,55 @@ x5=desc_count|rcv_name<<32, x6=rcv_size|priority<<32, x7=timeout`，
 建 FB 客户端、提交第一帧。r221 要回答两件事：阻塞点到底是哪个函数（打印 PC/LR 的共享缓存偏移
 `VME_OFFSET + pc - vme_start` 与 8 个代码字，宿主上 `decode-clover-cache-offset.py` 直接命名），
 以及发给 launchd 的那条消息里写了什么（把发送缓冲的可打印串截出来，服务名通常就是明文）。
+
+## round221 设计：把阻塞点落到函数名，把服务名从消息体里抠出来
+
+r220 只回答到「向 launchd 发同步 XPC、回信是 SpringBoard 自己的端口」。r221 在同一处采样里补两条读数，
+都不用新窗口：
+
+- **`sbm2x`**：每个被采到的线程带 `pc`/`lr`，用 `vm_map_lookup_entry(map, pc & ~0xfff)` 找到映射项后
+  算 `VME_OFFSET(entry) + (pc - vme_start)`，把用户态地址换成 dyld 共享缓存的**文件偏移**；同时
+  `copyin` PC 处的 8 个代码字。宿主侧 `decode-clover-cache-offset.py --foff 0x… --code aa.bb…`
+  直接给出 `libxpc` 里的函数名（r200 已经用同一套偏移翻译验过硬件的 `brk` 落点）。
+- **`sbmsg`**：对「发送 + 带载荷」的调用（`send_size > 0` 且 remote disposition 非零）把发送缓冲
+  前 176 字节 `copyin` 上来，抽 ≥4 字节的可打印 ASCII 串，最多 3 段用 `|` 连接。XPC 的名字（服务名、
+  消息 id 前缀）通常是明文，能直接读出主线程在对谁说话。
+
+打印沿用 r220 的 `ipc_object_translate` 端口属主，不新增 tee 类（`sbm2` 行前缀统一成
+`clover r221:`，类预算 192 行覆盖一次启动里最多 5 线程 × 3 次变化），避免 512 行环被两类挤占。
+
+## round221 读数（boot 10）
+
+冷刷 cache 后的 boot 10：窗口里 512 条 kind-22 内核行、49 条 kind-21 驱动判据、9 条 `clover r221:`
+（4 条 `sbm2`、4 条 `sbm2x`、1 条 `sbmsg`）。SpringBoard 主线程在 470.599 采样后被杀，
+`killsig` 仍是 `___kill` 进门、`spid=58 scomm=backboardd`，`[479.093986]` 退出（`rv=0x9`）。
+
+- **主线程 PC/LR 落到函数名**：390.048651、413.011700 两次发送采样和被杀时 470.599480 的主线程
+  （tid `0x102`）都是同一对地址：`pc=1d1454b58`、`lr=1d1458224`，`poff=51454b58`、`loff=51458224`，
+  8 个代码字 `d65f03c0.928005f0.d4001001.d65f03c0.92800610.d4001001.d65f03c0.92800630`——这是
+  `ret / mov x16,#0x2f / svc #0x80` 的 mach trap 桩，不是 `brk`。所以
+  `decode-clover-cache-offset.py --foff … --code …` 的窗口判据（命中窗里必须有 `brk`）不适用，
+  会报 “no cache file carries the given code words”；改用代码字在 54 个缓存文件里搜字节模式，
+  唯一命中在 `dyld_shared_cache_arm64.23` 的未滑 vm `0x1cb780b58`，于是本靴
+  slide = `0x1d1454b58 − 0x1cb780b58 = 0x5CD4000`。
+- 用 `--addr 0x1cb780b58` 得到 `image /usr/lib/system/libsystem_kernel.dylib`、`function start
+  0x1cb780b50 (+0x8 into it)`、`nearest export _mach_msg2_trap`；`--addr 0x1cb784224` 得到
+  `function start 0x1cb7841d8 (+0x4c into it)`、`nearest export _mach_msg2_internal`。**r220 说的
+  「在 libxpc 里」不成立**：PC 是 `_mach_msg2_trap` 里 svc 之后的 ret（阻塞时保存的 PC 正好落在
+  trap 桩上），LR 是 `_mach_msg2_internal` 里 +0x4c 的调用点；真正的调用者还在更上层，这轮没取用户栈。
+- **`poff` 的语义纠正**：它**含 slide**（`VME_OFFSET + pc − vme_start`），不是纯缓存偏移。
+  直接拿运行时地址喂 `--addr` 会被 `.25` 的映射区间覆盖而解析成 AnnounceDaemon，必须先按代码字定 slide。
+- **发送体明文**：413.141850 的 `sbmsg` 从 204 字节发送体里抽到 `@CPX@|handle|instance`
+  （`@CPX@` 是 XPC 序列化标记，另外两段是键名）。390/404 s 的 24 字节调用和 470 s 另一条线程
+  （tid `0x466`）的 40 字节调用都没有 ≥4 字节的连续可打印串，因此没有输出。
+- **只有主线程被卡住**：被采到的 0x2fe/0x3c3/0x3fc/0x458/0x45c/0x45d 的 PC 全是
+  `___workq_kernreturn+0x8`（空转的工作队列线程）；tid `0x466` 在 470 s 也落到 `_mach_msg2_trap`
+  同一 PC（`sbm2` 里它发 40 字节给 `rem=0x203`，属主是 SpringBoard 自己），是第二个 mach_msg2 停点。
+- **FB 客户端**：窗口里能看到的 #4 是 pid 56、#5 是 pid 168，907 s 才出现 `client#6 pid=87`
+  （窗口里没有它的 comm）；SpringBoard（pid 26）到 479 s 被杀都没建过。backboardd 照常 present
+  （`done=2 presented=2`）。
+
+**结论**：SpringBoard 主线程卡在 **libsystem_kernel 的 `_mach_msg2_trap` / `_mach_msg2_internal`**
+同步 XPC 上（发给 launchd 的 204 字节载荷含 `@CPX@`、`handle`、`instance`），直到 479 s 被
+backboardd 的系统 shell 看门狗杀掉都没等到回信。r222 要问「谁在调 `_mach_msg2_internal`」
+（用户栈回溯）和「这条 XPC 在请求什么」（整段 204 字节十六进制，而不是可打印串）。
