@@ -917,8 +917,12 @@ def check_sb_sample(kernel: bytes) -> bool:
              "sbmsg": (b"clover r221: sbmsg t=%llu tid=0x%llx") in kernel,
              "sbuf": (b"clover r222: sbuf t=%llu") in kernel,
              "sbhex": (b"clover r222: sbhex t=%llu") in kernel,
-             "sbport": (b"clover r223: sbport t=%llu %s nm=%x cnt=%u ql=%u seq=%u") in kernel,
-             "peer": (b"clover r224: peer t=%llu pid=%d n=%u sc=%d act=%d b=%u") in kernel}
+             "sbport": (b"clover %s: sbport t=%llu %s nm=%x cnt=%u ql=%u seq=%u") in kernel,
+             "peer": (b"clover r224: peer t=%llu pid=%d n=%u sc=%d act=%d b=%u") in kernel,
+             "p1": (b"clover r225: p1s t=%llu pid=%d n=%u c=%u%s%s\n") in kernel,
+             "p1m2": (b"clover r225: p1m2 t=%llu tid=0x%llx op=%llx b=%x sz=%x") in kernel,
+             "p1uf": (b"clover r225: p1uf t=%llu tid=0x%llx") in kernel,
+             "p1hex": (b"clover r225: p1hex t=%llu tid=0x%llx") in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())

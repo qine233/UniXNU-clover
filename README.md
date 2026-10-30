@@ -8,23 +8,22 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 launchd 把守护进程拉起来；r202 让 `IOMobileFramebufferLegacy` attach + start，r205 写
 `display-scale=2` 解掉 `FBSDisplayMode` 断言，r206 起 compositor 连续 present
 （`done/presented=4`、每帧 9 216 000 字节），但整屏仍是黑的——SpringBoard 没有把界面画上去，
-450–535 s 时被 backboardd 的系统 shell 看门狗用 `kill(2)` 杀掉。
+约 497 s 时被 backboardd 的系统 shell 看门狗用 `kill(2)` 杀掉。
 
-r224 读数（boot 13）：**launchd 的线程从没停在收端口上，但它的端口也不积压**。431–911 s
-共 60 次采样，pid 1 只有 4–5 条线程，全部是停靠态：一条永远在 `_sigsuspend_nocancel`
-（`__sleep_continue`），一到两条在 `_semaphore_wait_trap`（`_semaphore_wait_continue`，
-wait 是 `_semaphore_event` 这个全内核共用哨兵），两到三条在 `___workq_kernreturn`
-（`_workq_unpark_continue`，libdispatch 的工人）；**没有一条在 `ipc_mqueue_receive`**。
-同靴 434.097 s SpringBoard 主线程（tid `0x103`）发 204 B 同步请求（`id=400000cf rem=807
-loc=b03`，体是 `@CPX@|handle|instance`），launchd 端口 `807` 同毫秒 `cnt=0 seq=1372 rn=107
-ms=1 sr=162`——队列空、接收者健在、已收过 1372 条，说明接收是 dispatch 工人按需做的，
-8 s 采样点上看不到常驻 receiver，r223 的「launchd 没取请求」不成立于本靴。447.918 与
-469.247 s 主线程停在 `ipc_mqueue_receive`（`op=40700420e`），等的端口 `7b03`/`1d07` 各有
-1 条 308/272 B 的 `id=40000000` 消息且 `rn=0 ms=0 sr=2 rcv=0/0`——**消息在、接收者不在**；
-475.351 s backboardd（spid=58）`SIGKILL`，475.482 s `exit pid=27 t=9s rv=0x9`，到 912 s
-都没再拉起。缺口再收窄：**launchd 收了请求却始终没往 `b03` 回信（窗口内没有任何一条
-pid 1 发出的 mach 消息）；SpringBoard 随后被看门狗杀。r225 把 r221/r222 的发送与栈探针
-扩到 pid 1，并在每个 beat 读 SpringBoard 回信端口的队列。**
+r225 读数（boot 14）：**launchd 在发消息，回信也在到；死的是一块画不出桌面的 SpringBoard**。
+606.098 与 730.375 s 两次心跳抓到 pid 1 的同一线程 `0x482` 停在 `_mach_msg2_trap` 上，
+发的是 `id=0x20000000` 的 libxpc 消息：一条 64 B、`bits&0xff=0x12`（`MOVE_SEND_ONCE`）、
+体里有 `CPX@`/`error`；一条 116 B、带复杂位与一个描述符、体里有 `rec_execcnt`/`req_pid`。
+目标都是 send-once 权，所以 `sbport … kr=17` 只是 `MAKE_SEND` 对这种权利不适用，
+**不是端口失效**。另一头 `sbport rp nm=a03 cnt=0 ql=5 seq=26→29→30 rn=a03 ms=1 sr=1`
+（422–491 s，11 条）：SpringBoard 的回复端口 `seq` 两次上涨、`cnt` 恒为 0，
+同段里它的主线程 `0x104` 正以 `rem=7c03/753b rn=a03` 做 MIG 式 send+recv——
+**r223/r224 的「launchd 不回信」不成立于本靴**。但 SpringBoard 到 497 s 仍没画出桌面，
+屏上一直是 backboardd 的进度条（`frame#0..#2 pixels=41586 box=305x887..755x1029`、
+`colours ff000000/2262414…`、`client pid=58`），497.143 s `killsig pid=27 … spid=58
+scomm=backboardd sig=9`，`upc` 落在 `___kill`+0x8 的 `svc` 上，497.336 s `exit t=9s rv=0x9`。
+缺口再收窄：**不是「谁没回信」，而是 backboardd 为什么判 SpringBoard 不健康。
+r226 把 kill 发信线程的完整寄存器/栈、SpringBoard 的收方向与 4 s 节拍上的 `gone` 收尾行一起读。**
 
 更早的逐轮读数在 [`notes/development-log.md`](notes/development-log.md)。
 
@@ -32,8 +31,8 @@ pid 1 发出的 mach 消息）；SpringBoard 随后被看门狗杀。r225 把 r2
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 活不下来：不渲染，约 475 s 被系统 shell 看门狗杀掉** | r224 读数（boot 13）：launchd（pid 1）在 431–911 s 的 60 次采样里只有 4–5 条线程，全是停靠态（`sigsuspend`、`semaphore_wait`、`workq_unpark`），**没有一条停在 `ipc_mqueue_receive`**；但 434.097 s 它的端口 `807` 是 `cnt=0 seq=1372 rn=107 ms=1 sr=162`——队列空、接收者健在、已收 1372 条，接收由 dispatch 工人按需做。同秒 SpringBoard 主线程发 204 B 同步请求（`id=400000cf rem=807 loc=b03`）。447.918 / 469.247 s 主线程停在 `ipc_mqueue_receive`，所等端口各有 1 条 308/272 B 的 `id=40000000` 消息而 `rn=0 ms=0 sr=2 rcv=0/0`；475.351 s 被 backboardd（spid=58）`SIGKILL`，475.482 s `exit t=9s rv=0x9`，到 912 s 没再拉起 | r225：把 r221/r222 的发送探针与用户栈抓取扩到 pid 1（窗口内没有任何一条 launchd 发出的 mach 消息），并在每个 beat 读 SpringBoard 最后一个回信端口的队列 |
-| 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
+| 1 | **SpringBoard 活不下来：不渲染，约 497 s 被系统 shell 看门狗杀掉** | r225 读数（boot 14）：launchd（pid 1）线程 `0x482` 在 606.098 / 730.375 s 停在 `_mach_msg2_trap` 上发 `id=0x20000000` 的 libxpc 消息（64 B `MOVE_SEND_ONCE` 体含 `CPX@`/`error`；116 B 复杂消息体含 `rec_execcnt`/`req_pid`），目标是一次性回信权，`kr=17` 只是 `MAKE_SEND` 不适用。SpringBoard 的回复端口 `a03` 在 422–491 s 的 11 条读数里 `seq 26→29→30`、`cnt=0`，主线程 `0x104` 以 `rem=7c03/753b rn=a03` 做 MIG 式 send+recv，**回信是通的**。屏上始终是 backboardd 的进度条（`frame#0..#2 pixels=41586 box=305x887..755x1029`）；497.143 s backboardd（spid=58）`SIGKILL`，`upc` 落在 `___kill`+0x8，497.336 s `exit t=9s rv=0x9`，到 900 s 没再拉起 | r226：打 kill 发信线程的完整用户寄存器与原始栈字（`ulr=0x10086a144` 落在 backboardd `__TEXT` 之外，未符号化）、SpringBoard 收方向的队首消息、peer 节拍改 4 s 并补 `gone` 收尾行 |
+| 2 | **屏幕上是黑的** | compositor 已连续 present：r225（boot 14）`frame#0..#2`、`copy#1..#3 bytes=9216000`、`scanout/retire done=presented=1..3`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素——那是 backboardd 的引导进度条，不是桌面 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 5 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |

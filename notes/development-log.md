@@ -16727,3 +16727,108 @@ payload 仍是 56 MiB（sha256 `4cd6291609668faccb156c3cd75cc1f97d74cf5eadb7bed3
 没有等到回信，475 s 被 backboardd 的 system-shell 看门狗杀掉，之后 launchd 没有重启它。
 r225 要做的是把 r221/r222 的发送探针与用户栈抓取从 SpringBoard 扩到 pid 1，并在每个
 r224 beat 上读 SpringBoard 最后一个回信端口的 `cnt/seq/rn/ms/sr` 与队首消息头。
+
+## round225 设计（boot 14 待读数）
+
+r224 把接收侧读完了：pid 1 在 60 次采样里没有一条线程停在 `ipc_mqueue_receive`，`807` 端口
+同毫秒 `cnt=0 seq=1372`，说明接收是 dispatch 工人按需做的，卡点不在「launchd 没收」。但 r224
+的窗口里**一条 launchd 发出的 mach 消息都没有**，因为 r221 的发送探针只对 SpringBoard 取样；
+而 SpringBoard 自己 447.918 s / 469.247 s 停在 `ipc_mqueue_receive`、`7b03`/`1d07` 上各压着一条
+`id=40000000` 且无接收者——这一点目前只有「发出去了」和「60 s 没回信」两头，中间那段
+「谁该回、为什么没回」还是空的。
+
+r225 做三件事：
+
+1. **pid 1 的发送探针**：`clover_p1_sample()` 在 launchd 自己的 mach trap 上运行（`copyin`
+   读的是当前任务的 map，换上下文读到的就是另一个进程的同一段虚拟地址），把 `mach_msg2_trap`
+   的调用字、两个端口名及其属主、六帧用户栈（`VME_OFFSET + pc - vme_start`）和消息体前
+   96 字节打成 `clover r225: p1s / p1m2 / p1uf / p1hex`。时钟与变更预算都是 pid 1 自己的，
+   不会花掉 SpringBoard 的 32 条。
+2. **每个 r224 beat 读回信端口**：`clover_sb_sample()` 记下 SpringBoard 最后一次发送的
+   `loc`（回信端口名）与当时 pid；`clover_peer_sample()` 每 8 s 用 `proc_find(pid)` 重新拿
+   task（不保存 task 指针，SpringBoard 会退出），再打印该端口的
+   `cnt/ql/seq/rn/ms/sr/rcv/kobj/wq/km` 与队首头。`sbport` 的格式串改成带轮次参数
+   `"clover %s: sbport ..."`，r223 的两条 `rem`/`loc` 仍打 `r223`，新的一条打 `r225` 并带
+   标签 `rp`。
+3. **契约**：驱动 tee 新增 `{ "clover r225: ", "r225-p1", 192, 0, 0, 0 }`；`check-clover.py`
+   断言新补丁的六条打印、`clover_p1_note_current`/`clover_p1_sample`、`launchd` 的 trap
+   分支、`clover_sb_last_reply` 与 `"rp"` 调用，并要求 `current_task() != task` 仍在；
+   `verify-clover-payload.py` 的 sb 组新增 `p1/p1m2/p1uf/p1hex` 四个 needle，并把 `sbport`
+   needle 改成带 `%s` 轮次的新格式。
+
+构建：`build-xnu-4k-baseline.sh` 的 LATE_PATCH 反向名单把
+`zzzzzzzzzz-clover-p1-sample.patch` 放在最前（它改的是 r223/r224 新增块，必须先离开）。
+内核 `kernel.macho` sha256 `6cd190d21b423803164031fb6f63e76931fc1eb6fe2fa977c04aef35f6b78d48`
+（968 个 object 戳）；归一化后 `round225-kernel-amfi.macho`；payload
+`~/clover-out/round225-payload.img` 56 MiB sha256
+`7637d2761b7f8547c2880d230447a5b124f54635909ff822f0acee02a6e10356`。双闸门通过，冷刷
+cache（`mmcblk0p49`）后等 900 s 死线进 TWRP，再读回 1216 扇区。
+
+## round225 读数（boot 14）
+
+payload 仍 56 MiB（sha256 `7637d2761b7f8547c2880d230447a5b124f54635909ff822f0acee02a6e10356`），
+只冷刷 cache（`mmcblk0p49`），900 s 死线照常 panic 进 TWRP，宿主零 misc 写。读回 623104 B：
+`16 report record(s), 64 driver verdict line(s), 16 probe line(s), 512 kernel log line(s), boot 14`。
+
+1. **launchd 自己在发消息，内容是 libxpc 的**：120 s 心跳在 483/606/727/847 s 给出 4 条 `p1s`，
+   全部 `n=4 c=32`；两条 `p1m2` 都落在同一线程 `0x482`、同一 `op=400000001`（`mach_msg2_trap`）上：
+   - 606.098579 s：`b=12 sz=40 rem=4c85f id=20000000 dc=0`。这里的字段都是十六进制，
+     `sz=0x40`=64 B；消息体头 `12 00 00 00 40 00 00 00` 与之相符，
+     `bits&0xff=0x12` = `MACH_MSG_TYPE_MOVE_SEND_ONCE`，`msgh_id=0x20000000`，
+     体里能读出 `CPX@`、`error`。
+   - 730.375394 s：`b=80000012 sz=74 rem=4744f dc=1`，即 116 B 的复杂消息
+     （`0x80000000` 复杂位），体里带一个描述符，字符串依次是 `CPX@`、`rec_execcnt`、`req_pid`
+     —— 与 r221 在 `libxpc.dylib` 里找到的键名一致，`0x20000000` 也与 XPC 的 id 一致。
+   两条的目标都是 **send-once 权**（`4c85f`/`4744f`）。所以 `sbport rem … kr=17`
+   （`KERN_INVALID_RIGHT`）不是端口坏了：`ipc_object_copyin(…MAKE_SEND…)` 对一个
+   send-once 对象本来就没有 send right 可拿。r225 把「`kr=17` = 端口失效」这个读法否掉。
+2. **栈把发送点落进 libsystem_kernel**：`p1uf f=626241b0.62623fb8.7452b7ec.7452b1d4.7452b048.44828`
+   里的前两个不是地址，是**共享缓存文件偏移**（walker 用 `VME_OFFSET + pc − vme_start` 算的，
+   缓存基址 0x180000000、文件偏移 0）；加回 0x180000000 再减本 boot 的 slide 0x16ae0000，
+   就是 `_mach_msg_overwrite`+0x1ec 与 `_mach_msg`+0x14，往上还有 `_mach_msg2_trap`。
+   后面四个数（`7452b7ec…`、`44828`）在宿主上对不上任何缓存映射，可能是子缓存文件的偏移，
+   **本轮不引作结论**。
+3. **SpringBoard 的回信真的来了**：`sbport … rp nm=a03 cnt=0 ql=5 seq=26→29→30 rn=a03 ms=1 sr=1`，
+   422–491 s 共 11 条。seq 在 430 与 464 s 两次上升，`cnt` 恒为 0——接收者一直在原位，
+   来一条就立刻取走；同一段里 SpringBoard 主线程 `0x104` 正以 `rem=7c03/753b rn=a03`
+   做 MIG 式的 send+recv。**r223/r224 的「launchd 不回信」在本靴不成立**；被回信的是 `a03`
+   （SpringBoard 自己的回复权）。491 s 之后这条读数消失（`proc_find(27)` 拿不到 task），
+   与 497 s 的退出一致。`kobj` 在 430/464/483 s 三处不同（`34f498880`→`34f492f60`→`34fda8380`），
+   而 `seq` 不回零，端口对象还是同一块。
+4. **死因仍是看门狗**：497.143890 s `killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58
+   scomm=backboardd ns=-1 code=0x0 cs=0x22000301`；`killsrc upc=1e2625100 ulr=10086a144
+   insn=540000e3`——`upc` 减 slide 得 `libsystem_kernel.___kill`+0x8，也就是 `svc #0` 那条指令；
+   `ulr=0x10086a144` 落在 backboardd 的 `__TEXT`（0x100000000..0x1000e0000）之外，
+   **这一格还不能符号化**——r226 要把发信线程的完整用户寄存器和原始栈字打出来，
+   别再让内核侧替用户态换算。497.336066 s `exit pid=27 t=9s rv=0x9 ns=2 code=0x9`，
+   之后到 900 s 没有重启。
+5. **屏幕还在出帧，出的是 backboardd 的引导进度**：`frame#0..#2` 每次 `pixels=41586
+   box=305x887..755x1029`，`colours ff000000/2262414 ff070707/24 ff464646/14 ff626262/5
+   other=41543`，`copy#1..#3 bytes=9216000`、`scanout/retire done=presented=1..3`，
+   `client pid=58` 的 selector 6 在 497.421 与 497.456 s 还各 present 一次
+   （`e00002d5` 是 pending 的正常回法）。SpringBoard 被杀时，backboardd 仍在那块
+   450×142 的进度条区域出帧。
+6. **watchdogd 依旧只是噪声**：534.364463 s `crit pid=165`、639.925588 s `crit pid=234`，
+   `rv=0x5 sig=5 fatal=1 crashbits=0x1`，与 r193 的 `panic_on_crash_disabled=1` 一致。
+
+**结论**：r225 把「launchd 没回信」这条线结掉——launchd 在发 XPC 消息（`id=0x20000000`，
+体里有 `error`/`rec_execcnt`/`req_pid`），目标是一次性回信权；SpringBoard 的回复端口 `a03`
+的 `seq` 在涨，MIG 回边也在。真正没有发生的事是「SpringBoard 把桌面画出来」：
+到 497 s 屏上仍是黑底 + backboardd 的进度条，随后 backboardd 用 `SIGKILL` 收走它。
+r226 要问的是 backboardd 为什么判它不健康：把 kill 前 SpringBoard 收发的消息
+（谁发、什么 id、体首字节）与发信线程的完整寄存器/栈读出来。
+
+## round226 设计（boot 15 待读数）
+
+r225 把「回信没到」排除了，剩下的窗口只有 497 s 前那几秒：SpringBoard 被拉起后只活 9 s
+（`exit t=9s`）就被 backboardd 收走，而屏上一直是 backboardd 的进度条。r226 做三件事：
+
+1. **kill 发信者的完整现场**：`psignal_internal` 那一格改成打印发信线程的
+   `pc/sp/fp/lr/x0..x7` 与用户栈原始 8 个字（不再做 `VME_OFFSET` 换算），并用
+   `ipc_entry` 直接读目标端口的接收者进程名——`ulr=0x10086a144` 落在 backboardd
+   `__TEXT` 之外，只有原始寄存器才能判它是另一个 mapping 还是被内核读歪了。
+2. **SpringBoard 的收方向**：r221 的 `sbm2` 只看发送，补一条对 `ipc_mqueue_receive`
+   入口的取样，打出它在等哪个端口、队首消息的 `bits/size/id`，把「谁在叫醒它」落到具体 id。
+3. **beat 提前**：r225 的 `rp` 只在 8 s 节拍上读，497 s 前最后一次是 491 s；
+   把 peer 节拍改成 4 s，并在 `proc_find` 失败时打一条收尾行（`gone`），
+   让「SpringBoard 死了」本身成为一条读数，而不是读数消失。

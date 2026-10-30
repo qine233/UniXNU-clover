@@ -664,6 +664,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // ~115 lines. 192 keeps the whole conversation and still bounds a looping
   // producer.
   { "clover r224: ", "r224-peer", 192, 0, 0, 0 },
+  // Round225 adds launchd's own mach_msg2 reading: one state line per change,
+  // then at most 24 probes of up to five lines each (call words, user frames,
+  // body hex, two port states) over a full boot. 192 holds the worst case and
+  // still bounds a producer that loops harder than pid 1 does.
+  { "clover r225: ", "r225-p1", 192, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

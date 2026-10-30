@@ -1,0 +1,372 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10592,6 +10592,12 @@
+ static uint32_t clover_sb_changes;
+ static char clover_sb_last[256];
+ static char clover_sb_last_m2[1024];
++/* Round225: the beat that samples pid 1 also reads back the reply port that
++ * SpringBoard last handed a message to, so a send whose answer never arrives
++ * is read from both ends on the same clock. The pid is kept instead of the
++ * task: SpringBoard exits, and a stale task pointer would fault the sampler. */
++static int clover_sb_pid;
++static mach_port_name_t clover_sb_last_reply;
+ 
+ void
+ clover_sb_note_current(void)
+@@ -10682,7 +10688,7 @@
+  */
+ static void
+ clover_sb_port_state(task_t task, mach_port_name_t name, const char *tag,
+-    uint64_t secs)
++    uint64_t secs, const char *rn)
+ {
+ 	ipc_space_t space;
+ 	ipc_object_t obj = IPC_OBJECT_NULL;
+@@ -10701,13 +10707,13 @@
+ 		    &obj);
+ 	}
+ 	if (kr != KERN_SUCCESS) {
+-		printf("clover r223: sbport t=%llu %s nm=%x kr=%d\n",
+-		    (unsigned long long)secs, tag, name, kr);
++		printf("clover %s: sbport t=%llu %s nm=%x kr=%d\n",
++		    rn, (unsigned long long)secs, tag, name, kr);
+ 		return;
+ 	}
+ 	if (io_otype(obj) != IOT_PORT) {
+-		printf("clover r223: sbport t=%llu %s nm=%x ty=%d\n",
+-		    (unsigned long long)secs, tag, name, io_otype(obj));
++		printf("clover %s: sbport t=%llu %s nm=%x ty=%d\n",
++		    rn, (unsigned long long)secs, tag, name, io_otype(obj));
+ 		io_unlock(obj);
+ 		return;
+ 	}
+@@ -10718,10 +10724,10 @@
+ 		mach_msg_header_t *mh = (kmsg != NULL) ? ikm_header(kmsg) : NULL;
+ 		ipc_space_t recv = ip_get_receiver(port);
+ 
+-		printf("clover r223: sbport t=%llu %s nm=%x cnt=%u ql=%u seq=%u"
++		printf("clover %s: sbport t=%llu %s nm=%x cnt=%u ql=%u seq=%u"
+ 		    " rn=%x ms=%u sr=%u rcv=%llx/%llx kobj=%llx wq=%llx"
+ 		    " km=%llx h=%x.%x.%x.%x.%x.%x\n",
+-		    (unsigned long long)secs, tag, name,
++		    rn, (unsigned long long)secs, tag, name,
+ 		    (unsigned)port->ip_messages.imq_msgcount,
+ 		    (unsigned)port->ip_messages.imq_qlimit,
+ 		    (unsigned)port->ip_messages.imq_seqno,
+@@ -10965,6 +10971,11 @@
+ 				    sizeof(lo));
+ 				clover_sb_port_owner(task,
+ 				    (mach_port_name_t)mhdr[j][2], ho, sizeof(ho));
++				if ((uint32_t)(r[3] >> 32) != 0) {
++					clover_sb_pid = pid;
++					clover_sb_last_reply =
++					    (mach_port_name_t)(uint32_t)(r[3] >> 32);
++				}
+ 				lw = snprintf(m2lines + loff,
+ 				    sizeof(m2lines) - (size_t)loff,
+ 				    "clover r221: sbm2 t=%llu tid=0x%llx op=%llx"
+@@ -11186,10 +11197,11 @@
+ 				 * sitting there unwoken.
+ 				 */
+ 				clover_sb_port_state(task,
+-				    (mach_port_name_t)(uint32_t)r[3], "rem", secs);
++				    (mach_port_name_t)(uint32_t)r[3], "rem", secs,
++				    "r223");
+ 				clover_sb_port_state(task,
+ 				    (mach_port_name_t)(uint32_t)(r[3] >> 32), "loc",
+-				    secs);
++				    secs, "r223");
+ 				}
+ 			}
+ 		}
+@@ -11284,6 +11296,270 @@
+ 	if (len > 0) {
+ 		line[sizeof(line) - 1] = '\0';
+ 		printf("%s", line);
++	}
++	/*
++	 * Round225. The beat now also reads the other end: the reply port that
++	 * SpringBoard last handed a message to, found again through its pid so
++	 * a dead SpringBoard cannot leave a stale task behind. A reply port
++	 * with cnt=0 on every beat says the answer was never sent; a count
++	 * that appears and stays says it was sent and never taken.
++	 */
++	if (clover_sb_pid > 0 && clover_sb_last_reply != MACH_PORT_NULL) {
++		struct proc *sp = proc_find(clover_sb_pid);
++
++		if (sp != NULL) {
++			task_t st = proc_task(sp);
++
++			if (st != TASK_NULL) {
++				clover_sb_port_state(st, clover_sb_last_reply, "rp",
++				    secs, "r225");
++			}
++			proc_rele(sp);
++		}
++	}
++}
++
++/*
++ * Round225. Round224 said where the wait is not: no launchd thread parks in
++ * ipc_mqueue_receive, so the receiver is not the wall. It could not say what
++ * launchd does instead, because the r221 sender probe only ever ran on
++ * SpringBoard's own mach traps. This sampler runs on launchd's mach traps --
++ * copyin reads through the trapping task's map -- and every thread parked on
++ * mach_msg2_trap carries its call words, both port owners, six user frames
++ * and the first 96 bytes of the body. Its clock and its change budget are
++ * launchd's own, so a busy pid 1 cannot spend SpringBoard's lines.
++ */
++static task_t clover_p1_task;
++static volatile uint32_t clover_p1_ready;
++
++void
++clover_p1_note_current(void)
++{
++	if (__atomic_load_n(&clover_p1_ready, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	task_reference(current_task());
++	clover_p1_task = current_task();
++	__atomic_store_n(&clover_p1_ready, 1, __ATOMIC_RELEASE);
++}
++
++void
++clover_p1_sample(void)
++{
++	static uint64_t p1_last_secs;
++	static uint64_t p1_heartbeat;
++	static uint32_t p1_changes;
++	static uint32_t p1_probes;
++	static char p1_last[512];
++	task_t task;
++	thread_t thr;
++	uint64_t secs;
++	char sig[512];
++	char tokens[256];
++	int soff = 0;
++	int toff = 0;
++	int changed;
++	int heartbeat;
++	uint64_t tids[4];
++	uint64_t x16s[4];
++	uint64_t pcs[4];
++	uint64_t fps[4];
++	uint64_t sps[4];
++	uint64_t m2[4][8];
++	uint32_t n = 0;
++	uint32_t i;
++	uint32_t j;
++
++	if (!__atomic_load_n(&clover_p1_ready, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	task = clover_p1_task;
++	if (task == TASK_NULL || current_task() != task) {
++		return;
++	}
++	secs = clover_now_seconds();
++	if (secs < p1_last_secs + 8) {
++		return;
++	}
++	p1_last_secs = secs;
++	if (!lck_mtx_try_lock(&task->lock)) {
++		return;
++	}
++	tokens[0] = '\0';
++	sig[0] = '\0';
++	queue_iterate(&task->threads, thr, thread_t, task_threads) {
++		arm_saved_state_t *ss;
++		uint64_t pc = 0;
++		int wrote;
++
++		if (n >= 4 || toff >= (int)sizeof(tokens) - 64) {
++			break;
++		}
++		ss = get_user_regs(thr);
++		tids[n] = thr->thread_id;
++		x16s[n] = 0;
++		pcs[n] = 0;
++		fps[n] = 0;
++		sps[n] = 0;
++		for (j = 0; j < 8; j++) {
++			m2[n][j] = 0;
++		}
++		if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1) {
++			pc = (uint64_t)get_saved_state_pc(ss);
++			pcs[n] = pc;
++			if (!is_saved_state32(ss)) {
++				x16s[n] = (uint64_t)saved_state64(ss)->x[16];
++				for (j = 0; j < 8; j++) {
++					m2[n][j] = (uint64_t)saved_state64(ss)->x[j];
++				}
++			}
++			fps[n] = (uint64_t)get_saved_state_fp(ss);
++			sps[n] = (uint64_t)get_saved_state_sp(ss);
++		}
++		wrote = snprintf(tokens + toff, sizeof(tokens) - (size_t)toff,
++		    " %llx:%d:%llx:%llx:%llx",
++		    (unsigned long long)thr->thread_id, thr->state,
++		    (unsigned long long)thr->wait_event,
++		    (unsigned long long)(uintptr_t)thr->continuation,
++		    (unsigned long long)pc);
++		if (wrote <= 0 || wrote >= (int)(sizeof(tokens) - (size_t)toff)) {
++			tokens[toff] = '\0';
++			break;
++		}
++		toff += wrote;
++		n++;
+ 	}
++	lck_mtx_unlock(&task->lock);
++	if (n == 0) {
++		return;
++	}
++	for (i = 0; i < n; i++) {
++		int sw = snprintf(sig + soff, sizeof(sig) - (size_t)soff,
++		    " %llx:%llx:%llx:%llx:%llx",
++		    (unsigned long long)tids[i], (unsigned long long)pcs[i],
++		    (unsigned long long)x16s[i], (unsigned long long)m2[i][0],
++		    (unsigned long long)m2[i][3]);
++
++		if (sw <= 0 || sw >= (int)(sizeof(sig) - (size_t)soff)) {
++			break;
++		}
++		soff += sw;
++	}
++	changed = (strcmp(sig, p1_last) != 0);
++	heartbeat = (secs >= p1_heartbeat + 120);
++	if (!changed && !heartbeat) {
++		return;
++	}
++	if (changed && p1_changes >= 32) {
++		if (!heartbeat) {
++			return;
++		}
++		changed = 0;
++	}
++	p1_heartbeat = secs;
++	if (changed) {
++		p1_changes++;
++		strlcpy(p1_last, sig, sizeof(p1_last));
++	}
++	printf("clover r225: p1s t=%llu pid=%d n=%u c=%u%s%s\n",
++	    (unsigned long long)secs, task_pid(task), n, p1_changes,
++	    changed ? " chg" : "", tokens);
++	for (i = 0; i < n && p1_probes < 24; i++) {
++		uint64_t *r = m2[i];
++		uint32_t hdr[6] = { 0, 0, 0, 0, 0, 0 };
++		uint32_t bits;
++		uint32_t ssz;
++		char ro[24];
++		char lo[24];
++
++		if (x16s[i] != (uint64_t)-47 || r[0] == 0) {
++			continue;
++		}
++		(void)copyin((user_addr_t)r[0], hdr, sizeof(hdr));
++		clover_sb_port_owner(task, (mach_port_name_t)(uint32_t)r[3],
++		    ro, sizeof(ro));
++		clover_sb_port_owner(task,
++		    (mach_port_name_t)(uint32_t)(r[3] >> 32), lo, sizeof(lo));
++		bits = (uint32_t)r[2];
++		ssz = (uint32_t)(r[2] >> 32);
++		printf("clover r225: p1m2 t=%llu tid=0x%llx op=%llx b=%x sz=%x"
++		    " rem=%x loc=%x id=%x dc=%x rn=%x rs=%x ro=%s lo=%s"
++		    " h=%x.%x.%x.%x.%x.%x\n",
++		    (unsigned long long)secs, (unsigned long long)tids[i],
++		    (unsigned long long)r[1], bits, ssz,
++		    (uint32_t)r[3], (uint32_t)(r[3] >> 32),
++		    (uint32_t)(r[4] >> 32), (uint32_t)r[5],
++		    (uint32_t)(r[5] >> 32), (uint32_t)r[6],
++		    ro[0] ? ro : "-", lo[0] ? lo : "-",
++		    hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5]);
++		{
++			uint64_t frames[6] = { 0, 0, 0, 0, 0, 0 };
++			vm_map_entry_t entry = VM_MAP_ENTRY_NULL;
++			vm_map_t map = current_map();
++			uint32_t fn;
++			uint32_t k;
++			char fo[256];
++			int foff = 0;
++
++			fn = clover_user_fp_walk(fps[i], sps[i], frames, 6);
++			fo[0] = '\0';
++			for (k = 0; k < fn && foff < (int)sizeof(fo) - 24; k++) {
++				uint64_t off = 0;
++				uint64_t fa = frames[k];
++
++				if (map != VM_MAP_NULL) {
++					vm_map_lock_read(map);
++					if (vm_map_lookup_entry(map,
++					    (vm_map_offset_t)(fa & ~0xfffULL),
++					    &entry) &&
++					    entry != VM_MAP_ENTRY_NULL &&
++					    fa >= (uint64_t)entry->vme_start &&
++					    fa < (uint64_t)entry->vme_end) {
++						off = (uint64_t)VME_OFFSET(entry) +
++						    (fa - (uint64_t)entry->vme_start);
++					}
++					vm_map_unlock_read(map);
++				}
++				foff += snprintf(fo + foff,
++				    sizeof(fo) - (size_t)foff, "%s%llx",
++				    k ? "." : "", (unsigned long long)off);
++			}
++			if (fn > 0) {
++				printf("clover r225: p1uf t=%llu tid=0x%llx"
++				    " n=%u f=%s\n",
++				    (unsigned long long)secs,
++				    (unsigned long long)tids[i], fn, fo);
++			}
++		}
++		if (ssz > 0 && (bits & 0xff) != 0) {
++			unsigned char hb[96];
++			char hx[200];
++			uint32_t hlim = (ssz < (uint32_t)sizeof(hb)) ?
++			    ssz : (uint32_t)sizeof(hb);
++			uint32_t k;
++			int ho = 0;
++
++			if (copyin((user_addr_t)r[0], hb, hlim) == KERN_SUCCESS) {
++				hx[0] = '\0';
++				for (k = 0; k < hlim; k++) {
++					ho += snprintf(hx + ho,
++					    sizeof(hx) - (size_t)ho, "%02x", hb[k]);
++					if (ho >= (int)sizeof(hx) - 3) {
++						break;
++					}
++				}
++				printf("clover r225: p1hex t=%llu tid=0x%llx"
++				    " sz=%x n=%x %s\n",
++				    (unsigned long long)secs,
++				    (unsigned long long)tids[i], ssz, hlim, hx);
++			}
++		}
++		clover_sb_port_state(task, (mach_port_name_t)(uint32_t)r[3],
++		    "rem", secs, "r225");
++		clover_sb_port_state(task,
++		    (mach_port_name_t)(uint32_t)(r[3] >> 32), "loc", secs,
++		    "r225");
++		p1_probes++;
++	}
+ }
+ #endif /* __arm64__ */
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -243,9 +243,17 @@
+ 		extern void clover_sb_note_current(void);
+ 		extern void clover_sb_sample(void);
+ 		extern void clover_peer_sample(void);
++		extern void clover_p1_note_current(void);
++		extern void clover_p1_sample(void);
+ 
+ 		if (strncmp(p->p_comm, "SpringBoard", 16) == 0) {
+ 			clover_sb_note_current();
++		}
++		/* Round225: pid 1's own mach traps are the only place copyin can
++		 * read launchd's stack, so its sampler runs here. */
++		if (strncmp(p->p_comm, "launchd", 16) == 0) {
++			clover_p1_note_current();
++			clover_p1_sample();
+ 		}
+ 		clover_sb_sample();
+ 		clover_peer_sample();

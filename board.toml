@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r224: launchd's own threads at the blocked send -- round223 left the reply port 0xa03 empty and the 24-byte request still sitting at seqno 0 on launchd's port, so every eight seconds the kernel now walks the threads of pid 1 and prints each one's state, wait event, continuation and pc: a thread parked in ipc_mqueue_receive while that port holds messages means the wakeup was lost, and a receiver running anything else means the request was never asked for"
+title = "clover r225: launchd sends too -- the r224 beat never saw a launchd mach message because the sender probe only watched SpringBoard; r225 samples pid 1 on its own traps and reads the reply port at every beat"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
