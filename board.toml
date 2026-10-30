@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r228: the dump that cannot be lost -- each SpringBoard generation's kill dumps its own receive-ring window (per-victim-pid guard), entries carry pid+generation, the dump prints a spin-locked snapshot, and a compact rcdump/rce tail goes into the driver's probe ring; the unattended deadline moves to 1800 s so generation C gets its full window"
+title = "clover r229: a ring that describes the boot it covers -- the tee drops the bare apfs event tails, keeps two lines per nagging producer and four exits per command, and the kernel reads the receiver of the blocked send: backboardd's own threads and the queue behind the name, once per changed batch"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

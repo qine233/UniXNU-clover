@@ -1,0 +1,171 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 4419e5e..f58a701 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10840,6 +10840,104 @@ clover_sb_port_state(task_t task, mach_port_name_t name, const char *tag,
+ 	}
+ 	io_unlock(obj);
+ }
++/*
++ * Round229. Round228 narrowed the stall to one send whose remote owner is
++ * backboardd, and round224 already proved the shape of reading a receiver:
++ * sample that task's own threads. The difference is who is asked. A daemon
++ * can exit while this runs, so the proc reference taken here keeps the task
++ * alive across the walk and every early exit drops it; the task lock is
++ * try-locked so a wedged receiver cannot wedge the SpringBoard sampler; and
++ * the whole read is capped because the caller fires it whenever the blocked
++ * request changes. The port is read in the sender's space: the name there is
++ * a send right at the same port object, so its queue count says whether the
++ * request backboardd never answered is still sitting in its receiver.
++ */
++static void
++clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
++{
++	static uint32_t bb_fired;
++	static uint32_t bb_beats;
++	struct proc *p;
++	extern struct proc *proc_find(int pid);
++	extern task_t proc_task(struct proc *p);
++	extern int proc_rele(struct proc *p);
++	task_t task;
++	thread_t thr;
++	char tokens[224];
++	char line[320];
++	int toff = 0;
++	int len;
++	int sc;
++	int act;
++	uint32_t n = 0;
++
++	if (pid <= 0 || sb_task == TASK_NULL) {
++		return;
++	}
++	if (bb_fired >= 24) {
++		return;
++	}
++	bb_fired++;
++	p = proc_find(pid);
++	if (p == NULL) {
++		printf("clover r229: bb t=%llu pid=%d n=%u gone\n",
++		    (unsigned long long)secs, pid, bb_fired);
++		return;
++	}
++	task = proc_task(p);
++	if (task == TASK_NULL) {
++		proc_rele(p);
++		printf("clover r229: bb t=%llu pid=%d n=%u notask\n",
++		    (unsigned long long)secs, pid, bb_fired);
++		return;
++	}
++	if (!lck_mtx_try_lock(&task->lock)) {
++		proc_rele(p);
++		printf("clover r229: bb t=%llu pid=%d n=%u busy\n",
++		    (unsigned long long)secs, pid, bb_fired);
++		return;
++	}
++	sc = task->suspend_count;
++	act = task->active;
++	tokens[0] = '\0';
++	queue_iterate(&task->threads, thr, thread_t, task_threads) {
++		arm_saved_state_t *ss;
++		uint64_t pc = 0;
++		int wrote;
++
++		if (n >= 4 || toff >= (int)sizeof(tokens) - 64) {
++			break;
++		}
++		ss = get_user_regs(thr);
++		if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1) {
++			pc = (uint64_t)get_saved_state_pc(ss);
++		}
++		wrote = snprintf(tokens + toff, sizeof(tokens) - (size_t)toff,
++		    " %llx:%d:%llx:%llx:%llx",
++		    (unsigned long long)thr->thread_id, thr->state,
++		    (unsigned long long)thr->wait_event,
++		    (unsigned long long)(uintptr_t)thr->continuation,
++		    (unsigned long long)pc);
++		if (wrote <= 0 || wrote >= (int)(sizeof(tokens) - (size_t)toff)) {
++			tokens[toff] = '\0';
++			break;
++		}
++		toff += wrote;
++		n++;
++	}
++	lck_mtx_unlock(&task->lock);
++	proc_rele(p);
++	bb_beats++;
++	len = snprintf(line, sizeof(line),
++	    "clover r229: bb t=%llu pid=%d n=%u sc=%d act=%d k=%u f=%u%s\n",
++	    (unsigned long long)secs, pid, n, sc, act, bb_beats, bb_fired,
++	    tokens);
++	if (len > 0) {
++		line[sizeof(line) - 1] = '\0';
++		printf("%s", line);
++	}
++	clover_sb_port_state(sb_task, name, "bb", secs, "r229");
++}
+ /*
+  * One line carries every thread: tid:state:wait:continuation:pc per thread.
+  * The continuation is what names a blocked thread's wait -- wait_event is zero
+@@ -11010,6 +11108,8 @@ clover_sb_sample(void)
+ 		uint32_t npick = 0;
+ 		int soff = 0;
+ 		int loff = 0;
++		int bb_pid = 0;
++		mach_port_name_t bb_name = MACH_PORT_NULL;
+ 
+ 		m2sig[0] = '\0';
+ 		m2lines[0] = '\0';
+@@ -11061,6 +11161,34 @@ clover_sb_sample(void)
+ 				    sizeof(lo));
+ 				clover_sb_port_owner(task,
+ 				    (mach_port_name_t)mhdr[j][2], ho, sizeof(ho));
++				/*
++				 * Round229: remember the first picked thread
++				 * whose destination is backboardd. The name
++				 * arrives as "%d:%s" from port_owner, so the
++				 * pid is read back by hand and the destination
++				 * name in this thread's own registers is kept
++				 * for the queue read after the sample.
++				 */
++				if (bb_pid == 0 && ro[0] != '\0') {
++					unsigned long pidv = 0;
++					int c;
++					int g;
++
++					for (c = 0; ro[c] != '\0' && ro[c] != ':';
++					    c++) {
++						if (ro[c] < '0' || ro[c] > '9') {
++							pidv = 0;
++							break;
++						}
++						pidv = pidv * 10 +
++						    (unsigned long)(ro[c] - '0');
++					}
++					if (pidv > 0 && ro[c] == ':' &&
++					    strncmp(ro + c + 1, "backboardd", 10) == 0) {
++						bb_pid = (int)pidv;
++						bb_name = (mach_port_name_t)(uint32_t)r[3];
++					}
++				}
+ 				if ((uint32_t)(r[3] >> 32) != 0) {
+ 					clover_sb_pid = pid;
+ 					clover_sb_last_reply =
+@@ -11096,6 +11224,17 @@ clover_sb_sample(void)
+ 				printf("%s", m2lines);
+ 			}
+ 
++			/*
++			 * Round229. The batch named backboardd as a destination,
++			 * so the receiver is read now -- while the sender still
++			 * sits in the trap and the queue still holds what it
++			 * holds. Once per batch: the batch itself only runs when
++			 * the numeric signature changed.
++			 */
++			if (bb_pid != 0) {
++				clover_bb_sample(bb_pid, task, bb_name, secs);
++			}
++
+ 			/*
+ 			 * Round221. A name says who is being called; it does not say
+ 			 * where the caller sits. Each picked thread now carries the

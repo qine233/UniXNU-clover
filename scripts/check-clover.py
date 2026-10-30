@@ -814,6 +814,10 @@ def check_board(errors: list) -> str:
             errors.append("drivers/CloverSdhci gives round228's receive dump no tee class: three "
                           "generations of kill dumps (129 lines each) plus the sbtask lines would "
                           "land in the ring uncounted and evict the earlier readings")
+        if '{ "clover r229: ", "r229-bb", 64, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round229's receiver sample no tee class: a "
+                          "thread line and a queue line per changed batch would land in the ring "
+                          "uncounted")
         if '{ "clover r217: ", "r217-sbs", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round217's live sample no tee class: a line "
                           "that changes every eight seconds for the length of the boot would land "
@@ -988,6 +992,42 @@ def check_board(errors: list) -> str:
                                   "dump guard, the pid/gen stamp, the locked snapshot or the "
                                   "probe-ring tail could not land on the card")
 
+        r229_patch = next((base / "patches/xnu-clover/zzzzzzzzzzzzzz-clover-r229.patch"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover/zzzzzzzzzzzzzz-clover-r229.patch").is_file()),
+                          None)
+        if r229_patch is None:
+            errors.append("patches/xnu-clover/zzzzzzzzzzzzzz-clover-r229.patch is missing: boot 17 "
+                          "ended on a send to backboardd nobody answered, and the receiver has to "
+                          "be read on its own clock")
+        else:
+            r229_text = r229_patch.read_text()
+            for needle in ('"clover r229: bb t=%llu pid=%d n=%u sc=%d act=%d k=%u f=%u%s\\n"',
+                           '"clover r229: bb t=%llu pid=%d n=%u gone\\n"',
+                           '"clover r229: bb t=%llu pid=%d n=%u busy\\n"',
+                           'strncmp(ro + c + 1, "backboardd", 10)',
+                           "clover_bb_sample(bb_pid, task, bb_name, secs)",
+                           'clover_sb_port_state(sb_task, name, "bb", secs, "r229")',
+                           "lck_mtx_try_lock(&task->lock)",
+                           "bb_fired >= 24"):
+                if needle not in r229_text:
+                    errors.append(f"{r229_patch.name} lacks {needle[:56]!r}: the receiver's own "
+                                  "threads, the queue behind the name, or the bound that keeps a "
+                                  "respawning daemon from filling the ring could not be read")
+
+        # Round229's first cut is negative: three producers filled half the kernel ring with lines
+        # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
+        # respawn), so the ring started 400 s into the boot. The filters have to be in the object, and
+        # their counters have to be reported at the drain, or a ring that starts late again cannot be
+        # told from a filter that never ran.
+        for needle in ("static uint32_t teeStampSkip (const char *line, uint32_t length)",
+                       "static bool teeExitCommKey (const char *line, uint32_t length, TeeExitComm **entry)",
+                       "static bool teeNagSource (const char *line, uint32_t length, uint32_t *hash)",
+                       "CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u dropped=%u comms=%u\\n"):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci lacks {needle[:52]!r}: the ring would again "
+                              "spend half its records on the three producers r229 filters out, "
+                              "and a late start would not name which one filled it")
         if "CloverSdhci r212: panic tail lines=%u unseen=%u bufx=%d tee=%u boot=%u" not in sdhci_source:
             errors.append("drivers/CloverSdhci has no round212 panic-time tail read: a boot whose "
                           "block path stops would again take the kernel ring with it, and without "
@@ -1963,8 +2003,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r228:"):
-        errors.append('[payload] title is not "clover r228: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r229:"):
+        errors.append('[payload] title is not "clover r229: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3012,8 +3052,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r228:"):
-        errors.append('[payload] title is not "clover r228: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r229:"):
+        errors.append('[payload] title is not "clover r229: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

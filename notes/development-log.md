@@ -17061,3 +17061,35 @@ TWRP，panic 自写 BCB，宿主零 misc 写。四个仪器全部兑现：
 2. **内核：卡住的发送在对面排队**。当 sbm2 当前请求 `ro=58:backboardd` 时，按 r224 的
    trylock 采样器样法采 backboardd（pid 58）的线程（各 tid:state:wait:pc），并读它收队列的
    `ql/rcv`——回答「3403 这条在不在 58 的队里、58 的主线程卡在哪」。死线保持 1800 s。
+
+## r229 构建（发布 v0.5.92）
+
+1. **补丁**：`patches/xnu/zzzzzzzzzzzzzz-clover-r229.patch`（171 行，14 个 z 排在 glob 最末），
+   同一文件同步到 `patches/xnu-clover/`。`build-xnu-4k-baseline.sh` 的 LATE_PATCH 名单把它列为
+   **第一项**——它堆在 `zzzzzzzz-clover-sb-sample`（r217/r224/r225 所在）之上，剥离时必须先反剥它。
+2. **合成方式**：新增 `clover_bb_sample(pid, sb_task, name, secs)` 放在 `clover_sb_port_state`
+   之后、`clover_sb_sample` 之前；sbm2 批次循环内手解 `ro` 的 `pid:name`（不用 strchr/strtoul，
+   本树 task.c 无先例，只用 strncmp），认出 `backboardd` 后在 **`lck_mtx_unlock(&task->lock)`
+   之后**触发——m2 块本身就在 SpringBoard 采样器的解锁之后运行，因此不会嵌套 task 锁。
+   采样器走 r224 的 `lck_mtx_try_lock` + gone/notask/busy 三类早退，`bb_fired >= 24` 封顶；
+   每行只带 4 个线程的 `tid:state:wait:continuation:pc` 五元组（tee 单条记录 320 字节，
+   tokens 缓冲 224 B，表头另用 `line[320]`，避免与 tokens 重叠）。收尾调
+   `clover_sb_port_state(sb_task, name, "bb", secs, "r229")`——用发送方 space 里的 send right
+   读同一个 port object 的 `cnt/ql/rcv`，直接回答「3403 还在不在 58 队里」。
+3. **驱动**：`CloverSdhci.cpp` 的 tee 负过滤（`teeStampSkip`/`teeNagSource`/`teeExitCommKey` +
+   `gTeeFlDropped` + drain 尾行）已编译，本轮再给 r229 内核行加类预算
+   `{ "clover r229: ", "r229-bb", 64, ... }`，否则新行会被 probe 配额挡在环外。
+   `scripts/build-arm-driver.py CloverSdhci` 在组装树 `-Werror` 通过。
+4. **闸门**：`check-clover.py`（title 升 `clover r229:`、新增 r229 补丁 needles + 驱动过滤 needles +
+   tee 类断言）与 `verify-clover-payload.py`（新增 `bb`/`bbgone`/`tee-filter` 三项）
+   在组装树 `out/clover/tree` 全绿：verify 49 OK / 0 FAIL。
+5. **产物**：内核 `510b1883ec862929a13f68bbf15ca4412e6626f67315c055c867d648f650717c` →
+   `patch-clover-amfi.py` 两刀仍落在与 r186–r228 相同的站点（文件偏移 0x1abf0e4 / 0x1abf16c）→
+   `normalize-kernel-macho.py` 清掉 968 个 build-uuid 戳 →
+   `round229-kernel-amfi.macho` sha256 `f13745a9079e0c04d251124cee57fca022f9fc510f2078397af9bf851b0b5739`；
+   payload `round229-payload.img` sha256 `3c441d9e14c07da5ce005e036e8119c9b347f73e9334a186cd92fac75d7017e9`
+   （58,720,256 B）。
+6. **冷刷**：设备先在 TWRP，`adb -s 81ffcaaa reboot bootloader` 回 fastboot；唯一主机写入分区是
+   **cache = mmcblk0p49**（承载内核日志环与 kill dump 的位置，历来如此），misc 只读不写、BCB 由
+   内核自己落。`fastboot flash cache round229-payload.img` → `fastboot reboot`，
+   无人值守脚本 `--boot-after-flash --out round229-log-window.bin` 观察 2100 s。

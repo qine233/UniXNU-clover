@@ -684,6 +684,10 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // generations -- so the budget covers three dumps plus the sbtask lines and
   // still bounds a producer that loops harder than SpringBoard does.
   { "clover r228: ", "r228-rcv", 480, 0, 0, 0 },
+  // Round229 reads the receiver of the blocked send instead of guessing it: one thread line and one
+  // queue line per batch that names backboardd, and the kernel fires it at most 24 times. 64 holds
+  // the whole conversation and still bounds a producer that loops harder than a boot does.
+  { "clover r229: ", "r229-bb", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -3497,6 +3501,158 @@ static void flushVerdictRing (void)
 }
 
 // ------------------------------------------------------------------ round175: the kernel log tee
+static uint32_t teeStringLength (const char *s);
+static bool teeHasPrefix (const char *line, uint32_t length, const char *prefix);
+
+// Round229: the negative filters. Boot 17 counted the ring's residents: 141 copies of a bare
+// "fl=0x14809021 vt=1 fs=apfs" tail (a lap or a writer that does not end its line leaves the tail
+// of an r170 open line standing alone, and the tail carries "apfs", so the allowlist let every copy
+// in), 97 "r170: exit" lines from bluetoothd and fairplayd.A2 respawning at t=17-19 s, and 14
+// CoreAnalyticsHub nag lines. Together they ate half of a 512-record ring whose whole job is to
+// cover the boot, and the reading this port needs -- what generation 2 did after 1482 s -- fell
+// into the records the noise displaced. Each filter is keyed on what makes the noise repeatable,
+// not on one day's magic value, and each drop is counted so the census can say what was filtered.
+static uint32_t gTeeFlDropped = 0;      // bare fl=... fs=apfs tails
+static uint32_t gTeeNagDropped = 0;     // nag lines past two per source
+static uint32_t gTeeExitKept = 0;       // exit lines inside the per-comm budget
+static uint32_t gTeeExitDropped = 0;    // exit lines past the per-comm budget
+
+struct TeeExitComm {
+  char name[32];
+  uint32_t kept;
+};
+static const uint32_t kTeeExitComms = 16;      // distinct comm= values tracked
+static const uint32_t kTeeExitPerComm = 4;     // exit lines kept per comm
+static TeeExitComm gTeeExitTable[kTeeExitComms];
+static uint32_t gTeeExitCommsUsed = 0;
+
+// The definitions of teeStringLength and teeHasPrefix follow; these filters are placed above the
+// allowlist matcher because teeConsumeLine calls them before it consults the allowlist.
+static const char kTeeNagToken[] = "handleNagTimerExpiry";
+static const uint32_t kTeeNagSources = 8;      // distinct producers tracked
+static const uint32_t kTeeNagPerSource = 2;    // lines kept per producer
+static uint32_t gTeeNagTable[kTeeNagSources];  // hash of the producer name, 0 = free row
+static uint32_t gTeeNagKept[kTeeNagSources];
+
+// A nag line names its producer before the callback ("CoreAnalyticsHub::handleNagTimerExpiry..."),
+// and "per source" means per producer: the bytes before "::handleNag" are the key. The scan starts
+// after a "[ <mono>]: " timestamp so different sources do not hash to their stamp's digits.
+static uint32_t teeStampSkip (const char *line, uint32_t length)
+{
+  if (!length || line[0] != '[') {
+    return 0;
+  }
+  uint32_t i = 0;
+  while (i < length && line[i] != ']') {
+    i++;
+  }
+  if (i >= length) {
+    return 0;
+  }
+  i++;
+  while (i < length && (line[i] == ':' || line[i] == ' ')) {
+    i++;
+  }
+  return i;
+}
+
+// The value of comm=<name> in a line, as length bytes into `out`; zero if the line has no comm=
+// or the table is full. Boot 17's names were short (bluetoothd, fairplayd.A2); 31 characters of a
+// trailing name is the whole question "which process is looping", and a longer one is truncated,
+// not dropped.
+static bool teeExitCommKey (const char *line, uint32_t length, TeeExitComm **entry)
+{
+  const char *const token = "comm=";
+  const uint32_t width = teeStringLength (token);
+  uint32_t at = 0;
+  while (at + width <= length) {
+    if (teeHasPrefix (line + at, length - at, token)) {
+      break;
+    }
+    at++;
+  }
+  if (at + width > length) {
+    return false;
+  }
+  uint32_t start = at + width;
+  uint32_t n = 0;
+  while (start + n < length && n < sizeof ((*entry)->name) - 1 &&
+         line[start + n] != ' ' && line[start + n] != '\r') {
+    n++;
+  }
+  // Compare against the tracked names, and claim a free row for a new one.
+  for (uint32_t i = 0; i < gTeeExitCommsUsed; i++) {
+    TeeExitComm *cand = &gTeeExitTable[i];
+    if (n == teeStringLength (cand->name)) {
+      uint32_t j = 0;
+      while (j < n && cand->name[j] == line[start + j]) {
+        j++;
+      }
+      if (j == n) {
+        *entry = cand;
+        return true;
+      }
+    }
+  }
+  if (gTeeExitCommsUsed >= kTeeExitComms) {
+    *entry = &gTeeExitTable[0];   // full table: reuse row 0's budget, counting its drops
+    return true;
+  }
+  TeeExitComm *fresh = &gTeeExitTable[gTeeExitCommsUsed];
+  for (uint32_t i = 0; i < n; i++) {
+    fresh->name[i] = line[start + i];
+  }
+  fresh->name[n] = '\0';
+  gTeeExitCommsUsed++;
+  *entry = fresh;
+  return true;
+}
+
+// The producer's own name, walked backwards from "::handleNagTimerExpiry" so a leading timestamp
+// cannot enter the key: skip the ':' pair, collect at most 32 bytes until a space, '(' or ':', and
+// FNV-1a the result. A line that carries the token without a name before it hashes nothing and is
+// filtered as its source's surplus would be -- an anonymous nag is still a nag.
+static bool teeNagSource (const char *line, uint32_t length, uint32_t *hash)
+{
+  const uint32_t width = teeStringLength (kTeeNagToken);
+  uint32_t at = 0;
+  bool found = false;
+  while (at + width <= length) {
+    if (teeHasPrefix (line + at, length - at, kTeeNagToken)) {
+      found = true;
+      break;
+    }
+    at++;
+  }
+  if (!found || at == 0) {
+    return false;
+  }
+  uint32_t i = at;
+  while (i > 0 && line[i - 1] == ':') {
+    i--;
+  }
+  char name[32];
+  uint32_t n = 0;
+  while (i > 0 && n < sizeof (name) && line[i - 1] != ' ' && line[i - 1] != '(' &&
+         line[i - 1] != ':' && line[i - 1] != '\t') {
+    i--;
+    name[n] = line[i];
+    n++;
+  }
+  if (n == 0) {
+    return false;
+  }
+  uint32_t h = 2166136261u;
+  for (uint32_t j = 0; j < n; j++) {
+    h = (h ^ (unsigned char) name[n - 1 - j]) * 16777619u;
+  }
+  if (h == 0) {
+    h = 1;
+  }
+  *hash = h;
+  return true;
+}
+
 static uint32_t teeStringLength (const char *s)
 {
   uint32_t length = 0;
@@ -3606,6 +3762,69 @@ static void teeConsumeLine (uint32_t &pushed)
   gTeeSeen++;
   if (teeHasPrefix (gTeeLine + start, length - start, "CloverSdhci ")) {
     return;
+  }
+  // Round229 filter 1: a line that *starts* with the fl=/vt=/fs= tail of an r170 open reading,
+  // once its "[ <mono>]: " stamp is skipped, is that tail printed alone -- a lap, or a writer
+  // whose line got split. The whole open reading exists elsewhere in the ring; the tail alone
+  // carries no information beyond "apfs", which is exactly the token that let it in.
+  {
+    const uint32_t unstamped = teeStampSkip (gTeeLine + start, length - start);
+    if (teeHasPrefix (gTeeLine + start + unstamped, length - start - unstamped, "fl=")) {
+      gTeeFlDropped++;
+      return;
+    }
+  }
+  // Round229 filter 2: the analytics nag repeats on a timer for as long as anyone is alive to
+  // service it. Two lines per producer proves the timer runs; the rest is a clock in the ring.
+  {
+    uint32_t hash = 0;
+    if (teeNagSource (gTeeLine + start, length - start, &hash)) {
+      uint32_t slot = 0;
+      bool found = false;
+      for (uint32_t i = 0; i < kTeeNagSources; i++) {
+        if (gTeeNagTable[i] == hash) {
+          slot = i;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        for (slot = 0; slot < kTeeNagSources; slot++) {
+          if (gTeeNagTable[slot] == 0) {
+            gTeeNagTable[slot] = hash;
+            break;
+          }
+        }
+        if (slot >= kTeeNagSources) {
+          slot = 0;   // table full: fold a new source into slot 0's budget
+          gTeeNagTable[0] = hash;
+          gTeeNagKept[0] = 0;
+        }
+      }
+      if (gTeeNagKept[slot] < kTeeNagPerSource) {
+        gTeeNagKept[slot]++;
+      } else {
+        gTeeNagDropped++;
+        return;
+      }
+    }
+  }
+  // Round229 filter 3: r170's exit lines. Round195 left them uncapped because "a process dying is
+  // what a stop is read from" -- true of the first four, false of the ninety-seventh bluetoothd.
+  // The first kTeeExitPerComm per comm survive with their pid; the surplus is counted and the
+  // count reaches the ring as one tail line from the census block below.
+  if (teeHasPrefix (gTeeLine + start + teeStampSkip (gTeeLine + start, length - start),
+                    length - start - teeStampSkip (gTeeLine + start, length - start),
+                    "clover r170: exit ")) {
+    TeeExitComm *comm = nullptr;
+    if (teeExitCommKey (gTeeLine + start, length - start, &comm)) {
+      if (comm->kept >= kTeeExitPerComm) {
+        gTeeExitDropped++;
+        return;
+      }
+      comm->kept++;
+      gTeeExitKept++;
+    }
   }
   if (!teeLineMatches (gTeeLine + start, length - start)) {
     return;
@@ -3979,6 +4198,11 @@ static void panicDrainRings (void)
   // drained above, so the one record is written here rather than left for a flush that will not come.
   teeSay ("CloverSdhci r184: panic drain wrote=%u dropped=%u tee_passes=%u\n",
           gPanicDrainWritten, gPanicDrainDropped, kPanicTeePasses);
+  // Round229: the filter counts, at the one moment they are final. Without this line a host that
+  // finds the ring starting at 400 s cannot tell whether the earlier lines were lapped or dropped
+  // on purpose, and the whole point of filtering was to make the ring's coverage readable.
+  teeSay ("CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u dropped=%u comms=%u\n",
+          gTeeFlDropped, gTeeNagDropped, gTeeExitKept, gTeeExitDropped, gTeeExitCommsUsed);
   // Round212: the exit line is queued before the last flush so it rides with it, and it repeats the
   // boot id: a pair of lines with the same id is one boot's drain seen from both ends.
   panicTailSay ("CloverSdhci r212: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u "
