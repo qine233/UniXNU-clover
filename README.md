@@ -10,21 +10,24 @@ launchd 把守护进程拉起来；r202 让 `IOMobileFramebufferLegacy` attach +
 （`done/presented=4`、每帧 9 216 000 字节），但整屏仍是黑的——SpringBoard 没有把界面画上去，
 450–535 s 时被 backboardd 的系统 shell 看门狗用 `kill(2)` 杀掉。
 
-r222 读数（boot 11）：**阻塞点这次有了一整条调用链**。SpringBoard 主线程（tid `0x104`）在
-403/411/423/436 s 四次采样完全一致，六帧从下到上依次是
-`_mach_msg_overwrite+0x1ec` → `_mach_msg+0x14` → libdispatch（`0x18f56dd28+0x20c`）→
-libdispatch（`0x18f56e2a4+0x38`）→ **`libxpc._xpc_connection_send_message_with_reply_sync+0x100`** →
-Foundation thunk（`0x186e80d04+0xc`）。宿主反汇编该 thunk 只有一条尾调 `bl 0x187548f50`，而它 `b`
-进 libxpc 的同步发送，所以 x30 直接回到 thunk+0xc——调用者就是 Foundation 的一条同步 XPC 请求。
-**它等的是什么也读出来了**：395.171 s 主线程往 launchd 端口 `0x3f07` 发了一条 24 字节空体的同步请求
-（`msgh_id=0x5b9173`，reply 端口 `0xa03`，16 KiB）；403 s 起每次采样都是纯收
-`op=40700420e b=0 sz=0 rn=a03 rs=4000`，一直到 446.42 s 被 backboardd `kill(9)`（`spid=58`）、
-456.1 s 退出（`rv=0x9`）都没收到回信。launchd 在 450 s 之后到 912.9 s 一直没再拉起 SpringBoard，
-同期 bluetoothd / fairplayd.A2 每 ~5 s 成对 spawn/exit——launchd 自己也不正常。其余活动线程分别是
-`notify_post`（tid `0x168`）、XPC 发送（`0x40f`）、给 logd 发 36 字节 `h=13.0.1b03.0.0.2d52`
-（`0x411`）、`__kernelrpc_mach_port_is_connection_for_service+0x80`（`0x41c`）。缺口收窄成一句话：
-**SpringBoard 卡在一条发给 launchd 的同步 XPC 上，launchd 回没回、回了为什么没唤醒都不清楚；
-r223 直接读两端端口的内核状态（消息队列、msgcount、waitq、srights），把这两种可能分开。**
+r223 读数（boot 12）：**回信根本没发出**。主线程（tid `0x104`）在 443.990512 s 仍是一次
+send+receive：`op=400304003 b=131513 sz=18`（24 B）`rem=2e03 loc=1d03 vou=a03 id=5b9173
+rn=1d03 rs=44 ro=1:launchd lo=27:SpringBoard`。同一毫秒读到的内核端口状态把两种可能分开了：
+目标端口（`rem=0x2e03`）`cnt=2 ql=6 seq=0 rn=0x11d03 ms=1 sr=5`，队列首条 kmsg 的
+`msgh_id` 就是 `5b9173`（`h=20111211.20.e35d0b60.e35d5060.a03.5b9173`）；而回信端口（`loc=0x1d03`）
+`cnt=0 ql=5 seq=20 ms=1 sr=1 kobj=…e35d0b60 wq=…e345a580 km=0`——**队列空**。
+464.500653 s 主线程又发了一条 204 B 的同步请求（`sz=cc id=400000cf rem=807`），目标队列
+`cnt=1 ql=128 seq=1386 sr=161`。472.88 s 起主线程转为纯收
+`op=40700420e sz=0 rn=1d03 rs=4000`，可此时 `rem=0x7a03` 端口已经
+`cnt=1 ql=6 seq=0 rn=0 ms=0 sr=2 rcv=0/0 kobj=0`——**端口上没有可送达的接收者，消息却还留在队列里**
+（首条 308 B，`h=20111211.134.e3a53100.e35d5060.a03.40000000`）。
+537–590 s 的请求改发到 lsd（`rem=6003 ro=117:lsd cnt=0 seq=1`，请求被取走），回信端口依旧空。
+整批 20 条 sbport 行里回信端口的 `cnt` 一律是 0，所以**排除「回信躺在队列里没人唤醒」；
+是 launchd 既没取走这条请求、也没回过信**。本靴 `kill(9)` 也不灵：r207 在 498.928036 s 发的
+`killsig`（`ns=-1`）没有生效，SpringBoard 一直活到 599.286642 s 才
+`exit pid=27 rv=0x9 ns=2 code=0x9`；900 s 死线照样 panic（boot 12 slot 4，`@ArmCpu.cpp:647`）进
+TWRP。缺口再收窄：**同步请求压在 launchd（或 lsd）的接收队列里没人处理，回信端口随后被摧毁；
+r224 把采样对象换成 launchd（pid 1）与 lsd，按线程抓栈，并记录目标端 receive 权被 destroy 的时刻。**
 
 更早的逐轮读数在 [`notes/development-log.md`](notes/development-log.md)。
 
@@ -32,7 +35,7 @@ r223 直接读两端端口的内核状态（消息队列、msgcount、waitq、sr
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 活不下来：不渲染，约 450–535 s 后被 backboardd 的系统 shell 看门狗杀掉** | r222 读数（boot 11）：主线程（tid `0x104`）四次采样同一组六帧，栈顶是 **`libxpc._xpc_connection_send_message_with_reply_sync+0x100`**，上面还有 Foundation thunk 与 libdispatch 两层；395.171 s 它往 launchd 端口 `0x3f07` 发了 24 字节空体同步请求（`msgh_id=0x5b9173`，reply `0xa03`），403 s 起一直纯收 `rn=a03 rs=4000`，446.42 s 被 `kill(9)`、456.1 s 退出（`rv=0x9`）。launchd 在 450→912.9 s 没再拉起 SpringBoard，bluetoothd/fairplayd 每 ~5 s 成对 spawn/exit | r223：在采样 beat 上读 `0xa03` 与 `0x3f07` 的内核端口状态（ip_messages/msgcount/waitq/mscount/srights/receivers/kobject），队列非空就打出首条 kmsg 头，区分「回信没人唤醒」与「launchd 根本没回」 |
+| 1 | **SpringBoard 活不下来：不渲染，约 450–600 s 后被系统 shell 看门狗杀掉** | r223 读数（boot 12）：443.990512 s 主线程（tid `0x104`）的同步请求（`id=5b9173`，24 B）压在 launchd 端口队列首条（`cnt=2 ql=6 ms=1 sr=5`），回信端口 `0x1d03` 是 `cnt=0`；464.5 s 又一条 204 B 请求（`id=400000cf`）；472.9–507.1 s 转纯收时目标端口变成 `cnt=1 rcv=0/0 kobj=0`——消息滞留但已无可送达的接收者；537 s 起换 `rem=6003`（`ro=117:lsd`），547 s 时队列被取空（`seq=1`）仍无回信；20 条采样里回信端口 `cnt` 全为 0；498.9 s 的 `kill(9)`（`ns=-1`）未生效，599.3 s 才 `exit rv=0x9` | r224：采样对象换成 launchd（pid 1）与 lsd，按线程抓栈，并记录目标端 receive 权被 destroy 的时刻 |
 | 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |

@@ -239,7 +239,7 @@ index 4a12dd9..5fd9344 100644
  	queue_iterate(&task->threads, thr, thread_t, task_threads) {
  		arm_saved_state_t *ss;
  		arm_kernel_saved_state_t *ks;
-@@ -10473,4 +10566,547 @@ clover_task_threads(task_t task, uint32_t budget)
+@@ -10473,4 +10566,633 @@ clover_task_threads(task_t task, uint32_t budget)
  	}
  	return n;
  }
@@ -348,6 +348,79 @@ index 4a12dd9..5fd9344 100644
 +	task_deallocate(owner);
 +}
 +
++/*
++ * Round223. The two ends of the blocked send are read together. A name on the
++ * send side only says where the message was addressed; the port object says
++ * whether the message is still sitting in the receiver's queue, whether a
++ * reply is waiting in the sender's own queue, and whether anything was ever
++ * sent. ipc_object_translate returns the object locked and without a
++ * reference, so all of it is read under that lock, and the first queued
++ * message's header is read through ikm_header(). Nothing is retained.
++ */
++static void
++clover_sb_port_state(task_t task, mach_port_name_t name, const char *tag,
++    uint64_t secs)
++{
++	ipc_space_t space;
++	ipc_object_t obj = IPC_OBJECT_NULL;
++	kern_return_t kr;
++
++	if (name == MACH_PORT_NULL) {
++		return;
++	}
++	space = task->itk_space;
++	if (space == IPC_SPACE_NULL) {
++		return;
++	}
++	kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_SEND, &obj);
++	if (kr != KERN_SUCCESS) {
++		kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_RECEIVE,
++		    &obj);
++	}
++	if (kr != KERN_SUCCESS) {
++		printf("clover r223: sbport t=%llu %s nm=%x kr=%d\n",
++		    (unsigned long long)secs, tag, name, kr);
++		return;
++	}
++	if (io_otype(obj) != IOT_PORT) {
++		printf("clover r223: sbport t=%llu %s nm=%x ty=%d\n",
++		    (unsigned long long)secs, tag, name, io_otype(obj));
++		io_unlock(obj);
++		return;
++	}
++	{
++		ipc_port_t port = (ipc_port_t)obj;
++		ipc_kmsg_t kmsg = cqe_queue_first(&port->ip_messages.imq_messages,
++		    struct ipc_kmsg, ikm_link);
++		mach_msg_header_t *mh = (kmsg != NULL) ? ikm_header(kmsg) : NULL;
++		ipc_space_t recv = ip_get_receiver(port);
++
++		printf("clover r223: sbport t=%llu %s nm=%x cnt=%u ql=%u seq=%u"
++		    " rn=%x ms=%u sr=%u rcv=%llx/%llx kobj=%llx wq=%llx"
++		    " km=%llx h=%x.%x.%x.%x.%x.%x\n",
++		    (unsigned long long)secs, tag, name,
++		    (unsigned)port->ip_messages.imq_msgcount,
++		    (unsigned)port->ip_messages.imq_qlimit,
++		    (unsigned)port->ip_messages.imq_seqno,
++		    port->ip_messages.imq_receiver_name,
++		    (unsigned)port->ip_mscount,
++		    (unsigned)port->ip_srights,
++		    (unsigned long long)(uintptr_t)recv,
++		    (unsigned long long)((recv != IPC_SPACE_NULL &&
++		    recv->is_task != TASK_NULL) ?
++		    (uintptr_t)recv->is_task : 0),
++		    (unsigned long long)port->ip_kobject,
++		    (unsigned long long)(uintptr_t)port->ip_waitq.waitq_queue.head,
++		    (unsigned long long)(uintptr_t)kmsg,
++		    (unsigned)(mh != NULL ? mh->msgh_bits : 0),
++		    (unsigned)(mh != NULL ? mh->msgh_size : 0),
++		    (unsigned)(mh != NULL ? mh->msgh_remote_port : 0),
++		    (unsigned)(mh != NULL ? mh->msgh_local_port : 0),
++		    (unsigned)(mh != NULL ? mh->msgh_voucher_port : 0),
++		    (unsigned)(mh != NULL ? mh->msgh_id : 0));
++	}
++	io_unlock(obj);
++}
 +/*
 + * One line carries every thread: tid:state:wait:continuation:pc per thread.
 + * The continuation is what names a blocked thread's wait -- wait_event is zero
@@ -781,6 +854,19 @@ index 4a12dd9..5fd9344 100644
 +							    ssz, hlim, hx);
 +						}
 +					}
++				/*
++				 * Round223. Both ends of this send are
++				 * read while the thread still waits: the
++				 * destination queue says whether launchd
++				 * took the request or never will, and the
++				 * reply queue says whether an answer is
++				 * sitting there unwoken.
++				 */
++				clover_sb_port_state(task,
++				    (mach_port_name_t)(uint32_t)r[3], "rem", secs);
++				clover_sb_port_state(task,
++				    (mach_port_name_t)(uint32_t)(r[3] >> 32), "loc",
++				    secs);
 +				}
 +			}
 +		}

@@ -16634,3 +16634,43 @@ TWRP（`81ffcaaa recovery`），宿主零 misc 写。
 回复已经进了 `0xa03` 的队列但没唤醒等待者（我们内核的 IPC 唤醒路径问题），或 launchd 根本没回。
 r223 直接读两个端口的内核状态：`a03` 的 `ip_messages`/`ip_msgcount`/`ip_waitq`，`3f07` 的
 属主、`ip_mscount`/`ip_srights`/`ip_receivers`/`ip_msgcount`；队列里若有回信，把头字段也打出来。
+
+## round223 读数（boot 12）
+
+payload 仍是 56 MiB（sha256 `02e552e80679b3c8735f8818299d6fd971c1aa7adb16f81edb097c9bfd14eae0`），
+冷刷 cache（mmcblk0p49）后一帧跑完：16 条 report、64 条驱动判据、15 条 probe 行、512 条内核行，
+`boot 12`。窗口里 19 条 `sbm2`、19 条 `sbm2x`、19 条 `sbuf`、5 条 `sbhex`，以及本轮新加的
+**20 条 `sbport`**（每批最多 5 线程 × 目标/回信两行）。900 s 死线照常 panic
+（`@ArmCpu.cpp:647`）并自己写 BCB 进 TWRP，宿主零 misc 写。
+
+1. **主线程的发送没变**：443.990512 s 的 `sbm2` 仍是
+   `tid=0x104 op=400304003 b=131513 sz=18 rem=2e03 loc=1d03 vou=a03 id=5b9173 rn=1d03 rs=44
+   ro=1:launchd lo=27:SpringBoard`——24 字节、发往 launchd 端口 `0x2e03`，回信端口（`loc`）
+   `0x1d03`，`0xa03` 是 **voucher**，不是回信端口（r222 把它当回信端口是标签错位）。
+2. **目标队列里就压着这条请求**：同毫秒 `sbport rem nm=2e03 cnt=2 ql=6 seq=0 rn=11d03 ms=1
+   sr=5 rcv=…/… kobj=0 wq=0 km=… h=20111211.20.e35d0b60.e35d5060.a03.5b9173`——消息数 2、
+   队列长 6、序号还是 0（一条都没被取走），首条 kmsg 的 `msgh_id` 正是 `5b9173`。
+   同一毫秒的回信端口 `loc nm=1d03 cnt=0 ql=5 seq=20 ms=1 sr=1 kobj=…e35d0b60
+   wq=…e345a580 km=0`——**队列空**。
+3. **它又发了第二条**：464.500653 s `op=403114207 sz=cc rem=807 loc=1d03 id=400000cf
+   ro=1:launchd`（204 B），`sbport rem nm=807 cnt=1 ql=128 seq=1386 sr=161`，同样没被取走。
+4. **472.88 s 起转纯收，可等的端口已经没有接收者**：`op=40700420e sz=0 rem=7a03 rn=1d03
+   rs=4000`（16 KiB），`sbport rem nm=7a03 cnt=1 ql=6 seq=0 rn=0 ms=0 sr=2 rcv=0/0 kobj=0
+   wq=0`——消息数 1、序号 0，但 `ip_receiver_name`、`ip_kobject`、`ip_receivers` 全空，
+   只剩 2 个发送权；队列首条 308 B（`h=20111211.134.e3a53100.e35d5060.a03.40000000`）。
+   473/481/489/507/510/519 六次采样一字不差，**回信端口始终没收到任何东西**。
+5. **后来换了个端口，有人取走却不回**：537.342943 起 `rem=6003`，同一时刻 `sbport nm=6003
+   cnt=1 ql=6 seq=0 sr=2 rcv=0/0`（272 B，`h=20111211.110.e3bceba0.e35d5060.a03.40000000`）；
+   547.373090 起 `ro=117:lsd`，`sbport nm=6003 cnt=0 ql=6 seq=1`——**lsd 把请求取走了**，
+   但 `rn=1d03 rs=4000` 一直等不到回信，直到 590.237788 最后一次采样（`seq=1` 不再变）。
+6. **kill 还是慢半拍**：498.928036 s `killsig pid=27 … sig=9 spid=58 scomm=backboardd
+   ns=-1 code=0x0`；SpringBoard 没有立刻死，599.286642 s 才
+   `exit pid=27 ppid=1 t=11s rv=0x9 ns=2 code=0x9`。之后 bluetoothd / fairplayd.A2
+   每 ~15 s 成对 spawn/exit，launchd 活着但没再拉起 SpringBoard。
+
+**结论**：r222 留下的两种可能，r223 直接排掉了一半——**回信根本没进过 `0x1d03` 的队列**
+（两次采样 `cnt=0`），所以不是「回信躺队列没人唤醒」。真正发生的是：launchd 的端口
+（`2e03`、`807`）收了请求却一条没取；随后目标端口 `7a03` 连接收者都没了、消息滞留；
+换到 lsd 的 `6003` 后请求被取走（`seq` 从 0 变 1）但照样没有回信。
+**r224 把采样对象换成 launchd（pid 1）与 lsd**：按线程抓栈看它们卡在哪，并在采样 beat 上盯着
+目标端口的 `ip_receivers`/`ip_receiver_name`，记录接收权从有到无的时刻。

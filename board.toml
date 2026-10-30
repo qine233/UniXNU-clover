@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r222: the caller frames of the blocked thread as cache offsets, and the send body as hex -- round221 named the stop as libsystem_kernel _mach_msg2_trap and read three printable keys out of the 204-byte body, so each picked thread now walks its user fp chain and prints six return addresses as the same VME_OFFSET + pc - vme_start offsets, and each body is dumped as hex instead of filtered text, where the caller of _mach_msg2_internal and the XPC request are both visible"
+title = "clover r223: the kernel state of both ends of the blocked send -- round222 named the caller as libxpc _xpc_connection_send_message_with_reply_sync waiting on 0xa03 for an answer to the 24-byte request sent to launchd 0x3f07, so each sample now translates both names and prints the port queue count, qlimit, seqno, mscount, srights, receiver task, kobject and waitq head, plus the header of the first queued message: a reply in 0xa03 means the wakeup path lost it, an empty 0xa03 with 0x3f07 still holding the request means launchd never answered"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

@@ -916,7 +916,8 @@ def check_sb_sample(kernel: bytes) -> bool:
              "sbm2x": (b"clover r221: sbm2x t=%llu tid=0x%llx pc=%llx") in kernel,
              "sbmsg": (b"clover r221: sbmsg t=%llu tid=0x%llx") in kernel,
              "sbuf": (b"clover r222: sbuf t=%llu") in kernel,
-             "sbhex": (b"clover r222: sbhex t=%llu") in kernel}
+             "sbhex": (b"clover r222: sbhex t=%llu") in kernel,
+             "sbport": (b"clover r223: sbport t=%llu %s nm=%x cnt=%u ql=%u seq=%u") in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())

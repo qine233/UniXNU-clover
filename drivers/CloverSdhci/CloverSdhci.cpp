@@ -655,6 +655,10 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // body. Two lines per picked thread per change, five threads, and the
   // batch prints only when it changes, so 192 covers a realistic boot.
   { "clover r222: ", "r222-sbs", 192, 0, 0, 0 },
+  // Round223 reads both ends of the blocked send: two port-state lines per
+  // picked thread per change (destination and reply port), five threads, so
+  // 192 covers the batch and the lines just before the kill.
+  { "clover r223: ", "r223-sbs", 192, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
