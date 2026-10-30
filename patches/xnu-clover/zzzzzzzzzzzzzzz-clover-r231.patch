@@ -1,0 +1,275 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 336a501..2bcd301 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10876,14 +10876,31 @@ clover_sb_port_state(task_t task, mach_port_name_t name, const char *tag,
+  * SpringBoard), but the registers are kernel-side, and the names resolve in
+  * backboardd's own space, so the question "who is backboardd waiting on" is
+  * answerable without touching a foreign user buffer.
++ *
++ * Round231 fixes the register the hop row reads. Boot 19 printed a hop for every
++ * thread parked in the trap, and every one of them said remote=0: x3 carries
++ * the message header's names, and a receive has no remote. The receive name is
++ * in x5's high half -- round221 already named a reply that way, rn=b03 -- and
++ * x6's low half is the receive size. The row now prints those, resolves the
++ * name in the receiver's own space, and reads that port's queue, so a hop has
++ * a name and a backlog instead of an anonymous local name. The firing rule
++ * changed with the reading: boot 19 spent its sixteen fires on one unchanged
++ * receiver, so the sampler now fires on a changed thread/hop set or on a
++ * two-minute heartbeat, and the cap covers the whole boot. Boot 18 and 19 also
++ * kept one backboardd thread in _ulock_wait_continue for the whole generation.
++ * That continuation is a static function, so this side cannot name it; every
++ * waiting thread that is not in the trap is printed with its continuation, pc
++ * and x0-x3 instead, and the host resolves the continuation against the same
++ * kernel's symbol table. x0 is the user lock address the wait started on.
+  */
+ static void
+ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ {
+ 	static uint32_t bb_fired;
+ 	static uint32_t bb_same;
+-	static char bb_last[224];
+ 	static char bb_last_hop[192];
++	static char bb_last_wait[192];
++	static uint64_t bb_last_t;
+ 	struct proc *p;
+ 	extern struct proc *proc_find(int pid);
+ 	extern task_t proc_task(struct proc *p);
+@@ -10892,26 +10909,44 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 	thread_t thr;
+ 	char tokens[224];
+ 	char hopsig[192];
++	char wsig[192];
+ 	char line[320];
+ 	uint64_t htid[4];
++	uint32_t hrn[4];
++	uint32_t hrs[4];
+ 	uint32_t hrem[4];
+ 	uint32_t hloc[4];
+ 	uint32_t hid[4];
+ 	uint64_t hto[4];
++	uint64_t hop[4];
++	uint64_t utid[6];
++	uint64_t ucont[6];
++	uint64_t upc[6];
++	uint64_t ux0[6];
++	uint64_t ux1[6];
++	uint64_t ux2[6];
++	uint64_t ux3[6];
++	uint32_t ust[6];
++	uint32_t un = 0;
++	uint32_t uall = 0;
++	uint64_t run_tid = 0;
++	uint64_t dt;
+ 	uint32_t hn = 0;
+ 	uint32_t n = 0;
+ 	unsigned int i;
+ 	int toff = 0;
+ 	int hoff = 0;
++	int woff = 0;
+ 	int len;
+ 	int sc;
+ 	int act;
+ 	int same;
++	int have_run = 0;
+ 
+ 	if (pid <= 0 || sb_task == TASK_NULL) {
+ 		return;
+ 	}
+-	if (bb_fired >= 16) {
++	if (bb_fired >= 96) {
+ 		return;
+ 	}
+ 	p = proc_find(pid);
+@@ -10937,6 +10972,7 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 	act = task->active;
+ 	tokens[0] = '\0';
+ 	hopsig[0] = '\0';
++	wsig[0] = '\0';
+ 	queue_iterate(&task->threads, thr, thread_t, task_threads) {
+ 		arm_saved_state_t *ss;
+ 		uint64_t pc = 0;
+@@ -10977,8 +11013,8 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 		}
+ 		wrote = snprintf(hopsig + hoff, sizeof(hopsig) - (size_t)hoff,
+ 		    " %llx:%x:%x:%x:%llx",
+-		    (unsigned long long)thr->thread_id, (uint32_t)x[3],
+-		    (uint32_t)(x[3] >> 32), (uint32_t)(x[4] >> 32),
++		    (unsigned long long)thr->thread_id, (uint32_t)(x[5] >> 32),
++		    (uint32_t)x[6], (uint32_t)(x[4] >> 32),
+ 		    (unsigned long long)x[7]);
+ 		if (wrote <= 0 || wrote >= (int)(sizeof(hopsig) - (size_t)hoff)) {
+ 			hopsig[hoff] = '\0';
+@@ -10986,12 +11022,76 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 		}
+ 		hoff += wrote;
+ 		htid[hn] = thr->thread_id;
++		hrn[hn] = (uint32_t)(x[5] >> 32);
++		hrs[hn] = (uint32_t)x[6];
+ 		hrem[hn] = (uint32_t)x[3];
+ 		hloc[hn] = (uint32_t)(x[3] >> 32);
+ 		hid[hn] = (uint32_t)(x[4] >> 32);
+ 		hto[hn] = x[7];
++		hop[hn] = x[1];
+ 		hn++;
+ 	}
++	/*
++	 * Round231. A thread that is waiting and is not in the trap is not an IPC
++	 * receive; the one this boot keeps seeing is an unfair-lock wait whose
++	 * continuation is a static kernel function. The registers are all this
++	 * side can read (the lock word lives in the receiver's memory), so the
++	 * row carries the continuation, pc and x0-x3, and the host resolves the
++	 * continuation against the same kernel's symbols. x0 is the lock address
++	 * the wait started on; the only holder this side can name is a runnable
++	 * thread of the same task, which rides along as run=.
++	 */
++	queue_iterate(&task->threads, thr, thread_t, task_threads) {
++		arm_saved_state_t *ss;
++		uint64_t x16 = 0;
++		uint64_t x[4];
++		int j;
++		int wrote;
++
++		if ((thr->state & TH_WAIT) == 0) {
++			if (!have_run) {
++				run_tid = thr->thread_id;
++				have_run = 1;
++			}
++			continue;
++		}
++		ss = get_user_regs(thr);
++		if (ss == NULL || (uintptr_t)ss == (uintptr_t)-1 ||
++		    is_saved_state32(ss) || thr->continuation == NULL) {
++			continue;
++		}
++		x16 = (uint64_t)saved_state64(ss)->x[16];
++		if (x16 == (uint64_t)-47) {
++			continue;
++		}
++		for (j = 0; j < 4; j++) {
++			x[j] = (uint64_t)saved_state64(ss)->x[j];
++		}
++		if (x[0] == 0) {
++			continue;
++		}
++		uall++;
++		if (un >= 6) {
++			continue;
++		}
++		utid[un] = thr->thread_id;
++		ust[un] = thr->state;
++		ucont[un] = (uint64_t)(uintptr_t)thr->continuation;
++		upc[un] = (uint64_t)get_saved_state_pc(ss);
++		ux0[un] = x[0];
++		ux1[un] = x[1];
++		ux2[un] = x[2];
++		ux3[un] = x[3];
++		wrote = snprintf(wsig + woff, sizeof(wsig) - (size_t)woff,
++		    " %llx:%x:%llx", (unsigned long long)thr->thread_id, thr->state,
++		    (unsigned long long)(uintptr_t)thr->continuation);
++		if (wrote <= 0 || wrote >= (int)(sizeof(wsig) - (size_t)woff)) {
++			wsig[woff] = '\0';
++			break;
++		}
++		woff += wrote;
++		un++;
++	}
+ 	/*
+ 	 * The reference taken under the lock is what lets the owner lookups
+ 	 * below run after the proc reference is dropped: backboardd can exit on
+@@ -11002,19 +11102,22 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 	lck_mtx_unlock(&task->lock);
+ 	proc_rele(p);
+ 
+-	same = (strcmp(tokens, bb_last) == 0) && (strcmp(hopsig, bb_last_hop) == 0);
+-	if (same) {
++	same = (strcmp(hopsig, bb_last_hop) == 0) && (strcmp(wsig, bb_last_wait) == 0);
++	if (same && secs - bb_last_t < 120) {
+ 		bb_same++;
+ 		task_deallocate(task);
+ 		return;
+ 	}
+-	strlcpy(bb_last, tokens, sizeof(bb_last));
++	dt = (bb_last_t != 0 && secs > bb_last_t) ? secs - bb_last_t : 0;
+ 	strlcpy(bb_last_hop, hopsig, sizeof(bb_last_hop));
++	strlcpy(bb_last_wait, wsig, sizeof(bb_last_wait));
++	bb_last_t = secs;
+ 	bb_fired++;
+ 	len = snprintf(line, sizeof(line),
+-	    "clover r229: bb t=%llu pid=%d n=%u sc=%d act=%d f=%u s=%u hops=%u%s\n",
++	    "clover r229: bb t=%llu pid=%d n=%u sc=%d act=%d f=%u s=%u hops=%u"
++	    " wait=%u d=%llu%s\n",
+ 	    (unsigned long long)secs, pid, n, sc, act, bb_fired, bb_same, hn,
+-	    tokens);
++	    uall, (unsigned long long)dt, tokens);
+ 	if (len > 0) {
+ 		line[sizeof(line) - 1] = '\0';
+ 		printf("%s", line);
+@@ -11022,31 +11125,53 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 	clover_sb_port_state(sb_task, name, "bb", secs, "r229");
+ 
+ 	/*
+-	 * Round230. Every thread of the receiver that is itself parked in the
+-	 * trap, with the destination it is parked on translated in the
+-	 * receiver's own space. The first hop's queue is read last: it says
+-	 * whether backboardd's own request is still sitting where it was sent.
++	 * Round231. Every thread of the receiver that is itself parked in the
++	 * trap, with the name it is parked on read from x5's high half and
++	 * translated in the receiver's own space. The first hop's queue is read
++	 * last: it says whether backboardd's own request is still sitting where
++	 * it was sent, and its port object can be compared with the sender-side
++	 * reading the caller prints.
+ 	 */
+ 	for (i = 0; i < hn; i++) {
+-		char ro[24];
++		char rno[24];
+ 		char lo[24];
+ 
+-		clover_sb_port_owner(task, (mach_port_name_t)hrem[i], ro, sizeof(ro));
+-		clover_sb_port_owner(task, (mach_port_name_t)hloc[i], lo, sizeof(lo));
++		clover_sb_port_owner(task, (mach_port_name_t)hrn[i], rno,
++		    sizeof(rno));
++		clover_sb_port_owner(task, (mach_port_name_t)hloc[i], lo,
++		    sizeof(lo));
+ 		len = snprintf(line, sizeof(line),
+-		    "clover r230: bbhop t=%llu pid=%d tid=0x%llx rem=%x loc=%x id=%x"
+-		    " to=%llx ro=%s lo=%s\n",
++		    "clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rn=%x"
++		    " rs=%x rem=%x loc=%x id=%x to=%llx rno=%s lo=%s\n",
+ 		    (unsigned long long)secs, pid,
+-		    (unsigned long long)htid[i], hrem[i], hloc[i], hid[i],
+-		    (unsigned long long)hto[i], ro[0] ? ro : "-", lo[0] ? lo : "-");
++		    (unsigned long long)htid[i], (unsigned long long)hop[i],
++		    hrn[i], hrs[i], hrem[i], hloc[i], hid[i],
++		    (unsigned long long)hto[i], rno[0] ? rno : "-",
++		    lo[0] ? lo : "-");
+ 		if (len > 0) {
+ 			line[sizeof(line) - 1] = '\0';
+ 			printf("%s", line);
+ 		}
+ 	}
+-	if (hn > 0 && hrem[0] != 0) {
+-		clover_sb_port_state(task, (mach_port_name_t)hrem[0], "bbq", secs,
+-		    "r230");
++	if (hn > 0 && hrn[0] != 0) {
++		clover_sb_port_state(task, (mach_port_name_t)hrn[0], "bbq", secs,
++		    "r231");
++	}
++	for (i = 0; i < un; i++) {
++		len = snprintf(line, sizeof(line),
++		    "clover r231: bbwait t=%llu pid=%d tid=0x%llx st=%x"
++		    " cont=%llx pc=%llx x0=%llx x1=%llx x2=%llx x3=%llx"
++		    " u=%u run=0x%llx\n",
++		    (unsigned long long)secs, pid,
++		    (unsigned long long)utid[i], ust[i],
++		    (unsigned long long)ucont[i], (unsigned long long)upc[i],
++		    (unsigned long long)ux0[i], (unsigned long long)ux1[i],
++		    (unsigned long long)ux2[i], (unsigned long long)ux3[i],
++		    uall, (unsigned long long)run_tid);
++		if (len > 0) {
++			line[sizeof(line) - 1] = '\0';
++			printf("%s", line);
++		}
+ 	}
+ 	task_deallocate(task);
+ }

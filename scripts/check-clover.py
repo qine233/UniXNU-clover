@@ -822,6 +822,10 @@ def check_board(errors: list) -> str:
             errors.append("drivers/CloverSdhci gives round230's next-hop lines no tee class: a hop "
                           "line per thread parked in the trap, plus its queue line, would land in "
                           "the ring uncounted")
+        if '{ "clover r231: ", "r231-bb", 192, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round231's receive-name hops and waiting-thread "
+                          "rows no tee class: thirteen lines per fire over a whole boot would land "
+                          "in the ring uncounted")
         if '{ "clover r217: ", "r217-sbs", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round217's live sample no tee class: a line "
                           "that changes every eight seconds for the length of the boot would land "
@@ -1045,6 +1049,33 @@ def check_board(errors: list) -> str:
                 if needle not in r230_text:
                     errors.append(f"{r230_patch.name} lacks {needle[:56]!r}: the receiver would again "
                                   "print a beat instead of a change, or name no next hop")
+
+        # Round231 corrects the register the hop row reads. Boot 19 showed x3 remote=0 on every
+        # parked thread -- a receive has no remote name -- while round221 had already proved the
+        # receive name is in x5's high half (rn=b03). The row now carries x5/x6, the name resolves
+        # in the receiver's own space, and the sampler fires on a changed set or a two-minute
+        # heartbeat instead of spending sixteen fires on one unchanged receiver. The unfair-lock
+        # thread boot 18/19 kept is printed raw for the host to resolve.
+        r231_patch = next((base / "patches/xnu-clover/zzzzzzzzzzzzzzz-clover-r231.patch"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover/zzzzzzzzzzzzzzz-clover-r231.patch").is_file()),
+                          None)
+        if r231_patch is None:
+            errors.append("patches/xnu-clover/zzzzzzzzzzzzzzz-clover-r231.patch is missing: boot 19 "
+                          "read the hop out of x3, where a receive has no name")
+        else:
+            r231_text = r231_patch.read_text()
+            for needle in ('"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rn=%x"',
+                           '(uint32_t)(x[5] >> 32)',
+                           'clover_sb_port_state(task, (mach_port_name_t)hrn[0], "bbq", secs,',
+                           '"clover r231: bbwait t=%llu pid=%d tid=0x%llx st=%x"',
+                           "same && secs - bb_last_t < 120",
+                           "bb_fired >= 96",
+                           "uall, (unsigned long long)dt, tokens"):
+                if needle not in r231_text:
+                    errors.append(f"{r231_patch.name} lacks {needle[:56]!r}: the hop would again be "
+                                  "read from the register a receive leaves empty, or the sampler "
+                                  "would spend its fires on one unchanged receiver")
 
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
@@ -2043,8 +2074,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r230:"):
-        errors.append('[payload] title is not "clover r230: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r231:"):
+        errors.append('[payload] title is not "clover r231: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3092,8 +3123,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r230:"):
-        errors.append('[payload] title is not "clover r230: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r231:"):
+        errors.append('[payload] title is not "clover r231: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

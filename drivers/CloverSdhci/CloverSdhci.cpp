@@ -693,6 +693,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // those. 96 is 16 fires' worth of hops and queues, so the tail of a wedged boot keeps its own hop
   // lines instead of losing them to the head of the same class.
   { "clover r230: ", "r230-hop", 96, 0, 0, 0 },
+  // Round231 changes the hop row to the receive name and lets the sampler fire on a changed set or a
+  // two-minute heartbeat, capped at 96 fires, with up to six waiting-thread rows beside each one.
+  // 192 holds the whole conversation -- the heartbeat tail included -- and still bounds a producer
+  // that loops harder than the receiver does.
+  { "clover r231: ", "r231-bb", 192, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

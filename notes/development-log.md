@@ -17233,3 +17233,49 @@ TWRP，panic 自写 BCB，宿主零 misc 写。四个仪器全部兑现：
    （`nm=4503` 解析出的对象）**比地址**——同一个对象才说明「消息会被这条线程取走」；
    ② 开火判据换成 hop 集合 + 心跳、配额提到 96；③ ulock 线程单独一行（`x0` 锁地址 +
    该进程里 `TH_BLOCKING`/`TH_RUN` 的候选持有者 tid）；④ 环过滤冻结，不再动。
+
+## round231 读数（boot 20）——三个 hop 名都没有「端口右」，采样器只跟着 SpringBoard 的批签名跑
+
+1. **环**：512 行窗口覆盖 **730.5–1813.0 s**（r230 是 648.6–1813.0），没有新噪声顶上来。驱动计数
+   `CloverSdhci r229: tee filter fl=222 nag=3189 exit kept=20 dropped=227 comms=16`、
+   `r230: tee sync-in=8 sync-out=8 dropped=348`、
+   `r212: drain exit boot=20 wrote=26 dropped=0 tee_passes=8 probe=21 probe_drop=0 probe_pend=3`。
+   类分布：r231 143 行、r218 97、r221 63、r229 46、r217 37——采样行本身仍是主体。
+2. **新字段都兑现了**。hop 行 63 条，只有三种签名、全部 `rem=0`（接收半边）：
+   `tid=0x18a rn=7f03 rs=2 rem=0 loc=7f03 id=0 to=ffffffff`（21 条）、
+   `tid=0x35b rn=790f rs=2 rem=0 loc=0 id=0 to=0`（23 条）、
+   `tid=0x37b rn=6c03 rs=2 rem=0 loc=6c03 id=0 to=ffffffff`（19 条）。
+   `rn` 现在取自 x5 高半，正是 mach_msg2 的 `rcv_name`；`rs=2` 是 x6 低半的 `rcv_size`，
+   在 `MACH64_MSG_VECTOR` 下等于 iovec 条数，所以这三条线程都在把收件箱摊成两个向量接收。
+3. **hop 没有下一跳可读：三个名字都没有 SEND/RECEIVE 右**。`sbport … bbq nm=790f kr=17`
+   （23 条，7f03/790f 交替）——`ipc_object_translate` 对该名返回 `KERN_INVALID_RIGHT`(17)，
+   说明它在 58 的 space 里既不是发送右也不是接收右：**是 port set 或已死名字，不是端口对象**。
+   于是 `rno=- lo=-` 也是必然（属主查不到端口对象）。接收方确实在主事件循环上等，
+   但等的是一组端口的集合，集合里哪个成员有消息，本轮还没有读。
+4. **等待线程的其余半边**：57 条 `bbwait`。`tid=0x34b st=41(TH_WAIT|TH_WAIT_REPORT)
+   cont=fffffff00773cbac(_ulock_wait_continue) pc=1ea67abdc x0=1000001 x1=105d8f0f4 x2=0`
+   整个窗口一字不变；`0x34c` 同一个 continuation，锁地址 `16f6dd720`、`x2=ffffffff`。
+   `x0=0x1000001` 是 `UL_COMPARE_AND_WAIT | ULF_NO_ERRNO`，`x1` 是用户态锁地址——
+   两条线程卡在两把不同的 unfair lock 上，持有者都没释放。其余 `st=1` 的行
+   `cont=fffffff0076bb128(_workq_unpark_continue) x0=0x40/0x100` 是空闲工作队列线程，不是卡点。
+5. **采样器自己成了第二个盲区：行停在 1195 s**。63/57/23 条行只覆盖 **735–1195 s**，
+   而环一直到 1813 s。原因在调用点：`clover_bb_sample` 仍然在
+   `if (npick > 0 && strcmp(m2sig, clover_sb_last_m2) != 0)` 分支里（`kern/task.c:11386`），
+   **只有 SpringBoard 的在飞批次签名变化时才开火**。gen=1 的 pid=237 在 736 s 出生、主线程
+   从 1445/1567/1699 s 三拍都停在同一笔 `rem=4103 → 58:backboardd`（`rn=1d03`、
+   `rs=4000`）上，批次不再变，bb 行就再也不出。r230 的心跳只写在采样器内部，管不到调用点——
+   r232 的第一件事是把开火从 SpringBoard 的签名里摘出来，改成自己的节拍。
+6. **发给 backboardd 的端口仍然空着**。三拍的 `sbport t=1445/1567/1699 rem nm=4103 cnt=0
+   ql=6 seq=3 rn=147bb ms=0 sr=1 … wq=0` 逐字段相同：消息一生只进过 3 条、此刻队列空、
+   等待队列头为 0。结合第 3 点，**取走它的接收线程等在一个 port set 上**——r232 要沿
+   port-set 的成员表（`ips_wqset.wqs_links` → `ip_waitq.waitq_links`）逐成员打印
+   `msgcount/seqno/receiver_name/first kmsg`，才能把 `nm=4103` 的端口对象和集合成员对上。
+7. **屏**：730.5–1813.0 s 只有 1385.96 s 一行 `r180: client#6 pid=87 type=0 status=0
+   class=IOMobileFramebufferUserClient seen=6`，**没有 `swap#`/`frame#`/`copy#`/`retire#`**。
+   1800 s 死线 panic（`elr=1c8326c50` 用户态、`ticks=344872`），boot 20，`panic tail lines=3
+   unseen=0`。
+8. **r232 设计**：① 采样器改成独立节拍（每 20 s 一拍、配额 96），不再挂在 SpringBoard 的
+   `m2sig` 变化上；② hop 名先按 `MACH_PORT_RIGHT_PORT_SET` 翻译，若是集合就遍历成员端口，
+   逐成员打 `ty/cnt/ql/seq/rn/kmsg`，若不是集合再退回 SEND/RECEIVE；③ `nm=4103` 解析出的
+   端口对象与集合成员**比地址**，回答「哪条接收线程属于这条消息」；④ ulock 行加
+   `x2`（期望值）与同进程 `TH_RUN`/`TH_BLOCKING` 的候选持有者；⑤ 环过滤不动。

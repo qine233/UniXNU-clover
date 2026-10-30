@@ -933,10 +933,14 @@ def check_sb_sample(kernel: bytes) -> bool:
              "rcdump": (b"clover r228: rcdump t=%llu n=%u tot=%u\n") in kernel,
              "rce": (b"clover r228: rce t=%llu pid=%u gen=%u tid=%llx k=%u") in kernel,
              "sbtask": (b"clover r228: sbtask gen=%u pid=%d t=%llu\n") in kernel,
-             "bb": (b"clover r229: bb t=%llu pid=%d n=%u sc=%d act=%d f=%u s=%u hops=%u%s\n") in kernel,
+             "bb": (b"clover r229: bb t=%llu pid=%d n=%u sc=%d act=%d f=%u s=%u hops=%u"
+                    b" wait=%u d=%llu%s\n") in kernel,
              "bbgone": (b"clover r229: bb t=%llu pid=%d f=%u gone\n") in kernel,
-             "bbhop": (b"clover r230: bbhop t=%llu pid=%d tid=0x%llx rem=%x loc=%x id=%x"
-                       b" to=%llx ro=%s lo=%s\n") in kernel,
+             "bbhop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rn=%x"
+                       b" rs=%x rem=%x loc=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
+             "bbwait": (b"clover r231: bbwait t=%llu pid=%d tid=0x%llx st=%x"
+                        b" cont=%llx pc=%llx x0=%llx x1=%llx x2=%llx x3=%llx"
+                        b" u=%u run=0x%llx\n") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
                            b"dropped=%u comms=%u\n") in kernel,
              "tee-sync": (b"CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n") in kernel}

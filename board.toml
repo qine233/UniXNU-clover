@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r230: the receiver speaks only when it changes -- the tee also drops CloverBlock's r190 sync metronome, and every backboardd thread parked in mach_msg2_trap now names the next hop it is waiting on, with that hop's queue read behind it"
+title = "clover r231: the hop is read where a receive keeps its name -- x5's high half, translated in backboardd's own space with the queue behind it; every waiting thread that is not in the trap carries its continuation, pc and lock address, and the sampler fires on a change or a two-minute beat"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
