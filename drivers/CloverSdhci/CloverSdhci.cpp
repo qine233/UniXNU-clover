@@ -651,6 +651,10 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // it prints only when the batch changes, so 192 covers a realistic boot with
   // room to spare.
   { "clover r221: ", "r221-sbs", 192, 0, 0, 0 },
+  // Round222 adds the blocked thread's user frames and the full send
+  // body. Two lines per picked thread per change, five threads, and the
+  // batch prints only when it changes, so 192 covers a realistic boot.
+  { "clover r222: ", "r222-sbs", 192, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

@@ -16591,3 +16591,46 @@ r220 只回答到「向 launchd 发同步 XPC、回信是 SpringBoard 自己的�
 同步 XPC 上（发给 launchd 的 204 字节载荷含 `@CPX@`、`handle`、`instance`），直到 479 s 被
 backboardd 的系统 shell 看门狗杀掉都没等到回信。r222 要问「谁在调 `_mach_msg2_internal`」
 （用户栈回溯）和「这条 XPC 在请求什么」（整段 204 字节十六进制，而不是可打印串）。
+
+## round222 读数（boot 11）
+
+冷刷 cache（mmcblk0p49，58720256 字节）后 `run-clover-unattended.sh --boot-after-flash --wait 900`
+一帧跑完：16 条 report、64 条驱动判据、15 条 probe 行、512 条内核行，`boot 11`。窗口里 12 条
+`sbm2`、12 条 `sbuf`、5 条 `sbhex`。payload 的 900 s 死线照常抬头，panic 自己写的 BCB 把复位送进
+TWRP（`81ffcaaa recovery`），宿主零 misc 写。
+
+1. **slide 每靴都变，帧偏移要按代码字重算**。本靴主线程 pc `1d6d40b58`、`poff=56d40b58`，而
+   代码字仍是同一组（`d65f03c0.928005f0…`），未滑 vm 仍是 `0x1cb780b58`，所以
+   **slide = `0x1d6d40b58 − 0x1cb780b58 = 0xB5C0000`**。`sbuf` 帧是 `VME_OFFSET + (fa −
+   vme_start)`，含 slide；换成缓存布局地址要 **`0x180000000 + f − slide`**，不能直接加。
+2. **主线程（tid 0x104）的 6 帧落在连续四层**，403/411/423/436 四次采样完全一样：
+   - `0x56d441b0` → `libsystem_kernel.dylib` `_mach_msg_overwrite+0x1ec`（下一函数起点
+     `0x1cb7841d8` 正是 `_mach_msg2_trap`）；
+   - `0x56d43fb8` → 同库 `_mach_msg+0x14`；
+   - `0x1ab2df34`、`0x1ab2e2dc` → `libdispatch.dylib` 的两个静态函数（起点
+     `0x18f56dd28 +0x20c`、`0x18f56e2a4 +0x38`，无导出名）；
+   - `0x68c33df0` → **`libxpc.dylib` `_xpc_connection_send_message_with_reply_sync+0x100`**；
+   - `0x12440d10` → Foundation 里 `0x186e80d04+0xc` 的 **方法 thunk**（宿主反汇编：
+     `stp x29,x30 / mov x29,sp / bl 0x187548f50 / ldp / ret`），`0x187548f50` 再尾调进 libxpc
+     的同步函数，所以 x30 直接回到 thunk+0xc。
+   **结论：SpringBoard 主线程阻塞在一次同步 XPC 往返上，不是 mach trap 桩本身。**
+3. **它到底在等什么**：395.171 的发送采样是 `b=131513 sz=18 rem=3f07 loc=a03 id=5b9173
+   ro=1:launchd lo=27:SpringBoard`，发往 **launchd 属主的端口 0x3f07**，24 字节（只有
+   mach 头、`sbhex` 全零），回复端口是自己空间里的 `0xa03`；从 403 起每一次采样都是
+   `op=40700420e b=0 sz=0 rn=a03 rs=4000 loc=0`——**纯收**：在 16 KiB 回复缓冲区上阻塞等
+   `0xa03` 的回信，无超时。395.673 到 446.42（被杀）之间它没有离开过这个状态。
+4. **发送侧线程**不再是 blank：tid 0x168 在 `notify_post`/XPC notification；tid 0x40f 在
+   `_xpc_connection_send_message` + dispatch mach 发送；tid 0x411 在 `_xpc_connection_send_message`
+   里、另有 `os_log` 帧（它 423 s 发 36 字节 `h=13.0.1b03.0.0.2d52` 给 logd）；tid 0x41c 的
+   frame0 是 `__kernelrpc_mach_port_is_connection_for_service+0x80`，436 s 发 40 字节
+   `bits=1315 sz=28 rem=203 loc=4c07 id=ca8` 给我方 SpringBoard。
+5. **本轮系统活到了死线**：446.42 仍然是 `killsig … sig=9 spid=58 scomm=backboardd`，
+   `exit pid=27 t=8s rv=0x9` 出现在 456.1，但 450 之后就再没有 `sbs` 采样，直到 912.9 日志尾
+   **launchd 没有再拉起 SpringBoard**；同一窗口里 bluetoothd / fairplayd.A2 从 ~700 s 到 912 s
+   每 ~5 s 成对 spawn/exit（各活 14–17 s）。也就是说 launchd 还在收发/拉起别的作业，却既不回
+   SpringBoard 的同步请求，也不重启它。
+
+**结论**：卡点从「mach trap」推进到「**launchd 端口上的同步 XPC 不回信**」。两种解释只能二选一：
+回复已经进了 `0xa03` 的队列但没唤醒等待者（我们内核的 IPC 唤醒路径问题），或 launchd 根本没回。
+r223 直接读两个端口的内核状态：`a03` 的 `ip_messages`/`ip_msgcount`/`ip_waitq`，`3f07` 的
+属主、`ip_mscount`/`ip_srights`/`ip_receivers`/`ip_msgcount`；队列里若有回信，把头字段也打出来。

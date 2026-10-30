@@ -10,19 +10,21 @@ launchd 把守护进程拉起来；r202 让 `IOMobileFramebufferLegacy` attach +
 （`done/presented=4`、每帧 9 216 000 字节），但整屏仍是黑的——SpringBoard 没有把界面画上去，
 450–535 s 时被 backboardd 的系统 shell 看门狗用 `kill(2)` 杀掉。
 
-r221 读数（boot 10）：SpringBoard 主线程在 `[479.004840]` 被 backboardd 以 `kill(9)` 杀掉、
-`[479.093986]` 退出（`rv=0x9`），到死都没等到回信。**阻塞点这次有了函数名**：390/413/470 s 三次
-采样（tid `0x102`）的 PC 都是 `0x1d1454b58`、LR 都是 `0x1d1458224`；代码字 `d65f03c0 / mov x16,#0x2f /
-svc #0x80` 在 `dyld_shared_cache_arm64.23` 命中未滑 vm `0x1cb780b58`，定出 slide `0x5CD4000`，
-于是 PC = `libsystem_kernel.dylib` 的 **`_mach_msg2_trap`（+0x8，svc 后的 ret）**、LR =
-**`_mach_msg2_internal`（+0x4c）**——r220 猜的「libxpc」不对，直接调用层在 libsystem_kernel 内部，
-真正的调用者还在更上层。**载荷也读出了明文**：413 s 那条 204 字节同步调用（发往 launchd 的
-`0x807`，reply `0x903`）的发送体里有 `@CPX@`、`handle`、`instance`（`@CPX@` 是 XPC 序列化标记）。
-其余被采线程全部停在 `___workq_kernreturn+0x8`（空转），只有主线程与 470 s 的 tid `0x466` 卡在
-mach_msg2；SpringBoard 始终没建 `IOMobileFramebufferUserClient`（窗口里客户端是 pid 56/168，907 s
-才有 pid 87），backboardd 自己 present 了两帧。缺口收窄成一句话：**主线程卡在一条发给 launchd、
-请求里带 `handle`/`instance` 的同步 XPC 上，直到被杀都没返回；r222 用用户栈回溯找出调用者，并把
-204 字节整段按十六进制读出来，确认它到底在请求什么。**
+r222 读数（boot 11）：**阻塞点这次有了一整条调用链**。SpringBoard 主线程（tid `0x104`）在
+403/411/423/436 s 四次采样完全一致，六帧从下到上依次是
+`_mach_msg_overwrite+0x1ec` → `_mach_msg+0x14` → libdispatch（`0x18f56dd28+0x20c`）→
+libdispatch（`0x18f56e2a4+0x38`）→ **`libxpc._xpc_connection_send_message_with_reply_sync+0x100`** →
+Foundation thunk（`0x186e80d04+0xc`）。宿主反汇编该 thunk 只有一条尾调 `bl 0x187548f50`，而它 `b`
+进 libxpc 的同步发送，所以 x30 直接回到 thunk+0xc——调用者就是 Foundation 的一条同步 XPC 请求。
+**它等的是什么也读出来了**：395.171 s 主线程往 launchd 端口 `0x3f07` 发了一条 24 字节空体的同步请求
+（`msgh_id=0x5b9173`，reply 端口 `0xa03`，16 KiB）；403 s 起每次采样都是纯收
+`op=40700420e b=0 sz=0 rn=a03 rs=4000`，一直到 446.42 s 被 backboardd `kill(9)`（`spid=58`）、
+456.1 s 退出（`rv=0x9`）都没收到回信。launchd 在 450 s 之后到 912.9 s 一直没再拉起 SpringBoard，
+同期 bluetoothd / fairplayd.A2 每 ~5 s 成对 spawn/exit——launchd 自己也不正常。其余活动线程分别是
+`notify_post`（tid `0x168`）、XPC 发送（`0x40f`）、给 logd 发 36 字节 `h=13.0.1b03.0.0.2d52`
+（`0x411`）、`__kernelrpc_mach_port_is_connection_for_service+0x80`（`0x41c`）。缺口收窄成一句话：
+**SpringBoard 卡在一条发给 launchd 的同步 XPC 上，launchd 回没回、回了为什么没唤醒都不清楚；
+r223 直接读两端端口的内核状态（消息队列、msgcount、waitq、srights），把这两种可能分开。**
 
 更早的逐轮读数在 [`notes/development-log.md`](notes/development-log.md)。
 
@@ -30,7 +32,7 @@ mach_msg2；SpringBoard 始终没建 `IOMobileFramebufferUserClient`（窗口里
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 活不下来：不渲染，约 450–535 s 后被 backboardd 的系统 shell 看门狗杀掉** | r221 读数（boot 10）：杀点 `[479.004840]`、退出 `[479.093986]`（`rv=0x9`）。主线程（tid `0x102`）三次采样 PC `0x1d1454b58`、LR `0x1d1458224`，代码字在缓存里定出 slide `0x5CD4000`，于是落在 **`libsystem_kernel._mach_msg2_trap`（+0x8）**，调用层是 **`_mach_msg2_internal`（+0x4c）**；413 s 的 204 字节同步 XPC（发往 launchd 的 `0x807`）载荷里有 `@CPX@`、`handle`、`instance`。其余 SpringBoard 线程全在 `___workq_kernreturn+0x8` 空转。SpringBoard 到死没建 FB 客户端（窗口内客户端 pid 56/168，907 s 才有 pid 87） | r222：回溯主线程的用户栈，命名 `_mach_msg2_internal` 的调用者（libxpc 的哪次调用）；把 204 字节发送体整段按十六进制读回，确认这条 XPC 的请求类型 |
+| 1 | **SpringBoard 活不下来：不渲染，约 450–535 s 后被 backboardd 的系统 shell 看门狗杀掉** | r222 读数（boot 11）：主线程（tid `0x104`）四次采样同一组六帧，栈顶是 **`libxpc._xpc_connection_send_message_with_reply_sync+0x100`**，上面还有 Foundation thunk 与 libdispatch 两层；395.171 s 它往 launchd 端口 `0x3f07` 发了 24 字节空体同步请求（`msgh_id=0x5b9173`，reply `0xa03`），403 s 起一直纯收 `rn=a03 rs=4000`，446.42 s 被 `kill(9)`、456.1 s 退出（`rv=0x9`）。launchd 在 450→912.9 s 没再拉起 SpringBoard，bluetoothd/fairplayd 每 ~5 s 成对 spawn/exit | r223：在采样 beat 上读 `0xa03` 与 `0x3f07` 的内核端口状态（ip_messages/msgcount/waitq/mscount/srights/receivers/kobject），队列非空就打出首条 kmsg 头，区分「回信没人唤醒」与「launchd 根本没回」 |
 | 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |

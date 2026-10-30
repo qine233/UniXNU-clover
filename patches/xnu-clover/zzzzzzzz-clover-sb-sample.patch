@@ -239,7 +239,7 @@ index 4a12dd9..5fd9344 100644
  	queue_iterate(&task->threads, thr, thread_t, task_threads) {
  		arm_saved_state_t *ss;
  		arm_kernel_saved_state_t *ks;
-@@ -10473,4 +10566,468 @@ clover_task_threads(task_t task, uint32_t budget)
+@@ -10473,4 +10566,547 @@ clover_task_threads(task_t task, uint32_t budget)
  	}
  	return n;
  }
@@ -702,6 +702,85 @@ index 4a12dd9..5fd9344 100644
 +					    " sz=%x txt=%s\n",
 +					    (unsigned long long)secs,
 +					    (unsigned long long)tids[pick[j]], ssz, txt);
++				}
++				/*
++				 * Round222. A file offset names the function a
++				 * thread sits in; the frames above it name the
++				 * caller. The round218 walker already follows
++				 * the user fp chain, so each picked thread now
++				 * walks six frames and prints every return
++				 * address as the same VME_OFFSET + pc -
++				 * vme_start offset, which the host reads
++				 * without knowing the slide. A call that sends
++				 * a body also dumps its first 160 bytes as
++				 * hex: the printable filter kept three keys and
++				 * threw away the message that carries them.
++				 */
++				{
++					uint64_t frames[6] = { 0, 0, 0, 0, 0, 0 };
++					uint32_t fn;
++					uint32_t k;
++					char fo[256];
++					int foff = 0;
++					uint32_t hlim;
++					unsigned char hb[160];
++					char hx[360];
++					int ho = 0;
++
++					fn = clover_user_fp_walk(fps[pick[j]],
++					    sps[pick[j]], frames, 6);
++					fo[0] = '\0';
++					for (k = 0; k < fn &&
++					    foff < (int)sizeof(fo) - 24; k++) {
++						uint64_t off = 0;
++						uint64_t fa = frames[k];
++
++						if (map != VM_MAP_NULL) {
++							vm_map_lock_read(map);
++							if (vm_map_lookup_entry(map,
++							    (vm_map_offset_t)(fa & ~0xfffULL),
++							    &entry) &&
++							    entry != VM_MAP_ENTRY_NULL &&
++							    fa >= (uint64_t)entry->vme_start &&
++							    fa < (uint64_t)entry->vme_end) {
++								off = (uint64_t)VME_OFFSET(entry) +
++								    (fa - (uint64_t)entry->vme_start);
++							}
++							vm_map_unlock_read(map);
++						}
++						foff += snprintf(fo + foff,
++						    sizeof(fo) - (size_t)foff, "%s%llx",
++						    k ? "." : "", (unsigned long long)off);
++					}
++					if (fn > 0) {
++						printf("clover r222: sbuf t=%llu"
++						    " tid=0x%llx n=%u f=%s\n",
++						    (unsigned long long)secs,
++						    (unsigned long long)tids[pick[j]],
++						    fn, fo);
++					}
++					if (ssz > 0 && (bits & 0xff) != 0 &&
++					    r[0] != 0) {
++						hlim = (ssz < (uint32_t)sizeof(hb)) ?
++						    ssz : (uint32_t)sizeof(hb);
++						if (copyin((user_addr_t)r[0], hb, hlim) ==
++						    KERN_SUCCESS) {
++							hx[0] = '\0';
++							for (k = 0; k < hlim; k++) {
++								ho += snprintf(hx + ho,
++								    sizeof(hx) - (size_t)ho, "%02x",
++								    hb[k]);
++								if (ho >= (int)sizeof(hx) - 3) {
++									break;
++								}
++							}
++							printf("clover r222: sbhex t=%llu"
++							    " tid=0x%llx sz=%x n=%x %s\n",
++							    (unsigned long long)secs,
++							    (unsigned long long)tids[pick[j]],
++							    ssz, hlim, hx);
++						}
++					}
 +				}
 +			}
 +		}

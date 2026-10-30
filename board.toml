@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r221: the blocked thread's pc and lr as dyld shared-cache file offsets, and the service name in its send body -- round220 showed the main thread waiting on launchd (pid 1) in a synchronous XPC, so each sampled mach_msg2 thread now records its trap address translated through its own map entry (VME_OFFSET + pc - vme_start) with eight instructions at the pc, and every call that sends a body prints the printable runs of that body, where launchd's service name is plain text"
+title = "clover r222: the caller frames of the blocked thread as cache offsets, and the send body as hex -- round221 named the stop as libsystem_kernel _mach_msg2_trap and read three printable keys out of the 204-byte body, so each picked thread now walks its user fp chain and prints six return addresses as the same VME_OFFSET + pc - vme_start offsets, and each body is dumped as hex instead of filtered text, where the caller of _mach_msg2_internal and the XPC request are both visible"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
