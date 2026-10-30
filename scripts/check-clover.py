@@ -806,6 +806,10 @@ def check_board(errors: list) -> str:
         if '{ "clover r225: ", "r225-p1", 192, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round225's pid-1 sender reading no tee class: "
                           "twenty-four probes of five lines would land in the ring uncounted")
+        if '{ "clover r226: ", "r226-die", 192, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round226's kill-site registers and receive "
+                          "samples no tee class: seven lines per kill plus the sbrcv updates "
+                          "would land in the ring uncounted")
         if '{ "clover r217: ", "r217-sbs", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round217's live sample no tee class: a line "
                           "that changes every eight seconds for the length of the boot would land "
@@ -900,6 +904,30 @@ def check_board(errors: list) -> str:
             if "current_task() != task" not in p1_text:
                 errors.append(f"{p1_patch.name} does not keep copyin inside the owning task: a "
                               "launchd stack read from another context is a different address")
+
+        r226_patch = next((base / "patches/xnu-clover/zzzzzzzzzzz-clover-r226.patch"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover/zzzzzzzzzzz-clover-r226.patch").is_file()),
+                          None)
+        if r226_patch is None:
+            errors.append("patches/xnu-clover/zzzzzzzzzzz-clover-r226.patch is missing: round225 "
+                          "left the kill's ulr at a Killing %@ helper and the receiver unread, so "
+                          "the next frame would have nothing that names the caller or the wait")
+        else:
+            r226_text = r226_patch.read_text()
+            for needle in ('"clover r226: kreg%u %016llx.%016llx.%016llx.%016llx.%016llx.%016llx.%016llx.%016llx\\n"',
+                           '"clover r226: kreg4 fp=%016llx lr=%016llx sp=%016llx pc=%016llx cpsr=%08x\\n"',
+                           '"clover r226: kraw%u %016llx.%016llx.%016llx.%016llx.%016llx.%016llx.%016llx.%016llx\\n"',
+                           "clover_sender_regs(", "clover_sender_regs(uint64_t *out, uint32_t max)",
+                           '"clover r226: sbrcv t=%llu tid=0x%llx k=%u cnt=%u ql=%u seq=%u"',
+                           "clover_r226_receive_note(", "clover_sb_is_current(",
+                           "clover_port_recv_task(", "ipc_entry_lookup(",
+                           "ipc_kmsg_queue_first(&port->ip_messages.imq_messages)",
+                           '"clover r226: sbgone t=%llu pid=%d\\n"',
+                           "if (secs < peer_last_secs + 4) {"):
+                if needle not in r226_text:
+                    errors.append(f"{r226_patch.name} lacks {needle[:56]!r}: the kill could not "
+                                  "name its caller, the sender's registers or the receive wait")
 
         if "CloverSdhci r212: panic tail lines=%u unseen=%u bufx=%d tee=%u boot=%u" not in sdhci_source:
             errors.append("drivers/CloverSdhci has no round212 panic-time tail read: a boot whose "
@@ -1876,8 +1904,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r225:"):
-        errors.append('[payload] title is not "clover r225: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r226:"):
+        errors.append('[payload] title is not "clover r226: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2916,8 +2944,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r225:"):
-        errors.append('[payload] title is not "clover r225: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r226:"):
+        errors.append('[payload] title is not "clover r226: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

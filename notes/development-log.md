@@ -16798,9 +16798,13 @@ payload 仍 56 MiB（sha256 `7637d2761b7f8547c2880d230447a5b124f54635909ff822f0a
 4. **死因仍是看门狗**：497.143890 s `killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58
    scomm=backboardd ns=-1 code=0x0 cs=0x22000301`；`killsrc upc=1e2625100 ulr=10086a144
    insn=540000e3`——`upc` 减 slide 得 `libsystem_kernel.___kill`+0x8，也就是 `svc #0` 那条指令；
-   `ulr=0x10086a144` 落在 backboardd 的 `__TEXT`（0x100000000..0x1000e0000）之外，
-   **这一格还不能符号化**——r226 要把发信线程的完整用户寄存器和原始栈字打出来，
-   别再让内核侧替用户态换算。497.336066 s `exit pid=27 t=9s rv=0x9 ns=2 code=0x9`，
+   `ulr=0x10086a144` **不是 `__TEXT` 之外的地址**：backboardd 本靴 slide = 0x7F8000
+   （0x10086a144 − 0x7F8000 = 0x100071ee4，正好落在 `__TEXT` 里，且是 0x8000 对齐的
+   页对齐量），对应镜像偏移 **0x71ee4**——宿主 `otool -tvV` 里第二处 `bl _kill`
+   （0x100071ee0，返回 0x100071ee4）的返回地址，即「Killing %@」helper 的调用点；
+   与 r218 由 `ulr=0x100ce0144`、slide 0xC6E000 解出的镜像偏移 0x72144 是同一条批量
+   杀路径。r226 仍要把发信线程的完整用户寄存器和原始栈字打出来，但目的是看**调用者是谁、
+   判据是什么**（x0 里的 comm 串、栈上哪几个字），不是「无法符号化」。497.336066 s `exit pid=27 t=9s rv=0x9 ns=2 code=0x9`，
    之后到 900 s 没有重启。
 5. **屏幕还在出帧，出的是 backboardd 的引导进度**：`frame#0..#2` 每次 `pixels=41586
    box=305x887..755x1029`，`colours ff000000/2262414 ff070707/24 ff464646/14 ff626262/5
@@ -16825,10 +16829,55 @@ r225 把「回信没到」排除了，剩下的窗口只有 497 s 前那几秒�
 
 1. **kill 发信者的完整现场**：`psignal_internal` 那一格改成打印发信线程的
    `pc/sp/fp/lr/x0..x7` 与用户栈原始 8 个字（不再做 `VME_OFFSET` 换算），并用
-   `ipc_entry` 直接读目标端口的接收者进程名——`ulr=0x10086a144` 落在 backboardd
-   `__TEXT` 之外，只有原始寄存器才能判它是另一个 mapping 还是被内核读歪了。
+   `ipc_entry` 直接读目标端口的接收者进程名。`ulr=0x10086a144` 已按 slide 0x7F8000
+   回到镜像偏移 0x71ee4（「Killing %@」helper 的 `bl _kill` 返回点），所以寄存器/栈字
+   要看的是**调用者与判据**：x0 是否就是 p_comm 串、栈上哪些字是它的参数。
 2. **SpringBoard 的收方向**：r221 的 `sbm2` 只看发送，补一条对 `ipc_mqueue_receive`
    入口的取样，打出它在等哪个端口、队首消息的 `bits/size/id`，把「谁在叫醒它」落到具体 id。
 3. **beat 提前**：r225 的 `rp` 只在 8 s 节拍上读，497 s 前最后一次是 491 s；
    把 peer 节拍改成 4 s，并在 `proc_find` 失败时打一条收尾行（`gone`），
    让「SpringBoard 死了」本身成为一条读数，而不是读数消失。
+
+## round226 读数（boot 15）
+
+payload `62f8d60c1aaef92c78b62824ca106444cc4cf2c3f855c55183b616a3da45a388`（56 MiB），
+内核 `13eb35e657c9acaab072e6dbcb7614ecf57ed37a511f88aa1b64aec3269e5233`；
+冷刷 cache 后无人值守跑到 900 s 死线，读回内核日志尾段（469.32–913 s）与 probe 环。
+
+1. **kill 现场：x0 就是 SpringBoard 的 pid，调用点回到「Killing %@」helper**。
+   532.091901 s `clover r207: killsig pid=27 comm=SpringBoard ppid=1 sig=9 spid=58
+   scomm=backboardd cs=0x22000301`。同一瞬间的 `kreg0..kreg4`：
+   `x0=0x1b`（27）、`x1=0x9`（SIGKILL）、`x2=0x1`、`x3=0x16f70c4f8`、`x4=0x1f5088230`、
+   `x5=0x1a`、`x6=0x00c0000004420122`、`x7=0xe6`；
+   `fp=0x16f70d990 lr=0x100763144 sp=0x16f70d860 pc=0x1d2975100 cpsr=0x40000000`。
+   r208 的 `sender upc=0x1d2975100 uinsn=540000e3` 表明 `pc` 是 `___kill`+0x8 的 `svc`；
+   `kreg2` 里 `x20=0x1006f1000` 是 backboardd 的镜像基址，`lr−x20=0x72144`——
+   与 r218 由 `ulr=0x100ce0144`、slide `0xC6E000` 得到的 `0x72144` 是同一个返回点，
+   即「Killing %@」helper 里第二处 `bl _kill`。`kraw0/kraw1` 是 `sp` 下的十六个原始字
+   （`ffffffffffffffff`、`0x16f70d8b8`、`0x16f70d878`、`0x21da28b008420102`、`0x80000` …），
+   按原样落盘、不换算。532.120416 s `exit pid=27 t=10s rv=0x9 ns=2 code=0x9`。
+2. **回信在 480 s 停了，之后它只停在一个等待上**。回复端口 5203（本靴的 SpringBoard 代）
+   在 472 s `seq=3`、480.005 s `seq=11`，此后 484–532 s 每 4 s 一条读数全是
+   `cnt=0 ql=5 seq=11 rn=5203 ms=0 sr=0`；r221 发送面在 480.596 / 508.845 / 525.450 s
+   都看到主线程 `0x104` 以 `rem=5903 rn=1d03` 进 `mach_msg2`（`op=0x40700420e`，
+   `x6` 低位 `0x4000`）。r223 的 5903 端口同一时段 `cnt=1 ql=6 seq=0 rn=0 ms=0 sr=2`，
+   队首消息 `bits=0x20111211 sz=0x86(134) rem=0x1877a100 loc=0x1861cf20 vou=0x903 id=0x40000000`
+   ——一条没人取的消息压在收端口上。
+3. **收方向探针一条都没有**。`grep -c sbrcv` = 0。内核日志尾段从 469.32 s 开始，
+   而 `clover_r226_receive_note` 的 32 行配额是全局的：SpringBoard 早期的阻塞接收
+   完全可能在窗口之前就用完配额；另一种可能是 `clover_sb_note_current` 的
+   `if (ready) return;` 只锁存第一颗 SpringBoard task（持引用），一旦发生过重启，
+   `clover_sb_is_current()` 对后来的进程恒假。本靴只有一个 `killsig`，但窗口看不到
+   469 s 之前是否存在过更早的 SpringBoard 代，所以两种解释都还没有被证伪。
+4. **死亡本身成为读数**：536.135058 s `clover r226: sbgone t=536 pid=27`，与
+   `exit` 行相隔 4 s（peer 节拍），确认 `proc_find` 失败会收尾而不是静默。
+5. **屏幕仍旧只有进度条**：`frame#0..#3 pixels=41586 box=305x887..755x1029`，
+   `colours ff000000/2262366`、`client pid=58`，532.875 / 532.911 s backboardd
+   仍在 present；`retire#4 done=presented=4` 但画面没有桌面。
+
+**结论**：r226 结掉了「谁在杀、按什么参数杀」——backboardd 用 `kill(27, SIGKILL)`
+走「Killing %@」helper；也读到了 SpringBoard 死亡前的最后状态：回信在 480 s 停止，
+之后它挂在一个收端口上，而那个端口里压着一条 `id=0x40000000` 的消息。
+收方向的具体证据缺失来自探针机制（全局配额 + 一次性 task 锁存），不是被测对象。
+r227 把收方向改成「固定环记录最近 64 次变化、SpringBoard 被杀时整段倒出」，
+并让 task 锁存跟随重启——这样 469 s 之前的流量也不会再被日志环形缓冲挤掉。

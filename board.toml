@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r225: launchd sends too -- the r224 beat never saw a launchd mach message because the sender probe only watched SpringBoard; r225 samples pid 1 on its own traps and reads the reply port at every beat"
+title = "clover r226: name the caller -- r225 resolved ulr to backboardd's Killing %@ helper, so r226 prints the killed thread's registers and stack, samples SpringBoard's receive path, and halves the beat to 4 s"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

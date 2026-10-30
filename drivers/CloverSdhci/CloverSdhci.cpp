@@ -669,6 +669,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // body hex, two port states) over a full boot. 192 holds the worst case and
   // still bounds a producer that loops harder than pid 1 does.
   { "clover r225: ", "r225-p1", 192, 0, 0, 0 },
+  // Round226 adds the killed thread's registers: seven lines per kill (four
+  // kreg, one kreg4, two kraw) capped at four kills, plus one-line sbrcv
+  // updates from the receive path (32 changes) and a single sbgone. 192 holds
+  // four full kills and still leaves room for the receive side.
+  { "clover r226: ", "r226-die", 192, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

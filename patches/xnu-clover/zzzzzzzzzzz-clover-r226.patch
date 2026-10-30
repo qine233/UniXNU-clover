@@ -1,0 +1,404 @@
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+index dfd2a63..5d60167 100644
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -2073,6 +2073,7 @@ psignal_internal(proc_t p, task_t task, thread_t thread, int flavor, int signum,
+ 		static uint32_t clover_kill_used;
+ 		static uint32_t clover_kill_prints;
+ 		static uint32_t clover_r208_prints;
++		static uint32_t clover_r226_prints;
+ 		proc_t clover_kill_sender = current_proc();
+ 		uint32_t clover_kill_slot = 8;
+ 		uint32_t clover_kill_i;
+@@ -2244,6 +2245,83 @@ psignal_internal(proc_t p, task_t task, thread_t thread, int flavor, int signum,
+ 			clover_emmc_probe_say(clover_r211_line,
+ 			    (unsigned int)strlen(clover_r211_line));
+ 
++			/*
++			 * Round226. The slide turned ulr 0x10086a144 into image
++			 * offset 0x71ee4 -- the return of the second `bl _kill`,
++			 * inside backboardd's "Killing %@" helper. It cannot say
++			 * why that helper chose this process. These words can:
++			 * x0 is the pid that reached kill(2), and the stack under
++			 * sp still holds what the caller passed. Printed raw and
++			 * untranslated on purpose.
++			 */
++			if (clover_r226_prints < 4) {
++				extern uint32_t clover_sender_regs(uint64_t *r,
++				    uint32_t n);
++				uint64_t clover_r226_r[34];
++				uint64_t clover_r226_w[16];
++				uint32_t clover_r226_n;
++				uint32_t clover_r226_i;
++				char clover_r226_line[320];
++
++				clover_r226_prints++;
++				clover_r226_n = clover_sender_regs(clover_r226_r, 34);
++				for (clover_r226_i = 0;
++				    clover_r226_i < 4 && clover_r226_n == 34;
++				    clover_r226_i++) {
++					uint64_t *g = &clover_r226_r[clover_r226_i * 8];
++
++					snprintf(clover_r226_line,
++					    sizeof(clover_r226_line),
++					    "clover r226: kreg%u %016llx.%016llx.%016llx.%016llx.%016llx.%016llx.%016llx.%016llx\n",
++					    clover_r226_i,
++					    (unsigned long long)g[0], (unsigned long long)g[1],
++					    (unsigned long long)g[2], (unsigned long long)g[3],
++					    (unsigned long long)g[4], (unsigned long long)g[5],
++					    (unsigned long long)g[6], (unsigned long long)g[7]);
++					clover_r226_line[sizeof(clover_r226_line) - 1] = '\0';
++					printf("%s", clover_r226_line);
++					clover_emmc_probe_say(clover_r226_line,
++					    (unsigned int)strlen(clover_r226_line));
++				}
++				if (clover_r226_n == 34) {
++					snprintf(clover_r226_line,
++					    sizeof(clover_r226_line),
++					    "clover r226: kreg4 fp=%016llx lr=%016llx sp=%016llx pc=%016llx cpsr=%08x\n",
++					    (unsigned long long)clover_r226_r[29],
++					    (unsigned long long)clover_r226_r[30],
++					    (unsigned long long)clover_r226_r[31],
++					    (unsigned long long)clover_r226_r[32],
++					    (unsigned)clover_r226_r[33]);
++					clover_r226_line[sizeof(clover_r226_line) - 1] = '\0';
++					printf("%s", clover_r226_line);
++					clover_emmc_probe_say(clover_r226_line,
++					    (unsigned int)strlen(clover_r226_line));
++					if (copyin((user_addr_t)clover_r226_r[31],
++					    clover_r226_w, sizeof(clover_r226_w)) != 0) {
++						memset(clover_r226_w, 0,
++						    sizeof(clover_r226_w));
++					}
++					for (clover_r226_i = 0;
++					    clover_r226_i < 2; clover_r226_i++) {
++						uint64_t *g =
++						    &clover_r226_w[clover_r226_i * 8];
++
++						snprintf(clover_r226_line,
++						    sizeof(clover_r226_line),
++						    "clover r226: kraw%u %016llx.%016llx.%016llx.%016llx.%016llx.%016llx.%016llx.%016llx\n",
++						    clover_r226_i,
++						    (unsigned long long)g[0], (unsigned long long)g[1],
++						    (unsigned long long)g[2], (unsigned long long)g[3],
++						    (unsigned long long)g[4], (unsigned long long)g[5],
++						    (unsigned long long)g[6], (unsigned long long)g[7]);
++						clover_r226_line[sizeof(clover_r226_line) - 1] = '\0';
++						printf("%s", clover_r226_line);
++						clover_emmc_probe_say(clover_r226_line,
++						    (unsigned int)strlen(clover_r226_line));
++					}
++				}
++			}
++
+ 			if (strncmp(p->p_comm, "SpringBoard", 16) == 0) {
+ 				clover_r208_prints += clover_task_threads(proc_task(p),
+ 				    (clover_r208_prints < 64) ? 64 - clover_r208_prints : 0);
+diff --git a/osfmk/ipc/ipc_mqueue.c b/osfmk/ipc/ipc_mqueue.c
+index ba4b60c..446b56b 100644
+--- a/osfmk/ipc/ipc_mqueue.c
++++ b/osfmk/ipc/ipc_mqueue.c
+@@ -75,6 +75,7 @@
+ #include <mach/sync_policy.h>
+ 
+ #include <kern/assert.h>
++#include <kern/clock.h>
+ #include <kern/counter.h>
+ #include <kern/sched_prim.h>
+ #include <kern/ipc_kobject.h>
+@@ -908,6 +909,96 @@ ipc_mqueue_receive_continue(
+ 	mach_msg_receive_continue();  /* hard-coded for now */
+ }
+ 
++/*
++ * Round226. r225 watched SpringBoard send and saw the reply arrive on a03,
++ * but the thread that ended up blocked was waiting on 7b03/1d07 with a message
++ * already queued -- so the question moved to the receive side: which port did
++ * it park on, and what was already in that port's queue when it parked. This
++ * runs on every blocking receive in the system, so the gate is one load and
++ * one pointer compare, and the line is printed only when the (port, count,
++ * id) triple changes, thirty-two times at most. Callers hold the waitq lock.
++ */
++#if defined(__arm64__)
++extern int clover_sb_is_current(void);
++
++static void
++clover_r226_port_note(ipc_port_t port, uint32_t kind, uint64_t secs)
++{
++	static uintptr_t last_key;
++	static uint32_t last_cnt;
++	static uint32_t last_id;
++	static uint32_t prints;
++	ipc_kmsg_t kmsg;
++	mach_msg_header_t *mh;
++	uint32_t cnt;
++	uint32_t id = 0;
++	uintptr_t key;
++
++	if (prints >= 32) {
++		return;
++	}
++	cnt = port->ip_messages.imq_msgcount;
++	kmsg = ipc_kmsg_queue_first(&port->ip_messages.imq_messages);
++	mh = (kmsg != IKM_NULL) ? ikm_header(kmsg) : NULL;
++	if (mh != NULL) {
++		id = mh->msgh_id;
++	}
++	key = (uintptr_t)port ^ ((uintptr_t)kind << 3);
++	if (key == last_key && cnt == last_cnt && id == last_id) {
++		return;
++	}
++	last_key = key;
++	last_cnt = cnt;
++	last_id = id;
++	prints++;
++	printf("clover r226: sbrcv t=%llu tid=0x%llx k=%u cnt=%u ql=%u seq=%u"
++	    " rn=%x ms=%u sr=%u kobj=%llx h=%x.%x.%x.%x.%x.%x\n",
++	    (unsigned long long)secs,
++	    (unsigned long long)current_thread()->thread_id, kind, cnt,
++	    (unsigned)port->ip_messages.imq_qlimit,
++	    (unsigned)port->ip_messages.imq_seqno,
++	    port->ip_messages.imq_receiver_name,
++	    (unsigned)port->ip_mscount,
++	    (unsigned)port->ip_srights,
++	    (unsigned long long)port->ip_kobject,
++	    (unsigned)(mh != NULL ? mh->msgh_bits : 0),
++	    (unsigned)(mh != NULL ? mh->msgh_size : 0),
++	    (unsigned)(mh != NULL ? mh->msgh_remote_port : 0),
++	    (unsigned)(mh != NULL ? mh->msgh_local_port : 0),
++	    (unsigned)(mh != NULL ? mh->msgh_voucher_port : 0),
++	    (unsigned)(mh != NULL ? mh->msgh_id : 0));
++}
++
++static void
++clover_r226_receive_note(struct waitq *waitq)
++{
++	static uintptr_t last_set;
++	static uint32_t set_prints;
++	uint64_t ns = 0;
++	int ty;
++
++	if (!clover_sb_is_current()) {
++		return;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	ty = waitq_type(waitq);
++	if (ty == WQT_PORT) {
++		clover_r226_port_note(ip_from_waitq(waitq), 0, ns / 1000000000ULL);
++		return;
++	}
++	if (set_prints < 8 && last_set != (uintptr_t)io_from_waitq(waitq)) {
++		last_set = (uintptr_t)io_from_waitq(waitq);
++		set_prints++;
++		printf("clover r226: sbrcv t=%llu tid=0x%llx k=1 ty=%d obj=%llx\n",
++		    (unsigned long long)(ns / 1000000000ULL),
++		    (unsigned long long)current_thread()->thread_id, ty,
++		    (unsigned long long)last_set);
++	}
++}
++#else
++#define clover_r226_receive_note(w) do { (void)(w); } while (0)
++#endif /* __arm64__ */
++
+ /*
+  *	Routine:	ipc_mqueue_receive
+  *	Purpose:
+@@ -989,6 +1080,8 @@ ipc_mqueue_receive_on_thread_and_unlock(
+ 
+ 	assert(thread == current_thread());
+ 
++	clover_r226_receive_note(waitq);
++
+ 	if (waitq_type(waitq) == WQT_PORT_SET) {
+ 		ipc_pset_t pset = ips_object_to_pset(object);
+ 		wqs_prepost_flags_t wqs_flags = WQS_PREPOST_LOCK;
+@@ -1032,6 +1125,17 @@ ipc_mqueue_receive_on_thread_and_unlock(
+ 	}
+ 
+ 	if (port) {
++#if defined(__arm64__)
++		/* Round226: the port a port-set wait finally resolved to. */
++		if (clover_sb_is_current()) {
++			uint64_t clover_r226_ns = 0;
++
++			absolutetime_to_nanoseconds(mach_absolute_time(),
++			    &clover_r226_ns);
++			clover_r226_port_note(port, 2,
++			    clover_r226_ns / 1000000000ULL);
++		}
++#endif
+ #if MACH_FLIPC
+ 		if (option64 & MACH64_PEEK_MSG) {
+ 			ipc_mqueue_peek_on_thread_locked(&port->ip_messages,
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index a1b09b3..3448705 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10610,6 +10610,18 @@ clover_sb_note_current(void)
+ 	__atomic_store_n(&clover_sb_ready, 1, __ATOMIC_RELEASE);
+ }
+ 
++/*
++ * Round226. The receive probe in ipc_mqueue.c runs on every blocking receive
++ * in the system, so its gate has to be a load and a pointer compare: the task
++ * captured above is the only one whose waits are printed.
++ */
++int
++clover_sb_is_current(void)
++{
++	return __atomic_load_n(&clover_sb_ready, __ATOMIC_ACQUIRE) &&
++	    clover_sb_task == current_task();
++}
++
+ static uint64_t
+ clover_now_seconds(void)
+ {
+@@ -10619,6 +10631,39 @@ clover_now_seconds(void)
+ 	return ns / 1000000000ULL;
+ }
+ 
++/*
++ * Round226. ipc_object_translate asks for a right type, and the launchd send
++ * descriptors name a send-once right, which no translate right covers: that is
++ * the kr=17 of rounds 223-225, not a dead port. The entry table answers the
++ * same question without nursing a right: the entry carries the port object
++ * whatever right the name holds. The space lock keeps the entry alive while
++ * its object is locked and referenced, the same order translate uses.
++ */
++static task_t
++clover_port_recv_task(ipc_space_t space, mach_port_name_t name)
++{
++	ipc_entry_t entry;
++	ipc_object_t obj;
++	task_t owner = TASK_NULL;
++
++	is_read_lock(space);
++	entry = ipc_entry_lookup(space, name);
++	if (entry != NULL && (obj = entry->ie_object) != IPC_OBJECT_NULL) {
++		io_lock(obj);
++		if (io_otype(obj) == IOT_PORT) {
++			ipc_space_t recv = ip_get_receiver((ipc_port_t)obj);
++
++			if (recv != IPC_SPACE_NULL && recv->is_task != TASK_NULL) {
++				owner = recv->is_task;
++				task_reference(owner);
++			}
++		}
++		io_unlock(obj);
++	}
++	is_read_unlock(space);
++	return owner;
++}
++
+ /*
+  * Round220. A port name in the descriptor says nothing by itself. Translate it
+  * in the sampled task's own space and, when it is a port whose receive right
+@@ -10652,18 +10697,19 @@ clover_sb_port_owner(task_t task, mach_port_name_t name, char *out, size_t outle
+ 		kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_RECEIVE,
+ 		    &obj);
+ 	}
+-	if (kr != KERN_SUCCESS) {
+-		return;
+-	}
+-	if (io_otype(obj) == IOT_PORT) {
+-		ipc_space_t recv = ip_get_receiver((ipc_port_t)obj);
++	if (kr == KERN_SUCCESS) {
++		if (io_otype(obj) == IOT_PORT) {
++			ipc_space_t recv = ip_get_receiver((ipc_port_t)obj);
+ 
+-		if (recv != IPC_SPACE_NULL && recv->is_task != TASK_NULL) {
+-			owner = recv->is_task;
+-			task_reference(owner);
++			if (recv != IPC_SPACE_NULL && recv->is_task != TASK_NULL) {
++				owner = recv->is_task;
++				task_reference(owner);
++			}
+ 		}
++		io_unlock(obj);
++	} else {
++		owner = clover_port_recv_task(space, name);
+ 	}
+-	io_unlock(obj);
+ 	if (owner == TASK_NULL) {
+ 		return;
+ 	}
+@@ -11239,7 +11285,10 @@ clover_peer_sample(void)
+ 	uint32_t n = 0;
+ 
+ 	secs = clover_now_seconds();
+-	if (secs < peer_last_secs + 8) {
++	/* Round226: four seconds, not eight. The r225 frame's last reply-port brief
++	 * was 491 s and the kill was at 497 s; a beat that lands inside that gap
++	 * is the point. */
++	if (secs < peer_last_secs + 4) {
+ 		return;
+ 	}
+ 	peer_last_secs = secs;
+@@ -11305,16 +11354,24 @@ clover_peer_sample(void)
+ 	 * that appears and stays says it was sent and never taken.
+ 	 */
+ 	if (clover_sb_pid > 0 && clover_sb_last_reply != MACH_PORT_NULL) {
++		/* Round226: the reading used to just stop. Say it once instead, so
++		 * the last beat before a death and the death itself are two facts. */
++		static int clover_sb_gone;
+ 		struct proc *sp = proc_find(clover_sb_pid);
+ 
+ 		if (sp != NULL) {
+ 			task_t st = proc_task(sp);
+ 
++			clover_sb_gone = 0;
+ 			if (st != TASK_NULL) {
+ 				clover_sb_port_state(st, clover_sb_last_reply, "rp",
+ 				    secs, "r225");
+ 			}
+ 			proc_rele(sp);
++		} else if (!clover_sb_gone) {
++			clover_sb_gone = 1;
++			printf("clover r226: sbgone t=%llu pid=%d\n",
++			    (unsigned long long)secs, clover_sb_pid);
+ 		}
+ 	}
+ }
+@@ -11562,4 +11619,42 @@ clover_p1_sample(void)
+ 		p1_probes++;
+ 	}
+ }
++
++/*
++ * Round226. The r225 frame named the kill site through a slide the host had to
++ * derive: ulr 0x10086a144 minus backboardd's 0x7F8000 is image offset 0x71ee4,
++ * the return of the second `bl _kill`, inside the "Killing %@" helper. What the
++ * slide cannot say is why that helper picked this process. The caller's own
++ * registers can: x0 is the pid that was passed to kill(2), the stack words
++ * under sp are the arguments its caller built, and both are printed raw here
++ * -- no translation, no mapping lookup, because the point is to read the
++ * decision, not to name an address. Layout: x0..x28, fp, lr, sp, pc, cpsr.
++ */
++uint32_t
++clover_sender_regs(uint64_t *out, uint32_t max)
++{
++	thread_t thr = current_thread();
++	arm_saved_state_t *ss;
++	arm_saved_state64_t *s64;
++	uint32_t n = 0;
++	uint32_t i;
++
++	if (thr == THREAD_NULL || out == NULL || max < 34) {
++		return 0;
++	}
++	ss = get_user_regs(thr);
++	if (ss == NULL || (uintptr_t)ss == (uintptr_t)-1 || is_saved_state32(ss)) {
++		return 0;
++	}
++	s64 = saved_state64(ss);
++	for (i = 0; i < 29; i++) {
++		out[n++] = (uint64_t)s64->x[i];
++	}
++	out[n++] = (uint64_t)get_saved_state_fp(ss);
++	out[n++] = (uint64_t)get_saved_state_lr(ss);
++	out[n++] = (uint64_t)get_saved_state_sp(ss);
++	out[n++] = (uint64_t)get_saved_state_pc(ss);
++	out[n++] = (uint64_t)get_saved_state_cpsr(ss);
++	return n;
++}
+ #endif /* __arm64__ */
