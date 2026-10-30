@@ -1,0 +1,410 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10581,12 +10581,14 @@
+  * describes the stop.
+  *
+  * The task is captured on SpringBoard's own trap entry, where its task cannot
+- * be deallocating, and one reference is held for the life of the boot: this is
+- * a diagnostic build, and the reference is what lets a sample taken after the
+- * kill read a live object instead of a freed one.
++ * be deallocating, and one reference is held while it is the latched task:
++ * this is a diagnostic build, and the reference is what lets a sample taken
++ * after the kill read a live object instead of a freed one. Round227 makes the
++ * latch follow a restart; see clover_sb_note_current below.
+  */
+ static task_t clover_sb_task;
+ static volatile uint32_t clover_sb_ready;
++static uint32_t clover_sb_gen;
+ static uint64_t clover_sb_last_secs;
+ static uint64_t clover_sb_heartbeat;
+ static uint32_t clover_sb_changes;
+@@ -10599,15 +10601,45 @@
+ static int clover_sb_pid;
+ static mach_port_name_t clover_sb_last_reply;
+ 
++static uint64_t clover_now_seconds(void);
++
++/*
++ * Round227. Round225 latched the first SpringBoard task for the life of the
++ * boot, so after a restart every probe that compares against it went quiet:
++ * the old task was dead, and the new one never replaced it. The latch now
++ * follows the restart -- a different current task on SpringBoard's own trap
++ * entry swaps the pointer, keeps a reference to the new task, drops the old
++ * one, and resets the per-generation sample state so the new generation's
++ * first state change is printed instead of being compared against the dead
++ * generation's last line.
++ */
+ void
+ clover_sb_note_current(void)
+ {
+-	if (__atomic_load_n(&clover_sb_ready, __ATOMIC_ACQUIRE)) {
++	task_t cur = current_task();
++	task_t old;
++
++	if (__atomic_load_n(&clover_sb_ready, __ATOMIC_ACQUIRE) &&
++	    __atomic_load_n(&clover_sb_task, __ATOMIC_ACQUIRE) == cur) {
+ 		return;
+ 	}
+-	task_reference(current_task());
+-	clover_sb_task = current_task();
++	task_reference(cur);
++	old = __atomic_exchange_n(&clover_sb_task, cur, __ATOMIC_ACQ_REL);
+ 	__atomic_store_n(&clover_sb_ready, 1, __ATOMIC_RELEASE);
++	if (old != TASK_NULL && old != cur) {
++		clover_sb_gen++;
++		clover_sb_pid = 0;
++		clover_sb_last_reply = MACH_PORT_NULL;
++		clover_sb_last_secs = 0;
++		clover_sb_heartbeat = 0;
++		clover_sb_changes = 0;
++		clover_sb_last[0] = '\0';
++		clover_sb_last_m2[0] = '\0';
++		printf("clover r227: sbtask gen=%u pid=%d t=%llu\n",
++		    clover_sb_gen, task_pid(cur),
++		    (unsigned long long)clover_now_seconds());
++		task_deallocate(old);
++	}
+ }
+ 
+ /*
+@@ -10619,7 +10651,7 @@
+ clover_sb_is_current(void)
+ {
+ 	return __atomic_load_n(&clover_sb_ready, __ATOMIC_ACQUIRE) &&
+-	    clover_sb_task == current_task();
++	    __atomic_load_n(&clover_sb_task, __ATOMIC_ACQUIRE) == current_task();
+ }
+ 
+ static uint64_t
+@@ -10831,7 +10863,7 @@
+ 	if (!__atomic_load_n(&clover_sb_ready, __ATOMIC_ACQUIRE)) {
+ 		return;
+ 	}
+-	task = clover_sb_task;
++	task = __atomic_load_n(&clover_sb_task, __ATOMIC_ACQUIRE);
+ 	if (task == TASK_NULL) {
+ 		return;
+ 	}
+--- a/osfmk/ipc/ipc_mqueue.c
++++ b/osfmk/ipc/ipc_mqueue.c
+@@ -910,70 +910,136 @@
+ }
+ 
+ /*
+- * Round226. r225 watched SpringBoard send and saw the reply arrive on a03,
+- * but the thread that ended up blocked was waiting on 7b03/1d07 with a message
+- * already queued -- so the question moved to the receive side: which port did
+- * it park on, and what was already in that port's queue when it parked. This
+- * runs on every blocking receive in the system, so the gate is one load and
+- * one pointer compare, and the line is printed only when the (port, count,
+- * id) triple changes, thirty-two times at most. Callers hold the waitq lock.
++ * Round227. Round226 printed each changed blocking receive live, capped at 32
++ * lines, and stayed silent the whole boot: either the cap was spent before the
++ * msgbuf window that survived to the host (469 s on), or SpringBoard's latched
++ * task was a generation that had already died. Live printing could not tell
++ * those apart, so r227 keeps the last 64 distinct receives in a fixed ring and
++ * dumps the ring from psignal_internal at the moment SpringBoard is killed,
++ * where the whole history lands in one window instead of trickling into the
++ * msgbuf. The gate is still one load and one pointer compare per blocking
++ * receive, and the record is keyed on (port, kind, count, seq, id, size) so a
++ * thread that parks on the same empty port keeps one entry. Callers hold the
++ * waitq lock, which is the port's mqueue lock.
+  */
+ #if defined(__arm64__)
+ extern int clover_sb_is_current(void);
+ 
+-static void
+-clover_r226_port_note(ipc_port_t port, uint32_t kind, uint64_t secs)
++#define CLOVER_RECV_RING 64
++
++struct clover_recv_ent {
++	uint64_t cre_t;
++	uint64_t cre_tid;
++	uint64_t cre_port;
++	uint64_t cre_kobj;
++	uint32_t cre_kind;
++	uint32_t cre_name;
++	uint32_t cre_cnt;
++	uint32_t cre_ql;
++	uint32_t cre_seq;
++	uint32_t cre_ms;
++	uint32_t cre_sr;
++	uint32_t cre_bits;
++	uint32_t cre_size;
++	uint32_t cre_id;
++	uint64_t cre_remote;
++	uint64_t cre_local;
++	uint64_t cre_voucher;
++	uint32_t cre_bodylen;
++	uint32_t cre_body[8];
++};
++
++static struct clover_recv_ent clover_recv_ring[CLOVER_RECV_RING];
++static uint32_t clover_recv_head;
++static uint32_t clover_recv_total;
++
++static void
++clover_recv_note(ipc_port_t port, ipc_object_t setobj, uint32_t kind,
++    uint64_t secs)
+ {
+-	static uintptr_t last_key;
+-	static uint32_t last_cnt;
+-	static uint32_t last_id;
+-	static uint32_t prints;
++	static uintptr_t last_obj;
++	static uint32_t last_kind, last_cnt, last_seq, last_id, last_size;
++	struct clover_recv_ent *e;
+ 	ipc_kmsg_t kmsg;
+ 	mach_msg_header_t *mh;
+-	uint32_t cnt;
+-	uint32_t id = 0;
+ 	uintptr_t key;
+-
+-	if (prints >= 32) {
+-		return;
++	uint32_t cnt = 0;
++	uint32_t id = 0;
++	uint32_t size = 0;
++	uint32_t len = 0;
++	uint32_t seq = 0;
++	uint32_t i;
++	uint8_t *bp;
++	const uint8_t *src;
++
++	key = (port != IP_NULL) ? (uintptr_t)port : (uintptr_t)setobj;
++	mh = NULL;
++	if (port != IP_NULL) {
++		cnt = port->ip_messages.imq_msgcount;
++		seq = port->ip_messages.imq_seqno;
++		kmsg = ipc_kmsg_queue_first(&port->ip_messages.imq_messages);
++		mh = (kmsg != IKM_NULL) ? ikm_header(kmsg) : NULL;
++		if (mh != NULL) {
++			id = mh->msgh_id;
++			size = mh->msgh_size;
++		}
+ 	}
+-	cnt = port->ip_messages.imq_msgcount;
+-	kmsg = ipc_kmsg_queue_first(&port->ip_messages.imq_messages);
+-	mh = (kmsg != IKM_NULL) ? ikm_header(kmsg) : NULL;
+-	if (mh != NULL) {
+-		id = mh->msgh_id;
+-	}
+-	key = (uintptr_t)port ^ ((uintptr_t)kind << 3);
+-	if (key == last_key && cnt == last_cnt && id == last_id) {
++	if (last_obj == key && last_kind == kind && last_cnt == cnt &&
++	    last_seq == seq && last_id == id && last_size == size) {
+ 		return;
+ 	}
+-	last_key = key;
++	last_obj = key;
++	last_kind = kind;
+ 	last_cnt = cnt;
++	last_seq = seq;
+ 	last_id = id;
+-	prints++;
+-	printf("clover r226: sbrcv t=%llu tid=0x%llx k=%u cnt=%u ql=%u seq=%u"
+-	    " rn=%x ms=%u sr=%u kobj=%llx h=%x.%x.%x.%x.%x.%x\n",
+-	    (unsigned long long)secs,
+-	    (unsigned long long)current_thread()->thread_id, kind, cnt,
+-	    (unsigned)port->ip_messages.imq_qlimit,
+-	    (unsigned)port->ip_messages.imq_seqno,
+-	    port->ip_messages.imq_receiver_name,
+-	    (unsigned)port->ip_mscount,
+-	    (unsigned)port->ip_srights,
+-	    (unsigned long long)port->ip_kobject,
+-	    (unsigned)(mh != NULL ? mh->msgh_bits : 0),
+-	    (unsigned)(mh != NULL ? mh->msgh_size : 0),
+-	    (unsigned)(mh != NULL ? mh->msgh_remote_port : 0),
+-	    (unsigned)(mh != NULL ? mh->msgh_local_port : 0),
+-	    (unsigned)(mh != NULL ? mh->msgh_voucher_port : 0),
+-	    (unsigned)(mh != NULL ? mh->msgh_id : 0));
++	last_size = size;
++
++	e = &clover_recv_ring[clover_recv_head % CLOVER_RECV_RING];
++	bp = (uint8_t *)e;
++	for (i = 0; i < sizeof(*e); i++) {
++		bp[i] = 0;
++	}
++	clover_recv_head++;
++	clover_recv_total++;
++	e->cre_t = secs;
++	e->cre_tid = current_thread()->thread_id;
++	e->cre_port = (uint64_t)key;
++	e->cre_kind = kind;
++	if (port != IP_NULL) {
++		e->cre_kobj = (uint64_t)(uintptr_t)port->ip_kobject;
++		e->cre_name = port->ip_messages.imq_receiver_name;
++		e->cre_cnt = cnt;
++		e->cre_ql = port->ip_messages.imq_qlimit;
++		e->cre_seq = seq;
++		e->cre_ms = port->ip_mscount;
++		e->cre_sr = port->ip_srights;
++	}
++	if (mh != NULL) {
++		e->cre_bits = mh->msgh_bits;
++		e->cre_size = size;
++		e->cre_id = id;
++		e->cre_remote = (uint64_t)(uintptr_t)mh->msgh_remote_port;
++		e->cre_local = (uint64_t)(uintptr_t)mh->msgh_local_port;
++		e->cre_voucher = (uint64_t)(uintptr_t)mh->msgh_voucher_port;
++		if (size > sizeof(*mh) && size <= 4096) {
++			len = size - (uint32_t)sizeof(*mh);
++			if (len > sizeof(e->cre_body)) {
++				len = (uint32_t)sizeof(e->cre_body);
++			}
++			src = (const uint8_t *)(mh + 1);
++			bp = (uint8_t *)e->cre_body;
++			for (i = 0; i < len; i++) {
++				bp[i] = src[i];
++			}
++			e->cre_bodylen = len;
++		}
++	}
+ }
+ 
+ static void
+-clover_r226_receive_note(struct waitq *waitq)
++clover_recv_note_waitq(struct waitq *waitq)
+ {
+-	static uintptr_t last_set;
+-	static uint32_t set_prints;
+ 	uint64_t ns = 0;
+ 	int ty;
+ 
+@@ -983,20 +1049,67 @@
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+ 	ty = waitq_type(waitq);
+ 	if (ty == WQT_PORT) {
+-		clover_r226_port_note(ip_from_waitq(waitq), 0, ns / 1000000000ULL);
+-		return;
++		clover_recv_note(ip_from_waitq(waitq), IP_NULL, 0,
++		    ns / 1000000000ULL);
++	} else if (ty == WQT_PORT_SET) {
++		clover_recv_note(IP_NULL, io_from_waitq(waitq), 1,
++		    ns / 1000000000ULL);
+ 	}
+-	if (set_prints < 8 && last_set != (uintptr_t)io_from_waitq(waitq)) {
+-		last_set = (uintptr_t)io_from_waitq(waitq);
+-		set_prints++;
+-		printf("clover r226: sbrcv t=%llu tid=0x%llx k=1 ty=%d obj=%llx\n",
+-		    (unsigned long long)(ns / 1000000000ULL),
+-		    (unsigned long long)current_thread()->thread_id, ty,
+-		    (unsigned long long)last_set);
++}
++
++/*
++ * Called from psignal_internal when SpringBoard is the victim, with the pc of
++ * the killer already printed. Newest entry last, so the line closest to the
++ * kill is the last one in the window.
++ */
++void
++clover_recv_dump(void)
++{
++	struct clover_recv_ent *e;
++	uint32_t n = clover_recv_total;
++	uint32_t start;
++	uint32_t i;
++	uint64_t ns = 0;
++	uint64_t secs;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	secs = ns / 1000000000ULL;
++	if (n > CLOVER_RECV_RING) {
++		n = CLOVER_RECV_RING;
++	}
++	start = clover_recv_head - n;
++	printf("clover r227: rcvsum t=%llu n=%u tot=%u\n",
++	    (unsigned long long)secs, n, clover_recv_total);
++	for (i = 0; i < n; i++) {
++		e = &clover_recv_ring[(start + i) % CLOVER_RECV_RING];
++		printf("clover r227: rcv%u t=%llu tid=%llx k=%u p=%llx o=%llx"
++		    " nm=%x c=%u q=%u s=%u ms=%u sr=%u"
++		    " h=%x.%x.%llx.%llx.%llx.%x bl=%u\n",
++		    i, (unsigned long long)e->cre_t,
++		    (unsigned long long)e->cre_tid, e->cre_kind,
++		    (unsigned long long)e->cre_port,
++		    (unsigned long long)e->cre_kobj, e->cre_name, e->cre_cnt,
++		    e->cre_ql, e->cre_seq, e->cre_ms, e->cre_sr,
++		    e->cre_bits, e->cre_size,
++		    (unsigned long long)e->cre_remote,
++		    (unsigned long long)e->cre_local,
++		    (unsigned long long)e->cre_voucher, e->cre_id,
++		    e->cre_bodylen);
++		if (e->cre_bodylen >= 4) {
++			printf("clover r227: rcvb%u n=%u"
++			    " a=%08x.%08x.%08x.%08x.%08x.%08x.%08x.%08x\n",
++			    i, e->cre_bodylen / 4, e->cre_body[0], e->cre_body[1],
++			    e->cre_body[2], e->cre_body[3], e->cre_body[4],
++			    e->cre_body[5], e->cre_body[6], e->cre_body[7]);
++		}
+ 	}
+ }
+ #else
+-#define clover_r226_receive_note(w) do { (void)(w); } while (0)
++#define clover_recv_note_waitq(w) do { (void)(w); } while (0)
++static inline void
++clover_recv_dump(void)
++{
++}
+ #endif /* __arm64__ */
+ 
+ /*
+@@ -1080,7 +1193,7 @@
+ 
+ 	assert(thread == current_thread());
+ 
+-	clover_r226_receive_note(waitq);
++	clover_recv_note_waitq(waitq);
+ 
+ 	if (waitq_type(waitq) == WQT_PORT_SET) {
+ 		ipc_pset_t pset = ips_object_to_pset(object);
+@@ -1126,14 +1239,14 @@
+ 
+ 	if (port) {
+ #if defined(__arm64__)
+-		/* Round226: the port a port-set wait finally resolved to. */
++		/* Round227: the port a port-set wait finally resolved to. */
+ 		if (clover_sb_is_current()) {
+-			uint64_t clover_r226_ns = 0;
++			uint64_t clover_recv_ns = 0;
+ 
+ 			absolutetime_to_nanoseconds(mach_absolute_time(),
+-			    &clover_r226_ns);
+-			clover_r226_port_note(port, 2,
+-			    clover_r226_ns / 1000000000ULL);
++			    &clover_recv_ns);
++			clover_recv_note(port, IP_NULL, 2,
++			    clover_recv_ns / 1000000000ULL);
+ 		}
+ #endif
+ #if MACH_FLIPC
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -2113,7 +2113,27 @@
+ 			 * log buffer has overwritten it. */
+ 			clover_emmc_probe_say(clover_r207_line,
+ 			    (unsigned int)strlen(clover_r207_line));
++		}
++
++#if defined(__arm64__)
++		/*
++		 * Round227. SpringBoard's blocking receives are kept in a 64-entry
++		 * ring instead of being printed live (r226's live line never
++		 * reached the msgbuf window that survived to the host). The kill
++		 * is the one moment the whole history is worth printing, and it
++		 * runs once.
++		 */
++		if (signum == SIGKILL &&
++		    strncmp(p->p_comm, "SpringBoard", 16) == 0) {
++			static int clover_r227_dumped;
++			extern void clover_recv_dump(void);
++
++			if (!clover_r227_dumped) {
++				clover_r227_dumped = 1;
++				clover_recv_dump();
++			}
+ 		}
++#endif /* __arm64__ */
+ 
+ 		/*
+ 		 * Round208/211. Round207 named the sender; this says where in the

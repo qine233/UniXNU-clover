@@ -926,8 +926,11 @@ def check_sb_sample(kernel: bytes) -> bool:
              "kreg": (b"clover r226: kreg%u %016llx.%016llx.%016llx.%016llx.") in kernel,
              "kreg4": (b"clover r226: kreg4 fp=%016llx lr=%016llx sp=%016llx pc=%016llx") in kernel,
              "kraw": (b"clover r226: kraw%u %016llx.%016llx.%016llx.%016llx.") in kernel,
-             "sbrcv": (b"clover r226: sbrcv t=%llu tid=0x%llx k=%u cnt=%u ql=%u seq=%u") in kernel,
-             "sbgone": (b"clover r226: sbgone t=%llu pid=%d\n") in kernel}
+             "sbgone": (b"clover r226: sbgone t=%llu pid=%d\n") in kernel,
+             "rcvsum": (b"clover r227: rcvsum t=%llu n=%u tot=%u\n") in kernel,
+             "rcv": (b"clover r227: rcv%u t=%llu tid=%llx k=%u p=%llx o=%llx") in kernel,
+             "rcvb": (b"clover r227: rcvb%u n=%u") in kernel,
+             "sbtask": (b"clover r227: sbtask gen=%u pid=%d t=%llu\n") in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())

@@ -810,6 +810,10 @@ def check_board(errors: list) -> str:
             errors.append("drivers/CloverSdhci gives round226's kill-site registers and receive "
                           "samples no tee class: seven lines per kill plus the sbrcv updates "
                           "would land in the ring uncounted")
+        if '{ "clover r227: ", "r227-rcv", 256, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round227's receive dump no tee class: one "
+                          "summary plus sixty-four receive and body lines at the kill would land "
+                          "in the ring uncounted and evict the earlier readings")
         if '{ "clover r217: ", "r217-sbs", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round217's live sample no tee class: a line "
                           "that changes every eight seconds for the length of the boot would land "
@@ -928,6 +932,33 @@ def check_board(errors: list) -> str:
                 if needle not in r226_text:
                     errors.append(f"{r226_patch.name} lacks {needle[:56]!r}: the kill could not "
                                   "name its caller, the sender's registers or the receive wait")
+
+        r227_patch = next((base / "patches/xnu-clover/zzzzzzzzzzzz-clover-r227.patch"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover/zzzzzzzzzzzz-clover-r227.patch").is_file()),
+                          None)
+        if r227_patch is None:
+            errors.append("patches/xnu-clover/zzzzzzzzzzzz-clover-r227.patch is missing: round226 "
+                          "printed each changed receive live and the boot stayed silent, so the "
+                          "next frame would have nothing that says where SpringBoard parked")
+        else:
+            r227_text = r227_patch.read_text()
+            for needle in ('"clover r227: rcvsum t=%llu n=%u tot=%u\\n"',
+                           '"clover r227: rcv%u t=%llu tid=%llx k=%u p=%llx o=%llx"',
+                           '"clover r227: rcvb%u n=%u"',
+                           '"clover r227: sbtask gen=%u pid=%d t=%llu\\n"',
+                           "#define CLOVER_RECV_RING 64",
+                           "struct clover_recv_ent {",
+                           "clover_recv_dump(void)",
+                           "clover_recv_note_waitq(waitq)",
+                           "clover_r227_dumped",
+                           "clover_recv_note(port, IP_NULL, 2,",
+                           "__atomic_exchange_n(&clover_sb_task, cur, __ATOMIC_ACQ_REL)",
+                           "task_deallocate(old)"):
+                if needle not in r227_text:
+                    errors.append(f"{r227_patch.name} lacks {needle[:56]!r}: the receive ring "
+                                  "could not be dumped at the kill or the latch would not follow "
+                                  "a SpringBoard restart")
 
         if "CloverSdhci r212: panic tail lines=%u unseen=%u bufx=%d tee=%u boot=%u" not in sdhci_source:
             errors.append("drivers/CloverSdhci has no round212 panic-time tail read: a boot whose "
@@ -1904,8 +1935,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r226:"):
-        errors.append('[payload] title is not "clover r226: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r227:"):
+        errors.append('[payload] title is not "clover r227: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2944,8 +2975,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r226:"):
-        errors.append('[payload] title is not "clover r226: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r227:"):
+        errors.append('[payload] title is not "clover r227: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

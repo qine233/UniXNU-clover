@@ -674,6 +674,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // updates from the receive path (32 changes) and a single sbgone. 192 holds
   // four full kills and still leaves room for the receive side.
   { "clover r226: ", "r226-die", 192, 0, 0, 0 },
+  // Round227 replaces r226's live receive lines with a 64-entry ring dumped at
+  // the kill: one summary, at most 64 state lines and at most 64 body lines,
+  // plus the latch's sbtask line on a SpringBoard restart. 256 holds the whole
+  // dump and still bounds a producer that loops harder than SpringBoard does.
+  { "clover r227: ", "r227-rcv", 256, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

@@ -16881,3 +16881,44 @@ payload `62f8d60c1aaef92c78b62824ca106444cc4cf2c3f855c55183b616a3da45a388`（56 
 收方向的具体证据缺失来自探针机制（全局配额 + 一次性 task 锁存），不是被测对象。
 r227 把收方向改成「固定环记录最近 64 次变化、SpringBoard 被杀时整段倒出」，
 并让 task 锁存跟随重启——这样 469 s 之前的流量也不会再被日志环形缓冲挤掉。
+
+## r227 — 收方向改成内核固定环，锁存跟随重启
+
+r226 的两条读数把问题指向探针机制本身：收方向的 32 行配额是全局的，而内核日志尾段从
+469.32 s 才开始，早期流量完全可能在窗口之前就用完；`clover_sb_note_current` 又只锁存
+第一颗 SpringBoard task，一旦发生过重启，`clover_sb_is_current()` 对后来的进程恒假。
+两者都没法在 r226 的数据里分开。
+
+**改动（三个文件，`zzzzzzzzzzzz-clover-r227.patch`）**
+
+1. `ipc_mqueue.c`：不再从收路径实时打印。改为固定 64 项的 `clover_recv_ent` 环，
+   每条记 port / 端口集对象 / kind / 消息 id / 队列长度 / 序号 / 远端 / 本地 / 凭证 /
+   大小 / 前四个消息字；去重键是 `port/kind/cnt/seq/id/size`，只有真正变化才占一条。
+   `clover_recv_dump()` 打印一行汇总 `rcvsum t=… n=… tot=…`，随后最多 64 行 `rcv%u`，
+   `bodylen >= 4` 时再补一行 `rcvb%u`（前 32 字节按 8 个十六进制字给出）。
+   收发等待处仍在 `clover_sb_is_current()` 门内调用，port-set 解析成功后另记一条 kind=2。
+2. `kern_sig.c`：`psignal_internal` 里 `signum == SIGKILL && p->p_comm == "SpringBoard"`
+   时一次性调用 `clover_recv_dump()`，用静态 `clover_r227_dumped` 保证只倒一次。
+   这样倒出的环覆盖的是被杀之前的全部流量，不再依赖 469 s 之后的日志窗口。
+3. `task.c`：`clover_sb_note_current()` 改为跟随重启——原子交换 `clover_sb_task`，
+   旧 task 非空且不是当前 task 时 `clover_sb_gen++`、清掉 pid / last_reply / last_secs /
+   heartbeat / changes / last[] / last_m2[]，打印 `sbtask gen=%u pid=%d t=%llu`，再
+   `task_deallocate(old)`。`is_current` / `sample` 侧改用原子读。
+
+**契约与预算**：驱动 tee 新增 `{ "clover r227: ", "r227-rcv", 256, 0, 0, 0 }`——一条汇总
+加最多 64 条接收和 64 条体行，必须整类有配额，否则会挤掉更早的读数。`check-clover.py`
+断言该 tee 类与补丁里的全部输出格式、环结构、dump 调用点、原子交换和 `task_deallocate`；
+`verify-clover-payload.py` 断言镜像里 `rcvsum` / `rcv` / `rcvb` / `sbtask` 四条齐全，
+标题断言升到 `clover r227:`。
+
+**构建**：官方驱动全量构建 exit 0；内核 `kernel.macho` sha256
+`8fbd8b43cd6f431cde708f41afe93f47e05b43a771e192fdb407f771a4f52bcf`，
+AMFI 两处 site 打过之后归一化（968 个 object stamp 清零 + LC_UUID + _PrelinkKCID），
+`kernel-amfi.macho` sha256 `e6768d040121765f20b07f8c8c7f48b7dac7c3ee0882b0624fa7108f538fd66d`；
+payload 56 MiB。双闸门全过（`check-clover` 打印 ADT 13556 字节 / 8 核 / splash
+`0x9d400000-0x9f800000`；verify 逐项 OK，r217 那条含 `rcvsum present, rcv present,
+rcvb present, sbtask present`）。显示归档对新内核复检 PASS（`build-report.json` 的
+`kernel_sha256` 已是新值）。
+
+**待读数（boot 16）**：`sbtask gen=` 是否出现第二代、`rcvsum tot=` 的量级、`rcv0..63`
+里那条 `id=0x40000000` 消息是从哪个端口、什么时候被取的，以及 `rcvb` 前 32 字节。
