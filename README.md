@@ -8,18 +8,20 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 launchd 把守护进程拉起来；r202 让 `IOMobileFramebufferLegacy` attach + start，r205 写
 `display-scale=2` 解掉 `FBSDisplayMode` 断言，r206 起 compositor 连续 present
 （`done/presented=4`、每帧 9 216 000 字节），但整屏仍是黑的——SpringBoard 没有把界面画上去，
-约 480–535 s 时被 backboardd 的系统 shell 看门狗用 `kill(2)` 杀掉。
+450–535 s 时被 backboardd 的系统 shell 看门狗用 `kill(2)` 杀掉。
 
-r219 读数（boot 8）：杀点 `[480.159684]`、退出 `[480.714504]`（0.55 s）；`killsrc` 的 upc 仍是
-`___kill+0x8`，ulr 仍落在镜像偏移 `0x72144` 的批量杀循环。探针第一次抓到 SpringBoard 主线程的
-`mach_msg2` 描述符：t=412/420 在发一条 24 字节的同步 MQ/XPC 调用（远端端口 `0x3003`、回复端口
-`0xa03`、`msgh_id=0x5b9173`、68 字节接收缓冲），t=438 起同一条线程已换成纯接收（16 384 字节，
-`RCV_LARGE|STRICT_REPLY|RCV_SYNC_WAIT`），并在同一个描述符上停到被杀——**显示服务那次同步调用
-已经返回，主线程是在随后的接收上等**；同一时刻另一条线程在发 100 字节的复杂 kobject 调用。
-SpringBoard 仍从未创建 `IOMobileFramebufferUserClient`（本靴客户端只有 pid 58/56/160）。r219 的
-打印标签整体偏了一位，这里的读数已按 `mach_traps.h` 的寄存器约定重解。缺口因此收窄成一句话：
-**SpringBoard 的 XPC 在正常运转，但没有走到建 FB 客户端、提交第一帧；那几个端口名背后是谁，
-r220 直接读属主 pid。**
+r220 读数（boot 9）：杀点 `[449.509949]`、退出 `[449.514325]`（4.4 ms）；`killsrc` 的 upc 仍是
+`___kill+0x8`，ulr 仍落在镜像偏移 `0x72144` 的批量杀循环。**端口属主把「在等谁」问出了答案**：
+SpringBoard 主线程（tid `0x104`）从 380 s 起就停在同一个 libxpc 函数的 mach_msg2 里——380/401 s
+是 24 字节的同步 MQ/XPC 调用（remote `0x3903`、reply `0x903`、`msgh_id=0x5b9173`、68 B 接收），
+413 s 是 204 字节的同步调用（remote `0x807`、reply `0x903`、`msgh_id=0x400000cf`）；**这些目标
+端口的属主都是 launchd（pid 1），回复端口 `0x903` 的属主是 SpringBoard 自己**。424 s 起同一线程
+换成在 `0x903` 上的 16 384 字节纯接收（`RCV_LARGE|STRICT_REPLY|RCV_SYNC_WAIT`），直到被杀都没
+返回；同一时刻另一条线程（`0x30a`）在 `0x1003` 上做 20 字节纯接收。SpringBoard 仍从未创建
+`IOMobileFramebufferUserClient`（本靴客户端只有 pid 58/56/164）；backboardd 自己 present 了三帧。
+缺口因此收窄成一句话：**主线程卡在向 launchd 发出的同步 XPC 上，在它返回之前不会走到建 FB
+客户端、提交第一帧；那条请求的载荷（很可能带服务名）与阻塞点的函数，r221 从缓存偏移和消息体
+字符串里读。**
 
 更早的逐轮读数在 [`notes/development-log.md`](notes/development-log.md)。
 
@@ -27,7 +29,7 @@ r220 直接读属主 pid。**
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 活不下来：不渲染，约 480–535 s 后被 backboardd 的系统 shell 看门狗杀掉** | r219 读数（boot 8）：杀点 `[480.159684]`、退出 `[480.714504]`（0.55 s）；killsrc 的 upc 仍是 `___kill+0x8`、ulr 仍是镜像偏移 `0x72144` 的批量杀循环。**第一次读到 mach_msg2 描述符**：主线程 t=412/420 发 24 字节同步 MQ/XPC 调用（remote `0x3003`、reply `0xa03`、`msgh_id=0x5b9173`、rcv 68 B），t=438 起转成纯接收（rcv 16 384 B、`RCV_LARGE\|STRICT_REPLY\|RCV_SYNC_WAIT`）并停到被杀；另一线程同时发 100 字节复杂 kobject 调用（to `0x203`、reply `0x2803`、id `0x12cb`）。SpringBoard 仍无 FB 客户端（本靴 pid 58/56/160）；backboardd present 三帧 | r220：修正 r219 的参数标签（`x5` 的 `rcv_name`/`desc_count`、`x7` 超时本帧漏打），并把 remote/reply 端口名用 IPC 空间翻成属主 `pid:comm`，回答「在等哪个服务」 |
+| 1 | **SpringBoard 活不下来：不渲染，约 450–535 s 后被 backboardd 的系统 shell 看门狗杀掉** | r220 读数（boot 9）：杀点 `[449.509949]`、退出 `[449.514325]`（4.4 ms）；killsrc 的 upc 仍是 `___kill+0x8`、ulr 仍是镜像偏移 `0x72144` 的批量杀循环。**端口属主读数**：主线程从 380 s 起反复做同步 XPC —— 380/401 s 的 24 B 调用（remote `0x3903`、reply `0x903`、id `0x5b9173`、rcv 68 B）与 413 s 的 204 B 调用（remote `0x807`、reply `0x903`、id `0x400000cf`），**目标端口属主全是 launchd（pid 1）**，`0x903` 属主是 SpringBoard 自己；424 s 起转成 `0x903` 上 16 KB 纯接收直到被杀。SpringBoard 仍无 FB 客户端（本靴 pid 58/56/164）；backboardd present 三帧 | r221：打印主线程 PC/LR 的共享缓存偏移（`VME_OFFSET + pc - vme_start`）与 8 个代码字，落到 libxpc 的具体函数；同时抓发送消息体的可打印串，读出服务名 |
 | 2 | **屏幕上是黑的** | compositor 已 present 四帧：`frame#0..3`、`copy#4 111 ms bytes=9216000`、`scanout#4 ok`、`retire#4 done=4 presented=4`；但 2 304 000 像素里 2 262 414 个 `ff000000`，只有 `305x887..755x1029` 那块变了 41 586 个像素 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |

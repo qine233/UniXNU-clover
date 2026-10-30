@@ -16501,3 +16501,41 @@ x5=desc_count|rcv_name<<32, x6=rcv_size|priority<<32, x7=timeout`，
 补记：r170 的 `t=` 是 `clock_get_uptime()` 的原始 tick 除以 1e9 后当秒打印，这板子的时基是
 19.2 MHz，所以 `t=9s` 对应约 480.7 s 的靴内时间，与本帧采样窗完全一致——上一轮记的
 「t=9s 与采样矛盾」不是矛盾，是把 tick 当秒读了。
+
+## round220 读数（boot 9）：端口属主把「在等谁」指到 launchd
+
+本帧两件事：修正后的参数标签自洽；端口属主读数把主线程的等待对象从「某个守护进程」
+收窄到 **launchd**，并且证明回信端口是它自己的。
+
+- **杀点 `[449.509949]`、退出 `[449.514325]`**（kill→exit 4.4 ms；r219 是 0.55 s、r218 是 23.1 s，
+  说明那 0.5–23 s 是调度/写盘抖动，不是探针开销）。killsrc 仍是 `___kill+0x8`、
+  `ulr` 仍落镜像偏移 `0x72144` 的批量杀循环。
+- **主线程（tid 0x104）**从 380 s 起一直在共享缓存同一个函数的邻域：380/401/413/424 s 的 PC 都是
+  `0x1d1f84b58`，440 s 出现在 `0x1d1f849cc`，被杀时的快照又回到 `0x1d1f84b58`（LR `0x1d1f88224`）。
+  四次采样按 `mach_traps.h` 的标签读出来是：
+
+  | 采样 | options64 (x1) | bits / send_size (x2) | remote → 属主 (x3 低) | reply → 属主 (x3 高) | voucher / id (x4) | rcv_size (x6) |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | t=369 | `0x5_00100231`（MQ） | `0x131513` / 2 | `0x2003` → **26:runningboardd** | `0x903` → 27:SpringBoard | `0xa03` / `0x40000000` | 0 |
+  | t=380/401 | `0x4_00304003`（MQ） | `0x131513` / 24 | `0x3903` → **1:launchd** | `0x903` → 27:SpringBoard | `0xa03` / `0x5b9173` | `0x44` |
+  | t=413 | `0x4_03114207`（MQ） | `0x131513` / 204 | `0x807` → **1:launchd** | `0x903` → 27:SpringBoard | `0xa03` / `0x400000cf` | `0xcc` |
+  | t=424 | `0x4_0700420e`（MQ） | 0 / 0（纯接收） | — | — | — | `0x4000` |
+
+  - 三个**发送**的目标端口（`0x2003`、`0x3903`、`0x807`）属主分别是 runningboardd 和 launchd；
+    `0x3903` 与 `0x807` 都是 launchd 的端口（bootstrap 一侧）。**回复端口 `0x903` 属于 SpringBoard
+    自己**——所以「在等谁」不是一个服务端口，而是自己端口上的回信。
+  - 424 s 起是 `0x903` 上的 16 384 B **纯接收**（`RCV_LARGE|STRICT_REPLY|SYNC_WAIT`，`to=0`），
+    一直到被杀都没返回（≥25.5 s）。接收缓冲头残留 `remote=0x5a03`、属主解不出（`ho=-`）——
+    send-once 回信被消费后名字就死了，这恰好证明此前**有回信到达并唤醒过线程**。
+  - 380/401 s 的两条 24 B 调用是同一条请求（`msgh_id=0x5b9173`、remote/reply 同），413 s 换成
+    204 B（`msgh_id=0x400000cf`、remote `0x807`）。369 s 那条 MQ 调用发往 runningboardd，
+    `msgh_id=0x40000000`，纯发送不接收。
+- 同一时刻另一条线程（`0x30a`）在 `0x1003` 上做 20 B 纯接收（无发送，属主因此不打印）。
+- 本靴 FB 客户端仍只有 pid 58/56/164（**没有 27**）；backboardd 照常 present
+  （`retire#3 done=3 presented=3`，每帧 9 216 000 B）。
+
+**结论**：SpringBoard 的主线程在 libxpc 里反复向 **launchd** 发同步 XPC（369 s 还发过 runningboardd），
+最后一次在 `0x903` 上等回信，≥25.5 s 没等到，被 backboardd 的系统 shell 看门狗杀掉；它没走到
+建 FB 客户端、提交第一帧。r221 要回答两件事：阻塞点到底是哪个函数（打印 PC/LR 的共享缓存偏移
+`VME_OFFSET + pc - vme_start` 与 8 个代码字，宿主上 `decode-clover-cache-offset.py` 直接命名），
+以及发给 launchd 的那条消息里写了什么（把发送缓冲的可打印串截出来，服务名通常就是明文）。
