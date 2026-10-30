@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r232: the receiver is sampled on its own twenty-second beat once a batch names it, not on the sender's changing batch; every hop name is translated as a port set and walked for its members, each member's object and queue printed so the blocked send's port can be found inside the set it is served from"
+title = "clover r233: every port-set member is printed with a star on the blocked destination, every hop and receiver name gets its owner, the sample moves to a kernel thread so a quiet trap no longer ends the reading, and the unfair lock word an idle thread waits on is read out of its own address space"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

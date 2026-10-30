@@ -4,15 +4,35 @@
 ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。
 配套固件仓库 `uefi-clover`（Mu-Silicium 移植），驱动与硬件常量在 `porting.toml`。
 
-现状一句话：**回信收不到，是因为请求被 backboardd 的 port set 带走；三个集合的成员表已经读出来，
-但 SpringBoard 等的回信口还是空的。** XNU 起来、三卷全挂、launchd 把守护进程拉起来。
-boot 21（r232，死线 1800 s）把采样器从 SpringBoard 的批签名里摘出来，改成 20 s 一拍，覆盖 727–1760 s；
-backboardd 的三条在飞线程等的 `4a03 / 7803 / 6c03` 现在按 port set 翻译开、成员逐拍打出：15 拍里只有
-`a003` 的 seqno 动过（49→56），其余成员整窗不动。SpringBoard 主线程 `0x910` 停在 `rcv_name=1e03`
-的接收上（`STRICT_REPLY` 期望口 `5e03`），而 `5e03` 在 backboardd 里是普通端口
-`o=fffffff8743a6ce0`、`rn=3e2b`、`cnt=0 seq=3`；它不在集合的前 8 个可见成员里，但 `4a03` 有 11 个、
-`7803` 有 9 个——还差「打全并比地址」这一刀。内核环在 1763.1 s 之后一行不出，死线自己的 panic
-记录第一次没有落下。
+现状一句话：**回信收不到，是因为请求被 backboardd 的 port set 带走；成员表已打全一拍，
+但可能带 `*` 的三个成员被 tee 的单趟 push 限额吞掉，锁的属主又因换算少了一步而没查出来。**
+XNU 起来、三卷全挂、launchd 把守护进程拉起来。
+boot 22（r233，死线 1800 s）把采样搬进 20 s 一拍的内核线程，不再依赖任何任务进入 `mach_msg2`：
+`r232 bbset` 一直打到 t=1764（wall 1768.9），证明采样活着。集合 `5903` 有 11 个成员，前 8 个全
+`0:0`；唯一完整落地的一拍里 tee 先有 8 行、再是成员行，16 行/趟的 push 限额把 `i=8..10` 计进
+throttled，而 `*` 只可能落在被吞的三行里。四条等待线程的锁字都读到了
+（`0x4203 / 0x7d0fd50 / 0xffffff00 / 0`），但 r233 用 `word & ~1` 查名字、没走
+`ipc_entry_name_mask()`，`0x4203` 的 gen 字节从 `0x03` 变成 `0x02`，属主解析全部失败。
+SpringBoard 交回的回信名 `4e0f` 在 808 s 已失效（`kr=15`）。r234 三刀：换算、单行成员带 `*`、
+按类拆 tee 预算。
+
+r233 读数（boot 22）：**成员表出来了、节拍线程活了，但 tee 的类配额和单趟 push 限额先死了；
+锁属主是换算错，不是锁错了。**
+① 环：512 行窗口 **775.2–1768.9 s**，全是 boot 22；最后一条完整记录是 `r232 bbset t=1764`
+（wall 1768.883），紧跟的 slot 231 是一条写入被截断的记录（`BAD (newline missing)`），像复位打断了
+一次环写。② tee：末次 census `seen=3187 kept=736 throttled=45 lap=2`；`r233-bb` 的 256 行配额在上膛后
+约 15 拍内烧完（驱动环里 `r233-bb probe lines capped at 256`），`r229-bb` 64、`r231-bb` 192 也各自到顶，
+`r232-set` 128 没到顶、bbset 一路打到 1764。③ 783 s 那一拍：先 8 行（`r229 bb`、`sbport`、`sbown`、
+4×`bbhop`、`bbset`），再 11 个成员的 `bbsep`；tee 每趟最多 push 16 行（`kTeePushPerPass`），正好在
+`i=7` 用满，`i=8..10` 落进 `gTeeThrottled`（这一处 +3，全 boot 45）——**`*` 唯一可能落的三个成员
+被吞**。④ 成员表：`5903`（`o=fffffff7a8fab9a0`、`all=11`）前 8 个全 `cnt=0 seq=0`；集合属主
+`58:backboardd+ps`，目的口 `rem`（2303）属主 `58:backboardd`。⑤ 节拍线程兑现：`beat t=808 pid=58
+rn=2303 rep=4e0f`（120 s 一行的第一行，也是最后一行），同拍 `sbrep nm=4e0f kr=15`——交回的回信名
+已失效（`KERN_INVALID_NAME`），那个 send-once 右早被取走。⑥ 锁字：`w=0/0x4203/0x7d0fd50/0xffffff00`，
+r233 用 `word & ~1` 且未走 `ipc_entry_name_mask()`（`bsd/sys/ulock.h:43`、`osfmk/ipc/ipc_entry.c:812`，
+`name | 0x03`），`0x4203→0x4202` 的 gen 字节 `0x03→0x02`，四条全部 `ow=0x0`。⑦ 采样活着：
+`r232 bbset` 44 条打到 1764；r229 到 1249、r231 到 1127 停的都是 tee 预算，不是采样。1768.9 s 后
+环无新行；本 boot 又是**没有 kind-20 记录**（最新仍是 boot 20）、`misc block 1` 为空，和 boot 21 一样。
 
 r232 读数（boot 21）：**port set 的成员表出来了；采样器修好后又暴露第二个盲区——1763 s 之后整机不再出声。**
 ① 环：512 行窗口 **727.2–1763.1 s**，全是 boot 21；没有 `tee filter`/`tee sync`/`drain exit` 行

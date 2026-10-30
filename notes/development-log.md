@@ -17324,3 +17324,104 @@ TWRP，panic 自写 BCB，宿主零 misc 写。四个仪器全部兑现：
    `1e03`（cnt/ql/seq/rn/kmsg），看回信口是否空着；④ 节拍改由内核定时器/callout 驱动（不依赖任何任务进
    `mach_msg2`），每 20 s 一行自证心跳、直到死线；⑤ 顺带打 `0x33c` 的目的名 `e747` 属主与锁 `0x100b90194`
    的持有者。
+
+## round233 实现与构建（v0.5.97 前半）
+
+r232 留下了五个问题：`a6ce0` 不在可见的 8 个成员里（4a03 有 `all=11`、7803 有 `all=9`）、
+`e747` 与 `1e03` 的属主没名字、`0x3be` 等的 `0x100b90194` 不知道谁持有、以及 1763 s 之后
+内核是否还活着。r233 四刀一起上：
+
+1. **bbset 打全并标目标**。`clover_pset_report` 的成员上限 `CLOVER_BBSEP_MAX` 提到 24，
+   摘要行不变（`n=` 仍是前 8 个），另按 `i/all` 逐成员再打一行
+   `clover r233: bbsep t=… i=%u/%u m=<obj>:<cnt>:<seq>:<rn><*>`，对象地址等于被阻塞目的对象
+   （`clover_bb_mark_obj`，由 `clover_bb_note_mark` 在采样开头按发送方 space 翻译后记住）的成员带 `*`。
+   行数按 `(obj, msgcount, seqno, receiver_name)` 的 FNV 哈希 + `stored/all` + 600 s 心跳收敛。
+   一个 C block 不能引用任何局部数组（`__block` 也不行），所以成员快照放进文件级
+   `struct clover_bbsep_snap`，block 只持有这个结构。
+2. **属主名字**。每个 hop 的 `rem`（当 `rem != 0 && rem != loc`）新打
+   `clover r233: bbhopo t=… tid=… rem=%x ro=<pid:comm>`；`sbport`/`sbrep` 走新增的
+   `clover_sb_owner_row`，打 `clover r233: sbown t=… %s nm=%x own=<pid:comm>`（只在属主变化或
+   600 s 后重复）。属主解析一律先 `ipc_object_translate`（SEND 失败再 RECEIVE）、在对象锁内
+   `ipc_kobject_get_locked(…, IKOT_THREAD_CONTROL)` 取 task，解锁后再读 pid/comm。
+3. **节拍进内核线程**。`clover_sb_note_current` 里用 `kernel_thread_start` 起
+   `clover_bb_beat_thread`，`assert_wait_timeout(…, THREAD_INTERRUPTIBLE, 20, NSEC_PER_SEC)` +
+   `thread_block(THREAD_CONTINUE_NULL)` 每 20 s 一拍，每 120 s 打一行
+   `clover r233: beat t=… pid=… rn=… rep=…` 并顺带读一次 SpringBoard 的回信口（`sbrep`）；
+   采样本身（`clover_bb_sample`）也改由这个线程每 20 s 调一次。原来挂在 trap 入口上的那一段删掉，
+   `clover_bb_beat` 连同 `clover_sb_sample` 里的开火逻辑一起消失——boot 21 的 1763 s 停流正说明
+   “读”不能依赖任何任务继续进 `mach_msg2`。SpringBoard 的 task 指针故意不 deallocate，beat 线程读它。
+   （`wait_result_t` 的返回值是 `THREAD_TIMED_OUT`，`kern_types.h:89`；`THREAD_TIMEOUT` 不存在。）
+4. **锁的持有者**。`clover_bb_lock_word` 对 `op` 属于 unfair-lock 一族
+   （`0x1000001`/`0x40`/`0x100`/`0x1xxxxxx` 的低字节 1–4）的等待行，用
+   `copyinmap(task->map, addr & ~3, &word, 4)` 把锁字读出来，`owner = word & ~1`，
+   再按 name 解析成 thread（`IKOT_THREAD_CONTROL`），打
+   `clover r233: bblock t=… tid=… op=… a=… st=… w=%08x own=%x ow=… ost=…`；读不到时是 `rd=err` 变体。
+
+契约侧：驱动 `CloverSdhci.cpp` 加 tee 类 `{ "clover r233: ", "r233-bb", 256, 0, 0, 0 }`
+（一条 set 行 + 12 个成员 + 属主，256 够一整轮）；`check-clover.py` 的 title 升到 `clover r233:`、
+新增 r233 补丁 needles 与 tee 类断言；`verify-clover-payload.py` 新增 `bbsep`/`sbown`/`bbhopo`/`beat`/
+`bblock`/`bblock-err` 六项；`board.toml` 的 loader 标题换成 r233；`build-xnu-4k-baseline.sh` 的
+LATE_PATCH 把 r233 放在最前。
+
+构建时踩到一个新坑：第一遍真实编译在 `task.c` 里把 `THREAD_TIMEOUT` 写错，make 在失败时删掉了
+`task.o`；而 `unixnu build kernel` 的归档阶段跑在编译之前，`build-corecrypto-14.py` 的
+`kernel_names()` 要 `nm` 全部对象，于是卡在 `osfmk/DEVELOPMENT/task.o: No such file or directory`。
+驱动只在 `startup.o.json` 记录缺席时才跑 bootstrap pass，删掉那条记录让它重跑一遍即可补回对象，
+之后归档、正式编译、prelink 全部走通。
+
+产物：内核 `68ad4f785c2247c1a9e6e91b7e0d71edc10046c8cf0688940ee237f9705ba1db` → AMFI 两刀仍落在
+file `0x1abf0e4` / `0x1abf16c`（r163/r164 同址）→ `normalize-kernel-macho.py` 清掉 968 个 object 戳，
+得 `round233-kernel-amfi.macho` `c755573336b8d4096ccaa22a926db71881c63fa7f2d62434c939764fc6414321`；
+payload 卷内 kernel `9156aded3f37ad9b55ea880b8d00bee69b095a30a8e0e68816cbdbba55982195`
+（入口探针 6985 字节 / 37 段）、ADT `22de057b…`、trustcache `7c369ce0…`、data 种子 `614b8356…`；
+`round233-payload.img` `ef2c6b54b42cbc20f026e6a1816b1477a225fa0d3374e6c1117ba87154b33309`
+（58,720,256 B）。两个闸门：`check-clover.py` 绿；`verify-clover-payload.py` 47 项 OK、0 FAIL
+（r217 那一行 39 个子项里新增的六项全 present）；`build-arm-driver.py CloverSdhci` 的 `-Werror`
+与 ARM64/iOS 17 对象审计通过。
+
+冷刷只写 **cache = mmcblk0p49**（内核日志环与 kill dump 的落点），misc 只读、BCB 由内核自己落；
+`adb reboot bootloader` → `fastboot flash cache round233-payload.img` → `fastboot reboot`，
+无人值守脚本观察 2100 s。
+
+## r233 读数（boot 22）
+
+**成员表出来了、节拍线程活了，但 tee 的类配额和单趟 push 限额先死了；锁属主没查出来是换算错，不是锁错了。**
+
+① 环：512 行窗口 **775.2–1768.9 s**，全部 boot 22。最后一条完整记录是
+`[1768.883093] clover r232: bbset t=1764 …`，紧跟的 slot 231 是一条写入被截断的记录
+（解码器报 `BAD (newline missing)`）——像复位打断了一次环写，而不是内核停笔。
+
+② tee：末次 census `seen=3187 kept=736 throttled=45 lap=2`。按类配额 `r233-bb` 的 **256** 行在上膛后
+约 15 拍内烧完（驱动环里有 `CloverSdhci r195: r233-bb probe lines capped at 256`），此后到 1768 s
+再没有一行 r233；`r229-bb` 64、`r231-bb` 192 也各自到顶，`r232-set` 128 没到顶，bbset 一路打到 1764。
+
+③ 783 s 那一拍是唯一完整落地的一拍：先 8 行（`r229 bb`、`sbport`、`sbown`、4×`bbhop`、`bbset`），
+再是 11 个成员的 `bbsep`。tee 每趟最多 push 16 行（`kTeePushPerPass`，`CloverSdhci.cpp:559`），
+正好在 `i=7` 用满，`i=8..10` 计入 `gTeeThrottled`（这一处 +3，全 boot 45）。三个被吞的成员正是
+`*`（对象等于 `clover_bb_mark_obj`）唯一可能落下的地方，所以可见行上一颗星也没有。
+
+④ 成员表：`5903`（`o=fffffff7a8fab9a0`、`all=11`）前 8 个全 `cnt=0 seq=0`，接收名
+`5a03/4d17/7d03/7c03/4803/14417/11a07/11733`。三个集合的属主是 `58:backboardd+ps`，
+被阻塞的目的口 `rem`（2303）属主 `58:backboardd`——属主行本身是通的。
+
+⑤ 节拍线程兑现：`beat t=808 pid=58 rn=2303 rep=4e0f` 一行（120 s 一行的第一行，也是最后一行，
+类配额随后用尽）；同拍 `sbrep nm=4e0f kr=15`——SpringBoard 交回的回信名在 808 s 已不是有效名
+（`KERN_INVALID_NAME`），那个 send-once 右早被取走/死掉，不是探针读错。
+
+⑥ 锁字：四条等待行各读到一个 unfair-lock 字 `w=00000000 / 00004203 / 07d0fd50 / ffffff00`，
+全部 `ow=0x0 ost=0`。XNU 自己的换算是 `ulock_owner_value_to_port_name()`（`bsd/sys/ulock.h:43`）
+→ `ipc_entry_name_mask()`（`osfmk/ipc/ipc_entry.c:812`），即 `name | 0x03`
+（`MACH_PORT_MAKE(0, IE_BITS_GEN_MASK + IE_BITS_GEN_ONE)` 的 gen 字节，名字低 8 位留给 flag；
+`MACH_PORT_INDEX(name) = name >> 8`），既不剥低位也不清。r233 用 `word & ~1` **且没做这一步**，
+`0x4203 → 0x4202` 的 gen 字节从 `0x03` 变成 `0x02`，查不到属主。另外三个字
+（`0x0`、`0x7d0fd50`、`0xffffff00`）本来就不像该 space 里的可解析名字。r234 改这一行。
+
+⑦ 采样本体活着：`r232 bbset` 44 条从 783 打到 1764；`r229` 的 2 行/拍到 1249 因 64 行配额停，
+`r231` 的 hop/wait 到 1127 停——停的都是 tee 的类预算，不是内核的采样。1768.9 s 之后环再无新行；
+本 boot 死线 1800 s 又是**没有 kind-20 记录**（报告环最新仍是 boot 20）、`misc block 1` 为空，
+和 boot 21 同一种缺席，而最后一条可读记录离死线还有 31 s。
+
+r234 三刀：① 锁属主改用 `ipc_entry_name_mask(word)`（照抄 `ulock_owner_value_to_port_name()`，
+不再先 `& ~1`）；② 集合成员合并成一行、`*` 内联，并排在每拍其他行之前，谁也吞不掉；
+③ 驱动 tee 把 r233 的行拆成 beat/set/member/owner/lock 各类，各自 30 分钟够用的预算，
+并给 set 行留一趟 push。

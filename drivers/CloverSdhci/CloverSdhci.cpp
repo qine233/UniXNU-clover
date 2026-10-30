@@ -704,6 +704,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // one row. Three hop names at 120 s heartbeat over a 1800 s boot is under fifty rows per set, so
   // 128 holds the whole conversation and still bounds a producer that loops harder than a receiver.
   { "clover r232: ", "r232-set", 128, 0, 0, 0 },
+  // Round233 asks four questions at once: which member of a named port set is the blocked
+  // destination (the star row), who owns each hop and receiver name (the owner rows), whether the
+  // kernel is still sampling after the trap goes quiet (the beat thread), and who holds the unfair
+  // lock an idle thread waits on (the word read). The member dump shares the round232 set-row lock,
+  // so 256 keeps a full 12-member set plus its owners without starving the beat rows that prove the
+  // kernel is alive.
+  { "clover r233: ", "r233-bb", 256, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
