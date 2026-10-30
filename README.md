@@ -50,7 +50,7 @@ r227 改成「内核环里记录、kill 时倒出」，不再从收路径实时�
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **SpringBoard 活不下来：不渲染，约 500 s 被系统 shell 看门狗杀掉** | r227 读数（boot 16）：三代——A ~614.7 s 出生即卡被杀（无收记录）；B=pid 27 正常收 614–636 s（`rcv32..63`）后停等 15.5 s，651.53 s 被 backboardd `SIGKILL`（`exit pid=27 rv=0x9`）；C=pid 229 健康活到 906 s 仍在收（`sbm2 t=906`、`sbport id=40000000`），但 906 s 仍无新 UI 帧（r180 帧停 653 s），912 s 被自家 900 s 死线 panic 杀掉 | r228：死线 900→1800 s 给 C 代留时间；dump 每代一次（guard 跟 `clover_sb_gen` 重置）；环项加 pid/gen 归属；dump 走驱动 probe 环保证落盘 |
+| 1 | **SpringBoard 活不下来：不渲染，约 500 s 被系统 shell 看门狗杀掉** | r227 读数（boot 16）：三代——A ~614.7 s 出生即卡被杀（无收记录）；B=pid 27 正常收 614–636 s（`rcv32..63`）后停等 15.5 s，651.53 s 被 backboardd `SIGKILL`（`exit pid=27 rv=0x9`）；C=pid 229 健康活到 906 s 仍在收（`sbm2 t=906`、`sbport id=40000000`），但 906 s 仍无新 UI 帧（r180 帧停 653 s），912 s 被自家 900 s 死线 panic 杀掉 | r228（已发布，待上机）：死线 900→1800 s 给 C 代留时间；dump 每 pid 一次（guard 记 pid，换代即重置）；环项加 pid/gen 归属；dump 先锁快照再打印，摘要经驱动 probe 环保证落盘 |
 | 2 | **屏幕上是黑的** | compositor 已连续 present：r226（boot 15）`frame#0..#3`、`copy#1..#3 bytes=9216000`、`retire#4 done=presented=4`；但 2 304 000 像素里 2 262 366 个 `ff000000`，只有 `305x887..755x1029` 那块有变化（41 586 个像素）——那是 backboardd 的引导进度条（`client pid=58`，532.91 s 还在 present），不是桌面 | 等第 1 项修好、SpringBoard 活下来画 UI；之后用色带校验几何与缩放 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |

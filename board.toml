@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r227: the receive ring -- r226 printed each changed blocking receive live and the boot stayed silent, so r227 keeps the last 64 distinct receives in a kernel ring and dumps it when SpringBoard is killed; the latch now follows a SpringBoard restart"
+title = "clover r228: the dump that cannot be lost -- each SpringBoard generation's kill dumps its own receive-ring window (per-victim-pid guard), entries carry pid+generation, the dump prints a spin-locked snapshot, and a compact rcdump/rce tail goes into the driver's probe ring; the unattended deadline moves to 1800 s so generation C gets its full window"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2350,7 +2350,11 @@ kernel_args = [
   # boot that now gets past launchd: long enough for a service stall to resolve or for the desktop to
   # present, short enough that a hung boot still comes back and the card can still be read. The
   # checker's 60..1800 window is the only constraint, so the value is a reading, not a contract.
-  "clover-unattended=900",
+  # Round228 raises it to 1800, for the reading round227's boot 16 produced: generation C was
+  # latched at 653 s, still receiving and healthy at 906 s, and the 900 s deadline killed a boot
+  # that may have been about to present. 1800 s gives the second SpringBoard a full watchdog
+  # window after the first restart instead of measuring the first kill's fallout.
+  "clover-unattended=1800",
   # Round193. Round192's frame ends with `watchdogd[97] exited -- exit reason namespace 2
   # subcode 0x5 description: none` and the panic-path syncs right behind it, after the same job
   # died the same way twice before (pids 52, 92, 97, each `rv=0x5 ns=2 code=0x5`). ns 2 is

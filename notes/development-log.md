@@ -16960,5 +16960,64 @@ probe——panic 发生在 probe 排空之前，但内核日志由驱动侧按�
    printf/msgbuf 通道吞吐极低。dump 必须走驱动 probe 环（`clover_emmc_probe_say`）
    直接落盘，且打印前先锁快照。
 
-**r228 方向**：死线 900→1800 s 给 C 代留足时间；dump 每代一次（guard 跟 gen 重置）；
-环项加 pid/gen 归属；dump 精简版写驱动 probe 环；tee 预算 256→320。
+**r228 方向**：死线 900→1800 s 给 C 代留足时间；dump 每 pid 一次（guard 记 pid，换代即重置）；
+环项加 pid/gen 归属；dump 先锁快照再打印，摘要走驱动 probe 环；tee 预算 256→480。
+
+## r228 — 每代一次的转储，走 probe 环落盘；死线 1800 s
+
+r227 读数里的三个事实决定这一轮：(1) 三代 SpringBoard，A 代出生即卡、B 代 636 s 停等
+被杀、C 代健康活到 906 s——被自家 900 s 死线 panic 杀掉，而桌面上不上屏与「SpringBoard
+是否活着」已经解开，C 代差的是时间；(2) dump 的一次性 guard 被 A 代的 kill 消耗，B 代
+被杀时环根本没倒出来；(3) dump 边打印边读活环——64 条尾段打了 32 s（617.04→649.46 s），
+晚打印的槽装进 B 代新记录，早打印的 A 代记录被顶出窗口，printf/msgbuf 通道吞吐极低。
+
+**改动（内核三个文件，`zzzzzzzzzzzzz-clover-r228.patch`，13 个 z 排最后应用）**
+
+1. `ipc_mqueue.c`：
+   - `clover_recv_ent` 加 `cre_pid` / `cre_gen` 两个字段；`clover_recv_note` 在锁外取
+     `task_pid(current_task())` 与 `clover_sb_gen_read()`（原子读），锁内写条目，
+     环里每条记录从此自带「哪一代、哪个 pid 留下」。
+   - `clover_recv_dump` 重写：`hw_lock` 下把环**快照**到栈上数组（`snap[64]`），解锁后才
+     打印——r227 的 32 s 实时读环缺陷从此不存在。摘要 `rcvsum` 带 pid/gen 归属；随后
+     最多 64 条状态行 `rcv` + 64 条体行 `rcvb`（与 r227 同格式，标签升 r228）。
+   - 快照打印前先走**紧凑投递**：`rcdump`（一行摘要）+ 最多 3 条 `rce`（最近三条）
+     经 `clover_emmc_probe_say` 进驱动 RAM probe 环，保证即使 msgbuf 窗口被覆盖，
+     关键行也随 panicProbeFlush 落到卡上。
+2. `kern_sig.c`：`clover_r227_dumped` 静态闩换成**每 pid 一次**的
+   `clover_r228_dumped_pid`——pid 变了就再 dump，第三代被杀也能倒出自己那一代的环。
+3. `task.c`：加 `clover_sb_gen_read()` 访问器（`__atomic_load_n` acquire）；
+   `sbtask` 行标签升 `clover r228:`。
+
+**契约**：驱动 `kProbeSlots` 32→64（每槽 256 B，seq 计数器 + 密封字，锁无关）；
+tee 类换成 `{ "clover r228: ", "r228-rcv", 480, 0, 0, 0 }`——每次 kill 的完整转储
+1 摘要 + 64 状态 + 64 体行 = 129 行，三代 387 ≤ 480；旧 r227 标签行全部改标 r228，
+否则允许列表行没有类 token 会无上限推送、绕过预算。死线 `clover-unattended` 900→1800 s
+（checker 窗口 60..1800 含端点）；宿主脚本 `WAIT=2100`、`LANDING_WAIT=2100`（覆盖
+1800 s 死线 + 复位延迟 + TWRP adb），`DEADLINE_SLACK=120` 不动。`check-clover.py`
+新增 r228 补丁块 13 项断言（rcdump/rce 格式串、pid/gen 字段、`clover_r228_dumped_pid`、
+`clover_sb_gen_read`、`hw_lock_lock(&clover_recv_lock)`、快照数组、`clover_emmc_probe_say`
+调用）与 WAIT/LANDING 2100 断言；`verify-clover-payload.py` 的 found 字典升 r228 六条
+格式串并新增 `rcdump`/`rce` 键。
+
+无锁死风险：`clover_recv_note` 持 waitq 锁 → 取 `clover_recv_lock`（单向）；
+`clover_recv_dump` 只持 `clover_recv_lock`，解锁后打印——无环。
+
+## r228 构建（发布 v0.5.90）
+
+补丁落树时挨了两刀：(1) `hw_lock_lock` 在这个 XNU 树里是**两参宏**
+（`simple_lock.h:124`：`#define hw_lock_lock(lck, grp) hw_lock_lock(lck)`），
+`ipc_mqueue.c` 里两处一参调用直接编译失败（`too few arguments`），全树调用样例都带
+`LCK_GRP_NULL`——两处都补上第二参，补丁与 checker 的 needle 一起改；(2) `unixnu build kernel`
+里 `build_archives()` 排在 `make` **之前**（`scripts/unixnu/kernel.py:101-102`），第一次失败的
+make 没产出 `ipc_mqueue.o`，第二次运行从 archive 1/15 `build-corecrypto-14.py` 就崩
+（`nm: ipc_mqueue.o: No such file or directory`），根本走不到 make。做法是先手动把
+`build-xnu-4k-baseline.sh`（带全套 `XNU_*` env）跑通补齐对象，再跑 `unixnu build kernel`。
+
+构建：内核 `kernel.macho` sha256 `31d0606e11262cc9be248ac624ffb12397faa01f9daf0dc60d774813ff4e9447`
+（968 个 object 戳）；AMFI 两刀 + 归一化后 `round228-kernel-amfi.macho` sha256
+`ab3c32f1bdd3c2feabbf8f440039db21d49c942651acda39cedadddbf610f3c0`；payload
+`~/clover-out/round228-payload.img` 56 MiB sha256
+`8083424c2c251ce65d4757ba72b8951e8b2634551188e0f2518fbcdc82bb708f`，内含 kernel
+sha256 `16b309c62704feb485c2ea949ffe2dbab2bffcc7eb8039a7e247f333feb10337`。
+双闸门通过（check-clover：title 两处断言升到 `clover r228:`；verify 全 OK，
+r217 组含 rcdump/rce/sbtask）。冷刷只 cache（`mmcblk0p49`），宿主等 1800 s 死线落 TWRP。

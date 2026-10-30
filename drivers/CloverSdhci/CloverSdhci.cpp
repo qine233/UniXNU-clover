@@ -427,10 +427,13 @@ static uint32_t gBootId = 0;
 // the SIGKILL at 457 s and the block guard's loss at 341 s, and the panic tail read could not carry
 // the kill forward because a 16 KiB msgbuf holds a few seconds of a chatty boot. So the kernel probe
 // writes straight into this RAM ring (a memcpy into the driver's BSS: no block request, no guard,
-// no msgbuf, no tee), and the panic drain is what puts it on the card. 32 slots of 256 bytes are
-// what a kill's thread list needs; the seal word is written last and compared on read, so a drain
-// that races a writer skips the one record rather than writing half of it.
-static const uint32_t kProbeSlots = 32;
+// no msgbuf, no tee), and the panic drain is what puts it on the card. 64 slots of 256 bytes are
+// what a kill's thread list needs with round228's rcdump/rce tail on top; the seal word is written
+// last and compared on read, so a drain that races a writer skips the one record rather than
+// writing half of it. Round228 doubles the ring from 32: r228's dump adds four lines per kill, and
+// one generation's kill can now carry r207/r208/r211/r226 plus three generations' dumps before a
+// drain runs.
+static const uint32_t kProbeSlots = 64;
 static const uint32_t kProbeTextBytes = 256;
 static char gProbeText[kProbeSlots][kProbeTextBytes];
 static uint32_t gProbeArm[kProbeSlots];   // slot number + 1; written after the text, read as a seal
@@ -674,11 +677,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // updates from the receive path (32 changes) and a single sbgone. 192 holds
   // four full kills and still leaves room for the receive side.
   { "clover r226: ", "r226-die", 192, 0, 0, 0 },
-  // Round227 replaces r226's live receive lines with a 64-entry ring dumped at
-  // the kill: one summary, at most 64 state lines and at most 64 body lines,
-  // plus the latch's sbtask line on a SpringBoard restart. 256 holds the whole
-  // dump and still bounds a producer that loops harder than SpringBoard does.
-  { "clover r227: ", "r227-rcv", 256, 0, 0, 0 },
+  // Round228 keeps the ring dump but prints it from a spin-locked snapshot,
+  // relabels it, and adds a compact rcdump/rce tail that travels the probe
+  // ring. The full dump is one summary plus at most 64 state lines and 64
+  // body lines -- 129 lines per generation's kill, and boot 16 watched three
+  // generations -- so the budget covers three dumps plus the sbtask lines and
+  // still bounds a producer that loops harder than SpringBoard does.
+  { "clover r228: ", "r228-rcv", 480, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

@@ -1,0 +1,226 @@
+--- a/osfmk/ipc/ipc_mqueue.c
++++ b/osfmk/ipc/ipc_mqueue.c
+@@ -81,6 +81,7 @@
+ #include <kern/ipc_kobject.h>
+ #include <kern/ipc_mig.h>       /* XXX - for mach_msg_receive_continue */
+ #include <kern/misc_protos.h>
++#include <kern/simple_lock.h>
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <kern/waitq.h>
+@@ -921,15 +922,27 @@
+  * receive, and the record is keyed on (port, kind, count, seq, id, size) so a
+  * thread that parks on the same empty port keeps one entry. Callers hold the
+  * waitq lock, which is the port's mqueue lock.
++ *
++ * Round228. Boot 16 watched three SpringBoard generations, and the dump read
++ * a live ring: printf took 32 s for 32 lines, so the tail moved under the
++ * reader. Every record now carries the pid and generation that latched the
++ * task, appends and the dump snapshot share one spin lock, and the dump prints
++ * from the copy -- plus a compact rcdump/rce tail into the driver's probe
++ * ring, the one path that lands on the card even when the msgbuf window is
++ * gone before the panic drain.
+  */
+ #if defined(__arm64__)
+ extern int clover_sb_is_current(void);
++extern uint32_t clover_sb_gen_read(void);
++extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
+ 
+ #define CLOVER_RECV_RING 64
+ 
+ struct clover_recv_ent {
+ 	uint64_t cre_t;
+ 	uint64_t cre_tid;
++	uint32_t cre_pid;
++	uint32_t cre_gen;
+ 	uint64_t cre_port;
+ 	uint64_t cre_kobj;
+ 	uint32_t cre_kind;
+@@ -952,6 +965,7 @@
+ static struct clover_recv_ent clover_recv_ring[CLOVER_RECV_RING];
+ static uint32_t clover_recv_head;
+ static uint32_t clover_recv_total;
++static hw_lock_data_t clover_recv_lock;
+ 
+ static void
+ clover_recv_note(ipc_port_t port, ipc_object_t setobj, uint32_t kind,
+@@ -968,6 +982,8 @@
+ 	uint32_t size = 0;
+ 	uint32_t len = 0;
+ 	uint32_t seq = 0;
++	uint32_t pid;
++	uint32_t gen;
+ 	uint32_t i;
+ 	uint8_t *bp;
+ 	const uint8_t *src;
+@@ -995,6 +1011,9 @@
+ 	last_id = id;
+ 	last_size = size;
+ 
++	pid = task_pid(current_task());
++	gen = clover_sb_gen_read();
++	hw_lock_lock(&clover_recv_lock, LCK_GRP_NULL);
+ 	e = &clover_recv_ring[clover_recv_head % CLOVER_RECV_RING];
+ 	bp = (uint8_t *)e;
+ 	for (i = 0; i < sizeof(*e); i++) {
+@@ -1004,6 +1023,8 @@
+ 	clover_recv_total++;
+ 	e->cre_t = secs;
+ 	e->cre_tid = current_thread()->thread_id;
++	e->cre_pid = pid;
++	e->cre_gen = gen;
+ 	e->cre_port = (uint64_t)key;
+ 	e->cre_kind = kind;
+ 	if (port != IP_NULL) {
+@@ -1035,6 +1056,7 @@
+ 			e->cre_bodylen = len;
+ 		}
+ 	}
++	hw_lock_unlock(&clover_recv_lock);
+ }
+ 
+ static void
+@@ -1060,32 +1082,63 @@
+ /*
+  * Called from psignal_internal when SpringBoard is the victim, with the pc of
+  * the killer already printed. Newest entry last, so the line closest to the
+- * kill is the last one in the window.
++ * kill is the last one in the window. The compact rcdump/rce lines go to the
++ * driver's probe ring first: the kill is the one reading that must survive to
++ * the card, and boot 16 lost the whole kill window out of the msgbuf.
+  */
+ void
+ clover_recv_dump(void)
+ {
++	static struct clover_recv_ent snap[CLOVER_RECV_RING];
+ 	struct clover_recv_ent *e;
+-	uint32_t n = clover_recv_total;
++	uint32_t n;
+ 	uint32_t start;
+ 	uint32_t i;
++	uint32_t total;
+ 	uint64_t ns = 0;
+ 	uint64_t secs;
++	char line[256];
++	int len;
+ 
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+ 	secs = ns / 1000000000ULL;
+-	if (n > CLOVER_RECV_RING) {
+-		n = CLOVER_RECV_RING;
+-	}
+-	start = clover_recv_head - n;
+-	printf("clover r227: rcvsum t=%llu n=%u tot=%u\n",
+-	    (unsigned long long)secs, n, clover_recv_total);
++	hw_lock_lock(&clover_recv_lock, LCK_GRP_NULL);
++	total = clover_recv_total;
++	n = (total > CLOVER_RECV_RING) ? CLOVER_RECV_RING : total;
++	start = clover_recv_head - n;
+ 	for (i = 0; i < n; i++) {
+-		e = &clover_recv_ring[(start + i) % CLOVER_RECV_RING];
+-		printf("clover r227: rcv%u t=%llu tid=%llx k=%u p=%llx o=%llx"
++		snap[i] = clover_recv_ring[(start + i) % CLOVER_RECV_RING];
++	}
++	hw_lock_unlock(&clover_recv_lock);
++
++	len = snprintf(line, sizeof(line),
++	    "clover r228: rcdump t=%llu n=%u tot=%u\n",
++	    (unsigned long long)secs, n, total);
++	if (len > 0) {
++		clover_emmc_probe_say(line, (unsigned int)len);
++	}
++	for (i = (n > 3) ? n - 3 : 0; i < n; i++) {
++		e = &snap[i];
++		len = snprintf(line, sizeof(line),
++		    "clover r228: rce t=%llu pid=%u gen=%u tid=%llx k=%u"
++		    " p=%llx o=%llx nm=%x c=%u q=%u s=%u id=%x sz=%u\n",
++		    (unsigned long long)e->cre_t, e->cre_pid, e->cre_gen,
++		    (unsigned long long)e->cre_tid, e->cre_kind,
++		    (unsigned long long)e->cre_port,
++		    (unsigned long long)e->cre_kobj, e->cre_name, e->cre_cnt,
++		    e->cre_ql, e->cre_seq, e->cre_id, e->cre_size);
++		if (len > 0) {
++			clover_emmc_probe_say(line, (unsigned int)len);
++		}
++	}
++	printf("clover r228: rcvsum t=%llu n=%u tot=%u\n",
++	    (unsigned long long)secs, n, total);
++	for (i = 0; i < n; i++) {
++		e = &snap[i];
++		printf("clover r228: rcv%u t=%llu pid=%u gen=%u tid=%llx k=%u p=%llx o=%llx"
+ 		    " nm=%x c=%u q=%u s=%u ms=%u sr=%u"
+ 		    " h=%x.%x.%llx.%llx.%llx.%x bl=%u\n",
+-		    i, (unsigned long long)e->cre_t,
++		    i, (unsigned long long)e->cre_t, e->cre_pid, e->cre_gen,
+ 		    (unsigned long long)e->cre_tid, e->cre_kind,
+ 		    (unsigned long long)e->cre_port,
+ 		    (unsigned long long)e->cre_kobj, e->cre_name, e->cre_cnt,
+@@ -1096,7 +1149,7 @@
+ 		    (unsigned long long)e->cre_voucher, e->cre_id,
+ 		    e->cre_bodylen);
+ 		if (e->cre_bodylen >= 4) {
+-			printf("clover r227: rcvb%u n=%u"
++			printf("clover r228: rcvb%u n=%u"
+ 			    " a=%08x.%08x.%08x.%08x.%08x.%08x.%08x.%08x\n",
+ 			    i, e->cre_bodylen / 4, e->cre_body[0], e->cre_body[1],
+ 			    e->cre_body[2], e->cre_body[3], e->cre_body[4],
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -2120,16 +2120,22 @@
+ 		 * Round227. SpringBoard's blocking receives are kept in a 64-entry
+ 		 * ring instead of being printed live (r226's live line never
+ 		 * reached the msgbuf window that survived to the host). The kill
+-		 * is the one moment the whole history is worth printing, and it
+-		 * runs once.
++		 * is the one moment the whole history is worth printing.
++		 *
++		 * Round228. Boot 16 watched three SpringBoard generations, and the
++		 * one-shot guard spent itself on generation A's kill: B's kill --
++		 * the one the ring was kept for -- printed nothing. The guard now
++		 * follows the victim's pid, so every generation's kill dumps its
++		 * own window once.
+ 		 */
+ 		if (signum == SIGKILL &&
+ 		    strncmp(p->p_comm, "SpringBoard", 16) == 0) {
+-			static int clover_r227_dumped;
++			static int clover_r228_dumped_pid;
+ 			extern void clover_recv_dump(void);
++			int clover_r228_pid = proc_getpid(p);
+ 
+-			if (!clover_r227_dumped) {
+-				clover_r227_dumped = 1;
++			if (clover_r228_dumped_pid != clover_r228_pid) {
++				clover_r228_dumped_pid = clover_r228_pid;
+ 				clover_recv_dump();
+ 			}
+ 		}
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10635,7 +10635,7 @@
+ 		clover_sb_changes = 0;
+ 		clover_sb_last[0] = '\0';
+ 		clover_sb_last_m2[0] = '\0';
+-		printf("clover r227: sbtask gen=%u pid=%d t=%llu\n",
++		printf("clover r228: sbtask gen=%u pid=%d t=%llu\n",
+ 		    clover_sb_gen, task_pid(cur),
+ 		    (unsigned long long)clover_now_seconds());
+ 		task_deallocate(old);
+@@ -10652,6 +10652,18 @@
+ {
+ 	return __atomic_load_n(&clover_sb_ready, __ATOMIC_ACQUIRE) &&
+ 	    __atomic_load_n(&clover_sb_task, __ATOMIC_ACQUIRE) == current_task();
++}
++
++/*
++ * Round228. ipc_mqueue.c stamps every receive record with the generation
++ * that latched the task, so a dump printed for generation B's kill cannot
++ * show generation C's pid as the owner of B's entries. A load is all the
++ * caller needs.
++ */
++uint32_t
++clover_sb_gen_read(void)
++{
++	return __atomic_load_n(&clover_sb_gen, __ATOMIC_ACQUIRE);
+ }
+ 
+ static uint64_t

@@ -54,15 +54,16 @@
 
 set -u
 
-WAIT=900
+WAIT=2100
 ADB_WAIT=180
-LANDING_WAIT=420
-# Round202. The payload's deadline is 900 s of its own uptime, not 900 s of the host's
-# wall clock: after the reboot it still has to reach that instant, sit on the panic screen
-# for its reset delay, boot the bootloader and start TWRP's adb. Round202's frame reached
-# SpringBoard at 358 s and the script's plain WAIT window expired before the landing, so
-# the deadline's own reset was read as "nothing came back". The slack covers exactly those
-# three steps and nothing else.
+LANDING_WAIT=2100
+# Round202. The payload's deadline is 1800 s of its own uptime (round228 moved it from 900),
+# not 1800 s of the host's wall clock: after the reboot it still has to reach that instant,
+# sit on the panic screen for its reset delay, boot the bootloader and start TWRP's adb.
+# Round202's frame reached SpringBoard at 358 s and the script's plain WAIT window expired
+# before the landing, so the deadline's own reset was read as "nothing came back". WAIT and
+# LANDING_WAIT cover the 1800 s deadline with margin; the slack covers the reset delay and
+# TWRP's adb on top.
 DEADLINE_SLACK=120
 OUT="$HOME/clover-out/clover-log-window.bin"
 FLASH_CACHE=""
@@ -81,15 +82,15 @@ usage() {
   cat <<'EOF'
 
 Options:
-  --wait SECONDS         how long to wait for fastboot at the start (default 900;
+  --wait SECONDS         how long to wait for fastboot at the start (default 2100;
                          after --boot-after-flash the same budget is spent waiting
                          for the deadline's landing, plus a fixed 120 s for the
                          payload's reset delay and TWRP's adb coming up)
   --adb-wait SECONDS     how long to wait for recovery adb (default 180)
   --landing-wait SECONDS how long to watch for either TWRP's adb or the board
-                         returning to fastboot after a recovery reboot (default 420:
+                         returning to fastboot after a recovery reboot (default 2100:
                          a bootloader that quietly turned it into an ordinary reboot
-                         only shows that once the payload's own deadline resets)
+                         only shows that once the payload's own 1800 s deadline resets)
   --out PATH             dump file (default ~/clover-out/clover-log-window.bin)
   --flash-cache IMG      cold-flash IMG to the cache partition before recovery;
                          this is an eMMC write and is printed before it runs

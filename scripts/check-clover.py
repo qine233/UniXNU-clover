@@ -810,10 +810,10 @@ def check_board(errors: list) -> str:
             errors.append("drivers/CloverSdhci gives round226's kill-site registers and receive "
                           "samples no tee class: seven lines per kill plus the sbrcv updates "
                           "would land in the ring uncounted")
-        if '{ "clover r227: ", "r227-rcv", 256, 0, 0, 0 },' not in sdhci_source:
-            errors.append("drivers/CloverSdhci gives round227's receive dump no tee class: one "
-                          "summary plus sixty-four receive and body lines at the kill would land "
-                          "in the ring uncounted and evict the earlier readings")
+        if '{ "clover r228: ", "r228-rcv", 480, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round228's receive dump no tee class: three "
+                          "generations of kill dumps (129 lines each) plus the sbtask lines would "
+                          "land in the ring uncounted and evict the earlier readings")
         if '{ "clover r217: ", "r217-sbs", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round217's live sample no tee class: a line "
                           "that changes every eight seconds for the length of the boot would land "
@@ -959,6 +959,34 @@ def check_board(errors: list) -> str:
                     errors.append(f"{r227_patch.name} lacks {needle[:56]!r}: the receive ring "
                                   "could not be dumped at the kill or the latch would not follow "
                                   "a SpringBoard restart")
+
+        r228_patch = next((base / "patches/xnu-clover/zzzzzzzzzzzzz-clover-r228.patch"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover/zzzzzzzzzzzzz-clover-r228.patch").is_file()),
+                          None)
+        if r228_patch is None:
+            errors.append("patches/xnu-clover/zzzzzzzzzzzzz-clover-r228.patch is missing: boot 16 "
+                          "watched three SpringBoard generations and only the first kill dumped, "
+                          "so the guard has to follow the victim's pid")
+        else:
+            r228_text = r228_patch.read_text()
+            for needle in ('"clover r228: rcdump t=%llu n=%u tot=%u\\n"',
+                           '"clover r228: rce t=%llu pid=%u gen=%u tid=%llx k=%u"',
+                           '"clover r228: rcvsum t=%llu n=%u tot=%u\\n"',
+                           '"clover r228: rcv%u t=%llu pid=%u gen=%u tid=%llx k=%u p=%llx o=%llx"',
+                           '"clover r228: rcvb%u n=%u"',
+                           '"clover r228: sbtask gen=%u pid=%d t=%llu\\n"',
+                           "clover_r228_dumped_pid",
+                           "clover_sb_gen_read(void)",
+                           "hw_lock_lock(&clover_recv_lock, LCK_GRP_NULL)",
+                           "static struct clover_recv_ent snap[CLOVER_RECV_RING];",
+                           "uint32_t cre_pid;",
+                           "uint32_t cre_gen;",
+                           "clover_emmc_probe_say(line, (unsigned int)len);"):
+                if needle not in r228_text:
+                    errors.append(f"{r228_patch.name} lacks {needle[:56]!r}: the per-generation "
+                                  "dump guard, the pid/gen stamp, the locked snapshot or the "
+                                  "probe-ring tail could not land on the card")
 
         if "CloverSdhci r212: panic tail lines=%u unseen=%u bufx=%d tee=%u boot=%u" not in sdhci_source:
             errors.append("drivers/CloverSdhci has no round212 panic-time tail read: a boot whose "
@@ -1935,8 +1963,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r227:"):
-        errors.append('[payload] title is not "clover r227: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r228:"):
+        errors.append('[payload] title is not "clover r228: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -1963,14 +1991,23 @@ def check_board(errors: list) -> str:
         errors.append("scripts/run-clover-unattended.sh has no watch_after_deadline: after "
                       "--boot-after-flash the script would again read a fastboot landing as proof "
                       "of a reset whose recovered landing it never checked")
-    # Round202's frame reached SpringBoard at 358 s, the payload's deadline is 900 s of its own
-    # uptime, and the script gave the landing exactly WAIT seconds of host time -- so the board's
-    # own reset landed after the window closed and the run reported "neither". The reset delay and
-    # TWRP's adb coming up have to be inside the same budget.
+    # Round202's frame reached SpringBoard at 358 s, and its 900 s deadline sat outside the
+    # script's WAIT window -- so the board's own reset landed after the window closed and the
+    # run reported "neither". Round228's deadline is 1800 s (board.toml), so WAIT and
+    # LANDING_WAIT both cover it plus the reset delay and TWRP's adb coming up, with
+    # DEADLINE_SLACK on top.
     if "DEADLINE_SLACK=120" not in script_text:
         errors.append("scripts/run-clover-unattended.sh has no DEADLINE_SLACK: the landing budget "
-                      "would again expire before the payload's 900 s deadline plus its reset delay, "
+                      "would again expire before the payload's deadline plus its reset delay, "
                       "and a reset that did happen would read as nothing coming back")
+    if "WAIT=2100" not in script_text:
+        errors.append("scripts/run-clover-unattended.sh does not wait 2100 s: with the r228 "
+                      "deadline at 1800 s the --boot-after-flash watch would expire before the "
+                      "payload's own reset")
+    if "LANDING_WAIT=2100" not in script_text:
+        errors.append("scripts/run-clover-unattended.sh does not watch 2100 s for the recovery "
+                      "landing: a board whose BCB did not take boots the payload and only comes "
+                      "back to fastboot when the 1800 s deadline resets it")
     if "returned to fastboot by itself, so the deadline fired" in script_text:
         errors.append("scripts/run-clover-unattended.sh still says the board 'returned to fastboot "
                       "by itself, so the deadline fired': round195 showed that sentence on a board "
@@ -2975,8 +3012,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r227:"):
-        errors.append('[payload] title is not "clover r227: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r228:"):
+        errors.append('[payload] title is not "clover r228: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -3532,9 +3569,10 @@ def check_board(errors: list) -> str:
          "--count",
          "run-clover-unattended.sh would have no machine-readable record count"),
         ("board.toml",
-         '"clover-unattended=900"',
-         "the deadline would cut a boot that round193's frame shows still moving at 312.9 s, "
-         "and the round would be measuring the deadline instead of the boot"),
+         '"clover-unattended=1800"',
+         "the deadline would cut a boot that r227's frame shows still moving past 900 s "
+         "(generation C latched at 653 s and healthy at 906 s), and the round would be "
+         "measuring the deadline instead of the boot"),
         ("drivers/CloverSdhci/CloverSdhci.cpp",
          'CloverSdhci r195: %s probe lines capped at %u',
          "the tee would go back to an uncapped transcript: on round194's frame the flood had "
