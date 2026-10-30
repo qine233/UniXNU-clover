@@ -17279,3 +17279,48 @@ TWRP，panic 自写 BCB，宿主零 misc 写。四个仪器全部兑现：
    逐成员打 `ty/cnt/ql/seq/rn/kmsg`，若不是集合再退回 SEND/RECEIVE；③ `nm=4103` 解析出的
    端口对象与集合成员**比地址**，回答「哪条接收线程属于这条消息」；④ ulock 行加
    `x2`（期望值）与同进程 `TH_RUN`/`TH_BLOCKING` 的候选持有者；⑤ 环过滤不动。
+
+## round232 读数（boot 21）——port set 的成员表出来了，采样器修好后又在 1763 s 整体熄火
+
+1. **环**：512 行全是 boot 21，窗口 **727.2–1763.1 s**，最后一行 1763.101 s，比 1800 s 死线早 37 s。
+   类分布：r218 sbpc 69、r223+r229+r225 sbport 63（其中 `nm=5e03` 51）、r231 bbhop 59、r232 bbset 45、
+   r231 bbwait 45、r221 sbm2 40、sbm2x 40、r222 sbuf 39、r217 sbs 33、r224 peer 24、r229 bb 18。
+   驱动只剩武装行（log window / verdict / kernel / `boot id=21` / `recovery BCB pre-armed` / flight / link），
+   **没有 `tee filter`/`tee sync`/`drain exit` 行**——那几条只在排干时打，本轮没有排干。
+2. **独立节拍兑现了**。`r229: bb` 18 拍 `t=727→1760`，`f=8→25 s=2→3 hops=4→3 wait=4→2/4 d=29→126`；
+   hop/set/wait/sbport 行都跟到 1760 的最后一拍。r231 的「1195 s 断流」修掉了。
+3. **port set 解析兑现了**。三个 hop 名都按集合翻译出来（`rno=58:backboardd+ps`、`lo=58:backboardd+ps`），
+   每拍 3 张成员表、15 拍共 45 行：
+   - `4a03` `o=fffffff959b419d0 n=8 all=11`：`4b03/4713/7f03/7e03/4d03/11577/11c03/13e33`，全 `0:0`；
+   - `7803` `o=fffffff959b41a00 n=8 all=9`：`635f 0:52`、`a003 0:49→56`、`6d03 0:16`、`b603 0:8`、
+     `11107 0:8`、`10f07 0:8`、`14303 0:7`、`14103 0:7`；
+   - `6c03` `o=fffffff959b41af0 n=3 all=3`：`6703 0:0`、`6803 0:0`、`6603 0:7`。
+   整窗只有 `a003` 的 seqno 动过：1395 s 还是 49，1517 s 起 56（一次跳 7 条）；`635f` 一直 52，其余全零。
+   四条在飞的接收线程等在三组集合上，但集合里几乎不动。
+4. **等了半天的 `5e03` 不在可见成员里**。`sbport nm=5e03 o=fffffff8743a6ce0 cnt=0 ql=6 seq=3 rn=3e2b ms=0 sr=1
+   rcv=fffffff6a70aa8f8/fffffff959677010 wq=0` 51 条逐字段相同（727→1760 s）。
+   它不在 4a03 的可见 8 个成员里，也不在 7803 的可见 8 个或 6c03 的 3 个里；但 4a03 有 `all=11`（3 个没打）、
+   7803 有 `all=9`（1 个没打）——8 条上限还不允许下结论。r233 必须打全并标出 `o==a6ce0` 的成员。
+5. **hop 的第四种签名是发送者**。除 `0x161/0x365/0x372` 三条接收（op 都是 `MACH_RCV_*`、`rem=0`）外，
+   `tid=0x33c op=500040011 rn=0 rs=0 rem=e747 id=30000000 to=0 rno=- lo=-`（11 条）是**发送**：
+   op 解出 `MACH_SEND_MSG|SEND_TIMEOUT|SEND_NOIMPORTANCE|MACH64_MSG_VECTOR|MACH64_SEND_MQ_CALL`，
+   目的名 `e747`、超时 0（轮询）。与它对应的是 `bbwait`：`tid=0x3be st=41 cont=…73cb24(_ulock_wait_continue)
+   x0=1000001 x1=100b90194 x2=0` 14 条不变；其余 31 条 `st=1 cont=_workq_unpark_continue` 是空闲工作队列线程。
+6. **SpringBoard 主线程仍在等回信**。`sbm2 t=727..1760 tid=0x910 op=40700420e rem=5e03 loc=0 rn=1e03 rs=4000
+   to=0 ro=58:backboardd h=0.0.5e03.0.0.0`（34 条），`sbpc tid=0x910 x16=ffffffffffffffd1`（到 899 s 的配额）。
+   op 只有接收位（`RCV_MSG|RCV_LARGE|RCV_LARGE_IDENTITY|STRICT_REPLY|RCV_INTERRUPT|RCV_SYNC_WAIT`）：
+   `rn=1e03` 是它自己的回信口，`rs=4000` 是 16 KiB 接收区，`rem=5e03` 是 `STRICT_REPLY` 的期望端口名。
+   **它等的是「发往 `5e03` 那笔请求换回来的回信」**，而 `5e03` 在 backboardd 里是普通端口、接收名 `3e2b`、
+   队列空、`seq` 停在 3。这条纠正 r229–r231 的「阻塞发送」说法：0x910 是接收等待，不是发送阻塞。
+7. **屏**：727–1763 s 只有 1707.49 s 一行 `r180: client#6 pid=87 type=0 status=0
+   class=IOMobileFramebufferUserClient seen=6`，**没有 `swap#`/`frame#`/`copy#`/`retire#`**。
+8. **死线这一侧第一次断了**。内核环最后一行 1763.101 s，之后 37 s 一行不出；
+   **没有 boot 21 的 kind-20 panic 记录**（报告环 16 条全是旧靴），`misc block 1` 为空，
+   TWRP 是 r198 预置 BCB 落下来的。boot 17–20 都有 `unattended deadline 1800 s` 记录，本轮没有——
+   要么 1800 s 前整机已经停住（连内核行都不再产生），要么死线自己的记录路径没走完。
+   r233 必须用**不依赖任何任务进 trap** 的节拍来回答「1763 s 之后内核还活着吗」。
+9. **r233 设计**：① bbset 打全（`all` 个成员都打、超长分行），并给对象地址等于 `a6ce0` 的成员打 `*`；
+   ② sbport 增打接收 task 的 pid/name，回答 `a6ce0` 归谁、`3e2b` 是谁的接收名；③ 每拍读 SpringBoard 自己的
+   `1e03`（cnt/ql/seq/rn/kmsg），看回信口是否空着；④ 节拍改由内核定时器/callout 驱动（不依赖任何任务进
+   `mach_msg2`），每 20 s 一行自证心跳、直到死线；⑤ 顺带打 `0x33c` 的目的名 `e747` 属主与锁 `0x100b90194`
+   的持有者。

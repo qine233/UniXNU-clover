@@ -1,0 +1,242 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 2bcd301..7494f33 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -105,6 +105,7 @@
+ #include <ipc/ipc_entry.h>
+ #include <ipc/ipc_object.h>
+ #include <ipc/ipc_port.h>
++#include <ipc/ipc_pset.h>
+ #include <ipc/ipc_hash.h>
+ #include <ipc/ipc_init.h>
+ 
+@@ -10601,6 +10602,14 @@ static char clover_sb_last_m2[1024];
+ static int clover_sb_pid;
+ static mach_port_name_t clover_sb_last_reply;
+ 
++/* Round232: the receiver sample stops riding SpringBoard's batch signature. The
++ * pid and name are latched the first time a batch names backboardd, and the
++ * sample then runs on its own beat from the same trap entry, so a receiver that
++ * never changes is still read while the sender's batch sits still. */
++static int clover_bb_target_pid;
++static mach_port_name_t clover_bb_target_name;
++static uint64_t clover_bb_beat;
++
+ static uint64_t clover_now_seconds(void);
+ 
+ /*
+@@ -10630,6 +10639,9 @@ clover_sb_note_current(void)
+ 		clover_sb_gen++;
+ 		clover_sb_pid = 0;
+ 		clover_sb_last_reply = MACH_PORT_NULL;
++		clover_bb_target_pid = 0;
++		clover_bb_target_name = MACH_PORT_NULL;
++		clover_bb_beat = 0;
+ 		clover_sb_last_secs = 0;
+ 		clover_sb_heartbeat = 0;
+ 		clover_sb_changes = 0;
+@@ -10727,6 +10739,7 @@ clover_sb_port_owner(task_t task, mach_port_name_t name, char *out, size_t outle
+ 	char *pname;
+ 	char comm[16];
+ 	kern_return_t kr;
++	int pset = 0;
+ 
+ 	out[0] = '\0';
+ 	if (name == MACH_PORT_NULL) {
+@@ -10741,6 +10754,10 @@ clover_sb_port_owner(task_t task, mach_port_name_t name, char *out, size_t outle
+ 		kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_RECEIVE,
+ 		    &obj);
+ 	}
++	if (kr != KERN_SUCCESS) {
++		kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_PORT_SET,
++		    &obj);
++	}
+ 	if (kr == KERN_SUCCESS) {
+ 		if (io_otype(obj) == IOT_PORT) {
+ 			ipc_space_t recv = ip_get_receiver((ipc_port_t)obj);
+@@ -10749,6 +10766,19 @@ clover_sb_port_owner(task_t task, mach_port_name_t name, char *out, size_t outle
+ 				owner = recv->is_task;
+ 				task_reference(owner);
+ 			}
++		} else if (io_otype(obj) == IOT_PORT_SET) {
++			/*
++			 * Round232. A set's receive right is named only in its
++			 * own space, so that space's task is the owner. The
++			 * name is tagged so a hop row says "set" instead of
++			 * leaving the caller to decode a name that translated
++			 * under neither SEND nor RECEIVE.
++			 */
++			pset = 1;
++			if (space->is_task != TASK_NULL) {
++				owner = space->is_task;
++				task_reference(owner);
++			}
+ 		}
+ 		io_unlock(obj);
+ 	} else {
+@@ -10763,10 +10793,59 @@ clover_sb_port_owner(task_t task, mach_port_name_t name, char *out, size_t outle
+ 	if (pname != NULL) {
+ 		strlcpy(comm, pname, sizeof(comm));
+ 	}
+-	snprintf(out, outlen, "%d:%s", task_pid(owner), comm);
++	snprintf(out, outlen, "%d:%s%s", task_pid(owner), comm, pset ? "+ps" : "");
+ 	task_deallocate(owner);
+ }
+ 
++/*
++ * Round232. A hop name that translates under neither SEND nor RECEIVE can be a
++ * port set: a set's receive right lives in its own entry type, and a receiver
++ * that serves a member port blocks on the set, not on the member's name. The
++ * set object comes back locked from the translate; the member walk runs under
++ * that lock and copies each member's object, queue count, seqno and receiver
++ * name into one row, so the member object can be matched against the port a
++ * blocked send was addressed to. Members are not lockable here (the set lock is
++ * held), and nothing is retained past the row.
++ */
++static void
++clover_pset_report(ipc_pset_t pset, const char *tag, uint64_t secs,
++    const char *rn, mach_port_name_t name)
++{
++	char memb[220];
++	char *mp = memb;
++	char line[320];
++	__block uint32_t n = 0;
++	__block uint32_t all = 0;
++	__block int off = 0;
++	int len;
++
++	memb[0] = '\0';
++	waitq_set_foreach_member_locked(&pset->ips_wqset, ^(struct waitq *wq) {
++		ipc_port_t port = ip_from_waitq(wq);
++
++		all++;
++		if (n >= 8 || off >= (int)sizeof(memb) - 32) {
++			return;
++		}
++		off += snprintf(mp + off, sizeof(memb) - (size_t)off,
++		    "%s%llx:%u:%u:%x", n ? "," : "",
++		    (unsigned long long)(uintptr_t)port,
++		    (unsigned)port->ip_messages.imq_msgcount,
++		    (unsigned)port->ip_messages.imq_seqno,
++		    port->ip_messages.imq_receiver_name);
++		n++;
++	});
++	io_unlock(ips_to_object(pset));
++	len = snprintf(line, sizeof(line),
++	    "clover %s: bbset t=%llu %s nm=%x o=%llx n=%u all=%u m=%s\n",
++	    rn, (unsigned long long)secs, tag, name,
++	    (unsigned long long)(uintptr_t)pset, n, all, memb);
++	if (len > 0) {
++		line[sizeof(line) - 1] = '\0';
++		printf("%s", line);
++	}
++}
++
+ /*
+  * Round223. The two ends of the blocked send are read together. A name on the
+  * send side only says where the message was addressed; the port object says
+@@ -10797,6 +10876,15 @@ clover_sb_port_state(task_t task, mach_port_name_t name, const char *tag,
+ 		    &obj);
+ 	}
+ 	if (kr != KERN_SUCCESS) {
++		kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_PORT_SET,
++		    &obj);
++		if (kr == KERN_SUCCESS && io_otype(obj) == IOT_PORT_SET) {
++			clover_pset_report((ipc_pset_t)obj, tag, secs, rn, name);
++			return;
++		}
++		if (kr == KERN_SUCCESS) {
++			io_unlock(obj);
++		}
+ 		printf("clover %s: sbport t=%llu %s nm=%x kr=%d\n",
+ 		    rn, (unsigned long long)secs, tag, name, kr);
+ 		return;
+@@ -10814,10 +10902,11 @@ clover_sb_port_state(task_t task, mach_port_name_t name, const char *tag,
+ 		mach_msg_header_t *mh = (kmsg != NULL) ? ikm_header(kmsg) : NULL;
+ 		ipc_space_t recv = ip_get_receiver(port);
+ 
+-		printf("clover %s: sbport t=%llu %s nm=%x cnt=%u ql=%u seq=%u"
+-		    " rn=%x ms=%u sr=%u rcv=%llx/%llx kobj=%llx wq=%llx"
++		printf("clover %s: sbport t=%llu %s nm=%x o=%llx cnt=%u ql=%u"
++		    " seq=%u rn=%x ms=%u sr=%u rcv=%llx/%llx kobj=%llx wq=%llx"
+ 		    " km=%llx h=%x.%x.%x.%x.%x.%x\n",
+ 		    rn, (unsigned long long)secs, tag, name,
++		    (unsigned long long)(uintptr_t)port,
+ 		    (unsigned)port->ip_messages.imq_msgcount,
+ 		    (unsigned)port->ip_messages.imq_qlimit,
+ 		    (unsigned)port->ip_messages.imq_seqno,
+@@ -11153,9 +11242,16 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 			printf("%s", line);
+ 		}
+ 	}
+-	if (hn > 0 && hrn[0] != 0) {
+-		clover_sb_port_state(task, (mach_port_name_t)hrn[0], "bbq", secs,
+-		    "r231");
++	/*
++	 * Round232. Every hop name is resolved, not just the first: boot 20's
++	 * three names are distinct, and a name that is a set is now walked for
++	 * its members so the sender's port object can be matched against them.
++	 */
++	for (i = 0; i < hn; i++) {
++		if (hrn[i] != 0) {
++			clover_sb_port_state(task, (mach_port_name_t)hrn[i],
++			    "bbq", secs, "r232");
++		}
+ 	}
+ 	for (i = 0; i < un; i++) {
+ 		len = snprintf(line, sizeof(line),
+@@ -11424,6 +11520,18 @@ clover_sb_sample(void)
+ 					    strncmp(ro + c + 1, "backboardd", 10) == 0) {
+ 						bb_pid = (int)pidv;
+ 						bb_name = (mach_port_name_t)(uint32_t)r[3];
++						/*
++						 * Round232: latch the receiver the
++						 * first time a batch names it; the
++						 * beat below runs without this
++						 * branch.
++						 */
++						if (clover_bb_target_pid == 0) {
++							clover_bb_target_pid = bb_pid;
++							clover_bb_target_name =
++							    bb_name;
++							clover_bb_beat = 0;
++						}
+ 					}
+ 				}
+ 				if ((uint32_t)(r[3] >> 32) != 0) {
+@@ -11465,12 +11573,10 @@ clover_sb_sample(void)
+ 			 * Round229. The batch named backboardd as a destination,
+ 			 * so the receiver is read now -- while the sender still
+ 			 * sits in the trap and the queue still holds what it
+-			 * holds. Once per batch: the batch itself only runs when
+-			 * the numeric signature changed.
++			 * holds. Round232 moved the call out of this branch: the
++			 * receiver is latched above and read on its own beat
++			 * after the batch block.
+ 			 */
+-			if (bb_pid != 0) {
+-				clover_bb_sample(bb_pid, task, bb_name, secs);
+-			}
+ 
+ 			/*
+ 			 * Round221. A name says who is being called; it does not say
+@@ -11672,6 +11778,19 @@ clover_sb_sample(void)
+ 			}
+ 		}
+ 	}
++	/*
++	 * Round232. The receiver is sampled on its own beat once a batch has
++	 * named it. Boot 20 stopped printing at 1195 s because this sample was
++	 * tied to the batch signature, which stopped changing while SpringBoard
++	 * still entered the trap; the beat keeps the reading moving for as long
++	 * as the trap is entered, and clover_bb_sample still suppresses an
++	 * unchanged receiver between heartbeats.
++	 */
++	if (clover_bb_target_pid != 0 && secs >= clover_bb_beat) {
++		clover_bb_beat = secs + 20;
++		clover_bb_sample(clover_bb_target_pid, task,
++		    clover_bb_target_name, secs);
++	}
+ }
+ /*
+  * Round224. Round223 left one question: the launchd port held two messages

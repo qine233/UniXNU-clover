@@ -698,6 +698,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // 192 holds the whole conversation -- the heartbeat tail included -- and still bounds a producer
   // that loops harder than the receiver does.
   { "clover r231: ", "r231-bb", 192, 0, 0, 0 },
+  // Round232 stops tying the receiver sample to SpringBoard's batch signature: once a batch names
+  // backboardd, the kernel latches it and samples on its own 20 s beat while the trap keeps being
+  // entered. Each hop name is resolved, and a name that is a port set is walked for its members in
+  // one row. Three hop names at 120 s heartbeat over a 1800 s boot is under fifty rows per set, so
+  // 128 holds the whole conversation and still bounds a producer that loops harder than a receiver.
+  { "clover r232: ", "r232-set", 128, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

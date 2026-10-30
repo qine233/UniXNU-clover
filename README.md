@@ -4,13 +4,30 @@
 ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。
 配套固件仓库 `uefi-clover`（Mu-Silicium 移植），驱动与硬件常量在 `porting.toml`。
 
-现状一句话：**桌面卡点不在「backboardd 不回信」，而在「backboardd 等的三个名字都不是端口」**
-——XNU 起来、三卷全挂、launchd 把守护进程拉起来。boot 20（r231，死线 1800 s）把接收名从 x5
-高半读了出来：backboardd 的在飞线程停在 `rn=0x7f03 / 0x790f / 0x6c03`，全部 `rem=0`（纯接收），
-而这三个名字在 58 的 space 里连 SEND/RECEIVE 右都没有（`kr=17`，是 port set 或已死名字），
-所以 hop 没有「下一跳的端口」可读；SpringBoard 发去的 `nm=4103` 端口在 backboardd 里
-`rn=147bb`、`cnt=0 seq=3`，取走消息的线程等在这一组集合上。同时采样器只跟着 SpringBoard 的
-批签名开火，行在 1195 s 就停了——下一轮先修这个仪器缺陷，再按 port-set 成员表走。
+现状一句话：**回信收不到，是因为请求被 backboardd 的 port set 带走；三个集合的成员表已经读出来，
+但 SpringBoard 等的回信口还是空的。** XNU 起来、三卷全挂、launchd 把守护进程拉起来。
+boot 21（r232，死线 1800 s）把采样器从 SpringBoard 的批签名里摘出来，改成 20 s 一拍，覆盖 727–1760 s；
+backboardd 的三条在飞线程等的 `4a03 / 7803 / 6c03` 现在按 port set 翻译开、成员逐拍打出：15 拍里只有
+`a003` 的 seqno 动过（49→56），其余成员整窗不动。SpringBoard 主线程 `0x910` 停在 `rcv_name=1e03`
+的接收上（`STRICT_REPLY` 期望口 `5e03`），而 `5e03` 在 backboardd 里是普通端口
+`o=fffffff8743a6ce0`、`rn=3e2b`、`cnt=0 seq=3`；它不在集合的前 8 个可见成员里，但 `4a03` 有 11 个、
+`7803` 有 9 个——还差「打全并比地址」这一刀。内核环在 1763.1 s 之后一行不出，死线自己的 panic
+记录第一次没有落下。
+
+r232 读数（boot 21）：**port set 的成员表出来了；采样器修好后又暴露第二个盲区——1763 s 之后整机不再出声。**
+① 环：512 行窗口 **727.2–1763.1 s**，全是 boot 21；没有 `tee filter`/`tee sync`/`drain exit` 行
+（那几条只在排干时打，本轮没有排干）。② 独立节拍兑现：`bb` 18 拍 727→1760
+（`f=8→25 s=2→3 hops=4→3 wait=4→2`），hop/set/wait 跟到最后一拍。③ 三个 hop 名都翻译成 port set
+（`rno/lo=58:backboardd+ps`），15 拍 × 3 张成员表：`4a03`（`all=11`，8 个可见，全 `0:0`）、
+`7803`（`all=9`，`a003` seq 49→56、`635f` 52、其余不动）、`6c03`（3 个，`6603` 7、其余 0）。
+④ 第四种 hop 签名是发送者：`0x33c op=500040011 rem=e747 id=30000000`
+（`SEND_MSG|SEND_TIMEOUT|MACH64_SEND_MQ_CALL`，超时 0），同拍 `0x3be` 停在 `_ulock_wait_continue`
+（`x0=1000001 x1=100b90194`）。⑤ SpringBoard 主线程 `0x910 x16=-47`，`op=40700420e` 只有接收位
+（含 `STRICT_REPLY|RCV_SYNC_WAIT`），`rn=1e03 rs=4000`、`rem=5e03`——它等的是发往 `5e03` 那笔请求的
+回信；`5e03` 是普通端口、`rn=3e2b`、`cnt=0 seq=3` 整窗不动，且不在三个集合的前 8 个可见成员里。
+⑥ 屏只有 1707.49 s 一行 `r180: client#6`，没有 `swap#`/`frame#`。⑦ **1763.1 s 后内核环一行不出**，
+比 1800 s 死线早 37 s；没有 boot 21 的 kind-20 记录、`misc block 1` 空，TWRP 由 r198 预置 BCB 落下——
+死线自己的记录第一次缺席。
 
 r231 读数（boot 20）：**三个 hop 名全是 port set（`kr=17`），采样器停在 1195 s。**
 ① 环：512 行窗口 **730.5–1813.0 s**，`tee filter fl=222 nag=3189 exit kept=20 dropped=227
@@ -108,8 +125,8 @@ r227 改成「内核环里记录、kill 时倒出」，不再从收路径实时�
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **backboardd 等的是 port set，不是端口；三个接收名都没有 SEND/RECEIVE 右** | r231 读数（boot 20）：hop 行 63 条，三种签名 `tid=0x18a rn=7f03`、`0x35b rn=790f`、`0x37b rn=6c03`，全部 `rem=0`；`sbport … bbq nm=790f kr=17`（`KERN_INVALID_RIGHT`）说明它们是 port set 或死名。`0x34b` 整个窗口停在 `_ulock_wait_continue`（`x0=1000001` 锁地址 `105d8f0f4`），`0x34c` 在 `16f6dd720`。SpringBoard gen=1（pid=237）从 736 s 起停在 `rem=4103→58:backboardd`，目的端口 `cnt=0 seq=3 rn=147bb wq=0` | r232：hop 名按 `MACH_PORT_RIGHT_PORT_SET` 翻译并遍历集合成员（`ips_wqset.wqs_links`），逐成员打 `ty/cnt/ql/seq/rn/kmsg`，再与 `nm=4103` 的端口对象比地址 |
-| 2 | **采样器只跟着 SpringBoard 的批签名跑，735 s 之后只覆盖到 1195 s** | r231 读数（boot 20）：63/57/23 条行只覆盖 735–1195 s，而环到 1813 s；调用点在 `npick > 0 && strcmp(m2sig, clover_sb_last_m2) != 0` 分支里（`kern/task.c:11386`），gen=1 的批次不再变化就不再开火。窗口内屏上只有 1385.96 s 一行 `r180: client#6`，没有 `swap#`/`frame#` | r232：把 bb 采样器改成独立 20 s 节拍、配额 96，不再依赖 SpringBoard 的签名；环过滤不动 |
+| 1 | **backboardd 等的三个名字确是 port set；SpringBoard 等的回信口仍空着** | r232 读数（boot 21）：三个 hop 名按集合翻译（`rno/lo=58:backboardd+ps`），15 拍成员表：`4a03`（`all=11`）全 `0:0`、`7803`（`all=9`）只有 `a003` seq 49→56、`6c03` 只有 `6603` 到 7；`5e03`（`o=fffffff8743a6ce0`、`rn=3e2b`、`cnt=0 seq=3`）不在 8 个可见成员里；SpringBoard `0x910` 停在 `rn=1e03` 的 `STRICT_REPLY|RCV_SYNC_WAIT` 接收上（期望口 `5e03`）；`0x33c` 是唯一发送者（`rem=e747`），`0x3be` 停在 ulock `0x100b90194` | r233：bbset 打全（`all` 个成员），给 `o==a6ce0` 的成员打 `*`；sbport 增打接收 task 的 pid/name；每拍读 SpringBoard 的 `1e03` |
+| 2 | **采样器独立节拍了，但 1763 s 后整机不再出声，死线记录缺席** | r232 读数（boot 21）：`bb` 18 拍 727→1760，hop/set/wait 跟到最后一拍；内核环 727.2–1763.1 s 后一行不出（早于死线 37 s）；没有 boot 21 的 kind-20 panic 记录，`misc block 1` 为空，落 TWRP 靠 r198 预置 BCB。屏上只有 1707.49 s 一行 `r180: client#6` | r233：节拍改由内核定时器/callout 驱动（不依赖任务进 `mach_msg2`），每 20 s 一行自证心跳直到死线，回答内核是否还活着、死线为何没记录 |
 | 3 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 4），再问地址 |
 | 4 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 5 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |

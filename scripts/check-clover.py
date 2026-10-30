@@ -826,6 +826,10 @@ def check_board(errors: list) -> str:
             errors.append("drivers/CloverSdhci gives round231's receive-name hops and waiting-thread "
                           "rows no tee class: thirteen lines per fire over a whole boot would land "
                           "in the ring uncounted")
+        if '{ "clover r232: ", "r232-set", 128, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round232's port-set member rows no tee class: "
+                          "each hop name that resolves as a set adds a row per fire, and over a "
+                          "whole boot they would land in the ring uncounted")
         if '{ "clover r217: ", "r217-sbs", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round217's live sample no tee class: a line "
                           "that changes every eight seconds for the length of the boot would land "
@@ -1076,6 +1080,37 @@ def check_board(errors: list) -> str:
                     errors.append(f"{r231_patch.name} lacks {needle[:56]!r}: the hop would again be "
                                   "read from the register a receive leaves empty, or the sampler "
                                   "would spend its fires on one unchanged receiver")
+
+        # Round232 answers the shape boot 20 printed: three receive names came back kr=17 under both
+        # SEND and RECEIVE, which is what a port set looks like from the outside, and the sampler
+        # stopped at 1195 s because it rode the sender's batch signature. The receiver is now latched
+        # once a batch names it and sampled on its own twenty-second beat, and each hop name is
+        # translated as a set: a member walk is the only way to line the sender's port object up with
+        # the ports a set actually serves.
+        r232_patch = next((base / "patches/xnu-clover/zzzzzzzzzzzzzzzz-clover-r232.patch"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover/zzzzzzzzzzzzzzzz-clover-r232.patch").is_file()),
+                          None)
+        if r232_patch is None:
+            errors.append("patches/xnu-clover/zzzzzzzzzzzzzzzz-clover-r232.patch is missing: boot 21 "
+                          "would again read a port-set name as a dead right and stop sampling at the "
+                          "last changed batch")
+        else:
+            r232_text = r232_patch.read_text()
+            for needle in ('#include <ipc/ipc_pset.h>',
+                           'waitq_set_foreach_member_locked(&pset->ips_wqset',
+                           'ip_from_waitq(wq)',
+                           '"clover %s: bbset t=%llu %s nm=%x o=%llx n=%u all=%u m=%s\\n"',
+                           'kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_PORT_SET,',
+                           'pset ? "+ps" : ""',
+                           'clover_bb_target_pid != 0 && secs >= clover_bb_beat',
+                           'clover_bb_target_pid = bb_pid;',
+                           'clover_sb_port_state(task, (mach_port_name_t)hrn[i],',
+                           '"clover %s: sbport t=%llu %s nm=%x o=%llx cnt=%u ql=%u"'):
+                if needle not in r232_text:
+                    errors.append(f"{r232_patch.name} lacks {needle[:56]!r}: a set would again read "
+                                  "as a dead right, the sender's object could not be matched to a "
+                                  "member, or the sampler would stop when the batch stops changing")
 
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
@@ -2074,8 +2109,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r231:"):
-        errors.append('[payload] title is not "clover r231: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r232:"):
+        errors.append('[payload] title is not "clover r232: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3123,8 +3158,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r231:"):
-        errors.append('[payload] title is not "clover r231: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r232:"):
+        errors.append('[payload] title is not "clover r232: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

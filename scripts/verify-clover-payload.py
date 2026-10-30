@@ -917,7 +917,7 @@ def check_sb_sample(kernel: bytes) -> bool:
              "sbmsg": (b"clover r221: sbmsg t=%llu tid=0x%llx") in kernel,
              "sbuf": (b"clover r222: sbuf t=%llu") in kernel,
              "sbhex": (b"clover r222: sbhex t=%llu") in kernel,
-             "sbport": (b"clover %s: sbport t=%llu %s nm=%x cnt=%u ql=%u seq=%u") in kernel,
+             "sbport": (b"clover %s: sbport t=%llu %s nm=%x o=%llx cnt=%u ql=%u seq=%u") in kernel,
              "peer": (b"clover r224: peer t=%llu pid=%d n=%u sc=%d act=%d b=%u") in kernel,
              "p1": (b"clover r225: p1s t=%llu pid=%d n=%u c=%u%s%s\n") in kernel,
              "p1m2": (b"clover r225: p1m2 t=%llu tid=0x%llx op=%llx b=%x sz=%x") in kernel,
@@ -941,6 +941,7 @@ def check_sb_sample(kernel: bytes) -> bool:
              "bbwait": (b"clover r231: bbwait t=%llu pid=%d tid=0x%llx st=%x"
                         b" cont=%llx pc=%llx x0=%llx x1=%llx x2=%llx x3=%llx"
                         b" u=%u run=0x%llx\n") in kernel,
+             "bbset": (b"clover %s: bbset t=%llu %s nm=%x o=%llx n=%u all=%u m=%s\n") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
                            b"dropped=%u comms=%u\n") in kernel,
              "tee-sync": (b"CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n") in kernel}
