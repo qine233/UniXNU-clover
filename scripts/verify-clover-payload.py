@@ -966,6 +966,10 @@ def check_sb_sample(kernel: bytes) -> bool:
                          b" disa=%llx grp=%llx\n") in kernel,
              "bbnochain": (b"clover r239: bbnochain t=%llu pid=%d tid=0x%llx"
                            b" base=%llx fn=%u\n") in kernel,
+             "census": (b"clover r243: census t=%llu\n") in kernel,
+             "census-nodes": (b"clover r243: node %s\n") in kernel,
+             "census-hbt": (b"clover r243: hbt len=%u u32=%u\n") in kernel,
+             "census-buttons": (b"clover r243: path buttons=%s\n") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
                            b"dropped=%u comms=%u\n") in kernel,
              "tee-sync": (b"CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n") in kernel}

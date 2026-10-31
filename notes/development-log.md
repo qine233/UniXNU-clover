@@ -17913,3 +17913,206 @@ iPad7,1（J120AP，有 home 键）默认值取 `homeButtonType != 2`，于是死
 Apple SSHB 触感 home 键，**照搬 sheng 的 `buttons` 节点（`home-button-type=2`）就是如实
 描述硬件、去掉病根**，比内核伪造 leave 干净，且是 sheng 验证过能到桌面的做法。
 r240 = 这一处 ADT 改动 + 契约，冷刷后看 backboardd 是否不再死等、SpringBoard 是否往下走。
+
+## r240 实现与构建
+
+不动内核（r239 的探针原样保留，正好用来读「死等有没有消失」），只改设备树这一处。
+
+1. **ADT（`scripts/make-clover-adt.py`）**。device-tree 子节点里、`product` 之前加一个
+   `buttons` 节点，照 sheng：`compatible`/`device_type` = `buttons`、
+   `button-names` = `hold\0voldown\0volup\0`（**无 `menu`/`home` 项**）、
+   `home-button-type` = `u32(2)`。注释写明 WHY：Mi Pad 4 无 Apple SSHB 触感 home 键，
+   MobileGestalt 从本节点读 `home-button-type`、BSPlatform 透传，backboardd
+   `applyDefinitions:` 比到 2 就跳过那个死等 block。节点无条件发布（clover 恒为
+   iPad7,1 类；构建本就传 `--ipad-identity`）。
+2. **契约（`scripts/check-clover.py`）**。`check_adt` 新增 `/buttons` 断言：节点存在、
+   `home-button-type == u32(2)`、`button-names` 不含 `menu`/`home`。两处 `[payload] title`
+   断言升到 `clover r240:`。**r239 的 tee 类与 printf 断言、`verify-clover-payload.py` 的
+   `bbgrp`/`bbchain`/`bbnochain` 标记全部保留**——内核没变，下一帧要靠它们读死等是否还在。
+   `board.toml` 标题升到 `clover r240:`。
+3. **构建**。内核复用 r239 的 AMFI 产物 `round239-kernel-amfi.macho`
+   （`a6e4dacb…`，逐字节可复现，无需重编）。`./unixnu build payload` 的 `tree` 步把设备仓
+   `scripts/` 同步进 `out/clover/tree`（`tree.py:_copy_scripts`），`payload.py` 遂用新的
+   `make-clover-adt.py` 生成 ADT：**13556 → 13792 字节，+236 正是 buttons 节点**。
+   payload `round240-payload.img` sha256
+   `cb40f31f83047944b8ee4bc7f2ea633568889f84a4a373537d177c86bf73654f`（58720256 字节，
+   卷尺寸不变、ADT 增量被填充吸收）。`check-clover.py` 绿（ADT 13792、8 核、buttons 断言过），
+   `verify-clover-payload.py` EXIT=0（r217 组含 `bbgrp`/`bbchain`/`bbnochain`）。
+   冷刷 cache（唯一宿主写的分区），跑满 1800 s 死线，读 boot 29。
+
+## r240 读数（boot 29）——buttons-only 没解开死等，链原样回来
+
+冷刷 `round241` 之前的 `round240-payload.img`，跑满 1800 s，读回 boot 29。结论一句话：
+**只加 `/buttons/home-button-type=2` 不够，死等链一字不差地回来了。**
+
+1. **组状态原样**。`clover r239: bbgrp … pid=58 tid=0x340 base=121d8d840
+   b=fffffffd g=0 cnt=1 wait=1 notif=0 nh=0 nt=0`，从 t=1089 一路到 t=1805 每拍都是这一行，
+   与 boot 28 的预测值（`create_with_count(1)` 存 −4 ⇒ `b=fffffffd g=0 cnt=1 wait=1`）逐字段相同。
+2. **self→组链原样**。`clover r239: bbchain … pid=58 tid=0x340 blk=121d938a0
+   inv=100e29c44 ctl=121d8d310 grp=121d8d840`：同一个 block、同一个 controller、同一个组。
+   backboardd 仍在派发那个死等 block，`applyDefinitions:` 的 `cmp x22,#2` 仍走了 `b.ne`。
+3. **所以 `BSPlatform.homeButtonType` 没变成 2**。`/buttons` 节点确实进了镜像
+   （`home-button-type` 在 payload 字节里命中 3 次），但它压不动 homeButtonType。
+4. **根因在 `/product`**。对照 sheng（`scripts/make-sheng-adt.py:85` 的帮助文本明说
+   「/product 和 /buttons 一起描述一个**无 Home 键**的 iPad 类设备，MobileGestalt 从树上读这两处」）：
+   sheng 的 `--ipad-identity` `/product` 是 `iPad Pro (12.9-inch) (2nd generation)`，带
+   `artwork-device-subtype=2732`、`compatible-device-fallback=iPad6,7`、`thin-bezel=1`——一台
+   **没有 Home 键**的 iPad Pro。而 clover 的 `/product` 只写了 `product-name="Mi Pad 4 LTE"`、
+   `model="iPad7,1"`，**iPad7,1 是有机械 Home 键的真 iPad**，MobileGestalt 据此推出的
+   homeButtonType 自然 `!= 2`，`/buttons` 的 2 被产品身份盖过。boot 29 把这条因果钉死。
+
+## r241 实现与构建——照 sheng 补齐 /product 的无 Home 键身份
+
+按常驻要求「后续每次修 bug 都以 sheng 为参考」，r241 不再发明字段，直接复刻 sheng
+`--ipad-identity` 的整个 `/product` 块（`make-sheng-adt.py:187-197`）。内核仍不动。
+
+1. **ADT（`scripts/make-clover-adt.py`）**。`/product` 从两字段扩成 sheng 的无 Home 键
+   iPad Pro 身份：`product-name` 与 `product-description` = `iPad Pro (12.9-inch) (2nd generation)`、
+   `artwork-device-idiom=pad`、`artwork-device-subtype=u32(2732)`、`artwork-scale-factor=u32(2)`、
+   `artwork-display-gamut=sRGB`（面板按 8-bit BGRX 扫描输出，P3 会让 CoreGraphics 去填
+   WebKit 进程没有 GPU 设备的广色域表面——sheng 的原注）、`compatible-device-fallback=iPad6,7`、
+   `thin-bezel=u32(1)`；`model` 保留 `iPad7,1`。`/buttons` 节点原样保留。
+2. **契约（`scripts/check-clover.py`）**。`check_adt` 在 `/buttons` 断言后新增 `/product`
+   断言：节点存在、两个 name/description 串等于 iPad Pro 描述、三个字符串字段
+   （idiom/gamut/fallback）与三个 u32 字段（subtype/scale/thin-bezel）逐个钉值，任何一个退回
+   iPad7,1 默认都会让闸门失败而不是悄悄重新武装死等。两处 `[payload] title` 升 `clover r241:`，
+   `board.toml` 标题同步。**r239 的 tee 类/printf 断言与 verify 的 bbgrp/bbchain/bbnochain 全保留**。
+3. **构建**。内核复用 r239 `round239-kernel-amfi.macho`（`a6e4dacb…`）。
+   `./unixnu build payload --device ../UniXNU-clover --unique-chip-id 0x81ffcaaa --uefi ../mu-clover
+   --kernel … --data-ramdisk … --trust-cache …` EXIT=0。ADT **13792 → 14140 字节，+348 正是
+   /product 那批字段**。payload `round241-payload.img` sha256
+   `1bd161bfc890c27d158cd5db7438585a71121e82f963779ea83e6f83c78346fa`（58720256 字节）。
+   `check-clover.py` 绿（ADT 14140、8 核、/product 断言过），`verify-clover-payload.py` EXIT=0。
+   镜像字节里 `iPad Pro (12.9-inch)…`、`compatible-device-fallback`、`iPad6,7`、
+   `artwork-device-subtype`、`thin-bezel`、`home-button-type` 全部命中。
+   设备先在 TWRP（boot 29 死线复位落点），`adb reboot bootloader` 送进 fastboot 后冷刷 cache，
+   跑满 1800 s 死线，读 boot 30。
+
+## r241 读数（boot 30）——/product 也没解开死等，两次单节点假设都被真机否掉
+
+boot 30 的卡上日志（`round241-log-window.bin`，512 条内核环 + 64 条判据环，boot 计数 30）
+把 r241 的假设否掉了，和 boot 29 一样干脆：
+
+1. **死等组逐拍原样**。`bbgrp` 从 t=1090 到 t=1283（以及更晚）每一拍都是
+   `base=159d901d0 b=fffffffd g=0 cnt=1 wait=1 notif=0`——一次 enter、零次 leave、
+   generation 从未前进，和 boot 28/29 逐字段相同。组还是那个 `OS_dispatch_group`。
+2. **block 链原样**。`bbchain` 每一拍 `fi=0 fn=10 blk=159d97360 inv=100cb3c44 … grp=159d901d0`；
+   `inv` 减去本帧 backboardd slide 仍是宿主证明过的 invoke body `0x1000303c4`，
+   `[block+0x20]=controller`、`[controller+0x38]=` 那个被死等的组。SSHB 触感 block 照旧被派发。
+3. **屏幕没有前进**。整帧只有 1297 s 一条 `r180: client#6 pid=87`，没有任何 swap/frame/retire，
+   SpringBoard 仍停在等 backboardd 回信。报告窗最新 panic 记录还是 boot 27（环旋转把
+   boot 28/29/30 的死线记录挤掉了，和 r232/r233 记的现象一致），但内核环清楚跑到 ~1808 s。
+4. **结论**：`/buttons/home-button-type=2`（r240）与无 Home 键 `/product`（r241）**单独都不**
+   让 `BSPlatform.homeButtonType` 变成 2。`/chosen/display-scale`（r205）当年是生效的
+   （SpringBoard 过了 FBSDisplayMode 校验），证明 ADT 能到用户态——所以问题不在「ADT 没被读」，
+   而在 homeButtonType 的取值并不只由这两个节点决定。不再单字段猜。
+
+## r242 实现与构建——照 sheng 补齐剩下的 gestalt 身份（target-type + 安全元组）
+
+按常驻要求「以 sheng 为参考」，把 clover 与 sheng 的 ADT 逐节点对照后，r241 之后**仅剩的
+gestalt 身份差异**是两处，sheng 自己的注释把它们都钉到 MobileGestalt 上：
+
+- 根节点 `target-type`：sheng 发 `J120`，注释「hw.product/hw.machine/hw.target come from the
+  root 'model'/'target-type' (IODTPlatformExpert)」。clover 根节点只有 `model=iPad7,1`、
+  `compatible=J120AP`、`board-id=12`，**没有 target-type**，于是 `hw.target` 一直为空。
+- `/chosen` 安全元组：sheng 发 `certificate-production-status=0`、`effective-production-status-ap=0`、
+  `certificate-security-mode=1`、`effective-security-mode-sep=1`，注释「Security status as on a
+  dev-fused, undemoted board (tuple 0,0,1,1), as read by MobileGestalt」。clover **整组都没有**。
+
+r242 把这两处照 sheng 补齐（整组搬，不再单字段试），内核仍不动：
+
+1. **ADT（`scripts/make-clover-adt.py`）**。根节点 `model` 之后加 `target-type=J120`；
+   `/chosen` 的 `osenvironment` 之后加四个 u32 安全元组 (0,0,1,1)。`/buttons`（r240）、
+   `/product`（r241）原样保留。clover 自己的硬件 `compatible=J120AP`/`board-id=12` 不动
+   （那是本板 DT 匹配，不是 gestalt 身份；sheng 的 `xiaomi,sheng/qcom,sm8550` 是它自己的板）。
+   同时把 r241 那段「/product 是 homeButtonType 来源」的注释改成被 boot 30 否掉后的如实描述。
+2. **契约（`scripts/check-clover.py`）**。`check_adt` 在 `/product` 断言后新增：根 `target-type==J120`、
+   `/chosen` 四个安全元组逐个钉值。两处 `[payload] title` 升 `clover r242:`，`board.toml` 同步。
+   **r239 的 tee 类/printf 与 verify 的 bbgrp/bbchain/bbnochain 全保留**，下一帧靠它们读死等是否消失。
+3. **构建**。内核复用 r239 `round239-kernel-amfi.macho`（`a6e4dacb…`）。
+   `./unixnu build payload …` EXIT=0。ADT **14140 → 14344 字节，+204 正是 target-type + 安全元组**。
+   payload `round242-payload.img` sha256
+   `7d29a20e6b36022f52b9927df7e5658db0c44850a81aec583fe3e7c91be7ef7f`（58720256 字节）。
+   `check-clover.py` 绿（ADT 14344、8 核、target-type/安全元组断言过），`verify-clover-payload.py` EXIT=0。
+   镜像字节里 `target-type`、`J120`、`certificate-production-status`、`effective-security-mode-sep`、
+   `iPad Pro (12.9-inch)…`、`home-button-type` 全部命中。boot 30 死线落 TWRP 后
+   `adb reboot bootloader` 进 fastboot，冷刷 cache，跑满 1800 s 死线，读 boot 31（读数待补）。
+   若 boot 31 仍死等，下一步不再改 ADT，而是去宿主提取的共享缓存里反汇编
+   `-[BSPlatform homeButtonType]` 的真实取值路径（task #459），把来源钉死再动手。
+
+## r242 读数（boot 31）——整套身份也没能动死等，第三个 ADT 假设被真机否掉
+
+boot 31 跑满 1800 s 死线（`round242-log-window.bin`，内核环 512 行全属本 boot，
+boot 计数 31，16 report / 64 判据 / 0 probe）。判据一行不漏地回到 boot 28/29/30 的形状：
+
+1. **死等组逐拍原样**。卡住的仍是 backboardd（pid 58）主线程 `tid=0x376`：
+   `bbgrp t=1170 base=129d8f890 b=fffffffd g=0 cnt=1 wait=1 notif=0`——一次 enter、
+   零次 leave、gen 从未前进；全 boot 共 26 拍 bbgrp，判据没有一秒松动。
+2. **block 链原样**。`bbchain t=1170 fi=0 fn=10 blk=129d95ce0 inv=10040dc44 ctl=129d8f360
+   def=129d8f9c0 grp=129d8f890`——`inv` 减本 boot backboardd slide 仍是宿主钉过的
+   invoke body `0x1000303c4`；`bbustk` 里该线程的用户栈停在 `___ulock_wait`。
+3. **r242 的两处新增（根 target-type、/chosen 安全元组）与 r240 的 /buttons、r241 的
+   /product 一起在场，判决未变**。至此三个单/双节点假设（boot 29 buttons-only、
+   boot 30 product-only、boot 31 whole-identity）全部被真机否掉。
+
+按预声明的退路：**不再改 ADT**，去宿主提取的共享缓存里把 `-[BSPlatform homeButtonType]`
+的取值路径钉死。
+
+## r242 宿主反汇编（task #459）——homeButtonType 的真实来源被钉到 IODeviceTree:/buttons
+
+在 `~/clover-out/dyld-cache`（iPadOS 17.7.11 拆分缓存，54 个文件）上做的。方法学的两个坑，
+先记下来免得再踩：映射表条目是 **32 字节**（`<QQQII>` addr/size/fileOffset/maxProt/initProt），
+按 40 解会得到垃圾映射；链式指针的解码是 **vm = v & (2^36-1)**——低 36 位存的是完整未滑动
+VM 地址，0x20 的 tag 在 36 位以上。映像定位用 `decode-clover-cache-offset.py` 的
+`parse_images()`（在可执行映射里扫 0x1000 对齐的 MH_MAGIC_64）：BackBoardServices 在 .05
+vm 0x18f656000，BaseBoard 紧随其后 vm 0x18f6df000 大小 0xc5000。
+
+ObjC 走链 classlist→class→class_ro(+0x18 name/+0x20 baseMethods) 找到 `BSPlatform`
+（class vm 0x1f4893958，ro 0x1e6cc0cc0，方法表 0x18f76c110，flags 0xc000000f、17 条小表项）。
+小表项的 name 字段没能解出选择子（相对跳一 Hop 落点全跨到别的映像的 TEXT——遗留问题），
+但 types/imp 两项解得干净：整型返回的候选只有两个，`q16@0:8` 的 **0x18f6eeecc** 和
+`i16@0:8` 的 0x18f6e57a0。反汇编两者都是 dispatch_once 取值器；前者在栈上组块，
+invoke 指针 **0x18f6fe3a0**——与符号串 `___28-[BSPlatform homeButtonType]_block_invoke`
+（28 恰为 `-[BSPlatform homeButtonType]` 的长度）严丝合缝。身份就此钉死：
+
+```
+-[BSPlatform homeButtonType]  (BaseBoard IMP 0x18f6eeecc)
+  dispatch_once(token, &stackBlock{invoke=0x18f6fe3a0})
+    w0 = MGGetSInt32Answer(CFSTR("JwLB44/jEB8aFDpXQ16Tuw"), 0)   ; 混淆问题名
+    cache = (w0==2)?2 : (w0==1)?1 : 0
+    若 [self+0x20] 非空：MGCopyAnswer("oPeik/9e8lQWMszEjbPzng")
+      → 取 'ArtworkDeviceSubType' → ==0x984(2436) 则 cache=2
+```
+
+再钉 MG 那一头：在 .11（libMobileGestalt 的 TEXT）里逐串搜——混淆键 `JwLB44/…` 的规范串在
+0x1a026fcb7，明文 **`home-button-type`** 在 0x1a0274930，且它的 CFSTR（0x1e7c9c530，.33）
+在 MG 文本里只有两处引用。反汇编这两处（0x1a0207a38 与 0x1a021ba9c）：都调同一个内部助手
+0x1a02113dc，路径串硬编码 **`IODeviceTree:/buttons`**，助手做的事就是
+`IORegistryEntryFromPath → IORegistryEntryCreateCopyProperty("home-button-type") → 整数`；
+查不到条目或属性就回默认值。0x1a0207a38 把整数原样交回（HomeButtonType 的问题处理器），
+0x1a021ba9c 是 `==1` 的布尔版。也就是说：
+
+- **MGGetSInt32Answer("JwLB44/jEB8aFDpXQ16Tuw") 读的就是 ADT 的 /buttons/home-button-type**，
+  r240 的方向从一开始就是对的；
+- boot 29/30/31 死等未动只剩两种可能：`IODeviceTree:/buttons` 在平面里**根本没发布出来**
+  （或属性没跟着出来），或者 homeButtonType 拿到的其实不是这条链——r239 宿主反汇编
+  backboardd 的 `cmp x22,#2` 已证第二种不成立，剩下第一种从未被真机观测过；
+- r205 只证过 `/chosen` 可达用户态，**/chosen 之后的兄弟节点是否进了平面，八轮以来
+  没有一帧读数**。
+
+## r243 设计——内核侧一次性清点 IODeviceTree 平面
+
+不改 ADT、不改用户态，只加观测。`iokit/Kernel/IOStartIOKit.cpp` 新增
+`clover_iodt_census(secs)`：`IORegistryIterator::iterateOver(gIODTPlane)` 两层走遍平面，
+每个节点打一行 `clover r243: node <path>`（上限 40 行）；再用与 MG 完全相同的
+`IORegistryEntry::fromPath("/buttons"/"/product"/"/chosen"/"/", gIODTPlane)` 逐路径点名，
+读回 `/buttons/home-button-type`（OSData 长度与 u32 值）、`/chosen/display-scale`（阳性对照）、
+根的 `target-type`。一次性闩锁（`static volatile int ran`）保证整 boot 只打一遍。
+调用点挂在 `osfmk/kern/task.c` 的 `clover_bb_sample` 尾部——这个函数每一拍已被证明会跑，
+读数不会再是沉默。驱动侧 tee 新类 `{ "clover r243: ", "r243", 64, 0, 0, 0 }`：清点只出一次，
+64 行富余，也不会挤掉 r234 的节拍行。契约：补丁文件
+`zzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r243.patch`（28 个 z，重放排在 r239 之后、LATE 摘除排最前），
+`check-clover.py` 钉 census 的 11 个 needle 与一次性闩锁，`verify-clover-payload.py` 新增
+census/census-nodes/census-hbt/census-buttons 四项，`board.toml` 标题升 `clover r243:`。
+
+（构建与读数待补。）

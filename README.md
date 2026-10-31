@@ -35,10 +35,24 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 * 这是**用户态在等一个永远不会来的条件，不是内核阻塞**：backboardd 其余线程
   （包括四个在 port set 上收消息的）都活着。r239（boot 28）已把这条链在设备上逐字段读出：
   组的账本 `cnt=1 g=0 wait=1`（一次 enter、零次 leave），block→self→组 的指针链也命中。
-* 下一轮（r240）的打算：**照搬参考移植 sheng 的做法**——它跑同一套镜像、已到桌面，
-  靠的是 ADT 里一个 `buttons` 节点发 `home-button-type=2`。backboardd 查到 2 就打
-  「没有真正的 home 键」并**跳过**那段触感初始化，死等根本不发生。Mi Pad 4 也没有
-  Apple 的触感 home 键，发 2 是如实描述硬件、去掉病根，比在内核里伪造一次 leave 干净。
+* 怎么去掉病根——**照搬参考移植 sheng 的做法**：它跑同一套镜像、已到桌面，靠的是
+  ADT 把设备描述成一台**没有实体 home 键的 iPad**。backboardd 查到「没有 home 键」
+  就打一行日志、**跳过**那段触感初始化，死等根本不发生。Mi Pad 4 也没有 Apple 的
+  触感 home 键，如实这样描述硬件、去掉病根，比在内核里伪造一次 leave 干净。
+* 走过三次弯路：r240（boot 29）只加了一个 `buttons`/`home-button-type=2` 节点，
+  r241（boot 30）又照 sheng 把整个 `product`（产品身份）节点改成无 home 键的
+  iPad Pro，r242（boot 31）再把 sheng 独有的剩下两样——根节点 `target-type` 和
+  `/chosen` 的安全状态元组——也补齐。三次真机读数，死等**一字未变**。
+* 于是不再猜节点，直接反汇编系统缓存里的取值代码，来源钉死了：`BSPlatform` 的
+  「有没有 home 键」= MobileGestalt 的一个整数问题（混淆代号 `JwLB44/…`），而
+  MobileGestalt 对这个问题的答案就是去设备树平面查 **`IODeviceTree:/buttons` 节点的
+  `home-button-type` 属性**——r240 的方向从一开始就对。节点、属性、类型、值都已在
+  ADT 里且过了校验，可死等不动，那么唯一从没被观测过的事就是：**内核到底有没有把
+  这个节点发布进那个平面**。
+* r243 不再改任何配置，只加一个读数：内核在自己已经证明会跑的采样点上，一次性
+  把设备树平面整个点名一遍——每个节点叫什么、`/buttons` 按路径查得到查不到、
+  `home-button-type` 的值是多少，并用 r205 已证可达用户态的 `/chosen` 做阳性对照。
+  查不到，病根在内核发布环节；查得到且值对，就回头重查这条反汇编链本身。
 
 每一轮的设计、构建与真机读数（含本节的证据出处）都在
 [`notes/development-log.md`](notes/development-log.md) 里逐轮可查；
@@ -48,7 +62,7 @@ r236–r239 是把这条链读出来的四轮。
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点已钉到 `_controllerReadyGroup` 的 `dg_gen`；boot 28 读到 `cnt=1 g=0 wait=1`（一次 enter、零次 leave），block→self→组 链命中 | r240：照 sheng 在 ADT 发 `buttons`/`home-button-type=2`，让 backboardd 跳过触感初始化，看回信是否恢复 |
+| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点已钉到 `_controllerReadyGroup` 的 `dg_gen`；boot 28/29/30/31 都读到 `cnt=1 g=0 wait=1`（一次 enter、零次 leave），block→self→组 链命中；宿主反汇编把取值链钉到 `IODeviceTree:/buttons` 的 `home-button-type` | r243：内核一次性点名设备树平面（`clover r243:` 清点节点、按 MG 同款路径查 `/buttons` 并读回属性值，`/chosen` 做对照），boot 32 验证病根在发布还是在读法 |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 3），再问地址 |
 | 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |

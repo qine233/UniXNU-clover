@@ -285,6 +285,64 @@ def check_adt(errors: list) -> str:
             errors.append("/chosen/display-scale is not one 32-bit cell")
         elif struct.unpack("<I", scale)[0] != DISPLAY_SCALE:
             errors.append(f"/chosen/display-scale is not {DISPLAY_SCALE}")
+        # Round240. backboardd's -[BKButtonHapticsController applyDefinitions:] compares
+        # BSPlatform.homeButtonType against 2 and, when equal, skips the block that waits
+        # forever on _controllerReadyGroup (the boot 28 deadlock, confirmed in r239).
+        # MobileGestalt reads home-button-type from /buttons; the Mi Pad 4 has no Apple
+        # SSHB home button, so 2 is the truthful value, mirroring UniXNU-sheng.
+        buttons = root["children"].get("buttons")
+        if buttons is None:
+            errors.append("the ADT has no /buttons: BSPlatform takes the iPad7,1 home-button "
+                          "default and backboardd stalls on _controllerReadyGroup")
+        else:
+            hbt = buttons["properties"].get("home-button-type")
+            if hbt != struct.pack("<I", 2):
+                errors.append("/buttons/home-button-type is not a 4-byte 2; backboardd would "
+                              "dispatch the SSHB haptics block that waits forever")
+            names = buttons["properties"].get("button-names", b"").split(b"\0")
+            if b"menu" in names or b"home" in names:
+                errors.append("/buttons/button-names declares a home/menu button this board "
+                              "does not have")
+        # Round241/242. boot 29 (/buttons only) and boot 30 (/product only) both left the
+        # deadlock unchanged, so neither node alone is the homeButtonType source. Mirror the
+        # whole iPad Pro identity UniXNU-sheng publishes (make-sheng-adt.py:187-197), which
+        # boots this image to the desktop, and pin every field so a regression to the iPad7,1
+        # default fails the gate instead of silently re-arming the stall.
+        product = root["children"].get("product")
+        if product is None:
+            errors.append("the ADT has no /product: MobileGestalt falls back to the iPad7,1 "
+                          "home-button identity and backboardd stalls")
+        else:
+            props = product["properties"]
+            for key in ("product-name", "product-description"):
+                if props.get(key, b"").split(b"\0")[0] != b"iPad Pro (12.9-inch) (2nd generation)":
+                    errors.append(f"/product/{key} is not the home-button-less iPad Pro identity "
+                                  "sheng uses; BSPlatform keeps the mechanical home-button answer")
+            for key, value in (("artwork-device-idiom", b"pad"),
+                               ("artwork-display-gamut", b"sRGB"),
+                               ("compatible-device-fallback", b"iPad6,7")):
+                if props.get(key, b"").split(b"\0")[0] != value:
+                    errors.append(f"/product/{key} is not {value.decode()!r} (sheng's iPad Pro identity)")
+            for key, value in (("artwork-device-subtype", 2732),
+                               ("artwork-scale-factor", 2),
+                               ("thin-bezel", 1)):
+                if props.get(key) != struct.pack("<I", value):
+                    errors.append(f"/product/{key} is not a 4-byte {value} (sheng's iPad Pro identity)")
+        # Round242. The remaining gestalt inputs clover lacked versus sheng: hw.target comes
+        # from the root target-type (IODTPlatformExpert), and MobileGestalt reads the /chosen
+        # security tuple as a dev-fused, undemoted board (0,0,1,1). boot 30 still stalled with
+        # /buttons and /product set, so pin both here too -- the whole identity must match the
+        # proven-to-desktop port, not just the two nodes already tried.
+        if root["properties"].get("target-type", b"").split(b"\0")[0] != b"J120":
+            errors.append("the ADT root has no target-type J120: hw.target stays empty and "
+                          "MobileGestalt's device identity is incomplete (sheng publishes J120)")
+        for key, value in (("certificate-production-status", 0),
+                           ("effective-production-status-ap", 0),
+                           ("certificate-security-mode", 1),
+                           ("effective-security-mode-sep", 1)):
+            if chosen["properties"].get(key) != struct.pack("<I", value):
+                errors.append(f"/chosen/{key} is not a 4-byte {value} (sheng's dev-fused security "
+                              "tuple MobileGestalt reads)")
     return f"{len(data)} bytes, {len(cpus)} cores"
 
 
@@ -870,7 +928,10 @@ def check_board(errors: list) -> str:
                  "the block-chain rows would push the group state out of the ring"),
                 ('{ "clover r239: bbnochain", "r239-nochain", 96, 0, 0, 0 },',
                  "the negative chain row would be unread, so silence could not be told "
-                 "apart from a chain that was never searched")):
+                 "apart from a chain that was never searched"),
+                ('{ "clover r243: ", "r243", 64, 0, 0, 0 },',
+                 "the IODeviceTree census would land uncounted: its node rows could push "
+                 "the beat rows that prove the kernel is alive out of the ring")):
             if tee not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci gives round238's rows no tee class ({tee}): "
                               f"{why}")
@@ -1381,6 +1442,41 @@ def check_board(errors: list) -> str:
                     r239_text.find('"clover r239: bbnochain'):
                 errors.append(f"{r239_patch.name} prints the negative row before the positive one: "
                               "a sample that found the chain would answer it had found nothing")
+
+        # Round243. The host disassembly pinned -[BSPlatform homeButtonType] to
+        # MGGetSInt32Answer("JwLB44/jEB8aFDpXQ16Tuw") whose libMobileGestalt handler
+        # resolves IORegistryEntryFromPath("IODeviceTree:/buttons") and copies its
+        # "home-button-type" property; missing entry or property answers 0, and 0 is
+        # what sends backboardd into the SSHB wait that never drains. Three ADT rounds
+        # have not moved the wait, so the plane gets observed rather than assumed --
+        # and the census has to run from the beat that is already proven to fire.
+        r243_name = "zzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r243.patch"
+        r243_patch = next((base / "patches/xnu-clover" / r243_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r243_name).is_file()), None)
+        if r243_patch is None:
+            errors.append(f"patches/xnu-clover/{r243_name} is missing: whether /buttons is "
+                          "published at all would again be argued from the ADT bytes instead "
+                          "of read off the live plane")
+        else:
+            r243_text = r243_patch.read_text()
+            for needle in ('clover_iodt_census(unsigned long long secs)',
+                           'IORegistryIterator::iterateOver(gIODTPlane, 0)',
+                           'IORegistryEntry::fromPath("/buttons", gIODTPlane)',
+                           'IORegistryEntry::fromPath("/chosen", gIODTPlane)',
+                           'e->getProperty("home-button-type")',
+                           'root->getProperty("target-type")',
+                           '"clover r243: census t=%llu',
+                           '"clover r243: node %s',
+                           '"clover r243: hbt len=%u u32=%u',
+                           '"clover r243: path buttons=%s',
+                           'clover_iodt_census((unsigned long long) secs);'):
+                if needle not in r243_text:
+                    errors.append(f"{r243_patch.name} lacks {needle[:56]!r}: the census would "
+                                  "not walk the plane, or would not name what it found")
+            if r243_text.count("static volatile int ran = 0;") != 1:
+                errors.append(f"{r243_patch.name} is not once-only: a census that reprints every "
+                              "beat would spend its whole budget saying the same thing")
 
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
@@ -2421,8 +2517,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r239:"):
-        errors.append('[payload] title is not "clover r239: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r243:"):
+        errors.append('[payload] title is not "clover r243: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3474,8 +3570,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r239:"):
-        errors.append('[payload] title is not "clover r239: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r243:"):
+        errors.append('[payload] title is not "clover r243: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

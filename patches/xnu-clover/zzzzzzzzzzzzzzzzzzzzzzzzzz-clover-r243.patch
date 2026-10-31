@@ -1,0 +1,150 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -230,4 +230,123 @@
+ 		chosen->release();
+ 	}
+ }
++
++/*
++ * Round243. Which value BSPlatform.homeButtonType hands backboardd is decided
++ * by two reads in libMobileGestalt: the question the host disassembly pinned
++ * resolves IORegistryEntryFromPath("IODeviceTree:/buttons") and copies that
++ * entry's "home-button-type" property, and either read coming back empty
++ * answers the default 0 -- the number that sends backboardd into the SSHB
++ * haptics block whose _controllerReadyGroup never drains. Three rounds of ADT
++ * edits have not moved the wait, so the plane's real contents get observed:
++ * the walk names every node fromPath sees, the four property reads answer the
++ * four questions the block turns on, and /chosen is the positive control --
++ * r205 proved its display-scale reaches userland.
++ */
++extern "C" void
++clover_iodt_census(unsigned long long secs)
++{
++	static volatile int ran = 0;
++	IORegistryIterator  *it, *jt;
++	IORegistryEntry     *root, *child, *grand;
++	OSData              *d;
++	OSObject            *o;
++	char                path[72];
++	char                next[96];
++	int                 seen = 0;
++
++	if (ran) {
++		return;
++	}
++	ran = 1;
++	if (gIODTPlane == NULL) {
++		printf("clover r243: census t=%llu no-plane\n", secs);
++		return;
++	}
++	printf("clover r243: census t=%llu\n", secs);
++
++	it = IORegistryIterator::iterateOver(gIODTPlane, 0);
++	if (it == NULL) {
++		printf("clover r243: census no-iterator\n");
++		return;
++	}
++	while ((child = it->getNextObjectFlat()) != NULL) {
++		if (seen < 40) {
++			snprintf(path, sizeof(path), "/%s", child->getName() ? child->getName() : "?");
++			printf("clover r243: node %s\n", path);
++		}
++		seen++;
++		jt = IORegistryIterator::iterateOver(child, gIODTPlane, 0);
++		if (jt == NULL) {
++			continue;
++		}
++		while ((grand = jt->getNextObjectFlat()) != NULL) {
++			if (seen < 40) {
++				snprintf(next, sizeof(next), "%s/%s", path,
++				    grand->getName() ? grand->getName() : "?");
++				printf("clover r243: node %s\n", next);
++			}
++			seen++;
++		}
++		jt->release();
++	}
++	it->release();
++
++	/*
++	 * The decisive two. /buttons existing at all says whether the node the
++	 * MG handler names is reachable by path; the property value says what
++	 * MG would hand BSPlatform. 2 skips the SSHB block, anything else is
++	 * the dead wait.
++	 */
++	{
++		IORegistryEntry *e = IORegistryEntry::fromPath("/buttons", gIODTPlane);
++		printf("clover r243: path buttons=%s\n",
++		    e == NULL ? "missing" : (e->getName() ? e->getName() : "present"));
++		if (e != NULL) {
++			o = e->getProperty("home-button-type");
++			d = OSDynamicCast(OSData, o);
++			if (d != NULL) {
++				const unsigned char *b = (const unsigned char *) d->getBytesNoCopy();
++				unsigned int v = (d->getLength() >= 4 && b != NULL) ?
++				    (unsigned int)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) : 0;
++				printf("clover r243: hbt len=%u u32=%u\n",
++				    (unsigned int) d->getLength(), v);
++			} else {
++				printf("clover r243: hbt absent\n");
++			}
++			e->release();
++		}
++	}
++	{
++		IORegistryEntry *e = IORegistryEntry::fromPath("/product", gIODTPlane);
++		printf("clover r243: path product=%s\n", e == NULL ? "missing" : "present");
++		if (e != NULL) {
++			e->release();
++		}
++	}
++	{
++		IORegistryEntry *e = IORegistryEntry::fromPath("/chosen", gIODTPlane);
++		printf("clover r243: path chosen=%s\n", e == NULL ? "missing" : "present");
++		if (e != NULL) {
++			o = e->getProperty("display-scale");
++			d = OSDynamicCast(OSData, o);
++			printf("clover r243: scale=%s\n", d != NULL ? "data" : (o != NULL ? "other" : "absent"));
++			e->release();
++		}
++	}
++	root = IORegistryEntry::fromPath("/", gIODTPlane);
++	if (root != NULL) {
++		o = root->getProperty("target-type");
++		d = OSDynamicCast(OSData, o);
++		if (d != NULL) {
++			printf("clover r243: target=%.16s\n",
++			    (const char *) d->getBytesNoCopy());
++		} else {
++			printf("clover r243: target absent\n");
++		}
++		root->release();
++	}
++	printf("clover r243: census done nodes=%d\n", seen);
++}
+ }; /* extern "C" */
++
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12228,6 +12228,21 @@
+ 			}
+ 		}
+ 	}
++	/*
++	 * Round243. The host disassembly pinned -[BSPlatform homeButtonType] to
++	 * MGGetSInt32Answer("JwLB44/jEB8aFDpXQ16Tuw"), whose libMobileGestalt
++	 * handler resolves IORegistryEntryFromPath("IODeviceTree:/buttons") and
++	 * copies its "home-button-type" property; a missing entry or property
++	 * answers the default 0, and 0 is exactly the value that sends
++	 * backboardd into the SSHB haptics block that never drains. r240/r241/
++	 * r242 all put those nodes in the ADT and the wait has not moved by a
++	 * byte, so what the kernel really published into the IODeviceTree plane
++	 * gets observed rather than assumed -- once, from this beat.
++	 */
++	{
++		extern void clover_iodt_census(unsigned long long secs);
++		clover_iodt_census((unsigned long long) secs);
++	}
+ 	task_deallocate(task);
+ }
+ /*

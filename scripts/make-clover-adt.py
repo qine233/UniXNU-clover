@@ -226,6 +226,16 @@ def generate_adt(args) -> bytes:
         # behaviour changes this round has no way to attribute.
         *([("ephemeral-storage", u32(1))] if args.packed_data_ramdisk else []),
         ("osenvironment", cstr("main")),
+        # Round242. boot 30 proved /product alone does not move BSPlatform.homeButtonType
+        # either: the SSHB haptics block still waited on _controllerReadyGroup. The remaining
+        # gestalt inputs clover lacked versus UniXNU-sheng (which boots this image to the
+        # desktop) are this security tuple and the root target-type. MobileGestalt reads the
+        # tuple as a dev-fused, undemoted board (0,0,1,1); sheng's note records mobileactivationd
+        # then takes its native Hactivation branch. Mirrored verbatim from make-sheng-adt.py:144.
+        ("certificate-production-status", u32(0)),
+        ("effective-production-status-ap", u32(0)),
+        ("certificate-security-mode", u32(1)),
+        ("effective-security-mode-sep", u32(1)),
         ("darwinboot-memory-size", u64(args.owned_memory_size)),
         *root_matching,
         ("dram-base", u64(args.dram_base)),
@@ -264,7 +274,39 @@ def generate_adt(args) -> bytes:
     # sleep-disabled: suspend/resume is not implemented on this port.
     defaults = node("defaults", [("sleep-disabled", u32(1))])
     options = node("options")
-    product = node("product", [("product-name", cstr("Mi Pad 4 LTE")), ("model", cstr("iPad7,1"))])
+    # Round241/242. Mirror UniXNU-sheng's --ipad-identity /product block, which boots this
+    # same image to the desktop: a home-button-less iPad Pro (12.9-inch) identity
+    # (artwork-device-subtype 2732, compatible-device-fallback iPad6,7, thin-bezel 1).
+    # boot 29 (/buttons only) and boot 30 (/product only) both left the SSHB haptics block
+    # waiting on _controllerReadyGroup, so neither node alone is the homeButtonType source;
+    # r242 adds the remaining gestalt inputs sheng carries -- the root target-type and the
+    # /chosen security tuple -- so the whole identity matches the proven-to-desktop port.
+    product = node("product", [
+        ("product-name", cstr("iPad Pro (12.9-inch) (2nd generation)")),
+        ("model", cstr("iPad7,1")),
+        ("product-description", cstr("iPad Pro (12.9-inch) (2nd generation)")),
+        ("artwork-device-idiom", cstr("pad")),
+        ("artwork-device-subtype", u32(2732)),
+        ("artwork-scale-factor", u32(2)),
+        # sRGB: the panel scans out 8-bit BGRX; P3 would make CoreGraphics fill wide-color
+        # surfaces on a GPU device the WebKit processes do not have here (sheng's note).
+        ("artwork-display-gamut", cstr("sRGB")),
+        ("compatible-device-fallback", cstr("iPad6,7")),
+        ("thin-bezel", u32(1)),
+    ])
+
+    # The Mi Pad 4 has no Apple SSHB haptics home button. MobileGestalt reads
+    # home-button-type from this node and BSPlatform passes it through; backboardd's
+    # applyDefinitions: compares it against 2 and, when equal, logs "not configuring
+    # SSHB" and returns without dispatching the block that waits forever on
+    # _controllerReadyGroup (the boot 28 deadlock). 2 is the truthful non-mechanical
+    # answer, mirroring UniXNU-sheng, which boots this same image to the desktop.
+    buttons = node("buttons", [
+        ("compatible", cstr("buttons")),
+        ("device_type", cstr("buttons")),
+        ("button-names", b"hold\0voldown\0volup\0"),
+        ("home-button-type", u32(2)),
+    ])
 
     arm_io = node("arm-io", [
         ("device_type", cstr("arm-io")),
@@ -278,11 +320,15 @@ def generate_adt(args) -> bytes:
     # in /chosen, /arm-io and the CPU nodes.
     return node("device-tree", [
         ("model", cstr("iPad7,1")),
+        # Round242. hw.target comes from the root target-type (IODTPlatformExpert);
+        # sheng publishes J120 here and clover had none, so hw.target stayed empty.
+        # libMobileGestalt reads hw.product/hw.target together for the device identity.
+        ("target-type", cstr("J120")),
         ("compatible", cstr("J120AP")),
         ("board-id", u32(12)),
         ("#address-cells", u32(2)),
         ("#size-cells", u32(2)),
-    ], [chosen, cpus, psci, defaults, options, product, arm_io])
+    ], [chosen, cpus, psci, defaults, options, buttons, product, arm_io])
 
 
 def main() -> int:

@@ -753,6 +753,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r239: bbgrp", "r239-grp", 96, 0, 0, 0 },
   { "clover r239: bbchain", "r239-chain", 96, 0, 0, 0 },
   { "clover r239: bbnochain", "r239-nochain", 96, 0, 0, 0 },
+  // Round243 prints the IODeviceTree plane once -- every node name the plane
+  // iterator sees plus the four properties the homeButtonType question turns on
+  // -- from the first printed backboardd sample. One-shot by a static guard,
+  // so one beat's worth of lines: the whole census cannot exceed 64 records.
+  { "clover r243: ", "r243", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
