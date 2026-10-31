@@ -18143,3 +18143,77 @@ boot 32 跑满 1800 s 死线（`round242`→`round243-log-window.bin`，内核�
 就等于回到看不见）。`board.toml` 标题升 `clover r244:`。判决规则不变：
 `path buttons=missing` ⇒ 修平面发布（`IODeviceTreeAlloc`/MakeReferenceTable 一侧，照 sheng）；
 `buttons` 在且 `hbt len=4 u32=2` 而 bbgrp 仍在 ⇒ 回头解小方法表 name 字段、重证 getter 身份。
+
+## r244 读数（boot 33）——平面是完整的、值就是 2；死等照旧，判决落到「getter 链之外」
+
+boot 33 跑满 1800 s 死线（`round244-log-window.bin`，内核环窗口 1042.7–1813.0 s、boot 计数 33）。
+census 这次全数回到宿主：
+
+1. **平面完整**。`node /J120AP`、`/J120AP/chosen`、`/cpus`、`/psci`、`/defaults`、`/buttons`、
+   `/product`，`census done nodes=9`（根 + 六子 + intc）。
+2. **MG 问的就是这个值**。`path buttons=` 打的是命中节点的注册名，`hbt len=4 u32=2` 只有在
+   `fromPath("/buttons")` 命中、且 `getProperty("home-button-type")` 是 ≥4 字节的 OSData 时才会
+   印出——也就是说内核里「按 MG 那条路径」拿到的就是 2。`path product=present`、
+   `path chosen=present`、`scale=data`、`target=J120`。
+3. **死等一字未动**。`bbgrp t=1153 pid=58 tid=0x3ba base=137d90840 b=fffffffd g=0 cnt=1 wait=1`
+   与 `t=1180`/`t=1204` 同形；`killsig pid=27 comm=SpringBoard … comm=backboardd`。
+   配套细节：等待字在 `base+0x34`（`bbobj a=137d90874 val=100000002`），块链 `blk=137d969a0
+   inv=1007d4c44 ctl=137d90310 grp=137d90840`。
+
+按 r244 预登记的判决规则，这一支落到「回头重解 getter」。
+
+## r244/r245 宿主复核——getter 链钉死，r242 的两处「引用点」是基址算错的产物
+
+**backboardd 侧（这次是真凭据）**：`/private/tmp/iosroot2/usr/libexec/backboardd`（OS 卷是
+`044-76040-038.dmg`，不是 044-76034-038）。`applyDefinitions:` 前两条 `bl` 都落在标准
+`objc_msgSend` 桩上，桩体 `adrp x1,<selref>; ldr x1,[..]; adrp x16,<stub pool>; ldr x16; br x16`，
+两个 selref 用 `dyld_info -fixups` 解出：
+
+- `0x1000a52a0` → selref `__objc_selrefs 0x1001073D0` → rebase `0x1000C577B` → 串 **`sharedInstance`**
+- `0x10009e980` → selref `__objc_selrefs 0x1001053C0` → rebase `0x1000BFB32` → 串 **`homeButtonType`**
+- 调用方的类引用 `0x1000EEAD0` → bind **`BaseBoard/_OBJC_CLASS_$_BSPlatform`**
+
+所以 `cmp x22,#2` 比的确实是 `[[BSPlatform sharedInstance] homeButtonType]`。r242 的推断成立。
+
+**libMobileGestalt 侧（更正 r242）**：`.11` 片是 Mach-O 分片，片内偏移→VM 需要一个图像基址，
+r242 用错基址把 `0x1a02113dc` 当成「读 /buttons 的 helper」，那段反汇编是错位的产物。用能自证的
+相对解码（capstone 以片内偏移当 PC，页增量不受基址影响）重做后：
+
+- 真正读 `/buttons` 的函数有四处调用点（片内 `0x523a4c`、`0x53321c`、`0x537aac`、`0x53b0c0`），
+  形态都是 `bl <helper>`，参数 `x0="IODeviceTree:/buttons"`、`x1=<CFString>`、`w2=0`；
+  helper 体首是 `sub sp,sp,#0x30` 后一次性读属性（`w1,#3` 即 4 字节）。
+- **`home-button-type` 这个属性名在 `.11` 里没有直接代码引用**：它只在字符串表里
+  （`0x590a30`，紧邻 `main-screen-scale`、`force-supported`、`model-config`，就是 MG 题库那一段）。
+  属性名是经 CFString 结构间接传入的，CFString 在另一个数据片，基址没解出来 → 这条静态线到此为止。
+- 还观察到 `MGIOKitSupport.c` 的断言串与一处闸门：`bl <cached sysctl>`（结果缓存在数据单元，
+  `-1` 作未初始化哨兵重查），多个题库处理器以 `cmp w0,#4/#1/#3` 决定要不要走 DT 查询。
+  **闸门名与判据没能在宿主钉死**——这是 r245 换成真机测量的原因。
+
+**内核侧对照**：XNU 的 `IORegistryEntry::fromPath` 对 `"/x"` 的处理是
+`gRegistryRoot->getChildEntry(plane)` 再逐段走，别名只在路径不以 `/` 开头时生效；用户态
+`IORegistryEntryFromPath` 传的就是同一串、同一平面，所以「内核能查到 /buttons」和「用户态能查到」
+不是两条世界。差别只能在**值如何被解读**（CFData/CFNumber 的类型判定、sysctl 闸门）或**根本没发起查询**。
+
+## r245 设计——把 census 变成判决器，不再猜节点
+
+`zzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r245.patch`（30 个 z，叠在 r244 上、LATE 摘除列最前）。
+仍是一次性点名（`ran` 闩锁 + `secs>=1500` 门），加两行新读数：
+
+1. `model=%.16s`：平面根的 `model`。`make-sheng-adt.py:124` 写明 `hw.product/hw.machine/hw.target`
+   来自根 `model`/`target-type`，且 **libMobileGestalt 先用 `hw.product` 前缀匹配
+   iPhone/iPod/iPad 才认这台设备**；clover 的 ADT 根 `model` 已是 `iPad7,1`（make-clover-adt.py:322），
+   所以这一行是给那条前提上保险，不是新的猜测。
+2. `svc total=%d button-family=%d` + 至多 12 行 `svc <name>`：扫 **IOService 平面**，凡名字含
+   `utton`/`HID`/`aptic`/`SSB`/`Resolver` 的都算命中。依据是 backboardd 自己的串
+   `not configuring SSHB because we don't have a real home button` 与
+   `/System/Library/PrivateFrameworks/Haptics.framework/Haptics`：那条 `leave` 是按键解析器
+   拿到「控制器就绪」后补的，如果这台板子上一个能发这个通知的驱动都没注册，通知就永远不来——
+   与 ADT 里写几个字节无关，也就解释了 boot 29/30/31/33 的读数一字不变。
+
+判决规则（写下，读数回来直接对号）：
+- `button-family=0` ⇒ 病根是「板上没有按键/HID 服务的提供者」，走 r245 之后的最后一刀：
+  内核替那条永远不会发生的 `leave` 完成一次（`base+0x34` 的 dg_state 低 32 位 +4，再唤醒
+  等待 `0x137d90874` 的线程），一次、有界、只针对 `cnt=1 wait=1 g=0` 这个签名。
+- `button-family>0` ⇒ 服务在，问题在 MG 的取值/闸门；下一轮改为解 backboardd 里 BSPlatform
+  的 `homeButtonType` 缓存槽（r242 记的 `0x1f48945e8`，按 kslide 定位），直接读它算出的数。
+- `model` 不是 `iPad7,1` ⇒ ADT 生成链有漂移，先修 ADT。

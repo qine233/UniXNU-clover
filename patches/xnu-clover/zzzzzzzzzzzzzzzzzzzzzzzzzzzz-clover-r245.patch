@@ -1,0 +1,78 @@
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -255,17 +255,6 @@
+ 	char                next[96];
+ 	int                 seen = 0;
+ 
+-	/*
+-	 * Round244. Boot 32 proved the census runs -- and proved the ring rotates
+-	 * it away: the first full beat sits hours before the 512-record window the
+-	 * panic drain reads back, so a print that early is a print nobody sees.
+-	 * The census now fires inside the window: once the boot is past 1500 s of
+-	 * the 1800 s deadline, its ~30 rows are younger than the oldest record the
+-	 * drain can still reach.
+-	 */
+-	if (secs < 1500) {
+-		return;
+-	}
+ 	if (ran) {
+ 		return;
+ 	}
+@@ -355,8 +344,56 @@
+ 		} else {
+ 			printf("clover r243: target absent\n");
+ 		}
++		/*
++		 * Round245. hw.product is the root model (IODTPlatformExpert), and
++		 * libMobileGestalt prefix-matches it against iPhone/iPod/iPad before it
++		 * answers any identity question. sheng's tree carries iPad7,1 here too.
++		 */
++		o = root->getProperty("model");
++		d = OSDynamicCast(OSData, o);
++		if (d != NULL) {
++			printf("clover r243: model=%.16s\n",
++			    (const char *) d->getBytesNoCopy());
++		} else {
++			printf("clover r243: model absent\n");
++		}
+ 		root->release();
+ 	}
++	/*
++	 * Round245. The other half of the question: the ready notification the
++	 * blocked thread waits for is issued by whatever resolves the button, so the
++	 * service plane gets walked for the classes that could own it. Names longer
++	 * than 20 characters are counted, not printed, to keep the rows short.
++	 */
++	{
++		extern const IORegistryPlane *gIOServicePlane;
++		IORegistryIterator  *si;
++		IORegistryEntry     *svc;
++		int                  total = 0, matched = 0;
++
++		si = IORegistryIterator::iterateOver(gIOServicePlane, 0);
++		if (si == NULL) {
++			printf("clover r243: svc no-iterator\n");
++		} else {
++			while ((svc = si->getNextObjectFlat()) != NULL) {
++				const char *nm = svc->getName();
++				total++;
++				if (nm == NULL) {
++					continue;
++				}
++				if (strstr(nm, "utton") != NULL || strstr(nm, "HID") != NULL ||
++				    strstr(nm, "aptic") != NULL || strstr(nm, "SSB") != NULL ||
++				    strstr(nm, "Resolver") != NULL) {
++					matched++;
++					if (matched <= 12) {
++						printf("clover r243: svc %.24s\n", nm);
++					}
++				}
++			}
++			si->release();
++			printf("clover r243: svc total=%d button-family=%d\n", total, matched);
++		}
++	}
+ 	printf("clover r243: census done nodes=%d\n", seen);
+ }
+ }; /* extern "C" */
