@@ -18318,3 +18318,56 @@ boot 34（`~/clover-out/round245-log-window.bin`，deadline 1800 s 到点，卡�
     `offline-hid-home` + 上游 `drivers/NativeHidInput`，其 report 2 bit 0 就是 Consumer/Menu(Home)）。
   - `svc total` 仍为 1 且 `stopped=0` ⇒ 服务平面真的只有一个条目，说明 IOKit 的服务发布整条链
     没跑起来；那是一条比按键更靠前的线索，先查它。
+
+### 排期注记：sheng 的 HID 按键路在本板可行（宿主已证，未上机）
+
+`~/UniXNU/scripts/build-native-hid-input.py` 是 NativeHidInput 的 ABI 闸门：它要一份「参照候选」
+（别板 prelink 产物）来证明 IOHIDFamily 的原文没被动过，再拿编译出的 vtable 逐槽对齐。**本板不需要
+借那份文件**——`./unixnu build kernel` 产出的 `out/clover/kernel/kernel.json` 本身就带 `extents`、
+`original_executable_sha256` 与 `candidate_sha256`，且其中
+`com.apple.iokit.IOHIDFamily` 的 `__TEXT` 哈希与脚本里钉死的 `HID_TEXT_SHA`
+`7e4c5104…0406e86b72` **逐字相等**（同一份 21H461 kernelcache、同一 slide；IOHIDFamily 的
+`__TEXT_EXEC` _extent 在 `0xfffffff004acb000`，脚本硬编码的构造器 `0xfffffff004ad94f8` 正落在里面）。
+把 `kernel.macho`/`kernel.json` 作为 `native-owner-ufs-cpu-desktop-clover-candidate.{macho,json}`
+放进 `build/native-prelink/` 后实跑：
+
+```
+NativeHidInput: -Werror build and actual ARM64/iOS 17 object audit passed
+PASS: original HID instruction identity, base imports, call boundaries and exact owned vtable
+```
+
+接线点也就此明确：`board.toml [kernel] archives` 加 `build-native-hid-input.py`，档案进
+`CONFIG_XNU_EXTRA_LD_ARCHIVES`，再照 sheng 的 `package/HidInputProbe.cpp` 写一份 clover 版
+（`offline-hid-input=1` → 加载 IOHIDFamily/IOHIDEventDriver → 等 `IOHIDResource` →
+`native_hid_input_allocate()` → `init/attach/start`），从 CloverPMGR 调用。
+`drivers/NativeHidInput.cpp:22` 写明 report 2 的 bit 0 是 Consumer/Menu(Home)，即 Home 键本体。
+是否要走这一步，由 boot 35 的 `svc total=/button-family=` 决定，不提前上机。
+
+## boot 35 没有回来：是我这一轮的仪器吃掉了板子（r247）
+
+boot 35（r246）刷写成功、开机后 **既没落 TWRP 也没回 fastboot**，宿主侧 2220 s 内 USB 上一个设备都
+没出现——不是「读数没排干」，是**死线 panic 与复位根本没发生**。原因在这轮新写的那一行：
+
+```c
+while ((svc = si->getNextObjectRecursive()) != NULL) { ... svc->release(); }
+```
+
+`IORegistryEntry.h:991-1000` 的契约写得很清楚：`getNextObject`/`getNextObjectFlat` 交出的条目由
+**迭代器自己 retain 着**（`IORegistryIterator::getNextObjectFlat` 里 `next->retain()`，并在下一次
+调用时对上一个 `where->current->release()`，`IORegistryEntry.cpp:2496-2508`），
+注释原话是 **“The entry returned is retained while the iterator is pointing at it … The caller
+should not release it.”**。我按普通 `copy` 语义多减了一次引用，注册表条目在遍历中途被提前释放，
+平面被踩——于是采样节拍上的 census 把跑到 t=1500 的那次启动整个弄死了，看门狗也就没机会 panic。
+
+r247 做两件事，都不加新读数：
+1. **删掉那次 `svc->release()`**（只保留 `si->release()`，迭代器才是我们该放的）；
+2. `kCloverSvcCap` 从 8000 降到 **2000**。整平面遍历是本板第一次做，节拍上下文里每条目都要过一次
+   注册表锁；「少读一段」只丢一个日志窗，「读挂」丢一次开机（还要人手重启才能救回来）。
+   `stopped=` 会在撞到上限时置 1，所以短计数不会被误读成空平面。
+
+顺带两个流程教训（都已进 memory）：
+- **补丁基线必须是「真重放态」**。这次我先拿 `/tmp/r246-final.cpp` 当基线，而它其实是被我上一轮手工
+  编辑污染过的版本——生成的 r247 补丁把 r244 的 `if (secs < 1500) return;` 闸门整块删掉了，
+  而且自己的 round-trip 校验还是干净的。可靠做法是**只重放到上一轮**（跳过 r247 自己）取基线：
+  `for PATCH ...; case *clover-r247.patch) continue;;` → 那份文件才是 r246 的真后状态。
+- **别在块注释里写 `getNextObject*/`**：`*/` 会提前闭合注释。改成 `getNextObject() and …`。

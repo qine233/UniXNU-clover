@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r246: boot 34 kept the ADT verdict (model=iPad7,1, /buttons resolves, home-button-type len=4 u32=2) and the wait stood (bbgrp cnt=1 g=0 wait=1) -- and the service count turned out to be the instrument, not the board: a one-level walk of the IOService plane always returns 1, because its root has one child, the platform expert. The walk is now recursive over the whole plane with its bound reported, and the census adds the one read userland actually makes -- getPlane(\"IODeviceTree\") by name, the path IOKitServer takes when a caller hands it a null plane -- because the branch backboardd takes says homeButtonType != 2, while the kernel reads 2, so the name is the part of the chain that has never been looked at"
+title = "clover r247: boot 35 never landed and the reason is this instrument's own line -- r246's whole-plane service walk called svc->release() on every entry, while IORegistryIterator documents that reference as the iterator's (IORegistryEntry.h:993, the caller should not release it), so a census that drops registry refcounts early ate the boot that ran it; the release is gone, the recursive walk and the by-name plane read (getPlane(\"IODeviceTree\") -> /buttons -> home-button-type) stay, and boot 36 is the first reading either of them has ever produced"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

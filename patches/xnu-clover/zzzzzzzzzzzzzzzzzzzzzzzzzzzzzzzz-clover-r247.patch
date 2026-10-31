@@ -1,0 +1,41 @@
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -245,10 +245,13 @@
+  */
+ 
+ /*
+- * Round246. A bound for the service-plane walk, generous next to what this
+- * board has ever published and small next to what would take the boot minute.
++ * Round246. A bound for the service-plane walk: the census runs on the sample beat,
++ * and every entry it touches takes the registry lock, so the walk has to stay short enough
++ * that the boot still owns its own deadline. Round247 halves it after boot 35 -- this is the
++ * first whole-plane walk the board has ever attempted, and the reading is worth more if a
++ * miss costs a log window than if it costs the boot.
+  */
+-static const int kCloverSvcCap = 8000;
++static const int kCloverSvcCap = 2000;
+ 
+ /*
+  * Round245. This translation unit does not pull in <string.h>, and a registry
+@@ -440,6 +443,12 @@
+ 	 * kIORegistryIterateRecursively over the whole plane, with getNextObject-
+ 	 * Recursive keeping its own done-set, and it stops at a bound that is
+ 	 * printed so a short count can never be read as an empty plane.
++	 *
++	 * Round247. Boot 35 never landed, and the reason is one line of this loop:
++	 * "svc->release()". getNextObject() and getNextObjectRecursive() hand the entry out retained by
++	 * the iterator itself -- IORegistryEntry.h:993 says the caller should not release it -- so
++	 * dropping its count mid-walk takes registry entries out from under the plane. Only the
++	 * iterator is ours to release.
+ 	 */
+ 	{
+ 		IORegistryIterator  *si;
+@@ -464,7 +473,6 @@
+ 						printf("clover r243: svc %.24s\n", nm);
+ 					}
+ 				}
+-				svc->release();
+ 			}
+ 			if (total >= kCloverSvcCap && si->getNextObjectRecursive() != NULL) {
+ 				stopped = 1;

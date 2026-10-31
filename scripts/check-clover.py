@@ -1546,7 +1546,7 @@ def check_board(errors: list) -> str:
                           "still never have been looked at")
         else:
             r246_text = r246_patch.read_text()
-            for needle in ('kCloverSvcCap = 8000',
+            for needle in ('kCloverSvcCap',
                            'kIORegistryIterateRecursively',
                            'getNextObjectRecursive()',
                            '"clover r243: svc total=%d stopped=%d button-family=%d',
@@ -1563,6 +1563,36 @@ def check_board(errors: list) -> str:
                                     if line.startswith("+")):
                     errors.append(f"{r246_patch.name} still carries {stale!r}: the one-level walk is "
                                   "the instrument that reported total=1 on a plane that has services")
+
+        # Round247. Boot 35 never came back: r246's walk released every entry it was handed, and
+        # IORegistryIterator documents that reference as the iterator's (IORegistryEntry.h:993,
+        # "The caller should not release it"). Early refcount loss takes registry entries out from
+        # under the plane, which is how a census ends up eating the boot that runs it.
+        r247_name = "z" * 32 + "-clover-r247.patch"
+        r247_patch = next((base / "patches/xnu-clover" / r247_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r247_name).is_file()), None)
+        if r247_patch is None:
+            errors.append(f"patches/xnu-clover/{r247_name} is missing: the service walk would keep "
+                          "releasing entries the iterator still points at, which is what stopped "
+                          "boot 35 from ever landing")
+        else:
+            r247_added = "".join(line for line in r247_patch.read_text().splitlines(True)
+                                 if line.startswith("+"))
+            r247_removed = "".join(line for line in r247_patch.read_text().splitlines(True)
+                                    if line.startswith("-"))
+            if "svc->release();" in r247_added:
+                errors.append(f"{r247_patch.name} adds a release of the iterated entry back: the "
+                              "iterator owns that reference and releasing it early corrupts the "
+                              "registry the census is reading")
+            if "svc->release();" not in r247_removed:
+                errors.append(f"{r247_patch.name} does not remove the iterated entry's release: "
+                              "boot 35's missing landing was that one line")
+            for needle in ('IORegistryEntry.h:993', 'iterator is ours to release',
+                           'kCloverSvcCap = 2000'):
+                if needle not in r247_added:
+                    errors.append(f"{r247_patch.name} lacks {needle!r}: the next reader would have "
+                                  "nothing saying why this loop must not release")
 
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
@@ -2603,8 +2633,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r246:"):
-        errors.append('[payload] title is not "clover r246: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r247:"):
+        errors.append('[payload] title is not "clover r247: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3656,8 +3686,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r246:"):
-        errors.append('[payload] title is not "clover r246: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r247:"):
+        errors.append('[payload] title is not "clover r247: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
