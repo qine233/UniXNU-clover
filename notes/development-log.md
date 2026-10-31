@@ -18241,3 +18241,34 @@ r242 用错基址把 `0x1a02113dc` 当成「读 /buttons 的 helper」，那段�
 - boot 34：`run-clover-unattended.sh --wait 2100 --out ~/clover-out/round245-log-window.bin
   --flash-cache ~/clover-out/round245-payload.img --boot-after-flash`。读数回来直接对
   上面写下的两条判决分支走，不再增设假设。
+
+### r245 宿主补充读数：`cmp x22,#2` 的两侧到底谁在等（推翻 r240 的方向）
+
+把 backboardd 里那一支重新逐条反汇编（`/tmp/bbd_stubs.py`，`otool -l` 取 `__text`
+va 0x100004744/fo 0x4744，capstone 解桩里的 `adrp x1` 选择器页）：
+
+```
+0x10002fe74  bl sharedInstance 桩 0x1000a52a0
+0x10002fe80  bl homeButtonType 桩 0x10009e980
+0x10002fe84  mov x22, x0                 ; x22 = homeButtonType
+0x10002fe8c  cmp x22, #2
+0x10002fe90  b.ne 0x10002fedc            ; != 2 → 投 block
+```
+
+- **== 2 那侧（0x10002fe94–0x10002fed8）**：取一个对象、问一个布尔、`cbz` 决定是否打
+  `__oslogstring @0x1000d54e8`——那条串原话就是
+  `not configuring SSHB because we don't have a real home button`，然后 release、直接
+  走 epilogue 返回。**这条路一个 block 都不投，也就没有死等。**
+- **!= 2 那侧（0x10002fedc–0x10002ff28）**：`adr x8,#0x1000303c4`（就是 r239 已认出的
+  block invoke）、`adr x9,#0x1000e4670`（descriptor）、`ldr x21,[x20,#0x30]`（队列），
+  `bl 0x100097a64`、`bl 0x100097620`（dispatch_async），把那条永远不 leave 的
+  `_controllerReadyGroup` 挂上去。**死等只可能来自这一侧。**
+
+于是 r240 的方向要按字面重述一遍：**需要的是「用户态拿到 2」，不是「设备树里写 2」。**
+boot 33 已经证明内核自己按 MG 同款路径读到 `home-button-type` 的 len=4 u32=2，可死等仍在，
+所以只能有一种解释：**backboardd 拿到的不是 2**——要么这次 DT 读取在用户态根本没成功
+（MG 落到默认值），要么这一问的答案另有来源（r245 在 `.11` 里找到的那个
+`bl 0x52aa38` 一次性 sysctl 闸门，几个 handler 都在碰 DT 之前先 `cmp w0,#4/#1/#3`）。
+这两条都还没被任何一块板子上的读数区分开，r245 的 `svc total=/button-family=` 正是
+为此而设：如果板上压根没有一个能发 ready 通知的服务，那 !=2 这一侧永远是死路，
+无论答案从哪来。
