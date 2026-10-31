@@ -18116,3 +18116,30 @@ invoke 指针 **0x18f6fe3a0**——与符号串 `___28-[BSPlatform homeButtonTyp
 census/census-nodes/census-hbt/census-buttons 四项，`board.toml` 标题升 `clover r243:`。
 
 （构建与读数待补。）
+
+## r243 读数（boot 32）——census 跑了，但被环形缓冲转出去了；死等仍是原形
+
+boot 32 跑满 1800 s 死线（`round242`→`round243-log-window.bin`，内核环 512 行、窗口
+**1042.7–1813.0 s**、16 report / 64 判据 / 19 probe，boot 计数 32）：
+
+1. **死等原形未变**。`bbgrp t=1037 tid=0x3fd b=fffffffd g=0 cnt=1 wait=1`，末拍
+   `t=1798` 同形；`killsig pid=27 comm=SpringBoard sig=9 … comm=backboardd`——与
+   boot 28/29/30/31 逐字段同。旁证一条：`r180: client#6 pid=87 IOMobileFramebufferUserClient
+   seen=6`，图形用户客户端在开，桌面链在等 backboardd。
+2. **census 确实执行了，却一行都没回到宿主**。判据不是猜测：`bbgrp` 与 census 在同一个
+   函数（`clover_bb_sample` 尾调用）里，t=1037 拍了 bbgrp，同一次调用必走到 census 尾部。
+   缺读数的原因是**环形缓冲旋转**：census 一次性闩锁吃在第一个完整拍（t≈460–600），
+   约 30 行 printf 进的是 512 条容量的内核 msgbuf，而 panic 排干只够带回
+   **最后 ~771 s** 的窗口——450 秒后它已被完全挤出。这不是仪器没响，是仪器响在了
+   没人听得见的时刻。
+
+## r244 设计——把 census 挪进排干窗口
+
+`zzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r244.patch`（29 个 z，叠在 r243 上、LATE 摘除列最前）：
+在 `clover_iodt_census` 体首加 `if (secs < 1500) return;`，**放在 `ran` 闩锁之前**——早拍
+不消耗一次性额度，1500 s（死线 1800 s 的最后 300 s）后的第一个完整拍才点名，约 30 行
+读数必然落在排干窗口内。读数行仍带 `clover r243:` 串（仪器身份不变，tee 类 r243/64
+原样可用）。`check-clover.py` 钉两点：gate 串在位、gate 在 latch 之前（早拍吞掉额度
+就等于回到看不见）。`board.toml` 标题升 `clover r244:`。判决规则不变：
+`path buttons=missing` ⇒ 修平面发布（`IODeviceTreeAlloc`/MakeReferenceTable 一侧，照 sheng）；
+`buttons` 在且 `hbt len=4 u32=2` 而 bbgrp 仍在 ⇒ 回头解小方法表 name 字段、重证 getter 身份。

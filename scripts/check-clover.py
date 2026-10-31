@@ -1478,6 +1478,26 @@ def check_board(errors: list) -> str:
                 errors.append(f"{r243_patch.name} is not once-only: a census that reprints every "
                               "beat would spend its whole budget saying the same thing")
 
+        # Round244. Boot 32 proved the census ran (its beat printed bbgrp beside it) and proved
+        # the 512-record ring rotated its ~30 rows away hours before the drain reads the window.
+        # The gate has to be ahead of the latch (an early beat must not consume the one shot) and
+        # inside the deadline's tail: 1500 s of 1800 s leaves the rows younger than the drain.
+        r244_name = "zzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r244.patch"
+        r244_patch = next((base / "patches/xnu-clover" / r244_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r244_name).is_file()), None)
+        if r244_patch is None:
+            errors.append(f"patches/xnu-clover/{r244_name} is missing: the census would print at "
+                          "the first beat again and be rotated out of the drained window")
+        else:
+            r244_text = r244_patch.read_text()
+            if "if (secs < 1500) {" not in r244_text:
+                errors.append(f"{r244_patch.name} lacks the 1500 s gate: rows printed hours "
+                              "before the drain would again be invisible")
+            if r244_text.find("if (secs < 1500) {") > r244_text.find("if (ran) {"):
+                errors.append(f"{r244_patch.name} checks the latch before the gate: an early "
+                              "beat would consume the one shot and print nothing")
+
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
         # respawn), so the ring started 400 s into the boot. The filters have to be in the object, and
@@ -2517,8 +2537,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r243:"):
-        errors.append('[payload] title is not "clover r243: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r244:"):
+        errors.append('[payload] title is not "clover r244: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3570,8 +3590,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r243:"):
-        errors.append('[payload] title is not "clover r243: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r244:"):
+        errors.append('[payload] title is not "clover r244: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

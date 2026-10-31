@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r243: boot 31 proved the whole-identity ADT does not move the wait either -- bbgrp still cnt=1 wait=1 -- so the ADT stays as r242 and the kernel now walks the IODeviceTree plane once from the proven beat: every node name the plane iterator sees, plus /buttons/home-button-type, /chosen/display-scale and the root target-type read back, because the host disassembly pinned -[BSPlatform homeButtonType] to MGGetSInt32Answer of the /buttons property (question JwLB44/jEB8aFDpXQ16Tuw) and only the device can say whether that node is published at all"
+title = "clover r244: boot 32 proved the census runs -- its beat printed bbgrp beside it -- and proved the 512-record kernel ring rotates the census rows away long before the panic drain reads the window, so the census now fires past 1500 s of the 1800 s deadline: one shot, inside the window, naming every IODeviceTree node and the four lookups MobileGestalt itself makes (/buttons + home-button-type len/u32, /product, /chosen display-scale control, root target-type) -- the reading that decides whether the SSHB haptics deadlock is a plane-publication fault or a wrong getter chain"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

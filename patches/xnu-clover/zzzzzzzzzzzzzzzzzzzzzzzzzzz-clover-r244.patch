@@ -1,0 +1,20 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -255,6 +255,17 @@
+ 	char                next[96];
+ 	int                 seen = 0;
+ 
++	/*
++	 * Round244. Boot 32 proved the census runs -- and proved the ring rotates
++	 * it away: the first full beat sits hours before the 512-record window the
++	 * panic drain reads back, so a print that early is a print nobody sees.
++	 * The census now fires inside the window: once the boot is past 1500 s of
++	 * the 1800 s deadline, its ~30 rows are younger than the oldest record the
++	 * drain can still reach.
++	 */
++	if (secs < 1500) {
++		return;
++	}
+ 	if (ran) {
+ 		return;
+ 	}
