@@ -950,6 +950,8 @@ def check_sb_sample(kernel: bytes) -> bool:
                         b" w=%08x own=%x ow=0x%llx ost=%x\n") in kernel,
              "bblock-err": (b"clover r234: bblock t=%llu tid=0x%llx op=%llx a=%llx"
                             b" st=%x rd=err\n") in kernel,
+             "bbustk": (b"clover r236: bbustk t=%llu pid=%d tid=0x%llx sp=%llx"
+                        b" fp=%llx lr=%llx fn=%u%s\n") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
                            b"dropped=%u comms=%u\n") in kernel,
              "tee-sync": (b"CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n") in kernel}

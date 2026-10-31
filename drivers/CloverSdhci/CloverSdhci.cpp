@@ -459,14 +459,28 @@ static const uint32_t kFlightEntryOffset = 32;   // sectors past logfs start; 12
 static const uint32_t kFlightEntrySlots = 12;
 static const uint32_t kFlightBeatOffset = 56;    // four one-block records, 4 s apart
 static const uint32_t kFlightBeatSlots = 4;
+// Round236: the two sectors the beat leaves unused. The deadline record is written from the timer
+// interrupt before panic(), so the fact that the deadline fired reaches the card even when the panic
+// sink cannot (boot 24's frame: no kind-20 record, empty BCB, and the card busy recovering). The
+// panic marker is written on both sides of the report append, so an empty report window names the
+// gate that refused instead of leaving a silence that looks like a card failure.
+static const uint32_t kFlightDeadlineOffset = 60; // one record, one write, once per boot
+static const uint32_t kFlightDeadlineSlots = 1;
+static const uint32_t kFlightPanicOffset = 61;    // enter and exit, one sector each
+static const uint32_t kFlightPanicSlots = 2;
 static const uint32_t kFlightKind = 23;
 static const uint32_t kFlightEventRead = 1;
 static const uint32_t kFlightEventWrite = 2;
 static const uint32_t kFlightEventBeat = 3;
+static const uint32_t kFlightEventDeadline = 4;
+static const uint32_t kFlightEventPanic = 5;
 static volatile uint32_t gFlightArmed = 0;
 static volatile uint32_t gPanicActive = 0;       // the panic sink is writing; no beat may cut in
 static uint32_t gFlightEntrySeq = 0;
 static uint32_t gFlightBeatSeq = 0;
+static uint32_t gFlightDeadlineSeq = 0;
+static uint32_t gFlightPanicSeq = 0;
+static volatile uint32_t gFlightDeadlineDone = 0; // the deadline fires on every CPU; one record
 static uint32_t gFlightPrevDone = 0;             // result of the last finished request
 static uint32_t gFlightPrevMs = 0;
 static uint32_t gFlightPrevDir = 0;
@@ -718,6 +732,10 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r234: sbown", "r234-own", 192, 0, 0, 0 },
   { "clover r234: bblock", "r234-lock", 96, 0, 0, 0 },
   { "clover r234: beat", "r234-beat", 96, 0, 0, 0 },
+  // Round236 adds one row per waiting thread that a printed sample already names: the user frame
+  // chain, sp, fp and lr. It has the same cadence as the bbwait rows and one row per thread, so the
+  // same 192 covers it and the frame before the kill cannot be pushed out by the head of the boot.
+  { "clover r236: bbustk", "r236-ustk", 192, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -3267,15 +3285,39 @@ static uint32_t flightCounterMs (uint64_t since)
   return static_cast<uint32_t> ((now - since) * 1000ULL / frequency);
 }
 
-static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t blocks)
+static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t blocks,
+                         const uint32_t *extra = nullptr, uint32_t extraWords = 0)
 {
-  if (!__atomic_load_n (&gFlightArmed, __ATOMIC_ACQUIRE) || !gVerdictFirst || !gHost) {
+  // Round236: the deadline record and the panic marker are the two readings that must survive the
+  // death of everything else, so they do not depend on the flight region having been armed by a
+  // boot that reached its block-driver phase. They still need the window base and the host: without
+  // those there is nowhere to write.
+  const bool forced = (event == kFlightEventDeadline) || (event == kFlightEventPanic);
+  if (!gVerdictFirst || !gHost) {
+    return false;
+  }
+  if (!forced && !__atomic_load_n (&gFlightArmed, __ATOMIC_ACQUIRE)) {
     return false;
   }
   const bool beat = (event == kFlightEventBeat);
-  const uint32_t seq = beat ? gFlightBeatSeq : gFlightEntrySeq;
-  const uint32_t slot = seq % (beat ? kFlightBeatSlots : kFlightEntrySlots);
-  const uint32_t record = gVerdictFirst + (beat ? kFlightBeatOffset : kFlightEntryOffset) + slot;
+  uint32_t offset = kFlightEntryOffset, slots = kFlightEntrySlots;
+  uint32_t *seqp = &gFlightEntrySeq;
+  if (beat) {
+    offset = kFlightBeatOffset;
+    slots = kFlightBeatSlots;
+    seqp = &gFlightBeatSeq;
+  } else if (event == kFlightEventDeadline) {
+    offset = kFlightDeadlineOffset;
+    slots = kFlightDeadlineSlots;
+    seqp = &gFlightDeadlineSeq;
+  } else if (event == kFlightEventPanic) {
+    offset = kFlightPanicOffset;
+    slots = kFlightPanicSlots;
+    seqp = &gFlightPanicSeq;
+  }
+  const uint32_t seq = *seqp;
+  const uint32_t slot = seq % slots;
+  const uint32_t record = gVerdictFirst + offset + slot;
   const uint32_t present = read32 (SDHCI_PRESENT_STATE);
   for (uint32_t i = 0; i < kBlockWords; i++) {
     gFlightBlock[i] = 0;
@@ -3321,21 +3363,25 @@ static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t bl
   gFlightBlock[32] = gFlightCurPid;
   gFlightBlock[33] = gFlightCurComm0;
   gFlightBlock[34] = gFlightCurComm1;
+  // Round236: the deadline's own numbers and the panic marker's gates ride after the round210
+  // header, so the two readings keep one decoder instead of two record formats.
+  for (uint32_t i = 0; i < extraWords && 35 + i < kBlockWords; i++) {
+    gFlightBlock[35 + i] = extra[i];
+  }
   uint32_t words = 0, status = 0;
   if (!writePioBlock (record, gFlightBlock, words, status)) {
     return false;
   }
   // The card may still be programming; a beat does not wait for it, because a beat that spends
-  // 200 ms inside the timer interrupt is its own problem. The next entry record's wait covers it.
-  if (!beat) {
+  // 200 ms inside the timer interrupt is its own problem. The deadline and panic records are taken
+  // in contexts that are about to end the boot, so they do not wait either.
+  if (!beat && !forced) {
     uint32_t rsp = 0, rstatus = 0, polls = 0;
     waitCardReady (rsp, rstatus, polls);
   }
+  (*seqp)++;
   if (beat) {
-    gFlightBeatSeq++;
     gFlightBeats++;
-  } else {
-    gFlightEntrySeq++;
   }
   return true;
 }
@@ -3493,6 +3539,55 @@ extern "C" void clover_emmc_flight_beat (void)
     return;
   }
   (void)flightWrite (kFlightEventBeat, 2, 0, 0);
+  dropHostTicket (token);
+}
+
+// Round236: the deadline fact, written where the panic screen cannot lose it. Boot 24 reached its
+// 1800 s deadline with no kind-20 record, no drain enter line and an empty BCB, while the driver's
+// own ring carried six card recoveries in the same stretch -- so the sink's silence was the card's,
+// and a reading that only exists behind the sink cannot say whether the deadline fired at all.
+// This is called from ArmCpu's timer interrupt immediately before panic(): it takes the host the way
+// a beat does (one try, plus the stuck-holder recovery when the stage has stopped moving) and writes
+// one record after the panic has already been decided. It does not wait for the card afterwards and
+// it does not depend on the flight region having been armed by bring-up -- only on the window base
+// and the mapped host, which are the two things that make a write possible at all.
+extern "C" void clover_emmc_flight_deadline (unsigned long long seconds, unsigned long long ticks,
+                                             unsigned long long cnt0, unsigned long long cnt1,
+                                             unsigned long long freq)
+{
+  if (__atomic_exchange_n (&gFlightDeadlineDone, 1u, __ATOMIC_ACQ_REL)) {
+    return;
+  }
+  if (!gVerdictFirst || !gHost) {
+    return;
+  }
+  const uint32_t owner = __atomic_load_n (&gHostOwner, __ATOMIC_ACQUIRE);
+  if (owner) {
+    const uint32_t stage = __atomic_load_n (&gFlightStage, __ATOMIC_ACQUIRE);
+    const uint64_t since = __atomic_load_n (&gFlightStageSince, __ATOMIC_ACQUIRE);
+    uint64_t frequency = counterFrequency ();
+    if (frequency < 1000000ULL || frequency > 1000000000ULL) {
+      frequency = 19200000ULL;
+    }
+    const uint64_t now = readCounter ();
+    if (since && now > since && now - since > frequency * kGuardStuckMs / 1000ULL) {
+      recoverStuckRequest (stage, owner);
+    }
+  }
+  uint32_t token = 0;
+  (void)tryTakeHost (token);
+  uint32_t extra[10];
+  extra[0] = static_cast<uint32_t> (seconds);
+  extra[1] = static_cast<uint32_t> (seconds >> 32);
+  extra[2] = static_cast<uint32_t> (ticks);
+  extra[3] = static_cast<uint32_t> (ticks >> 32);
+  extra[4] = static_cast<uint32_t> (cnt0);
+  extra[5] = static_cast<uint32_t> (cnt0 >> 32);
+  extra[6] = static_cast<uint32_t> (cnt1);
+  extra[7] = static_cast<uint32_t> (cnt1 >> 32);
+  extra[8] = static_cast<uint32_t> (freq);
+  extra[9] = static_cast<uint32_t> (freq >> 32);
+  (void)flightWrite (kFlightEventDeadline, 3, 0, 0, extra, 10);
   dropHostTicket (token);
 }
 
@@ -8429,13 +8524,40 @@ static unsigned int panicAppendText (const char *text, unsigned int length)
 // two halves of one reading. It runs whatever the append returned -- a full log slot area (3) or a
 // card that refused (2, 4, 5) is still a boot whose last words are in RAM, and the drain decides for
 // itself whether the rings are armed.
+// Round236: what the sink found when it was entered. panicAppendText returns 1 for a closed gate,
+// 2/4/5 for a card that refused, so the return code alone cannot say which gate was closed -- and a
+// frame with an empty report window is exactly the one that needs to know. The marker is written
+// before the append and again with its return code, and neither write depends on the gates it
+// reports. At most two records per boot, in the sector after the deadline record.
+static void flightPanicMark (uint32_t stage, unsigned int rc, bool haveText)
+{
+  if (!gVerdictFirst || !gHost) {
+    return;
+  }
+  uint32_t extra[8];
+  extra[0] = stage;
+  extra[1] = __atomic_load_n (&gPanicLogReady, __ATOMIC_ACQUIRE);
+  // The host word says whether the sink found the controller owned, which is the one gate the
+  // return code cannot express: a refused append with the host free is a card that said no.
+  extra[2] = __atomic_load_n (&gHostOwner, __ATOMIC_ACQUIRE);
+  extra[3] = gPanicLogFirst;
+  extra[4] = rc;
+  extra[5] = __atomic_load_n (&gPanicDrained, __ATOMIC_RELAXED);
+  extra[6] = gBootId;
+  extra[7] = (__atomic_load_n (&gUnattendedArmed, __ATOMIC_RELAXED) ? 1u : 0u) |
+             (gBcbWritten ? 2u : 0u) | (haveText ? 4u : 0u);
+  (void)flightWrite (kFlightEventPanic, 3, 0, 0, extra, 8);
+}
+
 extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int length)
 {
   // Round210: the timer keeps running through a panic, and a beat that cut in here would be a
   // second owner of the card in the middle of the panic's own writes. The first panic owns it.
   __atomic_store_n (&gPanicActive, 1u, __ATOMIC_RELEASE);
+  flightPanicMark (0, 0, text != nullptr);
   const unsigned int rc = panicAppendText (text, length);
   gPanicAppendRc = rc;
+  flightPanicMark (1, rc, text != nullptr);
   panicDrainRings ();
   // Last, because everything above is a reading and this changes what the reset does. The screen
   // wrote its IMEM word before calling here; on this board that word does not survive into XBL's

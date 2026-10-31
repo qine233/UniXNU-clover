@@ -4,17 +4,37 @@
 ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。
 配套固件仓库 `uefi-clover`（Mu-Silicium 移植），驱动与硬件常量在 `porting.toml`。
 
-现状一句话：**SpringBoard 的请求被 backboardd 取走了、回信没有回来；而被阻塞的目的口不属于
-backboardd 的 port set——backboardd 不是在等内核，而是主线程停在用户态一个条件上，
-4 条收件线程和空闲工作队列都不动它。**
+现状一句话：**SpringBoard 的请求被 backboardd 取走了、回信没有回来；backboardd 主线程停在
+自己进程内的一个 block 里，经 libdispatch 主队列 drain 走到 `___ulock_wait`，在一个堆上的
+dispatch 对象上无限等待，而对象的值字至今是 0——不是内核阻塞。**
 XNU 起来、三卷全挂、launchd 把守护进程拉起来。
-boot 24（r235，死线 1800 s）没有再踩 753 s 那个 `ipc_space.h:173` 断言，内核环一路写到
-1789.6 s；r234 的一行集合、分账 tee 和 `ipc_entry_name_mask()` 全部兑现（`bbset` 43 条
-848→1786、`all=11` 每次都在，没有一类烧光）。集合 11 个成员里没有 SpringBoard 等的 `4c03`；
-`4c03` 一生只进过 3 条消息、此刻 `cnt=0 seq=3 wq=0`。锁属主的 `own` 已算对，`ow=0x0` 是线程
-端口早已失效——锁这一列结案。死线本身仍然没留 kind-20 记录（卡在末期反复
-`read gave up` + `card recover`），TWRP 由 r198 预置 BCB 落下；r236 要把「死线到点」的证据
-放到不经过 panic 屏的路径上，并把 backboardd 的用户态等待符号化。
+boot 25（r236，死线 1800 s）三条「不经过 panic 屏」的刀全部兑现：死线自己往 flight 区写下
+`elapsed=1800.005s cnt0/cnt1/freq` 的强制记录（ps 是定时器中断现场）；panic 沉降口两条标记
+（stage0 rc=0、stage1 rc=113=100+槽 13）证明 panic 文本第一次真的落进 cache（lba 13320242），
+随后 `drain … wrote=24 dropped=0 unseen=0` 跑完。死线前最后 12 笔 fairplay 读各 1–2 ms 完成，
+卡是健康的——r235 的「卡在恢复中导致静默失败」被排除。用户态这边：主线程 `tid=0x42f`
+31 次采样逐字节相同，`___ulock_wait` 上 `x0=0x1000001 x1=0x100c8f0d4 x2=0 x3=0`，
+对象字 `w=0`；宿主按共享缓存 slide 0x2DA0000 把链条符号化到 libdispatch 的
+drain/thunk/wait helper，backboardd slide 0x666000 给出 block 镜像偏移 0x303e4。
+r237 要把 pid 58 的 `ulock_wait`/`ulock_wake` 计数与这个地址对齐，打印对象头并加深栈。
+
+r236 读数（boot 25）：**三条刀全部落笔；backboardd 在一个堆上的 dispatch 对象上永远等。**
+① 死线记录：槽 60 `fired after 1800 s at t=1800760 ms ps=0x01e800f6 ticks=313678
+cnt0=0xef30b36 cnt1=0x81ae42466 freq=19200000 elapsed=1800.005s`。② panic：stage0 rc=0、
+stage1 rc=113（槽 13，lba 13320242），`gates=0x7`、`drained=0` 是预期（标记在 drain 之前）；
+drain `wrote=24 dropped=0 tee_passes=8 probe_seen=19`，`r184 wrote=24`、
+`r229 tee kept=20 dropped=228`。③ 内核环窗口 1008.2–1812.9 s，全 boot 25；驱动 flight 时钟
+比内核 msgbuf 晚约 12.1 s（`gFlightStart` 在 arm 时取）。④ bbustk 112 行/33 拍/53 tid，
+主线程 31 次相同 `lr=1922f8a80 fn=6 1922f8e40 1006963e4 192355c9c 192356cc0 1922fe3f8 1922fee74`；
+81 行是 `__pthread_wqthread+0x168` 空闲。⑤ `bbwait pc=1ce526bdc`=`___ulock_wait+0x8`，
+`x0=0x1000001 x1=0x100c8f0d4 x2=0 x3=0`，`bblock w=0`。⑥ 共享缓存 slide 0x2DA0000
+（页内偏移保持的枚举 + BL/BLR 校验），链条落到 libdispatch `0x18F558A4C+0x34`、
+`0x18F558E0C+0x34`、thunk `0x18F5B5C84+0x18`/`0x18F5B6CB0+0x10`、drain `0x18F55E138+0x2C0`；
+backboardd slide 0x666000（r218 killsrc ulr−0x72144），block 偏移 0x303e4。⑦ ulock 对象头在堆
+0x100c8f0a0，boot 24/25 地址差 0xA02530 非页整数倍，不能写成镜像偏移。⑧ 未解：libdispatch
+函数名（`.symbols` 子缓存无镜像表、宿主无 dsc_extractor/capstone）、block 符号（rootfs 加密）、
+`___ulock_wake` 是否曾打这个字。
+r237 方向：pid 58 的 `ulock_wait`/`ulock_wake` 聚合计数按地址对账、打印对象头、栈深加过 6。
 
 r235 读数（boot 24）：**断言不再、采样活到 1789.6 s；被阻塞的口不属于集合，backboardd 卡在
 用户态条件上。**

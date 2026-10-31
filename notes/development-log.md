@@ -17511,3 +17511,120 @@ r233 的三刀先把「读数不够」修掉，r234 再把读数变成答案：
    区别在于这一 boot **死线前卡正在反复恢复**：drain 的第一次写就要排干驱动环，
    卡不在可用状态时它会静默失败，而 `panicAppendText` 与 `drain` 都走同一个 `gHost`。
    r236 必须把「死线到点」的证据放到不经过 panic 屏的路径上。
+
+## r236 实现与构建
+
+三条「不经过 panic 屏」的证据刀，加一条用户态栈：
+
+1. **死线自证**。`ArmCpu` 的定时器中断一看到 `now - gTick0Counter` 越过
+   `clover-unattended` 秒数，先调 `clover_emmc_flight_deadline()` 再 `panic()`。驱动把它写成
+   flight 区的一条强制记录：`kFlightDeadlineOffset = 60`（1 槽），event 4，dir 写 3（none），
+   extra 从 word 35 起是五对 64 位小端——seconds/ticks/cnt0/cnt1/freq。强制写只要求
+   `gVerdictFirst && gHost`，**不看 `gFlightArmed`、不等卡 ready**：一个失效的盘和一块
+   沉默的卡都会让普通写返回 false，而这条记录要的恰恰是「写进去或写失败」本身。
+   一次性用 `gFlightDeadlineDone` 的 `__atomic_exchange_n` 保证只有第一个 CPU 落笔；
+   若 host 票仍被一个过期的 stage 占着，先按 `kGuardStuckMs` 判，再 `recoverStuckRequest` 收回，
+   然后 `tryTakeHost` 非阻塞拿票，写完 `dropHostTicket`。
+2. **panic 沉降口的进出标记**。`clover_emmc_panic_append()` 在写第一段文本之前和之后各发一条
+   强制记录：`kFlightPanicOffset = 61`（2 槽），event 5，extra 8 words——stage、
+   `gPanicLogReady`、`gHostOwner`（活的属主，不是常量）、`gPanicLogFirst`、`append` 返回码、
+   `gPanicDrained`、`gBootId`、闸门位图（1 armed、2 bcb、4 text）。两条记录之间的 rc 就是
+   「panic 屏有没有写进卡」的直接读数，卡饿死时它俩的缺席/成功分得清。
+3. **backboardd 的用户态等待栈**。sampler 每拍从 `saved_state64` 取 `x[29]/x[30]` 与 sp，
+   用 `clover_user_bp_walk()` 沿帧链读回最多 6 个返回地址。读的不是自己进程的地址，
+   `copyin` 会解析到 sampler 自己的 map，所以走 `pmap_find_phys(pmap, va)` 拿物理页、
+   再用 `ml_phys_read_64` 读 32 位字——每 64 位槽两次翻译，帧记录可能跨页。帧是裸地址，
+   slide 每靴不同，符号化留给宿主。行是 `clover r236: bbustk`，tee 类 `r236-ustk` 192 字节。
+   帧链只在真的要打印的那一拍才走：签名门已经把安静 boot 压在 tee 的行预算内。
+
+flight 区几何仍是 512 字节块/记录，新增的三处在 `VERDICT_OFFSET=64` 之内：entries 32..43、
+beats 56..59、deadline 60、panic 61..62。解码器 `read-clover-log.py` 加了
+`FLIGHT_DEADLINE_OFFSET`/`FLIGHT_PANIC_OFFSET`、`flight_pairs`/`flight_pairs_words`、
+`FLIGHT_EVENTS` 的 4/5 与 `FLIGHT_DIRS` 的 3，selftest 覆盖延迟记录、两条 panic 标记与
+坏记录。
+
+构建：内核 `a4a5100d…`（无 AMFI 刀）→ AMFI 签名点 `0x1ac00e4`、`0x1ac016c` → 归一化
+（968 处对象时间戳清零、LC_UUID/_PrelinkKCID 由文件导出）→
+`round236-kernel-amfi.macho` sha256 `3c36c7cc31b786b28d0f09a82ebcbc1fac4c2c7206ec202974697b32e115621b`、
+`round236-payload.img` sha256 `a4843e14441266ee34a59b61946de824da459ffaa4b82214d47ae8946f331099`。
+`check-clover.py` 与 `verify-clover-payload.py` 全过（r217 组含 `bbustk`）。LATE_PATCH 顺序
+把 r236 放在 22 个 z 的最前。
+
+冷刷 cache，跑满 1800 s 死线，读回 **boot 25**。
+
+## r236 读数（boot 25）——三条刀全部落笔，backboardd 主线程在一个堆上的 dispatch 对象上永远等
+
+1. **死线自证成立，而且是它自己写进去的**。flight 区槽 60 有一条完整记录：
+   `fired after 1800 s at t=1800760 ms ps=0x01e800f6 ticks=313678 cnt0=0xef30b36
+   cnt1=0x81ae42466 freq=19200000 elapsed=1800.005s`。`ps=0x01e800f6` 是定时器中断现场，
+   `cnt1-cnt0` 除以 19.2 MHz 正是 1800.005 s。这条路径不看 `gFlightArmed`、不等卡 ready，
+   写成功就说明「死线到点」不再依赖 panic 屏或一张可用的卡。它之前 12 条 entry
+   （seq 242051..242062，t=1800714..1800759 ms，ps=0x01f800f0）全是 fairplay pid 429 的读，
+   每笔 1–2 ms 完成：**死线那一刻卡是健康的**，r235 的怀疑（卡在恢复中导致静默失败）被排除。
+2. **panic 沉降口两条标记都在，rc=113**。stage0 t=1800925、`rc=0`；stage1 t=1800932、
+   `rc=113`（=100+槽 13），`log_ready=1 host=0x3b2cc log_first=13320216 drained=0 boot=25
+   gates=0x7(armed,bcb,text)`。槽 13 就是报告环里 lba 13320242 的那条 boot 25 kind-20，
+   里面是 panic 行：**panic 文本第一次真正落到了 cache 上**。`drained=0` 是预期的——
+   stage1 标记在 `panicDrainRings()` 之前发出，驱动环的排干是下一拍才发生。
+3. **drain 这次跑完了**：`drain enter boot=25 first=13320216 panic_first=13320216 verdict=1
+   tee=1 append_rc=113 probe_seen=19` → `panic tail lines=3 unseen=0 bufx=113587` →
+   `drain exit … wrote=24 dropped=0 tee_passes=8 probe=19 probe_drop=0 probe_pend=3`，
+   紧跟 `r184 wrote=24`、`r229 tee filter fl=221 nag=3194 exit kept=20 dropped=228 comms=16`。
+   r235 那种「drain enter 之后没有下文」没有再来。
+4. **两个时钟不是一个历元**。驱动 flight 记录用的是 `flightCounterMs(gFlightStart)`，
+   `gFlightStart` 在驱动 arm 时才取，因此整组数字比内核 msgbuf 晚约 **12.1 s**
+   （死线 t=1800.760 s ↔ 内核环末尾 1812.9 s），不是时间倒流。内核环窗口
+   **1008.235–1812.894 s**，末两行是 CoreAnalyticsHub 的 nag 定时器 @1812.387/1812.893。
+   beats 落在 1782/1786/1794/1798 s，`miss=163/164 stuck=8 recov=8 stage=idle`。
+5. **用户态栈第一次拿到**：`bbustk` 112 行，33 个采样时刻（t=1003..1753 s），53 个不同 tid。
+   主线程 `tid=0x42f` 被采 31 次（t=1028..1753），31 次**逐字节相同**：
+   `sp=1701eb810 fp=1701eb830 lr=1922f8a80 fn=6 1922f8e40 1006963e4 192355c9c 192356cc0
+   1922fe3f8 1922fee74`。其余 81 行是空闲工作队列线程，`lr=1e03c2580`
+   （`__pthread_wqthread+0x168`），`fn=0` 或 `fn=1 1e03bfccc`（`_start_wqthread+0x8`）。
+   栈是稳定的，不是采样噪声。
+6. **寄存器证据**：`bbwait pc=1ce526bdc` → unslid `0x1CB786BDC` = libsystem_kernel
+   `___ulock_wait+0x8`；`x0=0x1000001` = `UL_COMPARE_AND_WAIT|ULF_NO_ERRNO`，
+   `x1=0x100c8f0d4`（ulock 地址），`x2=0`（期望值），`x3=0`（无限等待）。
+   `bblock w=00000000`：那个字现在仍是 0，**等待开始之后从未有人 signal 过**。
+7. **宿主端怎么定 slide**。共享缓存每靴随机 slide，裸帧不能直接查符号。方法：
+   在一张只在页内偏移固定的锚点表上枚举 `slide`，步长 0x4000，取
+   `off=(anchor-s)%page`、从 `s+off` 起扫——先前的实现直接按页对齐枚举，把锚点的页内
+   偏移（0xA80）打碎了，所以一个候选都出不来。用 BL/BLR 配对校验后唯一赢家
+   **slide=0x2DA0000（score 6.25）**，工作队列帧也自洽，没有巧合候选。链条
+   （运行地址 → unslid → 符号）：
+   * `lr 0x1922f8a80` → `0x18F558A80` = libdispatch fn `0x18F558A4C+0x34`；该 fn 调
+     stub `0x1948825a0` → `___ulock_wait`（`0x18F558A7C`），然后在 0/0xF0 上循环。
+   * `frame0 0x1922f8e40` → `0x18F558E40` = `0x18F558E0C+0x34`；`add x22,x0,#0x34;
+     mov w19,#0x31`，调 `0x18F558740`，然后 `ldaxr`/比较循环。
+   * `frame1 0x1006963e4` → 主可执行（backboardd）；boot 25 slide **0x666000**，
+     镜像偏移 **0x303e4**。
+   * `frame2 0x192355c9c` → `0x18F5B5C9C` = `0x18F5B5C84+0x18`（+0x14 处 `BLR x8`，
+     随后 `B` 到 stub `0x194882528` = `__Block_release`）。
+   * `frame3 0x192356cc0` → `0x18F5B6CC0` = `0x18F5B6CB0+0x10`（+0xC 处 `BLR x1`）。
+   * `frame4 0x1922fe3f8` → `0x18F55E3F8` = `0x18F55E138+0x2C0`（+0x2BC 处
+     `BL 0x18F5B6CB0`；0x510 字节，主队列 drain 形状，调
+     `__dispatch_wait_for_enqueuer`）。
+   * `frame5 0x1922fee74` → `0x18F55EE74` = `0x18F55ECF8+0x17C`（+0x170 处
+     `BL 0x18F55E138`）。
+   * 中间层 `0x18F558740`（0xE8 字节）把超时换算完，在 forever 分支尾调
+     `0x18F558A4C`（`0x18F558824` 处 `B`），所以栈里少一帧——尾调不压栈。
+8. **backboardd 的 slide 是用别的锚点定的**。r218 的 killsrc 记录里
+   `ulr=0x1006d8144` 减去镜像偏移 0x72144（同一 IPSW 的批量杀进程返回点）
+   = **0x666000**，`ulr - slide = 0x100072144` 分毫不差。于是 frame1 才能从裸地址
+   落到偏移 0x303e4。killustk 里同样出现 `0x192355c9c`/`0x192356cc0` 两个 thunk，
+   说明这条 callout 通路是共享的，不是这一条栈的偶然。
+9. **那个 ulock 对象在堆上，不在静态 __DATA**。`x1=0x100c8f0d4` 是对象 +0x34，
+   dispatch 对象头在 **0x100c8f0a0**。boot 24 是 0x101691604，两次相差 0xA02530，
+   不是页的整数倍——没有任何页对齐 slide 能把两者映到同一个镜像偏移。它是一个
+   运行期堆对象，只能按堆地址报告，不能写成镜像偏移。
+10. **结论**：backboardd 主线程停在一个自己进程内、镜像偏移 0x303e4 的 block 里，
+    经 libdispatch 主队列 drain → block invoke thunk → wait helper → slow-path →
+    `___ulock_wait`，在一个堆上的 dispatch 对象上无限等待，而对象的值字至今是 0。
+    这不是内核阻塞（四条 port set 线程和 81 条空闲工作队列线程都正常），是**用户态
+    等一个从未被 signal 的条件**。r237 起把 pid 58 的 `ulock_wait`/`ulock_wake`
+    计数与这个地址对齐，并打印对象头（isa/value），再加深化栈深。
+
+未解：libdispatch 函数名（`.symbols` 子缓存 685,817,856 字节、`dyld_v1 arm64` 头、
+mappingCount 1/16 KB、无镜像表；宿主没有 `dsc_extractor`/`ipsw`/capstone）、
+backboardd 的 block 符号（rootfs 加密，只有偏移 0x303e4）、以及 `___ulock_wake`
+是否曾以这个字为目标。

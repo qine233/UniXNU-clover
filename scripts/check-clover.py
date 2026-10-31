@@ -852,6 +852,11 @@ def check_board(errors: list) -> str:
             errors.append("drivers/CloverSdhci gives round211's stack-backtrace lines no tee class: "
                           "twelve lines per kill would land in the ring uncounted and could push out "
                           "the exec/exit pairs")
+        if '{ "clover r236: bbustk", "r236-ustk", 192, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci gives round236's userspace-stack rows no tee class: "
+                          "one row per picked thread per changed batch, over a whole boot, would "
+                          "land in the ring uncounted and push out the r234 rows that name the "
+                          "blocked member")
         sb_patch = next((base / "patches/xnu-clover/zzzzzzzz-clover-sb-sample.patch"
                          for base in (REPO, pathlib.Path.cwd())
                          if (base / "patches/xnu-clover/zzzzzzzz-clover-sb-sample.patch").is_file()),
@@ -1214,6 +1219,42 @@ def check_board(errors: list) -> str:
                 errors.append(f"{r235_patch.name} checks is_active after the lookup: the assert "
                               "would still fire first")
 
+        # Round236 asks what the blocked task is waiting on in its own address space. copyin
+        # resolves in the caller's map, and the caller is the sampler, not backboardd, so the walk
+        # translates each frame with pmap_find_phys and reads the physical page. ml_phys_read_64
+        # returns one 32-bit word, so a 64-bit slot takes two translated reads -- a frame record
+        # may straddle a page -- and the walk is bounded to the stack window.
+        r236_patch = next((base / "patches/xnu-clover/zzzzzzzzzzzzzzzzzzzzzz-clover-r236.patch"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover/zzzzzzzzzzzzzzzzzzzzzz-clover-r236.patch").is_file()),
+                          None)
+        if r236_patch is None:
+            errors.append("patches/xnu-clover/zzzzzzzzzzzzzzzzzzzzzz-clover-r236.patch is missing: "
+                          "the blocked threads' userspace frames would again be unreadable from the "
+                          "sampler's address space, and the wait would stay a raw pc")
+        else:
+            r236_text = r236_patch.read_text()
+            for needle in ('extern unsigned int ml_phys_read_64(addr64_t paddr64);',
+                           'clover_user_read32(pmap_t pmap, uint64_t addr, uint32_t *value)',
+                           'ppnum_t page = pmap_find_phys(pmap, (addr64_t)addr);',
+                           'phys = ((uint64_t)page << PAGE_SHIFT) | (addr & (PAGE_SIZE - 1));',
+                           'clover_user_bp_walk(pmap_t pmap, uint64_t fp, uint64_t sp, uint64_t *frames,',
+                           'clover_user_read32(pmap, fp + 12, &rhi)',
+                           'ufp[un] = (uint64_t)saved_state64(ss)->x[29];',
+                           'ulr[un] = (uint64_t)saved_state64(ss)->x[30];',
+                           'usp[un] = (uint64_t)get_saved_state_sp(ss);',
+                           'clover_user_bp_walk(vm_map_pmap(task->map), ufp[i], usp[i],',
+                           '"clover r236: bbustk t=%llu pid=%d tid=0x%llx sp=%llx"',
+                           '" fp=%llx lr=%llx fn=%u%s\\n"'):
+                if needle not in r236_text:
+                    errors.append(f"{r236_patch.name} lacks {needle[:56]!r}: the kernel would again "
+                                  "print a userspace pc with no chain behind it, or read a foreign "
+                                  "map through copyin")
+            if r236_text.count("clover_user_read32(pmap, fp") < 4:
+                errors.append(f"{r236_patch.name} reads fewer than four 32-bit halves per frame: "
+                              "ml_phys_read_64 returns one word, so a 64-bit slot straddling a page "
+                              "would be assembled from half a record")
+
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
         # respawn), so the ring started 400 s into the boot. The filters have to be in the object, and
@@ -1330,6 +1371,48 @@ def check_board(errors: list) -> str:
         if "clover_emmc_flight_beat ();" not in armcpu_source:
             errors.append("drivers/ArmCpu never calls the round210 beat: nothing would sample the "
                           "controller between block requests")
+        # Round236: boot 24 hit its 1800 s deadline with no kind-20 panic record, no drain-enter line
+        # and an empty BCB while the driver's own ring carried six card recoveries in the same
+        # stretch. The sink's silence was the card's, so the deadline gets a record that does not go
+        # through the sink at all: ArmCpu calls into the driver immediately before panic(), the
+        # driver writes one dedicated block past the guard and the arming gates, and the sink's own
+        # entry and exit are marked too so a sink that never ran can be told from one that ran and
+        # failed.
+        for needle, why in (
+                ("static const uint32_t kFlightDeadlineOffset = 60;",
+                 "the deadline record is not at sector 60, where the reader looks"),
+                ("static const uint32_t kFlightPanicOffset = 61;",
+                 "the panic markers are not at sectors 61-62, where the reader looks"),
+                ("const bool forced = (event == kFlightEventDeadline) || (event == kFlightEventPanic);",
+                 "the two survival records would still need the arming gates"),
+                ("if (!forced && !__atomic_load_n (&gFlightArmed, __ATOMIC_ACQUIRE)) {",
+                 "the armed gate no longer exempts the forced records"),
+                ("extern \"C\" void clover_emmc_flight_deadline (",
+                 "no deadline entry point for the timer to call before panic()"),
+                ("if (__atomic_exchange_n (&gFlightDeadlineDone, 1u, __ATOMIC_ACQ_REL)) {",
+                 "the deadline record is not one-shot: every CPU in the interrupt would write it"),
+                ("(void)flightWrite (kFlightEventDeadline, 3, 0, 0, extra, 10);",
+                 "the deadline record does not carry its five 64-bit numbers"),
+                ("flightPanicMark (0, 0, text != nullptr);",
+                 "the panic sink has no entry marker: a sink that died inside append would leave "
+                 "nothing to say it was ever entered"),
+                ("flightPanicMark (1, rc, text != nullptr);",
+                 "the panic sink has no exit marker: the append's return code would be unreadable"),
+                ("(void)flightWrite (kFlightEventPanic, 3, 0, 0, extra, 8);",
+                 "the panic marker does not carry the eight gate words"),
+                ("__atomic_load_n (&gHostOwner, __ATOMIC_ACQUIRE)",
+                 "the panic marker does not read the live host owner, which is the one gate its "
+                 "return code cannot express")):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci lacks {needle[:52]!r}: {why}")
+        deadline_call = armcpu_source.find("clover_emmc_flight_deadline (")
+        panic_call = armcpu_source.find('panic ("clover r148:')
+        if deadline_call < 0:
+            errors.append("drivers/ArmCpu never calls the round236 deadline record: the deadline "
+                          "would again be known only through the sink that boot 24 starved")
+        elif panic_call < 0 or deadline_call > panic_call:
+            errors.append("drivers/ArmCpu calls the deadline record after panic(): the record has "
+                          "to be on the card before the screen starts resetting the board")
 
     adt = board["payload"]["adt"]
     cores = [int(value, 0) for value in adt["cpu_regs"].split(",") if value.strip()]
@@ -2211,8 +2294,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r235:"):
-        errors.append('[payload] title is not "clover r235: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r236:"):
+        errors.append('[payload] title is not "clover r236: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -2856,6 +2939,10 @@ def check_board(errors: list) -> str:
                        '24: "boot-24", 25: "probe-25"',
                        '12: "reinit"',
                        "def decode_boot(data, first_lba)",
+                       "FLIGHT_DEADLINE_OFFSET = 60", "FLIGHT_PANIC_OFFSET = 61",
+                       '4: "deadline", 5: "panic"', '3: "none"',
+                       "def flight_pairs(words, count)", "def flight_pairs_words(values)",
+                       'no deadline record', 'no panic marker',
                        '"--boot"', '"--probe"',
                        'struct.unpack_from("<10I", block)',
                        "expects and kind not in expects",
@@ -3260,8 +3347,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r235:"):
-        errors.append('[payload] title is not "clover r235: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r236:"):
+        errors.append('[payload] title is not "clover r236: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

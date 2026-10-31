@@ -1,0 +1,149 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index df9a93c..95c2200 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10388,6 +10388,66 @@ clover_user_fp_walk(uint64_t fp, uint64_t sp, uint64_t *frames, uint32_t frames_
+ 	return i;
+ }
+ 
++extern unsigned int ml_phys_read_64(addr64_t paddr64);
++
++/*
++ * Round236. A frame chain that belongs to another task cannot be read with copyin: copyin
++ * resolves the address in the calling thread's map, and the caller here is the sampler, not
++ * backboardd. The page table still names the backing page, so each frame address is
++ * translated with pmap_find_phys and its bytes are read from the physical page. ml_phys_read_64
++ * returns one 32-bit word, so a 64-bit slot is two reads, each with its own translation --
++ * a frame record may straddle a page.
++ */
++static int
++clover_user_read32(pmap_t pmap, uint64_t addr, uint32_t *value)
++{
++	ppnum_t page = pmap_find_phys(pmap, (addr64_t)addr);
++	uint64_t phys;
++
++	if (page == 0) {
++		return 0;
++	}
++	phys = ((uint64_t)page << PAGE_SHIFT) | (addr & (PAGE_SIZE - 1));
++	*value = (uint32_t)ml_phys_read_64((addr64_t)phys);
++	return 1;
++}
++
++static uint32_t
++clover_user_bp_walk(pmap_t pmap, uint64_t fp, uint64_t sp, uint64_t *frames,
++    uint32_t frames_max)
++{
++	uint32_t i = 0;
++	uint64_t limit;
++
++	if (pmap == PMAP_NULL || sp == 0) {
++		return 0;
++	}
++	limit = sp + 0x40000;
++	while (i < frames_max && fp != 0 && (fp & 7) == 0 &&
++	    fp >= sp && fp < limit) {
++		uint32_t lo, hi, rlo, rhi;
++		uint64_t parent, ret;
++
++		if (!clover_user_read32(pmap, fp, &lo) ||
++		    !clover_user_read32(pmap, fp + 4, &hi) ||
++		    !clover_user_read32(pmap, fp + 8, &rlo) ||
++		    !clover_user_read32(pmap, fp + 12, &rhi)) {
++			break;
++		}
++		parent = (uint64_t)lo | ((uint64_t)hi << 32);
++		ret = (uint64_t)rlo | ((uint64_t)rhi << 32);
++		if (ret == 0) {
++			break;
++		}
++		frames[i++] = ret;
++		if (parent <= fp) {
++			break;
++		}
++		fp = parent;
++	}
++	return i;
++}
++
+ /*
+  * Round211. Walk one thread's kernel stack the way kdp does: the kernel
+  * saved state sits at the top of the thread's kernel stack, and each
+@@ -11392,6 +11452,11 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 	uint64_t ux1[6];
+ 	uint64_t ux2[6];
+ 	uint64_t ux3[6];
++	uint64_t ufp[6];
++	uint64_t ulr[6];
++	uint64_t usp[6];
++	uint64_t uframes[6][6];
++	uint32_t ufn[6];
+ 	uint32_t ust[6];
+ 	uint32_t un = 0;
+ 	uint32_t uall = 0;
+@@ -11549,6 +11614,10 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 		ux1[un] = x[1];
+ 		ux2[un] = x[2];
+ 		ux3[un] = x[3];
++		ufp[un] = (uint64_t)saved_state64(ss)->x[29];
++		ulr[un] = (uint64_t)saved_state64(ss)->x[30];
++		usp[un] = (uint64_t)get_saved_state_sp(ss);
++		ufn[un] = 0;
+ 		wrote = snprintf(wsig + woff, sizeof(wsig) - (size_t)woff,
+ 		    " %llx:%x:%llx", (unsigned long long)thr->thread_id, thr->state,
+ 		    (unsigned long long)(uintptr_t)thr->continuation);
+@@ -11653,6 +11722,15 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 			    "bbq", secs, "r232");
+ 		}
+ 	}
++	/*
++	 * Round236. Only a sample that is about to print pays for the walk: the frame chain
++	 * is the reading, but it is also six address spaces' worth of translation, and the
++	 * signature gate above is what keeps a quiet boot inside the tee's line budget.
++	 */
++	for (i = 0; i < un; i++) {
++		ufn[i] = clover_user_bp_walk(vm_map_pmap(task->map), ufp[i], usp[i],
++		    uframes[i], 6);
++	}
+ 	for (i = 0; i < un; i++) {
+ 		len = snprintf(line, sizeof(line),
+ 		    "clover r231: bbwait t=%llu pid=%d tid=0x%llx st=%x"
+@@ -11669,6 +11747,38 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 			printf("%s", line);
+ 		}
+ 		clover_bb_lock_word(task, utid[i], ux0[i], ux1[i], ust[i], secs);
++		/*
++		 * The registers name the wait; the chain names the promise. The frames are
++		 * raw return addresses, because both the app and the shared cache have a
++		 * slide and only the host can resolve them.
++		 */
++		{
++			char ft[96];
++			int foff = 0;
++			uint32_t j;
++
++			ft[0] = '\0';
++			for (j = 0; j < ufn[i]; j++) {
++				int wrote = snprintf(ft + foff, sizeof(ft) - (size_t)foff,
++				    " %llx", (unsigned long long)uframes[i][j]);
++				if (wrote <= 0 || wrote >= (int)(sizeof(ft) - (size_t)foff)) {
++					break;
++				}
++				foff += wrote;
++			}
++			len = snprintf(line, sizeof(line),
++			    "clover r236: bbustk t=%llu pid=%d tid=0x%llx sp=%llx"
++			    " fp=%llx lr=%llx fn=%u%s\n",
++			    (unsigned long long)secs, pid,
++			    (unsigned long long)utid[i],
++			    (unsigned long long)usp[i],
++			    (unsigned long long)ufp[i],
++			    (unsigned long long)ulr[i], ufn[i], ft);
++			if (len > 0) {
++				line[sizeof(line) - 1] = '\0';
++				printf("%s", line);
++			}
++		}
+ 	}
+ 	task_deallocate(task);
+ }

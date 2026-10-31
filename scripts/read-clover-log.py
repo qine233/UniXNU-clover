@@ -96,6 +96,10 @@ FLIGHT_ENTRY_OFFSET = 32   # round210: the gap the report window and the driver'
 FLIGHT_ENTRY_SLOTS = 12
 FLIGHT_BEAT_OFFSET = 56    # four one-block beats, 4 s apart, at the end of that gap
 FLIGHT_BEAT_SLOTS = 4
+FLIGHT_DEADLINE_OFFSET = 60   # round236: the deadline fires once and gets its own block
+FLIGHT_DEADLINE_SLOTS = 1
+FLIGHT_PANIC_OFFSET = 61      # round236: the sink's entry and exit, one block each
+FLIGHT_PANIC_SLOTS = 2
 FLIGHT_KIND = 23
 BOOT_OFFSET = KERNEL_OFFSET + 2 * KERNEL_SLOTS   # round212: one block after the kernel ring
 BOOT_KIND = 24
@@ -105,8 +109,8 @@ DUMP_SECTORS = BOOT_OFFSET + 1    # round212 adds the boot record past the end o
 KINDS = {17: "report-17", 19: "report-19", 20: "panic-20",
          21: "verdict-21", 22: "kernel-22", 23: "flight-23",
          24: "boot-24", 25: "probe-25"}
-FLIGHT_EVENTS = {1: "read", 2: "write", 3: "beat"}
-FLIGHT_DIRS = {0: "read", 1: "write", 2: "beat"}
+FLIGHT_EVENTS = {1: "read", 2: "write", 3: "beat", 4: "deadline", 5: "panic"}
+FLIGHT_DIRS = {0: "read", 1: "write", 2: "beat", 3: "none"}
 # Round213's holder stages. A beat whose stage word has not moved for 75 s is the request that
 # stopped, so the name is what the dump prints where r212 could only print the request.
 FLIGHT_STAGES = {0: "idle", 1: "entry", 2: "idleWait", 3: "check", 4: "adma", 5: "batch",
@@ -277,41 +281,45 @@ def report(records, newest_only=False, order_by_seq=False):
 
 
 FLIGHT_WORDS = 35
+FLIGHT_BLOCK_WORDS = SECTOR // 4   # round236: extras live at 35.., so the whole block is read
 
 
 def decode_flight(data, first_lba):
-    """The round210 flight region: {"entries": [...], "beats": [...]} in slot order.
+    """The flight region: entries, beats, the deadline record and the panic markers.
 
-    Each record is one block with FLIGHT_WORDS little-endian words and no text block, so
-    there is no body and no sum -- the header *is* the record. Word order is what
+    Each record is one block with FLIGHT_WORDS little-endian header words and no text block,
+    so there is no body and no sum -- the header *is* the record. Word order is what
     flightWrite lays down in CloverSdhci.cpp; a reader that disagrees about one word
     would print a plausible table of the wrong columns, so the selftest round-trips
-    every field.
+    every field. Round236 adds words 35.. as event-specific extras: the deadline's
+    signed-side numbers (seconds, ticks, cnt0, cnt1, freq, each a 64-bit pair) and the
+    panic marker's gate states with the sink's append rc.
 
-    Slots are reused modulo 12 (entries) and modulo 4 (beats) and seq restarts at zero
-    each boot. Walking back from the highest seq therefore stops at the first slot whose
-    stored seq is not the one the walk needs, and never below zero: records of this boot
-    are the contiguous run 0..top, because flightWrite increments seq only after the
-    block it wrote, so a gap means a slot that was never written this boot -- not a
-    sequence number that was skipped.
+    Slots are reused modulo 12 (entries), modulo 4 (beats), once (deadline) and twice
+    (panic) and seq restarts at zero each boot. Walking back from the highest seq
+    therefore stops at the first slot whose stored seq is not the one the walk needs,
+    and never below zero: records of this boot are the contiguous run 0..top, because
+    flightWrite increments seq only after the block it wrote, so a gap means a slot that
+    was never written this boot -- not a sequence number that was skipped.
 
     What this cannot tell apart is an earlier boot's run that also survives intact and
-    reaches a higher seq than this boot's: every record of every boot is congruent with
-    its own slot, so congruence alone does not name a boot. Round210 is the first boot
-    to write this region, so a fresh partition has no such run; a later round has to
-    stamp a boot id into the record before the chain can be trusted across two r210+
-    boots.
+    reaches a higher seq than this boot's, unless the higher writer's boot id is in the
+    record. The entries and beats carry none (r210), the panic marker carries gBootId
+    (r236), and the boot record at sector 1216 names the current boot, so a panic
+    marker can be attributed and a chain can be bounded by it.
     """
     groups = {}
     for name, base, slots, event in (("entries", FLIGHT_ENTRY_OFFSET, FLIGHT_ENTRY_SLOTS, None),
-                                     ("beats", FLIGHT_BEAT_OFFSET, FLIGHT_BEAT_SLOTS, 3)):
+                                     ("beats", FLIGHT_BEAT_OFFSET, FLIGHT_BEAT_SLOTS, 3),
+                                     ("deadline", FLIGHT_DEADLINE_OFFSET, FLIGHT_DEADLINE_SLOTS, 4),
+                                     ("panic", FLIGHT_PANIC_OFFSET, FLIGHT_PANIC_SLOTS, 5)):
         records = []
         for slot in range(slots):
             sector = base + slot
             block = data[sector * SECTOR:(sector + 1) * SECTOR]
             if len(block) < SECTOR:
                 break
-            words = struct.unpack_from(f"<{FLIGHT_WORDS}I", block)
+            words = struct.unpack_from(f"<{FLIGHT_BLOCK_WORDS}I", block)
             if (words[0], words[1]) != MAGIC:
                 break
             problems = []
@@ -327,7 +335,7 @@ def decode_flight(data, first_lba):
             if words[7] not in FLIGHT_DIRS:
                 problems.append(f"dir {words[7]} unknown")
             if event is not None and words[6] != event:
-                problems.append(f"event {words[6]} is not a beat")
+                problems.append(f"event {words[6]} is not a {FLIGHT_EVENTS[event]}")
             record = {
                 "slot": slot, "lba": words[2], "seq": words[4], "event": words[6],
                 "dir": words[7], "op_lba": words[8], "op_blocks": words[9],
@@ -341,10 +349,24 @@ def decode_flight(data, first_lba):
                 "stuck_stage": words[27], "stage_lba": words[28], "stage_blocks": words[29],
                 "stage_pid": words[30], "stage_dir": words[31],
                 "cur_pid": words[32], "comm0": words[33], "comm1": words[34],
+                "extra": words[35:],
             }
             records.append((slot, record, problems))
         groups[name] = records
     return groups
+
+
+def flight_pairs(words, count):
+    """Round236's extras: `count` little-endian 64-bit values from the first word on."""
+    return [words[2 * index] | (words[2 * index + 1] << 32) for index in range(count)]
+
+
+def flight_pairs_words(values):
+    """The inverse of flight_pairs, for selftest."""
+    words = []
+    for value in values:
+        words.extend((value & 0xFFFFFFFF, value >> 32))
+    return words
 
 
 def flight_chain(records):
@@ -380,17 +402,21 @@ def flight_comm(record):
 
 
 def flight_report(groups):
-    """Print the two chains and the one conclusion this round is built to support.
+    """Print the four chains and the one conclusion this round is built to support.
 
     The last entry record names a request whose result word belongs to the request
     *before* it, so the newest entry is the one with no successor: the request in
     flight when the writing stopped. The newest beat's time bounds when the guard and
     the controller were still accepting commands, and a gap between the two is where
-    the stop happened.
+    the stop happened. Round236's deadline record is the one record that says the
+    deadline itself fired when the sink could not, and the panic markers say whether
+    the sink ran before the deadline or after it.
     """
     entries = flight_chain(groups["entries"])
     beats = flight_chain(groups["beats"])
-    written = len(groups["entries"]) + len(groups["beats"])
+    deadline = flight_chain(groups["deadline"])
+    panic = flight_chain(groups["panic"])
+    written = sum(len(groups[name]) for name in ("entries", "beats", "deadline", "panic"))
     if entries:
         span = f"seq {entries[0]['seq']}..{entries[-1]['seq']}"
     else:
@@ -441,6 +467,31 @@ def flight_report(groups):
         print("flight: entries without any beat -- no beat ever found the guard free")
     elif beats:
         print("flight: beats without any entry -- no block request started after arming")
+    # Round236: the deadline record is written from the timer interrupt ahead of panic(), so it
+    # exists on a boot whose sink never reached the card. The panic markers say what the sink
+    # itself managed: entry with the gates, and exit with the append rc or nothing at all.
+    if deadline:
+        record = deadline[-1]
+        seconds, ticks, cnt0, cnt1, freq = flight_pairs(record["extra"], 5)
+        period = ((cnt1 - cnt0) / freq) if freq and cnt1 > cnt0 else 0.0
+        print(f"flight: deadline fired after {seconds} s at t={record['t_ms']} ms "
+              f"ps={record['present']:#010x} ticks={ticks} cnt0={cnt0:#x} cnt1={cnt1:#x} "
+              f"freq={freq} elapsed={period:.3f}s")
+    else:
+        print("flight: no deadline record -- the deadline either did not fire or could not write")
+    if panic:
+        print(f"flight: {len(panic)} panic marker records in this boot's window")
+        for record in panic:
+            stage, log_ready, owner, log_first, rc, drained, boot, gates = record["extra"][:8]
+            print(f"  panic seq {record['seq']:>3} slot {record['slot']:>2} "
+                  f"t={record['t_ms']:>8}ms stage={stage} log_ready={log_ready} "
+                  f"host={owner:#x} log_first={log_first} rc={rc} drained={drained} "
+                  f"boot={boot} gates={gates:#x}"
+                  f"({'armed,' if gates & 1 else ''}"
+                  f"{'bcb,' if gates & 2 else ''}"
+                  f"{'text' if gates & 4 else ''})")
+    else:
+        print("flight: no panic marker -- the sink never entered, or its first write refused")
     return written
 
 
@@ -449,18 +500,25 @@ def build_flight_record(lba, seq, event, dir_, op_lba, op_blocks, t_ms=0, presen
                         guard_waits=0, beat_misses=0, pending=(0, 0), slot=None, kind=FLIGHT_KIND,
                         stage=0, stage_ms=0, stuck=0, recovered=0, steals=0, stuck_stage=0,
                         stage_lba=0, stage_blocks=0, stage_pid=0, stage_dir=0,
-                        cur_pid=0, comm=(0, 0)):
-    """One round210 flight block as flightWrite lays it out, for selftest."""
+                        cur_pid=0, comm=(0, 0), extra=()):
+    """One flight block as flightWrite lays it out, for selftest."""
     if slot is None:
-        slot = seq % (FLIGHT_BEAT_SLOTS if event == 3 else FLIGHT_ENTRY_SLOTS)
+        slots = {3: FLIGHT_BEAT_SLOTS, 4: FLIGHT_DEADLINE_SLOTS}.get(event, FLIGHT_ENTRY_SLOTS)
+        if event == 5:
+            slots = FLIGHT_PANIC_SLOTS
+        slot = seq % slots
     flags = ((present & 1) and 1 or 0) | ((present & 2) and 2 or 0) | (4 if event == 3 else 0)
-    return struct.pack(f"<{FLIGHT_WORDS}I", MAGIC[0], MAGIC[1], lba, kind, seq, slot,
-                       event, dir_, op_lba, op_blocks, t_ms, prev_done, prev_ms,
-                       present, flags, ops, guard_waits, beat_misses, pending[0],
-                       pending[1], prev_dir, prev_blocks,
-                       stage, stage_ms, stuck, recovered, steals, stuck_stage,
-                       stage_lba, stage_blocks, stage_pid, stage_dir,
-                       cur_pid, comm[0], comm[1]).ljust(SECTOR, b"\0")
+    words = [MAGIC[0], MAGIC[1], lba, kind, seq, slot,
+             event, dir_, op_lba, op_blocks, t_ms, prev_done, prev_ms,
+             present, flags, ops, guard_waits, beat_misses, pending[0],
+             pending[1], prev_dir, prev_blocks,
+             stage, stage_ms, stuck, recovered, steals, stuck_stage,
+             stage_lba, stage_blocks, stage_pid, stage_dir,
+             cur_pid, comm[0], comm[1]]
+    assert len(words) == FLIGHT_WORDS, len(words)
+    words.extend(extra)
+    assert len(words) < SECTOR // 4, len(words)
+    return struct.pack(f"<{len(words)}I", *words).ljust(SECTOR, b"\0")
 
 
 def build_record(kind, slot, lba, body_text, seq=0, boot=0):
@@ -502,7 +560,9 @@ def selftest():
     # the 1216-sector dump both rings already read and no window moved to make room for it.
     assert FLIGHT_ENTRY_OFFSET == 2 * REPORT_SLOTS, FLIGHT_ENTRY_OFFSET
     assert FLIGHT_ENTRY_OFFSET + FLIGHT_ENTRY_SLOTS <= FLIGHT_BEAT_OFFSET, FLIGHT_BEAT_OFFSET
-    assert FLIGHT_BEAT_OFFSET + FLIGHT_BEAT_SLOTS <= VERDICT_OFFSET, FLIGHT_BEAT_OFFSET
+    assert FLIGHT_BEAT_OFFSET + FLIGHT_BEAT_SLOTS <= FLIGHT_DEADLINE_OFFSET, FLIGHT_DEADLINE_OFFSET
+    assert FLIGHT_DEADLINE_OFFSET + FLIGHT_DEADLINE_SLOTS <= FLIGHT_PANIC_OFFSET, FLIGHT_PANIC_OFFSET
+    assert FLIGHT_PANIC_OFFSET + FLIGHT_PANIC_SLOTS <= VERDICT_OFFSET, FLIGHT_PANIC_OFFSET
 
     dump = bytearray()
     dump += build_record(19, 0, first_lba, "bring-up report", boot=boot_id)
@@ -625,7 +685,7 @@ def selftest():
     # Round210's flight region: 14 entries and 6 beats wrap both slot counts, every field is
     # round-tripped, and the chain walk picks the newest run instead of the largest time stamp --
     # the stale case below is the one that matters, because a partition is not erased per boot.
-    flight = bytearray((FLIGHT_BEAT_OFFSET + FLIGHT_BEAT_SLOTS) * SECTOR)
+    flight = bytearray((FLIGHT_PANIC_OFFSET + FLIGHT_PANIC_SLOTS) * SECTOR)
 
     def place(target, block, sector):
         target[sector * SECTOR:(sector + 1) * SECTOR] = block
@@ -651,6 +711,25 @@ def selftest():
                                   seq, 3, 2, 0, 0, t_ms=1000 + 4000 * seq, present=0,
                                   ops=seq, guard_waits=1, beat_misses=seq, pending=(9, 1)),
               FLIGHT_BEAT_OFFSET + seq % FLIGHT_BEAT_SLOTS)
+    # Round236: one deadline record with its five 64-bit numbers, and the sink's two markers
+    # with the entry gates and the append's return code. The deadline's dir word is 3 ("none")
+    # because the record is not a sector request, and the decoder has to accept it as such.
+    deadline_values = (1800, 108000, 0x1000, 0x2000, 19200000)
+    place(flight,
+          build_flight_record(first_lba + FLIGHT_DEADLINE_OFFSET, 0, 4, 3, 0, 0,
+                              t_ms=1800000, present=0, stage=12, stage_ms=79000,
+                              extra=flight_pairs_words(deadline_values)),
+          FLIGHT_DEADLINE_OFFSET)
+    panic_entry = (1, 1, 0x77, 1, 103, 3, boot_id, 7)
+    panic_exit = (1, 1, 0x77, 1, 2, 3, boot_id, 7)
+    place(flight,
+          build_flight_record(first_lba + FLIGHT_PANIC_OFFSET, 0, 5, 3, 0, 0,
+                              t_ms=1800100, present=0, extra=panic_entry),
+          FLIGHT_PANIC_OFFSET)
+    place(flight,
+          build_flight_record(first_lba + FLIGHT_PANIC_OFFSET + 1, 1, 5, 3, 0, 0,
+                              t_ms=1800200, present=0, extra=panic_exit),
+          FLIGHT_PANIC_OFFSET + 1)
     groups = decode_flight(bytes(flight), first_lba)
     entries = flight_chain(groups["entries"])
     beats = flight_chain(groups["beats"])
@@ -672,7 +751,22 @@ def selftest():
             newest["cur_pid"]) == (3, 130, 3, 2, 2, 1, 2013, 4, 113, 1, 313), newest
     assert flight_comm(newest) == "apfs", newest
     assert all(not problems for _, _, problems in groups["entries"] + groups["beats"])
-    assert flight_report(groups) == len(groups["entries"]) + len(groups["beats"])
+    # Round236's two record kinds: the deadline's 64-bit numbers and the panic marker's gate
+    # words round-trip through the same decoder, so a swapped pair would print a plausible
+    # deadline that never happened.
+    deadline_chain = flight_chain(groups["deadline"])
+    assert [record["seq"] for record in deadline_chain] == [0], deadline_chain
+    assert deadline_chain[0]["event"] == 4, deadline_chain[0]
+    assert deadline_chain[0]["dir"] == 3, deadline_chain[0]
+    assert flight_pairs(deadline_chain[0]["extra"], 5) == list(deadline_values), deadline_chain[0]
+    assert (deadline_chain[0]["stage"], deadline_chain[0]["stage_ms"]) == (12, 79000), deadline_chain[0]
+    panic_chain = flight_chain(groups["panic"])
+    assert [record["seq"] for record in panic_chain] == [0, 1], panic_chain
+    assert tuple(panic_chain[0]["extra"][:8]) == panic_entry, panic_chain[0]
+    assert tuple(panic_chain[1]["extra"][:8]) == panic_exit, panic_chain[1]
+    assert all(not problems for _, _, problems in groups["deadline"] + groups["panic"])
+    assert flight_report(groups) == sum(len(groups[name]) for name in
+                                        ("entries", "beats", "deadline", "panic"))
 
     # A boot that stopped after five requests leaves slots 5..11 with whatever was there
     # before. A slot whose seq word does not name its own slot ends the chain instead of
@@ -727,8 +821,9 @@ def main():
                         help="read the kernel-log ring the round175 tee writes (kind 22, "
                              "sectors 192..1215)")
     parser.add_argument("--flight", action="store_true",
-                        help="read the round210 flight region instead: entry records (kind 23, "
-                             "sectors 32..43) and four-second beats (sectors 56..59)")
+                        help="read the flight region instead: entry records (kind 23, sectors "
+                             "32..43), four-second beats (sectors 56..59), round236's deadline "
+                             "record (sector 60) and panic markers (sectors 61..62)")
     parser.add_argument("--driver", action="store_true",
                         help="of the ring being read, only the lines CloverSdhci said itself; over "
                              "--tee this is expected to be empty, and is a check that the tee is not "
@@ -752,11 +847,12 @@ def main():
     if len(data) < SLOT_BYTES:
         raise SystemExit(f"{path} is {len(data)} bytes; the first slot alone is {SLOT_BYTES}")
     if args.flight:
-        need = (FLIGHT_BEAT_OFFSET + FLIGHT_BEAT_SLOTS) * SECTOR
+        need = (FLIGHT_PANIC_OFFSET + FLIGHT_PANIC_SLOTS) * SECTOR
         if len(data) < need:
             raise SystemExit(f"{path} is {len(data)} bytes; the flight region needs {need}")
         groups = decode_flight(data, args.first_lba)
-        written = len(groups["entries"]) + len(groups["beats"])
+        written = sum(len(groups[name]) for name in
+                      ("entries", "beats", "deadline", "panic"))
         if args.count:
             print(written)
             return 0 if written else 1

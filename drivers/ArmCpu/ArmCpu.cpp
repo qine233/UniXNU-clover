@@ -17,6 +17,9 @@ extern "C" void rtclock_intr (unsigned int);
 // Round210: the storage driver's flight beat. This is the one clock that outlives the block layer,
 // so CPU0's tick is where the controller gets sampled when nothing else is running.
 extern "C" void clover_emmc_flight_beat (void);
+extern "C" void clover_emmc_flight_deadline (unsigned long long seconds, unsigned long long ticks,
+                                             unsigned long long cnt0, unsigned long long cnt1,
+                                             unsigned long long freq);
 // Kernel-internal entries used for secondary CPU startup (Darwin 23 osfmk).
 extern "C" vm_offset_t ml_static_vtop (vm_offset_t);
 extern "C" char LowResetVectorBase[], LowResetVectorEnd[], ResetHandlerData[], const_boot_args[];
@@ -642,6 +645,11 @@ void ArmCpu::interrupt (void)
         if (now - gTick0Counter >= gUnattendedSeconds * gTickCounterFrequency) {
           uint64_t elr = 0, spsr = 0;
           __asm__ volatile ("mrs %0, elr_el1\n\tmrs %1, spsr_el1" : "=r" (elr), "=r" (spsr));
+          // Round236: the deadline gets its own block on the card before the panic screen runs, because
+          // the sink is exactly what boot 24's card busies starved. Forced past the guard and the arming
+          // gates, but still bounded, and one-shot so only the first CPU to arrive writes it.
+          clover_emmc_flight_deadline (gUnattendedSeconds, armcpu_timer_interrupts, gTick0Counter, now,
+                                       gTickCounterFrequency);
           panic ("clover r148: unattended deadline %llu s (elr=%llx spsr=%llx ticks=%llu cnt0=%llx cnt1=%llx freq=%llx)",
                  gUnattendedSeconds, entryElr, entrySpsr, armcpu_timer_interrupts, gTick0Counter, now,
                  gTickCounterFrequency);
