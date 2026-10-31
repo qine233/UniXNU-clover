@@ -971,7 +971,8 @@ def check_sb_sample(kernel: bytes) -> bool:
              "census-hbt": (b"clover r243: hbt len=%u u32=%u\n") in kernel,
              "census-buttons": (b"clover r243: path buttons=%s\n") in kernel,
              "census-model": (b"clover r243: model=%.16s\n") in kernel,
-             "census-svc": (b"clover r243: svc total=%d button-family=%d\n") in kernel,
+             "census-svc": (b"clover r243: svc total=%d stopped=%d button-family=%d\n") in kernel,
+             "census-plane": (b"clover r243: plane byname=%s buttons byname=%s\n") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
                            b"dropped=%u comms=%u\n") in kernel,
              "tee-sync": (b"CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n") in kernel}

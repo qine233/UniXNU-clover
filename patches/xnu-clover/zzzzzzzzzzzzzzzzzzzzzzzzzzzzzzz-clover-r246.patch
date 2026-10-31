@@ -1,0 +1,118 @@
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -242,7 +242,13 @@
+  * the walk names every node fromPath sees, the four property reads answer the
+  * four questions the block turns on, and /chosen is the positive control --
+  * r205 proved its display-scale reaches userland.
++ */
++
++/*
++ * Round246. A bound for the service-plane walk, generous next to what this
++ * board has ever published and small next to what would take the boot minute.
+  */
++static const int kCloverSvcCap = 8000;
+ 
+ /*
+  * Round245. This translation unit does not pull in <string.h>, and a registry
+@@ -349,7 +355,38 @@
+ 				    (unsigned int) d->getLength(), v);
+ 			} else {
+ 				printf("clover r243: hbt absent\n");
++			}
++			e->release();
++		}
++	}
++	/*
++	 * Round246. The lookup above holds the plane object, which is not what a
++	 * userland caller has. IOKitServer hands fromPath() a null plane and the
++	 * path itself carries "IODeviceTree:", so the name is resolved with
++	 * getPlane() -- and a null result is a null entry, which is the answer
++	 * libMobileGestalt turns into the default integer. Boot 33 proved the
++	 * object path reads 2, and the wait says userland did not get 2, so the
++	 * name is the one part of this chain that has never been looked at.
++	 */
++	{
++		const IORegistryPlane *byname = IORegistryEntry::getPlane("IODeviceTree");
++		IORegistryEntry       *e = byname != NULL ?
++		    IORegistryEntry::fromPath("/buttons", byname) : NULL;
++
++		printf("clover r243: plane byname=%s buttons byname=%s\n",
++		    byname != NULL ? "ok" : "missing", e != NULL ? "present" : "missing");
++		if (byname != NULL) {
++			o = e != NULL ? e->getProperty("home-button-type") : NULL;
++			d = OSDynamicCast(OSData, o);
++			if (d != NULL) {
++				const unsigned char *b = (const unsigned char *) d->getBytesNoCopy();
++				unsigned int v = (d->getLength() >= 4 && b != NULL) ?
++				    (unsigned int)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) : 0;
++				printf("clover r243: hbt byname len=%u u32=%u\n",
++				    (unsigned int) d->getLength(), v);
+ 			}
++		}
++		if (e != NULL) {
+ 			e->release();
+ 		}
+ 	}
+@@ -396,38 +433,45 @@
+ 		root->release();
+ 	}
+ 	/*
+-	 * Round245. The other half of the question: the ready notification the
+-	 * blocked thread waits for is issued by whatever resolves the button, so the
+-	 * service plane gets walked for the classes that could own it. backboardd's
+-	 * own log string says "not configuring SSHB because we don't have a real
+-	 * home button", which makes the resolver the notification's only candidate.
++	 * Round246. Boot 34 read svc total=1, and that is the instrument, not the
++	 * board: without the recursive option the iterator walks the plane root's
++	 * children, and the IOService root has exactly one child -- the platform
++	 * expert -- with every other service below it. The walk is now
++	 * kIORegistryIterateRecursively over the whole plane, with getNextObject-
++	 * Recursive keeping its own done-set, and it stops at a bound that is
++	 * printed so a short count can never be read as an empty plane.
+ 	 */
+ 	{
+ 		IORegistryIterator  *si;
+ 		IORegistryEntry     *svc;
+-		int                  total = 0, matched = 0;
++		int                  total = 0, matched = 0, stopped = 0;
+ 
+-		si = IORegistryIterator::iterateOver(gIOServicePlane, 0);
++		si = IORegistryIterator::iterateOver(gIOServicePlane,
++		    kIORegistryIterateRecursively);
+ 		if (si == NULL) {
+ 			printf("clover r243: svc no-iterator\n");
+ 		} else {
+-			while ((svc = si->getNextObjectFlat()) != NULL) {
++			while (total < kCloverSvcCap &&
++			    (svc = si->getNextObjectRecursive()) != NULL) {
+ 				const char *nm = svc->getName();
++
+ 				total++;
+-				if (nm == NULL) {
+-					continue;
+-				}
+-				if (clover_name_has(nm, "utton") || clover_name_has(nm, "HID") ||
+-				    clover_name_has(nm, "aptic") || clover_name_has(nm, "SSB") ||
+-				    clover_name_has(nm, "Resolver")) {
++				if (nm != NULL && (clover_name_has(nm, "utton") ||
++				    clover_name_has(nm, "HID") || clover_name_has(nm, "aptic") ||
++				    clover_name_has(nm, "SSB") || clover_name_has(nm, "Resolver"))) {
+ 					matched++;
+-					if (matched <= 12) {
++					if (matched <= 20) {
+ 						printf("clover r243: svc %.24s\n", nm);
+ 					}
+ 				}
++				svc->release();
+ 			}
++			if (total >= kCloverSvcCap && si->getNextObjectRecursive() != NULL) {
++				stopped = 1;
++			}
+ 			si->release();
+-			printf("clover r243: svc total=%d button-family=%d\n", total, matched);
++			printf("clover r243: svc total=%d stopped=%d button-family=%d\n",
++			    total, stopped, matched);
+ 		}
+ 	}
+ 	printf("clover r243: census done nodes=%d\n", seen);

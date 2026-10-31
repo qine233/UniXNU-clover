@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r245: boot 33 read the IODeviceTree plane complete -- /buttons resolves in-kernel and its home-button-type is len=4 u32=2 -- and the SSHB haptics wait stood untouched (bbgrp cnt=1 g=0 wait=1, killsig SpringBoard<-backboardd), so the ADT is not the gap; backboardd's two stubs now decode to [[BSPlatform sharedInstance] homeButtonType], which keeps the getter chain and moves the question to userland, so the census also names the root model (hw.product, the prefix MobileGestalt matches before any identity answer) and counts the IOService entries that could ever issue the controller-ready notification (Button/HID/Haptics/SSHB/Resolver)"
+title = "clover r246: boot 34 kept the ADT verdict (model=iPad7,1, /buttons resolves, home-button-type len=4 u32=2) and the wait stood (bbgrp cnt=1 g=0 wait=1) -- and the service count turned out to be the instrument, not the board: a one-level walk of the IOService plane always returns 1, because its root has one child, the platform expert. The walk is now recursive over the whole plane with its bound reported, and the census adds the one read userland actually makes -- getPlane(\"IODeviceTree\") by name, the path IOKitServer takes when a caller hands it a null plane -- because the branch backboardd takes says homeButtonType != 2, while the kernel reads 2, so the name is the part of the chain that has never been looked at"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

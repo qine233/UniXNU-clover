@@ -18272,3 +18272,49 @@ boot 33 已经证明内核自己按 MG 同款路径读到 `home-button-type` 的
 这两条都还没被任何一块板子上的读数区分开，r245 的 `svc total=/button-family=` 正是
 为此而设：如果板上压根没有一个能发 ready 通知的服务，那 !=2 这一侧永远是死路，
 无论答案从哪来。
+
+## r245 读数（boot 34）与 r246（把点名改成用户态那一问）
+
+boot 34（`~/clover-out/round245-log-window.bin`，deadline 1800 s 到点，卡上窗口 512 条）：
+
+```
+[1500.049245] clover r243: census t=1500
+[1500.049273] clover r243: node /J120AP            （9 个节点同上，/J120AP/buttons 在列）
+[1500.049383] clover r243: path buttons=buttons
+[1500.049400] clover r243: hbt len=4 u32=2
+[1500.049450] clover r243: target=J120
+[1500.049459] clover r243: model=iPad7,1
+[1500.049475] clover r243: svc total=1 button-family=0
+[1500.049484] clover r243: census done nodes=9
+...
+[1329.023264] clover r239: bbgrp t=1323 pid=58 tid=0x443 base=101193370 b=fffffffd g=0 cnt=1 wait=1
+```
+
+- `model=iPad7,1`：根 `model` 确实进了平面，MobileGestalt 的前缀分派前提成立。
+- **`svc total=1` 是仪器自己的错，不是板子的答复**：`IORegistryIterator::iterateOver(plane, 0)`
+  只走平面根的**一层孩子**，而 IOService 平面的根只有唯一一个孩子在最上面——platform expert
+  （`iterateOver(plane, options)` = `iterateOver(gRegistryRoot, plane, options)`，
+  `IORegistryEntry.cpp:2374`），其它服务全在它下面。所以这一列永远报 1，`button-family=0`
+  同样是 0，既不能证明「板上没有按键类服务」，也不能否定。**预先写下的两条判决分支因此都没被
+  触发**，boot 34 只结掉了 model 那一半。
+- 于是 r246 改两处：
+  1. 服务平面改成 `kIORegistryIterateRecursively` + `getNextObjectRecursive()` 整平面遍历，
+     带上限 `kCloverSvcCap=8000` 且把 `stopped=` 一起报出来，短计数不再可能被读成空平面。
+  2. 新增**用户态那一问**：`IORegistryEntry::getPlane("IODeviceTree")`，再按这个平面查
+     `/buttons` 并读 `home-button-type`（`plane byname=` / `buttons byname=` / `hbt byname=`）。
+     依据是内核代码本身：调用方不带平面对象时，`fromPath()` 从路径里截出平面名交给
+     `getPlane()`（`IORegistryEntry.cpp:1584-1593`），用户客户端注册表调用同样走
+     `IOUserClient.cpp:3464`；`getPlane()` 返回 NULL 就是 NULL 条目，而 MobileGestalt 把
+     「查不到」写成默认整数。
+- 判决规则（boot 35 直接对号，不再增设假设）：
+  - `plane byname=missing` ⇒ 根因找到：平面对象存在但**没有以名字注册**，内核读得到、用户态读
+    不到。下一步修注册一侧（`makePlane(kIODeviceTreePlane)` 在
+    `IODeviceTreeSupport.cpp:132` 是否真的跑到、以及 clover 的 ARM DT 平台是否另建了平面）。
+  - `plane byname=ok` 且 `buttons byname=present` 且 `hbt byname len=4 u32=2` ⇒ 用户态等价路径
+    在平面这一层是通的，死等只能来自 MobileGestalt 自己的闸门（r245 在 `.11` 里看到的
+    `bl 0x52aa38` 一次性 sysctl）或答案另有来源；下一轮改为把那一问的**来源**钉死，而不再动 ADT。
+  - `svc total` 明显大于 1（几百以上）而 `button-family=0` ⇒ 板上确实没有任何按键/HID/触感类
+    服务，走「补一个 HID home 提供者」这条 sheng 已验证的路（`offline-hid-input`/
+    `offline-hid-home` + 上游 `drivers/NativeHidInput`，其 report 2 bit 0 就是 Consumer/Menu(Home)）。
+  - `svc total` 仍为 1 且 `stopped=0` ⇒ 服务平面真的只有一个条目，说明 IOKit 的服务发布整条链
+    没跑起来；那是一条比按键更靠前的线索，先查它。

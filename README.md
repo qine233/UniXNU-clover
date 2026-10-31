@@ -61,11 +61,23 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
   把 r242 那两处「引用点」查了个明白：那是 dyld chunk 基址算错造出来的假象，真正的
   两个桩用 `dyld_info -fixups` 逐个解开了选择器和类引用——`sharedInstance`、
   `homeButtonType`、`BaseBoard/_OBJC_CLASS_$_BSPlatform`，取值链本身站得住。
-* 于是不再猜节点，也不再猜反汇编，把最后两种可能各自变成一条读数：r245 让 census
-  多问两件事——服务平面里到底有没有一个能发「控制器就绪」通知的按键/HID/触感类
-  （backboardd 自己的日志串说「没有真的 home 键就不配 SSHB」，那这个通知只可能来自
-  按键解算器），以及根节点的 `model` 是不是 `iPad7,1`（MobileGestalt 回答任何身份
-  问题前会先按这个前缀分派）。两条判决规则先写死在开发日志里，读数出来就直接走。
+* 于是不再猜节点，也不再猜反汇编，把最后两种可能各自变成一条读数。r245 先把这一支的
+  语义在宿主上钉死（这次钉反过一次，随即纠正）：`applyDefinitions:` 里
+  `cmp x22,#2 / b.ne`，**`==2` 那一侧才是记一条「不配 SSHB」的日志然后直接返回**，
+  投出那条永远不 leave 的 block 的是 `!=2` 那一侧。也就是说要的是「用户态拿到 2」，
+  不是「设备树里写 2」。
+* r245 把 census 升级成判决器，加两行读数：平面根的 `model`（MobileGestalt 回答任何身份
+  问题前会先按它的前缀分派），以及 IOService 平面里按键/HID/触感/Resolver 类的点名。
+  boot 34 带回 `model=iPad7,1`（前提成立），但 `svc total=1`——这一行是仪器自己的错：
+  `iterateOver(plane, 0)` 只走平面根的一层孩子，而 IOService 平面的根在最上面只有一个孩子
+  （platform expert），其它服务全在它下面，所以这一列在任何板子上都报 1。
+* r246 于是改两处，都不猜：服务平面换成整平面递归遍历（并把上限和「有没有撞到上限」一起报
+  出来，短计数不可能再被读成空平面）；再加一行**用户态那一问**——`getPlane("IODeviceTree")`
+  按名字查平面，再用这个平面查 `/buttons` 读 `home-button-type`。依据是内核代码本身：调用方
+  不带平面对象时 `fromPath()` 从路径里截出名字交给 `getPlane()`，用户客户端的注册表调用也走
+  同一条；而 `getPlane()` 返回 NULL 就是查不到，MobileGestalt 会把「查不到」写成默认整数。
+  这条正好对上 boot 33/34 的矛盾：**内核读到 2，backboardd 的行为却是「不是 2」**。
+
 
 每一轮的设计、构建与真机读数（含本节的证据出处）都在
 [`notes/development-log.md`](notes/development-log.md) 里逐轮可查；
@@ -75,7 +87,7 @@ r236–r239 是把这条链读出来的四轮。
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点已钉到 `_controllerReadyGroup` 的 `dg_gen`；boot 28/29/30/31/33 都读到 `cnt=1 g=0 wait=1`（一次 enter、零次 leave）；boot 33 的点名证明内核侧完全正确——设备树平面 9 个节点齐全、`/buttons` 按 MG 同款路径查得到、`home-button-type` 读回 4 字节的 2；宿主 `dyld_info` 又把取值链钉成 `[[BSPlatform sharedInstance] homeButtonType]` | r245：census 升级为判决器（根节点 `model` + 服务平面按键/HID/触感类点名），boot 34 读数决定下一轮是「内核替它走完那一次 leave」还是「进 backboardd 读 BSPlatform 的缓存槽」 |
+| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点已钉到 `_controllerReadyGroup`；boot 33/34 都读到 `cnt=1 g=0 wait=1`，且内核侧平面完整（9 个节点、`/buttons` 查得到、`home-button-type` len=4 u32=2、根 `model=iPad7,1`）；宿主把分支语义钉反了一次——`==2` 才是「记一条日志、跳过 SSHB」，投死等 block 的是 `!=2` 一侧，所以用户态拿到的不是 2 | r246：服务平面改整平面递归点名（带上限与撞限位），并新增用户态等价问（`getPlane("IODeviceTree")` → `/buttons` → `home-button-type`），boot 35 按写死的分支走 |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 3），再问地址 |
 | 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |
