@@ -4,20 +4,37 @@
 ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。
 配套固件仓库 `uefi-clover`（Mu-Silicium 移植），驱动与硬件常量在 `porting.toml`。
 
-现状一句话：**SpringBoard 的请求被 backboardd 取走了、回信没有回来；backboardd 的一个线程
-（boot 25 主线程 0x42f、boot 26 工作队列 0x461）停在自己进程内的一个 block 里，经 libdispatch
-的 drain/thunk 通路走到 `___ulock_wait`，在一个堆上的 dispatch 对象上无限等待，而对象的值字
-至今是 0——不是内核阻塞。**
+现状一句话：**SpringBoard 的请求被 backboardd 取走了、回信没有回来；backboardd 的工作队列
+线程在 `BKButtonHapticsController` 的一个 block 里，对 home button 定义上的一个
+`OS_dispatch_group` 无限等待——组的 gen 从未前进、也从未有人 wake，是这个进程内欠了一次
+`dispatch_group_leave`，不是内核阻塞。**
 XNU 起来、三卷全挂、launchd 把守护进程拉起来。
-boot 26（r237，死线 1800 s）把 pid 58 的 ulock wait/wake 按地址记成表：记到的 8 个地址全是
-健康等待（15 次 wait、次次 woken、rc 0、无溢出），卡住的那个字 `0x15dd8f944` 不在表里——
-dump 只印前 8 槽，且钩子要等 pid 闩锁（首次采样 t≈1007），等待早于闩锁更可能是被丢掉的原因。
-10 帧栈把 boot 26 的等待线程符号化到 `__pthread_wqthread`/`_start_wqthread`：这次是
-libdispatch 工作队列线程（boot 25 是主线程 0x42f），backboardd 镜像偏移 0x303e4 的 block
-经 continuation 进来、在 block 内部等；对象头 9 拍逐字节相同（isa=0x1f7e54bf0、
-val=0x100000002、等待字仍 0）。
-r238 把过滤点移到 `sys_ulock.c` 按进程名匹配，12 槽全打印并加 seen/filtered/stored/overflow
-计数与阻塞行的当前等待字——让卡住的地址要么进表，要么用计数证明被丢在哪一步。
+boot 27（r238，死线 1800 s）把 `sys_ulock.c` 的过滤改成按进程名匹配、12 槽全打印并加
+seen/filtered/stored/overflow 计数：卡住的等待从 t=464 起就在表里，终值
+`seen=5181 filt=4966 stored=163 over=52 open=1`，它那一行 `w=1 b=1 k=0 s=0 wr=0 sw=0
+op=1000001`、`cw=0` 六大拍不变。地址是堆对象 +0x34 = `dg_gen`，isa 减 slide 0x4f04000
+正是 `OS_dispatch_group`；宿主反汇编把等待点落在 backboardd 0x303e4
+（`bl _dispatch_group_wait` 的返回地址，block 在 0x1000303c4 起）：self=BKButtonHapticsController，
+`[self+0x20]`=home button 定义，`[定义+0x38]` 的组被 wait(DISPATCH_TIME_FOREVER)。
+r239 读 `dg_state`（+0x30，低 32 位 bits / 高 32 位 gen）与 notify head/tail，确认 enter/leave
+谁欠着；并从栈帧取 block 的保存 x19 读出 on-device 的 self→定义链。
+
+r238 读数（boot 27）：**卡住的等待进表了：它等的是 home button 定义上的一个组，gen 从未前进、也从未有人 wake。**
+① 环：512 行内核窗口，最后 1812.666 s，16 report/64 判据/44 probe；boot 27 的 kind-20 记录这次
+落在 report 槽 14（`clover r148: unattended deadline 1800 s … @ArmCpu.cpp:655`），
+drain `append_rc=114 wrote=49 dropped=0 tail lines=3 unseen=0`；bbset t=1797 队列 11 条、最新 0x959，
+sbm2 t=1695 仍 `rem=5403`。② ulock 六拍×12 行：静态锁 `0x1f9745580` w=26 b=26 k=26 s=27，其余地址
+b==k，窗口 5181 次 wait 中 4966 次被过滤、215 次属于 backboardd、163 进表、52 溢出。③ 卡住行
+`a=0x101691ce4 first=464 age 621→1310 w=1 b=1 k=0 s=0 wr=0 sw=0 op=1000001 cw=0`——一次 enter、
+零次 leave、零次 wake，组计数永远到不了 0。④ isa 0x1f9748bf0 − 0x4f04000 = 0x1F4844BF0 =
+`OS_dispatch_group`；等待字 = base+0x34 = `dg_gen`，对象 +8 的 0x100000002 是引用计数对，不是状态。
+⑤ bbustk 91 行，tid 0x3a9 的 32 次十帧栈逐字节相同：
+`lr=19445ca80 fn=10 19445ce40 1010213e4 1944b9c9c 1944bacc0 1944623f8 194462e74 19446c794 19446c0a8 1e2526534 1e2523ccc`，
+仍落在 `__pthread_wqthread`。⑥ 宿主：0x303e4 = `0x1000303c4` block 内 `0x1000303e0 bl
+_dispatch_group_wait` 的返回地址，链为 x19=block → x8=[block+0x20]=self →
+x0=[x8+0x20]=`_homeButtonDefinition` → x0=[x0+0x38]=组；block 由 IMP 0x10002fe4c 在 0x10002fef4
+构造（捕获 self 与 objc_retain 的 x2），`dispatch_async([self+0x30], block)`；`cmp x22,#2` 的
+BSPlatform 查询不等于 2 才会走这条路。
 
 r237 读数（boot 26）：**记到的 ulock 全健康，卡住的等待早于 pid 闩锁；10 帧栈改判为工作队列线程。**
 ① 环：512 行内核窗口全 boot 26，最后 `r234 bbset t=1801`（wall 1801.604），64 判据/16 report/0 probe；
@@ -29,7 +46,8 @@ boot 26 的 kind-20 记录未入 report 窗口（槽 14 仍 boot 6），BCB 落�
 ⑤ bbustk 109 行、tid 0x461 恒定，10 帧：stub+0x34 → 0x18f558e0c+0x34 → backboardd 0x303e4 →
 BLR x8/x1 thunk → drain 0x18f55e138+0x2c0 → … → `__pthread_wqthread+0x11c`/`_start_wqthread+0x8`。
 ⑥ sbm2 t=1788 仍 `rem=5603`，bbset t=1801 队列 11 条。
-r238 方向：进程名过滤进 `sys_ulock.c`、12 槽全打印、四计数与阻塞行现值。
+r239 方向：读组的 `dg_state`（+0x30）与 notify head/tail；在栈帧里取 block 的保存 x19，
+读出 on-device 的 self→定义链与类的 isa；宿主确认 `0x2fe4c` 的选择器与 `BSPlatform` 查询分支。
 
 r236 读数（boot 25）：**三条刀全部落笔；backboardd 在一个堆上的 dispatch 对象上永远等。**
 ① 死线记录：槽 60 `fired after 1800 s at t=1800760 ms ps=0x01e800f6 ticks=313678

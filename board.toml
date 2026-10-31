@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r237: every ulock wait and wake of backboardd is counted by address on a two-minute heartbeat, the object behind the wait word is read at its header, and the userspace chain goes ten frames deep"
+title = "clover r238: the ulock table is fed by process name at the syscall rather than by the sampler latch, every call is counted, all twelve slots print blocked-first with age and a fresh word read, and the wait itself stays on the two-minute heartbeat"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

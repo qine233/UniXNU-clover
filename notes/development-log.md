@@ -17719,3 +17719,81 @@ BCB 落上了（TWRP adb），`misc block 1` 仍空；boot 26 的 kind-20 记录
 
 未解：为什么这条 wait 没进表（槽 9..12 vs. pid 闩锁）；backboardd 的 block 符号；
 libdispatch 静态对象的本地名。
+
+## r238 实现与构建
+
+r237 的表证明了卡住的等待不在表里，但「只印前 8 槽」和「pid 闩锁丢掉了等待」两种解释分不开。
+这一轮把过滤点从采样器挪进 `sys_ulock.c`：钩子拿到调用进程的名字，自己决定记不记；
+每一个调用都有去处，缺一个地址时能说出它被哪道门拦下。
+
+1. **按名字过滤**。四个钩子的签名从 `(pid, addr, op)` 变成 `(pid, name, addr, op)`；
+   `sys_ulock.c` 在 `sys_ulock_wait2` 的进入与首次阻塞两处、`ulock_wait_continue`、
+   `sys_ulock_wake` 里传 `proc_name_address(p)`（等待者）或 `current_proc()` 的名字（唤醒者）。
+   `task.c` 的 `clover_ulock_is_target()` 只做 `strncmp(name, "backboardd", sizeof("backboardd"))`；
+   `clover_bb_target_pid` 与采样器的 pid 闩锁不再参与记账。
+2. **计数归因**。`clover_ulock_seen/filtered/stored/overflow` 四个 `__atomic_add_fetch` 计数器：
+   `seen` 是到达钩子的每一次 ulock 调用；`filtered` 是 pid/addr 为 0 或进程名不符被丢掉的；
+   `stored` 是命中旧行或抢到新行的；`overflow` 是地址不在表里且 12 个槽全满。槽的键从
+   `addr` 变成 `(addr, pid)`，`first_secs`/`last_secs`/`word`/`word_seen` 随行保存。
+3. **12 槽全打印、阻塞优先**。dump 先印 `blocked > woken` 的行，再印其余；行格式
+   `w b k s wr sw op st age cw`，`age` 是距最后一次事件的秒数。dump 时用
+   `proc_find`/`proc_task`/`clover_user_read32` 重读该地址的 32 位字（`cw=`，读失败印
+   `fffffffe`）。计数单独一行 `ulockc seen filt stored over open`，`open` 是仍然阻塞的行数。
+4. **驱动 tee**。新类 `r238-ulock` 224 字节（每拍 12 行 + 1 计数行，15 拍装下整条时间序列）、
+   `r238-ulockc` 96 字节（计数行独立一类，后段行挤不掉它）；`r237-obj` 96 字节保留。
+
+构建：内核 `round238-kernel-amfi.macho` sha256
+`369fff70f0e0face4f6dbe71b8ad7467090095692dd6325b2e10f829885985f5`，payload
+`098228cee9967655a6792e1b0b266e80c124d9c408cbf726116c843a5fc12939`，boot.img
+`196b284fc15119610260480c767a5d0a14bf18b4eed31d2e267548be1ba7d00b`。
+`verify-clover-payload.py` 与 `check-clover.py` 全绿，LATE_PATCH 把 r238 放在 23 个 z 的最前。
+冷刷 cache（唯一由宿主写的分区），`run-clover-unattended.sh` 跑满 1800 s 死线。
+
+## r238 读数（boot 27）——卡住的等待终于进表：它等的是 home button 定义上的一个 dispatch group，gen 从未前进、也从未有 wake
+
+boot 27 跑满 1800 s 死线：内核环 512 行全属本 boot，最后一条是 `1812.666` 的
+CoreAnalyticsHub nag timer（`r234: bbset t=1797`），16 条 report、64 条驱动判据、44 条 probe。
+这一轮 boot 27 的 kind-20 记录**进了** report 窗口（槽 14）：`clover r148: unattended deadline
+1800 s … @ArmCpu.cpp:655`；drain `append_rc=114`、`wrote=49 dropped=0`、`tail lines=3 unseen=0`。
+
+1. **表：6 拍 × 12 行、同一组 12 个地址**。t=1085、1228、1367、1506、1639、1774，每拍 12 行；
+   最终计数 `seen=5181 filt=4966 stored=163 over=52 open=1`（首拍 4453/4246/159/48）。
+   `stored + over = 215` 正好等于进入 backboardd 的调用数（`seen − filt`）：**4966 次其它进程的
+   调用被名字过滤，215 次是 backboardd 的，163 次落进行，52 次因 12 槽全满没有位置**。
+   卡住的地址不再丢——r237 的 pid 闩锁（首次采样 t≈1007）已经不是门。
+2. **卡住的等待从 t=464 就在表里**。6 拍逐字相同（只有 age 在长）：
+   `a=101691ce4 pid=58 w=1 b=1 k=0 s=0 wr=0 sw=0 op=1000001 st=464 age=621→1310 cw=0`。
+   其余 11 行全部 `b == k`：静态锁 `0x1f9745580` 是 `w=26 b=26 k=26 s=27`，其它是短命等待；
+   只有这一行 `open`。
+3. **对象是 OS_dispatch_group，等待字就是它的 gen**。bbobj 每拍
+   `base=101691cb0 isa=1f9748bf0 val=100000002 w=0`。isa 去本 boot 的共享缓存 slide
+   `0x4f04000` 得 `0x1F4844BF0`，即 `OS_dispatch_group` 的类对象。**修正 r237 的读法**：
+   `+8` 的 `0x100000002` 是引用计数对，不是状态字；`+0x34` 的 `w=0` 是 `dg_gen`，也正是
+   ulock 行记录的地址（`0x101691ce4 = base + 0x34`）——`_dispatch_group_wait_slow` 就等在这个字上。
+   libdispatch 1477 的 `dg_state` 是 `+0x30` 的 64 位（低 32 位 `dg_bits`、高 32 位 `dg_gen`）；
+   `dg_bits` 还没读，但 gen 一直是 0 且这条地址从未有过 wake（`s=0 sw=0`；`ulock_wake` 只作用于
+   调用进程自己的地址空间，别的进程叫不醒它）——**组的计数从来没有回到 0，有一次 enter
+   没有对应的 leave**。
+4. **栈没变**。91 行 `bbustk`；`tid=0x3a9` 的 32 拍是逐字节相同的 10 帧（boot 26 是 `0x461`，
+   同一位置）：`lr=19445ca80 fn=10 19445ce40 1010213e4 1944b9c9c 1944bacc0 1944623f8
+   194462e74 19446c794 19446c0a8 1e2526534 1e2523ccc`。f1 `0x1010213e4` 去 backboardd
+   slide `0xFF1000` 得偏移 `0x303e4`；boot 26 的 slide 是 `0xEAA000`，两帧差 `0x147000`，
+  是同一个调用点。
+5. **宿主把 0x303e4 读成「先等组、再 applyDefinitions」**。`0x1000303e4` 是
+   `0x1000303e0 bl _dispatch_group_wait` 的返回地址，所在 block invoke `0x1000303c4`：
+   `x8 = [block+0x20]`（捕获的 self）→ `x0 = [x8+0x20]`（`_homeButtonDefinition`）→
+   `x0 = [x0+0x38]`（home button 定义上的某个 dispatch group）→ 无限等；醒来后
+   `x0 = [block+0x20]`、`x2 = [block+0x28]`，尾调 `[self _queue_applyDefinitions:<arg>]`。
+   这个 block 在 `0x10002fef4` 造字面量，所在的函数 `0x10002fe4c` 是 `BKButtonHapticsController`
+   方法列表里的第 11 个 IMP：它捕获 self 与一个保留的参数，`dispatch_async([self+0x30], block)`。
+   与类元数据逐项对上：`+0x20` 是 `_homeButtonDefinition`、`+0x30` 是 `_queue`、`+0x38` 是
+   `_controllerReadyGroup`。**修正上一轮的口径**：block+0x20 是控制器本身，不是外层 block；
+   组属于 home button 定义（BKSButtonHapticsDefinition，在 BackBoardServices 里），控制器只负责等。
+   同一函数还有一条分支（`0x2fe8c` 的 `cmp x22,#2`）：`BSPlatform` 的查询返回 2 时打
+   「not configuring SSHB because we don't have a real home button」并**跳过** dispatch。
+   我们既然停在 block 里，说明那次查询没有返回 2。
+6. **SpringBoard 还在等**。`sbm2 t=1695` 仍是发给 `58:backboardd`、`rem=5403`；
+   `bbset t=1797` 队列 11 条，最新序号 `0x959`。没有回信。
+
+未解：group 的 `dg_state`（`+0x30`）没读；`+0x38` 在 BKSButtonHapticsDefinition 里的 ivar 名
+与 enter/leave 的调用点；`0x2fe4c` 的选择器名与 `BSPlatform` 那次查询的返回值。

@@ -952,9 +952,10 @@ def check_sb_sample(kernel: bytes) -> bool:
                             b" st=%x rd=err\n") in kernel,
              "bbustk": (b"clover r236: bbustk t=%llu pid=%d tid=0x%llx sp=%llx"
                         b" fp=%llx lr=%llx fn=%u%s\n") in kernel,
-             "ulock": (b"clover r237: ulock t=%llu pid=%d a=%llx w=%u b=%u k=%u"
-                       b" s=%u wr=%d sw=%d op=%x\n") in kernel,
-             "ulocko": (b"clover r237: ulocko t=%llu pid=%d n=%u\n") in kernel,
+             "ulock": (b"clover r238: ulock t=%llu pid=%d a=%llx w=%u b=%u k=%u"
+                       b" s=%u wr=%d sw=%d op=%x st=%llu age=%llu cw=%x\n") in kernel,
+             "ulockc": (b"clover r238: ulockc t=%llu seen=%u filt=%u stored=%u"
+                        b" over=%u open=%u\n") in kernel,
              "bbobj": (b"clover r237: bbobj t=%llu pid=%d"
                        b" tid=0x%llx a=%llx base=%llx isa=%llx"
                        b" val=%llx w=%x\n") in kernel,

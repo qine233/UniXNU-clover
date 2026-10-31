@@ -858,12 +858,14 @@ def check_board(errors: list) -> str:
                           "land in the ring uncounted and push out the r234 rows that name the "
                           "blocked member")
         for tee, why in (
-                ('{ "clover r237: ulock", "r237-ulock", 192, 0, 0, 0 },',
-                 "the ulock time series would land uncounted and push out every earlier reading"),
+                ('{ "clover r238: ulock", "r238-ulock", 224, 0, 0, 0 },',
+                 "the 12-slot ulock series would land uncounted and lose its tail"),
+                ('{ "clover r238: ulockc", "r238-ulockc", 96, 0, 0, 0 },',
+                 "the counter row would be pushed out by the address rows that follow it"),
                 ('{ "clover r237: bbobj", "r237-obj", 96, 0, 0, 0 },',
                  "the object-header rows would share the beat's budget and lose their tail")):
             if tee not in sdhci_source:
-                errors.append(f"drivers/CloverSdhci gives round237's rows no tee class ({tee}): "
+                errors.append(f"drivers/CloverSdhci gives round238's rows no tee class ({tee}): "
                               f"{why}")
         sb_patch = next((base / "patches/xnu-clover/zzzzzzzz-clover-sb-sample.patch"
                          for base in (REPO, pathlib.Path.cwd())
@@ -1295,6 +1297,40 @@ def check_board(errors: list) -> str:
                     r237_text.find('ret = wait_result_to_return_code(wr);'):
                 errors.append(f"{r237_patch.name} records the wake before the wait result exists: "
                               "the row could not say why the wait came back")
+
+        # Round238 moves the filter out of the sampler latch: boot 26 showed the recorded waits were
+        # all healthy while the stuck address never appeared, and the two candidate causes -- only
+        # eight of twelve slots printed, or the wait predating the pid latch -- are both removed here.
+        # The hooks now take the caller's process name and decide for themselves, every call is
+        # counted, all twelve slots print blocked-first with ages, and the blocked row's word is read
+        # again at dump time.
+        r238_name = "zzzzzzzzzzzzzzzzzzzzzzzz-clover-r238.patch"
+        r238_patch = next((base / "patches/xnu-clover" / r238_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r238_name).is_file()), None)
+        if r238_patch is None:
+            errors.append(f"patches/xnu-clover/{r238_name} is missing: the ulock table would again "
+                          "depend on the sampler latch and print only eight of twelve rows")
+        else:
+            r238_text = r238_patch.read_text()
+            for needle in ('clover_ulock_is_target(const char *name)',
+                           'strncmp(name, "backboardd", sizeof("backboardd")) == 0',
+                           'clover_ulock_note_wait(int pid, const char *name, uint64_t addr, uint32_t op)',
+                           'clover_ulock_note_block(int pid, const char *name, uint64_t addr, uint32_t op)',
+                           'clover_ulock_note_woken(int pid, const char *name, uint64_t addr,',
+                           'clover_ulock_note_wake(int pid, const char *name, uint64_t addr,',
+                           'proc_name_address(p)',
+                           'proc_name_address(cp)',
+                           '"clover r238: ulockc t=%llu seen=%u filt=%u stored=%u over=%u"',
+                           'blocked > woken',
+                           'p = proc_find(row->pid);'):
+                if needle not in r238_text:
+                    errors.append(f"{r238_patch.name} lacks {needle[:56]!r}: a wait that began "
+                                  "before the latch would be lost again, or the dump would not say "
+                                  "where it was dropped")
+            if r238_text.count('clover_ulock_enter(pid, name, addr)') < 4:
+                errors.append(f"{r238_patch.name} does not route all four hooks through the same "
+                              "filter: one path would count differently from the others")
 
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
@@ -2335,8 +2371,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r237:"):
-        errors.append('[payload] title is not "clover r237: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r238:"):
+        errors.append('[payload] title is not "clover r238: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3388,8 +3424,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r237:"):
-        errors.append('[payload] title is not "clover r237: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r238:"):
+        errors.append('[payload] title is not "clover r238: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
