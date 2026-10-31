@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r236: the deadline and the panic sink each get a record that does not wait on the card, and backboardd's userspace wait is captured with a pmap walk so the frames can be symbolized on the host"
+title = "clover r237: every ulock wait and wake of backboardd is counted by address on a two-minute heartbeat, the object behind the wait word is read at its header, and the userspace chain goes ten frames deep"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

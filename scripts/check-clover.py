@@ -857,6 +857,14 @@ def check_board(errors: list) -> str:
                           "one row per picked thread per changed batch, over a whole boot, would "
                           "land in the ring uncounted and push out the r234 rows that name the "
                           "blocked member")
+        for tee, why in (
+                ('{ "clover r237: ulock", "r237-ulock", 192, 0, 0, 0 },',
+                 "the ulock time series would land uncounted and push out every earlier reading"),
+                ('{ "clover r237: bbobj", "r237-obj", 96, 0, 0, 0 },',
+                 "the object-header rows would share the beat's budget and lose their tail")):
+            if tee not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci gives round237's rows no tee class ({tee}): "
+                              f"{why}")
         sb_patch = next((base / "patches/xnu-clover/zzzzzzzz-clover-sb-sample.patch"
                          for base in (REPO, pathlib.Path.cwd())
                          if (base / "patches/xnu-clover/zzzzzzzz-clover-sb-sample.patch").is_file()),
@@ -1254,6 +1262,39 @@ def check_board(errors: list) -> str:
                 errors.append(f"{r236_patch.name} reads fewer than four 32-bit halves per frame: "
                               "ml_phys_read_64 returns one word, so a 64-bit slot straddling a page "
                               "would be assembled from half a record")
+
+        # Round237 asks whether the wait is ever woken. Both syscall entry points feed a small
+        # address-keyed table for the latched pid: waits entered, waits that blocked, waits that came
+        # back through ulock_wait_continue, and wake calls with their return. The table prints from
+        # the two-minute heartbeat, and the same sample reads the object header 0x34 bytes below the
+        # wait word and walks ten frames instead of six.
+        r237_patch = next((base / "patches/xnu-clover/zzzzzzzzzzzzzzzzzzzzzzz-clover-r237.patch"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover/zzzzzzzzzzzzzzzzzzzzzzz-clover-r237.patch").is_file()),
+                          None)
+        if r237_patch is None:
+            errors.append("patches/xnu-clover/zzzzzzzzzzzzzzzzzzzzzzz-clover-r237.patch is missing: "
+                          "the ulock wait would stay an unexplained pc and nothing would say "
+                          "whether it was ever woken")
+        else:
+            r237_text = r237_patch.read_text()
+            for needle in ('#define CLOVER_ULOCK_SLOTS 12',
+                           'clover_ulock_note_wait(int pid, uint64_t addr, uint32_t op)',
+                           'clover_ulock_note_block(proc_pid(p), (uint64_t)args->addr,',
+                           'clover_ulock_note_woken(cp != PROC_NULL ? proc_pid(cp) : 0,',
+                           'clover_ulock_note_wake(proc_pid(p), (uint64_t)args->addr,',
+                           'clover_ulock_dump(secs);',
+                           '"clover r237: ulock t=%llu pid=%d a=%llx w=%u b=%u k=%u"',
+                           '"clover r237: bbobj t=%llu pid=%d"',
+                           'uint64_t uframes[6][10];',
+                           'uframes[i], 10);'):
+                if needle not in r237_text:
+                    errors.append(f"{r237_patch.name} lacks {needle[:56]!r}: a wait that never "
+                                  "returns would again look the same as one that was woken")
+            if r237_text.find('clover_ulock_note_woken(cp != PROC_NULL') < \
+                    r237_text.find('ret = wait_result_to_return_code(wr);'):
+                errors.append(f"{r237_patch.name} records the wake before the wait result exists: "
+                              "the row could not say why the wait came back")
 
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
@@ -2294,8 +2335,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r236:"):
-        errors.append('[payload] title is not "clover r236: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r237:"):
+        errors.append('[payload] title is not "clover r237: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3347,8 +3388,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r236:"):
-        errors.append('[payload] title is not "clover r236: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r237:"):
+        errors.append('[payload] title is not "clover r237: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

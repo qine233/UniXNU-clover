@@ -4,19 +4,32 @@
 ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。
 配套固件仓库 `uefi-clover`（Mu-Silicium 移植），驱动与硬件常量在 `porting.toml`。
 
-现状一句话：**SpringBoard 的请求被 backboardd 取走了、回信没有回来；backboardd 主线程停在
-自己进程内的一个 block 里，经 libdispatch 主队列 drain 走到 `___ulock_wait`，在一个堆上的
-dispatch 对象上无限等待，而对象的值字至今是 0——不是内核阻塞。**
+现状一句话：**SpringBoard 的请求被 backboardd 取走了、回信没有回来；backboardd 的一个线程
+（boot 25 主线程 0x42f、boot 26 工作队列 0x461）停在自己进程内的一个 block 里，经 libdispatch
+的 drain/thunk 通路走到 `___ulock_wait`，在一个堆上的 dispatch 对象上无限等待，而对象的值字
+至今是 0——不是内核阻塞。**
 XNU 起来、三卷全挂、launchd 把守护进程拉起来。
-boot 25（r236，死线 1800 s）三条「不经过 panic 屏」的刀全部兑现：死线自己往 flight 区写下
-`elapsed=1800.005s cnt0/cnt1/freq` 的强制记录（ps 是定时器中断现场）；panic 沉降口两条标记
-（stage0 rc=0、stage1 rc=113=100+槽 13）证明 panic 文本第一次真的落进 cache（lba 13320242），
-随后 `drain … wrote=24 dropped=0 unseen=0` 跑完。死线前最后 12 笔 fairplay 读各 1–2 ms 完成，
-卡是健康的——r235 的「卡在恢复中导致静默失败」被排除。用户态这边：主线程 `tid=0x42f`
-31 次采样逐字节相同，`___ulock_wait` 上 `x0=0x1000001 x1=0x100c8f0d4 x2=0 x3=0`，
-对象字 `w=0`；宿主按共享缓存 slide 0x2DA0000 把链条符号化到 libdispatch 的
-drain/thunk/wait helper，backboardd slide 0x666000 给出 block 镜像偏移 0x303e4。
-r237 要把 pid 58 的 `ulock_wait`/`ulock_wake` 计数与这个地址对齐，打印对象头并加深栈。
+boot 26（r237，死线 1800 s）把 pid 58 的 ulock wait/wake 按地址记成表：记到的 8 个地址全是
+健康等待（15 次 wait、次次 woken、rc 0、无溢出），卡住的那个字 `0x15dd8f944` 不在表里——
+dump 只印前 8 槽，且钩子要等 pid 闩锁（首次采样 t≈1007），等待早于闩锁更可能是被丢掉的原因。
+10 帧栈把 boot 26 的等待线程符号化到 `__pthread_wqthread`/`_start_wqthread`：这次是
+libdispatch 工作队列线程（boot 25 是主线程 0x42f），backboardd 镜像偏移 0x303e4 的 block
+经 continuation 进来、在 block 内部等；对象头 9 拍逐字节相同（isa=0x1f7e54bf0、
+val=0x100000002、等待字仍 0）。
+r238 把过滤点移到 `sys_ulock.c` 按进程名匹配，12 槽全打印并加 seen/filtered/stored/overflow
+计数与阻塞行的当前等待字——让卡住的地址要么进表，要么用计数证明被丢在哪一步。
+
+r237 读数（boot 26）：**记到的 ulock 全健康，卡住的等待早于 pid 闩锁；10 帧栈改判为工作队列线程。**
+① 环：512 行内核窗口全 boot 26，最后 `r234 bbset t=1801`（wall 1801.604），64 判据/16 report/0 probe；
+boot 26 的 kind-20 记录未入 report 窗口（槽 14 仍 boot 6），BCB 落上、misc block 1 空。
+② ulock 6 拍×8 行、无 `ulocko`；`0x1f7e51580` w=b=k=s=7（op 1000002）、`0x16ff6f720` w=2 b=2 k=1 s=1
+（op 1000001）、其余 6 个地址各 1 次，全部 rc 0，窗口共 15 次 wait。③ 栈上等待字 0x15dd8f944
+不在表：只印前 8 槽，且钩子按 pid 闩锁过滤（首次采样 t≈1007），bbobj 在 t=1012 已拍到 →
+等待早于闩锁更可能。④ bbobj 9 拍相同 `tid=0x461 base=15dd8f910 isa=1f7e54bf0 val=100000002 w=0`。
+⑤ bbustk 109 行、tid 0x461 恒定，10 帧：stub+0x34 → 0x18f558e0c+0x34 → backboardd 0x303e4 →
+BLR x8/x1 thunk → drain 0x18f55e138+0x2c0 → … → `__pthread_wqthread+0x11c`/`_start_wqthread+0x8`。
+⑥ sbm2 t=1788 仍 `rem=5603`，bbset t=1801 队列 11 条。
+r238 方向：进程名过滤进 `sys_ulock.c`、12 槽全打印、四计数与阻塞行现值。
 
 r236 读数（boot 25）：**三条刀全部落笔；backboardd 在一个堆上的 dispatch 对象上永远等。**
 ① 死线记录：槽 60 `fired after 1800 s at t=1800760 ms ps=0x01e800f6 ticks=313678

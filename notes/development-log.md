@@ -17628,3 +17628,94 @@ beats 56..59、deadline 60、panic 61..62。解码器 `read-clover-log.py` 加�
 mappingCount 1/16 KB、无镜像表；宿主没有 `dsc_extractor`/`ipsw`/capstone）、
 backboardd 的 block 符号（rootfs 加密，只有偏移 0x303e4）、以及 `___ulock_wake`
 是否曾以这个字为目标。
+
+## r237 实现与构建
+
+r236 把 backboardd 主线程钉在了一个堆上的 dispatch 对象上：`___ulock_wait(uaddr, 0, 0)`
+无限等待，值字至今是 0。这一轮不再猜「谁该 signal」，而是让内核把 **pid 58 的每一次
+ulock wait 与 wake 按地址记账**，并把那个对象在等待时刻的头读出来。
+
+1. **按地址记账**。`task.c` 里 12 个槽的静态表 `clover_ulock_rows[]`，每行
+   `uint64_t addr; uint32_t waits, blocked, woken, wakes, last_op; int32_t last_wait_rc, last_wake_rc;`。
+   槽用 `__atomic_compare_exchange_n` 在 `addr` 上抢占（0 → 目标地址），命中即复用；
+   12 个槽都占满就只加 `clover_ulock_overflow`，不驱逐、不哈希。计数器全是
+   `__atomic_add_fetch`，没有锁——`decl_lck_spin_data` 需要显式初始化，采样器在
+   任何能跑的那一拍都可能落笔，用锁反而引入一个新的未初始化对象。
+   四个导出钩子全部先过滤 `pid <= 0 || pid != clover_bb_target_pid || addr == 0`：
+   `note_wait/note_block/note_woken/note_wake`。`note_woken` 不传 op（传 0），
+   `task.c` 只在 `op != 0` 时写 `last_op`，免得用一个空操作码把原等待操作码盖掉。
+2. **sys_ulock 的四个落笔点**。`bsd/kern/sys_ulock.c`：
+   `sys_ulock_wait2` 进入时 `note_wait`；第一次 `wr == THREAD_WAITING` 的保存块里
+   `note_block`；`ulock_wait_continue` 在 `ret = wait_result_to_return_code(wr)` 之后
+   `note_woken`（只对 `ULK_UADDR` 的 key 记，进程经 `current_proc()` 取，`PROC_NULL` 记 0）；
+   `sys_ulock_wake` 在 `ret = ulock_wake(...)` 之后 `note_wake`。
+   也就是说：**同一个地址上「谁在等、等了多久、谁叫醒的、叫醒返回什么」四件事
+   现在都写成同一行**，两分钟的节拍打印 ≤8 行。
+3. **对象头**。`bbustk` 的每一帧里，若 `x0`/`x1` 像锁操作（`clover_bb_is_lock_op`，
+   从 r236 的 `clover_bb_lock_word` 里抽出来复用），就把 `x1` 当等待字：
+   `base = (x1 & ~3) - 0x34`，用 `clover_user_read32` 读 `base+0/4/8/12` 与 `base+0x34`
+   五个字，打印 `isa val w` 等——**对象在等待那一刻的内容**，而不是事后猜。
+   tee 类 `r237-obj` 96 字节；记账行 tee 类 `r237-ulock` 192 字节。
+4. **栈再深四帧**。`uframes[6][6]` → `[6][10]`，`clover_user_bp_walk(..., 10)`，
+   `ft[96]` → `ft[192]`。r236 的 6 帧已经在 libdispatch 的主队列 drain 里；
+   帧链是尾调拼出来的，再往下 4 帧才有机会碰到调用者。
+
+构建：内核 `953b1212…`（无 AMFI 刀）→ AMFI 签名点仍是 `0x1ac00e4`、`0x1ac016c`
+（`0x34000229→0x14000011`、`0x36000520→0xd503201f`）→ 归一化 968 处时间戳清零、
+LC_UUID/_PrelinkKCID 由文件导出 → `round237-kernel-amfi.macho` sha256
+`b13b7b10e0df38179cd8886d265a52c38cde7e0b4fa38e4ff6e6e52f331cb9bb`。
+payload 重建两次（第二次连日志一起归档），`round237-payload.img` sha256
+`dab085efa77457ec5aa4153debaff15d937f4320dffd320a21783575a5982268`，`verify-clover-payload.py`
+全过（r217 组含 `ulock`/`ulocko`/`bbobj`）。`check-clover.py` 绿，CloverSdhci 的
+`-Werror` 与对象审计绿。LATE_PATCH 把 r237 放在 23 个 z 的最前。冷刷 cache，跑满 1800 s 死线。
+
+## r237 读数（boot 26）——ulock 表只打印 8 行、卡住的等待早于 pid 闩锁；10 帧栈证明这是 libdispatch 工作队列线程
+
+boot 26 跑满 1800 s 死线：内核环 512 行全属本 boot，最后一条是 `r234: bbset t=1801`
+（wall 1801.604），64 条驱动判据、16 条 report、0 条 probe。死线到点后 panic 路径自己的
+BCB 落上了（TWRP adb），`misc block 1` 仍空；boot 26 的 kind-20 记录没有出现在 report
+窗口（槽 14 仍是 boot 6），和 boot 24 一样，记录本身丢在复位前。
+
+1. **ulock 表有 8 行、无溢出、全是健康等待**。6 拍（t=1062、1182、1315、…、1733）
+   每拍 8 行，共 48 行，没有 `ulocko` 行，说明 12 个槽没有被占满。8 个地址：
+   - `0x1f7e51580`：`w=7 b=7 k=7 s=7 op=1000002`（unfair lock|no-errno）；
+   - `0x16ff6f720`：`w=2 b=2 k=1 s=1 op=1000001`（compare-and-wait|no-errno）；
+   - `0x16f9ad6c4`、`0x16f9ad024`、`0x16f9acfe4`、`0x16f9ad044`、`0x10142da00`、
+     `0x1014186d8`：各 `w=b=k=s=1 op=1000002`。
+   所有 `wr`/`sw` 都是 0：记到的每一次阻塞都被叫醒了；整个 800 s 窗口只有 15 次 wait。
+   `0x1f7e51580` 去 slide 0x3610000 得 `0x1F4841580`，落在共享缓存数据段，与卡住对象
+   isa 同区——这是一个 libdispatch 静态对象上的健康锁，不是卡点。
+2. **栈上那个等待字根本不在表里**。10 帧栈的等待地址是 `0x15dd8f944`（堆），表里没有。
+   代码允许两种解释：(a) dump 只打印前 8 个槽（`shown < 8`），9..12 槽即使有也不显示；
+   (b) 钩子先按 `clover_bb_target_pid` 过滤，而这个 pid 要等 SpringBoard 采样器第一次看到
+   目标为 `"<pid>:backboardd"` 的消息才闩上（boot 26 首次采样 t≈1007）——闩上之前的 wait
+   全部被丢。`bbobj` 在 t=1012 就已经拍到该线程，等待至少开始于 t≈1012 之前，**闩锁竞态
+   更可能**。表里全是短命 wait，正好符合「长等待发生在闩锁之前、没进表」。
+3. **对象头每拍相同**。26 条 `bbobj` 里，`tid=0x461` 的行出现 9 次（t=1012 到 t=1753）
+   且逐字节相同：`a=15dd8f944 base=15dd8f910 isa=1f7e54bf0 val=100000002 w=0`。
+   isa 去 slide 后 `0x1F4844BF0` 在共享缓存的高位映射里，
+   `image_for_vmaddr` 仍给不出镜像名；`+8` 的值字是 `0x100000002`，`+0x34` 的等待字
+   仍是 **0**。其余 17 行是假阳性：`isa=0 val=0 w=ffffff00`（7 行）、
+   `isa=1f5000001f5 val=1f5000001f5 w=eb3b`（5 行）、
+   `val=e0c2fccc00000000 w=5f08/5f0950c0`（4 行）、`isa=0 val=0 w=1`（1 行）。
+4. **10 帧栈把 block 追到工作队列线程**。109 行 `bbustk`，`tid=0x461` 每次相同：
+   `sp=16fa33810 fp=16fa33830 lr=192b68a80`，
+   `fn=10 192b68e40 100eda3e4 192bc5c9c 192bc6cc0 192b6e3f8 192b6ee74 192b78794 192b780a8 1e0c32534 1e0c2fccc`。
+   宿主按 cache slide 0x3610000、backboardd slide 0xEAA000 符号化：
+   `lr=0x18f558a80`（`0x18f558a4c+0x34`，旁边是 `___ulock_wait` stub `0x1948825a0`）→
+   `f0=0x18f558e40`（`0x18f558e0c+0x34`）→ `f1` backboardd 镜像偏移 **0x303e4** →
+   `f2=0x18f5b5c9c`（BLR x8）→ `f3=0x18f5b6cc0`（BLR x1）→ `f4=0x18f55e3f8`
+   （`0x18f55e138+0x2c0`，调用 `0x18f5b6cb0`）→ `f5=0x18f55ee74`（`0x18f55ecf8+0x17c`，
+   调用 `0x18f55e138`）→ `f6=0x18f568794`（BLR x8）→ `f7=0x18f5680a8`
+   （`0x18f567f14+0x194`）→ `f8` libsystem_pthread `__pthread_wqthread+0x11c`、
+   `f9` `_start_wqthread+0x8`。
+   **修正 r236 的定性**：boot 25 被采样的是主线程 `0x42f`；boot 26 停在 ulock 上的
+   `0x461` 是一条 **libdispatch 工作队列线程**，backboardd 的 `0x303e4` block 经
+   continuation（BLR x8）进来，在 block 内部等这个字。等待通路与主队列 drain 相同，
+   仍然完全是用户态，不是内核阻塞。
+5. **SpringBoard 的请求仍在队列里**。t=1788 的 `sbm2` 仍是发往 `58:backboardd`、
+   `rem=5603`；t=1801 的 `bbset` 队列 11 条，最新序号 `0x985`。没有回信，与 backboardd
+   阻塞在线程内部一致。
+
+未解：为什么这条 wait 没进表（槽 9..12 vs. pid 闩锁）；backboardd 的 block 符号；
+libdispatch 静态对象的本地名。

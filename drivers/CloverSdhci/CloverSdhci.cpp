@@ -736,6 +736,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // chain, sp, fp and lr. It has the same cadence as the bbwait rows and one row per thread, so the
   // same 192 covers it and the frame before the kill cannot be pushed out by the head of the boot.
   { "clover r236: bbustk", "r236-ustk", 192, 0, 0, 0 },
+  // Round237 accounts for the wait itself: every ulock_wait2/ulock_wake of the latched pid is
+  // counted by address, and the two-minute heartbeat prints at most eight address rows plus an
+  // overflow row -- 15 beats in a 1800 s boot, so 192 holds the whole time series. The object-header
+  // row rides each printed sample (at most 33 of them) and gets its own class so a burst cannot eat
+  // the series that says whether the wait was ever woken.
+  { "clover r237: ulock", "r237-ulock", 192, 0, 0, 0 },
+  { "clover r237: bbobj", "r237-obj", 96, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

@@ -1,0 +1,340 @@
+diff --git a/bsd/kern/sys_ulock.c b/bsd/kern/sys_ulock.c
+--- a/bsd/kern/sys_ulock.c
++++ b/bsd/kern/sys_ulock.c
+@@ -53,6 +53,18 @@
+ #include <kern/policy_internal.h>
+ #include <kern/task.h>
+ #include <kern/telemetry.h>
++
++/*
++ * Round237. The sampler owns the table and latches the pid; this side only
++ * reports. Each hook filters on the latched pid, so a busy system costs one
++ * integer compare per ulock call.
++ */
++extern void clover_ulock_note_wait(int pid, uint64_t addr, uint32_t op);
++extern void clover_ulock_note_block(int pid, uint64_t addr, uint32_t op);
++extern void clover_ulock_note_woken(int pid, uint64_t addr, uint32_t op,
++    int32_t rc);
++extern void clover_ulock_note_wake(int pid, uint64_t addr, uint32_t op,
++    int32_t rc);
+ #include <kern/waitq.h>
+ #include <kern/sched_prim.h>
+ #include <kern/turnstile.h>
+@@ -514,6 +526,9 @@
+ 	int ret = 0;
+ 	thread_t self = current_thread();
+ 	ulk_t key;
++
++	clover_ulock_note_wait(proc_pid(p), (uint64_t)args->addr,
++	    (uint32_t)args->operation);
+ 
+ 	/* involved threads - each variable holds +1 ref if not null */
+ 	thread_t owner_thread   = THREAD_NULL;
+@@ -748,6 +763,8 @@
+ 		uthread->uu_save.uus_ulock_wait_data.flags = flags;
+ 		uthread->uu_save.uus_ulock_wait_data.owner_thread = owner_thread;
+ 		uthread->uu_save.uus_ulock_wait_data.old_owner = old_owner;
++		clover_ulock_note_block(proc_pid(p), (uint64_t)args->addr,
++		    (uint32_t)args->operation);
+ 	}
+ 
+ 	ull_unlock(ull);
+@@ -857,6 +874,13 @@
+ 	thread_t old_owner = uthread->uu_save.uus_ulock_wait_data.old_owner;
+ 
+ 	ret = wait_result_to_return_code(wr);
++
++	if (ull->ull_key.ulk_key_type == ULK_UADDR) {
++		struct proc *cp = current_proc();
++
++		clover_ulock_note_woken(cp != PROC_NULL ? proc_pid(cp) : 0,
++		    (uint64_t)ull->ull_key.ulk_addr, 0, (int32_t)ret);
++	}
+ 
+ 	ull_lock(ull);
+ 	turnstile_complete((uintptr_t)ull, &ull->ull_turnstile, NULL, TURNSTILE_ULOCK);
+@@ -890,6 +914,8 @@
+ 	}
+ #endif
+ 	ret = ulock_wake(proc_task(p), args->operation, args->addr, args->wake_value);
++	clover_ulock_note_wake(proc_pid(p), (uint64_t)args->addr,
++	    (uint32_t)args->operation, (int32_t)ret);
+ 
+ 	if ((args->operation & ULF_NO_ERRNO) && (ret != 0)) {
+ 		*retval = -ret;
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10668,7 +10668,164 @@
+  * never changes is still read while the sender's batch sits still. */
+ static int clover_bb_target_pid;
+ static mach_port_name_t clover_bb_target_name;
++
++/*
++ * Round237. Boot 25 put backboardd's main thread in ___ulock_wait on a word at
++ * heap+0x34 and left two questions the sampler cannot answer: whether that wait
++ * is ever woken, and what the object around the word held at the time. The
++ * table below is fed from sys_ulock_wait2() and sys_ulock_wake() for the latched
++ * pid only. Addresses are claimed once and never recycled, so a row that has
++ * been printed keeps the same meaning for the rest of the boot; a full table
++ * counts overflow instead of evicting.
++ */
++#define CLOVER_ULOCK_SLOTS 12
++struct clover_ulock_row {
++	uint64_t addr;
++	uint32_t waits;
++	uint32_t blocked;
++	uint32_t woken;
++	uint32_t wakes;
++	uint32_t last_op;
++	int32_t last_wait_rc;
++	int32_t last_wake_rc;
++};
++static struct clover_ulock_row clover_ulock_rows[CLOVER_ULOCK_SLOTS];
++static uint32_t clover_ulock_overflow;
+ 
++static struct clover_ulock_row *
++clover_ulock_slot(uint64_t addr)
++{
++	unsigned int i;
++
++	for (i = 0; i < CLOVER_ULOCK_SLOTS; i++) {
++		if (clover_ulock_rows[i].addr == addr) {
++			return &clover_ulock_rows[i];
++		}
++	}
++	for (i = 0; i < CLOVER_ULOCK_SLOTS; i++) {
++		uint64_t zero = 0;
++
++		if (clover_ulock_rows[i].addr != 0) {
++			continue;
++		}
++		if (__atomic_compare_exchange_n(&clover_ulock_rows[i].addr,
++		    &zero, addr, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++			clover_ulock_rows[i].waits = 0;
++			clover_ulock_rows[i].blocked = 0;
++			clover_ulock_rows[i].woken = 0;
++			clover_ulock_rows[i].wakes = 0;
++			clover_ulock_rows[i].last_op = 0;
++			clover_ulock_rows[i].last_wait_rc = 0;
++			clover_ulock_rows[i].last_wake_rc = 0;
++			return &clover_ulock_rows[i];
++		}
++	}
++	__atomic_add_fetch(&clover_ulock_overflow, 1, __ATOMIC_RELAXED);
++	return NULL;
++}
++
++void
++clover_ulock_note_wait(int pid, uint64_t addr, uint32_t op)
++{
++	struct clover_ulock_row *row;
++
++	if (pid <= 0 || pid != clover_bb_target_pid || addr == 0) {
++		return;
++	}
++	row = clover_ulock_slot(addr);
++	if (row == NULL) {
++		return;
++	}
++	__atomic_add_fetch(&row->waits, 1, __ATOMIC_RELAXED);
++	row->last_op = op;
++}
++
++void
++clover_ulock_note_block(int pid, uint64_t addr, uint32_t op)
++{
++	struct clover_ulock_row *row;
++
++	if (pid <= 0 || pid != clover_bb_target_pid || addr == 0) {
++		return;
++	}
++	row = clover_ulock_slot(addr);
++	if (row == NULL) {
++		return;
++	}
++	__atomic_add_fetch(&row->blocked, 1, __ATOMIC_RELAXED);
++	row->last_op = op;
++}
++
++void
++clover_ulock_note_woken(int pid, uint64_t addr, uint32_t op, int32_t rc)
++{
++	struct clover_ulock_row *row;
++
++	if (pid <= 0 || pid != clover_bb_target_pid || addr == 0) {
++		return;
++	}
++	row = clover_ulock_slot(addr);
++	if (row == NULL) {
++		return;
++	}
++	__atomic_add_fetch(&row->woken, 1, __ATOMIC_RELAXED);
++	row->last_wait_rc = rc;
++	if (op != 0) {
++		row->last_op = op;
++	}
++}
++
++void
++clover_ulock_note_wake(int pid, uint64_t addr, uint32_t op, int32_t rc)
++{
++	struct clover_ulock_row *row;
++
++	if (pid <= 0 || pid != clover_bb_target_pid || addr == 0) {
++		return;
++	}
++	row = clover_ulock_slot(addr);
++	if (row == NULL) {
++		return;
++	}
++	__atomic_add_fetch(&row->wakes, 1, __ATOMIC_RELAXED);
++	row->last_wake_rc = rc;
++	row->last_op = op;
++}
++
++/*
++ * One line per address answers whether a wait that is still there has ever been
++ * woken: w is the number of waits, b the ones that blocked, k the ones that came
++ * back through ulock_wait_continue, s the wake calls from the same pid. The
++ * beat prints this every two minutes, so the counters read as a time series.
++ */
++void
++clover_ulock_dump(uint64_t secs)
++{
++	unsigned int i;
++	unsigned int shown = 0;
++
++	for (i = 0; i < CLOVER_ULOCK_SLOTS && shown < 8; i++) {
++		struct clover_ulock_row *row = &clover_ulock_rows[i];
++
++		if (row->addr == 0 ||
++		    (row->waits + row->blocked + row->woken + row->wakes) == 0) {
++			continue;
++		}
++		printf("clover r237: ulock t=%llu pid=%d a=%llx w=%u b=%u k=%u"
++		    " s=%u wr=%d sw=%d op=%x\n",
++		    (unsigned long long)secs, clover_bb_target_pid,
++		    (unsigned long long)row->addr, row->waits, row->blocked,
++		    row->woken, row->wakes, row->last_wait_rc,
++		    row->last_wake_rc, row->last_op);
++		shown++;
++	}
++	if (clover_ulock_overflow != 0) {
++		printf("clover r237: ulocko t=%llu pid=%d n=%u\n",
++		    (unsigned long long)secs, clover_bb_target_pid,
++		    clover_ulock_overflow);
++	}
++}
++
+ /* Round233. The destination's port object, read once from the latched sender's
+  * space, so a port-set walk can mark the member the blocked message is actually
+  * sitting in. The beat itself moves to a kernel thread: boot 21's ring went
+@@ -10820,6 +10977,7 @@
+ 				clover_sb_port_state(sb, clover_sb_last_reply,
+ 				    "sbrep", secs, "r234");
+ 			}
++			clover_ulock_dump(secs);
+ 		}
+ 		if (clover_bb_target_pid != 0) {
+ 			clover_bb_sample(clover_bb_target_pid, sb,
+@@ -11303,6 +11461,15 @@
+  */
+ extern kern_return_t copyinmap(vm_map_t, vm_map_offset_t, void *, vm_size_t);
+ 
++static int
++clover_bb_is_lock_op(uint64_t op, uint64_t addr)
++{
++	return addr != 0 && addr < 0x10000000000ULL &&
++	    ((op == 0x1000001ULL) || (op == 0x40ULL) || (op == 0x100ULL) ||
++	    ((op & 0xFFFF00FFULL) == 0x01000000ULL && (op & 0xff) >= 1 &&
++	    (op & 0xff) <= 4));
++}
++
+ static void
+ clover_bb_lock_word(task_t task, uint64_t tid, uint64_t op, uint64_t addr,
+     uint32_t st, uint64_t secs)
+@@ -11314,12 +11481,8 @@
+ 	uint32_t own;
+ 	uint64_t ownid = 0;
+ 	uint32_t ownst = 0;
+-	int is_lock;
+ 
+-	is_lock = (op == 0x1000001ULL) || (op == 0x40ULL) || (op == 0x100ULL) ||
+-	    ((op & 0xFFFF00FFULL) == 0x01000000ULL && (op & 0xff) >= 1 &&
+-	    (op & 0xff) <= 4);
+-	if (!is_lock || addr == 0 || addr >= 0x10000000000ULL) {
++	if (!clover_bb_is_lock_op(op, addr)) {
+ 		return;
+ 	}
+ 	if (copyinmap(task->map, (vm_map_offset_t)(addr & ~3ULL), &word,
+@@ -11455,7 +11618,7 @@
+ 	uint64_t ufp[6];
+ 	uint64_t ulr[6];
+ 	uint64_t usp[6];
+-	uint64_t uframes[6][6];
++	uint64_t uframes[6][10];
+ 	uint32_t ufn[6];
+ 	uint32_t ust[6];
+ 	uint32_t un = 0;
+@@ -11727,9 +11890,14 @@
+ 	 * is the reading, but it is also six address spaces' worth of translation, and the
+ 	 * signature gate above is what keeps a quiet boot inside the tee's line budget.
+ 	 */
++	/*
++	 * Round237. Six frames stopped inside libdispatch; the promise the main
++	 * thread is waiting on lives further out. Ten frames is still one tee
++	 * record: the line stays under 320 bytes.
++	 */
+ 	for (i = 0; i < un; i++) {
+ 		ufn[i] = clover_user_bp_walk(vm_map_pmap(task->map), ufp[i], usp[i],
+-		    uframes[i], 6);
++		    uframes[i], 10);
+ 	}
+ 	for (i = 0; i < un; i++) {
+ 		len = snprintf(line, sizeof(line),
+@@ -11753,7 +11921,7 @@
+ 		 * slide and only the host can resolve them.
+ 		 */
+ 		{
+-			char ft[96];
++			char ft[192];
+ 			int foff = 0;
+ 			uint32_t j;
+ 
+@@ -11779,6 +11947,35 @@
+ 				printf("%s", line);
+ 			}
+ 		}
++		/*
++		 * Round237. The wait word sits at object+0x34, so the header the
++		 * word belongs to starts 0x34 bytes below it. Reading isa, the
++		 * word at +8 and the wait word itself names what the blocked
++		 * thread is parked on and whether the object is still live.
++		 */
++		if (clover_bb_is_lock_op(ux0[i], ux1[i])) {
++			uint64_t base = (ux1[i] & ~3ULL) - 0x34ULL;
++			pmap_t pmap = vm_map_pmap(task->map);
++			uint32_t ilo = 0, ihi = 0, vlo = 0, vhi = 0, gw = 0;
++
++			if (clover_user_read32(pmap, base, &ilo) &&
++			    clover_user_read32(pmap, base + 4, &ihi) &&
++			    clover_user_read32(pmap, base + 8, &vlo) &&
++			    clover_user_read32(pmap, base + 12, &vhi) &&
++			    clover_user_read32(pmap, base + 0x34, &gw)) {
++				printf("clover r237: bbobj t=%llu pid=%d"
++				    " tid=0x%llx a=%llx base=%llx isa=%llx"
++				    " val=%llx w=%x\n",
++				    (unsigned long long)secs, pid,
++				    (unsigned long long)utid[i],
++				    (unsigned long long)ux1[i],
++				    (unsigned long long)base,
++				    (unsigned long long)((uint64_t)ilo |
++				    ((uint64_t)ihi << 32)),
++				    (unsigned long long)((uint64_t)vlo |
++				    ((uint64_t)vhi << 32)), gw);
++			}
++		}
+ 	}
+ 	task_deallocate(task);
+ }
