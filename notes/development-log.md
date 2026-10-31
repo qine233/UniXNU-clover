@@ -18371,3 +18371,23 @@ r247 做两件事，都不加新读数：
   而且自己的 round-trip 校验还是干净的。可靠做法是**只重放到上一轮**（跳过 r247 自己）取基线：
   `for PATCH ...; case *clover-r247.patch) continue;;` → 那份文件才是 r246 的真后状态。
 - **别在块注释里写 `getNextObject*/`**：`*/` 会提前闭合注释。改成 `getNextObject() and …`。
+
+### 排期注记（续）：sheng HID 路的接线细节已在宿主摸清，等读数再动板子
+
+- `native_hid_input_allocate()` 与整台合成 HID 设备都在**上游**
+  `~/UniXNU/drivers/NativeHidInput/NativeHidInput.cpp` 里；探针需要的
+  `native_hid_static_init` 不是函数，sheng 直接把它别名到
+  `__GLOBAL__sub_I_NativeHidInput.cpp`（`package/HidInputProbe.cpp:13`）——
+  也就是 `scripts/build-native-hid-input.py:107` 用
+  `llvm-objcopy --globalize-symbol=__GLOBAL__sub_I_NativeHidInput.cpp` 从 `.late.o`
+  里救出来的那个静态初始化符号。两者是一对，缺一就链接不上。
+- sheng 的链接法：`scripts/build-gop-legacy-display.py:313-314` 把
+  `NativeHidInput.late.o` 与 `hid-original-bindings.o` 塞进**同一颗显示档案**里，
+  探针对象 `HidInputProbe.o` 用 `LegacyDisplayProbe.o` 的 compile record 换源码同名编出来
+  （`cmd` 复用 + `str(arg)==str(source)` 替换）。clover 侧对应的落点就是
+  `scripts/build-clover-gop-legacy-display.py` 已经在做的同一套手法，接入是纯加法。
+- 所以 r248 若走这条路，工作量只有三件：`[kernel] archives` 里加
+  `build-native-hid-input.py`、把上面两个对象并进 clover 的显示档案、照 sheng 写
+  `package/CloverHidInputProbe.cpp` 并从 CloverPMGR 调；boot args 加
+  `offline-hid-input=1 offline-hid-home=1`。**但先等 boot 36 的
+  `plane byname=`：**如果平面名字本来就缺，修名字比造一台 HID 设备更靠前，两条路不能混做。
