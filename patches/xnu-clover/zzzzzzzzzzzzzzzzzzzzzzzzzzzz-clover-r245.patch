@@ -1,25 +1,39 @@
 diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
 --- a/iokit/Kernel/IOStartIOKit.cpp
 +++ b/iokit/Kernel/IOStartIOKit.cpp
-@@ -255,17 +255,6 @@
- 	char                next[96];
- 	int                 seen = 0;
- 
--	/*
--	 * Round244. Boot 32 proved the census runs -- and proved the ring rotates
--	 * it away: the first full beat sits hours before the 512-record window the
--	 * panic drain reads back, so a print that early is a print nobody sees.
--	 * The census now fires inside the window: once the boot is past 1500 s of
--	 * the 1800 s deadline, its ~30 rows are younger than the oldest record the
--	 * drain can still reach.
--	 */
--	if (secs < 1500) {
--		return;
--	}
- 	if (ran) {
- 		return;
- 	}
-@@ -355,8 +344,56 @@
+@@ -243,6 +243,31 @@
+  * four questions the block turns on, and /chosen is the positive control --
+  * r205 proved its display-scale reaches userland.
+  */
++
++/*
++ * Round245. This translation unit does not pull in <string.h>, and a registry
++ * name is short by construction, so the containment test is written out.
++ */
++static bool
++clover_name_has(const char *name, const char *part)
++{
++	if (name == NULL || part == NULL) {
++		return false;
++	}
++	for (const char *head = name; *head != '\0'; head++) {
++		const char *a = head;
++		const char *b = part;
++		while (*b != '\0' && *a == *b) {
++			a++;
++			b++;
++		}
++		if (*b == '\0') {
++			return true;
++		}
++	}
++	return false;
++}
++
+ extern "C" void
+ clover_iodt_census(unsigned long long secs)
+ {
+@@ -355,8 +380,56 @@
  		} else {
  			printf("clover r243: target absent\n");
  		}
@@ -41,11 +55,11 @@ diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
 +	/*
 +	 * Round245. The other half of the question: the ready notification the
 +	 * blocked thread waits for is issued by whatever resolves the button, so the
-+	 * service plane gets walked for the classes that could own it. Names longer
-+	 * than 20 characters are counted, not printed, to keep the rows short.
++	 * service plane gets walked for the classes that could own it. backboardd's
++	 * own log string says "not configuring SSHB because we don't have a real
++	 * home button", which makes the resolver the notification's only candidate.
 +	 */
 +	{
-+		extern const IORegistryPlane *gIOServicePlane;
 +		IORegistryIterator  *si;
 +		IORegistryEntry     *svc;
 +		int                  total = 0, matched = 0;
@@ -60,9 +74,9 @@ diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
 +				if (nm == NULL) {
 +					continue;
 +				}
-+				if (strstr(nm, "utton") != NULL || strstr(nm, "HID") != NULL ||
-+				    strstr(nm, "aptic") != NULL || strstr(nm, "SSB") != NULL ||
-+				    strstr(nm, "Resolver") != NULL) {
++				if (clover_name_has(nm, "utton") || clover_name_has(nm, "HID") ||
++				    clover_name_has(nm, "aptic") || clover_name_has(nm, "SSB") ||
++				    clover_name_has(nm, "Resolver")) {
 +					matched++;
 +					if (matched <= 12) {
 +						printf("clover r243: svc %.24s\n", nm);

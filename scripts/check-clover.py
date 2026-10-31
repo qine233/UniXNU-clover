@@ -1498,6 +1498,39 @@ def check_board(errors: list) -> str:
                 errors.append(f"{r244_patch.name} checks the latch before the gate: an early "
                               "beat would consume the one shot and print nothing")
 
+        # Round245: boot 33 read the plane complete (/buttons present, home-button-type len=4
+        # u32=2) and the wait still stood, so the census has to answer the two questions the ADT
+        # cannot: whether hw.product reaches the tree at all, and whether any service that could
+        # ever issue the controller-ready notification is registered.
+        r245_name = "zzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r245.patch"
+        r245_patch = next((base / "patches/xnu-clover" / r245_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r245_name).is_file()), None)
+        if r245_patch is None:
+            errors.append(f"patches/xnu-clover/{r245_name} is missing: the reading would again be "
+                          "the plane's contents alone, which boot 33 already showed is not the gap")
+        else:
+            r245_text = r245_patch.read_text()
+            for needle in ('"clover r243: model=%.16s',
+                           '"clover r243: model absent',
+                           '+static bool\n+clover_name_has(const char *name, const char *part)',
+                           'IORegistryIterator::iterateOver(gIOServicePlane, 0)',
+                           '"clover r243: svc total=%d button-family=%d',
+                           'clover_name_has(nm, "utton")', 'clover_name_has(nm, "HID")',
+                           'clover_name_has(nm, "aptic")', 'clover_name_has(nm, "SSB")',
+                           'clover_name_has(nm, "Resolver")'):
+                if needle not in r245_text:
+                    errors.append(f"{r245_patch.name} lacks {needle[:56]!r}: the census would not "
+                                  "answer which of the two remaining causes it is")
+            for stale in ('strstr(', 'extern const IORegistryPlane *gIOServicePlane;'):
+                if stale in r245_text:
+                    errors.append(f"{r245_patch.name} re-adds {stale!r}: this translation unit does "
+                                  "not pull in <string.h>, and the plane global already has C++ "
+                                  "linkage through IOPlatformExpert.h -- either one fails to build")
+            if "static volatile int ran = 0;" in r245_text:
+                errors.append(f"{r245_patch.name} re-adds the latch: the census body already owns "
+                              "the one-shot gate and a second latch would silence it forever")
+
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
         # respawn), so the ring started 400 s into the boot. The filters have to be in the object, and
@@ -2537,8 +2570,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r244:"):
-        errors.append('[payload] title is not "clover r244: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r245:"):
+        errors.append('[payload] title is not "clover r245: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3590,8 +3623,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r244:"):
-        errors.append('[payload] title is not "clover r244: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r245:"):
+        errors.append('[payload] title is not "clover r245: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

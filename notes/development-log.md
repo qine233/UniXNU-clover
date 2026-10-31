@@ -18217,3 +18217,27 @@ r242 用错基址把 `0x1a02113dc` 当成「读 /buttons 的 helper」，那段�
 - `button-family>0` ⇒ 服务在，问题在 MG 的取值/闸门；下一轮改为解 backboardd 里 BSPlatform
   的 `homeButtonType` 缓存槽（r242 记的 `0x1f48945e8`，按 kslide 定位），直接读它算出的数。
 - `model` 不是 `iPad7,1` ⇒ ADT 生成链有漂移，先修 ADT。
+
+### r245 落地：census 编译修复、补丁基线重取与产物
+
+- 第一次编译挂在两处：`strstr` 在本翻译单元里没有 `<string.h>`；`gIOServicePlane` 在
+  `extern "C"` 块里重新声明会和 `IOService.h:122`（经 `IOPlatformExpert.h:41` 已经进来了）
+  的 C++ linkage 打架。改成文件内 `static bool clover_name_has(const char *, const char *)`
+  手写包含判断，平面全局一律不再本地声明。
+- **补丁基线取错的教训**：漂移时的那份工作树里 `LATE_PATCH` 已被脚本反向剥掉，直接拿它
+  当 r244 后状态生成 r245，会把 r244 的 `if (secs < 1500) return;` 闸门整块丢掉——这样的
+  补丁在自己的 round-trip 校验里是干净的，只有整体重放才会 STUCK。修法：`git checkout -- .`
+  回到 HEAD，删掉 `zzz-boot-progress.patch` 新建的未跟踪文件 `osfmk/kern/boot_progress.h`
+  （它是该补丁自己创建的，留着就报 already exists），再按 glob 序**单趟**重放。
+  这一次 94 个补丁全部落位，census 文件与目标逐字节一致。
+- `startup.o.json` 是 bootstrap pass 的唯一开关：`nm: error: …IOStartIOKit.cpo: No such file`
+  说明上次编译死在这个文件上，而 marker 还在，所以驱动直接跳到 archives。删 marker 才会重编。
+- 产物：内核 `6cc065c5…` → AMFI 两刀仍在 `0x1ac00e4`/`0x1ac016c`（与 r186–r244 同址）→
+  normalize 968 戳 → round245-kernel-normalized.macho `f8aa6905…` →
+  **round245-payload.img `ea6810f5…`**（58720256 B，ADT 仍 14344）。双闸门绿：
+  verify-clover-payload 的 r217 组新增 `census-model`/`census-svc` 两项 present；
+  check-clover 的 r245 块钉 `clover_name_has` 定义与五处调用，并反向断言
+  `strstr(` 与 `extern const IORegistryPlane *gIOServicePlane;` 不得出现。
+- boot 34：`run-clover-unattended.sh --wait 2100 --out ~/clover-out/round245-log-window.bin
+  --flash-cache ~/clover-out/round245-payload.img --boot-after-flash`。读数回来直接对
+  上面写下的两条判决分支走，不再增设假设。

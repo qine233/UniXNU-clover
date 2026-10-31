@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r244: boot 32 proved the census runs -- its beat printed bbgrp beside it -- and proved the 512-record kernel ring rotates the census rows away long before the panic drain reads the window, so the census now fires past 1500 s of the 1800 s deadline: one shot, inside the window, naming every IODeviceTree node and the four lookups MobileGestalt itself makes (/buttons + home-button-type len/u32, /product, /chosen display-scale control, root target-type) -- the reading that decides whether the SSHB haptics deadlock is a plane-publication fault or a wrong getter chain"
+title = "clover r245: boot 33 read the IODeviceTree plane complete -- /buttons resolves in-kernel and its home-button-type is len=4 u32=2 -- and the SSHB haptics wait stood untouched (bbgrp cnt=1 g=0 wait=1, killsig SpringBoard<-backboardd), so the ADT is not the gap; backboardd's two stubs now decode to [[BSPlatform sharedInstance] homeButtonType], which keeps the getter chain and moves the question to userland, so the census also names the root model (hw.product, the prefix MobileGestalt matches before any identity answer) and counts the IOService entries that could ever issue the controller-ready notification (Button/HID/Haptics/SSHB/Resolver)"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
