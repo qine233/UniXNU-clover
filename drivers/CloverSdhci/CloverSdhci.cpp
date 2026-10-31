@@ -744,6 +744,15 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r238: ulock", "r238-ulock", 224, 0, 0, 0 },
   { "clover r238: ulockc", "r238-ulockc", 96, 0, 0, 0 },
   { "clover r237: bbobj", "r237-obj", 96, 0, 0, 0 },
+  // Round239 adds two rows per blocked group wait to the sample that already prints bbobj: the
+  // dispatch group's own state, and either the block->controller->definition chain the host proved
+  // or its explicit absence. They have the same cadence as bbobj -- at most one per printed sample
+  // per waiting thread -- so 96 covers a 30-minute boot. The positive and negative chain rows split
+  // the budget because only one of the two is ever produced: whichever the device answers with can
+  // fill its class, and neither can push the other out.
+  { "clover r239: bbgrp", "r239-grp", 96, 0, 0, 0 },
+  { "clover r239: bbchain", "r239-chain", 96, 0, 0, 0 },
+  { "clover r239: bbnochain", "r239-nochain", 96, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

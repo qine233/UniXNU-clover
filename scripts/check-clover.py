@@ -863,7 +863,14 @@ def check_board(errors: list) -> str:
                 ('{ "clover r238: ulockc", "r238-ulockc", 96, 0, 0, 0 },',
                  "the counter row would be pushed out by the address rows that follow it"),
                 ('{ "clover r237: bbobj", "r237-obj", 96, 0, 0, 0 },',
-                 "the object-header rows would share the beat's budget and lose their tail")):
+                 "the object-header rows would share the beat's budget and lose their tail"),
+                ('{ "clover r239: bbgrp", "r239-grp", 96, 0, 0, 0 },',
+                 "the dispatch-group state rows would share the header's budget and lose their tail"),
+                ('{ "clover r239: bbchain", "r239-chain", 96, 0, 0, 0 },',
+                 "the block-chain rows would push the group state out of the ring"),
+                ('{ "clover r239: bbnochain", "r239-nochain", 96, 0, 0, 0 },',
+                 "the negative chain row would be unread, so silence could not be told "
+                 "apart from a chain that was never searched")):
             if tee not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci gives round238's rows no tee class ({tee}): "
                               f"{why}")
@@ -1331,6 +1338,49 @@ def check_board(errors: list) -> str:
             if r238_text.count('clover_ulock_enter(pid, name, addr)') < 4:
                 errors.append(f"{r238_patch.name} does not route all four hooks through the same "
                               "filter: one path would count differently from the others")
+
+        # Round239 turns boot 27's host-proven deadlock chain into on-device readings. The group the
+        # waiter parks on is named by its own state word (dg_bits and dg_gen make up the 64-bit
+        # dg_state at object+0x30, and the ulock address is its high half), so the sampler reads all
+        # three words; and because a blocked thread's live x19 belongs to whichever libdispatch frame
+        # is innermost, the block is recovered from the frames the walker already walked -- each
+        # return address's own caller frame, eight bytes below its link -- and accepted only when the
+        # object it captures names exactly the group being waited on.
+        r239_name = "zzzzzzzzzzzzzzzzzzzzzzzzz-clover-r239.patch"
+        r239_patch = next((base / "patches/xnu-clover" / r239_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r239_name).is_file()), None)
+        if r239_patch is None:
+            errors.append(f"patches/xnu-clover/{r239_name} is missing: the group's own state would "
+                          "again be inferred from a wait word instead of read, and the chain the "
+                          "host proved would stay unproven on the device")
+        else:
+            r239_text = r239_patch.read_text()
+            for needle in ('clover_user_read64(pmap_t pmap, uint64_t addr, uint64_t *value)',
+                           'uint64_t *callers',
+                           'callers[i] = parent;',
+                           'clover_bb_find_block(pmap_t pmap, const uint64_t *callers, uint32_t fn,',
+                           'clover_user_read64(pmap, callers[i] - 8, &cand)',
+                           'hold != group',
+                           'uint64_t ucallers[6][10];',
+                           'uframes[i], ucallers[i], 10);',
+                           'base + 0x30, &state',
+                           'base + 0x38, &head',
+                           'base + 0x40, &tail',
+                           '"clover r239: bbgrp t=%llu pid=%d"',
+                           '"clover r239: bbchain t=%llu pid=%d"',
+                           '"clover r239: bbnochain t=%llu pid=%d"'):
+                if needle not in r239_text:
+                    errors.append(f"{r239_patch.name} lacks {needle[:56]!r}: the group state would "
+                                  "not be read, or the chain would be assumed instead of searched")
+            if r239_text.find('clover_bb_find_block(pmap_t pmap') > \
+                    r239_text.find('"clover r239: bbchain'):
+                errors.append(f"{r239_patch.name} prints the chain row before the finder exists: "
+                              "the patch would not compile")
+            if r239_text.find('"clover r239: bbchain') > \
+                    r239_text.find('"clover r239: bbnochain'):
+                errors.append(f"{r239_patch.name} prints the negative row before the positive one: "
+                              "a sample that found the chain would answer it had found nothing")
 
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
@@ -2371,8 +2421,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r238:"):
-        errors.append('[payload] title is not "clover r238: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r239:"):
+        errors.append('[payload] title is not "clover r239: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3424,8 +3474,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r238:"):
-        errors.append('[payload] title is not "clover r238: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r239:"):
+        errors.append('[payload] title is not "clover r239: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

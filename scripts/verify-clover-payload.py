@@ -959,6 +959,13 @@ def check_sb_sample(kernel: bytes) -> bool:
              "bbobj": (b"clover r237: bbobj t=%llu pid=%d"
                        b" tid=0x%llx a=%llx base=%llx isa=%llx"
                        b" val=%llx w=%x\n") in kernel,
+             "bbgrp": (b"clover r239: bbgrp t=%llu pid=%d tid=0x%llx base=%llx"
+                       b" b=%x g=%x cnt=%u wait=%d notif=%d nh=%llx nt=%llx\n") in kernel,
+             "bbchain": (b"clover r239: bbchain t=%llu pid=%d tid=0x%llx fi=%u fn=%u"
+                         b" blk=%llx inv=%llx isa=%llx ctl=%llx sisa=%llx def=%llx"
+                         b" disa=%llx grp=%llx\n") in kernel,
+             "bbnochain": (b"clover r239: bbnochain t=%llu pid=%d tid=0x%llx"
+                           b" base=%llx fn=%u\n") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
                            b"dropped=%u comms=%u\n") in kernel,
              "tee-sync": (b"CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n") in kernel}

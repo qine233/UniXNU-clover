@@ -1,0 +1,273 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index fee08b4..35348fd 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10407,19 +10407,40 @@ clover_user_read32(pmap_t pmap, uint64_t addr, uint32_t *value)
+ 	if (page == 0) {
+ 		return 0;
+ 	}
+ 	phys = ((uint64_t)page << PAGE_SHIFT) | (addr & (PAGE_SIZE - 1));
+ 	*value = (uint32_t)ml_phys_read_64((addr64_t)phys);
+ 	return 1;
+ }
+ 
++/*
++ * Round239. A heap slot that holds a pointer is 8 bytes wide, and the two halves
++ * may sit in different pages, so each half gets its own translation. The range
++ * test is the one the wait rows already use: below the kernel base and aligned.
++ */
++static int
++clover_user_read64(pmap_t pmap, uint64_t addr, uint64_t *value)
++{
++	uint32_t lo, hi;
++
++	if (addr == 0 || (addr & 3) != 0 || addr >= 0x10000000000ULL) {
++		return 0;
++	}
++	if (!clover_user_read32(pmap, addr, &lo) ||
++	    !clover_user_read32(pmap, addr + 4, &hi)) {
++		return 0;
++	}
++	*value = (uint64_t)lo | ((uint64_t)hi << 32);
++	return 1;
++}
++
+ static uint32_t
+ clover_user_bp_walk(pmap_t pmap, uint64_t fp, uint64_t sp, uint64_t *frames,
+-    uint32_t frames_max)
++    uint64_t *callers, uint32_t frames_max)
+ {
+ 	uint32_t i = 0;
+ 	uint64_t limit;
+ 
+ 	if (pmap == PMAP_NULL || sp == 0) {
+ 		return 0;
+ 	}
+ 	limit = sp + 0x40000;
+@@ -10434,25 +10455,99 @@ clover_user_bp_walk(pmap_t pmap, uint64_t fp, uint64_t sp, uint64_t *frames,
+ 		    !clover_user_read32(pmap, fp + 12, &rhi)) {
+ 			break;
+ 		}
+ 		parent = (uint64_t)lo | ((uint64_t)hi << 32);
+ 		ret = (uint64_t)rlo | ((uint64_t)rhi << 32);
+ 		if (ret == 0) {
+ 			break;
+ 		}
+-		frames[i++] = ret;
++		frames[i] = ret;
++		/*
++		 * Round239. frames[i] is a return address inside the function that
++		 * owns `parent`, so parent is that function's frame -- the place its
++		 * callee-saved registers were pushed. A block's captured pointers are
++		 * reachable from the frame of the block body that is still running.
++		 */
++		if (callers != NULL) {
++			callers[i] = parent;
++		}
++		i++;
+ 		if (parent <= fp) {
+ 			break;
+ 		}
+ 		fp = parent;
+ 	}
+ 	return i;
+ }
+ 
++/*
++ * Round239. The host proved what the wait is: -[BKButtonHapticsController
++ * applyDefinitions:] dispatches a block whose body loads its captured controller
++ * from block+0x20, reads the controller's _controllerReadyGroup at +0x38 and
++ * parks in ___ulock_wait on that group's dg_gen (backboardd file offset 0x303c4,
++ * the bl at 0x303e0, the return address 0x303e4 the frame chain carries). The
++ * block pointer itself only lives in the block body's own frame -- that frame
++ * pushed x19 eight bytes below its link -- because a blocked thread's *live*
++ * x19 belongs to whichever libdispatch frame is innermost. So the chain is
++ * searched for rather than assumed: every frame the walker names offers the slot
++ * below its link as a candidate block, and a candidate is accepted only when the
++ * pointer it captures at +0x20 names an object whose +0x38 is exactly the group
++ * this thread waits on. A stack word that merely looks like a pointer does not
++ * survive that test.
++ */
++static int
++clover_bb_find_block(pmap_t pmap, const uint64_t *callers, uint32_t fn,
++    uint64_t group, uint64_t *blk, uint64_t *inv, uint64_t *isa, uint64_t *self,
++    uint64_t *sisa, uint64_t *def, uint64_t *disa, uint32_t *at)
++{
++	uint32_t i;
++
++	for (i = 0; i < fn; i++) {
++		uint64_t cand = 0, captured = 0, hold = 0;
++
++		if (callers[i] <= 8) {
++			continue;
++		}
++		if (!clover_user_read64(pmap, callers[i] - 8, &cand) ||
++		    cand == 0 || (cand & 7) != 0 || cand >= 0x10000000000ULL) {
++			continue;
++		}
++		if (!clover_user_read64(pmap, cand + 0x10, inv) ||
++		    !clover_user_read64(pmap, cand + 0x20, &captured) ||
++		    captured == 0 || (captured & 7) != 0 ||
++		    captured >= 0x10000000000ULL) {
++			continue;
++		}
++		if (!clover_user_read64(pmap, captured + 0x38, &hold) ||
++		    hold != group) {
++			continue;
++		}
++		*blk = cand;
++		*self = captured;
++		*at = i;
++		if (!clover_user_read64(pmap, cand, isa)) {
++			*isa = 0;
++		}
++		if (!clover_user_read64(pmap, captured, sisa)) {
++			*sisa = 0;
++		}
++		*def = 0;
++		*disa = 0;
++		if (clover_user_read64(pmap, captured + 0x20, def) &&
++		    *def != 0 && (*def & 7) == 0 && *def < 0x10000000000ULL) {
++			if (!clover_user_read64(pmap, *def, disa)) {
++				*disa = 0;
++			}
++		}
++		return 1;
++	}
++	return 0;
++}
++
+ /*
+  * Round211. Walk one thread's kernel stack the way kdp does: the kernel
+  * saved state sits at the top of the thread's kernel stack, and each
+  * frame from there down keeps {x29, x30} in its first sixteen bytes.
+  * Only addresses inside this thread's own stack are followed, so a
+  * corrupt chain ends the walk instead of faulting the kernel.
+  */
+ static uint32_t
+@@ -11697,16 +11792,22 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 	uint64_t ux0[6];
+ 	uint64_t ux1[6];
+ 	uint64_t ux2[6];
+ 	uint64_t ux3[6];
+ 	uint64_t ufp[6];
+ 	uint64_t ulr[6];
+ 	uint64_t usp[6];
+ 	uint64_t uframes[6][10];
++	/*
++	 * Round239. The frame that owns a return address is where that function
++	 * pushed its callee-saved registers, so the walker reports it next to the
++	 * address. A running block's pointer is only reachable from its own frame.
++	 */
++	uint64_t ucallers[6][10];
+ 	uint32_t ufn[6];
+ 	uint32_t ust[6];
+ 	uint32_t un = 0;
+ 	uint32_t uall = 0;
+ 	uint64_t run_tid = 0;
+ 	uint64_t dt;
+ 	uint32_t hn = 0;
+ 	uint32_t n = 0;
+@@ -11975,17 +12076,17 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 	 */
+ 	/*
+ 	 * Round237. Six frames stopped inside libdispatch; the promise the main
+ 	 * thread is waiting on lives further out. Ten frames is still one tee
+ 	 * record: the line stays under 320 bytes.
+ 	 */
+ 	for (i = 0; i < un; i++) {
+ 		ufn[i] = clover_user_bp_walk(vm_map_pmap(task->map), ufp[i], usp[i],
+-		    uframes[i], 10);
++		    uframes[i], ucallers[i], 10);
+ 	}
+ 	for (i = 0; i < un; i++) {
+ 		len = snprintf(line, sizeof(line),
+ 		    "clover r231: bbwait t=%llu pid=%d tid=0x%llx st=%x"
+ 		    " cont=%llx pc=%llx x0=%llx x1=%llx x2=%llx x3=%llx"
+ 		    " u=%u run=0x%llx\n",
+ 		    (unsigned long long)secs, pid,
+ 		    (unsigned long long)utid[i], ust[i],
+@@ -12053,16 +12154,83 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 				    (unsigned long long)utid[i],
+ 				    (unsigned long long)ux1[i],
+ 				    (unsigned long long)base,
+ 				    (unsigned long long)((uint64_t)ilo |
+ 				    ((uint64_t)ihi << 32)),
+ 				    (unsigned long long)((uint64_t)vlo |
+ 				    ((uint64_t)vhi << 32)), gw);
+ 			}
++			/*
++			 * Round239. The word waited on is dg_gen, the high half of the
++			 * 64-bit dg_state at object+0x30, so the group's own bookkeeping is
++			 * one load away: dg_bits counts outstanding enters and records whether
++			 * anyone waits, and the notify list head and tail at +0x38 and +0x40
++			 * say whether anyone asked to be called back when it drains. A group
++			 * entered once and never left reads b=fffffffd, and a g of zero says
++			 * the generation has never advanced -- the deadlock, if there is one,
++			 * is written here.
++			 */
++			{
++				uint64_t state = 0, head = 0, tail = 0;
++				int32_t bits;
++
++				if (clover_user_read64(pmap, base + 0x30, &state) &&
++				    clover_user_read64(pmap, base + 0x38, &head) &&
++				    clover_user_read64(pmap, base + 0x40, &tail)) {
++					bits = (int32_t)((uint32_t)state & 0xfffffffcU);
++					printf("clover r239: bbgrp t=%llu pid=%d"
++					    " tid=0x%llx base=%llx b=%x g=%x"
++					    " cnt=%u wait=%d notif=%d nh=%llx nt=%llx\n",
++					    (unsigned long long)secs, pid,
++					    (unsigned long long)utid[i],
++					    (unsigned long long)base,
++					    (unsigned int)((uint32_t)state),
++					    (unsigned int)(state >> 32),
++					    (unsigned int)(-bits >> 2),
++					    ((uint32_t)state & 1) ? 1 : 0,
++					    ((uint32_t)state & 2) ? 1 : 0,
++					    (unsigned long long)head,
++					    (unsigned long long)tail);
++				}
++			}
++			/*
++			 * Round239. If the chain the host proved is the one really running,
++			 * the walk finds it and names every object in it; if it does not, the
++			 * negative row is printed so silence is never mistaken for consent.
++			 */
++			{
++				uint64_t blk = 0, inv = 0, isa = 0, ctl = 0, sisa = 0;
++				uint64_t def = 0, disa = 0;
++				uint32_t at = 0;
++
++				if (clover_bb_find_block(pmap, ucallers[i], ufn[i], base,
++				    &blk, &inv, &isa, &ctl, &sisa, &def, &disa, &at)) {
++					printf("clover r239: bbchain t=%llu pid=%d"
++					    " tid=0x%llx fi=%u fn=%u blk=%llx inv=%llx"
++					    " isa=%llx ctl=%llx sisa=%llx def=%llx"
++					    " disa=%llx grp=%llx\n",
++					    (unsigned long long)secs, pid,
++					    (unsigned long long)utid[i], at, ufn[i],
++					    (unsigned long long)blk,
++					    (unsigned long long)inv,
++					    (unsigned long long)isa,
++					    (unsigned long long)ctl,
++					    (unsigned long long)sisa,
++					    (unsigned long long)def,
++					    (unsigned long long)disa,
++					    (unsigned long long)base);
++				} else {
++					printf("clover r239: bbnochain t=%llu pid=%d"
++					    " tid=0x%llx base=%llx fn=%u\n",
++					    (unsigned long long)secs, pid,
++					    (unsigned long long)utid[i],
++					    (unsigned long long)base, ufn[i]);
++				}
++			}
+ 		}
+ 	}
+ 	task_deallocate(task);
+ }
+ /*
+  * One line carries every thread: tid:state:wait:continuation:pc per thread.
+  * The continuation is what names a blocked thread's wait -- wait_event is zero
+  * for a thread parked on a mach_msg wait, exactly the case this is read for --

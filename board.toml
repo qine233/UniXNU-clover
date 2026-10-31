@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r238: the ulock table is fed by process name at the syscall rather than by the sampler latch, every call is counted, all twelve slots print blocked-first with age and a fresh word read, and the wait itself stays on the two-minute heartbeat"
+title = "clover r239: the group a blocked backboardd thread waits on has its own state read on the device -- dg_bits, dg_gen and the notify list -- and the block that captured it, the controller it captured and the home-button definition it holds are searched for through the waiter's own frames, with a row that says so when the chain is not there"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

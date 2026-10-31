@@ -17749,7 +17749,7 @@ r237 的表证明了卡住的等待不在表里，但「只印前 8 槽」和「
 `verify-clover-payload.py` 与 `check-clover.py` 全绿，LATE_PATCH 把 r238 放在 23 个 z 的最前。
 冷刷 cache（唯一由宿主写的分区），`run-clover-unattended.sh` 跑满 1800 s 死线。
 
-## r238 读数（boot 27）——卡住的等待终于进表：它等的是 home button 定义上的一个 dispatch group，gen 从未前进、也从未有 wake
+## r238 读数（boot 27）——卡住的等待终于进表：它等的是控制器上的一个 dispatch group，gen 从未前进、也从未有 wake
 
 boot 27 跑满 1800 s 死线：内核环 512 行全属本 boot，最后一条是 `1812.666` 的
 CoreAnalyticsHub nag timer（`r234: bbset t=1797`），16 条 report、64 条驱动判据、44 条 probe。
@@ -17781,19 +17781,135 @@ CoreAnalyticsHub nag timer（`r234: bbset t=1797`），16 条 report、64 条驱
   是同一个调用点。
 5. **宿主把 0x303e4 读成「先等组、再 applyDefinitions」**。`0x1000303e4` 是
    `0x1000303e0 bl _dispatch_group_wait` 的返回地址，所在 block invoke `0x1000303c4`：
-   `x8 = [block+0x20]`（捕获的 self）→ `x0 = [x8+0x20]`（`_homeButtonDefinition`）→
-   `x0 = [x0+0x38]`（home button 定义上的某个 dispatch group）→ 无限等；醒来后
-   `x0 = [block+0x20]`、`x2 = [block+0x28]`，尾调 `[self _queue_applyDefinitions:<arg>]`。
+   `x8 = [block+0x20]`（捕获的 self）→ `x0 = [x8+0x38]`（`_controllerReadyGroup`）→ 无限等；
+   醒来后 `x0 = [block+0x20]`、`x2 = [block+0x28]`，尾调 `[self _queue_applyDefinitions:<arg>]`。
    这个 block 在 `0x10002fef4` 造字面量，所在的函数 `0x10002fe4c` 是 `BKButtonHapticsController`
    方法列表里的第 11 个 IMP：它捕获 self 与一个保留的参数，`dispatch_async([self+0x30], block)`。
    与类元数据逐项对上：`+0x20` 是 `_homeButtonDefinition`、`+0x30` 是 `_queue`、`+0x38` 是
-   `_controllerReadyGroup`。**修正上一轮的口径**：block+0x20 是控制器本身，不是外层 block；
-   组属于 home button 定义（BKSButtonHapticsDefinition，在 BackBoardServices 里），控制器只负责等。
-   同一函数还有一条分支（`0x2fe8c` 的 `cmp x22,#2`）：`BSPlatform` 的查询返回 2 时打
-   「not configuring SSHB because we don't have a real home button」并**跳过** dispatch。
-   我们既然停在 block 里，说明那次查询没有返回 2。
+   `_controllerReadyGroup`。**两处修正上一轮的口径**：(a) block+0x20 是控制器本身，不是外层
+   block；(b) 组是**控制器**的 `_controllerReadyGroup`（`[block+0x20]+0x38`），不是 home button
+   定义上的字段——本节初稿写成 `[定义+0x38]`，是错的。同一函数还有一条分支（`0x2fe8c` 的
+   `cmp x22,#2`）：`BSPlatform` 的查询返回 2 时打「not configuring SSHB because we don't have a
+   real home button」并**跳过** dispatch。我们既然停在 block 里，说明那次查询没有返回 2。
 6. **SpringBoard 还在等**。`sbm2 t=1695` 仍是发给 `58:backboardd`、`rem=5403`；
    `bbset t=1797` 队列 11 条，最新序号 `0x959`。没有回信。
 
-未解：group 的 `dg_state`（`+0x30`）没读；`+0x38` 在 BKSButtonHapticsDefinition 里的 ivar 名
-与 enter/leave 的调用点；`0x2fe4c` 的选择器名与 `BSPlatform` 那次查询的返回值。
+未解（r239 的处理见下一节）：group 的 `dg_state`（`+0x30`）没读；enter/leave 的调用点；
+`BSPlatform` 那次查询的选择器名。
+
+## r239 宿主：把 boot 27 那条链读到可检验的程度——组的布局、enter/leave 的调用点、以及为什么不能用现场的 x19
+
+boot 27 停在 `_dispatch_group_wait`，但「组里缺一次 leave」这件事要在设备上被读出来，得先把
+libdispatch 1477.100.9 的组布局钉死，再把 enter/leave 两边的代码找到。两件事都从
+`~/UniXNU/refer/libdispatch` 的源码取，不再靠猜。
+
+1. **`OS_dispatch_group` 的字段**。`_OS_OBJECT_HEADER` 占 16 字节，加上 `dispatch_object_s` 的
+   `do_next`/`do_targetq`/`do_ctxt`/`do_finalizer` 四个指针共 48 字节，所以
+   **`dg_state` 在 `+0x30`、`dg_notify_head` 在 `+0x38`、`dg_notify_tail` 在 `+0x40`**，
+   后两个是完整的 8 字节指针——**推翻 r238 记下的 `dg_notify_tail +0x3c / dg_notify_count +0x40
+   / dg_value +0x44`**，那三个字段不存在。`dg_state` 是 64 位：低 32 位 `dg_bits`
+   （`VALUE_MASK 0xfffffffc`、`HAS_NOTIFS 0x2`、`HAS_WAITERS 0x1`），高 32 位 `dg_gen`；
+   这解释了 boot 27 的 ulock 地址 `base+0x34` 正是 `dg_gen`——`_ulock_wait` 等的就是它。
+   计数解码 `value = (uint32_t)(-(int32_t)(dg_bits & MASK)) >> 2`。
+2. **enter/leave 的算术，以及它为什么能叫醒等待者**。`enter` 给 `dg_bits` 减 4；
+   `leave` 给 64 位的 `dg_state` 加 4，所以 1→0 那次进位会自然推进 `dg_gen`，等在 `dg_gen`
+   上的线程因此被唤醒。`create_with_count(1)` 存 `dg_bits = -4`。于是**预测**：一次 enter
+   没有对应 leave、且有人在等，设备上的读数应是 `b=fffffffd`（cnt=1）、`g=0`、`wait=1`。
+3. **enter 与 leave 就在 backboardd 里**。`-[BKButtonHapticsController init]`
+   （`0x2e790`）造 `_controllerReadyGroup` 与 `_queue`，在 `0x2e8c4` 调
+   `dispatch_group_enter`，并把 leave 包成一个 block（`0x30c7c`）交给
+   `-[BRButtonResolverController scheduleReadyNotificationOnDispatchQueue:withBlock:]`。
+   **组从来没有回到 0，就是那个 ready 通知从来没有发生**——排期下一格是问
+   `BRButtonResolverController` 在等谁。
+4. **`0x2fe4c` 的选择器与 `BSPlatform` 的查询**。方法列表第 11 个 IMP 是
+   `-[BKButtonHapticsController applyDefinitions:]`；`0x2fe8c` 的 `cmp x22,#2` 比的是
+   `[[BSPlatform sharedInstance] homeButtonType]`，随后 `b.ne 0x2fedc`：**等于 2 时
+   fall through，打「not configuring SSHB because we don't have a real home button」并跳过
+   dispatch**；不等于 2 才走默认 haptics，构造 `0x303c4` 那个 block 去无限等——也就是我们
+   停下来的这条。（r240 核分支方向时把本节初稿「返回 2 才走 SSHB 分支」的含糊说法改正：
+   ==2 是跳过。）
+5. **块的指针不能从现场的 `x19` 拿**。ARM64 允许被调函数把 `x19` 存进栈后再复用这个寄存器，
+   所以陷入时的 `x19` 属于最内层那帧 libdispatch，不是 block。block 只在自己的帧里：
+   block body 的序言是 `stp x20,x19,[sp,#-0x20]! ; stp x29,x30,[sp,#0x10] ; add x29,sp,#0x10`，
+   于是 `x19` 存在 `fp-8`，而 `fp` 正是「返回地址落在 block 内部」那一帧的 parent。
+   **r239 的内核读数就按这个找**：对 walk 出来的每一帧，取其 parent 帧下方 8 字节做候选，
+   只有「候选 `+0x20` 的对象的 `+0x38` 恰等于本线程等的组」才算命中——栈上随便一个像指针的
+   字过不了这道检验。
+
+## r239 实现与构建
+
+1. **内核（`osfmk/kern/task.c`）**。新增 `clover_user_read64`（指针宽 8 字节、两半可能跨页，
+   各自走一次 `clover_user_read32` 的翻译，范围判据沿用等待行的「低于内核基址且 4 字节对齐」）；
+   `clover_user_bp_walk` 多收一个 `callers[]`，把每帧的 parent 一并带出；
+   `clover_bb_find_block` 按上面第 5 条搜链；采样循环里在原有 `clover r237: bbobj` 之后
+   打印 `clover r239: bbgrp`（`base+0x30/0x38/0x40` → `b g cnt wait notif nh nt`）与
+   `clover r239: bbchain` / `bbnochain`（命中给 `fi fn blk inv isa ctl sisa def disa grp`，
+   没命中给 `base fn`，让沉默不再是暧昧的答案）。
+2. **驱动 tee**。新类 `r239-grp` 96、`r239-chain` 96、`r239-nochain` 96：前两类与 `bbobj`
+   同节奏（每个打印的样本每个等待线程一行）；正负两类分预算是因为一次采样只会产出其中一类，
+   谁出现谁占自己的额度，互相挤不掉。
+3. **契约**。`LATE_PATCH` 把 r239 放在 25 个 z 的最前；`check-clover.py` 断言三条读数串、
+   64 位读、`callers[i] = parent`、命中判据 `hold != group`、三个 tee 类，以及
+   「finder 定义在 chain 行之前、正行在负行之前」；`verify-clover-payload.py` 在 r217 组里
+   加 `bbgrp`/`bbchain`/`bbnochain`；`board.toml` 标题升到 `clover r239:`。
+
+构建：内核 `df5333da…`（无 AMFI 刀）→ AMFI 两刀仍落在与 r237/r238 相同的站点（文件偏移
+`0x1ac00e4` / `0x1ac016c`）→ 归一化 968 处时间戳清零、LC_UUID/_PrelinkKCID 由文件导出 →
+`round239-kernel-amfi.macho` sha256 `a6e4dacbe034382757a997d437097d7583cc0a788eb219f034aa468d48fa2bda`。
+payload `round239-payload.img` sha256 `b2bdfc1fddaaa2c42f03b8fae8b87fe9bf1325ee3689392bb426a0c19baddaf8`
+（58720256 字节）。`check-clover.py` 绿，`verify-clover-payload.py` 0 FAIL（r217 组含
+`bbgrp`/`bbchain`/`bbnochain`）。冷刷 cache（唯一由宿主写的分区），跑满 1800 s 死线。
+
+## r239 读数（boot 28）——预测逐字段命中，self→组链在设备上自证
+
+boot 28 跑满 1800 s 死线：内核环 512 行全属本 boot，窗口 **1069.837–1784.442 s**，
+末行 `r217 sbs t=1784 pid=229`；16 report / 64 判据 / 0 probe。boot 28 的 kind-20 仍没进
+report 窗口（槽 14 还是 boot 27），和 boot 24/26 同一种缺席；设备靠内核写的 BCB 落进 TWRP。
+
+1. **组的账本，预测分毫不差**。卡住线程 `tid=0x45f` 的 `bbgrp`：
+   `base=155d90d10 b=fffffffd g=0 cnt=1 wait=1 notif=0 nh=0 nt=0`——正是上一节按
+   libdispatch 1477 推的 `b=fffffffd`（cnt=1）、`g=0`、`wait=1`。**一次 enter、零次 leave、
+   gen 从未前进、notify 链空**，死等被写成了可读的数。ulock 表同一地址
+   `a=155d90d44`（= base+0x34 = `dg_gen`）`first st=476 w=1 b=1 k=0 s=0 wr=0 sw=0
+   op=1000001 cw=0`，age 734→1149 六大拍不变；计数 `seen=4731 filt=4585 stored=98
+   over=48 open=1`。
+2. **链命中，而且自证**。`bbchain tid=0x45f fi=0 fn=10 blk=155d99540 inv=100ccc3c4
+   isa=213774a98 ctl=155d90580 sisa=81a100da4df5 def=155d90e20 disa=21a20c9184f5
+   grp=155d90d10`：
+   * `inv 0x100ccc3c4` 减本靴 backboardd slide **0xC9C000** = `0x1000303c4`，正是宿主
+     证明的 block invoke 体；`bbustk` 的 frame1 `0x100ccc3e4` 减同一 slide = `0x303e4`
+     （`bl _dispatch_group_wait` 的返回地址）。两处独立对上，slide 不是凑的。
+   * 命中判据兑现：`blk+0x20 = ctl = 0x155d90580`（捕获的 self = 控制器），
+     `ctl+0x38 = grp = 0x155d90d10`（`_controllerReadyGroup`）恰等于本线程等的组；
+     `def = ctl+0x20 = 0x155d90e20`（`_homeButtonDefinition`）也在。`sisa`/`disa` 是
+     non-pointer isa 字，留宿主解。
+3. **对象身份与共享缓存 slide**。`bbobj` 卡住行 `isa=213770bf0` 减 cache slide
+   **0x1EF2C000** = `0x1F4844BF0` = `OS_dispatch_group`，与 boot 27 同一类对象；
+   `val=100000002` 是引用计数对、`w=0`。cache slide 由三帧 libdispatch 返回地址
+   （`0x18F5B5C9C`/`0x18F5B6CC0`/`0x18F55E3F8`）与组 isa 共同钉死。
+4. **负行让沉默不暧昧**。`tid=0xa41/0xb69/0xb4d` 给的是 `bbnochain`（`fn=1`），它们的
+   `bbgrp` 是垃圾（`b=1 g=57075680`、`nh=7ffef00000001` 之类）——`clover_bb_is_lock_op`
+   的启发式也会罩住非组的等待，正负分两类后，谁是真的、谁是噪声一眼可分。
+   `r239-grp`/`r239-chain`/`r239-nochain` 三个 tee 预算都没到顶。
+5. **SpringBoard 还在等同一封回信**。本靴 pid=229，主线程 `tid=0x801`，
+   `sbm2 rem=4b03 ro=58:backboardd rn=a03 rs=4000`（`STRICT_REPLY` 接收）；
+   `bbset` 成员 10（`1403`）seq 879→949→970 一路涨。请求被取走、回信没回来，与 boot 27 同形。
+
+**结论**：宿主反汇编推出的那条链（block → self → `_controllerReadyGroup`），现在在设备上
+逐字段被读出来了；组里「欠一次 leave」不再是推断，是 `cnt=1 g=0 wait=1` 三个数。
+
+**r240 改走 sheng 的路（不再造内核刀）**。参考 `~/UniXNU-sheng`：它跑同一套 iPadOS
+17.7.11 镜像、已经起到完整桌面（记录里有 idle desktop 120 Hz 提交、render server 预热
+162 个 Metal 库），而它的 porting.toml **完全没有**这条 backboardd 卡点。差别在 ADT：
+sheng 发一个 `buttons` 节点，`home-button-type = 2`、`button-names = hold/voldown/volup`
+（无 `menu`/home 项），注释明说「2 = the non-mechanical answer BSPlatform passes through」。
+宿主把 backboardd `0x2fe8c` 的分支方向核死：`cmp x22,#2` 后 `b.ne 0x2fedc`——
+**`homeButtonType == 2` 时 fall through，打「not configuring SSHB because we don't have a
+real home button」并 `b 0x2ff2c` 直接返回，根本不构造 `0x303c4` 那个死等 block**；
+只有 `!= 2` 才走到 `0x2fef4 adr x8, 0x303c4` 去 `dispatch_async` + 无限等。
+（修正 r239 宿主节第 4 条的含糊措辞：==2 是**跳过** haptics dispatch，不是「走 SSHB 分支」。）
+clover 的 ADT 现在只发 `product-name`/`model=iPad7,1`、没有 buttons 节点，iOS 遂按
+iPad7,1（J120AP，有 home 键）默认值取 `homeButtonType != 2`，于是死等。Mi Pad 4 同样没有
+Apple SSHB 触感 home 键，**照搬 sheng 的 `buttons` 节点（`home-button-type=2`）就是如实
+描述硬件、去掉病根**，比内核伪造 leave 干净，且是 sheng 验证过能到桌面的做法。
+r240 = 这一处 ADT 改动 + 契约，冷刷后看 backboardd 是否不再死等、SpringBoard 是否往下走。
