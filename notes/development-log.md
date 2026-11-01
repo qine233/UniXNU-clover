@@ -19704,3 +19704,75 @@ backboardd 内部**不存在「带期限的等」**：睡下去的每一个都�
 **⑥ 与渲染/桌面这一格的关系**：boot 50 没有任何一条带期限的等待，也没有一条在发消息等回音
 （`remote=0`），所以「等渲染完成通知」在这一靴**没有得到任何支持**；GPU 分支不是被证伪，
 是**还没被支持**。CPU-first 照旧，但下一步该做的是 r264 的端口可读性，而不是先写渲染器。
+
+## 镜像侧侦察（boot 51 期间，r264 之后）：等待者是 VFXCore 的**贴图加载**组，不是着色器编译组
+
+把 boot 48/49/50 落到这条死等上的每一句字符串都回 `~/clover-out/dyld-cache` 逐片核对（全程宿主，
+不花上机时间）。**两处结论要改口，一处要加限定**，先写错的：
+
+**① 「async Metal library/shader-compile」说错了：`asyncGroupRequests` 挂的是 `TextureCache`。**
+`dyld_shared_cache_arm64.07` 里 `AsyncGroupRequestState`、`asyncGroupRequests`、`waitAsyncGroup`
+三串同片，读它们的邻居（`strings` 邻域，非猜）：
+
+```
+0x1340010  ... VFXCore/DisplayClock.swift | Unable to create display link for main screen
+           | mtlTextureDescriptorCache | renderTargets | _TtC7VFXCore12TextureCache
+           | operationQueue | asyncGroupRequests | textureEntryByKey | defaultSampler... | groupID
+0x1340198  ... groupID | Failed loading VFXBRDF in Bundle | VFXCore/TextureCache.swift
+           | Calling waitAsyncGroup on missing group id | Can't perform purgeReferenceCount on
+             non loaded cache entry | Can't wait cache entry in non loading state
+           | Can't set texture for cache entry in non loading state
+           | Can't perform fetchTexture on non loaded cache entry | Can't fetch texture
+```
+
+也就是「等的那一格」是 **TextureCache 的一张贴图从 `Loading` 变成 loaded**：`groupID`/
+`asyncGroupRequests`/`operationQueue` 是它自己的字段，报错语全在 `CacheEntry` 状态机上
+（`Can't wait cache entry in non loading state` 等），`AsyncGroupRequestState` 紧挨
+`TextureKey`/`CacheEntry`/`WeakStorage`/`Loading`/`StorageKind`（`0x12fc260`）。
+boot 50 那行 `cont=_ulock_wait_continue dl=0`、`base=147d3f390 g=0 cnt=1 wait=1 notif=0`
+和这个形状**完全合**：`dispatch_group_wait(..., DISPATCH_TIME_FOREVER)` 在内核里就是 ulock，
+无限等——这解释了 `dl=` 全场为零。
+
+顺手把「着色器」那条证据也验了：`_renderPipelineStateForFramebuffer:device:` 的真实串是
+**`_renderPipelineStateForFramebufferDescriptor:device:`**，邻居全是 Metal 渲染状态缓存字段
+（`_depthStencilState`、`_encoder`、`_colorPixelFormat`、`supportsFamily:`），是 VFXCore 的
+**管线状态缓存 ivar**，不是库编译；`Error: failed to create Metal library: %@` 那一句的邻居是
+`ImguiLibrary`/`imgui.ini`/`ImguiRenderPipelineState`——**那是 ImGui 调试叠加层**，不是主渲染路径。
+把它当「主渲染在等着色器编译」是错的。
+
+**② 「VisualLogger 是 opt-in（`enableRecord`）」也是我把属性名写快了：镜像里是 `enableRecording`。**
+`0x135b163` 与 `0x13b5704` 两处邻居是 `Default | beginFrame() | Prepare Systems | _TtC3ECS9Scheduler
+| enableRecording | currentJobID | recurrentJobs | jobQueueForThisFrame | groupsToUnregister`——
+它是 VFXCore **ECS Scheduler 的录制开关**（VisualLogger.framework 与 libVFXCore.dylib 确实同片，
+`0x45e06` 有 framework 路径串）。所以「关录制」这件事**存在且是布尔**，但它是**记录器**的开关：
+证据只到「贴图加载组不看 `enableRecording` 的脸」为止——`asyncGroupRequests` 的邻居里没有它。
+**结论：把 VisualLogger  suppression 当成「不用 GPU 就能散组」的免费杠杆，是没有证据的**，
+不能据此开一轮。这是本项目第 N 次「字符串找到了≠因果找到了」，记在 r220/r263 那两条旁边。
+
+**③ 「没有任何软件渲染器」这条继续成立，但 `swiftshader` 要加限定。**
+全片计数：`AppleSoftwareRenderer` = **0**、`llvmpipe` = **0**、`MTLCreateSoftware*` = **0**；
+`swiftshader` 只在 `dyld_shared_cache_arm64.27` 出现 2 次，邻居是
+`_MESA_platform_surfaceless | EGL_ANGLE_platform_angle_device_type_swiftshader |
+EGL_ANGLE_platform_angle_device_type_egl_angle ... is not supported`，同片有
+`/System/Library/PrivateFrameworks/WebCore.framework/Frameworks/libANGLE`——
+**那是 WebCore 里 ANGLE 的 EGL 扩展名枚举，不是这台机器上能打开的软件设备**。
+所以准确说法是：镜像里有 ANGLE 的软件后端**名字**，没有它的**代码**；backboardd 能用的软渲染路径为零。
+
+**④ 由此重排 CPU-first 的杠杆顺序（比 r264 之后的原计划更具体）**：
+等待者要的从来不是「有人画完」，是**「有人把一张贴图交给 TextureCache 并 leave 它的 group」**。
+`-[MTLDevice newTextureWithDescriptor:]` 是纯分配（CPU 就能完成，不需要 shader、不需要 CP、不需要 µcode），
+所以「一个只回答设备查询 + 纹理/缓冲分配的 CPU 壳」恰好是这条等待的**最小充分答案**；
+而 `waitAsyncGroup` 之后才轮到管线状态与命令队列。**这一步不写驱动，只发布壳**——
+正是 sheng 的 stage 5（发布设备）与 stage 7–9（真提交硬件）的分段，`NativeAdrenoPublish.cpp:1-13`
+的 `AGXDeviceUserClient` 命名技巧也是为这一格服务的。
+**⑤ 补两条「软件渲染」的精确证据（这次是串本身，不是我的印象）**：
+`dyld_shared_cache_arm64.03`（CARenderServer 一侧）两处 `0x29a15e6`、`0x29b31da` 都是
+`CoreAnimation: Software renderer! Simulating crash!` **紧挨**
+`CoreAnimation: Failed to initialize Metal or OpenGLES contexts!`、
+`windowserver-server.cpp`、`_shutdown_called`、`entering flipbook, disallowing detaching`——
+即 backboardd 自己的无 Metal 分支是**主动模拟崩溃**，不是降级渲染。
+`dyld_shared_cache_arm64.13` 里 CoreImage 有真的软件路线，两串不同：
+`0x36d54ee` `-[NUSoftwareRenderer initWithCIContext:priority:]`（`Software`），
+`0x36ca78a` 是 `NUDevice_iOS.m` 的 `Software renderer is unsupported`，同邻
+`-[_newRendererWithCIContextOptions:error:]` 与 `defaultDevice != nil`。
+**结论：镜像里有「CoreImage 能走 CIContext 软解」，没有「窗口服务器能软合成」。**
