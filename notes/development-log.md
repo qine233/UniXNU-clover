@@ -18693,3 +18693,92 @@ backboardd 问没问也就没有第二种读法。
 它读的是别的键、或者 r242 那个分支语义**又**钉反了一次——这条线在 r245 已经翻过一次车。
 下一轮先在共享缓存里把 `-[BSPlatform homeButtonType]` 与 libMobileGestalt 的取数点钉死，
 再决定是补 HID home 提供者还是改内核替那次等待完成。
+
+## r251 设计：先让记录器答得出它自己提出的问题，再加任何新仪器
+
+`zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r251.patch`（34 个 z，叠在 r250 上、LATE 摘除列最前）。
+只改 `IOUserClient.cpp` 里 r250 那一台，四处，没有一处是新仪器：
+
+1. `CLOVER_MG_ROWS` 8 → 24。boot 38 一次开机 15 条问，24 格装得下整段。
+2. **按时间序打印**：`start = notes <= ROWS ? 0 : notes % ROWS`，从环的起点顺着读，行号打成
+   `row i/n`。槽序打印让 `row 7` 成了全帧最早那条，读者要靠时间戳反推回卷点才能发现——
+   这种「读数自己需要一段考证」的形态本身就是 bug。
+3. **每进程计数**（`clover r251: who pid=%d comm=%.20s path=%u key=%u`）：环会被更忙的开机动，
+   计数不会。「pid 58 到底问没问」这个问题从此不依赖环的容量。总数行也带上 `whos=`，
+   于是 `asks` 与留下来的行数对不上时，帧自己会说出来。
+4. `comm=` 取 `IOCopyLogNameForPID` 那个 `pid <n>, <name>` 串里逗号之后的部分。boot 38 里
+   `SpringBo` 就是这么被前缀吃掉的——名字是这台仪器唯一的身份列，前缀里的 pid 后面还会再打一遍。
+
+驱动侧跟着前缀走：类 `{ "clover r251: ", "r251-mgq", 48, 0, 0, 0 }`，每趟上限的豁免前缀
+`r250` → `r251`。预算 48 是量出来的：1 行总数 + 至多 8 行 who + 至多 24 行 row = 33 行，
+跟 census 那 22 行同批出发，`r243` 类自己的 64 也够。
+
+宿主先绿的证据（不需要开机就能证的都证了）：`check-clover.py` 绿；
+`verify-clover-payload.py` 48 条 OK、0 FAIL，`mgq-asks`/`mgq-none`/`mgq-row`/`mgq-who` 四项
+present，并拿 `round250-payload.img` 做反向对照（四项全 ABSENT）。内核二进制里已无 `clover r250` 串。
+AMFI 两刀的文件偏移随内核长大挪到 `0x1ac40e4`/`0x1ac416c`（VA 不变），原指令编码仍逐条命中。
+
+判决写在刷机前，只有一条要看：**`who pid=58` 在不在**。
+
+- 在，且 `key>0` ⇒ backboardd 问过了、并且从这块注册表拿到了 `2`。那 `homeButtonType == 2`
+  就不是死等的原因，r242 那条「`!=2` 才投 block」的读法必须重审，或者它的值另有来源
+  （早于查询就缓存 / 别的键 / 别的框架）。
+- 在，但 `key=0`（只解析路径没读键，像 audiomxd 那样）⇒ 它压根没走 `home-button-type` 这条路，
+  死等与 MG 无关，直接转 sheng 的 HID home 提供者。
+- 不在（`who` 里没有 58）⇒ backboardd 从不查询注册表；同一结论，转 HID 那条线。
+
+无论哪一种，r250 的读法都留一句：**装仪器的时候要连它的留存上限一起算预算**，否则它报出来的
+「沉默」永远有两种读法。
+
+## 宿主复核（boot 38 之后，未花开机）：MG 只走 IORegistry，而 backboardd 的死等有两处根本不问 MG
+
+材料：`~/clover-out/dyld-cache/*`（iPadOS 17.7.11 逐 dylib 分片）与
+`/private/tmp/iosroot2/usr/libexec/backboardd`。逐条给指令级证据。
+
+**1. `home-button-type` 全缓存只出现一次**：`.11` 片文件 `0x590930` = VM `0x1a0274930`，
+在 `libMobileGestalt.dylib` 的 `__cstring`；对应 CFString `0x1e7c9c530`。BackBoardServices /
+SpringBoardServices / BaseBoard 里都没有这个串。**取值只有 IORegistry 一条路**：MG 的处理函数
+`0x1a0207a38` 里 `adrp/add x0` 得到 `"IODeviceTree:/buttons"`、`x1` 是那条 CFString、`w2=0`，
+`bl 0x1a02113dc`；`0x1a02113dc` 再进 `0x1a02111c4`，体内是 `IORegistryEntryFromPath`
+(`0x1a02111ec`) + `IORegistryEntryCreateCFProperty` (`0x1a0211258`) + `IOObjectRelease`。
+CFData→`CFNumberCreate(w=3)` 即 4 字节。**没有 `IORegistryEntrySearchCFProperty`，也没有
+`hw.homebuttontype`**——MG 那五个 `sysctlbyname` 站点是 `kern.hv_vmm_present`/`hw.memsize`/
+`kern.exclaves_status`/`hw.cpu64bit_capable`，都不在这条路上。**读不到时 MG 返回 0，不是 2。**
+
+**2. `-[BSPlatform homeButtonType]`** 在 BaseBoard `0x18f6eeecc`：`dispatch_once`（令牌
+`0x1f48945f0`）+ 缓存槽 `0x1f48945e8`（r242 量的槽号对）。once 块 `0x18f6fe3a0` 里
+`MGGetSInt32Answer("JwLB44/jEB8aFDpXQ16Tuw")`，再 `cmp w0,#2 / #1` 折成 2/1/0，
+最后 `MGCopyAnswer("oPeik/9e8lQWMszEjbPzng")["ArtworkDeviceSubType"] == 0x984` 会**强制改成 2**。
+
+**3. 关键的一条：backboardd 里等 `_controllerReadyGroup` 的地方不止一处。**
+`-[BKButtonHapticsController applyDefinitions:] @0x10002fe4c` 是
+`mov x22,x0; cmp x22,#0x2; b.ne 0x10002fedc`——`==2` 只打一行「not configuring SSHB…」就返回；
+`!=2` 排入 invoke `0x1000303c4`，体内 `ldr x8,[x0,#0x20]; ldr x0,[x8,#0x38]; mov x1,#-1;
+bl _dispatch_group_wait`，即无限等 ivar 56（`_controllerReadyGroup`）。
+`-[init] 0x10002e8c4` 做唯一一次 `dispatch_group_enter`，**唯一的 `leave` 在 `0x100030ca8`**，
+紧挨着日志串 `_BRController ready: device haptic asset slot count:%d`。
+
+而 `-[…_configureAsyncWithBlock:] @0x10002eafc`（invoke `0x100030c44`）与
+`-[…_configureSyncWithBlock:] @0x10002ebd4`（invoke `0x100030c0c`）里有**同一段
+`dispatch_group_wait(_controllerReadyGroup, -1)` 前言，且这两处一次都不调 `homeButtonType`**。
+所以「backboardd 卡在这个 group 上」并不蕴含「它问过 home-button-type」，更不蕴含它拿到了非 2。
+**这条死等的真正缺口是那个 `leave`：没有任何东西报 `_BRController ready:`。**
+
+**4. 要更正本轮日志里两处已经写歪的话**（都是同一函数上反复翻车的延续）：
+
+- r245 写下「r242 用错基址把 `0x1a02113dc` 当成读 /buttons 的 helper」「`home-button-type` 在
+  `.11` 里没有直接代码引用」——**两句都不成立**：`0x1a02113dc` 确实就是那条 /buttons helper
+  （参数寄存器里直接是 `IODeviceTree:/buttons` 与那条 CFString），属性名也有直接代码引用
+  （`0x1a0207a58`、`0x1a021bab8`）。r242 的原始判断是对的。
+- 「`bl 0x52aa38` 是一次一性 sysctl」这句（r250 之前写的下一刀方向）也不成立：
+  `0x52aa38` → VM `0x1a020ea38`，那里是一个 once 缓存的全局 int（`0x1f4890ac8`），不是 sysctl。
+  下一刀不该再去解它。
+
+**5. 还没查到的**（明确标出来，别当已知）：MG 的磁盘缓存 plist
+（`…/com.apple.MobileGestalt.plist`，读者 `0x1a020b2c8`）会不会在这条问题上直接命中而不走注册表；
+`0x1f4890ac8` 的生产者是谁。要 `ipsw dyld` 或 class-dump 级别的工具，再配一个打在 MG 入口
+`0x1a0207a38` 上的探针才能在板上验。
+
+**结论落到方向上**：ADT 这一侧到此为止是对的（boot 38 已实测被读走、值也对）；桌面缺的不是
+「一个更正确的 home 键编号」，而是**那个报 `_BRController ready:` 的控制器**——也就是 sheng
+那条 HID home 提供者路线，`who pid=58` 的答案只决定我们以哪一句证据开工，不改变开工方向。
