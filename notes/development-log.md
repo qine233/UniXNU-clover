@@ -20021,3 +20021,37 @@ boot 52 只剩一个问题：**五种 workloop 等待是同一把 note 还是五
 `semaphore_wait_trap`）只说明「等的是内核事件」；真正的答案在**调用它的那一层**——
 落在 `DataMigration` 自己的符号（插件执行/看门狗那几条串都在镜像里）就是「迁移插件从没跑起来」，
 落在 `Foundation`/`NSXPC` 一层则是「它在等一次它自己发起的往返」。两种都不需要 GPU。
+## r266 期间的源码侦察：内核已经会回答「谁该叫醒我」，我们一直在自己猜
+
+boot 52 之后我按 continuation 猜债主在等什么（workloop / 信号量），但**本板内核里早就有一张
+按 `thread->block_hint` 分派的表**：`osfmk/kern/kern_stackshot.c:4302` 的
+`stackshot_thread_wait_owner_info(thread, waitinfo)` 对**每一种等待**调用对应的求解器——
+
+| `block_hint` | 求解器（全部 `extern` 在 `osfmk/kern/block_hint.h:68-85`） |
+| --- | --- |
+| `kThreadWaitKernelMutex` | `kdp_lck_mtx_find_owner(wq_q, wait_event, info)` |
+| `kThreadWaitPortReceive` / `Send` | `kdp_mqueue_recv_find_owner` / `kdp_mqueue_send_find_owner`（还递出 `portlabel_id`） |
+| `kThreadWaitSemaphore` | `kdp_sema_find_owner` |
+| `kThreadWaitUserLock` | `kdp_ulock_find_owner`（r237 那把 ulock 我们手工读了半天，其实有现成的） |
+| `kThreadWaitKernelRWLock*` | `kdp_rwlck_find_owner` |
+| `kThreadWaitPThread*` | `kdp_pthread_find_owner` |
+| **`kThreadWaitWorkloopSyncWait`** | **`kdp_workloop_sync_wait_find_owner(thread, wait_event, info)`** |
+| `kThreadWaitOnProcess` | `kdp_wait4_find_process` |
+| `kThreadWaitSleepWithInheritor` / `Eventlink` / `Compressor` | 对应各家 |
+
+而 `bsd/kern/kern_event.c:2570` 那一段把债主那种等待的身份写得很明白：
+`thread_set_pending_block_hint(get_machthread(uth), kThreadWaitWorkloopSyncWait)` +
+`waitq_assert_wait64(&ts->ts_waitq, knote_filt_wev64(kn), THREAD_ABORTSAFE, TIMEOUT_WAIT_FOREVER)` +
+`kevent_register_wait_block(ts, thread, filt_wlwait_continue, cont_args)`，其中
+`thread_t thread = kqwl->kqwl_owner ?: kqr_thread(kqr)`。
+**所以它不是「池子空转」**（我一度这么读，那是错的读法）：这是**同步 workloop 调用**——
+调用方把一个 block 交给某个 workloop 并无限等它执行，等的是 `kqwl_owner` 那个**具体线程**。
+
+**由此定 r267（比抓用户栈更直接，且两种等待共用一把尺子）**：普查每一行读 `thr->block_hint`，
+按上表调对应 `kdp_*_find_owner`，把 `thread_waitinfo_t`（`osfmk/kern/kcdata.h:1025`）里的
+`twi_owner_pid`/`twi_owner_tid`/`twi_owner_unique_id`/`twi_flags` 报成一行
+`clover r267: own tid=… hint=… opid=… otid=… ouniq=… flags=…`。
+backboardd 那把 ulock 与债主那五把 workloop 等待**同一次就能各自点出属主线程**，
+不用再从栈去猜；r266 的用户栈保留作对照（栈说「谁调用」，这张表说「谁负责」）。
+前提要一起验（照 sheng 的规矩）：`stackshot_thread_wait_owner_info` 是 `static`，
+所以走 `block_hint.h` 里那些 `extern` 个体；`kdp_*` 要求持有什么锁，源码逐条读过后再接。
