@@ -18782,3 +18782,55 @@ bl _dispatch_group_wait`，即无限等 ivar 56（`_controllerReadyGroup`）。
 **结论落到方向上**：ADT 这一侧到此为止是对的（boot 38 已实测被读走、值也对）；桌面缺的不是
 「一个更正确的 home 键编号」，而是**那个报 `_BRController ready:` 的控制器**——也就是 sheng
 那条 HID home 提供者路线，`who pid=58` 的答案只决定我们以哪一句证据开工，不改变开工方向。
+
+## r251 读数（boot 39）：backboardd 问过三次，`home-button-type` 也拿到了 2——而且它问的第二个键我们没有
+
+`round251-log-window.bin`：boot 39，16 report / 64 verdict / 19 probe / 512 kernel-log 记录，
+census 照旧整批（`svc total=123 stopped=0 button-family=2`、`census done nodes=9`）。本轮的三行：
+
+```
+[ 1511.263956]: clover r251: asks path=9 key=6 notes=15 whos=5
+[ 1511.263967]: clover r251: who pid=58  comm=backboardd   path=3 key=3
+[ 1511.264012]: clover r251: who pid=27  comm=SpringBoard  path=2 key=1
+[ 1511.264027]: clover r251: who pid=145 comm=audiomxd     path=1 key=0
+[ 1511.264038]: clover r251: who pid=162 comm=PreBoard     path=1 key=1
+[ 1511.264050]: clover r251: who pid=260 comm=SpringBoard  path=2 key=1
+```
+
+15 行 row 全在，而且是**真时间序**（`row 1/15` 是最早的 t=444，正是上一轮被 8 格环吃掉的那批）：
+
+```
+row 1/15 t=444 path pid=58 backboardd  IODeviceTree:/buttons              val=1
+row 2/15 t=444 key  pid=58 backboardd  function-button_halleffect         len=0 val=0   ← 缺席
+row 3/15 t=444 path pid=58 backboardd  IODeviceTree:/buttons              val=1
+row 4/15 t=444 key  pid=58 backboardd  home-button-type                   len=4 val=2
+row 5/15 t=444 path pid=58 backboardd  IODeviceTree:/buttons              val=1
+row 6/15 t=444 key  pid=58 backboardd  home-button-type                   len=4 val=2
+row 7/15 t=447 path pid=27 SpringBoard …  row 8/15 t=472 key … val=2
+row 9/15 t=486 path pid=145 audiomxd（只解析路径，没读键）
+row 10..12        SpringBoard / PreBoard，key 仍是 home-button-type val=2
+row 13..15 t=805..810 pid=260 SpringBoard（重启后的新一代），同样 val=2
+```
+
+**r251 写死的三分岔落在第一支**：`who` 里有 pid 58，且 `key=3 > 0`——backboardd 自己问了三次，
+两次把 `home-button-type` 读回 `2`。于是「backboardd 拿到的编号不是 2」这条从 r240 一直吊到
+现在的假设，到此彻底结掉：**它拿到的就是 2**。而 `-[BKButtonHapticsController applyDefinitions:]`
+的 `cmp x22,#2` 在 `==2` 一侧只打一行日志就返回，所以那处根本不会投等；宿主那一轮已经指出
+`_configureAsync/SyncWithBlock:` 两处含同一个 `dispatch_group_wait(_controllerReadyGroup,-1)`
+且**完全不问 homeButtonType**——板上读数与宿主结构现在是同一句话：
+
+> 死等缺的是那个唯一的 `dispatch_group_leave`（`0x100030ca8`，紧挨
+> `_BRController ready: device haptic asset slot count:%d`），不是任何一个按钮编号。
+
+背板仍在同一处：t=1204 `pid=58 tid=0x3c9 base=1015907a0 b=fffffffd g=0 cnt=1 wait=1 notif=0`。
+
+**新线索，而且是这块板子第一次「被问了一件没有的事」**：`row 2/15` 的
+`function-button_halleffect` 回来 `len=0 val=0`——`clover_mg_answer_of()` 里 obj==NULL 才是这个形态，
+也就是**这个键在我们 ADT 的 `/buttons` 下不存在**。全仓 grep `halleffect` 零命中，
+`make-clover-adt.py:304` 的 buttons 节点只有 `compatible`/`device_type`/`home-button-type`。
+它是 backboardd 在同一颗 `/buttons` 上、同一次初始化里读的第二个键，就在它读编号之前。
+
+下一步（r252）不许先猜值。要在宿主钉死三件事再动 ADT：
+① `function-button_halleffect` 的读点是不是就在那个 ready 路径上（缺席会不会让 BR 控制器永不 ready）；
+② 真实机型该键的**类型与取值**从哪份材料取证（不能自己编一个数）；
+③ `_BRController` 到底是哪个类、ready 由谁触发（另一路调查正在跑）。
