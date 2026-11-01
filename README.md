@@ -110,6 +110,14 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
   把整个环再发一遍（走的正是 r249 那条豁免）。判决也写下：有 `row … comm=…` 就在「答案被读错」
   那条路上；只有 `no user client ever named a button path or key` 就说明 MG 的 home 键身份根本不
   来自注册表，ADT、平面、census 这条线整个作废，改走 sheng 的 HID home 提供者。
+* boot 38（r250 实机）第一次答了「问没问」：`asks path=9 key=6 notes=15`，SpringBoard 与 PreBoard
+  都把 `IODeviceTree:/buttons` 解析成功、把 `home-button-type` 读回 `len=4 val=2`。于是「ADT 缺节点」
+  「平面名字取错」「用户态压根没问」三条线一起结掉——值是对的，也被真的读走了。可这台仪器又犯了
+  r249 那一类自身的错：8 格环从第 9 条起回头覆盖，而打印按槽序不按时间序，`notes=15` 里最早那 7 条
+  （最可能是 pid 更小的 backboardd 问出来的）正好被吃掉；`comm=` 还被 `pid <n>, ` 前缀截成了
+  `SpringBo`。r251 因此不加新仪器，只把这一台修到能答完它自己提的问题：24 行、时间序、取名字尾部、
+  每进程一行计数。真正剩下来的一句话是：**用户态拿到 2，backboardd 却还在 `!=2` 那一支死等**——
+  要么 MG 的值不来自这块注册表，要么 r242 那条分支语义又钉反了，先在共享缓存里查清再决定动谁。
 
 
 每一轮的设计、构建与真机读数（含本节的证据出处）都在
@@ -120,7 +128,7 @@ r236–r239 是把这条链读出来的四轮。
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点已钉到 `_controllerReadyGroup`，`cnt=1 g=0 wait=1`；boot 37（r249）把 census 读全了：`plane byname=ok`、`buttons byname=present`、`hbt byname len=4 u32=2`、`svc total=123 stopped=0 button-family=2`（`svc buttons`/`svc IOHIDResource`）、`model=iPad7,1`。r246 预写的两条分支（平面名字取错、板上没有按键/HID 提供者）**同时作废**，r240 那条「用户态拿到的不是 2」也失去了依据——同一条按名路由，内核侧读回来就是 `2` | r250 在用户客户端的两处必经出口（`is_io_registry_entry_from_path`/`_ool`、`IOCopyPropertyCompatible`）记「谁、问了什么、答了什么」，只过滤名字含 `utton` 的，环在 census 的豁免 burst 里回放。boot 38 的对号：出现 `row … comm=<进程>` ⇒ 病在答案的读法（类型判定/sysctl 闸门/缓存槽，去解 `bl 0x52aa38` 那次一性 sysctl）；只有 `no user client ever named a button path or key` ⇒ 用户态没问过注册表，改走 sheng 的 HID home 提供者三刀；一行 `clover r250:` 都没有 ⇒ 仪器没上板，先按 r248 查产物 |
+| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点已钉到 `_controllerReadyGroup`（t=1399 仍 `base=100c7c920 b=fffffffd g=0 cnt=1 wait=1`）；boot 38（r250）第一次把「问没问」读出来：`asks path=9 key=6 notes=15`，SpringBoard（pid 27，重启后 269）与 PreBoard（167）都`IODeviceTree:/buttons` 解析成功并读回 `home-button-type len=4 val=2`。**ADT 缺节点、平面名字取错、`/buttons` 不可达、用户态没问过这四条线全部结掉**——值发布了、可达、且被真实进程读对了。剩下唯一没答的是 backboardd 自己问没问，而这 7 条最早笔记被记录器自己的 8 格环挤掉了 （`notes=15`、槽位循环覆盖、按槽序打印） | r251 不加新仪器，只把这台仪器修到能答完它自己提出的问题：环扩到 24 行、按时间序打印、`comm` 跳掉 `pid <n>, ` 前缀取名字尾部、每个被记到的进程给一行计数。同时**在宿主**先把 `-[BSPlatform homeButtonType]` 与 libMobileGestalt 的取数点钉死：boot 38 说用户态拿到的是 `2`，而 r242 的反汇编说 `==2` 那支只是「记日志、跳过 SSHB」、投死等 block 的是 `!=2` 一侧——两者要同时成立，要么 MG 的值不来自这块注册表（另有来源或早于查询就缓存了），要么这条分支语义**又**钉反了一次（r245 已经在同一个函数上翻过一次车）。查清之前不许再开机赌方向 |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 3），再问地址 |
 | 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |

@@ -18622,3 +18622,74 @@ controller-ready。r245 预写的第三支（「服务在，问题在 MG 的取�
 取 `getCStringNoCopy()` 后 `release()`）；`OSNumber` 没有公开的字节长度（`getDataByteLength()` 是
 `OSData` 的方法，`size` 成员是 protected），所以那支干脆报 `len=0`，把「这是 OSNumber」编进读数而不是
 伪造一个长度；`is_io_registry_entry_from_path` 在记录器定义之前两百行，必须前置声明。
+
+### r250 落地：产物与双闸门
+
+`/opt/homebrew/bin/python3.13 ./unixnu build kernel --device ../UniXNU-clover` 第一趟就撞在下面三条
+（都写在上面），修完 `getDataByteLength()` 那一处后编译干净：prelink 内核 `62754e4d…` →
+`patch-clover-amfi.py` 两刀仍在 `0x1ac00e4` / `0x1ac016c`（与 r186–r249 同址，说明 r250 的插入没有
+把 AMFI 那段挪位）→ amfi 拷贝 `236c4f7e…` → `normalize-kernel-macho.py` 清 968 个 object 戳 →
+normalized `7458e152…` → `./unixnu build payload --kernel <normalized> …` EXIT=0 →
+**round250-payload.img `cc044a4c…`**（58720256 B，ADT 仍 14344）。
+
+- 途中踩到 r245 记过的那个坑：上一趟编译死在 `IOUserClient.cpp`，`.cpo` 被 make 删掉而
+  `startup.o.json` 还在，于是下一趟的 archive 1/15 以
+  `nm: error: …IOUserClient.cpo: No such file` 挂住。按 memory 的修法删 marker 让 bootstrap
+  重跑，编译才补齐。
+- `check-clover.py` 绿（含新的 r250 补丁块、tee 类、豁免断言）；
+  `verify-clover-payload.py` 48 条 OK、0 FAIL，新增的 `mgq-asks`/`mgq-row`/`mgq-none` 三项 present；
+  拿 round249-payload.img 做反向对照，同一三项报 **ABSENT**，探针确实在区分而不是恒真。
+- 卡内 `unixnu.toml` 1633 B、`tomllib` 解析过、xnu 条目带回本轮标题（标题里继续有真引号，
+  `"census done"`、`"utton"`、`"no user client ever named a button path or key"` 三处），
+  r248 那条清单闸门继续真的在板上被走。
+
+## r250 读数（boot 38）：用户态确实问了，而且拿到的就是 2
+
+`round250-log-window.bin`：boot 38，census 又是一整批（`census done nodes=9` 在，
+`plane byname=ok`、`hbt byname len=4 u32=2`、`svc total=123 stopped=0 button-family=2` 全在），
+紧跟着本轮真正要的那三行：
+
+```
+[ 1516.426271]: clover r250: asks path=9 key=6 notes=15
+[ 1516.471857]: clover r250: row 0 t=491 path pid=27  comm=pid 27, SpringBo   what=IODeviceTree:/buttons   len=0 val=1
+[ 1516.521418]: clover r250: row 1 t=500 path pid=167 comm=pid 167, PreBoar   what=IODeviceTree:/buttons   len=0 val=1
+[ 1516.570874]: clover r250: row 2 t=500 key  pid=167 comm=pid 167, PreBoar   what=home-button-type        len=4 val=2
+[ 1516.620168]: clover r250: row 3 t=524 path pid=138 comm=pid 138, audiomx   what=IODeviceTree:/buttons   len=0 val=1
+[ 1516.671976]: clover r250: row 4 t=789 path pid=269 comm=pid 269, SpringB   what=IODeviceTree:/buttons   len=0 val=1
+[ 1516.721081]: clover r250: row 5 t=789 key  pid=269 comm=pid 269, SpringB   what=home-button-type        len=4 val=2
+[ 1516.769786]: clover r250: row 6 t=790 path pid=269 comm=pid 269, SpringB   what=IODeviceTree:/buttons   len=0 val=1
+[ 1516.820617]: clover r250: row 7 t=465 key  pid=27  comm=pid 27,  SpringBo  what=home-button-type        len=4 val=2
+```
+
+**三条判决分支落在第一支**：`no user client ever named a button path or key` 没有出现，
+`asks path=9 key=6` 也不是零。SpringBoard（pid 27，重启后 269）与 PreBoard（167）都
+`IODeviceTree:/buttons` 解析成功（`val=1` 就是 `fromPath` 返回非空）并把 `home-button-type`
+读回 `len=4 val=2`——这台板子的 ADT 不仅发布了，而且被真实用户态进程按真实名字读走了正确的数。
+`audiomxd`（138）只解析路径、不读键，说明过滤条件没有把无关进程算进来。
+
+于是这些线全部结掉：ADT 缺节点、平面名字取错、`/buttons` 不可达、用户态压根没问——**都不是**。
+r240/r241 那两轮补的身份字段现在是「已被读走且读对」，不是「待验证」。
+
+## 但这批读数同时暴露记录器自己的两个缺陷，必须先修再解释
+
+1. **环会覆盖，打印顺序是槽序而不是时间序。** `row = rows[notes % 8]`：第 9 条起回头盖掉
+   第 1～7 条。`notes=15` 意味着 15 条里只有最后 7 条加第 8 条活着——看 `row 7` 是 `t=465`
+   （全场最早）而 `row 0..6` 是 `t=491..790` 就清楚了。丢掉的最早 7 条正是 pid 最小的那些进程会
+   问出来的：backboardd 是 pid 58，launchd 在它之前起 SpringBoard，所以**「backboardd 问没问」
+   这个唯一还没答的问题，恰好被仪器挤掉了**。这和 r249 的推送上限是同一类错误：仪器自己吃掉了
+   自己那一条决定性读数。
+2. **`comm=` 截断到 16 字节，把进程名切坏**（`pid 27, SpringBo`）。这是 `IOCopyLogNameForPID`
+   给的 `OSString` 本来就长成 `pid <n>, <name>`，前缀白占了 8 个字节。截断点该跳过前缀。
+
+所以 r251 不加新仪器，只把这一台修到能答完它自己提出的问题：环扩到 24 行（一次开机 15 条，
+装得下，且 burst 仍在豁免里，32 行类预算够）、按时间序打印（知道 `notes` 就能算出环的起点），
+`comm` 取名字尾部而不是前缀，再给每个被记到的进程一行计数——这样 `asks` 与 row 的差额不再是谜，
+backboardd 问没问也就没有第二种读法。
+
+**另一件事要在宿主先查清，不许再靠开机试**：boot 38 说明 `homeButtonType` 这条路对用户态
+**返回的是 2**，而 r242 的宿主反汇编说 `==2` 那一支才是「记一条日志、跳过 SSHB」，投死等 block 的是
+`!=2` 一侧。backboardd（pid 58）到 t=1399 仍卡在 `base=100c7c920 b=fffffffd g=0 cnt=1 wait=1`。
+两者要同时成立，只有三种可能：backboardd 拿到的不是注册表这个值（MG 另有来源或早于注册表缓存）、
+它读的是别的键、或者 r242 那个分支语义**又**钉反了一次——这条线在 r245 已经翻过一次车。
+下一轮先在共享缓存里把 `-[BSPlatform homeButtonType]` 与 libMobileGestalt 的取数点钉死，
+再决定是补 HID home 提供者还是改内核替那次等待完成。
