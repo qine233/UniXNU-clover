@@ -20470,3 +20470,31 @@ libdispatch 从 block 里等另一 block 时，正常是靠**再造一条工人�
 那一个门槛——照惯例先查 sheng：它的 ADT `/defaults` 与 boot-args 里有没有我们缺的线程/vnode 类旋钮
 （r258 已经从 sheng 抄过一条 `kern.maxvnodes=66560`，同族旋钮值得整表比对，而不是再猜第二个）。
 
+## r270 前置：整表比对 sheng 的 `/defaults` 与 boot-args，「线程一族旋钮」这条假设被自己否掉，换到 IPI
+
+照 `修 clover 先查 sheng` 的规矩先做整表比对（不是想到一条抄一条）：
+
+**① `/defaults` 已经没得抄了。** `UniXNU-sheng/scripts/make-sheng-adt.py:179` 那颗 defaults 节点
+**一共只有两个键**：`sleep-disabled=1` 与 `kern.maxvnodes=66560`——两条 clover 都已经有（后者是 r258 抄的）。
+所以 r269 读数末尾那条「libdispatch 起不了第六条工人线程，也许是缺哪个线程/vnode 旋钮」的猜想
+**在 sheng 这边没有任何支持证据**，不许再当修法。
+
+**② boot-args 全表比对（clover 27 条 / sheng 45 条）落在我这边的差集只有两类**：
+`sheng-*` 与 `offline-*` 全是 sheng 自家驱动/探针的开关（`sheng-gpu-*`、`sheng-touch`、
+`boot-ui-focus4` 等，r262 已经抄过 BootUiTrace 那一族），另一条值得单独说的是 **`armcpu-spi-ipi=1`**。
+
+**③ 而 `armcpu-spi-ipi` 正好戳在 boot 56 那幅图上。** 本板 `drivers/ArmCpu/ArmCpu.cpp:43` 的注释写着
+「**ICC_SGI1R_EL1 generates nothing on this board**」——SPI-IPI 模式是为多核情形准备的另一条投递路径；
+`porting.toml` 的 CPU 区记的结论是「clover 的 GIC 用 SGI 做 IPI」，但**「我们真的收到了跨核 IPI」这件事
+从来没有被量过**（同一区里还写着这两条 boot-arg 是**故意不传**的，理由是 SPI 号码是按「有更多 INTID 的 GIC」硬编码的）。
+把它和 boot 56 的形状并排看就很顺：**五条工人在 `_filt_wlwait_continue` 里睡、一条在机器号上睡、
+整个任务 `run=0` 且没有一条 runnable**——如果 workloop 的「有活了」事件要靠一次跨核唤醒送到睡着的工人，
+而那次 IPI 在这块板上落不了地，看到的就正是这幅图：**活儿排了，人叫不醒**。
+这也解释了为什么它**不像**渲染问题：GPU 那条路一条等待都不在这幅图里。
+
+**④ 所以 r270 要问的第一个问题不是「谁欠 signal」（已答），也不是「旋钮少了哪条」（已否），
+而是「这块板子的跨核 IPI 到底到不到」**：round82 起 panic 屏就在印 tick/IPI 计数与 `GICD_TYPER`，
+先把它变成**每拍可读**的计数（谁给谁发过 IPI、有没有送出、有没有落地），
+再和「五条工人睡着」同一帧比对。判定要能反证：若计数在涨而工人仍不醒，钥匙就不在 IPI，
+得回到 workloop 自己的 `wl_request` 事件；若计数**不涨**，那是本板第一次拿到 IPI 的正面判据。
+
