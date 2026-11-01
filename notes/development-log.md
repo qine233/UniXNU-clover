@@ -19789,3 +19789,16 @@ EGL_ANGLE_platform_angle_device_type_egl_angle ... is not supported`，同片有
 `IOSurface` 204 处、`CGImage` 212 处。也就是说：**贴图加载那一格**只要设备能回答分配；
 但 VFXCore 整体还要求库编译（14 处 `newLibrary`），所以「壳不需要会画」只对这一格成立，
 不能当成「VFX 全流程 CPU 顶得住」的证据——那需要真着色器或真编译后端。
+**⑦ 但在把「关 VisualLogger」当 r265 之前，先记下一条会削弱它的事实（今晚不解决它）**：
+`otool -L /private/tmp/iosroot2/usr/libexec/backboardd` 的**直接依赖里没有 VFX，也没有 VisualLogger**
+（有 QuartzCore、Metal、BackBoardHIDEventFoundation/Processors、BackBoardServices、CoreGraphics；
+二进制里 `VisualLogger`/`VFX` 相关串只有压缩段里一个 `(vlX`）。也就是说 r261 把最底两帧
+`1e3c02534`/`1e3bffccc` 落成 VisualLogger.framework 这件事，要么成立在「运行期 dlopen」上
+（诊断类子系统确实常这样进来），要么那两帧根本属于 `.31` 里的别的镜像——**而 `.31` 是一大片装了很多镜像的缓存**。
+`decode-clover-cache-offset.py` 报的是「子缓存 + 镜像 + 最近导出」，镜像名是从缓存的镜像表取的，
+所以它不是凭空的；但同一轮 r261 自己就记着「slide 还剩 4 字节的账没结」。**在 boot 51 的栈重新落帧、
+并且能同时证明「这两帧的镜像身份与 r261 用同一套 slide」之前，不为 VL suppression 花任何一轮。**
+顺带一条机制猜测（写出来供以后核对，不当证据）：栈上的语义是**触控事件观察/日志序列化**
+（`-[BKTouchDeliveryObservationManager _queue_postPendingUpdates]`、`_BKLogTouchEvents`、
+`descriptionForRootObject:` + `BKTouchHitTestContextMap`），而 VisualLogger 正是记触控与屏幕的那套东西——
+若真是它把 VFXCore 拉进来，「一个诊断记录器坐在桌面关键路径上」本身就值得单独记一笔。
