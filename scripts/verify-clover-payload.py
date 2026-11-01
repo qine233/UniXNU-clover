@@ -954,8 +954,10 @@ def check_sb_sample(kernel: bytes) -> bool:
              "bb": (b"clover r229: bb t=%llu pid=%d n=%u sc=%d act=%d f=%u s=%u hops=%u"
                     b" wait=%u d=%llu%s\n") in kernel,
              "bbgone": (b"clover r229: bb t=%llu pid=%d f=%u gone\n") in kernel,
-             "bbhop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rn=%x"
-                       b" rs=%x rem=%x loc=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
+             # Round264 renamed two fields of this row: x6 is rcv_size, not a send right, and x3's low
+             # half is the remote port, not a receive timeout.
+             "bbhop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
+                       b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "bbwait": (b"clover r231: bbwait t=%llu pid=%d tid=0x%llx st=%x"
                         b" cont=%llx pc=%llx x0=%llx x1=%llx x2=%llx x3=%llx"
                         b" u=%u run=0x%llx\n") in kernel,
@@ -1055,10 +1057,17 @@ def check_sb_sample(kernel: bytes) -> bool:
              # wait from a timed one, and the send right's owner names the service an answer is owed by --
              # the four-slot hop capture was a cap, not a count, so this is where that stops. Both
              # literals are pinned whole (r252's lesson: an eaten format string leaves prefix needles green).
+             # Round264: the census row re-decoded the way mach_msg2_trap unpacks its own arguments
+             # (remote port in x3's low half, x6 is rcv_size), the remote's owner as peer=, and the
+             # receive port's queue depth and send-right count -- plus the hop row, whose two labels
+             # this round retires because they called a port a timeout and a size a port name.
              "bb-census-row": (b"clover r262: census t=%llu pid=%d threads=%u shown=%u"
-                               b" hidden=%u wait=%u run=%u\n") in kernel,
+                               b" hidden=%u wait=%u run=%u rx=%u tm=%u\n") in kernel,
              "bb-census-th": (b"clover r262: th tid=%llx st=%x we=%llx cont=%llx"
-                              b" pc=%llx dl=%llx m2=%llx rn=%x sn=%x rem=%x peer=%s\n") in kernel,
+                              b" pc=%llx dl=%llx m2=%llx rcv=%x remote=%x local=%x to=%llx"
+                              b" sz=%x mc=%u sr=%x peer=%s\n") in kernel,
+             "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
+                               b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,
              # Round257: the gate that made boot 44 say published=0 must be gone from the shipped image,
              # and the flag it tested has to still be readable as a value.

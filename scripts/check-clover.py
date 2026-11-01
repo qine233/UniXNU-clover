@@ -1896,9 +1896,9 @@ def check_board(errors: list) -> str:
             for needle in ('#define CLOVER_BB_CENSUS 20',
                            '#define CLOVER_BB_M2_TRAP  (-47)',
                            '"clover r262: census t=%llu pid=%d threads=%u shown=%u"',
-                           '" hidden=%u wait=%u run=%u\\n"',
-                           '" pc=%llx dl=%llx m2=%llx rn=%x sn=%x rem=%x peer=%s\\n"',
-                           'clover_sb_port_owner(task, (mach_port_name_t)csn[i]',
+                           '" hidden=%u wait=%u run=%u',
+                           '" pc=%llx dl=%llx m2=%llx',
+                           'clover_sb_port_owner(task, (mach_port_name_t)c',
                            'if (thr->wait_timer_armed && thr->wait_timer != NULL)',
                            'absolutetime_to_nanoseconds(thr->wait_timer->tc_soft_deadline,'):
                 if needle not in r263_text:
@@ -1913,12 +1913,15 @@ def check_board(errors: list) -> str:
                               "registers of a thread that is not in the trap are not port names")
             baseline_script = (REPO.parent / "UniXNU" /
                                "scripts/build-xnu-4k-baseline.sh").read_text()
-            late_head = next((line for line in baseline_script.splitlines()
-                              if line.startswith("for LATE_PATCH in")), "")
-            if r263_name not in late_head:
-                errors.append("build-xnu-4k-baseline.sh does not reverse r263 first in LATE_PATCH: the "
-                              "compile pass would run on the widened-census tree and a replay failure "
-                              "would look like a broken patch instead of an out-of-order one")
+            # Round264 rewrote this row, so r263 is no longer the first entry; what has to hold is
+            # that it still leaves ahead of the rounds it edited on top of.
+            late_list = " ".join(line for line in baseline_script.splitlines()
+                                 if "clover-r2" in line)
+            if (late_list.find(r263_name) < 0 or late_list.find(r263_name) > late_list.find(
+                    "z" * 37 + "-clover-r262.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r263 ahead of r262 in "
+                              "LATE_PATCH: the compile pass would run on the widened-census tree and a "
+                              "replay failure would look like a broken patch instead of an out-of-order one")
             load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r263_name
             if not load_copy.is_file():
                 errors.append(f"UniXNU/patches/xnu/{r263_name} is missing: unixnu loads patches from "
@@ -1928,6 +1931,70 @@ def check_board(errors: list) -> str:
                 errors.append("drivers/CloverSdhci no longer carries the census class: the widened row "
                               "is the same producer and shares its budget, so a missing entry drops the "
                               "reading entirely")
+
+        # Round264 re-reads the census row after boot 50: r263 resolved the owner of x[6] as if it named a
+        # port, and mach_msg2_trap's own unpacking says x6 is rcv_size|priority while the remote port -- the
+        # right the caller sent on, and the only thing that can answer it -- sits in x3's low half. So peer=
+        # named a non-port and every row printed "-", the worst kind of instrument result: it looks like an
+        # answer. The row is re-derived from mach_msg.c field by field, the remote's owner becomes peer= with
+        # three distinct shapes so "no send right" and "cannot resolve" stop printing alike, and the receive
+        # port is read directly (imq_msgcount, ip_srights) to ask what no register can: whether anyone can
+        # still post to that port at all.
+        r264_name = "z" * 39 + "-clover-r264.patch"
+        r264_patch = next((base / "patches/xnu-clover" / r264_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r264_name).is_file()), None)
+        if r264_patch is None:
+            errors.append(f"patches/xnu-clover/{r264_name} is missing: the next boot would again resolve a "
+                          "rcv_size as a port name and report the absence of a peer as if it were a finding")
+        else:
+            r264_text = r264_patch.read_text()
+            r264_added = "".join(line for line in r264_text.splitlines(True)
+                                 if line.startswith("+"))
+            for needle in ('crn[cn] = (uint64_t)saved_state64(ss)->x[5] >> 32',
+                           'crem[cn] = (uint64_t)saved_state64(ss)->x[3]',
+                           'cloc[cn] = (uint64_t)saved_state64(ss)->x[3] >> 32',
+                           'cto[cn] = (uint64_t)saved_state64(ss)->x[7]',
+                           '" pc=%llx dl=%llx m2=%llx rcv=%x remote=%x local=%x to=%llx"',
+                           '" sz=%x mc=%u sr=%x peer=%s\\n"',
+                           'clover_sb_port_mail(task_t task, mach_port_name_t name',
+                           '*mc = port->ip_messages.imq_msgcount',
+                           '*sr = port->ip_srights',
+                           'clover_sb_port_owner(task, (mach_port_name_t)crem[i]',
+                           'strlcpy(peer, "none", sizeof(peer))',
+                           'strlcpy(peer, "?", sizeof(peer))',
+                           '" hidden=%u wait=%u run=%u rx=%u tm=%u\\n"'):
+                if needle not in r264_text:
+                    errors.append(f"{r264_patch.name} lacks {needle[:64]!r}: without it the row cannot say "
+                                  "whom the waiter actually sent to, or whether anyone can still answer it")
+            # The two labels this round exists to retire: a row that still calls x[6] a send right, or
+            # prints the remote port as a timeout, has gone back to the reading boot 50 mis-took.
+            for gone in ('rn=%x sn=%x rem=%x',
+                           'clover_sb_port_owner(task, (mach_port_name_t)csn[i]',
+                           '" rs=%x rem=%x'):
+                if gone in r264_added:
+                    errors.append(f"{r264_patch.name} still prints {gone!r}: x6 is rcv_size|priority and "
+                                  "x3's low half is a port name, so those labels are the defect itself")
+            if 'rx=%u' not in r264_added or 'tm=%u' not in r264_added:
+                errors.append(f"{r264_patch.name} leaves the receive-only count out of the header: a beat "
+                              "has to say how many waiters hold no send right without a reader recounting rows")
+            baseline_script = (REPO.parent / "UniXNU" /
+                               "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_head = next((line for line in baseline_script.splitlines()
+                              if line.strip().startswith("for LATE_PATCH in")), "")
+            if r264_name not in late_head:
+                errors.append("build-xnu-4k-baseline.sh does not reverse r264 first in LATE_PATCH: the "
+                              "compile pass would run on the r263-shaped tree, and a replay failure would "
+                              "read as a broken patch rather than an out-of-order one")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r264_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r264_name} is missing: unixnu loads patches from "
+                              "that directory and silently skips a board patch that lives only in "
+                              "this repo")
+            if '{ "clover r262: ", "r262-th", 384, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci dropped the census class this row is budgeted under: "
+                              "the re-decode keeps one header plus twenty rows per beat, so the same "
+                              "producer needs the same class")
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -3233,8 +3300,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r263:"):
-        errors.append('[payload] title is not "clover r263: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r264:"):
+        errors.append('[payload] title is not "clover r264: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4286,8 +4353,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r263:"):
-        errors.append('[payload] title is not "clover r263: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r264:"):
+        errors.append('[payload] title is not "clover r264: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

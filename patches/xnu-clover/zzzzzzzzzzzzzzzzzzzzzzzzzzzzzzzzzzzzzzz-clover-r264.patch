@@ -1,0 +1,204 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11304,6 +11304,48 @@
+ 	}
+ 	snprintf(out, outlen, "%d:%s%s", task_pid(owner), comm, pset ? "+ps" : "");
+ 	task_deallocate(owner);
++}
++
++/*
++ * Round264. Two numbers read straight off the port object a thread is receiving
++ * on, and together they decide a shape no register can: whether anyone can still
++ * post to that port at all. ip_messages.imq_msgcount is the mail already sitting
++ * in the queue -- a waiter with mail queued is an instrument error, not a finding
++ * -- and ip_srights is the count of send rights that exist, so zero of both means
++ * no code path in any task can ever wake this thread again. Both are read without
++ * the port lock: a sample, correct to the beat, and stated as such because the
++ * queue is being changed by other cpus while this prints.
++ */
++static void
++clover_sb_port_mail(task_t task, mach_port_name_t name, uint32_t *mc, uint32_t *sr)
++{
++	ipc_space_t space;
++	ipc_object_t obj = IPC_OBJECT_NULL;
++	kern_return_t kr;
++
++	*mc = 0;
++	*sr = 0;
++	if (name == MACH_PORT_NULL) {
++		return;
++	}
++	space = task->itk_space;
++	if (space == IPC_SPACE_NULL) {
++		return;
++	}
++	kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_RECEIVE, &obj);
++	if (kr != KERN_SUCCESS) {
++		kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_SEND, &obj);
++	}
++	if (kr != KERN_SUCCESS) {
++		return;
++	}
++	if (io_otype(obj) == IOT_PORT) {
++		ipc_port_t port = (ipc_port_t)obj;
++
++		*mc = port->ip_messages.imq_msgcount;
++		*sr = port->ip_srights;
++	}
++	io_unlock(obj);
+ }
+ 
+ /*
+@@ -11848,6 +11890,10 @@
+ 	uint64_t crn[CLOVER_BB_CENSUS];
+ 	uint64_t csn[CLOVER_BB_CENSUS];
+ 	uint64_t crem[CLOVER_BB_CENSUS];
++	uint64_t cloc[CLOVER_BB_CENSUS];
++	uint64_t cto[CLOVER_BB_CENSUS];
++	uint32_t crx = 0;
++	uint32_t ctm = 0;
+ 	uint32_t cst[CLOVER_BB_CENSUS];
+ 	uint32_t cn = 0;
+ 	uint32_t call = 0;
+@@ -12053,24 +12099,38 @@
+ 		crn[cn] = 0;
+ 		csn[cn] = 0;
+ 		crem[cn] = 0;
++		cloc[cn] = 0;
++		cto[cn] = 0;
++		if (cdl[cn] != 0) {
++			ctm++;
++		}
+ 		if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1 &&
+ 		    !is_saved_state32(ss) && (thr->state & TH_RUN) == 0) {
+ 			cpc[cn] = (uint64_t)get_saved_state_pc(ss);
+-			/*
+-			 * Round263. A thread parked in the mach_msg2 trap carries the
+-			 * names of the right it sent on and the right it receives on in
+-			 * its saved registers, exactly where the hop rows already read
+-			 * them (r230/r231: x5's high half is the receive name, x6 the
+-			 * send name, x3's low half the send right's remote name). The
+-			 * hop capture is four slots wide, which boot 49 showed is a cap
+-			 * and not a count -- the census row is where those names stop
+-			 * being limited to four threads.
+-			 */
++				/*
++				 * Round264, reading the trap the way this kernel does. Boot 50
++				 * showed the r263 row naming a port that is not one: x[6] is not
++				 * a send right. mach_msg2_trap's own unpacking
++				 * (osfmk/ipc/mach_msg.c, struct mach_msg2_trap_args in
++				 * osfmk/mach/mach_traps.h) is x2 = msgh_bits|send_size,
++				 * x3 = msgh_remote_port|msgh_local_port -- low half remote --
++				 * x4 = voucher|msgh_id, x5 = descriptor count|rcv_name, high
++				 * half rcv_name, x6 = rcv_size|priority, x7 = timeout. So the
++				 * peer a waiter is talking to was always x3's low half, and
++				 * boot 50 read it as zero in every row: those threads hold no
++				 * send right at all, which is a different finding from the one
++				 * this round went looking for.
++				 */
+ 			if ((int64_t)saved_state64(ss)->x[16] == CLOVER_BB_M2_TRAP) {
+ 				cm2[cn] = (uint64_t)CLOVER_BB_M2_TRAP;
+ 				crn[cn] = (uint64_t)saved_state64(ss)->x[5] >> 32;
+ 				csn[cn] = (uint64_t)saved_state64(ss)->x[6];
+ 				crem[cn] = (uint64_t)saved_state64(ss)->x[3];
++				cloc[cn] = (uint64_t)saved_state64(ss)->x[3] >> 32;
++				cto[cn] = (uint64_t)saved_state64(ss)->x[7];
++				if ((uint32_t)crem[cn] == 0) {
++					crx++;
++				}
+ 			}
+ 		}
+ 		cn++;
+@@ -12115,43 +12175,60 @@
+ 	if (bb_census_t == 0 || secs >= bb_census_t + 120) {
+ 		bb_census_t = secs;
+ 		printf("clover r262: census t=%llu pid=%d threads=%u shown=%u"
+-		    " hidden=%u wait=%u run=%u\n", (unsigned long long)secs, pid,
+-		    call, cn, (call > cn) ? call - cn : 0, cwait, crun);
++		    " hidden=%u wait=%u run=%u rx=%u tm=%u\n", (unsigned long long)secs, pid,
++		    call, cn, (call > cn) ? call - cn : 0, cwait, crun, crx, ctm);
+ 		for (i = 0; i < cn; i++) {
+ 			char peer[24];
++			uint32_t mmc = 0;
++			uint32_t msr = 0;
+ 
+ 			/*
+-			 * Round263. The send right's owner is the task that will answer:
+-			 * translating a send name in this space resolves through the port
+-			 * object to its receiver's space, so the name names the far side
+-			 * and not this one (r233 built that lookup for the hop rows, where
+-			 * four slots were all it had). An empty peer is not "no answer is
+-			 * coming", it is "this thread is not in the trap" -- the deadline
+-			 * says which of the two shapes it is: 0 = no timer armed, so the
+-			 * wait was given no timeout and nothing will ever expire it, nonzero
+-			 * = seconds left on the wait_timer this thread blocked with.
++			 * Round264. peer= is now the owner of the remote port the waiter
++			 * itself holds a send right on, and it has three shapes because
++			 * boot 50 proved two of them were being printed alike: "none" =
++			 * remote is MACH_PORT_NULL, so this is a receive-only wait and
++			 * nobody is answering a request because no request was sent from
++			 * this call; "?" = a remote name exists and this kernel could not
++			 * resolve it; "pid:comm" = the far side, named. mc=/sr= come from
++			 * the receive port itself and settle the question the registers
++			 * cannot: mail queued while its receiver sleeps means the reading
++			 * is wrong, sr=0 with an empty queue means no task can ever wake
++			 * this thread again and the missing thing is a publisher. dl= keeps
++			 * its meaning (0 = no timer armed, nothing will expire this wait).
+ 			 */
+ 			peer[0] = '\0';
+-			if ((int64_t)cm2[i] == CLOVER_BB_M2_TRAP && csn[i] != 0) {
+-				clover_sb_port_owner(task, (mach_port_name_t)csn[i],
+-				    peer, sizeof(peer));
++			if ((int64_t)cm2[i] == CLOVER_BB_M2_TRAP) {
++				if ((uint32_t)crem[i] == 0) {
++					strlcpy(peer, "none", sizeof(peer));
++				} else {
++					clover_sb_port_owner(task, (mach_port_name_t)crem[i],
++					    peer, sizeof(peer));
++					if (peer[0] == '\0') {
++						strlcpy(peer, "?", sizeof(peer));
++					}
++				}
++				clover_sb_port_mail(task, (mach_port_name_t)crn[i], &mmc, &msr);
+ 			}
+ 			printf("clover r262: th tid=%llx st=%x we=%llx cont=%llx"
+-			    " pc=%llx dl=%llx m2=%llx rn=%x sn=%x rem=%x peer=%s\n",
++			    " pc=%llx dl=%llx m2=%llx rcv=%x remote=%x local=%x to=%llx"
++			    " sz=%x mc=%u sr=%x peer=%s\n",
+ 			    (unsigned long long)ctid[i], cst[i],
+ 			    (unsigned long long)cwe[i],
+ 			    (unsigned long long)ccont[i],
+ 			    (unsigned long long)cpc[i],
+ 			    (unsigned long long)cdl[i], (unsigned long long)cm2[i],
+-			    (unsigned int)crn[i], (unsigned int)csn[i],
+-			    (unsigned int)(uint32_t)crem[i], peer[0] ? peer : "-");
++			    (unsigned int)crn[i], (unsigned int)(uint32_t)crem[i],
++			    (unsigned int)(uint32_t)cloc[i], (unsigned long long)cto[i],
++			    (unsigned int)(uint32_t)csn[i], mmc, msr, peer);
+ 		}
+ 	}
+ 
+ 	/*
+-	 * Round231. Every thread of the receiver that is itself parked in the
+-	 * trap, with the name it is parked on read from x5's high half and
+-	 * translated in the receiver's own space. The first hop's queue is read
++	 * Round231, with round264's field names. Every thread of the receiver that
++	 * is itself parked in the trap, with the receive name read from x5's high
++	 * half translated in the receiver's own space; x6 is rcv_size|priority and
++	 * x3's halves are the remote and local ports, which r231 printed as rs=/rem=
++	 * and made a timeout out of a port name. The first hop's queue is read
+ 	 * last: it says whether backboardd's own request is still sitting where
+ 	 * it was sent, and its port object can be compared with the sender-side
+ 	 * reading the caller prints.
+@@ -12165,8 +12242,8 @@
+ 		clover_sb_port_owner(task, (mach_port_name_t)hloc[i], lo,
+ 		    sizeof(lo));
+ 		len = snprintf(line, sizeof(line),
+-		    "clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rn=%x"
+-		    " rs=%x rem=%x loc=%x id=%x to=%llx rno=%s lo=%s\n",
++		    "clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
++		    " sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n",
+ 		    (unsigned long long)secs, pid,
+ 		    (unsigned long long)htid[i], (unsigned long long)hop[i],
+ 		    hrn[i], hrs[i], hrem[i], hloc[i], hid[i],
