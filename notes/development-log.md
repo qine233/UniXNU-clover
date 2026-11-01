@@ -18984,3 +18984,28 @@ ButtonResolver 的 Legacy 线在找一个「由按键驱动发布的 HID 服务�
 SPU 形状驱动；③ 那个未解的第二个混淆键（`0x207203994` 的 import 名在两片子镜像里都找不到）
 标 **UNVERIFIED**，别当已知。`maxAssetSlots` 不是注册表属性，来自 `maxNumberOfSlots`，
 所以别指望从 ADT 里喂它。
+
+### 两处必须马上更正的自我叙述，外加一条对照组的硬事实
+
+写完上面那段的同一分钟里查了本仓自己的代码，三件事：
+
+1. **`button-names` 我们早就发布了**——`make-clover-adt.py:306` 里 `("button-names",
+   b"hold\0voldown\0volup\0")`。所以上面「r254 可能还得补 button-names」那句作废：
+   AppleM68Buttons 要的名单已经在卡上了。（顺带说明 r252 的缺席记录器为什么没报它——
+   它是被**驱动**读的，不经过用户客户端出口。）
+2. **对照组也用 2**：`UniXNU-sheng/scripts/make-sheng-adt.py:186` 同样是
+   `('home-button-type', struct.pack('<I', 2))`，而 sheng 是把这台同一镜像跑到桌面的。
+   所以「2 本身就是投死等的那一支」这个新读法，与对照组冲突——**不要把 r254 押在改值上**。
+   同一函数上第三次翻烧饼的地方，恰恰是最不该动手的地方。
+3. **对照组多的是什么**：`UniXNU-sheng/board.toml` 的 `[components] include` 里有
+   **`ShengHidInput`**（还有 `AppleKeyStoreState`），而本板的 `[kernel.prelink] roots`
+   31→32 项里既没有 M68Buttons、也没有任何 HID 输入提供者——`CloverInput` 只是 I2C 仪器，
+   不发任何 IOHID 服务。这条与 r253 的判断同向：缺的是**按键/HID 侧的驱动**，
+   不是任何一个 ADT 数字。而且本仓 `drivers/NativeHidInput` 的资格校验产物
+   （`build/native-hid-input/NativeHidInput.late.o`、`hid-original-bindings.o`、
+   `abi-audit.json`，今天 07:12 生成）已经躺在树上没接进去——r253 若仍不够，
+   下一步就是把它接进归档，那一刀是对照组已经验证过的形状。
+
+结论：boot 41（r253）只验一件事——`/buttons` 有了 child 之后，census 的 `svc` 点名里会不会出现
+`AppleM68Buttons`（它名字里就有 `utton`，r245 的点名器会自动抓到）、`button-family=` 会不会变大、
+以及 backboardd 的 `bbgrp` 是否还 `wait=1`。不改值、不加新键。
