@@ -14,9 +14,11 @@
 //     so that channel does not exist here. Observability is the kernel's own message buffer: every reading below is an
 //     IOLog line prefixed "clover r180: ", which CloverSdhci's tee (round175/176) filters into the kind-22 logfs ring,
 //     so a frame is read back with the host script instead of photographed.
-//   * none of the twelve unrelated probes the reference late entry fans out to (keystore, cpufreq, GPU power, touch,
-//     WiFi, ADSP, battery, audio, buttons, backlight, DPU, HID). Those are other boards' work items; here the late entry
-//     does one thing: bring up the framebuffer.
+//   * the eleven of the reference's late-entry fan-out that are other boards' work items (keystore, cpufreq,
+//     GPU power, touch, WiFi, ADSP, battery, audio, buttons, backlight, DPU) stay out. Round255 adds the
+//     twelfth, HID, because that one is this board's blocker: package/CloverHidInputProbe.cpp hangs an owned
+//     IOHIDDevice under the original IOHIDResource, which is how the reference board gets past the wait this
+//     one dies in. Here the late entry therefore does two things: bring up the framebuffer, and arm the input.
 //   * a fixed line budget, and per-event caps, because the ring holds 512 slots and is shared with the storage stack.
 //   * the console descriptor's v_display word is recorded. The base driver claimed the main display only for the
 //     literal 1; this board's copy accepts any nonzero value (see the comment in that file), and the reading here is
@@ -46,6 +48,8 @@ extern "C" IOService *native_gop_presenter_create(void);
 extern "C" bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
 extern "C" void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
+// package/CloverHidInputProbe.cpp, in the same archive as this file and the driver it starts.
+extern "C" void clover_hid_input_probe(void);
 static IOService *pendingLegacyDisplay,*activeLegacyDisplay,*activeGOPPresenter,*activeGOPNub,*gpuHandoffPresenter;
 // GPU hand-off counters the driver writes through these names.
 volatile uint32_t native_legacy_gpu_fallbacks,native_legacy_gpu_last_status;
@@ -595,6 +599,10 @@ void native_legacy_display_probe(void) {
     native_legacy_display_checkpoint();
 }
 void native_legacy_display_late_probe(void) {
+    // Round255, and deliberately first: the HID device waits five seconds for IOHIDResource to appear, and the
+    // framebuffer branch below can return without ever running. The two instruments share this entry point the
+    // way the reference board's late fan-out does, and neither one's result is an argument for the other.
+    clover_hid_input_probe();
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;
     native_legacy_surface_status=OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");
     OSDictionary *matching=IOService::nameMatching("IOCoreSurfaceRoot");

@@ -773,6 +773,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // total line, eight who lines, 24 rows, one misses line, 32 miss lines and 32 live miss lines --
   // 118 records, so the class budget goes from 64 to 128.
   { "clover r252: ", "r252-mgq", 128, 0, 0, 0 },
+  // Round255's input device speaks once at the end of its probe and then once per second from its own
+  // timer while it is looking for the event driver, so the live lines are capped inside the probe at
+  // eight. Worst case is therefore the one stage line, two refusal lines and eight checkpoint lines --
+  // eleven, and 32 leaves the same headroom r243 gives the census. It is a separate class from r180
+  // because a boot where the display works and the HID device does not is the reading this round is
+  // here for, and neither half may push the other out of the ring.
+  { "clover r255: ", "r255-hid", 32, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

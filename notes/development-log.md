@@ -19144,3 +19144,68 @@ boot 40 那些读数的来源是 1500 秒以后的那一次 census，而这次�
    + `hid-original-bindings.o` 并进显示 archive、`scripts/build-native-hid-input.py` 进
    `kernel.archives`、`package/CloverHidInputProbe.cpp` 由 CloverPMGR 调、boot-args
    `offline-hid-input=1 offline-hid-home=1`）。不改 `home-button-type` 的值。
+
+## r255 落地：屏幕归屏幕，输入归这块板子
+
+boot 42 把 r254 的两件事都结掉了：AppleM68Buttons 从 prelink roots 里摘出去之后，开机不再在 12.7 秒
+停住，census 和缺席记录器都活到了 21 分钟；那张按名字去重的表也如设计只说一遍——`soc-generation` 一行
+带一个计数，而不是八行。剩下的一件事仍然是那件老事：backboardd 卡在一个 dispatch group 上，只有
+ButtonResolver 的完成块能让它出来，而那个块只对「HID 服务带着 resolver 过滤的那几个键」的进程生成。
+home-button-type 已经证明不是它：boot 39/40/42 三次都是 backboardd 自己把它读成 2。
+
+r255 于是照 sheng 的形状做输入这一半。四件东西，各有各自的证明责任：
+
+1. `scripts/build-clover-hid-input.py`——把 IOHIDDevice 的真实 ABI 从**这块板子自己的内核**里读出来。
+   sheng 那份是照着另一个板的 prelink 候选写的，地址直接写在文件里；我们的 prelink 把 kext 符号表全剥了，
+   `__ZTV11IOHIDDevice` 根本不存在，所以 vtable 只能按结构找：207 个非空指针、`___cxa_pure_virtual` 恰好
+   只出现在第 180 槽、后面 24 字节仍为零、前 168 槽与 IOService 自己的表差恰好 18 处——全图扫下来只有
+   一处，0xfffffff005d045c0。三处代码站点（构造函数、start、report 转发）用它们自己的字节找回来，构造函数
+   的 adrp/add 再解一遍，证明它存的 vptr 就是上面那张表。钉住的旧值同时保留为断言：地址会动的重建必须在这里
+   失败，而不是在平板上。
+2. `drivers/NativeHidInput/NativeHidInput.cpp`——vendored 的自有设备，report 2 是 Consumer 键
+   （Menu/Power/VolInc/VolDec），report 3 是十指数字化仪；它 `-Werror` 编译过，靠的就是上面生成的那份头。
+3. `package/CloverHidInputProbe.cpp`——运行时那一半：按标识加载 IOHIDFamily 与 IOHIDEventDriver、从
+   metaclass 表读回五个类尺寸、等 IOHIDResource、拿内核自己的 kmod 注册 metaclass、init/attach/start，
+   然后**在原始 IOHIDEventDriver 匹配之后**才把 Built-In / DisplayIntegrated / PrimaryUsagePage 0x0d /
+   PrimaryUsage 4 发到事件服务和它的父 interface 上，各一次。
+4. `native_legacy_display_late_probe()` 从只做一件事变成做两件事，HID 排在最前面——framebuffer 那一路是会
+   直接 return 的。
+
+第一趟内核链接教的一课值得记下来：`weak_import` 对静态链接的内核**不是**「可以不定义」。驱动通过弱导入
+向两个生产者（触摸帧、按键）递出它的 work-loop action，板子上一个生产者都还没有，于是链接器在
+`_native_touch_set_sink` / `_native_buttons_set_sink` 上把整张图拒了——而我自己在归档里那道
+「板级符号必须有人定义」的检查恰好因为认出了 N_WEAK_REF 而放过了它们。现在的做法是板子定义这两个函数，
+只计数不调用，并把计数印进 stage 行的 `sinks=..,..`：驱动确实伸过一次手、这块板子确实没有东西接，
+这是一条读数，不是一段沉默。归档检查里也补了按名的硬断言，理由就写在这条注释里。
+
+## r255 读数（boot 43）：设备真的挂上去了，事件驱动真的匹配了，死等还在
+
+`round255-log-window.bin`：boot 43，16 条报告、64 条驱动判据、21 条 probe 中转、512 行内核日志。
+本轮自己的 `clover r255:` 一行都不在窗口里——不是没打印，是**打得太早**：late entry 在 t≈25 s，而留下的
+512 行窗口从 **t=1208 s** 才开始（`lap=24`，msgbuf 在这台机器上卷了二十四圈）。这是这台仪器第四次
+栽在「自己的输出通道就是自己的上限」上，只是这次栽的是时间而不是条数。
+
+能读的部分来自 r243 那次 census，它在 backboardd 第一次被打样时才打印，正好落在窗口里：
+
+| | boot 42（r254） | boot 43（r255） |
+| --- | --- | --- |
+| `svc total` | 122 | **128** |
+| `button-family` | 2 | **5** |
+| `svc` 点名的类 | `IOHIDResource`、`buttons` | `IOHIDResource`、`buttons`、**`IOHIDInterface`**、**`IOHIDEventDriver`**、**`IOHIDEventServiceUserClient…`** |
+
+这台板上唯一的 IOHIDDevice 就是我们那一个：`IOHIDInterface` 与 `IOHIDEventDriver` 只有在一个
+IOHIDDevice 挂到 `IOHIDResource` 下面并且原始家族匹配它之后才会出现，`IOHIDEventServiceUserClient`
+更说明有用户态真的开到了事件服务上。所以 r255 想证的机械部分是**成了**的：加载家族、等资源、注册
+metaclass、alloc/init/attach/start 这一条链在这台机器上走通了，没有 panic，也没有停在任何一步。
+
+没成的还是那一件：backboardd（pid=58）的 `clover r239: bbgrp` 在 boot 43 依旧是 `cnt=1 wait=1 notif=0`
+（boot 42 同形），`dispatch_group_wait(_controllerReadyGroup,-1)` 没有被解开；桌面照旧到不了。
+另一条迟到的证人更具体：r252 的缺席表在 boot 43 记着 `pid=58 comm=backboardd missing=DisplayIntegrated
+count=14`（首次 t=485 s），而 `DisplayIntegrated` 正是探针要在事件驱动匹配后发到那个服务上的键之一——
+它仍在被记为「问了而没有」，说明**发布这一步要么没发生，要么发错了地方**（发到服务/父 interface，而不是
+backboardd 真正去 copyProperty 的那个节点）。
+
+这就是 r255 的读数边界：没有 `stage=`/`published=`/`property_seen`，无法区分这两支。r256 因此先把
+自己的输出送到得了的地方——把 verdict 从一次性早打印改成慢心跳（探针状态每 120 s 重述一次，仍在
+`r255-hid` 的 32 行预算内），让任何一段晚窗口都必然带着它；再用 `DisplayIntegrated`/`Built-In` 会不会
+停止累积当第二个证人。`home-button-type` 仍然不动。

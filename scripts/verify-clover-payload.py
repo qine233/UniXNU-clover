@@ -1023,6 +1023,21 @@ def check_sb_sample(kernel: bytes) -> bool:
              # The sixteen-slot ring this round replaces must not survive in the image, or the frame
              # would report a shown count out of a table that no longer exists.
              "mgq-miss-old": (b"clover r252: misses total=%u shown=%u\n") not in kernel,
+             # Round255. The owned input device is only in this image if the archive the kernel
+             # force-loads carries it, and the only proof from the file is the strings its two
+             # objects print: the probe's stage verdict and refusals, and the product strings the
+             # driver publishes through the original IOHIDDevice slots it overrides.
+             "hid-stage": (b"clover r255: stage=%d load=%d matching=%d meta=%d resource=%u "
+                           b"sizes=%u,%u,%u,%u,%u device=%llx transfer=%u presses=%u sinks=%u,%u\n") in kernel,
+             "hid-size": (b"clover r255: IOHIDDevice size=%u not 208, refusing\n") in kernel,
+             "hid-load": (b"clover r255: IOHIDFamily load=%d, no device\n") in kernel,
+             "hid-service": (b"clover r255: service=%llx%s\n") in kernel,
+             # The driver reaches for two producers through weak imports, and a static kernel link has
+             # no undefined-weak: the first r255 build died on exactly these two names. The board's
+             # answer is a pair of counters, printed in the stage line above.
+             "hid-sink": (b"clover r255: device=%llx") in kernel,
+             "hid-name": (b"Offline HID input probe") in kernel,
+             "hid-resource": (b"IOHIDResource") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
                            b"dropped=%u comms=%u\n") in kernel,
              "tee-sync": (b"CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n") in kernel}

@@ -190,7 +190,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r254: the button driver came back out of the prelink, and the absence list stops repeating itself. boot 41 is the shortest boot of this port and the most informative: AppleM68Buttons matched /J120AP/buttons, printed its own start line, and at t=12.744 panicked \"failed to instantiate function-button_hold\" @AppleM68Buttons.cpp:336 -- handleStart builds function-button_<name> for every button on the driver's own hardcoded list, and a synthesized ADT node gives it none of them. The same node shape (button-names hold/voldown/volup, home-button-type=2, no function-button_*) reaches the desktop on UniXNU-sheng with this same image and no prelink roots at all, so what this board lacks is not Apple's driver but any driver that publishes the HID buttons -- NativeHidInput, whose bindings already qualify. The recorder changes too: boot 40 counted 153 misses and its 16-slot ring kept four names repeated, soc-generation eight times, so misses become a distinct-name tally with a count per name, the live print moves from button rows to miss rows, and r252-mgq's tee budget goes 64 to 128."
+title = "clover r255: the screen works and the desktop still does not arrive, so the input now comes from this board. boot 42 read back what round254's revert bought -- no early panic, the census and the absence recorder alive, and the same 21-minute stop with backboardd waiting on a dispatch group that only a ButtonResolver completion block leaves. That block is built for a process whose HID service carries the keys the resolver filters on, and this board has never had such a service: home-button-type is published, reachable and read back as 2 by backboardd itself, and sixteen rounds of device-tree work never moved the wait because the wait was never on a registry number. UniXNU-sheng reaches the desktop with the identical buttons node, no Apple button driver and its own IOHIDDevice under the original IOHIDResource, so this round builds that shape: scripts/build-clover-hid-input.py derives IOHIDDevice's real 207-slot table, 0xd0 instance and three call sites out of this board's own linked kernel -- the prelink keeps no kext symbols, so the vtable is found by structure and the constructor's vptr store is decoded back -- and refuses the build over any byte that moved; drivers/NativeHidInput is vendored and compiles -Werror against the header that generates; package/CloverHidInputProbe.cpp loads IOHIDFamily and IOHIDEventDriver by identifier, reads the five class sizes, waits for IOHIDResource, registers the metaclass against the kernel's own kmod, starts the device, and once the original event driver matches publishes \"Built-In\"/\"DisplayIntegrated\"/\"PrimaryUsagePage\" 0x0d/\"PrimaryUsage\" 4 on it and on its parent interface exactly once. The late entry that used to do one thing now does two, and where boot 41 died at 12.7 s over a button name it did not have -- \"failed to instantiate function-button_hold\" -- boot 43 asks the other question: whether an owned HID service is what releases _controllerReadyGroup's wait."
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2229,6 +2229,35 @@ kernel_args = [
   "offline-legacy-validate=1",
   "offline-legacy-transfer=1",
   "offline-legacy-retire=1",
+  # Round255 arms the owned input device, and it is armed because the display route is the one that
+  # proved the screen can be driven while the desktop still never arrives: backboardd sits in a
+  # dispatch group that only a ButtonResolver completion block leaves, and the block is built only for
+  # a process whose HID service carries the keys the resolver filters on. Boots 39/40/42 read
+  # home-button-type back as 2 from backboardd's own hands, and 16 rounds of ADT work never moved the
+  # wait -- because the wait is not on a registry number, it is on a service that does not exist here.
+  # UniXNU-sheng's answer is not Apple's button driver (boot 41 showed what that costs) but its own
+  # IOHIDDevice subclass under the original IOHIDResource, so this board builds the same shape:
+  #   offline-hid-input=1  arms package/CloverHidInputProbe.cpp in the display driver's late entry;
+  #   offline-hid-home=1   asks for the button-capable device rather than a touch-only one.
+  # Both are sheng's spellings, kept verbatim: they describe an offline input source, not a board.
+  # What comes back on the card's kernel-log ring, all of it class "clover r255: ":
+  #   `stage=5 load=0 matching=0 meta=0 resource=1 sizes=.. device=0x.. transfer=.. presses=.. sinks=..,..` --
+  #    one step number per gate: 1 armed, 2 families loaded, 3 resource found, 4 metaclass
+  #    registered, 5 device started; -2/-3/-4/-5 name the step that refused, and the three load
+  #    statuses say whether IOHIDFamily/IOHIDEventDriver came up and the metaclass chain took. The
+  #    last pair counts the two producers the driver offers its work-loop actions to -- the touch
+  #    frame and the key press -- which this board has neither of, and a static kernel link cannot be
+  #    answered with an undefined weak symbol, so the instrument defines both and calls nothing;
+  #   `clover r255: device=0x.. driver=none` -- the device started but no IOHIDEventDriver matched
+  #    under it, which is the report-descriptor layout being judged, not this wiring;
+  #   `clover r255: service=0x.. Built-In=1 PrimaryUsagePage=1 PrimaryUsage=1` -- the event service
+  #    exists and the four classification keys were published on it and on its parent interface once
+  #    each, which is the exact filter -[BKHIDDirectTouchEventProcessor processEvent:...] reads.
+  # A device that reports before the panel does is the failure mode this board would rather not debug,
+  # so the driver asks native_hid_input_requested() first and the probe only says yes once the original
+  # validator has accepted two swaps; three Home presses, then silence.
+  "offline-hid-input=1",
+  "offline-hid-home=1",
   # Round184 parks 排期 4, 5 and 6. The three instrument arguments below are deliberately NOT passed
   # any more: the goal moved to getting iPadOS onto its own screen, and each of these three spends
   # boot time and bus risk on a question that is not that one. The drivers stay linked, their modes

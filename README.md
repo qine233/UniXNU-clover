@@ -146,14 +146,21 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
   `UniXNU-sheng/board.toml` 的 `[kernel]` 里**根本没有 `prelink.roots`**，按键由它自己的
   `ShengHidInput` 发出来。所以本板缺的不是 Apple 的驱动，是**任何一个把 HID 按键发布出来的驱动**。
   r254 把那行 root 摘回去（两个 checker 同时改成断言它**不在**镜像里——它再出现就意味着这台机器
-  又回到 13 秒就死），下一刀是 `drivers/NativeHidInput` 接线。
+  又回到 13 秒就死）。r255 把 `drivers/NativeHidInput` 接上了，boot 43 证明这条链在本板走通：
+  census 的 `svc` 从点名 `IOHIDResource`+`buttons` 两类（`button-family=2`）变成
+  `IOHIDResource`+`buttons`+**`IOHIDInterface`**+**`IOHIDEventDriver`**+**`IOHIDEventServiceUserClient`**
+  （`button-family=5`，`svc total` 122→128）——本板唯一的 IOHIDDevice 就是我们那颗，家族匹配了它，
+  用户态也真开到了事件服务上，全程不 panic。
 
-> 仪器第三次复发，r254 结掉：boot 40 上 `r252-mgq` 的 64 行类预算被吃满（`capped at 64`，
-> `row 12/15` 也被截断），因为 miss 与 row 既当场出声又在 census 里重发一遍；更要紧的是缺席表
-> 本身——`misses total=153 shown=16`，那 16 行是四个名字重复（`soc-generation` 独占 8 行）。
-> r254 = live 打印只留给 miss、row 交给 census 那一批、预算 64→128，缺席表改成**按名字去重**
-> 的计数表（`CLOVER_MG_MISSES 32`，每行带 `count=`）。同一个毛病三次出现的地方都记着：
-> r249 的推送上限、r251 的回卷环、r252/r254 的类预算——一台仪器的输出通道就是它的上限。
+> 仪器第四次复发，r255 撞上、r256 结：这次不是条数预算，是**时间窗口**。
+> （第三次是 r254 结掉的：boot 40 上 `r252-mgq` 的 64 行预算被吃满，`misses total=153 shown=16`
+> 那 16 行其实是四个名字重复、`soc-generation` 独占 8 行；live 打印改留给 miss、row 交给 census、
+> 预算 64→128，缺席表改成**按名字去重**的计数表 `CLOVER_MG_MISSES 32`。）探针的状态行只在
+> late entry（t≈25 s）打印一次，而卡上留下的 512 行内核窗口从 **t=1208 s** 才开始（`lap=24`），
+> 于是本轮自己的 `clover r255:` 一行都读不到——机制成没成要靠 r243 census 的迟到点名反推，
+> `published=`/`property_seen` 这两个直接答案全丢了。r256 = 把 verdict 改成慢心跳（每 120 s 重述，
+> 仍在 `r255-hid` 的 32 行预算内），让任何一段晚窗口必然带着它。同一类毛病四次出现的地方都记着：
+> r249 的推送上限、r251 的回卷环、r252/r254 的类预算、r255 的时间窗——一台仪器的输出通道就是它的上限。
 
 
 每一轮的设计、构建与真机读数（含本节的证据出处）都在
@@ -164,7 +171,7 @@ r236–r239 是把这条链读出来的四轮。
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点是 `-[BKButtonHapticsController init]` 交给 ButtonResolver 的一个栈上 block 里的 `dispatch_group_wait(_controllerReadyGroup,-1)`（唯一 `leave` 在 `0x100030ca8`，紧挨 `_BRController ready: device haptic asset slot count:%d`）。板上已排除：boot 39/40 两次实测 `who pid=58 comm=backboardd path=3 key=3`，backboardd 自己把 `home-button-type` 读回 **2**；ADT 节点可达、值正确。宿主已排除：`function-button_halleffect` 不是 MG 的键，是 AppleM68Buttons 用 `function-button_%s` 拼的。真凶形态：`/buttons` 有 provider（`svc buttons`）但**十六轮以来没有 child**——`com.apple.driver.AppleM68Buttons` 不在 `[kernel.prelink] roots`（stock kernelcache 4 次命中，我们 0 次），而对照组 sheng 除了同值 2 之外还有 `ShengHidInput`。boot 40 的缺席清单另有 153 条，去重后前几条全是 SpringBoard 问 `product-id`/`platform-name`/`soc-generation`/`/product/camera`，**没有一条在按键路上**。r253 的试验已判完：把 `AppleM68Buttons` 加进 roots，它 match、start，然后在 `handleStart` 里 `failed to instantiate function-button_hold` 于 12.7 秒 panic——合成 ADT 喂不出它要的 `function-button_<name>`；而 sheng 用同一个 `buttons` 节点到桌面，靠的是自己的 `ShengHidInput`，那边压根没有 `prelink.roots` | r254 起这条 root 已摘回（checker 反向钉住）。下一刀 = `drivers/NativeHidInput` 接线：`NativeHidInput.late.o` + `hid-original-bindings.o` 已在 `build/native-hid-input/` 通过资格校验，接法照 sheng（并进显示 archive、`scripts/build-native-hid-input.py` 进 `kernel.archives`、`package/CloverHidInputProbe.cpp` 由 CloverPMGR 调、boot-args `offline-hid-input=1 offline-hid-home=1`），**不改 `home-button-type` 的值**；读法不变：`svc` 点名出不出按键驱动、`button-family=` 变不变、backboardd 的 `bbgrp` 还等不等 |
+| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点是 `-[BKButtonHapticsController init]` 交给 ButtonResolver 的一个栈上 block 里的 `dispatch_group_wait(_controllerReadyGroup,-1)`（唯一 `leave` 在 `0x100030ca8`，紧挨 `_BRController ready: device haptic asset slot count:%d`）。板上已排除：boot 39/40 两次实测 `who pid=58 comm=backboardd path=3 key=3`，backboardd 自己把 `home-button-type` 读回 **2**；ADT 节点可达、值正确。宿主已排除：`function-button_halleffect` 不是 MG 的键，是 AppleM68Buttons 用 `function-button_%s` 拼的。真凶形态：`/buttons` 有 provider（`svc buttons`）但**十六轮以来没有 child**——`com.apple.driver.AppleM68Buttons` 不在 `[kernel.prelink] roots`（stock kernelcache 4 次命中，我们 0 次），而对照组 sheng 除了同值 2 之外还有 `ShengHidInput`。boot 40 的缺席清单另有 153 条，去重后前几条全是 SpringBoard 问 `product-id`/`platform-name`/`soc-generation`/`/product/camera`，**没有一条在按键路上**。r253 的试验已判完：把 `AppleM68Buttons` 加进 roots，它 match、start，然后在 `handleStart` 里 `failed to instantiate function-button_hold` 于 12.7 秒 panic——合成 ADT 喂不出它要的 `function-button_<name>`；而 sheng 用同一个 `buttons` 节点到桌面，靠的是自己的 `ShengHidInput`，那边压根没有 `prelink.roots`。**r255 已把这条接上并测到**：boot 43 的 census `svc` 多出 `IOHIDInterface`/`IOHIDEventDriver`/`IOHIDEventServiceUserClient`、`button-family` 2→5、`svc total` 122→128——我们的 IOHIDDevice 挂到了 `IOHIDResource` 下、原始家族匹配了它、用户态开到了事件服务，全程不 panic；但 `bbgrp` 依旧 `wait=1 notif=0`，桌面没来。同时 boot 43 的缺席表记着 `pid=58 comm=backboardd missing=DisplayIntegrated count=14`（首次 t=485 s），而那个键正是探针要在事件驱动匹配后发上去的 | r256 两件事：① 把 `clover r255:` 的 verdict 从一次性早打印改成每 120 s 的慢心跳（`r255-hid` 预算 32 行内），因为本轮读不到它——不是没打印，是 late entry 在 t≈25 s 而卡上窗口从 t=1208 s 才开始；有了 `stage=`/`published=`/`property_seen` 才能分「发布没发生」和「发错了节点」。② 用 `DisplayIntegrated`/`Built-In` 在缺席表里会不会停止累积当第二个证人。**不改 `home-button-type` 的值** |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 3），再问地址 |
 | 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |

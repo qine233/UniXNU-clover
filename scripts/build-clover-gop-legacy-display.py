@@ -10,9 +10,11 @@ The clover narrowing of the reference port's build-gop-legacy-display.py. Three 
   * the driver sources are this device repository's vendored drivers/NativeMobileDisplay, so the
     archive the kernel links is the one this board's README describes - the builder refuses to run
     against the base module;
-  * the board-local instrument is kits/clover/CloverLegacyDisplayProbe.cpp: no boot-progress
-    channel (this board builds with CONFIG_XNU_BOOT_PROGRESS=n) and none of the other boards'
-    peripheral probes, so the archive is three objects instead of thirty.
+  * the board instruments are kits/clover/CloverLegacyDisplayProbe.cpp and, from round255,
+    kits/clover/CloverHidInputProbe.cpp: no boot-progress channel (this board builds with
+    CONFIG_XNU_BOOT_PROGRESS=n) and none of the other boards' peripheral probes, so the archive is
+    seven objects instead of thirty -- the display driver and its presenter, the two board
+    instruments, and the owned IOHIDDevice with the original bindings it is qualified against.
 
 Everything the reference qualifies, this qualifies too, and against the same instructions: the
 original family's executable text in this kernel is byte-identical to the image the reference
@@ -277,8 +279,20 @@ if not any(str(x).startswith(('-isysroot', '--sysroot')) for x in cmd): cmd += [
 run(cmd, cwd=r['directory'])
 require(probe_obj.exists(), 'the board instrument compiled')
 
+# Round255: the second instrument, same flags, same archive. It hangs an owned IOHIDDevice under the
+# original IOHIDResource, which is what the reference board does to get past the wait this board dies
+# in, and it is only legal at all because scripts/build-clover-hid-input.py derives IOHIDDevice's real
+# 207-slot table out of this same kernel image and refuses the build over any byte that differs.
+hid_probe_source = ROOT / 'kits/clover/CloverHidInputProbe.cpp'; hid_probe_obj = OUT / 'CloverHidInputProbe.o'
+run([str(hid_probe_source) if str(value) == str(probe_source) else
+     str(hid_probe_obj) if str(value) == str(probe_obj) else value for value in cmd], cwd=r['directory'])
+require(hid_probe_obj.exists(), 'the HID instrument compiled')
+print(run(['python3', ROOT / 'scripts/build-clover-hid-input.py', '--kernel', KERNEL], text=True), end='')
+hid = ROOT / 'build/native-hid-input'
+
 archive = OUT / 'libNativeLegacyDisplay.late.a'; archive.unlink(missing_ok=True)
-run(['xcrun', 'ar', 'rcs', archive, late, OUT / 'original-bindings.o', probe_obj])
+run(['xcrun', 'ar', 'rcs', archive, late, OUT / 'original-bindings.o', probe_obj, hid_probe_obj,
+     hid / 'NativeHidInput.late.o', hid / 'hid-original-bindings.o'])
 
 print(run(['python3', ROOT / 'scripts/build-arm-driver.py', 'NativeGOPPresenter'], text=True), end='')
 presenter = ROOT / 'build/native-gop-presenter'
@@ -300,14 +314,20 @@ def globals_of(path):
     position, count, strings, _ = struct.unpack_from('<4I', data, start + 8)
     defined = set(); undefined = set()
     for index in range(count):
-        string, kind, section, _, _ = struct.unpack_from('<IBBHQ', data, position + index * 16)
+        string, kind, section, description, _ = struct.unpack_from('<IBBHQ', data, position + index * 16)
         if kind & 0xe0: continue                                   # symbolic debug entry
         if not kind & 1: continue                                  # file-local
         name = data[strings + string:data.index(b'\0', strings + string)].decode()
         # n_type low nibble: 0 undefined, 2 absolute (what .set emits), 0xe in a section.
-        (undefined if kind & 0xe == 0 else defined).add(name)
+        # N_WEAK_REF (0x40 in n_desc) is a reference the link may answer with nothing: the HID driver
+        # reaches for a touch and a button sink through weak imports, and this board has neither yet.
+        if kind & 0xe == 0:
+            if not description & 0x40: undefined.add(name)
+        else: defined.add(name)
     return defined, undefined
 members = {'NativeLegacyDisplay.late': late, 'CloverLegacyDisplayProbe': probe_obj,
+           'CloverHidInputProbe': hid_probe_obj, 'NativeHidInput.late': hid / 'NativeHidInput.late.o',
+           'hid-original-bindings': hid / 'hid-original-bindings.o',
            'NativeGOPPresenter.late': presenter_late, 'original-bindings': OUT / 'original-bindings.o'}
 owners = {}
 for owner, path in members.items():
@@ -315,17 +335,38 @@ for owner, path in members.items():
         require(name not in owners or name.startswith(('ltmp', 'l_')),
                 'duplicate definition of ' + name + ' in ' + owner + ' and ' + owners.get(name, ''))
         owners[name] = owner
-contract = {name for name in owners if name.startswith(('_native_legacy', '_native_gop'))}
+# The names this archive owns end to end: the display driver, the presenter, and from round255 the HID
+# driver plus the touch counters its report builder reads.
+board = ('_native_legacy', '_native_gop', '_native_hid', '_native_touch', '_native_buttons', '_clover_hid')
+contract = {name for name in owners if name.startswith(board)}
 for owner, path in members.items():
     for name in globals_of(path)[1]:
-        if name.startswith(('_native_legacy', '_native_gop')):
+        if name.startswith(board):
             require(name in owners, name + ' (needed by ' + owner + ') is defined by no archive member')
 require('_native_legacy_gpu_complete' in contract, 'the presenter hands frame completion back to the driver')
+# A weak import is not optional to a static kernel link. The first round255 build passed every check
+# here -- the driver's two sink references were correctly recognised as N_WEAK_REF and excused -- and
+# then ld refused the kernel over _native_touch_set_sink and _native_buttons_set_sink. The board's
+# answer is a pair of counters in the HID instrument, and that answer has to be in the archive.
+for name in ('_native_touch_set_sink', '_native_buttons_set_sink'):
+    require(name in owners, name + ' is imported weak by the HID driver and defined by no member: '
+            'the kernel link has no notion of an undefined weak symbol')
+require('_native_hid_live_checkpoint' in contract and '_native_hid_input_requested' in contract,
+        'the HID instrument answers the driver that reports through it')
+require('_native_touch_seq' in contract and '_native_touch_xs' in contract,
+        'the touch counters the HID digitizer report reads are defined here, empty, not left unresolved')
+# The driver's OSMetaClass registration is its C++ static initializer, which the archive carries
+# globalized and nothing else in the kernel calls; the probe calls it by that name between preModLoad
+# and postModLoad. If objcopy ever stops globalizing it, the link has to say so here.
+require('__GLOBAL__sub_I_NativeHidInput.cpp' in owners,
+        'the HID driver initializer is not global in this archive, so the probe cannot register it')
 
 sources = [ROOT / 'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp', ROOT / 'drivers/NativeMobileDisplay/NativeLegacyRequest.h',
            ROOT / 'drivers/NativeMobileDisplay/NativeGOPPresenter.cpp', ROOT / 'drivers/NativeMobileDisplay/NativeGOPWire.h',
            probe_source, ROOT / 'scripts/build-clover-gop-legacy-display.py',
-           ROOT / 'scripts/audit-clover-mobile-graphics-legacy.py']
+           ROOT / 'scripts/audit-clover-mobile-graphics-legacy.py',
+           ROOT / 'drivers/NativeHidInput/NativeHidInput.cpp', hid_probe_source,
+           ROOT / 'scripts/build-clover-hid-input.py']
 # Three hashes, and only two of them are the identity of what gets linked. `ar` stamps every member
 # with its mtime, so archive_sha256 changes on each run even when nothing else did (round180 measured
 # this: two consecutive runs, four byte-identical members, two archive hashes). The linker reads object
@@ -343,11 +384,13 @@ sources = [ROOT / 'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp', ROOT / 
     generated_abi_sha256=sha(OUT / 'OriginalLegacyFramebufferABI.h'),
     original_audit_sha256=sha(ABI_JSON),
     compiled_object_sha256=sha(obj), late_object_sha256=sha(late), archive_sha256=sha(archive),
+    hid_abi_sha256=sha(hid / 'abi-audit.json'),
+    hid_late_object_sha256=sha(hid / 'NativeHidInput.late.o'),
     bindings={n: hex(v) for n, v in bindings.items()}, virtual_entries=358, owned_entries=owned,
     inherited_native_entries=native, guarded_backend_leaves=[i for i in pure if i not in (213, 337)],
     archive_board_symbols=sorted(contract),
     original_instructions_modified=False, driver_initialized=False, display_presented=False,
-    device_observed=False), indent=2) + '\n')
+    device_observed=False, hid_device_started=False, hid_properties_published=False), indent=2) + '\n')
 print(f'Clover Legacy archive built: {archive}')
 print(f'{len(bindings)} original bindings, {len(owned)} owned entries, {len(native)} inherited native entries; '
       'seven backend leaves still guarded, runtime lifecycle unqualified until a device frame reads back')

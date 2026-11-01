@@ -956,7 +956,11 @@ def check_board(errors: list) -> str:
                 ('{ "clover r252: ", "r252-mgq", 128, 0, 0, 0 },',
                  "the user-client question rows and the absent-answer list would land uncounted, and "
                  "the one reading that separates a wrong answer from no question at all "
-                 "would be missing")):
+                 "would be missing"),
+                ('{ "clover r255: ", "r255-hid", 32, 0, 0, 0 },',
+                 "round255's input readings would share the display's budget: a boot where the panel "
+                 "works and the HID device does not is the reading this round is here for, and "
+                 "neither half may push the other out of the ring")):
             if tee not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci gives round238's rows no tee class ({tee}): "
                               f"{why}")
@@ -1880,6 +1884,85 @@ def check_board(errors: list) -> str:
                 errors.append(f"board.toml dropped {dep}: the HID family and the platform layer are "
                               "roots in their own right, and a boot without either cannot reach the "
                               "desktop whatever happens to the button driver")
+
+        # Round255, the same sentence read forwards. What this board lacks is not Apple's button
+        # driver but any driver that publishes the HID buttons, and the reference board's answer is an
+        # owned IOHIDDevice subclass attached under the original IOHIDResource. Four files have to
+        # agree about that: the driver, the probe that starts it, the builder that qualifies both and
+        # archives them into the one force-loaded set the kernel links, and the board arguments that
+        # arm it. Any one of them missing is a boot that silently does nothing -- which is exactly
+        # what a boot where it all works also looks like from the outside, so the wiring is checked
+        # here rather than inferred from a quiet ring.
+        hid_probe = REPO / "package/CloverHidInputProbe.cpp"
+        hid_driver = REPO / "drivers/NativeHidInput/NativeHidInput.cpp"
+        hid_audit = REPO / "scripts/build-clover-hid-input.py"
+        for path, why in ((hid_probe, "the probe that loads the families, waits for IOHIDResource and "
+                                      "publishes the classification the compositor filters on"),
+                          (hid_driver, "the owned IOHIDDevice subclass the probe allocates"),
+                          (hid_audit, "the qualification that reads IOHIDDevice's real 207-slot table "
+                                      "out of this board's kernel and refuses anything else")):
+            if not path.is_file():
+                errors.append(f"{path.relative_to(REPO)} is missing: {why}")
+        if hid_probe.is_file():
+            probe_text = hid_probe.read_text()
+            for needle in ('PE_parse_boot_argn("offline-hid-input", &enabled, sizeof enabled)',
+                           'PE_parse_boot_argn("offline-hid-home", &home, sizeof home)',
+                           'OSKextLoadKextWithIdentifier("com.apple.iokit.IOHIDFamily")',
+                           'IOService::serviceMatching("IOHIDResource")',
+                           'clover_hid_class_sizes[4] != 208',
+                           'extern "C" __attribute__((noinline)) void native_hid_live_checkpoint(IOService *device)',
+                           'volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;',
+                           'extern "C" void native_touch_set_sink(void (*sink)(void *), void *context)',
+                           'extern "C" void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context)',
+                           'if (native_legacy_transfer_calls < 2) { return false; }'):
+                if needle not in probe_text:
+                    errors.append(f"package/CloverHidInputProbe.cpp lacks {needle[:64]!r}: the device "
+                                  "would be started on the wrong condition, or the driver's own hooks "
+                                  "would be compiled C++-mangled and the archive would not link")
+            # The device must not report into a display that is not driven yet, and it must not go on
+            # pressing Home every second once it can: a bounded grant per tick, counted, and four
+            # capped print paths -- eleven lines is everything this instrument has to say.
+            if "clover_hid_presses" not in probe_text:
+                errors.append("package/CloverHidInputProbe.cpp does not count the Home presses it "
+                              "grants: an unbounded tick would keep the compositor busy for the rest "
+                              "of the boot and the frame could not tell a held device from a looping one")
+            if probe_text.count("if (printed++ < 8)") < 4:
+                errors.append("package/CloverHidInputProbe.cpp prints its per-second checkpoint "
+                              "without a cap on every path: the ring is shared with the storage "
+                              "stack, and eleven lines is the whole reading")
+            display_text = (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text()
+            if not (0 <= display_text.find("clover_hid_input_probe();")
+                    < display_text.find("IOService *display=pendingLegacyDisplay;")):
+                errors.append("package/CloverLegacyDisplayProbe.cpp does not arm the HID device at the "
+                              "top of the late entry: the framebuffer branch can return without ever "
+                              "reaching it, and then the round measures nothing")
+            if 'extern "C" void clover_hid_input_probe(void);' not in display_text:
+                errors.append("package/CloverLegacyDisplayProbe.cpp calls the HID probe without "
+                              "declaring it: the two objects are in one archive, and a name that "
+                              "differs by mangling links as a different symbol")
+            builder_text = (REPO / "scripts/build-clover-gop-legacy-display.py").read_text()
+            for needle in ("hid / 'NativeHidInput.late.o', hid / 'hid-original-bindings.o'",
+                           "kits/clover/CloverHidInputProbe.cpp",
+                           "ROOT / 'scripts/build-clover-hid-input.py'",
+                           "'NativeHidInput.late': hid / 'NativeHidInput.late.o'",
+                           "'_native_hid', '_native_touch'"):
+                if needle not in builder_text:
+                    errors.append(f"scripts/build-clover-gop-legacy-display.py lacks {needle[:56]!r}: "
+                                  "the HID objects would not be in the archive the kernel force-loads, "
+                                  "and an unresolved board symbol would only surface in the link")
+        for needle in ("require(VPTR == 0xfffffff005d045c0",
+                       "changed == [0, 1, 7, 12, 14, 21, 23, 76, 81, 82, 86, 87, 91, 92, 93, 101, 132, 140]",
+                       "static_assert(sizeof(IOHIDDevice)==0xd0",
+                       "owned == [0, 1, 7, 14, 86, 87, 111, 171, 173, 180]",
+                       "the constructor stores {stored:#x} but the vtable qualified here is"):
+            if not hid_audit.is_file() or needle not in hid_audit.read_text():
+                errors.append(f"scripts/build-clover-hid-input.py lacks {needle[:56]!r}: the subclass "
+                              "would be compiled against a claim nobody re-read from this board's own "
+                              "image, which is how a vtable slot ends up pointing at the wrong method")
+        for argument in ("offline-hid-input=1", "offline-hid-home=1"):
+            if argument not in board["payload"]["kernel_args"]:
+                errors.append(f"[payload] kernel_args has no {argument}: the instrument stays dark and "
+                              "the boot reads back the same silence round254 left")
 
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
@@ -2920,8 +3003,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r254:"):
-        errors.append('[payload] title is not "clover r249: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r255:"):
+        errors.append('[payload] title is not "clover r255: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3973,8 +4056,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r254:"):
-        errors.append('[payload] title is not "clover r249: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r255:"):
+        errors.append('[payload] title is not "clover r255: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
