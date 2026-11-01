@@ -19943,3 +19943,55 @@ backboardd 的门 → datamigrator → keybagd。如果 r265 的 `pth` 行里出
 下一跳由那一行自己点名。**boot 51 的环从 t=1186 起，512 行里没有 keybagd 的任何影子**
 （`grep -ic keybag` = 0），所以「keybagd 到底起没起」这件事现在仍然未知——
 r265 的债主普查正是为它准备的。
+## r265 读数（boot 52）：债主取了活儿没回，而它自己睡在五个 workloop 事件上——两把钥匙都在我这行读数里丢了
+
+冷刷 `round265-payload.img`（sha c21e81db…，内核 325b44f1…）跑 boot 52。16 条报告、64 行驱动判据、
+22 行 probe、512 行内核日志。
+
+**① 分岔落定：`rmc=0`。**那笔唯一在外的请求这靴长这样（pid 58 的 tid 0x35a，四拍同形）：
+
+```
+clover r262: th tid=35a st=41 cont=…725e2ac dl=0 m2=…d1 rcv=4803 remote=cf17 local=0 to=0
+             sz=4000 mc=0 sr=1 rmc=0 rsr=1 peer=141:com.apple.datam
+```
+
+`rmc=0` = **发过去那颗端口上已经没有消息了**——债主把请求取走了。按 r265 预写的两支，
+这一支是「它取走了活儿、没回」，所以问题在它的手上，不在队列里。`rsr=1` 是 backboardd 自己
+那条连接持有的发送权，**它回得来**，不是「回不了」。表头四拍全 `threads=15 shown=15 hidden=0
+wait=15 run=0 rx=10 tm=0`；组等待者（这靴 `tid=0x383 blk=100da4ef0 grp=100d77be0`）到 t=1801 照旧。
+（`peer=141`：pid 每靴会挪，上一靴是 140。`comm` 尾巴那个 `-` 是我表头里 `busy ? "busy" : "-"`
+的锁旗，不是名字的一部分——`clover r265: peer` 行没有分隔符，读数时别把它算进名字。）
+
+**② 债主自己的普查：8–10 条线程，全睡，`run=0`、`tm=0`、`rx=1`。**把 `cont=` 逐条落到**本靴**
+符号表（`nm -n` 对 unstripped noctf，`/tmp/kallsyms265.txt`；这三个偏移在 r264→r265 之间没挪，
+但每靴仍必须重查）：
+
+| 条数 | continuation | 睡在什么上 |
+| --- | --- | --- |
+| **5** | `_filt_wlwait_continue` | kqueue 的 **EVFILT_WORKLOOP** 请求等待（`wl_request`，等人 `wl_post`） |
+| 1 | `_semaphore_wait_continue` | mach 信号量（等人 `semaphore_signal`） |
+| 1 | `_ipc_mqueue_receive_continue`（`remote=0`） | 空等的收信者，就是表头那 `rx=1` |
+| 2 | `_workq_unpark_continue` | 空闲 libdispatch 工人 |
+
+**两条今晚立的假设在这一靴一起死**：`pth` 行里**没有任何一条持有发送权**（`rx=1` 的那条 `remote=0`），
+也就是说 datamigrator 这靴**没有在等别的进程给它回 mach_msg**——「门 → datamigrator → keybagd」
+这一支在钥匙袋那一格前就断了；同理 `peer=58:backboardd` 也没出现，「互相等待的闭环」也不成立。
+它睡的是**内核里的事件**（五把 workloop note + 一把信号量），不是端口。
+
+**③ 我把自己刚拿到的答案又扔掉了：`pth` 行没有 `we=`。**`_filt_wlwait_continue` 与
+`_semaphore_wait_continue` 的等待对象**不是端口**，它们在行里唯一的身份就是 `thread->wait_event`
+（workloop 是 note/klist 的地址，信号量是端口或 wait queue 的地址）。我照 r264 搬字段时
+把 `we=` 省了（r264 那行有 `we=`，我新版对端行没有），于是**五条线程睡的是同一把 note 还是五把，
+现在读不出来**——而这正是「谁该 `wl_post`」的分岔。这是本项目第 N 次同一类错的**新变体**：
+不是读错字段，而是**换了等待对象的种类却没换身份字段**。r265 的注释里写着「字段沿用 r264 的字面」,
+但 r264 那批字面是为端口等待设计的。
+
+**④ 由此定 r266（还是不加新仪器，只补我丢掉的两格）**：
+(a) `pth` 行补 `we=` 与 `pc=`——非端口等待只有 `we=` 能分组；
+(b) 对债主那两条**有身份的**睡线程各抓一次用户栈（`_filt_wlwait_continue` 一条、
+    `_semaphore_wait_continue` 一条，用 r236 已有的 walker，前缀 `clover r266: pustk`），
+    栈落到 `libdispatch`/`libsystem_kernel` 的 `wl_request` 还是 DataMigration 自己的
+    `DMWaitForExecutePluginsSignal`/`pluginSignpost` 那一侧，就把「谁该 post」变成一句话。
+宿主这一侧同时留一条待查：镜像里 `DMWatchdogPluginsAfterTimeout`、`DMImposePluginArtificialHang`、
+`DMWaitForExecutePluginsSignal` 这些名字说明**插件执行本身就靠这些等待**——
+若 (b) 落在它们身上，桌面这一格的病根是「迁移插件从没跑起来」，跟 GPU 无关。
