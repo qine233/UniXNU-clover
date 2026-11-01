@@ -19317,3 +19317,31 @@ base=16f01bb4c b=1 g=27d22ec0 cnt=0 wait=1`，栈地址 0x16f…）。两件事�
 r258 因此不做新论断，只做一件事：把这条线程真正卡住的那个地址的**前 8 个字原样打出来**，并把 r238
 已经抓到的 ulock（`a=20527f68c w=1 b=1 k=1 s=1 wr=0 sw=0 op=1000002 st=428 age=1303 cw=ffffffff`）
 的**持有者线程**读出来。先确认对象是什么，再谈谁欠它一次 leave。
+
+## r258 落地与读数（boot 46）：形状对齐 sheng，前进一层，死等不变
+
+先记流程（两路并行读 sheng，`file:line` 在流水与 README 里）：sheng 的内核时间线是 `bsd_init` →
+`sheng_pmgr_run()`（`sheng-platform-power.patch:8-11`，在 `bsd_bufferinit` 之后）→ `vfsinit()` 加载
+IOMobileGraphicsFamily 并**第一次** `native_legacy_display_probe()`（`offline-legacy-phase=4` 下只 init、
+停在 `LegacyDisplayProbe.cpp:471-476` 等 `bsd_autoconf` 发布 IOBSD 资源）→ `vfs_mountroot` →
+`bsd_autoconf()` 的 `IOKitBSDInit()` 之后进 late 扇出：keystore→cpufreq→gpu→touch→wifi→adsp→battery→
+audio→buttons→backlight→dpu→**HID 最后**（`LegacyDisplayProbe.cpp:493-505`）→ framebuffer nub
+attach/start → 才 spawn launchd；Home 也门控在 `native_legacy_transfer_calls<2`（`HidInputProbe.cpp:37`）。
+**结论：顺序不是差异**，我们三点都已一致（HID 在屏前、launchd 前、Home 门控在两帧之后）。
+
+比完剩下两条「它有我们没有」，本轮一次改完（都在 payload 侧，内核不动）：
+`sheng-touch-hid=1`（设备形状：`NativeHidInput.cpp:291/296` 靠它把 digitizer collection 拼进
+descriptor，并在**设备身上**设 `Built-In`/`DisplayIntegrated`/`DigitizerCollectionDispatch`）与
+`kern.maxvnodes=66560`（sheng 记到的桌面最后一道坎是 vnode jetsam，这套内核 `CONFIG_VNODES=1024`，
+`make-sheng-adt.py:176-179`）。ADT 14344→14384。checker 同步钉住这三件事，镜像里
+`DigitizerCollectionDispatch`/`kern.maxvnodes` 两个属性名 verified present。
+
+boot 46：`deviceBuiltIn=1 published=1 seen=1 sinks=1,1 transfer=7`——形状真的成了（触摸 sink 也被装了，
+boot 45 是 `sinks=0,1`）。缺席表 `188/26 → 244/28`，**消失的名字为 0**，新增两个：`MaxHoverHeight`、
+`NeedsHostState`——数字化仪 collection 第一次被 hidd 分类到底才会问的键。也就是说 HID 这条路又往前走了
+一层，没有任何回退。`Manufacturer` 仍在（sheng 也不设，判为无关）。死等两处照旧：堆上 `b=fffffffd
+cnt=1 wait=1`、栈上 `b=1 g=530ad010 wait=1`。
+
+下一步分岔按代价排：① **发一帧真实的触摸报告**（sheng 的设备会报，我们的 `native_touch_*` 是空的——
+这是「它有我们没有」里还剩的最后一条形状差异，且不需要新仪器）；② 给堆上那个组做 r239 那套取证；
+③ `kern.maxvnodes` 的效果本轮读不出（它针对 jetsam 而非这个 wait），下一帧看 SpringBoard 存活即可判断。
