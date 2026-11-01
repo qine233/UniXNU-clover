@@ -19009,3 +19009,46 @@ SPU 形状驱动；③ 那个未解的第二个混淆键（`0x207203994` 的 imp
 结论：boot 41（r253）只验一件事——`/buttons` 有了 child 之后，census 的 `svc` 点名里会不会出现
 `AppleM68Buttons`（它名字里就有 `utton`，r245 的点名器会自动抓到）、`button-family=` 会不会变大、
 以及 backboardd 的 `bbgrp` 是否还 `wait=1`。不改值、不加新键。
+
+## r252 读数（boot 40）：153 条「问了但没有」，其中没有一条在按键路上
+
+`round252-log-window.bin`：boot 40，census 照旧整批到 `census done nodes=9`，r252 那台仪器第一次
+完整跑通：
+
+```
+[ 1519.143741]: clover r252: asks path=9 key=6 notes=15 whos=5
+[ 1519.188992]: who pid=143 comm=audiomxd   path=1 key=0
+               who pid=58  comm=backboardd  path=3 key=3
+               who pid=26  comm=SpringBoard path=2 key=1
+               who pid=178 comm=PreBoard    path=1 key=1
+               who pid=265 comm=SpringBoard path=2 key=1
+row 1/15..15/15  t=431..807，真时间序；内容与 boot 39 一字不差
+[ 1520.116010]: clover r252: misses total=153 shown=16
+miss 1/16 t=806 key  pid=265 SpringBoard missing=product-id
+miss 2/16 t=807 path pid=265 SpringBoard missing=IODeviceTree:/product/camera
+miss 3/16 t=810 key  pid=265 SpringBoard missing=platform-name
+miss 4..7/16        SpringBoard missing=soc-generation
+    CloverSdhci r195: r252-mgq probe lines capped at 64, later ones stay out of the kernel ring
+```
+
+三点结论：
+
+1. **缺席记录器有效，而且本板缺得多**：153 条。前 16 条全是 SpringBoard 在问 SoC/产品身份
+   （`product-id`、`platform-name`、`soc-generation`、`/product/camera`）——这些是真 ADT 里有、
+   我们的 `make-clover-adt.py` 没写的字段，但**没有一条在按键/触觉路上**。
+   按 r252 写死的三分岔，落点是第二支：缺口不在 `button` 那一族，
+   下一步的方向由宿主那条 `_BRController ready` 的触发源决定，不是由 ADT 决定。
+2. **`home-button-type` 侧一切复现**：backboardd 依旧 `path=3 key=3`、val=2、`function-button_halleffect`
+   依旧缺席。仪器修好之后，读数不是「这次不一样」，是「和 boot 39 完全一样」——这正是
+   一台仪器该有的样子。
+3. **它又撞了自己的上限**：64 行的类预算被吃掉（`capped at 64`），`row 12/15` 那行也被截断。
+   原因算得出来：前 16 条 miss 与前面 24 条 row 都会**当场出声**，census 又把 1+5+15+1+16
+   整批发一遍，合计约 78 行 > 64。这是 r249/r251 那类「仪器自己丢读数」的第三次复发，
+   修法下次一起做：live 打印只留 miss（它才是新信息），row 交给 census 那一批，
+   并把 `r252-mgq` 的预算提到 128。
+
+对照组的硬事实放在这，免得下一轮去动值：`UniXNU-sheng/scripts/make-sheng-adt.py:186` 同样
+`home-button-type = 2`，而它跑到桌面；它的 `[components] include` 里有 **`ShengHidInput`**，
+本板 roots 里既没有 HID 输入提供者、也（直到 r253 之前）没有 `AppleM68Buttons`。
+所以 r253 = 把那行 root 加上，boot 41 只验一件事：**`svc` 点名里会不会出现 `AppleM68Buttons`、
+`button-family=` 会不会变大、backboardd 的 `bbgrp` 还等不等**。不改值。

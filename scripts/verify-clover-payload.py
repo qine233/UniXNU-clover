@@ -902,6 +902,23 @@ def check_card_recover(kernel: bytes) -> bool:
     return ok
 
 
+def _m68_personality(kernel: bytes) -> bool:
+    """True when the shipped prelink carries AppleM68Buttons' own personality dict.
+
+    A window is taken around each occurrence of the bundle identifier because the plist is stored
+    as one blob: the identifier, IONameMatch=buttons and IOProviderClass=IOPlatformDevice are
+    kilobytes apart, not adjacent, and the first probe of this contract got that wrong and read a
+    linked-in kext as a stripped personality."""
+    needle = b"com.apple.driver.AppleM68Buttons"
+    window = 4096
+    at = kernel.find(needle)
+    while at != -1:
+        chunk = kernel[max(0, at - window):at + window]
+        if (b"IOKitPersonalities" in chunk and b"IONameMatch" in chunk
+                and b"IOProviderClass" in chunk and b"IOPlatformDevice" in chunk):
+            return True
+        at = kernel.find(needle, at + 1)
+    return False
 def check_sb_sample(kernel: bytes) -> bool:
     """Round217 samples the living process instead of reading the corpse. The image has to carry
     the try-locked walk and the sampler line: r216's frame showed the kill-time walk waiting 39 s
@@ -987,6 +1004,12 @@ def check_sb_sample(kernel: bytes) -> bool:
              # have a child on the board.
              "m68-class": (b"AppleM68Buttons") in kernel,
              "m68-name": (b"function-button_%s") in kernel,
+             # Presence of the class name is not the contract: a kext can be linked in and still
+             # never match anything, which is precisely what has been true of /buttons for sixteen
+             # rounds. The personality has to be in the shipped prelink info, with its IONameMatch
+             # and its IOProviderClass, because that dict is the only reason IOPlatformExpert would
+             # attach the driver to the node we publish.
+             "m68-personality": _m68_personality(kernel),
              "mgq-miss": (b"clover r252: misses total=%u shown=%u\n") in kernel,
              "mgq-missrow": (b"clover r252: miss %u/%u %s\n") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
