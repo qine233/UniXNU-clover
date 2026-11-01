@@ -19524,3 +19524,60 @@ r262 就答这一刀：不再只报 `TH_WAIT` 的线程，而是每拍把 pid 58
 (tid, state, pc, lr, 内核栈前几帧, 睡在哪个字) 一起报出去——形状照 sheng 的
 `BootUiTraceProbe`（跨任务用原生 XNU VM API 读、热线程按上下文切换率与运行时间称出、
 `peer` 指明等谁）。哪个线程本该跑那笔 leave、它此刻睡在哪，一读数就能分岔。
+
+## r262 读数（boot 49）：一次看清全部线程，两条分支当场死了一条
+
+五条普查（t=1276 / 1401 / 1545 / 1665 / 1786，另有 t=1350 之类被 beat 夹着的行），
+每拍一条表头加十四行。第一手形状：
+
+```
+clover r262: census t=1786 pid=58 threads=15 shown=14 wait=15 run=0
+clover r262: th tid=3b4  st=41 we=fffffff376dad0a0 cont=fffffff00773ec48 pc=1db6f2bdc
+clover r262: th tid=159  st=1  we=0 cont=fffffff00725e2ac pc=1db6ecb58        （×10 个线程同形状）
+clover r262: th tid=12d9 st=1  we=fffffff291490548 cont=fffffff0076bd128 pc=1db6ec8e8 （×6）
+```
+
+把三个 continuation 对着**本轮内核自己**的符号表解（r231 注释里说好的读法）：
+
+| cont | 符号 | 意思 |
+| --- | --- | --- |
+| `0xfffffff00725e2ac` | `_ipc_mqueue_receive_continue` | 在自己的端口上等消息 |
+| `0xfffffff00773ec48` | `_ulock_wait_continue` | 用户态锁等待——就是那只组 |
+| `0xfffffff0076bd128` | `_workq_unpark_continue` | dispatch 工作线程池，停在那里等活 |
+
+**① 「压在触摸传输上」这条分支当场死了。** pid 58 的十五个线程里，没有任何一个睡在 IOKit、
+驱动或总线路径上；睡的地方只有三类：端口收消息、用户态锁、工作线程池等活。r261 留下的两条分支
+（等渲染完成 vs 等自家一条被卡的队列）里，后一条现在要说清楚：它**不是**被内核调用卡住——
+六个 `workq` 工作者全部停泊在 `_workq_unpark_continue`，也就是说**有闲着的工人**，
+缺的不是可跑的线程，是那笔根本没被排进来的活儿。
+
+**② 组还是那只组，一分没动。** `a=101985a54`（= `grp=101985a20` +0x34）
+`w=1 b=1 k=0 s=0 op=1000001 wr=0 cw=0 age=822→1087`，`bbgrp` 同拍 `b=fffffffd cnt=1 wait=1 notif=0`。
+和 boot 48 逐字段同形（那一靴是 `15bd8e6d4`，t≈461 起）。
+
+**③ 顺手钉一个差点读错的地方。** r238 那行的 `w/b/k/s` 是**累计**计数
+（waits / blocked / woken / wakes，`zzzz…r238.patch` 的 struct 就写着），
+不是「此刻有几个线程在等」。boot 49 里 `a=2047ad580` 那行 `w=14 b=14 k=14 s=15`
+如果按字面读成「十四个线程挤在一把锁上」，就会把一把**热而无争**的缓存内全局锁
+当成第二个死锁。这一类「同一个字母在不同仪器里意思不同」的坑，只有回到补丁本身能拦住。
+
+**④ 本轮仪器自己的两处不足，写在读数旁边而不是藏在下一轮。**
+cap 撞上了：`threads=17 shown=14`（第一拍）与 `15/14`——每拍都有线程没报出去，
+下一版要么把上限抬到 20 以上，要么把 `hidden=` 明确报出来。
+以及 `ipc_mqueue_receive_continue` 这一类**不能**区分「空闲等活」和「在等一个永远不来的回音」——
+两者在 `cont` 这一层完全同形。分岔只剩这一格，而 sheng 早就有对着它的仪器：
+`BootUiTraceProbe.c` 的每线程行带 `event / trap / args[3]` 与 `peer`（它在和谁说话）。
+
+**⑤ 这一靴还看到 SpringBoard 换了活法。** `clover r217: sbs t=1250 pid=272 n=3…` 里
+`b25:65:fffffff376dac7a0:fffffff00773ec48:1db6f2bdc` —— 一个新起的 SpringBoard 实例
+（boot 48 那靴是 pid 27 被反复 SIGKILL）也有一条线程睡在**同一种** ulock 上；
+本窗口内 0 条 `killsig`。也就是说窗口末段看到的是「SpringBoard 活着并且一起卡着」，
+不是被杀。
+
+## r263 由此定：把每个等待者「在和谁说话」报出来
+
+1. 普查行加 `dl=`（`thread->block_deadline`）：**0 = 无限等（空闲等活）**，
+   有限 = 定时等（等回音就是这种）。一条字段把上面第 ④ 点的两类分开，不需要新仪器。
+2. 对端口收信的线程，把 `wait_event` 走到 port，再走 r232/r234 已有的
+   「entry → owner 名字」那条路，报出**它在等哪个服务**；这就是 sheng 的 `peer`。
+3. 上限抬到 20 并把没报出的数量写进表头。

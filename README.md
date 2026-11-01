@@ -216,13 +216,26 @@ backboardd 自己发起、睡在组基址 +0x34、`wr=0 cw=0` age=877。所以�
 缺口改成一句可测的问题：**该 leave 的那笔完成来自哪里**——渲染侧（GPU/Metal，sheng 有整套
 `Adreno740`/`AdrenoMetal`，本板 `gpu=planned`）还是 backboardd 自家另一条卡住的队列。
 r262 = 照 sheng `BootUiTraceProbe` 的形状，每拍报出 pid 58 全部线程的
-(tid, state, pc, lr, 内核栈, 睡在哪个字) 与等待对象，一次读数分岔这两条分支。|
+(tid, state, pc, lr, 内核栈, 睡在哪个字) 与等待对象，一次读数分岔这两条分支。
+**boot 49（r262 实机）答了干脆的一半**：普查每拍报出 pid 58 的十五个线程，三个 continuation 对着
+本轮内核的符号表解出来 —— `_ipc_mqueue_receive_continue`（十个，端口收消息）、
+`_ulock_wait_continue`（tid 0x3b4，睡在 `101985a54` = 组基址 +0x34，`wr=0 cw=0` age 822→1087）、
+`_workq_unpark_continue`（六个 dispatch 工作者停泊等活）。**「压在内核调用/触摸传输上」这条当场死了**：
+pid 58 没有一个线程睡在 IOKit 或驱动路径上，而且有六个空闲工人在等活——缺的不是可跑的线程，
+是那笔根本没被排进来的活儿。顺带钉住一处差点读错的地方：r238 的 `w/b/k/s` 是**累计**计数
+（补丁 struct 里是 waits/blocked/woken/wakes），`a=2047ad580` 的 `w=14 b=14 k=14 s=15`
+是一把热而无争的缓存内全局锁，不是十四个线程挤在同一把锁上。仪器自己的两处不足也写进读数旁边：
+cap 每拍撞上（`threads=17 shown=14`），而 `_ipc_mqueue_receive_continue` 分不清「空闲等活」与
+「在等一个永远不来的回音」——同形。r263 照 sheng 补这两处：普查行加 `dl=`
+（`block_deadline`：0=无限等、有限=定时等，等回音是定时等），把 `wait_event` 走到 port 再走
+r232/r234 的 owner 名字路报出「它在等哪个服务」（sheng 的 `peer`），上限抬到 20 并打印 `hidden=`。
+同一靴 SpringBoard 换了活法：`sbs t=1250 pid=272` 里也有一条线程睡在同一种 ulock 上，窗口内 0 条 `killsig`。|
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 3），再问地址  r259 不等轨先把地址再问一遍（`clover-input=3` 回膛），理由是同一趟正在发合成手指，需要知道总线上到底有没有真坐标 || 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨  **boot 47 的教训不是「面板没答」，是「答案回不来」**：仪器跑了，42 行说在 t≈12 s，而环这次从 t=1194.04 起——r260 不再插第二次心跳，改抄 sheng 的机制：`drivers/CloverInput/CloverInput.cpp:241` 的 `clover_input_observation[16]`（自 r181 就为「不依赖日志环」而存在）由 beat 每拍重述成一条 `clover r260: bus mode=.. … verdict=..`，总线仍一靴只碰一次；sheng 的驱动根本不 print（`TouchProbe.cpp:29` 的行数组 + `BootLog.c:340-356` 每 2 秒 compose），所以它的早期读数活得下来，因为那是状态。`mode=0` 也打印——没跑过必须说出来。 **boot 48（r260 实机）把答案带回来了，而且每拍都有**：
 `bus mode=3 … xfers=4 timeout=0 nack=4 verdict=102` 与 r183 一字不差——电气与协议栈都活着，
 两个候选地址全 NACK。触摸这一格从「问不到」变成「已知不应答」，下一格在电源轨（3），不在 I2C 层。|
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |
 | 5 | watchdogd 每次起就崩 | 自身可执行文件里 `brk #1`（`IOWatchdog` 服务在板上不存在）。r193 的 `panic_on_crash_disabled=1` 已把它从「致命」摘掉，所以它只是噪声 | 写一个最小 `IOWatchdog` 服务，或让 plist 不再要求它 |
-| 6 | **GPU/Metal 一个都没有**（Adreno 512 无驱动、无固件、无 renderer） | `porting.toml` 的 `gpu` 区 `status = "planned"`、`limits = ["No GPU driver, firmware or renderer is present."]`；r261 的取证把 boot 48 那只死等的组的等待线程解进 `libVFXCore.dylib`/`VisualLogger.framework`（渲染/特效侧的框架），而 sheng 到桌面靠的正是它 `gpu` 区那一整套 Adreno 组件（`Adreno740`+`AdrenoMetal`+`AirNir`+`AdrenoPM4`+`AdrenoFirmware`+`ArmSmmu4K`；「空闲桌面每 250 ms 提交 6 个命令缓冲」「render server 预热 162 个 Metal 库」） | 先分岔，别急着写驱动（r262）：等的是渲染完成（GPU 区），还是 backboardd 自家另一条卡住的队列。若落在 GPU，按它自己 `next_action` 那句先评 Adreno 512 能复用 sheng 的哪几块 |
+| 6 | **GPU/Metal 一个都没有**（Adreno 512 无驱动、无固件、无 renderer） | `porting.toml` 的 `gpu` 区 `status = "planned"`、`limits = ["No GPU driver, firmware or renderer is present."]`；r261 的取证把 boot 48 那只死等的组的等待线程解进 `libVFXCore.dylib`/`VisualLogger.framework`（渲染/特效侧的框架），而 sheng 到桌面靠的正是它 `gpu` 区那一整套 Adreno 组件（`Adreno740`+`AdrenoMetal`+`AirNir`+`AdrenoPM4`+`AdrenoFirmware`+`ArmSmmu4K`；「空闲桌面每 250 ms 提交 6 个命令缓冲」「render server 预热 162 个 Metal 库」） | 先分岔，别急着写驱动（r262）：等的是渲染完成（GPU 区），还是 backboardd 自家另一条卡住的队列。若落在 GPU，按它自己 `next_action` 那句先评 Adreno 512 能复用 sheng 的哪几块 **r262 的普查把这一格推进了一步但没有关掉**：pid 58 没有线程睡在内核/驱动路径上（所以「等一个内核侧完成」不成立），六个空闲 `workq` 工人在等活（所以「没有线程可跑那笔 leave」也不成立），剩下的形状是「那笔活儿从来没被排进来」——而它的来源要么是渲染侧的完成通知（本板没有 GPU/Metal 可用），要么是等一个永远不来的回音；`_ipc_mqueue_receive_continue` 这一层还分不清这两者，r263 的 `dl=` + port owner 就是为分辨它们而加的 |
 
 1 挡住桌面；6 是 r261 之后 1 最可能的病根（还没证，r262 就是证它）；2–4 是之后要补的板级驱动，5 只是噪声。
 
