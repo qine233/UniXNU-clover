@@ -18880,3 +18880,53 @@ miss/missrow` 全 present，反向对照 `round251-payload.img` 报六项全 ABS
 对字符串边界是瞎的，而这一条恰好只有编译器看得见。
 
 boot 40 = 这份镜像，判决只看 `clover r252: misses total=… shown=…` 与它下面那串 `miss i/n`。
+
+## 宿主新证据（boot 40 还在跑）：`/buttons` 十六轮以来**根本没有驱动挂在上面**
+
+从 `~/clover-out/dyld-cache` 的字符串反查 `function-button_halleffect` 的来历，结果落到了
+内核里。iPadOS 17.7.11 的 `kernelcache.decompressed` 里，`AppleM68Buttons` 的字符串表是：
+
+```
+... volup voldown ringerab ringeren halleffect halleffect1 halleffect2 skey help helpdouble app ...
+home-button-type  function-button_%s  function-wake_button_%s  use-button-type-keychords
+button-names  button-delay_%s  button-debounce-on_%s  press-count-usage-pairs  panic-usage ...
+"AppleM68Buttons::handleStart failed to instantiate %s"
+```
+
+也就是说 `function-button_halleffect` 这个名字是 **`function-button_` + 按钮名**拼出来的，
+而按钮名来自 ADT 的 `button-names`。背板里那批名字（`ringerab`/`hall effect`/`helpdouble`…）
+全是这个驱动的词表。**问这个键的是 Apple 自己的按钮驱动，不是 MG。**
+
+然后是决定性的一条。stock kernelcache 的 `__PRELINK_INFO` 里，这个 kext 的人设是：
+
+```
+CFBundleIdentifier   = com.apple.driver.AppleM68Buttons
+IOKitPersonalities.AppleM68Buttons:
+  IOClass        = AppleM68Buttons
+  IONameMatch    = buttons
+  IOProviderClass = IOPlatformDevice
+OSBundleLibraries  = kpi.{bsd,libkern,mach,iokit,unsupported,private}
+                     + com.apple.iokit.IOHIDFamily
+                     + com.apple.driver.AppleARMPlatform
+```
+
+对照 `board.toml` 的 `[kernel.prelink] roots`（31 项）：**`com.apple.driver.AppleM68Buttons`
+不在里面**，而且它声明的两个非 KPI 依赖 `IOHIDFamily` 与 `AppleARMPlatform` **都已经在**根列表里
+（r220/r183 那两轮为显示与电源接进来的）。`grep -c AppleM68Buttons` 在本板 `kernel.macho` 里是
+**0**，在 stock kernelcache 里是 4 处（bundle id、类名、文件名、personality）。
+
+于是这一路解释得通所有已测事实：
+
+- 我们十六轮前就开始发布 `/J120AP/buttons`，census 也看见它了（`node /J120AP/buttons`、
+  `path buttons=buttons`），但**没有任何驱动 match 它**——`IONameMatch=bons` 的那个类不在内核里。
+- boot 39 实测 backboardd 自己问 `home-button-type` 拿到 2 却仍死等：MG 那条路是**用户态直接读
+  ADT**，读得到；而真正该把按键/触觉控制器拉起来、并在 ready 时补那一次
+  `dispatch_group_leave`（`0x100030ca8`）的，是这个缺失的驱动。
+- `svc total=123 stopped=0 button-family=2` 里那两条 `svc buttons` / `svc IOHIDResource`：
+  `buttons` 正是 `IOPlatformDevice` 那条 nub——personality 的 **provider 已经在了，缺的是 child**。
+
+**r253 因此是一行配置，不是新代码**：把 `com.apple.driver.AppleM68Buttons` 加进
+`[kernel.prelink] roots`，让 Apple 自己的驱动去 match 我们自己发布的 `/buttons`。要盯的下游两件事：
+① 它 `handleStart` 需要 `button-names` 才谈得上实例化任何按键（缺席时最坏是「一个都不建」，
+不会比现在更空）；② 它一 fail 就打印那几条 `handleStart failed to …`，本板的 tee 抓
+`clover r253:` 之外也要照常把内核日志带上卡——那些行直接告我们它读到了什么。
