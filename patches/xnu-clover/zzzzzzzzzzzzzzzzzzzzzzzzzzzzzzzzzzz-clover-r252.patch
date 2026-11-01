@@ -64,7 +64,7 @@ diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
  static uint32_t         clover_mg_notes;
  static uint64_t         clover_mg_path_asks;
  static uint64_t         clover_mg_key_asks;
-@@ -3722,10 +3741,50 @@ clover_mg_tally(int pid, const char *name, bool path)
+@@ -3722,10 +3741,49 @@ clover_mg_tally(int pid, const char *name, bool path)
  	} else {
  		entry->keys++;
  	}
@@ -104,8 +104,7 @@ diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
 +	snprintf(row, CLOVER_MG_LINE, "t=%llu %s pid=%d comm=%.20s missing=%.48s",
 +	    (unsigned long long) (ns / 1000000000ULL), kind, pid, asker->name, what);
 +	if (clover_mg_miss_notes < CLOVER_MG_MISSES) {
-+		printf("clover r252: %s
-+", row);
++		printf("clover r252: %s\n", row);
 +	}
 +	clover_mg_miss_notes++;
 +}
@@ -115,7 +114,7 @@ diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
  {
  	char        *row;
  	uint64_t     ns = 0;
-@@ -3752,11 +3811,11 @@ clover_mg_note(const char *kind, const char *what, unsigned int length, unsigned
+@@ -3752,11 +3810,11 @@ clover_mg_note(const char *kind, const char *what, unsigned int length, unsigned
  	if (clover_mg_notes < CLOVER_MG_ROWS) {
  		// Also said out loud while there is still room in the ring, so the kernel log's own
  		// stamp can place the question in the boot's timeline; past the ring the dump is
@@ -128,7 +127,7 @@ diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
  	if (who != NULL) {
  		who->release();
  	}
-@@ -3765,32 +3824,45 @@ clover_mg_note(const char *kind, const char *what, unsigned int length, unsigned
+@@ -3765,32 +3823,45 @@ clover_mg_note(const char *kind, const char *what, unsigned int length, unsigned
  extern "C" void
  clover_mg_dump(void)
  {
@@ -178,7 +177,7 @@ diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
  
  /* The answer in the two numbers the question turns on: how many bytes, and what they say when
   * they are a value at all. 0xffffffff means "answered, and it is not a number to read". */
-@@ -3869,10 +3941,12 @@ IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
+@@ -3869,10 +3940,12 @@ IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
  
  	obj = IOCopyPropertyCompatibleReal(regEntry, name);
  	if (clover_mg_interesting(name)) {

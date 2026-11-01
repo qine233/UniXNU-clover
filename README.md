@@ -110,6 +110,17 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
   把整个环再发一遍（走的正是 r249 那条豁免）。判决也写下：有 `row … comm=…` 就在「答案被读错」
   那条路上；只有 `no user client ever named a button path or key` 就说明 MG 的 home 键身份根本不
   来自注册表，ADT、平面、census 这条线整个作废，改走 sheng 的 HID home 提供者。
+* boot 39（r251 实机，24 行时间序环 + 每进程计数）把最后一层窗户纸捅破了：
+  `who pid=58 comm=backboardd path=3 key=3`——**backboardd 自己问了三次，两次把 `home-button-type`
+  读回 `2`**。所以「用户态拿到的不是 2」这条从 r240 吊到现在的假设正式作废：`applyDefinitions:`
+  的 `cmp x22,#2` 在 `==2` 一侧只打一行日志就返回，真正的无限 `dispatch_group_wait` 在
+  `_configureAsync/SyncWithBlock:`，那两处一次都不问这个键；死等缺的是唯一的
+  `dispatch_group_leave`（`0x100030ca8`，紧挨 `_BRController ready: device haptic asset slot count`）。
+  同一帧还捞到计划外的东西：`function-button_halleffect` 回来 `len=0 val=0`——这块板子第一次
+  「被问了一件没有的事」，而它能被看见纯属名字里正好有 `utton`。r252 因此把缺席单独记成一类读数：
+  不按名字过滤，改按「谁在问」过滤（只记已经进过 button 计数表的那几个进程），16 行环加总数，
+  同批豁免发出。下一轮干什么，直接由 `miss` 列表决定，不再猜。
+
 * boot 38（r250 实机）第一次答了「问没问」：`asks path=9 key=6 notes=15`，SpringBoard 与 PreBoard
   都把 `IODeviceTree:/buttons` 解析成功、把 `home-button-type` 读回 `len=4 val=2`。于是「ADT 缺节点」
   「平面名字取错」「用户态压根没问」三条线一起结掉——值是对的，也被真的读走了。可这台仪器又犯了

@@ -1720,6 +1720,13 @@ def check_board(errors: list) -> str:
             if 'printf("clover r251: ' in r252_added:
                 errors.append(f"{r252_patch.name} still prints under the r251 prefix, which no "
                               "longer matches the tee class the burst is accounted to")
+            # An inserted source line whose \n was eaten by the script that wrote it turns the
+            # format string into a real newline inside a literal -- which clang reports as a cascade
+            # of nine errors that all point somewhere else. Pin the literal, not the count.
+            if r252_added.count('printf("clover r252: %s\\n", row);') != 2:
+                errors.append(f"{r252_patch.name} does not carry two intact "
+                              "'printf(\"clover r252: %s\\\\n\", row);' literals: a format string "
+                              "broken by a real newline compiles as a wall of unrelated errors")
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
