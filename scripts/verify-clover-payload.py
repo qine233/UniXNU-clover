@@ -974,6 +974,12 @@ def check_sb_sample(kernel: bytes) -> bool:
              "census-model": (b"clover r243: model=%.16s\n") in kernel,
              "census-svc": (b"clover r243: svc total=%d stopped=%d button-family=%d\n") in kernel,
              "census-plane": (b"clover r243: plane byname=%s buttons byname=%s\n") in kernel,
+             # Round250. The census proves the kernel published the right answer; these two prove the
+             # image can say whether userland ever asked for it. Both branches have to be in the
+             # binary: the row that names a caller, and the verdict that no caller existed.
+             "mgq-asks": (b"clover r250: asks path=%llu key=%llu notes=%u\n") in kernel,
+             "mgq-none": (b"clover r250: no user client ever named a button path or key\n") in kernel,
+             "mgq-row": (b"clover r250: row %u %s\n") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
                            b"dropped=%u comms=%u\n") in kernel,
              "tee-sync": (b"CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n") in kernel}

@@ -18535,3 +18535,90 @@ census 与整集合行属于同一类读数，它们的**缺席不能与「什�
 
 顺带把这轮的标题里放了一对真正的双引号（`"census done"`），这样清单转义不是只在宿主上被测过，
 而是每轮都真的随镜像上板。
+
+## r249 读数（boot 37）：census 第一次从头跑到尾，而它给出的每个答案都是对的
+
+`round249-log-window.bin`：boot 37，panic-20 落点、死线 1800 s 到点、一次 `dd` 全读回。
+census 那一批 22 行**一行不少**（r248 之前被吃掉的后半截这次全在）：
+
+```
+[ 1503.803189]: clover r243: census t=1503
+[ 1503.803215..803292]: node /J120AP … cpus psci defaults buttons product arm-io      (8 行)
+[ 1506.415975]: clover r243: node /J120AP/options        ← 离上一行 2.6 s
+[ 1506.518213]: clover r243: path buttons=buttons
+[ 1506.569509]: clover r243: hbt len=4 u32=2
+[ 1506.619958]: clover r243: plane byname=ok buttons byname=present
+[ 1506.673427]: clover r243: hbt byname len=4 u32=2
+[ 1506.723332]: clover r243: path product=present
+[ 1506.772530]: clover r243: path chosen=present
+[ 1506.821274]: clover r243: scale=data
+[ 1506.869249]: clover r243: target=J120
+[ 1506.917239]: clover r243: model=iPad7,1
+[ 1506.965761]: clover r243: svc buttons
+[ 1507.116545]: clover r243: svc IOHIDResource
+[ 1507.165645]: clover r243: svc total=123 stopped=0 button-family=2
+[ 1507.216209]: clover r243: census done nodes=9
+```
+
+r249 写下的三分岔，落点是第一支：`census done` 在卡上，census 从头到尾跑完过。推送上限这条线
+到此结掉——r249 的豁免生效，22 行 burst 一次过。
+
+**r246 预写的两条判决分支，这次全被否掉：**
+
+- 「平面名字取错、`getPlane` 返回空」——`plane byname=ok`，而且用 `IORegistryEntry::fromPath`
+  走用户态那条一模一样的按名路由，`buttons byname=present`，`hbt byname len=4 u32=2`。
+  内核拿到的值、和用户态用同一条路能拿到的值，是同一个 `2`。
+- 「板上没有按键/HID 服务的提供者」——`svc total=123 stopped=0 button-family=2`，
+  点名叫到 `svc buttons` 与 `svc IOHIDResource`，没有一个服务处于 stopped。
+
+于是这台板子的**发布侧**没有毛病：ADT 有 `/buttons`、`home-button-type` 是 4 字节 `2`、
+平面按名可达、服务在、根 `model=iPad7,1`、`target=J120`、`scale=data`。backboardd 还在等它的
+controller-ready。r245 预写的第三支（「服务在，问题在 MG 的取值/闸门」）是唯一还活着的分支，
+但它内部仍然是两件事，而 boot 37 没法把它分开：
+
+1. 用户态问了，答案被读成别的数（CFData/CFNumber 判定、sysctl 闸门、缓存槽）；
+2. **用户态根本没问过**——MG 的 `homeButtonType` 从别处取值，那 ADT、平面、census 全是旁边的事。
+
+**下一轮唯一该做的事，就是把「问没问」这一问钉死。** census 答的是内核发布了什么；
+没有人答过注册表被问过什么。顺带记下 `node /options` 前那 2.6 s 的空档：全平面遍历第一次
+真的把注册锁压出了形状，读数本身没受影响，但 r250 的仪器不能再挂在同一把锁的临界区里。
+
+## r250 设计：在用户客户端的出口记「谁、问了什么、答了什么」
+
+`zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r250.patch`（33 个 z，叠在 r247 上、LATE 摘除列最前）。
+只碰两处内核出口，因为它们是所有用户态注册表查询的必经之路：
+
+- `is_io_registry_entry_from_path` 与 `_ool`：记下被解析的串，`val=1` 是解析到了、`val=0` 是注册表
+  说不认。
+- `IOCopyPropertyCompatible`：整个文件里每一次「按名字取注册表属性」都走这一个函数。原来的函数体
+  改名 `IOCopyPropertyCompatibleReal`，调用者用的名字不变，所以这文件其余部分一行没动。命中时
+  记下键名、返回的字节长度、以及当它是数时那个数。
+
+过滤条件是名字里含 `utton`（手写逐字符判 `u t t o n`，沿用 r245 的教训：这个编译单元不拉
+`<string.h>`），否则一整个开机的无关属性读会把 8 行环刷满。环是 `CLOVER_MG_ROWS=8` 的
+`snprintf` 文本环，前 8 条当场 `printf` 出声（好让内核日志自己的时间戳把问题摆进开机时间线），
+超过 8 条只进环。真正把它送上卡的是 census：`clover_iodt_census` 在 `census done` 前一行调
+`clover_mg_dump()`，把自己那批 `asks path=/key=/notes=`、逐行 row、或者
+`no user client ever named a button path or key` 塞进同一个 burst——r249 已经证明这条 burst
+豁免于每趟 16 行的推送上限。为什么必须在 burst 里：问题在 launchd boot-task 的头几秒就问完了，
+而 r244 量过这块板子的 msgbuf 有多短，等到 1500 s 那一拍，20 s 时打印的那行早就被覆盖掉了。
+
+驱动侧加一个 tee 类 `{ "clover r250: ", "r250-mgq", 32, 0, 0, 0 }`，并把 r249 那条豁免的判定从
+「r234-set 或 r243」扩成「…或 r250」——同一类一次性 burst，缺席同样无法与「什么都没查到」区分。
+
+判决写在刷机前：
+
+- 卡上出现 `row … comm=<进程> what=…home-button-type… val=<n>` ⇒ 有人问了，且拿到了 `n`。
+  如果 `n != 2`，病根在答案的读法（类型判定/缓存）；如果 `n == 2` 还死等，那 MG 那条路根本不是
+  `homeButtonType` 的来源，直接去解 `bl 0x52aa38` 那次一性 sysctl。
+- 只有 `asks path=0 key=0 notes=0` 与那一行 nobody asked ⇒ 用户态压根没问注册表，ADT/平面/census
+  这条线整个作废，走 sheng 的 HID home 提供者三刀（`build-native-hid-input.py`、
+  `NativeHidInput.late.o`+`hid-original-bindings.o` 并进显示归档、CloverPMGR 调
+  `CloverHidInputProbe`，boot args `offline-hid-input=1 offline-hid-home=1`）。
+- `clover r250:` 一行都不在 ⇒ 仪器没上板（构建或清单问题），先按 r248 那条线查产物，不许拿它当读数。
+
+宿主侧先撞上三个坑，都在编译这一趟里被抓出来，不需要一次开机去换：
+`IOCopyLogNameForPID()` 返回的是 +1 的 `OSString *` 而不是 `char *`（本文件 4411 行就是这么用的，
+取 `getCStringNoCopy()` 后 `release()`）；`OSNumber` 没有公开的字节长度（`getDataByteLength()` 是
+`OSData` 的方法，`size` 成员是 protected），所以那支干脆报 `len=0`，把「这是 OSNumber」编进读数而不是
+伪造一个长度；`is_io_registry_entry_from_path` 在记录器定义之前两百行，必须前置声明。

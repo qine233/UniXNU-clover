@@ -1,0 +1,268 @@
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -275,10 +275,13 @@ clover_name_has(const char *name, const char *part)
+ 		}
+ 	}
+ 	return false;
+ }
+ 
++/* Round250, defined in IOUserClient.cpp: the user client's own side of the button question. */
++extern "C" void clover_mg_dump(void);
++
+ extern "C" void
+ clover_iodt_census(unsigned long long secs)
+ {
+ 	static volatile int ran = 0;
+ 	IORegistryIterator  *it, *jt;
+@@ -480,9 +483,16 @@ clover_iodt_census(unsigned long long secs)
+ 			si->release();
+ 			printf("clover r243: svc total=%d stopped=%d button-family=%d\n",
+ 			    total, stopped, matched);
+ 		}
+ 	}
++	/*
++	 * Round250. The census answers what the kernel published; this answers whether anyone in
++	 * userland asked. It is printed here, inside the burst the tee already exempts from its
++	 * per-pass cap, because the question is asked in the first seconds of launchd's boot tasks
++	 * and its own log line is long overwritten by the time this beat runs.
++	 */
++	clover_mg_dump();
+ 	printf("clover r243: census done nodes=%d\n", seen);
+ }
+ }; /* extern "C" */
+ 
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -44,10 +44,12 @@
+ #include <IOKit/IOUserServer.h>
+ #include <IOKit/system.h>
+ #include <libkern/OSDebug.h>
+ #include <DriverKit/OSAction.h>
+ #include <sys/proc.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <sys/kauth.h>
+ #include <sys/codesign.h>
+ #include <sys/code_signing.h>
+ 
+ #include <mach/sdt.h>
+@@ -3353,10 +3355,18 @@ is_io_registry_iterator_exit_entry(
+ 	IOLockUnlock(&oIter->lock);
+ 
+ 	return didIt ? kIOReturnSuccess : kIOReturnNoDevice;
+ }
+ 
++/*
++ * Round250. Declared here because the first thing that uses it is the path resolution below;
++ * the recorder itself lives further down, next to the property read it also instruments.
++ */
++static bool clover_mg_interesting(const char *name);
++static void clover_mg_note(const char *kind, const char *what, unsigned int length,
++    unsigned int value);
++
+ /* Routine io_registry_entry_from_path */
+ kern_return_t
+ is_io_registry_entry_from_path(
+ 	mach_port_t main_port,
+ 	io_string_t path,
+@@ -3367,10 +3377,12 @@ is_io_registry_entry_from_path(
+ 	if (main_port != main_device_port) {
+ 		return kIOReturnNotPrivileged;
+ 	}
+ 
+ 	entry = IORegistryEntry::fromPath( path );
++	/* val=1 means the path resolved, val=0 means the registry said no. */
++	clover_mg_note("path", path, 0, entry != NULL ? 1 : 0);
+ 
+ 	if (!entry && IOTaskRegistryCompatibility(current_task())) {
+ 		OSDictionary * matching;
+ 		const OSObject * objects[2] = { kOSBooleanTrue, NULL };
+ 		const OSSymbol * keys[2]    = { gIOCompatibilityMatchKey, gIOPathMatchKey };
+@@ -3433,10 +3445,11 @@ is_io_registry_entry_from_path_ool(
+ 		}
+ 	}
+ 
+ 	if ((KERN_SUCCESS == err) && (KERN_SUCCESS == res)) {
+ 		entry = IORegistryEntry::fromPath(cpath);
++		clover_mg_note("path", cpath, 0, entry != NULL ? 1 : 0);
+ 		res = entry ? kIOReturnSuccess : kIOReturnNotFound;
+ 	}
+ 
+ 	if (map_data) {
+ 		vm_deallocate(kernel_map, map_data, path_oolCnt);
+@@ -3598,12 +3611,141 @@ is_io_registry_entry_get_registry_entry_id(
+ 
+ 	return kIOReturnSuccess;
+ }
+ 
+ 
++/*
++ * Round250. Boot 37 settled the plane side of the home-button question: the by-name route a
++ * userland caller takes resolves (plane byname=ok), the entry is there (buttons byname=present)
++ * and the property reads back len=4 u32=2 -- and backboardd is still waiting on a
++ * controller-ready notification that never comes. The registry is not the gap any more. What has
++ * never been measured is the question itself: did anything in userland ask, who asked, and how
++ * many bytes came back? Every property a user client reads and every path it resolves passes
++ * through the two places instrumented here, filtered to names containing "utton" so a boot's
++ * worth of unrelated property reads stays out of the log.
++ *
++ * The rows are kept in a ring rather than only printed, because round244 measured how short this
++ * board's memory of the kernel log is: the question is asked once, within the first seconds of
++ * launchd's boot tasks, and by the time the census prints at 1500 s a line printed at 20 s has
++ * been overwritten in msgbuf. The census calls clover_mg_dump() inside its own exempt burst, so
++ * an early question reaches the card with the readings that explain it. And if the dump says
++ * nothing was ever asked, that answers a different question: MobileGestalt got its value from
++ * somewhere else, and the ADT, the plane and this probe are all beside the point.
++ */
++#define CLOVER_MG_ROWS  8
++#define CLOVER_MG_LINE  112
++static char      clover_mg_rows[CLOVER_MG_ROWS][CLOVER_MG_LINE];
++static uint32_t  clover_mg_notes;
++static uint64_t  clover_mg_path_asks;
++static uint64_t  clover_mg_key_asks;
++
++static bool
++clover_mg_interesting(const char *name)
++{
++	const char *p;
++
++	if (name == NULL) {
++		return false;
++	}
++	for (p = name; p[4] != '\0'; p++) {
++		if (p[0] == 'u' && p[1] == 't' && p[2] == 't' && p[3] == 'o' && p[4] == 'n') {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++clover_mg_note(const char *kind, const char *what, unsigned int length, unsigned int value)
++{
++	char        *row;
++	uint64_t     ns = 0;
++	int          pid;
++	OSString    *who;
++	const char  *nm;
++
++	if (!clover_mg_interesting(what)) {
++		return;
++	}
++	if (kind[0] == 'p') {
++		clover_mg_path_asks++;
++	} else {
++		clover_mg_key_asks++;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	pid = proc_selfpid();
++	who = IOCopyLogNameForPID(pid);
++	nm = who != NULL ? who->getCStringNoCopy() : "?";
++	row = clover_mg_rows[clover_mg_notes % CLOVER_MG_ROWS];
++	snprintf(row, CLOVER_MG_LINE, "t=%llu %s pid=%d comm=%.16s what=%.40s len=%u val=%u",
++	    (unsigned long long) (ns / 1000000000ULL), kind, pid, nm, what, length, value);
++	if (clover_mg_notes < CLOVER_MG_ROWS) {
++		// Also said out loud while there is still room in the ring, so the kernel log's own
++		// stamp can place the question in the boot's timeline; past eight notes the dump is
++		// the only channel, and this cannot flood.  Printed from inside the user client, so it
++		// names the caller that asked.
++		printf("clover r250: %s\n", row);
++	}
++	clover_mg_notes++;
++	if (who != NULL) {
++		who->release();
++	}
++}
++
++extern "C" void
++clover_mg_dump(void)
++{
++	uint32_t i, n;
++
++	printf("clover r250: asks path=%llu key=%llu notes=%u\n",
++	    (unsigned long long) clover_mg_path_asks, (unsigned long long) clover_mg_key_asks,
++	    clover_mg_notes);
++	n = clover_mg_notes < CLOVER_MG_ROWS ? clover_mg_notes : CLOVER_MG_ROWS;
++	for (i = 0; i < n; i++) {
++		printf("clover r250: row %u %s\n", i, clover_mg_rows[i]);
++	}
++	if (n == 0) {
++		printf("clover r250: no user client ever named a button path or key\n");
++	}
++}
++
++/* The answer in the two numbers the question turns on: how many bytes, and what they say when
++ * they are a value at all. 0xffffffff means "answered, and it is not a number to read". */
++static unsigned int
++clover_mg_answer_of(OSObject *obj, unsigned int *length)
++{
++	const uint8_t *b;
++	OSData        *data;
++	OSNumber      *num;
++
++	*length = 0;
++	if (obj == NULL) {
++		return 0;
++	}
++	if ((data = OSDynamicCast(OSData, obj)) != NULL) {
++		*length = data->getLength();
++		b = (const uint8_t *) data->getBytesNoCopy();
++		if (b != NULL && *length >= 4) {
++			return (unsigned int) (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24));
++		}
++		return 0xffffffffu;
++	}
++	if ((num = OSDynamicCast(OSNumber, obj)) != NULL) {
++		/*
++		 * len=0 is deliberate and is the encoding, not an omission: OSNumber keeps its width in a
++		 * protected member no free function in this file can reach (libkern/c++/OSNumber.h:80), and
++		 * inventing a byte count here would be a reading rather than a measurement. A row with
++		 * len=0 and a small val is an OSNumber; the ADT's properties come back as OSData and carry
++		 * their real length, which is the case the home-button question is actually made of.
++		 */
++		return (unsigned int) num->unsigned64BitValue();
++	}
++	return 0xffffffffu;
++}
++
+ static OSObject *
+-IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
++IOCopyPropertyCompatibleReal(IORegistryEntry * regEntry, const char * name)
+ {
+ 	OSObject     * obj;
+ 	OSObject     * compatProperties;
+ 	OSDictionary * props;
+ 
+@@ -3629,11 +3771,30 @@ IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
+ 	}
+ 
+ 	return obj;
+ }
+ 
++/* The one place every user-client property read of a registry entry goes through, wrapped so the
++ * question is recorded with the answer it got. Renamed body above; the name the callers use is
++ * this one, so nothing else in this file had to change. */
++static OSObject *
++IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
++{
++	OSObject      * obj;
++	unsigned int    length;
++	unsigned int    value;
++
++	obj = IOCopyPropertyCompatibleReal(regEntry, name);
++	if (clover_mg_interesting(name)) {
++		value = clover_mg_answer_of(obj, &length);
++		clover_mg_note("key", name, length, value);
++	}
++	return obj;
++}
++
+ /* Routine io_registry_entry_get_property */
++
+ kern_return_t
+ is_io_registry_entry_get_property_bytes(
+ 	io_object_t registry_entry,
+ 	io_name_t property_name,
+ 	io_struct_inband_t buf,

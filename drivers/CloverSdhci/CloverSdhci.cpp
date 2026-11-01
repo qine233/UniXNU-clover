@@ -758,6 +758,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // -- from the first printed backboardd sample. One-shot by a static guard,
   // so one beat's worth of lines: the whole census cannot exceed 64 records.
   { "clover r243: ", "r243", 64, 0, 0, 0 },
+  // Round250 prints who asked the registry about a button, from inside the user client that answers.
+  // Eight notes are said as they happen; the census then re-sends the whole ring, so the burst is at
+  // most nine rows (eight plus the asks counter, or one plus the "nobody asked" verdict). 32 leaves
+  // room for a boot where the same question is asked from two places.
+  { "clover r250: ", "r250-mgq", 32, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -4027,9 +4032,14 @@ static void teeConsumeLine (uint32_t &pushed)
   // census is not an empty plane: every row it answers with is a question whose absence would
   // otherwise read as a verdict. It is printed once per boot behind a static guard, its class
   // budget of 64 still bounds it, and the burst is under forty rows.
+  // Round250 rides the same burst: the recorder's dump is called from the last line of the census,
+  // so it is one-shot for exactly the same reason and would be truncated by the same cap. The
+  // recorder also prints a note the moment a question arrives, outside any burst -- those are the
+  // first eight only, and they take the ordinary per-pass budget like any other probe.
   const bool reserved = probe != nullptr &&
       (teeHasPrefix (probe->name, teeStringLength (probe->name), "r234-set") ||
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r243"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r243") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r250"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

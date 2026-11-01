@@ -916,6 +916,13 @@ def check_board(errors: list) -> str:
             errors.append("drivers/CloverSdhci does not exempt the census from the per-pass push cap: "
                           "boot 36 proved the census is one burst of more than sixteen rows, so its "
                           "tail would again be throttled and read as a plane that said nothing")
+        # Round250 prints from the last line of that same burst. An instrument whose verdict is
+        # "nobody asked" is worthless if the line carrying it is the one the cap drops, and r249
+        # proved on hardware that the tail of a burst is exactly what gets lost.
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r250")' not in sdhci_source:
+            errors.append("drivers/CloverSdhci does not exempt round250's dump from the per-pass push "
+                          "cap: it rides the census burst, so its rows would be throttled and an "
+                          "answered question would read as silence")
         if '{ "clover r217: ", "r217-sbs", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci gives round217's live sample no tee class: a line "
                           "that changes every eight seconds for the length of the boot would land "
@@ -945,7 +952,10 @@ def check_board(errors: list) -> str:
                  "apart from a chain that was never searched"),
                 ('{ "clover r243: ", "r243", 64, 0, 0, 0 },',
                  "the IODeviceTree census would land uncounted: its node rows could push "
-                 "the beat rows that prove the kernel is alive out of the ring")):
+                 "the beat rows that prove the kernel is alive out of the ring"),
+                ('{ "clover r250: ", "r250-mgq", 32, 0, 0, 0 },',
+                 "the user-client question rows would land uncounted, and the one reading that "
+                 "separates a wrong answer from no question at all would be missing")):
             if tee not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci gives round238's rows no tee class ({tee}): "
                               f"{why}")
@@ -1607,6 +1617,67 @@ def check_board(errors: list) -> str:
                 if needle not in r247_added:
                     errors.append(f"{r247_patch.name} lacks {needle!r}: the next reader would have "
                                   "nothing saying why this loop must not release")
+
+        # Round250, the question itself. Boot 37 answered everything the kernel can be asked about
+        # the home button and answered it right: the by-name plane route resolves, /buttons is on it,
+        # home-button-type reads back len=4 u32=2, the service plane carries two button-family
+        # services and none is stopped. backboardd is still waiting. What no round has ever measured
+        # is whether a userland process asked the registry at all, so the recorder sits on the two
+        # exits every user-client path resolution and property read passes through. Its dump is the
+        # first frame with either answer, and both answers move the diagnosis: a named caller means
+        # the value it was given is the bug, and "no user client ever named a button path or key"
+        # means MobileGestalt gets that identity from somewhere outside this registry -- which would
+        # make the ADT, the plane and this census all beside the point.
+        r250_name = "z" * 33 + "-clover-r250.patch"
+        r250_patch = next((base / "patches/xnu-clover" / r250_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r250_name).is_file()), None)
+        if r250_patch is None:
+            errors.append(f"patches/xnu-clover/{r250_name} is missing: boot 38 would again read the "
+                          "registry's answer without the question, and the next round would have to "
+                          "guess whether userland ever asked")
+        else:
+            r250_added = "".join(line for line in r250_patch.read_text().splitlines(True)
+                                 if line.startswith("+"))
+            r250_text = r250_patch.read_text()
+            for needle in ('clover_mg_note("path", path, 0, entry != NULL ? 1 : 0)',
+                           'clover_mg_note("path", cpath, 0, entry != NULL ? 1 : 0)',
+                           'IOCopyPropertyCompatibleReal(IORegistryEntry * regEntry, const char * name)',
+                           'clover_mg_note("key", name, length, value)',
+                           '"clover r250: asks path=%llu key=%llu notes=%u',
+                           '"clover r250: no user client ever named a button path or key',
+                           'extern "C" void clover_mg_dump(void);',
+                           '\tclover_mg_dump();'):
+                if needle not in r250_text:
+                    errors.append(f"{r250_patch.name} lacks {needle[:60]!r}: without it the frame "
+                                  "would not say who asked, what they asked for, and what they got")
+            # The recorder is used by is_io_registry_entry_from_path, which sits two hundred lines
+            # above its definition -- so the forward declaration has to be in the patch, or the
+            # kernel simply will not build and boot 38 will be a build log.
+            if "static void clover_mg_note(const char *kind," not in r250_added:
+                errors.append(f"{r250_patch.name} uses clover_mg_note before defining it with no "
+                              "forward declaration: the first compile of the round would be the "
+                              "discovery")
+            # IOCopyLogNameForPID hands back an OSString, not a C string -- the same mistake r250's
+            # first draft made, and one no host check catches because nothing here compiles XNU.
+            if "nm = IOCopyLogNameForPID(" in r250_added:
+                errors.append(f"{r250_patch.name} treats IOCopyLogNameForPID's return as a char *: "
+                              "it is a +1 OSString, so the kernel would not build and the name of "
+                              "the caller would be the reason")
+            for needle in ('who->getCStringNoCopy()', 'who->release();'):
+                if needle not in r250_added:
+                    errors.append(f"{r250_patch.name} lacks {needle!r}: the copied OSString would "
+                                  "leak a retain on every recorded question")
+            # Every row the kernel prints has to start with the token the tee's class is keyed on,
+            # or the reading is dropped before it reaches the card and r249's lesson repeats.
+            if r250_text.count('"clover r250: ') < 3:
+                errors.append(f"{r250_patch.name} does not print every row under the "
+                              '"clover r250: " prefix the tee class matches: a row on another '
+                              "prefix never reaches the card")
+            if "utton" not in r250_added:
+                errors.append(f"{r250_patch.name} does not filter on the button substring: the "
+                              "recorder would spend its ring on unrelated property reads and lose "
+                              "the question under the noise")
 
         # Round248, the manifest emitter. Boots 35 and 36 carried no reading at all -- not a drained
         # ring, not one block written, boot id still 34 -- and r247 blamed the census for it. The real
@@ -2682,7 +2753,7 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r249:"):
+    if not board["payload"]["title"].startswith("clover r250:"):
         errors.append('[payload] title is not "clover r249: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
@@ -3735,7 +3806,7 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r249:"):
+    if not board["payload"]["title"].startswith("clover r250:"):
         errors.append('[payload] title is not "clover r249: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):

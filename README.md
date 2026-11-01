@@ -94,9 +94,22 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
   就断在这里，`hbt len=`、三行 `byname`、`svc total=/stopped=/button-family=` 和 `census done`
   被 `gTeeThrottled` 就地丢弃——扫描索引照样往前走，所以**没有下一趟补发**。boot 34 之所以读得完整，
   只因为那一版的服务点名只走一层、整批不超过 16 行。r249 因此只动读数通道：census 类与整集合行
+  只因为那一版的服务点名只走一层、整批不超过 16 行。r249 因此只动读数通道：census 类与整集合行
   共用同一条例外（两者的「缺席」都不能与「什么都没查到」区分），每趟上限照旧保护那块还在服务
   文件系统请求的卡。boot 37 的判据是一行：**`census done` 在不在卡上**——在，就有完整的 byname 与
   服务点名可对号；不在而前面的 census 行在，那就是遍历本身走不完，是下一条要追的 bug。
+* boot 37（r249 实机）把那判据答成了「在」：22 行 census 一行不少，`plane byname=ok`、
+  `buttons byname=present`、`hbt byname len=4 u32=2`、`svc total=123 stopped=0 button-family=2`
+  （点名叫到 `svc buttons` 与 `svc IOHIDResource`）、`model=iPad7,1`、`census done nodes=9`。
+  于是 r246 预写的两条判决分支一起被否：平面名字没错，板上也不缺发 ready 的服务。**内核的发布侧
+  没有毛病**——用户态用同一条按名路由能拿到同一个 `2`，backboardd 却还在等。剩下的唯一分岔不是
+  「值不对」而是「有没有人问过」，而这台板子从来没有量过：census 答的是内核发布了什么，没有人
+  答过注册表被问过什么。r250 就钉这一问：`is_io_registry_entry_from_path`（含 `_ool`）与
+  `IOCopyPropertyCompatible` 是用户态每一次注册表查询的必经出口，两处都记「谁、问了什么、答了
+  多少字节、那个数是多少」，只留名字含 `utton` 的；8 行环当场出声，census 在 `census done` 前
+  把整个环再发一遍（走的正是 r249 那条豁免）。判决也写下：有 `row … comm=…` 就在「答案被读错」
+  那条路上；只有 `no user client ever named a button path or key` 就说明 MG 的 home 键身份根本不
+  来自注册表，ADT、平面、census 这条线整个作废，改走 sheng 的 HID home 提供者。
 
 
 每一轮的设计、构建与真机读数（含本节的证据出处）都在
@@ -107,7 +120,7 @@ r236–r239 是把这条链读出来的四轮。
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点已钉到 `_controllerReadyGroup`；boot 33/34 都读到 `cnt=1 g=0 wait=1`，且内核侧平面完整（9 个节点、`/buttons` 查得到、`home-button-type` len=4 u32=2、根 `model=iPad7,1`）；宿主把分支语义钉反了一次——`==2` 才是「记一条日志、跳过 SSHB」，投死等 block 的是 `!=2` 一侧，所以用户态拿到的不是 2 | r246/r247 两次刷写零读数，r248 查明是负载清单（`unixnu.toml`）里的标题没转义、固件读不到 xnu 条目，XNU 根本没启动；census 已修好但一次都没跑过。boot 36（r248）按写死的分支走：`plane byname=` 判平面名字，`svc total=/stopped=/button-family=` 判板上有没有能发 ready 通知的服务 |
+| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点已钉到 `_controllerReadyGroup`，`cnt=1 g=0 wait=1`；boot 37（r249）把 census 读全了：`plane byname=ok`、`buttons byname=present`、`hbt byname len=4 u32=2`、`svc total=123 stopped=0 button-family=2`（`svc buttons`/`svc IOHIDResource`）、`model=iPad7,1`。r246 预写的两条分支（平面名字取错、板上没有按键/HID 提供者）**同时作废**，r240 那条「用户态拿到的不是 2」也失去了依据——同一条按名路由，内核侧读回来就是 `2` | r250 在用户客户端的两处必经出口（`is_io_registry_entry_from_path`/`_ool`、`IOCopyPropertyCompatible`）记「谁、问了什么、答了什么」，只过滤名字含 `utton` 的，环在 census 的豁免 burst 里回放。boot 38 的对号：出现 `row … comm=<进程>` ⇒ 病在答案的读法（类型判定/sysctl 闸门/缓存槽，去解 `bl 0x52aa38` 那次一性 sysctl）；只有 `no user client ever named a button path or key` ⇒ 用户态没问过注册表，改走 sheng 的 HID home 提供者三刀；一行 `clover r250:` 都没有 ⇒ 仪器没上板，先按 r248 查产物 |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 3），再问地址 |
 | 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |
