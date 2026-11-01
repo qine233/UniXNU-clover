@@ -763,7 +763,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // kernel now keeps 24 rows, prints them oldest first, and folds every ask into a per-process tally
   // printed before the rows. The burst is therefore one counter line, up to eight who lines and up
   // to 24 rows -- 33 at worst, so 48 leaves the same headroom r243 gives the census.
-  { "clover r251: ", "r251-mgq", 48, 0, 0, 0 },
+  // Round252 adds a second list to the same burst: every registry name a button-asking process
+  // reached for and this board does not have, up to 16 rows plus its own total. The budget goes to
+  // the census's 64 because the worst case is now one total line, eight who lines, 24 rows, one
+  // misses line and 16 miss rows -- 50 records in the pass that is already exempt.
+  { "clover r252: ", "r252-mgq", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -4042,7 +4046,7 @@ static void teeConsumeLine (uint32_t &pushed)
   const bool reserved = probe != nullptr &&
       (teeHasPrefix (probe->name, teeStringLength (probe->name), "r234-set") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r243") ||
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r251"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r252"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

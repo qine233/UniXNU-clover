@@ -977,10 +977,12 @@ def check_sb_sample(kernel: bytes) -> bool:
              # Round250. The census proves the kernel published the right answer; these two prove the
              # image can say whether userland ever asked for it. Both branches have to be in the
              # binary: the row that names a caller, and the verdict that no caller existed.
-             "mgq-asks": (b"clover r251: asks path=%llu key=%llu notes=%u whos=%u\n") in kernel,
-             "mgq-none": (b"clover r251: no user client ever named a button path or key\n") in kernel,
-             "mgq-row": (b"clover r251: row %u/%u %s\n") in kernel,
-             "mgq-who": (b"clover r251: who pid=%d comm=%.20s path=%u key=%u\n") in kernel,
+             "mgq-asks": (b"clover r252: asks path=%llu key=%llu notes=%u whos=%u\n") in kernel,
+             "mgq-none": (b"clover r252: no user client ever named a button path or key\n") in kernel,
+             "mgq-row": (b"clover r252: row %u/%u %s\n") in kernel,
+             "mgq-who": (b"clover r252: who pid=%d comm=%.20s path=%u key=%u\n") in kernel,
+             "mgq-miss": (b"clover r252: misses total=%u shown=%u\n") in kernel,
+             "mgq-missrow": (b"clover r252: miss %u/%u %s\n") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
                            b"dropped=%u comms=%u\n") in kernel,
              "tee-sync": (b"CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n") in kernel}

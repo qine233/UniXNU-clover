@@ -18834,3 +18834,33 @@ row 13..15 t=805..810 pid=260 SpringBoard（重启后的新一代），同样 va
 ① `function-button_halleffect` 的读点是不是就在那个 ready 路径上（缺席会不会让 BR 控制器永不 ready）；
 ② 真实机型该键的**类型与取值**从哪份材料取证（不能自己编一个数）；
 ③ `_BRController` 到底是哪个类、ready 由谁触发（另一路调查正在跑）。
+
+## r252 设计：把「问了而我们没有」变成一类读数，不再靠 button 过滤器撞运气
+
+`zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r252.patch`（35 个 z，叠在 r251 上、LATE 摘除列最前）。
+动机只有一句：boot 39 之所以能看见 `function-button_halleffect` 缺席，是因为它的名字里正好有
+`utton`。**其余所有「用户态问了、这块板子没有」的东西，在这台仪器里根本不存在。** 于是这一轮把
+缺席单独记成一类读数：
+
+- 属性读到 NULL，或路径解析不出来 ⇒ 记一条 `missing`；
+- 但**不按名字过滤，改按「谁在问」过滤**：只有已经出现在 button 计数表里的进程（backboardd、
+  SpringBoard、PreBoard、audiomxd）的缺席才会被记。问按键的那批进程，缺的东西才要紧；不限来源的话
+  一整个开机的能力探测会把环挤满——那正是这个项目已经付过两次学费的错法；
+- 16 行环 + `misses total=%u shown=%u`，按时间序，和 r251 那台同批从 census 的豁免 burst 发出去；
+- 整台仪器输出前缀统一成 `clover r252: `，驱动的类与每趟上限豁免跟着改名（`r252-mgq`，预算从 48
+  提到 64：1 总数 + 8 who + 24 row + 1 misses + 16 miss = 最坏 50 行）。
+
+判决写在刷机前：**下一轮干什么，直接由 `miss` 列表决定。**
+
+- 列表里出现任何与触觉/SSHB/BK/Haptics 有关的名字 ⇒ r253 就补那一个（或那条路径），
+  不再猜；
+- 列表只有 `function-button_halleffect` ⇒ 说明缺口不在注册表属性上，等 `_BRController` 那条
+  宿主调查给出触发源，r253 走 HID/服务提供者；
+- `misses total=0` ⇒ UI 那批进程要的东西我们全都有，死等 100% 属于「事件没人发」，直接跳到
+  服务/HID 那条线，ADT 侧此后不必再动。
+
+宿主这一趟先撞到的两个坑，都是编译期抓的，不花开机：`clover_mg_miss` 同时被用作数组名和函数名
+（clang 报「redefinition … as different kind of symbol」，一路连锁出九个「function definition is not
+allowed here」，其实只有第一个是真错）；以及缺席记录器写在两个 `fromPath` 出口里，同样需要前置声明。
+另外这次是本轮第二次踩「编译失败把 `.cpo` 删掉、`startup.o.json` 还在，于是下一趟 archive 1/15 以
+`nm: error: …IOUserClient.cpo: No such file` 挂住」——按 memory 的修法删 marker 让 bootstrap 重跑。

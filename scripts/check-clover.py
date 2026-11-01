@@ -919,8 +919,8 @@ def check_board(errors: list) -> str:
         # Round250 prints from the last line of that same burst. An instrument whose verdict is
         # "nobody asked" is worthless if the line carrying it is the one the cap drops, and r249
         # proved on hardware that the tail of a burst is exactly what gets lost.
-        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r251")' not in sdhci_source:
-            errors.append("drivers/CloverSdhci does not exempt round250's dump from the per-pass push "
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r252")' not in sdhci_source:
+            errors.append("drivers/CloverSdhci does not exempt round252's dump from the per-pass push "
                           "cap: it rides the census burst, so its rows would be throttled and an "
                           "answered question would read as silence")
         if '{ "clover r217: ", "r217-sbs", 64, 0, 0, 0 },' not in sdhci_source:
@@ -953,9 +953,10 @@ def check_board(errors: list) -> str:
                 ('{ "clover r243: ", "r243", 64, 0, 0, 0 },',
                  "the IODeviceTree census would land uncounted: its node rows could push "
                  "the beat rows that prove the kernel is alive out of the ring"),
-                ('{ "clover r251: ", "r251-mgq", 48, 0, 0, 0 },',
-                 "the user-client question rows would land uncounted, and the one reading that "
-                 "separates a wrong answer from no question at all would be missing")):
+                ('{ "clover r252: ", "r252-mgq", 64, 0, 0, 0 },',
+                 "the user-client question rows and the absent-answer list would land uncounted, and "
+                 "the one reading that separates a wrong answer from no question at all "
+                 "would be missing")):
             if tee not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci gives round238's rows no tee class ({tee}): "
                               f"{why}")
@@ -1678,6 +1679,47 @@ def check_board(errors: list) -> str:
                 errors.append(f"{r250_patch.name} does not filter on the button substring: the "
                               "recorder would spend its ring on unrelated property reads and lose "
                               "the question under the noise")
+
+        # Round252, the absent answers. Boot 39 found the first property this board was asked for
+        # and does not have -- function-button_halleffect, answered len=0 val=0 -- and it was found
+        # by luck: the name happened to contain the button substring. Every other gap is invisible
+        # to that filter, so the recorder now also reports what cannot be answered, for exactly the
+        # processes the button tally already named. The gate on the tally is the contract: an
+        # unfiltered miss list over a whole boot would push the decisive rows out of the ring, which
+        # is the defect this project has now paid for twice.
+        r252_name = "z" * 35 + "-clover-r252.patch"
+        r252_patch = next((base / "patches/xnu-clover" / r252_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r252_name).is_file()), None)
+        if r252_patch is None:
+            errors.append(f"patches/xnu-clover/{r252_name} is missing: the next round would again be "
+                          "picked from whatever the button filter happened to let through, not from "
+                          "what this board is missing")
+        else:
+            r252_added = "".join(line for line in r252_patch.read_text().splitlines(True)
+                                 if line.startswith("+"))
+            r252_text = r252_patch.read_text()
+            for needle in ('#define CLOVER_MG_MISSES 16',
+                           'static const struct clover_mg_who *\nclover_mg_asked(int pid)'
+                           if False else 'clover_mg_asked(int pid)',
+                           'clover_mg_miss("key", name)',
+                           'clover_mg_miss("path", path)',
+                           'clover_mg_miss("path", cpath)',
+                           '"clover r252: misses total=%u shown=%u',
+                           '"clover r252: miss %u/%u %s',
+                           'static void clover_mg_miss(const char *kind, const char *what);'):
+                if needle not in r252_text:
+                    errors.append(f"{r252_patch.name} lacks {needle[:64]!r}: without it a missing "
+                                  "property is indistinguishable from a property nobody asked about")
+            # Both from_path bodies have to record the unresolved path, and the wrapper the absent
+            # property; the tally gate is what keeps a chatty boot from filling the miss ring.
+            if "asker == NULL" not in r252_added:
+                errors.append(f"{r252_patch.name} records misses without gating them on the button "
+                              "tally: every probe in the boot would land in the ring and the rows "
+                              "that answer the actual question would be overwritten again")
+            if 'printf("clover r251: ' in r252_added:
+                errors.append(f"{r252_patch.name} still prints under the r251 prefix, which no "
+                              "longer matches the tee class the burst is accounted to")
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -2799,7 +2841,7 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r251:"):
+    if not board["payload"]["title"].startswith("clover r252:"):
         errors.append('[payload] title is not "clover r249: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
@@ -3852,7 +3894,7 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r251:"):
+    if not board["payload"]["title"].startswith("clover r252:"):
         errors.append('[payload] title is not "clover r249: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):

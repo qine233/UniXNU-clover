@@ -1,0 +1,193 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -3362,10 +3362,11 @@ is_io_registry_iterator_exit_entry(
+  * the recorder itself lives further down, next to the property read it also instruments.
+  */
+ static bool clover_mg_interesting(const char *name);
+ static void clover_mg_note(const char *kind, const char *what, unsigned int length,
+     unsigned int value);
++static void clover_mg_miss(const char *kind, const char *what);
+ 
+ /* Routine io_registry_entry_from_path */
+ kern_return_t
+ is_io_registry_entry_from_path(
+ 	mach_port_t main_port,
+@@ -3379,10 +3380,13 @@ is_io_registry_entry_from_path(
+ 	}
+ 
+ 	entry = IORegistryEntry::fromPath( path );
+ 	/* val=1 means the path resolved, val=0 means the registry said no. */
+ 	clover_mg_note("path", path, 0, entry != NULL ? 1 : 0);
++	if (entry == NULL) {
++		clover_mg_miss("path", path);
++	}
+ 
+ 	if (!entry && IOTaskRegistryCompatibility(current_task())) {
+ 		OSDictionary * matching;
+ 		const OSObject * objects[2] = { kOSBooleanTrue, NULL };
+ 		const OSSymbol * keys[2]    = { gIOCompatibilityMatchKey, gIOPathMatchKey };
+@@ -3446,10 +3450,13 @@ is_io_registry_entry_from_path_ool(
+ 	}
+ 
+ 	if ((KERN_SUCCESS == err) && (KERN_SUCCESS == res)) {
+ 		entry = IORegistryEntry::fromPath(cpath);
+ 		clover_mg_note("path", cpath, 0, entry != NULL ? 1 : 0);
++		if (entry == NULL) {
++			clover_mg_miss("path", cpath);
++		}
+ 		res = entry ? kIOReturnSuccess : kIOReturnNotFound;
+ 	}
+ 
+ 	if (map_data) {
+ 		vm_deallocate(kernel_map, map_data, path_oolCnt);
+@@ -3651,10 +3658,22 @@ struct clover_mg_who {
+ 	char      name[24];
+ 	uint32_t  paths;
+ 	uint32_t  keys;
+ };
+ static char             clover_mg_rows[CLOVER_MG_ROWS][CLOVER_MG_LINE];
++/*
++ * Round252. The button filter is what caught boot 39's first absent answer --
++ * function-button_halleffect read back len=0 val=0 because the name happened to contain the
++ * substring. Everything else this board does not have is invisible to that instrument, so misses
++ * are recorded without the name filter, but only for the processes the button questions already
++ * named: the same daemons that ask about a home button are the ones whose missing properties
++ * matter, and bounding the list to them keeps a chatty boot from filling the ring with probes that
++ * mean nothing.
++ */
++#define CLOVER_MG_MISSES 16
++static char             clover_mg_miss_rows[CLOVER_MG_MISSES][CLOVER_MG_LINE];
++static uint32_t         clover_mg_miss_notes;
+ static struct clover_mg_who clover_mg_who[CLOVER_MG_WHO];
+ static uint32_t         clover_mg_whos;
+ static uint32_t         clover_mg_notes;
+ static uint64_t         clover_mg_path_asks;
+ static uint64_t         clover_mg_key_asks;
+@@ -3722,10 +3741,50 @@ clover_mg_tally(int pid, const char *name, bool path)
+ 	} else {
+ 		entry->keys++;
+ 	}
+ }
+ 
++/* Round252. Is this pid one of the processes whose button questions we are already tracking? */
++static const struct clover_mg_who *
++clover_mg_asked(int pid)
++{
++	uint32_t i;
++
++	for (i = 0; i < clover_mg_whos; i++) {
++		if (clover_mg_who[i].pid == pid) {
++			return &clover_mg_who[i];
++		}
++	}
++	return NULL;
++}
++
++/* Round252. A question this board cannot answer, said once per ring slot. kind is "key" for a
++ * property that is not there and "path" for a registry path that does not resolve. */
++static void
++clover_mg_miss(const char *kind, const char *what)
++{
++	char        *row;
++	uint64_t     ns = 0;
++	int          pid;
++	const struct clover_mg_who *asker;
++
++	pid = proc_selfpid();
++	asker = clover_mg_asked(pid);
++	if (asker == NULL) {
++		return;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	row = clover_mg_miss_rows[clover_mg_miss_notes % CLOVER_MG_MISSES];
++	snprintf(row, CLOVER_MG_LINE, "t=%llu %s pid=%d comm=%.20s missing=%.48s",
++	    (unsigned long long) (ns / 1000000000ULL), kind, pid, asker->name, what);
++	if (clover_mg_miss_notes < CLOVER_MG_MISSES) {
++		printf("clover r252: %s
++", row);
++	}
++	clover_mg_miss_notes++;
++}
++
+ static void
+ clover_mg_note(const char *kind, const char *what, unsigned int length, unsigned int value)
+ {
+ 	char        *row;
+ 	uint64_t     ns = 0;
+@@ -3752,11 +3811,11 @@ clover_mg_note(const char *kind, const char *what, unsigned int length, unsigned
+ 	if (clover_mg_notes < CLOVER_MG_ROWS) {
+ 		// Also said out loud while there is still room in the ring, so the kernel log's own
+ 		// stamp can place the question in the boot's timeline; past the ring the dump is
+ 		// the only channel, and this cannot flood.  Printed from inside the user client, so it
+ 		// names the caller that asked.
+-		printf("clover r251: %s\n", row);
++		printf("clover r252: %s\n", row);
+ 	}
+ 	clover_mg_notes++;
+ 	if (who != NULL) {
+ 		who->release();
+ 	}
+@@ -3765,32 +3824,45 @@ clover_mg_note(const char *kind, const char *what, unsigned int length, unsigned
+ extern "C" void
+ clover_mg_dump(void)
+ {
+ 	uint32_t i, n, start;
+ 
+-	printf("clover r251: asks path=%llu key=%llu notes=%u whos=%u\n",
++	printf("clover r252: asks path=%llu key=%llu notes=%u whos=%u\n",
+ 	    (unsigned long long) clover_mg_path_asks, (unsigned long long) clover_mg_key_asks,
+ 	    clover_mg_notes, clover_mg_whos);
+ 	/*
+ 	 * Round251. The tally first, because it is the line that cannot be truncated by a busy boot,
+ 	 * and it is the one that names whether the process we care about ever asked.
+ 	 */
+ 	for (i = 0; i < clover_mg_whos; i++) {
+-		printf("clover r251: who pid=%d comm=%.20s path=%u key=%u\n", clover_mg_who[i].pid,
++		printf("clover r252: who pid=%d comm=%.20s path=%u key=%u\n", clover_mg_who[i].pid,
+ 		    clover_mg_who[i].name, clover_mg_who[i].paths, clover_mg_who[i].keys);
+ 	}
+ 	/*
+ 	 * Then the rows, oldest first: boot 38 printed slot order and a reader would have had to
+ 	 * re-derive the wrap from the timestamps to see that row 7 was the earliest question.
+ 	 */
+ 	n = clover_mg_notes < CLOVER_MG_ROWS ? clover_mg_notes : CLOVER_MG_ROWS;
+ 	start = clover_mg_notes <= CLOVER_MG_ROWS ? 0 : clover_mg_notes % CLOVER_MG_ROWS;
+ 	for (i = 0; i < n; i++) {
+-		printf("clover r251: row %u/%u %s\n", i + 1, n, clover_mg_rows[(start + i) % CLOVER_MG_ROWS]);
++		printf("clover r252: row %u/%u %s\n", i + 1, n, clover_mg_rows[(start + i) % CLOVER_MG_ROWS]);
+ 	}
+ 	if (n == 0) {
+-		printf("clover r251: no user client ever named a button path or key\n");
++		printf("clover r252: no user client ever named a button path or key\n");
++	}
++	/*
++	 * Round252 last, because it is the list the next round is chosen from: every registry name a
++	 * button-asking process reached for and this board does not have.
++	 */
++	printf("clover r252: misses total=%u shown=%u\n",
++	    (unsigned int) clover_mg_miss_notes,
++	    clover_mg_miss_notes < CLOVER_MG_MISSES ? clover_mg_miss_notes : CLOVER_MG_MISSES);
++	n = clover_mg_miss_notes < CLOVER_MG_MISSES ? clover_mg_miss_notes : CLOVER_MG_MISSES;
++	start = clover_mg_miss_notes <= CLOVER_MG_MISSES ? 0 : clover_mg_miss_notes % CLOVER_MG_MISSES;
++	for (i = 0; i < n; i++) {
++		printf("clover r252: miss %u/%u %s\n", i + 1, n,
++		    clover_mg_miss_rows[(start + i) % CLOVER_MG_MISSES]);
+ 	}
+ }
+ 
+ /* The answer in the two numbers the question turns on: how many bytes, and what they say when
+  * they are a value at all. 0xffffffff means "answered, and it is not a number to read". */
+@@ -3869,10 +3941,12 @@ IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
+ 
+ 	obj = IOCopyPropertyCompatibleReal(regEntry, name);
+ 	if (clover_mg_interesting(name)) {
+ 		value = clover_mg_answer_of(obj, &length);
+ 		clover_mg_note("key", name, length, value);
++	} else if (obj == NULL) {
++		clover_mg_miss("key", name);
+ 	}
+ 	return obj;
+ }
+ 
+ /* Routine io_registry_entry_get_property */
