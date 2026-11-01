@@ -20424,3 +20424,49 @@ SMR 那层不能省：空间会长表（`ipc_entry.c:581` 那处 grow），`is_a
 `convert_semaphore_to_port` 捐给端口的内核引用（或藏在 400 之外的进程里），
 仍是结构死等，但这次有正面证据。`scanned=` 报的是「看了几颗空间」，不是入口数——
 换了机制，这一格的含义也变了，读 boot 56 时按新含义读。
+
+## r269 读数（boot 56）：**那份唯一发送权在债主自己名下**——桌面卡死是 datamigrator 进程内自锁
+
+boot 56 = round269-payload.img（kernel 56445a3c → AMFI 25a2b7b7 → normalize efd2c8d5，镜像 5bd4ae53）。
+冷刷走的是新闸门那条路：先在 TWRP 读卡上 boot 计数（`PRE_BOOT=55`），`adb reboot bootloader`，
+刷 cache，跑满 1800 s 死线；读回时 checker 那句「the boot count moved: 55 -> 56」落地，
+这一窗确实是刚刷进去的那版跑出来的（不是上一版的窗口）。全帧 4 次普查（t=1404/1539/1670/1793），
+**四次读数一字不差**：
+
+```
+clover r268: sem  t=1793 pid=139 tid=370 count=-1 srights=1 otype=0 receiver=kspace port=fffffff4b364b880
+clover r269: srhost t=1793 pid=139 tid=370 port=fffffff4b364b880 hit=139 name=2d23 type=10000 scanned=77 probed=77
+```
+
+**① 三种结局里中的是第一种：进程内自锁。** `hit=139` 就是债主自己；
+`probed=77 scanned=77` 说明这靴活着的 77 颗进程**每一颗都查了**（`proc_find` 从 1 数到 400，
+77 个存在，一个都没跳过），不是「停在闸门上」——`scanned` 与 `probed` 相等本身就是这条读数的自证。
+`srights=1` 加上「唯一持有者是 139」，等于说全系统能 signal 这只机器号的那一份权利
+**就攥在等它的那个任务自己手里**（名字 `0x2d23`，入口类型 `0x10000>>16 = 1 = IOT_PORT`，
+纯发送权 ⇒ 反查表登记的那一类，正是「有权利 signal」）。
+
+**② `receiver=kspace` 兑现了 r269 的猜测，也纠正了我上一版 memory 里的话。**
+机器号端口确实在 `ipc_space_kernel` 里（`ipc_port_alloc_special`），那颗空间没有 `is_task`，
+所以 boot 55 那个空格**不是「端口没有接收方」，而是「接收方的空间不是任何进程」**。
+两种情况以后各有标签（`no-space` / `kspace`），不会再靠空白猜。
+
+**③ 债主内部的全貌（`clover r265: peer t=1793 pid=139 threads=8 wait=8 run=0 rx=1`）**：
+8 条线程**全睡**，没有一条在跑。按 continuation 分组：一条 `runloop` 在
+`_ipc_mqueue_receive_continue`（tid 0x367，等 mach 消息）、五条在 `_filt_wlwait_continue`
+（tid 0x371/0x376/0x3f6/0x511/0x79c，libdispatch workloop 工人，r267 报它们的属主正是 0x370）、
+一条在 `_workq_unpark_continue`（tid 0x12c9， parked 的工作队列线程）、
+剩下就是 0x370 睡在这只机器号上。**环闭合**：0x370 要工人跑 block 来 signal，
+工人等 workloop，workloop 的属主又是 0x370。
+
+**④ 对桌面的意义（这是 r262 起一直在分岔的那一格）**：backboardd 侧 `tid=49c`
+`rcv=d403 remote=cb07 local=0 sz=4000 mc=0 sr=1 rsr=1 peer=139:com.apple.datam`——
+它把请求发给 **139 的接收端口**等回信，而对侧队列 `mc=0`（消息没在里面堆着），
+对侧全体线程又在睡。**backboardd 不是卡在渲染，是卡在一次永远不会有人回复的 XPC 往返上**，
+SpringBoard 再排在 backboardd 后面。CPU-first 这条判断继续成立：渲染侧一条等待都不需要动。
+
+**⑤ 下一刀要问的已经不是「谁欠它 signal」（已经答了），而是「0x370 等的这个 block 为什么不排出去」**：
+libdispatch 从 block 里等另一 block 时，正常是靠**再造一条工人线程**（overcommit）来破环的；
+这里五条工人在 workloop 里睡着、一条都没新起。所以 r270 查的是**本板让 libdispatch 起不了新工人**的
+那一个门槛——照惯例先查 sheng：它的 ADT `/defaults` 与 boot-args 里有没有我们缺的线程/vnode 类旋钮
+（r258 已经从 sheng 抄过一条 `kern.maxvnodes=66560`，同族旋钮值得整表比对，而不是再猜第二个）。
+
