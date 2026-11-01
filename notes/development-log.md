@@ -18864,3 +18864,19 @@ row 13..15 t=805..810 pid=260 SpringBoard（重启后的新一代），同样 va
 allowed here」，其实只有第一个是真错）；以及缺席记录器写在两个 `fromPath` 出口里，同样需要前置声明。
 另外这次是本轮第二次踩「编译失败把 `.cpo` 删掉、`startup.o.json` 还在，于是下一趟 archive 1/15 以
 `nm: error: …IOUserClient.cpo: No such file` 挂住」——按 memory 的修法删 marker 让 bootstrap 重跑。
+
+### r252 落地：产物、双闸门，以及一条 needle 抓不到的错
+
+`./unixnu build kernel` 第一次跑挂在**自己插进去的那行源码**上：`printf("clover r252: %s\n", row);`
+里的 `\n` 被生成脚本当成真换行吃掉了，于是内核源码里出现字符串字面量中间断行，clang 报 9 个错、
+只有第一个指向真凶。修完重编：prelink 内核 `902cd3b6…` → AMFI 两刀仍在 `0x1ac40e4`/`0x1ac416c`
+（与 r251 同址）→ amfi `7955a435…` → normalize 968 戳 → `e9fc5bb4…` → payload →
+**round252-payload.img `43f352e7…`**（58720256 B，ADT 14344）。
+
+`check-clover.py` 绿；`verify-clover-payload.py` 48 条 OK、0 FAIL，六项 `mgq-asks/none/row/who/
+miss/missrow` 全 present，反向对照 `round251-payload.img` 报六项全 ABSENT。二进制里已无
+`clover r251` 串。契约上新增一条把这次教训钉住的断言：**钉两条完整的
+`printf("clover r252: %s\n", row);` 字面量**，而不是数前缀——因为「前缀出现次数」这种 needle
+对字符串边界是瞎的，而这一条恰好只有编译器看得见。
+
+boot 40 = 这份镜像，判决只看 `clover r252: misses total=… shown=…` 与它下面那串 `miss i/n`。
