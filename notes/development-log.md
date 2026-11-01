@@ -19233,3 +19233,39 @@ r256 只做一件事：**把状态再说一遍，说得晚一点、说得久一�
 backboardd 不读的节点上，下一刀是「它到底在哪个 entry 上 copyProperty」（缺席记录器现在只记键名，
 `%c` 分 path/key，不记被问的那 entry 的名字——这一条值得单独一轮把它补上）；`published=0` → 链子断在
 事件驱动匹配之前，回到 report descriptor 那一侧。`home-button-type` 仍然不动。
+
+## r256 读数（boot 44）：心跳读到了，答案是我自己那道门槛
+
+`round256-log-window.bin`：boot 44。beat 每 120 s 一条，窗口里五条，内容一致：
+
+```
+clover r255: beat stage=5 service=fffffff469d7a2c0 device-has-no-built-in published=0 seen=0
+             presses=1086 sinks=0,1 transfer=8
+```
+
+一行把 r255 读不到的三件事全说清了：
+
+1. `stage=5`——设备起到底；`service=fffffff469d7a2c0`——`findEventDriver()` 真的在设备下面找到了
+   原始 `IOHIDEventDriver`（这个地址只在匹配成功时才会被记住）。r255 靠 census 反推的那一半，现在是
+   直接读到的。
+2. `device-has-no-built-in` + `published=0 seen=0`——**发布从来没有发生**，被挡住了，而挡它的不是板子
+   也不是家族，是探针自己那句 `if (device->getProperty("Built-In") == nullptr) return;`。
+   宿主侧一句 grep 就接上因果：vendored 的 `drivers/NativeHidInput/NativeHidInput.cpp:296` 只在
+   `touchOnly || touchEnabled` 时才 `setProperty("Built-In", true)`，而我们跑的是按键那颗设备、
+   触摸没开，于是设备自己没有 Built-In，于是 sheng 那句「有再传播」的判断在这台板上永远为假。
+   sheng 的守卫是在**抄设备自己的旗标**；我们要做的是**给事件服务发分类键**，两回事，守卫不该跟过来。
+3. `sinks=0,1`——r255 那两个弱导入的生产者计数确实进了镜像（按钮侧装了一次 sink，触摸侧 0 次），
+   `transfer=8` 说明屏幕仍在被驱动。`presses=1086` 则暴露这个字段本身命名不对：它数的是
+   **被问了 1086 次**，不是发出了 1086 次 Home——预算 3 次是在 `taken < budget` 那里卡的，
+   所以设备其实只按了 3 次，但读数说不出这件事。
+
+也就是说：桌面这一步**没有任何外部障碍被证明存在**，卡点是本地一个复制过来的守卫。backboardd 的
+`bbgrp` 在 boot 44 仍然 `wait=1 notif=0`（与 42/43 同形），这与上面第 2 条完全一致——分类键没发出去，
+resolver 也就没有可匹配的 HID 服务。
+
+**r257**：① 去掉那道守卫——事件驱动一旦匹配就发那四个键（设备上的 Built-In 降为读数，不再当条件）；
+② 把 asks 与 grants 分开数，`presses=` 只数真发出去的；③ beat 的格式串变了，两个 checker 与 tee 注释
+一起跟上。读法照旧：`published=1 seen=1` 之后，看 r252 缺席表里 `DisplayIntegrated` 会不会停止累积——
+停，则这一格通了、下一步看 `bbgrp`；不停，则说明 backboardd 问的是别的节点，那时才轮到把缺席记录器
+升级成「在哪个 entry 上问的」（`IOCopyPropertyCompatible` 的调用点上 `regEntry` 就在手里）。
+`home-button-type` 仍然不动。
