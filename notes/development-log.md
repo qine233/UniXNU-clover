@@ -19581,3 +19581,31 @@ cap 撞上了：`threads=17 shown=14`（第一拍）与 `15/14`——每拍都�
 2. 对端口收信的线程，把 `wait_event` 走到 port，再走 r232/r234 已有的
    「entry → owner 名字」那条路，报出**它在等哪个服务**；这就是 sheng 的 `peer`。
 3. 上限抬到 20 并把没报出的数量写进表头。
+
+## r263 构建现场：仪器写了不存在的字段，配额算少了自己新增的行
+
+**① `dl=` 第一次写成 `thr->block_deadline`，本板内核编译当场拒绝**
+（`no member named 'block_deadline' in 'struct thread'`）。这个字段是别的内核的形状，不是 iOS 17
+的 XNU。回到 `osfmk/kern/thread.h` 与 `waitq.c` 核对，定时等真正记在：
+
+| 字段 | 位置 | 意思 |
+| --- | --- | --- |
+| `thread->wait_timer` | `thread.h:762` | `timer_call_t` 指针，`thread.c:1504` 分配 |
+| `thread->wait_timer_armed` | `thread.h:764` | 这次等待有没有装定时器 |
+| `wait_timer->tc_soft_deadline` | `timer_call.h:73` | 绝对期限（`waitq.c:1391` 装填） |
+
+所以 `dl=` 改成「还剩几秒」（0 = 没装 = 无限等），用采样已在用的
+`absolutetime_to_nanoseconds` 换算，读数和 `t=` 同一把秒表，不需要读者再算刻度。
+教训：字段名只能从**这一版内核的头文件**里取，不能凭印象写；写仪器时先把符号本身 `grep` 一遍。
+
+**② 抬上限的时候没重算 tee 配额。** 普查上限 14→20，每拍行数 15→21；按 boot 49 的实测节拍
+（5 拍、窗口到 1786 s）1800 s 死线内约 13 拍 = 273 行，按标称 120 s 节拍 15 拍 = 315 行，
+而 `r262-th` 的配额是给 14 行定的 256 ——会在 boot 中途吃满，砍掉的正好是 card 只保留最后
+512 行时**唯一留得下的尾段**。抬到 384，并把驱动注释里写错的「boot 49 五拍 105 行」改回实测的
+75 行（`grep -c` 5 条 census 表头 + 70 条线程行）。
+
+**③ 一次「假的第二个错误」。** 第一次构建死在 `task.c`，`task.o` 因此没产出；第二次 `make`
+跳过了 osfmk 直接进入 `LDFILELIST bsd` 才失败，而 `-j4` 把日志搅成乱码，整段看不到任何
+`error:`。用构建记录的原始命令（`compile_commands.json` 里 task.c 那条）单独编译一次，
+exit 0 且产出 `task.o`，才确认源码没问题、缺的只是上一轮留下的对象。教训：并行 make 的日志
+不能只看有没有 `error:`，缺对象时用单文件编译把「源码坏了」和「构建状态坏了」切开。

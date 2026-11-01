@@ -1852,24 +1852,82 @@ def check_board(errors: list) -> str:
             if r262_added.count('"clover r262: ') < 2:
                 errors.append(f"{r262_patch.name} does not print every row under the "
                               '"clover r262: " prefix the tee class matches')
-            if '{ "clover r262: ", "r262-th", 256, 0, 0, 0 },' not in sdhci_source:
+            if '{ "clover r262: ", "r262-th", 384, 0, 0, 0 },' not in sdhci_source:
                 errors.append("drivers/CloverSdhci gives round262's census no tee class, or gives it a "
                               "budget that trims its tail: fifteen rows per beat across an 1800 s "
                               "deadline is about 225 lines, and a class that runs out mid-boot drops "
                               "the late readings the ring window is made of")
             baseline_script = (REPO.parent / "UniXNU" /
                                "scripts/build-xnu-4k-baseline.sh").read_text()
-            late_head = next((line for line in baseline_script.splitlines()
-                              if line.startswith("for LATE_PATCH in")), "")
-            if r262_name not in late_head:
-                errors.append("build-xnu-4k-baseline.sh does not reverse r262 first in LATE_PATCH: the "
-                              "compile pass would run on the census-shaped tree and the replay would "
-                              "look like a broken patch when it is only out of order")
+            # Round263 stacks on this census, so r262 is no longer the first entry -- what still has to
+            # hold is the order relative to the patch it rewrote: the list is reversed at build time, so
+            # the newest round must appear above the one it edits on top of.
+            late_list = " ".join(line for line in baseline_script.splitlines()
+                                 if "clover-r2" in line)
+            if (late_list.find(r262_name) < 0 or late_list.find(r262_name) > late_list.find(
+                    "z" * 36 + "-clover-r254.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r262 ahead of r254 in "
+                              "LATE_PATCH: the compile pass would run on the census-shaped tree and the "
+                              "replay would look like a broken patch when it is only out of order")
             load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r262_name
             if not load_copy.is_file():
                 errors.append(f"UniXNU/patches/xnu/{r262_name} is missing: unixnu loads patches from "
                               "that directory and silently skips a board patch that lives only in "
                               "this repo")
+
+        # Round263 widens the census r262 added, on the strength of what boot 49 showed: the cap was hit
+        # on every beat (threads=17, shown=14), so threads went unsaid, and the four-slot hop capture is
+        # also a cap -- which matters because the hop row is the only place a waiting thread's port gets
+        # translated to the task that owns it. The row therefore gains the block deadline (0 = an untimed
+        # wait, finite = one given a timeout: the difference between an idle receiver and a thread waiting
+        # for an answer) plus the mach_msg2 names read where r230/r231 read them, and the owner of the
+        # send right resolved by the same helper the hop rows use.
+        r263_name = "z" * 38 + "-clover-r263.patch"
+        r263_patch = next((base / "patches/xnu-clover" / r263_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r263_name).is_file()), None)
+        if r263_patch is None:
+            errors.append(f"patches/xnu-clover/{r263_name} is missing: the next boot would again report "
+                          "fourteen of a task's threads and name the peer of only four of them")
+        else:
+            r263_text = r263_patch.read_text()
+            r263_added = "".join(line for line in r263_text.splitlines(True)
+                                 if line.startswith("+"))
+            for needle in ('#define CLOVER_BB_CENSUS 20',
+                           '#define CLOVER_BB_M2_TRAP  (-47)',
+                           '"clover r262: census t=%llu pid=%d threads=%u shown=%u"',
+                           '" hidden=%u wait=%u run=%u\\n"',
+                           '" pc=%llx dl=%llx m2=%llx rn=%x sn=%x rem=%x peer=%s\\n"',
+                           'clover_sb_port_owner(task, (mach_port_name_t)csn[i]',
+                           'if (thr->wait_timer_armed && thr->wait_timer != NULL)',
+                           'absolutetime_to_nanoseconds(thr->wait_timer->tc_soft_deadline,'):
+                if needle not in r263_text:
+                    errors.append(f"{r263_patch.name} lacks {needle[:64]!r}: without it the row cannot "
+                                  "say who owes this thread its answer, or whether it is waiting forever")
+            # The cap has to be visible, and the trap test has to be the same one the hop rows use.
+            if 'hidden=%u' not in r263_added:
+                errors.append(f"{r263_patch.name} still hides what its cap dropped: a header without a "
+                              "hidden count reads as a task that has only as many threads as were shown")
+            if 'x[16] == CLOVER_BB_M2_TRAP' not in r263_added.replace('(int64_t)saved_state64(ss)->', ''):
+                errors.append(f"{r263_patch.name} does not gate the mach_msg2 fields on the trap number: "
+                              "registers of a thread that is not in the trap are not port names")
+            baseline_script = (REPO.parent / "UniXNU" /
+                               "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_head = next((line for line in baseline_script.splitlines()
+                              if line.startswith("for LATE_PATCH in")), "")
+            if r263_name not in late_head:
+                errors.append("build-xnu-4k-baseline.sh does not reverse r263 first in LATE_PATCH: the "
+                              "compile pass would run on the widened-census tree and a replay failure "
+                              "would look like a broken patch instead of an out-of-order one")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r263_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r263_name} is missing: unixnu loads patches from "
+                              "that directory and silently skips a board patch that lives only in "
+                              "this repo")
+            if '{ "clover r262: ", "r262-th", 384, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci no longer carries the census class: the widened row "
+                              "is the same producer and shares its budget, so a missing entry drops the "
+                              "reading entirely")
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -3175,8 +3233,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r262:"):
-        errors.append('[payload] title is not "clover r262: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r263:"):
+        errors.append('[payload] title is not "clover r263: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4228,8 +4286,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r262:"):
-        errors.append('[payload] title is not "clover r262: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r263:"):
+        errors.append('[payload] title is not "clover r263: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

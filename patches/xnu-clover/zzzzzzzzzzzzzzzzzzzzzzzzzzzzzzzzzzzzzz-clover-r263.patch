@@ -1,0 +1,105 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11775,7 +11775,8 @@
+  * that shape is what this pass copies, minus the weights, because one beat has to
+  * fit the card's last 512 kernel rows.
+  */
+-#define CLOVER_BB_CENSUS 14
++#define CLOVER_BB_CENSUS 20
++#define CLOVER_BB_M2_TRAP  (-47)
+ 
+ static void
+ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+@@ -11841,6 +11842,12 @@
+ 	uint64_t cwe[CLOVER_BB_CENSUS];
+ 	uint64_t ccont[CLOVER_BB_CENSUS];
+ 	uint64_t cpc[CLOVER_BB_CENSUS];
++	uint64_t cdl[CLOVER_BB_CENSUS];
++	uint64_t dl_ns;
++	uint64_t cm2[CLOVER_BB_CENSUS];
++	uint64_t crn[CLOVER_BB_CENSUS];
++	uint64_t csn[CLOVER_BB_CENSUS];
++	uint64_t crem[CLOVER_BB_CENSUS];
+ 	uint32_t cst[CLOVER_BB_CENSUS];
+ 	uint32_t cn = 0;
+ 	uint32_t call = 0;
+@@ -12034,9 +12041,37 @@
+ 		cwe[cn] = (uint64_t)(uintptr_t)thr->wait_event;
+ 		ccont[cn] = (uint64_t)(uintptr_t)thr->continuation;
+ 		cpc[cn] = 0;
++		cdl[cn] = 0;
++		if (thr->wait_timer_armed && thr->wait_timer != NULL) {
++			dl_ns = 0;
++			absolutetime_to_nanoseconds(thr->wait_timer->tc_soft_deadline,
++			    &dl_ns);
++			dl_ns /= 1000000000ULL;
++			cdl[cn] = dl_ns > secs ? dl_ns - secs : 1;
++		}
++		cm2[cn] = 0;
++		crn[cn] = 0;
++		csn[cn] = 0;
++		crem[cn] = 0;
+ 		if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1 &&
+ 		    !is_saved_state32(ss) && (thr->state & TH_RUN) == 0) {
+ 			cpc[cn] = (uint64_t)get_saved_state_pc(ss);
++			/*
++			 * Round263. A thread parked in the mach_msg2 trap carries the
++			 * names of the right it sent on and the right it receives on in
++			 * its saved registers, exactly where the hop rows already read
++			 * them (r230/r231: x5's high half is the receive name, x6 the
++			 * send name, x3's low half the send right's remote name). The
++			 * hop capture is four slots wide, which boot 49 showed is a cap
++			 * and not a count -- the census row is where those names stop
++			 * being limited to four threads.
++			 */
++			if ((int64_t)saved_state64(ss)->x[16] == CLOVER_BB_M2_TRAP) {
++				cm2[cn] = (uint64_t)CLOVER_BB_M2_TRAP;
++				crn[cn] = (uint64_t)saved_state64(ss)->x[5] >> 32;
++				csn[cn] = (uint64_t)saved_state64(ss)->x[6];
++				crem[cn] = (uint64_t)saved_state64(ss)->x[3];
++			}
+ 		}
+ 		cn++;
+ 	}
+@@ -12080,14 +12115,36 @@
+ 	if (bb_census_t == 0 || secs >= bb_census_t + 120) {
+ 		bb_census_t = secs;
+ 		printf("clover r262: census t=%llu pid=%d threads=%u shown=%u"
+-		    " wait=%u run=%u\n", (unsigned long long)secs, pid, call, cn,
+-		    cwait, crun);
++		    " hidden=%u wait=%u run=%u\n", (unsigned long long)secs, pid,
++		    call, cn, (call > cn) ? call - cn : 0, cwait, crun);
+ 		for (i = 0; i < cn; i++) {
++			char peer[24];
++
++			/*
++			 * Round263. The send right's owner is the task that will answer:
++			 * translating a send name in this space resolves through the port
++			 * object to its receiver's space, so the name names the far side
++			 * and not this one (r233 built that lookup for the hop rows, where
++			 * four slots were all it had). An empty peer is not "no answer is
++			 * coming", it is "this thread is not in the trap" -- the deadline
++			 * says which of the two shapes it is: 0 = no timer armed, so the
++			 * wait was given no timeout and nothing will ever expire it, nonzero
++			 * = seconds left on the wait_timer this thread blocked with.
++			 */
++			peer[0] = '\0';
++			if ((int64_t)cm2[i] == CLOVER_BB_M2_TRAP && csn[i] != 0) {
++				clover_sb_port_owner(task, (mach_port_name_t)csn[i],
++				    peer, sizeof(peer));
++			}
+ 			printf("clover r262: th tid=%llx st=%x we=%llx cont=%llx"
+-			    " pc=%llx\n", (unsigned long long)ctid[i], cst[i],
++			    " pc=%llx dl=%llx m2=%llx rn=%x sn=%x rem=%x peer=%s\n",
++			    (unsigned long long)ctid[i], cst[i],
+ 			    (unsigned long long)cwe[i],
+ 			    (unsigned long long)ccont[i],
+-			    (unsigned long long)cpc[i]);
++			    (unsigned long long)cpc[i],
++			    (unsigned long long)cdl[i], (unsigned long long)cm2[i],
++			    (unsigned int)crn[i], (unsigned int)csn[i],
++			    (unsigned int)(uint32_t)crem[i], peer[0] ? peer : "-");
+ 		}
+ 	}
+ 

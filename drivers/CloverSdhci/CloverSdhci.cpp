@@ -805,8 +805,14 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // leave is either asleep on that very word, which the census shows as a second sleeper on the same
   // address, or idle and never handed the block. Fifteen lines per beat inside an 1800 s deadline is
   // about 225 of them; a class that runs out mid-boot drops exactly the late readings the ring window
-  // needs, so the budget bounds the producer without trimming its tail.
-  { "clover r262: ", "r262-th", 256, 0, 0, 0 },
+  // needs, so the budget bounds the producer without trimming its tail. Round263 widens each row (the
+  // block deadline, the mach_msg2 names, and the owner of the send right -- the service an answer is
+  // owed by) and the cap from fourteen rows to twenty with a hidden count, so the line count per beat
+  // is still one header plus the rows, but twenty of them: boot 49 spent 5 beats and 75 lines in a window
+  // that ends at 1786 s, and the same cadence against the 1800 s deadline with the widened cap is 273
+  // lines -- 315 if the beat holds its nominal two minutes. 384 so the widest legal census cannot
+  // reach its own tail.
+  { "clover r262: ", "r262-th", 384, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

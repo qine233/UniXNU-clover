@@ -226,9 +226,11 @@ pid 58 没有一个线程睡在 IOKit 或驱动路径上，而且有六个空闲
 （补丁 struct 里是 waits/blocked/woken/wakes），`a=2047ad580` 的 `w=14 b=14 k=14 s=15`
 是一把热而无争的缓存内全局锁，不是十四个线程挤在同一把锁上。仪器自己的两处不足也写进读数旁边：
 cap 每拍撞上（`threads=17 shown=14`），而 `_ipc_mqueue_receive_continue` 分不清「空闲等活」与
-「在等一个永远不来的回音」——同形。r263 照 sheng 补这两处：普查行加 `dl=`
-（`block_deadline`：0=无限等、有限=定时等，等回音是定时等），把 `wait_event` 走到 port 再走
-r232/r234 的 owner 名字路报出「它在等哪个服务」（sheng 的 `peer`），上限抬到 20 并打印 `hidden=`。
+「在等一个永远不来的回音」——同形。r263 照 sheng 补这两处：普查行加 `dl=`——本板内核没有
+`block_deadline` 这个字段（编译拒绝），定时等真记在 `thread->wait_timer`（`waitq.c:1391` 装填、
+`timer_call.h:73` 存绝对期限），所以 `dl=` 报「还剩几秒」，0=没装定时器=无限等；对还停在 mach_msg2
+陷阱里的线程（`x16==-47`）按 r230/r231 的老约定解出发送权名，用 r232/r233 的 owner 路报出
+「它在等哪个服务」（sheng 的 `peer`）；上限抬到 20 并在表头打印 `hidden=`。
 同一靴 SpringBoard 换了活法：`sbs t=1250 pid=272` 里也有一条线程睡在同一种 ulock 上，窗口内 0 条 `killsig`。|
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 3），再问地址  r259 不等轨先把地址再问一遍（`clover-input=3` 回膛），理由是同一趟正在发合成手指，需要知道总线上到底有没有真坐标 || 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨  **boot 47 的教训不是「面板没答」，是「答案回不来」**：仪器跑了，42 行说在 t≈12 s，而环这次从 t=1194.04 起——r260 不再插第二次心跳，改抄 sheng 的机制：`drivers/CloverInput/CloverInput.cpp:241` 的 `clover_input_observation[16]`（自 r181 就为「不依赖日志环」而存在）由 beat 每拍重述成一条 `clover r260: bus mode=.. … verdict=..`，总线仍一靴只碰一次；sheng 的驱动根本不 print（`TouchProbe.cpp:29` 的行数组 + `BootLog.c:340-356` 每 2 秒 compose），所以它的早期读数活得下来，因为那是状态。`mode=0` 也打印——没跑过必须说出来。 **boot 48（r260 实机）把答案带回来了，而且每拍都有**：
 `bus mode=3 … xfers=4 timeout=0 nack=4 verdict=102` 与 r183 一字不差——电气与协议栈都活着，

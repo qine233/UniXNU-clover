@@ -1051,10 +1051,14 @@ def check_sb_sample(kernel: bytes) -> bool:
              # filtered to threads that are waiting AND not in the trap, so they cannot show a second
              # sleeper on the same word or an idle worker that never got the block. Both literals are
              # pinned whole, because a format string cut in half still leaves every prefix needle green.
+             # Round262's census row, then Round263's wider one: the deadline separates an untimed idle
+             # wait from a timed one, and the send right's owner names the service an answer is owed by --
+             # the four-slot hop capture was a cap, not a count, so this is where that stops. Both
+             # literals are pinned whole (r252's lesson: an eaten format string leaves prefix needles green).
              "bb-census-row": (b"clover r262: census t=%llu pid=%d threads=%u shown=%u"
-                               b" wait=%u run=%u\n") in kernel,
+                               b" hidden=%u wait=%u run=%u\n") in kernel,
              "bb-census-th": (b"clover r262: th tid=%llx st=%x we=%llx cont=%llx"
-                              b" pc=%llx\n") in kernel,
+                              b" pc=%llx dl=%llx m2=%llx rn=%x sn=%x rem=%x peer=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,
              # Round257: the gate that made boot 44 say published=0 must be gone from the shipped image,
              # and the flag it tested has to still be readable as a value.
