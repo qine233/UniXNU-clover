@@ -1065,7 +1065,15 @@ def check_sb_sample(kernel: bytes) -> bool:
                                b" hidden=%u wait=%u run=%u rx=%u tm=%u\n") in kernel,
              "bb-census-th": (b"clover r262: th tid=%llx st=%x we=%llx cont=%llx"
                               b" pc=%llx dl=%llx m2=%llx rcv=%x remote=%x local=%x to=%llx"
-                              b" sz=%x mc=%u sr=%x peer=%s\n") in kernel,
+                              b" sz=%x mc=%u sr=%x rmc=%u rsr=%x peer=%s\n") in kernel,
+             # Round265: boot 51 resolved the one outstanding send right to pid 140, so the shipped kernel
+             # has to walk that task as well (a header per fire plus its rows) and must not lose r264's row
+             # in the process. A payload without the peer rows names a debtor and then reads nothing about
+             # it, which is the reading this round exists to get.
+             "bb-peer-header": (b"clover r265: peer t=%llu pid=%d comm=%s%s threads=%u shown=%u"
+                                b" hidden=%u wait=%u run=%u rx=%u tm=%u\n") in kernel,
+             "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx dl=%llx"
+                             b" rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x peer=%s\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

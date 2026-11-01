@@ -19854,3 +19854,39 @@ r264 之前只知道前者，现在第一次点名了后者。r260 的触摸判�
 **(b) 把 `mc=`/`sr=` 也读在 `remote=6b0f` 那颗端口上**，也就是 datamigrator 自己的收信队列深度：
 `mc_remote>0` 说明**消息还排在它队列里没人取**（它自己被别的东西卡住），
 `mc_remote=0` 说明**它取走了、正在处理、没回**。两支的分岔不同，一支查它的等待者，一支查它的活儿。
+## r265 落地：把同一把尺子挪到债主身上（pid 140 = com.apple.datamigrator）
+
+boot 51 给的是一个名字，不是解释。r265 不加新仪器，只做两件事：**①对那颗端口真正的接收者任务
+跑同一份线程普查；②把 `mc=`/`sr=` 也读在 `remote=` 上**——因为债主的队列深度才分得开两种形状：
+`rmc>0` = 消息还排在它队列里没人取（它自己被别的东西卡住，去查它的等待者）；
+`rmc=0` 而我们还在睡 = 它取走了活儿没回（去查它的活儿）。
+
+`osfmk/kern/task.c` 三处（补丁 `zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r265.patch`，40 个 z，
+坐在 r264 上、`LATE_PATCH` 最先摘除）：
+
+1. `clover_bb_peer_task(task, name)`：SEND→RECEIVE 两次 `ipc_object_translate`，`IOT_PORT` 就
+   `ip_get_receiver` 取接收者 task 并 `task_reference`。和 `clover_sb_port_owner` 的区别写在注释里：
+   那个给标签，这个给**对象**，而对象会在别人的线程被走完之前退出。
+2. `clover_bb_peer_census(peer, secs)`：`try_lock(&peer->lock)` → `queue_iterate(&peer->threads)`，
+   每拍一行表头 + 最多 12 行（`CLOVER_BB_PEER_ROWS 12`），字段沿用 r264 的字面
+   （`tid/st/cont/dl/rcv/remote/to/mc/sr/rmc/rsr/peer=`），但 `peer=` 用**债主自己的 space** 解，
+   所以它报的是「datamigrator 此刻在等谁」——下一跳自动出来。它**不调用** `clover_bb_sample`：
+   两者共享同一组去重 statics，嵌套会把第一份的行吞掉（`check-clover.py` 现在按字符串禁止这件事）。
+3. 普查行本身多两格 `rmc=`/`rsr=`，`clover_sb_port_mail` 原样复用（同一段 translate 对 SEND 名也成立：
+   先试 RECEIVE 失败就试 SEND，落到的都是同一颗 port 对象）。
+
+**读数的语义要先说清楚再印出来**：`sr=1` 在我们自己的回音端口上，是内核为在途
+`MACH_SEND_REPLY` 消息持的那一份发送权，**不是「还有别人能回」**；这句话写进补丁注释、board 标题
+和 `check-clover.py` 的注释块，就是防止下一轮又把它读成容量。
+
+通道与配额：新前缀 `clover r265: ` 必须有新 tee 类，否则整批行直接被丢——
+`drivers/CloverSdhci/CloverSdhci.cpp` 加 `{ "clover r265: ", "r265-peer", 224, 0, 0, 0 }`
+（15 拍 × 13 行 = 195，224 留一点余量）。契约同步：`check-clover.py` 钉住 11 条补丁内字面量、
+LATE 顺序改成**顺序断言**（r265 在 r264 前、r264 在 r263 前——原来的「r264 必须是表头第一项」
+被这次叠放自己作废，这是本项目第三次被同一种断言咬到），`verify-clover-payload.py` 把普查行
+钉成含 `rmc=%u rsr=%x` 的新形状并新增 `bb-peer-header`/`bb-peer-row`。
+
+**这一轮也把自己写文件的手法修了一次**：给 README 追加读数时，脚本按「找到 `| 6 |` 就截一半」
+重建字符串，结果**把 v0.6.38 之后的 119 行全删了**（提交前 `git diff --stat` 才露出来）。
+从 HEAD 恢复后改成只做整串锚点替换，并加了一条断言：长度必须变大。规矩：**改文档的脚本只在
+整串上做 `replace`，不许用切片重组文件**，`--stat` 里出现大段删除就先当事故处理。

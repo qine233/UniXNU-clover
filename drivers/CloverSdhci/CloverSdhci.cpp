@@ -813,6 +813,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // lines -- 315 if the beat holds its nominal two minutes. 384 so the widest legal census cannot
   // reach its own tail.
   { "clover r262: ", "r262-th", 384, 0, 0, 0 },
+  // Round265 fires a second census on the same 120 s clock, against the task that owes the answer boot 51
+  // named. Its rows are capped at twelve, so a fire is one header plus at most twelve rows, thirteen lines:
+  // the same fifteen fires that budgeted r262-th at 384 give 195 here, and 224 keeps the widest legal peer
+  // census off its own tail without spending half again a ring on a process the boot may never even reach.
+  { "clover r265: ", "r265-peer", 224, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

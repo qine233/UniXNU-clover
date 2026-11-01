@@ -1980,12 +1980,16 @@ def check_board(errors: list) -> str:
                               "has to say how many waiters hold no send right without a reader recounting rows")
             baseline_script = (REPO.parent / "UniXNU" /
                                "scripts/build-xnu-4k-baseline.sh").read_text()
-            late_head = next((line for line in baseline_script.splitlines()
-                              if line.strip().startswith("for LATE_PATCH in")), "")
-            if r264_name not in late_head:
-                errors.append("build-xnu-4k-baseline.sh does not reverse r264 first in LATE_PATCH: the "
-                              "compile pass would run on the r263-shaped tree, and a replay failure would "
-                              "read as a broken patch rather than an out-of-order one")
+            # An order assertion, not a "first in the list" one: r265 sits on top of r264, so r264 can no
+            # longer be the head and demanding it would fail for the right reason and the wrong cause.
+            late_list = " ".join(line for line in baseline_script.splitlines()
+                                 if "clover-r2" in line)
+            if (late_list.find(r264_name) < 0 or
+                    late_list.find("z" * 40 + "-clover-r265.patch") > late_list.find(r264_name) or
+                    late_list.find(r264_name) > late_list.find("z" * 38 + "-clover-r263.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r264 between r265 and r263 in "
+                              "LATE_PATCH: the compile pass would run on a tree this patch was not written "
+                              "against, and a replay failure would read as a broken patch")
             load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r264_name
             if not load_copy.is_file():
                 errors.append(f"UniXNU/patches/xnu/{r264_name} is missing: unixnu loads patches from "
@@ -1995,6 +1999,61 @@ def check_board(errors: list) -> str:
                 errors.append("drivers/CloverSdhci dropped the census class this row is budgeted under: "
                               "the re-decode keeps one header plus twenty rows per beat, so the same "
                               "producer needs the same class")
+
+        # Round265 turns the ruler around. Boot 51 resolved peer= for the one thread in backboardd that
+        # holds a send right -- tid 0x43d, remote=0x6b0f, rcv=0xc903, mc=0, four beats in a row -- to
+        # pid 140, whose comm XNU itself truncates at fifteen characters (MAXCOMLEN), and the only image
+        # path matching com.apple.datam... is DataMigration.framework's com.apple.datamigrator XPC
+        # service. A name is not an explanation, so the census now also runs on the debtor task, and the
+        # queue of the port the request was actually sent to is read as rmc=/rsr=. sr=1 on the waiter's own
+        # reply port is the kernel's held reply right for an in-flight MACH_SEND_REPLY message, which is
+        # why the new pair is on the remote side instead.
+        r265_name = "z" * 40 + "-clover-r265.patch"
+        r265_patch = next((base / "patches/xnu-clover" / r265_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r265_name).is_file()), None)
+        if r265_patch is None:
+            errors.append(f"patches/xnu-clover/{r265_name} is missing: without it the boot names a debtor "
+                          "and then reads nothing about it")
+        else:
+            r265_text = r265_patch.read_text()
+            r265_added = "".join(line for line in r265_text.splitlines(True)
+                                 if line.startswith("+"))
+            for needle in ('clover_bb_peer_task(task_t task, mach_port_name_t name)',
+                           'clover_bb_peer_census(task_t peer, uint64_t secs)',
+                           'queue_iterate(&peer->threads, thr, thread_t, task_threads)',
+                           '#define CLOVER_BB_PEER_ROWS 12',
+                           'clover_sb_port_mail(task, (mach_port_name_t)crem[i], &rmc,',
+                           '" sz=%x mc=%u sr=%x rmc=%u rsr=%x peer=%s\\n"',
+                           '"clover r265: peer t=%llu pid=%d comm=%s%s threads=%u shown=%u"',
+                           '" rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x peer=%s\\n"',
+                           'clover_sb_port_owner(peer, (mach_port_name_t)prm[i], ppeer,',
+                           'clover_bb_peer_census(peer_task, secs);',
+                           'task_deallocate(peer_task);'):
+                if needle not in r265_added:
+                    errors.append(f"{r265_patch.name} lacks {needle[:64]!r}: that is the reading which tells "
+                                  "an unanswered request from one the debtor never took")
+            # The peer census must not be able to call back into the sampler that calls it.
+            if 'clover_bb_sample(' in r265_added:
+                errors.append(f"{r265_patch.name} calls the sampler from inside the peer census: the two "
+                              "share the dedupe statics, so a second process would swallow the first one's "
+                              "rows")
+            baseline_script = (REPO.parent / "UniXNU" /
+                               "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_head = next((line for line in baseline_script.splitlines()
+                              if line.strip().startswith("for LATE_PATCH in")), "")
+            if r265_name not in late_head:
+                errors.append("build-xnu-4k-baseline.sh does not reverse r265 first in LATE_PATCH: the "
+                              "compile pass would run on the r264-shaped tree and a replay failure would "
+                              "read as a broken patch rather than an out-of-order one")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r265_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r265_name} is missing: unixnu loads patches from that "
+                              "directory and silently skips a board patch that lives only in this repo")
+            if '{ "clover r265: ", "r265-peer", 224, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci has no class for the peer census: twelve rows plus a "
+                              "header on a two-minute clock is 195 lines across a 1800 s boot, and an "
+                              "unjewelled prefix means the boot reads as if the debtor was never walked")
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -3300,8 +3359,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r264:"):
-        errors.append('[payload] title is not "clover r264: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r265:"):
+        errors.append('[payload] title is not "clover r265: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4353,8 +4412,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r264:"):
-        errors.append('[payload] title is not "clover r264: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r265:"):
+        errors.append('[payload] title is not "clover r265: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

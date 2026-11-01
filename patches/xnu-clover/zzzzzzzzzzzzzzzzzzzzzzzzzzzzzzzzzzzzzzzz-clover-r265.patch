@@ -1,0 +1,246 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11819,7 +11819,183 @@
+  */
+ #define CLOVER_BB_CENSUS 20
+ #define CLOVER_BB_M2_TRAP  (-47)
++
++#define CLOVER_BB_PEER_ROWS 12
++
++/*
++ * Round265. The receiver's task behind a name in someone else's space, with the
++ * reference the caller has to hold: a task can exit while its threads are being
++ * walked, and unlike clover_sb_port_owner this is not a label, it is the object
++ * the census below runs on.
++ */
++static task_t
++clover_bb_peer_task(task_t task, mach_port_name_t name)
++{
++	ipc_space_t space;
++	ipc_object_t obj = IPC_OBJECT_NULL;
++	task_t peer = TASK_NULL;
++	kern_return_t kr;
++
++	if (name == MACH_PORT_NULL) {
++		return TASK_NULL;
++	}
++	space = task->itk_space;
++	if (space == IPC_SPACE_NULL) {
++		return TASK_NULL;
++	}
++	kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_SEND, &obj);
++	if (kr != KERN_SUCCESS) {
++		kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_RECEIVE,
++		    &obj);
++	}
++	if (kr != KERN_SUCCESS) {
++		return TASK_NULL;
++	}
++	if (io_otype(obj) == IOT_PORT) {
++		ipc_space_t recv = ip_get_receiver((ipc_port_t)obj);
++
++		if (recv != IPC_SPACE_NULL && recv->is_task != TASK_NULL) {
++			peer = recv->is_task;
++			task_reference(peer);
++		}
++	}
++	io_unlock(obj);
++	return peer;
++}
++
++/*
++ * Round265. Boot 51 named the debtor of the one outstanding request in the
++ * blocked process -- pid 140, com.apple.datamigrator, four beats running,
++ * rcv=0xc903 with an empty queue and no deadline -- and a name is not an
++ * explanation. The same ruler goes onto it: every thread it has, what it sleeps
++ * on, whether it is itself in the trap with a request of its own, and that
++ * request's owner resolved in the peer's own space. It never calls
++ * clover_bb_sample, so a debtor that is itself a waiter cannot recurse.
++ */
++static void
++clover_bb_peer_census(task_t peer, uint64_t secs)
++{
++	thread_t thr;
++	unsigned int i;
++	struct proc *pp;
++	char *pname;
++	char comm[16];
++	uint64_t ptid[CLOVER_BB_PEER_ROWS];
++	uint64_t pcont[CLOVER_BB_PEER_ROWS];
++	uint64_t pdl[CLOVER_BB_PEER_ROWS];
++	uint64_t prm[CLOVER_BB_PEER_ROWS];
++	uint64_t prc[CLOVER_BB_PEER_ROWS];
++	uint64_t pto[CLOVER_BB_PEER_ROWS];
++	uint32_t pst[CLOVER_BB_PEER_ROWS];
++	uint32_t pn = 0;
++	uint32_t pcall = 0;
++	uint32_t pwait = 0;
++	uint32_t prun = 0;
++	uint32_t prx = 0;
++	uint32_t ptm = 0;
++	uint64_t pns;
++	int busy = 0;
++
++	if (!lck_mtx_try_lock(&peer->lock)) {
++		busy = 1;
++	} else {
++		queue_iterate(&peer->threads, thr, thread_t, task_threads) {
++			arm_saved_state_t *ss;
++
++			pcall++;
++			if ((thr->state & TH_WAIT) != 0) {
++				pwait++;
++			}
++			if ((thr->state & TH_RUN) != 0 &&
++			    (thr->state & TH_WAIT) == 0) {
++				prun++;
++			}
++			if (pn >= CLOVER_BB_PEER_ROWS) {
++				continue;
++			}
++			ss = get_user_regs(thr);
++			ptid[pn] = thr->thread_id;
++			pst[pn] = thr->state;
++			pcont[pn] = (uint64_t)(uintptr_t)thr->continuation;
++			pdl[pn] = 0;
++			prm[pn] = 0;
++			prc[pn] = 0;
++			pto[pn] = 0;
++			if (thr->wait_timer_armed && thr->wait_timer != NULL) {
++				pns = 0;
++				absolutetime_to_nanoseconds(
++				    thr->wait_timer->tc_soft_deadline, &pns);
++				pns /= 1000000000ULL;
++				pdl[pn] = pns > secs ? pns - secs : 1;
++			}
++			if (pdl[pn] != 0) {
++				ptm++;
++			}
++			if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1 &&
++			    !is_saved_state32(ss) && (thr->state & TH_RUN) == 0 &&
++			    (int64_t)saved_state64(ss)->x[16] == CLOVER_BB_M2_TRAP) {
++				prm[pn] = (uint64_t)saved_state64(ss)->x[3];
++				prc[pn] = (uint64_t)saved_state64(ss)->x[5] >> 32;
++				pto[pn] = (uint64_t)saved_state64(ss)->x[7];
++				if ((uint32_t)prm[pn] == 0) {
++					prx++;
++				}
++			}
++			pn++;
++		}
++		lck_mtx_unlock(&peer->lock);
++	}
++	comm[0] = '\0';
++	pp = (struct proc *)get_bsdtask_info(peer);
++	pname = (pp != NULL) ? proc_name_address(pp) : NULL;
++	if (pname != NULL) {
++		strlcpy(comm, pname, sizeof(comm));
++	}
++	printf("clover r265: peer t=%llu pid=%d comm=%s%s threads=%u shown=%u"
++	    " hidden=%u wait=%u run=%u rx=%u tm=%u\n", (unsigned long long)secs,
++	    task_pid(peer), comm, busy ? "busy" : "-", pcall, pn,
++	    (pcall > pn) ? pcall - pn : 0, pwait, prun, prx, ptm);
++	if (busy) {
++		return;
++	}
++	for (i = 0; i < pn; i++) {
++		char ppeer[24];
++		uint32_t pmc = 0;
++		uint32_t psr = 0;
++		uint32_t pmmc = 0;
++		uint32_t pmsr = 0;
+ 
++		/*
++		 * Three shapes again, because boot 50 proved that an unresolved name and
++		 * an absent one print alike otherwise. A thread outside the trap has no
++		 * port side to name at all, so its peer= stays empty and that is a third
++		 * reading, not a failure to resolve.
++		 */
++		ppeer[0] = '\0';
++		if ((uint32_t)prm[i] != 0) {
++			clover_sb_port_owner(peer, (mach_port_name_t)prm[i], ppeer,
++			    sizeof(ppeer));
++			if (ppeer[0] == '\0') {
++				strlcpy(ppeer, "?", sizeof(ppeer));
++			}
++			clover_sb_port_mail(peer, (mach_port_name_t)prm[i], &pmmc,
++			    &pmsr);
++		} else if ((uint32_t)prc[i] != 0) {
++			strlcpy(ppeer, "none", sizeof(ppeer));
++		}
++		if ((uint32_t)prc[i] != 0) {
++			clover_sb_port_mail(peer, (mach_port_name_t)prc[i], &pmc, &psr);
++		}
++		printf("clover r265: pth tid=%llx st=%x cont=%llx dl=%llx"
++		    " rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x peer=%s\n",
++		    (unsigned long long)ptid[i], pst[i],
++		    (unsigned long long)pcont[i], (unsigned long long)pdl[i],
++		    (unsigned int)prc[i], (unsigned int)(uint32_t)prm[i],
++		    (unsigned long long)pto[i], pmc, psr, pmmc, pmsr, ppeer);
++	}
++}
++
++
+ static void
+ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ {
+@@ -11899,6 +12075,7 @@
+ 	uint32_t call = 0;
+ 	uint32_t cwait = 0;
+ 	uint32_t crun = 0;
++	task_t peer_task = TASK_NULL;
+ 	/*
+ 	 * The census is re-stated on a clock, not on a change: the sampler itself
+ 	 * fires whenever the thread/hop set moves, which under a busy userland is
+@@ -12181,6 +12358,8 @@
+ 			char peer[24];
+ 			uint32_t mmc = 0;
+ 			uint32_t msr = 0;
++			uint32_t rmc = 0;
++			uint32_t rsr = 0;
+ 
+ 			/*
+ 			 * Round264. peer= is now the owner of the remote port the waiter
+@@ -12208,10 +12387,26 @@
+ 					}
+ 				}
+ 				clover_sb_port_mail(task, (mach_port_name_t)crn[i], &mmc, &msr);
++				/*
++				 * Round265. The same two numbers on the port this thread sent to,
++				 * which is the question boot 51 leaves open: sr=1 there is the
++				 * kernel's own held reply right for an in-flight MACH_SEND_REPLY
++				 * message, so it says nothing about who else could answer. rmc=
++				 * does: mail still queued at the debtor means it never took the
++				 * request, an empty queue with the waiter still asleep means it
++				 * took the work and has not answered. peer_task is the first
++				 * debtor found and gets the census of its own below.
++				 */
++				clover_sb_port_mail(task, (mach_port_name_t)crem[i], &rmc,
++				    &rsr);
++				if (peer_task == TASK_NULL) {
++					peer_task = clover_bb_peer_task(task,
++					    (mach_port_name_t)crem[i]);
++				}
+ 			}
+ 			printf("clover r262: th tid=%llx st=%x we=%llx cont=%llx"
+ 			    " pc=%llx dl=%llx m2=%llx rcv=%x remote=%x local=%x to=%llx"
+-			    " sz=%x mc=%u sr=%x peer=%s\n",
++			    " sz=%x mc=%u sr=%x rmc=%u rsr=%x peer=%s\n",
+ 			    (unsigned long long)ctid[i], cst[i],
+ 			    (unsigned long long)cwe[i],
+ 			    (unsigned long long)ccont[i],
+@@ -12219,8 +12414,13 @@
+ 			    (unsigned long long)cdl[i], (unsigned long long)cm2[i],
+ 			    (unsigned int)crn[i], (unsigned int)(uint32_t)crem[i],
+ 			    (unsigned int)(uint32_t)cloc[i], (unsigned long long)cto[i],
+-			    (unsigned int)(uint32_t)csn[i], mmc, msr, peer);
++			    (unsigned int)(uint32_t)csn[i], mmc, msr, rmc, rsr, peer);
+ 		}
++		if (peer_task != TASK_NULL) {
++			clover_bb_peer_census(peer_task, secs);
++			task_deallocate(peer_task);
++			peer_task = TASK_NULL;
++		}
+ 	}
+ 
+ 	/*
