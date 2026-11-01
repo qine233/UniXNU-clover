@@ -281,7 +281,15 @@ def resolve(namer, slide, addr):
     sym = namer.symbols(image)
     n = nearest(sym, unslid)
     if n:
-        bits.append('sym %s +%#x' % (n[1], unslid - n[0]))
+        # One address can carry several symbol entries -- a redacted local one and a named exported one.
+        # Prefer any name that survived, because that is the difference between "libdispatch somewhere"
+        # and the actual entry point the caller used.
+        at = n[0]
+        names = sorted({name for addr, name in sym if addr == at})
+        real = [x for x in names if x != '<redacted>']
+        chosen = real[0] if real else (names[0] if names else '<redacted>')
+        bits.append('sym %s%s +%#x' % (chosen, '' if len(real) > 1 else '', unslid - at)
+                    + (' (also %s)' % ', '.join(real[1:]) if len(real) > 1 else ''))
     return unslid, '%s (+%#x of %#x) %s' % (path, unslid - vm, vsz, '  '.join(bits))
 
 

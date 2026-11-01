@@ -20353,3 +20353,11 @@ workloop 的属主 0x36c 被一只 dispatch_semaphore 按住、而那只机器�
 **发送权在谁手里**仍然决定这是进程内自锁还是外头欠它一次 signal，且现在有了框架名可以对照读。
 主程序那几帧要命名得另找一块料：可执行文件自己也带 slide，卡上没有它的 `sbm2x`，下一版把
 `clover r221` 的取样点也挪到主程序一次，或者从 OS 卷里取出 `datamigrator` 本体再解。
+
+**⑥ 解码器再补一格（v0.6.51）**：同一地址可以挂多条符号项（一条被涂、一条是导出名），所以取「最近符号」时
+**把该地址上的所有名字收齐、优先挑没被涂掉的那个**。这一改把 `_mach_msg`、`_mach_msg_overwrite`、
+`_mach_msg2_internal`、`_CFRunLoopRunSpecific` 从 `<redacted>` 里救了出来；libdispatch 那几处仍是局部函数
+（真被涂掉），但**函数起点 + 偏移现在是跨靴稳定的身份**，够用来对照读栈了。整理出来的读法：
+`tid=0x36d` 与 `tid=0x36c` 的 frame5–frame9 都在 libdispatch（**workloop 工人线程的启动段**），
+中间夹着主程序自己的帧（`0x1009…`，缓存外），最外层是 lr/frame0 的 libdispatch 局部函数——
+即**工人在跑 datamigrator 交下来的 block，block 里调了 `dispatch_semaphore_wait`**。
