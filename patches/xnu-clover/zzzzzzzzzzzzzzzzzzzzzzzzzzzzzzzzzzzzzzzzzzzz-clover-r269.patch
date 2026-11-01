@@ -1,0 +1,256 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11939,15 +11939,24 @@
+  *
+  * The semaphore object is reached the way kdp_sema_find_owner reaches it -- the waitq the thread is
+  * enqueued on is the one embedded in it -- and this runs after that call, so the object has already
+- * been walked by the kernel's own path. The port is read through its fields rather than through
+- * ip_get_receiver(): that accessor asserts io_lock_held() and this census holds no port lock, and a
+- * panic from a probe is a lost boot, not a reading.
++ * been walked by the kernel's own path.
++ *
++ * Round269 corrects two things round268 wrote. The port is read under its own lock now:
++ * ip_get_receiver() asserts ip_mq_lock_held() (osfmk/ipc/ipc_port.h:528-532) -- not the io_lock_held
++ * round268's comment claimed -- and reading ip_receiver raw is wrong in general because that slot
++ * holds ip_destination for a port that is not in a space, so the space is only taken when
++ * ip_in_a_space() says it is one. And boot 55 showed receiver= empty for a reason round268 had not
++ * guessed: ipc_kobject_alloc_port() allocates every IKOT_* kernel port inside ipc_space_kernel, and
++ * ipc_space_create_special() (osfmk/ipc/ipc_init.c:159) gives that space no is_task at all. So a
++ * mach semaphore has no receiving process to name, ever; the row now says kspace instead of leaving
++ * the field blank, because "no receiver space" and "a receiver space with no task" are different
++ * readings and only one of them is true.
+  */
+ #define CLOVER_BB_SEMA_NAME 20
+ 
+ static int
+ clover_sema_state(thread_t thr, int *count, uint32_t *srights, uint32_t *otype,
+-    char *who, size_t wholen)
++    ipc_port_t *port_out, char *who, size_t wholen)
+ {
+ 	struct semaphore *sem;
+ 	ipc_port_t port;
+@@ -11959,6 +11968,7 @@
+ 	*count = 0;
+ 	*srights = 0;
+ 	*otype = 0;
++	*port_out = IP_NULL;
+ 	who[0] = '\0';
+ 	if (thr->waitq.wq_q == NULL) {
+ 		return 0;
+@@ -11974,19 +11984,98 @@
+ 	if (*otype != IOT_PORT) {
+ 		return 1;
+ 	}
+-	*srights = (uint32_t)port->ip_srights;
+-	space = port->ip_receiver;
++	*port_out = port;
++	io_lock((ipc_object_t)port);
++	*srights = (uint32_t)port->ip_srights;
++	space = ip_in_a_space(port) ? ip_get_receiver(port) : IPC_SPACE_NULL;
+ 	if (space == IPC_SPACE_NULL) {
++		io_unlock((ipc_object_t)port);
++		strlcpy(who, "no-space", wholen);
+ 		return 1;
+ 	}
+ 	recv = space->is_task;
++	io_unlock((ipc_object_t)port);
+ 	if (recv == TASK_NULL) {
++		/* ipc_space_kernel: the receiver of every kernel-object port, and it has no task. */
++		strlcpy(who, "kspace", wholen);
+ 		return 1;
+ 	}
+ 	pp = (struct proc *)get_bsdtask_info(recv);
+ 	pname = (pp != NULL) ? proc_name_address(pp) : NULL;
+ 	snprintf(who, wholen, "%d:%s", task_pid(recv), pname != NULL ? pname : "?");
+ 	return 1;
++}
++
++/*
++ * Round269. boot 55 settled that the debtor's semaphore has one waiter queued and exactly one send
++ * right left in the system, which is the middle branch: somebody can signal it and has not. Neither
++ * the semaphore nor its port says who that somebody is -- a port counts its send rights but does not
++ * point back at the spaces holding them -- so this asks the only thing that can answer.
++ *
++ * The asking is the kernel's own reverse lookup, not a scan: every ipc space keeps a reverse hash
++ * (ipc_hash.c) over its entry table that maps an object back to the name that refers to it, and
++ * ipc_hash_lookup() is the exported reader of it. It is the right instrument here for a reason beyond
++ * speed: that hash only holds pure send rights (the comment at ipc_hash.c:139 says so explicitly --
++ * receive, send-once, port-set and dead-name rights are not entered), so a hit is a process that can
++ * signal, which is the question, while a table scan would also name the receiver.
++ *
++ * CLOVER_BB_SEMA_PROBE processes is a cap, and it is printed as probed= alongside scanned= so a frame
++ * can tell "looked at every process and none of them holds it" from "stopped at the cap". Each space
++ * is read the way ipc_right_lookup_read() reads one: is_read_lock, then an SMR section, because the
++ * table can be swapped out from under a reader by a growing space (is_active_table() uses
++ * smr_serialized_load). No task lock is held here -- the census runs this after unlocking the peer,
++ * the way round266's stack walks do.
++ */
++#define CLOVER_BB_SEMA_PROBE 400
++
++static void
++clover_sema_send_holder(ipc_port_t port, uint64_t *hit_pid, uint64_t *hit_name,
++    uint64_t *hit_bits, uint32_t *scanned, uint32_t *probed)
++{
++	struct proc *pp;
++	task_t task;
++	ipc_space_t space;
++	mach_port_name_t name;
++	ipc_entry_t entry;
++	uint32_t pid;
++	extern struct proc *proc_find(int pid);
++	extern task_t proc_task(struct proc *p);
++	extern int proc_rele(struct proc *p);
++
++	*hit_pid = 0;
++	*hit_name = 0;
++	*hit_bits = 0;
++	*scanned = 0;
++	*probed = 0;
++	for (pid = 1; pid <= CLOVER_BB_SEMA_PROBE && *hit_pid == 0; pid++) {
++		pp = proc_find((int) pid);
++		if (pp == NULL) {
++			continue;
++		}
++		(*probed)++;
++		task = proc_task(pp);
++		if (task == TASK_NULL) {
++			proc_rele(pp);
++			continue;
++		}
++		space = task->itk_space;
++		if (space != IPC_SPACE_NULL) {
++			(*scanned)++;
++			is_read_lock(space);
++			if (is_active(space)) {
++				smr_ipc_enter();
++				if (ipc_hash_lookup(space, (ipc_object_t) port, &name, &entry)
++				    == TRUE) {
++					*hit_pid = pid;
++					*hit_name = (uint64_t) name;
++					*hit_bits = (uint64_t) IE_BITS_TYPE(entry->ie_bits);
++				}
++				smr_ipc_leave();
++			}
++			is_read_unlock(space);
++		}
++		proc_rele(pp);
++	}
+ }
+ 
+ /*
+@@ -12020,6 +12109,7 @@
+ 	uint32_t pot[CLOVER_BB_PEER_ROWS];
+ 	uint8_t psem[CLOVER_BB_PEER_ROWS];
+ 	char pwho[CLOVER_BB_PEER_ROWS][CLOVER_BB_SEMA_NAME];
++	ipc_port_t pport[CLOVER_BB_PEER_ROWS];
+ 	/*
+ 	 * Round266. Boot 52 showed the debtor asleep on five workloop notes and a mach semaphore, and the row
+ 	 * could not group them because it carried no wait-event word: for a wait whose object is not a port,
+@@ -12042,6 +12132,7 @@
+ 	uint32_t pst[CLOVER_BB_PEER_ROWS];
+ 	uint32_t pn = 0;
+ 	uint32_t pcall = 0;
++	int srhost_done = 0;
+ 	uint32_t pwait = 0;
+ 	uint32_t prun = 0;
+ 	uint32_t prx = 0;
+@@ -12075,9 +12166,10 @@
+ 			pdl[pn] = 0;
+ 			clover_wait_owner(thr, &phint[pn], &pak[pn], &pown[pn], &pctx[pn]);
+ 			psem[pn] = 0;
++			pport[pn] = IP_NULL;
+ 			if (phint[pn] == (uint32_t)kThreadWaitSemaphore) {
+ 				psem[pn] = (uint8_t)clover_sema_state(thr, &psc[pn],
+-				    &psp[pn], &pot[pn], pwho[pn], sizeof(pwho[pn]));
++				    &psp[pn], &pot[pn], &pport[pn], pwho[pn], sizeof(pwho[pn]));
+ 			}
+ 			if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1 &&
+ 			    !is_saved_state32(ss) && (thr->state & TH_RUN) == 0) {
+@@ -12241,10 +12333,30 @@
+ 		 */
+ 		if (psem[i] != 0) {
+ 			printf("clover r268: sem t=%llu pid=%d tid=%llx count=%d"
+-			    " srights=%u otype=%x receiver=%s\n", (unsigned long long)secs,
++			    " srights=%u otype=%x receiver=%s port=%llx\n", (unsigned long long)secs,
+ 			    task_pid(peer), (unsigned long long)ptid[i], psc[i], psp[i],
+-			    pot[i], pwho[i][0] != '\0' ? pwho[i] : "-");
++			    pot[i], pwho[i][0] != '\0' ? pwho[i] : "-",
++			    (unsigned long long)(uintptr_t)pport[i]);
+ 		}
++		/*
++		 * Round269. The one row r268 could not close: a semaphore with a waiter queued and a
++		 * send right still alive has an obliging task, and the object does not name it. Ask the
++		 * process list which space reverse-maps this port. Once per fire, on the first
++		 * semaphore row: the census has at most one such thread, and the lookup is per process.
++		 */
++		if (psem[i] != 0 && pport[i] != IP_NULL && !srhost_done) {
++			uint64_t shpid = 0, shname = 0, shbits = 0;
++			uint32_t shscan = 0, shprobe = 0;
++
++			srhost_done = 1;
++			clover_sema_send_holder(pport[i], &shpid, &shname, &shbits,
++			    &shscan, &shprobe);
++			printf("clover r269: srhost t=%llu pid=%d tid=%llx port=%llx hit=%llu"
++			    " name=%llx type=%llx scanned=%u probed=%u\n", (unsigned long long)secs,
++			    task_pid(peer), (unsigned long long)ptid[i],
++			    (unsigned long long)(uintptr_t)pport[i], shpid, shname, shbits,
++			    shscan, shprobe);
++		}
+ 	}
+ }
+ 
+@@ -12333,6 +12445,8 @@
+ 	uint32_t cot[CLOVER_BB_CENSUS];
+ 	uint8_t csem[CLOVER_BB_CENSUS];
+ 	char cwho[CLOVER_BB_CENSUS][CLOVER_BB_SEMA_NAME];
++	ipc_port_t cport[CLOVER_BB_CENSUS];
++	int csrhost_done = 0;
+ 	uint32_t cn = 0;
+ 	uint32_t call = 0;
+ 	uint32_t cwait = 0;
+@@ -12529,9 +12643,10 @@
+ 		cdl[cn] = 0;
+ 		clover_wait_owner(thr, &chint[cn], &cak[cn], &cown[cn], &cctx[cn]);
+ 		csem[cn] = 0;
++		cport[cn] = IP_NULL;
+ 		if (chint[cn] == (uint32_t)kThreadWaitSemaphore) {
+ 			csem[cn] = (uint8_t)clover_sema_state(thr, &csc[cn], &csp[cn],
+-			    &cot[cn], cwho[cn], sizeof(cwho[cn]));
++			    &cot[cn], &cport[cn], cwho[cn], sizeof(cwho[cn]));
+ 		}
+ 		if (thr->wait_timer_armed && thr->wait_timer != NULL) {
+ 			dl_ns = 0;
+@@ -12703,10 +12818,31 @@
+ 			 */
+ 			if (csem[i] != 0) {
+ 				printf("clover r268: sem t=%llu pid=%d tid=%llx count=%d"
+-				    " srights=%u otype=%x receiver=%s\n",
++				    " srights=%u otype=%x receiver=%s port=%llx\n",
+ 				    (unsigned long long)secs, pid,
+ 				    (unsigned long long)ctid[i], csc[i], csp[i], cot[i],
+-				    cwho[i][0] != '\0' ? cwho[i] : "-");
++				    cwho[i][0] != '\0' ? cwho[i] : "-",
++				    (unsigned long long)(uintptr_t)cport[i]);
++				/*
++				 * Round269, same question as the peer census asks: the send right
++				 * exists, name the process whose space reverse-maps it. Once per census,
++				 * because the lookup costs a pass over the process list and both
++				 * censuses can carry the row.
++				 */
++				if (cport[i] != IP_NULL && !csrhost_done) {
++					uint64_t shpid = 0, shname = 0, shbits = 0;
++					uint32_t shscan = 0, shprobe = 0;
++
++					csrhost_done = 1;
++					clover_sema_send_holder(cport[i], &shpid, &shname, &shbits,
++					    &shscan, &shprobe);
++					printf("clover r269: srhost t=%llu pid=%d tid=%llx port=%llx"
++					    " hit=%llu name=%llx type=%llx scanned=%u probed=%u\n",
++					    (unsigned long long)secs, pid,
++					    (unsigned long long)ctid[i],
++					    (unsigned long long)(uintptr_t)cport[i], shpid, shname,
++					    shbits, shscan, shprobe);
++				}
+ 			}
+ 		}
+ 		if (peer_task != TASK_NULL) {

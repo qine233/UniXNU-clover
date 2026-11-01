@@ -1090,9 +1090,15 @@ def check_sb_sample(kernel: bytes) -> bool:
              # Round268: the kernel names a semaphore's creator, not its signaller, so the shipped kernel has
              # to read the object itself -- waiters queued and send rights left -- or the deepest wait in the
              # chain stays unattributable. One row per semaphore waiter, in both censuses, so the constant is
-             # present once.
+             # present once. Round269 appends port= to it, because the sender-right scan below needs the object
+             # address on the frame to be checkable at all.
              "bb-sema-rights": (b"clover r268: sem t=%llu pid=%d tid=%llx count=%d"
-                                b" srights=%u otype=%x receiver=%s\n") in kernel,
+                                b" srights=%u otype=%x receiver=%s port=%llx\n") in kernel,
+             # Round269: boot 55 landed on count=-1 srights=1, the middle branch -- somebody can signal and has
+             # not. Only the process list knows who, through the per-space reverse hash that holds pure send
+             # rights. Without this row the round is a riddle again.
+             "bb-sema-holder": (b"clover r269: srhost t=%llu pid=%d tid=%llx port=%llx hit=%llu"
+                                b" name=%llx type=%llx scanned=%u probed=%u\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

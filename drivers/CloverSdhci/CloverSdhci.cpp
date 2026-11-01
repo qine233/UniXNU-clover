@@ -833,6 +833,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // waiter in the debtor and none in backboardd, so a fire costs a row or two; 64 covers twenty fires of the
   // pair of censuses, which is more beats than the 1800 s deadline allows.
   { "clover r268: ", "r268-sema", 64, 0, 0, 0 },
+  // Round269 prints one row per census fire, not one per waiter: the sender-right search is latched, because
+  // the scan it costs is a proc_find over pids 1..400 with an entry-table walk in each, and paying that for
+  // every semaphore row would starve the beat. Two censuses times twenty fires is forty rows inside the
+  // 1800 s deadline, so 64 is the same headroom r268 was given.
+  { "clover r269: ", "r269-srhost", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

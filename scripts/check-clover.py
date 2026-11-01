@@ -2206,13 +2206,15 @@ def check_board(errors: list) -> str:
                 if needle not in r268_added:
                     errors.append(f"{r268_patch.name} lacks {needle[:64]!r}: without it the semaphore row "
                                   "cannot say whether the wait is structurally unanswerable")
-            # The port must be read through its fields, not through ip_get_receiver(): that accessor asserts
-            # io_lock_held() and this census holds no port lock, so using it turns a probe into a panic. The
-            # call form is what is forbidden -- the round's own comment names the accessor to explain why.
-            if "= ip_get_receiver(" in r268_added:
-                errors.append(f"{r268_patch.name} resolves the semaphore's receiver through "
-                              "ip_get_receiver(): it asserts a held port lock, and a panic from a probe is "
-                              "a lost boot rather than a reading")
+            # The round that shipped this read it unlocked, which is the defect r269 removes -- not the
+            # accessor. ip_get_receiver() (osfmk/ipc/ipc_port.h:528) asserts ip_mq_lock_held(), so it is the
+            # SAFE form once the port is locked; what is unsafe is the raw port->ip_receiver, because for a
+            # port that is not in any space the same slot aliases ip_destination. A ban on the accessor was
+            # written from that misunderstanding and forbade the only correct usage, so it is reversed here
+            # and the requirement now lives in the round269 block.
+            if "space = port->ip_receiver;" not in r268_added:
+                errors.append(f"{r268_patch.name} no longer shows the unlocked raw read: this block records "
+                              "what r268 shipped so the r269 assertions have something to be a fix of")
             # A row that is only printed when the hint says semaphore: an unconditional read would dereference
             # the container_of result for waits that are not semaphores at all.
             if "if (phint[pn] == (uint32_t)kThreadWaitSemaphore) {" not in r268_added or \
@@ -2234,6 +2236,98 @@ def check_board(errors: list) -> str:
             if '{ "clover r268: ", "r268-sema", 64, 0, 0, 0 },' not in sdhci_source:
                 errors.append("drivers/CloverSdhci has no class for the semaphore-rights rows: a new prefix "
                               "is a producer of its own and an unbudgeted one drops the reading silently")
+
+        # Round269 names the holder of the one send right. boot 55 read count=-1 srights=1 on the debtor's
+        # semaphore, which is the middle branch of the r268 fork: the object is alive, a wake-up is owed, and
+        # nothing said by whom. A port counts send rights but never points back at the spaces holding them, so
+        # the census now asks the kernel's reverse lookup -- ipc_hash_lookup (osfmk/ipc/ipc_hash.c) maps
+        # (space, object) -> name, and the comment at ipc_hash.c:139 records that only pure send rights are
+        # entered there, which is exactly the set this round wants: a hit is a task that can signal, while a
+        # table scan would also name the receiver.
+        r269_name = "z" * 44 + "-clover-r269.patch"
+        r269_patch = next((base / "patches/xnu-clover" / r269_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r269_name).is_file()), None)
+        if r269_patch is None:
+            errors.append(f"patches/xnu-clover/{r269_name} is missing: boot 56 would again stop at srights=1 "
+                          "and never say who owes the signal")
+        else:
+            r269_text = r269_patch.read_text()
+            r269_added = "".join(line for line in r269_text.splitlines(True)
+                                 if line.startswith("+"))
+            for needle in ('clover_sema_send_holder(ipc_port_t port',
+                           '#define CLOVER_BB_SEMA_PROBE 400',
+                           'ipc_hash_lookup(space, (ipc_object_t) port, &name, &entry)',
+                           'smr_ipc_enter();',
+                           'smr_ipc_leave();',
+                           'is_read_lock(space);',
+                           'extern int proc_rele(struct proc *p);',
+                           'extern struct proc *proc_find(int pid);',
+                           'io_lock((ipc_object_t)port);',
+                           'io_unlock((ipc_object_t)port);',
+                           'space = ip_in_a_space(port) ? ip_get_receiver(port) : IPC_SPACE_NULL;',
+                           'strlcpy(who, "no-space", wholen)',
+                           'strlcpy(who, "kspace", wholen)',
+                           'receiver=%s port=%llx',
+                           '"clover r269: srhost t=%llu pid=%d tid=%llx port=%llx hit=%llu"',
+                           'name=%llx type=%llx scanned=%u probed=%u'):
+                if needle not in r269_added:
+                    errors.append(f"{r269_patch.name} lacks {needle[:64]!r}: without it the sender of the "
+                                  "semaphore stays unnamed, or the receiver is read the way r268 read it")
+            # The reversed contract. r268's checker forbade ip_get_receiver() because its comment claimed the
+            # accessor asserts io_lock_held(); it asserts ip_mq_lock_held() (ipc_port.h:528), so it is the
+            # correct reader once the port is locked, and the raw ip_receiver field is what must not be read:
+            # for a port with no space that slot aliases ip_destination, and the space pointer that follows is
+            # then dereferenced. Both halves are pinned, not just the ban.
+            if "ip_get_receiver(port)" not in r269_added:
+                errors.append(f"{r269_patch.name} still resolves the receiver by field: the accessor is the "
+                              "only reader of ip_receiver that checks the port is in a space at all")
+            if "space = port->ip_receiver;" in r269_added:
+                errors.append(f"{r269_patch.name} re-adds r268's raw ip_receiver read: an unlocked field read "
+                              "can hand back ip_destination, and the is_task dereference after it is a panic")
+            # proc_find/proc_task/proc_rele are not declared in any header task.c includes; every earlier
+            # census in this file declares them inside the function that uses them. Without that, proc_rele is
+            # an implicit declaration -- an error in this tree's C dialect, and proc_find's pointer return
+            # would be truncated to int if the compiler let it through.
+            if r269_added.count("extern int proc_rele(struct proc *p);") != 1:
+                errors.append(f"{r269_patch.name} does not declare proc_rele where it calls it: the sender "
+                              "scan would not compile, or would compile with a truncated proc_find")
+            # One helper, two callers, one latch each. A third call would put the process-list walk inside a
+            # held task lock, which is not what it was written for.
+            if r269_added.count("clover_sema_send_holder(") != 3:
+                errors.append(f"{r269_patch.name} calls clover_sema_send_holder "
+                              f"{r269_added.count('clover_sema_send_holder(') - 1} times instead of twice: the "
+                              "helper is allowed one definition and one call per census, and both censuses "
+                              "run it after dropping the peer task lock")
+            # The walk must sit in the print phase, not the collect phase: the peer task lock is dropped
+            # before rows are printed (round236 established that, and the round266 block above asserts it for
+            # the stack walk), and a proc_find pass belongs after it for the same reason. The unlock line is
+            # unchanged context here, so what this patch can prove is the order inside the print phase: the
+            # semaphore row is printed, and only then is its port looked up in the process list.
+            if r269_added.find("receiver=%s port=%llx") > r269_added.find(
+                    "clover_sema_send_holder(pport[i]"):
+                errors.append(f"{r269_patch.name} puts the sender-right walk before the semaphore row it "
+                              "belongs to: the census walks after the peer task lock is dropped, and that "
+                              "is the print phase this row lives in")
+            if r269_added.rfind("receiver=%s port=%llx") > r269_added.find(
+                    "clover_sema_send_holder(cport[i]"):
+                errors.append(f"{r269_patch.name} puts the blocked process's walk before its semaphore row, "
+                              "which is the same print-phase rule on the other census")
+            baseline_script = (REPO.parent / "UniXNU" /
+                               "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in baseline_script.splitlines()
+                                 if "clover-r2" in line)
+            if (late_list.find(r269_name) < 0 or
+                    late_list.find(r269_name) > late_list.find("z" * 43 + "-clover-r268.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r269 before r268 in LATE_PATCH: "
+                              "the compile pass would run on a tree this patch was not written against")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r269_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r269_name} is missing: unixnu loads patches from that "
+                              "directory and silently skips a board patch that lives only in this repo")
+            if '{ "clover r269: ", "r269-srhost", 64, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci has no class for the sender-right rows: a new prefix is a "
+                              "producer of its own and an unbudgeted one drops the reading silently")
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -3539,8 +3633,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r268:"):
-        errors.append('[payload] title is not "clover r268: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r269:"):
+        errors.append('[payload] title is not "clover r269: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3628,6 +3722,27 @@ def check_board(errors: list) -> str:
             errors.append("scripts/decode-clover-slide.py scans cache headers one page at a time: the "
                           "shared cache packs them every 32 bytes, so most images go unseen and frames "
                           "that are in the cache get reported as outside it")
+    # Round269's other half: the syntax gate that was missing when five errors went through as "clean".
+    # The ad-hoc check printed keep[:40] of the diagnostic stream, and task.c carries a thousand
+    # pre-existing -Wcast-function-type-strict warnings ahead of line 12000, so an undeclared proc_rele
+    # and two subscripts of an incomplete struct were never shown. The shipped tool has to derive its
+    # exit code from the compiler and has to treat the silently-wrong classes as hard errors.
+    syntax_tool = REPO / "scripts/check-clover-xnu-syntax.py"
+    if not syntax_tool.is_file():
+        errors.append("scripts/check-clover-xnu-syntax.py is missing: a round would again be "
+                      "self-certified by a diagnostic list that stops at forty lines")
+    else:
+        stext = syntax_tool.read_text()
+        for needle in ("compile_commands.json", "clean.insert(1, \"-fsyntax-only\")",
+                       "implicit function declaration", "incomplete type", "out-of-scope",
+                       "return 1 if (hard or r.returncode != 0) else 0"):
+            if needle not in stext:
+                errors.append("scripts/check-clover-xnu-syntax.py has no %r: without the real flags, the "
+                              "hard classes and the compiler's own exit code it is the truncated printer "
+                              "again" % needle)
+        if "[:40]" in stext or "keep[:40]" in stext:
+            errors.append("scripts/check-clover-xnu-syntax.py truncates the diagnostic list: that is the "
+                          "defect that let five errors in task.c ship as a clean check")
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -4632,8 +4747,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r268:"):
-        errors.append('[payload] title is not "clover r268: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r269:"):
+        errors.append('[payload] title is not "clover r269: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

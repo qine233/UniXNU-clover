@@ -20361,3 +20361,66 @@ workloop 的属主 0x36c 被一只 dispatch_semaphore 按住、而那只机器�
 `tid=0x36d` 与 `tid=0x36c` 的 frame5–frame9 都在 libdispatch（**workloop 工人线程的启动段**），
 中间夹着主程序自己的帧（`0x1009…`，缓存外），最外层是 lr/frame0 的 libdispatch 局部函数——
 即**工人在跑 datamigrator 交下来的 block，block 里调了 `dispatch_semaphore_wait`**。
+
+
+## r269 落地：发送权不再靠猜，直接问内核的反查表（补丁 44z，tee 类 r269-srhost）
+
+r268 读数⑤定的那一格——「那一份发送权在谁手里」——这一轮去要了。形状和当初的设计不一样，
+**换的理由值得记下来，因为它同时纠正了我对 `ipc_entry` 的两个误判**。
+
+**① 先按设计写了「扫任务端口表」，编译器告我三处不行。**
+设计里写的是「逐任务 `is_read_lock` → 走 `is_table[i].ie_object` 找等于这只 port 的那格」，
+我照着写完（`CLOVER_BB_SEMA_SLOTS 6000` 兜住扫描量），语法自检却报**干净**。真实情况是五个错误：
+
+- `proc_rele` **未声明**（`error: call to undeclared function`，ISO C99 之后隐式声明是错误）。
+  `proc_find`/`proc_task` 也只是「用了别的函数体里的 out-of-scope 声明」，警告级——
+  这条最阴：如果编译器的方言让它过去，`proc_find` 的返回值按 `int` 截断，
+  下一句就会拿半截地址当 `struct proc *` 解引用。**内核里这三个 BSD 帮手没有任何头文件声明它们**，
+  `task.c` 里每一处早期普查都是在**自己的函数体内**写 `extern` 声明（`task.c:10931-10933`、
+  `12372-12374`、`13624-13626`），我这轮第一次忘了。
+- `table[i]` 报 **`subscript of pointer to incomplete type 'struct ipc_entry_table'`**：
+  这棵树的层级表是不透明结构，索引要经 `ipc_entry_table_base()` / `ipc_entry_table_get()`，
+  而那两个访问器**没有对外头文件**（全树只有 `osfmk/ipc/*.c` 与 `kern/ipc_misc.c` 用得到）。
+  我当初写 `#include <ipc/ipc_entry.h>` 就指望能按下标走，是认错了一层抽象。
+
+**② 改成内核自己的反查：`ipc_hash_lookup()`，而且它语义上更对。**
+每颗 ipc 空间除了入口表还带一张**反向哈希**（`osfmk/ipc/ipc_hash.c`，就借入口表的 `ie_index` 字段活著），
+`ipc_hash_lookup(space, obj, &name, &entry)` 是它的对外读口（`ipc_hash.h:80`，条件写着「空间要读锁或写锁」）。
+换成它有两个好处，第二个才是决定性的：
+
+- 每个任务 O(1)，不再需要 `SLOTS` 这种总量兜底，`PROBE 400` 就是全部代价；
+- **这张表里只放纯发送权**。`ipc_hash.c:139` 那段注释原话：接收权、send-once、port-set、
+  dead-name 都**不入表**。所以命中就是「这个进程有权利 signal 这只机器号」；
+  我自己扫表反而会把**接收者**也报成债主——那正是 r268 已经知道不对的答案（`sem->owner` 就是创建者/接收侧）。
+
+锁的照抄对象换成 `ipc_right_lookup_read()`（`ipc_right.c:126` 起）：`is_read_lock(space)` →
+`smr_ipc_enter()` → 查 → `smr_ipc_leave()` → `is_read_unlock(space)`。
+SMR 那层不能省：空间会长表（`ipc_entry.c:581` 那处 grow），`is_active_table()` 内部是
+`smr_serialized_load`，**不进入 SMR 读临界区就是拿一个可能已经被换走的表指针**。
+调用点仍在**放开 peer 任务锁之后**（与 r266 的栈走查同一相位），每次普查只走一遍（`srhost_done`
+/ `csrhost_done` 两把闩），行是 `clover r269: srhost t= pid= tid= port= hit= name= type= scanned= probed=`；
+两条 r268 的 `sem` 行同时补上 ` port=%llx`，好让两边对得上。
+
+**③ receiver 这一格按 r268 读数④的账补上，checker 的禁令也翻过来了。**
+`clover_sema_state()` 现在在 `io_lock(port)` 里读 `ip_srights`，并且只在
+`ip_in_a_space(port)` 为真时才取 `ip_get_receiver(port)`；分不出来的两种情况各给一个标签：
+不在任何空间 ⇒ `no-space`，在 `ipc_space_kernel`（`ipc_space_create_special` 从不设 `is_task`）⇒ `kspace`。
+`check-clover.py` 里那条给错误理由加的 `"= ip_get_receiver("` 禁令**改成必须命中**，
+反过来把 `space = port->ip_receiver;` 钉成禁止项（它只能出现在减号行），
+并新增一条 `extern int proc_rele(struct proc *p);` 必须在加号行——**这一条就是给①那类错误上闸**。
+
+**④ 我自己那套语法自检是坏的，这轮把它做成工具。**
+`/tmp/r267syntax.py` 打印的是 `keep[:40]`，而 `task.c` 本来就有上千条
+`-Wcast-function-type-strict` 警告全排在前面，于是第 1189 条之后的真错误一条也看不见——
+「EXIT=0、新增区间零告警」是对**被截断的清单**的读数，不是对文件的读数。
+现在仓库里有 `scripts/check-clover-xnu-syntax.py`：它取 `compile_commands.json` 里那一条**原样的编译参数**
+跑 `-fsyntax-only`，错误**永不截断**，退出码来自编译器；并把 `implicit function declaration`、
+`undeclared`、`incomplete type`、`out-of-scope`、`conflicting types` 这些「链接不了或跑错」的类别
+一律按 HARD 处理，即使编译器只是警告。r269 这棵树现在跑它是 `exit=0 diagnostics=110 hard=0`。
+
+**⑤ 这一行仍然分三种结果，而②让第一种更可信**：`hit=` 落在债主自己的 pid ⇒ **进程内自锁**
+（只有纯发送权会命中，所以这就是同进程另一条线程攥着 signal 权）；落在别的 pid ⇒ **新的债主**，
+把 r265 那套普查挪到它身上；`hit=0` 且 `probed=400` ⇒ 那份 srights 是
+`convert_semaphore_to_port` 捐给端口的内核引用（或藏在 400 之外的进程里），
+仍是结构死等，但这次有正面证据。`scanned=` 报的是「看了几颗空间」，不是入口数——
+换了机制，这一格的含义也变了，读 boot 56 时按新含义读。
