@@ -57,7 +57,7 @@ volatile int clover_hid_load_status = -1, clover_hid_matching_load_status = -1, 
 volatile uint64_t clover_hid_device;
 volatile uint32_t clover_hid_events[8];
 volatile int clover_hid_results[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
-volatile uint32_t clover_hid_published, clover_hid_property_seen, clover_hid_presses;
+volatile uint32_t clover_hid_published, clover_hid_property_seen, clover_hid_presses, clover_hid_requests;
 volatile uint32_t clover_hid_sink_touch, clover_hid_sink_buttons;
 }
 
@@ -65,7 +65,9 @@ volatile uint32_t clover_hid_sink_touch, clover_hid_sink_buttons;
 // cannot put events in front of a display. A Home press is exactly what backboardd is waiting for,
 // but the driver's tick would otherwise press one every 1.1 s for the rest of the boot: this grants
 // a bounded number, three by default and offline-hid-auto-home-count=<n<=8> to change it, which is
-// sheng's spelling. Only the device's own work loop calls this, so a plain counter needs no lock.
+// sheng's spelling. Only the device's own work loop calls this, so a plain counter needs no lock --
+// and both counters are defined in the block above, since `extern "C" uint32_t x;` alone is a
+// declaration and a static kernel link is not going to answer it.
 extern "C" bool native_hid_input_requested(void) {
     static uint32_t budget;
     static bool configured;
@@ -78,8 +80,13 @@ extern "C" bool native_hid_input_requested(void) {
             budget = requested;
         }
     }
-    uint32_t taken = __atomic_fetch_add(&clover_hid_presses, 1, __ATOMIC_RELAXED);
-    return taken < budget;
+    // boot 44 counted 1086 of these and the line called them presses, which is how a reader would
+    // learn that the device had hammered the compositor a thousand times when in fact three grants
+    // were ever made. Ask and grant are two numbers now, because only the pair says the cap worked.
+    uint32_t asked = __atomic_fetch_add(&clover_hid_requests, 1, __ATOMIC_RELAXED);
+    if (asked >= budget) { return false; }
+    __atomic_fetch_add(&clover_hid_presses, 1, __ATOMIC_RELAXED);
+    return true;
 }
 
 extern "C" void native_hid_input_observed(unsigned event, int result) {
@@ -167,33 +174,38 @@ extern "C" __attribute__((noinline)) void native_hid_live_checkpoint(IOService *
             lastService = 0;
         } else {
             lastService = (unsigned long long)(uintptr_t)driver;
-            if (device->getProperty("Built-In") == nullptr) {
-                // No keyboard/pointing collection was ever published with Built-In set, so there is
-                // nothing to propagate; say so rather than publish a false identity.
-                snprintf(state, sizeof state, " device-has-no-built-in");
-            } else {
-                static IORegistryEntry *publishedFor;
-                if (publishedFor != driver) {
-                    publishedFor = driver;
-                    driver->setProperty("Built-In", kOSBooleanTrue);
-                    driver->setProperty("DisplayIntegrated", kOSBooleanTrue);
-                    // -[BKHIDDirectTouchEventProcessor processEvent:sender:dispatcher:] drops a digitizer
-                    // event unless the sending service is usage page 0x0D with usage 1, 4 or 0x20; this
-                    // device lists its keyboard collection first, so the services would otherwise
-                    // publish (1,6).
-                    driver->setProperty("PrimaryUsagePage", (unsigned long long)0x0d, 32);
-                    driver->setProperty("PrimaryUsage", (unsigned long long)4, 32);
-                    if (IORegistryEntry *interface = driver->getParentEntry(gIOServicePlane)) {
-                        interface->setProperty("Built-In", kOSBooleanTrue);
-                        interface->setProperty("DisplayIntegrated", kOSBooleanTrue);
-                        interface->setProperty("PrimaryUsagePage", (unsigned long long)0x0d, 32);
-                        interface->setProperty("PrimaryUsage", (unsigned long long)4, 32);
-                    }
-                    clover_hid_published = clover_hid_published + 1;
+            // Round255 copied this guard from sheng, and boot 44 showed what the copy cost:
+            // `if (device->getProperty("Built-In") == nullptr) return;` never became false on sheng
+            // because its device sets Built-In for itself, while drivers/NativeHidInput sets it only
+            // for a touch device (line 296: `if(touchOnly||touchEnabled)`) -- so this board's
+            // button-only device has no Built-In, the guard always refused, and the four keys were
+            // never published at all (published=0 seen=0 with the event driver matched and the device
+            // started). sheng's line copies the device's own flag; what this instrument is for is
+            // putting the classification on the service backboardd actually reads, so the device's
+            // flag is a reading now, not a precondition.
+            static IORegistryEntry *publishedFor;
+            if (publishedFor != driver) {
+                publishedFor = driver;
+                driver->setProperty("Built-In", kOSBooleanTrue);
+                driver->setProperty("DisplayIntegrated", kOSBooleanTrue);
+                // -[BKHIDDirectTouchEventProcessor processEvent:sender:dispatcher:] drops a digitizer
+                // event unless the sending service is usage page 0x0D with usage 1, 4 or 0x20; this
+                // device lists its keyboard collection first, so the services would otherwise
+                // publish (1,6).
+                driver->setProperty("PrimaryUsagePage", (unsigned long long)0x0d, 32);
+                driver->setProperty("PrimaryUsage", (unsigned long long)4, 32);
+                if (IORegistryEntry *interface = driver->getParentEntry(gIOServicePlane)) {
+                    interface->setProperty("Built-In", kOSBooleanTrue);
+                    interface->setProperty("DisplayIntegrated", kOSBooleanTrue);
+                    interface->setProperty("PrimaryUsagePage", (unsigned long long)0x0d, 32);
+                    interface->setProperty("PrimaryUsage", (unsigned long long)4, 32);
                 }
-                describeDriver(driver, used, state, sizeof state);
-                clover_hid_property_seen = 1;
+                clover_hid_published = clover_hid_published + 1;
             }
+            describeDriver(driver, used, state, sizeof state);
+            snprintf(state + used, used < sizeof state ? sizeof state - used : 0, " deviceBuiltIn=%d",
+                     device->getProperty("Built-In") != nullptr);
+            clover_hid_property_seen = 1;
         }
     }
     if (printed++ < 8) { printf("clover r255: device=%llx%s\n", (unsigned long long)clover_hid_device, state); }
@@ -207,10 +219,10 @@ extern "C" __attribute__((noinline)) void native_hid_live_checkpoint(IOService *
     }
     if (now >= nextBeat) {
         nextBeat += 120 * frequency;
-        printf("clover r255: beat stage=%d service=%llx%s published=%u seen=%u presses=%u sinks=%u,%u "
-               "transfer=%u\n", clover_hid_stage, lastService, state, clover_hid_published,
-               clover_hid_property_seen, clover_hid_presses, clover_hid_sink_touch,
-               clover_hid_sink_buttons, native_legacy_transfer_calls);
+        printf("clover r255: beat stage=%d service=%llx%s published=%u seen=%u presses=%u asks=%u "
+               "sinks=%u,%u transfer=%u\n", clover_hid_stage, lastService, state, clover_hid_published,
+               clover_hid_property_seen, clover_hid_presses, clover_hid_requests,
+               clover_hid_sink_touch, clover_hid_sink_buttons, native_legacy_transfer_calls);
     }
 }
 

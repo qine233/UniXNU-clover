@@ -1036,7 +1036,11 @@ def check_sb_sample(kernel: bytes) -> bool:
              # counter, and the gate is a clock rather than a call count because the driver calls the
              # checkpoint ten times a second while a press is held.
              "hid-beat": (b"clover r255: beat stage=%d service=%llx%s published=%u seen=%u presses=%u "
-                          b"sinks=%u,%u transfer=%u\n") in kernel,
+                          b"asks=%u sinks=%u,%u transfer=%u\n") in kernel,
+             # Round257: the gate that made boot 44 say published=0 must be gone from the shipped image,
+             # and the flag it tested has to still be readable as a value.
+             "hid-gate": (b"device-has-no-built-in") not in kernel,
+             "hid-flag": (b" deviceBuiltIn=%d") in kernel,
              "hid-early": (b"clover r255: device=%llx%s\n") in kernel,
              # The single-line-per-second print round255 shipped with is gone by design; leaving it in
              # the image would mean the beat was added without capping the early path, which is the one

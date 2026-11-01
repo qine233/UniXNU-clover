@@ -1938,14 +1938,25 @@ def check_board(errors: list) -> str:
                 errors.append("package/CloverHidInputProbe.cpp does not cap the early checkpoint at one "
                               "capped print: boot 43 showed the early lines are the ones the ring loses, "
                               "so they are bounded and the beat carries the rest")
-            for needle in ('"clover r255: beat stage=%d service=%llx%s published=%u seen=%u presses=%u '
-                           'sinks=%u,%u "',
-                           '"transfer=%u\\n"',
+            for needle in ('"clover r255: beat stage=%d service=%llx%s published=%u seen=%u presses=%u asks=%u "',
+                           '"sinks=%u,%u transfer=%u\\n"',
                            "mrs %0, cntpct_el0", "mrs %0, cntfrq_el0"):
                 if needle not in probe_text:
                     errors.append(f"package/CloverHidInputProbe.cpp lacks {needle[:56]!r}: without the "
                                   "beat this instrument says its verdict once at t=25 s into a ring that "
                                   "keeps 512 rows from t=1208 s, which is how round255 lost the answer")
+            # Round257: boot 44 read published=0 seen=0 with the event driver matched, and the cause was
+            # this file's own copy of sheng's precondition -- the vendored driver sets Built-In only for a
+            # touch device, so on a button device the guard refused forever. The flag is a reading now.
+            if 'device-has-no-built-in' in probe_text:
+                errors.append("package/CloverHidInputProbe.cpp still gates the publish on the device's "
+                              "own Built-In flag: boot 44 showed that gate is why nothing was ever "
+                              "published on a button-only device")
+            for needle in ('" deviceBuiltIn=%d"', "clover_hid_requests"):
+                if needle not in probe_text:
+                    errors.append(f"package/CloverHidInputProbe.cpp lacks {needle[:40]!r}: the device's "
+                                  "flag has to stay readable, and an ask is not a press -- 1086 of one "
+                                  "looked like a compositor being hammered when three grants were made")
             display_text = (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text()
             if not (0 <= display_text.find("clover_hid_input_probe();")
                     < display_text.find("IOService *display=pendingLegacyDisplay;")):
@@ -3019,8 +3030,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r256:"):
-        errors.append('[payload] title is not "clover r256: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r257:"):
+        errors.append('[payload] title is not "clover r257: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4072,8 +4083,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r256:"):
-        errors.append('[payload] title is not "clover r256: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r257:"):
+        errors.append('[payload] title is not "clover r257: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
