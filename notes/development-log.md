@@ -20498,3 +20498,31 @@ libdispatch 从 block 里等另一 block 时，正常是靠**再造一条工人�
 再和「五条工人睡着」同一帧比对。判定要能反证：若计数在涨而工人仍不醒，钥匙就不在 IPI，
 得回到 workloop 自己的 `wl_request` 事件；若计数**不涨**，那是本板第一次拿到 IPI 的正面判据。
 
+## r270 的实现形状（现场查到：仪器已经在驱动里，不用改 ArmCpu）
+
+`drivers/ArmCpu/ArmCpu.cpp:32` 起整块在 `extern "C" {` 里，所以这些量**已经是 C 链接的全局**，
+内核补丁可以直接 `extern` 读，不需要新驱动接口：
+
+```
+35: volatile uint64_t armcpu_timer_interrupts;   // 本核架构定时器中断（tick）
+36: volatile uint64_t armcpu_ipi_interrupts;     // 收到的 IPI 总数
+37: volatile uint64_t armcpu_ipi_sent;           // 内核请 ArmCpu 发出去的 IPI 总数
+42: volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];
+```
+
+`armcpu_core_sgi[8]` 是**逐逻辑核的 SGI 接收计数**，正是这一问要的粒度。于是 r270 只需一行：
+普查每次拍火时印 `clover r270: ipi t= sent=%llu recv=%llu sgi=…,… per-core timer=…`，
+配上 tee 类 `r270-ipi`（一次拍火一条，64 足够）。读法是可反证的三条：
+
+1. **`sent` 一直在涨、`recv` 与 `sent` 差得越来越多** ⇒ IPI 发出去没人接，跨核唤醒确实是黑的；
+   这把 boot 56 那幅「活儿排了、工人叫不醒」从推测变实证，接下来才轮到 `armcpu-spi-ipi=1` 这条路
+   （注意本板驱动注释：`ICC_SGI1R_EL1 generates nothing on this board`，而 SPI 号码是按更多 INTID 的
+   GIC 硬编码的——真要传，得先把 `kIpiSpiBase=1008` 与本板 `GICD_TYPER` 的 INTID 数对上，别抄了守卫不抄前提）。
+2. **`sent` 根本不涨** ⇒ 内核压根没请求跨核 signal，那 datamigrator 的环就不是 IPI 问题，
+   回到 workloop 自己的 `wl_request` 事件（`_filt_wlwait_continue` 等的那个 note 有没有被 post）。
+3. **某个 `sgi[i]` 恒为 0 而该核在跑线程** ⇒ 单颗核收不到 IPI（比总数更精确的定位，直接指出是哪一核）。
+
+补丁编号按惯例排 **45z**（r270），仍只动 `task.c`，LATE 队列首位；
+`verify-clover-payload.py` 加钉 `bb-ipi`，`check-clover.py` 加 Round270 块（printf 字面、
+`extern volatile uint32_t armcpu_core_sgi[8]`、LATE 顺序、tee 类字面）。
+
