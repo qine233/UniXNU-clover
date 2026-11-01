@@ -19641,3 +19641,63 @@ exit 0 且产出 `task.o`，才确认源码没问题、缺的只是上一轮留�
 顺带记一条链接契约的坑（将来真加归档时要用）：`check-clover.py:618-625` 规定归档是**普通路径、没有
 `-Wl,-force_load`**，只有别的驱动引用它导出的符号才留得住（CloverSdhci 靠 CloverPMGR 调 `clover_emmc_run()`
 活下来）；sheng 的 GPU 归档走的是 gated force_load（`UniXNU/scripts/build-xnu-4k-baseline.sh:703-710`）。
+
+## r263 读数（boot 50）：`dl=` 全场为零，而 `peer=` 是仪器自己的错
+
+冷刷 `round263-payload.img`（sha 2da95fbb…，内核 7b13b653…）跑 boot 50，读回 16 条报告、
+512 行内核日志、20 条 probe 行（boot 49 是 0 条）。
+
+**① 表头：`threads=15 shown=15 hidden=0`（三拍全这样，t=1491/1621/1758）。**
+cap 抬到 20 之后没线程再被吞掉，r262 那条「有线程没报出去」的仪器缺陷关闭。
+`wait=14 run=1`、`wait=15 run=0`、`wait=12 run=3`——最后这拍有三条线程在跑，
+比 boot 49 的「全睡」稍活，但组还是那只组。
+
+**② `dl=` 十五行全零。**普查里没有任何一条线程 armed 了 wait_timer。也就是说这一靴
+backboardd 内部**不存在「带期限的等」**：睡下去的每一个都是无限等，没有任何一次等待
+会在时钟上醒来。r263 想分的两类里，「定时等回音」这一类在这只进程里**为空**；
+「无限等」既有等端口消息的，也有睡 ulock 的（tid=0x361，`cont=…773fc48`
+= `_ulock_wait_continue`，`dl=0`：那只组永远不会到期）。
+
+**③ `peer=` 全部是 `-`，原因不是「没有属主」，是我把寄存器读错了。**
+本轮按 r230/r231 的约定取 `x[6]` 当发送权名去解属主。回本板内核读 `osfmk/ipc/mach_msg.c:934`
+`mach_msg2_trap` 自己的解包（`struct mach_msg2_trap_args`，`osfmk/mach/mach_traps.h:465`）：
+
+| 寄存器 | 内核里的名字 | 真实内容 |
+| --- | --- | --- |
+| x1 | `options` | m2 选项 |
+| x2 | `msgh_bits_and_send_size` | 低 32 = msgh_bits，高 32 = send_size |
+| x3 | `msgh_remote_and_local_port` | **低 32 = msgh_remote_port（发送权！）**，高 32 = msgh_local_port |
+| x4 | `msgh_voucher_and_id` | 低 = voucher，高 = msgh_id |
+| x5 | `desc_count_and_rcv_name` | 低 = 描述符个数，**高 32 = rcv_name** |
+| x6 | `rcv_size_and_priority` | 低 = rcv_size，高 = priority ——**根本不是端口** |
+| x7 | `timeout` | 超时 |
+
+所以：`rn=`（取 x5 高 32）一直是对的；`sn=`（取 x6）是 rcv_size，全为 2 就是「收 2 个描述符」
+而已，拿它去 `ipc_object_translate` 当然解不出来；`peer=-` **不携带任何信息**。
+同时 `rem=`（我一直标成「接收超时」）其实是 **x3 低 32 = 发送权名**，本轮十五行全是 `rem=0`
+= `MACH_PORT_NULL` ——这批 `cont=_ipc_mqueue_receive_continue` 的线程是**纯收信者**：
+它们不是在向谁发请求后等回答，而是**等别人给自己发消息**，且没有期限。
+
+这条读错是「仪器写进注释的约定，必须回到本板源码逐字段核对」的第二次发作
+（r220 已经有一次「Round219 read these words one register off」的记录，`task.c:12541`）。
+
+**④ 组账本没变，但窗口后段安静了。**`base=147d3f390`（tid=0x361）从 t=1257 到 t=1440
+每拍都是 `b=fffffffd g=0 cnt=1 wait=1 notif=0`，和 boot 48/49 逐字段同形；t=1440 之后
+`r239` 不再刷它（采样按变化触发，线程没再被读到就不是没等——这条要分清）。
+同窗口另外几只是**活过又散掉**的正常组：`base=16f549b4c` 从 `b=1 g=4905e1c0` 变成
+`b=0 g=ffffff00 wait=0`；`16fe91b4c`、`16ff17b4c`（t=1810）也都是散掉的形状。
+说明进程里 dispatch 组照常运转，死的是那一只。
+
+**⑤ 由此定 r264：把陷阱按内核自己的字读，并去问那只端口「有没有人能给它的收信端口寄信」。**
+一行普查变成：`rcv=`（x5 高 32，原 `rn=`）、`remote=`（x3 低 32）并把它的属主报成 `peer=`
+（这才是「谁欠它回音」；`remote=0` 要显式报 `none`，不能和「解不出」同形，r262 hidden= 的教训）、
+`local=`（x3 高 32）、`to=`（x7 超时）、`sz=`（x6 低 32，替掉假的 `sn=`），
+再对 `rcv=` 那颗端口读 `ip_messages.imq_msgcount`（队列里已有几条消息）与 `ip_srights`
+（还有几份发送权）。这两个数一出来就分掉三种形状：
+队列非空却还在睡（不可能，说明我们读错了）；队列为空且 `ip_srights=0`
+（**没有任何人能再给它发消息**——结构性死等，缺的是发布那颗端口/服务的提供者）；
+队列为空但 `ip_srights>0`（有人能发，只是没发——回到「谁该发」）。
+
+**⑥ 与渲染/桌面这一格的关系**：boot 50 没有任何一条带期限的等待，也没有一条在发消息等回音
+（`remote=0`），所以「等渲染完成通知」在这一靴**没有得到任何支持**；GPU 分支不是被证伪，
+是**还没被支持**。CPU-first 照旧，但下一步该做的是 r264 的端口可读性，而不是先写渲染器。
