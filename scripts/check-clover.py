@@ -1808,6 +1808,69 @@ def check_board(errors: list) -> str:
                               "plus the distinct total: a format string broken by an eating generator "
                               "changes what the card reads back while leaving every prefix needle green")
 
+        # Round262, the unfiltered thread census. r261's host forensics narrowed the boot's last dead
+        # wait to one open question -- who owes that dispatch group its leave -- and the wait rows this
+        # same sampler already prints cannot answer it: they keep at most six threads that are waiting
+        # AND not in the trap, so a thread that is idle, or a second thread asleep on the very word the
+        # first one waits on, is invisible by construction. Sheng reads the same shape with
+        # package/BootUiTraceProbe.c. These assertions pin the census pass, the clock that gates it (the
+        # card keeps the last 512 kernel rows and the sampler fires every twenty seconds, so an ungated
+        # fifteen-line dump spends the whole window on one instrument), the totals that keep "not shown"
+        # separate from "does not exist", and the tee class that carries it.
+        r262_name = "z" * 37 + "-clover-r262.patch"
+        r262_patch = next((base / "patches/xnu-clover" / r262_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r262_name).is_file()), None)
+        if r262_patch is None:
+            errors.append(f"patches/xnu-clover/{r262_name} is missing: the next boot would read the "
+                          "group's waiters through the filter built for a different question, and r261 "
+                          "showed that filter is exactly what hides the thread that owes the leave")
+        else:
+            r262_text = r262_patch.read_text()
+            r262_added = "".join(line for line in r262_text.splitlines(True)
+                                 if line.startswith("+"))
+            for needle in ('#define CLOVER_BB_CENSUS 14',
+                           '"clover r262: census t=%llu pid=%d threads=%u shown=%u"',
+                           '"clover r262: th tid=%llx st=%x we=%llx cont=%llx"',
+                           'bb_census_t == 0 || secs >= bb_census_t + 120',
+                           'ctid[cn] = thr->thread_id;',
+                           'cwe[cn] = (uint64_t)(uintptr_t)thr->wait_event;',
+                           'ccont[cn] = (uint64_t)(uintptr_t)thr->continuation;'):
+                if needle not in r262_text:
+                    errors.append(f"{r262_patch.name} lacks {needle[:64]!r}: without it the frame "
+                                  "cannot name the thread that owes the group its leave")
+            # The census has to be the unfiltered pass, or it re-reports what r231 already says.
+            for needle in ('		call++;', '		cwait++;', '		crun++;'):
+                if needle not in r262_added:
+                    errors.append(f"{r262_patch.name} does not count every thread in the census "
+                                  f"{needle.strip()!r}: a header without totals cannot tell a capped "
+                                  "walk from a task that really has that many threads")
+            if 'x16 == (uint64_t)-47' in r262_added or 'if ((thr->state & TH_WAIT) == 0)' in r262_added:
+                errors.append(f"{r262_patch.name} filters inside the census pass: skipping a running "
+                              "thread, or one that sits in the trap, is the blind spot this round "
+                              "exists to remove")
+            if r262_added.count('"clover r262: ') < 2:
+                errors.append(f"{r262_patch.name} does not print every row under the "
+                              '"clover r262: " prefix the tee class matches')
+            if '{ "clover r262: ", "r262-th", 256, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci gives round262's census no tee class, or gives it a "
+                              "budget that trims its tail: fifteen rows per beat across an 1800 s "
+                              "deadline is about 225 lines, and a class that runs out mid-boot drops "
+                              "the late readings the ring window is made of")
+            baseline_script = (REPO.parent / "UniXNU" /
+                               "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_head = next((line for line in baseline_script.splitlines()
+                              if line.startswith("for LATE_PATCH in")), "")
+            if r262_name not in late_head:
+                errors.append("build-xnu-4k-baseline.sh does not reverse r262 first in LATE_PATCH: the "
+                              "compile pass would run on the census-shaped tree and the replay would "
+                              "look like a broken patch when it is only out of order")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r262_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r262_name} is missing: unixnu loads patches from "
+                              "that directory and silently skips a board patch that lives only in "
+                              "this repo")
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -3112,8 +3175,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r260:"):
-        errors.append('[payload] title is not "clover r260: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r262:"):
+        errors.append('[payload] title is not "clover r262: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4165,8 +4228,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r260:"):
-        errors.append('[payload] title is not "clover r260: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r262:"):
+        errors.append('[payload] title is not "clover r262: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

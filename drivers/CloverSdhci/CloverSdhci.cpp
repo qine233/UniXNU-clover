@@ -799,6 +799,14 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // came back with no answer at all. Fifteen beats fit the 1800 s deadline, so 16 bounds the same
   // producer without cutting it short.
   { "clover r260: bus", "r260-bus", 16, 0, 0, 0 },
+  // Round262 adds the unfiltered census of the same task's threads: one header and up to fourteen rows,
+  // re-stated every two minutes. It exists because r261's host forensics narrowed the boot's last dead
+  // wait to one question the filtered wait rows cannot answer -- whoever owes that dispatch group its
+  // leave is either asleep on that very word, which the census shows as a second sleeper on the same
+  // address, or idle and never handed the block. Fifteen lines per beat inside an 1800 s deadline is
+  // about 225 of them; a class that runs out mid-boot drops exactly the late readings the ring window
+  // needs, so the budget bounds the producer without trimming its tail.
+  { "clover r262: ", "r262-th", 256, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

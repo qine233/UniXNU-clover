@@ -1046,6 +1046,15 @@ def check_sb_sample(kernel: bytes) -> bool:
              "hid-bus-row": (b"clover r260: bus mode=%llu map=%llx hw=%llx io=%llx op=%llx err=%llx "
                              b"status=%llx state=%llx clk=%llx ack=%llx id=%llx,%llx xfers=%llu "
                              b"timeout=%llu nack=%llu verdict=%lld\n") in kernel,
+             # Round262: the unfiltered thread census. r261's host forensics named the wait -- backboardd
+             # asleep on a dispatch group inside a call into libVFXCore -- but the sampler's wait rows are
+             # filtered to threads that are waiting AND not in the trap, so they cannot show a second
+             # sleeper on the same word or an idle worker that never got the block. Both literals are
+             # pinned whole, because a format string cut in half still leaves every prefix needle green.
+             "bb-census-row": (b"clover r262: census t=%llu pid=%d threads=%u shown=%u"
+                               b" wait=%u run=%u\n") in kernel,
+             "bb-census-th": (b"clover r262: th tid=%llx st=%x we=%llx cont=%llx"
+                              b" pc=%llx\n") in kernel,
              "input-armed": (b"clover-input") in kernel,
              # Round257: the gate that made boot 44 say published=0 must be gone from the shipped image,
              # and the flag it tested has to still be readable as a value.

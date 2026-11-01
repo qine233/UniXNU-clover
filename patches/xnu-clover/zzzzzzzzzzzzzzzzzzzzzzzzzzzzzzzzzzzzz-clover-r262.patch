@@ -1,0 +1,115 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11760,6 +11760,23 @@
+  * and x0-x3 instead, and the host resolves the continuation against the same
+  * kernel's symbol table. x0 is the user lock address the wait started on.
+  */
++/*
++ * Round262. The wait rows this sampler already prints are filtered: they name
++ * up to six threads that are waiting and not in the trap, and they say nothing
++ * about how many threads the task has or what the rest are doing. The census is
++ * the unfiltered pass -- every thread, its state, the event it blocks on and the
++ * continuation that would wake it -- so the question r261 left open can be
++ * answered by a reading instead of a guess: the dispatch group that never drains
++ * is owed one leave, and whoever owes it is either asleep on that very word (then
++ * the census shows a second sleeper on the same address) or idle and never handed
++ * the block (then it shows a thread with no wait event at all). Sheng answers the
++ * same question with package/BootUiTraceProbe.c, which walks cross-task with the
++ * native VM API and names the hot threads by context-switch rate and run time;
++ * that shape is what this pass copies, minus the weights, because one beat has to
++ * fit the card's last 512 kernel rows.
++ */
++#define CLOVER_BB_CENSUS 14
++
+ static void
+ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ {
+@@ -11820,6 +11837,22 @@
+ 	int act;
+ 	int same;
+ 	int have_run = 0;
++	uint64_t ctid[CLOVER_BB_CENSUS];
++	uint64_t cwe[CLOVER_BB_CENSUS];
++	uint64_t ccont[CLOVER_BB_CENSUS];
++	uint64_t cpc[CLOVER_BB_CENSUS];
++	uint32_t cst[CLOVER_BB_CENSUS];
++	uint32_t cn = 0;
++	uint32_t call = 0;
++	uint32_t cwait = 0;
++	uint32_t crun = 0;
++	/*
++	 * The census is re-stated on a clock, not on a change: the sampler itself
++	 * fires whenever the thread/hop set moves, which under a busy userland is
++	 * every twenty seconds, and fifteen rows of that would spend the boot's
++	 * whole log window on one instrument.
++	 */
++	static uint64_t bb_census_t;
+ 
+ 	if (pid <= 0 || sb_task == TASK_NULL) {
+ 		return;
+@@ -11974,6 +12007,38 @@
+ 		}
+ 		woff += wrote;
+ 		un++;
++	}
++	/*
++	 * Round262: the unfiltered pass. Still under the task lock, still only
++	 * reading fields this file already reads elsewhere. A thread that is
++	 * running on another cpu has a stale saved context, so its pc is reported
++	 * only when the thread is not in TH_RUN; the wait event and the
++	 * continuation are the scheduler's own and are correct in every state.
++	 */
++	queue_iterate(&task->threads, thr, thread_t, task_threads) {
++		arm_saved_state_t *ss;
++
++		call++;
++		if ((thr->state & TH_WAIT) != 0) {
++			cwait++;
++		}
++		if ((thr->state & TH_RUN) != 0 && (thr->state & TH_WAIT) == 0) {
++			crun++;
++		}
++		if (cn >= CLOVER_BB_CENSUS) {
++			continue;
++		}
++		ss = get_user_regs(thr);
++		ctid[cn] = thr->thread_id;
++		cst[cn] = thr->state;
++		cwe[cn] = (uint64_t)(uintptr_t)thr->wait_event;
++		ccont[cn] = (uint64_t)(uintptr_t)thr->continuation;
++		cpc[cn] = 0;
++		if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1 &&
++		    !is_saved_state32(ss) && (thr->state & TH_RUN) == 0) {
++			cpc[cn] = (uint64_t)get_saved_state_pc(ss);
++		}
++		cn++;
+ 	}
+ 	/*
+ 	 * The reference taken under the lock is what lets the owner lookups
+@@ -12006,6 +12071,25 @@
+ 		printf("%s", line);
+ 	}
+ 	clover_sb_port_state(sb_task, name, "bb", secs, "r229");
++	/*
++	 * Round262. One header plus at most CLOVER_BB_CENSUS rows, once every two
++	 * minutes, class `r262-th` on the card. The header carries the totals the
++	 * rows cannot: a task with more threads than the cap says so explicitly,
++	 * because "not shown" and "does not exist" have to stay different readings.
++	 */
++	if (bb_census_t == 0 || secs >= bb_census_t + 120) {
++		bb_census_t = secs;
++		printf("clover r262: census t=%llu pid=%d threads=%u shown=%u"
++		    " wait=%u run=%u\n", (unsigned long long)secs, pid, call, cn,
++		    cwait, crun);
++		for (i = 0; i < cn; i++) {
++			printf("clover r262: th tid=%llx st=%x we=%llx cont=%llx"
++			    " pc=%llx\n", (unsigned long long)ctid[i], cst[i],
++			    (unsigned long long)cwe[i],
++			    (unsigned long long)ccont[i],
++			    (unsigned long long)cpc[i]);
++		}
++	}
+ 
+ 	/*
+ 	 * Round231. Every thread of the receiver that is itself parked in the
