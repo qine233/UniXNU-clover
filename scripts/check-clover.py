@@ -2172,6 +2172,69 @@ def check_board(errors: list) -> str:
                 errors.append("drivers/CloverSdhci has no class for the wait-owner rows: a new prefix is a "
                               "producer of its own and an unbudgeted one drops the reading silently")
 
+        # Round268 reads the object behind the one hint whose kernel answer is not an answer.
+        # kdp_sema_find_owner reports pid_from_task(sem->owner), and create_semaphore sets that field to the
+        # task that made the semaphore (osfmk/kern/sync_sema.c:128; the struct comment in sync_sema.h:55 says
+        # exactly that), so boot 54's owner=pid 138 on its own waiter names a creator, not a signaller. The
+        # signaller is whoever holds a send right on the semaphore's port, which is the reading that decides
+        # whether that thread can ever wake: count (negative means waiters are queued), ip_srights, and the
+        # receiving task named.
+        r268_name = "z" * 43 + "-clover-r268.patch"
+        r268_patch = next((base / "patches/xnu-clover" / r268_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r268_name).is_file()), None)
+        if r268_patch is None:
+            errors.append(f"patches/xnu-clover/{r268_name} is missing: the census would still stop at a "
+                          "semaphore's creator and could not say whether anyone can signal it")
+        else:
+            r268_text = r268_patch.read_text()
+            r268_added = "".join(line for line in r268_text.splitlines(True)
+                                 if line.startswith("+"))
+            for needle in ('clover_sema_state(thread_t thr, int *count, uint32_t *srights',
+                           'offsetof(struct semaphore, waitq)',
+                           '*count = sem->count;',
+                           'port = sem->port;',
+                           '*srights = (uint32_t)port->ip_srights;',
+                           'space = port->ip_receiver;',
+                           'snprintf(who, wholen, "%d:%s", task_pid(recv)',
+                           '"clover r268: sem t=%llu pid=%d tid=%llx count=%d"',
+                           '" srights=%u otype=%x receiver=%s\\n"',
+                           'psem[pn] = (uint8_t)clover_sema_state(thr, &psc[pn],',
+                           'csem[cn] = (uint8_t)clover_sema_state(thr, &csc[cn], &csp[cn],',
+                           '#include <kern/sync_sema.h>',
+                           '#define CLOVER_BB_SEMA_NAME 20'):
+                if needle not in r268_added:
+                    errors.append(f"{r268_patch.name} lacks {needle[:64]!r}: without it the semaphore row "
+                                  "cannot say whether the wait is structurally unanswerable")
+            # The port must be read through its fields, not through ip_get_receiver(): that accessor asserts
+            # io_lock_held() and this census holds no port lock, so using it turns a probe into a panic. The
+            # call form is what is forbidden -- the round's own comment names the accessor to explain why.
+            if "= ip_get_receiver(" in r268_added:
+                errors.append(f"{r268_patch.name} resolves the semaphore's receiver through "
+                              "ip_get_receiver(): it asserts a held port lock, and a panic from a probe is "
+                              "a lost boot rather than a reading")
+            # A row that is only printed when the hint says semaphore: an unconditional read would dereference
+            # the container_of result for waits that are not semaphores at all.
+            if "if (phint[pn] == (uint32_t)kThreadWaitSemaphore) {" not in r268_added or \
+                    "if (chint[cn] == (uint32_t)kThreadWaitSemaphore) {" not in r268_added:
+                errors.append(f"{r268_patch.name} reads a semaphore off a thread the kernel did not report "
+                              "as one: the container_of result is only meaningful under that hint")
+            baseline_script = (REPO.parent / "UniXNU" /
+                               "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in baseline_script.splitlines()
+                                 if "clover-r2" in line)
+            if (late_list.find(r268_name) < 0 or
+                    late_list.find(r268_name) > late_list.find("z" * 42 + "-clover-r267.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r268 before r267 in LATE_PATCH: "
+                              "the compile pass would run on a tree this patch was not written against")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r268_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r268_name} is missing: unixnu loads patches from that "
+                              "directory and silently skips a board patch that lives only in this repo")
+            if '{ "clover r268: ", "r268-sema", 64, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci has no class for the semaphore-rights rows: a new prefix "
+                              "is a producer of its own and an unbudgeted one drops the reading silently")
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -3476,8 +3539,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r267:"):
-        errors.append('[payload] title is not "clover r267: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r268:"):
+        errors.append('[payload] title is not "clover r268: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3525,6 +3588,24 @@ def check_board(errors: list) -> str:
         errors.append("scripts/run-clover-unattended.sh still says the board 'returned to fastboot "
                       "by itself, so the deadline fired': round195 showed that sentence on a board "
                       "that had come up in Android and was put into fastboot by hand")
+    # Round268's flash test. The script treated "an adb device is already up" as "we are in recovery,
+    # just read", and that shortcut set SKIP_RECOVERY=1 -- which is also the gate on the flash block. A
+    # run asked to --flash-cache with the board sitting in TWRP therefore flashed nothing, read the
+    # window the PREVIOUS payload's boot had left, and exited 0: every number in the report was real and
+    # none of it belonged to the round. The fix is two parts, and both are asserted because the failure
+    # was silent: a declared flash hops the board to the bootloader, and the card's own boot counter, read
+    # while recovery is still up, has to have moved before a window is called a result.
+    if '[ -n "$(adb_serial)" ]; then\n  SKIP_RECOVERY=1' in script_text:
+        errors.append("scripts/run-clover-unattended.sh lets an adb device in recovery set "
+                      "SKIP_RECOVERY=1 unconditionally: that shortcut skips a declared --flash-cache and "
+                      "reports the previous boot's window as this round's reading")
+    for needle in ("an adb device is up and a flash was declared",
+                   'PRE_BOOT=$(python3 "$(cd "$(dirname "$0")" && pwd)/read-clover-log.py" --boot',
+                   "the window still holds boot"):
+        if needle not in script_text:
+            errors.append("scripts/run-clover-unattended.sh has no %r: without the hop-and-count pair a "
+                          "flash that never booted is indistinguishable from a boot that printed nothing"
+                          % needle)
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
@@ -4529,8 +4610,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r267:"):
-        errors.append('[payload] title is not "clover r267: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r268:"):
+        errors.append('[payload] title is not "clover r268: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

@@ -50,7 +50,9 @@
 #
 # Exit codes: 0 records decoded, 1 dump saved but no records, 2 no fastboot, 3
 # consent missing, 4 the board did not land in recovery, 5 no adb in recovery, 6 the
-# board never left fastboot when asked to reboot.
+# board never left fastboot when asked to reboot, or -- with --flash-cache -- the window
+# still holds the boot count the card had before the flash, which means the board never ran
+# the payload this run wrote.
 
 set -u
 
@@ -72,6 +74,8 @@ SKIP_RECOVERY=0
 BOOT_AFTER_FLASH=0
 REBOOT_BOOTLOADER=0
 DECODE=1
+# The boot counter the card itself holds before a declared flash; empty when unreadable.
+PRE_BOOT=""
 
 say() { printf '[unattended] %s\n' "$*" >&2; }
 warn() { printf '[unattended] WARNING: %s\n' "$*" >&2; }
@@ -242,9 +246,35 @@ say "contract: clover-unattended=<s> deadline, panic writes a boot-recovery BCB 
 
 # A device already sitting in TWRP is the shortest path: dump from it. This also
 # covers a rerun after a failed recovery entry.
+#
+# Round268 flash test: that shortcut used to swallow --flash-cache. With the board in TWRP and a
+# new payload in hand, SKIP_RECOVERY=1 skipped the flash block, the script then read the window the
+# PREVIOUS payload's boot had left and exited 0 -- a stale reading that is indistinguishable from a
+# result. A flash was declared, so landing in recovery is not this run's job: hop to the bootloader
+# and flash.
 if [ -n "$(adb_serial)" ]; then
-  SKIP_RECOVERY=1
-  say "an adb device is already up; treating it as recovery"
+  if [ -n "$FLASH_CACHE" ]; then
+    [ -f "$FLASH_CACHE" ] || die 2 "no image at $FLASH_CACHE"
+    # Recovery is the only moment this run can ask the card which boot it last ran, and that number
+    # is the guard below's whole subject: without it, a flash that never booted reads identically to
+    # a boot that produced nothing new.
+    PRE_DUMP="$(dirname "$OUT")/$(basename "$OUT").pre-flash"
+    if adb exec-out "dd if=/dev/block/bootdevice/by-name/logdump bs=512 count=1217 2>/dev/null" \
+        > "$PRE_DUMP" 2>/dev/null && [ "$(wc -c < "$PRE_DUMP" | tr -d ' ')" = 623104 ]; then
+      PRE_BOOT=$(python3 "$(cd "$(dirname "$0")" && pwd)/read-clover-log.py" --boot "$PRE_DUMP" 2>/dev/null \
+        | sed -n 's/^boot \([0-9][0-9]*\).*/\1/p' | head -1)
+      say "card before this flash: boot ${PRE_BOOT:-?} (the window the previous payload left)"
+    else
+      rm -f "$PRE_DUMP"
+      say "card before this flash: unreadable, so the boot-count guard below has nothing to compare against"
+    fi
+    say "an adb device is up and a flash was declared: adb reboot bootloader, then the flash"
+    adb reboot bootloader >/dev/null 2>&1 || die 2 "adb reboot bootloader failed; nothing was flashed"
+    wait_fastboot || die 2 "no fastboot after leaving recovery; nothing was flashed"
+  else
+    SKIP_RECOVERY=1
+    say "an adb device is already up; treating it as recovery"
+  fi
 fi
 
 if [ "$SKIP_RECOVERY" = 0 ] && [ -n "$FLASH_CACHE" ]; then
@@ -420,6 +450,16 @@ boot_id=$(python3 "$decoder" --boot "$OUT" 2>/dev/null | sed -n 's/^boot \([0-9]
 # out of msgbuf -- which it can only do if a line the driver said reached the kernel log at all.
 echo_lines=$(count_records --tee --driver --count "$OUT")
 say "decoded: $OUT.txt ($count report record(s), $verdicts driver verdict line(s), $probe_lines probe line(s), $tee_lines kernel log line(s), boot ${boot_id:-?})"
+# Round268's guard: this run wrote a payload, so the window must be from a boot that ran it. A board
+# that stayed in recovery, a flash that did not land, a reboot that went to Android -- all of them
+# leave the previous boot's window here, and every number in the text above would be real but belong
+# to the round before this one.
+if [ -n "$PRE_BOOT" ] && [ -n "$FLASH_CACHE" ]; then
+  if [ -z "$boot_id" ] || [ "$boot_id" -le "$PRE_BOOT" ]; then
+    die 6 "the window still holds boot ${boot_id:-none}, not a boot after the $PRE_BOOT the card had before this flash: the payload was written but never ran, so nothing in $OUT.txt is this round's reading"
+  fi
+  say "the boot count moved: $PRE_BOOT -> $boot_id, so this window is the boot that ran the payload just flashed"
+fi
 if [ "$verdicts" -gt 0 ] && [ "$tee_lines" = 0 ]; then
   warn "the ring armed but brought no kernel lines: the tee ran and msgbuf held nothing it keeps"
 fi

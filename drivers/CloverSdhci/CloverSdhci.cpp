@@ -828,6 +828,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // subset of those: 192 covers that load twice over while still leaving two thirds of the card's last 512
   // kernel rows for r262-th and r265-peer, which are the rows this class is read alongside.
   { "clover r267: ", "r267-owner", 192, 0, 0, 0 },
+  // Round268 adds a row only where round267's answer was incomplete: one per thread whose hint says semaphore,
+  // because that is the kind whose owner field names a creator rather than a signaller. Boot 54 showed one such
+  // waiter in the debtor and none in backboardd, so a fire costs a row or two; 64 covers twenty fires of the
+  // pair of censuses, which is more beats than the 1800 s deadline allows.
+  { "clover r268: ", "r268-sema", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

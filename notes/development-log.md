@@ -20184,3 +20184,125 @@ ref_count / count`），报 `sc=`（`sem->count`，负数=有等待者）、`sp=
 缺的是「把发送权发出去」的那一步（和 r264 那格 `sr=0` 同族）；`sp>=1` 且 `sc<0` ⇒ 有人能 signal 却没做，
 回到「谁该 signal」；`sc>=0` ⇒ 计数早就给过了，是我们读错了时刻。
 顺带把 `ull_opcode` 那条（④）留在 r269，别在一轮里追两个问题。
+
+## r268 落地：机器号不再只报「谁造的」，改报「计数、发送权、接收者」（补丁 43z，tee 类 r268-sema）
+
+**改了什么**（全在 `task.c`，新增一个 include）：
+
+1. `#include <kern/sync_sema.h>`（task.c:136）取 `struct semaphore` 的**布局**，不是取便利函数：
+   `task_link / waitq / owner / port / ref_count / count`（`sync_sema.h:52-59`）。对象从
+   `thr->waitq.wq_q` 用 `offsetof(struct semaphore, waitq)` 反查，和 `kdp_sema_find_owner` 走的是
+   同一条路，且我们**排在这条调用之后**才做——即内核自己的路径已经把这颗对象头走过一遍。
+2. `clover_sema_state()`（task.c:11949）四级取值，每一级失败就带着已拿到的部分返回：
+   `sem->count`（`%d`，**有等待者时为负**）→ `io_otype((ipc_object_t)port) != IOT_PORT` 就停 →
+   `port->ip_srights`（还剩几份发送权）→ `port->ip_receiver` 当 `ipc_space_t`，取其 `is_task`，
+   再 `get_bsdtask_info`→`proc_name_address` 拼成 `pid:comm`（截到 20 字节，`CLOVER_BB_SEMA_NAME`）。
+3. 两处普查各自加一组按行的数组（peer 是 `psc/psp/pot/psem/pwho`，主普查 `csc/csp/cot/csem/cwho`），
+   **只对 `hint==kThreadWaitSemaphore` 的行**填值，打印仍在解锁之后，行只在填成功时出：
+   `clover r268: sem t= pid= tid= count= srights= otype= receiver=`。
+
+**落完地对着自己的注释又核了一遍源码，两处要记**：
+
+- 注释里写的「`ip_get_receiver()` asserts `io_lock_held()`」**说法不准**：`osfmk/ipc/ipc_port.h:528-532`
+  那句是 `ip_mq_lock_held(port)`（注释原文还补了「otherwise PAC could fail」）。结论不变——普查不持端口锁，
+  所以不能调它——但**理由写歪了**，这是同一类错的第四次（r220 寄存器错位、r264 读 x6、r267 读 `thread.c`、这次读断言名）。
+- 更要紧的是它**顺手漏了的那一半**：`ip_get_receiver` 返回的是 `ip_in_a_space(port) ? port->ip_receiver : NULL`，
+  而 `ip_in_a_space` = `ip_active(port) && port->ip_receiver_name != MACH_PORT_NULL`（同文件 490-494）。
+  **不在空间里的端口，那份存储是 `ip_destination`（另一个 `ipc_port`），不是空间**——我把 `ip_receiver`
+  当空间读、再取 `is_task`，对一颗不在空间里的端口就会拿错类型的指针喂给 `get_bsdtask_info`。
+  机器号端口由创建它的任务持有名字、`sem` 又持着引用，实际上不会走到这一格，但「实际上不会」不是我要的标准。
+  **r269 第一件**：补 `ip_receiver_name != MACH_PORT_NULL` 这道门槛（顺带 `otype` 已经挡住了非端口对象），**并把这段注释里 `io_lock_held` 的说法当场改对**——文字与代码一起改，只动活树一次，r268 的补丁与卡上镜像就保持同源（注释不进二进制，改它不动已刷出去的读数）。
+
+**刷写测试里撞出来的仪器通道缺陷（`run-clover-unattended.sh`，与本轮补丁无关但影响读数可信度）**：
+设备坐在 TWRP 时，脚本第 245 行那条「已在 recovery 就直接读」的捷径会把 `--flash-cache` **整个吞掉**：
+`SKIP_RECOVERY=1` 让刷写块不再执行，脚本于是去读**上一版 payload 留下的窗口**、把它当本轮结果打出来、
+`exit 0`。我第一次跑 boot 55 时拿到的正是 boot 54 的 16 份报告——数字全是真的，只是不属于这一轮。
+两处修法：(1) 声明了刷写就不走捷径，先 `adb reboot bootloader` 再刷；(2) 加一道硬闸门——进 recovery 时
+先把卡上的 boot 计数读下来存成 `PRE_BOOT`，读完回窗口后要求 `boot_id > PRE_BOOT`，否则 `die 6`
+（退出码表里已补这一条）。sheng 的 `run-sheng-unattended.sh` 没有刷写/落 recovery 这一棒，无参考可抄。
+
+**校验**：补丁 43z 由 `/tmp/r268patch.py` 从 r267 落地后的快照生成，9 个 hunk，正向 apply 后与活树
+**逐字节相同**、反向 `git apply -R --check` 干净；`-fsyntax-only` 零 error；`check-clover.py` 绿；
+`verify-clover-payload.py` 新增 `bb-sema-rights` 字面量钉，board 标题升到 `clover r268:`。
+tee 类 `{ "clover r268: ", "r268-sema", 64 }`（每靴最多两条 hint=6 的行 × 16 拍，64 有裕量；
+真超了也还能从 512 行的内核日志环里读到同一串文本）。
+
+**boot 55 要看什么**：债主那条 park 在机器号上的线程（boot 54 是 pid 138 / tid 0x34d）——
+`srights=0` ⇒ **结构上没人能叫醒它**，缺的是「把发送权发出去」那一步（和 r264 的 `sr=0` 同族，指向
+datamigrator 从没把自己的机器号端口交给任何人的那一格）；`srights>=1` 且 `count<0` ⇒ 有人能 signal 却没做，
+问题回到「谁该 signal」，那需要 `ipc_port` 的发送者队列（下一轮）；`count>=0` ⇒ 计数早就给过，
+是我们读的时刻不对（那么 `dl=0` 的死等就说明醒它的事件被别的东西吞了）。`receiver=` 若是
+`138:com.apple.datam-` 自己，就确认「自己等自己造的号」这一读法。
+
+### 顺带查掉的一条「照搬 sheng」候选：`/chosen/ephemeral-storage`（boot 55 之前的桌面侧侦察）
+
+`make-sheng-adt.py:148` 的注释写着「带这条属性，datamigrator 会跳过全部迁移
+（`os_variant_uses_ephemeral_storage`）」——正卡在我们的债主身上，值得查。**结论：不照搬，两条理由都成立。**
+
+1. **sheng 现在也没发它**：那条属性的条件是 `(data_ramdisk or packed_data_ramdisk) and not persistent_data`，
+   而 `UniXNU-sheng/board.toml:88` 写的是 `"persistent_data" = true` ⇒ 属性为空。也就是说
+   **sheng 是带着「datamigrator 真会跑迁移」这件事把同一张镜像开到桌面的**——这条属性不是它的解法，
+   也就不该被当成我们的解法。
+2. **前提在 clover 上不成立**：我们的 Data 是真 APFS 持久卷（r128 起的 userdata 窗口），
+   声称 ephemeral 是对板子说假话，与既定的身份键规则同一条红线。
+
+于是「datamigrator 为什么在 clover 上不动」仍然是**待读的问题**，不是**待抄的属性**；
+boot 55 的 `clover r268: sem` 那几行仍是这一格唯一的新事实。
+
+## r268 读数（boot 55）：机器号**能被人叫醒**，只是全系统只剩一份发送权——而 `receiver=` 这一格是我又读错了字段
+
+冷刷 `round268-payload.img`（sha f2db2cf2…，内核 normalize 后 f66aa037…、AMFI 前 e4da3453…）跑 boot 55。
+先记仪器通道：刷前脚本从卡上读到的 boot 是 **54**，读回时是 **55**，新加的 `PRE_BOOT` 闸门打出
+`the boot count moved: 54 -> 55`——上一版脚本在这里会把 54 的窗口当本轮结果交出来。
+本帧 7 个普查块、39 条 `own` 行、**2 条 `sem` 行**。
+
+**① 形状与 boot 54 一致，只是号码全挪。** 债主 `pid=142 comm=com.apple.datam-`，
+8 条线程 `wait=8 run=0 rx=1`；`tid=0x36c` 那条 `cont=_semaphore_wait_continue`、
+`we=fffffff00700620c`（= `_semaphore_event`）、`dl=0`；本帧 9 条 `WorkloopSyncWait` 的 `owner=`
+全指 `tid 0x36c`、`ctx=0x11bd0c840`（同一只 workloop）。r267 的 `own` 行对它报
+`hint=6 ak=1 owner=8e`——`0x8e` 就是 142：**创建者 = 等待者所在的进程**，与 boot 54 同判。
+
+**② `sem` 行给出的判据是中间那一格：有人能 signal，而它没做。**
+`count=-1 srights=1 otype=0`。逐字段按本板源码读：
+`count=-1` ⇒ 信号量队列里挂着等待者（`semaphore_wait` 递减到负）；
+`srights=1` ⇒ **全系统只剩一份发送权**——不是 `srights=0` 的「结构上没人能叫醒」，
+也不是 `count>=0` 的「计数早就给过了」；`otype=0` **不是「类型未知」**：
+`osfmk/ipc/ipc_object.h:185` 就是 `#define IOT_PORT 0`，0 恰好是「它确实是一颗端口」。
+所以 boot 54 留的三分岔当场落在第二支：**这一等是有解的，只是欠一次 signal**。
+
+**③ `receiver=-` 是我的字段选错，不是内核没答。**
+机器号的端口由 `convert_semaphore_to_port` 造出来，传的是
+`IPC_KOBJECT_ALLOC_NONE`（`osfmk/kern/ipc_kobject.h:234` 的原话是「Just make the naked port」），
+⇒ **它是一颗只有发送权的裸端口，压根没有接收方空间**，`ip_receiver` 本就该是 0。
+我把「谁接收」当成这类对象的身份字段，是 boot 52 之后我写下那条教训（换等待对象的种类就必须换身份字段）
+**之后的第四次同样犯错**，而且这次是教训已经在笔记里、我照样发出去了。
+真正能回答「谁欠它一次 signal」的是**那一份发送权住在哪个任务的哪个名字里**——端口自己不记这件事。
+
+**④ 顺带查清：这棵树里早就有正确读法，我 r268 没用。**
+`task.c:11200 clover_port_recv_task()` 的形状是 `is_read_lock(space)` → `is_active(space)` →
+`ipc_entry_lookup` → `io_lock(obj)` → **在端口锁内**调 `ip_get_receiver()` → `io_unlock` → `is_read_unlock`。
+我这一轮反而在注释里断言「`ip_get_receiver` 要 `io_lock_held` 所以不能调」——两处都不对：
+断言的是 `ip_mq_lock_held(port)`（`ipc_port.h:528-532`），而 `checker` 里那条
+`"= ip_get_receiver("` 禁令是给一个错误理由加的锁。**它挡住的正是唯一正确的用法。**
+更要紧的是裸读的风险被 boot 55 证明是真的：不在空间里的端口，那份存储是 `ip_destination`（另一个
+`ipc_port`），我把它当 `ipc_space_t` 再取 `is_task` 就会拿错类型喂给 `get_bsdtask_info`；
+这一靴它是 0 才侥幸没事。**下一轮把禁令反过来钉**：普查里读端口属主必须走 io_lock + `ip_in_a_space`，
+裸字段读法禁止。
+
+**⑤ 定 r269（一个问题：那一份发送权在谁手里）**：普查拿到 `sem->port` 之后，**扫任务的端口表**——
+按 `clover_port_recv_task` 的锁序逐任务 `is_read_lock` → 走 `is_table[0].ie_size` 找
+`ie_object == port`，报 `clover r269: srhost port= pid= comm= name=`，并带上扫了多少颗空间、
+是否命中；`sem` 行同时补上裸 `port=` 好让两边对得上。三种结果当场分开：
+命中的名字在 **pid 142 自己**的空间 ⇒ 这是**进程内自锁**（那 8 条线程里没人能替它 signal，
+下一格回到「0x36c 到底在等什么人来 signal」）；命中的名字在**别的进程** ⇒ 普查得到一个**新债主**，
+r265 的那套挪到它身上；**一颗都没命中** ⇒ 那份 srights 是 `convert_semaphore_to_port` 捐给端口的
+内核引用，用户态谁也拿不到 ⇒ 回到「结构上叫不醒」，但这一次是有正面证据的结构死等。
+
+**⑥ 宿主侧一条否定结论，写给以后别再来）**：这批 r266 用户栈在宿主上**命名不出来**。
+两条独立原因都验过：本板这颗 iOS 17 共享缓存的**非导出符号名是涂掉的**
+（取 `LC_SYMTAB` 的 `N_FUN` 表逐条打印，命中的是字面量 `<redacted>`，只有导出符号留着名字）；
+而 split cache 的地址表在数据/链接编辑段之间留了 **32 MB 的空洞**，本帧若干帧
+（`0x1f76…`、`0x100a…`）就落在空洞里——`decode-clover-cache-offset.py --addr` 因此把同一条栈的
+三帧分别念成 CalendarDatabase / CoreMotion / libauthinstall（同一条 datamigrator 的栈不可能同时在这三颗镜像里）。
+**结论：不要把任何一轮的答案压在「宿主解出这些帧」上。**要名字就往内核侧要（r269 这种「谁来 signal」的正面判据），
+或者干脆别问这一格。

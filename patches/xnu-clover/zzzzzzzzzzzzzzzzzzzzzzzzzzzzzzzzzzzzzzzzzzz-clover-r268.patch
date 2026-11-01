@@ -1,0 +1,191 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -133,6 +133,7 @@
+ #include <kern/policy_internal.h>
+ #include <kern/restartable.h>
+ #include <kern/ipc_kobject.h>
++#include <kern/sync_sema.h>    /* struct semaphore, for round268's rights reading */
+ 
+ #if defined(__arm64__)
+ #include <arm/thread.h>
+@@ -11874,15 +11875,21 @@
+  *   kThreadWaitWorkloopSyncWait  owner = the tid of kqwl->kqwl_owner (or the bound request
+  *                                thread, or STACKSHOT_WAITOWNER_THREQUESTED), context = the
+  *                                workloop's kqwl_dynamicid
+- *   kThreadWaitSemaphore         owner = the pid of sem->owner's task, context = the kernel
+- *                                address of sem->port
++ *   kThreadWaitSemaphore         owner = the pid of sem->owner, which create_semaphore sets to the
++ *                                task that made the semaphore (sync_sema.c:128) -- a creator, not a
++ *                                signaller; context = that task's semaphore port, permuted by
++ *                                VM_KERNEL_UNSLIDE_OR_PERM
+  *   kThreadWaitUserLock          owner = the tid of ull->ull_owner, context = the user address
+  *                                ull was taken on
+  * The hint is reported for every waiter whether or not it was asked: KernelMutex, the port
+- * receive/send kinds and the pthread kinds are deliberately not asked (the mutex path resolves
+- * its owner through ctid_get_thread, which takes a reference this census would never drop), so
+- * ak=0 means "the kernel has a name for this, we did not go and read it" and is a different
+- * reading from ak=1 owner=0, which means it asked and nothing owns the wait.
++ * receive/send kinds and the pthread kinds are deliberately not asked. No census row in boot 52 or
++ * 53 carries the mutex hint (nothing sleeps in lck_mtx_sleep), so asking it buys no reading, and
++ * kdp_lck_mtx_find_owner asserts the mutex is not destroyed on a state word it reads while holding
++ * nothing -- a panic on a race in a probe that fires every two minutes. So ak=0 means "the kernel
++ * has a name for this, we did not go and read it" and is a different reading from ak=1 owner=0,
++ * which means it asked and the object carries no owner. For a semaphore that owner field is the
++ * creating task rather than a signaller, and for a compare-and-wait ulock the kernel writes zero by
++ * design; round268 reads the semaphore's own count and send rights for that reason.
+  */
+ static void
+ clover_wait_owner(thread_t thr, uint32_t *hint, uint32_t *asked, uint64_t *owner,
+@@ -11923,6 +11930,66 @@
+ }
+ 
+ /*
++ * Round268. kdp_sema_find_owner answers hint=6 with a pid, but the field it reads is the one
++ * create_semaphore writes (osfmk/kern/sync_sema.c:128, "task that owns semaphore"), so it names the
++ * task that made the semaphore, not anyone who owes it a signal. The signaller is whoever holds a
++ * send right on the semaphore's port, and that is three fields away in the same object: boot 54's
++ * debtor thread 0x34d parks on a semaphore whose owner field is its own process, so the only
++ * readings that decide whether it can ever wake are the count and the rights.
++ *
++ * The semaphore object is reached the way kdp_sema_find_owner reaches it -- the waitq the thread is
++ * enqueued on is the one embedded in it -- and this runs after that call, so the object has already
++ * been walked by the kernel's own path. The port is read through its fields rather than through
++ * ip_get_receiver(): that accessor asserts io_lock_held() and this census holds no port lock, and a
++ * panic from a probe is a lost boot, not a reading.
++ */
++#define CLOVER_BB_SEMA_NAME 20
++
++static int
++clover_sema_state(thread_t thr, int *count, uint32_t *srights, uint32_t *otype,
++    char *who, size_t wholen)
++{
++	struct semaphore *sem;
++	ipc_port_t port;
++	ipc_space_t space;
++	task_t recv;
++	struct proc *pp;
++	char *pname;
++
++	*count = 0;
++	*srights = 0;
++	*otype = 0;
++	who[0] = '\0';
++	if (thr->waitq.wq_q == NULL) {
++		return 0;
++	}
++	sem = (struct semaphore *)((uintptr_t)thr->waitq.wq_q -
++	    offsetof(struct semaphore, waitq));
++	*count = sem->count;
++	port = sem->port;
++	if (port == IP_NULL) {
++		return 1;
++	}
++	*otype = (uint32_t)io_otype((ipc_object_t)port);
++	if (*otype != IOT_PORT) {
++		return 1;
++	}
++	*srights = (uint32_t)port->ip_srights;
++	space = port->ip_receiver;
++	if (space == IPC_SPACE_NULL) {
++		return 1;
++	}
++	recv = space->is_task;
++	if (recv == TASK_NULL) {
++		return 1;
++	}
++	pp = (struct proc *)get_bsdtask_info(recv);
++	pname = (pp != NULL) ? proc_name_address(pp) : NULL;
++	snprintf(who, wholen, "%d:%s", task_pid(recv), pname != NULL ? pname : "?");
++	return 1;
++}
++
++/*
+  * Round265. Boot 51 named the debtor of the one outstanding request in the
+  * blocked process -- pid 140, com.apple.datamigrator, four beats running,
+  * rcv=0xc903 with an empty queue and no deadline -- and a name is not an
+@@ -11948,6 +12015,11 @@
+ 	uint32_t pak[CLOVER_BB_PEER_ROWS];
+ 	uint64_t pown[CLOVER_BB_PEER_ROWS];
+ 	uint64_t pctx[CLOVER_BB_PEER_ROWS];
++	int32_t psc[CLOVER_BB_PEER_ROWS];
++	uint32_t psp[CLOVER_BB_PEER_ROWS];
++	uint32_t pot[CLOVER_BB_PEER_ROWS];
++	uint8_t psem[CLOVER_BB_PEER_ROWS];
++	char pwho[CLOVER_BB_PEER_ROWS][CLOVER_BB_SEMA_NAME];
+ 	/*
+ 	 * Round266. Boot 52 showed the debtor asleep on five workloop notes and a mach semaphore, and the row
+ 	 * could not group them because it carried no wait-event word: for a wait whose object is not a port,
+@@ -12002,6 +12074,11 @@
+ 			ppc[pn] = 0;
+ 			pdl[pn] = 0;
+ 			clover_wait_owner(thr, &phint[pn], &pak[pn], &pown[pn], &pctx[pn]);
++			psem[pn] = 0;
++			if (phint[pn] == (uint32_t)kThreadWaitSemaphore) {
++				psem[pn] = (uint8_t)clover_sema_state(thr, &psc[pn],
++				    &psp[pn], &pot[pn], pwho[pn], sizeof(pwho[pn]));
++			}
+ 			if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1 &&
+ 			    !is_saved_state32(ss) && (thr->state & TH_RUN) == 0) {
+ 				ppc[pn] = (uint64_t)get_saved_state_pc(ss);
+@@ -12156,6 +12233,18 @@
+ 			    task_pid(peer), (unsigned long long)ptid[i], phint[i], pak[i],
+ 			    (unsigned long long)pown[i], (unsigned long long)pctx[i]);
+ 		}
++		/*
++		 * Round268. The one row of this census that the kernel's answer cannot close: a
++		 * semaphore wait whose owner field names its creator. count<0 says somebody is
++		 * still queued on it and srights says whether any task at all still holds the
++		 * right to signal it.
++		 */
++		if (psem[i] != 0) {
++			printf("clover r268: sem t=%llu pid=%d tid=%llx count=%d"
++			    " srights=%u otype=%x receiver=%s\n", (unsigned long long)secs,
++			    task_pid(peer), (unsigned long long)ptid[i], psc[i], psp[i],
++			    pot[i], pwho[i][0] != '\0' ? pwho[i] : "-");
++		}
+ 	}
+ }
+ 
+@@ -12239,6 +12328,11 @@
+ 	uint32_t cak[CLOVER_BB_CENSUS];
+ 	uint64_t cown[CLOVER_BB_CENSUS];
+ 	uint64_t cctx[CLOVER_BB_CENSUS];
++	int32_t csc[CLOVER_BB_CENSUS];
++	uint32_t csp[CLOVER_BB_CENSUS];
++	uint32_t cot[CLOVER_BB_CENSUS];
++	uint8_t csem[CLOVER_BB_CENSUS];
++	char cwho[CLOVER_BB_CENSUS][CLOVER_BB_SEMA_NAME];
+ 	uint32_t cn = 0;
+ 	uint32_t call = 0;
+ 	uint32_t cwait = 0;
+@@ -12434,6 +12528,11 @@
+ 		cpc[cn] = 0;
+ 		cdl[cn] = 0;
+ 		clover_wait_owner(thr, &chint[cn], &cak[cn], &cown[cn], &cctx[cn]);
++		csem[cn] = 0;
++		if (chint[cn] == (uint32_t)kThreadWaitSemaphore) {
++			csem[cn] = (uint8_t)clover_sema_state(thr, &csc[cn], &csp[cn],
++			    &cot[cn], cwho[cn], sizeof(cwho[cn]));
++		}
+ 		if (thr->wait_timer_armed && thr->wait_timer != NULL) {
+ 			dl_ns = 0;
+ 			absolutetime_to_nanoseconds(thr->wait_timer->tc_soft_deadline,
+@@ -12596,6 +12695,18 @@
+ 				    (unsigned long long)secs, pid,
+ 				    (unsigned long long)ctid[i], chint[i], cak[i],
+ 				    (unsigned long long)cown[i], (unsigned long long)cctx[i]);
++			}
++			/*
++			 * Round268. Same row for the blocked process: a semaphore wait there is
++			 * rarer than in the debtor, but it is the one wait whose kernel answer is
++			 * only a creator, so the census reads its count and rights the same way.
++			 */
++			if (csem[i] != 0) {
++				printf("clover r268: sem t=%llu pid=%d tid=%llx count=%d"
++				    " srights=%u otype=%x receiver=%s\n",
++				    (unsigned long long)secs, pid,
++				    (unsigned long long)ctid[i], csc[i], csp[i], cot[i],
++				    cwho[i][0] != '\0' ? cwho[i] : "-");
+ 			}
+ 		}
+ 		if (peer_task != TASK_NULL) {
