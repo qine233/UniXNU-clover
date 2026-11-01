@@ -19609,3 +19609,35 @@ cap 撞上了：`threads=17 shown=14`（第一拍）与 `15/14`——每拍都�
 `error:`。用构建记录的原始命令（`compile_commands.json` 里 task.c 那条）单独编译一次，
 exit 0 且产出 `task.o`，才确认源码没问题、缺的只是上一轮留下的对象。教训：并行 make 的日志
 不能只看有没有 `error:`，缺对象时用单文件编译把「源码坏了」和「构建状态坏了」切开。
+
+## 渲染策略改道：先用 CPU 顶桌面（2026-11-02 用户定），并把 sheng 的 GPU 链拆成可用/不可用两堆
+
+用户指令：**不急着写 Adreno 驱动，前期用 CPU 强行解码把桌面顶出来。** 已写进
+`porting.toml` 的 `gpu` 区 `next_action`、README 卡点表第 6 行，以及项目记忆
+`clover-rendering-strategy.md`（只有证明软件顶不掉，才回 GPU 区）。
+
+同一时间把 sheng 的 GPU 链读完（宿主侧侦察，无需上机），结论按「a5xx 能不能借」分堆：
+
+| sheng 的一段 | 文件 | Adreno 512（a5xx）能不能借 |
+| --- | --- | --- |
+| 电源/时钟普查 + 首次写（`sheng-gpu-power=1..3`） | `package/GpuPowerProbe.cpp:2-49`、`GpuPowerBoard.h:16-49` | **形状可借，偏移全错**：它是 sm8550 dtsi 量出来的（GDSCR 寄存器投票，不是 SPMI/RPMh）；SDM660 要 GCC `0x1830000` / turingcc |
+| GMU：SMMU ctx → AOP cmd-db → HFI → cold start RSC/PDC → µcode | `kits/AdrenoFirmware/AdrenoHfi*.c`、`NativeAdrenoGmu*.cpp`、mode 4–8 | **不适用**：a5xx 根本没有 GMU/HFI/RSC，µcode 走 RB 侧 |
+| PM4 编码器 | `kits/AdrenoPM4/AdrenoPM4.c`（type-7 编码） | **形状可借，payload 全是 A740** |
+| SMMU | `kits/ArmSmmu4K/*`（README 说是 SMMUv2 native 4K kit） | **可借**：SDM660 就是 SMMUv2，只换 SID/bank/ASM 分配 |
+| zap shader（mode 9，`qcom_mdt_load` PAS 13） | 同上 | **未知，需要证据**：本板厂商 DT 里留着 `gpu-zap 0xf0b00000+0x2000`（`notes/clover-device-tree-sources.md:39`），别假设 a5xx 不需要 |
+| Metal 侧 AirNir | `scripts/build-air-nir-ios.py`（cross-build `freedreno/ir3`） | **不适用**：IR3 是 a6xx+ 指令集，a5xx 是另一套 ISA |
+| 「发布一个 Metal 能打开的设备」 | `drivers/NativeAdreno/NativeAdrenoPublish.cpp:1-13`：一个 IOService，user-client 类**故意取名 `AGXDeviceUserClient`**，好让 stock sandbox 允许 `IOServiceOpen`；`NativeAdrenoAccelerator.cpp:2-5` 注册 `AGXAccelerator : IOAcceleratorES` | **这正是 CPU 路线能借的那一段** |
+
+三条要紧事实：
+
+1. **sheng 自己就把「设备壳」和「硬件真提交」分成两段**（`GpuPowerProbe.cpp` 的 stage 5 vs stage 7–9）。
+   所以 CPU-first 不是凭空发明：借的是它的分段——先发布壳、不碰 CP/µcode，看 backboardd 那组等待会不会散。
+2. **但没有任何一块板证明过软光栅能顶桌面**：sheng 没有 CPU renderer（AirNir 是 Vulkan 桥）。
+   按「先查 sheng」的规矩，这条得说明白：这是**两边都没有的东西**，不是照搬。
+3. **显示不依赖 GPU**：legacy presenter 是 CPU 拷贝帧；GPU 只是 phase-4 的旁挂 presenter
+   （`package/LegacyDisplayProbe.cpp:23,556-566`），而 sheng 的 GPU 探针在**桌面起来之后 10 s** 才跑
+   （`GpuPowerProbe.cpp:47-48`）。clover 的 framebuffer 已经能画（splash、panic 屏），所以「先出画面、后补渲染」顺序上成立。
+
+顺带记一条链接契约的坑（将来真加归档时要用）：`check-clover.py:618-625` 规定归档是**普通路径、没有
+`-Wl,-force_load`**，只有别的驱动引用它导出的符号才留得住（CloverSdhci 靠 CloverPMGR 调 `clover_emmc_run()`
+活下来）；sheng 的 GPU 归档走的是 gated force_load（`UniXNU/scripts/build-xnu-4k-baseline.sh:703-710`）。
