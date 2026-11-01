@@ -19802,3 +19802,55 @@ EGL_ANGLE_platform_angle_device_type_egl_angle ... is not supported`，同片有
 （`-[BKTouchDeliveryObservationManager _queue_postPendingUpdates]`、`_BKLogTouchEvents`、
 `descriptionForRootObject:` + `BKTouchHitTestContextMap`），而 VisualLogger 正是记触控与屏幕的那套东西——
 若真是它把 VFXCore 拉进来，「一个诊断记录器坐在桌面关键路径上」本身就值得单独记一笔。
+## r264 读数（boot 51）：唯一一笔「已发出、等回音」的请求，债主是 com.apple.datamigrator
+
+冷刷 `round264-payload.img`（sha e0384cac…，内核 amfi 1c96b89c…）。回读 16 条报告、
+64 条驱动判据、44 条 probe 行、512 行内核日志，boot 51。普查三拍：
+`t=1434/1567/1688`，`threads=15 shown=15 hidden=0`，`wait=14/15/13`、`run=1/0/2`，
+**`rx=10/10/9`、`tm=0/0/0`**（`rx=` 是「在陷阱里且 `remote=0`」即纯收信者的条数，
+`tm=` 是带期限的等待条数——**继续为零**，和 boot 50 一样这只进程里没有任何一次等待会在时钟上醒来）。
+
+**① `peer=` 解出来了，而且是镜像里真有的一个 XPC 服务。**
+四拍（t=1308/1434/1571/1694）同一条线程、同一行形状：
+
+```
+clover r262: th tid=43d st=41 we=0 cont=fffffff00725e2ac pc=1d62d8b58 dl=0
+    m2=ffffffffffffffd1 rcv=c903 remote=6b0f local=0 to=0 sz=4000 mc=0 sr=1
+    peer=140:com.apple.datam
+```
+
+`remote=6b0f` 的属主解成 **pid 140，comm 前缀 `com.apple.datam`**。`peer` 缓冲来自
+`clover_sb_port_owner` 里的 `char comm[16]`（`task.c:11249`），而 XNU 的 `p_comm` 本身就只有
+`MAXCOMLEN` 16 字节，**所以截断是内核的存储宽度，不是仪器的**——想再长只能去读可执行文件的 vnode 路径。
+镜像里对得上号的只有一个：
+`/System/Library/PrivateFrameworks/DataMigration.framework/XPCServices/com.apple.datamigrator.xpc/com.apple.datamigrator`
+（`/private/tmp/iosroot2` 全树 `find -name 'com.apple.datam*'` 唯一命中；
+`System/Library/LaunchDaemons` 的 523 个 plist 里没有 `datam*` 标签，所以它是**按需拉起的 XPC 服务**，
+不是开机常驻的守护进程）。`all peers` 计数：`140:com.apple.datam` 4 条、`none` 21 条、空（不在陷阱里）17 条。
+**这就是 boot 50 预告那一刀要指名的对象：整个 backboardd 里唯一一笔「发出去了、正等回音、且永不到期」的调用。**
+
+**② `mc=0 sr=1` 这两格要按 Mach 自己的语义读，别读成「别人还能回」。
+`mc=`/`sr=` 读的是**我们自己的收信端口** `rcv=c903`（`ip_messages.imq_msgcount`、`ip_srights`）。
+一次带 `MACH_SEND_REPLY` 的请求，内核在消息在途期间**自己持有那颗回音端口的一份发送权**，
+所以 `sr=1` 与「恰有一笔在途请求」同形，不能当独立证据。真正有信息量的是
+`mc=0`（**回音还没到**）加上 `dl=0`/`to=0`（**也不会到期**）：**这笔请求被对方取走了，回音没回来，
+而等待永远不会醒**。按 r264 预写的三分岔，落在「有人能发而没发——回到谁该发」这一支，债主就是 pid 140。
+
+**③ 组那一侧一动不动，和 boot 48/49/50 同形**：`tid=0x408` 睡在
+`cont=fffffff00773fc48`（`_ulock_wait_continue`，本靴符号已按 r264 内核重查），
+`bbchain` 从 t=1434 到 t=1791 每拍都是 `blk=141da5080 grp=141d7ad50 isa=1ff3a0a98 def=141d99060`；
+`bbnochain` 在 t=1434~1540 之间换了四只空闲工人（`base=16f073b4c/16f7a3b4c/16eddbb4c/16ed55b4c`，
+`fn=0/1` 都有），是散掉的正常形状。**也就是说这只进程里同时站着两个等待者**：
+一个是等自己 dispatch 组的 `0x408`（r261 的 VFXCore 栈），一个是等 datamigrator 回音的 `43d`。
+r264 之前只知道前者，现在第一次点名了后者。r260 的触摸判据继续是 `verdict=102`（4 笔全 NACK），没变。
+
+**④ 这一条改变了下一步的排序，也改变了对「GPU 区」的说法**：
+如果 backboardd 的主线程卡在「问 datamigrator 要数据迁移状态、而那个 XPC 服务不回」，
+那卡点既不是渲染完成、也不是触摸传输，而是**一次没人应答的 XPC 往返**——
+它比设备壳便宜得多，而且镜像里那条 `Software renderer! Simulating crash!` 的路径本来就在它后面。
+下一步（r265）不加新仪器，只把同一把尺子挪两个地方：
+**(a) 对端口的接收者任务（pid 140）跑同一份线程普查**——`clover_sb_port_owner` 已经拿到
+那颗 task 并有引用，把普查的第二拍交给它，读它此刻睡在哪个字、等谁；
+**(b) 把 `mc=`/`sr=` 也读在 `remote=6b0f` 那颗端口上**，也就是 datamigrator 自己的收信队列深度：
+`mc_remote>0` 说明**消息还排在它队列里没人取**（它自己被别的东西卡住），
+`mc_remote=0` 说明**它取走了、正在处理、没回**。两支的分岔不同，一支查它的等待者，一支查它的活儿。
