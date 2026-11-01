@@ -19269,3 +19269,36 @@ resolver 也就没有可匹配的 HID 服务。
 停，则这一格通了、下一步看 `bbgrp`；不停，则说明 backboardd 问的是别的节点，那时才轮到把缺席记录器
 升级成「在哪个 entry 上问的」（`IOCopyPropertyCompatible` 的调用点上 `regEntry` 就在手里）。
 `home-button-type` 仍然不动。
+
+## r257 读数（boot 45）：分类键发出去了，七个缺席名字消失；顺手把旧论断推翻一半
+
+`round257-log-window.bin`：boot 45。beat 一致：
+
+```
+clover r255: beat stage=5 service=fffffff3ce458980 Built-In=1 PrimaryUsagePage=1 PrimaryUsage=1
+             deviceBuiltIn=0 published=1 seen=1 presses=3 asks=1080 sinks=0,1 transfer=9
+```
+
+四个键确实在事件服务上了（`Built-In=1 PrimaryUsagePage=1 PrimaryUsage=1`，`published=1 seen=1`），
+`deviceBuiltIn=0` 保留成读数——r256 那道守卫本来就是错的方向。`presses=3 asks=1080` 也如设计：
+预算生效，而且两个数并排才说得出这件事。
+
+r252 的缺席表是这一轮真正的记分牌：**288→188 条、32→26 个名字**，而消失的七个全部是 HID 形状的属性——
+`Built-In`、`DisplayIntegrated`、`HIDVirtualDevice`、`StandardType`、`CapsLockLanguageSwitch`、
+`KeyboardLanguage`、`AppleBluetoothRemote`；新增的只有 `Manufacturer`（HID 走得更深之后才会问的一层）。
+也就是说用户态确实在遍历我们那颗设备，并且以前问不到、现在问得到。
+
+**同时，这帧栈把我们自己的旧论断推翻了一半。** 仍然 `wait=1` 的那条线程（pid 58，tid 0x3fe，
+`base=127d7a9e0 b=fffffffd cnt=1 wait=1`）的十帧用户栈，用 `scripts/decode-clover-cache-offset.py`
+落名之后全部在 **AssistantServices.framework**（`0x19fb88e40 / 0x19fbe5c9c / 0x19fbe6cc0 /
+0x19fb8e3f8 / 0x19fb8ee74 / 0x19fb98794 / 0x19fb980a8`，最近导出符号是 `_AFAnalyticsContextCreate…`、
+`_AFWorkoutPredictionTypeGetFromName` 一族），等待点 `pc=1dbdb6bdc` 落在 **Home.framework**
+（函数起点 0x1dbdb6ad8）。而 r239 那条「唯一 `leave` 在 `0x100030ca8`、挨着 `_BRController ready:
+device haptic asset slot count`」的读法，对应的是**栈上**那个组（boot 45 里是 `tid=0xec7
+base=16f01bb4c b=1 g=27d22ec0 cnt=0 wait=1`，栈地址 0x16f…）。两件事同时为真：按键 haptics 那个组还在等，
+**另有一个堆上的组也被一条与按键无关的线程长期等着**。之前把桌面缺口写成「一个 dispatch group、
+一个 leave 点」是过窄的，得按两个等待者重做。
+
+顺带把一条我自己的想法枪毙掉：sheng 整个仓库里没有 `haptics`/`taptic`/`vibra` 任何一个词，
+也没有 `soc-generation`/`product-id`/`is-muse` 这类 MG 身份键——它一个都不发也照样到桌面。
+所以「补 `/product/haptics`」「补 ADT 身份表」这两条候选都不是必要条件，r258 不再往那个方向花轮次。
