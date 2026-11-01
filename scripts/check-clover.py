@@ -1809,6 +1809,26 @@ def check_board(errors: list) -> str:
             errors.append(f"board.toml's title cannot be emitted as a TOML basic string ({exc}): "
                           "the firmware would drop the xnu entry and boot with no OS to show")
 
+        # Round253, the root list. The board has published /J120AP/buttons since r240 and the
+        # census has confirmed it is reachable, yet nothing ever attached to it: the child that
+        # matches IONameMatch="buttons" on an IOPlatformDevice is AppleM68Buttons, its
+        # personality is present in the stock 17.7.11 prelink info, and the bundle was simply not
+        # in [kernel.prelink] roots -- grep -c AppleM68Buttons is 4 in the stock kernelcache and 0
+        # in this board's kernel. Pin both halves of the claim: the root is listed, and the node
+        # it matches is still named the way the personality expects.
+        prelink_roots = board["kernel"]["prelink"]["roots"]
+        if "com.apple.driver.AppleM68Buttons" not in prelink_roots:
+            errors.append("board.toml's [kernel.prelink] roots do not list "
+                          "com.apple.driver.AppleM68Buttons: without it the /buttons node this "
+                          "board publishes has a provider and no driver, which is the shape that "
+                          "made sixteen rounds of ADT work change nothing")
+        m68_deps = ("com.apple.iokit.IOHIDFamily", "com.apple.driver.AppleARMPlatform")
+        for dep in m68_deps:
+            if dep not in prelink_roots:
+                errors.append(f"board.toml dropped {dep}, one of AppleM68Buttons' two non-KPI "
+                              "dependencies: the root would then be unlinked and the boot would "
+                              "lose the display or the platform layer that shares it")
+
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
         # respawn), so the ring started 400 s into the boot. The filters have to be in the object, and
@@ -2848,7 +2868,7 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r252:"):
+    if not board["payload"]["title"].startswith("clover r253:"):
         errors.append('[payload] title is not "clover r249: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
@@ -3901,7 +3921,7 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r252:"):
+    if not board["payload"]["title"].startswith("clover r253:"):
         errors.append('[payload] title is not "clover r249: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):

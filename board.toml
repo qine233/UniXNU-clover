@@ -111,6 +111,13 @@ roots = [
   "com.apple.security.sandbox",
   "com.apple.iokit.IOHIDFamily",
   "com.apple.iokit.IOHIDEventDriver",
+  # Round253. Apple's own button driver, and the reason sixteen rounds of ADT work changed
+  # nothing: its personality in the stock 17.7.11 prelink is IOClass=AppleM68Buttons,
+  # IONameMatch="buttons", IOProviderClass=IOPlatformDevice -- it is the child that this board's
+  # /J120AP/buttons node has never had. Its only non-KPI dependencies, IOHIDFamily and
+  # AppleARMPlatform, are already roots above, so this is a match, not a new stack. grep -c
+  # AppleM68Buttons is 4 in the stock kernelcache and was 0 in ours.
+  "com.apple.driver.AppleM68Buttons",
 ]
 
 [firmware]
@@ -170,7 +177,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r252: boot 39 closed the question -- who pid=58 comm=backboardd path=3 key=3, and it read \"home-button-type\" twice as len=4 val=2, so backboardd does get 2 and the dead wait is not that gate; it belongs to _configureAsync/SyncWithBlock:, whose only group leave sits next to the \"_BRController ready\" log. The same frame caught the first property this board was asked for and does not have: \"function-button_halleffect\" answered len=0 val=0 -- and only because the name happened to contain the button substring. r252 drops that luck: misses (absent properties and unresolvable paths) are recorded for every process the button tally already named, 16 rows plus a total, printed from the same exempt burst. The next round gets picked from a list of what is missing, not from whatever a filter let through."
+title = "clover r253: the button node had a provider and never a driver. boot 39 proved backboardd asks and gets the right answer -- who pid=58 comm=backboardd path=3 key=3, home-button-type len=4 val=2 -- and the host says why that was never going to be enough: function-button_halleffect is not MobileGestalt's key but AppleM68Buttons' own \"function-button_%s\" format, and that kext's personality is IONameMatch=\"buttons\" on IOPlatformDevice. com.apple.driver.AppleM68Buttons is in the stock prelink and absent from our 31 roots, so the /buttons node we have published since r240 has had nothing attached to it: the census showed svc buttons, which is the provider, and the child was simply not in the kernel. This round adds that one root -- both of its non-KPI dependencies, IOHIDFamily and AppleARMPlatform, were already there. What decides it is not the census but the driver's own voice on the card: its handleStart logs name every property it reads, and backboardd's group has exactly one leave, next to \"_BRController ready\"."
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

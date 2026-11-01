@@ -981,6 +981,12 @@ def check_sb_sample(kernel: bytes) -> bool:
              "mgq-none": (b"clover r252: no user client ever named a button path or key\n") in kernel,
              "mgq-row": (b"clover r252: row %u/%u %s\n") in kernel,
              "mgq-who": (b"clover r252: who pid=%d comm=%.20s path=%u key=%u\n") in kernel,
+             # Round253: Apple's own button driver has to be inside the shipped prelink, not
+             # merely requested -- the personality string and the class name are both in its text,
+             # and their presence is the only host-side proof that the /buttons node will finally
+             # have a child on the board.
+             "m68-class": (b"AppleM68Buttons") in kernel,
+             "m68-name": (b"function-button_%s") in kernel,
              "mgq-miss": (b"clover r252: misses total=%u shown=%u\n") in kernel,
              "mgq-missrow": (b"clover r252: miss %u/%u %s\n") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
