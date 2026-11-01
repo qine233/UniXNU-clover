@@ -19914,3 +19914,32 @@ LATE 顺序改成**顺序断言**（r265 在 r264 前、r264 在 r263 前——�
 解开它的钥匙不是 GPU、不是设备壳，而是「backboardd 必须先能收信才配得到回音」这一顺序问题；
 如果 `peer=` 指向别家（launchd、containermanagerd、mediaserverd 之类），闭环假设当场死，
 下一跳由那一行自己点名。**不猜，等读数。**
+## r265 期间的宿主侧第三眼：backboardd 那扇门就叫「等数据迁移」，而债主问的是钥匙袋
+
+三条串，全从镜像本身读出来，没有一条靠印象：
+
+1. **backboardd 自己的符号表里有这扇门**：`BKMigrator`、
+   `checkInAndWaitForForDataMigration:completionBlock:`（真名 `checkInAndWaitForDataMigration:completionBlock:`）、
+   `_lock_migratorDidComplete`、`dataMigratorDidComplete`、`migrateIfNeeded`、`_migrateBackBoard`、
+   `com.apple.backboardd.migration`、日志字面量 `Data Migration` 与
+   `checkInAndWaitForDataMigration: Telling "%{public}@" that it can start immediately`。
+   也就是说 backboardd **在开机流程里显式设了一道「等迁移完成才让谁开始」的门**，
+   boot 51 那笔没人回的请求正好落在它的语义范围里。
+2. **债主一侧的客户端串**（`.25`，DataMigration 那侧）：`Can't connect to datamigrator!`、
+   `deferExitWithConnection: will defer exit when migration completes`、
+   `deferred exit did timeout. will end transaction and exit`、`DMWaitForExecutePluginsSignal`、
+   `DMMigrationPluginResults`、`LastSystemVersion`、`DMLastMigrationResults`、`DMUserDataDisposition`、
+   还有一个 **`com.apple.datamigrator.continuous-integration`**（CI 开关形状的东西）。
+3. **最关键的一条**：`nm -u com.apple.datamigrator` 里全是 MobileKeyBag 的入口——
+   `MKBDeviceUnlockedSinceBoot`、`MKBGetDeviceLockState`、`MKBDeviceLockAssertionConsume`、
+   `MKBKeyBagKeyStashLoad`、`MKBLockDevice`，并且它直链 `MobileKeyBag.framework` 与 `Security.framework`。
+   这些调用在 iOS 上都是**走向 keybagd 的同步往返**。而本项目的 r197 那一格恰恰是
+   「Data 卷缺 keybags 的根因」——**同一Subsystem 我们已经有过案底**。
+
+**于是假设升一级（仍然要 boot 52 来判，别提前当结论）**：
+backboardd 的门 → datamigrator → keybagd。如果 r265 的 `pth` 行里出现
+`peer=<pid>:keybagd`（或 `securityd`），链条就在一靴里连上，桌面这一格的病根是**钥匙袋没人答**，
+不是 GPU、不是触摸、不是设备壳；如果 `peer=` 指向别家，这条升过的假设就跟着降级，
+下一跳由那一行自己点名。**boot 51 的环从 t=1186 起，512 行里没有 keybagd 的任何影子**
+（`grep -ic keybag` = 0），所以「keybagd 到底起没起」这件事现在仍然未知——
+r265 的债主普查正是为它准备的。
