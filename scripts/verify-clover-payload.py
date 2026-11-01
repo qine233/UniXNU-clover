@@ -998,20 +998,31 @@ def check_sb_sample(kernel: bytes) -> bool:
              "mgq-none": (b"clover r252: no user client ever named a button path or key\n") in kernel,
              "mgq-row": (b"clover r252: row %u/%u %s\n") in kernel,
              "mgq-who": (b"clover r252: who pid=%d comm=%.20s path=%u key=%u\n") in kernel,
-             # Round253: Apple's own button driver has to be inside the shipped prelink, not
-             # merely requested -- the personality string and the class name are both in its text,
-             # and their presence is the only host-side proof that the /buttons node will finally
-             # have a child on the board.
-             "m68-class": (b"AppleM68Buttons") in kernel,
-             "m68-name": (b"function-button_%s") in kernel,
-             # Presence of the class name is not the contract: a kext can be linked in and still
-             # never match anything, which is precisely what has been true of /buttons for sixteen
-             # rounds. The personality has to be in the shipped prelink info, with its IONameMatch
-             # and its IOProviderClass, because that dict is the only reason IOPlatformExpert would
-             # attach the driver to the node we publish.
-             "m68-personality": _m68_personality(kernel),
-             "mgq-miss": (b"clover r252: misses total=%u shown=%u\n") in kernel,
-             "mgq-missrow": (b"clover r252: miss %u/%u %s\n") in kernel,
+             # Round254 reads the same three probes backwards, and keeps them because they are the
+             # proof of the round that removed the root. Round253 linked Apple's button driver, the
+             # personality matched /J120AP/buttons, and handleStart panicked
+             # "failed to instantiate function-button_hold" at t=12.744 s, ending the boot before any
+             # instrument ran. The driver builds function-button_<name> for every name in its own
+             # table, and a synthesized ADT node has none of them, so the class, the format string and
+             # the personality must all be OUT of the shipped image: their presence here would mean a
+             # board that dies at thirteen seconds instead of the one that reaches the desktop.
+             "m68-class": b"AppleM68Buttons" not in kernel,
+             "m68-name": b"function-button_%s" not in kernel,
+             # The personality is checked in its absence for the same reason it was checked in its
+             # presence: it is the only thing that makes IOPlatformExpert attach a driver to the node
+             # we publish, so if the dict is back in the image the boot is back at thirteen seconds.
+             "m68-personality": not _m68_personality(kernel),
+             # Round254's miss list is one row per distinct name with a count, and the live line is
+             # said once per name. All three have to be in the binary: without the first the frame
+             # cannot say how many absences there were, without the second the names are unreadable,
+             # and without the third there is no record that the tally was ever taken at all.
+             "mgq-miss": (b"clover r252: misses total=%u distinct=%u\n") in kernel,
+             "mgq-missrow": (b"clover r252: miss %u/%u t=%llus %c pid=%d comm=%.20s count=%u "
+                             b"missing=%s\n") in kernel,
+             "mgq-missnew": (b"clover r252: miss new t=%llu %c pid=%d comm=%.20s missing=%s\n") in kernel,
+             # The sixteen-slot ring this round replaces must not survive in the image, or the frame
+             # would report a shown count out of a table that no longer exists.
+             "mgq-miss-old": (b"clover r252: misses total=%u shown=%u\n") not in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
                            b"dropped=%u comms=%u\n") in kernel,
              "tee-sync": (b"CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n") in kernel}

@@ -19052,3 +19052,95 @@ miss 4..7/16        SpringBoard missing=soc-generation
 本板 roots 里既没有 HID 输入提供者、也（直到 r253 之前）没有 `AppleM68Buttons`。
 所以 r253 = 把那行 root 加上，boot 41 只验一件事：**`svc` 点名里会不会出现 `AppleM68Buttons`、
 `button-family=` 会不会变大、backboardd 的 `bbgrp` 还等不等**。不改值。
+
+## r253 读数（boot 41）：驱动真的 start 了，然后在 12.7 秒把整台机器停了
+
+boot 41 的内核日志只有 11 行，最后一条是它自己的：
+
+```
+[   12.744272]: AppleM68Buttons:0x100000150 start
+```
+
+紧接着是 panic 槽（slot 4，kind 20）：
+
+```
+"AppleM68Buttons::handleStart failed to instantiate function-button_hold" @AppleM68Buttons.cpp:336
+```
+
+这是这台板子第一次有按键驱动 attach 到 `/J120AP/buttons` 并且进 `start`，也是第一次
+13 秒就死。代价写得很清楚：**census、属性记录器、backboardd 采样三件仪器一行都没出**——
+boot 40 那些读数的来源是 1500 秒以后的那一次 census，而这次开机根本没走到那里。
+`--wait 2100` 的无人值守脚本 100 秒就返回，因为设备早就进 TWRP 了。
+
+## 宿主：从我们自己的内核里把 handleStart 要什么挖出来
+
+不用新仪器也能读到驱动自己的意图。`round253-kernel-normalized.macho` 偏移
+0x1891e80–0x1892480 那一段是可打印字符串，按 NUL 切开倒出来就是这枚 kext 的私有常量表：
+
+```
+0x1891ed6  hold      0x1891edb  menu     0x1891ee0  volup    0x1891ee6  voldown
+0x1891eee  ringerab  0x1891ef7  ringeren 0x1891f00  halleffect  0x1891f0b  halleffect1
+0x1891f17  hesattach 0x1891f21  halleffect2  0x1891f2d  skey   0x1891f32  help
+0x1891f37  helpdouble  0x1891f42  app
+...
+0x1892055  press-count-usage-pairs   0x189206d  PressCountUsagePairs
+0x1892082  platform-type-consumer    0x1892099  button-names
+0x18920a6  button-delay_%s  0x18920b6  button-debounce-on_%s  0x18920cc  button-debounce-off_%s
+0x18920e3  button-priority_%s
+0x189223c  home-button-type  0x189224d  function-button_%s
+0x1892260  "AppleM68Buttons::handleStart failed to instantiate %s" @%s:%d
+0x189229f  function-wake_button_%s
+```
+
+`home-button-type`、`function-button_%s` 和那句 panic 挨在一起，按钮名是一张硬编码表，
+而 panic 里那条名字恰好是我们 ADT 里 `button-names` 的第一条 `hold`。到这里能下的结论是：
+`handleStart` 按名字列表逐条构造 `function-button_<name>`，拿不到就 panic——
+**一颗合成 ADT 里的 `/buttons` 节点，给不了它任何一条**。
+
+想把 `instantiate` 那一步的调用者也定死，得反汇编。这条路这轮走了三步就停下，踩到的两个坑记下来，
+下次直接用：
+
+1. ADRP 的 immhi 是 **bits[23:5]**（我第一遍按 `bits[23:12]` 取，解出来的页地址散成
+   0xc9b00000 这种不可能值）；
+2. `add Xd, Xn, #imm12` 判 `sh` 位不能写 `((w2>>23)&0x3f)==0`——bits[28:23] 在 opcode 里本来就是
+   `100010`，那个条件把所有命中都杀了。
+3. 前两条修好后页命中了（0x4881000/0x4882000 这些就是 kext 自己的 `__cstring` 页），
+   但用「往前找 `CF FA ED FE`」定位到的 header 是假的，按它的 vmaddr 推出来的 `__text`
+   属于 AppleCredentialManager。要真走这条路，得从 `__PRELINK_INFO` 的 kext 清单取偏移，
+   不能靠扫魔数。
+
+第三步没走完，因为这轮不需要：名字表 + 格式串 + panic 点名的那条，加上对照组的硬事实，
+已经足够决定下一步做什么。
+
+## 对照组把这条线结掉
+
+`UniXNU-sheng/scripts/make-sheng-adt.py:185-186` 发布的是**同一个** `buttons` 节点：
+
+```python
+('button-names', b'hold\0voldown\0volup\0'),
+('home-button-type', struct.pack('<I', 2)),
+```
+
+没有一条 `function-button_*`，而它带着同一个 iPadOS 17.7.11 镜像跑到桌面。差别不在值，
+在结构：`UniXNU-sheng/board.toml` 的 `[kernel]` 里**根本没有 `prelink.roots`**，
+按键是它自己的 `ShengHidInput`（`kernel.archives` 里那一行）发出来的。
+
+于是本板缺的东西说法定向改一次：**不缺 Apple 的按键驱动，缺的是任何一个把 HID 按键发布出来的驱动**。
+把 AppleM68Buttons 塞进 prelink 不是补上那块拼图，是换了一条必须靠真 ADT 才能走的路。
+
+## r254 落地：root 摘回去，仪器自己别再吃读数
+
+1. `[kernel.prelink] roots` 从 32 回 31，`AppleM68Buttons` 那行删掉，但注释留在原地，
+   写清楚 boot 41 的 panic 串与行号；两个 checker 的契约同时反着钉：
+   `check-clover.py` 断言这行 root **不在**，`verify-clover-payload.py` 把 `m68-class`、
+   `m68-name`、`m68-personality` 三个探针改成断言**不在镜像里**——它们再出现就意味着
+   这台板子又回到 13 秒就死。
+2. 缺席记录器（r252）按 boot 40 的读数修：`misses total=153 shown=16`、而那 16 行是
+   四个名字重复（`soc-generation` 独占 8 行），这是 r249/r251 之后第三次仪器自己丢读数。
+   r254 = 一张**按名字去重**的表（`CLOVER_MG_MISSES 32`，每行 `count=`），live 打印从
+   「按键行」挪到「miss 行」（按键行 census 反正会重放，miss 第一次出现的顺序之后买不回来），
+   `r252-mgq` 的 tee 类预算 64 → 128。
+3. 下一刀还是原计划：`drivers/NativeHidInput` 接线（`build/native-hid-input/NativeHidInput.late.o`
+   + `hid-original-bindings.o` 并进显示 archive、`scripts/build-native-hid-input.py` 进
+   `kernel.archives`、`package/CloverHidInputProbe.cpp` 由 CloverPMGR 调、boot-args
+   `offline-hid-input=1 offline-hid-home=1`）。不改 `home-button-type` 的值。

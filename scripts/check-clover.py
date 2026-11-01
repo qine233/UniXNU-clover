@@ -953,7 +953,7 @@ def check_board(errors: list) -> str:
                 ('{ "clover r243: ", "r243", 64, 0, 0, 0 },',
                  "the IODeviceTree census would land uncounted: its node rows could push "
                  "the beat rows that prove the kernel is alive out of the ring"),
-                ('{ "clover r252: ", "r252-mgq", 64, 0, 0, 0 },',
+                ('{ "clover r252: ", "r252-mgq", 128, 0, 0, 0 },',
                  "the user-client question rows and the absent-answer list would land uncounted, and "
                  "the one reading that separates a wrong answer from no question at all "
                  "would be missing")):
@@ -1728,6 +1728,55 @@ def check_board(errors: list) -> str:
                               "'printf(\"clover r252: %s\\\\n\", row);' literals: a format string "
                               "broken by a real newline compiles as a wall of unrelated errors")
 
+        # Round254, the same recorder's second truncation. Boot 40 kept the census and the tally and
+        # still lost the reading: the miss list came back as "misses total=153 shown=16", sixteen rows
+        # that were four names repeated -- soc-generation eight times over -- so the instrument spent
+        # its budget restating one absence and hid the rest. One row per distinct name with a count is
+        # the same instrument read correctly, the live print moves from the button rows (which the
+        # census replays anyway) to the miss rows (whose first-seen order no later dump can restore),
+        # and the tee class grows to carry it.
+        r254_name = "z" * 36 + "-clover-r254.patch"
+        r254_patch = next((base / "patches/xnu-clover" / r254_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r254_name).is_file()), None)
+        if r254_patch is None:
+            errors.append(f"patches/xnu-clover/{r254_name} is missing: the next boot would again be "
+                          "read from a sixteen-slot ring that keeps the same absence eight times")
+        else:
+            r254_text = r254_patch.read_text()
+            r254_added = "".join(line for line in r254_patch.read_text().splitlines(True)
+                                 if line.startswith("+"))
+            r254_removed = "".join(line for line in r254_patch.read_text().splitlines(True)
+                                   if line.startswith("-"))
+            for needle in ('#define CLOVER_MG_MISSES 32',
+                           'struct clover_mg_miss {',
+                           'clover_mg_miss_distinct',
+                           'clover_mg_same(const char *a, const char *b)',
+                           '"clover r252: misses total=%u distinct=%u\\n"',
+                           '"clover r252: miss new t=%llu %c pid=%d comm=%.20s missing=%s\\n"',
+                           '"clover r252: miss %u/%u t=%llus %c pid=%d comm=%.20s count=%u '
+                           'missing=%s\\n"',
+                           '"clover r252: nothing a button-asking process reached for was absent\\n"'):
+                if needle not in r254_added:
+                    errors.append(f"{r254_patch.name} lacks {needle[:64]!r}: without it the frame "
+                                  "cannot say which absences there were, only how many of one")
+            # The repetition this round exists to remove, both halves of it.
+            if 'misses total=%u shown=%u' in r254_added:
+                errors.append(f"{r254_patch.name} still reports a shown count out of a ring: a frame "
+                              "that shows sixteen of one hundred and fifty-three misses has to say so")
+            if r254_removed.count('printf("clover r252: %s\\n", row);') != 2:
+                errors.append(f"{r254_patch.name} does not take both live row prints out of "
+                              "clover_mg_note/clover_mg_miss: the census replays those rows, and the "
+                              "pass budget they spend is the one the miss list is printed into")
+            # r251's and r252's literal-integrity lesson, applied to this round's own strings: a
+            # generator that eats the backslash before an n leaves a printf spanning two source lines,
+            # which still compiles and still matches the tee prefix, and no prefix-counting assertion
+            # notices.
+            if r254_added.count('missing=%s\\n"') != 2 or 'distinct=%u\\n"' not in r254_added:
+                errors.append(f"{r254_patch.name} does not carry two intact 'missing=%s\\n' literals "
+                              "plus the distinct total: a format string broken by an eating generator "
+                              "changes what the card reads back while leaving every prefix needle green")
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -1809,25 +1858,28 @@ def check_board(errors: list) -> str:
             errors.append(f"board.toml's title cannot be emitted as a TOML basic string ({exc}): "
                           "the firmware would drop the xnu entry and boot with no OS to show")
 
-        # Round253, the root list. The board has published /J120AP/buttons since r240 and the
-        # census has confirmed it is reachable, yet nothing ever attached to it: the child that
-        # matches IONameMatch="buttons" on an IOPlatformDevice is AppleM68Buttons, its
-        # personality is present in the stock 17.7.11 prelink info, and the bundle was simply not
-        # in [kernel.prelink] roots -- grep -c AppleM68Buttons is 4 in the stock kernelcache and 0
-        # in this board's kernel. Pin both halves of the claim: the root is listed, and the node
-        # it matches is still named the way the personality expects.
+        # Round254, the same root list read backwards. Round253 put AppleM68Buttons in it, the
+        # personality matched, the driver attached to /J120AP/buttons and printed its own start --
+        # and then panicked at t=12.744 s, "handleStart failed to instantiate function-button_hold"
+        # @AppleM68Buttons.cpp:336, because handleStart builds function-button_<name> for every name
+        # on the list in its __cstring and a synthesized ADT node gives it none of them. That boot
+        # ended seventeen minutes short of the place being measured: no census, no property recorder,
+        # no backboardd sample. The root stays out, pinned here with the reason, until the buttons
+        # this board has to publish arrive through the board's own HID driver rather than through
+        # Apple's SSHB one. The two families the round also needed remain roots for everything else
+        # that uses them, so their absence would be a different bug.
         prelink_roots = board["kernel"]["prelink"]["roots"]
-        if "com.apple.driver.AppleM68Buttons" not in prelink_roots:
-            errors.append("board.toml's [kernel.prelink] roots do not list "
-                          "com.apple.driver.AppleM68Buttons: without it the /buttons node this "
-                          "board publishes has a provider and no driver, which is the shape that "
-                          "made sixteen rounds of ADT work change nothing")
+        if "com.apple.driver.AppleM68Buttons" in prelink_roots:
+            errors.append("board.toml's [kernel.prelink] roots list com.apple.driver.AppleM68Buttons "
+                          "again: it attaches, cannot instantiate function-button_hold against a "
+                          "synthesized /buttons node, and panics the boot at 12.7 s -- nineteen "
+                          "minutes less reading than the deadlock it was meant to explain")
         m68_deps = ("com.apple.iokit.IOHIDFamily", "com.apple.driver.AppleARMPlatform")
         for dep in m68_deps:
             if dep not in prelink_roots:
-                errors.append(f"board.toml dropped {dep}, one of AppleM68Buttons' two non-KPI "
-                              "dependencies: the root would then be unlinked and the boot would "
-                              "lose the display or the platform layer that shares it")
+                errors.append(f"board.toml dropped {dep}: the HID family and the platform layer are "
+                              "roots in their own right, and a boot without either cannot reach the "
+                              "desktop whatever happens to the button driver")
 
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
@@ -2868,7 +2920,7 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r253:"):
+    if not board["payload"]["title"].startswith("clover r254:"):
         errors.append('[payload] title is not "clover r249: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
@@ -3921,7 +3973,7 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r253:"):
+    if not board["payload"]["title"].startswith("clover r254:"):
         errors.append('[payload] title is not "clover r249: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):

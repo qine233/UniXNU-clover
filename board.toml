@@ -111,13 +111,26 @@ roots = [
   "com.apple.security.sandbox",
   "com.apple.iokit.IOHIDFamily",
   "com.apple.iokit.IOHIDEventDriver",
-  # Round253. Apple's own button driver, and the reason sixteen rounds of ADT work changed
-  # nothing: its personality in the stock 17.7.11 prelink is IOClass=AppleM68Buttons,
-  # IONameMatch="buttons", IOProviderClass=IOPlatformDevice -- it is the child that this board's
-  # /J120AP/buttons node has never had. Its only non-KPI dependencies, IOHIDFamily and
-  # AppleARMPlatform, are already roots above, so this is a match, not a new stack. grep -c
-  # AppleM68Buttons is 4 in the stock kernelcache and was 0 in ours.
-  "com.apple.driver.AppleM68Buttons",
+  # Round253 added Apple's own button driver here and round254 took it back out; the comment stays as
+  # the record of what boot 41 measured. The hypothesis was worth the round: the personality in the
+  # stock 17.7.11 prelink is IOClass=AppleM68Buttons, IONameMatch="buttons",
+  # IOProviderClass=IOPlatformDevice, which is the child this board's /J120AP/buttons node has never
+  # had, and its only non-KPI dependencies (IOHIDFamily, AppleARMPlatform) were already roots.
+  # It matched. It started. And at t=12.744 s the kernel printed
+  #   AppleM68Buttons::handleStart failed to instantiate function-button_hold   @AppleM68Buttons.cpp:336
+  # and panicked, which ended the boot seventeen minutes short of the place we were measuring: no
+  # census, no property recorder, no backboardd sample -- the last kernel row of boot 41 is the
+  # driver's own start line. Two facts came out of it. One: handleStart walks a list of button names
+  # and builds function-button_<name> for each, holding the name list and the per-button properties in
+  # the driver's own __cstring (hold, menu, volup, voldown, ringerab, ringeren, halleffect,
+  # halleffect1, hesattach, halleffect2, skey, help, helpdouble, app, then home-button-type and
+  # function-button_%s right next to the panic string), so a synthesized /buttons node without those
+  # properties is not a node the driver can start on. Two: UniXNU-sheng publishes the same buttons
+  # node -- same compatible, same button-names = "hold\0voldown\0volup\0", same home-button-type = 2,
+  # and no function-button_* anywhere -- reaches the desktop, and does it with no prelink roots at all,
+  # because the home button is not what it brings up: its input arrives through its own ShengHidInput.
+  # So the missing thing on this board is not the Apple driver but any driver at all that publishes
+  # the HID buttons; that is the NativeHidInput wiring, and it goes in front of this one.
 ]
 
 [firmware]
@@ -177,7 +190,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r253: the button node had a provider and never a driver. boot 39 proved backboardd asks and gets the right answer -- who pid=58 comm=backboardd path=3 key=3, home-button-type len=4 val=2 -- and the host says why that was never going to be enough: function-button_halleffect is not MobileGestalt's key but AppleM68Buttons' own \"function-button_%s\" format, and that kext's personality is IONameMatch=\"buttons\" on IOPlatformDevice. com.apple.driver.AppleM68Buttons is in the stock prelink and absent from our 31 roots, so the /buttons node we have published since r240 has had nothing attached to it: the census showed svc buttons, which is the provider, and the child was simply not in the kernel. This round adds that one root -- both of its non-KPI dependencies, IOHIDFamily and AppleARMPlatform, were already there. What decides it is not the census but the driver's own voice on the card: its handleStart logs name every property it reads, and backboardd's group has exactly one leave, next to \"_BRController ready\"."
+title = "clover r254: the button driver came back out of the prelink, and the absence list stops repeating itself. boot 41 is the shortest boot of this port and the most informative: AppleM68Buttons matched /J120AP/buttons, printed its own start line, and at t=12.744 panicked \"failed to instantiate function-button_hold\" @AppleM68Buttons.cpp:336 -- handleStart builds function-button_<name> for every button on the driver's own hardcoded list, and a synthesized ADT node gives it none of them. The same node shape (button-names hold/voldown/volup, home-button-type=2, no function-button_*) reaches the desktop on UniXNU-sheng with this same image and no prelink roots at all, so what this board lacks is not Apple's driver but any driver that publishes the HID buttons -- NativeHidInput, whose bindings already qualify. The recorder changes too: boot 40 counted 153 misses and its 16-slot ring kept four names repeated, soc-generation eight times, so misses become a distinct-name tally with a count per name, the live print moves from button rows to miss rows, and r252-mgq's tee budget goes 64 to 128."
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

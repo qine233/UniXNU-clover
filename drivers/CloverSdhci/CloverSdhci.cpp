@@ -764,10 +764,15 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // printed before the rows. The burst is therefore one counter line, up to eight who lines and up
   // to 24 rows -- 33 at worst, so 48 leaves the same headroom r243 gives the census.
   // Round252 adds a second list to the same burst: every registry name a button-asking process
-  // reached for and this board does not have, up to 16 rows plus its own total. The budget goes to
-  // the census's 64 because the worst case is now one total line, eight who lines, 24 rows, one
-  // misses line and 16 miss rows -- 50 records in the pass that is already exempt.
-  { "clover r252: ", "r252-mgq", 64, 0, 0, 0 },
+  // reached for and this board does not have. Boot 40 read that list back as "misses total=153
+  // shown=16" -- sixteen rows that were four names repeated, soc-generation eight times over, so the
+  // instrument spent its budget saying the same absence eight ways and still hid the other names.
+  // Round254 keeps one row per distinct name with a count, up to 32 of them, and moves the live print
+  // off the button rows onto the miss rows, because the census replays the rows anyway and the order
+  // a name first went missing is the part no later dump can restore. Worst case is therefore one
+  // total line, eight who lines, 24 rows, one misses line, 32 miss lines and 32 live miss lines --
+  // 118 records, so the class budget goes from 64 to 128.
+  { "clover r252: ", "r252-mgq", 128, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

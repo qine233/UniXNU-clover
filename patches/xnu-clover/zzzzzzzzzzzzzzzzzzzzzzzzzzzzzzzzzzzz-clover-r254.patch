@@ -1,0 +1,157 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 248d783..749eb2e 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -3669,9 +3669,26 @@ static char             clover_mg_rows[CLOVER_MG_ROWS][CLOVER_MG_LINE];
+  * matter, and bounding the list to them keeps a chatty boot from filling the ring with probes that
+  * mean nothing.
+  */
+-#define CLOVER_MG_MISSES 16
+-static char             clover_mg_miss_rows[CLOVER_MG_MISSES][CLOVER_MG_LINE];
++/*
++ * Round254. The ring is replaced by a tally of distinct names, because boot 40 showed what a ring
++ * of sixteen slots does with a boot that misses one hundred and fifty-three times: the sixteen rows
++ * it kept were four names repeated -- soc-generation alone took eight of them -- so the list the next
++ * round is chosen from said less than the total line above it. A name is asked once per property or
++ * path, so the set of names is the reading; how many times each was reached is a second number that
++ * costs nothing to keep and says which one is load-bearing.
++ */
++#define CLOVER_MG_MISSES 32
++struct clover_mg_miss {
++	char        name[48];
++	char        kind;
++	int         pid;
++	char        comm[24];
++	uint64_t    first;
++	uint32_t    count;
++};
++static struct clover_mg_miss clover_mg_miss_rows[CLOVER_MG_MISSES];
+ static uint32_t         clover_mg_miss_notes;
++static uint32_t         clover_mg_miss_distinct;
+ static struct clover_mg_who clover_mg_who[CLOVER_MG_WHO];
+ static uint32_t         clover_mg_whos;
+ static uint32_t         clover_mg_notes;
+@@ -3757,13 +3774,33 @@ clover_mg_asked(int pid)
+ 	return NULL;
+ }
+ 
+-/* Round252. A question this board cannot answer, said once per ring slot. kind is "key" for a
+- * property that is not there and "path" for a registry path that does not resolve. */
++/* Round254. strcmp without pulling string.h into this file, the same reason the button filter is
++ * hand-rolled: the includes here are the ones IOUserClient has always carried. */
++static bool
++clover_mg_same(const char *a, const char *b)
++{
++	while (a[0] != '\0' && b[0] != '\0') {
++		if (a[0] != b[0]) {
++			return false;
++		}
++		a++;
++		b++;
++	}
++	return a[0] == b[0];
++}
++
++/* Round252, re-shaped by round254. A question this board cannot answer. kind is "key" for a property
++ * that is not there and "path" for a registry path that does not resolve. The first time a name is
++ * seen it is given a row and said out loud, so the kernel log's own stamp places the question in the
++ * boot's timeline; every later hit on the same name only adds to its count and stays quiet, because
++ * the census dump replays the whole table anyway and the pass budget that was left to this class was
++ * being spent on repetitions. */
+ static void
+ clover_mg_miss(const char *kind, const char *what)
+ {
+-	char        *row;
++	struct clover_mg_miss *row;
+ 	uint64_t     ns = 0;
++	uint32_t     i;
+ 	int          pid;
+ 	const struct clover_mg_who *asker;
+ 
+@@ -3772,14 +3809,27 @@ clover_mg_miss(const char *kind, const char *what)
+ 	if (asker == NULL) {
+ 		return;
+ 	}
+-	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+-	row = clover_mg_miss_rows[clover_mg_miss_notes % CLOVER_MG_MISSES];
+-	snprintf(row, CLOVER_MG_LINE, "t=%llu %s pid=%d comm=%.20s missing=%.48s",
+-	    (unsigned long long) (ns / 1000000000ULL), kind, pid, asker->name, what);
+-	if (clover_mg_miss_notes < CLOVER_MG_MISSES) {
+-		printf("clover r252: %s\n", row);
+-	}
+ 	clover_mg_miss_notes++;
++	for (i = 0; i < clover_mg_miss_distinct; i++) {
++		if (clover_mg_same(clover_mg_miss_rows[i].name, what)) {
++			clover_mg_miss_rows[i].count++;
++			return;
++		}
++	}
++	if (clover_mg_miss_distinct >= CLOVER_MG_MISSES) {
++		return;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	row = &clover_mg_miss_rows[clover_mg_miss_distinct];
++	snprintf(row->name, sizeof(row->name), "%.47s", what);
++	row->kind = kind[0];
++	row->pid = pid;
++	snprintf(row->comm, sizeof(row->comm), "%.20s", asker->name);
++	row->first = ns / 1000000000ULL;
++	row->count = 1;
++	clover_mg_miss_distinct++;
++	printf("clover r252: miss new t=%llu %c pid=%d comm=%.20s missing=%s\n",
++	    (unsigned long long) row->first, row->kind, pid, asker->name, what);
+ }
+ 
+ static void
+@@ -3807,13 +3857,13 @@ clover_mg_note(const char *kind, const char *what, unsigned int length, unsigned
+ 	row = clover_mg_rows[clover_mg_notes % CLOVER_MG_ROWS];
+ 	snprintf(row, CLOVER_MG_LINE, "t=%llu %s pid=%d comm=%.20s what=%.40s len=%u val=%u",
+ 	    (unsigned long long) (ns / 1000000000ULL), kind, pid, nm, what, length, value);
+-	if (clover_mg_notes < CLOVER_MG_ROWS) {
+-		// Also said out loud while there is still room in the ring, so the kernel log's own
+-		// stamp can place the question in the boot's timeline; past the ring the dump is
+-		// the only channel, and this cannot flood.  Printed from inside the user client, so it
+-		// names the caller that asked.
+-		printf("clover r252: %s\n", row);
+-	}
++	/*
++	 * Round254 stops saying these out loud. The row is in the ring and the census replays the ring,
++	 * so the live print bought only the kernel log's timestamp -- and it bought it by spending the
++	 * per-pass budget of the very class the census dump answers from. Boot 40 still fit inside the
++	 * cap, but the lines it crowded out are the reading the next round is chosen from, and the
++	 * timeline a reader wanted is on the miss lines, which now get that channel to themselves.
++	 */
+ 	clover_mg_notes++;
+ 	if (who != NULL) {
+ 		who->release();
+@@ -3850,16 +3900,21 @@ clover_mg_dump(void)
+ 	}
+ 	/*
+ 	 * Round252 last, because it is the list the next round is chosen from: every registry name a
+-	 * button-asking process reached for and this board does not have.
++	 * button-asking process reached for and this board does not have. Round254 prints it as a
++	 * distinct-name tally in the order the names first appeared, oldest question first, with how many
++	 * times each came back empty -- the count is what tells a load-bearing absence from a probe.
+ 	 */
+-	printf("clover r252: misses total=%u shown=%u\n",
+-	    (unsigned int) clover_mg_miss_notes,
+-	    clover_mg_miss_notes < CLOVER_MG_MISSES ? clover_mg_miss_notes : CLOVER_MG_MISSES);
+-	n = clover_mg_miss_notes < CLOVER_MG_MISSES ? clover_mg_miss_notes : CLOVER_MG_MISSES;
+-	start = clover_mg_miss_notes <= CLOVER_MG_MISSES ? 0 : clover_mg_miss_notes % CLOVER_MG_MISSES;
+-	for (i = 0; i < n; i++) {
+-		printf("clover r252: miss %u/%u %s\n", i + 1, n,
+-		    clover_mg_miss_rows[(start + i) % CLOVER_MG_MISSES]);
++	printf("clover r252: misses total=%u distinct=%u\n",
++	    (unsigned int) clover_mg_miss_notes, (unsigned int) clover_mg_miss_distinct);
++	for (i = 0; i < clover_mg_miss_distinct; i++) {
++		printf("clover r252: miss %u/%u t=%llus %c pid=%d comm=%.20s count=%u missing=%s\n",
++		    i + 1, clover_mg_miss_distinct,
++		    (unsigned long long) clover_mg_miss_rows[i].first, clover_mg_miss_rows[i].kind,
++		    clover_mg_miss_rows[i].pid, clover_mg_miss_rows[i].comm,
++		    clover_mg_miss_rows[i].count, clover_mg_miss_rows[i].name);
++	}
++	if (clover_mg_miss_distinct == 0) {
++		printf("clover r252: nothing a button-asking process reached for was absent\n");
+ 	}
+ }
+ 
