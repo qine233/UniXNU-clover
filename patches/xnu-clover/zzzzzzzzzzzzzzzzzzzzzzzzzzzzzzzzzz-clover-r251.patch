@@ -1,0 +1,173 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -3628,17 +3628,38 @@ is_io_registry_entry_get_registry_entry_id(
+  * launchd's boot tasks, and by the time the census prints at 1500 s a line printed at 20 s has
+  * been overwritten in msgbuf. The census calls clover_mg_dump() inside its own exempt burst, so
+  * an early question reaches the card with the readings that explain it. And if the dump says
+  * nothing was ever asked, that answers a different question: MobileGestalt got its value from
+  * somewhere else, and the ADT, the plane and this probe are all beside the point.
++ *
++ * Round251. Boot 38 answered the question -- SpringBoard and PreBoard both resolve
++ * IODeviceTree:/buttons and read home-button-type back len=4 val=2 -- and in doing so showed that
++ * this instrument has the same defect r249 fixed in the tee, in a different place: the ring is
++ * rows[notes % 8], so from the ninth ask it overwrites the first, and it printed slots in slot
++ * order rather than in time order. With notes=15 the seven earliest asks were the ones that
++ * vanished, and the smallest pid is exactly where backboardd sits, so the one thing left to answer
++ * was the one thing the ring could not keep. Two changes, neither of them a new instrument: the ring
++ * is 24 rows and the dump reads it from the wrap point, and every ask also folds into an
++ * unbounded-by-the-ring per-process tally, because "did pid 58 ask" must survive even a boot with
++ * two hundred property reads. The comm= field also stops spending its width on the "pid N, " prefix
++ * IOCopyLogNameForPID puts on the front of the name it returns.
+  */
+-#define CLOVER_MG_ROWS  8
+-#define CLOVER_MG_LINE  112
+-static char      clover_mg_rows[CLOVER_MG_ROWS][CLOVER_MG_LINE];
+-static uint32_t  clover_mg_notes;
+-static uint64_t  clover_mg_path_asks;
+-static uint64_t  clover_mg_key_asks;
++#define CLOVER_MG_ROWS  24
++#define CLOVER_MG_LINE  120
++#define CLOVER_MG_WHO    8
++struct clover_mg_who {
++	int       pid;
++	char      name[24];
++	uint32_t  paths;
++	uint32_t  keys;
++};
++static char             clover_mg_rows[CLOVER_MG_ROWS][CLOVER_MG_LINE];
++static struct clover_mg_who clover_mg_who[CLOVER_MG_WHO];
++static uint32_t         clover_mg_whos;
++static uint32_t         clover_mg_notes;
++static uint64_t         clover_mg_path_asks;
++static uint64_t         clover_mg_key_asks;
+ 
+ static bool
+ clover_mg_interesting(const char *name)
+ {
+ 	const char *p;
+@@ -3652,10 +3673,59 @@ clover_mg_interesting(const char *name)
+ 		}
+ 	}
+ 	return false;
+ }
+ 
++/* Round251. IOCopyLogNameForPID hands back "pid <n>, <name>"; boot 38 showed the cost of printing
++ * that from the front -- a 16-byte field cut the name to "SpringBo" after spending eight bytes on a
++ * pid that is printed again two fields later. The name is what identifies the asker, so take the
++ * part after the comma-space and keep the pid column for the number. */
++static const char *
++clover_mg_short(const char *logname)
++{
++	const char *p;
++
++	for (p = logname; p[1] != '\0'; p++) {
++		if (p[0] == ',' && p[1] == ' ') {
++			return p + 2;
++		}
++	}
++	return logname;
++}
++
++/* Round251. The tally is the reading that must not depend on the ring's capacity: a boot where
++ * every process asks often enough to wrap 24 rows still has to answer "did this pid ask at all",
++ * because that is the question the frame is being read for. */
++static void
++clover_mg_tally(int pid, const char *name, bool path)
++{
++	struct clover_mg_who *entry = NULL;
++	uint32_t              i;
++
++	for (i = 0; i < clover_mg_whos; i++) {
++		if (clover_mg_who[i].pid == pid) {
++			entry = &clover_mg_who[i];
++			break;
++		}
++	}
++	if (entry == NULL) {
++		if (clover_mg_whos >= CLOVER_MG_WHO) {
++			return;
++		}
++		entry = &clover_mg_who[clover_mg_whos++];
++		entry->pid = pid;
++		entry->paths = 0;
++		entry->keys = 0;
++		snprintf(entry->name, sizeof (entry->name), "%.20s", name);
++	}
++	if (path) {
++		entry->paths++;
++	} else {
++		entry->keys++;
++	}
++}
++
+ static void
+ clover_mg_note(const char *kind, const char *what, unsigned int length, unsigned int value)
+ {
+ 	char        *row;
+ 	uint64_t     ns = 0;
+@@ -3672,41 +3742,55 @@ clover_mg_note(const char *kind, const char *what, unsigned int length, unsigned
+ 		clover_mg_key_asks++;
+ 	}
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+ 	pid = proc_selfpid();
+ 	who = IOCopyLogNameForPID(pid);
+-	nm = who != NULL ? who->getCStringNoCopy() : "?";
++	nm = who != NULL ? clover_mg_short(who->getCStringNoCopy()) : "?";
++	clover_mg_tally(pid, nm, kind[0] == 'p');
+ 	row = clover_mg_rows[clover_mg_notes % CLOVER_MG_ROWS];
+-	snprintf(row, CLOVER_MG_LINE, "t=%llu %s pid=%d comm=%.16s what=%.40s len=%u val=%u",
++	snprintf(row, CLOVER_MG_LINE, "t=%llu %s pid=%d comm=%.20s what=%.40s len=%u val=%u",
+ 	    (unsigned long long) (ns / 1000000000ULL), kind, pid, nm, what, length, value);
+ 	if (clover_mg_notes < CLOVER_MG_ROWS) {
+ 		// Also said out loud while there is still room in the ring, so the kernel log's own
+-		// stamp can place the question in the boot's timeline; past eight notes the dump is
++		// stamp can place the question in the boot's timeline; past the ring the dump is
+ 		// the only channel, and this cannot flood.  Printed from inside the user client, so it
+ 		// names the caller that asked.
+-		printf("clover r250: %s\n", row);
++		printf("clover r251: %s\n", row);
+ 	}
+ 	clover_mg_notes++;
+ 	if (who != NULL) {
+ 		who->release();
+ 	}
+ }
+ 
+ extern "C" void
+ clover_mg_dump(void)
+ {
+-	uint32_t i, n;
++	uint32_t i, n, start;
+ 
+-	printf("clover r250: asks path=%llu key=%llu notes=%u\n",
++	printf("clover r251: asks path=%llu key=%llu notes=%u whos=%u\n",
+ 	    (unsigned long long) clover_mg_path_asks, (unsigned long long) clover_mg_key_asks,
+-	    clover_mg_notes);
++	    clover_mg_notes, clover_mg_whos);
++	/*
++	 * Round251. The tally first, because it is the line that cannot be truncated by a busy boot,
++	 * and it is the one that names whether the process we care about ever asked.
++	 */
++	for (i = 0; i < clover_mg_whos; i++) {
++		printf("clover r251: who pid=%d comm=%.20s path=%u key=%u\n", clover_mg_who[i].pid,
++		    clover_mg_who[i].name, clover_mg_who[i].paths, clover_mg_who[i].keys);
++	}
++	/*
++	 * Then the rows, oldest first: boot 38 printed slot order and a reader would have had to
++	 * re-derive the wrap from the timestamps to see that row 7 was the earliest question.
++	 */
+ 	n = clover_mg_notes < CLOVER_MG_ROWS ? clover_mg_notes : CLOVER_MG_ROWS;
++	start = clover_mg_notes <= CLOVER_MG_ROWS ? 0 : clover_mg_notes % CLOVER_MG_ROWS;
+ 	for (i = 0; i < n; i++) {
+-		printf("clover r250: row %u %s\n", i, clover_mg_rows[i]);
++		printf("clover r251: row %u/%u %s\n", i + 1, n, clover_mg_rows[(start + i) % CLOVER_MG_ROWS]);
+ 	}
+ 	if (n == 0) {
+-		printf("clover r250: no user client ever named a button path or key\n");
++		printf("clover r251: no user client ever named a button path or key\n");
+ 	}
+ }
+ 
+ /* The answer in the two numbers the question turns on: how many bytes, and what they say when
+  * they are a value at all. 0xffffffff means "answered, and it is not a number to read". */
