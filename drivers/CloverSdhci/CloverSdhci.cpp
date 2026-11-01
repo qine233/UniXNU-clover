@@ -4020,8 +4020,16 @@ static void teeConsumeLine (uint32_t &pushed)
   // eight per-fire rows came first and the sixteenth push was the pass's last; the set row is the
   // one reading whose absence cannot be told from a set that did not change, so the cap does not
   // apply to it. Its class budget still bounds it.
+  // Round249 gives the same exemption to the census. Boot 36 measured the loss exactly: the pass
+  // that carried it had already pushed five bb rows at t=1514, the census then took eleven, and the
+  // sixteenth push closed the pass -- so hbt len=, the three byname rows, the service walk's total
+  // and census done were throttled, and the tee's cursor moved past them for good. A truncated
+  // census is not an empty plane: every row it answers with is a question whose absence would
+  // otherwise read as a verdict. It is printed once per boot behind a static guard, its class
+  // budget of 64 still bounds it, and the burst is under forty rows.
   const bool reserved = probe != nullptr &&
-      teeHasPrefix (probe->name, teeStringLength (probe->name), "r234-set");
+      (teeHasPrefix (probe->name, teeStringLength (probe->name), "r234-set") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r243"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

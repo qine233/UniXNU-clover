@@ -170,7 +170,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r248: boots 35 and 36 never started XNU at all -- the round title carried getPlane(\"IODeviceTree\"), the payload emitter wrote it into unixnu.toml between bare quotes, the string ended at the first quote and the xnu entry disappeared, so the menu had no OS and the card kept boot 34's records; the emitter now escapes the title and parses the manifest before it ships, and r247's census fix (no svc->release(), the iterator owns that reference) still stands untested -- boot 37 is the first frame that can carry a reading"
+title = "clover r249: boot 36 is the first frame whose census ran and it reached the card in halves -- five bb rows plus eleven census rows filled the tee\u0027s sixteen pushes per pass, the line index moved past the rest, and hbt len=, the three byname rows, svc total=/stopped=/button-family= and \"census done\" were throttled for good; boot 34 read the census whole only because the flat service walk made the burst fit. A throttled census and a census that stops mid-walk leave the same silence, so the census class now shares the whole-set row\u0027s exemption from the per-pass cap, and \"census done\" on the card is the answer to which of the two it was"
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

@@ -18481,3 +18481,57 @@ iterator is pointing at it … The caller should not release it」）确实是�
 通知的服务」定性。若 `plane byname=missing`，下一步修平面**注册**一侧；若 `plane byname=ok`
 且 `hbt byname len=4 u32=2`，那用户态到平面这一层是通的，死等只能回到 MobileGestalt 自己的
 闸门（`bl 0x52aa38` 那个一次性 sysctl），而不是设备树。
+
+## boot 36 读数（r248 实机）：census 真的跑了，但它到卡上是半截的（r249）
+
+boot 36（`~/clover-out/round248-log-window.bin`，16 report / 64 verdict / 0 probe / 512 kernel log，
+boot 计数器 36）第一次把 census 送到了卡上，也第一次把它读丢了：
+
+```
+slot 150  [ 1514.414365]: clover r234: bbset  t=1514 ... n=9 all=9
+slot 151  [ 1514.414414]: clover r234: bbset  t=1514 ... n=3 all=3
+slot 152  [ 1514.414454]: clover r234: bbset  t=1514 ... n=3 all=3
+slot 153  [ 1514.414613]: clover r236: bbustk t=1514 pid=58 tid=0x41b
+slot 154  [ 1514.414715]: clover r239: bbchain t=1514 ...
+slot 155  [ 1514.414789]: clover r236: bbustk t=1514 tid=0x1030
+slot 156  [ 1514.414858]: clover r239: bbnochain t=1514 tid=0x1030
+slot 157  [ 1514.414945]: clover r236: bbustk t=1514 tid=0x10f2
+slot 158  [ 1514.415017]: clover r239: bbnochain t=1514 tid=0x10f2
+slot 159  [ 1514.415030]: clover r243: census t=1514          ┐
+slot 160..168  clover r243: node /J120AP … /options           │ 11 行
+slot 169  [ 1514.415169]: clover r243: path buttons=buttons   ┘
+slot 170  [ 1536.485650]: clover r221: sbm2 t=1536 ...        ← 下一趟，census 再也没有回来
+```
+
+9 行 bb 采样 + 11 行 census = 20？不是：那一趟的推送上限是 **16 行**
+（`kTeePushPerPass = 16`，CloverSdhci.cpp:573），第 16 次推送落在 census 的第 7 行附近，
+之后的 census 行被 `gTeeThrottled++` 就地丢掉——tee 的扫描索引照样往前挪，所以**没有下一趟补发**，
+`hbt len=`、三行 `byname`、`path product=`/`chosen=`/`scale=`、`target=`、`model=`、
+`svc total=/stopped=/button-family=` 和 `census done` 全部永久缺席。
+
+r247 归因给 `svc->release()` 的那条线到这里正式作废：census 跑完了它能跑的部分，板子也活着跑到
+1800 s 死线；丢读数的是本驱动自己的推送上限。boot 34（r245）之所以整批读回来，是因为那一版
+服务点名只做一层、总行数 ≤16——同一份仪器，burst 变大以后才第一次撞上上限。
+
+于是这轮的判决还一条都没收到：`plane byname=` 到底是不是 missing，`svc total=` 到底是 1 还是几百。
+**在拿到这两行之前，「修平面名字」和「补一台 HID home 提供者」两条路都不许开工。**
+
+## r249 设计：把 census 移出每趟上限，并让「被丢」与「跑不完」可分
+
+`CloverSdhci.cpp` 只改一处——`reserved` 的判定从「只有 r234-set」扩成「r234-set 或 r243」：
+census 与整集合行属于同一类读数，它们的**缺席不能与「什么都没查到」区分**，所以每趟 16 行的
+上限不该管它们；类预算 64 行仍然封顶，census 一次开机只发一批（`ran` 闩锁）。
+`check-clover.py` 把这条豁免钉成契约（连同 r248 已有的清单契约），并解释为什么必须是豁免而不是
+把上限调大：上限保护的是「同一块卡还要服务别的请求」这件事，把它整体抬高是把一次性的 burst
+算进常驻的洪峰预算里。
+
+判决留给 boot 37，只认一条线索：**`census done nodes=…` 在不在卡上**。
+
+- 在 ⇒ census 从头到尾跑完过，于是同一批里必然带着 `hbt len=`、三行 `byname` 与
+  `svc total=/stopped=/button-family=`，按 r246 写死的四分支直接对号；
+- 不在，但前面的 census 行在 ⇒ census 确实卡在遍历里（那就是 IORegistry 遍历自身的问题，
+  下一步给它分段），丢读数这条线就此结掉；
+- `census t=` 都没有 ⇒ 采样节拍没跑到 1500 s 闸门，回头看 bb 采样与死线记录。
+
+顺带把这轮的标题里放了一对真正的双引号（`"census done"`），这样清单转义不是只在宿主上被测过，
+而是每轮都真的随镜像上板。
