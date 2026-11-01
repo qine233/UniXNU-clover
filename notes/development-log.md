@@ -19890,3 +19890,27 @@ LATE 顺序改成**顺序断言**（r265 在 r264 前、r264 在 r263 前——�
 重建字符串，结果**把 v0.6.38 之后的 119 行全删了**（提交前 `git diff --stat` 才露出来）。
 从 HEAD 恢复后改成只做整串锚点替换，并加了一条断言：长度必须变大。规矩：**改文档的脚本只在
 整串上做 `replace`，不许用切片重组文件**，`--stat` 里出现大段删除就先当事故处理。
+## r265 期间的宿主侧第二眼：债主的接口里有一条回指 backboardd 的队列（假设，不是结论）
+
+读 `…/com.apple.datamigrator.xpc/` 的 `Info.plist` 与可执行文件，四条事实：
+
+1. 它是 **System XPC 服务**，`XPCService._RoleAccount = mobile`、`RunLoopType = NSRunLoop`；
+   523 个 LaunchDaemons 里没有任何 `datam*` 标签，所以它是**按 XPC 请求拉起**的，
+   而 boot 51 已经证明它被拉起了（pid 140 活着，四拍都在）。
+2. 它的 `CFBundleExecutable` 就叫 `com.apple.datamigrator`——所以 `peer=140:com.apple.datam`
+   那个 15 字节的 comm **不是 launchd 的作业名截断，而是可执行文件名本身**（XNU 存 `MAXCOMLEN` 16）。
+   这一条把 r264 读数里「截断可能吃掉关键后缀」的担心关掉：后缀本来就没有。
+3. 直接依赖里有 **BackBoardServices**、ProgressUI、WirelessDiagnostics、libMobileGestalt、DataMigration。
+   也就是说它**会反过来找 backboardd**，不是单向被问。
+4. 它的 XPC 方法名（字符串前缀 `com.apple.datamigrator.`）包含
+   `isMigrationNeeded`、`migrate`、`migrationDidStart`/`migrationDidFinish`、`migrationPhaseDescription`、
+   `migrationFailureNotification`、`deferExit`、`cancelDeferExit`、`forceMigrationOnNextReboot`、
+   `changeVisibility`、`concurrentPluginQueue`，以及 **`hidEventQueue`**。
+
+**由此立一条要由 boot 52 来判的假设**（写清楚它现在只是形状吻合）：backboardd 主流程卡在
+`isMigrationNeeded` 这类同步往返上，而 datamigrator 的回复要走它自己那条
+`hidEventQueue`/`concurrentPluginQueue` 一类的队列，而那些队列的**服务端在 backboardd 里**——
+如果 r265 的 `pth` 行里出现 `peer=58:backboardd…`，就是一个**互相等待的闭环**，
+解开它的钥匙不是 GPU、不是设备壳，而是「backboardd 必须先能收信才配得到回音」这一顺序问题；
+如果 `peer=` 指向别家（launchd、containermanagerd、mediaserverd 之类），闭环假设当场死，
+下一跳由那一行自己点名。**不猜，等读数。**
