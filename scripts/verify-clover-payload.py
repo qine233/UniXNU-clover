@@ -1081,6 +1081,12 @@ def check_sb_sample(kernel: bytes) -> bool:
              # boot 52 already answered and cannot act on it.
              "bb-peer-stack": (b"clover r266: pustk t=%llu pid=%d tid=%llx cont=%llx"
                                b" we=%llx sp=%llx fp=%llx lr=%llx fn=%u%s\n") in kernel,
+             # Round267: boot 53 showed the debtor's five workloop waits are five separate notes, so what is
+             # left to know is who owns each one -- which is what thread->block_hint and the kernel's own
+             # kdp_*_find_owner answer. Both censuses print the same row, so the string constant appears once
+             # in the image; a payload without it names waits by their addresses again.
+             "bb-wait-owner": (b"clover r267: own t=%llu pid=%d tid=%llx hint=%x ak=%u"
+                               b" owner=%llx ctx=%llx\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

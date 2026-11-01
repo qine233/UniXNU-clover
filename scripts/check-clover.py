@@ -2102,6 +2102,76 @@ def check_board(errors: list) -> str:
                 errors.append("drivers/CloverSdhci has no class for the peer stacks: the new prefix is a "
                               "producer of its own, and an unbudgeted one drops the reading silently")
 
+        # Round267 stops naming a wait by its address. Boot 53 answered the r266 fork -- the debtor's five
+        # workloop waits carry five distinct we= words, so nothing in that process sleeps on one shared note,
+        # and the row still could not say who owns any of them. The kernel already answers that question:
+        # stackshot_thread_wait_owner_info (osfmk/kern/kern_stackshot.c) switches on thread->block_hint and
+        # calls the kdp_*_find_owner helpers, which are all extern in osfmk/kern/block_hint.h while only the
+        # dispatcher is static. So the census calls the three that are plain reads -- semaphore, ulock and
+        # workloop sync wait -- and reports hint= plus ak= on every waiter, because a hint the instrument
+        # did not go and read must not print like a wait nobody owns. KernelMutex stays unasked for two reasons
+        # that are both true: no census row in boot 52 or 53 carries that hint (nothing sleeps in lck_mtx_sleep),
+        # and kdp_lck_mtx_find_owner asserts state != LCK_MTX_TAG_DESTROYED on a mutex it reads while holding
+        # nothing, which is a panic on a race in a probe that runs every two minutes. The ctid lookup is not the
+        # risk -- compact_id_resolve (osfmk/kern/compact_id.c:89) is a bare array index and ctid_get_thread
+        # (osfmk/kern/thread.c:4118) takes no reference, which is the claim r267's own comment gets wrong.
+        r267_name = "z" * 42 + "-clover-r267.patch"
+        r267_patch = next((base / "patches/xnu-clover" / r267_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r267_name).is_file()), None)
+        if r267_patch is None:
+            errors.append(f"patches/xnu-clover/{r267_name} is missing: the boot would still print a wait "
+                          "address and call that an owner")
+        else:
+            r267_text = r267_patch.read_text()
+            r267_added = "".join(line for line in r267_text.splitlines(True)
+                                 if line.startswith("+"))
+            for needle in ('clover_wait_owner(thread_t thr, uint32_t *hint, uint32_t *asked',
+                           'kdp_sema_find_owner(thr->waitq.wq_q, thr->wait_event, &wi);',
+                           'kdp_ulock_find_owner(thr->waitq.wq_q, thr->wait_event, &wi);',
+                           'kdp_workloop_sync_wait_find_owner(thr, thr->wait_event, &wi);',
+                           'bzero(&wi, sizeof(wi));',
+                           '(thr->state & TH_WAIT) == 0 || thr->wait_event == 0',
+                           'clover_wait_owner(thr, &phint[pn], &pak[pn], &pown[pn], &pctx[pn]);',
+                           'clover_wait_owner(thr, &chint[cn], &cak[cn], &cown[cn], &cctx[cn]);',
+                           '"clover r267: own t=%llu pid=%d tid=%llx hint=%x',
+                           '" ak=%u owner=%llx ctx=%llx\\n"'):
+                if needle not in r267_added:
+                    errors.append(f"{r267_patch.name} lacks {needle[:64]!r}: without it the owner is still "
+                                  "an address, or an unanswered wait prints like one nobody owes")
+            # One helper, two callers. A third call site would mean a census that asks the kernel outside the
+            # task lock it was written for, and bzero of the record is what keeps a find_owner that writes
+            # only context (a semaphore with no owner) from printing a stack residue as a tid.
+            if r267_added.count("clover_wait_owner(") != 3:
+                errors.append(f"{r267_patch.name} calls clover_wait_owner "
+                              f"{r267_added.count('clover_wait_owner(') - 1} times instead of twice: the "
+                              "helper is allowed one definition and one call per census, and both censuses "
+                              "collect under the task lock")
+            # Collect while locked, print after: each call has to precede its own row in file order, which is
+            # the order the patch text carries.
+            for call, row in (('clover_wait_owner(thr, &phint[pn]', 'hint=%x ak=%u'),
+                              ('clover_wait_owner(thr, &chint[cn]', 'hint=%x"')):
+                if not (0 <= r267_added.find(call) < r267_added.find(row)):
+                    errors.append(f"{r267_patch.name} prints the owner row before it collects the wait "
+                                  "record: the kdp_ helpers read another process's objects and belong in "
+                                  "the locked pass, the way r236 walks after the unlock and never before it")
+            baseline_script = (REPO.parent / "UniXNU" /
+                               "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in baseline_script.splitlines()
+                                 if "clover-r2" in line)
+            if (late_list.find(r267_name) < 0 or
+                    late_list.find(r267_name) > late_list.find("z" * 41 + "-clover-r266.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r267 before r266 in LATE_PATCH: "
+                              "the compile pass would run on a tree this patch was not written against, and "
+                              "a replay failure would read as a broken patch")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r267_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r267_name} is missing: unixnu loads patches from that "
+                              "directory and silently skips a board patch that lives only in this repo")
+            if '{ "clover r267: ", "r267-owner", 192, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci has no class for the wait-owner rows: a new prefix is a "
+                              "producer of its own and an unbudgeted one drops the reading silently")
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -3406,8 +3476,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r266:"):
-        errors.append('[payload] title is not "clover r266: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r267:"):
+        errors.append('[payload] title is not "clover r267: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4459,8 +4529,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r266:"):
-        errors.append('[payload] title is not "clover r266: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r267:"):
+        errors.append('[payload] title is not "clover r267: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

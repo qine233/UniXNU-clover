@@ -1,0 +1,146 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11865,6 +11865,64 @@
+ }
+ 
+ /*
++ * Round267. The kernel already knows who owes every wait: the stackshot path answers it with
++ * stackshot_thread_wait_owner_info (osfmk/kern/kern_stackshot.c), which switches on
++ * thread->block_hint and calls the kdp_*_find_owner helpers. Those helpers are extern here
++ * through <kern/block_hint.h> (pulled in by <kern/thread.h>) and only the dispatcher is static,
++ * so the census asks them itself instead of guessing from a wait address. Three kinds are asked,
++ * and each is a plain read of a kernel object -- no lock, no user memory:
++ *   kThreadWaitWorkloopSyncWait  owner = the tid of kqwl->kqwl_owner (or the bound request
++ *                                thread, or STACKSHOT_WAITOWNER_THREQUESTED), context = the
++ *                                workloop's kqwl_dynamicid
++ *   kThreadWaitSemaphore         owner = the pid of sem->owner's task, context = the kernel
++ *                                address of sem->port
++ *   kThreadWaitUserLock          owner = the tid of ull->ull_owner, context = the user address
++ *                                ull was taken on
++ * The hint is reported for every waiter whether or not it was asked: KernelMutex, the port
++ * receive/send kinds and the pthread kinds are deliberately not asked (the mutex path resolves
++ * its owner through ctid_get_thread, which takes a reference this census would never drop), so
++ * ak=0 means "the kernel has a name for this, we did not go and read it" and is a different
++ * reading from ak=1 owner=0, which means it asked and nothing owns the wait.
++ */
++static void
++clover_wait_owner(thread_t thr, uint32_t *hint, uint32_t *asked, uint64_t *owner,
++    uint64_t *ctx)
++{
++	thread_waitinfo_t wi;
++
++	bzero(&wi, sizeof(wi));
++	*hint = (uint32_t)thr->block_hint;
++	*asked = 0;
++	*owner = 0;
++	*ctx = 0;
++	if ((thr->state & TH_WAIT) == 0 || thr->wait_event == 0) {
++		return;
++	}
++	switch ((block_hint_t)*hint) {
++	case kThreadWaitSemaphore:
++		kdp_sema_find_owner(thr->waitq.wq_q, thr->wait_event, &wi);
++		*asked = 1;
++		*owner = wi.owner;
++		*ctx = wi.context;
++		break;
++	case kThreadWaitUserLock:
++		kdp_ulock_find_owner(thr->waitq.wq_q, thr->wait_event, &wi);
++		*asked = 1;
++		*owner = wi.owner;
++		*ctx = wi.context;
++		break;
++	case kThreadWaitWorkloopSyncWait:
++		kdp_workloop_sync_wait_find_owner(thr, thr->wait_event, &wi);
++		*asked = 1;
++		*owner = wi.owner;
++		*ctx = wi.context;
++		break;
++	default:
++		break;
++	}
++}
++
++/*
+  * Round265. Boot 51 named the debtor of the one outstanding request in the
+  * blocked process -- pid 140, com.apple.datamigrator, four beats running,
+  * rcv=0xc903 with an empty queue and no deadline -- and a name is not an
+@@ -11886,6 +11944,10 @@
+ 	uint64_t pwe[CLOVER_BB_PEER_ROWS];
+ 	uint64_t ppc[CLOVER_BB_PEER_ROWS];
+ 	uint64_t pdl[CLOVER_BB_PEER_ROWS];
++	uint32_t phint[CLOVER_BB_PEER_ROWS];
++	uint32_t pak[CLOVER_BB_PEER_ROWS];
++	uint64_t pown[CLOVER_BB_PEER_ROWS];
++	uint64_t pctx[CLOVER_BB_PEER_ROWS];
+ 	/*
+ 	 * Round266. Boot 52 showed the debtor asleep on five workloop notes and a mach semaphore, and the row
+ 	 * could not group them because it carried no wait-event word: for a wait whose object is not a port,
+@@ -11939,6 +12001,7 @@
+ 			pwe[pn] = (uint64_t)(uintptr_t)thr->wait_event;
+ 			ppc[pn] = 0;
+ 			pdl[pn] = 0;
++			clover_wait_owner(thr, &phint[pn], &pak[pn], &pown[pn], &pctx[pn]);
+ 			if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1 &&
+ 			    !is_saved_state32(ss) && (thr->state & TH_RUN) == 0) {
+ 				ppc[pn] = (uint64_t)get_saved_state_pc(ss);
+@@ -12079,6 +12142,20 @@
+ 		    (unsigned long long)ppc[i], (unsigned long long)pdl[i],
+ 		    (unsigned int)prc[i], (unsigned int)(uint32_t)prm[i],
+ 		    (unsigned long long)pto[i], pmc, psr, pmmc, pmsr, ppeer);
++		/*
++		 * Round267. The debtor's five workloop waits and its mach semaphore printed
++		 * their own wait addresses for two boots without naming anyone. This is the
++		 * kernel's own answer, per thread, next to the row it belongs to: hint= is
++		 * thread->block_hint, and for the three kinds clover_wait_owner asks, owner=
++		 * is the tid -- a pid when hint=6, because that is what
++		 * kdp_sema_find_owner writes -- and ctx= is the object's own identity.
++		 */
++		if (phint[i] != 0) {
++			printf("clover r267: own t=%llu pid=%d tid=%llx hint=%x ak=%u"
++			    " owner=%llx ctx=%llx\n", (unsigned long long)secs,
++			    task_pid(peer), (unsigned long long)ptid[i], phint[i], pak[i],
++			    (unsigned long long)pown[i], (unsigned long long)pctx[i]);
++		}
+ 	}
+ }
+ 
+@@ -12158,6 +12235,10 @@
+ 	uint32_t crx = 0;
+ 	uint32_t ctm = 0;
+ 	uint32_t cst[CLOVER_BB_CENSUS];
++	uint32_t chint[CLOVER_BB_CENSUS];
++	uint32_t cak[CLOVER_BB_CENSUS];
++	uint64_t cown[CLOVER_BB_CENSUS];
++	uint64_t cctx[CLOVER_BB_CENSUS];
+ 	uint32_t cn = 0;
+ 	uint32_t call = 0;
+ 	uint32_t cwait = 0;
+@@ -12352,6 +12433,7 @@
+ 		ccont[cn] = (uint64_t)(uintptr_t)thr->continuation;
+ 		cpc[cn] = 0;
+ 		cdl[cn] = 0;
++		clover_wait_owner(thr, &chint[cn], &cak[cn], &cown[cn], &cctx[cn]);
+ 		if (thr->wait_timer_armed && thr->wait_timer != NULL) {
+ 			dl_ns = 0;
+ 			absolutetime_to_nanoseconds(thr->wait_timer->tc_soft_deadline,
+@@ -12502,6 +12584,19 @@
+ 			    (unsigned int)crn[i], (unsigned int)(uint32_t)crem[i],
+ 			    (unsigned int)(uint32_t)cloc[i], (unsigned long long)cto[i],
+ 			    (unsigned int)(uint32_t)csn[i], mmc, msr, rmc, rsr, peer);
++			/*
++			 * Round267. Backboardd's own waits, named by the kernel instead of by
++			 * their addresses: the row that has carried the dispatch-group ulock as a
++			 * bare word since round239 now says whose lock it is, and every waiter
++			 * with a hint shows whether the kernel has a name for its wake-up at all.
++			 */
++			if (chint[i] != 0) {
++				printf("clover r267: own t=%llu pid=%d tid=%llx hint=%x"
++				    " ak=%u owner=%llx ctx=%llx\n",
++				    (unsigned long long)secs, pid,
++				    (unsigned long long)ctid[i], chint[i], cak[i],
++				    (unsigned long long)cown[i], (unsigned long long)cctx[i]);
++			}
+ 		}
+ 		if (peer_task != TASK_NULL) {
+ 			clover_bb_peer_census(peer_task, secs);

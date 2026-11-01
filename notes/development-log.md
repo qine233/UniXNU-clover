@@ -20086,3 +20086,101 @@ libdispatch/CoreFoundation 的帧不会在 WebCore 里，而工具给的函数�
 `thread_waitinfo_t.owner`（拿不到属主时给 `STACKSHOT_WAITOWNER_THREQUESTED`），
 `context` 给 `kqwl_dynamicid`。对每一行普查报 `hint/owner/context`，
 五把 workloop 与那把信号量**各自等谁**就是一次调用出来的数——不需要符号、不需要 slide、不需要猜镜像。
+
+## r267 落地：普查不再猜属主，直接问内核（补丁 42z， tee 类 r267-owner）
+
+**改了什么**（全部在 `task.c`，无需新增 include：`thread_waitinfo_t` 经 `<kern/kern_cdata.h>`→`kcdata.h`
+已在，`block_hint_t` 与四个 `kdp_*` extern 经 `<kern/thread.h>`→`block_hint.h` 已在）：
+
+1. `clover_wait_owner()`（task.c:11888）：读 `thr->block_hint`，只对**三种**hint 真正去问——
+   `kThreadWaitSemaphore`(0x06)/`kThreadWaitUserLock`(0x0a) 传 `thr->waitq.wq_q` + `thr->wait_event`，
+   `kThreadWaitWorkloopSyncWait`(0x10) 传线程本身 + `thr->wait_event`；先 `bzero` 记录，因为
+   `kdp_sema_find_owner` 在 `sem->owner` 为空时**不写 owner**，不清零就会把栈残余念成一个 tid。
+   **KernelMutex 故意不问**，两个都成立的理由：boot 52/53 的普查里没有任何一行带这个 hint（没有线程睡在
+   `lck_mtx_sleep`），问了也拿不到读数；而 `kdp_lck_mtx_find_owner` 对着一个**不持任何锁**读来的 mutex
+   `assert3u(state.data, !=, LCK_MTX_TAG_DESTROYED)`（`lock_mtx.c:1358`），两分钟一次的探针里这就是一次
+   撞车即 panic。它和 port/pthread 那几类一样报 `ak=0`。
+   **更正（本轮自己的错）**：落地那晚我在这里写的是「`ctid_get_thread` 要引用、普查这层永远不会放回」——**错的**。
+   `compact_id_resolve`（`compact_id.c:89`）只是一次数组下标，`ctid_get_thread`（`thread.c:4118`）
+   既不加锁也不取引用。这条错话同样印在 r267 的 task.c 注释与这块板的标题串里，而那两者已经刷进卡上了；
+   镜像里的**读数**不受影响，文字改到 r268 的补丁与标题里，仓库里的 checker 注释已当场改正。
+   教训照旧：写进注释的理由必须回到本板源码逐字段核对——这是第三次（r220 寄存器错位、r264 读 x6、这次读 `thread.c`）。
+2. 两处普查在**持锁段**里收集（peer 行 `&phint[pn]`、主普查 `&chint[cn]`），在**解锁后**打印
+   `clover r267: own t= pid= tid= hint= ak= owner= ctx=`（task.c:12154 / 12594），
+   沿用 r236「收集在锁内、I/O 在锁外」的分法；每行普查只多一条短行，不动原行长（ tee 单行上限 320）。
+
+**读数语义钉住三件事**：`hint=6` 的 `owner=` 是 **pid**（内核写 `pid_from_task(sem->owner)`），其余是 tid；
+`ak=0` 是「我没去问」，不等于「没人欠它」；workloop 拿不到属主时内核会给
+`STACKSHOT_WAITOWNER_THREQUESTED = UINT64_MAX-6`（读数里就是 `fffffffffffffff9`），
+那是「正等一个新工作者」而不是「没人在乎」。
+
+**校验**：`-fsyntax-only`（compile_commands.json 的真实参数、450 项）exit 0、零 error；新增行区间只剩
+12400 那条 r263 就有的 `%x`/int 告警。补丁双向 `git apply --check` 通过（正向在上一轮快照目录、
+反向在活树），反向快照字节数与 r266 状态一致（403540）——说明这次的反向重建没有夹带。
+契约：42z 位于 `LATE_PATCH` 首位（r266 之前），tee `{ "clover r267: ", "r267-owner", 192 }`，
+`check-clover.py` 新增 Round267 块（含「helper 只有一处定义两处调用」「调用必须排在自己那行打印之前」
+两条顺序断言），`verify-clover-payload.py` 新增 `bb-wait-owner` 字面量钉，board 标题升到 r267。
+
+**boot 54 要看什么**：五把 workloop 等待的 `owner=` 是**同一个 tid**（→ 一个线程欠五次，下一轮去普查它）
+还是五个不同 tid / `fffffffffffffff9`（→ 工作者根本没被绑上，回到「活儿没排进来」那一格）；
+`tid=36c` 那把信号量的 `owner=`（pid）是谁；以及 backboardd 的 `0x361` 那把 ulock 的属主线程——
+它从 r239 起就只有一个裸地址，这一轮应当变成一个 tid。
+
+## r267 读数（boot 54）：五把 workloop 等待**共指一条线程**，而那条线程睡在自己进程的机器号上
+
+冷刷 `round267-payload.img`（sha 2da88dcc…，内核 normalize 后 239778e4…、AMFI 前 aff36458…）跑 boot 54：
+16 条报告、64 行驱动判据、31 行 probe、512 行内核日志。`own` 行 37 条，落在 3 个普查块里
+（t=1118/1243 的 pid=58 普查 + t=1243 的 pid=138 债主普查；债主这靴是 pid **138**，`comm=com.apple.datam-`）。
+本靴共享缓存 slide 从 `clover r221: sbm2x pc=1e5798b58 poff=65798b58` 得 **0x180000000**（与 boot 53 同值）。
+
+**① 这一轮的答案是本轮的全部价值：五把等待不是五个债，是一个债主。**
+`pid=138` 里 tid `0x34b / 0x34c / 0x3ee / 0x5eb / 0x784` 五行 `hint=10 ak=1` 全部报
+**`owner=tid 0x34d`**、全部报**同一个 `ctx=0x100f0c840`**。`ctx` 是 `kqwl_dynamicid`
+（`kdp_workloop_sync_wait_find_owner` 写的），两两相同 ⇒ **这是一只 workloop，不是五只**；
+boot 53 看到的五个不同 `we=` 是**每笔同步调用各自的 knote**，不是五个不同的锁。
+于是「五个人各自等一件事」这个读法作废：**整只进程收窄到一条线程 0x34d。**
+
+**② 0x34d 在等一件内核认可的机器号（mach semaphore），三条独立证据对上了。**
+它的 `pth` 行：`cont=fffffff0072c26c8`、`we=fffffff00700620c`。拿本轮自己的 unstripped noctf 查：
+`s _semaphore_wait_continue = fffffee0072c26c8`、`s _semaphore_event = fffffee00700620c`，
+而 `SEMAPHORE_EVENT` 就是 `CAST_EVENT64_T(&semaphore_event)`（`bsd`/`osfmk` 侧 `sync_sema.c:61`）。
+三处独立对上（continuation、wait_event、`kdp_sema_find_owner` 里那句
+`assert(event == SEMAPHORE_EVENT)` 也没炸）——所以这一行是**真正的机器号等待**，不是同址巧合。
+`dl=0`：没有期限，永远不会自己醒。
+
+**③ 但 `hint=6` 的 `owner=` 不是债主，我落地时的说法要按源码收窄。**
+`create_semaphore` 里写的是 `s->owner = task`（`sync_sema.c:128`），字段注释就是
+「task that owns semaphore」——**创建者**，不是「该 signal 它的人」。所以 `owner=pid 138` 说的是
+「这只机器号是 datamigrator 自己造的」。**它没有回答「谁能叫醒 0x34d」**；叫醒它的人持有的
+是那只机器号端口的**发送权**，而这正是 r267 唯一没读的东西。这是本轮自己留下的、也是 r268 的靶子。
+
+**④ backboardd 这一行第一次说清「不是别人抱着锁」。**
+`tid=0x413 hint=a ak=1 owner=0 ctx=1018798d4`，`we=fffffff37407ad00`、`dl=0`。按 `kdp_ulock_find_owner`：
+`UL_UNFAIR_LOCK` 写 `thread_tid(ull->ull_owner)`，`UL_COMPARE_AND_WAIT*` **恒写 0**。
+所以 `owner=0` 有两种读法——「没人抱锁」或「本来就是等值唤醒（futex 语义）」——r267 分不开，
+需要 `ull_opcode`（它在 `sys_ulock.c` 内部，头文件不外露）。`ctx=1018798d4` 是**用户态地址**
+（不加 addrperm），既不在共享缓存映射（slide 0x180000000 起）也不在 r239 那只堆组 `0x16f548b4c` 上，
+是第三个地方。
+另外这靴的普查里没有 `0xde8`（r237/r239 的组等待者）——`t=1118` 时 backboardd 17 条线程全示
+（`hidden=0`），`0xde8` 是 t=1302 才出现的线程，两套仪器不矛盾，只是各自抓到不同时刻。
+
+**⑤ 内核自己把地址洗过了，别再当地址读。**
+`hint=6` 的 `ctx=c00b39f54ef961b` 不是坏指针：`VM_KERNEL_UNSLIDE_OR_PERM` 对**非 slide** 的内核地址
+走的是 `VM_KERNEL_STRIP_PTR(v) + vm_kernel_addrperm`（`osfmk/mach/vm_param.h:403-407`），
+`vm_kernel_addrperm` 每靴随机 ⇒ 它是**本靴内稳定的身份**，宿主还原不出真地址。
+`hint=10` 的 `ctx` 是纯 id、`hint=a` 的 `ctx` 是用户态地址，两者都不加 perm——三类要分开读。
+（本板 `nm` 查无 KASSAN 符号，所以不是 KASSAN 标签，是 addrperm。）
+
+**⑥ 我自己的宿主解码器错过一次状态位，已按源码改回。**
+第一版 `r267read.py` 的 `TH_*` 表是凭记忆写的，把 `st=41` 念成 `CONTINUED|RUN`；
+`osfmk/kern/thread.h:479` 的真表是 `WAIT=0x01 SUSP=0x02 RUN=0x04 UNINT=0x08 TERMINATE=0x10
+TERMINATE2=0x20 WAIT_REPORT=0x40 IDLE=0x80 WAKING=0x100` ⇒ `0x41 = WAIT|WAIT_REPORT`，**是睡着**。
+内核表头里的 `wait=/run=` 用的是符号，没被带错；错的只有我这行的标签。
+
+**⑦ 由 ①②③ 定 r268（不用猜，字段都在手边）**：`hint=6` 那一行把**机器号端口本身**读出来——
+从 `thr->waitq.wq_q` 反查 `struct semaphore`（`sync_sema.h:52-59`：`task_link / waitq / owner / port /
+ref_count / count`），报 `sc=`（`sem->count`，负数=有等待者）、`sp=`（`sem->port->ip_srights`，
+还剩几份发送权）、以及接收者的 `pid:comm`。三种形状当场分开：`sp=0` ⇒ **结构上不可能有人叫醒它**，
+缺的是「把发送权发出去」的那一步（和 r264 那格 `sr=0` 同族）；`sp>=1` 且 `sc<0` ⇒ 有人能 signal 却没做，
+回到「谁该 signal」；`sc>=0` ⇒ 计数早就给过了，是我们读错了时刻。
+顺带把 `ull_opcode` 那条（④）留在 r269，别在一轮里追两个问题。

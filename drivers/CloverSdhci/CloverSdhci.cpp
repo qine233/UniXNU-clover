@@ -822,6 +822,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // candidate cap (three), not the row cap: fifteen fires on the census clock is 45 lines, and 64 leaves the
   // widest legal peer census short of its own tail.
   { "clover r266: ", "r266-stack", 64, 0, 0, 0 },
+  // Round267 prints one row per waiter that carries a block hint, beside the census row it belongs to, so the
+  // count per fire is bounded by the two row caps together (20 + 12) and by how many of those rows are actually
+  // waiting. Boot 53 observed four census fires with 67 rows and two peer fires with 32, and waiters are a
+  // subset of those: 192 covers that load twice over while still leaving two thirds of the card's last 512
+  // kernel rows for r262-th and r265-peer, which are the rows this class is read alongside.
+  { "clover r267: ", "r267-owner", 192, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
