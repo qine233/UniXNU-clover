@@ -773,13 +773,20 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // total line, eight who lines, 24 rows, one misses line, 32 miss lines and 32 live miss lines --
   // 118 records, so the class budget goes from 64 to 128.
   { "clover r252: ", "r252-mgq", 128, 0, 0, 0 },
+  // Round256 splits the same instrument's late reading into a class of its own, because boot 43 proved
+  // the early one is unreadable: the card keeps the last 512 kernel-log rows, those rows started at
+  // t=1208 s, and every verdict this probe printed came at t=25 s -- msgbuf had lapped it 24 times.
+  // The beat line is one per 120 s of the generic ARM counter for the rest of the boot, so an 1800 s
+  // deadline holds fifteen of them, and 24 bounds a producer that ticks harder (the driver calls the
+  // checkpoint ten times a second while a press is held, which is why the gate is a clock and not a
+  // count). It sits AHEAD of the bare "clover r255: " token below on purpose: teeProbeClass returns the
+  // first class whose token appears in the line, so the specific row has to be tested first or the two
+  // would spend each other's budget -- which is the whole point of splitting them.
+  { "clover r255: beat", "r256-beat", 24, 0, 0, 0 },
   // Round255's input device speaks once at the end of its probe and then once per second from its own
-  // timer while it is looking for the event driver, so the live lines are capped inside the probe at
-  // eight. Worst case is therefore the one stage line, two refusal lines and eight checkpoint lines --
-  // eleven, and 32 leaves the same headroom r243 gives the census. It is a separate class from r180
-  // because a boot where the display works and the HID device does not is the reading this round is
-  // here for, and neither half may push the other out of the ring.
-  { "clover r255: ", "r255-hid", 32, 0, 0, 0 },
+  // timer while it is looking for the event driver, so the early lines are capped inside the probe at
+  // eight: one stage line, two refusals and eight checkpoints -- eleven, so 16 leaves headroom.
+  { "clover r255: ", "r255-hid", 16, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

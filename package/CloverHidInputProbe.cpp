@@ -139,52 +139,79 @@ static IORegistryEntry *findEventDriver(IORegistryEntry *parent, unsigned depth)
     return found;
 }
 
-// Called by the driver once per second with the device, from its own timer. The card has a ring of
-// its own and a per-class budget on top of it, so this prints while the picture is still changing
-// and stops: eight lines cover absent device, unmatched driver, first publish and the readback of
-// the properties backboardd is about to be judged on, and the counters say the rest.
+// Called by the driver once per second with the device (and every hundred milliseconds while a press
+// is held), from its own timer. Two different prints, because round255 measured the cost of having
+// only one: the card keeps the last 512 kernel-log rows, and on boot 43 those rows started at t=1208 s
+// while this instrument spoke once at t=25 s -- every verdict line had already been overwritten by the
+// time the drain read it. So:
+//   * eight capped early lines, which tell the story of the chain changing state while it changes; and
+//   * one beat line every 120 s for the rest of the boot, timed off the generic ARM counter rather
+//     than off a call count (the call rate is 1/s idle and 10/s during a press), which says the same
+//     state again whenever anything reads the ring. Fifteen beats fit an 1800 s deadline.
+// Its own tee class ("clover r255: beat"), matched ahead of the bare "clover r255: " one, so the two
+// cannot spend each other's budget.
 extern "C" __attribute__((noinline)) void native_hid_live_checkpoint(IOService *device) {
     static unsigned printed;
-    char line[160];
-    size_t used = (size_t)snprintf(line, sizeof line, "clover r255: device=%llx", (unsigned long long)clover_hid_device);
+    static uint64_t frequency, nextBeat;
+    static unsigned long long lastService;
+    char state[80];
+    size_t used = 0;
     if (device == nullptr) {
-        if (printed++ < 8) { printf("%s absent\n", line); }
-        return;
-    }
-    IORegistryEntry *driver = findEventDriver(device, 4);
-    if (driver == nullptr) {
-        describeDriver(device, used, line, sizeof line);
-        if (printed++ < 8) { printf("%s driver=none\n", line); }
-        return;
-    }
-    if (device->getProperty("Built-In") == nullptr) {
-        // No keyboard/pointing collection was ever published with Built-In set, so there is
-        // nothing to propagate; say so rather than publish a false identity.
-        if (printed++ < 8) { printf("%s device-has-no-built-in\n", line); }
-        return;
-    }
-    static IORegistryEntry *publishedFor;
-    if (publishedFor != driver) {
-        publishedFor = driver;
-        driver->setProperty("Built-In", kOSBooleanTrue);
-        driver->setProperty("DisplayIntegrated", kOSBooleanTrue);
-        // -[BKHIDDirectTouchEventProcessor processEvent:sender:dispatcher:] drops a digitizer event
-        // unless the sending service is usage page 0x0D with usage 1, 4 or 0x20; this device lists
-        // its keyboard collection first, so the services would otherwise publish (1,6).
-        driver->setProperty("PrimaryUsagePage", (unsigned long long)0x0d, 32);
-        driver->setProperty("PrimaryUsage", (unsigned long long)4, 32);
-        if (IORegistryEntry *interface = driver->getParentEntry(gIOServicePlane)) {
-            interface->setProperty("Built-In", kOSBooleanTrue);
-            interface->setProperty("DisplayIntegrated", kOSBooleanTrue);
-            interface->setProperty("PrimaryUsagePage", (unsigned long long)0x0d, 32);
-            interface->setProperty("PrimaryUsage", (unsigned long long)4, 32);
+        snprintf(state, sizeof state, " absent");
+        lastService = 0;
+    } else {
+        IORegistryEntry *driver = findEventDriver(device, 4);
+        if (driver == nullptr) {
+            describeDriver(device, used, state, sizeof state);
+            snprintf(state + used, used < sizeof state ? sizeof state - used : 0, " driver=none");
+            lastService = 0;
+        } else {
+            lastService = (unsigned long long)(uintptr_t)driver;
+            if (device->getProperty("Built-In") == nullptr) {
+                // No keyboard/pointing collection was ever published with Built-In set, so there is
+                // nothing to propagate; say so rather than publish a false identity.
+                snprintf(state, sizeof state, " device-has-no-built-in");
+            } else {
+                static IORegistryEntry *publishedFor;
+                if (publishedFor != driver) {
+                    publishedFor = driver;
+                    driver->setProperty("Built-In", kOSBooleanTrue);
+                    driver->setProperty("DisplayIntegrated", kOSBooleanTrue);
+                    // -[BKHIDDirectTouchEventProcessor processEvent:sender:dispatcher:] drops a digitizer
+                    // event unless the sending service is usage page 0x0D with usage 1, 4 or 0x20; this
+                    // device lists its keyboard collection first, so the services would otherwise
+                    // publish (1,6).
+                    driver->setProperty("PrimaryUsagePage", (unsigned long long)0x0d, 32);
+                    driver->setProperty("PrimaryUsage", (unsigned long long)4, 32);
+                    if (IORegistryEntry *interface = driver->getParentEntry(gIOServicePlane)) {
+                        interface->setProperty("Built-In", kOSBooleanTrue);
+                        interface->setProperty("DisplayIntegrated", kOSBooleanTrue);
+                        interface->setProperty("PrimaryUsagePage", (unsigned long long)0x0d, 32);
+                        interface->setProperty("PrimaryUsage", (unsigned long long)4, 32);
+                    }
+                    clover_hid_published = clover_hid_published + 1;
+                }
+                describeDriver(driver, used, state, sizeof state);
+                clover_hid_property_seen = 1;
+            }
         }
-        clover_hid_published = clover_hid_published + 1;
     }
-    used = 0;
-    describeDriver(driver, used, line, sizeof line);
-    clover_hid_property_seen = 1;
-    if (printed++ < 8) { printf("clover r255: service=%llx%s\n", (unsigned long long)(uintptr_t)driver, line); }
+    if (printed++ < 8) { printf("clover r255: device=%llx%s\n", (unsigned long long)clover_hid_device, state); }
+    uint64_t now;
+    __asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(now));
+    if (!frequency) {
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+        if (!frequency) { frequency = 1; nextBeat = now + 120; }   // a board that cannot say: one a minute
+        else nextBeat = now + 120 * frequency;
+        return;
+    }
+    if (now >= nextBeat) {
+        nextBeat += 120 * frequency;
+        printf("clover r255: beat stage=%d service=%llx%s published=%u seen=%u presses=%u sinks=%u,%u "
+               "transfer=%u\n", clover_hid_stage, lastService, state, clover_hid_published,
+               clover_hid_property_seen, clover_hid_presses, clover_hid_sink_touch,
+               clover_hid_sink_buttons, native_legacy_transfer_calls);
+    }
 }
 
 extern "C" void clover_hid_input_probe(void) {

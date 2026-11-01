@@ -1031,11 +1031,20 @@ def check_sb_sample(kernel: bytes) -> bool:
                            b"sizes=%u,%u,%u,%u,%u device=%llx transfer=%u presses=%u sinks=%u,%u\n") in kernel,
              "hid-size": (b"clover r255: IOHIDDevice size=%u not 208, refusing\n") in kernel,
              "hid-load": (b"clover r255: IOHIDFamily load=%d, no device\n") in kernel,
-             "hid-service": (b"clover r255: service=%llx%s\n") in kernel,
+             # Round256's beat: the early lines are the ones the ring loses (boot 43 printed its verdict
+             # at t=25 s and kept rows from t=1208 s), so the state is said again every 120 s of the ARM
+             # counter, and the gate is a clock rather than a call count because the driver calls the
+             # checkpoint ten times a second while a press is held.
+             "hid-beat": (b"clover r255: beat stage=%d service=%llx%s published=%u seen=%u presses=%u "
+                          b"sinks=%u,%u transfer=%u\n") in kernel,
+             "hid-early": (b"clover r255: device=%llx%s\n") in kernel,
+             # The single-line-per-second print round255 shipped with is gone by design; leaving it in
+             # the image would mean the beat was added without capping the early path, which is the one
+             # thing boot 43 proved cannot be read back.
+             "hid-spam": (b"clover r255: service=%llx%s\n") not in kernel,
              # The driver reaches for two producers through weak imports, and a static kernel link has
              # no undefined-weak: the first r255 build died on exactly these two names. The board's
-             # answer is a pair of counters, printed in the stage line above.
-             "hid-sink": (b"clover r255: device=%llx") in kernel,
+             # answer is a pair of counters, printed in the stage line above and in the beat.
              "hid-name": (b"Offline HID input probe") in kernel,
              "hid-resource": (b"IOHIDResource") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "

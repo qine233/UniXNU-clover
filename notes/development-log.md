@@ -19209,3 +19209,27 @@ backboardd 真正去 copyProperty 的那个节点）。
 自己的输出送到得了的地方——把 verdict 从一次性早打印改成慢心跳（探针状态每 120 s 重述一次，仍在
 `r255-hid` 的 32 行预算内），让任何一段晚窗口都必然带着它；再用 `DisplayIntegrated`/`Built-In` 会不会
 停止累积当第二个证人。`home-button-type` 仍然不动。
+
+## r256 落地：让 verdict 迟到也读得到
+
+r255 的证据是「机械成了、答案丢了」，丢的原因是时间而不是条数：卡上的 kind-22 环只保留最后 512 行内核
+日志，boot 43 那一批从 **t=1208 s** 起，而本探针所有的话都在 **t≈25 s** 说完——msgbuf 已经绕了 24 圈。
+于是同一类毛病第四次出现（r249 推送上限 / r251 回卷环 / r252+r254 类预算 / r255 时间窗）。
+
+r256 只做一件事：**把状态再说一遍，说得晚一点、说得久一点。**
+
+* `native_hid_live_checkpoint()` 早期打印收成**一条**带 8 次上限的行（它讲链条怎么变的），另外每
+  **120 s** 打一条 beat：`clover r255: beat stage=%d service=%llx <四个键的读数> published=%u seen=%u
+  presses=%u sinks=%u,%u transfer=%u`。1800 s 死线约 15 条，任何一段晚窗口都必然带着它。
+* 节拍用**通用 ARM 计数器**（`cntfrq_el0` 算一次，`cntpct_el0` 比时间），不是调用次数——驱动按住一次
+  Home 时每 100 ms 就进一次 checkpoint，按次计会跟着输入状态漂。
+* tee 里 beat 单独成类（`clover r255: beat` → `r256-beat`，24 行），并且**排在**裸前缀
+  `clover r255: `（`r255-hid`，预算降到 16）之前：`teeProbeClass` 返回第一个在行里出现的 token，
+  而 `clover r255: beat…` 本身就含裸前缀，顺序错了两个类就又在花同一份预算——分开的意义正好被抵消。
+* `verify-clover-payload.py` 除了要求 beat 在，还要求旧的逐秒 `service=%llx%s` 行**不在**：加节拍却不
+  收早期打印，就还是 boot 43 那台读不出东西的仪器。
+
+两个分支等 beat 来分：`published=1 seen=1` 而 r252 缺席表里 `DisplayIntegrated` 还在涨 → 发到了
+backboardd 不读的节点上，下一刀是「它到底在哪个 entry 上 copyProperty」（缺席记录器现在只记键名，
+`%c` 分 path/key，不记被问的那 entry 的名字——这一条值得单独一轮把它补上）；`published=0` → 链子断在
+事件驱动匹配之前，回到 report descriptor 那一侧。`home-button-type` 仍然不动。
