@@ -77,6 +77,18 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
   不带平面对象时 `fromPath()` 从路径里截出名字交给 `getPlane()`，用户客户端的注册表调用也走
   同一条；而 `getPlane()` 返回 NULL 就是查不到，MobileGestalt 会把「查不到」写成默认整数。
   这条正好对上 boot 33/34 的矛盾：**内核读到 2，backboardd 的行为却是「不是 2」**。
+* r246/r247 那两次刷写**一条读数都没留下**，上一轮把这记在 census 的 `svc->release()` 头上，
+  是错的。宿主上的三条证据：卡上 boot 计数器还停在 34（`bootIdClaim()` 是块驱动上膛那一刻的
+  本启动第一笔卡写，它没跑）、flight 区 0 条 entry/0 条 beat、三轮镜像反汇编到
+  `_clover_iodt_census` 都是 `cmp x0, #0x5dc` 同一条 1500 s 闸门。真正的位置在
+  `~/UniXNU/scripts/unixnu/payload.py`：它把 board.toml 的标题**裸插**进清单的
+  `title = "…"`，而这两轮标题里写了 `getPlane("IODeviceTree")`，第一个内层引号把 TOML 字符串
+  截断，固件（`UniXNULib/Config.c`）读不到 xnu 条目，菜单里没有操作系统——`tomllib` 逐份解析
+  存档镜像实测：r245 通过，r246/r247 都在第 9 行报错。
+* r248 因此只修通道，不动 census：生成器改 `json.dumps` 转义（与同文件 install 条目一致，
+  固件的 `Toml.c` 支持 `\"`），并在写完后 `tomllib` 解析一遍、要求 xnu 条目带回本轮标题与
+  内核路径——解析不了的清单再也刷不到板子上。`verify-clover-payload.py` 同步加一条卡内清单
+  闸门（拿旧镜像验过它真会叫）。census 的第一手读数是 boot 36。
 
 
 每一轮的设计、构建与真机读数（含本节的证据出处）都在
@@ -87,7 +99,7 @@ r236–r239 是把这条链读出来的四轮。
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点已钉到 `_controllerReadyGroup`；boot 33/34 都读到 `cnt=1 g=0 wait=1`，且内核侧平面完整（9 个节点、`/buttons` 查得到、`home-button-type` len=4 u32=2、根 `model=iPad7,1`）；宿主把分支语义钉反了一次——`==2` 才是「记一条日志、跳过 SSHB」，投死等 block 的是 `!=2` 一侧，所以用户态拿到的不是 2 | r246：服务平面改整平面递归点名（带上限与撞限位），并新增用户态等价问（`getPlane("IODeviceTree")` → `/buttons` → `home-button-type`），boot 35 按写死的分支走 |
+| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点已钉到 `_controllerReadyGroup`；boot 33/34 都读到 `cnt=1 g=0 wait=1`，且内核侧平面完整（9 个节点、`/buttons` 查得到、`home-button-type` len=4 u32=2、根 `model=iPad7,1`）；宿主把分支语义钉反了一次——`==2` 才是「记一条日志、跳过 SSHB」，投死等 block 的是 `!=2` 一侧，所以用户态拿到的不是 2 | r246/r247 两次刷写零读数，r248 查明是负载清单（`unixnu.toml`）里的标题没转义、固件读不到 xnu 条目，XNU 根本没启动；census 已修好但一次都没跑过。boot 36（r248）按写死的分支走：`plane byname=` 判平面名字，`svc total=/stopped=/button-family=` 判板上有没有能发 ready 通知的服务 |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 3），再问地址 |
 | 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |

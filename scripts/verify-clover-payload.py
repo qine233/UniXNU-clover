@@ -25,6 +25,7 @@ import re
 import struct
 import subprocess
 import sys
+import tomllib
 
 XNU_PAYLOAD = pathlib.Path("/Users/zhouzhou/UniXNU/out/clover/payload/payload.img")
 LOCAL_ROOT = pathlib.Path("/Users/zhouzhou/UniXNU-clover/build/clover-root/launchd.macho")
@@ -1372,6 +1373,34 @@ def report(image: pathlib.Path) -> int:
         same = inside == disk.read_bytes()
         ok &= same
         print(f"{label:42} {'OK' if same else 'DIFFERS'}")
+
+    # Round248. unixnu.toml is the one file on this volume the firmware must read before XNU exists,
+    # and boots 35 and 36 measured what a manifest it cannot parse costs: no boot id, no beat, no
+    # panic record, no kernel log -- because no kernel ran. The round title carries a quoted function
+    # name, the shape the emitter used to write between bare quotes, so the shipped file is parsed
+    # here the way the firmware's parser parses it and required to offer this board's title, its
+    # kernel and the unattended deadline.
+    manifest = blobs.get("unixnu.toml")
+    label = "unixnu.toml: parses and offers this round's xnu entry"
+    if manifest is None:
+        print(f"{label:42} SKIPPED")
+        ok = False
+    else:
+        try:
+            parsed = tomllib.loads(manifest.decode())
+        except tomllib.TOMLDecodeError as exc:
+            ok = False
+            print(f"{label:42} FAIL (unparsable: {exc})")
+        else:
+            board = tomllib.loads((pathlib.Path(__file__).resolve().parents[1] / "board.toml").read_text())
+            xnu = next((entry for entry in parsed.get("entry", []) if entry.get("type") == "xnu"), {})
+            parts = {"title": xnu.get("title") == board["payload"]["title"],
+                     "kernel": xnu.get("path") == "Payloads/kernel.macho",
+                     "deadline": "clover-unattended=1800" in xnu.get("args", "")}
+            same = all(parts.values())
+            ok &= same
+            print(f"{label:42} {'OK' if same else 'FAIL'} "
+                  f"({', '.join(f'{name} ok' if yes else f'{name} WRONG' for name, yes in parts.items())})")
 
     # Round137's root is not the initrd; it is the APFS volume /chosen names. A payload whose ADT
     # lost the dictionary boots nothing, and the kernel would wait at IOFindBSDRoot for ten timeouts.

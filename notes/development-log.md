@@ -18391,3 +18391,93 @@ r247 做两件事，都不加新读数：
   `package/CloverHidInputProbe.cpp` 并从 CloverPMGR 调；boot args 加
   `offline-hid-input=1 offline-hid-home=1`。**但先等 boot 36 的
   `plane byname=`：**如果平面名字本来就缺，修名字比造一台 HID 设备更靠前，两条路不能混做。
+
+## r248：boot 35/36 那两次不是「仪器吃掉了板子」，是负载里的清单解析不了
+
+### 先把两条线索摆在一起
+
+上一轮（r247）把「boot 35 没回来」归给 census 里那行 `svc->release()`。这一轮在宿主上把
+三条独立证据摆开，那个归因不成立：
+
+1. **卡上连一笔写都没有。** 无人值守读回来的窗口仍是 boot 34 的内容，boot 计数器（第 1216
+   扇、kind 24）= 34。而 `bootIdClaim()` 是 CloverSdhci 在 GPT 走完、三环上膛那一刻写的
+   **本启动第一笔卡写**（r212）。计数器没动，说明这两次刷写里 XNU 根本没跑到 IOKit 的块驱动。
+   同理：flight 区 0 条 entry、0 条 beat（beat 是 CPU0 定时器每 4 s 写一次的），panic 槽最新
+   一条还是 boot 33 那条。
+2. **census 在镜像里确实是惰性的。** 把三轮的 `roundNNN-kernel-amfi.macho` 反汇编到
+   `_clover_iodt_census` 入口：r245/r246/r247 三条都是 `sub sp` → 存 canary →
+   `cmp x0, #0x5dc`（1500 s 闸门）在同一条指令位置上。r246/r247 改的东西在 1500 s 之前
+   没有任何一条会跑。
+3. **r246/r247 那两次根本没有 boot 号。** 卡上计数器没被推进过，所以「boot 35」「boot 36」
+   只是刷写次数的口头编号，不是帧号——这一点也一并更正上一节的写法。
+
+### 真正的位置：EFI/UniXNU/unixnu.toml
+
+把三颗 payload 里的清单用 mtools 抽出来对比，r245 的 1459 B、r246 的 1535 B、r247 的 1364 B；
+再用 `tomllib` 逐个解析：
+
+```
+shipped 245 parses, xnu title len 645
+shipped 246 FAILS: Expected newline or end of document after a statement (at line 9, column 487)
+shipped 247 FAILS: Expected newline or end of document after a statement (at line 9, column 441)
+```
+
+第 9 行就是 `[[entry]] id="xnu"` 的 `title =`。根因在生成器，不在板级补丁：
+`~/UniXNU/scripts/unixnu/payload.py` 那一行是
+
+```python
+f'[[entry]]\nid = "xnu"\ntitle = "{spec.get("title", "UniXNU")}"\n...'
+```
+
+把 board.toml 的标题**裸插**进一对双引号里。r246/r247 的标题都写了
+`getPlane("IODeviceTree")`——第一个内层引号当场把 TOML 字符串截断，后面的整段变成垃圾语句，
+固件（`package/UniXNUPkg/Library/UniXNULib/Config.c`，解析器 `Toml.c`）读不到 xnu 条目，
+菜单里就没有操作系统：r246 那次卡在菜单上一直没人看见设备，r247 那次固件按自己的规矩落回
+fastboot。**同文件里 install 那一条早就用 `json.dumps` 输出标题，只有 xnu 这条没有。**
+
+顺带把「非 panic 复位 / 238 s 自复位」这条旧线排掉：本轮两次都连清单都没过，谈不上复位形态。
+
+### r248 做的三件事（都不动 census 的代码）
+
+1. **生成器**：`title = {json.dumps(title)}`，与 install 条目一致。`Toml.c` 的
+   `ParseString()` 支持 `\"`/`\\`/`\u` 转义，所以转义后的标题在固件侧也是原样。
+2. **出厂闸门（同一文件）**：写完清单先 `tomllib.loads(config)` 解析一遍，再要求第一条
+   `type="xnu"` 的条目带回本轮标题、`Payloads/kernel.macho` 路径；解析失败或身份不符就
+   `Error()` 中断 payload 构建——解析不了的镜像再也刷不到板子上。
+3. **两个 checker 的契约**：
+   - `check-clover.py` 钉生成器现在的三处形状（`title = {json.dumps(title)}`、两条报错串），
+     并**反向**钉死裸插那一行不许回来；同时要求本轮标题里继续出现
+     `getPlane(\"IODeviceTree\")`——这一轮的回归样本必须真的在产物里被走过，而不是躲开它。
+   - `verify-clover-payload.py` 新增一条：把卡内 `unixnu.toml` 用 `tomllib` 解析，要求
+     标题/内核路径/`clover-unattended=1800` 三项都对得上 board.toml。拿旧镜像验证过它真的会叫：
+     r247 报 `FAIL (unparsable: ... line 9, column 441)`，r245 报 `FAIL (title WRONG...)`
+     （它命名的是 r245 那一轮，不是本轮——正是应有的行为）。
+
+### 对照开机（卡上 boot 35）：环境与板子都好
+
+为了不把「补丁导致」和「板子/构建环境导致」混在一起，先把磁盘上那份**已知能跑到 1800 s**
+的 `round245-payload.img` 原样重刷一次。读回来：
+
+```
+boot 35  lba 13321432  kind 24 (boot-24)  ok
+decoded: 16 report record(s), 64 driver verdict line(s), 20 probe line(s), 512 kernel log line(s), boot 35
+```
+
+同一份镜像、同一块卡、同一套宿主流程，1800 s 死线到点、panic 自己写 BCB、落进 TWRP、一次
+`dd` 全读回来。所以 r246/r247 的两次空白只可能是那两份产物自己，而上面已经找到它们唯一的
+共同点：**清单解析不了**。
+
+### r247 的修法保留，但它从没被测试过
+
+`svc->release()` 那一行按 `IORegistryEntry.h:993`（「The entry returned is retained while the
+iterator is pointing at it … The caller should not release it」）确实是错的，删掉它和把
+`kCloverSvcCap` 降到 2000 都留着。但必须写清楚：**这两处改动到现在一次都没在板子上跑过**，
+因为带它们的镜像根本没启动。census 的第一手读数是 boot 36（r248）。
+
+### boot 36（r248）待读
+
+按 r246 预先写死的判决分支对号：`plane byname=` / `buttons byname=` / `hbt byname=` 三行给
+「用户态那一问」定性，`svc total=` / `stopped=` / `button-family=` 给「板上有没有能发 ready
+通知的服务」定性。若 `plane byname=missing`，下一步修平面**注册**一侧；若 `plane byname=ok`
+且 `hbt byname len=4 u32=2`，那用户态到平面这一层是通的，死等只能回到 MobileGestalt 自己的
+闸门（`bl 0x52aa38` 那个一次性 sysctl），而不是设备树。

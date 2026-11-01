@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import pathlib
 import re
 import struct
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 HERE = pathlib.Path(__file__).resolve()
 REPO = HERE.parents[1]
@@ -1574,8 +1576,8 @@ def check_board(errors: list) -> str:
                            if (base / "patches/xnu-clover" / r247_name).is_file()), None)
         if r247_patch is None:
             errors.append(f"patches/xnu-clover/{r247_name} is missing: the service walk would keep "
-                          "releasing entries the iterator still points at, which is what stopped "
-                          "boot 35 from ever landing")
+                          "releasing entries the iterator still points at -- wrong on the board, but "
+                          "still wrong, and boot 37 would be the first frame to test it")
         else:
             r247_added = "".join(line for line in r247_patch.read_text().splitlines(True)
                                  if line.startswith("+"))
@@ -1587,12 +1589,43 @@ def check_board(errors: list) -> str:
                               "registry the census is reading")
             if "svc->release();" not in r247_removed:
                 errors.append(f"{r247_patch.name} does not remove the iterated entry's release: "
-                              "boot 35's missing landing was that one line")
+                              "the iterator would still be handed back a plane it corrupts")
             for needle in ('IORegistryEntry.h:993', 'iterator is ours to release',
                            'kCloverSvcCap = 2000'):
                 if needle not in r247_added:
                     errors.append(f"{r247_patch.name} lacks {needle!r}: the next reader would have "
                                   "nothing saying why this loop must not release")
+
+        # Round248, the manifest emitter. Boots 35 and 36 carried no reading at all -- not a drained
+        # ring, not one block written, boot id still 34 -- and r247 blamed the census for it. The real
+        # cause is upstream of XNU: scripts/unixnu/payload.py wrote the board's title into
+        # EFI/UniXNU/unixnu.toml between bare quotes, the titles of those two rounds contain
+        # getPlane("IODeviceTree"), and the string ended at the first quote, so the firmware's parser
+        # dropped the xnu entry and the board booted a menu with no OS in it. The emitter now escapes
+        # the title the way the install entry already did and parses the manifest it generated, so an
+        # unreadable payload cannot be flashed again.
+        emitter_text = (REPO.parent / "UniXNU" / "scripts/unixnu/payload.py").read_text()
+        for needle in ('title = {json.dumps(title)}',
+                       'raise Error(f\'generated unixnu.toml does not parse: {exc}\')',
+                       "xnu entry does not carry this board's title and kernel path"):
+            if needle not in emitter_text:
+                errors.append("scripts/unixnu/payload.py lacks "
+                              f"{needle!r}: a board title with a quote in it would again ship a "
+                              "manifest the firmware cannot read, and the flash would produce no "
+                              "reading at all")
+        if 'title = "{spec.get("title"' in emitter_text:
+            errors.append("scripts/unixnu/payload.py re-adds the unescaped title: that is the exact "
+                          "shape that ate boots 35 and 36")
+        # And the round title has to keep a quote in it, so the shipped manifest is a live test of
+        # the escaping rather than a case that was never exercised.
+        emitted_title = f"title = {json.dumps(board['payload']['title'])}\n"
+        try:
+            if tomllib.loads(emitted_title)["title"] != board["payload"]["title"]:
+                errors.append("the board title does not round-trip through a TOML basic string: the "
+                              "menu would name a different round than the payload carries")
+        except tomllib.TOMLDecodeError as exc:
+            errors.append(f"board.toml's title cannot be emitted as a TOML basic string ({exc}): "
+                          "the firmware would drop the xnu entry and boot with no OS to show")
 
         # Round229's first cut is negative: three producers filled half the kernel ring with lines
         # that say nothing new (the bare apfs event tail, a nagging client repeated, an exit line per
@@ -2633,8 +2666,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r247:"):
-        errors.append('[payload] title is not "clover r247: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r248:"):
+        errors.append('[payload] title is not "clover r248: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -3686,8 +3719,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r247:"):
-        errors.append('[payload] title is not "clover r247: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r248:"):
+        errors.append('[payload] title is not "clover r248: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
