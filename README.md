@@ -89,6 +89,14 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
   固件的 `Toml.c` 支持 `\"`），并在写完后 `tomllib` 解析一遍、要求 xnu 条目带回本轮标题与
   内核路径——解析不了的清单再也刷不到板子上。`verify-clover-payload.py` 同步加一条卡内清单
   闸门（拿旧镜像验过它真会叫）。census 的第一手读数是 boot 36。
+* boot 36（r248 实机）终于把 census 跑起来了，却只送到卡上一半：那一趟先被 9 行 bb 采样占了位子，
+  census 的 `census t=`、9 行节点、`path buttons=` 填到每趟 **16 次推送**的上限（`kTeePushPerPass`）
+  就断在这里，`hbt len=`、三行 `byname`、`svc total=/stopped=/button-family=` 和 `census done`
+  被 `gTeeThrottled` 就地丢弃——扫描索引照样往前走，所以**没有下一趟补发**。boot 34 之所以读得完整，
+  只因为那一版的服务点名只走一层、整批不超过 16 行。r249 因此只动读数通道：census 类与整集合行
+  共用同一条例外（两者的「缺席」都不能与「什么都没查到」区分），每趟上限照旧保护那块还在服务
+  文件系统请求的卡。boot 37 的判据是一行：**`census done` 在不在卡上**——在，就有完整的 byname 与
+  服务点名可对号；不在而前面的 census 行在，那就是遍历本身走不完，是下一条要追的 bug。
 
 
 每一轮的设计、构建与真机读数（含本节的证据出处）都在

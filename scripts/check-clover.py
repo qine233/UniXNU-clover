@@ -1630,6 +1630,10 @@ def check_board(errors: list) -> str:
                           "shape that ate boots 35 and 36")
         # And the round title has to keep a quote in it, so the shipped manifest is a live test of
         # the escaping rather than a case that was never exercised.
+        if '"' not in board["payload"]["title"]:
+            errors.append("board.toml's round title carries no double quote: the escaping that lost "
+                          "boots 35 and 36 would then ship untested again, and the next title that "
+                          "quotes a function name would be the first one the firmware ever sees")
         emitted_title = f"title = {json.dumps(board['payload']['title'])}\n"
         try:
             if tomllib.loads(emitted_title)["title"] != board["payload"]["title"]:
