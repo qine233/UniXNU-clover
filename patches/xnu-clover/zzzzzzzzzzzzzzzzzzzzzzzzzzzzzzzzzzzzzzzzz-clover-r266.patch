@@ -1,0 +1,133 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11821,6 +11821,7 @@
+ #define CLOVER_BB_M2_TRAP  (-47)
+ 
+ #define CLOVER_BB_PEER_ROWS 12
++#define CLOVER_BB_STACKS 3
+ 
+ /*
+  * Round265. The receiver's task behind a name in someone else's space, with the
+@@ -11882,7 +11883,25 @@
+ 	char comm[16];
+ 	uint64_t ptid[CLOVER_BB_PEER_ROWS];
+ 	uint64_t pcont[CLOVER_BB_PEER_ROWS];
++	uint64_t pwe[CLOVER_BB_PEER_ROWS];
++	uint64_t ppc[CLOVER_BB_PEER_ROWS];
+ 	uint64_t pdl[CLOVER_BB_PEER_ROWS];
++	/*
++	 * Round266. Boot 52 showed the debtor asleep on five workloop notes and a mach semaphore, and the row
++	 * could not group them because it carried no wait-event word: for a wait whose object is not a port,
++	 * thread->wait_event is the only identity the row has. The same round asks the second half of the
++	 * question, which no kernel field answers -- what called into that wait -- by walking the user stack of
++	 * one thread per distinct continuation. Candidates are chosen under the lock and walked after it, the
++	 * way round236 does for the blocked process; distinctness is by continuation, so three slots buy three
++	 * different kinds of sleep rather than three workq workers.
++	 */
++	uint64_t ktid[CLOVER_BB_STACKS];
++	uint64_t kcont[CLOVER_BB_STACKS];
++	uint64_t kwe[CLOVER_BB_STACKS];
++	uint64_t ksp[CLOVER_BB_STACKS];
++	uint64_t kfp[CLOVER_BB_STACKS];
++	uint64_t klr[CLOVER_BB_STACKS];
++	uint32_t kn = 0;
+ 	uint64_t prm[CLOVER_BB_PEER_ROWS];
+ 	uint64_t prc[CLOVER_BB_PEER_ROWS];
+ 	uint64_t pto[CLOVER_BB_PEER_ROWS];
+@@ -11917,7 +11936,35 @@
+ 			ptid[pn] = thr->thread_id;
+ 			pst[pn] = thr->state;
+ 			pcont[pn] = (uint64_t)(uintptr_t)thr->continuation;
++			pwe[pn] = (uint64_t)(uintptr_t)thr->wait_event;
++			ppc[pn] = 0;
+ 			pdl[pn] = 0;
++			if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1 &&
++			    !is_saved_state32(ss) && (thr->state & TH_RUN) == 0) {
++				ppc[pn] = (uint64_t)get_saved_state_pc(ss);
++			}
++			if ((thr->state & TH_WAIT) != 0 && kn < CLOVER_BB_STACKS &&
++			    ss != NULL && (uintptr_t)ss != (uintptr_t)-1 &&
++			    !is_saved_state32(ss)) {
++				uint32_t k;
++				int seen = 0;
++
++				for (k = 0; k < kn; k++) {
++					if (kcont[k] == (uint64_t)(uintptr_t)thr->continuation) {
++						seen = 1;
++						break;
++					}
++				}
++				if (!seen) {
++					ktid[kn] = thr->thread_id;
++					kcont[kn] = (uint64_t)(uintptr_t)thr->continuation;
++					kwe[kn] = (uint64_t)(uintptr_t)thr->wait_event;
++					ksp[kn] = (uint64_t)get_saved_state_sp(ss);
++					kfp[kn] = (uint64_t)get_saved_state_fp(ss);
++					klr[kn] = (uint64_t)get_saved_state_lr(ss);
++					kn++;
++				}
++			}
+ 			prm[pn] = 0;
+ 			prc[pn] = 0;
+ 			pto[pn] = 0;
+@@ -11958,6 +12005,44 @@
+ 	if (busy) {
+ 		return;
+ 	}
++	/*
++	 * Round266. One user stack per distinct continuation, walked with the pmap the peer owns. The frames are
++	 * raw return addresses for the host to resolve, exactly as in r236's rows: the app and the shared cache
++	 * each carry a slide, and only this boot's slide turns them into names.
++	 */
++	{
++		uint32_t k;
++
++		for (k = 0; k < kn; k++) {
++			uint64_t frames[10];
++			uint64_t callers[10];
++			uint32_t fn;
++			uint32_t j;
++			char ft[224];
++			int foff = 0;
++
++			bzero(frames, sizeof(frames));
++			bzero(callers, sizeof(callers));
++			fn = clover_user_bp_walk(vm_map_pmap(peer->map), kfp[k], ksp[k],
++			    frames, callers, 10);
++			ft[0] = '\0';
++			for (j = 0; j < fn && j < 10; j++) {
++				int wrote = snprintf(ft + foff, sizeof(ft) - (size_t)foff,
++				    " %llx", (unsigned long long)frames[j]);
++
++				if (wrote <= 0 || wrote >= (int)(sizeof(ft) - (size_t)foff)) {
++					break;
++				}
++				foff += wrote;
++			}
++			printf("clover r266: pustk t=%llu pid=%d tid=%llx cont=%llx"
++			    " we=%llx sp=%llx fp=%llx lr=%llx fn=%u%s\n",
++			    (unsigned long long)secs, task_pid(peer),
++			    (unsigned long long)ktid[k], (unsigned long long)kcont[k],
++			    (unsigned long long)kwe[k], (unsigned long long)ksp[k],
++			    (unsigned long long)kfp[k], (unsigned long long)klr[k], fn, ft);
++		}
++	}
+ 	for (i = 0; i < pn; i++) {
+ 		char ppeer[24];
+ 		uint32_t pmc = 0;
+@@ -11986,10 +12071,12 @@
+ 		if ((uint32_t)prc[i] != 0) {
+ 			clover_sb_port_mail(peer, (mach_port_name_t)prc[i], &pmc, &psr);
+ 		}
+-		printf("clover r265: pth tid=%llx st=%x cont=%llx dl=%llx"
+-		    " rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x peer=%s\n",
++		printf("clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
++		    " dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
++		    " peer=%s\n",
+ 		    (unsigned long long)ptid[i], pst[i],
+-		    (unsigned long long)pcont[i], (unsigned long long)pdl[i],
++		    (unsigned long long)pcont[i], (unsigned long long)pwe[i],
++		    (unsigned long long)ppc[i], (unsigned long long)pdl[i],
+ 		    (unsigned int)prc[i], (unsigned int)(uint32_t)prm[i],
+ 		    (unsigned long long)pto[i], pmc, psr, pmmc, pmsr, ppeer);
+ 	}

@@ -818,6 +818,10 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // the same fifteen fires that budgeted r262-th at 384 give 195 here, and 224 keeps the widest legal peer
   // census off its own tail without spending half again a ring on a process the boot may never even reach.
   { "clover r265: ", "r265-peer", 224, 0, 0, 0 },
+  // Round266 walks one user stack per distinct continuation of the debtor, so the count per fire is the
+  // candidate cap (three), not the row cap: fifteen fires on the census clock is 45 lines, and 64 leaves the
+  // widest legal peer census short of its own tail.
+  { "clover r266: ", "r266-stack", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

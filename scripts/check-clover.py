@@ -2040,12 +2040,14 @@ def check_board(errors: list) -> str:
                               "rows")
             baseline_script = (REPO.parent / "UniXNU" /
                                "scripts/build-xnu-4k-baseline.sh").read_text()
-            late_head = next((line for line in baseline_script.splitlines()
-                              if line.strip().startswith("for LATE_PATCH in")), "")
-            if r265_name not in late_head:
-                errors.append("build-xnu-4k-baseline.sh does not reverse r265 first in LATE_PATCH: the "
-                              "compile pass would run on the r264-shaped tree and a replay failure would "
-                              "read as a broken patch rather than an out-of-order one")
+            late_list = " ".join(line for line in baseline_script.splitlines()
+                                 if "clover-r2" in line)
+            if (late_list.find(r265_name) < 0 or
+                    late_list.find("z" * 41 + "-clover-r266.patch") > late_list.find(r265_name) or
+                    late_list.find(r265_name) > late_list.find("z" * 39 + "-clover-r264.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r265 between r266 and r264 in "
+                              "LATE_PATCH: the compile pass would run on a tree this patch was not written "
+                              "against, and a replay failure would read as a broken patch")
             load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r265_name
             if not load_copy.is_file():
                 errors.append(f"UniXNU/patches/xnu/{r265_name} is missing: unixnu loads patches from that "
@@ -2054,6 +2056,51 @@ def check_board(errors: list) -> str:
                 errors.append("drivers/CloverSdhci has no class for the peer census: twelve rows plus a "
                               "header on a two-minute clock is 195 lines across a 1800 s boot, and an "
                               "unjewelled prefix means the boot reads as if the debtor was never walked")
+
+        # Round266 fixes the field this round's own row lost. Boot 52 answered the r265 fork -- rmc=0 rsr=1,
+        # the debtor took the request and has not answered -- and its census then showed five threads parked in
+        # filt_wlwait (a kqueue EVFILT_WORKLOOP request) and one in a mach semaphore, with no thread of that
+        # task holding a send right. Both are waits whose object is not a port, so the only identity a row can
+        # carry is thread->wait_event; r265 copied r264's field list and left we= out, which makes "five
+        # sleepers on one note" and "five on five notes" print alike. Same family as the hidden= and peer=
+        # lessons: a field that cannot resolve must not print like a field that is absent, and a census that
+        # changes the KIND of waited-on object has to change its identity field with it.
+        r266_name = "z" * 41 + "-clover-r266.patch"
+        r266_patch = next((base / "patches/xnu-clover" / r266_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r266_name).is_file()), None)
+        if r266_patch is None:
+            errors.append(f"patches/xnu-clover/{r266_name} is missing: the boot would name the waiting kinds "
+                          "and still be unable to group them or say who called them")
+        else:
+            r266_text = r266_patch.read_text()
+            r266_added = "".join(line for line in r266_text.splitlines(True)
+                                 if line.startswith("+"))
+            for needle in ('pwe[pn] = (uint64_t)(uintptr_t)thr->wait_event;',
+                           'ppc[pn] = (uint64_t)get_saved_state_pc(ss);',
+                           '"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"',
+                           'kcont[k] == (uint64_t)(uintptr_t)thr->continuation',
+                           '#define CLOVER_BB_STACKS 3',
+                           'fn = clover_user_bp_walk(vm_map_pmap(peer->map), kfp[k], ksp[k],',
+                           '"clover r266: pustk t=%llu pid=%d tid=%llx cont=%llx"',
+                           '" we=%llx sp=%llx fp=%llx lr=%llx fn=%u%s\\n"'):
+                if needle not in r266_added:
+                    errors.append(f"{r266_patch.name} lacks {needle[:64]!r}: without it the peer rows still "
+                                  "cannot group a non-port wait or name its caller")
+            # A walk that runs while the task lock is held reads user memory through a pmap that can be
+            # torn down; r236 walks after the unlock and r266 must not be the round that changes that.
+            walk_at = r266_text.find('clover_user_bp_walk')
+            unlock_at = r266_text.find('lck_mtx_unlock(&peer->lock)')
+            if unlock_at >= 0 and walk_at < unlock_at:
+                errors.append(f"{r266_patch.name} walks the peer stack before dropping the peer task lock: "
+                              "the frame walk is user-memory I/O and belongs after the unlock, as in r236")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r266_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r266_name} is missing: unixnu loads patches from that "
+                              "directory and silently skips a board patch that lives only in this repo")
+            if '{ "clover r266: ", "r266-stack", 64, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci has no class for the peer stacks: the new prefix is a "
+                              "producer of its own, and an unbudgeted one drops the reading silently")
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -3359,8 +3406,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r265:"):
-        errors.append('[payload] title is not "clover r265: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r266:"):
+        errors.append('[payload] title is not "clover r266: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4412,8 +4459,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r265:"):
-        errors.append('[payload] title is not "clover r265: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r266:"):
+        errors.append('[payload] title is not "clover r266: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

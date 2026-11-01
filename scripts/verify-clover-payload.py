@@ -1072,8 +1072,15 @@ def check_sb_sample(kernel: bytes) -> bool:
              # it, which is the reading this round exists to get.
              "bb-peer-header": (b"clover r265: peer t=%llu pid=%d comm=%s%s threads=%u shown=%u"
                                 b" hidden=%u wait=%u run=%u rx=%u tm=%u\n") in kernel,
-             "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx dl=%llx"
-                             b" rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x peer=%s\n") in kernel,
+             "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
+                             b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
+                             b" peer=%s\n") in kernel,
+             # Round266: boot 52 found the debtor asleep on five EVFILT_WORKLOOP waits and a semaphore, which
+             # are not port waits -- the wait-event word is their only identity, and one user stack per
+             # distinct continuation is what names the caller. A payload missing these re-asks the question
+             # boot 52 already answered and cannot act on it.
+             "bb-peer-stack": (b"clover r266: pustk t=%llu pid=%d tid=%llx cont=%llx"
+                               b" we=%llx sp=%llx fp=%llx lr=%llx fn=%u%s\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

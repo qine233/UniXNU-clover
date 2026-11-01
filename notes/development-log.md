@@ -19995,3 +19995,29 @@ wait=15 run=0 rx=10 tm=0`；组等待者（这靴 `tid=0x383 blk=100da4ef0 grp=1
 宿主这一侧同时留一条待查：镜像里 `DMWatchdogPluginsAfterTimeout`、`DMImposePluginArtificialHang`、
 `DMWaitForExecutePluginsSignal` 这些名字说明**插件执行本身就靠这些等待**——
 若 (b) 落在它们身上，桌面这一格的病根是「迁移插件从没跑起来」，跟 GPU 无关。
+## r266 落地：把 `we=` 还回债主那一行，并且每种睡眠各抓一次用户栈
+
+boot 52 只剩一个问题：**五种 workloop 等待是同一把 note 还是五把，以及是谁调用进去的**。
+`zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r266.patch`（41 个 z，坐 r265 上、`LATE_PATCH` 最先摘除）
+只动 `osfmk/kern/task.c` 的债主普查，四处：
+
+1. `pth` 行补 `we=`（`thr->wait_event`）与 `pc=`（非 `TH_RUN` 才取 `get_saved_state_pc`）。
+   **理由是对象的种类**：端口的等待有 `rcv=/remote=` 当身份，workloop note 与 mach 信号量没有——
+   `we=` 是它们唯一的身份。r265 抄上一轮字段时把它省了，于是「五条同一把」和「五条各一把」同形。
+2. 锁内挑**至多三种不同的 continuation**（`CLOVER_BB_STACKS 3`，按 cont 去重）记下
+   `tid/cont/we/sp/fp/lr`，**解锁之后**才调 `clover_user_bp_walk(vm_map_pmap(peer->map), fp, sp, …)`。
+   去重而不是「取前三条」，是因为前三条很可能是三个空闲 `workq` 工人；三种不同 cont 保证
+   wlwait、信号量、工人各拿一栈。写后解锁这一点由 `check-clover.py` 钉住：
+   帧遍历是用户内存 I/O，不能持着任务锁做（r236 就是这个次序）。
+3. 新前缀 `clover r266: pustk`，因此新 tee 类 `r266-stack`，配额 **64**（每拍 3 行 × 15 拍 = 45，
+   留一点余量）。`check-clover.py` 还钉住「r265 的 LATE 断言改成**顺序**断言」：r266 一叠上去，
+   「r265 必须是表头第一项」就自己作废了——这是同一种断言第四次咬人，已经全部换成 A 在 B 之前。
+4. `verify-clover-payload.py` 把 `bb-peer-row` 钉成新形状（含 `we=%llx pc=%llx`）并加 `bb-peer-stack`。
+   顺手记一次自己差点造的错：批量把标题 `clover r265:` 改成 `r266:` 时，**同一趟 replace 把 r265 块里
+   两条内核字面量和 tee 断言一起改了**，闸门立刻红了两条——凡是「按前缀批量替换」的脚本编辑，
+   都要先看它到底命中了几处，替换数量对不上预期就该停。
+
+**boot 53 的分岔照样先写好**：`pustk` 的帧落进 `libdispatch`/`libsystem_kernel`（`wl_request`、
+`semaphore_wait_trap`）只说明「等的是内核事件」；真正的答案在**调用它的那一层**——
+落在 `DataMigration` 自己的符号（插件执行/看门狗那几条串都在镜像里）就是「迁移插件从没跑起来」，
+落在 `Foundation`/`NSXPC` 一层则是「它在等一次它自己发起的往返」。两种都不需要 GPU。
