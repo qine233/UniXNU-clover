@@ -20055,3 +20055,34 @@ backboardd 那把 ulock 与债主那五把 workloop 等待**同一次就能各�
 不用再从栈去猜；r266 的用户栈保留作对照（栈说「谁调用」，这张表说「谁负责」）。
 前提要一起验（照 sheng 的规矩）：`stackshot_thread_wait_owner_info` 是 `static`，
 所以走 `block_hint.h` 里那些 `extern` 个体；`kdp_*` 要求持有什么锁，源码逐条读过后再接。
+## r266 读数（boot 53）：五把 workloop 等待是**五个不同对象**；宿主解码在这批地址上不可信
+
+冷刷 `round266-payload.img`（sha 8ecee77c…，内核 f88fba8c…）跑 boot 53。债主 pid 这靴是 143
+（`comm=com.apple.datam-`，尾巴那个 `-` 仍是锁旗）。两拍表头 `threads=8 shown=8 hidden=0 wait=8 run=0 rx=1 tm=0`。
+
+**① `we=` 一上来就分掉了 r265 分不开的那一格**：五条 `_filt_wlwait_continue` 的等待对象是
+**五个不同的地址**——`fffffff27b020700 / …98180 / …a0f00 / …92500 / 27b24a600`；
+它们的 `pc` 全是同一个 `1d7b588c0`（同一条系统调用桩），`dl=0`。信号量那条 `tid=36c` 是
+`we=fffffff00700620c`、`pc=1d7b58ad4`。**所以这不是「五条线程挤在同一把 note 上」，
+而是五个各自独立的同步 workloop 调用**，每个都在等自己那把锁的属主线程去执行。
+另外四条 `_workq_unpark_continue` 的 `we=` 落在 `fffffff4470…`/`fffffff446f…`（workqueue 区），
+`tid=366` 是 `we=0` 的空等收信者——两类一眼分开了。**补 `we=` 这一格当场回本。**
+
+**② `pustk` 抓到了，但它把我送到一处必须诚实的岔口**：同一靴还有一条 `clover r221: sbm2x`
+给出 `pc=1d7b58b58 lr=1d7b5c224 poff=57b58b58 loff=57b5c224` ⇒ **本靴共享缓存 slide = 0x180000000**。
+拿 `scripts/decode-clover-cache-offset.py --addr <运行期地址>` 解债主/ backboardd 的帧，
+`0x19b94df1c`、`0x19b98ed74` 这类落进
+`dyld_shared_cache_arm64.09` 的 `WebCore` 文本区间（`0x1991a4000+0x29ca000`），
+并且「function start」离最近导出符号差 0xfdb4c/0x13e9a4 字节——**这个读法不可信**：
+libdispatch/CoreFoundation 的帧不会在 WebCore 里，而工具给的函数起点是它自己的启发式。
+（同一把工具在 r261 解 libVFXCore 是能用的，因为那片镜像小、起点合理；这次两片都不满足。）
+所以 boot 53 的栈我只用两件事：**哪些帧相同**（backboardd 卡住那条线程与债主等信号量那条线程
+共享 `19b98dc9c 19b98ecc0 19b9363f8 19b936e74 19b940794` 一串 ⇒ 两边都在同一条 libdispatch 工作者主干上），
+**以及 `pc=` 落在同一桩**。名字不在这里拿。
+
+**③ 于是 r267 不用再猜，走 v0.6.46 已经查到的那条路**：内核自己按 `thread->block_hint`
+分派 `kdp_*_find_owner`（`block_hint.h:68-85` 全 extern），
+`kdp_workloop_sync_wait_find_owner` 直接把 `kqwl->kqwl_owner` 的 **tid** 写进
+`thread_waitinfo_t.owner`（拿不到属主时给 `STACKSHOT_WAITOWNER_THREQUESTED`），
+`context` 给 `kqwl_dynamicid`。对每一行普查报 `hint/owner/context`，
+五把 workloop 与那把信号量**各自等谁**就是一次调用出来的数——不需要符号、不需要 slide、不需要猜镜像。
