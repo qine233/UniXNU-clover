@@ -19740,14 +19740,22 @@ boot 50 那行 `cont=_ulock_wait_continue dl=0`、`base=147d3f390 g=0 cnt=1 wait
 `ImguiLibrary`/`imgui.ini`/`ImguiRenderPipelineState`——**那是 ImGui 调试叠加层**，不是主渲染路径。
 把它当「主渲染在等着色器编译」是错的。
 
-**② 「VisualLogger 是 opt-in（`enableRecord`）」也是我把属性名写快了：镜像里是 `enableRecording`。**
-`0x135b163` 与 `0x13b5704` 两处邻居是 `Default | beginFrame() | Prepare Systems | _TtC3ECS9Scheduler
-| enableRecording | currentJobID | recurrentJobs | jobQueueForThisFrame | groupsToUnregister`——
-它是 VFXCore **ECS Scheduler 的录制开关**（VisualLogger.framework 与 libVFXCore.dylib 确实同片，
-`0x45e06` 有 framework 路径串）。所以「关录制」这件事**存在且是布尔**，但它是**记录器**的开关：
-证据只到「贴图加载组不看 `enableRecording` 的脸」为止——`asyncGroupRequests` 的邻居里没有它。
-**结论：把 VisualLogger  suppression 当成「不用 GPU 就能散组」的免费杠杆，是没有证据的**，
-不能据此开一轮。这是本项目第 N 次「字符串找到了≠因果找到了」，记在 r220/r263 那两条旁边。
+**② VisualLogger 这条杠杆：我先判它「没证据」，那个判决本身没证据，现撤回。**
+写这条时我查的是**字符串邻居**：开关实名 `enableRecording`（不是我先前写的 `enableRecord`——
+`.31` 片里那处 `enableRecord` 命中是别家框架的 `enableRecordButton:`，以 `.07` 的两处为准，
+邻居是 `Default | beginFrame() | Prepare Systems | _TtC3ECS9Scheduler | enableRecording |
+currentJobID | recurrentJobs | jobQueueForThisFrame | groupsToUnregister`，即 VFXCore ECS Scheduler
+的录制字段），而 `asyncGroupRequests` 的邻居里没有它，于是我说「关录制不会散组」。
+**这个推理不成立**，因为板子早就给过相反的直接证据：r261 把 boot 48 等待线程的十帧解到底，
+最底两帧 `1e3c02534`/`1e3bffccc` 落在 `.31` 的 **VisualLogger.framework**，上面才是一串 libVFXCore，
+再回调进 backboardd 自己（`descriptionForRootObject:`、类 `BKTouchHitTestContextMap`）又回 libVFXCore 睡下——
+**是记录器把 VFXCore 拉进这条触控路径的**，不是 VFXCore 自己来的。
+所以正确写法：VisualLogger suppression **仍然是候选杠杆**，而且正因为「拉进来的是它」，
+它是 CPU-first 里最便宜的一档；**还没被证实的是「谁打开 VisualLogger」**——`.31` 里
+`com.apple.visuallogger`/`VisualLoggerAgent`/`VLServer`/`CFPreferences`/`CBCopy` 全 0 命中
+（`MobileGestalt` 63、`MobileAsset` 30，所以入口更可能在 gestalt 键或 asset 类型上），
+得先把开关找出来再决定要不要为它花一靴。
+教训升一级：**字符串邻居只能用来否证我脑补的因果，不能用来否证板上栈已经给出的因果。**
 
 **③ 「没有任何软件渲染器」这条继续成立，但 `swiftshader` 要加限定。**
 全片计数：`AppleSoftwareRenderer` = **0**、`llvmpipe` = **0**、`MTLCreateSoftware*` = **0**；
@@ -19776,3 +19784,8 @@ EGL_ANGLE_platform_angle_device_type_egl_angle ... is not supported`，同片有
 `0x36ca78a` 是 `NUDevice_iOS.m` 的 `Software renderer is unsupported`，同邻
 `-[_newRendererWithCIContextOptions:error:]` 与 `defaultDevice != nil`。
 **结论：镜像里有「CoreImage 能走 CIContext 软解」，没有「窗口服务器能软合成」。**
+**⑥ 顺手把「壳要回答哪些调用」数了一遍（同一张片里的串计数，不是反汇编）**：`.07`（libVFXCore）里
+`newTextureWithDescriptor` 12 处、`newBufferWithLength` 5 处、`newLibrary` 14 处、`MTLCompileOptions` 2 处、
+`IOSurface` 204 处、`CGImage` 212 处。也就是说：**贴图加载那一格**只要设备能回答分配；
+但 VFXCore 整体还要求库编译（14 处 `newLibrary`），所以「壳不需要会画」只对这一格成立，
+不能当成「VFX 全流程 CPU 顶得住」的证据——那需要真着色器或真编译后端。
