@@ -1041,6 +1041,11 @@ def check_sb_sample(kernel: bytes) -> bool:
              # published, and the bus instrument that could say whether a real one exists is back in
              # the same image -- both are only true of this payload if these bytes are in it.
              "hid-touch-line": (b"touch=%u reports=%u ") in kernel,
+             # Round260: the beat carries the touch bus verdict as state, because boot 47 proved the
+             # burst it replaced never reaches the card (spoken t=12 s, ring window from t=1194 s).
+             "hid-bus-row": (b"clover r260: bus mode=%llu map=%llx hw=%llx io=%llx op=%llx err=%llx "
+                             b"status=%llx state=%llx clk=%llx ack=%llx id=%llx,%llx xfers=%llu "
+                             b"timeout=%llu nack=%llu verdict=%lld\n") in kernel,
              "input-armed": (b"clover-input") in kernel,
              # Round257: the gate that made boot 44 say published=0 must be gone from the shipped image,
              # and the flag it tested has to still be readable as a value.

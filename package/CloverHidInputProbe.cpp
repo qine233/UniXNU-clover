@@ -47,6 +47,16 @@ extern "C" IOService *native_hid_input_allocate(void);
 // which is what "the screen is actually being driven" means on this board.
 extern "C" volatile uint32_t native_legacy_transfer_calls;
 
+// Defined by drivers/CloverInput/CloverInput.cpp:241 and filled there slot by slot (the legend is the
+// comment above that line). Round260 reads it here because boot 47 proved the other half of round259
+// never arrived: the I2C instrument asked its question at t=12 s in 42 IOLog lines, the card keeps
+// the last 512 kernel rows, and that boot's window began at t=1194 s -- so a resumed instrument is
+// still an unread one. UniXNU-sheng does not have this problem because its drivers do not print:
+// package/TouchProbe.cpp:29 keeps `char native_touch_rows[4][120]` and package/BootLog.c re-composes
+// those rows onto the medium every 2 s, which makes an early reading permanent because it is state
+// rather than a line. The same rule applies here, with the state this driver already keeps.
+extern "C" volatile uint64_t clover_input_observation[16];
+
 extern "C" {
 // Touch inputs of NativeHidInput, with nothing behind them on this board yet.
 volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
@@ -276,6 +286,24 @@ extern "C" __attribute__((noinline)) void native_hid_live_checkpoint(IOService *
                clover_hid_published, clover_hid_property_seen, clover_hid_presses, clover_hid_requests,
                clover_hid_touch_frames, native_touch_hid_reports,
                clover_hid_sink_touch, clover_hid_sink_buttons, native_legacy_transfer_calls);
+        // Round260, and it is the whole point of this line: the touch bus instrument has its answer
+        // sixteen minutes into the boot and the card ring has forgotten it by the time anyone reads
+        // the card, so the answer is re-published from the state the driver already keeps. Every
+        // field here is a slot of clover_input_observation, which drivers/CloverInput fills in as it
+        // walks the bus -- nothing is recomputed and nothing is asked again, so the bus is still
+        // touched exactly once per boot and only the reading repeats. mode=0 is a reading too: it
+        // says the instrument never ran, which is the one thing a missing line cannot tell you.
+        printf("clover r260: bus mode=%llu map=%llx hw=%llx io=%llx op=%llx err=%llx status=%llx "
+               "state=%llx clk=%llx ack=%llx id=%llx,%llx xfers=%llu timeout=%llu nack=%llu "
+               "verdict=%lld\n",
+               (unsigned long long)clover_input_observation[0], (unsigned long long)clover_input_observation[1],
+               (unsigned long long)clover_input_observation[2], (unsigned long long)clover_input_observation[3],
+               (unsigned long long)clover_input_observation[4], (unsigned long long)clover_input_observation[5],
+               (unsigned long long)clover_input_observation[6], (unsigned long long)clover_input_observation[7],
+               (unsigned long long)clover_input_observation[8], (unsigned long long)clover_input_observation[9],
+               (unsigned long long)clover_input_observation[10], (unsigned long long)clover_input_observation[11],
+               (unsigned long long)clover_input_observation[12], (unsigned long long)clover_input_observation[13],
+               (unsigned long long)clover_input_observation[14], (long long)clover_input_observation[15]);
     }
 }
 

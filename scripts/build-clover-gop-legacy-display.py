@@ -360,6 +360,17 @@ require('_native_touch_seq' in contract and '_native_touch_xs' in contract,
 # and postModLoad. If objcopy ever stops globalizing it, the link has to say so here.
 require('__GLOBAL__sub_I_NativeHidInput.cpp' in owners,
         'the HID driver initializer is not global in this archive, so the probe cannot register it')
+# Round260: the beat reads the touch bus instrument's state, and that state lives in another archive
+# (libCloverInput.a defines _clover_input_observation; this one only references it). The kernel link
+# answers it, so nothing here can prove the reference resolves -- but a beat that prints sixteen zeros
+# reads as "the bus said nothing", which is exactly the ambiguity this round exists to remove. Name the
+# import, so a round that stops building CloverInput fails here instead of shipping a silent row.
+require('_clover_input_observation' in globals_of(hid_probe_obj)[1],
+        'the HID beat no longer imports drivers/CloverInput state: the I2C verdict would be unread, '
+        'because its 42 early lines are gone from the kernel ring long before the card is read')
+require('_clover_input_observation' not in owners,
+        '_clover_input_observation is defined by this archive and by libCloverInput.a: the kernel '
+        'link would fail on the duplicate, and only one of the two would be the bus instrument\'s own')
 
 sources = [ROOT / 'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp', ROOT / 'drivers/NativeMobileDisplay/NativeLegacyRequest.h',
            ROOT / 'drivers/NativeMobileDisplay/NativeGOPPresenter.cpp', ROOT / 'drivers/NativeMobileDisplay/NativeGOPWire.h',

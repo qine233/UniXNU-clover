@@ -983,7 +983,11 @@ def check_board(errors: list) -> str:
                 ('{ "clover r181: ", "r181-i2c", 24, 0, 0, 0 },',
                  "round259 puts the touch bus back in the boot, and an unbounded line type is a ring "
                  "that starts late -- the r254 lesson, applied before the producer is turned on rather "
-                 "than after it ate the budget")):
+                 "than after it ate the budget"),
+                ('{ "clover r260: bus", "r260-bus", 16, 0, 0, 0 },',
+                 "round260's re-published bus verdict would share the beat's budget, and the two are "
+                 "different questions -- one is what the panel answered, the other is what the device "
+                 "published")):
             if tee not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci gives round238's rows no tee class ({tee}): "
                               f"{why}")
@@ -1998,6 +2002,27 @@ def check_board(errors: list) -> str:
                 errors.append("package/CloverHidInputProbe.cpp does not make the synthetic frame "
                               "one-shot: a device that keeps producing fingers nobody moved is a fake "
                               "input source rather than an instrument")
+            # Round260, and this one is the reading round259 could not get. Boot 47 had the I2C
+            # instrument armed and running -- and came back with no `clover r181` line at all, because
+            # it spoke at t=12 s into a kernel ring that keeps the last 512 rows, and that boot's window
+            # began at t=1194 s. UniXNU-sheng does not have this failure because its drivers do not
+            # print: package/TouchProbe.cpp:29 keeps `char native_touch_rows[4][120]` and
+            # package/BootLog.c:340-356 re-composes those rows onto the medium every 2 s, so a reading
+            # is state and stays readable. CloverInput already keeps exactly that state --
+            # clover_input_observation[16], defined for the reason in its own comment -- and this file
+            # is now the composer that re-says it on every beat.
+            for needle in ('extern "C" volatile uint64_t clover_input_observation[16];',
+                           '"clover r260: bus mode=%llu map=%llx hw=%llx io=%llx op=%llx err=%llx status=%llx "',
+                           '"state=%llx clk=%llx ack=%llx id=%llx,%llx xfers=%llu timeout=%llu nack=%llu "',
+                           '"verdict=%lld\\n"'):
+                if needle not in probe_text:
+                    errors.append(f"package/CloverHidInputProbe.cpp lacks {needle[:56]!r}: the touch bus "
+                                  "verdict would again be a burst of early lines the ring throws away, "
+                                  "which is the reading round259 armed this instrument to get")
+            if probe_text.count("clover_input_observation[15]") != 1:
+                errors.append("package/CloverHidInputProbe.cpp does not carry the bus instrument's last "
+                              "verdict code on the beat exactly once: without it a row of zeros cannot be "
+                              "told from a probe that never ran")
             display_text = (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text()
             if not (0 <= display_text.find("clover_hid_input_probe();")
                     < display_text.find("IOService *display=pendingLegacyDisplay;")):
@@ -2013,6 +2038,8 @@ def check_board(errors: list) -> str:
                            "kits/clover/CloverHidInputProbe.cpp",
                            "ROOT / 'scripts/build-clover-hid-input.py'",
                            "'NativeHidInput.late': hid / 'NativeHidInput.late.o'",
+                           "'_native_touch_set_sink'",
+                           "'_clover_input_observation' in globals_of(hid_probe_obj)[1]",
                            "'_native_hid', '_native_touch'"):
                 if needle not in builder_text:
                     errors.append(f"scripts/build-clover-gop-legacy-display.py lacks {needle[:56]!r}: "
@@ -3085,8 +3112,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r259:"):
-        errors.append('[payload] title is not "clover r259: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r260:"):
+        errors.append('[payload] title is not "clover r260: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4138,8 +4165,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r259:"):
-        errors.append('[payload] title is not "clover r259: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r260:"):
+        errors.append('[payload] title is not "clover r260: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

@@ -19382,3 +19382,62 @@ NACK 才有意义。checker 那边把「parked」的老注释改掉，并加一�
 r251 回卷环、r252/r254 类预算上出现过三次，这次的形态是「上膛一个没预算的生产者」：总线如果说话，
 它就该有自己的名额，而不是和心跳抢那 16 个 per-pass 推送。
 
+
+## r259 读数（boot 47）：帧发出去了，总线的答案根本没回来——而且这两件事是同一个毛病
+
+死线到点（`clover r148: unattended deadline 1800 s`，boot 47），卡上一次读回 512 行内核日志、
+64 行驱动判据、20 行探针。读数只有两种，而且都指回这一轮自己：
+
+**① 合成帧成了。** 环里五条 beat（t=1218.79 / 1338.84 / 1458.84 / 1579.00 / 1698.40，正好 120 s 一格）
+全都写着同一句：
+
+```
+clover r255: beat stage=5 service=fffffff2f9cac500 Built-In=1 PrimaryUsagePage=1 PrimaryUsage=1
+  deviceBuiltIn=1 published=1 seen=1 presses=3 asks=741 touch=1 reports=2 sinks=1,1 transfer=8
+```
+
+`touch=1` 是这只仪器只发过一次；`reports=2` 是**驱动自己的** `native_touch_hid_reports`，在
+`handleReport` 返回之后才加一（`NativeHidInput.cpp:205`），所以它是「按下与抬手两笔报告都走完
+IOHIDDevice 的原实现」这个意思，不是我自己数的。`presses=3` 仍是 3 次 Home 放行，`asks` 从 741
+长到 1212——一节拍 118 次问、三次准，上限还在做事。这颗设备到这里和 sheng 的形状没有差别了：
+`DigitizerCollectionDispatch`、`Built-In`、usage page 0x0D、报告进栈，全都有读数。
+
+**② 两处死等一动没动。** 堆上那只组（pid 58 tid 0x398）从 t=1342 到 t=1796 一直是
+`base=145d08b30 b=fffffffd cnt=1 wait=1`，`bbchain` 每拍报同一只 block（`blk=145da6d90
+inv=100d43c44 ctl=145d79480 grp=145d08b30`）——一帧手指、三次 Home 之后，它等的还是同一个对象。
+栈上那两只（tid 0xeeb `base=16f170b4c`、tid 0xe78 `base=16fc44b4c`）都还 `b=1 ... wait=1`，而且
+`g=45dfede0` 相同：两只不同线程栈在等**同一只组**，这是 boot 47 新给的一条形状；同一拍还有一只
+`base=16fbbeb4c b=0 g=1 wait=0` 在等着别的（不是 group）。结论老实写下来：**一帧数字化仪报告不是
+释放 backboardd 的那把钥匙**。输入这一侧到此已经没有可抄的了——sheng 有的我们都有，且报得出去。
+
+**③ `clover r181` 一条都没有。** 这是本轮真正要记的东西。仪器是跑了的（`clover-input=3` 在场，
+`input-armed` 在镜像里，PMGR 尾位不变），它把答案说在 t≈12 s；而卡上这次读到的环从
+**t=1194.04** 起（第一条就是 `[ 1194.044589]`）。42 行 burst 全部在窗口之前，环只留最后 512 行。
+所以我花了一轮上膛的仪器，带回来的是「没有答案」，而不是「面板没答」——这两句话的区别就是这台
+板子做仪器做到现在最贵的一课。
+
+## 本项目第五次被同一件事咬到，这次咬的是时间不是量
+
+r249 是每轮推送上限、r251 是八槽回卷、r252/r254 是类预算（`misses total=153 shown=16`）、
+r256 是 verdict 迟到（t=25 s 说话、t=1208 s 起才有窗口）。r259 的形态是新的：**我给一个生产者加了
+预算，却没有给它加时间。** 预算管「说得太多」，管不了「说得太早」。
+
+r260 的修法不是再插一次心跳。心跳是我们自己的补丁，而 **sheng 根本没有这个问题**——它的驱动
+**不 print**：`package/TouchProbe.cpp:29` 留 `char native_touch_rows[4][120]`，
+`package/BootLog.c:340-356` 每 2 秒把这些行重新 compose 一遍写进卡；它的 Wi-Fi 甚至有一张
+512 行的 `native_wifi_text[512][112]`（`BootLog.c:96`），由同一个写手带持久游标增量排干
+（`BootLog.c:806`）。也就是说 sheng 的一条读数之所以活得久，不是因为说得好听，是因为它是**状态**。
+
+我们手上正好有这个状态：`drivers/CloverInput/CloverInput.cpp:241` 的
+`volatile uint64_t clover_input_observation[16]`，注释写得很清楚——「kept ... without depending on a
+log ring」，槽位是 mode / 失败的窗口 / HW_VERSION / IO_MODE / OPERATIONAL / ERROR / STATUS / STATE /
+CLK / 应答地址 / 两个身份字节 / 子传输数 / 超时数 / NACK 数 / 最后一步判据码。**它从来没被重新说过。**
+
+所以 r260 = beat 每拍补一条 `clover r260: bus mode=.. map=.. hw=.. ... verdict=..`，十六个槽照原样搬，
+不重算、不重跑——总线仍然一靴只碰一次，重复的只有读数。`mode=0` 也照样打印：一个没跑的仪器必须
+**说出来**，不能靠「那行不见了」来表达，那是这一整段故事反复教过的同一件事。给它自己的 tee 类
+`r260-bus`（预算 16；1800 s 死线放得下十五拍）。链接契约加在
+`scripts/build-clover-gop-legacy-display.py`：`_clover_input_observation` 必须是显示 archive 的
+**引用**而不是它的定义——它归 `libCloverInput.a`，静态核链接会答它；但如果 CloverInput 哪天不再构建，
+这条 beat 会打印十六个零并读成「总线没说话」，而那是假的判决。所以在这儿点名。
+

@@ -793,6 +793,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // address and at most one "rails unproven" verdict, so 24 is more than the burst can be, and the
   // cap keeps a bus that talks back from spending the boot's last 512 rows on itself.
   { "clover r181: ", "r181-i2c", 24, 0, 0, 0 },
+  // Round260 re-publishes the touch bus verdict from state on every beat, and this is the class that
+  // says how many times it was said. It is the reading that survived boot 47 when the burst above did
+  // not: the instrument spoke at t=12 s, the ring window on that boot began at t=1194 s, and the card
+  // came back with no answer at all. Fifteen beats fit the 1800 s deadline, so 16 bounds the same
+  // producer without cutting it short.
+  { "clover r260: bus", "r260-bus", 16, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
