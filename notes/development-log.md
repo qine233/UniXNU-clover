@@ -20306,3 +20306,50 @@ r265 的那套挪到它身上；**一颗都没命中** ⇒ 那份 srights 是 `c
 三帧分别念成 CalendarDatabase / CoreMotion / libauthinstall（同一条 datamigrator 的栈不可能同时在这三颗镜像里）。
 **结论：不要把任何一轮的答案压在「宿主解出这些帧」上。**要名字就往内核侧要（r269 这种「谁来 signal」的正面判据），
 或者干脆别问这一格。
+
+## r268 补（v0.6.50）：boot 55 那三条用户栈**解出来了**——我上一条「宿主解不出名字」是错的，撤回
+
+上一条读数里我写下「这批 r266 用户栈在宿主上永远解不出名字」，理由是两条：这颗缓存涂掉非导出符号名，
+以及 split cache 的地址表里有 32 MB 空洞、帧就落在洞里。**两条都是我自己算错换来的错结论**，
+现场逐条纠正：
+
+**① 空洞来自我把未滑动的地址表当成运行时地址表。** 缓存头里的 region 表是**未滑动**的（从 0x180000000
+起算，数据/链接编辑段之间留着洞），板子印出来的是**滑动后**的运行时地址。两者差一个每靴随机的 slide。
+r221 那行 `sbm2x pc=1d8880b58 poff=58880b58 c=<八个字>` 里，`poff` 是 `VME_OFFSET + (pc - vme_start)`，
+用它减出 0x180000000 是**恒等式**，不是「slide=0」的证据——我把一个定义式读成了测量值（同一类错的第五起）。
+
+**② slide 能从卡上唯一钉死，不用猜。** 把那八个指令字在解出的子档里做字节搜索：boot 55 命中两处
+（`.13` 与 `.23`）。每处命中给出「这堆字节未滑动地住在哪儿」，于是一个候选 slide = `pc - unslid`。
+`.13` 那个候选是 `0x2f44ff80`——**不是页对齐的**（iOS 的映射至少 0x4000 对齐），一颗缓存字节不可能同时
+映在两个地址，所以它被排除；`.23` 的 `0xd100000` 是页对齐的，四条 `sbm2x` 全部同意。
+**于是本靴 slide = 0xd100000，且这个数是板子给的、不是我调出来的。**
+
+**③ 帧名出来还需要修我自己写的两个小错**（都静默产出错答案，都已进 checker）：
+镜像表原来按 0x1000 步长扫魔数——**共享缓存的镜像头按 32 字节打包**，所以我只认出 825 个镜像，
+大多数帧被念成「不在任何镜像里」；改成 `blob.find(magic)` 逐命中后得 5000+ 个镜像。
+符号表原来写 `N_STAB = 0x0E`——mach-o 里 **stab 掩码是 0xE0、`N_SECT` 才是 0x0E**，
+写反的结果是把每一个定义符号都跳过去，符号名一格都不出。两处各修一次，输出立刻变成下表。
+
+**④ boot 55 三条栈的真实形状（`scripts/decode-clover-slide.py`，slide 由卡上 `sbm2x` 现推）**：
+`tid=0x360`（`cont=_ipc_mqueue_receive_continue`，`we=0`）——
+`_mach_msg2_internal` ← `_mach_msg_overwrite` ← `_mach_msg` ← CoreFoundation ← CoreFoundation ←
+**`_CFRunLoopRunSpecific`** ← Foundation ×2 ← libxpc ×3：**这就是主 runloop 线程在 XPC 里等一个回信**。
+`tid=0x36c`（等机器号那条，也是五条 workloop 等待的属主）——lr 与 frame0 和 frame5–frame9 **全在
+`/usr/lib/system/libdispatch.dylib`**（+0x4680、+0x4cdc、+0x61c9c、+0x62cc0、+0xa3f8、+0xae74、+0x14794），
+中间四帧（`0x100942d50` 等）在**主程序自己的映射**里（缓存外，本工具只管缓存）。
+所以「0x36c 睡在机器号上」的上一半是：**它是被 libdispatch 的 dispatch_semaphore 按住的**，
+调用者是 datamigrator 自己的代码。
+`tid=0x36d`（workloop 等待者）——libdispatch ×4 → 主程序 ×3 → **`DataMigration.framework` (+0x1838)**
+→ libxpc ×2 → libdispatch：**这条栈真的穿过 DataMigration 框架，并且正卡在一次 XPC 往返里。**
+
+**④bis 这个 slide 方法是自我交叉验证的。** boot 54 的 `tid=0x34d` 用自己的 `sbm2x` 推出 slide `0x1a018000`，
+boot 55 的 `tid=0x36c` 用另一批行推出 `0xd100000`——**两个独立算出的 slide 把两条栈解到同一串缓存地址上**
+（`0x18f558680`、`0x18f558cdc`、`0x18f5b5c9c`、`0x18f5b6cc0`、`0x18f55e3f8`、`0x18f55ee74`、`0x18f568794`，
+逐帧一字不差）。两靴的 pid 与 tid 都挪了、地址也全挪了，唯独减去各自 slide 之后重合——
+**这同时证明「slide 每靴随机」和「这套反推是对的」**，不是我在同一批数字上自圆其说。
+
+**⑤ 于是 r269 的问题更硬，也更值得问**：三条栈拼出的是「runloop 等 XPC 回信、XPC 的活儿要经 workloop、
+workloop 的属主 0x36c 被一只 dispatch_semaphore 按住、而那只机器号全系统只剩一份发送权」。
+**发送权在谁手里**仍然决定这是进程内自锁还是外头欠它一次 signal，且现在有了框架名可以对照读。
+主程序那几帧要命名得另找一块料：可执行文件自己也带 slide，卡上没有它的 `sbm2x`，下一版把
+`clover r221` 的取样点也挪到主程序一次，或者从 OS 卷里取出 `datamigrator` 本体再解。

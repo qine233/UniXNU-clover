@@ -3606,6 +3606,28 @@ def check_board(errors: list) -> str:
             errors.append("scripts/run-clover-unattended.sh has no %r: without the hop-and-count pair a "
                           "flash that never booted is indistinguishable from a boot that printed nothing"
                           % needle)
+    # Round268's second half: the shared-cache frame decoder, whose two constants decide whether it lies.
+    # Scanning image headers one per 0x1000 found 825 of the cache's images and reported most real frames as
+    # "in no image"; the cache packs headers every 32 bytes, so the scan has to find each magic occurrence.
+    # And N_STAB is the 0xE0 debug mask while N_SECT is 0x0E: written the other way round every defined
+    # symbol is skipped and no name is ever printed -- which is exactly the state that made the previous
+    # round conclude, wrongly, that these frames cannot be named on the host at all.
+    slide_tool = REPO / "scripts/decode-clover-slide.py"
+    if not slide_tool.is_file():
+        errors.append("scripts/decode-clover-slide.py is missing: without it the runtime frame addresses "
+                      "have no slide to unslide by, and the unslid region table answers them with holes")
+    else:
+        tool = slide_tool.read_text()
+        for needle in ("N_STAB = 0xE0", "N_SECT = 0x0E", "MH_MAGIC_BYTES",
+                       "cand % PAGE_ALIGN == 0", "refusing to name frames"):
+            if needle not in tool:
+                errors.append("scripts/decode-clover-slide.py has no %r: one byte-step, page-alignment test "
+                              "or symbol-classification rule is gone, and the tool answers with names it "
+                              "did not earn" % needle)
+        if "range(0, size - 32, PAGE_ALIGN)" in tool:
+            errors.append("scripts/decode-clover-slide.py scans cache headers one page at a time: the "
+                          "shared cache packs them every 32 bytes, so most images go unseen and frames "
+                          "that are in the cache get reported as outside it")
     # Round170. The r169 frame had no panic, no EIO and no signature refusal left: what it had was
     # dyld's check_np line three times per process until the console ran out, and nothing at all
     # about the processes themselves. A child's exit is silent by design -- only critical processes
