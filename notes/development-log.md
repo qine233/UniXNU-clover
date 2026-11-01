@@ -18930,3 +18930,57 @@ OSBundleLibraries  = kpi.{bsd,libkern,mach,iokit,unsupported,private}
 ① 它 `handleStart` 需要 `button-names` 才谈得上实例化任何按键（缺席时最坏是「一个都不建」，
 不会比现在更空）；② 它一 fail 就打印那几条 `handleStart failed to …`，本板的 tee 抓
 `clover r253:` 之外也要照常把内核日志带上卡——那些行直接告我们它读到了什么。
+
+## 宿主第二击：那次 `leave` 是 ButtonResolver 的 completion block，而它的接口工厂看的就是 `home-button-type` 的**值**
+
+（`backboardd` 与 `ButtonResolver.framework` 的指令级读数；`.37` 片 VM = 文件偏移 + `0x2003b0000`。）
+
+**1. `0x100030ca8` 不是方法，是一个栈上 block。** `-[BKButtonHapticsController init]`（`0x10002e8c4`）
+里 `0x10002e8fc adr x8,#0x100030c7c` + `0x10002e904 adr x9,#0x1000e4698` 组出 `__NSConcreteStackBlock`，
+`x0 = self->_BRController`（`0x10002e8cc ldr x22,[x20,#0x28]`），
+`x2 = dispatch_get_global_queue(0x15,0)`，然后 `0x10002e928 bl 0x1000a2120` →
+**`objc_msgSend$scheduleReadyNotificationOnDispatchQueue:withBlock:`**。ivar 类型串直接给出类型：
+`0x1000b412e` = `T@"BRButtonResolverController",&,N,V_BRController`；
+`0x1000b2b8e` = `T@"NSObject<OS_dispatch_group>",&,N,V_controllerReadyGroup`。
+block 体里 `0x100030cb4 objc_msgSend$maxAssetSlots` 就是那句
+`_BRController ready: device haptic asset slot count:%d` 的来源。
+
+**2. 这一支要更正我 40 分钟前写下的话。** 同一个 `init` 里还有
+`0x10002e944 objc_msgSend$homeButtonType` → `0x10002e950 cmp x23,#2` → `0x10002e954 b.ne 0x10002e98c`，
+而**`==2` 落到的那一侧**（`0x10002e980`）正是 `_configureAsyncWithBlock:`——它的排队块 `0x100030c44`
+就是那个无限 `dispatch_group_wait`。也就是说：**我们 ADT 里的 2，本身就是投下这次死等的那一支**。
+（这是同一函数上的第三次改判：r242 说 ==2 只记日志、r245 反向、这一轮给了地址级证据又翻回去。
+所以这条只能当「当前最优解释」，不能当定论；能立刻验它的办法只有一个——把值换掉看死等是否消失。）
+
+**3. 更硬的一条在 ButtonResolver 里，而且它不依赖上面那次方向判断。**
+`-[BRInterfaceAOP _findService]`（`0x200fc61a4`）要 `serviceAvailable` 且
+`maxNumberOfSlots >= 1`；而接口工厂 `0x200fc45cc` 读的是 CFString `0x229b90d70` =
+**`JwLB44/jEB8aFDpXQ16Tuw`**——这正是 `-[BSPlatform homeButtonType]` 那次 once 块里
+`MGGetSInt32Answer` 用的同一个键（r245 记过）。它的分支是：
+
+- `0x200fc45f8 cmp w0,#1`：**等于 1** ⇒ `initWithFastHaptics:NO`，AOP 接口建出来；
+- **不等于 1**（我们现在是 2）⇒ 还要另一个混淆键（blob `0x200fcca98`/`0x200fccabc`，
+  字 `0xEBE7F0D8`/`0x1AE169F0`，`bl 0x207203994`）**非零**，否则 **AOP = nil**——
+  基类 `-[BRInterface scheduleReadyNotificationWithBlock:]`（`0x200fca238`）是**光一个 `ret`**，
+  只有子类会通知。接口集合本身是 `[BRInterfaceLegacy, BRInterfaceKeyboard, BRInterfaceAOP?]`
+  （`0x200fca150`，AOP 只在非 nil 时进表 `0x200fca19c cbz`）。
+
+**4. 它到底在找什么服务**：`0x200fc6438/440/448 csel` 按 `_fastHaptics` 二选一 →
+**`AppleSPUHapticsAudioDriver`** 或 **`AppleSPUButtonDriver`**，再读属性 **`IOServiceMatched`**
+（`0x200fc6468`），`AOPMatchedCallback`（`0x200fc64a8`）→ `setService:`/`setConnect:`/
+`updateReadyState`（`0x200fc6668`）。Legacy/HID 那条线用的匹配键是
+`PrimaryUsagePage`、`PrimaryUsage`、`Built-In`、**`PressCountUsagePairs`**（`0x200fc8914`）、
+`DeviceUsagePage`/`DeviceUsage`；日志 subsystem `com.apple.ButtonResolver`。
+
+**为什么 r253 不但不作废、反而更该做**：`PressCountUsagePairs` 这个词我们在同一个位置见过两次——
+AppleM68Buttons 自己的串表里就有 `press-count-usage-pairs`/`PressCountUsagePairs`。也就是说
+ButtonResolver 的 Legacy 线在找一个「由按键驱动发布的 HID 服务」，而**那个驱动正是本板内核里
+从来没有过的 AppleM68Buttons**。r253 把它接进 prelink 之后，才有资格谈 ready。
+
+**下一轮（r254）的候选，按代价排序**：① 把 `home-button-type` 从 2 改成 1——iPad7,1 是有 Touch ID
+主页键的机型，2 本来就是我们从 r240 起一路猜来的值，而 1 是 ButtonResolver 唯一**不需要第二个
+混淆键**就能建出 AOP 接口的值；② 若 ready 仍不来，按 `updateReadyState`/`IOServiceMatched` 这两处
+在板上点名（`clover r254:` 记 IOKit 类名与属性存在性），或者直接补一个能 `IOServiceOpen` 的
+SPU 形状驱动；③ 那个未解的第二个混淆键（`0x207203994` 的 import 名在两片子镜像里都找不到）
+标 **UNVERIFIED**，别当已知。`maxAssetSlots` 不是注册表属性，来自 `maxNumberOfSlots`，
+所以别指望从 ADT 里喂它。
