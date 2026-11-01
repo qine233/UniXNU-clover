@@ -130,6 +130,11 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
   每进程一行计数。真正剩下来的一句话是：**用户态拿到 2，backboardd 却还在 `!=2` 那一支死等**——
   要么 MG 的值不来自这块注册表，要么 r242 那条分支语义又钉反了，先在共享缓存里查清再决定动谁。
 
+> 仪器自己还剩一次复发要修：boot 40 上 `r252-mgq` 的 64 行类预算被吃满（`capped at 64`，
+> `row 12/15` 也被截断），因为 miss 与 row 既当场出声又在 census 里重发一遍。下次把 live 打印
+> 只留给 miss、row 交给 census 那一批，并把预算提到 128。这是同一个毛病第三次出现——
+> r249 的推送上限、r251 的回卷环、r252 的类预算。
+
 
 每一轮的设计、构建与真机读数（含本节的证据出处）都在
 [`notes/development-log.md`](notes/development-log.md) 里逐轮可查；
@@ -139,7 +144,7 @@ r236–r239 是把这条链读出来的四轮。
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点是 `-[BKButtonHapticsController …]` 里那句 `dispatch_group_wait(_controllerReadyGroup,-1)`（boot 38 仍 `base=100c7c920 b=fffffffd cnt=1 wait=1`）。宿主已把它读到底：`applyDefinitions:` 是 `cmp x22,#2` / `b.ne`，`==2` 只打一行日志就返回；**但 `_configureAsync/SyncWithBlock:` 两处含同样的无限 wait，且一次都不问 `homeButtonType`**。唯一的 `leave` 在 `0x100030ca8`，紧挨 `_BRController ready: device haptic asset slot count:%d`。MG 侧取值只有 IORegistry 一条路（`IODeviceTree:/buttons` + `IORegistryEntryCreateCFProperty`，读不到返回 0，没有 sysctl 后路），而 boot 38 实测用户态读到的就是 `2` | 缺的不是「一个更对的 home 键编号」，是**那个会报 `_BRController ready:` 的控制器**——开工方向是 sheng 的 HID home 提供者（`build-native-hid-input.py` 进 `[kernel] archives`、`NativeHidInput.late.o` + `hid-original-bindings.o` 并进 clover 显示归档、`package/CloverHidInputProbe.cpp` 由 CloverPMGR 调用，boot args `offline-hid-input=1 offline-hid-home=1`）。boot 39（r251 的 24 行环 + 每进程计数）只决定以哪句证据开工：`who` 里有 pid 58 且 `key>0` ⇒ 它问过也拿到 2，死等与编号无关；没有 58 ⇒ 它从不问，同一条结论换一种证法。另两处已在本轮更正：r245 说「`home-button-type` 无直接代码引用、`0x1a02113dc` 不是 /buttons helper」不成立（r242 是对的）；`bl 0x52aa38` 也不是 sysctl，是 once 缓存的全局 int `0x1f4890ac8` |
+| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 死等点是 `-[BKButtonHapticsController init]` 交给 ButtonResolver 的一个栈上 block 里的 `dispatch_group_wait(_controllerReadyGroup,-1)`（唯一 `leave` 在 `0x100030ca8`，紧挨 `_BRController ready: device haptic asset slot count:%d`）。板上已排除：boot 39/40 两次实测 `who pid=58 comm=backboardd path=3 key=3`，backboardd 自己把 `home-button-type` 读回 **2**；ADT 节点可达、值正确。宿主已排除：`function-button_halleffect` 不是 MG 的键，是 AppleM68Buttons 用 `function-button_%s` 拼的。真凶形态：`/buttons` 有 provider（`svc buttons`）但**十六轮以来没有 child**——`com.apple.driver.AppleM68Buttons` 不在 `[kernel.prelink] roots`（stock kernelcache 4 次命中，我们 0 次），而对照组 sheng 除了同值 2 之外还有 `ShengHidInput`。boot 40 的缺席清单另有 153 条，前 16 条全是 SpringBoard 问 `product-id`/`platform-name`/`soc-generation`/`/product/camera`，**没有一条在按键路上** | r253 只做一件事：把那行 root 加上（它两个非 KPI 依赖本来就在根里），让 Apple 自己的驱动去 match 我们发布的节点。boot 41 的读法：`svc` 点名里出不出 `AppleM68Buttons`、`button-family=` 变不变、backboardd 的 `bbgrp` 还等不等。若仍等，下一刀是对照组已验证过的 `drivers/NativeHidInput` 接线（`NativeHidInput.late.o` + `hid-original-bindings.o` 已在 `build/native-hid-input/` 通过资格校验，未接入），**不改 `home-button-type` 的值** |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 3），再问地址 |
 | 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |
