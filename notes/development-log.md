@@ -19302,3 +19302,18 @@ base=16f01bb4c b=1 g=27d22ec0 cnt=0 wait=1`，栈地址 0x16f…）。两件事�
 顺带把一条我自己的想法枪毙掉：sheng 整个仓库里没有 `haptics`/`taptic`/`vibra` 任何一个词，
 也没有 `soc-generation`/`product-id`/`is-muse` 这类 MG 身份键——它一个都不发也照样到桌面。
 所以「补 `/product/haptics`」「补 ADT 身份表」这两条候选都不是必要条件，r258 不再往那个方向花轮次。
+
+### 落盘前先撤回一句：那个「堆上的第二个等待者」很可能是仪器认错了对象
+
+同一次读档里顺手核了 `bbobj` 给的 `isa`：把 `0x204e74bf0` 用 `scripts/decode-clover-cache-offset.py`
+落进共享缓存，它落在 **ScreenTimeSettingsUI.framework 的 __TEXT**（text 0x204e42000+0x142000，
+函数起点 0x204e74bcc 内 +0x24）。一个 dispatch 对象的第一个字应该是**类指针**（在 `__DATA_CONST`
+一类的数据段里），不可能是另一个框架代码段中间的地址；而栈上那两个组的 `isa` 读到 0，正是因为
+`_dispatch_group_wait` 用的栈对象没有头。所以 `base=127d7a9e0` 这个「堆上的组」大概率根本
+不是组——r239 把一个我们误判了类型的地址按 dispatch_group 的字段布局解出了 `b/g/cnt/wait/notif/nh/nt`。
+上一段里「两个等待者、不是一个」那句话请按此作废：**只有一个被证实在等的东西，就是 r239 一直在读的那个**，
+而它对按键是否必要也还没有独立证据（r257 之后 boot 45 仍 `wait=1`，这一点是真的）。
+
+r258 因此不做新论断，只做一件事：把这条线程真正卡住的那个地址的**前 8 个字原样打出来**，并把 r238
+已经抓到的 ulock（`a=20527f68c w=1 b=1 k=1 s=1 wr=0 sw=0 op=1000002 st=428 age=1303 cw=ffffffff`）
+的**持有者线程**读出来。先确认对象是什么，再谈谁欠它一次 leave。
