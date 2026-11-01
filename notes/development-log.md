@@ -19441,3 +19441,86 @@ CLK / 应答地址 / 两个身份字节 / 子传输数 / 超时数 / NACK 数 / 
 **引用**而不是它的定义——它归 `libCloverInput.a`，静态核链接会答它；但如果 CloverInput 哪天不再构建，
 这条 beat 会打印十六个零并读成「总线没说话」，而那是假的判决。所以在这儿点名。
 
+
+## r260 读数（boot 48）：判据活下来了，答案就是 r183 那一句
+
+四条 beat（t=1338 / 1459 / 1578 / 1698）每拍都带回同一行：
+
+```
+clover r260: bus mode=3 map=0 hw=20070000 io=c0a5 op=90 err=0 status=10000c8 state=1d
+  clk=315 ack=0 id=0,0 xfers=4 timeout=0 nack=4 verdict=102
+```
+
+这正是 r183 那 42 行 burst 的压缩版：控制器驱动得起来（`io`/`op`/`clk`/`state` 都是活值），
+两个候选地址四笔子传输**全部 NACK**，一次超时都没有，`verdict=102` = 「电气通、器件不应答」。
+r259 读不到的东西这次每拍都读得到——把读数从「一行打印」改成「一份每拍重述的状态」
+兑现了它的承诺。触摸这一支的答案就此钉死：面板/触摸控制器要么没上电、要么根本不在总线上；
+下一步不在 I2C 层，在电源层（README 表里的依赖 3）。
+
+输入侧形状照旧（`touch=1 reports=2`、`presses=3`、`sinks=1,1`），两处等待也照旧：
+堆上那只组 `base=15bd8e6a0 b=fffffffd cnt=1 wait=1 notif=0` 从 t=1239 到 t=1803 一字未动；
+r238 按名字匹配的那条 ulock 行同拍报 `a=15bd8e6d4 w=1 b=1 k=0 s=0 wr=0 sw=0 op=1000001
+st=461 age=877 cw=0` ——组基址 +0x34 正是它睡的那个字，从 t≈461 起没有任何写手（`wr=0`）、
+没有任何唤醒（`cw=0`）。
+
+## r261 宿主取证：抱着这只组不放的那条线程，栈在 backboardd 自己的触控事件管线里
+
+不动板子，把 boot 48 带回的读数在宿主上解到底。四步，每步都用可复核的工具，不猜：
+
+**① 等待者是 backboardd，判据是名字不是 pid。** r238 的 hook 用
+`strncmp(comm, "backboardd")` 匹配调用进程，所以 `ulock_wait2(UL_COMPARE_AND_WAIT|ULF_NO_ERRNO,
+15bd8e6d4, …)` 这一条是 backboardd 自己发起的，睡在组基址 +0x34 的字上。
+r229 的采样器在自己函数里做 `proc_find(pid)→proc_task→queue_iterate(&task->threads)`，
+所以 `bbwait`/`bbustk` 报的每一行都是 pid 58 的真实线程（这条怀疑过，现在结掉）。
+
+**② 十帧用户栈解到具名框架。** boot 48 的 `bbustk` 给
+`lr=195b38a80`、帧 `195b38e40 · 100b4ec64 · 195b95c9c · 195b96cc0 · 195b3e3f8 · 195b3ee74 ·
+195b48794 · 195b480a8 · 1e3c02534 · 1e3bffccc`。用 `scripts/decode-clover-cache-offset.py` 逐条落到
+子缓存 `.07` 的 `libVFXCore.dylib`（VFX.framework，text 0x1952db000+0xa1b000）与
+`.31` 的 `VisualLogger.framework`。也就是说：这条线程从 VisualLogger 进 libVFXCore，
+libVFXCore 又回调进 backboardd 自己的二进制，再从这里进 libVFXCore 并睡下。
+
+**③ backboardd 那帧落在触控事件管线上，选择器和类都从链式修复里解出来。**
+二进制脱了本地符号（`nm` 只剩 `__mh_execute_header`），但 `__objc_stubs`（0x100097d40+0xece0）
+里的选择器桩、`__objc_selrefs`、`__objc_classrefs` 全都带 chained fixups。
+用 lldb 把桩反汇编成 `adrp x1 → ldr x1,[selref] → br objc_msgSend`，再取 selref 低 36 位落回
+`__objc_methname`（`__TEXT` fileoff 0，偏移即虚拟地址减 0x100000000）读到字符串：
+调用点 0xec18=`bs_filter:`、0xec3c=`count`、**0xec68=`descriptionForRootObject:`**、
+0xeba0=`_thread_displayLinkFired`、0xeba8/0xeacc=`removeAllObjects`。
+0xec60 载入的类引用 `0x1000ef170` 是本地 rebase，顺着 class 结构（data 位取低 36 位）
+解到 `class_ro` 的名字串：**`BKTouchHitTestContextMap`**。
+函数归属用 `xcrun dyld_info -objc` 的完整方法表按 IMP 地址排序查：
+0xe7d4 在 `-[BKHIDDirectTouchEventProcessor _queue_enumerateDigitizersForDisplay:usingBlock:]` 里，
+0xebc4 那段 C 辅助函数紧接在 `-[BKTouchDeliveryObservationManager _queue_postPendingUpdates]` 之后，
+它的 os_log 字面量是 `canceling paths %{public}@ -- %{public}@ (ts:%{public}@)`，前面就是
+`_BKLogTouchEvents`。所以栈上那帧的语义是：**取消触控路径时的描述/日志序列化**。
+
+**④ slide 还剩 4 字节的账没结，但结论不依赖它。** 那两帧（栈帧与 `bbchain` 的 `inv`）
+= 0x100b4ec64/0x100b4ec44。若 backboardd 载入基址是 0x100b40000，它们分别落在
+`mov x2, x27` 与 `bl _BKLogTouchEvents`——都不是返回地址（返回应是 +0xec6c/+0xec48）；
+若是 0x100b44000，它们正好是 `-[BKHIDDirectTouchEventProcessor processEvent:sender:dispatcher:]` 里
+`bl _objc_retain_x20`（0xac60）与 `bl <objc 桩>`（0xac40）的返回地址。两种读法都落在
+**backboardd 的 HID/触控事件处理**里，差别只是同一个函数族的哪一处；
+而 `inv` 那条本来就撞上 r257 记过的同一类错（读到的槽位是陈的/类型认错），所以不建在它上面。
+16K 对齐的 slide 无法由这两条独立确定——留作下一条读数，不当结论用。
+
+**这条线与 r251 的触感故事不再是一回事。** boot 45（r257/r258）同一只堆上的组，
+等待线程的十帧解到的是 AssistantServices 与 Home.framework；boot 48 解到的是
+libVFXCore/VisualLogger/backboardd 触控路径。堆地址每靴都换（127d7a9e0 → 145d08b30 → 15bd8e6a0），
+无法跨靴对同一对象，但**账本形状一模一样**（`b=fffffffd cnt=1 wait=1 notif=0`，从开机早期一路到死线）。
+也就是说：这是一个**线程身份随队列复用而变、组却始终不放**的等待——
+「谁的栈」不是可钉的常量，「谁该 leave」才是这个移植真正要回答的问题。
+
+**先查 sheng 的结论（这一轮的规矩）。** sheng 树里 `vfx`/`VisualLogger`/`descriptionForRootObject`
+一个都没有，也没有任何「跳过 VFX」的开关；它的 porting.toml `gpu` 区写死了它到桌面靠什么：
+组件 `Adreno740`+`AdrenoMetal`+`AirNir`+`Sm8550Platform`+`AdrenoPM4`+`AdrenoFirmware`+`ArmSmmu4K`，
+并且「空闲桌面每 250 ms 提交 6 个命令缓冲（120 Hz）」、「render server 预热整套镜像的 162 个
+Metal 库」。本板的 `gpu` 区仍是 `status = "planned"`、`limits = ["No GPU driver, firmware or
+renderer is present."]`。libVFXCore 是渲染/特效侧的框架，它 enter 的组要等一次渲染侧完成才 leave——
+在没有任何 GPU 的板子上，这就是那句「永远不会来的完成」。
+两条分支还分得开：**(a) 等的是 Metal/IOGPU 的渲染完成**（那就是 GPU 区，抄 sheng 的结构、
+换 Adreno 512 的 ISA）；**(b) 等的是 backboardd 自己另一条被卡住的队列**（比如压在触摸传输上）。
+r262 就答这一刀：不再只报 `TH_WAIT` 的线程，而是每拍把 pid 58 的**全部**线程连同
+(tid, state, pc, lr, 内核栈前几帧, 睡在哪个字) 一起报出去——形状照 sheng 的
+`BootUiTraceProbe`（跨任务用原生 XNU VM API 读、热线程按上下文切换率与运行时间称出、
+`peer` 指明等谁）。哪个线程本该跑那笔 leave、它此刻睡在哪，一读数就能分岔。

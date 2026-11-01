@@ -162,6 +162,42 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 > 仍在 `r255-hid` 的 32 行预算内），让任何一段晚窗口必然带着它。同一类毛病四次出现的地方都记着：
 > r249 的推送上限、r251 的回卷环、r252/r254 的类预算、r255 的时间窗——一台仪器的输出通道就是它的上限。
 
+* boot 48（r260 实机）把「答案回不来」这条结掉了：四条 beat（t=1338/1459/1578/1698）每拍都带回
+  `clover r260: bus mode=3 map=0 hw=20070000 io=c0a5 op=90 err=0 status=10000c8 state=1d clk=315
+  ack=0 id=0,0 xfers=4 timeout=0 nack=4 verdict=102`——就是 r183 那 42 行 burst 的压缩版：
+  控制器驱动得起来，两个候选地址四笔子传输**全 NACK**，零超时。触摸的答案就此钉死：
+  不在 I2C 层，在电源层。同一拍两处等待照旧。
+* r261 不动板子，把 boot 48 的读数在宿主上解到底，四步都可复核：
+  ① r238 的 hook 按 `strncmp(comm,"backboardd")` 匹配，所以那条 `ulock_wait2(COMPARE_AND_WAIT|NO_ERRNO,
+  15bd8e6d4)` 是 backboardd 自己发起的（组基址 +0x34，`wr=0` 从未被写、`cw=0` 从未被唤醒，age=877）；
+  ② `bbustk` 十帧用缓存解码器落到 `libVFXCore.dylib`（VFX.framework，子缓存 .07）与
+  `VisualLogger.framework`（.31）——线程从 VisualLogger 进 libVFXCore，libVFXCore 回调进 backboardd
+  自己的二进制，再从那里进 libVFXCore 睡下；③ backboardd 脱了本地符号，但 `__objc_stubs` 的桩、
+  `__objc_selrefs`、`__objc_classrefs` 都带 chained fixups：lldb 反汇编桩取 selref 低 36 位落回
+  `__objc_methname` 读到 `bs_filter:`/`count`/**`descriptionForRootObject:`**/`removeAllObjects`，
+  类引用顺 class 结构解到 **`BKTouchHitTestContextMap`**，函数归属由 `dyld_info -objc` 的方法表按
+  IMP 排序查得：调用它的 0xe7d4 在
+  `-[BKHIDDirectTouchEventProcessor _queue_enumerateDigitizersForDisplay:usingBlock:]` 里，那段 C 辅助
+  函数紧接 `-[BKTouchDeliveryObservationManager _queue_postPendingUpdates]`，它的 os_log 字面量是
+  `canceling paths %{public}@ -- %{public}@ (ts:%{public}@)`，前面就是 `_BKLogTouchEvents`；
+  ④ 还剩一笔账没结：那两帧与 `bbchain` 的 `inv` 在 slide=0x100b40000 下落在
+  `mov x2, x27`/`bl _BKLogTouchEvents`（不是返回地址），在 0x100b44000 下正好是
+  `-[BKHIDDirectTouchEventProcessor processEvent:sender:dispatcher:]` 里两处 `bl` 的返回地址——
+  两种读法都在 backboardd 的触控事件管线内，结论不依赖它，`inv` 那条撞上的是 r257 记过的同一类错。
+* 于是一条旧论断要更正：把这只组说成「触感初始化欠一次 leave」不再成立。等待线程的栈随靴变化
+  （boot 45 = AssistantServices/Home.framework，boot 48 = libVFXCore/VisualLogger/backboardd 触控路径），
+  堆地址也每靴不同（127d7a9e0→145d08b30→15bd8e6a0），**不变的只有账本形状**
+  （`b=fffffffd cnt=1 wait=1 notif=0` 从开机早期一路到死线）。可钉的从来不是「谁的栈」，
+  而是「谁该 leave」。
+* 先查 sheng：它树里 `vfx`/`VisualLogger`/`descriptionForRootObject` 一个都没有，也没有任何跳过 VFX
+  的开关；它到桌面靠的是 `gpu` 区那一整套（`Adreno740`+`AdrenoMetal`+`AirNir`+`Sm8550Platform`+
+  `AdrenoPM4`+`AdrenoFirmware`+`ArmSmmu4K`，「空闲桌面每 250 ms 提交 6 个命令缓冲」，
+  「render server 预热镜像里 162 个 Metal 库」）。本板 `gpu` 仍是 `planned`、
+  `limits = ["No GPU driver, firmware or renderer is present."]`。所以剩下两条分支：**等的是
+  Metal/IOGPU 的渲染完成**（GPU 区），还是**等的是 backboardd 自家另一条被卡住的队列**。
+  r262 用一条读数分岔：照 sheng 的 `BootUiTraceProbe` 的形状（跨任务用原生 XNU VM API、
+  热线程按上下文切换率与运行时间称出、报出 `peer`），每拍把 pid 58 的**全部**线程连同
+  (tid, state, pc, lr, 内核栈前几帧, 睡在哪个字) 报出去。
 
 每一轮的设计、构建与真机读数（含本节的证据出处）都在
 [`notes/development-log.md`](notes/development-log.md) 里逐轮可查；
@@ -171,12 +207,24 @@ r236–r239 是把这条链读出来的四轮。
 
 | # | 缺口 | 现状（真机读数） | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 十六轮的结论到 r254 为止是「缺一个发布 HID 按键的驱动」，r255–r257 把这一半**做完并测到了**：boot 43 的 census 多出 `IOHIDInterface`/`IOHIDEventDriver`/`IOHIDEventServiceUserClient`（`button-family` 2→5、`svc total` 122→128，全程不 panic）；boot 44 的 beat 是 `stage=5`、事件驱动已匹配、`transfer=8` 而 `published=0`，卡点是探针自己从 sheng 抄来的 Built-In 守卫（`NativeHidInput.cpp:296` 只在触摸设备上设 `Built-In`，按键设备永远没有，守卫永远为假）；r257 把守卫降级成读数（`deviceBuiltIn=0`）后，boot 45 读到 `Built-In=1 PrimaryUsagePage=1 PrimaryUsage=1 published=1 seen=1`，r252 缺席表从 288 条 32 个名字掉到 188 条 26 个，消失的七个全是 HID 形状的属性（`Built-In`/`DisplayIntegrated`/`HIDVirtualDevice`/`StandardType`/`CapsLockLanguageSwitch`/`KeyboardLanguage`/`AppleBluetoothRemote`），只多出更深层才会问的 `Manufacturer`——用户态确实在遍历我们那颗设备。桌面仍然没来，而且 boot 45 的栈推翻了一个旧论断：仍 `wait=1` 的主线程（tid 0x3fe，堆上的组 `base=127d7a9e0 b=fffffffd cnt=1 wait=1`）十帧用户栈全在 **AssistantServices**、等待点在 **Home.framework**，与按键无关；r239 那句「唯一 leave 在 `0x100030ca8`，挨着 `_BRController ready: device haptic asset slot count`」对应的是**另一个**栈上的组（`tid 0xec7 base=16f01bb4c b=1 g=27d22ec0 wait=1`），它也还在等。所以缺口是**两个等待者**，不是一个。（**这句在落盘时被自己撤回**：`isa=0x204e74bf0` 落进共享缓存是 ScreenTimeSettingsUI 的 **__TEXT**，不是类指针——那个「堆上的组」多半是 r239 把类型认错后按 dispatch_group 布局解出来的，所以不能算第二个等待者；能确认的只有「r257 之后 boot 45 仍 `wait=1`」。r258 先把那个地址的原样八个字与 ulock 持有者读出来。）一条候选已被 sheng 枪毙：它仓库里 `haptics`/`taptic`/`vibra` 与 `soc-generation`/`product-id`/`is-muse` 一个都没有，不发这些也到桌面 | r258 不猜名字，改读对象：对这两个组分别做 r239 对栈上那个组做过的取证（谁 alloc、`b=` 的 dq 链表、谁在等、谁该 leave），判 AssistantServices/Home 这条线程是不是第二个独立缺口。**不改 `home-button-type`，也不补 `/product/haptics` 或 ADT 身份表** r259 把这条线上最后一格形状补掉并同飞硬件问路：beat 现在通过驱动自己的通知发**一帧**合成数字化仪报告（中心点 15240/10160 = 驱动的轴上限 30480×20320，`NativeHidInput.cpp:167`；按下→50 ms→抬手，seqlock 与 `touchSend` 都是驱动自己的，探针只写它公开的六个符号；一次性，所以读法是 beat 上的 `touch=1 reports=2`——按下与抬手都进了 HID 栈），同一趟把 r184 停掉的 `clover-input=3` 放回 boot-args 并给它单独的 tee 类 `r181-i2c`（预算 24），因为合成坐标的可信度正好要靠「面板到底 ACK 不 ACK」来定：轨仍未证（r183 四帧全 NACK），NACK 在这里仍是有效答案。**r259 把这条差异填平了，并且证否了它**：boot 47 五条 beat 全读 `touch=1 reports=2`（`reports` 是驱动 `handleReport` 返回后才加一的自有计数，所以按下与抬手两笔都走完 IOHIDDevice 原实现），`presses=3` 上限仍在做事；而堆上那只组照旧 `base=145d08b30 b=fffffffd cnt=1 wait=1` 从 t=1342 到 t=1796，`bbchain` 每拍报同一只 block。**一帧数字化仪报告不是释放 backboardd 的钥匙。**新的形状读数：tid 0xeeb 与 0xe78 两只不同线程栈的 `g=45dfede0` 相同——两只线程在等同一只组；另有一只 `b=0 g=1 wait=0` 等的不是 group。输入侧已经没有可抄 sheng 的了。|
-| 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 3），再问地址  r259 不等轨先把地址再问一遍（`clover-input=3` 回膛），理由是同一趟正在发合成手指，需要知道总线上到底有没有真坐标 || 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨  **boot 47 的教训不是「面板没答」，是「答案回不来」**：仪器跑了，42 行说在 t≈12 s，而环这次从 t=1194.04 起——r260 不再插第二次心跳，改抄 sheng 的机制：`drivers/CloverInput/CloverInput.cpp:241` 的 `clover_input_observation[16]`（自 r181 就为「不依赖日志环」而存在）由 beat 每拍重述成一条 `clover r260: bus mode=.. … verdict=..`，总线仍一靴只碰一次；sheng 的驱动根本不 print（`TouchProbe.cpp:29` 的行数组 + `BootLog.c:340-356` 每 2 秒 compose），所以它的早期读数活得下来，因为那是状态。`mode=0` 也打印——没跑过必须说出来。|
+| 1 | **backboardd 不回 SpringBoard 的信**（上节详述） | 十六轮的结论到 r254 为止是「缺一个发布 HID 按键的驱动」，r255–r257 把这一半**做完并测到了**：boot 43 的 census 多出 `IOHIDInterface`/`IOHIDEventDriver`/`IOHIDEventServiceUserClient`（`button-family` 2→5、`svc total` 122→128，全程不 panic）；boot 44 的 beat 是 `stage=5`、事件驱动已匹配、`transfer=8` 而 `published=0`，卡点是探针自己从 sheng 抄来的 Built-In 守卫（`NativeHidInput.cpp:296` 只在触摸设备上设 `Built-In`，按键设备永远没有，守卫永远为假）；r257 把守卫降级成读数（`deviceBuiltIn=0`）后，boot 45 读到 `Built-In=1 PrimaryUsagePage=1 PrimaryUsage=1 published=1 seen=1`，r252 缺席表从 288 条 32 个名字掉到 188 条 26 个，消失的七个全是 HID 形状的属性（`Built-In`/`DisplayIntegrated`/`HIDVirtualDevice`/`StandardType`/`CapsLockLanguageSwitch`/`KeyboardLanguage`/`AppleBluetoothRemote`），只多出更深层才会问的 `Manufacturer`——用户态确实在遍历我们那颗设备。桌面仍然没来，而且 boot 45 的栈推翻了一个旧论断：仍 `wait=1` 的主线程（tid 0x3fe，堆上的组 `base=127d7a9e0 b=fffffffd cnt=1 wait=1`）十帧用户栈全在 **AssistantServices**、等待点在 **Home.framework**，与按键无关；r239 那句「唯一 leave 在 `0x100030ca8`，挨着 `_BRController ready: device haptic asset slot count`」对应的是**另一个**栈上的组（`tid 0xec7 base=16f01bb4c b=1 g=27d22ec0 wait=1`），它也还在等。所以缺口是**两个等待者**，不是一个。（**这句在落盘时被自己撤回**：`isa=0x204e74bf0` 落进共享缓存是 ScreenTimeSettingsUI 的 **__TEXT**，不是类指针——那个「堆上的组」多半是 r239 把类型认错后按 dispatch_group 布局解出来的，所以不能算第二个等待者；能确认的只有「r257 之后 boot 45 仍 `wait=1`」。r258 先把那个地址的原样八个字与 ulock 持有者读出来。）一条候选已被 sheng 枪毙：它仓库里 `haptics`/`taptic`/`vibra` 与 `soc-generation`/`product-id`/`is-muse` 一个都没有，不发这些也到桌面 | r258 不猜名字，改读对象：对这两个组分别做 r239 对栈上那个组做过的取证（谁 alloc、`b=` 的 dq 链表、谁在等、谁该 leave），判 AssistantServices/Home 这条线程是不是第二个独立缺口。**不改 `home-button-type`，也不补 `/product/haptics` 或 ADT 身份表** r259 把这条线上最后一格形状补掉并同飞硬件问路：beat 现在通过驱动自己的通知发**一帧**合成数字化仪报告（中心点 15240/10160 = 驱动的轴上限 30480×20320，`NativeHidInput.cpp:167`；按下→50 ms→抬手，seqlock 与 `touchSend` 都是驱动自己的，探针只写它公开的六个符号；一次性，所以读法是 beat 上的 `touch=1 reports=2`——按下与抬手都进了 HID 栈），同一趟把 r184 停掉的 `clover-input=3` 放回 boot-args 并给它单独的 tee 类 `r181-i2c`（预算 24），因为合成坐标的可信度正好要靠「面板到底 ACK 不 ACK」来定：轨仍未证（r183 四帧全 NACK），NACK 在这里仍是有效答案。**r259 把这条差异填平了，并且证否了它**：boot 47 五条 beat 全读 `touch=1 reports=2`（`reports` 是驱动 `handleReport` 返回后才加一的自有计数，所以按下与抬手两笔都走完 IOHIDDevice 原实现），`presses=3` 上限仍在做事；而堆上那只组照旧 `base=145d08b30 b=fffffffd cnt=1 wait=1` 从 t=1342 到 t=1796，`bbchain` 每拍报同一只 block。**一帧数字化仪报告不是释放 backboardd 的钥匙。**新的形状读数：tid 0xeeb 与 0xe78 两只不同线程栈的 `g=45dfede0` 相同——两只线程在等同一只组；另有一只 `b=0 g=1 wait=0` 等的不是 group。输入侧已经没有可抄 sheng 的了。 **r261 的宿主取证再改一次口径**：boot 48 那条等待线程的十帧解到
+`libVFXCore.dylib`+`VisualLogger.framework`，backboardd 那帧在选择器 `descriptionForRootObject:`
+（receiver 类 `BKTouchHitTestContextMap`）的调用点上，位于
+`-[BKHIDDirectTouchEventProcessor _queue_enumerateDigitizersForDisplay:usingBlock:]` 调用的
+「canceling paths …」日志辅助函数里；r238 按进程名匹配证明 `ulock_wait2(…, 15bd8e6d4)` 就是
+backboardd 自己发起、睡在组基址 +0x34、`wr=0 cw=0` age=877。所以「触感欠一次 leave」这条旧论断作废，
+缺口改成一句可测的问题：**该 leave 的那笔完成来自哪里**——渲染侧（GPU/Metal，sheng 有整套
+`Adreno740`/`AdrenoMetal`，本板 `gpu=planned`）还是 backboardd 自家另一条卡住的队列。
+r262 = 照 sheng `BootUiTraceProbe` 的形状，每拍报出 pid 58 全部线程的
+(tid, state, pc, lr, 内核栈, 睡在哪个字) 与等待对象，一次读数分岔这两条分支。|
+| 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气是通的（两个候选地址都 NACK：`done xfers=4 nack=4 timeout=0`），`rails unproven` | 先把面板轨真的上电（依赖 3），再问地址  r259 不等轨先把地址再问一遍（`clover-input=3` 回膛），理由是同一趟正在发合成手指，需要知道总线上到底有没有真坐标 || 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路是好的（`obs00=00000100`），但核心版本字不在 v5 带内，`apid=-1` 一个都没认，`ldo-a11`/`ldo-b3` 未读 | 先弄清那个版本字，再认 APID、读轨、开轨  **boot 47 的教训不是「面板没答」，是「答案回不来」**：仪器跑了，42 行说在 t≈12 s，而环这次从 t=1194.04 起——r260 不再插第二次心跳，改抄 sheng 的机制：`drivers/CloverInput/CloverInput.cpp:241` 的 `clover_input_observation[16]`（自 r181 就为「不依赖日志环」而存在）由 beat 每拍重述成一条 `clover r260: bus mode=.. … verdict=..`，总线仍一靴只碰一次；sheng 的驱动根本不 print（`TouchProbe.cpp:29` 的行数组 + `BootLog.c:340-356` 每 2 秒 compose），所以它的早期读数活得下来，因为那是状态。`mode=0` 也打印——没跑过必须说出来。 **boot 48（r260 实机）把答案带回来了，而且每拍都有**：
+`bus mode=3 … xfers=4 timeout=0 nack=4 verdict=102` 与 r183 一字不差——电气与协议栈都活着，
+两个候选地址全 NACK。触摸这一格从「问不到」变成「已知不应答」，下一格在电源轨（3），不在 I2C 层。|
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 全部自校验通过，`part(3) hosts=0:1` 是候选边），判决行还没上屏 | 有边就上 GLINK/APR；没镜像则先压 `vadsp` 电源 |
 | 5 | watchdogd 每次起就崩 | 自身可执行文件里 `brk #1`（`IOWatchdog` 服务在板上不存在）。r193 的 `panic_on_crash_disabled=1` 已把它从「致命」摘掉，所以它只是噪声 | 写一个最小 `IOWatchdog` 服务，或让 plist 不再要求它 |
+| 6 | **GPU/Metal 一个都没有**（Adreno 512 无驱动、无固件、无 renderer） | `porting.toml` 的 `gpu` 区 `status = "planned"`、`limits = ["No GPU driver, firmware or renderer is present."]`；r261 的取证把 boot 48 那只死等的组的等待线程解进 `libVFXCore.dylib`/`VisualLogger.framework`（渲染/特效侧的框架），而 sheng 到桌面靠的正是它 `gpu` 区那一整套 Adreno 组件（`Adreno740`+`AdrenoMetal`+`AirNir`+`AdrenoPM4`+`AdrenoFirmware`+`ArmSmmu4K`；「空闲桌面每 250 ms 提交 6 个命令缓冲」「render server 预热 162 个 Metal 库」） | 先分岔，别急着写驱动（r262）：等的是渲染完成（GPU 区），还是 backboardd 自家另一条卡住的队列。若落在 GPU，按它自己 `next_action` 那句先评 Adreno 512 能复用 sheng 的哪几块 |
 
-1 挡住桌面；2–4 是之后要补的板级驱动，5 只是噪声。
+1 挡住桌面；6 是 r261 之后 1 最可能的病根（还没证，r262 就是证它）；2–4 是之后要补的板级驱动，5 只是噪声。
 
 > 备注（时基）：r207 已核，环上的 `t=` 与 `mach_absolute_time` 一致，没有偏慢；
 > 早期「慢 50 倍」是基数除错的读法，已废弃。另：每靴 1800 s 的死线是本项目
