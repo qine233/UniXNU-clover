@@ -787,6 +787,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // timer while it is looking for the event driver, so the early lines are capped inside the probe at
   // eight: one stage line, two refusals and eight checkpoints -- eleven, so 16 leaves headroom.
   { "clover r255: ", "r255-hid", 16, 0, 0, 0 },
+  // Round259 puts the touch bus instrument back in the boot, and it gets a class of its own for the
+  // same reason the r254 census lesson says every producer needs a number: an unbounded line type is a
+  // ring that starts late. The I2C probe's whole answer is a geometry line, an ACK line per candidate
+  // address and at most one "rails unproven" verdict, so 24 is more than the burst can be, and the
+  // cap keeps a bus that talks back from spending the boot's last 512 rows on itself.
+  { "clover r181: ", "r181-i2c", 24, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

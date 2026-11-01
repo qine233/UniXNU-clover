@@ -190,7 +190,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r258: traced sheng's boot order end to end and took the two things it has that we never copied. Its kernel timeline is bsd_init -> sheng_pmgr_run -> vfsinit (load IOMobileGraphicsFamily, register and park the display) -> vfs_mountroot -> bsd_autoconf -> IOKitBSDInit -> one late fan-out in the order keystore, cpufreq, gpu, touch, wifi, adsp, battery, audio, buttons, backlight, dpu, HID -- then the framebuffer nub attach/start, and only then launchd. We already match that shape: HID before the panel, before userland, Home gated on two accepted swaps. So the gap was not order. Two differences survive the comparison, and both are things sheng has and we do not. One: sheng boots a COMBINED device with the digitizer collection enabled (board.toml:74, sheng-touch=4 sheng-touch-hid=1 sheng-buttons=1), which is what makes its driver set Built-In/DisplayIntegrated/DigitizerCollectionDispatch on the device itself (NativeHidInput.cpp:291-296) -- our button-only shape never had that collection, never set DigitizerCollectionDispatch, and that is the real reason boot 44 answered published=0; r257 removed our symptom, this round fixes the shape, with native_touch_* left empty so the collection is published and no finger ever is. Two: sheng's last documented desktop blocker was vnode jetsam, cleared by \"kern.maxvnodes\" = 66560 in /defaults (make-sheng-adt.py:176-179) because this kernel family builds with CONFIG_VNODES=1024 -- we never published that key at all. Its repo contains no haptics, no BKButton, no ButtonResolver and no MG identity key, so those stay off our list, and home-button-type is still not touched."
+title = "clover r259: the device that publishes a digitizer collection now puts a finger in it, and the bus instrument that could prove a real one comes back in the same flight. r258 left one shape difference between this board and the one that reaches the desktop: the reference board reports real fingers, ours published the collection and sent nothing, because the six native_touch_* symbols the driver links against were defined empty. So the beat that already carries the HID verdict now writes one frame at the centre of the panel (15240, 10160 -- the driver's own axis maxima, so it lands mid-screen after transformCoordinate), runs the driver's own notification, waits 50 ms so the press is a press and not a report folded into the lift, writes the lift, and never does it again. The seqlock protocol is the driver's (odd while a writer is inside, even when the frame reads as a whole), the report is built by the driver's own touchSend, and \"touch=1 reports=2\" on the beat line is the whole claim: press and lift both reached the HID stack. One frame, because a device that keeps producing fingers nobody moved is a fake input source, not an instrument. The second half of the round is the honest counterpart to the first: these coordinates are synthetic, because this board's I2C panel has never ACKed (round183), and the only way to learn whether real ones exist is to ask the bus again -- so drivers/CloverInput is resumed in the same cold flash with clover-input=3, the mode that reads 0x8040 from Goodix and 0x00 from EDT/FocalTech, and a NACK is a valid answer there. The rails are still unproven since r183, which is what the \"no address ACKed; rails unproven\" line is for. Two questions with the same word in them, one flight: does the panel answer, and does a synthetic finger go anywhere once userland sees a digitizer service. home-button-type is still not touched."
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2273,9 +2273,11 @@ kernel_args = [
   # the report descriptor and to set Built-In/DisplayIntegrated/DigitizerCollectionDispatch on the
   # device itself (line 296). UniXNU-sheng boots its desktop with exactly this argument set
   # (board.toml:74, sheng-touch=4 sheng-touch-hid=1 sheng-buttons=1); our button-only shape was the
-  # reason boot 44 could not answer its own Built-In gate. Touch stays silent: this board defines the
-  # six native_touch_* counters empty, so the seqlock never moves and the digitizer report is never
-  # sent -- the collection is published, no finger ever is.
+  # reason boot 44 could not answer its own Built-In gate. And from round259 the digitizer is no
+  # longer only published: the HID beat writes one synthetic frame at the panel centre through the
+  # driver's own notification and lifts it, so a collection with no finger in it is no longer the
+  # shape this board presents. Coordinates are synthetic, honestly -- this board's I2C panel has never
+  # ACKed (round183), which is why the argument below goes back in the same round.
   "sheng-touch-hid=1",
   # Round184 parks 排期 4, 5 and 6. The three instrument arguments below are deliberately NOT passed
   # any more: the goal moved to getting iPadOS onto its own screen, and each of these three spends
@@ -2301,7 +2303,15 @@ kernel_args = [
   # It runs last in the PMGR tail, after the eMMC, because its only way off the device is the
   # card-backed kernel-log ring CloverSdhci sets up. It never panics: once the readings are the
   # product, stopping the boot is losing them.
-  # "clover-input=3",
+  #
+  # Round259 resumes it. Not because the desktop moved -- it is the same instrument round183 ran, and
+  # round183's answer was four NACKs -- but because r258's device now emits a digitizer report, and
+  # two questions with the same word in them are best answered by the same flight: whether the panel
+  # answers on the bus at all (the only source of real coordinates this board could have), and whether
+  # a synthetic finger goes anywhere once userland sees a digitizer service. A NACK is a valid answer
+  # here and the rails are still unproven since round183; that is what the `no address ACKed; rails
+  # unproven` line is for, and it is why this argument is back rather than a second HID probe.
+  "clover-input=3",
   # Round182 puts drivers/CloverPower on the SPMI arbiter, and mode 3 is the one worth booting for.
   # Mode 1 is the pure-read control: map core/chnls-cnfg/obsrvr/intr, decode the version and walk the
   # 448-entry APID map, start no transaction at all. Mode 2 stops after the two revid blocks. Mode 3

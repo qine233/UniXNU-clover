@@ -658,9 +658,11 @@ def check_board(errors: list) -> str:
         # screen. Each of these three spends boot time and bus risk on a question that is not that
         # one, so their arguments leave the shipped boot -- while their archives stay built and
         # linked, so a round that resumes them changes one line rather than re-deriving the whole
-        # stack. The contract therefore inverts: the argument must be *absent*, and the build+link
-        # half still has to agree with itself, because "parked" and "silently never existed" must not
-        # be the same reading.
+        # stack. The build+link half has to agree with itself either way, because "parked" and
+        # "silently never existed" must not be the same reading.
+        #
+        # Round259 resumes the first of them -- the argument is asserted *present* below, in mode 3,
+        # the one that asks the panel a question its own vendor driver asks. The other two stay parked.
         parked = (("round181", "CloverInput", "libCloverInput.a", "clover-input=",
                    "clover_input_run()", ("1", "2", "3")),
                   ("round182", "CloverPower", "libCloverPower.a", "clover-power=",
@@ -694,6 +696,17 @@ def check_board(errors: list) -> str:
             if passed and any(value not in modes for value in passed):
                 errors.append(f"{argument}{passed} names a mode {driver} does not implement "
                               f"({', '.join(modes)}); it would report and return")
+
+        # Round259's resumption, pinned. A boot arg that comes back by accident is a second bus
+        # instrument nobody scheduled, and one that leaves because a later round rewrote the list is
+        # the I2C question silently unasked again; mode 3 is the only mode that actually asks the
+        # panel something, so that is the string this round owns.
+        if "clover-input=3" not in board["payload"]["kernel_args"]:
+            errors.append("kernel_args no longer carries clover-input=3: round259 resumed drivers/"
+                          "CloverInput in the same flight as the synthetic digitizer frame, because "
+                          "real fingers and synthetic fingers are two halves of one question -- and a "
+                          "NACK is a valid answer there (round183's), so the instrument is not a risk "
+                          "this round decided to avoid")
 
         # round184, the unattended deadline returns. Everything above is parked *because* the
         # critical path is the boot itself, and a boot nobody can read is not an answer: round149
@@ -966,7 +979,11 @@ def check_board(errors: list) -> str:
                  "precisely because those lines are gone before the ring is ever read (boot 43: verdict "
                  "at t=25 s, window from t=1208 s). It is also listed AHEAD of the bare prefix, because "
                  "teeProbeClass returns the first token that appears in a line and 'clover r255: beat' "
-                 "contains 'clover r255: ' too")):
+                 "contains 'clover r255: ' too"),
+                ('{ "clover r181: ", "r181-i2c", 24, 0, 0, 0 },',
+                 "round259 puts the touch bus back in the boot, and an unbounded line type is a ring "
+                 "that starts late -- the r254 lesson, applied before the producer is turned on rather "
+                 "than after it ate the budget")):
             if tee not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci gives round238's rows no tee class ({tee}): "
                               f"{why}")
@@ -1939,7 +1956,7 @@ def check_board(errors: list) -> str:
                               "capped print: boot 43 showed the early lines are the ones the ring loses, "
                               "so they are bounded and the beat carries the rest")
             for needle in ('"clover r255: beat stage=%d service=%llx%s published=%u seen=%u presses=%u asks=%u "',
-                           '"sinks=%u,%u transfer=%u\\n"',
+                           '"touch=%u reports=%u sinks=%u,%u transfer=%u\\n"',
                            "mrs %0, cntpct_el0", "mrs %0, cntfrq_el0"):
                 if needle not in probe_text:
                     errors.append(f"package/CloverHidInputProbe.cpp lacks {needle[:56]!r}: without the "
@@ -1957,6 +1974,30 @@ def check_board(errors: list) -> str:
                     errors.append(f"package/CloverHidInputProbe.cpp lacks {needle[:40]!r}: the device's "
                                   "flag has to stay readable, and an ask is not a press -- 1086 of one "
                                   "looked like a compositor being hammered when three grants were made")
+            # Round259: the touch sink stops being a counter and becomes a producer. sheng's device
+            # reports real fingers, and the last shape difference left between the two boards was a
+            # digitizer collection with nothing in it -- so the beat publishes one frame at the centre
+            # of the panel and lifts it, through the driver's own notification and the driver's own
+            # seqlock protocol, and it does so exactly once.
+            for needle in ("void publishTouchFrame(unsigned down) {",
+                           "native_touch_count = down ? 1 : 0;",
+                           "gTouchSink(gTouchContext);",
+                           "if (gTouchSink != nullptr && lastService != 0 && clover_hid_touch_frames == 0)",
+                           "native_touch_hid_reports,",
+                           'native_touch_xs[0] = 15240;', 'native_touch_ys[0] = 10160;'):
+                if needle not in probe_text:
+                    errors.append(f"package/CloverHidInputProbe.cpp lacks {needle[:56]!r}: the board "
+                                  "would still be a device that publishes a digitizer collection and "
+                                  "never puts a finger in it, which is the difference between this "
+                                  "board and the one that reaches the desktop")
+            if probe_text.count("gTouchSink(gTouchContext);") != 2:
+                errors.append("package/CloverHidInputProbe.cpp does not call the sink twice: a press "
+                              "with no lift leaves a finger down on the panel forever, and a single "
+                              "report is not a touch")
+            if probe_text.count("clover_hid_touch_frames == 0") != 1:
+                errors.append("package/CloverHidInputProbe.cpp does not make the synthetic frame "
+                              "one-shot: a device that keeps producing fingers nobody moved is a fake "
+                              "input source rather than an instrument")
             display_text = (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text()
             if not (0 <= display_text.find("clover_hid_input_probe();")
                     < display_text.find("IOService *display=pendingLegacyDisplay;")):
@@ -3044,8 +3085,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r258:"):
-        errors.append('[payload] title is not "clover r258: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r259:"):
+        errors.append('[payload] title is not "clover r259: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4097,8 +4138,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r258:"):
-        errors.append('[payload] title is not "clover r258: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r259:"):
+        errors.append('[payload] title is not "clover r259: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

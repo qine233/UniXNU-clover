@@ -1036,7 +1036,12 @@ def check_sb_sample(kernel: bytes) -> bool:
              # counter, and the gate is a clock rather than a call count because the driver calls the
              # checkpoint ten times a second while a press is held.
              "hid-beat": (b"clover r255: beat stage=%d service=%llx%s published=%u seen=%u presses=%u "
-                          b"asks=%u sinks=%u,%u transfer=%u\n") in kernel,
+                          b"asks=%u touch=%u reports=%u sinks=%u,%u transfer=%u\n") in kernel,
+             # Round259: the beat now says whether the device put a finger in the collection it
+             # published, and the bus instrument that could say whether a real one exists is back in
+             # the same image -- both are only true of this payload if these bytes are in it.
+             "hid-touch-line": (b"touch=%u reports=%u ") in kernel,
+             "input-armed": (b"clover-input") in kernel,
              # Round257: the gate that made boot 44 say published=0 must be gone from the shipped image,
              # and the flag it tested has to still be readable as a value.
              "hid-gate": (b"device-has-no-built-in") not in kernel,

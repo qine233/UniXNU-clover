@@ -25,9 +25,12 @@
 //
 // Gates: offline-hid-input=1 arms the probe, offline-hid-home=1 asks for the Home-capable device.
 // Both are sheng's names; they describe an offline input source, not a board, so there is no
-// reason to invent a second spelling. CloverInput (round181) is the touch instrument and has no
-// HID producer yet, so the six symbols NativeHidInput links against for touch are defined here
-// empty: count stays 0, the seqlock never moves, and the driver's tick sends no finger report.
+// reason to invent a second spelling. CloverInput (round181) is the touch instrument and is armed
+// again from round259, so the six symbols NativeHidInput links against for touch are defined here
+// twice over: the I2C probe can fill them when its panel ever ACKs, and until then the beat writes
+// one synthetic frame through the driver's own notification (see native_touch_set_sink below), which
+// is the difference between a device that publishes a digitizer collection and one that also puts a
+// finger in it.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSMetaClass.h>
@@ -59,6 +62,7 @@ volatile uint32_t clover_hid_events[8];
 volatile int clover_hid_results[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 volatile uint32_t clover_hid_published, clover_hid_property_seen, clover_hid_presses, clover_hid_requests;
 volatile uint32_t clover_hid_sink_touch, clover_hid_sink_buttons;
+volatile uint32_t clover_hid_touch_frames;
 }
 
 // The driver asks this before it sends anything, so a device that exists before the panel does
@@ -102,8 +106,38 @@ extern "C" void native_hid_input_observed(unsigned event, int result) {
 // reached for a producer and this board had none, which is a reading, not a silent gap.
 // answered with an undefined weak symbol, so the board defines both and calls nothing. The counters
 // are defined in the block above, the same place every other reading of this instrument lives.
+// Round259: the sink is no longer just counted, it is used. sheng's device reports real fingers; the
+// last remaining shape difference between the two boards was that ours publishes a digitizer collection
+// and then never puts a finger in it. So the first beat after the event driver is up writes one frame
+// at the centre of the panel and one frame with nobody touching it, through the driver's own
+// notification -- which is the driver's seqlock protocol (odd while writing, even when readable) and
+// the driver's own work-loop action, so nothing here reaches into its internals.
+//
+// Two honest limits: this board's I2C panel has never ACKed (round183), so the coordinates are a
+// synthetic touch, not a reading of glass; and it is sent once, because a device that keeps producing
+// fingers nobody moved would be a fake input source rather than an instrument.
+namespace {
+void (*gTouchSink)(void *) = nullptr;
+void *gTouchContext = nullptr;
+
+// The driver's own axis maxima (30480 x 20320, drivers/NativeHidInput/NativeHidInput.cpp:167), so
+// slot 0 lands in the middle of the panel after transformCoordinate() rather than at an edge.
+void publishTouchFrame(unsigned down) {
+    native_touch_seq = native_touch_seq + 1;                      // odd: a writer is inside
+    __asm__ volatile("dmb ish" ::: "memory");
+    native_touch_count = down ? 1 : 0;
+    native_touch_xs[0] = 15240;
+    native_touch_ys[0] = 10160;
+    native_touch_ids[0] = 1;
+    __asm__ volatile("dmb ish" ::: "memory");
+    native_touch_seq = native_touch_seq + 1;                      // even: readable as a whole frame
+}
+}  // namespace
+
 extern "C" void native_touch_set_sink(void (*sink)(void *), void *context) {
-    (void)sink; (void)context;
+    if (sink == nullptr) { gTouchContext = nullptr; }             // stop() uninstalls it
+    else { gTouchContext = context; }
+    gTouchSink = sink;
     clover_hid_sink_touch = clover_hid_sink_touch + 1;
 }
 extern "C" void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context) {
@@ -219,9 +253,28 @@ extern "C" __attribute__((noinline)) void native_hid_live_checkpoint(IOService *
     }
     if (now >= nextBeat) {
         nextBeat += 120 * frequency;
+        // Round259 spends the frame the block above describes: the first beat that has both an event
+        // driver and a sink publishes one finger at the centre of the panel and then lifts it, once.
+        // `touch` counts the frames this instrument published -- it reaches 1 and stays there, because
+        // a device that keeps producing fingers nobody moved is a fake input source, not an
+        // instrument -- and `reports` is the driver's own counter, bumped after handleReport returns,
+        // so 2 means press and lift both reached the HID stack and 1 means the lift was refused.
+        // IOWorkLoop::runAction calls the action inline while the gate is already held (iokit/Kernel/
+        // IOWorkLoop.cpp:572), so this is synchronous and the counters are readable on the same line
+        // as the send; the sleep is between the two frames so the press lasts 50 ms instead of being
+        // folded into one report by a reader that catches both seqlock values in one go.
+        if (gTouchSink != nullptr && lastService != 0 && clover_hid_touch_frames == 0) {
+            clover_hid_touch_frames = clover_hid_touch_frames + 1;
+            publishTouchFrame(1);
+            gTouchSink(gTouchContext);
+            IOSleep(50);
+            publishTouchFrame(0);
+            gTouchSink(gTouchContext);
+        }
         printf("clover r255: beat stage=%d service=%llx%s published=%u seen=%u presses=%u asks=%u "
-               "sinks=%u,%u transfer=%u\n", clover_hid_stage, lastService, state, clover_hid_published,
-               clover_hid_property_seen, clover_hid_presses, clover_hid_requests,
+               "touch=%u reports=%u sinks=%u,%u transfer=%u\n", clover_hid_stage, lastService, state,
+               clover_hid_published, clover_hid_property_seen, clover_hid_presses, clover_hid_requests,
+               clover_hid_touch_frames, native_touch_hid_reports,
                clover_hid_sink_touch, clover_hid_sink_buttons, native_legacy_transfer_calls);
     }
 }

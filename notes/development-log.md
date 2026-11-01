@@ -19345,3 +19345,40 @@ cnt=1 wait=1`、栈上 `b=1 g=530ad010 wait=1`。
 下一步分岔按代价排：① **发一帧真实的触摸报告**（sheng 的设备会报，我们的 `native_touch_*` 是空的——
 这是「它有我们没有」里还剩的最后一条形状差异，且不需要新仪器）；② 给堆上那个组做 r239 那套取证；
 ③ `kern.maxvnodes` 的效果本轮读不出（它针对 jetsam 而非这个 wait），下一帧看 SpringBoard 存活即可判断。
+
+## r259 落地：把最后一条「sheng 有、我们没有」的形状补上，同时把问真手指的那把尺子上膛
+
+用户的选择题只有一个答案值得花一趟冷刷：硬件 I2C 与 HID 合成帧一起。这两半看着像两个方向，其实是
+同一个问题的两种问法——这台板子的屏幕上到底有没有手指。所以它们进同一发镜像，读同一个环。
+
+**第一半：sink 从「计数」变成「使用」。** `package/CloverHidInputProbe.cpp` 里 `native_touch_set_sink`
+此前只把 `clover_hid_sink_touch` 加一，理由是这台板子没有能填那六个 `native_touch_*` 的生产者；
+r255–r258 三轮读数把这条理由收窄成一条差异：boot 46 已经 `sinks=1,1`、`deviceBuiltIn=1`、
+`DigitizerCollectionDispatch` 在设备上，用户态也确实新问了 `MaxHoverHeight`/`NeedsHostState` 两个键
+——也就是说采集合格了，唯一还缺的是**采集里没有人**。sheng 的同一格不是「发了驱动」，是「发了手指」。
+所以 r259 在 beat 分支里做一件事，且只做一次：`publishTouchFrame(1)` 写中心点、跑驱动自己的
+`gTouchSink(gTouchContext)`、`IOSleep(50)`、`publishTouchFrame(0)` 再跑一次。三个决定都不是随手写的：
+
+* **走驱动自己的协议，不碰它的内部。** seqlock 是驱动的（奇数=写者在内，偶数=整帧可读，
+  `NativeHidInput.cpp:158-165` 的 `before/after` 判据就长这样），报告是驱动的 `touchSend()` 建的，
+  通知是驱动的 `touchNotify`。探针只写它公开的那六个符号。
+* **中心点不是猜的。** 15240/10160 来自驱动的轴上限 30480×20320（`NativeHidInput.cpp:167`），
+  过 `transformCoordinate()` 之后落在面板正中；写边缘点会让「坐标进了 HID 栈」和「落在有效区」
+  两件事混在一起。
+* **只发一次。** 一个持续造手指的设备是假输入源，不是仪器。`clover_hid_touch_frames == 0` 是它的门闩，
+  checker 反向钉住（这一句只许出现一次）。
+
+`runAction` 在同一个 work-loop 线程里是直接调用的（`iokit/Kernel/IOWorkLoop.cpp:572`，gate 递归），
+所以发帧与读 `reports=` 在同一条 beat 行里就是同步的；那 50 ms 是给「按下」留的时间，不是给排队留的。
+
+**第二半：`clover-input=3` 回到 boot-args。** r184 停它是因为目标换了（先把 iPadOS 弄上屏），不是因为
+它答错过——它 r183 的答案是四个地址全 NACK。合成帧写完之后，这台板子的坐标可信度立刻成了问题：
+`touch=1 reports=2` 说的是「HID 栈收了」，不说「玻璃上有人」。所以同一趟把问真手指的那把尺子重新上膛，
+mode 3 读的是 Goodix `0x8040` 与 EDT/FocalTech `0x00`——两个候选各自上游驱动真读过的寄存器，
+NACK 才有意义。checker 那边把「parked」的老注释改掉，并加一条**在场**断言：回来的参数必须是故意的。
+轨（vcc_i2c/vdd）自 r183 以来仍未证，这一趟不假装证它。
+
+**仪器的第四课。** 给 `clover r181: ` 单独一条 tee 类（预算 24）。同一个毛病在 r249 推送上限、
+r251 回卷环、r252/r254 类预算上出现过三次，这次的形态是「上膛一个没预算的生产者」：总线如果说话，
+它就该有自己的名额，而不是和心跳抢那 16 个 per-pass 推送。
+
