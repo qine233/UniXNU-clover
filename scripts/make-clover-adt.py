@@ -272,7 +272,12 @@ def generate_adt(args) -> bytes:
     psci = node("psci", [("compatible", cstr("arm,psci-1.0")), ("method", cstr(args.psci_method))])
 
     # sleep-disabled: suspend/resume is not implemented on this port.
-    defaults = node("defaults", [("sleep-disabled", u32(1))])
+    # kern.maxvnodes: round258, copied from UniXNU-sheng/scripts/make-sheng-adt.py:176-179. That port's
+    # note is the reason -- this kernel family is built with CONFIG_VNODES=1024 ("xsmall"), so
+    # desiredvnodes clips at 1024 and the desktop's own file activity jetsam-kills it; sheng names
+    # vnode jetsam as the last blocker it had to clear to reach an idle desktop, and it clears it
+    # here rather than in a boot arg. Absent this line the value stays at the built-in ceiling.
+    defaults = node("defaults", [("sleep-disabled", u32(1)), ("kern.maxvnodes", u32(66560))])
     options = node("options")
     # Round241/242. Mirror UniXNU-sheng's --ipad-identity /product block, which boots this
     # same image to the desktop: a home-button-less iPad Pro (12.9-inch) identity

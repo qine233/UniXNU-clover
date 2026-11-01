@@ -1977,6 +1977,20 @@ def check_board(errors: list) -> str:
                     errors.append(f"scripts/build-clover-gop-legacy-display.py lacks {needle[:56]!r}: "
                                   "the HID objects would not be in the archive the kernel force-loads, "
                                   "and an unresolved board symbol would only surface in the link")
+        # Round258, both halves read off UniXNU-sheng rather than invented here: the device shape and the
+        # vnode floor. The ADT line is checked where the ADT is generated, because that is the only file
+        # whose bytes end up on the card.
+        adt_generator = (REPO / "scripts/make-clover-adt.py").read_text()
+        if '("kern.maxvnodes", u32(66560))' not in adt_generator:
+            errors.append("scripts/make-clover-adt.py does not publish kern.maxvnodes: sheng's "
+                          "make-sheng-adt.py:176-179 names vnode jetsam as the last blocker it cleared "
+                          "for an idle desktop, and this kernel family clips desiredvnodes at the "
+                          "CONFIG_VNODES=1024 built-in without it")
+        if 'PE_parse_boot_argn("sheng-touch-hid"' not in (REPO / "drivers/NativeHidInput/NativeHidInput.cpp").read_text():
+            errors.append("drivers/NativeHidInput/NativeHidInput.cpp no longer reads sheng-touch-hid: that "
+                          "argument is the only thing that gives the device its digitizer collection and its "
+                          "device-side Built-In/DisplayIntegrated/DigitizerCollectionDispatch, which is the "
+                          "shape the reference board boots a desktop with")
         for needle in ("require(VPTR == 0xfffffff005d045c0",
                        "changed == [0, 1, 7, 12, 14, 21, 23, 76, 81, 82, 86, 87, 91, 92, 93, 101, 132, 140]",
                        "static_assert(sizeof(IOHIDDevice)==0xd0",
@@ -1986,7 +2000,7 @@ def check_board(errors: list) -> str:
                 errors.append(f"scripts/build-clover-hid-input.py lacks {needle[:56]!r}: the subclass "
                               "would be compiled against a claim nobody re-read from this board's own "
                               "image, which is how a vtable slot ends up pointing at the wrong method")
-        for argument in ("offline-hid-input=1", "offline-hid-home=1"):
+        for argument in ("offline-hid-input=1", "offline-hid-home=1", "sheng-touch-hid=1"):
             if argument not in board["payload"]["kernel_args"]:
                 errors.append(f"[payload] kernel_args has no {argument}: the instrument stays dark and "
                               "the boot reads back the same silence round254 left")
@@ -3030,8 +3044,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r257:"):
-        errors.append('[payload] title is not "clover r257: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r258:"):
+        errors.append('[payload] title is not "clover r258: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4083,8 +4097,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r257:"):
-        errors.append('[payload] title is not "clover r257: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r258:"):
+        errors.append('[payload] title is not "clover r258: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

@@ -1050,6 +1050,11 @@ def check_sb_sample(kernel: bytes) -> bool:
              # no undefined-weak: the first r255 build died on exactly these two names. The board's
              # answer is a pair of counters, printed in the stage line above and in the beat.
              "hid-name": (b"Offline HID input probe") in kernel,
+             # Round258: the two things sheng has that this board never published. The digitizer
+             # collection is a report-descriptor byte string, but DigitizerCollectionDispatch and
+             # kern.maxvnodes are property names that only exist if the shipped image says so.
+             "hid-digitizer": (b"DigitizerCollectionDispatch") in kernel,
+             "adt-maxvnodes": (b"kern.maxvnodes") in kernel,
              "hid-resource": (b"IOHIDResource") in kernel,
              "tee-filter": (b"CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u "
                            b"dropped=%u comms=%u\n") in kernel,

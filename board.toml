@@ -190,7 +190,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r257: the wait has a local cause -- our own copied guard. r256 made the input instrument readable late in a boot and boot 44 read it in one line: stage=5, an IOHIDEventDriver found below the device, transfer=8, and published=0 seen=0 with the state word \"device-has-no-built-in\". Nothing external refused: the probe asks the device for Built-In before propagating anything, that question came from sheng whose device sets the flag for itself, and the vendored drivers/NativeHidInput sets it only for a touch device, so on a button-only device the guard was false forever and the four classification keys -- Built-In, DisplayIntegrated, PrimaryUsagePage 0x0d, PrimaryUsage 4 -- were never put on the service backboardd reads. This round turns the flag into a reading (deviceBuiltIn=) and publishes whenever the event driver has matched, and splits the counter that lied: boot 44 said presses=1086 when only three grants were ever made, so asks= and presses= are two numbers now and only the pair proves the cap held. The next reading is decided by two things: whether published=1 seen=1 makes DisplayIntegrated stop accumulating in the r252 absence list -- if it does, the wait is the next thing to watch; if it keeps accumulating, backboardd is asking a different entry, and the recorder gains the entry it was asked of, which IOCopyPropertyCompatible already has in its hand. home-button-type is still not touched."
+title = "clover r258: traced sheng's boot order end to end and took the two things it has that we never copied. Its kernel timeline is bsd_init -> sheng_pmgr_run -> vfsinit (load IOMobileGraphicsFamily, register and park the display) -> vfs_mountroot -> bsd_autoconf -> IOKitBSDInit -> one late fan-out in the order keystore, cpufreq, gpu, touch, wifi, adsp, battery, audio, buttons, backlight, dpu, HID -- then the framebuffer nub attach/start, and only then launchd. We already match that shape: HID before the panel, before userland, Home gated on two accepted swaps. So the gap was not order. Two differences survive the comparison, and both are things sheng has and we do not. One: sheng boots a COMBINED device with the digitizer collection enabled (board.toml:74, sheng-touch=4 sheng-touch-hid=1 sheng-buttons=1), which is what makes its driver set Built-In/DisplayIntegrated/DigitizerCollectionDispatch on the device itself (NativeHidInput.cpp:291-296) -- our button-only shape never had that collection, never set DigitizerCollectionDispatch, and that is the real reason boot 44 answered published=0; r257 removed our symptom, this round fixes the shape, with native_touch_* left empty so the collection is published and no finger ever is. Two: sheng's last documented desktop blocker was vnode jetsam, cleared by \"kern.maxvnodes\" = 66560 in /defaults (make-sheng-adt.py:176-179) because this kernel family builds with CONFIG_VNODES=1024 -- we never published that key at all. Its repo contains no haptics, no BKButton, no ButtonResolver and no MG identity key, so those stay off our list, and home-button-type is still not touched."
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2268,6 +2268,15 @@ kernel_args = [
   # validator has accepted two swaps; three Home presses, then silence.
   "offline-hid-input=1",
   "offline-hid-home=1",
+  # sheng-touch-hid=1 is not a touch experiment here, it is the device SHAPE: it is what the vendored
+  # driver reads (drivers/NativeHidInput/NativeHidInput.cpp:291) to append the digitizer collection to
+  # the report descriptor and to set Built-In/DisplayIntegrated/DigitizerCollectionDispatch on the
+  # device itself (line 296). UniXNU-sheng boots its desktop with exactly this argument set
+  # (board.toml:74, sheng-touch=4 sheng-touch-hid=1 sheng-buttons=1); our button-only shape was the
+  # reason boot 44 could not answer its own Built-In gate. Touch stays silent: this board defines the
+  # six native_touch_* counters empty, so the seqlock never moves and the digitizer report is never
+  # sent -- the collection is published, no finger ever is.
+  "sheng-touch-hid=1",
   # Round184 parks 排期 4, 5 and 6. The three instrument arguments below are deliberately NOT passed
   # any more: the goal moved to getting iPadOS onto its own screen, and each of these three spends
   # boot time and bus risk on a question that is not that one. The drivers stay linked, their modes
