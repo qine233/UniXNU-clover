@@ -20947,3 +20947,41 @@ board 标题升到 `clover r275:`，两处 `[payload] title` 断言同步。
 不带 `boot_progress_ext`，因为本板 `CONFIG_XNU_BOOT_PROGRESS=n`，计数只能印在拍上）。
 `class=1` ⇒ 已经存在一个同类，再发布一颗是另一个问题（谁先注册、UserClient 归属、SEL 键），那一轮先做 PreBoard
 普查再谈。`walked=` 撞上 `stopped=1` ⇒ 这轮什么都没量到，得先把 cap 抬起来或把走查挪出普查窗口。
+
+## r275 读数（boot 62，文件 `boot63-r275.bin.txt`）：前提成立了，而且我把针修一处
+
+**① 读数本身。** 普查窗里两条，一次拍火、逐字：
+
+```
+[ 1533.055651]: clover r275: aks class=0 userclient_class=0
+[ 1533.516343]: clover r275: aks walked=127 stopped=0 keystore_services=0
+```
+
+夹在 `r243: model=iPad7,1` 与 `r243: svc total=127 stopped=0 button-family=5` 之间，所以这两条确实是同一趟
+走查的产物，不是别的拍的复读。**三格判据落在第一格**：`AppleKeyStore` / `AppleKeyStoreUserClient` 两个
+metaclass **都不存在**，走查跑完（`walked=127`、`stopped=0`，远低于 `kCloverSvcCap=2000`），平面里没有任何一颗
+名字含 keystore 的服务。也就是说 sheng 那条「类不存在才发布」的守卫，在本板的前提是**量出来成立的**，
+不是抄过来的假设。`svc %.24s class=` 那一条一行都没印——这与 `keystore_services=0` 互相自洽，
+不是掉行（`walked=` 与 r243 自己的 `total=` 同值就是这趟走查的完整性证明）。
+**② 同窗旁证，说明这一格确实还堵在那儿。** 债主这一靴是 **pid 137**（`r274: map t=1498/t=1758 pid=137
+ne=66 e0=100d8a000-100daa000`，两拍同值，基址与 boot 61 一样是 128 KiB 的 `__TEXT`）；r273 的 workloop 行这趟有
+17 条；`r252` 账本第 27 条仍是 `pid=188 comm=PreBoard count=1 missing=IODeviceTree:/arm-io/sep`——
+**该发解锁通知的人依然在问那颗我们硬件上没有的 SEP**。三件并排读：等待已被念成函数名（r274）、
+锁状态的服务确实不存在（r275）、请求它的人还在问（r252）。
+**③ 我这一轮的针有一处会自己骗自己，先记下来、r276 修。** 驱动 `NativeKeyStoreEvents.cpp:145` 发布时
+`setName("Native keystore state service")`——**小写 keystore**，而我匹配的是大写 `"KeyStore"`，
+`clover_name_has` 又是逐字节比较。于是移植之后这行会**继续报 `keystore_services=0`**，
+把「已经发布了一颗」读成「还是没有」。这正是本项目反复踩的那一族（测不出「有」的仪器不能用来宣布「没有」），
+只是这次反着踩：修法是两处一起改——名字匹配改成大小写不敏感，**并且**把类名也纳入匹配
+（`getClassNameSymbol()` 已经在手上了），这样只要有一颗是 `AppleKeyStore` 类实例化出来的，无论它叫什么都会上表。
+**④ 下一轮的判据预先写死（r276）**。移植 sheng 的形状：vendor 上游驱动进本仓 `drivers/NativeKeyStoreEvents/`
+（宿主已用本板真实驱动编译参数零错编过，242 KB 目标文件，**不改它一行源码**），板侧 `package/CloverKeyStoreProbe.cpp`
+供它要的六个 extern（`native_aks_state_enabled`/`native_aks_lock_state`/`native_aks_call`/`native_aks_opened`/
+`native_keyevents_open_refused`/`native_keyevents_allocate`），门槛换成本板参数 `offline-key-events=1` + `clover-aks=1`，
+`.late.o` 走 `NativeHidInput` 同形处理（剥 `__DATA,__mod_init_func` + globalize `__GLOBAL__sub_I_NativeKeyStoreEvents.cpp`，
+再逐字节比对 `.text`），调用点插在 `package/CloverLegacyDisplayProbe.cpp:605` 那句 `clover_hid_input_probe()` 旁边
+（`native_legacy_display_late_probe()`，由基仓 `bsd_autoconf()` 的补丁调用）。计数**不能**进 `boot_progress_ext`——
+本板 `CONFIG_XNU_BOOT_PROGRESS=n`，所以照 r255/r260 的规矩印在拍上。读数的判据：下一靴 `class=` 必须从 0 变 1
+（这是 r275 那条针给自己的正对照），`keystore_services>=1`，然后看 `r265/r268/r273` 那三行是否还在报
+`hit=<债主自己> count=-1`——**如果解锁通知真的发出去了，那条 `dispatch_semaphore_wait(..., FOREVER)` 就该消失**。
+若类已发布、等待照旧，那说明等的不是 keystore 而是 PreBoard 本身没跑起来，下一刀才回到 r274 计划里那份 PreBoard 普查。
