@@ -708,17 +708,28 @@ def check_board(errors: list) -> str:
                           "NACK is a valid answer there (round183's), so the instrument is not a risk "
                           "this round decided to avoid")
 
-        # round285 removes the deadline again, for round149's own question restated: how far does
-        # iPadOS get when nothing interrupts it. Every frame since round228 answered "1800 s" -- the
-        # deadline fires before the boot finishes, so the reading was always the deadline's, never the
-        # boot's. With the argument absent nothing arms it; a present deadline (in any numeric form)
-        # would cut the boot this round exists to read, so absence is the contract, exactly as
-        # round149 left it.
+        # round287 puts the deadline back. round285 measured its price on the standing card: boot 73
+        # ran past t=3145 s with nothing interrupting it and never came back, so the window could only
+        # be read by a hand-written BCB -- an unattended run that cannot return by itself cannot be read
+        # by scripts/run-clover-unattended.sh, whose whole landing path is the deadline panic's own
+        # recovery BCB. The argument is the contract again; the value stays a reading, not a pin, so the
+        # only bound is 60..1800 -- short of that it cuts the boot before the census reads, long of it
+        # the run outlives the board's own resets and the tee ring wraps.
         unattended_args = [argument for argument in board["payload"]["kernel_args"]
                            if argument.startswith("clover-unattended=")]
-        if unattended_args:
-            errors.append(f"kernel_args still carries {unattended_args[0]}: round285 wants the boot "
-                          "uninterrupted, and any deadline would cut the boot it exists to read")
+        if not unattended_args:
+            errors.append("kernel_args dropped clover-unattended=<s>: with no deadline the boot never "
+                          "returns by itself and run-clover-unattended.sh cannot read the window it "
+                          "exists to read -- round287 restores it after round285 measured that cost")
+        else:
+            raw = unattended_args[0].split("=", 1)[1]
+            try:
+                seconds = int(raw)
+            except ValueError:
+                seconds = -1
+            if not 60 <= seconds <= 1800:
+                errors.append(f"clover-unattended={raw} is outside 60..1800: shorter cuts the census "
+                              "off, longer outlives the resets the board survives")
 
         # round184, the panic-time ring drain. The deadline is only useful if the reading survives
         # it, and the two RAM rings do not: kind 21 and kind 22 hold their slots in kernel memory and
@@ -4515,8 +4526,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r286:"):
-        errors.append('[payload] title is not "clover r286: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r287:"):
+        errors.append('[payload] title is not "clover r287: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5629,8 +5640,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r286:"):
-        errors.append('[payload] title is not "clover r286: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r287:"):
+        errors.append('[payload] title is not "clover r287: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

@@ -21593,3 +21593,38 @@ present、`gpu-r282-gone` present）；payload sha256 `61a73142…`，归档
 总线没应答（别读成「没上电」）；`gdsc` 行 `cx_on=1 gx_on=1 gfx3d_en=1` 则 `chipid` 行该出
 `chipid=05010200 expect=05010200 ok=1`。`chipid skipped` 会点名哪个门没开。与 r285 同靴规则：无死线，
 读回需要一只手在平板上。桌面仍是 CPU-first；这一轮是 bring-up 取证，不是驱动。
+
+## Round287 (v0.6.83): the unattended deadline goes back on
+
+**① 修什么。** r285/r286 把 `clover-unattended=` 摘掉，想直接看「没人打断时 iPadOS 能走多远」。
+代价这一轮被自己量出来了：板子回到 fastboot 后，我把它卡上现存窗口（boot 73）读回来——r282 的
+GPU 行照常印在 t=2783 / 2903 / 3023 / 3145（`gpu_ahb=1`、两枚 eMMC 对照=1、`cx_on=0 gx_on=0
+gfx3d_en=0`，正对照成立），可**跑到 t=3145 s 都没自己回来**。也就是说无死线的一次开机，只要它
+走到了地方，就再也不自动落 TWRP，`run-clover-unattended.sh` 唯一的着陆点（死线 panic 自己写进
+misc 的 boot-recovery BCB）根本不存在；这次能读到，纯粹是我手动写了 BCB 才把它捞进 TWRP。一台
+不能自己回来的无人值守运行，等于读不到。用户随即定：把死线加回来，方便后续测试。
+
+**② 修法。** 只动配置，不动内核：kernel_args 里加回 `"clover-unattended=1800"`（r228 的值——过普查门
+（>1500 s）与 GPU 行的同时，短于这块板子自己扛得住的复位，环也不会转丢）。内核侧的无人值守机器
+（ArmCpu 解析 `clover-unattended=` → CNTVCT 死线 → panic → CloverSdhci 写 misc BCB + 排干两个环 →
+20 s 后复位进 TWRP）从 r147 起一直完好，r285 只是让两个 checker 断言它「缺席」。这一轮把断言翻回
+「在场」：check-clover.py 要求参数存在且落在 60..1800，verify-clover-payload.py 的卡内清单门要求
+xnu 条目的 args 里含 `clover-unattended=`（原样要求「不含」）。标题升到 r287（含一处双引号，守住
+boot 35/36 那次裸引号截断 TOML 的教训），并同步两处标题断言。GPU 内核与驱动**逐字节沿用 r286**：
+探针行仍是 `clover r286:`，verify 的 `gpu-row-*` 针照样命中；r287 复用 r286 的已归一化 amfi 内核
+重建 payload，不重新链接。
+
+**③ 契约。** board.toml title 前缀 `clover r287:`；check-clover 两处标题断言、死线存在+范围断言；
+verify manifest 门 `deadline in args`。
+
+**④ 构建与闸门。** 复用 `~/clover-out/round286-kernel-amfi.macho`（未改内核），`build payload`
+--unique-chip-id 0x81ffcaaa → `out/clover/payload/payload.img` → 归档
+`~/clover-out/round287-v0.6.83-payload.img`（58,720,256 B，sha256 `2d9c90a2…`）。
+`check-clover.py` → `clover ok`；`verify-clover-payload.py` → EXIT=0，零 FAIL/SKIPPED，清单门
+`title ok, kernel ok, deadline ok`。
+
+**⑤ 下一靴怎么读。** r287 = boot 74（冷刷 cache 后自动跑）。死线恢复后 `--boot-after-flash` 的
+着陆重新可用：跑到 1800 s → panic 自己写 BCB → 落 TWRP → 一次 dd 读回，全程不用手。这一趟同时拿到
+两件事：① 桌面在 1800 s 窗口里的真实形状（census / datamigrator / keystore 各行照旧）；② **r286 的
+GPU 上电结果第一次读得到**——`gdsc` 行 `cx_on / gx_on / gfx3d_en` 与 `chipid=` 那行（对上
+0x05010200 则 `ok=1`；`chipid skipped` 点名哪个门没开）。桌面仍 CPU-first，GPU 只是并行取证。

@@ -191,7 +191,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r286: the GPU line powers on for real. Round282 only read; this round writes the vendor \"power-on\" sequence -- the gcc_gpu_cfg_ahb vote (the clock the vendor enables before any GPUCC access, with gcc_gpu_bimc_gfx and gcc_bimc_gfx beside it), then GDSC cx and gx each mirroring gdsc.c's init + toggle (clear SW_COLLAPSE, poll PWR_ON), then the gfx3d branch enable -- reads every GDSCR back, and reads chipid at 0x05010200 gated on cx-on && gx-on && gfx3d-enabled, checked against a512's 0x05010200. The RCG is deliberately not reprogrammed: a branch enable and a rate this round did not set are two different answers. The desktop stays CPU-first; this is bring-up forensics, not a driver."
+title = "clover r287: the unattended deadline goes back on. Round285 measured the cost of a run that never returns -- boot 73 reached t=3145 s with nothing interrupting it and the window was only readable after a hand wrote the recovery BCB, so the run script's own landing was gone. Restating round184's price list: \"a boot nobody can read is not an answer.\" The deadline panic writes its own boot-recovery BCB into misc, so the next reset lands in TWRP with nothing from the host; 1800 s is round228's value, past the census gate and the GPU rows on the ring, inside the resets this board survives. The kernel rides unchanged on round286's GPU power-on."
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2512,6 +2512,13 @@ kernel_args = [
   # no flight-beat card writes. A hang is silent, and the panel (or the desktop, if it presents) is
   # the only stop; reading it back needs a hand on the tablet. scripts/run-clover-unattended.sh is
   # unchanged and still works when the argument is passed back in.
+  # Round287 passes it back in, because round285 measured the whole cost of leaving it out: the standing
+  # card from boot 73 showed a no-deadline run reaching t=3145 s with nothing interrupting it and never
+  # coming back, so the window was only readable after a hand wrote the recovery BCB. An unattended run
+  # that cannot return by itself cannot be read by scripts/run-clover-unattended.sh at all -- its landing
+  # is the deadline panic's own BCB, nothing else. 1800 s is round228's value again: past the census gate
+  # (fires beyond 1500 s) and the GPU rows on the ring, inside the resets the board survives.
+  "clover-unattended=1800",
   # Round193. Round192's frame ends with `watchdogd[97] exited -- exit reason namespace 2
   # subcode 0x5 description: none` and the panic-path syncs right behind it, after the same job
   # died the same way twice before (pids 52, 92, 97, each `rv=0x5 ns=2 code=0x5`). ns 2 is
