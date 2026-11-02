@@ -39,6 +39,8 @@
 // counters are exported instead, which is also what makes them readable by a second instrument.
 #include <IOKit/IOService.h>
 #include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOWorkLoop.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSKext.h>
 #include <libkern/c++/OSMetaClass.h>
@@ -73,31 +75,19 @@ volatile uint32_t native_aks_last_selector;
 volatile int32_t native_aks_last_rc;
 
 /*
- * Round279. Who opened the keystore, and what did they ask -- said when it happens, not only summed up
- * later.
+ * Round279 opened this file's voice and round280 changes only *when* it speaks. The design below is the
+ * second attempt at the same question -- who opened the keystore and what did they ask -- and the first
+ * attempt's failure is the reason for its shape: round279 printed each event as it happened, and boot 67
+ * read nothing, because the card's kernel-log ring keeps 512 records and the tee pushed 758 that boot, so
+ * what survived covered 1458.7 s to 1814.1 s. Events at 470..1500 s were printed, kept, and rotated out.
+ * A row the ring cannot keep is not a reading, so the events are recorded here and said once at 1600 s --
+ * after the census' 1500 s gate, before the 1800 s deadline, inside the window the ring does keep.
  *
- * Why this channel. Boot 66 (round278, classes registered and the service withheld) lived to the 1800 s
- * deadline and printed the whole census -- stage=2, service=0, ks_names=0, and its own `aks class=1`
- * row, the control that says the classes really landed -- while boots 63 and 64, which did publish the
- * service, stopped at 1499.386 s and 726 s with no census row and no deadline record. The bisect is
- * therefore done and it points at the published service, so the next question is what a client does
- * with it. Two channels had already been tried for that and each has a hole this board measured:
- * round277's probe relay is drained only by the panic sink (grep the driver: panicProbeFlush has one
- * caller, inside clover_emmc_panic_append), so a boot that ends without panicking cannot deliver a
- * single relay row -- that is why boot 64 read 0 `r277` rows and why that zero was never evidence
- * about the census; and the census itself only runs at 1500 s, which boot 63 missed by six tenths of a
- * second. The kernel log is the channel that is proven to reach the card every beat -- boot 63 carried
- * 511 kernel-log lines and 64 driver verdict lines to the card with no panic at all. So these rows are
- * printed with printf and get a class and an exemption in the tee, exactly as round275 taught.
- *
- * Why counters stay. The census still prints opens=/calls=/sel7=/sel14=/sel17=/sel35= for the same
- * boot: a row that arrives only once needs a copy that does not ride the same pipe, and the pair is
- * also what tells "nobody asked" apart from "the rows were capped". The caps below are per boot and
- * each one prints its own capped line when it is reached, so a full set reads as a full set.
+ * Why the counters stay in the census. opens=/calls=/sel7=/sel14=/sel17=/sel35= are printed from the
+ * census at 1543 s on every boot that reaches it: if the late rows are missing and those counters are not,
+ * the instrument failed and the events happened, which is the distinction a single-channel reading cannot
+ * make on its own.
  */
-#define CLOVER_AKS_SAY_OPEN 8
-#define CLOVER_AKS_SAY_CALL 24
-static uint32_t clover_aks_said_opens, clover_aks_said_calls, clover_aks_said_refused;
 
 // IOLib.cpp, declared extern "C" there. It hands back "pid <n>, <name>" as a +1 OSString, and round251
 // already measured the cost of printing that from the front: the pid is a field of its own two
@@ -148,17 +138,123 @@ clover_aks_who(int *pid_out, char *name_out, size_t name_cap)
     }
 }
 
+/*
+ * Round280. Round279 printed these events the moment they happened and boot 67 proved that shape cannot be
+ * read: the card's kernel-log ring holds 512 records and the tee kept 758 lines that boot, so what came back
+ * covered 1458.7 s to 1814.1 s -- 355 s of a 1814 s boot -- and every row printed before ~1459 s was rotated
+ * out. The opens and calls are all before that (the census at 1543 s counted 56 opens and 213 calls), so the
+ * rows arrived and then left, and the boot reported nothing. An event row that the ring cannot keep is not a
+ * reading; the reading has to be a state printed after the horizon the ring keeps. So nothing here prints on
+ * the event. The first eight opens, the first eight refusals and the first twelve calls are copied into small
+ * tables -- pid, comm, selector, return code -- and one row per table is printed by a timer armed at 1600 s,
+ * which is after the census' 1500 s gate and before the 1800 s deadline, so its rows are inside the last
+ * 355 s no matter what the boot does after it. The counters the census prints at 1543 s stay the copy that
+ * rides no pipe at all: if the timer's rows are missing and the census' opens=/calls= are not, the instrument
+ * failed and the events happened.
+ */
+#define CLOVER_AKS_ROWS        8
+#define CLOVER_AKS_CALL_ROWS  12
+#define CLOVER_AKS_LATE_MS    1600000u
+struct clover_aks_row {
+    int       pid;
+    char      comm[20];
+    uint32_t  selector;
+    int32_t   rc;
+};
+static clover_aks_row clover_aks_open_rows[CLOVER_AKS_ROWS];
+static clover_aks_row clover_aks_call_rows[CLOVER_AKS_CALL_ROWS];
+static uint32_t clover_aks_open_rowc, clover_aks_call_rowc;
+static IOTimerEventSource *clover_aks_timer;
+
+// Recorded, never printed: the caller's thread is the client's, and the only thing this path should cost it
+// is a copy of thirty-odd bytes.
+static void
+clover_aks_record(clover_aks_row *rows, uint32_t *filled, uint32_t cap, uint32_t selector, int32_t rc)
+{
+    if (*filled >= cap) {
+        return;
+    }
+    int  pid = 0;
+    char name[20];
+
+    clover_aks_who(&pid, name, sizeof(name));
+    rows[*filled].pid = pid;
+    rows[*filled].selector = selector;
+    rows[*filled].rc = rc;
+    size_t k = 0;
+    while (k + 1 < sizeof(rows[*filled].comm) && name[k] != '\0') {
+        rows[*filled].comm[k] = name[k];
+        k++;
+    }
+    rows[*filled].comm[k] = '\0';
+    *filled = *filled + 1;
+}
+
+// The IOKit timer hands back the owner it was given; the owner here is the published service, so the print
+// can name the object it is reporting on. One-shot by construction: nothing re-arms it.
+static void
+clover_aks_late_say(OSObject *owner, IOTimerEventSource *sender)
+{
+    uint32_t k;
+
+    printf("clover r280: aks late stage=%d status=%x service=%llx owner=%s opens=%u calls=%u refused=%u "
+        "other=%u\n", (int) native_keyevents_stage, (unsigned) native_keyevents_status,
+        (unsigned long long) native_keyevents_service,
+        // getName() belongs to IOObject, not OSObject, and the owner the timer hands back is typed OSObject*;
+        // casting is what keeps the row honest about which service it is reporting on rather than printing a
+        // pointer twice under two names.
+        OSDynamicCast(IOService, owner) != NULL && OSDynamicCast(IOService, owner)->getName() != NULL
+            ? OSDynamicCast(IOService, owner)->getName() : "?",
+        (unsigned) native_aks_opens, (unsigned) native_aks_calls,
+        (unsigned) native_keyevents_refused_opens, (unsigned) native_aks_other_calls);
+    for (k = 0; k < CLOVER_AKS_SELECTORS; k++) {
+        if (k != 7 && k != 14 && k != 17 && k != 35) {
+            continue;
+        }
+        printf("clover r280: aks sel%u n=%u rc=%x\n", k,
+            (unsigned) native_aks_selector_hits[k], (unsigned) native_aks_selector_rc[k]);
+    }
+    for (k = 0; k < clover_aks_open_rowc; k++) {
+        printf("clover r280: open %u pid=%d comm=%.16s\n", k, clover_aks_open_rows[k].pid,
+            clover_aks_open_rows[k].comm);
+    }
+    for (k = 0; k < clover_aks_call_rowc; k++) {
+        printf("clover r280: call %u pid=%d comm=%.16s sel=%u rc=%x\n", k,
+            clover_aks_call_rows[k].pid, clover_aks_call_rows[k].comm,
+            (unsigned) clover_aks_call_rows[k].selector, (unsigned) clover_aks_call_rows[k].rc);
+    }
+    // The honesty row: how much of what happened never reached a table. Without it a full table and a busy
+    // system look the same, which is the mistake boot 67 just cost a round.
+    printf("clover r280: rows open=%u/%u call=%u/%u dropped=%u\n", clover_aks_open_rowc,
+        (unsigned) native_aks_opens, clover_aks_call_rowc, (unsigned) native_aks_calls,
+        (unsigned) (native_aks_opens + native_aks_calls > clover_aks_open_rowc + clover_aks_call_rowc
+            ? native_aks_opens + native_aks_calls - clover_aks_open_rowc - clover_aks_call_rowc : 0));
+}
+
+// Arm the one print. Done at the point the service is known to exist, because the timer goes on that
+// service's own work loop; if any step fails the census' counters are still the reading, so the failure is
+// silent by design and the late row's absence means only the table did not get to speak.
+static void
+clover_aks_arm(IOService *service)
+{
+    IOWorkLoop *wl = service != NULL ? service->getWorkLoop() : NULL;
+
+    if (wl == NULL) {
+        return;
+    }
+    clover_aks_timer = IOTimerEventSource::timerEventSource(service, clover_aks_late_say);
+    if (clover_aks_timer == NULL || wl->addEventSource(clover_aks_timer) != kIOReturnSuccess) {
+        OSSafeReleaseNULL(clover_aks_timer);
+        return;
+    }
+    // Kept on purpose: the work loop holds the only reference it needs, and freeing this after arming would
+    // cancel the one reading this round exists to take.
+    (void) clover_aks_timer->setTimeoutMS(CLOVER_AKS_LATE_MS);
+}
+
 void native_keyevents_open_refused(void) {
     native_keyevents_refused_opens = native_keyevents_refused_opens + 1;
-    if (clover_aks_said_refused < CLOVER_AKS_SAY_OPEN) {
-        int  pid;
-        char name[24];
-
-        clover_aks_said_refused = clover_aks_said_refused + 1;
-        clover_aks_who(&pid, name, sizeof(name));
-        printf("clover r279: aks refused n=%u pid=%d comm=%.20s\n",
-            (unsigned) native_keyevents_refused_opens, pid, name);
-    }
+    clover_aks_record(clover_aks_open_rows, &clover_aks_open_rowc, CLOVER_AKS_ROWS, 0xffffffffu, -1);
 }
 
 // The driver's own gate: state mode only when this board asks for it.
@@ -185,20 +281,9 @@ uint32_t native_aks_lock_state(void) {
 
 void native_aks_opened(void) {
     native_aks_opens = native_aks_opens + 1;
-    if (clover_aks_said_opens < CLOVER_AKS_SAY_OPEN) {
-        int  pid;
-        char name[24];
-
-        clover_aks_said_opens = clover_aks_said_opens + 1;
-        clover_aks_who(&pid, name, sizeof(name));
-        printf("clover r279: aks open n=%u pid=%d comm=%.20s\n",
-            (unsigned) native_aks_opens, pid, name);
-    }
+    clover_aks_record(clover_aks_open_rows, &clover_aks_open_rowc, CLOVER_AKS_ROWS, 0xfffffffeu, 0);
 }
 
-// One row per asked selector until the cap, then one row that says the cap was reached -- the second
-// form is what makes a full set of rows and a truncated one read differently, which is the failure
-// this board has been fooled by twice (boot 34's stopped walk, boot 63's capped census).
 void native_aks_call(uint32_t selector, int32_t result) {
     native_aks_calls = native_aks_calls + 1;
     native_aks_last_selector = selector;
@@ -209,19 +294,9 @@ void native_aks_call(uint32_t selector, int32_t result) {
     } else {
         native_aks_other_calls = native_aks_other_calls + 1;
     }
-    if (clover_aks_said_calls < CLOVER_AKS_SAY_CALL) {
-        int  pid;
-        char name[24];
-
-        clover_aks_said_calls = clover_aks_said_calls + 1;
-        clover_aks_who(&pid, name, sizeof(name));
-        printf("clover r279: aks call n=%u pid=%d comm=%.20s sel=%u rc=%x\n",
-            (unsigned) native_aks_calls, pid, name, (unsigned) selector, (unsigned) result);
-    } else if (native_aks_calls == CLOVER_AKS_SAY_CALL + 1) {
-        printf("clover r279: aks calls capped at=%u last_sel=%u last_rc=%x\n",
-            (unsigned) CLOVER_AKS_SAY_CALL, (unsigned) native_aks_last_selector,
-            (unsigned) native_aks_last_rc);
-    }
+    // First twelve, then silence the tables can be honest about: the census row prints the totals, and the
+    // late rows print how many events never got a table slot.
+    clover_aks_record(clover_aks_call_rows, &clover_aks_call_rowc, CLOVER_AKS_CALL_ROWS, selector, result);
 }
 }
 
@@ -314,15 +389,11 @@ extern "C" void clover_keystore_probe(void) {
     native_keyevents_status = kIOReturnSuccess;
     native_keyevents_stage = 3;
     /*
-     * Said twice on purpose, because the two copies answer on different schedules. This one goes out at
-     * bsd_autoconf, so it is the only reading of the publish that exists before the census' 1500 s gate --
-     * boot 63 died at 1499.386 s, six tenths of a second short of the row that would have named it, and a
-     * row that only prints after the gate cannot testify about a boot that ends before it. It is also the
-     * row at the highest risk of being overwritten in msgbuf before the tee's first pass, which is exactly
-     * why the census keeps printing the same stage and pointer at 1500 s: one copy early, one copy that
-     * the pipe is measured to deliver.
+     * The publish itself is not printed here any more. Round279 printed it at bsd_autoconf, and boot 67
+     * showed why that buys nothing: a line from the first second of the kernel's life is behind the ring's
+     * 355 s horizon before anything can read it. The census prints the same stage and pointer at 1543 s --
+     * inside the horizon -- and the late timer row below prints it again from the service's own work loop,
+     * so the publish has two readings that both arrive after the ring learned to keep them.
      */
-    printf("clover r279: aks up service=%llx sls=%u state=%d\n",
-        (unsigned long long) native_keyevents_service,
-        (unsigned) native_aks_lock_state(), (int) native_aks_state_enabled());
+    clover_aks_arm(service);
 }

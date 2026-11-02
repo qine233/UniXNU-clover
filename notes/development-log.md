@@ -21181,3 +21181,58 @@ boot 66 的 r252 账本里 audiomxd 仍 `count=28 missing=IOService:/IOResources
 - **构建坑一条（新）**：内核头里的 `strcpy` 是**三参数宏**，探针里 `strcpy(name_out, "?")` 编译成
   「too few arguments provided to function-like macro invocation」外加两条 -Werror 噪音；
   改成一个字节一个字节写。归档步骤在链接前，所以这错 1 分钟就露出来。
+
+## r279 读数（boot 67，文件 boot68-r279.bin.txt）：服务真被人用了，但事件行活不过环的地平线
+
+**① 判决行。**
+
+```
+clover r276: aks stage=3 status=0 service=fffffff8116fff20 refused=0 opens=56 calls=213
+             sel7=58 sel14=3 sel17=81 sel35=3 sls=0
+clover r275: aks class=1 userclient_class=1
+clover r276: ks walked=154 stopped=0 ks_names=38 ks_classes=38 rows=8
+clover r276: ks svc Native keystore state se class=AppleKeyStore hit=nc
+clover r276: ks svc AppleKeyStoreUserClient class=AppleKeyStoreUserClient hit=nc
+```
+
+内核日志最大时间戳 **1814.081553 s**——**发着那颗服务，本靴活过了 1800 s 死线**。到 1543 s 普查点火时，
+平面里已经有 38 颗名字或类含 keystore 的条目（boot 66 不发服务时是 0），56 次 open、213 次调用落进直方图，
+其中 sel7（`aks_get_lock_state`）58 次、sel17（`aks_get_device_state`）81 次。
+
+**② 第一次「有覆盖地」回答路径查询。** 这靴 r252 账本在场（`asks path=6 key=4 notes=10 whos=3`），
+8 个 distinct `missing=` 里**没有** AppleKeyStore；而 boot 66（不发服务）同一条账本是
+`path=10 key=6 notes=16 whos=6`，里面有 audiomxd `count=28 missing=IOService:/IOResources/AppleKeyStore`。
+⇒ 服务在，audiomxd 就不缺它；这条比 boot 63 那次「0 miss」值钱，因为那靴整个账本是 0 行。
+
+**③ 桌面这一格没解开。** `r268 sem count=-1` 仍 0 行、`hint=6` 仍消失（和 boot 63 一样）——解锁等待确实没了；
+但债主（这靴 pid=151）的 workloop 照旧 `tr=5 tc=0 tt=3c2 ow=0`，backboardd 仍持唯一一笔发送权
+（`rem=3e03 mc=0 sr=1`），runningboardd 以 **0x8badf00d** 杀了 AccessibilityUIS（一个超时没起来的启动）。
+
+**④ 一句我自己要撤回的话。** r278 的判据写的是「发了服务 ⇒ 本靴早停」。那是 **2 对 1** 的相关，
+boot 67 把分母补上了：发着服务活到死线。所以那句降级为**未证**——真正稳的只有「63/64 早停时服务是发着的」
+与「66/67 分别不发/发服务都能活到死线」这两组事实本身。
+
+**⑤ 我这轮自己的仪器失败（可量化）。** `clover r279:` 一行都没回到宿主。不是没印：
+把这靴 kind 22 的时间戳排开看，**509 行覆盖 1458.7 s → 1814.1 s，只有 355 s**，
+而 tee 自己那行说 `seen=3176 kept=758`——卡上内核日志环只有 512 槽，kept 超过它就把最老的换掉。
+open/call 全发生在 470–1500 s，所以行被推上去、又被轮换掉。**一行印在环地平线之前的事件，等于没印。**
+（顺带：269 行 r279 自己也挤掉了别人的行。）
+
+## r280 落地（v0.6.74）：平时只记账，1600 s 由定时器一次说完
+
+- **形状改了，问题没改**：`package/CloverKeyStoreProbe.cpp` 不再在事件里 printf；前 8 次 open、前 8 次拒绝、
+  前 12 次 selector 调用被抄进固定表（pid / comm / sel / rc），一次性的
+  `IOTimerEventSource`（挂在发布出来的那颗服务的 work loop 上）在 **1600 s** 把表连同
+  `stage/service/opens/calls/refused/other` 与四枚有名 selector 一起印出来。1600 s 选在
+  普查门（1500 s）之后、死线（1800 s）之前，因此无论这一靴后面发生什么，这些行都落在环会保留的窗口里。
+- **一行专管自己的诚实**：`clover r280: rows open=%u/%u call=%u/%u dropped=%u` —— 表满之后还剩多少事件没槽位；
+  没有它，「满表」与「很忙」长得一样，这正是 boot 67 刚付过学费的一格。
+- **计数器的副本不动**：普查在 1543 s 照旧印 `opens=/calls=/sel7=/sel14=/sel17=/sel35=`。
+  于是「中继行没到而计数器到了」= 仪器坏；两者都没到 = 真没人问。
+- **r279 的东西全部拆干净**：探针里不留 `clover r279` 字符串，CloverSdhci 的类表与每趟豁免换成
+  `{ "clover r280: ", "r280-aks", 40 }` / `"r280"`，`board.toml` 标题升到 r280。checker 里 7 种破坏
+  （装回 r279 行、删 arm、arm 挪到 stage=3 之前、往 shim 里塞 printf、删类、删豁免、留着 r279 旧类）
+  逐条报过错——最后一种一开始没抓住，因为断言找的是 `"r279"` 而旧类写的是 `"r279-aks"`，已收紧。
+- **判据（刷前写死）**：`aks late` 整段缺席 ⇒ 定时器没响或 tee 丢了它，此时以普查计数器为准，下一刀是把表交给普查印
+  （要一张板级补丁）；`open 0 pid=… comm=datamigrator` 且调用 rc 全 0 ⇒ 剩的 stall 在 keystore 下游，
+  下一刀是 workloop 里那五个等待者；表里全是 `e00002c7` ⇒ 客户端契约仍被拒，下一刀是把没答的选择器补上。

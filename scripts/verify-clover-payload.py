@@ -1116,11 +1116,19 @@ def check_sb_sample(kernel: bytes) -> bool:
              # six tenths of a second before its own gate: an instrument that only speaks from the census
              # cannot testify about a boot that ends before it, and a payload that lost one of these rows
              # would report "nobody asked" for a keystore that nobody shipped.
-             "aks-say-up": (b"clover r279: aks up service=%llx sls=%u state=%d\n") in kernel,
-             "aks-say-open": (b"clover r279: aks open n=%u pid=%d comm=%.20s\n") in kernel,
-             "aks-say-refused": (b"clover r279: aks refused n=%u pid=%d comm=%.20s\n") in kernel,
-             "aks-say-call": (b"clover r279: aks call n=%u pid=%d comm=%.20s sel=%u rc=%x\n") in kernel,
-             "aks-say-capped": (b"clover r279: aks calls capped at=%u last_sel=%u last_rc=%x\n") in kernel,
+             # Round280 replaces round279's five event rows with one late table, and the reason is on the
+             # card: boot 67 kept 758 kernel lines into a 512-record ring, so the reading that came back
+             # spanned 1458.7 s to 1814.1 s and every open and call -- all of them before 1500 s -- had
+             # rotated out. Whole literals are pinned because a boot that says the state without naming
+             # callers is exactly the half-reading that already cost this board a round.
+             "aks-say-late": (b"clover r280: aks late stage=%d status=%x service=%llx owner=%s "
+                          b"opens=%u calls=%u refused=%u other=%u\n") in kernel,
+             "aks-say-sel": (b"clover r280: aks sel%u n=%u rc=%x\n") in kernel,
+             "aks-say-open": (b"clover r280: open %u pid=%d comm=%.16s\n") in kernel,
+             "aks-say-call": (b"clover r280: call %u pid=%d comm=%.16s sel=%u rc=%x\n") in kernel,
+             "aks-say-rows": (b"clover r280: rows open=%u/%u call=%u/%u dropped=%u\n") in kernel,
+             # The old rows have to be gone: they would spend ring space on readings the ring drops anyway.
+             "aks-say-r279-gone": b"clover r279: " not in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,
