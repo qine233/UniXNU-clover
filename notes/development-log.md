@@ -20598,3 +20598,78 @@ clover r271: cpu t=%llu real=%u max=%u reg=%u start=%u run=%u
 `reg=1` ⇒ 副核从没上来过，本板一直是单核，ADT 的八核与 `check-clover.py` 打印的「8 cores」都只是声明；
 `reg=8 start=8 run=1` ⇒ 核都在、只有一颗出 idle，问题回到唤醒路径，且这一次有正面起点；
 `reg=8 run=8` ⇒ 调度器手里有核可发，这一格问不出更多东西了，下一格是 workloop 的 `wl_request` 事件。
+
+
+## r271 的前置查档（等 boot 58 这段时间在树上读的，与上一轮的判据直接相关）
+
+**① `reg=` 的含义比我写标题时以为的更强：只有真起来的核才会占一格。**
+`CpuDataEntries[cpu].cpu_data_vaddr` 唯一的写点是 `osfmk/arm64/cpu.c:879` 的
+`cpu_data_register()`，而调用它的是那颗核自己上电后跑的 `arm_init_cpu` 一条路
+（启动核另有 `arm_init.c:456` 直接把 `&BootCpuData` 填进 `CpuDataEntries[master_cpu]`）。
+树里**没有**「先按 DT 声明给每颗核预分配槽位」这一步。所以 `reg=1` 不是「内核只登记了 1 颗」这种弱判据，
+而是「除此之外没有第二颗核进过内核」——ADT 声明八颗与这件事完全无关。这一条写进标题时我说成了
+「注册过几颗」，语义要更硬才诚实。
+
+**② 副核的放电路径只有一条，而且它要求 PMGR 干活。**
+`cpu_start()`（`osfmk/arm64/cpu.c:903`）在非本核的分支最后一步是
+`(void) PE_cpu_start(cpu_data_ptr->cpu_id, NULL, NULL)`；本板这颗内核里 `PE_cpu_start` 的实现是
+`iokit/Kernel/arm/AppleARMSMP.cpp:266`，函数体只有：`gPMGR->enableCPUCore(cpu_id, 0)`
+（`APPLEVIRTUALPLATFORM` 那支还要显式递 `LowResetVectorBase` 的物理地址）。
+两个读数都记下来：返回值被 `(void)` 丢掉，且 `AppleARMSMP` 这条路是 Apple PMGR 的形状——
+SDM660 没有 Apple PMGR，我们的 `ApplePMGRNub`（r83 照 sheng 形状发的）有没有真提供
+`enableCPUCore`、它接到的是哪个寄存器，**目前没有任何读数证明过**。
+如果 boot 58 落进 `reg=1`，下一刀问的就是这个，不是「ADT 少声明了几颗核」。
+
+**③ 「内核有没有试着放核」这件事可以零补丁看见。**
+`cpu_start()` 在被 `processor_should_kprintf(processor, true)` 放过的那一行里就是
+`kprintf("cpu_start() cpu: %d\n", cpu)`——它是进 msgbuf 的内核日志，而 CloverSdhci 的 tee
+本来就是按前缀白名单从 msgbuf 里挑行。也就是说 r272 只要加一条
+`{ "cpu_start()", "r272-cpustart", 16, 0, 0, 0 }`，不改内核、不加补丁，就能把
+「从没调用过 cpu_start」与「调用了但核没醒」分开——这正是 `reg=1` 那一支里唯一还要猜的部分。
+（诚实的边界已经关掉：`processor_should_kprintf` 在 `osfmk/kern/processor.c:1081`，函数体是
+`return reason != REASON_CLPC_SYSTEM;`——只有 CLPC（簇电源控制）引起的上/下线才闭嘴，
+初始 `last_startup_reason` 不是它，所以副核第一次 `cpu_start` 一定出声。）
+
+
+## r271 读数（boot 58）：本板一直是单核，「唤醒路径」这一支当场结掉
+
+**① 三条拍火全同一句**（t=1339/1479/1733，pid=58 的普查与 pid=146 的债主普查都到齐）：
+
+```
+clover r271: cpu t=1339 real=1 max=8 reg=1 start=0 run=1 s=00000000 r=10000000 tm=223730,0,0,0,0,0,0,0
+clover r271: cpu t=1479 ... tm=247650,0,0,0,0,0,0,0
+clover r271: cpu t=1733 ... tm=292260,0,0,0,0,0,0,0
+```
+
+**② 落在预先写死的第一格，而且比预想的更硬。** `reg=1`：`CpuDataEntries[]` 的 vaddr 只由那颗核自己
+上电后经 `cpu_data_register()`（`cpu.c:879`）写，启动核由 `arm_init.c:456` 直接填 —— 这棵树里**没有**
+「按 DT 声明给每颗核预分配槽位」那一步，所以 `reg=1` 的意思不是「内核只登记了 1 颗」这种弱读数，
+而是「除启动核外没有任何第二颗核进过内核」。`real=1`（`real_ncpus`）与 `max=8`（这颗内核的
+`MAX_CPUS` 编译期值）一起把边界也量出来了：ADT 声明的八核、`check-clover.py` 打印的「8 cores」
+到现在为止都是**声明**，不是在线数。
+
+**③ `start=0` 必须读准，别把它念成「没有核在跑」。** `StartedState` 由 `processor_start()` 置位，
+而启动核自己不走这条路；所以这颗 0 说的是「没有任何副核被 start 过」。同一行的 `run=1`/`r=10000000`
+（`cpu_running` 只在 slot 0 为真）与 `tm=223730` 才是「那颗核活着」的正面读数。
+
+**④ 两台仪器在这一格里咬合上了，这一点值得单独记。** 内核自己的 `cpu_stat.timer_cnt[0]` 与 r270 那行
+驱动侧的 `armcpu_core_timer[0]` **同一次拍火同为 223730**（t=1479 时同为 247650，t=1733 同为 292260），
+其余七格两边都是 0。上一轮我怕的是「驱动数的是中断、内核数的是它派发过的时钟」两边会不一致，
+读数是不一致**不存在**——所以 r270 那句 `sent=0 recv=0` 与这一句 `reg=1` 是同一件事的两面：
+单核机器不需要跨核唤醒，调度器从没请求过，驱动也就从没发过。
+
+**⑤ 对本格病情的影响要说小一点，不要说大。** 「八条线程全睡、0 条可运行」不是被单核造成的：
+债主 pid 146 这次是 `threads=8/9 wait=8/9 run=0`，而那份唯一发送权就攥在它自己任务里
+（`clover r269: srhost ... hit=146 name=3903 scanned=78 probed=78`），**再加七颗核也不会有人替它
+`signal`**。所以 SMP/唤醒这条支线到此为止（它作为一个「移植保真度」的洞还开着，但不是桌面这一格的钥匙）。
+桌面那一格回到 boot 57 之前就写好的第三格：workloop 的 `wl_request` 事件——
+五条工人睡在同一只 kqwl（r267 已证同一 `ctx`），没人往里面放活儿。
+
+**⑥ r272 定为一趟「零内核补丁」的轮次，只动驱动的 tee。** 上一节查档找到了入口：
+`cpu_start()` 里那句 `kprintf("cpu_start() cpu: %d\n", cpu)` 进的是内核 msgbuf，而 CloverSdhci 的
+tee 本来就按前缀白名单从 msgbuf 挑行（r175/r176 那条通道）。所以只要加一条
+`{ "cpu_start()", "r272-cpustart", 16, 0, 0, 0 }`，就能把两件现在还没有分开的事分开：
+`reg=1` 到底是「内核从没试着放副核」（一行 `cpu_start()` 都没有），还是「内核试了、
+`gPMGR->enableCPUCore()` 这条 Apple PMGR 形状的路在 SDM660 上不干活」（有几行、核仍不醒）。
+后一支才真的需要往 PMGR/固件那边动刀。**注意这一轮的判据要预先写成两格而不是三格**：
+这一趟不碰内核，所以 `LATE_PATCH`、补丁复制、`bb-*` 镜像针都不动，只有 tee 与 checker 的类表。
