@@ -20882,3 +20882,25 @@ tee 类 `{ "clover r274: ", "r274-map", 32, 0, 0, 0 }`；补丁
 **这条路不是不能走，但它不该比读数更贵**：r274 那一行是板上直接量出来的，先把量到的用掉，
 宿主猜的只当交叉验证；真要修这个脚本，也等 `ne=/e0..e3` 到手之后再说。
 
+## r274 读数（boot 61，文件 `boot62-r274.txt`）：两台仪器撞上同一个基址，等待被念成了函数名
+
+**① 互证。** 板上报 `e0=100a09000-100a29000`（128 KiB，正是这颗二进制的 `__TEXT` 大小）⇒ 加载基址 `0x100a09000`、
+slide `0xa09000`。我先前只用 boot 60 的四条帧在宿主穷举（判据是「每条 return address 的前一条必须是 `bl/blr/b/br`」，
+把页对齐候选从 10 个砍到 1 个）得到 boot 60 的 `0x10116b000 / slide 0x116b000`。把 boot 61 的
+`100a15d50 / 100a179fc / 100a181a0 / 100a123d0` 减掉板上报的 slide，得到
+`0x10000cd50 / 0x10000e9fc / 0x10000f1a0 / 0x1000093d0`，**与 boot 60 逐帧相同**。两趟靴、两台仪器、一个答案。
+**② 我事先的预期错了一格，但错得不影响用途**：我猜 `e0` 会是 `__PAGEZERO`，实际 `e0` 就是 `__TEXT`
+（枚举从头开始就到它）——要的「基址」正好是它。这也说明 `ne=66` 的映射表足够长，四条窗口够用。
+**③ 念出来的东西**（`scripts/clover-name-main-image.py`：`nm` 无符号 ⇒ 用 `LC_FUNCTION_STARTS` 定函数边界，
+用 `__stubs` / `__objc_stubs` 的 GOT slot 与 `__objc_selrefs` rebase 反查导入名和选择器）：
+`0x10000cd50` 落在一个只有 32 字节的函数里，它先 `-sema` 取信号量，再 `dispatch_semaphore_wait(x1 = -1)`；
+上一层在 `alloc/init`、`setDelegate:`、`activate` 之后调 `-waitUntilPreboardDidFinishUnlock`；
+再上一层来自 `-_unlockKeyBagUseOfForceIsAuthorized`；而睡在同一只 workloop 上的等待者，栈是
+`-migrateCheckingNecessity:...:migrationResultHandler:` → `-startMigrationAndOrBlockIfNecessary...` → `dispatch_sync`。
+于是 r273 的「loop 内互等」有了动机：**datamigrator 的 XPC 处理器在等设备完成解锁**；本板 r252 的账本早就记着
+PreBoard 问了 `IODeviceTree:/arm-io/sep` 且 `missing=1`（我们没有 SEP）。
+**④ 下一轮换一个对象问。** sheng 到桌面靠的不是真 SEP：它自带 `AppleKeyStoreState`
+（`package/KeyStoreProbe.cpp` + `sheng-aks=1`，回答「无密码、开机即解锁」，其余 selector 一律按「服务不可达」失败）。
+r275 不再追 datamigrator，而是量「该发通知的人卡在哪」：给 PreBoard 做一次同形状普查（threads/wait/run +
+每条线程 hint 与栈），并打一行「IORegistry 里有没有 AppleKeyStore」。**「没有 keystore」要做成读数，
+不能继续做成推论**；在看到那个等待之前，不做锁状态模拟、不写 keystore 驱动。
