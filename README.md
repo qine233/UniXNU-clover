@@ -47,7 +47,7 @@ leave」一路收紧到一句可测的话：
 | 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路好，但核心版本字不在 v5 带内，APID 一个没认 | 弄清版本字、认 APID、读轨开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 自校验通过），判决行还没上屏 | 有边就上 GLINK/APR；没镜像先压 `vadsp` 电源 |
 | 5 | watchdogd 每次起就崩 | 自身可执行文件里 `brk #1`（`IOWatchdog` 服务不存在），已摘除致命 | 写最小 `IOWatchdog` 服务，或让 plist 不再要求它 |
-| 6 | **GPU/Metal 一个都没有**（Adreno 512 无驱动、无固件、无 renderer） | `gpu` 区 `planned`；r282 只读探针量时钟/GDSC，r286 已发真上电序列（GDSC/时钟 + chipid 读回），待冷刷 | 读回 chipid 再分岔；**用户定：先 CPU 硬顶桌面，GPU 只并行推进** |
+| 6 | **GPU/Metal 一个都没有**（Adreno 512 无驱动、无固件、无 renderer） | `gpu` 区 `planned`；boot 74 实机：**r286 上电写序列在本板第一次生效**——`cx_on=1`、`gfx3d_en=1`、AHB/BIMC 三票=1（eMMC 正对照成立），但 `gx_on=0`，因为 `rcg=80000000`（gfx3d_clk_src 的父源 CONFIG=0，正是 r286 没设的那一半）→ `chipid skipped` | 下一步由数据定：r288 先编 RCG 父源+频率再重走 gx，读 `chipid`（对 0x05010200）；**桌面仍 CPU-first** |
 
 1 挡住桌面；6 是 1 最可能的病根（尚未证）；2–4 是之后要补的板级驱动，5 只是噪声。
 

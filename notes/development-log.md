@@ -21628,3 +21628,32 @@ verify manifest 门 `deadline in args`。
 两件事：① 桌面在 1800 s 窗口里的真实形状（census / datamigrator / keystore 各行照旧）；② **r286 的
 GPU 上电结果第一次读得到**——`gdsc` 行 `cx_on / gx_on / gfx3d_en` 与 `chipid=` 那行（对上
 0x05010200 则 `ok=1`；`chipid skipped` 点名哪个门没开）。桌面仍 CPU-first，GPU 只是并行取证。
+
+### boot 74 读数（r287 实机，v0.6.83）
+
+冷刷 + 死线自动落回成功：boot 计数 73→74，`--boot-after-flash` 的着陆重新可用，一次 dd 带回 512 行
+内核日志。两条新事实：
+
+* **GPU 写序列第一次在本板生效**（boot 73 跑的是 r282 只读，r286 从没飞过）。`clover r286: gpu` 的
+  `gpucc post` 行：`cx=a0282000 cx_on=1 cx_collapse=0` 与 `cxhw=80001fe0`（bit31 置位）——**CX 电源域
+  真上了电**；`gfx3d_en=1`、`gcc gpu_ahb=1 gpu_bimc=1 bimc=1`（三票都成，且同页 eMMC 两票照常=1，正
+  对照成立）。对比 boot 73 只读的 `cx_on=0 cx_collapse=1 gfx3d_en=0 bimc=0`——写路径把硬件从「固件留的
+  接口态」推到了「CX 开、gfx3d 使能」。**但 `gx=08282000 gx_on=0`（尽管 gx_collapse=0）、`chipid skipped
+  cx_on=1 gx_on=0 gfx3d_en=1`：GX 没起来，chipid 的门按预写的判据点名 gx_on。**
+* **根因线索钉在同一行**：`rcg=80000000`。gfx3d_clk_src 的 cmd_rcgr（0x1070）读回只有 bit31、CONFIG
+  父源选择位=0——正是 r286 标题自己划下的那条界「a branch enable and a rate this round did not set are
+  two different answers」。分支使能成了，但没给它一个跑起来的时钟源，所以喂给 GX 的 gfx3d 时钟实际不
+  转，GX 域上不了电。**下一步由数据决定，不猜**：r288 先编 RCG 的父源（选 CXO）与测试门，再重走
+  gfx3d/gx，读回 `gx_on` 与 `chipid`（对上 0x05010200 则 `ok=1`）。
+
+**一条计划外的致命异常，而且第一次读得回来**：boot 74 没跑到普查（census 在 >1500 s），它自己的
+kind-20 记录不是 1800 s 死线，而是 `Kernel data abort. at pc 0xfffffff007a702d4 lr 0xfffffff00568971c`。
+宿主 `nm` 解：pc 落在 `_memmove`（寄存器 x0=…fc985000 / x1=…fae8a000 / x2=0x1fe0，一次约 8 KB 的内核
+缓冲间拷贝），lr 的最近下方符号是 legacy display 的 surface 路径。异常前的最后内核行是 t=1419 的
+`clover r155: hdr main`（dyld 共享缓存头读数）。这条 ~1420 s 的早停落在过去几次「静默无记录早停」的
+同一时段带（boot 68 @1324、boot 63 @1499）——**恢复死线的意外收获是：r196/r198 的 BCB + panic 排干现在
+对任何 panic 都生效，这条间歇性 surface/memmove 早停第一次带着寄存器窗口回来**。与 GPU 写的因果只有一
+条样本（boot 74 恰是第一次跑 GPU 写），**未证，别当结论**；桌面这一格此刻仍读到债主 pid 150 datamigrator
+的 workloop `tr=5 tc=0 tt=3c9 ow=0`、`pth … peer=198:com.apple.migra`，与既往一致。r288 一趟同时兼作对照：
+若普查能跑到 ⇒ 这条早停是间歇的、与 GPU 无关；若又死在同一处 ⇒ 才谈得上把 surface/memmove 与 GPU 上电
+挂钩。桌面仍 CPU-first。
