@@ -21366,3 +21366,64 @@ GPUCC 行、两处 map failed、两处 notimer）。标题与两处 title 断言
 修法：改完 `configs/*_defconfig` 一律重跑 `./unixnu defconfig clover_defconfig`，再看链接行。
 `check-clover.py` 只能读仓库里的 defconfig，看不到 `out/` 快照，这个顺序只能写进流程。
 
+## r281 读数（boot 69，文件 boot70-r281.bin.txt）：看门狗从未被武装，而卡最后一次写入比内核最后一行早 11 s
+
+**① 判据的第一支落定：APSS 看门狗不是行刑者。** 两拍都读到复位默认值——
+
+```
+[738.103922] clover r281: wdt t=738 en=0 armed=0 intmask=0 sts=0 bark=524287 bite=1048575 bark_ms=16001 bite_ms=32002
+[861.134467] clover r281: wdt t=861 en=0 armed=0 intmask=0 sts=0 bark=524287 bite=1048575 bark_ms=16001 bite_ms=32002
+```
+
+`en=0`（控制寄存器的使能位）、`armed=0`（`AppleARMWatchdogTimer` 的武装状态）、`intmask=0`、`sts=0`，
+bark/bite 都是 16.0/32.0 s 的复位默认值 ⇒ **这颗 0x17817000 从头到尾没人启动**。r280 ④ 那条
+「watchdogd 不喂狗 → 硬件 WDT bark」的假设到此被读数否掉，不再沿着它做修法。
+
+**② 正对照都在，所以 0 是 0。** r281 的状态行按周期落到环里：`fire=5`（738 s）→ `fire=6`（861 s），
+keystore 三格全活——`stage=3 status=0 service=fffffff4610503e0 owner=IOResources`，`opens 26→30`、
+`calls 90→109`、`refused=0`、`other=1`；747 s 那拍的表 `rows open=8/26 call=12/90 dropped=96` 说明表的
+读写路径也在转（`dropped=96` 是环的固有丢弃，不是本轮丢的）。驱动环里只有一条 `boot id=69`，
+文件号 70 ↔ 启动号 69 对得上。⇒ 仪器活着；`wdt` 的 0 不是「没读到」。
+
+**③ watchdogd 自己崩了两次，但它的崩溃不能复位板子。** 两行 BRK：
+
+```
+[724.742847] clover r199: ubrk pid=165 comm=watchdogd ... esr=0xf2000001 ec=60 brk=0x1
+[850.975888] clover r199: ubrk pid=185 comm=watchdogd ... esr=0xf2000001 ec=60 brk=0x1
+```
+
+两个不同 pid ⇒ launchd 把它拉起来过第二次；r200 的 `map=1 start=0x100703000 end=0x100713000 off=0xab0c`
+把现场钉在它自己的 __TEXT 里。这与 sheng 的注释「hardware watchdog not implemented」一致：
+用户态看门狗发现没有可用的后端就 BRK。但 ① 已经说明 WDT 没被 arm，所以**它崩或它跑都不是板子回去的原因**。
+
+**④ 收笔形状（卡通道）。** 飞行区 12 条 entry（seq 147271..147282）：最新一条 `seq 147282 t=918449 ms
+pid=135 comm=mobileas write lba=34681848 blocks=8`；4 条 beat 里最新 `seq 107 t=915175 ms`，与 entry
+相隔 3274 ms（4 s 节拍正常）；`stuck=5 recov=5 miss=121` 是老毛病。解码器另外打印的
+`deadline t=1802275 elapsed=1800.000s` 与两条 panic 标记**都带 `boot=66`**，是飞行区没清零留下的旧记录，
+不是 boot 69 的；本靴没有任何属于自己的 deadline/panic 记录。
+
+**⑤ 内核最后一行是 929.733467 s**（`clover r234: beat t=929 pid=58 rn=3d03 rep=390b`），比最新 entry
+（918.449 s）晚 **11.3 s**。所以 r280 ② 的「日志停 = 板子停」必须收窄：teeing 与飞行记录都是 eMMC 写，
+**卡堵住时它们会滞后**；能在卡外说话的那一路（r283 要加的）才有资格定义「最后一次执行」。
+
+**⑥ 时间账。** 任务 22:04:42 起、22:22:24 落进 TWRP ≈ 1050 s，**远早于 1800 s 死线**；内核最后写到
+918–930 s，到落点还有 25–45 s。TWRP 的 PMIC PON 读数是「PS_HOLD 撤销 + Hard Reset、cold boot」
+（SID2 PON1/GP1）。PS_HOLD 只能说明是 SoC 自己发起的受控复位，**分不开软件 reboot 与硬件 WDT**；
+分开它们的是 ①，而不是 PON。
+
+**⑦ 现在的假设（收窄版）。** 板子在 918–930 s 之间停止走软件通道；复位前后卡处于 `stuck=5` 状态，
+所以 panic 汇与飞行区都可能写不进去。要么是一次 panic 在卡堵时发生（panic 屏 20 s 后自己 PSCI 复位，
+正好解释 25–45 s 的空档），要么是一条不经 panic、也不经卡的复位路径（`halt_all_cpus` / `IOPM` / 别的
+平台代码）。r283 不去猜，直接让复位入口在**卡外的 IMEM** 留一句话。
+
+**⑧ sheng 对照（规矩：先查 sheng）。** 两条都不能照搬：`package/BootResetCore.h` 的 SDAM 单元是
+SM8550 的 `0xc400000` 系地址，clover 的 SPMI 窗口是 SDM660 的另一组（`PowerArb.h` 只读且明确没有
+写路径），搬过来只会指向不存在的寄存器；`BootWatchdogPolicy.c` 禁用 `com.apple.watchdogd` 的前提是
+「硬件看门狗在喂」，而 ① 证明本板 WDT 从未武装，前提不成立。**结论：本轮不抄任何 sheng 修法，先补仪器。**
+
+**⑨ r283 仪器（卡外、跨复位）。** 用 clover 的 IMEM 空洞 `0x660..0x6af`（20 字，DT 里没有子节点认领）：
+一个记录槽（magic/kind/pid/aux/CNTVCT/comm 文本/启动号/心跳计数）加一条每拍递增的 CNTVCT 心跳。
+复位入口（`PEHaltRestartInternal` → `gIOPlatform->haltRestart` 之前）与 panic 屏各写一次 kind；
+`clover_unattended_begin` 在下次启动时把它读回来印一行再清零。**有记录 = 软件路径点名了它；
+没有记录 = 复位不经过内核任何已知入口，下一步再往 PSCI 之外找。**
+
