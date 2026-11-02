@@ -21287,3 +21287,46 @@ exec launchd 之前写 `/private/var/db/com.apple.xpc.launchd/disabled.plist`，
 2. **量 0x17817000**：照 CloverInput/CloverPower 的形状在拍里读 WDT 的 CS/RCS 与 bark 时间并印一行
    （armed? bark 还剩多少？）。若 WDT 被 arm 且 bark 时间与早停间隔同量级，④ 那条假设就从「像」变成「是」，
    下一步才是照 sheng 把 watchdogd 禁用（或把 `AppleARMWatchdogTimer` 的处理弄清楚）。
+
+## r281 实现、构建与归档（v0.6.76）
+
+**boot 68 的结论只有一句**：这一轮的两个说话点都没到，板子在 1324.217 s 静默止住；节拍本身没有
+断档（每百秒 192→143→97→44 是在变慢，不是消失），本靴也没有 panic 记录。所以「日志没了」等于
+「板子不执行了」，不是 tee 的问题；三个早停时刻（726/1324/1499 s）对三个跑到 1813/1814 s 的靴子，
+是间歇事件，与发不发 keystore 服务无关。r278 那句因果到此第二次撤回，这次连分母一起记下。
+
+**实现**（`package/CloverKeyStoreProbe.cpp`）：
+
+- 状态行改成周期：`CLOVER_AKS_FIRST_MS = 240000`、`CLOVER_AKS_STATE_MS = 120000`，
+  `clover_aks_say()` 末尾用 `sender->setTimeoutMS(...)` 在回调里重挂自己；open/call 表每第 5 次
+  点火说一次（`CLOVER_AKS_TABLE_EVERY`）。t 用 `clock_get_uptime` + `absolutetime_to_nanoseconds`
+  现量，不拿点火次数推。
+- WDT 行：`0x17817000` 的 `EN(0x08)/STS(0x0c)/BARK(0x10)/BITE(0x14)`，`withRange` +
+  `kIOMapAnywhere|kIOMapInhibitCache` + `volatile` 读 + `dsb sy`（照 CloverInput 的 windowRead），
+  首次点火时懒映射，映射失败只印一次 `nomap`；`bark_ms/bite_ms` 按驱动自己的 32765 Hz 换算。
+- 解耦：`clover_aks_arm(NULL)` 放在 `native_keyevents_stage = 1` 之后（资源服务 work loop），
+  stage=3 之后再 `clover_aks_arm(service)`，函数幂等——发布被拒也留得住硬件行。
+- 一个编译坑：这个 SDK 没有 `IOKit/IOMemoryMap.h`，`IOMemoryMap` 声明在
+  `IOKit/IOMemoryDescriptor.h`；include 错时后台通知仍报 exit 0，是日志里 `exit=1` 才说明内核
+  构建其实没成。
+
+**契约**：`check-clover.py` 的 r280 块换成 r281 块（七条格式串、全部宏、两处 `setTimeoutMS`、
+`stage=1 < arm(NULL) < stage=2`、`stage=3 < arm(service)`、teeing 类 `r281-aks` 128 行与 `r281`
+每趟豁免、r279/r280 串反向钉）；`verify-clover-payload.py` 钉 `aks-say-state/wdt/wdt-nomap/sel/
+open/call/rows` 与两条 `*-gone` 负条。
+
+**产物**：内核 `9c031702`（8 条 r281 串、0 条 r279/r280）→ AMFI `532c9a50`（r163/r164 两刀）→
+normalize `4dfdc0d3`（972 个戳归零）→ payload `4ff2446a`，归档
+`~/clover-out/round281-v0.6.76-payload.img`；`mdir` 六个文件齐。**上机未发生**：板子不在 USB 上
+（`adb devices`/`fastboot devices` 空），所以这一轮没有任何帧读数被声称。
+
+## GPU 并行线开工（与 r281 同轮，不占靴）
+
+按用户 2026-11-02「测完这一轮后把 GPU 驱动也放进来并行」的指令，先把只读上电/时钟取证写成底稿
+`notes/gpu-bringup.md`：GPU `0x05000000+0x40000`、chipid `0x05010200`、GPUCC `0x05065000`、
+GCC `0x01830000`、SMMU `0x05040000+0x10000`（三根 IRQ、GPU bank `gpu-offset 0x48000`）、
+GDSC `gdsc_gpu_cx/gdsc_gpu_gx`（GX 需要 `GFX3D_CLK_SRC`）、zap PAS 13 `a512_zap` 在
+`0xf0b00000+0x2000`，以及 a5xx 没有 GMU、用 RB 侧 `a530_pfp/a530_pm4` µcode 这一组事实。
+r282 候选只读不写：chipid / GPUCC / GDSC / SMMU 识别，判据（`0xffffffff`＝AHB 未开、全零＝
+未上电、GDSC 已开）先写死；桌面路线仍是 CPU-first，GPU 线只是并行推进。
+

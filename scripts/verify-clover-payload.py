@@ -1116,18 +1116,21 @@ def check_sb_sample(kernel: bytes) -> bool:
              # six tenths of a second before its own gate: an instrument that only speaks from the census
              # cannot testify about a boot that ends before it, and a payload that lost one of these rows
              # would report "nobody asked" for a keystore that nobody shipped.
-             # Round280 replaces round279's five event rows with one late table, and the reason is on the
-             # card: boot 67 kept 758 kernel lines into a 512-record ring, so the reading that came back
-             # spanned 1458.7 s to 1814.1 s and every open and call -- all of them before 1500 s -- had
-             # rotated out. Whole literals are pinned because a boot that says the state without naming
-             # callers is exactly the half-reading that already cost this board a round.
-             "aks-say-late": (b"clover r280: aks late stage=%d status=%x service=%llx owner=%s "
+             # Round281 replaces round280's one late table with a repeating schedule, because boot 68 stopped
+             # at 1324 s before the table and a reading with one speaking time only describes boots that reach
+             # it. Whole literals are pinned: the state row, the watchdog row and its no-map arm are three
+             # separate readings, and a boot that ships two of them leaves the third to be inferred.
+             "aks-say-state": (b"clover r281: aks t=%u fire=%u stage=%d status=%x service=%llx owner=%s "
                           b"opens=%u calls=%u refused=%u other=%u\n") in kernel,
-             "aks-say-sel": (b"clover r280: aks sel%u n=%u rc=%x\n") in kernel,
-             "aks-say-open": (b"clover r280: open %u pid=%d comm=%.16s\n") in kernel,
-             "aks-say-call": (b"clover r280: call %u pid=%d comm=%.16s sel=%u rc=%x\n") in kernel,
-             "aks-say-rows": (b"clover r280: rows open=%u/%u call=%u/%u dropped=%u\n") in kernel,
-             # The old rows have to be gone: they would spend ring space on readings the ring drops anyway.
+             "aks-say-wdt": (b"clover r281: wdt t=%u en=%x armed=%u intmask=%u sts=%x bark=%u bite=%u "
+                          b"bark_ms=%u bite_ms=%u\n") in kernel,
+             "aks-say-wdt-nomap": (b"clover r281: wdt t=%u nomap\n") in kernel,
+             "aks-say-sel": (b"clover r281: aks sel%u n=%u rc=%x\n") in kernel,
+             "aks-say-open": (b"clover r281: open %u pid=%d comm=%.16s\n") in kernel,
+             "aks-say-call": (b"clover r281: call %u pid=%d comm=%.16s sel=%u rc=%x\n") in kernel,
+             "aks-say-rows": (b"clover r281: rows open=%u/%u call=%u/%u dropped=%u\n") in kernel,
+             # Both earlier shapes have to be gone: they would spend ring space on readings the ring drops anyway.
+             "aks-say-r280-gone": b"clover r280: " not in kernel,
              "aks-say-r279-gone": b"clover r279: " not in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"

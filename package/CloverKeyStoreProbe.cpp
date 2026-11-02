@@ -38,7 +38,11 @@
 // board, so sheng's boot_progress_ext rows are not available and could not be read anyway; the
 // counters are exported instead, which is also what makes them readable by a second instrument.
 #include <IOKit/IOService.h>
+#include <IOKit/IODeviceMemory.h>
 #include <IOKit/IODeviceTreeSupport.h>
+// IOMemoryMap is declared in IOMemoryDescriptor.h in this SDK; there is no IOMemoryMap.h, and the
+// drivers/CloverInput mapping this file copies gets the class from the same header.
+#include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
 #include <libkern/c++/OSData.h>
@@ -48,6 +52,7 @@
 #include <libkern/c++/OSSymbol.h>
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
+#include <kern/clock.h>
 #include <string.h>
 #include <kern/task.h>
 #include <sys/proc.h>
@@ -75,18 +80,27 @@ volatile uint32_t native_aks_last_selector;
 volatile int32_t native_aks_last_rc;
 
 /*
- * Round279 opened this file's voice and round280 changes only *when* it speaks. The design below is the
- * second attempt at the same question -- who opened the keystore and what did they ask -- and the first
- * attempt's failure is the reason for its shape: round279 printed each event as it happened, and boot 67
- * read nothing, because the card's kernel-log ring keeps 512 records and the tee pushed 758 that boot, so
- * what survived covered 1458.7 s to 1814.1 s. Events at 470..1500 s were printed, kept, and rotated out.
- * A row the ring cannot keep is not a reading, so the events are recorded here and said once at 1600 s --
- * after the census' 1500 s gate, before the 1800 s deadline, inside the window the ring does keep.
+ * Round281. Round280 built one late table so a row would outlive the ring's horizon, and boot 68 answered
+ * the other half of that lesson: the table spoke at 1600 s and the board was gone at 1324.217 s, so the
+ * shape that keeps a row for 355 s was still silent -- it had one speaking point, and the stop came
+ * before it. These stops are intermittent (726, 1324 and 1499 s against 1813, 1814 and 1814 s on the
+ * same image family), so the reading cannot be a moment. This round speaks on a schedule instead: one
+ * state row every 120 s starting at 240 s, tables every fifth row. Wherever the board stops, its last
+ * row is at most two minutes old, and the ring keeps ten times that.
+ *
+ * The same beat reads the APSS watchdog, because a stop with no panic record and no log tail is what a
+ * hardware bite looks like. The block is 17817000.qcom,wdt -- TWRP's dmesg names it and /proc/iomem
+ * marks 17817000-17817fff as msm-watchdog -- and the offsets are the downstream driver's
+ * (drivers/soc/qcom/watchdog_v2.c, the one this chip's Linux boots with): RST 0x04, EN 0x08, STS 0x0c,
+ * BARK_TIME 0x10, BITE_TIME 0x14, with EN bit 0, UNMASKED_INT_EN bit 1, and both time registers counted
+ * in ticks of WDT_HZ=32765. Read only: nothing here writes RST, so this instrument cannot change the
+ * thing it measures. If the map fails the row says nomap and the state row still arrives, which keeps
+ * one broken reading from hiding the other.
  *
  * Why the counters stay in the census. opens=/calls=/sel7=/sel14=/sel17=/sel35= are printed from the
- * census at 1543 s on every boot that reaches it: if the late rows are missing and those counters are not,
- * the instrument failed and the events happened, which is the distinction a single-channel reading cannot
- * make on its own.
+ * census at 1543 s on every boot that reaches it: if the cadence rows are missing and those counters are
+ * not, the instrument failed and the events happened, which is the distinction a single-channel reading
+ * cannot make on its own.
  */
 
 // IOLib.cpp, declared extern "C" there. It hands back "pid <n>, <name>" as a +1 OSString, and round251
@@ -139,22 +153,31 @@ clover_aks_who(int *pid_out, char *name_out, size_t name_cap)
 }
 
 /*
- * Round280. Round279 printed these events the moment they happened and boot 67 proved that shape cannot be
- * read: the card's kernel-log ring holds 512 records and the tee kept 758 lines that boot, so what came back
- * covered 1458.7 s to 1814.1 s -- 355 s of a 1814 s boot -- and every row printed before ~1459 s was rotated
- * out. The opens and calls are all before that (the census at 1543 s counted 56 opens and 213 calls), so the
- * rows arrived and then left, and the boot reported nothing. An event row that the ring cannot keep is not a
- * reading; the reading has to be a state printed after the horizon the ring keeps. So nothing here prints on
- * the event. The first eight opens, the first eight refusals and the first twelve calls are copied into small
- * tables -- pid, comm, selector, return code -- and one row per table is printed by a timer armed at 1600 s,
- * which is after the census' 1500 s gate and before the 1800 s deadline, so its rows are inside the last
- * 355 s no matter what the boot does after it. The counters the census prints at 1543 s stay the copy that
- * rides no pipe at all: if the timer's rows are missing and the census' opens=/calls= are not, the instrument
- * failed and the events happened.
+ * Round281's cadence. Round279 printed these events as they happened and boot 67 read nothing: the card's
+ * kernel-log ring holds 512 records and that boot kept 758 kernel lines, so what came back covered 1458.7 s
+ * to 1814.1 s, and every row printed before the horizon was rotated out. Round280 answered that with one
+ * table at 1600 s and boot 68 ended at 1324 s, before the table. Both failures are the same mistake in
+ * different clothes: a reading with a fixed speaking time only describes boots that outlive it. So the
+ * events are still copied into small tables (pid, comm, selector, return code) and nothing prints on the
+ * event path, but the timer now repeats: one state row every 120 s from 240 s, the tables every fifth row.
  */
 #define CLOVER_AKS_ROWS        8
 #define CLOVER_AKS_CALL_ROWS  12
-#define CLOVER_AKS_LATE_MS    1600000u
+#define CLOVER_AKS_FIRST_MS    240000u
+#define CLOVER_AKS_STATE_MS    120000u
+#define CLOVER_AKS_TABLE_EVERY 5
+
+// The watchdog block the two TWRP facts name, and the downstream driver's offsets and tick rate. The
+// register numbers are quoted rather than guessed so a row that disagrees with them is a reading of a
+// different block, not a decoding question.
+#define CLOVER_WDT_PHYS        0x17817000ull
+#define CLOVER_WDT_BYTES       0x20
+#define CLOVER_WDT_EN          0x08
+#define CLOVER_WDT_STS         0x0c
+#define CLOVER_WDT_BARK        0x10
+#define CLOVER_WDT_BITE        0x14
+#define CLOVER_WDT_HZ          32765u
+
 struct clover_aks_row {
     int       pid;
     char      comm[20];
@@ -164,7 +187,59 @@ struct clover_aks_row {
 static clover_aks_row clover_aks_open_rows[CLOVER_AKS_ROWS];
 static clover_aks_row clover_aks_call_rows[CLOVER_AKS_CALL_ROWS];
 static uint32_t clover_aks_open_rowc, clover_aks_call_rowc;
+static uint32_t clover_aks_fires;
 static IOTimerEventSource *clover_aks_timer;
+static bool clover_aks_armed;
+static IOMemoryMap *clover_wdt_map;
+static volatile uint32_t *clover_wdt_regs;
+static bool clover_wdt_tried;
+
+// Measured, not derived from the fire count: a row that says t= must be able to disagree with the beat
+// above it, or it is not a second reading of the same boot.
+static unsigned
+clover_uptime_seconds(void)
+{
+    uint64_t uptime = 0;
+    uint64_t nsecs = 0;
+
+    clock_get_uptime(&uptime);
+    absolutetime_to_nanoseconds(uptime, &nsecs);
+    return (unsigned) (nsecs / 1000000000ull);
+}
+
+// Mapped on the first fire, not at bsd_autoconf: this reading is wanted beside a state row, and the
+// platform's memory picture is settled by then. The map is kept for the boot -- releasing it would only
+// unmap the page the next row reads -- so a failed map is remembered rather than retried every two
+// minutes.
+static void
+clover_wdt_open(void)
+{
+    IODeviceMemory *memory;
+
+    if (clover_wdt_tried) {
+        return;
+    }
+    clover_wdt_tried = true;
+    memory = IODeviceMemory::withRange(CLOVER_WDT_PHYS, CLOVER_WDT_BYTES);
+    if (memory == NULL) {
+        return;
+    }
+    clover_wdt_map = memory->map(kIOMapAnywhere | kIOMapInhibitCache);
+    memory->release();
+    if (clover_wdt_map != NULL) {
+        clover_wdt_regs = (volatile uint32_t *) clover_wdt_map->getVirtualAddress();
+    }
+}
+
+// Same barrier shape as drivers/CloverInput's windowRead: the loads are ordered before the row prints.
+static uint32_t
+clover_wdt_read(uint32_t offset)
+{
+    uint32_t value = clover_wdt_regs[offset / 4];
+
+    __asm__ volatile ("dsb sy" ::: "memory");
+    return value;
+}
 
 // Recorded, never printed: the caller's thread is the client's, and the only thing this path should cost it
 // is a copy of thirty-odd bytes.
@@ -190,15 +265,23 @@ clover_aks_record(clover_aks_row *rows, uint32_t *filled, uint32_t cap, uint32_t
     *filled = *filled + 1;
 }
 
-// The IOKit timer hands back the owner it was given; the owner here is the published service, so the print
-// can name the object it is reporting on. One-shot by construction: nothing re-arms it.
+// The scheduled reading. The IOKit timer hands back the owner it was given (the published service, or the
+// resource service when the publish did not happen), so the row can name the object whose work loop is
+// speaking. The tables are appended by client threads and read here without a lock: a row that is caught
+// mid-copy can misname one comm, and that is cheaper than making every client wait on a diagnostic.
 static void
-clover_aks_late_say(OSObject *owner, IOTimerEventSource *sender)
+clover_aks_say(OSObject *owner, IOTimerEventSource *sender)
 {
-    uint32_t k;
+    unsigned  t = clover_uptime_seconds();
+    bool      tables;
+    uint32_t  k;
 
-    printf("clover r280: aks late stage=%d status=%x service=%llx owner=%s opens=%u calls=%u refused=%u "
-        "other=%u\n", (int) native_keyevents_stage, (unsigned) native_keyevents_status,
+    clover_aks_fires++;
+    tables = (clover_aks_fires % CLOVER_AKS_TABLE_EVERY) == 0;
+
+    printf("clover r281: aks t=%u fire=%u stage=%d status=%x service=%llx owner=%s opens=%u calls=%u "
+        "refused=%u other=%u\n", t, (unsigned) clover_aks_fires,
+        (int) native_keyevents_stage, (unsigned) native_keyevents_status,
         (unsigned long long) native_keyevents_service,
         // getName() belongs to IOObject, not OSObject, and the owner the timer hands back is typed OSObject*;
         // casting is what keeps the row honest about which service it is reporting on rather than printing a
@@ -207,49 +290,86 @@ clover_aks_late_say(OSObject *owner, IOTimerEventSource *sender)
             ? OSDynamicCast(IOService, owner)->getName() : "?",
         (unsigned) native_aks_opens, (unsigned) native_aks_calls,
         (unsigned) native_keyevents_refused_opens, (unsigned) native_aks_other_calls);
+
+    // The watchdog row, every fire, beside the state it belongs to: this is the hypothesis under test, and
+    // a row that only appears once would be the same mistake round280 made with the tables.
+    clover_wdt_open();
+    if (clover_wdt_regs == NULL) {
+        printf("clover r281: wdt t=%u nomap\n", t);
+    } else {
+        uint32_t en = clover_wdt_read(CLOVER_WDT_EN);
+        uint32_t sts = clover_wdt_read(CLOVER_WDT_STS);
+        uint32_t bark = clover_wdt_read(CLOVER_WDT_BARK);
+        uint32_t bite = clover_wdt_read(CLOVER_WDT_BITE);
+
+        printf("clover r281: wdt t=%u en=%x armed=%u intmask=%u sts=%x bark=%u bite=%u bark_ms=%u "
+            "bite_ms=%u\n", t, en, en & 1u, (en >> 1) & 1u, sts, bark, bite,
+            (unsigned) ((uint64_t) bark * 1000ull / CLOVER_WDT_HZ),
+            (unsigned) ((uint64_t) bite * 1000ull / CLOVER_WDT_HZ));
+    }
+
+    if (!tables) {
+        goto rearm;
+    }
     for (k = 0; k < CLOVER_AKS_SELECTORS; k++) {
         if (k != 7 && k != 14 && k != 17 && k != 35) {
             continue;
         }
-        printf("clover r280: aks sel%u n=%u rc=%x\n", k,
+        printf("clover r281: aks sel%u n=%u rc=%x\n", k,
             (unsigned) native_aks_selector_hits[k], (unsigned) native_aks_selector_rc[k]);
     }
     for (k = 0; k < clover_aks_open_rowc; k++) {
-        printf("clover r280: open %u pid=%d comm=%.16s\n", k, clover_aks_open_rows[k].pid,
+        printf("clover r281: open %u pid=%d comm=%.16s\n", k, clover_aks_open_rows[k].pid,
             clover_aks_open_rows[k].comm);
     }
     for (k = 0; k < clover_aks_call_rowc; k++) {
-        printf("clover r280: call %u pid=%d comm=%.16s sel=%u rc=%x\n", k,
+        printf("clover r281: call %u pid=%d comm=%.16s sel=%u rc=%x\n", k,
             clover_aks_call_rows[k].pid, clover_aks_call_rows[k].comm,
             (unsigned) clover_aks_call_rows[k].selector, (unsigned) clover_aks_call_rows[k].rc);
     }
     // The honesty row: how much of what happened never reached a table. Without it a full table and a busy
     // system look the same, which is the mistake boot 67 just cost a round.
-    printf("clover r280: rows open=%u/%u call=%u/%u dropped=%u\n", clover_aks_open_rowc,
+    printf("clover r281: rows open=%u/%u call=%u/%u dropped=%u\n", clover_aks_open_rowc,
         (unsigned) native_aks_opens, clover_aks_call_rowc, (unsigned) native_aks_calls,
         (unsigned) (native_aks_opens + native_aks_calls > clover_aks_open_rowc + clover_aks_call_rowc
             ? native_aks_opens + native_aks_calls - clover_aks_open_rowc - clover_aks_call_rowc : 0));
+
+rearm:
+    // Re-armed from inside the callback: wakeAtTime() takes a new deadline while the source is enabled,
+    // and that is how a repeating IOKit timer is spelled. If the service is torn down the source goes with
+    // its work loop, which is the correct end of the schedule.
+    if (sender != NULL) {
+        (void) sender->setTimeoutMS(CLOVER_AKS_STATE_MS);
+    }
 }
 
-// Arm the one print. Done at the point the service is known to exist, because the timer goes on that
-// service's own work loop; if any step fails the census' counters are still the reading, so the failure is
-// silent by design and the late row's absence means only the table did not get to speak.
+// Arm the schedule. It belongs to the instrument rather than to the published service: the watchdog row is
+// not this service's reading, so an armed-but-withheld keystore must not take the hardware question down
+// with it. Called with NULL first (the resource service's work loop), and again with the service after a
+// successful publish only when that first attempt had nowhere to run.
 static void
 clover_aks_arm(IOService *service)
 {
-    IOWorkLoop *wl = service != NULL ? service->getWorkLoop() : NULL;
+    IOService  *owner;
+    IOWorkLoop *wl;
 
+    if (clover_aks_armed) {
+        return;
+    }
+    owner = service != NULL ? service : IOService::getResourceService();
+    wl = owner != NULL ? owner->getWorkLoop() : NULL;
     if (wl == NULL) {
         return;
     }
-    clover_aks_timer = IOTimerEventSource::timerEventSource(service, clover_aks_late_say);
+    clover_aks_timer = IOTimerEventSource::timerEventSource(owner, clover_aks_say);
     if (clover_aks_timer == NULL || wl->addEventSource(clover_aks_timer) != kIOReturnSuccess) {
         OSSafeReleaseNULL(clover_aks_timer);
         return;
     }
-    // Kept on purpose: the work loop holds the only reference it needs, and freeing this after arming would
-    // cancel the one reading this round exists to take.
-    (void) clover_aks_timer->setTimeoutMS(CLOVER_AKS_LATE_MS);
+    clover_aks_armed = true;
+    // Kept on purpose: the work loop holds the only reference it needs, and freeing this would cancel the
+    // one reading this round exists to take.
+    (void) clover_aks_timer->setTimeoutMS(CLOVER_AKS_FIRST_MS);
 }
 
 void native_keyevents_open_refused(void) {
@@ -312,6 +432,10 @@ extern "C" void clover_keystore_probe(void) {
         return;
     }
     native_keyevents_stage = 1;
+    // The schedule starts here, before any step below can refuse the publish: its watchdog row is not this
+    // service's reading, and r279/r280 both lost rounds to a schedule that only existed after the thing it
+    // measured succeeded. The first row is still 240 s away, well past bsd_autoconf.
+    clover_aks_arm(NULL);
     PE_parse_boot_argn("offline-keystore", &original, sizeof(original));
     native_keyevents_status = kIOReturnNotPermitted;
 
@@ -392,8 +516,9 @@ extern "C" void clover_keystore_probe(void) {
      * The publish itself is not printed here any more. Round279 printed it at bsd_autoconf, and boot 67
      * showed why that buys nothing: a line from the first second of the kernel's life is behind the ring's
      * 355 s horizon before anything can read it. The census prints the same stage and pointer at 1543 s --
-     * inside the horizon -- and the late timer row below prints it again from the service's own work loop,
-     * so the publish has two readings that both arrive after the ring learned to keep them.
+     * inside the horizon -- and the scheduled row prints them every 120 s, so the publish has two readings
+     * that both arrive after the ring learned to keep them.
      */
+    // Retries only if the early arm found no work loop; the guard inside makes this a no-op otherwise.
     clover_aks_arm(service);
 }

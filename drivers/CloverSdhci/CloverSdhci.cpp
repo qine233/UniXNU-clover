@@ -883,16 +883,16 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // runs is distinguishable from a round that was capped, and if the keystore rows ever starve the census rows
   // the two counters say which producer lost.
   { "clover r276: ", "r276-ks", 64, 0, 0, 0 },
-  // Round280 replaces round279's per-event rows with one late table, because boot 67 measured that the
-  // per-event shape cannot be read: the tee kept 758 kernel lines into a 512-record ring, so the card came
-  // back holding 1458.7 s to 1814.1 s -- 355 s of a 1814 s boot -- and every open and call row, printed at
-  // 470..1500 s, had been pushed, kept and rotated out before the host read it. The probe now records the
-  // first eight opens and twelve calls and says them from a timer armed at 1600 s, which is after the
-  // census' 1500 s gate and before the 1800 s deadline, so its rows land inside the window the ring keeps
-  // whatever else the boot prints. 40 bounds a producer of at most 22 rows (one late state, four named
-  // selectors, eight opens, twelve calls, one honesty row) and leaves the census rows printed a second
-  // later their own room.
-  { "clover r280: ", "r280-aks", 40, 0, 0, 0 },
+  // Round281 replaces round280's single late table with a schedule, because boot 68 measured the other half
+  // of the same lesson: the table spoke at 1600 s and the board was gone at 1324.217 s, so a reading with one
+  // fixed speaking time only describes boots that outlive it. The probe now says a state row and a watchdog
+  // row every 120 s from 240 s, and the keystore tables every fifth row (600 s). Wherever the boot stops, its
+  // last row is at most two minutes old, which fits inside the 355 s the 512-record ring kept on boot 67.
+  // 128 covers the whole schedule with room to spare: at most 15 state rows and 15 watchdog rows to the 1800 s
+  // deadline, plus two table dumps of twenty-five rows each (four named selectors, eight opens, twelve calls,
+  // one honesty row) is 105, and the cap is here so a runaway timer shows up as its own capped line instead of
+  // crowding the census rows out. Separate from r276-ks so the two producers' counters stay apart.
+  { "clover r281: ", "r281-aks", 128, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -4175,13 +4175,17 @@ static void teeConsumeLine (uint32_t &pushed)
   // the class budget of 64 still bounds it.
   // Round276 is exempt for exactly the same reason and gets checked the same way: it publishes the service the
   // r275 rows ask about, so its own rows have to be readable or a capped round looks identical to an absent one.
+  // Round281 rides the same burst and gets the same exemption for a sharper reason: its rows are printed from
+  // an IOKit timer on the work loop, far from the passes that carry the census, so they arrive beside whatever
+  // else shares that pass -- and a schedule whose row is dropped by the per-pass cap is indistinguishable from
+  // a boot that did not reach the next fire. The class budget of 128 still bounds it.
   const bool reserved = probe != nullptr &&
       (teeHasPrefix (probe->name, teeStringLength (probe->name), "r234-set") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r243") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r252") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r275") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r276") ||
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r280"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r281"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

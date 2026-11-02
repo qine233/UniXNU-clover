@@ -2906,51 +2906,70 @@ def check_board(errors: list) -> str:
             errors.append("board.toml passes clover-aks-sls: the reported lock state has to be the driver's "
                           "default (unlocked since boot) or the reading says nothing about the wait it targets")
 
-        # Round280. The bisect knob has to stay gone, the round279 event rows have to be gone with it, and what
-        # replaces them is the same question asked at a time the card can still remember. Boot 67 is the
-        # measurement: the tee kept 758 kernel lines into a 512-record ring, so the reading that came back
-        # spanned 1458.7 s to 1814.1 s -- 355 s -- and every open and call row printed at 470..1500 s had been
-        # rotated out. So the probe records and a 1600 s timer says the tables, after the census' 1500 s gate
-        # and before the 1800 s deadline. Position is the whole shape of this round, in three places: the arm
-        # comes after the service started, the record calls sit in the shims the vendored driver actually
-        # invokes, and nothing on the event path prints.
+        # Round281. Round280's one late table was a wager on the boot outliving 1600 s, and boot 68 ended
+        # at 1324 s before either the census or the table, so the wager lost to the same shape it was meant to
+        # fix -- a reading with one speaking time describes only the boots that reach it. The cadence is now
+        # the contract: state every 120 s from 240 s, tables every fifth fire, and the same timer reads the
+        # watchdog block every fire. The stops are 726/1324/1499 s against 1813/1814/1814 s, so a row must be
+        # inside the ring's 355 s horizon at every second a board could die, and 120 s between fires makes
+        # that true for any stop.
         bisect_probe = REPO / "package/CloverKeyStoreProbe.cpp"
         if not bisect_probe.is_file():
-            errors.append("package/CloverKeyStoreProbe.cpp is missing: the keystore's table and its one late "
-                          "print live in the probe, and a board without them cannot say who used the service")
+            errors.append("package/CloverKeyStoreProbe.cpp is missing: the periodic state, the tables and "
+                          "the watchdog row live in the probe, and a board without them cannot say how far "
+                          "it got before it stopped")
         else:
             bisect_text = bisect_probe.read_text()
             if "clover-aks-nosvc" in bisect_text:
                 errors.append("the keystore probe still gates on clover-aks-nosvc: round278 promised the knob "
                               "was a bisect and not a mode")
-            if "clover r279" in bisect_text:
-                errors.append("the probe still prints round279's per-event rows: boot 67 measured that they "
-                              "rotate out of the ring before the host reads the card, and 269 of them also "
-                              "pushed other producers' rows out -- a row that cannot arrive is not a spare")
-            for needle in ('"clover r280: aks late stage=%d status=%x service=%llx owner=%s opens=%u calls=%u refused=%u "',
-                           '"other=%u\\n"',
-                           '"clover r280: aks sel%u n=%u rc=%x\\n"',
-                           '"clover r280: open %u pid=%d comm=%.16s\\n"',
-                           '"clover r280: call %u pid=%d comm=%.16s sel=%u rc=%x\\n"',
-                           '"clover r280: rows open=%u/%u call=%u/%u dropped=%u\\n"',
+            for stale in ("clover r279", "clover r280", "CLOVER_AKS_LATE_MS", "clover_aks_late_say"):
+                if stale in bisect_text:
+                    errors.append(f"the probe still carries {stale!r}: this round replaces the one-shot late "
+                                  "table with a repeating row, and two speakings for one reading is how a "
+                                  "stale image gets mistaken for a new one")
+            for needle in ('"clover r281: aks t=%u fire=%u stage=%d status=%x service=%llx owner=%s opens=%u calls=%u "',
+                           '"refused=%u other=%u\\n"',
+                           '"clover r281: wdt t=%u nomap\\n"',
+                           '"clover r281: wdt t=%u en=%x armed=%u intmask=%u sts=%x bark=%u bite=%u bark_ms=%u "',
+                           '"bite_ms=%u\\n"',
+                           '"clover r281: aks sel%u n=%u rc=%x\\n"',
+                           '"clover r281: open %u pid=%d comm=%.16s\\n"',
+                           '"clover r281: call %u pid=%d comm=%.16s sel=%u rc=%x\\n"',
+                           '"clover r281: rows open=%u/%u call=%u/%u dropped=%u\\n"',
                            '#define CLOVER_AKS_ROWS        8',
                            '#define CLOVER_AKS_CALL_ROWS  12',
-                           '#define CLOVER_AKS_LATE_MS    1600000u',
-                           'clover_aks_timer = IOTimerEventSource::timerEventSource(service, clover_aks_late_say);',
-                           '(void) clover_aks_timer->setTimeoutMS(CLOVER_AKS_LATE_MS);'):
+                           '#define CLOVER_AKS_FIRST_MS    240000u',
+                           '#define CLOVER_AKS_STATE_MS    120000u',
+                           '#define CLOVER_AKS_TABLE_EVERY 5',
+                           '#define CLOVER_WDT_PHYS        0x17817000ull',
+                           '#define CLOVER_WDT_EN          0x08',
+                           '#define CLOVER_WDT_STS         0x0c',
+                           '#define CLOVER_WDT_BARK        0x10',
+                           '#define CLOVER_WDT_BITE        0x14',
+                           '#define CLOVER_WDT_HZ          32765u',
+                           'IODeviceMemory::withRange(CLOVER_WDT_PHYS, CLOVER_WDT_BYTES)',
+                           'kIOMapAnywhere | kIOMapInhibitCache',
+                           'clover_aks_timer = IOTimerEventSource::timerEventSource(owner, clover_aks_say);',
+                           '(void) clover_aks_timer->setTimeoutMS(CLOVER_AKS_FIRST_MS);',
+                           '(void) sender->setTimeoutMS(CLOVER_AKS_STATE_MS);',
+                           'if (clover_aks_armed) {'):
                 if needle not in bisect_text:
-                    errors.append(f"the keystore probe lacks {needle[:72]!r}: the late state, the named "
-                                  "selectors, the open table, the call table and the dropped count are five "
-                                  "separate readings, and shipping four of them leaves the fifth to be "
-                                  "inferred from silence -- the mistake boot 67 just cost a round")
-            # Where the arm sits is where the timer gets its work loop: the service's own, which only exists
-            # after start() returned true. Arming earlier reports a publish that has not happened, which is
-            # the same mistake round278 made in the other direction and pinned for it.
+                    errors.append(f"the keystore probe lacks {needle[:72]!r}: a schedule that fires once is "
+                                  "the reading boot 68 could not reach, and the watchdog row is the only "
+                                  "measurement of the hypothesis those stops suggest")
+            # The early arm is the whole change of timing: it has to run before every step that can refuse the
+            # publish, or a keystore that never publishes takes the hardware row down with it.
+            arm_early = bisect_text.index("clover_aks_arm(NULL);")
+            if not (bisect_text.index("native_keyevents_stage = 1;") < arm_early <
+                    bisect_text.index("native_keyevents_stage = 2;")):
+                errors.append("clover_aks_arm(NULL) does not sit between stage=1 and stage=2: the schedule "
+                              "must exist before the publish can be refused, because the watchdog row is not "
+                              "the keystore's reading and r278 measured a boot that never published")
             if not (bisect_text.index("native_keyevents_stage = 3;") <
                     bisect_text.index("clover_aks_arm(service);")):
-                errors.append("the late-say timer is armed before stage=3: it would print a service the board "
-                              "never published, and the row would then mean nothing about the one reading it "
-                              "exists to take")
+                errors.append("the retry arm sits before stage=3: it would name a service the board never "
+                              "published, and the idempotent guard would then freeze the wrong owner")
             if bisect_text.count("clover_aks_record(clover_aks_open_rows") != 2 or \
                     bisect_text.count("clover_aks_record(clover_aks_call_rows") != 1:
                 errors.append("the open and call tables are not filled exactly where the vendored driver's "
@@ -2965,16 +2984,16 @@ def check_board(errors: list) -> str:
         if "clover-aks-nosvc=1" in board_args:
             errors.append("board.toml still passes clover-aks-nosvc=1: the service has to be published for "
                           "this round's question to exist")
-        if '{ "clover r280: ", "r280-aks", 40, 0, 0, 0 },' not in sdhci_source:
-            errors.append("drivers/CloverSdhci has no class for the keystore's late table: an unbudgeted "
-                          "producer drops its rows silently, and this round's whole reading is one row per "
-                          "table")
-        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r280")' not in sdhci_source:
-            errors.append("the r280 rows are not exempt from the per-pass push cap: the late table fires "
-                          "beside the census burst, where boot 36 measured the cap eating exactly that")
-        if '"r279' in sdhci_source:
-            errors.append("the round279 tee class is still in the driver: a class for a producer that no "
-                          "longer exists is how a budget looks allocated when nothing is spending it")
+        if '{ "clover r281: ", "r281-aks", 128, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the repeating keystore rows: an unbudgeted "
+                          "producer drops its rows silently, and this round's reading is the cadence itself")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r281")' not in sdhci_source:
+            errors.append("the r281 rows are not exempt from the per-pass push cap: the timer can fire beside "
+                          "the census burst, where boot 36 measured the cap eating exactly that")
+        for stale in ('"r279', '"r280'):
+            if stale in sdhci_source:
+                errors.append(f"the tee still carries round {stale[2:]}'s class: a class for a producer that "
+                              "no longer exists is how a budget looks allocated when nothing is spending it")
 
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
@@ -4281,8 +4300,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r280:"):
-        errors.append('[payload] title is not "clover r280: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r281:"):
+        errors.append('[payload] title is not "clover r281: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5395,8 +5414,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r280:"):
-        errors.append('[payload] title is not "clover r280: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r281:"):
+        errors.append('[payload] title is not "clover r281: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
