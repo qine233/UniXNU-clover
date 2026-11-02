@@ -102,6 +102,7 @@ r288/r289 期间把这条线一直缺的那张表补齐了。原文五份已进�
 | `sdm660.dtsi` | `4d84f5169e88` | 同上 `arch/arm64/boot/dts/vendor/qcom/` |
 | `sdm660-gpu.dtsi` | `3c3abcba2bbf` | 同上 |
 | `msm-gdsc-660.dtsi` | `e31d934fbb42` | 同上 |
+| `sdm660-regulator.dtsi` | `4dc3788265a9` | 同上（§5.4 用它更正「三颗轨」的读法） |
 | `adreno-gpulist.h` | `e998295aa216` | 同上 `drivers/gpu/msm/` |
 
 ### 5.1 `gfx3d_clk_src` 的父源表（`gpucc-sdm660.c:57`，`P_XO` 等枚举在 `:34`）
@@ -153,11 +154,12 @@ bit31 不在这两份源（下游 `gpucc-sdm660.c` 与 mainline 同名文件）�
 真正从没碰过的是 `0x10d0 / 0x10b0`（rbbmtimer）与 `0x1054 / 0x1030`（rbcpr）两对，加上 CONFIG
 寄存器 `0x1074`（我们只读过 CMD_RCGR `0x1070`，`clk_rcg2` 的 CONFIG 在 `cmd_rcgr + 4`，两份源都是这个形状）。
 
-轨（`clock_gfx: gfx@5065000`，`sdm660.dtsi:1081-1097`）：
+轨（`clock_gfx: gfx@5065000`，`sdm660.dtsi:1081-1097`；**它们的实现见 §5.4——都不是 SPMI 直读**）：
 
-* `vdd_dig_gfx-supply = <&pm660l_s3_level>` → **CX 数字轨是 PM660L 的 S**；
-* `vdd_mx_gfx-supply = <&pm660l_s5_level>` → **GPU PLL 吃 PM660L S5**；
-* `vdd_gfx-supply = <&gfx_vreg_corner>` → GX 的 corner 轨（`sdm660.dtsi:2836` 的 parent 也是它）；
+* `vdd_dig_gfx-supply = <&pm660l_s3_level>` → **CX 数字轨是 PM660L 的 S3**（RPM SMD 持有）；
+* `vdd_mx_gfx-supply = <&pm660l_s5_level>` → **GPU PLL 吃 PM660L S5**（RPM SMD 持有）；
+* `vdd_gfx-supply = <&gfx_vreg_corner>` → GX 的 corner（CPR4，MMIO `0x05061000`；`sdm660.dtsi:2836`
+  的 parent 也是它）；
 * `qcom,gfxfreq-corner`：0 / 160→1 / 266→2 / 370→3 / 465→4 / 588→5 / 647→6 / 700→7 / 750→7。
 
 `gpucc_660_probe()`（`:401-468`）在注册任何时钟之前先 `devm_regulator_get` 这三颗轨，拿不到就
@@ -169,15 +171,42 @@ bit31 不在这两份源（下游 `gpucc-sdm660.c` 与 mainline 同名文件）�
 `msm_gpu` 用它取 `GPUCC_RBCPR_CLK`）与 `clock_gfx: gfx@5065000`（`qcom,gpucc-sdm660`，`:1081`）。
 地址相同、驱动不同，别把它当成两处硬件。
 
-### 5.3 下一步（可反驳的读数，不是「再猜一次」）
+### 5.3 下一步（可反驳的读数，不是「再猜一次」；§5.4 已把第 1 条改过一次）
 
-1. **读轨，不写轨**：用 r182 已经跑通的 SPMI 通路读 PM660L S3/S5 的 enable/voltage 状态，和 boot 74
-   已有的 `cx_on=1` 放在一起。若 S5（MX）关着而 PLL 从没配置，那 `gfx3d` 只有 XO 可走就是**结果**不是原因，
-   但足以解释「跑不了高频」；若 S3/S5 都开着，轨这一支当场结掉。
+1. **读「角」，不读轨**：轨本身读不到（见 §5.4，S3/S5 是 RPM SMD 持有的），能读到的是 GX 的角
+   ——CPR `0x05061000` 与 GFX LDO `0x0506e000` 都在 MMIO 上，和 boot 74 已有的 `cx_on=1` 放在一起。
+   若角读回 0，那 `gfx3d` 只能停在 XO 档就是**结果**而不是原因；若角已经在，这一支当场结掉。
 2. **补齐账单**：把 `0x1020 / 0x10b0+0x10d0 / 0x1030+0x1054` 三票按厂商表在 XO 档使能并回读，
-   与 `gfx3d`、GX GDSCR 同排打印；`rcg` 那行改印**拆解后的 src/div/mux 字段**而不是整字，
-   免得再拿一个带无名位的裸字做判决（仪器课：一行读数的解释宽度就是它的上限）。
+   与 `gfx3d`、GX GDSCR 同排打印；`rcg` 那行改印**拆解后的 src/div/mux 字段**而不是整字，并同时读
+   CONFIG `0x1074`（本轮从没读过它），免得再拿一个带无名位的裸字做判决
+   （仪器课：一行读数的解释宽度就是它的上限）。
 3. 只有这两步之后 `gx_on` 仍为 0，才轮到「GX 的塌陷由 GPMU/RBCCU 掌管、GDSCR 写不动」这条支——
    它的正对照是 `a5xx_regulator_enable()` 用 `A5XX_GPMU_RBCCU_PWR_CLK_STATUS`（`a5xx_reg.h:766`）
    轮询状态，而不是读 GDSCR；`adreno-gpulist.h:592` 的 a512 条目里带 `zap_name = "a512_zap"`，
    说明本板 a512 确实走 GPMU/zap 那条路。
+
+### 5.4 更正 §5.2 与 §5.3 第 1 条：那三颗「轨」不是 SPMI 读得到的（2026-11-03，同一天）
+
+`sdm660-regulator.dtsi`（同一棵树、同一分支；`sha256 4dc3788265a9…`，已进仓
+`notes/sources/sdm660/`）把这三颗 regulator 的实现写清楚了：
+
+* `pm660l_s3_level`（`:57`）与 `pm660l_s5_level`（`:104`）都是 `compatible =
+  "qcom,rpm-smd-regulator"`——**RPM 通过 SMD 持有的轨**（文件注释 `:53` 写 S3+S4 = VDD_CX、`:99`
+  写 S5 = VDD_MX）。它们没有 SPMI 外设地址，所以 r182 的 SPMI 通路读不到；§5.3 原先那句
+  「用 r182 的 SPMI 通路读 PM660L S3/S5」是错的，照做会去读一个不存在的地址。这一支要么走
+  RPM SMD（那是 GLINK 的活，而 ADSP/GLINK 自己还压在排期 4），要么放弃。
+* `vdd_gfx = &gfx_vreg_corner` 也不是 PMIC 轨，而是 **CPR4 角调节器**：`gfx_cpr: cpr4-ctrl@05061000`
+  （`qcom,cpr4-sdm660-mmss-ldo-regulator`，`:534-542`），`gfx_vreg_corner` 在它 `thread@0` 里
+  （`:569`，`regulator-min/max-microvolt = <1>/<7>` = 角 1..7，正对 `qcom,gfxfreq-corner` 的 7 档）。
+  **它是 MMIO**：`cpr_ctrl = 0x05061000 + 0x4000`，另有一段 fuse `0x00784000 + 0x1000`。注意这块
+  不在 GPUCC 窗口内（GPUCC 是 `0x5065000..0x5075000`），要单独映射。
+* 而 CPR 节点自己 `clocks = <&clock_gpu GPUCC_RBCPR_CLK>, <&clock_rpmcc RPM_SMD_CNOC_CLK>`
+  （`:538-540`）——**rbcpr 正是我们从没使能过的那根**（§5.2 第 6 条）。于是这条链是自洽的、
+  且读得出真假：`rbcpr_clk` 关 ⇒ CPR 不转 ⇒ `gfx_corner` 停在 0 角 ⇒ `vdd_gfx` 不上角 ⇒ GX 上不了电。
+  测法：在 XO 档打开 `0x1030`（RCG，`map_0` 的 `cxo_a`=0，19.2 MHz 一档）与 `0x1054`（分支），
+  再读 CPR `0x05061000`、GFX LDO `ldo@0506e000 + 0x34`（`qcom,sdm660-gfx-ldo`，400..925 mV，`:523-529`）
+  与 mem-acc 角 `regulator@01fcf004`（`qcom,mem-acc-regulator`，`acc-sel-l1` 第 0 位，`:510-520`）。
+  `gx_on` 跟着变就是这条链；不跟着变就退回 §5.3 第 3 条。
+
+r290 的 GPU 那一格因此定为：**开 rbcpr + rbbmtimer 两票 → 读 CONFIG `0x1074`、CPR `0x05061000`、
+GFX LDO `0x0506e000`、mem-acc `0x01fcf004` → 再看 `gx_on` 与 `chipid`**。S3/S5 两轨不在这一格。

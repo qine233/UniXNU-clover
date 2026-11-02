@@ -21659,9 +21659,11 @@ GPU 上电结果第一次读得到**——`gdsc` 行 `cx_on / gx_on / gfx3d_en` 
 
 boot 74 支持的只有一句：`gfx3d_en=1`、`cxo_en=1`、`cx_on=1` 而 `gx_on=0`。下一步因此不是「补父源」，而是
 把厂商账单里从没碰过的两对补齐（rbbmtimer `0x10b0`+`0x10d0`、rbcpr `0x1030`+`0x1054`）、改读 CONFIG
-`0x1074`，并用 r182 的 SPMI 通路读 GPUCC 自己要求的三颗轨（PM660L S3=`vdd_dig_gfx`、S5=`vdd_mx_gfx`、
-`gfx_vreg_corner`=`vdd_gfx`；`sdm660.dtsi:1084-1086`）。`gx_on` 仍为 0 才轮到「GX 由 GPMU/RBCCU 掌管」
-那条支，它的正对照写在 §5.3。
+`0x1074`，再读 GX 的**角**——`vdd_gfx = &gfx_vreg_corner` 是 CPR4 角调节器（`cpr4-ctrl@05061000`，
+MMIO），而它自己的 `clocks` 里正是 `GPUCC_RBCPR_CLK`（`sdm660-regulator.dtsi:534-540`）：rbcpr 不开 ⇒
+CPR 不转 ⇒ 角停在 0 ⇒ GX 上不了电，这条链读得出真假。至于 `pm660l_s3_level` / `pm660l_s5_level`
+（`vdd_dig_gfx` / `vdd_mx_gfx`），它们是 `qcom,rpm-smd-regulator`——**RPM 经 SMD 持有，SPMI 通路读不到**，
+所以轨不在这一格。`gx_on` 仍为 0 才轮到「GX 由 GPMU/RBCCU 掌管」那条支，正对照写在 §5.3。
 
 **一条计划外的致命异常，而且第一次读得回来**：boot 74 没跑到普查（census 在 >1500 s），它自己的
 kind-20 记录不是 1800 s 死线，而是 `Kernel data abort. at pc 0xfffffff007a702d4 lr 0xfffffff00568971c`。
