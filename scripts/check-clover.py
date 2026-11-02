@@ -2788,6 +2788,60 @@ def check_board(errors: list) -> str:
                 errors.append(f"UniXNU/patches/xnu/{r276_name} is not the same bytes as this repo's copy: "
                               "the two trees would compile different kernels")
 
+        # Round277 is the round boot 63 forced: the publish went in, and the census that was supposed to read
+        # it said nothing at all -- no r243 row, no r275 row, no r276 row, the kernel log stopping one second
+        # before the census' own gate and no panic record for the boot. Those are three different facts wearing
+        # one absence, and the reason is plumbing: every census row reaches the card through the msgbuf tee,
+        # which is allowed sixteen block writes per pass and lags the kernel by seconds. So the same questions
+        # are now also answered on the driver's probe relay. The assertions below exist because an instrument
+        # that can only be read when the pipeline keeps up is the instrument that produced boot 63.
+        r277_name = "z" * 51 + "-clover-r277.patch"
+        r277_patch = next((base / "patches/xnu-clover" / r277_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r277_name).is_file()), None)
+        if r277_patch is None:
+            errors.append(f"patches/xnu-clover/{r277_name} is missing: without the relay the census is "
+                          "readable only through the channel that failed to carry it")
+        else:
+            r277_text = r277_patch.read_text()
+            r277_added = "".join(line for line in r277_text.splitlines(True) if line.startswith("+"))
+            if r277_text.count("--- a/") != 1 or "--- a/iokit/Kernel/IOStartIOKit.cpp" not in r277_text:
+                errors.append(f"{r277_name} does not touch exactly iokit/Kernel/IOStartIOKit.cpp: the relay "
+                              "rows belong to the census that is already taking the registry lock once")
+            for needle in ('clover_emmc_probe_say(const char *text, unsigned int length)',
+                           '#define CLOVER_CENSUS_SAY(',
+                           '"clover r277: enter secs=%llu calls=%d\\n"',
+                           '"clover r277: waiting secs=%llu calls=%d\\n"',
+                           '"clover r277: walking visited=%d names=%d classes=%d\\n"',
+                           '"clover r277: svc-walk end visited=%d stopped=%d classes=%d\\n"',
+                           '"clover r277: aks stage=%d status=%x service=%llx class=%d opens=%u calls=%u\\n"',
+                           '(total & 31) == 0'):
+                if needle not in r277_added:
+                    errors.append(f"{r277_name} lacks {needle[:60]!r}: entry, the waiting heartbeat, the walk's "
+                                  "own progress and the publish reading are four separate rows and a round that "
+                                  "ships three of them is the boot 63 reading again")
+            # The waiting row is the round's positive control, and it is only that if it is bounded: an
+            # unbounded heartbeat would fill a 64-slot relay ring and hide the rows it exists to corroborate.
+            if r277_added.count("clover_census_calls % 16") != 1:
+                errors.append(f"{r277_name} does not bound the waiting row to every sixteenth call: the relay "
+                              "ring is sixty-four slots shared with every other probe in the boot")
+            if "iterateOver" in r277_added.replace("si = IORegistryIterator::iterateOver", ""):
+                errors.append(f"{r277_name} opens a third registry iterator: the relay moves the reading off "
+                              "the tee, it does not add another walk of the plane")
+            late_script = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in late_script.splitlines() if "clover-r2" in line)
+            if (late_list.find(r277_name) < 0 or
+                    late_list.find(r277_name) > late_list.find("z" * 50 + "-clover-r276.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r277 before r276 in LATE_PATCH: the "
+                              "compile pass would run on a tree this patch was not written against")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r277_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r277_name} is missing: unixnu loads patches from that "
+                              "directory and silently skips a board patch that lives only in this repo")
+            elif load_copy.read_bytes() != r277_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r277_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+
         # The keystore itself: a vendored driver, a board instrument that supplies what it links against, and
         # the two boot arguments that arm it. Every one of these is checked by name because the failure mode is
         # silent -- a driver nobody links is a kernel that boots, and an instrument whose gate never opens is a
@@ -4156,8 +4210,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r276:"):
-        errors.append('[payload] title is not "clover r276: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r277:"):
+        errors.append('[payload] title is not "clover r277: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5270,8 +5324,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r276:"):
-        errors.append('[payload] title is not "clover r276: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r277:"):
+        errors.append('[payload] title is not "clover r277: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

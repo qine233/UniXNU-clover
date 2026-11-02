@@ -1102,6 +1102,13 @@ def check_sb_sample(kernel: bytes) -> bool:
              # string the census has to match, so if it is absent the kernel was linked without the vendored
              # object and every r276 row above would still print happily.
              "bb-aks-service": b"Native keystore state service" in kernel,
+             # Round277: the census rows that ride the driver's probe relay instead of the kernel log.
+             # Boot 63 carried none of the tee rows at all, so these literals are what prove the round
+             # shipped an instrument that can still be read when the tee cannot keep up.
+             "bb-aks-relay": (b"clover r277: enter secs=%llu calls=%d\n") in kernel,
+             "bb-aks-relay-aks": (b"clover r277: aks stage=%d status=%x service=%llx class=%d opens=%u calls=%u\n") in kernel,
+             "bb-aks-relay-walk": (b"clover r277: walking visited=%d names=%d classes=%d\n") in kernel,
+             "bb-aks-relay-end": (b"clover r277: svc-walk end visited=%d stopped=%d classes=%d\n") in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,

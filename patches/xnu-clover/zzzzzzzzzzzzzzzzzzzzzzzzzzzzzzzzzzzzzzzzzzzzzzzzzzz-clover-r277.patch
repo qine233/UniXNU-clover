@@ -1,0 +1,111 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -330,6 +330,27 @@
+ extern "C" volatile uint32_t native_aks_opens, native_aks_calls;
+ extern "C" volatile uint32_t native_aks_selector_hits[];
+ extern "C" uint32_t native_aks_lock_state(void);
++
++/*
++ * Round277. Boot 63 printed nothing from this function at all -- no r243 row, no r275 row, no r276 row --
++ * and its kernel log stops at 1499.4 s, one second before the gate below, with no panic record for the boot
++ * either. That is the reading a missing line cannot answer: "never started", "started and died in the walk",
++ * and "printed everything but the tee had a ten-second backlog when the board stopped" all look the same on
++ * the kernel log, because the kernel ring reaches the card through the driver's msgbuf consumer, which runs
++ * at most sixteen block writes per pass. So the census now announces itself on the channel that does not go
++ * through the kernel log at all: r212's probe relay, straight into the driver's own ring. Every row below is
++ * a relay row, and a round that starts but never finishes says where it stopped.
++ */
++extern "C" unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++static int clover_census_calls;
++
++#define CLOVER_CENSUS_SAY(...) do { \
++	char _row[96]; \
++	int  _n = snprintf(_row, sizeof(_row), __VA_ARGS__); \
++	if (_n > 0) { \
++		clover_emmc_probe_say(_row, (unsigned int) (_n < (int) sizeof(_row) ? _n : (int) sizeof(_row) - 1)); \
++	} \
++} while (0)
+ 
+ extern "C" void
+ clover_iodt_census(unsigned long long secs)
+@@ -353,13 +374,25 @@
+ 	 */
+ 	if (secs < 1500) {
+ 		return;
++	}
++	/*
++	 * The waiting row is the census' own positive control: it says the beat that calls this function is
++	 * still alive after the gate, so a boot with no census rows at all is a boot where the census was
++	 * never reached, not a boot where nothing worked. It is taken every sixteenth call because the caller
++	 * runs on the sampler's own cadence and a 64-slot relay ring is not a place for a heartbeat.
++	 */
++	clover_census_calls++;
++	if (ran == 0 && (clover_census_calls % 16) == 0) {
++		CLOVER_CENSUS_SAY("clover r277: waiting secs=%llu calls=%d\n", secs, clover_census_calls);
+ 	}
+ 	if (ran) {
+ 		return;
+ 	}
+ 	ran = 1;
++	CLOVER_CENSUS_SAY("clover r277: enter secs=%llu calls=%d\n", secs, clover_census_calls);
+ 	if (gIODTPlane == NULL) {
+ 		printf("clover r243: census t=%llu no-plane\n", secs);
++		CLOVER_CENSUS_SAY("clover r277: no-plane\n");
+ 		return;
+ 	}
+ 	printf("clover r243: census t=%llu\n", secs);
+@@ -558,10 +591,21 @@
+ 		    (unsigned) native_aks_selector_hits[14], (unsigned) native_aks_selector_hits[17],
+ 		    (unsigned) native_aks_selector_hits[35], (unsigned) native_aks_lock_state());
+ 
++		/*
++		 * The same reading on the relay, in the short form the 96-byte row allows. Round276's answer is
++		 * the one thing this boot has to know -- did the keystore publish -- and boot 63 showed what it
++		 * costs to ask a question whose only answer lives behind the msgbuf consumer.
++		 */
++		CLOVER_CENSUS_SAY("clover r277: aks stage=%d status=%x service=%llx class=%d opens=%u calls=%u\n",
++		    (int) native_keyevents_stage, (unsigned) native_keyevents_status,
++		    (unsigned long long) native_keyevents_service, have_class,
++		    (unsigned) native_aks_opens, (unsigned) native_aks_calls);
++
+ 		si = IORegistryIterator::iterateOver(gIOServicePlane,
+ 		    kIORegistryIterateRecursively);
+ 		if (si == NULL) {
+ 			printf("clover r243: svc no-iterator\n");
++			CLOVER_CENSUS_SAY("clover r277: svc no-iterator\n");
+ 		} else {
+ 			int ks_names = 0, ks_classes = 0, ks_rows = 0;
+ 
+@@ -607,6 +651,15 @@
+ 						printf("clover r243: svc %.24s\n", nm);
+ 					}
+ 				}
++				/*
++				 * Every thirty-second service, so a walk that never finishes still says how far it got:
++				 * 127 services took four rows on boot 62's shape, and the last row's visited= is the
++				 * position the census stopped at rather than an absence.
++				 */
++				if ((total & 31) == 0) {
++					CLOVER_CENSUS_SAY("clover r277: walking visited=%d names=%d classes=%d\n",
++					    total, ks_names, ks_classes);
++				}
+ 			}
+ 			if (total >= kCloverSvcCap && si->getNextObjectRecursive() != NULL) {
+ 				stopped = 1;
+@@ -625,6 +678,8 @@
+ 			 */
+ 			printf("clover r276: ks walked=%d stopped=%d ks_names=%d ks_classes=%d rows=%d\n",
+ 			    total, stopped, ks_names, ks_classes, ks_rows);
++			CLOVER_CENSUS_SAY("clover r277: svc-walk end visited=%d stopped=%d classes=%d\n",
++			    total, stopped, ks_classes);
+ 		}
+ 	}
+ 	/*
+@@ -635,6 +690,7 @@
+ 	 */
+ 	clover_mg_dump();
+ 	printf("clover r243: census done nodes=%d\n", seen);
++	CLOVER_CENSUS_SAY("clover r277: done nodes=%d calls=%d\n", seen, clover_census_calls);
+ }
+ }; /* extern "C" */
+ 
