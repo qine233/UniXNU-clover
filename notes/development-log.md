@@ -20705,3 +20705,44 @@ CloverSdhci 只做两件事：`kTeeAllowlist` 加 `"cpu_start()"` token（第 60
 有几条并跟着 `CloverPMGR: unimplemented power operation 168` ⇒ 调用真的走到了我们的钩子，那时才谈得上把 `enableCPUCore` 实现成 PSCI/寄存器操作。
 **三条都不改桌面这一格的结论**：boot 58 的债主普查仍是 `threads=8/9 wait=8/9 run=0`、
 唯一发送权在它自己任务里，多几颗核不会替它 signal。
+
+
+## r272 读数（boot 59）：ring 看不见它问的那一刻，而且这轮连正对照都没有
+
+**① 读到的东西。** 四次拍火全部重复 boot 58：`clover r271: cpu t=1410 real=1 max=8 reg=1 start=0
+run=1 s=00000000 r=10000000 tm=237196,0,0,0,0,0,0,0`（t=1541 → 258687，另有 1678、1803），
+`clover r270: ipi ... sent=0 recv=0` 照旧，内核 `cpu_stat.timer_cnt[0]` 第三次与驱动
+`armcpu_core_timer[0]` 同值。`cpu_start()` 的行数是 **0 条**。
+
+**② 但这个 0 不能写成「内核从没试着放副核」——量具看不见那一时刻。** 这一窗的时间跨度实测是
+`t=1273 … t=1814`（512 行覆盖 541 s，与 boot 58 的 `1208…` 同一形状）。而 `cpu_start()` 只在 IOKit
+起第二颗核的那一刻出声，那是 t<10 s 的事：等死线把环落到卡上，那行早被后来的行挤出去了。
+**这是「仪器问的不是它能看见的东西」这一族的第六次复发**：r249 的 tee 每趟 16 推、r251 的 8 槽环吃掉
+最早七条、r256 的「探针在 t=25 s 说话而窗从 t=1208 s 开始」、r265 掉 `we=`、r268 之前把恒等式当测量值——
+这次的形状最新颖：**限制不是配额、不是字段，是环的时间地平线**。
+
+**③ 更要紧：这一轮连「正对照」都没拿到。** 我一度想写「同一窗里有 `Sandbox:` 与
+`CoreAnalyticsHub::handleNagTimerExpiry` 两条别人的行，所以白名单是通的」——**这句站不住**，
+逐条查过来源：nag 那条走的是另一把钥匙（`CloverSdhci.cpp:3788` `kTeeNagToken[] =
+"handleNagTimerExpiry"`，r195 起的专用通道），Sandbox 那条是因为整行含 `apfs` 子串
+（`teeTokensMatch` 在行内**任意位置**找 token，而 `"apfs"` 在白名单里）。两条都不是「任意前缀能进」的
+证据。所以 `cpu_start()` 这个 token 到底通不通，本靴无法区分「话说得太早」与「token 写错了」。
+**一个测不出「没有」的仪器，不能用来宣布「没有」。**
+
+**④ 于是这一格现在的证据等级要照实写。** 「没试着放副核」仍靠两件事支撑：(a) 宿主侧静态事实——
+镜像里没有 `AppleARMSMP`（`optional iokitcpp` 未开），全树 `processor_start()` 只剩 `IOCPU.cpp:311`
+一个调用者；(b) 板侧但是**从缺席推出**——本板 `CloverPMGR.cpp:104-112` 把所有 CPU 电源钩子覆盖成
+`unimplemented(168..176)`，那函数是 `panic("CloverPMGR: unimplemented power operation %u")`，
+boot 58/59 都跑满 1800 s 没炸。r272 想要的那次直接测量**没拿到**。
+
+**⑤ 修法记下别丢（推迟项，不和桌面那一格抢同一轮）**：要量「试没试」，得能在 t≈1400 s 的普查里说出
+t=2 s 的事，而且**必须自带对照**——在 `cpu_start()` 现场（`osfmk/arm64/cpu.c:903`）自增一个
+`unsigned long long clover_cpu_start_calls`，并把尝试过的 cpu 记进一位掩码
+`clover_cpu_start_bits |= 1ull << cpu`，普查行加 `cs=%llu bits=%llx`。计数与「环里 0 条」不同：
+它是内核里的一份状态，读它不要求那句话还在环里；再配一格「本靴 boot 计数」当哨兵，行没印出来时
+不会被误读成 0。这是 47 个 z 的补丁，动 `cpu.c` 与 `task.c` 两个文件，checker 照 r271 的规矩钉字面。
+**但它是保真度那一格的账，不是桌面的**：桌面那一格（r273）问 workloop 的 `kqwl_request`——
+五条工人在睡、一条也没新起，「内核有没有向 workqueue 要过人、要到的线程是谁」现在还没有读数，
+而入口已经在 `bsd/kern/kern_event.c` 里查清：wlwait 的等待事件本身就是 `struct knote *`
+（`kdp_workloop_sync_wait_find_owner` 第一行就是 `kn = (struct knote *)event`），
+`knote_get_kq(kn)` 出来就是 `kqworkloop`，`kqwl_request.tr_state` / `tr_thread` 正是那句话。
