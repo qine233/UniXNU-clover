@@ -8875,6 +8875,14 @@ extern "C" void clover_unattended_begin (void)
   // previous boot; the heartbeat belongs to the same one and says how far its timer got even when
   // no reset hook fired. "empty" is itself a reading: it means the board came back through a path
   // that never reached this kernel's funnels, or it reset before this function armed the slot.
+  //
+  // Round284: the line goes through sdhciSay, not IOLog. Boot 70 proved why: the one-shot row sat
+  // in msgbuf, the kernel-log tee copied it into the 512-record ring, and a boot that ran fourteen
+  // minutes rotated it out before the card window was read -- a round whose whole answer was absent
+  // read exactly like a boot that never touched the slot. sdhciSay pushes the same string into the
+  // 64-record driver verdict ring, which the block path drains; that copy is outside the tee. The
+  // push happens before the ring is armed (gVerdictFirst is still zero), so the line stays pending
+  // in RAM and is the first record the drain writes once the window is known.
   volatile uint64_t *record = reinterpret_cast<volatile uint64_t *> (base + kResetRecordOffset);
   const uint64_t recordMagic = record[0];
   const uint64_t beats = record[10];
@@ -8890,13 +8898,13 @@ extern "C" void clover_unattended_begin (void)
       }
     }
     text[i] = 0;
-    IOLog ("clover r283: last reset kind=%llu pid=%llu aux=%llx pc=%llx cnt=%llu beat=%llu beatcnt=%llu text=%s\n",
+    sdhciSay ("clover r283: last reset kind=%llu pid=%llu aux=%llx pc=%llx cnt=%llu beat=%llu beatcnt=%llu text=%s\n",
            static_cast<unsigned long long> (record[1]), static_cast<unsigned long long> (record[2]),
            static_cast<unsigned long long> (record[3]), static_cast<unsigned long long> (record[4]),
            static_cast<unsigned long long> (record[5]), static_cast<unsigned long long> (beats),
            static_cast<unsigned long long> (beatCounter), text);
   } else {
-    IOLog ("clover r283: last reset unnamed magic=%llx beat=%llu beatcnt=%llu\n",
+    sdhciSay ("clover r283: last reset unnamed magic=%llx beat=%llu beatcnt=%llu\n",
            static_cast<unsigned long long> (recordMagic), static_cast<unsigned long long> (beats),
            static_cast<unsigned long long> (beatCounter));
   }

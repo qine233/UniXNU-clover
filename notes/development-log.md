@@ -21482,3 +21482,38 @@ userdata 镜像、trustcache 与 data 种子的字节都没变，这一靴只冷
 `kind=1/2/3/4` 分别点名 halt/restart/reboot(2)/panic 屏，pid 与 text 直接把路径说完；
 `unnamed` 加 `beat` 非零则说明复位没经过内核任何已知入口（下一轮去 PSCI/固件）；
 `unnamed` 且 `beat=0` 则可能复位发生在武装之前，这行本身会证明该靴没有武装过。
+
+---
+
+## r284（v0.6.79）—— 复位判决行加驱动环副本，读回 boot 70 的 IMEM 记录
+
+**① 这轮修什么。** r283 的判决行只有一条不经卡管道的副本：`clover_unattended_begin` 里的
+`IOLog("clover r283: last reset ...")` 写进内核 msgbuf，tee 把它抄进 512 记录的 kernel-log 环，
+再由块 I/O 排干到卡上。boot 70 实跑约 14 分钟（1300+ s 后自己复位），tee 在环里留下的最老行只到
+1458.7 s —— 早于 1600 s 的 r280 表，也早于任何可能落在末段的复位判决行，于是 r283 的判决行被旋转
+出环，整轮读数「零行」，与「槽从未被碰过」同形。教训与 r279/r280 是同一门课：只印一次、且唯一
+副本走 kernel-log tee 的判决行，描述不了比它自己的环地平线活得更久的靴。
+
+**② 修法。** 把 `clover_unattended_begin` 的两行判决从裸 `IOLog` 改成 `sdhciSay`。`sdhciSay` 内部既
+`IOLog("%s\n")` 又 `ringPush(kRingDriver, ...)`，于是这一行同时落进 64 记录的驱动判据环——那条环由
+块路径排干，**在 tee 地平线之外**。push 发生在环武装之前（`gVerdictFirst` 仍为零），所以该行以
+pending 状态留在 RAM 里，一旦 logfs 窗口已知，它就是排干写下的第一条记录。两条格式串不变：
+`clover r283: last reset kind=...` / `clover r283: last reset unnamed ...`，前一条照旧。
+
+**③ 契约。** `check-clover.py` 新增两条断言：`sdhciSay ("clover r283: last reset kind=` 与
+`sdhciSay ("clover r283: last reset unnamed` 都必须出现在 CloverSdhci 源里，且读回体
+（`last reset` 到清槽 `for (i < 20)` 之间）不得再出现裸 `IOLog ("clover r283:`。两处 title 断言升到
+r284；标题里带 `"unnamed"` 双引号（boot 35/36 转义事故要求每轮标题都带一个）。
+
+**④ 构建与闸门（v0.6.79）。** 内核 `d5b28b78…` → AMFI 两刀仍在 file `0x1ad20e4` / `0x1ad216c`，
+`92658e15…` → 归一化 `295743ba…`（973 个 object 戳清零）→ payload 卷内 kernel 同源、ADT、
+`unixnu.toml`、trustcache、data 种子均不变；镜像 `93e6f053…`，归档
+`~/clover-out/round284-v0.6.79-payload.img`（58 720 256 字节）。`check-clover.py` 绿、
+`verify-clover-payload.py` exit=0（50 组 OK，无 FAIL）。`verify-userdata-window.py` 本轮不适用：
+只冷刷 cache，userdata 镜像、trustcache、data 种子字节都没变。
+
+**⑤ 下一靴怎么读。** r284 是 boot 72：先找驱动判据环里的 `clover r283: last reset ...` 行——这是
+boot 70 遗留的 IMEM 记录（读在清之前，boot 70 死后槽没被清，本靴开箱即读）。`kind=1/2/3/4` 分别
+点名 halt/restart/reboot(2)/panic 屏；`unnamed` 加 `beat` 非零说明复位没经过内核任何已知入口；
+`unnamed` 且 `beat=0` 说明复位发生在武装之前。同一条行还应出现在 kernel-log 环（若本靴活得够短），
+正对照是「驱动环有、kernel-log 环可能没有」，二者不同源才能证明副本真的多了一条管道。

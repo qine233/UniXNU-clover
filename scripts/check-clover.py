@@ -3119,6 +3119,16 @@ def check_board(errors: list) -> str:
             if needle not in sdhci_source:
                 errors.append(f"CloverSdhci.cpp lacks {needle[:48]!r}: kind and the unnamed line are the "
                               "two halves of this round's answer")
+        readback_body = sdhci_source[read_at:clear_at] if 0 <= read_at < clear_at else ""
+        if 'sdhciSay ("clover r283: last reset kind=' not in sdhci_source or \
+                'sdhciSay ("clover r283: last reset unnamed' not in sdhci_source:
+            errors.append("the r283 reset verdict does not go through sdhciSay: boot 70 rotated the "
+                          "one-shot IOLog row out of the 512-record kernel ring before the card was "
+                          "read, so the whole answer was absent; the driver ring copy is the one that "
+                          "survives the horizon")
+        if 'IOLog ("clover r283:' in readback_body:
+            errors.append("the r283 reset verdict is still printed with bare IOLog: that copy has no "
+                          "path to the card outside the kernel-log tee")
         if '{ "clover r283: ", "r283-reset", 16, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci has no class for the r283 line: the bring-up pass also "
                           "carries the census, and the one row this round exists for would be capped away")
@@ -4493,8 +4503,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r283:"):
-        errors.append('[payload] title is not "clover r283: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r284:"):
+        errors.append('[payload] title is not "clover r284: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5607,8 +5617,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r283:"):
-        errors.append('[payload] title is not "clover r283: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r284:"):
+        errors.append('[payload] title is not "clover r284: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
