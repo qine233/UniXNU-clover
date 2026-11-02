@@ -180,6 +180,23 @@ extern "C" void clover_keystore_probe(void) {
     }
     native_keyevents_stage = 2;
 
+    /*
+     * Round278. One knob, one question. Boots 63 and 64 -- the two that carry this port -- stopped with no
+     * panic record and no census row, at 1499 s and 726 s, while the round-275 image run as a control
+     * (boot 65) reached 1813 s, fired the census and wrote its deadline record like every boot before it;
+     * all three carry the same chronic card recoveries, so the card is not the variable. This board's
+     * instrument is now asked to separate the two remaining explanations in a single flight: register the
+     * classes and withhold the service. Classes-only still flips the census' own `aks class=` to 1, because
+     * that row asks OSMetaClass, not the registry -- so if the boot lives and ks_classes= stays 0, it is a
+     * service that daemons can talk to which ends the boot, not the linked code and not the boot argument.
+     * With the knob off, nothing about round276 changes.
+     */
+    unsigned no_service = 0;
+    if (PE_parse_boot_argn("clover-aks-nosvc", &no_service, sizeof(no_service)) && no_service == 1) {
+        native_keyevents_status = kIOReturnSuccess;
+        return;
+    }
+
     IOService *service = native_keyevents_allocate();
     bool initialized = service != NULL && service->init();
     bool attached = initialized && service->attach(provider);

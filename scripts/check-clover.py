@@ -2906,6 +2906,31 @@ def check_board(errors: list) -> str:
             errors.append("board.toml passes clover-aks-sls: the reported lock state has to be the driver's "
                           "default (unlocked since boot) or the reading says nothing about the wait it targets")
 
+        # Round278 is a bisect, so its assertions are about position rather than presence. The knob has to sit
+        # between the metaclass registration and the allocation, because only there does "classes registered,
+        # no service" become a reading instead of a guess about which half of the port ends the boot: boots 63
+        # and 64 stopped at 1499 s and 726 s with no census row and no panic record, while the round-275 image
+        # reflashed as a control (boot 65) ran to 1813 s, fired the census and wrote its deadline record, with
+        # the same chronic card recoveries in all three.
+        bisect_probe = REPO / "package/CloverKeyStoreProbe.cpp"
+        if not bisect_probe.is_file():
+            errors.append("package/CloverKeyStoreProbe.cpp is missing: the bisect lives in the probe, and a "
+                          "round that ships without it answers nothing about the regression it was cut for")
+        else:
+            bisect_text = bisect_probe.read_text()
+            gate = 'PE_parse_boot_argn("clover-aks-nosvc"'
+            if gate not in bisect_text:
+                errors.append("the keystore probe has no clover-aks-nosvc gate: without it the boot cannot be "
+                              "told apart from the service, and the port stays a single indivisible suspect")
+            elif not (bisect_text.index("native_keyevents_stage = 2;") < bisect_text.index(gate) <
+                      bisect_text.index("IOService *service = native_keyevents_allocate();")):
+                errors.append("clover-aks-nosvc is not between the class registration and the allocation: put "
+                              "earlier and it also skips the metaclasses, which is a different question, and "
+                              "later and it withholds nothing")
+        if "clover-aks-nosvc=1" not in board_args:
+            errors.append("board.toml does not pass clover-aks-nosvc=1: the knob exists to be read once, and an "
+                          "armed-but-untested round is how a bisect becomes a permanent mode")
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -4210,8 +4235,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r277:"):
-        errors.append('[payload] title is not "clover r277: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r278:"):
+        errors.append('[payload] title is not "clover r278: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5324,8 +5349,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r277:"):
-        errors.append('[payload] title is not "clover r277: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r278:"):
+        errors.append('[payload] title is not "clover r278: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

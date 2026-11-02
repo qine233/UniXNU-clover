@@ -190,7 +190,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r277: say where the census is, on a channel that does not ride the kernel log. Round276 published the keystore round275 measured missing, and boot 63 answered with a particular shape of silence: no r243 row, no r275 row, no r276 row, the kernel log stopping at 1499.4 s -- one second before the census' own gate -- and no panic record written for that boot either. Three different facts -- \"the beat never reached the census\", \"it died inside the walk\", \"it printed while the consumer still had a backlog\" -- wore the same absence, because every census row reaches the card through the tee, which gets sixteen block writes per pass and no more. So the census now says where it is on r212's probe relay -- the driver's own ring, ordered by sequence number and boot id: entry, the aks reading in short form, progress every thirty-second service, and the walk's end. The readings are written down before the flash: no relay row means the caller stopped; enter with no walking row means the census died between the class lookup and the walk; a last walking= of N names the position it stopped at; and an aks row that arrives with class=1 means round276's publish happened and was only ever left unread. This changes nothing the census measures and adds no second keystore knob."
+title = "clover r278: bisect the port that ends this board early. The round-276 and round-277 images stopped at 1499 s and 726 s with no census row and no panic record for the boot, while the round-275 image reflashed as a control (boot 65) reached 1813 s, fired the census and wrote its deadline record -- and all three carry the same chronic card recoveries (7 to 11 per boot), so the card is not the variable and this keystore port is. One knob, one question: `clover-aks-nosvc=1` registers the AppleKeyStore metaclasses and withholds the service, so the census should read \"stage=2, service=0, ks_classes=0\" while its aks class= row still says 1, because that row asks the class table rather than the registry. A boot that now reaches the deadline means the thing that ends the board is a service userland can open, and the next cut is what the client contract gets wrong; a boot that still stops early means it is the linked code or offline-key-events=1 itself, before anything is published. Either way the knob comes out next round: it is a bisect, not a mode, and the round-277 relay rows stay in so the census can still say where it is."
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2314,6 +2314,15 @@ kernel_args = [
   #     ks_classes= rows=` -- a name is a claim, the class is the evidence, and `stopped=0` is what makes a
   #     zero mean zero.
   "offline-key-events=1",
+  # Round278's bisect, and the only reason it exists: the two boots that carry the keystore (63 at 1499 s,
+  # 64 at 726 s) stopped with no panic record and no census row, while the round-275 image run as a control
+  # (boot 65) reached 1813 s, fired the census and wrote its deadline record; all three show the same
+  # chronic card recoveries, so the card is not the variable. With this argument the probe registers the
+  # AppleKeyStore metaclasses and stops before allocating the service: stage=2, service=0, ks_classes=0,
+  # while the census' own aks class= row still reads 1 because that row asks OSMetaClass, not the registry.
+  # Boot lives => a service userland can open is what ends the boot. Boot still stops => the linked code or
+  # the boot argument itself, before anything is published. Removed once read: a bisect, not a mode.
+  "clover-aks-nosvc=1",
   "clover-aks=1",
   # Round184 parks 排期 4, 5 and 6. The three instrument arguments below are deliberately NOT passed
   # any more: the goal moved to getting iPadOS onto its own screen, and each of these three spends
