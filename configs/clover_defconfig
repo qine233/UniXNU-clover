@@ -67,7 +67,7 @@ CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 # clover_input_run, clover_power_run and clover_dsp_run from CloverPMGR again), so ordinary archive
 # resolution pulls the
 # member in. force_load would additionally keep anything unreferenced, which here means nothing.
-CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-sdhci/libCloverSdhci.a {tree}/build/clover-block/libCloverBlock.a {tree}/build/clover-input/libCloverInput.a {tree}/build/clover-power/libCloverPower.a {tree}/build/clover-dsp/libCloverDsp.a"
+CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/clover-sdhci/libCloverSdhci.a {tree}/build/clover-block/libCloverBlock.a {tree}/build/clover-input/libCloverInput.a {tree}/build/clover-power/libCloverPower.a {tree}/build/clover-dsp/libCloverDsp.a {tree}/build/clover-gpu/libCloverGpu.a"
 
 # Not set, on purpose, and each one is a real porting task rather than a switch to flip:
 #   NATIVE_UFS          — clover boots from eMMC (sdhc_1 at 0xc0c4000), not UFS; there is no XNU SDHCI

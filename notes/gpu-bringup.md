@@ -15,7 +15,7 @@ clover 自己的厂商设备树里取，不从 sheng 的 sm8550 偏移里猜；s
 | chipid | `0x05010200`（a512） | `qcom,chipid` |
 | GPU 中断 | `GIC_SPI 300`，level high | `interrupts` |
 | GPUCC | `0x05065000`，`qcom,gpucc-sdm660` | `clock_gpu: clock-controller@5065000` |
-| GCC | `0x01830000`（时钟控制器） | `sdm660.dtsi` GCC 节点 |
+| GCC | `0x00100000` + `0x94000`（时钟控制器） | `sdm660.dtsi` `clock-controller@100000`；`CloverInput/InputRegs.h` 已按同一 DT 钉过 |
 | GPU SMMU | `0x05040000` + `0x10000`，SMMUv2，3 级页表 | `kgsl_smmu` |
 | SMMU 上下文 | bank 0 = user（`gpu-offset 0x48000`），bank 2 = secure | `gfx3d_user` / `gfx3d_secure` |
 | SMMU 中断 | `GIC_SPI 329/330/331` | `kgsl_smmu interrupts` |
@@ -37,17 +37,43 @@ sheng 的 `GpuPowerProbe.cpp` 把「读电源/时钟状态」和「第一次写 
 stage 5 之后。本板连 GDSC 的当前状态都没读过；在没有读数的情况下写任何一位都可能把整机带进
 不可恢复的电源状态（而且现在还有 726/1324/1499 s 的间歇早停没定性）。所以 r282 只做**只读**：
 
-1. 映射 `0x05000000`、`0x05065000`、`0x01830000`、`0x05040000`；
-2. 每 120 s 与 keystore/WDT 行一起印：chipid 回读、GPUCC 的 GDSCR/RBBM 状态、GCC 的 GPU 分支
-   enable/div、SMMU 的 sACR/context bank 有效位；
-3. 不做任何写、不申请 IRQ、不碰 SMMU 页表。
+1. 映射 `0x00100000`（GCC）、`0x05065000`（GPUCC）；**不映射 GPU 核与 SMMU**——这两块要 GPU 的
+   GDSC/GX 时钟在才能安全读，r282 不碰；
+2. 每 120 s（首行 240 s）与 keystore/WDT 行一起印：GCC 三根 GPU 分支的 enable 位 + 两条 eMMC 分支
+   作正对照；只有 `GCC_GPU_CFG_AHB_CLK` 的 enable 位为 1 时才读 GPUCC 的 `gdsc_gpu_cx`（GDSCR
+   0x1004、状态在 hw-ctrl 0x1008 的 bit31）、`gdsc_gpu_gx`（GDSCR 0x1094 的 bit31）与 gfx3d 分支；
+3. 不做任何写、不申请 IRQ、不碰 SMMU 页表、不读 GPU 核 chipid（留到能安全开 GX 的那一轮）。
+
+**GDSC 偏移的来源**（2026-11-02 取回，均在下游仓库
+`LineageOS/android_kernel_xiaomi_sdm660`、分支 `lineage-17.1`）：
+
+- `arch/arm/boot/dts/qcom/msm-gdsc-660.dtsi`：`gdsc_gpu_cx: qcom,gdsc@5066004`，`hw-ctrl-addr = <&gpu_cx_hw_ctrl>`，
+  该 syscon 是 `0x5066008`；`gdsc_gpu_gx: qcom,gdsc@5066094`，`domain-addr = <&gpu_gx_domain_addr>`
+  （`0x5065130`）、`sw-reset = <&gpu_gx_sw_reset>`（`0x5066090`）；
+- `drivers/clk/qcom/gdsc-regulator.c`：`PWR_ON_MASK = BIT(31)`；有 `hw-ctrl-addr` 时状态从 hw-ctrl 读，
+  否则从 GDSCR 读（`poll_gdsc_status()`）；`qcom,gds-timeout = <2000>`；
+- `drivers/clk/qcom/gdsc.c`：`SW_COLLAPSE_MASK = BIT(0)`，写 0 表示上电、写 1 表示塌陷——所以只读时
+  「bit0=0 && bit31=1」才是「已上电且没有人在请求关」。
+- `drivers/clk/qcom/gcc-sdm660.c`：`gcc_gpu_cfg_ahb_clk` 的 `enable_reg = 0x71004`、`BIT(0)`、
+  `CLK_IS_CRITICAL`；`gcc_gpu_bimc_gfx_clk` 0x71010、`gcc_bimc_gfx_clk` 0x7106c，都是 `BIT(0)`。
+  这些偏移相对 DT 的 GCC 基址，所以物理地址分别是 `0x081004/0x081010/0x08106c`。正对照是
+  `gcc_sdcc1_ahb_clk`（0x116008）与 `gcc_sdcc1_apps_clk`（0x116004）：eMMC 在 `sdhc_1`（`0xc0c4000`），
+  每一轮块读写都证明这两根分支是活的。
+- 下游 `gcc-sdm660.c` 的 probe 在碰 GPUCC 之前先 `clk_prepare_enable(gcc_gpu_cfg_ahb_clk)`，注释是
+  “This clock is used for all GPUCC register access”；r282 把这句当作读 GPUCC 的门。
 
 判据先写死：
 
-- `chipid != 0x05010200` ⇒ 地址或时钟没到，后面所有读数都不可信；
-- GDSC 显示 already-on ⇒ 固件/ABL 把 GPU 留在了上电状态，先查谁开的，再决定是否接手；
-- 所有 GPU 寄存器读回全 `0xffffffff` ⇒ AHB 时钟没开（只读也会挂总线），下一步先开 `GCC_GPU_CFG_AHB_CLK` 再读；
-- 全 0 ⇒ 寄存器块没供电，读到的是未供电的总线默认值。
+- GCC 的 `gcc_gpu_cfg_ahb_clk` bit0 = 0 而两条 eMMC 分支在同一行 = 1 ⇒ GCC 窗口是活的、GPU 的 AHB
+  投票确实没人开；这一支是本轮**唯一**允许下「GPU 时钟没开」结论的形状；
+- `gcc_gpu_cfg_ahb_clk` 的整字读回 `0xffffffff` ⇒ 总线没应答，不是「时钟开着」；同样不读 GPUCC；
+- AHB 开着但 `gdsc_gpu_cx` 的 hw-ctrl bit31 = 0 ⇒ CX 没上电，GPUCC 里的 GDSCR 读数不可信；
+- CX 上电、`gdsc_gpu_gx` bit31 = 0 ⇒ 固件只留了 CX，GX 归我们开；
+- 两颗 bit31 都是 1 ⇒ 固件/ABL 已经把 GPU 留在上电状态，先查谁开的，再决定是否接手；
+- 正对照反了（eMMC 分支读 0）⇒ 本轮所有 GPU 读数作废，先修窗口。
+
+（chipid 不再作为 r282 的判据：GPU 核寄存器要 GX 与 gfx3d 时钟，读它等于在没有控制的块里冒挂总线的险。
+等 r283 能写 GDSC/时钟后再读，并用 a512 的值 `0x05010200` 验收。）
 
 ## 3. 后续顺序（每步一个可反驳的读数）
 

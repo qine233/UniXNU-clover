@@ -70,6 +70,13 @@ void clover_power_run(void);
 // not a PIL attempt that hangs on an unpowered CX domain. Read-only against SMEM and one APCS
 // register, opt-in through `clover-dsp`, and absent means not a byte is read.
 void clover_dsp_run(void);
+// Round282: drivers/CloverGpu, the GPU line's first reading and the same schedule point for the
+// same reason. It answers the two facts a first Adreno driver depends on -- whether the GPUCC
+// interface clock is voted on and whether the firmware left the GPU's two GDSCs up -- from the
+// board's own GCC and GPUCC windows. Read-only in the hard sense: two mappings, a fixed list of
+// words, no write, and GPUCC is not even mapped unless the GCC row shows its AHB vote. Opt-in
+// through `clover-gpu=1`; absent, it creates no mapping and no timer.
+void clover_gpu_run(void);
 }
 
 // The panic screen prints these lines, so the reading survives even when the console is the
@@ -247,4 +254,10 @@ extern "C" void sheng_pmgr_run(void)
   // bring-up job, and the second answer only means something next to the first. `clover-dsp` absent
   // means SMEM is not mapped and the doorbell register is not read.
   clover_dsp_run();
+  // Round282, last in the same tail: the GPU probe speaks on its own repeating timer because the
+  // card ring keeps only its last few hundred seconds, so where it sits in this sequence only
+  // decides whether its immediate row lands on the card at all. After CloverSdhci, like the two
+  // instruments above, because that ring is its only way off the device. Absent `clover-gpu`, it
+  // returns before mapping a single register.
+  clover_gpu_run();
 }

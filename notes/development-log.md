@@ -21324,9 +21324,45 @@ normalize `4dfdc0d3`（972 个戳归零）→ payload `4ff2446a`，归档
 
 按用户 2026-11-02「测完这一轮后把 GPU 驱动也放进来并行」的指令，先把只读上电/时钟取证写成底稿
 `notes/gpu-bringup.md`：GPU `0x05000000+0x40000`、chipid `0x05010200`、GPUCC `0x05065000`、
-GCC `0x01830000`、SMMU `0x05040000+0x10000`（三根 IRQ、GPU bank `gpu-offset 0x48000`）、
+GCC `0x01830000`（**round282 更正为 `0x00100000`**：DT 的 `clock-controller@100000`，`0x01830000` 是错钉）、SMMU `0x05040000+0x10000`（三根 IRQ、GPU bank `gpu-offset 0x48000`）、
 GDSC `gdsc_gpu_cx/gdsc_gpu_gx`（GX 需要 `GFX3D_CLK_SRC`）、zap PAS 13 `a512_zap` 在
 `0xf0b00000+0x2000`，以及 a5xx 没有 GMU、用 RB 侧 `a530_pfp/a530_pm4` µcode 这一组事实。
 r282 候选只读不写：chipid / GPUCC / GDSC / SMMU 识别，判据（`0xffffffff`＝AHB 未开、全零＝
 未上电、GDSC 已开）先写死；桌面路线仍是 CPU-first，GPU 线只是并行推进。
+
+## Round282：GPU 并行线第一行只读取证（v0.6.77）
+
+在 r281 同轮把 GPU 线真正接进构建，仍不占额外靴：`clover-gpu=1` 时 `drivers/CloverGpu` 才映射
+寄存器，缺席时一个字节都不读、一颗 timer 都不建。实现与判据（`notes/gpu-bringup.md` 同款）：
+
+- **地址先纠错**：GCC 是 `0x00100000`（DT `clock-controller@100000`，`reg = <0x100000 0x94000>`），
+  `gcc_gpu_cfg_ahb_clk` 的 `0x71004` 落到 `0x081004`；旧的 `0x01830000` 在 `porting.toml`、
+  `notes/gpu-bringup.md` 与本节上文都就地标了更正，`CloverInput/InputRegs.h` 早已用对基址。
+- **只映射两扇窗**：GCC 与 GPUCC `0x05065000`；GPU 核 `0x05000000`、SMMU、chipid **不碰**——
+  安全到那里需要 GX 与 gfx3d 根时钟，这一轮故意不控。
+- **同页正对照**：每拍先读 `gpu_ahb/gpu_bimc/bimc`，同一行读 `gcc_sdcc1_ahb/apps`。eMMC 每靴都在用，
+  所以「GPU 位 0 而对照 1」才是读数，「整行 0」不是。
+- **门**：只有 AHB 打分读 1 才读 GPUCC（vendor 探针：该时钟用于所有 GPUCC 寄存器访问）；
+  整字 `0xffffffff` 当作总线没应答，不当成 0 票，GPUCC 直接跳过并印 `gpucc skipped`。
+- **GDSC 语义照下游**：CX 状态看 hw-ctrl `0x1008` bit31（`msm-gdsc-660.dtsi` 给该节点
+  `hw-ctrl-addr`，`gdsc-regulator.c` 因此轮询 syscon 而不是 GDSCR），GX 看自己 `0x1094` 的 bit31；
+  同时报 SW_COLLAPSE、gfx3d/cxo 分支使能、gfx3d RCG 与 GX 的两枚 syscon。零写操作。
+- **节奏**：240 s 首行、之后每 120 s，加武装时立刻一行；与 r281 同理，单一说话时刻只描述活得久的靴子。
+
+**契约**：`check-clover.py` 新增 r282 块（两个源文件、`build-arm-driver.py CloverGpu`、defconfig
+`libCloverGpu.a`、`SHENG_PMGR`、`clover-gpu=1` 唯一模式、三条格式串、`withRange` 两窗、门与
+`setTimeoutMS` 两处、tee 类 `r282-gpu` 64 行与 `r282` 每趟豁免、`GpuRegs.h` 不许出现
+`0x01830000`、源码不许直接索引两扇窗）；`verify-clover-payload.py` 钉七条 r282 串（GCC 行、skip、
+GPUCC 行、两处 map failed、两处 notimer）。标题与两处 title 断言升到 r282。
+
+**构建（v0.6.77）**：kernel.macho `39b3818e…`（链接成功，`Undefined symbols` 0 条，`clover r282` 串
+8 条）；AMFI `49816dab…` → normalized `e39f7016…`；payload `2dcc7140…`，`verify-clover-payload.py`
+全绿、`mdir` 六文件齐、`check-clover.py` ok。归档 `~/clover-out/round282-v0.6.77-payload.img`。
+
+**本轮新踩的静默坑（构建链）**：`unixnu` 的 `[kernel] archives` 是每靴从 `board.toml` 现读的，所以
+`libCloverGpu.a` 照常被建出来；但 `CONFIG_XNU_EXTRA_LD_ARCHIVES` 来自 `out/clover/.config`，它是
+`unixnu defconfig` 对 `configs/clover_defconfig` 的**快照**。只改仓库里的 defconfig 不动快照，最终
+链接行仍只到 `libCloverDsp.a`，报的是 `_clover_gpu_run` 未定义——看起来像接线写错，其实是快照旧了。
+修法：改完 `configs/*_defconfig` 一律重跑 `./unixnu defconfig clover_defconfig`，再看链接行。
+`check-clover.py` 只能读仓库里的 defconfig，看不到 `out/` 快照，这个顺序只能写进流程。
 

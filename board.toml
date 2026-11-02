@@ -71,6 +71,7 @@ archives = [
   "build-arm-driver.py CloverInput",
   "build-arm-driver.py CloverPower",
   "build-arm-driver.py CloverDsp",
+  "build-arm-driver.py CloverGpu",
 ]
 
 [kernel.prelink]
@@ -190,7 +191,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r281: the keystore state becomes periodic and the watchdog gets a number, because boot 68 stopped at 1324.217 s without either speaking point being reached. Three early stops now stand at 726, 1324 and 1499 s while the boots that lived reached 1813 s and 1814 s: the beat stayed alive to the last second, the rows per hundred seconds fell 192 to 143 to 97 to 44 without a break, so the board stopped executing, it was not the tee dropping a line. What that shape fits is a watchdog, and the device names one: TWRP reads 17817000.qcom,wdt as MSM Watchdog and /proc/iomem gives 17817000-17817fff as msm-watchdog, while sheng disables com.apple.watchdogd outright with sheng-disable-watchdogd=1 and BootWatchdogPolicy.c. So this round changes two things and neither of them is a fix yet. First, the keystore rows stop depending on a single moment: the state line repeats every 120 s from 240 s with stage, service, opens, calls, refused, other and dropped, and the open and call tables are still said, every fifth fire, so whatever second the board dies on there is a row inside the ring's 355 s horizon. Second, the same timer reads the watchdog block read-only and prints it every fire: en, the unmasked interrupt bit, sts, bark, bite, and the bark and bite translated to milliseconds at the downstream driver's 32765 Hz. The block is mapped on first fire, never written, so a wrong address costs a row, not the boot. Decided before the flash: wdt armed=0 means the watchdog was never started and the stops are something else that still needs naming; armed=1 with sts=0 and a bark_ms smaller than the gap to the stop means the bark fired first, which matches runningboardd killing AccessibilityUIS with 0x8badf00d as another deadline expiring rather than a crash; armed=1 with a bitten or expired bird means the APSS watchdog is the executioner, and the next round is sheng's \"disable watchdogd\" argument plus its policy file rather than another instrument. A late aks row that arrives on a boot that also stops is the positive control for the schedule itself; if both are missing the timer never ran and nothing here was measured at all."
+title = "clover r282: the GPU line starts beside the desktop, with one read-only row and nothing written. The user asked for \"GPU work in parallel\", and the useful first step is not a driver: this board has never read a GPU register, so the two facts a driver depends on are unmeasured -- whether GPUCC is clocked and whether the firmware left the CX and GX domains up. The row reads three GCC GPU votes `gcc_gpu_cfg_ahb_clk`, `gcc_gpu_bimc_gfx_clk`, `gcc_bimc_gfx_clk` from the DT's own 0x00100000 window (not the 0x01830000 this repo carried until this round; that pin was wrong), alongside `gcc_sdcc1_ahb_clk` and `gcc_sdcc1_apps_clk`, the two eMMC branches this port exercises every boot, as a positive control on the same page. GPUCC at 0x05065000 is read only when the AHB vote reads 1, because the vendor probe enables that clock before any GPUCC access; a whole word of 0xffffffff is treated as a bus that did not answer, not as a vote of zero. The second row then reads the two GDSCs with the semantics their own downstream files give them: CX status from hw-ctrl 0x1008 bit 31 (that node has hw-ctrl-addr, and gdsc-regulator polls the syscon instead of the GDSCR), GX status from its own 0x1094 bit 31, plus the collapse bits, gfx3d and cxo branch enables, the gfx3d RCG command word, and the two syscons GX names. Nothing is written, and the GPU core at 0x05000000, the SMMU and chipid are deliberately not touched: reaching them safely needs GX and the gfx3d root, which this round does not control. The row repeats every 120 s from 240 s so a boot that stops early still leaves a reading inside the 512-record ring's horizon, and it speaks once immediately as well. Decided before the flash: eMMC controls 0 with GPU bits 0 means the whole row is void, not a GPU reading; AHB=0 with controls=1 means the GPU clock was off and the GPUCC question stays unasked; CX hw bit 31=0 means CX was unpowered and a GX answer would be suspect; CX on with GX off is the firmware leaving only the interface domain; both on means the firmware left the GPU fully powered and the next round writes nothing to power and goes straight to the gfx3d root and chipid. This round sits beside round281, which is still the one that reads the watchdog and the keystore schedule."
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2364,6 +2365,22 @@ kernel_args = [
   # and no reading depends on having spoken late. Nothing is re-run -- one bus transaction set per boot,
   # many readings of it.
   "clover-input=3",
+  # Round282 starts the GPU line beside the desktop instead of in front of it, as the user asked.
+  # "Write an Adreno driver" is not a next step: this board has never read one GPU register, and the
+  # two facts a first driver depends on are unmeasured -- whether GPUCC is clocked at all (the
+  # vendor probe enables `gcc_gpu_cfg_ahb_clk` first, "used for all GPUCC register access") and
+  # whether the firmware left the two GPU GDSCs up. So this round reads, and only reads:
+  #   `clover r282: gpu t= fire= gcc gpu_ahb= gpu_bimc= bimc= ctl_sdhc1_ahb= ctl_sdhc1_apps= raw ...`
+  #    -- the two eMMC branches are the positive control, read from the same page on every boot;
+  #   `clover r282: gpu ... gpucc cx= cxhw= cx_on= cx_collapse= gx= gx_on= gx_collapse= gfx3d_en=
+  #    cxo_en= rcg= dom= sw=` -- only when that AHB vote reads 1, because GPUCC access is unsafe
+  #    without it; a whole word of 0xffffffff is a bus that did not answer, not a vote of zero;
+  #   `clover r282: gpu ... gpucc skipped` / `gpucc map failed` -- refusals are readings too.
+  # No write, no GPU core (0x05000000), no SMMU and no chipid: reaching the core safely needs GX and
+  # the gfx3d root clock, which this round deliberately does not control. The row repeats every
+  # 120 s from 240 s for the same reason r281's does -- a single speaking time only describes the
+  # boots that outlive it. Design and decision criteria: notes/gpu-bringup.md.
+  "clover-gpu=1",
   # Round182 puts drivers/CloverPower on the SPMI arbiter, and mode 3 is the one worth booting for.
   # Mode 1 is the pure-read control: map core/chnls-cnfg/obsrvr/intr, decode the version and walk the
   # 448-entry APID map, start no transaction at all. Mode 2 stops after the two revid blocks. Mode 3

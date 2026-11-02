@@ -2995,6 +2995,82 @@ def check_board(errors: list) -> str:
                 errors.append(f"the tee still carries round {stale[2:]}'s class: a class for a producer that "
                               "no longer exists is how a budget looks allocated when nothing is spending it")
 
+        # Round282 starts the GPU line beside the desktop, and this block is what keeps it a
+        # *measurement* rather than an unread driver. Four halves have to agree, the same four every
+        # Clover driver has: the two source files exist, the archive is built and linked, the entry
+        # point is called from sheng_pmgr_run(), and the boot argument selects it. On top of that the
+        # addresses are pinned to the board's own DT, and the read-only discipline is asserted
+        # structurally: both windows are read through the one helper, so a direct index anywhere in
+        # the file is the start of a write this round promised not to make.
+        gpu_source_path = REPO / "drivers/CloverGpu/CloverGpu.cpp"
+        gpu_regs_path = REPO / "drivers/CloverGpu/GpuRegs.h"
+        if not gpu_source_path.is_file() or not gpu_regs_path.is_file():
+            errors.append("drivers/CloverGpu is missing: round282's whole reading is the two files "
+                          "that map GCC and GPUCC and print what they find")
+        else:
+            gpu_source = gpu_source_path.read_text()
+            gpu_regs = gpu_regs_path.read_text()
+            for needle, where, text_ in (
+                    ("#define kGccPhys            0x00100000ULL", "GpuRegs.h", gpu_regs),
+                    ("#define kGpuccPhys          0x05065000ULL", "GpuRegs.h", gpu_regs),
+                    ("#define kGccGpuCfgAhb       0x71004U", "GpuRegs.h", gpu_regs),
+                    ("#define kGpuccCxHwCtrl      0x1008U", "GpuRegs.h", gpu_regs),
+                    ("#define kGpuccGdscGx        0x1094U", "GpuRegs.h", gpu_regs),
+                    ("IODeviceMemory::withRange(kGccPhys, kGccSize)", "CloverGpu.cpp", gpu_source),
+                    ("IODeviceMemory::withRange(kGpuccPhys, kGpuccSize)", "CloverGpu.cpp", gpu_source),
+                    ("if ((ahb & 1u) == 0 || ahb_raw == 0xffffffffu) {", "CloverGpu.cpp", gpu_source),
+                    ("PE_parse_boot_argn(\"clover-gpu\", &mode, sizeof(mode))", "CloverGpu.cpp", gpu_source),
+                    ("clover_gpu_timer = IOTimerEventSource::timerEventSource(owner, clover_gpu_say);",
+                     "CloverGpu.cpp", gpu_source),
+                    ("(void) clover_gpu_timer->setTimeoutMS(CLOVER_GPU_FIRST_MS)",
+                     "CloverGpu.cpp", gpu_source),
+                    ("(void) sender->setTimeoutMS(CLOVER_GPU_STATE_MS)", "CloverGpu.cpp", gpu_source),
+                    # One format string per reading, so "which of the three rows is missing" is a question
+                    # a decoder can answer from the image instead of from the card.
+                    ("\"clover r282: gpu t=%u fire=%u gcc gpu_ahb=%u gpu_bimc=%u bimc=%u ctl_sdhc1_ahb=%u \"",
+                     "CloverGpu.cpp", gpu_source),
+                    ("\"clover r282: gpu t=%u gpucc skipped ahb=%u raw=%08x (GPUCC access needs the \"",
+                     "CloverGpu.cpp", gpu_source),
+                    ("\"clover r282: gpu t=%u gpucc cx=%08x cxhw=%08x cx_on=%u cx_collapse=%u \"",
+                     "CloverGpu.cpp", gpu_source)):
+                if needle not in text_:
+                    errors.append(f"{where} lacks {needle[:64]!r}: round282's row is the only measurement of "
+                                  "whether the GPU is clocked and powered, and every constant in it came from "
+                                  "the board's own downstream tree rather than from a nearby SoC")
+            # A direct index is how a write starts. Both windows go through clover_gpu_read().
+            for window in ("clover_gpu_gcc[", "clover_gpu_gpucc["):
+                if window in gpu_source:
+                    errors.append(f"CloverGpu.cpp indexes {window} directly: round282 writes no register, and "
+                                  "the one read helper is what makes that checkable rather than promised")
+            if "0x01830000" in gpu_regs:
+                errors.append("GpuRegs.h carries 0x01830000: that pin was wrong -- the board's DT puts GCC at "
+                              "0x00100000 (clock-controller@100000), which is also what CloverInput's registers "
+                              "already use, and the wrong base would have read a different block as clocks")
+        gpu_built = any("CloverGpu" in item for item in board["kernel"]["archives"])
+        # `text` has been reassigned to patch sources by this point in the function; read the
+        # defconfig this check is about rather than whatever the last round's block left behind.
+        gpu_defconfig = defconfig_path.read_text()
+        if "libCloverGpu.a" in gpu_defconfig and not gpu_built:
+            errors.append("the defconfig links libCloverGpu.a but [kernel] archives omits build-arm-driver.py "
+                          "CloverGpu, so that archive does not exist")
+        if gpu_built and "libCloverGpu.a" not in gpu_defconfig:
+            errors.append("[kernel] archives builds CloverGpu but the defconfig does not link libCloverGpu.a, "
+                          "so clover_gpu_run() is undefined")
+        if gpu_built and flags.get("SHENG_PMGR", "n") not in ("y", "1"):
+            errors.append("CloverGpu is scheduled from sheng_pmgr_run(), which CONFIG_XNU_SHENG_PMGR="
+                          f"{flags.get('SHENG_PMGR', 'n')} does not compile into the kernel")
+        gpu_args = [item for item in board["payload"]["kernel_args"] if item.startswith("clover-gpu")]
+        if gpu_built and gpu_args != ["clover-gpu=1"]:
+            errors.append(f"kernel_args carries {gpu_args!r} for clover-gpu: the probe has one mode (read "
+                          "both windows) and absence means no mapping, so anything else is noise or a second "
+                          "instrument nobody wrote")
+        if '{ "clover r282: ", "r282-gpu", 64, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the GPU rows: an unbudgeted producer drops "
+                          "them silently, and this round's reading is the row itself")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r282")' not in sdhci_source:
+            errors.append("the r282 rows are not exempt from the per-pass push cap: the GPU timer can fire "
+                          "beside the census burst, where boot 36 measured the cap eating exactly that")
+
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -4300,8 +4376,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r281:"):
-        errors.append('[payload] title is not "clover r281: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r282:"):
+        errors.append('[payload] title is not "clover r282: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5414,8 +5490,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r281:"):
-        errors.append('[payload] title is not "clover r281: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r282:"):
+        errors.append('[payload] title is not "clover r282: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

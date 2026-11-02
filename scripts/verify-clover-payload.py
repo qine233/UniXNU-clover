@@ -1132,6 +1132,22 @@ def check_sb_sample(kernel: bytes) -> bool:
              # Both earlier shapes have to be gone: they would spend ring space on readings the ring drops anyway.
              "aks-say-r280-gone": b"clover r280: " not in kernel,
              "aks-say-r279-gone": b"clover r279: " not in kernel,
+             # Round282 starts the GPU line beside the desktop with a read-only row. Five literals, because
+             # the refusal arms are readings too: a payload that carries the GCC row but not the skip arm
+             # would leave "the AHB vote was off" indistinguishable from "the string was never linked". The
+             # GPUCC row is the second half and stands on its own; the two map/no-timer arms say why a row
+             # that should be there is not.
+             "gpu-row-gcc": (b"clover r282: gpu t=%u fire=%u gcc gpu_ahb=%u gpu_bimc=%u bimc=%u "
+                             b"ctl_sdhc1_ahb=%u ctl_sdhc1_apps=%u raw ahb=%08x ctl=%08x\n") in kernel,
+             "gpu-row-skip": (b"clover r282: gpu t=%u gpucc skipped ahb=%u raw=%08x (GPUCC access needs the "
+                              b"gcc_gpu_cfg_ahb vote)\n") in kernel,
+             "gpu-row-gpucc": (b"clover r282: gpu t=%u gpucc cx=%08x cxhw=%08x cx_on=%u cx_collapse=%u "
+                               b"gx=%08x gx_on=%u gx_collapse=%u gfx3d_en=%u cxo_en=%u rcg=%08x dom=%08x "
+                               b"sw=%08x\n") in kernel,
+             "gpu-row-mapfail": b"clover r282: gpu t=%u gpucc map failed phys=%llx\n" in kernel,
+             "gpu-mapfail": b"clover r282: gpu map failed phys=%llx size=%x\n" in kernel,
+             "gpu-notimer-wl": b"clover r282: gpu t=%u notimer (resource service work loop unavailable)\n" in kernel,
+             "gpu-notimer-src": b"clover r282: gpu t=%u notimer (timer source refused)\n" in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,
