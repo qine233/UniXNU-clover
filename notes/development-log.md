@@ -21236,3 +21236,54 @@ open/call 全发生在 470–1500 s，所以行被推上去、又被轮换掉。
 - **判据（刷前写死）**：`aks late` 整段缺席 ⇒ 定时器没响或 tee 丢了它，此时以普查计数器为准，下一刀是把表交给普查印
   （要一张板级补丁）；`open 0 pid=… comm=datamigrator` 且调用 rc 全 0 ⇒ 剩的 stall 在 keystore 下游，
   下一刀是 workloop 里那五个等待者；表里全是 `e00002c7` ⇒ 客户端契约仍被拒，下一刀是把没答的选择器补上。
+
+## r280 读数（boot 68，文件 boot69-r280.bin.txt）：这靴在两个说话点之前就没了，但它把「谁复位了板子」变成可测的问题
+
+**① 判据的第一支。** `clover r280:` 一行都没有，而这**不是仪器坏**：内核日志最大 **1324.217052 s**，
+比普查门（1500 s）和定时器（1600 s）都早，所以 r280 的两个说话点都没到。`clover r243`/`r252`/`r276`
+全 0 行与此一致；`r267`=27、`r273`=6 说明采样与卡一直工作到最后。
+
+**② 最后几行说板子到 1324 s 还是活的。**
+
+```
+[ 1324.217007]: clover r234: beat t=1324 pid=58 rn=3303 rep=8203
+[ 1324.217052]: clover r234: sbport t=1324 sbrep nm=8203 kr=15
+```
+
+节拍（每 4 s 一拍）跑到最后一刻；每百秒行数 **192 → 143 → 97 → 44**（900→1300 s）在掉，
+但没断档。本靴**没有 kind 20 记录**（`boot 68 kind 20` 计数 0），卡恢复 7 次（老毛病）。
+⇒ 「日志自己停」= 节拍停 = 板子在那一刻**不再执行**（复位或挂死），不是 tee 掉线——tee 掉线不会让
+节拍行变少，只会让它们缺失。
+
+**③ 三次同型早停，时间各不相同**：boot 63=1499.386 s、boot 64=726 s、boot 68=1324.217 s；
+期间 boot 65/66/67 都活到 1813/1814 s 并写了死线记录。⇒ 这是**间歇性**事件，与 keystore 无关
+（66/67 一发一不发都活到了；63/64/68 都早停）。r278 的因果结论已撤回，这里补上分母。
+
+**④ 一个一直没问对的问题：是谁把板子弄回去的。** 早停没有 panic 记录 ⇒ 不是我们任何一条 panic 路径；
+宿主侧能看到的落点是 TWRP（misc 里 boot 67 死线 panic 写的 BCB 一直没被正常启动清掉，所以「落进 TWRP」
+不能区分复位来源）。趁板子在 TWRP 里问了一次：`/proc/bootreason`、`/proc/bootargs` 都不存在，
+`/proc/cmdline` 里没有 `androidboot.bootreason`；**但 dmesg 给了硬件事实**——
+
+```
+msm_watchdog 17817000.qcom,wdt: wdog absent resource not present
+msm_watchdog 17817000.qcom,wdt: MSM Watchdog Initialized
+```
+
+⇒ 这颗 SDM660 的 APSS 看门狗寄存器在 **0x17817000**。我们自己的 prelink roots 里就有
+`com.apple.driver.AppleARMWatchdogTimer`，而 boot 67 的日志里出现过 `comm=watchdogd`
+带一次 BRK 陷阱（`esr=0xf2000001 ec=60 brk=0x1`）。**假设**：板子偶发卡住 → watchdogd 不再喂狗 →
+硬件 WDT bark 直接暖复位 ⇒ 无 panic、无日志尾部、复位时刻随最后一次喂狗而漂移（726/1324/1499 全对上）。
+
+**⑤ 旁板怎么做（规矩：先查 sheng）。** `UniXNU-sheng/package/BootWatchdogPolicy.c` 在挂上可写 Data 之后、
+exec launchd 之前写 `/private/var/db/com.apple.xpc.launchd/disabled.plist`，把 **`com.apple.watchdogd` 禁用**
+（它自己那行 printf 写明「hardware watchdog not implemented」），参数是 `sheng-disable-watchdogd=1`；
+另有 `sheng-lite=1` 关掉一批只找网络/iCloud/相册、在首启抢 CPU 与内存的 daemon（其中四个正是
+「同步 XPC 等待环」的来源）。也就是说：**旁板明确不让用户态看门狗参与开机**，而我们让它跑。
+
+**⑥ r281 因此改两件事**（顺序：先量，再动）：
+1. **把 keystore 的状态行改成周期性**：从 ~240 s 起每 120 s 一行紧凑 state（`stage/service/opens/calls/
+   refused/other/dropped`），表（open/call）每 600 s 说一次。这样无论板子在 726 还是 1324 还是 1814 s 结束，
+   环里总有一行落在最后 355 s 内——r280 的教训就是「只在门后说话」的仪器读不到门前的死。
+2. **量 0x17817000**：照 CloverInput/CloverPower 的形状在拍里读 WDT 的 CS/RCS 与 bark 时间并印一行
+   （armed? bark 还剩多少？）。若 WDT 被 arm 且 bark 时间与早停间隔同量级，④ 那条假设就从「像」变成「是」，
+   下一步才是照 sheng 把 watchdogd 禁用（或把 `AppleARMWatchdogTimer` 的处理弄清楚）。
