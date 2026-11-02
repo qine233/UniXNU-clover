@@ -1624,7 +1624,7 @@ def report(image: pathlib.Path) -> int:
     # panic record, no kernel log -- because no kernel ran. The round title carries a quoted function
     # name, the shape the emitter used to write between bare quotes, so the shipped file is parsed
     # here the way the firmware's parser parses it and required to offer this board's title, its
-    # kernel and the unattended deadline.
+    # kernel and -- since round285 disarms the deadline -- no clover-unattended= argument.
     manifest = blobs.get("unixnu.toml")
     label = "unixnu.toml: parses and offers this round's xnu entry"
     if manifest is None:
@@ -1641,7 +1641,7 @@ def report(image: pathlib.Path) -> int:
             xnu = next((entry for entry in parsed.get("entry", []) if entry.get("type") == "xnu"), {})
             parts = {"title": xnu.get("title") == board["payload"]["title"],
                      "kernel": xnu.get("path") == "Payloads/kernel.macho",
-                     "deadline": "clover-unattended=1800" in xnu.get("args", "")}
+                     "deadline": "clover-unattended=" not in xnu.get("args", "")}
             same = all(parts.values())
             ok &= same
             print(f"{label:42} {'OK' if same else 'FAIL'} "

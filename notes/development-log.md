@@ -21517,3 +21517,36 @@ boot 70 遗留的 IMEM 记录（读在清之前，boot 70 死后槽没被清，�
 点名 halt/restart/reboot(2)/panic 屏；`unnamed` 加 `beat` 非零说明复位没经过内核任何已知入口；
 `unnamed` 且 `beat=0` 说明复位发生在武装之前。同一条行还应出现在 kernel-log 环（若本靴活得够短），
 正对照是「驱动环有、kernel-log 环可能没有」，二者不同源才能证明副本真的多了一条管道。
+
+---
+
+## r285（v0.6.80）—— 去掉死线，原样启动一次
+
+**① 这轮修什么。** 自 round228 起每一帧都带着 `clover-unattended=1800`，读到的答案永远是死线自己
+的：死线在靴子跑完之前就触发，`panic("clover r148: unattended deadline 1800 s")` 抢在 iPadOS 真正
+走多远之前把读数定格。用户回到 rec 后下的令是「去掉死线去延迟，直接以最真实的状态开始启动一次」——
+即 round149 的老问题再问一遍：什么都不打断，iPadOS 能自己走到哪。round149 那会儿靴子还没过 launchd；
+现在这轮，boot 已经能过 launchd，所以这是一次「过 launchd 之后、无人打断」的真读数。
+
+**② 修法。** 死线是纯 boot-arg，去掉它**不需要重建内核**。`board.toml` 的 `kernel_args` 里删掉
+`"clover-unattended=1800"`；`ArmCpu.cpp` 里 `PE_parse_boot_argn` 解析不到它，`gUnattendedSeconds=0`，
+于是死线 panic、20 s panic 屏复位、每 4 s 的 flight-beat 卡写入全部不武装。没有任何东西打断靴子；
+挂起是静默的，面板——或者桌面，如果它出来了——是唯一的停点。内核复用 r284 的归一化镜像
+`295743ba…`，只重建 payload。
+
+**③ 契约。** `check-clover.py` 把「必须有 `clover-unattended=`」翻成「必须没有」：任一
+`clover-unattended=` 参数都报错，注释说清 round285 要的是不被任何东西打断的靴。`armcpu-clock-panic=`
+的检查保留（那个滴答计数看门狗是测调度器不是测靴子，不得与死线同返）。标题升到 r285、带
+`"nothing interrupts it"` 双引号（boot 35/36 转义事故要求每轮标题都带一个）。`verify-clover-payload.py`
+把 `"deadline"` 断言从「`clover-unattended=1800` 在 args 里」翻成「`clover-unattended=` 不在 args 里」。
+
+**④ 构建与闸门（v0.6.80）。** 内核不变（复用 r284 归一化 `295743ba…`），只跑 `unixnu build payload`。
+payload 卷内 kernel 同源 `295743ba…`、`kernel_args` 已无 `clover-unattended=1800`；镜像 sha256
+`919815eb…`，归档 `~/clover-out/round285-v0.6.80-payload.img`（58 720 256 字节）。`check-clover.py`
+绿（ADT 14384 字节、8 核、/product 断言过），`verify-clover-payload.py` exit=0（`unixnu.toml` 解析过、
+title ok、kernel ok、deadline ok=absent）。`verify-userdata-window.py` 不适用：只冷刷 cache。
+
+**⑤ 下一靴怎么读。** r285 是 boot 72：**没有死线，靴子不会自己回来**。面板——或桌面，如果它出来——
+是唯一的停点，读回需要一只手在平板上（adb 若桌面呈现、或 fastboot 手动回 rec）。判据：iPadOS 走到
+多远、有没有挂在哪一步；boot 72 的 IMEM 记录若存在，就是这轮「什么都不打断」的真实落点。这一轮
+故意不装任何看门狗，所以它留下的不是死线的读数，而是靴子自己的读数。

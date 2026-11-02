@@ -708,29 +708,17 @@ def check_board(errors: list) -> str:
                           "NACK is a valid answer there (round183's), so the instrument is not a risk "
                           "this round decided to avoid")
 
-        # round184, the unattended deadline returns. Everything above is parked *because* the
-        # critical path is the boot itself, and a boot nobody can read is not an answer: round149
-        # removed the deadline to let the panel be the stop, and round183 found out what that cost --
-        # a boot that gets anywhere never comes back to fastboot, and the panel is a printer that
-        # stops drawing when the screen is full -- round183's frame still had the kernel's own version
-        # banner on row one and the instrument's `part(3)` on its last row, so nothing after that row
-        # was drawn anywhere. So the deadline is back, and the assert is its mirror image:
-        # the argument must be present, in a numeric form ArmCpu can turn into a CNTVCT deadline, with
-        # a ceiling the host script's own wait can still outlast.
-        unattended_args = [argument.split("=", 1)[1] for argument in board["payload"]["kernel_args"]
+        # round285 removes the deadline again, for round149's own question restated: how far does
+        # iPadOS get when nothing interrupts it. Every frame since round228 answered "1800 s" -- the
+        # deadline fires before the boot finishes, so the reading was always the deadline's, never the
+        # boot's. With the argument absent nothing arms it; a present deadline (in any numeric form)
+        # would cut the boot this round exists to read, so absence is the contract, exactly as
+        # round149 left it.
+        unattended_args = [argument for argument in board["payload"]["kernel_args"]
                            if argument.startswith("clover-unattended=")]
-        if not unattended_args:
-            errors.append("kernel_args carries no clover-unattended=: round184 wants the board to "
-                          "come back to fastboot by itself, and with no deadline a boot that reaches "
-                          "userland never does")
-        for value in unattended_args:
-            if not value.isdigit():
-                errors.append(f"clover-unattended={value} is not a plain second count; ArmCpu's "
-                              "deadline would not parse")
-            elif not 60 <= int(value) <= 1800:
-                errors.append(f"clover-unattended={value} is outside the 60..1800 s window: below it "
-                              "the deadline cuts off the boot it exists to read, above it the host "
-                              "wait gives up before the board does")
+        if unattended_args:
+            errors.append(f"kernel_args still carries {unattended_args[0]}: round285 wants the boot "
+                          "uninterrupted, and any deadline would cut the boot it exists to read")
 
         # round184, the panic-time ring drain. The deadline is only useful if the reading survives
         # it, and the two RAM rings do not: kind 21 and kind 22 hold their slots in kernel memory and
@@ -4476,15 +4464,11 @@ def check_board(errors: list) -> str:
     # for a device that will never appear -- and the panel it leaves behind is a printer, not a
     # scrolling console, that stops drawing when the screen is full. round183's frame is the proof:
     # its first row is still the kernel's own version banner and its last row is the DSP instrument's
-    # `part(3)`. Both halves of the reading were lost that way. The argument's presence and its range
-    # are asserted above, next to the archives that schedule it; what stays here is the rule that the
-    # *tick-count* watchdog must not come back with it, because a clock that panics at N ticks
+    # `part(3)`. Both halves of the reading were lost that way. Round285 disarms it again: absence
+    # is asserted above, next to the archives that schedule it, so what stays here is the rule that
+    # the *tick-count* watchdog must not come back, because a clock that panics at N ticks
     # measures the scheduler rather than the boot.
     kernel_args = board["payload"]["kernel_args"]
-    if not any(argument.startswith("clover-unattended=") for argument in kernel_args):
-        errors.append("[payload] kernel_args has no clover-unattended=: round184 wants the board to "
-                      "return to fastboot on its own, and with no deadline a boot that reaches "
-                      "userland never does")
     if any(argument.startswith("armcpu-clock-panic=") for argument in kernel_args):
         errors.append("[payload] kernel_args still carries armcpu-clock-panic=: the tick-count "
                       "watchdog would also cut the observation short")
@@ -4503,8 +4487,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r284:"):
-        errors.append('[payload] title is not "clover r284: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r285:"):
+        errors.append('[payload] title is not "clover r285: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5617,8 +5601,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r284:"):
-        errors.append('[payload] title is not "clover r284: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r285:"):
+        errors.append('[payload] title is not "clover r285: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -6173,11 +6157,6 @@ def check_board(errors: list) -> str:
         ("scripts/read-clover-log.py",
          "--count",
          "run-clover-unattended.sh would have no machine-readable record count"),
-        ("board.toml",
-         '"clover-unattended=1800"',
-         "the deadline would cut a boot that r227's frame shows still moving past 900 s "
-         "(generation C latched at 653 s and healthy at 906 s), and the round would be "
-         "measuring the deadline instead of the boot"),
         ("drivers/CloverSdhci/CloverSdhci.cpp",
          'CloverSdhci r195: %s probe lines capped at %u',
          "the tee would go back to an uncapped transcript: on round194's frame the flood had "
