@@ -842,6 +842,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // would be the same nine numbers printed fifteen times. Twenty fires inside the 1800 s deadline is half
   // of 64, which leaves the same headroom the last two rounds were given.
   { "clover r270: ", "r270-ipi", 64, 0, 0, 0 },
+  // Round271 prints exactly one row per census fire, like r270: the cpu bookkeeping is global, so a copy
+  // per thread row would print the same eight start/running bits fifteen times. The row is short (~110
+  // bytes, longer once the per-cpu timer counters grow), and twenty fires inside the 1800 s deadline is
+  // half of 64 -- the same headroom the last two rounds were given.
+  { "clover r271: ", "r271-cpu", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

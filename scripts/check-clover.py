@@ -2385,6 +2385,70 @@ def check_board(errors: list) -> str:
                 errors.append("drivers/ArmCpu no longer tallies the IPIs it sends and the SGIs it receives: "
                               "the census row would be reading globals that nothing writes")
 
+        # Round271 asks the kernel the same question the driver was asked in r270. Boot 57 answered
+        # "sent=0 recv=0, and only core 0 ever takes a timer interrupt" from the CPU driver's counters --
+        # which cannot tell "the board lost the interrupt" from "there was never a cpu registered on that
+        # core to lose it to". CpuDataEntries[] is the array XNU fills as cpus register, StartedState is
+        # set by processor_start(), cpu_running flips as that cpu enters and leaves idle, and
+        # cpu_stat.timer_cnt is the kernel's own tick tally. Eight threads waiting on one registered core
+        # is a different fault, with a different fix, from eight threads waiting on eight cores that
+        # nobody wakes.
+        r271_name = "z" * 46 + "-clover-r271.patch"
+        r271_patch = next((base / "patches/xnu-clover" / r271_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r271_name).is_file()), None)
+        if r271_patch is None:
+            errors.append(f"patches/xnu-clover/{r271_name} is missing: the frame would go on reporting "
+                          "the board's interrupt counters as if they said how many cpus XNU is using")
+        else:
+            r271_text = r271_patch.read_text()
+            r271_added = "".join(line for line in r271_text.splitlines(True)
+                                 if line.startswith("+"))
+            for needle in ('#include <arm/cpu_data_internal.h>',
+                           '#include <arm/cpu_internal.h>',
+                           '#define CLOVER_R271_NCORE (MAX_CPUS < 8 ? MAX_CPUS : 8)',
+                           'CpuDataEntries[k].cpu_data_vaddr',
+                           'cdp->cpu_flags & StartedState',
+                           'if (cdp->cpu_running)',
+                           'cdp->cpu_stat.timer_cnt',
+                           '"clover r271: cpu t=%llu real=%u max=%u reg=%u start=%u run=%u"',
+                           's=%u%u%u%u%u%u%u%u r=%u%u%u%u%u%u%u%u'):
+                if needle not in r271_added:
+                    errors.append(f"{r271_patch.name} lacks {needle[:64]!r}: without the kernel's own "
+                                  "registered/started/running/timer fields the row is another copy of "
+                                  "the driver's numbers")
+            if "armcpu_" in r271_added:
+                errors.append(f"{r271_patch.name} reads the driver's globals again: r271 exists precisely "
+                              "because those counters describe interrupts, not cpus")
+            if r271_added.count("clover r271: cpu") != 1:
+                errors.append(f"{r271_patch.name} prints the cpu row "
+                              f"{r271_added.count('clover r271: cpu')} times: one census fire is one row")
+            # The row has to sit inside the census block -- after r270's global row and before the thread
+            # rows it qualifies. Both neighbours are context lines, so this reads the whole patch, not
+            # just its plus side.
+            if "armcpu_core_timer[6], armcpu_core_timer[7]);" not in r271_text:
+                errors.append(f"{r271_patch.name} is not applied directly after r270's row: the last "
+                              "context line of the hunk is that row's closing printf argument list, and "
+                              "without it the two readings are not known to arrive in the same frame")
+            if (r271_text.find("clover r271: cpu") < 0 or
+                    r271_text.find("for (i = 0; i < cn; i++)") < r271_text.find("clover r271: cpu")):
+                errors.append(f"{r271_patch.name} puts the cpu row after the thread rows it is meant to "
+                              "be read against")
+            baseline_script = (REPO.parent / "UniXNU" /
+                               "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in baseline_script.splitlines()
+                                 if "clover-r2" in line)
+            if (late_list.find(r271_name) < 0 or
+                    late_list.find(r271_name) > late_list.find("z" * 45 + "-clover-r270.patch")):                errors.append("build-xnu-4k-baseline.sh does not reverse r271 before r270 in LATE_PATCH: "
+                              "the compile pass would run on a tree this patch was not written against")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r271_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r271_name} is missing: unixnu loads patches from that "
+                              "directory and silently skips a board patch that lives only in this repo")
+            if '{ "clover r271: ", "r271-cpu", 64, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci has no class for the cpu row: a new prefix is a "
+                              "producer of its own and an unbudgeted one drops the reading silently")
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -3689,8 +3753,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r270:"):
-        errors.append('[payload] title is not "clover r270: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r271:"):
+        errors.append('[payload] title is not "clover r271: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4803,8 +4867,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r270:"):
-        errors.append('[payload] title is not "clover r270: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r271:"):
+        errors.append('[payload] title is not "clover r271: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

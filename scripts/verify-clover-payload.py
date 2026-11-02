@@ -1105,6 +1105,14 @@ def check_sb_sample(kernel: bytes) -> bool:
              # tell "the kernel never asked" from "the IPI went out and nobody arrived".
              "bb-ipi": (b"clover r270: ipi t=%llu sent=%llu recv=%llu tick=%llu"
                         b" sgi=%u,%u,%u,%u,%u,%u,%u,%u tm=%u,%u,%u,%u,%u,%u,%u,%u\n") in kernel,
+             # Round271: boot 57 read sent=0 recv=0 and a timer tick on core 0 only, all of it from the CPU
+             # driver's counters -- which cannot say whether a core was ever registered to receive one.
+             # This row is XNU's own bookkeeping (real_ncpus, CpuDataEntries, StartedState, cpu_running,
+             # cpu_stat.timer_cnt), and without it "eight waiters, one core" stays an inference from
+             # interrupts rather than a reading of the scheduler's machine set.
+             "bb-cpu": (b"clover r271: cpu t=%llu real=%u max=%u reg=%u start=%u run=%u"
+                        b" s=%u%u%u%u%u%u%u%u r=%u%u%u%u%u%u%u%u"
+                        b" tm=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

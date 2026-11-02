@@ -1,0 +1,93 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -134,6 +134,15 @@
+ #include <kern/restartable.h>
+ #include <kern/ipc_kobject.h>
+ #include <kern/sync_sema.h>    /* struct semaphore, for round268's rights reading */
++/*
++ * Round271. CpuDataEntries is the array XNU itself fills as cpus register: the started/running bits
++ * and the per-cpu timer/ipi counters are the kernel's own answer to "how many cpus does this board
++ * actually have online", which the round270 row (printed from the board driver's counters) cannot
++ * give. The board can count interrupts on a core XNU never started, and the two readings disagreeing
++ * is itself a finding.
++ */
++#include <arm/cpu_data_internal.h>
++#include <arm/cpu_internal.h>   /* real_ncpus, for the same row */
+ 
+ #if defined(__arm64__)
+ #include <arm/thread.h>
+@@ -12045,6 +12054,13 @@
+  */
+ #define CLOVER_BB_SEMA_PROBE 400
+ 
++/*
++ * Round271. Eight because that is what the ADT declares for this board and what round270's
++ * driver-side counters are sized for; clamped by MAX_CPUS so the walk can never run off the end of
++ * CpuDataEntries on a build configured for fewer cores.
++ */
++#define CLOVER_R271_NCORE (MAX_CPUS < 8 ? MAX_CPUS : 8)
++
+ static void
+ clover_sema_send_holder(ipc_port_t port, uint64_t *hit_pid, uint64_t *hit_name,
+     uint64_t *hit_bits, uint32_t *scanned, uint32_t *probed)
+@@ -12771,6 +12787,60 @@
+ 		    armcpu_core_timer[0], armcpu_core_timer[1], armcpu_core_timer[2],
+ 		    armcpu_core_timer[3], armcpu_core_timer[4], armcpu_core_timer[5],
+ 		    armcpu_core_timer[6], armcpu_core_timer[7]);
++		/*
++		 * Round271. Boot 57 showed the driver counting timer interrupts on core 0 only, and
++		 * zero IPIs sent -- but the driver's per-core array says nothing about what XNU believes,
++		 * because the board will happily deliver a tick to a cpu the kernel never started. This is
++		 * the kernel's own bookkeeping read directly: CpuDataEntries[] is filled in by
++		 * cpu_data_register() as cpus come up, StartedState is set by processor_start(), and
++		 * cpu_running flips as that cpu enters and leaves idle. Three readings, three different
++		 * faults: reg=1 means secondary cpus were never brought up here, so eight waiting threads
++		 * were always competing for one core; reg=8 with run=1 means they are up and only one is
++		 * out of idle, which is a wake-up-path bug; reg=8 and run=8 means the scheduler has cores
++		 * to give them and the stall is not about cpus at all. tm= is XNU's per-cpu timer count
++		 * (cpu_stat.timer_cnt), so it can be compared against the driver's tm= one row above --
++		 * if the two disagree, someone is counting interrupts the kernel never dispatched.
++		 */
++		{
++			cpu_data_t *cdp;
++			uint64_t ctm[8];
++			uint32_t sbit[8], rbit[8];
++			uint32_t reg = 0, nstart = 0, nrun = 0;
++			int k;
++
++			for (k = 0; k < 8; k++) {
++				ctm[k] = 0;
++				sbit[k] = 0;
++				rbit[k] = 0;
++			}
++			for (k = 0; k < CLOVER_R271_NCORE; k++) {
++				cdp = CpuDataEntries[k].cpu_data_vaddr;
++				if (cdp == NULL) {
++					continue;
++				}
++				reg++;
++				if (cdp->cpu_flags & StartedState) {
++					nstart++;
++					sbit[k] = 1;
++				}
++				if (cdp->cpu_running) {
++					nrun++;
++					rbit[k] = 1;
++				}
++				ctm[k] = cdp->cpu_stat.timer_cnt;
++			}
++			printf("clover r271: cpu t=%llu real=%u max=%u reg=%u start=%u run=%u"
++			    " s=%u%u%u%u%u%u%u%u r=%u%u%u%u%u%u%u%u"
++			    " tm=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
++			    (unsigned long long)secs, real_ncpus, (unsigned int) MAX_CPUS,
++			    reg, nstart, nrun,
++			    sbit[0], sbit[1], sbit[2], sbit[3], sbit[4], sbit[5], sbit[6], sbit[7],
++			    rbit[0], rbit[1], rbit[2], rbit[3], rbit[4], rbit[5], rbit[6], rbit[7],
++			    (unsigned long long)ctm[0], (unsigned long long)ctm[1],
++			    (unsigned long long)ctm[2], (unsigned long long)ctm[3],
++			    (unsigned long long)ctm[4], (unsigned long long)ctm[5],
++			    (unsigned long long)ctm[6], (unsigned long long)ctm[7]);
++		}
+ 		for (i = 0; i < cn; i++) {
+ 			char peer[24];
+ 			uint32_t mmc = 0;

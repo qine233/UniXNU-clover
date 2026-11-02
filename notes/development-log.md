@@ -20563,3 +20563,38 @@ boot 56 的形状（整个任务 8 条线程全睡、0 条可运行、block 排�
 `started=8` 而 `running` 只有 1 颗 ⇒ 线程被放到不会醒的核上，那是**唤醒路径**而不是上线路径；
 两者都不成 ⇒ 回到 workloop 的 `wl_request` 事件本身。
 
+
+
+## r271 落地（v0.6.58）：一行「内核自己知道几颗核」
+
+**① 上一条里我打算用的四个名字，这棵树一个都没有。** 我写的是 `CPU_DATA(i)` 的
+signal/started/running 位、`processor_count`、`max_cpus`、`ml_get_active_cpus()`；逐个 grep 过：
+`ml_get_active_cpus`/`ml_get_max_cpus`/`ml_get_pending_cpus`/`ml_cpu_start`/`struct machine_cpu`/
+`machine_slot`/`cpu_signal_state` 在 `osfmk/` 里**零命中**。所以这一轮不是「按设计填字段」，是把设计里
+凭空假设的那层 API 换成树上真有的东西。真有的这些：
+
+- `osfmk/arm/cpu_data_internal.h:266` `extern cpu_data_entry_t CpuDataEntries[MAX_CPUS];` ——
+  `cpu_register()` 每上一颗核就填一格 `cpu_data_vaddr`，没上过的槽是 `NULL`。这一条就是
+  「注册过几颗」的直接读数，不需要任何调度器 API。
+- 同文件 `struct cpu_data` 里 `cpu_flags` + `#define StartedState 0x1000`（`processor_start()` 走的路）、
+  `bool cpu_running`、`cpu_stat.timer_cnt`（内核自己的每核 timer 计数，和 r270 那张驱动表可对）。
+- `osfmk/arm/cpu_internal.h:73` `extern unsigned int real_ncpus;`（定义在 `cpu_common.c:69`，默认 1）。
+- `MAX_CPUS` 在这棵树里**没有 `#define`**（只有 i386 那份 64），它是构建配置带进来的常量。我不猜它，
+  直接把它的值印成 `max=`，让数组边界自己上卡。
+
+**② 第一版被自家闸门拦下一条错，这条错正是 r269 那课的形状。** 只 `#include <arm/cpu_data_internal.h>`
+时 `real_ncpus` 是 `use of undeclared identifier`（`task.c:12834`），`check-clover-xnu-syntax.py`
+报 `hard=1` 并把那一行点名；补 `#include <arm/cpu_internal.h>` 之后 `exit=0 hard=0`。
+这次不是「打印前 40 条把错挤掉」，是闸门把错误行号直接给出来——上一轮立的规矩在起作用。
+
+**③ 行的形状**（普查每次拍火印一条，紧跟 r270 那条，落在逐线程行之前；类 `r271-cpu`，预算 64）：
+
+```
+clover r271: cpu t=%llu real=%u max=%u reg=%u start=%u run=%u
+    s=%u%u%u%u%u%u%u%u r=%u%u%u%u%u%u%u%u tm=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu
+```
+
+`s=`/`r=` 是八位的 started / running 位串，`tm=` 是内核侧逐核 timer 计数。三条判据仍然照上一条写死：
+`reg=1` ⇒ 副核从没上来过，本板一直是单核，ADT 的八核与 `check-clover.py` 打印的「8 cores」都只是声明；
+`reg=8 start=8 run=1` ⇒ 核都在、只有一颗出 idle，问题回到唤醒路径，且这一次有正面起点；
+`reg=8 run=8` ⇒ 调度器手里有核可发，这一格问不出更多东西了，下一格是 workloop 的 `wl_request` 事件。
