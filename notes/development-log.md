@@ -20985,3 +20985,52 @@ ne=66 e0=100d8a000-100daa000`，两拍同值，基址与 boot 61 一样是 128 K
 （这是 r275 那条针给自己的正对照），`keystore_services>=1`，然后看 `r265/r268/r273` 那三行是否还在报
 `hit=<债主自己> count=-1`——**如果解锁通知真的发出去了，那条 `dispatch_semaphore_wait(..., FOREVER)` 就该消失**。
 若类已发布、等待照旧，那说明等的不是 keystore 而是 PreBoard 本身没跑起来，下一刀才回到 r274 计划里那份 PreBoard 普查。
+
+## r276 落地（v0.6.70）：把 keystore 发出来，并且先把能看见它的那根针修好
+
+**① 这一轮是 r275 读数的直接后果。** boot 62 给了三样：两个 metaclass 都不存在、走查跑完（`walked=127 stopped=0`）、
+平面里没有 keystore 服务——这正是上游驱动自己的门槛（`NativeKeyStoreEvents.cpp:131`：`native_aks_state_enabled()`
+不开就 `kIOReturnNotReady`；板侧探针 `KeyStoreProbe.cpp:93-96`：类存在就不发）。所以这轮才动手，而不是照抄 sheng。
+**② 进镜像的东西。** 三件，全部由 `scripts/build-clover-gop-legacy-display.py` 收进同一张 `.late.a`：
+- `drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp` —— 从 `~/UniXNU/drivers/NativeKeyStoreEvents/` **逐字节 vendor**，
+  一行不改（checker 拿两仓文件比对；上游那份自带的宿主测试 `test_closed_boundary.py` 也一并拿过来，在宿主上直接跑通：
+  「默认关死边界、状态模式下只答那几号选择器」）。
+- `package/CloverKeyStoreProbe.cpp` —— 本板的仪器，供驱动链接的六个符号（`native_aks_state_enabled`/
+  `native_aks_lock_state`/`native_aks_call`/`native_aks_opened`/`native_keyevents_open_refused`/
+  `native_keyevents_static_init`），门槛是 `offline-key-events=1`（sheng 的名字留着，它说的是「离线 keystore」这件事本身）
+  加 `clover-aks=1`（sheng 写作 `sheng-aks`，这一个是**板名**，所以换了拼法；换得起是因为读它的就是本板文件，
+  不像 `sheng-touch-hid` 那样被 vendor 的驱动自己读）。
+- 内核侧补丁 `z×50-clover-r276.patch`（只动 `iokit/Kernel/IOStartIOKit.cpp`）：普查把 `boot_progress_ext` 那格换成
+  直接印 `clover r276: aks stage= status= service= refused= opens= calls= sel7/14/17/35 sls=`，因为本板
+  `CONFIG_XNU_BOOT_PROGRESS=n`，而且探针跑在 `bsd_autoconf`——比环能回看的时间窗早了二十多分钟（r272 那一课的正面应用）。
+**③ 同轮把自己那根针修了。** r275 匹配的是大写 `"KeyStore"`、`clover_name_has` 逐字节比较，而驱动发布时
+`setName("Native keystore state service")` 是小写；不修的话这轮**成功也会读成零**。现在名字大小写不敏感，
+**并且**连类名一起匹配，两个计数分开印（`ks_names=` 是平面怎么称呼、`ks_classes=` 是谁家的类），行里带 `hit=n|c`。
+`class=` 那一行从 0 变 1 就是这轮的自我对照——同一根针先量了前提，现在负责证明它自己没瞎。
+**④ 构建里被自家闸门拦下的一次真错。** 第一次建内核，归档自检直接报
+`_clover_keystore_probe (needed by CloverLegacyDisplayProbe) is defined by no archive member`——我把探针函数写在
+`extern "C" { … }` 块**外面**，被 C++ mangle 了。这条检查存在的意义就是把这个错从十五分钟后的链接器嘴里提前到归档步骤里说；
+修法是给函数本身加 `extern "C"`，并在文件里写清「这不是装饰」。
+**⑤ 一条不打算假装赢的事。** r252 账本里 `missing=IOService:/IOResources/AppleKeyStore` 那一行，这轮之后**可能照旧**：
+那是按**路径**查的，而我们这颗服务注册在 IOResources 下、名字叫 `Native keystore state service`，路径不等于它。
+只有按**类**匹配的调用方（libaks / MobileKeyBag，也就是 datamigrator 走的那条）能找到。这句话写在 board.toml 与本节里，
+是为了下一轮别把这条还存在的缺席读成移植失败。
+**⑥ 判据（刷之前写死）。** 下一靴三格：`aks class=1 userclient_class=1` 且 `ks_classes>=1` ⇒ 发出来了；
+`stage=3 service!=0` 但 `class=0` ⇒ 注册成了别的类；`stage=0` ⇒ 探针根本没被叫到（那就是 `clover_keystore_probe()`
+的调用点问题，而不是 keystore 的问题）。真正要看的结果在别处：债主那一行 `clover r268: sem ... count=-1` 与
+`hit=<它自己>` 是否还在，以及 `r273` 那五条 workloop 等待者的 `tr/tt`。
+**如果类已发布、解锁等待照旧**——那 datamigrator 等的就不是这条通知，r274 计划里那份 **PreBoard 普查**（同形状：
+threads/wait/run + 每条线程 hint 与栈）才是下一刀；**这一支不预设结论，也不在这轮里加第二个 keystore 旋钮**。
+**⑦ 产物。** 内核 `3eefea52`，AMFI+归一化 `fd61e03a`；payload `round276-v0.6.70-payload.img`（`58,720,256` 字节）sha256
+`6f3f308359cd5f8c093e40320382db8fc267fb5222e0f23f4dd48540acd8762a`；`check-clover.py` 与 `verify-clover-payload.py` 双 EXIT=0（新增 `bb-aks-publish` / `bb-aks-service` 两枚针，
+`bb-aks-svc` / `bb-aks-walked` 换到 r276 的字面量——旧行**应当**从镜像里消失）。
+**⑧ 构建链的第二次静默失败：LATE 表的表头写成裸文件名。** 这轮三次内核构建都死在
+`bsd/kern/bsd_init.c:987 patch does not apply`——而 r276 只动 `IOStartIOKit.cpp`。真正的原因在
+`build-xnu-4k-baseline.sh` 的 LATE 反打表：我把表头写成 `"z×50-clover-r276.patch"`，漏了
+`"$ROOT/patches/xnu/` 前缀；那个循环是 `if apply --reverse --check …; then reverse`，**路径找不到就静默跳过**，
+于是最新的补丁从不反打、它的邻居照常反打，重放到一半就撞在一个毫无关系的文件上。前三次我都在修工作树，
+其实该修的是这张表。修法与验证：把树归零→按 glob 正打 115 条→按脚本原样反打 49 条→重放 115 条，三步全绿
+（`/tmp/r276-replay.py`，它从脚本里读表而不是抄表）；`check-clover.py` 新增一条守卫——解析这个循环，要求每条
+表项都以 `"$ROOT/patches/xnu/` 开头、文件在盘上、且表长不少于 40 条。**正对照做过**：把那行改回裸文件名，
+checker 立刻 EXIT=1 并指名它；改回后 EXIT=0。这一条与 r275 那轮的「重复 `for LATE_PATCH in`」是同一个文件的
+同一处，两次都是**静默**：一个把循环变成表项，一个把表项变成不存在的路径。

@@ -1,0 +1,169 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -267,6 +267,43 @@
+ 		const char *a = head;
+ 		const char *b = part;
+ 		while (*b != '\0' && *a == *b) {
++			a++;
++			b++;
++		}
++		if (*b == '\0') {
++			return true;
++		}
++	}
++	return false;
++}
++
++/*
++ * Round276. Boot 62 caught the matcher above looking for the wrong thing: the service this port is
++ * about to publish calls itself "Native keystore state service" (drivers/NativeKeyStoreEvents/
++ * NativeKeyStoreEvents.cpp:145), which is lowercase, so a case-sensitive "KeyStore" test would have
++ * kept answering keystore_services=0 even after a successful publish -- an instrument that cannot see
++ * the thing it asks about, this time pointing the wrong way. The case fold is written out because
++ * this translation unit pulls in no <ctype.h>.
++ */
++static char
++clover_lower(char c)
++{
++	if (c >= 'A' && c <= 'Z') {
++		return (char) (c + ('a' - 'A'));
++	}
++	return c;
++}
++
++static bool
++clover_name_has_ci(const char *name, const char *part)
++{
++	if (name == NULL || part == NULL) {
++		return false;
++	}
++	for (const char *head = name; *head != '\0'; head++) {
++		const char *a = head;
++		const char *b = part;
++		while (*b != '\0' && clover_lower(*a) == clover_lower(*b)) {
+ 			a++;
+ 			b++;
+ 		}
+@@ -280,6 +317,20 @@
+ /* Round250, defined in IOUserClient.cpp: the user client's own side of the button question. */
+ extern "C" void clover_mg_dump(void);
+ 
++/*
++ * Round276, defined in package/CloverKeyStoreProbe.cpp and force-loaded with the display archive: the
++ * owned AppleKeyStore's own account of what it did at bsd_autoconf(). It is read here rather than
++ * printed there because that is hours before the ring the panic drain can reach -- boot 59's lesson,
++ * applied before shipping rather than after -- and because CONFIG_XNU_BOOT_PROGRESS=n on this board
++ * leaves no boot-progress row for sheng's version of this to live in.
++ */
++extern "C" volatile uint32_t native_keyevents_stage, native_keyevents_refused_opens;
++extern "C" volatile int native_keyevents_status;
++extern "C" volatile uint64_t native_keyevents_service;
++extern "C" volatile uint32_t native_aks_opens, native_aks_calls;
++extern "C" volatile uint32_t native_aks_selector_hits[];
++extern "C" uint32_t native_aks_lock_state(void);
++
+ extern "C" void
+ clover_iodt_census(unsigned long long secs)
+ {
+@@ -490,13 +541,29 @@
+ 		OSSafeReleaseNULL(ksname);
+ 		OSSafeReleaseNULL(ksclient);
+ 		printf("clover r275: aks class=%d userclient_class=%d\n", have_class, have_client_class);
++		/*
++		 * Round276. The publish's own state, printed beside the lookup that authorises it, because
++		 * the two readings only mean something together: stage=3 with a non-zero service and
++		 * class=1 is "this board now has an AppleKeyStore and the census can see it", stage=3 with
++		 * class=0 would mean the service exists but was not registered as that class, and stage=0
++		 * means the instrument never ran -- which r272 learned is the one reading a missing line
++		 * cannot tell you apart from. sel7/14/17/35 are the four selectors that answer something;
++		 * opens= counts the handshakes libaks was willing to make at all.
++		 */
++		printf("clover r276: aks stage=%d status=%x service=%llx refused=%u opens=%u calls=%u "
++		    "sel7=%u sel14=%u sel17=%u sel35=%u sls=%u\n", (int) native_keyevents_stage,
++		    (unsigned) native_keyevents_status, (unsigned long long) native_keyevents_service,
++		    (unsigned) native_keyevents_refused_opens, (unsigned) native_aks_opens,
++		    (unsigned) native_aks_calls, (unsigned) native_aks_selector_hits[7],
++		    (unsigned) native_aks_selector_hits[14], (unsigned) native_aks_selector_hits[17],
++		    (unsigned) native_aks_selector_hits[35], (unsigned) native_aks_lock_state());
+ 
+ 		si = IORegistryIterator::iterateOver(gIOServicePlane,
+ 		    kIORegistryIterateRecursively);
+ 		if (si == NULL) {
+ 			printf("clover r243: svc no-iterator\n");
+ 		} else {
+-			int keystore_seen = 0;
++			int ks_names = 0, ks_classes = 0, ks_rows = 0;
+ 
+ 			while (total < kCloverSvcCap &&
+ 			    (svc = si->getNextObjectRecursive()) != NULL) {
+@@ -504,23 +571,34 @@
+ 
+ 				total++;
+ 				/*
+-				 * Round275, in the same walk on purpose: a second whole-plane walk would
+-				 * take the registry lock twice to answer one question. The class name is
+-				 * printed with the entry name because the two differ, and a service that
+-				 * merely *looks* like a keystore by name is not the same reading as one
+-				 * instantiated from the AppleKeyStore class.
++				 * Round276 replaces this round's own first draft of the match, in the same walk for
++				 * the same reason: a second whole-plane walk would take the registry lock twice to
++				 * answer one question. Boot 62 read keystore_services=0 with a case-sensitive
++				 * "KeyStore" test, and the service this port is about to publish calls itself
++				 * "Native keystore state service" -- so the needle had to be widened before a
++				 * publish could be seen at all, or the round that fixes the deadlock would report
++				 * it as still absent. Two counts are kept apart on purpose: ks_names= is what the
++				 * plane calls a keystore, ks_classes= is what is built from one, and a row carries
++				 * both bits. A name alone is a claim; the class is the evidence.
+ 				 */
+-				if (nm != NULL && clover_name_has(nm, "KeyStore")) {
+-					const IOService   *sv = OSDynamicCast(IOService, svc);
+-					const OSMetaClass *mc = sv != NULL ? sv->getMetaClass() : NULL;
+-					const OSSymbol    *cls = mc != NULL ? mc->getClassNameSymbol() : NULL;
++				const IOService   *sv = OSDynamicCast(IOService, svc);
++				const OSMetaClass *mc = sv != NULL ? sv->getMetaClass() : NULL;
++				const OSSymbol    *cls = mc != NULL ? mc->getClassNameSymbol() : NULL;
++				const char        *cn = cls != NULL ? cls->getCStringNoCopy() : NULL;
++				bool               by_name = nm != NULL && clover_name_has_ci(nm, "keystore");
++				bool               by_class = cn != NULL && clover_name_has_ci(cn, "keystore");
+ 
+-					if (keystore_seen < 8) {
+-						printf("clover r275: svc %.24s class=%.24s\n", nm,
+-						    cls != NULL ? cls->getCStringNoCopy() : "?");
+-					}
+-					keystore_seen++;
++				if (by_name) {
++					ks_names++;
+ 				}
++				if (by_class) {
++					ks_classes++;
++				}
++				if ((by_name || by_class) && ks_rows < 8) {
++					printf("clover r276: ks svc %.24s class=%.24s hit=%s%s\n", nm,
++					    cn != NULL ? cn : "?", by_name ? "n" : "-", by_class ? "c" : "-");
++					ks_rows++;
++				}
+ 				if (nm != NULL && (clover_name_has(nm, "utton") ||
+ 				    clover_name_has(nm, "HID") || clover_name_has(nm, "aptic") ||
+ 				    clover_name_has(nm, "SSB") || clover_name_has(nm, "Resolver"))) {
+@@ -537,12 +615,16 @@
+ 			printf("clover r243: svc total=%d stopped=%d button-family=%d\n",
+ 			    total, stopped, matched);
+ 			/*
+-			 * The keystore line repeats walked=/stopped= on purpose. "No service named
+-			 * KeyStore" only means "none" if the walk finished, and this board has
+-			 * already been fooled once by a count that stopped early (boot 34's svc total=1).
++			 * The keystore line repeats walked=/stopped= on purpose. "No keystore service" only
++			 * means "none" if the walk finished, and this board has already been fooled once by a
++			 * count that stopped early (boot 34's svc total=1). Round276 splits the one count into
++			 * two because boot 62 showed the two can disagree: ks_names= is what the plane calls a
++			 * keystore and ks_classes= is what is built from one, and after this port publishes its
++			 * service the expected reading is ks_names=1 ks_classes=1 with the class row's own
++			 * aks class= flipping 0 -> 1, which is the instrument checking itself.
+ 			 */
+-			printf("clover r275: aks walked=%d stopped=%d keystore_services=%d\n",
+-			    total, stopped, keystore_seen);
++			printf("clover r276: ks walked=%d stopped=%d ks_names=%d ks_classes=%d rows=%d\n",
++			    total, stopped, ks_names, ks_classes, ks_rows);
+ 		}
+ 	}
+ 	/*

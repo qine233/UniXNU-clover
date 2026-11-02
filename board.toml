@@ -190,7 +190,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r275: the wait has a name, so this round measures the thing it waits on instead of the thread that waits. boot 61 unslided datamigrator's four frames into -waitUntilPreboardDidFinishUnlock, reached from -_unlockKeyBagUseOfForceIsAuthorized, with the bound servicer parked in dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER) -- a device-unlock wait -- and this board's own r252 ledger already has audiomxd asking eighteen times for IOService:/IOResources/AppleKeyStore and missing it. The fix on the table is sheng's owned keystore, but its guard is \"publish only if the AppleKeyStore metaclass is absent\", and that precondition has never been read here: this board links the stock kernelcache, whose image carries the class strings. So nothing is published this round and three things are measured, inside the service walk the census already runs rather than a second one: aks class= and userclient_class= from the metaclass table, one row per service whose name says KeyStore with its own class beside it, and a tally that repeats walked=/stopped= so that a zero can only be read as zero by a walk that finished. class=0 is the green light for sheng's shape; class=1 means a second service of an existing class, which is a different problem and gets different code."
+title = "clover r276: publish the keystore this board was measured to be missing. Boot 61 read the debtor's frames as names -- -_unlockKeyBagUseOfForceIsAuthorized calls -waitUntilPreboardDidFinishUnlock, which parks a thread in dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER) -- and boot 62 then measured why no unlock can arrive: `clover r275: aks class=0 userclient_class=0` with `walked=127 stopped=0 keystore_services=0`, both metaclasses absent and the walk finished, so the upstream driver's own guard (\"publish only if the class is absent\") holds here as a reading rather than as an imported assumption. This round links that driver -- vendored byte for byte from ~/UniXNU/drivers/NativeKeyStoreEvents, compiled clean against this board's driver flags -- behind offline-key-events=1 and clover-aks=1, and answers the four selectors that answer something: no keybag, no passcode, unlocked since boot. It ships the reading that can falsify it too: the census now folds case when it matches a name (boot 62 caught the old needle looking for \"KeyStore\" while the service is named \"Native keystore state service\", so a successful publish would have kept reading zero), matches the class beside the name, and prints the probe's own stage/status/service/opens/calls from inside the census -- because the probe runs at bsd_autoconf, hours before the ring the panic drain reaches. The win condition is written down before the flash: class=1 and ks_classes>=1 with the semaphore row gone from the debtor's census. class=1 with the wait unchanged means the unlock event is not what datamigrator is blocked on, and the next cut is the PreBoard census, not another keystore knob."
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2279,6 +2279,42 @@ kernel_args = [
   # shape this board presents. Coordinates are synthetic, honestly -- this board's I2C panel has never
   # ACKed (round183), which is why the argument below goes back in the same round.
   "sheng-touch-hid=1",
+  # Round276 arms the owned AppleKeyStore. Why this argument and not another: boot 61 read the debtor's own
+  # frames as function names -- -_unlockKeyBagUseOfForceIsAuthorized calls -waitUntilPreboardDidFinishUnlock,
+  # which parks a thread in dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER) -- so the XPC reply the
+  # desktop is waiting on is gated on a device-unlock event, and boot 62 then measured that this board has
+  # no keystore to emit one: `clover r275: aks class=0 userclient_class=0` with `walked=127 stopped=0
+  # keystore_services=0`, both classes absent and the walk finished. That is the upstream driver's own
+  # precondition, read here rather than imported from the reference board.
+  # What this round does NOT claim: the r252 absence list may still print `missing=IOService:/IOResources/
+  # AppleKeyStore` afterwards, because that row is a path lookup and the service registers under the name the
+  # driver gives it, "Native keystore state service" -- under IOResources, but not at that path. Only the
+  # class-matched callers (libaks and MobileKeyBag, which is what datamigrator uses) find it, so the reading
+  # this round is judged on is the census (class 0 -> 1, ks_classes>=1) and whether the debtor's semaphore
+  # row disappears, not that ledger line. Saying it here keeps a still-missing row from being read as a failure
+  # of the port next round.
+  #   offline-key-events=1  arms package/CloverKeyStoreProbe.cpp; sheng's name, kept verbatim because it
+  #     describes an offline keystore, not a board (the same rule as the HID pair above);
+  #   clover-aks=1          selects state mode -- the user client that answers "no keybag, no passcode,
+  #     nothing locked". This one is spelled for this board on purpose, and the difference from
+  #     sheng-touch-hid above is why: that name is read by the vendored driver, so renaming it would mean
+  #     editing bytes we ship identical to upstream. sheng-aks is read by the BOARD's probe
+  #     (native_aks_state_enabled), which is this file's own twin, so the board can name its own argument
+  #     without touching the driver. clover-aks-sls=<n> would override the reported lock state the way
+  #     sheng's does; it is deliberately NOT passed, because 0 (unlocked since boot) is what this round is
+  #     betting on, and a knob nobody has read is not a reading.
+  # What comes back on the card's ring, class "clover r276: " and printed by the census (not by the probe,
+  # which runs at bsd_autoconf -- hours before the window the panic drain can reach, which is exactly how
+  # r272's cpu_start() line was lost):
+  #   `aks stage= status= service= refused= opens= calls= sel7= sel14= sel17= sel35= sls=` -- stage 1 armed
+  #     and refused, 2 classes registered, 3 service started; the four selectors are the ones that answer
+  #     something (lock state, system keybag handle, device state, extended device state), so opens>0 with
+  #     every sel zero would mean someone connected and asked nothing;
+  #   `ks svc <name> class=<class> hit=n|c` per keystore service, and `ks walked= stopped= ks_names=
+  #     ks_classes= rows=` -- a name is a claim, the class is the evidence, and `stopped=0` is what makes a
+  #     zero mean zero.
+  "offline-key-events=1",
+  "clover-aks=1",
   # Round184 parks 排期 4, 5 and 6. The three instrument arguments below are deliberately NOT passed
   # any more: the goal moved to getting iPadOS onto its own screen, and each of these three spends
   # boot time and bus risk on a question that is not that one. The drivers stay linked, their modes

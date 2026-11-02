@@ -290,9 +290,34 @@ require(hid_probe_obj.exists(), 'the HID instrument compiled')
 print(run(['python3', ROOT / 'scripts/build-clover-hid-input.py', '--kernel', KERNEL], text=True), end='')
 hid = ROOT / 'build/native-hid-input'
 
+# Round276: the third instrument, and the first one that is not an instrument of the panel or the bus.
+# Boot 61 named datamigrator's wait as -waitUntilPreboardDidFinishUnlock and boot 62 measured that this
+# board has no AppleKeyStore at all (clover r275: aks class=0 userclient_class=0, walked=127 stopped=0),
+# which is the precondition the upstream driver's own guard asks for. The driver is vendored byte for
+# byte (diff-identical to ~/UniXNU/drivers/NativeKeyStoreEvents) and is not audited slot by slot the way
+# IOHIDDevice had to be: it subclasses IOService and IOUserClient only, and those two tables are the
+# kernel's own. What it needs from this board is the six C names it links against, and those live in
+# package/CloverKeyStoreProbe.cpp -- the same split sheng uses, with the board-neutral boot arg
+# (offline-key-events) kept and the board-named one (sheng-aks) spelled clover-aks.
+ks_probe_source = ROOT / 'kits/clover/CloverKeyStoreProbe.cpp'; ks_probe_obj = OUT / 'CloverKeyStoreProbe.o'
+run([str(ks_probe_source) if str(value) == str(probe_source) else
+     str(ks_probe_obj) if str(value) == str(probe_obj) else value for value in cmd], cwd=r['directory'])
+require(ks_probe_obj.exists(), 'the keystore instrument compiled')
+print(run(['python3', ROOT / 'scripts/build-arm-driver.py', 'NativeKeyStoreEvents'], text=True), end='')
+keystore = ROOT / 'build/native-keystore-events'
+keystore_late = keystore / 'NativeKeyStoreEvents.late.o'
+run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func',
+     '--globalize-symbol=__GLOBAL__sub_I_NativeKeyStoreEvents.cpp',
+     keystore / 'NativeKeyStoreEvents.o', keystore_late])
+require(code((keystore / 'NativeKeyStoreEvents.o').read_bytes(),
+             macho((keystore / 'NativeKeyStoreEvents.o').read_bytes())) ==
+        code(keystore_late.read_bytes(), macho(keystore_late.read_bytes())),
+        'Owned keystore instructions unchanged by late init staging')
+
 archive = OUT / 'libNativeLegacyDisplay.late.a'; archive.unlink(missing_ok=True)
 run(['xcrun', 'ar', 'rcs', archive, late, OUT / 'original-bindings.o', probe_obj, hid_probe_obj,
-     hid / 'NativeHidInput.late.o', hid / 'hid-original-bindings.o'])
+     hid / 'NativeHidInput.late.o', hid / 'hid-original-bindings.o',
+     ks_probe_obj, keystore_late])
 
 print(run(['python3', ROOT / 'scripts/build-arm-driver.py', 'NativeGOPPresenter'], text=True), end='')
 presenter = ROOT / 'build/native-gop-presenter'
@@ -328,16 +353,21 @@ def globals_of(path):
 members = {'NativeLegacyDisplay.late': late, 'CloverLegacyDisplayProbe': probe_obj,
            'CloverHidInputProbe': hid_probe_obj, 'NativeHidInput.late': hid / 'NativeHidInput.late.o',
            'hid-original-bindings': hid / 'hid-original-bindings.o',
-           'NativeGOPPresenter.late': presenter_late, 'original-bindings': OUT / 'original-bindings.o'}
+           'NativeGOPPresenter.late': presenter_late, 'original-bindings': OUT / 'original-bindings.o',
+           'CloverKeyStoreProbe': ks_probe_obj, 'NativeKeyStoreEvents.late': keystore_late}
 owners = {}
 for owner, path in members.items():
     for name in globals_of(path)[0]:
         require(name not in owners or name.startswith(('ltmp', 'l_')),
                 'duplicate definition of ' + name + ' in ' + owner + ' and ' + owners.get(name, ''))
         owners[name] = owner
-# The names this archive owns end to end: the display driver, the presenter, and from round255 the HID
-# driver plus the touch counters its report builder reads.
-board = ('_native_legacy', '_native_gop', '_native_hid', '_native_touch', '_native_buttons', '_clover_hid')
+# The names this archive owns end to end: the display driver, the presenter, from round255 the HID
+# driver plus the touch counters its report builder reads, and from round276 the keystore pair -- the
+# driver's five hooks and the instrument's own entry point. The last two prefixes are the whole reason
+# the split is safe: the driver cannot link without the board supplying the state gate and the counters,
+# and the board cannot publish without the driver handing it the allocation and the initializer.
+board = ('_native_legacy', '_native_gop', '_native_hid', '_native_touch', '_native_buttons', '_clover_hid',
+         '_native_keyevents', '_native_aks', '_clover_keystore')
 contract = {name for name in owners if name.startswith(board)}
 for owner, path in members.items():
     for name in globals_of(path)[1]:
@@ -355,6 +385,16 @@ require('_native_hid_live_checkpoint' in contract and '_native_hid_input_request
         'the HID instrument answers the driver that reports through it')
 require('_native_touch_seq' in contract and '_native_touch_xs' in contract,
         'the touch counters the HID digitizer report reads are defined here, empty, not left unresolved')
+# The keystore instrument reaches its driver's static initializer through an asm label, so the board
+# prefix rules above cannot see that reference at all: the name it imports is the initializer's own, and
+# objcopy only made it global a few lines earlier. If that ever stops being true the kernel link fails
+# deep inside the archive step, which is exactly where r255's weak sink names were found.
+require('__GLOBAL__sub_I_NativeKeyStoreEvents.cpp' in owners,
+        'the keystore instrument imports __GLOBAL__sub_I_NativeKeyStoreEvents.cpp and no member defines it: '
+        'the driver would be linked without its metaclass registration reachable')
+require('_native_keyevents_allocate' in owners and '_native_aks_state_enabled' in owners,
+        'the keystore driver and its board instrument must both be in this archive: one allocates the '
+        'service, the other answers the gate and the counters it reports through')
 # The driver's OSMetaClass registration is its C++ static initializer, which the archive carries
 # globalized and nothing else in the kernel calls; the probe calls it by that name between preModLoad
 # and postModLoad. If objcopy ever stops globalizing it, the link has to say so here.

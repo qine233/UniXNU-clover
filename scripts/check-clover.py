@@ -2698,6 +2698,160 @@ def check_board(errors: list) -> str:
                 errors.append(f"UniXNU/patches/xnu/{r275_name} is not the same bytes as this repo's copy: "
                               "the two trees would compile different kernels")
 
+        # Round276 is the round the r275 reading authorised: the owned AppleKeyStore goes in, and the census
+        # that authorised it is fixed in the same pass so the publish can be seen. Two things are asserted
+        # because both have been got wrong on this board: that the vendored driver is the upstream file with no
+        # edit (byte identity, checked against ~/UniXNU/drivers), and that the board's own instrument can read
+        # what the board publishes -- boot 62's keystore_services=0 came from a case-sensitive match against a
+        # name that is lowercase, so a needle that cannot see the thing it asks about is what would otherwise
+        # have reported this round's success as its failure.
+        r276_name = "z" * 50 + "-clover-r276.patch"
+        r276_patch = next((base / "patches/xnu-clover" / r276_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r276_name).is_file()), None)
+        if r276_patch is None:
+            errors.append(f"patches/xnu-clover/{r276_name} is missing: without the widened match and the probe "
+                          "readout the keystore would be published blind")
+        else:
+            r276_text = r276_patch.read_text()
+            r276_added = "".join(line for line in r276_text.splitlines(True) if line.startswith("+"))
+            if r276_text.count("--- a/") != 1 or "--- a/iokit/Kernel/IOStartIOKit.cpp" not in r276_text:
+                errors.append(f"{r276_name} does not touch exactly iokit/Kernel/IOStartIOKit.cpp: this is the "
+                              "census' own file and a second file would mean a second walk or a second lock")
+            for needle in ('clover_name_has_ci(const char *name, const char *part)',
+                           'clover_lower(char c)',
+                           'clover_name_has_ci(nm, "keystore")',
+                           'clover_name_has_ci(cn, "keystore")',
+                           'mc->getClassNameSymbol()',
+                           '"clover r276: ks svc %.24s class=%.24s hit=%s%s\\n"',
+                           '"clover r276: ks walked=%d stopped=%d ks_names=%d ks_classes=%d rows=%d\\n"',
+                           '"clover r276: aks stage=%d status=%x service=%llx refused=%u opens=%u calls=%u "',
+                           '"sel7=%u sel14=%u sel17=%u sel35=%u sls=%u\\n"',
+                           'extern "C" volatile uint32_t native_keyevents_stage'):
+                if needle not in r276_added:
+                    errors.append(f"{r276_name} lacks {needle[:64]!r}: the name match, the class match and the "
+                                  "probe readout are three separate readings and a round that ships two of the "
+                                  "three is how boot 62 read a zero that meant nothing")
+            if "iterateOver" in r276_added:
+                errors.append(f"{r276_name} opens a second registry iterator: the census walk is the one pass "
+                              "this board can afford to take the registry lock in")
+            if 'clover r275: svc %.24s class=%.24s' in r276_added.replace('\n', '') and \
+                    '"clover r275: svc' in r276_added:
+                errors.append(f"{r276_name} re-adds the r275 service row beside its own: two rows asking one "
+                              "question in one burst is how a truncated one gets read as the other")
+            if '{ "clover r276: ", "r276-ks", 64, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci has no class for the keystore publish rows: an unbudgeted "
+                              "producer drops the reading silently, and dropping the row that says whether the "
+                              "service registered is the one thing this round has to answer")
+            if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r276")' not in sdhci_source:
+                errors.append("the r276 rows are not exempt from the per-pass push cap: they print inside the "
+                              "r243 census burst, so without the exemption a capped round is indistinguishable "
+                              "from one that found nothing")
+            late_script = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in late_script.splitlines() if "clover-r2" in line)
+            if (late_list.find(r276_name) < 0 or
+                    late_list.find(r276_name) > late_list.find("z" * 49 + "-clover-r275.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r276 before r275 in LATE_PATCH: the "
+                              "compile pass would run on a tree this patch was not written against")
+            loop = late_script.split("for LATE_PATCH in ", 1)
+            if len(loop) != 2:
+                errors.append("build-xnu-4k-baseline.sh has no parsable LATE_PATCH loop: the reversal list is "
+                              "the only thing that makes the compile pass run on a tree this patch series was "
+                              "written against, and an unparsable one is an unverified build")
+            else:
+                # The bug this guard exists for: the list's head was written as a bare filename, so the loop's
+                # `if apply --reverse --check` guard was false for a path that does not exist and the newest
+                # patch was never reversed. The build then died in bsd_init.c, a file that patch does not touch,
+                # and three rebuilds in a row blamed the tree instead of the list. An entry is only a LATE entry
+                # if the loop can actually find it.
+                entries = re.findall(r'"([^"]+\.patch)"', loop[1].split("; do", 1)[0])
+                bare = [entry for entry in entries if not entry.startswith("$ROOT/patches/xnu/")]
+                if bare:
+                    errors.append("LATE_PATCH has entries with no $ROOT/patches/xnu/ prefix (" +
+                                  ", ".join(bare) + "): the reversal loop skips a path it cannot find, so the "
+                                  "patch is left applied while its neighbours are reversed and the replay fails "
+                                  "somewhere that has nothing to do with it")
+                absent = [entry for entry in entries
+                          if not (REPO.parent / "UniXNU" / entry.replace("$ROOT/", "")).is_file()]
+                if absent:
+                    errors.append("LATE_PATCH names patches that are not on disk (" + ", ".join(absent) +
+                                  "): the same silent skip, from the other side")
+                if len(entries) < 40:
+                    errors.append(f"LATE_PATCH was parsed as only {len(entries)} entries: the loop spans more "
+                                  "than one line and a short read means this checker is not looking at the list "
+                                  "the build uses")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r276_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r276_name} is missing: unixnu loads patches from that "
+                              "directory and silently skips a board patch that lives only in this repo")
+            elif load_copy.read_bytes() != r276_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r276_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+
+        # The keystore itself: a vendored driver, a board instrument that supplies what it links against, and
+        # the two boot arguments that arm it. Every one of these is checked by name because the failure mode is
+        # silent -- a driver nobody links is a kernel that boots, and an instrument whose gate never opens is a
+        # service that never registers, and neither says so unless something is pinned.
+        keystore_source = REPO / "drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp"
+        keystore_upstream = REPO.parent / "UniXNU" / "drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp"
+        if not keystore_source.is_file():
+            errors.append("drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp is missing: the AppleKeyStore "
+                          "this board was measured to lack is what round276 is here to publish")
+        else:
+            keystore_text = keystore_source.read_text()
+            if not keystore_upstream.is_file():
+                errors.append("the upstream copy of the keystore driver is gone, so this repo's vendored copy can "
+                              "no longer be proven unedited")
+            elif keystore_source.read_bytes() != keystore_upstream.read_bytes():
+                errors.append("the vendored keystore driver is not byte-identical to ~/UniXNU/drivers: the whole "
+                              "claim of this port is that the upstream service is shipped unchanged, with the "
+                              "board supplying only its six hooks")
+            for needle in ('class AppleKeyStore final : public IOService',
+                           'OSDefineMetaClassAndStructors(AppleKeyStore, IOService)',
+                           'native_aks_state_enabled', 'native_aks_lock_state', 'native_aks_call',
+                           '"Native keystore state service"'):
+                if needle not in keystore_text:
+                    errors.append(f"the vendored keystore driver lost {needle[:48]!r}: that is the shape the "
+                                  "target's libaks matches and reads")
+        ks_probe = REPO / "package/CloverKeyStoreProbe.cpp"
+        if not ks_probe.is_file():
+            errors.append("package/CloverKeyStoreProbe.cpp is missing: the driver links against six board "
+                          "symbols and cannot stand alone")
+        else:
+            ks_text = ks_probe.read_text()
+            for needle in ('PE_parse_boot_argn("offline-key-events"', 'PE_parse_boot_argn("clover-aks"',
+                           'OSMetaClass::getMetaClassWithName(name)',
+                           '__asm__("__GLOBAL__sub_I_NativeKeyStoreEvents.cpp")',
+                           'OSMetaClass::preModLoad(g_kernel_kmod_info.name)',
+                           'OSMetaClass::postModLoad(handle)', 'native_keyevents_allocate',
+                           'void clover_keystore_probe(void)'):
+                if needle not in ks_text:
+                    errors.append(f"the keystore instrument lost {needle[:56]!r}: registering a metaclass after "
+                                  "boot in a statically linked kernel needs all of these steps, and the absent-"
+                                  "class guard is the one r275 measured")
+            # A comment may name the channel to explain why it is not used; a write to it is the thing
+            # that would silently go nowhere, so the assertion is on the array subscript, not the word.
+            if "boot_progress_ext[" in ks_text:
+                errors.append("the keystore instrument writes boot_progress_ext: CONFIG_XNU_BOOT_PROGRESS=n on "
+                              "this board, so those rows would neither be produced nor read and the counters "
+                              "have to reach the card through the census instead")
+        display_source = (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text()
+        if "clover_keystore_probe();" not in display_source:
+            errors.append("nothing calls clover_keystore_probe(): a linked instrument that no entry point runs is "
+                          "indistinguishable at boot from one that was never built")
+        elif display_source.index("clover_keystore_probe();") > display_source.index("IOService *display=pendingLegacyDisplay;if(!display)return;"):
+            errors.append("the keystore call sits after the display probe's early return: the framebuffer branch "
+                          "can bail without ever reaching it, which is exactly why the HID call was moved first "
+                          "in round255")
+        board_args = " ".join(str(value) for value in board["payload"]["kernel_args"])
+        for arg in ("offline-key-events=1", "clover-aks=1"):
+            if arg not in board_args:
+                errors.append(f"board.toml does not pass {arg}: the keystore gate stays shut and the round "
+                              "reports a service that was never asked to exist")
+        if "clover-aks-sls" in board_args:
+            errors.append("board.toml passes clover-aks-sls: the reported lock state has to be the driver's "
+                          "default (unlocked since boot) or the reading says nothing about the wait it targets")
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -4002,8 +4156,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r275:"):
-        errors.append('[payload] title is not "clover r275: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r276:"):
+        errors.append('[payload] title is not "clover r276: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5116,8 +5270,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r275:"):
-        errors.append('[payload] title is not "clover r275: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r276:"):
+        errors.append('[payload] title is not "clover r276: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

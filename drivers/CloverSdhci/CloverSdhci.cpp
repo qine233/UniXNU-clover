@@ -869,13 +869,20 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // four address-space ranges. Four fires inside a deadline is the whole budget's worth of rows, so 32 is
   // generous by design -- the row is the only way to read the frames that are not in the shared cache.
   { "clover r274: ", "r274-map", 32, 0, 0, 0 },
-  // Round275 asks a registry question, so it is a per-fire producer of a different shape: one line for the
-  // two metaclass lookups, up to eight lines for the services whose name carries "KeyStore", and one summary
-  // row that carries the walk's own reached/stopped count. Ten rows a fire, four fires inside the deadline is
-  // 40, and the 64 budget is the census headroom the last two rounds used -- deliberately wide because a row
-  // that says nothing (class=0 and walked>0 with keystore_services=0) is the reading we are buying, and it
-  // must survive the ring rotation to be read at all.
+  // Round275 measures the precondition of the only proposed fix, so it is a per-boot producer of a different
+  // shape: one line for the two metaclass lookups, up to eight lines for the services whose name carries
+  // "KeyStore", and one summary row carrying the walk's own reached/stopped count. The census is latched by
+  // `static volatile int ran` and fires once past 1500 s, so the whole round is at most ten rows per boot --
+  // 64 is the same headroom the r243 census got, not a per-beat budget, and deliberately wide because a row
+  // that says nothing (class=0 and walked>0 with keystore_services=0) is the reading being bought here, and
+  // it has to survive the ring rotation to be read at all.
   { "clover r275: ", "r275-aks", 64, 0, 0, 0 },
+  // Round276 publishes the service and reports what publishing it did, again from inside the one census fire:
+  // one stage/status row, up to eight per-service rows, one tally. Same 64 for the same reason -- the rows are
+  // bounded by the census, not by the beat -- and the class is separate from r275-aks on purpose: a round that
+  // runs is distinguishable from a round that was capped, and if the keystore rows ever starve the census rows
+  // the two counters say which producer lost.
+  { "clover r276: ", "r276-ks", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -4156,11 +4163,14 @@ static void teeConsumeLine (uint32_t &pushed)
   // would be counted against a cap that pass has usually spent by then. Exempting them is not a favour to the
   // new round -- a truncated keystore row is the same false "none" that boot 36 nearly made of the plane, and
   // the class budget of 64 still bounds it.
+  // Round276 is exempt for exactly the same reason and gets checked the same way: it publishes the service the
+  // r275 rows ask about, so its own rows have to be readable or a capped round looks identical to an absent one.
   const bool reserved = probe != nullptr &&
       (teeHasPrefix (probe->name, teeStringLength (probe->name), "r234-set") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r243") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r252") ||
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r275"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r275") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r276"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

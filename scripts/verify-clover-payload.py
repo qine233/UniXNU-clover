@@ -1085,14 +1085,23 @@ def check_sb_sample(kernel: bytes) -> bool:
              # still leaves the prefix needles green.
              "bb-peer-map": (b"clover r274: map t=%llu pid=%d ne=%u shown=%u e0=%llx-%llx"
                              b" e1=%llx-%llx e2=%llx-%llx e3=%llx-%llx\n") in kernel,
-             # Round275 measures the precondition of the only proposed fix, so all three rows have to be in the
-             # image: the class lookup (what the metaclass table says), the per-service row (what the plane
-             # holds, with the class next to the name because a service named KeyStore is not the same reading
-             # as one built from AppleKeyStore), and the tally that carries walked=/stopped= so that a row
-             # count of zero means "the plane has none" rather than "the walk stopped at 2000".
+             # Round275 measured the precondition of the only proposed fix and Round276 acted on it, so three
+             # rows are pinned: the class lookup (what r275 read as 0/0 on boot 62, and what has to read 1 the
+             # moment this round works -- the needle checking itself), the publish's own state (stage 3 with a
+             # non-zero service is "started", and stage 0 is distinguishable from "capped" only because the row
+             # exists), and the service census. r275's own svc/walked literals are gone on purpose: they matched
+             # a case-sensitive "KeyStore" while the driver names its service "Native keystore state service",
+             # so a successful publish would have kept reporting zero -- the replaced shapes are the second and
+             # third rows here, under r276, with the name folded and the class asked beside it.
              "bb-aks-class": (b"clover r275: aks class=%d userclient_class=%d\n") in kernel,
-             "bb-aks-svc": (b"clover r275: svc %.24s class=%.24s\n") in kernel,
-             "bb-aks-walked": (b"clover r275: aks walked=%d stopped=%d keystore_services=%d\n") in kernel,
+             "bb-aks-publish": (b"clover r276: aks stage=%d status=%x service=%llx refused=%u opens=%u calls=%u "
+                                b"sel7=%u sel14=%u sel17=%u sel35=%u sls=%u\n") in kernel,
+             "bb-aks-svc": (b"clover r276: ks svc %.24s class=%.24s hit=%s%s\n") in kernel,
+             "bb-aks-walked": (b"clover r276: ks walked=%d stopped=%d ks_names=%d ks_classes=%d rows=%d\n") in kernel,
+             # The driver itself, not just the instrument that reports it: the name it gives the service is the
+             # string the census has to match, so if it is absent the kernel was linked without the vendored
+             # object and every r276 row above would still print happily.
+             "bb-aks-service": b"Native keystore state service" in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,

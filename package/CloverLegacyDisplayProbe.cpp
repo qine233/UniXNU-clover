@@ -50,6 +50,8 @@ extern "C" void native_gop_presenter_set_source(IOService *presenter,IOService *
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 // package/CloverHidInputProbe.cpp, in the same archive as this file and the driver it starts.
 extern "C" void clover_hid_input_probe(void);
+// package/CloverKeyStoreProbe.cpp, same archive, started from the same entry point (round276).
+extern "C" void clover_keystore_probe(void);
 static IOService *pendingLegacyDisplay,*activeLegacyDisplay,*activeGOPPresenter,*activeGOPNub,*gpuHandoffPresenter;
 // GPU hand-off counters the driver writes through these names.
 volatile uint32_t native_legacy_gpu_fallbacks,native_legacy_gpu_last_status;
@@ -603,6 +605,10 @@ void native_legacy_display_late_probe(void) {
     // framebuffer branch below can return without ever running. The two instruments share this entry point the
     // way the reference board's late fan-out does, and neither one's result is an argument for the other.
     clover_hid_input_probe();
+    // Round276, for exactly the same reason and in front of the same return: the keystore is the service
+    // datamigrator's -waitUntilPreboardDidFinishUnlock is waiting on, so it has to be published before the
+    // display hand-off can bail out, and whether the panel comes up says nothing about whether it was.
+    clover_keystore_probe();
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;
     native_legacy_surface_status=OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");
     OSDictionary *matching=IOService::nameMatching("IOCoreSurfaceRoot");
