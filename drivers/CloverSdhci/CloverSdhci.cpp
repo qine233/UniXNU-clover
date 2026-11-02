@@ -591,6 +591,14 @@ static const char *const kTeeAllowlist[] = {
   "vm_fault", "shared_region",   // the empty shared region this boot still dies in
   "mountroot", "rootvp",  // whether the root was accepted, and by which filesystem
   "panic",                // the panic string, if a panic got here first
+  // Round272 admits the kernel's own secondary-cpu print, osfmk/arm64/cpu.c:909
+  // kprintf("cpu_start() cpu: %d"). Boot 58 measured that only the boot cpu ever registered
+  // (clover r271: cpu real=1 reg=1), and the kernel image carries no AppleARMSMP at all, so the
+  // question left is whether XNU ever *attempted* a bring-up. That attempt already speaks; the only
+  // thing missing was a token to let its line through. It is also the line that would appear next
+  // to a panic("enableCPUCore is unimplemented") (IOPMGR.cpp:45) if an attempt reached the missing
+  // PMGR hook -- "panic" is on this list, so that half was never blind and did not appear.
+  "cpu_start()",
 };
 static const uint32_t kTeeAllowlistCount =
     sizeof (kTeeAllowlist) / sizeof (kTeeAllowlist[0]);
@@ -847,6 +855,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // bytes, longer once the per-cpu timer counters grow), and twenty fires inside the 1800 s deadline is
   // half of 64 -- the same headroom the last two rounds were given.
   { "clover r271: ", "r271-cpu", 64, 0, 0, 0 },
+  // Round272 spends a class on a line the kernel already prints, because the question boot 58 left
+  // open is exactly "did XNU try": cpu_start() speaks once per attempted cpu, seven attempts is the
+  // whole story of this board, and a class that never fills is itself the reading. 16 leaves room
+  // for a retry loop without letting this producer crowd out the census.
+  { "cpu_start()", "r272-cpustart", 16, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

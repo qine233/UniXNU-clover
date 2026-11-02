@@ -20673,3 +20673,35 @@ tee 本来就按前缀白名单从 msgbuf 挑行（r175/r176 那条通道）。�
 `gPMGR->enableCPUCore()` 这条 Apple PMGR 形状的路在 SDM660 上不干活」（有几行、核仍不醒）。
 后一支才真的需要往 PMGR/固件那边动刀。**注意这一轮的判据要预先写成两格而不是三格**：
 这一趟不碰内核，所以 `LATE_PATCH`、补丁复制、`bb-*` 镜像针都不动，只有 tee 与 checker 的类表。
+
+
+## r272 落地（v0.6.60）：一趟不碰 XNU 源码的轮次
+
+**① 先把「为什么可以不碰」查清。** `nm` 过 `mach.development.bcm2837.unstripped.noctf`：
+`AppleARMSMP` 相关符号**一个都没有**（`grep -c AppleARMSMP` = 0），而 `iokit/conf/files.arm64:7` 里那一行是
+`iokit/Kernel/arm/AppleARMSMP.cpp  optional iokitcpp` —— 这颗内核的构建没开 `iokitcpp`。
+`PE_cpu_start` 因此只剩 `iokit/Kernel/IOCPU.cpp:90` 那份（把 target 当 `IOCPU *` 再 `startCPU`），
+而 `processor_start()` 的调用点在整棵树里只有两处：`AppleARMSMP.cpp:232/515` 与 `IOCPU.cpp:311`。
+`AppleARMSMP.cpp:499` 的原话顺手把我上一轮的读数钉准了：
+「processor_start() never gets called for the boot CPU, so it needs to ...」——
+所以 `s=00000000 start=0` 是「没有副核被 start 过」，不是「没核在跑」。
+更硬的一条在我自己仓里：`drivers/CloverPMGR/CloverPMGR.cpp:104-105` 已经把 PMGR 的 CPU 电源钩子全部覆盖成 `unimplemented(168/169/…)`，而 `unimplemented()` 是 `panic("CloverPMGR: unimplemented power operation %u")` —— boot 58 跑满 1800 s 没有这个 panic，所以**那些钩子从没被调用过**。注意这是「从缺席推出来」的，tee 那句 `cpu_start()` 才是对调用者本身的测量：前者依赖「panic 一定会被记下来」，后者不依赖任何假设。
+
+**② 于是这一轮的仪器是「借来的一句话」，不是新探针。** `osfmk/arm64/cpu.c:909`
+`kprintf("cpu_start() cpu: %d")` 已经在 msgbuf 里说；`processor_should_kprintf`
+（`osfmk/kern/processor.c:1081`，函数体 `return reason != REASON_CLPC_SYSTEM;`）不会挡第一次放核。
+CloverSdhci 只做两件事：`kTeeAllowlist` 加 `"cpu_start()"` token（第 601 行），
+`kTeeProbeClasses` 加 `{ "cpu_start()", "r272-cpustart", 16, 0, 0, 0 }`（第 862 行）。
+**这里有个顺序坑，checker 现在钉住它**：`teeKernelLog` 先跑 `teeLineMatches`（白名单），
+只有过了白名单才轮到类表与配额——只加类不加 token，那条行根本进不来，
+读出来会是假的「内核没试过」。所以 Round272 块断言 token 必须在 `struct TeeProbeClass` 之前，
+并反向断言 `patches/xnu-clover/` 里**不存在** 47 个 z 的 r272 补丁、`LATE_PATCH` 头仍是 r271——
+这一轮宣称「不碰源码」，就得让它碰不得。
+
+**③ 三格判据（boot 59）**：一条 `cpu_start()` 都没有 ⇒ 「内核从没试着放副核」坐实，
+这件事的形状是 sheng 有而我们缺的一块（`UniXNU-sheng/patches/xnu/zzyf-sheng-amp.patch` 打开
+`__ARM_AMP__`、`MAX_CPUS 8`、`MAX_CPU_CLUSTERS 2`，另有一条 `zzye-sheng-cpu-idle.patch`），
+不是缺一个 boot-arg；有几条但没有 panic ⇒ 有人调了 `cpu_start()`，却没走到我们那个会炸的钩子——那说明这条路断在 `PE_cpu_start` 把 `cpu_id` 当 `IOCPU *` 用的那一步（本板没有 AppleARMSMP，活着的 `PE_cpu_start` 是 `IOCPU.cpp:90`），要去读 `IOCPU::startCPU`；
+有几条并跟着 `CloverPMGR: unimplemented power operation 168` ⇒ 调用真的走到了我们的钩子，那时才谈得上把 `enableCPUCore` 实现成 PSCI/寄存器操作。
+**三条都不改桌面这一格的结论**：boot 58 的债主普查仍是 `threads=8/9 wait=8/9 run=0`、
+唯一发送权在它自己任务里，多几颗核不会替它 signal。

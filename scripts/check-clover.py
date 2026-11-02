@@ -2449,6 +2449,36 @@ def check_board(errors: list) -> str:
                 errors.append("drivers/CloverSdhci has no class for the cpu row: a new prefix is a "
                               "producer of its own and an unbudgeted one drops the reading silently")
 
+        # Round272 patches nothing. Boot 58 measured reg=1 -- only the boot cpu ever registered -- and
+        # the reason is readable in the shipped image: nm over the unstripped kernel finds no
+        # AppleARMSMP symbols, because iokit/conf/files.arm64:7 lists it as `optional iokitcpp`. What is
+        # left unwitnessed is whether the kernel ever tried, and osfmk/arm64/cpu.c:909 already kprints
+        # that attempt, so the whole round is a tee token and a class. These assertions hold the round to
+        # that: the token has to be in the allowlist (which gates before the class table is consulted --
+        # a class without its token admits nothing), and no new board patch may appear.
+        if '"cpu_start()",' not in sdhci_source:
+            errors.append("drivers/CloverSdhci's allowlist has no cpu_start() token: teeLineMatches runs "
+                          "before the class table, so an allowlisted-off line never reaches its budget")
+        if '{ "cpu_start()", "r272-cpustart", 16, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the cpu_start() row: an unbudgeted "
+                          "producer of its own would push the census out of the ring")
+        if sdhci_source.index('"cpu_start()",') > sdhci_source.index("struct TeeProbeClass"):
+            errors.append("the cpu_start() allowlist token is not in the allowlist table (it must sit "
+                          "above the class table, which is where the gate that admits a line lives)")
+        r272_name = "z" * 47 + "-clover-r272.patch"
+        if (REPO / "patches/xnu-clover" / r272_name).is_file():
+            errors.append(f"patches/xnu-clover/{r272_name} exists: round272's claim is that the kernel "
+                          "already says what this round needs to hear, so a patch would mean the round "
+                          "stopped being a tee change and became a new reading no one asked for")
+        r272_late = " ".join(line for line in (REPO.parent / "UniXNU" /
+                                               "scripts/build-xnu-4k-baseline.sh").read_text().splitlines()
+                             if "clover-r2" in line)
+        if r272_late.find("z" * 46 + "-clover-r271.patch") < 0 or \
+                r272_late.find("z" * 46 + "-clover-r271.patch") > r272_late.find(
+                    "z" * 45 + "-clover-r270.patch"):
+            errors.append("build-xnu-4k-baseline.sh no longer reverses r271 first: round272 ships no "
+                          "patch, so the LATE head must still be the r271 row that produced boot 58")
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -3753,8 +3783,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r271:"):
-        errors.append('[payload] title is not "clover r271: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r272:"):
+        errors.append('[payload] title is not "clover r272: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4867,8 +4897,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r271:"):
-        errors.append('[payload] title is not "clover r271: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r272:"):
+        errors.append('[payload] title is not "clover r272: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
