@@ -1170,6 +1170,14 @@ def check_sb_sample(kernel: bytes) -> bool:
                                     b"cnt=%llu beat=%llu beatcnt=%llu text=%s\n") in kernel,
              "reset-record-unnamed": (b"clover r283: last reset unnamed magic=%llx beat=%llu "
                                       b"beatcnt=%llu\n") in kernel,
+             # Round289: boot 74 and boot 75 both ended in `Kernel data abort.` and both were read as a pc plus
+             # an lr that resolves to nothing, because the 480-byte panic record stops before esr, far, fp and
+             # sp -- and the trace lives only in these rows. A payload without them would meet the next fatal
+             # with exactly the reading that could not name the last two.
+             "abort-state-row": (b"clover r289: abt pid=%d tid=0x%llx pc=%016llx lr=%016llx fp=%016llx"
+                                 b" sp=%016llx esr=%08x far=%016llx cpsr=%08x kstack=%016llx..%016llx\n") in kernel,
+             "abort-frames-row": (b"clover r289: bt n=%u from=%u f=") in kernel,
+             "abort-frames-empty": (b"clover r289: bt n=0 from=0 f=\n") in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,

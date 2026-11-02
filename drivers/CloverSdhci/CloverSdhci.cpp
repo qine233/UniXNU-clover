@@ -926,6 +926,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // separate from r281-aks so a GPU probe that starves cannot be mistaken for a keystore that went
   // quiet.
   { "clover r286: ", "r286-gpu", 64, 0, 0, 0 },
+  // Round289 speaks only at a fatal data abort, and it is the reading the panic record cannot carry:
+  // the kind-20 slot is 480 bytes, and boot 74 and boot 75 both showed it cut off inside the register
+  // list, before esr, far, fp and sp -- the four fields that name a fault. At most one abt row and two
+  // bt rows per abort, so 32 is not a cap but a headroom; the class is separate so a truncated trace
+  // reads as a truncated trace rather than as a GPU or keystore row missing.
+  { "clover r289: ", "r289-abt", 32, 0, 0, 0 },
   // Round283 prints at most one line per boot, during the bring-up pass that arms the slot, and it
   // is the whole reading: a reset that got a name, or the proof that none did. That pass carries the
   // census and the GPT walk, so the per-pass cap can eat the one row the frame exists for -- and a
@@ -4217,6 +4223,15 @@ static void teeConsumeLine (uint32_t &pushed)
   // an IOKit timer on the work loop, far from the passes that carry the census, so they arrive beside whatever
   // else shares that pass -- and a schedule whose row is dropped by the per-pass cap is indistinguishable from
   // a boot that did not reach the next fire. The class budget of 128 still bounds it.
+  // Round286 rides the same burst for the same reason: the GPU schedule fires beside the census and
+  // the keystore rows, and a capped gpucc row would read as a board whose GDSC write never ran.
+  // Round289 is exempt for a sharper reason than any of these: its rows are the last lines in the log
+  // buffer, because they are printed by the abort handler on the way to panic, and the panic drain is
+  // exactly the pass that has already spent its sixteen pushes on everything older. Boot 74 and boot
+  // 75 measured the shape -- the only thing that came back of either fault was the 480-byte kind-20
+  // slot, which runs out of room in the middle of the register list. A trace the cap eats is a fault
+  // with no name again, so the rows are checked the way r249's census is: absent must never look like
+  // empty. The class budget of 32 still bounds it.
   const bool reserved = probe != nullptr &&
       (teeHasPrefix (probe->name, teeStringLength (probe->name), "r234-set") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r243") ||
@@ -4225,7 +4240,8 @@ static void teeConsumeLine (uint32_t &pushed)
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r276") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r281") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r283") ||
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r286"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r286") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r289"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

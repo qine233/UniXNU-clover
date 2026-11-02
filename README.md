@@ -34,10 +34,13 @@ leave」一路收紧到一句可测的话：
   「无 keybag、开机即解锁」）：解锁信号量等待随之消失，但 workloop 那五条等待者照旧，
   桌面仍未出。
 * **单核已坐实**：内核 `CpuDataEntries` 只注册一颗核（`real=1`），副核从未被 start。
-* **第二道坎（间歇）**：部分靴子在 726–1420 s 被一条致命 `Kernel data abort` 提前掐掉，崩在
-  `_memmove` / `IOSKArena::unmap`、两靴同一 caller，落在**我们自己的 legacy display / IOSurface 内存
-  路径**（boot 74/75 复现；boot 48/67 曾活到死线没犯）。r286 的 GPU 写被排除（GPU 行先干净打完、异常在
-  别处代码）。下一步给这类 panic 抓现场 backtrace 把 caller 定名。
+* **第二道坎（间歇）**：部分靴子在 726–1420 s 被一条致命 `Kernel data abort` 提前掐掉，boot 74 崩在
+  `_memmove`、boot 75 崩在 `IOSKArena::unmap` 的 cold 分支（两靴 `lr` 同一个值；boot 48/67 曾活到死线没犯）。
+  r286 的 GPU 写被排除（GPU 行先干净打完，异常在完全不同的代码里）。**「同一 caller」这句话在落盘时要收回一半**：
+  那个 `lr` 在本板内核符号表里落在一段 12 MB 的空档（`_native_legacy_*` 两个绝对符号之间），宿主解不出名字，
+  而卡上带回的 480 字节 panic 记录又在寄存器表中途截断，`esr`/`far`/`fp`/`sp` 一个没收 —— 所以 r289 改在
+  `panic_with_thread_kernel_state()`（内核里唯一同时握着这些字段的地方）打一条现场 `abt` 行加最多十二个
+  返回地址，走异常自己的 `fp` 链；等 boot 76 把那行带回来，caller 才有名字。
 
 每一轮的设计、构建与真机读数都在 [`notes/development-log.md`](notes/development-log.md)
 逐轮可查，本节只留当前结论。

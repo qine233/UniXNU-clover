@@ -3225,6 +3225,76 @@ def check_board(errors: list) -> str:
                 errors.append("build-xnu-4k-baseline.sh does not reverse r283 before r277 in LATE_PATCH: "
                               "the compile pass would run on a tree this patch was not written against")
 
+        # Round289, the fault's own backtrace. Boot 74 and boot 75 both ended in `Kernel data abort.` and
+        # both left the same 480-byte kind-20 record, cut off inside the register list -- so esr, far, fp
+        # and sp, the four fields that turn a pc into a cause, never reached the card, and the one caller
+        # field that did (lr 0xfffffff00568971c) sits in the 12 MB of this kernel's symbol table that holds
+        # no symbol at all. The reading is therefore not obtainable on the host, which is what makes this
+        # a source contract rather than a decoder one: the fields have to be printed where they exist.
+        r289_name = "z" * 53 + "-clover-r289.patch"
+        r289_patch = next((base / "patches/xnu-clover" / r289_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r289_name).is_file()), None)
+        if r289_patch is None:
+            errors.append(f"patches/xnu-clover/{r289_name} is missing: the next data abort would again be "
+                          "read as a pc and an lr that names nothing, which is exactly where round288 ended")
+        else:
+            r289_text = r289_patch.read_text()
+            r289_added = "".join(line for line in r289_text.splitlines(True)
+                                 if line.startswith("+"))
+            for needle in ('"clover r289: abt pid=%d tid=0x%llx pc=%016llx lr=%016llx fp=%016llx sp=%016llx "',
+                           '"esr=%08x far=%016llx cpsr=%08x kstack=%016llx..%016llx\\n"',
+                           '"clover r289: bt n=%u from=%u f="',
+                           '"clover r289: bt n=0 from=0 f=\\n"',
+                           'clover_abort_trace(arm_saved_state_t *ss)',
+                           'clover_kstack_walk(top, bottom, (uint64_t)state->fp, frames, 12)',
+                           'clover_abort_trace(ss);'):
+                if needle not in r289_text:
+                    errors.append(f"{r289_name} lacks {needle[:64]!r}: without it the abort keeps only the "
+                                  "fields the panic record already had room for")
+            # The hook has to be the panic-path one: handle_abort reaches the fault's state through
+            # panic_with_thread_kernel_state, so a call site anywhere else is a different exception.
+            if "panic_with_thread_kernel_state" not in r289_text:
+                errors.append(f"{r289_name} does not hook panic_with_thread_kernel_state: that is the only "
+                              "function holding the arm_saved_state64 of the abort, and the round would read "
+                              "a handler frame instead of the fault")
+            # Printed before the message, not after: panic_plain() is where the record's budget is spent,
+            # and a trace queued behind it has to survive the drain of a board that is already dying. The
+            # stock order at this site is saved_state64() -> original_faulting_state -> panic_plain(), so
+            # the call sitting between the first and the second is what "before the record" means here.
+            sleh_part = r289_text.split("diff --git a/osfmk/kern/task.c")[0]
+            trace_at = sleh_part.find("clover_abort_trace(ss);")
+            state_at = sleh_part.find("arm_saved_state64_t *state = saved_state64(ss);")
+            before_plain_at = sleh_part.find("os_atomic_cmpxchg(&original_faulting_state")
+            if min(trace_at, state_at, before_plain_at) < 0 or not (state_at < trace_at < before_plain_at):
+                errors.append(f"{r289_name} does not place the trace between saved_state64() and the "
+                              "faulting-state latch: that window is the only position that is after the "
+                              "flavor check and before panic_plain(), whose record truncated boot 74 and 75")
+            # A panic path may not block. proc_name takes p_lock, and this board is single-core -- an
+            # abort holding that lock would hang in the instrument instead of reporting the fault. Checked
+            # against the added code only: the comment is allowed to name the call it refuses.
+            r289_code = "".join(line for line in r289_added.splitlines(True)
+                                if not line.lstrip("+").lstrip().startswith(("*", "/*")))
+            for forbidden in ("proc_name(", "task_procname(", "task_best_name(", "mutex_lock", "lck_mtx_"):
+                if forbidden in r289_code:
+                    errors.append(f"{r289_name} calls {forbidden} from the abort path: a lock taken on the "
+                                  "way to panic is a boot that says nothing at all")
+            load_r289 = REPO.parent / "UniXNU" / "patches" / "xnu" / r289_name
+            if not load_r289.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r289_name} is missing: unixnu loads patches from there "
+                              "and silently skips one that lives only in this repo")
+            elif load_r289.read_bytes() != r289_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r289_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+        if '{ "clover r289: ", "r289-abt", 32, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the r289 rows: they would fall into the "
+                          "unclassed kernel log flow, where a fatal's own trace is the first thing dropped")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r289")' not in sdhci_source:
+            errors.append("the r289 rows are not exempt from the per-pass push cap: they are the last lines "
+                          "in the log buffer and the panic drain is the pass that has already spent its "
+                          "sixteen pushes -- a capped trace reads as a fault with no name, which is the "
+                          "reading round288 was forced to settle for")
+
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -4526,8 +4596,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r287:"):
-        errors.append('[payload] title is not "clover r287: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r289:"):
+        errors.append('[payload] title is not "clover r289: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5640,8 +5710,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r287:"):
-        errors.append('[payload] title is not "clover r287: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r289:"):
+        errors.append('[payload] title is not "clover r289: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

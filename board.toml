@@ -191,7 +191,12 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r287: the unattended deadline goes back on. Round285 measured the cost of a run that never returns -- boot 73 reached t=3145 s with nothing interrupting it and the window was only readable after a hand wrote the recovery BCB, so the run script's own landing was gone. Restating round184's price list: \"a boot nobody can read is not an answer.\" The deadline panic writes its own boot-recovery BCB into misc, so the next reset lands in TWRP with nothing from the host; 1800 s is round228's value, past the census gate and the GPU rows on the ring, inside the resets this board survives. The kernel rides unchanged on round286's GPU power-on."
+# Round289 changes no configuration key and adds no boot arg: the title names the round, the kernel
+# half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into ~/UniXNU/patches/xnu/, and the
+# driver half is the r289-abt tee class with the per-pass cap exemption. What it adds is the field
+# both data aborts lacked -- esr, far, fp and the fault's own frame chain -- because the 480-byte
+# panic record stopped inside the register list and the lr it did carry names nothing.
+title = "clover r289: the data abort's own backtrace. Boot 74 died in _memmove at about 1420 s and boot 75 in the cold path of IOSKArena::unmap at about 880 s, both with the same lr, and all either left behind was what a 480-byte panic slot could carry: pc, lr and x0..x14, cut off before esr, far, fp and sp. That lr resolves to nothing -- it sits in the 12 MB of this kernel's symbol table between the absolute _native_legacy_* hook values where no symbol exists -- so the caller was the one field the record never had room for, and r249's lesson restated for a fatal is \"a reading the channel cannot carry is a fault with no name.\" panic_with_thread_kernel_state is the only function in XNU holding the whole saved state, so the fault now speaks from there: an abt row with pid, tid, pc, lr, fp, sp, esr, far, cpsr and the stack bounds, then up to twelve return addresses walked from the fault's own fp by r211's bounded walker. Boot 76's reading is a name, not a correlation."
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

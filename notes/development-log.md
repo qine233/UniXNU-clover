@@ -21693,3 +21693,57 @@ panic 抓一条真正的内核 backtrace（沿用 r211/r236 的线程栈抓取�
 那是我们能改的代码。GPU 那半停在 cx 开、gx 等 RCG 父源：编 RCG 需要的父源/频率值**不在盘上**（facts 无时钟
 摘要），按「别造寄存器」的规矩，等 backtrace 这趟顺路带一次外部源（Linux gcc-sdm660 的 gfx3d_clk_src 父表）
 转录带出处，再决定 r290。桌面仍 CPU-first。
+
+## Round289 (v0.6.86): 给 data abort 现场抓它自己的内核 backtrace
+
+**① 这一轮只补一个字段：谁调用了那次 fault。** r288 把两次早停定到「我们一侧的 legacy display / IOSurface
+内存路径」，用的是 pc 的有边界解法（boot 74 `_memmove +0x64`、boot 75 `IOSKArena::unmap(...) .cold.1 +0x8`），
+但它能说的到此为止，因为卡上带回来的只有 kind-20 那 480 字节：`pc`、`lr` 和 `x0..x14`，寄存器表在中途被截断。
+被截掉的正好是能定名的四个字段——`esr`（读还是写、哪一级 translation fault）、`far`（故障地址）、`fp`、`sp`。
+而带回来的那个 `lr = 0xfffffff00568971c`，在本板内核镜像里**谁都解不出来**：把符号表按地址排好后逐字查，
+`0xfffffff004b9ebfc`（绝对符号 `_native_legacy_surface_allocation`）到 `0xfffffff0057865cc` 之间**没有任何符号**，
+那 12 MB 空档里 lr 落在中间——它不是「函数名的最近下方」，是根本没有名字。（r287/r288 我用 nm 的 nearest-below
+把它解成 display surface 路径，那次错读已在 r288 ③ 里撤回。）也就是说：**这条读数不可能在宿主上补出来**，只能
+在字段还活着的那一刻打出来。
+
+**② 落点选在唯一持有整份现场的那个函数。** `osfmk/arm64/sleh.c:468 panic_with_thread_kernel_state()` 是 XNU 里
+唯一同时拿着 `arm_saved_state64` 全部字段（`pc/lr/fp/sp/esr/far/cpsr/x0..x28`）的地方，且它后面紧跟着的
+`panic_plain()` 就是那条 480 字节记录的产地。所以新行插在两者之间——行先落进内核日志环，panic 的排干通道
+（r184/r212）随后把它带上卡。读数两条：
+* `clover r289: abt pid= tid= pc= lr= fp= sp= esr= far= cpsr= kstack=<低>..<高>`；
+* `clover r289: bt n= from= f=<六个返回地址>`（超过六个再来一行 `from=6`），并在 `n=0` 时**照样打一行**
+  `bt n=0 from=0 f=`——r249 的课：缺席不能被读成没查到。
+栈链从**故障自己的 `fp`** 走起，不是从 panic 的当前帧：异常是在同一条内核栈上取的，`state->fp` 往下才是「被
+打断那个函数的调用者们」，而 panic 帧把它们挡在上面。走链复用 r211 的有界遍历器 `clover_kstack_walk`（只跟随
+落在本线程栈区间内的地址），所以坏链是停下而不是在 panic 里再炸一次——那正是 r216 为 boot-4 写下的守卫。
+`kernel_stack == NULL`（栈被换出）也照 r216 的口径写进读数：`kstack=0..0` 且 `bt n=0`。
+
+**③ 一条设计上的硬约束：这条路径不许阻塞。** 想按 pid 取进程名就会走到 `proc_name()`，它要拿 p_lock；本板
+r271 已证**真核只有一个**，如果异常正是持着那把锁发生的，仪器会在报出故障之前把自己挂死——那读数就变成「又
+一次静默早停」。所以只读 `task->task_pid` 与 `thr->thread_id` 这类直接字段，名字交给环里已有的 r170 exec 行
+去对。`check-clover.py` 把这条钉成禁止形式（补丁新增的**代码行**里不得出现 `proc_name(`/`task_procname(`/
+`task_best_name(`/`mutex_lock`/`lck_mtx_`，注释里允许提这个名字，因为它正是在说「为什么不调用它」）。
+通道照 r249/r283 的规矩办：`r289-abt` 独立 tee 类（预算 32）**且豁免每趟 16 次推送上限**——这些行是日志缓冲里
+最晚的几行，而 panic 排干恰好是早已把 16 次预算花在更老行上的那一趟；被上限吃掉的 trace，读起来和「这次故障
+没有名字」的 boot 74/75 一模一样。双通道照旧：`printf` 进内核日志环，`clover_emmc_probe_say` 进驱动的中转环。
+
+**④ 一轮工程事故，记在这里而不是藏在提交里。** 补丁基线我一开始取错了树：改的是 `~/UniXNU/.cache/xnu-work`，
+而 `unixnu build kernel` 真正重放的是 `~/UniXNU/out/clover/tree/.cache/xnu-work`（`scripts/unixnu/kernel.py:76`
+用 `ctx.tree`）。前一棵在 `panic_with_thread_kernel_state` 里比后一棵**多一个空行**，于是照着它生成的补丁在真
+树里 `git apply --check` 直接失败。按 r247 记过的可靠取法重做：新开一份 shared clone、按 glob 序把 117 张补丁
+正打（跳过本轮这张）、确认它与活树**逐字节相同**，再在这份真基线上编辑、`diff -u` 出补丁、在基线里正向
+`apply --check`→apply→与编辑态 `cmp`→反向 `--check`→反打→`cmp` 回基线，双向都过才装进三个目录（`~/UniXNU/
+patches/xnu`、设备仓 `patches/xnu-clover`、`out/clover/tree/patches/xnu`）。那张错基线的补丁没有留下任何影响：
+它从没被打进真树。另：`~/UniXNU/.cache/xnu-work` 那两个文件已恢复成重放态，免得下次又拿到旧形状。
+
+**⑤ 契约与读数判据。** 补丁 `zzzz…z(53)-clover-r289.patch` 坐在 r283 上、`LATE_PATCH` 最先摘除；
+`check-clover.py` 断言四件事——字面量齐全、钩在 `panic_with_thread_kernel_state` 里且**位置**在
+`saved_state64()` 之后、`os_atomic_cmpxchg(&original_faulting_state` 之前（这就是「排在记录之前」的可检形式）、
+不阻塞、三个目录逐字节相同、tee 类与豁免在册。`verify-clover-payload.py` 新增 `abort-state-row` /
+`abort-frames-row` / `abort-frames-empty` 三枚卡内字面量闸门（两道闸门与 `unixnu.toml` 标题+死线闸门都过，
+EXIT=0）。boot 76 的读法预先写明：**看到 `clover r289: abt` 与 `bt` 行**，就用本轮内核镜像（含新符号
+`clover_abort_trace`）把每个返回地址解成函数名——那就 unmap/memmove 的 caller 定了名；只看到 `abt` 而
+`bt n=0 kstack=0..0`，那是栈被换出的那一支，改问「panic 发生在哪个线程的哪种等待上」；两行都没有而 boot 计数
+照样往前走，那是排干通道没带上它，属于仪器自己的第五次复发，按 r255/r256 的同类修法处理。若这次开机干脆没犯
+（boot 48/67 有过两次），`esr/far` 这一格仍欠着，下一趟照原样再飞。GPU 那半不动：cx 开、gx 等一份**带出处**的
+`gfx3d_clk_src` 父表；桌面仍 CPU-first。

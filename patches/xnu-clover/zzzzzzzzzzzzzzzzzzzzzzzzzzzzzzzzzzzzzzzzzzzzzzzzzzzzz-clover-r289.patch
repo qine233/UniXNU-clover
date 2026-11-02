@@ -1,0 +1,115 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -474,6 +474,12 @@
+ 
+ 	ss_valid = is_saved_state64(ss);
+ 	arm_saved_state64_t *state = saved_state64(ss);
++
++	/* Round289: this is the only place in XNU that holds the fault's esr, far, fp and sp, and
++	 * the panic record that follows does not have room for them. Printed before panic_plain so
++	 * the lines are already in the log the panic drain flushes. */
++	extern void clover_abort_trace(arm_saved_state_t *ss);
++	clover_abort_trace(ss);
+ 
+ 	os_atomic_cmpxchg(&original_faulting_state, NULL, state, seq_cst);
+ 
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -14294,5 +14294,95 @@
+ 	out[n++] = (uint64_t)get_saved_state_pc(ss);
+ 	out[n++] = (uint64_t)get_saved_state_cpsr(ss);
+ 	return n;
++}
++#endif /* __arm64__ */
++
++#if defined(__arm64__)
++/*
++ * Round289. The two flights that ended the round287 and round288 boots died in a
++ * `Kernel data abort.` -- boot 74 inside _memmove, boot 75 inside the cold path of
++ * IOSKArena::unmap -- and everything we knew of either was what the panic record fit into
++ * its 480-byte slot: pc, lr and x0..x14, cut off mid-register-list. The one field that
++ * would have named the caller is the one the slot never carried, and the lr it did carry
++ * resolves to nothing: it sits in the 12 MB gap of this kernel's symbol table between the
++ * absolute _native_legacy_* hook values (0xfffffff004b9ebfc to 0xfffffff0057865cc holds no
++ * symbol at all), so no host-side decode of that boot can name it.
++ *
++ * esr, far, fp and sp exist at this moment -- panic_with_thread_kernel_state() is the one
++ * function in XNU holding the whole arm_saved_state64 -- so they are printed here rather
++ * than left to the record's budget. Frames are walked from the fault's own fp, not from the
++ * caller's: the exception was taken on the same kernel stack, so the chain at state->fp is
++ * the aborted function's callers, which is the half that the handler frames above it hide.
++ * r211's bounded walker is reused so a corrupt chain ends the walk instead of faulting the
++ * kernel inside its own panic (the boot-4 abort r216 was written for).
++ *
++ * Nothing here blocks: no proc lookup, no name, no lock. Looking a process up by pid takes
++ * p_lock, and a single-core board that aborts while holding it would hang before it could
++ * say so -- pid and tid are direct reads, and the ring already carries r170's exec rows to
++ * name a pid with. Both channels are used, as every decisive one-shot line is: printf for
++ * the kernel log ring the panic drain flushes, probe_say for the driver ring beside it.
++ */
++void
++clover_abort_trace(arm_saved_state_t *ss)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	arm_saved_state64_t *state;
++	thread_t thr;
++	task_t task;
++	uint64_t bottom = 0;
++	uint64_t top = 0;
++	uint64_t frames[12];
++	uint32_t n = 0;
++	uint32_t i;
++	uint32_t k;
++	char line[256];
++
++	if (ss == NULL || (uintptr_t)ss == (uintptr_t)-1 || is_saved_state32(ss)) {
++		return;
++	}
++	state = saved_state64(ss);
++	thr = current_thread();
++	if (thr == THREAD_NULL) {
++		return;
++	}
++
++	/* Round216's case, spelled in the reading instead of silently missing: a thread whose
++	 * kernel stack has been swapped out has kernel_stack == NULL, and fp then means nothing. */
++	if (thr->kernel_stack != NULL) {
++		bottom = (uint64_t)(uintptr_t)thr->kernel_stack;
++		top = bottom + kernel_stack_size;
++		n = clover_kstack_walk(top, bottom, (uint64_t)state->fp, frames, 12);
++	}
++
++	task = get_threadtask(thr);
++	snprintf(line, sizeof(line),
++	    "clover r289: abt pid=%d tid=0x%llx pc=%016llx lr=%016llx fp=%016llx sp=%016llx "
++	    "esr=%08x far=%016llx cpsr=%08x kstack=%016llx..%016llx\n",
++	    (task != TASK_NULL) ? task_pid(task) : 0,
++	    (unsigned long long)thr->thread_id,
++	    (unsigned long long)state->pc, (unsigned long long)state->lr,
++	    (unsigned long long)state->fp, (unsigned long long)state->sp,
++	    (unsigned int)state->esr, (unsigned long long)state->far,
++	    (unsigned int)state->cpsr,
++	    (unsigned long long)bottom, (unsigned long long)top);
++	printf("%s", line);
++	clover_emmc_probe_say(line, (unsigned int)strlen(line));
++
++	if (n == 0) {
++		const char *none = "clover r289: bt n=0 from=0 f=\n";
++		printf("%s", none);
++		clover_emmc_probe_say(none, (unsigned int)strlen(none));
++	}
++	for (i = 0; i < n; i += 6) {
++		int head = snprintf(line, sizeof(line), "clover r289: bt n=%u from=%u f=", n, i);
++		char *p = line + head;
++		for (k = i; k < n && k < i + 6; k++) {
++			p += snprintf(p, (size_t)(line + sizeof(line) - p), "%s%016llx",
++			    (k == i) ? "" : ",", (unsigned long long)frames[k]);
++		}
++		*p = '\0';
++		printf("%s", line);
++		clover_emmc_probe_say(line, (unsigned int)strlen(line));
++	}
+ }
+ #endif /* __arm64__ */
