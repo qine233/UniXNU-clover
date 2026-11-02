@@ -20526,3 +20526,40 @@ libdispatch 从 block 里等另一 block 时，正常是靠**再造一条工人�
 `verify-clover-payload.py` 加钉 `bb-ipi`，`check-clover.py` 加 Round270 块（printf 字面、
 `extern volatile uint32_t armcpu_core_sgi[8]`、LATE 顺序、tee 类字面）。
 
+## r270 读数（boot 57）：不是 IPI 丢了，是**根本没有一次跨核唤醒被请求**——而逐核 tick 只有 core 0 在动
+
+boot 57 = round270-payload.img（kernel 5834c96c → AMFI cfc110f8 → normalize 006be329，镜像 63456f3d）。
+死线照常落地、闸门照常报「the boot count moved: 56 -> 57」。四次普查的 `clover r270: ipi` 全帧只有这一种形状：
+
+```
+t=1338 sent=0 recv=0 tick=224585 sgi=0,0,0,0,0,0,0,0 tm=224585,0,0,0,0,0,0,0
+t=1467 sent=0 recv=0 tick=246600 ... tm=+22015 在 core0，其余七颗恒 0
+t=1602 sent=0 recv=0 tick=269657 (+23057)
+t=1723 sent=0 recv=0 tick=291290 (+21633)
+```
+
+**① 我自己那条 IPI 假设按预定的方式被证否了。** 判定表里写的是「`sent` 不涨 ⇒ 内核压根没请求跨核
+signal，问题不在投递」，读数正落在这一格：385 秒窗口里 `sent` 与 `recv` **都是 0**。
+所以「workloop 工人叫不醒」不是 IPI 在半路丢了——**是从来没有人发出过请求**。
+
+**② 同一条读数指向更基本的事：逐核 timer 只有 core 0 在走。** `tm=` 八列里七列恒 0，
+core 0 每 130 秒涨 2.2 万多次（约 170 Hz tick，与 r148 那行 `ticks=` 的量级对得上）。
+一颗核**要么在跑线程、要么在 idle**，两种都会取架构定时器中断；八核里七核一次都不取，
+只有两种解释：**它们没在跑**，或者它们**跑着但永远不被打断**——后者意味着
+「调度器以为它们在线、把线程放上去，而那颗核再也不理会任何东西」。
+boot 56 的形状（整个任务 8 条线程全睡、0 条可运行、block 排出去了却没人跑）与后者完全吻合。
+
+**③ 这一格我们仓库自己标过「没量过」。** `porting.toml` 的 CPU 区原话：
+`armcpu-spi-ipi` 与 `armcpu-self-ipi` 故意不传的理由是「**the online-CPU count has not been measured**」，
+并且同一句还承认「驱动里的 SPI 号码是按有更多 INTID 的 GIC 硬编码的」。
+也就是说 boot 57 不是从干净证据里冒出来的新猜想，而是**把那条一直挂着的空白补上**。
+另外要记下：boot-args 全表比对时我把 sheng 的 `sheng-smp=1` 归进「它自家驱动的开关」一笔带过，
+现在看那是本板最该重新看的一条——**它是我们没有、而它有的 SMP 开关**（只是不能直接抄名字，要连实现一起查）。
+
+**④ r271 就量这个，一行就够**：普查每次拍火印 `clover r271: cpu n=… started=… running=… idle=… pending=…`，
+逐核给 XNU 自己的处理器状态位（`CPU_DATA(i)` 的 signal/started/running 位与 `processor_count`/`max_cpus`），
+判据预先写死：`started` 只有 1 颗 ⇒ 本板一直是单核在跑，ADT 的八核声明与 `checker` 的「8 cores」都是空话，
+下一格回到 CPU 上线路径（`processor_start`/`signalCPU` 的先后与 `SIGPdisabled` 那条 r217 记过的机制）；
+`started=8` 而 `running` 只有 1 颗 ⇒ 线程被放到不会醒的核上，那是**唤醒路径**而不是上线路径；
+两者都不成 ⇒ 回到 workloop 的 `wl_request` 事件本身。
+
