@@ -869,6 +869,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // four address-space ranges. Four fires inside a deadline is the whole budget's worth of rows, so 32 is
   // generous by design -- the row is the only way to read the frames that are not in the shared cache.
   { "clover r274: ", "r274-map", 32, 0, 0, 0 },
+  // Round275 asks a registry question, so it is a per-fire producer of a different shape: one line for the
+  // two metaclass lookups, up to eight lines for the services whose name carries "KeyStore", and one summary
+  // row that carries the walk's own reached/stopped count. Ten rows a fire, four fires inside the deadline is
+  // 40, and the 64 budget is the census headroom the last two rounds used -- deliberately wide because a row
+  // that says nothing (class=0 and walked>0 with keystore_services=0) is the reading we are buying, and it
+  // must survive the ring rotation to be read at all.
+  { "clover r275: ", "r275-aks", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -4144,10 +4151,16 @@ static void teeConsumeLine (uint32_t &pushed)
   // first ring slots only, and they take the ordinary per-pass budget like any other probe.
   // Round251 renames that class rather than adding one: boot 38 showed the recorder losing its own
   // decisive rows to an 8-slot ring, and the fixed instrument prints from the same place.
+  // Round275 rides the same burst as its own host: the three keystore rows are printed inside
+  // clover_iodt_census's service walk, so they arrive in the pass that is already carrying the r243 census and
+  // would be counted against a cap that pass has usually spent by then. Exempting them is not a favour to the
+  // new round -- a truncated keystore row is the same false "none" that boot 36 nearly made of the plane, and
+  // the class budget of 64 still bounds it.
   const bool reserved = probe != nullptr &&
       (teeHasPrefix (probe->name, teeStringLength (probe->name), "r234-set") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r243") ||
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r252"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r252") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r275"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

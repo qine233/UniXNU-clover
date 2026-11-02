@@ -2623,6 +2623,80 @@ def check_board(errors: list) -> str:
                 errors.append(f"UniXNU/patches/xnu/{r274_name} is not the same bytes as this repo's copy: "
                               "the two trees would compile different kernels")
 
+        # Round275 stops chasing the debtor and measures what it is waiting on. Boot 61's frames named the
+        # wait (-waitUntilPreboardDidFinishUnlock, then dispatch_semaphore_wait forever) and this board's own
+        # r252 ledger named a missing IOService:/IOResources/AppleKeyStore, but the only fix on the table --
+        # sheng's owned keystore -- publishes only when the AppleKeyStore *metaclass* is absent, and that
+        # precondition has never been read here. So the round measures, it does not patch: the two class
+        # lookups, every service in the plane whose name says KeyStore, and the walk's own reached/stopped
+        # count so that "none" can never be read off a truncated walk. One iterator, one pass: a second
+        # whole-plane walk would take the registry lock twice to answer one question.
+        r275_name = "z" * 49 + "-clover-r275.patch"
+        r275_patch = next((base / "patches/xnu-clover" / r275_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r275_name).is_file()), None)
+        if r275_patch is None:
+            errors.append(f"patches/xnu-clover/{r275_name} is missing: without it the keystore question "
+                          "stays an inference drawn from another round's ledger line")
+        else:
+            r275_text = r275_patch.read_text()
+            r275_added = "".join(line for line in r275_text.splitlines(True)
+                                 if line.startswith("+"))
+            if r275_text.count("--- a/") != 1 or "--- a/iokit/Kernel/IOStartIOKit.cpp" not in r275_text:
+                errors.append(f"{r275_name} does not touch exactly iokit/Kernel/IOStartIOKit.cpp: the census "
+                              "walk already lives there, and a second file would mean a second walk")
+            for needle in ('OSSymbol::withCString("AppleKeyStore")',
+                           'OSSymbol::withCString("AppleKeyStoreUserClient")',
+                           'OSMetaClass::getMetaClassWithName(ksname)',
+                           'OSMetaClass::getMetaClassWithName(ksclient)',
+                           '"clover r275: aks class=%d userclient_class=%d\\n"',
+                           'clover_name_has(nm, "KeyStore")',
+                           'mc->getClassNameSymbol()',
+                           '"clover r275: svc %.24s class=%.24s\\n"',
+                           'if (keystore_seen < 8)',
+                           '"clover r275: aks walked=%d stopped=%d keystore_services=%d\\n"'):
+                if needle not in r275_added:
+                    errors.append(f"{r275_name} lacks {needle[:64]!r}: that is one of the three readings, "
+                                  "and a round that returns two of three is how boot 34 read a stopped "
+                                  "walk as an empty plane")
+            if "iterateOver" in r275_added:
+                errors.append(f"{r275_name} opens a second registry iterator: the keystore rows belong in "
+                              "the walk that is already running, not beside another one")
+            if r275_added.count("aks class=") != 1 or r275_added.count("aks walked=") != 1:
+                errors.append(f"{r275_name} prints its summary rows more than once per fire: the census "
+                              "budget is shared with the thread rows that resolve the wait")
+            if not (r275_added.find("aks class=") < r275_added.find('svc %.24s class=')
+                    < r275_added.find("aks walked=")):
+                errors.append(f"{r275_name} does not print class, then services, then the tally: a ring "
+                              "that rotates mid-fire would cut the rows off from their own bound")
+            if '{ "clover r275: ", "r275-aks", 64, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci has no class for the keystore rows: a new prefix is a "
+                              "producer of its own and an unbudgeted one drops the reading silently -- the "
+                              "exact way r272's cpu_start() line looked like a kernel that never tried")
+            if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r275")' not in sdhci_source:
+                errors.append("the keystore rows are not exempt from the per-pass push cap: they print inside "
+                              "the r243 census burst, which boot 36 measured as already spent by the time the "
+                              "walk's own rows arrive, so the cap would eat them and a truncated row reads as "
+                              "\"the plane has none\"")
+            late_script = (REPO.parent / "UniXNU" /
+                           "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in late_script.splitlines()
+                                 if "clover-r2" in line)
+            if (late_list.find(r275_name) < 0 or
+                    late_list.find(r275_name) > late_list.find("z" * 48 + "-clover-r274.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r275 before r274 in LATE_PATCH: the "
+                              "compile pass would run on a tree this patch was not written against")
+            if late_script.count("\nfor LATE_PATCH in ") != 1:
+                errors.append("build-xnu-4k-baseline.sh has more than one LATE_PATCH loop: the older ones "
+                              "were joined by a backslash and silently became words of the list")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r275_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r275_name} is missing: unixnu loads patches from that "
+                              "directory and silently skips a board patch that lives only in this repo")
+            elif load_copy.read_bytes() != r275_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r275_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -3927,8 +4001,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r274:"):
-        errors.append('[payload] title is not "clover r274: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r275:"):
+        errors.append('[payload] title is not "clover r275: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5041,8 +5115,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r274:"):
-        errors.append('[payload] title is not "clover r274: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r275:"):
+        errors.append('[payload] title is not "clover r275: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

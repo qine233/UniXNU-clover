@@ -1085,6 +1085,14 @@ def check_sb_sample(kernel: bytes) -> bool:
              # still leaves the prefix needles green.
              "bb-peer-map": (b"clover r274: map t=%llu pid=%d ne=%u shown=%u e0=%llx-%llx"
                              b" e1=%llx-%llx e2=%llx-%llx e3=%llx-%llx\n") in kernel,
+             # Round275 measures the precondition of the only proposed fix, so all three rows have to be in the
+             # image: the class lookup (what the metaclass table says), the per-service row (what the plane
+             # holds, with the class next to the name because a service named KeyStore is not the same reading
+             # as one built from AppleKeyStore), and the tally that carries walked=/stopped= so that a row
+             # count of zero means "the plane has none" rather than "the walk stopped at 2000".
+             "bb-aks-class": (b"clover r275: aks class=%d userclient_class=%d\n") in kernel,
+             "bb-aks-svc": (b"clover r275: svc %.24s class=%.24s\n") in kernel,
+             "bb-aks-walked": (b"clover r275: aks walked=%d stopped=%d keystore_services=%d\n") in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,

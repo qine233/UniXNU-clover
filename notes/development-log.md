@@ -20904,3 +20904,46 @@ PreBoard 问了 `IODeviceTree:/arm-io/sep` 且 `missing=1`（我们没有 SEP）
 r275 不再追 datamigrator，而是量「该发通知的人卡在哪」：给 PreBoard 做一次同形状普查（threads/wait/run +
 每条线程 hint 与栈），并打一行「IORegistry 里有没有 AppleKeyStore」。**「没有 keystore」要做成读数，
 不能继续做成推论**；在看到那个等待之前，不做锁状态模拟、不写 keystore 驱动。
+
+## r275 落地（v0.6.67）：把「本板没有 keystore」从推论改成读数
+
+**① 这一轮问的是前提，不是修法。** boot 61 把等待念成了函数名（`-_unlockKeyBagUseOfForceIsAuthorized` →
+`-waitUntilPreboardDidFinishUnlock` → `dispatch_semaphore_wait(..., FOREVER)`），而唯一摆在那儿的修法是 sheng 自带的
+keystore（`~/UniXNU-sheng/package/KeyStoreProbe.cpp` + `drivers/NativeKeyStoreEvents`）。它的门槛写得很死：
+**只有当 `AppleKeyStore` 这个 metaclass 不存在时才发布**。sheng 成立是因为它不带 prelink roots，而本板链的是
+stock kernelcache，镜像里确实有 `AppleKeyStore` / `AppleKeyStoreUserClient` 这两串——所以这条前提在本板从来没被
+量过。按「抄守卫要连前提一起验」的规矩，r275 不写驱动、不加 boot-arg，只把前提做成三行读数。
+**② 落点与形状。** 补丁 `patches/xnu-clover/z…z(49)-clover-r275.patch`，只动 `iokit/Kernel/IOStartIOKit.cpp`
+一个文件、两个 hunk、61 行纯增量，全部在 `clover_iodt_census()` 已经跑着的那趟 `gIOServicePlane` 走查里：
+
+- `clover r275: aks class=%d userclient_class=%d` —— 查 metaclass 表（`OSMetaClass::getMetaClassWithName`，
+  本树 `OSMetaClass.h:1105`）。
+- `clover r275: svc %.24s class=%.24s` —— 名字含 `KeyStore` 的服务，每颗一行（至多 8 行），**类名与条目名并排印**：
+  一颗只是名字叫 keystore 的服务，和一颗真由 `AppleKeyStore` 类实例化出来的服务，是两个不同的读数。
+- `clover r275: aks walked=%d stopped=%d keystore_services=%d` —— 把 `walked=`/`stopped=` 重复一遍。
+  「没有 keystore」只有在走查跑完的前提下才等于「平面里没有」；boot 34 那次 `svc total=1` 已经把这种错教过一次。
+
+刻意**不开第二个迭代器**：整平面再走一遍等于为一件事拿两次注册表锁，`kCloverSvcCap=2000` 的预算也白付一遍。
+**③ 与计划的偏差，写在账上。** r274 读数那节里我给 r275 排了两件事，这轮只做了 keystore 那半件；
+**PreBoard 的同形状普查没有发**。理由是这一轮的量已经足够分岔：`class=0` 就直接走 sheng 那条发布路线，普查只是
+锦上添花；`class=1` 时才需要知道 PreBoard 卡在哪个对象上——所以普查排进 r276，由 r275 的读数决定要不要做。
+**④ 仪器侧的两处接线。** tee 新类 `{ "clover r275: ", "r275-aks", 64, 0, 0, 0 }`（一拍至多 10 行、四拍 40 行，
+64 是普查那一档的余量）；更关键的是把 `r275` 加进 `teeKernelLog` 的**每趟 16 条上限白名单**（`r234-set`/`r243`/`r252`
+之后）。这三行本来就印在 r243 普查那一爆里，boot 36 实测那一趟的配额早被 bb 行吃光——不进白名单就会被静默截断，
+截断的 keystore 行读起来和「平面里没有」一模一样，正是 r272 那课的假阴性。checker 现在两条都钉：类必须在，
+白名单也必须在。
+**⑤ 顺手修掉一个真的构建缺陷。** `~/UniXNU/scripts/build-xnu-4k-baseline.sh` 的 `LATE_PATCH` 名单里有**两行都以
+`for LATE_PATCH in` 开头**（r274 那一轮插入时留下的），第二行其实只是上一行的续行，于是 `for`、`LATE_PATCH`、`in`
+三个词被当成了路径混进名单——循环照跑（`git apply` 对不存在的文件名失败即跳过），但每趟都白试三次，而且以后任何人
+按行首找名单都会找错。现在合成一条，checker 加断言 `
+for LATE_PATCH in ` 只能出现一次。
+**⑥ 构建与闸门。** 内核 `1ec3a3dd…` → AMFI `c669f70f…` → 归一化 `f9a9fb63…`；
+payload `round275-v0.6.67-payload.img` sha256 `6c241bac…`（58720256 字节）。
+`check-clover.py` EXIT=0（Round275 块：单文件、三行字面量、打印次序、类与白名单、LATE 头、双仓字节一致）；
+`verify-clover-payload.py` EXIT=0，出厂镜像里 `bb-aks-class`/`bb-aks-svc`/`bb-aks-walked` 三枚针全部 present。
+board 标题升到 `clover r275:`，两处 `[payload] title` 断言同步。
+**⑦ 判据先写死。** `class=0 userclient_class=0` 且 `walked` 跑完、`keystore_services=0` ⇒ sheng 那条
+`NativeKeyStoreEvents` + `offline-key-events=1` 的路线在本板成立，下一轮就做驱动移植（`.late.o` 接线 + 板侧探针
+不带 `boot_progress_ext`，因为本板 `CONFIG_XNU_BOOT_PROGRESS=n`，计数只能印在拍上）。
+`class=1` ⇒ 已经存在一个同类，再发布一颗是另一个问题（谁先注册、UserClient 归属、SEL 键），那一轮先做 PreBoard
+普查再谈。`walked=` 撞上 `stopped=1` ⇒ 这轮什么都没量到，得先把 cap 抬起来或把走查挪出普查窗口。

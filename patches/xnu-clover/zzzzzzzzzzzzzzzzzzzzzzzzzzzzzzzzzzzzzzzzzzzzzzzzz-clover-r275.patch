@@ -1,0 +1,87 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -457,17 +457,70 @@
+ 		IORegistryIterator  *si;
+ 		IORegistryEntry     *svc;
+ 		int                  total = 0, matched = 0, stopped = 0;
++
++		/*
++		 * Round275. The debtor's own code says what it waits for: boot 61's four
++		 * main-image frames unslide (against the base this board printed itself, and
++		 * independently against the only slide that makes every frame follow a call)
++		 * into -waitUntilPreboardDidFinishUnlock reached from
++		 * -_unlockKeyBagUseOfForceIsAuthorized, and the bound workloop servicer then
++		 * blocks in dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER). So the wait is
++		 * a device-unlock wait, and this board's own r252 ledger has audiomxd asking
++		 * eighteen times for IOService:/IOResources/AppleKeyStore and missing it.
++		 *
++		 * sheng ships an owned AppleKeyStore for exactly that hole, but its guard is
++		 * "publish only if the AppleKeyStore *metaclass* is absent", and sheng boots with
++		 * no prelink roots while this board links the stock kernelcache -- whose image
++		 * really does carry AppleKeyStore/AppleKeyStoreUserClient strings. So the
++		 * precondition, not the fix, is what has to be measured first: a second service
++		 * of a class that already exists is a different problem than no service at all,
++		 * and the two need different code. Both readings are here, plus whatever service
++		 * the plane actually holds.
++		 */
++		const OSSymbol    *ksname = OSSymbol::withCString("AppleKeyStore");
++		const OSSymbol    *ksclient = OSSymbol::withCString("AppleKeyStoreUserClient");
++		int                  have_class = 0, have_client_class = 0;
++
++		if (ksname != NULL && OSMetaClass::getMetaClassWithName(ksname) != NULL) {
++			have_class = 1;
++		}
++		if (ksclient != NULL && OSMetaClass::getMetaClassWithName(ksclient) != NULL) {
++			have_client_class = 1;
++		}
++		OSSafeReleaseNULL(ksname);
++		OSSafeReleaseNULL(ksclient);
++		printf("clover r275: aks class=%d userclient_class=%d\n", have_class, have_client_class);
+ 
+ 		si = IORegistryIterator::iterateOver(gIOServicePlane,
+ 		    kIORegistryIterateRecursively);
+ 		if (si == NULL) {
+ 			printf("clover r243: svc no-iterator\n");
+ 		} else {
++			int keystore_seen = 0;
++
+ 			while (total < kCloverSvcCap &&
+ 			    (svc = si->getNextObjectRecursive()) != NULL) {
+ 				const char *nm = svc->getName();
+ 
+ 				total++;
++				/*
++				 * Round275, in the same walk on purpose: a second whole-plane walk would
++				 * take the registry lock twice to answer one question. The class name is
++				 * printed with the entry name because the two differ, and a service that
++				 * merely *looks* like a keystore by name is not the same reading as one
++				 * instantiated from the AppleKeyStore class.
++				 */
++				if (nm != NULL && clover_name_has(nm, "KeyStore")) {
++					const IOService   *sv = OSDynamicCast(IOService, svc);
++					const OSMetaClass *mc = sv != NULL ? sv->getMetaClass() : NULL;
++					const OSSymbol    *cls = mc != NULL ? mc->getClassNameSymbol() : NULL;
++
++					if (keystore_seen < 8) {
++						printf("clover r275: svc %.24s class=%.24s\n", nm,
++						    cls != NULL ? cls->getCStringNoCopy() : "?");
++					}
++					keystore_seen++;
++				}
+ 				if (nm != NULL && (clover_name_has(nm, "utton") ||
+ 				    clover_name_has(nm, "HID") || clover_name_has(nm, "aptic") ||
+ 				    clover_name_has(nm, "SSB") || clover_name_has(nm, "Resolver"))) {
+@@ -483,6 +536,13 @@
+ 			si->release();
+ 			printf("clover r243: svc total=%d stopped=%d button-family=%d\n",
+ 			    total, stopped, matched);
++			/*
++			 * The keystore line repeats walked=/stopped= on purpose. "No service named
++			 * KeyStore" only means "none" if the walk finished, and this board has
++			 * already been fooled once by a count that stopped early (boot 34's svc total=1).
++			 */
++			printf("clover r275: aks walked=%d stopped=%d keystore_services=%d\n",
++			    total, stopped, keystore_seen);
+ 		}
+ 	}
+ 	/*
