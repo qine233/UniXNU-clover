@@ -1079,6 +1079,12 @@ def check_sb_sample(kernel: bytes) -> bool:
              # has to stay readable as "no waiter" rather than "no instrument".
              "bb-peer-workloop": (b"clover r273: wl t=%llu pid=%d tid=%llx kn=%llx kq=%llx wlo=%u"
                                   b" ks=%x kc=%u kqpid=%d dyn=%llx tr=%x tc=%u tt=%llx ow=%llx\n") in kernel,
+             # Round274: the peer task's first mappings, so the four frames of the bound servicer
+             # that belong to no shared-cache image can be turned into functions of the binary we
+             # already hold. Pinned whole for the same reason as every other row: a cut literal
+             # still leaves the prefix needles green.
+             "bb-peer-map": (b"clover r274: map t=%llu pid=%d ne=%u shown=%u e0=%llx-%llx"
+                             b" e1=%llx-%llx e2=%llx-%llx e3=%llx-%llx\n") in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,

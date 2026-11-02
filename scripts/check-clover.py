@@ -2567,6 +2567,62 @@ def check_board(errors: list) -> str:
                 errors.append(f"UniXNU/patches/xnu/{r273_name} is not the same bytes as this repo's copy: "
                               "the two trees would compile different kernels")
 
+        # Round274 asks for the one number that turns boot 60's four unnamed frames into function names: the
+        # address the peer's own binary was loaded at. The read is osfmk-side and legal there -- struct _vm_map
+        # is complete in task.c, which is exactly the thing that was NOT true of struct kqworkloop in r273 --
+        # so the patch touches one file. The row is printed once per fire, ahead of the rows it resolves, and
+        # carries ne= (how many entries the map has) next to shown= (how many this row carries) so a truncated
+        # walk reads as truncation rather than as the whole address space.
+        r274_name = "z" * 48 + "-clover-r274.patch"
+        r274_patch = next((base / "patches/xnu-clover" / r274_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r274_name).is_file()), None)
+        if r274_patch is None:
+            errors.append(f"patches/xnu-clover/{r274_name} is missing: without the peer's own mappings the "
+                          "four main-image frames of the bound servicer stay four numbers and nothing more")
+        else:
+            r274_text = r274_patch.read_text()
+            r274_added = "".join(line for line in r274_text.splitlines(True)
+                                 if line.startswith("+"))
+            if "--- a/bsd/" in r274_text:
+                errors.append(f"{r274_name} touches a bsd file: this read is of struct _vm_map, which task.c "
+                              "can resolve on its own -- reaching for bsd again would be r273's mistake twice")
+            for needle in ('#define CLOVER_WL_MAP_ROWS 4',
+                           'uint64_t mestart[CLOVER_WL_MAP_ROWS];',
+                           'uint64_t meend[CLOVER_WL_MAP_ROWS];',
+                           'uint32_t mene;',
+                           'for (i = 0; i < CLOVER_WL_MAP_ROWS; i++) {',
+                           'mene = (uint32_t)peer->map->hdr.nentries;',
+                           'me = vm_map_first_entry(peer->map);',
+                           'me != vm_map_to_entry(peer->map) && men < CLOVER_WL_MAP_ROWS;',
+                           'mestart[men] = (uint64_t)me->vme_start;',
+                           '"clover r274: map t=%llu pid=%d ne=%u shown=%u e0=%llx-%llx e1=%llx-%llx"',
+                           '" e2=%llx-%llx e3=%llx-%llx\\n"'):
+                if needle not in r274_added:
+                    errors.append(f"{r274_name} lacks {needle[:64]!r}: without it the row cannot say which "
+                                  "range the frames fell in, which is the whole point of the round")
+            if r274_added.count("clover r274: map") != 1:
+                errors.append(f"{r274_name} prints the map row {r274_added.count('clover r274: map')} times: "
+                              "one row per fire is the design, per thread would eat the census budget")
+            if '{ "clover r274: ", "r274-map", 32, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci has no class for the map row: a new prefix is a producer "
+                              "of its own and an unbudgeted one drops the reading silently")
+            late_script = (REPO.parent / "UniXNU" /
+                           "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in late_script.splitlines()
+                                 if "clover-r2" in line)
+            if (late_list.find(r274_name) < 0 or
+                    late_list.find(r274_name) > late_list.find("z" * 47 + "-clover-r273.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r274 before r273 in LATE_PATCH: the "
+                              "compile pass would run on a tree this patch was not written against")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r274_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r274_name} is missing: unixnu loads patches from that "
+                              "directory and silently skips a board patch that lives only in this repo")
+            elif load_copy.read_bytes() != r274_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r274_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the

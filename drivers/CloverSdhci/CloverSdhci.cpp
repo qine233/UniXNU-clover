@@ -865,6 +865,10 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // once-per-fire summary, so it gets the census budget: twenty fires times a couple of waiters fits in 64 with
   // headroom for the day a workloop has five waiters, which is the shape boot 58 reported for pid 58.
   { "clover r273: ", "r273-wl", 64, 0, 0, 0 },
+  // Round274 prints one row per census fire, before the thread rows it exists to resolve: the peer's first
+  // four address-space ranges. Four fires inside a deadline is the whole budget's worth of rows, so 32 is
+  // generous by design -- the row is the only way to read the frames that are not in the shared cache.
+  { "clover r274: ", "r274-map", 32, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

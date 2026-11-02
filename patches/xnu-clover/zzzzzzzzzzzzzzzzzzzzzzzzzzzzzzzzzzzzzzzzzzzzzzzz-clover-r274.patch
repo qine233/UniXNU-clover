@@ -1,0 +1,83 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11984,6 +11984,10 @@
+ #define CLOVER_WL_TT     8    /* tid of kqwl_request.tr_thread, above the BINDING floor */
+ #define CLOVER_WL_OW     9    /* tid of kqwl_owner */
+ #define CLOVER_WL_PID    10   /* pid of the process owning the kqueue */
++
++/* Round274: how many map entries the peer census walks. The main executable is inside the first two on
++ * iOS (entry zero is __PAGEZERO), and four is enough to show the ordering without printing a page. */
++#define CLOVER_WL_MAP_ROWS 4
+ 
+ /*
+  * Round273. What the kernel thinks of the workloop a thread is parked on.
+@@ -12241,6 +12245,18 @@
+ 	 */
+ 	struct clover_workloop_read pwl[CLOVER_BB_PEER_ROWS];
+ 	uint32_t pwlcount = 0;
++	/*
++	 * Round274. The first few entries of the peer's own address space, taken under the peer lock because
++	 * that is the lock the map lives under (vm_map_lock is the task lock in this tree). Entries are linked in
++	 * ascending address, so the __PAGEZERO and the main executable are at the front, and the host has the
++	 * binary: boot 60's bound servicer thread showed four frames in datamigrator's own Mach-O
++	 * (0x101177d50, 0x1011799fc, 0x10117a1a0, 0x1011743d0) and the shared-cache slide names everything
++	 * around them, so the one number missing to turn those four into functions is the load address.
++	 */
++	uint64_t mestart[CLOVER_WL_MAP_ROWS];
++	uint64_t meend[CLOVER_WL_MAP_ROWS];
++	uint32_t men;
++	uint32_t mene;
+ 	char pwho[CLOVER_BB_PEER_ROWS][CLOVER_BB_SEMA_NAME];
+ 	ipc_port_t pport[CLOVER_BB_PEER_ROWS];
+ 	/*
+@@ -12361,7 +12377,30 @@
+ 				}
+ 			}
+ 			pn++;
++		}
++		/*
++		 * Round274. Still under the peer lock, which is the lock the map is walked under: walk the first
++		 * few entries of the peer's own address space. Nothing is looked up here -- the row prints the
++		 * ranges, and the host decides which one holds the frames it already has.
++		 */
++		men = 0;
++		mene = 0;
++		for (i = 0; i < CLOVER_WL_MAP_ROWS; i++) {
++			mestart[i] = 0;
++			meend[i] = 0;
+ 		}
++		if (peer->map != NULL) {
++			vm_map_entry_t me;
++
++			mene = (uint32_t)peer->map->hdr.nentries;
++			for (me = vm_map_first_entry(peer->map);
++			    me != vm_map_to_entry(peer->map) && men < CLOVER_WL_MAP_ROWS;
++			    me = me->vme_next) {
++				mestart[men] = (uint64_t)me->vme_start;
++				meend[men] = (uint64_t)me->vme_end;
++				men++;
++			}
++		}
+ 		lck_mtx_unlock(&peer->lock);
+ 	}
+ 	comm[0] = '\0';
+@@ -12378,6 +12417,19 @@
+ 		return;
+ 	}
+ 	/*
++	 * Round274. The peer's own address space, printed once per fire ahead of the rows it is there to
++	 * resolve: ne= is how many entries the map has, shown= how many of them this row carries, and e0..e3 are
++	 * start-end pairs in ascending order. The reason this row exists is that boot 60's bound servicer thread
++	 * walked through four addresses that belong to no shared-cache image, and the only thing between those
++	 * four numbers and a function name is the base the binary was loaded at.
++	 */
++	printf("clover r274: map t=%llu pid=%d ne=%u shown=%u e0=%llx-%llx e1=%llx-%llx"
++	    " e2=%llx-%llx e3=%llx-%llx\n", (unsigned long long)secs, task_pid(peer), mene, men,
++	    (unsigned long long)mestart[0], (unsigned long long)meend[0],
++	    (unsigned long long)mestart[1], (unsigned long long)meend[1],
++	    (unsigned long long)mestart[2], (unsigned long long)meend[2],
++	    (unsigned long long)mestart[3], (unsigned long long)meend[3]);
++	/*
+ 	 * Round266. One user stack per distinct continuation, walked with the pmap the peer owns. The frames are
+ 	 * raw return addresses for the host to resolve, exactly as in r236's rows: the app and the shared cache
+ 	 * each carry a slide, and only this boot's slide turns them into names.
