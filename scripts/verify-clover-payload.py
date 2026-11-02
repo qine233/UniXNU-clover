@@ -1148,6 +1148,14 @@ def check_sb_sample(kernel: bytes) -> bool:
              "gpu-mapfail": b"clover r282: gpu map failed phys=%llx size=%x\n" in kernel,
              "gpu-notimer-wl": b"clover r282: gpu t=%u notimer (resource service work loop unavailable)\n" in kernel,
              "gpu-notimer-src": b"clover r282: gpu t=%u notimer (timer source refused)\n" in kernel,
+             # Round283's answer crosses the reset in IMEM, but the two lines that read the record are
+             # still strings in this image. Both are pinned because they are exclusive branches: a
+             # payload carrying only the named branch could not tell "no reset hook fired" from "the
+             # record was never read", and the unnamed line is the reading that says exactly that.
+             "reset-record-named": (b"clover r283: last reset kind=%llu pid=%llu aux=%llx pc=%llx "
+                                    b"cnt=%llu beat=%llu beatcnt=%llu text=%s\n") in kernel,
+             "reset-record-unnamed": (b"clover r283: last reset unnamed magic=%llx beat=%llu "
+                                      b"beatcnt=%llu\n") in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,

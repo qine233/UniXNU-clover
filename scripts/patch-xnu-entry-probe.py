@@ -915,6 +915,16 @@ def assemble_c(source, va, workdir, symbols):
     if reason % 8 or not any(base <= reason and reason + 8 <= base + size for base, size, _, _ in SEGMENTS):
         raise SystemExit('Invalid _clover_fastboot_reason')
     definitions.append(f'-DFASTBOOT_REASON={reason:#x}UL')
+    # Round283: the card-independent reset record. The screen resolves the writer function itself
+    # (not the slot pointer): the writer owns the layout, the first-writer rule and the null check,
+    # so the screen only names the panic and its caller. Required for the same reason as the reason
+    # pointer above -- a silently missing symbol would read as "no panic happened" on the next boot.
+    note = symbols.get('_clover_imem_note')
+    if note is None:
+        raise SystemExit('Missing _clover_imem_note: the panic screen could not record the reset')
+    if not any(base <= note and note + 4 <= base + size for base, size, _, _ in SEGMENTS):
+        raise SystemExit('Invalid _clover_imem_note')
+    definitions.append(f'-DIMEM_NOTE={note:#x}UL')
     # Round125 puts the console itself on the panic screen: the ring buffer's three counters, the flags
     # that make console_write() drop bytes silently, and the one tty this board has. `console_ring` is
     # file-static in osfmk/console/serial_console.c, but this kernel carries STABS, so llvm-nm still

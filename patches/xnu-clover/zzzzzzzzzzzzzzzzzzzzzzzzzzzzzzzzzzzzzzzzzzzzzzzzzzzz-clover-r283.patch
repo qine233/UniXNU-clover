@@ -1,0 +1,65 @@
+diff --git a/bsd/kern/kern_shutdown.c b/bsd/kern/kern_shutdown.c
+index 20d9d47..185c7a6 100644
+--- a/bsd/kern/kern_shutdown.c
++++ b/bsd/kern/kern_shutdown.c
+@@ -183,6 +183,19 @@ reboot_kernel(int howto, char *message)
+ 		panic_kernel(howto, message);
+ 	}
+ 
++	/* Clover round283: name the process that asked for this reset, in the storage driver's IMEM
++	 * slot. This runs before the shutdown machinery so a board that wedges on the way out still
++	 * carries the caller across the reset; the writer one-shots, so the later PEHaltRestart hook
++	 * does not overwrite it. Kernel threads have no bsd_info, hence the null check. */
++	{
++		extern void clover_imem_note(unsigned int, unsigned long, unsigned long, unsigned long,
++		    const char *);
++		proc_t self = current_proc();
++		clover_imem_note(3, self ? (unsigned long)proc_getpid(self) : 0,
++		    (unsigned long)howto, (unsigned long)__builtin_return_address(0),
++		    self ? &self->p_comm[0] : "");
++	}
++
+ 	if (!OSCompareAndSwap(0, 1, &system_inshutdown)) {
+ 		if ((howto & RB_QUICK) == RB_QUICK) {
+ 			goto force_reboot;
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+index d0149a6..7cf0fee 100644
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -981,6 +981,14 @@ PEInitiatePanic(void)
+ #endif // defined(__arm64__)
+ }
+ 
++/* Clover round283: every kernel-initiated halt or restart ends in the call below, and the panic
++ * screen has its own writer because it resets through PSCI without coming back here. Record the
++ * type in the storage driver's IMEM slot before any of the shutdown machinery can block. The
++ * writer no-ops when that driver has not armed the slot, and the first writer wins, so the panic
++ * screen's message survives if a restart hook follows it. */
++extern "C" void clover_imem_note(unsigned int kind, unsigned long pid, unsigned long aux,
++    unsigned long pc, const char *text);
++
+ int
+ PEHaltRestartInternal(unsigned int type, uint32_t details)
+ {
+@@ -992,6 +1000,21 @@ PEHaltRestartInternal(unsigned int type, uint32_t details)
+ 	uint32_t          timeout = kShutdownTimeout;
+ 	static boolean_t  panic_begin_called = FALSE;
+ 
++	switch (type) {
++	case kPEHaltCPU:
++	case kPEHangCPU:
++	case kPEUPSDelayHaltCPU:
++		clover_imem_note(1, 0, type, (unsigned long)__builtin_return_address(0), "");
++		break;
++	case kPERestartCPU:
++	case kPEPanicRestartCPU:
++	case kPEPanicRestartCPUNoCallouts:
++		clover_imem_note(2, 0, type, (unsigned long)__builtin_return_address(0), "");
++		break;
++	default:
++		break;
++	}
++
+ 	if (type == kPEHaltCPU || type == kPERestartCPU || type == kPEUPSDelayHaltCPU) {
+ 		/* If we're in the panic path, the locks and memory allocations required below
+ 		 *  could fail. So just try to reboot instead of risking a nested panic.

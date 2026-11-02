@@ -230,6 +230,15 @@ volatile uint32_t clover_emmc_stage = 0;
 // passes it as FASTBOOT_REASON) and writes the word through it just before PSCI SYSTEM_RESET.
 // Null means the cell is not available this boot: the screen then resets normally.
 volatile uint32_t *clover_fastboot_reason = nullptr;
+// Round283: the reset record above, published once clover_unattended_begin() has mapped IMEM. The
+// kernel's reset funnels and the panic screen write through these entry points; both check this
+// pointer, so a boot that never armed the instrument writes nothing anywhere. clover_imem_note is
+// reached by the panic screen through the patcher (IMEM_NOTE), which resolves this function's
+// address rather than the slot's, so the layout stays in one place.
+volatile uint64_t *clover_imem_record = nullptr;
+void clover_imem_note (unsigned int kind, unsigned long pid, unsigned long aux, unsigned long pc,
+                       const char *text);
+void clover_imem_heartbeat (void);
 // drivers/CloverBlock's entry points: mode 21 asks for the boot's block device, and the block run
 // itself is deferred to the IOBSD resource publication because it needs devfs and the vnode tables
 // vfsinit() builds (round113 proved the early run gets no devfs node at all).
@@ -333,6 +342,23 @@ static const uint64_t kImemSize = 0x1000ULL;
 static const uint32_t kRestartReasonOffset = 0x65c;
 static const uint32_t kRestartFastboot = 0x77665501u;
 static OSSharedPtr<IOMemoryMap> gImemMap;
+
+// Round283, who reset the board. clover.dtb claims restart_reason@65c (4 bytes) and boot_stats@6b0
+// (0x20), leaving 0x660..0x6af -- twenty words -- unclaimed by any child node. XBL on this board
+// ignores the restart-reason cell (round195), so nothing in the boot chain writes here and the words
+// survive a warm reset. A record in this gap is the only reading that does not need the card:
+// rounds 280/281 showed the flight ring can sit 11 s behind the last kernel line when the card is
+// wedged, so "the log stopped" is not the same as "the board stopped".
+//
+// Layout, twenty 64-bit words, little endian:
+//   0 magic | 1 kind | 2 pid | 3 aux | 4 pc | 5 CNTVCT | 6..8 text[24]
+//   9 beat magic | 10 beat count | 11 beat CNTVCT | 12..19 zero
+// The first writer wins (kind 1 halt, 2 restart, 3 reboot(2), 4 panic screen); the heartbeat owns
+// words 9..11 and never touches the magic, so a boot can end either with a named reset (kind != 0)
+// or with only a heartbeat (the reset did not pass through any hook this kernel knows).
+static const uint32_t kResetRecordOffset = 0x660;
+static const uint64_t kResetRecordMagic = 0x00333832564f4c43ULL;   // "CLOV283" as stored bytes
+static const uint64_t kResetBeatMagic = 0x0033383254414542ULL;     // "BEAT283" as stored bytes
 
 // Round196. The IMEM word above reads back on this board but the reset that follows does not
 // consult it: round195's panic left fb=1 in SRAM and the board came up in Android, not fastboot.
@@ -899,6 +925,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // 15 fires to the 1800 s deadline, so 64 is headroom rather than a promise; separate from
   // r281-aks so a GPU probe that starves cannot be mistaken for a keystore that went quiet.
   { "clover r282: ", "r282-gpu", 64, 0, 0, 0 },
+  // Round283 prints at most one line per boot, during the bring-up pass that arms the slot, and it
+  // is the whole reading: a reset that got a name, or the proof that none did. That pass carries the
+  // census and the GPT walk, so the per-pass cap can eat the one row the frame exists for -- and a
+  // dropped row would read exactly like a boot whose slot was never touched.
+  { "clover r283: ", "r283-reset", 16, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -4192,7 +4223,8 @@ static void teeConsumeLine (uint32_t &pushed)
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r275") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r276") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r281") ||
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r282"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r282") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r283"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.
@@ -8759,6 +8791,63 @@ extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int
   return rc;
 }
 
+// Round283. Called from the kernel's reset funnels in scheduler context and from the panic screen,
+// so: no locks, no allocation, no formatting. cntvct_el0 is the same 19.2 MHz counter the rest of
+// the board's timing uses; ISB makes the read ordered after the stores above it.
+static inline uint64_t imemCounter (void)
+{
+  uint64_t value;
+  __asm__ volatile ("isb\n\tmrs %0, cntvct_el0" : "=r" (value));
+  return value;
+}
+
+extern "C" void clover_imem_note (unsigned int kind, unsigned long pid, unsigned long aux,
+                                  unsigned long pc, const char *text)
+{
+  volatile uint64_t *record = clover_imem_record;
+  if (record == nullptr || record[0] == kResetRecordMagic) {
+    // Nothing mapped, or somebody already named this reset. First writer wins so the panic screen
+    // keeps the message that explains a panic even if a later restart hook follows it.
+    return;
+  }
+  record[1] = kind;
+  record[2] = pid;
+  record[3] = aux;
+  record[4] = pc;
+  record[5] = imemCounter ();
+  volatile unsigned char *bytes = reinterpret_cast<volatile unsigned char *> (record + 6);
+  unsigned int i = 0;
+  if (text != nullptr) {
+    for (; i < 24; ++i) {
+      const unsigned char c = static_cast<unsigned char> (text[i]);
+      bytes[i] = c;
+      if (c == 0) {
+        break;
+      }
+    }
+  }
+  for (; i < 24; ++i) {
+    bytes[i] = 0;
+  }
+  __asm__ volatile ("dsb sy" ::: "memory");
+  record[0] = kResetRecordMagic;
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+// One timer tick, no card: the last CNTVCT here is the last moment the board executed the clock's
+// interrupt path. Words 9..11 only, so the reset writer's magic and text are never disturbed.
+extern "C" void clover_imem_heartbeat (void)
+{
+  volatile uint64_t *record = clover_imem_record;
+  if (record == nullptr) {
+    return;
+  }
+  record[9] = kResetBeatMagic;
+  record[10] = record[10] + 1;
+  record[11] = imemCounter ();
+  __asm__ volatile ("dsb st" ::: "memory");
+}
+
 // Round147: arm the unattended contract. Called from CloverPMGR right after it publishes its nub,
 // which is the first point in this boot with working IOKit mapping -- before launchd and before
 // anything that can panic for a reason worth reading. This half only makes resets land in fastboot;
@@ -8782,6 +8871,40 @@ extern "C" void clover_unattended_begin (void)
            static_cast<unsigned long long> (kImemPhys));
     return;
   }
+  // Round283: one line per boot, before anything else uses the slot. The record belongs to the
+  // previous boot; the heartbeat belongs to the same one and says how far its timer got even when
+  // no reset hook fired. "empty" is itself a reading: it means the board came back through a path
+  // that never reached this kernel's funnels, or it reset before this function armed the slot.
+  volatile uint64_t *record = reinterpret_cast<volatile uint64_t *> (base + kResetRecordOffset);
+  const uint64_t recordMagic = record[0];
+  const uint64_t beats = record[10];
+  const uint64_t beatCounter = record[11];
+  if (recordMagic == kResetRecordMagic) {
+    char text[25];
+    const volatile unsigned char *bytes = reinterpret_cast<const volatile unsigned char *> (record + 6);
+    unsigned int i = 0;
+    for (; i < 24; ++i) {
+      text[i] = bytes[i] ? static_cast<char> (bytes[i]) : 0;
+      if (text[i] == 0) {
+        break;
+      }
+    }
+    text[i] = 0;
+    IOLog ("clover r283: last reset kind=%llu pid=%llu aux=%llx pc=%llx cnt=%llu beat=%llu beatcnt=%llu text=%s\n",
+           static_cast<unsigned long long> (record[1]), static_cast<unsigned long long> (record[2]),
+           static_cast<unsigned long long> (record[3]), static_cast<unsigned long long> (record[4]),
+           static_cast<unsigned long long> (record[5]), static_cast<unsigned long long> (beats),
+           static_cast<unsigned long long> (beatCounter), text);
+  } else {
+    IOLog ("clover r283: last reset unnamed magic=%llx beat=%llu beatcnt=%llu\n",
+           static_cast<unsigned long long> (recordMagic), static_cast<unsigned long long> (beats),
+           static_cast<unsigned long long> (beatCounter));
+  }
+  for (unsigned int i = 0; i < 20; ++i) {
+    record[i] = 0;
+  }
+  clover_imem_record = record;
+  __asm__ volatile ("dsb sy" ::: "memory");
   volatile uint32_t *cell = reinterpret_cast<volatile uint32_t *> (base + kRestartReasonOffset);
   cell[0] = kRestartFastboot;
   __asm__ volatile ("dsb sy" ::: "memory");

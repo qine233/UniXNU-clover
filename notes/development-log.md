@@ -21427,3 +21427,58 @@ SM8550 的 `0xc400000` 系地址，clover 的 SPMI 窗口是 SDM660 的另一组
 `clover_unattended_begin` 在下次启动时把它读回来印一行再清零。**有记录 = 软件路径点名了它；
 没有记录 = 复位不经过内核任何已知入口，下一步再往 PSCI 之外找。**
 
+
+## r283 落地（v0.6.78）：让复位在卡外留一句话，第一次写入者胜出
+
+**① 为什么是 IMEM 的 0x660。** r281 把「谁复位了板子」逼到两个否证之间：APSS WDT 从未武装（`en=0 armed=0`），
+而卡通道最后一条 entry 比内核最后一行早 11.3 s——卡上的记录可能比板子先死。r148 已经在同一页 IMEM
+（`0x146bf000`，4 KiB 映射，cache-inhibited `mapRange`）用 `0x65c` 放 fastboot 单元；DT 里只有
+`restart_reason@65c` 与 `boot_stats@6b0`，中间的 `0x660..0x6af` 20 个字没有节点认领。r283 就放在这里：
+**不需要新映射，复位也带不走。**
+
+**② 记录形状与「第一次写入者胜出」。** 20 字：`0` magic `CLOV283`（`0x00333832564f4c43`）、`1` kind、`2` pid、
+`3` aux（halt/restart 的 type 或 `reboot(2)` 的 howto）、`4` caller pc、`5` CNTVCT、`6..8` 24 字节文本；
+`9` 心跳 magic `BEAT283`（`0x0033383254414542`）、`10` 计数、`11` 最后 CNTVCT；`12..19` 留空。
+`clover_imem_note` 先读 `record[0]`，已经是 magic 就直接返回——panic 屏写下 panic 文本后，
+`PEHaltRestartInternal` 的 restart 钩子不会把它换成一行没有信息的 type。
+
+**③ 三个写入者，各自在漏斗上。** `PEHaltRestartInternal`（`iokit/Kernel/IOPlatformExpert.cpp`）按 type
+分 halt(1)/restart(2)，带 `__builtin_return_address(0)`；`reboot_kernel`（`bsd/kern/kern_shutdown.c`）
+记 kind 3、`proc_getpid(current_proc())`、`howto` 与 `p_comm[0]`（内核线程 `bsd_info == NULL` 时 pid 记 0）；
+panic 屏在 `msr daifset, #15` 之后、画屏之前记 kind 4 和 `fmt` 的前 24 字节——它用自己的 PSCI SMC 复位，
+不会回到 `PEHaltRestartInternal`，所以必须有第四个写手。patcher 解析 `_clover_imem_note` 并传
+`-DIMEM_NOTE=`，缺符号就退出，不会静默编成空操作。
+
+**④ 心跳只碰 9..11。** `ArmCpu::interrupt` 里 CPU0（`(logicalId & 7) == 0`）每 tick 调
+`clover_imem_heartbeat`，只写 beat magic、自增计数、刷新 CNTVCT。四核都写会把计数变成墨迹；写 0..8
+会与一次性记录赛跑。心跳的价值是**卡外的时间**：上一靴最后一次 tick 的 CNTVCT 与计数，和记录里的
+CNTVCT 一起，能在板子没来得及落卡时说出「停止执行前还跑了多久」。
+
+**⑤ 读回顺序。** `clover_unattended_begin` 在 `mapRange` 成功之后、写 `0x65c` 之前：读 magic/beat/文本 →
+打一行 `clover r283: last reset kind=... pid=... aux=... pc=... cnt=... beat=... beatcnt=... text=...`
+或 `clover r283: last reset unnamed magic=... beat=... beatcnt=...` → **清 20 个字** → 发布
+`clover_imem_record` 指针 → `dsb sy` → 再写 fastboot 单元。读在清之前、指针在清之后，checker 按这个
+下标顺序断言（`last reset kind` < `for (i < 20)` < `clover_imem_record = record`）。
+
+**⑥ tee 类。** 这一行按 r251 的教训走独立类：`{ "clover r283: ", "r283-reset", 16 }` 并加入每趟豁免。
+武装那一趟同时扛着普查与 GPT 走查，被每趟 16 次写上限吃掉的那行会与「槽从未被碰过」同形——
+而这一行就是整轮唯一的读数。
+
+**⑦ 构建与闸门（v0.6.78）。** 52 个 z 的补丁 `zzzz…-clover-r283.patch` 坐 LATE_PATCH 首位，仓库与
+`UniXNU/patches/xnu/` 两份 `cmp` 相同；`check-clover.py` 新增 r283 块（`0x660`、两个 magic、一次性
+守卫、心跳三字、读/清/发布顺序、两行格式串、tee 类与豁免、ArmCpu 调用与 CPU0 门、panic 屏
+`IMEM_NOTE`/`imem_note (caller, fmt)`、patcher `-DIMEM_NOTE=`、补丁六条钩子与两棵补丁树字节相等、
+LATE_PATCH 顺序），两处 title 断言升到 r283。第一次跑 checker 时被自家契约拦下：r283 标题里没有
+双引号（boot 35/36 的转义事故要求每轮标题都带一个）——把 `"unnamed"` 加进标题后绿。
+内核 `65e9c08b…` → AMFI 两刀仍在 file `0x1ad20e4` / `0x1ad216c`，`c6af79b0…` → 归一化
+`71c5ecfa…`（973 个 object 戳清零）→ payload 卷内 kernel `48d6a065…`（52 346 880 字节，入口探针
+7019 字节 / 37 段）、ADT `60d5b6bf…`（14 384 字节）、`unixnu.toml` `ce19d411…`（1888 字节）、
+trustcache `7c369ce0…`、data 种子 `614b8356…`；镜像 `ae909772…`，归档
+`~/clover-out/round283-v0.6.78-payload.img`。`verify-clover-payload.py` exit=0（50 组 OK，含新增
+`reset-record-named` / `reset-record-unnamed`，无 FAIL）。`verify-userdata-window.py` 本轮不适用：
+userdata 镜像、trustcache 与 data 种子的字节都没变，这一靴只冷刷 cache。
+
+**⑧ 下一靴怎么读。** r283 是 boot 71（文件 `boot72-r283.bin`）：先找 `clover r283: last reset ...`。
+`kind=1/2/3/4` 分别点名 halt/restart/reboot(2)/panic 屏，pid 与 text 直接把路径说完；
+`unnamed` 加 `beat` 非零则说明复位没经过内核任何已知入口（下一轮去 PSCI/固件）；
+`unnamed` 且 `beat=0` 则可能复位发生在武装之前，这行本身会证明该靴没有武装过。

@@ -3071,6 +3071,123 @@ def check_board(errors: list) -> str:
             errors.append("the r282 rows are not exempt from the per-pass push cap: the GPU timer can fire "
                           "beside the census burst, where boot 36 measured the cap eating exactly that")
 
+        # Round283 asks the question boot 69 left open: which software path, if any, resets the board.
+        # The r281 read showed the APSS watchdog never armed and the card's last write 11 s older than
+        # the kernel's last line, so the answer has to live somewhere the reset cannot take away. The
+        # slot is twenty words in IMEM's unclaimed 0x660 gap -- the same cache-inhibited page the
+        # restart-reason cell already uses -- and the contract is first-writer-wins so the panic
+        # screen's message survives a later restart hook. The heartbeat is a separate writer that
+        # never touches words 0..8, which is what keeps a named reset from being overwritten by the
+        # pulse that follows it.
+        if "static const uint32_t kResetRecordOffset = 0x660;" not in sdhci_source:
+            errors.append("CloverSdhci.cpp does not place the reset record at 0x660: the slot has to be "
+                          "inside the already-mapped IMEM page, in the gap the DT leaves unclaimed")
+        if "static const uint64_t kResetRecordMagic = 0x00333832564f4c43ULL;" not in sdhci_source:
+            errors.append("CloverSdhci.cpp's reset-record magic is not the r283 word: a record read back "
+                          "under a different magic is a slot another writer owns")
+        if "static const uint64_t kResetBeatMagic = 0x0033383254414542ULL;" not in sdhci_source:
+            errors.append("CloverSdhci.cpp's beat magic is not the r283 word: the heartbeat is the only "
+                          "card-free evidence of how far the previous boot's timer got")
+        if "if (record == nullptr || record[0] == kResetRecordMagic) {" not in sdhci_source:
+            errors.append("clover_imem_note does not stop at first writer: a restart hook after the panic "
+                          "screen would replace the message that explains the reset")
+        note_at = sdhci_source.find("extern \"C\" void clover_imem_note")
+        beat_at = sdhci_source.find("extern \"C\" void clover_imem_heartbeat (void)")
+        if note_at < 0 or beat_at < 0:
+            errors.append("CloverSdhci.cpp lacks clover_imem_note or clover_imem_heartbeat: the kernel's "
+                          "reset hooks and ArmCpu both call them by name")
+        else:
+            beat_body = sdhci_source[beat_at:beat_at + 900]
+            if "record[9] = kResetBeatMagic;" not in beat_body or \
+                    "record[10] = record[10] + 1;" not in beat_body or \
+                    "record[11] = imemCounter ();" not in beat_body:
+                errors.append("clover_imem_heartbeat does not write exactly words 9..11: any other index "
+                              "would race the one-shot reset record")
+            for index in ("record[0]", "record[1]", "record[2]"):
+                if index in beat_body:
+                    errors.append(f"clover_imem_heartbeat writes {index}: the pulse must not disturb the "
+                                  "reset record it runs beside")
+        read_at = sdhci_source.find("clover r283: last reset kind=")
+        clear_at = sdhci_source.find("for (unsigned int i = 0; i < 20; ++i) {")
+        arm_at = sdhci_source.find("clover_imem_record = record;")
+        if not (0 <= read_at < clear_at < arm_at):
+            errors.append("clover_unattended_begin does not read the record, clear twenty words and only "
+                          "then arm the pointer: a later order would erase the reading before it is printed")
+        for needle in ("\"clover r283: last reset kind=%llu pid=%llu aux=%llx pc=%llx cnt=%llu "
+                       "beat=%llu beatcnt=%llu text=%s\\n\"",
+                       "\"clover r283: last reset unnamed magic=%llx beat=%llu beatcnt=%llu\\n\""):
+            if needle not in sdhci_source:
+                errors.append(f"CloverSdhci.cpp lacks {needle[:48]!r}: kind and the unnamed line are the "
+                              "two halves of this round's answer")
+        if '{ "clover r283: ", "r283-reset", 16, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the r283 line: the bring-up pass also "
+                          "carries the census, and the one row this round exists for would be capped away")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r283")' not in sdhci_source:
+            errors.append("the r283 line is not exempt from the per-pass push cap: a capped round would "
+                          "read exactly like a boot whose slot was never touched")
+
+        arm_cpu_source = (REPO / "drivers/ArmCpu/ArmCpu.cpp").read_text()
+        if 'extern "C" void clover_imem_heartbeat (void);' not in arm_cpu_source or \
+                "clover_imem_heartbeat ();" not in arm_cpu_source:
+            errors.append("ArmCpu does not stamp the IMEM heartbeat: without it an unnamed reset cannot "
+                          "say whether the board was still taking timer ticks when it went")
+        if "if ((logicalId & 7) == 0) {\n        clover_imem_heartbeat ();\n      }" not in arm_cpu_source:
+            errors.append("ArmCpu's heartbeat is not gated on CPU0: four cores racing one counter would "
+                          "turn the count into ink rather than a clock")
+
+        panic_source = (REPO / "scripts/xnu-panic-screen.c").read_text()
+        for needle in ("#define IMEM_KIND_PANIC 4u",
+                       "(IMEM_KIND_PANIC, 0UL, 0UL, (unsigned long)pc, fmt);",
+                       "imem_note (caller, fmt);"):
+            if needle not in panic_source:
+                errors.append(f"xnu-panic-screen.c lacks {needle[:44]!r}: a panic screen that resets "
+                              "through its own SMC must still name itself before it goes")
+        patcher_source = (REPO / "scripts/patch-xnu-entry-probe.py").read_text()
+        if "note = symbols.get('_clover_imem_note')" not in patcher_source or \
+                "definitions.append(f'-DIMEM_NOTE={note:#x}UL')" not in patcher_source:
+            errors.append("patch-xnu-entry-probe.py does not resolve _clover_imem_note into IMEM_NOTE: "
+                          "the panic screen's note would compile to a no-op")
+
+        r283_name = "z" * 52 + "-clover-r283.patch"
+        r283_patch = next((base / "patches/xnu-clover" / r283_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r283_name).is_file()), None)
+        if r283_patch is None:
+            errors.append(f"patches/xnu-clover/{r283_name} is missing: the three reset funnels would "
+                          "run unpatched and every reset would read as unnamed")
+        else:
+            r283_text = r283_patch.read_text()
+            for needle in ("case kPEHaltCPU:",
+                           "case kPEHangCPU:",
+                           "case kPEUPSDelayHaltCPU:",
+                           "case kPERestartCPU:",
+                           "case kPEPanicRestartCPU:",
+                           "case kPEPanicRestartCPUNoCallouts:",
+                           'clover_imem_note(1, 0, type, (unsigned long)__builtin_return_address(0), "");',
+                           'clover_imem_note(2, 0, type, (unsigned long)__builtin_return_address(0), "");',
+                           "clover_imem_note(3, self ? (unsigned long)proc_getpid(self) : 0,",
+                           "(unsigned long)howto",
+                           "&self->p_comm[0]"):
+                if needle not in r283_text:
+                    errors.append(f"{r283_name} lacks {needle[:60]!r}: halt, restart and reboot(2) are "
+                                  "the three funnels this round needs a name from")
+            if "PEHaltRestartInternal" not in r283_text or "reboot_kernel" not in r283_text:
+                errors.append(f"{r283_name} does not hook PEHaltRestartInternal and reboot_kernel: the "
+                              "reset path has to be named at its funnel, not at a caller")
+            load_r283 = REPO.parent / "UniXNU" / "patches" / "xnu" / r283_name
+            if not load_r283.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r283_name} is missing: unixnu loads patches from "
+                              "there and silently skips one that lives only in this repo")
+            elif load_r283.read_bytes() != r283_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r283_name} is not the same bytes as this repo's "
+                              "copy: the two trees would compile different kernels")
+            late_script = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in late_script.splitlines() if "clover-r2" in line)
+            if (late_list.find(r283_name) < 0 or
+                    late_list.find(r283_name) > late_list.find("z" * 51 + "-clover-r277.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r283 before r277 in LATE_PATCH: "
+                              "the compile pass would run on a tree this patch was not written against")
+
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -4376,8 +4493,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r282:"):
-        errors.append('[payload] title is not "clover r282: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r283:"):
+        errors.append('[payload] title is not "clover r283: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5490,8 +5607,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r282:"):
-        errors.append('[payload] title is not "clover r282: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r283:"):
+        errors.append('[payload] title is not "clover r283: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

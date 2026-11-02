@@ -17,6 +17,10 @@ extern "C" void rtclock_intr (unsigned int);
 // Round210: the storage driver's flight beat. This is the one clock that outlives the block layer,
 // so CPU0's tick is where the controller gets sampled when nothing else is running.
 extern "C" void clover_emmc_flight_beat (void);
+// Round283: the card-independent beat. IMEM survives the reset that takes the board away, so the
+// last value here is the last tick the clock actually delivered -- the one reading a wedged card
+// cannot lag. Null until the storage driver maps the slot, which is why the call is unconditional.
+extern "C" void clover_imem_heartbeat (void);
 extern "C" void clover_emmc_flight_deadline (unsigned long long seconds, unsigned long long ticks,
                                              unsigned long long cnt0, unsigned long long cnt1,
                                              unsigned long long freq);
@@ -637,6 +641,11 @@ void ArmCpu::interrupt (void)
       armcpu_irq_phase=2;
       rtclock_intr (0);
       armcpu_irq_phase=3;
+      // Round283: CPU0 stamps the tick in IMEM before anything below can panic. One writer, so the
+      // beat is a count of delivered ticks, not a race between cores.
+      if ((logicalId & 7) == 0) {
+        clover_imem_heartbeat ();
+      }
       // Round147 comes first: it is a wall-clock promise, and its message names the contract rather
       // than a tick count. The deadline is measured from the first tick, so it describes silence
       // after the clock started, not time spent in arm_init before that.

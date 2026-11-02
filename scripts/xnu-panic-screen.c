@@ -82,6 +82,16 @@ struct ctx {
 #define FASTBOOT_REASON 0UL
 #endif
 #define FASTBOOT_WORD 0x77665501u
+
+/* Round283: the same driver publishes a record slot in IMEM's unclaimed gap at 0x660, and this
+ * note is the function that fills it. The patcher resolves clover_imem_note and passes its address
+ * here; the function itself checks the published slot, so a panic before that driver armed the
+ * instrument writes nothing. kind 4 means "the panic screen reached the reset"; the first 24 bytes
+ * of the panic format string go with it, which is enough to name the path without the card. */
+#ifndef IMEM_NOTE
+#define IMEM_NOTE 0UL
+#endif
+#define IMEM_KIND_PANIC 4u
 /* How long the finished screen stays up before PSCI SYSTEM_RESET. The record is
  * already on the card by then; this is time for a photograph. */
 #define PANIC_RESET_SECONDS 20
@@ -216,6 +226,18 @@ static int mapped (u64 a)
   u64 par;
   __asm__ volatile ("at s1e1w, %1\n\tisb\n\tmrs %0, par_el1" : "=r" (par) : "r" (a) : "memory");
   return !(par & 1);
+}
+
+/* The card-independent half of the panic reading. The driver's writer does the bounds and the
+ * first-writer rule; here only the call itself can fail, and a macro of 0 says this build has no
+ * writer. Called before anything is drawn, so a screen that faults later still leaves the path. */
+static void imem_note (u64 pc, const char *fmt)
+{
+  if (IMEM_NOTE == 0UL) {
+    return;
+  }
+  ((void (*) (unsigned int, unsigned long, unsigned long, unsigned long, const char *))IMEM_NOTE)
+    (IMEM_KIND_PANIC, 0UL, 0UL, (unsigned long)pc, fmt);
 }
 
 /* arm_vm_init installs the kernel's own translation tables, and the seeded
@@ -462,6 +484,9 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   u32 row, col, fb;
 
   __asm__ volatile ("msr daifset, #15");
+  /* Before the panel, the map checks, and the card: a panic is a named reset even on a board whose
+   * storage is exactly what stopped answering. */
+  imem_note (caller, fmt);
   g.base = (u8 *)v->v_baseaddr;
   g.rb   = v->v_rowbytes;
   g.w    = v->v_width;
