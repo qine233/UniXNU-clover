@@ -1132,22 +1132,36 @@ def check_sb_sample(kernel: bytes) -> bool:
              # Both earlier shapes have to be gone: they would spend ring space on readings the ring drops anyway.
              "aks-say-r280-gone": b"clover r280: " not in kernel,
              "aks-say-r279-gone": b"clover r279: " not in kernel,
-             # Round282 starts the GPU line beside the desktop with a read-only row. Five literals, because
-             # the refusal arms are readings too: a payload that carries the GCC row but not the skip arm
-             # would leave "the AHB vote was off" indistinguishable from "the string was never linked". The
-             # GPUCC row is the second half and stands on its own; the two map/no-timer arms say why a row
-             # that should be there is not.
-             "gpu-row-gcc": (b"clover r282: gpu t=%u fire=%u gcc gpu_ahb=%u gpu_bimc=%u bimc=%u "
+             # Round286 takes the GPU line from read-only to power-on: GDSC cx then gx, the AHB/CFG
+             # votes, the gfx3d branch enable, then a read-back of the GDSCRs and a gated chipid read.
+             # The literals are pinned as whole strings because the refusal arms are readings too: a
+             # payload that carries the gcc row but not the skip arm would leave "the AHB vote was off"
+             # indistinguishable from "the string was never linked", and a payload missing the chipid
+             # row or its skipped arm would leave the round's acceptance to be inferred. The map and
+             # no-timer arms say why a row that should be there is not; r282's rows have to be gone
+             # because this round writes what that one only read.
+             "gpu-row-gcc": (b"clover r286: gpu t=%u fire=%u gcc gpu_ahb=%u gpu_bimc=%u bimc=%u "
                              b"ctl_sdhc1_ahb=%u ctl_sdhc1_apps=%u raw ahb=%08x ctl=%08x\n") in kernel,
-             "gpu-row-skip": (b"clover r282: gpu t=%u gpucc skipped ahb=%u raw=%08x (GPUCC access needs the "
+             "gpu-row-gcc-post": (b"clover r286: gpu t=%u gcc post gpu_ahb=%u gpu_bimc=%u bimc=%u "
+                                  b"raw ahb=%08x bimc_gfx=%08x bimc=%08x\n") in kernel,
+             "gpu-row-skip": (b"clover r286: gpu t=%u gpucc skipped ahb=%u raw=%08x (GPUCC access needs the "
                               b"gcc_gpu_cfg_ahb vote)\n") in kernel,
-             "gpu-row-gpucc": (b"clover r282: gpu t=%u gpucc cx=%08x cxhw=%08x cx_on=%u cx_collapse=%u "
-                               b"gx=%08x gx_on=%u gx_collapse=%u gfx3d_en=%u cxo_en=%u rcg=%08x dom=%08x "
-                               b"sw=%08x\n") in kernel,
-             "gpu-row-mapfail": b"clover r282: gpu t=%u gpucc map failed phys=%llx\n" in kernel,
-             "gpu-mapfail": b"clover r282: gpu map failed phys=%llx size=%x\n" in kernel,
-             "gpu-notimer-wl": b"clover r282: gpu t=%u notimer (resource service work loop unavailable)\n" in kernel,
-             "gpu-notimer-src": b"clover r282: gpu t=%u notimer (timer source refused)\n" in kernel,
+             "gpu-row-gpucc-pre": (b"clover r286: gpu t=%u gpucc pre cx=%08x cxhw=%08x cx_on=%u "
+                                   b"cx_collapse=%u gx=%08x gx_on=%u gx_collapse=%u gfx3d_en=%u cxo_en=%u "
+                                   b"rcg=%08x dom=%08x sw=%08x\n") in kernel,
+             "gpu-row-gpucc-post": (b"clover r286: gpu t=%u gpucc post cx=%08x cxhw=%08x cx_on=%u "
+                                    b"cx_collapse=%u gx=%08x gx_on=%u gx_collapse=%u gfx3d_en=%u cxo_en=%u "
+                                    b"rcg=%08x dom=%08x sw=%08x\n") in kernel,
+             "gpu-row-gdsc": (b"clover r286: gpu t=%u gdsc cx_on=%u gx_on=%u gfx3d_en=%u cx=%08x cxhw=%08x "
+                              b"gx=%08x\n") in kernel,
+             "gpu-row-chipid": b"clover r286: gpu t=%u chipid=%08x expect=%08x ok=%u\n" in kernel,
+             "gpu-row-chipid-skip": b"clover r286: gpu t=%u chipid skipped cx_on=%u gx_on=%u gfx3d_en=%u\n" in kernel,
+             "gpu-row-coremapfail": b"clover r286: gpu t=%u core map failed phys=%llx\n" in kernel,
+             "gpu-row-mapfail": b"clover r286: gpu t=%u gpucc map failed phys=%llx\n" in kernel,
+             "gpu-mapfail": b"clover r286: gpu map failed phys=%llx size=%x\n" in kernel,
+             "gpu-notimer-wl": b"clover r286: gpu t=%u notimer (resource service work loop unavailable)\n" in kernel,
+             "gpu-notimer-src": b"clover r286: gpu t=%u notimer (timer source refused)\n" in kernel,
+             "gpu-r282-gone": b"clover r282: " not in kernel,
              # Round283's answer crosses the reset in IMEM, but the two lines that read the record are
              # still strings in this image. Both are pinned because they are exclusive branches: a
              # payload carrying only the named branch could not tell "no reset hook fired" from "the

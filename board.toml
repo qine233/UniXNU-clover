@@ -191,7 +191,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r285: the deadline comes off and the boot runs as-is. Every frame since round228 answered 1800 s -- the deadline fired before the boot finished, so the reading was always the deadline's, never the boot's. This round asks round149's question again, with a boot that now gets past launchd: how far does iPadOS get when \"nothing interrupts it\". With clover-unattended= absent, nothing arms: no deadline panic, no 20 s panic-screen reset, no flight-beat card writes. A hang is silent and the panel -- or the desktop, if it presents -- is the only stop, so reading this boot back needs a hand on the tablet."
+title = "clover r286: the GPU line powers on for real. Round282 only read; this round writes the vendor \"power-on\" sequence -- the gcc_gpu_cfg_ahb vote (the clock the vendor enables before any GPUCC access, with gcc_gpu_bimc_gfx and gcc_bimc_gfx beside it), then GDSC cx and gx each mirroring gdsc.c's init + toggle (clear SW_COLLAPSE, poll PWR_ON), then the gfx3d branch enable -- reads every GDSCR back, and reads chipid at 0x05010200 gated on cx-on && gx-on && gfx3d-enabled, checked against a512's 0x05010200. The RCG is deliberately not reprogrammed: a branch enable and a rate this round did not set are two different answers. The desktop stays CPU-first; this is bring-up forensics, not a driver."
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2365,21 +2365,24 @@ kernel_args = [
   # and no reading depends on having spoken late. Nothing is re-run -- one bus transaction set per boot,
   # many readings of it.
   "clover-input=3",
-  # Round282 starts the GPU line beside the desktop instead of in front of it, as the user asked.
-  # "Write an Adreno driver" is not a next step: this board has never read one GPU register, and the
-  # two facts a first driver depends on are unmeasured -- whether GPUCC is clocked at all (the
-  # vendor probe enables `gcc_gpu_cfg_ahb_clk` first, "used for all GPUCC register access") and
-  # whether the firmware left the two GPU GDSCs up. So this round reads, and only reads:
-  #   `clover r282: gpu t= fire= gcc gpu_ahb= gpu_bimc= bimc= ctl_sdhc1_ahb= ctl_sdhc1_apps= raw ...`
+  # Round286 takes the GPU line from reading to power-on, beside the desktop as the user asked.
+  # "Write an Adreno driver" is still not the next step; this round powers and clocks the core and
+  # then identifies it, and stops there. The sequence mirrors the vendor's: vote gcc_gpu_cfg_ahb
+  # (the clock the vendor enables before any GPUCC access, with gcc_gpu_bimc_gfx and gcc_bimc_gfx
+  # beside it), then GDSC cx and gx (clear SW_COLLAPSE, poll PWR_ON, per gdsc.c's init + toggle),
+  # then the gfx3d branch enable. Rows:
+  #   `clover r286: gpu t= fire= gcc gpu_ahb= gpu_bimc= bimc= ctl_sdhc1_ahb= ctl_sdhc1_apps= raw ...`
   #    -- the two eMMC branches are the positive control, read from the same page on every boot;
-  #   `clover r282: gpu ... gpucc cx= cxhw= cx_on= cx_collapse= gx= gx_on= gx_collapse= gfx3d_en=
-  #    cxo_en= rcg= dom= sw=` -- only when that AHB vote reads 1, because GPUCC access is unsafe
-  #    without it; a whole word of 0xffffffff is a bus that did not answer, not a vote of zero;
-  #   `clover r282: gpu ... gpucc skipped` / `gpucc map failed` -- refusals are readings too.
-  # No write, no GPU core (0x05000000), no SMMU and no chipid: reaching the core safely needs GX and
-  # the gfx3d root clock, which this round deliberately does not control. The row repeats every
-  # 120 s from 240 s for the same reason r281's does -- a single speaking time only describes the
-  # boots that outlive it. Design and decision criteria: notes/gpu-bringup.md.
+  #   `clover r286: gpu ... gcc post ...` -- the three votes read back after the write;
+  #   `clover r286: gpu ... gpucc pre ...` / `gpucc post ...` -- the GDSCRs before and after; the
+  #    hw-ctrl syscon is CX's status bit, and a whole word of 0xffffffff is a bus that did not
+  #    answer, not a vote of zero;
+  #   `clover r286: gpu ... gdsc cx_on= gx_on= gfx3d_en= cx= cxhw= gx=` -- the write's own result;
+  #   `clover r286: gpu ... chipid= expect= ok=` -- read only when cx-on && gx-on && gfx3d-enable,
+  #    checked against a512's 0x05010200; `chipid skipped` names the gate that did not open.
+  # The RCG command word (0x1070) is deliberately NOT reprogrammed -- a branch enable and a rate
+  # this round did not set are two different answers -- and the GPU core (0x05000000) is mapped only
+  # behind the gate. Design and decision criteria: notes/gpu-bringup.md.
   "clover-gpu=1",
   # Round182 puts drivers/CloverPower on the SPMI arbiter, and mode 3 is the one worth booting for.
   # Mode 1 is the pure-read control: map core/chnls-cnfg/obsrvr/intr, decode the version and walk the

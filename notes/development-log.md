@@ -21550,3 +21550,46 @@ title ok、kernel ok、deadline ok=absent）。`verify-userdata-window.py` 不�
 是唯一的停点，读回需要一只手在平板上（adb 若桌面呈现、或 fastboot 手动回 rec）。判据：iPadOS 走到
 多远、有没有挂在哪一步；boot 72 的 IMEM 记录若存在，就是这轮「什么都不打断」的真实落点。这一轮
 故意不装任何看门狗，所以它留下的不是死线的读数，而是靴子自己的读数。
+
+---
+
+## r286（v0.6.81）—— GPU 线真上电：写厂商序列 + 读回 + chipid
+
+**① 这轮修什么。** r282 只读了 GCC/GPUCC，一个字没写。桌面那一格 CPU-first 继续，GPU 线并行走
+notes/gpu-bringup.md 的第 2 步：真上电——把厂商的 GDSC/时钟序列写下去，读回每一个 GDSCR，并在
+cx-on && gx-on && gfx3d-enable 全开时读 chipid（0x05010200，对 a512 的 0x05010200）。r282 的教训
+是「一个字全 0xffffffff 是总线没应答，不是投票为零」，所以这轮写完之后每个寄存器都读回、每格都印。
+
+**② 修法。** `CloverGpu.cpp` 全重写，`GpuRegs.h` 补 GDSC 写位与 GPU 核常量。新增四个写助手
+（`clover_gpu_write`/`set_bits`/`clear_bits`/`update_bits`）都走同一个 `clover_gpu_write()`，所以
+checker 的「不许直接下标」纪律照旧成立（扩到 `clover_gpu_core[`）。上电序列 `clover_gpu_power_on`：
+先 `set_bits` GCC 的三票（`gcc_gpu_cfg_ahb` 0x71004、`gcc_gpu_bimc_gfx` 0x71010、`gcc_bimc_gfx`
+0x7106c，都置 bit0），读回；`(ahb & 1)==0 || ahb==0xffffffff` 则打 `gpucc skipped` 并返回（下个
+节拍重试）。然后开 gpucc，`clover_gpu_gdsc_on(cx, 0x1004, 0x1008, has_hw_ctrl=true)` 与
+`(gx, 0x1094, 0x1094, false)`——各镜像 gdsc.c 的 `gdsc_init`（清 HW_CONTROL+SW_OVERRIDE、写
+EN_REST_WAIT/EN_FEW_WAIT/CLK_DIS_WAIT 三个等待字段）加 `gdsc_toggle_logic(true)`（清 SW_COLLAPSE、
+在状态寄存器上轮询 PWR_ON bit31），轮询是有界自旋 `CLOVER_GPU_GDSC_SPIN 100000`（本板这个时刻没有
+可睡的定时器，是 CloverPower `pa_wait` 的老规矩，不是 IODelay）。最后 `set_bits` gfx3d 0x1098 bit0。
+RCG **故意不重编**——分支使能与这一轮没设的速率是两回事，raw 报出。chipid 读在 `clover_gpu_report_chipid`
+里，闸门是 cx-on && gx-on && gfx3d-enable，未开则打 `chipid skipped` 并点名哪个门没开。
+
+**③ 契约。** `check-clover.py` GPU 块翻成写纪律：新常量（`kGpuPhys 0x05000000`、`kGpuChipid 0x10200`、
+`kGpuChipidValue 0x05010200`、`kGdscHwControl`、`kGdscSwOverride`、三个等待掩码）、`withRange(kGpuPhys,
+kGpuSize)`、三个写调用点、`chipid` 相关行全部钉死；直接下标白名单扩到三窗。tee 类与豁免前缀
+r282→r286（CloverSdhci）。`verify-clover-payload.py` 换成 13 条 r286 字面量 + 反向 `gpu-r282-gone`
+（r282 串必须消失）。board.toml 标题升 r286、带 `"power-on"` 双引号（boot 35/36 转义事故规矩），
+`clover-gpu=1` 仍在场，`clover-unattended=` 保持缺席（r285 起的规矩，不装任何看门狗）。
+
+**④ 构建与闸门（v0.6.81）。** 内核重建（archive 16/16 CloverGpu 编过）→ AMFI 两刀照旧在
+0x1ad30e4/0x1ad316c → 归一化 973 戳清零（`c5bdb26e…`）→ payload。第一次过 `check-clover.py` 被我
+自己两处绊住：CloverGpu.cpp 注释里写了字面 `clover_gpu_gcc[`（撞了「不许直接下标」的针，改措辞）；
+board.toml 标题没带双引号（补 `"power-on"`）。改完 payload 重打（标题进 `unixnu.toml` 清单，先打的那
+份标题是旧的）。最终：`check-clover.py` exit=0、`verify-clover-payload.py` exit=0（13 条 r286 字面量全
+present、`gpu-r282-gone` present）；payload sha256 `61a73142…`，归档
+`~/clover-out/round286-v0.6.81-payload.img`（58 720 256 字节）。
+
+**⑤ 下一靴怎么读。** r286 是 boot 73（需冷刷 cache）。三档判据：`gcc` 行里 `gpu_ahb=1` 而
+`ctl_sdhc1_ahb/apps` 两票照常读 1（正对照）→ GPUCC 访问安全；`gpucc pre` 的 cx/gx 全 0xffffffff =
+总线没应答（别读成「没上电」）；`gdsc` 行 `cx_on=1 gx_on=1 gfx3d_en=1` 则 `chipid` 行该出
+`chipid=05010200 expect=05010200 ok=1`。`chipid skipped` 会点名哪个门没开。与 r285 同靴规则：无死线，
+读回需要一只手在平板上。桌面仍是 CPU-first；这一轮是 bring-up 取证，不是驱动。

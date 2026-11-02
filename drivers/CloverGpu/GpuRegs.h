@@ -64,4 +64,30 @@
 #define kGdscSwCollapse     0x00000001U
 #define kGdscPwrOn          0x80000000U
 
+// gdsc.c's remaining bits, needed only now that this round writes. gdsc_init() clears the hw-trigger
+// and sw-override bits so collapse/restore follows register writes, and sets the three wait timers;
+// gdsc_toggle_logic(true) then clears SW_COLLAPSE and polls PWR_ON. The write side mirrors both, so
+// these are the bits the write touches, quoted from the same file the offsets above came from.
+#define kGdscHwControl      0x00000002U   // BIT(1): hw trigger for collapse/restore
+#define kGdscSwOverride     0x00000004U   // BIT(2): sw override of the state machine
+#define kGdscEnRestWaitMask 0x00F00000U   // gdsc.c EN_REST_WAIT_MASK  GENMASK(23,20)
+#define kGdscEnFewWaitMask  0x000F0000U   // gdsc.c EN_FEW_WAIT_MASK   GENMASK(19,16)
+#define kGdscClkDisWaitMask 0x0000F000U   // gdsc.c CLK_DIS_WAIT_MASK  GENMASK(15,12)
+#define kGdscEnRestWaitVal  (0x2u << 20)
+#define kGdscEnFewWaitVal   (0x8u << 16)
+#define kGdscClkDisWaitVal  (0x2u << 12)
+#define kGdscWaitMask       (kGdscEnRestWaitMask | kGdscEnFewWaitMask | kGdscClkDisWaitMask)
+#define kGdscWaitVal        (kGdscEnRestWaitVal | kGdscEnFewWaitVal | kGdscClkDisWaitVal)
+
+// GPU core. Base from `msm_gpu` reg = <0x5000000 0x40000> (sdm660-gpu.dtsi). This window is mapped
+// only after the CX and GX power polls read on and the AHB vote is set; before that, touching it is
+// the unclocked-bus gamble round282 declined and this round still refuses to take.
+#define kGpuPhys            0x05000000ULL
+#define kGpuSize            0x40000U
+
+// The DT's qcom,chipid, read at kGpuPhys + 0x10200. a512 reports 0x05010200 once the core is powered
+// and the AHB path is clocked; the read is gated on both and is the round's acceptance.
+#define kGpuChipid          0x10200U
+#define kGpuChipidValue     0x05010200U
+
 #endif // CLOVER_GPU_GPUREGS_H

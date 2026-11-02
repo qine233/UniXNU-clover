@@ -919,12 +919,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // one honesty row) is 105, and the cap is here so a runaway timer shows up as its own capped line instead of
   // crowding the census rows out. Separate from r276-ks so the two producers' counters stay apart.
   { "clover r281: ", "r281-aks", 128, 0, 0, 0 },
-  // Round282 is the GPU line's first producer, and like r281 it is a schedule rather than one
-  // speaking time: one GCC row every fire and, only when that row's AHB vote reads 1, one GPUCC
-  // row (or the skip/map-failed refusal, which is a reading too). At most two rows per fire and
-  // 15 fires to the 1800 s deadline, so 64 is headroom rather than a promise; separate from
-  // r281-aks so a GPU probe that starves cannot be mistaken for a keystore that went quiet.
-  { "clover r282: ", "r282-gpu", 64, 0, 0, 0 },
+  // Round286 is the GPU line's first writer, and like r281 it is a schedule rather than one
+  // speaking time: one GCC row every fire plus, on the boot that runs the power sequence, the
+  // gcc-post/gpucc/gdsc/chipid rows, then the steady gpucc+chipid pair every later fire. At most a
+  // handful of rows per fire and 15 fires to the deadline, so 64 is headroom rather than a promise;
+  // separate from r281-aks so a GPU probe that starves cannot be mistaken for a keystore that went
+  // quiet.
+  { "clover r286: ", "r286-gpu", 64, 0, 0, 0 },
   // Round283 prints at most one line per boot, during the bring-up pass that arms the slot, and it
   // is the whole reading: a reset that got a name, or the proof that none did. That pass carries the
   // census and the GPT walk, so the per-pass cap can eat the one row the frame exists for -- and a
@@ -4223,8 +4224,8 @@ static void teeConsumeLine (uint32_t &pushed)
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r275") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r276") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r281") ||
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r282") ||
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r283"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r283") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r286"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.
