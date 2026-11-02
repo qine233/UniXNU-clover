@@ -21646,6 +21646,23 @@ GPU 上电结果第一次读得到**——`gdsc` 行 `cx_on / gx_on / gfx3d_en` 
   转，GX 域上不了电。**下一步由数据决定，不猜**：r288 先编 RCG 的父源（选 CXO）与测试门，再重走
   gfx3d/gx，读回 `gx_on` 与 `chipid`（对上 0x05010200 则 `ok=1`）。
 
+**2026-11-03 收回上面那条「根因线索」。** 等 r288 期间把 `gfx3d_clk_src` 的父源表从厂商源里取全了
+（[`notes/gpu-bringup.md`](gpu-bringup.md) §5，原文五份已进仓 `notes/sources/sdm660/`，可按行号核对），
+对照之后这条读数是错的三处：
+
+* 我们读的是 **CMD_RCGR `0x1070`**，不是 CONFIG（`clk_rcg2` 的 CONFIG 在 `cmd_rcgr + 4 = 0x1074`，本轮
+  从没读过它）。所以「CONFIG 父源选择位=0」这句指的是一个没读过的寄存器；
+* 按 CMD 的字段，低 2 位=0 恰恰就是父源表里写在 0 号的 `xo`，bits[15:8]=0 是分频 1——这一行读不出
+  「没有时钟源」，只读得出「在 XO 档」；
+* `rcg` 的 bit31、以及 `cx=a0282000 / gx=08282000` 都带的 bit27，在下游 `gpucc-sdm660.c`、mainline 同名
+  文件与 `gdsc-regulator.c:29-39` 里**都没有名字**。拿一个没名字的位当病根，正是这台板子反复犯的那类错。
+
+boot 74 支持的只有一句：`gfx3d_en=1`、`cxo_en=1`、`cx_on=1` 而 `gx_on=0`。下一步因此不是「补父源」，而是
+把厂商账单里从没碰过的两对补齐（rbbmtimer `0x10b0`+`0x10d0`、rbcpr `0x1030`+`0x1054`）、改读 CONFIG
+`0x1074`，并用 r182 的 SPMI 通路读 GPUCC 自己要求的三颗轨（PM660L S3=`vdd_dig_gfx`、S5=`vdd_mx_gfx`、
+`gfx_vreg_corner`=`vdd_gfx`；`sdm660.dtsi:1084-1086`）。`gx_on` 仍为 0 才轮到「GX 由 GPMU/RBCCU 掌管」
+那条支，它的正对照写在 §5.3。
+
 **一条计划外的致命异常，而且第一次读得回来**：boot 74 没跑到普查（census 在 >1500 s），它自己的
 kind-20 记录不是 1800 s 死线，而是 `Kernel data abort. at pc 0xfffffff007a702d4 lr 0xfffffff00568971c`。
 宿主 `nm` 解：pc 落在 `_memmove`（寄存器 x0=…fc985000 / x1=…fae8a000 / x2=0x1fe0，一次约 8 KB 的内核

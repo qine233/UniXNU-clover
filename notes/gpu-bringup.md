@@ -90,3 +90,94 @@ stage 5 之后。本板连 GDSC 的当前状态都没读过；在没有读数的
 
 这条线**不阻塞** r281 的 keystore/WDT 读数，也不改这一轮的 payload。GPU 探针在 r282 才进
 `board.toml`，且第一版只读、只走 r281 已经验证过的周期行通道。
+
+## 5. gfx3d 的父源/频率表与 GX 的完整账单（2026-11-03 取回，全部有源）
+
+r288/r289 期间把这条线一直缺的那张表补齐了。原文五份已进仓，下面的每一条都能在本仓
+`notes/sources/sdm660/` 里按行号核对，不再依赖 `/tmp`：
+
+| 文件 | sha256 前 12 | 上游 |
+| --- | --- | --- |
+| `gpucc-sdm660.c` | `2305d741b7da` | `LineageOS/android_kernel_xiaomi_sdm660` @ `lineage-20`（下游 CAF，这块板子真跑过的驱动） |
+| `sdm660.dtsi` | `4d84f5169e88` | 同上 `arch/arm64/boot/dts/vendor/qcom/` |
+| `sdm660-gpu.dtsi` | `3c3abcba2bbf` | 同上 |
+| `msm-gdsc-660.dtsi` | `e31d934fbb42` | 同上 |
+| `adreno-gpulist.h` | `e998295aa216` | 同上 `drivers/gpu/msm/` |
+
+### 5.1 `gfx3d_clk_src` 的父源表（`gpucc-sdm660.c:57`，`P_XO` 等枚举在 `:34`）
+
+`cmd_rcgr = 0x1070`、`hid_width = 5`、`mnd_width = 0`、`flags = FORCE_ENABLE_RCG`（`:199`）。
+父源把「硬件 mux 值」和「时钟名」成对给出（索引即 `cfg` 里读回的 src 值）：
+
+| 索引 | 硬件 mux 值 | 名字 |
+| --- | --- | --- |
+| 0 | 0 | `xo`（19.2 MHz） |
+| 1 | 1 | `gpu_pll0_pll_out_main` |
+| 2 | 3 | `gpu_pll1_pll_out_main` |
+| 3 | 5 | `gcc_gpu_gpll0_clk` |
+| 4 | 7 | `core_bi_pll_test_se` |
+
+`ftbl_gfx3d_clk_src`（`:171`）只有 `F_GFX(f, s, h, m, n, sf)` 一种形状，`s` 恒为 0、`h` 恒为 2
+（除 19.2 MHz 那档 `h=1`），真正决定频率的是最后一列 PLL 频率：160/266/370/430/465/585/588/647/700/750 MHz
+= 640/532/740/860/930/1170/1176/1294/1400/1500 MHz ÷ 2。SDM630 换另一张表（`:186`）。
+设备侧的 `ro.vendor.gpu.available_frequencies = 647000000 588000000 465000000 370000000 266000000 160000000`
+正是这张表的子集，两边对上。
+
+**boot 74 的 `rcg=80000000` 说明什么、不至于说明什么。** 整行原文（`~/clover-out/round287-log-window.bin`，
+t=1338）：`gpucc post cx=a0282000 cxhw=80001fe0 cx_on=1 cx_collapse=0 gx=08282000 gx_on=0
+gx_collapse=0 gfx3d_en=1 cxo_en=1 rcg=80000000 dom=00140001 sw=00000000`。按上表，CMD 的低 2 位 = 0
+就是「已经选在 `xo`」，bits[15:8]=0 就是分频 1——也就是说这一行**不能**读成「gfx3d 没有时钟源」。
+bit31 不在这两份源（下游 `gpucc-sdm660.c` 与 mainline 同名文件）对 CMD_RCGR 的任何字段里；同理
+`cx=a0282000` 与 `gx=08282000` 都带 bit27，而 `gdsc-regulator.c:29-39` 从 BIT(31) 到 BIT(0) 一个都
+认不出它——**两个没名字的位，别拿它们做判决**。所以 r288 流水日志里那句「没给它一个跑起来的时钟源，
+所以喂给 GX 的 gfx3d 时钟实际不转」是**过度论断**，本轮撤回；boot 74 真正说的是 `gfx3d_en=1`、
+`cxo_en=1` 而 `gx_on=0`，仅此而已。
+
+### 5.2 GX 上电前，厂商的账单是六根时钟、三颗轨
+
+`msm_gpu` 的 `clocks`/`clock-names`（`sdm660-gpu.dtsi:68-76`）逐条列出，括号里是我们在 boot 74
+读到的状态：
+
+1. `GPUCC_GFX3D_CLK` = GPUCC `0x1098` BIT(0)（`gpucc-sdm660.c:266`）——**已开**（`gfx3d_en=1`）；
+2. `GCC_GPU_CFG_AHB_CLK` = GCC `0x71004` BIT(0)——**已开**（`gpu_ahb=1`）；
+3. `GPUCC_RBBMTIMER_CLK` = GPUCC `0x10d0` BIT(0)，父 `rbbmtimer_clk_src`（`cmd_rcgr 0x10b0`，
+   父源表 `map_0`：`cxo_a`=0 / `gcc_gpu_gpll0_clk`=5 / `gcc_gpu_gpll0_div_clk`=6 / `core_bi`=7，
+   频率只有 19.2 MHz 一档）——**从没碰过**；
+4. `GCC_GPU_BIMC_GFX_CLK` = GCC `0x71010`——**已开**（`gpu_bimc=1`）；
+5. `GCC_BIMC_GFX_CLK` = GCC `0x7106c`——**已开**（`bimc=1`）；
+6. `GPUCC_RBCPR_CLK` = GPUCC `0x1054` BIT(0)，父 `rbcpr_clk_src`（`cmd_rcgr 0x1030`，同一张
+   `map_0`，19.2 MHz / 50 MHz 两档）——**从没碰过**。
+
+还有第 7 项是这两颗 RCG 的公共父：`gpucc_cxo_clk` = GPUCC `0x1020` BIT(0)（`:249`），`map_0` 名字
+`cxo_a` 就是它产出的。boot 74 已经把它读回来了——`cxo_en=1`，所以这条父也在。
+真正从没碰过的是 `0x10d0 / 0x10b0`（rbbmtimer）与 `0x1054 / 0x1030`（rbcpr）两对，加上 CONFIG
+寄存器 `0x1074`（我们只读过 CMD_RCGR `0x1070`，`clk_rcg2` 的 CONFIG 在 `cmd_rcgr + 4`，两份源都是这个形状）。
+
+轨（`clock_gfx: gfx@5065000`，`sdm660.dtsi:1081-1097`）：
+
+* `vdd_dig_gfx-supply = <&pm660l_s3_level>` → **CX 数字轨是 PM660L 的 S**；
+* `vdd_mx_gfx-supply = <&pm660l_s5_level>` → **GPU PLL 吃 PM660L S5**；
+* `vdd_gfx-supply = <&gfx_vreg_corner>` → GX 的 corner 轨（`sdm660.dtsi:2836` 的 parent 也是它）；
+* `qcom,gfxfreq-corner`：0 / 160→1 / 266→2 / 370→3 / 465→4 / 588→5 / 647→6 / 700→7 / 750→7。
+
+`gpucc_660_probe()`（`:401-468`）在注册任何时钟之前先 `devm_regulator_get` 这三颗轨，拿不到就
+`return`（`:424-448`），随后才对两颗 GPU PLL 做 `clk_alpha_pll_configure`（`:465-468`，
+`l=0x29`、`alpha=0xaaaaab00`、`config_ctl=0x4001055b`、VCO 档 `0x2<<20`）。**换句话说厂商自己也是
+「先把轨拿到，再谈 PLL 和时钟」**——这正是下一步该问的形状。
+
+同一窗口有两个提供者节点：`clock_gpu: clock-controller@5065000`（`qcom,gpu-sdm660`，`:1074`，
+`msm_gpu` 用它取 `GPUCC_RBCPR_CLK`）与 `clock_gfx: gfx@5065000`（`qcom,gpucc-sdm660`，`:1081`）。
+地址相同、驱动不同，别把它当成两处硬件。
+
+### 5.3 下一步（可反驳的读数，不是「再猜一次」）
+
+1. **读轨，不写轨**：用 r182 已经跑通的 SPMI 通路读 PM660L S3/S5 的 enable/voltage 状态，和 boot 74
+   已有的 `cx_on=1` 放在一起。若 S5（MX）关着而 PLL 从没配置，那 `gfx3d` 只有 XO 可走就是**结果**不是原因，
+   但足以解释「跑不了高频」；若 S3/S5 都开着，轨这一支当场结掉。
+2. **补齐账单**：把 `0x1020 / 0x10b0+0x10d0 / 0x1030+0x1054` 三票按厂商表在 XO 档使能并回读，
+   与 `gfx3d`、GX GDSCR 同排打印；`rcg` 那行改印**拆解后的 src/div/mux 字段**而不是整字，
+   免得再拿一个带无名位的裸字做判决（仪器课：一行读数的解释宽度就是它的上限）。
+3. 只有这两步之后 `gx_on` 仍为 0，才轮到「GX 的塌陷由 GPMU/RBCCU 掌管、GDSCR 写不动」这条支——
+   它的正对照是 `a5xx_regulator_enable()` 用 `A5XX_GPMU_RBCCU_PWR_CLK_STATUS`（`a5xx_reg.h:766`）
+   轮询状态，而不是读 GDSCR；`adreno-gpulist.h:592` 的 a512 条目里带 `zap_name = "a512_zap"`，
+   说明本板 a512 确实走 GPMU/zap 那条路。
