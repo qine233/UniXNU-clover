@@ -21112,3 +21112,72 @@ kernel `56731589` → AMFI `ac120a10` → payload `round278-v0.6.72-payload.img`
 教训与 r252 那条同源：**能钉整段结构的检查，比写检查的那只手更早发现问题**；而标题这种「一行很长」的字段只能按行改。
 **④ 判据（刷之前写死）。** 到 1800 s 并有 panic 记录 + `stage=2 service=0 ks_classes=0 class=1` ⇒ 服务是有罪的那一半；
 仍在 1500 s 前停止且无 panic 记录 ⇒ 链进来的代码或 boot-arg，下一刀是把 `.late.a` 里那颗驱动对象摘掉再开一靴对照。
+
+## r278 读数（boot 66，文件 boot67-r278.bin.txt）：早停跟着「发出去的服务」来，注册类不发服务的那半活到死线
+
+**① 判决行。** 这一靴把 r278 的判据读成了第一支：
+
+```
+clover r277: enter secs=1543 calls=1
+clover r277: walking visited=32 names=0 classes=0 / 64 / 96
+clover r277: svc-walk end visited=127 stopped=0 classes=0
+clover r277: done nodes=9 calls=1
+clover r275: aks class=1 userclient_class=1
+clover r276: aks stage=2 status=0 service=0 refused=0 opens=0 calls=0 sel7=0 sel14=0 sel17=0 sel35=0 sls=0
+clover r276: ks walked=127 stopped=0 ks_names=0 ks_classes=0 rows=0
+clover r243: svc total=127 stopped=0 button-family=5 / census done nodes=9
+```
+
+同靴卡上有 boot 66 自己的 kind 20 死线记录（seq 45），内核日志最大时间戳 **1814.508449 s**。
+⇒ 注册了 `AppleKeyStore`/`AppleKeyStoreUserClient` 两颗类、**不发那颗服务**，板子就一路活到 1800 s；
+而发了服务的两靴（63 停在 1499.386 s、64 停在 726 s）既没普查行也没本靴 panic 记录。
+`aks class=1` 与 `ks_classes=0` 同时成立，正是这轮设计好的自我对照：类真的落进了表，平面里真的没有服务。
+
+**② 与 boot 63 的逐生产者对照**（同一张卡、同一枚普查代码，只差那颗服务）：
+
+| 生产者 | boot 63（发了服务） | boot 66（不发服务） |
+| --- | --- | --- |
+| `clover r243`（普查） | 0 | 26 |
+| `clover r252`（谁问了什么） | 0 | 53 |
+| `clover r267`（等待属主） | 49 | 41 |
+| `clover r268`（信号量 count=-1） | 0 | 4（t=1380/1543/1676/1807） |
+| `hint=6`（同一把信号量） | 0 | 2 |
+| 内核日志行 | 511 | 614 |
+| 卡恢复次数 | 7 | 4 |
+
+boot 66 的 r252 账本里 audiomxd 仍 `count=28 missing=IOService:/IOResources/AppleKeyStore` ——不发服务，
+它就照旧问不到，这正是这一支该有的形状。而 r268/r273 那对配对读数说明：发服务时那条 FOREVER 解锁等待
+变成 0（boot 63），不发服务时它回来（boot 66），workloop 的五条等待者两靴一模一样（`tr=5 tc=0 tt=377 ow=0`）。
+⇒ 那颗服务**确实改变**了 datamigrator 的等待，桌面这一格却并没有因此解开。
+
+**③ 一处要在我自己面前撤回的读法。** 我一开始想把 boot 63 的「AppleKeyStore miss=0」当成
+「发了服务所以用户态按路径也找得到它」的证据，回卡上一查：那一靴 `clover r252` **整段 0 行**，
+0 个 miss 是 0 行的账本里出来的，不是一条也没问到的账本。它不能作为命中与否的证据，
+判「路径查询命中」只能看有 r252 行的靴（boot 66 有 53 行，而它不发服务）。
+
+**④ 仪器课（比 r277 那条更硬的一层）。** r277 的中继行这次带回了 51 条，可 boot 64 一条都没有——
+回驱动里查：`panicProbeFlush()` 的唯一调用者在 `panicDrainRings()`，而 `panicDrainRings()` 只在
+`clover_emmc_panic_append()` 里被调。**也就是说中继只在 panic 排空时落卡：不 panic 就早停的靴，
+结构上不可能带回任何中继行。** boot 64 的 0 条「r277」于是从来不是关于普查的证据，而是关于
+「这一靴没有 panic」的证据。把这条与 ① 里 `calls=1 secs=1543` 合起来，位置问题就有了便宜的解法：
+普查的被调点在这靴第一次被走到就是 1543 s，boot 63 停在 1499.386 s，差 0.6 s——它不是死在普查里，
+是根本没走到普查。能在这种靴里出声的只有每拍都到卡的那条管道（boot 63 无 panic 仍带走 511 行内核日志）。
+
+## r279 落地（v0.6.73）：把「谁开了 keystore、问了什么」搬到每拍都能到卡的那条管道上
+
+- **旋钮按承诺拆掉**：`clover-aks-nosvc` 从探针与 `board.toml` 都消失（参数从 30 回到 29），
+  服务照旧发布。checker 现在反向钉它：探针源码里出现 `clover-aks-nosvc` 就是错，board.toml 里出现
+  `clover-aks-nosvc=1` 也是错——「读了就拆」的规矩由检查守住，不由下一次的手性守住。
+- **新的五行**（都印在 `clover r279:` 前缀下，走 printf→msgbuf→tee→卡）：`aks up service=… sls=… state=…`
+  （紧跟 `stage=3`，位置被 checker 钉住：发布没发生就不能预告）、`aks open n= pid= comm=`、
+  `aks refused n= pid= comm=`、`aks call n= pid= comm= sel= rc=`、以及咬到上限时的
+  `aks calls capped at=24 last_sel= last_rc=`。上限：开 8、拒 8、调用 24。
+- **pid/comm 从哪来**：`clover_aks_who()` 用 `current_task()`→`get_bsdtask_info`→`proc_pid`，
+  名字用 `IOCopyLogNameForPID()`（IOLib.cpp，`extern "C"` 前置声明），并按 r251 的老规矩只取
+  `"pid <n>, <name>"` 里逗号之后的部分。
+- **tee 的两处**：`kTeeProbeClasses` 新增 `{ "clover r279: ", "r279-aks", 96 }`，
+  每趟 16 行的豁免名单加上 `"r279"`；正向对照跑过——删类、删豁免、改串、挪位置、把旋钮装回去，
+  五种破坏 `check-clover.py` 全部报错。
+- **构建坑一条（新）**：内核头里的 `strcpy` 是**三参数宏**，探针里 `strcpy(name_out, "?")` 编译成
+  「too few arguments provided to function-like macro invocation」外加两条 -Werror 噪音；
+  改成一个字节一个字节写。归档步骤在链接前，所以这错 1 分钟就露出来。

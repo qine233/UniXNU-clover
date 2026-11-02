@@ -883,6 +883,15 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // runs is distinguishable from a round that was capped, and if the keystore rows ever starve the census rows
   // the two counters say which producer lost.
   { "clover r276: ", "r276-ks", 64, 0, 0, 0 },
+  // Round279 says the keystore's own events -- who opened it, what selector they asked, and that the
+  // service is up -- from the client's thread, when it happens, because this board measured that the
+  // two channels that could have carried them do not: the round277 probe relay is drained only by the
+  // panic sink, so a boot that ends without panicking delivers none of it (boot 64 read 0 rows and that
+  // zero meant nothing), and the census only runs at 1500 s while boot 63 died at 1499.386 s. The rows
+  // are capped at 8 opens, 8 refusals and 24 calls plus one capped line, so 96 leaves the producer's
+  // whole set with room for the repeat that a reopening daemon prints; a truncated set would read as
+  // "nobody asked", which is the mistake this class exists to prevent.
+  { "clover r279: ", "r279-aks", 96, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);
@@ -4170,7 +4179,8 @@ static void teeConsumeLine (uint32_t &pushed)
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r243") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r252") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r275") ||
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r276"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r276") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r279"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

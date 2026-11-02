@@ -1109,6 +1109,18 @@ def check_sb_sample(kernel: bytes) -> bool:
              "bb-aks-relay-aks": (b"clover r277: aks stage=%d status=%x service=%llx class=%d opens=%u calls=%u\n") in kernel,
              "bb-aks-relay-walk": (b"clover r277: walking visited=%d names=%d classes=%d\n") in kernel,
              "bb-aks-relay-end": (b"clover r277: svc-walk end visited=%d stopped=%d classes=%d\n") in kernel,
+             # Round279. Boot 66 settled the bisect -- classes registered, service withheld, and the board
+             # lived to its deadline with the whole census printed -- so what is left to learn is what a
+             # client does with the published service. These five literals are that reading, and they are
+             # pinned as whole format strings rather than as a prefix count because boot 63's census died
+             # six tenths of a second before its own gate: an instrument that only speaks from the census
+             # cannot testify about a boot that ends before it, and a payload that lost one of these rows
+             # would report "nobody asked" for a keystore that nobody shipped.
+             "aks-say-up": (b"clover r279: aks up service=%llx sls=%u state=%d\n") in kernel,
+             "aks-say-open": (b"clover r279: aks open n=%u pid=%d comm=%.20s\n") in kernel,
+             "aks-say-refused": (b"clover r279: aks refused n=%u pid=%d comm=%.20s\n") in kernel,
+             "aks-say-call": (b"clover r279: aks call n=%u pid=%d comm=%.20s sel=%u rc=%x\n") in kernel,
+             "aks-say-capped": (b"clover r279: aks calls capped at=%u last_sel=%u last_rc=%x\n") in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,

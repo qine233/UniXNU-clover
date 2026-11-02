@@ -190,7 +190,7 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-title = "clover r278: bisect the port that ends this board early. The round-276 and round-277 images stopped at 1499 s and 726 s with no census row and no panic record for the boot, while the round-275 image reflashed as a control (boot 65) reached 1813 s, fired the census and wrote its deadline record -- and all three carry the same chronic card recoveries (7 to 11 per boot), so the card is not the variable and this keystore port is. One knob, one question: `clover-aks-nosvc=1` registers the AppleKeyStore metaclasses and withholds the service, so the census should read \"stage=2, service=0, ks_classes=0\" while its aks class= row still says 1, because that row asks the class table rather than the registry. A boot that now reaches the deadline means the thing that ends the board is a service userland can open, and the next cut is what the client contract gets wrong; a boot that still stops early means it is the linked code or offline-key-events=1 itself, before anything is published. Either way the knob comes out next round: it is a bisect, not a mode, and the round-277 relay rows stay in so the census can still say where it is."
+title = "clover r279: the keystore says who opened it and what they asked, in the channel this board measured as deliverable. Round278's bisect is settled: boot 66 registered the AppleKeyStore metaclasses and withheld the service, and it lived to the 1800 s deadline, wrote its record and printed the whole census -- stage=2 service=0 ks_names=0 beside its own `aks class=1` control -- while boots 63 and 64, which did publish the service, stopped at 1499.386 s and 726 s with no census row and no deadline record. The knob is out, the service goes back on, and the question is what a client does with it. Two channels already failed to answer that and this round says why in the code: round277's probe relay is drained only by the panic sink -- grep the driver, panicProbeFlush has one caller, inside clover_emmc_panic_append -- so a boot that ends without panicking cannot deliver a single relay row, which is why boot 64 read zero `r277` rows and why that zero was never evidence about the census; and the census itself only runs at 1500 s, a gate boot 63 missed by six tenths of a second. The kernel log is the channel proven to reach the card every beat -- boot 63 carried 511 kernel-log lines and 64 driver verdict lines with no panic at all -- so the probe now prints on the events themselves: the publish, each open with pid and comm, each refusal, the first 24 selector calls with their return codes, and one line when the cap bites. The tee gets a class and an exemption from its per-pass cap, because this board has twice read a truncated row as \"nobody asked\", and the census keeps printing the same counters as the copy that does not ride that pipe. Decided before the flash: `aks up` with no `aks open` means nothing in userland reached the service and the early end is our own start() in the plane the daemons need; opens whose calls come back e00002c7 mean the client contract is what they reject; opens that succeed with calls that all succeed mean the keystore is answering and the end is downstream of the answer -- then the next cut is the datamigrator's XPC reply, not a second keystore knob."
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's
@@ -2314,15 +2314,12 @@ kernel_args = [
   #     ks_classes= rows=` -- a name is a claim, the class is the evidence, and `stopped=0` is what makes a
   #     zero mean zero.
   "offline-key-events=1",
-  # Round278's bisect, and the only reason it exists: the two boots that carry the keystore (63 at 1499 s,
-  # 64 at 726 s) stopped with no panic record and no census row, while the round-275 image run as a control
-  # (boot 65) reached 1813 s, fired the census and wrote its deadline record; all three show the same
-  # chronic card recoveries, so the card is not the variable. With this argument the probe registers the
-  # AppleKeyStore metaclasses and stops before allocating the service: stage=2, service=0, ks_classes=0,
-  # while the census' own aks class= row still reads 1 because that row asks OSMetaClass, not the registry.
-  # Boot lives => a service userland can open is what ends the boot. Boot still stops => the linked code or
-  # the boot argument itself, before anything is published. Removed once read: a bisect, not a mode.
-  "clover-aks-nosvc=1",
+  # Round278's bisect knob is REMOVED here, exactly as that round promised in its own comment ("Removed
+  # once read: a bisect, not a mode"), because boot 66 read it: with the classes registered and the
+  # service withheld the board lived to the 1800 s deadline, fired the census, printed stage=2
+  # service=0 ks_names=0 beside its own `aks class=1` control and wrote its deadline record -- while the
+  # two boots that published the service stopped at 1499.386 s and 726 s with neither. The service is
+  # the variable, so it goes back on and the question moves to what a client does with it (round279).
   "clover-aks=1",
   # Round184 parks 排期 4, 5 and 6. The three instrument arguments below are deliberately NOT passed
   # any more: the goal moved to getting iPadOS onto its own screen, and each of these three spends
