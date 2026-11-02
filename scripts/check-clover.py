@@ -2663,7 +2663,8 @@ def check_board(errors: list) -> str:
                 errors.append(f"{r275_name} opens a second registry iterator: the keystore rows belong in "
                               "the walk that is already running, not beside another one")
             if r275_added.count("aks class=") != 1 or r275_added.count("aks walked=") != 1:
-                errors.append(f"{r275_name} prints its summary rows more than once per fire: the census "
+                errors.append(f"{r275_name} prints its summary rows more than once: the census is latched "
+                              "per boot, so a second copy would mean the walk is being re-entered and its "
                               "budget is shared with the thread rows that resolve the wait")
             if not (r275_added.find("aks class=") < r275_added.find('svc %.24s class=')
                     < r275_added.find("aks walked=")):

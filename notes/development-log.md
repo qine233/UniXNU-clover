@@ -20927,8 +20927,7 @@ stock kernelcache，镜像里确实有 `AppleKeyStore` / `AppleKeyStoreUserClien
 **③ 与计划的偏差，写在账上。** r274 读数那节里我给 r275 排了两件事，这轮只做了 keystore 那半件；
 **PreBoard 的同形状普查没有发**。理由是这一轮的量已经足够分岔：`class=0` 就直接走 sheng 那条发布路线，普查只是
 锦上添花；`class=1` 时才需要知道 PreBoard 卡在哪个对象上——所以普查排进 r276，由 r275 的读数决定要不要做。
-**④ 仪器侧的两处接线。** tee 新类 `{ "clover r275: ", "r275-aks", 64, 0, 0, 0 }`（一拍至多 10 行、四拍 40 行，
-64 是普查那一档的余量）；更关键的是把 `r275` 加进 `teeKernelLog` 的**每趟 16 条上限白名单**（`r234-set`/`r243`/`r252`
+**④ 仪器侧的两处接线。** tee 新类 `{ "clover r275: ", "r275-aks", 64, 0, 0, 0 }`（普查由 `static volatile int ran` 闩住，**每靴只跑一次**：一次至多 1 条类行 + 8 条服务行 + 1 条账行 = 10 行，64 是同一档普查的余量而非按拍累加）；更关键的是把 `r275` 加进 `teeKernelLog` 的**每趟 16 条上限白名单**（`r234-set`/`r243`/`r252`
 之后）。这三行本来就印在 r243 普查那一爆里，boot 36 实测那一趟的配额早被 bb 行吃光——不进白名单就会被静默截断，
 截断的 keystore 行读起来和「平面里没有」一模一样，正是 r272 那课的假阴性。checker 现在两条都钉：类必须在，
 白名单也必须在。
@@ -20942,6 +20941,7 @@ payload `round275-v0.6.67-payload.img` sha256 `6c241bac…`（58720256 字节）
 `check-clover.py` EXIT=0（Round275 块：单文件、三行字面量、打印次序、类与白名单、LATE 头、双仓字节一致）；
 `verify-clover-payload.py` EXIT=0，出厂镜像里 `bb-aks-class`/`bb-aks-svc`/`bb-aks-walked` 三枚针全部 present。
 board 标题升到 `clover r275:`，两处 `[payload] title` 断言同步。
+**⑦ 一处自己写错、留给 r276 重建时一并改的注释**：CloverSdhci 里 `r275-aks` 那段的算术写成了「一拍 10 行、四拍 40 行」，实际普查是每靴一次（`ran` 闩锁）。这只是注释，不改行为，但它所在的文件是要编进内核的，而 boot 62 正在跑镜像 `6c241bac…`——为一行注释重刷一次会把这趟读数和产物拆开，所以按「更正走新版本」的规矩记在这里，等 r276 那趟本来就要重建时一起改。
 **⑦ 判据先写死。** `class=0 userclient_class=0` 且 `walked` 跑完、`keystore_services=0` ⇒ sheng 那条
 `NativeKeyStoreEvents` + `offline-key-events=1` 的路线在本板成立，下一轮就做驱动移植（`.late.o` 接线 + 板侧探针
 不带 `boot_progress_ext`，因为本板 `CONFIG_XNU_BOOT_PROGRESS=n`，计数只能印在拍上）。
