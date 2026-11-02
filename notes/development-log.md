@@ -21657,3 +21657,39 @@ kind-20 记录不是 1800 s 死线，而是 `Kernel data abort. at pc 0xfffffff0
 的 workloop `tr=5 tc=0 tt=3c9 ow=0`、`pth … peer=198:com.apple.migra`，与既往一致。r288 一趟同时兼作对照：
 若普查能跑到 ⇒ 这条早停是间歇的、与 GPU 无关；若又死在同一处 ⇒ 才谈得上把 surface/memmove 与 GPU 上电
 挂钩。桌面仍 CPU-first。
+
+## Round288 (v0.6.85): control re-flash of the round287 payload -- is the early fatal reproducible, and is it the GPU?
+
+**① 为什么是这一趟。** r287 之后 boot 74 带回一条计划外的致命 `Kernel data abort`（~1420 s），我第一次
+把它错挂到 legacy display（nm 的 nearest-below 给了 `_native_legacy_surface_allocation +0xaeab20`，一个超过
+任何单函数的偏移，是不可信的解法），并且只有一条样本、无法判断它是「第一次跑 r286 GPU 写」的副作用还是
+既往那类静默早停。r288 不改任何东西：把 round287 的 payload 原样再冷刷飞一次，专答两件事——这条早停会不会
+复现、以及 GPU 上电结论稳不稳。
+
+**② 读数（boot 75，冷刷自动落回，boot 计数 74→75）。** 两件事都答了，而且把第一条的归因纠正过来：
+* **GPU 完全复现**：t=614 与 t=858 两拍都读 `gpucc post cx=a0282000 cx_on=1 cx_collapse=0 / gx=08282000
+  gx_on=0 gfx3d_en=1 rcg=80000000` → `chipid skipped cx_on=1 gx_on=0 gfx3d_en=1`。与 boot 74 一字不差。**
+  cx 开、gfx3d 使能、gx 因 RCG 父源没编而关** 这条 GPU 事实是稳的，不是单次噪声。
+* **早停复现，但不在 GPU**：boot 75 也死在一条 `Kernel data abort`，崩在 ~880 s。用带函数边界的宿主解法把
+  两靴的现场解清楚：**boot 74 pc `_memmove +0x64`（拷贝）、boot 75 pc `IOSKArena::unmap(...) +0x8`（IOKit
+  内存 arena 解除映射的 cold 分支）**，两靴 **lr 完全相同**（同一 caller，落在 legacy display 段的匿名 static
+  里，nm 只能给不可信的 nearest-below）。所以这枚异常属于**我们自己的 legacy display / IOSurface 内存路径**
+  （present/scanout/retire 或某次 surface 的分配/解除映射把一片 backing memory 弄坏了），**不是 CloverGpu**
+  ——GPU 驱动在 858 s 那拍已干净打完 chipid 行，880 s 的异常晚于它、且在完全不同的代码里。**GPU 被排除。**
+
+**③ 归因订正（我上一轮写错的）。** r287 读数段里我把 boot 74 的 lr 解成「display surface 路径」用的是一次
+错的 nm 读数；本段用「pc 落在有边界的函数内」的正解重新钉：boot 74 的 caller 与 boot 75 的 caller 是同一个
+lr，且两靴 faulting pc 分别是 _memmove 与 IOSKArena::unmap——这既坐实了它在我们一侧，也说明**只凭 stripped
+prelink 的最近下方符号解 caller 会错**（这正是 r257/r260 记过的同一类错读），需要现场 backtrace 才能把那个
+匿名 static 定名。
+
+**④ 桌面这一格不变**：boot 75 没跑到普查（census >1500 s，它 880 s 就死了），tail 里债主仍是 datamigrator
+的 workloop 形状，与既往一致。**它是一贯阻塞；这条 display 异常是会提前掐掉部分靴子的第二道坎（间歇：boot
+48/67 曾活到 1796/1814 s 没犯，boot 64/74/75 分别在 726/1420/880 s 犯）。**
+
+**⑤ 下一轮 r289 干什么。** 不猜：这条异常既然复现、且落在我们 legacy display 路径，先把它**定名**——给这类
+panic 抓一条真正的内核 backtrace（沿用 r211/r236 的线程栈抓取通道，在 fatal 现场把 fp 链与每帧 pc 抄进 tee
+环），下一靴直接读出「谁调用了这次 unmap/memmove」。若坐实在 CloverLegacyDisplay 的某次 surface 生命周期，
+那是我们能改的代码。GPU 那半停在 cx 开、gx 等 RCG 父源：编 RCG 需要的父源/频率值**不在盘上**（facts 无时钟
+摘要），按「别造寄存器」的规矩，等 backtrace 这趟顺路带一次外部源（Linux gcc-sdm660 的 gfx3d_clk_src 父表）
+转录带出处，再决定 r290。桌面仍 CPU-first。

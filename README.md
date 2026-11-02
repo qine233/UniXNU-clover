@@ -34,6 +34,10 @@ leave」一路收紧到一句可测的话：
   「无 keybag、开机即解锁」）：解锁信号量等待随之消失，但 workloop 那五条等待者照旧，
   桌面仍未出。
 * **单核已坐实**：内核 `CpuDataEntries` 只注册一颗核（`real=1`），副核从未被 start。
+* **第二道坎（间歇）**：部分靴子在 726–1420 s 被一条致命 `Kernel data abort` 提前掐掉，崩在
+  `_memmove` / `IOSKArena::unmap`、两靴同一 caller，落在**我们自己的 legacy display / IOSurface 内存
+  路径**（boot 74/75 复现；boot 48/67 曾活到死线没犯）。r286 的 GPU 写被排除（GPU 行先干净打完、异常在
+  别处代码）。下一步给这类 panic 抓现场 backtrace 把 caller 定名。
 
 每一轮的设计、构建与真机读数都在 [`notes/development-log.md`](notes/development-log.md)
 逐轮可查，本节只留当前结论。
