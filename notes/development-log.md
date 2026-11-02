@@ -20746,3 +20746,51 @@ t=2 s 的事，而且**必须自带对照**——在 `cpu_start()` 现场（`osf
 而入口已经在 `bsd/kern/kern_event.c` 里查清：wlwait 的等待事件本身就是 `struct knote *`
 （`kdp_workloop_sync_wait_find_owner` 第一行就是 `kn = (struct knote *)event`），
 `knote_get_kq(kn)` 出来就是 `kqworkloop`，`kqwl_request.tr_state` / `tr_thread` 正是那句话。
+
+
+## r273 落地（v0.6.62）：把 workloop「要没要过线程」读出来——顺带被闸门抓到一次「读错了头文件」
+
+**① 这一轮问的那一件事。** r267 的 `owner=` 是内核 `kdp_workloop_sync_wait_find_owner`
+（`bsd/kern/kern_event.c:2590`）三个分支塌成的一个数：`kqwl_owner` 有值、或有绑好的请求线程、
+或只写「请求过线程」（`STACKSHOT_WAITOWNER_THREQUESTED`）。boot 59 两次给出 `hint=10 owner=3b7`，
+而 `0x3b7` 正是债主自己那条线程、同一趟普查里它也在睡——三种来历对应三种不同的坏，
+行面上分不开。所以 r273 直接读对象：`kn = (struct knote *)wait_event` → `knote_get_kq(kn)`
+→ 确认 `KQ_WORKLOOP` → 打印 `kq_state / kq_count / kqwl_dynamicid / kqwl_request.tr_state /
+tr_count / tr_thread`，再加 `kqwl_owner` 与那颗 kqueue 属主的 pid。行是
+`clover r273: wl t= pid= tid= kn= kq= wlo= ks= kc= kqpid= dyn= tr= tc= tt= ow=`，
+一个等 workloop 的线程一条（`osfmk/kern/task.c:12481`）。`tr_thread` 只在 `>= WORKQ_TR_STATE_BINDING`
+时才当线程读，下面那一档那个 union 槽是优先级队列的链——这条下限照抄内核自己那句判断。
+
+**② 踩到的坑是真的，而且是闸门替我踩的。** 第一版把读对象写在 `task.c` 里并
+`#include <sys/eventvar.h>`，`check-clover-xnu-syntax.py` 直接 `exit=1`：
+十条 `unknown type name 'workq_threadreq_s'` 全落在
+`build/xnu/ios-obj/EXPORT_HDRS/bsd/sys/eventvar.h:215/349/458…`，再加 `task.c:12033`
+一条 `use of undeclared identifier 'WORKQ_TR_STATE_BINDING'`。原因在搜索路径：osfmk 编出来命中的是
+**导出副本**，`BSD_KERNEL_PRIVATE` 那一段（`workq_threadreq_s`、`workq_tr_state_t` 全套）被剥掉了——
+`eventvar.h` 里 `kqworkloop` 声明 `workq_threadreq_s kqwl_request;` 的地方在导出副本里根本不存在。
+所以最终形状是：读函数放 `bsd/kern/kern_event.c:2661`（那里 include 的是真头文件），
+`task.c` 只传等待字、拿回 `uint64_t out[11]`，**和它已经在调的 `kdp_*_find_owner` 同一条通道**；
+两侧的索引各自 `#define`（`CLOVER_WL_*` / `CLOVER_WL_OUT_*`），checker 把两侧同名项的编号一起钉住，
+免得这份「只有位置、没有类型」的契约单侧漂走。checker 另外反向禁止 `task.c` 那一半出现
+`struct kqworkloop *` / `struct kqueue *` / `kqwl->` / `kn->`——注释里提一句允许，手里持有不允许。
+
+**③ 自带正对照，这次是事前加的。** boot 60（r272 的第二趟）里债主 `pid=143` 的 `4f2/88a`
+已经从 `hint=10` 漂到 `hint=2`（等 mach 收信），也就是说「这一趟没有 workloop 等待者」是可能的读数。
+r272 那一轮的教训正是「测不出『没有』的仪器不能宣布『没有』」，所以 `clover r265: peer` 行加了
+`wl=<本次拍火见到的 workloop 等待者条数>`：没有 r273 行而 `wl>0` ⇒ 被 tee 掉了；`wl=0` ⇒
+真的没人等在 loop 上，这一格当场从「workloop」挪回「端口等待」。
+
+**④ 三分支判据（先写死，boot 61 见分晓）**：`tr=0 ow=0` ⇒ 内核从没向 workqueue 要过工人，
+该回头找「本该往这只 loop 上投事件的那一侧」；`tr=4/5` 且 `tt=` 是同一趟普查里也在睡的那条 ⇒
+loop 内互等，要切的是 `tt` 那条线程自己的等待；`tr=1/2` 且 `tt=0` ⇒ 要了线程而 workqueue 不给，
+刀口在 `bsd/pthread/pthread_workqueue.c` 的加线程门槛，不在等待图。顺带 `dyn=` 相同可以把
+「几条等待共用一只 loop」从推断变成读数，`kqpid=` 则挡住「knote 指着别人进程的 kqueue」这种意外。
+
+**⑤ 契约与产物。** 补丁 `patches/xnu-clover/z…z-clover-r273.patch`（47 个 z；r272 不占号，
+所以这一轮的号紧接 r271 的 46 个 z），两文件七个 hunk，纯增量——唯一被改的既有行是 r265 的 peer 行；
+`build-xnu-4k-baseline.sh` 的 `LATE_PATCH` 头换成它（先摘 r273 再摘 r271 再摘 r270）；
+tee 类 `{ "clover r273: ", "r273-wl", 64, 0, 0, 0 }`（`drivers/CloverSdhci/CloverSdhci.cpp:867`）；
+`check-clover.py` 加 Round273 块；`verify-clover-payload.py` 的 `bb-peer-workloop` 针 + peer 行针补 `wl=%u`。
+内核 `393e6c45…` → AMFI 后 `2f18a6db…`（两处站点仍在 0x1acb0e4/0x1acb16c）→ 归一化 `37267494…`；
+出厂镜像 `~/clover-out/round273-payload.img` sha256 `b35a50b9…`。两道闸门 exit=0，
+`task.c`/`kern_event.c` 语法门 exit=0、诊断条数与本轮改动前一致（112/44，全是既有告警）。

@@ -1,0 +1,261 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -183,6 +183,17 @@
+ #include <sys/bsdtask_info.h>
+ #include <sys/kdebug_triage.h>
+ #include <sys/code_signing.h> /* for address_space_debugged */
++/*
++ * Round273. The census already asks the kernel who owns a workloop wait, and kdp_workloop_sync_wait_find_owner
++ * answers with one number collapsed out of three different readings: the tid of kqwl_owner, or the tid of a bound
++ * request thread, or STACKSHOT_WAITOWNER_THREQUESTED. The fields behind that answer live in struct kqworkloop,
++ * which this file cannot read directly: including <sys/eventvar.h> here resolves to the EXPORT_HDRS copy, and the
++ * private half of it -- workq_threadreq_s and the WORKQ_TR_STATE_* enum -- is stripped out of that copy, so the
++ * compile gets ten "unknown type name" errors instead of the struct. kern_event.c includes the real header, so the
++ * read lives there and this file calls it the same way it already calls kdp_workloop_sync_wait_find_owner: hand
++ * over the wait-event word, get back integers.
++ */
++extern void     clover_workloop_snapshot(uint64_t event, uint64_t out[11]);
+ /*
+  * Exported interfaces
+  */
+@@ -11956,6 +11967,88 @@
+ }
+ 
+ /*
++ * The contract between this file and the read in bsd/kern/kern_event.c. Both sides are this port's own code, and
++ * the array is positional only: index 0 is a pair of bits rather than a pointer, so a mismatch here cannot be
++ * caught by a type checker. That is why the indices have names and the driver of this round -- check-clover.py --
++ * asserts both sides list them in the same order.
++ */
++#define CLOVER_WL_FIELDS 11
++#define CLOVER_WL_FLAGS  0    /* bit0: the word unpacked into a kqueue; bit1: that kqueue is a workloop */
++#define CLOVER_WL_KN     1
++#define CLOVER_WL_KQ     2
++#define CLOVER_WL_KS     3    /* kq_state */
++#define CLOVER_WL_KC     4    /* kq_count */
++#define CLOVER_WL_DYN    5    /* kqwl_dynamicid */
++#define CLOVER_WL_TR     6    /* kqwl_request.tr_state */
++#define CLOVER_WL_TC     7    /* kqwl_request.tr_count */
++#define CLOVER_WL_TT     8    /* tid of kqwl_request.tr_thread, above the BINDING floor */
++#define CLOVER_WL_OW     9    /* tid of kqwl_owner */
++#define CLOVER_WL_PID    10   /* pid of the process owning the kqueue */
++
++/*
++ * Round273. What the kernel thinks of the workloop a thread is parked on.
++ *
++ * boot 59 answered the "who owns it" half of this and left the other half open: two of the debtor's threads
++ * reported hint=10 owner=3b7, and that 0x3b7 is a number the kernel reached by picking one of three branches --
++ * kqwl_owner set, or a bound request thread, or "a thread was requested" -- which the row cannot tell apart. The
++ * difference matters because those branches are different failures: kqwl_owner set means a thread is *inside* this
++ * workloop right now and not coming back, BINDING/BOUND means the workqueue handed one over and it is the same
++ * thread parked elsewhere in the census, and NEW/QUEUED means XNU asked for a servicer and never got one, which is
++ * a workqueue thread-count problem rather than a wait-graph problem. So read the request itself.
++ *
++ * The walk is the kernel's own and it lives in bsd/kern/kern_event.c next to
++ * kdp_workloop_sync_wait_find_owner, which opens the same way: kn = (struct knote *)event on the thread's
++ * wait-event word, the kqueue through knote_get_kq(), and KQ_WORKLOOP before anything touches kqwl_request. It has
++ * to live there because struct kqworkloop is only complete under BSD_KERNEL_PRIVATE, and this file is compiled
++ * against the exported copy of eventvar.h. Nothing here reaches further than that function already reached on the
++ * same boot, so this adds no new object to the probe -- only more of the ones it already walked. The KQ_WORKLOOP
++ * assert is deliberately not copied: a wait whose object is not a workloop prints wlo=0 with dyn/tr/tt/ow zeroed,
++ * because "the hint said workloop and the object disagrees" is a reading worth having on its own line.
++ *
++ * tr_thread is only meaningful from WORKQ_TR_STATE_BINDING up -- below that the union slot is the priority-queue
++ * entry -- and that bound is copied from the kernel's own check in the same function.
++ */
++struct clover_workloop_read {
++	uint8_t valid;         /* the wait-event word unpacked into a kqueue at all */
++	uint8_t workloop;      /* that kqueue says KQ_WORKLOOP */
++	uint64_t kn;           /* the wait-event word: which note this thread waits on */
++	uint64_t kq;           /* the kqueue the note names, i.e. the workloop itself */
++	uint64_t dyn;          /* kqwl_dynamicid, so five waiters can be proved to name one loop */
++	uint64_t trtid;        /* tid of kqwl_request.tr_thread, above the BINDING floor */
++	uint64_t owntid;       /* tid of kqwl_owner, the thread currently servicing */
++	uint32_t ks;           /* kq_state bits */
++	uint32_t kc;           /* kq_count: events queued on this loop */
++	uint32_t tr;           /* kqwl_request.tr_state */
++	uint32_t tc;           /* kqwl_request.tr_count: requests folded into it */
++	int32_t kqpid;         /* pid of the process that owns the kqueue */
++};
++
++static void
++clover_workloop_read(thread_t thr, struct clover_workloop_read *out)
++{
++	uint64_t raw[CLOVER_WL_FIELDS];
++
++	bzero(out, sizeof(*out));
++	bzero(raw, sizeof(raw));
++	if ((thr->state & TH_WAIT) == 0 || thr->wait_event == 0) {
++		return;
++	}
++	clover_workloop_snapshot((uint64_t)(uintptr_t)thr->wait_event, raw);
++	out->valid = (uint8_t)(raw[CLOVER_WL_FLAGS] & 1);
++	out->workloop = (uint8_t)((raw[CLOVER_WL_FLAGS] >> 1) & 1);
++	out->kn = raw[CLOVER_WL_KN];
++	out->kq = raw[CLOVER_WL_KQ];
++	out->ks = (uint32_t)raw[CLOVER_WL_KS];
++	out->kc = (uint32_t)raw[CLOVER_WL_KC];
++	out->dyn = raw[CLOVER_WL_DYN];
++	out->tr = (uint32_t)raw[CLOVER_WL_TR];
++	out->tc = (uint32_t)raw[CLOVER_WL_TC];
++	out->trtid = raw[CLOVER_WL_TT];
++	out->owntid = raw[CLOVER_WL_OW];
++	out->kqpid = (int32_t)raw[CLOVER_WL_PID];
++}
++
++/*
+  * Round268. kdp_sema_find_owner answers hint=6 with a pid, but the field it reads is the one
+  * create_semaphore writes (osfmk/kern/sync_sema.c:128, "task that owns semaphore"), so it names the
+  * task that made the semaphore, not anyone who owes it a signal. The signaller is whoever holds a
+@@ -12141,6 +12234,13 @@
+ 	uint32_t psp[CLOVER_BB_PEER_ROWS];
+ 	uint32_t pot[CLOVER_BB_PEER_ROWS];
+ 	uint8_t psem[CLOVER_BB_PEER_ROWS];
++	/*
++	 * Round273. One workloop reading per row, taken under the peer lock because that is where the thread still
++	 * belongs to the census: the printing loop below runs after the unlock, and by then thread_t is not the
++	 * census's to hold.
++	 */
++	struct clover_workloop_read pwl[CLOVER_BB_PEER_ROWS];
++	uint32_t pwlcount = 0;
+ 	char pwho[CLOVER_BB_PEER_ROWS][CLOVER_BB_SEMA_NAME];
+ 	ipc_port_t pport[CLOVER_BB_PEER_ROWS];
+ 	/*
+@@ -12204,6 +12304,13 @@
+ 				psem[pn] = (uint8_t)clover_sema_state(thr, &psc[pn],
+ 				    &psp[pn], &pot[pn], &pport[pn], pwho[pn], sizeof(pwho[pn]));
+ 			}
++			pwl[pn].valid = 0;
++			if (phint[pn] == (uint32_t)kThreadWaitWorkloopSyncWait) {
++				clover_workloop_read(thr, &pwl[pn]);
++				if (pwl[pn].valid != 0) {
++					pwlcount++;
++				}
++			}
+ 			if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1 &&
+ 			    !is_saved_state32(ss) && (thr->state & TH_RUN) == 0) {
+ 				ppc[pn] = (uint64_t)get_saved_state_pc(ss);
+@@ -12264,9 +12371,9 @@
+ 		strlcpy(comm, pname, sizeof(comm));
+ 	}
+ 	printf("clover r265: peer t=%llu pid=%d comm=%s%s threads=%u shown=%u"
+-	    " hidden=%u wait=%u run=%u rx=%u tm=%u\n", (unsigned long long)secs,
++	    " hidden=%u wait=%u run=%u rx=%u tm=%u wl=%u\n", (unsigned long long)secs,
+ 	    task_pid(peer), comm, busy ? "busy" : "-", pcall, pn,
+-	    (pcall > pn) ? pcall - pn : 0, pwait, prun, prx, ptm);
++	    (pcall > pn) ? pcall - pn : 0, pwait, prun, prx, ptm, pwlcount);
+ 	if (busy) {
+ 		return;
+ 	}
+@@ -12359,6 +12466,28 @@
+ 			    (unsigned long long)pown[i], (unsigned long long)pctx[i]);
+ 		}
+ 		/*
++		 * Round273. The row above answers "whose tid is on this workloop" out of three different
++		 * situations and cannot say which one it used. This is the object itself: tr= is
++		 * kqwl_request.tr_state (0 idle, 1 new, 2 queued, 3 canceled, 4 binding, 5 bound -- only at 4
++		 * and above is tt= a thread rather than a queue link), ow= is kqwl_owner, tc= how many requests
++		 * the workqueue folded into this one, kc= how many events sit queued on the loop, dyn= is the
++		 * loop's identity so several waiting threads can be proved to be waiting on one loop rather
++		 * than on five, and kqpid= names the process that owns it. The branch is read off the row:
++		 * ow=0 tr=0 means nobody ever asked the workqueue for a servicer, tr=4/5 with tt= equal to a
++		 * tid this census also prints as asleep means the servicer was handed over and parked, and
++		 * tr=1/2 with tt=0 means the request is in flight and the workqueue has not answered it.
++		 */
++		if (pwl[i].valid != 0) {
++			printf("clover r273: wl t=%llu pid=%d tid=%llx kn=%llx kq=%llx wlo=%u"
++			    " ks=%x kc=%u kqpid=%d dyn=%llx tr=%x tc=%u tt=%llx ow=%llx\n",
++			    (unsigned long long)secs, task_pid(peer),
++			    (unsigned long long)ptid[i], (unsigned long long)pwl[i].kn,
++			    (unsigned long long)pwl[i].kq, pwl[i].workloop, pwl[i].ks,
++			    pwl[i].kc, pwl[i].kqpid, (unsigned long long)pwl[i].dyn,
++			    pwl[i].tr, pwl[i].tc, (unsigned long long)pwl[i].trtid,
++			    (unsigned long long)pwl[i].owntid);
++		}
++		/*
+ 		 * Round268. The one row of this census that the kernel's answer cannot close: a
+ 		 * semaphore wait whose owner field names its creator. count<0 says somebody is
+ 		 * still queued on it and srights says whether any task at all still holds the
+--- a/bsd/kern/kern_event.c
++++ b/bsd/kern/kern_event.c
+@@ -2619,6 +2619,80 @@
+ 	}
+ 
+ 	waitinfo->context = kqwl->kqwl_dynamicid;
++}
++
++/*
++ * UniXNU clover round273: the whole workloop request, for the thread census in osfmk/kern/task.c.
++ *
++ * kdp_workloop_sync_wait_find_owner above answers "who owns this wait" with a single number chosen out of three
++ * branches, and the caller cannot tell which branch produced it: kqwl_owner, or a bound request thread, or
++ * STACKSHOT_WAITOWNER_THREQUESTED. On this board that collapsed reading is the one open question left about the
++ * process the desktop is waiting on -- boot 59 reported owner=3b7 twice, and 0x3b7 is a thread of that same
++ * process which the census also shows asleep, so the loop is waiting on itself. Which branch fired decides what to
++ * fix next: a set kqwl_owner means a thread went into this workloop and never came out, BINDING/BOUND means the
++ * workqueue handed a thread over and it is parked somewhere else in the process, and NEW/QUEUED/CANCELED means
++ * XNU asked for a servicer and the workqueue never answered, which is a thread-count problem rather than a
++ * wait-graph problem.
++ *
++ * This lives here rather than in the caller because struct kqworkloop is only complete under BSD_KERNEL_PRIVATE:
++ * osfmk/kern/task.c compiles against the exported copy of sys/eventvar.h, where workq_threadreq_s has been
++ * stripped. The walk is the one immediately above -- the wait-event word is a knote, the kqueue comes out of
++ * knote_get_kq(), and kqwl_request is only touched once that kqueue says KQ_WORKLOOP -- and it reads the same
++ * objects the stackshot path already reads for the same threads, holding no lock and touching no user memory.
++ * The asserts are not copied: a probe that fires every two minutes must report what it saw instead of panicking on
++ * a shape it did not expect, so a non-workloop kqueue returns wlo=0 with the request fields zeroed.
++ *
++ * The contract is positional (task.c names each index), and out[0] carries the two flags as bits so that a caller
++ * which passes a stale wait-event word still sees valid=0/workloop=0 rather than a plausible-looking zero request.
++ */
++#define CLOVER_WL_OUT_FLAGS 0
++#define CLOVER_WL_OUT_KN    1
++#define CLOVER_WL_OUT_KQ    2
++#define CLOVER_WL_OUT_KS    3
++#define CLOVER_WL_OUT_KC    4
++#define CLOVER_WL_OUT_DYN   5
++#define CLOVER_WL_OUT_TR    6
++#define CLOVER_WL_OUT_TC    7
++#define CLOVER_WL_OUT_TT    8
++#define CLOVER_WL_OUT_OW    9
++#define CLOVER_WL_OUT_PID   10
++
++void
++clover_workloop_snapshot(uint64_t event, uint64_t out[11])
++{
++	struct knote *kn = (struct knote *)(uintptr_t)event;
++	struct kqueue *kq;
++	struct kqworkloop *kqwl;
++	workq_threadreq_t kqr;
++
++	bzero(out, 11 * sizeof(*out));
++	if (event == 0) {
++		return;
++	}
++
++	kq = knote_get_kq(kn);
++	out[CLOVER_WL_OUT_FLAGS] = 1;
++	out[CLOVER_WL_OUT_KN] = (uint64_t)(uintptr_t)kn;
++	out[CLOVER_WL_OUT_KQ] = (uint64_t)(uintptr_t)kq;
++	out[CLOVER_WL_OUT_KS] = (uint64_t)kq->kq_state;
++	out[CLOVER_WL_OUT_KC] = (uint64_t)kq->kq_count;
++	out[CLOVER_WL_OUT_PID] = (uint64_t)(kq->kq_p != NULL ? proc_pid(kq->kq_p) : 0);
++	if ((kq->kq_state & KQ_WORKLOOP) == 0) {
++		return;
++	}
++
++	out[CLOVER_WL_OUT_FLAGS] |= 2;
++	kqwl = (struct kqworkloop *)kq;
++	kqr = &kqwl->kqwl_request;
++	out[CLOVER_WL_OUT_DYN] = (uint64_t)kqwl->kqwl_dynamicid;
++	out[CLOVER_WL_OUT_TR] = (uint64_t)kqr->tr_state;
++	out[CLOVER_WL_OUT_TC] = (uint64_t)kqr->tr_count;
++	if (kqr->tr_state >= WORKQ_TR_STATE_BINDING && kqr->tr_thread != THREAD_NULL) {
++		out[CLOVER_WL_OUT_TT] = thread_tid(kqr->tr_thread);
++	}
++	if (kqwl->kqwl_owner != THREAD_NULL) {
++		out[CLOVER_WL_OUT_OW] = thread_tid(kqwl->kqwl_owner);
++	}
+ }
+ 
+ static void

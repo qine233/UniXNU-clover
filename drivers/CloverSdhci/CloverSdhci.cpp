@@ -860,6 +860,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // whole story of this board, and a class that never fills is itself the reading. 16 leaves room
   // for a retry loop without letting this producer crowd out the census.
   { "cpu_start()", "r272-cpustart", 16, 0, 0, 0 },
+  // Round273 prints one row per thread the census finds parked on a workloop, which on boot 59 was two of the
+  // debtor's seven threads and on backboardd's side none at all. It is a per-row producer like r267 rather than a
+  // once-per-fire summary, so it gets the census budget: twenty fires times a couple of waiters fits in 64 with
+  // headroom for the day a workloop has five waiters, which is the shape boot 58 reported for pid 58.
+  { "clover r273: ", "r273-wl", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

@@ -2479,6 +2479,94 @@ def check_board(errors: list) -> str:
             errors.append("build-xnu-4k-baseline.sh no longer reverses r271 first: round272 ships no "
                           "patch, so the LATE head must still be the r271 row that produced boot 58")
 
+        # Round273 reads the workloop object instead of the kernel's one-number answer for it. r267's owner=
+        # field is whichever of three branches kdp_workloop_sync_wait_find_owner took -- kqwl_owner, a bound
+        # request thread, or "a thread was requested" -- and boot 59's owner=3b7 (a thread of the debtor's own,
+        # asleep in the same census) could have come from any of them, with a different fix each. So the row
+        # prints kq_state, kq_count, kqwl_dynamicid and the whole kqwl_request: tr_state, tr_count, tr_thread.
+        # The read lives in bsd/kern/kern_event.c because struct kqworkloop is only complete under
+        # BSD_KERNEL_PRIVATE -- a round that tried to include sys/eventvar.h from task.c compiles against the
+        # exported copy and gets ten "unknown type name" errors -- and task.c reaches it the same way it
+        # reaches kdp_workloop_sync_wait_find_owner. The peer row gains wl=, the count of workloop waiters in
+        # that fire: boot 60 found the debtor's threads waiting on mach ports instead, and without the count
+        # an absent r273 row cannot be told apart from an instrument that never ran.
+        r273_name = "z" * 47 + "-clover-r273.patch"
+        r273_patch = next((base / "patches/xnu-clover" / r273_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r273_name).is_file()), None)
+        if r273_patch is None:
+            errors.append(f"patches/xnu-clover/{r273_name} is missing: without the workloop request the "
+                          "census still only has r267's collapsed owner, which cannot say whether XNU ever "
+                          "asked the workqueue for a servicer")
+        else:
+            r273_text = r273_patch.read_text()
+            r273_added = "".join(line for line in r273_text.splitlines(True)
+                                 if line.startswith("+"))
+            if "--- a/bsd/kern/kern_event.c" not in r273_text or \
+                    "--- a/osfmk/kern/task.c" not in r273_text:
+                errors.append(f"{r273_name} does not carry both halves of the round: the read is "
+                              "kern_event.c's and the row is task.c's")
+            for needle in ('extern void     clover_workloop_snapshot(uint64_t event, uint64_t out[11]);',
+                           'struct clover_workloop_read {',
+                           'clover_workloop_snapshot((uint64_t)(uintptr_t)thr->wait_event, raw);',
+                           '#define CLOVER_WL_FIELDS 11',
+                           '#define CLOVER_WL_FLAGS  0',
+                           '#define CLOVER_WL_TR     6',
+                           '#define CLOVER_WL_TT     8',
+                           '#define CLOVER_WL_OW     9',
+                           '#define CLOVER_WL_PID    10',
+                           'if (phint[pn] == (uint32_t)kThreadWaitWorkloopSyncWait)',
+                           'if (pwl[i].valid != 0)',
+                           '"clover r273: wl t=%llu pid=%d tid=%llx kn=%llx kq=%llx wlo=%u"',
+                           '" ks=%x kc=%u kqpid=%d dyn=%llx tr=%x tc=%u tt=%llx ow=%llx\\n"',
+                           '" hidden=%u wait=%u run=%u rx=%u tm=%u wl=%u\\n"',
+                           '#define CLOVER_WL_OUT_FLAGS 0',
+                           '#define CLOVER_WL_OUT_TR    6',
+                           '#define CLOVER_WL_OUT_TT    8',
+                           '#define CLOVER_WL_OUT_OW    9',
+                           '#define CLOVER_WL_OUT_PID   10',
+                           'clover_workloop_snapshot(uint64_t event, uint64_t out[11])',
+                           'kq = knote_get_kq(kn);',
+                           'if ((kq->kq_state & KQ_WORKLOOP) == 0)',
+                           'kqr->tr_state >= WORKQ_TR_STATE_BINDING',
+                           'out[CLOVER_WL_OUT_KC] = (uint64_t)kq->kq_count;',
+                           'out[CLOVER_WL_OUT_DYN] = (uint64_t)kqwl->kqwl_dynamicid;'):
+                if needle not in r273_added:
+                    errors.append(f"{r273_name} lacks {needle[:64]!r}: without it the row is another copy "
+                                  "of what r267 already collapsed into owner=")
+            # The exported-header trap, stated as a prohibition: the moment task.c names a bsd-private type
+            # again, the file it was compiled against is not the file that was read.
+            task_part = r273_text[:r273_text.index("--- a/bsd/kern/kern_event.c")] \
+                if "--- a/bsd/kern/kern_event.c" in r273_text else r273_text
+            # Prose in a comment may name the accessor this round deliberately does not call; the
+            # prohibition is on holding one: a type, a dereference, or the unpack itself.
+            for bad in ('struct kqworkloop *', 'struct kqueue *', 'kqwl->', 'kn->'):
+                if bad in task_part:
+                    errors.append(f"{r273_name} reads bsd-private types from task.c ({bad!r}): task.c "
+                                  "compiles against EXPORT_HDRS, where those fields do not exist")
+            if r273_added.count("clover r273: wl") != 1:
+                errors.append(f"{r273_name} prints the workloop row {r273_added.count('clover r273: wl')} "
+                              "times: one waiter per row is the whole design, two rows per waiter would "
+                              "double the budget for no extra reading")
+            if '{ "clover r273: ", "r273-wl", 64, 0, 0, 0 },' not in sdhci_source:
+                errors.append("drivers/CloverSdhci has no class for the workloop row: a new prefix is a "
+                              "producer of its own and an unbudgeted one drops the reading silently")
+            late_script = (REPO.parent / "UniXNU" /
+                           "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in late_script.splitlines()
+                                 if "clover-r2" in line)
+            if (late_list.find(r273_name) < 0 or
+                    late_list.find(r273_name) > late_list.find("z" * 46 + "-clover-r271.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r273 before r271 in LATE_PATCH: "
+                              "the compile pass would run on a tree this patch was not written against")
+            load_copy = REPO.parent / "UniXNU" / "patches" / "xnu" / r273_name
+            if not load_copy.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r273_name} is missing: unixnu loads patches from that "
+                              "directory and silently skips a board patch that lives only in this repo")
+            elif load_copy.read_bytes() != r273_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r273_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -3783,8 +3871,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r272:"):
-        errors.append('[payload] title is not "clover r272: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r273:"):
+        errors.append('[payload] title is not "clover r273: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4897,8 +4985,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r272:"):
-        errors.append('[payload] title is not "clover r272: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r273:"):
+        errors.append('[payload] title is not "clover r273: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

@@ -1071,7 +1071,14 @@ def check_sb_sample(kernel: bytes) -> bool:
              # in the process. A payload without the peer rows names a debtor and then reads nothing about
              # it, which is the reading this round exists to get.
              "bb-peer-header": (b"clover r265: peer t=%llu pid=%d comm=%s%s threads=%u shown=%u"
-                                b" hidden=%u wait=%u run=%u rx=%u tm=%u\n") in kernel,
+                                b" hidden=%u wait=%u run=%u rx=%u tm=%u wl=%u\n") in kernel,
+             # Round273: r267 collapsed the workloop owner into one number and boot 59 could not tell
+             # which of the kernel's three branches produced it. The row is the object: kq_state,
+             # kq_count, kqwl_dynamicid and the whole kqwl_request. wl= on the header above is the
+             # positive control -- boot 60 found the debtor on mach ports instead, so an absent row
+             # has to stay readable as "no waiter" rather than "no instrument".
+             "bb-peer-workloop": (b"clover r273: wl t=%llu pid=%d tid=%llx kn=%llx kq=%llx wlo=%u"
+                                  b" ks=%x kc=%u kqpid=%d dyn=%llx tr=%x tc=%u tt=%llx ow=%llx\n") in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,
