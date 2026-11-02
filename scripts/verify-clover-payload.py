@@ -1099,6 +1099,12 @@ def check_sb_sample(kernel: bytes) -> bool:
              # rights. Without this row the round is a riddle again.
              "bb-sema-holder": (b"clover r269: srhost t=%llu pid=%d tid=%llx port=%llx hit=%llu"
                                 b" name=%llx type=%llx scanned=%u probed=%u\n") in kernel,
+             # Round270: boot 56 named the holder as the debtor's own task and the whole task is asleep with
+             # nothing runnable, which is a wake-up that never lands. The driver already tallies IPIs sent,
+             # IPIs received and per-core SGIs; this row is the only new thing, and a frame without it cannot
+             # tell "the kernel never asked" from "the IPI went out and nobody arrived".
+             "bb-ipi": (b"clover r270: ipi t=%llu sent=%llu recv=%llu tick=%llu"
+                        b" sgi=%u,%u,%u,%u,%u,%u,%u,%u tm=%u,%u,%u,%u,%u,%u,%u,%u\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

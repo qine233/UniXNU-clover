@@ -838,6 +838,10 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // every semaphore row would starve the beat. Two censuses times twenty fires is forty rows inside the
   // 1800 s deadline, so 64 is the same headroom r268 was given.
   { "clover r269: ", "r269-srhost", 64, 0, 0, 0 },
+  // Round270 prints exactly one row per census fire -- the counters are global, so a copy per thread row
+  // would be the same nine numbers printed fifteen times. Twenty fires inside the 1800 s deadline is half
+  // of 64, which leaves the same headroom the last two rounds were given.
+  { "clover r270: ", "r270-ipi", 64, 0, 0, 0 },
 };
 static const uint32_t kTeeProbeClassCount =
     sizeof (kTeeProbeClasses) / sizeof (kTeeProbeClasses[0]);

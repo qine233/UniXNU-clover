@@ -1,0 +1,50 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -505,6 +505,23 @@
+ extern char     *proc_name_address(struct proc *p);
+ extern uint64_t get_dispatchqueue_offset_from_proc(void *);
+ extern int kevent_proc_copy_uptrs(void *proc, uint64_t *buf, uint32_t bufsize);
++
++/*
++ * Round270. The board's own CPU driver already keeps this accounting, and it is all inside an
++ * extern "C" block (drivers/ArmCpu/ArmCpu.cpp:32), so the census can read it without any new
++ * driver interface. What is being asked is narrower than "is the GIC broken": boot 56 showed
++ * com.apple.datamigrator with eight threads, all asleep, none runnable, and the one thread that owes
++ * a semaphore's signal is the same thread that owns the workloop its five workers sleep on. That is a
++ * queue that got work and never woke anybody, and on ARM the wake-up of a sleeping thread on another
++ * core is an IPI -- which this board's driver comments already distrust ("ICC_SGI1R_EL1 generates
++ * nothing on this board"). sent vs recv says whether the kernel asked and nobody arrived; the
++ * per-core array says whether one specific core ever receives one at all.
++ */
++extern volatile uint64_t armcpu_ipi_sent;
++extern volatile uint64_t armcpu_ipi_interrupts;
++extern volatile uint64_t armcpu_timer_interrupts;
++extern volatile uint32_t armcpu_core_sgi[8];
++extern volatile uint32_t armcpu_core_timer[8];
+ extern void workq_proc_suspended(struct proc *p);
+ extern void workq_proc_resumed(struct proc *p);
+ extern struct proc *kernproc;
+@@ -12737,6 +12754,23 @@
+ 		printf("clover r262: census t=%llu pid=%d threads=%u shown=%u"
+ 		    " hidden=%u wait=%u run=%u rx=%u tm=%u\n", (unsigned long long)secs, pid,
+ 		    call, cn, (call > cn) ? call - cn : 0, cwait, crun, crx, ctm);
++		/*
++		 * Round270. One row per census fire, before the rows it belongs to: if the wake-up never
++		 * arrives, that is the reading the thread rows have to be interpreted against. sgi=/tm= are
++		 * eight numbers each, one per logical core, because "the board loses IPIs" and "core 5 never
++		 * receives one" are different faults with different fixes.
++		 */
++		printf("clover r270: ipi t=%llu sent=%llu recv=%llu tick=%llu"
++		    " sgi=%u,%u,%u,%u,%u,%u,%u,%u tm=%u,%u,%u,%u,%u,%u,%u,%u\n",
++		    (unsigned long long)secs,
++		    (unsigned long long)armcpu_ipi_sent,
++		    (unsigned long long)armcpu_ipi_interrupts,
++		    (unsigned long long)armcpu_timer_interrupts,
++		    armcpu_core_sgi[0], armcpu_core_sgi[1], armcpu_core_sgi[2], armcpu_core_sgi[3],
++		    armcpu_core_sgi[4], armcpu_core_sgi[5], armcpu_core_sgi[6], armcpu_core_sgi[7],
++		    armcpu_core_timer[0], armcpu_core_timer[1], armcpu_core_timer[2],
++		    armcpu_core_timer[3], armcpu_core_timer[4], armcpu_core_timer[5],
++		    armcpu_core_timer[6], armcpu_core_timer[7]);
+ 		for (i = 0; i < cn; i++) {
+ 			char peer[24];
+ 			uint32_t mmc = 0;
