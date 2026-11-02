@@ -20803,3 +20803,50 @@ tee 类 `{ "clover r273: ", "r273-wl", 64, 0, 0, 0 }`（`drivers/CloverSdhci/Clo
 内核 `393e6c45…` → AMFI 后 `2f18a6db…`（两处站点仍在 0x1acb0e4/0x1acb16c）→ 归一化 `37267494…`；
 出厂镜像 `~/clover-out/round273-payload.img` sha256 `b35a50b9…`。两道闸门 exit=0，
 `task.c`/`kern_event.c` 语法门 exit=0、诊断条数与本轮改动前一致（112/44，全是既有告警）。
+
+
+## r273 读数（boot 60，文件 `boot61-r273.txt`）：workloop 已经绑到一条线程，而那条线程睡在机器号上
+
+四次拍火一致（`t=1416/1549/1672/1799`），每次表头都写 `wl=5`，四条 `clover r273: wl` 的字段一字不差：
+
+```
+clover r265: peer t=1416 pid=141 comm=com.apple.datam- threads=8 shown=8 hidden=0 wait=8 run=0 rx=1 tm=0 wl=5
+clover r273: wl t=1416 pid=141 tid=360 kn=fffffff8ab892980 kq=fffffff7c46b8d00 wlo=1 ks=18a0 kc=0
+             kqpid=141 dyn=10170c840 tr=5 tc=0 tt=35f ow=0
+```
+
+**读到的事，逐条。**
+
+1. `wlo=1`：这五条等待的等待字确实是 workloop 的 knote（不是猜的）。
+2. `kq=fffffff7c46b8d00`、`dyn=10170c840` 对五条等待（`360/361/388/49a/823`）**完全相同**，
+   而且 `kqpid=141` 就是它们自己的进程——boot 52/53 那个「五条睡在同一只 loop 上」从此是**读数**，不是推断。
+3. **`tr=5` = `WORKQ_TR_STATE_BOUND`、`tt=35f`、`ow=0`**。这一条是本轮真正买到的东西：
+   workqueue **已经**给这只 loop 交了一条线程（0x35f），所以「workqueue 不肯加线程」这一支当场死掉；
+   而 `kqwl_owner` 是空的——也就是说 r267 在 boot 59 报的 `owner=3b7` 走的是
+   **「已绑的请求线程」那一支**，不是「有人正在 loop 里当差」。r273 存在的理由就是这个塌法分不开，现在分开了。
+4. `kc=0`：这只 loop 上**没有排队待处理的事件**。所以卡点不是「事件排着没人取」，
+   而是「取了事件的线程出不来」——五条同步等待在等这只 loop ack，而这只 loop 唯一的线程正在别处睡。
+5. `tt=35f` 就是同一次普查里的另一行：`pth tid=35f st=41 ... hint=6`（机器号）、
+   `r268: sem count=-1 srights=1 receiver=kspace`、`r269: srhost hit=141 name=3d1b scanned=78 probed=78`
+   ——**全系统唯一能叫醒它的发送权在 pid 141 自己手里**。它的用户栈（`r266: pustk tid=35f`）
+   在本靴 slide `0x16700000` 下念出来是：lr/frame0/frame5..frame9 全在
+   `/usr/lib/system/libdispatch.dylib`（`+0x4680 / +0x4cdc / +0x61c9c / +0x62cc0 / +0xa3f8 / +0xae74 / +0x14794`），
+   中间 **frame1..frame4 落在债主自己的主镜像里**：`0x101177d50 / 0x1011799fc / 0x10117a1a0 / 0x1011743d0`。
+   也就是说：**libdispatch 把这条 loop 的服务线程交给了 datamigrator 自己的代码，那段代码在里面
+   做了 `dispatch_semaphore_wait`，而该发信号的人再也发不出来**（其余 7 条线程：5 条等这只 loop、
+   1 条 `hint=2` 空等收信、1 条 `hint=f` parked 工人）。
+
+**正对照第一次真的干活。** 第一次拍火表头写 `wl=5`，可那趟只印出 2 条 r273 行
+（`tid=360`、`tid=823`）——**另外 3 条被 tee 的每趟上限挤掉了**。没有 `wl=` 的话，
+这一趟会被读成「只有两条线程等 workloop」。后面三趟都是 5 条齐全。所以「行数 < wl」
+以后都当作掉行处理，不当作事实。
+
+**下一轮（r274）问的一件事**：主镜像那 4 帧是谁。本板已经能念共享缓存（slide 由 `sbm2x` 钉死），
+唯独主镜像缺**加载基址**——这正是我先前记在保真账上的一条，现在它在关键路径上。
+r274 就印这个：普查里读 `peer->map` 的头几个 `vm_map_entry` 的 `start/end`
+（`task.c` 已经拿得到 `peer->map`，r266 就是用它取 pmap 的），让宿主把
+`0x101177d50` 这类地址减成主镜像内的 vmaddr，再用本地的 `~/clover-out/datamigrator.macho`
+把「谁在 workloop 服务路径里等机器号」念成函数名。有了名字才谈得上修法：
+要么那段代码不该同步等（改成 workloop 的第二次投递/redrive），
+要么它等的那个信号本来该由同一个进程里另一条被这只 loop 卡住的线程发——两支的刀口不一样。
+
