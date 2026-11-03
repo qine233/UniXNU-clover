@@ -23659,3 +23659,52 @@ checker 钉这两条。
 `read-clover-log.py --selftest` 另加两枚正对照：带签名的句子与 marker 必须印出正文与 `magic=yes`，
 同一格抹掉签名必须印「not a sentence」且**不得**印出正文；三枚真窗回归——boot 89 拒 `chronod`、
 boot 91 拒 `osanalyt` 混血、boot 90 那条诚实 marker 除新 `magic=absent` 标签外逐字不变。
+
+## Round302 读数（boot 92，v0.7.9）：**marker 的签名第一次落地，句子仍写不进卡——这靴把「卡在 sink 里拒收」钉成了形状**
+
+冷刷 `round302-v0.7.8-payload.img`（sha256 `f26c1037…`），`--boot-after-flash --allow-misc-bcb`，22:33 起跑、
+22:45 落回；boot 计数 91 → 92（脚本自报「the boot count moved」），driver verdict 环里 `r212`/`r301`/`r302`
+三族行都在 boot 92 名下、校验全 ok ⇒ 身份对，§Round302 ⑤ 七支判读按真值往下走。
+
+**① marker 侧落在 (a)。** `panic seq 0 slot 0 t=564828ms stage=0 log_ready=1 host=0x286c8
+log_first=13320216 rc=0 drained=0 boot=92 magic=yes gates=0x7(armed,bcb,text)`。
+**独占缓冲 + 签名成立**：boot 91 那格混血（`event=5 dir=3 blocks=8`＋活的 `stage/pid/comm`）这一靴不在了，
+这条 marker 干净——stage=0（sink 入口）、rc=0、boot=92，一字不串。**但 slot 1 仍是 boot 87 的 STALE
+stage=1（exit）marker** ⇒ boot 92 自己的**退出 marker 没落地**（写它的是 sink 里 `flightPanicMark(1,rc)`，
+同一块 `gFlightMarker`、同一条 `writePioBlock`，却没写进去）。
+
+**② 句子侧落在 (f)。** verdict 环 `CloverSdhci r302: blind ok=0 chars=352 total=480 slot=8`
+（seq 46，boot 92），flight 段 `no sentence record`，slot=8 = 92 % 12 对得上 ⇒ **这笔盲写也被拒**，
+且 `chars=352>0` 说明有正文可写（352 是这块的容量、480 是全文）。三笔读数同病：
+`drain enter … append_rc=2`、`r301: panic text rc=2`／`r301: panic copy rc=2 chars=480 said=2`、
+`r302: blind ok=0` ⇒ **append 的 pre-write read（rc=2）与句子盲写（ok=0）与退出 marker（缺席）一起失败**，
+只有 sink 进门那一笔（entry marker）写成了。
+
+**③ 结构性新发现（预登记没写这一支，但字面上可读）。** report 环（kind-20）**最后一笔是 boot 87**：
+16 格 seq 34–49 = boots 52,53,54,55,56,58,59,60,61,62,65,66,74,76,84,87。
+**boot 88/89/90/91/92 五连靴都进了 sink，却一张 kind-20 都没留下** ⇒ `append_rc=2` 连续五靴。
+更细的不对称在 verdict 环的时间线里（seq 39–52 全 boot 92、按序）：
+seq 39/40 = `r172: dma cmd lba=27830960` → `r159: multi read fail lba=27830960`（一笔读在 sink 之前就失败了）；
+seq 41–50 = drain enter→exit（中间夹着 r301/r302 那几行）；seq 51/52 = drain exit 之后
+`r169: read gave up lba=27830960` → `r215: card recover why=gaveup … ok=1`。
+⇒ **这枚 lba 27830960 在读路径上反复失败、driver 整卡恢复（cmd0→cmd7 重训）**，sink 的三笔 flight 写
+正撞在这段卡故障里；而 **verdict 环照写不误**（drain 行都在卡上）——所以不是「卡全死」，
+是「卡在 sink 那一小段里对 flight 写拒收」。预登记 (b) 支那句「诊断要从『谁重建缓冲』挪到『谁重放传输』」
+这一靴**提前兑现**了方向：r302 已经把缓冲切成独占，剩下的失败在传输/卡这一侧。
+
+**④ 结局时间带（第五个数据点）。** beats 416–452 s；sink entry marker t=564828 ms；flight entries 一路写到
+**t=645439 ms**（axassets/wifid/analytic/cloudd/manageda，**每一笔都 `stuck=1 recov=1`**——卡已经在降级态）；
+deadline 记录仍是 boot 87 的 ⇒ 复位发生在 645 s 之后、1800 s 之前，**不是 deadline 复位**（sink 的 recovery 复位）。
+八核像五靴五个时间：≈645–7xx（92）/ 642.7–7xx（91）/ 661–7xx（89）/ 746–7xx（90）/ 835–9xx（88）
+⇒ **分布第五次落地**；这一票仍是「同族、非控制」，「核数 vs 镜像」那轮控制仍未跑。
+
+**⑤ 债务重估。** r302 **结清了**：判决记录独占缓冲 + 自带 magic，boot 92 读作 `magic=yes` 且字段干净。
+**未结清**：句子仍到不了卡上，但原因已从「没有一条不靠 flush 的写法」变成「写法有了、卡在 sink 里拒收」。
+下一问很具体：**为什么 sink 里只有第一笔 flight 写能落地，后面三笔全被拒，而 verdict 环照写不误？**
+boot 92 的 `lba 27830960` 反复 multi-read fail + card recover 是现成线索。设备侧下一格（r303）要给
+`flightPanicText`／`flightPanicMark` 的 `writePioBlock` 补**失败自证**（像 r298 给翻译补 `rerr=` 那样——
+现在 `blind ok=0` 只知道被拒，不知道被什么拒），或在 sink 里每笔写前打一拍卡状态（r159/r169/r215 已在环里，
+缺的是「这一笔 flight 写为什么 false」的那一条）。
+
+**⑥ 产物。** `~/clover-out/round302-boot92-window.bin`（623,104 B）与解码 `…bin.txt`
+（16 report / 64 verdict / 0 probe / 512 kernel，boot 92）、`r302-boot92-unattended.log`。

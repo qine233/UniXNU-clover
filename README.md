@@ -273,6 +273,21 @@ leave」一路收紧到一句可测的话：
   其中「槽被拒读而 `drain enter boot=92` 存在」那一支是本轮最重要的一支——若落地，说明混血不是共用缓冲造的，
   诊断要从「谁重建缓冲」挪到「谁重放传输」。普查尾巴仍四靴 0 行、`r300: fire/done` 那份非管道副本仍欠，
   桌面主线（#577）与「镜像 vs 核数」那轮控制都没动。
+* **boot 92（r302 / v0.7.8 的读回）：marker 的签名第一次落地，句子仍写不进卡——这一靴把「卡在 sink 里拒收」钉成了形状**。
+  判读落在预登记的两支：**marker 侧 (a)**——`panic seq 0 slot 0 t=564828ms stage=0 boot=92 magic=yes`，
+  独占缓冲 + 签名成立，boot 91 那格混血（`event=5 dir=3 blocks=8`）不再出现；
+  **句子侧 (f)**——`CloverSdhci r302: blind ok=0 chars=352 total=480 slot=8` 且 flight 段 `no sentence record` ⇒
+  这笔盲写**有正文可写却被卡拒收**。三笔同病：`append_rc=2`（append 的 pre-write read 被拒，与 boot 90 同款）、
+  `blind ok=0`、且 boot 92 的退出 marker（slot 1）缺席——sink 里**只有进门那一笔写成了**。
+  结构上更硬的证据在 verdict 环时间线里：seq 39/40 = `r172: dma cmd lba=27830960` → `r159: multi read fail lba=27830960`
+  发生在 drain enter 之前，seq 51/52 = `r169: read gave up` → `r215: card recover why=gaveup` 在 drain exit 之后，
+  而中间 drain 的 verdict 环行**照写不误** ⇒ 不是「卡全死」，是「卡在 sink 那段对 flight 写拒收」，
+  预登记 (b) 支的方向（诊断从「谁重建缓冲」挪到「谁重放传输」）这一靴提前兑现。report 环最后一笔是 boot 87
+  （16 格 seq 34–49，boot 88/89/90/91/92 五连靴全 `append_rc=2` 没留一张 kind-20）。
+  结局 ≈645–7xx s（卡上最后一笔 645.4 s、无 deadline 记录）⇒ 八核像五靴五个时间，分布第五次落地；
+  「核数 vs 镜像」那轮控制仍未跑。**债务重估**：r302 结清「判决记录独占缓冲 + 自带 magic」，
+  未结清的是「句子到不了卡」——写法有了（盲写不预读），剩下的是 sink 里那笔写为什么 false（r303 要给
+  `writePioBlock` 补失败自证，像 r298 给翻译补 `rerr=` 那样）。详见 `notes/development-log.md` §Round302 读数。
 * **再后一支（本格欠的两条仪器债）**：`vbits=`（`ipc_right_lookup_read()` 已经交出的 entry 位掩码，
   用来分 port set / send-once，不需要对象、锁纪律与 translate 同一条）与 `qmc=/qsr=` 自带返回码。
 * **那笔「等设备解锁」的死等已经不是现场，但它的机制现在读全了**：r274 命中的形状是
