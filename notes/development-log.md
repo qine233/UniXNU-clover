@@ -22461,3 +22461,147 @@ watchdogd symptomsd WirelessRunner`），`r281: aks` 行显示我们自己的 ke
 一个名字，在**缓存字符串表**里只剩两个候选（`com.apple.migration`、`com.apple.migrationpluginwrapper`；
 `com.apple.migration.plist` 不是服务名）——选不出来是仪器问题，不该让读数背。r295 的加宽以
 「pid 58 那行必须完整印出 `com.apple.backboardd`」为正对照。
+
+## Round295 (v0.6.99): 第二枚名字源 + 顺 send 传递式走四跳
+
+**① 先收回上一节的一句话：加宽读不出来。** 上面那段把 r295 写成「`peer=`/`comm=` 至少 24 字符」，
+动手后才发现这条**在本 kernel 里做不到**：截断不在读者，而在字段。`bsd/sys/param.h:95` 是
+`#define MAXCOMLEN 16`，`struct proc` 的名字槽是 `p_comm[MAXCOMLEN+1]`＝**17 字节**，
+`proc_name_address()` 递出来的就是这一枚数组；把 `char comm[]` 摆宽只是多印两个 NUL。
+15 个字符恰好是 `com.apple.migration` 与 `com.apple.migrationpluginwrapper` 还相同的那一点，
+所以「加宽缓冲区」救不回任何信息——这条不是猜测，是读了 `param.h` 与 `p_comm` 声明之后的结论。
+
+**② 换一枚不截断的名字源。** 可执行文件的 vnode 留着完整的名头（name component），而这两颗服务不共用它。
+VFS 的公开 KPI 是 `vnode_getname(vnode_t)` / `vnode_putname(const char *)`（`bsd/sys/vnode.h:2342/2350`）。
+但读它要落在哪儿不是随便挑的：`osfmk/kern/task.c` 里 `struct proc` 只是**前置声明**（第一次编译就在
+`pp->p_textvp` 上撞出 `incomplete definition of type 'struct proc'`），`struct vnode` 的完整定义又只躺在
+`bsd/sys/vnode_internal.h`——**`bsd/kern/proc_info.c` 是本树里少见的两边都完整的文件**，名字就读在那里，
+`clover_proc_exec_name(task, out, outlen)` 返回四态整数，task.c 用一条 `extern` 声明问它。
+
+**③ 锁的前提要一起验（照抄 KPI 不等于照抄前提）。** `vnode_getname()` 往下走
+`vnode_getparent_and_name()`（`vfs_cache.c:922`）拿 `NAME_CACHE_LOCK_SHARED`，缓存没命中就 `vfs_addname()`
+→ `add_name_internal()` 再拿 `strtable_rw_lock`（shared）**并且可能分配/扩容**。也就是说它会阻塞。
+因此调用点必须在**任何 task lock 之外**：`clover_bb_chain` 对 `cur->lock` 用的是 `lck_mtx_try_lock`，
+读完线程就 `lck_mtx_unlock`，**之后**才问名字；`clover_proc_exec_name` 自己不再拿任何锁。
+`check-clover.py` 把这条写成了反向断言——r295 补丁的新增行里出现 `vn_getpath(`、`vnode_lock`、
+`lck_mtx_lock(`、`proc_lock(` 任一条就判失败（`vn_getpath` 是另一条看起来更简单的路，它会阻塞并且要
+`vn_finish`，在采样线程里不能用）。
+
+**④ 空名字要能自证为什么空。** 沿用 r293 那条规矩（仪器要看得见它问的那一刻），`exec=` 后面跟一枚
+`ex=` 四态：`ok` / `noproc`（BSD 进程已经不在了）/ `notext`（镜像没有 text vnode）/ `noname`
+（名字缓存里没这根字符串）。boot 50 已经证明过：不分开写，「没解开」与「没有」在卡上是同一行字。
+
+**⑤ 传递式走链，每一步说得出怎么停的。** 老的普查只走一跳（`clover_bb_peer_census`），boot 82 的链就
+断在跳到的那个人身上。r295 改成 `clover_bb_chain`：从 58 出发，在**当前 task 自己的地址空间**里解析那笔
+remote 名（r264 修正过的解码：x16 = `-47` 是 trap 号、x3 = 目的端口），拿到属主当作下一跳，四跳封顶、
+五行输出，`seen[]` 按 pid 防环。终止不是空白而是判决：
+`lock_busy`（这人的 task lock 被别处占着，本行其余不读）、`no_trap`（没有线程在 mach trap 里）、
+`no_send`（在 trap 里但没指远端口）、`no_owner`（那枚名反查不到接收 task）、
+`self_reference`（等的就是本跳或链起点）、`cycle`（等的是这条链已经走过的 task）、
+`depth_limit`（第五跳到了，`peer=` 仍把它点名）。引用只经 `clover_bb_peer_task` 取、每条不走下去的分支
+都 `task_deallocate`；它**不调用** `clover_bb_sample`，所以「既是债主又是欠款人」不会让这里递归。
+
+**⑥ 卡上通道按同一理由开好。** `drivers/CloverSdhci` 新增类 `{ "clover r295: ", "r295-chain", 128, 0, 0, 0 }`
+并进每拍上限的豁免链——链被上限砍在第四跳，和链自己停在第四跳，在卡上长得一模一样。
+
+**⑦ 宿主侧：把落地瞬间的物理读数自动化。** `scripts/run-clover-unattended.sh` 在「确认 TWRP 的 adb 存在」
+的第一时间、**读卡上日志之前**抓 `/sys/class/power_supply`、`/sys/class/thermal` 与 `rawdump` 头 512 字节，
+落到 `*.landing-sensors.txt` 与 `*.landing-rawdump-head.bin`。这是 boot 82 第 ⑤ 条的账：那次是复位后
+9 分钟手工补抓的 25.0 ℃，读不了复位那一刻。本轮只动宿主脚本，不动负载、不因此发版；两枚循环已在真机
+TWRP 上干跑验证过输出格式。**同一份快照里 `emmc_therm` 报 `-40`**——这颗传感器在本板没接，读数按「未接」
+处理，不当「卡很凉」用。
+
+**⑧ 判据（刷之前写死，boot 83）**：正对照 `hop=0` 的 `exec=` 必须是 `backboardd`；若它印 `-` 配
+`ex=noname`，说明截断不是这台仪器唯一的毛病，这一支先修仪器再说链。往下：`hop=1` 期望 `datamigrator`；
+`hop=2` 的作用就是把 `com.apple.migration` 与 `com.apple.migrationpluginwrapper` 分开——**这两者对桌面是两
+件不同的事**（前者是迁移服务本体，后者是它的插件包装进程）。链的终止判决决定下一支：落在
+`no_owner`/`no_send` ⇒ 债链断在我们读不到的地方，去问内核外；成环 ⇒ 按「谁先破环」做；走到
+`SpringBoard` ⇒ 回 r206 那格 SIGKILL 线；四跳没走完（`depth_limit`）⇒ 加深度，别加猜测。
+**本轮不碰 GPU**（boot 82 已把它从复位嫌疑里摘出去），复位来源那一格等 ⑦ 的自动快照攒够几靴再说。
+
+**⑨ 产物与账。** 内核 `kernel.macho` sha256 `e698a3e5…`（AMFI 后 `2507bfc0…`，落点在 file 偏移
+`0x1ad30e4`/`0x1ad316c`；归一化后 `65dd99c3…`，抹掉 973 枚对象印记）；负载
+`~/clover-out/round295-v0.6.99-payload.img` sha256 `81853304163f447863877910326dab45152e12ced42ee03690d1d58ea1a678f0`，
+内核两枚副本同目录 `round295-kernel-{amfi,normalized}.macho`。补丁
+`patches/xnu/zzzz…z(54)-clover-r295.patch`（三处 hunk：`bsd/kern/proc_info.c` 追加、`osfmk/kern/task.c` 两个），
+与 `UniXNU-clover/patches/xnu-clover/` 那份逐字节相同（`cmp` 过）；`LATE_PATCH` 里排在 r289 之前（最新先出）。
+两道闸门都过：`check-clover.py` 的 r295 块（含七枚 `end=` 字面量与四态 `ex=`）、
+`verify-clover-payload.py` 的 `bb-send-chain`（整行 printf 字面量在负载里的内核文本上命中）。
+上机日志 `~/clover-out/r295-boot83-unattended.log`，窗口 `~/clover-out/round295-log-window.bin(.txt)`。
+
+### boot 83（round295 / v0.6.99，2026-11-03）：**仪器两条判据都成立，债链的叶子第一次有名有姓**
+
+**① 判决。** 链跑通了，而且每一行都带着自己的终止判决：
+
+```
+[667.042438] hop=0 t=657 pid=58  comm=backboardd       exec=backboardd                  ex=ok threads=16 wait=11 run=5 trap=8  rcv=d903 remote=d013 rmc=0 rsr=1 peer=148:com.apple.datam end=-
+[667.042532] hop=1 t=657 pid=148 comm=com.apple.datam  exec=com.apple.datamigrator      ex=ok threads=8  wait=7  run=1 trap=1  rcv=112b remote=5403 rmc=0 rsr=1 peer=166:osanalyticshelp end=-
+[667.042573] hop=2 t=657 pid=166 comm=osanalyticshelp  exec=osanalyticshelper           ex=ok threads=2  wait=1  run=1 trap=1  rcv=0    remote=0    rmc=0 rsr=0 peer=-                end=no_send
+[807.447694] hop=0 t=797 pid=58  comm=backboardd       exec=backboardd                  ex=ok threads=16 wait=13 run=3 trap=10 rcv=d903 remote=d013 rmc=0 rsr=1 peer=148:com.apple.datam end=-
+[807.589161] hop=1 t=797 pid=148 comm=com.apple.datam  exec=com.apple.datamigrator      ex=ok threads=8  wait=7  run=1 trap=1  rcv=7b07 remote=5907 rmc=0 rsr=1 peer=202:com.apple.migra end=-
+[807.736011] hop=2 t=797 pid=202 comm=com.apple.migra  exec=com.apple.migrationpluginwrapper ex=ok threads=4 wait=4 run=0 trap=1 rcv=0   remote=0    rmc=0 rsr=0 peer=-                end=no_send
+```
+
+预登记的正对照成立：`hop=0` 的 `exec=backboardd ex=ok`。六行 `ex=` **全是 `ok`**，也就是说
+第二枚名字源在本板没有一格是空的——`noproc`/`notext`/`noname` 一次都没出现，这既是好消息也说明
+四态标签这一层还没被真实咬过（它的地平线仍未测满，不是缺陷）。
+
+**② boot 82 那两个候选，答案定了。** `peer=202` 的 `comm=` 仍是那半截 `com.apple.migra`
+（字段极限，见上一节 ①），但 `exec=` 给的是 **`com.apple.migrationpluginwrapper`**，不是
+`com.apple.migration`。对桌面这是两件不同的事：被问的是**插件包装进程**，它自己 4 根线程
+**全在等、0 根在跑**。pid 也从 187 挪到 202——boot 82 那句「187 是谁」不该继续被引用，
+本靴的同一条链读出来就是 202。
+
+**③ 链不是静态的。** 同一根 `hop=1`（datamigrator，pid 148）在两拍里指的是**不同的端口、不同的对家**：
+t=657 走 `remote=5403` → pid 166 `osanalyticshelper`，t=797 走 `remote=5907` → pid 202
+`migrationpluginwrapper`。⇒ 说「datamigrator 在等 X」要带上拍次；它能等的人不止一个。
+而 `hop=0`（backboardd）两拍都走同一枚 `remote=d013`，对端始终是 148。
+
+**④ 两拍的叶子都是 `no_send`，而这正是这一轮留下的仪器缺口。** `no_send` 的含义写死在代码里：
+这人有线程在 mach trap 里，但那根的 `x3`（目的端口）为 0——**它不是没在等，是在纯收**。
+现在的捕获条件是「第一条 `x[3]!=0` 的线程」，所以纯收那根的 `rcv=`/`to=` 全印成 0，
+`rmc`/`rsr` 也就没读。⇒ 这一行只能说到「链停在等回音的人身上」，说不出**它在等哪一枚口、
+回音是不是已经在队列里**。r296 要补的就是这一格（判据见 ⑧）。
+
+**⑤ 第七起静默复位，还在同一条时间带里。** 卡上 `boot 83` 名下 **kind-20（panic 报告）0 条**；
+`--flight` 的两条 panic 标记仍是 `boot=76` 并印 `STALE: boot 83 never entered the sink`，
+deadline 槽读到的是那条**未盖章**的旧记录（`t=1802682 ms`，`un-stamped`）⇒ 本靴既没进 panic 管道、
+也没走到自己的 1800 s。落点由宿主墙钟界定（离开 fastboot 14:41:30，脚本看见 TWRP 的 adb 在
+14:56:14 与 15:02:23 之间）⇒ **复位在开机后约 884–1253 s 之间**，比 boot 82 的 707 s 晚、
+比 boot 77 的 1248 s 早，仍落在 707–1335 s 那一带里（第七起：718/1184/1248/1335/997/707/本靴）。
+r292 的 WDT 第八靴同判：`en=0 armed=0 intmask=0 sts=0`、bark/bite 在复位值、全程无 `chg`
+⇒ APSS watchdog 继续被排除。**这一轮不加任何复位嫌疑的读数**，因为 r295 的账在桌面那一格。
+
+**⑥ 落地快照第一次自动跑，并且立刻证明了它不是仪式。** `run-clover-unattended.sh` 在 TWRP 的 adb
+出现的第一时间抓下（复位后约 25 s，对照 boot 82 那次的 9 分钟）：
+`temp=250`（25.0 ℃）、**`charger_temp=322`**、`status=Charging`、`current_now=18554`、
+`voltage_now=4344959`、`die_health=Cool`、`system_temp_level=0`、tsens 最高 37.0 ℃。
+boot 82 九分钟后读到的是 `charger_temp=294` 与 `status=Full`——**同一个物理量，晚了九分钟就低了
+2.8 ℃、充电状态也从 Charging 掉成 Full**。⇒ 「复位时不热」这句话以前没有依据，现在也没有：
+本靴的落地读数说明机身在复位后那一刻**是温的**，而 25 ℃ / 37 ℃ 远在任何限流门槛之下——
+这只把「热到关机」这一支判成不太可能，**不能**判成「与电无关」。
+`emmc_therm` 报 `-40`：这颗传感器本板没接，按「未接」处理，不进任何结论。
+`rawdump` 头 512 字节**全 0**（`tr -d '\0' | wc -c` = 0）⇒ 第七起也没有 staged ramdump，
+「等一次崩了就有现成 dump」这条路继续是空的。产物：
+`~/clover-out/round295-log-window.bin.landing-sensors.txt`（7650 字节）与
+`...landing-rawdump-head.bin`（512 字节）。
+
+**⑦ 卡上最后的动静，与复位之间隔了约 300 s。** 内核环的最后一行在 `829.762011`，飞区最新一条
+entry 在 `909897 ms`（beat 最新在 `791651 ms`，解码器自己报了 `gap 118246 ms`），此后到复位之前
+卡上再没有任何写入。这与「UI 那几个进程全在等一个不回音的往返」是同一个形状，
+但**只记相关性**：写入静默既可能是没活干，也可能是驱动自己没被叫到，本格的读数分不开这两支。
+
+**⑧ 下一支（r296，桌面主线）：把 `no_send` 那行读成「它在等谁的收」。** 沿 ④ 那一格补三样东西——
+trap 里那根纯收线程的 `rcv=`（`x5>>32`）与 `to=`（`x7`），以及**在收方向**读那枚口的
+`rmc`/`rsr`（r223/r265 已经在发送方向做过同一件事，这里把它挪到接收侧）。判据现在写死：
+(a) `rmc>0` 而线程仍在等 ⇒ **回音已经在队列里，缺的是唤醒/调度**，下一支往内核的投递-唤醒那一格走；
+(b) `rmc=0` 且该口 `srights=0` ⇒ 没人再持有发送权，问的是「这枚回音端口该由谁拿着」，属镜像侧；
+(c) `rmc=0` 且 `srights>=1` ⇒ 有人在、消息没到，回到 `migrationpluginwrapper` 为什么不起活；
+(d) 若 `no_send` 那行一个都读不出来（`rcv=0`）⇒ 是本板根本没进 `MACH_RCV`，那这一支改问栈：
+把 r236 的用户栈采样挂到叶子上，而不是挂在 pid 58 上。
+
+**⑨ 产物与账。** `~/clover-out/round295-log-window.bin(.txt)`（boot 83，512 行内核环、64 行驱动判据、
+16 条 report、1 条 probe）、`~/clover-out/r295-boot83-unattended.log`、
+`~/clover-out/round295-v0.6.99-payload.img`（sha `81853304…`）、
+`round295-kernel-{amfi,normalized}.macho`（`2507bfc0…` / `65dd99c3…`）、
+落地快照两枚见 ⑥。发版 **v0.6.99**。

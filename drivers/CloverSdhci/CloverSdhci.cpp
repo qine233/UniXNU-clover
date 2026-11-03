@@ -948,6 +948,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // census was capped, not that the page is silent -- and the census is the baseline the next round's
   // writes would be judged against, so losing it silently is the one outcome this class exists to prevent.
   { "clover r294: ", "r294-gpu", 32, 0, 0, 0 },
+  // Round295 walks the send chain, at most one row per hop and five hops per fire, on the same clock as the
+  // two censuses it is read beside. Twenty fires to the deadline is a hundred rows, so 128 is the same
+  // headroom r265-peer was given rather than a promise about how deep this boot's chain goes: the row that
+  // ends a chain is the one worth having, and a class that fills before the fifth hop would make depth_limit
+  // and a dropped row read alike. Separate class, because a boot whose chain was capped has to say so without
+  // taking the debtor census down with it.
+  { "clover r295: ", "r295-chain", 128, 0, 0, 0 },
   // Round289 speaks only at a fatal data abort, and it is the reading the panic record cannot carry:
   // the kind-20 slot is 480 bytes, and boot 74 and boot 75 both showed it cut off inside the register
   // list, before esr, far, fp and sp -- the four fields that name a fault. At most one abt row and two
@@ -4283,6 +4290,10 @@ static void teeConsumeLine (uint32_t &pushed)
   // Round290 rides with round286 for the reason already written above: its branch row is the only
   // place the halt bit is read, and a capped one would leave the boot saying "gfx3d was asked for"
   // with no way to say whether it ran.
+  // Round295 rides with the censuses for the reason r243 gave: the chain is worth reading only to its
+  // last row, and the verdict that ends it (end=depth_limit, end=cycle, end=self_reference) is printed
+  // there. A pass cap that ate the fifth hop would leave the boot looking as though the chain stopped
+  // after four.
   const bool reserved = probe != nullptr &&
       (teeHasPrefix (probe->name, teeStringLength (probe->name), "r234-set") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r243") ||
@@ -4295,7 +4306,8 @@ static void teeConsumeLine (uint32_t &pushed)
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r289") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r290") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r291") ||
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r294"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r294") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r295"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

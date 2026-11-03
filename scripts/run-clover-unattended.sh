@@ -356,6 +356,41 @@ twrp=$(adb shell getprop ro.twrp.version 2>/dev/null | tr -d '\r')
 device=$(adb shell getprop ro.product.device 2>/dev/null | tr -d '\r')
 say "recovery: device=${device:-?} twrp=${twrp:-?}"
 
+# Round295, host side. Thermal and voltage are quantities of the landing instant, not of the reading
+# instant: boot 82 reset at 707 s and this host only sampled its battery twenty minutes later, at
+# which point the board had cooled back to 25.0 C and status=Full -- a number that cannot clear or
+# convict thermal, because the interval between the reset and the sample is exactly where a thermal
+# cause would live. So the snapshot moves to the first moment recovery's adb is confirmed, before
+# any block read below, which is the closest this contract can get to the reset itself. Everything
+# here is a file read; nothing is written to the board.
+#
+# rawdump is the vendor RAM-dump writer's partition. Its head is taken at the same instant because
+# the boot 82 probe found the partition present but never read it on the board's own timeline, and
+# "no dump was written" read at landing is a different statement from the same words read later.
+landing_sensors="$(dirname "$OUT")/$(basename "$OUT").landing-sensors.txt"
+landing_raw="$(dirname "$OUT")/$(basename "$OUT").landing-rawdump-head.bin"
+{
+  echo "# landing snapshot at $(date -u +%Y-%m-%dT%H:%M:%SZ), taken before the log window was read"
+  echo "## /sys/class/power_supply"
+  adb shell 'for d in /sys/class/power_supply/*; do echo "-- ${d##*/}"; for f in $d/*; do printf "%s=%s\n" "${f##*/}" "$(cat "$f" 2>/dev/null)"; done; done' 2>/dev/null
+  echo "## /sys/class/thermal"
+  adb shell 'for d in /sys/class/thermal/thermal_zone*; do printf "%s type=%s temp=%s\n" "${d##*/}" "$(cat "$d/type" 2>/dev/null)" "$(cat "$d/temp" 2>/dev/null)"; done' 2>/dev/null
+} > "$landing_sensors" 2>/dev/null
+if adb exec-out "dd if=/dev/block/bootdevice/by-name/rawdump bs=512 count=1 2>/dev/null" \
+    > "$landing_raw" 2>/dev/null && [ -s "$landing_raw" ]; then
+  {
+    echo "## rawdump first 512 bytes (also saved beside this file)"
+    echo -n "printable: "
+    LC_ALL=C tr -cd '\40-\176' < "$landing_raw"
+    echo
+    od -c "$landing_raw" | head -12
+  } >> "$landing_sensors" 2>/dev/null
+else
+  rm -f "$landing_raw"
+  echo "## rawdump: no readable partition or no bytes came back at landing" >> "$landing_sensors"
+fi
+say "landing snapshot: $landing_sensors ($(wc -c < "$landing_sensors" | tr -d ' ') bytes, read only)"
+
 # Round214: misc, read only. Block 0 holds the BCB the panic path left (the host never writes it
 # here); block 1 holds the watchdog's two counters as text, so a boot whose card stopped answering
 # says whether the watchdog tripped and whether the card came back at all. Two blocks, no writes.

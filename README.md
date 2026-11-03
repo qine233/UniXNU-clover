@@ -32,9 +32,22 @@ leave」一路收紧到一句可测的话：
   `tid=38e` 持着一笔没人回音的 send：`remote=7e0f sr=1 rmc=0 peer=187:com.apple.migra`
   （远端口 0 条待办 = 消息被取走、回音没来）。**pid 187 是谁现在读不出来**：`peer=`/`comm=` 被截到 15 字符
   （同一枚缺陷把 `com.apple.datam` 也截了），缓存里只剩 `com.apple.migration` 与
-  `com.apple.migrationpluginwrapper` 两个候选——**选不出来是仪器问题，r295 第一刀就加宽它**
-  （正对照：pid 58 那行必须完整印出 `com.apple.backboardd`），再把普查从钉死 58/147 改成
-  **顺着 send 传递式走 4 跳**，终止条件印成读数：`no_send`/`no_owner`/`self_reference`/`depth_limit`。
+  `com.apple.migrationpluginwrapper` 两个候选——**选不出来是仪器问题，但不是能加宽的仪器问题**：
+  `bsd/sys/param.h:95` 的 `MAXCOMLEN 16` 让 `p_comm` 只有 17 字节，缓冲区摆宽救不回字段里从没存在的字节。
+  r295 因此换**第二枚名字源**——可执行文件 vnode 的完整名头，经 `vnode_getname()` 在
+  `bsd/kern/proc_info.c`（本树里 `struct proc` 与 `struct vnode` 同时完整的少数文件之一）读出来，
+  配一枚四态 `ex=`（`ok`/`noproc`/`notext`/`noname`）让空名字自己说为什么空；正对照是
+  pid 58 那行必须完整印出 `backboardd`。普查同时从钉死 58/147 改成
+  **顺着 send 传递式走 4 跳**，终止条件印成读数：`lock_busy`/`no_trap`/`no_send`/`no_owner`/
+  `self_reference`/`cycle`/`depth_limit`。
+* **boot 83 把这条链读全了（r295 已发出）**：`hop=0 exec=backboardd ex=ok`（正对照成立，两拍六行 `ex=` 全 `ok`）
+  → `hop=1 exec=com.apple.datamigrator`（pid 148，8 线程 7 等 1 跑）→ 叶子在两拍里**不是同一个人**：
+  t=657 是 `pid 166 exec=osanalyticshelper`，t=797 是 **`pid 202 exec=com.apple.migrationpluginwrapper`**
+  （`comm=` 仍是截断的 `com.apple.migra`，靠 `exec=` 才分开——boot 82 那两个候选的答案是**插件包装进程**；
+  pid 也从 187 挪到 202，旧 pid 别再引用）。叶子 `threads=4 wait=4 run=0 trap=1 end=no_send`。
+  **`no_send` 不能读成「这人没在等」**：它在代码里的含义是「trap 里那根的 `x3`=0」，也就是**纯收**——
+  捕获条件只挑 `x3!=0` 的线程，所以那根的 `rcv=`/`to=` 与收方向的 `rmc`/`rsr` 没读出来，
+  「回音是否已经在队列里」这一问本靴答不了。r296 补这一格（判据已写在流水日志）。
 * **那笔「等设备解锁」的死等已经不是现场，但它的机制现在读全了**：r274 命中的形状是
   `-[DMMigrator _unlockKeyBagUseOfForceIsAuthorized]` → `-[MigratorAlternateAppDelegate
   waitUntilPreboardDidFinishUnlock]` → `dispatch_semaphore_wait(sem, FOREVER)`（宿主复核
@@ -110,6 +123,16 @@ leave」一路收紧到一句可测的话：
   但**这是复位后 9 分钟的读数，读不成「复位时不热」**——TWRP 空转 9 分钟足以吹凉机身，正是 r293「仪器要能看见它问的
   那一刻」的同一家族。⇒ 改宿主脚本（不动负载、不发版）：落回 TWRP 的第一件事抓 `power_supply`/`thermal` 与
   `rawdump` 头部，再抓卡上日志。之前那句「电池这一支在 rec 里现测排除」按这条收回，等落地即测的读数再说。
+* **boot 83 把落地快照第一次自动跑出来，并且立刻证明那次九分钟的读数是低报的**：r295 的脚本改动在 TWRP 的 adb
+  出现后约 **25 s** 抓到 `temp=250`（25.0 ℃）而 **`charger_temp=322`（32.2 ℃）、`status=Charging`、
+  `current_now=18554`**——boot 82 晚九分钟读的是 `charger_temp=294` 与 `status=Full`，**同一个量差 2.8 ℃ 且方向是
+  复位后更热**，可见晚读会系统性低报，那条修正不是仪式。tsens 最高 37.0 ℃、`die_health=Cool`、`system_temp_level=0`
+  ⇒ 只能把「热到关机」判成不太可能，**判不出**「与电无关」。`rawdump` 头 512 字节仍全 0 ⇒ 第七起也没 staged ramdump。
+  `emmc_therm=-40` 是没接的传感器，不进结论。本靴也是**第七起静默复位**（kind-20 名下 0 条、panic 标记仍 `boot=76`
+  报 `STALE: boot 83 never entered the sink`、deadline 槽是那条未盖章旧记录），落点由宿主墙钟界定在开机后
+  **约 884–1253 s**，仍在 707–1335 s 那一带；WDT 第八靴同判（`en=0 armed=0`、全程无 `chg`）⇒ APSS watchdog 继续排除。
+  卡上最后的动静：内核环尾 `829.762 s`、飞区最新 `909897 ms`，之后到复位没有任何写入（解码器自己报 `gap 118246 ms`）
+  ——与「UI 那几个进程全在等不回音的往返」同形，**只记相关性**。
 * **`watchdogd` 那条相关性已撤掉，它的死因宿主已定名。** `watchdogd+0xab0c` 的 `bl` 在宿主上解到
   `libSystem/__os_crash`，紧跟的 `brk #1` 是编译器给 noreturn 调用返回加的兜底，它带的字符串是
   `connect_to_kext() unexpectedly failed - unable to lookup watchdog KEXT service` —— 缺的是
@@ -173,7 +196,12 @@ leave」一路收紧到一句可测的话：
 
 | # | 缺口 | 现状 | 下一步 |
 | --- | --- | --- | --- |
-| 1 | **backboardd 不回 SpringBoard 的信** | 卡在发给 `datamigrator` 的一笔没人回音的 XPC 往返（上节详述）；keystore 已发布（boot 82：`opens=22→27 calls=80→99 refused=0`）、当年那笔解锁死等已消失（`r268`/`hint=6` 两靴 0 行），workloop 等待者从五条读成三条；**boot 82 新读：债链多一跳**——datamigrator（pid 147）7 线程全等 0 跑，它自己有一笔没回音的 send 指向 `pid 187:com.apple.migra…`（`sr=1 rmc=0`），而 `peer=`/`comm=` 截到 15 字符，这个名字**现在读不满**（仪器缺陷，不是硬件事实） | **r295**：加宽 `peer=`/`comm=`（正对照=pid 58 那行完整印出 `com.apple.backboardd`），再把普查从钉死 58/147 改成**顺着 send 传递式走 4 跳**，终止条件印成读数 `no_send`/`no_owner`/`self_reference`/`depth_limit`；宿主那侧已把当年那笔等待读全（唯一的 `signal` 要 PreBoard 状态 0 **且** `MKBDeviceUnlockedSinceBoot()` 非 0，另外三枚回调只打日志）|
+| 1 | **backboardd 不回 SpringBoard 的信** | 卡在发给 `datamigrator` 的一笔没人回音的 XPC 往返（上节详述）；keystore 已发布（boot 82：`opens=22→27 calls=80→99 refused=0`）、当年那笔解锁死等已消失（`r268`/`hint=6` 两靴 0 行），workloop 等待者从五条读成三条；**boot 82 新读：债链多一跳**——datamigrator（pid 147）7 线程全等 0 跑，它自己有一笔没回音的 send 指向 `pid 187:com.apple.migra…`（`sr=1 rmc=0`），而 `peer=`/`comm=` 截到 15 字符，这个名字**现在读不满**（仪器缺陷，不是硬件事实） | **r295**：`peer=`/`comm=` 的截断**加宽解决不了**（`MAXCOMLEN+1`=17 字节，是字段的极限不是读者的极限），
+所以换第二枚不截断的名字源——exec vnode 的完整名头经 `vnode_getname()` 读在 `bsd/kern/proc_info.c`
+（`struct proc`/`struct vnode` 都完整的文件），调用点在任何 task lock 之外，配四态 `ex=`；正对照=pid 58
+那行完整印出 `backboardd`。普查同时改成**顺着 send 传递式走 4 跳**（`seen[]` 防环、引用只在
+`clover_bb_peer_task` 取与放），终止条件印成七种读数 `lock_busy`/`no_trap`/`no_send`/`no_owner`/
+`self_reference`/`cycle`/`depth_limit`；宿主那侧已把当年那笔等待读全（唯一的 `signal` 要 PreBoard 状态 0 **且** `MKBDeviceUnlockedSinceBoot()` 非 0，另外三枚回调只打日志），并且把落地瞬间的 `power_supply`/`thermal`/`rawdump` 快照做进了 `run-clover-unattended.sh`。**boot 83 已按这条读回**：链 `58 backboardd → 148 com.apple.datamigrator → 叶子`，叶子在两拍里换了人（t=657 是 `pid 166 osanalyticshelper`，t=797 是 **`pid 202 exec=com.apple.migrationpluginwrapper`**——两个候选靠 `exec=` 分开，`comm=` 照旧截断；旧 pid 187 别再引用），每一行都带 `end=`，六行 `ex=` 全 `ok`。⇒ **r296**：`end=no_send` 现在只能说「trap 里那根的 `x3`=0」也就是**纯收**，那根的 `rcv=`/`to=` 与收方向的 `rmc`/`rsr` 还没读，所以「回音是否已在队列里」本靴答不了；补上这三样，判据四支（`rmc>0` 仍在等 ⇒ 缺唤醒；`rmc=0 srights=0` ⇒ 该谁持有回音端口；`rmc=0 srights>=1` ⇒ 真没人回；`rcv=0` ⇒ 改把 r236 的用户栈采样挂到叶子上）|
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气通，两个候选地址全 NACK（`verdict=102`） | 先把面板轨真上电（依赖 3），再问地址 |
 | 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路好，但核心版本字不在 v5 带内，APID 一个没认 | 弄清版本字、认 APID、读轨开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 自校验通过），判决行还没上屏 | 有边就上 GLINK/APR；没镜像先压 `vadsp` 电源 |

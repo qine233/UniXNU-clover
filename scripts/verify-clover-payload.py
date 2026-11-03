@@ -1090,6 +1090,14 @@ def check_sb_sample(kernel: bytes) -> bool:
              # still leaves the prefix needles green.
              "bb-peer-map": (b"clover r274: map t=%llu pid=%d ne=%u shown=%u e0=%llx-%llx"
                              b" e1=%llx-%llx e2=%llx-%llx e3=%llx-%llx\n") in kernel,
+             # Round295: boot 82's chain ended on pid 187 and the kernel cannot say which service that is,
+             # because p_comm is 17 bytes and com.apple.migration and com.apple.migrationpluginwrapper share
+             # their first fifteen. The row carries both name sources and the walk's own verdict, so a chain
+             # that stopped is a reading rather than a missing row -- which is only true if the whole literal
+             # shipped, hence the pinned merge rather than a prefix.
+             "bb-send-chain": (b"clover r295: hop=%u t=%llu pid=%d comm=%s exec=%s ex=%s"
+                               b" threads=%u wait=%u run=%u trap=%u thid=%llx rcv=%x remote=%x"
+                               b" to=%llx rmc=%u rsr=%x peer=%s end=%s\n") in kernel,
              # Round275 measured the precondition of the only proposed fix and Round276 acted on it, so three
              # rows are pinned: the class lookup (what r275 read as 0/0 on boot 62, and what has to read 1 the
              # moment this round works -- the needle checking itself), the publish's own state (stage 3 with a

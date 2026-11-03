@@ -1,0 +1,268 @@
+diff --git a/bsd/kern/proc_info.c b/bsd/kern/proc_info.c
+index b33d152..505c68d 100644
+--- a/bsd/kern/proc_info.c
++++ b/bsd/kern/proc_info.c
+@@ -3992,3 +3992,45 @@ proc_set_dyld_images(int pid, user_addr_t buffer, uint32_t buffersize, int32_t *
+ 	*retval = 0;
+ 	return 0;
+ }
++
++/*
++ * Round295. The send-chain census in osfmk/kern/task.c names every task it walks, and
++ * the name it can print from there is p_comm -- MAXCOMLEN+1 = 17 bytes, which is not a
++ * limit of the reader but of the field: boot 82's last link, pid 187, reads
++ * "com.apple.migra" and com.apple.migration and com.apple.migrationpluginwrapper are the
++ * same fifteen characters. The executable's vnode keeps its whole name component and the
++ * two services do not share it, so the untruncated second name is read here: this is one
++ * of the few files in the tree that has both struct proc and struct vnode complete, and
++ * task.c -- which is Mach, and includes neither header -- calls this instead.
++ *
++ * Returns 0 with a name, or which of three states came back empty (1 no BSD proc, 2 no
++ * text vnode, 3 the name cache had no string), so the row can print the absence as a
++ * reading. Nothing is blocked for: p_textvp is read without the proc lock the same way
++ * the census reads p_comm beside it, and vnode_getname() takes only the VFS name-cache
++ * lock. It is called with no task lock held.
++ */
++int
++clover_proc_exec_name(task_t task, char *out, size_t outlen)
++{
++	proc_t pp;
++	const char *name;
++
++	if (outlen == 0) {
++		return 1;
++	}
++	out[0] = '\0';
++	pp = (proc_t)get_bsdtask_info(task);
++	if (pp == NULL) {
++		return 1;
++	}
++	if (pp->p_textvp == NULL) {
++		return 2;
++	}
++	name = vnode_getname(pp->p_textvp);
++	if (name == NULL) {
++		return 3;
++	}
++	strlcpy(out, name, outlen);
++	vnode_putname(name);
++	return 0;
++}
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 273f0cc..d817b6e 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12574,6 +12574,198 @@ clover_bb_peer_census(task_t peer, uint64_t secs)
+ 	}
+ }
+ 
++/*
++ * Round295. Boot 82's chain ends on a name no buffer in this kernel can print:
++ * peer=187 reads "com.apple.migra" because p_comm is MAXCOMLEN+1 = 17 bytes
++ * (bsd/sys/param.h:95), and 15 characters is exactly where com.apple.migration and
++ * com.apple.migrationpluginwrapper are the same string. That is a limit of the field,
++ * not of the reader -- struct proc is not even complete on this side of the kernel --
++ * so widening the buffers in these rows would recover nothing. The executable's vnode
++ * keeps its whole name component and the two services do not share it, and
++ * bsd/kern/proc_info.c is one of the few files where struct proc and struct vnode are
++ * both complete, so the untruncated name is read there and asked for here.
++ */
++extern int clover_proc_exec_name(task_t task, char *out, size_t outlen);
++
++static const char *const clover_bb_exec_states[] = {
++	"ok", "noproc", "notext", "noname"
++};
++
++/*
++ * Round295. Returns which of four states the second name came back in, because an
++ * empty exec= has to say whether the process was already gone, its image had no text
++ * vnode, or the name cache had no string for it -- boot 50 proved that an unresolved
++ * name and an absent one print alike otherwise. Called with no lock held: the helper
++ * takes the VFS name-cache lock, which must not be taken under a task lock.
++ */
++static const char *
++clover_bb_exec_name(task_t task, char *out, size_t outlen)
++{
++	int state;
++
++	state = clover_proc_exec_name(task, out, outlen);
++	if (state < 0 ||
++	    state >= (int)(sizeof(clover_bb_exec_states) / sizeof(clover_bb_exec_states[0]))) {
++		out[0] = '\0';
++		return "unknown";
++	}
++	return clover_bb_exec_states[state];
++}
++
++#define CLOVER_BB_CHAIN 4
++
++/*
++ * Round295. The census walks one hop: it names the debtor of the blocked process and
++ * stops there, which is how boot 82 left pid 187 as the last readable link. This
++ * walks the send chain instead. Each hop takes the first thread of that task which is
++ * sitting in the mach trap with a remote name -- the same decode round264 fixed, x3
++ * is the destination port and x16 the trap number -- resolves that name in the hop's
++ * own space, and makes the owner the next hop. Four hops, five rows, and every row
++ * states why it stopped, so the end of a chain is a reading rather than an absence:
++ *
++ *   lock_busy     this task's lock was held elsewhere; nothing else on the row is read
++ *   no_trap       none of its threads is inside the mach trap
++ *   no_send       one is, but it names no remote port (rcv= is its own side)
++ *   no_owner      the remote name did not reverse-map to a receiving task
++ *   self_reference it waits on this hop, or on the process the chain started from
++ *   cycle         it waits on a task this chain already walked
++ *   depth_limit   the fifth hop was reached; peer= still names it
++ *
++ * It takes a peer reference only through clover_bb_peer_task and drops every one it
++ * does not walk on. It never calls clover_bb_sample, so a task that is both waiter
++ * and debtor cannot make this recurse.
++ */
++static void
++clover_bb_chain(task_t root, uint64_t secs)
++{
++	task_t cur = root;
++	task_t next;
++	int owned = 0;
++	unsigned int hop = 0;
++	int seen[CLOVER_BB_CHAIN + 1];
++	uint32_t nseen = 0;
++
++	while (cur != TASK_NULL) {
++		thread_t thr;
++		struct proc *pp;
++		unsigned int call = 0;
++		unsigned int nwait = 0;
++		unsigned int nrun = 0;
++		unsigned int ntrap = 0;
++		uint64_t ntid = 0;
++		uint64_t nrcv = 0;
++		uint64_t nrem = 0;
++		uint64_t nto = 0;
++		uint32_t nrmc = 0;
++		uint32_t nrsr = 0;
++		char comm[16];
++		char exec[40];
++		char peer[24];
++		const char *exstate;
++		const char *end = "-";
++		int busy = 0;
++
++		comm[0] = exec[0] = peer[0] = '\0';
++		next = TASK_NULL;
++		if (!lck_mtx_try_lock(&cur->lock)) {
++			busy = 1;
++		} else {
++			queue_iterate(&cur->threads, thr, thread_t, task_threads) {
++				arm_saved_state_t *ss;
++
++				call++;
++				if ((thr->state & TH_WAIT) != 0) {
++					nwait++;
++				}
++				if ((thr->state & TH_RUN) != 0 &&
++				    (thr->state & TH_WAIT) == 0) {
++					nrun++;
++				}
++				ss = get_user_regs(thr);
++				if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1 &&
++				    !is_saved_state32(ss) && (thr->state & TH_RUN) == 0 &&
++				    (int64_t)saved_state64(ss)->x[16] == CLOVER_BB_M2_TRAP) {
++					ntrap++;
++					if (nrem == 0 &&
++					    (uint32_t)saved_state64(ss)->x[3] != 0) {
++						nrem = (uint64_t)saved_state64(ss)->x[3];
++						ntid = thr->thread_id;
++						nrcv = (uint64_t)saved_state64(ss)->x[5] >> 32;
++						nto = (uint64_t)saved_state64(ss)->x[7];
++					}
++				}
++			}
++			lck_mtx_unlock(&cur->lock);
++		}
++		if (busy) {
++			end = "lock_busy";
++		} else if (ntrap == 0) {
++			end = "no_trap";
++		} else if (nrem == 0) {
++			end = "no_send";
++		}
++		if (nrem != 0) {
++			uint32_t k;
++
++			clover_sb_port_owner(cur, (mach_port_name_t)nrem, peer,
++			    sizeof(peer));
++			if (peer[0] == '\0') {
++				strlcpy(peer, "?", sizeof(peer));
++			}
++			clover_sb_port_mail(cur, (mach_port_name_t)nrem, &nrmc, &nrsr);
++			next = clover_bb_peer_task(cur, (mach_port_name_t)nrem);
++			if (next == TASK_NULL) {
++				end = "no_owner";
++			} else if (next == cur || next == root) {
++				task_deallocate(next);
++				next = TASK_NULL;
++				end = "self_reference";
++			} else {
++				int again = 0;
++
++				for (k = 0; k < nseen; k++) {
++					if (seen[k] == task_pid(next)) {
++						again = 1;
++						break;
++					}
++				}
++				if (again != 0) {
++					task_deallocate(next);
++					next = TASK_NULL;
++					end = "cycle";
++				} else if (hop >= CLOVER_BB_CHAIN) {
++					task_deallocate(next);
++					next = TASK_NULL;
++					end = "depth_limit";
++				}
++			}
++		}
++		exstate = clover_bb_exec_name(cur, exec, sizeof(exec));
++		pp = (struct proc *)get_bsdtask_info(cur);
++		if (pp != NULL) {
++			strlcpy(comm, proc_name_address(pp), sizeof(comm));
++		}
++		printf("clover r295: hop=%u t=%llu pid=%d comm=%s exec=%s ex=%s"
++		    " threads=%u wait=%u run=%u trap=%u thid=%llx rcv=%x remote=%x"
++		    " to=%llx rmc=%u rsr=%x peer=%s end=%s\n", hop,
++		    (unsigned long long)secs, task_pid(cur),
++		    comm[0] != '\0' ? comm : "-", exec[0] != '\0' ? exec : "-", exstate,
++		    call, nwait, nrun, ntrap, (unsigned long long)ntid,
++		    (unsigned int)(uint32_t)nrcv, (unsigned int)(uint32_t)nrem,
++		    (unsigned long long)nto, nrmc, nrsr,
++		    peer[0] != '\0' ? peer : "-", end);
++		if (nseen < (uint32_t)(sizeof(seen) / sizeof(seen[0]))) {
++			seen[nseen++] = task_pid(cur);
++		}
++		if (owned) {
++			task_deallocate(cur);
++		}
++		cur = next;
++		owned = (cur != TASK_NULL) ? 1 : 0;
++		hop++;
++	}
++}
++
+ 
+ static void
+ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+@@ -13135,6 +13327,14 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 			task_deallocate(peer_task);
+ 			peer_task = TASK_NULL;
+ 		}
++		/*
++		 * Round295. The send chain from the blocked process itself, not from the one
++		 * debtor this fire happened to resolve: hop=0 re-derives its own debtor with the
++		 * same rule every later hop uses, so the row that starts the chain is evidence
++		 * rather than a restatement of the census above, and its exec= is this round's
++		 * positive control -- it has to read backboardd.
++		 */
++		clover_bb_chain(task, secs);
+ 	}
+ 
+ 	/*

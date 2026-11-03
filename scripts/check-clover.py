@@ -3445,6 +3445,76 @@ def check_board(errors: list) -> str:
                           "sixteen pushes -- a capped trace reads as a fault with no name, which is the "
                           "reading round288 was forced to settle for")
 
+        # Round295, the chain and the name the kernel cannot print. Boot 82 control-ruled the payload out of
+        # the reset question and left the desktop chain one link longer than boot 81's: backboardd waits on a
+        # debtor that itself waits on pid 187, and 187 reads as "com.apple.migra" -- which is what p_comm
+        # holds, MAXCOMLEN+1 = 17 bytes, and the first fifteen characters of both com.apple.migration and
+        # com.apple.migrationpluginwrapper. The round's whole value is that second name source plus a walk
+        # that says where it stopped, so both are pinned here rather than left to the decoder: an unverifiable
+        # exec= is the same silent blank this port has already been bitten by twice (r249's census, r289's
+        # truncated panic record).
+        r295_name = "z" * 54 + "-clover-r295.patch"
+        r295_patch = next((base / "patches/xnu-clover" / r295_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r295_name).is_file()), None)
+        if r295_patch is None:
+            errors.append(f"patches/xnu-clover/{r295_name} is missing: the next boot would again stop at one "
+                          "hop and print a 15-character name for the link that ends the chain")
+        else:
+            r295_text = r295_patch.read_text()
+            for needle in ('"clover r295: hop=%u t=%llu pid=%d comm=%s exec=%s ex=%s"',
+                           '" threads=%u wait=%u run=%u trap=%u thid=%llx rcv=%x remote=%x"',
+                           '" to=%llx rmc=%u rsr=%x peer=%s end=%s\\n"',
+                           'extern int clover_proc_exec_name(task_t task, char *out, size_t outlen);',
+                           'clover_bb_exec_name(task_t task, char *out, size_t outlen)',
+                           '#define CLOVER_BB_CHAIN 4',
+                           'clover_bb_chain(task_t root, uint64_t secs)',
+                           'clover_bb_chain(task, secs);',
+                           'MAXCOMLEN',
+                           'diff --git a/bsd/kern/proc_info.c',
+                           'clover_proc_exec_name(task_t task, char *out, size_t outlen)',
+                           'name = vnode_getname(pp->p_textvp);',
+                           'vnode_putname(name);'):
+                if needle not in r295_text:
+                    errors.append(f"{r295_name} lacks {needle[:64]!r}: without it the chain is one hop again, "
+                                  "or a name the field never held")
+            # Every way this walk can stop has to be a printed word. An absent row and a row that stopped at
+            # the third hop read alike otherwise, which is the defect this port keeps re-learning.
+            for verdict in ('"lock_busy"', '"no_trap"', '"no_send"', '"no_owner"', '"self_reference"',
+                            '"cycle"', '"depth_limit"'):
+                if verdict not in r295_text:
+                    errors.append(f"{r295_name} never prints end={verdict}: the end of a chain has to be "
+                                  "a reading, not a gap between rows")
+            # The name comes from the VFS name cache, which is entered without a task lock and without
+            # blocking on a vnode lock: vn_getpath() takes the vnode lock, and this board's wait has
+            # already been suspected of sitting under the filesystem once.
+            r295_code = "".join(line for line in r295_text.splitlines(True)
+                                if line.startswith("+")
+                                and not line.lstrip("+").lstrip().startswith(("*", "/*")))
+            for forbidden in ("vn_getpath(", "vnode_lock", "lck_mtx_lock(", "proc_lock("):
+                if forbidden in r295_code:
+                    errors.append(f"{r295_name} calls {forbidden}: the census runs beside a wedged userland "
+                                  "and a lock it waits on is a boot that says nothing at all")
+            load_r295 = REPO.parent / "UniXNU" / "patches" / "xnu" / r295_name
+            if not load_r295.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r295_name} is missing: unixnu loads patches from there "
+                              "and silently skips one that lives only in this repo")
+            elif load_r295.read_bytes() != r295_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r295_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+            late_script = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in late_script.splitlines() if "clover-r2" in line)
+            if (late_list.find(r295_name) < 0 or
+                    late_list.find(r295_name) > late_list.find("z" * 53 + "-clover-r289.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r295 before r289 in LATE_PATCH: the "
+                              "compile pass would run on a tree this patch was not written against")
+        if '{ "clover r295: ", "r295-chain", 128, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the r295 rows: five hops of a chain would "
+                          "share the census budgets, and the hop that ends it is the one worth reading")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r295")' not in sdhci_source:
+            errors.append("the r295 rows are not exempt from the per-pass push cap: a chain capped at its "
+                          "fourth hop is indistinguishable from a chain that stopped there")
+
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -4746,8 +4816,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r294:"):
-        errors.append('[payload] title is not "clover r294: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r295:"):
+        errors.append('[payload] title is not "clover r295: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5875,8 +5945,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r294:"):
-        errors.append('[payload] title is not "clover r294: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r295:"):
+        errors.append('[payload] title is not "clover r295: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
