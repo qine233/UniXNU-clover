@@ -1284,6 +1284,13 @@ def check_sb_sample(kernel: bytes) -> bool:
                             b" rc=%d,%d,%d,%d,%d,%d,%d,%d"
                             b" want=%x,%x,%x,%x,%x,%x,%x,%x seen=%x,%x,%x,%x,%x,%x,%x,%x"
                             b" entry=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx\n") in kernel,
+             # Round300 pays the debt boot 88 opened: its ring stopped at the r299 row and the r262 thread rows
+             # and r296/r298 chain rows were simply not there -- three exempt classes, no capped-at notice --
+             # so nothing on the card separated a board that stopped mid-fire from a fire that emitted fewer
+             # rows. A fire now numbers itself, states what it planned, and closes with what went out; both
+             # rows are pinned whole, because a cut format string leaves every prefix needle green.
+             "bb-census-fire": (b"clover r300: fire t=%llu seq=%llu pid=%d th=%u hidden=%u\n") in kernel,
+             "bb-census-done": (b"clover r300: done t=%llu seq=%llu th=%u chain=%u\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

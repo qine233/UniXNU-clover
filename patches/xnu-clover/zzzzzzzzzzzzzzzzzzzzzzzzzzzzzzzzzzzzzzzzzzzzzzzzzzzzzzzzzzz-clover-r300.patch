@@ -1,0 +1,77 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12781,7 +12781,16 @@
+  * link= and tlink= disagree is itself the reading worth looking at. Nothing here waits: no space
+  * lock, no task lock beyond the one the walk already try-locks, no thread_block; the fields are read
+  * while ipc_object_translate() still holds the object's lock.
++ */
++/*
++ * Round300. A census fire now attests to itself, because boot 88 left one open question that no
++ * row can answer: the ring's newest row was the r299 one and the thread and chain rows that boot
++ * 87's fire put after it never appeared, and nothing on the card says whether the board stopped
++ * mid-fire or the fire emitted fewer rows. The walk counts the hops whose row-pair it printed and
++ * hands that number to the census, so the fire's closing row states what really went out.
+  */
++static uint32_t clover_bb_chain_hops;
++
+ static void
+ clover_bb_chain(task_t root, uint64_t secs)
+ {
+@@ -13011,6 +13020,7 @@
+ 		    (unsigned long long)secs, (unsigned long)prev_obj, (unsigned long)rvobj,
+ 		    verr, (unsigned int)(uint32_t)frcv, (unsigned long)robj, rerr, otype, tname,
+ 		    (unsigned long)tspace, (unsigned long)space_id, link, tlink);
++		clover_bb_chain_hops++;
+ 		prev_obj = robj;
+ 		prev_tname = tname;
+ 		prev_tspace = tspace;
+@@ -13126,6 +13136,18 @@
+ 	 * whole log window on one instrument.
+ 	 */
+ 	static uint64_t bb_census_t;
++	/*
++	 * Round300. A fire is now numbered and closed by a row of its own, because boot 88 could not
++	 * say which of two different things a missing row is: its ring ended on the r299 row with the
++	 * thread and chain rows absent, all three classes exempt from the per-pass push cap and none of
++	 * them named by a capped-at notice -- so either the board stopped mid-fire or the fire emitted
++	 * fewer rows than boot 87's did, and the card carried nothing that separated them. `fire=` opens
++	 * with what the census promised (th= rows) and `done=` closes with what actually went out, so a
++	 * fire whose done= is absent was interrupted and a fire whose done= is present has a number, not
++	 * an absence, where the chain rows used to be.
++	 */
++	static uint64_t clover_census_seq;
++	static uint32_t clover_census_rows;
+ 
+ 	if (pid <= 0 || sb_task == TASK_NULL) {
+ 		return;
+@@ -13510,6 +13532,12 @@
+ 			    (unsigned long long)armcpu_smp_entry[4], (unsigned long long)armcpu_smp_entry[5],
+ 			    (unsigned long long)armcpu_smp_entry[6], (unsigned long long)armcpu_smp_entry[7]);
+ 		}
++		clover_census_seq++;
++		clover_census_rows = 0;
++		clover_bb_chain_hops = 0;
++		printf("clover r300: fire t=%llu seq=%llu pid=%d th=%u hidden=%u\n",
++		    (unsigned long long)secs, (unsigned long long)clover_census_seq, pid, cn,
++		    (call > cn) ? call - cn : 0);
+ 		for (i = 0; i < cn; i++) {
+ 			char peer[24];
+ 			uint32_t mmc = 0;
+@@ -13571,6 +13599,7 @@
+ 			    (unsigned int)crn[i], (unsigned int)(uint32_t)crem[i],
+ 			    (unsigned int)(uint32_t)cloc[i], (unsigned long long)cto[i],
+ 			    (unsigned int)(uint32_t)csn[i], mmc, msr, rmc, rsr, peer);
++			clover_census_rows++;
+ 			/*
+ 			 * Round267. Backboardd's own waits, named by the kernel instead of by
+ 			 * their addresses: the row that has carried the dispatch-group ulock as a
+@@ -13631,6 +13660,9 @@
+ 		 * positive control -- it has to read backboardd.
+ 		 */
+ 		clover_bb_chain(task, secs);
++		printf("clover r300: done t=%llu seq=%llu th=%u chain=%u\n",
++		    (unsigned long long)secs, (unsigned long long)clover_census_seq,
++		    clover_census_rows, clover_bb_chain_hops);
+ 	}
+ 
+ 	/*

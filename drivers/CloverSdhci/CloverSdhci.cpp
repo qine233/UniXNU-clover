@@ -886,6 +886,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // one per thread, but it is not -- the arrays are global, so a fire costs exactly one row, and twenty fires
   // inside the 1800 s deadline is the same half of 64 r270 and r271 were given.
   { "clover r299: ", "r299-smp", 64, 0, 0, 0 },
+  // Round300 prints two rows per census fire: one when the fire opens, one when it closes. Twenty fires inside
+  // the 1800 s deadline is forty rows -- the same half of 64 r270, r271 and r299 were given for the same reason,
+  // because these are per-fire producers and a fire costs a fixed two rows however many threads it walks. The
+  // class is separate from r299's so a boot that reached the opening row but never wrote the closing one is not
+  // read as a boot whose smp row went missing: the pair's job is exactly to say how far one fire got, and that
+  // claim cannot be carried by a class that also holds the cpu row.
+  { "clover r300: ", "r300-fire", 64, 0, 0, 0 },
   // Round272 spends a class on a line the kernel already prints, because the question boot 58 left
   // open is exactly "did XNU try": cpu_start() speaks once per attempted cpu, seven attempts is the
   // whole story of this board, and a class that never fills is itself the reading. 16 leaves room
@@ -4347,7 +4354,13 @@ static void teeConsumeLine (uint32_t &pushed)
        // in front of it, a boot whose secondaries were asked for would return nothing at all and read like a
        // boot that never reached the next fire -- the same false-empty r249's census was exempted for, and
        // the class budget of 64 still bounds it.
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r299"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r299") ||
+       // Round300 is the row that answers boot 88's question, and it only answers it if it is present: a fire
+       // whose done= row was throttled away reads exactly like a fire the board never finished, which is the
+       // false-empty this exemption exists to stop. The count it carries (th=, chain=) is the number of rows
+       // this fire really pushed, so losing the row that holds the number would put us back where the absent
+       // r262/r296/r298 thread rows left us -- an absence with nothing beside it to attribute.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r300"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

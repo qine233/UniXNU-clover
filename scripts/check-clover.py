@@ -3824,6 +3824,76 @@ def check_board(errors: list) -> str:
                           "flipping both at once would fold two faults into one")
 
 
+        # Round300 pays the instrument debt boot 88 opened. Its ring's newest row was the r299 one, and the
+        # thread rows (r262) and chain rows (r296/r298) that boot 87's same fire put after it were absent --
+        # all three classes exempt from the per-pass push cap, none of them named by a capped-at notice -- so
+        # the card could not separate "the board stopped mid-fire" from "this fire emitted fewer rows". That
+        # is the same class of reading r251 was built for, one layer up: an absence with no number beside it.
+        # So a fire is now numbered, opened with what it planned (th= rows, hidden= the threads the cap kept
+        # off the card) and closed with what really went out (th=, chain=), and the closing row is the one the
+        # push cap must not touch.
+        r300_name = "z" * 59 + "-clover-r300.patch"
+        r300_patch = next((base / "patches/xnu-clover" / r300_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r300_name).is_file()), None)
+        if r300_patch is None:
+            errors.append(f"patches/xnu-clover/{r300_name} is missing: without the pair a boot 88-shaped frame "
+                          "is read again as an absence, and the only two hypotheses it leaves are exactly as "
+                          "far apart as they were before this round")
+        else:
+            r300_text = r300_patch.read_text()
+            r300_added = "".join(line for line in r300_text.splitlines(True)
+                                 if line.startswith("+")
+                                 and not line.lstrip("+").lstrip().startswith(("*", "/*")))
+            for needle in ('"clover r300: fire t=%llu seq=%llu pid=%d th=%u hidden=%u\\n"',
+                           '"clover r300: done t=%llu seq=%llu th=%u chain=%u\\n"',
+                           'static uint32_t clover_bb_chain_hops;',
+                           'static uint64_t clover_census_seq;',
+                           'static uint32_t clover_census_rows;',
+                           'clover_census_rows++;',
+                           'clover_bb_chain_hops++;',
+                           'clover_census_rows = 0;',
+                           'clover_bb_chain_hops = 0;'):
+                if needle not in r300_text:
+                    errors.append(f"{r300_name} lacks {needle[:72]!r}: planned, printed and hop-printed are "
+                                  "three different numbers, and a row that carries fewer than all three puts "
+                                  "the absence back where boot 88 left it")
+            for reprint in ('printf("clover r262:', 'printf("clover r296:', 'printf("clover r298:'):
+                if reprint in r300_added:
+                    errors.append(f"{r300_name} reprints {reprint.split('(')[1]}: those rows are the counts this "
+                                  "round reports, and a rewrite would make boots 50 to 88 unreadable against 89")
+            if 'clover r299' in r300_added:
+                errors.append(f"{r300_name} touches the r299 smp row: boot 88 is the only eight-core frame on "
+                              "record and its row is what that reading rests on")
+            for forbidden in ("thread_block(", "simple_wait(", "lck_mtx_lock(", "proc_lock(", "sleep("):
+                if forbidden in r300_added:
+                    errors.append(f"{r300_name} calls {forbidden}: the census prints beside a wedged userland, "
+                                  "and a fire that blocks would show up on this very row as a missing done=")
+            load_r300 = REPO.parent / "UniXNU" / "patches" / "xnu" / r300_name
+            if not load_r300.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r300_name} is missing: unixnu loads patches from there "
+                              "and silently skips one that lives only in this repo")
+            elif load_r300.read_bytes() != r300_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r300_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+            late_script_r300 = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list_r300 = " ".join(line for line in late_script_r300.splitlines() if "clover-r" in line)
+            if (late_list_r300.find(r300_name) < 0 or
+                    late_list_r300.find(r300_name) > late_list_r300.find("z" * 58 + "-clover-r299.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r300 before r299 in LATE_PATCH: the "
+                              "counters reset between r299's row and the thread loop and the hop counter closes "
+                              "r298's comment, so a tree without them fails to apply -- and an earlier apply "
+                              "failure here is silent")
+        if '{ "clover r300: ", "r300-fire", 64, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the r300 pair: two rows per fire that fall into "
+                          "the unclassed flow are throttled with the chatter, which is the exact cap this "
+                          "round exists to prove its rows past")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r300")' not in sdhci_source:
+            errors.append("the r300 rows are not exempt from the per-pass push cap: a capped done= row reads "
+                          "exactly like a fire the board never finished, and the round would ship the false "
+                          "empty it was written to remove")
+
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -5124,8 +5194,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r299:"):
-        errors.append('[payload] title is not "clover r299: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r300:"):
+        errors.append('[payload] title is not "clover r300: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -6253,8 +6323,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r299:"):
-        errors.append('[payload] title is not "clover r299: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r300:"):
+        errors.append('[payload] title is not "clover r300: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
