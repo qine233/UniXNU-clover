@@ -22354,3 +22354,110 @@ r283 那条通道继续自证不是我们的：`beatmagic=801a082c402c3190` ≠ 
 `~/clover-out/round294-v0.6.98-payload.img`（sha `4b02653c…`）、内核 `2c369a95…`。
 控制轮 `~/clover-out/round289-control-log-window.bin(.txt)` + `~/clover-out/r294-control-boot82.log`
 （boot 82，跑的是 round289 那颗镜像）。
+
+### boot 82（r294b 控制轮 / round289-v0.6.86 镜像，2026-11-03）：**预登记的第 (a) 支命中——负载不是变量**
+
+**① 判决。** 刷的是归档的 `round289-v0.6.86-payload.img`（boot 76 那颗、本 port 最后一颗走到自己 1800 s 死线的镜像），
+**同一颗镜像的第二次跑**。它在 **707.103272 s** 静默复位：内核 tee 最后一行
+`[  707.103272]: clover r223: sbport t=707 rem nm=2e03 ... sr=1`，其后一条槽是 `BAD (newline missing)` 的半行；
+卡上 **boot 82 名下 kind-20（panic 报告）0 条**（那 16 条 report 属于 boot 55/56/58/59 那些旧靴）；
+`--flight` 的判决行自己就说清了归属——deadline 记录 `t=1802682 ms` 印 `un-stamped`（round289 早于 r293，它不会盖章），
+两条 panic 标记仍是 `boot=76` 并印 `STALE: boot 82 never entered the sink`。
+⇒ **boot 82 从没进过 panic 管道，也就是没走到死线、没 panic**——第六起静默复位。
+
+**② 为什么这一读能定负载的罪。** boot 76 与 boot 82 是**同一个文件、同一颗内核**（`round289-v0.6.86-payload.img`，
+sha 未变），一次跑到 1800 s 并正常 panic，一次 707 s 静默复位。镜像相同而结局不同 ⇒
+**「哪一代负载」不是变量**，r290/r291/r294 那些新增的读写都不必再作为复位原因被审。
+连 boot 81 的控制一起看：r294 已经把两笔 GPUCC 写删掉、boot 82 更是退回 r290 之前的镜像，
+**复位照旧** ⇒ **GPU 这一格整体从「整卡复位嫌疑」里摘出去**（它作为桌面主线的一格照旧存在）。
+
+**③ 六起的时间带。** 718/1184/1248/1335/997/707 s——跨度 707–1335 s，没有一次落在同一秒，也没有任何一靴重复另一靴的秒数。
+「比死线早」这件事对 boot 73/76 仍然只是相关性。**能用的结论只有一条**：这一带里没有我们改过的东西，
+找复位来源要往 AP 之外去（PMIC/AOP/xbl 那一侧），而那条通道现在有了**新的负对照**：见 ④。
+
+**④ 平台自己的跨复位记录＝零（新负对照，宿主读，不动负载）。** 落在 TWRP 后逐颗盘探过去：
+`/dev/block/by-name/` 里唯一的 dump 分区是 **`rawdump`（128 MiB）**，设备上 `md5sum` 与宿主整颗拉回后逐字节核对一致：
+`fde9e0818281836e4fc0edfede2b8762`，**非零字节数 = 0** ⇒ 这块板子从没 staged 过任何 ramdump，六起静默复位一起都没抓到。
+`apdp`/`msadp` 是小米的 attestation 证书（Xiaomi Root CA / SecTools Test User），`ddr` 是训练 blob，`ssd` 是 8 KiB 二进制——
+都不是复位记录。TWRP 的 dmesg 里 `qpnp-power-on` 那两行（`Hard Reset` + `PS_HOLD`）与 r294 那次主动软复位的输出同形，
+继续按已作废的仪器对待。**pstore 目录空。** ⇒ 「等一次崩了就能拿到现成 dump」这条路在这块板上不存在，
+复位来源要么靠**我们自己在复位前一刻写下去的读数**（飞行记录那条管道），要么靠**卡外的物理量**（温度/电量/电压）。
+
+**⑤ 落地的物理读数（带着它自己的地平线缺陷）。** `~/clover-out/boot82-landing-twrp-sensors.txt`：
+复位后约 9 分钟读到 `temp=250`（25.0 ℃）、`charger_temp=294`、`die_health=Cool`、`system_temp_level=0`、
+`status=Full capacity=100 voltage_now=4360340`、`current_now=976`。**这不能读成「复位时不热」**——它是复位后 9 分钟的读数，
+TWRP 空转 9 分钟足以把机身吹凉（正是 r293 那条规矩的同一家族：仪器看不见它问的那一刻）。
+⇒ 要拿温度/电压参与这条线，得把**落地瞬间**的快照做进 `run-clover-unattended.sh`（宿主侧改动，不动负载、不发版），
+下一支就这么做：落回 TWRP 的第一件事是抓 `power_supply`/`thermal` 与 `rawdump` 头部，再抓卡上日志。
+
+**⑥ 桌面主线在这一靴里换了形状（同一份读数的另一半）。** 债主仍是 **pid 147 `com.apple.datamigrator`**，
+`threads=7 shown=7 wait=7 run=0 rx=1 tm=1 **wl=3**`——五个 workloop 等待者现在是三个（r273 的行同形：`tr=5 tc=0 tt=38e/4bc ow=0`）。
+两件事同时变了：
+* **r268 的解锁信号量分支与 `hint=6` 在 boot 81、boot 82 两靴里都是 0 行**（`grep -c` 各 0）——与「keystore（r276）之后
+  那笔 `dispatch_semaphore_wait(..., FOREVER)` 消失」的旧读数一致，所以 `-waitUntilPreboardDidFinishUnlock`
+  不再是这一靴的现场。它仍是**历史事实**（r274 用 `~/clover-out/datamigrator.macho` 命名过），但别再当现阻塞引用。
+* **债链比文档多一跳**：datamigrator 自己有一笔没回音的 send——`tid=38e rcv=3b03 remote=7e0f sr=1 rmc=0 rsr=1
+  peer=187:com.apple.migra`（远端口 0 条待办、1 份发送权，即「消息被取走、回音没来」），
+  而 **pid 187 是谁，本板现在读不出来**：`comm=` 表里没有它的行，且 `peer=` 字段被截到 15 字符
+  （`com.apple.datam` 那半截是同一枚缺陷）。宿主侧在缓存里能找到的候选名是
+  `com.apple.migration`、`com.apple.migrationpluginwrapper`（还有 `com.apple.migration.plist`，不是服务名）——
+  **截断让我们在这两个之间选不出来**，这是仪器问题，不是硬件事实。
+* 活着并按了名的进程（boot 82 的 `comm=` 全集）：SpringBoard、backboardd、datamigrator、**keybagd**、passd、
+  usermanagerd、watchdogd、symptomsd、WirelessRunner。keybagd/passd 在场是 ⑤/⑥ 之外唯一新东西。
+
+**⑦ 下一支（r295，桌面主线，不动 GPU 也不追复位来源）。** 把「问谁」这件事一次问到底：
+* **(1) 加宽名字字段**——`peer=`/`comm=` 至少 24 字符，正对照是 pid 58 那一行必须完整读出 `com.apple.backboardd`
+  （读不满就是截断，不是硬件没这个名字）。
+* **(2) 顺着 send 走链**：现在的普查钉死 58 与 147 两个 pid；r295 改成**传递式走 4 跳**——从 58 出发，读它唯一那笔在外的
+  send 的属主，普查那个进程，再对它第一个持发送权的线程重复，每跳一行（`depth= pid= comm= send_port= remote_port= ...`），
+  并把终止条件写成读数而不是空白：`no_send`（这人没在等）、`no_owner`（口没属主，链断在核外）、
+  `self_reference`（自己等自己）、`depth_limit`（4 跳没走完，说明链更长）。
+* **判据（刷前写死）**：(a) 链终止在一个「所有线程 `dl=0` 且 `sr=0`」的进程 ⇒ 它就是叶子，回音永远不会来，
+  下一支问它为什么不来；(b) 链成环（A→B→A）⇒ 是两个服务互相等，桌面这一格要按「谁先破环」来做；
+  (c) 链走到 `com.apple.SpringBoard` ⇒ 回到 r206 那格的 SIGKILL 线；(d) 链在 4 跳内走不完 ⇒ 仪器加深度，别加猜测。
+* 这一支**不碰 GPU**（②已经把 GPU 从复位嫌疑里摘掉，GPU 那格回到「只读侦察 + 缺轨编程出处」的原位），
+  也**不追复位来源**（④⑤说明卡外通道要先把落地读数自动化，那是宿主脚本的活，与桌面并行）。
+
+**⑧ 产物与账。** `~/clover-out/round289-control-log-window.bin(.txt)`（boot 82，512 行内核环覆盖 475.035805→707.103272 s）、
+`~/clover-out/r294-control-boot82.log`、`~/clover-out/boot82-landing-twrp-sensors.txt`、
+`~/clover-out/boot82-partition-probe/`（`rawdump-verified-zero.txt` 记 md5 与非零字节数；`apdp/msadp/ddr/ssd` 各 64 KiB 头部）、
+刷的还是 `~/clover-out/round289-v0.6.86-payload.img`（sha `…` 见 `round289-*` 归档行）。**本轮不发新负载、不打 tag**；
+r295 才发 v0.6.99。
+
+### 宿主复核（boot 82 之后，不动负载、不发版）：那笔死等原来要等的是两个与门，而且类名要收回一半
+
+**① 归名核对。** `xcrun dyld_info -objc ~/clover-out/datamigrator.macho` 把方法连类一起报出来：
+`0x10000CD30 -[MigratorAlternateAppDelegate waitUntilPreboardDidFinishUnlock]`、
+`0x10000E8EC -[DMMigrator _unlockKeyBagUseOfForceIsAuthorized]`，前者所在的类声明是
+`@interface MigratorAlternateAppDelegate : NSObject <BKSAlternateSystemAppDelegate>`。
+**同时把一句话收回**：会话里曾把它归到 `_BKDisplayLinkManager` 名下——那个名字**在这颗主镜像里 0 次命中，
+在 54 张缓存切片的字符串与符号里也 0 次命中**（`LC_ALL=C grep -l -a BKDisplayLinkManager dyld_shared_cache_arm64*`
+无输出；缓存里同类的是 `AXDisplayLinkManager`、`TKDisplayLinkManager`，没有 `BK` 前缀那一枚），
+仓库文档从未这样落盘，此处只记「不要这样归名」。
+`waitUntilPreboardDidFinishUnlock` 这个串本身是真的，也只在主镜像里（选择器由实现它的二进制携带），
+所以 r274 的命名成立、类归属不成立。
+
+**② 语义（`otool -tV` 逐条读，地址都是 `__text` 偏移处的 vm 地址）。**
+`init`(0xCCD4)：`dispatch_semaphore_create(0)` 存进 ivar `+0x8`；`waitUntilPreboardDidFinishUnlock`(0xCD30)：
+取 `-sema`（0x1000151a0 那枚 objc stub）后 `dispatch_semaphore_wait(sem, x1=-1)`。全类**只有一个**
+`dispatch_semaphore_signal`(0x100012d84) 站点，在 `alternateSystemApp:didExitWithStatus:`(0xCD8C) 里，且前面挂着两个与门：
+`cbz w21` ⇒ **status 必须为 0**（非 0 只打「exit with status」日志然后走人）；`_MKBDeviceUnlockedSinceBoot`(0x100012bf8)
+之后 `cbz w0` ⇒ **MobileKeyBag 必须回答「开机以来已解锁」**（回答 0 就只打日志）。
+另外三枚回调——`alternateSystemAppDidLaunch:`(0xCD60)、`alternateSystemApp:didTerminateWithSignal:`(0xCE48)、
+`alternateSystemApp:didFailToLaunchWithError:`(0xCEC4)——**全部只打日志、不发信号**。
+⇒ 可以照全话说：这笔死等在真实设备上等的是「**PreBoard 以状态 0 干净退出** 且 **MKB 说已解锁**」；
+PreBoard 被信号打死、启动失败、或者退出码非 0，都永远不放行。这不是新猜测，是从那两个 `cbz` 读出来的。
+
+**③ 现场对照。** 本板 PreBoard 确实在跑：round258 的 r252 行有 `pid=170 comm=PreBoard`，问
+`IODeviceTree:/buttons`（`len=0 val=1`）、`home-button-type`（`len=4 val=2`，都在照常答），
+missing 的是 `/arm-io/disp0`、`/arm-io/sep`、`ane-type`——**sep 那一格正是 MKB 这条线要的硬件**。
+boot 82 的 `comm=` 全集里 keybagd/passd 在场（`SpringBoard backboardd datamigrator keybagd passd usermanagerd
+watchdogd symptomsd WirelessRunner`），`r281: aks` 行显示我们自己的 keystore `opens=22→27 calls=80→99 refused=0`——
+**有人在开、有人在读、一个都没被拒**。至于 `MKBDeviceUnlockedSinceBoot()` 在本板到底返回什么，宿主读不出来，
+这一格现在是空的（下一支若要接，得在卡上问，而 boot 81/82 里 `r268`/`hint=6` 全 0 行，说明这笔死等本身已经不是现场）。
+
+**④ 一枚仪器缺陷（自己踩到才修的）。** `peer=`/`comm=` 字段被截到 15 字符：boot 82 读到的
+`peer=187:com.apple.migra` 与 `peer=147:com.apple.datam` 都断在同一个宽度上，于是「pid 187 是谁」这条链上最关键的
+一个名字，在**缓存字符串表**里只剩两个候选（`com.apple.migration`、`com.apple.migrationpluginwrapper`；
+`com.apple.migration.plist` 不是服务名）——选不出来是仪器问题，不该让读数背。r295 的加宽以
+「pid 58 那行必须完整印出 `com.apple.backboardd`」为正对照。
