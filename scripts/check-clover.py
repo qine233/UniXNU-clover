@@ -4467,6 +4467,110 @@ def check_board(errors: list) -> str:
                           "on boot 94's stale marker")
 
 
+        # Round308. Boot 98 ran the control round the ledger owed since boot 87 and answered none of it:
+        # every reading that could have judged it -- the census family, the r271 core counts, the r229 early
+        # returns -- is produced inside the burst whose absence the round controls for and printed through the
+        # console tee that the same boot measured as throttled=56, lap=2. A judge that rides in the thing it
+        # judges cannot judge, so this round moves the judge: the counters leave the sampler's frame for file
+        # scope, two rows bracket the r299 printf on the driver relay alone, and one row per heartbeat says
+        # the whole accounting on the relay before it prints it. Five things have to stay true in the patch:
+        # the relay hand-offs exist, the bracket rows never reach the console, the beat row keeps both legs,
+        # the counters are not local any more, and the two bracket rows sit exactly where the stop is.
+        r308_name = "z" * 65 + "-clover-r308.patch"
+        r308_patch = next((base / "patches/xnu-clover" / r308_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r308_name).is_file()), None)
+        if r308_patch is None:
+            errors.append(f"patches/xnu-clover/{r308_name} is missing: without a core count and a sampler "
+                          "accounting that do not ride the kernel log, the next control round is judged by "
+                          "the same pipe it is testing and boot 98 repeats")
+        else:
+            r308_text = r308_patch.read_text()
+            r308_added = "".join(line.lstrip("+") for line in r308_text.splitlines()
+                                 if line.startswith("+") and not line.startswith("+++"))
+            r308_code = "".join(
+                line.lstrip("+") for line in r308_text.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+                and not line.lstrip("+").lstrip().startswith(('*', '//', '/*')))
+            for row in ('clover r308: beat', 'clover r308: smp-pre', 'clover r308: smp-post'):
+                if r308_text.count(row) != 1:
+                    errors.append(f"{r308_name} does not say {row} exactly once: two of one row and none of "
+                                  "the other is how a relay pair turns back into an absence")
+            for hand in ('clover_emmc_probe_say(prow308,', 'clover_emmc_probe_say(row308,',
+                         'clover_emmc_probe_say(row,'):
+                if hand not in r308_code:
+                    errors.append(f"{r308_name} does not hand {hand.split('(')[1]} to the relay directly: the "
+                                  "leg that survives a blind tee is the one that never enters the console")
+            if 'printf("%s", row);' not in r308_code:
+                errors.append(f"{r308_name} drops the beat row's second leg: one leg alone cannot tell a "
+                              "relay that sealed a row from a sampler that never ran")
+            for row, var in (('smp-pre', 'prow308'), ('smp-post', 'row308')):
+                if f'printf("%s", {var})' in r308_code or f'printf("clover r308: {row}' in r308_code:
+                    errors.append(f"{r308_name} prints the {row} row to the console: the pair is the "
+                                  "negative control for the r299 printf, and a console copy of it would "
+                                  "hang or lose exactly where the row is meant to say it did not")
+            if "clover_census_row" in r308_code:
+                errors.append(f"{r308_name} sends a row through clover_census_row: that function prints to "
+                              "the console as well, so both of the round's channels would go quiet together")
+            for needle in ('static volatile uint32_t clover_bb_enters;',
+                           'static volatile uint32_t clover_bb_busy;',
+                           'static volatile uint32_t clover_bb_capped;'):
+                if needle not in r308_added:
+                    errors.append(f"{r308_name} does not put {needle.split()[-1][:-1]} at file scope: a "
+                                  "counter that lives in the sampled function's frame is only readable by a "
+                                  "row produced inside the burst it counts")
+            for gone in ('-	static uint32_t bb_fired;', '-	static uint32_t bb_same;'):
+                if gone not in r308_text:
+                    errors.append(f"{r308_name} leaves {gone[9:-1]} in place: two counters with one meaning "
+                                  "is a reading that depends on which row the reader found first")
+            positions = [r308_text.find("(unsigned long long)ctm[6], (unsigned long long)ctm[7]);"),
+                         r308_text.find("clover r308: smp-pre"),
+                         r308_text.find("* Round299. Same fire"),
+                         r308_text.find("clover r308: smp-post"),
+                         r308_text.find("clover_census_seq++;")]
+            if min(positions) < 0 or positions != sorted(positions):
+                errors.append(f"{r308_name} does not bracket the r299 row with pre before it and post after "
+                              "it: outside that pair the two rows say nothing about the printf they exist to "
+                              "time, which is the one statement boot 97 stopped at")
+            beat_at = r308_text.find("clover_r308_beat_row(secs);")
+            dump_at = r308_text.find("clover_ulock_dump(secs);")
+            if dump_at < 0 or beat_at < dump_at:
+                errors.append(f"{r308_name} does not say the beat row from the heartbeat after the ulock "
+                              "dump: outside the heartbeat the row would run only when a target latched, "
+                              "which is the state boot 98 could not read")
+            for forbidden in ('thread_block', 'simple_wait', 'lck_mtx_lock', 'proc_lock', 'hw_lock_lock'):
+                if forbidden in r308_code:
+                    errors.append(f"{r308_name} calls {forbidden}: the bracket rows are handed over while "
+                                  "the census holds another task's thread walk, where nothing may sleep or "
+                                  "take a lock")
+            load_r308 = REPO.parent / "UniXNU" / "patches" / "xnu" / r308_name
+            if not load_r308.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r308_name} is missing: unixnu loads patches from there, "
+                              "and this repo's copy only ever names the round")
+            elif load_r308.read_bytes() != r308_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r308_name} is not the same bytes as this repo's copy: "
+                              "the shipped image would carry a different row than the one checked here")
+            late_script_r308 = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list_r308 = " ".join(line for line in late_script_r308.splitlines() if "clover-r" in line)
+            if (late_list_r308.find(r308_name) < 0 or
+                    late_list_r308.find(r308_name) > late_list_r308.find("z" * 64 + "-clover-r307.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r308 before r307 in LATE_PATCH: "
+                              "r308 inserts inside the block r306 and r307 added, so a tree that removes "
+                              "them first leaves r308 un-reversible -- and an apply failure in that loop is "
+                              "silent")
+        for needle in ('{ "clover r308: ", "r308-relay", 64, 0, 0, 0 }',
+                       'teeHasPrefix (probe->name, teeStringLength (probe->name), "r308")',
+                       '"CloverSdhci r308: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u "'):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no {needle[:52]!r}: the relay's second leg is "
+                              "printed by the console path only because this class and its exemption say "
+                              "it may be, and without them a throttled copy reads as a dead relay")
+        if "CloverSdhci r212: drain exit" in sdhci_source:
+            errors.append("the drain exit line still carries the r212 token: round308 added a column and "
+                          "renamed one, and a reader that cannot tell which generation wrote the record "
+                          "reads this round's ring_pend= as that row never having a backlog at all")
+
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -4792,8 +4896,12 @@ def check_board(errors: list) -> str:
                 ("CloverSdhci r212: drain enter boot=%u first=%u panic_first=%u verdict=%u tee=%u ",
                  "no drain enter line: a silent panic drain could not be told from one that "
                  "never ran"),
-                ("CloverSdhci r212: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u ",
+                ("CloverSdhci r308: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u ",
                  "no drain exit line: the flush would not report how much it wrote"),
+                ("probe=%u probe_drop=%u ring_pend=%u probe_pend=%u\\n",
+                 "the drain exit line still reports one backlog for two rings: boot 97 read a zero under "
+                 "the name probe_pend= that was the driver tee ring's count, so the relay's own queue was "
+                 "the one number the row did not say"),
                 ("panicProbeFlush ()",
                  "the drain never flushes the probe ring"),
                 ("static uint32_t panicRingFlush (uint32_t which)",
@@ -5771,8 +5879,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r307:"):
-        errors.append('[payload] title is not "clover r307: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r308:"):
+        errors.append('[payload] title is not "clover r308: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -6910,8 +7018,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r307:"):
-        errors.append('[payload] title is not "clover r307: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r308:"):
+        errors.append('[payload] title is not "clover r308: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

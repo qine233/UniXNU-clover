@@ -24528,3 +24528,71 @@ latch 没 latch，卡上读不出。所以 ① 那格的候选解释有两个（
 正对照（本轮仪器没坏的证据）：中转的消费者本靴跑了 **7257 趟**（boot 97 只到 902）而 `seen=` 仍是 0、
 `blocked=0/0/0`、`empty=0`、`cut=0`——分预算后的 `why=tail`/`why=beat` 两支这一次**都在说话**，
 r307 第①条在第二种靴子上也兑了一次。
+
+## Round308 (v0.7.18)：裁判不能坐在被审的那条腿上——核数与采样账目一起搬到不经 tee 的中转
+
+**① 驱动这一轮的设计缺陷，是 boot 98 用自己的沉默示范的。**
+r307 的第③条「控制轮正式跑」把判据写成「单核那一靴应当读出 `reg=1 start=0`」。
+`boot 98`（`armcpu-smp=0`，同一枚 r307 镜像）回来的是普查一族**整族 0 行**，而这一族里
+`r271` 那行正是 `reg=` 的生产者——**判据与被判据的东西同生同死**。这不算跑过控制轮，
+它只算把「控制轮凭什么算跑过」这格还给仪器。因此本轮只造一条腿：把「几颗核」与
+「采样器跑到哪一步」搬到 kind-25 的中转上（`clover_emmc_probe_say()`，不经内核日志、
+不经 msgbuf、不经 tee），控制轮的判据换成那枚行，之后才谈「尾巴属镜像 vs 属核数」。
+
+**② `seen=0` 是整靴的账，不是某一枚行的账——这也是本轮要先补正对照的原因。**
+boot 97 与 boot 98 的每一枚 `CloverSdhci r307: probe` 报告行都写着 `seen=0`
+（`blocked=0/0/0 empty=0 cut=0 dropped=0 skipped=0`，`calls=` 一路涨到 139065）。
+`gProbeSeq` 在 `clover_emmc_probe_say()` 里**每次交接都自增**，只有两枚早退例外
+（空串 `empty`、超长 `cut`），两个例外都记了数——⇒ 「0」只能是「一次都没被人叫过」。
+可这条推论本身需要一个能无条件发声的生产者来托底：本板的 relay 生产点全都在条件分支里
+（`:10697` 的 trylock 失败、`:12861` 的普查行、`:15124` 的 abort 现场、`:13724` 的 `pre`）。
+没有一个跑，`seen=0` 就说不出是「通路死了」还是「通路活着、没人走到」。
+所以 r308 第一枚行放在**内核计时器自己的心跳**上，与 latch、与 cap、与批量签名都无关。
+
+**③ 三枚新行，各自钉在一段只能有一种病因的区间上（`osfmk/kern/task.c`）。**
+- `clover r308: beat t= target= ent= fired= same= cap= gone= notask= busy= reg= start= run=`
+  ——心跳每 120 s 一枚（`clover_bb_beat_thread()`，在 `clover_ulock_dump(secs);` 之后调
+  `clover_r308_beat_row()`，`task.c:11191…11244` 段内）。**先交中转、再 printf**：printf 那一条
+  是同一条语句的第二腿，两条腿的差就是 tee 的账。计数全部搬到文件级
+  （`clover_bb_enters/fired/same/capped/gone/notask/busy`，`:10824…10840`），
+  原来 `bb_fired`/`bb_same` 是采样函数自己的 `static`——读它们的行只能由它们产的行走出来。
+- `clover r308: smp-pre t= seq= pid= th= hidden= reg= start= run=`——就在 `r271` 那行 printf 之后、
+  `r299` 那行之前（`:13744…13767`）。
+- `clover r308: smp-post t= seq= pid= th= hidden= reg= start= run=`——就在 `r299` 的 printf 返回之后、
+  那三个自增之前（`:13799…13816`）。两枚行**只走中转、不许 printf**，字段与 `r271` 行逐字同产
+  （同一组 `reg/nstart/nrun` 局部变量，第十一层：列名与填它的表达式必须同源）。
+
+**④ 这一对把 boot 97 那个「没有可阻塞语句」的夹点变成一个可指名的调用。**
+boot 97 在卡上有 `r262` 头行、`r270`、`r271`、`r299` 四枚 printf 行，然后什么都没有；
+`relay seen=0` 说明 `:13724` 那次交接没执行 ⇒ 停点在 `r299` 那行与 `clover_census_seq++` 之间，
+而那 28 行里只有右花括号和三次自增。 bytes 进 msgbuf 只证明 `log_message` 被叫过，
+不证明 printf 返回了。`smp-pre`/`smp-post` 之间**恰好只有那一句 printf**，
+于是「没走到」与「走进去了没出来」第一次成为两个可分的读数。
+
+**⑤ 驱动侧还掉一笔真账（`:5217`）。** `CloverSdhci r212: drain exit` 那行的 `probe_pend=`
+打的是 `gRingPending[kRingDriver]`——驱动 tee 环自己的积压，与中转无关。boot 97 读出 0，
+被当成「中转没有待搬的行」，而中转真正待搬的数目（`gProbeSeq - gProbeNext`）当时**没有任何一列**。
+本轮把它改名 `ring_pend=`、补上真的 `probe_pend=`，token 升到 `CloverSdhci r308: drain exit`
+（第九层：加列的行必须说出是哪一代镜像写的）。读者不用改：`read-clover-log.py` 不解析这两列，
+只印原文。
+
+**⑥ boot 99 判读预登记（读数之前写死，四支互斥、各有正对照）。**
+- **(甲) `smp-pre` 有、`smp-post` 无**（同靴、同 `seq=`）⇒ 普查线程停在 `r299` 那行 printf 里面，
+  停在它的字节已经进了 msgbuf 之后。这是十一靴来第一次有个**能指名的调用**。下一手是把那行
+  拆短或让那一拍别走控制台，再看停点跟不跟着走。
+- **(乙) 两枚都有、`r307: pre` 也有，但 `r300: fire`/`done` 无** ⇒ 区间挪到 `snprintf` 与
+  `clover_census_row()`（`:13820…`），也就是 r304/r305 那台机器自己身上。
+- **(丙) 两枚都无，而本靴 `beat` 行有、且 `fired≥1`** ⇒ burst 进了、`bb_fired` 加了，
+  停点在 `:13576`（fired 自增）与 `:13744`（pre-smp）之间——r229 的 printf、
+  `clover_sb_port_state()`、普查头行、`r270` 的 printf、`r271` 的循环，五个候选；
+  夹点比 boot 97 那格**更小**，不是更大。
+- **(丁) `beat` 行也没有**（而 sink 侧 `probe seen=` 仍是 0）⇒ 是**中转这条路在本镜像里死了**，
+  boot 96/97/98 一切以 relay 为前提的结论（含「没人叫过它」）全部作废、重开。
+  这一支是本轮的正对照存在的唯一理由，不许在读了别的东西之后再补。
+- 每支都还要单独记一条：`beat` 行的 `reg=/start=/run=` 与 tee 那枚 `r271` 行的同名字段
+  只能**同靴同拍**才许对照；跨靴比是第九层那格。
+
+**⑦ 控制轮（boot 100，同一枚 r308 镜像、`armcpu-smp=0`）的成立判据换了。**
+成立＝本靴 `beat` 行在卡上、且它自己读出 `reg=1 start=0`；`payload.json` 的 `kernel_args`
+里 `armcpu-smp=0` 在场（args 烤在镜像里，不靠人记）。判据不成立就只报「控制轮没跑成」，
+不再拿「普查一族 0 行」当单核的证据——那是本轮要修的错，不是本轮的读数。

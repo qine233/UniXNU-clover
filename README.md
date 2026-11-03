@@ -510,6 +510,33 @@ leave」一路收紧到一句可测的话：
   进函数、走线程表**之前**投一枚 `r308: enter t= pid= target=` 并带核数摘要），控制轮再以那枚不经 tee 的行
   为成立判据重跑；本靴的正对照＝中转消费者跑了 **7257 趟**（boot 97 只到 902）而 `seen=` 仍 0、
   `blocked=0/0/0`、`empty=0`、`cut=0`，分预算后的 `tail`/`beat` 两支这次都在说话。
+* **r308（v0.7.18，一笔账：裁判不能坐在被审的那条腿上）**。**内核**（`osfmk/kern/task.c`）三枚新行，
+  全部先交 `clover_emmc_probe_say()`（kind-25，不经内核日志/msgbuf/tee）：
+  ① `clover r308: beat t= target= ent= fired= same= cap= gone= notask= busy= reg= start= run=`——心跳线程
+  自己每 120 s 一枚（`clover_r308_beat_row()`，挂在 `clover_ulock_dump(secs);` 之后），**这条是正对照**：
+  它与 latch、与 `bb_fired>=96` 的 cap、与批量签名都无关，所以「relay `seen=0`」第一次能分清
+  「通路死了」与「通路活着、没人走到」；交完中转再 `printf` 同一串字节，两条腿的差就是 tee 的账。
+  ② `clover r308: smp-pre` 与 ③ `clover r308: smp-post`——只走中转、不 printf，一枚在 `r299` 那行 printf
+  **之前**、一枚在它**返回之后**，字段 `t=/seq=/pid=/th=/hidden=` 与 `reg=/start=/run=` 直接复用 `r271`
+  那行自己的局部变量（第十一层：列名与填它的表达式同源）。**为什么是这两枚**：boot 97 卡上有
+  `r262`/`r270`/`r271`/`r299` 四枚 printf 行、relay 整靴 `seen=0`、`r306: step` 与 `r307: pre` 都不在，
+  于是停点被夹在 `r299` 与那三次自增之间——那 28 行里只有一枚 `}` 和三次数；而 bytes 进 msgbuf 只证明
+  `log_message` 被叫过，不证明 printf 返回。`smp-pre`/`smp-post` 之间**恰好只有那一句 printf**。
+  计数同时搬到文件级（`clover_bb_enters/fired/same/capped/gone/notask/busy`）：`bb_fired`/`bb_same` 原本
+  是采样函数自己的 `static`，读它们的行只能由它们产的行走出来。**驱动**：`drain exit` 那行的
+  `probe_pend=` 打的其实是 `gRingPending[kRingDriver]`（tee 环积压），改名 `ring_pend=`，另补真
+  `probe_pend= = gProbeSeq - gProbeNext`，token 升 `CloverSdhci r308: drain exit`；新增 tee 类
+  `r308-relay`（64）并把 `r308` 放进豁免列，让 `beat` 行的第二腿不被每趟 16 条的上限吃掉。
+  闸门：`check-clover ok`（新钉：三枚行各只出现一次、两枚括号行不许有 printf 副本、`clover_census_row`
+  不在场、旧局部计数已删、位置链 `ctm[7]);`→`smp-pre`→`Round299`→`smp-post`→`clover_census_seq++`、
+  `beat` 行排在 `clover_ulock_dump` 之后、双仓补丁逐字节相同、LATE_PATCH 里 r308 先于 r307 逆放，
+  并反向钉 `CloverSdhci r212: drain exit` 已不在盘上）、`verify-clover-payload` EXIT=0
+  （新键 `relay-bracket`/`relay-bracket-onceliteral`/`beat-accounting`/`exit-generation`）、
+  `read-clover-log --selftest` ok、`task.c` 语法 `exit=0 hard=0`、`CloverSdhci` `-Werror`＋对象审计过。
+  产物链内核 `185955ea`→AMFI `ff5c1972`（两刀编码与 r305–r307 逐字节同）→归一化 `7e669d95`（973/973 戳、
+  `_clover_fastboot_reason` 在符号表）；镜像 `~/clover-out/round308-v0.7.18-payload.img`
+  sha256 `ae4baa8a…`，58,720,256 B。**boot 99 的判读四支与控制轮的成立判据，读数之前写死在
+  `notes/development-log.md` §Round308 ⑥⑦**。
 * **这两条仪器债已由 r303 结清**（原文曾记作「本格欠着」）：`vbits=` 现以 r298 行末的 `vb_r=`/`vb_v=` 落地
   （`ipc_right_lookup_read()` 已经交出的 entry 位掩码，用来分 port set / send-once / 死名，不需要对象、锁纪律与
   translate 同一条），`cap=send` 行的 `qmc=/qsr=` 也带上了自己的返回码 `qerr=`。

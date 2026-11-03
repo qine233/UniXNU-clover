@@ -1147,6 +1147,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // exact ambiguity r304 and r305 were written to remove. One row per fire, so 64 is headroom for an
   // 1800 s deadline, and the class is separate so a missing step row cannot read as a missing census.
   { "clover r306: ", "r306-step", 64, 0, 0, 0 },
+  // Round308 speaks on the relay first and prints the same bytes as its second leg: at most one beat
+  // row every two minutes (fifteen to the deadline) and two rows per census fire from inside the core
+  // count block. The printf copy is the relay row's control, so the per-pass cap must not be allowed to
+  // eat it -- a boot that lost the printed copy to throttling would read as a relay that sealed a row
+  // the console never saw, which is the exact ambiguity this round exists to remove rather than rejoin.
+  { "clover r308: ", "r308-relay", 64, 0, 0, 0 },
   // Round289 speaks only at a fatal data abort, and it is the reading the panic record cannot carry:
   // the kind-20 slot is 480 bytes, and boot 74 and boot 75 both showed it cut off inside the register
   // list, before esr, far, fp and sp -- the four fields that name a fault. At most one abt row and two
@@ -4687,7 +4693,13 @@ static void teeConsumeLine (uint32_t &pushed)
        // between the counters and the fire row, and it is printed by the console path only, on purpose. If
        // the per-pass cap ate it, a boot would report neither copy of "got here" and read like a fire that
        // never started -- the false-empty this exemption exists to stop, one layer under the relay.
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r306"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r306") ||
+       // Round308's rows are the relay's own second leg: the beat row is sealed on the driver ring and
+       // printed by the console path in the same statement, and the pair is the reading (a relay row with
+       // no printed copy says the console lost it; neither says the sampler never ran). A per-pass cap
+       // that ate the printed half would turn "the tee is blind" into "the relay is dead", which is the
+       // one confusion this round was written to keep out of the next control round.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r308"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.
@@ -5214,12 +5226,19 @@ static void panicDrainRings (void)
           gTeeSyncInKept, gTeeSyncOutKept, gTeeSyncDropped);
   // Round212: the exit line is queued before the last flush so it rides with it, and it repeats the
   // boot id: a pair of lines with the same id is one boot's drain seen from both ends.
-  panicTailSay ("CloverSdhci r212: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u "
-                "probe=%u probe_drop=%u probe_pend=%u\n",
+  // Round308 renames one column and adds the column it was mistaken for. `gRingPending[kRingDriver]`
+  // counts the driver's whole tee ring, so the row named it probe_pend while saying nothing about the
+  // relay: boot 97 read a 0 there and could not tell an empty relay from a relay whose rows were never
+  // drained. ring_pend= keeps that number under the name its producer owns, and probe_pend= is now the
+  // relay's own backlog -- sealed minus consumed, the same pair the flush reports beside a write.
+  panicTailSay ("CloverSdhci r308: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u "
+                "probe=%u probe_drop=%u ring_pend=%u probe_pend=%u\n",
                 static_cast<unsigned int> (gBootId), gPanicDrainWritten, gPanicDrainDropped,
                 kPanicTeePasses, gProbeFlushed,
                 static_cast<unsigned int> (__atomic_load_n (&gProbeDropped, __ATOMIC_RELAXED)),
-                static_cast<unsigned int> (gRingPending[kRingDriver]));
+                static_cast<unsigned int> (gRingPending[kRingDriver]),
+                static_cast<unsigned int> (__atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED)) -
+                static_cast<unsigned int> (__atomic_load_n (&gProbeNext, __ATOMIC_RELAXED)));
   gPanicDrainWritten += panicRingFlush (kRingDriver);
 }
 

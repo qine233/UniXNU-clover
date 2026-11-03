@@ -837,8 +837,13 @@ def check_panic_tail_read(kernel: bytes) -> bool:
                          b"bufx=%d tee=%u boot=%u\n") in kernel,
              "enter": (b"CloverSdhci r212: drain enter boot=%u first=%u panic_first=%u "
                        b"verdict=%u tee=%u append_rc=%u probe_seen=%u\n") in kernel,
-             "exit": (b"CloverSdhci r212: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u "
-                      b"probe=%u probe_drop=%u probe_pend=%u\n") in kernel,
+             # Round308 moves this row's token and splits its last column in two. The number that used to
+             # sit under probe_pend= is the driver tee ring's backlog, so the relay's own queue -- sealed
+             # minus consumed, the pair the flush reports beside a write -- had no column at all, and boot
+             # 97 read that 0 as a relay with nothing pending.
+             "exit": (b"CloverSdhci r308: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u "
+                      b"probe=%u probe_drop=%u ring_pend=%u probe_pend=%u\n") in kernel,
+             "exit-generation": (b"CloverSdhci r212: drain exit") not in kernel,
              "kept-r184": (b"CloverSdhci r184: panic drain wrote=%u dropped=%u tee_passes=%u\n")
                           in kernel,
              # Round301's whole point is that the sentence survives a refused report append, and a
@@ -1352,6 +1357,25 @@ def check_sb_sample(kernel: bytes) -> bool:
              # and the boot would be back to one absence standing for two facts.
              "census-pre": (b"clover r307: pre t=%llu seq=%llu pid=%d th=%u hidden=%u\n") in kernel,
              "census-pre-relay-only": kernel.count(b"clover r307: pre t=%llu") == 1,
+             # Round308. Boot 97 is the shape: the census head, r270, r271 and r299 all reached the card and
+             # then the boot said nothing, with the relay reporting seen=0 -- never asked for a row. That
+             # brackets the stop inside a window with no statement that can block, so the two rows here seal
+             # on the relay around the r299 printf and carry the r271 row's own core counts. Their console
+             # twins are deliberately absent: the pair times one printf, and a copy that rides the pipe under
+             # trial times nothing.
+             "relay-bracket": all(needle in kernel for needle in (
+                 b"clover r308: smp-pre t=%llu seq=%llu pid=%d th=%u hidden=%u"
+                 b" reg=%u start=%u run=%u\n",
+                 b"clover r308: smp-post t=%llu seq=%llu pid=%d th=%u hidden=%u"
+                 b" reg=%u start=%u run=%u\n")),
+             "relay-bracket-onceliteral": all(kernel.count(b"clover r308: smp-%s" % side) == 1
+                                              for side in (b"pre", b"post")),
+             # The beat thread's own accounting row, which is what makes an absent bracket pair a reading
+             # rather than a hole: it runs whether or not a target ever latched, and it is the only row on
+             # the card that says how many cpus XNU thinks it has on a boot whose tee went blind.
+             "beat-accounting": (
+                 b"clover r308: beat t=%llu target=%d ent=%u fired=%u same=%u cap=%u gone=%u"
+                 b" notask=%u busy=%u reg=%u start=%u run=%u\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

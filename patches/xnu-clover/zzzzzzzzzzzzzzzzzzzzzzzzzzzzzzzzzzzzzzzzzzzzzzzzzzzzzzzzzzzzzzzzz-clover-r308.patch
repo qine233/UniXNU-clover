@@ -1,0 +1,225 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10822,6 +10822,25 @@
+ static mach_port_name_t clover_bb_target_name;
+ 
+ /*
++ * Round308. Boot 98 was the control round for "does the census tail belong to the image or to the
++ * core count", and it answered nothing: the whole census family came back as zero rows, and every
++ * reading that could have said whether the sampler ran at all -- bb_fired, bb_same, the r229 early
++ * returns, the r271 core counts -- was produced inside that same burst or printed through the console
++ * tee, which that very boot proved it was losing lines to (throttled=56, lap=2). A judge that rides
++ * in the thing it judges cannot judge. These counters are file scope and the only row that reads them
++ * is sealed on the driver relay, which does not pass through the kernel log, so the next control round
++ * has a reading that survives the loss it is measuring. Each one is incremented at exactly one
++ * statement, named for it, and never reset.
++ */
++static volatile uint32_t clover_bb_enters;   /* clover_bb_sample() reached its first statement */
++static volatile uint32_t clover_bb_fired;    /* the walk after the thread table, past both gates */
++static volatile uint32_t clover_bb_same;     /* the same-signature return inside the 120 s window */
++static volatile uint32_t clover_bb_capped;   /* the clover_bb_fired >= 96 return */
++static volatile uint32_t clover_bb_gone;     /* proc_find() found no such pid */
++static volatile uint32_t clover_bb_notask;   /* proc_task() came back TASK_NULL */
++static volatile uint32_t clover_bb_busy;     /* the task lock was held, try_lock failed */
++
++/*
+  * Round238. Round237 fed this table only after the SpringBoard sampler latched
+  * backboardd's pid, and printed only the first eight rows; boot 26 left a stuck
+  * wait at 0x15dd8f944 that never appeared, so the table could not say whether it
+@@ -11172,8 +11191,54 @@
+  * The task reference is taken under the latched pointer, which the latch never
+  * frees (see clover_sb_note_current), and the pid/name are read as plain words:
+  * they are latched once and only ever cleared, so a torn read is not possible.
++ */
++
++/*
++ * Round308. The reading the beat thread can give that no row inside the census burst can: what the
++ * kernel believes about its own cpus, and how far the backboardd sampler has got, both sealed on the
++ * driver relay before anything is printed. Boot 96 read `reg=` off a tee-delivered row and boot 98 lost
++ * the row entirely, so the same three numbers are now said by a producer that does not ride the console.
++ * The bound and the two flags are the ones round271 already uses; nothing here redefines them.
+  */
+ static void
++clover_r308_beat_row(uint64_t secs)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	char row[256];
++	uint32_t reg = 0, nstart = 0, nrun = 0;
++	int len;
++	int k;
++
++	for (k = 0; k < (MAX_CPUS < 8 ? MAX_CPUS : 8); k++) {
++		cpu_data_t *cdp = CpuDataEntries[k].cpu_data_vaddr;
++
++		if (cdp == NULL) {
++			continue;
++		}
++		reg++;
++		if (cdp->cpu_flags & StartedState) {
++			nstart++;
++		}
++		if (cdp->cpu_running) {
++			nrun++;
++		}
++	}
++
++	len = snprintf(row, sizeof(row),
++	    "clover r308: beat t=%llu target=%d ent=%u fired=%u same=%u cap=%u gone=%u"
++	    " notask=%u busy=%u reg=%u start=%u run=%u\n",
++	    (unsigned long long)secs, clover_bb_target_pid, clover_bb_enters, clover_bb_fired,
++	    clover_bb_same, clover_bb_capped, clover_bb_gone, clover_bb_notask, clover_bb_busy,
++	    reg, nstart, nrun);
++	if (len <= 0) {
++		return;
++	}
++	row[sizeof(row) - 1] = '\0';
++	clover_emmc_probe_say(row, (unsigned int)strlen(row));
++	printf("%s", row);
++}
++
++static void
+ clover_bb_beat_thread(void *param, wait_result_t wres)
+ {
+ 	uint64_t last_beat = 0;
+@@ -11213,6 +11278,13 @@
+ 				    "sbrep", secs, "r234");
+ 			}
+ 			clover_ulock_dump(secs);
++			/*
++			 * Round308. Sealed on the relay before it is printed, because the reading it carries is
++			 * the one boot 98 could not get: how far the sampler got, and what the kernel believes
++			 * about its own cpus. It runs on the heartbeat rather than inside the burst so a boot
++			 * whose sampler never latched a target still says something.
++			 */
++			clover_r308_beat_row(secs);
+ 		}
+ 		if (clover_bb_target_pid != 0) {
+ 			clover_bb_sample(clover_bb_target_pid, sb,
+@@ -13210,8 +13282,6 @@
+ static void
+ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ {
+-	static uint32_t bb_fired;
+-	static uint32_t bb_same;
+ 	static char bb_last_hop[192];
+ 	static char bb_last_wait[192];
+ 	static uint64_t bb_last_t;
+@@ -13318,30 +13388,35 @@
+ 	static uint64_t clover_census_seq;
+ 	static uint32_t clover_census_rows;
+ 
++	clover_bb_enters++;
+ 	if (pid <= 0 || sb_task == TASK_NULL) {
+ 		return;
+ 	}
+ 	clover_bb_note_mark(sb_task, name);
+-	if (bb_fired >= 96) {
++	if (clover_bb_fired >= 96) {
++		clover_bb_capped++;
+ 		return;
+ 	}
+ 	p = proc_find(pid);
+ 	if (p == NULL) {
++		clover_bb_gone++;
+ 		printf("clover r229: bb t=%llu pid=%d f=%u gone\n",
+-		    (unsigned long long)secs, pid, bb_fired);
++		    (unsigned long long)secs, pid, clover_bb_fired);
+ 		return;
+ 	}
+ 	task = proc_task(p);
+ 	if (task == TASK_NULL) {
+ 		proc_rele(p);
++		clover_bb_notask++;
+ 		printf("clover r229: bb t=%llu pid=%d f=%u notask\n",
+-		    (unsigned long long)secs, pid, bb_fired);
++		    (unsigned long long)secs, pid, clover_bb_fired);
+ 		return;
+ 	}
+ 	if (!lck_mtx_try_lock(&task->lock)) {
+ 		proc_rele(p);
++		clover_bb_busy++;
+ 		printf("clover r229: bb t=%llu pid=%d f=%u busy\n",
+-		    (unsigned long long)secs, pid, bb_fired);
++		    (unsigned long long)secs, pid, clover_bb_fired);
+ 		return;
+ 	}
+ 	sc = task->suspend_count;
+@@ -13565,7 +13640,7 @@
+ 
+ 	same = (strcmp(hopsig, bb_last_hop) == 0) && (strcmp(wsig, bb_last_wait) == 0);
+ 	if (same && secs - bb_last_t < 120) {
+-		bb_same++;
++		clover_bb_same++;
+ 		task_deallocate(task);
+ 		return;
+ 	}
+@@ -13573,11 +13648,11 @@
+ 	strlcpy(bb_last_hop, hopsig, sizeof(bb_last_hop));
+ 	strlcpy(bb_last_wait, wsig, sizeof(bb_last_wait));
+ 	bb_last_t = secs;
+-	bb_fired++;
++	clover_bb_fired++;
+ 	len = snprintf(line, sizeof(line),
+ 	    "clover r229: bb t=%llu pid=%d n=%u sc=%d act=%d f=%u s=%u hops=%u"
+ 	    " wait=%u d=%llu%s\n",
+-	    (unsigned long long)secs, pid, n, sc, act, bb_fired, bb_same, hn,
++	    (unsigned long long)secs, pid, n, sc, act, clover_bb_fired, clover_bb_same, hn,
+ 	    uall, (unsigned long long)dt, tokens);
+ 	if (len > 0) {
+ 		line[sizeof(line) - 1] = '\0';
+@@ -13666,6 +13741,30 @@
+ 			    (unsigned long long)ctm[4], (unsigned long long)ctm[5],
+ 			    (unsigned long long)ctm[6], (unsigned long long)ctm[7]);
+ 			/*
++			 * Round308. Boot 97 is the shape this pair exists for: r262, r270, r271 and r299 were all on
++			 * the card and the relay sealed nothing all boot, which put the stop between the r299 printf
++			 * and the three counter increments below -- a window with no statement in it that can block.
++			 * Either the walk is inside that printf after its bytes reached the msgbuf, or the rows never
++			 * got there, and the four printfs cannot tell the two apart because they are the pipe under
++			 * trial. These two rows seal on the relay instead, one before the r299 row and one after it:
++			 * pre without post names printf itself, and neither row with the beat row present names a
++			 * walk that stopped above the core counts. reg=/start=/run= are the r271 row's own variables,
++			 * so the control round reads the core count off a leg the tee cannot eat.
++			 */
++			{
++				char prow308[256];
++				int plen308 = snprintf(prow308, sizeof(prow308),
++				    "clover r308: smp-pre t=%llu seq=%llu pid=%d th=%u hidden=%u"
++				    " reg=%u start=%u run=%u\n",
++				    (unsigned long long)secs, (unsigned long long)clover_census_seq, pid, cn,
++				    (call > cn) ? call - cn : 0, reg, nstart, nrun);
++				if (plen308 > 0) {
++					extern unsigned int clover_emmc_probe_say(const char *text,
++					    unsigned int length);
++					clover_emmc_probe_say(prow308, (unsigned int)strlen(prow308));
++				}
++			}
++			/*
+ 			 * Round299. Same fire, immediately under the row above: reg=1 of max=8 is the question, and
+ 			 * this is the answer's mechanism. st= is step per logical core (1 nub started, 2 registered with
+ 			 * XNU, 3 start thread ran, 4 CPU_ON handed to the firmware, 5 entered initCPU, 6 redistributor
+@@ -13700,6 +13799,24 @@
+ 			    (unsigned long long)armcpu_smp_entry[2], (unsigned long long)armcpu_smp_entry[3],
+ 			    (unsigned long long)armcpu_smp_entry[4], (unsigned long long)armcpu_smp_entry[5],
+ 			    (unsigned long long)armcpu_smp_entry[6], (unsigned long long)armcpu_smp_entry[7]);
++			/*
++			 * Round308. The other half of the pair above, sealed after the r299 row's printf returned and
++			 * before anything the census owns is touched. It carries the same nine fields with the same
++			 * producers so the two rows differ by exactly one statement: the printf between them.
++			 */
++			{
++				char row308[256];
++				int len308 = snprintf(row308, sizeof(row308),
++				    "clover r308: smp-post t=%llu seq=%llu pid=%d th=%u hidden=%u"
++				    " reg=%u start=%u run=%u\n",
++				    (unsigned long long)secs, (unsigned long long)clover_census_seq, pid, cn,
++				    (call > cn) ? call - cn : 0, reg, nstart, nrun);
++				if (len308 > 0) {
++					extern unsigned int clover_emmc_probe_say(const char *text,
++					    unsigned int length);
++					clover_emmc_probe_say(row308, (unsigned int)strlen(row308));
++				}
++			}
+ 		}
+ 		clover_census_seq++;
+ 		clover_census_rows = 0;
