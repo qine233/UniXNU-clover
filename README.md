@@ -165,9 +165,12 @@ leave」一路收紧到一句可测的话：
   `clover r299: smp t=601 req=1 con=1 run=7 st=07777777 fl=00000000 rc=0×7 entry=0,a3203000×7`
   与 boot 88 **一字不差**，`r270: ipi … sent=296411 recv=296290` 也是非零收发 ⇒ 「开关→注册→上线→互发
   IPI」不是这一靴走运。而 `clover r262: th`/`r296:`/`r298:` 本窗又是 **0 行**（round298 那枚镜像的
-  boot 87 同一段环里是 33 + 8 + 8，round297 那枚是 41 + 8）⇒ 尾巴没了是**跟着 r299 这枚镜像来的性质**，
-  不是某一靴的偶然。这正是 r300 那两行要切开的东西：`done th=` 非零而卡上 0 行 ⇒ 仪器（每拍推送上限），
-  `done th=0` ⇒ 内核这一拍没进循环。**结局是第十起静默无 panic 复位，且比 boot 88 更早**：内核环最后
+  boot 87 同一段环里是 33 + 8 + 8，round297 那枚是 41 + 8）——当时判成「跟着 r299 这枚镜像来的性质」，
+  **boot 90 换了镜像（r300）尾巴仍然整段没有，所以这条归因已降级：「跟镜像」与「跟核数」两条假设都还活着**
+  （单核像 86/87 都送出、八核像 88/89/90 全 0）。这正是 r300 那两行要切开的东西：`done th=` 非零而卡上 0 行 ⇒ 仪器（每拍推送上限），
+  `done th=0` ⇒ 内核这一拍没进循环。**结局当时记成「第十起静默无 panic 复位」，这个词已被 boot 90 撤回**
+  （见下面 boot 90 那条：`panicDrainRings()` 只有一个调用者，而本靴名下有 `drain enter boot=89 …
+  append_rc=2`，所以 boot 89 进了 panic sink，只是文案被卡拒了）：内核环最后
   一行 661.003 s（`clover r225: sbport t=661`）、驱动 flight 里本靴最后一笔块请求 650.759 s
   （`pid=252 comm=mapssync`、`xpcproxy`，`stuck=1 recov=1`）、最新心跳 536.228 s；kind-20 记录 0 条、
   卡上死线记录仍署 boot 87、panic 标记两枚一枚是 boot 87 的 STALE 一枚是没写过的槽（`boot=0 gates=0x0()`）、
@@ -175,6 +178,29 @@ leave」一路收紧到一句可测的话：
   预登记的两支（「与 boot 88 同带」「回到 1681–1800 那一族」）**都没落**，落的是第三支：同一枚镜像两靴都早、
   且早得不同——八核像的开始时间被压到 660–940 s 这一段。两靴一像只能说「分布挪了位」，说「核数挪的」还差一票；
   r300 只加两行 printf 与两个计数器、不动任何硬件路径，所以 **boot 90 同时也是仪器轮的控制轮**。
+* **boot 90（r300 / v0.7.4 的读回）：仪器不自证，而这一靴其实喊过一声、嗓子被占了**。八核第三次上线，
+  这次**跨了镜像**：`r271: cpu t=698 real=8 max=8 reg=8 start=7 run=8`、`r299: smp … req=1 con=1 run=7
+  st=07777777 fl=0 rc=0×7 entry=0,a3203000×7` 与前两靴逐字段相同、`r270: ipi sent=250500 recv=250415`
+  ⇒ 多核不是某一枚镜像的运气。桌面那一格照旧没动（`threads=24 shown=20 hidden=4 wait=22`、
+  `sbport bb nm=2d03 cnt=0`、债主仍 `own=58:backboardd`）。**r300 的读数落在预登记五支之外**：卡上
+  `clover r300: fire` 与 `done` 各 **0 行**，而这不是地平线问题——kernel 环 512 行的 `seq` 我逐条核过
+  **1194…1705 连续无洞**，`r299: smp` 是 seq 1657（698.750532），下一行 seq 1658 是 698.977911 的别人的行，
+  `fire` 本该坐在两者之间 ⇒ 每一支都要求 `fire` 先到，**五支全落空，只能记「没量到」**。
+  错在我自己：那两行 printf 与它们要量的行**走同一条管道**（printf → msgbuf → tee → 卡上环），
+  缺席必然与被量物同形——「判决行要有一条不经该管道的副本」这条规矩，我这次把副本印进了 burst 里。
+  **本靴真正的新事实是它的结局不是静默**：flight `panic seq 0 slot 0 t=686630ms stage=0 log_ready=1
+  host=0x20fdf rc=0 boot=90 gates=0x7(armed,bcb,text)`（入口标记落了、出口标记没落），verdict 环里
+  `r212: drain enter boot=90 … append_rc=2` / `panic tail … lap=29` / `r184: panic drain wrote=0` /
+  `drain exit boot=90`——`panicDrainRings()` 在整份源码里只由 `clover_emmc_panic_append` 调用 ⇒ **sink 跑过**，
+  而 `append_rc=2` 是 `panicAppendText()` 在写之前**读**报告槽那笔 `readPioBlock` 失败（`:8824`），
+  配上 `host=0x20fdf≠0`（那一刻控制器被占）⇒ 一次性尝试、不重试 ⇒ **卡上没有 boot-90 的 kind-20 记录，
+  panic 那句话丢了**。时钟对齐（boot 87：sink 1803.044 s vs 环尾 1814 s）说明驱动 ms 钟慢约 9.8 s，
+  所以 sink 入口 ≈ 内核 696 s，而普查那一拍在 698.75 s——**尾巴丢的那一刻正处在 sink 已开跑、guard 被占的窗口里**
+  （同窗还有「最新心跳 587.938 s vs 最新请求 736.607 s ⇒ 148.669 s 没有一条心跳找到过空闲 guard」、
+  `card busy 5285 ms`）；**这条不作因果结论**（boot 88 没进 sink 尾巴也整段没有），只是把两个缺席放进同一个待测嫌疑。
+  结局时间带 **746–7xx s**（下界环尾 746.396 s，本靴最后两行是 `r286/r290: gpu`；上界由 20:56:05 读回扣
+  recovery+读回，墙钟只有 ±30 s 把握）⇒ 三条八核靴三个时间（661–7xx / 746–7xx / 835–9xx），**分布而非时刻**，
+  「核数」与「镜像」谁挪的仍差一整轮控制。三笔仪器债登记在 `notes/development-log.md` §boot 90 ⑧。
 * **r300（v0.7.4，仪器债）：一次普查 fire 现在自己说「打到哪儿」**。`task.c` 里那一拍加编号与收尾：
   `clover r300: fire t=%llu seq=%llu pid=%d th=%u hidden=%u`（`th=` 打算打几行线程、`hidden=` 被
   `CLOVER_BB_CENSUS` 挡在卡外的线程数）打在 r299 行之后、线程循环之前；
@@ -190,6 +216,7 @@ leave」一路收紧到一句可测的话：
   r300→r299→r298，因为计数器归零坐在 r299 那行与线程循环之间、跳计数器坐在 r298 注释封口处）；
   `check-clover.py` 钉两行完整格式串与三个计数器并禁止重印被数的行，`verify-clover-payload.py` 加
   `bb-census-fire`/`bb-census-done` 两枚整串针，守卫做过正对照（摘类行 / 摘豁免各 EXIT=1 并指名）。
+  **boot 90 已读回：落在五支之外——`fire`/`done` 自己也没到卡上，所以这债没结清，副本必须挪出那条管道（r301）**。
 * **再后一支（本格欠的两条仪器债）**：`vbits=`（`ipc_right_lookup_read()` 已经交出的 entry 位掩码，
   用来分 port set / send-once，不需要对象、锁纪律与 translate 同一条）与 `qmc=/qsr=` 自带返回码。
 * **那笔「等设备解锁」的死等已经不是现场，但它的机制现在读全了**：r274 命中的形状是
@@ -364,7 +391,11 @@ boot 86 的 `link=unknown` 由此升一级；同一枚 `d0b` 也正式结掉 boo
 | 6 | **GPU/Metal 一个都没有**（Adreno 512 无驱动、无固件、无 renderer） | `gpu` 区 `planned`；boot 74 实机：**r286 上电写序列在本板第一次生效**——`cx_on=1`、`gfx3d_en=1`、`cxo_en=1`、AHB/BIMC 三票=1（eMMC 正对照成立），但 `gx_on=0` → `chipid skipped`。**boot 76/77 逐字段复现**，所以 `gx_on=0` 是稳定硬件状态，不是竞态也不是时机。**boot 77 的 r290 读数把「问了」和「在跑」分开了**：`gfx3d=1/1`、`rbbm=1/1`（BIT(0) 按下、BIT(31) 仍 HALT），而 `cxo=1/0`、`rbcpr=1/0` 两支 halt=0 —— 前者是本轮没动过的天然正对照，后者是本轮新按的一票真的把分支启动了。（`rcg=80000000` 曾被读成「父源没设」，已收回；halt 两支的 RCG 都是 `0x80000000`、在跑那支 `0x00000000`，**只记相关性**：BIT(31) 在 RCG 命令字里的名字要等一份归档的 `clk-rcg.c`。见 [`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5） | 分支清白、债在电：`gx` 的 GDSC `gx_collapse=0` 而 `gx_on=0` 是**电没到**，不是使能没按。r291（v0.6.92 已发出）按 §5.6 的厂商表读 GFX LDO，但**不新增映射**：`gfx_ldo_vreg` 的 0x0506e000 正落在 DT 声明的 GPUCC `reg = <0x5065000 0x10000>` 里（偏移 0x9000），于是读 `0x9018` VREF（µV=val*5000+375000）、`0x901c` 开关控制（byp/pdn/cpr_byp）、`0x9028` 的 `LDO_READY=BIT(2)`/`LDO_VREF_SETTLED=BIT(4)`，连同当拍 `cx_on`/`gx_on` 一起打——那两票是这行的正对照：三个词全 `0xffffffff` 而 `cx_on` 照常，是这页没应答，整行作废。checker 把「本驱动只开三张窗口」钉成 `IODeviceMemory::withRange` 计数=3。判据写死：`LDO_READY=0` 或 µV=375000 ⇒ 角从没抬起（债在 CPR4/`vdd_gfx`）；µV 落在 DT 的 400000…925000 且 `ready=1` 而 `gx_on=0` ⇒ 轨清白，回查 GDSC 自己的等待字段与 `gpu_gx_domain_addr`。角数（厂商 `SDM660_MMSS_FUSE_CORNERS=6` vs DT 的 1..7）不印也不下结论。S3/S5 两颗是 `qcom,rpm-smd-regulator`，SPMI 读不到，不在这一格。**boot 78 把两条预登记判据一起点亮**（`beat` 副本顶上，`ldo post` 在环窗外）：`vref=0 val=0 uv=375000`、`sts=0`（`ready=0 settled=0`）、`ctrl=80000038`=`LDO_CLAMP_IO|LDO_PDN|LDO_UNDER_SW_CTRL`+一枚没名字的 BIT(3)，同拍 `cx_on=1` 作正对照 ⇒ **轨自这次上电起既没使能也没编程，「轨清白」这一支关闭**。下一手是对轨**编程**，缺的不是寄存器（三处都在 `msm_gfx_ldo.c` 点得名）而是使能全序与角→电压来源（CPR4 fuse 在 `0x00784000` 另一张窗口），没有 sha256 出处不写。**boot 79/80 逐拍复现同一读数**（`uv=375000 sts=0 pdn=1` 且同拍 `cx_on=1`），轨的状态不是时机问题。**r294 把这格的读数铺成全普查**：`GpuRegs.h` 按厂商 `msm_gfx_ldo.c` 把 0x00..0x30 全部定名（0x20 没有 `#define`，但厂商的 dump 名字表 `register_str[8]`（`:249`）就叫它 `LDO_STATUS0`——普查行仍只印词、不判位，见 §5.11 第 6 条；ADC_CTL 0x34 落在 DT `reg = <0x0506e000 0x34>` 之外，不读），`clover_gpu_report_ldo_words()` 在 post/beat 两拍各印 13 个词 + 当拍 `cx_on/gx_on`，**一个词也不写**——它是下一轮真去编程轨时的基线，r291 那三个词保留自己那行以便和已归档的 boot 78 对比。**boot 81 的普查第一次上卡就当轮给结论**：两拍（t=859/t=980）13 个词里只有 `w1c=80000038`、`w24=0000000d` 非零，其余 11 个全 `00000000`；并排厂商 `sdm660_ldo_config[]` 的期望值（ATEST `0x00000080`、CFG0 `0x0100A600`、CFG1 `0x000000A0`、CFG2 `0x0000C3FE`、VREF_TEST_CFG `0x00401100`、REF_X1 `0x00000230`、REF_X2 `0x00000048`）⇒ **一位都不对**。所以不是「编程到一半」，是这颗 LDO 从复位到现在没人按那张表配过，引导加载器也没配。正对照照旧成立：`w1c` 读出非零、同拍 `cx_on=1` ⇒ 这页在应答，0 是读数不是空窗。`w24` 是 `LDO_STATUS1_REG`（厂商 msm_gfx_ldo.c:54 定义了却从没读过），归档里没有它的位名 ⇒ 印出来、不命名。**同一轮还做了一个控制**：删掉 r290 的 `kGpuccRbcprEn`/`kGpuccRbbmtimerEn` 两笔写（读照旧），因为四起静默复位只出现在带那两笔写的负载上；checker 现在反向拒绝这两行回到源码。**这个控制与紧随的 r294b 一起把 GPU 从「整卡复位嫌疑」里清出去了**（boot 81 删写仍 997 s 复位、boot 82 刷 boot 76 那颗旧镜像仍 707 s 复位）⇒ 本格的债仍在电（轨没人配过），但**它不再是复位线的嫌疑人**，**§5.11 把「下一手」的前提换了**：`msm_gfx_ldo.c` 的 SDM660 分支（`:1560`）不调 `corner_config_init`，所以那份文件里的 fuse 代码与 `ldo_fuse_enable` 在本板从不执行；mode 只由 CPR4 那句 `ldo_regulator_bypass = BHS_MODE`（`cpr4-mmss-ldo-regulator.c:513`）决定，而 `ctrl=0x80000038` 里 BIT(9) PWR_SRC_SEL=0 + BIT(2)/BIT(1)=0 说的是**两个供电级（LDO 与 BHS）都停在复位状态**——比 boot 81 那句「11 个词全 0」更硬，且不依赖那 11 个 0。真正的判据 fuse 在 CPR4 那份文件里点齐了名（row 73 bit 62..57 = 六角的 ldo_enable、row 71 bit 38 = 闭环允许、row 65 = 初压/偏移，全在 DT 声明的 `fuse_base = <0x00784000 0x1000>` 内）⇒ 下一手是**读这三枚 8 字节行**（要按 DT 第二段窗口主动把映射数从 3 抬到 4；行距已结：`cpr3_read_fuse_param` 的本体在**新归档的 `cpr3-util.c:195`**（sha256 `2f3c672d0142…`，`BYTES_PER_FUSE_ROW 8` :24、偏移 row*8 的 8 字节 `readq_relaxed`），与 gfx-ldo 那份逐字一致 ⇒ 三枚行 = `+0x208/+0x238/+0x248`）。**桌面仍 CPU-first** |
 
 1 挡住桌面；6 是 1 最可能的病根（尚未证）；2–4 是之后要补的板级驱动，5 只是噪声（已定名且非瓶颈）。
-**十连「静默、无 panic」复位（718/1184/1248/1335/997/707/1681/1712–1800/835–9xx/661–7xx s）已经判定它是独立的一道坎，不是主线症状**：
+**十一连「无 panic 文案」复位（718/1184/1248/1335/997/707/1681/1712–1800/835–9xx/661–7xx/746–7xx s）已经判定它是独立的一道坎，不是主线症状**：
+boot 89/90 两靴把「静默」这个词从它们自己身上摘掉了——两靴都进了 panic sink（`drain enter boot=89/90 …
+append_rc=2`，而 `panicDrainRings()` 只由 sink 调用），只是那句 panic 文案在被写之前要读一次报告槽，
+那笔读被「控制器被人占着」拒了（`host=0x20fdf`），于是**名字有、文案没送出**；所以从现在起这条坎的准确说法是
+**「读不到为什么结束」**，而 r301 就是把那一份文案改成 RAM 副本、走已被证明能落地的 verdict 环。
 r292 把 WDT 的地平线换细以后 boot 79/80/81/82 都排除了 APSS watchdog；r294 这个控制轮杀掉了第一条因果假说
 （r290 的两笔 GPUCC 分支使能写——boot 81 带着 `rbcpr=0/1 rbbm=0/1` 的读数仍在 997 s 复位）；**r294b 又杀掉了
 「负载是变量」这一支**——boot 82 刷的还是 boot 76 那颗 `round289-v0.6.86` 归档镜像，同一颗文件这次 707 s 静默复位
@@ -392,7 +423,7 @@ r292 把 WDT 的地平线换细以后 boot 79/80/81/82 都排除了 APSS watchdo
 | Data 卷 | 1 GiB 种子、UUID 钉住（r198），`ENOSPC` 消失 |
 | eMMC | 高速 8 线 + CMD18 批量；ADMA2 读（逐字比对）、写只准回写自己读到的字节；r192 把 cache flush 交还卡，barrier 不再挂死 |
 | launchd 与守护进程 | `exec`/`exit` 成对、`Early boot complete`、SpringBoard 被反复拉起 |
-| 八核 SMP | r299（v0.7.3）把 `ArmCpu` 里那条被 `sheng-smp` 关着的 PSCI `CPU_ON` 路径接进 `armcpu-*` 家族；boot 88 读回 `real=8 max=8 reg=8 start=7 run=8`、`rc=0`×7、`fl=0`，且 `clover r270: ipi` 从 `sent=0 recv=0` 变成 `sent=344711 recv=344557`（八颗各收过 1.3 万～7.3 万笔）。boot 89（同一枚镜像的控制轮）逐字段复现：`smp` 那行一字不差、`sent=296411 recv=296290` |
+| 八核 SMP | r299（v0.7.3）把 `ArmCpu` 里那条被 `sheng-smp` 关着的 PSCI `CPU_ON` 路径接进 `armcpu-*` 家族；boot 88 读回 `real=8 max=8 reg=8 start=7 run=8`、`rc=0`×7、`fl=0`，且 `clover r270: ipi` 从 `sent=0 recv=0` 变成 `sent=344711 recv=344557`（八颗各收过 1.3 万～7.3 万笔）。boot 89（同一枚镜像的控制轮）逐字段复现：`smp` 那行一字不差、`sent=296411 recv=296290`；boot 90（**换到 r300 那枚镜像**）再次复现 `real=8 … run=8`、`st=07777777 rc=0×7`、`sent=250500 recv=250415` ⇒ 可复现性跨镜像成立 |
 | 显示栈首次出帧 | r202 attach + start，5 个进程各拿到一个 `IOMobileFramebufferUserClient`；r206 第一次 present：`swap#1/2/3 accepted`、`scanout#3 ok bytes=9216000`、`retire#3 done=3 presented=3`、`copy#3 93 ms` |
 | 读数通道 | 两个环落在 **logdump**（p56）：kind-21 驱动判据 64 槽、kind-22 内核日志 512 槽，一次 `dd` 1216 扇区读回；panic 屏把 `fb=` 写进记录 |
 | 无人值守 | `run-clover-unattended.sh`：冷刷 cache → 死线 → 预置 BCB 落 TWRP → 读回日志，退出码 0（本帧读数即由此而来） |
@@ -401,17 +432,21 @@ r292 把 WDT 的地平线换细以后 boot 79/80/81/82 都排除了 APSS watchdo
 ## 待完成
 
 - 上表只有 **1** 挡住桌面；**6** 是 1 最可能的病根（尚未证，桌面仍 CPU-first）；**2–4** 挡住板级功能；
-  **5** 是已定名的噪声。静默无 panic 复位是**独立的一道坎**（见上表后的说明），不是主线症状。
-- **多核已到位并且可复现（boots 88–89 / v0.7.3）**：`clover r271: cpu … real=8 max=8 reg=8 start=7
+  **5** 是已定名的噪声。「读不到为什么结束」是**独立的一道坎**（见上表后的说明），不是主线症状——
+  boot 89/90 之后它的措辞从「静默无 panic」改成「进了 panic sink、文案被卡拒」，因为 `drain enter
+  boot=89/90 … append_rc=2` 只在 sink 里产生。
+- **多核已到位并且可复现（boots 88–90，跨两枚镜像 / v0.7.3 与 v0.7.4）**：`clover r271: cpu … real=8 max=8 reg=8 start=7
   run=8 s=01111111`、`clover r299: smp … req=1 con=1 run=7 st=07777777 fl=00000000 rc=0×7
   entry=a3203000×7`、`clover r270: ipi … sent=344711 recv=344557`（boot 89：`sent=296411 recv=296290`，
-  `smp` 那行一字不差）——八颗核上线、固件每次都答应、而且都在收 IPI，两靴两次。
-  「一核跑 iPadOS 17 迟早要还」这一条不用还了。它**不挡**「进桌面」这句话：两靴同拍
-  `r229: sbport … cnt=0` 与 `bb … hops=3` 都不变，所以多核不进修复清单（这条反证靠的是队列与跳数，
+  `smp` 那行一字不差；boot 90 换 r300 像：`sent=250500 recv=250415`，`smp` 那行仍一字不差）
+  ——八颗核上线、固件每次都答应、而且都在收 IPI，三靴三次、两枚像。
+  「一核跑 iPadOS 17 迟早要还」这一条不用还了。它**不挡**「进桌面」这句话：三靴同拍
+  `r229: sbport … cnt=0` 与债主 `own=58:backboardd` 都不变，所以多核不进修复清单（这条反证靠的是队列与属主，
   不是 `run=`——单核像上 `run=` 本来取过 2…7）。**控制轮已经把它该答的答了，同时挪出一条新问题**：
-  八核像的静默复位两靴分别落在 835–9xx 与 661–7xx s，而 v0.7.0–v0.7.2 那四靴要么跑到 1800 s 死线、
+  八核像的结局三靴分别落在 835–9xx、661–7xx 与 746–7xx s，而 v0.7.0–v0.7.2 那四靴要么跑到 1800 s 死线、
   要么在 1681 s 之后——预登记的「同带」/「回到晚带」两支都没落，落的是第三支（都早、且早得不同）。
-  两靴一像只能说分布挪了位；核数这一票要靠 r300 那一轮（只加两行 printf、不动硬件路径）来补。
+  三靴两像只能说分布挪了位；**核数与镜像谁挪的仍没分开**（要一枚八核像关掉 `armcpu-smp`、
+  或一枚没有 r299 行的像开八核，都得花一整轮，所以现在只登记）。
 - **payload 容器不逐字节可复现**：ADT 的 `/chosen/random-seed` 每次重抽（内核本身可复现）。
 - **构建顺序反着**：`unixnu` 先跑 archives 再跑 XNU，身份戳会删掉 object，让 `nm` 失败；r186 起用一次性 object 预 pass 绕过，没有修。
 - **补丁回放名单手写**：新增补丁若碰到排序在前那条的上下文，必须手动加进 `build-xnu-4k-baseline.sh` 的「先反向」名单。

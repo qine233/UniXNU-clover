@@ -23324,3 +23324,111 @@ seq 1 是 boot 87 的（`STALE: boot 89 never entered the sink`），seq 0 是 `
 `…bin.txt`（16 report / 64 verdict / 3 probe / 512 kernel，boot 89）、`…landing-sensors.txt`、
 `…landing-rawdump-head.bin`、`r299-control-boot89-unattended.log`（`unattended-exit=0`）。
 刷的是与 boot 88 同一枚归档镜像（sha256 未重算前已核对 `--flash-cache` 指的就是那个文件）。
+
+> **本节 ②④ 两处已被 boot 90 改掉，改正在 §boot 90 ⑤⑥ 里**：②「尾巴跟着 r299 这枚镜像来」——boot 90 换了
+> 镜像（r300）尾巴仍然整段没有，而它丢的东西现在连 r300 自己那两行都包括，所以「跟镜像」与「跟核数」两条
+> 假设都还活着；④「第十起静默无 panic 复位」——boot 89 名下有 `drain enter boot=89 … append_rc=2` 与
+> `drain exit boot=89`，那两行只在 panic sink 里产生，所以 boot 89 **进了 sink**，不是静默。
+
+## boot 90（round300 / v0.7.4 的读数）：**r300 那两行自己也没到卡上——而这一靴其实喊过一声，只是嗓子被占了**
+
+刷 `round300-v0.7.4-payload.img`（58,720,256 B，sha256 `e48677987c2dbe35…`，落盘后重算核对过），
+`--boot-after-flash --allow-misc-bcb`，落点仍是 TWRP（`r300-boot90-unattended.log` 末行 `unattended-exit=0`；
+外层包装命令返回 2，来自日志写完之后的最后一步，与卡上读数无关——日志与窗口都是完整的）。
+内核环 512 行、覆盖 **345.349–746.396 s**，`misc` block 0 `command=''`、block 1 空（本靴的 panic 路径没写看门狗计数）。
+
+**① 八颗核第三次上线，而且这次跨了镜像。**
+`clover r271: cpu t=698 real=8 max=8 reg=8 start=7 run=8 s=01111111 r=11111111
+tm=47729,37617,28831,13041,16556,13769,1960,7458`；
+`clover r299: smp t=698 req=1 con=1 run=7 st=07777777 fl=00000000 rc=0×7
+want=0,1,2,3,100,101,102,103 seen=0,80000001,…,80000103 entry=0,a3203000×7`（与 boot 88/89 那一行一字不差）；
+`clover r270: ipi t=698 sent=250500 recv=250415 tick=166903 sgi=53864,48810,48091,38580,19542,18240,12402,10941`。
+boot 88/89 是同一枚 r299 像，boot 90 是 **另一枚像（r300）** ⇒ 「开关→注册→上线→互发 IPI」不是某一枚镜像的运气。
+
+**② 桌面那一格还是没动。**
+`r262: census t=698 pid=58 threads=24 shown=20 hidden=4 wait=22 run=2 rx=8 tm=0`、
+`r229: bb t=698 pid=58 … hops=2 wait=13 d=0`、`r229: sbport bb nm=2d03 cnt=0 ql=6 seq=3 rn=3503 sr=1`、
+`r234: sbown bb nm=2d03 own=58:backboardd`。债主仍是 backboardd 自己、`cnt=0` 仍是队列里没信；
+`threads=` 从 17/18/19 涨到 24（隐藏的 4 条是上限截的，不是新的阻塞）。核数与 r300 都没顶开这条链，
+而这一拍的 `r296:`/`r298:` 链行 0 条 ⇒ 本靴**没有**债链读数（见 ③）。
+
+**③ r300 的读数：预登记五支之外的第六支＝没量到。**
+卡上 `clover r300: fire` **0 行**、`clover r300: done` **0 行**。而且这不是环的地平线：我把 kernel 环 512 条的
+`seq` 逐条核过，**1194…1705 连续无洞**（卡上写这一层没丢过行），`r299: smp` 是 seq 1657（slot 121，698.750532），
+紧挨着的 seq 1658 是 698.977911 的 `r217: sbs`——`fire` 行本该坐在 1657 与 1658 之间，卡上没有，
+而它后面 0.227 s 的别人的行在。预登记的每一支都要求 `fire` 行先到（拿 `fire th=` 与 `done th=` 与卡上行数对），
+所以五支全落空，落的是**没量到**。按 `feedback-instrument-horizon`，这个 0 不能读成「循环没走完」，
+也不能读成「tee 吃了尾巴」——两种事实在这一枚仪器上是同一个形状。
+**我自己的错要写在这里**：r300 的两行 printf 与它要量的那批行**走的是同一条管道**
+（内核 printf → msgbuf → tee → 卡上环），所以它们的缺席与被量物的缺席必然同形；那条 feedback 说的是
+「只印一次的判决行要有一条不经该管道的副本」，我这次把副本印在了 burst 里面，等于没做副本。
+r300 名下这笔债**没结清**，读数只能记成「仪器不自证」。
+
+**④ 本靴真正的新事实：boot 90 进了 panic sink，而它的句子被卡拒了。**
+- flight 的 panic 槽：`panic seq 0 slot 0 t=686630ms stage=0 log_ready=1 host=0x20fdf log_first=13320216
+  rc=0 drained=0 boot=90 gates=0x7(armed,bcb,text)`；stage=1 那枚槽仍是 boot 87 的（解码器印 STALE）
+  ⇒ **入口标记落了，出口标记没落**。
+- 驱动 verdict 环里本靴名下四行：`r212: drain enter boot=90 … verdict=1 tee=1 append_rc=2 probe_seen=0`、
+  `r212: panic tail lines=3 unseen=0 bufx=87632 cursor=87632 size=131072 lap=29 refused=0 pend=10 drop=0 append_rc=2`、
+  `r184: panic drain wrote=0 dropped=0 tee_passes=8`、`r212: drain exit boot=90 wrote=0 dropped=0 tee_passes=8
+  probe=0 probe_drop=0 probe_pend=7`。`panicDrainRings()` 在整份 `CloverSdhci.cpp` 里**只有一个调用者**
+  ——`clover_emmc_panic_append` 内部（`:8929`）——所以这四行等价于「sink 跑过」。
+- `append_rc=2` 的含义要看代码：`panicAppendText()` 在写之前要**读**回 16 个报告槽来找最旧的槽位，
+  那笔 `readPioBlock` 一失败就 `return 2`（`:8824`）；标记里 `host=0x20fdf≠0`＝那一刻控制器被别人占着。
+  ⇒ 不是「闸门关着」（那会回 1），是**卡在这一笔上说不**，而且是**一次性尝试、不重试**。
+- 于是卡上**没有 boot-90 的 kind-20 记录**（report 环最新几槽是 boot 84/87 的），panic 那句话没到盘上。
+  内核环里 696–746 s 那一段也没有任何 fault 文本（allowlist 里有 `"panic"` 这个 token，
+  所以 `panic-on-crash disabled via boot-arg` 这种行它照样抄到了——369/449/609 s 三处为证）；
+  但**我不能据此断言 panic 文本没进 msgbuf**，因为同一台仪器刚刚在 ③ 里示范过它怎么整段丢行。
+  两条解释（句子没进 msgbuf／句子和普查尾巴一起被丢）现在分不开——这正是 r301 要绕开整个分岔的理由：
+  **从 sink 的入参里直接拿一份 RAM 副本**，走已经被证明能落地的 verdict 环。
+- 时钟对齐：boot 87 的 sink 入口在 `t=1803044 ms`，它自己那靴的内核环尾行到 `t=1814 s`；
+  boot 90 最新一笔块请求在 `736.590 s` 而环尾行在 `746.396 s` ⇒ 驱动 ms 钟比内核秒钟**慢约 9.8 s**。
+  所以 marker 的 686.630 s ≈ 内核 **696 s**，而普查那一拍在 698.75 s——**尾巴丢掉的那一刻，
+  正处在 sink 已经开跑、guard 被人占着的窗口里**。同一窗口里还有 flight 的
+  「最新心跳 587.938 s vs 最新请求 736.607 s ⇒ 中间 **148.669 s 没有一条心跳找到过空闲的 guard**」、
+  `r169: card busy 5285 ms`（715.8 s）与排干时的 `r215: card recover why=idle d=2 n=1`。
+  **这条不能当因果结论**（boot 88 没进 sink，尾巴也一样整段没有），它只是把「尾行为什么丢」与
+  「append 为什么被拒」放进同一个待测嫌疑里：卡路径的拥塞。
+- 顺带：这一靴内核环的最后两行是 GPU 那两行（`clover r286: gpu t=746 fire=6 gcc …` 与
+  `clover r290: gpu t=746 branches beat gfx3d=1/1 cxo=1/0 rbcpr=0/1 rbbm=0/1 …`）——板子最后说的话是 GPU 普查。
+
+**⑤ 撤回一条已落盘的判断：boot 89 也不是「静默无 panic 复位」。**
+§boot 89 ④ 的依据只有 flight 的 panic 槽没有 boot-89 名下标记，但同一枚窗口里有
+`drain enter boot=89 … append_rc=2` / `panic tail … boot=89 … lap=30` / `drain exit boot=89`——
+按 ④ 的论证（`panicDrainRings` 唯一调用者就是 sink），这三行只能在 panic 路径里产生。
+⇒ boot 89 **进了 sink、append 同样被拒**，只是它连入口标记那笔写都没落地。
+那枚 `panic seq 0 slot 0 t=823033ms stage=88 … boot=0 gates=0x0()` 是**未归属的旧槽**（解码器老实印了 `boot=0`），
+我不建在它上面。**「静默」这个词从现在起只用于 boot 88 以及 84 之前那几靴**；
+八核时代到 89/90 为止的两靴结局都是 panic，只是**名字丢了**。时间点没变，
+所以 §boot 88 ⑤ / §boot 89 ④ 里那串带（718/1184/1248/1335/997/707/1681/1712–1800/835–9xx/661–7xx）
+照抄，只是最后两条的**限定词**从「静默无 panic」改成「进了 sink、文案被拒」。
+
+**⑥ 修正 §boot 89 ② 的归因：尾行缺席现在有两个都还活着的解释，而分开它们要一整轮。**
+样本按「有没有送出普查尾行」排：单核像 boot 86（`r262: th` 41 条）、boot 87（33 条）**都送到**；
+八核像 boot 88、89、90 **全 0 条**。boot 90 是 r300 像＋八核 ⇒ 与「跟着 r299 那枚镜像来」不矛盾，
+与「跟着核数来」也不矛盾。要分开，要么**一枚八核像把 `armcpu-smp` 关掉**（改 board.toml），
+要么**一枚没有 r299 行的像开八核**（回退内核补丁）——两个都得花一整轮，所以现在只登记不做。
+tee 自己的计数器也是这笔债的一部分：`r175: tee seen= kept= throttled= lap=` 被 `kTeeCensusMax=12`
+限制成**一辈子只印 12 条**，boot 90 在 `seen=3191`（本靴很早期，lap 才 2）就花完了 ⇒
+晚期数读不到，只剩排干时那枚 `lap=29`（boot 89 是 30，跑到 1800 s 的 boot 87 是 53）——
+**每秒落后程度三者接近，所以「这靴 lap 更多」不能解释整段尾巴消失**。
+
+**⑦ 结局的时间带。** 下界：内核环最后一行 `746.396 s`。上界：宿主 `20:56:05` 把窗口读回，
+扣掉 TWRP 自己起来的约 30–40 s 与读回的约 20–30 s ⇒ **746–7xx s**（墙钟标定只有 ±30 s 的把握，
+不假装更准）。比 boot 88 的 835–9xx 早、比 boot 89 的 661–7xx 晚；卡上死线记录仍是 boot 87 的（STALE）
+⇒ 本靴没跑到 1800 s。按 §boot 89 ④ 预登记的「r300 只加两行 printf 与两个计数器，不动任何硬件路径，
+所以 boot 90 同时是复位时机那一票的控制轮」——**这一票回来了：仍然早，且三靴三个时间（661–7xx / 746–7xx / 835–9xx），
+分布而不是时刻**；把「核数」与「镜像」任一条钉死都还差那一整轮控制。
+
+**⑧ 落地的三笔仪器债（都写进 porting.toml 的 diagnostics）：**
+(1) **r300 不自证**：判决行要有一份**不经过 msgbuf/tee** 的副本 ⇒ r301 先把它用在最高价值的那一句上（panic 文案）。
+(2) **tee 的自报数只有 12 条**：一个「一辈子只印 N 条」的状态行，在长 boot 上等于没有尾巴；
+    改成按拍重播或至少把最后一枚数带到排干行里。
+(3) **panic 句子只存在于 sink 的入参里**（就本靴的证据而言），而 sink 的 append 是**一次性、不重试**的块读＋块写
+    ⇒ 拒了就没有第二手。r301 = 留 RAM 副本 + 由排干补写。
+
+**⑨ 产物。** `~/clover-out/round300-boot90-window.bin`（623,104 B）与解码 `…bin.txt`
+（16 report / 64 verdict / 3 probe / 512 kernel，boot 90）、`…landing-sensors.txt`
+（`charger_temp=332 temp=260 die_health=Cool`，第八次凉）、`…landing-rawdump-head.bin`（第八次全 0）、
+`r300-boot90-unattended.log`（`unattended-exit=0`）。刷的是与归档同一枚镜像（sha256 已重算核对）。
