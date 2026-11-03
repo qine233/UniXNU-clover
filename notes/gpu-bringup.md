@@ -480,3 +480,41 @@ clover r291: gpu t=617 ldo beat vref=00000000 val=0 uv=375000 ctrl=80000038 byp=
    而 `register_str[]`（`:240-251`）第 9 项——索引 8 ⇒ 偏移 `8*4 = 0x20`——就叫 **`LDO_STATUS0`**（`:249`）；
    准确的说法是「**有 dump 名字、没有 `#define`**」。`0x24` 反过来：有 `#define LDO_STATUS1_REG`（`:54`）而**没有位名**，
    所以 boot 81 的 `w24=0x0000000d` 仍然只印不解释。两条都是注释/文档修正，本轮不改任何字节，不发负载。
+
+### 5.12 更正 §5.11 第 4 条：本板 DTB 自己把 LDO 模式关了，fuse 那三枚行答的是已经答了的题（2026-11-03，宿主，未开花机）
+
+1. **证据来自我们烧的那颗 DTB，不是厂商 dtsi 的类比。** `dtc -I dtb -O dts ~/mu-clover/Resources/DTBs/clover.dtb`
+   （sha256 前缀 `815b8255`，2026-10-23 由真机 xbl 填进检出，任务 #18 那一步）里
+   `cpr4-ctrl@05061000`（扁平化后第 7658 行）的 corners 子节点写着：
+   `qcom,cpr-fuse-corners = <0x06>`（:7692）、
+   **`qcom,cpr-corner-allow-ldo-mode = <0x00 0x00 0x00 0x00 0x00 0x00 0x00>`（:7704）**、
+   **`qcom,cpr-corner-allow-closed-loop = <0x00 0x00 0x00 0x00 0x00 0x00 0x00>`（:7705）**，
+   与 `sdm660-regulator.dtsi:634-637` 逐字相同——这颗板子的出厂 DTB 就是这么带的。
+2. **于是 §5.11 第 4 条作废。** `cpr4_mmss_parse_ldo_mode_data()`（`cpr4-mmss-ldo-regulator.c:297-326`）做的是
+   `corner[i].ldo_mode_allowed = (ldo_allowed[i] && fuse->ldo_enable[i])`（:321-322）——
+   与门的 DT 那头是 0，**fuse 行 73 无论读回什么都得 false**。同一文件 :369-371 的
+   `corner[i].use_open_loop = !(fuse->ldo_cpr_cl_enable && use_closed_loop[i] && corner[i].ldo_mode_allowed)`
+   因此**恒真**：厂商给这颗 SoC 的 MMSS 轨既不进 LDO 模式、也不进闭环。
+   另有一枚**节点级**开关别混：`:511 vreg->ldo_mode_allowed = !of_property_read_bool(of_node, "qcom,ldo-disable")`
+   是整节点的一个布尔，与上面那枚 per-corner 数组不是同一个量，本板 DTB 里没有 `qcom,ldo-disable`。
+3. **r298 原计划（读 row 65/71/73、为此新增第四枚 `IODeviceMemory::withRange`）因此取消**：它问的那道题
+   已经由出厂 DT 答了，而且读回什么都不改变结论。任务 #549 按这条改向，`drivers/CloverGpu/GpuRegs.h`
+   里为那一支预备的 `kCpr4Fuse*` 常量已写又已撤（不留死常量替一个错前提作证）。**一个位也没写过。**
+4. **boot 81 的 LDO 普查从「故障」改判成「符合配置」。** `ctrl=0x80000038` 两级都在复位值、
+   `:513 vreg->ldo_regulator_bypass = BHS_MODE` 是 CPR4 的初值——在厂商自己的 SDM660 配置下这颗 LDO
+   本来就不该被抬进 LDO 模式。boot 78 的 `uv=375000 sts=0 pdn=1`（§5.9 那格）现在说的是
+   **「vdd_gfx 这颗 LDO 不是这块板的供电路径」**，不是「供电路径没抬起来」。
+   §5.9 的结论「轨清白」因此更站得住了，但理由换了：不是我们没读到，是它不该有读数。
+5. **真正喂 GPU 的是哪一路，DT 写得直白**（`sdm660-regulator.dtsi:555-559`，同一份内容要按第 1 条的办法
+   在 `clover.dtb` 里复核一遍再进结论）：`vdd-supply = <&gfx_stub_vreg>` 是 **stub regulator**
+   （`:500-505`，`compatible = "qcom,stub-regulator"`，min 400000/max 1070000，没有硬件寄存器）、
+   `mem-acc-supply = <&gfx_mem_acc_vreg>`、`system-supply = <&pm660l_s3_level> /* vdd_cx */`。
+   所以电压这一格真正的下一枚读数是 **pm660l 的 S3**，而它是
+   `compatible = "qcom,rpm-smd-regulator"` + `qcom,use-voltage-level` + `qcom,set = <3>`（`:55-63`）——
+   **电平是发给 RPM 的 SMD 请求**，不是 CloverPower 现在这套 SPMI 直读 LDO 寄存器问得出来的东西
+   （那两条是 pm660 pm8998 侧的 `ldo-a11-vcc_i2c`、pm660l 的 `ldo-b3-vdd`，`CloverPower.cpp:624-626`）。
+6. **下一支按「不需要 RPM 也能读」排。** 先读 `gfx_mem_acc_vreg` 那颗**单字 MEM_ACC 寄存器**：
+   `reg = <0x01fcf004 0x4>`、`reg-names = "acc-sel-l1"`、`qcom,corner-acc-map = <0x1 0x0>`
+   （`sdm660-regulator.dtsi:510-518`）——纯 MMIO、4 字节、与 GCC/GPUCC 同法映射，读回来的是
+   「L1 电源域的 mem-acc 角选择停在哪儿」，与 GPU 是否拿得到 vdd_cx 是同一张问题的另一头。
+   RPM-SMD 那一格（S3 电平）排在它后面，并且要写明：**我们的引导链从未发过这种请求**。仍只读。
