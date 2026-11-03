@@ -22834,3 +22834,101 @@ owner=IOResources opens=100 calls=442 refused=0 other=1`——boot 84 是 `opens
 GPU 那三枚 fuse 行（`cpr4-ctrl` 的第二段窗口 `0x00784000 0x1000`，行 65/71/73 = +0x208/+0x238/+0x248）
 **排在下一支**：它要新增第四枚 `IODeviceMemory::withRange`，与内核补丁不同层，
 两者同靴出险会分不清是谁——本轮的镜像已经过双闸门，先单独发。
+
+### boot 86（round297 / v0.7.1，2026-11-03）：**`link=` 三态一次到齐，而它先抽掉了 boot 84 那格 `qmc=0` 的支持**
+
+**① 这一轮问的是什么。** 16:46 冷刷 `round297-v0.7.1-payload.img`（sha `66d2e29b…`）。r297 只带一枚新读数
+`prev=/rvobj=/robj=/link=`，问一句：**hop 2 投出去的那封请求，是不是 hop 3 正在等的那枚口？** 刷前写死四支：
+(a) `link=yes` 且该跳 `qmc=0` ⇒ 进内核投递-唤醒那一格；(b) `link=no` ⇒ 它等的不是请求落下的那枚口，转镜像侧普查；
+(c) `link=unknown` 也是读数；(d) `robj` 在两拍之间稳不稳。正对照：`hop=0` 必须 `prev=0 link=-`，
+每条 r296 行配一条同 `hop=`/`t=` 的 r297 行。
+
+**② 八行两拍逐字**（`round297-log-window.bin.txt`，t=1131 与 t=1399 两拍的 r297 行；r296 那八行见 ④⑦）：
+
+```
+[ 1140.627604] hop=0 t=1131 prev=0                  rvobj=0                  robj=fffffff4cd0ccc40 link=-
+[ 1140.824137] hop=1 t=1131 prev=fffffff4cd0ccc40   rvobj=fffffff4ccfbd700   robj=fffffff4cd1e1b60 link=no
+[ 1141.011556] hop=2 t=1131 prev=fffffff4cd1e1b60   rvobj=0                  robj=fffffff4cd1d92a0 link=unknown
+[ 1141.205703] hop=3 t=1131 prev=fffffff4cd1d92a0   rvobj=0                  robj=0                 link=unknown
+[ 1405.330310] hop=0 t=1399 prev=0                  rvobj=0                  robj=fffffff4cd0ccc40 link=-
+[ 1405.545212] hop=1 t=1399 prev=fffffff4cd0ccc40   rvobj=fffffff4cd067740   robj=fffffff4cd1e1b60 link=no
+[ 1405.851889] hop=2 t=1399 prev=fffffff4cd1e1b60   rvobj=fffffff4cd1da100   robj=fffffff4cd1d92a0 link=no
+[ 1406.063399] hop=3 t=1399 prev=fffffff4cd1d92a0   rvobj=0                  robj=0                 link=unknown
+```
+
+正对照两条都成立：`hop=0` 两拍 `prev=0 link=-`；八条 r296 行配八条 r297 行（两类的每轮 cap 豁免都响）
+⇒ 这张表是完整的，不是被截的。
+
+**③ 判读：(a) 一次没出现；(b) 只在一半上成立；决定性的那一跳落在 (c)。**
+凡是两边都译得出对象的地方全答 `no`——hop=1 两拍、hop=2 的第二拍：本任务里**有一根线程正在等的口**，
+不是上一跳写进去的那枚。按 ⑤ 的口径说全：这两处比的是「上一跳的写入对象」与「本任务里第一根在 trap 内的
+线程所等的口」，线程未必是那根发送线程，但对象身份是同一把尺；整条链一次 `yes` 都没有。
+而预登记要读的那一格（hop=2 的 `robj=fffffff4cd1d92a0` 对 hop=3 的 `rvobj`）
+**读不出来**：叶子那枚 `rcv=d03` 在两拍里都译不成对象 ⇒ `link=unknown`。
+
+**④ 这一靴最值钱的不是 `link=`，是它让 boot 84 的判据 (b) 失去支持。** `rvobj` 与 `qmc=/qsr=` 走同一枚翻译：
+`clover_sb_port_mail()` 与 `clover_sb_port_obj()` 都是「先按 RECEIVE、失败再按 SEND」，且两条路径
+**翻译失败都直接 return、把出参留在初始化的 0**（`task.c:11364-11379` 与 `:11410-11423`）。
+叶子现在证明 `d03` 这两次翻译都失败 ⇒ 同一枚名字上的 `qmc`/`qsr` 根本没被读到。
+于是「`qmc=0 qsr=0`」从一句话变成两种读法：**队列真的空**，或者**那枚口没读到**；
+本靴的叶子确定走的是后一支，boot 84/85 因为 r296 的行不带翻译返回码而**无法回溯判定**
+⇒ 「判据 (b) 属镜像侧」下架（不是被反驳，是失去支持）。那是 `0` 被当成读数，
+正是本项目立过的那条规矩要挡的形状。反证也在同一张表里：发送侧几跳的 `rsr=1` 读自 `remote=` 的
+**成功**翻译，说明这条读路径本身在工作，只有失败的那一侧不留痕迹。叶子那行的 `rmc=0 rsr=0` 另是一回事：
+`remote=0` 时根本没读（初值），r296 落盘那天已写明。
+
+**⑤ `rvobj` 还指错了线程，这是同一支读出来的第二件事。** `rvobj` 译的是 `frcv`——普查里**第一根在 trap 内的
+线程**的 `x5>>32`（r296 的捕获规则，`task.c:12772`）；而 `cap=send` 那行打印的 `rcv=` 是 `nrcv`，
+来自**第一根 `x3≠0` 的线程**（`:12781`）。两者在 `cap=recv`（叶子）时相等，所以 ④ 那条结论不受影响；
+但 hop=0/hop=1 上它们可以来自不同线程 ⇒ `hop=0` 的 `rvobj=0` 有二义：`frcv` 本来就是 0，还是那枚名字没译出。
+⇒ r298 三件事：把翻译的**返回码**打出来（`0` 不再有三种意思共用一个数字）、把 `rvobj` 究竟用的哪枚名字打出来、
+把 `remote=` 那枚对象的**收方自己的名字** `ip_receiver_name` 打出来——`tname=` 与下一跳的 `rcv=`
+在**同一个地址空间**里可比，正是跨空间的 `link=` 问不出来的那一格。
+（不走 `is_table` 普查那条路：它要空间的锁，`check-clover.py` 对这一支禁的就是等锁。）
+
+**⑥ (d) 成立，而且指到了端口之外。** 三跳的 `robj` 在两拍之间逐位相同（`…0ccc40`／`…e1b60`／`…d92a0`），
+`rvobj` 在两拍之间变了（hop=1 两枚不同；hop=2 从 `0` 变成一枚对象）。⇒ 发送侧对象整靴稳定、
+接收侧在两拍之间重建过；「`ipc_object` 指针是跨地址空间的身份」第一次有自证。
+同一枚名字（pid 266 的 `5003`）在两拍之间「译不出 → 译得出」，也印证 ④：翻译成功与否本身随时间变。
+
+**⑦ 叶子换了人，链的形状没换。** `58 backboardd → 147 com.apple.datamigrator →
+266 com.apple.migrationpluginwrapper → 65 containermanagerd`（boot 84/85 的叶子是 installcoordinationd 126/119，
+boot 83 更早还在 osanalyticshelper 与 migrationpluginwrapper 之间换过人）。叶子形状与前两靴一致：
+`cap=recv thid=15a rcv=d03 remote=0 to=ffffffff rmc=0 rsr=0 qmc=0 qsr=0 peer=- end=no_send`、
+`threads=3 wait=3 run=0 trap=1`；`comm=` 仍截成 `containermanage`，`exec=` 给全名。
+⇒ 「第四跳是谁」每靴重读，旧 pid 不再引用。发送侧三跳 `cap=send`、`rsr=1`、`to=0` 三靴同形。
+
+**⑧ 第八起静默无 panic 复位。** 内核环最后一行 `[ 1711.714547]`（`clover r239: bbnochain pid=58 tid=0xd93`）；
+飞区最新 entry seq 202225 在 `t=1701831 ms`（launchd 的一笔 8 块写，`stage=entry(1)/0ms`、
+`prev=write/56/1ms/56`——卡在那一刻仍在正常应答），最新 beat seq 157 在 1484402 ms
+（解码器自报 `gap 217429 ms`）。**没有 boot 86 名下的死线记录，也没有 boot 86 的 sink 标记**
+（那两枚仍署 boot 84，解码器照旧印 `STALE: boot 86 never entered the sink`）
+⇒ 上界仍由死线记录给出，这靴落在 **1712–1800 s**。
+**带八条：718 / 1184 / 1248 / 1335 / 997 / 707 / 1681 / 本靴 1712–1800 s。**
+v0.7.0/v0.7.1 这一族镜像连续三靴三种结局（84 到点按设计 panic、85 停在 1681 s 后、86 停在 1712 s 后）
+⇒ 「何时结束」是分布这一格第二次落地，且不再是单靴观察。
+
+**⑨ 正对照与其余格子。** WDT 三行（1110.338／1230.626／1475.959）`en=0 armed=0 intmask=0 sts=0 why=ctrl`
+⇒ 连续第十靴排除 APSS 看门狗。keystore `clover r281: aks t=1475 fire=301 stage=3 status=0
+service=fffffff2198d6060 owner=IOResources opens=65 calls=260 refused=0 other=1`，本靴内
+`opens` 63→65、`calls` 248→260 在涨 ⇒ r276 定义的「started」仍在；跨靴的绝对数不可比（boot 85 到 100/442
+是那一靴用户态走得更远），`service=` 每靴重分配，别拿它对。GPU：`r286` 九行 + `r290/r291/r294` 各三行照常在场，
+`ctrl=80000038`、LDO 词全 0、`vref=0`、`pdn=1`——这是 §5.12 那条更正**之后第一次上机读**，
+按本板 DTB（`qcom,cpr-corner-allow-ldo-mode = <0x00×7>`、`allow-closed-loop = <0x00×7>`）它是「符合配置」
+而不是故障票。卡：6 笔 `CloverSdhci r172: dma deadline`（`ms=680/702/2078/4295/6188`、全 `budget=600`、
+`spin` 一次没出现）＋ 6 次整卡恢复 ⇒ 按 r293 的降级继续记慢性噪声；
+`CloverSdhci r175: tee seen` 12 行是推送配额自报。`clover r283:` 第二次带全套列上卡：
+`unnamed magic=ed88101300a109d0 beat=400544355143879 beatcnt=1367611472859 beatmagic=801a082e002c23b0`
+——仍 `unnamed`（槽里没有我们的 magic），`named` 那一支至今没在卡上兑现；三个词的量级与 boot 77 那次
+（`403443458069358`／`1371352791997`）同阶，但同阶不等于同义，**仍读不出复位来源**。
+
+**⑩ 落地快照第四次自动跑**：`@2026-11-03T09:10:17Z`（读卡上日志之前抓）、7650 字节；
+`charger_temp=327`（与 boot 84/85 相同）、`status=Charging`、`capacity=100`、`die_health=Cool`、
+tsens 最高 `372`（boot 85 是 379）、`emmc_therm=-40` 仍按未接处理；
+`round297-log-window.bin.landing-rawdump-head.bin` 512 字节**第五次全 0**
+⇒「复位会留下现成 ramdump」这条判据继续为空。
+
+**⑪ 产物**：`~/clover-out/round297-log-window.bin(.txt)`（512 行内核环、64 行驱动判据、16 条 report、
+8 行 r296、**8 行 r297**、0 行 probe）、`…landing-{sensors.txt,rawdump-head.bin}`、
+`~/clover-out/r297-boot86-unattended.log`；镜像 `round297-v0.7.1-payload.img`（`66d2e29b…`）、
+内核 `round297-kernel-{amfi,normalized}.macho`（`370c781d…`／`b8044988…`）。
