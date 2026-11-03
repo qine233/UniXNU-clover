@@ -35,7 +35,8 @@
 // gcc-sdm660.c:1891 `gcc_sdcc1_apps_clk`, .enable_reg = 0x16004, BIT(0).
 #define kGccSdcc1Apps       0x16004U
 
-// GPUCC. Base from `clock_gfx: gfx@5065000` (sdm660.dtsi:799), same 0x10000 length.
+// GPUCC. Base from `clock_gfx: gfx@5065000` (sdm660.dtsi:1081, reg at :1083 -- `clock_gpu:
+// clock-controller@5065000` is the same extent at :1074/:1076), same 0x10000 length.
 #define kGpuccPhys          0x05065000ULL
 #define kGpuccSize          0x10000U
 
@@ -77,6 +78,34 @@
 // Boot 74 could therefore say "gfx3d was asked for" without saying "gfx3d runs"; that gap is what
 // this round closes.
 #define kBranchClkOff       0x80000000U
+
+// Round291: the GFX LDO. `gfx_ldo_vreg: ldo@0506e000` (sdm660-regulator.dtsi:523) declares
+// reg = <0x0506e000 0x34>, and 0x0506e000 - 0x05065000 = 0x9000 falls inside the GPUCC extent the
+// line above already maps -- two DT nodes claim that block (`clock_gpu` and `clock_gfx` both say
+// 0x10000), so r291 reads through the mapping r286 opened rather than asking IOKit for a second
+// overlapping one. Offsets, masks and the decode come from the vendor driver for this exact
+// compatible: notes/sources/sdm660/msm_gfx_ldo.c (sha256 929bc99f86f1), whose of_match table names
+// "qcom,sdm660-gfx-ldo" at :1504. LDO_STATUS1 0x24 is defined but never read by that driver and
+// ADC_CTL 0x34 sits outside the DT window, so this round touches neither.
+#define kGpuccLdoVref       0x9018U   // LDO_VREF_SET_REG (:34)
+#define kGpuccLdoCtrl       0x901cU   // PWRSWITCH_CTRL_REG (:39)
+#define kGpuccLdoStatus     0x9028U   // PWRSWITCH_STATUS_REG (:56)
+#define kLdoVrefMask        0x0000007fU   // VREF_VAL_MASK = GENMASK(6, 0) (:37)
+#define kLdoMinUv           375000u       // MIN_LDO_VOLTAGE (:65)
+#define kLdoStepUv          5000u         // LDO_STEP_VOLATGE (:67)
+// The driver's own get-voltage decode, msm_gfx_ldo.c:1371: `*val = (reg & VREF_VAL_MASK) *
+// LDO_STEP_VOLATGE + MIN_LDO_VOLTAGE`. That is the arithmetic this row repeats, not an invention.
+#define kLdoCprBypass       0x40000000U   // CPR_BYPASS_IN_LDO_MODE_BIT (:41)
+#define kLdoBypass          0x00000040U   // LDO_BYPASS_BIT (:47)
+#define kLdoPdn             0x00000020U   // LDO_PDN_BIT (:48)
+#define kLdoReady           0x00000004U   // LDO_READY_BIT (:58)
+#define kLdoSettled         0x00000010U   // LDO_VREF_SETTLED_BIT (:57)
+// msm_gfx_ldo.c:307 is the driver's own settling test -- it waits while
+// `(status & (LDO_VREF_SETTLED_BIT | LDO_READY_BIT)) == 0`, then pr_err()s "LDO_VREF_SETTLED not
+// set". Those two bits are therefore what "the rail is up at its programmed corner" means in the
+// vendor's words, which is the question boot 77's `gx_on=0` now points at.
+// DT bounds for the decode, regulator.dtsi:528-529: regulator-min-microvolt 400000, max 925000 --
+// val 5 and val 110 in the driver's units. Printed only here, so a reading can be compared by hand.
 
 // gdsc.c:32 SW_COLLAPSE_MASK = BIT(0), written 0 to power on; gdsc-regulator.c:33 PWR_ON_MASK =
 // BIT(31). The pair is what makes a read-only row decodable: "bit31=1 and bit0=0" is powered on and

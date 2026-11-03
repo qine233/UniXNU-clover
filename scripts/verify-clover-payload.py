@@ -1184,6 +1184,13 @@ def check_sb_sample(kernel: bytes) -> bool:
              # whether the clock runs; without it the round asks a question the image cannot answer.
              "gpu-row-branches": (b"clover r290: gpu t=%u branches %s gfx3d=%u/%u cxo=%u/%u rbcpr=%u/%u "
                                   b"rbbm=%u/%u en/halt rcg3d=%08x rcg_rbcpr=%08x rcg_rbbm=%08x\n") in kernel,
+             # Round291: boot 77 left gfx3d halted with gx_collapse=0 and gx_on=0 -- collapse released,
+             # supply absent -- and the two halted branches' RCG words carry no sourced name. What is left
+             # to know is whether the corner the gx GDSC powers against was ever raised, which is the LDO
+             # word, the driver's own uV decode, and its own settling bits. Without this row the round asks
+             # about a rail the image cannot read.
+             "gpu-row-ldo": (b"clover r291: gpu t=%u ldo %s vref=%08x val=%u uv=%u ctrl=%08x byp=%u pdn=%u "
+                             b"cpr_byp=%u sts=%08x ready=%u settled=%u cx_on=%u gx_on=%u\n") in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,

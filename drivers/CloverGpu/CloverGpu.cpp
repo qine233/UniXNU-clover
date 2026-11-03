@@ -25,6 +25,9 @@
 //   round290 adds the two votes the DT's clock list still owed (rbcpr 0x1054, rbbmtimer 0x10d0) and
 //     reads every GPUCC branch's halt bit (BIT(31), CBCR_CLK_OFF) next to its enable request,
 //     because "gfx3d_en=1" on boot 74 only ever said somebody asked
+//   round291 reads the GFX LDO that the gx corner is set by -- vref/pwrswitch-ctrl/pwrswitch-status
+//     at 0x9018/0x901c/0x9028, the vendor's own decode and its own settling bits -- beside the
+//     same-beat gx_on, because boot 77 left gx collapse-released with PWR_ON never arriving
 //   read back the GDSCRs (the acceptance), then chipid at 0x05010200 gated on cx-on && gx-on &&
 //     gfx3d-enable, checked against a512's 0x05010200
 //
@@ -268,6 +271,35 @@ clover_gpu_report_branches(unsigned t, const char *stage)
         (unsigned) rcg3d, (unsigned) rcgr, (unsigned) rcgb);
 }
 
+// Round291's row: the GFX LDO that sets the corner GX powers up against. Boot 77 left the two
+// branches downstream of gx halted while cxo and rbcpr run, and the gx GDSC reads collapse-released
+// (bit0=0) with PWR_ON never arriving -- a domain whose supply never came, not one nobody asked.
+// So this row reads the three registers the vendor driver names for that supply, in the window the
+// DT declares (0x0506e000+0x34, which sits inside the GPUCC extent already mapped). It prints both
+// the raw words and the driver's own decode (uV = (word & 0x7f) * 5000 + 375000, msm_gfx_ldo.c:1371)
+// and the driver's own settling bits (LDO_READY | LDO_VREF_SETTLED, :307), beside the same-beat
+// cx_on/gx_on read from the GDSC registers -- those are the control that says this window answers,
+// so a row of 0xffffffff here means a bus that did not reply rather than a rail at zero.
+static void
+clover_gpu_report_ldo(unsigned t, const char *stage)
+{
+    uint32_t vref   = clover_gpu_read(clover_gpu_gpucc, kGpuccLdoVref);
+    uint32_t ctrl   = clover_gpu_read(clover_gpu_gpucc, kGpuccLdoCtrl);
+    uint32_t sts    = clover_gpu_read(clover_gpu_gpucc, kGpuccLdoStatus);
+    uint32_t val    = vref & kLdoVrefMask;
+    uint32_t uv     = val * kLdoStepUv + kLdoMinUv;
+    uint32_t cxhw   = clover_gpu_read(clover_gpu_gpucc, kGpuccCxHwCtrl);
+    uint32_t gx     = clover_gpu_read(clover_gpu_gpucc, kGpuccGdscGx);
+
+    printf("clover r291: gpu t=%u ldo %s vref=%08x val=%u uv=%u ctrl=%08x byp=%u pdn=%u "
+        "cpr_byp=%u sts=%08x ready=%u settled=%u cx_on=%u gx_on=%u\n", t, stage,
+        (unsigned) vref, (unsigned) val, (unsigned) uv, (unsigned) ctrl,
+        (unsigned) ((ctrl & kLdoBypass) != 0), (unsigned) ((ctrl & kLdoPdn) != 0),
+        (unsigned) ((ctrl & kLdoCprBypass) != 0), (unsigned) sts,
+        (unsigned) ((sts & kLdoReady) != 0), (unsigned) ((sts & kLdoSettled) != 0),
+        (unsigned) ((cxhw & kGdscPwrOn) != 0), (unsigned) ((gx & kGdscPwrOn) != 0));
+}
+
 // The gated chipid read. a512 reports 0x05010200 once the core is powered and the AHB path is
 // clocked; the gate is cx-on && gx-on && gfx3d-enable, so a chipid of 0xffffffff or 0 cannot be
 // blamed on a bus nobody clocked. The refusal row says which gate did not open.
@@ -357,6 +389,7 @@ clover_gpu_power_on(unsigned t)
 
     clover_gpu_powered = true;
     clover_gpu_report_branches(t, "post");
+    clover_gpu_report_ldo(t, "post");
     clover_gpu_report_gpucc(t, true);
     clover_gpu_report_chipid(t);
 }
@@ -377,6 +410,7 @@ clover_gpu_say(OSObject *owner, IOTimerEventSource *sender)
         // Steady state: the post-write readback and the gated chipid, repeated so a long boot that
         // rotates the ring out never loses the verdict.
         clover_gpu_report_branches(t, "beat");
+        clover_gpu_report_ldo(t, "beat");
         clover_gpu_report_gpucc(t, true);
         clover_gpu_report_chipid(t);
     }

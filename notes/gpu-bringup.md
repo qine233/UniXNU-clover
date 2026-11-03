@@ -278,7 +278,8 @@ compatible 原文（`qcom,sdm660-gfx-ldo`）找到的正是它的厂商驱动：
   DT 的 `gfx_vreg_corner` 写 `regulator-min/max-microvolt = <1>/<7>`（角 1..7），厂商 fuse 表只有
   6 档。这个差我暂时解释不了，所以 r291 不靠「角号」下结论，只读 LDO 自己的电压与状态位。
 
-**r291 因此定为**：映射 `0x0506e000 + 0x34`（第三次用同一套 `IODeviceMemory::withRange` 路径），
+**r291 因此定为**：读 `0x0506e000 + 0x34` 这三枚寄存器（原写「第三次用同一套 `IODeviceMemory::withRange`
+路径」——发版前核对 DT 发现该窗口已在 GPUCC 的 `0x10000` 范围内，改为走已有映射，见 §5.8），
 读 `0x18`/`0x1C`/`0x28` 三个带名字的寄存器，把 µV 按上面的公式解出来，连同当拍的 `gx_on` 一起打。
 判据事先写死：`LDO_READY=0` 或 µV 落在 375000（=val 0，即从没人写过） ⇒ GX 的供电确实没上角，
 这条链成立，下一步才谈 CPR/RCG 编程；`LDO_READY=1` 且 µV 已经在角上而 `gx_on` 仍 0 ⇒ 债不在轨上，
@@ -312,3 +313,44 @@ clover r290: gpu t=1097 branches beat gfx3d=1/1 cxo=1/0 rbcpr=1/0 rbbm=1/1 en/ha
 执行。另记两条与本节相关的仪器事实：`branches post` 那拍被环转出去了（窗从 796 s 起，首次上电更早），留下
 `beat` 副本顶上来——r249 那条「一次性判决行要有周期副本」在这轮真的被用到；`dom=00140001`、`sw=00000000`
 继续原样报，不编故事。
+
+### 5.8 r291 发出去的那一格：走 GPUCC 已有的映射读，而不是第三张窗口（§5.6 结尾那句要更正）
+
+§5.6 把 r291 写成「第三次用同一套 `IODeviceMemory::withRange` 路径映射 `0x0506e000 + 0x34`」。发版前自己核对
+DT 时发现那一刀是多余的，而且方向不对：
+
+* `sdm660.dtsi:1074/:1076` 的 `clock_gpu: clock-controller@5065000` 与 `:1081/:1083` 的
+  `clock_gfx: gfx@5065000` **两个节点都写 `reg = <0x5065000 0x10000>`**，而 `sdm660-regulator.dtsi:523/:525`
+  把 `gfx_ldo_vreg` 放在 `0x0506e000 + 0x34`——`0x0506e000 - 0x05065000 = 0x9000`，正好落在 r286 已经映射的
+  GPUCC 范围内。
+* 再要一张重叠窗口不是「更保守」，是让 IOKit 对同一页给出第二个映射，还会让「LDO 在不在 GPUCC 里」这件事
+  变成两条互不相干的读数。所以 r291 用 `kGpuccLdoVref 0x9018` / `kGpuccLdoCtrl 0x901c` /
+  `kGpuccLdoStatus 0x9028` 三个 GPUCC 内偏移读，`check-clover.py` 把「本驱动只开三张窗口」钉成
+  `IODeviceMemory::withRange(` 计数 = 3（GCC、GPUCC、GPU core）——将来谁缩小 `kGpuccSize` 把 LDO 挤出映射，
+  这枚针会立刻报错而不是读出一个漂亮的 0。
+
+行（`post`/`beat` 两支，字段完全一致，与 r290 同规矩）：
+
+```
+clover r291: gpu t=%u ldo %s vref=%08x val=%u uv=%u ctrl=%08x byp=%u pdn=%u cpr_byp=%u
+             sts=%08x ready=%u settled=%u cx_on=%u gx_on=%u
+```
+
+`uv` 是厂商自己的算式（`msm_gfx_ldo.c:1371`：`(reg & GENMASK(6,0)) * 5000 + 375000`），`ready`/`settled` 是
+它判稳用的那两个位（`:307` 的 `reg & (LDO_VREF_SETTLED_BIT | LDO_READY_BIT)`）；`byp`/`pdn`/`cpr_byp` 取
+`PWRSWITCH_CTRL` 的 BIT(6)/BIT(5)/BIT(30)。**同拍带上 `cx_on`/`gx_on`**：这两票本轮已连三靴稳定读到，
+它们在这行里的作用是正对照——若 `vref`/`ctrl`/`sts` 全 `0xffffffff` 而 `cx_on=1`，那是 0x9000 这页没应答，
+不能读成「电压为 0」；反过来三词有值而 `cx_on` 也照常，才是轨真的在说话。
+
+不读的两处也写死：`LDO_STATUS1_REG 0x24` 在厂商驱动里定义了但从不读，`ADC_CTL_REG 0x34` 在 DT 给的窗口之外。
+
+**判据（刷前写死）**：
+* `ready=0`（或 `settled=0` 而 `ready=0`）⇒ 从没判稳；配合 `uv=375000`（val=0）⇒ 角根本没抬起来，债在
+  CPR4/`vdd_gfx` 那侧，下一轮问的是 CPR4 的角寄存器（要有出处）。
+* `uv` 落在 400000…925000 之间（DT `regulator-min/max-microvolt`，`sdm660-regulator.dtsi:528/:529`，
+  即 val=5…110）且 `ready=1`，而 `gx_on` 仍 0 ⇒ **轨是清白的**，回头看 GDSC 自己的三个等待字段与
+  `gpu_gx_domain_addr`（`dom=00140001` 至今原样报，没名字过）。
+* `byp=1` 或 `pdn=1` ⇒ LDO 被旁路/掉电——这一支读出来就先去对 CPR_BYPASS 的语义，不先猜是谁写的。
+* 三个词全 `0xffffffff` ⇒ 这一页没应答，整行作废（照 r282 的规矩，不当 0 票用）。
+
+角数（厂商 `SDM660_MMSS_FUSE_CORNERS=6` 对 DT 的 1..7）本轮仍不下结论：这一行不印角号，只印电压与判稳位。

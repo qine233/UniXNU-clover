@@ -3071,6 +3071,21 @@ def check_board(errors: list) -> str:
                     ("clover_gpu_report_branches(t, \"post\");", "CloverGpu.cpp", gpu_source),
                     ("clover_gpu_report_branches(t, \"beat\");", "CloverGpu.cpp", gpu_source),
                     ("\"clover r290: gpu t=%u branches %s gfx3d=%u/%u cxo=%u/%u rbcpr=%u/%u rbbm=%u/%u \"",
+                     "CloverGpu.cpp", gpu_source),
+                    # Round291's row: the GFX LDO that sets the corner gx powers up against. The offsets
+                    # are the vendor driver's (msm_gfx_ldo.c, archived under notes/sources/sdm660) and the
+                    # window is the DT's -- and gfx_ldo_vreg at 0x0506e000 sits 0x9000 inside the GPUCC
+                    # extent, so the reads ride the mapping r286 already opened. A second overlapping
+                    # mapping would be a second answer to the same question.
+                    ("#define kGpuccLdoVref       0x9018U", "GpuRegs.h", gpu_regs),
+                    ("#define kGpuccLdoCtrl       0x901cU", "GpuRegs.h", gpu_regs),
+                    ("#define kGpuccLdoStatus     0x9028U", "GpuRegs.h", gpu_regs),
+                    ("#define kLdoMinUv           375000u", "GpuRegs.h", gpu_regs),
+                    ("#define kLdoReady           0x00000004U", "GpuRegs.h", gpu_regs),
+                    ("#define kLdoSettled         0x00000010U", "GpuRegs.h", gpu_regs),
+                    ("clover_gpu_report_ldo(t, \"post\");", "CloverGpu.cpp", gpu_source),
+                    ("clover_gpu_report_ldo(t, \"beat\");", "CloverGpu.cpp", gpu_source),
+                    ("\"clover r291: gpu t=%u ldo %s vref=%08x val=%u uv=%u ctrl=%08x byp=%u pdn=%u \"",
                      "CloverGpu.cpp", gpu_source)):
                 if needle not in text_:
                     errors.append(f"{where} lacks {needle[:64]!r}: round286's rows are the reading that "
@@ -3088,6 +3103,15 @@ def check_board(errors: list) -> str:
                 errors.append("GpuRegs.h carries 0x01830000: that pin was wrong -- the board's DT puts GCC at "
                               "0x00100000 (clock-controller@100000), which is also what CloverInput's registers "
                               "already use, and the wrong base would have read a different block as clocks")
+            # Round291 reads at 0x9000-range offsets of the window r286 maps. That is only legitimate
+            # because sdm660.dtsi gives clock_gpu/clock_gfx reg = <0x5065000 0x10000>, which contains the
+            # LDO node's 0x0506e000; a fourth window would be a second mapping of the same page, and a
+            # later round that shrank kGpuccSize would silently push the LDO offsets outside it. The
+            # count is the checkable form of "the rail row rides the GPUCC mapping, nothing else".
+            if gpu_source.count("IODeviceMemory::withRange(") != 3:
+                errors.append(f"CloverGpu.cpp opens {gpu_source.count('IODeviceMemory::withRange(')} windows, "
+                              "not 3: GCC, GPUCC and the GPU core are the only ones this round may map, and "
+                              "round291's LDO registers live inside the GPUCC extent the DT already declares")
         gpu_built = any("CloverGpu" in item for item in board["kernel"]["archives"])
         # `text` has been reassigned to patch sources by this point in the function; read the
         # defconfig this check is about rather than whatever the last round's block left behind.
@@ -3123,6 +3147,17 @@ def check_board(errors: list) -> str:
             errors.append("the r290 rows are not exempt from the per-pass push cap: they print from the "
                           "GPU timer beside the census burst, which is where boot 36 measured the cap "
                           "eating a scheduled round's own line")
+        # Round291's rail row is the reading that decides whether gx's GDSC is waiting on a voltage, so
+        # it gets its own class -- sharing r290's would let branch lines account for a row that is not
+        # them -- and the same cap exemption.
+        if '{ "clover r291: ", "r291-gpu", 32, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the round291 LDO rows: an unbudgeted "
+                          "producer drops them silently, and a missing rail row reads exactly like a "
+                          "rail that never came up")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r291")' not in sdhci_source:
+            errors.append("the r291 rows are not exempt from the per-pass push cap: they share the GPU "
+                          "timer with the r286/r290 rows, and boot 36 measured the cap eating the newest "
+                          "of exactly that kind of scheduled line")
 
         # Round283 asks the question boot 69 left open: which software path, if any, resets the board.
         # The r281 read showed the APSS watchdog never armed and the card's last write 11 s older than
@@ -4622,8 +4657,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r290:"):
-        errors.append('[payload] title is not "clover r290: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r291:"):
+        errors.append('[payload] title is not "clover r291: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5736,8 +5771,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r290:"):
-        errors.append('[payload] title is not "clover r290: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r291:"):
+        errors.append('[payload] title is not "clover r291: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

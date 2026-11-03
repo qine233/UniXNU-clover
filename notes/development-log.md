@@ -21879,3 +21879,58 @@ clover r283: last reset unnamed magic=ed88000200a909f8 beat=403443458069358 beat
 **⑦ 本轮不动形状。** GPU 三靴一致、halt 维度已到手，静默终止这一支有 r148/r198/r212 三条通道交叉，都够下一
 轮判；唯一要新加的读数在 r291（§5.6 的 LDO 三寄存器 + 同拍 `gx_on`）。桌面仍 CPU-first，第二道坎照 boot 76
 的规矩每轮 grep 一次 r289。
+---
+
+### round291（v0.6.92，待发）：读 GFX LDO 的三枚寄存器——而且不用新映射
+
+**① 这轮只问一个问题。** boot 77 把战场从「时钟区」推到「电」：`gfx3d`/`rbbmtimer` 的票都在、分支仍在
+HALT，而 `gx` 的 GDSC `gx_collapse=0`、`gx_on=0`——SW_COLLAPSE 早就放开，PWR_ON 不来是**供电没到**。
+§5.6 那张厂商 LDO 表就是为这一格取的，本轮照它读三个带名字的寄存器，把「角有没有抬起来」量成事实。
+
+**② 发版前自己推翻了一条 §5.6 的计划，记在这里。** §5.6 结尾写 r291「第三次用同一套
+`IODeviceMemory::withRange` 路径」映射 `0x0506e000 + 0x34`。核对 DT 之后这刀是多余的，而且更差：
+`sdm660.dtsi:1074/:1076`（`clock_gpu`）与 `:1081/:1083`（`clock_gfx`）都写 `reg = <0x5065000 0x10000>`，
+而 `sdm660-regulator.dtsi:523/:525` 把 `gfx_ldo_vreg` 放在 `0x0506e000 + 0x34`，
+`0x0506e000 - 0x05065000 = 0x9000` —— **LDO 就在 r286 已经映射的 GPUCC 范围里**。再要一张重叠窗口是给同一页
+第二个映射，还会把「LDO 在不在 GPUCC 里」这件事拆成两条互不相干的读数。所以 `GpuRegs.h` 新增的是
+GPUCC 内偏移 `kGpuccLdoVref 0x9018` / `kGpuccLdoCtrl 0x901c` / `kGpuccLdoStatus 0x9028`，
+`CloverGpu.cpp` 一行 `IODeviceMemory::withRange` 都没加——`check-clover.py` 现在把这件事钉成计数断言：
+本驱动 `IODeviceMemory::withRange(` 出现次数必须**正好是 3**（GCC、GPUCC、GPU core）。将来谁缩小
+`kGpuccSize` 把 LDO 挤出映射，这枚针立刻报错，而不是让读数变成一个好看的 0。
+
+**③ 行的形状与「为什么带 cx_on」。**
+
+```
+clover r291: gpu t=%u ldo %s vref=%08x val=%u uv=%u ctrl=%08x byp=%u pdn=%u cpr_byp=%u
+             sts=%08x ready=%u settled=%u cx_on=%u gx_on=%u
+```
+
+`post`/`beat` 两支字段一致（r249 的规矩：一次性行要有周期副本）。`uv` 不是我自己发明的算式，是
+`msm_gfx_ldo.c:1371` 的 `(reg & GENMASK(6,0)) * 5000 + 375000`；`ready`/`settled` 是它判稳用的两位
+（`:307` 的 `reg & (LDO_VREF_SETTLED_BIT | LDO_READY_BIT)`）；`byp`/`pdn`/`cpr_byp` 取 `PWRSWITCH_CTRL`
+的 BIT(6)/BIT(5)/BIT(30)（`:47/:48/:41`）。**同拍带上 `cx_on`/`gx_on` 是这行的正对照**：本轮之前它们已连三靴
+稳定读到，如果 `vref`/`ctrl`/`sts` 全 `0xffffffff` 而 `cx_on` 照常 1，那是 0x9000 这页没应答，整行作废
+（r282 的规矩），不能读成「电压是 0」。`LDO_STATUS1 0x24` 厂商定义了但从不读，`ADC_CTL 0x34` 在 DT 窗口
+之外，两处都不碰。角号不印：厂商 `SDM660_MMSS_FUSE_CORNERS=6` 对 DT 的 1..7 还没解释清，本轮只读电压与判稳位。
+
+**④ 契约与产物。** `clover-gpu=1` 才动；tee 类 `r291-gpu`（32）加每趟豁免前缀 `r291`（理由与 r286/r290 同：
+这些行印在 GPU 定时器上，而 boot 36 量过「每趟 16 次」上限吃的正是最晚的那条）。
+`check-clover.py` 新增六枚常量针、两枚调用针、行字面量针、窗口计数针与 tee 两枚针；
+`verify-clover-payload.py` 新增 `gpu-row-ldo`。`[payload] title` 升到 `"clover r291: the rail under gx. …"`，
+并按 boot 35/36 的规矩带一对转义双引号（`\"qcom,sdm660-gfx-ldo\"`）——checker 要求标题里**必须有**双引号，
+这样发出去的 manifest 才是转义路径的活体测试；第一次跑 checker 因为我这版标题一个引号都没用而被判错，
+EXIT 非零（我先前把 `| tail` 的退出码当成了 checker 的，这条也记着）。
+两个驱动都在组装树 `-Werror` 过（`build-arm-driver.py CloverGpu` / `CloverSdhci`）。
+产物：kernel `4c57bd69…`（prelink）→ amfi `859db74b…`（两刀仍 0x1ad30e4 / 0x1ad316c，说明 GPU 这轮的插入
+没挪动 AMFI 段）→ normalized `7b3f3c87…`（973 个 object 戳清零）→
+payload `e01b59d2…` = `~/clover-out/round291-v0.6.92-payload.img`（58,720,256 B）。
+`check-clover.py` EXIT=0、`verify-clover-payload.py` EXIT=0（`gpu-row-ldo present`，r289 三枚
+`abort-*` 与 r290 的 `gpu-row-branches` 仍在册）。
+
+**⑤ 判据（刷前写死）。** `ready=0`（且 `uv=375000`，即 val=0）⇒ 从没判稳、角根本没抬，债在 CPR4/`vdd_gfx`
+那侧，下一轮要有 CPR4 角寄存器的出处才谈编程；`uv` 落在 DT 的 400000…925000（`sdm660-regulator.dtsi:528/:529`，
+即 val 5…110）且 `ready=1` 而 `gx_on` 仍 0 ⇒ **轨是清白的**，回头看 GDSC 自己的三个等待字段与
+`gpu_gx_domain_addr`（`dom=00140001` 至今只是原样报，从没被命名过）；`byp=1` 或 `pdn=1` ⇒ LDO 被旁路/掉电，
+那一支先对 CPR_BYPASS 的语义再说话；三个词全 `0xffffffff` ⇒ 这一页没应答，整行作废。
+顺序照旧：boot 78 先落回，读回固定 grep 一次 `clover r289`（非零才解帧）。桌面仍 CPU-first，这一格是
+bring-up 取证，不是驱动。
