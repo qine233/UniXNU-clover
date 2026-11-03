@@ -104,7 +104,19 @@ FLIGHT_DEADLINE_OFFSET = 60   # round236: the deadline fires once and gets its o
 FLIGHT_DEADLINE_SLOTS = 1
 FLIGHT_PANIC_OFFSET = 61      # round236: the sink's entry and exit, one block each
 FLIGHT_PANIC_SLOTS = 2
+# round302: the panic sentence, written blind into the twelve sectors that sat unowned between the
+# entry ring and the beats. Its slot is boot id modulo 12, so the sink never reads the card to find it
+# -- which is exactly the read boot 90 lost its sentence on.
+FLIGHT_TEXT_OFFSET = 44
+FLIGHT_TEXT_SLOTS = 12
+FLIGHT_TEXT_BYTES = 352       # 88 words, the room left after the record's three own fields
 FLIGHT_KIND = 23
+# round302: a verdict record signs itself. flightWrite writes this word in the slot right after the
+# event's own extras, after them, so a sector that was never written as this event cannot be read as
+# one -- boot 91's panic slot carried a marker's event words and a block request's header, and the
+# decoder printed round293's boot stamp as that boot's `stage`.
+FLIGHT_MARKER_MAGIC = 0x434C564D      # 'CLVM'
+FLIGHT_MAGIC_WORD = {4: 46, 5: 43, 6: 126}
 BOOT_OFFSET = KERNEL_OFFSET + 2 * KERNEL_SLOTS   # round212: one block after the kernel ring
 BOOT_KIND = 24
 PROBE_KIND = 25
@@ -113,7 +125,7 @@ DUMP_SECTORS = BOOT_OFFSET + 1    # round212 adds the boot record past the end o
 KINDS = {17: "report-17", 19: "report-19", 20: "panic-20",
          21: "verdict-21", 22: "kernel-22", 23: "flight-23",
          24: "boot-24", 25: "probe-25"}
-FLIGHT_EVENTS = {1: "read", 2: "write", 3: "beat", 4: "deadline", 5: "panic"}
+FLIGHT_EVENTS = {1: "read", 2: "write", 3: "beat", 4: "deadline", 5: "panic", 6: "text"}
 FLIGHT_DIRS = {0: "read", 1: "write", 2: "beat", 3: "none"}
 # Round293: where each event's own boot id lives. Boot 79's frame is the reason: the deadline slot
 # and the panic slots are the only two groups a boot may never write, and when it does not the
@@ -121,7 +133,7 @@ FLIGHT_DIRS = {0: "read", 1: "write", 2: "beat", 3: "none"}
 # fired" this boot. An entry or beat carries no extras, so its stamp is word 35; the deadline's ten
 # words come first and its stamp is the eleventh; round236 already wrote gBootId as the panic
 # marker's sixth extra word. A zero means a record written before this round stamped anything.
-FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 35, 4: 45, 5: 41}
+FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 35, 4: 45, 5: 41, 6: 37}
 # Round213's holder stages. A beat whose stage word has not moved for 75 s is the request that
 # stopped, so the name is what the dump prints where r212 could only print the request.
 FLIGHT_STAGES = {0: "idle", 1: "entry", 2: "idleWait", 3: "check", 4: "adma", 5: "batch",
@@ -323,7 +335,8 @@ def decode_flight(data, first_lba):
     for name, base, slots, event in (("entries", FLIGHT_ENTRY_OFFSET, FLIGHT_ENTRY_SLOTS, None),
                                      ("beats", FLIGHT_BEAT_OFFSET, FLIGHT_BEAT_SLOTS, 3),
                                      ("deadline", FLIGHT_DEADLINE_OFFSET, FLIGHT_DEADLINE_SLOTS, 4),
-                                     ("panic", FLIGHT_PANIC_OFFSET, FLIGHT_PANIC_SLOTS, 5)):
+                                     ("panic", FLIGHT_PANIC_OFFSET, FLIGHT_PANIC_SLOTS, 5),
+                                     ("text", FLIGHT_TEXT_OFFSET, FLIGHT_TEXT_SLOTS, 6)):
         records = []
         for slot in range(slots):
             sector = base + slot
@@ -332,6 +345,11 @@ def decode_flight(data, first_lba):
                 break
             words = struct.unpack_from(f"<{FLIGHT_BLOCK_WORDS}I", block)
             if (words[0], words[1]) != MAGIC:
+                if name == "text":
+                    # round302: the sentence's slot is boot id modulo 12, so a run of them is not
+                    # contiguous -- boot 92 sits in sector 44+92%12 and says nothing about the eleven
+                    # neighbours. An empty sector here is an untouched slot, not the end of a ring.
+                    continue
                 break
             problems = []
             want_lba = first_lba + sector
@@ -354,6 +372,13 @@ def decode_flight(data, first_lba):
             # still carries a live request (blocks != 0, stage == kStageEntry, a pid and a name).
             # Printing it as a marker invents a `stage=91` out of the round293 boot stamp, which is
             # exactly the reading-shaped bug this file exists to refuse.
+            magic_word = FLIGHT_MAGIC_WORD.get(words[6])
+            magic = words[magic_word] == FLIGHT_MARKER_MAGIC if magic_word else None
+            if words[6] == 6 and magic is False:
+                # The event only exists from round302, so a sector here without the signature was
+                # never a sentence: it is an empty sector or somebody else's record.
+                problems.append("not a sentence: no r302 magic at word "
+                                f"{magic_word} (boot={words[37]}, chars={words[35]})")
             if (event == 5 and words[35 + 6] == 0 and words[35 + 7] == 0
                     and words[35 + 1] == 0 and words[35 + 3] == 0):
                 comm = struct.pack("<2I", words[33], words[34]).rstrip(b"\0").decode("latin1")
@@ -376,8 +401,15 @@ def decode_flight(data, first_lba):
                 "stage_pid": words[30], "stage_dir": words[31],
                 "cur_pid": words[32], "comm0": words[33], "comm1": words[34],
                 "boot": words[FLIGHT_BOOT_WORD[words[6]]] if words[6] in FLIGHT_BOOT_WORD else 0,
+                "magic": magic,
                 "extra": words[35:],
             }
+            if words[6] == 6 and magic:
+                raw = struct.pack(f"<{FLIGHT_TEXT_BYTES // 4}I", *words[38:38 + FLIGHT_TEXT_BYTES // 4])
+                record["chars"] = words[35]
+                record["append_rc"] = words[36]
+                record["total"] = words[9]
+                record["text"] = raw.split(b"\0", 1)[0].decode("latin1")
             records.append((slot, record, problems))
         groups[name] = records
     return groups
@@ -463,7 +495,12 @@ def flight_report(groups, boot_id=0):
     beats = flight_chain(groups["beats"])
     deadline = flight_chain(groups["deadline"])
     panic = flight_chain(groups["panic"])
-    written = sum(len(groups[name]) for name in ("entries", "beats", "deadline", "panic"))
+    # Newest by the writer's own boot id and clock, because these slots do not come in sequence.
+    text = sorted([record for slot, record, problems in groups["text"]
+                   if not problems and record["magic"]],
+                  key=lambda record: (record["boot"], record["t_ms"]))
+    written = sum(len(groups[name])
+                  for name in ("entries", "beats", "deadline", "panic", "text"))
     if entries:
         span = f"seq {entries[0]['seq']}..{entries[-1]['seq']}"
     else:
@@ -564,12 +601,30 @@ def flight_report(groups, boot_id=0):
             print(f"  panic seq {record['seq']:>3} slot {record['slot']:>2} "
                   f"t={record['t_ms']:>8}ms stage={stage} log_ready={log_ready} "
                   f"host={owner:#x} log_first={log_first} rc={rc} drained={drained} "
-                  f"boot={marker_boot}{stale} gates={gates:#x}"
+                  f"boot={marker_boot}{stale} magic="
+                  f"{'yes' if record['magic'] else 'absent (pre-r302 payload, or a sector that was never a marker)'}"
+                  f" gates={gates:#x}"
                   f"({'armed,' if gates & 1 else ''}"
                   f"{'bcb,' if gates & 2 else ''}"
                   f"{'text' if gates & 4 else ''})")
     else:
         print("flight: no panic marker -- the sink never entered, or its first write refused")
+    # round302: the sentence itself. It lives in its own twelve sectors, is chosen by boot id with no
+    # read beforehand, and signs itself, so this line is either the panic's words or a stated absence.
+    rejected_text = [(slot, record, problems) for slot, record, problems in groups["text"] if problems]
+    for slot, record, problems in rejected_text:
+        for problem in problems:
+            print(f"flight: sentence slot {slot} (lba {record['lba']}, t={record['t_ms']} ms) -- {problem}")
+    newest_text = text[-1] if text else None
+    if newest_text is not None:
+        truncated = newest_text["total"] > newest_text["chars"]
+        print(f"flight: sentence boot={newest_text['boot']} slot={newest_text['slot']} "
+              f"t={newest_text['t_ms']} ms chars={newest_text['chars']}/{newest_text['total']} "
+              f"append_rc={newest_text['append_rc']}"
+              f"{' (the block could not hold the rest)' if truncated else ''}")
+        print(f'flight:   "{newest_text["text"]}"')
+    else:
+        print("flight: no sentence record -- the sink wrote none, or every write of it refused")
     return written
 
 
@@ -578,7 +633,7 @@ def build_flight_record(lba, seq, event, dir_, op_lba, op_blocks, t_ms=0, presen
                         guard_waits=0, beat_misses=0, pending=(0, 0), slot=None, kind=FLIGHT_KIND,
                         stage=0, stage_ms=0, stuck=0, recovered=0, steals=0, stuck_stage=0,
                         stage_lba=0, stage_blocks=0, stage_pid=0, stage_dir=0,
-                        cur_pid=0, comm=(0, 0), extra=(), boot=0):
+                        cur_pid=0, comm=(0, 0), extra=(), boot=0, marker_magic=False):
     """One flight block as flightWrite lays it out, for selftest.
 
     `boot` goes where round293 says that event's stamp lives, so a selftest that builds a record
@@ -588,6 +643,8 @@ def build_flight_record(lba, seq, event, dir_, op_lba, op_blocks, t_ms=0, presen
         slots = {3: FLIGHT_BEAT_SLOTS, 4: FLIGHT_DEADLINE_SLOTS}.get(event, FLIGHT_ENTRY_SLOTS)
         if event == 5:
             slots = FLIGHT_PANIC_SLOTS
+        if event == 6:
+            slots = FLIGHT_TEXT_SLOTS
         slot = seq % slots
     flags = ((present & 1) and 1 or 0) | ((present & 2) and 2 or 0) | (4 if event == 3 else 0)
     words = [MAGIC[0], MAGIC[1], lba, kind, seq, slot,
@@ -604,6 +661,13 @@ def build_flight_record(lba, seq, event, dir_, op_lba, op_blocks, t_ms=0, presen
         while len(words) <= index:
             words.append(0)
         words[index] = boot
+    magic_index = FLIGHT_MAGIC_WORD.get(event)
+    if marker_magic and magic_index is not None:
+        # Written after the extras, exactly as flightWrite does it, so a selftest record and a card
+        # record agree that the signature is the last thing the writer put down.
+        while len(words) <= magic_index:
+            words.append(0)
+        words[magic_index] = FLIGHT_MARKER_MAGIC
     assert len(words) < SECTOR // 4, len(words)
     return struct.pack(f"<{len(words)}I", *words).ljust(SECTOR, b"\0")
 
@@ -944,8 +1008,54 @@ def selftest():
     # ... and it is not a marker, so no line may claim a stage for it.
     assert not any(line.strip().startswith("panic seq") and "stage=91" in line
                    for line in said.splitlines()), said
+    # Round302's own half: a verdict record that owns its buffer and signs itself. Positive control
+    # first -- a marker and a sentence that carry the magic must read as what they are, with the
+    # sentence's words on the card, and the sector must never be called a hybrid.
+    signed = bytearray(flight)
+    sentence = b"panic(cpu 3 caller 0xffffff80deadbeef): clover unattended deadline"
+    words = list(sentence)
+    words += [0] * (-len(words) % 4)
+    text_words = [int.from_bytes(bytes(words[i:i + 4]), "little")
+                  for i in range(0, len(words), 4)]
+    text_words += [0] * (FLIGHT_TEXT_BYTES // 4 - len(text_words))
+    place(signed,
+          build_flight_record(first_lba + FLIGHT_TEXT_OFFSET + boot_id % FLIGHT_TEXT_SLOTS,
+                              boot_id, 6, 3, 0, len(sentence), t_ms=642000,
+                              extra=[len(sentence), 2, boot_id] + text_words,
+                              boot=boot_id, marker_magic=True),
+          FLIGHT_TEXT_OFFSET + boot_id % FLIGHT_TEXT_SLOTS)
+    place(signed,
+          build_flight_record(first_lba + FLIGHT_PANIC_OFFSET, 0, 5, 3, 0, 0, t_ms=641900,
+                              extra=[0, 1, 0x20fdf, 13320216, 2, 0, boot_id, 7],
+                              boot=boot_id, marker_magic=True),
+          FLIGHT_PANIC_OFFSET)
+    decoded = decode_flight(bytes(signed), first_lba)
+    assert not decoded["text"][0][2], decoded["text"][0][2]
+    assert decoded["text"][0][1]["text"] == sentence.decode("latin1"), decoded["text"][0][1]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        flight_report(decoded, boot_id)
+    said = out.getvalue()
+    assert "not a marker" not in said, said
+    assert "magic=yes" in said, said
+    assert sentence.decode("latin1") in said, said
+    assert f"sentence boot={boot_id}" in said, said
+    # The same sector without the signature is not a sentence, and must not print quoted words:
+    # this is the rule that keeps a rebuilt shared buffer from ever being read as a verdict again.
+    unsigned = bytearray(signed)
+    struct.pack_into("<I", unsigned, (FLIGHT_TEXT_OFFSET + boot_id % FLIGHT_TEXT_SLOTS) * SECTOR
+                     + 126 * 4, 0)
+    decoded = decode_flight(bytes(unsigned), first_lba)
+    assert any(problem.startswith("not a sentence") for problem in decoded["text"][0][2]), \
+        decoded["text"][0][2]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        flight_report(decoded, boot_id)
+    said = out.getvalue()
+    assert "not a sentence: no r302 magic at word 126" in said, said
+    assert "panic(cpu 3 caller" not in said, said
     print("read-clover-log selftest: report window, both rings, flight region, wrap order, "
-          "ring kinds and bad records all ok")
+          "ring kinds, bad records and the r302 verdict signatures all ok")
     return 0
 
 

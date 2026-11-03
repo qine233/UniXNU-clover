@@ -23593,3 +23593,69 @@ ino 1370 size back to 3 (from 32768)` ⇒ **642.684 s**（环里这一靴没有 
 **⑧ 产物。** `~/clover-out/round301-boot91-window.bin`（623,104 B）与解码 `…bin.txt`
 （16 report / 64 verdict / 3 probe / 512 kernel，boot 91）、`…bin.pre-flash`（刷前窗，boot 90）、
 `…landing-sensors.txt`、`…landing-rawdump-head.bin`、`r301-boot91-unattended.log`（`unattended-exit=0`）。
+
+## Round302 (v0.7.8)：判决记录不再与流量共用缓冲，句子不再等第二次机会
+
+**① 这一轮要结的两笔债（boot 91 点名的，见 §boot 91 ⑥）。**
+`gFlightBlock` 是飞区**唯一一块记录缓冲**：每条 `flightWrite` 先清零、逐字重建 word0..34、再填 extras，
+然后 `writePioBlock` **从这块缓冲本身**逐字送 FIFO。于是 sink 自己的传输期间，任何一笔并发块请求
+（`flightEnter`/beat）都能把它重建，卡上收到的就是**两个字段的混血**——
+`event=5 dir=3`（只出自 `flightPanicMark`）配 `blocks=8` 与活的 `stage/pid/comm`（只出自请求路径），
+再加 word 35 那枚 `extraWords == 0` 才会打的 boot 戳。**混血读起来像读数**：解码器把 boot 戳当成
+`stage=91` 印了出来。另一笔：r301 那份 RAM 副本要等**后来的 flush** 才到卡上，而 boot 91 就是一靴没有 flush。
+
+**② 形状照 sheng 的四条（先查再动，见 [[reference-sheng-panic-storage]]）。**
+(1) **判决记录独占缓冲**：新 `gFlightMarker[kBlockWords]`，`forced` 事件（deadline、panic marker、句子）
+一律建在它上面，`buf = forced ? gFlightMarker : gFlightBlock`，`writePioBlock (record, buf, …)`；
+流量那一半（entry/beat）留在原缓冲，**缺席不是判决**，混血也不再能污染判决。
+(2) **记录自带签名**：`kFlightMarkerMagic = 0x434C564D`（'CLVM'）写在**自己 extras 之后的那一格**、
+且在 extras 之后落笔 ⇒ deadline word 46、marker word 43、句子 word 126；读者按事件表查偏移，
+`magic` 缺失就印「absent（r302 之前的镜像，或这格压根不是 marker）」，句子那一格缺签名直接拒读。
+(3) **不预读**：`panicAppendText()` 写之前要读满 16 个报告槽挑最老的一格——boot 90 就是这笔读被拒
+（`append_rc=2` 且 `host=0x20fdf`）、一次性、不重试 ⇒ 句子丢了。新句子记录**由 boot id 取模选格**
+（`kFlightTextOffset = 44`、`kFlightTextSlots = 12`，正是 entry 环与 beat 之间那 12 格无主区），
+`seq = gBootId`、`slot = gBootId % 12`，**一个字节都不先读**。
+(4) **不靠后续 flush**：句子就在 sink 里写出去（`gPanicAppendRc = rc;` 之后、退出 marker 之前），
+用 r301 已经抄好的 `gPanicStash`——所以这一轮不是「第二个 sink 属主」，是同一条副本的第三条出路。
+块的容量是 512 B：header 35 格 + 3 格自己的数（`chars`、`append_rc`、`boot`）+ 88 格正文 ⇒
+**能装 352 个字符**，全文长度放在 header 的 `blocks=` 位（`total=`），
+`chars < total` 就是「句子比这格长」，读起来是**记录的 truncated**而不是「panic 变短了」。
+
+**③ 与 r301 的关系一条规矩守住**：句子**只在 `append_rc < 100` 时盲写**（`rc >= 100` 表示 kind-20 记录已带它，
+再写一份会让宿主把一次 panic 读成两次）；`gPanicStashLength == 0` 也不写。退出 marker 仍是 sink 的最后一格记录，
+`panicAppendText()` 的 `rc` 编码与「一次、不重试」一个字没动（那是 patcher 的契约）。
+新状态行 `CloverSdhci r302: blind ok=%u chars=%u total=%u slot=%u` **无条件说**，
+它的用途是把「写被拒」与「排干根本没跑」切开——行在而卡上没句子＝驱动以为写了、卡没收下（新的故障形状），
+行说 `ok=0`＝这笔也被拒，行缺席＝排干没跑到那一格。`r302` 不进 tee 类表（checker 负断言）。
+
+**④ 入口序列的一个坑（改前先想清楚才动手）**：句子写在**每靴只有一格**的位置上，若仍走
+`(*seqp)++` 就会把 **entry 环的光标**推一格，下一靴的请求记录全部错位旋转。因此
+`seq = (event == kFlightEventText) ? gBootId : *seqp` 且 `if (event != kFlightEventText) (*seqp)++;`，
+checker 钉这两条。
+
+**⑤ boot 92 的判读态（刷写前登记；句子那一格是 lba 13320216 + 44 + 92 % 12 = 13320268）。**
+先问镜像身份：卡上 report 行应署 `clover r302:`，boot 计数应为 92——身份不对则下面全不作数。
+**marker 侧三态**：(a) panic 槽带 `magic=yes` ⇒ 独占缓冲+签名成立，`stage/rc/gates` 按权威值读；
+(b) 槽被拒读为「not a marker」**而 `drain enter boot=92` 存在** ⇒ 混血不是共用缓冲造的（那格已独占），
+凶手在传输路径（FIFO/重传）本身，**这是本轮最重要的那一支**，诊断要从「谁重建缓冲」挪到「谁重放传输」；
+(c) 既无 marker 也无 drain 行 ⇒ 这靴根本没进 sink（boot 88 那一形状），r302 无从判读，不作失败。
+**句子侧四态**：(d) `flight: sentence boot=92 …` 带正文 ⇒ **这块板第一次把「为什么结束」写成不依赖任何第二次机会的字**，
+再看 `chars/total` 是否截断、`append_rc` 是否与 kind-20 记录自相矛盾；
+(e) `blind ok=1` 行在、卡上无句子 ⇒ 驱动与卡对同一笔写的判断不一致（新的故障形状，指向传输而不是门）；
+(f) `blind ok=0 chars>0` ⇒ 这一笔也被拒，副本只剩环那一条，债务从「一条不靠 flush 的写法」变成「一种写法都没有」；
+(g) `blind ok=0 chars=0` ⇒ 屏空手调用 sink，「没有句子」是实测而不是推断，下一问是谁传了 nullptr。
+**搭读不作本轮结论**：deadline 记录现在也应 `magic=yes`；普查尾巴 `r262: th`/`clover r300`
+（已四靴 0 行、跨三枚镜像）是否回来——它们仍骑 msgbuf+tee，**债 (1) 要到它们也有非管道副本才结清**；
+结局落点是否仍在八核像那一段（631–940 s）——本轮不动任何硬件路径，所以 boot 92 同时是「镜像 vs 核数」
+那轮控制的又一张票（第四张同族票，仍不是控制本身）。
+
+**⑥ 闸门与产物。** 内核 `1237fa95…` → AMFI 两刀（仍在文件偏移 `0x1ad70e4`/`0x1ad716c`，
+证明驱动长大没挪动这两处）→ 归一化 `f2c048bc…`；
+`round302-v0.7.8-payload.img` 58,720,256 B，sha256 `f26c10376eb0d9f9017d0897b1fd8d27cf55f17305824c999227aa807dd08284`。
+`check-clover.py` EXIT=0；`verify-clover-payload.py` EXIT=0、50 项 OK（新增 `panic-blind-row` 针）。
+变异正对照六支，每支 EXIT=1 并指名：摘掉签名赋值行、把 `buf` 退回单一 `gFlightBlock`、
+把盲写挪到退出 marker 之后、在 `flightPanicText` 里塞一笔 `readPioBlock`、让句子推进 entry 光标、
+读者的 `FLIGHT_MAGIC_WORD` 表清空（这支还连带 `--selftest` 失败）。改完两文件与备份逐字节相同。
+`read-clover-log.py --selftest` 另加两枚正对照：带签名的句子与 marker 必须印出正文与 `magic=yes`，
+同一格抹掉签名必须印「not a sentence」且**不得**印出正文；三枚真窗回归——boot 89 拒 `chronod`、
+boot 91 拒 `osanalyt` 混血、boot 90 那条诚实 marker 除新 `magic=absent` 标签外逐字不变。

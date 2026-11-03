@@ -252,6 +252,27 @@ leave」一路收紧到一句可测的话：
   `--selftest` 用手工拼的混血做正对照，变异测试 `if False` ⇒ `AssertionError`，boot 89/90 两窗不误伤。
   两笔设备侧债（marker 独占缓冲 + 自带 magic；句子要有一条**不预读、不靠后续 flush** 的盲写路径）记为 **r302**，
   形状按用户规矩先查 sheng 的对照做法再动。详见 `notes/development-log.md` §boot 91 ①–⑧。
+* **r302（v0.7.8，仪器债：判决记录不再与流量共用缓冲，句子不再等第二次机会）**。形状全部由 boot 91 那一格混血点名，
+  四条照 sheng 抄（`~/UniXNU-sheng`：panic sink 根本不碰存储栈、writer 线程独占它的缓冲、一次性记录带 magic 且认证头最后写、
+  槽位由 `slots_written % slot_count` 盲写不预读——见 `notes/development-log.md` §Round302 ②）。本板落地：
+  新增 `gFlightMarker` 独占缓冲，`forced` 事件（deadline / panic marker / 句子）一律建在它上面，
+  流量那一半留在 `gFlightBlock`；`kFlightMarkerMagic = 'CLVM'` 写在**自己 extras 之后的那一格**且**在 extras 之后落笔**
+  （deadline word 46、marker word 43、句子 word 126），读者按事件表查偏移，缺签名就印「absent」而不是印假字段；
+  句子记录住进那 12 格无主区（`kFlightTextOffset = 44`），**槽位 = boot id % 12、一个字节都不先读**
+  ——`panicAppendText()` 那笔「读满 16 格找最老」正是 boot 90 丢句子的地方（`append_rc=2`、一次性、不重试）；
+  它复用 r301 已抄好的 `gPanicStash`，**只在 `append_rc < 100` 时写**，就在 sink 里、退出 marker 之前，
+  所以句子从此有一条**不依赖后来 flush** 的出路（boot 91 证明「后来的 flush」可以整靴不存在）。
+  一块 512 B 装 352 个字符，全文长度放在 header 的 `blocks=` 位 ⇒ `chars < total` 读作「记录截断了」而不是「panic 变短了」。
+  状态行 `CloverSdhci r302: blind ok=%u chars=%u total=%u slot=%u` 无条件说，作用是把「这笔写被拒」与「排干根本没跑」切开；
+  `r302` 负断言不进 tee 类表。**改前先想清的一个坑**：句子写在每靴固定一格上，若照其它事件走 `(*seqp)++` 会把
+  entry 环的光标推走、下一靴所有请求记录错位旋转 ⇒ `seq` 取 `gBootId` 且不推进，checker 钉住。
+  内核 `1237fa95` → AMFI 两刀仍在 `0x1ad70e4`/`0x1ad716c` → 归一化 `f2c048bc`；
+  `round302-v0.7.8-payload.img` 58,720,256 B，sha256 `f26c10376eb0d9f9017d0897b1fd8d27cf55f17305824c999227aa807dd08284`；
+  两道闸门 EXIT=0（verify 50 项 OK，新增 `panic-blind-row` 针），变异正对照六支各 EXIT=1 并指名，改完与备份逐字节相同。
+  **boot 92 的七态判读（marker 侧三支 + 句子侧四支）预登记在 `notes/development-log.md` §Round302 ⑤**；
+  其中「槽被拒读而 `drain enter boot=92` 存在」那一支是本轮最重要的一支——若落地，说明混血不是共用缓冲造的，
+  诊断要从「谁重建缓冲」挪到「谁重放传输」。普查尾巴仍四靴 0 行、`r300: fire/done` 那份非管道副本仍欠，
+  桌面主线（#577）与「镜像 vs 核数」那轮控制都没动。
 * **再后一支（本格欠的两条仪器债）**：`vbits=`（`ipc_right_lookup_read()` 已经交出的 entry 位掩码，
   用来分 port set / send-once，不需要对象、锁纪律与 translate 同一条）与 `qmc=/qsr=` 自带返回码。
 * **那笔「等设备解锁」的死等已经不是现场，但它的机制现在读全了**：r274 命中的形状是

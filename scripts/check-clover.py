@@ -3017,7 +3017,9 @@ def check_board(errors: list) -> str:
         # boot 76's deadline "this boot's". A stamp that only some records carry is the same hole, so the
         # entries, the beats and the deadline record carry it too, and the reader is asserted below to
         # print STALE rather than a conclusion when the stamp disagrees with the boot counter.
-        if "gFlightBlock[35] = gBootId;" not in sdhci_source:
+        # round302: the shared traffic buffer became buf, and the verdict records moved to
+        # gFlightMarker, so the stamp is looked for on the buffer the writer is holding.
+        if "buf[35] = gBootId;" not in sdhci_source:
             errors.append("flightWrite stamps no boot on the records that carry no extras: an entry or a "
                           "beat from the boot before the flash would read as this boot's last request")
         if "extra[10] = gBootId;" not in sdhci_source or \
@@ -3949,6 +3951,74 @@ def check_board(errors: list) -> str:
                           "does not ride msgbuf and the tee, and a class here would put it back in the "
                           "burst whose loss it is meant to survive")
 
+        # Round302 is driver-side only and answers the reading boot 91 forced. Its panic slot carries a
+        # marker's event and dir words and a block request's header -- eight-block write from osanalyt --
+        # because every flight event builds its record in the ONE gFlightBlock, which writePioBlock then
+        # streams out of that same buffer while flightEnter or a beat rebuilds it; boot 88 carries the
+        # identical shape, so this is the region's own defect and not r301's. The decoder could not tell,
+        # because a marker has no signature, and printed round293's boot stamp as `stage=91`. So three
+        # assertions: a verdict record owns its buffer, it signs itself after its extras, and the
+        # sentence reaches the card through a write that reads nothing first -- which is exactly the read
+        # boot 90's append_rc=2 was, and the reason r301's copy still needed a later flush.
+        for needle in ('static const uint32_t kFlightTextOffset = 44;',
+                       'static const uint32_t kFlightTextSlots = 12;',
+                       'static const uint32_t kFlightEventText = 6;',
+                       'static const uint32_t kFlightMarkerMagic = 0x434C564Du;',
+                       'static const uint32_t kPanicStashBlindBytes = 352;',
+                       'static uint32_t gFlightMarker[kBlockWords];',
+                       'uint32_t *buf = forced ? gFlightMarker : gFlightBlock;',
+                       'buf[35 + extraWords] = kFlightMarkerMagic;',
+                       '(event == kFlightEventText);',
+                       'flightWrite (kFlightEventText, 3, 0, gPanicStashLength, extra,',
+                       '"CloverSdhci r302: blind ok=%u chars=%u total=%u slot=%u\\n"'):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci lacks {needle[:64]!r}: without the owned buffer, the "
+                              "signature and the blind write, boot 91's shape stays on the card as a "
+                              "reading and the sentence still needs a second chance to reach it")
+        # The signature has to be laid down before the transfer starts and after the extras, or a record
+        # cut off mid-build would carry one anyway.
+        magic_at = sdhci_source.find("buf[35 + extraWords] = kFlightMarkerMagic;")
+        extras_at = sdhci_source.find("buf[35 + i] = extra[i];")
+        stream_at = sdhci_source.find("writePioBlock (record, buf, words, status)")
+        if not (0 <= extras_at < magic_at < stream_at):
+            errors.append("the r302 signature is not the last word written before the block streams: "
+                          "a magic that can be present on a half-built record is a magic that lies")
+        # The traffic buffer must not be able to carry a verdict again.
+        if "writePioBlock (record, gFlightBlock" in sdhci_source:
+            errors.append("flightWrite still streams gFlightBlock: that is the shared buffer boot 91's "
+                          "hybrid came from, and one writer rebuilding it mid-transfer is the whole bug")
+        # A sentence that reads the card to find its slot is the design that lost boot 90's text.
+        text_fn = sdhci_source[sdhci_source.find("static void flightPanicText"):
+                               sdhci_source.find("static void flightPanicMark")]
+        if "readPioBlock" in text_fn:
+            errors.append("flightPanicText reads the card before writing it: the pre-read is what "
+                          "panicAppendText() lost the sentence on (boot 90, append_rc=2, one attempt), "
+                          "and the slot is boot id modulo kFlightTextSlots precisely so nothing must be read")
+        # It is written inside the sink, after the append's return code and before the exit marker, so
+        # the exit marker stays the last word about the sink.
+        blind_at = sdhci_source.find("flightPanicText (rc);")
+        rc_at = sdhci_source.find("gPanicAppendRc = rc;")
+        exit_mark_at = sdhci_source.find("flightPanicMark (1, rc, text != nullptr);")
+        if not (0 <= rc_at < blind_at < exit_mark_at):
+            errors.append("the blind sentence write is not between the append's return code and the exit "
+                          "marker: it needs rc to decide whether the report record already carries the "
+                          "text, and the exit marker has to stay the sink's last record")
+        # The status row rides the drain's own flush, before the flushes, like r301's rows.
+        row_at = sdhci_source.find('"CloverSdhci r302: blind ok=%u chars=%u total=%u slot=%u\\n"')
+        flush_at = sdhci_source.find("gPanicDrainWritten += panicProbeFlush ();")
+        if row_at < 0 or flush_at < 0 or row_at > flush_at:
+            errors.append("the r302 status row is queued after the drain's flushes: it would report a "
+                          "write that the host could only learn about on the next beat")
+        # The sentence's slot is the boot id, so it must not advance the entry ring's cursor.
+        seq_guard = sdhci_source.find("if (event != kFlightEventText) {")
+        seq_step = sdhci_source.find("(*seqp)++;", seq_guard) if seq_guard >= 0 else -1
+        if seq_guard < 0 or seq_step < 0 or seq_step - seq_guard > 400:
+            errors.append("flightWrite advances the entry sequence for a sentence record: a panic at the "
+                          "end of a boot would rotate the request ring the next boot reads")
+        if '{ "clover r302' in sdhci_source:
+            errors.append("r302 rows were added to the tee class table: this round's rows are driver-side "
+                          "state and ride the RAM ring, not the pipe that lost the census tail")
+
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -4343,8 +4413,11 @@ def check_board(errors: list) -> str:
                  "the deadline record is not at sector 60, where the reader looks"),
                 ("static const uint32_t kFlightPanicOffset = 61;",
                  "the panic markers are not at sectors 61-62, where the reader looks"),
-                ("const bool forced = (event == kFlightEventDeadline) || (event == kFlightEventPanic);",
-                 "the two survival records would still need the arming gates"),
+                ("const bool forced = (event == kFlightEventDeadline) || (event == kFlightEventPanic) ||",
+                 "the survival records would still need the arming gates"),
+                ("(event == kFlightEventText);",
+                 "the sentence record is not one of the forced events: on a boot that never armed the "
+                 "flight region it would be refused before the sink ran"),
                 ("if (!forced && !__atomic_load_n (&gFlightArmed, __ATOMIC_ACQUIRE)) {",
                  "the armed gate no longer exempts the forced records"),
                 ("extern \"C\" void clover_emmc_flight_deadline (",
@@ -5250,8 +5323,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r301:"):
-        errors.append('[payload] title is not "clover r301: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r302:"):
+        errors.append('[payload] title is not "clover r302: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5970,7 +6043,16 @@ def check_board(errors: list) -> str:
                        # Round293: the reader has to say which boot wrote what it prints. A stale
                        # deadline record is not a boot that reached its deadline, and the reader that
                        # printed one as if it were is how boot 79 nearly read as a boot that did.
-                       "FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 35, 4: 45, 5: 41}",
+                       "FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 35, 4: 45, 5: 41, 6: 37}",
+                       # Round302: the reader has to know where a verdict record signs itself, and that
+                       # the sentence's slots do not arrive in sequence -- a reader that broke the group
+                       # at the first untouched sector would read every panic before boot id reached 12
+                       # as no sentence at all.
+                       "FLIGHT_TEXT_OFFSET = 44", "FLIGHT_TEXT_SLOTS = 12",
+                       "FLIGHT_MARKER_MAGIC = 0x434C564D",
+                       "FLIGHT_MAGIC_WORD = {4: 46, 5: 43, 6: 126}",
+                       '6: "text"', 'not a sentence: no r302 magic at word',
+                       "no sentence record",
                        "def flight_stamp(records, boot_id)", "STALE: boot",
                        'flight_report(groups, boot["boot"] if boot else 0)',
                        "never wrote one, so this group says nothing about this boot",
@@ -6380,8 +6462,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r301:"):
-        errors.append('[payload] title is not "clover r301: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r302:"):
+        errors.append('[payload] title is not "clover r302: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

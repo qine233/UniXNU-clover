@@ -494,6 +494,26 @@ static const uint32_t kFlightDeadlineOffset = 60; // one record, one write, once
 static const uint32_t kFlightDeadlineSlots = 1;
 static const uint32_t kFlightPanicOffset = 61;    // enter and exit, one sector each
 static const uint32_t kFlightPanicSlots = 2;
+// Round302: boot 91's panic slot is a hybrid -- event/dir 5/3 with eight extras that were never
+// written, while the same record's header names a live 8-block request from osanalyt, and boot 88
+// carries the identical shape. That is only reachable because every flight event builds its record
+// in the one gFlightBlock, which writePioBlock then streams out of that same buffer while the request
+// path is free to zero and rebuild it. Two things follow, and they are the two halves of this round:
+// a verdict record owns its buffer, and it says so itself -- a magic word right after its own extras,
+// so "this sector was written as a panic marker" is a fact the record carries instead of one the
+// reader infers from an offset (r293's boot stamp was being printed as boot 91's stage).
+//
+// The twelve sectors between the entry ring and the beats (44..55) have never had an owner. They
+// become the panic sentence's own record: one block, indexed by boot id, written inside the sink with
+// no read beforehand -- because r301's RAM copy still reaches the card only through a later flush,
+// and boot 91 is a boot that never got one. Blind indexing is what sheng does (slots_written modulo
+// the slot count, the window base computed once), and it is what this append has never done:
+// panicAppendText() reads all sixteen report slots before writing one of them, and boot 90 lost its
+// sentence exactly there (append_rc=2 on that read, one attempt, no retry).
+static const uint32_t kFlightTextOffset = 44;     // twelve one-block records, one per boot
+static const uint32_t kFlightTextSlots = 12;
+static const uint32_t kFlightEventText = 6;
+static const uint32_t kFlightMarkerMagic = 0x434C564Du;   // 'CLVM', the flight verdict magic
 static const uint32_t kFlightKind = 23;
 static const uint32_t kFlightEventRead = 1;
 static const uint32_t kFlightEventWrite = 2;
@@ -1067,9 +1087,16 @@ static uint32_t gPanicAppendRc = 0xffffffffu;
 // refuse, and the drain below decides whether to say it.
 static const uint32_t kPanicStashBytes = 480;   // the same cap the report record's body carries
 static const uint32_t kPanicStashPart = 240;    // a verdict row is kVerdictTextBytes=320 wide
+// Round302: the blind record is one 512-byte block, and three words of it are header (characters,
+// the append's return code, the boot id), so the sentence's own room is 88 words. 352 of the 480
+// characters is what fits in the block that needs no second chance; the ring copy keeps all 480,
+// and a record that truncates says so by carrying characters=480 with a length that fits.
+static const uint32_t kPanicStashBlindBytes = 352;
 static char gPanicStash[kPanicStashBytes + 1];
 static uint32_t gPanicStashLength = 0;          // characters copied out of the sink's argument
 static uint32_t gPanicStashSaid = 0;            // parts this drain queued (0, 1 or 2)
+static uint32_t gPanicBlindChars = 0;           // characters the blind record carried
+static uint32_t gPanicBlindOk = 0;              // 1 once the blind block reached the controller
 
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
@@ -3229,6 +3256,12 @@ static uint32_t gRingBlock[kBlockWords];
 // Round210: its own block, because a beat may run on top of a request that is halfway through
 // filling gRingBlock at the tail it was interrupted in.
 static uint32_t gFlightBlock[kBlockWords];
+// Round302: and a third one, for the records that are verdicts rather than traffic -- the deadline,
+// the panic marker and the panic sentence. boot 91 proved the traffic buffer cannot hold a verdict:
+// the entry path and a beat rebuild it while writePioBlock is still streaming it, so the sector ends
+// up carrying one event's header and another's stamp. The forced events own this buffer alone, which
+// is what makes their magic word mean something.
+static uint32_t gFlightMarker[kBlockWords];
 
 // One byte at a time, clamped: a verdict that overruns its slot is truncated rather than written
 // past the array, and the cursor stops advancing so the reported length is the stored length.
@@ -3586,7 +3619,12 @@ static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t bl
   // death of everything else, so they do not depend on the flight region having been armed by a
   // boot that reached its block-driver phase. They still need the window base and the host: without
   // those there is nowhere to write.
-  const bool forced = (event == kFlightEventDeadline) || (event == kFlightEventPanic);
+  // Round302 adds the third forced event, the panic sentence, and a rule that comes with it: a forced
+  // record is built in gFlightMarker, never in gFlightBlock, because boot 91 showed that the traffic
+  // buffer can be rebuilt by an entry or a beat while writePioBlock is still streaming it, which is
+  // how a sector ends up with one event's header and another event's boot stamp.
+  const bool forced = (event == kFlightEventDeadline) || (event == kFlightEventPanic) ||
+                      (event == kFlightEventText);
   if (!gVerdictFirst || !gHost) {
     return false;
   }
@@ -3608,59 +3646,67 @@ static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t bl
     offset = kFlightPanicOffset;
     slots = kFlightPanicSlots;
     seqp = &gFlightPanicSeq;
+  } else if (event == kFlightEventText) {
+    offset = kFlightTextOffset;
+    slots = kFlightTextSlots;
   }
-  const uint32_t seq = *seqp;
+  // Round302: the sentence's slot is chosen by the boot id the card already keeps across resets, so
+  // the sink can write it without reading anything first. That pre-read is where boot 90 lost the
+  // text: panicAppendText() reads all sixteen report slots to find the oldest one, boot 90's read was
+  // refused with the controller held (host=0x20fdf), and the sink tries once.
+  const uint32_t seq = (event == kFlightEventText) ? gBootId : *seqp;
   const uint32_t slot = seq % slots;
   const uint32_t record = gVerdictFirst + offset + slot;
   const uint32_t present = read32 (SDHCI_PRESENT_STATE);
+  uint32_t *buf = forced ? gFlightMarker : gFlightBlock;
   for (uint32_t i = 0; i < kBlockWords; i++) {
-    gFlightBlock[i] = 0;
+    buf[i] = 0;
   }
-  gFlightBlock[0] = kLogMagic0;
-  gFlightBlock[1] = kLogMagic1;
-  gFlightBlock[2] = record;
-  gFlightBlock[3] = kFlightKind;
-  gFlightBlock[4] = seq;
-  gFlightBlock[5] = slot;
-  gFlightBlock[6] = event;
-  gFlightBlock[7] = dir;
-  gFlightBlock[8] = lba;
-  gFlightBlock[9] = blocks;
-  gFlightBlock[10] = flightCounterMs (gFlightStart);
-  gFlightBlock[11] = gFlightPrevDone;
-  gFlightBlock[12] = gFlightPrevMs;
-  gFlightBlock[13] = present;
-  gFlightBlock[14] = ((present & SDHCI_CMD_INHIBIT) ? 1u : 0u) |
+  buf[0] = kLogMagic0;
+  buf[1] = kLogMagic1;
+  buf[2] = record;
+  buf[3] = kFlightKind;
+  buf[4] = seq;
+  buf[5] = slot;
+  buf[6] = event;
+  buf[7] = dir;
+  buf[8] = lba;
+  buf[9] = blocks;
+  buf[10] = flightCounterMs (gFlightStart);
+  buf[11] = gFlightPrevDone;
+  buf[12] = gFlightPrevMs;
+  buf[13] = present;
+  buf[14] = ((present & SDHCI_CMD_INHIBIT) ? 1u : 0u) |
                      ((present & SDHCI_DATA_INHIBIT) ? 2u : 0u) |
                      ((event == kFlightEventBeat) ? 4u : 0u);
-  gFlightBlock[15] = gFlightOps;
-  gFlightBlock[16] = __atomic_load_n (&gGuardWaits, __ATOMIC_RELAXED);
-  gFlightBlock[17] = __atomic_load_n (&gFlightBeatMisses, __ATOMIC_RELAXED);
-  gFlightBlock[18] = gRingPending[kRingKernel];
-  gFlightBlock[19] = gRingPending[kRingDriver];
-  gFlightBlock[20] = gFlightPrevDir;
-  gFlightBlock[21] = gFlightPrevBlocks;
+  buf[15] = gFlightOps;
+  buf[16] = __atomic_load_n (&gGuardWaits, __ATOMIC_RELAXED);
+  buf[17] = __atomic_load_n (&gFlightBeatMisses, __ATOMIC_RELAXED);
+  buf[18] = gRingPending[kRingKernel];
+  buf[19] = gRingPending[kRingDriver];
+  buf[20] = gFlightPrevDir;
+  buf[21] = gFlightPrevBlocks;
   // Round213: the stage the holder was in when this record went down, how long it had been there,
   // and the watchdog's counters. A beat whose stage has outlived the next beat is the request that
   // stopped; the counters say whether the watchdog has already been there.
-  gFlightBlock[22] = __atomic_load_n (&gFlightStage, __ATOMIC_ACQUIRE);
-  gFlightBlock[23] = flightCounterMs (__atomic_load_n (&gFlightStageSince, __ATOMIC_ACQUIRE));
-  gFlightBlock[24] = __atomic_load_n (&gFlightStuck, __ATOMIC_RELAXED);
-  gFlightBlock[25] = __atomic_load_n (&gFlightRecovered, __ATOMIC_RELAXED);
-  gFlightBlock[26] = __atomic_load_n (&gFlightSteals, __ATOMIC_RELAXED);
-  gFlightBlock[27] = __atomic_load_n (&gFlightStuckStage, __ATOMIC_RELAXED);
-  gFlightBlock[28] = __atomic_load_n (&gFlightStageLba, __ATOMIC_RELAXED);
-  gFlightBlock[29] = __atomic_load_n (&gFlightStageBlocks, __ATOMIC_RELAXED);
-  gFlightBlock[30] = __atomic_load_n (&gFlightStagePid, __ATOMIC_RELAXED);
-  gFlightBlock[31] = __atomic_load_n (&gFlightStageDir, __ATOMIC_RELAXED);
+  buf[22] = __atomic_load_n (&gFlightStage, __ATOMIC_ACQUIRE);
+  buf[23] = flightCounterMs (__atomic_load_n (&gFlightStageSince, __ATOMIC_ACQUIRE));
+  buf[24] = __atomic_load_n (&gFlightStuck, __ATOMIC_RELAXED);
+  buf[25] = __atomic_load_n (&gFlightRecovered, __ATOMIC_RELAXED);
+  buf[26] = __atomic_load_n (&gFlightSteals, __ATOMIC_RELAXED);
+  buf[27] = __atomic_load_n (&gFlightStuckStage, __ATOMIC_RELAXED);
+  buf[28] = __atomic_load_n (&gFlightStageLba, __ATOMIC_RELAXED);
+  buf[29] = __atomic_load_n (&gFlightStageBlocks, __ATOMIC_RELAXED);
+  buf[30] = __atomic_load_n (&gFlightStagePid, __ATOMIC_RELAXED);
+  buf[31] = __atomic_load_n (&gFlightStageDir, __ATOMIC_RELAXED);
   // Round213: the caller of this record's own request (entry) or of the last one (beat).
-  gFlightBlock[32] = gFlightCurPid;
-  gFlightBlock[33] = gFlightCurComm0;
-  gFlightBlock[34] = gFlightCurComm1;
+  buf[32] = gFlightCurPid;
+  buf[33] = gFlightCurComm0;
+  buf[34] = gFlightCurComm1;
   // Round236: the deadline's own numbers and the panic marker's gates ride after the round210
   // header, so the two readings keep one decoder instead of two record formats.
   for (uint32_t i = 0; i < extraWords && 35 + i < kBlockWords; i++) {
-    gFlightBlock[35 + i] = extra[i];
+    buf[35 + i] = extra[i];
   }
   // Round293: which boot wrote this. Boot 79's frame is the reason the field exists: the deadline
   // slot and the panic slots are the only two groups a boot may never reach, and when it does not
@@ -3669,10 +3715,17 @@ static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t bl
   // events that do carry extras put the stamp after their own (the deadline's is extra[10], and the
   // panic marker already named gBootId as extra[6] since round236).
   if (extraWords == 0) {
-    gFlightBlock[35] = gBootId;
+    buf[35] = gBootId;
+  }
+  // Round302: the verdict record's own signature, in the word right after its extras and written
+  // after them, so a record that never got this far fails its magic instead of being decoded from
+  // whatever a previous writer left in the sector. This is what separates 'this boot entered the sink'
+  // from 'this sector happens to be the one the sink would have used'.
+  if (forced && 35 + extraWords < kBlockWords) {
+    buf[35 + extraWords] = kFlightMarkerMagic;
   }
   uint32_t words = 0, status = 0;
-  if (!writePioBlock (record, gFlightBlock, words, status)) {
+  if (!writePioBlock (record, buf, words, status)) {
     return false;
   }
   // The card may still be programming; a beat does not wait for it, because a beat that spends
@@ -3682,7 +3735,12 @@ static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t bl
     uint32_t rsp = 0, rstatus = 0, polls = 0;
     waitCardReady (rsp, rstatus, polls);
   }
-  (*seqp)++;
+  if (event != kFlightEventText) {
+    // The sentence's slot is the boot id, so it has no sequence of its own to advance -- and the entry
+    // ring's cursor must not move, because a write at the end of a boot would otherwise rotate the
+    // request records that follow it on the next boot.
+    (*seqp)++;
+  }
   if (beat) {
     gFlightBeats++;
   }
@@ -4758,6 +4816,15 @@ static void panicDrainRings (void)
   panicTailSay ("CloverSdhci r301: panic copy rc=%u chars=%u said=%u\n",
                 static_cast<unsigned int> (gPanicAppendRc),
                 static_cast<unsigned int> (gPanicStashLength), gPanicStashSaid);
+  // Round302: and what the blind write did, said unconditionally for the same reason. The record in
+  // sector kFlightTextOffset + boot % kFlightTextSlots is the card's answer to 'did the sentence
+  // land'; this row is the driver's answer to 'did it get that far and what came back'. The pair is
+  // what tells a refused block write apart from a drain that never ran -- boot 91 had no drain rows
+  // at all, and the sector there was another writer's record wearing this one's offsets.
+  panicTailSay ("CloverSdhci r302: blind ok=%u chars=%u total=%u slot=%u\n",
+                gPanicBlindOk, gPanicBlindChars,
+                static_cast<unsigned int> (gPanicStashLength),
+                gBootId % kFlightTextSlots);
   gPanicDrainWritten += panicProbeFlush ();
   for (uint32_t which = 0; which < kRingCount; which++) {
     if (which == kRingKernel ? !gTeeReady : !gVerdictReady) {
@@ -8948,6 +9015,52 @@ static unsigned int panicAppendText (const char *text, unsigned int length)
 // frame with an empty report window is exactly the one that needs to know. The marker is written
 // before the append and again with its return code, and neither write depends on the gates it
 // reports. At most two records per boot, in the sector after the deadline record.
+// Round302: the sentence, one block, written blind. This is the write path that needs no later
+// opportunity: nothing is read first (the slot is boot id modulo the region's twelve sectors), it does
+// not wait for the periodic flush that r301's ring copy depends on -- boot 91 is a boot where that
+// flush never came -- and it carries its own magic, so a reader can tell it apart from whatever else
+// happened to land in sector 44 + boot % 12. It reuses the copy r301 already made in RAM, so the two
+// rounds are one path and not two owners of the sink: gPanicStash is filled before anything can refuse,
+// and this is the third thing done with it.
+//   The header's blocks= word carries the sentence's real length, because the block's own room is 352
+// of the 480 characters the stash can hold. chars= < total= on the card says the sentence was longer
+// than the blind record could take, which is a reading about the record, not about the panic.
+static void flightPanicText (unsigned int appendRc)
+{
+  gPanicBlindChars = 0;
+  gPanicBlindOk = 0;
+  if (!gVerdictFirst || !gHost) {
+    return;
+  }
+  // The same rule the ring copy follows: a return code of 100 or more means the kind-20 report record
+  // already holds the sentence, and a second copy of it would let the host read one panic as two.
+  // Here it is not a courtesy but the point -- the blind record exists for the boots whose report
+  // window refused, which is every boot this board has lost a sentence on.
+  if (appendRc >= 100 || gPanicStashLength == 0) {
+    return;
+  }
+  const uint32_t chars = gPanicStashLength > kPanicStashBlindBytes
+      ? kPanicStashBlindBytes : gPanicStashLength;
+  uint32_t extra[3 + kPanicStashBlindBytes / 4];
+  extra[0] = chars;
+  extra[1] = appendRc;
+  extra[2] = gBootId;
+  for (uint32_t word = 0; word < kPanicStashBlindBytes / 4; word++) {
+    uint32_t packed = 0;
+    for (uint32_t i = 0; i < 4; i++) {
+      const uint32_t at = word * 4 + i;
+      // Zero, not a space, past the end: the reader trims at the first NUL and an all-space tail
+      // would print as a sentence that grew into its room.
+      const uint32_t byte = at < chars ? static_cast<unsigned char> (gPanicStash[at]) : 0u;
+      packed |= byte << (8 * i);
+    }
+    extra[3 + word] = packed;
+  }
+  gPanicBlindChars = chars;
+  gPanicBlindOk = flightWrite (kFlightEventText, 3, 0, gPanicStashLength, extra,
+                               3 + kPanicStashBlindBytes / 4) ? 1u : 0u;
+}
+
 static void flightPanicMark (uint32_t stage, unsigned int rc, bool haveText)
 {
   if (!gVerdictFirst || !gHost) {
@@ -8991,6 +9104,11 @@ extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int
   flightPanicMark (0, 0, text != nullptr);
   const unsigned int rc = panicAppendText (text, length);
   gPanicAppendRc = rc;
+  // Round302: before the exit marker, because the exit marker is a reading about this sink and the
+  // sentence is the thing the whole sink exists to keep. If this write is refused too, the record
+  // simply is not there and the magic rule says so -- which is the honest shape of 'the card said no
+  // twice', as opposed to boot 91's sector that read like a verdict and belonged to a block request.
+  flightPanicText (rc);
   flightPanicMark (1, rc, text != nullptr);
   panicDrainRings ();
   // Last, because everything above is a reading and this changes what the reset does. The screen

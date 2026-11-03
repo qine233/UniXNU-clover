@@ -846,7 +846,10 @@ def check_panic_tail_read(kernel: bytes) -> bool:
              # row above -- so both strings are pinned here, complete, for the standing reason: a cut
              # format string leaves every prefix needle green.
              "panic-text": (b"CloverSdhci r301: panic text rc=%u chars=%u part=%u %s\n") in kernel,
-             "panic-copy": (b"CloverSdhci r301: panic copy rc=%u chars=%u said=%u\n") in kernel}
+             "panic-copy": (b"CloverSdhci r301: panic copy rc=%u chars=%u said=%u\n") in kernel,
+             # round302: the driver's own account of the blind sentence write. The record itself is
+             # binary words, so this row is the only thing in the image that names the attempt.
+             "panic-blind-row": (b"CloverSdhci r302: blind ok=%u chars=%u total=%u slot=%u\n") in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
