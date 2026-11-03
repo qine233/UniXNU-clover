@@ -465,11 +465,17 @@ clover r291: gpu t=617 ldo beat vref=00000000 val=0 uv=375000 ctrl=80000038 byp=
 5. **下一手仍是读，而且比 §5.10 的候选小得多：一行 8 字节 × 3 枚 row。** 读 row 65/71/73（各 8 字节，`row * BYTES_PER_FUSE_ROW`）
    并把上面那些 bit 段解出来打印，问的是**「这颗芯片出厂时被允许走 LDO 吗、允许走闭环吗、六个角的初压是多少」**——
    这正是 §5.10 想要而找不到出处的那道判据，出处现在在同一块 `0x1000` 窗口里，且 CPR4 与 gfx_ldo 两份文件都点得到名。
-   **两个前提先记账**：(a) 这需要一个新映射（`0x00784000` 不在现有 GPUCC 窗口内），`IODeviceMemory::withRange` 计数=3
-   那枚针要按「DT 声明的第二段窗口」这一条理由**主动**抬到 4，不是顺手加；(b) **行距 8 字节这个事实目前只有
-   `msm_gfx_ldo.c` 那份名字**（`BYTES_PER_FUSE_ROW 8`，`:71`，用处在 `:219`），CPR4 用的 `cpr3_read_fuse_param()` 本体在
-   `cpr3-regulator.c`，没归档 ⇒ 要么先把那份补上（带 sha256），要么把这一行读数标成「按 gfx-ldo 的行距读，stride 未经 CPR4 那份文件证实」。
-   仍**一个位也不写**。
+   **两个前提**：(a) 这需要一个新映射（`0x00784000` 不在现有 GPUCC 窗口内），`IODeviceMemory::withRange` 计数=3
+   那枚针要按「DT 声明的第二段窗口（`reg-names = "fuse_base"`）」这一条理由**主动**抬到 4，不是顺手加；
+   (b) 行距的问题**当天就结掉了**——`cpr3_read_fuse_param()` 的本体不在 `cpr3-regulator.c`（那份 6472 行里没有它，
+   `cpr3-regulator.h:959` 那个是 `#else` 桩，直接返回 `-EPERM`），而在 **`cpr3-util.c:195`**（同仓同分支，已归档
+   `notes/sources/sdm660/cpr3-util.c`，sha256 `2f3c672d0142…`）：`BYTES_PER_FUSE_ROW 8`（`:24`）、
+   `readq_relaxed(fuse_base_addr + param->row * BYTES_PER_FUSE_ROW)`（`:219-220`）、取段 `(fuse_val >> bit_start) & ((1<<bits)-1)`
+   并从低位往高拼接、`{0,0,0}` 结束（`:210-226`）——与 `msm_gfx_ldo.c:219` 那份逐字一致，所以**两个文件互为佐证**。
+   换算也在同一份里：`cpr3_convert_open_loop_voltage_fuse()`（`:244-251`）取 MSB 作符号位，
+   `uV = ref_volt + sign * steps * step_volt`，本板 `fuse_len = SDM660_MMSS_VOLTAGE_FUSE_SIZE = 5`、`step = 10000`（`:125`/`:127`）。
+   于是三枚行的字节偏移是确定的：**row 65 → +0x208、row 71 → +0x238、row 73 → +0x248**（各 8 字节，全在
+   `<0x00784000 0x1000>` 内）。仍**一个位也不写**。
 6. **两处驱动注释比这份笔记更严，已改口。** `drivers/CloverGpu/GpuRegs.h` 与 `CloverGpu.cpp` 都写过「0x20 在那份文件里没有名字」，
    而 `register_str[]`（`:240-251`）第 9 项——索引 8 ⇒ 偏移 `8*4 = 0x20`——就叫 **`LDO_STATUS0`**（`:249`）；
    准确的说法是「**有 dump 名字、没有 `#define`**」。`0x24` 反过来：有 `#define LDO_STATUS1_REG`（`:54`）而**没有位名**，
