@@ -23131,3 +23131,72 @@ st=… fl=… rc=… want=… seen=… entry=…`，同一次 fire 一行。task
 时钟/电源前提（`cxo`/`rbcpr` 那类），本轮一个都不碰，真需要就会读成 `rc=0 而 st<5`；
 副核上线会不会引入新的复位形状（桌面主线那一格本来就有八条静默复位），这轮不预判。
 桌面仍是 CPU-first：这一支改的是等的那台机器有几颗核，不是等谁。
+
+## Round299 读数（boot 88，v0.7.3）：**副核上线了，八颗都在收 IPI；而那一拍的尾巴在 r299 行之后没了**
+
+**① 主问「上了没」，答：上了。** `clover r271: cpu t=835 real=8 max=8 reg=8 start=7 run=8 s=01111111
+r=11111111 tm=59695,43260,35219,25964,18180,11705,4748,5073`。boot 87 那一格是 `real=1 max=8 reg=1
+start=0 run=1 s=00000000 r=10000000 tm=237841,0,0,…`。八颗全注册、七颗被请求、八颗 running，
+而且**八颗都数到了自己的 architectural timer**（最小的那颗也走了 5073 拍）——不是「上线躺着」。
+
+**② 新那行逐字段归名。** `clover r299: smp t=835 req=1 con=1 run=7 st=07777777 fl=00000000
+rc=0,0,0,0,0,0,0,0 want=0,1,2,3,100,101,102,103 seen=0,80000001,80000002,80000003,80000100,80000101,
+80000102,80000103 entry=0,a3203000,a3203000,a3203000,a3203000,a3203000,a3203000,a3203000`。
+按预登记逐条落：`req=1` ⇒ `armcpu-smp=1` 真到了驱动（不再靠 args 表推断）；`con=1` ⇒ `psciConduit()`
+读到了 `/psci method=smc`，与 panic 屏每年用的 `SYSTEM_RESET` 同一 conduit，仪器坏了那一支没出现；
+`rc=0`×7 ⇒ 固件七次都答应——**「引导加载器是否允许 Non-Secure 发 `CPU_ON`」这条 ⑨ 里没证的，
+现在证了**；`st=07777777` ⇒ 七颗都走到 7（running），最左那个 `0` 是 boot 核那一格，它不走这条路径；
+`fl=00000000` ⇒ 没有一颗触发驱动自己的失败位。
+
+**`want=`/`seen=` 的差不是不一致，是 MPIDR 的高位标志。** 驱动自己那句比较取低 16 位
+（`drivers/ArmCpu/ArmCpu.cpp:590`：`(mpidr & 0xffff) != (affinity & 0xffff)`，不相等就 `fl=1` 并 `wfe` 死等），
+`seen=0x80000001` 的低 16 位是 `0x0001` 对 `want=1`，`0x80000100` 对 `want=0x100`；多出来的
+`0x80000000` 是 MPIDR 的 Aff3-valid 位，既不在 ADT 的 `reg=` 里也不在那句比较的掩码里 ⇒ **七颗就是那七颗**。
+`seen[0]=0` 与 `entry[0]=0` 同属「没人写过」而不是「读到 0」：boot 核不经过 `initCPU()`/`startCPU()`。
+`entry=a3203000` 七颗同值＝内核物理复位向量（PSCI `CPU_ON` 的正确入口），且 `fl≠9 rc≠-1002`
+⇒ `ml_static_vtop()` 没递 0，本轮自己加的那枚短路没触发（它的正对照仍是「触发时会印 `fl=9 rc=-1002`」）。
+
+**③ 「有没有被用上」同拍就答了，而且是另一枚仪器。** `clover r270: ipi t=835 sent=344711 recv=344557
+tick=203770 sgi=72687,70129,60763,52767,31488,25582,17658,13580` —— boot 87 是 `sent=0 recv=0
+sgi=0,0,0,0,0,0,0,0`。**八颗核各收过 1.3 万～7.3 万笔 IPI**，`sent-recv=154`。⇒ 「核上线」与「调度器
+用它们」是两个独立读数，这靴两个都亮；`armcpu-self-ipi=1` 作为**使能项**（`machine.c` 只在本核收到
+第一笔 IPI 才清 `SIGPdisabled`）被读数接住，不是被假设接住。
+
+**④ 桌面主线：八个核没把那条链顶开。** 同拍 `clover r262: census t=835 pid=58 threads=17 shown=17
+hidden=0 wait=17 run=0 rx=9`（boot 87：`threads=18 wait=16 run=2`），`r229: bb … hops=3 wait=6`、
+`r229: sbport … nm=3707 cnt=0 ql=6 sr=1` ⇒ backboardd 仍全员在等。**这一格从此有了反证**：
+那笔没人回音的信不是「一颗核忙不过来」——多核不是桌面这一格的解，别把它写进修复清单。
+
+**⑤ 那一拍的尾巴没上卡，而这恰好是不能读成「没发生」的那一种 0。** 环里最新一枚槽是 `slot 351 …
+seq 1887`（r299 行），boot 87 同一拍的下一格本该是 `clover r262: th`（顺序：`r229 bb` → `r229 sbport`
+→ `r234 sbown` → `r262 census` → `r270` → `r271` → `r262 th`×N → `r296/r298`）。本靴 `clover r296:`
+与 `clover r298:` 各 **0 行**、`clover r262: th` **0 行**，而这三类都在 per-pass 推送上限的**豁免**列里，
+卡上也没有任何一条 `capped at` 通知点名它们（本窗只点名 r153/r155/r170-open/r181/r187/r189）⇒
+「被闸掉」需要一次**没有通知的**丢弃，而那正是 r249/r251 已经修掉的缺陷形状。两种读法里我按 supported
+的那条写：**写流在这里停了**。但要如实记：**这一枚仪器分不清「fire 被中途打断」与「fire 少打了一半」**，
+因为一次 fire 没有「打完」的标记。这是 r299 名下的新仪器债：给 fire 加一条尾部自证（`done=` 计数
+或在 r299 行里带 fire 序号），否则下一靴的「链行没出现」还是只能靠豁免列反推。
+
+**⑥ 结局：第九起静默无 panic 复位，也是这一族目前最早的一靴。** boot 88 名下 kind-20 记录 **0 条**
+（窗里 16 条全属 boots 52/53/54/55/56/58/59/60/61/62/65/66/74/76/84/87）、没有 boot 88 的死线记录
+（卡上那枚仍是 boot 87 的 `t=1802871 ms`，解码器印 STALE）、没有 boot 88 的 sink 标记（那枚
+`panic seq 0 … boot=0 gates=0x0()` 是一枚没写过的槽）。下界由内核环最后一行给（**835.009 s**），
+上界由宿主的落地读回给（18:58 冷刷＋重启，19:14:16 拉卡，扣掉 TWRP 自己起来的约 40 s ⇒ **≈9xx s**）。
+带因此是九条：718/1184/1248/1335/997/707/1681/1712–1800/**本靴 835–9xx**。
+**八颗核上线之后，这一族的结局比 v0.7.0–v0.7.2 那四靴早了一大截**（那四靴要么跑到死线，要么在 1681 s
+之后）——这是一靴的观察，不是结论：负载（r294b 已证不是变量）、镜像（boot 85 已证不是变量）、
+核数（本轮刚变）三个里只剩这一个没被排除，下一支要么复跑同一枚镜像作控制，要么把它当变量测。
+
+**⑦ 其余仪器照旧。** WDT 两拍 `en=0 armed=0 why=ctrl`（t=503/743，**连续第十二靴**排除 APSS）；
+keystore `stage=3` `opens 9→25`、`calls 29→79`、`refused=0`；I2C `verdict=102` 两拍同值；GPU 两拍
+`w1c=80000038 w24=0000000d` 其余全 0（按 §5.12 读作符合本板 DTB 配置，不是一张故障票）；
+`dma deadline` 本窗 **0 笔**（boot 87 1 笔）；`tee seen=3196 kept=783 throttled=58`（lap 2）；
+`clover r283: last reset unnamed …` 又一条（那条通道归别人，r294 已定名）；落地快照第七次
+`charger_temp=327 temp=250 die_health=Cool status=Charging capacity=100 voltage_now=4342518`、
+`rawdump` 头第七次全 0。
+
+**⑧ 产物。** `~/clover-out/round299-log-window.bin`（623,104 B）与解码 `…bin.txt`
+（16 report / 64 verdict / 13 probe / 512 kernel，boot 88）、`…landing-sensors.txt`、
+`…landing-rawdump-head.bin`、刷前对照 `…pre-flash`（与 `round298-log-window.bin` 逐字节相同，已核）、
+`r299-boot88-unattended.log`（`unattended-exit=0`）。镜像 `round299-v0.7.3-payload.img`
+（sha256 `fda745f853bf2604875feeec35754757ab84570a11e2e2363e61a3eb081b035d`）。
