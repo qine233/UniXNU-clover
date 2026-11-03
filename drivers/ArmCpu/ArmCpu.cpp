@@ -48,13 +48,23 @@ static bool gSpiIpi = false;                // boot-arg armcpu-spi-ipi=1: IPIs a
 static bool gSelfIpi = false;               // boot-arg armcpu-self-ipi=1: every core sends itself SGI 0 from initCPU
 volatile uint32_t armcpu_irq_phase = 0,armcpu_irq_id = 1023;
 volatile uint32_t armcpu_quiesce_calls = 0,armcpu_halt_calls = 0;
-// Secondary-CPU bring-up evidence (sheng-smp=1). Step values: 1 nub started, 2 registered, 3 start thread running,
+// Secondary-CPU bring-up evidence (armcpu-smp=1). Step values: 1 nub started, 2 registered, 3 start thread running,
 // 4 PSCI CPU_ON issued, 5 entered initCPU on the new core, 6 GIC redistributor ready, 7 running.
+// Round299 renames this gate into the armcpu-* family the rest of this driver already reads (armcpu-skip-gic,
+// armcpu-timer-intid, armcpu-clock-panic, armcpu-self-ipi, armcpu-spi-ipi, armcpu-diagnostics). The whole path was
+// already here -- probe() recognises the other seven nubs, finishSecondary() registers them with XNU, startCPU()
+// asks the firmware to power them and the new core arms its own redistributor -- and one boot-arg named after a
+// different board has kept every step of it dark while round271's census row printed `real=1 max=8 reg=1 start=0`
+// eleven boots in a row.
 volatile uint32_t armcpu_smp_requested = 0, armcpu_smp_running = 0, armcpu_smp_conduit = 0;
 volatile uint32_t armcpu_smp_step[8], armcpu_smp_mpidr[8], armcpu_smp_seen_mpidr[8], armcpu_smp_fail[8], armcpu_boot_mpidr = 0;
 // System registers seen on each secondary core at initCPU entry: CurrentEL, SCTLR_EL1, TCR_EL1, MAIR_EL1 (low words), MIDR_EL1.
 volatile uint32_t armcpu_smp_sys[8][5], armcpu_boot_sys[5];
 volatile int32_t armcpu_smp_psci_rc[8];
+// Round299: PSCI CPU_ON is a three-argument call and -4 is a verdict about the second one. A row carrying only the
+// return code cannot tell "this firmware refuses to power a core" from "it does not know that address", so the entry
+// point actually handed to the conduit is recorded next to the affinity it was aimed at (armcpu_smp_mpidr[]).
+volatile uint64_t armcpu_smp_entry[8];
 }
 
 #define ARMCPU_SMP_SLOTS 8
@@ -205,7 +215,7 @@ static bool gSmpWanted = false;
 // the boot nub, or a late secondary once the boot CPU is registered, finishes them.
 static class ArmCpu *volatile gPending[ARMCPU_SMP_SLOTS];
 static volatile uint32_t gBootRegistered = 0;
-static bool gRemoteGic = false; // sheng-smp-gic=1: the boot CPU prepares a new core's redistributor before CPU_ON
+static bool gRemoteGic = false; // armcpu-smp-remote-gic=1: the boot CPU prepares a new core's redistributor before CPU_ON
 
 // Shared peripheral interrupts (GICv3 SPIs, INTID 32..1019). A driver attaches a handler for one INTID; the line is set to
 // Group 1 non-secure, priority 0xa0, the given trigger and routed to the boot CPU (GICD_IROUTER, affinity routing is on),
@@ -234,9 +244,9 @@ IOService *ArmCpu::probe (IOService *provider, SInt32 *score)
   memcpy (&id, reg->getBytesNoCopy (), sizeof (id));
   if (ml_get_cpu_number (id) != ml_get_boot_cpu_number ()) {
     unsigned smp = 0;
-    PE_parse_boot_argn ("sheng-smp", &smp, sizeof (smp));
+    PE_parse_boot_argn ("armcpu-smp", &smp, sizeof (smp));
     if (smp == 0 || ml_get_cpu_number (id) < 0 || ml_get_cpu_number (id) >= ARMCPU_SMP_SLOTS) {
-      return nullptr; // Secondary startup is opt-in (sheng-smp=1).
+      return nullptr; // Secondary startup is opt-in (armcpu-smp=1).
     }
   }
   return IOCPU::probe (provider, score);
@@ -464,10 +474,10 @@ bool ArmCpu::start (IOService *provider)
   setCPUNumber (info.log_id);
   armcpu_registered = 1;
   unsigned smp = 0;
-  PE_parse_boot_argn ("sheng-smp", &smp, sizeof (smp));
+  PE_parse_boot_argn ("armcpu-smp", &smp, sizeof (smp));
   gSmpWanted = smp != 0;
   unsigned remote = 0;
-  PE_parse_boot_argn ("sheng-smp-gic", &remote, sizeof (remote));
+  PE_parse_boot_argn ("armcpu-smp-remote-gic", &remote, sizeof (remote));
   gRemoteGic = remote != 0;
   armcpu_smp_requested = gSmpWanted ? 1 : 0;
   unsigned cpuCount = static_cast<unsigned> (ml_get_max_cpu_number ()) + 1;
@@ -878,6 +888,14 @@ kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
   // PSCI 0.2 CPU_ON (SMC64 function id); the entry point is the kernel's physical reset vector page, whose reset
   // code selects this core's cpu_data entry by MPIDR affinity. The context id is unused by that code.
   uint64_t entry = static_cast<uint64_t> (ml_static_vtop (reinterpret_cast<vm_offset_t> (LowResetVectorBase)));
+  armcpu_smp_entry[logicalId] = entry;
+  if (entry == 0) {
+    // -4 from the firmware would be true but would be about an address we handed it, not about this board. The
+    // driver owns that failure, so it is recorded as its own code rather than sent to PSCI as address 0.
+    armcpu_smp_fail[logicalId] = 9;
+    armcpu_smp_psci_rc[logicalId] = -1002;
+    return KERN_FAILURE;
+  }
   cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
   cleanToMemory (ResetHandlerData, 0x1000);
   cleanToMemory (const_boot_args, 0x1000);

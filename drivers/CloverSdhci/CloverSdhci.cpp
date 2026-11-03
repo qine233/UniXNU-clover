@@ -881,6 +881,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // bytes, longer once the per-cpu timer counters grow), and twenty fires inside the 1800 s deadline is
   // half of 64 -- the same headroom the last two rounds were given.
   { "clover r271: ", "r271-cpu", 64, 0, 0, 0 },
+  // Round299 prints one row per census fire, beside r271's: the cpu row says how many cores XNU has, this one
+  // says what this board's CPU driver did about it. Sixteen numbers per core would be a lot of rows if it were
+  // one per thread, but it is not -- the arrays are global, so a fire costs exactly one row, and twenty fires
+  // inside the 1800 s deadline is the same half of 64 r270 and r271 were given.
+  { "clover r299: ", "r299-smp", 64, 0, 0, 0 },
   // Round272 spends a class on a line the kernel already prints, because the question boot 58 left
   // open is exactly "did XNU try": cpu_start() speaks once per attempted cpu, seven attempts is the
   // whole story of this board, and a class that never fills is itself the reading. 16 leaves room
@@ -4335,7 +4340,14 @@ static void teeConsumeLine (uint32_t &pushed)
        // r298 makes that worse and better at once: worse because boot 86 showed qmc=/qsr= are printed
        // by the same translation that produced rvobj, so a lost row leaves a zero nobody can attribute;
        // better because tlink= needs no translate on this hop's side, so the row is worth exempting.
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r298"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r298") ||
+       // Round299 prints from inside the same census burst, one row per fire, and it is the row that carries
+       // the whole mechanism: req=/st=/fl=/rc= are what separates "the gate never opened" from "the gate
+       // opened and the firmware said no" from "the core came up and its redistributor did not". With the cap
+       // in front of it, a boot whose secondaries were asked for would return nothing at all and read like a
+       // boot that never reached the next fire -- the same false-empty r249's census was exempted for, and
+       // the class budget of 64 still bounds it.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r299"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

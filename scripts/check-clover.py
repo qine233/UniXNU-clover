@@ -3729,6 +3729,100 @@ def check_board(errors: list) -> str:
                               "edits the lines r297 wrote, so a tree without them makes it fail to apply -- "
                               "and an earlier apply failure here is silent")
 
+        # Round299 brings the secondary cores up. Boot 87's r271 row read real=1 max=8 reg=1 start=0 on both
+        # fires, which is the kernel saying it has one cpu while its own device tree counts eight: the topology
+        # parsed, MAX_CPUS is eight, and nobody asked. The asking has been in this repo's vendored ArmCpu copy
+        # the whole time behind a boot-arg named after another board, so the round is a rename, two arguments,
+        # and one row that prints what that driver knows on the census's own beat -- because a state the driver
+        # spoke once before the first tick is already outside the ring's horizon by the time the card is read
+        # (boot 59 measured exactly that shape for r272), and because PSCI's -4 is a verdict about the address
+        # this driver handed it, which cannot be attributed unless the address is on the card too.
+        r299_name = "z" * 58 + "-clover-r299.patch"
+        r299_patch = next((base / "patches/xnu-clover" / r299_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r299_name).is_file()), None)
+        if r299_patch is None:
+            errors.append(f"patches/xnu-clover/{r299_name} is missing: without the row the boot would say "
+                          "whether cores came up but never why they did not, which is the shape that left "
+                          "boot 87's reg=1 with no mechanism beside it")
+        else:
+            r299_text = r299_patch.read_text()
+            r299_added = "".join(line for line in r299_text.splitlines(True)
+                                 if line.startswith("+")
+                                 and not line.lstrip("+").lstrip().startswith(("*", "/*")))
+            for needle in ('"clover r299: smp t=%llu req=%u con=%u run=%u"',
+                           '" st=%u%u%u%u%u%u%u%u fl=%u%u%u%u%u%u%u%u"',
+                           '" rc=%d,%d,%d,%d,%d,%d,%d,%d"',
+                           '" want=%x,%x,%x,%x,%x,%x,%x,%x seen=%x,%x,%x,%x,%x,%x,%x,%x"',
+                           '" entry=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx\\n"',
+                           'extern volatile uint64_t armcpu_smp_entry[8];',
+                           'extern volatile int32_t armcpu_smp_psci_rc[8];',
+                           'armcpu_smp_step[7],',
+                           'armcpu_smp_fail[7],'):
+                if needle not in r299_text:
+                    errors.append(f"{r299_name} lacks {needle[:72]!r}: step, stop, return code, targeted "
+                                  "affinity, seen affinity and the entry point are six different faults, and "
+                                  "a row that prints fewer than all six cannot say which one this boot hit")
+            if 'printf("clover r271:' in r299_added:
+                errors.append(f"{r299_name} reprints the r271 cpu row: it is additive, and boots 58 to 87 are "
+                              "compared against that row column by column")
+            if 'clover r298' in r299_added:
+                errors.append(f"{r299_name} touches the r298 identity row: this round is about cores, not "
+                              "ports, and boot 87's tlink= reading has to survive it unchanged")
+            for forbidden in ("thread_block(", "simple_wait(", "lck_mtx_lock(", "proc_lock("):
+                if forbidden in r299_added:
+                    errors.append(f"{r299_name} calls {forbidden}: the census prints beside a wedged userland "
+                                  "and reads counters that a driver thread maintains -- a blocking read here "
+                                  "changes the boot being measured")
+            load_r299 = REPO.parent / "UniXNU" / "patches" / "xnu" / r299_name
+            if not load_r299.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r299_name} is missing: unixnu loads patches from there "
+                              "and silently skips one that lives only in this repo")
+            elif load_r299.read_bytes() != r299_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r299_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+            late_script = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in late_script.splitlines() if "clover-r2" in line)
+            if (late_list.find(r299_name) < 0 or
+                    late_list.find(r299_name) > late_list.find("z" * 57 + "-clover-r298.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r299 before r298 in LATE_PATCH: the "
+                              "row is written against a tree that carries r271 and r298, and an apply failure "
+                              "here is silent")
+        armcpu_source = (REPO / "drivers/ArmCpu/ArmCpu.cpp").read_text()
+        if "sheng-smp" in armcpu_source:
+            errors.append("drivers/ArmCpu/ArmCpu.cpp still gates secondary startup on sheng-smp: a switch "
+                          "named after another board is a switch nobody reading this board's boot-args will "
+                          "find, which is how reg=1 of max=8 survived eleven boots")
+        for needle in ('PE_parse_boot_argn ("armcpu-smp", &smp, sizeof (smp));',
+                       'PE_parse_boot_argn ("armcpu-smp-remote-gic", &remote, sizeof (remote));',
+                       'volatile uint64_t armcpu_smp_entry[8];',
+                       'armcpu_smp_entry[logicalId] = entry;',
+                       'armcpu_smp_fail[logicalId] = 9;'):
+            if needle not in armcpu_source:
+                errors.append(f"drivers/ArmCpu/ArmCpu.cpp lacks {needle[:60]!r}: the gate, the entry-point "
+                              "record and the driver's own vtop failure are what the census row reads, so a "
+                              "rename that stops short of them leaves the row printing zeros that mean "
+                              "nothing")
+        if '{ "clover r299: ", "r299-smp", 64, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the r299 row: an unclassed producer of one row "
+                          "per census fire falls into the unclassed flow and is throttled with the chatter")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r299")' not in sdhci_source:
+            errors.append("the r299 row is not exempt from the per-pass push cap: a capped row is a boot whose "
+                          "secondaries read as never asked-for, which is the false-empty r249's census was "
+                          "exempted for")
+        for argument in ("armcpu-smp=1", "armcpu-self-ipi=1"):
+            if argument not in board["payload"]["kernel_args"]:
+                errors.append(f"kernel_args omits {argument}: the driver's secondary path is opt-in, so a "
+                              "round that renames the switch without passing it changes no hardware at all")
+        if any(argument.startswith("armcpu-spi-ipi") for argument in board["payload"]["kernel_args"]):
+            errors.append("kernel_args passes armcpu-spi-ipi: GICD_TYPER=0x7b04f3 puts this board's last SPI "
+                          "at INTID 671 and the driver's software-IPI base is 1008..1015, so that switch runs "
+                          "against numbers this controller does not implement")
+        if any(argument.startswith("armcpu-smp-remote-gic") for argument in board["payload"]["kernel_args"]):
+            errors.append("kernel_args passes armcpu-smp-remote-gic: this round lets each new core arm its own "
+                          "redistributor, which is the branch that has a wakeRedistributor(true) reading; "
+                          "flipping both at once would fold two faults into one")
+
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -5030,8 +5124,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r298:"):
-        errors.append('[payload] title is not "clover r298: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r299:"):
+        errors.append('[payload] title is not "clover r299: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -6159,8 +6253,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r298:"):
-        errors.append('[payload] title is not "clover r298: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r299:"):
+        errors.append('[payload] title is not "clover r299: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

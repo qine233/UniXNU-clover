@@ -109,17 +109,25 @@ leave」一路收紧到一句可测的话：
   「何时结束」仍是分布。WDT 两拍 `en=0 armed=0`（连续第十一靴排除 APSS）、keystore `opens 44→49 calls 165→186`
   四枚 selector 全 `rc=0`、GPU 三拍照常、`dma deadline` 降到 1 笔、`r283`/`tee seen` 本窗 0 行按「环窗外」读
   （环覆盖 `t=1444.5…1815.1`）、落地快照第六次（`charger_temp=322`）且 `rawdump` 头第六次全 0。
-* **下一支（r299，按用户指定先做）**：把副核放起来。整套代码已在 `drivers/ArmCpu/ArmCpu.cpp` 里——
-  `probe()` 认第二颗 nub（`:226-241`，被 `sheng-smp` 关着）、`finishSecondary()` 调 `ml_processor_register()`
-  （`:512`）、`startCPU()` 打 **PSCI 0.2 `CPU_ON`**、入口是内核物理复位向量并先 `cleanToMemory` 那一页
-  （`:872-885`）、新核自己 `wakeRedistributor`+`enableGic`+装 IPI handler（`:573-598`）。前置条件本机都在：
-  ADT 的 `/cpus` 是 8 颗、`reg=0x0-0x3,0x100-0x103` 与归档 `sdm660.dtsi` 的 Kryo 260 MPIDR 逐位一致，`/psci`
+* **r299（v0.7.3，按用户指定「把多核修了」已发出，等 boot 88 读回）：副核不缺代码，缺的是一枚用别人板子
+  命名的开关**。整套路径一直在 `drivers/ArmCpu/ArmCpu.cpp` 里——`probe()` 认第二颗 nub（`:226-241`）、
+  `finishSecondary()` 调 `ml_processor_register()`（`:512`）、`startCPU()` 打 **PSCI 0.2 `CPU_ON`**
+  （SMC64 `0xc4000003`，入口是内核物理复位向量、先 `cleanToMemory` 那一页，`:872-885`）、新核自己
+  `wakeRedistributor` + `enableGic` + 装 IPI handler 并把 `armcpu_smp_step` 数到 5/6/7（`:573-598`）——
+  挡着它的那枚 boot-arg 写作 `sheng-smp`（这枚驱动的来源板），本板 args 里没人会去找它，于是 `reg=1`
+  活了十一靴。r299 把它改名进 **`armcpu-smp`** 家族并与 `armcpu-self-ipi=1` 一起传上：后者不是假设而是
+  **使能项**（`osfmk/kern/machine.c` 只在一根核收到第一笔 IPI 时才清 `SIGPdisabled`，所以「IPI 从未被请求」
+  那格有一半是它）。`armcpu-spi-ipi` 继续不传——硬编码的 `1008..1015` 确实超读本板（`typer=0x7b04f3`
+  ⇒ ITLinesNumber=19 ⇒ SPI 只到 INTID 671），而 self-IPI 走 SGI 0，不吃这条限制。另一枚先前挡路的疑虑
+  也排掉了：BCM2837 未定义 `HAS_CLUSTER`，拓扑按 `phys_cluster_id` 把 8 颗全归 cluster 0
+  （`machine_routines.c:1094-1103`），`MAX_CPU_CLUSTERS=1` 的 `assert` 踩不到。前置条件本机都在：ADT 的
+  `/cpus` 是 8 颗、`reg=0x0-0x3,0x100-0x103` 与归档 `sdm660.dtsi` 的 Kryo 260 MPIDR 逐位一致，`/psci`
   带 `method=smc`（正是 `psciConduit()` 读的那枚属性），而这板的 PSCI conduit **每年都在被 panic 屏用作
-  `SYSTEM_RESET`**——那是现成的正对照。两枚先前挡路的疑虑现在都排掉了：BCM2837 未定义 `HAS_CLUSTER`，
-  拓扑把 8 颗全归 cluster 0，`MAX_CPU_CLUSTERS=1` 的 `assert` 踩不到（`machine_routines.c:1094-1103`）；
-  硬编码的 SPI-IPI 号 `1008..1015` 确实超读本板（`typer=0x7b04f3` ⇒ ITLinesNumber=19 ⇒ SPI 只到 INTID 671），
-  但那属于 `armcpu-spi-ipi`，我们要用的 `armcpu-self-ipi` 走 SGI 0。判据与基线：boot 87 的
-  `clover r271: cpu … real=1 max=8 reg=1 start=0 run=1` 就是「修之前」那一格。
+  `SYSTEM_RESET`**——那是现成的正对照。仪器侧新增 `clover r299: smp …` 行，打在**同一拍普查里、紧接
+  r271 那行下面**（不是一次性打印，环地平线内每靴可回溯），每颗核六个能各自归名的字段
+  `st=/fl=/rc=/want=/seen=/entry=`；`entry=` 专为 `rc=-4`（`INVALID_ADDRESS`）而加——固件说地址坏，
+  与我们自己 `ml_static_vtop` 递出 0（后者现在短路成 `fl=9 rc=-1002`），两件事从此分得开。
+  「修之前」那一格仍是 boot 87 的 `clover r271: cpu … real=1 max=8 reg=1 start=0 run=1`。
 * **再后一支（本格欠的两条仪器债）**：`vbits=`（`ipc_right_lookup_read()` 已经交出的 entry 位掩码，
   用来分 port set / send-once，不需要对象、锁纪律与 translate 同一条）与 `qmc=/qsr=` 自带返回码。
 * **那笔「等设备解锁」的死等已经不是现场，但它的机制现在读全了**：r274 命中的形状是
@@ -136,10 +144,11 @@ leave」一路收紧到一句可测的话：
 * **keystore 已发布并测到**（`NativeKeyStoreEvents` + `CloverKeyStoreProbe`，回答「无 keybag、开机即解锁」）：
   boot 82 的 `clover r281: aks` 行 `opens=22→27 calls=80→99 refused=0`——**有人在开、有人在读、一个都没被拒**；
   桌面仍未出，欠的回音现在指向链路的下一跳。`MKBDeviceUnlockedSinceBoot()` 在本板到底答什么，宿主读不出来（空的）。
-* **单核已坐实，且下一支就要改它**：内核 `CpuDataEntries` 只注册一颗核，副核从未被 start。boot 87 给的是
-  这一格的基线读数：`clover r271: cpu … real=1 max=8 reg=1 start=0 run=1 s=00000000 tm=237841,0,0,0,0,0,0,0`
-  ——**拓扑数到 8 颗（`max=8`），注册只有 1 颗（`reg=1`）**，所以缺的不是设备树也不是 `MAX_CPUS`，
-  是「谁去放副核」那一步（r299：`drivers/ArmCpu` 里那条被 boot-arg 关着的 PSCI `CPU_ON` 路径）。
+* **单核已坐实，r299 已经去改它（等 boot 88 读回）**：内核 `CpuDataEntries` 只注册一颗核，副核从未被 start。
+  boot 87 给的是这一格的基线读数：`clover r271: cpu … real=1 max=8 reg=1 start=0 run=1 s=00000000 tm=237841,0,0,0,0,0,0,0`
+  ——**拓扑数到 8 颗（`max=8`），注册只有 1 颗（`reg=1`），而 7 颗从未被请求（`start=0`）**，所以缺的不是
+  设备树也不是 `MAX_CPUS`，是「谁去放副核」那一步的开关（`drivers/ArmCpu` 里那条被 `sheng-smp` 关着的
+  PSCI `CPU_ON` 路径；r299 把它改名成 `armcpu-smp` 并传上，见上面那条）。
 * **第二道坎（间歇）**：部分靴子在 726–1420 s 被一条致命 `Kernel data abort` 提前掐掉，boot 74 崩在
   `_memmove`、boot 75 崩在 `IOSKArena::unmap` 的 cold 分支（两靴 `lr` 同一个值；boot 48/67 曾活到死线没犯）。
   r286 的 GPU 写被排除（GPU 行先干净打完，异常在完全不同的代码里）。**「同一 caller」这句话在落盘时要收回一半**：
@@ -329,9 +338,12 @@ r292 把 WDT 的地平线换细以后 boot 79/80/81/82 都排除了 APSS watchdo
 
 - 上表只有 **1** 挡住桌面；**6** 是 1 最可能的病根（尚未证，桌面仍 CPU-first）；**2–4** 挡住板级功能；
   **5** 是已定名的噪声。静默无 panic 复位是**独立的一道坎**（见上表后的说明），不是主线症状。
-- **多核**：本板至今单核（boot 87 的 `clover r271: cpu … real=1 max=8 reg=1 start=0 run=1`——拓扑数到 8 颗、
-  只注册了 1 颗）。整套放核代码在我们自己的 `drivers/ArmCpu` 里，被一枚 boot-arg 关着，r299 就是放它。
-  它不挡「进桌面」这句话里的逻辑，但一核跑 iPadOS 17 迟早要还。
+- **多核**：boot 88 之前，本板仍是单核——上一格读数是 boot 87 的 `clover r271: cpu … real=1 max=8 reg=1
+  start=0 run=1`（拓扑数到 8 颗、只注册了 1 颗、副核从未被请求）。放核的整套代码在我们自己的
+  `drivers/ArmCpu` 里，被一枚写作 `sheng-smp` 的 boot-arg 关着；r299 把它改名成 `armcpu-smp` 并传上，
+  加 `armcpu-self-ipi=1`，另加每拍重播的 `clover r299: smp …` 行。**这份清单要等 boot 88 才能勾**：
+  固件答 `DENIED`、或大核缺时钟/电源前置，都还在外面。它不挡「进桌面」这句话里的逻辑，
+  但一核跑 iPadOS 17 迟早要还。
 - **payload 容器不逐字节可复现**：ADT 的 `/chosen/random-seed` 每次重抽（内核本身可复现）。
 - **构建顺序反着**：`unixnu` 先跑 archives 再跑 XNU，身份戳会删掉 object，让 `nm` 失败；r186 起用一次性 object 预 pass 绕过，没有修。
 - **补丁回放名单手写**：新增补丁若碰到排序在前那条的上下文，必须手动加进 `build-xnu-4k-baseline.sh` 的「先反向」名单。

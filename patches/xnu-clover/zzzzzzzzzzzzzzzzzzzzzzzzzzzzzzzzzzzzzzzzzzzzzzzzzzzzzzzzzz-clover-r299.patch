@@ -1,0 +1,69 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -542,6 +542,24 @@
+ extern volatile uint64_t armcpu_timer_interrupts;
+ extern volatile uint32_t armcpu_core_sgi[8];
+ extern volatile uint32_t armcpu_core_timer[8];
++/*
++ * Round299. The secondary bring-up path lives in this board's ArmCpu copy and its whole memory is a set of
++ * driver-side arrays: how far each core got (step), why it stopped (fail), what the firmware answered the
++ * power call with (psci_rc), which entry point the driver handed it (entry), and the affinity the driver aimed
++ * at beside the MPIDR the new core actually reported. round271's row already says what XNU believes (reg,
++ * start, run); only these say why. They are printed here rather than from the driver because the census is the
++ * thing that re-states itself every fire -- a line the driver spoke once, before the first tick, would already
++ * have been outside the ring's horizon by the time the card is read (round272 measured exactly that).
++ */
++extern volatile uint32_t armcpu_smp_requested;
++extern volatile uint32_t armcpu_smp_running;
++extern volatile uint32_t armcpu_smp_conduit;
++extern volatile uint32_t armcpu_smp_step[8];
++extern volatile uint32_t armcpu_smp_mpidr[8];
++extern volatile uint32_t armcpu_smp_seen_mpidr[8];
++extern volatile uint32_t armcpu_smp_fail[8];
++extern volatile int32_t armcpu_smp_psci_rc[8];
++extern volatile uint64_t armcpu_smp_entry[8];
+ extern void workq_proc_suspended(struct proc *p);
+ extern void workq_proc_resumed(struct proc *p);
+ extern struct proc *kernproc;
+@@ -13456,6 +13474,41 @@
+ 			    (unsigned long long)ctm[2], (unsigned long long)ctm[3],
+ 			    (unsigned long long)ctm[4], (unsigned long long)ctm[5],
+ 			    (unsigned long long)ctm[6], (unsigned long long)ctm[7]);
++			/*
++			 * Round299. Same fire, immediately under the row above: reg=1 of max=8 is the question, and
++			 * this is the answer's mechanism. st= is step per logical core (1 nub started, 2 registered with
++			 * XNU, 3 start thread ran, 4 CPU_ON handed to the firmware, 5 entered initCPU, 6 redistributor
++			 * up, 7 running); fl= is why a core stopped short (1 wrong MPIDR, 2 its own GICR never came up,
++			 * 3 the boot core could not pre-arm it, 4 XNU refused the registration, 9 the driver's own
++			 * vtop of the reset vector came back 0); rc= is PSCI's return code per core, with -1001 meaning
++			 * the /psci node never named a conduit and -1000 meaning no start thread. want= and seen= are
++			 * the affinity the driver targeted and the MPIDR the core reported, so a step=5 with the two
++			 * disagreeing is a device-tree reading rather than a firmware one.
++			 */
++			printf("clover r299: smp t=%llu req=%u con=%u run=%u"
++			    " st=%u%u%u%u%u%u%u%u fl=%u%u%u%u%u%u%u%u"
++			    " rc=%d,%d,%d,%d,%d,%d,%d,%d"
++			    " want=%x,%x,%x,%x,%x,%x,%x,%x seen=%x,%x,%x,%x,%x,%x,%x,%x"
++			    " entry=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx\n",
++			    (unsigned long long)secs, armcpu_smp_requested, armcpu_smp_conduit,
++			    armcpu_smp_running,
++			    armcpu_smp_step[0], armcpu_smp_step[1], armcpu_smp_step[2], armcpu_smp_step[3],
++			    armcpu_smp_step[4], armcpu_smp_step[5], armcpu_smp_step[6], armcpu_smp_step[7],
++			    armcpu_smp_fail[0], armcpu_smp_fail[1], armcpu_smp_fail[2], armcpu_smp_fail[3],
++			    armcpu_smp_fail[4], armcpu_smp_fail[5], armcpu_smp_fail[6], armcpu_smp_fail[7],
++			    armcpu_smp_psci_rc[0], armcpu_smp_psci_rc[1], armcpu_smp_psci_rc[2],
++			    armcpu_smp_psci_rc[3], armcpu_smp_psci_rc[4], armcpu_smp_psci_rc[5],
++			    armcpu_smp_psci_rc[6], armcpu_smp_psci_rc[7],
++			    armcpu_smp_mpidr[0], armcpu_smp_mpidr[1], armcpu_smp_mpidr[2],
++			    armcpu_smp_mpidr[3], armcpu_smp_mpidr[4], armcpu_smp_mpidr[5],
++			    armcpu_smp_mpidr[6], armcpu_smp_mpidr[7],
++			    armcpu_smp_seen_mpidr[0], armcpu_smp_seen_mpidr[1], armcpu_smp_seen_mpidr[2],
++			    armcpu_smp_seen_mpidr[3], armcpu_smp_seen_mpidr[4], armcpu_smp_seen_mpidr[5],
++			    armcpu_smp_seen_mpidr[6], armcpu_smp_seen_mpidr[7],
++			    (unsigned long long)armcpu_smp_entry[0], (unsigned long long)armcpu_smp_entry[1],
++			    (unsigned long long)armcpu_smp_entry[2], (unsigned long long)armcpu_smp_entry[3],
++			    (unsigned long long)armcpu_smp_entry[4], (unsigned long long)armcpu_smp_entry[5],
++			    (unsigned long long)armcpu_smp_entry[6], (unsigned long long)armcpu_smp_entry[7]);
+ 		}
+ 		for (i = 0; i < cn; i++) {
+ 			char peer[24];

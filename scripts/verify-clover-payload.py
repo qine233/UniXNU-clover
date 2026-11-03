@@ -1273,6 +1273,17 @@ def check_sb_sample(kernel: bytes) -> bool:
              "bb-cpu": (b"clover r271: cpu t=%llu real=%u max=%u reg=%u start=%u run=%u"
                         b" s=%u%u%u%u%u%u%u%u r=%u%u%u%u%u%u%u%u"
                         b" tm=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n") in kernel,
+             # Round299 adds the row beside that one rather than widening it: r271 is the kernel's answer to
+             # "how many cpus does this board have", and boot 87 read real=1 max=8 reg=1 start=0 on both fires,
+             # which is the question without the mechanism. The mechanism lives in the CPU driver -- how far
+             # each core got, why it stopped, what the firmware answered, which address it was given and which
+             # affinity the core reported -- so this row prints those six, pinned whole for the standing reason:
+             # a cut format string leaves every prefix needle green, and this is the row the round ships.
+             "bb-cpu-smp": (b"clover r299: smp t=%llu req=%u con=%u run=%u"
+                            b" st=%u%u%u%u%u%u%u%u fl=%u%u%u%u%u%u%u%u"
+                            b" rc=%d,%d,%d,%d,%d,%d,%d,%d"
+                            b" want=%x,%x,%x,%x,%x,%x,%x,%x seen=%x,%x,%x,%x,%x,%x,%x,%x"
+                            b" entry=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

@@ -23053,3 +23053,81 @@ keystore `stage=3 status=0 refused=0`，本靴内 `opens=44→49`、`calls=165�
 多核那一格（r299，用户指定排在读数之后）与本支不同层：`drivers/ArmCpu/ArmCpu.cpp` 的副核上电整条已在
 （`probe` 认第二 nub `:226-241`、`ml_processor_register` `:512`、PSCI CPU_ON `:872-885`、新核自己
 `wakeRedistributor`+`enableGic` `:573-598`），只被 `sheng-smp` 一枚开关关着；boot 87 的 r271 行就是它的基线。
+
+## Round299 (v0.7.3): 副核不是缺代码，缺的是一枚叫别人板子的开关
+
+**① 这一支是用户点名的**（「把多核修了」，排在 boot 87 的读数之后）。要点先说结论：
+`clover r271: cpu … real=1 max=8 reg=1 start=0 run=1` 在 boot 87 的两拍里逐字相同，
+**一次排掉三种可能**——拓扑数得出 8 颗（`ml_parse_cpu_topology()` 读 `/cpus` 
+`，`max=8` 就是它的产物）、`MAX_CPUS` 已经是 8（共享补丁
+`~/UniXNU/patches/xnu/native-smp-secondary.patch`，commit `625daad`，为 sheng 写的，
+连带 `start.s` 里 `and x0, x15, #0xFFFF` 那枚 MPIDR 掩码）、**缺的只有「谁去放副核」**。
+
+**② 放核的整条代码本来就在本仓 vendored 的 `drivers/ArmCpu/ArmCpu.cpp` 里**：`probe()` 认第二颗 nub
+（`:244-250`）、`finishSecondary()` 调 `ml_processor_register()`（`:521`起）、`startCPU()` 打 PSCI 0.2
+`CPU_ON`（`0xc4000003`，入口是 `ml_static_vtop(LowResetVectorBase)` 的物理复位向量，先
+`cleanToMemory` 三页）、新核自己在 `initCPU()` 里 `wakeRedistributor`+`enableGic`+装 handler。
+拦着它的是一行：`PE_parse_boot_argn ("sheng-smp", …)`，`smp==0` 就 `return nullptr`
+（`sheng-smp-gic` 同理在 `start()` 里）。**一枚以别的板子命名的开关，就是读本板 boot-args 的人
+找不到的一枚开关**——`reg=1` 因此活了十一靴。
+
+**③ 所以 r299 不写新路径，只把闸名接进 `armcpu-*` 家族**（文件里其余六枚都是这个前缀：
+`armcpu-skip-gic`/`armcpu-timer-intid`/`armcpu-clock-panic`/`armcpu-self-ipi`/`armcpu-spi-ipi`/
+`armcpu-diagnostics`），并在 `board.toml` 里透传 `armcpu-smp=1` 与 `armcpu-self-ipi=1`。
+后者不是独立假设而是**使能项**：`osfmk/kern/machine.c` 的规矩是 XNU 只在一颗核第一次收到 IPI 时
+清掉 `SIGPdisabled`，在那之前 `cpu_signal()` 会跳过它——注册了但从没被敲过的核，调度器仍然用不上。
+Apple 自己的 CPU 驱动就是在 `initCPU` 里发这枚自我 IPI，这枚开关做的同一件事。
+两枚开关的效果在读数上是可分的：`st=7` 说明核进到了 running，`clover r270: ipi … sgi=` 的逐核位
+说明它真的收到过 IPI；只有前者没有后者就是 self-ipi 这一格的问题，不是上电的问题。
+
+**④ 仪器：SMP 状态挂在普查那一拍上重播，不是一次性打印。** 内核补丁 `z…58-clover-r299.patch` 在
+`osfmk/kern/task.c` 的 r271 行**下面**加一条 `clover r299: smp t=%llu req=%u con=%u run=%u
+st=… fl=… rc=… want=… seen=… entry=…`，同一次 fire 一行。task.c 里读驱动全局数组有先例
+（`armcpu_core_sgi[8]`、`armcpu_core_timer[8]` 从 r270 起就在读），这一支照同一形状
+`extern` 六枚驱动数组。为什么不从驱动自己印：**环地平线**——内核环只留最后 ~370 s，
+一条在 t<10 s 说过一次的话，读卡上日志的时候早就在窗外了（r272 量过这个形状）。
+字段各自归因：`st=` 是步号（1 nub、2 注册、3 起线程、4 CPU_ON 已发出、5 进了 initCPU、
+6 红istributor 就绪、7 running），`fl=` 是停下的原因（1 MPIDR 不符、2 自己的 GICR 没起、
+3 由核没被预唤醒、4 XNU 拒了注册、**9 本驱动 `ml_static_vtop` 回了 0**），
+`rc=` 是固件的返回码，`want=`/`seen=` 是驱动瞄准的 affinity 与新核自报的 MPIDR，
+`entry=` 是交给 PSCI 的那个地址。
+
+**⑤ `entry=` 是本轮自己加的一格，理由是 `rc=-4`。** PSCI 的 `INVALID_ADDRESS` 是关于
+**我们递给它的那个地址**的判决，行上若不带着那个地址，卡上就分不开「这板固件不放核」和
+「它不认识这个入口」——而这两者的修法不同。同理 `vtop` 回 0 时这一支不再把地址 0 送去敲门，
+自己记账（`fl=9`、`rc=-1002`）：那是本驱动的失败，不该记到固件头上。
+`rc=` 另有两个自家码：`-1001`＝`/psci` 节点没报出 conduit，`-1000`＝起线程失败。
+
+**⑥ 两条先前记在案的反对意见，这轮读掉了。**（a）**cluster 折叠会把 `assert` 踩响**：BCM2837 不定义
+`HAS_CLUSTER`，`osfmk/arm64/machine_routines.c:1094-1103` 因此走
+`phys_cluster_id = (cpu->cluster_type == CLUSTER_TYPE_P)` 那一支，而我们的 ADT
+（`scripts/make-clover-adt.py:170-177` 的 `build_cpu_node`）根本不发 `cluster-type`，
+副核继承 boot 的 `ml_get_boot_cluster_type()` ⇒ 全部落进同一枚逻辑 cluster，`MAX_CPU_CLUSTERS` 摸不到。
+（b）**`kIpiSpiBase=1008..1015` 越界**：`GICD_TYPER=0x7b04f3` ⇒ ITLinesNumber=19 ⇒ SPI 只到 INTID 671，
+这条是**真的**，但它作废的是 `armcpu-spi-ipi`（这轮继续不开），不是 SGI 0 的自我 IPI。
+把它当成整条 SMP 的否决票，是 `reg=1` 又活了一靴的原因之一。
+
+**⑦ 正对照与预登记态（刷写前写好）。** 现成的正对照：**同一枚 SMC conduit 每靴都在被 panic 屏用作
+`SYSTEM_RESET`**，所以 conduit 层可用不是假设；`clover r271:` 与 `clover r298:` 两行照常在场
+（新行是附加的，若 r271 行变形或 r298 行消失，就是这一支动了不该动的东西）。预登记读数：
+`req=0`＝开关没透传进来（契约失败，与硬件无关）；`req=1 st=…0`＝核一颗没进（`rc=` 给固件的说法）；
+`rc=0 而 st<5`＝固件答了应、核没走到 initCPU（复位向量/页表/MMU 那一侧）；
+`st=5 fl=1 want≠seen`＝设备树的 reg 与真实 MPIDR 不符；
+`st=6 停在 6`＝红istributor 起不来；`st=7 且 run>1`＝核上线，下一问才是它有没有被用上（r270 的 `sgi=`）。
+固件码按 PSCI 0.x：`0` 成功、`-1` NOT_SUPPORTED、`-2` INVALID_PARAMETERS、`-3` DENIED、
+`-4` INVALID_ADDRESS（配合 `entry=` 读）。
+
+**⑧ 契约。** `drivers/CloverSdhci` 加类别 `{ "clover r299: ", "r299-smp", 64, 0, 0, 0 }`（一次 fire 一行，
+20 拍用掉 64 的一半，与 r270/r271 同额），并把 `r299` 加进**免 per-pass 推送上限**那一列——
+理由就是 r249 给普查的那条：**被闸掉的行会读成「这靴根本没问过」**，而这轮整支就是问一次。
+`scripts/check-clover.py` 新增一整块断言（补丁在场、九条 needle、不许重印 r271 行、不许碰 r298 行、
+不许在普查里阻塞、两份补丁同字节、LATE 头是 r299、驱动里 `sheng-smp` 必须绝迹、
+`armcpu-smp=1`/`armcpu-self-ipi=1` 必须在场、`armcpu-spi-ipi` 与 `armcpu-smp-remote-gic` 必须不在场）；
+`scripts/verify-clover-payload.py` 把整条格式串钉住；`board.toml` 的标题换成 r299，并**改写**了那条
+「这板的在线核数从没测过」的旧注（现在测过了：`max=8 reg=1`）。
+
+**⑨ 还没证的（写在这，别让读数替它圆场）。** 这块板的引导加载器是否**允许** Non-Secure 发起
+`CPU_ON`——没读过，`rc=-3 DENIED` 是它可能的样子；Kryo 260 的大核簇上电要不要除 PSCI 之外的
+时钟/电源前提（`cxo`/`rbcpr` 那类），本轮一个都不碰，真需要就会读成 `rc=0 而 st<5`；
+副核上线会不会引入新的复位形状（桌面主线那一格本来就有八条静默复位），这轮不预判。
+桌面仍是 CPU-first：这一支改的是等的那台机器有几颗核，不是等谁。
