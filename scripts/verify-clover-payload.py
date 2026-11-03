@@ -1334,7 +1334,8 @@ def check_sb_sample(kernel: bytes) -> bool:
                  b"clover r262: th tid=", b"clover r300: fire t=", b"clover r300: done t=",
                  b"clover r296: hop=", b"clover r298: hop=", b"clover r303: hop=")),
              "probe-beat-flush": (b"CloverSdhci r304: probe why=%s wrote=%u seen=%u next=%u pend=%u"
-                                  b" flushed=%u skipped=%u stalled=%u refused=%u dropped=%u\n") in kernel,
+                                  b" flushed=%u skipped=%u stalled=%u refused=%u dropped=%u"
+                                  b" starve=%u/%u/%u/%u pio=%u/%x/%u@%u ch=%u\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

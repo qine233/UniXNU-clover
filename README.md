@@ -377,6 +377,44 @@ leave」一路收紧到一句可测的话：
   自己计数（`held=`/`young=`/`panic=`，随下一次跑成的报告印出来）＋一枚两把钟同记录的交接记录（内核秒 ↔ 上膛毫秒）」；
   ③ `writePioBlock` 自证，让句子能上卡、给「谁在普查那一拍附近动手」一个名字。
   详见 `notes/development-log.md` §Round304 读数 与文末 §Round304 读数更正（v0.7.14）。
+* **r305（v0.7.15，把上一段预登记的三小条一次付清：三件仪器，都只问自己那一格）**。**内核**
+  `patches/xnu-clover/zzz(62)-clover-r305.patch`（只改 `osfmk/kern/task.c`）：`clover_census_row` 里把
+  `clover_emmc_probe_say` 挪到 `printf` **之前**，并**删掉**旧位置那枚 `printf("%s", line)`——kind-25 有行而 kind-22
+  没有 ⇒ 停在控制台侧，两边都没有 ⇒ 根本没走到那一行；r305 在 `LATE_PATCH` 必须先于 r304 反打。**驱动**三件：
+  ① **节拍的饥饿自己计数**（`gBeatStarved[4]`，CloverSdhci.cpp:592，`held`/`young`/`panic`/`blind` 四支早退
+  :3995/3997/4006/4020/4026 各 tally 一处），**累加不清零**、由下一次跑成的报告与每枚 beat 记录同时带出——
+  被饿死的那个消费者不能是它自己唯一的报告者，这条是本轮动手前自己抓出来的仪器缺陷；② **两把钟同一枚记录**
+  （`kernelSeconds()` :3729 用 `absolutetime_to_nanoseconds(mach_absolute_time())`，beat 的 `extra[0]`、marker 的
+  `extra[8]` 各带一份，配 `gBootId` 在 `extra[12]`/`extra[12]`，:4046 与 :9326），用来把「驱动上膛毫秒」与「内核秒」
+  在**同一点**对上，v0.7.14 收回的那把跨钟尺子由此换成实测的 `arming_offset`；③ **`writePioBlock` 的三条早退各自
+  出声**（`pioFail()` :3237，`gPioAttempt` :3849 按调用点取 `100+event`/`21`/`22`/`20`），报告行尾巴
+  `starve=%u/%u/%u/%u pio=%u/%x/%u@%u ch=%u`（:4980）。读者侧 `read-clover-log.py` 按新词表重排
+  （`FLIGHT_BOOT_WORD={1:35,2:35,3:47,4:45,5:41,6:37}`、`FLIGHT_MAGIC_WORD={4:46,5:48}`）。三条负断言（不许清零
+  饥饿计数、中转点必须仍是那些、普查路径不许任何睡眠/取锁调用）与解码器自测的正/负对照写进 `check-clover.py`。
+* **boot 95（r305 / v0.7.15 的读回）：内核这把钟最后一行永远是普查的头一行，而两把钟第一次在同一枚记录里对上，
+  于是「节拍被饿了一百二十秒」这句话第一次不需要跨钟推断。** 冷刷 `round305-v0.7.15-payload.img`（`c52f1f00…`，
+  58,720,256 B；内核 `68ce7dc9`→AMFI `924b7243`→归一化 `82d8992b`→卡内 `ad5ba323`；ADT `e37eca9a` 14,384 B、
+  trustcache `7c369ce0`、ramdisk `614b8356`），boot 94→95，落回 TWRP。① **那条「先中转再 printf」落在 §Round304 ⑤
+  的（丙）支**：这一靴 kind-25 有 **0 行**（窗口里 23 行全是 boot 94 的残留），kind-22 里 `r300 fire`/`done`、`r262 th`、
+  `r296`、`r298`、`r303` 也全 **0 行**；内核环最新行是 `[616.939083] r262 census t=616 pid=58 threads=24 shown=20
+  hidden=4 wait=23 run=1`，后面只剩 `[616.939108] r270`、`[616.939148] r271 real=8 reg=8 start=7 run=8`、
+  `[616.939185] r299 req=1 con=1 run=7 st=07777777` 三行就断了 ⇒ 「走到了头一行」有独立见证，停点被夹在
+  **task.c:13595 与 task.c:13714 那 29 行之间**（三次自增 + 一发 `snprintf(fire)`）。**（丙）不当结论用**：这靴没有
+  SIGKILL 现场（`killsrc`/`killustk`/`skst` 三族 0 行），中转唯一的调用者就是普查，所以「`probe_say` 对本靴一切都拒绝」
+  这条替代解释没被排除，而尾巴报告行的印条件是 `wrote>0 || pend>0`——它自己的沉默由它自己的条件解释，不构成反证。
+  ② **两钟同记录验证成功并立刻兑了一次**：`arming_offset` 四拍 `11861/11855/11841/11835 ms`（12 s 内 0.2 % 漂移），
+  最后一枚跑成的 beat 在 **内核 497 s**，普查头行在 **616.9 s** ⇒ **同一枚钟上读出 120 s 的饥饿**（v0.7.14 说读不出的
+  正是这一类数）；beat marker 与普查的**先后**仍**没断言**（落在外推误差之内）。③ **第三件仪器出声**：`pio=0/0x00000000/0w@0ms
+  ch=0 total=0`（497 s 前没有任何一次块写被拒）＋ `starve=0/0/29267/31`——`held=31` 就是饥饿本身、`young=29267` 是 4 s
+  门槛的正常拒绝、`miss=31` 是同帧正对照。④ sink/死线没动：两枚 marker 仍是 boot 94 与 boot 87 的、`magic=absent`、
+  死线记录还是 boot 87，零条句子；`r283: last reset unnamed` ⇒ **第九起无名静默复位**，家族带 642.7/~645/661/746/835/
+  555/742/**617**（第九票），`charger_temp=342`。⑤ **本轮自己造出来的假读数已被读者挡住**：boot 94 的陈旧 marker 走
+  r305 的新词表解出过 `k=1129076301s arming_offset=1129075571250ms`，`read-clover-log.py` 因此加了 `r305_own()` 生成
+  门槛（新字段必须同时说出哪一代镜像带着它），selftest 用 boot 95 真实形状加了正/负对照。
+  **下一手 r306（两条，都不新开问题）**：① 让中转自己的沉默出声——`clover_emmc_probe_say` 每条早退各自计数，报告行的
+  印条件加一支 `calls>0 而 wrote=0`；② 给「走到了」加一条**不经中转**的副本——`:13705` 三次自增之后、`snprintf(fire)`
+  之前放一条裸 `printf` 的 step 行（要测的正是中转，副本不能骑在被测管道上）；另有 `drained=` 归属债与仍欠的
+  smp-off 同镜像控制轮。详见 `notes/development-log.md` §Round305 读数。
 * **这两条仪器债已由 r303 结清**（原文曾记作「本格欠着」）：`vbits=` 现以 r298 行末的 `vb_r=`/`vb_v=` 落地
   （`ipc_right_lookup_read()` 已经交出的 entry 位掩码，用来分 port set / send-once / 死名，不需要对象、锁纪律与
   translate 同一条），`cap=send` 行的 `qmc=/qsr=` 也带上了自己的返回码 `qerr=`。

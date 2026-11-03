@@ -116,7 +116,7 @@ FLIGHT_KIND = 23
 # one -- boot 91's panic slot carried a marker's event words and a block request's header, and the
 # decoder printed round293's boot stamp as that boot's `stage`.
 FLIGHT_MARKER_MAGIC = 0x434C564D      # 'CLVM'
-FLIGHT_MAGIC_WORD = {4: 46, 5: 43, 6: 126}
+FLIGHT_MAGIC_WORD = {4: 46, 5: 48, 6: 126}
 BOOT_OFFSET = KERNEL_OFFSET + 2 * KERNEL_SLOTS   # round212: one block after the kernel ring
 BOOT_KIND = 24
 PROBE_KIND = 25
@@ -130,10 +130,12 @@ FLIGHT_DIRS = {0: "read", 1: "write", 2: "beat", 3: "none"}
 # Round293: where each event's own boot id lives. Boot 79's frame is the reason: the deadline slot
 # and the panic slots are the only two groups a boot may never write, and when it does not the
 # previous boot's copy stays on the card and read, in this reader's own words, as if "the deadline
-# fired" this boot. An entry or beat carries no extras, so its stamp is word 35; the deadline's ten
-# words come first and its stamp is the eleventh; round236 already wrote gBootId as the panic
-# marker's sixth extra word. A zero means a record written before this round stamped anything.
-FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 35, 4: 45, 5: 41, 6: 37}
+# fired" this boot. An entry carries no extras, so its stamp is word 35; round305 gave the beat twelve
+# of its own -- its kernel second, four starvation counters and the last refused write -- so its stamp
+# is the thirteenth word, 47. The deadline's ten words come first and its stamp is the eleventh;
+# round236 already wrote gBootId as the panic marker's sixth extra word. A zero means a record written
+# before this round stamped anything.
+FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 47, 4: 45, 5: 41, 6: 37}
 # Round213's holder stages. A beat whose stage word has not moved for 75 s is the request that
 # stopped, so the name is what the dump prints where r212 could only print the request.
 FLIGHT_STAGES = {0: "idle", 1: "entry", 2: "idleWait", 3: "check", 4: "adma", 5: "batch",
@@ -460,6 +462,19 @@ def flight_comm(record):
     return raw.split(b"\0", 1)[0].decode("ascii", "replace") or "-"
 
 
+def r305_own(record, boot_id):
+    """Whether this record was written by the payload whose layout the reader is using.
+
+    One boot is one image, so a record that names the boot being read carries round305's extras; a
+    record left by an earlier boot of an older payload does not, and its kernel second, starvation
+    exits and refusal words are whatever the previous layout kept at those word numbers. Boot 95's
+    frame is the case in point: the boot 94 marker left there decodes to k=1129076301s, a number no
+    clock produces, and printing it as an uptime would be exactly the round293 class of defect this
+    reader was written to stop.
+    """
+    return bool(boot_id) and record["boot"] == boot_id
+
+
 def flight_stamp(records, boot_id):
     """One line saying whose record the newest of this group is.
 
@@ -534,7 +549,31 @@ def flight_report(groups, boot_id=0):
             flags.append("cmd")
         if record["flags"] & 2:
             flags.append("dat")
+        # Round305's twelve extras: the kernel's own second, the four starvation exits (blind, panic,
+        # young, held) counted since the ring was armed -- they are never cleared, because the block
+        # tail's probe line reports the same four and the consumer that can be starved must not decide
+        # what the other one sees -- and the last refused block write since arming: code, INT_STATUS,
+        # words handed, its flight ms, which channel asked and which block, plus the running total.
+        # The round293 stamp follows at word 47.
+        (ksecs, blind, panicked, young, held,
+         code, fail_status, fail_words, fail_ms, fail_channel, fail_lba, fail_total) = \
+            record["extra"][:12]
+        # The one number v0.7.14 withdrew because it had never been measured: kernel seconds minus the
+        # driver's milliseconds, taken in one instruction stream. It is the arming offset, and from this
+        # round every panic marker carries its own copy, so a marker no longer needs anybody else's clock.
+        offset = ksecs * 1000 - record["t_ms"] if ksecs else 0
+        # A record left by an older payload has no kernel second at word 35 and no starvation exits
+        # after it, so those words get named as unreadable rather than printed as readings -- boot 95's
+        # window holds boot 94's beat and marker records, and the reader is the one place that knows
+        # which payload wrote them.
+        clock_pair = (f"k={ksecs}s arming_offset={offset}ms "
+                      f"starve={blind}/{panicked}/{young}/{held} "
+                      f"pio={code}/{fail_status:#010x}/{fail_words}w@{fail_ms}ms "
+                      f"ch={fail_channel} lba={fail_lba} total={fail_total} "
+                      if r305_own(record, boot_id) else
+                      "k=? starve=? pio=? (clocks unreadable: an older payload's words are here) ")
         print(f"  beat  seq {record['seq']:>3} slot {record['slot']:>2} t={record['t_ms']:>8}ms "
+              f"{clock_pair}"
               f"ps={record['present']:#010x} inh={','.join(flags) or '-'} "
               f"ops={record['ops']} guard={record['guard_waits']} miss={record['beat_misses']} "
               f"pend={record['pending_kernel']}/{record['pending_driver']} "
@@ -591,16 +630,29 @@ def flight_report(groups, boot_id=0):
     if panic:
         print(f"flight: {len(panic)} panic marker records in the window")
         for record in panic:
-            (stage, log_ready, owner, log_first, rc, drained, marker_boot,
+            (stage, log_ready, owner, log_first, rc, drained_never, marker_boot,
              gates) = record["extra"][:8]
+            # Round305's five more: this marker's own kernel second, taken in the same instruction
+            # stream as its t=, and the last block write that was refused before it. The second is what
+            # the v0.7.14 correction asked for -- boot 94's marker could be bounded on the log's clock
+            # but never placed on it -- and the refusal splits "the sink's next row never ran" from "it
+            # ran and the card said no". `drained_never` is not printed: the entry marker is written
+            # before the drain exists, so that field is a constant, not a reading.
+            ksecs, fail_code, fail_status, fail_words, fail_channel = record["extra"][8:13]
             if record["boot"] != marker_boot:
                 print(f"flight: the panic marker's own stamp and its gBootId word disagree "
                       f"({record['boot']} vs {marker_boot})")
             stale = ("" if not (boot_id and marker_boot and marker_boot != boot_id)
                      else f" STALE: boot {boot_id} never entered the sink")
+            offset = ksecs * 1000 - record["t_ms"] if ksecs else 0
+            marker_pair = (f"k={ksecs}s arming_offset={offset}ms "
+                           f"pio={fail_code}/{fail_status:#010x}/{fail_words}w ch={fail_channel} "
+                           if r305_own(record, boot_id) else
+                           "k=? pio=? (clocks unreadable: an older payload's words are here) ")
             print(f"  panic seq {record['seq']:>3} slot {record['slot']:>2} "
-                  f"t={record['t_ms']:>8}ms stage={stage} log_ready={log_ready} "
-                  f"host={owner:#x} log_first={log_first} rc={rc} drained={drained} "
+                  f"t={record['t_ms']:>8}ms {marker_pair}"
+                  f"stage={stage} log_ready={log_ready} "
+                  f"host={owner:#x} log_first={log_first} rc={rc} "
                   f"boot={marker_boot}{stale} magic="
                   f"{'yes' if record['magic'] else 'absent (pre-r302 payload, or a sector that was never a marker)'}"
                   f" gates={gates:#x}"
@@ -1054,8 +1106,75 @@ def selftest():
     said = out.getvalue()
     assert "not a sentence: no r302 magic at word 126" in said, said
     assert "panic(cpu 3 caller" not in said, said
+    # Round305: the two clocks in one record, the starvation counters and the refusal that names itself.
+    # The geometry is the part worth asserting -- the beat's boot id moved from word 35 to word 47 the
+    # round its kernel second arrived at word 35, and a reader that kept looking at 35 would print 741 as
+    # "written by boot 741", which is the round293 defect re-made by this round's own change.
+    both = bytearray(flight)
+    beat_extra = [741, 0, 3, 5, 12, 2, 0x00000011, 7, 640500, 125, 13320256, 4, boot_id]
+    place(both,
+          build_flight_record(first_lba + FLIGHT_BEAT_OFFSET, 8, 3, 2, 0, 0, t_ms=729750,
+                              extra=beat_extra, boot=boot_id),
+          FLIGHT_BEAT_OFFSET)
+    place(both,
+          build_flight_record(first_lba + FLIGHT_PANIC_OFFSET, 0, 5, 3, 0, 0, t_ms=729900,
+                              extra=[1, 1, 0, 13320216, 100, 0, boot_id, 7,
+                                     741, 2, 0x00000011, 7, 103],
+                              boot=boot_id, marker_magic=True),
+          FLIGHT_PANIC_OFFSET)
+    decoded = decode_flight(bytes(both), first_lba)
+    beat = decoded["beats"][0][1]
+    assert not decoded["beats"][0][2], decoded["beats"][0][2]
+    assert beat["boot"] == boot_id and beat["extra"][0] == 741, beat
+    assert beat["extra"][1:5] == (0, 3, 5, 12), beat
+    marker = decoded["panic"][0][1]
+    assert marker["magic"] and marker["extra"][8] == 741 and marker["extra"][12] == 103, marker
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        flight_report(decoded, boot_id)
+    said = out.getvalue()
+    assert "k=741s arming_offset=11250ms" in said, said
+    assert "starve=0/3/5/12" in said, said
+    assert "pio=2/0x00000011/7w@640500ms ch=125 lba=13320256 total=4" in said, said
+    assert "drained=" not in said, said
+    assert "k=741s arming_offset=11100ms" in said, said
+    # A beat from a payload before this round has zeros where the pair now lives. That reads as no
+    # measurement, not as an arming offset of the whole uptime: the kernel second must stay out of the
+    # arithmetic when it was never taken.
+    old = bytearray(flight)
+    place(old, build_flight_record(first_lba + FLIGHT_BEAT_OFFSET, 0, 3, 2, 0, 0, t_ms=9000,
+                                   boot=boot_id), FLIGHT_BEAT_OFFSET)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        flight_report(decode_flight(bytes(old), first_lba), boot_id)
+    assert "k=0s arming_offset=0ms" in out.getvalue(), out.getvalue()
+    # ... and the case boot 95 actually produced: a record left in the region by an older payload, read
+    # through this reader's tables. Its word 35 is not a kernel second and its word 43 is not a refusal
+    # code, so the frame has to say it cannot read them -- boot 94's marker in boot 95's window decoded
+    # to k=1129076301s, a number no clock reaches, and printing that as an uptime is the round293 defect
+    # wearing this round's field names.
+    foreign = boot_id - 1
+    mixed = bytearray(flight)
+    place(mixed,
+          build_flight_record(first_lba + FLIGHT_BEAT_OFFSET, 9, 3, 2, 0, 0, t_ms=729750,
+                              extra=[1129076301, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, foreign],
+                              boot=foreign),
+          FLIGHT_BEAT_OFFSET)
+    place(mixed,
+          build_flight_record(first_lba + FLIGHT_PANIC_OFFSET, 0, 5, 3, 0, 0, t_ms=729900,
+                              extra=[0, 1, 0x3154c, 13320216, 0, 0, foreign, 7,
+                                     1129076301, 0, 0, 0, 0],
+                              boot=foreign),
+          FLIGHT_PANIC_OFFSET)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        flight_report(decode_flight(bytes(mixed), first_lba), boot_id)
+    said = out.getvalue()
+    assert "clocks unreadable" in said, said
+    assert "1129076301" not in said and "1129075571250" not in said, said
     print("read-clover-log selftest: report window, both rings, flight region, wrap order, "
-          "ring kinds, bad records and the r302 verdict signatures all ok")
+          "ring kinds, bad records, the r302 verdict signatures, the r305 clock pair and the "
+          "older-payload clock guard all ok")
     return 0
 
 

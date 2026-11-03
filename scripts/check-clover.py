@@ -4172,7 +4172,7 @@ def check_board(errors: list) -> str:
                        'return probeFlush ("drain", 0);',
                        'static const uint32_t kProbeSealRetries = 4;',
                        '"CloverSdhci r304: probe why=%s wrote=%u seen=%u next=%u pend=%u flushed=%u skipped=%u"',
-                       '" stalled=%u refused=%u dropped=%u\\n"'):
+                       '" stalled=%u refused=%u dropped=%u starve=%u/%u/%u/%u pio=%u/%x/%u@%u ch=%u\\n"'):
             if needle not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci has no {needle[:52]!r}: the relay ring is only worth a reading "
                               "once something consumes it without a panic, and one consumer with a cursor is what "
@@ -4185,6 +4185,117 @@ def check_board(errors: list) -> str:
         if beat_at < 0 or sdhci_source.find('probeFlush ("beat"', beat_at) < 0:
             errors.append("the beat does not flush the probe ring: on a boot that never reaches the sink, "
                           "CPU0's timer is the only writer left, which is the whole reason boot 93 read nothing")
+        # Round305. Boot 94 answered nothing for three reasons at once, and v0.7.14 had to withdraw two
+        # claims because of them: the census rows and their relay copy left in the same order the console
+        # got them (so a death inside printf() takes both, and one absence stands for two facts); the
+        # flight records carry the driver's clock while the log lines carry the kernel's and no record on
+        # the card holds the pair at one code point (so a marker can be bounded in kernel seconds but not
+        # placed in them -- the four ≈12 s figures were each a subtraction of the simultaneity being
+        # tested); and every card writer ends in one writePioBlock whose three refusal exits reach the
+        # caller as the same false (so "the sink's next rows never ran" and "they ran and the card said
+        # no" are one reading). Each of those three is pinned below, in the order the round fixes them.
+        r305_name = "z" * 62 + "-clover-r305.patch"
+        r305_patch = next((base / "patches/xnu-clover" / r305_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r305_name).is_file()), None)
+        if r305_patch is None:
+            errors.append(f"patches/xnu-clover/{r305_name} is missing: with the console copy still first, a "
+                          "boot that dies inside printf() loses the row and its relay together and the card "
+                          "cannot tell that from a fire that never reached the line")
+        else:
+            r305_text = r305_patch.read_text()
+            r305_added = [line.lstrip("+") for line in r305_text.splitlines(True)
+                          if line.startswith("+")
+                          and not line.lstrip("+").lstrip().startswith(("*", "/*"))]
+            # The order is what the round is, and a patch cannot be read for it line by line: the relay
+            # line is context (r304 added it) and only the print moves. The post-image -- every context
+            # line and every added line, in the hunk's own order -- is the file as it will compile.
+            r305_after = [line for line in r305_text.splitlines(True)
+                          if line.startswith((" ", "+")) and not line.startswith("+++")]
+            relay_at = next((i for i, line in enumerate(r305_after)
+                             if "clover_emmc_probe_say(line," in line), None)
+            print_at = next((i for i, line in enumerate(r305_after)
+                             if 'printf("%s", line);' in line), None)
+            if relay_at is None or print_at is None:
+                errors.append(f"{r305_name} does not contain both copies of the row: the whole reading is "
+                              "that the two channels now split, and a patch that only moves one of them "
+                              "moves a silence instead of naming it")
+            elif relay_at > print_at:
+                errors.append(f"{r305_name} still prints before it relays: boot 94's census rows are missing "
+                              "from BOTH pipes, which is what this order is the only cure for")
+            if not any(line.startswith("-") and 'printf("%s", line);' in line
+                       for line in r305_text.splitlines(True)):
+                errors.append(f"{r305_name} adds a second print instead of moving the one that was there: "
+                              "a row that reaches the console twice would also reach the log buffer twice, "
+                              "and msgbuf is where the tee reads its rows from")
+            for forbidden in ("thread_block(", "simple_wait(", "lck_mtx_lock(", "proc_lock(", "sleep(",
+                              "hw_lock_lock("):
+                if forbidden in "".join(r305_added):
+                    errors.append(f"{r305_name} calls {forbidden}: the handover happens on the census path, "
+                                  "which prints beside a wedged userland, and a relay that blocks is not a copy")
+            load_r305 = REPO.parent / "UniXNU" / "patches" / "xnu" / r305_name
+            if not load_r305.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r305_name} is missing: unixnu loads patches from there "
+                              "and silently skips one that lives only in this repo")
+            elif load_r305.read_bytes() != r305_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r305_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+            late_script_r305 = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list_r305 = " ".join(line for line in late_script_r305.splitlines() if "clover-r" in line)
+            if (late_list_r305.find(r305_name) < 0 or
+                    late_list_r305.find(r305_name) > late_list_r305.find("z" * 61 + "-clover-r304.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r305 before r304 in LATE_PATCH: r305 "
+                              "edits the function r304 adds, so a tree that removes r304 first has nothing for "
+                              "r305 to apply to -- and an apply failure in that loop is silent")
+        for needle in ('#include <kern/clock.h>',
+                       'absolutetime_to_nanoseconds (mach_absolute_time (), &ns);',
+                       'static uint32_t kernelSeconds ()',
+                       'extra[0] = kernelSeconds ();',
+                       'flightWrite (kFlightEventBeat, 2, 0, 0, extra, 13)',
+                       'extra[8] = kernelSeconds ();',
+                       'flightWrite (kFlightEventPanic, 3, 0, 0, extra, 13)',
+                       'extra[12] = gBootId;'):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no {needle[:52]!r}: the beat and the panic marker are "
+                              "the two records this board reads its own ending from, and neither may convert "
+                              "somebody else's timestamp -- v0.7.14 withdrew exactly that conversion")
+        if sdhci_source.count("__atomic_add_fetch (&gBeatStarved[") < 5:
+            errors.append(f"the beat counts its starvation exits {sdhci_source.count('__atomic_add_fetch (&gBeatStarved[')} "
+                          "times, not at least five: a beat that returns early writes nothing, so an exit nobody "
+                          "tallies is the same silence boot 94 reported as five why=tail rows and zero why=beat")
+        if "__atomic_store_n (&gBeatStarved[" in sdhci_source:
+            errors.append("the beat clears the starvation counters it reads: the block tail reports the same "
+                          "four now, and a counter that one consumer empties decides what the other one "
+                          "sees -- which is the shape of the absence boot 94 left behind")
+        for needle in ('" stalled=%u refused=%u dropped=%u starve=%u/%u/%u/%u pio=%u/%x/%u@%u ch=%u\\n"',
+                       'static_cast<unsigned int> (__atomic_load_n (&gBeatStarved[kBeatHeld], __ATOMIC_RELAXED)),',
+                       'gPioFailCode, gPioFailStatus, gPioFailWords, gPioFailMs, gPioFailAttempt'):
+            if needle not in sdhci_source:
+                errors.append(f"the probe report line has no {needle[:52]!r}: the beat cannot report its own "
+                              "starvation when starvation is why it never wrote, so the tail report -- the only "
+                              "consumer that ran on boot 94 -- has to carry these numbers too")
+        for needle in ('pioFail (1, 0, 0, lba);',
+                       'pioFail (2, status, 0, lba);',
+                       'gPioAttempt = 100 + event;',
+                       'gPioAttempt = kind ? kind : ((which == kRingKernel) ? 22u : 21u);',
+                       'gPioAttempt = 20;',
+                       'gPioAttempt = 0;'):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no {needle[:52]!r}: writePioBlock's three no-exits "
+                              "currently reach every caller as one bare false, and until each names itself the "
+                              "sink's silence is still two facts wearing one reading")
+        reader_r305 = next((base / "scripts/read-clover-log.py"
+                            for base in (REPO, pathlib.Path.cwd())
+                            if (base / "scripts/read-clover-log.py").is_file()), None)
+        if reader_r305 is not None:
+            reader_text = reader_r305.read_text()
+            for needle in ("FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 47,", "FLIGHT_MAGIC_WORD = {4: 46, 5: 48,",
+                           "arming_offset=", "starve=", "clocks unreadable"):
+                if needle not in reader_text:
+                    errors.append(f"read-clover-log.py does not know {needle!r}: the beat's boot id moved when "
+                                  "its kernel second arrived at word 35, and a reader that kept looking there "
+                                  "prints an uptime as a boot number -- the round293 defect re-made by this "
+                                  "round's own change")
 
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
@@ -4598,8 +4709,9 @@ def check_board(errors: list) -> str:
                  "nothing to say it was ever entered"),
                 ("flightPanicMark (1, rc, text != nullptr);",
                  "the panic sink has no exit marker: the append's return code would be unreadable"),
-                ("(void)flightWrite (kFlightEventPanic, 3, 0, 0, extra, 8);",
-                 "the panic marker does not carry the eight gate words"),
+                ("(void)flightWrite (kFlightEventPanic, 3, 0, 0, extra, 13);",
+                 "the panic marker does not carry its eight gate words plus round305's kernel second and "
+                 "last refusal -- and the r302 signature then lands at the wrong word"),
                 ("__atomic_load_n (&gHostOwner, __ATOMIC_ACQUIRE)",
                  "the panic marker does not read the live host owner, which is the one gate its "
                  "return code cannot express")):
@@ -5490,8 +5602,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r304:"):
-        errors.append('[payload] title is not "clover r304: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r305:"):
+        errors.append('[payload] title is not "clover r305: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -6210,14 +6322,14 @@ def check_board(errors: list) -> str:
                        # Round293: the reader has to say which boot wrote what it prints. A stale
                        # deadline record is not a boot that reached its deadline, and the reader that
                        # printed one as if it were is how boot 79 nearly read as a boot that did.
-                       "FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 35, 4: 45, 5: 41, 6: 37}",
+                       "FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 47, 4: 45, 5: 41, 6: 37}",
                        # Round302: the reader has to know where a verdict record signs itself, and that
                        # the sentence's slots do not arrive in sequence -- a reader that broke the group
                        # at the first untouched sector would read every panic before boot id reached 12
                        # as no sentence at all.
                        "FLIGHT_TEXT_OFFSET = 44", "FLIGHT_TEXT_SLOTS = 12",
                        "FLIGHT_MARKER_MAGIC = 0x434C564D",
-                       "FLIGHT_MAGIC_WORD = {4: 46, 5: 43, 6: 126}",
+                       "FLIGHT_MAGIC_WORD = {4: 46, 5: 48, 6: 126}",
                        '6: "text"', 'not a sentence: no r302 magic at word',
                        "no sentence record",
                        "def flight_stamp(records, boot_id)", "STALE: boot",
@@ -6629,8 +6741,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r304:"):
-        errors.append('[payload] title is not "clover r304: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r305:"):
+        errors.append('[payload] title is not "clover r305: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

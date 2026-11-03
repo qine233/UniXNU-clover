@@ -211,6 +211,13 @@
 // XNU_KERNEL_PRIVATE, which the kernel's own compile record for this driver already defines -- which
 // is why this round needs no XNU patch at all.
 #include <sys/msgbuf.h>
+// Round305: the kernel's own uptime clock, the one every log line's [ secs ] is printed from
+// (osfmk/kern/task.c's clover_now_seconds(), same two calls). The flight region has always carried the
+// driver's clock -- flightCounterMs(gFlightStart), milliseconds since this driver armed the region --
+// and the kernel log carries the other, and no record on the card has ever held both at one code
+// point, which is why boot 94's panic marker could be bounded in kernel seconds but not placed in
+// them. Reading the pair here, in the writer, is what turns the difference into a measurement.
+#include <kern/clock.h>
 #include "SdhciRegs.h"
 
 extern "C" {
@@ -569,6 +576,38 @@ static volatile uint32_t gFlightBeatMisses = 0;  // beats that found the guard h
 static uint64_t gFlightStart = 0;                // counter value when the region was armed
 static uint64_t gFlightOpStart = 0;
 static uint64_t gFlightLastBeat = 0;
+// Round305. A beat that returns early is a beat nobody counts: boot 94 carried five reports and every
+// one said why=tail, so the second flush consumer -- the one wired behind the beat -- never ran for the
+// whole boot, and the only evidence of that was an absence. The four exits of clover_emmc_flight_beat
+// are four different facts (the region is not armed, a panic owns the card, the last beat is four
+// seconds old, somebody else holds the host), so each one increments its own counter and every report
+// that lands -- the beat's own record and the block tail's probe line -- carries all four as they stand.
+// They are never cleared: two consumers read them, and the one that can be starved must not be the one
+// that decides what the other sees. Counting starvation is the only thing a consumer that
+// cannot move ahead of its own guard can still do.
+static const uint32_t kBeatBlind = 0;   // no window base, no host, region or host not armed
+static const uint32_t kBeatPanic = 1;   // the panic sink owns the card
+static const uint32_t kBeatYoung = 2;   // the last beat is under four seconds old
+static const uint32_t kBeatHeld = 3;    // somebody else holds the host ticket
+static volatile uint32_t gBeatStarved[4] = {0, 0, 0, 0};
+
+// Round305, the other half of the same defect: every writer on this driver ends in writePioBlock, and
+// writePioBlock has three distinguishable exits that say no -- no command slot, the command was
+// refused, the data phase did not finish -- and all three throw their detail away. Boot 94 could say
+// the sink's later rows did not reach the card but not whether they were refused or never attempted,
+// because the refusal had no voice. The last refusal is kept here and travels with the next record
+// that does land; the total is since the driver armed, the detail is only the most recent refusal, so a
+// boot that was refused twice names one of them and counts both. A 0 in the code means never refused.
+static volatile uint32_t gPioFails = 0;          // refusals since the driver armed
+static volatile uint32_t gPioFailCode = 0;       // 1 slot, 2 command, 3 data, 4 data errors, 5 short
+static volatile uint32_t gPioFailStatus = 0;     // SDHCI_INT_STATUS as the failing exit saw it
+static volatile uint32_t gPioFailWords = 0;      // words handed to the data port
+static volatile uint32_t gPioFailMs = 0;         // flight ms of the refusal, 0 before the region armed
+static volatile uint32_t gPioFailLba = 0;        // the block the refusal happened on
+static volatile uint32_t gPioFailAttempt = 0;    // what was being written: 21/22/25 ring, 20 screen,
+                                                 // 24 boot id, 100+event flight record
+static volatile uint32_t gPioAttempt = 0;        // who asked: ring kind, 20 screen, 100+flight event
+static uint32_t flightCounterMs (uint64_t since);
 
 // Round213: the stage the guard holder is in. r212's frame ended with an entry record and no
 // successor, and every wait inside this driver is bounded, so the next question is not "how long"
@@ -3190,12 +3229,29 @@ static bool writeSettled (uint32_t &response, uint32_t &status, uint32_t &polls)
 // data circuit, because a half-written block left active would wedge the card for the reads that
 // follow. `wordCount` is how many words were handed to the data port; the return value is true
 // only for a clean command response, DATA_END and all 128 words handed over.
+// Round305: the refusal keeps its own name. Every card write on this driver -- a flight record, a ring
+// row, the panic screen's two blocks -- ends in writePioBlock, and until now the answer to "why did
+// that row not reach the card" was a bare false. The three exits below are three different causes, and
+// the last one is only readable in the two out-params that the callers throw away, so they are copied
+// here first.
+static void pioFail (uint32_t code, uint32_t status, uint32_t words, uint32_t lba)
+{
+  __atomic_add_fetch (&gPioFails, 1u, __ATOMIC_RELAXED);
+  gPioFailCode = code;
+  gPioFailStatus = status;
+  gPioFailWords = words;
+  gPioFailLba = lba;
+  gPioFailAttempt = gPioAttempt;
+  gPioFailMs = flightCounterMs (gFlightStart);
+}
+
 static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCount,
                            uint32_t &status)
 {
   wordCount = 0;
   status = 0;
   if (!waitCommandSlot ()) {
+    pioFail (1, 0, 0, lba);
     resetReadPath ();
     return false;
   }
@@ -3219,6 +3275,7 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
   }
   if (!(status & SDHCI_INT_RESPONSE) ||
       (status & (SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX))) {
+    pioFail (2, status, 0, lba);
     resetReadPath ();
     return false;
   }
@@ -3254,6 +3311,11 @@ static bool writePioBlock (uint32_t lba, const uint32_t *words, uint32_t &wordCo
       wordCount == kBlockWords) {
     return true;
   }
+  // Round305: which of the three data-phase conditions said no. A card that never raised DATA_END and
+  // a host that raised an error bit and a transfer that ran out of its deadline with words still in
+  // the buffer are three different boards, and until now all three reached the caller as false.
+  pioFail ((status & kDataErrorMask) ? 4u : ((status & SDHCI_INT_DATA_END) ? 5u : 3u),
+           status, wordCount, lba);
   resetReadPath ();
   return false;
 }
@@ -3557,6 +3619,9 @@ static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length,
   gRingBlock[8] = gRingSeq[which];
   gRingBlock[9] = gBootId;
   uint32_t rsp = 0, rstatus = 0, polls = 0;
+  // Round305: name the channel before writing it, so a refusal says which one (21 driver verdicts,
+  // 22 the tee's kernel rows, 25 the relayed probe lines).
+  gPioAttempt = kind ? kind : ((which == kRingKernel) ? 22u : 21u);
   if (!writePioBlock (lba, gRingBlock, words, status)) {
     return false;
   }
@@ -3613,6 +3678,7 @@ static uint32_t bootIdClaim (uint32_t lba)
   gRingBlock[2] = lba;
   gRingBlock[5] = kBootKind;
   gRingBlock[9] = boot;
+  gPioAttempt = 24;    // round305: the boot-id block is its own channel
   if (!writePioBlock (lba, gRingBlock, words, status)) {
     return boot;
   }
@@ -3650,6 +3716,21 @@ static uint32_t flightCounterMs (uint64_t since)
     return 0;
   }
   return static_cast<uint32_t> ((now - since) * 1000ULL / frequency);
+}
+
+// Round305: the other clock on this board, read in the same breath as the one above. Every kernel log
+// line is stamped with it (osfmk/kern/task.c's clover_now_seconds() is these same two calls), and so is
+// every msgbuf row this driver tees onto the card -- which is why the two have always looked
+// commensurate and never were. Boot 94's panic marker is the case in point: its `t=` is milliseconds
+// since the driver armed the flight region, an event that happens some unknown seconds after the
+// kernel's own zero, so the marker could be bounded in kernel seconds but never placed in them. From
+// this round every beat carries the pair at one code point, and the lag between the two is a number on
+// the card rather than a subtraction between two records that may not even name the same instant.
+static uint32_t kernelSeconds ()
+{
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds (mach_absolute_time (), &ns);
+  return static_cast<uint32_t> (ns / 1000000000ULL);
 }
 
 static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t blocks,
@@ -3765,6 +3846,7 @@ static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t bl
     buf[35 + extraWords] = kFlightMarkerMagic;
   }
   uint32_t words = 0, status = 0;
+  gPioAttempt = 100 + event;    // round305: whose refusal this is, if writePioBlock says no
   if (!writePioBlock (record, buf, words, status)) {
     return false;
   }
@@ -3908,9 +3990,13 @@ static void recoverStuckRequest (uint32_t stage, uint32_t owner)
 // in milliseconds, so the check does not depend on frequency rounding.
 extern "C" void clover_emmc_flight_beat (void)
 {
-  if (!__atomic_load_n (&gFlightArmed, __ATOMIC_ACQUIRE) ||
-      __atomic_load_n (&gPanicActive, __ATOMIC_ACQUIRE) || !gVerdictFirst || !gHost ||
+  if (!__atomic_load_n (&gFlightArmed, __ATOMIC_ACQUIRE) || !gVerdictFirst || !gHost ||
       !__atomic_load_n (&gHostArmed, __ATOMIC_ACQUIRE)) {
+    __atomic_add_fetch (&gBeatStarved[kBeatBlind], 1u, __ATOMIC_RELAXED);
+    return;
+  }
+  if (__atomic_load_n (&gPanicActive, __ATOMIC_ACQUIRE)) {
+    __atomic_add_fetch (&gBeatStarved[kBeatPanic], 1u, __ATOMIC_RELAXED);
     return;
   }
   uint64_t frequency = counterFrequency ();
@@ -3919,6 +4005,7 @@ extern "C" void clover_emmc_flight_beat (void)
   }
   const uint64_t now = readCounter ();
   if (gFlightLastBeat && now - gFlightLastBeat < frequency * 4ULL) {
+    __atomic_add_fetch (&gBeatStarved[kBeatYoung], 1u, __ATOMIC_RELAXED);
     return;
   }
   gFlightLastBeat = now;
@@ -3932,14 +4019,45 @@ extern "C" void clover_emmc_flight_beat (void)
       recoverStuckRequest (stage, owner);
     }
     __atomic_add_fetch (&gFlightBeatMisses, 1u, __ATOMIC_RELAXED);
+    __atomic_add_fetch (&gBeatStarved[kBeatHeld], 1u, __ATOMIC_RELAXED);
     return;
   }
   uint32_t token = 0;
   if (!tryTakeHost (token)) {
     __atomic_add_fetch (&gFlightBeatMisses, 1u, __ATOMIC_RELAXED);
+    __atomic_add_fetch (&gBeatStarved[kBeatHeld], 1u, __ATOMIC_RELAXED);
     return;
   }
-  (void)flightWrite (kFlightEventBeat, 2, 0, 0);
+  // Round305. Twelve words after the beat's own header, and all three of them are the same kind of
+  // answer: what the exits that do not write would have said.
+  //   [0] is the kernel's own second, taken in the same instruction stream as the record's `t=` at word
+  //       10, so the difference between the two clocks is measured instead of inferred (the v0.7.14
+  //       correction withdrew four such inferences, all of them circular).
+  //   [1..4] are the four starvation exits, counted since the ring was armed and never cleared. Boot 94
+  //       proved the cost of not counting: every one of its five probe reports said why=tail, because
+  //       the flush wired behind the beat never ran -- and the only evidence of that was an absence,
+  //       which is not a reading. They are cumulative rather than read-and-clear because the beat is not
+  //       the only reader of them any more (the block tail reports them too), and a counter that one
+  //       consumer empties steals the other's answer; the beat is also the consumer that can be
+  //       starved, so a number it clears would be exactly as silent as the record it never wrote.
+  //   [5..11] are the last refused block write, with the register and the word count the caller would
+  //       have thrown away, and the refusals this boot has counted in all. 0 in [5] means none.
+  uint32_t extra[13];
+  extra[0] = kernelSeconds ();
+  for (uint32_t i = 0; i < 4; i++) {
+    extra[1 + i] = __atomic_load_n (&gBeatStarved[i], __ATOMIC_RELAXED);
+  }
+  extra[5] = gPioFailCode;
+  extra[6] = gPioFailStatus;
+  extra[7] = gPioFailWords;
+  extra[8] = gPioFailMs;
+  extra[9] = gPioFailAttempt;
+  extra[10] = gPioFailLba;
+  extra[11] = __atomic_load_n (&gPioFails, __ATOMIC_RELAXED);
+  // Round293's stamp has to travel inside the extras now: flightWrite puts gBootId at word 35 only for
+  // a record that carries none, and word 35 is this record's kernel second.
+  extra[12] = gBootId;
+  (void)flightWrite (kFlightEventBeat, 2, 0, 0, extra, 13);
   // Round304: the beat is the only writer left on a boot that never reaches the panic sink. Boot 93
   // stopped at ~555 s with the kernel's census rows still sitting in this driver's BSS and no drain to
   // read them: the beat runs every four seconds whether or not a block request ever finishes, and it is
@@ -4854,11 +4972,20 @@ static uint32_t probeFlush (const char *why, uint32_t cap)
   if (gProbeReports < kProbeReportsMax &&
       ((wrote && !pend) || (pend && gProbeCalls % kProbeBacklogEvery == 0))) {
     gProbeReports++;
+    // Round305 appends the beat's starvation and the last refused block write to this line, in front of
+    // nothing that was already here: the beat cannot report them when it is the thing being starved, and
+    // boot 94's five reports are the only consumer on that boot that ever ran. A reader that sees the
+    // same starve= pair twice -- here and in the next beat record -- is seeing one counter, not two.
     teeSay ("CloverSdhci r304: probe why=%s wrote=%u seen=%u next=%u pend=%u flushed=%u skipped=%u"
-            " stalled=%u refused=%u dropped=%u\n",
+            " stalled=%u refused=%u dropped=%u starve=%u/%u/%u/%u pio=%u/%x/%u@%u ch=%u\n",
             why, wrote, seen, next, pend, gProbeFlushed, gProbeSkipped, gProbeStalled,
             gProbeRefused, static_cast<unsigned int> (__atomic_load_n (&gProbeDropped,
-                                                                       __ATOMIC_RELAXED)));
+                                                                       __ATOMIC_RELAXED)),
+            static_cast<unsigned int> (__atomic_load_n (&gBeatStarved[kBeatBlind], __ATOMIC_RELAXED)),
+            static_cast<unsigned int> (__atomic_load_n (&gBeatStarved[kBeatPanic], __ATOMIC_RELAXED)),
+            static_cast<unsigned int> (__atomic_load_n (&gBeatStarved[kBeatYoung], __ATOMIC_RELAXED)),
+            static_cast<unsigned int> (__atomic_load_n (&gBeatStarved[kBeatHeld], __ATOMIC_RELAXED)),
+            gPioFailCode, gPioFailStatus, gPioFailWords, gPioFailMs, gPioFailAttempt);
   }
   return wrote;
 }
@@ -5525,6 +5652,9 @@ extern "C" uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words
         uint32_t handed = 0;
         uint32_t status = 0;
         flightStage (kStageSingle);
+        // Round305: 0 names this channel as the block device's own write, not an instrument record, so
+        // a refusal here cannot be read as the sink's or the tee's.
+        gPioAttempt = 0;
         if (!writePioBlock (lba + done, target, handed, status)) {
           continue;
         }
@@ -9083,6 +9213,7 @@ static unsigned int panicAppendText (const char *text, unsigned int length)
   gWriteBlock[9] = gBootId;
 
   uint32_t rsp = 0, rstatus = 0, polls = 0;
+  gPioAttempt = 20;    // round305: the panic screen's own sentence, kind 20
   bool headerOk = writePioBlock (lba, gWriteBlock, words, status);
   waitCardReady (rsp, rstatus, polls);
   if (!headerOk) {
@@ -9174,7 +9305,7 @@ static void flightPanicMark (uint32_t stage, unsigned int rc, bool haveText)
   if (!gVerdictFirst || !gHost) {
     return;
   }
-  uint32_t extra[8];
+  uint32_t extra[13];
   extra[0] = stage;
   extra[1] = __atomic_load_n (&gPanicLogReady, __ATOMIC_ACQUIRE);
   // The host word says whether the sink found the controller owned, which is the one gate the
@@ -9186,7 +9317,18 @@ static void flightPanicMark (uint32_t stage, unsigned int rc, bool haveText)
   extra[6] = gBootId;
   extra[7] = (__atomic_load_n (&gUnattendedArmed, __ATOMIC_RELAXED) ? 1u : 0u) |
              (gBcbWritten ? 2u : 0u) | (haveText ? 4u : 0u);
-  (void)flightWrite (kFlightEventPanic, 3, 0, 0, extra, 8);
+  // Round305: the two things boot 94 could not say. [8] is the kernel's own second taken in this same
+  // instruction stream, so the marker is placed on the log's clock instead of only bounded on it --
+  // v0.7.14 withdrew the conversion this record's absence forced, and the withdrawal is what this word
+  // pays for. [9..12] are the last refused block write: the sink's own silence splits into "the code
+  // never ran" and "it ran and the card said no" only if the refusal has a voice, and boot 94's five
+  // drain rows all had none.
+  extra[8] = kernelSeconds ();
+  extra[9] = gPioFailCode;
+  extra[10] = gPioFailStatus;
+  extra[11] = gPioFailWords;
+  extra[12] = gPioFailAttempt;
+  (void)flightWrite (kFlightEventPanic, 3, 0, 0, extra, 13);
 }
 
 extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int length)
