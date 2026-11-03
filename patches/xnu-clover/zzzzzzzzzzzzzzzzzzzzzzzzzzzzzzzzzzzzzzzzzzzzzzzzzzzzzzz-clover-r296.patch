@@ -1,0 +1,108 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index d817b6e..9dbc15a 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12634,6 +12634,16 @@ clover_bb_exec_name(task_t task, char *out, size_t outlen)
+  * It takes a peer reference only through clover_bb_peer_task and drops every one it
+  * does not walk on. It never calls clover_bb_sample, so a task that is both waiter
+  * and debtor cannot make this recurse.
++ *
++ * Round296 adds cap=, which says which thread thid=/rcv=/to= were taken from, and
++ * fills those three for a hop that only receives: boot 83 ended both leaves on
++ * no_send with all three columns zero, because the capture rule then demanded a
++ * non-zero x3, and a thread whose x3 is zero is inside the trap for a reply rather
++ * than not waiting at all. cap=send names the sending thread, cap=recv the receiving
++ * one, cap=none means the task had no thread in the trap to name -- so rcv=0 on a
++ * recv row is no longer readable as an instrument that gave up. qmc=/qsr= are the
++ * message count and send rights of the port cap=recv names, which is the difference
++ * between a reply that landed and never woke anybody and one that never came.
+  */
+ static void
+ clover_bb_chain(task_t root, uint64_t secs)
+@@ -12656,6 +12666,9 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 		uint64_t nrcv = 0;
+ 		uint64_t nrem = 0;
+ 		uint64_t nto = 0;
++		uint64_t frcv = 0;
++		uint64_t ftid = 0;
++		uint64_t fto = 0;
+ 		uint32_t nrmc = 0;
+ 		uint32_t nrsr = 0;
+ 		char comm[16];
+@@ -12663,6 +12676,9 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 		char peer[24];
+ 		const char *exstate;
+ 		const char *end = "-";
++		const char *cap = "none";
++		uint32_t nqmc = 0;
++		uint32_t nqsr = 0;
+ 		int busy = 0;
+ 
+ 		comm[0] = exec[0] = peer[0] = '\0';
+@@ -12686,6 +12702,20 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 				    !is_saved_state32(ss) && (thr->state & TH_RUN) == 0 &&
+ 				    (int64_t)saved_state64(ss)->x[16] == CLOVER_BB_M2_TRAP) {
+ 					ntrap++;
++					/*
++					 * Round296. The first thread found inside the trap is kept whatever its
++					 * x3 says, because boot 83 ended both leaves on no_send -- a thread in
++					 * the mach trap whose destination port is zero, which is not a thread
++					 * that is not waiting but one that is receiving only. What it waits for
++					 * arrives on the name in x5>>32, so that name is a reading rather than a
++					 * blank, and the queue under it says whether the reply has already landed
++					 * while the thread still sits there.
++					 */
++					if (frcv == 0) {
++						frcv = (uint64_t)saved_state64(ss)->x[5] >> 32;
++						ftid = thr->thread_id;
++						fto = (uint64_t)saved_state64(ss)->x[7];
++					}
+ 					if (nrem == 0 &&
+ 					    (uint32_t)saved_state64(ss)->x[3] != 0) {
+ 						nrem = (uint64_t)saved_state64(ss)->x[3];
+@@ -12704,6 +12734,25 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 		} else if (nrem == 0) {
+ 			end = "no_send";
+ 		}
++		/*
++		 * Round296. Which thread the row's thid=/rcv=/to= belong to has to be on the row:
++		 * a hop that sends names its destination in x3 and a hop that only receives names
++		 * nothing there, and boot 83 printed both shapes as the same three columns. The
++		 * receive-only case now fills those columns from the trap thread it found and asks
++		 * that name's own queue, because qmc>0 with the thread still waiting is a reply
++		 * that has landed and never woke anybody -- a different fault from qmc=0, where the
++		 * reply has not arrived at all. No lock is held here; clover_sb_port_mail takes the
++		 * object's own lock and reads two words.
++		 */
++		if (nrem == 0 && frcv != 0) {
++			cap = "recv";
++			ntid = ftid;
++			nrcv = frcv;
++			nto = fto;
++			clover_sb_port_mail(cur, (mach_port_name_t)frcv, &nqmc, &nqsr);
++		} else if (nrem != 0) {
++			cap = "send";
++		}
+ 		if (nrem != 0) {
+ 			uint32_t k;
+ 
+@@ -12745,14 +12794,14 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 		if (pp != NULL) {
+ 			strlcpy(comm, proc_name_address(pp), sizeof(comm));
+ 		}
+-		printf("clover r295: hop=%u t=%llu pid=%d comm=%s exec=%s ex=%s"
+-		    " threads=%u wait=%u run=%u trap=%u thid=%llx rcv=%x remote=%x"
+-		    " to=%llx rmc=%u rsr=%x peer=%s end=%s\n", hop,
++		printf("clover r296: hop=%u t=%llu pid=%d comm=%s exec=%s ex=%s"
++		    " threads=%u wait=%u run=%u trap=%u cap=%s thid=%llx rcv=%x remote=%x"
++		    " to=%llx rmc=%u rsr=%x qmc=%u qsr=%u peer=%s end=%s\n", hop,
+ 		    (unsigned long long)secs, task_pid(cur),
+ 		    comm[0] != '\0' ? comm : "-", exec[0] != '\0' ? exec : "-", exstate,
+-		    call, nwait, nrun, ntrap, (unsigned long long)ntid,
++		    call, nwait, nrun, ntrap, cap, (unsigned long long)ntid,
+ 		    (unsigned int)(uint32_t)nrcv, (unsigned int)(uint32_t)nrem,
+-		    (unsigned long long)nto, nrmc, nrsr,
++		    (unsigned long long)nto, nrmc, nrsr, nqmc, nqsr,
+ 		    peer[0] != '\0' ? peer : "-", end);
+ 		if (nseen < (uint32_t)(sizeof(seen) / sizeof(seen[0]))) {
+ 			seen[nseen++] = task_pid(cur);
