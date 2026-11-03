@@ -323,7 +323,8 @@ clover_gpu_report_ldo_words(unsigned t, const char *stage)
         (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoVrefTest),
         (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoVref),
         (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoCtrl),
-        // 0x20: no name in msm_gfx_ldo.c, so it is printed as a word and nothing more.
+        // 0x20: no #define in msm_gfx_ldo.c, but register_str[8] (:249) calls it LDO_STATUS0. Only the
+        // word is printed; the round291 reading of 0x24 is the same kind of unnamed-bits case.
         (unsigned) clover_gpu_read(clover_gpu_gpucc, 0x9020U),
         (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoStatus1),
         (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoStatus),

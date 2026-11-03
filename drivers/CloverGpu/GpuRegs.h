@@ -112,8 +112,10 @@
 // LDO_CFG0_REG :25, LDO_CFG1_REG :26, LDO_CFG2_REG :27, LDO_LD_DATA_REG :28, LDO_VREF_TEST_CFG :30,
 // LDO_VREF_SET_REG :34 and PWRSWITCH_CTRL_REG :39 (both read by r291), LDO_STATUS1_REG :54 (defined
 // there but never read by that driver), PWRSWITCH_STATUS_REG :56 (r291), REF_CURRENT_X1_REG :61 and
-// REF_CURRENT_X2_REG :62. The word at 0x20 is named by nothing in that file, so the row prints it
-// and claims nothing about it. ADC_CTL_REG 0x34 stays untouched: `gfx_ldo_vreg` declares
+// REF_CURRENT_X2_REG :62. The word at 0x20 has no #define in that file, but the vendor's own dump
+// table names it -- register_str[] :240-251 lists "LDO_STATUS0" at index 8, and dump_registers()
+// (:253-262) reads offset i*4 -- so a reading may be called LDO_STATUS0. The row still prints only
+// the word, and nothing is claimed about its bits. ADC_CTL_REG 0x34 stays untouched: `gfx_ldo_vreg` declares
 // reg = <0x0506e000 0x34> (sdm660-regulator.dtsi:523), so 0x30 is the last word inside the window.
 // sdm660_ldo_config[] :147-158 is the vendor's own expected word for the named ones -- ATEST 0x00000080,
 // CFG0 0x0100A600, CFG1 0x000000A0, CFG2 0x0000C3FE, LD_DATA 0x00000000, VREF_TEST_CFG 0x00401100,

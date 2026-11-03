@@ -422,3 +422,55 @@ clover r291: gpu t=617 ldo beat vref=00000000 val=0 uv=375000 ctrl=80000038 byp=
    对上 ⇒ XBL/固件编过程序，缺的只剩 fuse 的模式判据；全 0 或全 `0xffffffff` ⇒ 要么没人编，要么这页没应答
    （正对照仍按 r282：同拍 `cx_on`）。**没有这格读数之前不写任何位。**
 5. **不动主线。** 桌面仍 CPU-first；这一格是并行取证线，本轮不改 `drivers/CloverGpu` 的字节。
+
+### 5.11 更正 §5.10 第 3 条：本板根本不跑那段 fuse 代码；决定模式的是 CPR4 那三枚 fuse 行（2026-11-03，宿主，未开花机）
+
+同一份 `msm_gfx_ldo.c`（sha256 `929bc99f86f1…`）逐层回到调用点之后，§5.10 第 3 条那句「要不要抬这颗 LDO 由
+`get_operating_mode()` 里的 `ldo_fuse_enable` 决定」**在本板不成立**——不是判据选错了，是那段代码在 SDM660 上
+压根不会被执行。顺带把 boot 81 那行的读法改掉，并给「下一手」换了一个更靠前、而且能一次读完的问题。
+
+1. **fuse 那条链挂在 MSM8953 分支上。** `msm_gfx_ldo_probe()` 的分派里，`case MSM8953_SOC_ID`（`:1550-1558`）除了
+   `ops_type = CORNER` 还调 `msm_gfx_ldo_corner_config_init()`（`:1553`）；`case SDM660_SOC_ID`（`:1560-1565`）只做三件事：
+   挂 `sdm660_ldo_config`、置 `ops_type = VOLTAGE`、给 constraints 补 `REGULATOR_CHANGE_BYPASS`。而
+   `msm_gfx_ldo_corner_config_init()`（`:1459-1494`）才是 `target_init`（`:1253`，把 `ref_volt`/`ldo_enable_param`/`init_volt_param`
+   全指到 `msm8953_*` 那几张表）、`efuse_init`（`:1030`，映射 fuse 窗口）与 `voltage_init`（`:940`，`:1017` 读 fuse、
+   `:1023` 写 `ldo_fuse_enable`）的**唯一调用者**。`rdesc->ops` 也在 `:1582-1585` 分岔：CORNER 用 `corner_ops`，
+   本板用 `voltage_ops`——而 `get_operating_mode()` 只被 `:436`（`corner_enable`）与 `:708`（`set_corner`）读到。
+   ⇒ **本板上 `ldo_fuse_enable` 恒为 0（`kzalloc` 的字段），`efuse_base` 从没映射，那张 `0x00784000` 窗口
+   `msm_gfx_ldo.c` 自己一次也没读。** §5.10 给「门槛在 fuse」找的理由要收回；`msm_gfx_ldo.c` 里那段 fuse 代码不是本板的门槛。
+2. **本板 mode 的真正生产者只有消费者一句。** `msm_gfx_ldo_voltage_enable()`（`:819-846`）不问 fuse，
+   直接 `enable_mode = ldo_vreg->mode`；`mode == LDO_MODE` 才 `enable_ldo_mode()`（`:325`），否则 `enable_bhs_mode()`（`:373`）。
+   而写 `mode` 的地方全文件只有一处：`msm_gfx_ldo_set_bypass()`（`:786-808`），即消费者调 `regulator_set_bypass()`。
+   这个消费者在 DT 里点名了：`gfx_cpr` 的 `vdd-thread0-ldo-supply = <&gfx_ldo_vreg>`（`sdm660-regulator.dtsi:559`），
+   而 CPR4 那份驱动把自己的初始值写成 `vreg->ldo_regulator_bypass = BHS_MODE`（`cpr4-mmss-ldo-regulator.c:513`，
+   sha256 `045af7dc9c8c…`）。⇒ **出厂默认是 BHS 供电，LDO 侧那九个词全 0 与「本板走 BHS」不矛盾**，boot 81 的普查
+   不能单独读成「有人本该按那张表配而没配」。**但要留一条诚实的缺口**：`enum msm_ldo_supply_mode` 的声明在
+   `linux/regulator/msm-ldo-regulator.h`，这份头文件没归档 ⇒ 不能说 `BHS_MODE == 0`，只能说 CPR4 显式写成 BHS_MODE。
+3. **那么 `ctrl=0x80000038` 现在能命名的比 boot 81 那句更多，也更朴素。** 按 `:39-52` 那位表拆开：BIT(31) CLAMP_IO=1、
+   BIT(5) LDO_PDN=1、BIT(4) LDO_UNDER_SW_CTRL=1、BIT(3) 无名；**BIT(9) PWR_SRC_SEL=0 ⇒ 电源源选的是 BHS**，
+   **BIT(1) BHS_EN_FEW 与 BIT(2) BHS_EN_REST 都=0 ⇒ BHS 这一路也没被抬**。合起来是一句更硬的读法：
+   **这颗轨的两个供电级（LDO 与 BHS）在这次引导链里都停在复位状态**——这解释了 `gx_on=0`，而且不依赖那 11 个 0。
+   同一枚 `0x1C` 还反过来证伪「固件配过」：`msm_gfx_ldo_init()`（`:1102`）在 probe 时**无条件**先清 CLAMP_IO、
+   置 EN_LDOAP_CTRL_CPR（BIT(29)，`:1129-1132`）再写那九词（`:1135-1140`）；读到 CLAMP_IO 仍为 1、BIT(29) 仍为 0
+   ⇒ **本板从 fastboot 直接进 XNU 这条链上，没有任何人跑过 gfx-ldo 的 init**（XBL/AOP 没跑，Linux 更没跑）。
+   这一条把「下一手是读别人的表」换成了「下一手是我们自己按 `:1135`+`:325` 那两段配」，出处仍是同一份 sha256。
+4. **决定「要不要抬 LDO」的 fuse 在 CPR4 那份文件里，而且三枚行号全点得名。** `cpr4_sdm660_mmss_read_fuse_data()`
+   （`:150-215`）从 `ctrl->fuse_base` 读：`sdm660_mmss_ldo_enable_param`（`:99-106`）= **row 73 的 bit 62/61/60/59/58/57
+   分别对应 6 个 fuse-corner 的「这颗角允许 LDO 模式」**；`sdm660_ldo_cpr_cl_enable_param`（`:108-111`）= **row 71 bit 38**
+   （LDO 模式下允许 CPR 闭环）；`sdm660_cpr_fusing_rev_param`（`:82-85`）= **row 71 bit 34..36**（fuse combo，`CPR4_SDM660_MMSS_FUSE_COMBO_COUNT = 8`，`:59`）；
+   初压与偏移在 **row 65**（`init_voltage_param :73-80` 的 bit 39..24、`offset_voltage_param :87-94` 的 bit 52..44），
+   参考电压表 `sdm660_mmss_fuse_ref_volt`（`:116-123`：585000/645000/725000/790000/870000/925000）配步压 10000（`:125`）。
+   「允许」的最终判据是 `ldo_mode_allowed = DT 的 qcom,cpr-corner-allow-ldo-mode && fuse->ldo_enable[i]`（`:297-326`，属性名在 `:302`），
+   闭环那一路在 `:370-371`。三枚行全落在 DT 已声明的 `reg = <0x00784000 0x1000>`（名字 `fuse_base`，`sdm660-regulator.dtsi:536-537`）里。
+5. **下一手仍是读，而且比 §5.10 的候选小得多：一行 8 字节 × 3 枚 row。** 读 row 65/71/73（各 8 字节，`row * BYTES_PER_FUSE_ROW`）
+   并把上面那些 bit 段解出来打印，问的是**「这颗芯片出厂时被允许走 LDO 吗、允许走闭环吗、六个角的初压是多少」**——
+   这正是 §5.10 想要而找不到出处的那道判据，出处现在在同一块 `0x1000` 窗口里，且 CPR4 与 gfx_ldo 两份文件都点得到名。
+   **两个前提先记账**：(a) 这需要一个新映射（`0x00784000` 不在现有 GPUCC 窗口内），`IODeviceMemory::withRange` 计数=3
+   那枚针要按「DT 声明的第二段窗口」这一条理由**主动**抬到 4，不是顺手加；(b) **行距 8 字节这个事实目前只有
+   `msm_gfx_ldo.c` 那份名字**（`BYTES_PER_FUSE_ROW 8`，`:71`，用处在 `:219`），CPR4 用的 `cpr3_read_fuse_param()` 本体在
+   `cpr3-regulator.c`，没归档 ⇒ 要么先把那份补上（带 sha256），要么把这一行读数标成「按 gfx-ldo 的行距读，stride 未经 CPR4 那份文件证实」。
+   仍**一个位也不写**。
+6. **两处驱动注释比这份笔记更严，已改口。** `drivers/CloverGpu/GpuRegs.h` 与 `CloverGpu.cpp` 都写过「0x20 在那份文件里没有名字」，
+   而 `register_str[]`（`:240-251`）第 9 项——索引 8 ⇒ 偏移 `8*4 = 0x20`——就叫 **`LDO_STATUS0`**（`:249`）；
+   准确的说法是「**有 dump 名字、没有 `#define`**」。`0x24` 反过来：有 `#define LDO_STATUS1_REG`（`:54`）而**没有位名**，
+   所以 boot 81 的 `w24=0x0000000d` 仍然只印不解释。两条都是注释/文档修正，本轮不改任何字节，不发负载。
