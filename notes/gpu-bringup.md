@@ -387,3 +387,38 @@ clover r291: gpu t=617 ldo beat vref=00000000 val=0 uv=375000 ctrl=80000038 byp=
 5. **不动形状。** §5.7 那三条结论（票到了、钟没起、起不动与 gx 没合上同源）没有被本轮推翻或修改；
    本轮只把「债在轨那侧」从推断变成读数。主线（桌面）现在的瓶颈不在这格：boot 77/78 两连「静默无 panic
    复位」占了主线，见 development-log boot 78 ③④⑧。
+
+### 5.10 更正 §5.9 第 4 条：使能全序**有出处**，缺的是厂商自己的模式判据（2026-11-03，宿主，未花开机）
+
+§5.9 写「没有 sha256 出处的序列不写」，然后把门槛安在「顺序与角值来源」上。回到盘上那份
+`notes/sources/sdm660/msm_gfx_ldo.c`（sha256 `929bc99f86f1…`，与 §5.6 同一份）逐条核对之后，这句话**两头都要改**：
+
+1. **顺序有出处，而且名字齐全。** `enable_ldo_mode()`（`:325`）与 `switch_mode_to_ldo()`（`:498`）把每一步
+   的位与注释一起给出：`BHS_UNDER_SW_CTL` BIT(0)、`LDO_UNDER_SW_CTRL_BIT` BIT(4)、`LDO_PREON_SW_OVR_BIT`
+   BIT(7)、`LDO_BYPASS_BIT` BIT(6)、`PWR_SRC_SEL_BIT` BIT(9)、`ACK_SW_OVR_BIT` BIT(8)、
+   `CPR_BYPASS_IN_LDO_MODE_BIT` BIT(30)（`:40-52`），抬压是 `ldo_update_voltage()`（`:297`）——
+   写 `LDO_VREF_SET_REG 0x18` 的 `val` 后 `reg |= UPDATE_VREF_BIT`（BIT(31)）再落回去。
+   boot 78 那行 `ctrl=80000038`（BIT(31) CLAMP_IO｜BIT(5) PDN｜BIT(4) UNDER_SW_CTRL｜BIT(3) 未命名）
+   与 `pwr_src=0`，正好是厂商会走 `switch_mode_to_ldo()` 的起始形状——**清 `LDO_PDN` 那一步在
+   `:537`，不在 `enable_ldo_mode()` 里**，先前把两函数混作一谈是错的。
+2. **但本板不走 CORNER 那一支，所以缺的不是角→电压表。** `msm_gfx_ldo_probe()` 按 SoC 分派：
+   `SDM660_SOC_ID` → `ops_type = VOLTAGE`（`:1561-1562`，`sdm660_ldo_config`），只有 MSM8953 才是 CORNER
+   （`:1550-1552`）。于是 `:360/:387/:504/:645` 那四处 `ops_type == CORNER` 的 `CPR_BYPASS` 写在本板**不该照抄**，
+   `gfx_vreg_corner` 的 `qcom,cpr-voltage-ceiling`（`sdm660-regulator.dtsi:579-581`）也不是编程这颗轨的入口。
+3. **真正的门槛是厂商自己的模式判据。** `get_operating_mode()`（`:230-237`）不看寄存器，看三个软件量：
+   `!ldo_mode_disable && ldo_fuse_enable && ldo_corner_en_map[corner]` 才返回 `LDO_MODE`，否则 `BHS_MODE`；
+   `ldo_fuse_enable` 来自 `msm_gfx_ldo_efuse_init()`（`:1030`）读的那张 fuse 窗口
+   （`cpr4-ctrl@05061000` 的第二段 `reg = <0x00784000 0x1000>`，`sdm660-regulator.dtsi:536/:537`）。
+   **所以「要不要抬这颗 LDO」这个问题在厂商那里由 fuse 决定，而 fuse 在第四张窗口里**——这一点 §5.9 说对了，
+   只是给它的理由（角值表）不对。
+4. **r293 的候选因此还是读，不是写，而且比 §5.9 的「下一手」更靠前。** 厂商每次进出模式都调
+   `dump_registers()`（`:253-262`），它按 `i*4` 读 **0x00…0x28 共 11 个字**（`MAX_LDO_REGS 11`，`:69`）并用 `register_str[]`（`:240-251`）
+   点名——其中 **0x20 那格的名字是 `LDO_STATUS0`，本板从没印过**（r291 只读 0x18/0x1C/0x28），
+   而 `LDO_STATUS1 0x24` 厂商定义了也从不判。这 11 个字全落在 DT 声明的
+   `gfx_ldo_vreg reg = <0x0506e000 0x34>` 里（`:525`，11 个字由 `MAX_LDO_REGS`（`msm_gfx_ldo.c:69`）定），也就是**现有 GPUCC 映射内**（偏移 0x9000），
+   不新增窗口、不动 `IODeviceMemory::withRange` 计数=3 那枚针。把它们与 `sdm660_ldo_config[]`
+   （`:147-158`：ATEST 0x80、CFG0 0x0100A600、CFG1 0xA0、CFG2 0xC3FE、LD_DATA 0、VREF_TEST_CFG 0x00401100、
+   REF_X1 0x230、REF_X2 0x48）并排读回来，问的是**这颗 LDO 到底被谁配置过**：
+   对上 ⇒ XBL/固件编过程序，缺的只剩 fuse 的模式判据；全 0 或全 `0xffffffff` ⇒ 要么没人编，要么这页没应答
+   （正对照仍按 r282：同拍 `cx_on`）。**没有这格读数之前不写任何位。**
+5. **不动主线。** 桌面仍 CPU-first；这一格是并行取证线，本轮不改 `drivers/CloverGpu` 的字节。
