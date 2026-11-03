@@ -22127,3 +22127,18 @@ keystore 这轮的插入没挪动 AMFI 段）→ normalized `2e7e0bea…`（973 
 （`aks-say-wdt present, aks-say-wdt-nomap present`，r289 三枚 `abort-*`、r290 `gpu-row-branches`、
 r291 `gpu-row-ldo` 仍在册）；两个改过的源在组装树 `-Werror` 过（`build-arm-driver.py CloverSdhci` /
 `NativeKeyStoreEvents`）。
+
+**⑨ 落盘当天把自己今早那句话收紧了（宿主核对代码，未花开机）。** 上面 ④ 写「块层先静 11–12 s」，
+这个说法读得比仪器能说的更远，当场更正。`flightEnter()` 只有两个调用点——读路径 `CloverSdhci.cpp:2787`
+与 `clover_emmc_block_write` 的 `:5058`；而 `clover_emmc_flush_cache`（`:5801`，CloverInput 落报告就走它）
+和两个环的落卡 `ringWriteRecord → writePioBlock`（`:3411`/`:3430`）**既不记 entry 也不取 guard**。
+所以 boot 78 那 11 s 里 tee 行照常上卡，块设备没有沉默；飞区能说的是**「没有新的读/写请求开始」**，
+说不了「没人用盘」，更说不了「盘挂住」。
+顺带把 beat 的语义也从代码里核实了一遍（`:3727-3757`）：beat 用 try 取 host，**取不到就直接返回、不写槽**，
+`miss++` 只留在上一拍的字里——所以「拍陈旧」是流量饿掉，不是卡死；boot 76（拍旧 126 s、entry 新鲜）
+与 boot 74（旧 371.7 s）都属于这一类。
+分「驱动定时路径停了」与「卡不接了」这两支，能比的是 **beat（驱动直接落卡）** 与 **tee（要搭一次受
+guard 的操作才刷得出去）** 两条写通路各自的**最后一条落卡**，而不是 entry 环；这条改判据同时进了 README、
+porting.toml 的 storage 与 diagnostics 两段。`board.toml` 里 r292 那条已发布标题带着今早那句过强的话，
+**留着不改**：它是卡上镜像的标签，改了会让标签和板上字节讲的不是同一轮；更正从下一轮标题起生效。
+教训归到已有那条：**一条新读数的强度，等于它调用点的覆盖范围**——写结论前先数一遍谁没被记进去。
