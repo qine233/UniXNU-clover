@@ -233,6 +233,25 @@ leave」一路收紧到一句可测的话：
   驱动侧单独一轮：不动内核补丁、不动 boot args、不动 tee、不改 `panicAppendText` 的 `rc` 编码（那是 patcher 的契约）。
   **boot 91 的五支判读态（含「没有 `drain enter`＝这靴压根没喊」这一支）预登记在
   `notes/development-log.md` §Round301 ⑤**；债 (2)（tee 自报行只有 12 条）与「尾巴属镜像还是属核数」那轮控制仍未动。
+* **boot 91（r301 / v0.7.6 的读回）：这一靴落在预登记五支之外，而它把一个更基本的坑翻了出来——判决记录读起来像读数，其实是两次写的混血**。
+  八核第四次上线、跨第三枚镜像（`r271 real=8 reg=8 start=7 run=8`、`r299 req=1 con=1 run=7 st=07777777 fl=0 rc=0×7 entry=0,a3203000×7`、
+  `r270 sent=271685 recv=271562`），桌面那一格照旧没动。**r301 无法在这一靴判读**：卡上既无 `drain enter`、也无
+  `r301: panic text`/`panic copy` 任何一行，而飞区 panic 槽里那一格署名 boot 91、`event=5 dir=3`、
+  `t=631323 ms`，**八个 extras 却只有 word 35 有值、其余全 0，同时 header 带着 `blocks=8` 和活的 `stage_lba/stage_pid/comm=osanalyt`**。
+  逐字反推 + 枚举源码后确定：**没有一次 `flightWrite` 能同时产出这两套字段**——`event/dir=5/3` 只出自
+  `flightPanicMark`，而 `blocks=` 与活的 stage 只出自 `flightEnter`/beat，且 boot 戳只在 `extraWords == 0` 那条路上打；
+  `gFlightBlock` 是**唯一一块共享记录缓冲**，sink 与并发块请求在同一次 FIFO 传输里把它重建 ⇒ 卡片收到的是混血。
+  **boot 88 那一格与此逐字同形** ⇒ 不是 boot 91 偶然、也不是 r301 引进（它一行 `flightWrite` 都没碰）。
+  于是这一靴**两支都活着、我不选边**：(a) sink 进了、marker 头几个字落了、后续被拒且复位前排干一次没写成；
+  (b) sink 没进、`5/3` 另有来源。分不开的原因是**marker 记录没有自己的 magic**，读者把 r293 的 boot 戳当成 `stage=91` 印了出来。
+  结局时间带 **642.7–7xx s**（下界内核环尾 `642.683981`，上界读回墙钟；marker 的 `631323 ms` + 已知钟偏 ≈ 641.1 s
+  ⇒ **驱动钟与内核钟第一次互相验证**）。八核像四靴四个不同时间（642.7–7xx / 661–7xx / 746–7xx / 835–9xx）
+  ⇒「分布」第四次落地，但**「核数 vs 镜像」那一票仍未投**；普查尾巴 `r262: th` 与 `clover r300` 这一靴仍各 **0 行**
+  ⇒ **连续四靴、跨三枚镜像**。**本轮已改的是读者（纯宿主）**：`read-clover-log.py` 对 kind-23 panic 格加拒读规则
+  （stamp/gates/log_ready/log_first 全 0 ⇒ 印「这里没有 marker」并保留 `blocks`/`pid`/`comm` 作为现场证据），
+  `--selftest` 用手工拼的混血做正对照，变异测试 `if False` ⇒ `AssertionError`，boot 89/90 两窗不误伤。
+  两笔设备侧债（marker 独占缓冲 + 自带 magic；句子要有一条**不预读、不靠后续 flush** 的盲写路径）记为 **r302**，
+  形状按用户规矩先查 sheng 的对照做法再动。详见 `notes/development-log.md` §boot 91 ①–⑧。
 * **再后一支（本格欠的两条仪器债）**：`vbits=`（`ipc_right_lookup_read()` 已经交出的 entry 位掩码，
   用来分 port set / send-once，不需要对象、锁纪律与 translate 同一条）与 `qmc=/qsr=` 自带返回码。
 * **那笔「等设备解锁」的死等已经不是现场，但它的机制现在读全了**：r274 命中的形状是

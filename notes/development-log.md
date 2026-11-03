@@ -23503,3 +23503,93 @@ chars=%u part=%u %s`——**`rc >= 100` 表示报告记录已经落了，再说�
 `check-clover.py` EXIT=0、`verify-clover-payload.py` EXIT=0（48 格全 OK，
 `kernel.macho: panic-time log tail linked` 那格现含 `panic-text`/`panic-copy` 两枚新针）。
 构建日志 `r301-build-kernel.log` / `r301-build-payload.log` / `r301-verify.log`。
+
+## boot 91（round301 / v0.7.6 的读数）：**panic 槽里那条记录不是任何一次 `flightWrite` 写得出来的**
+
+冷刷 `round301-v0.7.6-payload.img`（sha256 `d5c2c984…`，刷前对照窗 `round301-boot91-window.bin.pre-flash` 里
+槽 61 还是 boot 90 那枚完整 marker），`--boot-after-flash --allow-misc-bcb`，`unattended-exit=0`，
+板子 21:38 起跑、21:50 读回；boot 计数 90 → 91（脚本自己报了「the boot count moved」）⇒ 这窗确实是刚刷进去那枚镜像跑的。
+
+**① r301 的两行一行都没到卡上，而且这次不是地平线问题。** 全窗 `grep -c r301` = **0**；driver verdict 环里
+boot 91 名下有 **39 条**（slot 0–38，`boot 91`、`said by driver`、校验全 ok），槽 39 起是上一靴的遗留。
+按 §Round301 ⑤ 那张表，这落在预登记的**第六支**上（我登记了五支，五支全落空）：
+`drain enter boot=91` 也没有，`panic tail`/`r184: panic drain`/`drain exit` 也都没有 ⇒
+**排干根本没走，或者走了但卡一次没答应**。r301 那份副本押的是「后来的 flush 会重试」，
+这条在 boot 90 上成立、在这靴**不成立**——它需要的正是它没拿到的那 15 s。
+
+**② 但 panic 槽里确实有一条 boot 91 写的记录，而它的字段集合不属于任何一次调用。** 逐字解 sector 61
+（lba 13320277，`record_lba` 自己就这么写着），四列并排（boot 88 的写 / boot 90 / boot 91 / 刷前的 boot 90）：
+
+| 字 | boot 88 写的 | boot 90 | **boot 91** |
+|---|---|---|---|
+| kind / seq / slot | 23 / 0 / 0 | 23 / 0 / 0 | 23 / 0 / 0 |
+| **event / dir** | **5 / 3** | **5 / 3** | **5 / 3** |
+| lba / **blocks** | 0 / 0 | 0 / 0 | 0 / **8** |
+| t_ms | 823033 | 686630 | **631323** |
+| ops / guard | 178187 / 178188 | 135024 / 135025 | **158659 / 158660** |
+| stage | 1 | 1 | **1 = kStageEntry** |
+| stageLba / stagePid / comm | 31508320 / 112 / chronod | 29510576 / 170 / audiomxd | **29044832 / 195 / osanalyt** |
+| extra[0] (stage) | **88** | 0 | **91** |
+| extra[1..7] | 全 0 | 1 / 0x20fdf / 13320216 / 0 / 0 / **90** / **0x7** | **全 0** |
+
+矛盾是字面可读的：`event=5, dir=3` 只有 `flightPanicMark` 会写（源码里 `kFlightEventPanic` 只在 `:8968` 出现一次，
+`dir=3` 与它同一条调用）；而 **panic marker 不可能有 `blocks=8`**（它传 `0, 0`）、**不可能缺 extras**
+（它传 8 个）、**word35 不可能是 boot id**（`gFlightBlock[35] = gBootId` 只在 `extraWords == 0` 那条规则里发生，
+即 `flightEnter` / beat 那两条不带 extras 的路径），`stage=1(kStageEntry)` + `stageLba/pid/comm` 指向
+一笔**实时块请求**（osanalyt 在 lba 29044832 读 8 块，正是 boot 91 最后 12 条 flight entry 里那一族）。
+⇒ 一个扇区里同时存在**两次 `flightWrite` 的字段集合**。机制只能是：`gFlightBlock` 是**唯一一块共享记录缓冲**，
+每条调用先清零、逐字重建 word0..34 再填 extras，然后 `writePioBlock` 逐字把**这块缓冲**经 FIFO 送出去；
+sink 与并发块请求路径在同一次传输里重建它，卡片收到的就是混血。
+`gPanicActive` 是 sink 进门就置的，但 `flightEnter` 那条路径不看它（它只挡 beat）。
+**boot 88 那一格与此逐字同形**（`extra[0]=88`、event/dir=5/3、extras 其余全 0）⇒ 这不是 boot 91 的偶然，
+也不是 r301 引进的（r301 一行 `flightWrite` 都没碰）。
+
+**③ 因此这一靴的判读只能是「两支都还活着」，我不选边。** (a) sink 进了（marker 的头几个字落了），
+随后 append 被拒、排干把 `drain enter` 与 `panic copy` 塞进环却在复位前一次没写成；
+(b) sink 没进，扇区里 `5/3` 那两个字的来源另有其人。分不开的原因很具体：**marker 记录没有自己的 magic**，
+所以任何落在这一格的 kind-23 记录都会被读者当成 marker 印出来（解码器现在印的 `stage=91`
+就是 r293 的 boot 戳被当成 `stage` 读——又一个「在错偏移上读到一个像样的数」的实例，见 [[feedback-instrument-horizon]]）。
+下一轮的手术因此是**先让这条记录无法被误读**：marker 用自己的缓冲 + 自己的 magic，读者遇到
+「extras 从没被写过的那一格」要印成「这里没有 marker」而不是印一串假字段。
+
+**④ 桌面主线这一格照旧没动。** 八核第四次上线（跨三枚镜像，逐字段同前）：
+`clover r271: cpu t=642 real=8 max=8 reg=8 start=7 run=8 s=01111111 r=11111111
+tm=34993,45578,29189,15241,12811,6698,4082,5713`、
+`clover r299: smp t=642 req=1 con=1 run=7 st=07777777 fl=00000000 rc=0×7 entry=0,a3203000×7`、
+`clover r270: ipi t=642 sent=271685 recv=271562 tick=154244 sgi=57905,…,10860`。
+同一拍 `clover r262: census t=642 pid=58 threads=15 shown=15 hidden=0 wait=14 run=1 rx=9 tm=0` 之后
+`r262: th` 全窗 **0 行**、`clover r300` 全窗 **0 行**（`grep -c` 两个都是 0）
+⇒ **尾巴连续四靴缺席、跨三枚镜像**；债 (3) 那轮控制仍未跑。`run=1` 照旧不作证据（[[feedback-instrument-horizon]] 第三层）。
+
+**⑤ 结局的时间带。** 下界由内核环最后一行给：`[ 642.683981] apfs_trim_to_prev_fsize:180: disk5s1 *** reset
+ino 1370 size back to 3 (from 32768)` ⇒ **642.684 s**（环里这一靴没有 panic 文案行）。
+驱动侧那两个时间戳与它对得上：marker 的 `t=631323 ms` + 上轮量的钟偏 ≈ 641.1 s，飞区最新一笔 `631320 ms`
+也落在同一秒——**两条钟第一次互相验证**。上界由读回墙钟给（21:38 起跑、21:50 拉卡，扣 recovery 与 dd ⇒ **≈7xx s**）
+⇒ 带 **642.7–7xx s**。八核像四靴四个时间：642.7–7xx（91）/ 661–7xx（89）/ 746–7xx（90）/ 835–9xx（88）
+（marker 自己的 `t=631323 ms` 落在 boot 91 这一条带内，不另计一靴）
+⇒ 四条四个时间，**分布**这一条第四次落地，同时把「八核像都早」钉成一个性质；
+**「核数 vs 镜像」那一票仍然没投**（能投它的只有 §④ 那轮控制）。
+
+**⑥ 本轮新增两笔仪器债（合起来就是 r302）：** (1) **marker 与实时请求共用一块记录缓冲** ⇒ 一次并发重建
+就能把判决记录写成混血，而混血**读起来像读数**；(2) **marker 没有自己的 magic** ⇒ 读者无法区分
+「这条记录被写过」与「这一格恰好是别的记录」。r301 那份 RAM 副本的方向没错，但它依赖的「后来的 flush」
+在这一靴不存在 ⇒ 句子要有**一条不需要任何后续机会的写法**（盲写一格、不预读、带自己的 magic），
+具体形状等 sheng 那边的对照结论（已按你的规矩先查再动）。
+
+**⑦ 读者这一侧已经改完了（本轮内，纯宿主，不动卡上任何东西）。** `scripts/read-clover-log.py` 的
+`decode_flight` 现在对 kind-23 的 panic 格加一条**「这一格从没被当 marker 写过」的拒读规则**：
+`event==5` 且 `extra[6]（stamp）==0` 且 `extra[7]（gates）==0` 且 `extra[1]（log_ready）==0`
+且 `extra[3]（log_first）==0` ⇒ 记成 problem，不产出 marker 字段；报告段里这些格**单独成行**印成
+`flight: panic slot N (lba …, seq …, t=… ms) -- not a marker: its eight extras were never written (stamp 0, gates 0) while the header names a live request -- blocks=…, stage=…, pid=…, comm=…, t=… ms`，
+把**证据留在读数位置上**（谁在飞、多少块、哪个 pid/comm），而不是印一串假字段或干脆丢弃。
+三个窗重跑：boot 89 拒 `comm=chronod blocks=0`（那格是真没写过）、**boot 91 拒 `blocks=8 … comm=osanalyt`**
+（正是 ② 的混血）、boot 90 输出逐字不变（没有这种格，改动不误伤）。
+`--selftest` 加了正对照：手工拼一枚混血（event 5 / dir 3 / `blocks=8` / 活的 `stage_lba`、`stage_pid`、
+`comm="osanalyt"` / `boot=0`，再只在 word 35 打 boot 戳）⇒ 断言 problem 命中、断言拒读行真的印出、
+断言**没有任何一行把 `stage=91` 当成 marker 报出来**。变异测试（把判据短路成 `if False`）⇒ `AssertionError: []`，
+改回后文件与备份逐字节相同。这一改**不结清 ⑥ 的两笔债**（设备上 marker 仍共用缓冲、仍无 magic），
+它只保证「混血不再伪装成读数」——下一轮的手术仍在 r302。
+
+**⑧ 产物。** `~/clover-out/round301-boot91-window.bin`（623,104 B）与解码 `…bin.txt`
+（16 report / 64 verdict / 3 probe / 512 kernel，boot 91）、`…bin.pre-flash`（刷前窗，boot 90）、
+`…landing-sensors.txt`、`…landing-rawdump-head.bin`、`r301-boot91-unattended.log`（`unattended-exit=0`）。

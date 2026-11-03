@@ -347,6 +347,21 @@ def decode_flight(data, first_lba):
                 problems.append(f"dir {words[7]} unknown")
             if event is not None and words[6] != event:
                 problems.append(f"event {words[6]} is not a {FLIGHT_EVENTS[event]}")
+            # Round302, read out of boot 91's frame: this sector holds a panic-event record whose
+            # eight marker words were never written, because flightWrite rebuilds ONE shared buffer
+            # and a block request can cut into the sink's own transfer. Such a sector is not a
+            # marker: the stamp (extra[6]) and the gates (extra[7]) are both zero while the header
+            # still carries a live request (blocks != 0, stage == kStageEntry, a pid and a name).
+            # Printing it as a marker invents a `stage=91` out of the round293 boot stamp, which is
+            # exactly the reading-shaped bug this file exists to refuse.
+            if (event == 5 and words[35 + 6] == 0 and words[35 + 7] == 0
+                    and words[35 + 1] == 0 and words[35 + 3] == 0):
+                comm = struct.pack("<2I", words[33], words[34]).rstrip(b"\0").decode("latin1")
+                problems.append(
+                    "not a marker: its eight extras were never written (stamp 0, gates 0) "
+                    f"while the header names a live request -- blocks={words[9]}, "
+                    f"stage={words[22]}, pid={words[30] or words[32]}, comm={comm or '-'}, "
+                    f"t={words[10]} ms")
             record = {
                 "slot": slot, "lba": words[2], "seq": words[4], "event": words[6],
                 "dir": words[7], "op_lba": words[8], "op_blocks": words[9],
@@ -527,6 +542,15 @@ def flight_report(groups, boot_id=0):
                   f"cnt0={cnt0:#x} cnt1={cnt1:#x} freq={freq} elapsed={period:.3f}s{caveat}")
     else:
         print("flight: no deadline record -- the deadline either did not fire or could not write")
+    rejected = [(slot, record, problems) for slot, record, problems in groups["panic"] if problems]
+    if rejected:
+        # Round302: a sector the chain cannot trust is still a reading, and it is the reading that
+        # says the sink's marker was mixed with somebody else's record. Say it, and say whose request
+        # is in the same sector, because that is the whole content of the frame.
+        for slot, record, problems in rejected:
+            for problem in problems:
+                print(f"flight: panic slot {slot} (lba {record['lba']}, seq {record['seq']}, "
+                      f"t={record['t_ms']} ms) -- {problem}")
     if panic:
         print(f"flight: {len(panic)} panic marker records in the window")
         for record in panic:
@@ -894,6 +918,32 @@ def selftest():
           FLIGHT_ENTRY_OFFSET)
     problems = decode_flight(bytes(wrong), first_lba)["entries"][0][2]
     assert any(problem.startswith("kind 21 != 23") for problem in problems), problems
+
+    # Round302, read out of boots 88 and 91: a panic slot can hold a record whose event and dir
+    # words are the marker's while its header names a live block request and its eight extras were
+    # never written -- flightWrite rebuilds one shared buffer, so a request can cut into the sink's
+    # transfer. Such a slot must be named as not-a-marker: the alternative prints the round293 boot
+    # stamp as `stage=`, which is a number with no meaning and looks exactly like a reading.
+    mixed = bytearray(flight)
+    chimera = bytearray(build_flight_record(first_lba + FLIGHT_PANIC_OFFSET, 0, 5, 3, 0, 8,
+                                            t_ms=631323, stage=1, stage_lba=29044832,
+                                            stage_blocks=8, stage_pid=195, cur_pid=195,
+                                            comm=(0x6e61736f, 0x74796c61), boot=0))
+    struct.pack_into("<I", chimera, 35 * 4, boot_id)   # the no-extras stamp lands in word 35
+    place(mixed, bytes(chimera), FLIGHT_PANIC_OFFSET)
+    decoded = decode_flight(bytes(mixed), first_lba)
+    problems = decoded["panic"][0][2]
+    assert any(problem.startswith("not a marker") for problem in problems), problems
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        flight_report(decoded, boot_id)
+    said = out.getvalue()
+    assert "panic slot 0 (lba 13320277" not in said or "not a marker" in said, said
+    assert "not a marker: its eight extras were never written" in said, said
+    assert "osanalyt" in said, said
+    # ... and it is not a marker, so no line may claim a stage for it.
+    assert not any(line.strip().startswith("panic seq") and "stage=91" in line
+                   for line in said.splitlines()), said
     print("read-clover-log selftest: report window, both rings, flight region, wrap order, "
           "ring kinds and bad records all ok")
     return 0
