@@ -1319,6 +1319,22 @@ def check_sb_sample(kernel: bytes) -> bool:
              # own threads whether any waits on that name. Pinned whole for the standing reason.
              "bb-receiver-census": (b"clover r303: hop=%u t=%llu rpid=%d rnm=%x rentr=%d"
                                     b" rvbits=%x rwait=%u rwtid=%llx rbusy=%d\n") in kernel,
+             # Round304 relays the fire's tail rows -- thread rows, chain pair, receiving row, and the fire's own
+             # opening and closing rows -- into round212's driver RAM ring as well as to the console, because boot
+             # 93 put the census head on the card and nothing behind it: those rows ride the tee, the tee rides a
+             # block tail, and that boot ended before the next one. Two readings are pinned here. The relay helper
+             # has to be in the shipped image (it is static, so its name lives in the symbol table and nowhere
+             # else), and the driver has to say what it moved, because rows sitting in BSS with nothing reporting
+             # seen/next/pend are the same silence this round replaces -- a number that is absent is the reading
+             # boot 88, 90, 91 and 93 each had to argue about. The one-copy check is the other half: the relay is
+             # the same buffer printf() prints, so a format string appearing twice would mean the row was rewritten
+             # rather than copied, which would cut boots 50 through 93 out of the comparison.
+             "census-relay": b"clover_census_row" in kernel,
+             "census-relay-onecopy": all(kernel.count(marker) == 1 for marker in (
+                 b"clover r262: th tid=", b"clover r300: fire t=", b"clover r300: done t=",
+                 b"clover r296: hop=", b"clover r298: hop=", b"clover r303: hop=")),
+             "probe-beat-flush": (b"CloverSdhci r304: probe why=%s wrote=%u seen=%u next=%u pend=%u"
+                                  b" flushed=%u skipped=%u stalled=%u refused=%u dropped=%u\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

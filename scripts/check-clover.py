@@ -4102,6 +4102,90 @@ def check_board(errors: list) -> str:
             errors.append("the r303 row is not exempt from the per-pass push cap: a capped receiving-side row "
                           "reads as a hop whose receiver has nothing, the false-empty the round was written to fill")
 
+        # Round304 pays the debt every census round since 262 has carried and boot 93 finally named: the fire's
+        # tail rows ride printf -> msgbuf -> the tee, and the tee only runs at the tail of a block request. Boot
+        # 93 put the census head on the card at 555.48 s (r262 census threads=18 shown=18) and nothing after it --
+        # not one of the 18 thread rows, not the chain pair, not r303's receiving row, not r300's own fire=/done=
+        # pair, all of which are exempt from the push cap and none named by a capped-at notice -- and then the
+        # board reset with no sink, so the panic drain never ran and the relay ring it owns was never read either
+        # (zero kind-25 records in that window). So this round does two halves of the same thing: the kernel hands
+        # those rows to round212's relay as well as to the console, and the relay gets consumers that do not need a
+        # panic -- the guarded block tail and CPU0's four-second beat. The format strings are untouched bytes;
+        # only the call changed, from printf() to snprintf() plus the handover, so boots 50 through 93 still line up
+        # against 94. The relay must not block either: its handover is one atomic counter and a copy.
+        r304_name = "z" * 61 + "-clover-r304.patch"
+        r304_patch = next((base / "patches/xnu-clover" / r304_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r304_name).is_file()), None)
+        if r304_patch is None:
+            errors.append(f"patches/xnu-clover/{r304_name} is missing: without the relay the census tail stays a "
+                          "reading that only survives when the board reaches the panic sink, which boot 93 did not")
+        else:
+            r304_text = r304_patch.read_text()
+            r304_added = "".join(line for line in r304_text.splitlines(True)
+                                 if line.startswith("+")
+                                 and not line.lstrip("+").lstrip().startswith(("*", "/*")))
+            for needle in ('extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);',
+                           'clover_census_row(const char *line)',
+                           'clover_emmc_probe_say(line, (unsigned int)strlen(line));',
+                           'char crow[256];',
+                           'int crowlen = snprintf(crow, sizeof(crow),',
+                           'if (crowlen > 0) {',
+                           '"clover r296: hop=%u t=%llu pid=%d comm=%s exec=%s ex=%s"',
+                           '"clover r298: hop=%u t=%llu prev=%lx rvobj=%lx verr=%d vname=%x robj=%lx"',
+                           '"clover r303: hop=%u t=%llu rpid=%d rnm=%x rentr=%d"',
+                           '"clover r262: th tid=%llx st=%x we=%llx cont=%llx"',
+                           '"clover r300: fire t=%llu seq=%llu pid=%d th=%u hidden=%u\\n"',
+                           '"clover r300: done t=%llu seq=%llu th=%u chain=%u\\n"'):
+                if needle not in r304_text:
+                    errors.append(f"{r304_name} lacks {needle[:72]!r}: the relay is worth exactly as much as the "
+                                  "rows it carries, and each of those six is one of them -- a format string that "
+                                  "changed on the way would also cut boots 50 to 93 out of the comparison")
+            if r304_added.count("clover_census_row(crow);") != 6:
+                errors.append(f"{r304_name} relays {r304_added.count('clover_census_row(crow);')} rows, not 6: the "
+                              "fire's opening row, its thread rows, the chain's identity+hop pair, the receiving "
+                              "row and the closing row are the tail boot 93 lost, and a partial set reads as a "
+                              "fire that emitted fewer rows -- the hypothesis this round exists to retire")
+            for forbidden in ("thread_block(", "simple_wait(", "lck_mtx_lock(", "proc_lock(", "sleep(",
+                              "hw_lock_lock("):
+                if forbidden in r304_added:
+                    errors.append(f"{r304_name} calls {forbidden}: the handover happens on the census path, which "
+                                  "prints beside a wedged userland, and a relay that blocks stops being a copy")
+            load_r304 = REPO.parent / "UniXNU" / "patches" / "xnu" / r304_name
+            if not load_r304.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r304_name} is missing: unixnu loads patches from there "
+                              "and silently skips one that lives only in this repo")
+            elif load_r304.read_bytes() != r304_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r304_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+            late_script_r304 = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list_r304 = " ".join(line for line in late_script_r304.splitlines() if "clover-r" in line)
+            if (late_list_r304.find(r304_name) < 0 or
+                    late_list_r304.find(r304_name) > late_list_r304.find("z" * 60 + "-clover-r303.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r304 before r303 in LATE_PATCH: r304 "
+                              "rewrites print sites r303 and r300 added, so a tree that removes them first leaves "
+                              "r304 un-reversible -- and an apply failure in that loop is silent")
+        for needle in ('static volatile uint32_t gProbeNext = 0;',
+                       'static uint32_t probeFlush (const char *why, uint32_t cap)',
+                       'probeFlush ("beat", kProbeFlushCap);',
+                       'probeFlush ("tail", kProbeFlushCap);',
+                       'return probeFlush ("drain", 0);',
+                       'static const uint32_t kProbeSealRetries = 4;',
+                       '"CloverSdhci r304: probe why=%s wrote=%u seen=%u next=%u pend=%u flushed=%u skipped=%u"',
+                       '" stalled=%u refused=%u dropped=%u\\n"'):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no {needle[:52]!r}: the relay ring is only worth a reading "
+                              "once something consumes it without a panic, and one consumer with a cursor is what "
+                              "keeps three of them from writing the same row twice")
+        if "const uint32_t first = (seen > kProbeSlots) ? seen - kProbeSlots : 0;" in sdhci_source:
+            errors.append("the probe drain still re-reads its whole window: with the beat and the tail consuming "
+                          "the same ring from a cursor, a drain that rescans every live slot puts every delivered "
+                          "row on the card a second time")
+        beat_at = sdhci_source.find("extern \"C\" void clover_emmc_flight_beat")
+        if beat_at < 0 or sdhci_source.find('probeFlush ("beat"', beat_at) < 0:
+            errors.append("the beat does not flush the probe ring: on a boot that never reaches the sink, "
+                          "CPU0's timer is the only writer left, which is the whole reason boot 93 read nothing")
+
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -5406,8 +5490,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r303:"):
-        errors.append('[payload] title is not "clover r303: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r304:"):
+        errors.append('[payload] title is not "clover r304: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -6545,8 +6629,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r303:"):
-        errors.append('[payload] title is not "clover r303: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r304:"):
+        errors.append('[payload] title is not "clover r304: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

@@ -1,0 +1,150 @@
+--- a/osfmk/kern/task.c	2026-11-04 01:40:36
++++ b/osfmk/kern/task.c	2026-11-04 01:40:36
+@@ -12825,6 +12825,32 @@
+  * hands that number to the census, so the fire's closing row states what really went out.
+  */
+ static uint32_t clover_bb_chain_hops;
++
++/*
++ * Round304. One row, two places. Boot 93 read the census head off the card and nothing after it: the
++ * fire's thread rows, its chain rows and its own closing row all ride printf -> msgbuf -> the driver's
++ * tee, and the tee only runs at the tail of a block request. That boot stopped seconds after the head
++ * with no further tail, so the rows this port has been built to measure were sitting in the kernel's
++ * log buffer and never reached the card -- an absence that says nothing at all about the chain, which
++ * is the false-empty round249's exemption was invented to stop and which rounds295 through 300 have
++ * each argued about once more.
++ *
++ * The relay is round212's, unchanged: the same bytes the console gets are copied into the driver's own
++ * BSS ring, where they wait for a consumer that needs neither the msgbuf, nor the tee's cursor, nor a
++ * panic. Nothing here sleeps and nothing here takes a lock -- the handover is one atomic slot counter
++ * plus a copy -- so it stays legal on the census path, which walks other tasks' thread lists holding a
++ * try-lock it has dropped before the row is printed. The buffer is the driver's own slot size, 256: a
++ * row longer than that truncates at the same byte in both copies, so the card and the console can never
++ * disagree about what a field said. The widest row any boot has measured is 228.
++ */
++extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++
++static void
++clover_census_row(const char *line)
++{
++	printf("%s", line);
++	clover_emmc_probe_say(line, (unsigned int)strlen(line));
++}
+ 
+ static void
+ clover_bb_chain(task_t root, uint64_t secs)
+@@ -13056,7 +13082,10 @@
+ 		if (pp != NULL) {
+ 			strlcpy(comm, proc_name_address(pp), sizeof(comm));
+ 		}
+-		printf("clover r296: hop=%u t=%llu pid=%d comm=%s exec=%s ex=%s"
++		{
++			char crow[256];
++			int crowlen = snprintf(crow, sizeof(crow),
++			    "clover r296: hop=%u t=%llu pid=%d comm=%s exec=%s ex=%s"
+ 		    " threads=%u wait=%u run=%u trap=%u cap=%s thid=%llx rcv=%x remote=%x"
+ 		    " to=%llx rmc=%u rsr=%x qmc=%u qsr=%u qerr=%d peer=%s end=%s\n", hop,
+ 		    (unsigned long long)secs, task_pid(cur),
+@@ -13065,12 +13094,23 @@
+ 		    (unsigned int)(uint32_t)nrcv, (unsigned int)(uint32_t)nrem,
+ 		    (unsigned long long)nto, nrmc, nrsr, nqmc, nqsr, nqerr,
+ 		    peer[0] != '\0' ? peer : "-", end);
+-		printf("clover r298: hop=%u t=%llu prev=%lx rvobj=%lx verr=%d vname=%x robj=%lx"
++			if (crowlen > 0) {
++				clover_census_row(crow);
++			}
++		}
++		{
++			char crow[256];
++			int crowlen = snprintf(crow, sizeof(crow),
++			    "clover r298: hop=%u t=%llu prev=%lx rvobj=%lx verr=%d vname=%x robj=%lx"
+ 		    " rerr=%d otype=%d tname=%x tspace=%lx space=%lx link=%s tlink=%s"
+ 		    " vb_r=%x vb_v=%x\n", hop,
+ 		    (unsigned long long)secs, (unsigned long)prev_obj, (unsigned long)rvobj,
+ 		    verr, (unsigned int)(uint32_t)frcv, (unsigned long)robj, rerr, otype, tname,
+ 		    (unsigned long)tspace, (unsigned long)space_id, link, tlink, vb_r, vb_v);
++			if (crowlen > 0) {
++				clover_census_row(crow);
++			}
++		}
+ 		/*
+ 		 * Round303. The census the chain could not reach from its own side: the receiving
+ 		 * task's own entry for the name the sender wrote to. tname= was read under the port's
+@@ -13127,10 +13167,17 @@
+ 				}
+ 				lck_mtx_unlock(&next->lock);
+ 			}
+-			printf("clover r303: hop=%u t=%llu rpid=%d rnm=%x rentr=%d"
++			{
++				char crow[256];
++				int crowlen = snprintf(crow, sizeof(crow),
++				    "clover r303: hop=%u t=%llu rpid=%d rnm=%x rentr=%d"
+ 			    " rvbits=%x rwait=%u rwtid=%llx rbusy=%d\n", hop,
+ 			    (unsigned long long)secs, task_pid(next), tname, rentr,
+ 			    rvbits, rwait, (unsigned long long)rwtid, rbusy);
++				if (crowlen > 0) {
++					clover_census_row(crow);
++				}
++			}
+ 		}
+ 		clover_bb_chain_hops++;
+ 		prev_obj = robj;
+@@ -13647,9 +13694,16 @@
+ 		clover_census_seq++;
+ 		clover_census_rows = 0;
+ 		clover_bb_chain_hops = 0;
+-		printf("clover r300: fire t=%llu seq=%llu pid=%d th=%u hidden=%u\n",
++		{
++			char crow[256];
++			int crowlen = snprintf(crow, sizeof(crow),
++			    "clover r300: fire t=%llu seq=%llu pid=%d th=%u hidden=%u\n",
+ 		    (unsigned long long)secs, (unsigned long long)clover_census_seq, pid, cn,
+ 		    (call > cn) ? call - cn : 0);
++			if (crowlen > 0) {
++				clover_census_row(crow);
++			}
++		}
+ 		for (i = 0; i < cn; i++) {
+ 			char peer[24];
+ 			uint32_t mmc = 0;
+@@ -13703,7 +13757,10 @@
+ 					    (mach_port_name_t)crem[i]);
+ 				}
+ 			}
+-			printf("clover r262: th tid=%llx st=%x we=%llx cont=%llx"
++			{
++				char crow[256];
++				int crowlen = snprintf(crow, sizeof(crow),
++				    "clover r262: th tid=%llx st=%x we=%llx cont=%llx"
+ 			    " pc=%llx dl=%llx m2=%llx rcv=%x remote=%x local=%x to=%llx"
+ 			    " sz=%x mc=%u sr=%x rmc=%u rsr=%x peer=%s\n",
+ 			    (unsigned long long)ctid[i], cst[i],
+@@ -13714,6 +13771,10 @@
+ 			    (unsigned int)crn[i], (unsigned int)(uint32_t)crem[i],
+ 			    (unsigned int)(uint32_t)cloc[i], (unsigned long long)cto[i],
+ 			    (unsigned int)(uint32_t)csn[i], mmc, msr, rmc, rsr, peer);
++				if (crowlen > 0) {
++					clover_census_row(crow);
++				}
++			}
+ 			clover_census_rows++;
+ 			/*
+ 			 * Round267. Backboardd's own waits, named by the kernel instead of by
+@@ -13775,9 +13836,16 @@
+ 		 * positive control -- it has to read backboardd.
+ 		 */
+ 		clover_bb_chain(task, secs);
+-		printf("clover r300: done t=%llu seq=%llu th=%u chain=%u\n",
++		{
++			char crow[256];
++			int crowlen = snprintf(crow, sizeof(crow),
++			    "clover r300: done t=%llu seq=%llu th=%u chain=%u\n",
+ 		    (unsigned long long)secs, (unsigned long long)clover_census_seq,
+ 		    clover_census_rows, clover_bb_chain_hops);
++			if (crowlen > 0) {
++				clover_census_row(crow);
++			}
++		}
+ 	}
+ 
+ 	/*

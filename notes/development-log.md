@@ -23823,3 +23823,79 @@ boot 93 = **连续第六靴**、且 r303 是这条尾巴上**最新被吞的一�
 span 255.4–555.4s；verdict 环 boot 93 有行、但**无排干行**＝没进 sink；r303/r296/r298/r300/r262-th 各 0 行）、
 `…landing-sensors.txt`（charger_temp=356）、`~/clover-out/unattended-r303.log`；镜像 `round303-v0.7.10-payload.img`
 （`3c2e7be4…`）。本轮是**读回轮，不发新镜像**（无代码改动）。
+
+## Round304 (v0.7.12)：普查尾巴要有那份「不骑被测管道」的副本
+
+**① 这一轮结的是 §Round303 ⑥ 点名预登记的那一支——桌面主线的前置，不是新问题。**
+boot 93 把这笔债从「反复论证」变成了「逐字段坐实」：kind-22 内核环里**最新那一行**就是普查那一拍的
+`clover r299: smp`（t≈555.481791 s，seq 1574，与 1569–1573 的头行/`r229`/`r234`/`r262 census`/`r270`/`r271`
+同一拍），而从 `clover r300: fire` 往后的**所有尾巴**——`r262 th`、`r296`、`r298`、`r300 done`、以及 r303 新加
+那一族——**各 0 行**；tee 只在块请求尾部泵（`kTeePushPerPass`=16 加豁免列，这几族都在豁免列里），这张卡最后一笔
+块 I/O 记在 543,659 ms，尾巴印在 555 s 之后＝没有下一次泵；而这靴**根本没进 panic sink**（两枚 marker 全 STALE），
+连那唯一会重试整条环的排干也没跑。⇒「在 msgbuf/BSS 里但没上卡」与「根本没产生」在这一靴**不可分辨**，
+这正是 r249 立「假-empty」这条规矩时要挡的东西，也是 r295/r296/r298/r300/r303 每一轮都要重讲一遍的那一支。
+本轮不再 argue，给它一份副本。
+
+**② 形状（两半，副本走 r212 的中转，不经 msgbuf、不经 tee、不需要 panic）。**
+- **内核**（`patches/xnu-clover/zzz(61)-clover-r304.patch`，只改 `osfmk/kern/task.c`）：新增
+  `clover_census_row(const char *line)`——先 `printf("%s", line)`，再
+  `clover_emmc_probe_say(line, strlen(line))`（r212 的中转，一字未改）。六处打印点
+  （`r262: th`／`r296:`／`r298:`／`r303:`／`r300: fire`／`r300: done`）由裸 `printf(...)` 改成
+  `snprintf(crow[256], …)` + 该 helper。**格式串逐字节不变**（boots 50–93 仍能与 94 对齐），
+  `verify-clover-payload.py` 的 `census-relay-onecopy` 针钉住「每条被中转的行在其内核里只出现一次」，
+  哪天变成两份就是两份副本开始各说各话。
+- **驱动**（`drivers/CloverSdhci/CloverSdhci.cpp:4799` 新函数 `probeFlush (why, cap)`）：r212 的排干本来
+  **每次重读整个窗口**——它是唯一消费者时成立，有第二个消费者就会把同一行送两次，宿主读到「一次探针、两条记录」。
+  这轮换成**单游标消费**：`gProbeNext`（原子）由 tail/beat/drain 三处共用，只有卡**收下了**才推进。三条边界：
+  槽未密封最多等 `kProbeSealRetries=4` 拍（等第一笔 与 被永久卡住 是两回事，界限就是这 4 拍，越过就跳过并计数）；
+  `ringWriteRecord` 被拒**不**推进游标（下一拍重试，不为一次卡忙赔掉一行）；每拍上限 `kProbeFlushCap=16` 条。
+  两个新泵：块尾（`flushVerdictRing()` 末尾，`why=tail`，`:4038`）和 **CPU0 的 4 s 节拍**
+  （`clover_emmc_flight_beat()`，`why=beat`，`:3947`）；panic 排干保留（`why=drain`、`cap=0`，`:4868`）。
+- **自证行** `CloverSdhci r304: probe why=%s wrote=%u seen=%u next=%u pend=%u flushed=%u skipped=%u stalled=%u refused=%u dropped=%u`：
+  `pend = seen-next` 就是 boot 93 只能推断的那个数字——**已经在驱动 BSS 里、还没上卡**的行数。`(wrote>0 且 pend=0)`
+  和 `(pend>0 且游标没在动)` 是两种读数，成对出现才有意义。它自己按类限额（`kProbeReportsMax=64`，有积压时每
+  `kProbeBacklogEvery=64` 拍报一次），免得仪器用自己的行把环占满——r251 那条教训的形状。
+
+**③ 守住的规矩。** 不重排任何既有列、不改任何既有格式串（只加 helper、只把 `printf` 换成 `snprintf`+中转）；
+**只搬预登记的五族**——`r267`/`r265` 那些不在主线尾巴上的行**没**被挪进中转，本轮不顺带改管道；
+新中转行本身**不骑 tee**（`probe_say` 直连 BSS），所以 §⑤ 那五支的输入不再取决于卡有没有新块请求；
+`check-clover.py` 三条负断言把这三点钉住：不许把 `clover_census_row(crow);` 写成非 6 处（少一处＝那一族又回到只有单份副本）、
+不许出现 `first = (seen > kProbeSlots) ? seen - kProbeSlots : 0`（旧的整窗重读，有了游标就是重复送行）、
+不许在普查路径上调 `thread_block(`/`simple_wait(`/`lck_mtx_lock(`/`proc_lock(`/`sleep(`/`hw_lock_lock(`。
+
+**④ 动手前验过的前提（不是假设）。**
+- **256 字节够不够**：`kProbeTextBytes=256`，宿主在 boots 50–93 的解码里量过最宽的一行是 r296 的 **228 B**
+  （r298 200、r262 th 184），所以两份副本会在同一字节截断，卡和串口不会就同一个字段说两种话。
+- **锁纪律**：`clover_emmc_probe_say()`（`:3501`）只做原子 `fetch_add` + 字节拷贝 + release 密封，无锁、无睡眠——
+  普查路径正走在别人的线程遍历上（try_lock 已放），合法。
+- **消费者会打架吗**：三个入口都在块锁内或节拍里，`gRingBusy[kRingDriver]` 一忙就整拍返回 0，不排队不自旋。
+- **补丁顺序**：r304 改的正是 r262/r296/r298/r300/r303 自己写的行，所以它在 `LATE_PATCH` 必须**先于 r303 反打**，
+  否则 r300 的 hunk 上下文对不上而那个循环的失败是静默的（r276 三次死构建买来的规矩）。
+
+**⑤ boot 94 的判读态（刷写前登记）。** 先问身份：卡上「刷前 boot 93」→「boot 94」，且出现 **kind-25** 记录
+（宿主解码器自 r212 起就带 `--probe`，本轮不用改脚本）与 `CloverSdhci r304: probe why=` 行。然后分五支：
+- **(甲) 尾巴齐**：`r300 fire`/`done` 成对、每跳 `r296`+`r298`+`r303` 三行一组、`r262 th` 数量与头行
+  `shown=` 一致 ⇒ 中转生效，**§Round303 ⑤ 那五支第一次有输入**，`rentr=`/`rvbits=`/`rwait=`/`rbusy=`
+  当场按那一节判读，桌面主线那一格正式开读。
+- **(乙) 有 `fire` 无 `done`、且 `pend>0`** ⇒ 尾巴确实产生了、是**消费没跑完**（节拍与块尾都再没来过）。
+  这时先读 `dropped=`：>0 表示 64 槽在两次 flush 之间被覆盖，**中转环自己成了新地平线**——修法是加密 flush 或加宽
+  槽，不是回头说「链上没有」。`dropped=0` 才是纯粹的「没有下一次泵」。
+- **(丙) 零条 kind-25 且零条 `probe why=`** ⇒ 驱动侧消费者根本没跑（`gVerdictFirst`/`gHost` 未到、或环恒忙）。
+  **这一支只能靠 `wrote=` 的缺席认出，不能读成「内核没抄」**——两者要分开就得有 (丁) 那条负对照。
+- **(丁) `probe why=… seen=0 wrote=0 pend=0`** ⇒ 内核根本没往中转放东西＝双投递没进这枚镜像。闸门里的
+  `census-relay` 针锁的是源码字面量，若真出现这一支，说明「闸门锁源码、运行时另有一枚镜像」这条老坑又踩了一次，
+  本轮结论要改记在镜像身份上而不是普查上。
+- **(戊) 尾巴齐了但只齐某一族**（例：有 `r262 th` 无 `r303`）⇒ 那一族自己没产生，**不是管道缺**；内容问题按
+  §Round303 ⑤ 判，别记成仪器失败。
+仪器侧本轮第一次有数字的三格：`stalled=`（等密封）、`skipped=`（4 拍等不到而跳过的行）、`refused=`（卡拒收）——
+三者非零含义不同，别再合并成「没上卡」。搭读不作本轮结论：复位时机与八核像（boot 94 是这一族第七张同族票，
+「核数 vs 镜像」那轮控制仍未跑）、r301/r302 那句 panic 句子、`flightPanicText` 的 `writePioBlock` 自证（**仍未付**）。
+
+**⑥ 闸门与产物。** 内核 `12a76a2450ac7bcb41c8b1ec689d3a18485fbb85559ae331efe427fb95f43085`（52,367,360 B；
+`clover_census_row` 与 `CloverSdhci r304: probe` 各命中一次）→ AMFI 两刀（仍在文件 `0x1ad70e4`/`0x1ad716c`、VA 不变，
+本轮插入没挪 AMFI 段）→ 归一化 `3acfb517247c63574ad84161fc794fd56f0a15dc43162e82f82999016e1e1098`（973 处对象戳清零）；
+`round304-v0.7.12-payload.img` 58,720,256 B，sha256
+`431a70d3a4dbbadedbfd2e871acef98b58beb9fb63db9d6686949cbaf8e2621e`。
+`check-clover.py` EXIT=0；`verify-clover-payload.py` EXIT=0，新增 `census-relay`、`census-relay-onecopy`、
+`probe-beat-flush` 三针，`[payload] title` 两处断言移到 `clover r304:`。补丁 61 枚 `z`、6026 B、
+`~/UniXNU/patches/xnu/` 与设备仓 `patches/xnu-clover/` 两处逐字节相同；`LATE_PATCH` 排在最前。

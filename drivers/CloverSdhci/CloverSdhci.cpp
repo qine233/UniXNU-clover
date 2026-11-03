@@ -465,7 +465,37 @@ static char gProbeText[kProbeSlots][kProbeTextBytes];
 static uint32_t gProbeArm[kProbeSlots];   // slot number + 1; written after the text, read as a seal
 static volatile uint32_t gProbeSeq = 0;   // next slot number to hand out
 static volatile uint32_t gProbeDropped = 0;   // records the ring overwrote before a drain
-static uint32_t gProbeFlushed = 0;        // records this drain put on the card
+static uint32_t gProbeFlushed = 0;        // records any consumer put on the card
+
+/*
+ * Round304. The probe ring had exactly one consumer -- the panic drain -- and boot 93 never reached
+ * it: the board stopped at ~555 s with no sink, no `drain enter` line and zero kind-25 records on the
+ * card, which is what a relay that only empties at a panic costs. A row the kernel handed over at
+ * 555.481 s is worth more in driver BSS than in msgbuf, but BSS nobody reads is the same silence.
+ * So the ring gets a cursor of its own and two more consumers that do not need the sink: the block
+ * tails that already flush both RAM rings, and CPU0's four-second beat.
+ *
+ * One cursor, advanced only after a record the card accepted, means a row is never written twice and
+ * a refused write costs a retry rather than the reading. The seal word doubles as the staleness test:
+ * if the producer overran an undelivered slot, that slot now carries a newer sequence number, the
+ * compare says "not the row I am looking for", and the pass skips it after a bounded wait instead of
+ * wedging the queue behind a row the writer never finished.
+ *
+ * All three consumers hold the block host while they run -- a tail holds the guard, the beat takes it
+ * with a try, the drain runs with gPanicActive set and beats excluded -- so the cursor has one writer
+ * at a time by construction, not by a lock invented here.
+ */
+static volatile uint32_t gProbeNext = 0;      // the sequence number the card has not received yet
+static uint32_t gProbeSkipped = 0;            // rows dropped after their seal never arrived
+static uint32_t gProbeStalled = 0;            // passes that stopped on an unsealed row
+static uint32_t gProbeRefused = 0;            // passes that stopped on a card that said no
+static uint32_t gProbeCalls = 0;              // flush passes of any consumer
+static uint32_t gProbeSealWait = 0;           // consecutive passes stopped on the same unsealed row
+static uint32_t gProbeReports = 0;            // r304 self-report lines said
+static const uint32_t kProbeFlushCap = 16;    // records per pass; two block writes each
+static const uint32_t kProbeSealRetries = 4;  // passes to wait for a seal before dropping the row
+static const uint32_t kProbeBacklogEvery = 64;  // passes between backlog reports
+static const uint32_t kProbeReportsMax = 64;
 
 // Round210: the flight region. Round209 proved the kernel was alive at the 900 s deadline while the
 // card accepted nothing -- the report window got no record and the rings got no drain -- so the one
@@ -1067,6 +1097,9 @@ static void teeKernelLog (void);
 // Round184: the panic sink drains both RAM rings before the board resets itself into fastboot.
 // Defined below the tee it calls, used by `clover_emmc_panic_append` at the bottom of this file.
 static void panicDrainRings (void);
+// Round304: the probe ring's consumer. Declared with the drain it replaces as the only caller, because
+// its two new call sites -- a guarded block tail and CPU0's beat -- are both far above its definition.
+static uint32_t probeFlush (const char *why, uint32_t cap);
 // Round198: the BCB is written here, at the end of the GPT walk, and only re-checked by the panic
 // sink. Defined further down with the card-write helpers it uses.
 static unsigned int panicMarkRecovery (void);
@@ -3907,6 +3940,11 @@ extern "C" void clover_emmc_flight_beat (void)
     return;
   }
   (void)flightWrite (kFlightEventBeat, 2, 0, 0);
+  // Round304: the beat is the only writer left on a boot that never reaches the panic sink. Boot 93
+  // stopped at ~555 s with the kernel's census rows still sitting in this driver's BSS and no drain to
+  // read them: the beat runs every four seconds whether or not a block request ever finishes, and it is
+  // already here holding the host, so it is where those rows get their second way out.
+  (void)probeFlush ("beat", kProbeFlushCap);
   dropHostTicket (token);
 }
 
@@ -3994,6 +4032,10 @@ static void flushVerdictRing (void)
 {
   flushRing (kRingDriver);
   flushRing (kRingKernel);
+  // Round304: the same pass that empties the two RAM rings now empties the relay ring too. This is the
+  // path that demonstrably runs on a boot like 93 -- its tee lifted seven kernel rows at 555.48 s -- so
+  // a census row handed over at the moment it was printed no longer waits for a panic to be written.
+  (void)probeFlush ("tail", kProbeFlushCap);
 }
 
 // ------------------------------------------------------------------ round175: the kernel log tee
@@ -4748,30 +4790,82 @@ static uint32_t panicRingFlush (uint32_t which)
 // into this driver's BSS, so nothing about them depends on the guard, the msgbuf or the tee. A
 // slot whose seal is not the number this loop expects was overwritten between the writer's text
 // copy and its seal store, and that one record is skipped rather than written half-formed.
-static uint32_t panicProbeFlush (void)
+//
+// Round304 moves that same bounded skip into a consumer with a cursor. The drain used to re-read the
+// whole window every time it ran -- harmless while it was the only caller, wrong the moment a second
+// one exists, because the same row would land on the card twice and the host would read one probe as
+// two. Now every consumer -- tail, beat, drain -- walks the same cursor and only advances it past a row
+// the card accepted.
+static uint32_t probeFlush (const char *why, uint32_t cap)
 {
-  const uint32_t seen = __atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED);
-  const uint32_t first = (seen > kProbeSlots) ? seen - kProbeSlots : 0;
+  if (!gVerdictFirst || !gHost || gRingBusy[kRingDriver]) {
+    return 0;
+  }
+  gProbeCalls++;
   uint32_t wrote = 0;
-  for (uint32_t seq = first; seq < seen; seq++) {
-    const uint32_t slot = seq % kProbeSlots;
-    if (__atomic_load_n (&gProbeArm[slot], __ATOMIC_ACQUIRE) != seq + 1) {
+  for (;;) {
+    const uint32_t seen = __atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED);
+    const uint32_t next = __atomic_load_n (&gProbeNext, __ATOMIC_RELAXED);
+    if (next >= seen || (cap && wrote >= cap)) {
+      break;
+    }
+    const uint32_t slot = next % kProbeSlots;
+    if (__atomic_load_n (&gProbeArm[slot], __ATOMIC_ACQUIRE) != next + 1) {
+      // Two different things look identical here -- a producer that took this number and has not
+      // sealed it yet, and a producer that wrapped and put a newer row in the slot. The bound is what
+      // separates waiting for the first from being wedged behind it forever: after kProbeSealRetries
+      // passes on the same number the row is dropped and named, because a relay that cannot pass a
+      // half-written row must still not stop the rows behind it.
+      if (++gProbeSealWait < kProbeSealRetries) {
+        gProbeStalled++;
+        break;
+      }
+      gProbeSealWait = 0;
+      gProbeSkipped++;
+      __atomic_store_n (&gProbeNext, next + 1, __ATOMIC_RELAXED);
       continue;
     }
+    gProbeSealWait = 0;
     uint32_t length = 0;
     while (length < kProbeTextBytes - 1 && gProbeText[slot][length]) {
       length++;
     }
     if (!length) {
+      __atomic_store_n (&gProbeNext, next + 1, __ATOMIC_RELAXED);
       continue;
     }
     if (!ringWriteRecord (kRingDriver, gProbeText[slot], length, kProbeKind)) {
+      // The cursor does not move: this row is retried by the next pass rather than paid for by a card
+      // that was busy for one write.
+      gProbeRefused++;
       break;
     }
+    __atomic_store_n (&gProbeNext, next + 1, __ATOMIC_RELAXED);
     wrote++;
   }
   gProbeFlushed += wrote;
+  const uint32_t seen = __atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED);
+  const uint32_t next = __atomic_load_n (&gProbeNext, __ATOMIC_RELAXED);
+  const uint32_t pend = seen - next;
+  // Two readings, and the pair is the point. `wrote` with nothing left pending says a burst the kernel
+  // handed over reached the card, with the numbers to prove it. `pend` with a write that has not moved
+  // says the opposite: the rows exist in BSS and are not on the card, which is what boot 93 could only
+  // infer from the absence of everything. Both are bounded so a boot cannot fill its own ring with them.
+  if (gProbeReports < kProbeReportsMax &&
+      ((wrote && !pend) || (pend && gProbeCalls % kProbeBacklogEvery == 0))) {
+    gProbeReports++;
+    teeSay ("CloverSdhci r304: probe why=%s wrote=%u seen=%u next=%u pend=%u flushed=%u skipped=%u"
+            " stalled=%u refused=%u dropped=%u\n",
+            why, wrote, seen, next, pend, gProbeFlushed, gProbeSkipped, gProbeStalled,
+            gProbeRefused, static_cast<unsigned int> (__atomic_load_n (&gProbeDropped,
+                                                                       __ATOMIC_RELAXED)));
+  }
   return wrote;
+}
+
+static uint32_t panicProbeFlush (void)
+{
+  return probeFlush ("drain", 0);
 }
 
 static void panicDrainRings (void)

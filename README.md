@@ -321,6 +321,28 @@ leave」一路收紧到一句可测的话：
   「核数 vs 镜像」控制未跑。**下一手（r304，主线前置）**：照 r212 给内核探针做的那样，把这一族逐跳行改抄进
   **驱动 RAM 环 + 周期/排干 flush**（不经卡、不经块尾部节奏），这样一靴哪怕 555 s 就停、没进 sink，尾巴也能靠那次
   flush 到卡；在那之前桌面主线那一格读不出、**既不记失败也不记 (a)/(b)**。详见 `notes/development-log.md` §Round303 读数。
+* **r304（v0.7.12，主线前置：给普查尾巴一份不骑被测管道的副本）**。两半。**内核**
+  `patches/xnu-clover/zzz(61)-clover-r304.patch`（只改 `osfmk/kern/task.c`）：新增
+  `clover_census_row(line)`——`printf` 之后再 `clover_emmc_probe_say(line, strlen(line))`（r212 的中转、一字未改），
+  六处打印点（`r262 th`/`r296`/`r298`/`r303`/`r300 fire`/`r300 done`）由裸 `printf` 改成 `snprintf(crow[256])`+helper，
+  **格式串逐字节不变**（boots 50–93 仍与 94 对齐）。**驱动** `CloverSdhci.cpp:4799` 新函数 `probeFlush (why, cap)`：
+  r212 的排干原本每次重读整窗——只有它一个消费者时成立，加了消费者就会重复送行，故改成**单游标** `gProbeNext`
+  由 tail/beat/drain 共用、只有卡收下才推进；未密封最多等 4 拍（`kProbeSealRetries`）再跳过并计数，卡拒收**不**推进，
+  每拍上限 16 条。两个新泵：块尾（`flushVerdictRing()` 末，`why=tail`）与 **CPU0 的 4 s 节拍**
+  （`clover_emmc_flight_beat()`，`why=beat`），panic 排干保留（`why=drain`、`cap=0`）。自证行
+  `CloverSdhci r304: probe why=… wrote=… seen=… next=… pend=… flushed=… skipped=… stalled=… refused=… dropped=…`——
+  `pend=seen-next` 就是 boot 93 只能推断的那个「已在 BSS、未上卡」的数字；报告自身限额 64 条、积压时每 64 拍一次
+  （别再犯 r251）。**动手前量过的前提**：`kProbeTextBytes=256` 而历史最宽一行是 r296 的 **228 B**，两份副本同一字节
+  截断、卡与串口不会就同一字段说两种话；`probe_say` 只写 BSS（原子＋拷贝＋release 密封，无锁无睡眠），在普查那条
+  try_lock 路径上合法；r304 在 `LATE_PATCH` 必须**先于 r303 反打**（它改的正是 r262/r296/r298/r300/r303 自己写的行）。
+  **只搬预登记的五族**，`r267`/`r265` 那几行没被挪进中转；三条负断言（中转点必须 6 处、不许恢复整窗重读、普查路径
+  不许任何睡眠/取锁调用）写进 `check-clover.py`。内核 `12a76a24`（AMFI 两刀仍在 `0x1ad70e4`/`0x1ad716c`）、归一化
+  `3acfb517`；`round304-v0.7.12-payload.img` 58,720,256 B，sha256
+  `431a70d3a4dbbadedbfd2e871acef98b58beb9fb63db9d6686949cbaf8e2621e`；双 checker EXIT=0（新增 `census-relay`、
+  `census-relay-onecopy`、`probe-beat-flush` 三针）。**boot 94 判读预登记在 §Round304 ⑤**：(甲) 尾巴齐 ⇒ §Round303 ⑤
+  五支第一次有输入；(乙) 有 `fire` 无 `done` 且 `pend>0` ⇒ 消费没跑完，再看 `dropped>`0 分清「中转环自己成了新地平线」；
+  (丙) 零 kind-25 且零 `probe why=` ⇒ 驱动消费者根本没跑，**不能读成内核没抄**；(丁) `seen=0 wrote=0` ⇒ 双投递没进镜像，
+  记在镜像身份而非普查；(戊) 只齐某一族 ⇒ 那一族自己没产生，是内容不是管道。未付：`writePioBlock` 自证、「核数 vs 镜像」控制轮。
 * **再后一支（本格欠的两条仪器债）**：`vbits=`（`ipc_right_lookup_read()` 已经交出的 entry 位掩码，
   用来分 port set / send-once，不需要对象、锁纪律与 translate 同一条）与 `qmc=/qsr=` 自带返回码。
 * **那笔「等设备解锁」的死等已经不是现场，但它的机制现在读全了**：r274 命中的形状是
