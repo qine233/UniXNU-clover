@@ -21799,3 +21799,83 @@ body 480、和校验 ok）第一行**不是** `Kernel data abort.`，而是
 cxo_en=1`），与 boot 74 在 1338 那一行一字不差。跨两靴、跨三拍不变 ⇒ `gx_on=0` 不是竞态、不是时机、也不是
 被谁抢先关掉了，是一个稳定的硬件状态。r290 要读的正是这件事的另一面：每支 branch 的 BIT(31) 停/走，加上
 本板时钟清单里欠到现在的两份投票（rbcpr 0x1054、rbbmtimer 0x10d0）。桌面仍 CPU-first。
+---
+
+### boot 77（round290 / v0.6.89，2026-11-03）：gfx3d 是「问了但没跑」，而 halt 位有一条同场正对照
+
+**① 读到什么。** `~/clover-out/round290-log-window.bin.txt` 里 r290 那行的两支（t=1097 与 t=1219）**逐字段
+相同**：
+
+```
+[ 1099.537389]: clover r290: gpu t=1097 branches beat gfx3d=1/1 cxo=1/0 rbcpr=1/0 rbbm=1/1 en/halt
+                  rcg3d=80000000 rcg_rbcpr=00000000 rcg_rbbm=80000000
+```
+
+按 r290 刷前写死的判据，`en=1 halt=1` 读作**票到了、钟没起**：`gfx3d_clk`（0x1098）BIT(0) 我们每拍都按下去，
+BIT(31) 却仍是 HALT；`rbbmtimer`（0x10d0）同一形状。而 `cxo=1/0`、`rbcpr=1/0` 两支 `halt=0` ——这两条是这行
+读数的地基：`cxo_clk` 是本轮**没有新写任何东西**的一支（固件本来就开着它），它给出「halt=0 长什么样」的
+天然正对照；`rbcpr` 是本轮新按下去的一票（0x1054 BIT(0)），它从 halt 走到不 halt，说明**这条管道的写与读
+在 GPUCC 上真的生效**，不是把寄存器读成常量。于是 r290 的两件事都成立：halt 位可读，且新投票有效。
+
+同一靴的 r286 行照旧：`cx=a0282000 cxhw=80001fe0 cx_on=1 cx_collapse=0 gx=08282000 gx_on=0 gx_collapse=0
+gfx3d_en=1 cxo_en=1 rcg=80000000 dom=00140001 sw=00000000`，`chipid skipped cx_on=1 gx_on=0 gfx3d_en=1`。
+`gx_on=0` 第三次跨靴复现（boot 74 / 76 / 77），且现在有了 halt 维度：**gx 域没上电与 gfx3d 分支起不来是同一
+件事的两面**——`gfx3d_clk` 的时钟来自 gx 电源域之后的东西，GDSC 没合上时分支永远停在 HALT，所以「给 RCG
+编程速率」这一支**不能**被排到下一轮，因为它要的主电源域还没来。
+
+**② `branches post` 那行缺席，是环地平线，不是丢读数。** 卡上内核环窗覆盖 796 s…1248 s，`fire=8/9/10` 三拍
+在场，而 `clover_gpu_power_on()` 只在 `!clover_gpu_powered` 那一拍跑（它把闩锁置上后就不再走这条路），那拍
+早被转出去。r249 的课在这里正好反着用：**一次性判决行的副本在周期通道上**——`beat` 支与 `post` 支字段与格式
+完全一致（`clover_gpu_report_branches(t, "post"|"beat")` 同一个 printf），两拍 `beat` 读数一致 ⇒ 首次上电那拍
+的读数被同一形状带上来了。所以这一格不欠读数，欠的是「窗再往前一点」，而窗的大小由卡时钟决定，不是本轮能
+控制的量。
+
+**③ `rcg3d=80000000 / rcg_rbbm=80000000 / rcg_rbcpr=00000000` 只记相关性，不解读。** 两支 halt 的 RCG 命令字
+都是 0x80000000、唯一在跑的那支是 0x00000000，这个对应关系很好认，但**盘上没有出处**：本树 `clk-rcg.h` 只有
+191 行且不包含这些偏移名，能把 CMD 寄存器 BIT(31) 说成「CG hidden/reset」的那份 `drivers/clk/qcom/clk-rcg.c`
+我们还没归档。按「读数要指到还在盘上的文件」的规矩，这一格先记账，等归档一份带 sha256 的 `clk-rcg.c` 再决定
+要不要把 0x80000000 读成「RCG 被藏着/复位中」。同理 `dom=00140001`、`sw=00000000` 继续原样报，不编故事。
+
+**④ 下一轮因此不改判据、只换战场：gx 的债在角/轨。** r290 出数后，「时钟区清白」这一支被排除了一半——
+`cxo`/`rbcpr` 在跑，`gfx3d`/`rbbm` 不起，而 `gx` GDSC 从头到尾 `gx=08282000`、`gx_collapse=0`（SW_COLLAPSE
+已经清掉，PWR_ON bit31 就是不来）。GDSC 合不上是**电**没到，不是使能位没按。§5.6 已经把这块唯一没出处的
+缺口补上：GFX LDO 在 `sdm660-regulator.dtsi:523` 的 `gfx_ldo_vreg: ldo@0506e000`，`reg=<0x0506e000 0x34>`，
+`msm_gfx_ldo.c` 的 `qcom,sdm660-gfx-ldo` 在 `:1504` 认出这颗板；三个带名字的读点 `0x18` VREF（µV=val\*5000+
+375000，`:65/:67/:1371`）、`0x1C` 开关控制（`:39-52`）、`0x28` 状态里的 `LDO_READY=BIT(2)`、
+`LDO_VREF_SETTLED=BIT(4)`（`:57-58`，驱动自己的等待在 `:307`/`:1336`）。`0x24` 定义了但驱动从不读、
+`0x34` ADC 在 DT 窗口之外，所以两处都不碰。判据已在 §5.6 写死：`LDO_READY=0` 或 µV 解出 375000 ⇒ 角从没抬
+起来，债在 CPR；`LDO_READY=1` 且 µV 抬起来而 `gx_on` 仍 0 ⇒ 轨是清白的，回头看 GDSC 自己的等待字段与
+`gpu_gx_domain_addr`。角数（厂商 `SDM660_MMSS_FUSE_CORNERS=6` vs DT pwrlevel 1..7）这轮**不下结论**。
+
+**⑤ 第二道坎：boot 77 是一条没有 panic 记录的静默终止。** 三个独立事实叠在一起：
+* panic 记录环里最新一条 seq=47 属于 **boot 76**（写的是 r148 死线），boot 77 **名下没有 kind-20 槽**；
+* 死线是 1800 s，boot 77 的最后一条内核记录在 **1248.429585**（`r231: bbhop pid=58 tid=0x376`），没到点；
+* 那条记录之后的槽 292（seq 2852、kind 22、body 138）是 `BAD (newline missing)`、`<no readable text
+  block>`——即板子在**内核环的一次写还没写完**的时候就断了。
+
+合起来是：这靴既不是 data abort（那会先有 kind-20），也不是死线停机（那会先有 r148 行），而是**一次不留
+panic 记录的复位**，发生时刻比 boot 74（1420 s）早、比 boot 75（880 s）晚。这正是 r283/r284 造出来要定名的
+那类现象的第一个卡上实例。`grep -c "clover r289"` = 0 也自洽：r289 只在 `panic_with_thread_kernel_state()`
+里出声，没有 panic 就没有行——它是这条路径的**在场证明**，不是这条路径的读数。
+
+**⑥ r283 的判决行第一次在卡上现身，读法必须带边界。** verdict 环 slot 0（lba 13320280、seq 0、kind 21、
+`said by kernel`）：
+
+```
+clover r283: last reset unnamed magic=ed88000200a909f8 beat=403443458069358 beatcnt=1371352791997
+```
+
+`unnamed` 不是「没记录」，是**槽里没有我们的 magic**。写手 `clover_imem_note()`（`CloverSdhci.cpp:8830`，
+`said by kernel`）：先写 1..6 号字，最后才落 `kResetRecordMagic = 0x00333832564f4c43`（"CLOV283"，`:360`）；
+读者在 `:8916` 只认 `record[0]==magic`，不认就打 `unnamed` 并把原词报出来（`:8933`）。观测值换算过来是
+`magic=0xed88000200a909f8`、`beat=0x16eee0001536e`、
+`beatcnt=0x13f4afefbbd`：心跳词本该是「一个小的 beat 计数 + 一个 CNTVCT≈0x8_2…」（对照 boot 76 那条 r148 行
+`cnt1=81d3c90a6`），而这两个数都比应有的形状大三四个数量级，`magic` 更像总线上的残留。所以这行只能读成
+**IMEM 的 0x660 槽没有活过「上次复位 → BCB → TWRP → fastboot → 重刷 → boot 77」这段路**（r147/r196 早就
+怀疑 IMEM 在跨刷写时不保真，这条是它的正面证据），**不能**读成「复位没被记」或「复位来自外部」。
+差量交给 boot 78：它读的是 boot 77 自己在跑时写的心跳，如果那时 IMEM 还在，`named` 就该出现——r284 加的
+「不经该管道的副本」这条规矩至今没在卡上兑现过 `named`，这一格仍然开着。
+
+**⑦ 本轮不动形状。** GPU 三靴一致、halt 维度已到手，静默终止这一支有 r148/r198/r212 三条通道交叉，都够下一
+轮判；唯一要新加的读数在 r291（§5.6 的 LDO 三寄存器 + 同拍 `gx_on`）。桌面仍 CPU-first，第二道坎照 boot 76
+的规矩每轮 grep 一次 r289。
