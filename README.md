@@ -47,15 +47,44 @@ leave」一路收紧到一句可测的话：
   pid 也从 187 挪到 202，旧 pid 别再引用）。叶子 `threads=4 wait=4 run=0 trap=1 end=no_send`。
   **`no_send` 不能读成「这人没在等」**：它在代码里的含义是「trap 里那根的 `x3`=0」，也就是**纯收**——
   捕获条件只挑 `x3!=0` 的线程，所以那根的 `rcv=`/`to=` 与收方向的 `rmc`/`rsr` 没读出来，
-  「回音是否已经在队列里」这一问本靴答不了。r296 补这一格（判据已写在流水日志）。
+  「回音是否已经在队列里」这一问本靴答不了。r296 补了这一格，boot 84 读到了答案（见下）。
 * **r296 已发出（v0.7.0）补的就是这一格**：链行加 `cap=send|recv|none` 说明那三列线程字段是谁的；`recv` 时
   把只收那根的 `rcv=`/`to=` 填回原列，并用**同一个** `clover_sb_port_mail()` 在收方向读那枚口的 `qmc=`/`qsr=`。
   前提照 r295 的规矩一起验：那函数只拿 object 自己的锁、读两个词、不分配不阻塞，调用点仍在
   `try_lock`→读线程→`unlock` **之后**；checker 这次多禁一枚 `thread_block(`——链是在已经卡住的用户空间旁边走的，
   采样线程自己睡着的代价是后面每一跳都没读数。`no_send` 这枚判决**故意不改名**：boot 83 两行就是这个值，
-  本轮要读的正是「同一个判决下面，队列里到底有没有东西」。boot 84 四支判据：`qmc>0` 仍在等 ⇒ 缺唤醒；
-  `qmc=0` 且 `qsr=0` ⇒ 没人有权回（镜像侧）；`qmc=0` 且 `qsr>=1` ⇒ 有人能答而没答；连 `rcv=0` ⇒ 那根线程
-  根本没进 `MACH_RCV`，改把用户栈采样挂到叶子上。
+  本轮要读的正是「同一个判决下面，队列里到底有没有东西」。
+* **boot 84 把这一格读满了，而且链比上一靴深一跳**：`hop=3 pid=126 exec=installcoordinationd`
+  `cap=recv thid=2e5 rcv=1917 remote=0 to=ffffffff qmc=0 qsr=0 end=no_send`——正对照成立（`cap=recv` 且 `rcv` 非零），
+  所以「根本没进 `MACH_RCV`」那一支不必启动。债链形状现在是
+  **backboardd(58) → datamigrator(144) → migrationpluginwrapper(189) → installcoordinationd(126)，最后这个人在收**。
+  四条判据落在 **(b)**：收的那枚口里**既没有消息（`qmc=0`）也没有发送权计数（`qsr=0`）**——「谁本该拿着向这枚口
+  说话的权利」属镜像侧。(a)(c) 排除；(d) 字面成立但要打折：`to=0xffffffff` 是有限值，按 ms 折算约 **49.7 天**，
+  本靴离死线只剩 110 s ⇒ **不能读成「它会自己醒」**，而且单位这条是推断（同一次发送方向的 `to=0` 加约定），
+  卡上没有小超时的正对照。另记：`cap=recv` 那行的 `rmc=`/`rsr=` 是**没读**的初值，不是三个 0 之一。
+* **boot 85 是同一枚 v0.7.0 镜像的控制轮，它把两件事分开答了**：仪器答「稳定」——八行两拍，
+  链还是 **backboardd → datamigrator → migrationpluginwrapper → installcoordinationd**，叶子还是
+  `cap=recv qmc=0 qsr=0`（判据 (b) 再现），每靴变的只有 pid（144→147、189→191、126→119）和端口名
+  （`7f07`→`5707`、`1917`→`1e0b`）——这正是「端口名跨 task 不可比」的第二次证明。结局答「不稳定」——
+  boot 84 跑满 1800 s 死线并按设计 panic，boot 85 卡上最后动静停在 **t=1680923 ms**、没有自己的死线记录、
+  没有自己的 panic 标记（飞区那两枚仍署 boot 84，解码器印 STALE）⇒ **第七起静默无 panic 复位**，
+  上界由死线记录给出（跑到了就该有），落在 **1681–1800 s**。带因此是七条：
+  718 / 1184 / 1248 / 1335 / 997 / 707 / 本靴。**「什么时候结束」在 v0.7.0 上是分布，不是常数**——
+  负载不是变量（r294b 已证），镜像也不是变量。WDT 两行 `t=` 在走、仍 `en=0 armed=0`；
+  keystore `stage=3 opens=100 calls=442`（上一靴 88/387）；落地快照第三次 `charger_temp=327`、
+  `rawdump` 头第四次全 0。
+* **本格读数的边界就是 r297（v0.7.1 已发出，boot 86 在跑）**：`hop=2` 的 `remote=7f07`（pid 189 的空间）与
+  `hop=3` 的 `rcv=1917`（pid 126 的空间）**无法判断是不是同一枚端口**，而 (b) 那句只在同一枚端口上才成立。
+  r297 另起一行 `clover r297: hop= t= prev= rvobj= robj= link=`，打的是 `ipc_object` 指针
+  （新增 `clover_sb_port_obj()`：先按 RECEIVE 译、失败再按 SEND，**不读字段**，`io_unlock` 后才返回值；
+  身份只用于比较，端口在两跳之间被释放只会让比较说 `no`，不会 fault）。另起一行而不加长那一行的理由是实测：
+  boot 84 最长那条 r296 行 **227 字节**，三枚指针最坏 + `link=unknown` = **79 字节**，306 顶到 320 的记录上限，
+  而长了的行**只截断、不分段**——`end=` 正在尾巴上。两行靠 `hop=`/`t=` 配对。判据两支：
+  **`link=yes` 而该跳 `qmc=0`** ⇒ 请求投进了这根线程正在等的口而队列是空的，下一支进内核投递-唤醒
+  （`ipc_mqueue_send()` / `ipc_mqueue_receive()` 的 `thread_block(ipc_mqueue_receive_continue)`，
+  `osfmk/ipc/ipc_mqueue.c:1214`）；**`link=no`** ⇒ installcoordinationd 听的不是请求落下的那枚口，
+  下一支普查它自己的 entry 集（r234 那套）把那枚名字与 `qmc` 找出来。**`link=unknown`** 也是读数：
+  那枚名字没译成对象。正对照：**hop=0 必须 `prev=0 link=-`**，且每条 r296 行配一条同 `hop=`/`t=` 的 r297 行。
 * **那笔「等设备解锁」的死等已经不是现场，但它的机制现在读全了**：r274 命中的形状是
   `-[DMMigrator _unlockKeyBagUseOfForceIsAuthorized]` → `-[MigratorAlternateAppDelegate
   waitUntilPreboardDidFinishUnlock]` → `dispatch_semaphore_wait(sem, FOREVER)`（宿主复核
@@ -209,7 +238,7 @@ leave」一路收紧到一句可测的话：
 （`struct proc`/`struct vnode` 都完整的文件），调用点在任何 task lock 之外，配四态 `ex=`；正对照=pid 58
 那行完整印出 `backboardd`。普查同时改成**顺着 send 传递式走 4 跳**（`seen[]` 防环、引用只在
 `clover_bb_peer_task` 取与放），终止条件印成七种读数 `lock_busy`/`no_trap`/`no_send`/`no_owner`/
-`self_reference`/`cycle`/`depth_limit`；宿主那侧已把当年那笔等待读全（唯一的 `signal` 要 PreBoard 状态 0 **且** `MKBDeviceUnlockedSinceBoot()` 非 0，另外三枚回调只打日志），并且把落地瞬间的 `power_supply`/`thermal`/`rawdump` 快照做进了 `run-clover-unattended.sh`。**boot 83 已按这条读回**：链 `58 backboardd → 148 com.apple.datamigrator → 叶子`，叶子在两拍里换了人（t=657 是 `pid 166 osanalyticshelper`，t=797 是 **`pid 202 exec=com.apple.migrationpluginwrapper`**——两个候选靠 `exec=` 分开，`comm=` 照旧截断；旧 pid 187 别再引用），每一行都带 `end=`，六行 `ex=` 全 `ok`。⇒ **r296（v0.7.0 已发出）**：`end=no_send` 只能说「trap 里那根的 `x3`=0」也就是**纯收**，而捕获规则把它的 `rcv=`/`to=` 留在了 0；r296 给这一行加 `cap=send|recv|none`、在 `recv` 时填回那根的 `rcv=`/`to=`，并用 `clover_sb_port_mail()` 读那枚口的收方向队列 `qmc=`/`qsr=`（前提同 r295：只拿 object 自己的锁、在 task lock 之外调用；checker 多禁 `thread_block(`）。boot 84 四支判据：`qmc>0` 仍在等 ⇒ 回音已入队、缺唤醒；`qmc=0` 且 `qsr=0` ⇒ 没人有权回，属镜像侧；`qmc=0` 且 `qsr>=1` ⇒ 有人能答而没答；连 `rcv=0` ⇒ 那根线程没进 `MACH_RCV`，改把 r236 的用户栈采样挂到叶子上 |
+`self_reference`/`cycle`/`depth_limit`；宿主那侧已把当年那笔等待读全（唯一的 `signal` 要 PreBoard 状态 0 **且** `MKBDeviceUnlockedSinceBoot()` 非 0，另外三枚回调只打日志），并且把落地瞬间的 `power_supply`/`thermal`/`rawdump` 快照做进了 `run-clover-unattended.sh`。**boot 83 已按这条读回**：链 `58 backboardd → 148 com.apple.datamigrator → 叶子`，叶子在两拍里换了人（t=657 是 `pid 166 osanalyticshelper`，t=797 是 **`pid 202 exec=com.apple.migrationpluginwrapper`**——两个候选靠 `exec=` 分开，`comm=` 照旧截断；旧 pid 187 别再引用），每一行都带 `end=`，六行 `ex=` 全 `ok`。⇒ **r296（v0.7.0 已发出）**：`end=no_send` 只能说「trap 里那根的 `x3`=0」也就是**纯收**，而捕获规则把它的 `rcv=`/`to=` 留在了 0；r296 给这一行加 `cap=send|recv|none`、在 `recv` 时填回那根的 `rcv=`/`to=`，并用 `clover_sb_port_mail()` 读那枚口的收方向队列 `qmc=`/`qsr=`（前提同 r295：只拿 object 自己的锁、在 task lock 之外调用；checker 多禁 `thread_block(`）。boot 84 四支判据：`qmc>0` 仍在等 ⇒ 回音已入队、缺唤醒；`qmc=0` 且 `qsr=0` ⇒ 没人有权回，属镜像侧；`qmc=0` 且 `qsr>=1` ⇒ 有人能答而没答；连 `rcv=0` ⇒ 那根线程没进 `MACH_RCV`，改把 r236 的用户栈采样挂到叶子上 **boot 84 读回来了**：叶子那行 `cap=recv thid=2e5 rcv=1917 remote=0 to=ffffffff qmc=0 qsr=0`——正对照成立，链也深一跳：**backboardd(58)→datamigrator(144)→migrationpluginwrapper(189)→installcoordinationd(126)**，最后这个人在收，而那枚收口里**既没消息也没发送权计数**⇒ 落判据 (b)（谁本该拿着发送权属镜像侧），(a)(c) 排除；(d) 字面成立但打折：`to=0xffffffff` 按 ms 折算是 49.7 天，本靴离死线只剩 110 s，**不能读成「会自己醒」**，而且单位是推断不是读数。下一支（r297）补对象身份 `robj=`/`rvobj=`+`link=yes|no|unknown`：端口名跨 task 不可比，`hop=2` 的 `remote=7f07`（189 的空间）与 `hop=3` 的 `rcv=1917`（126 的空间）是不是同一枚端口，本格读不出——而 (b) 那句只在同一枚端口上才成立。**这靴还活到了自己的 1800 s 死线**（flight `deadline fired … boot=84`、boot 84 名下 kind-20 一条）⇒ 那串「707–1335 s 静默复位」这一靴没添条目，WDT 三行逐拍在动、仍 `en=0 armed=0`（APSS 继续排除）。**boot 85 用同一枚 v0.7.0 镜像作控制轮，两件事分开落地**：链八行两拍逐跳同形、叶子仍 `cap=recv qmc=0 qsr=0`（只有 pid 与端口名在换：126→119、`1917`→`1e0b`——跨 task 不可比这件事第二次自己走上门来）⇒ 仪器稳定；但结局不同——卡上最后动静 `t=1680923 ms`，没有 boot 85 名下的死线记录也没有 sink 标记（那两枚仍署 boot 84、解码器印 STALE）⇒ **第七起静默无 panic 复位**，上界由死线记录给（跑到了就该有），落在 **1681–1800 s**；带因此是七条 718/1184/1248/1335/997/707/本靴，**「何时结束」在同一枚镜像上是分布不是常数**。WDT 两行在动仍 `en=0 armed=0`，keystore `stage=3 opens=100 calls=442` 继续在涨，落地快照第三次 `charger_temp=327`、`rawdump` 头第四次全 0。**r297（v0.7.1）已发出并在跑（boot 86）**：`clover_sb_port_obj()` 先按 RECEIVE 再按 SEND 译出对象、不读字段、`io_unlock` 后只返回身份，每跳另起一行 `prev=/rvobj=/robj=/link=`（另起一行的理由是实测——boot 84 最长那条 r296 行 227 字节，三枚指针最坏 +79 = 306 顶到 320 的记录上限，长了只截断不分段，而 `end=` 在尾巴上），两支预登记：`link=yes` 而该跳 `qmc=0` ⇒ 进内核投递-唤醒（`ipc_mqueue_send()` / `ipc_mqueue_receive()` 的 `thread_block(ipc_mqueue_receive_continue)`，`osfmk/ipc/ipc_mqueue.c:1214`）；`link=no` ⇒ 它等的不是请求落下的那枚口，转镜像侧普查它自己的 entry 集；`link=unknown` 也是读数。 |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气通，两个候选地址全 NACK（`verdict=102`） | 先把面板轨真上电（依赖 3），再问地址 |
 | 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路好，但核心版本字不在 v5 带内，APID 一个没认 | 弄清版本字、认 APID、读轨开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 自校验通过），判决行还没上屏 | 有边就上 GLINK/APR；没镜像先压 `vadsp` 电源 |

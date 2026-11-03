@@ -22605,3 +22605,232 @@ trap 里那根纯收线程的 `rcv=`（`x5>>32`）与 `to=`（`x7`），以及**
 `~/clover-out/round295-v0.6.99-payload.img`（sha `81853304…`）、
 `round295-kernel-{amfi,normalized}.macho`（`2507bfc0…` / `65dd99c3…`）、
 落地快照两枚见 ⑥。发版 **v0.6.99**。
+
+## Round296 (v0.7.0): 让只收不发的 hop 说得出它在等哪枚口、队列里有没有东西
+
+**① 这一支问什么。** boot 83 两拍的叶子都停在 `end=no_send`，而这枚判决在代码里的真实含义是
+「trap 里那根线程的 `x3`（目的端口）为 0」——它不是没在等，是**在等一次收**：它早前把消息发出去，
+现在阻塞在自己的回音端口上。r295 的捕获规则只保留 `x3 != 0` 的第一根线程，于是这根线程的
+`thid=`/`rcv=`/`to=` 全印 0，`rmc=`/`rsr=` 也就没被读。**「回音早就在队列里、只是没把谁叫醒」与
+「回音根本还没到」，在卡上是同一行字**——这正是本轮要避免的那种读数。
+
+**② 改了什么。** 同一条行里加三样：
+* `cap=send|recv|none`——**这一行那三列线程字段是谁的**。`send`＝有目的端口的那根；`recv`＝只收的那根；
+  `none`＝这 task 根本没有线程在 trap 里。这一列存在的理由和 r294 那枚没名字的 `w24` 相反：那次是不能编名
+  就不编，这次是名字来自本树里读得出的规则，但不写清楚来源就会在两拍之后被读成同一种 0。
+* `recv` 那根线程的 `rcv=`（`x5>>32`）与 `to=`（`x7`）——预登记判据 (d) 靠它：连 `rcv=0` 都印得出来，
+  才说明这根线程根本没进 `MACH_RCV`，而不是仪器放弃了。
+* `qmc=`/`qsr=`——**`rcv=` 那枚口自己的**消息数与发送权数，用 r223/r265 已有的 `clover_sb_port_mail()`
+  读在收方向（它 `ipc_object_translate()` 优先按 RECEIVE 权解析，正好是回音端口的所有权形态）。
+
+**③ 锁前提照 r295 的规矩一起验。** `clover_sb_port_mail()` 只做 `ipc_object_translate()`（拿 object
+自己的锁）＋读 `ip_messages.imq_msgcount`、`ip_srights` 两个词，然后 `io_unlock()`；不分配、不阻塞。
+调用点仍在 `lck_mtx_try_lock(&cur->lock)` 之后、`lck_mtx_unlock()` **之后**——与 r295 为
+`vnode_getname()` 立的那条规矩同形。`check-clover.py` 这次多禁一枚 `thread_block(`：
+链是在一个已经卡住的用户空间旁边走的，任何会让采样线程自己睡着的调用，代价是后面每一跳都没有读数。
+
+**④ 为什么不改 `no_send` 这个名字。** boot 83 的两行就是这个值；换名会让新旧两帧对不上，
+而本轮要读的正是「同一个判决下面，队列里到底有没有东西」。终止判决那一列保持七种不变。
+
+**⑤ 卡上通道。** `{ "clover r296: ", "r296-chain", 128, 0, 0, 0 }`，与 r295 同一枚预算、同样进每拍上限的
+豁免链——跳数没变，预算的理由也就没变；**r295 的类保留在表里**（它记录那个前缀曾经存在）。
+改过前缀的行只会被新类接住：忘了加类，整批链行会掉进未分类的内核日志流，而那里第一件被丢掉的就是
+链自己——checker 同时守类与豁免这两枚。
+
+**⑥ 契约落点。** 补丁 `patches/xnu/zzz…z(55)-clover-r296.patch`（六处 hunk，全在 `osfmk/kern/task.c`
+的 `clover_bb_chain` 里）；`LATE_PATCH` 表头（r296 反打先于 r295——它改的正是 r295 写下的那几行，
+顺序错就是一次静默的 apply 失败）；checker 断言整行 printf 字面量、`cap=` 三种取值、
+`if (frcv == 0)` 的捕获、`clover_sb_port_mail(cur, (mach_port_name_t)frcv, &nqmc, &nqsr)`、七枚 `end=`、
+四＋一枚禁用的阻塞调用、两份补丁副本逐字节一致、`LATE_PATCH` 顺序、sdhci 类与豁免；
+`verify-clover-payload.py` 的 `bb-send-chain` 换成 r296 那一枚字面量，并且**反向要求 r296 的补丁文本里
+仍留着 `clover r295: hop=%u`**——那是被改写的那一行，它出现在新补丁的删除侧才证明这次是真改写，
+而不是又加了一条长得相似的行。board.toml 标题升到 `clover r296:`。驱动侧 `build-arm-driver.py CloverSdhci`
+在 `-Werror` 下过。
+
+**⑦ 判据（刷之前写死，boot 84）。** 叶子那行必须 `cap=recv` 且 `rcv=` 非零（正对照；若仍是
+`cap=none`＋`rcv=0`，说明这根线程并不在收，那一支改问用户栈——把 r236 的采样挂到叶子上）。往下：
+(a) `qmc>0` 而线程仍在等 ⇒ 回音已在队列里，缺的是唤醒/投递，下一支进内核那条路径；
+(b) `qmc=0` 且 `qsr=0` ⇒ 没人持有向这枚口说话的权利，属镜像侧（谁本该拿着发送权）；
+(c) `qmc=0` 且 `qsr>=1` ⇒ 有人能答而没答，问的就是 `com.apple.migrationpluginwrapper` 本身；
+(d) `to=` 非零且是有限超时 ⇒ 这笔等待会自己醒，「永远不回」那句旧说法要收回。
+**本轮不碰 GPU、不追复位来源**；复位那一格继续攒 `run-clover-unattended.sh` 的落地快照。
+
+### boot 84（round296 / v0.7.0，2026-11-03）：**叶子那行 `cap=recv` 成立，四条判据落在 (b)＋一条要打折的 (d)**
+
+**① 判决。** 缺口补上了。这一靴链走满四跳，最后一行不再是「有个线程在 trap 里但我们看不见它」：
+
+```
+[1571.901067] hop=0 t=1562 pid=58  comm=backboardd       exec=backboardd                  ex=ok threads=17 wait=10 run=7  trap=9  cap=send thid=441 rcv=6d0f remote=c41f to=0          rmc=0 rsr=1 qmc=0 qsr=0 peer=144:com.apple.datam      end=-
+[1572.014829] hop=1 t=1562 pid=144 comm=com.apple.datam  exec=com.apple.datamigrator      ex=ok threads=10 wait=9  run=1  trap=1  cap=send thid=380 rcv=2f03 remote=5713 to=0          rmc=0 rsr=1 qmc=0 qsr=0 peer=189:com.apple.migra    end=-
+[1572.324931] hop=2 t=1562 pid=189 comm=com.apple.migra  exec=com.apple.migrationpluginwrapper ex=ok threads=5 wait=5 run=0 trap=2 cap=send thid=5bd rcv=2103 remote=7f07 to=0          rmc=0 rsr=1 qmc=0 qsr=0 peer=126:installcoordina  end=-
+[1572.449776] hop=3 t=1562 pid=126 comm=installcoordina  exec=installcoordinationd        ex=ok threads=8 wait=7  run=1  trap=1  cap=recv thid=2e5 rcv=1917 remote=0    to=ffffffff rmc=0 rsr=0 qmc=0 qsr=0 peer=-                 end=no_send
+[1699.267880] hop=0 t=1693 …（同上，threads=18 wait=11 trap=9，remote 仍是 c41f）
+[1699.399187] hop=1 t=1693 …（同上，wait=10 run=0 trap=2）
+[1699.723934] hop=2 t=1693 pid=189 … threads=3 wait=3 run=0 trap=2 remote=7f07 → peer=126
+[1699.856000] hop=3 t=1693 pid=126 … threads=4 wait=3 run=1 trap=1 cap=recv thid=2e5 rcv=1917 to=ffffffff qmc=0 qsr=0 end=no_send
+```
+
+预登记的正对照成立：叶子那行 **`cap=recv` 且 `rcv=1917` 非零**，所以判据 (d) 的「根本没进 `MACH_RCV`」那一支
+不必启动（不用把 r236 的用户栈采样挪到叶子上）。四行 `ex=` 仍全 `ok`，`peer=` 把三个对家逐跳点名。
+
+**② 债链比 boot 83 深了一跳，而深出来的那一跳就是答案所在。** 83 那两拍的叶子分别是
+`osanalyticshelper`(166) 与 `migrationpluginwrapper`(202)——插件包装进程自己落叶。本靴
+`migrationpluginwrapper` 是 pid 189，它 `cap=send`、把消息发给了 **pid 126 `installcoordinationd`**，
+后者才是纯收的那根（`thid=2e5`、`rcv=1917`）。⇒ 「桌面等的是 datamigrator 那一串」这句话现在有了具体形状：
+**backboardd → datamigrator → migrationpluginwrapper → installcoordinationd，最后一个人在收，
+收的那枚口里既没有消息也没有发送权。** pid 每靴都挪（148→144、166/202→189/126），
+所以引用要带靴号，旧 pid 别再往下抄。
+
+**③ 四条判据落点：(b) 成立，(d) 字面成立但要打折。**
+* **(b)** `qmc=0` 且 `qsr=0`——在收方向读到的：`rcv=1917` 那枚口的消息队列为空，且**它的发送权计数是 0**。
+  按预登记的读法，这一支属镜像侧：「谁本该拿着向这枚口说话的权利」。
+* **(c)** 排除：不是「有人能答而没答」，因为这枚口上没有任何发送权计数。
+* **(a)** 排除：回音不在队列里。
+* **(d)** `to=ffffffff` 是**非零且有限**，字面上满足「这笔等待会自己醒」；但按 `mach_msg2` 那枚超时字段的
+  通行单位（ms）折算 ≈ 4 294 967 295 ms ≈ **49.7 天**，本靴只剩约 110 s 就撞上 1800 s 死线。
+  ⇒ **不能说「它会自己醒」**：这是一枚数值上有限、物理上永不的超时。r264 定的字段读法在这里成立
+  （`x7` 确实带出了一个非零超时，而不是 0），但单位这条推断本格没有独立正对照——它是从「同一位置发出去的那次
+  `to=0`（三跳的发送方向超时都是 0）」加上约定推出来的，不是从卡上量出来的。要坐实单位，得让某处产生一枚
+  小的有限超时做对照（下一支可加：给一个已知会自己醒的等待采样一次）。
+
+**④ `cap=recv` 那行的 `rmc=`/`rsr=` 是初值，不是读数。** 发送方向那两列只在 `remote!=0` 时才读；
+本行 `remote=0`，所以 `rmc=0 rsr=0` 是「没读」的形状，读的是 `qmc`/`qsr`。这正是 `cap=` 这一列存在的理由，
+写在这里是为了下一次别再有人把三个 0 读成三个 0——`thid=2e5`、`rcv=1917`、`to=`、`qmc`/`qsr` 才是这行的读数。
+
+**⑤ 下一支的缺口，本轮读数的边界（r297，桌面主线）。** 端口**名**是每 task 的整数索引，跨 task 不可比：
+`hop=2` 的 `remote=7f07` 是 pid 189 地址空间里的名字，`hop=3` 的 `rcv=1917` 是 pid 126 里的名字，
+**本格的读数无法判断这两枚是不是同一枚端口**。而 (b) 那句「队列里没有回音」只有在同一枚端口上才成立。
+⇒ r297 补对象身份：`clover_sb_port_mail()` 那条路径已经拿到了 `ipc_object_t`，把 `remote=` 与 `rcv=` 各自的
+object 指针打进行里（`robj=`/`rvobj=`），并对相邻两跳给出 `same=1|0|?`。两支判据现在写死：
+(a) **同一对象**（hop2 的 `robj` == hop3 的 `rvobj`）而 `qmc=0` ⇒ 请求没落进队列、或已被别的线程取走，
+下一支进内核的投递-唤醒那一格；(b) **不同对象** ⇒ installcoordinationd 在听的不是请求落下的那枚口，
+下一支普查它自己的 entry 集（r234 那套），把 `hop2.robj` 对应的那枚名字与它的 `qmc` 找出来——
+那是一条「消息排在一没人听的队列里」的形状。
+
+**⑥ 这靴活到了自己的死线，所以「第八起静默复位」没有发生。** 环里最后一行在 `1815.138408`（deadline 之后），
+`--flight` 报 **`deadline fired after 1800 s at t=1802889 ms boot=84 ps=0x01f800f0 elapsed=1800.014s`**，
+panic 槽 stage 0/1 两行都署 `boot=84`、`gates=0x7(armed,bcb,text)`，report 窗口里 **boot 84 名下 kind-20 一条**
+（自 boot 76 以来第一次本靴自己有 panic 记录）。⇒ boot 77–82 那串「707–1335 s 之间无 panic 复位」在本靴
+**没复现**；这不推翻那条时间带（六起仍在），只是**第八次采样落在了带外**，复位来源那一格继续攒落地快照。
+r281 的 WDT 行本靴有 3 条、逐拍 `t=` 在动（正对照成立），读数照旧 `en=0 armed=0 intmask=0 sts=0`、
+bark/bite 停在复位值（`bark_ms=16001 bite_ms=32002`）⇒ APSS watchdog 继续被排除。
+`clover r283: last reset …` 那行本靴窗口里 **0 条**——环窗只覆盖 `1449.77 → 1815.14 s`（512 行的地平线），
+它在更早的位置被顶出去了，**不能读成「这靴没记录上一次复位」**；同一件事的副本在飞区里（`ps=0x01f800f0` 与 beat 计数）。
+
+**⑦ keystore 那格顺带又拍了一次，而且是在动的。** `clover r281: aks` 两拍：`fire=301 stage=3 status=0
+service=fffffff3e7a9c600 owner=IOResources opens=76 calls=345` → `fire=361 … opens=88 calls=387`。
+`stage=3` 且 `service` 非零＝r276 定义的「started」，`opens`/`calls` 在长 ⇒ 服务活着、有人在开它。
+这一格本轮不设判据，只是记下它没退步。
+
+**⑧ 落地快照（第二次自动跑）。** 复位后第一时间抓：`charger_temp=327`、`battery temp=260`（26.0 ℃）、
+`status=Charging`、`charge_type=Fast`、`voltage_max=4400000`；tsens `thermal_zone10=353`。
+`emmc_therm=-40` 仍按「本板未接」处理，不进结论。与 boot 83 的落地快照（`charger_temp=322`、`temp=250`）
+同量级——两靴落地时刻相近（07:51:36Z 对照上一轮那枚 +25 s），所以这两枚可以直接并排，
+不再有「晚了九分钟就低 2.8 ℃」那种偏置混进来。`rawdump` 头 512 字节**第三次全 0**
+（`...landing-rawdump-head.bin` 512 字节可查）⇒ 「等一次崩了就有现成 ramdump」这条路的判据继续是空的。
+产物：`~/clover-out/round296-log-window.bin(.txt)`（512 行内核环、64 行驱动判据、16 条 report、
+21 行 probe、8 行 r296）、`round296-log-window.bin.landing-sensors.txt`（7651 字节）、
+`...landing-rawdump-head.bin`、`~/clover-out/r296-boot84-unattended.log`。发版 **v0.7.0**。
+
+### boot 85（round296 控制轮 / 与 boot 84 同一枚 v0.7.0 镜像，2026-11-03）：**仪器复现了，结局没复现**
+
+**① 这一轮问的是什么。** 16:02 冷刷**同一枚** `round296-v0.7.0-payload.img`（sha `8557297c…`，与 boot 84 逐字节相同），
+不为新读数，只为两件事：(1) r296 的债链是不是每靴都走得到第四跳、还是 boot 84 那一回侥幸；(2) boot 84「跑满死线」
+到底是这枚镜像的性质，还是那一靴的性质。控制轮不做新仪器，也不写任何位。
+
+**② 债链：八行，两拍，逐跳同形**（`round296b-control-log-window.bin.txt`，t=1452 与 t=1581 两拍）：
+
+```
+[ 1460.560139] hop=0 pid=58  exec=backboardd                    ex=ok cap=send thid=384 rcv=5503 remote=d00b peer=147:com.apple.datam end=-
+[ 1460.686754] hop=1 pid=147 exec=com.apple.datamigrator        ex=ok cap=send thid=390 rcv=7d07 remote=7c07 peer=191:com.apple.migra end=-
+[ 1460.813629] hop=2 pid=191 exec=com.apple.migrationpluginwrapper ex=ok cap=send thid=64b rcv=3e03 remote=5707 peer=119:installcoordina end=-
+[ 1460.945018] hop=3 pid=119 exec=installcoordinationd          ex=ok cap=recv thid=2b4 rcv=1e0b remote=0 to=ffffffff rmc=0 rsr=0 qmc=0 qsr=0 end=no_send
+```
+
+（t=1581 那拍四行同形，叶子 `threads=3 wait=2 run=1 trap=1`。）与 boot 84 并排：链条**同一串服务**
+（backboardd → datamigrator → migrationpluginwrapper → installcoordinationd），`cap=` 阶梯同一形状，
+叶子同一枚判据 `qmc=0 qsr=0`；**每靴变的是 pid 与端口名**（144→147、189→191、126→119；
+`remote=7f07`→`5707`、`rcv=1917`→`1e0b`）。这正是 r297 要接的那一格的第二次证明：
+`remote=` 与 `rcv=` 是各自任务空间里的下标，两靴之间都不能对，何况跳与跳之间。⇒ 仪器这一格判**稳定**。
+
+**③ 结局：第七起静默无 panic 复位。** 卡上 boot 85 自己的动静停在 **t=1680923 ms**
+（飞区最新 entry seq 241088；最新 beat seq 177 在 1672654 ms，解码器自报 `gap 8269 ms`），
+内核环最后一行 `[ 1674.986161]`（apfs 的一句 `rejecting class open`）。**没有** boot 85 的死线记录，
+**没有** boot 85 的 panic 标记——飞区那两枚（`t=1802889 ms`、`1803055/1803062 ms`）署的是 boot 84，
+解码器照样印 `STALE: boot 85 never entered the sink`；环里最新的 kind-20 槽还停在 boot 52/53/54。
+宿主在 **08:33:49Z（16:33:49）** 检出 recovery 并抓落地快照。
+⇒ 上界不是墙钟给的，是**死线记录给的**：如果这靴跑到 1800 s，r236 那条死线记录和 r212 的 sink 标记都该署 boot 85；
+两者都没有，所以复位落在 **1681 s 与 1800 s 之间**。唯一能让它超过 1800 s 的读法是「panic 了、
+但死线记录和 sink 标记两次卡写都失败」——那本身是一种新故障，不是一条读数。
+**带因此是七条：718 / 1184 / 1248 / 1335 / 997 / 707 / 本靴 1681–1800 s。**
+
+**④ 这一靴真正买到的东西：结局不是镜像的性质。** boot 84 用同一枚镜像跑到 1803 s 并按设计 panic 落回，
+boot 85 在 1681 s 之后静默停住。同一 payload、同一 boot-args、同一分区 ⇒
+**「什么时候结束」在 v0.7.0 上是分布，不是常数**。这把 r294 立的那句「负载不是变量」补完了：
+不光负载不决定它，镜像也不决定它；剩下的候选仍是「卡上静默之后仍在等的东西里，有一件会到点自己复位」，
+而 APSS 看门狗已经连续九靴读出 `en=0 armed=0`（⑤）。
+
+**⑤ 正对照与地平线。** WDT 两行（1468.178、1592.118）`t=` 在走、`why=ctrl`、
+`en=0 armed=0 intmask=0 sts=0 bark=524287 bite=1048575` ⇒ 仪器活着，读到的是「没上膛」而不是「没读」。
+`clover r283:` 在本窗 **0 条**是**环地平线**（窗口只覆盖 1387.025–1674.986 s，那一行只在上膛那一次打印），
+副本在飞区，不是读数。GPU 三行（r286 六行、r290 两行、r291 两行、r294 普查两行）照常在场 ⇒ 那格没退步。
+
+**⑥ keystore 计数器继续长**：`clover r281: aks t=1592 fire=331 stage=3 status=0 service=fffffff3cd9362e0
+owner=IOResources opens=100 calls=442 refused=0 other=1`——boot 84 是 `opens=88 calls=387`，
+同一台服务、同一枚 `owner=IOResources`，计数在涨 ⇒ r276 定义的「started」仍在，没有回退。
+
+**⑦ 落地快照第三次自动跑**（`...landing-sensors.txt` 7650 字节，`@08:33:49Z`，读卡上日志之前抓）：
+`charger_temp=327`、`status=Charging`、`charge_type=Fast`、`current_now=28320`、`capacity=100`、
+`die_health=Cool`、tsens 最高 `thermal_zone11=379`。与 boot 84 的落地值 `327` **相同**（boot 83 是 `322`），
+`emmc_therm=-40` 仍按未接处理；`rawdump` 头 512 字节**第四次全 0**（`...landing-rawdump-head.bin`）
+⇒ 「复位会留下现成 ramdump」这条判据继续为空。
+
+**⑧ 产物**：`~/clover-out/round296b-control-log-window.bin(.txt)`（512 行内核环、64 行驱动判据、16 条 report、
+8 行 r296、0 行 probe）、`round296b-control-log-window.bin.landing-{sensors.txt,rawdump-head.bin}`、
+`~/clover-out/r296b-boot85-unattended.log`；刷前的窗口快照
+`round296b-control-log-window.bin.pre-flash` sha `69cddbbe…` 与 boot 84 的 `round296-log-window.bin` 相同
+⇒ 板上留的就是上一轮读到的那一窗。
+
+## Round297 (v0.7.1): 给两枚端口名一个跨地址空间都成立的身份
+
+**① 这一支只补一格。** boot 84/85 两靴都把叶子读到 `cap=recv qmc=0 qsr=0`，于是问题只剩一句：
+**hop 2 发出的那封请求，是不是投给 hop 3 正在等的那枚口？** 行上的名字回答不了——
+`remote=7f07` 是发送者任务空间里的下标，`rcv=1917` 是接收者空间里的下标，两个数字之间没有任何可比性
+（boot 85 更直接：同一枚服务在两靴里换了 `1917`→`1e0b`）。
+内核里唯一跨空间成立的值是 **`ipc_object` 指针**：一枚端口只有一个对象。
+
+**② 怎么读。** 新增 `static uintptr_t clover_sb_port_obj(task_t, mach_port_name_t)`：
+先按 RECEIVE 译、失败再按 SEND 译（与 `clover_sb_port_mail()` 同一套翻译次序），
+`ipc_object_translate()` 返回时对象是上锁的，这里**一个字段也不读**，`io_unlock()` 之后才返回。
+打出来的值是身份不是引用——解锁后从不解引用，所以一枚在两跳之间被释放的端口只会让比较说 `no`，不会 fault。
+每跳取两枚：`robj`（本跳 `remote=` 的对象）与 `rvobj`（本跳 `rcv=` 的对象），
+`prev_obj` 在循环外带着走，`link=` 是内核自己做的那次比较：
+`prev_obj!=0 且 rvobj!=0` ⇒ `yes|no`；`prev_obj!=0 而 rvobj==0` ⇒ `unknown`；第一跳 ⇒ `-`。
+
+**③ 为什么另起一行而不是加长那一行。** boot 84 实测最长的一条 r296 行 **227 字节**
+（八行分别是 201/201/207/207/218/219/227/227），而 tee 记录是 320 字节且**长了只截断、不分段**
+（`CloverSdhci.cpp:600`）。三枚指针按 `%lx` 最坏 16 位十六进制 + `link=unknown` = **79 字节**，
+227+79=**306**，只剩 14 字节给一个本轮无法预知的名字——`end=` 正好在尾巴上。
+所以 `clover r297:` 单独一行，两行靠 `hop=` 与 `t=` 配对（两行都带这两列）。
+
+**④ 预算与豁免。** 新类 `{ "clover r297: ", "r297-chain", 128, 0, 0, 0 }`（与 r295/r296 同额），
+并加进每轮 16 次推送上限的豁免链：这条链值钱的行是**最后一跳**那行，
+被上限吃掉叶子那行会把「没有 link」读成「链没接上」——这正是这支要问的那格。
+
+**⑤ 判据（刷 boot 86 前写死）。**
+(a) **`link=yes` 且该跳 `qmc=0`** ⇒ 请求确实投进了这根线程正在等的口，而队列是空的：
+下一支进内核的投递-唤醒那一格（发送侧 `ipc_mqueue_send()`，接收侧 `ipc_mqueue_receive()` 的
+`thread_block(ipc_mqueue_receive_continue)`——`osfmk/ipc/ipc_mqueue.c:1214`）。
+(b) **`link=no`** ⇒ installcoordinationd 等的不是请求落下的那枚口，问题在镜像侧：
+它到底在听谁、请求落在谁那里，是普查问题，不是内核问题。
+(c) **`link=unknown`** 也是一条读数：那枚名字没译成对象（收回权已释放，或它是 set 而不是 port）。
+正对照：**hop=0 必须 `prev=0 link=-`**，且每条 `clover r296:` 行都该有一条同 `hop=`/`t=` 的 `clover r297:` 行——
+只出现一半 ⇒ 某一类被 cap 吃掉或某一行没链进镜像。
+(d) 若 `robj` 在两拍之间稳定相同（同一服务、同一对象），那 `rvobj` 也可以拿来自证：
+两拍之间换了 ⇒ 端口在两拍之间重建过，这是新信息，值得单独记一行了再判。
+
+**⑥ 一位也不写。** 全支只有读与比较：`ipc_object_translate` + `io_unlock`，
+没有 `io_lock`、没有 `simple_wait`、没有 `thread_block`（`check-clover.py` 反向钉住这几枚）。
+GPU 那三枚 fuse 行（`cpr4-ctrl` 的第二段窗口 `0x00784000 0x1000`，行 65/71/73 = +0x208/+0x238/+0x248）
+**排在下一支**：它要新增第四枚 `IODeviceMemory::withRange`，与内核补丁不同层，
+两者同靴出险会分不清是谁——本轮的镜像已经过双闸门，先单独发。

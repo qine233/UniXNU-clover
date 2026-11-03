@@ -1,0 +1,134 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 9dbc15a..7f2ce4d 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11386,6 +11386,45 @@ clover_sb_port_mail(task_t task, mach_port_name_t name, uint32_t *mc, uint32_t *
+ 	io_unlock(obj);
+ }
+ 
++/*
++ * Round297. The same translation, but the answer this time is the object itself -- one number,
++ * printed only to be compared with another printing of the same number. It exists because every
++ * other name in the chain row is a per-task index: hop 2's remote=7f07 is an index in the sender's
++ * space and hop 3's rcv=1917 is an index in the receiver's, so no reader -- the kernel or a human
++ * holding two rows -- can say whether the request the sender placed is addressed to the port the
++ * receiver is blocked on. That question decides what boot 84's qmc=0 means, and the object pointer
++ * answers it across address spaces because there is exactly one ipc_object per port in the kernel.
++ *
++ * The lock discipline is clover_sb_port_mail's: ipc_object_translate() returns the object locked,
++ * nothing is read from it here, and io_unlock() runs before returning. The value is an identity,
++ * not a reference -- printed and compared, never dereferenced after the unlock -- so a port freed
++ * between two hops can only make the comparison say no, never fault.
++ */
++static uintptr_t
++clover_sb_port_obj(task_t task, mach_port_name_t name)
++{
++	ipc_space_t space;
++	ipc_object_t obj = IPC_OBJECT_NULL;
++	kern_return_t kr;
++
++	if (name == MACH_PORT_NULL) {
++		return 0;
++	}
++	space = task->itk_space;
++	if (space == IPC_SPACE_NULL) {
++		return 0;
++	}
++	kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_RECEIVE, &obj);
++	if (kr != KERN_SUCCESS) {
++		kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_SEND, &obj);
++	}
++	if (kr != KERN_SUCCESS) {
++		return 0;
++	}
++	io_unlock(obj);
++	return (uintptr_t)obj;
++}
++
+ /*
+  * Round233. The port's state says what is queued; it does not say who serves
+  * the name. The owner is resolved from the same space the state was read in, in
+@@ -12644,6 +12683,21 @@ clover_bb_exec_name(task_t task, char *out, size_t outlen)
+  * recv row is no longer readable as an instrument that gave up. qmc=/qsr= are the
+  * message count and send rights of the port cap=recv names, which is the difference
+  * between a reply that landed and never woke anybody and one that never came.
++ *
++ * Round297 prints a second, shorter row beside it -- prev=/rvobj=/robj=/link= -- because
++ * boot 84 answered the queue question and immediately exposed a worse one. Every name on
++ * the first row is an index inside the task printed for: hop 2's remote=7f07 lives in the
++ * sender's space, hop 3's rcv=1917 in the receiver's, and no reading of those two numbers
++ * can say whether they are the same port. So qmc=0 on hop 3 means "nothing is queued on
++ * the port this thread waits on", which is only the interesting statement if the request
++ * hop 2 placed was addressed to that port in the first place. The object pointer is the
++ * one value that survives crossing spaces -- there is one ipc_object per port -- and link=
++ * compares hop N-1's remote object with this hop's receive object. It goes on its own row
++ * rather than appended to the first one because the longest r296 row on boot 84 measured
++ * 227 bytes, and three pointers at 16 hex digits plus link=unknown add 79 -- 306 of the
++ * 320-byte tee record, which leaves fourteen bytes for a name this round cannot predict.
++ * A longer line is truncated, not split, and end= sits at the tail: the one column that
++ * says why the walk stopped.
+  */
+ static void
+ clover_bb_chain(task_t root, uint64_t secs)
+@@ -12654,6 +12708,7 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 	unsigned int hop = 0;
+ 	int seen[CLOVER_BB_CHAIN + 1];
+ 	uint32_t nseen = 0;
++	uintptr_t prev_obj = 0;
+ 
+ 	while (cur != TASK_NULL) {
+ 		thread_t thr;
+@@ -12679,6 +12734,9 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 		const char *cap = "none";
+ 		uint32_t nqmc = 0;
+ 		uint32_t nqsr = 0;
++		uintptr_t robj = 0;
++		uintptr_t rvobj = 0;
++		const char *link = "-";
+ 		int busy = 0;
+ 
+ 		comm[0] = exec[0] = peer[0] = '\0';
+@@ -12753,6 +12811,32 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 		} else if (nrem != 0) {
+ 			cap = "send";
+ 		}
++		/*
++		 * Round297. Two translations to identity, not to content, and one comparison carried
++		 * from the previous hop: every name on the row above is an index inside the task it is
++		 * printed for, so hop 2's remote= and hop 3's rcv= cannot be compared by anything that
++		 * reads them -- yet boot 84's leaf said qmc=0, and that only means something if the
++		 * request hop 2 placed is addressed to the very port hop 3 is blocked receiving on.
++		 * link=yes says it is (the reply has nowhere to come from and the image owns that
++		 * question); link=no says hop 3 waits on a different port than the one hop 2 wrote to,
++		 * which is a queue nobody listens on and a census question; link=unknown says one of
++		 * the two did not translate. prev_obj is kept out of the loop body so the walk carries
++		 * it forward, and it is the previous hop's remote object -- the sender's own view of
++		 * where its message went.
++		 */
++		if (nrem != 0) {
++			robj = clover_sb_port_obj(cur, (mach_port_name_t)nrem);
++		}
++		if (frcv != 0) {
++			rvobj = clover_sb_port_obj(cur, (mach_port_name_t)frcv);
++		}
++		if (prev_obj != 0) {
++			if (rvobj != 0) {
++				link = (rvobj == prev_obj) ? "yes" : "no";
++			} else {
++				link = "unknown";
++			}
++		}
+ 		if (nrem != 0) {
+ 			uint32_t k;
+ 
+@@ -12803,6 +12887,10 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 		    (unsigned int)(uint32_t)nrcv, (unsigned int)(uint32_t)nrem,
+ 		    (unsigned long long)nto, nrmc, nrsr, nqmc, nqsr,
+ 		    peer[0] != '\0' ? peer : "-", end);
++		printf("clover r297: hop=%u t=%llu prev=%lx rvobj=%lx robj=%lx link=%s\n", hop,
++		    (unsigned long long)secs, (unsigned long)prev_obj, (unsigned long)rvobj,
++		    (unsigned long)robj, link);
++		prev_obj = robj;
+ 		if (nseen < (uint32_t)(sizeof(seen) / sizeof(seen[0]))) {
+ 			seen[nseen++] = task_pid(cur);
+ 		}

@@ -1095,9 +1095,23 @@ def check_sb_sample(kernel: bytes) -> bool:
              # their first fifteen. The row carries both name sources and the walk's own verdict, so a chain
              # that stopped is a reading rather than a missing row -- which is only true if the whole literal
              # shipped, hence the pinned merge rather than a prefix.
-             "bb-send-chain": (b"clover r295: hop=%u t=%llu pid=%d comm=%s exec=%s ex=%s"
-                               b" threads=%u wait=%u run=%u trap=%u thid=%llx rcv=%x remote=%x"
-                               b" to=%llx rmc=%u rsr=%x peer=%s end=%s\n") in kernel,
+             # Round296 rewrites that literal rather than adding to it: boot 83 ended both leaves on no_send
+             # with thid=/rcv=/to= all zero, because the capture rule demanded a non-zero x3 and a thread whose
+             # x3 is zero is inside the trap waiting to receive. cap= names which thread the three columns came
+             # from and qmc=/qsr= are that port's own queue, so "the reply landed and never woke anybody" and
+             # "no reply came" stop printing alike. The r295 literal is gone on purpose; the checker below asks
+             # for the r296 one.
+             "bb-send-chain": (b"clover r296: hop=%u t=%llu pid=%d comm=%s exec=%s ex=%s"
+                               b" threads=%u wait=%u run=%u trap=%u cap=%s thid=%llx rcv=%x remote=%x"
+                               b" to=%llx rmc=%u rsr=%x qmc=%u qsr=%u peer=%s end=%s\n") in kernel,
+             # Round297 rides beside that row rather than inside it. Boot 84 read qmc=0 qsr=0 on the leaf's own
+             # receive name, and the sentence "nothing is queued on the port this thread waits on" is only worth
+             # anything if the request the previous hop placed was addressed to that port -- which no reader of
+             # two per-task port indices can say. prev=/rvobj=/robj= are ipc_object pointers, the one value that
+             # survives crossing address spaces, and link= is the kernel's own comparison of two of them. The
+             # literal is pinned whole for the standing reason: a format string cut in half leaves every prefix
+             # needle green, and this row is the whole answer of the round.
+             "bb-chain-link": (b"clover r297: hop=%u t=%llu prev=%lx rvobj=%lx robj=%lx link=%s\n") in kernel,
              # Round275 measured the precondition of the only proposed fix and Round276 acted on it, so three
              # rows are pinned: the class lookup (what r275 read as 0/0 on boot 62, and what has to read 1 the
              # moment this round works -- the needle checking itself), the publish's own state (stage 3 with a
