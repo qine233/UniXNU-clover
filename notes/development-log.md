@@ -23708,3 +23708,66 @@ boot 92 的 `lba 27830960` 反复 multi-read fail + card recover 是现成线索
 
 **⑥ 产物。** `~/clover-out/round302-boot92-window.bin`（623,104 B）与解码 `…bin.txt`
 （16 report / 64 verdict / 0 probe / 512 kernel，boot 92）、`r302-boot92-unattended.log`。
+
+## Round303 (v0.7.10)：债链在任务级已经成立，这一轮去普查收方任务自己那枚名字
+
+**① 这一轮结的是 boot 87 §⑩ 预登记的那一支（#577 桌面主线），不是新开问题。**
+boot 87 的 r298 行证明：每跳发送对象（`robj=`）的 `ip_receiver`（`tspace=`）逐跳等于下一跳自己的
+`itk_space`（`space=`），三跳都在**同一个地址空间里**可比、不依赖任何一枚名字译得出对象 ⇒ 债链在
+**任务**这一级是真的。失配只在**名字**上：收方任务把那枚口叫 `tname=`（3207/3507/2903），而这一跳被采样的
+线程等的是**另一个名字** `vname=`（4503/1003/d0b），`tlink=no` 唯一支持的下一步就是「去普查那个任务自己的
+entry 集」——谁持有 `tname=`、有没有线程真等在它上面（§⑩ (a)）。同一轮把两支仪器债一起结掉：§⑩ (b)
+的 `vbits=`（把 `ipc_right_lookup_read()` **已经成功交出来的** `bits` 印出来，将「port set / send-once /
+死名」分开，且**不需要对象、锁纪律与 translate 同一条**），和 §⑤ 的 `qerr=`（`cap=send` 行的 `qmc=/qsr=`
+至今没有自己的返回码，「0 只在同排返回码为 0 时才算读数」这条规矩在那些行落不了地）。
+
+**② 形状。**
+- (a) **新行** `clover r303: hop=%u t=%llu rpid=%d rnm=%x rentr=%d rvbits=%x rwait=%u rwtid=%llx rbusy=%d`，
+  紧跟每跳的 r298 行、由 `hop=`/`t=` 配对：
+  - `rpid=` 是 `clover_bb_peer_task` 递回的收方任务 pid（该函数返回一个 `task_reference`'d task，解引用
+    `next` 安全）；`rnm=` 就是这一跳发送方写进去的那枚 `tname=`。
+  - `rentr=`/`rvbits=`：**直接对收方任务的 `itk_space`** 调 `ipc_right_lookup_read()`（SMR、不加锁、死空间
+    回 `KERN_INVALID_TASK` 安全），`KERN_SUCCESS` 时取 `IE_BITS_TYPE(bits)` 并 `io_unlock(obj)`。
+  - `rwait=`/`rwtid=`/`rbusy=`：`lck_mtx_try_lock(&next->lock)`（**try，不是 lock**——普查要能在卡死的
+    用户态旁边站着说话），遍历收方任务的线程，数有几根的 `mach_msg2_trap` 里 x5>>32(rcv) 或 x3(remote)
+    等于 `tname=`，报第一根这样的 tid；拿不到锁就 `rbusy=1`。
+- (b) `clover_sb_port_obj()` 现带 `uint32_t *vbits`：`ipc_object_translate()` 失败（boot 87 的 `verr=17`）
+  时再走 `ipc_right_lookup_read()` 把 `bits` 取出来；r298 行末尾多印 `vb_r=%x vb_v=%x`——`vb_r` 是**发送名**
+  （`nrem`）的 entry 类型位，`vb_v` 是**那枚 `verr=17` 的收名**（`frcv`，即 `vname=`）的类型位，正是 §⑩ (b)。
+- `qerr=`：`clover_sb_port_mail()` 加出参 `int *err`（`-1` 初值、`-2`＝`IPC_SPACE_NULL`、否则 `(int)kr`）；
+  r296 行 `qsr=%u` 后多一列 `qerr=%d`，读的是 `nrcv` 那枚收队列口的 `ipc_object_translate()` 返回码。
+
+**③ 守住的规矩。** r303 只在 r296/r298 行尾**追加列**、不重排任何既有列（boots 50–88 仍能与 89+ 对齐）；
+普查块**不重印** `r262`/`r296`/`r298` 任何一行（checker 有重印负断言）；`qerr=` 用的是现有 helper，加的是
+出参不是新译法；`try_lock`/`io_unlock` 沿用 r295/r296 已确立的锁纪律。新行进 tee 类 `r303-hop`（预算 128），
+并加 `teeHasPrefix(...,"r303")` 的每拍推送豁免——普查/判决行不能被 cap 截，否则「0 行」又会被读成「没发生」。
+
+**④ 动手前必须先验的前提（差点写成 panic）。** `ipc_right_lookup_read(space,...)` 会 SMR 解引用
+`&space->is_table`，传 NULL space 直接挂。普查调的是**别人的** `next->itk_space`，所以先
+`if (next->itk_space != IPC_SPACE_NULL)`、NULL 时 `rentr=-2` 不动表——这跟仓里既有的 `IPC_SPACE_NULL`
+守卫同一个形状，不是新发明的约束。
+
+**⑤ boot 93 的判读态（刷写前登记；本轮改的是内核行，句子/尾巴那两条线本轮都没动）。**
+先问身份：卡上应出现 `clover r303:` 行、boot 计数 92→93。主问按 `hop=`/`t=` 与 r298 行配对，对每跳读
+`rentr=`/`rvbits=`：
+- `rentr=0` 且 `rvbits=20000`(RECEIVE) 且同排 `rwait>0` ⇒ **确有线程等在生产方写进去的那枚名字上**，
+  `tlink=no` 的解释就落在「采到的线程不是等这枚的线程」，任务级债链到此闭合；
+- `rvbits=80000`(PORT_SET) ⇒ boot 87 §④ 猜中的那支（runloop 等在集合上），本支仪器第一次把它与 send-once 分开；
+- `rvbits=40000`(SEND_ONCE)/`100000`(DEAD_NAME) ⇒ 收方拿的是一次性/死名，链的形状要重画；
+- `rentr≠0`（且非 -2）⇒ 收方空间里根本没有这枚名字 ⇒ 上一跳的 `robj` 与本跳 `tname` 不是同一对象，回到
+  §③ 之前的空白；`rentr=-2` ⇒ 收方空间 NULL，这一跳不作数；
+- `rbusy=1` 与 `rwait=0` 是两种不同的「没看到」：前者是收方任务锁正被人拿（它可能就在卡住的那条路上），
+  后者是拿得到锁、确实没有线程等。
+仪器债是否结清：`vb_v`（那枚 `verr=17` 的收名）与 `qerr` 是否随对应行出现且语义自洽 ⇒ 结清；某行
+`qmc=0 qsr=0` 而 `qerr≠0` ⇒ 那两个 0 正式记作「没读成」而不是「读出来是空」。
+搭读不作本轮结论：普查尾巴（`r262 th`/`clover r300`，已五靴 0 行跨四枚镜像，仍骑 msgbuf+tee）、r302 的句子
+（boot 92 落在 (f) `blind ok=0`，「卡在 sink 里拒收 flight 写」是另一条线、本轮没碰）、八核像结局落点
+（本轮不动任何硬件路径，boot 93 只是「核数 vs 镜像」那轮控制的又一张同族票，仍不是控制本身）。
+
+**⑥ 闸门与产物。** 内核 `d19361ee…`（52,367,360 B）→ AMFI 两刀（仍在文件偏移 `0x1ad70e4`/`0x1ad716c`、
+VA 不变，与 r302 同——这轮的插入没挪 AMFI 段）→ 归一化 `3da8fdb5…`；
+`round303-v0.7.10-payload.img` 58,720,256 B，sha256 `3c2e7be48a683e611eb85e5470923d0b8eb654621e4308aa1e568a72f4df894b`。
+`check-clover.py` EXIT=0；`verify-clover-payload.py` EXIT=0，新增 `bb-receiver-census` 针（整行钉住），
+r296 针更新到带 `qerr=%d`、r298 针更新到带 `vb_r=%x vb_v=%x`（截半行的字面量会留前缀针全绿，这轮的三行都是判决行，逐字钉）。
+补丁 60 枚 `z`、装在 `~/UniXNU/patches/xnu/` 与设备仓 `patches/xnu-clover/` 两处逐字节相同；
+`build-xnu-4k-baseline.sh` 的 `LATE_PATCH` 把 r303 排在最前（先于 59 枚 `z` 的 r300 反打），正向 glob 里它排最后。

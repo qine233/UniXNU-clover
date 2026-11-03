@@ -4019,6 +4019,89 @@ def check_board(errors: list) -> str:
             errors.append("r302 rows were added to the tee class table: this round's rows are driver-side "
                           "state and ride the RAM ring, not the pipe that lost the census tail")
 
+        # Round303 is the desktop mainline: boot 87 used r298's tlink= to prove the debt chain holds at task
+        # level (each hop's receive object names the next hop's own space), and the only thing that disagrees is
+        # the name -- tname= 0x3207/0x3507/0x2903 against the vname= the receiver's threads wait on. So the next
+        # reading is not on the sender's side but inside the receiving task: what that name is in the receiver's
+        # own ipc entry table, and whether any of its threads is parked on it. A per-hop row reads tname= through
+        # ipc_right_lookup_read() in the receiver's space (rentr=, rvbits=) and walks the receiver's own threads
+        # (rwait=, rwtid=, rbusy=). Two instrument debts ride along because they are the same shared zero seen
+        # twice: the mail helper now returns its translate code as qerr= (a qmc=0 qsr=0 only reads as a finding
+        # when qerr= says the translate succeeded), read on every rcv= row and not just cap=recv; and when the
+        # obj translate fails with KERN_INVALID_RIGHT -- boot 86's verr=17, an entry holding neither a receive nor
+        # a send right -- it names which shape that is (port set, send-once, dead name) as vb_r=/vb_v= instead of
+        # letting three readings print alike. The census runs beside a wedged userland and must not block: the one
+        # lock it takes is the receiver's try-lock, and a busy lock is reported as such rather than waited on.
+        r303_name = "z" * 60 + "-clover-r303.patch"
+        r303_patch = next((base / "patches/xnu-clover" / r303_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r303_name).is_file()), None)
+        if r303_patch is None:
+            errors.append(f"patches/xnu-clover/{r303_name} is missing: without the receiving-side row the name "
+                          "mismatch boot 87 named stays a hypothesis about the receiver's table rather than a "
+                          "reading of it")
+        else:
+            r303_text = r303_patch.read_text()
+            r303_added = "".join(line for line in r303_text.splitlines(True)
+                                 if line.startswith("+")
+                                 and not line.lstrip("+").lstrip().startswith(("*", "/*")))
+            for needle in ('#include <ipc/ipc_right.h>',
+                           'clover_sb_port_mail(task_t task, mach_port_name_t name, uint32_t *mc, uint32_t *sr,',
+                           'int *err)',
+                           '*err = -2;',
+                           '*err = (int)kr;',
+                           'clover_sb_port_obj(task_t task, mach_port_name_t name, int *err, int *otype,',
+                           'uint32_t *rname, uintptr_t *rspace, uint32_t *vbits)',
+                           'ipc_right_lookup_read(space, name, &bits, &o)',
+                           '*vbits = (uint32_t)IE_BITS_TYPE(bits);',
+                           '" to=%llx rmc=%u rsr=%x qmc=%u qsr=%u qerr=%d peer=%s end=%s\\n"',
+                           '" rerr=%d otype=%d tname=%x tspace=%lx space=%lx link=%s tlink=%s"',
+                           '" vb_r=%x vb_v=%x\\n"',
+                           '"clover r303: hop=%u t=%llu rpid=%d rnm=%x rentr=%d"',
+                           '" rvbits=%x rwait=%u rwtid=%llx rbusy=%d\\n"',
+                           'if (nrcv != 0) {',
+                           'int rentr = -2;',
+                           'if (next->itk_space != IPC_SPACE_NULL) {',
+                           'rentr = ipc_right_lookup_read(next->itk_space,',
+                           'rvbits = (uint32_t)IE_BITS_TYPE(rbits);',
+                           'io_unlock(robj_r);',
+                           'if (!lck_mtx_try_lock(&next->lock)) {',
+                           'rcv == tname || rem == tname'):
+                if needle not in r303_text:
+                    errors.append(f"{r303_name} lacks {needle[:72]!r}: the receiving-side census is three "
+                                  "different lookups -- the entry, the receiver's threads, the shared-zero codes "
+                                  "-- and a row missing any one leaves the name mismatch where boot 87 left it")
+            for reprint in ('printf("clover r299:', 'printf("clover r300:'):
+                if reprint in r303_added:
+                    errors.append(f"{r303_name} reprints {reprint.split('(')[1]}: boot 88's smp row and boot 90's "
+                                  "fire/done pair are the readings this row sits beside, and a rewrite would make "
+                                  "boots 88 to 92 unreadable against 93")
+            for forbidden in ("thread_block(", "simple_wait(", "lck_mtx_lock(", "proc_lock(", "sleep("):
+                if forbidden in r303_added:
+                    errors.append(f"{r303_name} calls {forbidden}: the census prints beside a wedged userland, "
+                                  "and a row that blocks would freeze the very fire it is measuring")
+            load_r303 = REPO.parent / "UniXNU" / "patches" / "xnu" / r303_name
+            if not load_r303.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r303_name} is missing: unixnu loads patches from there "
+                              "and silently skips one that lives only in this repo")
+            elif load_r303.read_bytes() != r303_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r303_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+            late_script_r303 = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list_r303 = " ".join(line for line in late_script_r303.splitlines() if "clover-r" in line)
+            if (late_list_r303.find(r303_name) < 0 or
+                    late_list_r303.find(r303_name) > late_list_r303.find("z" * 59 + "-clover-r300.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r303 before r300 in LATE_PATCH: the "
+                              "census prints land after r300's hop counter, so a tree that does not remove r303 "
+                              "first fails to apply r300 -- and an earlier apply failure here is silent")
+        if '{ "clover r303: ", "r303-hop", 128, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the r303 row: a per-hop census row that falls "
+                          "into the unclassed flow is throttled with the chatter, which is the exact cap this "
+                          "round exists to prove its row past")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r303")' not in sdhci_source:
+            errors.append("the r303 row is not exempt from the per-pass push cap: a capped receiving-side row "
+                          "reads as a hop whose receiver has nothing, the false-empty the round was written to fill")
+
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -5323,8 +5406,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r302:"):
-        errors.append('[payload] title is not "clover r302: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r303:"):
+        errors.append('[payload] title is not "clover r303: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -6462,8 +6545,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r302:"):
-        errors.append('[payload] title is not "clover r302: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r303:"):
+        errors.append('[payload] title is not "clover r303: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

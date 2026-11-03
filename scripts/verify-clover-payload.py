@@ -1112,9 +1112,13 @@ def check_sb_sample(kernel: bytes) -> bool:
              # from and qmc=/qsr= are that port's own queue, so "the reply landed and never woke anybody" and
              # "no reply came" stop printing alike. The r295 literal is gone on purpose; the checker below asks
              # for the r296 one.
+             # Round303 appends qerr= to that literal: boot 84's qmc=0 qsr=0 was indistinguishable from "the name
+             # never became an object", because the helper left both at their init when its translate failed. Now
+             # the queue read carries its own return code, so a 0 only reads as a finding when qerr=0 says the
+             # translate succeeded. The literal moves with it: a cut needle stays green even when the row is wrong.
              "bb-send-chain": (b"clover r296: hop=%u t=%llu pid=%d comm=%s exec=%s ex=%s"
                                b" threads=%u wait=%u run=%u trap=%u cap=%s thid=%llx rcv=%x remote=%x"
-                               b" to=%llx rmc=%u rsr=%x qmc=%u qsr=%u peer=%s end=%s\n") in kernel,
+                               b" to=%llx rmc=%u rsr=%x qmc=%u qsr=%u qerr=%d peer=%s end=%s\n") in kernel,
              # Round297 rides beside that row rather than inside it. Boot 84 read qmc=0 qsr=0 on the leaf's own
              # receive name, and the sentence "nothing is queued on the port this thread waits on" is only worth
              # anything if the request the previous hop placed was addressed to that port -- which no reader of
@@ -1130,8 +1134,14 @@ def check_sb_sample(kernel: bytes) -> bool:
             # ipc_port_init() at osfmk/ipc/ipc_port.c:846-847), and space= is this task's own, which is the
             # first comparison of two port names that lives inside one address space. Pinned whole: a cut
             # literal would still leave the r297 prefix needles green.
+            # Round303 appends vb_r=/vb_v= to that literal: the leaf's verr=17 was KERN_INVALID_RIGHT, which the
+            # translate returns only when the entry exists but holds neither a receive nor a send right -- a port
+            # set, a send-once right or a dead name, three readings that all printed as the same rerr/verr. When
+            # the translate fails the helper now asks ipc_right_lookup_read() and hands back the entry's own type
+            # bits, so the shape behind the failure is named instead of inferred.
             "bb-chain-link": (b"clover r298: hop=%u t=%llu prev=%lx rvobj=%lx verr=%d vname=%x robj=%lx"
-                              b" rerr=%d otype=%d tname=%x tspace=%lx space=%lx link=%s tlink=%s\n") in kernel,
+                              b" rerr=%d otype=%d tname=%x tspace=%lx space=%lx link=%s tlink=%s"
+                              b" vb_r=%x vb_v=%x\n") in kernel,
              # Round275 measured the precondition of the only proposed fix and Round276 acted on it, so three
              # rows are pinned: the class lookup (what r275 read as 0/0 on boot 62, and what has to read 1 the
              # moment this round works -- the needle checking itself), the publish's own state (stage 3 with a
@@ -1302,6 +1312,13 @@ def check_sb_sample(kernel: bytes) -> bool:
              # rows are pinned whole, because a cut format string leaves every prefix needle green.
              "bb-census-fire": (b"clover r300: fire t=%llu seq=%llu pid=%d th=%u hidden=%u\n") in kernel,
              "bb-census-done": (b"clover r300: done t=%llu seq=%llu th=%u chain=%u\n") in kernel,
+             # Round303 is the receiving task's own entry census -- the row the chain could not reach from its
+             # own side. tname= was read under the port's lock in the receiver's space, so rnm= is exactly that
+             # task's name for the port the sender wrote to (boot 87's 0x3207/0x3507/0x2903), and rentr=/rvbits=
+             # answer whether the entry still holds a right and what kind, while rwait=/rwtid= ask the receiver's
+             # own threads whether any waits on that name. Pinned whole for the standing reason.
+             "bb-receiver-census": (b"clover r303: hop=%u t=%llu rpid=%d rnm=%x rentr=%d"
+                                    b" rvbits=%x rwait=%u rwtid=%llx rbusy=%d\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

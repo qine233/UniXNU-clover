@@ -1,0 +1,292 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -105,6 +105,7 @@
+ #include <ipc/ipc_entry.h>
+ #include <ipc/ipc_object.h>
+ #include <ipc/ipc_port.h>
++#include <ipc/ipc_right.h>
+ #include <ipc/ipc_pset.h>
+ #include <ipc/ipc_hash.h>
+ #include <ipc/ipc_init.h>
+@@ -11371,9 +11372,19 @@
+  * no code path in any task can ever wake this thread again. Both are read without
+  * the port lock: a sample, correct to the beat, and stated as such because the
+  * queue is being changed by other cpus while this prints.
++ *
++ * Round303. The helper hands back its own return code, because its zero and a real
++ * zero were the same zero: boot 84's cap=recv leaf printed qmc=0 qsr=0 and round298
++ * could not say whether that meant "nothing queued and nobody holds a send right"
++ * or "this name never became an object" -- the helper tries RECEIVE then SEND and
++ * leaves both out-parameters at their initialised value when both fail. err= is
++ * -1 for a null name, -2 for a dead space, otherwise the translate's kr, so a
++ * qmc=0 qsr=0 now only reads as a finding when its own err= says the translate
++ * succeeded.
+  */
+ static void
+-clover_sb_port_mail(task_t task, mach_port_name_t name, uint32_t *mc, uint32_t *sr)
++clover_sb_port_mail(task_t task, mach_port_name_t name, uint32_t *mc, uint32_t *sr,
++    int *err)
+ {
+ 	ipc_space_t space;
+ 	ipc_object_t obj = IPC_OBJECT_NULL;
+@@ -11381,17 +11392,20 @@
+ 
+ 	*mc = 0;
+ 	*sr = 0;
++	*err = -1;
+ 	if (name == MACH_PORT_NULL) {
+ 		return;
+ 	}
+ 	space = task->itk_space;
+ 	if (space == IPC_SPACE_NULL) {
++		*err = -2;
+ 		return;
+ 	}
+ 	kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_RECEIVE, &obj);
+ 	if (kr != KERN_SUCCESS) {
+ 		kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_SEND, &obj);
+ 	}
++	*err = (int)kr;
+ 	if (kr != KERN_SUCCESS) {
+ 		return;
+ 	}
+@@ -11433,10 +11447,20 @@
+  * comparison, which is exactly what r297 could not do. (3) It says what kind of object it found,
+  * because "translated but is a port set" and "translated to a port whose receive right is gone"
+  * both otherwise print as tname=0.
++ *
++ * Round303. The one shape r298 could not name is now named: boot 86's verr=17 was
++ * KERN_INVALID_RIGHT, which ipc_object_translate returns only when the entry exists but holds
++ * neither a receive nor a send right -- a port set, a send-once right, or a dead name, three
++ * readings that all printed as the same rerr/verr. When the translate fails, this helper now
++ * asks ipc_right_lookup_read() -- the reader translate itself uses, but without demanding a
++ * receive or send right -- and hands the entry's own type bits back as vbits=. 0x80000 is a
++ * port set, 0x40000 send-once, 0x100000 a dead name, and 0 means the entry is gone too; the
++ * reader returns its object locked and nothing is read from it here, the same discipline as
++ * the translate path.
+  */
+ static uintptr_t
+ clover_sb_port_obj(task_t task, mach_port_name_t name, int *err, int *otype,
+-    uint32_t *rname, uintptr_t *rspace)
++    uint32_t *rname, uintptr_t *rspace, uint32_t *vbits)
+ {
+ 	ipc_space_t space;
+ 	ipc_object_t obj = IPC_OBJECT_NULL;
+@@ -11450,6 +11474,7 @@
+ 	*otype = -1;
+ 	*rname = 0;
+ 	*rspace = 0;
++	*vbits = 0;
+ 	if (name == MACH_PORT_NULL) {
+ 		return 0;
+ 	}
+@@ -11463,6 +11488,13 @@
+ 		kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_SEND, &obj);
+ 	}
+ 	if (kr != KERN_SUCCESS) {
++		ipc_entry_bits_t bits = 0;
++		ipc_object_t o = IPC_OBJECT_NULL;
++
++		if (ipc_right_lookup_read(space, name, &bits, &o) == KERN_SUCCESS) {
++			*vbits = (uint32_t)IE_BITS_TYPE(bits);
++			io_unlock(o);
++		}
+ 		*err = (int)kr;
+ 		return 0;
+ 	}
+@@ -12565,6 +12597,8 @@
+ 		uint32_t psr = 0;
+ 		uint32_t pmmc = 0;
+ 		uint32_t pmsr = 0;
++		int pmerr = -1;
++		int perr = -1;
+ 
+ 		/*
+ 		 * Three shapes again, because boot 50 proved that an unresolved name and
+@@ -12580,12 +12614,13 @@
+ 				strlcpy(ppeer, "?", sizeof(ppeer));
+ 			}
+ 			clover_sb_port_mail(peer, (mach_port_name_t)prm[i], &pmmc,
+-			    &pmsr);
++			    &pmsr, &pmerr);
+ 		} else if ((uint32_t)prc[i] != 0) {
+ 			strlcpy(ppeer, "none", sizeof(ppeer));
+ 		}
+ 		if ((uint32_t)prc[i] != 0) {
+-			clover_sb_port_mail(peer, (mach_port_name_t)prc[i], &pmc, &psr);
++			clover_sb_port_mail(peer, (mach_port_name_t)prc[i], &pmc, &psr,
++			    &perr);
+ 		}
+ 		printf("clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
+ 		    " dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
+@@ -12843,6 +12878,10 @@
+ 		uintptr_t space_id = 0;
+ 		const char *tlink = "-";
+ 		int busy = 0;
++		int nqerr = -1;
++		int nrerr = -1;
++		uint32_t vb_r = 0;
++		uint32_t vb_v = 0;
+ 
+ 		comm[0] = exec[0] = peer[0] = '\0';
+ 		next = TASK_NULL;
+@@ -12912,11 +12951,21 @@
+ 			ntid = ftid;
+ 			nrcv = frcv;
+ 			nto = fto;
+-			clover_sb_port_mail(cur, (mach_port_name_t)frcv, &nqmc, &nqsr);
+ 		} else if (nrem != 0) {
+ 			cap = "send";
+ 		}
+ 		/*
++		 * Round303. qmc=/qsr= now read rcv= on every row, not just cap=recv: a send row's rcv=
++		 * is the sending thread's own receive name (its x5>>32), and the queue under it is just as
++		 * much a reading there. The read carries its own return code, qerr=, so a qmc=0 qsr=0
++		 * only reads as a finding when qerr=0 -- boot 84's shared zero is finally separated on
++		 * cap=send rows too, where rcv= is not the name the r298 row already translated.
++		 */
++		if (nrcv != 0) {
++			clover_sb_port_mail(cur, (mach_port_name_t)nrcv, &nqmc, &nqsr,
++			    &nqerr);
++		}
++		/*
+ 		 * Round297. Two translations to identity, not to content, and one comparison carried
+ 		 * from the previous hop: every name on the row above is an index inside the task it is
+ 		 * printed for, so hop 2's remote= and hop 3's rcv= cannot be compared by anything that
+@@ -12931,11 +12980,11 @@
+ 		 */
+ 		if (nrem != 0) {
+ 			robj = clover_sb_port_obj(cur, (mach_port_name_t)nrem, &rerr, &otype,
+-			    &tname, &tspace);
++			    &tname, &tspace, &vb_r);
+ 		}
+ 		if (frcv != 0) {
+ 			rvobj = clover_sb_port_obj(cur, (mach_port_name_t)frcv, &verr, &votype,
+-			    &v_rname, &v_rspace);
++			    &v_rname, &v_rspace, &vb_v);
+ 		}
+ 		if (prev_obj != 0) {
+ 			if (rvobj != 0) {
+@@ -12973,7 +13022,8 @@
+ 			if (peer[0] == '\0') {
+ 				strlcpy(peer, "?", sizeof(peer));
+ 			}
+-			clover_sb_port_mail(cur, (mach_port_name_t)nrem, &nrmc, &nrsr);
++			clover_sb_port_mail(cur, (mach_port_name_t)nrem, &nrmc, &nrsr,
++			    &nrerr);
+ 			next = clover_bb_peer_task(cur, (mach_port_name_t)nrem);
+ 			if (next == TASK_NULL) {
+ 				end = "no_owner";
+@@ -13008,18 +13058,80 @@
+ 		}
+ 		printf("clover r296: hop=%u t=%llu pid=%d comm=%s exec=%s ex=%s"
+ 		    " threads=%u wait=%u run=%u trap=%u cap=%s thid=%llx rcv=%x remote=%x"
+-		    " to=%llx rmc=%u rsr=%x qmc=%u qsr=%u peer=%s end=%s\n", hop,
++		    " to=%llx rmc=%u rsr=%x qmc=%u qsr=%u qerr=%d peer=%s end=%s\n", hop,
+ 		    (unsigned long long)secs, task_pid(cur),
+ 		    comm[0] != '\0' ? comm : "-", exec[0] != '\0' ? exec : "-", exstate,
+ 		    call, nwait, nrun, ntrap, cap, (unsigned long long)ntid,
+ 		    (unsigned int)(uint32_t)nrcv, (unsigned int)(uint32_t)nrem,
+-		    (unsigned long long)nto, nrmc, nrsr, nqmc, nqsr,
++		    (unsigned long long)nto, nrmc, nrsr, nqmc, nqsr, nqerr,
+ 		    peer[0] != '\0' ? peer : "-", end);
+ 		printf("clover r298: hop=%u t=%llu prev=%lx rvobj=%lx verr=%d vname=%x robj=%lx"
+-		    " rerr=%d otype=%d tname=%x tspace=%lx space=%lx link=%s tlink=%s\n", hop,
++		    " rerr=%d otype=%d tname=%x tspace=%lx space=%lx link=%s tlink=%s"
++		    " vb_r=%x vb_v=%x\n", hop,
+ 		    (unsigned long long)secs, (unsigned long)prev_obj, (unsigned long)rvobj,
+ 		    verr, (unsigned int)(uint32_t)frcv, (unsigned long)robj, rerr, otype, tname,
+-		    (unsigned long)tspace, (unsigned long)space_id, link, tlink);
++		    (unsigned long)tspace, (unsigned long)space_id, link, tlink, vb_r, vb_v);
++		/*
++		 * Round303. The census the chain could not reach from its own side: the receiving
++		 * task's own entry for the name the sender wrote to. tname= was read under the port's
++		 * lock in the receiving task's space, so it is exactly that task's name for the port,
++		 * and this row asks the two things tlink=no left open -- does the entry still hold a
++		 * right there (rvbits=, rentr= its lookup code, -2 a space already gone) and does any of the receiver's own
++		 * threads actually wait on it (rwait=, rwtid= the first). rbusy= says the receiver's
++		 * lock was busy and the thread walk was skipped, the same try-lock the chain itself
++		 * uses, so a 0 there is never read as "nobody waits".
++		 */
++		if (next != TASK_NULL && tname != 0) {
++			ipc_entry_bits_t rbits = 0;
++			ipc_object_t robj_r = IPC_OBJECT_NULL;
++			uint32_t rvbits = 0;
++			uint32_t rwait = 0;
++			uint64_t rwtid = 0;
++			int rbusy = 0;
++			int rentr = -2;
++			thread_t rthr;
++
++			if (next->itk_space != IPC_SPACE_NULL) {
++				rentr = ipc_right_lookup_read(next->itk_space,
++				    (mach_port_name_t)tname, &rbits, &robj_r);
++				if (rentr == KERN_SUCCESS) {
++					rvbits = (uint32_t)IE_BITS_TYPE(rbits);
++					io_unlock(robj_r);
++				}
++			}
++			if (!lck_mtx_try_lock(&next->lock)) {
++				rbusy = 1;
++			} else {
++				queue_iterate(&next->threads, rthr, thread_t,
++				    task_threads) {
++					arm_saved_state_t *rss = get_user_regs(rthr);
++
++					if (rss != NULL &&
++					    (uintptr_t)rss != (uintptr_t)-1 &&
++					    !is_saved_state32(rss) &&
++					    (rthr->state & TH_RUN) == 0 &&
++					    (int64_t)saved_state64(rss)->x[16] ==
++					    CLOVER_BB_M2_TRAP) {
++						uint32_t rcv =
++						    (uint32_t)(saved_state64(rss)->x[5] >> 32);
++						uint32_t rem =
++						    (uint32_t)saved_state64(rss)->x[3];
++
++						if (rcv == tname || rem == tname) {
++							rwait++;
++							if (rwtid == 0) {
++								rwtid = rthr->thread_id;
++							}
++						}
++					}
++				}
++				lck_mtx_unlock(&next->lock);
++			}
++			printf("clover r303: hop=%u t=%llu rpid=%d rnm=%x rentr=%d"
++			    " rvbits=%x rwait=%u rwtid=%llx rbusy=%d\n", hop,
++			    (unsigned long long)secs, task_pid(next), tname, rentr,
++			    rvbits, rwait, (unsigned long long)rwtid, rbusy);
++		}
+ 		clover_bb_chain_hops++;
+ 		prev_obj = robj;
+ 		prev_tname = tname;
+@@ -13544,6 +13656,8 @@
+ 			uint32_t msr = 0;
+ 			uint32_t rmc = 0;
+ 			uint32_t rsr = 0;
++			int merr = -1;
++			int rmerr = -1;
+ 
+ 			/*
+ 			 * Round264. peer= is now the owner of the remote port the waiter
+@@ -13570,7 +13684,8 @@
+ 						strlcpy(peer, "?", sizeof(peer));
+ 					}
+ 				}
+-				clover_sb_port_mail(task, (mach_port_name_t)crn[i], &mmc, &msr);
++				clover_sb_port_mail(task, (mach_port_name_t)crn[i], &mmc, &msr,
++				    &merr);
+ 				/*
+ 				 * Round265. The same two numbers on the port this thread sent to,
+ 				 * which is the question boot 51 leaves open: sr=1 there is the
+@@ -13582,7 +13697,7 @@
+ 				 * debtor found and gets the census of its own below.
+ 				 */
+ 				clover_sb_port_mail(task, (mach_port_name_t)crem[i], &rmc,
+-				    &rsr);
++				    &rsr, &rmerr);
+ 				if (peer_task == TASK_NULL) {
+ 					peer_task = clover_bb_peer_task(task,
+ 					    (mach_port_name_t)crem[i]);

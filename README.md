@@ -286,8 +286,26 @@ leave」一路收紧到一句可测的话：
   （16 格 seq 34–49，boot 88/89/90/91/92 五连靴全 `append_rc=2` 没留一张 kind-20）。
   结局 ≈645–7xx s（卡上最后一笔 645.4 s、无 deadline 记录）⇒ 八核像五靴五个时间，分布第五次落地；
   「核数 vs 镜像」那轮控制仍未跑。**债务重估**：r302 结清「判决记录独占缓冲 + 自带 magic」，
-  未结清的是「句子到不了卡」——写法有了（盲写不预读），剩下的是 sink 里那笔写为什么 false（r303 要给
-  `writePioBlock` 补失败自证，像 r298 给翻译补 `rerr=` 那样）。详见 `notes/development-log.md` §Round302 读数。
+  未结清的是「句子到不了卡」——写法有了（盲写不预读），剩下的是 sink 里那笔写为什么 false（**这条驱动侧
+  `writePioBlock` 失败自证仍未付**，往后排）。详见 `notes/development-log.md` §Round302 读数。
+* **r303（v0.7.10，桌面主线 #577：付的是 boot 87 §⑩ 预登记的主线债 (4)+(5)，不是上一段那句驱动侧自证）**。
+  `patches/xnu-clover/zzz(60)-clover-r303.patch`，六处改动全在 `osfmk/kern/task.c`：
+  **(a)** 新行 `clover r303: hop=%u t=%llu rpid=%d rnm=%x rentr=%d rvbits=%x rwait=%u rwtid=%llx rbusy=%d`，
+  与 r298 行按 `hop=`/`t=` 配对，**去普查收方任务自己的 ipc entry**——发送方写进去的那枚名字（`rnm=tname`）
+  在这个任务里是什么、有没有线程真等在它上面（`rwait/rwtid`，在 `lck_mtx_try_lock` 下数——**try 不是 lock**，
+  普查要在卡死的用户态旁边站着说话）；**(b)** `clover_sb_port_obj()` 加 `uint32_t *vbits`，r298 行末尾多印
+  `vb_r=%x vb_v=%x`——把 `ipc_right_lookup_read()` **已经成功交出的** entry 位掩码印出来，将
+  `verr=17` 那枚译不出的名字分成 port set / send-once / 死名，**不需要对象**；**(c)** `clover_sb_port_mail()`
+  加 `int *err`，r296 行的 `qmc=/qsr=` 从此带 `qerr=%d`，让「0 只在同排返回码为 0 时算读数」这条规矩也管上
+  `cap=send` 行。**动手前先验的前提**：`ipc_right_lookup_read()` 会 SMR 解引用 `&space->is_table`，
+  所以普查先 `next->itk_space != IPC_SPACE_NULL`、NULL 时报 `rentr=-2` 不硬调。r303 行有独立 tee 类 `r303-hop`
+  预算 128 + 每拍推送豁免；r296/r298 只加尾列不动既有列，boots 50–88 仍与 89+ 对齐。内核 `d19361ee`（AMFI 两刀
+  仍在文件 `0x1ad70e4`/`0x1ad716c`、VA 不变）、归一化 `3da8fdb5`；`round303-v0.7.10-payload.img` 58,720,256 B，
+  sha256 `3c2e7be48a683e611eb85e5470923d0b8eb654621e4308aa1e568a72f4df894b`。`check-clover.py` 与
+  `verify-clover-payload.py` 双 EXIT=0（新增整行 `bb-receiver-census` 针）。**boot 93 判读预登记在
+  `notes/development-log.md` §Round303 ⑤**：`rentr=0`+`rvbits=20000`+`rwait>0` ⇒ 任务级债链闭合；
+  `rvbits=80000`(PORT_SET) ⇒ boot 87 猜中那支、本仪器第一次分得开集合与一次性；`40000`/`100000` ⇒ 链形重画；
+  非零非 -2 的 `rentr` ⇒ 上跳对象与本名不是同一 entry；`rbusy=1` 与 `rwait=0` 是两种不同的「没看到」。
 * **再后一支（本格欠的两条仪器债）**：`vbits=`（`ipc_right_lookup_read()` 已经交出的 entry 位掩码，
   用来分 port set / send-once，不需要对象、锁纪律与 translate 同一条）与 `qmc=/qsr=` 自带返回码。
 * **那笔「等设备解锁」的死等已经不是现场，但它的机制现在读全了**：r274 命中的形状是

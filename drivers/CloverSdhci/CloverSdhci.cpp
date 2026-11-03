@@ -1005,6 +1005,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // with it, so a class that lost hop=3's row would leave the card holding a zero that cannot be
   // attributed to anything.
   { "clover r298: ", "r298-chain", 128, 0, 0, 0 },
+  // Round303 prints one row per chain hop whose owner resolves and whose sender name translated -- the receiving
+  // task's own entry census, the row that answers what tlink=no left open. It is a per-hop producer exactly like
+  // r298 (at most one row per hop, so a fire of depth 4 costs 4 rows), and it shares r298's fate if throttled: this
+  // is the reading the whole round was written for, and a capped r303 row reads as a hop that never reached the
+  // receiving side -- the same false-empty r298's 128 budget and exemption were set to stop. Same budget, same
+  // exemption below.
+  { "clover r303: ", "r303-hop", 128, 0, 0, 0 },
   // Round289 speaks only at a fatal data abort, and it is the reading the panic record cannot carry:
   // the kind-20 slot is 480 bytes, and boot 74 and boot 75 both showed it cut off inside the register
   // list, before esr, far, fp and sp -- the four fields that name a fault. At most one abt row and two
@@ -4438,7 +4445,14 @@ static void teeConsumeLine (uint32_t &pushed)
        // false-empty this exemption exists to stop. The count it carries (th=, chain=) is the number of rows
        // this fire really pushed, so losing the row that holds the number would put us back where the absent
        // r262/r296/r298 thread rows left us -- an absence with nothing beside it to attribute.
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r300"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r300") ||
+       // Round303 prints from inside the same chain walk as r296/r298 -- one row per hop whose owner resolves --
+       // and it is the whole reading of this round: the receiving task's own entry for the name the sender wrote
+       // to (rvbits=, rwait=). A capped r303 row leaves exactly the hole the round exists to fill: a hop that
+       // translated a name on the r298 row but never reported what that name is in the receiver's space reads as
+       // "the receiver has nothing", which is the false-empty r298 was exempted for, one layer onto the peer. The
+       // class budget of 128 still bounds it, the same headroom r298 holds for the same per-hop producer.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r303"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.
