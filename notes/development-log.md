@@ -24205,6 +24205,45 @@ boot 94 那颗 marker 的旧第 35 字被读成 `k=1129076301s` 这种任何钟�
    以及**控制轮**（八核关 `armcpu-smp`、同镜像）——「尾巴属镜像还是属核数」到现在仍没被切开，
    第九票只是又投了一次「仍然早」。
 
+## Round306 (v0.7.16)：中转的沉默要自己出声——三条早退各自计数
+
+> **这一节补写在 boot 96 读数落盘之后**：那一轮只把读数写进了流水日志，设计留在会话里没落盘。
+> 补写的内容按**盘上文件**逐条核过，不引入读数里没有的东西——`drivers/CloverSdhci/CloverSdhci.cpp`
+> 里 `probeFlush()` 的具名守卫与三条早退、`clover_emmc_probe_say()` 的 `gProbeEmptySay`/`gProbeCutSay`，
+> 和 `patches/xnu-clover/zzz(63)-clover-r306.patch` 的 step 行；下面的行号会被 r307 挪动，所以只点名不点行号。
+> 读数见下一节。
+
+**① 这一轮问什么。** boot 95 把「普查那一拍之后卡上再无尾巴」这件事夹进了 `task.c` 那 29 行，
+但留下**一枚沉默有三种读法**：头一行之后没走到 fire（走路停在上头）、走到了而中转把每一行都拒了、
+走到了也交给中转而消费它的人一次都没越过自己的守卫。三种在后两枚渠道上都是「0 行」。
+r306 要给这三个名字各自一个数，并且把「走到了」这句话的副本放到**不经中转**的那条路上。
+
+**② 改动一：走路自己出声，且副本不骑被测管道。** `clover_bb_chain_hops = 0;` 之后、fire 那发
+`snprintf` 之前，一条裸 `printf` 的 `clover r306: step t=/seq=/pid=/th=/hidden=`——字段和 fire 行一字不差，
+所以两行能逐字段对齐：有 step 而无 fire ⇒ 断在 `snprintf`/`clover_census_row` 那几行；无 step ⇒ 走路根本没到那三个自增。
+它故意不走中转，因为那一轮要问的正是中转。驱动侧给它单开 tee 类 `r306-step`（64 行）并加进每拍推送上限的豁免列——
+被限额吃掉的对照行会把「没有」重新变成两种读法挤在一起。
+
+**③ 改动二：中转数自己的每一条早退。** `clover_emmc_probe_say()` 数「交到手里是空的」和「这行比槽位宽」
+（`gProbeEmptySay`/`gProbeCutSay`：截断的行是「尾巴没到」，不是「整行没到」，只有生产者分得清）；
+`probeFlush()` 把守卫的三条退出各自具名（未上膛 / 块属主在别人手里 / 这一环正在冲），
+并在**退出的那一刻**用 `teeSay()` 把 `CloverSdhci r306: probe silent why= guard= seen= next= flushed= blocked=a/b/c empty= cut=`
+说出口——`teeSay` 是纯生产者（不拿锁、不睡、不碰卡），所以从一条「注定做不成块写」的路径里出声是合法的。
+
+**④ 改动三：报告行补上第三种条件。** 原先两支印条件都要有东西在飞（`wrote>0` 或积压到 64 拍），
+于是一整靴队列全空的接力**什么都没说**，跟「没人叫过它」一个形状。加上 `nothing` 这一支
+（`calls>0` 而 `flushed=0`，上限 4 行），报告行的沉默第一次有了自己的名字。
+
+**⑤ 契约与闸门。** `check-clover.py` 钉住 step 行的格式串、三枚早退计数、具名守卫、`nothing` 那一支、
+tee 类与豁免，并反向钉住「合并的守卫」和 `CloverSdhci r304: probe` 那枚旧 token 都不在；
+对 step 行还有一条**只读代码不读注释**的反向断言：step 那支补丁的代码里不许出现 `clover_census_row`/`clover_emmc_probe_say`。
+`verify-clover-payload.py` 换上新键 `probe-silent`、`census-step` 与整条新的 `probe-beat-flush` 格式串。
+
+**⑥ 产物。** `~/clover-out/round306-v0.7.16-payload.img`（sha256 `9a5e9bbf…`，58,720,256 B）、
+`round306-kernel-amfi.macho`（`5d4e3afd…`）、`round306-payload.json`；
+内核链 `05762cb2` → 归一化 `f1586403`（973/973 枚 object 戳）→ 卡内 `32287fdc`；ADT 14,384 B、
+trustcache `7c369ce0`、ramdisk `614b8356`。
+
 ## Round306 读数（boot 96，v0.7.16）：中转第一次被证明「一次都没被人叫过」，而沉默被夹到 21 行
 
 冷刷 `round306-v0.7.16-payload.img`（sha256 `9a5e9bbf…`，58,720,256 B）；脚本自报 boot 95→96、落回 TWRP。
@@ -24271,3 +24310,221 @@ fl=00000000 rc=0×7`、`r270 sent=278476 recv=278361`、头行 `threads=16 shown
 3. **控制轮正式跑**：同一枚 r307 镜像刷两次，第二次带 `armcpu-smp=0`。boot 87 是「单核＋别的镜像」，
    八核时代已有十靴，「尾巴属镜像还是属核数」到现在仍未被切开，这一轮把它切。
 仍欠、仍不假装：`drained=` 那一列的归属（读者侧已改名 `drained_never`，落盘记录还没挪）。
+
+## Round307 (v0.7.17)：一份限量出声的报告，预算要按「谁在说」分——再给「走到了」加一条不经内核日志的副本
+
+> **写作的次序**：代码、契约与产物在刷写之前就落盘了（`git` 里 r307 的驱动/内核/两个 checker 都早于
+> `round307-v0.7.17-payload.img`），但**这一节的文字写于刷写之后、卡上读数之前**。判读条件因此仍然
+> 在读数之前钉死，次序上欠的那一步只是「设计散文没有先于刷写落盘」——记在这里，不追认成先登记。
+
+**① 这一轮付哪三笔账。** boot 96 把中转的沉默结成了「一次都没被人叫过」（`blocked=0/0/0`、`empty=0`、
+`cut=0`、`seen=0`、`nothing` 那一支出声四次、sink 侧第二条腿 `probe_seen=0` 独立同意），于是剩下三笔：
+一是**本轮仪器自己的 blindness**——`nothing` 的上限是一枚全局计数，四次名额被 `why=tail` 全花完，
+`why=drain`（那一趟恰好在现场跑的消费者）一条都没能说出口；二是 step 行的缺席仍有两种读法
+（内核日志/tee 丢行 vs 走路没到那三个自增），因为 r306 的副本骑在被测管道上；三是从 boot 87 欠到现在的
+**控制轮**——八核时代十靴、跨七枚镜像复现，而「尾巴属镜像」与「尾巴属核数」到现在还是同一枚缺席。
+
+**② 改动一：预算按说话人分，报告行带上它一直藏着的数。** `CloverSdhci.cpp` 里
+`gProbeSilenceSay`/`gProbeNothingSay`/`gProbeReports` 从单枚计数变成 `kProbeWhyCount`（tail/beat/drain/other）
+的数组，`probeWhySlot()` 按调用者的 `why` 落位；报告行与守卫早退行都补上 `calls=%u`（跑成的冲数），
+和本来就在的 `seen=%u`（中转累计封行数）配成一对——「有 N 趟消费者跑过，而累计交过来的行是 0」
+现在才是能读的一句话。两条行的 token 升到 `CloverSdhci r307: probe`：新添的列必须说出哪一代镜像带着它，
+否则读者会把旧镜像那行的缺列读成 0（第九层，boot 94 陈旧 marker 教过一次）。
+
+**③ 改动二：kind-25 的 `pre` 副本，不经内核日志。** `task.c:13706`（`clover_bb_chain_hops = 0;`）之后、
+r306 的 step `printf`（`:13738`）之前，直接把 `clover r307: pre t=%llu seq=%llu pid=%d th=%u hidden=%u`
+交给 `clover_emmc_probe_say()`（`:13724`），**不发 printf**。r306 证明中转这一靴是「没被人叫过」的旁观者，
+所以这一行现在合法：它骑的是 kind-25，被测的那条是内核日志→msgbuf→tee。三条行（`pre`/`step`/`fire`）
+字段一字不差，能逐字段对齐。
+
+**④ 契约与闸门。** `check-clover.py` 钉：三枚数组与 `probeWhySlot()` 的存在、两条行的 r307 token、
+`calls=` 列、`nothing` 那一支的新条件形状；**反向**钉单枚计数 `gProbeNothingSay < kProbeNothingSayMax`
+与 `CloverSdhci r306: probe` 都不在盘上。对 r307 补丁钉：pre 行的格式串、`clover_emmc_probe_say(prow,` 在场、
+`clover_census_row` 与任何 `printf("clover r307` 不在场（副本不许骑被测管道）、位置夹在三个自增与
+Round306 注释块之间、睡眠/取锁的调用黑名单、双仓补丁逐字节相同、`LATE_PATCH` 里 r307 先于 r306 逆放。
+`verify-clover-payload.py` 换上新键 `census-pre`、`census-pre-relay-only`（那枚格式串在镜像里只许出现一次）、
+`probe-report-generation`（旧的 `CloverSdhci r306: probe` 串必须不在镜像里）与两条 r307 全串。
+
+**⑤ 产物。** 内核 `b3037960` → AMFI 两刀 `8c4a0cb8`（VA 仍 `0xfffffff004ab40e4`/`…16c`，编码
+`0x34000229→0x14000011`、`0x36000520→0xd503201f`，与 r305/r306 逐字节同）→ 归一化 `cbf8f75a`
+（973/973 枚 object 戳清零、`_clover_fastboot_reason` 在符号表里）→ 卡内 `a71a18fc`；
+ADT 14,384 B、trustcache `7c369ce0`、ramdisk `614b8356`；
+`~/clover-out/round307-v0.7.17-payload.img` sha256 `0aa8e893…`，58,720,256 B。
+闸门：`check-clover ok`、`verify-clover-payload` EXIT=0（50 行全 OK）、`read-clover-log --selftest` ok、
+`task.c` 语法 `exit=0 hard=0`、`CloverSdhci` `-Werror` 与 ARM64/iOS 17 对象审计过。
+
+**⑥ boot 97 判读预登记（读数之前写死，四支互斥且各有正对照）。**
+- **(甲) kind-25 有本靴 `pre`、kind-22 无本靴 `step`** ⇒ 丢行在内核日志/tee 那一条腿上，
+  「普查那一拍之后没走到 fire」这条读法**不成立**，回到环地平线那一格；此时 `pre` 与 `step` 的
+  `t=/seq=/pid=/th=/hidden=` 只能同靴同拍对齐才许算数。
+- **(乙) 两支都无本靴行** ⇒ 走路在 `task.c:13704` 那三次自增**之前**就停了；夹点从
+  `:13595…:13738` 上移到 `:13595…:13704`，r306 收紧的那一段作废。
+- **(丙) 两支都有，而 `clover r300: fire`/`r262: th`/`done` 在两渠道仍 0 行** ⇒ 断在 `snprintf`
+  与 `clover_census_row` 之间，回到 §Round304 的 (甲) 支。
+- **(丁) `fire` 到了** ⇒ 尾巴跟着镜像来了，那一格结掉，控制轮（⑦）只需回答「核数是不是变量」。
+- **仪器自检**：`why=drain` 这一靴至少该有机会说话——如果 `calls=`、`blocked=`、`seen=` 说明 drain 跑过而
+  队列全空，`CloverSdhci r307: probe why=drain` 却仍 0 条，那说明按说话人分预算也没救活它，
+  这笔账要重新记（不许写成「drain 没跑」）。
+
+**⑦ boot 98 控制轮预登记（同一枚 r307 内核、同一次镜像构建路径，只把 `armcpu-smp` 翻成 0）。**
+判据只看尾巴，不看复位时机（时机那一格已经由十靴的散布说明它不是判据）：
+- **单核靴尾巴到了**（`fire`/`th`/`done` 任一有本靴行，而八核那十靴全 0）⇒「尾巴属核数」，
+  八核时代每次 fire 之后的静默由 SMP 带出来，普查那一拍的停点要重开。
+- **单核靴尾巴仍 0 行** ⇒ 在同一枚镜像上切开「核数」这一支，剩「镜像」与「走路停在上头」两种读法；
+  boot 87 那枚「单核且别的镜像」第一次有了可比的同镜像对照。
+- 八核那十一靴的逐字段形状（`r271 real=8 reg=8 start=7 run=8`、`r299 st=07777777 rc=0x7`、
+  `r270 sent/recv`）在单核靴上应读成 `reg=1 start=0`/`sent=0` 一类的**别的形状**，这是本轮唯一的
+  正对照：若单核靴仍读成八核的形状，说明 `armcpu-smp=0` 没进镜像（args 烤在 payload 里，
+  翻参数要重打 payload 并核 `payload.json` 的 `kernel_args`），整轮作废重跑。
+
+**⑧ 仍欠、仍不假装。** `drained=` 那一列的归属（读者侧已改名 `drained_never`，落盘记录还没挪）；
+桌面主线那一格仍无读数；GPU 那格的 `acc-sel-l1 @ 0x01fcf004` 仍没读。
+
+## Round307 读数（boot 97，v0.7.17）：`pre` 整靴一次都没被生产，普查那一拍在 `r299` 行之后就断了
+
+冷刷 `round307-v0.7.17-payload.img`（sha256 `0aa8e893…`，58,720,256 B；内核 `b3037960`→AMFI `8c4a0cb8`
+→归一化 `cbf8f75a`→卡内 `a71a18fc`；ADT `8f7e8782`、trustcache `7c369ce0`、ramdisk `614b8356`），
+boot 96→97，落回 TWRP。以下每一枚数都出自 `~/clover-out/round307-boot97-window.bin`（623,104 B）
+与它的解码 `…bin.txt`；脚本自报「16 条报告槽、64 条驱动判据行、3 条 kind-25 中转行、512 条内核日志行、boot 97」。
+**那 3 条中转行逐条标 boot 94**（`r226: kreg1/2/3`），本靴贡献 **0 条**。
+
+**① 落在预登记的 (乙) 支，而且这一支第一次不是「两种读法挤在一起」。** 内核环覆盖 **258.616 s → 490.544 s**
+（seq 1090→1601），这 232 秒里 `r262: census` 只响过一次：`[448.907920] census t=448 pid=58 threads=16
+shown=16 hidden=0 wait=15 run=1 rx=9`，环里紧接着同拍的三行 `[448.907944] r270: ipi sent=222806 recv=222710`、
+`[448.907983] r271: cpu real=8 max=8 reg=8 start=7 run=8`、`[448.908020] r299: smp req=1 con=1 run=7
+st=07777777 fl=00000000 rc=0×7`——**然后环里下一行已经是 `[452.616469]`（r224，3.7 s 之后）**。
+`clover r307: pre`（kind-25）与 `clover r306: step`（kind-22）**两条腿都是 0 行**，`fire`/`done`/`r262: th`
+/`hop` 同样 0 行 ⇒ 按 §Round307 ⑥ 落 (乙)：走路没到 `task.c:13704` 那三次自增。
+
+**② 「没到」这一句现在有了独立的腿，不再靠环地平线。** 中转这一靴的数字是：`drain enter boot=97 …
+probe_seen=0`，而 drain 自己那一趟的冲读数是 `calls=139065 wrote=0 seen=0 next=0 pend=0 flushed=0
+skipped=0 stalled=0 refused=0 blocked=0/0/0 empty=0 cut=0`。生产者的代码里**没有**「未上膛就丢行」这一支
+——`clover_emmc_probe_say()` 只有两条早退（空文本 / 超长截断），各自计数，两条都是 0——所以 `seen=0`
+只能读成**这一靴没有人叫过它**，而不是「叫了而它拒收」。于是 `:13724` 那次调用没执行是被**第二条渠道**
+证明的：kind-25 不经内核日志、不经 msgbuf、不经 tee，也不受环地平线约束（drain 之后卡上还落着 seq 60
+的驱动行，写渠在 panic 前后都收过东西）。**(甲) 那支「tee 丢了 step 行」在这一靴被排除**，不是没读到。
+
+**③ 停点因此被挪到 `task.c:13679 … :13707` 这 28 行——而且这一段里没有一条能阻塞的语句。**
+`r299` 那发 `printf` 在 `:13679`，它之后到 `:13704` 只有 `:13703` 那枚 `}`；三次自增不占时间，
+`:13707` 之后第一条就是纯内存的交接。也就是说：**能停在这里的，不是锁、不是睡眠、不是卡片拒绝，
+而是拿着这条走路的那条线程本身不往下走了**（被杀 / 被永久夺走）。这和 boot 94 那次「有 SIGKILL 现场」
+的形状不同：本靴现场三族（`killsrc`/`killustk`/`skst`）**0 行**，所以「杀在普查那一拍上」这条既没被证实
+也没被排除。这一格是本轮真正的收获，也是下一轮的题：**停点里没有可阻塞的语句，那就问「谁还活着」。**
+
+**④ r307 第①条（预算按说话人分）当轮兑了一次，读数就摆在形状上。** 本靴报告行 **9 条**，
+按说话人分是 `why=tail` 4 条（`calls=1/2/3/4`）、`why=beat` 4 条（`calls=168/448/631/902`）、
+`why=drain` **1 条**（`calls=139065`）——boot 96 是 4 条全 `tail`、drain 0 条。**在现场那一趟跑的消费者
+第一次有了自己的声音**，而它说的正是「跑到现场时队列里一行都没有」。`calls=` 也如期带上：
+同一句话现在有「跑了多少趟」与「累计交过来多少行」两个数，不再只有一枚 `wrote=`。
+正对照：`blocked=0/0/0`、`empty=0`、`cut=0` 三条早退全 0，所以「drain 有声音而 tail 也有」是预算分开的结果，
+不是守卫这一靴放行了（守卫一次都没拦）。
+
+**⑤ sink：本靴进了，可它的一句话都没到卡上；marker 与句子两头同时被拒。**
+`r212: drain enter boot=97 first=13320216 panic_first=13320216 verdict=1 tee=1 append_rc=2 probe_seen=0`、
+`r301: panic copy rc=2 chars=480 said=2`、`r302: blind ok=0 chars=352 total=480 slot=1`、
+`r184: panic drain wrote=0 tee_passes=8`、`r212: drain exit boot=97 wrote=0 dropped=0 tee_passes=8
+probe=0 probe_drop=0 probe_pend=11`，而 kind-20 那 16 槽里本靴一句都没有（`flight: no sentence record`）、
+marker 槽仍是 boot 87 那枚（`STALE … magic=absent`）、死线记录还是 boot 87 的（`t=1802871ms`）⇒ 没跑到 1800 s。
+**为什么 ring 的行能落而 marker 不能**：`pio=1/0x00000000/0w@445924ms`——自上线起**第一笔被拒的块写**
+记在驱动飞行毫秒 445,924（boot 96 这一格全 0），拒的正是 marker 那一块与句子那两刀；
+`starve=0/895/38329/54` 里 `panicked=895` 说节拍在 panic 期间被挡了 895 趟。
+**读者侧本轮抓到的一处假读数（我自己的）**：`drain exit` 那行的 `probe_pend=` 打的是
+`gRingPending[kRingDriver]`（**整条驱动环**待写记录数），不是中转的 `seen-next`；我把它读成「有 11 条中转行
+压在后面」，而同一条冲数行上的 `pend=0` 把它否掉了。名字说的是一件事、字段带的是另一件事＝一枚会自己
+造出假读数的列——记为 r308 第①条：那一行要么改名 `ring_pend=`，要么把真正的 `probe_pend=` 补上，
+token 一并升到本代。
+
+**⑥ 八核家族第十一靴与结局。** `real=8 max=8 reg=8 start=7 run=8`、`req=1 con=1 run=7 st=07777777 fl=00000000
+rc=0×7`、`sent=222806 recv=222710`、头行 `threads=16 shown=16 hidden=0 wait=15 run=1` ⇒ **跨九枚镜像逐字段复现**
+（见 [[unixnu-clover-smp]]）。`clover r283: last reset unnamed magic=ed80100900a109f8` ⇒ 按 §Round283 起沿用的
+同一记法，这是**第十一起无名静默复位**（那一行说的是上一靴的复位在卡外没有名字）；本靴自己的结束是
+**一次进过 sink 的 panic**，其原因文本没到卡上，内核时间下界是环里最新的 `[490.544416] r180: frame#5`。
+复位时机家族带：642.7 / ~645 / 661 / 746 / 835 / 555 / 742 / 617 / 576 / **≥490**。
+落地快照 `charger_temp=346`、`capacity=100`、`status=Charging`。桌面主线那一格**仍无读数**
+（环里 `r234: sbown … own=27:SpringBoard` 只说收方还活着，不说它把画面交出去了）。
+
+**⑦ 下一手 r308（三条，第一条是本轮自己抓出来的）。**
+1. **`drain exit` 那行的 `probe_pend=` 归位**：改名或补真值，行 token 升到本代（第九层）。
+2. **「停点里没有可阻塞的语句」这一格往前推**：`r299` 行与 `:13704` 之间现在只剩 `}`，所以要么在 `:13679`
+   那发 printf **之前**再加一条 kind-25 的会合行（把「进 burst」也钉在第二条腿上），要么换问法——
+   问「这一靴是谁在跑普查」：普查那拍的 `pid=58`，而本靴没有杀进程现场 ⇒ 下一条该读的是**跑普查那条
+   线程自己**在 `:13679` 之后还在不在（`current_thread()` 的身份 + 它的 `sched_flags`，一条 kind-25 行）。
+3. **控制轮 boot 98 按 §Round307 ⑦ 判**（同一枚内核、`armcpu-smp=0`），只读尾巴，不读复位时机。
+仍欠、仍不假装：`drained=` 那一列的归属（读者侧已改名 `drained_never`，落盘记录还没挪）；
+GPU 那格的 `acc-sel-l1 @ 0x01fcf004` 仍没读。
+
+## Round307 读数（boot 98，控制轮，v0.7.17）：这一靴没答尾巴，它把「控制轮凭什么算跑过」这格还给了仪器
+
+冷刷 `round307-smp0-control-payload.img`（sha256 `2c1827b9…`，58,720,256 B；内核与 boot 97 **同一枚**
+归一化 `cbf8f75a`，只有 `kernel_args` 差一枚：`armcpu-smp=0` 在、`armcpu-smp=1` 不在——
+`round307-smp0-payload.json` 的 `kernel_args` 逐字读过）。boot 97→98，落回 TWRP。以下每枚数都出自
+`~/clover-out/round307-boot98-smp0-window.bin`（623,104 B）与它的解码 `…bin.txt`；脚本自报
+「16 条报告槽、64 条驱动判据行、3 条 kind-25 中转行、512 条内核日志行、boot 98」。
+
+**① 预登记的两支都没走到，因为这一靴的普查那一族整族不在卡上。**
+`clover r262`（含 `census` 头行与 `r262: th` 线程行）、`r229: bb`、`r270: ipi`、`r271: cpu`、`r299: smp`、
+`r296:`、`r298:`、`r300: fire/done`、`r306: step`、`r307: pre` **在本靴窗口里都是 0 行**（全窗口搜 `r262`
+命中 0 次）。于是 §Round307 ⑦ 那两支——「单核靴尾巴到了」与「单核靴尾巴仍 0 行」——**都没有题面**：
+尾巴是普查 fire 之后的东西，而这一靴连 fire 的那一族都没出现在卡上。这一格没被切开，仍欠着。
+
+**② 「这一族不在环里」不能读成「这一族没跑」——两条损失渠道在本靴都有实测的数。**
+环覆盖 **256.569 s → 524.995 s**（512 行），而 tee 自己的状态行本靴最后一次报的是
+`CloverSdhci r175: tee seen=3284 kept=779 throttled=56 lap=2 idx=72489 size=131072`。
+`throttled=56` 是每趟 16 条推送上限吃掉的行数（`kTeePushPerPass`，`CloverSdhci.cpp:4691` 命中上限就
+`return`，**读游标照样往前**⇒ 非豁免行永久丢），`lap=2` 是 msgbuf 写手反超读游标两次（`:4762` 的记账）。
+豁免列里有 `r296 r298 r299 r300 r303 r306`，**没有 `r262 r229 r271`**。
+⇒ 「连 `r299`（豁免）都没有」比「`r262` 没有」强，但仍不敌一枚 `lap=`：本靴实测有 lap。
+对照：boot 97 那句「走路没到 `:13704`」站得住，靠的**不是**环的形状，而是中转那条不经 tee 的腿
+（`probe_seen=0` 配上生产者只有两条早退）。本靴那条腿同样是 `seen=0`——
+本靴自己的 `why=tail`（`calls=1/2/3/4`）与 `why=beat`（`calls=448/643/908/7257`）九行都写
+`seen=0 blocked=0/0/0 empty=0 cut=0`——可它只说「`:13724` 那一次交接没执行」，
+**说不出 burst 到底进没进**，因为 `pre` 被放在三次自增之后，而自增在 burst 的深处。
+
+**③ 本靴唯一能站住的机制性读数是「采样目标到内核 419 s 还没上闩」。**
+`[299.632329] clover r234: beat t=299 pid=0 rn=0 rep=707`、`[419.773433] clover r234: beat t=419 pid=0 rn=0 rep=707`
+——`pid=`/`rn=` 打的是 `clover_bb_target_pid`/`clover_bb_target_name`，而 beat 线程只在
+`clover_bb_target_pid != 0` 才调 `clover_bb_sample()`（`task.c:11217`），普查那一族全部产自这个函数。
+闩锁的来源是 mach-trap 批量里出现属主串 `<pid>:backboardd`（`task.c:14390`）。本靴 `r224/r225` 那三行
+每 4 s 照常到（`t=500/504/508/512/516/520/524`，`b=114…120`），说明批量通路活着，只是没 latch 成功；
+`rep=707` 在 299 与 419 两枚心跳里同一个值（boot 97 是 707→4203）。
+**但这一条不许当整靴的事实**：下一枚心跳行要 539 s 才印，而环的最新一行是 524.995 s ⇒ 419 s 之后
+latch 没 latch，卡上读不出。所以 ① 那格的候选解释有两个（没 latch ⇒ 没跑；跑了但被 cap/lap 吃掉），
+本靴分不开。
+
+**④ 这一靴真正的新形状是「结束没有任何卡上记录」，而且是实测不是缺席。**
+本靴自己的四枚节拍：`t=491279/495284/499291/507307 ms`、`k=503/507/511/519 s`、
+`arming_offset=11721/11716/11709/11693 ms`、`starve=0/0/87601→90104/25→26`、
+`pio=0/0x00000000/0w@0ms ch=0 lba=0 total=0`、`stuck=0 recov=0 steal=0`、`pend=0/0`。
+⇒ `panicked=` 整靴为 **0**、块写一次都没被拒（boot 97 是 `panicked=895`、`pio=1/…@445924ms`）。
+12 枚 entry 记录全挤在 `t=511517…511528 ms`，是正常的 `navd`(78)/`homed`(161) 块读。
+两枚 marker 分别是 boot 96（`magic=yes`）与 boot 87（`magic=absent`），句子 16 槽没有本靴行，
+死线记录还是 boot 87 的 ⇒ **本靴一次都没进 panic sink**，也没跑到 1800 s。
+落点由监视器记下：`05:37:31` 刷完并重启、`05:55` 见到 TWRP 的 adb，脚本明说那是
+**预上膛的 BCB 接住的**（r198 让非 panic 复位也落 TWRP），「落点不等于死因」。
+⇒ 本靴终点只剩一个区间：内核侧下界 **524.995 s**、驱动侧下界 **511.528 ms→511.5 s**、
+上界 ≈ 宿主看到的 **1044 s**。按第六层，**这个区间不许换算成复位时机的下一票**，
+它只说明一件事：十靴以来第一次，这靴的结束只能由宿主的钟夹住。
+
+**⑤ 顺带有的显示侧读数（主线那一格仍不算数）。**
+`[465.376268] r180: retire#1 done=1 presented=1 frames=1` 一直到 `[480.929732] retire#4 done=4 presented=4 frames=4`，
+帧内容行 `frame#5 kind=0 t=20s pixels=45460 box=305x811..970x1108`、色表
+`ff000000/2258540 … other=45426`（几乎全黑）。boot 97 的环里最新一行也是 `r180: frame#5`。
+⇒ 「交帧」这条在单核靴上同样跑得到；桌面那一格要的仍是「画面上是什么」，本靴没有那个判据。
+
+**⑥ 家族账。** 本靴**不进八核家族**（它连自己是几核都没能在卡上自证），
+所以「尾巴属镜像还是属核数」这格**原封不动**留给下一轮，而 boot 97 那一条十一靴、跨九枚镜像的复现不受影响。
+落地快照 `charger_temp=337`、`capacity=100`、`status=Charging`。
+
+**⑦ 这一轮欠下的账改写了 r308 的第②条。** 预登记的判据是「单核靴必须读成 `reg=1 start=0` 的形状」，
+但那条行产自被这一轮控制的那个 burst 自己——**判据与它要判的那件事同乘一条船**，这是第六层与第九层的
+又一件衣服：控制轮要成立，核数必须有**不经 tee、也不经普查**的一条腿。r308 因此定为三条：
+1. `drain exit` 那行的 `probe_pend=` 归位（改名 `ring_pend=` 或补真值，token 升代）。
+2. **把「burst 进了」与「几颗核」一起搬到 kind-25 的腿上**：在 `clover_bb_sample()` 进函数、走线程表
+   **之前**投一枚 `clover r308: enter t= pid= target=`，并把 `r271` 的核数摘要在同一枚行里带上
+   （或另投一枚），投递对象是 `clover_emmc_probe_say()`——本靴证明「骑 tee 的副本」在一趟 `lap=2`
+   的靴子里不能当证据。
+3. **控制轮重跑**，判据换成第②条那枚不经 tee 的核数行：跑成单核形状（`reg=1 start=0`）才算控制轮成立，
+   之后才谈尾巴属核数还是属镜像。
+正对照（本轮仪器没坏的证据）：中转的消费者本靴跑了 **7257 趟**（boot 97 只到 902）而 `seen=` 仍是 0、
+`blocked=0/0/0`、`empty=0`、`cut=0`——分预算后的 `why=tail`/`why=beat` 两支这一次**都在说话**，
+r307 第①条在第二种靴子上也兑了一次。

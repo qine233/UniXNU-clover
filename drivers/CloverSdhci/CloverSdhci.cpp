@@ -498,11 +498,10 @@ static uint32_t gProbeStalled = 0;            // passes that stopped on an unsea
 static uint32_t gProbeRefused = 0;            // passes that stopped on a card that said no
 static uint32_t gProbeCalls = 0;              // flush passes of any consumer
 static uint32_t gProbeSealWait = 0;           // consecutive passes stopped on the same unsealed row
-static uint32_t gProbeReports = 0;            // r304 self-report lines said
 static const uint32_t kProbeFlushCap = 16;    // records per pass; two block writes each
 static const uint32_t kProbeSealRetries = 4;  // passes to wait for a seal before dropping the row
 static const uint32_t kProbeBacklogEvery = 64;  // passes between backlog reports
-static const uint32_t kProbeReportsMax = 64;
+static const uint32_t kProbeReportsMax = 64;  // per speaker since round307
 
 /*
  * Round306. Boot 95 answered with the relay's own silence -- no kind-25 record, no report line -- and
@@ -525,10 +524,45 @@ static const uint32_t kProbeBlockCount = 3;
 static volatile uint32_t gProbeBlocked[kProbeBlockCount] = {0, 0, 0};
 static volatile uint32_t gProbeEmptySay = 0;    // callers that handed the relay nothing to carry
 static volatile uint32_t gProbeCutSay = 0;      // callers whose row exceeded the relay's text slot
-static uint32_t gProbeSilenceSay = 0;           // guard-exit report lines said
-static uint32_t gProbeNothingSay = 0;           // "a consumer ran and nothing has ever been delivered" lines said
-static const uint32_t kProbeSilenceSayMax = 4;  // bounded: this is a state line, not a stream
+/*
+ * Round307. Boot 96 paid r306's two budgets back as a blindness of this instrument's own: both were
+ * single counters shared by three speakers, and `why=tail` -- the consumer that runs most often -- spent
+ * all four `nothing` slots, so `why=drain`, the one consumer that runs at the scene of the stop, never
+ * got to say it. A bounded line said by whoever asks first is a line that reports its own queue order
+ * and not the boot: the budget has to belong to the speaker, so a silent drain means a silent drain.
+ * The guard-exit line had the same shape one branch above, so both counters become arrays.
+ *
+ * The row tokens move to r307 with them. Both lines gained a column (`calls=`), and a reader that cannot
+ * tell which generation of image wrote the record it is holding would read an r306 line's missing column
+ * as a zero -- the round293 lesson, applied to a field this round added.
+ */
+static const uint32_t kProbeWhyTail = 0;
+static const uint32_t kProbeWhyBeat = 1;
+static const uint32_t kProbeWhyDrain = 2;
+static const uint32_t kProbeWhyOther = 3;   // a speaker this table does not know: its own slot, not a shared one
+static const uint32_t kProbeWhyCount = 4;
+static uint32_t gProbeSilenceSay[kProbeWhyCount] = {0, 0, 0, 0};   // guard-exit lines said, per speaker
+static uint32_t gProbeNothingSay[kProbeWhyCount] = {0, 0, 0, 0};   // "a consumer ran and nothing has ever been delivered" lines, per speaker
+static uint32_t gProbeReports[kProbeWhyCount] = {0, 0, 0, 0};      // r304 self-report lines said, per speaker
+static const uint32_t kProbeSilenceSayMax = 4;  // per speaker: this is a state line, not a stream
 static const uint32_t kProbeNothingSayMax = 4;
+
+static uint32_t probeWhySlot (const char *why)
+{
+  if (why == nullptr) {
+    return kProbeWhyOther;
+  }
+  if (why[0] == 't' && why[1] == 'a' && why[2] == 'i' && why[3] == 'l') {
+    return kProbeWhyTail;
+  }
+  if (why[0] == 'b' && why[1] == 'e' && why[2] == 'a' && why[3] == 't') {
+    return kProbeWhyBeat;
+  }
+  if (why[0] == 'd' && why[1] == 'r' && why[2] == 'a' && why[3] == 'i' && why[4] == 'n') {
+    return kProbeWhyDrain;
+  }
+  return kProbeWhyOther;
+}
 
 // Round210: the flight region. Round209 proved the kernel was alive at the 900 s deadline while the
 // card accepted nothing -- the report window got no record and the rings got no drain -- so the one
@@ -4975,9 +5009,10 @@ static uint32_t probeFlush (const char *why, uint32_t cap)
      * the card either, and then the frame is empty in a way that says so beside it.
      */
     __atomic_fetch_add (&gProbeBlocked[blocked], 1u, __ATOMIC_RELAXED);
-    if (gProbeSilenceSay < kProbeSilenceSayMax) {
-      gProbeSilenceSay++;
-      teeSay ("CloverSdhci r306: probe silent why=%s guard=%s seen=%u next=%u flushed=%u"
+    const uint32_t slot = probeWhySlot (why);
+    if (gProbeSilenceSay[slot] < kProbeSilenceSayMax) {
+      gProbeSilenceSay[slot]++;
+      teeSay ("CloverSdhci r307: probe silent why=%s guard=%s calls=%u seen=%u next=%u flushed=%u"
               " blocked=%u/%u/%u empty=%u cut=%u\n",
               why, blocked == kProbeBlockUnarmed ? "unarmed"
                    : (blocked == kProbeBlockHost ? "host" : "busy"),
@@ -5041,32 +5076,34 @@ static uint32_t probeFlush (const char *why, uint32_t cap)
   const uint32_t seen = __atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED);
   const uint32_t next = __atomic_load_n (&gProbeNext, __ATOMIC_RELAXED);
   const uint32_t pend = seen - next;
-  // Round306's third branch. The two that were here both need something in flight: a burst that landed,
-  // or a backlog to report every 64 passes. Boot 95 had neither -- the queue was empty every time a
-  // consumer looked -- so a relay that never carried a single row said nothing at all, which is the same
-  // silence as a relay that was never asked. "A consumer ran, and nothing has ever been delivered" is
-  // its own reading and gets its own bounded line.
-  const bool nothing = gProbeCalls && !gProbeFlushed && gProbeNothingSay < kProbeNothingSayMax;
+  // Round307's half of the same branch. The sentence is the same -- "a consumer ran, and nothing has
+  // ever been delivered" -- but the budget is now this speaker's own, so four tail passes cannot buy
+  // the drain out of a voice. `calls=` rides along because the pair that makes the reading is
+  // `calls` with `seen`: passes that ran beside rows that were never handed over.
+  const uint32_t whySlot = probeWhySlot (why);
+  const bool nothing = gProbeCalls && !gProbeFlushed &&
+      gProbeNothingSay[whySlot] < kProbeNothingSayMax;
   // Two readings, and the pair is the point. `wrote` with nothing left pending says a burst the kernel
   // handed over reached the card, with the numbers to prove it. `pend` with a write that has not moved
   // says the opposite: the rows exist in BSS and are not on the card, which is what boot 93 could only
   // infer from the absence of everything. Both are bounded so a boot cannot fill its own ring with them.
-  if (gProbeReports < kProbeReportsMax &&
+  if (gProbeReports[whySlot] < kProbeReportsMax &&
       ((wrote && !pend) || (pend && gProbeCalls % kProbeBacklogEvery == 0) || nothing)) {
     if (nothing) {
-      gProbeNothingSay++;
+      gProbeNothingSay[whySlot]++;
     }
-    gProbeReports++;
+    gProbeReports[whySlot]++;
     // Round305 appends the beat's starvation and the last refused block write to this line, in front of
     // nothing that was already here: the beat cannot report them when it is the thing being starved, and
     // boot 94's five reports are the only consumer on that boot that ever ran. A reader that sees the
     // same starve= pair twice -- here and in the next beat record -- is seeing one counter, not two.
-    // Round306 appends the guard exits and the producer's own two exits, so the line that used to be
-    // silent whenever nothing was pending now says which side never spoke.
-    teeSay ("CloverSdhci r306: probe why=%s wrote=%u seen=%u next=%u pend=%u flushed=%u skipped=%u"
+    // Round306 appends the guard exits and the producer's own two exits. Round307 moves the token and
+    // adds `calls=`, because a reader that cannot tell which image wrote a record would read an older
+    // line's missing column as a zero.
+    teeSay ("CloverSdhci r307: probe why=%s calls=%u wrote=%u seen=%u next=%u pend=%u flushed=%u skipped=%u"
             " stalled=%u refused=%u dropped=%u starve=%u/%u/%u/%u pio=%u/%x/%u@%u ch=%u"
             " blocked=%u/%u/%u empty=%u cut=%u\n",
-            why, wrote, seen, next, pend, gProbeFlushed, gProbeSkipped, gProbeStalled,
+            why, gProbeCalls, wrote, seen, next, pend, gProbeFlushed, gProbeSkipped, gProbeStalled,
             gProbeRefused, static_cast<unsigned int> (__atomic_load_n (&gProbeDropped,
                                                                        __ATOMIC_RELAXED)),
             static_cast<unsigned int> (__atomic_load_n (&gBeatStarved[kBeatBlind], __ATOMIC_RELAXED)),

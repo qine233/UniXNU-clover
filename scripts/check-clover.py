@@ -4171,7 +4171,7 @@ def check_board(errors: list) -> str:
                        'probeFlush ("tail", kProbeFlushCap);',
                        'return probeFlush ("drain", 0);',
                        'static const uint32_t kProbeSealRetries = 4;',
-                       '"CloverSdhci r306: probe why=%s wrote=%u seen=%u next=%u pend=%u flushed=%u skipped=%u"',
+                       '"CloverSdhci r307: probe why=%s calls=%u wrote=%u seen=%u next=%u pend=%u flushed=%u skipped=%u"',
                        '" stalled=%u refused=%u dropped=%u starve=%u/%u/%u/%u pio=%u/%x/%u@%u ch=%u"',
                        '" blocked=%u/%u/%u empty=%u cut=%u\\n"'):
             if needle not in sdhci_source:
@@ -4357,15 +4357,104 @@ def check_board(errors: list) -> str:
                        '__atomic_fetch_add (&gProbeBlocked[blocked], 1u, __ATOMIC_RELAXED);',
                        '__atomic_fetch_add (&gProbeEmptySay, 1u, __ATOMIC_RELAXED);',
                        '__atomic_fetch_add (&gProbeCutSay, 1u, __ATOMIC_RELAXED);',
-                       '"CloverSdhci r306: probe silent why=%s guard=%s seen=%u next=%u flushed=%u"',
-                       'const bool nothing = gProbeCalls && !gProbeFlushed && '
-                       'gProbeNothingSay < kProbeNothingSayMax;',
+                       '"CloverSdhci r307: probe silent why=%s guard=%s calls=%u seen=%u next=%u flushed=%u"',
+                       'const bool nothing = gProbeCalls && !gProbeFlushed &&',
+                       'gProbeNothingSay[whySlot] < kProbeNothingSayMax;',
                        '{ "clover r306: ", "r306-step", 64, 0, 0, 0 }',
                        'teeHasPrefix (probe->name, teeStringLength (probe->name), "r306")'):
             if needle not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci has no {needle[:52]!r}: a consumer that returns before its "
                               "pass counter is incremented leaves the report line unreachable, so the guard exit "
                               "has to say its own reason or the three causes of boot 95 stay one silence")
+
+        # Round307. Boot 96 is the reading this contract exists to keep: four `nothing` slots, one shared
+        # counter, and `why=tail` -- the consumer that runs most often -- spent every one of them, so the
+        # line that would have said "the drain ran and the queue was empty" was bought out by a speaker
+        # that had nothing to report about the stop. A bounded state line whose budget is global reports
+        # the queue order of whoever asks first, which is a fact about this instrument and not about the
+        # board. Three assertions: the budgets are arrays, the speaker is named on the line, and the pass
+        # counter that the budgets used to hide is printed beside it.
+        r307_name = "z" * 64 + "-clover-r307.patch"
+        r307_patch = next((base / "patches/xnu-clover" / r307_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r307_name).is_file()), None)
+        if r307_patch is None:
+            errors.append(f"patches/xnu-clover/{r307_name} is missing: without a second copy of \"the walk "
+                          "reached the counters\" that does not ride the kernel log, boot 96's step-row "
+                          "absence still has two readings -- a tee that lost the row and a walk that never "
+                          "made it -- and r306 was the round that could not separate them")
+        else:
+            r307_text = r307_patch.read_text()
+            r307_added = "".join(line.lstrip("+") for line in r307_text.splitlines()
+                                 if line.startswith("+") and not line.startswith("+++"))
+            r307_code = "".join(
+                line.lstrip("+") for line in r307_text.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+                and not line.lstrip("+").lstrip().startswith(('*', '//', '/*')))
+            if '"clover r307: pre t=%llu seq=%llu pid=%d th=%u hidden=%u\\n"' not in r307_added:
+                errors.append(f"{r307_name} does not print the pre row with the step and fire rows' own "
+                              "fields: three rows that cannot be joined field for field are three absences "
+                              "instead of one pair")
+            if "clover_emmc_probe_say(prow," not in r307_code:
+                errors.append(f"{r307_name} does not hand the pre row to the relay directly: the whole point "
+                              "of this copy is that it reaches the card without the console path, which is "
+                              "the pipe under audit")
+            if "clover_census_row" in r307_code:
+                errors.append(f"{r307_name} sends the pre row through clover_census_row: that function "
+                              "prints to the console as well, so the copy would ride the pipe it is here to "
+                              "cross-check and both channels would go quiet together")
+            if 'printf("clover r307' in r307_code:
+                errors.append(f"{r307_name} prints the pre row to the console: the relay-only copy is the "
+                              "reading, and a printf here puts it back on the tee that r306 measured")
+            counters_at = r307_text.find("clover_bb_chain_hops = 0;")
+            pre_at = r307_text.find("clover r307: pre")
+            # The block the new row is inserted above: round306's comment opens the step row's block, and it is
+            # the hunk's own trailing context, so the interval is measurable inside the patch rather than only
+            # in the file.
+            step_at = r307_text.find("* Round306. One row printed by the console path alone")
+            if counters_at < 0 or pre_at < counters_at or (0 <= step_at < pre_at):
+                errors.append(f"{r307_name} does not put the pre row between the three counters and the "
+                              "step row: outside that interval it is not a copy of the same \"got here\" "
+                              "and the two rows cannot bracket anything")
+            for forbidden in ('thread_block', 'simple_wait', 'lck_mtx_lock', 'proc_lock', 'hw_lock_lock'):
+                if forbidden in r307_code:
+                    errors.append(f"{r307_name} calls {forbidden}: the pre row is handed over while the "
+                                  "census holds another task's thread walk, where nothing may sleep or take "
+                                  "a lock")
+            load_r307 = REPO.parent / "UniXNU" / "patches" / "xnu" / r307_name
+            if not load_r307.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r307_name} is missing: unixnu loads patches from there, "
+                              "and this repo's copy only ever names the round")
+            elif load_r307.read_bytes() != r307_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r307_name} is not the same bytes as this repo's copy: "
+                              "the shipped image would carry a different row than the one checked here")
+            late_script_r307 = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list_r307 = " ".join(line for line in late_script_r307.splitlines() if "clover-r" in line)
+            if (late_list_r307.find(r307_name) < 0 or
+                    late_list_r307.find(r307_name) > late_list_r307.find("z" * 63 + "-clover-r306.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r307 before r306 in LATE_PATCH: r307 "
+                              "inserts inside the block r306 added, so a tree that removes r306 first leaves "
+                              "r307 un-reversible -- and an apply failure in that loop is silent")
+        for needle in ('static uint32_t gProbeSilenceSay[kProbeWhyCount] = {0, 0, 0, 0};',
+                       'static uint32_t gProbeNothingSay[kProbeWhyCount] = {0, 0, 0, 0};',
+                       'static uint32_t gProbeReports[kProbeWhyCount] = {0, 0, 0, 0};',
+                       'static uint32_t probeWhySlot (const char *why)',
+                       'const uint32_t slot = probeWhySlot (why);',
+                       'const uint32_t whySlot = probeWhySlot (why);',
+                       'gProbeReports[whySlot] < kProbeReportsMax',
+                       '"CloverSdhci r307: probe why=%s calls=%u wrote=%u seen=%u'):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no {needle[:52]!r}: boot 96's four `nothing` slots "
+                              "were spent by why=tail alone, so a budget shared by three speakers reports "
+                              "which consumer asked first and not whether the drain had anything to say")
+        if "gProbeNothingSay < kProbeNothingSayMax" in sdhci_source or "gProbeSilenceSay < kProbeSilenceSayMax" in sdhci_source:
+            errors.append("a report budget is a single counter again: one cap for three consumers means the "
+                          "first speaker buys the others out of a voice, which is the blindness boot 96 "
+                          "printed on the card while reporting it")
+        if "CloverSdhci r306: probe" in sdhci_source:
+            errors.append("the probe report and guard-exit lines still carry the r306 token: round307 added "
+                          "a column to both, and a reader that cannot tell which generation wrote a record "
+                          "reads an older line's missing calls= as a zero")
         if 'if (!gVerdictFirst || !gHost || gRingBusy[kRingDriver]) {' in sdhci_source:
             errors.append("probeFlush's three guard exits are merged into one return again: whichever of "
                           "\"no window armed\", \"the host belongs to another thread\" and \"this ring is "
@@ -5682,8 +5771,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r306:"):
-        errors.append('[payload] title is not "clover r306: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r307:"):
+        errors.append('[payload] title is not "clover r307: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -6821,8 +6910,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r306:"):
-        errors.append('[payload] title is not "clover r306: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r307:"):
+        errors.append('[payload] title is not "clover r307: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

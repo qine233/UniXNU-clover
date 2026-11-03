@@ -1,0 +1,29 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -13704,6 +13704,26 @@
+ 		clover_census_seq++;
+ 		clover_census_rows = 0;
+ 		clover_bb_chain_hops = 0;
++		/*
++		 * Round307. The other copy of "the walk reached the counters", and this one goes to the relay
++		 * only -- no printf, so nothing about it rides the kernel log, the msgbuf or the tee, which is
++		 * the pipe round306's step row put under audit and the one boot 96 could not clear. Two
++		 * readings join on t=/seq=/pid=/th=/hidden=: kind-25 has this row and kind-22 has no step row
++		 * names a loss inside the console tee, which is a horizon; neither row names a walk that stopped
++		 * above these three increments; both rows with no fire or done row names snprintf and
++		 * clover_census_row instead. Handing the bytes to the ring first is round305's order kept for
++		 * the same reason -- the copy that must survive the stall is the one that cannot cause it.
++		 */
++		{
++			char prow[256];
++			int prowlen = snprintf(prow, sizeof(prow),
++			    "clover r307: pre t=%llu seq=%llu pid=%d th=%u hidden=%u\n",
++			    (unsigned long long)secs, (unsigned long long)clover_census_seq, pid, cn,
++			    (call > cn) ? call - cn : 0);
++			if (prowlen > 0) {
++				clover_emmc_probe_say(prow, (unsigned int)strlen(prow));
++			}
++		}
+ 		/*
+ 		 * Round306. One row printed by the console path alone, between the three counters and the fire
+ 		 * row, and deliberately not through clover_census_row. Boot 95 left the relay unattributed: the
