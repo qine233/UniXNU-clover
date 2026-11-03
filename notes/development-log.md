@@ -22016,3 +22016,114 @@ boot 77: [1064.392658] clover r199: ubrk pid=227 comm=watchdogd n=1 pc=0x101349b
 不能排除 APSS 看门狗：`r281: wdt` 在 boot 78 只在 **617 s** 读到一次 `en=0 armed=0`（trap 之前 59 s），
 那之后到死之间再没有第二拍。所以要问的下一格很窄：把 WDT 的读数挪到短节拍上，看 trap 之后 `armed` 有没有
 从 0 变成 1；同时在宿主上把 `watchdogd+0xab0c` 的那次 `bl` 解出来。两件事都不动 GPU 的形状。
+
+### r292 前置（宿主 + 已归档的卡上窗口，一次开机都没花）：上面那条相关性撤掉，飞区一直就在卡上没人读
+
+**① `watchdogd+0xab0c` 那次 `bl` 解出来了，落名 `libSystem/__os_crash`。** 全程不用板子，而且比预想的短：
+r200 那行的 `head=feedfacf.0100000c.00000000.00000002` 说明**映射起点就是 mach-o 头**（`__TEXT fileoff=0`、
+`vmaddr=0x100000000`），所以探针给的 `off=0xab0c` 与 `foff=0xab0c` 本来就是同一个数——**文件偏移**，
+不需要解 slide。把 `code=` 那八个字按 `foff-16` 回读本地 `/private/tmp/iosroot2/usr/libexec/watchdogd`，
+逐字节对上（`910003fd.700119a0.d503201f.9400026b.d4200020.…`），于是 `pc`=那枚 `d4200020`，前一条
+`9400026b` = `bl pc+0x9ac` → **foff 0xb4b4**。这个数落在 `__stubs`（0x10000b280+0x960）里，是第 47 号
+PLT 桩；桩体 `adrp x16 → 0x100010000 / ldr x16,[x16,#0x1e0] / br x16` 给出 GOT 槽 **0x1000101e0**，
+`xcrun dyld_info -fixups watchdogd` 直接点名：
+
+```
+__DATA_CONST  __got  0x1000101E0  bind  libSystem/__os_crash
+```
+
+一颗 `_NORETURN` 的崩溃上报函数**返回了**，编译器紧跟的 `brk #1` 把线程打死——这就是上面「一个被声明为
+noreturn 的调用返回了」的确切所指。它上游的断言串就在同一张镜像里，`__cstring 0x10000ce37`：
+
+```
+connect_to_kext() unexpectedly failed - unable to lookup watchdog KEXT service
+```
+
+**② 它找的是 `IOWatchdog` 服务，而我们这板没有能让那颗驱动 start 的设备节点。** 同一段 cstring 邻域（0x10000cdb7
+`IOWatchdog`、0x10000cdc2 `failed to discover watchdog KEXT service`、0x10000cdeb `detected virtual machine
+environment and no watchdog KEXT found, exiting...`）把整条 `connect_to_kext()` 摊开：先按类名匹配，
+匹配不到就分岔——虚机里体面退出，真机上 `__os_crash`。**这一段第一稿写错过并已当场改正**：我起初按
+19 MB 的 `mach.development.bcm2837.unstripped.noctf` 断言「我们内核里连 `IOWatchdog` 这个类名都不存在」，
+但那颗文件只是裸 XNU，kext 不在里面；prelink 命令的 `--root` 列表**明明白白带着
+`com.apple.driver.AppleARMWatchdogTimer`**，对 52 MB 的 `out/clover/kernel/kernel.macho` 重数：
+`AppleARMWatchdogTimer` 13 处、`IOWatchdog` 6 处、`IOWatchdogUserClient` 3 处、人格的 `wdt,s5l8960x` 1 处。
+**驱动在镜像里，缺的是匹配**：stock 人格是 `IOClass=AppleARMWatchdogTimer` /
+`IOProviderClass=AppleARMIODevice` / `IONameMatch=wdt,s5l8960x`（`apfs.kext` 的 `OSBundleLibraries` 还显式
+链着这颗），而 `strings build/clover/kernel.macho.adt` 里 `wdt`、`watchdog` 一个都没有，
+`make-clover-adt.py` 出现这两词的次数是 0。**这是 r240/r241 那个形状**（人格在、节点缺）。
+要补得连父节点一起补——provider 是 `AppleARMIODevice`，得先有一枚会被它匹配的 arm-io-device 节点，
+这一层在本板还没证过（历次 census 只点名按键/HID 类，没有一行提过 `AppleARM*`），**所以「补一颗 wdt 节点就够了」
+这句话现在不能写**。而 `sheng` 全仓 `IOWatchdog`/`watchdogd` 零引用却把同一张镜像开到桌面 ⇒ 这条缺口**不是桌面
+瓶颈**，r292 不碰它；真要碰，先量 `AppleARMIODevice` 在本板到底有没有平面，再造节点。
+
+**③ 上面那条相关性当场作废，而且是被一靴证伪的，不是被推理削弱的。** 三张已归档窗口里的
+`r199: ubrk comm=watchdogd` 全表：boot 76 t=1336.199（pid 216）、boot 77 t=1064.393（pid 227）、
+boot 78 t=675.998（pid 213）、boot 71 t=1671.275（pid 275）、boot 73 t=2866.356（pid 400）与 t=4055.340
+（pid 541）。**boot 76 跑到 1800 s 死线、panic 槽里是 r148 的死线、没有任何静默复位——它照样打了这记 brk**；
+boot 73 打了两次也没复位。所以「两靴死前都有 watchdogd brk」是真的，但「没有它也有」同样是热的，
+trap 到死的间隔还不固定（43 s / 184 s / ∞）。这句话在 ⑧ 里被当成相关性写，实际是**每靴都有的背景现象**。
+
+**④ 真正的发现是仪器：`read-clover-log.py --flight` 存在了八十轮，runner 从来没调用过。**
+飞区 sectors 40..63（`flight armed entry=13320248 slots=12 beat=13320272 slots=4`）里，beat 每 4 秒带
+自己的 CNTVCT，entry 带每笔请求的 pid/comm/lba/blocks/stage——**这正是 r291 ④ 说「缺的仪器就一条：驱动侧
+一条带 CNTVCT 的周期心跳」的那条，它一直在卡上，只是没人读**。把归档窗口全跑一遍 `--flight`（单位 ms）：
+
+| 靴 | 最后一拍 | 最后一笔请求 | 两者之差 | 内核环最后一行 | 结局 |
+|---|---|---|---|---|---|
+| boot 71 | 1792305 | 1802422 | 10.1 s | 1812.68 | 死线 panic |
+| boot 74 | 1035732 | 1407459 | **371.7 s** | 1419.74 | 致命 data abort |
+| boot 76 | 1676373 | 1802582 | **126.2 s** | 1814.68 | 死线 panic（迄今最远） |
+| boot 77 | 1235848 | 1236492 | 0.64 s | 1248.429585 | 静默复位 |
+| boot 78 | 707437 | 707848 | 0.41 s | 718.840606 | 静默复位 |
+
+**两起静默复位是这张表里唯一「拍和请求一起停」的两靴**：boot 78 的最后一笔是 pid 224（`announced`）在
+lba 30386448 的 8 块读，707.848 s；boot 77 同构（1236.492 s）。而 74/76 那两格「拍陈旧、请求新鲜」是
+**心跳被持续 I/O 饿掉**（beat 只做 IOLockTryLock，抢不到就跳过并 `miss++`），不是盘挂。于是这条仪器的读法
+要钉死：**单看 beat 停不停分不出「挂」和「饿」，必须和 entry 环的最新 seq 一起看。** 补上这一半之后，
+r291 ④ 那句「驱动环封顶不了复位时刻」就不成立了——boot 78 的 AP 在 707.8 s 之后再没碰过卡，内核采样器
+又活了 11 s，这两件事第一次有了数。
+
+**⑤ 这条读数的边界，写在落盘这一刻。** entry 记录是在 `flightEnter` 写的，一笔请求**完成**只体现在
+「下一条 entry 的 `prev=` 字段」里；所以最新那条 entry 天然无法区分「还在飞」和「完成之后再没人来过」。
+两靴的「盘先静」因此仍有两个读法：一笔请求挂住（本驱动单请求串行 + guard 排队，全系统盘 I/O 就此停），或者
+系统不再需要盘。要分这两者，需要 beat 在抢不到 guard 时把 holder 的 `stuck_stage`/年龄印出来——那些量 r213
+已经在算，只是从没出声。**r292 不解决这一格**，r292 只换掉 WDT 的 120 s 地平线。
+
+**⑥ r292 动的两处，判据先写下。**
+- `package/CloverKeyStoreProbe.cpp`：aks 定时器 120 s → **4 s**；state 行改每 30 拍（还是 120 s）、表每 5 个
+  state 行（还是 600 s），**首拍就带一张表**（旧表最早 720 s 才出声，而 boot 78 死于 718.84 s）。WDT 行
+  只在 `EN/STS/BARK/BITE` 变化时打，其余靠每 30 拍的 `why=ctrl` 复读——这样「没有 chg 行」仍能读作
+  「没动」而不是「定时器死了」，因为 ctrl 行本身就是它活着的证据。
+- `scripts/run-clover-unattended.sh`：解码块加 `--flight`，从这一轮起每轮固定读回飞区。
+
+判据：(a) 某靴死前出现 `why=chg` 且 `armed=1` ⇒ APSS 看门狗在死前被武装，静默复位有了硬件出口，下一格查
+谁武装的；(b) 直到最后一拍都只有 `why=ctrl armed=0` ⇒ 0x17817000 这块从头到尾没武装，复位不来自它，得往
+AOP/PON 那一侧找（那颗寄存器管不到那一层）；(c) **ctrl 行和 entry 环同时停**而内核采样器还活着 ⇒ 停的是
+驱动侧整条路径（workloop/定时器），不是盘。三条都还没有读数，等这一靴的卡上窗口。
+
+**⑦ 宿主环境两条更正（都当场撞过）。** capstone **不在** `/opt/homebrew/bin/python3.13` 里，在
+`~/clover-out/venv/bin/python`（旧记录那路径这轮失效）；`xcrun dyld_info -fixups/-objc` 对**脱符号的 iOS
+瘦 macho** 是好用的——r261 记的「读不了」特指那套 arm64 共享缓存的 `-segments`。另外这颗 watchdogd 的
+`LC_FUNCTION_STARTS` 尺寸为 0，别指望用它取函数边界；`nm` 也只剩 `__mh_execute_header`。
+
+**⑧ 契约、构建与产物（v0.6.94）。** 探针改动之外，本轮落地的还有两处：
+`drivers/CloverSdhci/CloverSdhci.cpp` 的 `kTeeProbeClasses` 里，`{ "clover r281: wdt", "r281-wdt", 48, 0, 0, 0 }`
+排在 `{ "clover r281: ", "r281-aks", 128, ... }` **之前**——`teeProbeClass()` 是前缀首中即停，顺序反了 bark 行就会
+记进 keystore 的预算；两类都在既有的 `reserved` 豁免里（该分支按前缀 `r281` 匹配，不需要新增词条）。
+`scripts/run-clover-unattended.sh` 的解码块加了固定一棒 `--flight`，读不到就明说「this boot predates round210」，
+免得缺席读成空。
+`check-clover.py`：三枚常量针换成 4 s/30/5 的新值，行字面量针带上新 `why=` 字段，`nomap` 针改判
+`why=ctrl`；新增 `{ "clover r281: wdt", "r281-wdt", 48, 0, 0, 0 },` 这一枚，并**断言它在 `{ "clover r281: "` 之前**
+（first-match-wins 的次序是本轮唯一会静默改掉预算的形状）。标题断言 r291→r292 两处。
+`verify-clover-payload.py`：`aks-say-wdt` 尾部字面量到 `bark_ms=%u bite_ms=%u why=%s\n`，
+`aks-say-wdt-nomap` 改 `clover r281: wdt t=%u nomap why=ctrl\n`。
+`[payload] title` 升到 `"clover r292: the watchdog sampled at the flip's resolution. …"`，并按 boot 35/36 的规矩
+带两对转义双引号（`\"why=first|chg|ctrl\"`、`\"r281-wdt\"`）——checker 要求标题里必须有双引号，发出去的 manifest
+才是转义路径的活体测试。
+产物：kernel `2e5e6e00…`（prelink）→ amfi `df3dabcc…`（两刀仍落在 `0x1ad30e4`/`0x1ad316c`，与 r291 同址，说明
+keystore 这轮的插入没挪动 AMFI 段）→ normalized `2e7e0bea…`（973 个 object 戳清零）→ payload
+`7c1d412a…` = `~/clover-out/round292-v0.6.94-payload.img`（58,720,256 B）。
+`check-clover.py` EXIT=0（`clover ok: ADT 14384 bytes`）、`verify-clover-payload.py` EXIT=0
+（`aks-say-wdt present, aks-say-wdt-nomap present`，r289 三枚 `abort-*`、r290 `gpu-row-branches`、
+r291 `gpu-row-ldo` 仍在册）；两个改过的源在组装树 `-Werror` 过（`build-arm-driver.py CloverSdhci` /
+`NativeKeyStoreEvents`）。

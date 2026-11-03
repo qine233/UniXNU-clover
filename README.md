@@ -56,10 +56,30 @@ leave」一路收紧到一句可测的话：
   所以「内核环还在写时驱动没有新行」只能读作「驱动没有要说的行」）。r283/r284 造的那条 IMEM 跨复位记录
   连续第三靴 `unnamed`，且数值量级不像本靴 CNTVCT —— 这条通道 r196 就因同样理由被判死（BCB 从 IMEM 挪进
   misc），教训写进流水日志：**新仪器要落在跨复位通道上，先查这条通道有没有被之前的轮次判死**。
-  唯一现成的相关性：**两靴死前都有一位 `watchdogd` 打了致命 `brk #1`**（boot 78 t=675.998 s→死 718.84 s，
-  boot 77 t=1064.39 s→死 1248.429585 s；`pc==lr`、指令流 `bti j; bl <目标>; brk #1` ⇒ 一个 noreturn 调用返回了），
-  r200 那行给了 `start=0x100e82000 off=0xab0c`，宿主上就能解出被调的是谁。电池这一支在 rec 里现测排除
-  （100%、4.36 V、25 °C、Full、`current_now=0`）。
+  电池这一支在 rec 里现测排除（100%、4.36 V、25 °C、Full、`current_now=0`）。
+* **`watchdogd` 那条相关性已撤掉，它的死因宿主已定名。** `watchdogd+0xab0c` 的 `bl` 在宿主上解到
+  `libSystem/__os_crash`，紧跟的 `brk #1` 是编译器给 noreturn 调用返回加的兜底，它带的字符串是
+  `connect_to_kext() unexpectedly failed - unable to lookup watchdog KEXT service` —— 缺的是
+  `IOWatchdog` 服务的**设备树匹配**（`AppleARMWatchdogTimer` 本体在 prelinked 镜像里，13 处引用，
+  但 `wdt,s5l8960x` 我们的 ADT 从不发布）。反证在卡上：这枚 brk 在五靴都打过（boot 71 t=1671.275、
+  boot 73 t=2866.356 与 t=4055.340 两次、boot 76 t=1336.199、boot 77、boot 78），而 **boot 76 一路跑到 1800 s
+  死线、panic 槽里是 r148 的死线、一次静默复位都没有** —— 这条相关性是被一靴证伪的，不是被推理削弱的；
+  trap 到死的间隔还不固定（43 s / 184 s / ∞）。sheng 也没有这个服务却能进桌面，所以它不是本板的挡路石，
+  要补也得先量 `AppleARMIODevice` 在本板到底有没有平面，r292 不碰它。
+* **新的现形：两靴死前 11–12 s 整条块 I/O 先静了。** r210 起卡上一直有一个飞区（12 条块请求 + 每 4 s 一拍
+  自带 CNTVCT 的心跳），八十个轮次没人解码过。解码后 boot 78 最后心跳 t=707.437、最后一笔块请求 t=707.848
+  （pid 224 的 8 块读，lba 30386448，已公告），而内核自己的采样器一直印到 718.840606；boot 77 同序
+  （心跳 1235.848 / 请求 1236.492 / 末行 1248.429585）。**被死线掐掉的 boot 76 是反过来的配对**：请求环到
+  1802.582 还在进，心跳比它旧 126 s —— 那是流量把心跳饿住，不是盘挂住。所以「挂」和「饿」只有把心跳与请求环
+  放在一起读才分得开，本轮起 runner 每轮固定解 `--flight`。
+* **r292 换的是仪器地平线，不是硬件形状。** 能把「硬件 bite」从这次静默里切出来的只有 APSS 看门狗，而 r281 的
+  `wdt` 行每 120 s 才一拍：boot 78 只在 617 s 读到一次 `en=0 armed=0`，之后 101 s 到死再无第二拍 —— 假设需要的
+  读数从没进过房间。r292 把定时器缩到 4 s、保持原有的行密度（状态行每 30 拍、表每第 5 个状态行），
+  `EN/STS/BARK/BITE` 只在变化时打印，并给每行盖 `why=first|chg|ctrl`：`chg` 缺席要能读成「没动过」而不是
+  「定时器死了」。该行有独立 tee 类 `r281-wdt`（排在 `r281-aks` 之前，first-match-wins，一次性 bark 不能吃
+  keystore 的预算）。判据：死前出现 `armed=1` 的 `chg` ⇒ 复位有硬件出口，下一格查谁武装的；到最后一拍都是
+  `ctrl armed=0` ⇒ 0x17817000 从头到尾没武装，往 AOP/PON 那一侧找；`ctrl` 行与 entry 环同时停而内核采样器
+  还活着 ⇒ 停的是驱动侧整条路径，不是盘。
 * **r283 的跨复位记录第一次上卡**：boot 77 的 verdict 环 slot 0 带回
   `clover r283: last reset unnamed magic=ed88000200a909f8 beat=403443458069358 beatcnt=1371352791997`。
   `unnamed` 只说明**槽里没有我们的 magic**（写手 `CloverSdhci.cpp:8830` 最后才落 `CLOV283`，读者 `:8916` 只认
@@ -78,10 +98,11 @@ leave」一路收紧到一句可测的话：
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气通，两个候选地址全 NACK（`verdict=102`） | 先把面板轨真上电（依赖 3），再问地址 |
 | 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路好，但核心版本字不在 v5 带内，APID 一个没认 | 弄清版本字、认 APID、读轨开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 自校验通过），判决行还没上屏 | 有边就上 GLINK/APR；没镜像先压 `vadsp` 电源 |
-| 5 | watchdogd 每次起就崩 | 自身可执行文件里 `brk #1`（`IOWatchdog` 服务不存在），已摘除致命 | 写最小 `IOWatchdog` 服务，或让 plist 不再要求它 |
+| 5 | watchdogd 每次起就崩 | 死因已定名：`bl` 到 `libSystem/__os_crash`，串是 `connect_to_kext() … unable to lookup watchdog KEXT service`。`AppleARMWatchdogTimer` 本体在镜像里，缺的是 `wdt,s5l8960x` 的设备树匹配（provider 是 `AppleARMIODevice`，本板平面未证）；致命已由 `panic_on_crash_disabled=1` 摘掉。**boot 76 带着这枚 brk 活到死线，sheng 零引用 `IOWatchdog` 也进桌面 ⇒ 不是本板的挡路石** | 先量 `AppleARMIODevice` 在本板有没有平面，再谈造 `IOWatchdog` 服务；不在当前排期 |
 | 6 | **GPU/Metal 一个都没有**（Adreno 512 无驱动、无固件、无 renderer） | `gpu` 区 `planned`；boot 74 实机：**r286 上电写序列在本板第一次生效**——`cx_on=1`、`gfx3d_en=1`、`cxo_en=1`、AHB/BIMC 三票=1（eMMC 正对照成立），但 `gx_on=0` → `chipid skipped`。**boot 76/77 逐字段复现**，所以 `gx_on=0` 是稳定硬件状态，不是竞态也不是时机。**boot 77 的 r290 读数把「问了」和「在跑」分开了**：`gfx3d=1/1`、`rbbm=1/1`（BIT(0) 按下、BIT(31) 仍 HALT），而 `cxo=1/0`、`rbcpr=1/0` 两支 halt=0 —— 前者是本轮没动过的天然正对照，后者是本轮新按的一票真的把分支启动了。（`rcg=80000000` 曾被读成「父源没设」，已收回；halt 两支的 RCG 都是 `0x80000000`、在跑那支 `0x00000000`，**只记相关性**：BIT(31) 在 RCG 命令字里的名字要等一份归档的 `clk-rcg.c`。见 [`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5） | 分支清白、债在电：`gx` 的 GDSC `gx_collapse=0` 而 `gx_on=0` 是**电没到**，不是使能没按。r291（v0.6.92 已发出）按 §5.6 的厂商表读 GFX LDO，但**不新增映射**：`gfx_ldo_vreg` 的 0x0506e000 正落在 DT 声明的 GPUCC `reg = <0x5065000 0x10000>` 里（偏移 0x9000），于是读 `0x9018` VREF（µV=val*5000+375000）、`0x901c` 开关控制（byp/pdn/cpr_byp）、`0x9028` 的 `LDO_READY=BIT(2)`/`LDO_VREF_SETTLED=BIT(4)`，连同当拍 `cx_on`/`gx_on` 一起打——那两票是这行的正对照：三个词全 `0xffffffff` 而 `cx_on` 照常，是这页没应答，整行作废。checker 把「本驱动只开三张窗口」钉成 `IODeviceMemory::withRange` 计数=3。判据写死：`LDO_READY=0` 或 µV=375000 ⇒ 角从没抬起（债在 CPR4/`vdd_gfx`）；µV 落在 DT 的 400000…925000 且 `ready=1` 而 `gx_on=0` ⇒ 轨清白，回查 GDSC 自己的等待字段与 `gpu_gx_domain_addr`。角数（厂商 `SDM660_MMSS_FUSE_CORNERS=6` vs DT 的 1..7）不印也不下结论。S3/S5 两颗是 `qcom,rpm-smd-regulator`，SPMI 读不到，不在这一格。**boot 78 把两条预登记判据一起点亮**（`beat` 副本顶上，`ldo post` 在环窗外）：`vref=0 val=0 uv=375000`、`sts=0`（`ready=0 settled=0`）、`ctrl=80000038`=`LDO_CLAMP_IO|LDO_PDN|LDO_UNDER_SW_CTRL`+一枚没名字的 BIT(3)，同拍 `cx_on=1` 作正对照 ⇒ **轨自这次上电起既没使能也没编程，「轨清白」这一支关闭**。下一手是对轨**编程**，缺的不是寄存器（三处都在 `msm_gfx_ldo.c` 点得名）而是使能全序与角→电压来源（CPR4 fuse 在 `0x00784000` 另一张窗口），没有 sha256 出处不写。**桌面仍 CPU-first** |
 
-1 挡住桌面；6 是 1 最可能的病根（尚未证）；2–4 是之后要补的板级驱动，5 只是噪声。
+1 挡住桌面；6 是 1 最可能的病根（尚未证）；2–4 是之后要补的板级驱动，5 只是噪声（已定名且非瓶颈）。
+两连「静默、无 panic」复位与它是同一条线上的两个症状还是独立的坎，交给 r292 这靴的卡上窗口判。
 
 > 备注（时基）：r207 已核，环上的 `t=` 与 `mach_absolute_time` 一致，没有偏慢；
 > 早期「慢 50 倍」是基数除错的读法，已废弃。每靴 1800 s 的死线是本项目自设的无人值守

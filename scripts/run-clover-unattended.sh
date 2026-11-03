@@ -423,6 +423,13 @@ decoder="$(cd "$(dirname "$0")" && pwd)/read-clover-log.py"
   python3 "$decoder" --probe "$OUT" 2>/dev/null || echo "    no probe lines: this boot predates round212 or no kill was issued"
   echo "== kernel-log ring (lines the tee copied out of msgbuf, sectors 192..1215)"
   python3 "$decoder" --tee "$OUT" 2>/dev/null || echo "    no kernel-log records: this boot predates round176"
+  # Round292. The flight region carries CPU0's four-second beat and the last twelve block requests, each
+  # with its own CNTVCT-derived time, written by the driver straight to the card -- the only timestamped
+  # heartbeat that does not ride on msgbuf. It has been on the card since round210 and no round read it:
+  # boots 77 and 78 stopped with no panic record, and the reading that names what the block layer was doing
+  # at the stop (a beat that stopped, a request that never came back) was sitting unread in sectors 56..63.
+  echo "== flight region (beats, the last block requests, deadline and panic markers)"
+  python3 "$decoder" --flight "$OUT" 2>/dev/null || echo "    no flight records: this boot predates round210"
   echo "== boot counter (round212, sector 1216)"
   python3 "$decoder" --boot "$OUT" 2>/dev/null || echo "    no boot record: this boot predates round212"
 } | tee "$OUT.txt"

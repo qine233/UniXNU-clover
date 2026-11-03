@@ -2929,9 +2929,9 @@ def check_board(errors: list) -> str:
                                   "stale image gets mistaken for a new one")
             for needle in ('"clover r281: aks t=%u fire=%u stage=%d status=%x service=%llx owner=%s opens=%u calls=%u "',
                            '"refused=%u other=%u\\n"',
-                           '"clover r281: wdt t=%u nomap\\n"',
+                           '"clover r281: wdt t=%u nomap why=ctrl\\n"',
                            '"clover r281: wdt t=%u en=%x armed=%u intmask=%u sts=%x bark=%u bite=%u bark_ms=%u "',
-                           '"bite_ms=%u\\n"',
+                           '"bite_ms=%u why=%s\\n"',
                            '"clover r281: aks sel%u n=%u rc=%x\\n"',
                            '"clover r281: open %u pid=%d comm=%.16s\\n"',
                            '"clover r281: call %u pid=%d comm=%.16s sel=%u rc=%x\\n"',
@@ -2939,8 +2939,9 @@ def check_board(errors: list) -> str:
                            '#define CLOVER_AKS_ROWS        8',
                            '#define CLOVER_AKS_CALL_ROWS  12',
                            '#define CLOVER_AKS_FIRST_MS    240000u',
-                           '#define CLOVER_AKS_STATE_MS    120000u',
-                           '#define CLOVER_AKS_TABLE_EVERY 5',
+                           '#define CLOVER_AKS_STATE_MS      4000u',
+                           '#define CLOVER_AKS_STATE_EVERY     30',
+                           '#define CLOVER_AKS_TABLE_EVERY      5',
                            '#define CLOVER_WDT_PHYS        0x17817000ull',
                            '#define CLOVER_WDT_EN          0x08',
                            '#define CLOVER_WDT_STS         0x0c',
@@ -2986,6 +2987,16 @@ def check_board(errors: list) -> str:
         if '{ "clover r281: ", "r281-aks", 128, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci has no class for the repeating keystore rows: an unbudgeted "
                           "producer drops its rows silently, and this round's reading is the cadence itself")
+        # Round292 gives the watchdog row its own class and its own place in the table. teeProbeClass takes
+        # the first entry whose prefix matches, so "clover r281: wdt" has to sit ahead of "clover r281: " or
+        # every watchdog row is charged to the keystore's budget -- and a one-shot bark that loses its ring
+        # slot reads exactly like a boot whose watchdog never moved.
+        if '{ "clover r281: wdt", "r281-wdt", 48, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class of its own for the four-second watchdog rows: the "
+                          "row that has to survive a bite cannot share a budget with the keystore schedule")
+        elif sdhci_source.index('{ "clover r281: wdt"') > sdhci_source.index('{ "clover r281: "'):
+            errors.append("the r281-wdt class is listed after r281-aks: first match wins, so the watchdog rows "
+                          "would be counted against the keystore's cap and this round would not read")
         if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r281")' not in sdhci_source:
             errors.append("the r281 rows are not exempt from the per-pass push cap: the timer can fire beside "
                           "the census burst, where boot 36 measured the cap eating exactly that")
@@ -4657,8 +4668,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r291:"):
-        errors.append('[payload] title is not "clover r291: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r292:"):
+        errors.append('[payload] title is not "clover r292: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5771,8 +5782,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r291:"):
-        errors.append('[payload] title is not "clover r291: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r292:"):
+        errors.append('[payload] title is not "clover r292: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

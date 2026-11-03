@@ -918,6 +918,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // deadline, plus two table dumps of twenty-five rows each (four named selectors, eight opens, twelve calls,
   // one honesty row) is 105, and the cap is here so a runaway timer shows up as its own capped line instead of
   // crowding the census rows out. Separate from r276-ks so the two producers' counters stay apart.
+  // Round292 samples the watchdog every four seconds and prints on a change, with a repeated control row on
+  // every state fire so "no change" cannot be mistaken for "the timer died". The row moves out of r281-aks
+  // into its own class because the schedule it now keeps is the only one on the board that can be made of
+  // one-shot events: a bark that flips EN or STS once has to survive no matter how many keystore rows the
+  // same boot produced. 48 covers fifteen control rows and a thirty-row burst, which is more flips than a
+  // bite-and-reset boot can print, and the cap is where a chattering status register becomes its own reading.
+  { "clover r281: wdt", "r281-wdt", 48, 0, 0, 0 },
   { "clover r281: ", "r281-aks", 128, 0, 0, 0 },
   // Round286 is the GPU line's first writer, and like r281 it is a schedule rather than one
   // speaking time: one GCC row every fire plus, on the boot that runs the power sequence, the

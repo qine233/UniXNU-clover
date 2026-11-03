@@ -1123,8 +1123,8 @@ def check_sb_sample(kernel: bytes) -> bool:
              "aks-say-state": (b"clover r281: aks t=%u fire=%u stage=%d status=%x service=%llx owner=%s "
                           b"opens=%u calls=%u refused=%u other=%u\n") in kernel,
              "aks-say-wdt": (b"clover r281: wdt t=%u en=%x armed=%u intmask=%u sts=%x bark=%u bite=%u "
-                          b"bark_ms=%u bite_ms=%u\n") in kernel,
-             "aks-say-wdt-nomap": (b"clover r281: wdt t=%u nomap\n") in kernel,
+                          b"bark_ms=%u bite_ms=%u why=%s\n") in kernel,
+             "aks-say-wdt-nomap": (b"clover r281: wdt t=%u nomap why=ctrl\n") in kernel,
              "aks-say-sel": (b"clover r281: aks sel%u n=%u rc=%x\n") in kernel,
              "aks-say-open": (b"clover r281: open %u pid=%d comm=%.16s\n") in kernel,
              "aks-say-call": (b"clover r281: call %u pid=%d comm=%.16s sel=%u rc=%x\n") in kernel,

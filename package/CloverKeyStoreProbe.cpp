@@ -164,8 +164,15 @@ clover_aks_who(int *pid_out, char *name_out, size_t name_cap)
 #define CLOVER_AKS_ROWS        8
 #define CLOVER_AKS_CALL_ROWS  12
 #define CLOVER_AKS_FIRST_MS    240000u
-#define CLOVER_AKS_STATE_MS    120000u
-#define CLOVER_AKS_TABLE_EVERY 5
+// Round292 shortens the timer to four seconds and keeps every row it used to print on the same schedule:
+// a state row every thirtieth fire (120 s, as round281 scheduled it) and the tables every fifth state row.
+// The cadence is what changed. Boots 77 and 78 stopped with no panic record and no r289 trace, and the
+// reading that was supposed to name that -- the watchdog row -- spoke once every 120 s, so both stops
+// happened in a silent stretch (boot 78: the row came at 617 s, the board was gone at 718.84 s). A row
+// that must catch a one-shot flip has to be sampled at the flip's resolution.
+#define CLOVER_AKS_STATE_MS      4000u
+#define CLOVER_AKS_STATE_EVERY     30    // 30 x 4 s: the 120 s state row round281 scheduled
+#define CLOVER_AKS_TABLE_EVERY      5    // five state rows: the 600 s table dump round281 scheduled
 
 // The watchdog block the two TWRP facts name, and the downstream driver's offsets and tick rate. The
 // register numbers are quoted rather than guessed so a row that disagrees with them is a reading of a
@@ -193,6 +200,8 @@ static bool clover_aks_armed;
 static IOMemoryMap *clover_wdt_map;
 static volatile uint32_t *clover_wdt_regs;
 static bool clover_wdt_tried;
+static bool clover_wdt_have_last;
+static uint32_t clover_wdt_last_en, clover_wdt_last_sts, clover_wdt_last_bark, clover_wdt_last_bite;
 
 // Measured, not derived from the fire count: a row that says t= must be able to disagree with the beat
 // above it, or it is not a second reading of the same boot.
@@ -274,38 +283,61 @@ clover_aks_say(OSObject *owner, IOTimerEventSource *sender)
 {
     unsigned  t = clover_uptime_seconds();
     bool      tables;
+    bool      state;
     uint32_t  k;
 
     clover_aks_fires++;
-    tables = (clover_aks_fires % CLOVER_AKS_TABLE_EVERY) == 0;
+    // Round292 keeps round281's schedule on a four-second timer: the state row is every thirtieth fire, the
+    // tables every fifth state row. The first fire is a state row and a table row, which is the part of the
+    // change that buys a boot ending at 718 s -- the old schedule could not say anything about the keystore
+    // before 720 s, and a table that arrives after the stop is the reading round280 was built to avoid.
+    state = ((clover_aks_fires - 1) % CLOVER_AKS_STATE_EVERY) == 0;
+    tables = state && (((clover_aks_fires - 1) / CLOVER_AKS_STATE_EVERY) % CLOVER_AKS_TABLE_EVERY) == 0;
 
-    printf("clover r281: aks t=%u fire=%u stage=%d status=%x service=%llx owner=%s opens=%u calls=%u "
-        "refused=%u other=%u\n", t, (unsigned) clover_aks_fires,
-        (int) native_keyevents_stage, (unsigned) native_keyevents_status,
-        (unsigned long long) native_keyevents_service,
-        // getName() belongs to IOObject, not OSObject, and the owner the timer hands back is typed OSObject*;
-        // casting is what keeps the row honest about which service it is reporting on rather than printing a
-        // pointer twice under two names.
-        OSDynamicCast(IOService, owner) != NULL && OSDynamicCast(IOService, owner)->getName() != NULL
-            ? OSDynamicCast(IOService, owner)->getName() : "?",
-        (unsigned) native_aks_opens, (unsigned) native_aks_calls,
-        (unsigned) native_keyevents_refused_opens, (unsigned) native_aks_other_calls);
+    if (state) {
+        printf("clover r281: aks t=%u fire=%u stage=%d status=%x service=%llx owner=%s opens=%u calls=%u "
+            "refused=%u other=%u\n", t, (unsigned) clover_aks_fires,
+            (int) native_keyevents_stage, (unsigned) native_keyevents_status,
+            (unsigned long long) native_keyevents_service,
+            // getName() belongs to IOObject, not OSObject, and the owner the timer hands back is typed OSObject*;
+            // casting is what keeps the row honest about which service it is reporting on rather than printing a
+            // pointer twice under two names.
+            OSDynamicCast(IOService, owner) != NULL && OSDynamicCast(IOService, owner)->getName() != NULL
+                ? OSDynamicCast(IOService, owner)->getName() : "?",
+            (unsigned) native_aks_opens, (unsigned) native_aks_calls,
+            (unsigned) native_keyevents_refused_opens, (unsigned) native_aks_other_calls);
+    }
 
-    // The watchdog row, every fire, beside the state it belongs to: this is the hypothesis under test, and
-    // a row that only appears once would be the same mistake round280 made with the tables.
+    // The watchdog row: read every fire, printed when it changes and on every state row. The change is the
+    // thing the two silent stops could have come from, and a bite is a one-shot -- it does not wait for the
+    // next two minutes. The state row that repeats an unchanged value is what keeps `chg` absent readable:
+    // without it, no watchdog row means either nothing changed or the timer died, which is the distinction
+    // round281 was built to make and round292 must not lose by shortening the schedule.
     clover_wdt_open();
     if (clover_wdt_regs == NULL) {
-        printf("clover r281: wdt t=%u nomap\n", t);
+        if (state) {
+            printf("clover r281: wdt t=%u nomap why=ctrl\n", t);
+        }
     } else {
         uint32_t en = clover_wdt_read(CLOVER_WDT_EN);
         uint32_t sts = clover_wdt_read(CLOVER_WDT_STS);
         uint32_t bark = clover_wdt_read(CLOVER_WDT_BARK);
         uint32_t bite = clover_wdt_read(CLOVER_WDT_BITE);
+        bool changed = !clover_wdt_have_last || en != clover_wdt_last_en || sts != clover_wdt_last_sts ||
+            bark != clover_wdt_last_bark || bite != clover_wdt_last_bite;
 
-        printf("clover r281: wdt t=%u en=%x armed=%u intmask=%u sts=%x bark=%u bite=%u bark_ms=%u "
-            "bite_ms=%u\n", t, en, en & 1u, (en >> 1) & 1u, sts, bark, bite,
-            (unsigned) ((uint64_t) bark * 1000ull / CLOVER_WDT_HZ),
-            (unsigned) ((uint64_t) bite * 1000ull / CLOVER_WDT_HZ));
+        if (changed || state) {
+            printf("clover r281: wdt t=%u en=%x armed=%u intmask=%u sts=%x bark=%u bite=%u bark_ms=%u "
+                "bite_ms=%u why=%s\n", t, en, en & 1u, (en >> 1) & 1u, sts, bark, bite,
+                (unsigned) ((uint64_t) bark * 1000ull / CLOVER_WDT_HZ),
+                (unsigned) ((uint64_t) bite * 1000ull / CLOVER_WDT_HZ),
+                !clover_wdt_have_last ? "first" : (changed ? "chg" : "ctrl"));
+            clover_wdt_last_en = en;
+            clover_wdt_last_sts = sts;
+            clover_wdt_last_bark = bark;
+            clover_wdt_last_bite = bite;
+            clover_wdt_have_last = true;
+        }
     }
 
     if (!tables) {
