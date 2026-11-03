@@ -1,0 +1,23 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -13704,6 +13704,20 @@
+ 		clover_census_seq++;
+ 		clover_census_rows = 0;
+ 		clover_bb_chain_hops = 0;
++		/*
++		 * Round306. One row printed by the console path alone, between the three counters and the fire
++		 * row, and deliberately not through clover_census_row. Boot 95 left the relay unattributed: the
++		 * same relay carried every kill-scene row on boot 94 and nothing on boot 95, and "the walk never
++		 * reached the fire" sat beside "the relay refused everything" as one absence. A copy of "got here"
++		 * that rides the pipe under audit is not a copy -- round301 learned that on boot 90, where the
++		 * fire and done rows went missing together with the rows they were supposed to bracket.
++		 * The fields are the fire row's own t=/seq=/pid=/th=/hidden= so the two read field for field:
++		 * a step with no fire row anywhere names the snprintf and clover_census_row as the interval, and
++		 * no step row names whatever sits above the counters instead.
++		 */
++		printf("clover r306: step t=%llu seq=%llu pid=%d th=%u hidden=%u\n",
++		    (unsigned long long)secs, (unsigned long long)clover_census_seq, pid, cn,
++		    (call > cn) ? call - cn : 0);
+ 		{
+ 			char crow[256];
+ 			int crowlen = snprintf(crow, sizeof(crow),

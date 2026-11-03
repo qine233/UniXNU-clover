@@ -415,6 +415,47 @@ leave」一路收紧到一句可测的话：
   印条件加一支 `calls>0 而 wrote=0`；② 给「走到了」加一条**不经中转**的副本——`:13705` 三次自增之后、`snprintf(fire)`
   之前放一条裸 `printf` 的 step 行（要测的正是中转，副本不能骑在被测管道上）；另有 `drained=` 归属债与仍欠的
   smp-off 同镜像控制轮。详见 `notes/development-log.md` §Round305 读数。
+* **r306（v0.7.16，把上一段预登记的两条一次付清：一次沉默的三种形状各拿一枚数）**。**内核**
+  `patches/xnu-clover/zzz(63)-clover-r306.patch`（只改 `osfmk/kern/task.c`）：`clover_bb_chain_hops = 0;` 之后、
+  `snprintf(fire)` 之前放一条**裸 printf** 的 step 行（`task.c:13718`：`clover r306: step t= seq= pid= th= hidden=`），
+  `th=` 是真打出去的线程行数、`hidden=` 是 `call - cn`（打算打而没打成），所以「走没走到」与「走到后打了几个」被这一行
+  自己分开。**两处刻意的不做**：不走 `clover_census_row`（本轮要测的正是中转，副本不能骑在被测管道上），不进 tee 豁免
+  （它靠 `"clover r"` 通配过筛，走 printf→msgbuf→tee→内核环 kind-22，与尾巴那两族不同源，因此是真正的第二条腿）。
+  **驱动**三件：`probeFlush` 那条合并门槛 `if (!gVerdictFirst || !gHost || gRingBusy[kRingDriver]) return 0;` 拆成
+  命名分支 `gProbeBlocked[3]` = `unarmed`/`host`/`busy`（`:525`，**累计不清零**——两个读者，清零会决定另一个看到什么），
+  并在**退出点本身**用 `teeSay` 出声（`:4980`，上限 `kProbeSilenceSayMax=4`：`teeSay` 只写驱动自己的 RAM 环，无锁、
+  不睡、不碰卡，这正是它被允许站在一条「按定义做不了块写」的路径上的原因）；生产者侧两条早退也计数——空串/零长
+  `gProbeEmptySay`（`:3598`）、超长截断 `gProbeCutSay`（`:3604`）；报告行的印条件加第三支 `nothing = calls>0 &&
+  flushed==0`（`:5049`，上限 4），并把这五个数复制进块尾报告行末尾的 `blocked=%u/%u/%u empty=%u cut=%u`（`:5066`）。
+  残留限制写进注释而不假装解掉：`unarmed` 那一支的沉默行自己也上不了卡，但计数不清零，下一靴（窗口上膛后）照样读得到。
+  契约：tee 类 `{ "clover r306: ", "r306-step", 64 }`（`:1115`）+ 豁免 `teeHasPrefix (…, "r306")`（`:4656`），
+  `check-clover.py` 钉住两条负断言（合并门槛必须已不在、`CloverSdhci r304: probe` 这个 token 必须已不在）并把 step 行的
+  「不许走中转」检查**只看代码行**（注释里提一下函数名就会误报），`verify-clover-payload.py` 的 `probe-beat-flush`
+  换成整条新格式串并新增 `probe-silent`/`census-step`。r306 在 `LATE_PATCH` 必须先于 r305 与 r304 反打。
+  详见 `notes/development-log.md` §Round306。
+* **boot 96（r306 / v0.7.16 的读回）：中转第一次被证明「这一靴一次都没被人叫过」，而那句沉默从 29 行夹到
+  21 行、并且不再是地平线问题。** 冷刷 `round306-v0.7.16-payload.img`（`9a5e9bbf…`，58,720,256 B；内核
+  `05762cb2`→AMFI `5d4e3afd`→归一化 `f1586403`→卡内 `32287fdc`），boot 95→96，落回 TWRP。① **新支 `nothing` 一靴说了 4 次**：
+  `CloverSdhci r306: probe why=tail wrote=0 seen=0 pend=0 flushed=0 … starve=0/0/50/1 pio=0/0/0@0 ch=0
+  blocked=0/0/0 empty=0 cut=0` ⇒ 三个门槛一次没走、生产者一次没被喂空串或超长、中转**一行都没进过**；boot 95 的
+  三种形状里 (乙)「中转拒收」与 (丙)「消费者卡在门槛前」被这两枚数**同时排除**，只剩「没人往里放」。
+  第二条腿独立成立：sink 自己读的 `drain enter boot=96 … tee=1 append_rc=4 probe_seen=0` 也是 0（一枚累计不清零的数、
+  两个时刻、两个读者）。② **step 行 0 条，但这条缺席站得住**：卡上最新一行是 `[576.330721] r299`，而 step 在
+  `task.c:13718`、`clover_census_row` 在 `:13728` ⇒ 停点夹在 **`:13703` 的 `}` 与 `:13728` 那次中转调用**之间（里面只有三次
+  自增＋两条 printf）。它不是「印了没搬走」：卡上已有 `r299` ⇒ tee 游标已在它之后；sink 又跑了 `kPanicTeePasses=8` 趟
+  `teeKernelLog()`（32 KiB 余量 vs 那一拍只写了约 1 KiB）；step 一族在 tee 豁免列里不受每趟 16 条上限；且 sink 之后
+  的卡写被证明接受（`drain enter` 自己上了卡）。③ **sink 与普查仍在同一枚钟的同一秒**：marker `t=564223ms k=576s
+  arming_offset=11777ms magic=yes rc=0` vs 普查头行 `[576.330590]`；`kernelSeconds()` 只有 1 s 分辨率（四拍 offset
+  11991/11989/11987/11974 与 marker 的 11777 之差就是这枚截断），**先后仍不断言**。句子仍没落地（`append_rc=4`、
+  零条 boot-96 的 kind-20）。④ **本轮仪器自己被抓到一处失明**：`nothing` 的上限是全局 4 次，被 `why=tail` 花光，
+  于是**在现场那一趟跑的 `why=drain` 一条都没能说出口**——限量出声的报告，预算必须按「谁在说」分。⑤ 八核**第九靴、
+  跨八枚镜像**复现（`real=8 reg=8 start=7 run=8`、`req=1 con=1 run=7 st=07777777`、`sent=278476 recv=278361`、头行
+  `threads=16 shown=16 hidden=0 wait=16 run=0`）；死线记录仍是 boot 87 那枚 ⇒ 本靴没跑到 1800 s；`r283: last reset
+  unnamed`＝**第十起无名静默复位**，带 642.7/~645/661/746/835/555/742/617/**576**，`charger_temp=337`。桌面主线**仍无读数**。
+  **下一手 r307（三条）**：① `nothing` 预算按 `why` 分（`tail`/`beat`/`drain` 各一份）并带上 `calls=`/`probe_seen=`；
+  ② 在 `:13707` 三次自增之后再放一条**走 kind-25 的 `clover r307: pre` 副本**——中转已被证明是没被人叫过的旁观者，
+  现在被测的管道是内核日志/tee，所以这条副本合法，两支一比就能把「没印」与「印了没搬走」彻底切开；③ **控制轮正式跑**
+  （同一枚 r307 镜像两次，第二次 `armcpu-smp=0`）。详见 `notes/development-log.md` §Round306 读数。
 * **这两条仪器债已由 r303 结清**（原文曾记作「本格欠着」）：`vbits=` 现以 r298 行末的 `vb_r=`/`vb_v=` 落地
   （`ipc_right_lookup_read()` 已经交出的 entry 位掩码，用来分 port set / send-once / 死名，不需要对象、锁纪律与
   translate 同一条），`cap=send` 行的 `qmc=/qsr=` 也带上了自己的返回码 `qerr=`。

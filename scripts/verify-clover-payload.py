@@ -1333,9 +1333,16 @@ def check_sb_sample(kernel: bytes) -> bool:
              "census-relay-onecopy": all(kernel.count(marker) == 1 for marker in (
                  b"clover r262: th tid=", b"clover r300: fire t=", b"clover r300: done t=",
                  b"clover r296: hop=", b"clover r298: hop=", b"clover r303: hop=")),
-             "probe-beat-flush": (b"CloverSdhci r304: probe why=%s wrote=%u seen=%u next=%u pend=%u"
+             "probe-beat-flush": (b"CloverSdhci r306: probe why=%s wrote=%u seen=%u next=%u pend=%u"
                                   b" flushed=%u skipped=%u stalled=%u refused=%u dropped=%u"
-                                  b" starve=%u/%u/%u/%u pio=%u/%x/%u@%u ch=%u\n") in kernel,
+                                  b" starve=%u/%u/%u/%u pio=%u/%x/%u@%u ch=%u"
+                                  b" blocked=%u/%u/%u empty=%u cut=%u\n") in kernel,
+             # Round306. Two more shapes, because boot 95 showed that a relay with nothing pending is
+             # silent in exactly the same way as a relay that was refused, and a consumer that stops at
+             # its own guard never reaches the line above at all.
+             "probe-silent": (b"CloverSdhci r306: probe silent why=%s guard=%s seen=%u next=%u"
+                              b" flushed=%u blocked=%u/%u/%u empty=%u cut=%u\n") in kernel,
+             "census-step": (b"clover r306: step t=%llu seq=%llu pid=%d th=%u hidden=%u\n") in kernel,
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,

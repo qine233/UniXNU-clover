@@ -504,6 +504,32 @@ static const uint32_t kProbeSealRetries = 4;  // passes to wait for a seal befor
 static const uint32_t kProbeBacklogEvery = 64;  // passes between backlog reports
 static const uint32_t kProbeReportsMax = 64;
 
+/*
+ * Round306. Boot 95 answered with the relay's own silence -- no kind-25 record, no report line -- and
+ * three different causes read identically: the window was never armed, the host was taken every time a
+ * consumer looked, and the kernel never called. The first two are the guard this function returns
+ * before doing anything, so on those two boots the pass counter that the report line reads stays at
+ * zero and the line never runs at all; the third is indistinguishable from either. Count each exit
+ * where it happens and say the line from the exit itself, the way round289's abort row is said by the
+ * handler rather than by a later pump: a status row that prints whatever it wrote is a status row that
+ * can only be silent because nothing ran.
+ *
+ * The producer's two early exits are counted beside them. `clover_emmc_probe_say` refuses an empty
+ * line and cuts a long one, and a cut row is not a missing row -- it is a row whose tail is missing,
+ * which is the difference between "the census stopped" and "the census row was too wide for the relay".
+ */
+static const uint32_t kProbeBlockUnarmed = 0;   // no verdict window yet
+static const uint32_t kProbeBlockHost = 1;      // the block host belongs to somebody else
+static const uint32_t kProbeBlockBusy = 2;      // this ring's own flush is in progress
+static const uint32_t kProbeBlockCount = 3;
+static volatile uint32_t gProbeBlocked[kProbeBlockCount] = {0, 0, 0};
+static volatile uint32_t gProbeEmptySay = 0;    // callers that handed the relay nothing to carry
+static volatile uint32_t gProbeCutSay = 0;      // callers whose row exceeded the relay's text slot
+static uint32_t gProbeSilenceSay = 0;           // guard-exit report lines said
+static uint32_t gProbeNothingSay = 0;           // "a consumer ran and nothing has ever been delivered" lines said
+static const uint32_t kProbeSilenceSayMax = 4;  // bounded: this is a state line, not a stream
+static const uint32_t kProbeNothingSayMax = 4;
+
 // Round210: the flight region. Round209 proved the kernel was alive at the 900 s deadline while the
 // card accepted nothing -- the report window got no record and the rings got no drain -- so the one
 // question left is which transfer stopped, and whether the controller still held CMD/DAT inhibit
@@ -1081,6 +1107,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // receiving side -- the same false-empty r298's 128 budget and exemption were set to stop. Same budget, same
   // exemption below.
   { "clover r303: ", "r303-hop", 128, 0, 0, 0 },
+  // Round306 prints one row per census fire, between the three counters and the fire row, and it is the
+  // only copy of "the walk reached this statement" that does not ride the relay being audited. Its value
+  // is entirely in being present or absent beside the fire row, so a throttled step row would restore the
+  // exact ambiguity r304 and r305 were written to remove. One row per fire, so 64 is headroom for an
+  // 1800 s deadline, and the class is separate so a missing step row cannot read as a missing census.
+  { "clover r306: ", "r306-step", 64, 0, 0, 0 },
   // Round289 speaks only at a fatal data abort, and it is the reading the panic record cannot carry:
   // the kind-20 slot is 480 bytes, and boot 74 and boot 75 both showed it cut off inside the register
   // list, before esr, far, fp and sp -- the four fields that name a fault. At most one abt row and two
@@ -3563,9 +3595,13 @@ static void kernelRingPush (const char *line, uint32_t length)
 extern "C" unsigned int clover_emmc_probe_say (const char *text, unsigned int length)
 {
   if (!text || !length) {
+    __atomic_fetch_add (&gProbeEmptySay, 1u, __ATOMIC_RELAXED);
     return 0;
   }
   if (length > kProbeTextBytes - 1) {
+    // Round306: counted, because a row that arrived at the card with its tail missing is a different
+    // fact from a row that never arrived, and only this side of the copy can tell them apart.
+    __atomic_fetch_add (&gProbeCutSay, 1u, __ATOMIC_RELAXED);
     length = kProbeTextBytes - 1;
   }
   const uint32_t seq = __atomic_fetch_add (&gProbeSeq, 1u, __ATOMIC_RELAXED);
@@ -4612,7 +4648,12 @@ static void teeConsumeLine (uint32_t &pushed)
        // translated a name on the r298 row but never reported what that name is in the receiver's space reads as
        // "the receiver has nothing", which is the false-empty r298 was exempted for, one layer onto the peer. The
        // class budget of 128 still bounds it, the same headroom r298 holds for the same per-hop producer.
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r303"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r303") ||
+       // Round306's step row is the negative control for the relay: it says the walk reached the statement
+       // between the counters and the fire row, and it is printed by the console path only, on purpose. If
+       // the per-pass cap ate it, a boot would report neither copy of "got here" and read like a fire that
+       // never started -- the false-empty this exemption exists to stop, one layer under the relay.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r306"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.
@@ -4916,7 +4957,42 @@ static uint32_t panicRingFlush (uint32_t which)
 // the card accepted.
 static uint32_t probeFlush (const char *why, uint32_t cap)
 {
-  if (!gVerdictFirst || !gHost || gRingBusy[kRingDriver]) {
+  uint32_t blocked = kProbeBlockCount;
+  if (!gVerdictFirst) {
+    blocked = kProbeBlockUnarmed;
+  } else if (!gHost) {
+    blocked = kProbeBlockHost;
+  } else if (gRingBusy[kRingDriver]) {
+    blocked = kProbeBlockBusy;
+  }
+  if (blocked != kProbeBlockCount) {
+    /*
+     * Round306. The exit is where the reading has to be said: a consumer that returns here never
+     * reaches the report below, so its pass counter stays zero and a whole boot can be silent for a
+     * reason that only this line is standing where it can name. teeSay is a producer -- it writes the
+     * driver's own RAM ring, no lock, no sleep, no card -- which is what lets it be said from a path
+     * that by definition could not do a block write. If the window is not armed, this row cannot reach
+     * the card either, and then the frame is empty in a way that says so beside it.
+     */
+    __atomic_fetch_add (&gProbeBlocked[blocked], 1u, __ATOMIC_RELAXED);
+    if (gProbeSilenceSay < kProbeSilenceSayMax) {
+      gProbeSilenceSay++;
+      teeSay ("CloverSdhci r306: probe silent why=%s guard=%s seen=%u next=%u flushed=%u"
+              " blocked=%u/%u/%u empty=%u cut=%u\n",
+              why, blocked == kProbeBlockUnarmed ? "unarmed"
+                   : (blocked == kProbeBlockHost ? "host" : "busy"),
+              static_cast<unsigned int> (__atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED)),
+              static_cast<unsigned int> (__atomic_load_n (&gProbeNext, __ATOMIC_RELAXED)),
+              gProbeFlushed,
+              static_cast<unsigned int> (__atomic_load_n (&gProbeBlocked[kProbeBlockUnarmed],
+                                                           __ATOMIC_RELAXED)),
+              static_cast<unsigned int> (__atomic_load_n (&gProbeBlocked[kProbeBlockHost],
+                                                          __ATOMIC_RELAXED)),
+              static_cast<unsigned int> (__atomic_load_n (&gProbeBlocked[kProbeBlockBusy],
+                                                          __ATOMIC_RELAXED)),
+              static_cast<unsigned int> (__atomic_load_n (&gProbeEmptySay, __ATOMIC_RELAXED)),
+              static_cast<unsigned int> (__atomic_load_n (&gProbeCutSay, __ATOMIC_RELAXED)));
+    }
     return 0;
   }
   gProbeCalls++;
@@ -4965,19 +5041,31 @@ static uint32_t probeFlush (const char *why, uint32_t cap)
   const uint32_t seen = __atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED);
   const uint32_t next = __atomic_load_n (&gProbeNext, __ATOMIC_RELAXED);
   const uint32_t pend = seen - next;
+  // Round306's third branch. The two that were here both need something in flight: a burst that landed,
+  // or a backlog to report every 64 passes. Boot 95 had neither -- the queue was empty every time a
+  // consumer looked -- so a relay that never carried a single row said nothing at all, which is the same
+  // silence as a relay that was never asked. "A consumer ran, and nothing has ever been delivered" is
+  // its own reading and gets its own bounded line.
+  const bool nothing = gProbeCalls && !gProbeFlushed && gProbeNothingSay < kProbeNothingSayMax;
   // Two readings, and the pair is the point. `wrote` with nothing left pending says a burst the kernel
   // handed over reached the card, with the numbers to prove it. `pend` with a write that has not moved
   // says the opposite: the rows exist in BSS and are not on the card, which is what boot 93 could only
   // infer from the absence of everything. Both are bounded so a boot cannot fill its own ring with them.
   if (gProbeReports < kProbeReportsMax &&
-      ((wrote && !pend) || (pend && gProbeCalls % kProbeBacklogEvery == 0))) {
+      ((wrote && !pend) || (pend && gProbeCalls % kProbeBacklogEvery == 0) || nothing)) {
+    if (nothing) {
+      gProbeNothingSay++;
+    }
     gProbeReports++;
     // Round305 appends the beat's starvation and the last refused block write to this line, in front of
     // nothing that was already here: the beat cannot report them when it is the thing being starved, and
     // boot 94's five reports are the only consumer on that boot that ever ran. A reader that sees the
     // same starve= pair twice -- here and in the next beat record -- is seeing one counter, not two.
-    teeSay ("CloverSdhci r304: probe why=%s wrote=%u seen=%u next=%u pend=%u flushed=%u skipped=%u"
-            " stalled=%u refused=%u dropped=%u starve=%u/%u/%u/%u pio=%u/%x/%u@%u ch=%u\n",
+    // Round306 appends the guard exits and the producer's own two exits, so the line that used to be
+    // silent whenever nothing was pending now says which side never spoke.
+    teeSay ("CloverSdhci r306: probe why=%s wrote=%u seen=%u next=%u pend=%u flushed=%u skipped=%u"
+            " stalled=%u refused=%u dropped=%u starve=%u/%u/%u/%u pio=%u/%x/%u@%u ch=%u"
+            " blocked=%u/%u/%u empty=%u cut=%u\n",
             why, wrote, seen, next, pend, gProbeFlushed, gProbeSkipped, gProbeStalled,
             gProbeRefused, static_cast<unsigned int> (__atomic_load_n (&gProbeDropped,
                                                                        __ATOMIC_RELAXED)),
@@ -4985,7 +5073,15 @@ static uint32_t probeFlush (const char *why, uint32_t cap)
             static_cast<unsigned int> (__atomic_load_n (&gBeatStarved[kBeatPanic], __ATOMIC_RELAXED)),
             static_cast<unsigned int> (__atomic_load_n (&gBeatStarved[kBeatYoung], __ATOMIC_RELAXED)),
             static_cast<unsigned int> (__atomic_load_n (&gBeatStarved[kBeatHeld], __ATOMIC_RELAXED)),
-            gPioFailCode, gPioFailStatus, gPioFailWords, gPioFailMs, gPioFailAttempt);
+            gPioFailCode, gPioFailStatus, gPioFailWords, gPioFailMs, gPioFailAttempt,
+            static_cast<unsigned int> (__atomic_load_n (&gProbeBlocked[kProbeBlockUnarmed],
+                                                        __ATOMIC_RELAXED)),
+            static_cast<unsigned int> (__atomic_load_n (&gProbeBlocked[kProbeBlockHost],
+                                                        __ATOMIC_RELAXED)),
+            static_cast<unsigned int> (__atomic_load_n (&gProbeBlocked[kProbeBlockBusy],
+                                                        __ATOMIC_RELAXED)),
+            static_cast<unsigned int> (__atomic_load_n (&gProbeEmptySay, __ATOMIC_RELAXED)),
+            static_cast<unsigned int> (__atomic_load_n (&gProbeCutSay, __ATOMIC_RELAXED)));
   }
   return wrote;
 }
