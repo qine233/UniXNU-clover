@@ -564,6 +564,33 @@ leave」一路收紧到一句可测的话：
   控制轮镜像已构建待刷：`round308-smp0-control-payload.img` sha256 `9354aec6…`，内核仍是同一枚 `7e669d95`、
   `payload.json` 的 `kernel_args` 里 `armcpu-smp=0` 在而 `=1` 不在。读数写在
   `notes/development-log.md` §boot 99 读数 ①–⑦。⑦ 记的是本轮自己踩到的发版纪律：`board.toml` 的 `payload.title` 会烤进镜像里的 `unixnu.toml`，而 `verify-clover-payload` 拿两者**逐字比相等**，所以读数落盘那一版不许动它——标题已恢复成 `ae4baa8a` 里真正带着的那段文本。代价如实记着：控制轮镜像 `9354aec6` 的标题比它多一个撇号（两枚内核同为 `7e669d95`，参数只差 `armcpu-smp`，而那枚标题只有引导侧清单会读）。
+* **boot 100（v0.7.18 镜像的控制轮，`armcpu-smp=0`，单核）：控制轮第一次成立，而它把题从「尾巴断在哪一行」换成「门开在两次心跳之间」**。
+  判据两半都复核过：卡上 kind-25 有 **3 枚本靴自己的** `clover r308: beat`（slot 44/49/51，`t=177/297/418`），逐字
+  `target=0 ent=0 fired=0 … reg=1 start=0 run=1`；`armcpu-smp=0` 同时看得见两处——`round308-smp0-payload.json` 的
+  `kernel_args`（**一枚整串，不是列表**，第一次按列表遍历得空集是查法错）与镜像里那份 `unixnu.toml` 的字节
+  `… armcpu-smp=0"`，`=1` 不在场。第十二层就此结清：**裁判没坐在被审的那条腿上**。
+  世代仍按每槽 `boot N` 头分（窗里留着 boot 99 的 8 枚 kind-25＋3 枚 kind-21，其中 4 枚 `beat … reg=8 start=7`——
+  按文本搜会把八核读数读进单核靴）；本靴自己＝512 行 kind-22（seq 961→1472 连续）、54 行 kind-21、6 行 kind-25，
+  中转账 `seen=3 next=3 flushed=3 dropped=0`。**门**读全了：`clover_bb_sample()` 全树只有 `task.c:11290` 一处被叫，
+  条件 `clover_bb_target_pid != 0`，而那枚闩锁只在被采样的 SpringBoard 批次里出现 `ro=<pid>:backboardd` 时合上
+  （`:14498…14509`，SpringBoard 换代时在 `:11133` 清零）⇒ 十一靴「普查一族 0 行」第一次有名字：不是 tee、不是核数、
+  不是管道，是那枚闩锁。**本靴那扇门开过一次**（`r221 … t=433 ro=58:backboardd`），而下一枚能说出 `ent≥1` 的 beat 行
+  按 120 s 印点在 538 s、靴死在 ~477 s——**这一格既不许读成「跑了没上卡」，也不许读成「门没开」**，缺的是心跳。
+  顺带更正 boot 99 §②：那句「全窗口搜 `backboard` 命中 0」的**证据不成立**（环只覆盖 772→1714 s），结论改用
+  地平线之外的 `ent=0` 十枚托底；规矩补一条：**窗口 grep 数得出在场的，数不出本该在场而没来的**。
+  复位时机上单核没把结束推后（98/100 靴 525.0/477.1 s，八核一族 490.5–1816 s 且 boot 97 也在 490.5 s 收，两分布重叠；
+  n=2、不建因果）。**桌面那一格把一条错话当场掐掉**：全靴普查（表在 dev-log §⑧）显示 boot 88–98 **每靴 28–34 枚
+  `r180: client pid=58`、`presented=` 最大 2–4**，boot 99 的 0 枚是地平线不是「没有」；本靴 3 帧逐字落地
+  （`bytes=9216000`＝1920×1200 RGBA、`ff000000` 占 **98.1%**、非黑 41,548 px 围在 `box=305x887..755x1029`，
+  boot 98 同一枚盒子还在长到 `305x811..970x1108`/45,460 px）⇒ 屏上是内容、但**不是桌面**；桌面那一格现在欠的是
+  **画面本身**，不是又一枚计数。**还抓到一枚真 bug**：`r170` 的 exec/exit 两行 `clock_get_uptime()` 之后直接
+  `/1000000000ULL`（`kern_exec.c:2050`、`kern_exit.c:1519`），而本板计时器 19,267,584 Hz、`clock_get_uptime()` 给的是
+  tick ⇒ `t=` 被压掉 **51.90 倍**（实测 `t=4s` 落在环 229.6–251.9 s、`t=7s` 落在 390.5 s），
+  **`r170` 一族全部 `t=` 读数作废**（pid/comm/ppid/rv/code 不受影响），那两行注释里「靠时间戳看循环快慢」的用途
+  从来没成立过；修它必须连着升 token（同名行换了单位）。**下一手 r309 四件已预登记**（真秒的 `r309: exec/exit`、
+  闩锁自己的 `r309: latch`、普查入口出口的 `r309: cen-in/cen-out`、排干入口的 `r309: drain-in`）
+  加 boot 102 四支甲乙丙丁与 boot 101（同镜像八核复现，已在跑）只看 `ro=` 的两支。读数与表全在
+  `notes/development-log.md` §boot 100 读数 ①–⑩。
 * **这两条仪器债已由 r303 结清**（原文曾记作「本格欠着」）：`vbits=` 现以 r298 行末的 `vb_r=`/`vb_v=` 落地
   （`ipc_right_lookup_read()` 已经交出的 entry 位掩码，用来分 port set / send-once / 死名，不需要对象、锁纪律与
   translate 同一条），`cap=send` 行的 `qmc=/qsr=` 也带上了自己的返回码 `qerr=`。
