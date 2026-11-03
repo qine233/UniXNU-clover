@@ -191,12 +191,21 @@ header_version = 0
 volume = "CLOVERESP"
 size_mib = 56
 loader = "firmware"
-# Round289 changes no configuration key and adds no boot arg: the title names the round, the kernel
-# half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into ~/UniXNU/patches/xnu/, and the
-# driver half is the r289-abt tee class with the per-pass cap exemption. What it adds is the field
-# both data aborts lacked -- esr, far, fp and the fault's own frame chain -- because the 480-byte
-# panic record stopped inside the register list and the lr it did carry names nothing.
-title = "clover r289: the data abort's own backtrace. Boot 74 died in _memmove at about 1420 s and boot 75 in the cold path of IOSKArena::unmap at about 880 s, both with the same lr, and all either left behind was what a 480-byte panic slot could carry: pc, lr and x0..x14, cut off before esr, far, fp and sp. That lr resolves to nothing -- it sits in the 12 MB of this kernel's symbol table between the absolute _native_legacy_* hook values where no symbol exists -- so the caller was the one field the record never had room for, and r249's lesson restated for a fatal is \"a reading the channel cannot carry is a fault with no name.\" panic_with_thread_kernel_state is the only function in XNU holding the whole saved state, so the fault now speaks from there: an abt row with pid, tid, pc, lr, fp, sp, esr, far, cpsr and the stack bounds, then up to twelve return addresses walked from the fault's own fp by r211's bounded walker. Boot 76's reading is a name, not a correlation."
+# Round290 is the GPU parallel line, and it changes no configuration key either: kernel_args and the
+# deadline stay exactly as round287 left them, and the kernel half is still round289's abort trace.
+# What the driver half adds is the field boot 74 lacked -- the halt bit. r286's gpucc row printed each
+# branch's enable request (BIT(0)) and called it gfx3d_en, but a Qualcomm branch also answers with
+# BIT(31) (mainline clk-branch.h:59 CBCR_CLK_OFF, halt_check BRANCH_HALT means 1 = halted), so boot
+# 74 said "gfx3d was asked for" without ever saying "gfx3d runs". This round reads that bit on all four
+# GPUCC branches, adds the two votes the DT's own clock list still owed (rbcpr 0x1054, rbbmtimer
+# 0x10d0 -- notes/gpu-bringup.md §5.2), and keeps the RCG words raw because no round here sets a rate.
+title = "clover r290: does the GPU clock actually run, or was it only asked? Boot 74 read gfx3d_en=1 and gx_on=0, and the row could not tell anything more: an enable request is BIT(0) of a branch, the halt state is BIT(31) (mainline clk-branch.h:59 CBCR_CLK_OFF, and BRANCH_HALT means a 1 there is halted), and r286 printed only the request. So this round reads en and halt for every GPUCC branch, opens the two votes the board's own clock list still owed -- rbcpr at 0x1054 and rbbmtimer at 0x10d0, which notes/gpu-bringup.md §5.2 shows no round of ours ever touched -- and keeps the three RCG command words raw, because a round that sets no rate must not decode one. The parent table is now sourced, and it also retracts the boot 74 reading: CMD_SRC_SEL=0 is XO, not \"no source\"."
+# The round below still stands as written: round289 changed no configuration key and added no boot
+# arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
+# ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
+# and what it added was the field both data aborts lacked -- esr, far, fp and the fault's own frame
+# chain -- because the 480-byte panic record stopped inside the register list and the lr it did carry
+# names nothing. Round290 leaves all of that in the image and adds the GPU rows above.
 dram_size = "0x80000000"
 # After the menu there is no serial console on this board, so the panel is the
 # only output: the entry probe paints DarwinBoot's stage bar and the kernel's

@@ -3056,7 +3056,22 @@ def check_board(errors: list) -> str:
                     ("\"clover r286: gpu t=%u chipid=%08x expect=%08x ok=%u", "CloverGpu.cpp", gpu_source),
                     ("\"clover r286: gpu t=%u chipid skipped cx_on=%u gx_on=%u gfx3d_en=%u",
                      "CloverGpu.cpp", gpu_source),
-                    ("\"clover r286: gpu t=%u core map failed phys=%llx", "CloverGpu.cpp", gpu_source)):
+                    ("\"clover r286: gpu t=%u core map failed phys=%llx", "CloverGpu.cpp", gpu_source),
+                    # Round290's own reading: the halt bit, which r286 never carried. The header has to
+                    # hold both new branch offsets and the two RCG words it prints raw, the source has to
+                    # ask for the two votes the DT's clock list still owed, and the row has to name its
+                    # stage so a "post" and a "beat" can be told apart by the decoder.
+                    ("#define kGpuccRbcprEn       0x1054U", "GpuRegs.h", gpu_regs),
+                    ("#define kGpuccRbbmtimerEn   0x10d0U", "GpuRegs.h", gpu_regs),
+                    ("#define kGpuccRbcprRcg      0x1030U", "GpuRegs.h", gpu_regs),
+                    ("#define kGpuccRbbmtimerRcg  0x10b0U", "GpuRegs.h", gpu_regs),
+                    ("#define kBranchClkOff       0x80000000U", "GpuRegs.h", gpu_regs),
+                    ("clover_gpu_set_bits(clover_gpu_gpucc, kGpuccRbcprEn, 1);", "CloverGpu.cpp", gpu_source),
+                    ("clover_gpu_set_bits(clover_gpu_gpucc, kGpuccRbbmtimerEn, 1);", "CloverGpu.cpp", gpu_source),
+                    ("clover_gpu_report_branches(t, \"post\");", "CloverGpu.cpp", gpu_source),
+                    ("clover_gpu_report_branches(t, \"beat\");", "CloverGpu.cpp", gpu_source),
+                    ("\"clover r290: gpu t=%u branches %s gfx3d=%u/%u cxo=%u/%u rbcpr=%u/%u rbbm=%u/%u \"",
+                     "CloverGpu.cpp", gpu_source)):
                 if needle not in text_:
                     errors.append(f"{where} lacks {needle[:64]!r}: round286's rows are the reading that "
                                   "decides the next GPU round, and every constant in them came from the "
@@ -3097,6 +3112,17 @@ def check_board(errors: list) -> str:
         if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r286")' not in sdhci_source:
             errors.append("the r286 rows are not exempt from the per-pass push cap: the GPU timer can fire "
                           "beside the census burst, where boot 36 measured the cap eating exactly that")
+        # Round290 reuses the r286 class's producer but its own rows are the reading that decides the
+        # next GPU round, so it gets its own class (a shared class would let r286's budget account for
+        # lines that are not its own) and the same cap exemption for the same reason.
+        if '{ "clover r290: ", "r290-gpu", 32, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the round290 branch rows: an unbudgeted "
+                          "producer drops them silently, and a halted-clock row that never arrived reads "
+                          "exactly like a clock that was never asked")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r290")' not in sdhci_source:
+            errors.append("the r290 rows are not exempt from the per-pass push cap: they print from the "
+                          "GPU timer beside the census burst, which is where boot 36 measured the cap "
+                          "eating a scheduled round's own line")
 
         # Round283 asks the question boot 69 left open: which software path, if any, resets the board.
         # The r281 read showed the APSS watchdog never armed and the card's last write 11 s older than
@@ -4596,8 +4622,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r289:"):
-        errors.append('[payload] title is not "clover r289: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r290:"):
+        errors.append('[payload] title is not "clover r290: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5710,8 +5736,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r289:"):
-        errors.append('[payload] title is not "clover r289: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r290:"):
+        errors.append('[payload] title is not "clover r290: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

@@ -58,6 +58,26 @@
 #define kGpuccGfx3dRcg      0x1070U
 #define kGpuccCxoEn         0x1020U
 
+// Round290, the two votes the DT's own GPU clock list names and no round of ours ever touched.
+// `msm_gpu clock-names` (sdm660-gpu.dtsi:75-76) asks for six clocks; r286 opened three of them plus
+// the gfx3d branch, and left "rbbmtimer_clk" and "rbcpr_clk" alone. Their branch registers are
+// gpucc-sdm660.c:276 `gpucc_rbbmtimer_clk` .enable_reg = 0x10d0 and :294 `gpucc_rbcpr_clk`
+// .enable_reg = 0x1054, both BIT(0) with halt_check BRANCH_HALT.
+#define kGpuccRbbmtimerEn   0x10d0U
+#define kGpuccRbcprEn       0x1054U
+// ... and the RCG command words those two branches are fed from, read this round so a row can say
+// what was requested of them: :215 rbbmtimer .cmd_rcgr = 0x10b0, :236 rbcpr .cmd_rcgr = 0x1030.
+#define kGpuccRbbmtimerRcg  0x10b0U
+#define kGpuccRbcprRcg      0x1030U
+
+// The halt bit. mainline clk-branch.h:59 names it `CBCR_CLK_OFF = BIT(31)`, and clk-branch.h:31
+// spells `BRANCH_HALT 0 /* pol: 1 = halt */` -- which is the halt_check every one of the four GPUCC
+// branches above and the three GCC ones declares. So a 1 at bit31 says the clock is NOT running
+// however the enable request at bit0 reads, and r286's `gfx3d_en=` field only ever printed bit0.
+// Boot 74 could therefore say "gfx3d was asked for" without saying "gfx3d runs"; that gap is what
+// this round closes.
+#define kBranchClkOff       0x80000000U
+
 // gdsc.c:32 SW_COLLAPSE_MASK = BIT(0), written 0 to power on; gdsc-regulator.c:33 PWR_ON_MASK =
 // BIT(31). The pair is what makes a read-only row decodable: "bit31=1 and bit0=0" is powered on and
 // nobody asking to collapse; "bit31=0" is off regardless of the collapse bit.

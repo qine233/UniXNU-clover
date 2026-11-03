@@ -21766,3 +21766,36 @@ EXIT=0）。boot 76 的读法预先写明：**看到 `clover r289: abt` 与 `bt`
 照样往前走，那是排干通道没带上它，属于仪器自己的第五次复发，按 r255/r256 的同类修法处理。若这次开机干脆没犯
 （boot 48/67 有过两次），`esr/far` 这一格仍欠着，下一趟照原样再飞。GPU 那半不动：cx 开、gx 等一份**带出处**的
 `gfx3d_clk_src` 父表；桌面仍 CPU-first。
+
+---
+
+### boot 76（round289 / v0.6.86，2026-11-03）：这靴没犯，仪器是「沉默且带对照」的
+
+**① 读到什么。** `~/clover-out/round289-log-window.bin.txt` 里 boot 76 的 kind-20 槽（lba 13320236、seq 47、
+body 480、和校验 ok）第一行**不是** `Kernel data abort.`，而是
+`clover r148: unattended deadline 1800 s (elr=fffffff007988e50 spsr=80000204 ...) @ArmCpu.cpp:664`——
+是死线自己停的板。全窗 `grep -c "clover r289"` = **0**，而镜像里确有 `_clover_abort_trace` 与 4 条
+`clover r289:` 字面量（`nm` + `strings` 复核过）。所以⑤ 预先写下的三支里走的是最后一支：**这次开机没犯**，
+不是仪器没接上。
+
+**② 为什么这不违反 r249 的课。** 「只印一次的判决行必须有一条不经该管道的副本」——这次反过来用：判决行
+（abt/bt）没印，而「没崩」这件事实有一条**不经过 r289 那条管道**的证据，就是 panic 记录环里的 r148 死线注记。
+两条通道（卡上的 kind-20 记录 vs 内核日志环 + tee 类）互相不能替对方撒谎，所以「仪器缺席 + 对照在场」读作
+「fault 未发生」；如果只有前者，才是 r249 说的那次复发。
+
+**③ 顺带量到的：第二道坎是间歇的。** boot 76 是迄今走得最远的一靴——内核日志尾到 1814 s，SpringBoard(pid 27)
+在 t≈1626 还在读 IODeviceTree（`r252: row 9/10 ... home-button-type len=4 val=2`），backboardd(pid 58) 在等
+`displayUUID`。boot 74 的 `_memmove` 故障在 1420 s、boot 75 的 `IOSKArena::unmap` 在 880 s，两靴同一个 lr；
+76 越过这两个时刻一路跑到死线。同一扇窗口里还留着 boot 54 的第三例（pc `0xfffffff007a6c094`、同一 lr
+`0xfffffff00568971c`）。三例分属三张镜像（r287 / r288 / r289 各一靴），**一次开机抓不到它**。
+
+**④ 所以 r289 不撤、也不改形状。** 钩子在内核里，之后每一张镜像都带着它；任何一靴真犯了，`esr/far/fp/sp` 加
+至多 12 帧就一起回来。这一格从「欠一次读数」改记成「欠一次复现」：复现概率不由本轮控制，于是每轮冷刷读回后
+固定跑一次 `grep -c "clover r289"`，非零才进解帧流程（`scripts/decode-clover-address.py` 对着当轮内核镜像），
+零就照② 的要求同时确认 panic 槽写的是死线——两个条件都过才算这靴干净。
+
+**⑤ GPU 这半在同一靴上确认了可复现。** t=1338 / 1582 / 1707 三次 fire 的 gpucc 行**逐字段相同**
+（`cx=a0282000 cxhw=80001fe0 gx=08282000 rcg=80000000 dom=00140001 sw=00000000`，`cx_on=1 gx_on=0 gfx3d_en=1
+cxo_en=1`），与 boot 74 在 1338 那一行一字不差。跨两靴、跨三拍不变 ⇒ `gx_on=0` 不是竞态、不是时机、也不是
+被谁抢先关掉了，是一个稳定的硬件状态。r290 要读的正是这件事的另一面：每支 branch 的 BIT(31) 停/走，加上
+本板时钟清单里欠到现在的两份投票（rbcpr 0x1054、rbbmtimer 0x10d0）。桌面仍 CPU-first。

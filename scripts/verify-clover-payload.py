@@ -1178,6 +1178,12 @@ def check_sb_sample(kernel: bytes) -> bool:
                                  b" sp=%016llx esr=%08x far=%016llx cpsr=%08x kstack=%016llx..%016llx\n") in kernel,
              "abort-frames-row": (b"clover r289: bt n=%u from=%u f=") in kernel,
              "abort-frames-empty": (b"clover r289: bt n=0 from=0 f=\n") in kernel,
+             # Round290: every GPU row this board has ever printed named the enable request (BIT(0)) and
+             # never the halt state (BIT(31), mainline clk-branch.h:59 with BRANCH_HALT's 1 = halted), so
+             # boot 74's `gfx3d_en=1` said only that the branch was asked. This is the row that says
+             # whether the clock runs; without it the round asks a question the image cannot answer.
+             "gpu-row-branches": (b"clover r290: gpu t=%u branches %s gfx3d=%u/%u cxo=%u/%u rbcpr=%u/%u "
+                                  b"rbbm=%u/%u en/halt rcg3d=%08x rcg_rbcpr=%08x rcg_rbbm=%08x\n") in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,

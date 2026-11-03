@@ -40,7 +40,10 @@ leave」一路收紧到一句可测的话：
   那个 `lr` 在本板内核符号表里落在一段 12 MB 的空档（`_native_legacy_*` 两个绝对符号之间），宿主解不出名字，
   而卡上带回的 480 字节 panic 记录又在寄存器表中途截断，`esr`/`far`/`fp`/`sp` 一个没收 —— 所以 r289 改在
   `panic_with_thread_kernel_state()`（内核里唯一同时握着这些字段的地方）打一条现场 `abt` 行加最多十二个
-  返回地址，走异常自己的 `fp` 链；等 boot 76 把那行带回来，caller 才有名字。
+  返回地址，走异常自己的 `fp` 链。**boot 76 没犯**：它是迄今最远的一靴（日志尾 1814 s，SpringBoard 在 t≈1626
+  仍在读 IODeviceTree），panic 槽里是 r148 的死线而不是 data abort，全窗 `clover r289` 行数为 0 而镜像里确有
+  `_clover_abort_trace` —— 沉默带对照，读作「这靴真没崩」。三例（boot 54/74/75）分属三张镜像，**一次开机抓不到
+  它**，所以 r289 留在每张镜像里等复现；每轮读回固定查一次该行计数，非零才解帧。
 
 每一轮的设计、构建与真机读数都在 [`notes/development-log.md`](notes/development-log.md)
 逐轮可查，本节只留当前结论。
@@ -54,7 +57,7 @@ leave」一路收紧到一句可测的话：
 | 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路好，但核心版本字不在 v5 带内，APID 一个没认 | 弄清版本字、认 APID、读轨开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 自校验通过），判决行还没上屏 | 有边就上 GLINK/APR；没镜像先压 `vadsp` 电源 |
 | 5 | watchdogd 每次起就崩 | 自身可执行文件里 `brk #1`（`IOWatchdog` 服务不存在），已摘除致命 | 写最小 `IOWatchdog` 服务，或让 plist 不再要求它 |
-| 6 | **GPU/Metal 一个都没有**（Adreno 512 无驱动、无固件、无 renderer） | `gpu` 区 `planned`；boot 74 实机：**r286 上电写序列在本板第一次生效**——`cx_on=1`、`gfx3d_en=1`、`cxo_en=1`、AHB/BIMC 三票=1（eMMC 正对照成立），但 `gx_on=0` → `chipid skipped`。（`rcg=80000000` 曾被读成「父源没设」，已收回：按厂商父源表，CMD 低 2 位=0 就是 XO；bit31 与 GDSCR 的 bit27 在两份源里都没有名字。见 [`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5） | 下一步由数据定：补齐厂商账单里从没碰过的两对 rbbmtimer（0x10b0+0x10d0）/rbcpr（0x1030+0x1054）、读 CONFIG（0x1074）与 GX 的角（CPR4 `0x05061000`、GFX LDO `0x0506e000`；CPR 自己的 `clocks` 里正是 rbcpr），再走 gx，读 `chipid`（对 0x05010200）。S3/S5 两颗是 `qcom,rpm-smd-regulator`，SPMI 读不到，不在这一格。**桌面仍 CPU-first** |
+| 6 | **GPU/Metal 一个都没有**（Adreno 512 无驱动、无固件、无 renderer） | `gpu` 区 `planned`；boot 74 实机：**r286 上电写序列在本板第一次生效**——`cx_on=1`、`gfx3d_en=1`、`cxo_en=1`、AHB/BIMC 三票=1（eMMC 正对照成立），但 `gx_on=0` → `chipid skipped`。**boot 76 三个 fire（t=1338/1582/1707）逐字段与 boot 74 一字不差**，所以 `gx_on=0` 是稳定硬件状态，不是竞态也不是时机。（`rcg=80000000` 曾被读成「父源没设」，已收回：按厂商父源表，CMD 低 2 位=0 就是 XO；bit31 与 GDSCR 的 bit27 在两份源里都没有名字。见 [`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5） | r290 起把「问了」和「在跑」分开读：每支 branch 同时报 BIT(0) 与 BIT(31)（mainline `clk-branch.h:59/:31`），并补上账单里从没碰过的两对 rbbmtimer（0x10b0+0x10d0）/rbcpr（0x1030+0x1054）——rbcpr 是 CPR4 (`cpr4-ctrl@05061000`) 自己 `clocks` 里那颗，而 GX 的角由 CPR 决定，这条链就是 `gx_on=0` 的当前嫌疑人。下一步再读 CONFIG（0x1074）与 GFX LDO `0x0506e000`，然后走 gx、读 `chipid`（对 0x05010200）。S3/S5 两颗是 `qcom,rpm-smd-regulator`，SPMI 读不到，不在这一格。**桌面仍 CPU-first** |
 
 1 挡住桌面；6 是 1 最可能的病根（尚未证）；2–4 是之后要补的板级驱动，5 只是噪声。
 

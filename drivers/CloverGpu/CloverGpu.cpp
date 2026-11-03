@@ -22,6 +22,9 @@
 //   set the gfx3d branch enable (0x1098); the RCG command word 0x1070 is deliberately NOT
 //     reprogrammed this round and stays reported raw -- a branch enable and a rate a round did not
 //     set are two different answers
+//   round290 adds the two votes the DT's clock list still owed (rbcpr 0x1054, rbbmtimer 0x10d0) and
+//     reads every GPUCC branch's halt bit (BIT(31), CBCR_CLK_OFF) next to its enable request,
+//     because "gfx3d_en=1" on boot 74 only ever said somebody asked
 //   read back the GDSCRs (the acceptance), then chipid at 0x05010200 gated on cx-on && gx-on &&
 //     gfx3d-enable, checked against a512's 0x05010200
 //
@@ -239,6 +242,32 @@ clover_gpu_report_gpucc(unsigned t, bool post)
     }
 }
 
+// Round290's row. Every GPUCC branch this board's own clock list asks for, read in the two fields
+// that carry meaning: the enable request at BIT(0) and the halt state at BIT(31) (CBCR_CLK_OFF,
+// with BRANCH_HALT's "pol: 1 = halt"). r286 printed the request alone, so boot 74's `gfx3d_en=1`
+// said "somebody asked" and never said "it runs" -- and a GDSC that will not power up is exactly
+// the shape a halted parent produces. Nothing here decodes the RCG command words; they are printed
+// raw next to the halt bits so a later round can tell a requested source from an active one.
+static void
+clover_gpu_report_branches(unsigned t, const char *stage)
+{
+    uint32_t gfx   = clover_gpu_read(clover_gpu_gpucc, kGpuccGfx3dEn);
+    uint32_t cxo   = clover_gpu_read(clover_gpu_gpucc, kGpuccCxoEn);
+    uint32_t rbcpr = clover_gpu_read(clover_gpu_gpucc, kGpuccRbcprEn);
+    uint32_t rbbm  = clover_gpu_read(clover_gpu_gpucc, kGpuccRbbmtimerEn);
+    uint32_t rcg3d = clover_gpu_read(clover_gpu_gpucc, kGpuccGfx3dRcg);
+    uint32_t rcgr  = clover_gpu_read(clover_gpu_gpucc, kGpuccRbcprRcg);
+    uint32_t rcgb  = clover_gpu_read(clover_gpu_gpucc, kGpuccRbbmtimerRcg);
+
+    printf("clover r290: gpu t=%u branches %s gfx3d=%u/%u cxo=%u/%u rbcpr=%u/%u rbbm=%u/%u "
+        "en/halt rcg3d=%08x rcg_rbcpr=%08x rcg_rbbm=%08x\n", t, stage,
+        (unsigned) (gfx & 1u), (unsigned) ((gfx & kBranchClkOff) != 0),
+        (unsigned) (cxo & 1u), (unsigned) ((cxo & kBranchClkOff) != 0),
+        (unsigned) (rbcpr & 1u), (unsigned) ((rbcpr & kBranchClkOff) != 0),
+        (unsigned) (rbbm & 1u), (unsigned) ((rbbm & kBranchClkOff) != 0),
+        (unsigned) rcg3d, (unsigned) rcgr, (unsigned) rcgb);
+}
+
 // The gated chipid read. a512 reports 0x05010200 once the core is powered and the AHB path is
 // clocked; the gate is cx-on && gx-on && gfx3d-enable, so a chipid of 0xffffffff or 0 cannot be
 // blamed on a bus nobody clocked. The refusal row says which gate did not open.
@@ -314,6 +343,11 @@ clover_gpu_power_on(unsigned t)
         uint32_t gfx  = clover_gpu_read(clover_gpu_gpucc, kGpuccGfx3dEn);
 
         clover_gpu_set_bits(clover_gpu_gpucc, kGpuccGfx3dEn, 1);
+        // Round290: the two votes the DT's clock list names and no round of ours ever asked for.
+        // Same shape as the gfx3d write -- set BIT(0), read the whole word back -- because the
+        // question this round asks is not "what rate" but "is the parent running at all".
+        clover_gpu_set_bits(clover_gpu_gpucc, kGpuccRbcprEn, 1);
+        clover_gpu_set_bits(clover_gpu_gpucc, kGpuccRbbmtimerEn, 1);
         gfx = clover_gpu_read(clover_gpu_gpucc, kGpuccGfx3dEn);
 
         printf("clover r286: gpu t=%u gdsc cx_on=%u gx_on=%u gfx3d_en=%u cx=%08x cxhw=%08x "
@@ -322,6 +356,7 @@ clover_gpu_power_on(unsigned t)
     }
 
     clover_gpu_powered = true;
+    clover_gpu_report_branches(t, "post");
     clover_gpu_report_gpucc(t, true);
     clover_gpu_report_chipid(t);
 }
@@ -341,6 +376,7 @@ clover_gpu_say(OSObject *owner, IOTimerEventSource *sender)
     } else {
         // Steady state: the post-write readback and the gated chipid, repeated so a long boot that
         // rotates the ring out never loses the verdict.
+        clover_gpu_report_branches(t, "beat");
         clover_gpu_report_gpucc(t, true);
         clover_gpu_report_chipid(t);
     }
