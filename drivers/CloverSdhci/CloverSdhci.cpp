@@ -1050,6 +1050,26 @@ static uint32_t gPanicDrainDropped = 0;         // oldest records it gave up to 
 // rings but no kind-20 record, and without this number the reader could not tell a failed slot scan
 // from a write that never got its turn.
 static uint32_t gPanicAppendRc = 0xffffffffu;
+// Round301: the sink's own sentence, kept in RAM whatever the append returns.
+//
+// Boots 89 and 90 both reached this function -- each carries drain enter boot=NN append_rc=2, and
+// panicDrainRings() has exactly one caller -- and neither left a kind-20 record, because
+// panicAppendText() reads the report window before it writes anything (it has to find the oldest
+// slot) and that read was refused while the host was owned (boot 90's marker says host=0x20fdf).
+// The return code 2 is therefore "the card said no to the read", not "a gate was closed" (rc=1),
+// and it is a one-shot: the sink tries once and never comes back. The sentence the screen passed in
+// is the one reading that names this board's endings, and on the two boots that had it, it was lost
+// at the last step.
+//
+// The RAM ring is the copy that does not use the tested pipe: a row queued here is retried by every
+// later flush, and those rows demonstrably reach the card -- boot 90's own drain rows (drain enter,
+// panic tail, r184, tee filter, drain exit) are on it. So the text is copied before anything can
+// refuse, and the drain below decides whether to say it.
+static const uint32_t kPanicStashBytes = 480;   // the same cap the report record's body carries
+static const uint32_t kPanicStashPart = 240;    // a verdict row is kVerdictTextBytes=320 wide
+static char gPanicStash[kPanicStashBytes + 1];
+static uint32_t gPanicStashLength = 0;          // characters copied out of the sink's argument
+static uint32_t gPanicStashSaid = 0;            // parts this drain queued (0, 1 or 2)
 
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
@@ -4707,6 +4727,37 @@ static void panicDrainRings (void)
   // Round209: after the tee has had its passes, read the buffer from the sink's side. On a boot
   // whose block path stopped, these passes find nothing and this is the only reading left.
   panicTailRead ();
+  /*
+   * Round301: the sentence, if the report window refused it. It is queued ahead of the flushes below
+   * so it rides this drain's own write, and a ring row whose write is refused stays queued for the
+   * next flush -- which is precisely what panicAppendText() cannot do, and why boots 89 and 90
+   * reached the sink with a name and left the card with none. The copy is only said when the append
+   * did not land (rc < 100): the report record is the same sentence, and repeating it would make the
+   * host read one panic as two.
+   */
+  if (gPanicStashLength != 0 && gPanicAppendRc < 100) {
+    char part[kPanicStashPart + 1];
+    for (uint32_t at = 0; at < gPanicStashLength; at += kPanicStashPart) {
+      const uint32_t take = (gPanicStashLength - at) < kPanicStashPart
+          ? (gPanicStashLength - at) : kPanicStashPart;
+      for (uint32_t i = 0; i < take; i++) {
+        part[i] = gPanicStash[at + i];
+      }
+      part[take] = '\0';
+      panicTailSay ("CloverSdhci r301: panic text rc=%u chars=%u part=%u %s\n",
+                    static_cast<unsigned int> (gPanicAppendRc),
+                    static_cast<unsigned int> (gPanicStashLength),
+                    gPanicStashSaid + 1, part);
+      gPanicStashSaid++;
+    }
+  }
+  // The status row is said whether or not there was anything to say: a frame with no r301 text rows
+  // has to be able to tell "the append landed, so the record already carries it" from "the sink got
+  // no text" from "the copy path broke". rc >= 100 with chars > 0 and said = 0 is the first, and the
+  // kind-20 slot is then the reading.
+  panicTailSay ("CloverSdhci r301: panic copy rc=%u chars=%u said=%u\n",
+                static_cast<unsigned int> (gPanicAppendRc),
+                static_cast<unsigned int> (gPanicStashLength), gPanicStashSaid);
   gPanicDrainWritten += panicProbeFlush ();
   for (uint32_t which = 0; which < kRingCount; which++) {
     if (which == kRingKernel ? !gTeeReady : !gVerdictReady) {
@@ -8922,6 +8973,21 @@ extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int
   // Round210: the timer keeps running through a panic, and a beat that cut in here would be a
   // second owner of the card in the middle of the panic's own writes. The first panic owns it.
   __atomic_store_n (&gPanicActive, 1u, __ATOMIC_RELEASE);
+  // Round301: the copy comes first, before anything that can refuse, because every step below this
+  // one is a card write and the two boots that proved the sentence is worth keeping are the two
+  // whose card write was refused. Printable only: the ring's reader splits rows on newlines, so
+  // the sentence's own line breaks become spaces here rather than turning one panic into three
+  // unverifiable rows.
+  gPanicStashSaid = 0;
+  gPanicStashLength = 0;
+  if (text != nullptr && length > 0) {
+    const uint32_t copied = length > kPanicStashBytes ? kPanicStashBytes : length;
+    for (uint32_t i = 0; i < copied; i++) {
+      const unsigned char c = static_cast<unsigned char> (text[i]);
+      gPanicStash[i] = (c >= 0x20 && c < 0x7f) ? static_cast<char> (c) : ' ';
+    }
+    gPanicStashLength = copied;
+  }
   flightPanicMark (0, 0, text != nullptr);
   const unsigned int rc = panicAppendText (text, length);
   gPanicAppendRc = rc;

@@ -739,11 +739,17 @@ def check_board(errors: list) -> str:
         sdhci_source = (REPO / "drivers/CloverSdhci/CloverSdhci.cpp").read_text()
         sink = sdhci_source.find("extern \"C\" unsigned int clover_emmc_panic_append "
                                  "(const char *text, unsigned int length)")
+        # Round301 grew the sink's body (the panic-text copy sits ahead of every card write), so these
+        # locality tests are cut on the function's own end brace rather than on a character window that
+        # any added comment would silently push past -- a window is a size assumption, the brace is the
+        # thing the assertion actually means.
+        sink_end = sdhci_source.find("\n}", sink) if sink >= 0 else -1
+        sink_body = sdhci_source[sink:sink_end] if sink_end > sink else ""
         if sink < 0:
             errors.append("drivers/CloverSdhci no longer defines clover_emmc_panic_append(const char "
                           "*, unsigned int): that name and signature are the patcher's PANIC_SINK "
                           "contract")
-        elif "panicDrainRings ();" not in sdhci_source[sink:sink + 600]:
+        elif "panicDrainRings ();" not in sink_body:
             errors.append("the panic sink does not call panicDrainRings () from its own body: the drain "
                           "has to run on the path the panic takes, not on a driver tail the boot that "
                           "panicked never reaches")
@@ -764,7 +770,7 @@ def check_board(errors: list) -> str:
         if "!gUnattendedArmed" not in sdhci_source:
             errors.append("the BCB write is not gated on gUnattendedArmed: a boot without the "
                           "unattended contract would commit the next reset to recovery")
-        if sink >= 0 and "panicMarkRecovery ();" not in sdhci_source[sink:sink + 900]:
+        if sink >= 0 and "panicMarkRecovery ();" not in sink_body:
             errors.append("the panic sink does not call panicMarkRecovery (): the BCB has to be in "
                           "misc before the screen resets the board")
 
@@ -3893,6 +3899,56 @@ def check_board(errors: list) -> str:
                           "exactly like a fire the board never finished, and the round would ship the false "
                           "empty it was written to remove")
 
+        # Round301 is driver-side only, and it exists because boot 90 read r300 back and got the sixth
+        # shape: fire= and done= are themselves 0 rows, inside a ring whose 512 records run seq
+        # 1194..1705 with no gap. The lesson is the standing one -- a verdict row needs a copy that does
+        # not use the pipe under test -- and the highest-value verdict row on this board is the panic
+        # sentence. Boots 89 and 90 both reached the sink (drain enter boot=NN append_rc=2, and
+        # panicDrainRings() has exactly one caller) and both lost the text, because panicAppendText()
+        # reads the report window before it writes and that one read was refused while the host was
+        # owned. One attempt, no retry, no copy. So the assertions here are about the copy's existence,
+        # its ordering against the two things that can lose it, and the fact that it does not depend on
+        # the tee at all.
+        for needle in ('static const uint32_t kPanicStashBytes = 480;',
+                       'static const uint32_t kPanicStashPart = 240;',
+                       'static char gPanicStash[kPanicStashBytes + 1];',
+                       'gPanicStashLength = copied;',
+                       '"CloverSdhci r301: panic text rc=%u chars=%u part=%u %s\\n"',
+                       '"CloverSdhci r301: panic copy rc=%u chars=%u said=%u\\n"',
+                       'gPanicAppendRc < 100'):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci lacks {needle[:64]!r}: without the copy a boot that "
+                              "reaches the panic sink still leaves the card without a name, which is the "
+                              "shape boots 89 and 90 are")
+        # The copy has to be taken before anything that can refuse, and said before the drain's flushes.
+        # Both are index tests rather than line counts because the file moves.
+        stash_at = sdhci_source.find("gPanicStashLength = copied;")
+        enter_mark_at = sdhci_source.find("flightPanicMark (0, 0, text != nullptr);")
+        if stash_at < 0 or enter_mark_at < 0 or stash_at > enter_mark_at:
+            errors.append("the panic-text copy does not come before the sink's first card write: the enter "
+                          "marker is itself a write, and a refusal there would leave nothing copied")
+        said_at = sdhci_source.find('"CloverSdhci r301: panic copy rc=%u chars=%u said=%u\\n"')
+        probe_flush_at = sdhci_source.find("gPanicDrainWritten += panicProbeFlush ();")
+        if said_at < 0 or probe_flush_at < 0 or said_at > probe_flush_at:
+            errors.append("the r301 rows are queued after the drain's flushes: they would sit in RAM for a "
+                          "beat that may never come, which is the failure this round is quoting")
+        # The row is said only when the append did not land. A duplicate would make the host read one
+        # panic as two, since the kind-20 record carries the same sentence when rc >= 100.
+        if sdhci_source.count("panicAppendText (text, length)") != 1:
+            errors.append("panicAppendText is called more than once: a retry from inside the sink is a "
+                          "second owner of a card that is already refusing, and the copy exists so this "
+                          "path does not have to fight it")
+        if "%.*s" in sdhci_source:
+            errors.append("the r301 row prints its part with %.*s: verdictFormat caps the whole row at "
+                          "kVerdictTextBytes, so an over-long part would be cut with nothing on the card "
+                          "saying how much -- the parts are capped instead and chars= names the total")
+        # And the negative that keeps the round honest about which pipe it uses: this copy must not go
+        # back through the tee, because the tee is the thing that lost the census tail three boots running.
+        if '{ "clover r301' in sdhci_source:
+            errors.append("r301 rows were added to the tee class table: the copy's whole point is that it "
+                          "does not ride msgbuf and the tee, and a class here would put it back in the "
+                          "burst whose loss it is meant to survive")
+
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
@@ -5194,8 +5250,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r300:"):
-        errors.append('[payload] title is not "clover r300: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r301:"):
+        errors.append('[payload] title is not "clover r301: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -5672,7 +5728,8 @@ def check_board(errors: list) -> str:
             errors.append("clover_emmc_panic_append no longer writes its two blocks through PIO: "
                           "the last line of a dying boot would depend on this round's flag")
         wrapper_start = text.find("extern \"C\" unsigned int clover_emmc_panic_append")
-        wrapper = text[wrapper_start:wrapper_start + 600] if wrapper_start >= 0 else ""
+        wrapper_end = text.find("\n}", wrapper_start) if wrapper_start >= 0 else -1
+        wrapper = text[wrapper_start:wrapper_end] if wrapper_end > wrapper_start else ""
         if "panicAppendText (" not in wrapper or "panicDrainRings ()" not in wrapper:
             errors.append("the exported clover_emmc_panic_append no longer both writes its own record "
                           "and drains the rings: round184's reading would stop at the panic line and "
@@ -6323,8 +6380,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r300:"):
-        errors.append('[payload] title is not "clover r300: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r301:"):
+        errors.append('[payload] title is not "clover r301: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

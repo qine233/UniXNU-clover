@@ -23432,3 +23432,74 @@ tee 自己的计数器也是这笔债的一部分：`r175: tee seen= kept= throt
 （16 report / 64 verdict / 3 probe / 512 kernel，boot 90）、`…landing-sensors.txt`
 （`charger_temp=332 temp=260 die_health=Cool`，第八次凉）、`…landing-rawdump-head.bin`（第八次全 0）、
 `r300-boot90-unattended.log`（`unattended-exit=0`）。刷的是与归档同一枚镜像（sha256 已重算核对）。
+
+## Round301 (v0.7.6): panic 的那句话要有第二份，而且第二份不能走被测的那条管道
+
+**① 这一轮只还债，不提问。** §boot 90 ⑧ 记了三笔仪器债，(1) 与 (3) 是同一句话的两面：**这条板上价值最高的
+那一条读数——这靴到底为什么结束——只存在于 panic 屏递给 sink 的入参里**，而它到卡上只有一条管道
+（`panicAppendText()`：先 `readPioBlock` 找最老的报告槽，再写两块），一次、不重试。boot 89 与 90 都走到了
+`clover_emmc_panic_append`（两靴各自带着 `drain enter boot=NN append_rc=2`，而 `panicDrainRings()` 在全源里
+只有一个调用者），两靴都**没留下 kind-20 记录**，因为 `append_rc=2` 是那次**预读**被拒（boot 90 的入口标记
+同时给出 `host=0x20fdf`＝那一刻控制器被占）。r300 的教训正在这里：我上一轮把「自证」印进了同一条管道，
+于是它的缺席与被量物同形。这一轮不再犯第二次。
+
+**② 副本走 RAM 环，因为 RAM 环已被证明能到卡上。** 关键事实不是推测：boot 90 那五行排干行
+（`drain enter`、`panic tail`、`r184: panic drain wrote=0`、`r229: tee filter`、`drain exit`）
+**就在卡上**，kind 21、slot 40–45、`said by driver`、校验 `ok`——而同一行自己说 `wrote=0`。
+这两件事同时成立只有一个解释：**`ringPush()` 进的是 RAM 环，任何一次后来的 flush 都会重试它**；
+排干那一刻一块没写成（`wrote=0`、`probe_pend=6`），而 panic 屏之后还有 15 s 复位延迟
+（payload 那侧 `--reset-delay 15`），周期 flush 在这段窗口里把积压的行补了上去。
+`panicAppendText()` 没有这第二手：它拒了就结束了。所以 r301 把句子交给环，而不是再交给一次块写。
+
+**③ 代码形状（只在 `drivers/CloverSdhci/CloverSdhci.cpp`，不动内核补丁、不动 boot args、不动 tee）。**
+`gPanicAppendRc` 之后新增四个静态量：`kPanicStashBytes = 480`（与报告记录正文同一个上限，抄满就等于
+「槽里那句的全部内容」）、`kPanicStashPart = 240`（verdict 行宽 `kVerdictTextBytes = 320`，减去前缀与字段
+余量后取整半，`chars>240` 就分两行）、`gPanicStash[481]`、`gPanicStashLength`、`gPanicStashSaid`。
+`clover_emmc_panic_append` 在把 `gPanicActive` 置起来之后、`flightPanicMark (0, 0, text != nullptr)` 之前
+**先抄**——抄在一切能拒绝它的东西之前，逐字符把非 `0x20..0x7e` 折成空格（环是文本道，不接转义）。
+`panicDrainRings()` 在 `panicTailRead ()` 之后、`gPanicDrainWritten += panicProbeFlush ()` 之前补写：
+只有 `gPanicStashLength != 0 && gPanicAppendRc < 100` 才分行说 `CloverSdhci r301: panic text rc=%u
+chars=%u part=%u %s`——**`rc >= 100` 表示报告记录已经落了，再说一遍会让宿主把一次 panic 读成两次**；
+状态行 `CloverSdhci r301: panic copy rc=%u chars=%u said=%u` **无条件说**，因为「没得说」本身就是读数。
+
+**④ 契约与守卫。** `board.toml` 标题升到 `clover r301: a panic's sentence has to survive a card that says no.`；
+`check-clover.py` 新增 r301 段：钉两枚常量、缓冲区、`gPanicStashLength = copied;`、两条完整格式串、
+`gPanicAppendRc < 100` 那道门、两处顺序（抄必须在 `flightPanicMark (0, 0, …)` 之前、补写必须在
+`panicProbeFlush ()` 之前）、`panicAppendText (text, length)` 仍只有一处调用、**禁止 `%.*s`**
+（截断的写法会把「句子分两半」变成「句子少一半」这种读不出来的形状），并加一条负断言
+`{ "clover r301` 不得出现在 tee 类表里——**副本一旦骑上被测管道，这一轮就白做**。
+`verify-clover-payload.py` 在 r212 那格加 `panic-text`/`panic-copy` 两枚整串针。
+守卫做过四笔正对照，各 EXIT=1 并指名后还原：摘 stash 常量、摘 `rc < 100` 门、把补写挪到 flush 之后、
+把 r301 加进 tee 类；还原后与 `/tmp/clover-sdhci-r301.bak` 逐字节相同。
+**顺带修掉一处工具缺陷**：`check-clover.py` 里三处「sink 函数体」断言原本用固定 600/900 字符窗，
+我这轮加的注释把调用推出了窗外 ⇒ 三条假 FAIL。改成以 `\n}` 收口取函数体，断言更强且对注释长度免疫。
+
+**⑤ boot 91 预登记（读回时按这张表判，别在判之前挑喜欢的分支）。** 先看有没有
+`drain enter boot=91`：**没有** ⇒ sink 没跑，这靴仍是那条「静默、无 panic 文案」的族，r301 无从出声，
+这一支与 boot 88 同形，不算 r301 失败。有 `drain enter` 之后按 `panic copy rc= chars= said=` 三分：
+(a) `rc >= 100`、`chars > 0`、`said=0` ⇒ **append 落了**，句子在 kind-20 记录里，副本正确保持沉默；
+一次 panic 应读成一条记录——若此时还看到 `r301: panic text` 行，那是这一轮的 bug，不是读数。
+(b) `rc < 100`、`chars > 0`、`said = 1`（或 `2`）⇒ **第一次有人把这条板上结束的原因读回来**；
+`chars > 240` 时分两行，按 `part=` 拼回去。这是这一族十一起结局里第一次有名字。
+(c) `rc < 100`、`chars = 0` ⇒ 屏递进来的就是空（`text == nullptr` 或 `length == 0`），
+那么「没有句子」第一次是实测而不是推测，下一步要问的是谁在空手调用 sink（`flightPanicMark` 的第三参）。
+(d) `rc < 100`、`chars > 0`、`said = 0` ⇒ 补写路径断了（排干没走到那三行、或环把它挤掉了）——
+**债从「句子只有一份」变成「环也拒了」**，用同一帧里 `r184: panic drain wrote=`/`dropped=` 与
+`drain exit … probe_pend=` 判是哪种。
+(e) 有 `drain enter` 而无 `panic copy` ⇒ 排干在补写之前就断了，这一支单独记，因为它意味着
+`gPanicStash` 那份 RAM 也跟着丢了。
+另外三条**不作为本轮结论**的并列读数：`clover r262: th`/`r296`/`r298` 尾巴是否回来（§boot 90 ② 那支仍未切开的
+镜像 vs 核数）；`r300: fire`/`done` 是否回来（它们仍走 msgbuf+tee，缺席仍不可判，债 (1) 只在这两行上也补一份
+副本时才结清）；结局落点是否还在 660–940 s 那一段（第四靴，仍是分布不是时刻）。
+
+**⑥ 不做什么。** 不改 `panicAppendText()` 的一次性形状（那是 patcher 的契约，`rc` 的编码不能同时动）；
+不给 tee 加 r301 类；不动 `kTeeCensusMax = 12`（债 (2) 排在其后）；不重开 GPU 线；不动 `armcpu-*`。
+宿主侧无需改动：解码器把 kind-21 正文整行印出，r301 两行自动可读，没有新几何、没有新字段。
+
+**⑦ 产物。** 内核 `out/clover/kernel/kernel.macho` sha256 `527b5d84…`；AMFI 两刀后
+`~/clover-out/round301-kernel-amfi.macho`（两刀仍在 `0x1ad70e4`/`0x1ad716c`，与 r300 同偏移），
+归一化 sha256 `e4450f90…`；`~/clover-out/round301-v0.7.6-payload.img` 58,720,256 B，sha256
+`d5c2c984bd029c2685e298c9784d57499ec61b574c8aecb54460fc3c1af34e03`（与 `round301-payload.json` 一致）；
+`check-clover.py` EXIT=0、`verify-clover-payload.py` EXIT=0（48 格全 OK，
+`kernel.macho: panic-time log tail linked` 那格现含 `panic-text`/`panic-copy` 两枚新针）。
+构建日志 `r301-build-kernel.log` / `r301-build-payload.log` / `r301-verify.log`。

@@ -826,7 +826,9 @@ def check_panic_tail_read(kernel: bytes) -> bool:
     r184 drain line, which is the record that the drain ran at all. Round211 adds `append_rc`: the
     status row is the only place where the sink's own verdict on the panic sentence survives.
     Round212 adds the two halves that make a silent drain attributable: the enter/exit pair and the
-    boot id in every row, plus the probe ring the kernel's kill-point lines are relayed into."""
+    boot id in every row, plus the probe ring the kernel's kill-point lines are relayed into.
+    Round301 adds the two rows that make a refused append still readable: the sink's sentence, said
+    from the RAM copy in parts, and the status line that says why there are no parts."""
     label = "kernel.macho: panic-time log tail linked"
     found = {"tail": (b"CloverSdhci r212: panic tail lines=%u unseen=%u bufx=%d tee=%u boot=%u "
                       b"cursor=%u size=%u lap=%u refused=%u pend=%u drop=%u guard=%u last=%ums "
@@ -838,7 +840,13 @@ def check_panic_tail_read(kernel: bytes) -> bool:
              "exit": (b"CloverSdhci r212: drain exit boot=%u wrote=%u dropped=%u tee_passes=%u "
                       b"probe=%u probe_drop=%u probe_pend=%u\n") in kernel,
              "kept-r184": (b"CloverSdhci r184: panic drain wrote=%u dropped=%u tee_passes=%u\n")
-                          in kernel}
+                          in kernel,
+             # Round301's whole point is that the sentence survives a refused report append, and a
+             # driver that lost the copy would still boot, still drain, and still print every r212
+             # row above -- so both strings are pinned here, complete, for the standing reason: a cut
+             # format string leaves every prefix needle green.
+             "panic-text": (b"CloverSdhci r301: panic text rc=%u chars=%u part=%u %s\n") in kernel,
+             "panic-copy": (b"CloverSdhci r301: panic copy rc=%u chars=%u said=%u\n") in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())

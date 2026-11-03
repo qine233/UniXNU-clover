@@ -217,6 +217,22 @@ leave」一路收紧到一句可测的话：
   `check-clover.py` 钉两行完整格式串与三个计数器并禁止重印被数的行，`verify-clover-payload.py` 加
   `bb-census-fire`/`bb-census-done` 两枚整串针，守卫做过正对照（摘类行 / 摘豁免各 EXIT=1 并指名）。
   **boot 90 已读回：落在五支之外——`fire`/`done` 自己也没到卡上，所以这债没结清，副本必须挪出那条管道（r301）**。
+* **r301（v0.7.6，仪器债：把 panic 的那句话做成两份，第二份不走被测管道）**。boot 89/90 都走进了
+  `clover_emmc_panic_append`（各自带 `drain enter boot=NN append_rc=2`），但**卡上没有 kind-20 记录**：
+  `panicAppendText()` 写之前要先**读**报告槽找最老的一格，那次预读被拒（boot 90 的标记同时给 `host=0x20fdf`），
+  而它是一次性、不重试的 ⇒ 这条板上价值最高的那句「这靴为什么结束」丢在最后一步。**副本交给 RAM 环而不是
+  再交给一次块写**，依据是同一帧里的实测：boot 90 那五行排干行 `said by driver`、kind 21、slot 40–45 都在卡上，
+  而它们自己说 `wrote=0`——环里的行会被**之后每一次 flush 重试**（panic 屏之后还有 15 s 复位延迟），
+  块写路径没有这第二手。做法：`clover_emmc_panic_append` 在置起 `gPanicActive` 之后、`flightPanicMark` 之前
+  把入参抄进 `gPanicStash`（480 B，与报告正文同宽；非可打印字符折成空格）；`panicDrainRings()` 在排干前
+  按 240 字符分行说 `CloverSdhci r301: panic text rc=%u chars=%u part=%u %s`，**且只在
+  `gPanicAppendRc < 100` 时说**（`rc>=100` 表示报告记录已落，重复它会让宿主把一次 panic 读成两次）；
+  状态行 `CloverSdhci r301: panic copy rc=%u chars=%u said=%u` 无条件说。负断言钉死**副本不得骑 tee**
+  （`{ "clover r301` 不许出现在 tee 类表里），否则这一轮白做；顺带把 `check-clover.py` 三处固定 600/900
+  字符窗的 sink 断言改成按 `\n}` 收口取函数体（我这轮的注释把调用推出了窗外，三条假 FAIL）。
+  驱动侧单独一轮：不动内核补丁、不动 boot args、不动 tee、不改 `panicAppendText` 的 `rc` 编码（那是 patcher 的契约）。
+  **boot 91 的五支判读态（含「没有 `drain enter`＝这靴压根没喊」这一支）预登记在
+  `notes/development-log.md` §Round301 ⑤**；债 (2)（tee 自报行只有 12 条）与「尾巴属镜像还是属核数」那轮控制仍未动。
 * **再后一支（本格欠的两条仪器债）**：`vbits=`（`ipc_right_lookup_read()` 已经交出的 entry 位掩码，
   用来分 port set / send-once，不需要对象、锁纪律与 translate 同一条）与 `qmc=/qsr=` 自带返回码。
 * **那笔「等设备解锁」的死等已经不是现场，但它的机制现在读全了**：r274 命中的形状是
