@@ -300,6 +300,38 @@ clover_gpu_report_ldo(unsigned t, const char *stage)
         (unsigned) ((cxhw & kGdscPwrOn) != 0), (unsigned) ((gx & kGdscPwrOn) != 0));
 }
 
+// Round294 widens that reading to the whole LDO block the vendor driver names, because boot 78 answered
+// "is the rail programmed" for three words and left the other ten unasked -- and the init list the vendor
+// probe writes (msm_gfx_ldo.c:1135-1140 over sdm660_ldo_config[] :147-158) names an expected word for each
+// of them. This row is read-only by design: the next round may write, and the words it finds here are the
+// baseline it will be judged against. The same-beat cx_on/gx_on ride along for the reason r291 gave: a row
+// of 0xffffffff with cx_on still set is a page that did not answer, not a block at zero.
+static void
+clover_gpu_report_ldo_words(unsigned t, const char *stage)
+{
+    uint32_t cxhw = clover_gpu_read(clover_gpu_gpucc, kGpuccCxHwCtrl);
+    uint32_t gx   = clover_gpu_read(clover_gpu_gpucc, kGpuccGdscGx);
+
+    printf("clover r294: gpu t=%u ldo words %s w00=%08x w04=%08x w08=%08x w0c=%08x w10=%08x "
+        "w14=%08x w18=%08x w1c=%08x w20=%08x w24=%08x w28=%08x w2c=%08x w30=%08x cx_on=%u gx_on=%u\n",
+        t, stage,
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoAtest),
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoCfg0),
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoCfg1),
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoCfg2),
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoLdData),
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoVrefTest),
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoVref),
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoCtrl),
+        // 0x20: no name in msm_gfx_ldo.c, so it is printed as a word and nothing more.
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, 0x9020U),
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoStatus1),
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoStatus),
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoRefX1),
+        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoRefX2),
+        (unsigned) ((cxhw & kGdscPwrOn) != 0), (unsigned) ((gx & kGdscPwrOn) != 0));
+}
+
 // The gated chipid read. a512 reports 0x05010200 once the core is powered and the AHB path is
 // clocked; the gate is cx-on && gx-on && gfx3d-enable, so a chipid of 0xffffffff or 0 cannot be
 // blamed on a bus nobody clocked. The refusal row says which gate did not open.
@@ -375,11 +407,17 @@ clover_gpu_power_on(unsigned t)
         uint32_t gfx  = clover_gpu_read(clover_gpu_gpucc, kGpuccGfx3dEn);
 
         clover_gpu_set_bits(clover_gpu_gpucc, kGpuccGfx3dEn, 1);
-        // Round290: the two votes the DT's clock list names and no round of ours ever asked for.
-        // Same shape as the gfx3d write -- set BIT(0), read the whole word back -- because the
-        // question this round asks is not "what rate" but "is the parent running at all".
-        clover_gpu_set_bits(clover_gpu_gpucc, kGpuccRbcprEn, 1);
-        clover_gpu_set_bits(clover_gpu_gpucc, kGpuccRbbmtimerEn, 1);
+        // Round294 takes these two writes back out. They are round290's -- the rbcpr and rbbmtimer
+        // branch enables the DT's clock list still owed -- and the boot record lines up with them
+        // exactly: boots 73 and 76, the two longest this port has run (3145 s without a deadline, and a
+        // full 1800 s to the deadline's own panic), were both built before r290, while boots 77, 78, 79
+        // and 80 -- every boot since it -- each ended in a silent, no-panic, pre-deadline reset at
+        // 718 s, 1184 s, 1248 s and 1335 s. Nothing between 77 and 80 touched the GPU again, so these
+        // two words are the only new writes the whole run has in common. That is a correlation, not a
+        // cause, and a correlation this tight gets tested rather than argued: the reads stay (r290's row
+        // still prints both branches, so a boot that stops dying still shows the two votes withheld), and
+        // only the BIT(0) presses go. If the silent resets continue anyway, the hypothesis is dead and
+        // this comment is the record of it being killed.
         gfx = clover_gpu_read(clover_gpu_gpucc, kGpuccGfx3dEn);
 
         printf("clover r286: gpu t=%u gdsc cx_on=%u gx_on=%u gfx3d_en=%u cx=%08x cxhw=%08x "
@@ -390,6 +428,7 @@ clover_gpu_power_on(unsigned t)
     clover_gpu_powered = true;
     clover_gpu_report_branches(t, "post");
     clover_gpu_report_ldo(t, "post");
+    clover_gpu_report_ldo_words(t, "post");
     clover_gpu_report_gpucc(t, true);
     clover_gpu_report_chipid(t);
 }
@@ -411,6 +450,7 @@ clover_gpu_say(OSObject *owner, IOTimerEventSource *sender)
         // rotates the ring out never loses the verdict.
         clover_gpu_report_branches(t, "beat");
         clover_gpu_report_ldo(t, "beat");
+        clover_gpu_report_ldo_words(t, "beat");
         clover_gpu_report_gpucc(t, true);
         clover_gpu_report_chipid(t);
     }

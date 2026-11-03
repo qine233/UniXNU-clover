@@ -107,6 +107,29 @@
 // DT bounds for the decode, regulator.dtsi:528-529: regulator-min-microvolt 400000, max 925000 --
 // val 5 and val 110 in the driver's units. Printed only here, so a reading can be compared by hand.
 
+// Round294 reads the rest of the LDO block instead of only the three words round291 asked. The
+// vendor driver names each of these offsets in notes/sources/sdm660/msm_gfx_ldo.c: LDO_ATEST_REG :24,
+// LDO_CFG0_REG :25, LDO_CFG1_REG :26, LDO_CFG2_REG :27, LDO_LD_DATA_REG :28, LDO_VREF_TEST_CFG :30,
+// LDO_VREF_SET_REG :34 and PWRSWITCH_CTRL_REG :39 (both read by r291), LDO_STATUS1_REG :54 (defined
+// there but never read by that driver), PWRSWITCH_STATUS_REG :56 (r291), REF_CURRENT_X1_REG :61 and
+// REF_CURRENT_X2_REG :62. The word at 0x20 is named by nothing in that file, so the row prints it
+// and claims nothing about it. ADC_CTL_REG 0x34 stays untouched: `gfx_ldo_vreg` declares
+// reg = <0x0506e000 0x34> (sdm660-regulator.dtsi:523), so 0x30 is the last word inside the window.
+// sdm660_ldo_config[] :147-158 is the vendor's own expected word for the named ones -- ATEST 0x00000080,
+// CFG0 0x0100A600, CFG1 0x000000A0, CFG2 0x0000C3FE, LD_DATA 0x00000000, VREF_TEST_CFG 0x00401100,
+// REF_X1 0x00000230, REF_X2 0x00000048 -- and probe writes exactly that list at :1135-1140
+// (writel_relaxed of ldo_init_config[i].value at ldo_init_config[i].offset). Those words are quoted
+// so a reading can be compared by hand; this round writes none of them.
+#define kGpuccLdoAtest      0x9000U   // LDO_ATEST_REG (msm_gfx_ldo.c:24)
+#define kGpuccLdoCfg0       0x9004U   // LDO_CFG0_REG (:25)
+#define kGpuccLdoCfg1       0x9008U   // LDO_CFG1_REG (:26)
+#define kGpuccLdoCfg2       0x900cU   // LDO_CFG2_REG (:27)
+#define kGpuccLdoLdData     0x9010U   // LDO_LD_DATA_REG (:28)
+#define kGpuccLdoVrefTest   0x9014U   // LDO_VREF_TEST_CFG (:30)
+#define kGpuccLdoStatus1    0x9024U   // LDO_STATUS1_REG (:54)
+#define kGpuccLdoRefX1      0x902cU   // REF_CURRENT_X1_REG (:61)
+#define kGpuccLdoRefX2      0x9030U   // REF_CURRENT_X2_REG (:62)
+
 // gdsc.c:32 SW_COLLAPSE_MASK = BIT(0), written 0 to power on; gdsc-regulator.c:33 PWR_ON_MASK =
 // BIT(31). The pair is what makes a read-only row decodable: "bit31=1 and bit0=0" is powered on and
 // nobody asking to collapse; "bit31=0" is off regardless of the collapse bit.

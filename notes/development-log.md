@@ -22222,3 +22222,81 @@ entry/beat/deadline 三类记录**没有 boot 戳**，所以解码器只能靠�
 一起钉进 `DMA_INTEGRITY`/`WRITE_DMA_INTEGRITY`：这一轮的判决要能在卡上读出来，首先得能在出厂镜像里被证明存在。
 同一形状的两面记在一处：**源码侧的针要钉源码里真实存在的那一段**（`check-clover.py` 那枚拼接针这轮暴露），
 **二进制侧的针要钉合并后的整串**（`verify-clover-payload.py` 这轮暴露）——两套形状不能互抄。
+
+### boot 80（round293 / v0.6.97，2026-11-03）：戳当场兑现，第四起静默复位也当场兑现
+
+**① 这一靴的帧。** boot 80 的最后一条内核 tee 行是 `[ 1335.047367]: clover r231: bbhop t=1335 pid=58 ...`，
+飞区里最新一条请求进卡在 t=1323814 ms、最新一拍在 t=1320098 ms（seq 152，与请求差 3716 ms）。没有 kind-20
+panic 槽，没有死线记录，板子按 r198 预置的 BCB 落回 TWRP。这是**连续第四起「静默、无 panic、早于死线」的复位**
+（77/78/79/80 = 718 s、1184 s、1248 s、1335 s）。
+
+**② r293 的 boot 戳第一轮就用上了。** 飞区 12 条 entry 记录与 4 条 beat 记录**全部署名 boot 80**；
+deadline 槽仍是 `t=1802682 ms ... elapsed=1800.001s`，解码器报 `un-stamped`（那是 r293 之前的负载写的），
+两条 panic 标记报 `boot=76 STALE: boot 80 never entered the sink gates=0x7(armed,bcb,text)`。没有这层署名，
+这一帧会被读成「boot 80 也走到了 1800 s 死线并 panic」——正是上一轮记录的那句差点发出去的假话。
+
+**③ APSS 看门狗第四靴排除。** 幸存的两拍都读 `en=0 armed=0 sts=0`，`bark=524287 bite=1048575` 还在复位值
+（t=737.611779、t=1098.120726），全程没有一条 `why=chg`。boot 77、78、79、80 四靴同判：**在这台仪器看得见
+的地平线内，静默复位不是 APSS WDT 干的**。
+
+**④ r283 那条卡外通道被它自己新加的词作废。** boot 80 的判决行是
+`clover r283: last reset unnamed magic=e9881001048909d1 beat=399118426001275 beatcnt=1370094500763
+beatmagic=801a082d822c1192`。`beatmagic` 不等于 `BEAT283` ⇒ IMEM `0x660` 那 20 个词从来不是本驱动的心跳；
+`magic` 也不等于 `CLOV283`。两个都不等，说明这一格是别人的内存，「跨复位问是谁按的」这条通道到此为止，
+不再有卡外证人（上一轮只是「看不懂」，这一轮是「不是我们的」）。
+
+**⑤ DMA 退出命名上了卡，但还没咬到人。** boot 80 全程只拒了一笔传输：
+`CloverSdhci r173: dma write cmd lba=35513552 blocks=128 st=00018000 err8=00 hctl=3c ms=0 budget=0 polls=0`
+——名字是 `cmd`（写命令相位），三个新字段都在，`ms/budget/polls=0` 是因为命令相位本来就不量。r293 想分的
+`spin` 还是 `deadline` 属于数据相位，boot 80 没给出第一次读数。另有两次整卡重初始化（`r215 ... n=1`、`n=2`），
+按已降级的慢性噪声记账。
+
+**⑥ TWRP 的 PMIC PON 闩锁：一条负对照省下的一轮。** 为了看「静默复位」会不会在 PON 原因寄存器里留下不同
+的字，直接 `adb reboot recovery` 造一次**已知的软复位**，落回后 TWRP dmesg 里的
+`power-on reason` / `power-off reason` 行与静默复位落回时**逐字节相同**（`~/clover-out/round293-boot80-twrp-dmesg.txt`）。
+⇒ 那枚闩锁没有区分力，内核侧 SPMI PON 仪器不值得建。**这是负对照，不是「PON 排除了」**：它排除的是这台仪器的
+判决力。
+
+**⑦ 时间线（本轮假说的唯一来源）。** 四起静默复位都发生在带着 r290 那两笔 GPUCC 写
+（`kGpuccRbcprEn` 0x1054、`kGpuccRbbmtimerEn` 0x10d0）的负载上，那两笔写第一次上机就是 boot 77；
+而本 port 活得最久的两靴——boot 73（无死线跑到 3145 s，GPU 行照常每拍出声）与 boot 76（真走到 1800 s
+死线并在自己的 panic 里落回）——都在 r290 之前。没有别的相关改动同时发生在这两组之间。
+
+### r294（v0.6.98）：把那条相关写成一次可证伪的开机，顺手把轨的全普查补齐
+
+**① 唯一的因果改动 = 删写。** `clover_gpu_power_on()` 里 r290 的两笔
+`clover_gpu_set_bits(clover_gpu_gpucc, kGpuccRbcprEn/kGpuccRbbmtimerEn, 1)` 被删除，只留一段说明为什么删、
+以及「若仍静默复位即假说死」的判据。r290 的 branches 行不动：读还照常问 `rbcpr=%u/%u rbbm=%u/%u` 的 en/halt，
+本轮要问的正是**不去投票的那两拍会不会还静默复位**。
+
+**② 契约里放反向断言。** `check-clover.py` 现在**拒绝**那两行出现在 `CloverGpu.cpp`，理由是「带着写的构建
+与它要解释的四起复位分不出来」；两处 `[payload] title` 断言从 r293 升到 r294。这轮也再次用到那条形状规矩：
+源码侧的针钉源码里真实存在的那一段，二进制侧的针钉编译合并后的整串。
+
+**③ 只读普查。** `GpuRegs.h` 把厂商 `msm_gfx_ldo.c`（`notes/sources/sdm660/`，sha256 `929bc99f86f1`）命名的
+0x00..0x30 全部偏移定名并写清两条例外：0x20 在那份文件里没有名字（普查行照样印，但不给它编一个名字），
+ADC_CTL 0x34 落在 DT `gfx_ldo_vreg reg = <0x0506e000 0x34>` 之外（不读）。`clover_gpu_report_ldo_words()` 在
+post/beat 两拍各印 13 个词加当拍的 `cx_on/gx_on`，**不写任何一个词**——它是下一轮真去编程轨时的基线。
+r291 那三个词保留自己那行，改了就没法和已归档的 boot 78 对比。
+
+**④ tee 与预算。** 新类 `{ "clover r294: ", "r294-gpu", 32, 0, 0, 0 }`，与 per-pass cap 的 `r294` 豁免同批加入；
+理由与 r286/r290/r291 一样：缺普查行必须能读成「被 cap 吃了」，不能读成「那页静默」。
+
+**⑤ 判据（刷 boot 81 前写死）。** (a) boot 81 若仍静默、无 panic、早于死线 ⇒ 假说当场死，源码里那段注释就是它
+死的记录，下一支回到「整卡复位的来源」而不是 GPUCC 的两笔写。(b) boot 81 若活得比 1335 s 久（哪怕走到自己的
+1800 s 死线）⇒ 凶手是这两笔写，但接着要用 r290 的 branches 行看 `rbcpr/rbbm` 的 en 位是否回落，把「为什么
+两笔 GPUCC 写能把 AP 弄死」问下去。(c) 普查行是否上卡：13 个词 + 两拍都该在，缺了要能在 r294 类的账上读出来。
+(d) 戳继续自证：飞区三组都该署 boot 81，deadline/panic 槽若仍是 boot 76 的旧记录就该继续报 STALE。
+桌面主线不动：backboardd→datamigrator 的 XPC 等待与债主 workloop 的五个等待者。
+
+**⑥ 契约、构建与产物。** 闸门：`check-clover.py` EXIT=0（`clover ok: ADT 14384 bytes`）、
+`verify-clover-payload.py` EXIT=0 且 0 FAIL（含新钉的 `gpu-row-ldo-census` 整串），
+`build-arm-driver.py CloverGpu` / `CloverSdhci` 在组装树 `-Werror` 过。
+产物：kernel `1c2d2a94…` → amfi `55d2c0b3…`（两刀仍在 `0x1ad30e4`/`0x1ad316c`，与 r292/r293 同址 ⇒ 驱动改动
+没挪 AMFI 段）→ normalized `2c369a95…`（973 个 object 戳清零）→ payload `4b02653c…` =
+`~/clover-out/round294-v0.6.98-payload.img`（58,720,256 B，`mdir` 数得 6 files）。
+**出厂镜像那侧的正对照**：payload 里搜得到 `clover r294: gpu t=%u ldo words`、搜不到 r293 的标题串——普查行与
+被删的那两笔写在同一个文件、同一趟编译里，所以「镜像里带的是回退后的 CloverGpu.cpp」这一句有指头可查的落点。
+**复现补测**：这轮落盘后又改了一处源码注释（不涉及任何语句）并重跑一趟 `unixnu build kernel` + amfi + normalize，
+归一化后的 sha256 仍是 `2c369a95…`（prelink 那颗因 object 戳而不同：`1c2d2a94` → `c7ab627e`，正是 r277 归一化步骤
+存在理由的现场演示）。⇒ 归档的 `round294-v0.6.98-payload.img` 与当前源码**同一颗内核**，无需重刷也无需重新归档。

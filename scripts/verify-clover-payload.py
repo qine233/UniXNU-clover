@@ -1196,6 +1196,11 @@ def check_sb_sample(kernel: bytes) -> bool:
              # about a rail the image cannot read.
              "gpu-row-ldo": (b"clover r291: gpu t=%u ldo %s vref=%08x val=%u uv=%u ctrl=%08x byp=%u pdn=%u "
                              b"cpr_byp=%u sts=%08x ready=%u settled=%u cx_on=%u gx_on=%u\n") in kernel,
+             # Round294's census: the whole LDO block, in one row. Pinned as the compiler merges the two
+             # segments, which is the shape the shipped image carries -- the source splits it across lines.
+             "gpu-row-ldo-census": (b"clover r294: gpu t=%u ldo words %s w00=%08x w04=%08x w08=%08x "
+                                    b"w0c=%08x w10=%08x w14=%08x w18=%08x w1c=%08x w20=%08x w24=%08x "
+                                    b"w28=%08x w2c=%08x w30=%08x cx_on=%u gx_on=%u\n") in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,

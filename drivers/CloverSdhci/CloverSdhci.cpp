@@ -943,6 +943,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // GPUCC window answered at 0x1000-range offsets and not at 0x9000 -- which is a fact about the
   // window, and would be invisible if the row shared a budget with the one that proves it.
   { "clover r291: ", "r291-gpu", 32, 0, 0, 0 },
+  // Round294 widens the rail reading to the whole LDO block, on the same schedule and with its own class
+  // for the same reason r291 gave: a boot that printed the three words and not the thirteen says the
+  // census was capped, not that the page is silent -- and the census is the baseline the next round's
+  // writes would be judged against, so losing it silently is the one outcome this class exists to prevent.
+  { "clover r294: ", "r294-gpu", 32, 0, 0, 0 },
   // Round289 speaks only at a fatal data abort, and it is the reading the panic record cannot carry:
   // the kind-20 slot is 480 bytes, and boot 74 and boot 75 both showed it cut off inside the register
   // list, before esr, far, fp and sp -- the four fields that name a fault. At most one abt row and two
@@ -4289,7 +4294,8 @@ static void teeConsumeLine (uint32_t &pushed)
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r286") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r289") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r290") ||
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r291"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r291") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r294"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.
