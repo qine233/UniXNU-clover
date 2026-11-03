@@ -93,8 +93,8 @@ stage 5 之后。本板连 GDSC 的当前状态都没读过；在没有读数的
 
 ## 5. gfx3d 的父源/频率表与 GX 的完整账单（2026-11-03 取回，全部有源）
 
-r288/r289 期间把这条线一直缺的那张表补齐了。原文五份已进仓，下面的每一条都能在本仓
-`notes/sources/sdm660/` 里按行号核对，不再依赖 `/tmp`：
+r288/r289 期间把这条线一直缺的那张表补齐了，r290 当天又补上 GFX LDO 那一格（§5.6）。原文九份已进仓，
+下面的每一条都能在本仓 `notes/sources/sdm660/` 里按行号核对，不再依赖 `/tmp`：
 
 | 文件 | sha256 前 12 | 上游 |
 | --- | --- | --- |
@@ -104,6 +104,9 @@ r288/r289 期间把这条线一直缺的那张表补齐了。原文五份已进�
 | `msm-gdsc-660.dtsi` | `e31d934fbb42` | 同上 |
 | `sdm660-regulator.dtsi` | `4dc3788265a9` | 同上（§5.4 用它更正「三颗轨」的读法） |
 | `adreno-gpulist.h` | `e998295aa216` | 同上 `drivers/gpu/msm/` |
+| `msm_gfx_ldo.c` | `929bc99f86f1` | 同上 `drivers/regulator/`（§5.6：GFX LDO 的寄存器表与位名） |
+| `cpr4-mmss-ldo-regulator.c` | `045af7dc9c8c` | 同上（§5.6：MMSS CPR4 的六档参考电压） |
+| `cpr3-regulator.h` | `2cac843f9978` | 同上（CPR3/CPR4 共用的内部结构声明，本轮未据它下任何读数） |
 
 ### 5.1 `gfx3d_clk_src` 的父源表（`gpucc-sdm660.c:57`，`P_XO` 等枚举在 `:34`）
 
@@ -241,3 +244,43 @@ GFX LDO `0x0506e000`、mem-acc `0x01fcf004` → 再看 `gx_on` 与 `chipid`**。
 偏移宏，GFX LDO 若上游无对应驱动则退回 vendor 头文件并注明版本——取到之后才建映射、才打读数。
 mem-acc `0x01fcf004` 是 vendor-only（`qcom,mem-acc-regulator`），上游没有，暂时排在后面。
 桌面仍 CPU-first。
+
+### 5.6 门槛已在 2026-11-03 当天跨过：GFX LDO 有名字齐全的寄存器表（vendor，本板 SoC 对应）
+
+§5.5 说「偏移没有出处，所以不建映射」——这句现在只对了半天。用 GitHub 代码检索按 DT 里那颗
+compatible 原文（`qcom,sdm660-gfx-ldo`）找到的正是它的厂商驱动：
+
+* 顺带更正 §5.5 给的候选路径：mainline 的 CPR 驱动是 `drivers/pmdomain/qcom/cpr.c`（MAINTAINERS
+  `F:` 两行之一，另一行是 binding yaml），兼容表里**只有** `qcom,qcs404-cpr`，全文没有 `cpr4`；
+  §5.5 写的 `drivers/misc/qcom-cpr.c` 在 master 上不存在（404）。所以 CPR4 这一支上游取不到，
+  下面的厂商源码是唯一有名字的出处。
+
+* 来源：`LineageOS/android_kernel_xiaomi_sdm660` @ `lineage-20`（与本文件上面那张表同一仓、同一分支，
+  也就是这块板子真跑过的 CAF 内核），路径 `drivers/regulator/`。三份已归档：
+  `notes/sources/sdm660/msm_gfx_ldo.c`（sha256 `929bc99f86f1`）、`cpr3-regulator.h`（`2cac843f9978`）、
+  `cpr4-mmss-ldo-regulator.c`（`045af7dc9c8c`）。
+* `msm_gfx_ldo.c:1504` 的 match 表里就有 `.compatible = "qcom,sdm660-gfx-ldo"`（另一颗是 msm8953），
+  而本板 DT 的 `gfx_ldo_vreg: ldo@0506e000`（`sdm660-regulator.dtsi:523-530`）写的正是这个
+  compatible、`reg = <0x0506e000 0x34>` —— **窗口大小 0x34 和驱动的寄存器表正好对上**，
+  所以偏移 0x00..0x30 可用，`ADC_CTL_REG 0x34`（`:63`）落在窗口外，不许碰。
+* 名字齐全的读数（都在这份文件里）：
+  `LDO_VREF_SET_REG 0x18`，值在 `VREF_VAL_MASK = GENMASK(6, 0)`（`:37`），解码
+  **µV = val × 5000 + 375000**（`:1371`，`MIN_LDO_VOLTAGE 375000`/`LDO_STEP_VOLATGE 5000` 在 `:65/:67`；
+  写方向的反函数 `GET_VREF` 在 `:266`）；
+  `PWRSWITCH_CTRL_REG 0x1C`，位名齐全：`CPR_BYPASS_IN_LDO_MODE BIT(30)`、`EN_LDOAP_CTRL_CPR BIT(29)`、
+  `PWR_SRC_SEL BIT(9)`、`LDO_BYPASS BIT(6)`、`LDO_PDN BIT(5)`、`LDO_UNDER_SW_CTRL BIT(4)`（`:39-52`）；
+  `PWRSWITCH_STATUS_REG 0x28`：`LDO_VREF_SETTLED BIT(4)`、`LDO_READY BIT(2)`（`:57-58`）、
+  `BHS_EN_REST_ACK BIT(1)`，而驱动自己判定「稳定」用的就是 `reg & (SETTLED|READY)` 非零
+  （`:307`、`:1336`）。`LDO_STATUS1_REG 0x24`（`:54`）在这份源码里**定义了但没用**，
+  所以本轮不读它、也不给它任何解释。
+* `cpr4-mmss-ldo-regulator.c` 补上另一头：`SDM660_MMSS_FUSE_CORNERS = 6`（`:31`），六档参考电压
+  **585/645/725/790/870/925 mV**（`:116-123`），偏移步进 10 mV（`:126`）。这里有一处**没对齐**：
+  DT 的 `gfx_vreg_corner` 写 `regulator-min/max-microvolt = <1>/<7>`（角 1..7），厂商 fuse 表只有
+  6 档。这个差我暂时解释不了，所以 r291 不靠「角号」下结论，只读 LDO 自己的电压与状态位。
+
+**r291 因此定为**：映射 `0x0506e000 + 0x34`（第三次用同一套 `IODeviceMemory::withRange` 路径），
+读 `0x18`/`0x1C`/`0x28` 三个带名字的寄存器，把 µV 按上面的公式解出来，连同当拍的 `gx_on` 一起打。
+判据事先写死：`LDO_READY=0` 或 µV 落在 375000（=val 0，即从没人写过） ⇒ GX 的供电确实没上角，
+这条链成立，下一步才谈 CPR/RCG 编程；`LDO_READY=1` 且 µV 已经在角上而 `gx_on` 仍 0 ⇒ 债不在轨上，
+回到 GPUCC 的分支/父源那一支（也就是 r290 的 halt 位读数负责区分的那一支）。mem-acc
+`0x01fcf004` 仍然排在后面：它是 vendor-only，暂无本板对应源码。桌面仍 CPU-first。
