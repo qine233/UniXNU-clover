@@ -960,15 +960,19 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // is the one worth having, and a class that fills before the fifth hop would make depth_limit and a dropped
   // row read alike. The hop count did not change between the two rounds, so neither did the budget.
   { "clover r296: ", "r296-chain", 128, 0, 0, 0 },
-  // Round297 adds a second row per hop instead of widening the first. The longest r296 row on boot 84
-  // measured 227 bytes, and three pointers printed as %lx (16 digits worst case) plus link=unknown add
-  // 79 -- 306 of the 320-byte record, which leaves fourteen bytes for a name this round cannot predict,
-  // and a longer line is truncated rather than split. The pair is joined by hop= and t=, printed on
-  // either row, so this class filling while r296 still has headroom loses the link verdict and nothing
-  // else -- which is why it gets the same 128 and its own exemption below: the row worth keeping is the
-  // leaf's, and a boot that lost hop=3's identity row would answer the question boot 84's qmc=0 raised
-  // with a silence that reads like "no link".
-  { "clover r297: ", "r297-chain", 128, 0, 0, 0 },
+  // Round297 added a second row per hop instead of widening the first, and Round298 rewrites that row
+  // in place -- one row per hop, so the pair with r296 still joins on hop= and t=. The measured reason
+  // for the separate row survives: the longest r296 row on boot 84 measured 227 bytes, and r297's three
+  // pointers plus link=unknown added 79 of the 320-byte record. r298's row is that same row with eight more
+  // columns (two return codes, vname=, tname=, tspace=, space=, otype=, tlink=), which formats at 225
+  // bytes with every field at its widest (five 16-digit pointers, two -1 codes, link=unknown,
+  // tlink=other_space) and about 205 with boot 86's own values -- still one row under the 320-byte
+  // record, still truncated rather than split if that ever changes. The budget stays 128 and the
+  // exemption below stays, for the reason
+  // boot 86 found: the leaf's identity row is the one worth keeping, and qmc=/qsr= share a translation
+  // with it, so a class that lost hop=3's row would leave the card holding a zero that cannot be
+  // attributed to anything.
+  { "clover r298: ", "r298-chain", 128, 0, 0, 0 },
   // Round289 speaks only at a fatal data abort, and it is the reading the panic record cannot carry:
   // the kind-20 slot is 480 bytes, and boot 74 and boot 75 both showed it cut off inside the register
   // list, before esr, far, fp and sp -- the four fields that name a fault. At most one abt row and two
@@ -4325,11 +4329,13 @@ static void teeConsumeLine (uint32_t &pushed)
        // Round296 rewrote the chain row in place, so it inherits r295's reason: a chain the cap cuts
        // short of its last hop cannot be told from a chain whose last hop reported depth_limit.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r296") ||
-       // Round297's identity row pairs with the chain row through hop= and t=, so losing one of the two
-       // does not misalign the chain -- but the row that answers this round's question is the leaf's,
-       // and a boot whose hop=3 identity row was throttled would report nothing where link= belongs.
-       // A silence that reads like "no link" is the failure this exemption exists to prevent.
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r297"));
+       // Round298 rewrites round297's identity row in place, so it inherits that row's reason: the row
+       // that answers the question is the leaf's, and a boot whose hop=3 identity row was throttled
+       // would report nothing where link= and tlink= belong -- a silence that reads like "no link".
+       // r298 makes that worse and better at once: worse because boot 86 showed qmc=/qsr= are printed
+       // by the same translation that produced rvobj, so a lost row leaves a zero nobody can attribute;
+       // better because tlink= needs no translate on this hop's side, so the row is worth exempting.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r298"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

@@ -3648,12 +3648,86 @@ def check_board(errors: list) -> str:
                 errors.append("build-xnu-4k-baseline.sh does not reverse r297 before r296 in LATE_PATCH: it "
                               "edits the lines r296 wrote, so a tree without them makes it fail to apply -- "
                               "and an earlier apply failure here is silent")
-        if '{ "clover r297: ", "r297-chain", 128, 0, 0, 0 },' not in sdhci_source:
-            errors.append("drivers/CloverSdhci has no class for the r297 rows: an identity row whose prefix "
+        # r297's row no longer ships -- round298 rewrites it in place -- so the two driver-side
+        # assertions of this block point at the round that produced the boot 86 reading. The patch file
+        # itself stays pinned above, because the boot 86 rows on the card were printed by it.
+        if '{ "clover r298: ", "r298-chain", 128, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the r298 rows: an identity row whose prefix "
                           "nothing matches falls into the unclassed flow and gets throttled with the chatter")
-        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r297")' not in sdhci_source:
-            errors.append("the r297 rows are not exempt from the per-pass push cap: losing the leaf's identity "
-                          "row is a silence that reads as a chain that did not link")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r298")' not in sdhci_source:
+            errors.append("the r298 rows are not exempt from the per-pass push cap: losing the leaf's identity "
+                          "row is a silence that reads as a chain that did not link -- and since qmc=/qsr= are "
+                          "printed by the same translation, a dropped row leaves a zero nobody can attribute")
+
+        # Round298 rewrites the identity row round297 introduced, in the same place. Boot 86 read all
+        # three link states and the hop the question was aimed at answered unknown, because the leaf's
+        # receive name never became an object -- and the helper that failed on it is the same one whose
+        # success produced boot 84's qmc=0: both try RECEIVE then SEND and both return with their
+        # out-parameters at their initialised zero. So a zero on the card could mean an empty queue or
+        # a queue never read, and the row carried nothing to choose between them. These assertions hold
+        # the three fixes: the return code of each translation, the name rvobj was really taken from,
+        # and the receiver's own name and space for the port this hop wrote to -- the first comparison
+        # of two port names that lives inside one address space, and the one that works even when this
+        # hop's name does not translate.
+        r298_name = "z" * 57 + "-clover-r298.patch"
+        r298_patch = next((base / "patches/xnu-clover" / r298_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r298_name).is_file()), None)
+        if r298_patch is None:
+            errors.append(f"patches/xnu-clover/{r298_name} is missing: the next boot would again print qmc=0 "
+                          "and rvobj=0 as one statement, which is the shape that cost boot 84 its verdict")
+        else:
+            r298_text = r298_patch.read_text()
+            r298_added = "".join(line for line in r298_text.splitlines(True)
+                                 if line.startswith("+")
+                                 and not line.lstrip("+").lstrip().startswith(("*", "/*")))
+            for needle in ('"clover r298: hop=%u t=%llu prev=%lx rvobj=%lx verr=%d vname=%x robj=%lx"',
+                           '" rerr=%d otype=%d tname=%x tspace=%lx space=%lx link=%s tlink=%s\\n"',
+                           'clover_sb_port_obj(task_t task, mach_port_name_t name, int *err, int *otype,',
+                           '*err = -1;',
+                           '*err = -2;',
+                           '*otype = (int)io_otype(obj);',
+                           '*rname = port->ip_receiver_name;',
+                           '*rspace = (uintptr_t)port->ip_receiver;',
+                           'tlink = (prev_tname == (uint32_t)frcv) ? "yes" : "no";',
+                           'prev_have = (robj != 0) ? 1 : 0;',
+                           'printf("clover r297: hop=%u'):
+                if needle not in r298_text:
+                    errors.append(f"{r298_name} lacks {needle[:72]!r}: without it the row cannot say which of "
+                                  "its zeros is a measurement and which is a failed translation -- and the "
+                                  "r297 printf has to appear, as the line this round replaces, because a "
+                                  "patch that only appends never rewrote the identity row")
+            if 'printf("clover r297:' in r298_added:
+                errors.append(f"{r298_name} still prints the r297 row beside the r297 one: two identity rows "
+                              "per hop double the chain's tee traffic for no new reading")
+            for value in ('tlink = "-";', 'tlink = "no_obj";', 'tlink = "no_recv";',
+                          'tlink = "other_space";', 'tlink = "no_name";'):
+                if value not in r298_added:
+                    errors.append(f"{r298_name} never prints {value}: tlink= has to name which side ran out, "
+                                  "and a verdict that cannot be printed reads as a row that was never written")
+            if 'printf("clover r296:' in r298_added:
+                errors.append(f"{r298_name} rewrites the r296 chain row instead of the identity row: boots "
+                              "83 to 86 are compared column by column and that row has to keep its shape")
+            for forbidden in ("vn_getpath(", "vnode_lock", "lck_mtx_lock(", "proc_lock(", "thread_block(",
+                              "simple_wait(", "io_lock(", "ipc_space_lock"):
+                if forbidden in r298_added:
+                    errors.append(f"{r298_name} calls {forbidden}: the chain runs beside a wedged userland, "
+                                  "and the receiver's fields are read while ipc_object_translate() already "
+                                  "holds the object's own lock")
+            load_r298 = REPO.parent / "UniXNU" / "patches" / "xnu" / r298_name
+            if not load_r298.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r298_name} is missing: unixnu loads patches from there "
+                              "and silently skips one that lives only in this repo")
+            elif load_r298.read_bytes() != r298_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r298_name} is not the same bytes as this repo's copy: "
+                              "the two trees would compile different kernels")
+            late_script = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list = " ".join(line for line in late_script.splitlines() if "clover-r2" in line)
+            if (late_list.find(r298_name) < 0 or
+                    late_list.find(r298_name) > late_list.find("z" * 56 + "-clover-r297.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r298 before r297 in LATE_PATCH: it "
+                              "edits the lines r297 wrote, so a tree without them makes it fail to apply -- "
+                              "and an earlier apply failure here is silent")
 
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
@@ -4956,8 +5030,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r297:"):
-        errors.append('[payload] title is not "clover r297: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r298:"):
+        errors.append('[payload] title is not "clover r298: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -6085,8 +6159,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r297:"):
-        errors.append('[payload] title is not "clover r297: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r298:"):
+        errors.append('[payload] title is not "clover r298: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

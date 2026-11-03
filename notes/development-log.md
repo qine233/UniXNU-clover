@@ -22932,3 +22932,46 @@ tsens 最高 `372`（boot 85 是 379）、`emmc_therm=-40` 仍按未接处理；
 8 行 r296、**8 行 r297**、0 行 probe）、`…landing-{sensors.txt,rawdump-head.bin}`、
 `~/clover-out/r297-boot86-unattended.log`；镜像 `round297-v0.7.1-payload.img`（`66d2e29b…`）、
 内核 `round297-kernel-{amfi,normalized}.macho`（`370c781d…`／`b8044988…`）。
+
+## Round298 (v0.7.2): 一行读数要能说出它自己是怎么变成 0 的
+
+**① 这一支只补 boot 86 读出来的三格。** (1) 每枚翻译带上**自己的返回码**——`qmc=/qsr=` 与 `rvobj=` 共用同一枚
+翻译、失败都停在初始化的 0，本靴证明「译不出」这一支是真实的，于是那个 0 有两种读法；
+(2) `rvobj` 打出它究竟用的哪枚名字（`vname=`），因为 `rvobj` 跟的是 `frcv`（第一根在 trap 内的线程），
+而 `cap=send` 行打印的 `rcv=` 跟的是 `nrcv`（第一根 `x3≠0` 的线程）；
+(3) 读 `remote=` 那枚对象的 **`ip_receiver_name`/`ip_receiver`**（`tname=`/`tspace=`）与本跳自己的
+`itk_space`（`space=`）——**收方任务自己给这枚口的名字，与本跳 `rcv=` 在同一个地址空间里，因而可比**，
+而它不需要那枚名字译得出对象。不走 `is_table` 普查：它要空间的锁，`check-clover.py` 这一支禁的就是等锁。
+
+**② 怎么写。** `clover_sb_port_obj()` 多加四个出参（`err`/`otype`/`rname`/`rspace`）：
+`-1`＝根本没名字可译、`-2`＝这个任务没有 space、其余就是内核返回的 `kern_return_t`。
+两枚收方字段在 `ipc_object_translate()` **仍然持着对象锁**的时候读，读完才 `io_unlock()`；
+`otype` 用 `io_otype()` 分开工港与 port set，因为「译出来但不是 port」与「port 的收回权已消亡」
+在 r297 里都印成 0。`tlink=` 由内核自己比：`(prev_tspace, prev_tname)` 对上 `(space, frcv)`。
+
+**③ 七态判据，boot 87 刷前写死。**
+`-`（第一跳，没有上一跳可比）；`no_obj`（上一跳的 `remote=` 没译出对象，它没有收方可比）；
+`no_recv`（译出了 port，但那枚 port 没有活的收回权——`rerr=0` 而 `tname/tspace` 皆 0）；
+`other_space`（那枚口收在**另一个任务**里，链条的 peer 规则本身要重读）；
+`no_name`（本跳的 trap 线程手里没有收名）；`yes`（同空间同名 ⇒ 上一跳写的就是这一跳在等的口）；
+`no`（同空间不同名 ⇒ 请求落在同一个任务的另一枚口上）。
+`yes` 且该跳 `rerr=0` 而队列仍空 ⇒ 进内核投递-唤醒那一格（`ipc_mqueue_send()`，接收侧
+`thread_block(ipc_mqueue_receive_continue)`，`osfmk/ipc/ipc_mqueue.c:1214`）；
+`no` ⇒ 镜像侧普查那个任务自己的 entry 集；`other_space` ⇒ 「谁欠谁」得改用收方身份而不是发送权的属主。
+
+**④ 从今天起 `qmc=0` 的读法有前提：同一行 `verr=0`。** 这是这一支给自己立的规矩，也是 boot 84 那条判据的死因。
+
+**⑤ 一行不换两行。** r298 **改写** r297 那一行，不另起第三行：`clover r297:` 前缀从此不再出现在卡上，
+新行实测最长 **225 字节**（五枚 16 位指针 + 两枚 `-1` + `link=unknown` + `tlink=other_space`），
+仍在 320 字节的 tee 记录之内；`clover r296:` 那一行**一位不动**，boot 83–86 的列还能逐列对比。
+驱动侧类名与豁免前缀一起换成 `r298-chain`/`"r298"`（预算仍 128）：被 cap 吃掉叶子那行，
+剩下的就是一个没人能归因的 0。
+
+**⑥ 正对照（刷前写好）。** `hop=0` 必须 `prev=0 link=- tlink=-`；每跳一条身份行、条数与 r296 行相同；
+卡上**不该再有 `clover r297:` 前缀**——出现即说明这枚补丁没链进镜像；
+WDT、keystore、GPU 三行照常在场，说明别的格子没退步。
+
+**⑦ 一位也不写。** 全支只有读与比较：`ipc_object_translate` + 持锁读两枚字段 + `io_unlock`，
+没有 `io_lock`、`simple_wait`、`thread_block`（checker 反向钉住）。
+GPU 那一格（`gfx_mem_acc` 的 `acc-sel-l1 @ 0x01fcf004`）仍按 §5.12 的结论**单独一轮发**：
+它要新增第四枚 `IODeviceMemory::withRange`，与内核补丁不同层，同靴出险分不清是谁。

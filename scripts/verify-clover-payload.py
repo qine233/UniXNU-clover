@@ -1111,7 +1111,16 @@ def check_sb_sample(kernel: bytes) -> bool:
              # survives crossing address spaces, and link= is the kernel's own comparison of two of them. The
              # literal is pinned whole for the standing reason: a format string cut in half leaves every prefix
              # needle green, and this row is the whole answer of the round.
-             "bb-chain-link": (b"clover r297: hop=%u t=%llu prev=%lx rvobj=%lx robj=%lx link=%s\n") in kernel,
+             # Round298 rewrites the identity row round297 shipped, in the same three columns: boot 86 read
+            # link=unknown at the leaf because its rcv=d03 never became an object, and the helper that failed
+            # is the same one that produced boot 84's qmc=0 -- both leave their out-parameters at zero when
+            # ipc_object_translate() fails, so the row has to carry the codes. tname=/tspace= are the receiver's
+            # own name and space for the port this hop wrote from (ip_receiver_name/ip_receiver, written by
+            # ipc_port_init() at osfmk/ipc/ipc_port.c:846-847), and space= is this task's own, which is the
+            # first comparison of two port names that lives inside one address space. Pinned whole: a cut
+            # literal would still leave the r297 prefix needles green.
+            "bb-chain-link": (b"clover r298: hop=%u t=%llu prev=%lx rvobj=%lx verr=%d vname=%x robj=%lx"
+                              b" rerr=%d otype=%d tname=%x tspace=%lx space=%lx link=%s tlink=%s\n") in kernel,
              # Round275 measured the precondition of the only proposed fix and Round276 acted on it, so three
              # rows are pinned: the class lookup (what r275 read as 0/0 on boot 62, and what has to read 1 the
              # moment this round works -- the needle checking itself), the publish's own state (stage 3 with a

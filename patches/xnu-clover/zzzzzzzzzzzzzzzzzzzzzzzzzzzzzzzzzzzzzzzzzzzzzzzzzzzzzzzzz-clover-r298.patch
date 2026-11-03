@@ -1,0 +1,194 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 7f2ce4d..ad5a91f 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11399,19 +11399,45 @@ clover_sb_port_mail(task_t task, mach_port_name_t name, uint32_t *mc, uint32_t *
+  * nothing is read from it here, and io_unlock() runs before returning. The value is an identity,
+  * not a reference -- printed and compared, never dereferenced after the unlock -- so a port freed
+  * between two hops can only make the comparison say no, never fault.
++ *
++ * Round298 keeps the translation and the lock discipline and adds the three things boot 86 showed
++ * this shape was missing. (1) It hands back its own return code, because r297's zero and
++ * clover_sb_port_mail's zero were the same zero: both helpers try RECEIVE then SEND and both leave
++ * their out-parameters at their initialised value when the translate fails, so boot 84's leaf
++ * printing qmc=0 qsr=0 meant either "nothing queued and nobody holds a send right" or "this name
++ * never became an object" -- and boot 86 proved the second branch is real by failing to translate
++ * the leaf's own rcv=d03 in both of its fires. (2) It reads, while the translate still holds the
++ * object's lock, the two fields that make the next hop comparable at all: ip_receiver_name and
++ * ip_receiver, which ipc_port_init() writes when the port is allocated (osfmk/ipc/ipc_port.c:846-847)
++ * and which ipc_port_destroy()/ipc_object_destroy() clear with the receive right. They are the
++ * receiving task's own name for this port and the receiving task's own space, so a name printed from
++ * them can be compared with a name printed from that task's own registers -- no cross-space index
++ * comparison, which is exactly what r297 could not do. (3) It says what kind of object it found,
++ * because "translated but is a port set" and "translated to a port whose receive right is gone"
++ * both otherwise print as tname=0.
+  */
+ static uintptr_t
+-clover_sb_port_obj(task_t task, mach_port_name_t name)
++clover_sb_port_obj(task_t task, mach_port_name_t name, int *err, int *otype,
++    uint32_t *rname, uintptr_t *rspace)
+ {
+ 	ipc_space_t space;
+ 	ipc_object_t obj = IPC_OBJECT_NULL;
+ 	kern_return_t kr;
+ 
++	/*
++	 * -1 means there was no name to translate and -2 no space to translate it in; neither is a
++	 * kernel return code, and neither is ever printed next to a non-zero object.
++	 */
++	*err = -1;
++	*otype = -1;
++	*rname = 0;
++	*rspace = 0;
+ 	if (name == MACH_PORT_NULL) {
+ 		return 0;
+ 	}
+ 	space = task->itk_space;
+ 	if (space == IPC_SPACE_NULL) {
++		*err = -2;
+ 		return 0;
+ 	}
+ 	kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_RECEIVE, &obj);
+@@ -11419,8 +11445,17 @@ clover_sb_port_obj(task_t task, mach_port_name_t name)
+ 		kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_SEND, &obj);
+ 	}
+ 	if (kr != KERN_SUCCESS) {
++		*err = (int)kr;
+ 		return 0;
+ 	}
++	*err = (int)kr;
++	*otype = (int)io_otype(obj);
++	if (*otype == IOT_PORT) {
++		ipc_port_t port = (ipc_port_t)obj;
++
++		*rname = port->ip_receiver_name;
++		*rspace = (uintptr_t)port->ip_receiver;
++	}
+ 	io_unlock(obj);
+ 	return (uintptr_t)obj;
+ }
+@@ -12698,6 +12733,36 @@ clover_bb_exec_name(task_t task, char *out, size_t outlen)
+  * 320-byte tee record, which leaves fourteen bytes for a name this round cannot predict.
+  * A longer line is truncated, not split, and end= sits at the tail: the one column that
+  * says why the walk stopped.
++ *
++ * Round298 rewrites that second row rather than adding a third, because boot 86 read the question
++ * and answered it unknown. link= was supposed to say whether the request hop N-1 placed went to the
++ * port hop N is blocked receiving on, and it could only ask by translating hop N's receive name into
++ * an object -- which the leaf's name never became, in either of boot 86's fires. So the row now
++ * carries the return code of both translations (rerr=/verr=, and -1/-2 mean "there was no name" and
++ * "there was no space", which the shared zero used to hide), the name rvobj was translated from
++ * (vname=, because rvobj takes frcv -- the first thread found inside the trap -- while a cap=send
++ * row prints nrcv, from the first thread whose x3 is non-zero, and boot 86 made those two disagree),
++ * and the receiver's own two identifiers for the object this hop's remote= names: tname= is that
++ * port's name in the receiving task's space and tspace= is that task's space, both read under the
++ * object's own lock. tlink= then compares (tspace, tname) carried from the previous hop against
++ * (space, vname) of this one -- a comparison of two names inside one address space, which is the
++ * thing port names across spaces could never be:
++ *
++ *   -            the first hop; there is nothing walked before it
++ *   no_obj       the previous hop's remote= did not translate, so it has no receiver to compare
++ *   no_recv      it did translate to a port, but that port has no live receive side
++ *   other_space  the port is received in a task other than the hop this chain walked to
++ *   no_name      this hop has a receiver to compare against but no receive name in its trap thread
++ *   yes          same space, same name -- the previous hop wrote to the port this one is blocked on
++ *   no           same space, different name -- the request landed on another port of this task
++ *
++ * otype= says which of those a zero means: io_otype() of the translated object (0 = port, 1 = set),
++ * -1 when nothing translated. A port whose receive right has died gives rerr=0 with tname=0 and
++ * tspace=0, and a port set gives the same zeros with otype=1 -- the two readings r297 could not tell
++ * apart. link= stays, as the object-identity cross-check of the two translations, so a hop where
++ * link= and tlink= disagree is itself the reading worth looking at. Nothing here waits: no space
++ * lock, no task lock beyond the one the walk already try-locks, no thread_block; the fields are read
++ * while ipc_object_translate() still holds the object's lock.
+  */
+ static void
+ clover_bb_chain(task_t root, uint64_t secs)
+@@ -12709,6 +12774,9 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 	int seen[CLOVER_BB_CHAIN + 1];
+ 	uint32_t nseen = 0;
+ 	uintptr_t prev_obj = 0;
++	uint32_t prev_tname = 0;
++	uintptr_t prev_tspace = 0;
++	int prev_have = 0;
+ 
+ 	while (cur != TASK_NULL) {
+ 		thread_t thr;
+@@ -12737,6 +12805,16 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 		uintptr_t robj = 0;
+ 		uintptr_t rvobj = 0;
+ 		const char *link = "-";
++		int rerr = -1;
++		int verr = -1;
++		int otype = -1;
++		int votype = -1;
++		uint32_t tname = 0;
++		uintptr_t tspace = 0;
++		uint32_t v_rname = 0;
++		uintptr_t v_rspace = 0;
++		uintptr_t space_id = 0;
++		const char *tlink = "-";
+ 		int busy = 0;
+ 
+ 		comm[0] = exec[0] = peer[0] = '\0';
+@@ -12825,10 +12903,12 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 		 * where its message went.
+ 		 */
+ 		if (nrem != 0) {
+-			robj = clover_sb_port_obj(cur, (mach_port_name_t)nrem);
++			robj = clover_sb_port_obj(cur, (mach_port_name_t)nrem, &rerr, &otype,
++			    &tname, &tspace);
+ 		}
+ 		if (frcv != 0) {
+-			rvobj = clover_sb_port_obj(cur, (mach_port_name_t)frcv);
++			rvobj = clover_sb_port_obj(cur, (mach_port_name_t)frcv, &verr, &votype,
++			    &v_rname, &v_rspace);
+ 		}
+ 		if (prev_obj != 0) {
+ 			if (rvobj != 0) {
+@@ -12837,6 +12917,27 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 				link = "unknown";
+ 			}
+ 		}
++		/*
++		 * Round298. The comparison that does not need this hop's name to translate: carry the
++		 * receiver's own two identifiers over from the previous hop and ask whether this task is
++		 * that receiver and this hop's waiting name is that name. hop 0 has nothing walked
++		 * before it, and every failure state names which side it ran out of -- r297's single
++		 * "unknown" covered three different readings and boot 86 could not tell them apart.
++		 */
++		space_id = (uintptr_t)cur->itk_space;
++		if (hop == 0) {
++			tlink = "-";
++		} else if (prev_have == 0) {
++			tlink = "no_obj";
++		} else if (prev_tspace == 0 || prev_tname == 0) {
++			tlink = "no_recv";
++		} else if (prev_tspace != space_id) {
++			tlink = "other_space";
++		} else if (frcv == 0) {
++			tlink = "no_name";
++		} else {
++			tlink = (prev_tname == (uint32_t)frcv) ? "yes" : "no";
++		}
+ 		if (nrem != 0) {
+ 			uint32_t k;
+ 
+@@ -12887,10 +12988,15 @@ clover_bb_chain(task_t root, uint64_t secs)
+ 		    (unsigned int)(uint32_t)nrcv, (unsigned int)(uint32_t)nrem,
+ 		    (unsigned long long)nto, nrmc, nrsr, nqmc, nqsr,
+ 		    peer[0] != '\0' ? peer : "-", end);
+-		printf("clover r297: hop=%u t=%llu prev=%lx rvobj=%lx robj=%lx link=%s\n", hop,
++		printf("clover r298: hop=%u t=%llu prev=%lx rvobj=%lx verr=%d vname=%x robj=%lx"
++		    " rerr=%d otype=%d tname=%x tspace=%lx space=%lx link=%s tlink=%s\n", hop,
+ 		    (unsigned long long)secs, (unsigned long)prev_obj, (unsigned long)rvobj,
+-		    (unsigned long)robj, link);
++		    verr, (unsigned int)(uint32_t)frcv, (unsigned long)robj, rerr, otype, tname,
++		    (unsigned long)tspace, (unsigned long)space_id, link, tlink);
+ 		prev_obj = robj;
++		prev_tname = tname;
++		prev_tspace = tspace;
++		prev_have = (robj != 0) ? 1 : 0;
+ 		if (nseen < (uint32_t)(sizeof(seen) / sizeof(seen[0]))) {
+ 			seen[nseen++] = task_pid(cur);
+ 		}
