@@ -2596,15 +2596,26 @@ static uint32_t admaBuildTable (uint32_t bytes)
 // Which part of a DMA read refused. Eight lines is the r169 rule: enough for a frame, bounded enough
 // for a boot. The ADMA_ERROR byte is printed because it names the descriptor the host gave up on --
 // a zero-length or misaligned table looks different from an address the bus refused.
-static void reportDmaFailure (const char *stage, uint32_t lba, uint32_t blocks, uint32_t status)
+//
+// Round293 adds how long the wait actually ran and how many polls it took, because the stage word
+// could not say which of two very different things happened: the card sitting on the data line past
+// the per-request deadline, or this loop spending its own spin budget before that deadline arrived.
+// Boot 79 refused seven transfers and its frame cannot tell the two apart -- both were printed as
+// "deadline", which reads as an accusation against the card whether or not the card was ever given
+// its 600 ms.
+static void reportDmaFailure (const char *stage, uint32_t lba, uint32_t blocks, uint32_t status,
+                              uint64_t elapsed = 0, uint64_t budget = 0, uint32_t polls = 0,
+                              uint64_t frequency = 19200000ULL)
 {
   static uint32_t reported = 0;
   if (reported >= 8) {
     return;
   }
   reported++;
-  sdhciSay ("CloverSdhci r172: dma %s lba=%u blocks=%u st=%08x err8=%02x hctl=%02x\n",
-         stage, lba, blocks, status, read8 (SDHCI_ADMA_ERROR), read8 (SDHCI_HOST_CONTROL));
+  sdhciSay ("CloverSdhci r172: dma %s lba=%u blocks=%u st=%08x err8=%02x hctl=%02x "
+            "ms=%llu budget=%llu polls=%u\n",
+         stage, lba, blocks, status, read8 (SDHCI_ADMA_ERROR), read8 (SDHCI_HOST_CONTROL),
+         elapsed * 1000ULL / frequency, budget * 1000ULL / frequency, polls);
 }
 
 // One CMD18 with the data phase handed to the host: same command, same block count, same explicit
@@ -2678,6 +2689,7 @@ static bool readAdmaRun (uint32_t lba, uint32_t *dst, uint32_t blocks, uint32_t 
                             static_cast<uint64_t> (blocks) * (frequency / 20ULL);
   const uint64_t start = readCounter ();
   bool ended = false;
+  bool spun = false;
   uint32_t guard = 0;
   for (;;) {
     status = read32 (SDHCI_INT_STATUS);
@@ -2692,6 +2704,7 @@ static bool readAdmaRun (uint32_t lba, uint32_t *dst, uint32_t blocks, uint32_t 
       break;
     }
     if (++guard >= kCommandSpinLimit) {
+      spun = true;
       break;
     }
   }
@@ -2700,7 +2713,8 @@ static bool readAdmaRun (uint32_t lba, uint32_t *dst, uint32_t blocks, uint32_t 
   const bool stopped = sendStopCommand ();
   if (!ended || (status & (kContentErrorMask | SDHCI_INT_ADMA_ERROR)) || !stopped) {
     abortReadTransfer ();
-    reportDmaFailure (ended ? (stopped ? "error" : "stop") : "deadline", lba, blocks, status);
+    reportDmaFailure (!ended ? (spun ? "spin" : "deadline") : (stopped ? "error" : "stop"),
+                      lba, blocks, status, ticks, deadline, guard, frequency);
     return false;
   }
   // The host wrote these lines behind the CPU's back; drop whatever the cache still holds of them.
@@ -3586,6 +3600,15 @@ static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t bl
   for (uint32_t i = 0; i < extraWords && 35 + i < kBlockWords; i++) {
     gFlightBlock[35 + i] = extra[i];
   }
+  // Round293: which boot wrote this. Boot 79's frame is the reason the field exists: the deadline
+  // slot and the panic slots are the only two groups a boot may never reach, and when it does not
+  // the previous boot's copies stay on the card and read, word for word, as this boot's ending. An
+  // entry or a beat carries no extras, so its stamp is the first word after the header; the two
+  // events that do carry extras put the stamp after their own (the deadline's is extra[10], and the
+  // panic marker already named gBootId as extra[6] since round236).
+  if (extraWords == 0) {
+    gFlightBlock[35] = gBootId;
+  }
   uint32_t words = 0, status = 0;
   if (!writePioBlock (record, gFlightBlock, words, status)) {
     return false;
@@ -3794,7 +3817,7 @@ extern "C" void clover_emmc_flight_deadline (unsigned long long seconds, unsigne
   }
   uint32_t token = 0;
   (void)tryTakeHost (token);
-  uint32_t extra[10];
+  uint32_t extra[11];
   extra[0] = static_cast<uint32_t> (seconds);
   extra[1] = static_cast<uint32_t> (seconds >> 32);
   extra[2] = static_cast<uint32_t> (ticks);
@@ -3805,7 +3828,10 @@ extern "C" void clover_emmc_flight_deadline (unsigned long long seconds, unsigne
   extra[7] = static_cast<uint32_t> (cnt1 >> 32);
   extra[8] = static_cast<uint32_t> (freq);
   extra[9] = static_cast<uint32_t> (freq >> 32);
-  (void)flightWrite (kFlightEventDeadline, 3, 0, 0, extra, 10);
+  // Round293: the boot this record belongs to. A deadline record is the one reading a boot can
+  // leave behind for the next one to mistake for its own, and boot 79 did exactly that.
+  extra[10] = gBootId;
+  (void)flightWrite (kFlightEventDeadline, 3, 0, 0, extra, 11);
   dropHostTicket (token);
 }
 
@@ -4783,15 +4809,19 @@ static const uint32_t kWriteCheckOffset = 4096u;
 // Which part of a DMA write refused, with the same eight-line bound the read reporter uses. The
 // ADMA_ERROR byte names the descriptor the host gave up on; HOST_CONTROL is printed because a DMA
 // scheme bit that did not stick looks different from a table the bus refused to read.
-static void reportWriteDmaFailure (const char *stage, uint32_t lba, uint32_t blocks, uint32_t status)
+static void reportWriteDmaFailure (const char *stage, uint32_t lba, uint32_t blocks, uint32_t status,
+                                   uint64_t elapsed = 0, uint64_t budget = 0, uint32_t polls = 0,
+                                   uint64_t frequency = 19200000ULL)
 {
   static uint32_t reported = 0;
   if (reported >= 8) {
     return;
   }
   reported++;
-  sdhciSay ("CloverSdhci r173: dma write %s lba=%u blocks=%u st=%08x err8=%02x hctl=%02x\n",
-         stage, lba, blocks, status, read8 (SDHCI_ADMA_ERROR), read8 (SDHCI_HOST_CONTROL));
+  sdhciSay ("CloverSdhci r173: dma write %s lba=%u blocks=%u st=%08x err8=%02x hctl=%02x "
+            "ms=%llu budget=%llu polls=%u\n",
+         stage, lba, blocks, status, read8 (SDHCI_ADMA_ERROR), read8 (SDHCI_HOST_CONTROL),
+         elapsed * 1000ULL / frequency, budget * 1000ULL / frequency, polls);
 }
 
 // One block run read straight through PIO, block by block. The verification reads of this round's
@@ -4891,6 +4921,7 @@ static bool writeAdmaRun (uint32_t lba, const uint32_t *src, uint32_t blocks, ui
                             static_cast<uint64_t> (blocks) * (frequency / 20ULL);
   const uint64_t start = readCounter ();
   bool ended = false;
+  bool spun = false;
   uint32_t guard = 0;
   for (;;) {
     status = read32 (SDHCI_INT_STATUS);
@@ -4905,6 +4936,7 @@ static bool writeAdmaRun (uint32_t lba, const uint32_t *src, uint32_t blocks, ui
       break;
     }
     if (++guard >= kCommandSpinLimit) {
+      spun = true;
       break;
     }
   }
@@ -4913,7 +4945,8 @@ static bool writeAdmaRun (uint32_t lba, const uint32_t *src, uint32_t blocks, ui
   const bool stopped = sendStopCommand ();
   if (!ended || (status & (kContentErrorMask | SDHCI_INT_ADMA_ERROR)) || !stopped) {
     resetReadPath ();
-    reportWriteDmaFailure (ended ? (stopped ? "error" : "stop") : "deadline", lba, blocks, status);
+    reportWriteDmaFailure (!ended ? (spun ? "spin" : "deadline") : (stopped ? "error" : "stop"),
+                           lba, blocks, status, ticks, deadline, guard, frequency);
     return false;
   }
   return true;
@@ -8924,6 +8957,7 @@ extern "C" void clover_unattended_begin (void)
   // in RAM and is the first record the drain writes once the window is known.
   volatile uint64_t *record = reinterpret_cast<volatile uint64_t *> (base + kResetRecordOffset);
   const uint64_t recordMagic = record[0];
+  const uint64_t beatMagic = record[9];
   const uint64_t beats = record[10];
   const uint64_t beatCounter = record[11];
   if (recordMagic == kResetRecordMagic) {
@@ -8937,15 +8971,23 @@ extern "C" void clover_unattended_begin (void)
       }
     }
     text[i] = 0;
-    sdhciSay ("clover r283: last reset kind=%llu pid=%llu aux=%llx pc=%llx cnt=%llu beat=%llu beatcnt=%llu text=%s\n",
+    sdhciSay ("clover r283: last reset kind=%llu pid=%llu aux=%llx pc=%llx cnt=%llu "
+           "beat=%llu beatcnt=%llu beatmagic=%llx text=%s\n",
            static_cast<unsigned long long> (record[1]), static_cast<unsigned long long> (record[2]),
            static_cast<unsigned long long> (record[3]), static_cast<unsigned long long> (record[4]),
            static_cast<unsigned long long> (record[5]), static_cast<unsigned long long> (beats),
-           static_cast<unsigned long long> (beatCounter), text);
+           static_cast<unsigned long long> (beatCounter),
+           static_cast<unsigned long long> (beatMagic), text);
   } else {
-    sdhciSay ("clover r283: last reset unnamed magic=%llx beat=%llu beatcnt=%llu\n",
+    // Round293 puts the heartbeat's own magic next to the two numbers it maintains. Boots 77 and 79
+    // both read this branch, and the words they found are shaped like small counters rather than
+    // like anything this driver writes; with the magic in the row, an unnamed sighting splits into
+    // "the slot never held our heartbeat" (the channel is not ours) and "our heartbeat, but nobody
+    // named the reset" (the channel is ours and the hook did not fire). Without it the two read alike.
+    sdhciSay ("clover r283: last reset unnamed magic=%llx beat=%llu beatcnt=%llu beatmagic=%llx\n",
            static_cast<unsigned long long> (recordMagic), static_cast<unsigned long long> (beats),
-           static_cast<unsigned long long> (beatCounter));
+           static_cast<unsigned long long> (beatCounter),
+           static_cast<unsigned long long> (beatMagic));
   }
   for (unsigned int i = 0; i < 20; ++i) {
     record[i] = 0;

@@ -3005,6 +3005,41 @@ def check_board(errors: list) -> str:
                 errors.append(f"the tee still carries round {stale[2:]}'s class: a class for a producer that "
                               "no longer exists is how a budget looks allocated when nothing is spending it")
 
+        # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
+        # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
+        # its own ending, so a silent boot leaves the boot before it on the card and the reader called
+        # boot 76's deadline "this boot's". A stamp that only some records carry is the same hole, so the
+        # entries, the beats and the deadline record carry it too, and the reader is asserted below to
+        # print STALE rather than a conclusion when the stamp disagrees with the boot counter.
+        if "gFlightBlock[35] = gBootId;" not in sdhci_source:
+            errors.append("flightWrite stamps no boot on the records that carry no extras: an entry or a "
+                          "beat from the boot before the flash would read as this boot's last request")
+        if "extra[10] = gBootId;" not in sdhci_source or \
+                "(void)flightWrite (kFlightEventDeadline, 3, 0, 0, extra, 11);" not in sdhci_source:
+            errors.append("the deadline record carries no boot id: it is the one record a boot leaves "
+                          "behind for the next one to mistake for its own ending, and boot 79 did")
+        # The same round fixes two lines that could not answer the question they were asked. A DMA
+        # refusal printed "deadline" whether the card held the data line past the per-request budget or
+        # the driver's own spin limit ran out first -- and boot 79 refused seven transfers without ever
+        # saying which of the two it saw. Both sides now print the time they waited, the budget they
+        # were working to and the poll count, and name the exit that fired.
+        for stage in ('(spun ? "spin" : "deadline")', '"ms=%llu budget=%llu polls=%u\\n"'):
+            if sdhci_source.count(stage) < 2:
+                errors.append(f"only one DMA refusal path carries {stage[:28]}: the read side and the write "
+                              "side both refused transfers on boot 79's frame and neither could say how long "
+                              "it had waited or which of its two budgets expired")
+        if 'reportDmaFailure (ended ? (stopped ? "error" : "stop") : "deadline"' in sdhci_source or \
+                'reportWriteDmaFailure (ended ? (stopped ? "error" : "stop") : "deadline"' in sdhci_source:
+            errors.append("a DMA refusal still calls every early exit a deadline: the card being deaf and "
+                          "this driver giving up early are different accusations and boot 79 could not tell "
+                          "them apart")
+        # And the cross-reset row: two unnamed sightings in a row (boots 77 and 79) printed the
+        # heartbeat's two words without the magic that says whether the slot was ever this driver's.
+        if sdhci_source.count("beatmagic=%llx") < 2:
+            errors.append("the last-reset row prints the heartbeat words without the heartbeat's magic: "
+                          "\"the slot does not hold our record\" and \"our record, but nobody named the "
+                          "reset\" would still read alike")
+
         # Round286 takes the GPU line from measurement to power-on: GDSC cx then gx, the AHB/CFG
         # votes, the gfx3d branch enable, then a read-back of the GDSCRs and a gated chipid read.
         # Four halves still have to agree, the same four every Clover driver has: the two source
@@ -3212,9 +3247,12 @@ def check_board(errors: list) -> str:
         if not (0 <= read_at < clear_at < arm_at):
             errors.append("clover_unattended_begin does not read the record, clear twenty words and only "
                           "then arm the pointer: a later order would erase the reading before it is printed")
-        for needle in ("\"clover r283: last reset kind=%llu pid=%llu aux=%llx pc=%llx cnt=%llu "
-                       "beat=%llu beatcnt=%llu text=%s\\n\"",
-                       "\"clover r283: last reset unnamed magic=%llx beat=%llu beatcnt=%llu\\n\""):
+        # The named row's format string is split across two lines by the C source, so the contract
+        # matches each literal segment as it appears rather than a joined form no file can contain.
+        for needle in ("\"clover r283: last reset kind=%llu pid=%llu aux=%llx pc=%llx cnt=%llu \"",
+                       "\"beat=%llu beatcnt=%llu beatmagic=%llx text=%s\\n\"",
+                       "\"clover r283: last reset unnamed magic=%llx beat=%llu beatcnt=%llu "
+                       "beatmagic=%llx\\n\""):
             if needle not in sdhci_source:
                 errors.append(f"CloverSdhci.cpp lacks {needle[:48]!r}: kind and the unnamed line are the "
                               "two halves of this round's answer")
@@ -3769,8 +3807,8 @@ def check_board(errors: list) -> str:
                  "no deadline entry point for the timer to call before panic()"),
                 ("if (__atomic_exchange_n (&gFlightDeadlineDone, 1u, __ATOMIC_ACQ_REL)) {",
                  "the deadline record is not one-shot: every CPU in the interrupt would write it"),
-                ("(void)flightWrite (kFlightEventDeadline, 3, 0, 0, extra, 10);",
-                 "the deadline record does not carry its five 64-bit numbers"),
+                ("(void)flightWrite (kFlightEventDeadline, 3, 0, 0, extra, 11);",
+                 "the deadline record does not carry its five 64-bit numbers plus the boot stamp"),
                 ("flightPanicMark (0, 0, text != nullptr);",
                  "the panic sink has no entry marker: a sink that died inside append would leave "
                  "nothing to say it was ever entered"),
@@ -4668,8 +4706,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r292:"):
-        errors.append('[payload] title is not "clover r292: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r293:"):
+        errors.append('[payload] title is not "clover r293: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -4688,14 +4726,22 @@ def check_board(errors: list) -> str:
     # for fastboot and printed "the board returned to fastboot by itself, so the deadline fired";
     # round195 read the same landing and the board had come up in Android and been put into
     # fastboot by hand, so that sentence was true about the deadline and false about its intent.
-    # The wait now answers both landings, TWRP's adb means the panic's own BCB took, and fastboot
-    # means it did not and the host writes its own. Both halves are asserted by name because the
-    # sequence around them is the same reboot-then-watch earlier rounds used.
+    # The wait now answers both landings, and fastboot means the recovery command never reached
+    # misc. Both halves are asserted by name because the sequence around them is the same
+    # reboot-then-watch earlier rounds used.
+    # Round293 takes the last over-read out of the TWRP branch: round198 pre-arms the BCB so that
+    # *any* reset lands in recovery, so an adb landing says a reset happened and nothing about which
+    # one. Boot 79 ended silent and printed "the panic path's own BCB took ... after the deadline
+    # reset", which is the sentence this project keeps having to un-write.
     script_text = (REPO / "scripts/run-clover-unattended.sh").read_text()
     if "watch_after_deadline() {" not in script_text:
         errors.append("scripts/run-clover-unattended.sh has no watch_after_deadline: after "
                       "--boot-after-flash the script would again read a fastboot landing as proof "
                       "of a reset whose recovered landing it never checked")
+    if "after the deadline reset" in script_text:
+        errors.append("scripts/run-clover-unattended.sh still calls a TWRP landing the deadline's: "
+                      "since round198 pre-arms the BCB every reset lands there, and a silent boot "
+                      "would be reported as one that reached its deadline")
     # Round202's frame reached SpringBoard at 358 s, and its 900 s deadline sat outside the
     # script's WAIT window -- so the board's own reset landed after the window closed and the
     # run reported "neither". Round228's deadline is 1800 s (board.toml), so WAIT and
@@ -5376,6 +5422,13 @@ def check_board(errors: list) -> str:
                        "def decode_boot(data, first_lba)",
                        "FLIGHT_DEADLINE_OFFSET = 60", "FLIGHT_PANIC_OFFSET = 61",
                        '4: "deadline", 5: "panic"', '3: "none"',
+                       # Round293: the reader has to say which boot wrote what it prints. A stale
+                       # deadline record is not a boot that reached its deadline, and the reader that
+                       # printed one as if it were is how boot 79 nearly read as a boot that did.
+                       "FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 35, 4: 45, 5: 41}",
+                       "def flight_stamp(records, boot_id)", "STALE: boot",
+                       'flight_report(groups, boot["boot"] if boot else 0)',
+                       "never wrote one, so this group says nothing about this boot",
                        "def flight_pairs(words, count)", "def flight_pairs_words(values)",
                        'no deadline record', 'no panic marker',
                        '"--boot"', '"--probe"',
@@ -5782,8 +5835,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r292:"):
-        errors.append('[payload] title is not "clover r292: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r293:"):
+        errors.append('[payload] title is not "clover r293: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

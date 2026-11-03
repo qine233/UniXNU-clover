@@ -48,13 +48,16 @@ leave」一路收紧到一句可测的话：
   死线（1800 s）也没到，最后一条内核记录之后的槽还是 `BAD (newline missing)` —— 一次不留 panic 记录的静默
   复位，正是 r283/r284 造出来要定名的那类现象的第一个卡上实例；`clover r289` 计数 0 与它自洽（没有 panic 就
   没有 `abt` 行）。
-* **第三道坎（新的主线瓶颈）：两连「静默、无 panic」复位。** boot 77 停在 1248.429585 s（最后一槽半行），
-  boot 78 停在 718.84 s（最后一槽**完整**，`clover r229: sbport t=718 bb`，seq 2183 `ok`）——两靴都没有
-  kind-20 panic 槽、都没到 1800 s 死线、`clover r289` 计数 0，也就是说复位落在两条 printf 之间，机器没留遗言。
+* **第三道坎（新的主线瓶颈）：三连「静默、无 panic」复位。** boot 77 停在 1248.429585 s（最后一槽半行），
+  boot 78 停在 718.84 s（最后一槽**完整**，`clover r229: sbport t=718 bb`，seq 2183 `ok`），
+  boot 79 停在 1184.031391 s（内核环最后一行）——三靴都没有 kind-20 panic 槽、都没到 1800 s 死线、
+  `clover r289` 计数 0，也就是说复位落在两条 printf 之间，机器没留遗言。
+  boot 79 把这坎的范围量出来了：卡上最后一笔请求在 1165.522 s 开始（cfprefsd 的 8 块写，`lba=34388184`）、
+  驱动自己的心跳最后一条落在 1163.919 s、内核 tee 环最新一行标着 1184.031391 s——**盘与内核都在照常出声，然后一起没声**。
   两条通道都封顶不了它：**「落回 TWRP」不是读数**（r198 每靴预写 recovery BCB，任何复位都落 TWRP），
   **驱动 verdict 环也没有时间戳**（boot 78 一共 40 条，全是上膛期与 cap 通知；seq 是跨环全局计数器，
   所以「内核环还在写时驱动没有新行」只能读作「驱动没有要说的行」）。r283/r284 造的那条 IMEM 跨复位记录
-  连续第三靴 `unnamed`，且数值量级不像本靴 CNTVCT —— 这条通道 r196 就因同样理由被判死（BCB 从 IMEM 挪进
+  连续第四靴 `unnamed`，且数值量级不像本靴 CNTVCT —— 这条通道 r196 就因同样理由被判死（BCB 从 IMEM 挪进
   misc），教训写进流水日志：**新仪器要落在跨复位通道上，先查这条通道有没有被之前的轮次判死**。
   电池这一支在 rec 里现测排除（100%、4.36 V、25 °C、Full、`current_now=0`）。
 * **`watchdogd` 那条相关性已撤掉，它的死因宿主已定名。** `watchdogd+0xab0c` 的 `bl` 在宿主上解到
@@ -86,6 +89,21 @@ leave」一路收紧到一句可测的话：
   `ctrl armed=0` ⇒ 0x17817000 从头到尾没武装，往 AOP/PON 那一侧找。**`--flight` 那条判据按上一条收紧后重写**：
   分「驱动自己的定时路径停了」与「卡不接了」，要比的是 **beat（驱动直接落卡）** 与 **tee（靠一次受 guard 的
   操作顺带刷出去）** 两条写通路各自最后一条，而不是 entry 环——entry 只记 read/`block_write` 的开始。
+* **boot 79 把 r292 的判据结掉了，走的是 (b) 那一支。** 活到落卡的两拍（fire=151 t=860 s、fire=211 t=1101 s）
+  都是 `en=0 armed=0 sts=0`，bark/bite 还在复位值，`why=chg` 一次没有——`0x17817000` 这块在本靴允许仪器看见的
+  区间里从头到尾没被武装，**静默复位不来自 APSS watchdog**；下一支在 AOP/PON 那一层（这颗寄存器管不到它）。
+  地平线照旧要说清：内核环止于 1184 s，那之后这格是盲的，所以这条只否证「看得见的那段」。
+* **r293 是把四处读数改窄，不改硬件。** 这一轮差点把 boot 76 的结局当成 boot 79 的：飞区的 deadline 槽与 panic 槽
+  都还是上一上一靴的（boot 79 从没写过 kind-20 记录，原始扫过 1217 个块），而解码器照样印出「deadline fired after
+  1800 s」——**只有 panic 标记带 boot id（r236），entry/beat/deadline 三类不带**，于是「写手停了的环」会悄悄混两靴。
+  r293 把 `gBootId` 盖进这三类（35 号词，deadline 走 `extra[10]` → 45 号词），解码器按靴次判陈旧并印
+  `STALE: boot N never wrote one, so this group says nothing about this boot`；DMA 被拒的行不再一律说 `"deadline"`，
+  切成 `spin|deadline|error|stop` 并加 `ms=/budget=/polls=`（boot 79 那 4 次读拒绝 + 1 次写拒绝分不出是卡压过 600 ms
+  预算还是本驱动自旋预算先用完）；r283 的两条行加 `beatmagic=%llx`，让下一次 `unnamed` 能分成「那格从没是我们的心跳」
+  与「是我们的、钩子没响」；runner 落回 TWRP 那句也改窄成「复位 + 预写 BCB 把它接进 recovery，死线响没响读卡」。
+  另两处误引一起收回：`clover r277: enter secs=1617` 那条槽是 boot 76 的，不是 boot 79 活到 1617 s 的证据；
+  「boot 79 拒了七笔传输」重数是 4 读 + 1 拒写、7 次整卡重初始化。
+  **eMMC 抖动这条假设随之降级**：4–9 次卡恢复在归档的每一靴都出现（包括干净 panic 结束的），报告器又封顶 8 行——慢性噪声，不是杀手。
 * **r283 的跨复位记录第一次上卡**：boot 77 的 verdict 环 slot 0 带回
   `clover r283: last reset unnamed magic=ed88000200a909f8 beat=403443458069358 beatcnt=1371352791997`。
   `unnamed` 只说明**槽里没有我们的 magic**（写手 `CloverSdhci.cpp:8830` 最后才落 `CLOV283`，读者 `:8916` 只认
@@ -108,7 +126,8 @@ leave」一路收紧到一句可测的话：
 | 6 | **GPU/Metal 一个都没有**（Adreno 512 无驱动、无固件、无 renderer） | `gpu` 区 `planned`；boot 74 实机：**r286 上电写序列在本板第一次生效**——`cx_on=1`、`gfx3d_en=1`、`cxo_en=1`、AHB/BIMC 三票=1（eMMC 正对照成立），但 `gx_on=0` → `chipid skipped`。**boot 76/77 逐字段复现**，所以 `gx_on=0` 是稳定硬件状态，不是竞态也不是时机。**boot 77 的 r290 读数把「问了」和「在跑」分开了**：`gfx3d=1/1`、`rbbm=1/1`（BIT(0) 按下、BIT(31) 仍 HALT），而 `cxo=1/0`、`rbcpr=1/0` 两支 halt=0 —— 前者是本轮没动过的天然正对照，后者是本轮新按的一票真的把分支启动了。（`rcg=80000000` 曾被读成「父源没设」，已收回；halt 两支的 RCG 都是 `0x80000000`、在跑那支 `0x00000000`，**只记相关性**：BIT(31) 在 RCG 命令字里的名字要等一份归档的 `clk-rcg.c`。见 [`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5） | 分支清白、债在电：`gx` 的 GDSC `gx_collapse=0` 而 `gx_on=0` 是**电没到**，不是使能没按。r291（v0.6.92 已发出）按 §5.6 的厂商表读 GFX LDO，但**不新增映射**：`gfx_ldo_vreg` 的 0x0506e000 正落在 DT 声明的 GPUCC `reg = <0x5065000 0x10000>` 里（偏移 0x9000），于是读 `0x9018` VREF（µV=val*5000+375000）、`0x901c` 开关控制（byp/pdn/cpr_byp）、`0x9028` 的 `LDO_READY=BIT(2)`/`LDO_VREF_SETTLED=BIT(4)`，连同当拍 `cx_on`/`gx_on` 一起打——那两票是这行的正对照：三个词全 `0xffffffff` 而 `cx_on` 照常，是这页没应答，整行作废。checker 把「本驱动只开三张窗口」钉成 `IODeviceMemory::withRange` 计数=3。判据写死：`LDO_READY=0` 或 µV=375000 ⇒ 角从没抬起（债在 CPR4/`vdd_gfx`）；µV 落在 DT 的 400000…925000 且 `ready=1` 而 `gx_on=0` ⇒ 轨清白，回查 GDSC 自己的等待字段与 `gpu_gx_domain_addr`。角数（厂商 `SDM660_MMSS_FUSE_CORNERS=6` vs DT 的 1..7）不印也不下结论。S3/S5 两颗是 `qcom,rpm-smd-regulator`，SPMI 读不到，不在这一格。**boot 78 把两条预登记判据一起点亮**（`beat` 副本顶上，`ldo post` 在环窗外）：`vref=0 val=0 uv=375000`、`sts=0`（`ready=0 settled=0`）、`ctrl=80000038`=`LDO_CLAMP_IO|LDO_PDN|LDO_UNDER_SW_CTRL`+一枚没名字的 BIT(3)，同拍 `cx_on=1` 作正对照 ⇒ **轨自这次上电起既没使能也没编程，「轨清白」这一支关闭**。下一手是对轨**编程**，缺的不是寄存器（三处都在 `msm_gfx_ldo.c` 点得名）而是使能全序与角→电压来源（CPR4 fuse 在 `0x00784000` 另一张窗口），没有 sha256 出处不写。**桌面仍 CPU-first** |
 
 1 挡住桌面；6 是 1 最可能的病根（尚未证）；2–4 是之后要补的板级驱动，5 只是噪声（已定名且非瓶颈）。
-两连「静默、无 panic」复位与它是同一条线上的两个症状还是独立的坎，交给 r292 这靴的卡上窗口判。
+三连「静默、无 panic」复位与它是同一条线上的症状还是独立的坎仍未判；r292 把 WDT 的地平线换细以后，
+boot 79 已经排除 APSS watchdog 这一支，下一格是 AOP/PON。
 
 > 备注（时基）：r207 已核，环上的 `t=` 与 `mach_absolute_time` 一致，没有偏慢；
 > 早期「慢 50 倍」是基数除错的读法，已废弃。每靴 1800 s 的死线是本项目自设的无人值守

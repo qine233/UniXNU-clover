@@ -291,7 +291,8 @@ if [ "$SKIP_RECOVERY" = 0 ] && [ -n "$FLASH_CACHE" ]; then
     landing=$?
     case $landing in
       0)
-        say "the panic path's own BCB took: TWRP adb $(adb_serial) after the deadline reset"
+        say "TWRP's adb came up ($(adb_serial)): the board reset and the pre-armed BCB landed it in recovery"
+        say "which names the landing, not the cause -- whether the deadline fired is on the card (the flight region's deadline record and panic markers, read with --flight)"
         SKIP_RECOVERY=1
         ;;
       1)

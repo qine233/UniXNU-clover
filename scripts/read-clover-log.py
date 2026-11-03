@@ -52,7 +52,9 @@ Header words:
   words[5] kind: 17, 19, 20 above, 21 = driver verdict line, 22 = kernel log line,
       25 = probe line the driver relayed;
       the flight region uses the same two magic words but one block per record,
-      with kind 23 and its own header words (see decode_flight below)
+      with kind 23 and its own header words (see decode_flight below), and round293
+      stamps each record with the boot that wrote it so a leftover from the boot
+      before the flash cannot be read as this boot's ending
   words[6] body length
   words[7] slot index
   words[8] sequence number (the two rings only; 0 in the report/panic records)
@@ -79,6 +81,8 @@ present but whose text does not sum is still printed: a half-written record is
 a reading.
 """
 import argparse
+import contextlib
+import io
 import struct
 import sys
 from pathlib import Path
@@ -111,6 +115,13 @@ KINDS = {17: "report-17", 19: "report-19", 20: "panic-20",
          24: "boot-24", 25: "probe-25"}
 FLIGHT_EVENTS = {1: "read", 2: "write", 3: "beat", 4: "deadline", 5: "panic"}
 FLIGHT_DIRS = {0: "read", 1: "write", 2: "beat", 3: "none"}
+# Round293: where each event's own boot id lives. Boot 79's frame is the reason: the deadline slot
+# and the panic slots are the only two groups a boot may never write, and when it does not the
+# previous boot's copy stays on the card and read, in this reader's own words, as if "the deadline
+# fired" this boot. An entry or beat carries no extras, so its stamp is word 35; the deadline's ten
+# words come first and its stamp is the eleventh; round236 already wrote gBootId as the panic
+# marker's sixth extra word. A zero means a record written before this round stamped anything.
+FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 35, 4: 45, 5: 41}
 # Round213's holder stages. A beat whose stage word has not moved for 75 s is the request that
 # stopped, so the name is what the dump prints where r212 could only print the request.
 FLIGHT_STAGES = {0: "idle", 1: "entry", 2: "idleWait", 3: "check", 4: "adma", 5: "batch",
@@ -303,10 +314,10 @@ def decode_flight(data, first_lba):
     was never written this boot -- not a sequence number that was skipped.
 
     What this cannot tell apart is an earlier boot's run that also survives intact and
-    reaches a higher seq than this boot's, unless the higher writer's boot id is in the
-    record. The entries and beats carry none (r210), the panic marker carries gBootId
-    (r236), and the boot record at sector 1216 names the current boot, so a panic
-    marker can be attributed and a chain can be bounded by it.
+    reaches a higher seq than this boot's -- unless the writer's boot id is in the record.
+    Round293 puts it there: FLIGHT_BOOT_WORD names where each event's own gBootId sits, so
+    every record can be read as this boot's or as a previous boot's leftover, and a record
+    from a payload that stamped nothing reads as unattributed rather than as this boot's.
     """
     groups = {}
     for name, base, slots, event in (("entries", FLIGHT_ENTRY_OFFSET, FLIGHT_ENTRY_SLOTS, None),
@@ -349,6 +360,7 @@ def decode_flight(data, first_lba):
                 "stuck_stage": words[27], "stage_lba": words[28], "stage_blocks": words[29],
                 "stage_pid": words[30], "stage_dir": words[31],
                 "cur_pid": words[32], "comm0": words[33], "comm1": words[34],
+                "boot": words[FLIGHT_BOOT_WORD[words[6]]] if words[6] in FLIGHT_BOOT_WORD else 0,
                 "extra": words[35:],
             }
             records.append((slot, record, problems))
@@ -401,7 +413,25 @@ def flight_comm(record):
     return raw.split(b"\0", 1)[0].decode("ascii", "replace") or "-"
 
 
-def flight_report(groups):
+def flight_stamp(records, boot_id):
+    """One line saying whose record the newest of this group is.
+
+    boot_id 0 in a record means the payload that wrote it stamped nothing, which is a different
+    statement from a stamp that names another boot: the first is this reader being older than the
+    field, the second is this boot never writing the group at all.
+    """
+    if not records:
+        return "flight: no records in this group"
+    newest = records[-1]
+    if newest["boot"] == 0:
+        return f"flight: {len(records)} records, writer unstamped (before r293)"
+    if boot_id and newest["boot"] != boot_id:
+        return (f"flight: {len(records)} records, newest written by boot {newest['boot']} -- STALE: "
+                f"boot {boot_id} never wrote one, so this group says nothing about this boot")
+    return f"flight: {len(records)} records, all written by boot {newest['boot']}"
+
+
+def flight_report(groups, boot_id=0):
     """Print the four chains and the one conclusion this round is built to support.
 
     The last entry record names a request whose result word belongs to the request
@@ -410,7 +440,9 @@ def flight_report(groups):
     the controller were still accepting commands, and a gap between the two is where
     the stop happened. Round236's deadline record is the one record that says the
     deadline itself fired when the sink could not, and the panic markers say whether
-    the sink ran before the deadline or after it.
+    the sink ran before the deadline or after it. Round293 adds the boot each of those
+    was written by, because a deadline record from an earlier boot is not evidence that
+    this boot reached its deadline.
     """
     entries = flight_chain(groups["entries"])
     beats = flight_chain(groups["beats"])
@@ -421,7 +453,7 @@ def flight_report(groups):
         span = f"seq {entries[0]['seq']}..{entries[-1]['seq']}"
     else:
         span = "none"
-    print(f"flight: {len(entries)} entry records in this boot's window ({span})")
+    print(f"flight: {len(entries)} entry records in the window ({span})")
     for record in entries:
         flags = []
         if record["flags"] & 1:
@@ -442,7 +474,8 @@ def flight_report(groups):
               f"/{record['stage_ms']}ms pid={record['cur_pid']} "
               f"comm={flight_comm(record)} stuck={record['stuck']} "
               f"recov={record['recovered']} steal={record['steals']}")
-    print(f"flight: {len(beats)} beat records in this boot's window")
+    print(flight_stamp(entries, boot_id))
+    print(f"flight: {len(beats)} beat records in the window")
     for record in beats:
         flags = []
         if record["flags"] & 1:
@@ -459,10 +492,15 @@ def flight_report(groups):
               f"stage_pid={record['stage_pid']} "
               f"stuck={record['stuck']} recov={record['recovered']} steal={record['steals']} "
               f"stuck_stage={FLIGHT_STAGES.get(record['stuck_stage'], '?')}")
+    print(flight_stamp(beats, boot_id))
     if entries and beats:
-        gap = entries[-1]["t_ms"] - beats[-1]["t_ms"]
-        print(f"flight: newest entry seq {entries[-1]['seq']} at t={entries[-1]['t_ms']} ms, "
-              f"newest beat seq {beats[-1]['seq']} at t={beats[-1]['t_ms']} ms, gap {gap} ms")
+        if boot_id and (entries[-1]["boot"] not in (0, boot_id) or
+                        beats[-1]["boot"] not in (0, boot_id)):
+            print("flight: entry and beat chains name different boots -- no gap to read")
+        else:
+            gap = entries[-1]["t_ms"] - beats[-1]["t_ms"]
+            print(f"flight: newest entry seq {entries[-1]['seq']} at t={entries[-1]['t_ms']} ms, "
+                  f"newest beat seq {beats[-1]['seq']} at t={beats[-1]['t_ms']} ms, gap {gap} ms")
     elif entries:
         print("flight: entries without any beat -- no beat ever found the guard free")
     elif beats:
@@ -470,23 +508,39 @@ def flight_report(groups):
     # Round236: the deadline record is written from the timer interrupt ahead of panic(), so it
     # exists on a boot whose sink never reached the card. The panic markers say what the sink
     # itself managed: entry with the gates, and exit with the append rc or nothing at all.
+    # Round293: both readings are only about the boot that wrote them, which is what the stamp says.
     if deadline:
         record = deadline[-1]
         seconds, ticks, cnt0, cnt1, freq = flight_pairs(record["extra"], 5)
         period = ((cnt1 - cnt0) / freq) if freq and cnt1 > cnt0 else 0.0
-        print(f"flight: deadline fired after {seconds} s at t={record['t_ms']} ms "
-              f"ps={record['present']:#010x} ticks={ticks} cnt0={cnt0:#x} cnt1={cnt1:#x} "
-              f"freq={freq} elapsed={period:.3f}s")
+        if boot_id and record["boot"] and record["boot"] != boot_id:
+            print(f"flight: the deadline record on the card is boot {record['boot']}'s, not boot "
+                  f"{boot_id}'s -- this boot never wrote one, so it either did not reach its "
+                  f"deadline or could not write the record (t={record['t_ms']} ms, "
+                  f"seconds={seconds}, ticks={ticks})")
+        else:
+            caveat = ("" if record["boot"] else
+                      " (un-stamped: a payload before r293 wrote this, so the panic markers' "
+                      "boot ids are the only attribution available)")
+            print(f"flight: deadline fired after {seconds} s at t={record['t_ms']} ms "
+                  f"boot={record['boot'] or '?'} ps={record['present']:#010x} ticks={ticks} "
+                  f"cnt0={cnt0:#x} cnt1={cnt1:#x} freq={freq} elapsed={period:.3f}s{caveat}")
     else:
         print("flight: no deadline record -- the deadline either did not fire or could not write")
     if panic:
-        print(f"flight: {len(panic)} panic marker records in this boot's window")
+        print(f"flight: {len(panic)} panic marker records in the window")
         for record in panic:
-            stage, log_ready, owner, log_first, rc, drained, boot, gates = record["extra"][:8]
+            (stage, log_ready, owner, log_first, rc, drained, marker_boot,
+             gates) = record["extra"][:8]
+            if record["boot"] != marker_boot:
+                print(f"flight: the panic marker's own stamp and its gBootId word disagree "
+                      f"({record['boot']} vs {marker_boot})")
+            stale = ("" if not (boot_id and marker_boot and marker_boot != boot_id)
+                     else f" STALE: boot {boot_id} never entered the sink")
             print(f"  panic seq {record['seq']:>3} slot {record['slot']:>2} "
                   f"t={record['t_ms']:>8}ms stage={stage} log_ready={log_ready} "
                   f"host={owner:#x} log_first={log_first} rc={rc} drained={drained} "
-                  f"boot={boot} gates={gates:#x}"
+                  f"boot={marker_boot}{stale} gates={gates:#x}"
                   f"({'armed,' if gates & 1 else ''}"
                   f"{'bcb,' if gates & 2 else ''}"
                   f"{'text' if gates & 4 else ''})")
@@ -500,8 +554,12 @@ def build_flight_record(lba, seq, event, dir_, op_lba, op_blocks, t_ms=0, presen
                         guard_waits=0, beat_misses=0, pending=(0, 0), slot=None, kind=FLIGHT_KIND,
                         stage=0, stage_ms=0, stuck=0, recovered=0, steals=0, stuck_stage=0,
                         stage_lba=0, stage_blocks=0, stage_pid=0, stage_dir=0,
-                        cur_pid=0, comm=(0, 0), extra=()):
-    """One flight block as flightWrite lays it out, for selftest."""
+                        cur_pid=0, comm=(0, 0), extra=(), boot=0):
+    """One flight block as flightWrite lays it out, for selftest.
+
+    `boot` goes where round293 says that event's stamp lives, so a selftest that builds a record
+    and a decoder that reads one agree on the position without either naming it twice.
+    """
     if slot is None:
         slots = {3: FLIGHT_BEAT_SLOTS, 4: FLIGHT_DEADLINE_SLOTS}.get(event, FLIGHT_ENTRY_SLOTS)
         if event == 5:
@@ -517,6 +575,11 @@ def build_flight_record(lba, seq, event, dir_, op_lba, op_blocks, t_ms=0, presen
              cur_pid, comm[0], comm[1]]
     assert len(words) == FLIGHT_WORDS, len(words)
     words.extend(extra)
+    index = FLIGHT_BOOT_WORD.get(event)
+    if index is not None:
+        while len(words) <= index:
+            words.append(0)
+        words[index] = boot
     assert len(words) < SECTOR // 4, len(words)
     return struct.pack(f"<{len(words)}I", *words).ljust(SECTOR, b"\0")
 
@@ -703,13 +766,14 @@ def selftest():
                                   recovered=seq // 5, steals=seq // 6, stuck_stage=seq % 12,
                                   stage_lba=2000 + seq, stage_blocks=seq % 9,
                                   stage_pid=100 + seq, stage_dir=1, cur_pid=300 + seq,
-                                  comm=(int.from_bytes(b"apfs", "little"), 0)),
+                                  comm=(int.from_bytes(b"apfs", "little"), 0), boot=boot_id),
               FLIGHT_ENTRY_OFFSET + seq % FLIGHT_ENTRY_SLOTS)
     for seq in range(6):
         place(flight,
               build_flight_record(first_lba + FLIGHT_BEAT_OFFSET + seq % FLIGHT_BEAT_SLOTS,
                                   seq, 3, 2, 0, 0, t_ms=1000 + 4000 * seq, present=0,
-                                  ops=seq, guard_waits=1, beat_misses=seq, pending=(9, 1)),
+                                  ops=seq, guard_waits=1, beat_misses=seq, pending=(9, 1),
+                                  boot=boot_id),
               FLIGHT_BEAT_OFFSET + seq % FLIGHT_BEAT_SLOTS)
     # Round236: one deadline record with its five 64-bit numbers, and the sink's two markers
     # with the entry gates and the append's return code. The deadline's dir word is 3 ("none")
@@ -718,17 +782,17 @@ def selftest():
     place(flight,
           build_flight_record(first_lba + FLIGHT_DEADLINE_OFFSET, 0, 4, 3, 0, 0,
                               t_ms=1800000, present=0, stage=12, stage_ms=79000,
-                              extra=flight_pairs_words(deadline_values)),
+                              extra=flight_pairs_words(deadline_values), boot=boot_id),
           FLIGHT_DEADLINE_OFFSET)
     panic_entry = (1, 1, 0x77, 1, 103, 3, boot_id, 7)
     panic_exit = (1, 1, 0x77, 1, 2, 3, boot_id, 7)
     place(flight,
           build_flight_record(first_lba + FLIGHT_PANIC_OFFSET, 0, 5, 3, 0, 0,
-                              t_ms=1800100, present=0, extra=panic_entry),
+                              t_ms=1800100, present=0, extra=panic_entry, boot=boot_id),
           FLIGHT_PANIC_OFFSET)
     place(flight,
           build_flight_record(first_lba + FLIGHT_PANIC_OFFSET + 1, 1, 5, 3, 0, 0,
-                              t_ms=1800200, present=0, extra=panic_exit),
+                              t_ms=1800200, present=0, extra=panic_exit, boot=boot_id),
           FLIGHT_PANIC_OFFSET + 1)
     groups = decode_flight(bytes(flight), first_lba)
     entries = flight_chain(groups["entries"])
@@ -765,8 +829,45 @@ def selftest():
     assert tuple(panic_chain[0]["extra"][:8]) == panic_entry, panic_chain[0]
     assert tuple(panic_chain[1]["extra"][:8]) == panic_exit, panic_chain[1]
     assert all(not problems for _, _, problems in groups["deadline"] + groups["panic"])
-    assert flight_report(groups) == sum(len(groups[name]) for name in
-                                        ("entries", "beats", "deadline", "panic"))
+    # Round293's stamp: the boot that wrote each record, at the word flightWrite puts it in. The
+    # entries and beats have no extras so theirs is word 35, the deadline's follows its ten
+    # numbers at 45, and the panic marker's is the same word its own gBootId extra already names.
+    assert all(record["boot"] == boot_id for record in entries + beats), (entries[-1], beats[-1])
+    assert deadline_chain[0]["boot"] == boot_id, deadline_chain[0]
+    assert all(record["boot"] == boot_id for record in panic_chain), panic_chain
+    assert flight_report(groups, boot_id) == sum(len(groups[name]) for name in
+                                                 ("entries", "beats", "deadline", "panic"))
+
+    # A previous boot's deadline and panic slots stay on the card when this boot never reaches
+    # them, which is exactly what boot 79's frame did: this reader printed "the deadline fired
+    # after 1800 s" for a record boot 76 wrote. A window whose boot record disagrees has to say so.
+    foreign = bytearray(flight)
+    foreign_deadline = flight_pairs_words(deadline_values)
+    place(foreign,
+          build_flight_record(first_lba + FLIGHT_DEADLINE_OFFSET, 0, 4, 3, 0, 0,
+                              t_ms=1800000, present=0, stage=12, stage_ms=79000,
+                              extra=foreign_deadline, boot=boot_id - 1),
+          FLIGHT_DEADLINE_OFFSET)
+    for slot, seq in ((0, 0), (1, 1)):
+        marker = (1, 1, 0x77, 1, 103 if slot == 0 else 2, 3, boot_id - 1, 7)
+        place(foreign,
+              build_flight_record(first_lba + FLIGHT_PANIC_OFFSET + slot, seq, 5, 3, 0, 0,
+                                  t_ms=1800100 + 100 * slot, present=0, extra=marker,
+                                  boot=boot_id - 1),
+              FLIGHT_PANIC_OFFSET + slot)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        flight_report(decode_flight(bytes(foreign), first_lba), boot_id)
+    said = out.getvalue()
+    assert (f"the deadline record on the card is boot {boot_id - 1}'s, not boot {boot_id}'s"
+            in said), said
+    assert f"STALE: boot {boot_id} never entered the sink" in said, said
+    assert "deadline fired" not in said, said
+    # ... and the same slots, once this boot writes them, read as this boot's again.
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        flight_report(groups, boot_id)
+    assert "deadline fired after 1800 s" in out.getvalue(), out.getvalue()
 
     # A boot that stopped after five requests leaves slots 5..11 with whatever was there
     # before. A slot whose seq word does not name its own slot ends the chain instead of
@@ -860,7 +961,10 @@ def main():
             print(f"{path}: no flight records (sector {FLIGHT_ENTRY_OFFSET} has no LOG1 magic)",
                   file=sys.stderr)
             return 1
-        flight_report(groups)
+        # Round293: whose records these are. The boot counter at sector 1216 names this boot, and a
+        # record stamped with another boot's id is a leftover, not a reading about this one.
+        boot = decode_boot(data, args.first_lba) if len(data) >= DUMP_SECTORS * SECTOR else None
+        flight_report(groups, boot["boot"] if boot else 0)
         return 0
     if args.boot:
         need = DUMP_SECTORS * SECTOR

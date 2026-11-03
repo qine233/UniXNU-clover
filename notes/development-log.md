@@ -22142,3 +22142,83 @@ guard 的操作才刷得出去）** 两条写通路各自的**最后一条落卡
 porting.toml 的 storage 与 diagnostics 两段。`board.toml` 里 r292 那条已发布标题带着今早那句过强的话，
 **留着不改**：它是卡上镜像的标签，改了会让标签和板上字节讲的不是同一轮；更正从下一轮标题起生效。
 教训归到已有那条：**一条新读数的强度，等于它调用点的覆盖范围**——写结论前先数一遍谁没被记进去。
+
+### boot 79（round292 / v0.6.94，2026-11-03）：看门狗两拍都没武装；而这一轮的判决差点读反了
+
+**① 帧。** `run-clover-unattended.sh`（bash，冷刷 cache）：卡上「刷前是 boot 78」；落回
+`recovery: device=clover twrp=3.7.1_12-1-clover-th3fron3`；`misc (read only, 1024 bytes): block 0 command=''`；
+解码 16 份报告记录 + 64 条驱动判据 + 1 条 probe + 512 行内核日志，boot 79。
+
+**② 本轮唯一要的东西：WDT，判据 (b) 命中。** 两拍活到落卡——fire=151 t=860 s、fire=211 t=1101 s——
+都是 `en=0 armed=0 sts=0`，bark/bite 还在复位值；从内核最后一行（t=1184.031391 s）往回扫，**没有任何
+`why=chg`**。`why=ctrl` 的复读每 30 拍一次，所以「没有 chg」读作「没动」而不是「定时器死了」，这正是 r292
+换排期买来的那格分辨力。结论按预登记走 (b)：`0x17817000` 这块这靴从头到尾没被武装，第三起静默复位不来自
+APSS watchdog，下一支在 AOP/PON 那一层——这颗寄存器管不到它。**地平线要说清**：内核环只覆盖到 1184 s，
+1184 s 之后到复位之间这格仪器是盲的，所以这条只否证「本靴允许我看见的区间」。
+
+**③ 差点发出去的那句假话。** 解码器把飞区读成「deadline fired after 1800 s」＋「panic 进过 sink」——
+**两条都是 boot 76 的**，boot 79 根本没走到过这两处。三条独立证据钉死：
+- deadline 记录的 `ticks=283834 cnt0=0x114c9a7a cnt1=0x81d3c90a6` 与 boot 76 的 r148 行逐位相同；
+- panic 标记自己带 boot id（r236 只给 panic 打了戳），里面写着 `boot=76`；
+- 对窗口内 1217 个块做原始扫描，kind-20 的复位记录**一条 boot 79 都没有**。
+
+boot 79 的真实最后读数：entry 最新 t=1165522 ms（一笔写，`lba=34388184`，cfprefsd）、beat 最新 t=1163919 ms、
+tee 最新 1184.031391 s。**第三起连续静默复位**（77、78、79：无 panic 槽、无死线、预写 BCB 把它接进 rec）。
+
+**④ 「谁没被记进去」再数一遍，这次数到飞区。** `flightWrite` 的 35 号词此前只有 panic 事件会写；
+entry/beat/deadline 三类记录**没有 boot 戳**，所以解码器只能靠内容猜归属——而它猜对了形状、猜错了靴次。
+宿主侧因此必须按事件分别给索引：`FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 35, 4: 45, 5: 41}`（deadline 是
+`extra[10]` → 45 号词，panic 的 `extra[6]` → 41 号词）。这条比 r292 ⑤ 更一般：**环里的记录如果没写手身份，
+写手一停就变成两靴混读**，而混读出来的句子形状完全合法。
+
+**⑤ eMMC 抖动这条假设降级，顺带抓出一处误引。** boot 79 判据环里 4 条读超时 + 1 条写拒绝 + 7 次整卡重初始化，
+看着很像「盘先死」；但翻归档，**每一靴——包括干净 panic 结束的那些——都有 4–9 次卡恢复**，而报告器封顶 8 行，
+这是慢性噪声不是杀手。另一处：`clover r277: enter secs=1617` 那条槽属于 **boot 76**（verdict 槽 58..63 是上一靴
+的遗留），不能当成 boot 79 活到 1617 s 的证据——同一个形状的错误，第 ④ 条的另一个实例。
+
+**⑥ r293：四处诚实化，全部是「读数要说自己能说到哪」。**
+- **驱动，flight 记录带靴次**：`flightWrite` 在 `extraWords == 0` 时把 `gBootId` 落进 35 号词（只在没带 extra
+  的记录上打，不去覆盖自带 extra 的那两类）；`clover_emmc_flight_deadline` 改成 11 词 extra 并追加
+  `extra[10] = gBootId`。下一靴的 entry/beat/deadline 自己就报得出是谁写的。
+- **驱动，DMA 拒绝要说退出名**：两条等待循环各加 `spun`，`++guard >= kCommandSpinLimit` 才算自旋耗尽；
+  阶段名从一律 `"deadline"` 切成 `spin|deadline|error|stop`，行尾加 `ms=/budget=/polls=`。boot 79 那 5 次拒绝
+  此前分不出「卡把数据线压过了 600 ms 预算」还是「本驱动的自旋预算先用完」，这两支的下一步完全不同。
+- **探针，r283 行加心跳魔数**：两条都打 `beatmagic=%llx`（`record[9]`）。boot 77/79 连读 `unnamed`，且值的形状
+  不像本驱动写的任何东西；有了魔数，`unnamed` 能分成「那格从没是我们的心跳」（通道不是我们的）与「是我们的，
+  但没人给复位起名」（通道是我们的、钩子没响）。r292 已判过 IMEM 跨不过 POR 级复位，这轮不猜复位类型，只把
+  下一次 `unnamed` 变得可解释。
+- **宿主，解码器按靴次判陈旧**：`flight_stamp()` 对每组给一句归属，非本靴写的一律印
+  `STALE: boot N never wrote one, so this group says nothing about this boot`；两条链不同靴就不印跨靴的
+  entry/beat 间隔；deadline/panic 陈旧时不再印「fired」。`--selftest` 加 foreign 变体（把 deadline/panic 槽
+  改写成 `boot_id-1`）并断言 STALE 句在、`"deadline fired"` 不在，再加同靴正对照断言 `"deadline fired after 1800 s"`
+  在——**负对照必须配上正对照**，否则「没印」既是修好了也是坏了。
+- **宿主脚本，落点句改窄**：`run-clover-unattended.sh` 那句「死线到点后 BCB 生效」换成「本靴复位了、预写的 BCB
+  把它接进 recovery；死线有没有响要读卡上飞区」。r198 的预写通道没有分辨力，这条在 r291 就记过，这次是它自己
+  在 runner 里漏出来。
+- **契约**：`check-clover.py` 钉 `gFlightBlock[35] = gBootId;`、`extra[10] = gBootId;` + 11 词的 deadline
+  `flightWrite`、`(spun ? "spin" : "deadline")` ≥ 2、`"ms=%llu budget=%llu polls=%u\n"` ≥ 2、
+  `beatmagic=%llx` ≥ 2，并**反向拒绝**旧的两种一律 `"deadline"` 的字面量；宿主侧钉 `FLIGHT_BOOT_WORD`、
+  `def flight_stamp`、`STALE: boot`、`flight_report(groups, boot["boot"] if boot else 0)`。r283 的两枚行字面量针
+  这轮暴露了自己的毛病：它按「两段拼起来」的整串找，而 C 源码把它拆成两行写——**针要钉源码里真实存在的那一段**，
+  改成逐段各一枚（外加第 3038 行本来就在数的 `beatmagic` ≥ 2）。
+- 标题升到 `clover r293`，boot 79 的读数与那句假话的成因一起进标签。
+
+**⑦ 判据（刷 boot 80 前写死）。** (a) 飞区三组（entry/beat/deadline）都该带上 boot 80；仍是旧靴 ⇒ 戳没生效，
+`flightWrite` 那段 `extraWords == 0` 的条件写错了。(b) `--flight` 里若 deadline/panic 仍显示 boot 76 的 STALE 句 ⇒
+本轮没到死线、也没 panic，即第四起静默复位；这时新的 DMA 阶段名（`spin` 还是 `deadline`）与 `ms/budget/polls`
+就是唯一的新区分。(c) `beatmagic` 若等于 `BEAT283` 而仍 `unnamed` ⇒ 通道是我们的、复位钩子没响，下一支查钩子
+为什么没跑；若不等 ⇒ 0x660 那格确实不是我们的，r283 这条通道正式作废。(d) WDT 再读一次 `armed=0` ⇒ AOP/PON
+那一支排上一格。桌面主线不动：backboardd→datamigrator 的 XPC 等待与债主 workloop 五个等待者。
+
+**⑧ 契约、构建与产物（v0.6.97）。** 闸门：`check-clover.py` EXIT=0（`clover ok: ADT 14384 bytes`）、
+`build-arm-driver.py CloverSdhci` 在组装树 `-Werror` 过、`normalize-kernel-macho.py --selftest` 与
+`read-clover-log.py --selftest` 全绿（后者本轮多带一支 foreign 变体与一支同靴正对照）。
+产物：kernel `c9fb3775…` → amfi `bd26d794…`（两刀仍在 `0x1ad30e4`/`0x1ad316c`，与 r292 同址 ⇒ 驱动改动没挪 AMFI 段）
+→ normalized `e4998fe9…`（973 个 object 戳清零）→ payload `e36533b6…` =
+`~/clover-out/round293-v0.6.97-payload.img`（58,720,256 B，`mdir` 数得 6 files）。
+**闸门当场抓到一枚针**：`verify-clover-payload.py` 报 `reset-record-named ABSENT, reset-record-unnamed ABSENT`——
+它按镜像里**合并后**的整串找（编译器把相邻字面量并成一个字符串，所以这枚针的形状是对的），而 r293 给两行都插了
+`beatmagic=%llx`。改针而不是改源码，并把 r172/r173 两枚 DMA 行的**整串**（含 `ms=%llu budget=%llu polls=%u\n`）
+一起钉进 `DMA_INTEGRITY`/`WRITE_DMA_INTEGRITY`：这一轮的判决要能在卡上读出来，首先得能在出厂镜像里被证明存在。
+同一形状的两面记在一处：**源码侧的针要钉源码里真实存在的那一段**（`check-clover.py` 那枚拼接针这轮暴露），
+**二进制侧的针要钉合并后的整串**（`verify-clover-payload.py` 这轮暴露）——两套形状不能互抄。

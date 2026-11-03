@@ -383,6 +383,10 @@ DMA_INTEGRITY = (
     "CloverSdhci r172: ADMA2 reads trusted for this boot",
     "CloverSdhci r172: reads stay on the PIO path for this boot",
     "CloverSdhci r172: first dma read lba=",
+    # Round293 splits the refusal: the same row used to say "deadline" whether the card held the data line past
+    # this request's budget or this driver's own spin limit ran out first. Boot 79 refused four reads and one
+    # write without naming either, so the row's tail -- exit name plus ms/budget/polls -- is now pinned here too.
+    "CloverSdhci r172: dma %s lba=%u blocks=%u st=%08x err8=%02x hctl=%02x ms=%llu budget=%llu polls=%u\n",
 )
 
 # Round173 gives the write side the same second transport, and the same kind of verdict line: the gate
@@ -394,6 +398,7 @@ WRITE_DMA_INTEGRITY = (
     "CloverSdhci r173: ADMA2 writes trusted for this boot",
     "CloverSdhci r173: writes stay on the PIO path for this boot",
     "CloverSdhci r173: first dma write lba=",
+    "CloverSdhci r173: dma write %s lba=%u blocks=%u st=%08x err8=%02x hctl=%02x ms=%llu budget=%llu polls=%u\n",
 )
 
 # Round166's kernel half prints the first words of every code-signature blob the exec path loads,
@@ -1167,9 +1172,9 @@ def check_sb_sample(kernel: bytes) -> bool:
              # payload carrying only the named branch could not tell "no reset hook fired" from "the
              # record was never read", and the unnamed line is the reading that says exactly that.
              "reset-record-named": (b"clover r283: last reset kind=%llu pid=%llu aux=%llx pc=%llx "
-                                    b"cnt=%llu beat=%llu beatcnt=%llu text=%s\n") in kernel,
+                                    b"cnt=%llu beat=%llu beatcnt=%llu beatmagic=%llx text=%s\n") in kernel,
              "reset-record-unnamed": (b"clover r283: last reset unnamed magic=%llx beat=%llu "
-                                      b"beatcnt=%llu\n") in kernel,
+                                      b"beatcnt=%llu beatmagic=%llx\n") in kernel,
              # Round289: boot 74 and boot 75 both ended in `Kernel data abort.` and both were read as a pc plus
              # an lr that resolves to nothing, because the 480-byte panic record stops before esr, far, fp and
              # sp -- and the trace lives only in these rows. A payload without them would meet the next fatal
