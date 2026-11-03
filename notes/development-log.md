@@ -22975,3 +22975,81 @@ WDT、keystore、GPU 三行照常在场，说明别的格子没退步。
 没有 `io_lock`、`simple_wait`、`thread_block`（checker 反向钉住）。
 GPU 那一格（`gfx_mem_acc` 的 `acc-sel-l1 @ 0x01fcf004`）仍按 §5.12 的结论**单独一轮发**：
 它要新增第四枚 `IODeviceMemory::withRange`，与内核补丁不同层，同靴出险分不清是谁。
+
+## Round298 读数（boot 87，v0.7.2）：收方任务对、名字不对，而 `verr=17` 说那枚名字根本不是 port
+
+**① 落回与结局。** `round298-v0.7.2-payload.img`（`ccd22262…`，与 `payload.json` 逐字节对上）冷刷 `cache`，
+卡上「刷前是 boot 86」→「boot 87」。**这靴跑到了自己的死线**：飞区 `deadline fired after 1800 s at
+t=1802871 ms boot=87 ticks=283740 freq=19200000 elapsed=1800.003s`，panic 标记两条都署 boot 87
+（`stage=0/1 log_ready=1 rc=112 gates=0x7(armed,bcb,text)`，`log_first=13320216`）⇒ v0.7.2 第一靴不是
+静默复位。复位这一格在 v0.7.0–v0.7.2 这一族里的形状就此是**分布**的第三个数据点：boot 84 到死线、
+85 静默 1681–1800、86 静默 1712–1800、**87 到死线**。
+
+**② 刷前写好的正对照，三支全部成立。** `clover r297:` **0 行**（补丁链进镜像、旧前缀如期下架）；
+8 条 `clover r296:` 配 8 条 `clover r298:`（两类的 cap 豁免都响，表没被截）；`hop=0` 两拍都是
+`prev=0 link=- tlink=-`。r296 那一位不动的字段逐列对得上 boot 83–86。
+
+**③ 决定性那一格答了，而且答在 `tlink=` 上——三跳全 `no`，且每一跳的收方任务都对。**
+
+| hop | 本跳 pid/exec | 上一跳那枚口的收方 `tspace=` | 本跳自己的 `space=` | 收方给它的名字 `tname=` | 本跳在等的名字 `vname=` | `tlink=` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | 58 backboardd | `…45a33d0` | `…45a56a0` | `3207` | `4503` | `-` |
+| 1 | 148 datamigrator | `…45a3ad8` | `…45a33d0` | `3507` | `79f3`／`2903` | **no** |
+| 2 | 180 migrationpluginwrapper | `…45a3d30` | `…45a3ad8` | `2903` | `1003` | **no** |
+| 3 | 123 installcoordinationd | `0`（叶子 `remote=0`） | `…45a3d30` | `0` | `d0b` | **no** |
+
+读法：`hop=N` 那一跳发送对象（`robj=`）的 `ip_receiver` 就是 `hop=N+1` 那一跳的 `itk_space`——**逐跳成立三次，
+且都在同一个地址空间里比**，不依赖任何一枚名字译得出对象。债链在**任务**这一级是真的。
+而 `hop=N+1` 被采样的那根线程等的是**另一个名字**。⇒ 按预登记七态落在 **(b) `no`**：下一步是普查那
+个任务自己的 entry 集（谁持有 `tname=` 那枚名字、有没有线程等在它上面），不是「镜像侧读不出」。
+
+**④ `verr=17` 有出处，它把 boot 86 的「译不出」升了一级。** `osfmk/mach/kern_return.h:151` 是
+`KERN_INVALID_RIGHT`；`ipc_object_translate()` 只有两个出口会回它，`!MACH_PORT_RIGHT_VALID_TRANSLATE(right)`
+那一支我们不可能命中（传的就是 RECEIVE/SEND），所以走的是另一支：`ipc_right_lookup_read()` **成功**、
+entry 在，但 `bits & MACH_PORT_TYPE(right)` 为空。⇒ 三跳上失败的 `vname=`（`4503`/`1003`/`d0b`）**不是不存在的名字，
+是「存在，但既不是收回权也不是发送权」**；最合理的两种是 **port set**（runloop 的 `mach_msg` 常等在集合上）与
+send-once。这一支仪器分不开它们，因为失败时压根没拿到对象。
+另记一枚本支自己的空白：helper 两次尝试只留**最后一次**的 kr（`task.c` 里 RECEIVE 失败后再 SEND，`*err`
+被第二次覆盖），所以 `verr=17` 说的是「SEND 那一次」，RECEIVE 那次的码没上卡。
+
+**⑤ boot 84/85 那两靴 `qmc=0 qsr=0` 的判据 (b) 到此正式下架，而且这次给出了机制。** 本靴叶子
+`cap=recv` 时 `rcv==frcv==d0b`，同一枚名字在 r296 行读队列、在 r298 行报 `verr=17` ⇒ **那两个 0 是「没读成」
+而不是「读出来是空」**。但别把它推广过头：`cap=send` 三行的 `qmc=/qsr=` 读的是 `nrcv`，而 `verr=` 报的是
+`frcv`——本靴只有 hop=1 第二拍两者恰好同为 `2903`，其余各行的 `qmc/qsr` 至今**没有自己的返回码**。
+⇒ 下一支的仪器债：`qmc=/qsr=` 必须带自己的 err（或改读在同一枚名字上），否则「0 只在同排返回码为 0 时算读数」
+这条规矩在 `cap=send` 行仍然落不了地。
+
+**⑥ 链形与换人。** 本靴 `58 backboardd → 148 com.apple.datamigrator → 180 com.apple.migrationpluginwrapper
+→ 123 installcoordinationd`；叶子回到 installcoordinationd（boot 86 是 containermanagerd 65），第四跳是谁
+**仍是每靴重读**；`ex=` 八行全 `ok`，`end=no_send`/`to=ffffffff` 形状不变；hop=2 两拍 `threads=3→5`、
+hop=0 `wait=12→14 trap=9→12`（本靴内部线程在涨，链不变）。`thid=` 逐跳稳定（`450/3a3/504/2ce` 两拍同值），
+而 `frcv` 在 hop=1 从 `79f3` 变 `2903` ⇒ 采样挑到的**线程**稳、挑到的**名字**不稳，这根线程在两拍之间换过等待对象。
+
+**⑦ 其余各格无退步（照例逐条点名）。** `clover r271: cpu` 两拍 `real=1 max=8 reg=1 start=0 run=1
+s=00000000 r=10000000 tm=237841,0,0,0,0,0,0,0 → 278509`——这是多核那一格 r299 的**基线读数**：拓扑数到 8 颗、
+注册 1 颗、start 0 颗。WDT 两拍 `en=0 armed=0 intmask=0 sts=0`（连续第十一靴排除 APSS 嫌疑）；
+keystore `stage=3 status=0 refused=0`，本靴内 `opens=44→49`、`calls=165→186`、`fire=301→361`，四枚 selector
+计数 `sel7 n=48 / sel14 n=3 / sel17 n=58 / sel35 n=3` 全 `rc=0`；GPU `clover r294:` 三拍 13 词仍只有
+`w1c=80000038`、`w24=0000000d` 非零（按 §5.12 读作符合本板 DTB，不是故障票）；`clover r260: bus` 三拍
+`verdict=102`（两枚候选地址 `nack=4 timeout=0`）；`CloverSdhci r172: dma deadline` 本靴只 1 笔
+（boot 86 是 6 笔，`ms=936 budget=600 polls=264 err8=00`、无 `spin`）记慢性噪声；`clover r283:` 与
+`CloverSdhci r175: tee seen` 本窗 **0 行**——按 r293 的规矩读作「**在环窗外**」而不是「没发生」：本靴环覆盖
+`t=1444.5…1815.1`（512 行 370 s），而这两行只在开机那一趟说话。
+
+**⑧ 落地快照第六次自动跑。** `@2026-11-03T10:20:58Z`（读卡上日志之前）、7650 字节；
+`charger_temp=322`（boot 84/85/86 都是 327）、`status/die_health=Cool`、`capacity=100`、
+`charge_type=Fast`；`round298-log-window.bin.landing-rawdump-head.bin` 512 字节**第六次全 0**
+⇒「复位会留下现成 ramdump」这条判据继续为空。
+
+**⑨ 产物。** `~/clover-out/round298-log-window.bin(.txt)`（512 行内核环、64 行驱动判据、16 条 report、
+44 行 probe、8 行 r296、**8 行 r298**、0 行 r297）、`…landing-{sensors.txt,rawdump-head.bin}`、
+`…pre-flash`、`~/clover-out/r298-boot87-unattended.log`；镜像 `round298-v0.7.2-payload.img`（`ccd22262…`）、
+内核 `round298-kernel-{amfi,normalized}.macho`。
+
+**⑩ 本格欠的两支，按预登记写死。** (a) **镜像侧普查**：`hop=1..3` 的收方任务里，`tname=` 那枚名字属于谁、
+有没有线程真的等在它上面——这是 `tlink=no` 唯一支持的下一步，走的还是 r233/r234 那套 entry 读法；
+(b) **一行 `vbits=`**：`ipc_right_lookup_read()` 已经成功并把 `bits` 交出来了，把它印出来就能把
+「port set / send-once / 其他」分不开这一格结掉，且**不需要对象、锁纪律与 translate 同一条**。
+多核那一格（r299，用户指定排在读数之后）与本支不同层：`drivers/ArmCpu/ArmCpu.cpp` 的副核上电整条已在
+（`probe` 认第二 nub `:226-241`、`ml_processor_register` `:512`、PSCI CPU_ON `:872-885`、新核自己
+`wakeRedistributor`+`enableGic` `:573-598`），只被 `sheng-smp` 一枚开关关着；boot 87 的 r271 行就是它的基线。
