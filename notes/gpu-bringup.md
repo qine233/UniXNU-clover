@@ -354,3 +354,36 @@ clover r291: gpu t=%u ldo %s vref=%08x val=%u uv=%u ctrl=%08x byp=%u pdn=%u cpr_
 * 三个词全 `0xffffffff` ⇒ 这一页没应答，整行作废（照 r282 的规矩，不当 0 票用）。
 
 角数（厂商 `SDM660_MMSS_FUSE_CORNERS=6` 对 DT 的 1..7）本轮仍不下结论：这一行不印角号，只印电压与判稳位。
+
+### 5.9 boot 78 把 §5.8 的两条判据一起点亮：vdd_gfx 在掉电位，参考电压从没编程过（2026-11-03）
+
+读到的唯一一行（`beat`；`ldo post` 那拍在这靴的 537.496418 → 718.840606 s 环窗之外，r249 的周期副本第二次
+顶上来，见 development-log 的 boot 78 块 ②）：
+
+```
+clover r291: gpu t=617 ldo beat vref=00000000 val=0 uv=375000 ctrl=80000038 byp=0 pdn=1 cpr_byp=0
+             sts=00000000 ready=0 settled=0 cx_on=1 gx_on=0
+```
+
+1. **§5.8 的第一条与第三条同时成立。** `ready=0` 且 `uv=375000`（`val=0`）⇒ 角根本没抬；`pdn=1` ⇒ LDO 在
+   掉电位。合起来的读法是：**这颗 LDO 自这次上电起既没被使能也没被编程**，`vdd_gfx` 侧从没动过。
+   **「轨是清白的」这一支关闭**——注意关闭的方向：不是「轨挡住了 gx」被证实，而是「轨无罪」被否掉；
+   gx 拿不到 PWR_ON 与「vdd_gfx 是 375 mV 且掉着」是同一件事的两个读数。
+2. **`ctrl=0x80000038` 只命名归档里有的位。** BIT(31) LDO_CLAMP_IO（`msm_gfx_ldo.c:40`）、BIT(5) LDO_PDN
+   （`:48`）、BIT(4) LDO_UNDER_SW_CTRL（`:49`），剩下 BIT(3)=0x8 **不在 `:39-49` 那十枚位里，不命名**。
+   `byp=0`（BIT(6)）与 `cpr_byp=0`（BIT(30)）分别说：LDO 没被旁路、CPR 也没被旁路——所以「谁把电放掉的」
+   这个问题本轮没有读数，只有 `pdn=1` 这个状态。按 §5.8 的规矩到此为止，不猜写手。
+3. **同拍正对照按预期工作了。** `cx_on=1` 与 `gcc gpu_ahb=1 gpu_bimc=1` 在 `vref/ctrl/sts` 全 0 的那一行里
+   照常说「这一页在应答」，所以那串 0 不是「没读到」（r282 的规矩：0 需要正对照）。三词也没出现
+   `0xffffffff`，那条作废判据没触发。
+4. **下一手是「对轨编程」，而它缺的不是寄存器是序列。** 寄存器三处都在 `msm_gfx_ldo.c` 里点得名：
+   `PWRSWITCH_CTRL` 抬 `LDO_PDN`、判稳读 `PWRSWITCH_STATUS`（`:307`），`LDO_VREF_SET_REG` 写 `val` 之后
+   抬 `UPDATE_VREF_BIT`（BIT(31)，`:35`）再落回去——厂商自己就是 `reg |= UPDATE_VREF_BIT` 后跟一句
+   `reg &= ~UPDATE_VREF_BIT`（`:282/:288`，即 `configure_ldo_voltage()` `:268` / `ldo_update_voltage()` `:297`）。
+   缺的是**顺序与角值来源**：`enable_ldo_mode()`（`:325`）与 `msm_gfx_ldo_voltage_enable()`（`:819`）
+   这条使能全序，以及角→电压那张表来自 CPR4 fuse（`gfx_cpr` 的 `qcom,cpr-voltage-ceiling`，
+   `sdm660-regulator.dtsi:579-581`，已在盘上）——而 fuse 本身在 `0x00784000`（`:536`）另一张窗口里。
+   没有 sha256 出处的序列不写；这是 GPU 这一格从「读」转「写」的真正门槛。
+5. **不动形状。** §5.7 那三条结论（票到了、钟没起、起不动与 gx 没合上同源）没有被本轮推翻或修改；
+   本轮只把「债在轨那侧」从推断变成读数。主线（桌面）现在的瓶颈不在这格：boot 77/78 两连「静默无 panic
+   复位」占了主线，见 development-log boot 78 ③④⑧。

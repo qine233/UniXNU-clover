@@ -21934,3 +21934,85 @@ payload `e01b59d2…` = `~/clover-out/round291-v0.6.92-payload.img`（58,720,256
 那一支先对 CPR_BYPASS 的语义再说话；三个词全 `0xffffffff` ⇒ 这一页没应答，整行作废。
 顺序照旧：boot 78 先落回，读回固定 grep 一次 `clover r289`（非零才解帧）。桌面仍 CPU-first，这一格是
 bring-up 取证，不是驱动。
+
+### boot 78（round291 / v0.6.92，2026-11-03）：vdd_gfx 从没抬起来过；第二起静默复位把主线占了
+
+**① 判决行（本轮唯一要的东西）读到了，而且两条预登记判据同时命中。**
+
+```
+[  617.181737]: clover r291: gpu t=617 ldo beat vref=00000000 val=0 uv=375000 ctrl=80000038
+               byp=0 pdn=1 cpr_byp=0 sts=00000000 ready=0 settled=0 cx_on=1 gx_on=0
+```
+
+逐字段：`vref=0 ⇒ val=0 ⇒ uv=375000`，即 `MIN_LDO_VOLTAGE`（`msm_gfx_ldo.c:65`，算式 `:1371`）——这颗 LDO 的
+参考从这次上电起**从没被编程过**。`sts=0`：`LDO_READY=BIT(2)`（`:58`）与 `LDO_VREF_SETTLED=BIT(4)`（`:57`）
+都是 0，厂商判稳用的正是这两位（`:307`）。`ctrl=80000038` 拆开是 BIT(31)=LDO_CLAMP_IO（`:40`）、
+BIT(5)=LDO_PDN（`:48`）、BIT(4)=LDO_UNDER_SW_CTRL（`:49`），再加一枚 BIT(3)=0x8——**这枚不在归档的
+寄存器表里，我不给它命名**（`msm_gfx_ldo.c:39-49` 定义了 0x1C 的十枚位，没有 0x8）。`byp=0`、`cpr_byp=0`。
+`cx_on=1` 是同拍正对照：这一页在应答，所以那一串 0 不是「没读到」。
+
+于是 §5.8 预登记的两支一起亮：`ready=0` 且 `uv=375000` ⇒ 角根本没抬、债在 CPR4/`vdd_gfx` 那侧；
+`pdn=1` ⇒ LDO 在掉电位。**「轨是清白的」这一支关闭**——不是轨挡住了 gx，是轨自己就没被抬起来过。
+`pdn=1` 这一支按预登记的规矩只到「先对 `CPR_BYPASS_IN_LDO_MODE`（`:41`）的语义」为止：本轮读不出写这位的是固件还是
+CPR4 从没 probe 过，所以不判「谁」。下一手只能是对轨**编程**，而编程序列（LDO enable + 角值来源）在
+盘上没有：`msm_gfx_ldo.c` 有寄存器表但没有可复现的 enable 全序，`cpr4-mmss-ldo-regulator.c`/
+`cpr3-regulator.h` 是 CPR 侧的，两边都没被钉成一枚能照着写的序列。
+
+**② 形状没变，但 `post` 那拍又被环地平线转出去了。** 这靴内核环只覆盖 537.496418 → 718.840606 s，
+上电期的 `ldo post` 在窗口之外，`beat` 副本第二次顶上来（r249 的规矩在 GPU 这条线上连用两轮）。
+GPU 整组行只在 t=617 fire=5 读到一次：`gcc gpu_ahb=1 gpu_bimc=1`（eMMC 的正对照）、
+`gfx3d=1/1`（问了但停着）、`chipid skipped cx_on=1 gx_on=0 gfx3d_en=1`。`grep -c "clover r289"` = 0。
+
+**③ 主线被第二起「静默、无 panic」复位占了，而且这次连"死在哪条路上"都能排除掉一部分。**
+boot 77 停在 1248.429585 s（最后一槽是 `BAD (newline missing)` 半行），boot 78 停在 718.84 s（最后一槽完整：
+`clover r229: sbport t=718 bb ...`，seq 2183，`ok`）。两靴都没有 kind-20 panic 槽（环里最新的 panic 槽是
+seq 47 = boot 76 的死线），r289 计数 0 ⇒ 这次**根本没走到 panic**，不是 r289 抓的那条 data abort 路。
+两靴的最后一行都是"写完的"，也就是说复位落在两条 printf 之间，机器没有留下遗言。
+
+**④ 两条仪器卫生，都记下来。**
+- **「落回 TWRP」不是读数**：r198 每靴开机前预写 recovery BCB，任何复位都落 TWRP。这条通道没有分辨力，
+  不能再被当成「走到过某条复位路径」的证据。
+- **驱动环封顶不了复位时刻**：boot 78 的 verdict 环一共 40 条（seq 0..39），全是 eMMC 上膛期的行与
+  tee/cap 通知，**没有一条带时间戳**；最新那条（seq 39）是 `r195: r225-p1 ... capped at 192`。
+  seq 是跨两个环的全局计数器（slot = seq mod 槽数：verdict 槽 39 = 39 mod 64、kernel 槽 124 = 2172 mod 512），
+  所以能确认「内核环还在写的时候驱动没有新行」= 「驱动没有要说的行」，**不是**「驱动先死了」。
+  缺的仪器就一条：驱动侧一条带 CNTVCT 的周期心跳，直接进 verdict 环、不经 msgbuf。
+
+**⑤ r283 连续第三靴读成 `unnamed`，这次能给它定性了：那条通道我们早在 r196 就判过死。**
+boot 78：`unnamed magic=6d881000008909f0 beat=0x1699c00014e15 beatcnt=0x13f1efffb9b`；另一窗口：
+`magic=ed88000200a909f8 beat=0x16eee0001536e beatcnt=0x13f4afefbbd`。两靴不同 ⇒ 页在应答、内容会换；
+但量级既不像 tick 数也不像**本靴**的 CNTVCT（718 s × 19.2 MHz ≈ 1.4e10，读到 1.37e12）⇒ 0x660 那 20 个词
+里不是我们的记录，写手是固件。关键事实：`task #346` 那轮（r196）已经因为同样的理由把 BCB 从 IMEM 挪进
+misc 分区——「不再靠 IMEM」——r283 又把跨复位记录建回同一个不可能活下来的电源域。**教训：新仪器要落在
+跨复位通道上，先查这条通道有没有被之前的轮次判死**（这条比"判据要写哪种读数会推翻哪一支"更靠前一步）。
+由于 POR 级复位本来就不留 IMEM，本轮这条读数的否定力度等于无，不写成关于复位类型的结论。
+
+**⑥ 电池这一支在宿主侧现测排除。** rec 里读 `/sys/class/power_supply/battery`：
+`capacity=100 voltage_now=4359607µV current_now=0 temp=250 status=Full charge_full=5978000 cycle_count=0`
+⇒「电掉了/电池空了」不成立。边界写清楚：这是**空载在 recovery 里**读的，它排除"没电"，不排除重载下的
+瞬时塌方。
+
+**⑦ 本轮不动形状。** r292 的两件事互不阻塞：(a) 驱动侧带时间戳的心跳行（自足，闭掉 ④ 的洞，也是下一次
+静默复位唯一能量化的仪器）；(b) CPR4/LDO 上电序列的转录（要带 sha256 的外部出处，才能谈对轨编程）。
+桌面仍 CPU-first。
+
+**⑧ 追加（写文档时把两靴的尾部又对了一遍）：两靴死前都有一位 `watchdogd` 打了致命的 `brk #1`。**
+
+```
+boot 78: [ 675.998797] clover r199: ubrk pid=213 comm=watchdogd n=1 pc=0x100e8cb0c lr=0x100e8cb0c
+                                       esr=0xf2000001 ec=60 brk=0x1
+         [ 675.998856] clover r200: ubrk2 pid=213 ... map=1 start=0x100e82000 end=0x100e92000
+                                       off=0xab0c code=...d503201f.9400026b.d4200020...
+         [ 675.999029] clover r193: crit pid=213 comm=watchdogd rv=0x5 sig=5 fatal=1 sigcrash=1
+         [ 675.999053] panic-on-crash disabled via boot-arg
+boot 77: [1064.392658] clover r199: ubrk pid=227 comm=watchdogd n=1 pc=0x101349b0c lr=0x101349b0c ...
+```
+
+两靴的 `pc==lr`、指令流是 `bti j; bl <目标>; brk #1`（r200 的 `code=` 里 `d503201f`/`9400026b`/`d4200020`），
+也就是**一个被声明为 noreturn 的调用返回了**，编译器紧跟的那枚 `brk #1` 把线程打死的。`off=0xab0c` 给了
+落在 watchdogd 本体里的偏移，`start=0x100e82000` 给了滑移——这两样在宿主上就够解出被调的是谁。
+
+时间关系：boot 78 从 trap 到环尾 42.8 s，boot 77 到环尾 184.04 s。**这是一条相关性，不是因果**，而且它
+不能排除 APSS 看门狗：`r281: wdt` 在 boot 78 只在 **617 s** 读到一次 `en=0 armed=0`（trap 之前 59 s），
+那之后到死之间再没有第二拍。所以要问的下一格很窄：把 WDT 的读数挪到短节拍上，看 trap 之后 `armed` 有没有
+从 0 变成 1；同时在宿主上把 `watchdogd+0xab0c` 的那次 `bl` 解出来。两件事都不动 GPU 的形状。
