@@ -23899,3 +23899,79 @@ boot 93 把这笔债从「反复论证」变成了「逐字段坐实」：kind-2
 `check-clover.py` EXIT=0；`verify-clover-payload.py` EXIT=0，新增 `census-relay`、`census-relay-onecopy`、
 `probe-beat-flush` 三针，`[payload] title` 两处断言移到 `clover r304:`。补丁 61 枚 `z`、6026 B、
 `~/UniXNU/patches/xnu/` 与设备仓 `patches/xnu-clover/` 两处逐字节相同；`LATE_PATCH` 排在最前。
+
+## Round304 读数（boot 94，v0.7.12）：中转管道被证明是好的，而普查尾巴一行都没进它——这一靴还第一次拍到「死在普查那一拍」
+
+冷刷 `round304-v0.7.12-payload.img`（sha256 `431a70d3…`），`--flash-cache … --boot-after-flash --allow-misc-bcb`；
+脚本自报「card before this flash: boot 93」→「the boot count moved: 93 -> 94」，落回 TWRP。窗口 623,104 B，
+解码 16 条 kind-20、64 条 kind-21、**55 条 kind-25**、512 条 kind-22、boot 94；内核环跨度
+`[375.764068]…[742.030664]`（≈366 s，512 槽）。八核身份逐字段复现（`r271 real=8 max=8 reg=8 start=7 run=8
+s=01111111 r=11111111`、`r299 req=1 con=1 run=7 st=07777777 fl=0 rc=0×8`、`r270 sent=365472 recv=365331`），
+显示通路还活着（`r180 frame#5 / copy#4 135 ms / scanout#4 ok / retire#4 done=4` 在 723–730 s），GPU 三拍照常（739 s）。
+
+**① r304 这台仪器自己：成立，而且是带正对照成立的。**
+卡上五条 `CloverSdhci r304: probe why=tail wrote=… seen=… next=… pend=…`，`seen` 依次 13→14→31→48→55、
+每次都 `next==seen`、`pend=0`、`skipped=0 stalled=0 refused=0 dropped=0`；55 条 kind-25 记录落在驱动环
+seq 39..97（4 格被 kind-21 判决行隔开），逐条 `said by kernel ok`。
+**正对照就是同一个中转本身**：它把 `r207 killsig` / `r208 sender` / `r211 skst` / `r218 killsrc+killustk` /
+`r226 kreg0-2` 这五族 kill 现场行原样送上了卡——r212 那条管道在 boot 94 是通的，而且新加的**单游标消费**
+没有重复送行（`seen` 与卡上的探针行数一一对上，没有 r212 整窗重读会产生的第二份）。
+
+**② 本轮要读的那六族：两条管道都 0 行。**
+`clover r300: fire`、`r300: done`、`r262: th`、`r296:`、`r298:`、`r303:` 在 kind-22（tee 副本）和
+kind-25（中转副本）里**都是 0 行**。普查那一拍只打到自己的头四行就断了：
+`r262 census t=741 threads=19 shown=19 hidden=0 wait=18 run=1 rx=9`（seq 1718）→ `r270 ipi`（1719）→
+`r271 cpu`（1720）→ `r299 smp`（1721，`[741.380886]`）——然后卡上属于这一拍的行就到此为止。
+按 §Round304 ⑤，这不是五支里的任何一支：(丙)/(丁) 被「55 条 kind-25 + 五条 `probe why=` + `pend=0`」排除，
+(乙) 被「连 `fire=` 都没有、`pend` 全程为 0」排除，(甲)/(戊) 至少要有一族到场。**落进预登记之外的新的一格：
+中转管道被证明活着，被中转的六行却从未进入它。**
+
+**③ 收回一条旧论断（boot 93 落盘的机制段）——两把钟不是一把。**
+boot 93 那段写的是「卡到 543.6 s 就没块请求了，普查 555 s 印进 msgbuf 之后没有下一次块尾部来泵」。本轮查清：
+flight 记录的 `t=` 是**驱动上膛以来的毫秒**（`flightCounterMs (gFlightStart)`，
+`drivers/CloverSdhci/CloverSdhci.cpp:3642`/`:3715`，`gFlightStart` 在 `:7603` 赋值），不是内核 uptime。两把钟在
+boot 93 差 11.83 s（543.654 ↔ 555.481）、在 boot 94 差 11.65 s（729.750 ↔ 741.40），同一枚 lag 反推 boot 87 也自洽
+（死线记录 `t=1802871 ms` ↔ 内核 `[1814.96]/[1815.06]` 那两条 panic 尾部的 `r155: hdr` 行，差 12.1 s）。
+⇒ **「之后没有块尾部来泵」不是读数，是跨钟推断，本轮撤回**；尾巴的缺席从「没被搬走」被 r304 换成更硬的一格。
+严格说清 r304 能排除到哪：若六行里任何一行在 742.03 s 那次 tail 泵**之前**产生，`seen` 必然大于 55（那次泵自己
+`wrote=7 pend=0`）；所以剩下的可能性只有一个——**这些行从未被产生，或产生在那次泵之后、来不及被任何泵搬走**。
+
+**④ boot 94 第一次拍到「死在普查那一拍」。**
+`[741.380886]` 的 r299 是这一拍最后一条，卡上其后只有别的线程的 `r224/r225`（`[742.030664]`）；而 **panic sink 的
+entry marker 这一靴落地了**：`t=729750ms stage=0 log_ready=1 host=0x3154c rc=0 drained=0 boot=94 magic=yes
+gates=0x7(armed,bcb,text)`。按 ③ 的 lag 折算，那一格 ≈ 内核 **741.4 s**——正落在 r299 与 `fire=` 之间那三个自增语句上。
+⇒ 连续七靴「普查尾巴 0 行」（88/89/90/91/92/93/94，跨五枚镜像）第一次有了**同靴的 panic 现场**：
+不是打完了没人搬，是**打到那儿就出事**。最后一枚有逐跳尾巴的靴是 boot 87——也正是 r299 把八核打开前的最后一枚镜像。
+「尾巴属镜像还是属核数」这一票本轮从「未投」变成「投给八核」，但同一枚 lag 也让 boot 87 那靴的 panic 尾部比尾巴晚 15 s，
+所以这条仍不是控制轮，别当结论用。
+
+**⑤ r302 的 marker 第一次在真 panic 上成立；句子仍一步没跑。**
+marker 四字段自洽、`magic=yes`、`rc=0`（写成了）、`gates=0x7` 三道门都开——r302 那笔「判决记录独占缓冲 + 自带 magic +
+盲写不预读」到此结清。但：480 B 句子那圈 kind-20 **还冻结在 boot 87 的 seq 49**；`why=drain` 的报告一行都没有；
+marker 自己报 `drained=0`。⇒ boot 89–94 这一族的形状收窄成一支：**sink 进去了、entry marker 写得上、之后的排干与句子
+一步都没跑**。那句 `flightPanicText`/`flightPanicMark` 的 `writePioBlock` 失败自证（boot 92 就在欠）从此不再是卫生，
+而是**主线的挡路石**——没有句子，就读不出是谁在普查那一拍动手。
+
+**⑥ r304 自己写漏的一条前提：节拍消费者这一靴根本没跑。**
+五条报告全是 `why=tail`，**零条 `why=beat`**。原因是我这轮的接法：`probeFlush ("beat", …)` 挂在
+`flightWrite (kFlightEventBeat, …)` 之后，而 `clover_emmc_flight_beat()` 在 `gPanicActive`／host 被人拿／不足 4 s 时
+提前 return（`:3911`–`:3941`），所以「卡被人拿着」会连带关掉这个消费者。boot 94 的 beat 记录本身停在
+`602,343 ms`（最新 entry `729,749 ms`，解码器直说 gap 127,406 ms）⇒ 尾巴那一拍没有块尾部可等时，也没有节拍来救。
+这是仪器缺陷，不是读数，r305 要改。
+
+**⑦ 八核像与复位时机（同族第八票，且第一次与普查同位）。**
+boot 94 内核钟停在 ≈742 s（marker 折算，`drained=0`、无死线记录）；家族带：642.7 / ~645 / 661 / 746 / 835 / 555 / **742**。
+落地快照 `charger_temp=365`（家族新高，前高 356）、`die_health=Cool`、`status=Charging`、`capacity=100`、
+`voltage_now=4345203`；`rawdump` 头全 0 照旧。
+
+**⑧ 下一手（r305，仍是主线前置，三小条，都不新开问题）。**
+1. `clover_census_row` 改**先中转、再 printf**（调一行序）：把「线程走到了这一行」与「这一行进得了 msgbuf」分开。
+   boot 95 若 kind-25 出现 `r300: fire` 而 kind-22 没有 ⇒ 停在 printf/控制台侧；两边都没有 ⇒ 根本没走到那一行。
+2. **把节拍消费者挪到 owner/guard 判定之前**（`clover_emmc_flight_beat()` 顶部），让「卡被人拿着」不再连带关掉尾巴的
+   第二个泵；`why` 继续区分 `beat`/`tail`/`drain`（本轮已证明只有 `tail` 在跑）。
+3. **`writePioBlock` 失败自证**（⑤ 升级出来的那笔）：句子一旦上卡，「谁在普查那一拍动手」就有名字。
+   在此之前，桌面主线那一格仍无读数，**既不记 (a)/(b)，也不记仪器失败**——仪器这一靴被证明是好的。
+
+**⑨ 产物。** `~/clover-out/round304-boot94-window.bin`（623,104 B）与解码 `…bin.txt`、`…landing-sensors.txt`、
+`…pre-flash`（刷前 boot 93）、`~/clover-out/unattended-r304.log`；镜像 `round304-v0.7.12-payload.img`（`431a70d3…`）、
+内核 `12a76a24…`、AMFI 后 `242fcf42…`、归一化 `3acfb517…`。本轮是**读回轮，不发新镜像**（无代码改动）。

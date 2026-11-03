@@ -340,9 +340,33 @@ leave」一路收紧到一句可测的话：
   `3acfb517`；`round304-v0.7.12-payload.img` 58,720,256 B，sha256
   `431a70d3a4dbbadedbfd2e871acef98b58beb9fb63db9d6686949cbaf8e2621e`；双 checker EXIT=0（新增 `census-relay`、
   `census-relay-onecopy`、`probe-beat-flush` 三针）。**boot 94 判读预登记在 §Round304 ⑤**：(甲) 尾巴齐 ⇒ §Round303 ⑤
-  五支第一次有输入；(乙) 有 `fire` 无 `done` 且 `pend>0` ⇒ 消费没跑完，再看 `dropped>`0 分清「中转环自己成了新地平线」；
+  五支第一次有输入；(乙) 有 `fire` 无 `done` 且 `pend>0` ⇒ 消费没跑完，再看 `dropped>0` 分清「中转环自己成了新地平线」；
   (丙) 零 kind-25 且零 `probe why=` ⇒ 驱动消费者根本没跑，**不能读成内核没抄**；(丁) `seen=0 wrote=0` ⇒ 双投递没进镜像，
   记在镜像身份而非普查；(戊) 只齐某一族 ⇒ 那一族自己没产生，是内容不是管道。未付：`writePioBlock` 自证、「核数 vs 镜像」控制轮。
+* **boot 94（r304 / v0.7.12 的读回）：中转这台仪器被证明是好的，而普查尾巴一行都没进它——并且这一靴第一次拍到「死在普查那一拍」。**
+  冷刷 `round304-v0.7.12-payload.img`（`431a70d3…`），boot 93→94，落回 TWRP；八核身份逐字段复现、显示通路还活着
+  （`r180 frame#5 / copy#4 135 ms / retire#4 done=4`）。仪器侧：五条 `CloverSdhci r304: probe why=tail` 的 `seen`
+  13→14→31→48→55、每次 `next==seen pend=0`、`skipped/stalled/refused/dropped` 全 0，55 条 kind-25 逐条 `ok`，而且
+  **同一个中转把 r207/r208/r211/r218/r226 五族 kill 现场行原样送上了卡**（正对照）、单游标没重复送行。但**本轮那六族
+  （`r300 fire`/`done`、`r262 th`、`r296`、`r298`、`r303`）在 kind-22 与 kind-25 里都 0 行**：那一拍只打到自己的头四行
+  （`r262 census t=741 threads=19` → `r270` → `r271` → `r299 [741.380886]`）就断了。这**不是 §⑤ 五支里的任何一支**，
+  是新的一格：**管道活着、行没进管道**。
+  **同时收回一句**：boot 93 那句「卡到 543.6 s 就没块请求、尾巴没有下一次块尾部来泵」是跨钟推断——flight 记录的 `t=`
+  是**驱动上膛以来的毫秒**（`flightCounterMs(gFlightStart)`，CloverSdhci.cpp:3642/3715/7603），不是内核 uptime；
+  boot 93/94 两把钟差 11.83/11.65 s，同一枚 lag 反推 boot 87 的死线记录（`1802871 ms` ↔ 内核 `[1814.96]`）也自洽。
+  新落的第一格：这一靴 **panic sink 的 entry marker 落地了**（`t=729750ms stage=0 rc=0 drained=0 boot=94 magic=yes
+  gates=0x7(armed,bcb,text)`）——折算 ≈ 内核 **741.4 s**，正落在 r299 与 `fire=` 之间那三个自增上 ⇒ 连续七靴尾巴 0 行
+  第一次有同靴 panic 现场：**不是打完了没人搬，是打到那儿就出事**；最后一枚有逐跳尾巴的靴（87）也正是八核打开前那枚。
+  第二格：r302 的 marker 第一次在真 panic 上成立（独占缓冲 + 自带 magic 结清），但句子那圈 kind-20 **仍冻结在 boot 87
+  seq 49**、零条 `why=drain`、`drained=0` ⇒ 「sink 进去了、marker 写得上、之后的排干与句子一步没跑」；那句
+  `writePioBlock` 失败自证从卫生**升级成主线的挡路石**。第三格：r304 自己写漏的前提——**五条报告全是 `why=tail`、
+  零条 `why=beat`**，因为 `probeFlush("beat")` 挂在 `flightWrite(kFlightEventBeat)` 之后，而 `clover_emmc_flight_beat()`
+  在 host 被人拿时提前 return（:3911-3941），这靴 beat 停在 602,343 ms（gap 127 s）⇒ 第二个泵整靴没跑，这是仪器缺陷。
+  结局带：642.7/~645/661/746/835/555/**742**（第八票，第一次与普查同位）；`charger_temp=365` 家族新高。
+  **下一手 r305（三小条）**：① `clover_census_row` 改成**先中转再 printf**——把「走到这一行」与「进得了 msgbuf」分开，
+  boot 95 若 kind-25 有 `fire` 而 kind-22 没有就是停在控制台侧，两边都没有就是根本没走到；② 节拍消费者挪到
+  owner/guard 判定之前；③ `writePioBlock` 自证，让句子能上卡、给「谁在普查那一拍动手」一个名字。
+  详见 `notes/development-log.md` §Round304 读数。
 * **再后一支（本格欠的两条仪器债）**：`vbits=`（`ipc_right_lookup_read()` 已经交出的 entry 位掩码，
   用来分 port set / send-once，不需要对象、锁纪律与 translate 同一条）与 `qmc=/qsr=` 自带返回码。
 * **那笔「等设备解锁」的死等已经不是现场，但它的机制现在读全了**：r274 命中的形状是
