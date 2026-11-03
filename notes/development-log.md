@@ -23771,3 +23771,55 @@ VA 不变，与 r302 同——这轮的插入没挪 AMFI 段）→ 归一化 `3d
 r296 针更新到带 `qerr=%d`、r298 针更新到带 `vb_r=%x vb_v=%x`（截半行的字面量会留前缀针全绿，这轮的三行都是判决行，逐字钉）。
 补丁 60 枚 `z`、装在 `~/UniXNU/patches/xnu/` 与设备仓 `patches/xnu-clover/` 两处逐字节相同；
 `build-xnu-4k-baseline.sh` 的 `LATE_PATCH` 把 r303 排在最前（先于 59 枚 `z` 的 r300 反打），正向 glob 里它排最后。
+
+## Round303 读数（boot 93，v0.7.10）：普查那一拍落在环的最新一行、尾巴没冲上卡——r303 这一靴没有任何读数
+
+冷刷 `round303-v0.7.10-payload.img`（sha256 `3c2e7be4…`），`--flash-cache … --boot-after-flash --allow-misc-bcb`；
+卡上「刷前 boot 92」→「boot 93」（脚本自报 `card before this flash: boot 92`、落回 TWRP）。窗口 623,104 B，
+kind-22 内核环解码 512 行、时间跨度 **t≈255.398…555.481 s**。
+
+**① 身份对，但结局是「没进 sink 的短命靴」。** SMP 那一族逐字段复现（`clover r271: cpu t=555 real=8 max=8 reg=8
+start=7 run=8 s=01111111 r=11111111`；`clover r299: smp req=1 con=1 run=7 st=07777777 fl=0 rc=0×7`；
+`clover r270: ipi sent=261965 recv=261866`，八核 sgi 计数全非零）。但两枚 panic marker **全是 STALE**——
+slot 0 是 boot 92 的 entry marker（`magic=yes`）、slot 1 是 boot 87 的 exit marker（`magic=absent`），
+解码器直说「**boot 93 never entered the sink**」；flight 段的死线记录也是 boot 87 的（`t=1802871 ms`），
+**boot 93 一笔没写** ⇒ 这靴既没跑到 1800 s 死线、也没进 panic 排干，它停在自己环里最新那一行 **t=555.481791**。
+落地快照：`charger_temp=356`（boot 92 是 322，本靴高）、`status=Charging`、`die_health=Cool`、`capacity=100`。
+
+**② 本轮要读的那一行（r303）0 行，而且不是落进预登记五支里的任何一支——它压根没到卡。** 普查头在环里、
+是这一族最新几行之一（`slot 35 seq 1571`：`clover r262: census t=555 pid=58 threads=18 shown=18 hidden=0 wait=17
+run=1 rx=6`），它和紧随的 `r270`(1572)/`r271`(1573)/`r299`(1574) 一起上卡了。但**逐跳尾巴**——`r262 th`、
+`clover r296:`、`clover r298:`、`clover r300:`、以及本轮新增的 **`clover r303:`**——在整张卡上**各 0 行**。
+按 §Round303 ⑤，`rentr/rvbits/rwait/rwtid/rbusy/vb_v/qerr` 全部**未取到**，五支判读没有一支有输入：
+主线条目普查这次**读不出来**，落在「预登记之外」而不是某一支上。
+
+**③ 为什么读不出来——这是 r212 机制、不是 r303 的 bug。** `clover r303` 和 `r296/r298/r262 th` 同属
+`clover_bb_chain` 普查 fire 的**线程遍历尾巴**，与那一拍的**头行**骑的是同一条管道：`printf → msgbuf → tee →
+kind-22 卡环`，而 tee **只在块 I/O 尾部泵**。这张卡的 flight 记录到 **t=543654 ms**（543 s）之后就没有新的块请求了
+（`mobile_assistantd`/`chronod` 的 8/32 块读排到 543.65 s 停），普查那一拍在 **555 s**——比最后一笔块 I/O 还晚
+≈12 s——于是尾巴印进了 msgbuf、却**没有下一次块尾部来触发 tee 把它泵上卡**，而这一靴 555 s 就停了、**没进 sink、
+没有 panic 排干**（r212 早证明：一次性行只有靠后来的 flush 重试才会落地，boot 90 那五行排干行就是这么补上的）。
+⇒ **boot 93 不能把「尾巴被节流」与「尾巴落在环地平线之外」这两支分开**：头行上了卡、尾巴在环最新行之后、之后没有任何
+第二次 flush——三种缺席解释（throttle / horizon / no-later-flush）在这一靴里恰好**不可分辨**。
+
+**④ 这不是新债务，是 §⑤ 早就点名「不作本轮结论」的那一笔，现在坐实到 r303。** r303 的设计意图是「把普查尾巴
+从『缺席读成没发生』里救出来」——它给了内容（`rentr/rvbits/rwait`）而非只给计数，但**它自己仍骑在被它审计的那条
+管道上**，所以它和 `r262 th`/`r296`/`r298`/`r300` 一样被同一个「尾巴要等后续 flush」吞掉。§Round303 ⑤ 的搭读条
+原话：「普查尾巴（`r262 th`/`clover r300`，已五靴 0 行跨四枚镜像，仍骑 msgbuf+tee）……债要到它们也有非管道副本才结清」。
+boot 93 = **连续第六靴**、且 r303 是这条尾巴上**最新被吞的一行**（跨五枚镜像）。
+
+**⑤ 八核像与复位时机（又一个同族数据点，仍非控制）。** boot 93 是一靴**没进 sink 的短命靴**，环最新行 555 s、
+无死线记录 ⇒ 复位在 ~555 s 之前/附近，**比之前五靴（642.7 / ~645 / 661 / 746 / 835 s）更早**，且是这一族里
+**第一靴连 sink 都没进**（89/90/91/92 都进了、只是那句被拒）。所以「何时结束」仍是分布，「核数 vs 镜像」那轮
+**控制仍未跑**（本轮没动硬件路径，是第六张同族票）。
+
+**⑥ 下一手（r304，主线的前置，不是新问题）：给普查尾巴一条不骑被测管道的副本。** 照 r212 给内核探针做过的
+那条——`clover_emmc_probe_say()` 把每行抄进驱动内的 RAM 环（不经卡、不经 msgbuf），由**节拍与 panic 排干**
+泵上卡，而不是只在块尾部泵。具体到 `clover_bb_chain`：`r262 th`/`r296`/`r298`/`r300`/`r303` 这一族逐跳行改走
+驱动 RAM 环 + 周期 flush，这样一靴哪怕 555 s 就停、没进 sink，尾巴也能靠那次 flush 到卡；到那时 §⑤ 的五支
+判读才第一次有输入。**在此之前，桌面主线的那一格读不出，且不能记作失败或记作 (a)/(b)。**
+
+**⑦ 产物。** `~/clover-out/round303-boot93-window.bin`（623,104 B）与解码 `…bin.txt`（512 行内核环，
+span 255.4–555.4s；verdict 环 boot 93 有行、但**无排干行**＝没进 sink；r303/r296/r298/r300/r262-th 各 0 行）、
+`…landing-sensors.txt`（charger_temp=356）、`~/clover-out/unattended-r303.log`；镜像 `round303-v0.7.10-payload.img`
+（`3c2e7be4…`）。本轮是**读回轮，不发新镜像**（无代码改动）。

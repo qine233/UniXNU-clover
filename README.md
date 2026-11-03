@@ -306,6 +306,21 @@ leave」一路收紧到一句可测的话：
   `notes/development-log.md` §Round303 ⑤**：`rentr=0`+`rvbits=20000`+`rwait>0` ⇒ 任务级债链闭合；
   `rvbits=80000`(PORT_SET) ⇒ boot 87 猜中那支、本仪器第一次分得开集合与一次性；`40000`/`100000` ⇒ 链形重画；
   非零非 -2 的 `rentr` ⇒ 上跳对象与本名不是同一 entry；`rbusy=1` 与 `rwait=0` 是两种不同的「没看到」。
+* **boot 93（r303 / v0.7.10 的读回）：这一拍落在环的最新一行、尾巴没冲上卡——r303 没有任何读数，且落进预登记之外。**
+  冷刷 `round303-v0.7.10-payload.img`（`3c2e7be4…`），boot 92→93，落回 TWRP。身份对（SMP 八核逐字段复现
+  `r271 real=8 reg=8 start=7 run=8`、`r299 req=1 con=1 run=7 rc=0×7`、`r270 sent=261965 recv=261866`），
+  但**普查那一拍（`clover r262: census t=555 threads=18 rx=6`）就是 kind-22 环的最新几行之一**（seq 1571，
+  环跨度 255.4–555.4 s），它和 `r270`/`r271`/`r299` 一起上卡了，而**逐跳尾巴——`r262 th`/`r296`/`r298`/`r300`/
+  `r303`——各 0 行**：本轮的 `rentr/rvbits/rwait/vb_v/qerr` 全未取到，§⑤ 五支一支都没有输入。
+  机制是 r212 那条、不是 r303 的 bug：这一族尾巴骑 `printf→msgbuf→tee→环`，**tee 只在块 I/O 尾部泵**，而这张卡
+  的 flight 记录到 543.65 s 就没了块请求，普查在 555 s 印进 msgbuf 后**没有下一次块尾部来泵它**；这靴又**没进
+  panic sink**（两枚 marker 全 STALE＝boot 92 entry / boot 87 exit，解码器直说「boot 93 never entered the sink」，
+  死线记录还是 boot 87 的）⇒ **没有第二次 flush 来重试环**。所以 boot 93 不能把「尾巴被节流／尾巴在环地平线外／
+  没有后续 flush」三种缺席分开。这正是 §⑤ 早标「不作本轮结论」的普查尾巴债，**现在坐实到 r303＝连续第六靴、跨五枚镜像**。
+  八核像：boot 93 是这一族**第一靴连 sink 都没进**、停在 ~555 s（比前五靴 642.7–835 更早），仍是一张同族票、
+  「核数 vs 镜像」控制未跑。**下一手（r304，主线前置）**：照 r212 给内核探针做的那样，把这一族逐跳行改抄进
+  **驱动 RAM 环 + 周期/排干 flush**（不经卡、不经块尾部节奏），这样一靴哪怕 555 s 就停、没进 sink，尾巴也能靠那次
+  flush 到卡；在那之前桌面主线那一格读不出、**既不记失败也不记 (a)/(b)**。详见 `notes/development-log.md` §Round303 读数。
 * **再后一支（本格欠的两条仪器债）**：`vbits=`（`ipc_right_lookup_read()` 已经交出的 entry 位掩码，
   用来分 port set / send-once，不需要对象、锁纪律与 translate 同一条）与 `qmc=/qsr=` 自带返回码。
 * **那笔「等设备解锁」的死等已经不是现场，但它的机制现在读全了**：r274 命中的形状是
