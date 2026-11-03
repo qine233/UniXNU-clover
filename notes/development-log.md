@@ -24596,3 +24596,89 @@ boot 97 在卡上有 `r262` 头行、`r270`、`r271`、`r299` 四枚 printf 行�
 成立＝本靴 `beat` 行在卡上、且它自己读出 `reg=1 start=0`；`payload.json` 的 `kernel_args`
 里 `armcpu-smp=0` 在场（args 烤在镜像里，不靠人记）。判据不成立就只报「控制轮没跑成」，
 不再拿「普查一族 0 行」当单核的证据——那是本轮要修的错，不是本轮的读数。
+
+
+## boot 99 读数（v0.7.18 镜像 `ae4baa8a`，八核）：预登记的四支一支都没中，因为题问错了地方
+
+**产物（读数都指到这些文件）**：`~/clover-out/round308-boot99-window.bin`（623,104 B）＋解码
+`round308-boot99-window.bin.txt`（165,272 B）＋`unattended-r308.log`（167,135 B）＋落点快照
+`…window.bin.landing-sensors.txt`（`capacity=100 charger_temp=346 die_health=Cool`，快照时刻 2026-11-03T23:04:33Z）＋
+`…window.bin.landing-rawdump-head.bin`（第六次全 0）。身份：`round308-payload.json` 里 `payload_sha256=ae4baa8a…`、
+`kernel_sha256=7e669d95…`、`kernel_args` 含 `armcpu-smp=1`；卡上自报 boot id＝**99**（kind 24 计数行
+`boot 99 lba 13321432 kind 24 ok`）。
+
+**① 本轮的正对照先立住：中转这条路在本镜像里是活的。**
+kind-25 的 `clover r308: beat` 有 **10 枚**（`t=660/780/900/1020/1140/1265/1389/1509/1633/1753`），内核环那边有它们
+各自的 printf 副本 **7 枚**（`[780.068106] [900.075463] [1020.082870] [1145.275759] [1269.333168] [1389.340306]
+[1633.251638]`）——3 枚的差**不许**笼统读成「没印」，也不许笼统读成「tee 丢了」：
+`[660]` 早于窗内最早一行（772 s）、`[1753]` 晚于窗内最新一行（1714.5 s，panic 前最后一次读游标之后），两枚都在
+环的读数地平线之外；**第三枚 `[1509]` 夹在两枚有副本的邻居之间，本靴没有任何一行仪器说得出它为什么没到**
+（tee 自己的报告行整族缺席，见④）——这一格按「欠一个解释」记账。驱动侧的账也对得上：`why=tail … wrote=13 seen=52`、`why=beat calls=198208 wrote=1
+seen=62 next=62 pend=0 flushed=62 skipped=0 stalled=0 refused=0 dropped=0 blocked=0/0/0 empty=0 cut=0`。
+**`seen=` 从 boot 97/98 的整靴 0 涨到本靴的 62**，且 `next==seen`、四个坏计数全 0 ⇒ r308 那条腿被证明能搬，
+预登记的（丁）支（「中转在本镜像里死了」）**排除**，boot 96/97/98 以 relay 为前提的结论也不必作废重开。
+
+**② 真正的读数是 `ent=0`：不是走死了，是门没开。**
+十枚 beat 行逐字同形：`target=0 ent=0 fired=0 same=0 cap=0 gone=0 notask=0 busy=0 reg=8 start=7 run=8`。
+`ent=` 是 `clover_bb_sample()` 进函数第一句的自增⇒ 整个 boot（660→1753 s）**一次都没被叫过**；
+`fired/same/cap/gone/notask/busy` 全 0 是它的必然后果，不是六条独立结论。`smp-pre`/`smp-post` **0 枚**同理。
+而 `target=`（就是 `clover_bb_target_pid`）十枚全 0＝闩锁从没合上过。全窗口（64 行 kind-21＋49 行 kind-25＋512 行
+kind-22）搜 `backboard` **命中 0**⇒ 本靴没有一个叫 backboardd 的任务进入过被采样的名字。
+所以：甲（pre 有 post 无）、乙（两枚都有）、丙（两枚都无而 `fired≥1`）**都预设 burst 跑过**，一支都不成立；
+十一靴来那条「普查尾巴断在哪一行」的题，在这一靴**没有对应的现场**——仪器第一次能说出「不是断在环里、
+也不是断在 printf 里，是没人调用」。这一格靠的正是 r308 那条不经 tee 的腿（`reg=8 start=7 run=8` 是八核上线的
+第一个**不骑被测管道**的读数，第十一层意义上的同源：同一段 `CpuDataEntries` 循环，与 tee 那枚 `r271` 行分开）。
+
+**③ 这一靴没有按前十靴的形状结束：它活到了自己的死线。**
+`flight: deadline fired after 1800 s at t=1802875 ms boot=99 … elapsed=1800.000s`，panic 点在 `ArmCpu.cpp:655`；
+四枚飞区节拍 `k=1801/1805/1809/1813 s`、`arming_offset≈12.1 s`、`starve=0/0/100613/77`、
+**`pio=0/0x00000000/0w@0ms`（本靴一次块写都没被拒过）**。sink 的 entry marker 落地：
+`t=1803862ms k=1816s stage=0 rc=0 boot=99 magic=yes gates=0x7(armed,bcb,text) host=0x0 log_first=13320216`；
+stage=1 的出口 marker 缺席（slot 1 是 boot 87 的陈旧行，读者按 boot id 标了 STALE——r305 那道生成门槛又一次挡住了
+把旧字节解成本代读数）。按第六层，这**不记成「复位发生在 1816 s」**：这一靴的结束是我们自己叫的 panic，
+不是无名复位；能记的只有「本靴 ≥1816 s 且死线到点」，与前十一靴 490–835 s 内结束的形状构成一条**新的分布事实**。
+
+**④ 新的仪器缺口：死线 panic 之后，排干一句没说。**
+整窗口 `drain` 命中 **0**——`drain enter`、本轮新写的 `CloverSdhci r308: drain exit … ring_pend= probe_pend=`、
+tee 自己的报告行，全都没有；而那枚 `drain exit` 行在镜像里是验过的（`verify-clover-payload` 的 `exit`/
+`exit-generation` 两条 needle 都绿）。**「镜像里有这行」与「本靴有没有它的读数」是两格**，本轮只能记成后者欠着。
+唯一还活着的机制候选是 entry marker 自带的 `host=0x0`：排干那条路要先拿到 SDHCI host ticket
+（`probeFlush`→`ringWriteRecord`→`writePioBlock`），而 r302 那枚 marker 是盲写、不要 ticket——
+这与 boot 94 的不对称同形（entry marker 上卡、之后的东西都不在）。**这一条按候选记账，不许当事实**：
+它需要一枚「排干入口第一句、不经 tee、不要 host」的行才能变成读数（下一手第②条）。
+
+**⑤ 用户态这一靴第一次有了新形状（桌面那一格仍读不到，但欠的是地平线不是「没有」）。**
+- SpringBoard＝**pid 27**（前两靴在 57 号段），`r217: sbs t=1683 pid=27 n=5 c=32 …`、`r218 sbpc` 五条线程、
+  `r221 sbm2 op=40700420e b=0 rem=2803` 到 1683 s 仍在打，`r222 sbuf`/`r223 sbport` 齐全 ⇒ 到内核 1688 s 它还活着。
+- 它发向 **`nm=2803`**：`r223: sbport … rem nm=2803 … cnt=2 ql=6 seq=0 rn=0 ms=0 sr=3 rcv=0/0 kobj=0 wq=0`，
+  而 `r234/r303: sbown … rem nm=2803 own=-` 连续多拍（772/773/801/813/823/828/838/897/1061 s）都译不出属主；
+  相比之下 `a303`、`7403` 两枚口的属主都是 `27:SpringBoard` 自己。**「属主译不出」有两种读法**（名字取不到 vs
+  该 entry 没有属主任务），本轮不分開、留给下一手第③条。
+- launchd 连杀三枚 `UARPUpdaterServi`（pid 173/174/175，`sig=9 spid=1`，`r207 killsig`）；keystore 一族
+  `r281: open/call` 全 `rc=0`，客户里出现了 `keybagd`（pid 11 与 46）、`ReportCrash`（pid 97，864 s 与 1469 s 两次来开）、
+  `akd`、`biomed`、`containermanagerd`、`fairplayd`、`UserEventAgent`、`DumpPanic`、`watchdogd`。
+- HID：`r255: beat stage=5 … published=1 seen=1 presses=3 asks=1162 touch=1`；`r260: bus mode=3 … verdict=102`
+  （触摸 I2C 仍不应答，与前靴同）。GPU 线无新东西：`r291: gpu … uv=375000 ctrl=80000038 pdn=1 sts=0 ready=0 cx_on=1
+  gx_on=0`、`r294` 十三词仍只有 `w1c=80000038`/`w24=0000000d` 非零、`r286 gpucc … gx=08282000 gx_on=0`；
+  `r281: wdt en=0 armed=0`（APSS 看门狗继续被排除）。
+- **桌面那一格本窗读不到，而且原因明确**：环最早一行 772 s，而 boot 98 的交帧族（`retire#1..#4`、`frame#5`）出在
+  465–481 s ⇒ 本窗里 `frame#`/`retire#`/`presented` 0 条**是地平线，不是「没交帧」**。这一格从此欠的不是判据、
+  是**一条不随地平线走的桌面读数**。
+
+**⑥ 与「尾巴属镜像 vs 属核数」那格的关系（不许偷换）。**
+boot 99 没答这格——它压根没有 burst。boot 100（同一枚归一化内核 `7e669d95`、`armcpu-smp=0`，镜像 `9354aec6…`，
+已构建待刷）现在校准的是**仪器本身**：`beat` 行的 `reg=/start=/run=` 会不会随那枚开关动
+（成立＝`reg=1 start=0`；若 smp=0 仍读 `reg=8`，则中转上的 `reg=` 不算核数的量，本轮所有基于它的推理一起收回）。
+校准通过之前，「八核第一次由不经 tee 的腿报出」这句话只到「有读数」，不到「是核数的读数」。
+
+**⑦ 本轮自己踩到的另一格（发版纪律，已当场收回）**：`board.toml` 的 `payload.title` 不是注释——它被烤进镜像里的
+`unixnu.toml`，而 `verify-clover-payload.py` 拿 board.toml 与镜像里那份**逐字比相等**（`xnu.title == board.title`）。
+我把 v0.7.18 的镜像（`ae4baa8a`，06:32:04）烤好之后，又在 06:42:35 提交里把标题里一处漏掉所有格的
+`not the relay own:` 改成 `not the relay's own:`，随后又试图把 boot 99 的读数追加进同一枚标题；两次都会让
+**已经被读过的那枚镜像过不了自己的闸门**（实测：追加后 `verify` EXIT=1，报 `title WRONG`）。因此标题已恢复成
+镜像里真正带着的那段文本（`git show 1f7ab0b:board.toml`），本节的读数只进 README / development-log / porting.toml。
+代价是一条要如实记下的偏差：**控制轮镜像 `9354aec6`（06:46:03，在改标题之后构建）里那份 `unixnu.toml` 的标题比
+boot 99 那枚多一个撇号**；两枚镜像的内核是同一枚 `7e669d95`、参数只差 `armcpu-smp=0/1`，而 `unixnu.toml` 的标题
+只有引导侧的清单会读、内核不读——所以 boot 100 仍是「同内核、一枚开关」的控制轮，但这句话要连着这个撇号一起引用。
+**规矩（第十一层的另一件衣服）**：会进镜像的字符串（标题、args、身份串）改完必须**重新构建再过闸门**；
+读数落盘的那一版**不许动它们**，要写就读数文件。

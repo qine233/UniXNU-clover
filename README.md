@@ -537,6 +537,33 @@ leave」一路收紧到一句可测的话：
   `_clover_fastboot_reason` 在符号表）；镜像 `~/clover-out/round308-v0.7.18-payload.img`
   sha256 `ae4baa8a…`，58,720,256 B。**boot 99 的判读四支与控制轮的成立判据，读数之前写死在
   `notes/development-log.md` §Round308 ⑥⑦**。
+* **boot 99（v0.7.18 的第一靴，八核）：预登记的甲/乙/丙/丁四支一支都没中，因为题问错了地方**。正对照先立住：
+  kind-25 上有 **10 枚** `clover r308: beat`（`t=660…1753`），内核环那边有 7 枚同字节的 printf 副本，驱动侧
+  `why=beat … wrote=1 seen=62 next=62 pend=0 blocked=0/0/0 empty=0 cut=0`——**`seen=` 从前两靴的整靴 0 涨到 62**
+  ⇒ 中转这条路在本镜像里是活的，（丁）支排除，boot 96/97/98 以 relay 为前提的结论不必作废。真读数是
+  `target=0 ent=0 fired=0 same=0 cap=0 gone=0 notask=0 busy=0 reg=8 start=7 run=8` 十枚逐字同形：
+  `ent=` 是 `clover_bb_sample()` 进函数第一句的自增，整个 boot（660→1753 s）**一次都没被叫过**，`smp-pre`/`smp-post`
+  0 枚是它的后果而非另一条结论；全窗口（64 行 kind-21＋49 行 kind-25＋512 行 kind-22）搜 `backboard` **命中 0**。
+  十一靴来「尾巴断在哪一行」这题，本靴第一次有个**不骑被测管道**的答案：不是断在 printf 里、不是断在环里，
+  **是没人调用**（门是 `clover_bb_target_pid != 0`）。另外两格：① 这一靴**没按前十靴的形状结束**——
+  `deadline fired after 1800 s at t=1802875 ms boot=99`、四枚飞区节拍 `k=1801…1813 s`、`pio=0` 整靴无一次块写被拒、
+  sink 的 entry marker 落地（`rc=0 magic=yes host=0x0`）；按第六层这**不记成「复位在 1816 s」**，只记
+  「≥1816 s 且死线到点」，与前十一靴 490–835 s 内结束构成一条新的分布事实。② **新的仪器缺口**：整窗 `drain`
+  命中 0——`drain enter`、本轮新写的 `CloverSdhci r308: drain exit`、tee 报告行全缺，而那枚行的字节在镜像里
+  闸门验过；「镜像里有」与「本靴有没有读数」是两格。唯一活着的机制候选是 marker 自带的 `host=0x0`
+  （排干要 SDHCI host ticket，r302 的盲写 marker 不要），与 boot 94 的不对称同形——**按候选记账，不当事实**。
+  用户态第一次有新形状：SpringBoard＝**pid 27**（前两靴在 57 号段）到 1688 s 仍活着，发向 `nm=2803`
+  （`cnt=2 ql=6`）而 `sbown … rem nm=2803 own=-` 连续九拍译不出属主，`a303`/`7403` 的属主都是它自己；
+  launchd 连杀 173/174/175 三枚 `UARPUpdaterServi`；keystore 一族全 `rc=0`（`keybagd` 11/46、`ReportCrash` 97、
+  `akd`、`biomed`、`containermanagerd`、`fairplayd`…）；HID `published=1 seen=1 presses=3 asks=1162` 而
+  `r260 … verdict=102` 不变；GPU 无新东西（`gx_on=0`、`w1c=80000038`、`r281 wdt en=0 armed=0`）。
+  **桌面那一格本窗读不到而且原因明确**：环最早一行 772 s，而 boot 98 的交帧族出在 465–481 s ⇒ 本窗
+  `frame#`/`retire#`/`presented` 0 条**是地平线，不是「没交帧」**——这一格欠的从此不是判据，是
+  **一条不随地平线走的桌面读数**。产物：`~/clover-out/round308-boot99-window.bin`（623,104 B）＋
+  `…bin.txt`＋`…landing-sensors.txt`（`capacity=100 charger_temp=346`）＋`unattended-r308.log`；
+  控制轮镜像已构建待刷：`round308-smp0-control-payload.img` sha256 `9354aec6…`，内核仍是同一枚 `7e669d95`、
+  `payload.json` 的 `kernel_args` 里 `armcpu-smp=0` 在而 `=1` 不在。读数写在
+  `notes/development-log.md` §boot 99 读数 ①–⑦。⑦ 记的是本轮自己踩到的发版纪律：`board.toml` 的 `payload.title` 会烤进镜像里的 `unixnu.toml`，而 `verify-clover-payload` 拿两者**逐字比相等**，所以读数落盘那一版不许动它——标题已恢复成 `ae4baa8a` 里真正带着的那段文本。代价如实记着：控制轮镜像 `9354aec6` 的标题比它多一个撇号（两枚内核同为 `7e669d95`，参数只差 `armcpu-smp`，而那枚标题只有引导侧清单会读）。
 * **这两条仪器债已由 r303 结清**（原文曾记作「本格欠着」）：`vbits=` 现以 r298 行末的 `vb_r=`/`vb_v=` 落地
   （`ipc_right_lookup_read()` 已经交出的 entry 位掩码，用来分 port set / send-once / 死名，不需要对象、锁纪律与
   translate 同一条），`cap=send` 行的 `qmc=/qsr=` 也带上了自己的返回码 `qerr=`。
