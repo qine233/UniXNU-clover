@@ -23,7 +23,7 @@ Three windows live in the partition:
       used to share the 64 records above with the driver. `--tee` reads this
       ring; the driver's state lines about the tee stay in the ring above, so
       every record here is something the kernel said.
-  flight region           sectors 32..43 and 56..59, one block per record
+  flight region           sectors 32..43, 44..55, 56..59 and 60..63, one block per record
       kind 23, written from round210: twelve entry records (sector 32) name
       the block request that is starting plus the result and duration of the
       one before it, and four beat records (sector 56) carry CPU0's four-second
@@ -110,13 +110,18 @@ FLIGHT_PANIC_SLOTS = 2
 FLIGHT_TEXT_OFFSET = 44
 FLIGHT_TEXT_SLOTS = 12
 FLIGHT_TEXT_BYTES = 352       # 88 words, the room left after the record's three own fields
+# round309: the drain's own first record, in the one sector of the region that had no owner. One slot,
+# so every boot overwrites the last one -- which is why the boot stamp and the STALE rule below are the
+# whole of its attribution, exactly as round293 required of the deadline and panic sectors.
+FLIGHT_DRAIN_OFFSET = 63
+FLIGHT_DRAIN_SLOTS = 1
 FLIGHT_KIND = 23
 # round302: a verdict record signs itself. flightWrite writes this word in the slot right after the
 # event's own extras, after them, so a sector that was never written as this event cannot be read as
 # one -- boot 91's panic slot carried a marker's event words and a block request's header, and the
 # decoder printed round293's boot stamp as that boot's `stage`.
 FLIGHT_MARKER_MAGIC = 0x434C564D      # 'CLVM'
-FLIGHT_MAGIC_WORD = {4: 46, 5: 48, 6: 126}
+FLIGHT_MAGIC_WORD = {4: 46, 5: 48, 6: 126, 7: 43}
 BOOT_OFFSET = KERNEL_OFFSET + 2 * KERNEL_SLOTS   # round212: one block after the kernel ring
 BOOT_KIND = 24
 PROBE_KIND = 25
@@ -125,7 +130,8 @@ DUMP_SECTORS = BOOT_OFFSET + 1    # round212 adds the boot record past the end o
 KINDS = {17: "report-17", 19: "report-19", 20: "panic-20",
          21: "verdict-21", 22: "kernel-22", 23: "flight-23",
          24: "boot-24", 25: "probe-25"}
-FLIGHT_EVENTS = {1: "read", 2: "write", 3: "beat", 4: "deadline", 5: "panic", 6: "text"}
+FLIGHT_EVENTS = {1: "read", 2: "write", 3: "beat", 4: "deadline", 5: "panic", 6: "text",
+                 7: "drain-in"}
 FLIGHT_DIRS = {0: "read", 1: "write", 2: "beat", 3: "none"}
 # Round293: where each event's own boot id lives. Boot 79's frame is the reason: the deadline slot
 # and the panic slots are the only two groups a boot may never write, and when it does not the
@@ -135,7 +141,7 @@ FLIGHT_DIRS = {0: "read", 1: "write", 2: "beat", 3: "none"}
 # is the thirteenth word, 47. The deadline's ten words come first and its stamp is the eleventh;
 # round236 already wrote gBootId as the panic marker's sixth extra word. A zero means a record written
 # before this round stamped anything.
-FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 47, 4: 45, 5: 41, 6: 37}
+FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 47, 4: 45, 5: 41, 6: 37, 7: 35}
 # Round213's holder stages. A beat whose stage word has not moved for 75 s is the request that
 # stopped, so the name is what the dump prints where r212 could only print the request.
 FLIGHT_STAGES = {0: "idle", 1: "entry", 2: "idleWait", 3: "check", 4: "adma", 5: "batch",
@@ -338,6 +344,7 @@ def decode_flight(data, first_lba):
                                      ("beats", FLIGHT_BEAT_OFFSET, FLIGHT_BEAT_SLOTS, 3),
                                      ("deadline", FLIGHT_DEADLINE_OFFSET, FLIGHT_DEADLINE_SLOTS, 4),
                                      ("panic", FLIGHT_PANIC_OFFSET, FLIGHT_PANIC_SLOTS, 5),
+                                     ("drain", FLIGHT_DRAIN_OFFSET, FLIGHT_DRAIN_SLOTS, 7),
                                      ("text", FLIGHT_TEXT_OFFSET, FLIGHT_TEXT_SLOTS, 6)):
         records = []
         for slot in range(slots):
@@ -515,7 +522,7 @@ def flight_report(groups, boot_id=0):
                    if not problems and record["magic"]],
                   key=lambda record: (record["boot"], record["t_ms"]))
     written = sum(len(groups[name])
-                  for name in ("entries", "beats", "deadline", "panic", "text"))
+                  for name in ("entries", "beats", "deadline", "panic", "drain", "text"))
     if entries:
         span = f"seq {entries[0]['seq']}..{entries[-1]['seq']}"
     else:
@@ -661,6 +668,27 @@ def flight_report(groups, boot_id=0):
                   f"{'text' if gates & 4 else ''})")
     else:
         print("flight: no panic marker -- the sink never entered, or its first write refused")
+    # round309: the drain's first record, written before panicDrainRings() reads a gate. Boot 99 is the boot that
+    # asked for it -- its panic entry marker is on the card and not one of the drain's rows is, which left "the
+    # drain needs the host ticket" standing as a candidate. One slot, so the boot stamp and this STALE rule are the
+    # whole attribution: a sector that names another boot is that boot's ending, not this one's.
+    drain = flight_chain(groups["drain"])
+    for slot, record, problems in groups["drain"]:
+        for problem in problems:
+            print(f"flight: drain-in slot {slot} (lba {record['lba']}, t={record['t_ms']} ms) -- {problem}")
+    if drain:
+        record = drain[-1]
+        (stamp, owner, window, first, drained, append_rc, ksecs, probe_seq) = record["extra"][:8]
+        stale = ("" if not (boot_id and stamp and stamp != boot_id)
+                 else f" STALE: boot {boot_id} never wrote this sector")
+        print(f"flight: drain-in boot={stamp or '?'}{stale} t={record['t_ms']}ms k={ksecs}s "
+              f"host={owner:#x} window={window} verdict_first={first} again={drained} "
+              f"append_rc={append_rc} probe={probe_seq} seq={record['seq']} "
+              f"magic={'yes' if record['magic'] else 'absent (a sector that was never a drain-in)'}")
+    else:
+        print("flight: no drain-in record -- either the sink stopped before panicDrainRings(), or this "
+              "boot's image predates round309; CloverSdhci r309: drain legs in= beside it separates the two "
+              "when the ring itself survived")
     # round302: the sentence itself. It lives in its own twelve sectors, is chosen by boot id with no
     # read beforehand, and signs itself, so this line is either the panic's words or a stated absence.
     rejected_text = [(slot, record, problems) for slot, record, problems in groups["text"] if problems]
@@ -765,7 +793,8 @@ def selftest():
     assert FLIGHT_ENTRY_OFFSET + FLIGHT_ENTRY_SLOTS <= FLIGHT_BEAT_OFFSET, FLIGHT_BEAT_OFFSET
     assert FLIGHT_BEAT_OFFSET + FLIGHT_BEAT_SLOTS <= FLIGHT_DEADLINE_OFFSET, FLIGHT_DEADLINE_OFFSET
     assert FLIGHT_DEADLINE_OFFSET + FLIGHT_DEADLINE_SLOTS <= FLIGHT_PANIC_OFFSET, FLIGHT_PANIC_OFFSET
-    assert FLIGHT_PANIC_OFFSET + FLIGHT_PANIC_SLOTS <= VERDICT_OFFSET, FLIGHT_PANIC_OFFSET
+    assert FLIGHT_PANIC_OFFSET + FLIGHT_PANIC_SLOTS <= FLIGHT_DRAIN_OFFSET, FLIGHT_PANIC_OFFSET
+    assert FLIGHT_DRAIN_OFFSET + FLIGHT_DRAIN_SLOTS <= VERDICT_OFFSET, FLIGHT_DRAIN_OFFSET
 
     dump = bytearray()
     dump += build_record(19, 0, first_lba, "bring-up report", boot=boot_id)
@@ -888,7 +917,7 @@ def selftest():
     # Round210's flight region: 14 entries and 6 beats wrap both slot counts, every field is
     # round-tripped, and the chain walk picks the newest run instead of the largest time stamp --
     # the stale case below is the one that matters, because a partition is not erased per boot.
-    flight = bytearray((FLIGHT_PANIC_OFFSET + FLIGHT_PANIC_SLOTS) * SECTOR)
+    flight = bytearray((FLIGHT_DRAIN_OFFSET + FLIGHT_DRAIN_SLOTS) * SECTOR)
 
     def place(target, block, sector):
         target[sector * SECTOR:(sector + 1) * SECTOR] = block
@@ -934,6 +963,15 @@ def selftest():
           build_flight_record(first_lba + FLIGHT_PANIC_OFFSET + 1, 1, 5, 3, 0, 0,
                               t_ms=1800200, present=0, extra=panic_exit, boot=boot_id),
           FLIGHT_PANIC_OFFSET + 1)
+    # round309: the drain's own first record, on its one sector, with the ticket the marker only showed
+    # afterwards. The held host (0x20fdf is boot 90's) is on purpose: this record exists to say what the
+    # gate saw, and a selftest that built it with a free ticket would not prove the column is read.
+    drain_in = (boot_id, 0x20fdf, 1, 1, 0, 2, 1800, 37)
+    place(flight,
+          build_flight_record(first_lba + FLIGHT_DRAIN_OFFSET, 0, 7, 3, 0, 0,
+                              t_ms=1800300, present=0, extra=drain_in, boot=boot_id,
+                              marker_magic=True),
+          FLIGHT_DRAIN_OFFSET)
     groups = decode_flight(bytes(flight), first_lba)
     entries = flight_chain(groups["entries"])
     beats = flight_chain(groups["beats"])
@@ -969,6 +1007,15 @@ def selftest():
     assert tuple(panic_chain[0]["extra"][:8]) == panic_entry, panic_chain[0]
     assert tuple(panic_chain[1]["extra"][:8]) == panic_exit, panic_chain[1]
     assert all(not problems for _, _, problems in groups["deadline"] + groups["panic"])
+    # round309: the drain-in sector. Its eight words and its stamp are the reading, so a decoder that
+    # disagrees about where the magic sits would print a sector that was never written as one.
+    drain_chain = flight_chain(groups["drain"])
+    assert [record["seq"] for record in drain_chain] == [0], drain_chain
+    assert drain_chain[0]["event"] == 7 and drain_chain[0]["dir"] == 3, drain_chain[0]
+    assert tuple(drain_chain[0]["extra"][:8]) == drain_in, drain_chain[0]
+    assert drain_chain[0]["boot"] == boot_id, drain_chain[0]
+    assert drain_chain[0]["magic"], drain_chain[0]
+    assert all(not problems for _, _, problems in groups["drain"])
     # Round293's stamp: the boot that wrote each record, at the word flightWrite puts it in. The
     # entries and beats have no extras so theirs is word 35, the deadline's follows its ten
     # numbers at 45, and the panic marker's is the same word its own gBootId extra already names.
@@ -976,7 +1023,19 @@ def selftest():
     assert deadline_chain[0]["boot"] == boot_id, deadline_chain[0]
     assert all(record["boot"] == boot_id for record in panic_chain), panic_chain
     assert flight_report(groups, boot_id) == sum(len(groups[name]) for name in
-                                                 ("entries", "beats", "deadline", "panic"))
+                                                 ("entries", "beats", "deadline", "panic", "drain"))
+    # ... and once it says so, the sector that carries another boot's stamp must not read as this boot's ending.
+    foreign_drain = bytearray(flight)
+    place(foreign_drain,
+          build_flight_record(first_lba + FLIGHT_DRAIN_OFFSET, 0, 7, 3, 0, 0,
+                              t_ms=1800300, present=0, extra=drain_in, boot=boot_id - 1),
+          FLIGHT_DRAIN_OFFSET)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        flight_report(decode_flight(bytes(foreign_drain), first_lba), boot_id)
+    said = out.getvalue()
+    assert (f"flight: drain-in boot={boot_id - 1} STALE: boot {boot_id} never wrote this sector"
+            in said), said
 
     # A previous boot's deadline and panic slots stay on the card when this boot never reaches
     # them, which is exactly what boot 79's frame did: this reader printed "the deadline fired
@@ -1227,12 +1286,12 @@ def main():
     if len(data) < SLOT_BYTES:
         raise SystemExit(f"{path} is {len(data)} bytes; the first slot alone is {SLOT_BYTES}")
     if args.flight:
-        need = (FLIGHT_PANIC_OFFSET + FLIGHT_PANIC_SLOTS) * SECTOR
+        need = (FLIGHT_DRAIN_OFFSET + FLIGHT_DRAIN_SLOTS) * SECTOR
         if len(data) < need:
             raise SystemExit(f"{path} is {len(data)} bytes; the flight region needs {need}")
         groups = decode_flight(data, args.first_lba)
         written = sum(len(groups[name]) for name in
-                      ("entries", "beats", "deadline", "panic"))
+                      ("entries", "beats", "deadline", "panic", "drain"))
         if args.count:
             print(written)
             return 0 if written else 1

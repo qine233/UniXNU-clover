@@ -1,0 +1,235 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2037,21 +2037,27 @@
+ 
+ 	set_proc_name(imgp, p);
+ 
+-	/* clover r170: one line per exec names every spawn and its parent, so a
++	/* clover r309: one line per exec names every spawn and its parent, so a
+ 	 * loop says which process is looping instead of leaving a row of pids.
+-	 * The seconds-since-boot field separates "spinning" from "merely slow".
++	 * The seconds-since-boot field is what separates "spinning" from "merely
++	 * slow", and round170 never actually delivered it: clock_get_uptime() hands
++	 * back machine ticks, and this board's time base is 19267584 Hz (the deadline
++	 * row prints freq=124f800), so dividing the raw tick count by 1e9 printed
++	 * seconds 51.90 times short. The token moves with the unit so an older card's
++	 * r170 rows cannot be read as this round's seconds.
+ 	 * The console tail is short, so stop after 256 lines. */
+ 	{
+ 		static uint32_t clover_exec_prints;
+ 
+ 		if (clover_exec_prints < 256) {
+-			uint64_t clover_now = 0;
++			uint64_t clover_now = 0, clover_ns = 0;
+ 
+ 			clock_get_uptime(&clover_now);
++			absolutetime_to_nanoseconds(clover_now, &clover_ns);
+ 			clover_exec_prints++;
+-			printf("clover r170: exec pid=%d ppid=%d t=%llus comm=%s\n",
++			printf("clover r309: exec pid=%d ppid=%d t=%llus comm=%s\n",
+ 			    proc_getpid(p), p->p_ppid,
+-			    clover_now / 1000000000ULL, p->p_comm);
++			    clover_ns / 1000000000ULL, p->p_comm);
+ 		}
+ 	}
+ 
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1506,21 +1506,25 @@
+ 	int error = 0;
+ 	bool proc_exiting = false;
+ 
+-	/* clover r170: a child's death is otherwise silent -- only the critical
++	/* clover r309: a child's death is otherwise silent -- only the critical
+ 	 * processes print through proc_handle_critical_exit. One line per exit
+ 	 * pairs with the exec line, so the frame shows which process came back
+-	 * and with what status, and the timestamp says how fast the loop runs. */
++	 * and with what status. The timestamp is what says how fast the loop runs,
++	 * and it pairs with exec's unit fix: clock_get_uptime() returns machine
++	 * ticks (19267584 per second on this board), so round170's divide by 1e9
++	 * printed seconds 51.90 times short. */
+ 	{
+ 		static uint32_t clover_exit_prints;
+ 
+ 		if (clover_exit_prints < 256) {
+-			uint64_t clover_now = 0;
++			uint64_t clover_now = 0, clover_ns = 0;
+ 
+ 			clock_get_uptime(&clover_now);
++			absolutetime_to_nanoseconds(clover_now, &clover_ns);
+ 			clover_exit_prints++;
+-			printf("clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx comm=%s\n",
++			printf("clover r309: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx comm=%s\n",
+ 			    proc_getpid(p), p->p_ppid,
+-			    clover_now / 1000000000ULL, rv,
++			    clover_ns / 1000000000ULL, rv,
+ 			    exit_reason != OS_REASON_NULL ?
+ 			    exit_reason->osr_namespace : -1,
+ 			    exit_reason != OS_REASON_NULL ?
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -13278,8 +13278,60 @@
+ 	}
+ }
+ 
++
++/*
++ * Round309. The census sampler's own two ends, delivered only through the driver relay -- no printf copy, because the
++ * leg being measured is the console one. Eleven boots asked whether the walk after the latch ever ran and could only
++ * answer from rows that ride the console pipeline those rows are the evidence about; boot 100 answered a different
++ * question (the latch opened at t=433 and the boot reset before the 120 s beat that would have
++ * reported it). These two rows are what the pre-registration asked for: they name the entry and the
++ * return without going through the tee, and they read ent= and fired= from the same variables the beat
++ * row names, so a row cannot disagree with the counter it measures. The in row appears once -- on the
++ * first entry of the boot, which is the entry the latch made possible. The out row appears only when
++ * the named return changes, because backboardd returning `same` every 20 s is one reading, not
++ * twenty-two rows competing with every other instrument for the relay's 64 slots.
++ */
++static void
++clover_r309_cen_in(uint64_t secs, int pid)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	char row[128];
++	int len;
++
++	if (clover_bb_enters != 1) {
++		return;
++	}
++	len = snprintf(row, sizeof(row),
++	    "clover r309: cen-in t=%llu pid=%d ent=%u\n",
++	    (unsigned long long)secs, pid, clover_bb_enters);
++	if (len > 0) {
++		row[sizeof(row) - 1] = '\0';
++		clover_emmc_probe_say(row, (unsigned int)strlen(row));
++	}
++}
+ 
+ static void
++clover_r309_cen_out(const char *why, uint64_t secs, int pid)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	static char last[16];
++	char row[128];
++	int len;
++
++	if (strcmp(why, last) == 0) {
++		return;
++	}
++	strlcpy(last, why, sizeof(last));
++	len = snprintf(row, sizeof(row),
++	    "clover r309: cen-out t=%llu pid=%d why=%s fired=%u\n",
++	    (unsigned long long)secs, pid, why, clover_bb_fired);
++	if (len > 0) {
++		row[sizeof(row) - 1] = '\0';
++		clover_emmc_probe_say(row, (unsigned int)strlen(row));
++	}
++}
++
++static void
+ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ {
+ 	static char bb_last_hop[192];
+@@ -13389,12 +13441,15 @@
+ 	static uint32_t clover_census_rows;
+ 
+ 	clover_bb_enters++;
++	clover_r309_cen_in(secs, pid);
+ 	if (pid <= 0 || sb_task == TASK_NULL) {
++		clover_r309_cen_out("bad", secs, pid);
+ 		return;
+ 	}
+ 	clover_bb_note_mark(sb_task, name);
+ 	if (clover_bb_fired >= 96) {
+ 		clover_bb_capped++;
++		clover_r309_cen_out("capped", secs, pid);
+ 		return;
+ 	}
+ 	p = proc_find(pid);
+@@ -13402,6 +13457,7 @@
+ 		clover_bb_gone++;
+ 		printf("clover r229: bb t=%llu pid=%d f=%u gone\n",
+ 		    (unsigned long long)secs, pid, clover_bb_fired);
++		clover_r309_cen_out("gone", secs, pid);
+ 		return;
+ 	}
+ 	task = proc_task(p);
+@@ -13410,6 +13466,7 @@
+ 		clover_bb_notask++;
+ 		printf("clover r229: bb t=%llu pid=%d f=%u notask\n",
+ 		    (unsigned long long)secs, pid, clover_bb_fired);
++		clover_r309_cen_out("notask", secs, pid);
+ 		return;
+ 	}
+ 	if (!lck_mtx_try_lock(&task->lock)) {
+@@ -13417,6 +13474,7 @@
+ 		clover_bb_busy++;
+ 		printf("clover r229: bb t=%llu pid=%d f=%u busy\n",
+ 		    (unsigned long long)secs, pid, clover_bb_fired);
++		clover_r309_cen_out("busy", secs, pid);
+ 		return;
+ 	}
+ 	sc = task->suspend_count;
+@@ -13641,6 +13699,7 @@
+ 	same = (strcmp(hopsig, bb_last_hop) == 0) && (strcmp(wsig, bb_last_wait) == 0);
+ 	if (same && secs - bb_last_t < 120) {
+ 		clover_bb_same++;
++		clover_r309_cen_out("same", secs, pid);
+ 		task_deallocate(task);
+ 		return;
+ 	}
+@@ -14247,6 +14306,7 @@
+ 		extern void clover_iodt_census(unsigned long long secs);
+ 		clover_iodt_census((unsigned long long) secs);
+ 	}
++	clover_r309_cen_out("done", secs, pid);
+ 	task_deallocate(task);
+ }
+ /*
+@@ -14508,6 +14568,47 @@
+ 							clover_bb_target_pid = bb_pid;
+ 							clover_bb_target_name =
+ 							    bb_name;
++							/*
++							 * Round309. The latch opening is the
++							 * fact the census gate turns on, and
++							 * until now the only row that said it
++							 * did so on the beat thread's 120 s
++							 * cadence: boot 100 latched at t=433 and
++							 * reset at ~477, six seconds before the
++							 * next beat would have reached t=538, so
++							 * the gate demonstrably opened and the
++							 * boot that proved it said nothing.
++							 * This row goes only through the driver
++							 * relay -- no printf copy, so it does not
++							 * ride the pipeline it is measuring. It
++							 * fires at most once per boot because
++							 * the latch it reports is guarded by == 0.
++							 */
++							{
++								extern unsigned int
++								    clover_emmc_probe_say(
++								    const char *text,
++								    unsigned int length);
++								char lrow[128];
++								int llen;
++
++								llen = snprintf(lrow,
++								    sizeof(lrow),
++								    "clover r309: latch t=%llu"
++								    " pid=%d name=%x gen=%u\n",
++								    (unsigned long long)secs,
++								    bb_pid,
++								    (uint32_t)bb_name,
++								    clover_sb_gen);
++								if (llen > 0) {
++									lrow[sizeof(lrow) - 1] =
++									    '\0';
++									clover_emmc_probe_say(
++									    lrow,
++									    (unsigned int)
++									    strlen(lrow));
++								}
++							}
+ 						}
+ 					}
+ 				}

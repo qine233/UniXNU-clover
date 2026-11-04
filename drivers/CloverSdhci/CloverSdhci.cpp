@@ -610,6 +610,20 @@ static const uint32_t kFlightPanicSlots = 2;
 static const uint32_t kFlightTextOffset = 44;     // twelve one-block records, one per boot
 static const uint32_t kFlightTextSlots = 12;
 static const uint32_t kFlightEventText = 6;
+/*
+ * Round309: the one sector 32..63 still without an owner becomes the drain's own first breath.
+ * Boot 99 searched the whole window for a `drain` row and found none -- not the r212 entry row, not the
+ * r308 exit row this round added, not the tee's report line -- while the same boot's panic entry marker
+ * is on the card. The only mechanism left standing is that everything the drain says reaches the card
+ * through a path that wants the host ticket, and that is a candidate, not a reading, until a row exists
+ * which is written before the drain reads a single gate and by the path r302 proved needs no ticket.
+ * One slot, overwritten each boot, and stamped with the boot id the way r293 requires: a boot that
+ * never got here shows the previous boot's record, and the decoder is told to say STALE rather than
+ * to print it as this ending.
+ */
+static const uint32_t kFlightDrainOffset = 63;    // one record, written before the drain's own gates
+static const uint32_t kFlightDrainSlots = 1;
+static const uint32_t kFlightEventDrainIn = 7;
 static const uint32_t kFlightMarkerMagic = 0x434C564Du;   // 'CLVM', the flight verdict magic
 static const uint32_t kFlightKind = 23;
 static const uint32_t kFlightEventRead = 1;
@@ -623,6 +637,7 @@ static uint32_t gFlightEntrySeq = 0;
 static uint32_t gFlightBeatSeq = 0;
 static uint32_t gFlightDeadlineSeq = 0;
 static uint32_t gFlightPanicSeq = 0;
+static uint32_t gFlightDrainSeq = 0;   // round309: the drain-in record's own cursor
 static volatile uint32_t gFlightDeadlineDone = 0; // the deadline fires on every CPU; one record
 static uint32_t gFlightPrevDone = 0;             // result of the last finished request
 static uint32_t gFlightPrevMs = 0;
@@ -1208,6 +1223,8 @@ static void teeKernelLog (void);
 // Round184: the panic sink drains both RAM rings before the board resets itself into fastboot.
 // Defined below the tee it calls, used by `clover_emmc_panic_append` at the bottom of this file.
 static void panicDrainRings (void);
+// Round309: the drain's first breath, written before that function reads a single gate.
+static bool flightPanicDrainIn (void);
 // Round304: the probe ring's consumer. Declared with the drain it replaces as the only caller, because
 // its two new call sites -- a guarded block tail and CPU0's beat -- are both far above its definition.
 static uint32_t probeFlush (const char *why, uint32_t cap);
@@ -1248,6 +1265,10 @@ static uint32_t gPanicStashLength = 0;          // characters copied out of the 
 static uint32_t gPanicStashSaid = 0;            // parts this drain queued (0, 1 or 2)
 static uint32_t gPanicBlindChars = 0;           // characters the blind record carried
 static uint32_t gPanicBlindOk = 0;              // 1 once the blind block reached the controller
+// Round309: whether the drain's own first record reached the card. The absence of the record is a
+// reading only if something says whether the code that writes it ran, and this is that something --
+// r305 put the last refusal's words in the marker, and this word names whether this write was it.
+static uint32_t gPanicDrainInOk = 0;            // 1 once the drain-in record reached the controller
 
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
@@ -3821,7 +3842,7 @@ static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t bl
   // buffer can be rebuilt by an entry or a beat while writePioBlock is still streaming it, which is
   // how a sector ends up with one event's header and another event's boot stamp.
   const bool forced = (event == kFlightEventDeadline) || (event == kFlightEventPanic) ||
-                      (event == kFlightEventText);
+                      (event == kFlightEventText) || (event == kFlightEventDrainIn);
   if (!gVerdictFirst || !gHost) {
     return false;
   }
@@ -3843,6 +3864,10 @@ static bool flightWrite (uint32_t event, uint32_t dir, uint32_t lba, uint32_t bl
     offset = kFlightPanicOffset;
     slots = kFlightPanicSlots;
     seqp = &gFlightPanicSeq;
+  } else if (event == kFlightEventDrainIn) {
+    offset = kFlightDrainOffset;
+    slots = kFlightDrainSlots;
+    seqp = &gFlightDrainSeq;
   } else if (event == kFlightEventText) {
     offset = kFlightTextOffset;
     slots = kFlightTextSlots;
@@ -5142,6 +5167,11 @@ static uint32_t panicProbeFlush (void)
 
 static void panicDrainRings (void)
 {
+  // Round309: the drain's first statement is a record that does not wait for the gates below it, because boot 99
+  // proved this function can be entered and still leave the card with none of the rows it says. Written blind and
+  // forced (sector 63, this boot's stamp), it answers whether the drain ran and what the host ticket was at that
+  // instant -- the reading the r212 entry row could not give, since that row itself is one of the rows missing.
+  gPanicDrainInOk = flightPanicDrainIn () ? 1u : 0u;
   if (gPanicDrained || !gVerdictFirst || !gHost) {
     return;
   }
@@ -5224,6 +5254,14 @@ static void panicDrainRings (void)
           gTeeFlDropped, gTeeNagDropped, gTeeExitKept, gTeeExitDropped, gTeeExitCommsUsed);
   teeSay ("CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\n",
           gTeeSyncInKept, gTeeSyncOutKept, gTeeSyncDropped);
+  // Round309: the blind sector's second leg, on the ring. If the drain-in record is absent from the card this row
+  // is what tells "the write was refused" apart from "the drain was never entered" -- in=1 with no sector is the
+  // first, and no row at all is the second. It rides the pipe the round is measuring, so it is a copy and never a
+  // substitute: the record is the reading, this is the attribution.
+  teeSay ("CloverSdhci r309: drain legs in=%u boot=%u host=%x probe=%u\n",
+          gPanicDrainInOk, static_cast<unsigned int> (gBootId),
+          static_cast<unsigned int> (__atomic_load_n (&gHostOwner, __ATOMIC_ACQUIRE)),
+          static_cast<unsigned int> (__atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED)));
   // Round212: the exit line is queued before the last flush so it rides with it, and it repeats the
   // boot id: a pair of lines with the same id is one boot's drain seen from both ends.
   // Round308 renames one column and adds the column it was mistaken for. `gRingPending[kRingDriver]`
@@ -9481,6 +9519,35 @@ static void flightPanicMark (uint32_t stage, unsigned int rc, bool haveText)
   extra[11] = gPioFailWords;
   extra[12] = gPioFailAttempt;
   (void)flightWrite (kFlightEventPanic, 3, 0, 0, extra, 13);
+}
+
+/*
+ * Round309: the drain's first breath, before it reads a gate.
+ *
+ * Boot 99 is the boot that asked for this. Its panic entry marker is on the card and every row the drain says is
+ * not -- neither the r212 entry row, nor the r308 exit row, nor either report line -- and the only mechanism left
+ * standing is that all of them reach the sector through a path that wants the host ticket, while this record's
+ * path (the forced flightWrite) does not. Saying that from the marker's host=0x0 word is a candidate. This record
+ * turns it into a reading: it exists on every boot that enters panicDrainRings(), and its boot stamp plus r293's
+ * generation gate say whether the boot that owns this window is the one that wrote it.
+ *
+ * What it names is everything the gate below reads, plus the ticket itself, taken in the same instruction stream.
+ * The refusal leg is not here: a drain-in sector that is absent or carries another boot's stamp means either that
+ * the sink stopped before the drain or that this write was refused, and `CloverSdhci r309: drain legs in=` beside
+ * it (on the ring, so it only speaks when the ring does) splits those two when the ring survives.
+ */
+static bool flightPanicDrainIn (void)
+{
+  uint32_t extra[8];
+  extra[0] = gBootId;
+  extra[1] = __atomic_load_n (&gHostOwner, __ATOMIC_ACQUIRE);
+  extra[2] = (gHost != 0) ? 1u : 0u;
+  extra[3] = gVerdictFirst ? 1u : 0u;
+  extra[4] = __atomic_load_n (&gPanicDrained, __ATOMIC_RELAXED);
+  extra[5] = gPanicAppendRc;
+  extra[6] = kernelSeconds ();
+  extra[7] = static_cast<uint32_t> (__atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED));
+  return flightWrite (kFlightEventDrainIn, 3, 0, 0, extra, 8);
 }
 
 extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int length)

@@ -591,6 +591,46 @@ leave」一路收紧到一句可测的话：
   闩锁自己的 `r309: latch`、普查入口出口的 `r309: cen-in/cen-out`、排干入口的 `r309: drain-in`）
   加 boot 102 四支甲乙丙丁与 boot 101（同镜像八核复现，已在跑）只看 `ro=` 的两支。读数与表全在
   `notes/development-log.md` §boot 100 读数 ①–⑩。
+* **boot 101（v0.7.18 同镜像八核重播）：门第一次被当场抓到开着——而它十七枚采样里只占一枚**。
+  六枚 `r308: beat`（`t=783/903/1023/1149/1269/1392`）逐字 `target=0 ent=0 … reg=8 start=7 run=8`，
+  即 1392 s 之前采样器整靴没闩上过；`r221: sbm2` 共 17 枚（约 8–10 s 一枚），`ro=` 一列 **13×`121:lsd`、
+  3×`-`、只有 t=1418 那一枚 `58:backboardd`**。就是那一枚让闩锁合上，36 µs 后普查头一行上卡：
+  `r234: sbown … own=58:backboardd`（1418.401750）→ `r262: census … pid=58 threads=21 shown=20 hidden=1`
+  （1418.401786）→ `r270 / r271 / r299`（1418.401896），而驱动最后一枚块请求记在 `t=1406793 ms`＝同一秒
+  （beat 记录给的尺子：`t=1381416 ms` 那枚写着 `k=1393 s`）⇒ **靴子在门开后约一秒内结束**，下一枚 beat 要到 1512。
+  十一靴的缺席就此改名：**不是头一行缺、不是管道死，是尾巴（`r262: th / r296 / r298 / r300 fire/done`）从没到，
+  而报「门开了」那一行的节奏比开门的事件慢一个数量级**。新欠的一笔要如实记：`smp-pre` 上了卡而 `smp-post` 没上，
+  **这不能读成 printf 是墙**——中转的投递腿是驱动自己约 4 s 的 beat（`CloverSdhci.cpp:4166`）与块 I/O 尾巴（`:4257`），
+  而打印 270 字节那行本身就是块流量，两次写之间必然有过一次 flush ⇒ **中转行「生产了」≠「一秒内到得了卡」**。
+  无名静默复位第十票 ≥1418 s（分布 617…≥1816，「八核把复位推早」再弱一格，仍不建因果）。
+  更正我自己 §boot 100 ⑩ 的三处预登记（`ro=` 对照：boot 99 十五枚全 `-`、boot 100 五枚含 1 枚 `58:backboardd`）。
+  读数在 `~/clover-out/round308-boot101-repeat-window.bin(.txt)`，逐条在 dev-log §boot 101 读数 ①–⑧。
+* **r309（v0.7.21）把这三格搬到不经心跳的腿上，并修掉一把压缩 51.90 倍的钟**：
+  ① `r170` 的 exec/exit 改 `absolutetime_to_nanoseconds()`、token 升 `clover r309: exec/exit`、列序不动，
+  镜像与补丁双向钉住旧 token 不在场；② `clover r309: latch t= pid= name= gen=` 在闩锁由 0 变非 0 的那一刻交出去；
+  ③ `clover r309: cen-in t= pid= ent=` 是被采样函数的第一句、`clover r309: cen-out t= pid= why= fired=` 在七个出口
+  各一枚（`why=` 逐一口名 bad/capped/gone/notask/busy/same/done），②③ **只走 kind-25 中转、不留 printf 副本**；
+  ④ flight **sector 63 / event 7 = drain-in** 由 `panicDrainRings()` 第一句在自家门之前写（`:5174`、`:9539`），
+  第二条腿 `CloverSdhci r309: drain legs in= boot= host= probe=`（`:5261`）——有行无扇区＝sink 拒写自己的记录，
+  两者皆无＝根本没走到排干。解码器补 `FLIGHT_DRAIN_OFFSET=63 / FLIGHT_EVENTS[7] / 魔字 43 / boot 字 35`，
+  自测加正对照与异靴 STALE 断言；列名从 `drained=` 改 `again=`（那词在 marker 行恒等于 0，不是读数）。
+  本轮自己踩到两坑并已变永针：LATE_PATCH 里手打的补丁名多一个 z ⇒ 反向循环**静默**跳过 ⇒ 重放在别的文件上炸
+  （第三次），故 `check-clover.py` 现在全局要求 LATE_PATCH 每个路径都指向真实文件；契约里
+  `for hand in ('...')` 少一个逗号＝逐字符迭代，一条断言跑成 51 条。产物：内核 `0c8cbe24…`、
+  归一化 `3f7bf462…`、payload 58,720,256 B，双闸门 0 FAIL；细节见 dev-log §Round309 ①–⑦。
+* **boot 102（v0.7.21 八核）：四枚新仪器全部到岗，普查的头行也头一次和 `latch`/`cen-in`/`smp-pre` 同时在场——而真正的读数在 panic**。
+  钟读对了（`exec pid=146 t=424s` 落在环 `[424.073104]`）；门在 `t=566` 当场出声，此前四枚采样自报行逐枚 `target=0 ent=0 fired=0`；
+  `cen-in t=580 ent=1` 与 `smp-pre` 都上了卡，`r299` 那行本身就在内核环里（整个 boot 最新的一行）。尾巴、`cen-out`、`smp-post` 仍一枚没有，
+  但**这不能读成「printf 没返回」**：`flushVerdictRing()` 固定先搬内核环、后跑 relay，而最后一刀 relay 自报 `wrote=2 … pend=0`——
+  它送掉 `cen-in`＋`smp-pre` 时环里没有待送行，`smp-post` 完全可能密封在那一刀之后（第十四层同一格）。
+  **本轮的定名读数在 sink**：flight marker 只有 `stage=0`（另一枚槽仍是 boot 87 的 STALE 字）、kind 20 无本靴句子、
+  盲写句子无、sector 63 drain-in 无、`drain legs in=` 行也无，而 marker 自己带 `log_ready=1`＋text 位 ⇒
+  **`panicAppendText()` 没返回**：「卡拒写」解释不了同一毫秒刚成功过的强制 raw-PIO 路径之后四步全缺席。
+  形状对得上：最后一条 block 记录 `entry seq 166867 t=569031ms read pid=111 comm=chronod` **与 marker 同一毫秒**，
+  而会替它恢复卡的 beat 路径本靴已 81 s 没落记录（最新 beat `seq 73 t=487827 ms`）——panic 停了别的核之后那笔 read 成了孤儿。
+  对照板的写法一直是「sink 根本不碰存储栈」，我们 r301/r302/r309 三步都只是在同一条会挂的腿上多写一笔。
+  ⇒ **r310 两件**：在 sink 第一笔写之前先把卡弄闲，并把 relay 的 `sealed`/`consumed` 塞进已经证明能落的 `marker(0)`。
+  时机那一格本靴 **581 s**，且是「带 marker 的 panic」而不是无名复位。读数与四支判读在 dev-log §boot 102 ①–⑦。
 * **这两条仪器债已由 r303 结清**（原文曾记作「本格欠着」）：`vbits=` 现以 r298 行末的 `vb_r=`/`vb_v=` 落地
   （`ipc_right_lookup_read()` 已经交出的 entry 位掩码，用来分 port set / send-once / 死名，不需要对象、锁纪律与
   translate 同一条），`cap=send` 行的 `qmc=/qsr=` 也带上了自己的返回码 `qerr=`。

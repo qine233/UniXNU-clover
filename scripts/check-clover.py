@@ -3968,7 +3968,7 @@ def check_board(errors: list) -> str:
                        'static uint32_t gFlightMarker[kBlockWords];',
                        'uint32_t *buf = forced ? gFlightMarker : gFlightBlock;',
                        'buf[35 + extraWords] = kFlightMarkerMagic;',
-                       '(event == kFlightEventText);',
+                       '(event == kFlightEventText) || (event == kFlightEventDrainIn);',
                        'flightWrite (kFlightEventText, 3, 0, gPanicStashLength, extra,',
                        '"CloverSdhci r302: blind ok=%u chars=%u total=%u slot=%u\\n"'):
             if needle not in sdhci_source:
@@ -4571,6 +4571,131 @@ def check_board(errors: list) -> str:
                           "reads this round's ring_pend= as that row never having a backlog at all")
 
 
+        # Round309. Boot 100 was the first control round that could judge itself, and what it judged was that the
+        # question was wrong: the census family has been absent for eleven boots because clover_bb_sample() has
+        # exactly one call site, behind a latch that needs a sampled SpringBoard send whose remote name resolves
+        # to <pid>:backboardd -- and the only row that reports the latch is printed on the beat thread's 120 s
+        # cadence. Boot 100 latched at t=433 and reset at ~477, so the gate demonstrably opened and the boot that
+        # proved it said nothing; boot 101 reproduced the shape exactly (its newest kernel line on the card is the
+        # r221 row whose ro= is 58:backboardd, and every r308 beat row says target=0). The second thing boot 100
+        # caught is a plain bug: the r170 exec and exit rows divided clock_get_uptime()'s machine ticks by 1e9 on a
+        # board whose time base is 19267584 Hz, so every t= they ever printed was 51.90x short -- including the
+        # timestamps those rows exist to give. Six things have to stay true in the patch: the three relay rows
+        # exist, none of them has a console copy, the two clock rows move to a new token with the new unit, the
+        # r170 token is gone rather than shadowed, and cen-in is the sampled function's first statement.
+        r309_name = "z" * 66 + "-clover-r309.patch"
+        r309_patch = next((base / "patches/xnu-clover" / r309_name
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "patches/xnu-clover" / r309_name).is_file()), None)
+        if r309_patch is None:
+            errors.append(f"patches/xnu-clover/{r309_name} is missing: without a row that says the latch opened "
+                          "and a row that says the sampler ran, the next boot answers the eleven-boot absence with "
+                          "the same 120 s cadence that hid it")
+        else:
+            r309_text = r309_patch.read_text()
+            r309_added = "".join(line.lstrip("+") for line in r309_text.splitlines()
+                                 if line.startswith("+") and not line.startswith("+++"))
+            r309_code = "".join(
+                line.lstrip("+") for line in r309_text.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+                and not line.lstrip("+").lstrip().startswith(('*', '//', '/*')))
+            for row in ('clover r309: latch', 'clover r309: cen-in', 'clover r309: cen-out'):
+                if r309_text.count(row) != 1:
+                    errors.append(f"{r309_name} does not say {row} exactly once: the latch row is the only "
+                                  "copy of \"the gate opened\" that does not wait for a heartbeat, and two of "
+                                  "them make the count meaningless")
+            for gone in ('clover r170: exec', 'clover r170: exit'):
+                if gone not in r309_text:
+                    errors.append(f"{r309_name} does not remove the {gone} row: the fix changes the unit of t=, "
+                                  "and a reader that cannot tell which generation of row it is holding would "
+                                  "read this round's seconds as 51.90x short -- or the old bytes as this "
+                                  "round's seconds")
+                if gone in r309_added:
+                    errors.append(f"{r309_name} re-adds {gone}: two tokens with one meaning is a reading that "
+                                  "depends on which row the reader found first")
+            for row in ('clover r309: exec', 'clover r309: exit'):
+                if r309_text.count(row) != 1:
+                    errors.append(f"{r309_name} does not say {row} exactly once: the token moved with the unit "
+                                  "so that an older card's r170 rows cannot be read as this round's seconds, and "
+                                  "a second copy of the new token would put that boundary back in question")
+            # The trailing comma is the whole assertion: without it this is a string, and `for hand in` walks
+            # its characters, turning one check into fifty that each count a single letter.
+            for hand in ('absolutetime_to_nanoseconds(clover_now, &clover_ns);',):
+                if r309_code.count(hand) != 2:
+                    errors.append(f"{r309_name} converts the tick count {r309_code.count(hand)} times instead of "
+                                  "twice: this is the bug boot 100 measured, and one row left dividing machine "
+                                  "ticks by 1e9 is one row still 51.90x short")
+            for buffer_ in ('row', 'lrow'):
+                if f'printf("%s", {buffer_})' in r309_code:
+                    errors.append(f"{r309_name} prints the {buffer_} row to the console: the leg being measured "
+                                  "is the console one, so a row that rides it cannot say whether the sampler ran "
+                                  "-- the pre-registration says relay only, no printf copy")
+            if "clover_census_row" in r309_code:
+                errors.append(f"{r309_name} sends a row through clover_census_row: that function prints to the "
+                              "console as well, so both channels would go quiet together")
+            enters_at = r309_text.find("clover_bb_enters++;")
+            cen_in_at = r309_text.find("clover_r309_cen_in(secs, pid);")
+            bad_at = r309_text.find("if (pid <= 0 || sb_task == TASK_NULL) {")
+            if min(enters_at, cen_in_at, bad_at) < 0 or not enters_at < cen_in_at < bad_at:
+                errors.append(f"{r309_name} does not hand the entry row over as the sampled function's first "
+                              "statement: after the pid check it would be a reading about a call that already "
+                              "decided to leave, which is not the question the eleven boots asked")
+            latch_assign = r309_text.find("clover_bb_target_name =")
+            latch_row = r309_text.find("clover r309: latch")
+            if min(latch_assign, latch_row) < 0 or latch_row < latch_assign:
+                errors.append(f"{r309_name} does not say the latch row immediately after the latch is filled: "
+                              "anywhere else it is a reading about a different instant than the gate opening")
+            for why in ('"bad"', '"capped"', '"gone"', '"notask"', '"busy"', '"same"', '"done"'):
+                if f'clover_r309_cen_out({why}' not in r309_code:
+                    errors.append(f"{r309_name} does not name the {why[:-1]} return: an out row without the "
+                                  "return it names is a count of rows, not a reading of where the walk stopped")
+            load_r309 = REPO.parent / "UniXNU" / "patches" / "xnu" / r309_name
+            if not load_r309.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r309_name} is missing: unixnu loads patches from there, "
+                              "and this repo's copy only ever names the round")
+            elif load_r309.read_bytes() != r309_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r309_name} is not the same bytes as this repo's copy: "
+                              "the shipped image would carry a different row than the one checked here")
+            late_script_r309 = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list_r309 = " ".join(line for line in late_script_r309.splitlines() if "clover-r" in line)
+            if (late_list_r309.find(r309_name) < 0 or
+                    late_list_r309.find(r309_name) > late_list_r309.find("z" * 65 + "-clover-r308.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r309 before r308 in LATE_PATCH: "
+                              "r309's helper block and its early-return edits sit inside regions r308 rewrote, "
+                              "so a tree that removes r308 first leaves r309 un-reversible -- and an apply "
+                              "failure in that loop is silent")
+            # The loop that removes them is silent in a second way, and round309 paid for it: a listed path
+            # that names no file fails its --reverse --check, the `if` takes the else, and the newest patch
+            # stays in the tree while its neighbours get stripped -- which then breaks the replay on a file
+            # that round has nothing to do with (this round's was bsd_init.c:987). Every path in the list has
+            # to name a file, so a typo in a run of z's is a build error rather than a drift event.
+            late_blob = late_script_r309.split("for LATE_PATCH in", 1)
+            if len(late_blob) == 2:
+                named = [piece.split('"')[0]
+                         for piece in late_blob[1].split("; do")[0].split('"$ROOT/patches/xnu/')[1:]]
+                missing = sorted({n for n in named
+                                  if not (REPO.parent / "UniXNU" / "patches" / "xnu" / n).is_file()})
+                if missing:
+                    errors.append("build-xnu-4k-baseline.sh lists " + ", ".join(missing) +
+                                  " in LATE_PATCH and no such file exists: the reverse loop's --check fails "
+                                  "quietly, that patch stays in the tree, and the replay breaks somewhere else")
+        for needle in ('static const uint32_t kFlightDrainOffset = 63;',
+                       'static const uint32_t kFlightEventDrainIn = 7;',
+                       'gPanicDrainInOk = flightPanicDrainIn () ? 1u : 0u;',
+                       '"CloverSdhci r309: drain legs in=%u boot=%u host=%x probe=%u\\n"'):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no {needle[:52]!r}: boot 99 found no drain row of any "
+                              "kind on a boot whose panic marker is on the card, and the only way that stops "
+                              "being a candidate is a record written before the drain reads a gate, by the "
+                              "path round302 proved needs no host ticket")
+        drain_gate = sdhci_source.find("gPanicDrainInOk = flightPanicDrainIn ()")
+        drain_first = sdhci_source.find("if (gPanicDrained || !gVerdictFirst || !gHost)")
+        if drain_gate < 0 or drain_first < 0 or drain_gate > drain_first:
+            errors.append("the drain-in record is not the first statement of panicDrainRings(): after that "
+                          "gate it can only ever say the drain decided to speak, which is the reading boot 99 "
+                          "already had")
+
+
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
         # and, in the same frame, showed the instrument eating the one reading still wanted:
         # rows[notes % 8] wraps from the ninth ask, and the dump printed slots in slot order, so the
@@ -4970,9 +5095,9 @@ def check_board(errors: list) -> str:
                  "the panic markers are not at sectors 61-62, where the reader looks"),
                 ("const bool forced = (event == kFlightEventDeadline) || (event == kFlightEventPanic) ||",
                  "the survival records would still need the arming gates"),
-                ("(event == kFlightEventText);",
-                 "the sentence record is not one of the forced events: on a boot that never armed the "
-                 "flight region it would be refused before the sink ran"),
+                ("(event == kFlightEventText) || (event == kFlightEventDrainIn);",
+                 "the sentence record or round309's drain-in record is not one of the forced events: on a "
+                 "boot that never armed the flight region it would be refused before the sink ran"),
                 ("if (!forced && !__atomic_load_n (&gFlightArmed, __ATOMIC_ACQUIRE)) {",
                  "the armed gate no longer exempts the forced records"),
                 ("extern \"C\" void clover_emmc_flight_deadline (",
@@ -5879,8 +6004,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r308:"):
-        errors.append('[payload] title is not "clover r308: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r309:"):
+        errors.append('[payload] title is not "clover r309: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -6599,14 +6724,14 @@ def check_board(errors: list) -> str:
                        # Round293: the reader has to say which boot wrote what it prints. A stale
                        # deadline record is not a boot that reached its deadline, and the reader that
                        # printed one as if it were is how boot 79 nearly read as a boot that did.
-                       "FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 47, 4: 45, 5: 41, 6: 37}",
+                       "FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 47, 4: 45, 5: 41, 6: 37, 7: 35}",
                        # Round302: the reader has to know where a verdict record signs itself, and that
                        # the sentence's slots do not arrive in sequence -- a reader that broke the group
                        # at the first untouched sector would read every panic before boot id reached 12
                        # as no sentence at all.
                        "FLIGHT_TEXT_OFFSET = 44", "FLIGHT_TEXT_SLOTS = 12",
                        "FLIGHT_MARKER_MAGIC = 0x434C564D",
-                       "FLIGHT_MAGIC_WORD = {4: 46, 5: 48, 6: 126}",
+                       "FLIGHT_MAGIC_WORD = {4: 46, 5: 48, 6: 126, 7: 43}",
                        '6: "text"', 'not a sentence: no r302 magic at word',
                        "no sentence record",
                        "def flight_stamp(records, boot_id)", "STALE: boot",
@@ -7018,8 +7143,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r308:"):
-        errors.append('[payload] title is not "clover r308: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r309:"):
+        errors.append('[payload] title is not "clover r309: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

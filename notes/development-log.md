@@ -24811,3 +24811,191 @@ boot 98 同一枚盒子在长（`box=305x811..970x1108`、45,460 px、`presented
   若 `r221` 一族仍全 `ro=-` ⇒ boot 99 那靴是常态，「八核时门会开」这条不必再查；
   若出现 `ro=<pid>:backboardd` ⇒ 门是抖动的，十一靴的「普查缺席」要按闩锁抖动重新记账，
   而②那枚 `latch` 行的价值也随之升一格。**两支都不许再用窗口 grep 数缺席**（⑥的规矩）。
+
+## boot 101 读数（v0.7.18 同镜像重播，八核）：门第一次被当场抓到开着——而且它只开了一枚采样的时间
+
+产物在盘上：`~/clover-out/round308-boot101-repeat-window.bin(.txt)`、`~/clover-out/unattended-r308-boot101.log`。
+卡上 boot 计数器（sector 1216，kind 24）＝ **101**，镜像＝ v0.7.18 那枚 r308 payload（未重编，重播）。
+
+**① 八核又复现（跨镜像逐字段照旧）。** `r271: cpu t=1418 real=8 max=8 reg=8 start=7 run=8 s=01111111
+r=11111111`，`r299: smp t=1418 req=1 con=1 run=7 st=07777777 fl=00000000 rc=0,0,0,0,0,0,0,0`，
+`r270: ipi t=1418 sent=759396 recv=758911 tick=478965`。桌面这一格仍然没有读数（最后一枚 entry 记录
+是 filecoor/cloudd 的普通读，`stuck=0 recov=0 steal=0`）。
+
+**② 采样器整靴没闩上过——六枚 beat 行逐字段相同。** `r308: beat` 共六枚，t=783／903／1023／1149／1269／1392，
+每一枚都是 `target=0 ent=0 fired=0 same=0 cap=0 gone=0 notask=0 busy=0 reg=8 start=7 run=8`。
+注意这六枚是 **中转与内核日志两条腿都到了**（1088／1466／1613／1718／1823／1934 行带内核时间戳，
+288–324 行是不带时间戳的中转副本）：这一族本来就不缺投递。
+
+**③ 门开在两拍之间，而且卡上有 microseconds 级的因果链。** boot 101 里 `r221: sbm2` 共 17 枚（约 8–10 s
+一枚，从 t=725 起），`ro=` 一列 13 枚是 `121:lsd`、3 枚是 `-`、**只有 t=1418 那一枚是 `58:backboardd`**。
+就是那一枚把闩锁的判据凑齐了，接着 36 µs 内普查头一行上了卡：
+
+```
+[ 1418.356261] r221: sbm2 t=1418 ... rn=1f03 rs=4000 pr=0 to=0 ro=58:backboardd lo=-  ho=58:backboardd
+[ 1418.401750] r234: sbown t=1418 bb nm=3c03 own=58:backboardd
+[ 1418.401786] r262: census t=1418 pid=58 threads=21 shown=20 hidden=1 wait=20 run=1 rx=9 tm=0
+[ 1418.401811] r270: ipi ...   [ 1418.401852] r271: cpu ...   [ 1418.401896] r299: smp ...
+```
+
+**④ 头一行之后立刻断，尾巴照旧 0 行。** `r262: th`／`r296:`／`r298:`／`r300: fire`／`r300: done`／
+`r231: bbhop` 在 boot 101 全 0 行。驱动最后一枚 entry 记录 `t=1406793 ms`（beat 记录给出换算尺子：
+`t=1381416 ms` 那枚写着 `k=1393 s`，即驱动毫秒 ≈ 内核秒 − 11.6 s）＝内核 **1418.4 s**，与 census 同一秒。
+下一枚 beat 行要到 ~1512 s。**靴子在门开之后约一秒内就结束了**——这正是 §boot 100 ⑩ 预登记的（乙）支的
+形状：不是管道死了，是报「门开了」那一行的节奏（120 s）比它要报的事件（一枚 8–10 s 的采样）慢一个数量级。
+
+**⑤ `smp-pre` 上了卡、`smp-post` 没上——这一对不能读成「printf 就是墙」。** 括号两枚都走 kind-25 中转，
+而中转的投递腿是 `probeFlush`：驱动自己那枚约 4 s 的 beat（`drivers/CloverSdhci/CloverSdhci.cpp:4166`）
+与块 I/O 尾巴（`:4257`）。`r299` 那 270 字节打印本身就在制造块流量（entry 记录以 ~2.5 ms 间隔一路排到
+1406793 ms），所以两次写 **之间** 必然发生过一次 tail flush：pre 被带走、post 刚排队靴子就结束，与
+「停在 printf 里」同样自洽，而前者不需要新假设。⇒ 这是一笔新账，记进「仪器要能看见它问的那一刻」：
+**中转行「生产了」不等于「一秒内到得了卡」**——r309 那三枚行的投递仍要过这块可重建缓冲，判读时按此折价。
+
+**⑥ 复位这一格：又一起无名静默复位。** boot 101 无 deadline 记录（卡上那枚仍是 boot 99 的
+`t=1802875 ms / 1800 s`，被解码器标 STALE）、两枚 panic marker 分别属 boot 99（magic=yes）与 boot 87
+（magic=absent，同样 STALE）、无句子行。时机这一格加第十票：本靴 **≥1418 s**。分布现在是
+642.7／~645／661／746／835／555／742／617／≥1418／（boot 99 的 ≥1816）——跨度已经到 617 s…≥1816 s，
+「八核把复位推早了」这条被 boot 99 与本靴两票继续削弱。这只说明分布，不说复位那一瞬在卡上——
+环地平线之外没有读数。
+
+**⑦ 更正我自己上一节的三处断言（预登记写早了）。** (a) 「boot 101 最新一行是 `r221: sbm2`」不对：
+最新一行是 `r299: smp`（1418.401896），而 census 头一行 **在卡上**。(b) 「十一靴的普查缺席」从来不是
+头一行的缺席——boot 94/95 就有过头行；真正十一靴缺席的是 **尾巴**（`r262: th`／`r296`／`r298`／`r300`）。
+(c) `ro=` 那一列的对照：boot 99 十五枚 **全 `ro=-`**（名字整个解不出来），boot 100（`armcpu-smp=0`）五枚
+里 3×`1:launchd`／1×`58:backboardd`／1×`-`，boot 101 十七枚里 13×`121:lsd`／3×`-`／**1×`58:backboardd`**。
+所以「门是抖动的」这一支命中，而抖动的形状是：**每靴只有一两枚采样落在 backboardd 上**，闩锁不是常开而是
+偶发。②那枚 `latch` 行的价值按预登记升一格，且它现在多了个要回答的问题：门开了以后为什么只跑出一枚头行。
+
+**⑧ boot 102（r309 镜像）判据沿用 §boot 100 ⑩ 的四支，外加本轮新加的一支。**
+(戊) 若 `latch`／`cen-in`／`cen-out` 三枚都生产而卡上一枚都没有，且 `drain legs in=` 那行也不在 ⇒ 先怀疑
+⑤ 这笔新账（投递等 flush，生产不等于送达），下一手把这三枚也接到「不经 4 s 节拍」的腿上。
+另需注意：若三枚里到了 `latch` 而没到 `cen-out("done")`，判 (甲)/(乙) 之前必须先排掉「靴子太短」——
+本靴的形状就是门开后一秒内结束，看 census 头一行与最后一枚 entry 记录的时间差，别把它读成「停在函数里面」。
+
+## Round309 (v0.7.21)：门要当场出声、普查要自报进出、排干要自证入口——外加一把压缩 51.90 倍的钟
+
+**① 这一轮结的是上面四笔账，不是新问题。** 预登记在 §boot 100 ⑩，逐条对上：
+
+- **① 钟**：`r170` 那两行把 `clock_get_uptime()` 的 machine ticks 直接除以 1e9，而本板时基是
+  19267584 Hz ⇒ 它们印过的每一个 `t=` 都短了 **51.90 倍**。改 `absolutetime_to_nanoseconds()`
+  （`osfmk/kern/clock.h:242`），列与列序一字不动，token 升 `clover r309: exec`／`clover r309: exit`
+  （补丁两处：`a/bsd/kern/kern_exec.c @@ -2037`、`a/bsd/kern/kern_exit.c @@ -1506`）。
+  **历史 r170 的 `t=` 全部作废**，`pid=/ppid=/comm=/rv=/ns=/code=` 不受影响。反向钉：镜像与补丁都不许再有
+  `clover r170: exec|exit`（第九层——旧字节不能被解成本代的秒）。
+- **② 门**：`clover_sb_sample()` 里 `if (clover_bb_target_pid == 0)` 那两处赋值之后交一枚
+  `clover r309: latch t= pid= name= gen=`（补丁 `a/osfmk/kern/task.c @@ -14508,6 +14568,47`）。
+  boot 101 已经把这一枚的必要性钉死了：门在 1392 与 1418 之间开，而唯一报它的行下一枚要到 1512。
+- **③ 普查进出**：`clover_bb_sample()` 第一句 `clover r309: cen-in t= pid= ent=`（`@@ -13278,8 +13278,60`
+  里新加的 `clover_r309_cen_in()`），七个出口各一枚 `clover r309: cen-out t= pid= why= fired=`，
+  `why=` 逐一口名 `bad/capped/gone/notask/busy/same/done`（hunks `+13441,15`、`+13457,7`、`+13466,7`、
+  `+13474,7`、`+13699,7`、`+14306,7`）。字段与被测变量同源（第十一层），**只走 kind-25 中转，不留 printf 副本**。
+- **④ 排干入口**：flight 新区间 **sector 63**、event `7 = drain-in`，由 `panicDrainRings()` 的**第一句**
+  （`drivers/CloverSdhci/CloverSdhci.cpp:5174`）交出去，位置在 `if (gPanicDrained || !gVerdictFirst || !gHost)`
+  那道门**之前**；记录带 `gBootId / gHostOwner / gHost!=0 / gVerdictFirst / gPanicDrained / gPanicAppendRc /
+  kernelSeconds() / gProbeSeq` 八字，magic `CLVM` 仍按规矩**最后**写（`:9539`）。第二条腿是 tee 上的
+  `CloverSdhci r309: drain legs in=%u boot=%u host=%x probe=%u`（`:5261`）。两支合起来才把
+  「sink 没走到排干」与「走到了但拒写自己的记录」切开：有行无扇区＝拒写，两者皆无＝没走到。
+  boot 99 §④ 那句 `host=0x0` 说的是 `gHostOwner`（票据空闲），不是 `gHost` 空——强制记录本来就不需要票据。
+
+**② 驱动侧不需要 tee 类，也不需要豁免列。** 这一点我上一轮的备忘写反了，按代码更正：那张类表
+（`CloverSdhci.cpp` 约 1085–1160）过滤的是**内核日志**前缀，而 `drain legs` 是驱动自己 `teeSay()` 出来的行；
+豁免列（约 4649–4702）匹配的是 `probe->name` 那族类名。两处都不必动，动了反而把不经过的路径写成经过。
+
+**③ 宿主解码器（`scripts/read-clover-log.py`）。** `FLIGHT_DRAIN_OFFSET = 63 / FLIGHT_DRAIN_SLOTS = 1 /
+FLIGHT_EVENTS[7] = "drain-in" / FLIGHT_MAGIC_WORD[7] = 43 / FLIGHT_BOOT_WORD[7] = 35`，几何断言、
+`written` 求和、模块文档里的扇区清单与打印块一并跟上。列名踩到一次自己的规矩：我先写了 `drained=`，
+而那个词在 panic marker 那行**结构上恒等于 0**（第八层：恒等于定值的字段不是读数），且自测里
+`assert "drained=" not in said` 正是为它设的——改成 `again=`（本靴排干被调用过几次），既过了针也说清了意思。
+自测补一枚正对照 `drain_in = (boot_id, 0x20fdf, 1, 1, 0, 2, 1800, 37)`（`marker_magic=True`，
+因为签名是最后写的）与一枚异靴 STALE 断言，`read-clover-log selftest … all ok`。
+
+**④ 本轮自己造的两次构建事故（都是旧坑，写下来当针）。**
+(a) `scripts/build-xnu-4k-baseline.sh` 的 LATE_PATCH 里我手打的那枚补丁名是 **67 个 z**，而真实文件 66 个。
+反向循环对不存在的路径 `git apply --reverse --check` 失败后**静默走 else**，于是 r309 留在树里、
+r308/r307/… 被剥掉，重放在一个与本轮无关的文件上炸：`error: patch failed: bsd_init.c:987`。
+这是同一枚坑第三次咬人，所以 `check-clover.py` 现在**全局**断言 LATE_PATCH 里每个 `$ROOT/patches/xnu/...`
+都指向真实文件（不再只排本轮）。(b) 契约里我写了 `for hand in ('absolutetime_to_nanoseconds(...);')`
+——**少一个逗号**，Python 把它当字符串逐字符迭代，一条断言跑成 51 条假报错。已补逗号并留一行注释指名这个陷阱。
+
+**⑤ 标题串改了两遍，两遍都有理由。** 第一遍按 §boot 101 ⑦ 的更正重写（先前那版把普查缺口归给那把钟，
+还断言「boot 101 最新一行是 `r221: sbm2`」——实际最新是 `r299`，而 census 头一行在卡上）。
+第二遍是因为仓库里有条真契约：**本轮标题必须含一个双引号**，让固件解析器的转义路径始终被真镜像测着
+（boots 35/36 就是这么丢的），无引号的标题会被 `check-clover.py` 判失败。现在那句被引起来的是
+"neither a dead pipe nor a missing head"。
+
+**⑥ 构建与闸门。** 内核 `kernel.macho` sha256 `0c8cbe24e972a1c9e392355c1829afcfbd230e2d9323cca4983828f5bf4e47ba`，
+五枚 r309 行各一次、`clover r170: exec|exit` 各 0 次；AMFI 两刀落在
+`0x1adb0e4 / 0x1adb16c`（随本轮代码位移，站点性质不变），`kernel-amfi.macho` `7c9238dd…`，
+归一化 `kernel-normalized.macho` `3f7bf4624a3d44c70aaf60c29b145076419fe61c9c399dbbc2ca4e5a4cf574ee`（973 枚戳清零）；
+payload 58720256 字节。`check-clover.py` 与 `verify-clover-payload.py` 双绿（0 FAIL，含新的
+`gate-and-burst / gate-and-burst-onceliteral / drain-legs / old-token-gone / kept-exit` 四组针）。
+归档 `~/clover-out/round309-{kernel-amfi.macho,kernel-normalized.macho,v0.7.21-payload.img}`。
+
+**⑦ 判读（boot 102 已在跑；四支见 §boot 100 ⑩，第五支与「靴子太短」的排除法见 §boot 101 ⑧）。**
+判完再决定下一手：若 (丙) 命中就把 `r262/r296/r298/r300` 一族升进 tee 豁免列并**结掉猜测**；
+若 (甲) 或 (乙) 命中，停点第一次有了可指名的区间，桌面那一格才谈得上从「计数器」换成「面板上的画面」
+（boot 100 §⑧ 欠的仍是三帧 1920×1200 的图，不是又一枚计数器）。GPU 那一格仍只欠 `acc-sel-l1 @ 0x01fcf004` 一次读。
+
+## boot 102 读数（v0.7.21 镜像 `944e0964`，八核 `armcpu-smp=1`）：门、进、pre 三枚都上了卡，尾巴仍没有——而真正的读数是 panic 只走了三步里的第一步
+
+**① 本轮四枚新仪器全部到岗，而且每一枚都带了自己的正对照。**
+- **钟**：`clover r309: exec` 的 `t=` 现在与环时间戳同一把尺——`pid=145 t=413s` 落在 `[413.985414]`、
+  `pid=146 t=424s` 落在 `[424.073104]`、`pid=64/61 t=431s` 落在 `[431.007690]/[431.010242]`。
+  ①那把压缩 51.90 倍的钟第一次读出真秒，且 `clover r170:` 整个不在场（反向钉过）。
+- **门**：`clover r309: latch t=566 pid=58 name=3c03 gen=0`（kind 25，slot 55）。它之前四枚采样自报行
+  （`r308: beat t=177/300/420/540`）**逐枚都是 `target=0 ent=0 fired=0 same=0 cap=0 gone=0 notask=0 busy=0`**
+  ——「门开过」这件事第一次不必等下一枚 120 s 的 beat 行，就在开的当场有了读数。
+- **进**：`clover r309: cen-in t=580 pid=58 ent=1`（slot 57）。
+- **pre**：`clover r308: smp-pre t=580 seq=0 pid=58 th=18 hidden=0 reg=8 start=7 run=8`（slot 58）。
+
+**② 普查那一拍在卡上是完整的头行＋三条核数行，而且整个 boot 最新的一行就是 `r299`。**
+内核环 512 行里 boot 102 的最新行 = slot 254（seq 1790）`[580.949886] clover r299: smp t=580 req=1 con=1 run=7
+st=07777777 rc=0×7`，往前依次是 `r271`（`real=8 max=8 reg=8 start=7 run=8`）、`r270`（`sent=299953 recv=299787`）、
+`r262: census`（`threads=18 shown=18 hidden=0 wait=17 run=1 rx=8`）。尾巴三族（`r262: th`/`r296`/`r298`）、
+`r300 fire/done`、`cen-out`、`smp-post` **一枚都不在**。
+⇒ 十一靴的「尾巴缺席」第一次是跟「`latch`/`cen-in`/`smp-pre` 三枚都在场」同时读出来的。
+
+**③ 按预登记，(乙) 收窄成一句话，但仍不能定名——第十四层那笔账本靴自己也被咬了一口。**
+(乙) 原本写的是「停在 `r262` 头行之前那几十行」，本靴头行明明在卡上，所以它不是原样命中。真正剩下的一格是：
+`r299` 的字节到了卡＝printf 已把该行交进 msgbuf；`smp-post` 是 printf 返回后的**下一句**密封。
+而搬运侧 `flushVerdictRing()` 的固定顺序是「驱动环 → 内核环 → `probeFlush ("tail")`」，
+**内核环那一刀在 relay 那一刀之前**；SMP 下跑这一刀的线程完全可能在 census 线程被换下的窗口里把 `r299` 搬上卡，
+然后在 `smp-post` 还没密封时就跑完 relay。最后一刀 relay 自己的报告正好站在这个解释上：
+slot 59 `probe why=tail calls=166772 wrote=2 seen=7 next=7 pend=0 flushed=7`——那一趟送掉两行（`cen-in`＋`smp-pre`）、
+跑完时环里**没有待送行**。所以「有 pre、无 post」在本靴读不出「printf 没返回」。
+⇒ 能切它的只有一个读数：**panic 当场 relay 的 sealed−consumed**。r308 把它放在排干退出行上，而排干没跑（④）。
+
+**④ 本轮最大的读数不在普查上，在 sink：它写完「进」标记之后一步都没再落。**
+- flight panic marker：`seq 0 slot 0 t=569031ms k=581s boot=102 magic=yes gates=0x7(armed,bcb,text) rc=0 log_ready=1
+  log_first=13320216 host=0x28c1d`，且它是 **`stage=0`**＝`flightPanicMark (0, …)`；另一枚槽（slot 1）仍是 boot 87 的
+  STALE 字（`magic=absent`）⇒ **本靴只写出一枚 marker，`flightPanicMark (1, rc, …)` 没到**。
+- kind 20 句子环 16 槽里最新属于 boot 87，无 boot 102；flight 文本区无本靴句子记录；**sector 63 的 drain-in 无**；
+  `CloverSdhci r309: drain legs in=` 那行也无。
+- 这四件事在代码里是同一串先后：`clover_emmc_panic_append()` ＝ 抄 RAM → `marker(0)` → `panicAppendText()` →
+  `flightPanicText()` → `marker(1)` → `panicDrainRings()`（第一句＝drain-in）。`panicAppendText` 的四个早退条件
+  （`gPanicLogReady / gHost / gPanicLogFirst / text`）本靴全为真——marker 自己带了 `log_ready=1` 和 text 位。
+⇒ **`panicAppendText()` 没有返回。** 「卡拒绝了之后每一笔写」这条替代解释站不住：`marker(0)`、盲写句子、
+`marker(1)`、drain-in 走的是**同一条 raw-PIO 强制写路径**，而它在同一毫秒刚刚成功过一次。
+它卡住的位置有形状：最后一条 block 记录是 `entry seq 166867 t=569031ms read lba=28106424 pid=111 comm=chronod`，
+**与 marker 同一毫秒**；而会替它把卡恢复过来的 beat 路径这一靴已经 81 s 没落过记录（最新 beat
+`seq 73 t=487827 ms`）。panic 停了别的核之后，那笔 in-flight read 成了没人收尾的孤儿，sink 自己的第一次轮询
+等的是永不到来的 completion。
+
+**⑤ 这一格对照板早就给过答案，而我们一直没照做。** `~/UniXNU-sheng` 的 panic sink **根本不碰存储栈**
+（抄 RAM＋画屏＋park），落盘交给单属主的 writer 线程。我们的 sink 从 r184 起就往卡上写；r301 补 RAM 副本、
+r302 补盲写句子、r309 补 drain-in——三件都是「在同一条会挂的腿上多写一笔」，而不是把它从那条腿上挪开。
+⇒ r310 因此不是又一枚计数器，两件事：**(1) 在 sink 第一笔写之前先把卡弄闲**（用 beat 那套 stuck 恢复/整卡重初始化），
+句子、盲记录、`marker(1)`、排干才有「到达」这回事；**(2) 把 relay 的 `sealed` 与 `consumed` 一并塞进已经证明能落的
+`marker(0)`**——③那一格从此不必等排干，也不必再靠缺席来猜。
+
+**⑥ 时机与性质这一格：本靴 581 s，是「带 marker 的 panic」，不是无名复位。**
+分布现在是 642.7／~645／661／746／835／555／742／617／≥1418／（boot 99 ≥1816）＋本靴 **581 s**。
+本靴也是多靴以来第一靴在死线（1800 s）之前**确实进了 panic**、且它最后的内核读数正好是普查那一拍（580 s）——
+「普查之后一秒内板子就结束」这条形状在 boot 101（读数为无名复位）与 boot 102（读数为 panic）两靴上各自独立成立。
+
+**⑦ 下一手（r310 预登记，读数之前写死）。** 判据只看句子到不到卡：
+(甲) `marker(0)` 与 `marker(1)` 都在（或 kind 20／盲写句子任一到）⇒ 卡在 sink 第一笔写之前确已被弄闲，
+`panicAppendText` 会返回，**panic 的原因第一次可读**，桌面那一格改由那句话说下一步；
+(乙) `marker(1)` 仍缺、而 drain-in 到了 ⇒ 「闲卡」不够，sink 里还有第二把会挂的锁，下一手把 drain 挪到 append 之前；
+(丙) `marker(1)` 与 drain-in 都缺 ⇒ 连 stuck 恢复自己也没跑成，下一手把恢复改成无等待的整卡 reset（只清控制器状态，不等 completion）；
+另：`marker(0)` 新带的那两枚 relay 计数若显示 `sealed > consumed`，③那一格当场结掉——尾巴不是没生产，是生产在最后一次 flush 之后。

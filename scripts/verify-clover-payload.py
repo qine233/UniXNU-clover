@@ -791,8 +791,10 @@ def check_cache_ownership(kernel: bytes) -> bool:
 def check_critical_exit_probe(kernel: bytes) -> bool:
     """Round193 reads why a crash became critical. The r192 frame ends on the third watchdogd
     SIGTRAP and the panic behind it, so the image has to carry the line that names the
-    crash-behavior bits and deadline of every critical exit, and it has to keep the r170 exit line
-    -- that one is what pairs the death with its pid and wait status in the same frame. Round211
+    crash-behavior bits and deadline of every critical exit, and it has to keep the exit line
+    that pairs the death with its pid and wait status in the same frame -- round309 renamed that
+    line's token when it fixed the seconds column, so the needle tracks the token, not the round
+    that first wrote it. Round211
     adds the kernel side of the same kill: the sender's own backtrace and, for every receiving
     thread, the saved user lr/sp plus the kernel frames behind it."""
     label = "kernel.macho: critical exit reading linked"
@@ -809,7 +811,7 @@ def check_critical_exit_probe(kernel: bytes) -> bool:
                       in kernel,
              "sbthk": (b"clover r211: sbthk n=%u ktop=%016llx kfp=%016llx klr=%016llx "
                        b"kf=%016llx,%016llx,%016llx,%016llx,%016llx,%016llx\n") in kernel,
-             "kept-r170": (b"clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx "
+             "kept-exit": (b"clover r309: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx "
                            b"comm=%s\n") in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
@@ -854,7 +856,12 @@ def check_panic_tail_read(kernel: bytes) -> bool:
              "panic-copy": (b"CloverSdhci r301: panic copy rc=%u chars=%u said=%u\n") in kernel,
              # round302: the driver's own account of the blind sentence write. The record itself is
              # binary words, so this row is the only thing in the image that names the attempt.
-             "panic-blind-row": (b"CloverSdhci r302: blind ok=%u chars=%u total=%u slot=%u\n") in kernel}
+             "panic-blind-row": (b"CloverSdhci r302: blind ok=%u chars=%u total=%u slot=%u\n") in kernel,
+             # round309: the drain's own entry counter, said on the driver's tee path. The binary drain-in
+             # sector is written from the first statement of the sink's drain, before its gates -- so a boot
+             # with no sector and no row here is a boot whose sink never reached the drain, and a boot with
+             # the row and no sector is the sink refusing its own write. Either leg alone would be a hole.
+             "drain-legs": (b"CloverSdhci r309: drain legs in=%u boot=%u host=%x probe=%u\n") in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
@@ -1376,6 +1383,19 @@ def check_sb_sample(kernel: bytes) -> bool:
              "beat-accounting": (
                  b"clover r308: beat t=%llu target=%d ent=%u fired=%u same=%u cap=%u gone=%u"
                  b" notask=%u busy=%u reg=%u start=%u run=%u\n") in kernel,
+             # Round309 moves three more statements off the kernel log and onto the relay, each one answering
+             # a question the eleven-boot census absence could not: whether the gate ever opened (latch),
+             # whether the burst was ever entered (cen-in) and where it left (cen-out with a named why). Boot
+             # 101 is the shape that made them necessary -- the latch condition held at t=1418 in the very
+             # row that latches, and the boot ended before the next beat row. Their console twins stay out of
+             # the source (check-clover.py pins that), and one literal each is all the image can show.
+             "gate-and-burst": all(needle in kernel for needle in (
+                 b"clover r309: latch t=%llu pid=%d name=%x gen=%u\n",
+                 b"clover r309: cen-in t=%llu pid=%d ent=%u\n",
+                 b"clover r309: cen-out t=%llu pid=%d why=%s fired=%u\n")),
+             "gate-and-burst-onceliteral": all(
+                 kernel.count(b"clover r309: " + row) == 1
+                 for row in (b"latch", b"cen-in", b"cen-out")),
              "bb-census-hop": (b"clover r231: bbhop t=%llu pid=%d tid=0x%llx op=%llx rcv=%x"
                                b" sz=%x remote=%x local=%x id=%x to=%llx rno=%s lo=%s\n") in kernel,
              "input-armed": (b"clover-input") in kernel,
@@ -1449,7 +1469,8 @@ def check_user_breakpoint_probe(kernel: bytes) -> bool:
     trapping address lives in the dyld shared cache and cannot be symbolized on the host. Round203
     adds the failed assert's inputs -- x4-x7, x19-x28, the stack words past the eighth argument and
     the object x0 points at -- for traps inside that cache only. The image has to carry all three
-    lines, and it has to keep the r170 exit line that pairs the pid with its death."""
+    lines, and it has to keep the exit line that pairs the pid with its death -- round309 renamed
+    that token along with its clock, so the needle follows the rename."""
     label = "kernel.macho: user breakpoint reading linked"
     found = {"ubrk": (b"clover r199: ubrk pid=%d comm=%s n=%u pc=0x%llx lr=0x%llx sp=0x%llx "
                       b"cpsr=0x%x esr=0x%x ec=%u brk=0x%x\n") in kernel,
@@ -1463,7 +1484,7 @@ def check_user_breakpoint_probe(kernel: bytes) -> bool:
              "ubrk8": (b"clover r206: ubrk%d pid=%d fp=%016llx w0=%016llx w1=%016llx "
                        b"w2=%016llx w3=%016llx w4=%016llx w5=%016llx w6=%016llx "
                        b"w7=%016llx w8=%016llx w9=%016llx w10=%016llx w11=%016llx\n") in kernel,
-             "kept-r170": (b"clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx "
+             "kept-exit": (b"clover r309: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx "
                            b"comm=%s\n") in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
@@ -1658,11 +1679,19 @@ def check_spawn_probe(kernel: bytes) -> bool:
     process tree went, because XNU only prints an exit reason for the critical processes -- a normal
     child's death is silent. The image must carry one exec line and one exit line, each with pid,
     parent, boot-relative seconds and the exit namespace/code, and each capped at 256 lines so the
-    panel keeps up with the boot instead of repeating one line forever."""
+    panel keeps up with the boot instead of repeating one line forever.
+    Round309 moves that pair's token: the two rows divided clock_get_uptime()'s machine ticks by 1e9
+    on a 19267584 Hz time base, so every `t=` ever read from them was compressed 51.9x. The columns
+    and their order are unchanged -- only the unit and the round that owns the line. The old token
+    is reverse-pinned because the standing rule couples a value's name to its producer: an image that
+    carried both would let a card's old r170 bytes be read as this round's seconds."""
     label = "kernel.macho: exec/exit probe linked"
-    found = {"exec": b"clover r170: exec pid=%d ppid=%d t=%llus comm=%s" in kernel,
-             "exit": (b"clover r170: exit pid=%d ppid=%d t=%llus "
-                      b"rv=0x%x ns=%d code=0x%llx comm=%s") in kernel}
+    found = {"exec": b"clover r309: exec pid=%d ppid=%d t=%llus comm=%s" in kernel,
+             "exit": (b"clover r309: exit pid=%d ppid=%d t=%llus "
+                      b"rv=0x%x ns=%d code=0x%llx comm=%s") in kernel,
+             "old-token-gone": all(needle not in kernel for needle in (
+                 b"clover r170: exec pid=%d ppid=%d t=%llus comm=%s",
+                 b"clover r170: exit pid=%d ppid=%d t=%llus rv=0x%x ns=%d code=0x%llx comm=%s"))}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
