@@ -25390,3 +25390,47 @@ ABI-checked, kernel read`；`verify-clover-payload.py` 退出 0、50 行 OK。
 `round314-v0.7.26-payload.img` sha256 `22fc0012ff3e58dd4c05beca31cce5fdf2666d367d861406976c4fbc07fcca52`
 （58,720,256 B）；内核两枚副本一并归档在 `~/clover-out/round314-kernel-amfi.macho` 与
 `round314-kernel-normalized.macho`。**未刷写**：用户指令仍是「我现在不在家，你直接完善别的开发吧」。
+
+---
+
+## Round315（v0.7.27）：README 改成纯表格，并补一张「各驱动开发进度」
+
+**文档轮：没有改代码、没有改内核、没有新镜像。** 用户规矩：「readme 以后都不要写过程内容，只用表格表述进度，
+现在还需要增加各个驱动的开发进度表」。这条本来就在 `AGENTS.md` 最后一段（README 只放当前状态、过程进
+`notes/development-log.md`），但盘上早就漂了——`README.md` 1073 行里 860 行（`:23-883`）是逐轮叙述。
+
+**① 先确认删掉的东西有别的文件兜着。** 按「读数要指到还在盘上的文件」，删之前逐条 grep：
+`41,548`、`opens=100`、`w24=0000000d`、`verdict=102`、`presented=3`、`real=8 max=8`、`not a v5 arbiter`、
+`$TOC` 全在 `notes/development-log.md`（`not a v5 arbiter` 另在 `notes/wifi-bringup.md`、`notes/power-bringup.md`）。
+唯一只在 README 里出现过的字面量是 `chronod read`——它在流水日志里写作
+`dev-log:24979` 的 `entry seq 166867 … pid=111 comm=chronod`，同一笔读数，不是缺失。确认完才删。
+
+**② 新结构**：`进度：从按下电源到桌面`（8 行表）、**`各驱动开发进度`（11 行表）**、
+`距离 iOS 桌面还差什么`（6 行 + 一行「读不到为什么结束」）、`已完成`、`待完成`、`构建`、`上机`、
+`读数怎么看`、`闸门`、`相关文档`、`许可证`。README 现在 186 行。
+
+**③ 驱动进度表的列是七列**：驱动 / 这一格负责 / 接线（`board.toml` 行号）/ 文档现状（类形状 · personality ·
+README+引用 · 宿主模型 · plist，五格各一个 `✓`/`✗`/`—`）/ 最新真机读数 / 下一步 / 阻塞于。
+「文档现状」那一列取自 r314 的判定表（`notes/unixnu-doc-conformance.md` §3、§6），不是自述：`plist` 写成
+「✗（已说明）」的语义是文档 `xnu-drivers.md:14` 把 plist 当 personality 的记录，没有 personality 就没有该记录的
+东西，而闸门要求这句话必须真写在 README 里。「接线」那一列的行号是当场从 `board.toml` 数的：
+archives 在 `:58-74`（ArmCpu `:62`、gop-legacy-display `:67`、pmgr `:68`、sdhci `:69`、block `:70`、input `:71`、
+power `:72`、dsp `:73`、gpu `:74`），参数现值 `clover-emmc=21 :1968`、`clover-apfs=3 :1967`、`clover-pmgr=2 :1261`、
+`armcpu-timer-intid=19 :1242`、`armcpu-smp=1 :1256`、`armcpu-self-ipi=1 :1257`、`clover-input=3 :2422`、
+`clover-gpu=1 :2441`、`clover-power=1 :2489`、`clover-aks=1 :2379`、`offline-hid-input=1 :2325`、
+`offline-hid-home=1 :2326`、`sheng-touch-hid=1 :2337`、`clover-unattended=1800 :2597`，
+`clover-dsp=3 :2534` 是**注释状态**（表里照实写）。
+
+**④ 顺手抓到一处真的引用烂账**：notes 与 memory 里到处写「排期 3／4／5／6／7／8」，而**盘上没有任何母表**——
+README 早前那次重排把编号列表丢了。本轮没有重新编号（重新编号会让旧引用更坏），做法是在 README 表头写死映射
+（3 显示与 GPU、4 输入、5 网络音频 USB、6 电源、7 块设备写吞吐、8 内核可复现）并声明「自 r314 起以行名为准」。
+
+**⑤ 规矩落进 `AGENTS.md`**：README 只放表格；一颗驱动新增或改动时要就地改它那一行（负责哪一格、接线带
+`board.toml` 行号、八条文档现状、最新读数、下一步、阻塞点）；撤回与推断写进流水日志，不写进 README；
+README 表格链接到的文件必须在盘上。
+
+**⑥ 实测**：`check-clover.py` 仓库里跑 EXIT=0（`drivers documented: 11`，products 是 notice）；
+链接自检脚本把 README 里每一枚 `notes/**.md` 与 `drivers/**` 引用对盘核过——**第一版指到两枚不存在的文件**
+（`notes/display-bringup.md`——显示与输入那条线从来没有独立底稿，散在 dev-log 与驱动 README 里），已改指
+`drivers/NativeMobileDisplay/README.md` 与 dev-log；改后 missing links: none。
+本轮不发新镜像：`round314-v0.7.26-payload.img`（`22fc0012…`）仍是待发的那一枚。

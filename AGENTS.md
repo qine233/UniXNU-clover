@@ -153,7 +153,12 @@ patch that sorts earlier: reversing that patch then fails and the build aborts.
 Regenerate the earlier patch itself with `scripts/save-xnu-patch.py` after
 reversing the later patches that touch the same file.
 
-`README.md` carries the current status only. The round-by-round log of what each
-boot frame showed and what was inferred from it lives in
-`notes/development-log.md`; new frames are appended there, and the README's
-progress tables are edited in place.
+`README.md` carries the current status only, and only as tables: the boot chain,
+the per-driver progress rows, the gap table, the completed and pending tables and
+the gate table. Round-by-round process content -- what a probe showed, what was
+inferred, what was retracted -- never goes in the README; it is appended to
+`notes/development-log.md` under `§RoundNNN`. When a driver is added or changed,
+edit its row in 各驱动开发进度 in place: which gap it owns, its wiring with
+`board.toml` line numbers, the eight documented clauses (`✓`/`✗`/`—` with a
+reason), its latest on-board reading, the next step and what blocks it. Every
+file a README table links to must exist on disk.
