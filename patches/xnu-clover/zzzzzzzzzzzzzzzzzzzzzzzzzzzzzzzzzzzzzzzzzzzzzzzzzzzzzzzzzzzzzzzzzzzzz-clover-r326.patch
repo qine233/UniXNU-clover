@@ -1,0 +1,111 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -13396,13 +13396,15 @@
+ 	char wsig[192];
+ 	char line[320];
+ 	/*
+-	 * Round325. Every hop's owner name, kept in the frame that walks the hops so one row can
+-	 * carry the whole chain. round324 latched only hop 0 and re-stated it on the 120 s beat; boot
+-	 * 110 latched at t=603 and ended at ~612, so no beat was ever due between the two and the row
+-	 * printed nothing -- the chain itself, including hops 1..3, is what the burst computed and the
+-	 * console tail dropped.
++	 * Round325, placed by round326. Every hop's owner name, kept in the frame that walks the hops
++	 * so one row can carry the whole chain. round324 latched only hop 0 and re-stated it on the
++	 * 120 s beat; round325 filled these slots in the hop loop itself, and boot 111 showed that loop
++	 * is below where the boot stops -- its one fire printed r229 through r299 and entered the panic
++	 * sink in that same second. The slots are filled above the census now, where the hops already
++	 * exist and the relay still reaches the card.
+ 	 */
+ 	char hopown[4][24] = { { '\0' } };
++	uint32_t resolved = 0;
+ 	uint64_t htid[4];
+ 	uint32_t hrn[4];
+ 	uint32_t hrs[4];
+@@ -13774,6 +13776,49 @@
+ 		printf("%s", line);
+ 	}
+ 	clover_sb_port_state(sb_task, name, "bb", secs, "r229");
++	/*
++	 * Round326. The debt named at the earliest point that can name it and the last point boot 111
++	 * proved the relay reaches. Round325 sealed these owners below the hop loop; that boot's only
++	 * fire printed r229, its own sbport and sbown rows, r262, r270, r271 and r299 and then entered
++	 * the panic sink in the same second, the relay's last seal being round308's pre-line and no
++	 * post-line -- so the segment that holds the hop walk never ran and bbnow printed nothing while
++	 * hops=4 was already a field of the row above. hn, hrn[], hloc[] and hrem[] are filled by the
++	 * walk that produced that row, so the four names are computable here. An empty slot stays '-':
++	 * a hop whose remote port is its local one has no other task to name, which r231's row says
++	 * with its own two fields.
++	 */
++	for (i = 0; i < hn; i++) {
++		char own326[24];
++
++		own326[0] = '\0';
++		if (hrem[i] != 0 && hrem[i] != hloc[i]) {
++			clover_sb_port_owner(task, (mach_port_name_t)hrem[i], own326,
++			    sizeof(own326));
++		}
++		strlcpy(hopown[i], own326[0] ? own326 : "-", sizeof(hopown[i]));
++		if (i == 0 && own326[0] != '\0') {
++			resolved = 1;
++		}
++	}
++	{
++		extern unsigned int clover_emmc_probe_say(const char *text,
++		    unsigned int length);
++		const char *st326 = hn == 0 ? "no_hop" :
++		    (resolved ? "hop_owner" : "hop_unresolved");
++		char now[240];
++		int nl = snprintf(now, sizeof(now),
++		    "clover r326: bbnow t=%llu pid=%d fired=%u hn=%u rem=%x res=%u state=%s"
++		    " o0=%s o1=%s o2=%s o3=%s\n",
++		    (unsigned long long)secs, pid, clover_bb_fired, hn,
++		    (hn != 0) ? hrem[0] : 0, resolved, st326,
++		    hopown[0][0] ? hopown[0] : "-", hopown[1][0] ? hopown[1] : "-",
++		    hopown[2][0] ? hopown[2] : "-", hopown[3][0] ? hopown[3] : "-");
++		if (nl > 0) {
++			now[sizeof(now) - 1] = '\0';
++			clover_emmc_probe_say(now, (unsigned int)strlen(now));
++			printf("%s", now);
++		}
++	}
+ 	/*
+ 	 * Round262. One header plus at most CLOVER_BB_CENSUS rows, once every two
+ 	 * minutes, class `r262-th` on the card. The header carries the totals the
+@@ -14187,37 +14232,6 @@
+ 				line[sizeof(line) - 1] = '\0';
+ 				printf("%s", line);
+ 			}
+-			strlcpy(hopown[i], rmo[0] ? rmo : "-", sizeof(hopown[i]));
+-		}
+-	}
+-	/*
+-	 * Round325. The burst's own answer, sealed on the driver relay at the moment it is computed.
+-	 * round324 moved this reading to the beat and boot 110 proved the beat is the wrong clock: the
+-	 * latch opened at t=603, the next 120 s beat was due at 667, and the board was gone by ~612 --
+-	 * a cadence slower than the event it judges. The relay is the channel that survived that same
+-	 * window from the outside (r309's cen-in at t=607 reached the card), so the row goes there
+-	 * first and to the console second. The four names are the chain in order; an empty slot means
+-	 * that hop's remote port was the local one, which r231's row already said.
+-	 */
+-	{
+-		extern unsigned int clover_emmc_probe_say(const char *text,
+-		    unsigned int length);
+-		uint32_t hn_now = __atomic_load_n(&clover_bb_debt_hn, __ATOMIC_ACQUIRE);
+-		uint32_t set = __atomic_load_n(&clover_bb_debt_set, __ATOMIC_ACQUIRE);
+-		uint32_t rem = __atomic_load_n(&clover_bb_debt_rem, __ATOMIC_ACQUIRE);
+-		const char *st = hn_now == 0 ? "no_hop" :
+-		    (set ? "hop_owner" : "hop_unresolved");
+-		char now[240];
+-		int nl = snprintf(now, sizeof(now),
+-		    "clover r325: bbnow t=%llu pid=%d fired=%u hn=%u rem=%x set=%u state=%s"
+-		    " o0=%s o1=%s o2=%s o3=%s\n",
+-		    (unsigned long long)secs, pid, clover_bb_fired, hn_now, rem, set, st,
+-		    hopown[0][0] ? hopown[0] : "-", hopown[1][0] ? hopown[1] : "-",
+-		    hopown[2][0] ? hopown[2] : "-", hopown[3][0] ? hopown[3] : "-");
+-		if (nl > 0) {
+-			now[sizeof(now) - 1] = '\0';
+-			clover_emmc_probe_say(now, (unsigned int)strlen(now));
+-			printf("%s", now);
+ 		}
+ 	}
+ 	/*

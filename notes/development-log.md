@@ -26181,3 +26181,59 @@ boot 108 冷刷并读回了 r320（v0.7.33，`1b47270b…`）。产物 `~/clover
 - **C｜** 若 `bbnow` 仍零行而 `r229: bb` 有行 ⇒ 唯一解释是**这靴没有任何 fire**（`f=0`），
   那就回到「让 beat 打开」那一支，r324 的 `target=0` 重新成为主线；
 - **D｜** 手1 与可比性照 C/D 两支复查（`en=1 armed=1 req=1`、`ephemeral ABSENT`）。
+
+## Round326（v0.7.37）：把债主封行挪进 boot 111 证明送达的那一小段，并改正 §Round325 ⑤ 里「字段一字不改」那句
+
+**① 一手。** `osfmk/kern/task.c` 的 `clover_bb_sample()`：
+- 在 `clover r229: bb` 那行（`clover_sb_port_state(sb_task, name, "bb", secs, "r229")`）之后**立刻**逐跳
+  解析：`hrem[i] != 0 && hrem[i] != hloc[i]` 才问 `clover_sb_port_owner(task, hrem[i], …)`，名字填进
+  `hopown[i]`，hop 0 有名字就把本地 `resolved` 置一；然后先 `clover_emmc_probe_say` 再 `printf` 出
+  `clover r326: bbnow …`。
+- 删掉 r325 挂在 hop 循环**之后**的那整块，以及循环里填名的 `strlcpy(hopown[i], rmo[0] ? rmo : "-", …)`。
+- r324 的 `clover_bb_debt_*` 闩锁与逐拍 `clover r324: bbwhy` 行**逐字未动**，r324 的看门狗上膛未动，
+  boot-args 未动（`clover-wdt-arm=1` 保留）⇒ boot 112 与 110/111 并排可读。
+
+**② 为什么是这个位置。** boot 111 的读数把「零行」从推断变成了测量（§Round325 读数 ②）：那次唯一的 fire
+从 `r229: bb` 一路打到 `r299: smp`（内核环 7 行，.248337→.248550），中转环同秒落 `cen-in`＋`smp-pre`
+而 `smp-post` 零枚 ⇒ 切断点在 `smp-pre` 之后、hop 循环之前——正是 r325 那行的位置。而 `hops=4` 已经是
+`r229: bb` 那行的一个字段，`hn`/`hrn[]`/`hloc[]`/`hrem[]` 由产生那一行的同一次走跳填好，所以四个名字在
+那一毫秒就已算得出，且那一毫秒带是**本靴最后一条被证明送达的通道**。r326 只是把封行放进那条带里。
+
+**③ 一处有意偏离，作废预登记那句「字段一字不改」。** §Round325 ⑤ 写的是「四枚 hop 属主＋闩锁＋中转行整块
+挪、字段一字不改」。实际没搬闩锁，也没沿用 `set=`：
+- `clover_bb_debt_hn/set/rem` 是 r324 拍行 `bbwhy` 的**唯一**写手。封行若继续写它，`set=` 就变成两个生产者
+  共用一个词（第十五层「一枚字不许两义」）——r325 已经这样了，只是那行从没落地所以没暴露。
+- 封行改用本次 fire 的本地量，列名 `res=`；`state=` 三态判据形状照旧（`no_hop`/`hop_owner`/
+  `hop_unresolved`），但它的来源从「跨拍闩锁」换成「本次解析」，这一点在读判据时算一处语义变化，写在这里。
+- `fired=`/`pid=`/`hn=`/`rem=`/`o0=%s o1=%s o2=%s o3=%s` 与 r325 逐字同形，两轮仍可比。
+
+**④ 契约。** 补丁 `zzzz…z(69)-clover-r326.patch`（3 hunks）与 r325/r324/r309 一起进 `build-xnu-4k-baseline.sh`
+的 `LATE_PATCH`，**r326 最先摘除**：它删的两段都在 r325/r324 自己新增的块里，后继不先摘就反向失败，而
+这个循环的失败是静默的。`check-clover.py` 这一格改成**分别读补丁的 `+` 与 `-` 两侧**断言「加了哪几枚字、
+删了哪两枚字」——删除行仍以 `-` 形状留在同一份文件文本里，朴素 substring 会让「两行都还在」的轮次过闸。
+`verify-clover-payload.py` 的针脚换成 `clover r326: bbnow … res=%u …`，并新增 `r325-bbnow-gone` 负针脚
+（镜像里有这行≠本靴有读数，但镜像里**不该再有**上一代那行）。tee：`{ "clover r326: bbnow", "r326-bbnow",
+32, 0, 0, 0 }` 独立类，且豁免每趟 16 次推送上限——这行与它作摘要的那批行出自同一次 burst，被上限吃掉会
+把「采样算不出东西」读成「没有采样」。`board.toml` 标题升 `clover r326:`，两处 title 断言一起升（r320 那
+次只升一处把闸门无论成败都判红）。
+
+**⑤ boot 112 判读（判据先登记，照 §Round325 ⑤ 四支搬过来，只补 B 的第三态）。**
+- **A｜** `clover r326: bbnow` 在卡上（中转或控制台任一）且 `o0=` 是一个服务名 ⇒ 债主定名，boot 109 起
+  欠的那笔「backboardd 自己在等谁」第一次成为读数。
+- **B｜** 有行、`hn>0` 而 `o0=-`（`state=hop_unresolved`）⇒ 位置已对、解析失败，下一手查
+  `clover_sb_port_owner` 而不是再挪位置；若 `state=no_hop` ⇒ 这次 fire 当下没有债，属另一读数不是缺席。
+- **C｜** `bbnow` 仍零行而 `r229: bb` 有行 ⇒ 唯一剩下的解释是这靴**没有任何 fire**，那就回到「逐拍
+  `target=0`」那一支，r324 的手 2 重新成为主线。
+- **D｜** 手 1 与可比性复查：`r281: wdt … en=1 armed=1 req=1` 应在、`ADT: ephemeral-storage ABSENT` 应在；
+  桌面这一格看 `frame#`/`presented=`/`box=`。停轮条件仍是「真进桌面」，不是「这轮有读数」。
+
+**⑥ 产物（本轮真构建，非复用）。** 内核 `kernel.macho` sha256 `1c26112e…`（52,404,224 B）→
+`patch-clover-amfi.py` → `round326-kernel-amfi.macho` `ae18bf02…`（两处 exec-hook 分支照 r163/r164 改写）→
+`normalize-kernel-macho.py` → `round326-kernel-normalized.macho` `6822bee8…`（973 枚 object stamp 归零）。
+payload 用**绝对路径** `--kernel /Users/zhouzhou/clover-out/round326-kernel-normalized.macho`，`payload.json`
+自报 `kernel_sha256=6822bee8…`——这一格是 r325 记过的那个坑的判据：相对路径会打在设备仓那枚陈旧
+`out/clover/kernel/kernel.macho` 上。产物 **`round326-v0.7.37-payload.img` sha256 `820b7782efaa27a0…`**
+（58,720,256 B，异于 boot 111 的 `e08bdd66…`）。双闸门：`check-clover.py`（从 `out/clover/tree` 跑）EXIT=0；
+`verify-clover-payload.py` **51 OK / 0 FAIL**，含 `r326-bbnow present`＋`r325-bbnow-gone present`＋
+`ADT: ephemeral-storage ABSENT (r322 revert) OK`。boot-args 一字未动（`clover-wdt-arm=1` 保留）⇒ boot 112
+与 110/111 并排可读。冷刷分区照旧只有 eMMC `cache`。

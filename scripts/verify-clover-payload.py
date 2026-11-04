@@ -1252,12 +1252,14 @@ def check_sb_sample(kernel: bytes) -> bool:
              "r324-wdt-arm": (b"clover r324: wdt-arm t=%u bite_ms=%u at=%u\n") in kernel,
              "r324-bbwhy": (b"clover r324: bbwhy t=%llu pid=%d fired=%u hn=%u rem=%x set=%u "
                             b"state=%s owner=%s\n") in kernel,
-             # Round325 keeps r324's beat copy and adds the one boot 110 proved necessary: the same answer
-             # sealed from inside the fire that walks the hops, with every hop's owner instead of hop 0 alone.
-             # Boot 110 latched at t=603 and ended near 612 while its next beat was due at 667, so the beat
-             # cadence is measurably slower than the event; the relay row is the leg that arrives in the window.
-             "r325-bbnow": (b"clover r325: bbnow t=%llu pid=%d fired=%u hn=%u rem=%x set=%u state=%s "
+             # Round325 put this row after the hop loop and boot 111 read zero copies on both channels while
+             # the r229/r231/r234/r299 rows of the same burst arrived -- so the placement, not the cadence, was
+             # the defect. Round326 seals the same answer immediately after the r229 line, inside the band boot
+             # 111 proved deliverable, and names the hops there instead of in the loop below the stop. The seal
+             # is a local count, so the column is res= rather than r324's set=.
+             "r326-bbnow": (b"clover r326: bbnow t=%llu pid=%d fired=%u hn=%u rem=%x res=%u state=%s "
                             b"o0=%s o1=%s o2=%s o3=%s\n") in kernel,
+             "r325-bbnow-gone": b"clover r325: bbnow" not in kernel,
 
              "aks-say-sel": (b"clover r281: aks sel%u n=%u rc=%x\n") in kernel,
              "aks-say-open": (b"clover r281: open %u pid=%d comm=%.16s\n") in kernel,
