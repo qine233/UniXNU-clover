@@ -25990,3 +25990,28 @@ boot 108 冷刷并读回了 r320（v0.7.33，`1b47270b…`）。产物 `~/clover
 另开一支对照：boot 107 卡在迁移、boot 108 卡在 chronod——若 r320 的 ephemeral 只是把闸**平移**而非**打开**，那 chronod 这一格可能也是「PreBoard 里的下一个必查闸」；判 chronod 是否本就应为 SpringBoard 供一个「已就绪」的回音，是分辨「真前进」与「换个地方等」的那把尺。
 
 **④ 本轮不发版。** 是读数落盘（reading drop），代码/ADT 零改动，待发产物仍是 `round320-v0.7.33-payload.img`（已刷、已读回）。停轮条件未满足：板子没进 iOS 桌面（卡在 chronod）。
+
+---
+
+## Round322（v0.7.34）：revert r320 的 ephemeral——便宜的 A/B 正对照靴，验「sheng 是靠持久 Data、不是靠 ephemeral」这个反转
+
+**① 为什么这么动。** Round321 读回 boot 108 之后查 sheng：sheng 进桌面用 `persistent_data=true` + `sheng-data-persist=2`（board.toml:87-88），`make-sheng-adt.py:95` 明写「no ephemeral-storage, so first-boot data migration runs」。**sheng 根本没设 ephemeral**——它靠持久 Data 卷 + 迁移真正跑完进桌面。r320 我引用 sheng（make-sheng-adt.py:148 那句「datamigrator skips every migration」）引用反了：:148 是 ephemeral 的注释，sheng 的桌面那枚 ADT 里 ephemeral 是**缺席**的。
+
+**② 本轮改了什么（一个字节 ADT 都不留、内核不动）。** 把 r320 加的 `/chosen/ephemeral-storage` 从 ADT 里**摘掉**，让 `os_variant_uses_ephemeral_storage()` 不再谎称这板易失：
+- `scripts/make-clover-adt.py`：删掉 line 232 那行 `*([("ephemeral-storage", u32(1))] if writable_root else [])`，注释改成 r322 反转说明（`writable_root` 仍被 RAMDisk 占位用着，没变孤儿）。
+- `scripts/check-clover.py`：`REQUIRED_CHOSEN` 去掉 `ephemeral-storage`；那枚值断言（原 `!= struct.pack("<I",1)`）翻成**缺席断言** `"ephemeral-storage" in chosen["properties"]` 就报错（沿用 r120 root-matching 的反向断言形状）。两处 `title.startswith` 针脚（6599 与 7747）一起升到 `clover r322:`。
+- `scripts/verify-clover-payload.py`：针脚从「ephemeral present」翻成 `ADT: ephemeral-storage ABSENT (r322 revert)`，判据 `b"ephemeral-storage" not in adt`（键名不在＝无歧义，不用 `01000000` 那种弱字节包含）。
+- `board.toml`：标题升 `clover r322:`，带真字面量双引号（过转义闸门）。
+
+**③ 构建与校验（哈希当场重数）。** 内核复用 `~/clover-out/round319-kernel-amfi.macho`（归一化件），与 r320/r319 逐字节同一枚——本轮整枚 payload 相对 r320 的唯一增量是 ADT **−40 字节**。`build payload` 跑了 `out/clover/tree/scripts/make-clover-adt.py ... --data-ramdisk ... --ipad-identity`（tree.assemble 重拷了设备脚本，改动真生效，别再踩 r320 记的「空转」坑）。产物 `~/clover-out/round322-v0.7.34-payload.img` `1aebc9f7…`（58,720,256 B）。两道闸门：`check-clover.py` = **EXIT=0，打印 `ADT 14384 bytes`**（14,424→14,384，正差 40＝ephemeral 键+u32 头没了，直接坐实）；`verify-clover-payload.py` = **51 OK / 0 FAIL、EXIT=0**，含 `ADT: ephemeral-storage ABSENT OK`。
+
+**④ 预登记 boot 109 的判读（本轮建好待刷；这是可证伪 A/B，两支都写死）。** 拿 r322（无 ephemeral）对 boot 108（有 ephemeral）比：
+
+| 读数形状 | 判读 |
+| --- | --- |
+| 回到 boot 107 那一格：`0x6003`/`migrationpluginwrapper` 迁移往返又没人应答、普查 `wait=19` | **证实「clover 缺 sheng 那套完整持久 Data 底座」**——不骗 os_variant 时迁移跑不完（写不进/装不了 staged apps），r320 的 ephemeral-skip 才是目前唯一让 SpringBoard 离开迁移口的办法；下一手转 route 2（真持久 Data 卷），别再做 ephemeral 的 A/B |
+| 迁移跑完了（datamigrator 有应答、staged apps 装上）、SpringBoard 越过迁移且 chronod 也回音、出现桌面帧 | r320 的 skip 才是**真正的拦路石**——ephemeral 标志本身把 chronod/userland 带歪；去掉它整条 PreBoard 顺下去，桌面这一格解开 |
+| 既不回迁移、也不进桌面，卡在第三个端口/新停点 | 去掉 ephemeral 冒出新的一格；按 r264/r296 形状读新端口名（`to=ffffffff` 那类要判是不是 `MACH_PORT_DEAD` 即时错误、不是阻塞） |
+| `clover r319: last` 节拍行缺席 | 跑的不是这枚内核——先查刷写/回读（内核字节与 boot 107/108 相同，理应照旧在） |
+
+对照锚：boot 108 的 SpringBoard 主线程 `ro=122:chronod` 行、`clover r319: last` 在 r322 内核字节相同，理应照旧逐拍出现。仪器地平线（别过度断言）：本轮仍**没有**一枚直接读 `os_variant_uses_ephemeral_storage()` 返回值的仪器；「去掉 ephemeral⇒os_variant 翻转⇒迁移/chronod 行为变」这一整条因果仍需 boot 109 的读回来钉，不能先当结论。停轮条件：板子真进 iOS 桌面。

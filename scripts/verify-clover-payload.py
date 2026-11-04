@@ -1948,18 +1948,20 @@ def report(image: pathlib.Path) -> int:
         print(f"{label:42} {'OK' if present else 'FAIL'} "
               f"({'UUID present' if uuid in adt else 'UUID ABSENT'})")
 
-    # Round320: the ADT must carry ephemeral-storage so datamigrator skips every migration and
-    # SpringBoard leaves PreBoard for the desktop. boot 107 stalled with the framebuffer already
-    # presenting frames but the UI still on the migration check; sheng's make-sheng-adt.py:148
-    # names this exact property as the cause of that skip. A payload whose ADT dropped it re-boots
-    # into the same PreBoard wait.
-    label = "ADT: ephemeral-storage present (skips migration)"
+    # Round322 REVERTS round320. boot 108 read back r320 and the desktop stall only moved: SpringBoard
+    # left the migration port (0x6003 / migrationpluginwrapper gone from the window) and now idles every
+    # beat on a chronod round-trip (tid=0x129, remote 0x2f03, ro=/ho=122:chronod, through the deadline).
+    # UniXNU-sheng, the board that boots this image to the desktop, does so with persistent_data=true and
+    # NO ephemeral-storage (make-sheng-adt.py:95: "no ephemeral-storage, so first-boot data migration
+    # runs") -- round320 cited it backwards. This cheap A/B stops asserting a volatile root is ephemeral
+    # so first-boot migration runs against the card's real /private/var window; the ADT key must be ABSENT.
+    label = "ADT: ephemeral-storage ABSENT (r322 revert)"
     if adt is None:
         print(f"{label:42} SKIPPED")
     else:
-        present = b"ephemeral-storage" in adt and b"\x01\x00\x00\x00" in adt
-        ok &= present
-        print(f"{label:42} {'OK' if present else 'FAIL'}")
+        absent = b"ephemeral-storage" not in adt
+        ok &= absent
+        print(f"{label:42} {'OK' if absent else 'FAIL'}")
 
     # The kernel slot cannot be a byte-equality check: `unixnu build payload`
     # writes the entry probes from board.toml (entry_probe_reset_*) into the

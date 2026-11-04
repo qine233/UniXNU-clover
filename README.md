@@ -51,7 +51,7 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 
 | # | 缺口 | 现状（一句话） | 下一步 | 出处 |
 | --- | --- | --- | --- | --- |
-| 1 | SpringBoard 那笔同步往返没人回（boot 108 起＝chronod） | boot 107 卡在 PreBoard 迁移（`0x6003`/`migrationpluginwrapper`）；r320 补 `/chosen/ephemeral-storage` 后 boot 108 读回**卡点真的前移**：迁移口消失，主线程 `tid=0x129` 每拍同步等 chronod（pid 122，端口 `2f03`）回音、贯穿 1800 s 死线——既非 GPU 也非触摸，也不再是迁移 | r322：把采样对象换成 chronod，读它自己卡在什么上（**挂在逐拍落地的 r221/r223 家族上，不挂普查尾巴**）；正对照＝`clover r319: last` 与 `ro=122:chronod` 理应照旧在 | dev-log §Round320–321 |
+| 1 | SpringBoard 那笔同步往返没人回（boot 108 起＝chronod） | boot 107 卡在 PreBoard 迁移（`0x6003`/`migrationpluginwrapper`）；r320 补 `/chosen/ephemeral-storage` 后 boot 108 读回**卡点真的前移**：迁移口消失，主线程 `tid=0x129` 每拍同步等 chronod（pid 122，端口 `2f03`）回音、贯穿 1800 s 死线。查 sheng：它进桌面用 `persistent_data` **不设** ephemeral（`make-sheng-adt.py:95`），r320 引用反了 | **r322（v0.7.34）已建待发**：revert ephemeral 的便宜 A/B 正对照靴——内核不动、ADT 摘掉 ephemeral（`ADT 14384`），等 boot 109 读回按两支判（回到迁移停⇒缺完整持久底座转 route 2 / 迁移跑完且 chronod 回音⇒r320 才是拦路石） | dev-log §Round320–322 |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气通，两个候选地址全 NACK | 依赖 3：先把面板轨上电 | dev-log §Round181、§Round312 |
 | 3 | PMIC 轨读不出来 | r313 起「不在 v5 带内」不再是拒读的理由（地板图改成按版本字选表） | 刷 `round313` / `round314` 镜像定档 | [`notes/power-bringup.md`](notes/power-bringup.md) §8 |
 | 4 | ADSP 没起 | SMEM 读通，判决行没上屏 | 有边上 GLINK/APR；没镜像先压 `vadsp` | dev-log §Round183 |

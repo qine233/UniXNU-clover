@@ -217,19 +217,18 @@ def generate_adt(args) -> bytes:
 
     chosen = node("chosen", [
         ("random-seed", os.urandom(64)),
-        # This board has no persistent Data volume: the image behind --data-ramdisk is the
-        # md0/mockfs root (scripts/make-clover-root.py), so its data is volatile. Round320 sets
-        # ephemeral-storage on that root because the desktop stall has a named cause now: boot
-        # 107 caught SpringBoard's main thread blocked on an unanswered migration round-trip
-        # (port 0x6003, `pr=0 to=0`, 140 s without its reply; migrationpluginwrapper spawned at
-        # t=653 while the framebuffer already presented 4 frames), i.e. it is stuck in PreBoard's
-        # data-migration check and never reaches Board to draw a desktop. UniXNU-sheng, which
-        # boots this image to the desktop, records at make-sheng-adt.py:148 that with this
-        # property "datamigrator skips every migration (os_variant_uses_ephemeral_storage)". An
-        # earlier round withheld it as un-attributable kernel behaviour; the card names that
-        # behaviour now, so this is a targeted fix, not a loose variable. A persistent Data root
-        # must NOT set it -- it would stop the staged system apps installing.
-        *([("ephemeral-storage", u32(1))] if writable_root else []),
+        # Round322 REVERTS round320's ephemeral-storage. The r320 rationale cited UniXNU-sheng
+        # (make-sheng-adt.py:148, "datamigrator skips every migration") as if sheng boots the
+        # desktop WITH ephemeral; boot 108 showed the skip only MOVED the stall (SpringBoard left
+        # the migration port and now idles every beat on a chronod round-trip), and sheng's real
+        # desktop boot uses persistent_data=true and does NOT set it (make-sheng-adt.py:95: "no
+        # ephemeral-storage, so first-boot data migration runs"). This board's /private/var is the
+        # card's real userdata window (board.toml [userdata]: mmcblk0p64, mounted, not a RAM
+        # scratch disk), so claiming the Data is ephemeral is a lie to os_variant that may itself
+        # be what keeps chronod from answering. The cheap A/B: stop emitting the property and let
+        # first-boot migration run against the real /var. If boot 109 returns to boot 107's
+        # migration wait, clover lacks the complete persistent substrate sheng has and route 2 is
+        # the real answer; if migration completes and chronod answers, r320 was the whole block.
         ("osenvironment", cstr("main")),
         # Round242. boot 30 proved /product alone does not move BSPlatform.homeButtonType
         # either: the SSHB haptics block still waited on _controllerReadyGroup. The remaining
