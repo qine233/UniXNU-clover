@@ -25132,3 +25132,59 @@ against 230 device-tree nodes**。`CloverSdhci` 的 tee 表新增独立类 `{ "c
 sha256 `1578451f9c4b796228a803f32a8444c4216c692526efeb8b1d6ba7015e46a22f`，58,720,256 B。
 `check-clover.py` 与 `verify-clover-payload.py` 双绿（0 FAIL，三枚 `gpu-row-memacc-*` 齐 present），
 `read-clover-log.py --selftest` 全绿。**未刷写**：boot 103 的卡上现场优先。
+
+---
+
+## Round312（v0.7.24）：Wi-Fi 线的取证轮——传输选定为「MMIO 可见的 ICNSS 子系统」，同时给这条线量出天花板
+
+**纯宿主轮：没有内核补丁、没有新驱动、没有镜像、没有上机。** 用户指令是「我现在不在家，你直接完善别的开发吧，
+比如 GPU 触摸 WiFi 等」；r311 把 GPU 那一格发了出去，本轮开 Wi-Fi 这条线，产出是 `notes/wifi-bringup.md`。
+一条并行线在没读数之前先写驱动，就是 GPU 线 r282 之前那条「先只读」规矩要避免的事，所以这一轮的全部价值都在
+「把事实和上限钉住」这一格。
+
+**① 取证办法先做成一件产物。** Wi-Fi 那一格要读的是 `qcom,icnss` 节点的 phandle，而这类解析过去只发生在
+`/tmp` 里一份没被跟踪的转译本上——上一轮（r311 §5.12）就是这么把 DT 读数写进 note 的，能重放但不能引用。
+本轮把它做成脚本：`scripts/dump-clover-dtb-dts.sh` 转译**烧进卡的那颗** `~/mu-clover/Resources/DTBs/clover.dtb`
+并打印两枚 sha256。本轮实测：DTB `815b82556e417f…`、转译本 `df8ef4a7759a81f…`（16,612 行），两次输出
+`cmp` 逐字节相同 ⇒ note 里的行号从此有了一枚可核对的锚。
+
+**② DT 的读数（逐字节点与 phandle 解析表在 `notes/wifi-bringup.md` §2.1）。** 芯片是
+`qcom,icnss@18800000`，`membase` 宽 8 MiB；四颗轨（0xf6/0xf7/0xf8/0xf9 解析为 `pm660_l5`、
+`pm660_l9_pin_ctrl`、`pm660_l6_pin_ctrl`、`pm660_l19_pin_ctrl`）**全部** `compatible = "qcom,rpm-smd-regulator"`，
+三颗还带 `qcom,enable-with-pin-ctrl = <0x00 0x02>`（使能跟 HW_EN1 引脚走）；唯一的时钟 `cxo_ref_clk_pin`
+来自 `qcom,rpmcc`（0x26），连给它做地址翻译的 ANOC2 SMMU 的 `smmu_aggr2_noc_clk` 也在同一枚 rpmcc 上（0xe9 → :8912）。
+
+**③ 「先枚举 PCIe」这条路在本板上不是难，是不存在。** 全份转译本里 `pcie` 只出现在一枚 `reg-names`
+字符串里（:2143 的 `pcie0-hwev`，STM 触发域），没有任何 PCIe 主控制器节点、没有 `pci` 节点。
+独立的第二份证据来自厂商驱动本身：`drivers/soc/qcom/icnss.c` 全文 `pci` 出现 **0 次**。
+
+**④ 厂商驱动归档并逐条引用。** `notes/sources/sdm660/icnss.c`（sha256 `1c7cfa6d9a8d573d…`，4,121 行，
+`LineageOS/android_kernel_xiaomi_sdm660` @ `lineage-20`）与 `notes/sources/sdm660/icnss.h`
+（`e1e430b820d84da1…`）。三条证词：`mem_base_va` 只有 4 处引用、**没有一处按偏移 readl/writel**（:2256 把它
+交给 MSA 内存池）；`icnss_hw_power_on()`（:574）的正文只有 `icnss_vreg_on()` + `icnss_clk_init()` 两步；
+真正的通道是 QMI/service-locator（:1061 server_arrive、:1322 register_driver，头文件引 `qmi.h` 与
+`service-locator.h`）。⇒ **不存在「读一枚 chipid 就算芯片在」的入口**，这条线和 GPU 那条「写 GDSC 序列」的
+形状根本不同。
+
+**⑤ 这条线的天花板量出来了，靠的是在盘的文件而不是断言。** `~/UniXNU/out/ipsw/21H461/kernelcache.decompressed`
+（44 MiB）里与无线有关的类名只有 `AppleBCMWLAN` 一族（含 `AppleBCMWLANBusInterfacePCIe`）加
+`IO80211Controller`/`IO80211Interface`——没有任何高通无线的匹配项。⇒ 即便轨抬起来、固件跑起来、QMI 握手成功，
+iOS 这一侧也没有消费者；而且它唯一那条 PCIe 路径需要的主控制器节点本板 DT 又没有。**Wi-Fi 停在只读侦察，
+工时还给桌面那一格的「画面本身」。**
+
+**⑥ 顺带修掉两处会在下一轮被当前提引用的错。**（a）`drivers/CloverInput/CloverInput.cpp` 那句
+「`vdd-supply`/`vcc_i2c-supply` 是 PM8950 的轨、经 SPMI」在本板 DT 里对不上：这两枚 phandle 解析成
+`pm660l_l3`（固定 3,000,000 µV，:5553）与 `pm660_l11`（1,775,000..1,950,000 µV，:5250），两者都是
+rpm-smd-regulator，而全份 DT 里 `pm8950` 出现 **0 次**（`pm660` 62 次、`pm660l` 32 次）。注释就地改正，
+行为零改动。（b）记忆里「本机没装 dtc」已经不成立（`/opt/homebrew/bin/dtc`），否则下一轮会绕路。
+
+**⑦ 一个必须写下来的空档。** 这两颗触摸轨的 enable **到今天一次都没读过**：r182 的 mode 3 在 round183 那帧
+停在 `core=03000000`（低于 v5 下界 `0x50000000`，dev-log:13842-13851），而同一帧上面一行就是
+`clover r181: no address ACKed; rails unproven`。⇒ 「触摸 NACK 是因为没人上电」既没证实也没排除；
+下一格按 `notes/wifi-bringup.md` §5 的顺序，先弄清 arbiter 版本那一格，再谈轨的读数，最后才考虑 ICNSS 那页的读。
+
+**⑧ 本轮的闸门与产物**：`check-clover.py` 与 `verify-clover-payload.py` 照旧 EXIT=0（镜像仍是 r311 那枚
+`round311-v0.7.23-payload.img`，本轮不重打）；`drivers/CloverInput` 单独过 `-Werror` 编译检查；
+脚本两次运行的转译本 `cmp` 相同。新增归档：`notes/wifi-bringup.md`、`notes/sources/sdm660/icnss.c`、
+`notes/sources/sdm660/icnss.h`、`scripts/dump-clover-dtb-dts.sh`；更新 `README.md`、`porting.toml` 的
+network 区（next_action 从「读 DT、选传输」变成「传输已选定，剩 §5 那三格读数」）。

@@ -659,6 +659,20 @@ leave」一路收紧到一句可测的话：
   产物：内核 `954d8d18…` → amfi `07b577db…`（**两刀 +0x1000，移到 `0x1adc0e4`/`0x1adc16c`，性质不变**）→
   归一化 `404f8e85…` → payload `1578451f…`（58,720,256 B），双闸门 0 FAIL、解码器自测全绿。**未刷写**：
   卡上还压着 boot 103，读它不需要刷，写它才会毁掉它。
+* **r312（v0.7.24，纯宿主、不发镜像）开 Wi-Fi 这条线，产出是一份选型与一处天花板**：本板 DTB 里无线是
+  `qcom,icnss@18800000`（`membase` 宽 8 MiB），而**整份 DTB 没有任何 PCIe 主控制器节点**（`pcie` 只出现在
+  `:2143` 那枚 `pcie0-hwev` 的 reg-names 里）；厂商 `icnss.c`（已归档，sha256 `1c7cfa6d9a8d…`）全文 `pci`
+  出现 **0 次**、`mem_base_va` 只有 4 处引用且**没有一处按偏移 readl**（`:2256` 把它交给 MSA 内存池），
+  `icnss_hw_power_on()`（`:574`）的正文只有 `vreg_on` + `clk_init`，通道是 QMI/service-locator。⇒ 传输选定为
+  「MMIO 可见的 ICNSS 子系统」，但它每一枚依赖都在 RPM 手里（四颗轨全是 `qcom,rpm-smd-regulator`，三颗还
+  `enable-with-pin-ctrl` 跟 HW_EN1；唯一的时钟与 ANOC2 SMMU 的聚合时钟都来自 `qcom,rpmcc`）。天花板量自
+  `~/UniXNU/out/ipsw/21H461/kernelcache.decompressed`：iOS 侧无线类名只有 `AppleBCMWLAN` 一族，**没有任何能绑
+  `qcom,icnss` 的东西** ⇒ 这条线不可能把网络做出来，工时还给桌面的「画面本身」。DT 读数的锚做成产物：
+  `scripts/dump-clover-dtb-dts.sh` 打印 DTB 与转译本两枚 sha256，两次运行逐字节相同。**顺带两处更正**：
+  `CloverInput` 那句「PM8950 rails through SPMI」在本板 DT 对不上（0x187/0x17b 解析为 `pm660l_l3` 与
+  `pm660_l11`，全是 rpm-smd，而 `pm8950` 在整份 DT 出现 0 次），且**这两颗轨的 enable 至今一次都没读到**
+  （r182 mode 3 在 round183 那帧停在 `not a v5 arbiter (03000000)`）——「触摸 NACK 因为没人上电」既没证实也没排除。
+  全部细节在 [`notes/wifi-bringup.md`](notes/wifi-bringup.md)，台账见 dev-log §Round312 ①–⑧。
 * **这两条仪器债已由 r303 结清**（原文曾记作「本格欠着」）：`vbits=` 现以 r298 行末的 `vb_r=`/`vb_v=` 落地
   （`ipc_right_lookup_read()` 已经交出的 entry 位掩码，用来分 port set / send-once / 死名，不需要对象、锁纪律与
   translate 同一条），`cap=send` 行的 `qmc=/qsr=` 也带上了自己的返回码 `qerr=`。

@@ -70,10 +70,17 @@
 //
 // WHAT IT DOES NOT CLAIM
 //
-// No power rails. clover.dts gives both touch nodes a supply (`vdd-supply`, `vcc_i2c-supply`,
-// phandles 0x187 and 0x17b -- PM8950 rails through SPMI), and this driver does not touch SPMI. If
-// no address answers here, the next question is whether VDD is on, not whether the bus is broken,
-// and the report says so instead of concluding "no touch controller". No interrupt setup either:
+// No power rails. The flashed DTB gives both touch nodes a supply (`vdd-supply` = phandle 0x187,
+// `vcc_i2c-supply` = 0x17b), and round312 resolved those two inside the same file: 0x187 is
+// `pm660l_l3` (fixed 3000000 uV) and 0x17b is `pm660_l11` (1775000..1950000 uV), both declared
+// `compatible = "qcom,rpm-smd-regulator"` -- so they are held by RPM over SMD, not by an AP-side
+// register, and `pm8950` appears nowhere in this board's DT (the earlier "PM8950 rails through SPMI"
+// in this paragraph was a vendor-tree analogy and is withdrawn; notes/wifi-bringup.md section 4).
+// That also means CloverPower's SPMI path cannot settle the question as things stand: its mode 3 read
+// on the round183 panel stopped at `not a v5 arbiter (03000000)`, so these two enables have never
+// been read.
+// If no address answers here, the next question is still whether VDD is on, not whether the bus is
+// broken, and the report says so instead of concluding "no touch controller". No interrupt setup either:
 // gpio67's INTR_CFG/INTR_STATUS are read and printed but not programmed, so the point-report round
 // starts from whatever state the boot left, not from a claim. No HID, no IOHIDDevice, no registry
 // publication, and no coordinate reading -- the 0x814E point format is pinned in the header and
