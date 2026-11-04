@@ -1,0 +1,95 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -13404,11 +13404,17 @@
+ 	 * exist and the relay still reaches the card.
+ 	 */
+ 	char hopown[4][24] = { { '\0' } };
+-	uint32_t resolved = 0;
++	/*
++	 * Round327. `asked` and `named` split what one `res=` could not: four dashes on boot 112 covered
++	 * "no remote to name", "asked, got nothing" and "asked, got a name that the copy then lost".
++	 * hrem is zeroed because the row prints all four slots and the hop walk fills only hn of them.
++	 */
++	uint32_t asked = 0;
++	uint32_t named = 0;
+ 	uint64_t htid[4];
+ 	uint32_t hrn[4];
+ 	uint32_t hrs[4];
+-	uint32_t hrem[4];
++	uint32_t hrem[4] = { 0, 0, 0, 0 };
+ 	uint32_t hloc[4];
+ 	uint32_t hid[4];
+ 	uint64_t hto[4];
+@@ -13777,42 +13783,47 @@
+ 	}
+ 	clover_sb_port_state(sb_task, name, "bb", secs, "r229");
+ 	/*
+-	 * Round326. The debt named at the earliest point that can name it and the last point boot 111
+-	 * proved the relay reaches. Round325 sealed these owners below the hop loop; that boot's only
+-	 * fire printed r229, its own sbport and sbown rows, r262, r270, r271 and r299 and then entered
+-	 * the panic sink in the same second, the relay's last seal being round308's pre-line and no
+-	 * post-line -- so the segment that holds the hop walk never ran and bbnow printed nothing while
+-	 * hops=4 was already a field of the row above. hn, hrn[], hloc[] and hrem[] are filled by the
+-	 * walk that produced that row, so the four names are computable here. An empty slot stays '-':
+-	 * a hop whose remote port is its local one has no other task to name, which r231's row says
+-	 * with its own two fields.
++	 * Round326 placed this row, round327 makes it say what it means. Boot 112 read it back on both
++	 * channels -- the placement is settled -- and returned hn=4 with four dashes and rem=0. A dash then
++	 * carried three different facts, and the one the next hand needs is which of them it is, so the
++	 * slots are now literals: `null` = that hop's remote port name is 0 and there is no task to ask,
++	 * `fail` = a remote was named, the walk of this task's space ran, and it found no owner, anything
++	 * else = that owner. The r326 test `hrem[i] != hloc[i]` is gone, because hloc is x[3]'s high half
++	 * and the trap does not define it as a port name (round326 ④-1); it no longer gets a vote on
++	 * whether a name is asked for. state= splits the same way, and r0..r3 carry the four remote names
++	 * in the raw beside the literals, so a literal and the word it was computed from are in one row.
+ 	 */
+ 	for (i = 0; i < hn; i++) {
+-		char own326[24];
++		char own327[24];
+ 
+-		own326[0] = '\0';
+-		if (hrem[i] != 0 && hrem[i] != hloc[i]) {
+-			clover_sb_port_owner(task, (mach_port_name_t)hrem[i], own326,
+-			    sizeof(own326));
++		own327[0] = '\0';
++		if (hrem[i] == 0) {
++			strlcpy(hopown[i], "null", sizeof(hopown[i]));
++			continue;
+ 		}
+-		strlcpy(hopown[i], own326[0] ? own326 : "-", sizeof(hopown[i]));
+-		if (i == 0 && own326[0] != '\0') {
+-			resolved = 1;
++		asked++;
++		clover_sb_port_owner(task, (mach_port_name_t)hrem[i], own327,
++		    sizeof(own327));
++		if (own327[0] == '\0') {
++			strlcpy(hopown[i], "fail", sizeof(hopown[i]));
++		} else {
++			strlcpy(hopown[i], own327, sizeof(hopown[i]));
++			named++;
+ 		}
+ 	}
+ 	{
+ 		extern unsigned int clover_emmc_probe_say(const char *text,
+ 		    unsigned int length);
+-		const char *st326 = hn == 0 ? "no_hop" :
+-		    (resolved ? "hop_owner" : "hop_unresolved");
+-		char now[240];
++		const char *st327 = hn == 0 ? "no_hop" :
++		    (named != 0 ? "hop_owner" : (asked != 0 ? "hop_unresolved" : "hop_null"));
++		char now[256];
+ 		int nl = snprintf(now, sizeof(now),
+-		    "clover r326: bbnow t=%llu pid=%d fired=%u hn=%u rem=%x res=%u state=%s"
+-		    " o0=%s o1=%s o2=%s o3=%s\n",
+-		    (unsigned long long)secs, pid, clover_bb_fired, hn,
+-		    (hn != 0) ? hrem[0] : 0, resolved, st326,
++		    "clover r327: bbnow t=%llu pid=%d fired=%u hn=%u state=%s named=%u asked=%u"
++		    " o0=%s o1=%s o2=%s o3=%s r0=%x r1=%x r2=%x r3=%x\n",
++		    (unsigned long long)secs, pid, clover_bb_fired, hn, st327, named, asked,
+ 		    hopown[0][0] ? hopown[0] : "-", hopown[1][0] ? hopown[1] : "-",
+-		    hopown[2][0] ? hopown[2] : "-", hopown[3][0] ? hopown[3] : "-");
++		    hopown[2][0] ? hopown[2] : "-", hopown[3][0] ? hopown[3] : "-",
++		    hrem[0], hrem[1], hrem[2], hrem[3]);
+ 		if (nl > 0) {
+ 			now[sizeof(now) - 1] = '\0';
+ 			clover_emmc_probe_say(now, (unsigned int)strlen(now));

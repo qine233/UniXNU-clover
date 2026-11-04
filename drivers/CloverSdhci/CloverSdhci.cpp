@@ -1186,13 +1186,14 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // budget is the beat count a WDT-shortened boot can produce (a little over 1800 s / 120 s), and 24
   // covers every fire without letting a repeating row crowd the census beside it.
   { "clover r324: bbwhy", "r324-bbwhy", 24, 0, 0, 0 },
-  // Round326 is round325's row moved, not a new row: boot 111 read back with zero bbnow lines and said why
-  // -- its only fire printed r229 through r299 and entered the panic sink in that same second, so the hop
-  // walk that round325 sealed from never ran, while hops=4 was already a field of the r229 row above. The
-  // seal now sits under that row, in the millisecond band boot 111 proved the relay reaches (its own
-  // cen-in and smp-pre sealed there). Fires are change-gated and capped by clover_bb_fired at 96, and a
+  // Round326 placed the in-band debt row and boot 112 read it back on both channels, so the placement is
+  // settled; round327 changes only what its four owner columns say. Boot 112's row read hn=4 with four
+  // dashes and rem=0, and a dash then covered "no remote to name", "asked and found no owner" and "named
+  // but the copy lost it" at once -- the one distinction the next hand needs. The slots are now literals,
+  // asked=/named= count the two branches, and the row carries the four remote port names in the raw. The
+  // channel and the budget are unchanged: same change-gated fire, capped by clover_bb_fired at 96, and a
   // board that survives to the 1800 s deadline can fire the census a dozen times, so 32 is headroom.
-  { "clover r326: bbnow", "r326-bbnow", 32, 0, 0, 0 },
+  { "clover r327: bbnow", "r327-bbnow", 32, 0, 0, 0 },
 
   // Round313 is the first boot that runs drivers/CloverPower at all -- the instrument shipped in
   // round182 and has never been on a board -- so its lines have no class and no budget of their own
@@ -4850,13 +4851,13 @@ static void teeConsumeLine (uint32_t &pushed)
        // per-pass cap is indistinguishable from a probe that never ran. The class budget of 16 still
        // bounds it.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r319-last") ||
-       // Round326 is round325's console copy, and it prints from inside the same burst as the
+       // Round327 keeps round326's console copy, and it prints from inside the same burst as the
        // r229/r231/r234 rows it summarizes, so the r249 reason applies directly: a pass that had already
        // spent its sixteen pushes would drop the one row that names the hops and leave the burst reading
-       // as a sample that computed nothing. The relay copy does not ride this cap -- that is why the round
+       // as a sample that computed nothing. The relay copy does not ride this cap -- that is why the row
        // exists -- but the two copies are each other's control, and a console copy the cap ate silently
        // breaks that. The class budget of 32 still bounds it.
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r326-bbnow") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r327-bbnow") ||
        // Round313's power report is one burst printed while the PMGR tail attaches, and it is the first
        // time this driver has ever run on a board. Exempting both of its classes is the r283 reason in
        // its plainest form: half a report and no report are different readings of the same bus, and a

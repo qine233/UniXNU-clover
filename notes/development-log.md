@@ -26297,3 +26297,60 @@ payload 用**绝对路径** `--kernel /Users/zhouzhou/clover-out/round326-kernel
   挪进这条已证明落地的带里（r327 之后第二手）。
 - **C｜** 出现 `fail` ⇒ 解析真的走不通，查 `clover_sb_port_owner` 的名字空间。
 - **D｜** 复查 `ephemeral ABSENT`、`r319: last` 正对照、`presented=`/`box=` 那一格。
+
+## Round327（v0.7.38）：让债主封行自己说清「四种缺席」是哪一种，并把 `hloc` 那枚残值从判据里摘掉
+
+**① 一手。** 只改 `osfmk/kern/task.c` 里 `clover_bb_sample()` 的封行那一段，通道、预算、位置都不动：
+- `o0..o3` 的缺席值由 `-` 换成**成因字面量**：`null`＝这一跳的远端端口名是 0，没有可命名的对象；`fail`＝问了
+  （远端非 0）、`clover_sb_port_owner` 把这个任务的名字空间三条腿都走过、没给出属主；其余＝属主名（`pid:comm`）。
+- `res=%u`（旧的那枚只在 hop 0 有名字时置一）换成两枚计数 `named=%u asked=%u`；`state=` 由三态扩成四态：
+  `no_hop`／`hop_null`（hn>0 而四枚远端全 0）／`hop_unresolved`（有非 0 远端但一枚名字都没解析出）／`hop_owner`。
+- 同一行带上四枚原字 `r0=%x r1=%x r2=%x r3=%x`（`hrem[]`）：字面量与算出它的那个字在同一行（第十一层）。
+  `hrem[4]` 加了零初始化——这一行印全部四格，而 hop 循环只填 `hn` 格，未初始化那两格会印出栈上的残值。
+- **删掉 `hrem[i] != hloc[i]` 这道跳过**：`hloc[i] = x[3]>>32` 是调用方留在高 32 位的残值，trap 从没把它定义成
+  端口名（§Round326 读数④-1）。现在不问的理由只剩「远端是 0」这一个；自环不再靠残值猜，而是**照名字读**
+  （`58:backboardd` 出现在 `o0=` 里就是自环，人人都看得出来，也不用再引入一枚含义模糊的字面量）。
+- r324 的 `clover_bb_debt_*` 闩锁、逐拍 `clover r324: bbwhy`、看门狗上膛与全部 boot-args 一字未动
+  ⇒ boot 113 与 110/111/112 并排可读。
+
+**② 为什么是这一手，而不是再挪位置。** boot 112 给了一个位置正确、语义不够的形状：`hn=4 rem=0 res=0` 而四列
+全 `-`。那一枚 `-` 同时装着三件事——「这一跳根本没有远端」、「有远端但解析不出属主」、「解析出来了但那一路
+没带上名字」——而下一手要走的正是「谁本该发到 `2f03`」，它需要区分第一件和第二件。所以本轮不再动仪器挂在哪
+（r326 已把它钉在已被证明送达的那一毫秒带里），只动这一行**说得出什么**。
+
+**③ 正对照与缺席读法。** `clover r327: bbnow` 只在本镜像里存在，闸门同时钉两枚负针脚（`r326-bbnow-gone`、
+`r325-bbnow-gone`）：一个文件里有两代同名行，缺席就没法归位。位置逐字沿用 r326（`clover r229: bb` 紧后面），
+所以若 boot 113 仍零行，解释只剩「这靴压根没 fire」，不再是放置。
+
+**④ 契约。** 补丁 `zzz(70)-clover-r327.patch`（2 hunks：删 r326 的封行块、加 r327 的），排进
+`build-xnu-4k-baseline.sh` 的 `LATE_PATCH` **最前面**——它改的正是 r326 写下的块，先摘 r326 会让 r327 反向失败，
+而那个循环的失败是静默的。`check-clover.py` 本轮加了两条以前没有的形状：
+- 「封行不许再问 `hloc[i]`」这条**只看代码加行**。它第一次跑红，红的是闸门自己：注释里引用了被删掉的那道
+  判断，朴素地扫 `+` 行会把解释这一刀的注释当成新代码。加行先滤掉 `*`/`/*`/`//` 开头的形状再判。
+- 反向断言补丁**不许删除** `clover_emmc_probe_say(now` 那一行。通道不是本轮的手；这类「只改读数」的轮次最容易
+  顺手把上一轮建立的腿改掉，而删了它 boot 113 就没有中转副本了。
+同轮另两条 needle 也被迫改：`clover_emmc_probe_say(now` 在 r327 补丁里是**上下文**不是加行，用它当加行断言
+永远红；tee 类与豁免前缀升 `r327-bbnow`。`board.toml` 标题升 `clover r327:`，两处 title 断言一起升。
+
+**⑤ boot 113 判读（判据先登记）。**
+- **A｜** 四列里出现任何一枚不是 `null`/`fail` 的名字 ⇒ 债主定名，boot 109 起欠的那笔第一次成为读数
+  （名字若就是 `58:backboardd`，那是自环：一条读数，但不结这笔）。
+- **B｜** `state=hop_null` 且 `r0..r3` 全 0 ⇒ backboardd 这四次等待**没有一次有发送对象**。主线从「顺债找债主」
+  正式改轨到「谁本该发到端口 `2f03`」：下一手把 r303 的**收方任务 entry 普查**挪进这条已证明落地的带里。
+- **C｜** `state=hop_unresolved`（`asked>0` 而 `named=0`）⇒ 解析真的走不通，查 `clover_sb_port_owner` 的三条
+  `ipc_object_translate` 与 `clover_port_recv_task` 回退，而不是再改读数形状。
+- **D｜** `bbnow` 仍零行而 `clover r229: bb` 有行 ⇒ 这靴没有任何 fire（`f=0`），回到「逐拍 `target=0`」那一支，
+  r324 手 2 重新成为主线。
+- **E｜** 可比性复查：`ADT: ephemeral-storage ABSENT`、`clover r319: last` 正对照、上膛那条腿仍**只能从「自落」
+  读**（不许把三靴的自落合并成「bite 复位」），桌面这一格读 `frame#`/`presented=`/`box=`。停轮条件仍是真进桌面。
+
+**⑥ 产物（本轮真构建）。** `build kernel` → prelink `kernel.macho` `6b2bae71…`（52,404,224 B）→
+`patch-clover-amfi.py` → `round327-kernel-amfi.macho` `28e08787…`（两站点仍在 `0x1ae00e4`/`0x1ae016c`，编码
+`0x34000229→0x14000011`、`0x36000520→0xd503201f`）→ `normalize-kernel-macho.py`（973 枚 object stamp 归零）→
+`round327-kernel-normalized.macho` `5f07606d…` → `build payload --kernel **绝对路径**`，`payload.json` 自报
+`kernel_sha256=5f07606d…`，这就是「发的是归一化那一枚、不是设备仓陈旧副本」的判据。产物
+**`round327-v0.7.38-payload.img` sha256 `9f53fa5d33002a74…`**（58,720,256 B，异于 boot 112 的 `820b7782…`）；
+ADT 14,384 B。双闸门：`check-clover.py` 仓库侧与 `out/clover/tree` 侧都 **EXIT=0**（12 archives、22 objects
+ABI-checked）；`verify-clover-payload.py` **EXIT=0、51 OK / 0 FAIL**，含 `r327-bbnow present`＋
+`r326-bbnow-gone present`＋`r325-bbnow-gone present`＋`ADT: ephemeral-storage ABSENT`。冷刷分区照旧只有 eMMC
+`cache`。

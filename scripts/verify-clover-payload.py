@@ -1254,11 +1254,14 @@ def check_sb_sample(kernel: bytes) -> bool:
                             b"state=%s owner=%s\n") in kernel,
              # Round325 put this row after the hop loop and boot 111 read zero copies on both channels while
              # the r229/r231/r234/r299 rows of the same burst arrived -- so the placement, not the cadence, was
-             # the defect. Round326 seals the same answer immediately after the r229 line, inside the band boot
-             # 111 proved deliverable, and names the hops there instead of in the loop below the stop. The seal
-             # is a local count, so the column is res= rather than r324's set=.
-             "r326-bbnow": (b"clover r326: bbnow t=%llu pid=%d fired=%u hn=%u rem=%x res=%u state=%s "
-                            b"o0=%s o1=%s o2=%s o3=%s\n") in kernel,
+             # the defect. Round326 sealed the same answer immediately after the r229 line and boot 112 read
+             # it back, which settled the position and exposed the next one: hn=4 with four dashes and rem=0,
+             # one literal standing for three different causes. Round327 names the cause in the slot --
+             # `null` for no remote port, `fail` for a remote the space walk could not name, the owner
+             # otherwise -- counts the two branches, and carries the four remote names in the raw.
+             "r327-bbnow": (b"clover r327: bbnow t=%llu pid=%d fired=%u hn=%u state=%s named=%u asked=%u "
+                            b"o0=%s o1=%s o2=%s o3=%s r0=%x r1=%x r2=%x r3=%x\n") in kernel,
+             "r326-bbnow-gone": b"clover r326: bbnow" not in kernel,
              "r325-bbnow-gone": b"clover r325: bbnow" not in kernel,
 
              "aks-say-sel": (b"clover r281: aks sel%u n=%u rc=%x\n") in kernel,
