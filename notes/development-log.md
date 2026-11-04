@@ -26015,3 +26015,30 @@ boot 108 冷刷并读回了 r320（v0.7.33，`1b47270b…`）。产物 `~/clover
 | `clover r319: last` 节拍行缺席 | 跑的不是这枚内核——先查刷写/回读（内核字节与 boot 107/108 相同，理应照旧在） |
 
 对照锚：boot 108 的 SpringBoard 主线程 `ro=122:chronod` 行、`clover r319: last` 在 r322 内核字节相同，理应照旧逐拍出现。仪器地平线（别过度断言）：本轮仍**没有**一枚直接读 `os_variant_uses_ephemeral_storage()` 返回值的仪器；「去掉 ephemeral⇒os_variant 翻转⇒迁移/chronod 行为变」这一整条因果仍需 boot 109 的读回来钉，不能先当结论。停轮条件：板子真进 iOS 桌面。
+
+## Round323（读数落盘，无新镜像）：boot 109 读回 r322——迁移真跑了、chronod 那格过了、显示路第一次整条转起来；卡点从 chronod 挪到 backboardd，但只画出一个盒子，仍不是桌面
+
+读数全部来自 `~/clover-out/clover-log-window-boot109.bin.txt`（512 行内核日志 + 64 行驱动判据 + flight 区，boot 109）。与 boot 108 同一枚内核字节（r319/r322 逐字节相同）、同一个 r221 采样器，两靴逐字段可比。
+
+**① 落回是用户手动，不是自动——这本身是一个读数。** 冷刷 r322 进 cache、`fastboot reboot` 起 boot 109 都在（脚本日志 line 4–8）。但 boot 109 **卡上没有自己的死线记录、也没有 panic 标记**（flight 区：`the deadline record on the card is boot 108's, not boot 109's`；两条 panic marker 分别 `boot=108 STALE`、`boot=87 STALE`）。原因量出来了：内核日志最后一条 ~t=719 s，且 `clover r281: wdt t=379/499/619 en=0 armed=0 intmask=0 ... why=ctrl` —— **板上硬件看门狗整靴没上膛**。板子在 ~719 s 挂住后没有任何东西把它复位，`r196/r198` 的「panic/非 panic 自动落 TWRP」这条自动回读通道**只在有 panic、有复位时才成立**；一次「挂死」既不跑 panic 路径、也没有 WDT bite，就只能人工弄进 recovery。用户两次反馈「不会自动回 TWRP、出问题后我手动操作的」和这行 `en=0 armed=0` 是同一件事的两侧。**判读纪律**：因此本轮**不能**说「boot 109 走到了 1800 s 死线」——它在 ~719 s 停住、被人工中断，后面的状态没被任何自动仪器记录。
+
+**② 三支预登记里，落进的是 branch 3（新的一格），不是 branch 1（回迁移格）。** 逐条（都取**逐拍落地**的 r221/r180/r262 家族，不碰普查尾巴那族常缺席的行）：
+
+| §Round322 ④ 那支 | boot 109 实际 | 判定 |
+| --- | --- | --- |
+| branch 4：`clover r319: last` 缺席＝不是这枚内核 | `clover r319: last status=c1343c8 err=0 sda=1 scl=1 vend=8 res=80` 在 t=380/500/620 逐拍在 | **排除**（跑的就是 r322） |
+| branch 1：回到 `0x6003`/`migrationpluginwrapper` 迁移往返没人应答 | `com.apple.datamigrator[179] ==> (apply-protobox)` t=646 **起来了**（迁移真在跑），且全窗 `0x6003`/`migrationpluginwrapper` 一次没再出现 | **排除**——revert 方向被证实：去掉 ephemeral 没把我们打回迁移陷阱 |
+| branch 2：迁移跑完 + chronod 回音 + 出现桌面帧 | chronod 那格**过了**（boot 108 的 `ro=122:chronod` 8 次贯穿到 1495 s，boot 109 `ro=122:chronod` **0 次**；t=644 `txt=com.apple.chronod.startup` 被处理，之后 SpringBoard 走到 launchd t=684/698 `txt=@CPX@`、cfprefsd t=706 `pr=56ff00`）。显示路**第一次整条转起来**（见 ③）。但 `presented` 只到 2、`swap#3 accepted` 后不再动，且**画出来的不是一个桌面**（见 ④） | **部分**：迁移/chronod/渲染三段都通了，唯独「桌面内容」没成 |
+| branch 3：既不回迁移也不进桌面，卡在第三个端口/新停点 | SpringBoard 主线程 `tid=0x12d` 最后 `rem=4203 ro=58:backboardd ho=58:backboardd`（t=716）；`clover r262: census t=718 pid=58 threads=22 wait=21 run=1`。债主从 boot 108 的 chronod 换成 **backboardd(pid 58)** | **命中**：卡点位移是量出来的（同 r221 采样器两靴可比），这是自 boot 107→108→109 连续第二格前移 |
+
+**③ 显示这一格第一次真的通了——这条对「route b（真渲染路出桌面）」是直接的好消息。** boot 108 `clover r180: client#` **0 行**（SpringBoard 冻在 chronod，根本没开帧缓冲客户端）。boot 109：
+
+- 五个 `IOMobileFramebufferUserClient` 进门：pid 86、87、58(backboardd)、56、74（`client#1..#5 seen=1..5`，t=631→702）。
+- 完整一次 swap→copy→scanout→retire→present 循环跑通：`swap#1 accepted` → `frame#0 ... pixels=41586 box=305x887..755x1029` → `copy#1 133 ms bytes=9216000` → `scanout#1 ok bytes=9216000` → `retire#1 done=1 presented=1 frames=1`；随后 `swap#2` → `frame#1` → `copy#2 1923 ms` → `scanout#2 ok` → `retire#2 done=2 presented=2 frames=2`；再 `swap#3 accepted`（t=718）。
+- 也就是说：真像素（9.2 MB 一帧）被拷贝、扫出、退休、presented，全在 OK——**欠画面本身这一格不再是拦路石**，卡点确实挪到了 backboardd 这笔同步往返。
+
+**④ 但屏上画出来的不是桌面，是一个小黑盒——这条把「进了桌面」的希望先按住。** `clover r180: frame#1 colours ff000000/2262414 ff070707/24 ff464646/14 ff626262/5 other=41543`，配合 `box=305x887..755x1029`（一个 450×142 的区域）：整屏 2.26 M 像素是纯黑，只有那一个盒子里有内容（41,543 个非黑像素）。这与 boot 100 记的「非黑 41,548 px 一枚会长的盒子」同形——**渲染交出来的仍是 boot 阶段的一个进度盒/单视图，不是 Home/桌面**。presented 停在 2、swap#3 后不再涨，说明画面没继续动，板子随后挂住/被人工中断。
+
+**⑤ 仪器地平线（本轮新添的一格，别读成桌面）。** 现在**分不清**「到桌面后主线程 idle、在 backboardd 连接口 `0x4203`（`cnt=0 ql=6 seq=3 pr=0 to=0`）等事件」与「卡在 backboardd 一笔往返没回」。`presented` 只到 2、只画一个盒、swap#3 后静默这几条更偏向后者，但**没有一枚仪器直接裁决**；且用户手动中断在 1800 s 之前，没有一次干净的死线落回读数来钉这一点。backboardd census 的 `wait=21 run=1` 也不能单看——backboardd 常态就有一堆等待工作线程，`run=1` 未必是卡死。**下一步要测的物理量**：backboardd(pid 58) 自己对谁挂同步往返（把 r229/r230/r236/r262 那族逐拍落地的债主梯子从 SpringBoard 挪到 backboardd 自己），以及那个盒子是谁画的、为什么 SpringBoard 只交出这一个 view（route b 的桌面内容本身）。
+
+**⑥ 落盘状态。** 无新镜像；待发仍是 `round322-v0.7.34-payload.img`（`1aebc9f7…`，58,720,256 B，已冷刷、boot 109 已读回）。板子现由用户手动停在 TWRP。停轮条件（板子真进 iOS 桌面）未满足：卡点到了 backboardd、只画出进度盒不是桌面；且自动回读通道因 WDT `en=0 armed=0` 对「挂死」无效，是个要单独处理的基础设施坎。

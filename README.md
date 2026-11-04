@@ -20,8 +20,8 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 | 4 | 磁盘 | 通 | eMMC 高速读写 + ADMA2；APFS 的 OS 卷与 Data 卷都挂上 | dev-log §Round128–138、§Round159 |
 | 5 | 用户态 | 通 | launchd 起一整套 iOS 守护进程，`Early boot complete` | dev-log §Round186 |
 | 6 | 点亮屏幕 | 通 | 第一次 present：`swap#1/2/3 accepted`、`scanout#3 ok bytes=9216000`、`presented=3` | dev-log §Round206 |
-| 7 | SpringBoard | **卡在这里** | boot 108（r320 读回）：越过 boot 107 的 PreBoard 迁移闸（`0x6003`/`migrationpluginwrapper` 消失），主线程 `tid=0x129` 每拍同步等 **chronod（pid 122，端口 `2f03`，`ro=/ho=122:chronod`）** 的回音、贯穿死线；`to=ffffffff` 那 12 条是发给 `MACH_PORT_DEAD` 的即时错误、不阻塞 | dev-log §Round295–321 |
-| 8 | 桌面 | 未到 | 画面那一格其实已通（r180 起 `presented=4`、copy/scanout/retire 全 ok）；欠的是 SpringBoard 那笔对 chronod 的同步往返没人回——不是 GPU 也不是触摸，也不是迁移了 | dev-log §Round321 ② |
+| 7 | SpringBoard | **卡在这里** | boot 109（r322 读回，revert ephemeral）：迁移真跑了（`datamigrator[179]` t=646 起来）、boot 108 那笔对 chronod 的同步往返**消失**（`ro=122:chronod` 8→0），主线程 `tid=0x12d` 走到 launchd/cfprefsd 后停在 **backboardd（pid 58，端口 `4203`，`ro=/ho=58:backboardd`）**；卡点自 boot 107→108→109 连续第二格前移 | dev-log §Round321–323 |
+| 8 | 桌面 | 未到 | **画面这一格第一次真通了**：boot 108 `r180 client#` 0 行 → boot 109 五个 `IOMobileFramebufferUserClient` 进门（86/87/58/56/74）、`swap#1→#3 accepted` + copy 9.2 MB→scanout ok→`presented=2` 全跑通。但交出来的仍是 `box=305x887..755x1029` 的一个小黑盒（整屏 2.26 M 纯黑 + 41543 非黑），presented 停在 2 后静默——**是进度盒不是桌面**；欠的是 SpringBoard 只交出这一个 view + backboardd 那笔同步往返 | dev-log §Round323 ③④⑤ |
 
 ## 各驱动开发进度
 
@@ -51,13 +51,13 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 
 | # | 缺口 | 现状（一句话） | 下一步 | 出处 |
 | --- | --- | --- | --- | --- |
-| 1 | SpringBoard 那笔同步往返没人回（boot 108 起＝chronod） | boot 107 卡在 PreBoard 迁移（`0x6003`/`migrationpluginwrapper`）；r320 补 `/chosen/ephemeral-storage` 后 boot 108 读回**卡点真的前移**：迁移口消失，主线程 `tid=0x129` 每拍同步等 chronod（pid 122，端口 `2f03`）回音、贯穿 1800 s 死线。查 sheng：它进桌面用 `persistent_data` **不设** ephemeral（`make-sheng-adt.py:95`），r320 引用反了 | **r322（v0.7.34）已建待发**：revert ephemeral 的便宜 A/B 正对照靴——内核不动、ADT 摘掉 ephemeral（`ADT 14384`），等 boot 109 读回按两支判（回到迁移停⇒缺完整持久底座转 route 2 / 迁移跑完且 chronod 回音⇒r320 才是拦路石） | dev-log §Round320–322 |
+| 1 | SpringBoard 那笔同步往返没人回（boot 109 起＝backboardd） | boot 107 卡在 PreBoard 迁移（`0x6003`）→ r320 补 ephemeral 让 boot 108 挪到 chronod（`ro=122:chronod`，贯穿死线）→ **r322 revert ephemeral 后 boot 109 读回：迁移真跑（`datamigrator[179]` 起来）、chronod 那格消失（8→0）、显示路第一次整条转起来（5 个帧缓冲客户端 + swap#1→#3 + `presented=2`），但主线程 `tid=0x12d` 停在 backboardd（pid 58，端口 `4203`），且只画出一个 450×142 黑盒不是桌面** | route 1（revert ephemeral）被证实：没打回迁移陷阱，卡点又前移一格。下一手：把逐拍落地的 r229/r262 债主梯子从 SpringBoard 挪到 **backboardd 自己卡在什么上**，并量「那个盒子是谁画的、SpringBoard 为何只交出这一个 view」 | dev-log §Round322–323 |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气通，两个候选地址全 NACK | 依赖 3：先把面板轨上电 | dev-log §Round181、§Round312 |
 | 3 | PMIC 轨读不出来 | r313 起「不在 v5 带内」不再是拒读的理由（地板图改成按版本字选表） | 刷 `round313` / `round314` 镜像定档 | [`notes/power-bringup.md`](notes/power-bringup.md) §8 |
 | 4 | ADSP 没起 | SMEM 读通，判决行没上屏 | 有边上 GLINK/APR；没镜像先压 `vadsp` | dev-log §Round183 |
 | 5 | watchdogd 每次起就崩 | 已定名且非瓶颈：boot 76 带着这枚 brk 活到死线，sheng 零引用 `IOWatchdog` 也进桌面 | 先量 `AppleARMIODevice` 在本板有没有平面；不在当前排期 | dev-log §Round199–200 |
 | 6 | GPU/Metal 一个都没有 | 分支清白、债在电：`gx_collapse=0` 而 `gx_on=0`，那颗 LDO 从复位起没人按厂商表配过 | 只读侦察到 MEM_ACC 那一格；桌面 CPU-first | [`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5.11–5.13 |
-| — | 「读不到为什么结束」（独立的一道坎，不是主线症状） | 「进了 panic sink、文案被卡拒」到 boot 104 又退一格：**sink 第一笔（marker）都没落地**，misc 因此没人写 ⇒ 不自动进 TWRP（misc 现读全零**不是**证据，进 recovery 会吃掉 BCB）；GPU 线已由 r294 / r294b 两个控制轮从复位嫌疑里摘出去 | 落地即测的物理量（传感器 + `rawdump` 头部）已做进宿主脚本 | dev-log §Round294、§Round301–310 |
+| — | 「读不到为什么结束」+「挂死不自动回 TWRP」（独立的一道基础设施坎，不是主线症状） | boot 109 量到根因：`clover r281: wdt en=0 armed=0 ... why=ctrl` 整靴——**板上硬件看门狗没上膛**。一次「挂死」既不跑 panic 路径、也没有 WDT bite 复位它 ⇒ `r196/r198` 的自动落 TWRP 只对 panic/复位成立、对挂死无效，只能人工进 recovery（用户两次反馈即此）；GPU 线已由 r294/r294b 两个控制轮从复位嫌疑里摘出去 | 让挂死也自动回读：把板上 WDT（SPC `0x17817000`，r281/r292 已读）上膛到 bite 复位，接 `r198` 非 panic 落 TWRP 那一棒 | dev-log §Round294、§Round301–310、§Round323 ① |
 
 ## 已完成（都有真机读数）
 
