@@ -25512,6 +25512,14 @@ CString 各自仍在（逐枚数过：各 1 次）。针脚换成走查仍在链
 `porting.toml` 那一格本轮也按老规矩踩过一次：给数组尾部追加元素时把 `"]` 一起削掉了，`tomllib` 立刻报
 `Unclosed array (at line 117, column 1)`——改完两条再验，13 个 area 全解析通过。**这条闸门是在写的当下就响，
 不是发完才响**，所以那一格现在的做法是：改完立刻 `tomllib.loads` 并把新增元素数一遍。
+**但上游那一枚闸门确实是发完才响的**：`porting-record.py check --base v0.7.27` 要求「改到 `board.toml` 的这一轮，
+必须同时改到每一颗把 `board.toml` 列进 `paths` 的 area 的 findings/evidence」——实测这样的 area 有 9 颗
+（configuration／firmware／memory／input／gpu／network／audio／packaging／diagnostics），本轮只写了 storage 与
+diagnostics，于是它逐颗点名报错；`scripts/test-clover-block.py` 也是同一族，新脚本要先有 area 认领它的 `paths`。
+补法的先例就在 diagnostics 那一段里（`Round164 changes one payload title and adds no configuration key`），本轮
+照抄形状：没动的 area 就写「本轮只动标题」，别造事实。**v0.7.28 的 tag 推在这道闸门之前**，动已推的 tag 是
+force 操作、要问，所以补齐的那一枚作为独立提交落在 main 上（先例：`08fb562 r308:` 这类不带 tag 的收尾提交），
+CI 判的是 main HEAD；补完后 `clover: 13 structured areas checked`。
 
 **⑨ 预登记 boot 103 的判读（这条是本轮唯一把宿主测试接到真机上的线）**：`clover-apfs=3` 那条路径打印
 `CloverBlock r159: boot os=X+Y system=Z+W data=U+V` 六枚数，走的就是 `blk_parse_manifest()` 的算术。

@@ -145,7 +145,10 @@ gh api repos/UniXNU/UniXNU/contents/components.toml --jq .content | base64 -d > 
 
 It reads `porting.toml` from the working tree but the changed-file list from
 `git diff base HEAD`, so a not-yet-committed record edit can be validated
-against the round that is already pushed.
+against the round that is already pushed. Run it **before** `git tag`, not after:
+round316 tagged and pushed v0.7.28 first and only then met the nine-area rule, and
+moving a pushed tag is a force operation that needs approval, so the fix landed as
+an untagged follow-up commit on `main`.
 
 XNU patches are replayed by filename order, `git apply --reverse --check` first
 and `set -e`. A new probe must never be inserted inside a block added by a
