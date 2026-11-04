@@ -25637,3 +25637,138 @@ map_ok=%u control=%u`，与 r294 那十三个词**同一次读、同一次 fire*
 **⑪ 未结**：`CloverInput` 一颗仍缺范例第 1、3 条（notes §7 未结 3 现在结掉三分之二）；
 `docs/drivers/uefi-drivers.md:7-13` 那一层的对照仍未搬（未结 4）；第一颗真走 personality 的驱动排在桌面
 之后（未结 1）。**本轮未刷写**：板子不在家。
+
+## Round318（v0.7.30）：CloverInput 交出第五颗纯层；r181 的 `bus=` 列第一次被证明看不见它专门打印的那件事
+
+**宿主侧轮：改了驱动源码、重新构建了内核与负载，刷写尝试没有取回任何读数。** 这一轮结的是 notes §7
+未结 3 的最后三分之一，也是**唯一一颗「判决与读数在同一个表达式里」的驱动**：r181 的 `bus=` 列是
+`qupRead(kQupI2cStatus) & kI2cStatusErrorMask`，`sda=`/`scl=` 两格读的又是 TLMM 的 IO 寄存器——两个位置
+都不对，所以源码自己写下的那句替代解释（「有人在传输中途把线拉低」）从 round181 到 round317
+**一次也没被仪器问过**。
+
+**① 纯层：`drivers/CloverInput/InputCore.h`，885 行，只 `#include <stdint.h>` 与 `"InputRegs.h"`。
+** 搬进去的是这一颗驱动的全部算术：TLMM 的三扇窗（NORTH/CENTER/SOUTH 基址 + 每针 4 KiB 步幅 +
+「表外偏移要拒」）、RCG 的父源/分频解码与两个写词（`input_rcg_decode()`、`input_rcg_xo_cfg()`、
+`input_rcg_update_word()`、`input_rcg_update_pending()`）、分支的 halt/run/request 三问与使能词、
+AHB 投票、三处针脚裁切（`input_pin_output_io()`/`input_pin_output_ctl()`/`input_pin_input_ctl()`/
+`input_pin_drive_ctl()`）与整行解码 `input_pin_decode()`、FIFO 尺寸表 `{4,16,32}` 与
+`input_fifo_sizes()`、状态机三问、每笔的 CONFIG 词与 done 掩码、两个 FIFO 游标（`input_tx_next()` 与
+`input_rx_word()`/`input_rx_pop()`）、v2 tag 打包（`input_write_tags()`/`input_read_tags()`）、两个计数
+寄存器 `input_counters()`、五个判决类 `input_xfer_verdict()`、`I2C_STATUS`/`ERROR_FLAGS` 两张位表
+（含 `sda_high`/`scl_high`）、观察槽 15 的步/败编码与名字、Goodix 身份解码与 FocalTech 的 M06 测试、
+以及三处时间换算（`input_ticks_per_ms()`/`input_ticks_for_ms()`/`input_elapsed_ms()`）。硬规矩沿用
+r317：**一个地址、一个掩码都不重打**，全部从 `InputRegs.h` 已命名的常量派生；层里新增的只有位名、
+判决类名与那三处换算，后者是 r170 的 51.9 倍误缩在源码上的唯一防线。
+
+**② 契约三面，跟 r316/r317 同一式，另加两条这一颗特有的。** `check-clover.py` 的 `# Round318.` 那段
+要求：每枚判断仍在层里（10 条 needle，含 `input_tag_len_field(reg_len) < 0`、
+`if (!(op & want) || got != rx_len || sent != tx_len)` 这两句**判定顺序**原文）；驱动**调用**它
+（48 枚函数名，从 `input_rcg_decode (` 到 `input_elapsed_ms (`）；`.cpp` 里不再留着第二份拷贝
+（14 枚裸表达式：`kStepAhbVote`、`kFailPoll`、`kQupStatusErrorFlags`、`kI2cStatusErrorMask`、
+`kQupNackFlag`、`kGtPidValidMax`、`(address << 1) | 1`、两个 STOP tag、`(cfg & kPinIntrTargetMask)`、
+`kRcgCfgWritable`、`kBlkSizes`、`(drive + 1u) * 2u`、`seg.first ? 0u : kQupMxConfigDuringRun`——
+这一段是本颗驱动格外好查的一面，因为它的第二副本全都是**能编译、能跑、也能给错答案**的表达式）。
+两颗这一颗特有的：层必须 `#include "InputRegs.h"`（否则它得自己重打寄存器），层里不许出现 `NULL`
+（这头文件在内核任何头之前被包含，写法是字面量 `0`）；以及两条 r318 行的**完整格式串**必须同时在
+源码与产物里——一条字段被重接线掉，镜像照样启动、行照样打印。最后**运行**
+`scripts/test-clover-input.py`（15 组、263 检查），而不是读它。
+
+**③ 量出来的盲区，数字都在源码里。** 主干 `I2C_STATUS_ERROR_MASK = 0x38000FC`
+（`i2c-qup-mainline.c:117`）与厂商 `QUP_MSTR_STTS_ERR_MASK = 0x380003C`（`i2c-msm-v2.h:134`）
+差的是 BIT(6) 与 BIT(7)；`ERROR_FLAGS` 上主干 `0x7C` 与厂商 `0x3C` 差 BIT(6)。更关键的是
+**BIT(26) `QUP_I2C_SDA` 与 BIT(27) `QUP_I2C_SCL` 在两枚掩码之外**——它们是核心自己看到的线电平，
+而 r181 的 `bus=` 列只印 `raw & 0x38000FC`，所以 boot 48 那行 `status=10000c8`（r260 beat）里的
+`sda=`/`scl=` 恒为 0 **不是「线没被拉低」，是这一格结构上不可能有读数**；同一行结尾那两格读的是
+TLMM gpio10/11 的 IO 寄存器，而那两枚针脚此刻 mux 是 `blsp_i2c3`，输入状态位归 QUP 驱动，不归 TLMM。
+r318 因此每次分段都印**未遮罩的原字**，配 `vend=`（厂商掩码）、`res=`（主干预掩码内、两棵树都没命名的位）
+与 `sda=`/`scl=`（层里的 BIT26/27）。
+
+**④ 模型顺手量出的十处事实**（`drivers/CloverInput/tests/clover_input_host.cpp`，819 行）：
+
+| 事实 | 出处 |
+| --- | --- |
+| v2 tag 线码 `START 0x81`、`DATAWR 0x82`、`DATAWR_STOP 0x83`、`DATARD_STOP 0x87`；长度字段 0 编码 256，所以两个方向都拒零长 | `i2c-qup-mainline.c:107-112`、`:569-613`、`:607-609` |
+| 回吐 tag 字节数是 2（`READ_RX_TAGS_LEN`）；读段写进 OUT FIFO 的 tag 是 4：START + 地址 + DATARD_STOP + 长度 | `i2c-qup-mainline.c:152`、`:1478-1483` |
+| boot 48 的 `io=c0a5` 解出 64/64 FIFO；本驱动每笔最多 7 字节（4 tag + 2 地址 + 1 数据）⇒ `OUT_SERVICE` 那格「重置 room」与主干「FIFO 模式无写请求就什么都不做」**永不分岔** | boot 48 归档行 × `i2c-qup-mainline.c:338-349`、`:1552-1563` |
+| boot 48 的 `status=10000c8` = NACK + FAILED + INVALID_READ_ADDR；BIT(7) 是残数 | `InputCore.h` 的两位表 × r260 行 |
+| `0x38000FC` 与 `0x380003C` 差 BIT(6)+BIT(7)；`0x7C` 与 `0x3C` 差 BIT(6)。BIT(6) 虽被厂商头命名，却不在厂商掩码里，因此 `res=` 实际只剩 BIT(7)；BIT(6) 只能从 `status=`/`flags=` 原字读出 | 两份源码的掩码 × `input_bus_status_decode()` |
+| **r181 的 `kPinIntrTargetMask = 0x1f00` 配 shift 5 裁的是位 [12:8]——与寄存器里任何字段都不重叠**，所以 boots 41–102 的 `tgt=` 是一个不对应任何字段的数；正解是 bit 5 起 3 位（`pinctrl-msm-mainline.c:1054` 的 `GENMASK(2,0)`），`input_pin_intr_target()` 现在由 shift 与 width 派生掩码 | `pinctrl-sdm660.c:64`、`pinctrl-msm-mainline.c:1054`、`:1090-1091` |
+| mux 值是一个针脚**自己**函数表里的索引（`blsp_i2c3` = 2），不是 SoC 全局序号（30 装不进 4 位） | `pinctrl-msm-mainline.c:187-190`、`:234-237`、`:185` |
+| Goodix：厂商 8 字节缓冲的 `[2..7]` 是本驱动 6 字节读的 `[0..5]`，pid 长度 3 或 4，版本 `(data[5]<<8)|data[4]`，`sensor_id >= 0x06` 视为无效；M06 的判据是回读 `[1]` 是 E | `gt9xx.c:1222-1258`、`:1250`、`edt-ft5x06-mainline.c:846-900` |
+| 一处**改正**：厂商真正「读两遍要求一致」的是 `gtp_i2c_read_dbl_check()` 用在 **sensor_id** 上；版本号只读一遍。本驱动反过来（版本两遍、sensor_id 一遍）——两条都合理，但档案那句理由要记成**我们的**选择 | `gt9xx.c:217-246`、`:1222-1258` |
+| 本板 mach tick 19,267,584 Hz；`input_ticks_per_ms()` 只在 1 MHz..1 GHz 内信任 `cntfrq`，否则落回 19.2 MHz XO，r170 的 51.9 倍误缩作为反例断言 | `armcpu-timer-intid`、r170 读数 |
+
+**⑤ 板上多两行，且它们是同一次读。** `clover r318: xfer %s class=%s status=%08x err=%08x vend=%08x
+res=%08x sda=%u scl=%u op=%08x t=%ums` 与 `clover r318: core %s class=%s flags=%08x err=%08x vend=%08x
+res=%08x iovr=%u ouvr=%u iur=%u oovr=%u`，每个分段各印一遍、**成功也印**（盲区在成功时也在）。
+`class=` 与下面失败分支、重试策略用的是同一个 `input_xfer_verdict()` 判决；`status=`/`err=` 是原字，
+`vend=`/`res=` 与四枚 FIFO 运行位是层对同一次读的解码。新 token 进 `drivers/CloverSdhci` 的类表
+（`{ "clover r318: ", "r318-input", 32, 0, 0, 0 }`）并拿 per-pass-cap 豁免
+（`teeHasPrefix(..., "r318")`），理由跟 r291/r294/r317 同一句，但这里最锋利：**一个 pass 留下解码行、
+吃掉原字行，就等于把这一轮要拿掉的盲区原样装回去**。r181 的每一行逐字未动，所以 boot 48 的
+`verdict=102` 仍可比。
+
+**⑥ 写侧：算术搬层，行为逐位不变；但有两处形状变化要写在明处。** 一是 `runSegment()` 每轮循环仍读
+`OPERATIONAL`、`ERROR_FLAGS`、`I2C_STATUS` 各一次，**一次都不多**——两个视图（主干预掩码 / 原字+解码）
+共用同一次读，所以 r181 的轮询与 r318 的两行不可能描述两个时刻；`clover_input_observation[5]`/[6] 仍存
+遮罩后的字，panic 屏与 r260 beat 的语义未变。二是 `finishTransfer()` 的总线空闲自旋改成每圈解码一次
+（以前是每圈读一次、就地掩码），读的次数相同。`chipRead()` 的线缓冲从手写的 `uint8_t wire[8]` 改成
+`input_write_tags()` 写入的 `kQupMaxTagsLen + 2`，并加了一条 `wireLen != 4` 的拒绝——按现在的请求界
+（`regLen` 1..2、`outLen` 1..254）它不可达，存在只是为了让「tag 编码突然不成立」有一个出口而不是
+静默发半条消息。
+
+**⑦ 被打回三次，两次是自己家的文件，一次是自己的测试方法。** 一是 `board.toml` 的超长 title：第一版
+标题里没有真正的双引号字面量，被 `check-clover.py` 那道「标题必须带双引号」的守卫挡下；补真字面量时
+又把裸 `"` 塞进 TOML 基本字符串，`tomllib` 在 `:225` 第 1881 列炸掉。做法仍是 r317 学会的那条：
+**逐行精确替换，不带 `re.S`**，`git diff --stat` 确认 `board.toml` 只有 1 行改动。二是检查数从 260 涨到
+263 之后，README 第 79 行仍写 260，而标题、镜像已经按 260 打了一枚——所以本轮发了**两枚**负载（见 ⑨），
+`be5e381f…` 作废、`02b845b4…` 是现在发的那枚。三是闸门自测：我先把 `sys.exit(1)` **追加**到
+`test-clover-input.py` 末尾，结果闸门照旧绿——因为那个 runner 自己以 `sys.exit(main())` 结尾，追加的代码
+是死代码；改成**前置**才让它红。**这条与第十七层同源：验一条管道，要把它自己会走的那条路掐断，而不是
+在路尽头再放一块牌子。**
+
+**⑧ 闸门确实**运行**这一颗的模型（红/绿自证）。** 把 `import sys\nsys.exit(1)\n` 前置进
+`scripts/test-clover-input.py` 后：单独跑 `RUNNER_RED_EXIT=1`；跑 `check-clover.py` 得到
+`GATE_RED_EXIT=1` 与那句「the CloverInput host model failed: a field cut, a verdict class, a FIFO cursor
+or a tag byte is not what this boot's report will claim it is」。从 `/tmp/test-clover-input.py.bak` 恢复后
+sha256 与改前逐字相同（`e5626d80…`），`GATE_RESTORED_EXIT=0`。所以这一格不是「闸门里写了 subprocess」，
+是「subprocess 真的能把这颗模型判红」。
+
+**⑨ 构建与校验（哈希当场重数，盘上都在）**：内核 `2e2b2e24f833…`（52,404,224 B，
+`out/clover/kernel/kernel.macho`，21:17；源码 mtime 21:13）→ AMFI `5c95ef5a554a…` → 归一化
+`e198681a780c…` → 负载 `02b845b4128d…`（58,720,256 B，`/Users/zhouzhou/clover-out/round318-v0.7.30-payload.img`）。
+卷内：`unixnu.toml` 3155 B `b80261fc…`、`kernel.macho` 52,404,224 B `864dca7f…`、`scratch-data.img`
+35,888 B `614b8356…`、`kernel.macho.adt` 14,384 B `41f62ac0…`、`kernel.macho.trustcache` 61,408 B
+`7c369ce0…`。作废的那枚 `be5e381f…`（260 标题）**内核件是同一枚 `864dca7f…`**，两枚的差异只落在
+`unixnu.toml`（`13949d07…` vs `b80261fc…`）与 `kernel.macho.adt`（`9a0c6593…` vs `41f62ac0…`，
+`/chosen/random-seed` 每趟重抽）。三道闸门：`verify-clover-payload.py` 48 OK / 0 FAIL、EXIT=0；
+仓里跑 `check-clover.py` = EXIT=0（`drivers documented: 11, base-repo drivers exempt: 0`）；组装树里跑
+= EXIT=0（`documented: 11, exempt: 11`、`12 archives, 22 objects ABI-checked, kernel read`）。
+**未跑 `--prove`**：本轮发的是新构建的内核，不是同一枚镜像的第二趟构建。
+
+**⑩ 预登记 boot 103/104 的判读**（第一枚带 r318 行的卡；boot 103 仍先按 Round310 (5)、Round316 ⑨、
+Round317 ⑩ 读，r318 的两行与 r181 的行同帧出现）：
+
+| 读数形状 | 判读 |
+| --- | --- |
+| `class=done status=…c8/…` 且 `sda=1 scl=1` | 总线干净、两条线都高；遮罩列此时也会说 0，这一格的正对照成立 |
+| `class=nack sda=1 scl=1` | 从机不应答而线是自由的 ⇒ 先查电（`pm660l_l3`/`pm660_l11`）、再查协议，**不是**「面板把线压住」 |
+| `class=nack` 且 `sda=0` 或 `scl=0` | r181 结构上印不出的那件事第一次有了读数：**有东西把线拉着**。此时必须同时报 `vend=`/`res=` 与当拍 `op=` |
+| `class=bus-error status` BIT(2)/BIT(4) 置位 | 总线级故障（BUS_ERROR/ARB_LOST），与 NACK 分开判 |
+| `class=core-error err≠0` | FIFO 故障；`iovr/ouvr/iur/oovr` 逐位说出是哪一种，这是 `flags=` 原字唯一的可行动版本 |
+| `class=incomplete` | 超时。r181 的 timeout 行应同帧、且 `sent=./.` `got=./.` 与 `class=` 一致；不一致先查 tee 而不是总线 |
+| `res!=0` | 状态行只可能是 BIT(7)、核心行只可能是 BIT(6)（两棵树都没名字 / 有名字但不在掩码里）；**读作「有东西发生、没人命名」，不读作总线故障** |
+| `status` 里 BIT(23)/BIT(24)/BIT(25) 置位而 `sda=1 scl=1` | tag 或读地址/读序列写坏了。层里有名，行里没印——要用 `status=` 原字在宿主上裁，本轮**未**把它做成字段 |
+| 两行只有一行 | tee 那一格的事（独立类 32 + 豁免）；一行缺席不许读成另一行描述的是一次干净传输 |
+| 整对缺席而 r181 行在场 | 镜像早于 v0.7.30，或 tee 吃了；先核标题再核类表 |
+| `t=` 仍是秒级压缩形状（同一分段跨 100 ms 却印 0/1） | 钟掉回 XO 或 `cntfrq` 越界；`input_ticks_per_ms()` 的分支之一，不是传输本身的事 |
+
+**⑪ 未结，以及刷写尝试的真实结果。** 代码与产物全在盘上；**读数一枚都没有**。无人值守那一趟：
+21:19 把 `be5e381f…` 冷刷进 cache 并重启，21:20:42Z TWRP 的 adb 就上来了——**约一分钟，而不是 1800 s
+死线的形状**；落地快照只取到 battery/bms 两段 sysfs（93%、Charging、27.0 °C、`voltage_now=4,249,989` µV），
+thermal 为空；随后 misc、logdump（两个路径）、logfs、mmcblk0p56、mmcblk0p39 **全部 read failed**，
+21:24 前后 adb 与 fastboot 都空，板子离了 USB。所以这一趟既不证明死线到了，也不证明 r318 内核 panic
+——最可能的是 `misc` 里残留的 boot-recovery BCB 让固件跳过 XNU（候选，未证）。另外三件按顺序：
+`CloverSdhci` 自己的纯层（README 进度表里它的下一步）；`docs/drivers/uefi-drivers.md:7-13` 的固件层对照
+（未结 4）；第一颗真走 personality 的驱动（未结 1，排在桌面之后）。板子回来后的第一步不是再改代码，
+是冷刷 `02b845b4…`（263 标题）并把同一套无人值守读回重跑一遍。

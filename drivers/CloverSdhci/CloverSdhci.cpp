@@ -1156,6 +1156,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // the thirteen words and not the shape would read as "the census never ran" when what happened is that
   // a capped pass ate it. 32 covers fifteen fires of one row with a margin.
   { "clover r317: ", "r317-gpu", 32, 0, 0, 0 },
+  // Round318 adds two rows per I2C segment: the raw I2C_STATUS/ERROR_FLAGS words with the layer's
+  // decode beside them, and the verdict class that both failure branches and the retry policy are keyed
+  // on. Own class for r291's reason -- and the pair is one reading, because round181's bus= column was
+  // the masked word and could not show a held line; a boot that kept xfer and lost core would say the
+  // bus was fine and never show why the branch reset. A boot runs a handful of segments, so 32 is
+  // headroom for the pair at sixteen segments, not a promise about how many probes it takes.
+  { "clover r318: ", "r318-input", 32, 0, 0, 0 },
   // Round313 is the first boot that runs drivers/CloverPower at all -- the instrument shipped in
   // round182 and has never been on a board -- so its lines have no class and no budget of their own
   // yet. The report is one-shot, printed in the PMGR tail beside the other bring-up bursts, and its
@@ -4800,6 +4807,13 @@ static void teeConsumeLine (uint32_t &pushed)
        // the board never produced are two different claims about the same rail, and the difference between
        // "list-never-written" and "dead-page" is the one this line is still asking about.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r317") ||
+       // Round318's two rows are one segment's reading: the raw status words and the decoded fields,
+       // printed from the same two reads. Exempting the class is r283's rule at its sharpest here --
+       // round181's bus= column was the masked word, so a per-pass cap that kept the decoded row and
+       // ate the raw one would restore exactly the blind spot this round exists to remove: a held SDA
+       // line would once again be indistinguishable from a clean bus with a NACK. The class budget of
+       // 32 still bounds it.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r318") ||
        // Round313's power report is one burst printed while the PMGR tail attaches, and it is the first
        // time this driver has ever run on a board. Exempting both of its classes is the r283 reason in
        // its plainest form: half a report and no report are different readings of the same bus, and a

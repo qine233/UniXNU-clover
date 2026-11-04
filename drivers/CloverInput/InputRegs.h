@@ -139,8 +139,10 @@
 // count at two and the second page of each window is the next pin's CTL.
 #define kPinPairSize        0x2000U
 
-// Per-pin register layout, pinctrl-sdm660.c:51-54 (ctl/io/intr_cfg/intr_status) with
-// intr_target_reg = the same 0x8 as intr_cfg.
+// Per-pin register layout, pinctrl-sdm660.c:51-55 (ctl/io/intr_cfg/intr_status/intr_target) with
+// intr_target_reg = the same 0x8 as intr_cfg. The stride between two pins' CTL is REG_SIZE = 0x1000
+// (pinctrl-sdm660.c:32), and a pin's block is base + REG_SIZE * id with base NORTH/CENTER/SOUTH
+// (:29-31) -- which is where the 4 KiB-per-pin shape of kInputPinStride comes from.
 #define kPinCtl             0x000U
 #define kPinIo              0x004U
 #define kPinIntrCfg         0x008U          // also INTR_TARGET
@@ -150,7 +152,7 @@
 //   mux_bit 2 (mask GENMASK(5,2) = 0x3c, because nfuncs = 10 -> order_base_2 = 4), pull_bit 0
 //   width 2, drv_bit 6 width 3, oe_bit 9, in_bit 0, out_bit 1, intr_enable_bit 0,
 //   intr_status_bit 0, intr_raw_status_bit 4, intr_polarity_bit 1, intr_detection_bit 2 width 2,
-//   intr_target_bit 5 width 5 (intr_target_kpss_val 3).
+//   intr_target_bit 5 (intr_target_kpss_val 3).
 // pinctrl-msm.c:690-701 decides which register each lives in, and it is not the split the field
 // names suggest: mux, pull and drive are read out of CTL, the OE bit likewise, while the input
 // status and the output latch are both in the IO register.
@@ -165,18 +167,59 @@
 #define kPinIntrEnable      0x1U            // INTR_CFG bit 0
 #define kPinIntrPolarity    0x2U            // INTR_CFG bit 1
 #define kPinIntrDetectShift 2U              // INTR_CFG[3:2]
-#define kPinIntrTargetShift 5U              // INTR_CFG[12:8]
-#define kPinIntrTargetMask  0x1F00U
+// The interrupt target is INTR_CFG[7:5]: three bits starting at bit 5.
+//
+// The bit comes from the SoC table (.intr_target_bit = 5, pinctrl-sdm660.c:64). The WIDTH does not --
+// PINGROUP (:33-69) sets no .intr_target_width for any sdm660 pin and neither does the SoC record
+// (sdm660_pinctrl, :1707-1715, whose only fields beyond the arrays are .ngpios = 114), and the
+// consumer treats an unset width as "use the default": pinctrl-msm-mainline.c:1054 initialises
+// intr_target_mask to GENMASK(2, 0) and only replaces it at :1090-1091 if the group declares a width.
+// So 3 bits, and the value this driver's own pins should show is .intr_target_kpss_val = 3 (Apps
+// processor).
+//
+// The mask is DERIVED here instead of written out, because round181 wrote it out and got it wrong
+// twice over: it shipped kPinIntrTargetMask = 0x1f00 with shift 5, a mask naming bits [12:8] and a
+// shift naming bit 5, so every tgt= printed on boots 41..102 was bits [12:8] moved down by five -- a
+// number that overlaps no field in the register and cannot be right for any pin. A mask spelled from
+// the shift and the width cannot disagree with them again.
+//
+// The consequence for the published rows is stated where it can be found, not hidden: from v0.7.30
+// the tgt= column means INTR_CFG[7:5]; before v0.7.30 it meant the garbage expression. Nothing is
+// lost either way, because the same row carries the raw cfg= word, so any historical row's target can
+// be re-cut on the host from that row's own bytes.
+#define kPinIntrTargetShift 5U              // .intr_target_bit, pinctrl-sdm660.c:64
+#define kPinIntrTargetWidth 3U              // GENMASK(2, 0): pinctrl-msm-mainline.c:1054
+#define kPinIntrTargetMask  (((1U << kPinIntrTargetWidth) - 1U) << kPinIntrTargetShift)
 #define kPinIntrStatusBit   0x1U            // INTR_STATUS bit 0
-#define kPinIntrRawBit      0x10U           // INTR_STATUS bit 4
+#define kPinIntrRawBit      0x10U           // bit 4: see the caveat below
+// Bit 4 is the one field this layer can prove and cannot use in the same breath.
+// The sources on disk put bit 4 in INTR_CFG, as RAW_STATUS_EN: pinctrl-msm-mainline.c:1120 sets
+// BIT(g->intr_raw_status_bit) into the value it then writes with msm_writel_intr_cfg(), and :876,905
+// clear and set the same bit in the same register from the mask/unmask path. Nothing in either tree
+// reads bit 4 out of INTR_STATUS -- :1336, the only INTR_STATUS read in the interrupt path, tests
+// intr_status_bit (bit 0). So `raw=` on the pin row is bit 4 of the STATUS register wearing the name
+// of a bit documented only in the CFG register (notes/unixnu-doc-conformance.md §11's column-name-and-
+// filling-expression rule). It is not wrong, it is unproven, and the two are not the same thing: the
+// round318 row prints INTR_CFG alongside, so RAW_STATUS_EN -- the enable this SoC's driver actually
+// sets -- is readable, and a pin whose interrupt latched but whose enable was cleared is separable
+// from a pin that never saw an edge.
 
-// Function numbers. pinctrl-sdm660.c:27-38 puts msm_mux_gpio first in every PINGROUP's .funcs, so
-// mux value 0 is GPIO, and the value a function gets is its index in that list. gpio10 and gpio11
-// are PINGROUP(10, NORTH, blsp_spi3, blsp_i2c3, ...) and PINGROUP(11, NORTH, blsp_spi3,
-// blsp_i2c3, ...) -- blsp_i2c3 is the second function after gpio, i.e. mux 2, on both pins.
-// gpio66 and gpio67 have no i2c function at all (PINGROUP(66, NORTH, _, _, qdss_cti1_b, ...) and
-// PINGROUP(67, NORTH, _, _, qdss_gpio0, ...)), which is why the touch reset and interrupt lines
-// are plain GPIOs.
+// Function numbers. The value a pad's mux field holds is the pin's OWN index in its function list,
+// not the SoC-wide function ordinal: pinctrl-msm-mainline.c:187-190 searches g->funcs[] for the
+// requested function and :234-237 writes the loop's index i (val |= i << g->mux_bit), while
+// PINGROUP's .funcs begins with msm_mux_gpio (pinctrl-sdm660.c:39, inside the list at :38-48) -- so
+// mux 0 is GPIO on every pin. The alternative reading is arithmetically impossible here:
+// enum sdm660_functions (:372) has roughly 200 members, blsp_i2c3's ordinal among them is 30, and
+// the mux field this SoC gives a pin is 4 bits wide (mux_bit 2 with nfuncs = 10 -> order_base_2(10)
+// = 4, the width pinctrl-msm-mainline.c:185 computes as GENMASK(mux_bit + order_base_2(nfuncs) - 1,
+// mux_bit)). 30 does not fit in 4 bits; index 2 does.
+//
+// gpio10 and gpio11 are PINGROUP(10, NORTH, blsp_spi3, blsp_i2c3, ...) at :1538 and
+// PINGROUP(11, NORTH, blsp_spi3, blsp_i2c3, ...) at :1540 -- blsp_i2c3 is the second function after
+// gpio, i.e. mux 2, on both pins, which is the value programI2cPins() writes.
+// gpio66 and gpio67 have no i2c function at all (:1643 PINGROUP(66, NORTH, NA, NA, qdss_cti1_b, ...),
+// :1644 PINGROUP(67, NORTH, NA, NA, qdss_gpio0, ...)), which is why the touch reset and interrupt
+// lines are plain GPIOs.
 #define kPinFuncGpio        0U
 #define kPinFuncBlspI2c3    2U
 
@@ -279,6 +322,42 @@
 #define kI2cStatusErrorMask  0x38000fcU
 #define kI2cStatusBusActive   0x100U        // BIT(8)
 #define kI2cStatusWrBufferFull 0x1U         // BIT(0)
+
+// Round318: the two trees disagree about WHICH of these bits is an error at all, and neither
+// disagreement was visible until every bit had a name. MAIN's I2C_STATUS_ERROR_MASK is 0x38000fc
+// (i2c-qup-mainline.c:117); the vendor's own QUP_MSTR_STTS_ERR_MASK is 0x380003c
+// (i2c-msm-v2.h:134) -- the difference is exactly BIT(6) and BIT(7), so a status word with only
+// those two set is a failure to one tree and nothing to the other. Same shape on the core flags:
+// MAIN's QUP_STATUS_ERROR_FLAGS is 0x7c, the vendor's QUP_ERR_FLGS_MASK is 0x3c (i2c-msm-v2.h:164),
+// differing by BIT(6). The names below come from the vendor header, which is the only one of the
+// two that names them at all.
+#define kI2cStatusVendorErrorMask 0x380003cU
+#define kQupCoreVendorErrorMask   0x3cU
+
+// QUP_I2C_STATUS (0x404) fields, i2c-msm-v2.h:121-136, one line per bit with the vendor's own name.
+// Two of them matter more than their names suggest: BIT(26)/BIT(27) are the core's own sense of the
+// SDA and SCL lines, and they are OUTSIDE kI2cStatusErrorMask -- so a reading taken through that
+// mask cannot show a held-low bus, ever, whatever the field is called.
+#define kI2cStatusBusError        0x4U      // QUP_BUS_ERROR        BIT(2)
+#define kI2cStatusPacketNacked    kQupNackFlag  // QUP_PACKET_NACKED  BIT(3), same bit the OPERATIONAL flag uses
+#define kI2cStatusArbLost         0x10U     // QUP_ARB_LOST         BIT(4)
+#define kI2cStatusInvalidWrite    0x20U     // QUP_INVALID_WRITE    BIT(5)
+#define kI2cStatusFailed          0x40U     // QUP_FAILED           BIT(6) -- vendor mask excludes it
+                                            // BIT(7): named in neither tree; printed as residue
+#define kI2cStatusBusMaster       0x200U    // QUP_BUS_MASTER       BIT(9)
+#define kI2cStatusInvalidTag      0x800000U    // QUP_INVALID_TAG      BIT(23)
+#define kI2cStatusInvalidReadAddr 0x1000000U   // QUP_INVALID_READ_ADDR BIT(24)
+#define kI2cStatusInvalidReadSeq  0x2000000U   // QUP_INVALID_READ_SEQ  BIT(25)
+#define kI2cStatusSdaSensor       0x4000000U   // QUP_I2C_SDA           BIT(26): the core sees SDA high
+#define kI2cStatusSclSensor       0x8000000U   // QUP_I2C_SCL           BIT(27): ... and SCL
+
+// QUP_ERROR_FLAGS (0x01c) fields. MAIN names none of them individually; the positions come from the
+// vendor's error-flags-enable enum (i2c-msm-v2.h:150-154), which enables each flag by the same bit.
+#define kCoreInputOverRun   0x4U        // QUP_INPUT_OVER_RUN_ERR_EN   BIT(2)
+#define kCoreOutputUnderRun 0x8U        // QUP_OUTPUT_UNDER_RUN_ERR_EN BIT(3)
+#define kCoreInputUnderRun  0x10U       // QUP_INPUT_UNDER_RUN_ERR_EN  BIT(4)
+#define kCoreOutputOverRun  0x20U       // QUP_OUTPUT_OVER_RUN_ERR_EN  BIT(5)
+                                          // BIT(6): inside MAIN's 0x7c, outside the vendor's 0x3c
 
 #define kQupMxConfigDuringRun 0x80000000U   // BIT(31): reprogram the counters while RUNNING
 #define kQupMaxTagsLen        4U            // START + 2-byte address + DATA* + length

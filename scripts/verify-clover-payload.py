@@ -533,7 +533,18 @@ CLOVER_INPUT = (("input round stamp", "clover r181:"),
                 ("declared geometry", "declared qup=%llx size=%u dt_size=%u gcc=%llx+%u intid=%u"),
                 ("goodix candidate", "goodix gt9xx @5d"),
                 ("focaltech candidate", "edt/focaltech @38"),
-                ("no-answer reading", "no address ACKed; rails unproven, sda=%08x scl=%08x status=%08x op=%08x"))
+                ("no-answer reading", "no address ACKed; rails unproven, sda=%08x scl=%08x status=%08x op=%08x"),
+                # Round318 turns the masked bus= column's blind spot into a reading: the raw
+                # I2C_STATUS and ERROR_FLAGS words are printed once per segment with the layer's
+                # decode beside them, and the verdict class the failure branches key on. These two
+                # format strings are the whole instrument -- if the rewire dropped a field, the
+                # payload would still boot and the row would still print.
+                ("r318 raw segment row",
+                 "clover r318: xfer %s class=%s status=%08x err=%08x vend=%08x res=%08x "
+                 "sda=%u scl=%u op=%08x t=%ums"),
+                ("r318 core row",
+                 "clover r318: core %s class=%s flags=%08x err=%08x vend=%08x res=%08x "
+                 "iovr=%u ouvr=%u iur=%u oovr=%u"))
 
 
 def check_clover_input(kernel: bytes) -> bool:

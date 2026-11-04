@@ -216,7 +216,15 @@ self-ipi 三枚，护住挂死的是 `clover-unattended=1800`，`:2597`）、以
    **r317 结掉三分之二**：`CloverGpu` 的每一枚「从字里读出一个判断」进了 `GpuCore.h`（LDO 普查、
    PWRSWITCH_CTRL／VREF／STATUS 解码、GDSC 写序列、分支 request/halt、AHB 门、chipid 门、L1 角选择），
    13 组宿主模型由 `scripts/test-clover-gpu.py` 编译并**运行**，同一面三式（存在／被调用／无第二副本）
-   由 `check-clover.py` 的 `# Round317.` 那一段把住。剩 `CloverInput` 一颗。
+   由 `check-clover.py` 的 `# Round317.` 那一段把住。**r318 结掉最后三分之一**：`CloverInput` 的
+   QUP v2 tag 算术、两个 FIFO 游标、每笔的 CONFIG 与 done 掩码、三处针脚裁切、RCG 词、五个判决类与
+   Goodix/FocalTech 身份解码进了 `InputCore.h`（885 行，只含 `<stdint.h>` 与 `InputRegs.h`），15 组
+   263 检查由 `scripts/test-clover-input.py` 编译并**运行**，同一面三式由 `check-clover.py` 的
+   `# Round318.` 那一段把住（层内 10 条 needle、驱动 48 枚调用、`.cpp` 14 枚第二副本归零），并且闸门对
+   这颗模型做过红/绿自证（前置 `sys.exit(1)` 让闸门红，恢复后绿）。**未结 3 至此关闭**：三颗驱动全部
+   交出纯层 + 由闸门运行的宿主模型。同一轮量出的一格属于仪器债而不是符合性——r181 的 pin 行把
+   INTR_CFG 的 target 裁成 `0x1f00 @ shift 5`（位 [12:8]），与寄存器里任何字段都不重叠；r318 改成
+   bit 5 起 3 位并由 shift/width 派生掩码，历史帧仍可凭同行 `cfg=` 原字在宿主上重裁。
 4. `docs/drivers/uefi-drivers.md:7-13` 那一层的对照（`.inf` / DSC / FDF / `args` 载入选项）在固件仓
    `uefi-clover`，本轮未动，同一套办法搬过去即可。
 

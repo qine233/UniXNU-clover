@@ -3469,6 +3469,18 @@ def check_board(errors: list) -> str:
             errors.append("the r317 verdict is not exempt from the per-pass push cap: it prints from the "
                           "same GPU timer as r286/r290/r291/r294/r311, and \"list-never-written\" versus "
                           "\"dead-page\" is the distinction this line has been circling since boot 77")
+        # Round318's two rows are one segment's reading -- the raw I2C_STATUS/ERROR_FLAGS words and the
+        # layer's decode of them -- so they are pinned in the same two places for the same reason. The
+        # sharper half is that round181's bus= column was the masked word: a cap that kept the decoded
+        # row and ate the raw one would put the SDA/SCL blind spot back into the boot report.
+        if '{ "clover r318: ", "r318-input", 32, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the round318 segment rows: an unbudgeted "
+                          "producer drops the raw status words, and a boot showing only the decode reads "
+                          "like a bus whose lines were never sampled")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r318")' not in sdhci_source:
+            errors.append("the r318 rows are not exempt from the per-pass push cap: the pair is one "
+                          "reading, and keeping the decoded row while dropping the raw one restores "
+                          "exactly the blind spot round318 exists to remove")
         # Round313 boots drivers/CloverPower for the first time. The report is one burst in the PMGR tail
         # and it is printed under two tokens -- round313's new lines and the round182 lines that keep
         # their origin stamp -- so both halves need their own budget and their own exemption, or the half
@@ -5889,13 +5901,15 @@ def check_board(errors: list) -> str:
                       "with it the only reading of blsp_i2c3, would not exist")
     else:
         text = touch.read_text()
+        # Round318 moved the tag bytes, the step codes and the status masks into InputCore.h, so what
+        # this block pins about the driver is the *call*, and the bytes themselves are pinned in the
+        # Round318 gate below -- a needle left here would be asserting a copy that no longer exists.
         missing = [needle for needle in
                    ("qupWrite (kQupSwReset, 1);",
-                    "clover_input_observation[15] = kStepResetCore",
                     "qupWrite (kQupI2cClkCtl, kQupI2cClk400k);",
                     "uint8_t tags[kQupMaxTagsLen]",
-                    "(address << 1) | 1",
-                    "kQupTagV2DataRdStop",
+                    "input_read_tags (address, outLen, tags, sizeof (tags))",
+                    "input_write_tags (address, regLen, outLen ? 0 : 1, wire, sizeof (wire))",
                     "return finishTransfer ();",
                     "extern \"C\" void clover_input_run (void)",
                     "PE_parse_boot_argn (\"clover-input\"",
@@ -5913,6 +5927,110 @@ def check_board(errors: list) -> str:
         if "kQupMxInputCnt, txLen" in text or "qupWrite (kQupMxOutputCnt, rxLen" in text:
             errors.append("CloverInput puts a tag vector in the wrong FIFO: both counter registers "
                           "are written from the output side, and only MX_READ_CNT adds rx_tag_len")
+
+        # Round318. Conformance §7 gap 3, the last of the three drivers: every bit-field, verdict
+        # class, tag byte, cursor, bound and unit conversion the touch instrument reads or decides is
+        # now in InputCore.h, and tests/clover_input_host.cpp runs it without a board. The failure
+        # mode of a split like this is a second copy left behind in the driver, so all three faces are
+        # asserted: (a) the layer still contains each decision, (b) the driver calls each of them,
+        # (c) the driver no longer contains the expression it used to.
+        input_core = REPO / "drivers/CloverInput/InputCore.h"
+        if not input_core.is_file():
+            errors.append("drivers/CloverInput/InputCore.h is missing: the touch instrument's pin "
+                          "decode, its INTR_CFG cut, its verdict classes and its tag bytes would be "
+                          "provable only on a bus that cannot answer")
+        else:
+            core_text = input_core.read_text()
+            missing = [needle for needle in
+                       ("return index < kInputBlkSizeCount ? kInputBlkSizes[index] : 0;",
+                        "if (rx->tag_left) {",
+                        "input_tag_len_field(reg_len) < 0",
+                        "if (!(op & want) || got != rx_len || sent != tx_len) {",
+                        "if (input_xfer_is_nack(bus_err)) {",
+                        "return input_core_mode_word() | (reads ? 0u : kQupNoInput);",
+                        "out->residue = out->mainline_error & ~(named & kI2cStatusErrorMask);",
+                        "out->residue = out->mainline_error & ~(named & kQupStatusErrorFlags);",
+                        "(ctl & (kPinDrvMask << kPinDrvShift)) >> kPinDrvShift",
+                        "return (word & kCbcrClkOff) && input_branch_fsm(word) != kCbcrFsmOn;")
+                       if needle not in core_text]
+            for needle in missing:
+                errors.append(f"drivers/CloverInput/InputCore.h lacks {needle!r}: this is a field cut "
+                              "or a verdict the host model proves and the board cannot -- losing it "
+                              "would be a log line that still prints and no longer means anything")
+            for needle in ("input_rcg_decode (", "input_branch_running (", "input_branch_halted (",
+                           "input_branch_enable_word (", "input_ahb_voted (",
+                           "input_ahb_vote_word (", "input_rcg_xo_cfg (", "input_rcg_update_word (",
+                           "input_rcg_update_pending (", "input_i2c_pin_ctl (",
+                           "input_pin_output_io (", "input_pin_output_ctl (",
+                           "input_pin_input_ctl (", "input_pin_drive_ctl (", "input_pin_decode (",
+                           "input_state_reset_done (", "input_core_tags_taken (",
+                           "input_state_reached (", "input_core_mode_word (", "input_core_config (",
+                           "input_fifo_sizes (", "input_counters (", "input_tx_reset (",
+                           "input_tx_next (", "input_tx_room_left (", "input_rx_reset (",
+                           "input_rx_needs_word (", "input_rx_word (", "input_rx_pop (",
+                           "input_rx_complete (", "input_done_mask (", "input_read_request_ok (",
+                           "input_write_tags (", "input_read_tags (", "input_xfer_verdict (",
+                           "input_xfer_verdict_name (", "input_xfer_is_nack (",
+                           "input_bus_status_decode (", "input_core_flags_decode (",
+                           "input_verdict_code (", "input_goodix_identify (",
+                           "input_bytes_agree (", "input_goodix_sensor_id_valid (",
+                           "input_ft_is_m06 (", "input_ticks_per_ms (", "input_ticks_for_ms (",
+                           "input_elapsed_ms ("):
+                if needle not in text:
+                    errors.append(f"drivers/CloverInput/CloverInput.cpp does not call {needle!r}: the "
+                                  "pure layer would be dead code the model passes and the kernel ignores")
+            # A second copy is the failure mode. Each of these was the driver's own expression
+            # before round318; any one of them back in the driver means the board runs arithmetic
+            # the model never proved.
+            for gone in ("kStepAhbVote", "kFailPoll", "kQupStatusErrorFlags", "kI2cStatusErrorMask",
+                         "kQupNackFlag", "kGtPidValidMax", "(address << 1) | 1", "kQupTagV2DataRdStop",
+                         "kQupTagV2DataWrStop", "(cfg & kPinIntrTargetMask)", "kRcgCfgWritable",
+                         "kBlkSizes", "(drive + 1u) * 2u", "seg.first ? 0u : kQupMxConfigDuringRun"):
+                if gone in text:
+                    errors.append(f"drivers/CloverInput/CloverInput.cpp still carries a second copy of "
+                                  f"{gone!r}: the shipped path and the modelled path would be two "
+                                  "answers to one question")
+            if '#include "InputRegs.h"' not in core_text:
+                errors.append("InputCore.h does not include InputRegs.h: without it the layer would "
+                              "have to re-type every register constant the board acts on")
+            if "NULL" in core_text:
+                errors.append("InputCore.h uses NULL: the header is included before anything that "
+                              "defines it on this build, so the check is a literal 0")
+            # The new r318 rows and the image that carries them: a reader of boot 103's log must not
+            # look for these fields in an older frame.
+            for needle in ("clover r318: xfer %s class=%s status=%08x err=%08x vend=%08x res=%08x "
+                           "sda=%u scl=%u ",
+                           "clover r318: core %s class=%s flags=%08x err=%08x vend=%08x res=%08x "):
+                if needle not in text:
+                    errors.append(f"drivers/CloverInput/CloverInput.cpp lacks the r318 row {needle!r}: "
+                                  "the raw status word and SDA/SCL would stay unreadable, because the "
+                                  "r181 bus= column is the masked word by construction")
+            harness = REPO / "drivers/CloverInput/tests/clover_input_host.cpp"
+            runner = next((base / "scripts/test-clover-input.py"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "scripts/test-clover-input.py").is_file()), None)
+            if runner is None:
+                errors.append("scripts/test-clover-input.py is missing: the pin cut, the verdict "
+                              "classes and the FIFO cursors would be proven only on a bus that has "
+                              "never ACKed")
+            elif not harness.is_file():
+                errors.append("drivers/CloverInput/tests/clover_input_host.cpp is missing: the host "
+                              "model has nothing to drive InputCore.h against")
+            else:
+                model = harness.read_text()
+                for needle in ("kInputXferNack", "kInputXferBusError", "kInputXferCoreError",
+                               "kInputXferIncomplete", "kInputStepResetCore", "kInputFailXfer",
+                               "input_bus_status_decode", "input_core_flags_decode",
+                               "input_goodix_identify", "kPinIntrTargetMask"):
+                    if needle not in model:
+                        errors.append(f"the CloverInput host model never exercises {needle}: a "
+                                      "refusal or a field cut the board can only reach at boot is "
+                                      "a decision nobody has seen fire")
+                check = subprocess.run([sys.executable, str(runner)], capture_output=True, text=True)
+                if check.returncode:
+                    errors.append("the CloverInput host model failed: a field cut, a verdict class, "
+                                  "a FIFO cursor or a tag byte is not what this boot's report will "
+                                  "claim it is\n" + (check.stdout + check.stderr)[-700:])
 
     # Round182, drivers/CloverPower. Two different things are asserted here, and both are things a
     # driver that still compiles can silently lose. First, the v5 transaction shape: the command word
@@ -6418,8 +6536,8 @@ def check_board(errors: list) -> str:
     # function of the arbiter's own version word, and that driver has never been in a boot whose title
     # named it, because clover-power has always been commented out. Its new lines are stamped r313 and
     # the round182 lines keep their origin stamp, which is the reason the tee now budgets both tokens.
-    if not board["payload"]["title"].startswith("clover r317:"):
-        errors.append('[payload] title is not "clover r317: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r318:"):
+        errors.append('[payload] title is not "clover r318: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7564,8 +7682,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r317:"):
-        errors.append('[payload] title is not "clover r317: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r318:"):
+        errors.append('[payload] title is not "clover r318: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

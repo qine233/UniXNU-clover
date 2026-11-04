@@ -117,6 +117,10 @@
 #include <kern/debug.h>
 #include <stdarg.h>
 #include "InputRegs.h"
+// The bus-free layer: every bit-field, verdict class, tag byte, cursor and unit conversion this
+// driver uses lives there, along with the host model (tests/clover_input_host.cpp) that runs them
+// without a board. Round318; notes/unixnu-doc-conformance.md §7 gap 3.
+#include "InputCore.h"
 
 extern "C" {
 // drivers/CloverSdhci's commit of both log rings to the card. At this scheduling point the block
@@ -227,14 +231,12 @@ static inline uint64_t counterFrequency (void)
   return value;
 }
 
-static uint64_t gTicksPerMs = 19200ULL;   // the XO default; refreshed at bring-up
+static uint64_t gTicksPerMs = input_ticks_per_ms (kXoHz);   // the XO default; refreshed at bring-up
 
+// The sanity window and the XO fallback are the layer's; this function only fetches the register.
 static void refreshTicksPerMs (void)
 {
-  const uint64_t frequency = counterFrequency ();
-  if (frequency >= 1000000ULL && frequency <= 1000000000ULL) {
-    gTicksPerMs = frequency / 1000ULL;
-  }
+  gTicksPerMs = input_ticks_per_ms (counterFrequency ());
 }
 
 // Busy wait. Nothing sleeps here: at this point in the boot a thread switch is not available to
@@ -243,7 +245,7 @@ static void refreshTicksPerMs (void)
 static void waitMs (uint32_t ms)
 {
   const uint64_t start = readCounter ();
-  const uint64_t want = static_cast<uint64_t> (ms) * gTicksPerMs;
+  const uint64_t want = input_ticks_for_ms (ms, gTicksPerMs);
   while (readCounter () - start < want) {
     __asm__ volatile ("yield" ::: "memory");
   }
@@ -262,11 +264,8 @@ static void waitMs (uint32_t ms)
 volatile uint64_t clover_input_observation[16];
 
 // A one-word verdict code, so the ring line and the observation array cannot disagree about which
-// step stopped. Positive values are steps, negative values are the two ways a step can fail.
-static const uint64_t kStepAhbVote = 1, kStepRcgUpdate = 2, kStepBranch = 3, kStepPins = 4,
-                      kStepResetCore = 5, kStepMasterGen = 6, kStepRun = 7, kStepPause = 8,
-                      kStepClk = 9;
-static const uint64_t kFailMap = 100, kFailPoll = 101, kFailXfer = 102;
+// step stopped. Positive values are steps, negative values are the two ways a step can fail. The
+// numbers and their names both live in InputCore.h (round318); this file has no copy of them.
 
 // ------------------------------------------------------------------ mode 1: what is the state?
 //
@@ -279,53 +278,43 @@ static void dumpClocks (void)
   const uint32_t branch = windowRead (gI2cClock, kGccI2cBranchOff);
   const uint32_t cmd = windowRead (gI2cClock, kGccI2cCmdOff);
   const uint32_t cfg = windowRead (gI2cClock, kGccI2cCfgOff);
-  const uint32_t src = (cfg & kRcgCfgSrcMask) >> kRcgCfgSrcShift;
-  const uint32_t div = cfg & kRcgCfgDivMask;
   // Only the rows this RCG's frequency table can be left in are named. Anything else prints the
-  // selector and stops, rather than inventing a rate.
-  uint64_t hz = 0;
-  const char *parent = "unknown";
-  if (src == kRcgSrcXo) {
-    parent = "xo";
-    hz = kXoHz / (div ? div : 1);
-  } else if (src == kRcgSrcGpll0 || src == kRcgSrcGpll0Early) {
-    parent = (src == kRcgSrcGpll0) ? "gpll0" : "gpll0_early_div";
-    hz = div ? (kGpll0Hz / div) : 0;
-  }
+  // selector and stops, rather than inventing a rate -- and that refusal is the layer's, not a
+  // half-remembered branch here.
+  struct InputRcg rcg;
+  input_rcg_decode (cfg, &rcg);
   IOLog ("clover r181: gcc vote=%08x ahb_halt=%08x i2c_branch=%08x\n",
          ahbVote, ahbHalt, branch);
   IOLog ("clover r181: rcg cmd=%08x cfg=%08x src=%u div=%u mode=%u hw=%u\n",
-         cmd, cfg, src, div, (cfg & kRcgCfgModeMask) >> kRcgCfgModeShift,
-         (cfg & kRcgCfgHwCtrl) ? 1u : 0u);
+         cmd, cfg, rcg.src, rcg.div, rcg.mode, rcg.hw_ctrl ? 1u : 0u);
   IOLog ("clover r181: apps clk parent=%s hz=%llu branch_on=%u ahb_on=%u\n",
-         parent, static_cast<unsigned long long> (hz),
-         ((branch & kCbcrClkOff) == 0 || ((branch & kCbcrFsmMask) >> kCbcrFsmShift) == kCbcrFsmOn) ? 1u : 0u,
-         ((ahbHalt & kCbcrClkOff) == 0 || ((ahbHalt & kCbcrFsmMask) >> kCbcrFsmShift) == kCbcrFsmOn) ? 1u : 0u);
+         rcg.parent, static_cast<unsigned long long> (rcg.hz),
+         input_branch_running (branch) ? 1u : 0u,
+         input_branch_running (ahbHalt) ? 1u : 0u);
 }
 
 // One decoded line per pin, in the same order pinctrl-msm.c's debug print gives: direction,
 // function, level, drive, bias. The values are this SoC's own encodings -- drive reg value r is
-// (r+1)*2 mA, bias 0 none / 1 down / 2 keeper / 3 up (pinctrl-msm.c:320-324,470-473).
+// (r+1)*2 mA, bias 0 none / 1 down / 2 keeper / 3 up -- and every one of those cut-and-name
+// decisions is InputCore.h's input_pin_decode, so the row and the host model read the same field.
 static void dumpPin (uint32_t pin, const char *label)
 {
   const uint32_t ctl = pinRead (pin, kPinCtl);
   const uint32_t io = pinRead (pin, kPinIo);
   const uint32_t cfg = pinRead (pin, kPinIntrCfg);
   const uint32_t status = pinRead (pin, kPinIntrStatus);
-  const uint32_t mux = (ctl & kPinMuxMask) >> kPinMuxShift;
-  const uint32_t pull = ctl & kPinPullMask;
-  const uint32_t drive = (ctl & (kPinDrvMask << kPinDrvShift)) >> kPinDrvShift;
+  struct InputPinState state;
+  input_pin_decode (ctl, io, cfg, status, &state);
   IOLog ("clover r181: pin %u %s ctl=%08x io=%08x mux=%u oe=%u in=%u out=%u drv=%u mA pull=%u\n",
-         pin, label, ctl, io, mux, (ctl >> kPinOeBit) & 1u, (io >> kPinInBit) & 1u,
-         (io >> kPinOutBit) & 1u, (drive + 1u) * 2u, pull);
+         pin, label, ctl, io, state.mux, state.oe, state.in_level, state.out_level,
+         state.drive_ma, state.pull);
   IOLog ("clover r181: pin %u intr cfg=%08x status=%08x tgt=%u det=%u pol=%u en=%u raw=%u\n",
-         pin, cfg, status, (cfg & kPinIntrTargetMask) >> kPinIntrTargetShift,
-         (cfg >> kPinIntrDetectShift) & 3u, (cfg & kPinIntrPolarity) ? 1u : 0u,
-         (cfg & kPinIntrEnable) ? 1u : 0u, (status & kPinIntrRawBit) ? 1u : 0u);
+         pin, cfg, status, state.intr_target, state.intr_detect, state.intr_polarity,
+         state.intr_enable, state.intr_raw);
 }
 
 // The core's own state: what version, what the boot left in the counters, and what the FIFOs are.
-// The block/FIFO depth is derived exactly the way the driver does it (i2c-qup.c:1856-1890):
+// The block/FIFO depth is the layer's input_fifo_sizes, which reproduces i2c-qup.c:1856-1890 --
 // out_blk_sz = blk_sizes[QUP_OUTPUT_BLOCK_SIZE(io_mode)], out_fifo_sz = out_blk_sz * (2 << size).
 static uint32_t gOutFifoSize = 0;
 static uint32_t gInFifoSize = 0;
@@ -333,13 +322,7 @@ static uint32_t gInFifoSize = 0;
 static void dumpQup (const char *when)
 {
   const uint32_t ioMode = qupRead (kQupIoMode);
-  static const uint32_t kBlkSizes[3] = { 4, 16, 32 };
-  const uint32_t outBlkIdx = kQupOutBlockSize (ioMode);
-  const uint32_t inBlkIdx = kQupInBlockSize (ioMode);
-  const uint32_t outBlk = outBlkIdx < 3 ? kBlkSizes[outBlkIdx] : 0;
-  const uint32_t inBlk = inBlkIdx < 3 ? kBlkSizes[inBlkIdx] : 0;
-  gOutFifoSize = outBlk * (2u << kQupOutFifoSize (ioMode));
-  gInFifoSize = inBlk * (2u << kQupInFifoSize (ioMode));
+  input_fifo_sizes (ioMode, &gOutFifoSize, &gInFifoSize);
   clover_input_observation[2] = qupRead (kQupHwVersion);
   clover_input_observation[3] = ioMode;
   IOLog ("clover r181: qup %s hw=%08x state=%08x cfg=%08x io=%08x op=%08x\n",
@@ -363,28 +346,28 @@ static void dumpQup (const char *when)
 static bool voteAhb (void)
 {
   const uint32_t before = windowRead (gAhbVote, kGccAhbVoteOff);
-  if (before & (1u << kAhbVoteBit)) {
+  if (input_ahb_voted (before)) {
     IOLog ("clover r181: ahb already voted %08x\n", before);
   } else {
-    windowWrite (gAhbVote, kGccAhbVoteOff, before | (1u << kAhbVoteBit));
+    windowWrite (gAhbVote, kGccAhbVoteOff, input_ahb_vote_word (before));
   }
   // BRANCH_HALT_VOTED: clk_branch_wait() polls the halt register of 0x17004, not the vote
   // register of 0x52004, and accepts either polarity of CLK_OFF or the NOC FSM saying "on".
   const uint32_t haltPhys = windowRead (gAhbHalt, kGccAhbHaltOff);
   uint32_t halt = haltPhys;
   uint64_t spins = 0;
-  while ((halt & kCbcrClkOff) && ((halt & kCbcrFsmMask) >> kCbcrFsmShift) != kCbcrFsmOn) {
+  while (input_branch_halted (halt)) {
     if (++spins >= kCbcrSpin) {
       IOLog ("clover r181: ahb halt stuck %08x vote=%08x->%08x\n",
              halt, before, windowRead (gAhbVote, kGccAhbVoteOff));
-      clover_input_observation[15] = kStepAhbVote * 1000 + kFailPoll;
+      clover_input_observation[15] = input_verdict_code (kInputStepAhbVote, kInputFailPoll);
       return false;
     }
     halt = windowRead (gAhbHalt, kGccAhbHaltOff);
   }
   IOLog ("clover r181: ahb halt=%08x vote %08x->%08x spins=%u\n",
          halt, before, windowRead (gAhbVote, kGccAhbVoteOff), static_cast<unsigned> (spins));
-  clover_input_observation[15] = kStepAhbVote;
+  clover_input_observation[15] = kInputStepAhbVote;
   return true;
 }
 
@@ -396,44 +379,44 @@ static bool voteAhb (void)
 static bool programRcg (void)
 {
   const uint32_t cfgBefore = windowRead (gI2cClock, kGccI2cCfgOff);
-  const uint32_t cfg = (cfgBefore & ~(kRcgCfgWritable | kRcgCfgSrcMask)) | kRcgDiv1 |
-                       (kRcgSrcXo << kRcgCfgSrcShift);
+  const uint32_t cfg = input_rcg_xo_cfg (cfgBefore);
   windowWrite (gI2cClock, kGccI2cCfgOff, cfg);
   const uint32_t cmdBefore = windowRead (gI2cClock, kGccI2cCmdOff);
-  windowWrite (gI2cClock, kGccI2cCmdOff, cmdBefore | kRcgCmdUpdate);
+  windowWrite (gI2cClock, kGccI2cCmdOff, input_rcg_update_word (cmdBefore));
   uint32_t cmd = windowRead (gI2cClock, kGccI2cCmdOff);
   uint64_t spins = 0;
-  while (cmd & kRcgCmdUpdate) {
+  while (input_rcg_update_pending (cmd)) {
     if (++spins >= kRcgUpdateSpin) {
       IOLog ("clover r181: rcg update stuck cmd=%08x cfg %08x->%08x\n",
              cmd, cfgBefore, windowRead (gI2cClock, kGccI2cCfgOff));
-      clover_input_observation[15] = kStepRcgUpdate * 1000 + kFailPoll;
+      clover_input_observation[15] = input_verdict_code (kInputStepRcgUpdate, kInputFailPoll);
       return false;
     }
     cmd = windowRead (gI2cClock, kGccI2cCmdOff);
   }
   IOLog ("clover r181: rcg cfg %08x->%08x cmd=%08x cleared spins=%u\n",
          cfgBefore, windowRead (gI2cClock, kGccI2cCfgOff), cmd, static_cast<unsigned> (spins));
-  clover_input_observation[15] = kStepRcgUpdate;
+  clover_input_observation[15] = kInputStepRcgUpdate;
   return true;
 }
 
 static bool enableBranch (void)
 {
   const uint32_t before = windowRead (gI2cClock, kGccI2cBranchOff);
-  windowWrite (gI2cClock, kGccI2cBranchOff, before | kCbcrEnable);
+  windowWrite (gI2cClock, kGccI2cBranchOff, input_branch_enable_word (before));
   uint32_t halt = before;
   uint64_t spins = 0;
-  while ((halt & kCbcrClkOff) && ((halt & kCbcrFsmMask) >> kCbcrFsmShift) != kCbcrFsmOn) {
+  while (input_branch_halted (halt)) {
     if (++spins >= kCbcrSpin) {
-      IOLog ("clover r181: branch stuck %08x wrote %08x\n", halt, before | kCbcrEnable);
-      clover_input_observation[15] = kStepBranch * 1000 + kFailPoll;
+      IOLog ("clover r181: branch stuck %08x wrote %08x\n", halt,
+             input_branch_enable_word (before));
+      clover_input_observation[15] = input_verdict_code (kInputStepBranch, kInputFailPoll);
       return false;
     }
     halt = windowRead (gI2cClock, kGccI2cBranchOff);
   }
   IOLog ("clover r181: branch %08x->%08x spins=%u\n", before, halt, static_cast<unsigned> (spins));
-  clover_input_observation[15] = kStepBranch;
+  clover_input_observation[15] = kInputStepBranch;
   return true;
 }
 
@@ -447,14 +430,12 @@ static void programI2cPins (void)
   for (uint32_t i = 0; i < 2; i++) {
     const uint32_t pin = 10u + i;
     const uint32_t ctl = pinRead (pin, kPinCtl);
-    const uint32_t next = (ctl & ~(kPinMuxMask | kPinPullMask | (kPinDrvMask << kPinDrvShift))) |
-                          (kPinFuncBlspI2c3 << kPinMuxShift) | (kPinDrv2mA << kPinDrvShift) |
-                          kPinPullNone;
+    const uint32_t next = input_i2c_pin_ctl (ctl);
     pinWrite (pin, kPinCtl, next);
     IOLog ("clover r181: pin %u i2c ctl %08x->%08x io=%08x\n",
            pin, ctl, pinRead (pin, kPinCtl), pinRead (pin, kPinIo));
   }
-  clover_input_observation[15] = kStepPins;
+  clover_input_observation[15] = kInputStepPins;
 }
 
 // The reset sequence's own pin states. Following the vendor driver's ordering:
@@ -466,15 +447,15 @@ static void programI2cPins (void)
 static void pinOutput (uint32_t pin, uint32_t level)
 {
   const uint32_t io = pinRead (pin, kPinIo);
-  pinWrite (pin, kPinIo, level ? (io | (1u << kPinOutBit)) : (io & ~(1u << kPinOutBit)));
+  pinWrite (pin, kPinIo, input_pin_output_io (io, level));
   const uint32_t ctl = pinRead (pin, kPinCtl);
-  pinWrite (pin, kPinCtl, (ctl & ~kPinMuxMask) | (1u << kPinOeBit));
+  pinWrite (pin, kPinCtl, input_pin_output_ctl (ctl));
 }
 
 static void pinInput (uint32_t pin)
 {
   const uint32_t ctl = pinRead (pin, kPinCtl);
-  pinWrite (pin, kPinCtl, (ctl & ~kPinMuxMask) & ~(1u << kPinOeBit));
+  pinWrite (pin, kPinCtl, input_pin_input_ctl (ctl));
 }
 
 // The mini-core, in qup_i2c_xfer_v2()'s and qup_i2c_probe()'s order: SW_RESET and wait for the
@@ -492,23 +473,23 @@ static bool bringUpCore (void)
   qupWrite (kQupSwReset, 1);
   uint64_t spins = 0;
   uint32_t state = qupRead (kQupState);
-  while ((state & kQupStateMask) != kQupStateReset || !(state & kQupStateValid)) {
+  while (!input_state_reset_done (state)) {
     if (++spins >= kCbcrSpin) {
       IOLog ("clover r181: sw_reset stuck state=%08x\n", state);
-      clover_input_observation[15] = kStepResetCore * 1000 + kFailPoll;
+      clover_input_observation[15] = input_verdict_code (kInputStepResetCore, kInputFailPoll);
       return false;
     }
     state = qupRead (kQupState);
   }
-  qupWrite (kQupConfig, kI2cMiniCore | kI2cNValV2);
+  qupWrite (kQupConfig, input_core_mode_word ());
   qupWrite (kQupI2cMasterGen, kQupV2TagsEn);
   spins = 0;
   state = qupRead (kQupState);
-  while (!(state & kQupI2cMastGen) || !(state & kQupStateValid)) {
+  while (!input_core_tags_taken (state)) {
     if (++spins >= kCbcrSpin) {
       IOLog ("clover r181: mast_gen stuck state=%08x gen=%08x\n",
              state, qupRead (kQupI2cMasterGen));
-      clover_input_observation[15] = kStepMasterGen * 1000 + kFailPoll;
+      clover_input_observation[15] = input_verdict_code (kInputStepMasterGen, kInputFailPoll);
       return false;
     }
     state = qupRead (kQupState);
@@ -516,7 +497,7 @@ static bool bringUpCore (void)
   qupWrite (kQupMxOutputCnt, 0);
   qupWrite (kQupMxInputCnt, 0);
   qupWrite (kQupIoMode, kQupRepackEn);
-  clover_input_observation[15] = kStepResetCore;
+  clover_input_observation[15] = kInputStepResetCore;
   return true;
 }
 
@@ -530,10 +511,10 @@ static bool changeState (uint32_t want, const char *label, uint64_t step)
   qupWrite (kQupState, want);
   uint64_t spins = 0;
   uint32_t state = qupRead (kQupState);
-  while ((state & kQupStateMask) != want || !(state & kQupStateValid)) {
+  while (!input_state_reached (state, want)) {
     if (++spins >= kCbcrSpin) {
       IOLog ("clover r181: state %s=%u stuck %08x\n", label, want, state);
-      clover_input_observation[15] = step * 1000 + kFailPoll;
+      clover_input_observation[15] = input_verdict_code (step, kInputFailPoll);
       return false;
     }
     state = qupRead (kQupState);
@@ -564,46 +545,30 @@ static uint32_t gXfersNack = 0;
 
 // Push whole words, low byte first, into the output FIFO. A short final word is written with its
 // unused bytes zero, which is what upstream's send_last_word does, and the counter written to
-// MX_WRITE_CNT tells the hardware how many of those bytes are real.
-static void pushTx (const uint8_t *bytes, uint32_t len, uint32_t *sent, uint32_t room)
+// MX_WRITE_CNT tells the hardware how many of those bytes are real. The cursor -- how far the
+// message has got and how much FIFO room is left to write into -- is InputTx's.
+static void pushTx (struct InputTx *tx, const uint8_t *bytes, uint32_t len)
 {
-  while (*sent < len && room >= 4) {
-    uint32_t chunk = len - *sent;
-    if (chunk > 4) {
-      chunk = 4;
-    }
-    uint32_t word = 0;
-    for (uint32_t i = 0; i < chunk; i++) {
-      word |= static_cast<uint32_t> (bytes[*sent + i]) << (i * 8);
-    }
+  uint32_t word = 0;
+  while (input_tx_next (tx, bytes, len, &word)) {
     qupWrite (kQupOutFifoBase, word);
-    *sent += chunk;
-    room -= 4;
   }
 }
 
 // Drain the input FIFO level-gated, the way round98 learned to drain the eMMC FIFO: a byte is only
 // taken when the hardware says a word is buffered, so this can never read past what arrived. The
-// first kQupRxTagLen bytes of a read are the tags the core echoes back, and are dropped.
-static void drainRx (uint8_t *out, uint32_t len, uint32_t *got, uint32_t *tagLeft,
-                     uint32_t *word, uint32_t *wordLeft)
+// first kQupRxTagLen bytes of a read are the tags the core echoes back, and are dropped -- by
+// input_rx_pop, not here, so the tag count and the drop cannot drift apart.
+static void drainRx (struct InputRx *rx, uint8_t *out)
 {
-  while (*got < len) {
-    if (*wordLeft == 0) {
+  while (!input_rx_complete (rx)) {
+    if (input_rx_needs_word (rx)) {
       if (!(qupRead (kQupOperational) & kQupInNotEmpty)) {
         return;
       }
-      *word = qupRead (kQupInFifoBase);
-      *wordLeft = 4;
+      input_rx_word (rx, qupRead (kQupInFifoBase));
     }
-    const uint8_t byte = static_cast<uint8_t> (*word & 0xff);
-    *word >>= 8;
-    (*wordLeft)--;
-    if (*tagLeft) {
-      (*tagLeft)--;
-      continue;
-    }
-    out[(*got)++] = byte;
+    input_rx_pop (rx, out);   // a tag byte returns 0 and still consumes its position
   }
 }
 
@@ -611,62 +576,68 @@ static bool runSegment (const Segment &seg, const char *why)
 {
   // config_run: the first sub-transfer programs the counters normally, a later one sets BIT(31)
   // to say "reprogram while RUNNING" -- the mechanism that makes a repeated start possible without
-  // releasing the bus.
-  const uint32_t configRun = seg.first ? 0u : kQupMxConfigDuringRun;
-  const uint32_t rxTotal = seg.rxLen ? kQupRxTagLen + seg.rxLen : 0;
-  uint32_t config = kI2cMiniCore | kI2cNValV2;
-  if (!rxTotal) {
-    config |= kQupNoInput;
+  // releasing the bus. Both counters and the CONFIG word come from the layer, so the read count and
+  // the "this transfer reads nothing" bit are derived from the same two lengths.
+  struct InputCounters counters;
+  input_counters (seg.txLen, seg.rxLen, seg.first ? 1 : 0, &counters);
+  qupWrite (kQupMxWriteCnt, counters.write_cnt);
+  if (counters.has_read) {
+    qupWrite (kQupMxReadCnt, counters.read_cnt);
   }
-  qupWrite (kQupMxWriteCnt, configRun | seg.txLen);
-  if (rxTotal) {
-    qupWrite (kQupMxReadCnt, configRun | rxTotal);
-  }
-  qupWrite (kQupConfig, config);
+  qupWrite (kQupConfig, input_core_config (seg.rxLen != 0));
 
   if (seg.first) {
     // RUN, program the bit clock, back to PAUSE: i2c-qup.c:1500-1505. The divisor only takes
     // effect while running, and the pause is what holds the bus between sub-transfers.
-    if (!changeState (kQupStateRun, "run0", kStepRun)) {
+    if (!changeState (kQupStateRun, "run0", kInputStepRun)) {
       return false;
     }
     qupWrite (kQupI2cClkCtl, kQupI2cClk400k);
     clover_input_observation[8] = kQupI2cClk400k;
-    clover_input_observation[15] = kStepClk;
-    if (!changeState (kQupStatePause, "pause0", kStepPause)) {
+    clover_input_observation[15] = kInputStepClk;
+    if (!changeState (kQupStatePause, "pause0", kInputStepPause)) {
       return false;
     }
   }
 
-  uint32_t sent = 0;
-  pushTx (seg.tx, seg.txLen, &sent, gOutFifoSize);
+  struct InputTx tx;
+  input_tx_reset (&tx, gOutFifoSize);
+  pushTx (&tx, seg.tx, seg.txLen);
 
-  if (!changeState (kQupStateRun, "run", kStepRun)) {
+  if (!changeState (kQupStateRun, "run", kInputStepRun)) {
     return false;
   }
 
-  const uint32_t want = seg.rxLen ? kQupMxInputDone : kQupMxOutputDone;
-  uint32_t got = 0, tagLeft = seg.rxLen ? kQupRxTagLen : 0;
-  uint32_t word = 0, wordLeft = 0;
-  uint32_t room = gOutFifoSize > sent ? gOutFifoSize - sent : 0;
+  const uint32_t want = input_done_mask (seg.rxLen);
+  struct InputRx rx;
+  input_rx_reset (&rx, seg.rxLen, kQupRxTagLen);
   const uint64_t start = readCounter ();
-  const uint64_t deadline = 100ULL * gTicksPerMs;   // 100 ms; a 400 kHz 12-byte transfer is <1 ms
-  uint32_t op = 0, err = 0, bus = 0;
+  const uint64_t deadline = input_ticks_for_ms (kInputXferTimeoutMs, gTicksPerMs);
+  uint32_t op = 0, err = 0, bus = 0, rawErr = 0, rawStatus = 0;
+  struct InputBusStatus busStatus;
+  struct InputCoreFlags coreFlags;
   for (;;) {
     op = qupRead (kQupOperational);
-    err = qupRead (kQupErrorFlags) & kQupStatusErrorFlags;
-    bus = qupRead (kQupI2cStatus) & kI2cStatusErrorMask;
+    // Two views of the same two reads: the masked words keep round181's poll and its r181 row
+    // byte-identical, and the raw words are what the r318 rows below report. A second read of either
+    // register would let the two rows describe two different moments.
+    rawErr = qupRead (kQupErrorFlags);
+    rawStatus = qupRead (kQupI2cStatus);
+    input_core_flags_decode (rawErr, &coreFlags);
+    input_bus_status_decode (rawStatus, &busStatus);
+    err = coreFlags.mainline_error;
+    bus = busStatus.mainline_error;
     if (err || bus) {
       break;
     }
     if (op & kQupOutSvcFlag) {
       qupWrite (kQupOperational, kQupOutSvcFlag);   // write-1-to-clear, as the ISR does
-      room = gOutFifoSize;
-      pushTx (seg.tx, seg.txLen, &sent, room);
-      room = gOutFifoSize > sent ? gOutFifoSize - sent : 0;
+      tx.room = gOutFifoSize;
+      pushTx (&tx, seg.tx, seg.txLen);
+      tx.room = input_tx_room_left (gOutFifoSize, tx.sent);
     }
     if (seg.rxLen && (op & (kQupInSvcFlag | kQupInNotEmpty))) {
-      drainRx (seg.rx, seg.rxLen, &got, &tagLeft, &word, &wordLeft);
+      drainRx (&rx, seg.rx);
       if (op & kQupInSvcFlag) {
         qupWrite (kQupOperational, kQupInSvcFlag);
       }
@@ -674,7 +645,7 @@ static bool runSegment (const Segment &seg, const char *why)
     // Stricter than upstream's FIFO-mode write path, which lets any handled flag end the
     // sub-transfer: here the done bit AND the byte count have to agree, so a transfer that ended
     // early is a timeout rather than short data that looks real.
-    if ((op & want) && (!seg.rxLen || got == seg.rxLen) && sent == seg.txLen) {
+    if ((op & want) && (!seg.rxLen || input_rx_complete (&rx)) && tx.sent == seg.txLen) {
       break;
     }
     if (readCounter () - start > deadline) {
@@ -682,38 +653,56 @@ static bool runSegment (const Segment &seg, const char *why)
       break;
     }
   }
-  const uint32_t ms = static_cast<uint32_t> ((readCounter () - start) /
-                                             (gTicksPerMs ? gTicksPerMs : 1));
+  const uint32_t ms = input_elapsed_ms (readCounter () - start, gTicksPerMs);
+  const int verdict = input_xfer_verdict (op, err, bus, want, tx.sent, seg.txLen,
+                                          rx.got, seg.rxLen);
   gXfersRun++;
   clover_input_observation[4] = op;
   clover_input_observation[5] = err;
   clover_input_observation[6] = bus;
   clover_input_observation[7] = qupRead (kQupState);
-  if (err || bus) {
-    const bool nack = (bus & kQupNackFlag) != 0;
-    gXfersNack += nack ? 1u : 0u;
-    IOLog ("clover r181: xfer %s err=%08x bus=%08x op=%08x %s t=%ums\n",
-           why, err, bus, op, nack ? "NACK" : "error", ms);
+  // The raw-status reading, on every segment and not only on failures: the r181 bus= column is the
+  // masked word, so SDA/SCL's own bits and whatever sits outside either tree's mask cannot appear
+  // there by construction. `vend=` is the vendor tree's mask over the same raw word, `res=` the bits
+  // inside MAIN's mask that neither tree names -- so a reader can see which of the three readings a
+  // non-zero belongs to. class= is the same verdict the branch below takes. Carried by v0.7.30 and
+  // later only.
+  IOLog ("clover r318: xfer %s class=%s status=%08x err=%08x vend=%08x res=%08x sda=%u scl=%u "
+         "op=%08x t=%ums\n",
+         why, input_xfer_verdict_name (verdict), rawStatus, rawErr, busStatus.vendor_error,
+         busStatus.residue, busStatus.sda_high, busStatus.scl_high, op, ms);
+  // ERROR_FLAGS' own four run counters, named. They are the only bits of that register the vendor
+  // tree can set during a transfer, and each one names a different FIFO fault, so a non-zero raw=
+  // above is only actionable once this row says which.
+  IOLog ("clover r318: core %s class=%s flags=%08x err=%08x vend=%08x res=%08x "
+         "iovr=%u ouvr=%u iur=%u oovr=%u\n",
+         why, input_xfer_verdict_name (verdict), rawErr, coreFlags.mainline_error,
+         coreFlags.vendor_error, coreFlags.residue, coreFlags.input_over_run,
+         coreFlags.output_under_run, coreFlags.input_under_run, coreFlags.output_over_run);
+  if (verdict != kInputXferDone) {
+    if (verdict == kInputXferIncomplete) {
+      gXfersTimeout++;
+      IOLog ("clover r181: xfer %s timeout op=%08x sent=%u/%u got=%u/%u t=%ums\n",
+             why, op, tx.sent, seg.txLen, rx.got, seg.rxLen, ms);
+      clover_input_observation[15] = kInputFailPoll;
+    } else {
+      const bool nack = input_xfer_is_nack (bus) != 0;
+      gXfersNack += nack ? 1u : 0u;
+      IOLog ("clover r181: xfer %s err=%08x bus=%08x op=%08x %s t=%ums\n",
+             why, err, bus, op, nack ? "NACK" : "error", ms);
+      clover_input_observation[15] = kInputFailXfer;
+    }
     // qup_i2c_error() (i2c-qup.c:918-936) answers a bus or core error with a SW_RESET, which is
     // also what drops the stale done flags before the next candidate is asked.
     qupWrite (kQupSwReset, 1);
-    clover_input_observation[15] = kFailXfer;
-    return false;
-  }
-  if (!(op & want) || got != seg.rxLen || sent != seg.txLen) {
-    gXfersTimeout++;
-    IOLog ("clover r181: xfer %s timeout op=%08x sent=%u/%u got=%u/%u t=%ums\n",
-           why, op, sent, seg.txLen, got, seg.rxLen, ms);
-    qupWrite (kQupSwReset, 1);
-    clover_input_observation[15] = kFailPoll;
     return false;
   }
   if (!seg.last) {
-    if (!changeState (kQupStatePause, "pause", kStepPause)) {
+    if (!changeState (kQupStatePause, "pause", kInputStepPause)) {
       return false;
     }
   }
-  IOLog ("clover r181: xfer %s ok op=%08x got=%u t=%ums\n", why, op, got, ms);
+  IOLog ("clover r181: xfer %s ok op=%08x got=%u t=%ums\n", why, op, rx.got, ms);
   return true;
 }
 
@@ -722,14 +711,19 @@ static bool runSegment (const Segment &seg, const char *why)
 // qup_i2c_bus_active() is followed by qup_i2c_change_state(qup, QUP_RESET_STATE)).
 static bool finishTransfer (void)
 {
+  // BUS_ACTIVE is the same bit input_bus_status_decode names, so the spin and the r318 row that
+  // reports it cannot use two different definitions of "the bus is still busy".
+  struct InputBusStatus status;
+  input_bus_status_decode (qupRead (kQupI2cStatus), &status);
   uint64_t spins = 0;
-  while (qupRead (kQupI2cStatus) & kI2cStatusBusActive) {
+  while (status.bus_active) {
     if (++spins >= kCbcrSpin) {
-      IOLog ("clover r181: bus still active status=%08x\n", qupRead (kQupI2cStatus));
+      IOLog ("clover r181: bus still active status=%08x\n", status.raw);
       break;
     }
+    input_bus_status_decode (qupRead (kQupI2cStatus), &status);
   }
-  return changeState (kQupStateReset, "reset", kStepResetCore);
+  return changeState (kQupStateReset, "reset", kInputStepResetCore);
 }
 
 // One i2c transfer: the register-address write, then optionally the read. Tags are built the way
@@ -739,7 +733,7 @@ static bool finishTransfer (void)
 static bool chipRead (uint8_t address, const uint8_t *reg, uint32_t regLen, uint8_t *out,
                       uint32_t outLen, const char *why)
 {
-  if (regLen < 1 || regLen > 2 || outLen < 1 || outLen > kQupReadLimit - kQupRxTagLen) {
+  if (!input_read_request_ok (regLen, outLen)) {
     IOLog ("clover r181: %s refused, reg=%u len=%u outside one block\n", why, regLen, outLen);
     return false;
   }
@@ -752,16 +746,16 @@ static bool chipRead (uint8_t address, const uint8_t *reg, uint32_t regLen, uint
   // segment of a two-part transfer never carries the STOP variant, because the repeated start that
   // follows it is the whole point (qup_i2c_set_tags() only picks _STOP when this is the last block
   // of the last message).
-  uint8_t wire[8];
-  uint32_t wireLen = 0;
-  wire[wireLen++] = kQupTagV2Start;
-  wire[wireLen++] = static_cast<uint8_t> (address << 1);
-  wire[wireLen++] = outLen ? kQupTagV2DataWr : kQupTagV2DataWrStop;
-  wire[wireLen++] = static_cast<uint8_t> (regLen);
-  for (uint32_t i = 0; i < regLen; i++) {
-    wire[wireLen++] = reg[i];
+  uint8_t wire[kQupMaxTagsLen + 2];
+  const uint32_t wireLen = input_write_tags (address, regLen, outLen ? 0 : 1, wire, sizeof (wire));
+  if (wireLen != kQupMaxTagsLen) {
+    IOLog ("clover r181: %s refused, reg=%u has no v2 tag encoding\n", why, regLen);
+    return false;
   }
-  Segment write { wire, wireLen, nullptr, 0, true, false };
+  for (uint32_t i = 0; i < regLen; i++) {
+    wire[kQupMaxTagsLen + i] = reg[i];
+  }
+  Segment write { wire, wireLen + regLen, nullptr, 0, true, false };
   if (!runSegment (write, why)) {
     return false;
   }
@@ -770,10 +764,9 @@ static bool chipRead (uint8_t address, const uint8_t *reg, uint32_t regLen, uint
   // MX_READ_CNT counts the two tag bytes the core echoes back into the input FIFO along with the
   // data (i2c-qup.c:1474-1482).
   uint8_t tags[kQupMaxTagsLen];
-  tags[0] = kQupTagV2Start;
-  tags[1] = static_cast<uint8_t> ((address << 1) | 1);
-  tags[2] = kQupTagV2DataRdStop;
-  tags[3] = static_cast<uint8_t> (outLen);
+  if (!input_read_tags (address, outLen, tags, sizeof (tags))) {
+    return false;
+  }
   Segment read { tags, kQupMaxTagsLen, out, outLen, false, true };
   if (!runSegment (read, why)) {
     return false;
@@ -820,8 +813,7 @@ static void printBytes (const char *label, const uint8_t *data, uint32_t len)
 static void goodixReset (uint8_t address)
 {
   const uint32_t ctl = pinRead (67, kPinCtl);
-  pinWrite (67, kPinCtl, (ctl & ~(kPinDrvMask << kPinDrvShift)) |
-                         (kTsIntDrive << kPinDrvShift));
+  pinWrite (67, kPinCtl, input_pin_drive_ctl (ctl, kTsIntDrive));
   pinOutput (66, 0);
   waitMs (20);
   pinOutput (67, address == 0x14 ? 1 : 0);
@@ -869,20 +861,15 @@ static void probeCandidate (uint8_t address, const char *name, bool isGoodix)
       snprintf (why, sizeof (why), "goodix version b");
       if (chipRead (address, reg, 2, second, kGtVersionLen, why)) {
         printBytes ("goodix 0x8140 b", second, kGtVersionLen);
-        uint32_t agree = 0;
-        for (uint32_t i = 0; i < kGtVersionLen; i++) {
-          agree += first[i] == second[i] ? 1u : 0u;
-        }
-        // The vendor's own decode (gt9xx.c:1236-1248), with its 8-byte buffer's [2..7] being this
-        // 6-byte data read's [0..5]: three product-id characters, a fourth only when the byte after
-        // them is not zero, and the version as (buf[7] << 8) | buf[6].
-        const uint32_t pidLength = first[3] ? 4u : 3u;
-        const uint32_t version = (static_cast<uint32_t> (first[5]) << 8) | first[4];
+        // gtp_i2c_read_dbl_check's agreement count, and the vendor's own decode (gt9xx.c:1222-1258),
+        // with its 8-byte buffer's [2..7] being this 6-byte data read's [0..5]. Both are the layer's,
+        // so the 8-to-6 shift lives in exactly one expression.
+        const uint32_t agree = input_bytes_agree (first, second, kGtVersionLen);
+        struct InputGoodixId id;
+        input_goodix_identify (first, kGtVersionLen, &id);
         IOLog ("clover r181: goodix agree=%u/6 pid=%c%c%c%c ver=%04x\n",
-               agree, first[0] >= 0x20 ? first[0] : '.', first[1] >= 0x20 ? first[1] : '.',
-               first[2] >= 0x20 ? first[2] : '.',
-               pidLength == 4u && first[3] >= 0x20 ? first[3] : ' ', version);
-        clover_input_observation[11] = version;
+               agree, id.pid[0], id.pid[1], id.pid[2], id.pid[3], id.version);
+        clover_input_observation[11] = id.version;
       }
     }
     uint8_t sensor = 0;
@@ -891,7 +878,7 @@ static void probeCandidate (uint8_t address, const char *name, bool isGoodix)
     snprintf (why, sizeof (why), "goodix sensor_id");
     if (chipRead (address, reg, 2, &sensor, 1, why)) {
       IOLog ("clover r181: goodix sensor_id=%02x valid=%u\n", sensor,
-             sensor < kGtPidValidMax ? 1u : 0u);
+             input_goodix_sensor_id_valid (sensor));
     }
     return;
   }
@@ -902,7 +889,7 @@ static void probeCandidate (uint8_t address, const char *name, bool isGoodix)
   snprintf (why, sizeof (why), "ft name");
   if (chipRead (address, reg, 1, name22, kFtNameLen, why)) {
     printBytes ("ft 0xbb", name22, kFtNameLen);
-    const bool m06 = name22[1] == 'E' || name22[1] == 'e';
+    const bool m06 = input_ft_is_m06 (name22, kFtNameLen) != 0;
     IOLog ("clover r181: ft guess=%s\n", m06 ? "m06-ish" : "m12-or-generic");
     uint8_t fw[2] = { 0 };
     reg[0] = static_cast<uint8_t> (kFtRegFwVersion);
@@ -947,7 +934,7 @@ extern "C" void clover_input_run (void)
       IOLog ("clover r181: map %s %llx failed\n", needed[i].label,
              static_cast<unsigned long long> (needed[i].phys));
       clover_input_observation[1] = needed[i].phys;
-      clover_input_observation[15] = kFailMap;
+      clover_input_observation[15] = kInputFailMap;
       return;
     }
   }

@@ -67,6 +67,43 @@ because real fingers and synthetic fingers are two halves of one question.
   provided" — records why: the smallest honest question this core can ask is one register byte read
   back, which is what `probeCandidate()` sends.
 
+## The bus-free layer, and the reading round181 could not print
+
+Round318 moved every decision this driver reads out of a word into `InputCore.h`, a header that includes
+only `<stdint.h>` and its own `InputRegs.h` — so every mask is still derived from the vendor's named
+register, and no second copy of a cut survives in `CloverInput.cpp`. The layer owns the QUP v2 tag
+arithmetic (`input_write_tags()`, `input_read_tags()`), the two FIFO cursors (`input_tx_next()`,
+`input_rx_word()`/`input_rx_pop()`), the per-transfer CONFIG word and done mask, the three TLMM pin cuts,
+the RCG word, the verdict classes (`input_xfer_verdict()`) and the Goodix/FocalTech identification.
+
+`tests/clover_input_host.cpp` drives it under `scripts/test-clover-input.py` (263 checks) and the build
+gate **runs** that test rather than reading it: every refusal class — NACK, bus error, core error,
+incomplete — is reached with a real word, the two Goodix reads are compared byte-wise before any
+identification, a three-character pid keeps its blank fourth slot, and the DIRECTION cases show what the
+wrong mask would report. The driver calls each decision; the pins that matter are listed in
+`check-clover.py`'s Round318 block, and the second-copy needles (`kQupStatusErrorFlags`,
+`kI2cStatusErrorMask`, `kQupNackFlag`, `kGtPidValidMax`, the tag encodings, the pin cuts, the per-segment
+CONFIG expression) all grep to zero in the `.cpp`.
+
+The new reading exists because of a measured blind spot. Round181's `bus=` column is
+`I2C_STATUS & kI2cStatusErrorMask`, and MAIN's mask (`0x38000fc`) does **not** contain SDA `BIT(26)` or
+SCL `BIT(27)`. The row prints `sda=`/`scl=` beside it, but those two come from a different cut, so the
+masked column can never show a held bus. Round318 therefore prints, once per segment and on success as
+well as failure:
+
+```
+clover r318: xfer %s class=%s status=%08x err=%08x vend=%08x res=%08x sda=%u scl=%u op=%08x t=%ums
+clover r318: core %s class=%s flags=%08x err=%08x vend=%08x res=%08x iovr=%u ouvr=%u iur=%u oovr=%u
+```
+
+`status=` and `err=` are the raw words; `vend=`/`res=` and the four ERROR_FLAGS run bits are the layer's
+decode of the same two reads; `class=` is the same verdict the failure branches and the retry policy are
+keyed on. Both rows carry the new stamp and their own tee class `r318-input(32)` with a per-pass-cap
+exemption, because the pair is one reading: a pass that kept the decoded row and ate the raw one would
+put the blind spot back. Round181's rows are byte-identical, so boot 48's `verdict=102` stays comparable.
+
+Carried by `v0.7.30` and later images only.
+
 ## What this driver does not claim
 
 No power rails. The source's own `WHAT IT DOES NOT CLAIM` block states the whole position: both touch
@@ -105,7 +142,7 @@ What it does not have is the class shape of `docs/drivers/xnu-drivers.md:19-64`,
 driver, and the reasons — with the three concrete prerequisites for changing that — are
 `notes/unixnu-doc-conformance.md` §5. Against the worked example it is honest about its own gap:
 `docs/drivers/native-novatek-touch.md:16-37` separates a pure core from a `struct nvt_bus`, and `:130-137`
-makes "write host tests for the pure helpers before the hardware probe" rule 3. CloverInput keeps its
-decode arithmetic inline with the MMIO and has **no host model**, which is the item listed in
-`notes/unixnu-doc-conformance.md` §7 — `drivers/CloverPower/PowerArb.h` and `drivers/CloverDsp/DspCore.h`
-are the shape to copy.
+makes "write host tests for the pure helpers before the hardware probe" rule 3. Round318 closes that gap:
+the decode arithmetic now lives in `InputCore.h` with a host model the gate executes, and the MMIO that
+remains in `CloverInput.cpp` reads words and hands them to the layer. The remaining §5 gap is the class
+shape — `notes/unixnu-doc-conformance.md` §5 lists the three prerequisites for changing it.
