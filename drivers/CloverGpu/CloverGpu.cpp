@@ -30,6 +30,12 @@
 //     same-beat gx_on, because boot 77 left gx collapse-released with PWR_ON never arriving
 //   read back the GDSCRs (the acceptance), then chipid at 0x05010200 gated on cx-on && gx-on &&
 //     gfx3d-enable, checked against a512's 0x05010200
+//   round311 opens a fourth window and writes nothing in it: the L1 domain's MEM_ACC corner select,
+//     the single `qcom,mem-acc-regulator` node in this unit's tree (`regulator@01fcf004`) and the one
+//     the GPU's own CPR4 corner consumer names as `mem-acc-supply`. It reads on every fire -- before
+//     the power sequence on the first, after it on the rest -- because the question is where that
+//     select stopped, and the node declares no clock and no supply of its own, so this read is not
+//     the unclocked-bus gamble the core window is.
 //
 // WHY THE VERDICTS REPEAT
 //
@@ -62,9 +68,11 @@
 static IOMemoryMap *clover_gpu_gcc_map;
 static IOMemoryMap *clover_gpu_gpucc_map;
 static IOMemoryMap *clover_gpu_core_map;
+static IOMemoryMap *clover_gpu_memacc_map;
 static volatile uint32_t *clover_gpu_gcc;
 static volatile uint32_t *clover_gpu_gpucc;
 static volatile uint32_t *clover_gpu_core;
+static volatile uint32_t *clover_gpu_memacc;
 static IOTimerEventSource *clover_gpu_timer;
 static bool clover_gpu_powered;
 static uint32_t clover_gpu_fires;
@@ -191,6 +199,79 @@ clover_gpu_open_core(void)
         clover_gpu_core = (volatile uint32_t *) clover_gpu_core_map->getVirtualAddress();
     }
     return clover_gpu_core;
+}
+
+// The MEM_ACC page. Round311's fourth window, and the first this line asks for outside the two clock
+// controllers: 0x01fcf004 is above GCC's 0x00100000+0x94000 (which ends at 0x0194000) and below the
+// GPUCC extent, so no window this driver already had reaches it. Lazy and retried like the other
+// two, because a refusal here is the platform map settling and costs one map attempt per two minutes.
+static volatile uint32_t *
+clover_gpu_open_mem_acc(void)
+{
+    IODeviceMemory *memory;
+
+    if (clover_gpu_memacc != NULL) {
+        return clover_gpu_memacc;
+    }
+    memory = IODeviceMemory::withRange(kMemAccPhys, kMemAccSize);
+    if (memory == NULL) {
+        return NULL;
+    }
+    clover_gpu_memacc_map = memory->map(kIOMapAnywhere | kIOMapInhibitCache);
+    memory->release();
+    if (clover_gpu_memacc_map != NULL) {
+        clover_gpu_memacc = (volatile uint32_t *) clover_gpu_memacc_map->getVirtualAddress();
+    }
+    return clover_gpu_memacc;
+}
+
+// Round311's row. Three shapes, because the row has to be able to say which of three different things
+// happened: `map=0` is IOKit refusing the range, `gpucc=0` is that the control bits below belong to a
+// window this fire has not opened yet, and the full row is the reading. The all-ones test is done on
+// the word before the field is cut, for the reason GpuRegs.h gives -- masked into a one-bit field, a
+// dead page would otherwise read as corner 1's own map value, and one word may not mean two things.
+// `corner=0` next to `answered=1` says the field holds something outside the tree's two-entry map,
+// which bit-size 1 makes unreachable and is kept as a guard rather than a forecast.
+static void
+clover_gpu_report_mem_acc(unsigned t)
+{
+    volatile uint32_t *window = clover_gpu_open_mem_acc();
+    uint32_t raw;
+    uint32_t field;
+    uint32_t corner = 0;
+    unsigned answered = 0;
+
+    if (window == NULL) {
+        printf("clover r311: gpu t=%u fire=%u mem_acc map=0 phys=%llx size=%x\n", t,
+            (unsigned) clover_gpu_fires, (unsigned long long) kMemAccPhys, kMemAccSize);
+        return;
+    }
+    raw = clover_gpu_read(window, 0);
+    if (raw != kMemAccNoAnswer) {
+        answered = 1;
+        field = (raw & kMemAccFieldMask) >> kMemAccBitPos;
+        if (field == kMemAccCorner1Field) {
+            corner = kMemAccMinCorner;
+        } else if (field == kMemAccCorner2Field) {
+            corner = kMemAccMaxCorner;
+        }
+    } else {
+        field = 0;
+    }
+
+    if (clover_gpu_gpucc != NULL) {
+        uint32_t cxhw = clover_gpu_read(clover_gpu_gpucc, kGpuccCxHwCtrl);
+        uint32_t gx   = clover_gpu_read(clover_gpu_gpucc, kGpuccGdscGx);
+
+        printf("clover r311: gpu t=%u fire=%u mem_acc map=1 answered=%u raw=%08x l1=%u corner=%u "
+            "gpucc=1 cx_on=%u gx_on=%u\n", t, (unsigned) clover_gpu_fires, answered,
+            (unsigned) raw, (unsigned) field, (unsigned) corner,
+            (unsigned) ((cxhw & kGdscPwrOn) != 0), (unsigned) ((gx & kGdscPwrOn) != 0));
+    } else {
+        printf("clover r311: gpu t=%u fire=%u mem_acc map=1 answered=%u raw=%08x l1=%u corner=%u "
+            "gpucc=0\n", t, (unsigned) clover_gpu_fires, answered, (unsigned) raw,
+            (unsigned) field, (unsigned) corner);
+    }
 }
 
 // The GCC row, every fire. The two eMMC votes are the control: this board's eMMC host is used
@@ -443,6 +524,9 @@ clover_gpu_say(OSObject *owner, IOTimerEventSource *sender)
     clover_gpu_fires++;
 
     clover_gpu_report_gcc(t);
+    // Round311: read before anything else this fire does, so the first row of a boot is the answer
+    // firmware left and not the answer our own write produced.
+    clover_gpu_report_mem_acc(t);
 
     if (!clover_gpu_powered) {
         clover_gpu_power_on(t);

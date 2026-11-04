@@ -25058,3 +25058,77 @@ marker 且**新列不出现在 marker 行**；18 词的 r310 marker 打印出 `p
 → `~/clover-out/round310-v0.7.22-payload.img` sha256 `937210697f186a1a36f9ffd791df8a71…`，58,720,256 B。
 `check-clover.py` 与 `verify-clover-payload.py` 双绿（0 FAIL，`quiesce-row present`），
 `read-clover-log.py --selftest` 全绿。
+
+## Round311（v0.7.23）：GPU 线开第四扇窗口，只读一个位——`acc-sel-l1`
+
+本轮没有内核补丁，也没有上机：**板子不在家，cache 不重刷**——卡上还压着 boot 103 的排干记录，
+读回它不需要刷写，而再往 cache 写一次就会把那靴的现场覆盖掉。发的是等 boot 103 读完之后才许上的下一枚镜像。
+
+**① 为什么是这一格。** `notes/gpu-bringup.md` §5.12 已经关掉两条：CPR4 那三枚 fuse 行答的是出厂 DT
+自己已经答过的题（`qcom,cpr-corner-allow-ldo-mode` 七枚全 0 ⇒ LDO 分支与闭环分支都得 false），
+boot 81 的十三字 LDO 普查因此从「故障」改判「符合配置」——**GFX LDO 不是这颗 SoC 的供电路径**。
+剩下能问的两条里，`system-supply`（pm660l_s3_level 的电压电平）要的是 RPM SMD 请求的读法，
+我们的引导链从未发过那种请求；`mem-acc-supply` 是**纯 MMIO 的一颗单字寄存器**，今天就能读。
+任务 #549 因此从「读 fuse」改向「读 `acc-sel-l1`」。
+
+**② 事实来自我们烧的那颗 DTB，不是厂商 dtsi 的类比。**
+`dtc -I dtb -O dts ~/mu-clover/Resources/DTBs/clover.dtb`（sha256 前缀 `815b8255`）第 7633-7645 行：
+`regulator@01fcf004` → `compatible = "qcom,mem-acc-regulator"`、`reg = <0x1fcf004 0x4>`、
+`reg-names = "acc-sel-l1"`、`regulator-name = "gfx_mem_acc_corner"`、
+`regulator-min-microvolt = <0x01>`、`regulator-max-microvolt = <0x02>`、
+`qcom,corner-acc-map = <0x01 0x00>`、`qcom,acc-sel-l1-bit-pos = <0x00>`、
+`qcom,acc-sel-l1-bit-size = <0x01>`、`phandle = <0x163>`；消费方是同树里 `cpr4-ctrl@05061000` 的
+`mem-acc-supply = <0x163>`。全树只有这一颗 `qcom,mem-acc-regulator`。**节点没有 `clocks`、也没有 `vdd-supply`**
+——这就是读它不必先等谁的钟：核窗口（`0x05000000`）那句「未上钟就碰总线」的门槛在这里没有对应的赌注。
+
+**③ 代码形状。** `GpuRegs.h` 新增 `kMemAccPhys/kMemAccSize/kMemAccBitPos/kMemAccBitSize/kMemAccFieldMask/
+kMemAccMinCorner/kMemAccMaxCorner/kMemAccCorner1Field/kMemAccCorner2Field/kMemAccNoAnswer`，
+每条带上面那段逐字出处；`CloverGpu.cpp` 新增 `clover_gpu_open_mem_acc()`（第四扇
+`IODeviceMemory::withRange(kMemAccPhys, kMemAccSize)`，lazy、失败每两分钟重试一次，与 `open_gpucc` 同法）
+和 `clover_gpu_report_mem_acc(t)`，调用点在 `clover_gpu_say()` 里紧跟 GCC 那行、
+**在本轮自己的任何动作之前**——第一拍那枚读数因此是固件留下的答案，不是我们写出来的答案。
+行有三种形状：`map=0 phys= size=`（IOKit 拒了这段范围）、`… gpucc=0`（读到了，但对照位所属的 GPUCC
+这一拍还没映射——首拍必是这支，因为 GPUCC 在 `clover_gpu_power_on()` 里验过 AHB 票才开）、
+完整形状再带 `cx_on= gx_on=`。解码只有一处需要小心：**`bit-size=1` 把 `0xffffffff` 切出来正是 1，
+也就是角 1 自己要的值**，所以 `answered=` 在 mask 之前判；`corner=` 取 1/2（用树自己的
+`corner-acc-map` 对回去），`corner=0` 只在 `answered=1` 时才有「字段落在映射外」这一义。
+
+**④ 「一个位也没写过」这次是断言，不是承诺。** `check-clover.py` 把四枚 store helper
+（`clover_gpu_write/set_bits/clear_bits/update_bits` 配 `clover_gpu_memacc`）钉成缺席，
+并把「不许直接下标窗口」那份名单从三扇扩到四扇；`IODeviceMemory::withRange(` 的计数从 3 改成 4，
+理由一起换掉——旧文案说「第四扇＝同一页重复映射」，那只对 LDO 那一支成立（`0x0506e000` 在 GPUCC 的
+`0x10000` 之内）；这一支是算术上真的够不着：`0x01fcf004` 在 GCC 的 `0x00100000+0x94000`（到 `0x0194000`）之上，
+在 GPUCC/核（`0x050xxxxx`）之下。
+
+**⑤ 契约与闸门。** **`GpuRegs.h` 第一次进 DT 地址登记表**：r286 起这三扇窗口全靠手抄、从没被那把
+「每个驱动基址都要对得上本机 `/proc/device-tree/soc/*/reg`」的尺子量过（#182 那把尺子正是为 r181 的
+`kQupPhys` 少一位而做的），本轮连同新窗口一起登记八枚，闸门读数从 **DT 30 addresses 涨到 38 addresses
+against 230 device-tree nodes**。`CloverSdhci` 的 tee 表新增独立类 `{ "clover r311: ", "r311-gpu", 32 }`
+并进免每拍上限名单——这行的读数是「形状」，被上限吃掉完整形状而留下 `map=0` 会把「页答了」报成「页没映射」。
+`verify-clover-payload.py` 在 GPU 那一族里加三枚**合并整串**针（`gpu-row-memacc-map`／
+`-gpucc`／`-nogpucc`）：两个分支共用前缀，只有整串能证明两支都还在镜像里。
+
+**⑥ 本格的地平线（写在这里，别留给下一轮猜）。** `bit-size=1` 时字段只能是 0 或 1，两值都在映射内，
+所以 `corner=` 不可能落在「映射外」；剩下的分辨力只有整字。若某靴读到 `raw=00000000`，
+这一格**分不开**「角 2 的真值」与「整页读零」：本板已知的非应答形状是全 1，而同一个 4 KiB 页里
+唯一另一个 DT 节点是 `qpdi@1fc1000`（`qcom,coresight-qpdi`），它的 `clocks = <0x26 0x08 0x26 0x09>`
+没有查到任何证据说明带着钟——拿它当对照就是 r282 拒掉的那一赌，所以本轮不碰。
+
+**⑦ 预登记（带这行的那一靴，boot 104 之后）。**
+甲：`map=1 answered=1` 且 `corner=` 稳定 → 与厂商期望无从比对（这颗节点没有电压表），
+      但 `corner=1` 配 `gx_on=0` 说的是「选择已在高位而域仍不上电」，供电路径那一格转到 RPM；
+乙：`corner=2` 配 `gx_on=0` → 选择停在低角，与 boot 77/78 的 gx 等电同形，下一手是「角编程要不要人做」；
+丙：`answered=0`（`raw=ffffffff`）配同一拍 `cx_on=1` → **ACC 页哑而 GPUCC 页答**，
+      嫌疑从 GPU 转到 `0x01fc0000` 之上的总线门，这条本身就是新事实；
+丁：`map=0 phys=01fcf004 size=4` 每拍都在 → IOKit 不肯给这段范围，与卡无关；先解决映射来源
+      （平台图里没有这段？），再谈读数；
+戊：整靴没有 `mem_acc` 行 → 不许读成「页死」，只说明 GPU 定时器没拍，回到 #549 之前重新对齐节拍。
+
+**⑧ 产物。** 两个驱动在组装树 `-Werror` 过（`CloverGpu`、`CloverSdhci`）；
+内核 `954d8d18219b969a…` → amfi `07b577dbbbfa3b14…`（**两刀从 `0x1adb0e4`/`0x1adb16c` 移到
+`0x1adc0e4`/`0x1adc16c`，各 +0x1000**：本轮第一次改动挪动了 AMFI 之前的段大小，站点性质不变
+——cbz→b、tbz→nop 两处编码都由 `patch-clover-amfi.py` 自己核对）→ normalized
+`404f8e8570d701c8…`（973 枚 object 戳清零）→ `~/clover-out/round311-v0.7.23-payload.img`
+sha256 `1578451f9c4b796228a803f32a8444c4216c692526efeb8b1d6ba7015e46a22f`，58,720,256 B。
+`check-clover.py` 与 `verify-clover-payload.py` 双绿（0 FAIL，三枚 `gpu-row-memacc-*` 齐 present），
+`read-clover-log.py --selftest` 全绿。**未刷写**：boot 103 的卡上现场优先。

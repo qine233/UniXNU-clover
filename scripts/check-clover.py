@@ -3156,7 +3156,28 @@ def check_board(errors: list) -> str:
                     ("\"clover r294: gpu t=%u ldo words %s w00=%08x w04=%08x w08=%08x w0c=%08x w10=%08x \"",
                      "CloverGpu.cpp", gpu_source),
                     ("\"w14=%08x w18=%08x w1c=%08x w20=%08x w24=%08x w28=%08x w2c=%08x w30=%08x "
-                     "cx_on=%u gx_on=%u\\n\"", "CloverGpu.cpp", gpu_source)):
+                     "cx_on=%u gx_on=%u\\n\"", "CloverGpu.cpp", gpu_source),
+                    # Round311: the MEM_ACC node as this unit's tree states it, the field inside it, and
+                    # the three shapes the one row can take. The all-ones test is pinned as an expression
+                    # because it is the part that keeps `corner=` from meaning two things: masked into a
+                    # one-bit field, a dead page's 0xffffffff is 1, which is also corner 1's own map value.
+                    ("#define kMemAccPhys         0x01fcf004ULL", "GpuRegs.h", gpu_regs),
+                    ("#define kMemAccSize         0x4U", "GpuRegs.h", gpu_regs),
+                    ("#define kMemAccBitPos       0U", "GpuRegs.h", gpu_regs),
+                    ("#define kMemAccBitSize      1U", "GpuRegs.h", gpu_regs),
+                    ("#define kMemAccCorner1Field 0x01U", "GpuRegs.h", gpu_regs),
+                    ("#define kMemAccCorner2Field 0x00U", "GpuRegs.h", gpu_regs),
+                    ("#define kMemAccNoAnswer     0xffffffffU", "GpuRegs.h", gpu_regs),
+                    ("IODeviceMemory::withRange(kMemAccPhys, kMemAccSize)", "CloverGpu.cpp", gpu_source),
+                    ("raw = clover_gpu_read(window, 0);", "CloverGpu.cpp", gpu_source),
+                    ("if (raw != kMemAccNoAnswer) {", "CloverGpu.cpp", gpu_source),
+                    ("clover_gpu_report_mem_acc(t);", "CloverGpu.cpp", gpu_source),
+                    ("\"clover r311: gpu t=%u fire=%u mem_acc map=0 phys=%llx size=%x\\n\"",
+                     "CloverGpu.cpp", gpu_source),
+                    ("\"clover r311: gpu t=%u fire=%u mem_acc map=1 answered=%u raw=%08x l1=%u corner=%u \"",
+                     "CloverGpu.cpp", gpu_source),
+                    ("\"gpucc=1 cx_on=%u gx_on=%u\\n\"", "CloverGpu.cpp", gpu_source),
+                    ("\"gpucc=0\\n\"", "CloverGpu.cpp", gpu_source)):
                 if needle not in text_:
                     errors.append(f"{where} lacks {needle[:64]!r}: round286's rows are the reading that "
                                   "decides the next GPU round, and every constant in them came from the "
@@ -3174,27 +3195,45 @@ def check_board(errors: list) -> str:
                     errors.append(f"CloverGpu.cpp still holds {gone[:56]}: round294 is the control that "
                                   "takes round290's two branch-enable writes back out, and a build that "
                                   "keeps them cannot be told from the four resets it is meant to explain")
-            # A direct index is how a bare store starts. All three windows go through the read/write
+            # A direct index is how a bare store starts. Every window goes through the read/write
             # helpers, so an index on the window object itself means a register touched outside the one
             # path -- which is the whole point of making the write checkable rather than promised.
-            for window in ("clover_gpu_gcc[", "clover_gpu_gpucc[", "clover_gpu_core["):
+            for window in ("clover_gpu_gcc[", "clover_gpu_gpucc[", "clover_gpu_core[",
+                           "clover_gpu_memacc["):
                 if window in gpu_source:
                     errors.append(f"CloverGpu.cpp indexes {window} directly: round286 touches every register "
                                   "through the read/write helpers, and a direct index is the store the checker "
                                   "cannot see")
+            # Round311 is a reading, and the discipline this line keeps is that a reading does not become a
+            # write by accident. The MEM_ACC word is the corner select for a supply domain whose expected
+            # value nobody has established (§5.12 closed the LDO branch, and the level that does exist is an
+            # RPM request this chain never sent), so a wrong value written here would be indistinguishable
+            # from a wrong value read. Every store helper is named, not just the one a careless round
+            # would reach for first.
+            for store in ("clover_gpu_write(clover_gpu_memacc", "clover_gpu_set_bits(clover_gpu_memacc",
+                          "clover_gpu_clear_bits(clover_gpu_memacc",
+                          "clover_gpu_update_bits(clover_gpu_memacc"):
+                if store in gpu_source:
+                    errors.append(f"CloverGpu.cpp contains {store[:52]}: round311 reads the L1 corner select "
+                                  "and writes nothing to it, and the round that changes that promise has to "
+                                  "say so here rather than in a comment")
             if "0x01830000" in gpu_regs:
                 errors.append("GpuRegs.h carries 0x01830000: that pin was wrong -- the board's DT puts GCC at "
                               "0x00100000 (clock-controller@100000), which is also what CloverInput's registers "
                               "already use, and the wrong base would have read a different block as clocks")
             # Round291 reads at 0x9000-range offsets of the window r286 maps. That is only legitimate
             # because sdm660.dtsi gives clock_gpu/clock_gfx reg = <0x5065000 0x10000>, which contains the
-            # LDO node's 0x0506e000; a fourth window would be a second mapping of the same page, and a
-            # later round that shrank kGpuccSize would silently push the LDO offsets outside it. The
-            # count is the checkable form of "the rail row rides the GPUCC mapping, nothing else".
-            if gpu_source.count("IODeviceMemory::withRange(") != 3:
+            # LDO node's 0x0506e000; a second mapping of that page would be the same hardware mapped twice,
+            # and a later round that shrank kGpuccSize would silently push the LDO offsets outside it.
+            # Round311 adds the one window the arithmetic says is genuinely separate: 0x01fcf004 is above
+            # GCC's end (0x00100000+0x94000 = 0x194000) and nowhere near the two GPU pages, so it cannot
+            # ride an existing mapping -- and its own DT node says how big it is (reg = <0x1fcf004 0x4>).
+            # The count is the checkable form of "four windows, each the extent its node declares".
+            if gpu_source.count("IODeviceMemory::withRange(") != 4:
                 errors.append(f"CloverGpu.cpp opens {gpu_source.count('IODeviceMemory::withRange(')} windows, "
-                              "not 3: GCC, GPUCC and the GPU core are the only ones this round may map, and "
-                              "round291's LDO registers live inside the GPUCC extent the DT already declares")
+                              "not 4: GCC, GPUCC, the GPU core and round311's MEM_ACC node are the only "
+                              "extents this line may map, the LDO registers stay inside the GPUCC extent the "
+                              "DT declares, and a fifth window means a register whose node nobody checked")
         gpu_built = any("CloverGpu" in item for item in board["kernel"]["archives"])
         # `text` has been reassigned to patch sources by this point in the function; read the
         # defconfig this check is about rather than whatever the last round's block left behind.
@@ -3252,6 +3291,17 @@ def check_board(errors: list) -> str:
             errors.append("the r294 census is not exempt from the per-pass push cap: it prints from the "
                           "same GPU timer as r286/r290/r291, and those four rows together are what a "
                           "sixteen-write pass runs out of first")
+        # Round311's MEM_ACC row joins the same schedule, and it is pinned in the same two places because
+        # its reading is a *shape*: the row is allowed to say "the range was refused" and "the page answered"
+        # and those two must not be able to trade places through a cap.
+        if '{ "clover r311: ", "r311-gpu", 32, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the round311 MEM_ACC rows: an unbudgeted "
+                          "producer drops them silently, and a boot with no corner row reads like a boot "
+                          "whose GPU timer never fired rather than like a capped pass")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r311")' not in sdhci_source:
+            errors.append("the r311 row is not exempt from the per-pass push cap: it prints from the GPU "
+                          "timer beside the censuses, and the three shapes of that row are the only thing "
+                          "that separates a refused mapping from an answered page")
 
         # Round283 asks the question boot 69 left open: which software path, if any, resets the board.
         # The r281 read showed the APSS watchdog never armed and the card's last write 11 s older than
@@ -6038,8 +6088,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r310:"):
-        errors.append('[payload] title is not "clover r310: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r311:"):
+        errors.append('[payload] title is not "clover r311: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7184,8 +7234,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r310:"):
-        errors.append('[payload] title is not "clover r310: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r311:"):
+        errors.append('[payload] title is not "clover r311: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -7869,6 +7919,20 @@ DT_BASE_CONTRACT = [
     ("qcom,smem@86000000", 1, "drivers/CloverDsp/DspRegs.h", "kSmemSize"),
     ("qcom,smp2p-adsp@17911008", 0, "drivers/CloverDsp/DspRegs.h", "kApcsIpcPhys"),
     ("qcom,smp2p-modem@17911008", 0, "drivers/CloverDsp/DspRegs.h", "kApcsIpcPhys"),
+    # Round311 registers the GPU line's windows as well as its own new one. The three pages this line has
+    # mapped since round286 were transcribed from the tree by hand and never compared against the dump
+    # this gate reads -- which is exactly the shape round181's kQupPhys was written to catch, and the
+    # reason the fourth window was not allowed to arrive without the other three being checked too.
+    # `gfx@5065000` and `clock-controller@5065000` are the same extent under two node names; the first
+    # one is what the dump lists.
+    ("clock-controller@100000", 0, "drivers/CloverGpu/GpuRegs.h", "kGccPhys"),
+    ("clock-controller@100000", 1, "drivers/CloverGpu/GpuRegs.h", "kGccSize"),
+    ("gfx@5065000", 0, "drivers/CloverGpu/GpuRegs.h", "kGpuccPhys"),
+    ("gfx@5065000", 1, "drivers/CloverGpu/GpuRegs.h", "kGpuccSize"),
+    ("qcom,kgsl-3d0@5000000", 0, "drivers/CloverGpu/GpuRegs.h", "kGpuPhys"),
+    ("qcom,kgsl-3d0@5000000", 1, "drivers/CloverGpu/GpuRegs.h", "kGpuSize"),
+    ("regulator@01fcf004", 0, "drivers/CloverGpu/GpuRegs.h", "kMemAccPhys"),
+    ("regulator@01fcf004", 1, "drivers/CloverGpu/GpuRegs.h", "kMemAccSize"),
 ]
 
 # (node leaf name, span index, header, base macro, size macro).  A driver may map only part of a

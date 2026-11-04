@@ -1271,6 +1271,16 @@ def check_sb_sample(kernel: bytes) -> bool:
              "gpu-row-ldo-census": (b"clover r294: gpu t=%u ldo words %s w00=%08x w04=%08x w08=%08x "
                                     b"w0c=%08x w10=%08x w14=%08x w18=%08x w1c=%08x w20=%08x w24=%08x "
                                     b"w28=%08x w2c=%08x w30=%08x cx_on=%u gx_on=%u\n") in kernel,
+             # Round311's MEM_ACC row, in all three shapes. They are pinned together because the row's
+             # reading *is* which shape it took: the refused-range line and the answered-page line are the
+             # two halves of "does this board's L1 corner select answer at all", and a driver that lost one
+             # of them would still boot, still power the GDSCs and still print every GPU row above.
+             "gpu-row-memacc-map": (b"clover r311: gpu t=%u fire=%u mem_acc map=0 phys=%llx size=%x\n")
+                                    in kernel,
+             "gpu-row-memacc-gpucc": (b"clover r311: gpu t=%u fire=%u mem_acc map=1 answered=%u "
+                                      b"raw=%08x l1=%u corner=%u gpucc=1 cx_on=%u gx_on=%u\n") in kernel,
+             "gpu-row-memacc-nogpucc": (b"clover r311: gpu t=%u fire=%u mem_acc map=1 answered=%u "
+                                        b"raw=%08x l1=%u corner=%u gpucc=0\n") in kernel,
              "bb-peer-row": (b"clover r265: pth tid=%llx st=%x cont=%llx we=%llx pc=%llx"
                              b" dl=%llx rcv=%x remote=%x to=%llx mc=%u sr=%x rmc=%u rsr=%x"
                              b" peer=%s\n") in kernel,

@@ -518,3 +518,46 @@ clover r291: gpu t=617 ldo beat vref=00000000 val=0 uv=375000 ctrl=80000038 byp=
    （`sdm660-regulator.dtsi:510-518`）——纯 MMIO、4 字节、与 GCC/GPUCC 同法映射，读回来的是
    「L1 电源域的 mem-acc 角选择停在哪儿」，与 GPU 是否拿得到 vdd_cx 是同一张问题的另一头。
    RPM-SMD 那一格（S3 电平）排在它后面，并且要写明：**我们的引导链从未发过这种请求**。仍只读。
+
+### 5.13 r311 发出去的那一格：第四扇窗口、一个位也没写（2026-11-04，宿主，未花开机）
+
+1. **「与 GCC/GPUCC 同法映射」这句要按算术读。** §5.12⑥ 说的是同一个 `IODeviceMemory::withRange`
+   写法，不是同一扇窗口：`0x01fcf004` 在 GCC 的 `0x00100000+0x94000`（到 `0x0194000`）之上，
+   也在 GPUCC（`0x05065000`）与核（`0x05000000`）之下，**r286 起那三扇没有任何一扇够得着它**，
+   所以 r311 是本线第一次向 IOKit 要第四张映射。`check-clover.py` 里那条「只许三扇」的断言因此
+   改成「只许四扇」，并把理由换掉——旧文案说的「第四扇＝同一页重复映射」只对 LDO 那一支成立
+   （`0x0506e000` 在 GPUCC 的 `0x10000` 里，r291 才走已有映射）。
+2. **这颗节点在出厂 DTB 里是逐字这样带的**（`dtc -I dtb -O dts ~/mu-clover/Resources/DTBs/clover.dtb`，
+   sha256 前缀 `815b8255`，第 7633-7645 行；§5.12 第 1 条要求的复核办法）：
+   `regulator@01fcf004` → `compatible = "qcom,mem-acc-regulator"`、`reg = <0x1fcf004 0x4>`、
+   `reg-names = "acc-sel-l1"`、`regulator-name = "gfx_mem_acc_corner"`、
+   `regulator-min-microvolt = <0x01>`、`regulator-max-microvolt = <0x02>`、
+   `qcom,corner-acc-map = <0x01 0x00>`、`qcom,acc-sel-l1-bit-pos = <0x00>`、
+   `qcom,acc-sel-l1-bit-size = <0x01>`、`phandle = <0x163>`；消费方是同一棵树里的
+   `cpr4-ctrl@05061000` 的 `mem-acc-supply = <0x163>`。**全树只有这一颗 `qcom,mem-acc-regulator`**。
+   节点**没有 `clocks` 也没有 `vdd-supply`**——这就是为什么读它可以不做 r282 那一赌：
+   没有任何一条记录说这页需要谁的钟先起；而核窗口（`0x05000000`）的同一句话是有前提的。
+3. **这一格读的不是电压。** `min/max-microvolt` 在这颗 compatible 上是**角号**（所以是 1 和 2，
+   不是 400000/925000），`corner-acc-map` 是两个角各自要的字段值。所以行里给的是
+   `raw=`（整字）、`l1=`（按 DT 自己的 pos/size 切出的字段）、`corner=`（1 或 2，用树自己的映射对回去），
+   **不声明这两个角在伏特上是多少**——那颗节点没有电压表，能说出电平的那条路是 §5.12⑤ 的 RPM。
+   判读之前有一枚必须先过的闸：`answered=`。`0xffffffff` 是本板「页没答」的形状（r282/r286 拿它当
+   GPUCC 的门禁用的就是这一条），而 **`bit-size=1` 将 `0xffffffff` 切出来正是 1，也就是角 1 自己要的值**——
+   先 mask 后判断会把一扇死页报成「角 1 已就位」。这就是第十五层那枚「一个字不许两义」在这一格的样子，
+   代码里钉成 `if (raw != kMemAccNoAnswer)`，两个 checker 各钉一处。
+4. **行有三种形状，缺行与形状不同是一回事还是两回事，要说死。** `map=0 phys= size=`＝IOKit 拒了这段范围；
+   `… answered= raw= l1= corner= gpucc=0`＝读到了，但对照位所属的那扇 GPUCC 这一拍还没开（首拍必是这个形状，
+   因为 GPUCC 是在 `clover_gpu_power_on()` 里、GCC 那票验过之后才映射的）；完整形状才带 `cx_on= gx_on=`。
+   三种都要出声，因为「这靴没有 mem_acc 行」只能说明 GPU 定时器没拍，说明不了这页死不活——这是第十三层
+   （镜像里有这行≠本靴有读数）在这一格的落法，也是它进 `CloverSdhci` 独立 tee 类 `r311-gpu`（32）并被
+   免掉每拍上限的理由。
+5. **本格的仪器地平线（写明，别留给下一轮猜）。** `bit-size=1` 时字段只能是 0 或 1，两个值都在映射里，
+   所以 `corner=` 永远不会落在「映射外」；剩下的分辨力只有 `raw` 整字。若某靴读到 `raw=00000000`，
+   这一格**分不开**「角 2 的真值」与「整页读零」：本板已知的非应答形状是全 1，而同一 4 KiB 页里另一个
+   DT 节点 `qpdi@1fc1000`（`qcom,coresight-qpdi`，`clocks` 指两颗没查过的源）**没被任何记录证明带钟**，
+   拿它当对照就是 r282 拒掉的那种赌。因此 `raw=00000000` 的下一步不是再读一遍，而是找一个有出处的同页字——
+   在本板目前不存在。
+6. **r311 之后剩下的两格，按「不需要 RPM」排到「需要 RPM」。** 已发出的这一格答完，MEM_ACC 这条腿就没有
+   可离线推进的了；下一格是 §5.12⑤ 的 **pm660l_s3_level 电平**，它要的是 RPM SMD 请求的读法，
+   而我们的引导链从未发过这种请求——**这一格要先在宿主上钉住「读一个已发的 level」到底读哪儿**
+   （`qcom,set = <3>` 的语义与 RPM 侧的镜像），不是先写驱动。GPU 主线仍按 CPU-first：本线只读不写。

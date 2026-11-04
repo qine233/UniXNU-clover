@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // clover (Mi Pad 4, SDM660): the registers the GPU line's first reading touches, and nothing else.
 //
-// Every address below is the board's own, not a nearby SoC's. The two windows are the DT nodes
-// `clock-controller@100000` (GCC, reg = <0x100000 0x94000>) and `gfx@5065000` (GPUCC, reg =
-// <0x5065000 0x10000>). The register offsets inside them come from that tree's own clock drivers;
+// Every address below is the board's own, not a nearby SoC's. The windows are the DT nodes
+// `clock-controller@100000` (GCC, reg = <0x100000 0x94000>), `gfx@5065000` (GPUCC, reg =
+// <0x5065000 0x10000>), `qcom,kgsl-3d0@5000000` (the GPU core, reg = <0x5000000 0x40000>) and
+// `regulator@01fcf004` (the L1 MEM_ACC select, reg = <0x1fcf004 0x4>); every one of those four bases
+// and sizes is compared against this unit's own `/proc/device-tree/soc/*/reg` dump by
+// scripts/check-clover.py. The register offsets inside them come from that tree's own clock drivers;
 // the GPU GDSC nodes come from its `msm-gdsc-660.dtsi`. A later round that writes any of these
 // registers inherits the same map, which is why the offsets are quoted with their source rather
 // than typed once into a probe.
@@ -131,6 +134,51 @@
 #define kGpuccLdoStatus1    0x9024U   // LDO_STATUS1_REG (:54)
 #define kGpuccLdoRefX1      0x902cU   // REF_CURRENT_X1_REG (:61)
 #define kGpuccLdoRefX2      0x9030U   // REF_CURRENT_X2_REG (:62)
+
+// Round311, the L1 domain's memory-accessor corner select. `regulator@01fcf004` in the tree this
+// unit actually ships (`~/mu-clover/Resources/DTBs/clover.dtb`, sha256 815b8255..., read with
+// `dtc -I dtb -O dts` at :7633-7645 -- the method §5.12 requires, not the vendor dtsi) is the only
+// MEM_ACC node in the tree, and the GPU's own CPR4 corner consumer points at it:
+// `cpr4-ctrl@05061000` has `mem-acc-supply = <0x163>` and 0x163 is this node's phandle. Verbatim:
+//
+//   compatible = "qcom,mem-acc-regulator";
+//   reg = <0x1fcf004 0x04>;
+//   reg-names = "acc-sel-l1";
+//   regulator-name = "gfx_mem_acc_corner";
+//   regulator-min-microvolt = <0x01>;
+//   regulator-max-microvolt = <0x02>;
+//   qcom,corner-acc-map = <0x01 0x00>;
+//   qcom,acc-sel-l1-bit-pos = <0x00>;
+//   qcom,acc-sel-l1-bit-size = <0x01>;
+//   phandle = <0x163>;
+//
+// Two things make this the next reading rather than any other word on the board. It is pure MMIO --
+// four bytes, one register, and the node declares no clocks and no supply of its own, so touching it
+// is not the unclocked-bus gamble the GPU core window is. And §5.12 established that this board's GX
+// corner is not the GFX LDO at all (`vdd-supply` is a stub regulator, `system-supply` is
+// pm660l_s3_level whose level is an RPM SMD request this boot chain has never sent), so mem-acc is
+// the half of the same question that can be answered without an RPM.
+#define kMemAccPhys         0x01fcf004ULL
+#define kMemAccSize         0x4U
+// The field the node describes: bit-pos 0, bit-size 1. The row prints the whole word as well, because
+// a reading that keeps only the field cannot tell a live 0 from a page that reads zero.
+#define kMemAccBitPos       0U
+#define kMemAccBitSize      1U
+#define kMemAccFieldMask    ((((1u << kMemAccBitSize) - 1u) << kMemAccBitPos))
+// The corners this node offers, from `regulator-min-microvolt`/`-max-` -- for this compatible those
+// two properties carry corner numbers, which is why they read 1 and 2 and not 400000/925000 -- and
+// the field value each corner asks for, in the order `qcom,corner-acc-map` lists them: corner 1 ->
+// 0x01, corner 2 -> 0x00. Nothing here claims to know what the two corners mean in volts: the node
+// has no voltage table, and §5.12 says the level that does exist is an RPM request.
+#define kMemAccMinCorner    1U
+#define kMemAccMaxCorner    2U
+#define kMemAccCorner1Field 0x01U
+#define kMemAccCorner2Field 0x00U
+// All-ones is this board's "the page did not answer" signature -- the same one round282 and round286
+// gate GPUCC behind. It has to be tested on the word before the field is cut out of it: with
+// bit-size 1 the masked field of 0xffffffff is 1, which is also corner 1's own map value, so a row
+// that decoded first and asked later would report a dead page as a powered corner.
+#define kMemAccNoAnswer     0xffffffffU
 
 // gdsc.c:32 SW_COLLAPSE_MASK = BIT(0), written 0 to power on; gdsc-regulator.c:33 PWR_ON_MASK =
 // BIT(31). The pair is what makes a read-only row decodable: "bit31=1 and bit0=0" is powered on and

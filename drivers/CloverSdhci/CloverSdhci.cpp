@@ -1124,6 +1124,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // census was capped, not that the page is silent -- and the census is the baseline the next round's
   // writes would be judged against, so losing it silently is the one outcome this class exists to prevent.
   { "clover r294: ", "r294-gpu", 32, 0, 0, 0 },
+  // Round311 adds the MEM_ACC corner row to the same schedule: one more row per fire, own class, own
+  // exemption -- for the reason r291 gave. This row is the only place the L1 select is read, and it
+  // has three shapes (map=0, gpucc=0, the full row) whose difference is the whole reading; a class
+  // that capped the full row but kept the map=0 one would leave a boot saying "the page was refused"
+  // when the page answered fifteen times.
+  { "clover r311: ", "r311-gpu", 32, 0, 0, 0 },
   // Round295 walks the send chain, at most one row per hop and five hops per fire, on the same clock as the
   // two censuses it is read beside. Twenty fires to the deadline is a hundred rows, so 128 is the same
   // headroom r265-peer was given rather than a promise about how deep this boot's chain goes: the row that
@@ -4739,7 +4745,13 @@ static void teeConsumeLine (uint32_t &pushed)
        // no printed copy says the console lost it; neither says the sampler never ran). A per-pass cap
        // that ate the printed half would turn "the tee is blind" into "the relay is dead", which is the
        // one confusion this round was written to keep out of the next control round.
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r308"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r308") ||
+       // Round311 rides with the other GPU rows for the reason r286 gave: the schedule prints beside the
+       // censuses, and its row is the only place the L1 MEM_ACC select is read. The sharper half is that
+       // this row has three shapes and the difference between them is the reading -- a per-pass cap that
+       // ate the answered shape and left the refused one would report a page that answered as a page that
+       // was never mapped. The class budget of 32 still bounds it.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r311"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.
