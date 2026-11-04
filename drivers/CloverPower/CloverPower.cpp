@@ -2,6 +2,18 @@
 // clover (Mi Pad 4, SDM660): the power instrument -- can this kernel ask a PMIC what state a rail
 // is in, and what does the answer say about the touch controller's supplies?
 //
+// DOCUMENTED CONTRACT (round314; the clause list is notes/unixnu-doc-conformance.md §2)
+//
+// Built-in XNU layer per docs/drivers/overview.md:11-16; archive per docs/drivers/xnu-drivers.md:118-124;
+// object ABI per docs/drivers/xnu-drivers.md:106-116 (build-arm-driver.py:120,129). The five SPMI windows
+// are board constants decoded from this unit's tree, as docs/drivers/xnu-drivers.md:215 prescribes for a
+// device below the arm-io range, and are bound to that tree by check_device_tree_constants(). It is the
+// worked example followed most closely in this repository: docs/drivers/native-novatek-touch.md:73-85
+// (constants with sources), :87-98 (staged boot argument, off by default) and :130-137 rules 1 and 3 (the
+// pure floor plan in PowerArb.h, host-tested before the hardware probe by
+// scripts/test-clover-power.py). No personality, so no plist per docs/drivers/xnu-drivers.md:14; the
+// reasons and the three prerequisites are notes/unixnu-doc-conformance.md §5.
+//
 // WHY THIS FILE EXISTS
 //
 // Schedule item 6 is power, and round181 is the reason it comes now. That driver asked the panel's

@@ -34,19 +34,39 @@
 // WHY IT RUNS FROM sheng_pmgr_run()
 //
 // An in-kernel UniXNU driver normally starts from a personality compiled into
-// iokit/KernelConfigTables.cpp by a patch under patches/xnu (docs/drivers/xnu-drivers.md:14,
-// :149). A device repository cannot add one: feeds.py resolves modules by (kind, name) and takes
-// the first path that exists, so a device-side `patches/xnu` would replace the base repository's
-// directory -- hundreds of upstream patches -- rather than extend it (round86 hit this same wall
-// from the other side, for osfmk/console). The alternative the base tree does offer is
-// kits/NativePrelink/patches/*.patch, but reaching it means the device repo taking over the whole
-// NativePrelink kit to smuggle one patch, which is the wrong kind of clever.
+// iokit/KernelConfigTables.cpp by a patch (docs/drivers/xnu-drivers.md:14, :149;
+// docs/guide/build-kernel.md:135). Until round314 this paragraph claimed a device repository could not
+// add one. Round314 measured that and it is false: 73 clover patches are tracked in the base
+// repository right now (`git ls-files patches/xnu | grep -c clover` = 73 against ~/UniXNU), and the
+// assembled tree links both out/clover/tree/patches/xnu -> the base directory and
+// out/clover/tree/patches/xnu-clover -> this repository's. What is actually true is narrower, and is
+// why the two directories carry different names: the kernel applies the *base* series, so a clover
+// patch has to be committed there to run, and this repository keeps the copy that gets reviewed
+// (a device-side directory named `patches/xnu` would shadow the upstream set rather than join it --
+// the wall round86 hit from the other side, for osfmk/console).
+//
+// Three concrete things, not a blocked mechanism, are what keep this driver off the documented path
+// (recorded as notes/unixnu-doc-conformance.md §5):
+//
+//   1. There is no provider to match. scripts/make-clover-adt.py:316-321 publishes exactly one
+//      /arm-io child, intc, so IOPlatformDevice + IONameMatch (docs/drivers/device-tree-matching.md
+//      :20-28) would match nothing for sdhci, spmi, gpu, i2c or dsp on this board.
+//   2. Probe order cannot express what this port needs. IOProbeScore orders candidates
+//      (docs/drivers/device-tree-matching.md:151-159); it cannot say "the DSP census reads a heap
+//      whose rings the block driver has to have armed first", which is why CloverPMGR chains
+//      emmc -> input -> power -> dsp.
+//   3. The archives are linked without -Wl,-force_load. docs/drivers/xnu-drivers.md:128-145 asks for
+//      it and the base script appends CONFIG_XNU_EXTRA_LD_ARCHIVES raw
+//      (build-xnu-4k-baseline.sh:1002), so a class nobody calls -- which is precisely what a
+//      personality-started driver is -- would be dropped by the linker. Round314 measured the
+//      consequence today: every Clover object's own exported symbols are in the linked kernel, so
+//      nothing of ours is lost; check-clover.py now checks that instead of trusting it.
 //
 // So the driver exports `clover_emmc_run()` and CloverPMGR calls it at the end of
 // `sheng_pmgr_run()`, the bsd_init.c hook this board has already been running through since
 // round83 (CONFIG_XNU_SHENG_PMGR, after bsd_bufferinit, with IOKit up and the panic screen
-// armed). That is a scheduling decision, not a design one: the day this port has its own patch
-// slot it gets its own personality.
+// armed). That is a scheduling decision, not a design one: closing it means the three items above,
+// in that order, and none of them is missing an upstream permission.
 //
 // WHAT IT DOES NOT CLAIM
 //

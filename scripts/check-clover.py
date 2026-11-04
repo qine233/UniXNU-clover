@@ -6173,8 +6173,8 @@ def check_board(errors: list) -> str:
     # function of the arbiter's own version word, and that driver has never been in a boot whose title
     # named it, because clover-power has always been commented out. Its new lines are stamped r313 and
     # the round182 lines keep their origin stamp, which is the reason the tee now budgets both tokens.
-    if not board["payload"]["title"].startswith("clover r313:"):
-        errors.append('[payload] title is not "clover r313: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r314:"):
+        errors.append('[payload] title is not "clover r314: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7319,8 +7319,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r313:"):
-        errors.append('[payload] title is not "clover r313: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r314:"):
+        errors.append('[payload] title is not "clover r314: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -8243,6 +8243,268 @@ def check_tree(errors: list) -> str:
     return "modules visible" if not missing else f"{len(missing)} missing"
 
 
+# Round314 (standing rule: "驱动均需要参考 unixnu 文档制作").  The clause list and the per-driver
+# verdicts are notes/unixnu-doc-conformance.md; what lands here are the four structural facts that
+# can be decided from the files alone, so the rule cannot rot back into a habit.  Nothing in this
+# group needs a built kernel, and the group that does is honest about it (see check_driver_products).
+DOC_CITATION = re.compile(r"(?<![\w/.-])([A-Za-z0-9_./-]+\.md):(\d+)(?:-(\d+))?")
+OWN_SOURCE_CITATION = re.compile(r"(?<![\w/.-])([A-Za-z0-9_]+\.cpp):(\d+)")
+
+
+def driver_docs_root() -> pathlib.Path | None:
+    """Where the clause files actually live.
+
+    Measured in round314: the device repository has no `docs/` tree at all (`ls` of it is the only
+    way to see this), so every `docs/**` citation in a driver README points into the base checkout.
+    A host without that checkout gets a notice, not a failure -- the rest of the group still runs.
+    """
+    for candidate in (REPO.parent / "UniXNU" / "docs", pathlib.Path.cwd() / "docs",
+                      pathlib.Path.home() / "UniXNU" / "docs"):
+        if (candidate / "drivers/xnu-drivers.md").is_file():
+            return candidate
+    return None
+
+
+def own_source_basenames() -> set:
+    """Basenames of the C++ files this repository edits, which is what §8 of the note forbids
+    citing by line number.  Vendored sources keep their line numbers: they do not move under us."""
+    return {path.name for path in REPO.glob("*/**/*.cpp")} | {path.name for path in REPO.glob("*/*.cpp")}
+
+
+def check_driver_documentation(errors: list) -> str:
+    """Every drivers/<name> is written against the UniXNU driver docs, and the checker can see it.
+
+    docs/drivers/xnu-drivers.md:7-14 makes the reference record part of a driver's layout and
+    :230-239 makes the test rows part of it, so a README that never names a clause is a driver that
+    was not written against the docs no matter what it does at runtime.  Four checks follow:
+
+      1. a driver with source has a README (clause 二's layout, and the only place the rest of the
+         rule can be recorded);
+      2. that README cites at least one `docs/**.md:<line>` clause, and every citation resolves --
+         in the base docs tree or in this repository -- to a file that has the cited line;
+      3. a driver without an `Info.plist` says so, because `:14` treats the plist as the record of a
+         personality and silence reads as an oversight; a driver *with* one has to be reachable by a
+         personality patch, because otherwise the plist records nothing;
+      4. no citation names one of this repository's own `.cpp` files by line number -- notes/
+         unixnu-doc-conformance.md §8, which this very round wrote after its own header insertions
+         invalidated every one of them.
+    """
+    docs = driver_docs_root()
+    mutable = own_source_basenames()
+    patches = REPO.parent / "UniXNU" / "patches"
+    patch_text = ""
+    if patches.is_dir():
+        patch_text = "\n".join(path.read_text(errors="replace")
+                               for path in patches.glob("**/*.patch"))
+    line_counts: dict = {}
+    checked = 0
+    for directory in sorted((REPO / "drivers").glob("*/")):
+        name = directory.name
+        sources = list(directory.glob("*.cpp"))
+        if not sources:
+            continue
+        checked += 1
+        readme = directory / "README.md"
+        if not readme.is_file():
+            errors.append(f"drivers/{name} has {sources[0].name} but no README.md: "
+                          "docs/drivers/xnu-drivers.md:7-14 makes the reference record part of the "
+                          "layout, and the clause list it must name has nowhere else to live")
+            continue
+        text = readme.read_text()
+        if not re.search(r"UniXNU [Dd]river [Dd]ocumentation|meets the UniXNU", text):
+            errors.append(f"drivers/{name}/README.md has no section naming the UniXNU driver "
+                          "documentation it was written against: the rule is '驱动均需要参考 unixnu "
+                          "文档制作', and a reader cannot tell that from a README that never cites")
+        citations = DOC_CITATION.findall(text)
+        if not any(path.startswith(("docs/", "drivers/", "porting/", "guide/"))
+                   for path, _, _ in citations):
+            errors.append(f"drivers/{name}/README.md cites no docs/**.md clause: every driver is "
+                          "authored against the documented clauses "
+                          "(docs/drivers/overview.md:11-16 and docs/drivers/xnu-drivers.md), and a "
+                          "README with no clause citation is the shape this rule replaced")
+        for path, first, last in citations:
+            first, last = int(first), int(last or first)
+            relative = path[len("docs/"):] if path.startswith("docs/") else path
+            target = (docs / relative) if docs is not None else None
+            if target is None or not target.is_file():
+                target = REPO / path
+            if not target.is_file():
+                errors.append(f"drivers/{name}/README.md cites {path}:{first} and that file is in "
+                              f"neither the base docs tree nor this repository: a citation nobody "
+                              "can open is worse than none")
+                continue
+            lines = line_counts.get(str(target))
+            if lines is None:
+                lines = len(target.read_text(errors="replace").splitlines())
+                line_counts[str(target)] = lines
+            if last > lines:
+                errors.append(f"drivers/{name}/README.md cites {path}:{first}-{last} but the file "
+                              f"has {lines} lines: the clause moved or the range was written wrong")
+        for match in OWN_SOURCE_CITATION.finditer(text):
+            if match.group(1) in mutable:
+                errors.append(f"drivers/{name}/README.md cites {match.group(0)}: this repository "
+                              f"edits {match.group(1)}, so its line numbers rot the moment a later "
+                              "round inserts a comment -- use a function, constant or sub-heading "
+                              "name instead (notes/unixnu-doc-conformance.md §8)")
+        plist = directory / "Info.plist"
+        if not plist.is_file() and "Info.plist" not in text:
+            errors.append(f"drivers/{name} ships no Info.plist and its README never says so: "
+                          "docs/drivers/xnu-drivers.md:14 treats the plist as the record of a "
+                          "personality, so a driver without one has to state why (no class, no "
+                          "match, chained entry point)")
+        if plist.is_file() and patch_text and name not in patch_text:
+            errors.append(f"drivers/{name}/Info.plist exists but no patch under the base "
+                          "repository's patches/ names this driver: a plist that records no "
+                          "personality is the file the docs call a reference to a real record "
+                          "(docs/drivers/xnu-drivers.md:147-168)")
+    if docs is None:
+        print("[check-clover] notice: the base repository's docs/ tree is not visible from here, so "
+              "clause citations were counted but not resolved against their files", file=sys.stderr)
+    return f"drivers documented: {checked}"
+
+
+# The product half of the same rule.  Every builder in this repository already refuses an object
+# that is not the iOS 17 kernel's own ABI (build-arm-driver.py:120,129, build-clover-block.py:142,144,
+# build-clover-pmgr.py:150,152, and the magic/CPU/subtype triple first in
+# kits/NativePrelink/native_prelink.py), so the hole is not the compile step -- it is that nothing
+# re-reads what the link actually took.  configs/clover_defconfig links these archives raw, with no
+# -Wl,-force_load, so an archive whose only exported symbol stops being referenced disappears from
+# the kernel without any step failing.  This group reads the built archives and the linked kernel.
+DRIVER_ARCHIVES = (
+    ("clover-sdhci", "libCloverSdhci.a", ("_clover_emmc_run",)),
+    ("clover-block", "libCloverBlock.a", ("_clover_block_run", "_clover_block_request")),
+    ("clover-input", "libCloverInput.a", ("_clover_input_run",)),
+    ("clover-power", "libCloverPower.a", ("_clover_power_run",)),
+    ("clover-dsp", "libCloverDsp.a", ("_clover_dsp_run",)),
+    ("clover-gpu", "libCloverGpu.a", ("_clover_gpu_run",)),
+    ("sheng-platform-power", "libShengPlatformPower.a", ("_sheng_pmgr_run",)),
+    ("armcpu", "libArmCpu.a", ()),
+    ("native-hid-input", "libNativeHidInput.a", ()),
+    ("native-keystore-events", "libNativeKeyStoreEvents.a", ()),
+    ("native-legacy-display", "libNativeLegacyDisplay.late.a", ()),
+    ("native-gop-presenter", "libNativeGOPPresenter.a", ()),
+)
+
+
+def archive_members(blob: bytes) -> list:
+    """(name, bytes) for every member of a `!<arch>` file, skipping the symbol tables.
+
+    The headers are fixed-width, not space-separated: macOS writes `__.SYMDEF SORTED` as its first
+    member, and splitting on whitespace would shift every later field by one token and read a
+    nonsense size.  BSD long names use the `#1/<len>` form, where the name itself is stored in front
+    of the data and counted in the member size, which is how `NativeLegacyDisplay.o` fits a 16-byte
+    name field.
+    """
+    if not blob.startswith(b"!<arch>\n"):
+        return []
+    members, offset = [], 8
+    while offset + 60 <= len(blob):
+        header = blob[offset:offset + 60]
+        if header[58:60] != b"`\n":
+            break
+        name = header[0:16].decode("ascii", "replace").rstrip()
+        try:
+            size = int(header[48:58])
+        except ValueError:
+            break
+        start, extra = offset + 60, 0
+        if name.startswith("#1/"):
+            extra = int(name[3:])
+            name = blob[start:start + extra].split(b"\0")[0].decode("ascii", "replace")
+            start += extra
+        # `__.SYMDEF` is the BSD symbol table, `//` the GNU name string table and `/<n>` a member
+        # whose name lives in that table.  None of them is a driver object.
+        if not name.startswith("/") and not name.startswith("__.SYMDEF"):
+            members.append((name.rstrip("/"), blob[start:start + size - extra]))
+        offset = offset + 60 + size + (size & 1)
+    return members
+
+
+def mach_object_abi(blob: bytes) -> str | None:
+    """None when `blob` is an arm64 iOS-17 Mach-O object, else why it is not.
+
+    The five fields are docs/drivers/xnu-drivers.md:106-116 read off the file: magic 0xfeedfacf,
+    CPU type 0x0100000c with subtype 0, filetype 1 (MH_OBJECT), and an LC_BUILD_VERSION whose
+    platform is 2 (iOS) at minimum 0x110000.  Same numbers the builders check, applied here to the
+    bytes that went into the archive rather than to the compiler that made them.
+    """
+    if len(blob) < 32 or struct.unpack_from("<I", blob, 0)[0] != 0xFEEDFACF:
+        return "not a 64-bit little-endian Mach-O (magic is not 0xfeedfacf)"
+    cpu, subtype, kind = struct.unpack_from("<III", blob, 4)
+    if (cpu, subtype) != (0x100000C, 0):
+        return f"CPU type 0x{cpu:x} subtype {subtype}, not arm64 (0x100000c, 0)"
+    if kind != 1:
+        return f"Mach-O file type {kind}, not MH_OBJECT (1)"
+    ncmds = struct.unpack_from("<I", blob, 16)[0]
+    offset, build = 32, None
+    for _ in range(ncmds):
+        command, size = struct.unpack_from("<II", blob, offset)
+        if command == 0x32:
+            build = struct.unpack_from("<II", blob, offset + 8)
+        offset += size
+    if build is None:
+        return "no LC_BUILD_VERSION: nothing names the kernel this object links against"
+    if build != (2, 0x110000):
+        return f"build version platform {build[0]} minimum 0x{build[1]:x}, not iOS (2) at 0x110000"
+    return None
+
+
+def kernel_image() -> pathlib.Path | None:
+    for candidate in (pathlib.Path.cwd().parent / "kernel/kernel.macho",
+                      REPO.parent / "UniXNU/out/clover/kernel/kernel.macho"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def check_driver_products(errors: list) -> str:
+    """Re-read the built archives and the linked kernel against the documented object ABI.
+
+    Absent products are a notice, because `check-clover.py` also runs on a host that has never
+    built: what it must never do is pass silently, since a missing archive here is exactly the
+    silent drop the raw (non-force_load) link makes possible.
+    """
+    roots = [pathlib.Path.cwd() / "build", REPO / "build"]
+    found, objects, notices = 0, 0, []
+    kernel = kernel_image()
+    image = kernel.read_bytes() if kernel else None
+    for directory, archive_name, symbols in DRIVER_ARCHIVES:
+        archive = next((root / directory / archive_name for root in roots
+                       if (root / directory / archive_name).is_file()), None)
+        if archive is None:
+            notices.append(f"{directory}/{archive_name}")
+            continue
+        found += 1
+        for member, blob in archive_members(archive.read_bytes()):
+            if not blob.startswith(b"\xcf\xfa\xed\xfe"):
+                continue
+            objects += 1
+            problem = mach_object_abi(blob)
+            if problem:
+                errors.append(f"build/{directory}/{archive_name}[{member}] is {problem}: "
+                              "docs/drivers/xnu-drivers.md:106-116 is the ABI the kernel takes, and "
+                              "the builders check the same five fields -- this is the copy that the "
+                              "link actually read")
+        if image is None:
+            continue
+        for symbol in symbols:
+            if symbol.encode() not in image:
+                errors.append(f"{kernel} has no {symbol}: the archive built it but the kernel does "
+                              f"not contain it, which is what a raw link does to an archive nothing "
+                              "references (docs/drivers/xnu-drivers.md:128-145 is the clause that "
+                              "would have kept it by force_load; configs/clover_defconfig:66-69 is "
+                              "the reason this board does not use it)")
+    for notice in notices:
+        print(f"[check-clover] notice: {notice} is not built; run from out/clover/tree to check the "
+              "object ABI of the copy the link read", file=sys.stderr)
+    if image is None and found:
+        print("[check-clover] notice: no kernel.macho next to the archives, so link presence was "
+              "not checked", file=sys.stderr)
+    if not found:
+        return "products not built (notices above)"
+    return f"{found} archives, {objects} objects ABI-checked, kernel " + ("read" if image else "absent")
+
+
 def main() -> int:
     errors: list = []
     adt_summary = check_adt(errors)
@@ -8251,12 +8513,15 @@ def main() -> int:
     dt_summary = check_device_tree_constants(errors)
     asm_summary = check_inline_asm(errors)
     tree_summary = check_tree(errors)
+    doc_summary = check_driver_documentation(errors)
+    product_summary = check_driver_products(errors)
     for error in errors:
         print(f"[check-clover] {error}", file=sys.stderr)
     if errors:
         return 1
     print(f"[check-clover] clover ok: ADT {adt_summary}; {region_summary}; "
-          f"board {board_summary}; DT {dt_summary}; {asm_summary}; {tree_summary}")
+          f"board {board_summary}; DT {dt_summary}; {asm_summary}; {tree_summary}; "
+          f"{doc_summary}; {product_summary}")
     return 0
 
 

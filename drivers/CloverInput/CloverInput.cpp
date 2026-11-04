@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // clover (Mi Pad 4, SDM660): the touch bus instrument -- can this kernel reach the panel's I2C?
 //
+// DOCUMENTED CONTRACT (round314; the clause list is notes/unixnu-doc-conformance.md §2)
+//
+// Built-in XNU layer per docs/drivers/overview.md:11-16; archive per docs/drivers/xnu-drivers.md:118-124;
+// object ABI per docs/drivers/xnu-drivers.md:106-116 (checked by build-arm-driver.py:120,129). The QUP
+// address is a board constant because there is no arm-io node for it, as docs/drivers/xnu-drivers.md:215
+// prescribes, and the staged boot argument of docs/drivers/native-novatek-touch.md:87-98 is what
+// clover-input=1/2/3 is. Against the worked example's rules at :130-137 this file is honest about its
+// own gap: rules 1 and 3 (a pure layer separated behind a bus struct, host tests for it before the
+// hardware probe) are NOT met here -- drivers/CloverPower/PowerArb.h and drivers/CloverDsp/DspCore.h
+// show the shape, and notes/unixnu-doc-conformance.md §7 schedules it. No personality, so no plist per
+// docs/drivers/xnu-drivers.md:14; see notes/unixnu-doc-conformance.md §5.
+//
 // WHY THIS FILE EXISTS
 //
 // Schedule item 5 is "input": a tablet that boots without a digitizer cannot be driven, and the first

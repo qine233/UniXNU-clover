@@ -4,6 +4,20 @@
 // package/ShengPlatformPower.cpp, which solves the same structural problem (a board with no
 // Apple PMGR hardware behind a prelinked AMFI that insists on one).
 //
+// DOCUMENTED CONTRACT (round314; the clause list is notes/unixnu-doc-conformance.md §2)
+//
+// This is the one board driver that does have the class shape of docs/drivers/xnu-drivers.md:19-64:
+// CloverPlatformPower is an IOService subclass (:122-136) that publishes itself with registerService()
+// (:227-228) -- but its provider is not a device-tree match. docs/drivers/overview.md:29-40 describes binding
+// through IOKitPersonalities against an ADT nub, and this board's ADT has no PMGR node
+// (scripts/make-clover-adt.py:316-321 publishes one /arm-io child, intc), so the class instead rides the
+// prelinked component of the original kernelcache: OSKextLoadKextWithIdentifier registers ApplePMGR and
+// ApplePMGRNub (:173), and com.apple.driver.ApplePMGR is a [kernel.prelink] root (board.toml:92).
+// docs/drivers/kexts.md:117 is why that is the only route -- the shipped DarwinBoot refuses a request
+// with staged kexts, so nothing can be injected at runtime. Archive per :118-124 of xnu-drivers.md; the
+// object ABI of :106-116 is not checked by this driver's own builder (build-clover-pmgr.py), so
+// check-clover.py checks the built members instead (notes/unixnu-doc-conformance.md §4).
+//
 // What AMFI actually needs, from the base repository's scripts/audit-amfi-pmgr-contract.py,
 // checked against the bytes of our own out/clover/kernel/kernel.macho: it builds
 // IOService::serviceMatching("ApplePMGRNub") and calls IOService::waitForMatchingService with a

@@ -125,3 +125,30 @@ no edge is cleared. No GLINK, APR or QRTR packet, and no claim that a channel ex
 is allocated. No clocks or rails voted: the `vdd_cx` question belongs to the SPMI/RPM path that
 round182 measured and round184 may ask to switch. And no register read of `qcom,icnss@18800000`, the
 Wi-Fi block itself — only its MSA memory, which is a memory question rather than a register one.
+## How this driver meets the UniXNU driver documentation
+
+Layer, archive wiring and object ABI follow `docs/drivers/overview.md:11-16`,
+`docs/drivers/xnu-drivers.md:118-124` (`build-arm-driver.py CloverDsp` in `board.toml`'s
+`[kernel] archives`, the key documented in `docs/porting/device-repository.md:113`) and
+`docs/drivers/xnu-drivers.md:106-116`, which `build-arm-driver.py` audits as "actual ARM64/iOS 17 object
+audit passed". Like every `clover-*` archive here, it reaches the link through
+`CONFIG_XNU_EXTRA_LD_ARCHIVES` (`configs/clover_defconfig:70`) rather than a `CONFIG_XNU_<NAME>` switch,
+and that variable is appended raw at `build-xnu-4k-baseline.sh:1002` — so, unlike the base build's own
+archives (`:823-848`), it arrives without the `-Wl,-force_load` of `docs/drivers/xnu-drivers.md:128-145`.
+What that costs, and why nothing is missing today, is measured in
+`notes/unixnu-doc-conformance.md` §4.
+
+The two windows are board constants rather than provider properties, which is what
+`docs/drivers/xnu-drivers.md:215` prescribes for a device below the `arm-io` range — this board's ADT
+publishes no SMEM or APCS node. No class of `docs/drivers/xnu-drivers.md:19-64` and no personality of
+`:147-168`, hence no `Info.plist` per `:14`: `extern "C" void clover_dsp_run(void)`, chained from `CloverPMGR`,
+with the reasons and the three prerequisites in `notes/unixnu-doc-conformance.md` §5.
+
+Against the five rows of `docs/drivers/xnu-drivers.md:230-239`, this is one of the two clover drivers
+that has all but the last: compile gated, object ABI gated, **host logic gated** — `DspCore.h` is the pure
+decode layer, `tests/clover_dsp_host.cpp` compiles it on the host and `scripts/test-clover-dsp.py` runs
+it, which is rule 3 of `docs/drivers/native-novatek-touch.md:130-137` ("write host tests for the pure
+helpers before the hardware probe") and rule 1 (separate the pure core from a bus struct). Kernel boot
+and hardware are the on-board loop. Its boot argument is the one instrument this port has deliberately
+left switched off: `"clover-dsp=3"` is commented out in `board.toml:2534`, because reading another
+processor's heap is the level that has to be earned by a log, not assumed — rule 6 of the same six.

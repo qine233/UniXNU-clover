@@ -3,6 +3,18 @@
 // the ADSP, does anybody own the doorbell, and was the DSP's firmware ever put in place by *this* boot
 // chain?
 //
+// DOCUMENTED CONTRACT (round314; the clause list is notes/unixnu-doc-conformance.md §2)
+//
+// Built-in XNU layer per docs/drivers/overview.md:11-16; archive per docs/drivers/xnu-drivers.md:118-124;
+// object ABI per docs/drivers/xnu-drivers.md:106-116 (build-arm-driver.py:120,129). Shared-memory access
+// is the DMA question of docs/drivers/xnu-drivers.md:186-194, taken here through the block driver's rings
+// rather than an IOMMU context, because clover has no SMMU path for this client yet. It runs after
+// clover_emmc_run() on purpose -- the heap it reads only means something once the rings that carry its
+// report exist -- and that ordering is the thing docs/drivers/device-tree-matching.md:151-159 cannot
+// express, which is why this is a chained entry point (notes/unixnu-doc-conformance.md §5). Worked-example
+// rules 1 and 3 of docs/drivers/native-novatek-touch.md:130-137 are met: the decode arithmetic is pure in
+// DspCore.h and host-tested by scripts/test-clover-dsp.py before any hardware touches it.
+//
 // WHY THIS FILE EXISTS
 //
 // Schedule item 5 is network and audio, and on this board neither of those words describes something

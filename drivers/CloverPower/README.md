@@ -164,3 +164,28 @@ write, no mode write, no pull-down, no soft-start, no RPM protocol. And no claim
 microvolts for a subtype this port has not proven: for anything but MAIN's L660 parts `0x40` is a
 range selector and `0x41` an index into a table nobody has read, so the report prints the raw bytes
 and says so.
+## How this driver meets the UniXNU driver documentation
+
+Layer, wiring and object ABI are the documented ones: `docs/drivers/overview.md:11-16`,
+`docs/drivers/xnu-drivers.md:118-124` (`build-arm-driver.py CloverPower` in `[kernel] archives`) and
+`docs/drivers/xnu-drivers.md:106-116`, the last of which `build-arm-driver.py:120,129` checks. The
+archive reaches the link through `CONFIG_XNU_EXTRA_LD_ARCHIVES` (`configs/clover_defconfig:70`), appended
+raw at `build-xnu-4k-baseline.sh:1002` and so without the `-Wl,-force_load` of
+`docs/drivers/xnu-drivers.md:128-145` — measured in `notes/unixnu-doc-conformance.md` §4. The five
+windows are board constants because `docs/drivers/xnu-drivers.md:215` is what applies to a device below
+the `arm-io` range, and each one is bound to the flashed tree by `check_device_tree_constants()`.
+
+It has the class-shape gap of `docs/drivers/xnu-drivers.md:19-64` the other clover instruments have:
+no IOService subclass, no personality, no `Info.plist` (`docs/drivers/xnu-drivers.md:14` treats the
+plist as a personality's record), reached instead as
+`extern "C" void clover_power_run(void)` chained from `CloverPMGR` — §5 of the conformance note.
+
+What it does have, and what makes it the template rather than the exception, is the fourth test row of
+`docs/drivers/xnu-drivers.md:230-239`: the floor-plan arithmetic is a pure header (`PowerArb.h`),
+`tests/clover_power_host.cpp` compiles it against a fake arbiter on the host, and
+`scripts/test-clover-power.py` runs it — rules 1 and 3 of `docs/drivers/native-novatek-touch.md:130-137`.
+Round313 is the round that proves the value of that pairing: the v3-vs-v5 direction question ("reading
+the wrong band's table silently shifts every APID instead of failing") was answered by the host model
+before any board was asked, and the vendor sources it rests on are cited slot by slot
+(`VEND:`/`MAIN:` against the two archived `spmi-pmic-arb.c` copies) rather than remembered. Its argument
+is shipped at the level the logs have earned: `clover-power=1` (`board.toml:2489`) is reads only.

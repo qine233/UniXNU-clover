@@ -88,3 +88,30 @@ returned this very nub. The full slot map is in `CloverPMGR.cpp` next to the arr
 No PMGR hardware exists on SDM660 in the sense XNU means it, no register map is claimed, and no
 secondary CPU is enabled by anything here. `unimplemented (slot)` is the honest answer for
 every power operation but the always-on pair, and it is loud on purpose.
+## How this driver meets the UniXNU driver documentation
+
+This is the clover driver that is closest to the documented shape, because it is a real IOService
+subclass: `class CloverPlatformPower : public ApplePMGR` is the class shape of
+`docs/drivers/xnu-drivers.md:19-64`, and the stages it runs — match, `start()`, publish by
+`registerService()`, the nub it hands AMFI — are the runtime table at `docs/drivers/xnu-drivers.md:219-228`.
+The `registerService()` calls are the last thing `start()` does, which is the order `:19-64` asks for, and
+the service it publishes is the one AMFI already looks for by class name.
+
+Layer and archive wiring follow `docs/drivers/overview.md:11-16` and
+`docs/drivers/xnu-drivers.md:118-124` — `build-clover-pmgr.py` in `[kernel] archives`,
+`CONFIG_XNU_SHENG_PMGR=y` in `configs/clover_defconfig`. The documented five-field object ABI of
+`:106-116` is checked by that builder itself: it requires filetype `1` and build version `(2, 0x110000)`
+(`build-clover-pmgr.py:150,152`), and the magic/CPU/subtype triple is refused earlier by the shared
+`kits/NativePrelink/native_prelink.py`. It is *not* a loadable kext and that is deliberate: the original
+`ApplePMGR` is a prelink root (`board.toml:92`) whose class this driver subclasses in the kernel, and
+`docs/drivers/kexts.md:117` is the reason a staged kext is not an option on this path — recorded in the
+source's own DOCUMENTED CONTRACT block.
+
+No personality, hence no `Info.plist`: `docs/drivers/xnu-drivers.md:14` makes the plist the record of a
+personality, and this driver has none — AMFI reaches it through its own
+`IOService::serviceMatching("ApplePMGRNub")`, not through `iokit/KernelConfigTables.cpp`. The chain of
+`extern "C"` entry points that replaced personalities for the other instruments, and the three concrete
+prerequisites for changing that, are `notes/unixnu-doc-conformance.md` §5. Against the five test rows of
+`docs/drivers/xnu-drivers.md:230-239` the gap is the third: the metaclass/`static_assert` arithmetic here
+has no host model, unlike `drivers/CloverPower/PowerArb.h` and `drivers/CloverDsp/DspCore.h`, and it is
+listed as an open item in §7.

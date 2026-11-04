@@ -2,6 +2,17 @@
 // clover (Mi Pad 4, SDM660): the GPU line's second step -- power the two GDSCs and the gfx3d branch
 // clock, read them back, and read chipid once the core can answer.
 //
+// DOCUMENTED CONTRACT (round314; the clause list is notes/unixnu-doc-conformance.md §2)
+//
+// Built-in XNU layer per docs/drivers/overview.md:11-16; archive wired per
+// docs/drivers/xnu-drivers.md:118-124; object ABI per docs/drivers/xnu-drivers.md:106-116, which
+// scripts/build-arm-driver.py:120,129 enforces. The four bases come from board constants, not from a
+// provider's reg property, because this board's ADT publishes no GPU node -- which is exactly what
+// docs/drivers/xnu-drivers.md:215 prescribes for a device below the arm-io range, and every one of them
+// is bound to the device's own tree by check_device_tree_constants(). No class of
+// docs/drivers/xnu-drivers.md:19-64 and no personality of :147-168, hence no plist per :14: the reasons
+// and the three prerequisites are notes/unixnu-doc-conformance.md §5.
+//
 // WHY THIS ROUND WRITES
 //
 // Round282 read the two windows and wrote nothing, because a first driver must not touch a power

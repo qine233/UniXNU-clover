@@ -2,6 +2,18 @@
 // clover (Mi Pad 4, SDM660): publish the eMMC as an IOBlockStorageDevice so XNU's own storage
 // stack, not this port's private PIO report, is what reads the card.
 //
+// DOCUMENTED CONTRACT (round314; the clause list is notes/unixnu-doc-conformance.md §2)
+//
+// docs/drivers/overview.md:11-16 puts a storage driver in the built-in XNU layer, which is where this
+// file is. docs/drivers/xnu-drivers.md:118-124 wires its archive; docs/drivers/xnu-drivers.md:106-116 is
+// the object ABI build-clover-block.py checks (kind == 1 and build_version (2, 0x110000), with the
+// magic/CPU/subtype triple rejected by kits/NativePrelink/native_prelink.py before that ever runs). The class shape of
+// docs/drivers/xnu-drivers.md:19-64 is what this file reaches for, and the paragraph below explains the
+// one rule it cannot follow -- IOStorageFamily is a prelinked component (board.toml:105), not
+// kernel-exported symbols. There is no personality, so docs/drivers/xnu-drivers.md:14 has no plist to
+// record; this driver is the IOResources client of docs/drivers/device-tree-matching.md:20-28, waiting on
+// the IOBSD resource. Chained entry point and why: notes/unixnu-doc-conformance.md §5.
+//
 // Round 111 left the logfs write path proven through IOMedia. Round 112 starts collecting the
 // instruments and moves up a layer: the partition table is no longer walked by hand. IOStorage
 // Family's IOGUIDPartitionScheme parses the GPT and publishes each entry as an IOMedia, and

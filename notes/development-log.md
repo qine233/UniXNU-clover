@@ -25293,3 +25293,100 @@ pm660 l11 仍是 SPMI PPID `0x04a`（`0x4a00`）、pm660l l3 仍是 `0x242`，�
 58,720,256 B。`check-clover.py` 与 `verify-clover-payload.py` 双绿（EXIT=0，0 FAIL，`pmic arbiter
 instrument linked` 那组 15 枚针脚全 present，含本轮新增的 `version legs`/`band verdict`/`positive control`/
 `floor plan`/`irq provenance`/`group indexing`/`window honesty`）。**未刷写**：boot 103 的卡上现场先读（#622）。
+
+## Round314（v0.7.26）：把「驱动要照 UniXNU 文档做」做成八条带行号的条款、11 份 README 与两道闸门
+
+**纯宿主轮：改的是文档、源码头注释与检查器，发了镜像，没有上机。** 常驻规矩是用户那句
+「驱动均需要参考 unixnu 文档制作」，本轮生效的指令仍是「我现在不在家，你直接完善别的开发吧」。
+所以这一轮的产物不是读数，是**让这句话下次还能被检查**的东西：`notes/unixnu-doc-conformance.md`
+（条款 + 逐颗判定 + 引用规矩）、11 份驱动 README 里各一节「怎么对上一份文档」、
+`check-clover.py` 里两条新闸门。
+
+**① 条款先落到行号。** `~/UniXNU/docs` 里对设备仓驱动成立的八条：层级
+（`drivers/overview.md:11-16`）、布局与「Info.plist 是 personality 的参考记录」（`drivers/xnu-drivers.md:7-14`）、
+类形状与运行期阶段表（`:19-64`、`:219-228`）、按内核 ABI 编译的五字段（`:71-116`）、归档接线
+（`:118-124` + `porting/device-repository.md:90-113` + `guide/build-kernel.md:131-134`）、
+`-Wl,-force_load`（`:128-145`，理由在 `:139`）、personality 与 `-DXNU_<NAME>`（`:147-168`）、
+测试五档（`:230-239`）；外加范例那六条落地规矩（`drivers/native-novatek-touch.md:130-137`）。
+11 颗驱动逐颗判定写在 §3，判定表是「审计当时的判断」，会动的 `.cpp` 一律用符号锚点（§8）。
+
+**② 本轮最大的一次自我更正（撤回一条我自己写下的论断）。** 前置记录说
+`build-clover-block.py`／`build-clover-pmgr.py`／`build-clover-gop-legacy-display.py` 三处没有第四档校验。
+逐行重看：三处都有——`:142,144` 与 `:150,152` 各自 `require(info['kind'] == 1)`＋
+`require(build_version == [(2, 0x110000)])`，第三处在 `:136`/`:306`/`:322` 把三颗对象交给
+`build-arm-driver.py` 编；而 magic/CPU/subtype 那三枚更早，`kits/NativePrelink/native_prelink.py:14-18`
+就拒。真正没人覆盖的一格不是「对象长什么样」，是「对象进没进最终内核」——这一格才是本轮闸门的位置。
+这条撤回同时改了 `CloverBlock` 源码头与它 README 里那句错引（原先写成 `build-arm-driver.py:120,129`，
+那是 sdhci 那套 builder 的行号，CloverBlock 归 `build-clover-block.py` 管）。
+
+**③ 顺带改正的四处不实（都是 `CloverSdhci`／`NativeHidInput` 两份 README 里的旧论断）。**
+链接方式写成 `-Wl,-force_load`（实际 `configs/clover_defconfig:70` 在
+`build-xnu-4k-baseline.sh:1002` 被**原样**追加，`configs/clover_defconfig:66-69` 自己写了为什么够用）；
+shipped 参数写成 `clover-emmc=1`（`board.toml:1968` 是 `clover-emmc=21`，而 21 是「boot 而不是拍照」：
+`clover_emmc_run()` 调 `clover_block_request()` 之后**返回**，末尾那句 `panic()` 在 21 档不可达）；
+看门狗写成 `armcpu-clock-panic=60000`（本板 kernel_args 里 armcpu-* 只有 timer-intid=19／smp=1／
+self-ipi=1 三枚，护住挂死的是 `clover-unattended=1800`，`board.toml:2597`）；以及把 CMD13、首块读、
+日志分区三段写成「以后要做」——round88、round96、round103 早就做完了。`board.toml:1020-1021` 与
+`:1593-1594` 那两处**没动**：它们说的是准确的窄版本（见 §Round314 ④）。
+
+**④ §5 那句过时论断的改正。** `CloverSdhci` 源码与 README 都曾写「设备仓加不了 personality，
+因为补丁槽位在上游」。实测推翻：基仓 `~/UniXNU/patches/xnu` 里 clover 补丁是 git 跟踪的 73 枚
+（`git ls-files patches/xnu | grep -c clover` = 73），组装树里 `patches/xnu` 链基仓、
+`patches/xnu-clover` 链本仓。成立的说法窄得多：内核应用的是**基仓那一份**，所以补丁要提交进基仓才会跑，
+本仓留的是供评审的副本——设备仓里放一个同名 `patches/xnu` 会整片盖掉上游而不是接上去。真正让我们还没
+上文档那条路的是三条具体前提：ADT 的 `/arm-io` 只有 `intc` 一个孩子（`make-clover-adt.py:316-321`）、
+`IOProbeScore` 表达不了「Dsp 必须在块设备把环备好之后」、归档不带 force_load。
+
+**⑤ 新量到的一条，反过来把前提缩小了一格。** `drivers/NativeHidInput` 用的是文档原样的
+`OSDeclareDefaultStructors` + `OSDefineMetaClassAndStructors`——它不是特权，是有人替它把
+`IOHIDDevice` 的真实 ABI 从原始 kernelcache 抄了出来：`scripts/build-clover-hid-input.py` 生成
+`OriginalHidDeviceABI.h`（私有存储按原尺寸 `static_assert`、168..206 槽声明为不可调用），再用生成的
+`original-bindings.S` 把 `gMetaClass`／vtable／构造析构 thunk 钉到读出来的地址，并且要求驱动恰好覆盖
+审计点名的十槽。`drivers/CloverPMGR` 走第三条路（`OSDefineMetaClassWithInit` + 运行期按名字查父类），
+`drivers/CloverBlock` 手写 MetaClass 是因为它既没有这份推导也没有可查的符号。⇒「类形状拿不到」不是
+上游堵的，是缺一份 family-ABI 推导；本轮把它写进 note §5，作为第 1、3 条前提之外**不再欠**的那一格。
+
+**⑥ 两条闸门，实跑数字。** `check-clover.py` 里新增 `check_driver_documentation()`（结构：README 存在、
+有一段点名文档的章节、至少一枚 `docs/**.md:行号`、每枚引用都落得下且在行数内、没 Info.plist 的必须说出
+理由、有 plist 的必须被基仓补丁点名、拒绝「本仓 `.cpp`:数字」——判定按 basename 是否属于本仓，所以
+`ConfigurationSettings.cpp:235`、`iokit/Kernel/IOService.cpp:6582` 照旧放行）与
+`check_driver_products()`（产物：按 `!<arch>` 固定宽度头走 12 枚归档、含 BSD `#1/len` 长名与 `__.SYMDEF`，
+逐枚对象核五字段，再到 `out/clover/kernel/kernel.macho` 验导出符号在不在；产物缺席只发 notice，不静默过）。
+仓库里跑 = `drivers documented: 11`；组装树里跑 = `drivers documented: 11; 12 archives,
+22 objects ABI-checked, kernel read`。负向四条都测了：CPU type 改 `0x1000007` 报、filetype 改 2 报、
+假符号名报缺、带路径的厂商引用不误报。
+
+**⑦ 引用规矩 §8 是从本轮自己踩到的坑长出来的。** 给七颗驱动的头部各插 11–14 行注释、
+`CloverSdhci.cpp` 那段改写净增 20 行，于是**每一个指向本仓 `.cpp` 的行号在同一轮里失效一次**。
+现在钉死：冻结目标（UniXNU 文档、`notes/sources/sdm660/*` 的 VEND/MAIN、`board.toml`、defconfig、
+头文件、`scripts/*.py`）用行号；会被后续轮次编辑的本仓 `.cpp` 用符号锚点。这条规矩本身也进了闸门（⑥）。
+
+**⑧ 未刷写。** 本轮没有新增 IOLog 行、没有写任何一个寄存器：改动全在注释、文档与检查器，
+所以镜像与 r313 的差别只可能在 DWARF 行表——这正是 r177 那条「两次构建逐字节可复现」契约要吃的形状，
+本轮实测见 ⑨。板子回来先读 boot 103（按 §Round310 ⑤，不带 `--flash-cache`），再看 boot 104 的
+`clover r311:` MEM_ACC 行，r313 的 arbiter 定档（`notes/power-bringup.md` §8 甲–庚）排在它们之后。
+
+**⑨ 本轮实测（产物与可复现性）。** 第一趟内核 `5e78c44f24ac89e7…`（52,404,224 B）→ AMFI 两刀落在
+file `0x1ae00e4` / `0x1ae016c`（**与 r313 同址**，本轮只动注释与文档、没有挪动 AMFI 之前任何一段的大小，
+站点性质照旧由脚本自己核对编码）→ amfi `97639a364e78fdcf…` → 归一化 `3fd3032b8c31567c…`
+（973 枚 object 戳清零，`LC_UUID` 与 `_PrelinkKCID` 由文件内容派生）。
+
+可复现性按 r177 的规矩做了两次真构建，不是一次构建的两份拷贝：第二趟原始件
+`b47b641b2f1a4ba5…`、AMFI 件 `4b687d6b147237a3…`——**两趟的 amfi 件确实不同**（脚本自报 build-varying
+3925 枚 vs 3926 枚，两边都是 stamps=973 + uuid=1 + kcid=1；多出来的那一枚脚本只报计数不报位置，本轮没去追它是
+哪一笔——它落在归一化要清掉的这三类里，所以不影响结论），
+`normalize-kernel-macho.py --prove` 判 **PROVE PASS: both builds of this tree are one image of
+52,404,224 bytes**，两趟归一化后都是 `3fd3032b…`，也正是发进负载的那一枚。所以「本轮改动只可能落在
+DWARF 行表」这句话现在是量出来的，不是推的：**发出去的镜像不绑定第几趟构建**。
+
+闸门实跑：仓库里 `check-clover.py` 退出 0（`drivers documented: 11`，12 枚 notice 全是指向组装树的产物缺席）；
+同一枚脚本在 `out/clover/tree` 里跑退出 0，尾行 `drivers documented: 11; 12 archives, 22 objects
+ABI-checked, kernel read`；`verify-clover-payload.py` 退出 0、50 行 OK。
+**第一版标题被闸门挡下一次**：新写的 r314 标题里没有一枚双引号，`check-clover.py` 直接 FAIL——
+那条断言的存在理由是 boots 35/36 的标题里带 `getPlane("IODeviceTree")`、转义没被实跑过就发了出去，
+所以「本轮标题不含引号」正好等于「这道防线又变成纸面上的」。补进去的字面量是真的：
+探针进入 IOKit 用的就是 `metaCast("IOHIDDevice")`（`package/CloverHidInputProbe.cpp`，按 §8 只给符号锚点）。
+**补引号之后标题变了，负载重打了一次**：第一枚 `c0564204…` 作废，发的是
+`round314-v0.7.26-payload.img` sha256 `22fc0012ff3e58dd4c05beca31cce5fdf2666d367d861406976c4fbc07fcca52`
+（58,720,256 B）；内核两枚副本一并归档在 `~/clover-out/round314-kernel-amfi.macho` 与
+`round314-kernel-normalized.macho`。**未刷写**：用户指令仍是「我现在不在家，你直接完善别的开发吧」。

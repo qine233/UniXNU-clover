@@ -696,6 +696,39 @@ leave」一路收紧到一句可测的话：
   双闸门 0 FAIL、`pmic arbiter instrument linked` 15 枚针脚全 present、宿主模型 PASS。出厂参数回到
   `clover-power=1`（不写一个字节、不起一次事务）。**未刷写**：boot 103 的卡上现场先读；判读七支
   （甲–庚）在 [`notes/power-bringup.md`](notes/power-bringup.md) §8，台账见 dev-log §Round313 ①–⑩。
+* **r314（v0.7.26，纯宿主开发、镜像已发未刷）把「驱动均需要参考 unixnu 文档制作」做成检查器**：
+  在此之前，一句从不引用任何条款的 README 与一份逐条照文档做的驱动，在闸门眼里是同一个东西。
+  `docs/drivers/overview.md` 与 `docs/drivers/xnu-drivers.md` 抽出**绑设备仓的八条**——层级
+  （`overview.md:11-16`）、目录形状与「`Info.plist` 是 personality 的记录」（`xnu-drivers.md:7-14`）、
+  类形状与运行期五站（`:19-64`、`:219-228`）、五字段对象 ABI（`:106-116`）、归档接线
+  （`:118-124` + `porting/device-repository.md:90-113`）、`-Wl,-force_load`（`:128-145`）、
+  personality 与 `KernelConfigTables`（`:147-168`）、五档测试（`:230-239`）——十一颗驱动逐条判定写在
+  [`notes/unixnu-doc-conformance.md`](notes/unixnu-doc-conformance.md)。**本轮第一个动作是撤回**：
+  早前记的「`build-clover-block.py`/`build-clover-pmgr.py`/`build-clover-gop-legacy-display.py` 缺 ABI 检查」
+  是错的，三颗都有（`:142,144`、`:150,152`、委派给 `build-arm-driver.py` 的 `:136`/`:306`/`:322`），
+  而 `(magic, cpu, subtype)` 在更早的 `kits/NativePrelink/native_prelink.py:14-18` 就被拒一次。
+  **真正没人查的是「链进去没有」**：`configs/clover_defconfig:70` 是被
+  `build-xnu-4k-baseline.sh:1002` **原样追加**的、没有 force_load，所以一枚没人引用它的成员会安静消失而
+  每一步都显示成功——这就是新增 `check_driver_products()` 补的那一格：按 `!<arch>` 固定宽度头逐枚走 12 颗归档
+  （BSD `#1/len` 长名与 `__.SYMDEF` 都处理），每枚对象重核那五个字段，再到链接好的内核里验每颗驱动的导出符号。
+  配套那条 `check_driver_documentation()` 让规矩活过下一个编辑者：有源码的 `drivers/*` 必须有 README、README 必须
+  有一段点名文档并**至少一枚能落地的 `docs/**.md:行号`**、没有 `Info.plist` 的必须说出为什么、并且**禁止
+  「本仓 `.cpp`:数字」**这种形状。实跑：仓库里 `drivers documented: 11`；组装树里
+  `drivers documented: 11; 12 archives, 22 objects ABI-checked, kernel read`；负向四条测过（CPU type、filetype、
+  假符号名、厂商引用不误报）。规矩 §8「冻结目标用行号、本仓可变 `.cpp` 用符号锚点」正是本轮自己踩出来的——
+  给七颗驱动头部各插 11–14 行注释，就让**每一个指向本仓 `.cpp` 的行号在同一轮里失效一次**。
+  顺带纠正四处不实（`-Wl,-force_load` 的论断、把出厂参数写成 `clover-emmc=1`、把看门狗写成
+  `armcpu-clock-panic=60000`、以及三段其实早在 round88/96/103 做完的「未来要做」），并量出：
+  文档那条类形状在本板不是够不着——`drivers/NativeHidInput` 就整块持有它（`scripts/build-clover-hid-input.py`
+  从原始 kernelcache 抄出 `IOHIDDevice` 的 `gMetaClass`/vtable/构造析出 thunk，探针走
+  `preModLoad`/`postModLoad`/`metaCast("IOHIDDevice")` 进门），所以 §5 剩的三前提是排期差、不是结构差。
+  产物：内核 `5e78c44f…` → amfi `97639a36…`（**两刀与 r313 同址** `0x1ae00e4`/`0x1ae016c` ⇒ 本轮没挪动
+  AMFI 之前任何一段）→ 归一化 `3fd3032b…`；**两次真构建**的第二趟 amfi 件 `4b687d6b…` 与第一趟不同，
+  `normalize-kernel-macho.py --prove` 判 **PROVE PASS**（52,404,224 B 同一枚镜像）⇒ r177 那条契约第二次
+  在「只动注释」这类改动上给出正面证据，发出去的镜像不绑定第几趟构建。
+  `round314-v0.7.26-payload.img` `22fc0012…`（58,720,256 B），双闸门 0 FAIL、`verify-clover-payload.py` 50 行 OK；
+  第一版标题因为不含双引号被闸门挡下一次（那道断言的存在理由就是 boots 35/36），补真字面量后重打，
+  `c0564204…` 作废。**未刷写**：boot 103 的卡上现场先读，台账见 dev-log §Round314 ①–⑨。
 * **这两条仪器债已由 r303 结清**（原文曾记作「本格欠着」）：`vbits=` 现以 r298 行末的 `vb_r=`/`vb_v=` 落地
   （`ipc_right_lookup_read()` 已经交出的 entry 位掩码，用来分 port set / send-once / 死名，不需要对象、锁纪律与
   translate 同一条），`cap=send` 行的 `qmc=/qsr=` 也带上了自己的返回码 `qerr=`。
@@ -919,7 +952,7 @@ r292 把 WDT 的地平线换细以后 boot 79/80/81/82 都排除了 APSS watchdo
 | 显示栈首次出帧 | r202 attach + start，5 个进程各拿到一个 `IOMobileFramebufferUserClient`；r206 第一次 present：`swap#1/2/3 accepted`、`scanout#3 ok bytes=9216000`、`retire#3 done=3 presented=3`、`copy#3 93 ms` |
 | 读数通道 | 两个环落在 **logdump**（p56）：kind-21 驱动判据 64 槽、kind-22 内核日志 512 槽，一次 `dd` 1216 扇区读回；panic 屏把 `fb=` 写进记录 |
 | 无人值守 | `run-clover-unattended.sh`：冷刷 cache → 死线 → 预置 BCB 落 TWRP → 读回日志，退出码 0（本帧读数即由此而来） |
-| 可复现内核 | 968 个 object 戳、`LC_UUID`、`_PrelinkKCID` 由文件内容派生，同树两次构建收敛到同一镜像 |
+| 可复现内核 | 968 个 object 戳（r311 起 973 个）、`LC_UUID`、`_PrelinkKCID` 由文件内容派生，同树两次构建收敛到同一镜像；r313 与 **r314 各再证一次**——r314 两趟的 amfi 件不同（`97639a36…` vs `4b687d6b…`）而归一化后都是 `3fd3032b…`，`normalize-kernel-macho.py --prove` 判 PROVE PASS |
 
 ## 待完成
 
@@ -1017,10 +1050,20 @@ python3 scripts/verify-clover-payload.py   # 归档对镜像：卷内形状 + �
 python3 scripts/verify-userdata-window.py  # 刷 userdata 前的宿主闸门
 ```
 
+`check-clover.py` 里另有两道 r314 加的驱动闸门（文档那一道在仓库里就能跑；产物那一道要**在组装树
+`out/clover/tree` 里跑**才看得见链接真正读过的归档）：
+`check_driver_documentation()` 管「这份驱动是不是照文档做的」（README 在不在、有没有点名文档的章节、
+每枚 `docs/**.md:行号` 落不落得下、没有 `Info.plist` 的有没有说出理由、有没有拿行号引本仓 `.cpp`）；
+`check_driver_products()` 管「这份驱动还在不在链接里」（12 枚归档逐枚走对象、核
+`docs/drivers/xnu-drivers.md:106-116` 那五个字段、再到内核里验导出符号）。产物缺席只发 notice，
+**不会静默通过**——这一格要抓的正是无 force_load 链接下「成员安静消失」。
+
 ## 相关文档
 
 - [`notes/development-log.md`](notes/development-log.md) — 每一轮的设计、构建与真机读数，完整历史。
 - [`notes/clover-device-tree-sources.md`](notes/clover-device-tree-sources.md) — 每个常量的来源，含 splash 地址的推翻过程。
+- [`notes/unixnu-doc-conformance.md`](notes/unixnu-doc-conformance.md) — 十一颗驱动逐条对照 UniXNU 驱动文档的判定、
+  仍未结的缺口（按能推进的顺序排），以及 r314 定下的引用规矩（冻结目标用行号、本仓可变 `.cpp` 用符号锚点）。
 - [`porting.toml`](porting.toml) — 上游要求的 13 个 area 与 findings。
 - [`AGENTS.md`](AGENTS.md) — 仓库边界与闸门。
 
