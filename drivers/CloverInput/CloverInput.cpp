@@ -263,6 +263,14 @@ static void waitMs (uint32_t ms)
 //   [15] the last verdict code (see the note at each site).
 volatile uint64_t clover_input_observation[16];
 
+// Round319: the last sub-transfer's raw words, latched so package/CloverHidInputProbe.cpp can re-say
+// the r318 detail on its 120 s beat after the one-time rows are overwritten by the tee's ring (the
+// r260 pattern: nothing is re-asked, only the reading repeats). Slots:
+//   [0] raw I2C_STATUS, [1] raw ERROR_FLAGS, [2] SDA high, [3] SCL high,
+//   [4] the vendor tree's mask over the raw status word, [5] the residue bits inside MAIN's mask.
+// All zeros means the instrument never ran a segment, which a missing beat row cannot say.
+volatile uint64_t clover_input_last_xfer[6];
+
 // A one-word verdict code, so the ring line and the observation array cannot disagree about which
 // step stopped. Positive values are steps, negative values are the two ways a step can fail. The
 // numbers and their names both live in InputCore.h (round318); this file has no copy of them.
@@ -679,6 +687,12 @@ static bool runSegment (const Segment &seg, const char *why)
          why, input_xfer_verdict_name (verdict), rawErr, coreFlags.mainline_error,
          coreFlags.vendor_error, coreFlags.residue, coreFlags.input_over_run,
          coreFlags.output_under_run, coreFlags.input_under_run, coreFlags.output_over_run);
+  clover_input_last_xfer[0] = rawStatus;
+  clover_input_last_xfer[1] = rawErr;
+  clover_input_last_xfer[2] = busStatus.sda_high;
+  clover_input_last_xfer[3] = busStatus.scl_high;
+  clover_input_last_xfer[4] = busStatus.vendor_error;
+  clover_input_last_xfer[5] = busStatus.residue;
   if (verdict != kInputXferDone) {
     if (verdict == kInputXferIncomplete) {
       gXfersTimeout++;

@@ -56,6 +56,7 @@ extern "C" volatile uint32_t native_legacy_transfer_calls;
 // those rows onto the medium every 2 s, which makes an early reading permanent because it is state
 // rather than a line. The same rule applies here, with the state this driver already keeps.
 extern "C" volatile uint64_t clover_input_observation[16];
+extern "C" volatile uint64_t clover_input_last_xfer[6];
 
 extern "C" {
 // Touch inputs of NativeHidInput, with nothing behind them on this board yet.
@@ -304,6 +305,18 @@ extern "C" __attribute__((noinline)) void native_hid_live_checkpoint(IOService *
                (unsigned long long)clover_input_observation[10], (unsigned long long)clover_input_observation[11],
                (unsigned long long)clover_input_observation[12], (unsigned long long)clover_input_observation[13],
                (unsigned long long)clover_input_observation[14], (long long)clover_input_observation[15]);
+        // Round319: the r318 xfer/core rows print once at driver start (~t=12 s) and the tee's ring
+        // laps over them before readback, so the raw words the r260 line does not carry -- raw
+        // I2C_STATUS / ERROR_FLAGS and SDA/SCL's own bits -- are latched by drivers/CloverInput in
+        // clover_input_last_xfer and re-said here from state, the same way round260 keeps the verdict
+        // alive. mode=0 on every field is a reading too: the instrument never ran a segment.
+        printf("clover r319: last status=%llx err=%llx sda=%llu scl=%llu vend=%llx res=%llx\n",
+               (unsigned long long)clover_input_last_xfer[0],
+               (unsigned long long)clover_input_last_xfer[1],
+               (unsigned long long)clover_input_last_xfer[2],
+               (unsigned long long)clover_input_last_xfer[3],
+               (unsigned long long)clover_input_last_xfer[4],
+               (unsigned long long)clover_input_last_xfer[5]);
     }
 }
 

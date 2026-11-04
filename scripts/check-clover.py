@@ -3481,6 +3481,19 @@ def check_board(errors: list) -> str:
             errors.append("the r318 rows are not exempt from the per-pass push cap: the pair is one "
                           "reading, and keeping the decoded row while dropping the raw one restores "
                           "exactly the blind spot round318 exists to remove")
+        # Round319 re-says the r318 raw words from state on the beat (the r260 pattern): the one-time
+        # xfer/core rows print at driver start and the tee's ring laps over them before readback, so
+        # the last sub-transfer's raw I2C_STATUS / ERROR_FLAGS / SDA / SCL are latched in
+        # clover_input_last_xfer and printed once per beat by package/CloverHidInputProbe.cpp. The
+        # class admits the beat row; a per-pass cap that ate it would read like a probe that never
+        # ran, so it is exempted for the same reason round281's schedule is.
+        if '{ "clover r319: last", "r319-last", 16, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the round319 beat row: an unbudgeted "
+                          "producer drops the raw-word re-publish, and its absence would read like the "
+                          "input probe never ran, which is the silence this round exists to remove")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r319-last")' not in sdhci_source:
+            errors.append("the r319-last beat row is not exempt from the per-pass push cap: a cap that "
+                          "ate it is indistinguishable from a probe that never ran")
         # Round313 boots drivers/CloverPower for the first time. The report is one burst in the PMGR tail
         # and it is printed under two tokens -- round313's new lines and the round182 lines that keep
         # their origin stamp -- so both halves need their own budget and their own exemption, or the half
@@ -5189,6 +5202,21 @@ def check_board(errors: list) -> str:
                 errors.append("package/CloverHidInputProbe.cpp does not carry the bus instrument's last "
                               "verdict code on the beat exactly once: without it a row of zeros cannot be "
                               "told from a probe that never ran")
+            # Round319's beat row re-says the r318 raw words (raw status/err, SDA/SCL's own bits) that
+            # the r260 line's 16 slots do not carry. It must read the latch, not re-read the bus: a
+            # beat that read the registers would touch the bus twice per boot, which is the one thing
+            # round260 was careful not to do.
+            for needle in ('extern "C" volatile uint64_t clover_input_last_xfer[6];',
+                           '"clover r319: last status=%llx err=%llx sda=%llu scl=%llu vend=%llx res=%llx\\n"'):
+                if needle not in probe_text:
+                    errors.append(f"package/CloverHidInputProbe.cpp lacks the r319 beat row {needle[:56]!r}: "
+                                  "the raw status word and SDA/SCL would again be one-time rows the ring "
+                                  "throws away, which is the blind spot round319 exists to remove")
+            for i in range(6):
+                if probe_text.count(f"clover_input_last_xfer[{i}]") != 1:
+                    errors.append(f"package/CloverHidInputProbe.cpp does not read r319 latch slot {i} "
+                                  "exactly once on the beat: a dropped slot reads as a zero, and a zero "
+                                  "must mean the instrument never ran, not a field nobody printed")
             display_text = (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text()
             if not (0 <= display_text.find("clover_hid_input_probe();")
                     < display_text.find("IOService *display=pendingLegacyDisplay;")):
@@ -6005,6 +6033,18 @@ def check_board(errors: list) -> str:
                     errors.append(f"drivers/CloverInput/CloverInput.cpp lacks the r318 row {needle!r}: "
                                   "the raw status word and SDA/SCL would stay unreadable, because the "
                                   "r181 bus= column is the masked word by construction")
+            # Round319 latches the last sub-transfer's raw words so the beat can re-say them after the
+            # one-time rows are overwritten by the tee's ring (the r260 pattern). The latch must be
+            # filled in runSegment -- the one place rawStatus/rawErr/sda/scl exist together -- and must
+            # not be re-read on the beat, or the bus would be touched twice per boot.
+            for needle in ('volatile uint64_t clover_input_last_xfer[6];',
+                           'clover_input_last_xfer[0] = rawStatus;',
+                           'clover_input_last_xfer[2] = busStatus.sda_high;',
+                           'clover_input_last_xfer[3] = busStatus.scl_high;'):
+                if needle not in text:
+                    errors.append(f"drivers/CloverInput/CloverInput.cpp lacks the r319 latch {needle!r}: "
+                                  "the raw status word and SDA/SCL would again be one-time rows the ring "
+                                  "throws away, which is the blind spot round319 exists to remove")
             harness = REPO / "drivers/CloverInput/tests/clover_input_host.cpp"
             runner = next((base / "scripts/test-clover-input.py"
                            for base in (REPO, pathlib.Path.cwd())
@@ -6536,8 +6576,10 @@ def check_board(errors: list) -> str:
     # function of the arbiter's own version word, and that driver has never been in a boot whose title
     # named it, because clover-power has always been commented out. Its new lines are stamped r313 and
     # the round182 lines keep their origin stamp, which is the reason the tee now budgets both tokens.
-    if not board["payload"]["title"].startswith("clover r318:"):
-        errors.append('[payload] title is not "clover r318: ...": the menu would not name this round')
+    # Round319 re-publishes the r318 raw words on the beat (the r260 pattern), so the image whose card
+    # first carries the surviving SDA/SCL reading has to name itself round319.
+    if not board["payload"]["title"].startswith("clover r319:"):
+        errors.append('[payload] title is not "clover r319: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7682,8 +7724,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r318:"):
-        errors.append('[payload] title is not "clover r318: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r319:"):
+        errors.append('[payload] title is not "clover r319: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

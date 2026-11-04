@@ -97,8 +97,10 @@
 // WHY NOTHING HERE PANICS
 //
 // The reasoning round176 established and round181 applied: the kernel log reaches the host by itself
-// (IOLog writes msgbuf, CloverSdhci's tee copies any line containing "clover r" into the card-backed
-// kernel ring, scripts/read-clover-log.py --tee reads it off the card), so halting the boot buys
+// (IOLog() writes into msgbuf -- its path in is _IOLogv -> console_printbuf_putc, write_through,
+// the same buffer printf reaches through putchar -> log_putc -- and CloverSdhci's tee copies any
+// line containing "clover r" into the card-backed kernel ring, scripts/read-clover-log.py --tee
+// reads it off the card), so halting the boot buys
 // nothing and costs whatever the rest of the boot would have printed. A power reading is worth more
 // than a halt, and a boot that finds an empty APID map still reaches launchd with the emptiness
 // recorded. Every wait here is bounded twice -- a poll count calibrated against the generic timer, and

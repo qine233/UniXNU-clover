@@ -25826,3 +25826,92 @@ TWRP——自动那一棒在 boot 104 不成立，别把「等不到 adb」读�
 | `clover r317:` 行在场而 `clover r318:` 零命中 | 只有两种：cache 里不是这枚文件（刷写没换），或 tee 把 r318 类吃了。前者看标题、后者看 `r318-input` 类是否在这枚内核里（盘上已证在），**不许**读成「I2C 分段没跑」——r260 的 beat 行在场就证明分段跑了 |
 | 一次分段只有一行 | 两半被拆开，另半不许当「干净传输」的证据 |
 | r318 两行全零 + `nack=4` | `raw=00000000` 的原字要当场和 `status=10000c8` 对齐；对不齐先查层里的裁位，不查总线 |
+
+## Round319（v0.7.32）：r319 的第一刀量错了对象——回退 printf 转换，把 r318 的原字改到 120 s 节拍上重说
+
+**一句话**：boot 105 与 boot 106 连续两帧都取回了「r181/r318 读数行缺席」，两帧的卡上证据指向同一个真因——
+行只在驱动起动时印一次（~t=12 s），tee 的 512 槽内核环在 ~700 s 靴里绕五到六圈，一次性行在读数之前就被覆盖。
+IOLog 到得了 msgbuf——boot 105 的 `r181-i2c probe lines capped at 24` 就是 tee 抄走 24+ 行 IOLog 的实据，路径是
+`_IOLogv -> console_printbuf_putc`（`iokit/Kernel/IOLib.cpp`，write_through），不是 `log_putc`——所以 r319 的第一刀
+（把行改成 printf、加 printf/iolog 双生对照）量错了东西，撤回。活下来的行只有一种形状：r260 在 HID 探针的
+120 s 节拍上从 `clover_input_observation` 重说判决。r319 就把 r318 的原字按这个形状重发一次。
+
+**① 两帧读回，卡上证据在盘上。** boot 105（round318 终版，`02b845b4…`）与 boot 106（r319 第一刀）都在 verdict
+环里印着同一句：`CloverSdhci r195: r181-i2c probe lines capped at 24`（另有 r155/r187/r189/r170-open/r153 各 capped
+行）。这一句是 tee 自己写的、每类配额的收尾——它意味着 tee 确实从 msgbuf 抄走了 24 行 `clover r181:`，抄满
+keep_max 之后才停。boot 105 里那 24 行是 **IOLog** 写的，boot 106 里同 24 行是 **printf** 写的（r319 第一刀把
+CloverInput 的 44 行、CloverPower 的 53 行全从 IOLog 换成了 printf）——两帧 capped 数逐字相同，所以「IOLog 到不了
+msgbuf」这个前提当场死掉：两条通道都到得了，都进了 tee，都被同一把 24 的刀截住。而 `clover r318:` 在 boot 105、
+`clover r319:`（含双生行）在 boot 106 的 512 槽内核环里**零命中**，同环 `clover r260:`/`r311:`/`r317:` 各 2–3 命中——
+那三行全是在节拍上重发的，这六行/四行全是一次性早印。**缺席的判据不是「没进 msgbuf」，是「进了、也抄了、然后被
+环的下一圈盖掉」**；boot 106 的双生对照两条腿都没剩下，所以那场对照什么都量不到——不是 printf 与 IOLog 没差别，
+是两条腿都没活到读回。
+
+**② 回退。** `drivers/CloverInput/CloverInput.cpp` 与 `drivers/CloverPower/CloverPower.cpp` 的「读数行」全部回到
+IOLog（两处共 97 行），双生对照行删掉，三处被第一刀改坏的注释改回真话：CloverInput/CloverPower 的头注回到
+「IOLog() writes into msgbuf」，CloverSdhci 的头注写成完整路径（`printf -> putchar -> log_putc -> log_putc_locked`；
+`IOLog -> _IOLogv -> console_printbuf_putc`，write_through；round319 第一刀「IOLog never reaches msgbuf」已撤回，卡上
+显示的是环绕）。回退本身不产生新读数，所以这一轮**净改动不是删，是下面这条真正的修法**。
+
+**③ 真修法：把 r318 的原字在节拍上重说（r260 的形状）。** `drivers/CloverInput/CloverInput.cpp` 加一枚闩锁
+`volatile uint64_t clover_input_last_xfer[6]`，在每次分段的 r318 IOLog 行之后、`if (verdict != kInputXferDone)` 之前填满：
+`[0]=rawStatus [1]=rawErr [2]=busStatus.sda_high [3]=busStatus.scl_high [4]=busStatus.vendor_error [5]=busStatus.residue`。
+`package/CloverHidInputProbe.cpp` 在它自己的 120 s 节拍块里（`if (now >= nextBeat)`）加一行
+`printf("clover r319: last status=%llx err=%llx sda=%llu scl=%llu vend=%llx res=%llx\n", …)`，六个槽各读一次。这是
+r260 的同一形状：**没有重新问一次硬件，只是同一份读数在节拍上再印一遍**——节拍行每 120 s 重发，所以它在环绕了
+五圈之后仍然在场。全零的含义也第一次说得清：仪器从没跑过一段分段，而「节拍行缺席」说不出这句话。
+
+**④ 契约四面。** `drivers/CloverSdhci/CloverSdhci.cpp` 的类表加
+`{ "clover r319: last", "r319-last", 16, 0, 0, 0 }`，豁免前缀加 `teeHasPrefix(..., "r319-last")`——理由与
+r291/r294/r317/r318 同一句，这里更锋利：per-pass push cap 把节拍行拦下，就等于把这一轮要补的读数原样还回去。
+`scripts/check-clover.py` 的 `# Round319.` 段断言：类表那一行在（`r319-last` 16）、豁免在、CloverHidInputProbe 的
+格式串逐字在（`clover r319: last status=%llx err=%llx sda=%llu scl=%llu vend=%llx res=%llx`）、**六个槽各被读恰好一次**
+（`for i in range(6): probe_text.count(f"clover_input_last_xfer[{i}]") != 1` 报错——少读一个槽就读成一枚零，而零必须
+意味着「仪器没跑」，不能意味着「没人印这一格」）、CloverInput 的闩锁声明与六条填槽 needle 在。`verify-clover-payload.py`
+加 `hid-r319-row` 针脚：完整格式串必须在这枚内核里。`board.toml` 标题升到 `clover r319:`，把上面的故事按
+「boot 105 + boot 106 两帧缺席 → IOLog 到得了 msgbuf → 环绕是原因 → r260 形状是修法」讲完。**寄存器写与 boot-arg
+一个字没动，两颗驱动仍从同一个 PMGR 钩子跑。**
+
+**⑤ 构建与校验（哈希当场重数，盘上都在）**：内核 `0625fcc6d67a…`（52,404,224 B，`out/clover/kernel/kernel.macho`）
+→ AMFI `cd380fdb8845…`（`/Users/zhouzhou/clover-out/round319-kernel-amfi.macho`）→ 归一化同文件改写 `f703e521d05a…`
+（973 object stamps zeroed, LC_UUID + _PrelinkKCID derived）→ 负载 `2a15526d8eb8…`（58,720,256 B，
+`/Users/zhouzhou/clover-out/round319-v0.7.32-payload.img`）。卷内：`unixnu.toml` 2110 B `b5733172…`、
+`kernel.macho` 52,404,224 B `70f9b739…`（probe 补丁就地化之后，与归一化件不同是这一步的注入）、`scratch-data.img`
+35,888 B `614b8356…`、`kernel.macho.adt` 14,384 B `4febcf1a…`、`kernel.macho.trustcache` 61,408 B `7c369ce0…`。
+两道闸门：`check-clover.py`（组装树里跑）= EXIT=0（`drivers documented: 11, exempt: 11, 12 archives, 22 objects
+ABI-checked, kernel read`）；`verify-clover-payload.py` = 48 OK / 0 FAIL、EXIT=0。**未跑 `--prove`**：本轮发的是新构建
+的内核，不是同一枚镜像的第二趟构建。
+
+**⑥ boot 106 的 panic sink 照旧一笔没写**（marker 槽是 boot 102/87 的旧记录，逐条标 `STALE: boot 106 never entered
+the sink`，deadline 记录最新仍是 boot 99）——「panic 后不自动落 TWRP」那一格在本帧依旧成立，读回仍是人工进 TWRP。
+与 r318/r319 读数行缺席是两回事：sink 那条链是第一笔写之前就停了，读数行是写了、抄了、被环盖了。
+
+**⑦ 预登记 boot 107 的判读**（第一枚带 `clover r319: last` 节拍行的卡）：
+
+| 读数形状 | 判读 |
+| --- | --- |
+| `clover r319: last status=… err=… sda=… scl=… vend=… res=…` 在节拍上、与 `clover r260: bus` 同帧 | r318 的原字第一次真被读回，按 Round318 ⑩ 那张表逐支读；`class` 不在这一行，`vend=`/`res=` 的语义与 r318 行同源 |
+| 六槽全零 + `nack=4` 在 r260 行 | 仪器没跑过分段，与「节拍行缺席」区分开——这是这一行的全部新意 |
+| `r319: last` 在场而 `r260:` 缺席 | HID 探针在发节拍，但 r260 那条被 cap 或 tee 吃了；两行同块同拍，拆开先查 tee 不查总线 |
+| `r319: last` 缺席而 `r260:` 在场 | `r319-last` 类被吃或豁免没生效；盘上已证类与豁免都在这枚内核里，所以只许读成 tee 那一格的事 |
+| `sda=0` 或 `scl=0` | r181 结构上印不出的那件事第一次有读数：有东西把线拉着，报 `status=` 原字与当拍 `r260` 行一起判 |
+| 两行全在场且逐拍一致 | 触摸仍是「已知不应答」（`verdict=102`），钥匙不在 I2C 层，跟 boot 48/103/104 同形 |
+
+**⑧ boot 107 实际读数（第一枚带 `clover r319: last` 的卡，`2a15526d…`，boot 107 确认）。** 预登记表第一行命中：
+`clover r319: last status=11363c8 err=0 sda=0 scl=0 vend=1000008 res=80` 在节拍上两次（t=620.304175、t=740.754548，
+120 s 间隔），且与 `clover r260: bus` 同帧（t=620.304148、t=740.754521）——r318 的原字第一次真被读回。六槽逐支：
+
+| 槽 | 值 | 解码 |
+| --- | --- | --- |
+| `status=` | `11363c8` | rawStatus 原字（非零 ⇒ 仪器真跑过分段） |
+| `err=` | `0` | ERROR_FLAGS 全零 |
+| `sda=` | `0` | BIT26（kI2cStatusSdaSensor）未置位 ⇒ 核没看到 SDA 高 ⇒ SDA 低 |
+| `scl=` | `0` | BIT27（kI2cStatusSclSensor）未置位 ⇒ SCL 低 |
+| `vend=` | `1000008` | raw & `0x380003c` = bit3+bit24 |
+| `res=` | `80` | bit7，两棵树都不命名的那一位 |
+
+与 r260 自洽：`11363c8 & 0x38000fc = 0x10000c8`，正是当拍 r260 的 `status=10000c8`——两行描述同一时刻，无漂移。
+`res=80`（bit7）也坐实了 InputRegs.h:346「bit7 两树皆不命名」的那条注释。**`sda=0 scl=0` 是这一行的全部新意**：
+r181/r260 的掩码结构上就看不见这两条线，现在第一次读到，两条线在 NACK 检测那一刻都低——不是空闲（空闲两条线都该
+高）。两条腿没分：外部有东西把线拉着，或 QUP 没把线释放；下一轮要切开，但先记下「线确实被摁住」这个事实。同拍 r260
+`nack=4 xfers=4 verdict=102` ⇒ 触摸仍是「已知不应答」，与 boot 48/103/104 同形，钥匙不在 I2C 层。

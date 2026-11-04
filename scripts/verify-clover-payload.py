@@ -1119,6 +1119,13 @@ def check_sb_sample(kernel: bytes) -> bool:
              "hid-bus-row": (b"clover r260: bus mode=%llu map=%llx hw=%llx io=%llx op=%llx err=%llx "
                              b"status=%llx state=%llx clk=%llx ack=%llx id=%llx,%llx xfers=%llu "
                              b"timeout=%llu nack=%llu verdict=%lld\n") in kernel,
+             # Round319: the beat also re-says the r318 raw words the r260 line's 16 slots do not carry
+             # -- raw I2C_STATUS / ERROR_FLAGS and SDA/SCL's own bits -- from clover_input_last_xfer,
+             # because those rows print once at driver start and the tee's ring laps over them before
+             # readback. The literal is pinned whole: a format string cut in half leaves prefix needles
+             # green while the row on the card says nothing.
+             "hid-r319-row": (b"clover r319: last status=%llx err=%llx sda=%llu scl=%llu vend=%llx "
+                              b"res=%llx\n") in kernel,
              # Round262: the unfiltered thread census. r261's host forensics named the wait -- backboardd
              # asleep on a dispatch group inside a call into libVFXCore -- but the sampler's wait rows are
              # filtered to threads that are waiting AND not in the trap, so they cannot show a second

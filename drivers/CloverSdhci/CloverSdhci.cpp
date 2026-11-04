@@ -224,9 +224,13 @@
 #include <pexpert/pexpert.h>
 #include <kern/debug.h>
 #include <stdarg.h>
-// Round175: the kernel log buffer. printf() and IOLog() both end in log_putc() ->
-// log_putc_locked(msgbufp, c) (bsd/kern/subr_prf.c:388, bsd/kern/subr_log.c:554), so everything this
-// boot prints is already sitting in one circular buffer that the driver can read. The header is
+// Round175: the kernel log buffer. printf() reaches msgbuf through putchar -> log_putc ->
+// log_putc_locked(msgbufp, c) (bsd/kern/subr_prf.c:388, bsd/kern/subr_log.c:554); IOLog() reaches it
+// through _IOLogv -> console_printbuf_putc (iokit/Kernel/IOLib.cpp, write_through=TRUE), not through
+// log_putc. Boot 105's "r181-i2c capped at 24" proved the tee copied 24+ IOLog rows off msgbuf, so
+// round319's first cut ("IOLog never reaches msgbuf") was wrong and is withdrawn; what the card
+// showed instead is that a one-time early line is overwritten by this ring's laps long before
+// readback. The header is
 // exported to drivers (EXPORT_HDRS/bsd/sys/msgbuf.h) and msgbufp is declared under
 // XNU_KERNEL_PRIVATE, which the kernel's own compile record for this driver already defines -- which
 // is why this round needs no XNU patch at all.
@@ -1163,6 +1167,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // bus was fine and never show why the branch reset. A boot runs a handful of segments, so 32 is
   // headroom for the pair at sixteen segments, not a promise about how many probes it takes.
   { "clover r318: ", "r318-input", 32, 0, 0, 0 },
+  // Round319 re-says the r318 xfer/core raw words from state on the beat (the r260 pattern): the
+  // one-time rows print at driver start and are overwritten by this ring's five or six laps before
+  // readback, so the last sub-transfer's raw I2C_STATUS / ERROR_FLAGS / SDA / SCL are latched in
+  // clover_input_last_xfer and printed once per beat by package/CloverHidInputProbe.cpp. One row per
+  // 120 s beat, 16 bounds the same producer without cutting it short.
+  { "clover r319: last", "r319-last", 16, 0, 0, 0 },
   // Round313 is the first boot that runs drivers/CloverPower at all -- the instrument shipped in
   // round182 and has never been on a board -- so its lines have no class and no budget of their own
   // yet. The report is one-shot, printed in the PMGR tail beside the other bring-up bursts, and its
@@ -4814,6 +4824,11 @@ static void teeConsumeLine (uint32_t &pushed)
        // line would once again be indistinguishable from a clean bus with a NACK. The class budget of
        // 32 still bounds it.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r318") ||
+       // Round319's beat row rides beside the census like round281's schedule: it fires on the HID
+       // probe's 120 s beat, far from the passes that carry the census, and a row dropped by the
+       // per-pass cap is indistinguishable from a probe that never ran. The class budget of 16 still
+       // bounds it.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r319-last") ||
        // Round313's power report is one burst printed while the PMGR tail attaches, and it is the first
        // time this driver has ever run on a board. Exempting both of its classes is the r283 reason in
        // its plainest form: half a report and no report are different readings of the same bus, and a
