@@ -222,7 +222,7 @@ loader = "firmware"
 # 12 entry records and 4 beat records all carry its stamp, the newest beat is 1320.098 s and the newest
 # request 1323.814 s, and the deadline slot and both panic markers are still boot 76's -- the r293
 # stamps mean that silence now reads as silence about boot 80 rather than as boot 76's ending.
-title = "clover r319: boot 105 and boot 106 both came back with the r181/r318 reading rows absent, and the built kernel plus the card cross-check says why: the rows print once at driver start (~t=12 s) and the tee's 512-slot kernel-log ring laps five or six times over the ~700 s boot, so a one-time line is overwritten long before readback. IOLog does reach msgbuf -- boot 105's \"r181-i2c capped at 24\" proves the tee copied 24+ IOLog rows, and _IOLogv writes through console_printbuf_putc (iokit/Kernel/IOLib.cpp), not through log_putc -- so round319's first cut (moving rows to printf, adding printf/iolog twins) measured the wrong thing and is withdrawn. The rows that do survive all share one shape: round260 re-publishes the verdict from clover_input_observation on the HID probe's 120 s beat, and that is the fix round319 now applies to the r318 detail -- clover_input_last_xfer[6] latches the last sub-transfer's raw I2C_STATUS / ERROR_FLAGS / SDA / SCL / vendor / residue, and a new beat row \"clover r319: last\" re-says them beside r260, with its own tee class r319-last(16) and a per-pass cap exemption. No register write changed, no boot arg changed, and both drivers still run from the same PMGR hook. Not flashed: the reading is pre-registered for the next boot in dev-log Round319."
+title = "clover r320: boot 107 read back on the r319 kernel moved the desktop stall forward and named it. The framebuffer path is live -- r180 retires presented=4, copy/scanout/retire all ok -- yet SpringBoard never draws a desktop: its main thread idles waiting on the PreBoard data-migration round-trip (migrationpluginwrapper spawned at t=653, port 0x6003 stuck with pr=0 to=0 for 140 s, census wait=19 run=1). So this is neither GPU nor touch -- it is an unanswered migration XPC. UniXNU-sheng boots this image to the desktop, and the one ADT difference that explains it is what make-sheng-adt.py:148 quotes: \"datamigrator skips every migration (os_variant_uses_ephemeral_storage)\", driven by /chosen/ephemeral-storage. clover never set it because packed_data_ramdisk=false keyed ephemeral-storage off the packed flag alone; round320 decouples it onto writable_root so the volatile --data-ramdisk mockfs root now carries ephemeral-storage=1. Kernel is unchanged (r319 reused); only the ADT and the payload. No register write, no boot arg. check-clover now requires ephemeral-storage==u32(1) in the ADT and verify-clover-payload pins it in the delivered payload. Not flashed: boot 108's two-way read is pre-registered in dev-log Round320."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -570,8 +570,11 @@ dram_size = "0x80000000"
 #         sign that image: getpid, sysctl (CTL_HW/HW_PAGESIZE), one console line
 #         with both results, then exit(0).
 #       - [payload.adt] packed_data_ramdisk = false, so the ADT carries one plain
-#         RAMDisk placeholder and no PackedRAMDisk, and /chosen stays a normal
-#         main boot (no ephemeral-storage).
+#         RAMDisk placeholder and no PackedRAMDisk. From round320 it does set
+#         /chosen/ephemeral-storage (make-clover-adt keys it on writable_root, which
+#         --data-ramdisk satisfies): the Data here is the volatile mockfs root, and
+#         that property is what makes datamigrator skip migration so SpringBoard
+#         leaves the PreBoard wait boot 107 caught it in.
 #       - rd=md0 joins the kernel arguments and the trust cache bundle made by
 #         the same script is pinned by trust_cache_sha256: AMFI has to see the
 #         init program's cdhash or the exec of /sbin/launchd is the next panic.
@@ -2632,10 +2635,12 @@ owned_memory_size = "0x40000000"
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 cpu_regs = "0x0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"
 psci_method = "smc"
-# False means the --data-ramdisk image gets one plain RAMDisk placeholder. Since round137 that
-# image is no longer anyone's root -- the APFS OS volume is -- but md0 is still built from it, and
-# a packed one would add PackedRAMDisk and ephemeral-storage, i.e. the Data-seed shape this board
-# has no driver for.
+# False means the --data-ramdisk image gets one plain RAMDisk placeholder (no PackedRAMDisk entry
+# in the memory map). Since round137 that image is no longer anyone's root -- the APFS OS volume is
+# -- but md0 is still built from it. Round320 decoupled ephemeral-storage from this flag: make-clover-adt
+# now keys it on writable_root, so the volatile --data-ramdisk root carries /chosen/ephemeral-storage and
+# datamigrator skips migration (the boot 107 desktop stall), while packed_data_ramdisk alone still only
+# controls whether PackedRAMDisk joins the memory map.
 packed_data_ramdisk = false
 ipad_identity = true
 unique_chip_id = "required"

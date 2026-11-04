@@ -51,7 +51,14 @@ TIMEBASE_HZ = 19200000
 
 REQUIRED_CHOSEN = ["random-seed", "nvram-proxy-data", "nvram-bank-size", "dram-base",
                    "dram-size", "crypto-hash-method", "display-base", "display-scale",
-                   "unique-chip-id", "amfi-only-platform-code", "root-matching"]
+                   "unique-chip-id", "amfi-only-platform-code", "root-matching",
+                   "ephemeral-storage"]
+# Round320 adds ephemeral-storage. boot 107 caught the desktop stalled in PreBoard's data-migration
+# check (SpringBoard's main thread idle on its own run-loop port, migrationpluginwrapper spawned at
+# t=653, framebuffer already presenting 4 frames but no desktop), and UniXNU-sheng -- which boots
+# this image to the desktop -- records that this /chosen property is what makes datamigrator skip
+# every migration (os_variant_uses_ephemeral_storage). It is required now because that behaviour is
+# the fix, not an un-attributable variable; a persistent Data root must never set it.
 # The volume /chosen names. It is the unsealed OS volume inside the iPadOS container the board's
 # OS window carries: UUID 04769D26-2CA0-4825-B443-E2E5F88300F2, role System, Sealed=No. Round119
 # copied a dictionary naming a volume no service here carried; that was a wrong target, not a
@@ -186,6 +193,11 @@ def check_adt(errors: list) -> str:
                 or ROOT_VOLUME_UUID.encode() not in root_matching):
             errors.append("/chosen/root-matching must be an IOMedia IOPropertyMatch on UUID "
                           f"{ROOT_VOLUME_UUID}; IOFindBSDRoot deserializes it verbatim")
+        # ephemeral-storage must be a non-zero u32: its presence alone is not enough, because
+        # os_variant_uses_ephemeral_storage() tests the value. u32 0 would leave datamigrator
+        # doing a real migration and SpringBoard back in the PreBoard wait boot 107 caught.
+        if chosen["properties"].get("ephemeral-storage") != struct.pack("<I", 1):
+            errors.append("/chosen/ephemeral-storage must be u32 1 so datamigrator skips migration")
         if len(chosen["properties"].get("random-seed", b"")) != 64:
             errors.append("/chosen/random-seed is not 64 bytes")
         if chosen["properties"].get("dram-base") != struct.pack("<Q", DRAM_BASE):
@@ -6577,9 +6589,11 @@ def check_board(errors: list) -> str:
     # named it, because clover-power has always been commented out. Its new lines are stamped r313 and
     # the round182 lines keep their origin stamp, which is the reason the tee now budgets both tokens.
     # Round319 re-publishes the r318 raw words on the beat (the r260 pattern), so the image whose card
-    # first carries the surviving SDA/SCL reading has to name itself round319.
-    if not board["payload"]["title"].startswith("clover r319:"):
-        errors.append('[payload] title is not "clover r319: ...": the menu would not name this round')
+    # first carries the surviving SDA/SCL reading has to name itself round319. Round320 reuses that
+    # kernel and changes only the ADT: /chosen gains ephemeral-storage so datamigrator skips the
+    # migration boot 107 caught SpringBoard waiting on, so the menu names round320.
+    if not board["payload"]["title"].startswith("clover r320:"):
+        errors.append('[payload] title is not "clover r320: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7724,8 +7738,10 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r319:"):
-        errors.append('[payload] title is not "clover r319: ...": the menu would not name this round')
+    # Round320: this second title needle rides the r192 block and must agree with the one above --
+    # both read board["payload"]["title"], so both must name the round the card will carry.
+    if not board["payload"]["title"].startswith("clover r320:"):
+        errors.append('[payload] title is not "clover r320: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

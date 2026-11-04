@@ -25915,3 +25915,57 @@ the sink`，deadline 记录最新仍是 boot 99）——「panic 后不自动落
 r181/r260 的掩码结构上就看不见这两条线，现在第一次读到，两条线在 NACK 检测那一刻都低——不是空闲（空闲两条线都该
 高）。两条腿没分：外部有东西把线拉着，或 QUP 没把线释放；下一轮要切开，但先记下「线确实被摁住」这个事实。同拍 r260
 `nack=4 xfers=4 verdict=102` ⇒ 触摸仍是「已知不应答」，与 boot 48/103/104 同形，钥匙不在 I2C 层。
+
+## Round320（v0.7.33）：桌面这一格从「渲染循环画到第四步就停」改判到数据迁移 XPC，修法照 sheng 把 ephemeral-storage 接进 ADT
+
+**① 为什么换赛道。** boot 107 的读数把桌面停点往前推了一格并给它命了名。r180 那条 framebuffer 路
+是活的——copy/scanout/retire 全 ok，`presented=4` 早已退休——可 SpringBoard 始终不画桌面：它的主线程
+空等在一次 PreBoard 的数据迁移往返上（`migrationpluginwrapper` 于 t=653 起来，端口 `0x6003` 上
+`pr=0 to=0` 挂了 140 s，普查 `wait=19 run=1`）。所以既不是 GPU 也不是触摸，是一笔没人应答的迁移 XPC。
+这一格此前一直被记成「渲染循环画到第四步就停」；boot 107 证明停点在那之后、在 SpringBoard 侧。
+
+**② 先查 sheng。** 对照板 `~/UniXNU-sheng` 把这枚镜像开到桌面。它和 clover 的 ADT 只差一条 `/chosen`
+属性，而那条正是 `make-sheng-adt.py:148` 引着的那句：`"datamigrator skips every migration
+(os_variant_uses_ephemeral_storage)"`——由 `/chosen/ephemeral-storage` 驱动。clover 从来没设它：
+`make-clover-adt.py` 把 ephemeral 挂在 `packed_data_ramdisk` 这一枚 flag 上，而本板 `packed_data_ramdisk=false`
+（走 `--data-ramdisk` 那枚易失 mockfs 根，非 packed），于是属性一直缺席。
+
+**③ 本轮改了什么（一个字节寄存器写、一个 boot-arg 都没动）。**
+- `scripts/make-clover-adt.py`：ephemeral 的开关从 `if args.packed_data_ramdisk` 解耦到
+  `writable_root = args.data_ramdisk or args.packed_data_ramdisk`（line 209 已定义，之前只用于 RAMDisk 占位）。
+  于是易失的 `--data-ramdisk` mockfs 根现在带上 `/chosen/ephemeral-storage = u32(1)`；持久 Data 根仍由
+  `persistent_data` 排除（照 sheng：持久根不是 ephemeral，设了反而让 datamigrator 该跳的不跳）。
+- `scripts/check-clover.py`：`REQUIRED_CHOSEN` 加了 `ephemeral-storage`，并加值断言——存在不等于生效，
+  `os_variant_uses_ephemeral_storage()` 测的是值，u32 0 会让 SpringBoard 退回 PreBoard 等待，正是 boot 107
+  那一格。另：`board["payload"]["title"]` 的断言在本文件里有两处（一处随每轮升代的 r192 文档块 line 7741），
+  本轮把它们一起升到 `clover r320:`——此前只升一处会让闸门无论 ephemeral 成不成都判红，是一枚潜伏的自错。
+- `scripts/verify-clover-payload.py`：交付 payload 里钉一枚 `ADT: ephemeral-storage present (skips migration)`
+  针脚（键在 + `01 00 00 00` 在）。
+- `board.toml`：标题升到 `clover r320:`，把上面故事按「boot 107 停点前移并命名 → 差一条 ephemeral →
+  照 sheng 解耦到 writable_root」讲完；两处旧注释（line 572/2635 一带，原写「no ephemeral-storage」/
+  「packed adds ephemeral-storage」）改成解耦后的说法。
+
+**④ 构建与校验（哈希当场重数，盘上都在）。** 内核不重建：`build payload` 用 `--kernel` 显式喂
+`~/clover-out/round319-kernel-amfi.macho`（归一化件 `f703e521…`），绕开 `out/clover/kernel/kernel.macho`
+那枚未过 AMFI 的陈旧件。`build payload` 会先 `tree.assemble()` 把设备仓脚本重拷进 tree，所以改过的
+`make-clover-adt.py` 在本轮真被执行（tree 副本之前是 Nov 1 的旧条件，正是这点若不查会让本轮空转）。
+产物 `~/clover-out/round320-v0.7.33-payload.img` `1b47270b…`（58,720,256 B），与 boot 107 那张 `2a15526d…` 不同。
+卷内逐枚：`kernel.macho` 52,404,224 B `9d97fe34…`——与 round319 payload 卷内内核**逐字节相同（0 处差异）**，
+本轮整枚 payload 的唯一增量就是 ADT；`kernel.macho.adt` 14,384 → **14,424 B（+40，正是 ephemeral 键 + u32 头）**
+`a28655e9…`；`scratch-data.img` 35,888 B `614b8356…` 未变；`unixnu.toml` 2,110 → 2,213 B（标题变长）。
+两道闸门：`check-clover.py` = EXIT=0（打印 `ADT 14424 bytes`，ephemeral 的 REQUIRED + 值==u32(1) 都过）；
+`verify-clover-payload.py` = 48 OK / 0 FAIL、EXIT=0，含 `ADT: ephemeral-storage present (skips migration) OK`。
+未跑 `--prove`：这是新构建的 payload，不是同一枚的第二趟。
+
+**⑤ 预登记 boot 108 的判读（本轮不刷写；冷刷与读回单独发版）。** 这是可证伪实验，两支都写死：
+
+| 读数形状 | 判读 |
+| --- | --- |
+| SpringBoard 离开 PreBoard、`0x6003` 不再 `pr=0 to=0`、普查出现桌面帧 | ephemeral 生效：datamigrator 跳过迁移，桌面这一格解开；`presented`/scanout 已由 r180 备好，应见真桌面 |
+| 内核日志出现 os_variant 把根判为 ephemeral 的信号（`osenvironment` 仍是 main，但 `os_variant_uses_ephemeral_storage()` 返回值翻转） | 属性真进了内核；配合上一支读，配合下一支排除 |
+| 仍停在同一笔迁移 XPC：`0x6003` `pr=0 to=0` 依旧、`migrationpluginwrapper` 无应答 | **假设被排除**（仪器地平线：ADT 里有 ephemeral ≠ 本靴 SpringBoard 走了跳过分支）；下一步查 `migrationpluginwrapper` 服务本身有没有起来，而不是再改 ADT |
+| SpringBoard 不再等 `0x6003` 但停在另一端口/普查出现新停点 | ephemeral 生效（迁移被跳过），冒出新的一格；读新端口名，按 r264/r296 形状判 |
+| `clover r319: last` 节拍行缺席 | 跑的不是这枚内核——先查刷写/回读，不查假设（内核字节与 boot 107 相同，理应照旧在） |
+
+对照锚：boot 107 的 `clover r319: last status=11363c8 ...` 在 r320 内核字节相同，理应照旧逐拍出现——它是「同一枚内核在跑」的正对照。
+停轮条件：板子真进 iOS 桌面，不是「这一轮有没有读数」。

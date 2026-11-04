@@ -20,8 +20,8 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 | 4 | 磁盘 | 通 | eMMC 高速读写 + ADMA2；APFS 的 OS 卷与 Data 卷都挂上 | dev-log §Round128–138、§Round159 |
 | 5 | 用户态 | 通 | launchd 起一整套 iOS 守护进程，`Early boot complete` | dev-log §Round186 |
 | 6 | 点亮屏幕 | 通 | 第一次 present：`swap#1/2/3 accepted`、`scanout#3 ok bytes=9216000`、`presented=3` | dev-log §Round206 |
-| 7 | SpringBoard | **卡在这里** | 桌面进程起来后不再被杀，而是与 backboardd 一起等同一笔没人回音的 XPC；屏幕停在进度条 | dev-log §Round295–303 |
-| 8 | 桌面 | 未到 | 欠的是**画面本身**（boot 100 三帧：98.1% `ff000000`、非黑 41,548 px） | dev-log §Round308 |
+| 7 | SpringBoard | **卡在这里** | boot 107 定名：主线程空等一笔没人应答的 PreBoard 数据迁移（`0x6003` `pr=0 to=0`、`migrationpluginwrapper` t=653 起）；r320 照 sheng 给 ADT 补 `/chosen/ephemeral-storage`，待 boot 108 读回 | dev-log §Round295–320 |
+| 8 | 桌面 | 未到 | 画面那一格其实已通（r180 起 `presented=4`、copy/scanout/retire 全 ok）；欠的是 SpringBoard 离开 PreBoard——不是 GPU 也不是触摸 | dev-log §Round320 ① |
 
 ## 各驱动开发进度
 
@@ -51,7 +51,7 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 
 | # | 缺口 | 现状（一句话） | 下一步 | 出处 |
 | --- | --- | --- | --- | --- |
-| 1 | backboardd 不回 SpringBoard 的信 | 债链已逐跳读通（backboardd → datamigrator → migrationpluginwrapper → 叶子），叶子在自己那枚收口里既不排队列也没发送权 | boot 104 已落回（`presented=4`、八核照常、债链形状未变）；panic sink 那一格 boot 104 一笔没写 | dev-log §Round295–310、§Round318 ⑬ |
+| 1 | SpringBoard 等一笔没人应答的 PreBoard 数据迁移 | boot 107 把停点定名了：主线程空等迁移往返（`migrationpluginwrapper` t=653 起、端口 `0x6003` `pr=0 to=0` 挂 140 s、普查 `wait=19 run=1`），既非 GPU 也非触摸；与 sheng 的 ADT 只差 `/chosen/ephemeral-storage` 一条 | r320 照 sheng 把 ephemeral 解耦到 `writable_root`，`build payload` 已证它进 ADT（14,384→14,424、u32(1)，闸门 EXIT=0）；**等 boot 108 冷刷读回**，两支预登记见 §Round320 ⑤（进桌面 / 仍停迁移⇒假设排除） | dev-log §Round295–320 |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气通，两个候选地址全 NACK | 依赖 3：先把面板轨上电 | dev-log §Round181、§Round312 |
 | 3 | PMIC 轨读不出来 | r313 起「不在 v5 带内」不再是拒读的理由（地板图改成按版本字选表） | 刷 `round313` / `round314` 镜像定档 | [`notes/power-bringup.md`](notes/power-bringup.md) §8 |
 | 4 | ADSP 没起 | SMEM 读通，判决行没上屏 | 有边上 GLINK/APR；没镜像先压 `vadsp` | dev-log §Round183 |

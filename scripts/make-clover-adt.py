@@ -217,14 +217,19 @@ def generate_adt(args) -> bytes:
 
     chosen = node("chosen", [
         ("random-seed", os.urandom(64)),
-        # This board has no Data volume: NativeRamBlock is not linked, so the
-        # image behind --data-ramdisk is the md0/mockfs root (see
-        # scripts/make-clover-root.py), not a seed the kernel writes to. The
-        # upstream QEMU fixture that boots that root passes only the RAMDisk
-        # placeholder, and keeps /chosen as a normal main boot, so this does too
-        # -- ephemeral-storage and osenvironment=ramdisk would add kernel
-        # behaviour changes this round has no way to attribute.
-        *([("ephemeral-storage", u32(1))] if args.packed_data_ramdisk else []),
+        # This board has no persistent Data volume: the image behind --data-ramdisk is the
+        # md0/mockfs root (scripts/make-clover-root.py), so its data is volatile. Round320 sets
+        # ephemeral-storage on that root because the desktop stall has a named cause now: boot
+        # 107 caught SpringBoard's main thread blocked on an unanswered migration round-trip
+        # (port 0x6003, `pr=0 to=0`, 140 s without its reply; migrationpluginwrapper spawned at
+        # t=653 while the framebuffer already presented 4 frames), i.e. it is stuck in PreBoard's
+        # data-migration check and never reaches Board to draw a desktop. UniXNU-sheng, which
+        # boots this image to the desktop, records at make-sheng-adt.py:148 that with this
+        # property "datamigrator skips every migration (os_variant_uses_ephemeral_storage)". An
+        # earlier round withheld it as un-attributable kernel behaviour; the card names that
+        # behaviour now, so this is a targeted fix, not a loose variable. A persistent Data root
+        # must NOT set it -- it would stop the staged system apps installing.
+        *([("ephemeral-storage", u32(1))] if writable_root else []),
         ("osenvironment", cstr("main")),
         # Round242. boot 30 proved /product alone does not move BSPlatform.homeButtonType
         # either: the SSHB haptics block still waited on _controllerReadyGroup. The remaining
