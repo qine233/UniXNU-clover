@@ -121,7 +121,17 @@ FLIGHT_KIND = 23
 # one -- boot 91's panic slot carried a marker's event words and a block request's header, and the
 # decoder printed round293's boot stamp as that boot's `stage`.
 FLIGHT_MARKER_MAGIC = 0x434C564D      # 'CLVM'
-FLIGHT_MAGIC_WORD = {4: 46, 5: 48, 6: 126, 7: 43}
+FLIGHT_MAGIC_WORD = {4: 46, 5: 53, 6: 126, 7: 43}
+# Round310 gives the panic marker five more words, and the signature always lands one word past the last
+# extra -- so this sector has carried it at 43 (rounds 302-304), 48 (305-309) and 53 (310+). A reader
+# that knows only the newest index reads boot 102's own marker as "never a marker", which is the
+# generation rule aimed the wrong way: the record is this boot's, the layout moved under it. So the
+# older positions are tried in turn and the one that signed the sector is what gets printed.
+FLIGHT_MAGIC_FALLBACK = {5: (48, 43)}
+# The sink's own door-step reading, for the marker's words [15..17].
+PANIC_QUIESCE = {0: "nothing outstanding", 1: "took the ticket, card back",
+                 2: "took the ticket, reset refused", 3: "no holder, card back",
+                 4: "no holder, reset refused", 5: "the steal lost the race"}
 BOOT_OFFSET = KERNEL_OFFSET + 2 * KERNEL_SLOTS   # round212: one block after the kernel ring
 BOOT_KIND = 24
 PROBE_KIND = 25
@@ -383,6 +393,14 @@ def decode_flight(data, first_lba):
             # exactly the reading-shaped bug this file exists to refuse.
             magic_word = FLIGHT_MAGIC_WORD.get(words[6])
             magic = words[magic_word] == FLIGHT_MARKER_MAGIC if magic_word else None
+            if magic is False:
+                # The signature is one word past the extras, so a marker whose sector signed at an
+                # older position is an older payload's marker -- not an unsigned sector. Try those
+                # positions before calling it unsigned, and keep which one signed for the printer.
+                for fallback in FLIGHT_MAGIC_FALLBACK.get(words[6], ()):
+                    if words[fallback] == FLIGHT_MARKER_MAGIC:
+                        magic, magic_word = True, fallback
+                        break
             if words[6] == 6 and magic is False:
                 # The event only exists from round302, so a sector here without the signature was
                 # never a sentence: it is an empty sector or somebody else's record.
@@ -411,6 +429,7 @@ def decode_flight(data, first_lba):
                 "cur_pid": words[32], "comm0": words[33], "comm1": words[34],
                 "boot": words[FLIGHT_BOOT_WORD[words[6]]] if words[6] in FLIGHT_BOOT_WORD else 0,
                 "magic": magic,
+                "magic_at": magic_word if magic else None,
                 "extra": words[35:],
             }
             if words[6] == 6 and magic:
@@ -656,6 +675,15 @@ def flight_report(groups, boot_id=0):
                            f"pio={fail_code}/{fail_status:#010x}/{fail_words}w ch={fail_channel} "
                            if r305_own(record, boot_id) else
                            "k=? pio=? (clocks unreadable: an older payload's words are here) ")
+            # round310's five words, and only when this sector signed itself where round310 puts its
+            # magic: an older marker's words 48..52 are whatever that layout kept at those numbers, and
+            # printing them as cursors is exactly what round305's own gate exists to refuse.
+            sink_pair = ""
+            if record.get("magic_at") == FLIGHT_MAGIC_WORD[5]:
+                sealed, consumed, quiesce, door_stage, door_owner = record["extra"][13:18]
+                sink_pair = (f" probe={sealed}/{consumed} pend={sealed - consumed}"
+                             f" quiesce={quiesce}({PANIC_QUIESCE.get(quiesce, '?')})"
+                             f" door={FLIGHT_STAGES.get(door_stage, '?')}/owner={door_owner:#x}")
             print(f"  panic seq {record['seq']:>3} slot {record['slot']:>2} "
                   f"t={record['t_ms']:>8}ms {marker_pair}"
                   f"stage={stage} log_ready={log_ready} "
@@ -665,7 +693,7 @@ def flight_report(groups, boot_id=0):
                   f" gates={gates:#x}"
                   f"({'armed,' if gates & 1 else ''}"
                   f"{'bcb,' if gates & 2 else ''}"
-                  f"{'text' if gates & 4 else ''})")
+                  f"{'text' if gates & 4 else ''}){sink_pair}")
     else:
         print("flight: no panic marker -- the sink never entered, or its first write refused")
     # round309: the drain's first record, written before panicDrainRings() reads a gate. Boot 99 is the boot that
@@ -713,7 +741,8 @@ def build_flight_record(lba, seq, event, dir_, op_lba, op_blocks, t_ms=0, presen
                         guard_waits=0, beat_misses=0, pending=(0, 0), slot=None, kind=FLIGHT_KIND,
                         stage=0, stage_ms=0, stuck=0, recovered=0, steals=0, stuck_stage=0,
                         stage_lba=0, stage_blocks=0, stage_pid=0, stage_dir=0,
-                        cur_pid=0, comm=(0, 0), extra=(), boot=0, marker_magic=False):
+                        cur_pid=0, comm=(0, 0), extra=(), boot=0, marker_magic=False,
+                        magic_at=None):
     """One flight block as flightWrite lays it out, for selftest.
 
     `boot` goes where round293 says that event's stamp lives, so a selftest that builds a record
@@ -741,7 +770,7 @@ def build_flight_record(lba, seq, event, dir_, op_lba, op_blocks, t_ms=0, presen
         while len(words) <= index:
             words.append(0)
         words[index] = boot
-    magic_index = FLIGHT_MAGIC_WORD.get(event)
+    magic_index = FLIGHT_MAGIC_WORD.get(event) if magic_at is None else magic_at
     if marker_magic and magic_index is not None:
         # Written after the extras, exactly as flightWrite does it, so a selftest record and a card
         # record agree that the signature is the last thing the writer put down.
@@ -1138,7 +1167,7 @@ def selftest():
     place(signed,
           build_flight_record(first_lba + FLIGHT_PANIC_OFFSET, 0, 5, 3, 0, 0, t_ms=641900,
                               extra=[0, 1, 0x20fdf, 13320216, 2, 0, boot_id, 7],
-                              boot=boot_id, marker_magic=True),
+                              boot=boot_id, marker_magic=True, magic_at=43),
           FLIGHT_PANIC_OFFSET)
     decoded = decode_flight(bytes(signed), first_lba)
     assert not decoded["text"][0][2], decoded["text"][0][2]
@@ -1179,7 +1208,7 @@ def selftest():
           build_flight_record(first_lba + FLIGHT_PANIC_OFFSET, 0, 5, 3, 0, 0, t_ms=729900,
                               extra=[1, 1, 0, 13320216, 100, 0, boot_id, 7,
                                      741, 2, 0x00000011, 7, 103],
-                              boot=boot_id, marker_magic=True),
+                              boot=boot_id, marker_magic=True, magic_at=48),
           FLIGHT_PANIC_OFFSET)
     decoded = decode_flight(bytes(both), first_lba)
     beat = decoded["beats"][0][1]
@@ -1197,6 +1226,34 @@ def selftest():
     assert "pio=2/0x00000011/7w@640500ms ch=125 lba=13320256 total=4" in said, said
     assert "drained=" not in said, said
     assert "k=741s arming_offset=11100ms" in said, said
+    # Round310 grows this record by five words, and the signature always sits one past the last of them,
+    # so one sector has carried it at 43, at 48 and now at 53. Boot 102's own marker is the middle case:
+    # it must still read as a marker (that is the fallback, and a reader that only knew 53 would call the
+    # sink silent on a frame that signed itself), while the new columns stay shut, because words 48..52 of
+    # an r309 marker are its kernel second and its refusal words -- not cursors.
+    assert marker["magic"] and marker["magic_at"] == 48, marker
+    r309_line = next(line for line in said.splitlines() if "panic seq" in line and "magic=yes" in line)
+    assert "pend=" not in r309_line, r309_line
+    sink310 = bytearray(flight)
+    place(sink310,
+          build_flight_record(first_lba + FLIGHT_PANIC_OFFSET, 0, 5, 3, 0, 0, t_ms=569031,
+                              extra=[0, 1, 0x28c1d, 13320216, 0, 0, boot_id, 7,
+                                     581, 0, 0, 0, 0, 71, 69, 1, 1, 0x28c1d],
+                              boot=boot_id, marker_magic=True),
+          FLIGHT_PANIC_OFFSET)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        flight_report(decode_flight(bytes(sink310), first_lba), boot_id)
+    said = out.getvalue()
+    assert "magic=yes" in said, said
+    # Seventy-one rows sealed into the relay, sixty-nine taken by a flush: the two that boot 102 left
+    # unanswerable, in the one record the sink is known to land.
+    assert "probe=71/69 pend=2" in said, said
+    assert "quiesce=1(took the ticket, card back)" in said, said
+    assert "door=entry/owner=0x28c1d" in said, said
+    unsigned310 = bytearray(sink310)
+    struct.pack_into("<I", unsigned310, FLIGHT_PANIC_OFFSET * SECTOR + 53 * 4, 0)
+    assert not decode_flight(bytes(unsigned310), first_lba)["panic"][0][1]["magic"]
     # A beat from a payload before this round has zeros where the pair now lives. That reads as no
     # measurement, not as an arming offset of the whole uptime: the kernel second must stay out of the
     # arithmetic when it was never taken.
@@ -1232,8 +1289,8 @@ def selftest():
     assert "clocks unreadable" in said, said
     assert "1129076301" not in said and "1129075571250" not in said, said
     print("read-clover-log selftest: report window, both rings, flight region, wrap order, "
-          "ring kinds, bad records, the r302 verdict signatures, the r305 clock pair and the "
-          "older-payload clock guard all ok")
+          "ring kinds, bad records, the r302 verdict signatures, the r305 clock pair, the r310 "
+          "sink-door words and the older-payload clock guard all ok")
     return 0
 
 

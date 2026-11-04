@@ -1225,6 +1225,8 @@ static void teeKernelLog (void);
 static void panicDrainRings (void);
 // Round309: the drain's first breath, written before that function reads a single gate.
 static bool flightPanicDrainIn (void);
+// Round310: lay the controller down before the sink asks it for anything. Defined with the sink.
+static void panicQuiesceCard (void);
 // Round304: the probe ring's consumer. Declared with the drain it replaces as the only caller, because
 // its two new call sites -- a guarded block tail and CPU0's beat -- are both far above its definition.
 static uint32_t probeFlush (const char *why, uint32_t cap);
@@ -1269,6 +1271,16 @@ static uint32_t gPanicBlindOk = 0;              // 1 once the blind block reache
 // reading only if something says whether the code that writes it ran, and this is that something --
 // r305 put the last refusal's words in the marker, and this word names whether this write was it.
 static uint32_t gPanicDrainInOk = 0;            // 1 once the drain-in record reached the controller
+// Round310: what the sink did to the card before it asked the card for anything. Boot 102 entered the
+// sink, wrote its first marker and never wrote a second one: every step after that first marker rides
+// the same forced raw-PIO path that had just succeeded, so the four absences name one call that did
+// not return rather than four refusals. The last request record and that marker carry the same
+// millisecond, and the beat path that would have ended that request had not written for 81 s, so the
+// sink's own first poll was waiting on a request whose holder the panic had just stopped. These two
+// words say whether the sink put the controller down first and what it found when it did.
+static volatile uint32_t gPanicQuiesce = 0;     // 7 no host, 0 nothing outstanding, 1/2 stole+ok/refused, 3/4 no holder+ok/refused, 5 steal lost, 6 holder appeared
+static volatile uint32_t gPanicQuiesceStage = 0;  // the stage the sink found at its own door
+static volatile uint32_t gPanicQuiesceOwner = 0;  // the ticket held at that door, 0 when nobody did
 
 // ------------------------------------------------------------------ the window and its reads
 static OSSharedPtr<IOMemoryMap> gHostMap;
@@ -2595,7 +2607,10 @@ static void flightEnter (uint32_t event, uint32_t dir, uint32_t lba, uint32_t bl
 static void flightExit (uint32_t done);
 // Round215: the request-context recovery, defined beside reinitializeCard below. The watchdog calls
 // it too, after it has taken the ticket from a holder that stopped.
-static bool cardRecoverHeld (const char *why, uint32_t detail);
+// Round310 adds `force`, and only the panic sink passes it: the per-boot cap and the cooldown exist
+// to keep one dead card from turning every request into a power cycle, and a boot that is ending has
+// no later request to protect. Without the flag the sink would read a refusal as a failed reset.
+static bool cardRecoverHeld (const char *why, uint32_t detail, bool force = false);
 
 // Round169: the r168 frame turned the write-path wall into a read-path cascade -- APFS read 16 KiB
 // buffers from every daemon it decompressed and each one came back as EIO, while the card was
@@ -6842,7 +6857,7 @@ static CardReinit reinitializeCard (void)
 // things that keep a dead card from turning every request into a power cycle are the per-boot cap
 // and the cooldown. On success the tee's backlog goes to the card here, because this context still
 // owns the host and that write is the frame's own proof that the card came back.
-static bool cardRecoverHeld (const char *why, uint32_t detail)
+static bool cardRecoverHeld (const char *why, uint32_t detail, bool force)
 {
   uint64_t frequency = counterFrequency ();
   if (frequency < 1000000ULL || frequency > 1000000000ULL) {
@@ -6850,10 +6865,10 @@ static bool cardRecoverHeld (const char *why, uint32_t detail)
   }
   const uint64_t now = readCounter ();
   const uint32_t tries = __atomic_load_n (&gFlightStuck, __ATOMIC_RELAXED);
-  if (tries >= kCardRecoverCap) {
+  if (!force && tries >= kCardRecoverCap) {
     return false;
   }
-  if (gCardRecoverLastTick && now > gCardRecoverLastTick &&
+  if (!force && gCardRecoverLastTick && now > gCardRecoverLastTick &&
       now - gCardRecoverLastTick < frequency * kCardRecoverCooldownMs / 1000ULL) {
     return false;
   }
@@ -9495,7 +9510,7 @@ static void flightPanicMark (uint32_t stage, unsigned int rc, bool haveText)
   if (!gVerdictFirst || !gHost) {
     return;
   }
-  uint32_t extra[13];
+  uint32_t extra[18];
   extra[0] = stage;
   extra[1] = __atomic_load_n (&gPanicLogReady, __ATOMIC_ACQUIRE);
   // The host word says whether the sink found the controller owned, which is the one gate the
@@ -9518,7 +9533,23 @@ static void flightPanicMark (uint32_t stage, unsigned int rc, bool haveText)
   extra[10] = gPioFailStatus;
   extra[11] = gPioFailWords;
   extra[12] = gPioFailAttempt;
-  (void)flightWrite (kFlightEventPanic, 3, 0, 0, extra, 13);
+  // Round310. Five more words, and all five are about the sink's own reach rather than the panic.
+  //   [13]/[14] are the relay's two cursors -- how many rows the kernel sealed into it and how many a
+  //     flush has taken to the card. Boot 102 proved the pair is the only thing that can settle a
+  //     bracket row: its smp-pre reached the card while smp-post did not, and because the tail pass
+  //     moves the kernel ring before it runs probeFlush, that pair cannot say whether the walk
+  //     returned from the printf or the second seal simply arrived after the last flush. Sealed
+  //     greater than consumed here is that question answered on the spot, in a record that lands.
+  //   [15]/[16]/[17] are what the sink found the controller doing at its own door, before it asked
+  //     the controller for anything: the outcome of the quiesce, the stage word, and the ticket that
+  //     was held. The refusal counts above could only ever name the last block write this boot
+  //     refused; these name the state the sink chose to leave behind.
+  extra[13] = static_cast<uint32_t> (__atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED));
+  extra[14] = static_cast<uint32_t> (__atomic_load_n (&gProbeNext, __ATOMIC_RELAXED));
+  extra[15] = __atomic_load_n (&gPanicQuiesce, __ATOMIC_RELAXED);
+  extra[16] = __atomic_load_n (&gPanicQuiesceStage, __ATOMIC_RELAXED);
+  extra[17] = __atomic_load_n (&gPanicQuiesceOwner, __ATOMIC_RELAXED);
+  (void)flightWrite (kFlightEventPanic, 3, 0, 0, extra, 18);
 }
 
 /*
@@ -9550,6 +9581,72 @@ static bool flightPanicDrainIn (void)
   return flightWrite (kFlightEventDrainIn, 3, 0, 0, extra, 8);
 }
 
+/*
+ * Round310: put the controller down before the sink asks it for anything.
+ *
+ * Boot 102 is the boot that asked for this. Its first marker reached the card and nothing after it did --
+ * not the sentence, not the blind copy of it, not the marker's own exit half, not the drain-in sector --
+ * and all four of those ride the same forced raw-PIO write that had just succeeded in the same
+ * millisecond, so together they name one call that did not return rather than four refusals. What that
+ * call was waiting for is also on the card: the marker's host= word is a live ticket, the stage had
+ * already gone back to idle, and the last request record is a read stamped in the same millisecond --
+ * a holder the panic has just stopped, with the beat path that would have taken the ticket from it
+ * silent for 81 s. sheng never puts this call on its sink path at all (RAM copy, screen, park); the
+ * closest shape that keeps our drain is to end the orphaned request first.
+ *
+ * The cap and the cooldown are waived here and only here: both exist to stop one dead card from turning
+ * every request into a power cycle, and a boot that is ending has no later request to protect. The steal
+ * is the beat's own compare-and-swap so a holder that is somehow still running keeps its card, and the
+ * ladder is shared with the watchdog rather than duplicated. Where the door shows a machine still
+ * running but no ticket held, this context takes one the normal way first: cardRecoverHeld resets
+ * registers, and doing that under a request another core has just started is the one thing neither the
+ * beat nor the sink is allowed. On the way out, while this context still owns the host, the rings are
+ * flushed once: if the card answers now, the rows the census sealed seconds ago leave with them, and the
+ * marker that follows carries the relay's own cursors either way.
+ */
+static void panicQuiesceCard (void)
+{
+  if (!gVerdictFirst || !gHost || !__atomic_load_n (&gHostArmed, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n (&gPanicQuiesce, 7u, __ATOMIC_RELAXED);
+    return;
+  }
+  const uint32_t stage = __atomic_load_n (&gFlightStage, __ATOMIC_ACQUIRE);
+  const uint32_t owner = __atomic_load_n (&gHostOwner, __ATOMIC_ACQUIRE);
+  const uint32_t inhibit = read32 (SDHCI_PRESENT_STATE) & (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT);
+  __atomic_store_n (&gPanicQuiesceStage, stage, __ATOMIC_RELAXED);
+  __atomic_store_n (&gPanicQuiesceOwner, owner, __ATOMIC_RELAXED);
+  if (stage == kStageIdle && !inhibit && !owner) {
+    return;
+  }
+  uint32_t ticket = 0;
+  const bool stealing = owner != 0;
+  if (stealing) {
+    ticket = __atomic_add_fetch (&gHostTickets, 1u, __ATOMIC_RELAXED);
+    if (!ticket) {
+      ticket = __atomic_add_fetch (&gHostTickets, 1u, __ATOMIC_RELAXED);
+    }
+    uint32_t expected = owner;
+    if (!__atomic_compare_exchange_n (&gHostOwner, &expected, ticket, false,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      __atomic_store_n (&gPanicQuiesce, 5u, __ATOMIC_RELAXED);
+      return;
+    }
+    __atomic_add_fetch (&gFlightSteals, 1u, __ATOMIC_RELAXED);
+  } else if (!tryTakeHost (ticket)) {
+    __atomic_store_n (&gPanicQuiesce, 6u, __ATOMIC_RELAXED);
+    return;
+  }
+  const bool ok = cardRecoverHeld ("panic", stage, true);
+  teeSay ("CloverSdhci r310: quiesce %s stage=%u inhibit=%x owner=%x ok=%u probe=%u/%u\n",
+          stealing ? "steal" : "idle", stage, inhibit, owner, ok ? 1u : 0u,
+          static_cast<unsigned int> (__atomic_load_n (&gProbeSeq, __ATOMIC_RELAXED)),
+          static_cast<unsigned int> (__atomic_load_n (&gProbeNext, __ATOMIC_RELAXED)));
+  (void) flushVerdictRing ();
+  dropHostTicket (ticket);
+  __atomic_store_n (&gPanicQuiesce, ok ? (stealing ? 1u : 3u) : (stealing ? 2u : 4u),
+                    __ATOMIC_RELAXED);
+}
+
 extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int length)
 {
   // Round210: the timer keeps running through a panic, and a beat that cut in here would be a
@@ -9570,6 +9667,10 @@ extern "C" unsigned int clover_emmc_panic_append (const char *text, unsigned int
     }
     gPanicStashLength = copied;
   }
+  // Round310: the card first, then the writes. Boot 102's marker says the sink got as far as its own
+  // first record and no further, and the call it stopped in is the one that puts blocks on the card --
+  // so whatever that request left running is now waiting for an answer no other core will give it.
+  panicQuiesceCard ();
   flightPanicMark (0, 0, text != nullptr);
   const unsigned int rc = panicAppendText (text, length);
   gPanicAppendRc = rc;

@@ -24999,3 +24999,62 @@ r302 补盲写句子、r309 补 drain-in——三件都是「在同一条会挂�
 (乙) `marker(1)` 仍缺、而 drain-in 到了 ⇒ 「闲卡」不够，sink 里还有第二把会挂的锁，下一手把 drain 挪到 append 之前；
 (丙) `marker(1)` 与 drain-in 都缺 ⇒ 连 stuck 恢复自己也没跑成，下一手把恢复改成无等待的整卡 reset（只清控制器状态，不等 completion）；
 另：`marker(0)` 新带的那两枚 relay 计数若显示 `sealed > consumed`，③那一格当场结掉——尾巴不是没生产，是生产在最后一次 flush 之后。
+
+## Round310（v0.7.22）：sink 先把自己的门槛放下，再把自己的门读出来
+
+本轮没有内核补丁——boot 102 读到的那格不在内核里。改的两处都在 `drivers/CloverSdhci/CloverSdhci.cpp`
+与宿主解码器。
+
+**① `panicQuiesceCard()`（`:9607`，调用点 `:9673`）。** sink 在**自己的第一笔写之前**读三样东西：
+`gFlightStage`、`gHostOwner`、`SDHCI_PRESENT_STATE` 的两枚 inhibit 位。读出来的值原样进
+`gPanicQuiesceStage` / `gPanicQuiesceOwner`，所以 `marker(0)` 带的是**门槛状态本身**，不是这次恢复跑出来的结果。
+若三项皆闲（`stage=idle`、无 inhibit、无属主）就直接返回，留 `quiesce=0`；否则走 beat 用过的那把梯子：
+
+- **有属主**：`gHostTickets` 取号 + `__atomic_compare_exchange_n` 抢（与 `recoverStuckRequest` `:4084…4093` 同一形状，
+  属主若真还在跑就抢不到，抢不到记 `5`、什么都不碰）；抢到才 `cardRecoverHeld ("panic", stage, true)`，
+  然后 `teeSay` 那行、`flushVerdictRing()`、`dropHostTicket`；成功记 `1`，被拒记 `2`。
+- **无属主但机器还在转**（stage 非 idle 或 inhibit 置位）：**先 `tryTakeHost`**（`:9631`）。
+  `cardRecoverHeld` 会写复位寄存器，在别人的请求底下做这件事是 beat 和 sink 都不许做的事；取不到号就记 `6`
+  （「门槛到取号之间冒出一位属主」——这本身是一条读数，不是失败）。
+- **AMFI 之前/宿主没上膛**：`!gVerdictFirst || !gHost || !gHostArmed` ⇒ 记 `7` 并返回。
+  这一档单独立一个数字，是因为 `0` 已经要表示「门是闲的」；一个 0 表示两件事就是第十三层的老毛病。
+
+**② 为什么 `force` 只给 sink。** `cardRecoverHeld` 的两道闸（每靴 16 次上限、15 s 冷却）是给请求路径挡「一颗死卡
+把每一笔请求都变成一次上下电」的；一靴将尽时没有后来的请求要保护。不放开的话 sink 会读到一次**它自己没做的**拒绝。
+默认参数 `= false` 让六处现有调用点一个字节都不用改。
+
+**③ `marker(0)` 的五枚新字（`:9513`，`extra[18]`）。** `[13]=gProbeSeq`（内核往 relay 里封了几行）、
+`[14]=gProbeNext`（flush 送掉了几行）、`[15..17]=quiesce/stage/owner`。前两枚把 boot 102 那一格（`smp-pre` 到了卡、
+`smp-post` 没到）从「只能靠缺席猜」挪进一条**已经证明能落**的记录里：`sealed > consumed` 就是当场答案。
+后三枚是 sink 自己的门口证词。这两组都不走 tee 配额，也不走 kind-25 中转——**判定路径不能由被它判定的那条管道投递**。
+
+**④ 宿主的世代闸（`scripts/read-clover-log.py`）。** 魔字永远写在最后一枚 extra 之后，所以这一个扇区先后署过
+43（r302–304）、48（r305–309）、53（r310）。`FLIGHT_MAGIC_WORD[5]` 升到 53，同时 `FLIGHT_MAGIC_FALLBACK[5]=(48,43)`
+逐个试签，并记下签上的位置 `magic_at`；`sink_pair` 那四列**只在 `magic_at==53` 时**才打印——r309 记录的 48..52 是它
+自己的内核秒与拒写词，拿过来当游标就是第十一层（列名与单位不同源）。自测三件事：boot 102 的真形状（签在 48）仍读成
+marker 且**新列不出现在 marker 行**；18 词的 r310 marker 打印出 `probe=71/69 pend=2`、
+`quiesce=1(took the ticket, card back)`、`door=entry/owner=0x28c1d`；把魔字 53 清零 ⇒ `magic` 变回 absent。
+
+**⑤ boot 103 判读（读数之前写死，接 §boot 102 ⑦ 的三支）。**
+(甲) `marker(0)`＋`marker(1)`（或 kind-20 句子／盲写句子任一枚）到 ⇒ 卡确被弄闲、`panicAppendText()` 会返回，
+**panic 的原因第一次可读**，下一步由那句话说；
+(乙) `marker(1)` 仍缺而 drain-in 到 ⇒ 闲卡不够，sink 里还有第二把会挂的锁，下一手把 drain 挪到 append 之前；
+(丙) 两者都缺 ⇒ 连恢复自己也没跑成，下一手是无等待的控制器清状态（不等 completion）；
+新增四支是 `quiesce=` 自己的读法：`0`＋同样的四缺席＝停点不在控制器，嫌疑转到 raw-PIO 路径本身；
+`2` 或 `4`＝复位被拒，那是卡的故事不是 sink 的故事；`5`＝抢票输给一位还在跑的属主（panic 之后仍有核在动，
+这条本身就是新事实）；`7`＝这靴连宿主都没上膛，之前所有 sink 读数要重看。
+`door=` 若读 `idle/owner=0x0` 而 `stage=0` 那条 marker 仍带着 `host=0x…` 的活票，就是「门槛比 marker 更早被读」的形状，
+不是「没人拿卡」。
+
+**⑥ 契约、构建与产物（v0.7.22）。** `check-clover.py`：驱动侧新增 11 枚针（`panicQuiesceCard` 声明与调用点、
+`cardRecoverHeld` 的 `force` 形参与两处 `!force &&`、`tryTakeHost` 那支、`quiesce=7`、`extra[18]`、
+`extra[15]`、`flightWrite (… extra, 18)`、`CloverSdhci r310: quiesce …` 整串），另加一条**顺序断言**：
+`panicQuiesceCard ();` 必须在 `flightPanicMark (0, 0, …)` 之前——写在 marker 之后就读的是 sink 自己动过的手，
+不是它走进门的形状。宿主侧 `FLIGHT_MAGIC_WORD` 那枚针从 `5: 48` 升到 `5: 53` 并补 `FLIGHT_MAGIC_FALLBACK`、
+`magic_at`、`sink_pair` 的世代闸与 `PANIC_QUIESCE` 表；四处旧针同步（`extra, 13`→`18` 两处、reader 的 48→53、
+`cardRecoverHeld` 签名两处）。`verify-clover-payload.py` 在 panic 那一族里加 `quiesce-row`，钉的是**合并后整串**。
+产物：驱动在组装树 `-Werror` 过；内核 `1bce8ac320b820d7…` → amfi `baa0e97343431ebc…`（两刀仍在
+`0x1adb0e4`/`0x1adb16c`，与 r309 同址 ⇒ 驱动改动没挪 AMFI 段）→ normalized `9eebcf9b8426059a…`（973 枚 object 戳清零）
+→ `~/clover-out/round310-v0.7.22-payload.img` sha256 `937210697f186a1a36f9ffd791df8a71…`，58,720,256 B。
+`check-clover.py` 与 `verify-clover-payload.py` 双绿（0 FAIL，`quiesce-row present`），
+`read-clover-log.py --selftest` 全绿。

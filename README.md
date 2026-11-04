@@ -631,6 +631,18 @@ leave」一路收紧到一句可测的话：
   对照板的写法一直是「sink 根本不碰存储栈」，我们 r301/r302/r309 三步都只是在同一条会挂的腿上多写一笔。
   ⇒ **r310 两件**：在 sink 第一笔写之前先把卡弄闲，并把 relay 的 `sealed`/`consumed` 塞进已经证明能落的 `marker(0)`。
   时机那一格本靴 **581 s**，且是「带 marker 的 panic」而不是无名复位。读数与四支判读在 dev-log §boot 102 ①–⑦。
+* **r310（v0.7.22）把 sink 从「等卡的上下文」里摘出来**：`panicQuiesceCard()`（`CloverSdhci.cpp:9607`，调用点 `:9673`）
+  在 sink **第一笔写之前**读 `gFlightStage`/`gHostOwner`/两枚 inhibit，有票就用 beat 那把 CAS 抢（抢不到记 `5`，什么都不碰），
+  无票而机器还转就**先 `tryTakeHost`**——`cardRecoverHeld` 会写复位寄存器，不能在别人的请求底下写它——然后走看门狗那同一条梯子。
+  `cardRecoverHeld` 因此多一枚 `force`（默认 `false`，六处旧调用点不动）：每靴 16 次上限与 15 s 冷却是给请求路径挡死卡的，
+  一靴将尽时没有后来的请求要保护；不放开，sink 会读到一次**它自己没做的**拒绝。七种读数（`0` 闲／`1``2` 抢票成／拒／
+  `3``4` 无属主成／拒／`5` 抢输／`6` 门槛后冒出属主／`7` 宿主没上膛）里 `7` 单独占一格，因为 `0` 已经要表示「门是闲的」。
+  `marker(0)` 从 13 词升 **18 词**：`probe=sealed/consumed` 把 boot 102 那格（`smp-pre` 到卡、`smp-post` 没到）从「只能靠缺席猜」
+  搬进一条已证明能落的记录，`quiesce/stage/owner` 是门口证词；这两组都不走 tee 配额也不走 kind-25 中转。
+  宿主按签名位认世代（同一扇区署过 43/48/53），`sink_pair` 只在 `magic_at==53` 时打印——**列名与单位必须同源**。
+  契约新增 11 枚驱动针＋一条顺序断言（`panicQuiesceCard()` 必须在 `flightPanicMark (0,…)` 之前）。产物：内核 `1bce8ac3…`、
+  归一化 `9eebcf9b…`、payload `93721069…`（58,720,256 B），双闸门 0 FAIL。boot 103 的判读（原三支＋`quiesce=` 四支）
+  在 dev-log §Round310 ①–⑥。
 * **这两条仪器债已由 r303 结清**（原文曾记作「本格欠着」）：`vbits=` 现以 r298 行末的 `vb_r=`/`vb_v=` 落地
   （`ipc_right_lookup_read()` 已经交出的 entry 位掩码，用来分 port set / send-once / 死名，不需要对象、锁纪律与
   translate 同一条），`cap=send` 行的 `qmc=/qsr=` 也带上了自己的返回码 `qerr=`。

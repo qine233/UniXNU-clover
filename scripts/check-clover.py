@@ -4254,7 +4254,7 @@ def check_board(errors: list) -> str:
                        'extra[0] = kernelSeconds ();',
                        'flightWrite (kFlightEventBeat, 2, 0, 0, extra, 13)',
                        'extra[8] = kernelSeconds ();',
-                       'flightWrite (kFlightEventPanic, 3, 0, 0, extra, 13)',
+                       'flightWrite (kFlightEventPanic, 3, 0, 0, extra, 18)',
                        'extra[12] = gBootId;'):
             if needle not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci has no {needle[:52]!r}: the beat and the panic marker are "
@@ -4290,7 +4290,7 @@ def check_board(errors: list) -> str:
                             if (base / "scripts/read-clover-log.py").is_file()), None)
         if reader_r305 is not None:
             reader_text = reader_r305.read_text()
-            for needle in ("FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 47,", "FLIGHT_MAGIC_WORD = {4: 46, 5: 48,",
+            for needle in ("FLIGHT_BOOT_WORD = {1: 35, 2: 35, 3: 47,", "FLIGHT_MAGIC_WORD = {4: 46, 5: 53,",
                            "arming_offset=", "starve=", "clocks unreadable"):
                 if needle not in reader_text:
                     errors.append(f"read-clover-log.py does not know {needle!r}: the beat's boot id moved when "
@@ -4694,6 +4694,39 @@ def check_board(errors: list) -> str:
             errors.append("the drain-in record is not the first statement of panicDrainRings(): after that "
                           "gate it can only ever say the drain decided to speak, which is the reading boot 99 "
                           "already had")
+        # Round310, the sink's own doorstep. Boot 102 entered the sink, landed its first marker and wrote
+        # nothing after it -- not the sentence, not the blind copy of it, not the marker's exit half, not the
+        # drain-in sector. All four of those ride the same forced raw-PIO write that had just succeeded in
+        # the same millisecond, so together they name one call that did not return, not four refusals. What
+        # it was waiting for is also on the card: the marker's host= word is a live ticket, the stage had
+        # gone back to idle, and the last request record is a read stamped in that same millisecond -- a
+        # holder the panic just stopped, with the beat that would have taken the ticket silent for 81 s.
+        for needle in ('static void panicQuiesceCard (void)',
+                       '  panicQuiesceCard ();',
+                       'static bool cardRecoverHeld (const char *why, uint32_t detail, bool force = false);',
+                       'if (!force && tries >= kCardRecoverCap) {',
+                       'const bool ok = cardRecoverHeld ("panic", stage, true);',
+                       '} else if (!tryTakeHost (ticket)) {',
+                       '__atomic_store_n (&gPanicQuiesce, 7u, __ATOMIC_RELAXED);',
+                       'uint32_t extra[18];',
+                       'extra[15] = __atomic_load_n (&gPanicQuiesce, __ATOMIC_RELAXED);',
+                       '(void)flightWrite (kFlightEventPanic, 3, 0, 0, extra, 18);',
+                       '"CloverSdhci r310: quiesce %s stage=%u inhibit=%x owner=%x ok=%u probe=%u/%u\\n"'):
+            if needle not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no {needle[:52]!r}: a sink that asks the card for "
+                              "a write before it has ended the request the panic just orphaned can only ever "
+                              "answer its own absences with \"the card refused\", which is what boot 102 did")
+        quiesce_call = sdhci_source.find("  panicQuiesceCard ();")
+        first_mark = sdhci_source.find("flightPanicMark (0, 0, text != nullptr);")
+        if quiesce_call < 0 or first_mark < 0 or quiesce_call > first_mark:
+            errors.append("panicQuiesceCard() is not called before the sink's first marker: after that write "
+                          "the card has already been asked for one block, and the reading of its door state is "
+                          "then the sink's own doing rather than what it walked in on")
+        # sheng, the reference board, is the reason this is a quiesce and not a retry: its panic sink never
+        # touches the storage stack at all (RAM copy, screen, park) and a single-owner writer thread does the
+        # writing. That shape is not ours to copy -- the drain is what makes our sink useful -- but the one
+        # thing it teaches is that the sink must not be the context that waits on a busy controller.
+
 
 
         # Round251, the recorder's own truncation. Boot 38 answered the question r250 was built to ask
@@ -5111,9 +5144,10 @@ def check_board(errors: list) -> str:
                  "nothing to say it was ever entered"),
                 ("flightPanicMark (1, rc, text != nullptr);",
                  "the panic sink has no exit marker: the append's return code would be unreadable"),
-                ("(void)flightWrite (kFlightEventPanic, 3, 0, 0, extra, 13);",
-                 "the panic marker does not carry its eight gate words plus round305's kernel second and "
-                 "last refusal -- and the r302 signature then lands at the wrong word"),
+                ("(void)flightWrite (kFlightEventPanic, 3, 0, 0, extra, 18);",
+                 "the panic marker does not carry its eight gate words, round305's kernel second and last "
+                 "refusal and round310's relay cursors and door state -- and the signature then lands at the "
+                 "wrong word"),
                 ("__atomic_load_n (&gHostOwner, __ATOMIC_ACQUIRE)",
                  "the panic marker does not read the live host owner, which is the one gate its "
                  "return code cannot express")):
@@ -6004,8 +6038,8 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r309:"):
-        errors.append('[payload] title is not "clover r309: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r310:"):
+        errors.append('[payload] title is not "clover r310: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -6275,8 +6309,8 @@ def check_board(errors: list) -> str:
                        "static const uint32_t kIdleSilent = 2;",
                        "static const uint32_t kCardRecoverCap = 16;",
                        "static const uint64_t kCardRecoverCooldownMs = 15000;",
-                       "static bool cardRecoverHeld (const char *why, uint32_t detail);",
-                       "static bool cardRecoverHeld (const char *why, uint32_t detail)",
+                       "static bool cardRecoverHeld (const char *why, uint32_t detail, bool force = false);",
+                       "static bool cardRecoverHeld (const char *why, uint32_t detail, bool force)",
                        "__atomic_add_fetch (&gFlightStuck, 1u, __ATOMIC_RELAXED);",
                        "if (reason != kIdleBusy && cardRecoverHeld (\"idle\", reason)) {",
                        "(void) cardRecoverHeld (\"stuck\", stage);",
@@ -6731,7 +6765,14 @@ def check_board(errors: list) -> str:
                        # as no sentence at all.
                        "FLIGHT_TEXT_OFFSET = 44", "FLIGHT_TEXT_SLOTS = 12",
                        "FLIGHT_MARKER_MAGIC = 0x434C564D",
-                       "FLIGHT_MAGIC_WORD = {4: 46, 5: 48, 6: 126, 7: 43}",
+                       "FLIGHT_MAGIC_WORD = {4: 46, 5: 53, 6: 126, 7: 43}",
+                       # Round310: the signature sits one word past the last extra, so this one sector has
+                       # carried it at three places. A reader that knows only the newest one calls boot 102's
+                       # own marker "never a marker" -- the generation rule aimed at the wrong boot.
+                       "FLIGHT_MAGIC_FALLBACK = {5: (48, 43)}",
+                       '"magic_at": magic_word if magic else None',
+                       'if record.get("magic_at") == FLIGHT_MAGIC_WORD[5]',
+                       'PANIC_QUIESCE = {0: "nothing outstanding"',
                        '6: "text"', 'not a sentence: no r302 magic at word',
                        "no sentence record",
                        "def flight_stamp(records, boot_id)", "STALE: boot",
@@ -7143,8 +7184,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r309:"):
-        errors.append('[payload] title is not "clover r309: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r310:"):
+        errors.append('[payload] title is not "clover r310: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

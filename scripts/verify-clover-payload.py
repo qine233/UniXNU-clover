@@ -861,7 +861,13 @@ def check_panic_tail_read(kernel: bytes) -> bool:
              # sector is written from the first statement of the sink's drain, before its gates -- so a boot
              # with no sector and no row here is a boot whose sink never reached the drain, and a boot with
              # the row and no sector is the sink refusing its own write. Either leg alone would be a hole.
-             "drain-legs": (b"CloverSdhci r309: drain legs in=%u boot=%u host=%x probe=%u\n") in kernel}
+             "drain-legs": (b"CloverSdhci r309: drain legs in=%u boot=%u host=%x probe=%u\n") in kernel,
+             # round310: what the sink found the card doing at its own door, before it asked the card for
+             # anything. Boot 102's four post-marker absences could only be read as "the card refused", and
+             # the word that would have settled it -- the stage and the live ticket the sink walked in on --
+             # was in no record. This row, and the same two words inside the marker, are that reading.
+             "quiesce-row": (b"CloverSdhci r310: quiesce %s stage=%u inhibit=%x owner=%x ok=%u "
+                             b"probe=%u/%u\n") in kernel}
     ok = all(found.values())
     detail = ", ".join(f"{name} {'present' if yes else 'ABSENT'}"
                        for name, yes in found.items())
