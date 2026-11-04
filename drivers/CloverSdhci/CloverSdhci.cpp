@@ -1150,6 +1150,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // that capped the full row but kept the map=0 one would leave a boot saying "the page was refused"
   // when the page answered fifteen times.
   { "clover r311: ", "r311-gpu", 32, 0, 0, 0 },
+  // Round317 adds one verdict row to the same schedule -- the census the thirteen words above are now
+  // counted into, printed in the same fire from the same reads. Its own class and its own exemption, for
+  // the reason r294 gave: this row is the interpretation of round294's baseline, and a boot that shows
+  // the thirteen words and not the shape would read as "the census never ran" when what happened is that
+  // a capped pass ate it. 32 covers fifteen fires of one row with a margin.
+  { "clover r317: ", "r317-gpu", 32, 0, 0, 0 },
   // Round313 is the first boot that runs drivers/CloverPower at all -- the instrument shipped in
   // round182 and has never been on a board -- so its lines have no class and no budget of their own
   // yet. The report is one-shot, printed in the PMGR tail beside the other bring-up bursts, and its
@@ -4789,6 +4795,11 @@ static void teeConsumeLine (uint32_t &pushed)
        // ate the answered shape and left the refused one would report a page that answered as a page that
        // was never mapped. The class budget of 32 still bounds it.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r311") ||
+       // Round317's verdict row is the interpretation of round294's thirteen words, and it prints from the
+       // same fire. The exemption is r283's rule in its plainest form here: a shape the cap ate and a shape
+       // the board never produced are two different claims about the same rail, and the difference between
+       // "list-never-written" and "dead-page" is the one this line is still asking about.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r317") ||
        // Round313's power report is one burst printed while the PMGR tail attaches, and it is the first
        // time this driver has ever run on a board. Exempting both of its classes is the r283 reason in
        // its plainest form: half a report and no report are different readings of the same bus, and a

@@ -1256,7 +1256,8 @@ def check_sb_sample(kernel: bytes) -> bool:
              "gpu-row-gdsc": (b"clover r286: gpu t=%u gdsc cx_on=%u gx_on=%u gfx3d_en=%u cx=%08x cxhw=%08x "
                               b"gx=%08x\n") in kernel,
              "gpu-row-chipid": b"clover r286: gpu t=%u chipid=%08x expect=%08x ok=%u\n" in kernel,
-             "gpu-row-chipid-skip": b"clover r286: gpu t=%u chipid skipped cx_on=%u gx_on=%u gfx3d_en=%u\n" in kernel,
+             "gpu-row-chipid-skip": (b"clover r286: gpu t=%u chipid skipped cx_on=%u gx_on=%u "
+                                     b"gfx3d_en=%u gate=%s\n") in kernel,
              "gpu-row-coremapfail": b"clover r286: gpu t=%u core map failed phys=%llx\n" in kernel,
              "gpu-row-mapfail": b"clover r286: gpu t=%u gpucc map failed phys=%llx\n" in kernel,
              "gpu-mapfail": b"clover r286: gpu map failed phys=%llx size=%x\n" in kernel,
@@ -1297,6 +1298,22 @@ def check_sb_sample(kernel: bytes) -> bool:
              "gpu-row-ldo-census": (b"clover r294: gpu t=%u ldo words %s w00=%08x w04=%08x w08=%08x "
                                     b"w0c=%08x w10=%08x w14=%08x w18=%08x w1c=%08x w20=%08x w24=%08x "
                                     b"w28=%08x w2c=%08x w30=%08x cx_on=%u gx_on=%u\n") in kernel,
+             # Round317's verdict: the same thirteen words counted against the vendor's init list by the
+             # layer that list now lives in. Pinned together with the two CString tables it renders, because
+             # the row is the interpretation and the tables are its vocabulary -- an image that linked the
+             # row but dropped a name would print `shape=unknown-shape`, which is a build accident wearing
+             # the costume of a reading. `no-gfx3d` is the chipid gate table, appended to the r286 refusal
+             # row in the same round.
+             "gpu-row-ldo-verdict": (b"clover r317: gpu t=%u ldo verdict %s shape=%s named=%u/%u "
+                                      b"comparable=%u agree=%u differ=%u nz_zero=%u/%u no_expect=%u "
+                                      b"outside=%u dead=%u ctrl_pdn=%u ctrl_unnamed=%08x vsettle=%u "
+                                      b"map_ok=%u control=%u\n") in kernel,
+             "gpu-ldo-shape-names": (b"no-words" in kernel and b"unnamed-mapping" in kernel
+                                      and b"dead-page" in kernel and b"list-unwritten-blind" in kernel
+                                      and b"list-never-written" in kernel and b"partial" in kernel
+                                      and b"as-expected" in kernel),
+             "gpu-chipid-gate-names": (b"no-cx" in kernel and b"no-gx" in kernel
+                                       and b"no-gfx3d" in kernel),
              # Round311's MEM_ACC row, in all three shapes. They are pinned together because the row's
              # reading *is* which shape it took: the refused-range line and the answered-page line are the
              # two halves of "does this board's L1 corner select answer at all", and a driver that lost one

@@ -3086,7 +3086,11 @@ def check_board(errors: list) -> str:
                      "CloverGpu.cpp", gpu_source),
                     ("clover_gpu_set_bits(clover_gpu_gpucc, kGpuccGfx3dEn, 1);", "CloverGpu.cpp", gpu_source),
                     ("clover_gpu_report_chipid(t);", "CloverGpu.cpp", gpu_source),
-                    ("if ((ahb & 1u) == 0 || ahb == 0xffffffffu) {", "CloverGpu.cpp", gpu_source),
+                    # Round317: the gate that used to be spelled here is now gpu_ahb_gate_open(), so the pin
+                    # follows the call. What must not regress is the word test inside it -- the host model
+                    # shows bit31 of 0xffffffff reads as "running", so a vote-only gate would let a dead GCC
+                    # page license the GPUCC window.
+                    ("if (!gpu_ahb_gate_open(ahb)) {", "CloverGpu.cpp", gpu_source),
                     ("PE_parse_boot_argn(\"clover-gpu\", &mode, sizeof(mode))", "CloverGpu.cpp", gpu_source),
                     ("clover_gpu_timer = IOTimerEventSource::timerEventSource(owner, clover_gpu_say);",
                      "CloverGpu.cpp", gpu_source),
@@ -3108,7 +3112,7 @@ def check_board(errors: list) -> str:
                     ("\"clover r286: gpu t=%u gdsc cx_on=%u gx_on=%u gfx3d_en=%u cx=%08x cxhw=%08x \"",
                      "CloverGpu.cpp", gpu_source),
                     ("\"clover r286: gpu t=%u chipid=%08x expect=%08x ok=%u", "CloverGpu.cpp", gpu_source),
-                    ("\"clover r286: gpu t=%u chipid skipped cx_on=%u gx_on=%u gfx3d_en=%u",
+                    ("\"clover r286: gpu t=%u chipid skipped cx_on=%u gx_on=%u gfx3d_en=%u gate=%s\\n\"",
                      "CloverGpu.cpp", gpu_source),
                     ("\"clover r286: gpu t=%u core map failed phys=%llx", "CloverGpu.cpp", gpu_source),
                     # Round290's own reading: the halt bit, which r286 never carried. The header has to
@@ -3157,6 +3161,14 @@ def check_board(errors: list) -> str:
                      "CloverGpu.cpp", gpu_source),
                     ("\"w14=%08x w18=%08x w1c=%08x w20=%08x w24=%08x w28=%08x w2c=%08x w30=%08x "
                      "cx_on=%u gx_on=%u\\n\"", "CloverGpu.cpp", gpu_source),
+                    # Round317's verdict row: the same thirteen words counted, in the same fire. The two
+                    # segments are pinned separately because that is how the compiler merges them, and the
+                    # merged string is what an image decoder searches for.
+                    ("\"clover r317: gpu t=%u ldo verdict %s shape=%s named=%u/%u comparable=%u agree=%u \"",
+                     "CloverGpu.cpp", gpu_source),
+                    ("\"differ=%u nz_zero=%u/%u no_expect=%u outside=%u dead=%u ctrl_pdn=%u "
+                     "ctrl_unnamed=%08x \"", "CloverGpu.cpp", gpu_source),
+                    ("\"vsettle=%u map_ok=%u control=%u\\n\"", "CloverGpu.cpp", gpu_source),
                     # Round311: the MEM_ACC node as this unit's tree states it, the field inside it, and
                     # the three shapes the one row can take. The all-ones test is pinned as an expression
                     # because it is the part that keeps `corner=` from meaning two things: masked into a
@@ -3169,8 +3181,12 @@ def check_board(errors: list) -> str:
                     ("#define kMemAccCorner2Field 0x00U", "GpuRegs.h", gpu_regs),
                     ("#define kMemAccNoAnswer     0xffffffffU", "GpuRegs.h", gpu_regs),
                     ("IODeviceMemory::withRange(kMemAccPhys, kMemAccSize)", "CloverGpu.cpp", gpu_source),
-                    ("raw = clover_gpu_read(window, 0);", "CloverGpu.cpp", gpu_source),
-                    ("if (raw != kMemAccNoAnswer) {", "CloverGpu.cpp", gpu_source),
+                    # Round317 moved the no-answer test and the corner lookup into one call whose argument
+                    # is the read. What is pinned here is the call site: the driver has to ask the layer,
+                    # not re-derive `l1=` next to the printf -- and the order the old needle proved (test the
+                    # word before cutting the field) is now asserted by the host model instead.
+                    ("gpu_mem_acc_decode(clover_gpu_read(window, 0), &sel);", "CloverGpu.cpp", gpu_source),
+                    ("(unsigned) sel.answered,", "CloverGpu.cpp", gpu_source),
                     ("clover_gpu_report_mem_acc(t);", "CloverGpu.cpp", gpu_source),
                     ("\"clover r311: gpu t=%u fire=%u mem_acc map=0 phys=%llx size=%x\\n\"",
                      "CloverGpu.cpp", gpu_source),
@@ -3234,6 +3250,146 @@ def check_board(errors: list) -> str:
                               "not 4: GCC, GPUCC, the GPU core and round311's MEM_ACC node are the only "
                               "extents this line may map, the LDO registers stay inside the GPUCC extent the "
                               "DT declares, and a fifth window means a register whose node nobody checked")
+
+            # Round317. Conformance §7 gap 3's other half: every decision this line reads out of a word
+            # moved into GpuCore.h so a host can prove it, and the pins follow the code, not the file. What
+            # is asserted is (a) that each decision still exists, (b) that the driver *calls* it, and (c)
+            # that no second copy survived in the driver. The third is the real risk of a split like this
+            # one, and here it is checkable unusually well: the masks the decoders consume are named only
+            # by the layer now, so a hand-rolled `(gfx & 1u)` left in CloverGpu.cpp is visible as a needle.
+            #
+            # The reason this round exists at all is in the layer's own header comment: boot 81's ten-year
+            # recorded verdict, "not one bit matches the vendor's list", was a human comparing twelve words
+            # by eye and was wrong -- one word does agree, and one word the list writes was missing from the
+            # table this repo quoted. A census is a function now, so the claim and its exceptions are
+            # counted by the same code the board runs.
+            gpu_core_path = REPO / "drivers/CloverGpu/GpuCore.h"
+            if not gpu_core_path.is_file():
+                errors.append("drivers/CloverGpu/GpuCore.h is missing: the LDO census, the branch/halt "
+                              "pair and the corner decode would be provable only on a board that cannot be "
+                              "un-broken, and boot 81's verdict would stay a sentence instead of a count")
+            else:
+                gpu_core = gpu_core_path.read_text()
+                core_decisions = (
+                # The census's own arithmetic, one clause per thing it distinguishes.
+                ("values[i] == kGpuNoAnswer", "gpu_ldo_census"),
+                ("out->nonzero_read_zero++;", "gpu_ldo_census"),
+                ("out->table_outside++;", "gpu_ldo_census"),
+                # The dead page is excluded *before* comparison. Without that order a silent
+                # window is 13 differences, which reads as an unprogrammed rail.
+                ("if (values[i] == kGpuNoAnswer) {\n            out->dead++;\n            continue;",
+                 "gpu_ldo_census"),
+                ("census.named != census.words", "gpu_ldo_shape"),
+                ("census.nonzero_read_zero == census.nonzero_expected", "gpu_ldo_shape"),
+                ("control_on ? GPU_LDO_SHAPE_UNPROGRAMMED : GPU_LDO_SHAPE_BLIND",
+                 "gpu_ldo_shape"),
+                ("\"list-unwritten-blind\", \"list-never-written\"", "kGpuLdoShapeNames"),
+                # The vendor's nine-entry list and the DT's 0x34 extent, kept apart.
+                ("return block_offset < kGpuLdoWindowBytes;", "gpu_ldo_expect_in_window"),
+                ("static const uint32_t kGpuLdoWindowBytes = 0x34U;", "GpuCore.h"),
+                # The bit the archived rows never carried: the residue of boot 81's 0x80000038.
+                ("out->unnamed = raw & ~kGpuLdoCtrlNamedBits;", "gpu_ldo_decode_ctrl"),
+                # Seven bits admit a voltage neither the vendor nor this node accepts.
+                ("out->in_dt_range = out->uv <= kGpuLdoDtMaxUv && out->uv >= kGpuLdoDtMinUv;",
+                 "gpu_ldo_decode_vref"),
+                ("static const uint32_t kGpuLdoDtMinUv = 400000U;", "GpuCore.h"),
+                # The settling question has two inputs and one predicate that is an *or*.
+                ("return raw != kGpuNoAnswer && (raw & (kLdoSettled | kLdoReady)) != 0;",
+                 "gpu_ldo_vendor_settled"),
+                # GDSC: the word our write produces, and the pair that means "powered".
+                ("return (before & ~(kGdscHwControl | kGdscSwOverride | kGdscWaitMask)) | kGdscWaitVal;",
+                 "gpu_gdsc_init_word"),
+                ("return before & ~kGdscSwCollapse;", "gpu_gdsc_release_word"),
+                ("return gpu_gdsc_pwr_on (word) && !gpu_gdsc_collapsed (word);",
+                 "gpu_gdsc_powered"),
+                # A request and a halt are two answers; only the conjunction is a clock state.
+                ("static inline bool gpu_branch_requested (uint32_t word) { return (word & 1u) != 0; }",
+                 "GpuCore.h"),
+                ("return gpu_branch_requested (word) && !gpu_branch_halted (word);",
+                 "gpu_branch_running"),
+                # The AHB gate: a vote of 0 and a word of 0xffffffff are different failures, and
+                # bit31 of the second one is set, so a bit0-only test opens GPUCC behind a dead page.
+                ("return gpu_branch_requested (ahb_word) && ahb_word != kGpuNoAnswer;",
+                 "gpu_ahb_gate_open"),
+                # The corner select: the order is the reading.
+                ("out->answered = raw != kMemAccNoAnswer;\n    if (!out->answered) {\n        return;\n    }\n    out->field = raw & kMemAccFieldMask;",
+                 "gpu_mem_acc_decode"),
+                ("gpu_mem_acc_decode_before_mask", "GpuCore.h"),
+                )
+                for needle, _ in core_decisions:
+                    if needle not in gpu_core:
+                        errors.append(f"drivers/CloverGpu/GpuCore.h lacks {needle[:64]!r}: this is a "
+                                      "decision the host model proves and a board cannot -- a decode that "
+                                      "masks before asking whether the page answered turns a silent window "
+                                      "into a corner, and a census that counts a dead word as a difference "
+                                      "turns it into an unprogrammed rail")
+                for needle in ("gpu_gdsc_pwr_on(", "gpu_gdsc_collapsed(", "gpu_gdsc_init_word(",
+                               "gpu_gdsc_release_word(", "gpu_branch_requested(", "gpu_branch_halted(",
+                               "gpu_ahb_gate_open(", "gpu_chipid_gate(", "gpu_ldo_decode_ctrl(",
+                               "gpu_ldo_decode_vref(", "gpu_ldo_vendor_settled(", "gpu_ldo_status_settled(",
+                               "gpu_ldo_census(", "gpu_ldo_shape_name(", "gpu_mem_acc_decode(",
+                               "gpu_ldo_word_gpucc_offset("):
+                    if needle not in gpu_source:
+                        errors.append(f"drivers/CloverGpu/CloverGpu.cpp does not call {needle!r}: the pure "
+                                      "layer would be dead code the model passes and the kernel ignores, "
+                                      "which is the one split that makes a green host test a lie")
+                for gone in ("(gfx & 1u)", "& kGdscPwrOn", "!= kMemAccNoAnswer", "& kMemAccFieldMask",
+                             "& kLdoVrefMask", "& kLdoPdn", "& kLdoReady", "& kLdoSettled",
+                             "kGdscEnRestWaitMask", "kBranchClkOff"):
+                    if gone in gpu_source:
+                        errors.append(f"drivers/CloverGpu/CloverGpu.cpp still carries a second copy of "
+                                      f"{gone!r}: the shipped path and the modelled path would be two "
+                                      "answers to one question, and only one of them has a host test")
+                # The layer must not re-type what GpuRegs.h already pinned to the device tree. That is the
+                # rule that keeps this split from becoming a second constant table -- the failure mode r313
+                # measured on the SPMI side, where two indexings of one block disagreed by an APID range.
+                for borrowed in ("kMemAccNoAnswer", "kGpuccLdoAtest", "kLdoMinUv", "kLdoStepUv",
+                                 "kGdscSwCollapse", "kGdscPwrOn", "kGdscWaitVal", "kBranchClkOff",
+                                 "kMemAccFieldMask", "kLdoBypass", "kLdoCprBypass"):
+                    if borrowed not in gpu_core:
+                        errors.append(f"GpuCore.h does not derive from GpuRegs.h's {borrowed!r}: the layer "
+                                      "is supposed to add names and verdicts, not re-type the numbers the "
+                                      "device tree check already vouches for")
+                if "#include \"GpuRegs.h\"" not in gpu_core:
+                    errors.append("GpuCore.h does not include GpuRegs.h: without it the layer would have to "
+                                  "re-declare every address, and the pin that ties each one to a DT node "
+                                  "would stop covering the code the board actually runs")
+                if "NULL" in gpu_core:
+                    errors.append("GpuCore.h uses NULL: the header is included before anything that defines "
+                                  "it and the standard the kernel builds these archives under is not "
+                                  "guaranteed to provide it, so the null pointer is spelled 0 here")
+
+                gpu_model = REPO / "drivers/CloverGpu/tests/clover_gpu_host.cpp"
+                gpu_runner = next((base / "scripts/test-clover-gpu.py"
+                                   for base in (REPO, pathlib.Path.cwd())
+                                   if (base / "scripts/test-clover-gpu.py").is_file()), None)
+                if gpu_runner is None:
+                    errors.append("scripts/test-clover-gpu.py is missing: the census, the decodes and the "
+                                  "GDSC word would be proven only on a board that cannot be un-broken")
+                elif not gpu_model.is_file():
+                    errors.append("drivers/CloverGpu/tests/clover_gpu_host.cpp is missing: the host model "
+                                  "has nothing to drive GpuCore.h against")
+                else:
+                    model_text = gpu_model.read_text()
+                    for needle in ("== 8", "== 1", "== 7", "kBoot81", "0x80000038", "0x0000000d",
+                                   "list-never-written", "list-unwritten-blind", "dead-page",
+                                   "unnamed-mapping", "no-words", "0xa0282000", "0x08282000",
+                                   "0x00282000", "1010000", "375000", "400000", "gpu_ldo_ctrl_probe_word",
+                                   "gpu_mem_acc_decode_before_mask", "0x00000008", "0x7fffffff"):
+                        if needle not in model_text:
+                            errors.append(f"the CloverGpu host model never asserts {needle!r}: a number the "
+                                          "board can only reach by reading it off a card is a number nobody "
+                                          "has seen proven, and round317 exists because one such number was "
+                                          "recorded wrong for eleven boots")
+                    check = subprocess.run([sys.executable, str(gpu_runner)],
+                                           capture_output=True, text=True)
+                    if check.returncode:
+                        errors.append("the CloverGpu host model failed: the census, a decode, the GDSC word "
+                                      "or the AHB gate is not what this boot's row will claim it is\n"
+                                      + (check.stdout + check.stderr)[-700:])
+                    else:
+                        print("[check-clover] CloverGpu host model: "
+                              + (check.stdout.strip().splitlines() or ["PASS"])[-1])
         gpu_built = any("CloverGpu" in item for item in board["kernel"]["archives"])
         # `text` has been reassigned to patch sources by this point in the function; read the
         # defconfig this check is about rather than whatever the last round's block left behind.
@@ -3302,6 +3458,17 @@ def check_board(errors: list) -> str:
             errors.append("the r311 row is not exempt from the per-pass push cap: it prints from the GPU "
                           "timer beside the censuses, and the three shapes of that row are the only thing "
                           "that separates a refused mapping from an answered page")
+        # Round317's verdict row is the interpretation of round294's thirteen words, so it is pinned in the
+        # same two places for the same reason: the shape is the reading, and a capped pass that ate it would
+        # leave a boot showing the words and none of what they mean.
+        if '{ "clover r317: ", "r317-gpu", 32, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the round317 LDO verdict: an unbudgeted "
+                          "producer drops the census interpretation, and a boot whose shape row never "
+                          "arrives reads like a boot whose census never ran")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r317")' not in sdhci_source:
+            errors.append("the r317 verdict is not exempt from the per-pass push cap: it prints from the "
+                          "same GPU timer as r286/r290/r291/r294/r311, and \"list-never-written\" versus "
+                          "\"dead-page\" is the distinction this line has been circling since boot 77")
         # Round313 boots drivers/CloverPower for the first time. The report is one burst in the PMGR tail
         # and it is printed under two tokens -- round313's new lines and the round182 lines that keep
         # their origin stamp -- so both halves need their own budget and their own exemption, or the half
@@ -6251,8 +6418,8 @@ def check_board(errors: list) -> str:
     # function of the arbiter's own version word, and that driver has never been in a boot whose title
     # named it, because clover-power has always been commented out. Its new lines are stamped r313 and
     # the round182 lines keep their origin stamp, which is the reason the tee now budgets both tokens.
-    if not board["payload"]["title"].startswith("clover r316:"):
-        errors.append('[payload] title is not "clover r316: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r317:"):
+        errors.append('[payload] title is not "clover r317: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7397,8 +7564,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r316:"):
-        errors.append('[payload] title is not "clover r316: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r317:"):
+        errors.append('[payload] title is not "clover r317: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

@@ -25534,3 +25534,106 @@ CI 判的是 main HEAD；补完后 `clover: 13 structured areas checked`。
 **⑩ 未结**：`CloverInput`／`CloverGpu` 两颗仍缺范例第 1、3 条（notes §7 未结 3 现在结掉三分之一）；
 `docs/drivers/uefi-drivers.md:7-13` 那一层的对照仍未搬（未结 4）；第一颗真走 personality 的驱动要改开机顺序，
 排在桌面这一格之后（未结 1）。**本轮未刷写**：板子不在家，boot 103 仍是第一枚要读的卡。
+
+## Round317（v0.7.29）：CloverGpu 交出本仓第四颗纯层；boot 81 那句判决被数了一遍，数出来是错的
+
+**宿主侧轮：改了驱动源码、重新构建了内核与负载，没有刷写。** 挑这一颗的理由还是 notes §7 未结 3：
+范例第 1、3 条（纯逻辑与总线分离／纯函数先有宿主测试）r316 结掉三分之一，`CloverGpu` 是剩下两颗里
+唯一一枚**判决由人眼在十六进制上比出来**的——boot 81 那十三个词跟厂商 `sdm660_ldo_config[]` 的对照，
+档案里写的是「一位都不对」。这句话不是测出来的，是一个人拿两张表逐字比出来的，而比的是十二个词。
+
+**① 纯层：`drivers/CloverGpu/GpuCore.h`，只 `#include "GpuRegs.h"`。** 搬进去的是九件事：LDO 块的普查
+`gpu_ldo_census()` 与其形状判定 `gpu_ldo_shape()`、`PWRSWITCH_CTRL` 的十一枚位解码 `gpu_ldo_decode_ctrl()`、
+`LDO_VREF_SET` 的电压解码加**两套上界** `gpu_ldo_decode_vref()`、STATUS 的两枚 bit 与厂商那条 **OR** 判据
+`gpu_ldo_vendor_settled()`、GDSC 写序列 `gpu_gdsc_init_word()`/`gpu_gdsc_release_word()` 与三种状态问法、
+时钟分支的 request/halt/running 三问 `gpu_branch_*()`、GPUCC 的门槛 `gpu_ahb_gate_open()`、chipid 的
+Gate `gpu_chipid_gate()`（拒绝行从此说得出是哪一扇没开）、L1 角选择 `gpu_mem_acc_decode()`。
+这一层立的一条硬规矩是**一个数字都不重打**：窗口长度、掩码、位、角的 map 值全部从 `GpuRegs.h` 的名字派生
+（`kGpuLdoBlockBase = kGpuccLdoAtest`、`kGpuNoAnswer = kMemAccNoAnswer`），层里新增的只有厂商期望表、
+厂商 dump 表给的名字、以及两套电压上界这些确实新的内容。这一格不是风格：r313 刚量过两张索引同一个块的表
+能差出整段 APID，而那份分歧就是靠「只有一处写了地址」收掉的。
+
+**② 契约三面，跟 r316 同一式。** `check-clover.py` 的 `# Round317.` 那段要求：每枚判断仍在层里（20 枚
+needle，含「死页在比较**之前**被排除」这一整段换行原文）；驱动**调用**它（17 枚函数名，少一枚就报「纯层会
+变成模型通过而内核忽略的死代码」）；`.cpp` 里不再留着第二份拷贝（10 枚裸掩码 `& kGdscPwrOn`／`kBranchClkOff`／
+`(gfx & 1u)` 之类——这一面对本颗驱动格外好查，因为掩码现在只有层里命名）。再加两条 r316 没有的：层必须
+`#include "GpuRegs.h"` 且逐枚派生自它已钉过的名字（`kMemAccNoAnswer`、`kLdoMinUv`、`kGdscWaitVal`……11 枚），
+以及层里不许出现 `NULL`（这头文件在内核任何头之前被包含，而归档的 C++ 标准没人担保它给 `NULL`；实际写法是
+字面量 `0`，`gnu++17` 与 `gnu++98` 两档都验过能编）。最后**运行** `scripts/test-clover-gpu.py`。
+
+**③ 数一遍的结果：boot 81 那句「一位都不对」不成立，而结论仍然成立。** 模型把 boot 81 归档的十三个词喂进
+普查，得到 `comparable=8 agree=1 differ=7`。那一枚 agree 是 `LDO_LD_DATA @0x10`——厂商期望 0，板子读回 0，
+**两边都是零所以它算一次相符**，这正是「一位都不对」错的地方，也是任何按位比对都必须先把「期望 0」和
+「缺期望」分开的地方（`no_expect=5` 走的是另一支）。真正撑得住的那句话窄得多也硬得多：**厂商列表里会被写
+非零值的词，七个，全读零**（`nz_zero=7/7`）——所以形状是 `list-never-written`，把 r294 那枚正对照
+（同拍 `cx_on`）拿掉就退成 `list-unwritten-blind`，而不是「这条轨在零伏」。档案里那句人眼的判决从此由
+`clover r317:` 行替代，卡上每次 fire 重数一遍。
+
+**④ 模型顺手量出的四处新事实**（`drivers/CloverGpu/tests/clover_gpu_host.cpp` 十三组，全部由
+`scripts/test-clover-gpu.py` 编译运行）：
+
+| 事实 | 出处 |
+| --- | --- |
+| 复位角 `val=0` → **375,000 uV，低于本节点自己声明的 400,000 uV 下界** | `msm_gfx_ldo.c:1371` 的解码 × `sdm660-regulator.dtsi:528` |
+| 掩码是 GENMASK(6,0)，七位允许 `val=0x7f` → 1,010,000 uV，**同时超出**厂商 980,000 与本节点 925,000 | `:66` × dtsi:529 |
+| 厂商的「稳了」是 **OR**：`0x4`（只有 READY）就通过 `:307` 的等待，而它 pr_err 里点名的是 SETTLED | `msm_gfx_ldo.c:307` |
+| `gpu_gdsc_init_word()` 再 release 产出的 `0x00282000`，**正是 boot 81 两个域都读回的 wait 字段**（`cx=0xa0282000`、`gx=0x08282000`），而各留一枚没人命名的位（CX bit29、GX bit27） | boot 81 归档行 × `gdsc.c` 的三枚 GENMASK |
+
+`gpu_ahb_gate_open()` 那一格还反证了一件事：`0xffffffff` 的 bit31 是**置位**的，所以任何只看 PWR_ON 的测试
+都会把一扇没应答的页当成上电的域——r286 的门槛一直带字测（`ahb == 0xffffffff`）不是保守，是必需。
+
+**⑤ 板上只多一行。** `clover r317: gpu t=%u ldo verdict %s shape=%s named=%u/%u comparable=%u agree=%u
+differ=%u nz_zero=%u/%u no_expect=%u outside=%u dead=%u ctrl_pdn=%u ctrl_unnamed=%08x vsettle=%u
+map_ok=%u control=%u`，与 r294 那十三个词**同一次读、同一次 fire**；r294 的行逐字未动，所以 boot 81/82 仍
+能对照。新 token 按老规矩进 `drivers/CloverSdhci` 的类表（`{ "clover r317: ", "r317-gpu", 32, 0, 0, 0 }`）
+并拿 per-pass-cap 豁免（`teeHasPrefix(..., "r317")`），两处都在 `check-clover.py` 里钉住——理由跟 r291/r294
+同一句：形状被 cap 吃掉和板子没给出形状，是同一根轨的两种不同判决。`map_ok=` 是这行自己的防线：驱动侧
+`kGpuccOffsets[]` 与层里 `gpu_ldo_word_gpucc_offset(i)` 必须逐枚相等，一枚 named 常量飘出其文档偏移，
+`named` 就从 13 掉下来而不是让一个错寄存器冒充对的那个。
+
+**⑥ 写侧一处真实变化，写在源码头。** `clover_gpu_gdsc_on()` 现在每颗域多**一次 MMIO 读**——因为层要拿到
+「当前那个字」才能算出下一步要写的字。存进去的字与改之前逐位相同（模型就是照旧序列断言的），读是无副作用的，
+所以这一格是形状变化而不是行为变化；r313 那条「判决路上有一步等硬件」的教训要求把它写出来而不是默默做掉。
+`clover_gpu_clear_bits()`/`update_bits()` 本轮删掉（算术搬层后无人调用），`.cpp` 里剩下的落盘通道只有
+`clover_gpu_write()` 与 `set_bits()`，README 那句「四枚 helper」同批改掉——这是本轮唯一一处 README 不实。
+
+**⑦ 被打回三次，都是自己的假设。** 一是「普查里一枚偏移重复就会掉 `named`」：重复的如果是**被命名的**两枚，
+`named` 仍是 13，守卫只抓走到表外偏移的那一种——测试改成 `0x34`（ADC_CTL，表内、DT 窗外）并补一组断言把
+这个局限写在明处。二是「厂商第一条写是 CLAMP_IO 清零 + bit30」：`EN_LDOAP_CTRL_CPR_BIT` 是 **BIT(29)**，
+所以厂商那次写产出 `0x20000038`，而死页那次的朴素产物是 `0x7fffffff`（两处注释同改）。三是我在 README 里
+把 boot 81 的 `0x0000000d` 安到了 PWRSWITCH_STATUS 上——那是 `LDO_STATUS1 @0x24`，`0x28` 本轮两个 boot
+都读 0；`vsettle=` 因此改成一句「这格还没有过一次真读数」的说明，而不是一条假装量过的判决。
+
+**⑧ 闸门测自己的排版那一格又响了一次，另外这次是我把自己家文件剪了。** 抄 r316 的结构时把
+`missing = [needle for needle in (...) if ...]` 的头连着抄，而本轮内容是 (needle, 名字) 的表，语法当场炸；
+同一轮里 r317 行的第二枚 needle 按「编译器会拼起来的那条」写，而源码里它是两段相邻字符串，红了一次——
+两次都改断言，不迁就源码。更严重的一处：换 board.toml 标题时用了 `re.S` 的贪婪 `.*`，把标题之后
+**2417 行配置一起吃掉**（`check-clover.py` 立刻 `KeyError: 'kernel_args'`）。`git show HEAD:board.toml`
+恢复，改成逐行精确替换，`git diff --stat` 确认只剩 1 行改动。**这条要在下一轮记住：改 board.toml 里
+那一行超长 title 的脚本，不许带 `re.S`。**
+
+**⑨ 构建与校验（哈希当场重数）**：内核 `a7917c324ee9…`（52,404,224 B，`out/clover/kernel/kernel.macho`，
+19:03；CloverGpu 是 archive 16/16，一次编过）→ AMFI `8ed2e0ecf91b…`（站点仍是 `0x1ae00e4`/`0x1ae016c`
+那一对，说明没有段搬动）→ 归一化 `dfcef9783ac9…`（973 枚对象戳）→ 负载
+`e882846ba8b4…`（58,720,256 B，`/Users/zhouzhou/clover-out/round317-v0.7.29-payload.img`）。
+两侧闸门 EXIT=0：仓里跑 = `drivers documented: 11, exempt: 0` ＋模型 PASS；组装树里跑 =
+`documented: 11, exempt: 11` ＋ `12 archives, 22 objects ABI-checked, kernel read`。
+`verify-clover-payload.py` 0 FAIL，新增三枚针脚全绿（`gpu-row-ldo-verdict`、`gpu-ldo-shape-names`
+七枚形状名、`gpu-chipid-gate-names` 三枚门名）；顺带把 `gpu-row-chipid-skip` 从旧的前缀升级成带
+` gate=%s\n` 的完整行。**未跑 `--prove`**：本轮发的是新构建的内核，不是同一枚镜像的第二趟构建。
+
+**⑩ 预登记 boot 104 的判读**（第一枚带 r317 行的卡；boot 103 仍先按 Round310 (5) 与 Round316 ⑨ 读）。
+
+| 读数形状 | 判读 |
+| --- | --- |
+| `named=13/13 … shape=list-never-written nz_zero=7/7` 且同拍 `control=1` | 厂商那份列表在这块板上**一次都没跑过**——这是 GPU 线到目前为止最硬的一句，且它由行自己数出来，不再由人眼 |
+| `shape=list-unwritten-blind` | 同一件事，但正对照没答：这一格不许读成轨在零伏，要先查同拍 `cx_on`/`gcc` 行 |
+| `dead=13 shape=dead-page` | GPUCC 那扇页没应答。与「 rail 是零」是两个相反答案，r294 的十三个词此时应逐枚 `ffffffff` |
+| `named=12/13`（或 `map_ok=0`） | 驱动侧常量与层的表不再同名——是映射事故，不是读数；先复现再改哪边由模型定 |
+| `differ=0 agree=8` | 预登记的反面：列表真跑过，本轮之后所有关于「没人写过」的推论作废，下一步才谈写 |
+| 整行缺席而 r294 行在场 | tee 那一格的问题（r317 有独立类与豁免），不许读成普查没跑 |
+| `vsettle=1` | 厂商的 OR 判据第一次被真读数碰到；同时要报 SETTLED/READY 各是几，因为它俩在 `:307` 是同一句的两个输入 |
+
+**⑪ 未结**：`CloverInput` 一颗仍缺范例第 1、3 条（notes §7 未结 3 现在结掉三分之二）；
+`docs/drivers/uefi-drivers.md:7-13` 那一层的对照仍未搬（未结 4）；第一颗真走 personality 的驱动排在桌面
+之后（未结 1）。**本轮未刷写**：板子不在家。

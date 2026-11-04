@@ -154,7 +154,9 @@ force_load 那两处。两颗要动开机顺序的活因此可以把风险写小
 当构建闸门；`CloverInput`、`CloverGpu`、`CloverBlock` 三颗既没分离也没有宿主模型——这是本文件里最重的一处
 真缺口，等板子回来有读数打底之后再动。**r316 更新**：那一格不再等板子。`CloverBlock` 交出第三颗
 （`drivers/CloverBlock/BlockCore.h` + `tests/clover_block_host.cpp` + `scripts/test-clover-block.py`），
-剩下 `CloverInput`／`CloverGpu` 两颗。
+剩下 `CloverInput`／`CloverGpu` 两颗。**r317 更新**：`CloverGpu` 交出第四颗
+（`drivers/CloverGpu/GpuCore.h` + `tests/clover_gpu_host.cpp` + `scripts/test-clover-gpu.py`），只剩
+`CloverInput` 一颗。
 
 第二条（常量全部带出处）六颗都做到，且地址不止带出处还被钉在设备自己的 DT 上（`check-clover.py` 的
 `check_device_tree_constants()`，38 枚地址对 230 个节点；`GpuRegs.h` 于 r311 收编）。第四条（分级 boot arg）
@@ -210,7 +212,11 @@ self-ipi 三枚，护住挂死的是 `clover-unattended=1800`，`:2597`）、以
 3. ~~`CloverInput`／`CloverGpu`／`CloverBlock` 的纯层分离与宿主模型（范例第 1、3 条）。~~
    **r316 结掉三分之一**：`CloverBlock` 的清单走查与请求算术进了 `BlockCore.h`，15 组宿主模型由
    `scripts/test-clover-block.py` 编译并**运行**（`check-clover.py` 的 `# Round316.` 那一段既要求驱动
-   真的调用它，也要求 `.cpp` 里不再留着第二份拷贝）。剩 `CloverInput`／`CloverGpu` 两颗。
+   真的调用它，也要求 `.cpp` 里不再留着第二份拷贝）。
+   **r317 结掉三分之二**：`CloverGpu` 的每一枚「从字里读出一个判断」进了 `GpuCore.h`（LDO 普查、
+   PWRSWITCH_CTRL／VREF／STATUS 解码、GDSC 写序列、分支 request/halt、AHB 门、chipid 门、L1 角选择），
+   13 组宿主模型由 `scripts/test-clover-gpu.py` 编译并**运行**，同一面三式（存在／被调用／无第二副本）
+   由 `check-clover.py` 的 `# Round317.` 那一段把住。剩 `CloverInput` 一颗。
 4. `docs/drivers/uefi-drivers.md:7-13` 那一层的对照（`.inf` / DSC / FDF / `args` 载入选项）在固件仓
    `uefi-clover`，本轮未动，同一套办法搬过去即可。
 

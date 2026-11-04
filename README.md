@@ -40,7 +40,7 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 | **CloverInput** | 触摸 / QUP v2 I2C-3 电气与应答普查 | archives `:71`；`clover-input=3` `:2422` | ✗ / ✗（已说明）/ ✓ / ✗ / ✗（已说明） | 电气通，两个候选地址全 NACK（`verdict=102`） | 先把面板两颗轨真上电再问地址；并补纯层分离 + 宿主模型 | 依赖 CloverPower：`pm660l_l3` / `pm660_l11` 的 enable 至今一次没读到 |
 | **CloverPower** | SPMI 仲裁器 + PMIC 轨读数 | archives `:72`；`clover-power=1` `:2489` | ✗ / ✗（已说明）/ ✓ / **✓**（`test-clover-power.py` PASS）/ ✗（已说明） | **未上机**：盘上最后一帧仍是 round183 的 `not a v5 arbiter (03000000)`；r313 的「按版本字选地板图 + 四条腿」等 boot 103/104 | 按 [`notes/power-bringup.md`](notes/power-bringup.md) §8 七支定档，再升 mode 2（revid）、mode 3（读 `0x46` 开轨） | 板子不在家 |
 | **CloverDsp** | ADSP / SMEM 共享堆通路 | archives `:73`；`clover-dsp=3` 在 `:2534` 是**注释状态** | ✗ / ✗（已说明）/ ✓ / **✓**（`test-clover-dsp.py`）/ ✗（已说明） | `$TOC` / `$PRT` 自校验通过，判决行没上屏 | 有边就上 GLINK/APR；没镜像先压 `vadsp` 电源 | 这颗会读堆，参数整颗摘掉（留着会毁掉当靴读数） |
-| **CloverGpu** | Adreno 512 的电源/时钟普查（只读） | archives `:74`；`clover-gpu=1` `:2441` | ✗ / ✗（已说明）/ ✓ / ✗ / ✗（已说明） | boot 81：LDO 十三词只有 `w1c=80000038`、`w24=0000000d` 非零，与厂商表一位都不对；boot 74/76/77 稳定 `cx_on=1 gx_on=0` | boot 104 落回后读 r311 的 MEM_ACC 行（`acc-sel-l1 @ 0x01fcf004`），按 [`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5.13 五支判读 | 供电那一头在 RPM 手里；桌面 CPU-first，本线只量不写 |
+| **CloverGpu** | Adreno 512 的电源/时钟普查（只读） | archives `:74`；`clover-gpu=1` `:2441` | ✗ / ✗（已说明）/ ✓ / **✓**（`GpuCore.h` + `test-clover-gpu.py` PASS）/ ✗（已说明） | boot 81 十三词由 r317 的普查数过：`comparable=8 agree=1 differ=7`，而七枚「厂商要写非零」的词全读零 ⇒ 那份 init 列表在本板一次都没跑过（档案里「一位都不对」那句已被这行取代）；boot 74/76/77 稳定 `cx_on=1 gx_on=0` | boot 104 落回后读 r317 的 `shape=` 行（§Round317 ⑩ 七支）与 r311 的 MEM_ACC 行（`acc-sel-l1 @ 0x01fcf004`，[`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5.13 五支） | 供电那一头在 RPM 手里；桌面 CPU-first，本线只量不写 |
 
 「personality」那一列全 ✗ 是同一件事：本板 ADT 的 `/arm-io` 只有 `intc` 一个孩子，spmi／sdhci／gpu／i2c／dsp
 都没有节点，`IOPlatformDevice` + `IONameMatch` 谁都匹配不到；补齐它的三个前提与顺序在 conformance §5，
@@ -83,7 +83,7 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 | 事项 | 现状 | 出处 |
 | --- | --- | --- |
 | 第一颗真走 personality 的驱动 | 三个前提各欠一件：ADT 发布节点、顺序怎么表达、归档补 force_load | conformance §5、§7 未结 1 |
-| `CloverInput` / `CloverGpu` 的纯层分离与宿主模型 | `CloverBlock` 已在 r316 交出第一颗（`BlockCore.h` + 15 组模型）；剩这两颗，范例第 1、3 条不再是最重的缺口 | conformance §6、§7 未结 3 |
+| `CloverInput` 的纯层分离与宿主模型 | `CloverBlock`（r316，`BlockCore.h` + 15 组）与 `CloverGpu`（r317，`GpuCore.h` + 13 组）已交出两颗，剩这一颗；范例第 1、3 条不再是本仓最重的缺口 | conformance §6、§7 未结 3 |
 | 固件那一层的文档对照 | `docs/drivers/uefi-drivers.md:7-13` 在 `uefi-clover`，同一套办法搬过去即可 | conformance §7 未结 4 |
 | payload 容器不逐字节可复现 | ADT 的 `/chosen/random-seed` 每次重抽（内核本身可复现） | dev-log §Round177 |
 | 构建顺序反着 | `unixnu` 先跑 archives 再跑 XNU，身份戳会删掉 object 让 `nm` 失败；r186 起用一次性 object 预 pass 绕过，没有修 | dev-log §Round186 |
@@ -157,9 +157,9 @@ scripts/run-clover-unattended.sh --out ~/clover-out/roundNNN-log-window.bin \
 
 ## 闸门
 
-| 闸门 | 查什么 | 跑在哪 | r316 实跑 |
+| 闸门 | 查什么 | 跑在哪 | r317 实跑 |
 | --- | --- | --- | --- |
-| `scripts/check-clover.py` | 板级预检 + ADT/DT 常量 + 补丁与探针形状 + 驱动宿主模型 | 仓库 | EXIT=0，`drivers documented: 11, base-repo drivers exempt: 0`，12 条 notice 全指向未构建的产物；`test-clover-block.py` 被这道闸门**跑**而不只是断言存在 |
+| `scripts/check-clover.py` | 板级预检 + ADT/DT 常量 + 补丁与探针形状 + 驱动宿主模型 | 仓库 | EXIT=0，`drivers documented: 11, base-repo drivers exempt: 0`，12 条 notice 全指向未构建的产物；`test-clover-block.py` 与本轮新增的 `test-clover-gpu.py` 都被这道闸门**跑**而不只是断言存在 |
 | 同一脚本的产物那一半 | 12 枚归档逐枚走对象、核 `docs/drivers/xnu-drivers.md:106-116` 那五个字段、再到链接好的内核里验每颗驱动的导出符号 | **必须在 `out/clover/tree` 里跑** | EXIT=0，`12 archives, 22 objects ABI-checked, kernel read`；`exempt: 11` ——组装树把基仓的 11 颗 `drivers/*`  symlink 进来，r316 起文档闸门只判本仓 authored 的那些 |
 | 同一脚本的文档那一半 | 有源码的 `drivers/*` 必须有 README；README 必须有一段点名文档并至少引一枚**能落地**的 `docs/**.md:行号`；没有 `Info.plist` 的必须说出理由；禁止「本仓 `.cpp`:数字」这种形状 | 仓库即可 | 负向测过：CPU type 改 `0x1000007`、filetype 改 2、换假符号名都报错，带路径的厂商引用不误报；r316 新暴露的一条：本仓 `.cpp` 引用被 `BlockCore.h` 取代，README 改用符号锚点 |
 | `scripts/verify-clover-payload.py` | 归档对镜像：卷内形状 + 逐轮探针断言（含标题必须带双引号，那是 boots 35/36 的转义防线） | 仓库 | EXIT=0，48 行 OK、0 FAIL；`SHNGROOT` 那一枚针脚换成了走查的拒绝标签——优化器把八枚 ASCII 折进立即数，镜像里没有那串字了 |

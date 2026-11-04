@@ -55,6 +55,20 @@
 // out of the 512-record ring is the mistake r283 fixed; this round repeats the verdicts instead of
 // printing them once.
 //
+// WHY THE DECODINGS LIVE IN GpuCore.h
+//
+// Round317 moved every bit-field, bound and count out of these printf argument lists and into
+// GpuCore.h, where scripts/test-clover-gpu.py compiles and runs them on a Mac against words this
+// repository already has on disk. The reason is a measurement, not a taste for structure: boot 81's
+// thirteen-word LDO census was compared against the vendor's `sdm660_ldo_config[]` by eye, and what we
+// recorded was "not one bit matches". By function it is eight comparable words, one of which agrees --
+// LDO_LD_DATA_REG expects 0x00000000 and reads 0x00000000 -- and seven that differ, all seven of them
+// non-zero expectations reading zero. The conclusion (nobody has ever run that init list on this board)
+// is unchanged and now rests on the count rather than on a claim about every word, two of which are not
+// zero. This file still owns the MMIO, the gates that decide whether a window gets touched, and every
+// printed field; what it asks GpuCore.h is what a read means. The r317 row is the first line this driver
+// prints that is one function's verdict rather than thirteen fields a reader has to compare himself.
+//
 // Opt-in through `clover-gpu=1`; absent, this touches no register and creates no timer.
 
 #include <IOKit/IOService.h>
@@ -66,6 +80,7 @@
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 #include <kern/clock.h>
+#include "GpuCore.h"
 #include "GpuRegs.h"
 
 #define CLOVER_GPU_FIRST_MS    240000u
@@ -110,8 +125,8 @@ clover_gpu_read(volatile uint32_t *window, uint32_t offset)
     return value;
 }
 
-// The write side, introduced by this round. All stores go through these four helpers, so the
-// windows are never indexed directly from a row the way a bare subscript on the window pointer
+// The write side, introduced by this round. Every store goes through these two helpers or through a
+// word GpuCore.h computed, so the windows are never indexed directly from a row the way a bare subscript on the window pointer
 // would be -- the same discipline the read side already keeps. The barrier orders the store
 // before the read-back that proves it.
 static void
@@ -127,28 +142,21 @@ clover_gpu_set_bits(volatile uint32_t *window, uint32_t offset, uint32_t bits)
     clover_gpu_write(window, offset, clover_gpu_read(window, offset) | bits);
 }
 
-static void
-clover_gpu_clear_bits(volatile uint32_t *window, uint32_t offset, uint32_t bits)
-{
-    clover_gpu_write(window, offset, clover_gpu_read(window, offset) & ~bits);
-}
-
-static void
-clover_gpu_update_bits(volatile uint32_t *window, uint32_t offset, uint32_t mask, uint32_t value)
-{
-    clover_gpu_write(window, offset, (clover_gpu_read(window, offset) & ~mask) | (value & mask));
-}
+// Round317 removed the other two read-modify-write helpers, clear_bits and update_bits. Their masks and
+// their results were the only thing that mattered about them, and both now live in GpuCore.h as
+// gpu_gdsc_init_word() and gpu_gdsc_release_word() -- the change that let the host model compare the word
+// that sequence produces against the words boot 81 read back.
 
 // gdsc_toggle_logic's poll, with the timer replaced by a bounded spin (see CLOVER_GPU_GDSC_SPIN).
 static bool
 clover_gpu_poll_pwr_on(volatile uint32_t *window, uint32_t status_offset)
 {
     for (uint32_t i = 0; i < CLOVER_GPU_GDSC_SPIN; i++) {
-        if ((clover_gpu_read(window, status_offset) & kGdscPwrOn) != 0) {
+        if (gpu_gdsc_pwr_on(clover_gpu_read(window, status_offset))) {
             return true;
         }
     }
-    return (clover_gpu_read(window, status_offset) & kGdscPwrOn) != 0;
+    return gpu_gdsc_pwr_on(clover_gpu_read(window, status_offset));
 }
 
 // gdsc_init() then gdsc_toggle_logic(true), for one GDSC. The hw controller updates its status bit
@@ -159,11 +167,16 @@ clover_gpu_gdsc_on(volatile uint32_t *gpucc, uint32_t gdscr_offset, uint32_t sta
                    bool has_hw_ctrl)
 {
     (void) has_hw_ctrl;
-    // gdsc_init: clear HW_CONTROL | SW_OVERRIDE, set the three wait fields.
-    clover_gpu_update_bits(gpucc, gdscr_offset,
-        kGdscHwControl | kGdscSwOverride | kGdscWaitMask, kGdscWaitVal);
+    // gdsc_init: clear HW_CONTROL | SW_OVERRIDE, set the three wait fields. Round317 computes that word
+    // in GpuCore.h, where scripts/test-clover-gpu.py can check the mask arithmetic against the words the
+    // board read back -- boot 81's cx and gx both report exactly those three wait fields. The two
+    // explicit reads cost one extra MMIO access each and run once per boot; the words written are the
+    // same two words these writes have always produced.
+    uint32_t before = clover_gpu_read(gpucc, gdscr_offset);
+    clover_gpu_write(gpucc, gdscr_offset, gpu_gdsc_init_word(before));
     // gdsc_toggle_logic(true): clear SW_COLLAPSE.
-    clover_gpu_clear_bits(gpucc, gdscr_offset, kGdscSwCollapse);
+    before = clover_gpu_read(gpucc, gdscr_offset);
+    clover_gpu_write(gpucc, gdscr_offset, gpu_gdsc_release_word(before));
     return clover_gpu_poll_pwr_on(gpucc, status_offset);
 }
 
@@ -247,41 +260,30 @@ static void
 clover_gpu_report_mem_acc(unsigned t)
 {
     volatile uint32_t *window = clover_gpu_open_mem_acc();
-    uint32_t raw;
-    uint32_t field;
-    uint32_t corner = 0;
-    unsigned answered = 0;
+    GpuMemAcc sel;
 
     if (window == NULL) {
         printf("clover r311: gpu t=%u fire=%u mem_acc map=0 phys=%llx size=%x\n", t,
             (unsigned) clover_gpu_fires, (unsigned long long) kMemAccPhys, kMemAccSize);
         return;
     }
-    raw = clover_gpu_read(window, 0);
-    if (raw != kMemAccNoAnswer) {
-        answered = 1;
-        field = (raw & kMemAccFieldMask) >> kMemAccBitPos;
-        if (field == kMemAccCorner1Field) {
-            corner = kMemAccMinCorner;
-        } else if (field == kMemAccCorner2Field) {
-            corner = kMemAccMaxCorner;
-        }
-    } else {
-        field = 0;
-    }
+    // Round317: the no-answer test and the corner lookup are GpuCore.h's, in that order. The order is the
+    // reading -- the field is one bit wide, so 0xffffffff masks to 1, which is also corner 1's own map
+    // value, and a decode that masked first would have printed corner=1 for a page that never replied.
+    gpu_mem_acc_decode(clover_gpu_read(window, 0), &sel);
 
     if (clover_gpu_gpucc != NULL) {
         uint32_t cxhw = clover_gpu_read(clover_gpu_gpucc, kGpuccCxHwCtrl);
         uint32_t gx   = clover_gpu_read(clover_gpu_gpucc, kGpuccGdscGx);
 
         printf("clover r311: gpu t=%u fire=%u mem_acc map=1 answered=%u raw=%08x l1=%u corner=%u "
-            "gpucc=1 cx_on=%u gx_on=%u\n", t, (unsigned) clover_gpu_fires, answered,
-            (unsigned) raw, (unsigned) field, (unsigned) corner,
-            (unsigned) ((cxhw & kGdscPwrOn) != 0), (unsigned) ((gx & kGdscPwrOn) != 0));
+            "gpucc=1 cx_on=%u gx_on=%u\n", t, (unsigned) clover_gpu_fires, (unsigned) sel.answered,
+            (unsigned) sel.raw, (unsigned) sel.field, (unsigned) sel.corner,
+            (unsigned) gpu_gdsc_pwr_on(cxhw), (unsigned) gpu_gdsc_pwr_on(gx));
     } else {
         printf("clover r311: gpu t=%u fire=%u mem_acc map=1 answered=%u raw=%08x l1=%u corner=%u "
-            "gpucc=0\n", t, (unsigned) clover_gpu_fires, answered, (unsigned) raw,
-            (unsigned) field, (unsigned) corner);
+            "gpucc=0\n", t, (unsigned) clover_gpu_fires, (unsigned) sel.answered, (unsigned) sel.raw,
+            (unsigned) sel.field, (unsigned) sel.corner);
     }
 }
 
@@ -298,8 +300,9 @@ clover_gpu_report_gcc(unsigned t)
 
     printf("clover r286: gpu t=%u fire=%u gcc gpu_ahb=%u gpu_bimc=%u bimc=%u ctl_sdhc1_ahb=%u "
         "ctl_sdhc1_apps=%u raw ahb=%08x ctl=%08x\n", t, (unsigned) clover_gpu_fires,
-        (unsigned) (ahb & 1u), (unsigned) (gpu_bimc & 1u), (unsigned) (bimc & 1u),
-        (unsigned) (ctl_ahb & 1u), (unsigned) (ctl_apps & 1u),
+        (unsigned) gpu_branch_requested(ahb), (unsigned) gpu_branch_requested(gpu_bimc),
+        (unsigned) gpu_branch_requested(bimc), (unsigned) gpu_branch_requested(ctl_ahb),
+        (unsigned) gpu_branch_requested(ctl_apps),
         (unsigned) ahb, (unsigned) ctl_ahb);
 }
 
@@ -321,19 +324,19 @@ clover_gpu_report_gpucc(unsigned t, bool post)
     if (post) {
         printf("clover r286: gpu t=%u gpucc post cx=%08x cxhw=%08x cx_on=%u cx_collapse=%u "
             "gx=%08x gx_on=%u gx_collapse=%u gfx3d_en=%u cxo_en=%u rcg=%08x dom=%08x sw=%08x\n",
-            t, (unsigned) cx, (unsigned) cxhw, (unsigned) ((cxhw & kGdscPwrOn) != 0),
-            (unsigned) ((cx & kGdscSwCollapse) != 0), (unsigned) gx,
-            (unsigned) ((gx & kGdscPwrOn) != 0), (unsigned) ((gx & kGdscSwCollapse) != 0),
-            (unsigned) (gfx & 1u), (unsigned) (cxo & 1u), (unsigned) rcg, (unsigned) dom,
-            (unsigned) sw);
+            t, (unsigned) cx, (unsigned) cxhw, (unsigned) gpu_gdsc_pwr_on(cxhw),
+            (unsigned) gpu_gdsc_collapsed(cx), (unsigned) gx,
+            (unsigned) gpu_gdsc_pwr_on(gx), (unsigned) gpu_gdsc_collapsed(gx),
+            (unsigned) gpu_branch_requested(gfx), (unsigned) gpu_branch_requested(cxo),
+            (unsigned) rcg, (unsigned) dom, (unsigned) sw);
     } else {
         printf("clover r286: gpu t=%u gpucc pre cx=%08x cxhw=%08x cx_on=%u cx_collapse=%u "
             "gx=%08x gx_on=%u gx_collapse=%u gfx3d_en=%u cxo_en=%u rcg=%08x dom=%08x sw=%08x\n",
-            t, (unsigned) cx, (unsigned) cxhw, (unsigned) ((cxhw & kGdscPwrOn) != 0),
-            (unsigned) ((cx & kGdscSwCollapse) != 0), (unsigned) gx,
-            (unsigned) ((gx & kGdscPwrOn) != 0), (unsigned) ((gx & kGdscSwCollapse) != 0),
-            (unsigned) (gfx & 1u), (unsigned) (cxo & 1u), (unsigned) rcg, (unsigned) dom,
-            (unsigned) sw);
+            t, (unsigned) cx, (unsigned) cxhw, (unsigned) gpu_gdsc_pwr_on(cxhw),
+            (unsigned) gpu_gdsc_collapsed(cx), (unsigned) gx,
+            (unsigned) gpu_gdsc_pwr_on(gx), (unsigned) gpu_gdsc_collapsed(gx),
+            (unsigned) gpu_branch_requested(gfx), (unsigned) gpu_branch_requested(cxo),
+            (unsigned) rcg, (unsigned) dom, (unsigned) sw);
     }
 }
 
@@ -356,10 +359,10 @@ clover_gpu_report_branches(unsigned t, const char *stage)
 
     printf("clover r290: gpu t=%u branches %s gfx3d=%u/%u cxo=%u/%u rbcpr=%u/%u rbbm=%u/%u "
         "en/halt rcg3d=%08x rcg_rbcpr=%08x rcg_rbbm=%08x\n", t, stage,
-        (unsigned) (gfx & 1u), (unsigned) ((gfx & kBranchClkOff) != 0),
-        (unsigned) (cxo & 1u), (unsigned) ((cxo & kBranchClkOff) != 0),
-        (unsigned) (rbcpr & 1u), (unsigned) ((rbcpr & kBranchClkOff) != 0),
-        (unsigned) (rbbm & 1u), (unsigned) ((rbbm & kBranchClkOff) != 0),
+        (unsigned) gpu_branch_requested(gfx), (unsigned) gpu_branch_halted(gfx),
+        (unsigned) gpu_branch_requested(cxo), (unsigned) gpu_branch_halted(cxo),
+        (unsigned) gpu_branch_requested(rbcpr), (unsigned) gpu_branch_halted(rbcpr),
+        (unsigned) gpu_branch_requested(rbbm), (unsigned) gpu_branch_halted(rbbm),
         (unsigned) rcg3d, (unsigned) rcgr, (unsigned) rcgb);
 }
 
@@ -378,18 +381,29 @@ clover_gpu_report_ldo(unsigned t, const char *stage)
     uint32_t vref   = clover_gpu_read(clover_gpu_gpucc, kGpuccLdoVref);
     uint32_t ctrl   = clover_gpu_read(clover_gpu_gpucc, kGpuccLdoCtrl);
     uint32_t sts    = clover_gpu_read(clover_gpu_gpucc, kGpuccLdoStatus);
-    uint32_t val    = vref & kLdoVrefMask;
-    uint32_t uv     = val * kLdoStepUv + kLdoMinUv;
+    GpuLdoVref corner;
+    GpuLdoCtrl bits;
     uint32_t cxhw   = clover_gpu_read(clover_gpu_gpucc, kGpuccCxHwCtrl);
     uint32_t gx     = clover_gpu_read(clover_gpu_gpucc, kGpuccGdscGx);
 
+    // Round317: the decoders moved, and with them one behaviour worth stating because it changes what a
+    // dead page would have printed. GpuRegs.h's mask is seven bits, so the old inline arithmetic turned a
+    // window that answered 0xffffffff into val 127 / uv 1010000 -- a voltage above the vendor's own
+    // MAX_LDO_VOLTAGE and above this unit's declared maximum, which is the number scripts/test-clover-gpu.py
+    // now demonstrates -- and turned the same word into bypass=1, pdn=1, cpr_bypass=1, ready=1, settled=1,
+    // which is a rail reported as powered down when in fact it never replied. Every field below is 0 for a
+    // word that did not answer, and the raw word still rides along as vref= and ctrl= and sts= so the
+    // distinction stays checkable. No boot this port has run showed a dead LDO page, so no reading on disk
+    // changes meaning; the row changed for the boot that might.
+    gpu_ldo_decode_vref(vref, &corner);
+    gpu_ldo_decode_ctrl(ctrl, &bits);
+
     printf("clover r291: gpu t=%u ldo %s vref=%08x val=%u uv=%u ctrl=%08x byp=%u pdn=%u "
         "cpr_byp=%u sts=%08x ready=%u settled=%u cx_on=%u gx_on=%u\n", t, stage,
-        (unsigned) vref, (unsigned) val, (unsigned) uv, (unsigned) ctrl,
-        (unsigned) ((ctrl & kLdoBypass) != 0), (unsigned) ((ctrl & kLdoPdn) != 0),
-        (unsigned) ((ctrl & kLdoCprBypass) != 0), (unsigned) sts,
-        (unsigned) ((sts & kLdoReady) != 0), (unsigned) ((sts & kLdoSettled) != 0),
-        (unsigned) ((cxhw & kGdscPwrOn) != 0), (unsigned) ((gx & kGdscPwrOn) != 0));
+        (unsigned) vref, (unsigned) corner.val, (unsigned) corner.uv, (unsigned) ctrl,
+        (unsigned) bits.bypass, (unsigned) bits.pdn, (unsigned) bits.cpr_bypass, (unsigned) sts,
+        (unsigned) gpu_ldo_status_ready(sts), (unsigned) gpu_ldo_status_settled(sts),
+        (unsigned) gpu_gdsc_pwr_on(cxhw), (unsigned) gpu_gdsc_pwr_on(gx));
 }
 
 // Round294 widens that reading to the whole LDO block the vendor driver names, because boot 78 answered
@@ -401,28 +415,65 @@ clover_gpu_report_ldo(unsigned t, const char *stage)
 static void
 clover_gpu_report_ldo_words(unsigned t, const char *stage)
 {
+    // The same thirteen words round294 prints, now collected once so the census and the row cannot be
+    // two different readings. The offsets are the GPUCC-relative constants GpuRegs.h quotes to the
+    // vendor's #defines, and map_ok below is what makes that quoting checkable on the board rather than
+    // only in a comment: if a constant ever drifts away from the offset its name says, the row says so.
+    static const uint32_t kGpuccOffsets[kGpuLdoWordCount] = {
+        kGpuccLdoAtest, kGpuccLdoCfg0, kGpuccLdoCfg1, kGpuccLdoCfg2, kGpuccLdoLdData,
+        kGpuccLdoVrefTest, kGpuccLdoVref, kGpuccLdoCtrl,
+        0x9020U,   // no #define names 0x20; register_str[8] does (GpuRegs.h:118-120), so GpuCore.h can
+        kGpuccLdoStatus1, kGpuccLdoStatus, kGpuccLdoRefX1, kGpuccLdoRefX2
+    };
+    uint32_t words[kGpuLdoWordCount];
+    uint32_t block_offsets[kGpuLdoWordCount];
+    bool map_ok = true;
+    GpuLdoCensus census;
     uint32_t cxhw = clover_gpu_read(clover_gpu_gpucc, kGpuccCxHwCtrl);
     uint32_t gx   = clover_gpu_read(clover_gpu_gpucc, kGpuccGdscGx);
+    GpuLdoCtrl ctrl;
+
+    for (uint32_t i = 0; i < kGpuLdoWordCount; i++) {
+        words[i] = clover_gpu_read(clover_gpu_gpucc, kGpuccOffsets[i]);
+        block_offsets[i] = kGpuccOffsets[i] - kGpuLdoBlockBase;
+        if (kGpuccOffsets[i] != gpu_ldo_word_gpucc_offset(i)) {
+            map_ok = false;
+        }
+    }
 
     printf("clover r294: gpu t=%u ldo words %s w00=%08x w04=%08x w08=%08x w0c=%08x w10=%08x "
         "w14=%08x w18=%08x w1c=%08x w20=%08x w24=%08x w28=%08x w2c=%08x w30=%08x cx_on=%u gx_on=%u\n",
-        t, stage,
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoAtest),
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoCfg0),
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoCfg1),
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoCfg2),
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoLdData),
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoVrefTest),
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoVref),
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoCtrl),
-        // 0x20: no #define in msm_gfx_ldo.c, but register_str[8] (:249) calls it LDO_STATUS0. Only the
-        // word is printed; the round291 reading of 0x24 is the same kind of unnamed-bits case.
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, 0x9020U),
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoStatus1),
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoStatus),
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoRefX1),
-        (unsigned) clover_gpu_read(clover_gpu_gpucc, kGpuccLdoRefX2),
-        (unsigned) ((cxhw & kGdscPwrOn) != 0), (unsigned) ((gx & kGdscPwrOn) != 0));
+        t, stage, (unsigned) words[0], (unsigned) words[1], (unsigned) words[2], (unsigned) words[3],
+        (unsigned) words[4], (unsigned) words[5], (unsigned) words[6], (unsigned) words[7],
+        (unsigned) words[8], (unsigned) words[9], (unsigned) words[10], (unsigned) words[11],
+        (unsigned) words[12], (unsigned) gpu_gdsc_pwr_on(cxhw), (unsigned) gpu_gdsc_pwr_on(gx));
+
+    // Round317's row: the census as one verdict, on the same reads and in the same fire as the thirteen
+    // words above. `control=` is the cx_on that licenses the shape -- round294's log says the positive
+    // control mattered and this is the first round where the row itself carries the reason. `agree=` is
+    // the field that corrects the record: on boot 81 it is 1, not 0, and it counts the one word the
+    // vendor's list expects to be zero. `map_ok=` is the guard against this row describing a block whose
+    // constants moved. `vsettle=` is the one new thing the row asks of PWRSWITCH_STATUS, and it is not the
+    // same question as round291's `ready=`/`settled=`: msm_gfx_ldo.c:307 waits while
+    // `(status & (LDO_VREF_SETTLED_BIT | LDO_READY_BIT)) == 0`, so the vendor's own settling test is an OR,
+    // and a word that sets READY alone passes it while the pr_err() printed after that loop names
+    // LDO_VREF_SETTLED. Printing the predicate beside the two bits is what keeps a row from answering "the
+    // vendor would call this settled" with a word that only says one of two inputs is high -- and on this
+    // board the field has never yet been exercised: boot 78's 0x28 read 0 and boot 81's is 0 too, the two
+    // non-zero words this unit has are PWRSWITCH_CTRL at 0x1c and the undefined LDO_STATUS1 at 0x24, which
+    // is a word nobody in that file names bits for.
+    gpu_ldo_census(block_offsets, words, kGpuLdoWordCount, &census);
+    gpu_ldo_decode_ctrl(words[7], &ctrl);
+    printf("clover r317: gpu t=%u ldo verdict %s shape=%s named=%u/%u comparable=%u agree=%u "
+        "differ=%u nz_zero=%u/%u no_expect=%u outside=%u dead=%u ctrl_pdn=%u ctrl_unnamed=%08x "
+        "vsettle=%u map_ok=%u control=%u\n", t, stage,
+        gpu_ldo_shape_name(gpu_ldo_shape(census, gpu_gdsc_pwr_on(cxhw))),
+        (unsigned) census.named, (unsigned) census.words, (unsigned) census.comparable,
+        (unsigned) census.agree, (unsigned) census.differ, (unsigned) census.nonzero_read_zero,
+        (unsigned) census.nonzero_expected, (unsigned) census.no_expectation,
+        (unsigned) census.table_outside, (unsigned) census.dead, (unsigned) ctrl.pdn,
+        (unsigned) ctrl.unnamed, (unsigned) gpu_ldo_vendor_settled(words[10]),
+        (unsigned) map_ok, (unsigned) gpu_gdsc_pwr_on(cxhw));
 }
 
 // The gated chipid read. a512 reports 0x05010200 once the core is powered and the AHB path is
@@ -434,13 +485,17 @@ clover_gpu_report_chipid(unsigned t)
     uint32_t cxhw = clover_gpu_read(clover_gpu_gpucc, kGpuccCxHwCtrl);
     uint32_t gx   = clover_gpu_read(clover_gpu_gpucc, kGpuccGdscGx);
     uint32_t gfx  = clover_gpu_read(clover_gpu_gpucc, kGpuccGfx3dEn);
-    bool cx_on  = (cxhw & kGdscPwrOn) != 0;
-    bool gx_on  = (gx & kGdscPwrOn) != 0;
-    bool gfx_on = (gfx & 1u) != 0;
+    bool cx_on  = gpu_gdsc_pwr_on(cxhw);
+    bool gx_on  = gpu_gdsc_pwr_on(gx);
+    bool gfx_on = gpu_branch_requested(gfx);
 
     if (!(cx_on && gx_on && gfx_on)) {
-        printf("clover r286: gpu t=%u chipid skipped cx_on=%u gx_on=%u gfx3d_en=%u\n",
-            t, (unsigned) cx_on, (unsigned) gx_on, (unsigned) gfx_on);
+        // Round317 names the gate instead of leaving the reader to pick which of the three bits closed
+        // it: the order is GpuCore.h's (CX first, because everything later rides on the AHB vote and the
+        // CX poll), so a row with all three shut says no-cx rather than making someone infer it.
+        printf("clover r286: gpu t=%u chipid skipped cx_on=%u gx_on=%u gfx3d_en=%u gate=%s\n",
+            t, (unsigned) cx_on, (unsigned) gx_on, (unsigned) gfx_on,
+            gpu_chipid_gate_name(gpu_chipid_gate(cx_on, gx_on, gfx_on)));
         return;
     }
     if (clover_gpu_open_core() == NULL) {
@@ -472,14 +527,17 @@ clover_gpu_power_on(unsigned t)
     gpu_bimc = clover_gpu_read(clover_gpu_gcc, kGccGpuBimcGfx);
     bimc     = clover_gpu_read(clover_gpu_gcc, kGccBimcGfx);
     printf("clover r286: gpu t=%u gcc post gpu_ahb=%u gpu_bimc=%u bimc=%u raw ahb=%08x "
-        "bimc_gfx=%08x bimc=%08x\n", t, (unsigned) (ahb & 1u), (unsigned) (gpu_bimc & 1u),
-        (unsigned) (bimc & 1u), (unsigned) ahb, (unsigned) gpu_bimc, (unsigned) bimc);
+        "bimc_gfx=%08x bimc=%08x\n", t, (unsigned) gpu_branch_requested(ahb),
+        (unsigned) gpu_branch_requested(gpu_bimc), (unsigned) gpu_branch_requested(bimc),
+        (unsigned) ahb, (unsigned) gpu_bimc, (unsigned) bimc);
 
     // 0xffffffff is not a vote of one: it is a bus that did not answer, and GPUCC is not touched
-    // behind it -- the r282 gate, now applied after the write instead of before it.
-    if ((ahb & 1u) == 0 || ahb == 0xffffffffu) {
+    // behind it -- the r282 gate, now applied after the write instead of before it. Round317 states it as
+    // gpu_ahb_gate_open(), and scripts/test-clover-gpu.py shows why the word test is half of it: bit31 is
+    // set in 0xffffffff, so any poll that reads only bits would have called a dead page powered on.
+    if (!gpu_ahb_gate_open(ahb)) {
         printf("clover r286: gpu t=%u gpucc skipped ahb=%u raw=%08x (GPUCC access needs the "
-            "gcc_gpu_cfg_ahb vote)\n", t, (unsigned) (ahb & 1u), (unsigned) ahb);
+            "gcc_gpu_cfg_ahb vote)\n", t, (unsigned) gpu_branch_requested(ahb), (unsigned) ahb);
         return;
     }
 
@@ -514,7 +572,7 @@ clover_gpu_power_on(unsigned t)
         gfx = clover_gpu_read(clover_gpu_gpucc, kGpuccGfx3dEn);
 
         printf("clover r286: gpu t=%u gdsc cx_on=%u gx_on=%u gfx3d_en=%u cx=%08x cxhw=%08x "
-            "gx=%08x\n", t, (unsigned) cx_on, (unsigned) gx_on, (unsigned) (gfx & 1u),
+            "gx=%08x\n", t, (unsigned) cx_on, (unsigned) gx_on, (unsigned) gpu_branch_requested(gfx),
             (unsigned) cx, (unsigned) cxhw, (unsigned) gx);
     }
 
