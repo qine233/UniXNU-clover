@@ -25772,3 +25772,57 @@ thermal 为空；随后 misc、logdump（两个路径）、logfs、mmcblk0p56、
 `CloverSdhci` 自己的纯层（README 进度表里它的下一步）；`docs/drivers/uefi-drivers.md:7-13` 的固件层对照
 （未结 4）；第一颗真走 personality 的驱动（未结 1，排在桌面之后）。板子回来后的第一步不是再改代码，
 是冷刷 `02b845b4…`（263 标题）并把同一套无人值守读回重跑一遍。
+
+**⑫ 上游闸门的账（v0.7.30 推上去之后才补，`55289ce`，不带 tag）**。main 那一跑红、tag 那一跑绿，
+和 round316、round317 每次一样，原因也一样：`porting-record.py` 把每一个变更路径去撞「哪几个区的
+`paths` 点名了它」，撞上的每个区都必须有改过的 findings 或 evidence。本轮缺三处：`drivers/CloverSdhci/
+CloverSdhci.cpp` 属 storage，而 storage 一条 r318 的话都没说（它确实是 storage 的改动——一个 tee 类
+加一条豁免——理由也正是本轮的理由：一次分段的原字与解码两行是一枚读数，被每趟上限拆开就把 r181 遮罩
+列那个盲区放回去了）；九份厂商源与 `scripts/test-clover-input.py` **谁都不认**——没有任何区的 `paths`
+提过 `notes/`，这也是 round312 的 `icnss.c`、round313 的两份 `spmi-pmic-arb.c` 各自 main 跑红的同一格。
+认领用逐枚点名而不是 `notes/sources/sdm660/**` 这种目录 glob：目录 glob 会把将来 GPU/PMIC 掉进来的源
+也算到 input 头上，要求一条不属于本轮的话。计量：`porting-record.py check --device . --base v0.7.29`
+EXIT=0（`clover: 13 structured areas checked`）。⑪ 之前那次「提交前跑闸门」是空跑——HEAD 还等于
+v0.7.29，`git diff base HEAD` 是空的，闸门读到的变更清单是零；AGENTS.md 已经写了要在 `git tag` 之前、
+提交之后跑。
+
+**⑬ boot 104 读回（2026-11-04 21:40 前后，用户手动进 TWRP——panic 后自动落 recovery 那一棒没成立）**。
+取数 = TWRP 下 `dd if=/dev/block/bootdevice/by-name/logdump bs=512 count=1217`。产物在盘：
+`/Users/zhouzhou/clover-out/boot104-logdump.bin` 623,104 B `87001412521657ec…`，解码文本
+`boot104-tee.txt` `13b0ef0f6b9063c3…`（512 条，全属 boot 104，钟 557.99–785.52 s）、
+`boot104-verdict.txt` `eacc3af148a52ec9…`（64 条，全属 boot 104）、`boot104-flight.txt`
+`03f732e31418ac47…`、`boot104-report.txt` `38136248b4f82499…`。
+
+| 读数 | 值 | 判读 |
+| --- | --- | --- |
+| `clover r311: gpu … mem_acc` | `map=1 answered=1 raw=00000000 l1=0 corner=2 gpucc=1 cx_on=1 gx_on=0`，t=621 `fire=5` 与 t=744 `fire=6` 两拍同形 | §Round311 ⑦/§Round317 ⑩ 预登记的三形状里取第一支：**寄存器应读，读回零**。MEM_ACC 这一格现在的地形是「活着、为零、corner=2」，不是「没应答」也不是「映射失败」 |
+| `clover r317: gpu ldo verdict` | `shape=list-never-written named=13/13 comparable=8 agree=1 differ=7 nz_zero=7/7 no_expect=5 outside=1 dead=0 ctrl_pdn=1 vsettle=0 map_ok=1 control=1`，两拍一致 | 纯层在生产：判形由卡上的字给，不是宿主算的。`shape` 仍是 `list-never-written`（无正对照 ⇒ 未升到 `list-unwritten-blind` 之外） |
+| `clover r260: bus` | `status=10000c8 state=1d clk=315 ack=0 xfers=4 timeout=0 nack=4 verdict=102`，两拍逐字同 | 触摸仍是「已知不应答」，与 boot 48/103 同形；钥匙不在 I2C 层 |
+| `clover r255: beat` | `published=1 seen=1 reports=2 sinks=1,1 presses=0 asks=0 touch=1 transfer=0` | 自有 HID 设备在线、报告计数在走，但 `asks=0`：没有客户端来取 |
+| `clover r180: retire#4 / client` | `done=4 presented=4 frames=4` 与 `client pid=58 selector 6 4 80000001 0 -> 0` | 帧仍在交（渲染侧没停），backboardd 那一次 selector 的返回是 0 |
+| `clover r299: smp` / `r308: beat` | `run=7/8`、`reg=8 start=7 run=8` | 八核照常 |
+
+**panic 落盘这一格：boot 104 一笔都没写。** marker 槽 0/1 分别是 boot 102、boot 87 的旧记录（解码器逐条
+标 `STALE: boot 104 never entered the sink`），句子记录缺席、drain-in 缺席、panic 屏记录最新是 boot 54、
+死线记录最新是 boot 99 的 `t=1802875 ms`。卡上最后一笔是 785.5 s 一次正常节拍 flush
+（`CloverSdhci r307: probe why=tail … wrote=3 seen=21 pend=0 refused=0`）。用户报的「panic 后不自动进
+TWRP」在这一格是自洽的：写 boot-recovery BCB 的正是 panic 路径自己，这一靴连 sink 的第一笔都没落地。
+**但 misc 现在读出来全零不能当证据**——进一次 recovery 本身就会吃掉并清零 BCB（仪器地平线之外的那一格）；
+能作证的是上面五条缺席，而不是那 1024 个零字节。
+
+**改正 ⑪ 的一句**：boot 104 跑的不是那枚已退役的 `be5e381f…`。判据在盘上、不靠肉眼——`grep -a` 逐枚数
+镜像里的字符串：`clover r318: xfer` 在 `round318-v0.7.30-payload-260checks.img` 与终版各命中 1 次、
+在 round317 那枚命中 0 次；tee 类 `r318-input` 分别 2、2、0 次。卡上 r317 行在场而 r318 行零命中
+⇒ 那一靴的镜像属 round317 那一支。所以 ⑪ 里「21:19 冷刷 `be5e381f…`」只证到**写进去了**，没证到**跑起来过**
+（它同时给出的「约一分钟 TWRP 的 adb 就上来了」更像固件那一头没接住这颗负载，而不是死线形状）。
+
+**现在的状态与 boot 105 的正对照**：cache 分区已冷刷终版 `round318-v0.7.30-payload.img`
+`02b845b4128d2684…`（58,720,256 B，21:5x，只写 cache＝mmcblk0p49），板子已在跑。读回仍需人工进一次
+TWRP——自动那一棒在 boot 104 不成立，别把「等不到 adb」读成「没 panic」。
+
+| boot 105 的形状 | 判读 |
+| --- | --- |
+| `clover r318: xfer/core` 两行在场 | r318 的第一帧真读数，按 ⑩ 那张表逐支读；`sda=1 scl=1` 且 `class=nack` ⇒ 线是自由的，先查电 |
+| `clover r317:` 行在场而 `clover r318:` 零命中 | 只有两种：cache 里不是这枚文件（刷写没换），或 tee 把 r318 类吃了。前者看标题、后者看 `r318-input` 类是否在这枚内核里（盘上已证在），**不许**读成「I2C 分段没跑」——r260 的 beat 行在场就证明分段跑了 |
+| 一次分段只有一行 | 两半被拆开，另半不许当「干净传输」的证据 |
+| r318 两行全零 + `nack=4` | `raw=00000000` 的原字要当场和 `status=10000c8` 对齐；对不齐先查层里的裁位，不查总线 |

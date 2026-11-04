@@ -37,10 +37,10 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 | **NativeMobileDisplay** | legacy display / GOP 出帧（屏幕那一步） | archives `:67`；`offline-legacy-*` `:2280-2287` | ✓ / ✗（已说明）/ ✓ / — / ✗（基仓也没有） | 原生 `IOMobileFramebufferLegacy` 已链接并构造到 phase 1；r206 第一次 present 成功 | 桌面欠的「画面本身」在这一格，仍 CPU-first | 帧内容不由这颗驱动产生，属主线 |
 | **NativeHidInput** | 自有 `IOHIDDevice` 进门并发一帧报告 | archives `:67`（`build-clover-gop-legacy-display.py` 调 `build-clover-hid-input.py`）；`offline-hid-input=1` `:2325`、`offline-hid-home=1` `:2326`、`sheng-touch-hid=1` `:2337` | **✓（唯一整块持有条文类形状：标准宏 + 从原始 kernelcache 派生真实 ABI）** / ✗（匹配记录是 Apple 自己的 personality）/ ✓ / — / ✗（正确形状） | AppleM68Buttons 早崩已定因并回退（boot 41/42）；r259 起自有设备真发一帧数字化仪报告 | 与 CloverInput 同一格：等面板出数 | 触摸无应答（见下面两颗） |
 | **NativeKeyStoreEvents** | keystore 事件（「无 keybag、开机即解锁」这一问的答案） | archives `:67` 内；`clover-aks=1` `:2379`、`offline-key-events=1` `:2372` | ✓ / ✗（已说明）/ ✓ / — / ✗（基仓也没有） | boot 82：`opens=22→27 calls=80→99 refused=0`；boot 85：`stage=3 opens=100 calls=442` | 已发布并测到，本颗无缺口 | 无 |
-| **CloverInput** | 触摸 / QUP v2 I2C-3 电气与应答普查 | archives `:71`；`clover-input=3` `:2422` | ✗ / ✗（已说明）/ ✓ / **✓**（`InputCore.h` + `test-clover-input.py` PASS，263 检查）/ ✗（已说明） | 电气通，两个候选地址全 NACK（`verdict=102`）；r318 起每次分段另印原字 `status=`/`err=` 与 `class=`，SDA/SCL 第一次成为字段——**尚无带 r318 行的真机帧** | 冷刷 v0.7.30 后按 dev-log §Round318 ⑩ 读两行；再上电 `pm660l_l3` / `pm660_l11` 问地址 | 板子不在 adb/fastboot：boot 103 尝试在冷刷后约 1 分钟落回 TWRP，五次块读全失败、无读数 |
-| **CloverPower** | SPMI 仲裁器 + PMIC 轨读数 | archives `:72`；`clover-power=1` `:2489` | ✗ / ✗（已说明）/ ✓ / **✓**（`test-clover-power.py` PASS）/ ✗（已说明） | **未上机**：盘上最后一帧仍是 round183 的 `not a v5 arbiter (03000000)`；r313 的「按版本字选地板图 + 四条腿」等 boot 103/104 | 按 [`notes/power-bringup.md`](notes/power-bringup.md) §8 七支定档，再升 mode 2（revid）、mode 3（读 `0x46` 开轨） | 板子不在家 |
+| **CloverInput** | 触摸 / QUP v2 I2C-3 电气与应答普查 | archives `:71`；`clover-input=3` `:2422` | ✗ / ✗（已说明）/ ✓ / **✓**（`InputCore.h` + `test-clover-input.py` PASS，263 检查）/ ✗（已说明） | boot 104（r317 那一支）`status=10000c8 xfers=4 timeout=0 nack=4 verdict=102` 两拍逐字同 ⇒ 仍是「已知不应答」；**带 r318 原字的首帧尚未落地**（cache 已换 `02b845b4…`） | 读 boot 105 的两行，按 dev-log §Round318 ⑩/⑬ 预登记判；再上电 `pm660l_l3` / `pm660_l11` 问地址 | 读回要人工进一次 TWRP：boot 104 panic 后没有自动落 recovery（panic 路径自己没写 BCB） |
+| **CloverPower** | SPMI 仲裁器 + PMIC 轨读数 | archives `:72`；`clover-power=1` `:2489` | ✗ / ✗（已说明）/ ✓ / **✓**（`test-clover-power.py` PASS）/ ✗（已说明） | **未上机**：盘上最后一帧仍是 round183 的 `not a v5 arbiter (03000000)`；boot 104 的 tee 环只覆盖 557 s 之后，而 r313 的报告在开机早期一次印完 ⇒ **这一靴证不到它，不许读成拒读** | 按 [`notes/power-bringup.md`](notes/power-bringup.md) §8 七支定档，再升 mode 2（revid）、mode 3（读 `0x46` 开轨） | 板子不在家 |
 | **CloverDsp** | ADSP / SMEM 共享堆通路 | archives `:73`；`clover-dsp=3` 在 `:2534` 是**注释状态** | ✗ / ✗（已说明）/ ✓ / **✓**（`test-clover-dsp.py`）/ ✗（已说明） | `$TOC` / `$PRT` 自校验通过，判决行没上屏 | 有边就上 GLINK/APR；没镜像先压 `vadsp` 电源 | 这颗会读堆，参数整颗摘掉（留着会毁掉当靴读数） |
-| **CloverGpu** | Adreno 512 的电源/时钟普查（只读） | archives `:74`；`clover-gpu=1` `:2441` | ✗ / ✗（已说明）/ ✓ / **✓**（`GpuCore.h` + `test-clover-gpu.py` PASS）/ ✗（已说明） | boot 81 十三词由 r317 的普查数过：`comparable=8 agree=1 differ=7`，而七枚「厂商要写非零」的词全读零 ⇒ 那份 init 列表在本板一次都没跑过（档案里「一位都不对」那句已被这行取代）；boot 74/76/77 稳定 `cx_on=1 gx_on=0` | boot 104 落回后读 r317 的 `shape=` 行（§Round317 ⑩ 七支）与 r311 的 MEM_ACC 行（`acc-sel-l1 @ 0x01fcf004`，[`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5.13 五支） | 供电那一头在 RPM 手里；桌面 CPU-first，本线只量不写 |
+| **CloverGpu** | Adreno 512 的电源/时钟普查（只读） | archives `:74`；`clover-gpu=1` `:2441` | ✗ / ✗（已说明）/ ✓ / **✓**（`GpuCore.h` + `test-clover-gpu.py` PASS）/ ✗（已说明） | **boot 104 两行都到**：r311 `mem_acc map=1 answered=1 raw=00000000 l1=0 corner=2 gpucc=1`（`0x01fcf004` 第一次应读，读回零）＋ r317 `shape=list-never-written named=13/13 comparable=8 agree=1 differ=7 dead=0 map_ok=1 control=1`（两拍同形，`cx_on=1 gx_on=0` 不变） | 按 [`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5.13 五支读 `answered=1 raw=0` 那一支的下游（corner=2 而 l1=0），并等一次带正对照的写 | 供电那一头在 RPM 手里；桌面 CPU-first，本线只量不写 |
 
 「personality」那一列全 ✗ 是同一件事：本板 ADT 的 `/arm-io` 只有 `intc` 一个孩子，spmi／sdhci／gpu／i2c／dsp
 都没有节点，`IOPlatformDevice` + `IONameMatch` 谁都匹配不到；补齐它的三个前提与顺序在 conformance §5，
@@ -51,13 +51,13 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 
 | # | 缺口 | 现状（一句话） | 下一步 | 出处 |
 | --- | --- | --- | --- | --- |
-| 1 | backboardd 不回 SpringBoard 的信 | 债链已逐跳读通（backboardd → datamigrator → migrationpluginwrapper → 叶子），叶子在自己那枚收口里既不排队列也没发送权 | 读 boot 103/104，再按 §Round310 ⑤ 判 panic sink | dev-log §Round295–310 |
+| 1 | backboardd 不回 SpringBoard 的信 | 债链已逐跳读通（backboardd → datamigrator → migrationpluginwrapper → 叶子），叶子在自己那枚收口里既不排队列也没发送权 | boot 104 已落回（`presented=4`、八核照常、债链形状未变）；panic sink 那一格 boot 104 一笔没写 | dev-log §Round295–310、§Round318 ⑬ |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气通，两个候选地址全 NACK | 依赖 3：先把面板轨上电 | dev-log §Round181、§Round312 |
 | 3 | PMIC 轨读不出来 | r313 起「不在 v5 带内」不再是拒读的理由（地板图改成按版本字选表） | 刷 `round313` / `round314` 镜像定档 | [`notes/power-bringup.md`](notes/power-bringup.md) §8 |
 | 4 | ADSP 没起 | SMEM 读通，判决行没上屏 | 有边上 GLINK/APR；没镜像先压 `vadsp` | dev-log §Round183 |
 | 5 | watchdogd 每次起就崩 | 已定名且非瓶颈：boot 76 带着这枚 brk 活到死线，sheng 零引用 `IOWatchdog` 也进桌面 | 先量 `AppleARMIODevice` 在本板有没有平面；不在当前排期 | dev-log §Round199–200 |
 | 6 | GPU/Metal 一个都没有 | 分支清白、债在电：`gx_collapse=0` 而 `gx_on=0`，那颗 LDO 从复位起没人按厂商表配过 | 只读侦察到 MEM_ACC 那一格；桌面 CPU-first | [`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5.11–5.13 |
-| — | 「读不到为什么结束」（独立的一道坎，不是主线症状） | 十一连静默复位已被两靴改写成「进了 panic sink、文案被卡拒」；GPU 线已由 r294 / r294b 两个控制轮从复位嫌疑里摘出去 | 落地即测的物理量（传感器 + `rawdump` 头部）已做进宿主脚本 | dev-log §Round294、§Round301–310 |
+| — | 「读不到为什么结束」（独立的一道坎，不是主线症状） | 「进了 panic sink、文案被卡拒」到 boot 104 又退一格：**sink 第一笔（marker）都没落地**，misc 因此没人写 ⇒ 不自动进 TWRP（misc 现读全零**不是**证据，进 recovery 会吃掉 BCB）；GPU 线已由 r294 / r294b 两个控制轮从复位嫌疑里摘出去 | 落地即测的物理量（传感器 + `rawdump` 头部）已做进宿主脚本 | dev-log §Round294、§Round301–310 |
 
 ## 已完成（都有真机读数）
 

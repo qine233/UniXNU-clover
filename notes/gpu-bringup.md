@@ -561,3 +561,14 @@ clover r291: gpu t=617 ldo beat vref=00000000 val=0 uv=375000 ctrl=80000038 byp=
    可离线推进的了；下一格是 §5.12⑤ 的 **pm660l_s3_level 电平**，它要的是 RPM SMD 请求的读法，
    而我们的引导链从未发过这种请求——**这一格要先在宿主上钉住「读一个已发的 level」到底读哪儿**
    （`qcom,set = <3>` 的语义与 RPM 侧的镜像），不是先写驱动。GPU 主线仍按 CPU-first：本线只读不写。
+
+7. **这一格开花了（boot 104，2026-11-04 21:40 手动回 TWRP 读回）。** 卡上原文两拍同形：
+   `clover r311: gpu t=621 fire=5 mem_acc map=1 answered=1 raw=00000000 l1=0 corner=2 gpucc=1 cx_on=1 gx_on=0`
+   与 `t=744 fire=6`。三件同时成立：`map=1`（第四扇窗口映射成）、`answered=1`（`0x01fcf004` **应读**，本板已知的
+   非应答全 1 形状在这里没出现）、`raw=00000000`。第 5 条预告的那一支正是这一支：**这一格分不开
+   「角 2 的真值是零」与「整页读零」**，因为 `bit-size=1` 裁出来的 `l1=0` 与整字 `raw=0` 是同一枚数的两种裁法，
+   而本板至今没有一枚有出处的同页字当对照。所以读数到此为止，不许写成「MEM_ACC 在零档」。
+   产物在盘：`/Users/zhouzhou/clover-out/boot104-logdump.bin` `87001412521657ec…`（623,104 B）、
+   解码 `boot104-tee.txt` `13b0ef0f6b9063c3…`；同帧的 r317 判形 `shape=list-never-written comparable=8 agree=1
+   differ=7 dead=0 map_ok=1 control=1` 见 dev-log §Round318 ⑬。下一格仍按第 6 条：先钉「读一个已发的 level 读哪儿」，
+   不是先写驱动。
