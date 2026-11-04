@@ -111,6 +111,72 @@
 #define kPmicArbVersionV5Min  0x50000000U
 #define kPmicArbVersionV6Min  0x60000000U   // the floor SHENG's v7 code sits above; v5 stops here
 
+// THE FLOOR PLAN IS A FUNCTION OF THAT WORD, NOT A CONSTANT.
+//
+// Round182 wrote this header as if v5 were the only shape, because that is the band its own refusal
+// tested for. Both trees this file cites disagree with that and agree with each other: VEND:1210
+// reads the word once and installs one of FOUR ops tables -- v1 below V2_MIN (:1212-1216), v2 for
+// [V2_MIN, V3_MIN) (:1219-1220), v3 for [V3_MIN, V5_MIN) (:1221-1222), v5 at or above V5_MIN
+// (:1223-1224) -- and MAIN:2100-2110 is the same four branches with the same floors. So a version
+// read in the [V3_MIN, V5_MIN) band is not "not v5 and therefore unreadable"; it is v3, whose
+// layout VEND spelled out in `pmic_arb_v3` at :1144-1155, and the only thing wrong with a v3 board
+// under a v5-only floor plan is that four addresses move.
+//
+// What moves, and what does not, with the archived tree as the authority:
+//
+//   APID map word        v2/v3  `core + 0x800 + 4n`  (VEND:1108-1111 apid_map_offset_v2)
+//                        v5     `core + 0x900 + 4n`  (VEND:1113-1116 apid_map_offset_v5)
+//   observer channel     v2/v3  `obsrvr + 0x1000*ee + 0x8000*apid`  (VEND:983 offset_v2, which v3
+//                                                             installs at :1148)
+//                        v5     `obsrvr + 0x10000*ee + 0x80*apid`   (VEND:1005)
+//   ACC_ENABLE, IRQ_*    v2/v3  inside `intr`: +0x1000*n, +0x4+0x1000*n, +0x8+0x1000*n
+//                                                             (VEND:1060-1064, :1078-1082, :1096-1100)
+//                        v5     inside `chnls`: +0x100+0x10000*n, +0x104, +0x108
+//                                                             (VEND:1066-1070, :1084-1088, :1102-1106)
+//   owner ACC_STATUS     v2  `intr + 0x100000 + 0x1000*ee + 4*group`  (VEND:1036-1040)
+//                        v3  `intr + 0x200000 + 0x1000*ee + 4*group`  (VEND:1042-1046)
+//                        v5  `intr + 0x10000*ee + 4*group`            (VEND:1048-1052)
+//
+// What does NOT move, which is why the answers worth having survive a band change: the ownership
+// table is `cnfg + 0x700 + 4n` with a 3-bit field in every band (VEND:50-51, read by v2/v3's lazy
+// walk at :858-861 and by v5's map reader at :920-922); the in-channel command block is CMD 0x00 /
+// STATUS 0x08 / RDATA0 0x18 in every band (VEND:27-33); the map word's PPID field is
+// `(w >> 8) & 0xfff` in every band (:867 for v2/v3, :917 for v5); and the command encoding is
+// identical from v2 up (:1025-1028).
+//
+// One field is NOT the same, and a copy of the v5 decode would silently invent it. v5 keeps IRQ
+// ownership in bit 24 of the map word (:46, tested at :918) because one PPID can have one APID per
+// EE. v2 and v3 have no such bit: VEND:860-861 sets `irq_ee = write_ee` straight from the cnfg
+// owner word. So `irq_owner=` in a v3 report means "the cnfg owner, which is also the IRQ owner by
+// VEND's own assignment", not "bit 24 was set" -- and pa_scan_apids() says which of the two it was.
+#define kPmicArbApidMapV23      0x800U      // VEND:1108-1111
+#define kPmicArbMapEntriesV23   ((kSpmiCoreSize - kPmicArbApidMapV23) / kPmicArbApidMapStride)
+#define kPmicArbObsEeStrideV23  0x1000U     // VEND:983
+#define kPmicArbObsApidStrideV23 0x8000U    // VEND:983
+#define kPmicArbAccInIntr       1U          // v2/v3: these three words are `intr` offsets
+#define kPmicArbAccInChnls      0U          // v5:   ... and these are `chnls` offsets
+#define kPmicArbAccEnableIntrStride 0x1000U // VEND:1060-1064
+#define kPmicArbIrqStatusIntrBase   0x4U    // VEND:1078-1082
+#define kPmicArbIrqClearIntrBase    0x8U    // VEND:1096-1100
+#define kPmicArbOwnerAccBaseV2  0x100000U   // VEND:1036-1040
+#define kPmicArbOwnerAccBaseV3  0x200000U   // VEND:1042-1046
+#define kPmicArbOwnerAccEeStrideV23 0x1000U // VEND:1039, :1045
+#define kPmicArbOwnerAccGroupShift 5U       // VEND:522-523 `min_apid >> 5`, :542 `apid = id + i*32`
+
+// How much of each window this driver maps, per band. For v5 the answer is the one round182 chose --
+// an EE block and a page -- because v5's strides are 0x80 per APID and 4 bytes per group. For v2/v3
+// it is not: an APID's observer channel is 0x8000 apart and its ACC_ENABLE sits at intr + 0x1000*apid,
+// so a 0x1000 observer block would cover APID 0 and half of APID 1, and a 0x1000 interrupt page would
+// cover APID 0's three words and nothing else. Refusing every rail above APID 1 for want of a mapping
+// is a self-inflicted horizon, and the vendor tree settles what the right size is: VEND:1227-1236
+// devm_ioremap_resource()s the whole `obsrvr`, `chnls` and `intr` ranges as the DT declares them.
+// Those are the DT's own numbers, so mapping them whole cannot reach outside the region the board's
+// device tree assigned to this device.
+#define kSpmiObsMapSizeV5       kSpmiObsBlockMapSize
+#define kSpmiObsMapSizeV23      kSpmiObsrvrSize
+#define kSpmiIntrMapSizeV5      0x1000U
+#define kSpmiIntrMapSizeV23     kSpmiIntrSize
+
 // APID -> PPID mapping table. VEND:1113-1116 `pmic_arb_apid_map_offset_v5()` returns
 // `0x900 + 0x4 * n` -- MAIN:1774-1777 has the identical function -- and VEND:909-911 is the loop
 // that walks it, stopping when the offset reaches the core window's size

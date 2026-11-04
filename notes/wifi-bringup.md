@@ -103,7 +103,7 @@ iOS 这一侧也没有消费者。** 这条线的价值上限是把「无线区�
 ## 4. 与另外两条线共用的一格债（这条最容易被误读，写清楚）
 
 触摸（`drivers/CloverInput`）与无线用的是同一类轨：`vdd-supply = <0x187>` = **pm660l_l3**（`:5553`，
-固定 3,000,000 µV）、`vcc_i2c-supply = <0x17b>` = **pm660_l11**（`:5250`，1,775,000..1,950,000 µV），
+固定 3,000,000 µV）、`vcc_i2c-supply = <0x17b>` = **pm660_l11**（`:5250`，`0x1b2920`..`0x1dc130` = 1,780,000..1,950,000 µV），
 两者 `compatible` 也都是 `qcom,rpm-smd-regulator`。全份 DT 里 `pm8950` 出现 **0 次**（`pm660` 62 次、
 `pm660l` 32 次）⇒ `drivers/CloverInput/CloverInput.cpp` 里「PM8950 rails through SPMI」那句是错的，
 本轮就地改正（注释，不改行为）。

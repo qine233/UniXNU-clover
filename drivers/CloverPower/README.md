@@ -26,20 +26,35 @@ writes anything.
 
 | block | physical | size | what lives there |
 | --- | --- | --- | --- |
-| core | `0x0800f000` | `0x1000` | version, `+0x0004`, and the APID map at `+0x900` (448 entries) |
-| chnls | `0x08400000` | `0x1000000` | the *write* channels — mapped one page per rail APID, read-only use |
-| obsrvr | `0x09400000` | `0x1000000` | this EE's observer block: `0x10000*ee + 0x80*apid` |
-| intr | `0x0a400000` | `0x220000` | per-EE IRQ status, `owner_acc` at `+0x10000*ee + 4*n` |
-| cnfg | `0x0800a000` | `0x3000` | the ownership table at `+0x700 + 4*apid`, bits 2:0 |
+| core | `0x0800f000` | `0x1000` | version, `+0x0004`, and the APID map — at `+0x900` (448 entries) on v5, at `+0x800` (512) on v2/v3 |
+| chnls | `0x08400000` | `0x1000000` | the *write* channels, and on v5 also the per-APID `ACC_ENABLE`/`IRQ_STATUS` words |
+| obsrvr | `0x09400000` | `0x1000000` | this EE's observer block: `0x10000*ee + 0x80*apid` on v5, `0x1000*ee + 0x8000*apid` on v2/v3 |
+| intr | `0x0a400000` | `0x220000` | per-EE owner/ACC status; on v2/v3 also the `ACC_ENABLE`/`IRQ_STATUS` words |
+| cnfg | `0x0800a000` | `0x3000` | the ownership table at `+0x700 + 4*apid`, bits 2:0 — same in every band |
+
+The right-hand column is a function of the version word, not a constant. `PowerArb.h` keeps one row
+per band (`pa_layout_v2/v3/v5`) and `pa_layout_for()` installs the row the way `VEND:1212-1224`
+installs its ops table; round313 is the round that replaced round182's single "is it v5?" test with
+that table, because the board's own version read lands in the v3 band and a v5-only floor plan made
+every rail behind this door unanswerable for a reason that was really "we only wrote down one band's
+addresses". `notes/power-bringup.md` carries the two archived trees this rests on.
 
 ## The three questions, one per boot argument (`clover-power=N`)
 
-Mode 1 asks what the arbiter itself says and starts **no transaction**: map the windows, read the
-version — `VEND:1210` branches on exactly that word to choose its ops table — read `core + 0x0004`
-once and print it under *both* decodings the sources give it (`PMIC_ARB_INT_EN` VEND:24, which that
-tree never reads, and `PMIC_ARB_FEATURES` MAIN:34, whose bits 10:0 MAIN:1361-1380 treat as the APID
-count), then walk the map bounded by the core window's own size, histogram the mapped entries by
-write owner, and list the ones belonging to this board's two PMICs.
+Mode 1 asks what the arbiter itself says and starts **no transaction**: read the version word twice,
+print it in four renderings (hex, decimal, nibble-by-nibble, and the second read with a `stable=`
+verdict), install the floor plan that word selects, print the band with both neighbouring floors,
+then read `core + 0x0004` once and print it under *both* decodings the sources give it (`INT_EN`
+VEND:24, which that tree never reads, and `FEATURES` MAIN:34, whose bits 10:0 MAIN:1361-1380 treat
+as the APID count) with a `differs=` that says whether the two agree — the control that tells a
+reader whether the core window is answering at all. Only then does it map the remaining windows at
+the *band's* sizes, walk the map bounded by the core window's own size, histogram the mapped entries
+by write owner, and list the ones belonging to this board's two PMICs.
+
+The four renderings exist because round183's photograph of this one word gave two transcriptions of
+it (`core=03000000` on one line, `ver=30000000` on the next) and no further look at the photo can
+settle which is right: `0x03000000` is below `V2_MIN` and has no known table, `0x30000000` is v3 and
+does. That difference is the whole round.
 
 Mode 2 does mode 1 and asks the two PMICs who they are, as one 5-byte burst across the revid block
 and, if the burst does not come back, as the same five bytes asked one at a time. A QPNP device
@@ -54,15 +69,31 @@ How to read the report:
 
 | what appears | what it means |
 | --- | --- |
-| `core=… ee=0 chan=… intid=…` with non-zero `obs00` | the arbiter answers at its DT address; proceed |
-| `below V5_MIN …` / `at or above V6_MIN …` | the floor plan is not v5's — the map base and the channel stride are different there, so the driver stops rather than guess |
+| `arbiter_ver hex=… dec=… nib=…-…-… again=… stable=…` | the one word, four ways, plus the second read — `stable=0` means the word moved between the two reads and no floor plan below it can be trusted |
+| `band=v3 floor=30000000 next=50000000 …` | which floor plan `pa_layout_for()` installed, named with the floors either side of it so the reader can re-derive the branch |
+| `band=none floors v2=… v6=…` | the word is outside every table this port has (v1 below `V2_MIN`, v6 and up) — the driver stops and says so rather than reading a wrong layout confidently |
+| `core+0004=… main_apids=… (mask …) differs=…` | the control: if `differs=1` the map walk's bound and MAIN's APID count disagree, which is a question about this silicon, not about this driver |
+| `layout=… map=0x…+%u x%u entries=%u obs=ee*0x…+apid*0x…+%u …` | the floor plan in one line: every address formula the rest of the report was produced with |
+| `%s apid=… group=… intr+0x… owner_acc=…` | the owner/ACC word, with the 32-APID **group** index it was read at spelled out (round182 indexed this by APID; the vendor indexes by group) |
+| `acc words are intr offsets on v3; no chnls page mapped` | on v2/v3 the enable/IRQ words are not in `chnls` — this line is the refusal to print a `chnls` word under the name of an access-port enable |
 | `mode 1 started no transaction; mapped=0` | the boot left the APID table empty for this EE; no PMIC is reachable this boot, and that is a firmware question |
 | `write-owner is EE %u, this EE is %u: reads ok, writes denied` | 排期 4's second gate, answered before any write is attempted |
-| `scan … apid=… owner=… irq_owner=… irq_apid=…` | which APID was chosen for a PPID under the tie-break, and who gets its interrupt |
+| `scan … apid=… owner=… irq_ee=… irq_src=… irq_apid=…` | which APID was chosen for a PPID under the tie-break, who gets its interrupt, **and which band rule produced that answer** (`map_bit24` on v5, `cnfg_owner` on v2/v3) |
 | `type is not PMIC_TYPE_VALUE; identity NOT established` | a transaction completed but the peripheral is not what the DT says — nothing downstream is decoded |
 | `burst no, singles yes: sequential reads unproven on this arbiter` | the arbiter answers single bytes only — every later multi-byte read must be shaped that way |
 | `enable=81 state=on follow=…` / `enable=00 state=off` | the answer round181's NACK needed: `0x80` is ON (VEND:212-214); an `00` in both rails with a NACKed bus means software, not silicon |
 | `0x40/0x41 raw=… dt=…` | the raw selector bytes; microvolts are claimed only for MAIN's L660 subtypes, which use the FTSMPS426 `raw * 1000` layout |
+
+## Why the floor plan is data
+
+Because the two tables this port knows are not equally safe against each other, and the host model
+found that rather than the comment assuming it. The v2/v3 map starts at `0x800` and runs to the end
+of the core window, so it *contains* v5's `0x900..0xfff`: a v5-shaped map walked under a v3 version
+word still finds every PPID, at an APID number 64 too high, and because ownership and the IRQ rule
+are indexed off that same APID the tie-break silently changes shape as well. The reverse direction
+does refuse — v5's walk starts above the words a v3 map wrote, reads zeros, and reports
+`PA_E_NOENTRY`. Nothing downstream of `pa_layout_for()` catches a mis-banded read in the direction
+that *does* answer, so the version word is the only defence, and it is printed four ways.
 
 ## Why the transaction logic is not in `CloverPower.cpp`
 
@@ -84,10 +115,12 @@ gate fails.
 
 Every transaction is an `EXT_READL` on an *observer* channel. VEND:124-125 states the rule — from v2
 on `rd_base` is "obsrvr" and `wr_base` is "chnls" — so a read cannot land on a PMIC input. The chnls
-window, where a v5 *write* command would go (VEND:1013), is mapped one page per rail APID solely to
-read that page's `ACC_ENABLE` and `IRQ_STATUS` words (VEND:1067-1069, :1085-1087), and no CMD word is
-ever written there. The one write in this driver is the command word that starts a read, into the
-observer channel's CMD, which is what a read *is*: VEND:370 `pmic_arb_set_rd_cmd()` writes
+window, where a v5 *write* command would go (VEND:1013), is mapped one page per rail APID on v5 only
+and solely to read that page's `ACC_ENABLE` and `IRQ_STATUS` words (VEND:1067-1069, :1085-1087); on
+v2/v3 those two words are `intr` offsets instead (VEND:1060-1064, :1078-1082), and the driver maps
+no chnls page at all and prints which window it used. No CMD word is ever written to chnls in either
+band. The one write in this driver is the command word that starts a read, into the observer
+channel's CMD, which is what a read *is*: VEND:370 `pmic_arb_set_rd_cmd()` writes
 `rd_base + PMIC_ARB_CMD`.
 
 That guarantee is machine-checked, not just stated: `check-clover.py` fails if `windowWrite` or
@@ -114,9 +147,9 @@ arbiter's own status bits — and every refusal has its own code (`PA_E_VERSION`
 | archive | `build/clover-power/libCloverPower.a` | plain archive path, no `force_load`; `_clover_power_run` is what pulls the member in |
 | link | `configs/clover_defconfig` → `CONFIG_XNU_EXTRA_LD_ARCHIVES` | fourth entry, after CloverSdhci / CloverBlock / CloverInput |
 | schedule | `drivers/CloverPMGR/CloverPMGR.cpp` | `clover_power_run()` at the very tail of `sheng_pmgr_run()`, after `clover_input_run()` |
-| switch | `board.toml` → `kernel_args` | `clover-power=3` |
+| switch | `board.toml` → `kernel_args` | `clover-power=1` (round313 ships the pure-read control: it writes no byte, starts no transaction, and its whole job is to name the band) |
 | host gate | `scripts/test-clover-power.py` | run by `scripts/check-clover.py`; a nonzero return is a failed round |
-| verify | `scripts/verify-clover-payload.py` | `kernel.macho: pmic arbiter instrument linked`, seven strings |
+| verify | `scripts/verify-clover-payload.py` | `kernel.macho: pmic arbiter instrument linked`, fifteen strings |
 
 It runs last in the PMGR tail on purpose: this report is the explanation of CloverInput's last line,
 and both leave through the same card-backed ring, so their order on the card is the order they were

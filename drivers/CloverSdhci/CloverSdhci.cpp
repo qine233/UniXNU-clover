@@ -1130,6 +1130,23 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // that capped the full row but kept the map=0 one would leave a boot saying "the page was refused"
   // when the page answered fifteen times.
   { "clover r311: ", "r311-gpu", 32, 0, 0, 0 },
+  // Round313 is the first boot that runs drivers/CloverPower at all -- the instrument shipped in
+  // round182 and has never been on a board -- so its lines have no class and no budget of their own
+  // yet. The report is one-shot, printed in the PMGR tail beside the other bring-up bursts, and its
+  // worst-case length is the APID listing (up to eight rows, a header and a self-counting summary),
+  // the version block (three renderings of the same word), the floor-plan line, the window line, two
+  // scan rows, two owner/ACC rows and the access-word pair: twenty-something lines, so 48 is
+  // headroom, not an expectation. The class matters for the same reason r283's does: a report the cap
+  // cut in half reads as a driver that stopped early, and here the two are different verdicts -- one
+  // says the arbiter answered part of the question, the other says it answered none.
+  //
+  // Two classes, not one, because the report is printed under two tokens: round313's own lines carry
+  // the new stamp and the round182 lines keep theirs, which is how a reader tells which round wrote
+  // which number. Splitting the burst across two budgets is what the house rule costs, and it is
+  // worth paying -- but then both halves need the same protection, or the untouched half is the one
+  // the per-pass cap eats. "clover r182" appears in no other driver, so the token is unambiguous.
+  { "clover r182: ", "r182-power", 48, 0, 0, 0 },
+  { "clover r313: ", "r313-power", 48, 0, 0, 0 },
   // Round295 walks the send chain, at most one row per hop and five hops per fire, on the same clock as the
   // two censuses it is read beside. Twenty fires to the deadline is a hundred rows, so 128 is the same
   // headroom r265-peer was given rather than a promise about how deep this boot's chain goes: the row that
@@ -4751,7 +4768,15 @@ static void teeConsumeLine (uint32_t &pushed)
        // this row has three shapes and the difference between them is the reading -- a per-pass cap that
        // ate the answered shape and left the refused one would report a page that answered as a page that
        // was never mapped. The class budget of 32 still bounds it.
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r311"));
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r311") ||
+       // Round313's power report is one burst printed while the PMGR tail attaches, and it is the first
+       // time this driver has ever run on a board. Exempting both of its classes is the r283 reason in
+       // its plainest form: half a report and no report are different readings of the same bus, and a
+       // per-pass cap that left the version block but ate the APID listing would make "the arbiter
+       // answered" indistinguishable from "the arbiter was not reached". The two class budgets of 48
+       // still bound the burst.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r182-power") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r313-power"));
   if (pushed >= kTeePushPerPass && !reserved) {
     // The per-pass push cap is sixteen block writes on a card that is also trying to serve the
     // request this tail belongs to; a chatty boot gets its surplus counted rather than queued forever.

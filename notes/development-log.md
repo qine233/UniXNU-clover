@@ -25174,7 +25174,8 @@ iOS 这一侧也没有消费者；而且它唯一那条 PCIe 路径需要的主�
 
 **⑥ 顺带修掉两处会在下一轮被当前提引用的错。**（a）`drivers/CloverInput/CloverInput.cpp` 那句
 「`vdd-supply`/`vcc_i2c-supply` 是 PM8950 的轨、经 SPMI」在本板 DT 里对不上：这两枚 phandle 解析成
-`pm660l_l3`（固定 3,000,000 µV，:5553）与 `pm660_l11`（1,775,000..1,950,000 µV，:5250），两者都是
+`pm660l_l3`（固定 3,000,000 µV，:5553）与 `pm660_l11`（1,780,000..1,950,000 µV，:5250 的
+`0x1b2920`..`0x1dc130`；**本行原来写的是 1,775,000，Round313 ⑦ 按那颗 DT 的两个 cell 改正**），两者都是
 rpm-smd-regulator，而全份 DT 里 `pm8950` 出现 **0 次**（`pm660` 62 次、`pm660l` 32 次）。注释就地改正，
 行为零改动。（b）记忆里「本机没装 dtc」已经不成立（`/opt/homebrew/bin/dtc`），否则下一轮会绕路。
 
@@ -25188,3 +25189,107 @@ rpm-smd-regulator，而全份 DT 里 `pm8950` 出现 **0 次**（`pm660` 62 次�
 脚本两次运行的转译本 `cmp` 相同。新增归档：`notes/wifi-bringup.md`、`notes/sources/sdm660/icnss.c`、
 `notes/sources/sdm660/icnss.h`、`scripts/dump-clover-dtb-dts.sh`；更新 `README.md`、`porting.toml` 的
 network 区（next_action 从「读 DT、选传输」变成「传输已选定，剩 §5 那三格读数」）。
+
+---
+
+## Round313（v0.7.25）：CloverPower 学会 v3 那张地板图，而仲裁器版本字不再靠「再看一眼照片」
+
+**纯宿主轮：驱动改了、镜像发了，但没有上机。** 用户指令仍是「我现在不在家，你直接完善别的开发吧，
+比如 GPU 触摸 WiFi 等」；r312 把 Wi-Fi 那条线钉成一份 note，本轮回到 r312 §⑦ 留的那一格——
+「下一格先弄清 arbiter 版本」——并把它做成一件产物：`notes/power-bringup.md` + 改过的
+`drivers/CloverPower` + `round313-v0.7.25-payload.img`。
+
+**① 为什么这一格不是「再拍一张照片」。** round183 那一帧（dev-log:13845-13881）里，同一个变量
+（core 偏移 0 那个 `%08x`）被打在两行上，而照片给出的转写是两个值：`core=03000000` 与
+`ver=30000000`。这两个候选会把后面每一条偏移带进不同的世界——`0x03000000` 低于 `V2_MIN (0x20010000)`，
+落在 v1，而 v1 的 `rd_base`/`wr_base` 都在 core（VEND:1212-1216），跟本板 DT 明明声明了
+chnls/obsrvr/intr 三扇独立窗相冲；`0x30000000` 正落在 `[V3_MIN, V5_MIN)`，那一档的地板图厂商写全了。
+照片已经给过两个答案，缺的从来不是清晰度——**再看一眼不可能裁决它**。所以本轮改的是仪器形状：
+四条腿 + 重读 + `band=` + 一条不经这张表的对照；同时把读数通道从「拍屏」换成「卡上文本」
+（`clover r` 早在 tee 白名单里，本轮为它申请两枚类配额，见 ⑥）。
+
+**② 取证先做成在盘的文件。** 两份 arbiter 驱动都进仓，行号从此可核对：
+`notes/sources/sdm660/spmi-pmic-arb.c`（1,382 行，sha256 `bedee16415c7290c2c07414623edc8af16b185f475e3512bb963e7c67076754c`，
+LineageOS `android_kernel_xiaomi_sdm660` @ lineage-20）与
+`notes/sources/sdm660/spmi-pmic-arb-mainline.c`（2,182 行，sha256
+`52e78067daedd326af49c09033932c84bdcdd8a1a9df77e4fc7ae12d18cf153b`，torvalds/linux master）。
+「v3 这一档有地板图」不是我们从读数推的，是 VEND:1219-1222 与 MAIN:2102-2110 两条 else-chain
+各自独立写出来的；两条独立出处正是本轮敢把「拒绝对这张地图做任何解释」换掉的依据。
+
+**③ 地板图从常量改成数据。** `PowerArb.h` 新增 `struct pa_layout` 与三行表（v2/v3/v5，逐条抄 VEND
+的 ops 表：v2 :1131-1142、v3 :1144-1155、v5 :1157-1168），`pa_layout_for()` 逐支照
+VEND:1212-1224 分支。四处分歧：APID 地图基址与条目数（`0x800`/512 对 `0x900`/448，:1108-1111、
+:1113-1116，界限都是「偏移走到 core 窗尾」:910-911）、observer 通道步幅（`0x1000*ee + 0x8000*apid`
+:983 对 `0x10000*ee + 0x80*apid` :1005）、`ACC_ENABLE`/`IRQ_STATUS`/`IRQ_CLEAR` 落在哪一扇窗
+（v2/v3 在 `intr` :1060-1064/:1078-1082/:1096-1100，v5 在 `chnls` :1066-1070/:1084-1088/:1102-1106）、
+owner ACC_STATUS 基址（`intr+0x100000` v2 / `+0x200000` v3 / `+0x10000*ee` v5，:1036-1052）。
+**不动的三件**才是这条线还值得读的理由：归属表每档都是 `cnfg+0x700+4n` 取 3 位、通道内命令块每档
+都是 CMD 0x00/STATUS 0x08/RDATA0 0x18、PPID 取法与 `fmt_cmd_v2` 编码自 v2 起逐字相同。
+映射范围也跟着档走：v2/v3 下 obsrvr 与 intr 按 DT 声明**整扇映**（VEND:1227-1236 就是整段
+`devm_ioremap_resource`）——`0x8000` 的 APID 步幅下，64 KiB 只够 APID 0 和半个 APID 1，
+把 APID 1 以上一律拒掉是**自己造的地板**。
+
+**④ 两个静默错位，都被本轮抓出来并改了报告形状。**（a）owner ACC_STATUS 在 r182 里按 **APID**
+索引；厂商按 **32 个一组的组号**索引（VEND:522-523 `first = min_apid >> 5`、:542 `apid = id + i*32`）。
+按 APID 乘 4 只与厂商地址在 APID 0/1 重合，往上就读隔壁那一组——宿主模型现在同时断言两种口径。
+（b）v2/v3 下再映一页 `chnls` 去读 `+0x100` 并按「access-port enable」的名字印出来，等于给一个事务
+寄存器偏移改名；本轮这一档**不映 chnls** 并当场自报
+`acc words are intr offsets on v3; no chnls page mapped`。附带：IRQ 归属本身就是随档变的规则
+（v5 看地图字 bit 24 :46/:918/:924；v2/v3 没这个位，:860-861 直接 `irq_ee = write_ee`），所以布尔位
+`irq_owner=` 拆成 `irq_ee=` + `irq_src=map_bit24|cnfg_owner|unknown`——列名与填它的表达式同源。
+
+**⑤ 仪器形状：一枚版本字四条腿。** 新 11 条 `clover r313:` 行里，判决那组的形状是
+`arbiter_ver hex=%08x dec=%u nib=%x-%x-…-%x again=%08x stable=%u`，接
+`band=%s floor=%08x next=%08x ee= chan= intid=`（落在已知表外时改打
+`band=none floors v2=… v6=…`），再加一条**不经这张表**的对照
+`core+0004=… main_apids=… (mask 7ff) differs=%u`，和一条把整张地板图摊开的
+`layout=%s map=0x%x+%u x%u entries=%u obs=ee*0x%x+apid*0x%x+%u | acc=%s base=… | owner_acc=…`。
+两读不等就打 `version moved under us: chose=… scan=…` 停住；表与实际走查不一致打
+`layout mismatch: mapped=… scan=…` 停住。**没有一条数字不带产生它的地址与规则。**
+
+**⑥ 报告出得来。** `drivers/CloverSdhci` 的 tee 新增两类 `{ "clover r182: ", "r182-power", 48 }`、
+`{ "clover r313: ", "r313-power", 48 }`，并接进 `reserved` 豁免链（在 `r311` 之后）：PMGR 尾巴一次突发、
+一次报满，半张报告不等于没报告——这一格的配额理由与 r249/r250 那一批同类，`check-clover.py`
+现在同时断言两枚类与两处豁免都在。出厂参数从 r184 起的「摘掉」改回 `"clover-power=1"`：mode 1 一个字节
+都不写、一次事务都不起，它的职责就是把档定名。
+
+**⑦ 改正两处已落盘的读数（走本版，不静默覆盖）。**（a）Round312 §⑥(a) 把 `pm660_l11` 的下界写成
+1,775,000 µV；那颗 DT 的 `regulator-min-microvolt = <0x1b2920>` 换算是 **1,780,000 µV**（上界
+`0x1dc130` = 1,950,000 不变），已在 `~/uefi-clover/Resources/DTBs/clover.dts` :5249-5250 逐字复核，
+`notes/wifi-bringup.md` §4、`drivers/CloverInput/CloverInput.cpp` 的头注释与 dev-log 那一行同步改正。
+（b）同一段注释说「CloverPower 的 SPMI 通路现在到不了这两枚 enable，因为 mode 3 停在
+`not a v5 arbiter`」——那句在 r313 之后不再成立：RPM 的 *binding* 不让外设变得不可寻址，
+pm660 l11 仍是 SPMI PPID `0x04a`（`0x4a00`）、pm660l l3 仍是 `0x242`，注释改成「只差版本字定档」。
+
+**⑧ 宿主模型测出来的方向性，不是注释假设的。** `tests/clover_power_host.cpp` case 3 现在造两枚假仲裁器
+（v3 与 v5），跑的是真表混读：**两个方向不对称**。v2/v3 的地图从 `0x800` 一路铺到 core 窗尾，
+**包含** v5 的 `0x900..0xfff`，所以拿 v3 表走一张 v5 形状的地图，每个 PPID 都还找得到，但 APID 号恰好
+高 64（`(0x900-0x800)/4`），而归属与 IRQ 都拿这个被移位的 APID 去索引，重赛点跟着变形
+（模型里 pm660_l11 在 v3 表报 `candidates=3`、选中 `9+64`，v5 表自己的答案是 7）；反过来会拒——v5 的
+走查起点在 v3 地图写过的字之上，读全零，报 `PA_E_NOENTRY`。⇒ `pa_layout_for()` 之后没有任何一道检查
+能抓到「档读错但居然答了」那支，**版本字是唯一防线**，这就是它值四条腿的原因。同处还写下一处**有意
+与厂商的分歧**：VEND:1222-1224 的 else 无上界（厂商自己会把 v6/v7 用 v5 表驱动），MAIN:2102-2110 同形；
+本端口在 `V6_MIN` 停住返回 null——未知版本字的正确答案是 `PA_E_VERSION` 加把那个字印出来，不是一次
+看着合理的读；将来真有板子落在那档，修法是加第四行，不是放宽上界。
+
+**⑨ 预登记的判读分支**（写在这轮，读数回来时不许现编）：完整七支在 `notes/power-bringup.md` §8，摘要——
+甲：四条腿一致 = `30000000` 且 `band=v3` ⇒ 档定；接下来只看 `mapped=` 是否 >0，>0 时排期 4 的闸门行
+第一次有资格当结论。乙：`band=v3` 而 `mapped=0` ⇒ 地图是空的，这跟读错档是两件事，问题交回引导加载器。
+丙：`stable=0` 或 `version moved under us` ⇒ **本轮所有偏移读数一并作废**，不许挑其中一次当结论。
+丁：`hex=03000000` ⇒ `band=none`，落在 v1，那一支要解释的是「v1 不分 obsrvr/chnls 与本板 DT 声明五扇窗」
+这个矛盾本身，不改代码。戊：`differs=1` 且 `mapped>0` ⇒ 是这颗硅对 `core+0x0004` 只支持两种读法之一，
+记成一条新事实，走查界限仍按 core 窗大小（VEND 的做法）。己：档定了、`mapped>0` 而 revid 报
+`burst no, singles yes` ⇒ 后面每一次多字节读（含电压那两字节）都得改成两次单读，当场记账。
+庚：整帧没有 `clover r313:` 行 ⇒ **不许读成「arbiter 没答」**，先数饥饿（tee 自己的 `calls=`/first-drop
+自报行），再看设备。
+
+**⑩ 闸门与产物。** `CloverPower.o` `60d8447ff8f29fd0…`、`CloverInput.o` `c69dad9d237d27d5…`
+（组装树 `-Werror` + ARM64/iOS 17 目标审计通过）；宿主模型 `scripts/test-clover-power.py` PASS（含 v3 假
+仲裁器那一支与 64 位移的方向性）；内核 `7696d4e493c14b03…` → amfi `83405748f4cb7777…`（**两刀在
+`0x1ae00e4`/`0x1ae016c`，比 r311 的 `0x1adc0e4`/`0x1adc16c` 各 +0x2000**，站点性质不变，编码由脚本自己核对）
+→ normalized `925893c5d2582b50…`（973 枚 object 戳清零；**本轮两次内核构建的 amfi 件不同而归一化后逐字节
+相同**——本轮的改动只落在 DWARF 行表，r177 那条可复现性契约第一次在这类改动上给出了正面证据）
+→ `~/clover-out/round313-v0.7.25-payload.img` sha256 `069fc0561286de1366f7c1f1817aa44941c3258decf86f5751a7d0c8f2a0e285`，
+58,720,256 B。`check-clover.py` 与 `verify-clover-payload.py` 双绿（EXIT=0，0 FAIL，`pmic arbiter
+instrument linked` 那组 15 枚针脚全 present，含本轮新增的 `version legs`/`band verdict`/`positive control`/
+`floor plan`/`irq provenance`/`group indexing`/`window honesty`）。**未刷写**：boot 103 的卡上现场先读（#622）。

@@ -3302,6 +3302,22 @@ def check_board(errors: list) -> str:
             errors.append("the r311 row is not exempt from the per-pass push cap: it prints from the GPU "
                           "timer beside the censuses, and the three shapes of that row are the only thing "
                           "that separates a refused mapping from an answered page")
+        # Round313 boots drivers/CloverPower for the first time. The report is one burst in the PMGR tail
+        # and it is printed under two tokens -- round313's new lines and the round182 lines that keep
+        # their origin stamp -- so both halves need their own budget and their own exemption, or the half
+        # nobody budgeted is the one the per-pass cap eats. The reading that must survive is "how far did
+        # the arbiter get": a report that lost its APID listing reads like a driver that never reached the
+        # map, and those are two different answers about the same silicon.
+        for token, name in (('{ "clover r182: ", "r182-power", 48, 0, 0, 0 },', "r182-power"),
+                            ('{ "clover r313: ", "r313-power", 48, 0, 0, 0 },', "r313-power")):
+            if token not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {name!r} for the CloverPower report: an "
+                              "unbudgeted one-shot burst is bounded only by the per-pass cap, so a long "
+                              "report would be cut in the middle and the cut would not be attributed")
+            if f'teeHasPrefix (probe->name, teeStringLength (probe->name), "{name}")' not in sdhci_source:
+                errors.append(f"the {name} class is not exempt from the per-pass push cap: the PMGR tail "
+                              "prints its burst into a pass that has usually spent its sixteen pushes "
+                              "already, and half a power report is a different verdict from none")
 
         # Round283 asks the question boot 69 left open: which software path, if any, resets the board.
         # The r281 read showed the APSS watchdog never armed and the card's last write 11 s older than
@@ -5758,6 +5774,39 @@ def check_board(errors: list) -> str:
         for needle in missing:
             errors.append(f"drivers/CloverPower/PowerArb.h lacks {needle!r}: the v5 transaction it "
                           "describes would not be the one the vendor driver sends")
+        # Round313: the floor plan is data. The arbiter's version word picks which of the vendor's ops
+        # tables runs, and with it the APID map base (0x800 v2/v3, 0x900 v5), the observer strides
+        # (0x1000/0x8000 versus 0x10000/0x80), where the access words live (inside `intr` for v2/v3,
+        # inside `chnls` for v5) and how the owner/ACC status is indexed (per 32-APID group, not per
+        # APID). None of that may be a constant again: a v3 arbiter read at v5 offsets returns a
+        # confidently wrong APID, and round183's frame is the evidence that this board may be one.
+        missing = [needle for needle in
+                   ("static inline const struct pa_layout * pa_layout_for (uint32_t version)",
+                    "return &pa_layout_v3;",
+                    "r->l = pa_layout_for (r->version);",
+                    "map = a->core[(l->mapBase + l->mapStride * i) / 4];",
+                    "l->ownerAccGroupStride * (apid >> kPmicArbOwnerAccGroupShift)",
+                    "static inline int pa_acc_window_is_intr (const struct pa_layout *l)")
+                   if needle not in text]
+        for needle in missing:
+            errors.append(f"drivers/CloverPower/PowerArb.h lacks {needle!r}: round313's whole point is "
+                          "that the band the version word selects decides where every one of these "
+                          "registers is, and a hard-coded v5 offset would silently mis-read a v3 board")
+        regs = REPO / "drivers/CloverPower/PowerRegs.h"
+        if not regs.is_file():
+            errors.append("drivers/CloverPower/PowerRegs.h is missing: the two bands' addresses have "
+                          "nothing to be named in")
+        else:
+            regtext = regs.read_text()
+            for needle in ("#define kPmicArbApidMapV23      0x800U",
+                           "#define kPmicArbObsApidStrideV23 0x8000U",
+                           "#define kPmicArbOwnerAccBaseV3  0x200000U",
+                           "#define kPmicArbOwnerAccGroupShift 5U",
+                           "#define kSpmiObsMapSizeV23",
+                           "#define kSpmiIntrMapSizeV23"):
+                if needle not in regtext:
+                    errors.append(f"drivers/CloverPower/PowerRegs.h lacks {needle!r}: the v2/v3 row of "
+                                  "the vendor's dispatch has no documented address to be read at")
         source = power.read_text()
         missing = [needle for needle in
                    ("extern \"C\" void clover_power_run (void)",
@@ -5771,6 +5820,29 @@ def check_board(errors: list) -> str:
         for needle in missing:
             errors.append(f"drivers/CloverPower/CloverPower.cpp lacks {needle!r}: the report would "
                           "not say which step, which identity or which enable it read")
+        # Round313's instrument shape. Round183's frame carried two transcriptions of one word --
+        # `ver=30000000` in the scan line and `(03000000)` in the refusal line -- and a photograph
+        # cannot settle which one the silicon said, so the next image has to make the question
+        # machine-checkable instead: the same word rendered four ways, read twice, printed beside the
+        # band the driver selected, and beside core + 0x0004 as a control that the page is answering.
+        missing = [needle for needle in
+                   ("layout = pa_layout_for (version);",
+                    "arbiter_ver hex=%08x dec=%u nib=%x-%x-%x-%x-%x-%x-%x-%x again=%08x stable=%u",
+                    "band=%s floor=%08x next=%08x",
+                    "main_apids=%u (mask %x) differs=%u",
+                    "no floor plan for band",
+                    "version moved under us: chose=",
+                    "layout mismatch: mapped=")
+                   if needle not in source]
+        for needle in missing:
+            errors.append(f"drivers/CloverPower/CloverPower.cpp lacks {needle!r}: the arbiter version "
+                          "would still be one transcribable number, which is the exact shape that left "
+                          "round183's two readings of it unresolvable")
+        # The refusal must stay a refusal. A band this port has no table for cannot be walked by
+        # guessing the nearest one, so the branch that stops has to come before the map walk.
+        if "if (!layout) {" not in source:
+            errors.append("drivers/CloverPower/CloverPower.cpp has no unknown-band stop: an unbanded "
+                          "arbiter would be read at v5 addresses and reported as an answer")
         # The guarantee is structural, not a promise in a comment. If either of these appears, the
         # round is no longer the one that can only be wrong in its report.
         if "windowWrite" in source:
@@ -5794,6 +5866,14 @@ def check_board(errors: list) -> str:
         elif not harness.is_file():
             errors.append("drivers/CloverPower/tests/clover_power_host.cpp is missing: the host model "
                           "has nothing to drive PowerArb.h against")
+        elif "pa_layout_v3" not in harness.read_text() or "setUp (1);" not in harness.read_text():
+            # Round313's claim is that a v3 arbiter is a *known* shape rather than a refusal, and the only
+            # place that can be proven before a board is put next to one is the model: it has to build a
+            # fake arbiter with the map at 0x800 and the channels 0x8000 apart and get the same APID, the
+            # same tie-break and the same five bytes back. A model that only ever drives the v5 fake would
+            # pass while the new table was wrong in every field.
+            errors.append("the arbiter host model does not drive a v3 fake: the second floor plan would "
+                          "be shipped unproven, on the same arithmetic that round183 could not resolve")
         else:
             check = subprocess.run([sys.executable, str(runner)], capture_output=True, text=True)
             if check.returncode:
@@ -6088,8 +6168,13 @@ def check_board(errors: list) -> str:
     # which is still inside the flush path and still leaves the arming lines where r185 put them.
     # Round193 changes no driver at all: it adds one kernel line at the top of
     # proc_handle_critical_exit and one boot argument, so every driver stamp stays where it was.
-    if not board["payload"]["title"].startswith("clover r311:"):
-        errors.append('[payload] title is not "clover r311: ...": the menu would not name this round')
+    # Round312 changes no source that prints and ships no image -- it is the Wi-Fi transport reading --
+    # so the menu stayed on round311. Round313 moves it: drivers/CloverPower's addresses become a
+    # function of the arbiter's own version word, and that driver has never been in a boot whose title
+    # named it, because clover-power has always been commented out. Its new lines are stamped r313 and
+    # the round182 lines keep their origin stamp, which is the reason the tee now budgets both tokens.
+    if not board["payload"]["title"].startswith("clover r313:"):
+        errors.append('[payload] title is not "clover r313: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7234,8 +7319,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r311:"):
-        errors.append('[payload] title is not "clover r311: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r313:"):
+        errors.append('[payload] title is not "clover r313: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -7953,6 +8038,14 @@ DT_WINDOW_CONTRACT = [
     # anything if the tree agrees it is inside. The chnls pages CloverPower maps for the two rails are
     # not listed because their base is 0x10000 * apid for an APID the arbiter only names at run time.
     ("qcom,spmi@800f000", 4, "drivers/CloverPower/PowerRegs.h", "kSpmiObsrvrPhys", "kSpmiObsBlockMapSize"),
+    # Round313 adds the second band's extents to the same gate. Under v2/v3 the observer channels are
+    # 0x8000 apart rather than 0x80, so a 0x10000 block would cover APID 0 and half of APID 1 and every
+    # resolved APID above that would be read out of the wrong channel; the vendor's own probe therefore
+    # maps what the DT declares, and so does this port. The two rows below are what makes that claim
+    # checkable rather than commented: each says "the span CloverPower asks IOKit to map at this base
+    # is inside the extent this unit's own tree names".
+    ("qcom,spmi@800f000", 4, "drivers/CloverPower/PowerRegs.h", "kSpmiObsrvrPhys", "kSpmiObsMapSizeV23"),
+    ("qcom,spmi@800f000", 6, "drivers/CloverPower/PowerRegs.h", "kSpmiIntrPhys", "kSpmiIntrMapSizeV23"),
 ]
 # kTlmmTileSize is the north tile's own span, which the tree does not declare -- pinctrl@03000000 is
 # the whole 12 MiB register block and the tile is a third of it.  pinctrl-sdm660.c:1419 gives the

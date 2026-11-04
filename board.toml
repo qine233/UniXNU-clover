@@ -222,7 +222,7 @@ loader = "firmware"
 # 12 entry records and 4 beat records all carry its stamp, the newest beat is 1320.098 s and the newest
 # request 1323.814 s, and the deadline slot and both panic markers are still boot 76's -- the r293
 # stamps mean that silence now reads as silence about boot 80 rather than as boot 76's ending.
-title = "clover r311: the GPU line opens a fourth window and writes nothing in it. What gpu-bringup 5.12 left standing: this board's GX corner is not the GFX LDO -- boot 81 read thirteen words of it and matched the vendor's init list on none, and the tree this unit ships closes LDO mode per corner with qcom,cpr-corner-allow-ldo-mode = <0x00 0x00 0x00 0x00 0x00 0x00 0x00>. The node that feeds the GPU's memory accessor is regulator@01fcf004: compatible \"qcom,mem-acc-regulator\", reg = <0x1fcf004 0x4>, reg-names = \"acc-sel-l1\", qcom,corner-acc-map = <0x01 0x00>, qcom,acc-sel-l1-bit-pos = <0x00>, qcom,acc-sel-l1-bit-size = <0x01>, phandle 0x163 -- and 0x163 is the mem-acc-supply the GPU's own cpr4-ctrl@05061000 names. Why this cell and not the RPM one: this node declares no clocks and no supply, so reading it is not the unclocked-bus gamble the core window is, while pm660l_s3_level's corner is an SMD request this boot chain has never sent. What the row can say and what it cannot: map=0 is IOKit refusing the range and gpucc=0 is a control page this fire has not opened -- both are printed, because a row that is absent cannot be told from a boot whose GPU timer never fired; raw= is the word, l1= the field the tree describes, corner= the tree's own map (corner 1 asks 0x01, corner 2 asks 0x00, and 0 is not a corner of this node), answered=0 meaning raw was all-ones -- this board's \"the page did not answer\" signature, which has to be tested before the mask because 0xffffffff cut into a one-bit field is 1, the very value corner 1 asks for, and one word may not mean two things. Registered readings for the boot that carries it: answered=0 with cx_on=1 says the ACC page is deaf while GPUCC answers and the suspect is the gate above 0x01fc0000 rather than the GPU; corner=2 beside gx_on=0 says the select sits at the lower corner and the GDSC's wait is elsewhere; corner=1 on every fire of a boot whose gx_on never arrives says the select is not what is missing, which leaves the RPM level as the only rail question left. This round ships offline: the card still holds boot 103's records and nothing here writes to it -- boot 103 is read first, against Round310 (5), and boot 104 is this row's first chance to speak."
+title = "clover r313: the power line stops refusing, and the arbiter's version word stops being transcribable. What round183 left standing: the flashed image printed `scan pm660-revid ... ver=30000000` and, in the same frame, `not a v5 arbiter (03000000)` -- two transcriptions of one %08x of one variable, a self-contradiction no re-reading of the photograph can settle, so the fix is an instrument-shape change and not another look at the photo. What the two trees now archived in notes/sources/sdm660/ agree on -- this unit's own tree names the node \"qcom,spmi-pmic-arb\" at 0x800f000 across five windows (LineageOS lineage-20 spmi-pmic-arb.c sha256 bedee16415c7290c2c07414623edc8af16b185f475e3512bb963e7c67076754c, torvalds master sha256 52e78067daedd326af49c09033932c84bdcdd8a1a9df77e4fc7ae12d18cf153b): 0x30000000 is exactly PMIC_ARB_VERSION_V3_MIN, it selects the v3 ops table, and [V3_MIN, V5_MIN) has a documented floor plan -- APID map at core+0x800 with 512 entries instead of 0x900 with 448, observer channels 0x8000 apart instead of 0x80, ACC_ENABLE/IRQ_STATUS/IRQ_CLEAR inside `intr` instead of inside `chnls`, and the owner/ACC status word indexed per 32-APID GROUP rather than per APID. That last one is a bug this port was carrying: round182 read it at 4*apid, so a rail above APID 31 was reported against somebody else's word. What does not move between the bands is the write-owner table (cnfg+0x700+4n, 3 bits), the channel register offsets, the PPID formula and the command encoding -- so the layout became data, a struct pa_layout selected by pa_layout_for() on the same read the vendor branches on, and the host model now drives two fake arbiters, one per band, and prints PASS for both. Why the word gets four legs: hex, decimal, separated nibbles and a repeat read with stable=, printed beside the driver's own band= verdict and beside core+0004 with differs= as the positive control -- because a version that reads 00000000 next to a second page that also reads 00000000 is a dead page, not a v1 arbiter, and that is the one reading a bare ver= could never have told us. What the report can say and what it cannot: irq_ee= and irq_src= replace round182's boolean irq_owner= because the two bands derive that answer differently (v5 from bit 24 of the map word, v2/v3 from the cnfg owner, where no such bit exists), so a column and the rule that fills it now share a name; and the two tables cannot be distinguished by an error code -- the host model found the asymmetry rather than assuming it: a v5 map walked under a v3 version word answers with every APID shifted by 64 and a tie-break that changed shape, and only the reverse direction refuses -- which is exactly why band= is a printed line and not an assumption. This round ships offline and boots in mode 1, which maps windows, reads the map and writes nothing: no CMD word, so no transaction, and the arbiter report cannot disturb the queue that is already on the card -- boot 103's records are read first, against Round310 (5), boot 104 is round311's MEM_ACC row's first chance to speak, and this instrument goes after both."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -2439,33 +2439,54 @@ kernel_args = [
   # this round did not set are two different answers -- and the GPU core (0x05000000) is mapped only
   # behind the gate. Design and decision criteria: notes/gpu-bringup.md.
   "clover-gpu=1",
-  # Round182 puts drivers/CloverPower on the SPMI arbiter, and mode 3 is the one worth booting for.
-  # Mode 1 is the pure-read control: map core/chnls-cnfg/obsrvr/intr, decode the version and walk the
-  # 448-entry APID map, start no transaction at all. Mode 2 stops after the two revid blocks. Mode 3
-  # adds the LDOs the touch panel is waiting on -- A11 (vcc_i2c) and B3 (vdd) -- read through their
-  # own APIDs.
-  # NOTHING HERE WRITES A PMIC. The arbiter's observer channel is written because that is how a read
-  # is requested (a CMD word is the request), and there is no write opcode and no windowWrite in the
-  # driver. The chnls window -- the one a real write goes through -- is mapped only so its
-  # ACC_ENABLE/IRQ_STATUS/CLEAR words can be reported, never programmed.
-  # What comes back, through round176's tee (`clover r` is already allowlisted):
-  #   `clover r182: core=.. ee=.. chan=.. intid=.. | cnfg700=.. obs00=.. intr00=..` -- the arbiter's
-  #    own identity registers, plus `core+0004` decoded both ways (VEND's interrupt-enable reading and
-  #    MAIN's APID-count reading), because those two interpretations disagree and only the board says
-  #    which one this silicon means;
-  #   `clover r182: scan ldo-a11 ppid=0x04a ... apid=.. owner=.. irq_owner=..` -- and the line that
-  #    decides 排期 4's second gate: `write-owner is EE n, this EE is 0: reads ok, writes denied`,
-  #    which is the same answer the vendor driver would give back as -EPERM;
-  #   `clover r182: pm660 rev2=.. type=51 want=51 subtype=1b want=1b` and `is QPNP, subtype matches
-  #    the DTB` -- the revid as MAIN's spmi_regulator_match() asks it, one 5-byte burst, falling back
-  #    to five singles and saying `burst no, singles yes` out loud if the burst is the thing that
-  #    failed, because that answer gates every later multi-byte SPMI read;
-  #   `clover r182: ldo-a11 enable=.. state=ON follow=..` and `0x40/0x41 raw=.. dt=1780000-1950000` --
-  #    register 0x46 is the enable, and a rail the panel needs but that reads OFF is the reason the
-  #    i2c probe NACKed.
+  # Round313 resumes drivers/CloverPower, and the mode it resumes in is 1 rather than the 3 round182
+  # shipped with. Mode 1 maps the arbiter's windows, reads its version word and walks its APID map, and
+  # starts no transaction at all: the observer command word is read as whatever the boot left there and
+  # is never written. Modes 2 and 3 add the two revid bursts and then the two LDO reads, which is what
+  # touches the bus, and 排期 6's next gate is the ownership answer mode 1 already prints.
+  # Why the instrument is back now: round182 stopped at "not a v5 arbiter", so every later question --
+  # who owns pm660l_l3 and pm660_l11 (排期 4's second gate, the touch rails), whether pm660_l5/l6/l9/l19
+  # are reachable at all (the Wi-Fi line round312 found has no PCIe host controller behind it, so its
+  # power question is an SPMI or RPM question), and pm660l_s3's second leg (the GPU's MEM_ACC corner) --
+  # was blocked on one word this driver refused to interpret. Round313 gives it a floor plan instead of a
+  # refusal, from two independent vendor trees archived in notes/sources/sdm660/.
+  # NOTHING HERE WRITES A PMIC. The arbiter's observer channel is written in modes 2/3 because a CMD word
+  # is how a read is requested; there is no write opcode and no windowWrite in the driver. The chnls
+  # window -- the one a real write goes through -- is mapped in the v5 band only so its
+  # ACC_ENABLE/IRQ_STATUS/CLEAR words can be reported, never programmed, and under v2/v3 those three
+  # words are `intr` offsets instead, which the report says out loud rather than printing one window's
+  # word under the other window's name.
+  # What comes back, through round176's tee (`clover r` is already allowlisted, and r313's lines now have
+  # their own budget and their own exemption from the per-pass cap):
+  #   `clover r313: arbiter_ver hex=.. dec=.. nib=x-x-x-x-x-x-x-x again=.. stable=..` -- the word round183
+  #    could not settle, in four renderings plus a second read. A photograph of a panel transcribed one
+  #    %08x as 30000000 on one line and 03000000 on another, which is a self-contradiction inside one
+  #    frame; a card-backed line with the same value in hex, decimal and separated nibbles, beside a
+  #    repeat read, is not transcribable in that way;
+  #   `clover r313: band=v3 floor=30000000 next=50000000 ..` (or `band=none`, printing all four floors)
+  #    -- the driver's own answer to which floor plan it is about to use, so a wrong band cannot hide
+  #    inside a number that looks like a reading;
+  #   `clover r313: core+0004=.. vend_int_en=.. main_apids=.. differs=..` -- the positive control: a
+  #    second page of the same window, decoded both ways because VEND:24 and MAIN:34 disagree about its
+  #    name, with `differs=` saying whether it differs from the version word. If the version line reads
+  #    00000000 and this one does too, that is a dead page, not a v1 arbiter;
+  #   `clover r313: layout=.. map=0x800|0x900 .. | acc=intr|chnls .. | owner_acc=..` and
+  #    `clover r313: windows cnfg700=.. obs00=.. owner_acc0=..@intr+0x..` -- every address the report is
+  #    about to use, printed with the rule that produced it;
+  #   `clover r182: scan ldo-a11 ppid=0x04a ... apid=.. owner=.. irq_ee=.. irq_src=..` -- and the line
+  #    that decides 排期 4's second gate: `write-owner is EE n, this EE is 0: reads ok, writes denied`,
+  #    which is the same answer the vendor driver would give back as -EPERM. `irq_ee=` replaces
+  #    round182's boolean `irq_owner=` because the two bands derive that answer differently -- v5 from
+  #    bit 24 of the map word, v2/v3 from the cnfg owner with no bit involved -- and `irq_src=` names
+  #    which rule filled the column;
+  #   `clover r313: ldo-a11 apid=.. group=.. intr+0x.. owner_acc=..` and the access-port pair -- the
+  #    owner/ACC status word is indexed per 32-APID group (VEND:521-523), not per APID, which is the
+  #    mistake round182's address arithmetic contained.
   # It runs last in the PMGR tail, after CloverInput, because its report is what tells the round181
-  # readings whether the panel's rails were ever on. It never panics.
-  # "clover-power=3",
+  # readings whether the panel's rails were ever on. It never panics. The lines reach the card on the
+  # tee's next block pass, as every instrument's do -- a boot that hangs before then still gets them out
+  # through the watchdog's panic drain.
+  "clover-power=1",
   # Round183 puts drivers/CloverDsp on the SMEM heap, and mode 3 is the one worth booting for: it is
   # mode 1 (the heap) plus mode 2 (who is on the other side of it) plus the two image scans, and the
   # question 排期 5 was blocked on -- is the ADSP already up? -- only has an answer when all three are

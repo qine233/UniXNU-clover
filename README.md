@@ -673,6 +673,29 @@ leave」一路收紧到一句可测的话：
   `pm660_l11`，全是 rpm-smd，而 `pm8950` 在整份 DT 出现 0 次），且**这两颗轨的 enable 至今一次都没读到**
   （r182 mode 3 在 round183 那帧停在 `not a v5 arbiter (03000000)`）——「触摸 NACK 因为没人上电」既没证实也没排除。
   全部细节在 [`notes/wifi-bringup.md`](notes/wifi-bringup.md)，台账见 dev-log §Round312 ①–⑧。
+* **r313（v0.7.25，纯宿主开发、镜像已发未刷）把「仲裁器版本字到底是什么」这一格从照片改成仪器**：round183
+  那一帧把同一个 `%08x` 打成两行，而照片给出的转写是 `core=03000000` 与 `ver=30000000` 两个值——
+  `0x03000000` 低于 `V2_MIN` 落 v1（v1 不分 obsrvr/chnls，与本板 DT 声明的五扇窗相冲），`0x30000000` 落 v3
+  （VEND 把那一档的地板图写全了）。**再看一眼照片不可能裁决它**，所以本轮改形状：
+  `arbiter_ver hex= dec= nib= again= stable=` 四条腿 + `band= floor= next=`（表外改打 `band=none floors …`）
+  + 一条不经这张表的对照 `core+0004=… main_apids=… differs=…`；同时给 `clover r182:`/`clover r313:` 各申请
+  48 行 tee 配额并进 `reserved` 豁免链 ⇒ **读数从此是卡上文本，不再是拍照**。地板图从常量变成数据
+  （`struct pa_layout` 三行，逐支照 VEND:1212-1224 与 MAIN:2102-2110）：四处分歧是 APID 地图基址与条目数、
+  observer 步幅、`ACC_ENABLE`/`IRQ_STATUS` 落在 intr 还是 chnls、owner ACC_STATUS 基址；**不动的三件**
+  （`cnfg+0x700+4n` 归属字、CMD/STATUS/RDATA0 命令块、PPID 取法与 `fmt_cmd_v2` 编码）才是换档后答案还在的理由。
+  顺手抓到两处**静默错位**：r182 把 owner/ACC-status 按 APID 索引而厂商按 **32 个一组的组号**（:522-523/:542，
+  只在 APID 0/1 重合），以及 v2/v3 下把 `chnls` 偏移当 access-port enable 打印（现在那一档不映 chnls 并自报）。
+  方向性是**宿主模型跑出来的**：v2/v3 的地图包含 v5 那段，所以拿 v3 表走 v5 形状的地图**静默成功**、每个 APID
+  高 64、重赛点跟着变形，反向才报 `PA_E_NOENTRY` ⇒ `pa_layout_for()` 之后没人能抓到读错档那支，版本字是唯一防线。
+  一处与厂商的有意分歧写进 `PowerArb.h`：VEND/MAIN 的 else 都无上界，本端口在 `V6_MIN` 返回 null——
+  未知版本字的正确答案是 `PA_E_VERSION` 加把那个字印出来。两份 arbiter 驱动已归档可引行号
+  （VEND `bedee164…` 1,382 行 / MAIN `52e78067…` 2,182 行）。产物：`CloverPower.o 60d8447f…`、内核
+  `7696d4e4…` → amfi `83405748…`（两刀 `0x1ae00e4`/`0x1ae016c`，比 r311 各 +0x2000）→ 归一化 `925893c5…`
+  （**本轮两次内核构建的 amfi 件不同而归一化后逐字节相同**——改动只落在 DWARF 行表，r177 那条可复现性契约
+  第一次在这类改动上给出正面证据）→ `round313-v0.7.25-payload.img` `069fc056…`（58,720,256 B），
+  双闸门 0 FAIL、`pmic arbiter instrument linked` 15 枚针脚全 present、宿主模型 PASS。出厂参数回到
+  `clover-power=1`（不写一个字节、不起一次事务）。**未刷写**：boot 103 的卡上现场先读；判读七支
+  （甲–庚）在 [`notes/power-bringup.md`](notes/power-bringup.md) §8，台账见 dev-log §Round313 ①–⑩。
 * **这两条仪器债已由 r303 结清**（原文曾记作「本格欠着」）：`vbits=` 现以 r298 行末的 `vb_r=`/`vb_v=` 落地
   （`ipc_right_lookup_read()` 已经交出的 entry 位掩码，用来分 port set / send-once / 死名，不需要对象、锁纪律与
   translate 同一条），`cap=send` 行的 `qmc=/qsr=` 也带上了自己的返回码 `qerr=`。
@@ -842,7 +865,7 @@ boot 86 的 `link=unknown` 由此升一级；同一枚 `d0b` 也正式结掉 boo
 遗留两枚仪器债：`cap=send` 行的 `qmc=/qsr=` 仍没有自己的返回码；helper 只留两次尝试里最后一次的 kr。
 本靴跑到自己的死线（`elapsed=1800.003s`、panic 标记署 boot 87），其余各格无退步。 |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气通，两个候选地址全 NACK（`verdict=102`） | 先把面板轨真上电（依赖 3），再问地址 |
-| 3 | PMIC 轨读不出来 | SPMI 仲裁器读通路好，但核心版本字不在 v5 带内，APID 一个没认 | 弄清版本字、认 APID、读轨开轨 |
+| 3 | PMIC 轨读不出来 → **r313 起「不在 v5 带内」不再是拒读的理由** | SPMI 仲裁器读通路好（obsrvr 应答过），round183 那帧把核心版本字打成 `03000000`/`30000000` 两个候选而照片无法裁决；r313 把地板图改成按版本字装表（v2/v3/v5 三行，两份独立树同证），并给那枚字四条腿 + 重读 + `band=` + `core+0004 differs=` 对照，报告走卡上文本 | 刷 `round313-v0.7.25-payload.img`，按 [`notes/power-bringup.md`](notes/power-bringup.md) §8 七支定档；档定了才升 mode 2 认 revid、mode 3 读 `0x46` 开轨 |
 | 4 | ADSP 没起 | SMEM 共享堆读通（`$TOC`/`$PRT` 自校验通过），判决行还没上屏 | 有边就上 GLINK/APR；没镜像先压 `vadsp` 电源 |
 | 5 | watchdogd 每次起就崩 | 死因已定名：`bl` 到 `libSystem/__os_crash`，串是 `connect_to_kext() … unable to lookup watchdog KEXT service`。`AppleARMWatchdogTimer` 本体在镜像里，缺的是 `wdt,s5l8960x` 的设备树匹配（provider 是 `AppleARMIODevice`，本板平面未证）；致命已由 `panic_on_crash_disabled=1` 摘掉。**boot 76 带着这枚 brk 活到死线，sheng 零引用 `IOWatchdog` 也进桌面 ⇒ 不是本板的挡路石** | 先量 `AppleARMIODevice` 在本板有没有平面，再谈造 `IOWatchdog` 服务；不在当前排期 |
 | 6 | **GPU/Metal 一个都没有**（Adreno 512 无驱动、无固件、无 renderer） | `gpu` 区 `planned`；boot 74 实机：**r286 上电写序列在本板第一次生效**——`cx_on=1`、`gfx3d_en=1`、`cxo_en=1`、AHB/BIMC 三票=1（eMMC 正对照成立），但 `gx_on=0` → `chipid skipped`。**boot 76/77 逐字段复现**，所以 `gx_on=0` 是稳定硬件状态，不是竞态也不是时机。**boot 77 的 r290 读数把「问了」和「在跑」分开了**：`gfx3d=1/1`、`rbbm=1/1`（BIT(0) 按下、BIT(31) 仍 HALT），而 `cxo=1/0`、`rbcpr=1/0` 两支 halt=0 —— 前者是本轮没动过的天然正对照，后者是本轮新按的一票真的把分支启动了。（`rcg=80000000` 曾被读成「父源没设」，已收回；halt 两支的 RCG 都是 `0x80000000`、在跑那支 `0x00000000`，**只记相关性**：BIT(31) 在 RCG 命令字里的名字要等一份归档的 `clk-rcg.c`。见 [`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5） | 分支清白、债在电：`gx` 的 GDSC `gx_collapse=0` 而 `gx_on=0` 是**电没到**，不是使能没按。r291（v0.6.92 已发出）按 §5.6 的厂商表读 GFX LDO，但**不新增映射**：`gfx_ldo_vreg` 的 0x0506e000 正落在 DT 声明的 GPUCC `reg = <0x5065000 0x10000>` 里（偏移 0x9000），于是读 `0x9018` VREF（µV=val*5000+375000）、`0x901c` 开关控制（byp/pdn/cpr_byp）、`0x9028` 的 `LDO_READY=BIT(2)`/`LDO_VREF_SETTLED=BIT(4)`，连同当拍 `cx_on`/`gx_on` 一起打——那两票是这行的正对照：三个词全 `0xffffffff` 而 `cx_on` 照常，是这页没应答，整行作废。checker 把「本驱动只开三张窗口」钉成 `IODeviceMemory::withRange` 计数=3（**r311 起这张断言改成 4**，理由见本节末）。判据写死：`LDO_READY=0` 或 µV=375000 ⇒ 角从没抬起（债在 CPR4/`vdd_gfx`）；µV 落在 DT 的 400000…925000 且 `ready=1` 而 `gx_on=0` ⇒ 轨清白，回查 GDSC 自己的等待字段与 `gpu_gx_domain_addr`。角数（厂商 `SDM660_MMSS_FUSE_CORNERS=6` vs DT 的 1..7）不印也不下结论。S3/S5 两颗是 `qcom,rpm-smd-regulator`，SPMI 读不到，不在这一格。**boot 78 把两条预登记判据一起点亮**（`beat` 副本顶上，`ldo post` 在环窗外）：`vref=0 val=0 uv=375000`、`sts=0`（`ready=0 settled=0`）、`ctrl=80000038`=`LDO_CLAMP_IO|LDO_PDN|LDO_UNDER_SW_CTRL`+一枚没名字的 BIT(3)，同拍 `cx_on=1` 作正对照 ⇒ **轨自这次上电起既没使能也没编程，「轨清白」这一支关闭**。下一手是对轨**编程**，缺的不是寄存器（三处都在 `msm_gfx_ldo.c` 点得名）而是使能全序与角→电压来源（CPR4 fuse 在 `0x00784000` 另一张窗口），没有 sha256 出处不写。**boot 79/80 逐拍复现同一读数**（`uv=375000 sts=0 pdn=1` 且同拍 `cx_on=1`），轨的状态不是时机问题。**r294 把这格的读数铺成全普查**：`GpuRegs.h` 按厂商 `msm_gfx_ldo.c` 把 0x00..0x30 全部定名（0x20 没有 `#define`，但厂商的 dump 名字表 `register_str[8]`（`:249`）就叫它 `LDO_STATUS0`——普查行仍只印词、不判位，见 §5.11 第 6 条；ADC_CTL 0x34 落在 DT `reg = <0x0506e000 0x34>` 之外，不读），`clover_gpu_report_ldo_words()` 在 post/beat 两拍各印 13 个词 + 当拍 `cx_on/gx_on`，**一个词也不写**——它是下一轮真去编程轨时的基线，r291 那三个词保留自己那行以便和已归档的 boot 78 对比。**boot 81 的普查第一次上卡就当轮给结论**：两拍（t=859/t=980）13 个词里只有 `w1c=80000038`、`w24=0000000d` 非零，其余 11 个全 `00000000`；并排厂商 `sdm660_ldo_config[]` 的期望值（ATEST `0x00000080`、CFG0 `0x0100A600`、CFG1 `0x000000A0`、CFG2 `0x0000C3FE`、VREF_TEST_CFG `0x00401100`、REF_X1 `0x00000230`、REF_X2 `0x00000048`）⇒ **一位都不对**。所以不是「编程到一半」，是这颗 LDO 从复位到现在没人按那张表配过，引导加载器也没配。正对照照旧成立：`w1c` 读出非零、同拍 `cx_on=1` ⇒ 这页在应答，0 是读数不是空窗。`w24` 是 `LDO_STATUS1_REG`（厂商 msm_gfx_ldo.c:54 定义了却从没读过），归档里没有它的位名 ⇒ 印出来、不命名。**同一轮还做了一个控制**：删掉 r290 的 `kGpuccRbcprEn`/`kGpuccRbbmtimerEn` 两笔写（读照旧），因为四起静默复位只出现在带那两笔写的负载上；checker 现在反向拒绝这两行回到源码。**这个控制与紧随的 r294b 一起把 GPU 从「整卡复位嫌疑」里清出去了**（boot 81 删写仍 997 s 复位、boot 82 刷 boot 76 那颗旧镜像仍 707 s 复位）⇒ 本格的债仍在电（轨没人配过），但**它不再是复位线的嫌疑人**，**§5.11 把「下一手」的前提换了**：`msm_gfx_ldo.c` 的 SDM660 分支（`:1560`）不调 `corner_config_init`，所以那份文件里的 fuse 代码与 `ldo_fuse_enable` 在本板从不执行；mode 只由 CPR4 那句 `ldo_regulator_bypass = BHS_MODE`（`cpr4-mmss-ldo-regulator.c:513`）决定，而 `ctrl=0x80000038` 里 BIT(9) PWR_SRC_SEL=0 + BIT(2)/BIT(1)=0 说的是**两个供电级（LDO 与 BHS）都停在复位状态**——比 boot 81 那句「11 个词全 0」更硬，且不依赖那 11 个 0。真正的判据 fuse 在 CPR4 那份文件里点齐了名（row 73 bit 62..57 = 六角的 ldo_enable、row 71 bit 38 = 闭环允许、row 65 = 初压/偏移，全在 DT 声明的 `fuse_base = <0x00784000 0x1000>` 内）⇒ 下一手是**读这三枚 8 字节行**（要按 DT 第二段窗口主动把映射数从 3 抬到 4；行距已结：`cpr3_read_fuse_param` 的本体在**新归档的 `cpr3-util.c:195`**（sha256 `2f3c672d0142…`，`BYTES_PER_FUSE_ROW 8` :24、偏移 row*8 的 8 字节 `readq_relaxed`），与 gfx-ldo 那份逐字一致 ⇒ 三枚行 = `+0x208/+0x238/+0x248`）。**§5.12 之后这一支作废**：出厂 DTB 里

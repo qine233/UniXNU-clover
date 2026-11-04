@@ -72,13 +72,15 @@
 //
 // No power rails. The flashed DTB gives both touch nodes a supply (`vdd-supply` = phandle 0x187,
 // `vcc_i2c-supply` = 0x17b), and round312 resolved those two inside the same file: 0x187 is
-// `pm660l_l3` (fixed 3000000 uV) and 0x17b is `pm660_l11` (1775000..1950000 uV), both declared
+// `pm660l_l3` (fixed 3000000 uV, DT `0x2dc6c0`) and 0x17b is `pm660_l11` (0x1b2920..0x1dc130 =
+// 1780000..1950000 uV), both declared
 // `compatible = "qcom,rpm-smd-regulator"` -- so they are held by RPM over SMD, not by an AP-side
 // register, and `pm8950` appears nowhere in this board's DT (the earlier "PM8950 rails through SPMI"
 // in this paragraph was a vendor-tree analogy and is withdrawn; notes/wifi-bringup.md section 4).
-// That also means CloverPower's SPMI path cannot settle the question as things stand: its mode 3 read
-// on the round183 panel stopped at `not a v5 arbiter (03000000)`, so these two enables have never
-// been read.
+// What r313 changes here is the second half of that sentence: an RPM *binding* does not make the
+// peripheral unaddressable -- pm660 l11 is still SPMI PPID 0x04a (sid 0, `0x4a00`) and pm660l l3 is
+// 0x242 -- and round313 gave CloverPower the v3 floor plan, so the enable byte at 0x46 is now
+// reachable pending one answer: which band this board's arbiter version word really names.
 // If no address answers here, the next question is still whether VDD is on, not whether the bus is
 // broken, and the report says so instead of concluding "no touch controller". No interrupt setup either:
 // gpio67's INTR_CFG/INTR_STATUS are read and printed but not programmed, so the point-report round

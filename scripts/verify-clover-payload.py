@@ -547,10 +547,28 @@ def check_clover_input(kernel: bytes) -> bool:
 # arbiter: the declared five-window geometry comes out of PowerRegs.h bound to the DTB, the scan line
 # is the map walk's summary, the owner line is 排期 4's second gate, and the enable line is the reason
 # round181's `rails unproven` was written.
+# Round313 rewrites what these strings say. The map-walk line gained `dec=` and `layout=` because the
+# word it prints is the one round183 could not settle, and the ownership line's boolean `irq_owner=`
+# became `irq_ee=` plus `irq_src=` because the two bands the version word selects derive that answer
+# from different places. The new r313 strings are the ones only a band-aware driver can emit: the four
+# renderings of the version word, the band the driver chose, the floor plan it printed as arithmetic,
+# the owner/ACC word read at its group address and the sentence that says the access words live in a
+# different window under this band. A payload carrying round182's stamps but not these would boot
+# claiming a floor plan it never selected.
 CLOVER_POWER = (("power round stamp", "clover r182:"),
+                ("band round stamp", "clover r313:"),
                 ("declared windows", "declared core=%llx+%u chnls=%llx+%llu obsrvr=%llx+%llu"),
-                ("map walk", "scan %s ppid=0x%03x rc=%d(%s) ver=%08x words=%u mapped=%u span=%u"),
+                ("map walk", "scan %s ppid=0x%03x rc=%d(%s) ver=%08x dec=%u layout=%s words=%u "
+                 "mapped=%u span=%u"),
+                ("version legs", "arbiter_ver hex=%08x dec=%u nib=%x-%x-%x-%x-%x-%x-%x-%x again=%08x "
+                 "stable=%u"),
+                ("band verdict", "band=%s floor=%08x next=%08x"),
+                ("positive control", "main_apids=%u (mask %x) differs=%u"),
+                ("floor plan", "layout=%s map=0x%x+%u x%u entries=%u obs=ee*0x%x+apid*0x%x+%u"),
                 ("ownership gate", "write-owner is EE %u, this EE is %u: reads ok, writes denied"),
+                ("irq provenance", "apid=%d owner=%u irq_ee=%u irq_src=%s irq_apid=%d"),
+                ("group indexing", "apid=%u group=%u intr+0x%x owner_acc=%08x"),
+                ("window honesty", "acc words are %s offsets on %s; no chnls page mapped"),
                 ("identity refusal", "type is not PMIC_TYPE_VALUE; identity NOT established"),
                 ("burst question", "burst no, singles yes: sequential reads unproven on this arbiter"),
                 ("enable reading", "enable=%02x state=%s follow=%02x"))

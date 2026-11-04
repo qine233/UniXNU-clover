@@ -350,13 +350,17 @@ static int readAt (const char *why, uint64_t step, uint32_t apid, uint32_t byte_
     gXactDenied += rc == PA_E_DENIED ? 1u : 0u;
     // The command word the channel was left holding is the difference between "the arbiter never saw
     // the request" (whatever the boot had there) and "it saw it and the PMIC refused" (this round's
-    // encoding), so it is read back and printed. Bounded because the offset is only inside the mapped
-    // observer block while apid < 512 channels of 0x80, which kPmicArbMapEntries already guarantees --
-    // the check is here so a later round with a bigger window cannot read off it by accident.
-    const uint32_t cmdWord = apid < kSpmiObsBlockMapSize / kPmicArbObsApidStride ?
-        windowRead (gObs, kPmicArbObsApidStride * apid + kPmicArbCmd) : 0u;
-    IOLog ("clover r182: read %s apid=%u addr=0x%02x len=%u rc=%d(%s) status=%08x cmd=%08x\n",
-           why, apid, byte_addr & 0xff, len, rc, paCodeName (rc), status, cmdWord);
+    // encoding), so it is read back and printed. Bounded by the stride the floor plan in force uses:
+    // APIDs below (mapped observer bytes / stride) are inside the mapping, and pa_read() has already
+    // refused anything above the band's own map-entry count, so this check is here to keep a later
+    // round with a smaller mapping from reading off the end by accident.
+    const uint32_t stride = gArb.l ? gArb.l->obsApidStride : kPmicArbObsApidStride;
+    const uint32_t bound = gArb.l ? gArb.l->obsMapSize / stride : kSpmiObsBlockMapSize / stride;
+    const uint32_t cmdWord = apid < bound ?
+        windowRead (gObs, stride * apid + kPmicArbCmd) : 0u;
+    IOLog ("clover r182: read %s apid=%u addr=0x%02x len=%u rc=%d(%s) status=%08x cmd=%08x%s\n",
+           why, apid, byte_addr & 0xff, len, rc, paCodeName (rc), status, cmdWord,
+           apid < bound ? "" : " (cmd outside mapped observer block)");
     clover_power_observation[15] = step * 1000 + paCodeToFail (rc);
   }
   return rc;
@@ -364,39 +368,70 @@ static int readAt (const char *why, uint64_t step, uint32_t apid, uint32_t byte_
 
 // ------------------------------------------------------------------ mode 1: what is the arbiter?
 //
-// The version decides whether anything below it is meaningful, so it is said first. VEND:1210
-// branches on this word to install its ops table; a value outside the v5 band would mean PowerRegs.h
-// describes the wrong floor plan for this silicon, and every offset printed afterwards would be
-// confidently wrong rather than wrong in an interesting way.
+// The version decides whether anything below it is meaningful, so it is said first -- and round313
+// says it in shapes that survive being looked at, which round182 did not. On round183's panel this
+// one word went out twice through the same `%08x` of the same variable, on two lines of one frame,
+// and came back off the photograph as `03000000` on one line and `30000000` on the other (see
+// notes/development-log.md's round183 transcription). That is not two readings of a register; it is
+// one reading and two transcriptions, and the two candidates are the entire difference between a v3
+// arbiter with a known floor plan and a device below V2_MIN that this port cannot describe at all.
+// A single eight-digit hex column is the shape that failed, so it is no longer the only shape:
 //
-// The three extra words on the first line are the *first* register of three of the mapped windows --
-// cnfg + 0x700 is APID 0's owner word, obs + 0x00 is APID 0's command word, intr + 0x00 is APID 0's
-// owner-access word -- which is the cheapest way to show that all three windows answer, in one line,
-// before any transaction is attempted.
-static void dumpVersion (void)
+//   dec=     the same word as a decimal number. 805306368 and 50331648 have different digit counts, so
+//            a photo that loses or gains a leading zero in the hex column cannot also do it here.
+//   nib=     the eight digits with separators, so the position of the non-zero digit is a column in
+//            the image rather than a count of leading zeros the reader has to trust.
+//   again=   a second read of the same register, printed beside the first. If the device is steady
+//            they agree; if the transcription of one line is wrong, the two lines still cross-check.
+//   band=    and layout=: what THIS code concluded from the word, in words, so nobody has to compare
+//            the number against a floor by hand and get it wrong in the same way the driver did in
+//            round182 (which read the word, refused it, and printed the floor it had refused against
+//            as though that were the reading).
+//
+// The core + 0x0004 line is the positive control for the read path itself: a window that returns one
+// fixed value no matter which offset is asked would show the same number in both columns, and
+// differs= would be 0. VEND:24 calls that address PMIC_ARB_INT_EN and never reads it; MAIN:34 calls
+// it PMIC_ARB_FEATURES and its v5 init (:1361-1380) takes bits 10:0 as the APID count. Both cannot
+// be true of the same bits, the port cannot settle that argument from software, and a report that
+// shows the word both ways can, so the two decodings stay side by side.
+static void dumpVersion (uint32_t version, uint32_t again, const struct pa_layout *layout)
 {
-  const uint32_t version = windowRead (gCore, kPmicArbVersion);
   const uint32_t word0004 = windowRead (gCore, kPmicArbIntEn);
   clover_power_observation[2] = version;
-  IOLog ("clover r182: core=%08x ee=%u chan=%u intid=%u | cnfg700=%08x obs00=%08x intr00=%08x\n",
-         version, kPmicArbEe, kPmicArbChannel, kPmicArbPeriphIntid,
-         windowRead (gCnfg, kPmicArbOwnerTable), windowRead (gObs, kPmicArbCmd),
-         windowRead (gIntr, kPmicArbOwnerAccStatus));
-  // One word, two names, two decodings, printed side by side. VEND:24 calls core + 0x0004
-  // PMIC_ARB_INT_EN and never reads it; MAIN:34 calls the same address PMIC_ARB_FEATURES and its v5
-  // init (:1361-1380) takes bits 10:0 as the APID count. Both cannot be true of the same bits, the
-  // port cannot settle it from software, and a reader of a ring dump can settle it in one look if all
-  // three numbers are here. Picking one silently would hide the disagreement from the next round,
-  // which is the one thing a reading must not do.
-  IOLog ("clover r182: core+0004=%08x vend_int_en=%u main_apids=%u (mask %x)\n",
-         word0004, word0004, word0004 & kPmicArbFeaturesApidMask, kPmicArbFeaturesApidMask);
-  if (version < kPmicArbVersionV5Min) {
-    IOLog ("clover r182: below V5_MIN %08x: map base would be v2/v3's 0x800, not 0x900\n",
-           kPmicArbVersionV5Min);
-  } else if (version >= kPmicArbVersionV6Min) {
-    IOLog ("clover r182: at or above V6_MIN %08x: not the v5 floor plan (SHENG's v7 is 0x2000/0x00)\n",
-           kPmicArbVersionV6Min);
+  IOLog ("clover r313: arbiter_ver hex=%08x dec=%u nib=%x-%x-%x-%x-%x-%x-%x-%x again=%08x stable=%u\n",
+         version, version,
+         (version >> 28) & 0xfu, (version >> 24) & 0xfu, (version >> 20) & 0xfu,
+         (version >> 16) & 0xfu, (version >> 12) & 0xfu, (version >> 8) & 0xfu,
+         (version >> 4) & 0xfu, version & 0xfu, again, version == again ? 1u : 0u);
+  if (layout) {
+    IOLog ("clover r313: band=%s floor=%08x next=%08x ee=%u chan=%u intid=%u\n",
+           layout->name, layout->versionMin,
+           layout == &pa_layout_v5 ? kPmicArbVersionV6Min :
+           (layout == &pa_layout_v3 ? kPmicArbVersionV5Min : kPmicArbVersionV3Min),
+           kPmicArbEe, kPmicArbChannel, kPmicArbPeriphIntid);
+  } else {
+    IOLog ("clover r313: band=none floors v2=%08x v3=%08x v5=%08x v6=%08x ee=%u chan=%u intid=%u\n",
+           kPmicArbVersionV2Min, kPmicArbVersionV3Min, kPmicArbVersionV5Min, kPmicArbVersionV6Min,
+           kPmicArbEe, kPmicArbChannel, kPmicArbPeriphIntid);
   }
+  IOLog ("clover r313: core+0004=%08x dec=%u vend_int_en=%u main_apids=%u (mask %x) differs=%u\n",
+         word0004, word0004, word0004, word0004 & kPmicArbFeaturesApidMask,
+         kPmicArbFeaturesApidMask, word0004 != version ? 1u : 0u);
+}
+
+// The three windows other than core, asked one word each, printed before any transaction is
+// attempted -- the cheapest way to show that all three answer, and the line that round183's
+// `obs00=00000100` proved it could do that job with. The observer word is APID 0's command register
+// and the interrupt word is this band's owner-status address for APID 0, both taken from the layout
+// that was chosen above rather than from a remembered offset: under v3 that owner word is at
+// intr + 0x200000, and a report that read intr + 0x0 and called it the owner status would be the
+// same kind of mistake this round exists to stop making.
+static void dumpWindows (const struct pa_layout *layout)
+{
+  IOLog ("clover r313: windows cnfg700=%08x obs00=%08x owner_acc0=%08x@%s+0x%x\n",
+         windowRead (gCnfg, kPmicArbOwnerTable), windowRead (gObs, kPmicArbCmd),
+         windowRead (gIntr, pa_owner_acc_addr (layout, kPmicArbEe, 0)),
+         "intr", pa_owner_acc_addr (layout, kPmicArbEe, 0));
 }
 
 // The map, in the only form that answers the question a blank table leaves open -- not "is it empty"
@@ -407,16 +442,18 @@ static void dumpVersion (void)
 // that is not this one. The line is built with an explicit cursor rather than strlen(), because
 // snprintf() returns the length it *would* have written and a cursor taken naively from it can walk
 // past the end of a buffer that truncated.
-static void dumpMapListing (uint32_t *listedOut, uint32_t *skippedOut)
+static void dumpMapListing (const struct pa_layout *layout, uint32_t *listedOut,
+                            uint32_t *skippedOut)
 {
   // "%03x/%u" is at most 8 bytes with its separator, so 96 bytes cannot truncate eight entries and the
   // cursor below stays honest.
   char line[8 * 9 + 8];
   uint32_t inLine = 0, first = 0, listed = 0, lines = 0, used = 0;
   *skippedOut = 0;
-  IOLog ("clover r182: map entries of sid 0 and sid 2 as ppid/owner:\n");
-  for (uint32_t i = 0; i < kPmicArbMapEntries && listed < 64; i++) {
-    const uint32_t map = windowRead (gCore, kPmicArbApidMap + kPmicArbApidMapStride * i);
+  IOLog ("clover r182: map entries of sid 0 and sid 2 as ppid/owner (%s, base 0x%x, %u entries):\n",
+         layout->name, layout->mapBase, layout->mapEntries);
+  for (uint32_t i = 0; i < layout->mapEntries && listed < 64; i++) {
+    const uint32_t map = windowRead (gCore, layout->mapBase + layout->mapStride * i);
     if (!map) {
       continue;   // VEND:915-916
     }
@@ -448,7 +485,7 @@ static void dumpMapListing (uint32_t *listedOut, uint32_t *skippedOut)
     lines++;
   }
   IOLog ("clover r182: listing lines=%u shown=%u other_sid=%u bound=%u\n",
-         lines, listed, *skippedOut, static_cast<unsigned> (kPmicArbMapEntries));
+         lines, listed, *skippedOut, layout->mapEntries);
   *listedOut = listed;
 }
 
@@ -462,10 +499,20 @@ static struct pa_scan gScan;
 static int scanFor (uint32_t ppid, const char *label)
 {
   const int rc = pa_scan_apids (&gArb, ppid, &gScan);
-  IOLog ("clover r182: scan %s ppid=0x%03x rc=%d(%s) ver=%08x words=%u mapped=%u span=%u\n",
-         label, ppid, rc, paCodeName (rc), gScan.version, gScan.words, gScan.mapped, gScan.apid_span);
-  IOLog ("clover r182: scan %s apid=%d owner=%u irq_owner=%u candidates=%u irq_apid=%d ee0=%u ee1=%u ee2=%u ee3=%u ee4=%u ee5=%u\n",
-         label, gScan.apid, gScan.owner, gScan.irq_owner, gScan.candidates, gScan.irq_apid,
+  IOLog ("clover r182: scan %s ppid=0x%03x rc=%d(%s) ver=%08x dec=%u layout=%s words=%u mapped=%u span=%u\n",
+         label, ppid, rc, paCodeName (rc), gScan.version, gScan.version,
+         gScan.l ? gScan.l->name : "none", gScan.words, gScan.mapped, gScan.apid_span);
+  // `irq_ee=` is the band's own IRQ-owner answer, and `irq_src=` names the rule that produced it:
+  // bit 24 of the map word on v5 (VEND:46/:918/:924) or the cnfg owner itself on v2/v3
+  // (VEND:860-861), where there is no bit to test. 255 means the band's rule answered "nobody"
+  // (VEND:47 INVALID_EE). Printing the number without the rule would let a v3 report be read as a
+  // v5 claim, which is the same class of mistake as reading a chnls word as an intr word.
+  IOLog ("clover r182: scan %s apid=%d owner=%u irq_ee=%u irq_src=%s irq_apid=%d candidates=%u "
+         "irq_none=%u ee0=%u ee1=%u ee2=%u ee3=%u ee4=%u ee5=%u\n",
+         label, gScan.apid, gScan.owner, gScan.irq_ee,
+         gScan.irq_from == kPaIrqFromMapBit ? "map_bit24" :
+         (gScan.irq_from == kPaIrqFromOwner ? "cnfg_owner" : "unknown"),
+         gScan.irq_apid, gScan.candidates, gScan.irq_none,
          gScan.per_ee[0], gScan.per_ee[1], gScan.per_ee[2], gScan.per_ee[3], gScan.per_ee[4],
          gScan.per_ee[5]);
   if (gScan.apid < 0) {
@@ -491,19 +538,41 @@ static int scanFor (uint32_t ppid, const char *label)
 // left in them is the starting condition of that round -- and `owner_acc_status` for this EE is a
 // second, independent answer to "may we use this channel", which is worth having next to the
 // ownership table rather than instead of it.
-static void dumpAccessState (int apid, const char *label)
+static void dumpAccessState (const struct pa_layout *layout, int apid, const char *label)
 {
-  // The APID has to be one the core window's map can hold before its owner-access word is inside the
-  // one page of the interrupt window that was mapped (0x4 per APID, 0x1000 mapped, so 448 is the
-  // largest index with a word in it -- which is kPmicArbMapEntries exactly).
-  if (apid < 0 || static_cast<uint32_t> (apid) >= kPmicArbMapEntries) {
+  if (apid < 0 || static_cast<uint32_t> (apid) >= layout->mapEntries) {
     return;
   }
   const uint32_t ch = static_cast<uint32_t> (apid);
-  const uint32_t ownerAcc = windowRead (gIntr, kPmicArbOwnerAccStatus +
-                                               kPmicArbOwnerAccStride * ch);
-  IOLog ("clover r182: %s apid=%u intr+0x%x owner_acc=%08x\n", label, ch,
-         kPmicArbOwnerAccStatus + kPmicArbOwnerAccStride * ch, ownerAcc);
+  // The owner/ACC-status word is indexed by 32-APID GROUP, not by APID: VEND:522-523 walks
+  // `first = min_apid >> 5` to `last = max_apid >> 5` and :542 turns the bit back into
+  // `apid = id + i * 32`, so the third argument of owner_acc_status() is the group. Round182 passed
+  // the APID and multiplied by 4, which agrees with the vendor address only for APID 0 and 1 and
+  // reads a neighbouring group's word for anything above that -- and the line carried no unit, so
+  // nothing on the panel could have caught it. Both the address and the index it came from are
+  // printed now, because a number whose address is not on the page is not a reading.
+  const uint32_t ownerAddr = pa_owner_acc_addr (layout, kPmicArbEe, ch);
+  const uint32_t ownerAcc = windowRead (gIntr, ownerAddr);
+  IOLog ("clover r313: %s apid=%u group=%u intr+0x%x owner_acc=%08x\n", label, ch,
+         ch >> kPmicArbOwnerAccGroupShift, ownerAddr, ownerAcc);
+  if (pa_acc_window_is_intr (layout)) {
+    // v2/v3 keep the three access words in the interrupt window itself (VEND:1060-1064, :1078-1082,
+    // :1096-1100), which was mapped whole above, so there is no per-APID page to have failed to map:
+    // a missing word here would be the silicon's, not the driver's. The bit that matters is bit 0 of
+    // ACC_ENABLE (VEND:100 SPMI_PIC_ACC_ENABLE_BIT, written to enable at :610 and tested at :551/:568)
+    // -- with it clear, this EE's access port is off and an observer command would be dropped rather
+    // than answered, which is the difference between "the PMIC refused" and "the arbiter never let
+    // the request out".
+    IOLog ("clover r313: %s apid=%u intr acc=%08x en=%u irq=%08x clr=%08x (acc words are %s here)\n",
+           label, ch,
+           windowRead (gIntr, pa_acc_word_addr (layout, ch, kPaAccWordEnable)),
+           (windowRead (gIntr, pa_acc_word_addr (layout, ch, kPaAccWordEnable)) &
+            kPmicArbAccEnableBit) ? 1u : 0u,
+           windowRead (gIntr, pa_acc_word_addr (layout, ch, kPaAccWordIrqStatus)),
+           windowRead (gIntr, pa_acc_word_addr (layout, ch, kPaAccWordIrqClear)), "intr");
+    clover_power_observation[15] = kStepAcc;
+    return;
+  }
   for (uint32_t i = 0; i < gChnlCount; i++) {
     if (gChnlApid[i] != ch) {
       continue;
@@ -712,16 +781,67 @@ extern "C" void clover_power_run (void)
   }
   refreshTicksPerMs ();
 
-  // Map everything first, and say which window failed if one does. A base the platform memory map does
-  // not contain is a payload-geometry answer, not a hardware answer, and it has to be distinguishable
-  // from an arbiter that reads back zeros -- so this stops with the failing phys recorded rather than
-  // reporting a version of 00000000 as though the hardware had said it.
+  // Map the core window on its own, read the one word that decides the shape of everything else, and
+  // only then map the windows whose extent depends on that answer. Round313's reason, in one sentence:
+  // VEND:1210-1224 (and MAIN:2100-2110) choose the floor plan off core + 0x0000, and the floor plan
+  // decides that an observer channel is 0x80 bytes from the next on v5 and 0x8000 on v2/v3, and that
+  // ACC_ENABLE is a chnls offset on v5 and an intr offset on v2/v3 -- so a mapping sized before the
+  // read is a mapping that can be the wrong extent for the answer it is about to be used to take.
+  // Round182 mapped four windows first and then refused to interpret the version; the refusal was
+  // correct for a v5-only floor plan, and the four windows were the wrong size for any other one.
+  //
+  // A base the platform memory map does not contain is a payload-geometry answer, not a hardware
+  // answer, and it has to be distinguishable from an arbiter that reads back zeros -- so every exit
+  // below records the failing phys rather than reporting a version of 00000000 as though the silicon
+  // had said it.
+  if (!mapWindow (gCore, kSpmiCorePhys, kSpmiMapSize)) {
+    IOLog ("clover r182: map spmi-core %llx failed\n",
+           static_cast<unsigned long long> (kSpmiCorePhys));
+    clover_power_observation[1] = kSpmiCorePhys;
+    clover_power_observation[15] = kFailMap;
+    clover_emmc_flush_cache ();
+    return;
+  }
+  gArb.core = reinterpret_cast<volatile uint32_t *> (gCore.base);
+  gArb.ee = kPmicArbEe;
+
+  // Two reads of the same register, because round183 proved this word gets *transcribed*: the same
+  // %08x of the same variable reached the panel on two lines and came back off the photograph as
+  // 03000000 on one and 30000000 on the other, which is a self-contradiction inside one frame that no
+  // amount of re-reading the photo can resolve. Two reads say whether the silicon is steady; the
+  // separate shapes on the line say whether the report is.
+  const uint32_t version = windowRead (gCore, kPmicArbVersion);
+  const uint32_t versionAgain = windowRead (gCore, kPmicArbVersion);
+  const struct pa_layout *layout = pa_layout_for (version);
+  gArb.l = layout;
+  dumpVersion (version, versionAgain, layout);
+  if (!layout) {
+    // The band has no floor plan here at all: below V2_MIN is v1, whose driver keeps rd_base and
+    // wr_base both at core (VEND:1213-1215) and whose DT would not declare the chnls/obsrvr/intr
+    // windows this board's DT does; at or above V6_MIN is SHENG's v7 territory (0x2000/0x00 bases,
+    // 0x20/0x8000 strides). Neither is guessable, and guessing one is how a wrong APID gets printed
+    // with a straight face, so stop -- but stop with the version word on the record, which round182
+    // could not do because it stopped before it had a way to say the number unambiguously.
+    IOLog ("clover r182: no floor plan for band %s; stopping, the map layout is unknown\n",
+           version < kPmicArbVersionV2Min ? "v1 (below V2_MIN)" : "v6 or above (SHENG's v7 family)");
+    clover_power_observation[15] = kStepScan * 1000 + kFailVersion;
+    clover_emmc_flush_cache ();
+    return;
+  }
+
   struct Needed { Window *window; uint64_t phys; uint32_t size; const char *label; };
   const Needed needed[] = {
-    { &gCore, kSpmiCorePhys, kSpmiMapSize, "spmi-core" },
     { &gCnfg, kSpmiCnfgPhys, kSpmiCnfgSize, "spmi-cnfg" },
-    { &gObs, pa_obs_block_phys (kPmicArbEe), kSpmiObsBlockMapSize, "spmi-obs-ee0" },
-    { &gIntr, kSpmiIntrPhys + kPmicArbOwnerAccEeStride * kPmicArbEe, kSpmiMapSize, "spmi-intr-ee0" },
+    // The observer base carries this EE's term (0x10000*ee on v5, 0x1000*ee on v2/v3, VEND:983 vs
+    // :1005) and the extent carries the band's whole window when the per-APID stride is the v2/v3 one,
+    // because a 0x10000 block at a 0x8000 stride covers APID 0 and half of APID 1 -- a self-inflicted
+    // horizon with the vendor driver's own mapping as the counter-example (VEND:1227-1236 ioremaps
+    // these windows whole, at the sizes this DT declares).
+    { &gObs, pa_obs_block_phys (layout, kPmicArbEe), layout->obsMapSize, "spmi-obs" },
+    // The interrupt window is based at its own phys in every band: the EE term belongs to the
+    // owner-status formula (pa_owner_acc_addr()), and v2/v3's ACC_ENABLE words are per-APID with no
+    // EE term at all (VEND:1060-1064), so pre-offsetting the mapping would silently shift those.
+    { &gIntr, kSpmiIntrPhys, layout->intrMapSize, "spmi-intr" },
   };
   for (uint32_t i = 0; i < sizeof (needed) / sizeof (needed[0]); i++) {
     if (!mapWindow (*needed[i].window, needed[i].phys, needed[i].size)) {
@@ -733,16 +853,18 @@ extern "C" void clover_power_run (void)
       return;
     }
   }
-  gArb.core = reinterpret_cast<volatile uint32_t *> (gCore.base);
   gArb.cnfg = reinterpret_cast<volatile uint32_t *> (gCnfg.base);
   gArb.obs = reinterpret_cast<volatile uint32_t *> (gObs.base);
-  gArb.ee = kPmicArbEe;
+  dumpWindows (layout);
 
   // What the device tree declares, printed once so a reading can be compared with the declaration
-  // rather than with a remembered number. The five spans are the DT's own (clover.dts:2267-2268); this
-  // mapping used 0x1000 of core, all 0x3000 of cnfg, one 0x10000 block of the 0x1000000 observer window
-  // and one 0x1000 page of the 0x220000 interrupt window, and this line is the record of that gap. The
-  // channel window is named here and mapped per rail APID below.
+  // rather than with a remembered number. The five spans are the DT's own (clover.dts:2267-2268). The
+  // next line is what this boot actually mapped, and it is a separate line on purpose: round182's
+  // comment had to describe the gap between the two in prose (0x1000 of a 0x1000000 observer window,
+  // 0x1000 of a 0x220000 interrupt window) because the gap was a choice, and a choice that is only in
+  // a comment cannot be checked from a photograph. Now the extent comes from the floor plan, so the
+  // numbers say it. The channel window is named here and mapped per rail APID below -- and only
+  // mapped at all in the band that keeps its ACC_ENABLE words there.
   IOLog ("clover r182: declared core=%llx+%u chnls=%llx+%llu obsrvr=%llx+%llu intr=%llx+%llu cnfg=%llx+%u\n",
          static_cast<unsigned long long> (kSpmiCorePhys), kSpmiCoreSize,
          static_cast<unsigned long long> (kSpmiChnlsPhys),
@@ -752,22 +874,44 @@ extern "C" void clover_power_run (void)
          static_cast<unsigned long long> (kSpmiIntrPhys),
          static_cast<unsigned long long> (kSpmiIntrSize),
          static_cast<unsigned long long> (kSpmiCnfgPhys), kSpmiCnfgSize);
+  // The row of the table this boot is running under, spelled out rather than implied by the band's
+  // name. Every offset printed below was taken from these numbers, and a reader who has only the word
+  // v3 cannot recompute a channel address from it -- but can from a stride.
+  IOLog ("clover r313: layout=%s map=0x%x+%u x%u entries=%u obs=ee*0x%x+apid*0x%x+%u | acc=%s"
+         " base=0x%x+apid*0x%x | owner_acc=0x%x+ee*0x%x+group*0x%x\n",
+         layout->name, layout->mapBase, layout->mapStride, 1u, layout->mapEntries,
+         layout->obsEeStride, layout->obsApidStride, layout->obsMapSize,
+         pa_acc_window_is_intr (layout) ? "intr" : "chnls",
+         layout->accEnableBase, layout->accEnableStride,
+         layout->ownerAccBase, layout->ownerAccEeStride, layout->ownerAccGroupStride);
   const uint32_t polls = calibratePolls ();
   IOLog ("clover r182: mode %u windows up, tps=%llu polls=%u\n", mode,
          static_cast<unsigned long long> (gTicksPerMs), polls);
 
-  dumpVersion ();
-
-  // The first scan is also the version check: pa_scan_apids() refuses anything outside the v5 band
-  // before it walks, because a v7 table would be read at a v2 address and produce a confidently wrong
-  // APID number rather than an obviously nonsense one.
+  // The first scan is also the layout check: pa_scan_apids() re-reads the version and installs the
+  // row it selects, so a band with no floor plan (or one that appeared only between the two reads)
+  // stops here rather than walking a table that belongs to another band.
   struct pa_scan revid0, revidL, a11, b3;
   const int rc0 = scanFor (kPpidPm660Revid, "pm660-revid");
   revid0 = gScan;
   clover_power_observation[3] = revid0.mapped;
   if (rc0 == PA_E_VERSION) {
-    IOLog ("clover r182: not a v5 arbiter (%08x); stopping, the map layout is unknown\n",
-           revid0.version);
+    // Only reachable if the word at core + 0x0000 changed between the read that chose the floor plan
+    // above and the read inside pa_scan_apids(). That is itself a finding -- an arbiter whose identity
+    // register is not stable is not an arbiter this port can transact with -- so it is said as one,
+    // with both numbers, instead of round182's single ambiguous hex column.
+    IOLog ("clover r313: version moved under us: chose=%08x scan=%08x dec=%u; stopping\n",
+           version, revid0.version, revid0.version);
+    clover_power_observation[15] = kStepScan * 1000 + kFailVersion;
+    clover_emmc_flush_cache ();
+    return;
+  }
+  if (revid0.l != layout) {
+    // The scan and the mapping disagree about which row is in force. They read the same word, so the
+    // only way this prints is a table bug -- and the transaction offsets below would then be the
+    // other band's, which is precisely the "confidently wrong" failure this round is built to avoid.
+    IOLog ("clover r313: layout mismatch: mapped=%s scan=%s; stopping\n", layout->name,
+           revid0.l ? revid0.l->name : "none");
     clover_power_observation[15] = kStepScan * 1000 + kFailVersion;
     clover_emmc_flush_cache ();
     return;
@@ -788,14 +932,24 @@ extern "C" void clover_power_run (void)
   // resolved, because then the answer is already in the four scan lines.
   uint32_t listed = 0, skipped = 0;
   if (mode == 1 || rc0 != PA_OK || rcL != PA_OK || rcA != PA_OK || rcB != PA_OK) {
-    dumpMapListing (&listed, &skipped);
+    dumpMapListing (layout, &listed, &skipped);
   }
 
   // Map the channel page for each rail APID, purely to read its ACC_ENABLE and IRQ_STATUS words
   // (VEND:1067-1069, :1085-1087). This is the window a *write* command would go through; reading two
   // registers of it starts nothing, and no CMD word is ever written here -- which is the whole
   // difference between this round and the one that turns a rail on.
+  //
+  // It is also only the right window in the band that keeps those words there. Under v2/v3 the same
+  // three words are `intr` offsets with a 0x1000-per-APID stride (VEND:1060-1064, :1078-1082,
+  // :1096-1100) and the interrupt window was mapped for exactly that above, so a chnls page would be
+  // mapped, read, and printed under a name that belongs to a different window. Skip it instead and
+  // say so, rather than printing a chnls word as an access-port enable.
   const int railApid[kPmicArbRailCount] = { a11.apid, b3.apid };
+  if (pa_acc_window_is_intr (layout)) {
+    IOLog ("clover r313: acc words are %s offsets on %s; no chnls page mapped\n", "intr",
+           layout->name);
+  } else {
   for (uint32_t i = 0; i < kPmicArbRailCount; i++) {
     if (railApid[i] < 0) {
       continue;
@@ -818,12 +972,13 @@ extern "C" void clover_power_run (void)
     gChnlApid[gChnlCount] = static_cast<uint32_t> (railApid[i]);
     gChnlCount++;
   }
-  dumpAccessState (a11.apid, kRails[0].label);
-  dumpAccessState (b3.apid, kRails[1].label);
+  }
+  dumpAccessState (layout, a11.apid, kRails[0].label);
+  dumpAccessState (layout, b3.apid, kRails[1].label);
 
   if (mode == 1) {
-    // Read-only, as asked: nothing above wrote a byte and no transaction was started. The obs command
-    // word in the version line is whatever the boot left there.
+    // Read-only, as asked: nothing above wrote a byte and no transaction was started. The observer
+    // command word on the windows line is whatever the boot left there.
     IOLog ("clover r182: mode 1 started no transaction; mapped=%u listed=%u other_sid=%u ee0=%u\n",
            revid0.mapped, listed, skipped, revid0.per_ee[0]);
     clover_emmc_flush_cache ();
