@@ -26117,3 +26117,67 @@ boot 108 冷刷并读回了 r320（v0.7.33，`1b47270b…`）。产物 `~/clover
 **⑦ 落盘状态。** 待发 `round325-v0.7.36-payload.img`（`e08bdd66…`，58,720,256 B），双闸门 EXIT=0、51 OK / 0 FAIL。板子在 TWRP（`81ffcaaa`），冷刷走 `adb reboot bootloader` → `run-clover-unattended.sh --flash-cache --boot-after-flash`；挂死这一支现在由 r324 的 WDT 自动落回，读回不需要人工。
 
 **⑧ 闸门自己的一次可疑 flaky（记下来，不当本轮判据）。** 双闸门之后又跑了一次 `check-clover.py`，它报 `the arbiter host model failed`（EXIT=1）；单独跑 `scripts/test-clover-power.py` 绿、紧接着再跑 `check-clover.py` 也绿。唯一的时间重合是本轮为审计显示归档在 `out/clover/tree` 里跑过 `build-clover-gop-legacy-display.py`，而 check-clover 会在同一棵树里现编那几颗宿主模型——像是抢同一枚产物导致的假红。判据没变（r325 的所有针脚仍逐条在盘上），但**下一轮把宿主模型测试与树内重跑分开**，别把这条红读成 CloverPower 坏了。
+
+## Round325 读数（boot 111，`round325-v0.7.36-payload.img` `e08bdd66…`）
+
+**① 本轮量到的一句话。** 属主名仍没到手，但「没到手」这一次不是缺席：卡上把这一靴唯一那次
+`clover_bb_sample()` 的 burst 逐行摆到了它停下的那一行——`clover r229: bb` 打了（`hops=4`）、
+它下面普查段一路打到 `clover r299: smp`，然后同一秒内核进了 panic sink。**r325 那行挂在切断点
+之下**，所以零行是「那段没执行」，不是「backboardd 不欠谁」。
+
+**② 逐行证据（时间戳都来自卡上文本，`~/clover-out/clover-log-window-boot111.bin.txt`）。**
+- 内核日志环的最后七行属于同一次 fire：`r229: bb t=712 pid=58 … f=1 hops=4`（712.248337）→
+  `r229: sbport`（.248390）→ `r234: sbown t=712 bb nm=4103 own=58:backboardd`（.248434）→
+  `r262: census t=712 threads=19 shown=19 wait=18 run=1`（.248468）→ `r270: ipi`（.248486）→
+  `r271: cpu real=8 reg=8 start=7 run=8`（.248518）→ `r299: smp req=1 con=1 run=7`（.248550）。
+  此后环里再没有任何一行。
+- 中转（kind-25）这一靴只落 8 枚，全部标 `boot 111`：`r308: beat` 179/301/421/545/665（每枚都
+  `target=0 fired=0`）、`r309: latch t=693 pid=58 name=4103`、`r309: cen-in t=712`、
+  `r308: smp-pre t=712 seq=0 pid=58 th=19`。`smp-post` 零枚。
+  ⇒ 切断点在 `smp-pre` 之后、hop 循环之前——正是 r325 那行的位置，也与内核环的最后一行互相印证。
+- `clover r325: bbnow` 命中 0、`clover r324: bbwhy` 命中 0、`r234: bbhopo`/`r231: bbhop`/`r300: done`
+  全 0：这条 fire 从没走到那一段。
+- 第 9 枚 kind-25 槽位 `beat t=1693` 是 **boot 108** 的（解码器标了 `seq 127 boot 108`）——中转环跨靴
+  留存，不许算进本靴读数（第十三层的老规矩，这次是解码器自己抓住的）。
+
+**③ 预登记四支的落点（§Round325 ⑥，判据没改）。**
+- **A｜属主名到手没有：没有。** 且按 B① 的形状定性：`bbnow` 零行而 `r229: bb` 有行 ⇒ fire 确实跑了、
+  行没算出来 ⇒ 是**代码位置**问题，不是「没有债」。本轮把它读到这一层，靠的不是推断，是上面那七行。
+- **B｜缺席分家成立。** 三种缺席里这一靴落在 ①，另外两支（`bbnow` 与 `r229: bb` 双零＝这靴没 walk；
+  `state=no_hop`＝跑了且当下不欠）都没发生。逐拍的 `target=0` 说明 r324 的手2 到 boot 111 仍然全瞎，
+  但它不是本轮判据——本轮绕开周期靠的就是 fire 内联，而 fire 只发生了这一次（`f=1`）。
+- **C｜手1 成立，但两靴的「自落」不是一种死法（这是对档案的改正，见 ④）。** `r281: wdt en=1 armed=1
+  bite=1048575(≈32 s) req=1 pet=26→57` 在场（t=408…542，27 枚，类预算 48 没用完）；板子第二次**零人工**
+  落回 TWRP（`CloverSdhci r198: recovery BCB pre-armed rc=100 written=1`，卡上死线记录仍是 boot 108 的）。
+- **D｜可比性成立。** 闸门发版前已钉 `ADT: ephemeral-storage ABSENT`，boot 111 与 110/109 并排可读。
+  桌面这一格：**仍未进**。显示侧比 boot 110 多走了一帧——`frame#0…#5`（t=0,1,3,4,6,14 s）全是同一枚
+  `box=305x811..970x1108`、`pixels=45460`，`swap#4 accepted` → `retire#4 done=4 presented=4`，
+  帧缓冲客户端到 `client#5 pid=74`。画到第 4 帧仍是一块 665×298 的黑盒，不是桌面 ⇒ **停轮条件未满足**。
+
+**④ 对本仓档案的三处改正。**
+1. **r325 的前提错了。** 上一轮写「把读数封在算出它的那一步就够」，隐含假设是「一次 fire 会走到 hop
+   循环」。boot 111 证明这个假设不成立：hop 数组 `hn`/`hrem[]` 在 `task.c:13592` 就填好了、`hops=4`
+   已经在 `r229: bb` 那行里印出来，但属主解析和封行被放在普查线程行、`clover_bb_chain`、`r300: done`
+   **之后**——那是 burst 里最靠后的一段，本靴它一次都没被执行。「封在算出它的那一刻」要说的是**封在
+   已经证明能落地的那一刻**，也就是 `r229: bb` 行的紧下面。
+2. **boot 110 与 boot 111 的自落不是同一种读数。** boot 110 的 panic marker 是 STALE（解码器明说
+   `boot 110 never entered the sink`）＝纯硬件复位、内核没进 sink；boot 111 的 marker 是本靴
+   （`boot=111 magic=yes stage=0 rc=0 probe=8/8 pend=0`）＝内核进了 sink，且其后一步没落、没有
+   drain-in、没有句子记录——与 boot 102 定名的 `panicAppendText()` 没返回同形。**上膛这条腿两轮都
+   成立**（都零人工落回 TWRP），但「WDT bite 复位」和「内核 panic 后复位」是两件事，不许合并成一句。
+3. **不许把 boot 111 的死因写成 WDT bite。** `r281: wdt` 行止于 t=542，可那是**变化闸控**行（r292 的形状），
+   它不出声只说明「签名没变」，不说明线程停了，更说明不了喂没喂；而同靴别的家族一直打到 712
+   （`r281: aks t=636 fire=91`、`r309: exit t=711`、`r180 t=695`）。bark≈29 s／bite≈32 s 的算术落在
+   ~574 s，与 panic 进场（k=712 s）也对不上。**boot 111 为什么死，本轮没有读数**，它是「burst 打到
+   第 7 行后同一秒进 sink」这一个未解形状，别给它安名字。
+
+**⑤ 下一手＝r326（判据先登记）。** 把「四枚 hop 属主 + 闩锁 + 中转行」整块从 hop 循环之后挪到
+`clover r229: bb` 行的**紧后面**（普查段之前），字段一字不改、仍先 `clover_emmc_probe_say` 后 `printf`。
+理由与证据：那一行的 `hops=` 说明数组已在手；同一毫秒带里 `cen-in`、`smp-pre` 两枚中转都落到了卡上，
+所以那是本靴**最后一条被证明送达的通道**。boot 112 判读：
+- **A｜** `clover r326: bbnow` 在卡上出现（`o0=` 是服务名 ⇒ 债主定名，boot 109 起欠的那笔结掉）；
+- **B｜** 若 `bbnow` 有行且 `hn>0` 而 `o0=-` ⇒ 属主解析本身失败（`clover_sb_port_owner` 走不通），
+  下一手查解析而不是位置；
+- **C｜** 若 `bbnow` 仍零行而 `r229: bb` 有行 ⇒ 唯一解释是**这靴没有任何 fire**（`f=0`），
+  那就回到「让 beat 打开」那一支，r324 的 `target=0` 重新成为主线；
+- **D｜** 手1 与可比性照 C/D 两支复查（`en=1 armed=1 req=1`、`ephemeral ABSENT`）。
