@@ -20,8 +20,8 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 | 4 | 磁盘 | 通 | eMMC 高速读写 + ADMA2；APFS 的 OS 卷与 Data 卷都挂上 | dev-log §Round128–138、§Round159 |
 | 5 | 用户态 | 通 | launchd 起一整套 iOS 守护进程，`Early boot complete` | dev-log §Round186 |
 | 6 | 点亮屏幕 | 通 | 第一次 present：`swap#1/2/3 accepted`、`scanout#3 ok bytes=9216000`、`presented=3` | dev-log §Round206 |
-| 7 | SpringBoard | **卡在这里** | boot 107 定名：主线程空等一笔没人应答的 PreBoard 数据迁移（`0x6003` `pr=0 to=0`、`migrationpluginwrapper` t=653 起）；r320 照 sheng 给 ADT 补 `/chosen/ephemeral-storage`，待 boot 108 读回 | dev-log §Round295–320 |
-| 8 | 桌面 | 未到 | 画面那一格其实已通（r180 起 `presented=4`、copy/scanout/retire 全 ok）；欠的是 SpringBoard 离开 PreBoard——不是 GPU 也不是触摸 | dev-log §Round320 ① |
+| 7 | SpringBoard | **卡在这里** | boot 108（r320 读回）：越过 boot 107 的 PreBoard 迁移闸（`0x6003`/`migrationpluginwrapper` 消失），主线程 `tid=0x129` 每拍同步等 **chronod（pid 122，端口 `2f03`，`ro=/ho=122:chronod`）** 的回音、贯穿死线；`to=ffffffff` 那 12 条是发给 `MACH_PORT_DEAD` 的即时错误、不阻塞 | dev-log §Round295–321 |
+| 8 | 桌面 | 未到 | 画面那一格其实已通（r180 起 `presented=4`、copy/scanout/retire 全 ok）；欠的是 SpringBoard 那笔对 chronod 的同步往返没人回——不是 GPU 也不是触摸，也不是迁移了 | dev-log §Round321 ② |
 
 ## 各驱动开发进度
 
@@ -51,7 +51,7 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 
 | # | 缺口 | 现状（一句话） | 下一步 | 出处 |
 | --- | --- | --- | --- | --- |
-| 1 | SpringBoard 等一笔没人应答的 PreBoard 数据迁移 | boot 107 把停点定名了：主线程空等迁移往返（`migrationpluginwrapper` t=653 起、端口 `0x6003` `pr=0 to=0` 挂 140 s、普查 `wait=19 run=1`），既非 GPU 也非触摸；与 sheng 的 ADT 只差 `/chosen/ephemeral-storage` 一条 | r320 照 sheng 把 ephemeral 解耦到 `writable_root`，`build payload` 已证它进 ADT（14,384→14,424、u32(1)，闸门 EXIT=0）；**等 boot 108 冷刷读回**，两支预登记见 §Round320 ⑤（进桌面 / 仍停迁移⇒假设排除） | dev-log §Round295–320 |
+| 1 | SpringBoard 那笔同步往返没人回（boot 108 起＝chronod） | boot 107 卡在 PreBoard 迁移（`0x6003`/`migrationpluginwrapper`）；r320 补 `/chosen/ephemeral-storage` 后 boot 108 读回**卡点真的前移**：迁移口消失，主线程 `tid=0x129` 每拍同步等 chronod（pid 122，端口 `2f03`）回音、贯穿 1800 s 死线——既非 GPU 也非触摸，也不再是迁移 | r322：把采样对象换成 chronod，读它自己卡在什么上（**挂在逐拍落地的 r221/r223 家族上，不挂普查尾巴**）；正对照＝`clover r319: last` 与 `ro=122:chronod` 理应照旧在 | dev-log §Round320–321 |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气通，两个候选地址全 NACK | 依赖 3：先把面板轨上电 | dev-log §Round181、§Round312 |
 | 3 | PMIC 轨读不出来 | r313 起「不在 v5 带内」不再是拒读的理由（地板图改成按版本字选表） | 刷 `round313` / `round314` 镜像定档 | [`notes/power-bringup.md`](notes/power-bringup.md) §8 |
 | 4 | ADSP 没起 | SMEM 读通，判决行没上屏 | 有边上 GLINK/APR；没镜像先压 `vadsp` | dev-log §Round183 |

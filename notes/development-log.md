@@ -25969,3 +25969,24 @@ r181/r260 的掩码结构上就看不见这两条线，现在第一次读到，�
 
 对照锚：boot 107 的 `clover r319: last status=11363c8 ...` 在 r320 内核字节相同，理应照旧逐拍出现——它是「同一枚内核在跑」的正对照。
 停轮条件：板子真进 iOS 桌面，不是「这一轮有没有读数」。
+
+---
+
+## Round321（读数落盘，无新镜像）：boot 108 读回——迁移闸真的过去了，桌面这一格从「数据迁移」挪到「chronod 同步往返没人回」
+
+boot 108 冷刷并读回了 r320（v0.7.33，`1b47270b…`）。产物 `~/clover-out/clover-log-window-boot108.bin.txt`（512 行内核环 + 48 条 probe + 64 条驱动判据 + 16 条报告，boot 108）。
+读回靠人工：板子 panic/到点后**不自动进 TWRP**（boot 104/106/107 一致，本轮再次坐实），是用户手动把板子拉进 recovery、脚本才认到 adb 读回。
+
+**① 落进 §Round320 ⑤ 的第四支：SpringBoard 不再等迁移端口、停在另一笔。** 证据（都来自**逐拍落地**的 r221 采样，不是那族常缺席的普查尾巴）：
+
+- boot 107 那一格的名字——端口 `0x6003` 的迁移往返、`migrationpluginwrapper`——**在 boot 108 的窗口里全没了**（`grep migrationpluginwrapper|datamigrator` = 0；`6003` = 0）。SpringBoard 主线程不再卡在那里。
+- boot 108 里 SpringBoard 主线程（`lo=27:SpringBoard+ps`，`tid=0x129`，`op=40700420e`）**每拍**都阻塞在同一笔同步 mach_msg 上，从 t=878 一直到窗口底 t=1745（贯穿死线）：`rem=2f03 loc=0 rn=b03 rs=4000 pr=0 to=0 ro=122:chronod ho=122:chronod`。目的远端口 `2f03` 的属主 `ro=` 与持有者 `ho=` **都读成 pid 122 = chronod**。
+- 另有 12 条 `to=ffffffff`（tid 0x413/0x4b4）是**别的线程**发给 `MACH_PORT_DEAD`——那会**立即返回 `MACH_SEND_INVALID_DEST`、不阻塞**，是噪声不是卡点；真正的挂是那笔发向 chronod、等回音的同步往返。
+
+**② 判读。** 这一格从「PreBoard 数据迁移没人应答」推进到「SpringBoard 同步等 chronod 回音没人应答」，**方向是量出来的、不是推的**：boot 107→108 之间，卡点端口从迁移口换成了 chronod 口，两靴同函数同管道可比。§Round320 的假设（ephemeral 让 SpringBoard 离开 PreBoard）**没有被排除，反而被支持**——它离开了迁移闸，只是还没走到桌面，下一步卡在 chronod。
+**不许过度断言之处**（仪器地平线）：我并没有一枚直接读 `os_variant_uses_ephemeral_storage()` 返回值的仪器，也没在窗口里看到 `migrationpluginwrapper` 早于环地平线被冲走的那段（它在 t≈653 就起来/退场，窗口只留最后 512 行）。所以严格说法是**「SpringBoard 现在不在迁移口上阻塞，而在 chronod 口上阻塞」**＝卡点位置是实测；「因为 ephemeral 才过去的」＝强推断。chronod（pid 122）是**活着**的（它持有端口 2f03），所以这是「chronod 收了没回」，不是「端口没人认领」。
+
+**③ 下一手（r322，未开工）。** 照桌面主线一贯的「顺着债走到债主」梯子（r230 backboardd hops / r267 kdp_find_owner / r303 收方任务 entry 的形状），把**采样对象从 SpringBoard 换成 chronod（pid 122）**：每拍读 chronod 自己的线程卡在什么上（它是否在等另一个守护进程、等 Data 卷上的某枚库/keystore、还是等一个时钟/时区设定）。**关键约束**（承 boot 96「限量出声按谁在说分预算」与 r319 教训）：新行必须挂在**已证会逐拍落地的 r221/r223 采样家族**上，不挂普查尾巴（尾巴在本镜像连续多靴 0 行）。正对照＝`clover r319: last` 与 SpringBoard 的 `ro=122:chronod` 行理应照旧在。
+另开一支对照：boot 107 卡在迁移、boot 108 卡在 chronod——若 r320 的 ephemeral 只是把闸**平移**而非**打开**，那 chronod 这一格可能也是「PreBoard 里的下一个必查闸」；判 chronod 是否本就应为 SpringBoard 供一个「已就绪」的回音，是分辨「真前进」与「换个地方等」的那把尺。
+
+**④ 本轮不发版。** 是读数落盘（reading drop），代码/ADT 零改动，待发产物仍是 `round320-v0.7.33-payload.img`（已刷、已读回）。停轮条件未满足：板子没进 iOS 桌面（卡在 chronod）。
