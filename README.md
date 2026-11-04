@@ -20,7 +20,7 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 | 4 | 磁盘 | 通 | eMMC 高速读写 + ADMA2；APFS 的 OS 卷与 Data 卷都挂上 | dev-log §Round128–138、§Round159 |
 | 5 | 用户态 | 通 | launchd 起一整套 iOS 守护进程，`Early boot complete` | dev-log §Round186 |
 | 6 | 点亮屏幕 | 通 | 第一次 present：`swap#1/2/3 accepted`、`scanout#3 ok bytes=9216000`、`presented=3` | dev-log §Round206 |
-| 7 | SpringBoard | **卡在这里** | boot 109（r322 读回，revert ephemeral）：迁移真跑了（`datamigrator[179]` t=646 起来）、boot 108 那笔对 chronod 的同步往返**消失**（`ro=122:chronod` 8→0），主线程 `tid=0x12d` 走到 launchd/cfprefsd 后停在 **backboardd（pid 58，端口 `4203`，`ro=/ho=58:backboardd`）**；卡点自 boot 107→108→109 连续第二格前移 | dev-log §Round321–323 |
+| 7 | SpringBoard | **卡在这里（backboardd）** | boot 109（r322）把卡点从 chronod 前移到 **backboardd（pid 58）**；**boot 110（r324 读回）再证一次：`clover r229: bb t=607 pid=58 hops=4`（boot 109 是 hops=2，债在加深）、`r262 census pid=58 threads=19 wait=18 run=1`，停点 ~612 s** | dev-log §Round323–324、§Round324 读数③ |
 | 8 | 桌面 | 未到 | **画面这一格第一次真通了**：boot 108 `r180 client#` 0 行 → boot 109 五个 `IOMobileFramebufferUserClient` 进门（86/87/58/56/74）、`swap#1→#3 accepted` + copy 9.2 MB→scanout ok→`presented=2` 全跑通。但交出来的仍是 `box=305x887..755x1029` 的一个小黑盒（整屏 2.26 M 纯黑 + 41543 非黑），presented 停在 2 后静默——**是进度盒不是桌面**；欠的是 SpringBoard 只交出这一个 view + backboardd 那笔同步往返 | dev-log §Round323 ③④⑤ |
 
 ## 各驱动开发进度
@@ -51,13 +51,13 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 
 | # | 缺口 | 现状（一句话） | 下一步 | 出处 |
 | --- | --- | --- | --- | --- |
-| 1 | SpringBoard 那笔同步往返没人回（boot 109 起＝backboardd） | boot 107 卡在 PreBoard 迁移（`0x6003`）→ r320 补 ephemeral 让 boot 108 挪到 chronod（`ro=122:chronod`，贯穿死线）→ **r322 revert ephemeral 后 boot 109 读回：迁移真跑（`datamigrator[179]` 起来）、chronod 那格消失（8→0）、显示路第一次整条转起来（5 个帧缓冲客户端 + swap#1→#3 + `presented=2`），但主线程 `tid=0x12d` 停在 backboardd（pid 58，端口 `4203`），且只画出一个 450×142 黑盒不是桌面** | **r324 已把逐拍债主梯子从 SpringBoard 挪到 backboardd 自己**（`task.c` 闩住第一跳属主名、每拍经驱动环重说 `clover r324: bbwhy ... state= owner=`），boot 109 欠的那枚「pid 58 阻塞在谁头上」等 boot 110 读回；仍要量「那个盒子是谁画的、SpringBoard 为何只交出这一个 view」 | dev-log §Round322–324 |
+| 1 | SpringBoard 那笔同步往返没人回（boot 109 起＝backboardd） | boot 107 迁移（`0x6003`）→ r320 ephemeral 让 boot 108 挪到 chronod → **r322 revert ⇒ boot 109 读回：迁移真跑、chronod 那格过、显示路第一次整条转起来（5 帧缓冲客户端 + swap#1→#3 + presented=2）但主线程停 backboardd、只画 450×142 黑盒不是桌面** ⇒ **boot 110（r324 读回）再量一次：backboardd 仍阻塞、`hops` 从 2 涨到 4，债更深不是解开；那笔阻塞的属主名仍没拿到** | **r324 手2（逐拍把债主梯子挪到 backboardd）没落地，但根因当场点名**：每枚 `clover r308: beat` 都 `target=0 fired=0`＝逐拍采样线程整靴没闩到 pid 58，bbwhy 块挂在 `if target!=0` 里从没跑；backboardd 只在**变化触发的普查**里 fire（`latch t=603 pid=58`→`r229 hops=4`），那族属主子行照旧被丢行尾巴冲走。**下一手 r325 二选一**：(甲) 逐拍线程无条件采样 pid 58，(乙) 把 debt 闩锁＋中转挪到变化触发那条本身——都是「一次 burst 的行不能当证据，逐拍周期必须快过它判的事件」 | dev-log §Round323–324、§Round324 读数② |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气通，两个候选地址全 NACK | 依赖 3：先把面板轨上电 | dev-log §Round181、§Round312 |
 | 3 | PMIC 轨读不出来 | r313 起「不在 v5 带内」不再是拒读的理由（地板图改成按版本字选表） | 刷 `round313` / `round314` 镜像定档 | [`notes/power-bringup.md`](notes/power-bringup.md) §8 |
 | 4 | ADSP 没起 | SMEM 读通，判决行没上屏 | 有边上 GLINK/APR；没镜像先压 `vadsp` | dev-log §Round183 |
 | 5 | watchdogd 每次起就崩 | 已定名且非瓶颈：boot 76 带着这枚 brk 活到死线，sheng 零引用 `IOWatchdog` 也进桌面 | 先量 `AppleARMIODevice` 在本板有没有平面；不在当前排期 | dev-log §Round199–200 |
 | 6 | GPU/Metal 一个都没有 | 分支清白、债在电：`gx_collapse=0` 而 `gx_on=0`，那颗 LDO 从复位起没人按厂商表配过 | 只读侦察到 MEM_ACC 那一格；桌面 CPU-first | [`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5.11–5.13 |
-| — | 「读不到为什么结束」+「挂死不自动回 TWRP」（独立的一道基础设施坎，不是主线症状） | boot 109 量到根因：`clover r281: wdt en=0 armed=0 ... why=ctrl` 整靴——**板上硬件看门狗没上膛**。一次「挂死」既不跑 panic 路径、也没有 WDT bite 复位它 ⇒ `r196/r198` 的自动落 TWRP 只对 panic/复位成立、对挂死无效，只能人工进 recovery（用户两次反馈即此）；GPU 线已由 r294/r294b 两个控制轮从复位嫌疑里摘出去 | **r324 已上膛那枚 WDT**：`CloverKeyStoreProbe.cpp` 在 t≥300 s 一次写 BARK/BITE(`1048575`≈32 s)/EN(bit0)/RST，之后每 4 s 拍续命；内核停调度⇒倒计时无喂⇒bite 硬复位⇒`r198` 预写 BCB 落 TWRP。闸门是一枚 boot-arg `clover-wdt-arm=1`（删一行整手回退），状态行加 `req=`/`pet=` 三态分开；等 boot 110 读回验「挂死能否自落」 | dev-log §Round294、§Round301–310、§Round323 ①、§Round324 ① |
+| — | 「读不到为什么结束」+「挂死不自动回 TWRP」 | **已解（boot 110 证实）**：r324 上膛 APSS WDT 后，`clover r281: wdt ... en=1 armed=1 bite=1048575(≈32s) req=1 pet=21→60`（boot 109 整靴 `en=0 armed=0`）；~558 s 起 aks 4 s 计时器先被饿停（之后无 wdt 行、别的线程仍打到 ~612 s）⇒ 倒计时无喂 ⇒ bite 硬复位 ⇒ `r198: recovery BCB pre-armed rc=100 written=1` ⇒ 落 TWRP，无人值守脚本**自动读到 boot 110、零人工**（无 panic：misc 空＋marker STALE；未到死线：记录仍是 boot 108 的）。控制对照：boot 109（en=0）挂住不自落、boot 110（en=1）自落 | 读回通道对「挂死」已成立，r325 沿用同一枚上膛；`clover r324: wdt-arm` 一次行被 512 行环地平线转掉（≈t=300 打、窗口只回溯到 t≈395），改由周期 r281 状态行这第二腿扛证据——一次行的第二腿要「周期＋单位更密」 | dev-log §Round323 ①、§Round324 读数① |
 
 ## 已完成（都有真机读数）
 

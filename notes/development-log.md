@@ -26064,3 +26064,21 @@ boot 108 冷刷并读回了 r320（v0.7.33，`1b47270b…`）。产物 `~/clover
 - **D｜ephemeral 不许漂。** 本轮 `ADT: ephemeral-storage ABSENT` 必须仍成立（r322 那步 revert 不能被这轮无意改回），否则 boot 110 与 boot 109 不可比。
 
 **⑥ 落盘状态。** 待发 `round324-v0.7.35-payload.img`（`369173b0…`，58,720,256 B），双闸门 EXIT=0、51 OK / 0 FAIL。板子现由用户手动停在 TWRP（`81ffcaaa`），冷刷需先 `adb reboot bootloader`。停轮条件（板子真进 iOS 桌面）未满足：本轮是「把两只基础设施/读数的手装进一枚镜像」，读数要等 boot 110 落回；两只手各自带本镜像独有的正对照行。
+
+## Round324 读数（boot 110，r324 镜像读回，无新镜像）：手1 成立——第一次一次「挂死」被自动读回；手2 没拿到属主，但根因当场被点名（逐拍采样线程 target=0）
+
+读数来自 `~/clover-out/clover-log-window-boot110.bin.txt`（16 报告记录、64 驱动判据、8 枚 kind-25 探针、512 行内核日志、boot 110）。冷刷 r324→`fastboot reboot` 起 boot 110；脚本 line 10 `TWRP's adb came up (81ffcaaa): the board reset and the pre-armed BCB landed it in recovery` ⇒ **无人值守脚本自己等到了落点并读回，全程零人工**（用户之后手动进 TWRP 是在读回已完成、板子 idle 之后）。
+
+**① 手1（WDT 上膛）= 成功，而且是这轮最想拿的那格：一次挂死第一次能自动读回。** 直读（`clover r281: wdt`，t=396→558 逐枚）：
+- `en=1 armed=1 intmask=0 bite=1048575 bite_ms=32002 bark=950280 bark_ms=29002 req=1 pet=21→60 why=chg` —— 板上 APSS 看门狗**被使能**（boot 109 是 `en=0 armed=0` 整靴）、BITE 寄存器收进了我们写的 20-bit 上限、`req=1`＝boot-arg `clover-wdt-arm=1` 生效、`pet` 随 4 s 计时器逐拍涨＝内核当时活着在喂。这是 §Round324 ⑤-A 预登记的 `req=1 armed=1 pet=高`「上膛且活着」那一支，TrustZone 没锁死那格（`armed=0` 那支被排除）。
+- 结束形状：**~558 s 之后没有任何 `clover r281: wdt` 行，而别的线程仍在打到 ~612 s**（`r224 peer`、`r262 census`、`r309 exit`、`apfs_trim`）⇒ aks 那枚 4 s 计时器**先被饿停**（pet 每拍都变、why=chg 必印，它不再印＝它不再跑），倒计时无喂。板子随后停调度；`r198: recovery BCB pre-armed rc=100 written=1` 在卡上，无 panic（`misc block 1 is empty: this boot's panic path wrote no watchdog counters`、两枚 panic marker 都是 `boot=108/87 STALE`）、无本靴死线记录（`the deadline record on the card is boot 108's, not boot 110's`）。⇒ 三个可能的「结束」里只剩一个：**armed WDT bite→硬复位→r198 BCB→recovery**。控制对照就在隔壁：boot 109 `en=0` 时同样停 ~719 s 却不自落、要人工；boot 110 `en=1` 就自落了——差异就是本轮这枚写。
+- 诚实的一格（仪器地平线）：本轮为手1 设计的正对照**一次行 `clover r324: wdt-arm` 在卡上没有**（grep 全窗 `clover r324` 零命中）。原因可指：那一行在**首个 ≥300 s 的 fire（≈t=300）**印一次，而 512 行内核日志环只回溯到 **t≈395.82**（窗口最早一行），t=300 那枚被环转掉了。手1 的落地证据因此由 **r281 状态行**这第二腿扛——`en=1 armed=1 req=1 pet=` 逐拍在场＝正是 14 层「一次印的判决行必须有一条不经该管道的副本」的用途，且这里那条副本（周期状态行）活了下来，一次行反而先掉。教训记进 [[feedback-instrument-horizon]]：给一次行加的第二腿最好是**周期且单位更密**的行，本轮做到了（4 s 状态行），所以结论站得住。
+
+**② 手2（backboardd 债主属主逐拍重说）= 没拿到，但根因当场点名，不用等下一轮再猜。** `clover r324: bbwhy` 两条腿（printf 与 kind-25 中转）都**零行**。逐条查为什么：
+- 每枚逐拍行 `clover r308: beat t=181/301/421/547`（以及 boot 108 的 t=1693）都自报 **`target=0 ent=0 fired=0`** ⇒ **逐拍采样线程整靴没把 `clover_bb_target_pid` 闩到 pid 58**；而 r324 的 bbwhy 块放在 `clover_bb_beat_thread` 里 `if (clover_bb_target_pid != 0)` 那一支之内 ⇒ target=0 时那段**一次都没执行**（既没算 hn 也没中转）。
+- 真正 fire 的是**变化触发**那一路，不是周期那一路：`r309: latch t=603 pid=58 name=2e03`→`r309: cen-in t=607 pid=58 ent=1`→`r308: smp-pre t=607 ... pid=58 th=19`→`r229: bb t=607 pid=58 n=4 ... hops=4 wait=8`（四枚 hop 令牌 `17e:/47f:/61f:/6bc:`，`6bc:4:0:0`）⇒ **backboardd 确实挂着、且这靴 hops=4（boot 109 是 hops=2，债在加深不是解开）**。但那族的属主子行——`clover r231 bbhop`/`clover r234 bbhopo`/`r267`/`r303`——和 boot 109 一样只在那次 burst 里印、被尾巴丢，全窗零行。（`r234: sbown t=607 bb nm=2e03 own=58:backboardd` 在，但那是端口 `2e03` 的属主＝backboardd 自己持有的那个口，不是它阻塞的那笔发送的收方，答不了「pid 58 在等谁」。）
+- 所以手2 的意图（把一次印的属主名搬成逐拍）没落地，**不是代码没编译**（verify 在镜像里钉到了 `clover r324: bbwhy` 那枚 CString），**是它挂在了一个整靴关着的闸上**：逐拍线程的 target 从没被设成 58。下一手（r325）二选一、且都要绕开这条闸：(甲) 让逐拍线程无条件采样 pid 58（把 beat 的 target 直接钉成 backboardd，独立于 SpringBoard 的变化普查），或 (乙) 把 debt 闩锁＋`clover_emmc_probe_say` 挪到变化触发那条本身（`r229/r234 bbhopo` 产 hop 名的那一步就地中转，不经 tee）。判据仍是第十三层：**一次 burst 的行不能当证据，逐拍行的周期必须比它判的事件更快。**
+
+**③ 桌面主线（#666）：backboardd 这一格没解开，还更深。** boot 110 停点 ~612 s，`r229 bb pid=58 hops=4`（boot 109 hops=2）；`r262 census pid=58 threads=19 wait=18 run=1`。守护进程还在 churn（bluetoothd/fairplayd `r309 exit`、apfs trim），没进桌面。仍 CPU-first。**停轮条件未满足。**
+
+**④ 落盘状态。** 无新镜像（本轮是 r324 的读回，版本停在已发的 **v0.7.35**）；读数产物 `~/clover-out/clover-log-window-boot110.bin(.txt)`。下一轮 r325＝修手2（把逐拍债主闸打开到 pid 58），会产新镜像、发版。手1 的读回通道已确认对「挂死」成立，r325 沿用同一枚上膛。
