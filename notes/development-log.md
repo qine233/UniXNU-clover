@@ -25434,3 +25434,95 @@ README 表格链接到的文件必须在盘上。
 （`notes/display-bringup.md`——显示与输入那条线从来没有独立底稿，散在 dev-log 与驱动 README 里），已改指
 `drivers/NativeMobileDisplay/README.md` 与 dev-log；改后 missing links: none。
 本轮不发新镜像：`round314-v0.7.26-payload.img`（`22fc0012…`）仍是待发的那一枚。
+
+## Round316（v0.7.28）：CloverBlock 交出本仓第三颗纯层 + 宿主模型；两道闸门各修一处自己的账
+
+**宿主侧轮：改了驱动源码、重新构建了内核与负载，没有刷写。** 挑这一颗的理由是 r314 自己下的判定：
+`notes/unixnu-doc-conformance.md` §6 里「范例第 1、3 条（纯逻辑与总线分离 / 纯函数先有宿主测试）三颗都没做到」
+是本文件最重的真缺口，而三颗里 `CloverBlock` 是唯一现在就有活跃问题的一格（磁盘：OS 卷已挂、Data 卷刚结掉
+`ENOSPC`）。那句「等板子回来有读数打底之后再动」本轮作废——这一格不需要读数，需要的是测试。
+
+**① 纯层：`drivers/CloverBlock/BlockCore.h`，只 `#include <stdint.h>`。** 搬进去的是五件事：清单走查
+`blk_parse_manifest()`（magic／version／行数／行是否越过本段／逐窗属性／分区内边界／卡的几何／名字，共 9 枚拒绝）、
+请求受理 `blk_admit_request()`、分批 `blk_next_chunk()`、交付记账 `blk_account_write()`/`blk_account_read()`、
+重叠判定 `blk_overlaps()` 与末块答复 `blk_last_block()`。布局常量全在这里（`kBlkBytes`、`kBlkSpanBlocks`、
+`kBlkRowsAt`、`kBlkRowStride`、五枚行内字段偏移、`kBlkVersion`、`kBlkFlagReadOnly`/`kBlkFlagWritable`），
+驱动侧留同名别名（`kBlockBytes = kBlkBytes`）以便旧句子仍能在源文件里读通。
+
+**② 行为保真是这一轮唯一的标准，做法是把每条拒绝的「legacy 标签」留在驱动里。** 新增 `manifestStep(code,
+window)` 把 `BLK_E_*` 换回历史上那些 panic 字符串（`root-magic`/`root-version`/`root-count`/
+`root|system|data-attr`/`…-bounds`/`…-geometry`/`root-name`/`systemwin`/`datawin`），没标签就
+`panic("CloverBlock r137: root-code %d window %d")`；报告行一枚没改。唯一一处「看起来像洞」的地方被**保留**
+而不是顺手补掉：零长缓冲原来不当非法请求处理，所以 `blk_admit_request()` 显式收一枚 `has_buffer`，模型里
+专门断言这个洞还在（`tests/clover_block_host.cpp` 的 `request_bound` 组：`has_buffer=1` 且缓冲 0 字节
+→ `BLK_REQ_OK` 且 `accepted == 0`）——把静默行为改成拒绝，就不是重构了。
+
+**③ 宿主模型：`tests/clover_block_host.cpp` 15 组 + `scripts/test-clover-block.py`**（clang++ `-std=gnu++17
+-O1 -Wall -Wextra -Werror`，120 s 死线，必须打印 `PASS:`；本轮实跑打印的那一行以
+`PASS: SHNGROOT walk with the nine refusals…` 开头）。假卡 `0x100000+0x80000` 落在 `0x200000` 的卡上，三扇窗
+`0x2000+0x10000`／`0x20000+0x8000`／`0x30000+0x40000`；断言的是发布出去的是**卡绝对 LBA**、行序不影响结果、
+每扇窗各自带上身份与 32 字节摘要、九枚拒绝各带着它打印的那个数字、重叠判定是半开区间、
+`reportMaxValidBlock()` 与请求受理判据不会在末块上打架。模型自己被证伪过两次才算数：它的分区一度越过卡尾
+（`kCardSectors` 从 `0x100000` 加到 `0x200000`，否则边界用例在测一件不可能发生的事）、magic 那枚字被我抄成
+`0x584f5248`（真值是 `0x474e4853`＝'S','H','N','G' 小端）。第三次是模型的断言逼出了实现的一处含糊，见 ②。
+
+**④ 闸门（`check-clover.py` 的 `# Round316.` 那一段）**：要求 `BlockCore.h` 在、14 枚条文在位、驱动**真的
+调用**纯层（7 枚 needle）、`.cpp` 里**不再留着第二份拷贝**（4 枚反向 needle）、模型与 runner 在盘、
+13 枚 `== BLK_E_*` 说明每一枚拒绝都被模型覆盖，最后**运行**这个模型。写这段闸门时被自己咬过两次：
+一枚 needle 因为隐式字符串拼接丢了冒号，`== BLK_E_GEOMETRY` 因为源码里换行而匹配不上——都是「闸门在测它
+自己的排版」的形状，改了断言而不是改源码去迁就它。
+
+**⑤ 两份陈旧契约是改正的，不是绕过的。** 一是 `scripts/verify-clover-payload.py` 在镜像里找 `SHNGROOT`
+那枚针脚本轮变红：字节级签名比对把八枚 ASCII 折进了立即数，**镜像里再也没有那串字**，而九枚拒绝标签作为
+CString 各自仍在（逐枚数过：各 1 次）。针脚换成走查仍在链接里的证据（`root-magic`/`root-count`/
+`system-bounds`/`data-geometry`/`datawin`/`root-code`），判读从「源码里有这串」改成「链接里留着这条走查的
+出口」。这是仪器第 13 层的同一格：镜像里有 ≠ 这枚镜像里有。二是 `drivers/CloverBlock/README.md` 里那六枚
+`check-clover.py:641-654` 之类的行号——r314 定下 §8 规矩（本仓会被后续轮次编辑的文件用符号锚点），却把这个
+规矩用在了 `.cpp` 上而漏了 `check-clover.py` 自己，本轮它就被改到全错；现在 README 用
+`# round107, the block device`／`# Round145.`／`# Round156.`／`# Round159.`／`# Round171.`／
+`# Round190:`／`# Round316.` 七段锚点，notes §6 里那枚 `check-clover.py:704-709` 同批改掉。
+
+**⑥ 写保护那条链这轮取证取到了能引用的程度**（源在盘上：
+`/Users/zhouzhou/UniXNU/out/feeds/IOStorageFamily-ad2e13e0/`）：`IOBlockStorageDriver.cpp:1616` 在
+`recordMediaParameters()` 里调 `reportWriteProtection(&_writeProtected)`，`:1490` 把 `!_writeProtected`
+作为 `isWritable` 交给媒体，真正执法的是 `IOMediaBSDClient.cpp:1002-1006`（`FWRITE` → `EACCES`）；
+`isMediaWritable()`（`:1578`）在族内没人调用，所以它不是防线；`:985-992` 是一次性的 root 例外，而它明确
+排除 APFS 媒体。这决定了 `publishWindow(..., true, ...)` 那句「OS 窗只读」是真话而不是自述。
+
+**⑦ 产物闸门第一次跑红，红的是闸门自己。** 在组装树 `out/clover/tree` 里跑 `check-clover.py` 报三条
+`drivers/NativeVirtioConsole` 的错（没有点名文档的章节／没有 `docs/**.md:行号`／没说为什么没有 plist）。
+核对归属：设备仓 11 颗 `drivers/*` 里没有这一颗，`/Users/zhouzhou/UniXNU/drivers/NativeVirtioConsole` 才是它的
+家，`out/clover/tree/drivers/NativeVirtioConsole` 是本轮 17:05 组装时建的 symlink。也就是说 r314 那条
+「驱动均需要参考 unixnu 文档制作」的闸门开始判**本仓不拥有**的代码。改法沿用 `check_tree()` 早已给
+`drivers/DarwinBoot` 的那条 notice 的规矩，但按路径而不是按名字：`base_repo_root()` 找到基仓检出（且不是当前
+仓库）后，realpath 落进基仓的 `drivers/*` 一律豁免并逐颗打印。两侧实跑：仓库里
+`drivers documented: 11, base-repo drivers exempt: 0`（本仓 11 颗一颗没漏），树里
+`documented: 11, exempt: 11` 且 `12 archives, 22 objects ABI-checked, kernel read`，EXIT 都是 0。
+
+**⑧ 构建与校验（全部哈希当场重数）**：原始内核 `725336422e71…`（52,404,224 B，`out/clover/kernel/kernel.macho`，
+17:03）→ AMFI `6623529e227b…`（两站点 `0x1ae00e4`/`0x1ae016c`，与 r313/r314 同一对，说明没有段搬动）→
+归一化 `8c9ff3693403…`（973 枚对象戳；`normalize-kernel-macho.py` 必须带 `--output`，本轮第一次裸跑把 amfi
+那枚就地覆盖了，重来一遍才保住三件产物）→ 负载 `639293e46ca7…`（58,720,256 B，
+`/Users/zhouzhou/clover-out/round316-v0.7.28-payload.img`）。卷内：`unixnu.toml bee6ba7a…`、
+`kernel.macho 50baf285…`、`scratch-data.img 614b8356…`、adt `e20345dc…`、trustcache `7c369ce0…`。
+显示归档审计：`kernel_sha256 = 72533642…`、late `a6fd5f5c…`、compiled `fda22636…`、archive `11f73d03…`、
+193 bindings / 24 owned entries / guarded leaves `[211,245,246,306,307,338,345]`。
+`verify-clover-payload.py` 48 行 OK、0 FAIL。块归档 365,696 B，190 枚 vtable 项 / 26 枚必需 override。
+`--prove` 那一道没有跑：本轮发的是新构建的内核，不是同一枚镜像的第二趟构建，重复构建等价性由 r314 结掉了。
+`porting.toml` 那一格本轮也按老规矩踩过一次：给数组尾部追加元素时把 `"]` 一起削掉了，`tomllib` 立刻报
+`Unclosed array (at line 117, column 1)`——改完两条再验，13 个 area 全解析通过。**这条闸门是在写的当下就响，
+不是发完才响**，所以那一格现在的做法是：改完立刻 `tomllib.loads` 并把新增元素数一遍。
+
+**⑨ 预登记 boot 103 的判读（这条是本轮唯一把宿主测试接到真机上的线）**：`clover-apfs=3` 那条路径打印
+`CloverBlock r159: boot os=X+Y system=Z+W data=U+V` 六枚数，走的就是 `blk_parse_manifest()` 的算术。
+
+| 读数形状 | 判读 |
+| --- | --- |
+| 六枚与 boot 99/102 同一张卡的上一枚读数逐字相同 | 重构没动语义，`BlockCore.h` + 模型可以当后续基准 |
+| 某一枚变了而 `CloverSdhci` 报的 GPT extent 没变 | 纯层与原实现有一处分歧；先把它喂进模型复现，模型能指出是哪一条 clause（9 枚拒绝各带自己的数字），再决定改哪边 |
+| `root-magic`/`root-count`/`…-bounds`/`…-geometry`/`datawin` 任一 panic | 卡没报到预期 extent，属 r159 已有分类，不算本轮回归 |
+| 整行缺席但 panic sink 显示卡在第一笔写前已被弄闲 | 走查没跑到；那是 r310 那一格的问题，不是这块纯层的问题——不许读成「算术错了」 |
+
+**⑩ 未结**：`CloverInput`／`CloverGpu` 两颗仍缺范例第 1、3 条（notes §7 未结 3 现在结掉三分之一）；
+`docs/drivers/uefi-drivers.md:7-13` 那一层的对照仍未搬（未结 4）；第一颗真走 personality 的驱动要改开机顺序，
+排在桌面这一格之后（未结 1）。**本轮未刷写**：板子不在家，boot 103 仍是第一枚要读的卡。

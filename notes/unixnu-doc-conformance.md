@@ -152,14 +152,17 @@ force_load 那两处。两颗要动开机顺序的活因此可以把风险写小
 第一条（纯逻辑与总线分离）与第三条（纯函数先有宿主测试）：`CloverDsp`（`DspCore.h`）和 `CloverPower`
 （`PowerArb.h`）做到了，而且各有宿主模型并被 `scripts/test-clover-dsp.py`、`scripts/test-clover-power.py`
 当构建闸门；`CloverInput`、`CloverGpu`、`CloverBlock` 三颗既没分离也没有宿主模型——这是本文件里最重的一处
-真缺口，等板子回来有读数打底之后再动。
+真缺口，等板子回来有读数打底之后再动。**r316 更新**：那一格不再等板子。`CloverBlock` 交出第三颗
+（`drivers/CloverBlock/BlockCore.h` + `tests/clover_block_host.cpp` + `scripts/test-clover-block.py`），
+剩下 `CloverInput`／`CloverGpu` 两颗。
 
 第二条（常量全部带出处）六颗都做到，且地址不止带出处还被钉在设备自己的 DT 上（`check-clover.py` 的
 `check_device_tree_constants()`，38 枚地址对 230 个节点；`GpuRegs.h` 于 r311 收编）。第四条（分级 boot arg）
 六颗全做到。第五条（序号计数器发布快照）`CloverSdhci` 的判据环/probe 环做到（单游标消费，r304），
 `CloverInput` 的触摸出数走的是 r255 的 IOHIDDevice 报告路径而不是 seq 快照，记录为形状差异而非缺陷。
 第六条（默认关闭直到日志证明每一级）：本轮实测 `board.toml` 的 kernel_args 里在的是
-`clover-input=3`（`:2422`，r259 把它接回来的，检查器在 `check-clover.py:704-709` 钉着这颗参数不许掉）、
+`clover-input=3`（`:2422`，r259 把它接回来的，检查器在 `# Round259's resumption, pinned` 那一段钉着这颗
+参数不许掉——r316 按 §8 把它原先的 `check-clover.py:704-709` 换成锚点，那个行号在本轮之后就不在了）、
 `clover-gpu=1`（`:2441`）、`clover-power=1`（`:2489`），`"clover-dsp=3"` 仍是注释状态（`:2534`）——
 所以这一条不是「所有仪器都关着」，而是「每一颗的档位都停在只读或只映射的那一级，DSP 那台因为会读堆而整颗摘掉」。
 
@@ -204,9 +207,23 @@ self-ipi 三枚，护住挂死的是 `clover-unattended=1800`，`:2597`）、以
    `require(kind == 1)`＋`require(build_version == [(2, 0x110000)])`，第三处把三颗对象交给
    `build-arm-driver.py` 编）。这条撤回之后，真正没人覆盖的一格仍然在，但它不是「对象长什么样」而是
    「对象进没进最终内核」——那就是 §4 的产物闸门补的位置，也是本轮唯一新增的那一格。
-3. `CloverInput`／`CloverGpu`／`CloverBlock` 的纯层分离与宿主模型（范例第 1、3 条）。
+3. ~~`CloverInput`／`CloverGpu`／`CloverBlock` 的纯层分离与宿主模型（范例第 1、3 条）。~~
+   **r316 结掉三分之一**：`CloverBlock` 的清单走查与请求算术进了 `BlockCore.h`，15 组宿主模型由
+   `scripts/test-clover-block.py` 编译并**运行**（`check-clover.py` 的 `# Round316.` 那一段既要求驱动
+   真的调用它，也要求 `.cpp` 里不再留着第二份拷贝）。剩 `CloverInput`／`CloverGpu` 两颗。
 4. `docs/drivers/uefi-drivers.md:7-13` 那一层的对照（`.inf` / DSC / FDF / `args` 载入选项）在固件仓
    `uefi-clover`，本轮未动，同一套办法搬过去即可。
+
+r316 还改了这个闸门本身一处。组装树把基仓的驱动 symlink 进 `drivers/*`，所以从
+`out/clover/tree` 跑的时候，`check_driver_documentation()` 开始判**本仓并不拥有**的代码——
+它给 `drivers/NativeVirtioConsole` 报了三条错（没有点名文档的章节、没有 `docs/**.md:行号`、
+没说为什么没有 plist），而那一颗驱动来自 `/Users/zhouzhou/UniXNU/drivers/`。现在按路径判定：
+`base_repo_root()` 找到基仓检出（且它不是当前仓库）后，realpath 落在基仓里的 `drivers/*` 一律豁免，
+并在 stderr 打印豁免了哪几颗、几颗（沿用 `check_tree()` 早已给 `drivers/DarwinBoot` 的那条 notice 的
+规矩，而不是写一张名单——名单会在下一颗基仓驱动进来时静默失准）。实跑两侧都过：仓库里
+`drivers documented: 11, base-repo drivers exempt: 0`，组装树里 `documented: 11, exempt: 11` 且
+`12 archives, 22 objects ABI-checked, kernel read`。豁免是按「谁 author 这颗」切的，不是按名字，
+所以 11 颗本仓驱动在树里照旧全部被判定。
 
 ## 8 引用规矩（本轮定的，因为本轮就踩到了）
 

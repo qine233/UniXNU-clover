@@ -199,7 +199,15 @@ def check_block(kernel: bytes) -> bool:
                           "FullName", "Sealed",
                           "AppleAPFSContainerScheme", "AppleAPFSVolume",
                           "SystemVersion.plist", "_clover_emmc_block_window",
-                          "_clover_emmc_block_userdata_window", "SHNGROOT", "EFI PART",
+                          "_clover_emmc_block_userdata_window",
+                          # Round316: the eight signature bytes are no longer a searchable string. The
+                          # walk moved into BlockCore.h and compares them byte by byte, so the optimizer
+                          # turns them into immediates and drops the table -- the decode is in the image,
+                          # the ASCII is not. The nine refusal tags replaced it as the marker, because
+                          # they are what the walk actually leaves behind and each one is a distinct
+                          # finding the frame has to be able to name.
+                          "root-magic", "root-count", "system-bounds", "data-geometry",
+                          "datawin", "root-code", "EFI PART",
                           "_clover_block_run", "_vnode_setmountedon", "_vn_rdwr",
                           "_native_verified_block_root_authorized",
                           "_native_verified_block_volume_device",

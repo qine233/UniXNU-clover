@@ -165,6 +165,7 @@
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
 #include <sys/types.h>
+#include "BlockCore.h"
 
 extern "C" {
 extern kmod_info_t g_kernel_kmod_info;
@@ -222,8 +223,11 @@ void *vfs_context_ucred (void *ctx);
 int PE_parse_boot_argn (const char *arg_string, void *arg_ptr, int arg_len);
 }
 
-static const uint32_t kBlockBytes = 512;
-static const uint32_t kBlockWords = kBlockBytes / 4;
+// The geometry lives in BlockCore.h -- the file the host model reads it from -- and these are the names
+// this file's existing lines use. One definition, two spellings: the round that changes a block size must
+// not be able to change it in one place only.
+static const uint32_t kBlockBytes = kBlkBytes;
+static const uint32_t kBlockWords = kBlkBlockWords;
 static const char kBSDNameKey[] = "BSD Name";
 static const char kBSDMajorKey[] = "BSD Major";
 static const char kBSDMinorKey[] = "BSD Minor";
@@ -268,10 +272,13 @@ static volatile uint64_t gWritesSinceFlush = 0;
 // and it is read through the PIO path in one request rather than eight. Entry i starts at byte 24 +
 // 128 i: name[32], u64 offset, u64 size, u32 block size, u32 flags, sha256[32]. The digest at byte
 // 4064 is deliberately not checked -- this file links no hash, and what a torn image would change is
-// the offsets, which the bounds below refuse on their own.
-static const uint32_t kRootManifestBlocks = 8;
-static const uint32_t kRootManifestBytes = kRootManifestBlocks * kBlockBytes;
-static const uint8_t kRootMagic[8] = { 'S', 'H', 'N', 'G', 'R', 'O', 'O', 'T' };
+// the offsets, which the bounds refuse on their own. Those bounds, the signature and the row walk now
+// live in BlockCore.h, because every one of them is a decision about a span of bytes that the card
+// wrote and that this boot is about to turn into LBAs; the host model that answers them is
+// drivers/CloverBlock/tests/clover_block_host.cpp. What stays here is the read, the publication and
+// the panic step each refusal becomes.
+static const uint32_t kRootManifestBlocks = kBlkSpanBlocks;
+static const uint32_t kRootManifestBytes = kBlkSpanBytes;
 static const char kRootWindowName[3] = { 'O', 'S', 0 };
 // Round143's second window, entry 1 of the same manifest: the SystemOS cryptex volume. Round142's
 // launchd died inside dyld (`namespace 6 subcode 0xd`, `/usr/lib/libSystem.B.dylib ... no such file,
@@ -623,11 +630,7 @@ static bool overlapsLogfsWindow(uint64_t first, uint64_t count)
   uint32_t windowFirst = 0;
   uint32_t windowSectors = 0;
   clover_emmc_block_window(&windowFirst, &windowSectors);
-  if (!windowSectors || !count) {
-    return false;
-  }
-  return first < static_cast<uint64_t>(windowFirst) + windowSectors &&
-         first + count > windowFirst;
+  return blk_overlaps (first, count, windowFirst, windowSectors) != 0;
 }
 
 char *CloverBlockDevice::getVendorString(void)
@@ -720,12 +723,10 @@ IOReturn CloverBlockDevice::reportMaxValidBlock(UInt64 *maxBlock)
   if (!maxBlock) {
     return kIOReturnBadArgument;
   }
-  uint32_t sectors = mediaSectors(this);
-  if (!sectors) {
-    return kIOReturnNotReady;
-  }
-  *maxBlock = static_cast<UInt64>(sectors - 1);
-  return kIOReturnSuccess;
+  // The same bound blk_admit_request will check a request against, from the same sector count -- one
+  // decision in BlockCore.h, two callers. A device that answered this question differently from how it
+  // answers the next one would refuse its own legal requests.
+  return blk_last_block (mediaSectors(this), maxBlock) == 0 ? kIOReturnSuccess : kIOReturnNotReady;
 }
 
 IOReturn CloverBlockDevice::reportMediaState(bool *mediaPresent, bool *changedState)
@@ -810,15 +811,20 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
   uint32_t windowFirst = window ? window->first : 0;
   const IODirection direction = buffer ? buffer->getDirection() : kIODirectionNone;
 
-  if (!buffer || (direction != kIODirectionIn && direction != kIODirectionOut)) {
+  // The bound, the clamp, the chunking and the accounting are BlockCore.h's, so the arithmetic the host
+  // model answers about is the arithmetic that decides which LBAs get a command. What stays here is the
+  // descriptor's own side: whether there is one at all, which way it points, and the copies it makes.
+  const bool served = buffer != nullptr &&
+                      (direction == kIODirectionIn || direction == kIODirectionOut);
+  const uint64_t bufferBytes = served ? buffer->getLength() : 0;
+  uint64_t accepted = 0;
+  const int admitted = blk_admit_request (served ? 1 : 0, block, nblks, bufferBytes, sectors, &accepted);
+  if (admitted == BLK_REQ_BUFFER) {
     status = kIOReturnNotWritable;
-  } else if (block >= sectors || nblks > sectors - block) {
+  } else if (admitted == BLK_REQ_RANGE) {
     status = kIOReturnBadArgument;
   } else {
-    UInt64 fitting = buffer->getLength() / kBlockBytes;
-    if (nblks > fitting) {
-      nblks = fitting;
-    }
+    nblks = accepted;
     // Round156: hand the card a run of blocks per call instead of one. The single-block
     // FIFO path costs a command, a response wait and a deadline check per 512 bytes;
     // dyld's shared cache is 3.7 GiB, so that overhead is most of what the read spends
@@ -830,76 +836,75 @@ IOReturn CloverBlockDevice::doAsyncReadWrite(IOMemoryDescriptor *buffer,
     if (batched) {
       IOLockLock(gBatchLock);
       while (done < nblks) {
-        uint32_t chunk = static_cast<uint32_t>(nblks - done);
-        if (chunk > kBatchBlocks) {
-          chunk = kBatchBlocks;
-        }
+        const uint32_t chunk = blk_next_chunk (nblks - done, kBatchBlocks);
         uint32_t cardBlock = windowFirst + static_cast<uint32_t>(block + done);
         const uint32_t bytes = chunk * kBlockBytes;
         if (direction == kIODirectionOut) {
-          if (buffer->readBytes(done * kBlockBytes, gBatchWords, bytes) != bytes) {
-            status = kIOReturnNoSpace;
-            break;
-          }
-          uint32_t written = clover_emmc_block_write(cardBlock, gBatchWords, chunk);
+          const uint32_t copied =
+              buffer->readBytes(done * kBlockBytes, gBatchWords, bytes) == bytes ? 1u : 0u;
+          const uint32_t written =
+              copied ? clover_emmc_block_write(cardBlock, gBatchWords, chunk) : 0u;
           __atomic_add_fetch(&gBlocksWritten, written, __ATOMIC_RELAXED);
-          if (written != chunk) {
-            // The card took `written` whole blocks before the command failed;
-            // those did reach the media, so they are the only part of this chunk
-            // that is done. The rest is left for the caller to retry.
-            done += written;
-            __atomic_add_fetch(&gWritesSinceFlush, written, __ATOMIC_RELAXED);
-            status = kIOReturnError;
+          const int delivered = blk_account_write (copied, written, chunk, &done);
+          if (delivered != BLK_DONE_ALL) {
+            // The card took `written` whole blocks before the command failed, and those did reach the
+            // media, so they are the only part of this chunk that is done and the only part that counts
+            // toward the next flush. The rest is the caller's to retry. Bytes that never reached staging
+            // deliver nothing at all, and the caller's error says which of the two happened.
+            if (delivered == BLK_DONE_PARTIAL) {
+              __atomic_add_fetch(&gWritesSinceFlush, written, __ATOMIC_RELAXED);
+            }
+            status = copied ? kIOReturnError : kIOReturnNoSpace;
             break;
           }
-          done += chunk;
           __atomic_add_fetch(&gWritesSinceFlush, chunk, __ATOMIC_RELAXED);
         } else {
-          uint32_t read = clover_emmc_block_read(cardBlock, gBatchWords, chunk);
+          const uint32_t read = clover_emmc_block_read(cardBlock, gBatchWords, chunk);
           __atomic_add_fetch(&gBlocksRead, read, __ATOMIC_RELAXED);
-          if (read != chunk) {
-            // Round157: none of these words reached the caller's buffer -- the
-            // read failed before writeBytes ran -- so r156's `done += read` told
-            // the completion that data had been delivered when it had not.
-            status = kIOReturnError;
+          // Round157's rule, now written once in blk_account_read: a short read delivers *nothing*,
+          // because none of these words reached the caller's buffer -- r156's `done += read` told a
+          // completion about data that had not arrived. A failed copy after a full read is the same.
+          const uint32_t copied =
+              read == chunk &&
+                      buffer->writeBytes(done * kBlockBytes, gBatchWords, bytes) == bytes ? 1u : 0u;
+          if (blk_account_read (read, copied, chunk, &done) != BLK_DONE_ALL) {
+            status = read == chunk ? kIOReturnNoSpace : kIOReturnError;
             break;
           }
-          if (buffer->writeBytes(done * kBlockBytes, gBatchWords, bytes) != bytes) {
-            // Same rule: a failed copy delivers no block of this chunk.
-            status = kIOReturnNoSpace;
-            break;
-          }
-          done += chunk;
         }
       }
       IOLockUnlock(gBatchLock);
     } else {
+      // The per-block fallback, for a boot that could not allocate the staging lock. Same core, a chunk
+      // of one: this is the slower path, not a second set of rules about what a delivery means.
       uint32_t words[kBlockWords];
-      for (; done < nblks; done++) {
-        // The caller's block numbers are relative to what this device claims, and the card's are
-        // absolute; the window's first LBA is the only difference between the two.
+      while (done < nblks) {
+        const uint32_t chunk = 1u;
         uint32_t cardBlock = windowFirst + static_cast<uint32_t>(block + done);
         if (direction == kIODirectionOut) {
-          if (buffer->readBytes(done * kBlockBytes, words, kBlockBytes) != kBlockBytes) {
-            status = kIOReturnNoSpace;
+          const uint32_t copied =
+              buffer->readBytes(done * kBlockBytes, words, kBlockBytes) == kBlockBytes ? 1u : 0u;
+          const uint32_t written = copied ? clover_emmc_block_write(cardBlock, words, chunk) : 0u;
+          __atomic_add_fetch(&gBlocksWritten, written, __ATOMIC_RELAXED);
+          const int delivered = blk_account_write (copied, written, chunk, &done);
+          if (delivered != BLK_DONE_ALL) {
+            if (delivered == BLK_DONE_PARTIAL) {
+              __atomic_add_fetch(&gWritesSinceFlush, written, __ATOMIC_RELAXED);
+            }
+            status = copied ? kIOReturnError : kIOReturnNoSpace;
             break;
           }
-          if (clover_emmc_block_write(cardBlock, words, 1) != 1) {
-            status = kIOReturnError;
-            break;
-          }
-          __atomic_add_fetch(&gBlocksWritten, 1u, __ATOMIC_RELAXED);
-          __atomic_add_fetch(&gWritesSinceFlush, 1u, __ATOMIC_RELAXED);
+          __atomic_add_fetch(&gWritesSinceFlush, chunk, __ATOMIC_RELAXED);
         } else {
-          if (clover_emmc_block_read(cardBlock, words, 1) != 1) {
-            status = kIOReturnError;
+          const uint32_t read = clover_emmc_block_read(cardBlock, words, chunk);
+          __atomic_add_fetch(&gBlocksRead, read, __ATOMIC_RELAXED);
+          const uint32_t copied =
+              read == chunk &&
+                      buffer->writeBytes(done * kBlockBytes, words, kBlockBytes) == kBlockBytes ? 1u : 0u;
+          if (blk_account_read (read, copied, chunk, &done) != BLK_DONE_ALL) {
+            status = read == chunk ? kIOReturnNoSpace : kIOReturnError;
             break;
           }
-          if (buffer->writeBytes(done * kBlockBytes, words, kBlockBytes) != kBlockBytes) {
-            status = kIOReturnNoSpace;
-            break;
-          }
-          __atomic_add_fetch(&gBlocksRead, 1u, __ATOMIC_RELAXED);
         }
       }
     }
@@ -993,13 +998,12 @@ __attribute__((noreturn)) static void fail(const char *step, uint64_t value)
 
 static uint32_t le32At(const uint8_t *at)
 {
-  return static_cast<uint32_t>(at[0]) | (static_cast<uint32_t>(at[1]) << 8) |
-         (static_cast<uint32_t>(at[2]) << 16) | (static_cast<uint32_t>(at[3]) << 24);
+  return blk_le32 (at);
 }
 
 static uint64_t le64At(const uint8_t *at)
 {
-  return static_cast<uint64_t>(le32At(at)) | (static_cast<uint64_t>(le32At(at + 4)) << 32);
+  return blk_le64 (at);
 }
 
 // A registry string, or nothing. Same wrapper every other property read in this file uses -- the
@@ -1039,21 +1043,53 @@ static uint32_t fnv1a(const char *text)
 
 // One entry's declared identity. The bytes stay in gRootManifest for the life of the boot, so this is
 // a copy of the three fields the manifest digest has to name exactly, not a pointer into the window.
-static void rememberEntry(ManifestEntry *slot, const uint8_t *entry)
+static void rememberEntry(ManifestEntry *slot, const blk_entry *row)
 {
-  memcpy(slot->sha256, entry + 56, sizeof(slot->sha256));
-  slot->offset = le64At(entry + 32);
-  slot->size = le64At(entry + 40);
+  for (uint32_t index = 0; index < sizeof(slot->sha256); index++) {
+    slot->sha256[index] = row->digest[index];
+  }
+  slot->offset = row->offset;
+  slot->size = row->size;
+}
+
+// The panic step a manifest refusal becomes. One code plus the window it was refused in is the whole
+// input, and this table is the frame's vocabulary: round128 could only separate "nothing was flashed"
+// from "a different release's manifest" from "this partition is not the one the image was sized for"
+// because each got its own tag. A new code in BlockCore.h has to be added here -- the default branch is
+// what says so, and it prints the code it could not name instead of dying silently.
+static const char *manifestStep(int code, int window)
+{
+  switch (code) {
+    case BLK_E_MAGIC: return "root-magic";
+    case BLK_E_VERSION: return "root-version";
+    case BLK_E_COUNT: return "root-count";
+    case BLK_E_ATTR:
+      return window == BLK_W_SYSTEM ? "system-attr"
+                                    : window == BLK_W_DATA ? "data-attr" : "root-attr";
+    case BLK_E_BOUNDS:
+      return window == BLK_W_SYSTEM ? "system-bounds"
+                                    : window == BLK_W_DATA ? "data-bounds" : "root-bounds";
+    case BLK_E_GEOMETRY:
+      return window == BLK_W_SYSTEM ? "system-geometry"
+                                    : window == BLK_W_DATA ? "data-geometry" : "root-geometry";
+    case BLK_E_NAME: return "root-name";
+    case BLK_E_SYSTEM: return "systemwin";
+    case BLK_E_DATA: return "datawin";
+    default: return nullptr;
+  }
 }
 
 // Latch the media to the windows inside the flashed root image. Everything the manifest holds is
 // bytes and names, and each refusal is its own panic step, so a photograph can tell "nothing was
 // flashed" (magic) from "a different release's manifest" (version) from "this partition is not the
-// one the image was sized for" (bounds). The windows are published relative to the card: the offset
-// in the manifest is relative to the start of userdata, and drivers/CloverSdhci's own read path only
-// takes card LBAs. Round143 reads both entries in one pass: the OS window is what root-matching
-// hands the kernel, and the SystemOS window is the cryptex volume the union mount on "/" needs.
-// Round159 adds the third: Data, the only window whose entry must not claim write protection.
+// one the image was sized for" (bounds). The walk over those bytes is BlockCore.h's -- see
+// blk_parse_manifest -- and what is left here is the three things that cannot be answered on a host:
+// the read that fills the span, the card's own sector count the windows are bounded against, and the
+// release stores that publish a window to the rest of the boot. The windows are published relative to
+// the card: the offset in the manifest is relative to the start of userdata, and drivers/CloverSdhci's
+// own read path only takes card LBAs. Round143 reads both entries in one pass: the OS window is what
+// root-matching hands the kernel, and the SystemOS window is the cryptex volume the union mount on "/"
+// needs. Round159 adds the third: Data, the only window whose entry must not claim write protection.
 static void windowsFromManifest(uint32_t partitionFirst, uint32_t partitionSectors,
                                 bool requireSystem, bool requireData)
 {
@@ -1061,75 +1097,44 @@ static void windowsFromManifest(uint32_t partitionFirst, uint32_t partitionSecto
   if (got != kRootManifestBlocks) {
     fail("root-read", got);
   }
-  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(gRootManifest);
-  if (memcmp(bytes, kRootMagic, sizeof(kRootMagic)) != 0) {
-    fail("root-magic", le32At(bytes));
-  }
-  const uint32_t version = le32At(bytes + 8);
-  const uint32_t count = le32At(bytes + 12);
-  if (version != 1) {
-    fail("root-version", version);
-  }
-  if (!count || count > 4) {
-    fail("root-count", count);
-  }
-  const uint64_t partitionBytes = static_cast<uint64_t>(partitionSectors) * kBlockBytes;
-  bool rootFound = false;
-  bool systemFound = false;
-  bool dataFound = false;
-  for (uint32_t index = 0; index < count; index++) {
-    const uint8_t *entry = bytes + 24 + 128 * index;
-    const bool root = memcmp(entry, kRootWindowName, sizeof(kRootWindowName)) == 0;
-    const bool system = memcmp(entry, kSystemWindowName, sizeof(kSystemWindowName)) == 0;
-    const bool data = memcmp(entry, kDataWindowName, sizeof(kDataWindowName)) == 0;
-    if (!root && !system && !data) {
-      continue;
+  const blk_card card = { partitionFirst, partitionSectors, clover_emmc_block_sectors () };
+  const blk_names names = { kRootWindowName, sizeof (kRootWindowName),
+                            kSystemWindowName, sizeof (kSystemWindowName),
+                            kDataWindowName, sizeof (kDataWindowName) };
+  blk_windows windows;
+  int window = BLK_W_OS;
+  uint64_t bad = 0;
+  const int code = blk_parse_manifest (reinterpret_cast<const uint8_t *> (gRootManifest),
+                                       kRootManifestBytes, &card, &names,
+                                       requireSystem ? 1 : 0, requireData ? 1 : 0,
+                                       &windows, &window, &bad);
+  if (code != BLK_OK) {
+    const char *step = manifestStep (code, window);
+    if (!step) {
+      panic ("CloverBlock r137: root-code %d window %d", code, window);
     }
-    // Both sealed windows are read-only images and say so in their entries. Data is the first window
-    // the owner mount attaches for writing: a read-only entry there would mount, then fail at the
-    // first write, so the manifest is refused here instead -- with its own tag.
-    const uint32_t expectFlags = data ? 0u : 1u;
-    const uint64_t offset = le64At(entry + 32);
-    const uint64_t size = le64At(entry + 40);
-    if (le32At(entry + 48) != kBlockBytes || le32At(entry + 52) != expectFlags) {
-      fail(root ? "root-attr" : system ? "system-attr" : "data-attr", index);
-    }
-    if (offset < kRootManifestBytes || (offset % kBlockBytes) || size < kBlockBytes ||
-        (size % kBlockBytes) || offset > partitionBytes || size > partitionBytes - offset) {
-      fail(root ? "root-bounds" : system ? "system-bounds" : "data-bounds", offset);
-    }
-    const uint64_t first = partitionFirst + offset / kBlockBytes;
-    const uint64_t sectors = size / kBlockBytes;
-    if (sectors > UINT32_MAX || first > UINT32_MAX || first + sectors >
-        static_cast<uint64_t>(clover_emmc_block_sectors())) {
-      fail(root ? "root-geometry" : system ? "system-geometry" : "data-geometry", sectors);
-    }
-    // The entry copy happens-before the release stores of its window below, so a reader that
-    // acquires the window's sector count also sees the declared offset, size and digest.
-    rememberEntry(root ? &gOsEntry : system ? &gSystemEntry : &gDataEntry, entry);
-    if (root) {
-      __atomic_store_n(&gWindowFirst, static_cast<uint32_t>(first), __ATOMIC_RELEASE);
-      __atomic_store_n(&gWindowSectors, static_cast<uint32_t>(sectors), __ATOMIC_RELEASE);
-      rootFound = true;
-    } else if (system) {
-      __atomic_store_n(&gSystemWindowFirst, static_cast<uint32_t>(first), __ATOMIC_RELEASE);
-      __atomic_store_n(&gSystemWindowSectors, static_cast<uint32_t>(sectors), __ATOMIC_RELEASE);
-      systemFound = true;
-    } else {
-      __atomic_store_n(&gDataWindowFirst, static_cast<uint32_t>(first), __ATOMIC_RELEASE);
-      __atomic_store_n(&gDataWindowSectors, static_cast<uint32_t>(sectors), __ATOMIC_RELEASE);
-      dataFound = true;
-    }
-    // Keep looking for the other entries; the manifest has one of each and any order is valid.
+    fail (step, bad);
   }
-  if (!rootFound) {
-    fail("root-name", count);
+  // The entry copies happen-before the release stores of their windows below, so a reader that acquires
+  // a window's sector count also sees the declared offset, size and digest. Publishing all three after
+  // the whole table was walked is one step stronger than the loop that used to publish each window as it
+  // matched: no other CPU can now see a window whose manifest was not read to the end. Nothing reads
+  // these during the walk -- clover_block_run publishes a media only after this returns -- so the order
+  // is a tightening, not a change.
+  if (windows.have_os) {
+    rememberEntry(&gOsEntry, &windows.os_entry);
+    __atomic_store_n(&gWindowFirst, windows.os_first, __ATOMIC_RELEASE);
+    __atomic_store_n(&gWindowSectors, windows.os_sectors, __ATOMIC_RELEASE);
   }
-  if (requireSystem && !systemFound) {
-    fail("systemwin", count);
+  if (windows.have_system) {
+    rememberEntry(&gSystemEntry, &windows.system_entry);
+    __atomic_store_n(&gSystemWindowFirst, windows.system_first, __ATOMIC_RELEASE);
+    __atomic_store_n(&gSystemWindowSectors, windows.system_sectors, __ATOMIC_RELEASE);
   }
-  if (requireData && !dataFound) {
-    fail("datawin", count);
+  if (windows.have_data) {
+    rememberEntry(&gDataEntry, &windows.data_entry);
+    __atomic_store_n(&gDataWindowFirst, windows.data_first, __ATOMIC_RELEASE);
+    __atomic_store_n(&gDataWindowSectors, windows.data_sectors, __ATOMIC_RELEASE);
   }
 }
 

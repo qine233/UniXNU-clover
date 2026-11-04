@@ -31,7 +31,7 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 | 驱动 | 这一格负责 | 接线（`board.toml` 行） | 文档现状：类形状 / personality / README+引用 / 宿主模型 / plist | 最新真机读数 | 下一步 | 阻塞于 |
 | --- | --- | --- | --- | --- | --- | --- |
 | **CloverSdhci** | eMMC 通路 + 卡上日志环（读数的唯一通道） | archives `:69`；`clover-emmc=21` `:1968` | ✗ / ✗（已说明）/ ✓ / ✗ / ✗（已说明） | 两个环落 logdump（kind-21 判据 64 槽、kind-22 内核日志 512 槽）；boot 102 最后一条 block 记录 `comm=chronod` 与 panic marker 同毫秒 | 把 completion 判据、环算术、tee 配额抽成纯函数配宿主模型 | 无（能用，缺的是测试不是硬件） |
-| **CloverBlock** | 把真 GPT 盘交给 IOKit，挂 OS/Data 卷 | archives `:70`；`clover-apfs=3` `:1967` | ✗（用现成类）/ ✗（已说明）/ ✓ / ✗ / ✗（已说明） | OS 卷挂上且 owner 审计放行；Data 卷 `ENOSPC` 消失 | 同上（纯层分离 + 宿主模型） | 无 |
+| **CloverBlock** | 把真 GPT 盘交给 IOKit，挂 OS/Data 卷 | archives `:70`；`clover-apfs=3` `:1967` | ✗（用现成类）/ ✗（已说明）/ ✓ / **✓**（`BlockCore.h` + `test-clover-block.py` PASS）/ ✗（已说明） | OS 卷挂上且 owner 审计放行；Data 卷 `ENOSPC` 消失 | 用真机验这块纯层：boot 103 的 `boot os=/system=/data=` 三对 LBA 要和 r316 模型的走查同形 | 无 |
 | **CloverPMGR** | 开机链的调度点（所有仪器从它后面起跑）+ 发布 `ApplePMGRNub` | archives `:68`；`clover-pmgr=2` `:1261` | ✓（`OSDefineMetaClassWithInit`，父类按名运行期解析）/ ✗ / ✓ / ✗ / ✓ | 每靴都在；`No PMGR?` 自 r83 起消失 | 让它做第一颗真走 personality 的驱动 | ADT 没有 provider 节点（conformance §5 前提 1） |
 | **ArmCpu** | CPU、时钟、SMP、看门狗、无人值守死线 | archives `:62`；`armcpu-timer-intid=19` `:1242`、`armcpu-smp=1` `:1256`、`armcpu-self-ipi=1` `:1257`、`clover-unattended=1800` `:2597` | ✓ / ✓（基仓 patch）/ ✓ / — / ✓（覆写基仓模块的四件套齐全） | boot 88–102 十二靴逐字段复现八核上线：`real=8 max=8 reg=8 start=7 run=8`，IPI `sent/recv` 差约百；boot 100 是 `armcpu-smp=0` 控制轮 | 无（这一格已够；复位时机那一坎已证明不属核数） | 无 |
 | **NativeMobileDisplay** | legacy display / GOP 出帧（屏幕那一步） | archives `:67`；`offline-legacy-*` `:2280-2287` | ✓ / ✗（已说明）/ ✓ / — / ✗（基仓也没有） | 原生 `IOMobileFramebufferLegacy` 已链接并构造到 phase 1；r206 第一次 present 成功 | 桌面欠的「画面本身」在这一格，仍 CPU-first | 帧内容不由这颗驱动产生，属主线 |
@@ -83,7 +83,7 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 | 事项 | 现状 | 出处 |
 | --- | --- | --- |
 | 第一颗真走 personality 的驱动 | 三个前提各欠一件：ADT 发布节点、顺序怎么表达、归档补 force_load | conformance §5、§7 未结 1 |
-| `CloverInput` / `CloverGpu` / `CloverBlock` 的纯层分离与宿主模型 | 无宿主模型；范例第 1、3 条是本仓最重的真缺口 | conformance §6、§7 未结 3 |
+| `CloverInput` / `CloverGpu` 的纯层分离与宿主模型 | `CloverBlock` 已在 r316 交出第一颗（`BlockCore.h` + 15 组模型）；剩这两颗，范例第 1、3 条不再是最重的缺口 | conformance §6、§7 未结 3 |
 | 固件那一层的文档对照 | `docs/drivers/uefi-drivers.md:7-13` 在 `uefi-clover`，同一套办法搬过去即可 | conformance §7 未结 4 |
 | payload 容器不逐字节可复现 | ADT 的 `/chosen/random-seed` 每次重抽（内核本身可复现） | dev-log §Round177 |
 | 构建顺序反着 | `unixnu` 先跑 archives 再跑 XNU，身份戳会删掉 object 让 `nm` 失败；r186 起用一次性 object 预 pass 绕过，没有修 | dev-log §Round186 |
@@ -157,12 +157,12 @@ scripts/run-clover-unattended.sh --out ~/clover-out/roundNNN-log-window.bin \
 
 ## 闸门
 
-| 闸门 | 查什么 | 跑在哪 | r314 实跑 |
+| 闸门 | 查什么 | 跑在哪 | r316 实跑 |
 | --- | --- | --- | --- |
-| `scripts/check-clover.py` | 板级预检 + ADT/DT 常量 + 补丁与探针形状 + 驱动宿主模型 | 仓库 | EXIT=0，`drivers documented: 11`，12 条 notice 全指向未构建的产物 |
-| 同一脚本的产物那一半 | 12 枚归档逐枚走对象、核 `docs/drivers/xnu-drivers.md:106-116` 那五个字段、再到链接好的内核里验每颗驱动的导出符号 | **必须在 `out/clover/tree` 里跑** | EXIT=0，`12 archives, 22 objects ABI-checked, kernel read` |
-| 同一脚本的文档那一半 | 有源码的 `drivers/*` 必须有 README；README 必须有一段点名文档并至少引一枚**能落地**的 `docs/**.md:行号`；没有 `Info.plist` 的必须说出理由；禁止「本仓 `.cpp`:数字」这种形状 | 仓库即可 | 负向测过：CPU type 改 `0x1000007`、filetype 改 2、换假符号名都报错，带路径的厂商引用不误报 |
-| `scripts/verify-clover-payload.py` | 归档对镜像：卷内形状 + 逐轮探针断言（含标题必须带双引号，那是 boots 35/36 的转义防线） | 仓库 | EXIT=0，50 行 OK、0 FAIL |
+| `scripts/check-clover.py` | 板级预检 + ADT/DT 常量 + 补丁与探针形状 + 驱动宿主模型 | 仓库 | EXIT=0，`drivers documented: 11, base-repo drivers exempt: 0`，12 条 notice 全指向未构建的产物；`test-clover-block.py` 被这道闸门**跑**而不只是断言存在 |
+| 同一脚本的产物那一半 | 12 枚归档逐枚走对象、核 `docs/drivers/xnu-drivers.md:106-116` 那五个字段、再到链接好的内核里验每颗驱动的导出符号 | **必须在 `out/clover/tree` 里跑** | EXIT=0，`12 archives, 22 objects ABI-checked, kernel read`；`exempt: 11` ——组装树把基仓的 11 颗 `drivers/*`  symlink 进来，r316 起文档闸门只判本仓 authored 的那些 |
+| 同一脚本的文档那一半 | 有源码的 `drivers/*` 必须有 README；README 必须有一段点名文档并至少引一枚**能落地**的 `docs/**.md:行号`；没有 `Info.plist` 的必须说出理由；禁止「本仓 `.cpp`:数字」这种形状 | 仓库即可 | 负向测过：CPU type 改 `0x1000007`、filetype 改 2、换假符号名都报错，带路径的厂商引用不误报；r316 新暴露的一条：本仓 `.cpp` 引用被 `BlockCore.h` 取代，README 改用符号锚点 |
+| `scripts/verify-clover-payload.py` | 归档对镜像：卷内形状 + 逐轮探针断言（含标题必须带双引号，那是 boots 35/36 的转义防线） | 仓库 | EXIT=0，48 行 OK、0 FAIL；`SHNGROOT` 那一枚针脚换成了走查的拒绝标签——优化器把八枚 ASCII 折进立即数，镜像里没有那串字了 |
 | `scripts/verify-userdata-window.py` | 刷 userdata 前的宿主闸门 | 仓库 | 本轮未涉及 |
 
 产物缺席只发 notice，**不会静默通过**——那一格要抓的正是无 `force_load` 链接下「成员安静消失」

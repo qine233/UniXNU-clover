@@ -5993,8 +5993,14 @@ def check_board(errors: list) -> str:
         if "done += read;" in text:
             errors.append("CloverBlock counts blocks the failed card read never delivered: the "
                           "completion would claim bytes that never reached the caller")
-        if "done += written;" not in text:
-            errors.append("CloverBlock lost the count of whole blocks a failed write did commit")
+        if "blk_account_write (" not in text or "blk_account_read (" not in text:
+            errors.append("CloverBlock no longer asks BlockCore.h what a command delivered: the count "
+                          "of whole blocks a failed write did commit, and the rule that a short read "
+                          "commits none, are one function each and both live in the pure layer")
+        core = REPO / "drivers/CloverBlock/BlockCore.h"
+        if core.is_file() and "*done += delivered;" not in core.read_text():
+            errors.append("BlockCore.h lost the partial-write count: a chunk the card took only part of "
+                          "would report none of it committed, which is round157's bug back again")
 
     # Round159. The user's request for this round was two-part -- finish the eMMC driver,
     # then mount the Data volume -- and both halves fail silently when a step is skipped,
@@ -6048,7 +6054,6 @@ def check_board(errors: list) -> str:
                     "static ManifestEntry gDataEntry;",
                     "static volatile uint32_t gDataWindowFirst = 0;",
                     "static volatile uint32_t gDataWindowSectors = 0;",
-                    "const uint32_t expectFlags = data ? 0u : 1u;",
                     "windowsFromManifest(first, sectors, apfs == 3, apfs == 3);",
                     "static IOMedia *publishDataVolume(void)",
                     "IOMedia *media = publishDataVolume();",
@@ -6069,10 +6074,83 @@ def check_board(errors: list) -> str:
             if tag not in text:
                 errors.append(f"CloverBlock has no {tag!r} verdict: a malformed {tag[:-1]} entry "
                               "would be published instead of named")
-        if "rememberEntry(root ? &gOsEntry : system ? &gSystemEntry : &gDataEntry, entry);" not in text:
+        if "rememberEntry(&gDataEntry, &windows.data_entry);" not in text:
             errors.append("CloverBlock does not keep the Data entry's offset/size/sha256: the "
                           "manifest digest and native_ram_block_volume_seed() would describe "
                           "different extents")
+
+        # Round316. The manifest walk and the request arithmetic moved into BlockCore.h so that a host
+        # model could answer them; the pins follow the code, not the file. What is asserted is (a) that
+        # every decision still exists, one clause each, (b) that the driver *calls* each of them, and
+        # (c) that no second copy survived in the driver -- a second copy is the failure mode of a split
+        # like this one, because the board would then run arithmetic the model never proved.
+        core = REPO / "drivers/CloverBlock/BlockCore.h"
+        if not core.is_file():
+            errors.append("drivers/CloverBlock/BlockCore.h is missing: the decode that turns a "
+                          "manifest row into a card LBA would be provable only on a card, and every "
+                          "filesystem above it would be reading bytes nobody checked")
+        else:
+            core_text = core.read_text()
+            missing = [needle for needle in
+                       ("if (!blk_has_root_magic (bytes)) {",
+                        "if (version != kBlkVersion) {",
+                        "count > kBlkRowsMax",
+                        "static_cast<uint64_t> (count) * kBlkRowStride > nbytes",
+                        "blk_le32 (row + kBlkRowBlockSizeAt) != kBlkBytes",
+                        "const uint32_t expect_flags = which == BLK_W_DATA ? kBlkFlagWritable : "
+                        "kBlkFlagReadOnly;",
+                        "offset < kBlkSpanBytes",
+                        "size > partition_bytes - offset",
+                        "first + sectors > card->card_sectors",
+                        "block >= sectors || nblks > sectors - block",
+                        "*done += delivered;",
+                        "if (delivered != chunk || !copied) {",
+                        "first + count > window_first",
+                        "*max_block = static_cast<uint64_t> (sectors) - 1;")
+                       if needle not in core_text]
+            for needle in missing:
+                errors.append(f"drivers/CloverBlock/BlockCore.h lacks {needle!r}: this is a bound or an "
+                              "identity decision the host model proves and the board cannot -- a window "
+                              "off by one row is a filesystem mounted over bytes that belong to "
+                              "something else")
+            for needle in ("blk_parse_manifest (", "blk_admit_request (", "blk_next_chunk (",
+                           "blk_account_write (", "blk_account_read (", "blk_overlaps (",
+                           "blk_last_block ("):
+                if needle not in text:
+                    errors.append(f"drivers/CloverBlock/CloverBlock.cpp does not call {needle!r}: the "
+                                  "pure layer would be dead code the model passes and the kernel ignores")
+            for gone in ("offset < kRootManifestBytes", "nblks > sectors - block",
+                         "chunk > kBatchBlocks", "first + count > windowFirst"):
+                if gone in text:
+                    errors.append(f"drivers/CloverBlock/CloverBlock.cpp still carries a second copy of "
+                                  f"{gone!r}: the shipped path and the modelled path would be two "
+                                  "answers to one question")
+            harness = REPO / "drivers/CloverBlock/tests/clover_block_host.cpp"
+            runner = next((base / "scripts/test-clover-block.py"
+                           for base in (REPO, pathlib.Path.cwd())
+                           if (base / "scripts/test-clover-block.py").is_file()), None)
+            if runner is None:
+                errors.append("scripts/test-clover-block.py is missing: the manifest walk and the "
+                              "delivery counts would be proven only on a card that cannot be un-broken")
+            elif not harness.is_file():
+                errors.append("drivers/CloverBlock/tests/clover_block_host.cpp is missing: the host "
+                              "model has nothing to drive BlockCore.h against")
+            else:
+                model = harness.read_text()
+                for needle in ("BLK_E_MAGIC", "BLK_E_VERSION", "BLK_E_COUNT", "BLK_E_ATTR",
+                               "BLK_E_BOUNDS", "BLK_E_GEOMETRY", "BLK_E_NAME", "BLK_E_SYSTEM",
+                               "BLK_E_DATA", "BLK_REQ_BUFFER", "BLK_REQ_RANGE", "BLK_DONE_PARTIAL",
+                               "BLK_DONE_NONE"):
+                    if f"== {needle}" not in model:
+                        errors.append(f"the CloverBlock host model never asserts {needle}: a refusal the "
+                                      "board can only reach by panicking is a refusal nobody has seen "
+                                      "fire, which is how round128's single tag lost three findings")
+                check = subprocess.run([sys.executable, str(runner)], capture_output=True, text=True)
+                if check.returncode:
+                    errors.append("the CloverBlock host model failed: the row walk, a bound, the "
+                                  "delivery counts or the log-window overlap is not what this boot's "
+                                  "report will claim it is\n"
+                                  + (check.stdout + check.stderr)[-700:])
 
     append = REPO / "scripts/append-data-window.py"
     if not append.is_file():
@@ -6173,8 +6251,8 @@ def check_board(errors: list) -> str:
     # function of the arbiter's own version word, and that driver has never been in a boot whose title
     # named it, because clover-power has always been commented out. Its new lines are stamped r313 and
     # the round182 lines keep their origin stamp, which is the reason the tee now budgets both tokens.
-    if not board["payload"]["title"].startswith("clover r314:"):
-        errors.append('[payload] title is not "clover r314: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r316:"):
+        errors.append('[payload] title is not "clover r316: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7319,8 +7397,8 @@ def check_board(errors: list) -> str:
     # the bring-up stops switching the cache on. The r171 line stays (it is the reading that says
     # ctrl=0/on=0), the flush body stays live for a card that ships with the cache already on, and
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
-    if not board["payload"]["title"].startswith("clover r314:"):
-        errors.append('[payload] title is not "clover r314: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r316:"):
+        errors.append('[payload] title is not "clover r316: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -8265,6 +8343,25 @@ def driver_docs_root() -> pathlib.Path | None:
     return None
 
 
+def base_repo_root() -> pathlib.Path | None:
+    """The upstream UniXNU checkout, when this host has one and it is not the repository at hand.
+
+    Round316 measured why the rule needs this: `configs` assembly symlinks the whole driver tree, so
+    `out/clover/tree/drivers/NativeVirtioConsole -> <base>/drivers/NativeVirtioConsole` appears among
+    `drivers/*` of the tree this checker is run from, and clause 一/二/三 -- written to police drivers
+    *this* repository authors -- failed on code it neither owns nor can edit.  The same exemption the
+    `check_tree()` notice already grants `drivers/DarwinBoot` is what that situation needs, expressed
+    as a path property rather than a name list so a base driver never gets a free pass on a rule it
+    genuinely implements badly elsewhere.
+    """
+    here = REPO.resolve()
+    for candidate in (REPO.parent / "UniXNU", pathlib.Path.home() / "UniXNU"):
+        resolved = candidate.resolve() if candidate.exists() else None
+        if resolved is not None and resolved != here and (resolved / "drivers").is_dir():
+            return resolved
+    return None
+
+
 def own_source_basenames() -> set:
     """Basenames of the C++ files this repository edits, which is what §8 of the note forbids
     citing by line number.  Vendored sources keep their line numbers: they do not move under us."""
@@ -8298,8 +8395,13 @@ def check_driver_documentation(errors: list) -> str:
                                for path in patches.glob("**/*.patch"))
     line_counts: dict = {}
     checked = 0
+    base = base_repo_root()
+    vendored = []
     for directory in sorted((REPO / "drivers").glob("*/")):
         name = directory.name
+        if base is not None and base in directory.resolve().parents:
+            vendored.append(name)
+            continue
         sources = list(directory.glob("*.cpp"))
         if not sources:
             continue
@@ -8360,7 +8462,12 @@ def check_driver_documentation(errors: list) -> str:
     if docs is None:
         print("[check-clover] notice: the base repository's docs/ tree is not visible from here, so "
               "clause citations were counted but not resolved against their files", file=sys.stderr)
-    return f"drivers documented: {checked}"
+    if vendored:
+        print(f"[check-clover] notice: {len(vendored)} drivers/* entries "
+              f"({', '.join(sorted(vendored))}) resolve into {base}, the base repository: this "
+              "documentation rule judges the drivers this repository authors, and those come from "
+              "the tree assembly", file=sys.stderr)
+    return f"drivers documented: {checked}, base-repo drivers exempt: {len(vendored)}"
 
 
 # The product half of the same rule.  Every builder in this repository already refuses an object
