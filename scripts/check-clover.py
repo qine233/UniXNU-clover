@@ -3070,6 +3070,40 @@ def check_board(errors: list) -> str:
             errors.append("drivers/CloverSdhci has no specific class for the arm line: the round shares one "
                           "prefix between two producers, and a generic budget lets the beat rows eat the arm")
 
+        # Round325 keeps round324's arm exactly as boot 110 read it and moves the debt row off the beat. The
+        # archive said "the target never latched"; boot 110's own card says otherwise -- r309's latch row is at
+        # t=603 and the census fire at 607, and the next 120 s beat was due at 667 in a boot that ended near
+        # 612. So the cadence, not the gate, was the defect, and the row now prints where the hops are walked.
+        # The gate asserts the copy is on the relay (the channel boot 110 proved survives that window) and that
+        # it carries every hop's owner, because hop 0 alone is the reading that was already latched.
+        r325_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r325.patch")),
+                         default=None)
+        if r325_patch is None or not r325_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r325.patch is missing: the fire-time debt row is this "
+                          "round's only hand, and an instrument nobody shipped is a reading nobody can take")
+        else:
+            r325_text = r325_patch.read_text()
+            for now in ('"clover r325: bbnow t=%llu pid=%d fired=%u hn=%u rem=%x set=%u state=%s"',
+                        'char hopown[4][24]',
+                        'strlcpy(hopown[i], rmo[0] ? rmo : "-", sizeof(hopown[i]));',
+                        'o0=%s o1=%s o2=%s o3=%s'):
+                if now not in r325_text:
+                    errors.append(f"the r325 kernel patch lacks {now[:56]!r}: without the per-hop names and "
+                                  "the chain columns the row repeats round324's hop-0 latch instead of "
+                                  "delivering the burst's own reading")
+            if 'clover_emmc_probe_say(now' not in r325_text:
+                errors.append("the r325 row prints to the console but is never sealed on the driver relay: the "
+                              "relay is the leg boot 110 showed arriving inside the window that killed the "
+                              "beat, so a printf-only copy is the instrument defect this round exists to fix")
+        if '{ "clover r325: bbnow", "r325-bbnow", 32, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the fire-time debt row: a row printed inside "
+                          "the census burst competes with that burst for the per-pass cap, and boot 36 "
+                          "measured what that looks like -- a truncated burst reads as an empty one")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r325-bbnow")' not in sdhci_source:
+            errors.append("the r325 debt row is not exempt from the per-pass cap: the relay copy does not ride "
+                          "the cap, so a console copy the cap ate silently breaks the two-copy control this "
+                          "round's reading depends on")
+
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
         # its own ending, so a silent boot leaves the boot before it on the card and the reader called
@@ -6640,8 +6674,8 @@ def check_board(errors: list) -> str:
     # kernel and added ephemeral-storage; boot 108 read it back and the stall only moved (migration ->
     # chronod), and sheng boots to the desktop without it, so round322 reverts the ADT again: same
     # kernel, ephemeral-storage ABSENT so first-boot migration runs -- the menu names round322.
-    if not board["payload"]["title"].startswith("clover r324:"):
-        errors.append('[payload] title is not "clover r324: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r325:"):
+        errors.append('[payload] title is not "clover r325: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7788,8 +7822,8 @@ def check_board(errors: list) -> str:
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r324:"):
-        errors.append('[payload] title is not "clover r324: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r325:"):
+        errors.append('[payload] title is not "clover r325: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

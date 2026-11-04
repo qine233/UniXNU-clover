@@ -26082,3 +26082,38 @@ boot 108 冷刷并读回了 r320（v0.7.33，`1b47270b…`）。产物 `~/clover
 **③ 桌面主线（#666）：backboardd 这一格没解开，还更深。** boot 110 停点 ~612 s，`r229 bb pid=58 hops=4`（boot 109 hops=2）；`r262 census pid=58 threads=19 wait=18 run=1`。守护进程还在 churn（bluetoothd/fairplayd `r309 exit`、apfs trim），没进桌面。仍 CPU-first。**停轮条件未满足。**
 
 **④ 落盘状态。** 无新镜像（本轮是 r324 的读回，版本停在已发的 **v0.7.35**）；读数产物 `~/clover-out/clover-log-window-boot110.bin(.txt)`。下一轮 r325＝修手2（把逐拍债主闸打开到 pid 58），会产新镜像、发版。手1 的读回通道已确认对「挂死」成立，r325 沿用同一枚上膛。
+
+## Round325（v0.7.36）：把 hop 属主从「等下一拍」改成「算出来那一刻就中转」——并改正 round324 落在自己档案里的那句根因
+
+**① 本轮要量的物理量**：backboardd（pid 58）那笔阻塞的**债主名字**，在**产生它的那一步**就送到卡上，不经任何时钟。
+
+**② 先改正上一轮写错的根因。** §Round324 读数② 把手2 的失败记成「逐拍采样线程整靴没把 `clover_bb_target_pid` 闩到 58、`if (clover_bb_target_pid != 0)` 从没执行」。逐条重看 boot 110 的窗口，**这句话反了**：
+- 闸**开过**——`clover r309: latch t=603 pid=58 name=2e03` 就在卡上（它是只走中转的 kind-25 行），而 `clover r229: bb t=607 pid=58 ... hops=4` 是同一次 fire 的产物 ⇒ `clover_bb_target_pid` 在 **t=603** 已经等于 58。
+- 那靴的 `clover r308: beat` 只有 **t=181 / 301 / 421 / 547** 四枚（外加上一靴残留的 1693），四枚都 `target=0` 是**因为闩锁还没开**，不是因为闩锁永不发生；下一枚按 120 s 节拍排在 **667**，而板子 ~612 已经没了。
+- 所以真正的缺陷是 **判据的周期（120 s）慢过它要判的事件（闩锁到停摆之间那 ~9 s）**——正是 r324 自己在同一段里引的第十三层那句话。把「一次 burst 的行」搬到「一次 beat 的行」没有解决周期问题，只是换了一个更慢的时钟。
+
+**③ 手（本轮唯一一刀，§Round324 读数② 预登记的 (乙) 条）。** `patches/xnu-clover/zzzz…zzz-clover-r325.patch`（68 枚 z，排在 r324 之后），osfmk/kern/task.c，两枚 hunk：
+- `clover_bb_sample()` 的帧里加 `char hopown[4][24] = { { '\0' } };`，在 r233/r234 已经算出每跳属主名的那一步（`rmo` 落地处）逐跳抄进去——**不新增任何一次端口查询**，只是把已经读到的名字留在同一个帧里。
+- hop 循环走完后（`r232` 的队列复读之前）**先 `clover_emmc_probe_say()` 再 printf** 一枚 `clover r325: bbnow t=%llu pid=%d fired=%u hn=%u rem=%x set=%u state=%s o0=%s o1=%s o2=%s o3=%s`：整条链一次一行，而不只是 hop 0。
+- 缺席读法分三态（第十四层沿用 r308 那条活下来的通道）：`state=no_hop`＝walk 跑了、backboardd 当下没有阻塞的发送（读数）；`hop_owner`＋`o0=`＝债本身；`hop_unresolved`＝有跳、这一拍没解出属主。`fired=` 在 13766 自增之后读，故 `fired>0` 与 `hn=0` 可分。
+- 一次 fire 一行、fire 受 r230 的变化闸与 `clover_bb_fired>=96` 的上限双重约束（boot 110 整靴只 fire 一次），所以预算不是猜的。
+- r324 的 beat 行、`clover-wdt-arm=1` 的上膛与 boot 109/110 可比性**逐字不动**：本轮是加一条腿，不是换一条腿。
+
+**④ 驱动与契约。** `drivers/CloverSdhci/CloverSdhci.cpp`：新 tee 类 `{ "clover r325: bbnow", "r325-bbnow", 32, 0, 0, 0 }`，并把 `r325-bbnow` 加进每拍 16 行的上限豁免（r249/r281 的理由：它印在普查同一个 pass 里，被上限吃掉的那半条会读成「这靴什么都没算出来」；中转那份不吃上限，两份互相对照正是本轮读数的成立条件）。`scripts/check-clover.py` 钉：r325 补丁在盘上、格式串、`char hopown[4][24]`、`strlcpy(hopown[i]...)`、`o0=%s o1=%s o2=%s o3=%s` 四列、**`clover_emmc_probe_say(now` 必须在**（否则退化成 printf-only，正是 boot 110 证明会丢的那条腿）、tee 类行、豁免行；`scripts/verify-clover-payload.py` 钉内核里整枚 CString；两处 `title` 断言与 `board.toml` 标题升到 r325。
+
+**⑤ 构建、闸门与两条当场抓到的坑。**
+- 第一次内核构建两连红：`ModuleNotFoundError: tomllib`（必须 `/opt/homebrew/bin/python3.13 ./unixnu`，memory 里那条老坑）；修好后红在 `build-xnu-4k-baseline.sh:314 ... bsd_init.c: patch does not apply`——**本轮只动 task.c，坏在无关文件上是 LATE_PATCH 名单的症状**。r324 没进那份「先反向」名单，r325 又坐在 r324 之上，于是反打把 r309 及更早的邻居剥掉、留下摘不掉的最新两枚，重放在 `bsd_init.c:987` 崩。修法两条一起：把 **r325、r324 置于名单最前**（各写一句理由），并按 memory 的三阶段复现验证——归零 → 正打 133 枚（applied 133）→ 按表反打 67 枚（全部可反）→ 重放 133 枚（applied 67，其余已在树里），**三趟全绿**；补丁文件本身改名成 68 枚 z（r324 是 67），两个仓各一份且逐字节相同。
+- 链路：`build kernel` → prelink `58a382c8…` → `patch-clover-amfi.py`（两刀**编码**对得上：`0x34000229→0x14000011`、`0x36000520→0xd503201f`，另 `nm` 有 `_clover_fastboot_reason`＝打在新内核而非设备仓那枚陈旧的上面）→ `round325-kernel-amfi.macho` `182f3213…` → `normalize-kernel-macho.py`（973/973 object 戳清零）→ `round325-kernel-normalized.macho` `c593405a…`（52,404,224 B）→ `build payload`（带 `--data-ramdisk` 与 `--trust-cache`）→ `round325-v0.7.36-payload.img` `e08bdd66…`（58,720,256 B）。镜像里 6 个文件齐（trustcache 61,408 / scratch-data 35,888 / ADT 14,384 / kernel 52,404,224）。
+- **ADT 14,384 B**，与 r322/r324 同形 ⇒ ephemeral 仍是 revert 那一版，boot 111 与 boot 109/110 可比。
+- `check-clover.py` **EXIT=0**；`verify-clover-payload.py` **51 OK / 0 FAIL、EXIT=0**，其中 `r325-bbnow present`、`ADT: ephemeral-storage ABSENT (r322 revert) OK`。
+- 显示归档按规矩对新内核重跑一遍审计：`build/native-legacy-display/build-report.json` 里 `kernel_sha256 = 58a382c8…`（本轮那颗）、`compiled_object_sha256 fda22636…` / `late_object_sha256 a6fd5f5c…`，PASS——链接进这枚内核的归档仍是对着它合格的。
+
+**⑥ boot 111 的判读（本轮唯一一支，预登记在此，读数不许事后改判据）。**
+- **A｜属主名到手没有。** 在卡上找 `clover r325: bbnow`（中转 kind-25 与内核日志两份任一都算在场）。`state=hop_owner` 且 `o0=` 是一个服务名 ⇒ **boot 109 起就欠的那笔「backboardd 自己在等谁」第一次成为读数**；`o1..o3` 给的是链的下一段，boot 110 量到 `hops=4`，所以四列都非 `-` 才是完整一条链。
+- **B｜缺席必须能分家（第十三层：一次 burst 的行不能当证据，周期也要比事件快）。** 三种缺席各有各的读法：① `bbnow` 零行而 `clover r229: bb` 有行 ⇒ fire 确实跑了、行没算出来 ⇒ 是代码问题，不是「没有债」；② 两者都零 ⇒ backboardd 这靴从没被 walk（普查的变化闸没开），**不许**读成「backboardd 不欠谁」；③ `state=no_hop`（`hn=0`）是读数——walk 跑了、当下没有阻塞的发送，与 ① ② 都不同。正对照沿用：r324 的 `bbwhy` 若这靴真的赶上一次 beat（181/301/421/547 那四枚必然 `target=0`，607 之后若有 667 才可能非 0），它应当与 `bbnow` 同形；`bbwhy` 继续零行不构成反驳，因为 120 s 的周期就是本轮要绕开的东西。
+- **C｜手1 应当照旧成立。** `clover r281: wdt ... en=1 armed=1 req=1 pet=` 逐拍在场、末段饿停、板子再次**自己**落进 TWRP（`r198: recovery BCB pre-armed rc=100` 是本靴的、panic marker 两枚仍 STALE、卡上的死线记录仍是上一靴的）——这是 r324 已确证的那条腿，本轮不许因为它没被改动就默认它还在：读不到 `en=1` 就是回归，不是「这靴没挂所以没触发」。
+- **D｜可比性。** ADT 必须仍 `ephemeral-storage ABSENT`（闸门已钉），否则 boot 111 不能与 boot 110/109 并排比。桌面这一格的判据不变：`r180 client#`/`swap#`/`presented=` 之后有没有第二个 view、`box=` 是不是涨满整屏；仍欠就是没进桌面，**停轮条件未满足**。
+
+**⑦ 落盘状态。** 待发 `round325-v0.7.36-payload.img`（`e08bdd66…`，58,720,256 B），双闸门 EXIT=0、51 OK / 0 FAIL。板子在 TWRP（`81ffcaaa`），冷刷走 `adb reboot bootloader` → `run-clover-unattended.sh --flash-cache --boot-after-flash`；挂死这一支现在由 r324 的 WDT 自动落回，读回不需要人工。
+
+**⑧ 闸门自己的一次可疑 flaky（记下来，不当本轮判据）。** 双闸门之后又跑了一次 `check-clover.py`，它报 `the arbiter host model failed`（EXIT=1）；单独跑 `scripts/test-clover-power.py` 绿、紧接着再跑 `check-clover.py` 也绿。唯一的时间重合是本轮为审计显示归档在 `out/clover/tree` 里跑过 `build-clover-gop-legacy-display.py`，而 check-clover 会在同一棵树里现编那几颗宿主模型——像是抢同一枚产物导致的假红。判据没变（r325 的所有针脚仍逐条在盘上），但**下一轮把宿主模型测试与树内重跑分开**，别把这条红读成 CloverPower 坏了。

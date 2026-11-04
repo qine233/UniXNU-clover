@@ -1,0 +1,57 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 88bb044..cfff8b7 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -13395,6 +13395,14 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 	char hopsig[192];
+ 	char wsig[192];
+ 	char line[320];
++	/*
++	 * Round325. Every hop's owner name, kept in the frame that walks the hops so one row can
++	 * carry the whole chain. round324 latched only hop 0 and re-stated it on the 120 s beat; boot
++	 * 110 latched at t=603 and ended at ~612, so no beat was ever due between the two and the row
++	 * printed nothing -- the chain itself, including hops 1..3, is what the burst computed and the
++	 * console tail dropped.
++	 */
++	char hopown[4][24] = { { '\0' } };
+ 	uint64_t htid[4];
+ 	uint32_t hrn[4];
+ 	uint32_t hrs[4];
+@@ -14179,6 +14187,37 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 				line[sizeof(line) - 1] = '\0';
+ 				printf("%s", line);
+ 			}
++			strlcpy(hopown[i], rmo[0] ? rmo : "-", sizeof(hopown[i]));
++		}
++	}
++	/*
++	 * Round325. The burst's own answer, sealed on the driver relay at the moment it is computed.
++	 * round324 moved this reading to the beat and boot 110 proved the beat is the wrong clock: the
++	 * latch opened at t=603, the next 120 s beat was due at 667, and the board was gone by ~612 --
++	 * a cadence slower than the event it judges. The relay is the channel that survived that same
++	 * window from the outside (r309's cen-in at t=607 reached the card), so the row goes there
++	 * first and to the console second. The four names are the chain in order; an empty slot means
++	 * that hop's remote port was the local one, which r231's row already said.
++	 */
++	{
++		extern unsigned int clover_emmc_probe_say(const char *text,
++		    unsigned int length);
++		uint32_t hn_now = __atomic_load_n(&clover_bb_debt_hn, __ATOMIC_ACQUIRE);
++		uint32_t set = __atomic_load_n(&clover_bb_debt_set, __ATOMIC_ACQUIRE);
++		uint32_t rem = __atomic_load_n(&clover_bb_debt_rem, __ATOMIC_ACQUIRE);
++		const char *st = hn_now == 0 ? "no_hop" :
++		    (set ? "hop_owner" : "hop_unresolved");
++		char now[240];
++		int nl = snprintf(now, sizeof(now),
++		    "clover r325: bbnow t=%llu pid=%d fired=%u hn=%u rem=%x set=%u state=%s"
++		    " o0=%s o1=%s o2=%s o3=%s\n",
++		    (unsigned long long)secs, pid, clover_bb_fired, hn_now, rem, set, st,
++		    hopown[0][0] ? hopown[0] : "-", hopown[1][0] ? hopown[1] : "-",
++		    hopown[2][0] ? hopown[2] : "-", hopown[3][0] ? hopown[3] : "-");
++		if (nl > 0) {
++			now[sizeof(now) - 1] = '\0';
++			clover_emmc_probe_say(now, (unsigned int)strlen(now));
++			printf("%s", now);
+ 		}
+ 	}
+ 	/*
