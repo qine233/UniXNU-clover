@@ -26237,3 +26237,63 @@ payload 用**绝对路径** `--kernel /Users/zhouzhou/clover-out/round326-kernel
 `verify-clover-payload.py` **51 OK / 0 FAIL**，含 `r326-bbnow present`＋`r325-bbnow-gone present`＋
 `ADT: ephemeral-storage ABSENT (r322 revert) OK`。boot-args 一字未动（`clover-wdt-arm=1` 保留）⇒ boot 112
 与 110/111 并排可读。冷刷分区照旧只有 eMMC `cache`。
+
+## Round326 读数（boot 112，`round326-v0.7.37-payload.img` `820b7782…`，零人工落回 TWRP）
+
+**① 本轮量到的一句话。** 位置那一半结掉了：`clover r326: bbnow` **两通道都落地**（中转 slot 2 / seq 66，
+内核环 slot 65 时间戳 `885.179096`），r325 同靴零行、它上面四行同毫秒带全在——上一轮那句「是放置问题不是
+没有债」被证实。读数那一半给了一个新的形状：**`hn=4` 而 `rem=0`、`res=0`、四列全 `-`**，也就是这一跳的
+**远端端口名是 0**——没有「发给谁」可命名，而同一串里的 `r229: sbport nm=2f03 ... ms=0 sr=1` 与
+`r234: sbown nm=2f03 own=58:backboardd` 说的是：backboardd 在等一笔**没人发到它自己端口上的消息**。
+
+**② 逐行证据（`~/clover-out/clover-log-window-boot112.bin.txt`）。**
+- 内核环里这次 fire 的顺序（同 t=882）：`r229: bb hops=4 wait=7 d=0`（882.956322，四枚跳的
+  `tid:state:wait_event:continuation:pc` = `17d/658/65c` 都 `state=1`、`667` 是 `4:0:0`）→
+  `r229: sbport bb nm=2f03 cnt=0 ql=6 rn=2a03 ms=0 sr=1 rcv=…`（.956374）→
+  `r234: sbown bb nm=2f03 own=58:backboardd`（.956414）→ **`r326: bbnow … hn=4 rem=0 res=0
+  state=hop_unresolved o0=- o1=- o2=- o3=-`（885.179096）** → `r262: census threads=18 shown=18
+  wait=17 run=1 rx=9 tm=0`（.179144）。封行的位置就是它设计的位置。
+- 中转（kind-25）本靴共 5 枚，全标 `boot 112`：`beat t=782`、`latch t=858 pid=58 name=2f03`、
+  `cen-in t=882 ent=1`、**`bbnow t=882`**、`smp-pre t=882 th=18`。`smp-post` 仍 0 枚——与 boot 111 同形。
+- 封行前后有 **2.2 s**（.956414 → 885.179096）：这 2.2 s 落在「r234 的 sbown 行」与「本封行」之间，
+  本行自己没带这段时间的读数，本轮不解释它（记为未结的第三格，别读成「解析花了 2.2 s」）。
+- `bbhopo`/`bbhop`/`r300: done`/`r267`/`r303` 全 0：hop 循环以下那段这靴仍然一次没跑到（与 boot 111 同）。
+- 正对照：`clover r319: last` 2 枚在；`r308: beat` 逐拍 6 枚全 `target=0 fired=0`（r324 手2 的逐拍腿照旧瞎，
+  本轮判据不靠它）。
+- 块路径到最后一秒还活着：flight 最新 entry `seq 166237 t=873211ms`（`coreduet`/`accounts`/`audioana` 的读）。
+
+**③ 预登记四支的落点（§Round326 ⑤，判据没改）。**
+- **A｜不成立**：`o0=` 不是服务名。
+- **B｜成立，并且行自己说出了原因的一半**：`hn>0`、`rem=0` ⇒ 这一跳的远端端口是 `MACH_PORT_NULL`，
+  「查解析而不是位置」这条照做，但**不是 `clover_sb_port_owner` 走不通**——是它没被调用（`hrem[i]!=0` 才问）。
+  hops 1..3 的 `-` 目前分不开三种成因（远端为 0／远端等于本地／问了没名字），见 ④-1。
+- **C｜不成立**（本靴有 fire，`f=1`）。
+- **D｜手1 的「自落」第三次成立，但本靴的 `en=/armed=` 没有读数**：`TWRP's adb came up`＋
+  `CloverSdhci r198: recovery BCB pre-armed rc=100 written=1`、misc block 1 空、**两枚 panic marker 都是
+  STALE**（`boot 112 never entered the sink`）＝boot 110 那一支的裸复位形状，不是 boot 111 那支。
+  卡上 `CloverSdhci r195: r281-wdt probe lines capped at 48, later ones stay out of the kernel ring`，
+  而环地平线回到 628 s，本靴窗口里 `clover r281: wdt` 命中 0 行 ⇒ **上膛这腿第三靴仍只能从「自落」读，
+  不能从状态行读**。`ADT: ephemeral-storage ABSENT` 由发版前闸门钉住（镜像未变）。
+- **桌面这一格仍未进**：`frame#4 kind=0 t=30s pixels=45460 box=305x811..970x1108`、
+  `retire#4 done=4 presented=4`，比 boot 111 少一枚线程（18 vs 19），盒子还是那一枚 ⇒ **停轮条件未满足**。
+
+**④ 对本仓档案的三处改正／新债。**
+1. **`hloc=` 这个列名不配它填的表达式**（第十一层）：`hloc[hn] = x[3]>>32`，而 x3 装的是 32 位远端端口名，
+   高 32 位是调用方留下的残值。本轮不依赖 `hloc`，但下面 hop 循环那几行（r231/r234 的 `lo=`）一直在用它，
+   那几行的「本地端口属主」读数从此要按「残值属主」重读。**r327 里先把封行自己的四列做成语义无歧义。**
+2. **「零行＝位置问题」这句只结了一半**：位置对了之后行落地，但「backboardd 欠谁」并没有变成一个名字，
+   它变成了一句更具体也更陌生的话——**这一跳不是「发给谁没回」，是「在自己的收口上等一封没人发的消息」**。
+   这句话的证据是 `nm=2f03 own=58:backboardd`＋`ms=0`（队列里没有消息），不是本轮的 `o0=-`。
+3. **不许把「自落三次」读成「上膛三次都被读到」**：只有 111 那靴有 `en=1 armed=1` 的状态行；110/112 两靴
+   的自落是同一形状的不同证据级别（复位是真的，`en=` 是缺席的）。
+
+**⑤ 下一手＝r327（判据先登记）。** 只改封行这一枚，不动通道、不动预算：
+`o0..o3` 的缺席值按成因分字面量——远端端口为 0 印 `null`、远端等于本地印 `self`、问了没名字印 `fail`，
+成功仍印服务名；同时把四枚 `hrem[i]` 原字带进同一行（`r0=%x r1=%x r2=%x r3=%x`），这样
+「一个 `-`」在本靴那种歧义在下一靴不可能再出现。boot 113 判读：
+- **A｜** 出现任何一个非 `null`/`self` 的名字 ⇒ 债主定名（boot 109 起欠的那笔结掉）。
+- **B｜** 四列全 `null` 且 `r0..r3` 全 0 ⇒ **backboardd 的四个等待全是收、没有一个发送对象**，主线从
+  「顺债找债主」改轨到「谁本该发到 `2f03`」：那一格现有的仪器是 r303 的收方任务 entry 普查，得先把它
+  挪进这条已证明落地的带里（r327 之后第二手）。
+- **C｜** 出现 `fail` ⇒ 解析真的走不通，查 `clover_sb_port_owner` 的名字空间。
+- **D｜** 复查 `ephemeral ABSENT`、`r319: last` 正对照、`presented=`/`box=` 那一格。
