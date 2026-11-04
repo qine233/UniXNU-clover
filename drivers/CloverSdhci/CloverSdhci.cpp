@@ -1173,6 +1173,20 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // clover_input_last_xfer and printed once per beat by package/CloverHidInputProbe.cpp. One row per
   // 120 s beat, 16 bounds the same producer without cutting it short.
   { "clover r319: last", "r319-last", 16, 0, 0, 0 },
+  // Round324's arm line: package/CloverKeyStoreProbe.cpp prints `clover r324: wdt-arm ...` exactly once,
+  // on the first four-second fire past 300 s, when it writes BARK/BITE/EN to the APSS watchdog. Its own
+  // class so an arm that speaks is never mistaken for the keystore census it rides beside; one line per
+  // boot, so 8 is headroom not an expectation -- and if the boot never reaches 300 s the absence IS the
+  // reading (the board died before arming, so there was no window for a hang-bite to matter). The prefix
+  // is the specific `clover r324: wdt`, not `clover r324: `, so it does not shadow the bbwhy class below.
+  { "clover r324: wdt", "r324-wdt", 8, 0, 0, 0 },
+  // Round324's second half: osfmk/kern/task.c re-states, every 120 s beat through the driver relay AND
+  // here on the console, who backboardd (pid 58) itself blocks on -- the reading boot 109's hops=2 row
+  // promised and its change-gated bbhopo child never delivered to the tail. It is a state line, so the
+  // budget is the beat count a WDT-shortened boot can produce (a little over 1800 s / 120 s), and 24
+  // covers every fire without letting a repeating row crowd the census beside it.
+  { "clover r324: bbwhy", "r324-bbwhy", 24, 0, 0, 0 },
+
   // Round313 is the first boot that runs drivers/CloverPower at all -- the instrument shipped in
   // round182 and has never been on a board -- so its lines have no class and no budget of their own
   // yet. The report is one-shot, printed in the PMGR tail beside the other bring-up bursts, and its

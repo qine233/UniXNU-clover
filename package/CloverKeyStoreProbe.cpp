@@ -179,11 +179,30 @@ clover_aks_who(int *pid_out, char *name_out, size_t name_cap)
 // different block, not a decoding question.
 #define CLOVER_WDT_PHYS        0x17817000ull
 #define CLOVER_WDT_BYTES       0x20
+// RST is the pet register. watchdog_v2.c pets with writel(1) here; nothing in this port has ever written
+// it -- rounds 281/292 read only, and the whole point of reading was to say "nobody started this WDT".
+#define CLOVER_WDT_RST         0x04
 #define CLOVER_WDT_EN          0x08
 #define CLOVER_WDT_STS         0x0c
 #define CLOVER_WDT_BARK        0x10
 #define CLOVER_WDT_BITE        0x14
 #define CLOVER_WDT_HZ          32765u
+// Round324 arms the block so a kernel wedge (this instrument's own 4 s timer stops firing) bites to a hard
+// reset, which the round198 recovery BCB pre-armed on the card then lands in TWRP -- the unattended
+// read-back a hang could never trigger, because a hang runs neither panic() nor a deadline. The BITE field
+// is 20 bits, so 1048575 ticks (about 32 s) is the longest bite this block can be given; the pet rides the
+// 4 s timer, so a live kernel resets the countdown eight times over before it could bite. BARK is set three
+// seconds under BITE (watchdog_v2.c's own bark/bite spacing) and EN is written with bit0 only -- bit1 is
+// UNMASKED_INT_EN, and arming the bark interrupt would take the wrong reading (a bark FIQ, not a reset).
+#define CLOVER_WDT_BITE_TICKS  1048575u
+#define CLOVER_WDT_BARK_TICKS  (CLOVER_WDT_BITE_TICKS - 3u * CLOVER_WDT_HZ)
+// Only arm after the earliest volatile phases are behind us, but well before the observed stop. The aks
+// timer's own first fire is at 240 s and it pets from then on, so 300 s is the first fire past the very
+// early mount/spawn burst and still 400 s ahead of boot 109's ~719 s stop -- a wedge there leaves the
+// countdown un-petted and bites ~32 s later. A boot that reaches the 1800 s deadline (boot 108's shape)
+// keeps the aks timer firing, so the pet never lapses and the WDT never acts: it cannot pre-empt the
+// deadline, it only covers the case the deadline cannot, a kernel that stops scheduling.
+#define CLOVER_WDT_ARM_AT_SEC  300u
 
 struct clover_aks_row {
     int       pid;
@@ -202,6 +221,25 @@ static volatile uint32_t *clover_wdt_regs;
 static bool clover_wdt_tried;
 static bool clover_wdt_have_last;
 static uint32_t clover_wdt_last_en, clover_wdt_last_sts, clover_wdt_last_bark, clover_wdt_last_bite;
+// Round324 write state. armed says the EN write was issued once; pets counts how many times this timer has
+// reset the countdown since, so "armed but never pet" (which would bite on the first 32 s window) is a
+// shape distinguishable from "armed and alive" on the row itself.
+static bool clover_wdt_armed;
+static uint32_t clover_wdt_pets;
+
+// The gate is a boot arg, not a compile default: arming a hardware reset is the one change in this file
+// that can act on the board, so the delivered image opts in explicitly and a follow-up opts back out by
+// dropping the arg. Mirrors native_aks_state_enabled()'s PE_parse_boot_argn shape.
+static bool
+clover_wdt_arm_requested(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        unsigned value = 0;
+        cached = PE_parse_boot_argn("clover-wdt-arm", &value, sizeof(value)) && value == 1;
+    }
+    return cached == 1;
+}
 
 // Measured, not derived from the fire count: a row that says t= must be able to disagree with the beat
 // above it, or it is not a second reading of the same boot.
@@ -248,6 +286,16 @@ clover_wdt_read(uint32_t offset)
 
     __asm__ volatile ("dsb sy" ::: "memory");
     return value;
+}
+
+// Round324 write path. watchdog_v2.c's own order is BARK_TIME, BITE_TIME, then EN, then a pet to RST; the
+// barrier is the same shape the reads use so a write cannot be reordered behind the row that reports it.
+static void
+clover_wdt_write(uint32_t offset, uint32_t value)
+{
+    __asm__ volatile ("dsb sy" ::: "memory");
+    clover_wdt_regs[offset / 4] = value;
+    __asm__ volatile ("dsb sy" ::: "memory");
 }
 
 // Recorded, never printed: the caller's thread is the client's, and the only thing this path should cost it
@@ -319,6 +367,26 @@ clover_aks_say(OSObject *owner, IOTimerEventSource *sender)
             printf("clover r281: wdt t=%u nomap why=ctrl\n", t);
         }
     } else {
+        // Round324: arm once past the floor, then pet every fire. The write happens before the read so the
+        // row below reports the state the write left (armed=1) rather than the state before it -- a positive
+        // control that the register took. If TrustZone has locked the block the read-back stays en=0 and the
+        // row says so honestly: no harm, and the whole "can this board self-land a hang" question answers
+        // itself on the card.
+        if (clover_wdt_arm_requested() && t >= CLOVER_WDT_ARM_AT_SEC) {
+            if (!clover_wdt_armed) {
+                clover_wdt_write(CLOVER_WDT_BARK, CLOVER_WDT_BARK_TICKS);
+                clover_wdt_write(CLOVER_WDT_BITE, CLOVER_WDT_BITE_TICKS);
+                clover_wdt_write(CLOVER_WDT_EN, 0x1u);   // EN bit0 only; bit1 would arm the bark FIQ, not the reset
+                clover_wdt_write(CLOVER_WDT_RST, 1u);     // first pet, so the countdown starts from now, not 300 s ago
+                clover_wdt_armed = true;
+                printf("clover r324: wdt-arm t=%u bite_ms=%u at=%u\n", t,
+                    (unsigned) ((uint64_t) CLOVER_WDT_BITE_TICKS * 1000ull / CLOVER_WDT_HZ),
+                    CLOVER_WDT_ARM_AT_SEC);
+            } else {
+                clover_wdt_write(CLOVER_WDT_RST, 1u);     // keep resetting the countdown while the timer runs
+                clover_wdt_pets++;
+            }
+        }
         uint32_t en = clover_wdt_read(CLOVER_WDT_EN);
         uint32_t sts = clover_wdt_read(CLOVER_WDT_STS);
         uint32_t bark = clover_wdt_read(CLOVER_WDT_BARK);
@@ -327,10 +395,16 @@ clover_aks_say(OSObject *owner, IOTimerEventSource *sender)
             bark != clover_wdt_last_bark || bite != clover_wdt_last_bite;
 
         if (changed || state) {
+            // req= and pet= name this round's writes on the state row itself: req=0 means the boot-arg was
+            // not passed (this boot is not armed by design), req=1 armed=1 pet=high means alive and fed, and
+            // req=1 armed=0 means the write did not take -- three readings that an en-only column cannot tell
+            // apart, which is the eleventh layer's "a column and the expression that fills it must share a
+            // source" point.
             printf("clover r281: wdt t=%u en=%x armed=%u intmask=%u sts=%x bark=%u bite=%u bark_ms=%u "
-                "bite_ms=%u why=%s\n", t, en, en & 1u, (en >> 1) & 1u, sts, bark, bite,
+                "bite_ms=%u req=%u pet=%u why=%s\n", t, en, en & 1u, (en >> 1) & 1u, sts, bark, bite,
                 (unsigned) ((uint64_t) bark * 1000ull / CLOVER_WDT_HZ),
                 (unsigned) ((uint64_t) bite * 1000ull / CLOVER_WDT_HZ),
+                clover_wdt_arm_requested() ? 1u : 0u, (unsigned) clover_wdt_pets,
                 !clover_wdt_have_last ? "first" : (changed ? "chg" : "ctrl"));
             clover_wdt_last_en = en;
             clover_wdt_last_sts = sts;

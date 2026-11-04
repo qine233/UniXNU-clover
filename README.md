@@ -51,13 +51,13 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 
 | # | 缺口 | 现状（一句话） | 下一步 | 出处 |
 | --- | --- | --- | --- | --- |
-| 1 | SpringBoard 那笔同步往返没人回（boot 109 起＝backboardd） | boot 107 卡在 PreBoard 迁移（`0x6003`）→ r320 补 ephemeral 让 boot 108 挪到 chronod（`ro=122:chronod`，贯穿死线）→ **r322 revert ephemeral 后 boot 109 读回：迁移真跑（`datamigrator[179]` 起来）、chronod 那格消失（8→0）、显示路第一次整条转起来（5 个帧缓冲客户端 + swap#1→#3 + `presented=2`），但主线程 `tid=0x12d` 停在 backboardd（pid 58，端口 `4203`），且只画出一个 450×142 黑盒不是桌面** | route 1（revert ephemeral）被证实：没打回迁移陷阱，卡点又前移一格。下一手：把逐拍落地的 r229/r262 债主梯子从 SpringBoard 挪到 **backboardd 自己卡在什么上**，并量「那个盒子是谁画的、SpringBoard 为何只交出这一个 view」 | dev-log §Round322–323 |
+| 1 | SpringBoard 那笔同步往返没人回（boot 109 起＝backboardd） | boot 107 卡在 PreBoard 迁移（`0x6003`）→ r320 补 ephemeral 让 boot 108 挪到 chronod（`ro=122:chronod`，贯穿死线）→ **r322 revert ephemeral 后 boot 109 读回：迁移真跑（`datamigrator[179]` 起来）、chronod 那格消失（8→0）、显示路第一次整条转起来（5 个帧缓冲客户端 + swap#1→#3 + `presented=2`），但主线程 `tid=0x12d` 停在 backboardd（pid 58，端口 `4203`），且只画出一个 450×142 黑盒不是桌面** | **r324 已把逐拍债主梯子从 SpringBoard 挪到 backboardd 自己**（`task.c` 闩住第一跳属主名、每拍经驱动环重说 `clover r324: bbwhy ... state= owner=`），boot 109 欠的那枚「pid 58 阻塞在谁头上」等 boot 110 读回；仍要量「那个盒子是谁画的、SpringBoard 为何只交出这一个 view」 | dev-log §Round322–324 |
 | 2 | 触摸没有任何应答 | QUP v2 I2C-3 电气通，两个候选地址全 NACK | 依赖 3：先把面板轨上电 | dev-log §Round181、§Round312 |
 | 3 | PMIC 轨读不出来 | r313 起「不在 v5 带内」不再是拒读的理由（地板图改成按版本字选表） | 刷 `round313` / `round314` 镜像定档 | [`notes/power-bringup.md`](notes/power-bringup.md) §8 |
 | 4 | ADSP 没起 | SMEM 读通，判决行没上屏 | 有边上 GLINK/APR；没镜像先压 `vadsp` | dev-log §Round183 |
 | 5 | watchdogd 每次起就崩 | 已定名且非瓶颈：boot 76 带着这枚 brk 活到死线，sheng 零引用 `IOWatchdog` 也进桌面 | 先量 `AppleARMIODevice` 在本板有没有平面；不在当前排期 | dev-log §Round199–200 |
 | 6 | GPU/Metal 一个都没有 | 分支清白、债在电：`gx_collapse=0` 而 `gx_on=0`，那颗 LDO 从复位起没人按厂商表配过 | 只读侦察到 MEM_ACC 那一格；桌面 CPU-first | [`notes/gpu-bringup.md`](notes/gpu-bringup.md) §5.11–5.13 |
-| — | 「读不到为什么结束」+「挂死不自动回 TWRP」（独立的一道基础设施坎，不是主线症状） | boot 109 量到根因：`clover r281: wdt en=0 armed=0 ... why=ctrl` 整靴——**板上硬件看门狗没上膛**。一次「挂死」既不跑 panic 路径、也没有 WDT bite 复位它 ⇒ `r196/r198` 的自动落 TWRP 只对 panic/复位成立、对挂死无效，只能人工进 recovery（用户两次反馈即此）；GPU 线已由 r294/r294b 两个控制轮从复位嫌疑里摘出去 | 让挂死也自动回读：把板上 WDT（SPC `0x17817000`，r281/r292 已读）上膛到 bite 复位，接 `r198` 非 panic 落 TWRP 那一棒 | dev-log §Round294、§Round301–310、§Round323 ① |
+| — | 「读不到为什么结束」+「挂死不自动回 TWRP」（独立的一道基础设施坎，不是主线症状） | boot 109 量到根因：`clover r281: wdt en=0 armed=0 ... why=ctrl` 整靴——**板上硬件看门狗没上膛**。一次「挂死」既不跑 panic 路径、也没有 WDT bite 复位它 ⇒ `r196/r198` 的自动落 TWRP 只对 panic/复位成立、对挂死无效，只能人工进 recovery（用户两次反馈即此）；GPU 线已由 r294/r294b 两个控制轮从复位嫌疑里摘出去 | **r324 已上膛那枚 WDT**：`CloverKeyStoreProbe.cpp` 在 t≥300 s 一次写 BARK/BITE(`1048575`≈32 s)/EN(bit0)/RST，之后每 4 s 拍续命；内核停调度⇒倒计时无喂⇒bite 硬复位⇒`r198` 预写 BCB 落 TWRP。闸门是一枚 boot-arg `clover-wdt-arm=1`（删一行整手回退），状态行加 `req=`/`pet=` 三态分开；等 boot 110 读回验「挂死能否自落」 | dev-log §Round294、§Round301–310、§Round323 ①、§Round324 ① |
 
 ## 已完成（都有真机读数）
 

@@ -1242,8 +1242,17 @@ def check_sb_sample(kernel: bytes) -> bool:
              "aks-say-state": (b"clover r281: aks t=%u fire=%u stage=%d status=%x service=%llx owner=%s "
                           b"opens=%u calls=%u refused=%u other=%u\n") in kernel,
              "aks-say-wdt": (b"clover r281: wdt t=%u en=%x armed=%u intmask=%u sts=%x bark=%u bite=%u "
-                          b"bark_ms=%u bite_ms=%u why=%s\n") in kernel,
+                          b"bark_ms=%u bite_ms=%u req=%u pet=%u why=%s\n") in kernel,
              "aks-say-wdt-nomap": (b"clover r281: wdt t=%u nomap why=ctrl\n") in kernel,
+             # Round324's two hands, both read out of the kernel image rather than from source: the arm
+             # line (package/CloverKeyStoreProbe.cpp) is the positive control for a boot that reached the
+             # arming window, and the bbwhy line (osfmk/kern/task.c) is the per-beat copy of who backboardd
+             # blocks on -- the reading boot 109's hops=2 promised and its burst-only child dropped. Finding
+             # the string proves the format survived to the image; it is not by itself a card reading.
+             "r324-wdt-arm": (b"clover r324: wdt-arm t=%u bite_ms=%u at=%u\n") in kernel,
+             "r324-bbwhy": (b"clover r324: bbwhy t=%llu pid=%d fired=%u hn=%u rem=%x set=%u "
+                            b"state=%s owner=%s\n") in kernel,
+
              "aks-say-sel": (b"clover r281: aks sel%u n=%u rc=%x\n") in kernel,
              "aks-say-open": (b"clover r281: open %u pid=%d comm=%.16s\n") in kernel,
              "aks-say-call": (b"clover r281: call %u pid=%d comm=%.16s sel=%u rc=%x\n") in kernel,

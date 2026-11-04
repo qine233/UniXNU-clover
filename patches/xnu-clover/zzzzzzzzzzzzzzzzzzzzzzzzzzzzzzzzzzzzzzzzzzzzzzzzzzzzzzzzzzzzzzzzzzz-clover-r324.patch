@@ -1,0 +1,90 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -10839,6 +10839,23 @@
+ static volatile uint32_t clover_bb_gone;     /* proc_find() found no such pid */
+ static volatile uint32_t clover_bb_notask;   /* proc_task() came back TASK_NULL */
+ static volatile uint32_t clover_bb_busy;     /* the task lock was held, try_lock failed */
++
++/*
++ * Round324. The question boot 109 could not answer: backboardd (pid 58) is a receiver that became a
++ * sender -- its r229 row said hops=2 -- yet the r234 bbhopo row that names the task owning that hop,
++ * the one reading that would say who backboardd itself blocks on, printed once inside the change-gated
++ * census burst and did not survive the console tail that round lost lines to. So the first resolved
++ * hop's remote port and its owner name are latched here, on the walk that already computes them, and
++ * re-stated every beat through the driver relay the r308 row proved survives. The latch is written by
++ * clover_bb_sample and read only by the beat thread after that call returns, so one writer at a time;
++ * clover_bb_debt_set is stored last so a reader that sees it set also sees the name, and cleared on a
++ * fire that found no hop, so hn=0 is a reading of "backboardd walked and has no blocked send" rather
++ * than an absence that could also mean the sampler never ran.
++ */
++static volatile uint32_t clover_bb_debt_rem;   /* the first hop's remote port, in backboardd's space */
++static volatile uint32_t clover_bb_debt_hn;    /* hop count from the last real fire */
++static volatile uint32_t clover_bb_debt_set;   /* a debt owner was resolved (release after the name) */
++static char clover_bb_debt_name[24];           /* the task name owning clover_bb_debt_rem */
+ 
+ /*
+  * Round238. Round237 fed this table only after the SpringBoard sampler latched
+@@ -11289,6 +11306,37 @@
+ 		if (clover_bb_target_pid != 0) {
+ 			clover_bb_sample(clover_bb_target_pid, sb,
+ 			    clover_bb_target_name, secs);
++			/*
++			 * Round324. The answer boot 109 could not get: who backboardd blocks on, re-stated
++			 * every beat on the relay that survives, not once in the burst the tail dropped. The
++			 * three counters beside the name are the positive control -- fired=0 says the walk has
++			 * not run (an absence), fired>0 with hn=0 says backboardd was walked and has no blocked
++			 * send (a reading, idle), and set=1 with a name is the debt itself.
++			 */
++			{
++				extern unsigned int clover_emmc_probe_say(const char *text,
++				    unsigned int length);
++				uint32_t hn = __atomic_load_n(&clover_bb_debt_hn,
++				    __ATOMIC_ACQUIRE);
++				uint32_t set = __atomic_load_n(&clover_bb_debt_set,
++				    __ATOMIC_ACQUIRE);
++				uint32_t rem = __atomic_load_n(&clover_bb_debt_rem,
++				    __ATOMIC_ACQUIRE);
++				const char *st = clover_bb_fired == 0 ? "never_walked" :
++				    (hn == 0 ? "no_hop" : (set ? "hop_owner" : "hop_unresolved"));
++				char why[160];
++				int wl = snprintf(why, sizeof(why),
++				    "clover r324: bbwhy t=%llu pid=%d fired=%u hn=%u rem=%x set=%u"
++				    " state=%s owner=%s\n",
++				    (unsigned long long)secs, clover_bb_target_pid,
++				    clover_bb_fired, hn, rem, set, st,
++				    set ? clover_bb_debt_name : "-");
++				if (wl > 0) {
++					why[sizeof(why) - 1] = '\0';
++					clover_emmc_probe_say(why, (unsigned int)strlen(why));
++					printf("%s", why);
++				}
++			}
+ 		}
+ 		task_deallocate(sb);
+ 	}
+@@ -14078,6 +14126,10 @@
+ 	 * it was sent, and its port object can be compared with the sender-side
+ 	 * reading the caller prints.
+ 	 */
++	__atomic_store_n(&clover_bb_debt_hn, hn, __ATOMIC_RELEASE);
++	if (hn == 0) {
++		__atomic_store_n(&clover_bb_debt_set, 0, __ATOMIC_RELEASE);
++	}
+ 	for (i = 0; i < hn; i++) {
+ 		char rno[24];
+ 		char lo[24];
+@@ -14109,6 +14161,14 @@
+ 
+ 			clover_sb_port_owner(task, (mach_port_name_t)hrem[i],
+ 			    rmo, sizeof(rmo));
++			if (i == 0) {
++				strlcpy(clover_bb_debt_name,
++				    rmo[0] ? rmo : "-", sizeof(clover_bb_debt_name));
++				__atomic_store_n(&clover_bb_debt_rem, hrem[i],
++				    __ATOMIC_RELEASE);
++				__atomic_store_n(&clover_bb_debt_set, 1,
++				    __ATOMIC_RELEASE);
++			}
+ 			len = snprintf(line, sizeof(line),
+ 			    "clover r234: bbhopo t=%llu pid=%d tid=0x%llx"
+ 			    " rem=%x ro=%s\n",

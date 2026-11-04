@@ -2953,7 +2953,7 @@ def check_board(errors: list) -> str:
                            '"refused=%u other=%u\\n"',
                            '"clover r281: wdt t=%u nomap why=ctrl\\n"',
                            '"clover r281: wdt t=%u en=%x armed=%u intmask=%u sts=%x bark=%u bite=%u bark_ms=%u "',
-                           '"bite_ms=%u why=%s\\n"',
+                           '"bite_ms=%u req=%u pet=%u why=%s\\n"',
                            '"clover r281: aks sel%u n=%u rc=%x\\n"',
                            '"clover r281: open %u pid=%d comm=%.16s\\n"',
                            '"clover r281: call %u pid=%d comm=%.16s sel=%u rc=%x\\n"',
@@ -3026,6 +3026,49 @@ def check_board(errors: list) -> str:
             if stale in sdhci_source:
                 errors.append(f"the tee still carries round {stale[2:]}'s class: a class for a producer that "
                               "no longer exists is how a budget looks allocated when nothing is spending it")
+
+        # Round324 ships two hands in one image, and each is a measurement the last boot could not make.
+        # Hand one: a hang now bites. The arm is gated on a boot arg so a board that never reaches 300 s, or
+        # a control boot that must not reset, reads as "did not arm" rather than "armed and never moved" --
+        # so the arg has to be on the board this round, CloverKeyStoreProbe has to gate on it, and the tee has
+        # to budget the one arm line separately from the watchdog state rows it rides beside.
+        if "clover-wdt-arm=1" not in board_args:
+            errors.append("board.toml does not pass clover-wdt-arm=1: the r324 arm is a boot arg on purpose, "
+                          "and without it no boot bites and the round's whole second half is unexercised")
+        for arm_needle in ('#define CLOVER_WDT_ARM_AT_SEC  300u',
+                           'PE_parse_boot_argn("clover-wdt-arm", &value, sizeof(value))',
+                           '"clover r324: wdt-arm t=%u bite_ms=%u at=%u\\n"'):
+            if arm_needle not in bisect_text:
+                errors.append(f"the keystore probe lacks {arm_needle[:48]!r}: a watchdog that is read but "
+                              "never armed cannot bite, and boot 109 proved the hang trips neither panic nor "
+                              "deadline nor a hardware reset -- which is exactly the gap this arm closes")
+        # Hand two: who backboardd blocks on. boot 109's r229 bb row said hops=2, but the r234 bbhopo child
+        # that names the owning task printed once inside the change-gated burst and the console tail dropped
+        # it. The reading is now latched and re-stated every beat on the driver relay, so it is not a one-shot
+        # the ring can lose. That row's format string lives in the kernel patch, so the gate reads the patch
+        # text, and the tee class is asserted so the console copy is not starved by the arm line sharing the
+        # round's prefix.
+        r324_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r324.patch")),
+                         default=None)
+        if r324_patch is None or not r324_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r324.patch is missing: the per-beat debt-owner row is "
+                          "this round's first hand and a kernel instrument nobody shipped is a reading nobody "
+                          "can take")
+        else:
+            r324_text = r324_patch.read_text()
+            for why in ('"clover r324: bbwhy t=%llu pid=%d fired=%u hn=%u rem=%x set=%u"',
+                        'static volatile uint32_t clover_bb_debt_hn;',
+                        '__atomic_store_n(&clover_bb_debt_set, 1,'):
+                if why not in r324_text:
+                    errors.append(f"the r324 kernel patch lacks {why[:56]!r}: without the latch and the "
+                                  "release-after-name store, the beat row is a guess about a hop the burst "
+                                  "may have dropped, not a copy of the reading")
+        if '{ "clover r324: bbwhy", "r324-bbwhy", 24, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the per-beat debt-owner row: a repeating state "
+                          "line with no budget is how boot 98 read a whole census family as zero rows")
+        if '{ "clover r324: wdt", "r324-wdt", 8, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no specific class for the arm line: the round shares one "
+                          "prefix between two producers, and a generic budget lets the beat rows eat the arm")
 
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
@@ -6597,8 +6640,8 @@ def check_board(errors: list) -> str:
     # kernel and added ephemeral-storage; boot 108 read it back and the stall only moved (migration ->
     # chronod), and sheng boots to the desktop without it, so round322 reverts the ADT again: same
     # kernel, ephemeral-storage ABSENT so first-boot migration runs -- the menu names round322.
-    if not board["payload"]["title"].startswith("clover r322:"):
-        errors.append('[payload] title is not "clover r322: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r324:"):
+        errors.append('[payload] title is not "clover r324: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7745,8 +7788,8 @@ def check_board(errors: list) -> str:
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r322:"):
-        errors.append('[payload] title is not "clover r322: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r324:"):
+        errors.append('[payload] title is not "clover r324: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
