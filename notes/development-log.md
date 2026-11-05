@@ -26983,3 +26983,89 @@ panic 块里，`x0` 的两枚格式串（按 VA 解出）是 `NativeLegacyDispla
 3. r329 起的四枚 vendored 显示报告 helper 仍零调用者（本轮只是把注释里的说法改准，债没还）。
 4. 若某轮真的想「纯注释而内核哈希不变」，得先让 `panic()` 那类 `__LINE__` 折叠停下来（例如把守卫
    统一走一处不嵌行数的 sink）——本轮没做，也没有这个必要，因为判据已经改成 ⑧ 那一句。
+
+## Round332c（与 v0.7.43 同代，宿主取证轮，不碰产物代码 ⇒ 不另发版、不刷写）：selector 6 是谁、第 4 次之后缺哪一行
+
+**① 为什么现在问这一格。** 桌面那一格的 standing premise 是「渲染循环画到第 4 步就停」（#666）。这句话一直
+是**我们从卡上行的形状里读出来的**，而从没问过：那一次调用**在出厂代码里是谁**、两次一组的那一对**由谁发起**、
+以及第二枚调用没来**意味着什么**。这一轮把这三格在宿主上问清楚，逐条只认能在盘上复开的证据。
+底稿与复算脚本输出都在 `~/clover-out/round333-forensics/`（`stock-family-word-scan.txt`、
+`family-windows-decoded.txt`、`offset-word-scan-and-strings.txt`）。
+
+**② 先钉住「出厂那一枚就是板子上跑的那一枚」。** 我自己重算了一次，不采信转述：
+`sha256(kernelcache.decompressed[0x1f40000 : 0x1f40000+225140]) = 2e044ee68c165039…`，与
+`build/display-analysis/clover-mobile-graphics-legacy-abi.json` 里的 `family_text_sha256` 逐字节同
+（同格 `family_text_base 0xfffffff00576c000`、`legacy_vptr 0xfffffff005f38570`）。
+⇒ 本文里凡写 `0x6777…` 的都是「板子地址 + 0x10000000」，落帧时减回去。
+
+**③ 我自己在出厂指令流里复核过的三件事**（不是代理报告的转述）：
+- **唤醒腿的数组几何成立**：`0x6777610` 起的窗口里逐条解码出 `movz x10, #0xb0`、一枚 `mul`、
+  `add x8, x8, #0x110`（`91044108`＝272）、以及 `movz w8,#0x2dd`＋`movk w8,#0xe000,lsl #16`
+  ＝ **`0xe00002dd`（kIOReturnPortExists）**。⇒ 通知口存在 `client+0x110`、步幅 `0xb0`、越界用 PortExists 拒。
+  这一格是 r333 那一行**要读的地址**，所以现在它是被本地解码支持的，不是被引用的。
+- **swapID 是个 32 位字段，且确实在用户客户端对象里**：`str w?,[x?,#0xf8]` 在全段 4 处命中，其中
+  **`0x67773c0` 落在 `0x6777390` 这个函数体内**（就是被 selector 6 那枚 thunk 调进去的那一个）。
+- **「3/4 那两支查的两枚字」查到了**：`ldr w?,[x?,#0x16d0]` 全段 7 处、`ldr w?,[x?,#0x16e0]` 3 处，
+  而 `0x678da30`/`0x678da58`/`0x678daa0`/`0x678dac8` 四枚**正好成两对**落在 0x678da00–0x678db00 那段里
+  （即那两支特殊查询的返回处）。⇒ 「查询成功」的判据是这两枚字都非零，r333 把它们并排读。
+
+**④ 本轮真正的增量：出厂代码里那几句话自己就把契约写出来了。** 在 `0xdd0600..0xdd0a00` 那串 cstring 里
+（逐条摘出来落在 `offset-word-scan-and-strings.txt`）有：
+`swapID = %d fDisplaySwapID = %d fPendingSwap = %p fPending->swapID = %d`、
+`... has gone wrong: fPendingSwap(%d) || (!TAILQ_EMPTY(&fSwapQueue))(%d)`、
+`virtual void IOMobileFramebufferLegacy::clear_up_swap_queue_gated()`、
+`void IOMobileFramebufferLegacy::disp_has_no_clients_gated()`、
+`IOMFB: %s:  CommandWake didn't happen even after 5 seconds.`、
+`"IOMFB: swap_wait_gated blocked for more than 5 seconds. Should not happen. Panicking\n" @%s:%d`、
+`IOMFB: swap_wait_gated blocked so cleared up swaps`、
+`IOMFB: swap_wait_gated retried > 2 times, clearing swaps and return`。
+**这四句是 `IOMobileFramebufferLegacy` 的方法名带的句子**，也就是**我们链接进来的那一族自己的代码**——
+`grep -a -c` 在本仓 `round332-kernel-normalized.macho` 与出厂 kernelcache 里命中数**逐枚相同**
+（`swap_wait_gated` 3/3、`fDisplaySwapID` 1/1、`clear_up_swap_queue_gated` 1/1、`blocked so cleared up swaps` 1/1）。
+⇒ 一句话：**出厂的等待路径本身带一枚「阻塞超过 5 秒就 panic」的断言，而且这句话就在我们的内核里。**
+以前我们只把 `swap_wait_gated` 当「客户端在等」，现在它还是一个**会自己宣判的定时器**：任何一靴如果死在它手上，
+卡上会出现那句句子（今天没有任何一枚针脚钉它，r333 补）。
+
+**⑤ 两处对代理报告的改正**（都按在盘卡上文本判）：
+1. 报告写「N=1,2,3 的成对行是同一形状 `6 N 80000001` 后跟 `6 N 80000000`」。**不成立**：boot 113 的 N=1 那一枚
+   是 `clover r180: client pid=58 selector 6 1 1 0 -> 00000000`（options **1**，bit31 清），到 N=2、N=3 才是
+   `80000001`。⇒ 「配对」这件事本身是两种形状，r333 印 `options=` 原字而不是印一个布尔。
+2. 报告漏了全段 8 枚 selector-6 行里的**第一枚**：`selector 6 0 80000003 0 -> 00000000 done=0 presented=0`
+   （517.949546）。`0x80000003` 掩掉 bit31 就是 3 ⇒ **这是那两支特殊查询里的一支，而且它答了 0**。
+   这一枚正好是 r333 需要的**正对照**：同一支查询路径在出厂代码里跑通过、并给出成功——
+   所以「查询这一支不工作」这种解释从一开始就被排除。
+
+**⑥ 仍未证的三格，写清楚不当下结论。** ① 那一枚方法的 Apple 名字拿不到（宿主侧非导出符号被涂），
+「swap / submit-swap-transaction」是按形状推的；② 第二枚调用到底是**阻塞在 mach 会合**还是**轮询**，
+卡上现在没有任何一行能分（`main` 镜像的 slide 也不在盘上，见 [[unixnu-clover-host-artifacts]]）；
+③ 「`registerNotification` 零行」目前是**用 55 行 < 96 行预算**判的（boot 113 卡上 `clover r180:` 恰好 55 枚，
+`capped at` 八枚都指向别的类，没有一枚指向显示类），而结构性的 `log=`/`logdrop=` 计数是 r329 才有的 ⇒
+这一格在 boot 113 上是「按预算算得过来」，不是「被计数自证过」。r333 起才有自证。
+
+**⑦ r333 的手（设计先钉死，实现下一轮做；预登记四支）。** 在 `wrappedExternal` 认到 selector 6 的那一刻、
+**先中转后 printf**（沿用 r305 那条次序），发一行 `clover r333: bbswap`：
+`ms=`（`probeNowUs()/1000`，沿用 r329 那条单位规矩，不叫 `t=`）`swap=`（latched swapID，`client+0xf8` 那枚 32 位字）
+`opt=`（scalarInput[1] 原字，含 bit31）`ret=`；随后 `pw=`/`ps=`＝被查询那两枚字（`legacy+0x16d0`/`+0x16e0`）
+——**在返回之前读，与本次调用的结果分成两组字**（第十五层）；`np0..np5`＝六格通知口，每格三种读法之一
+（口的值／`null`／`off`＝该格没读成，各占一枚字面量）；`notified=`＝`native_legacy_vsync_notify` 的进入计数；
+`s72=`＝selector 72 的进入计数（这两枚今天是「没有任何一行」的仪器）；
+`gap=`＝同一 `swap=` 上一次调用距今的毫秒，`pair=`＝这一 swapID 是否已见第二枚（`first`/`again`）——
+「配对」是本轮刚被证明**不能按字面假设**的东西，所以它自己得有读数。
+新针脚：`swap_wait_gated blocked for more than 5 seconds` 那句必须在镜像里在场（ CString，第十七层的判法），
+因为**我们的镜像里那句话存在**这一事实是本轮量的，而「某靴有没有喊过它」只能从卡上读。
+预登记四支：
+- **A｜`np0..np5` 全 `null`** ⇒ 客户端从没注册唤醒口，出厂的等待只能靠轮询，而轮询在 swap 4 之后没再来；
+  这一支把问题定名为「**我们的类从没让第二枚调用变得有必要**」，下一手回投递/渲染循环那一格（#666），
+  不再在 IPC 等待链里加列。
+- **B｜某枚 `np` 非 null 而 `notified=` 恒 0** ⇒ 口在、发的人没跑：唤醒腿第一次被**指名**（哪一型缺），
+  下一手是那一型的生产者，不是新的读数。
+- **C｜`pw=`/`ps=` 在 swap 4 后一枚归零且不再抬起** ⇒ `e00002d5` 是真的状态答案，客户端在等一枚
+  **我们从没置回去**的标志；这时 r327/r328 那对债主行改读为「同一件事的另一侧」，而不是并列的第二条证据。
+- **D｜`gap=` 从 20–47 ms 跳到 5.4 s 再断，且卡上出现 `swap_wait_gated` 那句** ⇒ 慢在客户端自己那一侧，
+  死因是出厂那枚 5 秒断言；那么本板的题从「画不出桌面」换成「**让 CommandWake 在 5 秒内发生**」，
+  措辞与判据都得跟着换（第十二层：判据不许产自被它控制的东西 ⇒ 那时才允许考虑 `sheng-vsync` 这类开关，
+  且 r329 已判它既非因也非药，先重读那一格再动）。
+
+**⑧ 本轮欠的两格。** ① 方法的 Apple 名字仍拿不到，除非把 `IOMobileFramebuffer` 用户侧那枚 image 的
+slide 弄到盘上——那是宿主工具的活，不是卡上的；② `main` 镜像（backboardd 自己）的 slide 现在没有任何一行
+能定，所以「第二枚调用阻塞在哪一次会合上」这句话在 r333 之后仍然只能是问题，不是读数。

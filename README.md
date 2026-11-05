@@ -90,6 +90,8 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 | 时间线只有「写」的一侧被钉住 | r330 起了 `$(basename "$OUT").timeline.txt`，闸门钉的是四个窗口都写；**读**的一侧还没有工具，判一靴的静默仍要靠人 `grep` 那份文件 | dev-log §Round330 ⑧ |
 | 四枚 vendored 显示报告 helper 仍无调用者 | r329 另建了同源的周期行，这四枚（`prepare_report`/`properties_now`/`state_words`/`clients_dump`）至今零调用 | dev-log §Round329 ②、§Round330 ⑧ |
 | 持有者扫描的四格地平线 | r331 腿 A 只走到 pid 400、腿 B 只走等待者自己的表、明细行截在 4 枚且没有「丢了几枚」这一列、一行只挑 `debt` 的第一枚 hop | dev-log §Round331 ⑧ |
+| 客户端的唤醒腿没有读数 | boot 113 的 8 枚 selector-6 行里，swapID 4 只有配对的第一枚（`6 4 80000001 -> 0`，564.994 s）而没有第二枚；正对照是同一串里更早那枚 `6 0 80000003 -> 0`＝特殊查询这一支**跑通过**。而 `registerNotification` 与 selector 72 在卡上各 0 行，那格缺席今天只由「卡上 `clover r180:` 恰好 55 枚 < 96 行预算、且八枚 `capped at` 都不指向显示类」算得过来，结构性自证（`log=`/`logdrop=`）是 r329 才有的。唤醒腿（`client+0x110` 起、步幅 `0xb0`、6 格）与那两支查询所查的 `+0x16d0`/`+0x16e0` 都已在出厂指令流里本地解码核实，**下一手 r333 才把它们做成一行** | dev-log §Round332c ③–⑦ |
+| 出厂等待路径自带一枚 5 秒断言，而今天没人钉它 | `"IOMFB: swap_wait_gated blocked for more than 5 seconds. Should not happen. Panicking"` 这句及其 `CommandWake didn't happen even after 5 seconds`、`retried > 2 times` 邻居，在 `round332-kernel-normalized.macho` 与出厂 kernelcache 里 `grep -a -c` **逐枚同数**（3/3、1/1、1/1）⇒ 那句话就在我们链接进来的那一族里；某靴若死在它手上，卡上会有它，但**没有任何针脚钉过这句话** | dev-log §Round332c ④ |
 | HID 边缘计数没有卡上通道 | `native_touch_edge_stats[0..3]`（装上了没/几枚接触起于边缘/被跳过几枚事件）只在 RAM 里加，**没有一行读数印它**——所以边缘接触那格既支持不了也反驳不了；要动它得新起一枚 tee 类，而那与桌面主线争同一格预算 | dev-log §Round332 ③、⑩ |
 | 基仓那 34 枚同形状引文不在本仓职权 | r332 的引文闸门明确跳过解析后落进基仓的路径；本仓发版源码里的 12 枚已撤回并做成禁则，基仓要有自己的账本或自己的规则，那是另一棵树的一次改动 | dev-log §Round332 ②、⑩ |
 
