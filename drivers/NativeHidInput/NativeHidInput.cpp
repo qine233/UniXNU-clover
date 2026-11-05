@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Explicit offline keyboard/consumer input source. Uses the unchanged original
 // HID parser and event dispatch; no user-client entitlement is substituted.
+// Citation rule for this file (round332): a claim that came down with the source it was vendored from is marked
+// "inherited claim, no record in this repository" instead of cited to an `int-` round number -- neither this
+// repository nor the base one carries the ledger those numbers count, so such a label would read as a reference
+// nobody can open. Wording that makes the round shipping a file the subject of that file's own comment is not used either.
 #include "OriginalHidDeviceABI.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
@@ -48,17 +52,19 @@ static const unsigned char touchDescriptor[]={
     0x09,0x54,0x75,0x08,0x95,0x01,0x15,0x00,0x26,0xff,0x00,0x81,0x02,0xc0
 };
 #define TOUCH_FINGERS 10
-// Edge contacts (int-163). A contact that starts within ~3 mm of a panel edge carries kIOHIDDigitizerEventFromEdgeTip (0x800) in its
-// finger events' event mask for its whole life, as Apple's multitouch stack reports it (MultitouchHID). UIKit derives UITouch's edge
-// type from that bit alone (_UIEventHIDTouchEdgeTypeForHIDEvent: 0x800/0x1000/0x2000/0x40000 -> 1..4), and every screen-edge
-// recognizer of SpringBoard fails at once on edge type 0: int-162 logged edge=0 for touches starting 2 pt above the bottom edge and
-// SBHomeGesturePanGestureRecognizer / SBFluidSwitcherScreenEdgePanGestureRecognizer going 0->5, so no home or switcher gesture.
-// The original IOHIDEventDriver (IOHIDFamily-2031.120.4) never sets the bit. Its dispatchEvent (IOHIDEventService slot 198, the slot
-// 37 of IOHIDFamily's indirect calls use) is wrapped for this device's driver only, in a copy of its vtable; the wrapper adds the bit
-// to the finger children of each digitizer collection and calls the original. IOHIDEvent virtuals of that version: getType 18,
-// getIntegerValue 23, setIntegerValue 24, getFixedValue 25 (setIntegerValue/getIntegerValue at +0xc0/+0xb8 in the driver's own
-// calls); _children at +24 (IOHIDEvent.h; appendChild stores into it and free releases it). _parent is never set (appendChild only
-// stores the child, int-163 skipped every finger by comparing it), so each child is an IOHIDEvent by its class instead.
+// Edge contacts. A contact that starts near a panel edge is meant to carry kIOHIDDigitizerEventFromEdgeTip (0x800) in its finger events' event
+// mask for its whole life, the way Apple's multitouch stack reports it (MultitouchHID), because UIKit derives UITouch's edge type from that bit
+// alone (_UIEventHIDTouchEdgeTypeForHIDEvent: 0x800/0x1000/0x2000/0x40000 -> 1..4). How close "near" has to be (~3 mm, and the 48 px below is
+// what that became) and the claim that every SpringBoard screen-edge recognizer fails at once on edge type 0 are each an
+// inherited claim, no record in this repository, and the recognizer names they used to cite are not on any card read here. That last part is still open as an
+// instrument gap:
+// native_touch_edge_stats[0..3] counts in RAM and no row prints it, so no boot can confirm or refute the edge story today.
+// What the wrapper itself does is readable from the enum below. The original IOHIDEventDriver (IOHIDFamily-2031.120.4) never sets the bit; its
+// dispatchEvent (IOHIDEventService slot 198, the slot 37 of IOHIDFamily's indirect calls use) is wrapped for this device's driver only, in a copy
+// of its vtable, and the wrapper adds the bit to the finger children of each digitizer collection before calling the original. IOHIDEvent
+// virtuals of that version: getType 18, getIntegerValue 23, setIntegerValue 24, getFixedValue 25 (setIntegerValue/getIntegerValue at +0xc0/+0xb8
+// in the driver's own calls); _children at +24 (IOHIDEvent.h; appendChild stores into it and free releases it). _parent is never set -- appendChild
+// only stores the child -- so each child is an IOHIDEvent by its class instead, which is why the test below is a class check and not a parent one.
 namespace edge {
 enum {kSlots=256,kDispatch=198,kGetType=18,kGetInteger=23,kSetInteger=24,kGetFixed=25,kContacts=256};
 enum : uint32_t {kDigitizer=11,kX=0xB0000,kY=0xB0001,kIndex=0xB0005,kMask=0xB0007,kTouch=0xB0009,kMaskTouch=2,kFromEdgeTip=0x800};

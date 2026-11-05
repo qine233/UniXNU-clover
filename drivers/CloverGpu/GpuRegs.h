@@ -78,8 +78,8 @@
 // spells `BRANCH_HALT 0 /* pol: 1 = halt */` -- which is the halt_check every one of the four GPUCC
 // branches above and the three GCC ones declares. So a 1 at bit31 says the clock is NOT running
 // however the enable request at bit0 reads, and r286's `gfx3d_en=` field only ever printed bit0.
-// Boot 74 could therefore say "gfx3d was asked for" without saying "gfx3d runs"; that gap is what
-// this round closes.
+// Boot 74 could therefore say "gfx3d was asked for" without saying "gfx3d runs"; round290 closed that gap by reading
+// bit31 beside bit0 on the same beat.
 #define kBranchClkOff       0x80000000U
 
 // Round291: the GFX LDO. `gfx_ldo_vreg: ldo@0506e000` (sdm660-regulator.dtsi:523) declares

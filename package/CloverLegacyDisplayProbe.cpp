@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Board-local instrument for the clover GOP display bring-up (round180).
+// Citation rule for this file (round332): a claim that came down with the source it was vendored from is marked
+// "inherited claim, no record in this repository" instead of cited to an `int-` round number -- neither this
+// repository nor the base one carries the ledger those numbers count, so such a label would read as a reference
+// nobody can open. Wording that makes the round shipping a file the subject of that file's own comment is not used either.
 //
 // This is the clover narrowing of the sheng device repository's package/LegacyDisplayProbe.cpp. It owns every hook
 // that drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp declares but does not define (18 of the 27 undefined
@@ -499,7 +503,9 @@ void native_legacy_client_observed(IOReturn status,IOUserClient *client) {
  * asking" and "nothing new happened to print about". The four report helpers sheng's probe exports
  * (`prepare_report`, `properties_now`, `state_words`, `clients_dump`) are what answers that on the
  * reference board -- its package/BootLog.c pulls all four into a report -- and here they have no caller
- * at all, which is the difference this round closes.
+ * at all. Round329 recorded that as an open debt rather than closing it (dev-log §Round329 ②.4, and the
+ * gap row in README); what that round added is this row, which reads the same client counters and the
+ * same three object words on the display's own clock.
  *
  * What the columns are, each named for the expression that fills it:
  *   ms=        probeNowUs()/1000: milliseconds since boot, from absolutetime_to_nanoseconds. Not `t=` --
@@ -794,8 +800,11 @@ void native_legacy_display_late_probe(void) {
                             unsigned gpu=0;PE_parse_boot_argn("sheng-fb-gpu",&gpu,sizeof gpu);
                             if(gpu==1) {
                                 IOService *handoff=native_gop_presenter_create();
-                                // Not a child of the display subsystem's node: the original display code enumerates that node's
-                                // children (sheng int-075/077: SpringBoard found no display and crashed with the presenter there).
+                                // Not a child of the display subsystem's node: the original display code enumerates that node's children, and the
+                                // crash that settled this (SpringBoard finding no display and dying with the presenter under that node) is a label
+                                // from sheng's own ledger, which is in neither repository -- so this is an
+                                // inherited claim, no record in this repository. It is also inert here: sheng-fb-gpu is not in board.toml's
+                                // args, so gpuHandoffPresenter is never created and this branch never runs on any image this board ships.
                                 IOService *home=IOService::getResourceService();
                                 bool handoffAttached=false;
                                 if(handoff && home)native_gop_presenter_set_source(handoff,nub);

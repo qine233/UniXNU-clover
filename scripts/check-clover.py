@@ -6990,8 +6990,8 @@ def check_board(errors: list) -> str:
     # kernel and added ephemeral-storage; boot 108 read it back and the stall only moved (migration ->
     # chronod), and sheng boots to the desktop without it, so round322 reverts the ADT again: same
     # kernel, ephemeral-storage ABSENT so first-boot migration runs -- the menu names round322.
-    if not board["payload"]["title"].startswith("clover r331:"):
-        errors.append('[payload] title is not "clover r331: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r332:"):
+        errors.append('[payload] title is not "clover r332: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -8176,8 +8176,8 @@ def check_board(errors: list) -> str:
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r331:"):
-        errors.append('[payload] title is not "clover r331: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r332:"):
+        errors.append('[payload] title is not "clover r332: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -9458,6 +9458,66 @@ def check_driver_products(errors: list) -> str:
     return f"{found} archives, {objects} objects ABI-checked, kernel " + ("read" if image else "absent")
 
 
+CITATION_RULE = "Citation rule for this file (round332)"
+INHERITED_MARKER = "inherited claim, no record in this repository"
+UNRESOLVABLE_CITATION = re.compile(r"\bint-\d{3}\b")
+
+
+def check_citation_integrity(errors: list) -> str:
+    """Round332. No shipped comment may cite a ledger that nobody on this machine can open.
+
+    The vendored display and HID classes carried twelve `int-NNN` citations. Two of them (the ones that
+    used to sit on the refresh-interval comment) asserted a pacing story that this repository's own host
+    scan then argued against -- the Round329 host scan (dev-log Round329, gap 2) found no reader of IOMFBDisplayRefresh anywhere in
+    the iPadOS 17.7.11 shared cache -- and the other ten name rounds of a ledger that exists in neither
+    this repository nor the base one (34 of the base repo's own driver files cite the same shape), so none
+    of them can be opened, checked, or falsified from a card. Round332 kept every engineering claim, put
+    the ones with no evidence behind them where a reader can see they have no evidence, and rules here so
+    the shape cannot walk back in:
+
+      1. the `int-NNN` shape may not appear in source this repository compiles;
+      2. a shipped comment may not say "this round closes" -- the round that shipped a file is not the
+         round a later reader is in, which is how round329's own title sentence went stale on disk;
+      3. the three files that held those claims each carry the citation-rule header and the marker phrase,
+         so a retired label leaves behind a rule and not a gap.
+    """
+    base = base_repo_root()
+    scanned = 0
+    for pattern in ("drivers/**/*.cpp", "drivers/**/*.h", "package/**/*.cpp", "package/**/*.h"):
+        for source in sorted(REPO.glob(pattern)):
+            resolved = source.resolve()
+            if base is not None and base in resolved.parents:
+                continue  # the base repository's own drivers cite their ledger; that is not this gate's to judge
+            scanned += 1
+            text = source.read_text(errors="replace")
+            hits = sorted(set(UNRESOLVABLE_CITATION.findall(text)))
+            if hits:
+                errors.append(f"{source.relative_to(REPO)} cites {', '.join(hits[:6])}: no repository on this "
+                              "machine holds the round log those numbers name, so the citation reads as evidence "
+                              "while being nothing a reader can check -- keep the claim and say it is inherited "
+                              "(see the citation rule at the top of the display and HID sources)")
+            if "this round closes" in text:
+                errors.append(f"{source.relative_to(REPO)} says \"this round closes\": a shipped file cannot be "
+                              "closing a round for whoever reads it next -- name the round that closed it "
+                              "(round329's title sentence is the case this rule was written from)")
+    for source in (REPO / "drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp",
+                   REPO / "drivers/NativeHidInput/NativeHidInput.cpp",
+                   REPO / "package/CloverLegacyDisplayProbe.cpp"):
+        relative = source.relative_to(REPO)
+        if not source.is_file():
+            errors.append(f"{relative} is missing: it is where round332 recorded the citation rule for the "
+                          "vendored display and HID claims, and the twelve retired labels lived in these files")
+            continue
+        text = source.read_text(errors="replace")
+        if CITATION_RULE not in text:
+            errors.append(f"{relative} lost the citation-rule header: without it a later round has no stated "
+                          "way to mark an inherited claim and the `int-NNN` shape returns by default")
+        if INHERITED_MARKER not in text:
+            errors.append(f"{relative} no longer marks anything as an {INHERITED_MARKER!r}: the claims this file "
+                          "inherited are still there, and an unmarked assumption reads as a reading")
+    return f"citation shapes banned in {scanned} authored sources"
+
+
 def main() -> int:
     errors: list = []
     adt_summary = check_adt(errors)
@@ -9467,6 +9527,7 @@ def main() -> int:
     asm_summary = check_inline_asm(errors)
     tree_summary = check_tree(errors)
     doc_summary = check_driver_documentation(errors)
+    citation_summary = check_citation_integrity(errors)
     product_summary = check_driver_products(errors)
     for error in errors:
         print(f"[check-clover] {error}", file=sys.stderr)
@@ -9474,7 +9535,7 @@ def main() -> int:
         return 1
     print(f"[check-clover] clover ok: ADT {adt_summary}; {region_summary}; "
           f"board {board_summary}; DT {dt_summary}; {asm_summary}; {tree_summary}; "
-          f"{doc_summary}; {product_summary}")
+          f"{doc_summary}; {citation_summary}; {product_summary}")
     return 0
 
 

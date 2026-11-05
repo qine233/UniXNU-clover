@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Reuse the unchanged original generic framebuffer implementation. Unknown
 // backend leaves stop; this class is not yet a published system display.
+// Citation rule for this file (round332): a claim that came down with the source it was vendored from is marked
+// "inherited claim, no record in this repository" instead of cited to an `int-` round number -- neither this
+// repository nor the base one carries the ledger those numbers count, so such a label would read as a reference
+// nobody can open. Wording that makes the round shipping a file the subject of that file's own comment is not used either.
 #include "OriginalLegacyFramebufferABI.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -67,9 +71,11 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool primary=false;
     bool logicalPM=false;
     bool transferred=false;
-    // Every request the validator accepted and the family has not retired yet. A client may submit swap N+1 while swap N is still on the GPU
-    // (int-131: swap 3 was validated during swap 2's GPU copy and one remembered pointer lost swap 2, which then never retired and left
-    // every wait on it busy), so more than one can be pending.
+    // Every request the validator accepted and the family has not retired yet, so more than one can be pending and this is an array, not a slot.
+    // The GPU overlap this note used to cite is an inherited claim, no record in this repository: the ledger its label named is not here, and the
+    // only swap/retire sequence on disk -- boot 113's window, `clover r180: swap#N accepted` then `retire#N` -- never shows a second acceptance
+    // before a retirement. The array stays because nothing read here proves a client cannot overlap them either; only `pending=` on the row says
+    // what the family itself thought was outstanding.
     const OriginalLegacySwapRequest *validated[8]={};
     bool isValidated(const OriginalLegacySwapRequest *request) const {
         if(!request)return false;
@@ -233,18 +239,20 @@ public:
     void registerService(IOOptionBits options=0) override {
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
         if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
-        // Nothing in the family publishes IOMFBDisplayRefresh (its platform subclass does), and without it the render server keeps its own
-        // 1/60 s heartbeat (int-210: refresh=0). Publish it before any client can find the display, only when sheng-vsync asks for more.
+        // Nothing in the family publishes IOMFBDisplayRefresh (its platform subclass does). The 1/60 s heartbeat this note used to cite for the
+        // render server is an inherited claim, no record in this repository, and round329's host scan argues against it outright: dev-log
+        // §Round329 ②.2 found no reader of that property anywhere in the iPadOS 17.7.11 shared cache, so publishing it treats nothing. Inert on
+        // this board anyway: board.toml's args carry no sheng-vsync, so hz stays 0 and the call below never runs.
         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
         if(primary && hz>60 && hz<=240)native_legacy_set_refresh_properties(this);
         IOService::registerService(options);native_legacy_registration_observed(this);
     }
     bool isMainDisplay() override {return primary;}
-    // The render server paces its display timer by the minimum refresh interval in IOMFBDisplayRefresh (int-209: no vsync client ever
-    // registered, frames came every 16.7 ms), and the generic slot 301 fixes it at 1/60 s. With sheng-vsync=<Hz> it reports the panel's
-    // own rate instead; the maximum interval and the step keep the original values. Words in 32.32 seconds, then their mach times.
-    // The original maximum interval is 1/24 s (int-240), which offers the render server a 24 to sheng-vsync Hz range. The panel has no
-    // variable refresh, so sheng-vsync-fixed=1 reports the maximum interval equal to the minimum: one fixed rate.
+    // What this function does is checkable from these lines: with sheng-vsync=<Hz> in 61..240 it overwrites words[0]/[1] with the panel's minimum
+    // refresh interval -- 32.32 seconds, then its mach time -- and sheng-vsync-fixed=1 sets the maximum equal to the minimum, one fixed rate.
+    // Why a client would care is not: that the render server paces its display timer off words[0], that without it frames come every 16.7 ms,
+    // and that the original maximum interval is 1/24 s are each an inherited claim, no record in this repository (dev-log §Round329 ②.2 argues
+    // against the pacing one). Both boot args are absent from board.toml, so this board ships the family's own values untouched.
     bool getRefreshAttributes(uint64_t *words,bool fixed) override {
         if(!IOMobileFramebufferLegacy::getRefreshAttributes(words,fixed) || !words)return false;
         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
@@ -257,9 +265,11 @@ public:
         native_legacy_vsync_observed(5,hz);
         return true;
     }
-    // A swap the client submitted while the previous one was still on its way (transferred) is not kicked by the family again: without the
-    // re-kick after each retirement it waited for the next submission (int-143: every offer came one frame late, a still screen showed the
-    // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
+    // A swap the client submitted while the previous one was still on its way (transferred) is not kicked by the family again, so each retirement
+    // has to re-kick the queue or the request waits for a submission that already happened. The failure that story was pinned to -- every offer
+    // one frame late, a still screen holding the previous frame until the next touch -- is an inherited claim, no record in this repository, and
+    // boot 113, the only window on disk with swap/retire rows, is serialized, so it can neither confirm the lag nor name its cause.
+    // A retirement inside a kick only asks the running kick to loop.
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
         armVsync();
@@ -325,8 +335,9 @@ public:
            !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
             native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
-        // The diagnostic renderer repaints the page over the scanout until it is told the system owns the display; the GPU path needs that as much
-        // as the CPU copy (int-093: accepted swaps were GPU-copied under a page that kept drawing).
+        // The diagnostic renderer repaints the page over the scanout until it is told the system owns the display, so both transfer paths
+        // prepare the scanout before writing pixels. The GPU half of that sentence is an inherited claim, no record in this repository -- and
+        // on this board there is no GPU transfer to prepare for: native_legacy_gpu_offer returns false without a hand-off presenter.
         if(!gpuBypass) {
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
         }
@@ -334,10 +345,13 @@ public:
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
             shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
-            // The compositor renders the next frame only after this swap retires, so retiring at the end of the copy serialized render and
-            // copy (int-243: about 4.4 ms render then about 3 ms copy per frame). Retire now: the presenter holds its own reference to this
-            // frame's memory, the previous frame's copy has finished (transferred held this one back), and the next swap still waits for
-            // the copy because transferred stays set until finishGpuSwap.
+            // The compositor renders the next frame only after this swap retires, so retiring at the end of the copy would serialize render and
+            // copy. Retire now instead: the presenter holds its own reference to this frame's memory, the previous frame's copy has finished
+            // (transferred held this one back), and the next swap still waits for the copy because transferred stays set until finishGpuSwap.
+            // The 4.4 ms render and 3 ms copy behind that reasoning is an inherited claim, no record in this repository -- and it describes a
+            // branch this board never enters: native_legacy_gpu_offer needs the hand-off presenter, which only sheng-fb-gpu=1 creates, and
+            // board.toml's args do not set it. So native_legacy_early_retires stays 0 here, and the only row that prints it
+            // (`gpu hand-off refused ... early_retires=`) has never appeared on a card.
             unsigned early=1;PE_parse_boot_argn("sheng-early-retire",&early,sizeof(early));
             if(early==1 && retireSwap(request,true)) {
                 gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;
@@ -371,9 +385,10 @@ public:
         {
             // Store only what changed since the previous frame (the scanout memory is slow device memory).
             uint64_t need=(uint64_t)width*height*4;
-            // Differential copy is opt-in (sheng-fb-diff=1): on hardware it reads the whole source every frame and was not faster
-            // than the plain copy (143-285 ms per swap either way), and the first boots with it were followed by an unresponsive
-            // lock screen that disappeared with the plain copy (int-005).
+            // Differential copy is opt-in (sheng-fb-diff=1). It reads the whole source every frame, and the two things that turned it off -- that
+            // it was no faster than the plain copy (143-285 ms per swap either way) and that the first boots carrying it were followed by an
+            // unresponsive lock screen that went away with the plain copy -- are each an inherited claim, no record in this repository. What is
+            // verifiable here is the gate: board.toml sets no sheng-fb-diff, so diffOff is true and the shadow buffer is never allocated.
             static int diffOff=-1;
             if(diffOff<0){unsigned v=0;PE_parse_boot_argn("sheng-fb-diff",&v,sizeof v);diffOff=(v!=1);}
             if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}

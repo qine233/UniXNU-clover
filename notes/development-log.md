@@ -26880,3 +26880,106 @@ hop 在本行里没有独立读数（`debt=` 说有几枚，不说它们是哪�
 `round331-v0.7.42-payload.img` 逐字节仍是 `e7b14b6a…`，所以不重建负载、不改版本号，v0.7.42 一次发完。
 一句留给下一次的话：这枚 flake 与 r331 无关，但它落在同一个闸门里；闸门里任何一条会随宿主负载变红的
 断言，都在替「判据」做它没答应的采样——现在满载腿在，这类句子至少会被跑出来而不是撞上。
+
+## Round332（v0.7.43，宿主侧，不刷写，纯注释轮）：把 12 枚开不了封的引文从发版源码里撤掉，并把这个形状做成闸门
+
+**① 债在哪儿。** README 的缺口表里那一行「纯注释轮仍欠」是 r330 与 r331 各记一次的（dev-log
+§Round330 ⑧、§Round331 ⑧）。它说的不是「注释还没写够」，是相反的一件事：`NativeLegacyDisplay.cpp`、
+`NativeHidInput.cpp` 与 `package/CloverLegacyDisplayProbe.cpp` 这三枚**会进发版镜像**的源文件里，
+有 12 枚形如 `int-NNN` 的引文被当成论据在使用，而那本编号账本在这台机器上任何一棵树里都不存在。
+本轮把债还成两件事：引文逐枚改到可核，形状进闸门。
+
+**② 动手前先查 sheng，再查三棵树。** 计数与判法都在 `~/clover-out/round332-citation-audit/audit.md`
+里（当天跑，命令与逐枚处置都落盘）。要点三句：设备仓 3 个文件带这一形状（12 枚标签、9 处站点）；
+基仓 `UniXNU` 34 个文件带同形状且 `docs/` 里没有轮次账本，`docs/drivers/native-adreno.md` 里的
+`int-148`/`int-150` 是句子里带着数字、没有表可查；对照板 `UniXNU-sheng` 在自己的
+`package/TouchProbe.cpp`、`ButtonProbe.cpp`、`GpuPowerProbe.cpp`、`BootWatchdogPolicy.c` 里用同一形状，
+但**同号不同事**——`int-143` 在 sheng 是 `sheng-gpu-pause-us` 提交前阻塞、`int-243` 是一次 App Library
+滑动、`int-005` 是 GPU 报告行排版、`int-075` 是一份报告布局注记；本轮这 12 枚里有 8 枚
+（`int-131`/`162`/`163`/`077`/`093`/`209`/`210`/`240`）在 sheng 一次都不出现。所以「去 sheng 找那本账」
+这一格是阴性结论，不是待办：这条引文的修法不能靠对照板。
+
+**③ 逐枚处置：不删论断，只把「谁说的」改成可核。** 站点按**符号**命名，不按行号（r314 立的那条：
+只会被编辑的文件别用行号当针脚——这三枚文件恰好是本轮在编辑的文件，而行号正是先前烂掉的那一部分）。
+三种去向各有代表：
+- **已被本轮自己的档案证伪**：`NativeLegacyDisplay::registerService` 的 `int-210` 说「没有
+  `IOMFBDisplayRefresh` 时渲染服务器保 1/60 s 心跳」。dev-log §Round329 ②.2 已在 iPadOS 17.7.11 的共享缓存
+  里扫过，`IOMFBDisplayRefresh` 没有读者；而 `grep -c sheng-vsync board.toml` = 0，那一支在本板上从不开。
+  现在写成「一支已废的机制＋本板不可达」，不再挂任何编号。
+- **分支在本板不可达**：早退那一支的 `int-243`（「约 4.4 ms 渲染再约 3 ms 拷贝」）。
+  `native_legacy_gpu_offer()` 没有 `gpuHandoffPresenter` 就返回 false，而 `grep -c sheng-fb-gpu board.toml` = 0
+  ⇒ 承载它的 `handoff` 从不成立；`native_legacy_early_retires` 只由
+  `gpu hand-off refused status=%08x early_retires=` 那一行说出，而 `grep -a early` 在
+  `~/clover-out/clover-log-window-boot113.bin.txt` 里 0 命中。`int-093`（CPU 拷贝路径上的
+  `prepare_scanout`）与 `int-075`/`int-077`（presenter 挂到显示节点之下）同理。
+  `int-005`（差量拷贝 143–285 ms 且首几靴锁屏失灵）也 inert：`sheng-fb-diff` 不在 args ⇒ `diffOff` 为真，
+  shadow 缓冲一次都没分配。
+- **仍然答不了，而且答不了的原因是一格仪器缺口**：`NativeHidInput` 边缘接触那一块的 `int-162`/`int-163`
+  （约 3 mm 边缘窗口、`edge=0` 让 SpringBoard 每条屏幕边缘识别器同时失效）。机制部分照旧写（slot 198
+  `dispatchEvent` 包装、IOHIDEvent 虚表 18/23/24/25、`_children` 在 +24），数字与判词标为
+  inherited claim；并补上本轮查出来的一句：`native_touch_edge_stats[0..3]` 只在 RAM 里加，
+  **没有一行卡上读数印它**，所以那两条编号既支持不了也反驳不了——这条已进 README 缺口表。
+  `int-131`（swap 3 在 swap 2 的 GPU 拷贝期间通过校验）由 boot 113 窗口逐字顶掉「引文」的身份：
+  `swap#1 520.047 → retire#1 530.257 → swap#2 530.282 → retire#2 531.800 → swap#3 531.869 → retire#3
+  533.637 → swap#4 559.593 → retire#4 561.082` 严格串行、每次 retire `current=0 pending=0`，
+  所以数组留作守卫，但它的理由改成这条读数而不是编号。
+
+**④ 换约定。** 新的标记短语是 `inherited claim, no record in this repository`，逐枚跟着那句论断写在
+它自己的注释里；每文件头部加一段 `Citation rule for this file (round332)` 说明为什么不再用编号。
+一处措辞禁令同时生效：发版文件不许把「发版这一轮」当该文件自身注释的主语。
+
+**⑤ 两处轮相对话术改准。** `CloverLegacyDisplayProbe.cpp` 的 `dispstate`「Why this row exists」块原写
+「这四枚 helper 没有调用者，which is the difference this round closes」——r329 只是**另建**了一份报告，
+helper 的债没还。现在点名 round329 与 dev-log §Round329 ②.4，并写明债仍在。`drivers/CloverGpu/GpuRegs.h`
+里那句「that gap is what this round closes」由 `git log -S 'this round closes' -- drivers/CloverGpu/GpuRegs.h`
+追到 `c0cbafc clover r290 (v0.6.89)` ⇒ 改成 round290 已经 closes 过。
+
+**⑥ 闸门。** `scripts/check-clover.py` 新增 `check_citation_integrity()`：扫 `drivers/**` 与 `package/**`
+的 `.cpp`/`.h`，**跳过解析后落进基仓的路径**（组装树 symlink 进来的那些不属于本仓职权），做三件事——
+禁 `int-\d{3}` 形状、禁轮相对句子、要求本轮命名的三枚文件里那两串（规则头＋标记短语）都在。
+两枚闸门各报 `citation shapes banned in 34 authored sources`（仓库与 `out/clover/tree` 各一次，
+`/tmp/r332-check-repo.log`、`round332-check-tree.log`）。四条负测逐条判红、恢复后转绿，日志与三枚
+恢复后的 sha256 都在 `~/clover-out/round332-citation-audit/negatives.log`：
+C1 把 `int-131` 写回 ⇒ 判红；C2 删规则头 ⇒ 判红（句子说的是「后来的人没有标法，形状会默认回来」）；
+C3 换掉标记短语 ⇒ 判红；C4 把「this round closes」写回 ⇒ 判红。
+
+**⑦ 本轮自己抓住的错——闸门第一次跑就判红在自己的说明文字上。** `Citation rule for this file` 那段
+注释为了说明禁令，把被禁的那句话**逐字引用**了一遍 ⇒ `check-clover.py` 以 3 枚错误判红（本轮的
+`int-` 撤回还没测到，先被自己的规则拦下）。这是第十八层 ⑤ 那一格的推广：**说明禁则的文字不许含被禁的串**；
+上一回同形的是 r331b 的 `usleep` 禁则，那一回判法是「禁则打在滤掉注释后的代码行、存在性针脚打在全文」，
+本轮因为要禁的正是注释里的句子，只能改成**描述而非引用**。这条不是隐藏掉的失败，写在这里是因为它给出
+一条通用形状：任何「用文本形状做禁则」的闸门，都要先问「用来写这条禁则的那段文字自己会不会撞上」。
+
+**⑧ 纯注释轮不是哈希轮——把「行为未变」从断言变成测量。** r331 与 r332 的归一化内核逐段比
+（`~/clover-out/round332-citation-audit/kernel-text-exec-diff.txt`、`other-segment-diffs.txt`）：
+`__DATA_CONST`、`__DATA`、`__BOOTDATA`、`__KLD`、`__LASTDATA_CONST`、`__KLDDATA`、`__PRELINK_TEXT`、
+`__PLK_TEXT_EXEC`、`__PRELINK_DATA`、`__PLK_DATA_CONST`、`__LINKINFO`、`__LINKEDIT` 全逐字节相同；
+`__TEXT_EXEC` 在 8,617,984 字节里差 **4 个字节**，两枚 `MOVZ` 立即数：
+`0x528053d1 → 0x52805491`（`mov w17, #670 → #676`）与 `0x52804e89 → 0x52804f49`（`mov w9, #628 → #634`）。
+`objdump` 把两处落在 `_native_legacy_backend_guard` 与 `_native_legacy_gop_mapping_observed` 的 `.cold.1`
+panic 块里，`x0` 的两枚格式串（按 VA 解出）是 `NativeLegacyDisplay: leaf=%u caller=%llx … @%s:%d` 与
+`NativeLegacyDisplay: wrong mapping owner @%s:%d` ⇒ **`panic()` 把 `__LINE__` 折成立即数**，站点在
+`package/CloverLegacyDisplayProbe.cpp:634` 与 `:676`（后者的调用跨 672–676，clang 取闭合括号那一行）。
+该文件本轮在 628 行以上只有两个 hunk（顶部 +4、502/506 处 +2）＝净 **+6**，正是这两枚立即数的位移；
+第三个 hunk 在 797 行以下，动不到它们。另有两格与代码无关、每建必变：Mach-O 头里的 `LC_UUID`
+（16 字节）与 `__PRELINK_INFO` 的 `_PrelinkKCID` `<data>`（22 字节 base64 文本）——这与 §Round329 那条
+`adt_sha256`/ADT `random-seed` 是同一条教训的上一层：**跨轮比内核，先排掉这两格再谈差异**。
+于是「纯注释轮」可用的判据不是「镜像哈希相同」（不可能相同），而是「差异只落在 `__LINE__` 立即数与那两格
+每建必变上」；本轮满足它。
+
+**⑨ 产物与状态。** board.toml 卡上标题升到 `clover r332:`（含转义引号，`verify-clover-payload.py` 的
+`title ok` 过）。内核 `round332-kernel-normalized.macho` = `3b34a354113ff90f…`（AMFI 后、归一化前
+`756123ef4590246f…`），负载 `round332-v0.7.43-payload.img` = `4543912c1b87a2db…`（58,720,256 B），
+`round332-payload.json` 自证 `kernel_sha256` 就是归一化那一枚、`kernel_args` 与 r328/r331 **逐字节相同**
+⇒ boot-args 一字未动。双闸门 EXIT=0；`verify` 51 行 OK、0 FAIL。板子不在 ⇒ **未刷写**：下一刷仍是
+`round328-v0.7.39-payload.img`（boot 114 读那对债主行不被混淆），r329→boot 115、r331→boot ≥116，
+而 r332 不改行为，因此不必单独占一次上机——它跟着下一支真正改读数的轮一起上机即可。
+
+**⑩ 本轮起记的欠账。**
+1. `native_touch_edge_stats[4]` 有四枚计数、没有卡上通道（③ 那格）。要动它得新起一枚 tee 类，
+   而这与桌面主线争同一格预算，所以留在缺口表里而不是本轮顺手加。
+2. 基仓那 34 枚同形状引文不在本仓职权内：本轮的闸门明确跳过解析进基仓的路径。基仓要有自己的账本或
+   自己的规则，那是另一棵树的一次改动。
+3. r329 起的四枚 vendored 显示报告 helper 仍零调用者（本轮只是把注释里的说法改准，债没还）。
+4. 若某轮真的想「纯注释而内核哈希不变」，得先让 `panic()` 那类 `__LINE__` 折叠停下来（例如把守卫
+   统一走一处不嵌行数的 sink）——本轮没做，也没有这个必要，因为判据已经改成 ⑧ 那一句。
