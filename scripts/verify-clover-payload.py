@@ -1271,6 +1271,17 @@ def check_sb_sample(kernel: bytes) -> bool:
              # r327's row stays, because the pair is the reading.
              "r328-bbrcv": (b"clover r328: bbrcv t=%llu pid=%d hn=%u rstate=%s rnamed=%u rasked=%u "
                             b"c=%s.%s.%s.%s v=%x.%x.%x.%x q=%u.%u.%u.%u s=%u.%u.%u.%u e=%d.%d.%d.%d\n") in kernel,
+             # Round329 prints from package/CloverLegacyDisplayProbe.cpp, and that object is linked into
+             # this kernel image, so the row is pinned at the outlet it has to pass through -- the format
+             # string the beat hands to the console -- rather than at a source line (round17's rule). Both
+             # literals are required: the cut branch is the only proof that the 320-byte record was not
+             # quietly swallowing the row's tail, and a binary that carries one and not the other cannot
+             # say which half of that promise it broke. r327's and r328's rows stay: this round adds a
+             # neighbour, it does not replace either.
+             "r329-dispstate": (b"clover r329: dispstate ms=%llu fires=%u seen=%u client=%s calls=%s fails=%s "
+                                b"regall=%s regs=%s grew=%s hot=%s s6=%s done=%s presented=%s frames=%s "
+                                b"vs=%u/%llu/%llu log=%u/%u logdrop=%u\n") in kernel,
+             "r329-dispstatecut": (b"clover r329: dispstatecut bytes=%d cap=%u fires=%u client=%s\n") in kernel,
 
              "aks-say-sel": (b"clover r281: aks sel%u n=%u rc=%x\n") in kernel,
              "aks-say-open": (b"clover r281: open %u pid=%d comm=%.16s\n") in kernel,

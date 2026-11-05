@@ -59,10 +59,15 @@ static char cloverRound[]="clover r180:";
 // One bounded log channel: the kernel message buffer, which the storage driver's tee carries onto the card. The budget
 // is per boot and per event class, never per frame.
 static volatile uint32_t cloverLogLines;
+// Round329 names the other half of this budget. Boot 113 carried 55 of the 96 lines this channel may
+// print, so a line that is missing from the card can mean either "the event never happened" or "the
+// event happened after line 96" -- and the r329 row is read beside both. Counted here, at the one
+// place that knows it dropped something, and published as `logdrop=` on the periodic row.
+static volatile uint32_t cloverLogDropped;
 enum {kCloverLogBudget=96};
 static void cloverLog(const char *format,...) __attribute__((format(printf,1,2)));
 static void cloverLog(const char *format,...) {
-    if(cloverLogLines>=kCloverLogBudget)return;
+    if(cloverLogLines>=kCloverLogBudget){cloverLogDropped=cloverLogDropped+1;return;}
     cloverLogLines=cloverLogLines+1;
     char line[320];
     va_list arguments;va_start(arguments,format);
@@ -357,7 +362,12 @@ void native_legacy_client_enter(task_t task,uint32_t type) {
 enum {kSeenClients=8,kSelectors=96,kRegEvents=8,kVtableSlots=256};
 struct ClientStat {
     uintptr_t object;int pid;uint32_t calls,fails;uint32_t selector_calls[kSelectors],selector_fails[kSelectors],selector_status[kSelectors];
-    unsigned regs;struct {uint32_t type;uint64_t port;uint32_t ref,status;} reg[kRegEvents];
+    unsigned regs;
+    // Round329: `regs` counts what this record kept (at most kRegEvents), so it saturates and cannot answer
+    // "how many registrations arrived". `regCalls` counts every call, kept or not; the two together are the
+    // difference between a client that registered once and one that registered eleven times and filled the slots.
+    uint32_t regCalls;
+    struct {uint32_t type;uint64_t port;uint32_t ref,status;} reg[kRegEvents];
     uint64_t sel6_first[3],sel6_last[3];uint32_t sel6_distinct;uint64_t sel6_seen[8][3];uint32_t sel6_calls[8],sel6_fails[8],sel6_status[8];
     uint32_t seq_count;struct {uint32_t a,b,c,status,done,presented;} seq[24];
     uintptr_t original_external,original_register;
@@ -407,13 +417,20 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
 static IOReturn wrappedRegister(IOUserClient *client,mach_port_t port,UInt32 type,UInt32 reference) {
     ClientStat *stat=statFor(client);
     IOReturn status=stat?reinterpret_cast<RegisterFn>(stat->original_register)(client,port,type,reference):kIOReturnNotAttached;
-    if(stat && stat->regs<kRegEvents){
-        auto &entry=stat->reg[stat->regs++];entry.type=type;entry.port=(uint64_t)(uintptr_t)port;entry.ref=reference;entry.status=(uint32_t)status;
-        cloverLog("client pid=%d registerNotification type=%u ref=%x port=%llx -> %08x",stat->pid,type,reference,
-            (unsigned long long)(uintptr_t)port,(unsigned)status);
+    if(stat) {
+        ++stat->regCalls;
+        if(stat->regs<kRegEvents){
+            auto &entry=stat->reg[stat->regs++];entry.type=type;entry.port=(uint64_t)(uintptr_t)port;entry.ref=reference;entry.status=(uint32_t)status;
+            cloverLog("client pid=%d registerNotification type=%u ref=%x port=%llx -> %08x",stat->pid,type,reference,
+                (unsigned long long)(uintptr_t)port,(unsigned)status);
+        }
     }
     return status;
 }
+// Round329's periodic state row, defined below with its columns. The beat that drives it is the display
+// driver's own 30 s work-loop timer; this file also fires it once for every client interposed, which is
+// what separates "the beat stopped" from "the channel carried nothing".
+static void reportDisplayState(void);
 static void interpose(IOUserClient *client,int pid) {
     if(seenClientCount>=kSeenClients)return;
     ClientStat &stat=seenClients[seenClientCount];
@@ -426,6 +443,7 @@ static void interpose(IOUserClient *client,int pid) {
     copy[168]=(uintptr_t)&wrappedExternal;copy[175]=(uintptr_t)&wrappedRegister;
     ++seenClientCount;
     *reinterpret_cast<uintptr_t **>(client)=copy;
+    reportDisplayState();
 }
 // The display object's state words the original wait selector tests (offsets 5808..5872, as dwords), for a report line.
 unsigned native_legacy_state_words(char *out,unsigned cap) {
@@ -470,6 +488,119 @@ void native_legacy_client_observed(IOReturn status,IOUserClient *client) {
             native_legacy_client_type,(unsigned)status,native_legacy_client_class,seenClientCount);
     native_legacy_client_checkpoint();
 }
+/*
+ * Round329. The display client's state, published on the display's own clock instead of only beside the
+ * events that happened to be first.
+ *
+ * Why this row exists. Boot 113 read the desktop cell back as four accepted swaps and a last wait
+ * (`selector 6 4 80000001 0 -> 00000000`) with no fifth swap after it, and that is the whole of what the
+ * card can say -- every r180 row about this client is printed on a first sighting or on the first four
+ * events, so after the stall the channel goes silent and silence reads two ways: "backboardd stopped
+ * asking" and "nothing new happened to print about". The four report helpers sheng's probe exports
+ * (`prepare_report`, `properties_now`, `state_words`, `clients_dump`) are what answers that on the
+ * reference board -- its package/BootLog.c pulls all four into a report -- and here they have no caller
+ * at all, which is the difference this round closes.
+ *
+ * What the columns are, each named for the expression that fills it:
+ *   ms=        probeNowUs()/1000: milliseconds since boot, from absolutetime_to_nanoseconds. Not `t=` --
+ *              this file's existing `t=` means seconds since the first frame and the kernel rows' `t=`
+ *              means seconds since boot; a third meaning for the same word is boot 100's `t=` defect.
+ *   fires=     this row's own ordinal, incremented before formatting, so the cut branch and the row
+ *              share one numbering and a gap in the numbering is a gap in the schedule.
+ *   seen=      seenClientCount, written by the unconditional `interpose` path.
+ *   client=    which record the client columns below describe: `pid58` (backboardd's own record),
+ *              `other` (clients were seen, none is pid 58) or `none` (no client yet). When it is not
+ *              `pid58` every client column prints `-`, because `-` is the difference between "nobody was
+ *              there to ask" and the zero that a client that asked nothing would print (r327's rule).
+ *   calls=     ClientStat::calls -- externalMethod entries, counted with no cap.
+ *   fails=     the same walk's nonzero returns.
+ *   regall=    ClientStat::regCalls: every registerNotificationPort call. `regs=` counts only what the
+ *              record kept (kRegEvents slots), so the two together separate "registered once" from
+ *              "registered eleven times and filled the slots".
+ *   grew=      calls minus the calls this row printed last fire; `-` on the first fire of a client,
+ *              because there is no earlier sample to subtract and total-calls is a different quantity.
+ *   hot=       the selector with the most calls this boot, as `<selector>:<calls>/<fails>/<last status>`,
+ *              or `none` while every selector count is zero.
+ *   s6=        the last selector-6 wait: sel6_last (the three 64-bit scalarInput words the call itself
+ *              carried, same memcpy as the event row) with selector_status[6], the last return the same
+ *              walk recorded. Conditioned on selector_calls[6], the count that fills both.
+ *   done= presented= frames=   the display object's words at 5820/5824/252 -- the same three offsets,
+ *              read the same way, that retire# prints at event time. Here they are read every fire, so
+ *              "presented is still 4" keeps being said after the event row has aged out of the ring.
+ *   vs=        <hz>/<started>/<sent> from vsyncHz and vsyncEvents[4]/[1]. A producer that always exists
+ *              in this file, so vs=0/0/0 is a reading: on this boot the refresh tick was never started.
+ *   log= logdrop=   cloverLogLines against kCloverLogBudget, and the lines that budget refused. Without
+ *              logdrop= a row missing from the card cannot be told from an event that arrived after line
+ *              96, and boot 113 spent 55 of those 96 lines.
+ *
+ * Two trigger sites, one producer: the driver's 30 s work-loop beat, and the first client interposed.
+ * The second is not a cadence, it is the discriminator -- a boot that shows fires=1 at the client's
+ * arrival and nothing after has lost the beat (the display's work loop stopped running), while a boot
+ * that shows no row at all never got the client, and the tee's own cap message says which.
+ *
+ * The row is never emitted half-written: 320 bytes is the card's record width and a longer line is
+ * truncated rather than split, so a too-wide row prints `clover r329: dispstatecut` with the width it
+ * needed instead. That row is the arithmetic's mandatory outlet -- the long row cannot say it was cut.
+ */
+static uint32_t dispstateFires,dispstatePreviousCalls;
+static bool dispstateHasPrevious;
+enum {kDispStateRowBytes=320};
+static void reportDisplayState(void) {
+    dispstateFires=dispstateFires+1;
+    const ClientStat *stat=nullptr;
+    for(unsigned c=0;c<seenClientCount;++c)if(seenClients[c].pid==58){stat=&seenClients[c];break;}
+    const char *clientTxt=stat?"pid58":(seenClientCount?"other":"none");
+    const char *callsTxt="-",*failsTxt="-",*regsTxt="-",*regallTxt="-",*grewTxt="-",*hotTxt="-",*s6Txt="-";
+    const char *doneTxt="-",*presentedTxt="-",*framesTxt="-";
+    char calls[16],fails[16],regs[16],regall[16],grew[16],hot[40],s6[96],done[16],presented[16],frames[16];
+    if(stat) {
+        snprintf(calls,sizeof calls,"%u",stat->calls);callsTxt=calls;
+        snprintf(fails,sizeof fails,"%u",stat->fails);failsTxt=fails;
+        snprintf(regs,sizeof regs,"%u",stat->regs);regsTxt=regs;
+        snprintf(regall,sizeof regall,"%u",stat->regCalls);regallTxt=regall;
+        if(dispstateHasPrevious) {
+            snprintf(grew,sizeof grew,"%lld",(long long)(stat->calls-dispstatePreviousCalls));grewTxt=grew;
+        }
+        unsigned best=0;uint32_t bestCalls=0;
+        for(unsigned k=0;k<kSelectors;++k)if(stat->selector_calls[k]>bestCalls){bestCalls=stat->selector_calls[k];best=k;}
+        if(bestCalls)snprintf(hot,sizeof hot,"%u:%u/%u/%08x",best,bestCalls,stat->selector_fails[best],stat->selector_status[best]);
+        else snprintf(hot,sizeof hot,"none");
+        hotTxt=hot;
+        if(stat->selector_calls[6]) {
+            snprintf(s6,sizeof s6,"%llx %llx %llx -> %08x",(unsigned long long)stat->sel6_last[0],
+                (unsigned long long)stat->sel6_last[1],(unsigned long long)stat->sel6_last[2],stat->selector_status[6]);
+            s6Txt=s6;
+        }
+        dispstatePreviousCalls=stat->calls;dispstateHasPrevious=true;
+    }
+    const unsigned char *object=reinterpret_cast<const unsigned char *>(native_legacy_object);
+    if(object) {
+        uint32_t completed=0,shown=0,frameCount=0;
+        memcpy(&completed,object+5820,4);memcpy(&shown,object+5824,4);memcpy(&frameCount,object+252,4);
+        snprintf(done,sizeof done,"%x",completed);doneTxt=done;
+        snprintf(presented,sizeof presented,"%x",shown);presentedTxt=presented;
+        snprintf(frames,sizeof frames,"%x",frameCount);framesTxt=frames;
+    }
+    char row[kDispStateRowBytes];
+    const uint64_t now=probeNowUs();
+    int length=snprintf(row,sizeof row,
+        "clover r329: dispstate ms=%llu fires=%u seen=%u client=%s calls=%s fails=%s regall=%s regs=%s grew=%s "
+        "hot=%s s6=%s done=%s presented=%s frames=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\n",
+        (unsigned long long)(now/1000),dispstateFires,seenClientCount,clientTxt,
+        callsTxt,failsTxt,regallTxt,regsTxt,grewTxt,hotTxt,s6Txt,doneTxt,presentedTxt,framesTxt,
+        vsyncHz,(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[1],
+        (unsigned)cloverLogLines,(unsigned)kCloverLogBudget,(unsigned)cloverLogDropped);
+    if(length<0 || static_cast<unsigned>(length)>=sizeof row) {
+        char cut[96];
+        snprintf(cut,sizeof cut,"clover r329: dispstatecut bytes=%d cap=%u fires=%u client=%s\n",
+            length,(unsigned)sizeof row,dispstateFires,clientTxt);
+        IOLog("%s",cut);
+        return;
+    }
+    IOLog("%s",row);
+}
+// The driver's beat calls this; it is also called once from the first client interposed, from below.
+extern "C" void native_legacy_display_state_beat(void) {reportDisplayState();}
 // The unit-scale policy, unchanged from the reference: `offline-legacy-unit-scale=<1..3>` publishes that many actual
 // scanout pixels per logical point through /chosen, which is the only place the family reads a UI scale from.
 static IORegistryEntry *unitScaleChosen;

@@ -1203,6 +1203,17 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // budget matches because the cadence is identical (one row per change-gated fire, capped at 96).
   { "clover r328: bbrcv", "r328-bbrcv", 32, 0, 0, 0 },
 
+  // Round329 publishes the display client's state on the display's own 30 s beat, and the two rows here are
+  // the widest that row can ever be plus the branch that says it did not fit. Order matters and is the only
+  // defence: the cut row's token starts with the state row's token, so a table that listed the shorter key
+  // first would send every `dispstatecut` into the `dispstate` budget -- the same containment r313 met with
+  // two address tables, where reading the wrong one answers instead of refusing. 96 is arithmetic, not
+  // optimism: the unattended deadline is 1800 s, so the beat can fire at most sixty times, and the probe
+  // fires one extra row for each client it interposes (at most eight). 8 for the cut branch, which the
+  // probe expects never to reach and prints only if the row outgrows the 320-byte record.
+  { "clover r329: dispstatecut", "r329-dispstatecut", 8, 0, 0, 0 },
+  { "clover r329: dispstate", "r329-dispstate", 96, 0, 0, 0 },
+
   // Round313 is the first boot that runs drivers/CloverPower at all -- the instrument shipped in
   // round182 and has never been on a board -- so its lines have no class and no budget of their own
   // yet. The report is one-shot, printed in the PMGR tail beside the other bring-up bursts, and its
@@ -4872,6 +4883,12 @@ static void teeConsumeLine (uint32_t &pushed)
        // pair and drop the other, which is exactly the shape r249 refuses -- a row the cap ate is
        // indistinguishable from a row the kernel never wrote. The class budget of 32 still bounds it.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r328-bbrcv") ||
+       // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
+       // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
+       // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is
+       // indistinguishable from a beat that never fired, and the two answer different questions. The class
+       // budgets of 32 and 8 still bound it.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r329-dispstate") ||
        // Round313's power report is one burst printed while the PMGR tail attaches, and it is the first
        // time this driver has ever run on a board. Exempting both of its classes is the r283 reason in
        // its plainest form: half a report and no report are different readings of the same bus, and a

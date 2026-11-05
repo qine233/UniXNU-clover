@@ -3245,6 +3245,24 @@ def check_board(errors: list) -> str:
             errors.append("the r328 receive row is not exempt from the per-pass cap: keeping one half of the "
                           "send/receive pair and eating the other makes \"the hop has no door\" "
                           "indistinguishable from \"the row was capped\"")
+        # Round329. Two classes, and the order between them is the only thing that keeps the longer key
+        # reachable: "clover r329: dispstate" is a prefix of "clover r329: dispstatecut", and teeProbeClass
+        # returns the first match, so a table that listed the state row first would send every cut row into
+        # the state row's budget -- r313's containment lesson read the other way (the wrong table answers
+        # instead of refusing).
+        for entry in ('{ "clover r329: dispstatecut", "r329-dispstatecut", 8, 0, 0, 0 },',
+                      '{ "clover r329: dispstate", "r329-dispstate", 96, 0, 0, 0 },'):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: a beat row with no budget of "
+                              "its own competes with the burst it happens to land in, and this row's whole "
+                              "job is to be readable when nothing else is happening")
+        if sdhci_source.find('{ "clover r329: dispstatecut"') > sdhci_source.find('{ "clover r329: dispstate"'):
+            errors.append("the r329 tee table lists the shorter token first: the cut row would be counted, "
+                          "and reported, as a state row")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r329-dispstate")' not in sdhci_source:
+            errors.append("the r329 state row is not exempt from the per-pass cap: it fires on the display's "
+                          "own beat, away from every burst, and a row the cap ate reads exactly like a beat "
+                          "that never fired -- which are the two answers this round is asking between")
 
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
@@ -6816,8 +6834,8 @@ def check_board(errors: list) -> str:
     # kernel and added ephemeral-storage; boot 108 read it back and the stall only moved (migration ->
     # chronod), and sheng boots to the desktop without it, so round322 reverts the ADT again: same
     # kernel, ephemeral-storage ABSENT so first-boot migration runs -- the menu names round322.
-    if not board["payload"]["title"].startswith("clover r328:"):
-        errors.append('[payload] title is not "clover r328: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r329:"):
+        errors.append('[payload] title is not "clover r329: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7964,8 +7982,8 @@ def check_board(errors: list) -> str:
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r328:"):
-        errors.append('[payload] title is not "clover r328: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r329:"):
+        errors.append('[payload] title is not "clover r329: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -8416,6 +8434,73 @@ def check_board(errors: list) -> str:
     elif "primary=video.v_display!=0;" not in display_driver.read_text():
         errors.append("the vendored driver lost its board-local v_display claim: the base module tests "
                       "v_display==1, and this firmware hands over a nonzero display descriptor")
+
+    # Round329 turns the legacy display client from a set of first-sighting rows into a state that keeps
+    # being read. Boot 113 is the reason: it showed four accepted swaps and then nothing, and every row the
+    # probe prints about that client is printed on a first sighting or on one of the first four events, so
+    # the silence after the stall cannot be told from a channel that ran out of budget -- which is why the
+    # row carries its own `log=/logdrop=` beside the counters. The beat lives in the driver because the
+    # probe owns no clock, and it must belong to no boot argument: a cadence that depends on the flag the
+    # reading is about puts the judge on the thing under trial.
+    if probe.is_file():
+        probe_code = [line for line in probe_text.splitlines()
+                      if not line.strip().startswith(('*', '/*', '//'))]
+        for now in ('"clover r329: dispstate ms=%llu fires=%u seen=%u client=%s calls=%s fails=%s regall=%s regs=%s grew=%s "',
+                    '"hot=%s s6=%s done=%s presented=%s frames=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\\n"',
+                    '"clover r329: dispstatecut bytes=%d cap=%u fires=%u client=%s\\n"',
+                    'static volatile uint32_t cloverLogDropped;',
+                    'cloverLogDropped=cloverLogDropped+1;return;',
+                    'uint32_t regCalls;',
+                    '++stat->regCalls;',
+                    'extern "C" void native_legacy_display_state_beat(void) {reportDisplayState();}',
+                    'const char *clientTxt=stat?"pid58":(seenClientCount?"other":"none");',
+                    'enum {kDispStateRowBytes=320};'):
+            if not any(now in line for line in probe_code):
+                errors.append(f"package/CloverLegacyDisplayProbe.cpp does not carry {now[:60]!r}: without it "
+                              "the client's state is still only printed beside a first event, and boot 113's "
+                              "silence stays ambiguous")
+        # Every column that describes a client must have a literal for "there was no such client to read",
+        # and that literal is `-`, not 0: a zero would print the same for a client that asked nothing.
+        if not probe_code or 'const char *callsTxt="-"' not in probe_text:
+            errors.append("the r329 row prints client columns with no literal for the case where no pid-58 "
+                          "client exists: `-` and 0 are two different answers and r327 already paid for "
+                          "collapsing them")
+        # Negative needles. The row must not take a name another producer already owns, and must not spend a
+        # column on a word that is a pure function of a column beside it (round8's rule: a field whose value
+        # is fixed by the row is not a reading).
+        for banned in ('"clover r329: dispstate t=', '"clover r329: dispstate us=',
+                       'dispstate %s state=', 'state=%s grew=', 'set=%u state=%s'):
+            if any(banned in line for line in probe_code):
+                errors.append(f"the r329 row carries {banned[:40]!r}: `t=` is this file's seconds-since-first-frame "
+                              "and the kernel rows' seconds-since-boot, so the beat names its own unit `ms=`; "
+                              "and a word that restates a column beside it is not a reading")
+        interpose_body = probe_text.split('static void interpose(IOUserClient *client,int pid) {')[1] \
+            if 'static void interpose(IOUserClient *client,int pid) {' in probe_text else ''
+        if 'reportDisplayState();' not in interpose_body.split('\n}')[0]:
+            errors.append("interpose() does not fire the state row: without a row printed from the client's own "
+                          "arrival there is nothing to tell a lost beat from a lost channel")
+
+    driver_text = display_driver.read_text() if display_driver.is_file() else ""
+    if driver_text:
+        driver_code = [line for line in driver_text.splitlines()
+                       if not line.strip().startswith(('*', '/*', '//'))]
+        for now in ('enum {kStateBeatMilliseconds=30000};',
+                    'extern "C" void native_legacy_display_state_beat(void);',
+                    'IOTimerEventSource *stateTimer=nullptr;',
+                    'stateTimer->setTimeoutMS(kStateBeatMilliseconds);',
+                    'startStateBeat();'):
+            if not any(now in line for line in driver_code):
+                errors.append(f"the vendored driver does not carry {now[:48]!r}: the state row would have no "
+                              "clock of its own, and a row that only prints when the client calls cannot say "
+                              "the client stopped calling")
+        start_beat = driver_text.split('void startStateBeat() {')[1].split('\n    }')[0] \
+            if 'void startStateBeat() {' in driver_text else ''
+        if not start_beat or 'PE_parse_boot_argn' in start_beat:
+            errors.append("the display state beat is not started unconditionally: a cadence gated on a boot "
+                          "argument cannot be the instrument that reads the thing the argument controls")
+        if 'stopStateBeat();' not in driver_text:
+            errors.append("the state beat has no stop: a timer left armed on a freed work loop is how a "
+                          "bring-up round turns into a fault at teardown")
 
     links = [
         ("drivers/CloverSdhci/CloverSdhci.cpp",

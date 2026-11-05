@@ -48,6 +48,11 @@ extern "C" void native_legacy_vsync_notify(void *display,uint64_t timestamp,uint
 // The unchanged original setDisplayRefreshProperties: publishes IOMFBDisplayRefresh from slot 301 (getRefreshAttributes below).
 extern "C" bool native_legacy_set_refresh_properties(void *display);
 extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
+// Round329: the instrument row that publishes the display client's state lives in the probe (it owns the counters);
+// this class only supplies the clock. 30 s, so a row is never further from the reader than the stall it is read
+// against, and the beat does not depend on the client making a call -- which is the thing being reported.
+extern "C" void native_legacy_display_state_beat(void);
+enum {kStateBeatMilliseconds=30000};
 extern "C" uint64_t mach_continuous_time(void);
 // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
 // either way (no compression is implemented), so the bytes are the same.
@@ -131,6 +136,35 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(vsyncTimer);
         OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
     }
+    // Round329's state beat. The instrument row this drives (clover r329: dispstate) is the display client's
+    // state published on a schedule rather than beside an event, and the schedule is the whole point: every other
+    // row about this client prints on a first sighting, so after the frame flow stops the channel goes quiet and
+    // quiet reads two ways. It is deliberately not gated on a boot argument -- an instrument whose cadence depends
+    // on a flag the reading is about is the r327 shape again -- and it runs on this object's work loop, so the row
+    // is stamped by the display's clock, not by another subsystem's.
+    IOTimerEventSource *stateTimer=nullptr;
+    static void stateBeatFired(OSObject *owner,IOTimerEventSource *) {
+        native_legacy_display_state_beat();
+        static_cast<NativeLegacyDisplay *>(owner)->armStateBeat();
+    }
+    void armStateBeat() {
+        IOWorkLoop *loop=getWorkLoop();
+        if(!stateTimer||!loop)return;
+        stateTimer->setTimeoutMS(kStateBeatMilliseconds);
+    }
+    void startStateBeat() {
+        if(stateTimer||!getWorkLoop())return;
+        IOTimerEventSource *timer=IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::stateBeatFired);
+        if(!timer)return;
+        if(getWorkLoop()->addEventSource(timer)!=kIOReturnSuccess){timer->release();return;}
+        stateTimer=timer;armStateBeat();
+    }
+    void stopStateBeat() {
+        if(!stateTimer)return;
+        stateTimer->cancelTimeout();
+        if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(stateTimer);
+        OSSafeReleaseNULL(stateTimer);
+    }
 public:
     // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
     void gpuComplete(int status) {
@@ -141,8 +175,9 @@ public:
         };
         if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
     }
-    void free() override {stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    void free() override {stopStateBeat();stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
+        stopStateBeat();
         stopVsync();
         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
         if(logicalPM){PMstop();logicalPM=false;}
@@ -160,6 +195,7 @@ public:
     }
     bool start(IOService *provider) override {
         if(!startDisplay(provider))return false;
+        startStateBeat();
         startVsync();return true;
     }
     bool startDisplay(IOService *provider) {

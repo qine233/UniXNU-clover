@@ -26499,3 +26499,117 @@ r327 **之前**摘除（它的两个 hunk 拿 r327 的行当上下文，先摘 r
   `r281 … en=1 armed=1` 应在、`r229: bb`/`r234: sbown` 位置不动；桌面格读
   `frame#`/`presented=`/`box=`；`e=` 里出现 -1 的槽要与 `c=null` 同排（本轮自己填的哨兵，不是端口的错）。
   停轮条件仍是「真进 iOS 桌面」，未满足前不许停。
+
+## Round329（v0.7.40）：把显示客户端的状态做成拍上的周期行——沉默不再只能被读成「没发生」
+
+**① 本轮的手。** 用户不在家，板子不能重启，所以这一轮按「先研究好再改」走完：只动仪器、不动行为，
+建好、过闸、归档、发版，**不刷写**。三处：
+
+- `package/CloverLegacyDisplayProbe.cpp`：新增 `reportDisplayState()` 与 `clover r329: dispstate` 行；
+  `ClientStat` 多一枚 `regCalls`（每次 `registerNotificationPort` 都数，`regs` 只数留下的槽）；
+  `cloverLog()` 在拒发那一支自增 `cloverLogDropped`；`interpose()` 尾部 fire 一次。
+- `drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp`：在驱动**自己的**工作循环上挂 `stateTimer`
+  （`kStateBeatMilliseconds=30000`），`startStateBeat()` 无条件起、`stopStateBeat()` 在 stop 与 free 都收。
+- `drivers/CloverSdhci/CloverSdhci.cpp`：两枚 tee 类 `r329-dispstatecut`(8) / `r329-dispstate`(96)，
+  与每拍上限豁免 `teeHasPrefix (…, "r329-dispstate")`。
+
+**② 为什么是仪器而不是修法（对照 sheng 的四条结论，全部落在盘上）。**
+1. boot 113 那一靴的「等待」本身**有答案**：`selector 6 4 80000001 0 -> 00000000` 是成功的等待，
+   swapId 走到 4 之后没有第 5 次。缺的不是「板子拒绝了什么」，是「之后没人再问，而本卡看不出有没有人想问」。
+2. selector 55 的 `e00002c7` 是 stock：出厂二进制里 `IOMobileFramebufferLegacy` vtable **slot 202** 就是
+   一枚无条件 `return 0xe00002c7` 的桩 ⇒ `sheng-vsync=120` 既不是因也不是药，`IOMFBDisplayRefresh`
+   在整枚共享缓存里**没有读者**。
+3. `r252: miss` 那三枚属性是 HID/音频身份，**sheng 也不发布** ⇒ 红鲱鱼，摘掉。
+4. sheng 有而我们缺、且真会改 pid 58 行为的只剩一枚 backlight `backlight-control=true` service；
+   没有板证据不许当因果修法发（「抄守卫要连前提一起验」）。而 sheng 多的另一件其实更朴素：它的
+   `package/BootLog.c` 把 round180 vendored 的四枚 legacy 显示报告 helper **全拉进一份报告**，
+   这四枚在本仓**零调用者**。本轮补的就是这一格——但**不是**把那四枚接上（它们仍然没人调，这笔债留着），
+   而是自己发一份同源的周期报告：读的是那四枚 helper 本来要读的同一批客户端计数与同三枚对象字。
+
+**③ 行的形状：每一列按「谁填它」命名，缺席按成因各占一枚字面量。**
+
+    clover r329: dispstate ms= fires= seen= client= calls= fails= regall= regs= grew=
+        hot= s6= done= presented= frames= vs= log=/ logdrop=
+
+- `ms=`：`probeNowUs()/1000`，自开机起毫秒。**不叫 `t=`**——本文件的 `t=` 已指「首帧之后秒」、内核行的 `t=`
+  指「开机之后秒」，同一枚字再抢第三个意思就是 boot 100 那处 `t=` 缺陷；也不叫 `us=`，因为本板 mach tick
+  19,267,584 Hz，`clock_get_uptime()/1e9` 那一类写法会把秒压掉 51.9 倍（r170 踩过、r309 修）。
+  闸门里配了两枚负针脚：`dispstate t=` 与 `dispstate us=` 都不许出现在镜像里。
+- `fires=` 在格式化**之前**自增 ⇒ cut 行与长行共用一套序号，序号断了就是排期断了。
+- `client=` 三档 `pid58`/`other`/`none`。不是 `pid58` 时全部客户列印 `-`：这是 r327 那条规矩——
+  「没人在那儿可问」与「一个什么都没问的客户端会印的 0」必须是两个词。
+- `calls=`/`fails=` 无上限计数；`regall=` 是 `regCalls`（每一次调用）而 `regs=` 只数记进 `kRegEvents` 的
+  那几条 ⇒ 两枚并读才分得开「注册过一次」与「注册了十一枚而槽满了」。
+- `grew=` 只在已经有上一次采样时才填，首枚印 `-`（没有可减的样本时「总调用数」是另一个量）。
+- `hot=` = `<selector>:<calls>/<fails>/<last status>`，全零时 `none`；`s6=` 由 `selector_calls[6]` 闩住——
+  填 `sel6_last` 与 `selector_status[6]` 的是同一个计数（列名与表达式同源）。
+- `done=`/`presented=`/`frames=` = 显示对象 5820/5824/252 三枚字，与 `retire#` 事件行读的是同三枚偏移、
+  同一种 memcpy；差别只在**这里每拍都读**，所以「presented 还是 4」在事件行被环挤掉之后仍然继续被说。
+- `vs=` = `<hz>/<started>/<sent>`（`vsyncHz`、`vsyncEvents[4]`/`[1]`）。生产者在同一文件里恒在 ⇒
+  `vs=0/0/0` 是读数（「refresh tick 从没起过」），不是「什么都没发生」。
+- `log=`/`logdrop=`：96 行预算的用量与被拒数。boot 113 那一靴吃掉 55 行；没有 `logdrop=`，
+  「卡上没这行」就分不开「事件发生在第 96 行之后」——第十层那条「数饥饿」在这里第一次有了自己的计数。
+- **两个触发点、一个生产者**：30 s 节拍，加上第一个客户端被 interpose 时那一枚。第二枚不是节拍，是判别器：
+  只印了 `fires=1`、之后再无 ⇒ 显示的工作循环停了；一枚都没有 ⇒ 客户端从没来过（那由 tee 自己的
+  `capped at` 行说）。节拍因此不许挂任何 boot-arg——挂在参数上的节奏不能用来读那枚参数控制的东西（闸门直判 `startStateBeat()` 体内没有 `PE_parse_boot_argn`）。
+- 本行走 `IOLog` 而**不走** `cloverLog` 的 96 行预算：它是那枚预算的证人，证人被自己作证的东西挡住就证不了。
+- 320 B 是卡上记录宽度，超了**截断而不拆行** ⇒ 另有 `clover r329: dispstatecut bytes= cap= fires= client=`。
+  这一支是那笔 snprintf 算术的必经出口：长行不能自证自己的尾巴活着。
+
+**④ tee 表里两枚类的次序是唯一的防线。** `r329-dispstatecut` 的 token 以 `r329-dispstate` 开头，
+而 `teeProbeClass` 取**第一条**前缀命中 ⇒ 长的必须排在前面。`check-clover.py` 除了「两枚都在」，
+还直接断言 `find(dispstatecut) < find(dispstate)`（第十六层：两张表互相包含时，读错那一支静默给数）。
+类预算 96 = 1800 s 死线 / 30 s = 60 拍，再加至多 8 枚由客户端触发的行；每拍上限豁免的理由沿用 r281/r319：
+被上限吃掉的行与从没起的拍不可区分。
+
+**⑤ 两处本轮自己抓住的错，都记在盘上。**
+1. **编译错**：`reportDisplayState()` 里局部 `uint32_t presented` 与同行缓冲 `char presented[16]` 同名，
+   archive 09 报 `no matching function for call to 'snprintf'` 与 integer-to-pointer。改名 `shown` 后才过。
+   教训：列名与表达式同源不等于局部名也要与列名同源。
+2. **卡上的标题写了一句不真的话**：board.toml 的 `[payload] title` 原写「This round **wires two of them**
+   into a state row」——可那四枚 helper 至今零调用者，本轮是**另建**一份报告。这句已改成
+   「本轮自己发这份报告、读同批计数与同三枚对象字；helper 的债留在账上」，并把「no kernel behaviour changes」
+   收成可核的三条（不写寄存器、不设属性、不打内核补丁；只在工作循环上加一枚 timer）。标题会进
+   `unixnu.toml`（verify 里 `title ok` 判的就是它），所以改完**重建了负载**；归档件是改后那枚 `e9c41a1f…`，
+   内核仍是同一枚 `d340ed02…`。探针注释里同一句「this round closes」按同样口径要在 r330 的注释轮改准
+   （注释改一次就动 DWARF 行表，r314 已量过，所以它必须与 `int-209`/`int-210` 那两处一起走一轮纯注释）。
+
+**⑥ 顺带一枚宿主发现：ADT 的 `adt_sha256` 每建必变，跨轮比 ADT 要先排掉那一格。**
+同一枚归一化内核、同一份 board.toml 连建两次，`adt_sha256` 也不同（`64f55c96…` vs `c873c715…`）。
+在宿主上逐字节比过 `~/clover-out/round329-adt-compare/`（r328 与 r329 两枚归档件里各提出一份，加第三次重建那份）：
+三枚之间的差异**全部**落在偏移 397..460（1-based）＝ ADT 内 `/chosen` 的 `random-seed` 那 64 字节，
+每建重掷；把那 64 字节清零，三枚 ADT 逐字节同为 `d7eaf753…`。于是「本轮没动 ADT」这句第一次有了可比的说法，
+而 §Round324 里那句「ADT 与 r322 逐字节同」按 `adt_sha256` 是判不出来的——那时能比的只有 14,384 这个尺寸。
+
+**⑦ 构建与双闸门。** `build kernel` → prelink `kernel.macho` `a72937c7…` → `patch-clover-amfi.py`
+（绝对 SOURCE；两站点仍在 `0x1ae00e4`/`0x1ae016c`，编码 `0x34000229→0x14000011`、`0x36000520→0xd503201f`）
+→ `round329-kernel-amfi.macho` `3610be15…` → `normalize-kernel-macho.py`（973 枚 object stamp 归零）
+→ `round329-kernel-normalized.macho` `d340ed02…`（52,404,224 B）→ `build payload --kernel **绝对路径**
+--data-ramdisk …/launchd.macho --trust-cache …/trustcache.bundle` →
+**`round329-v0.7.40-payload.img` sha256 `e9c41a1f…`**（58,720,256 B）；`payload.json` 自报
+`kernel_sha256=d340ed02…`＝打进的是归一化那枚。ADT 14,384 B（排掉 `random-seed` 后与 r328 逐字节同）。
+**boot-args 与 r328 逐字节相同**（`kernel_args` 逐字段 diff 过）⇒ 两靴可并排读。
+闸门：`check-clover.py` 仓库侧与 `out/clover/tree` 侧都 **EXIT=0**（12 archives、22 objects ABI-checked）；
+`verify-clover-payload.py` **EXIT=0、51 OK / 0 FAIL**，含 `r329-dispstate present`、`r329-dispstatecut present`、
+`r328-bbrcv present`、`r327-bbnow present`（本轮是加行不是换行 ⇒ 不新增负针脚）、`unixnu.toml … title ok`。
+镜像侧另在宿主把整枚格式串当 CString 找过一遍：完整一行逐字节在像里（第十七层那条针脚规则）。
+
+**⑧ 下一靴安排与预登记。** 用户回来后**第一刷仍是 `round328-v0.7.39-payload.img`**（boot 114）：
+§Round328 ⑥ 那四支 A–D 判的是 r327/r328 那对债主行，本轮没刷上去就不污染它。r329 的 `dispstate`
+行要到 boot 115（刷 `round329-v0.7.40-payload.img`）才第一次有读数，预登记四支：
+- **A｜** `dispstate` 在两枚以上拍子落地、`ms=` 间隔 ≈30,000 ⇒ 显示工作循环活着。再看 `grew=`：
+  连拍 `grew=0` ⇒ backboardd 停止问显示客户端，那笔欠的不在这条路上；`grew>0` 而 `presented=` 不动 ⇒
+  它还在问，卡的位置在「下一次 swap 之前」那一格。
+- **B｜** 只有客户端那一枚（`fires=1`）之后再无 ⇒ 工作循环在客户端上线之后停了。这是本轮唯一能把
+  「循环挂了」与「没人调用」分开的读数。正对照＝同靴 `r319: last` 与 `r281 … armed=1` 仍在
+  （证明到得了卡，缺席不是通道的错）。
+- **C｜** 一枚 `dispstate` 也没有而 `log=` 逼近 96／`logdrop>0` ⇒ 「那行没印」是预算饥饿；此后凡以
+  「行缺席」为判据的旧读法都要按这一支重读一遍。
+- **D｜** `dispstatecut` 若在 ⇒ 这行装不进 320 B，下一手是**收窄列**而不是接受截断（截断会把尾巴吞掉而不吭声）。
+- 可比性复查：`r327: bbnow`、`r328: bbrcv` 应照旧在（r329 的镜像带这两行，task.c 的补丁链一字未动）；
+  桌面格读 `presented=`/`frames=`/`box=`；`vs=` 三枚若仍 `0/0/0` 则是「refresh tick 从没起过」这一格
+  第一次有读数，非零就另立一轮判它。
+
+停轮条件仍是「板子真进 iOS 桌面」，未满足不许停。r330 的头两件事已记账：(1) 纯注释轮——
+`NativeLegacyDisplay.cpp` 里 `int-209`/`int-210` 那两枚不可核引文撤回、探针注释里「this round closes」
+改准；(2) 四枚 vendored 报告 helper 的调用者这笔债（本轮另建报告，没有把它们接上）。
