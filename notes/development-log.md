@@ -26691,3 +26691,192 @@ cannot tell a late landing from no landing at all`；给脚本尾部加一句不
 (1) 时间线目前只有「写」的一侧被契约钉住，**读的一侧**没有——还没有把这份文件摘要并进每轮读数的工具，
 所以下一靴它仍要靠人 `grep`；(2) `wait_leave_fastboot()` 那 60 s 窗口仍不写时间线（它失败时板子的状态
 是已知的——还在 fastboot——所以本轮故意不扩范围，但这是一种不一致，记下来）。
+
+
+## Round331（v0.7.42，宿主侧，不刷写）：从端口对象**往外**找持有者——两条按构造就不一致的腿
+
+**① 本轮的手。** 板子回不来，所以这一轮整轮在宿主：一枚新的内核补丁
+`patches/xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r331.patch`
+（13,669 B、2 hunk、z 前缀 74 枚，设备仓与 `UniXNU/patches/xnu/` 那份逐字节相同），改的仍是
+`osfmk/kern/task.c` 里 `clover_bb_sample()` 那一段带：紧接 r328 的 `bbrcv` 之后，**对其中一枚 hop 的
+收方向端口，反过来问「谁持有它的发送权」**。新增五个 helper：`clover_right_type_word()`（从
+`IE_BITS_TYPE` 解码权利类型词）、`clover_port_obj_held()`（名字→引用住的 port，顺带读
+`ip_srights`/`imq_msgcount`，并带回自己的错误码）、`clover_port_hash_holders()`（腿 A）、
+`clover_space_obj_names()`（腿 B）、`clover_bb_send_holders_row()`（出口：先中转、后 printf）。
+内核与负载都重建并过了双闸门；`board.toml` 的 `[payload] title` 升到 `clover r331:`。boot-args 一字未动。
+
+**② 这一格为什么是缺口，而不是「再多挪一次位置」。** boot 113 那行（§Round327 ②）说
+`hn=3 state=hop_unresolved named=0 asked=1`，逐列是「hop 0/1 的 `x[3]` 低半 = 0 ⇒ `null`，hop 2 = 0x7513
+⇒ 问过、没拿到名字 ⇒ `fail`」；而 §Round327 ④ 在同靴同帧的 `r221: sbm2` 里找到了收方向那枚
+（`rem=2e03 … rn=1e03 … ro=58:backboardd`），也就是说**两枚 0 只说明这两跳没有发送对象，不说明
+backboardd 不欠谁**。r328 把收方向的名字与队列长度问了（下一枚读回它 boot 114），但那仍然停在
+「这个口是谁的」这一层。真正没人问过的是一句更简单的话：**这个端口对象上挂着的发送权，在哪些任务的
+哪枚名字里**。r268 最近过——那是对信号量的 `ipc_hash_lookup` 扫描，而它的循环条件是
+`*hit_pid == 0`，找到第一枚就停，于是「两枚持有者」与「400 枚里一枚没有」在它那里是同一个读数。
+对照 sheng 也是阴性：`~/UniXNU-sheng/patches/xnu/*.patch` 只碰 `bsd/kern/kern_exec.c`、
+`osfmk/kern/processor.c`、`osfmk/kern/sched_clutch.c`、`pexpert/pexpert/arm64/{BCM2837.h,board_config.h}`，
+`task.c` 整枚没动，`drivers/` 里也没有从对象往外数持有者的仪器——所以这一格没有可照搬的形状，只能自己写。
+
+**③ 仪器的形状：两条腿，而且它们按构造就该不一致。**
+- **腿 A** `ipc_hash_lookup(space, obj)`，对 pid 1..`CLOVER_BB_SEMA_PROBE`(400) 逐枚问。这是内核自己的
+  反向查表，而 `osfmk/ipc/ipc_hash.c:173-175` 的注释写明了进表的条件：**只有纯发送权进表**
+  （"entries are only entered into the reverse table if they are pure send rights (not receive, send-once,
+  port-set, or dead-name rights)"）。所以腿 A 的计数**天生是下界**，它的读数必须跟 `ip_srights` 并排印，
+  不许单独成立：`sr > hits` 本身就是一条读数（「至少一枚权利住在反向表不携带的 entry 里」）。
+- **腿 B** 把等待者自己的 `ipc_entry` 表整颗走一遍，拿 `ie_volatile_object` 跟这枚对象比——这正是
+  `ipc_right.c:176` 给「有竞态的读者」读的那一枚字段（`ipc_entry.h:110` 那个 volatile 联合体成员），
+  也是 `ipc_hash.c:239` 判命中时比的同一件事。这条腿能答 boot 113 答不出的那一支：backboardd 那枚
+  发送权是不是它自己的（一枚 `SEND|RECEIVE` 的名字），是的话就没有别的任务能叫醒它。
+两腿读的都是别的核会长大的表，所以每个空间都走 r268 已经用过的那套协议：`is_read_lock(space)` →
+`is_active(space)` → `smr_ipc_enter()` → 表用 `smr_entered_load(&space->is_table)` 重新取。对象在整个扫描期间
+被 `ip_reference()` 引用住、出口 `ip_release()`：`ipc_object_translate` 交回来的是**上锁但不带引用**
+的东西（r220 写在 `clover_sb_port_owner` 旁边的那条规则），没有引用时一颗中途被销毁的端口会让回收后的
+地址读成「持有者」。
+
+**④ 列名，以及一条不重复使用别人列名的理由。** 主行两形状（有对象／没对象）列名完全一致，只是
+`obj=%llx` 换成 `obj=0`：
+```
+clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=%llx e=%d sr=%u q=%u scan=%s hits=%u probed=%u
+    scanned=%u self=%u ownnames=%u walked=%u cand=%u debt=%u
+```
+`scan=` 是两腿的判决，**一种「没有读数」占一枚字面量**：`no_cand`（这一拍没有任何一跳的收方向是真名）、
+`no_space`（任务没有 itk_space 或名字为 0）、`xlate`（翻译失败，`e=` 就是那颗 `KERN_*` 本身）、
+`notport`（是个 set／label／…，不是 port）、`no_srights`（`sr=0`——于是"没人欠它"第一次有了正读数而不只是
+缺席）、`own_only`（腿 B 命中而腿 A 为 0＝发送权全在反向表不携带的 entry 里）、`hash_only`（腿 A 命中而
+腿 B 为 0＝持有者全在**别的**任务里）、`holders`（两边都有）、`no_holder`（两腿都 0 枚，而 `probed=400`
+就在旁边）。`hits` 对 `sr` 是本轮的诚实对：`hits<sr` 不许读成「查得不对」，它读成「有些权利在表外」。
+`cand=`/`debt=` 是在**所有** hop 上数的：`cand`＝收方向是真名的那几跳，`debt`＝其中队列已空的那几跳，
+挑中的只是第一枚——这样一行只有一个 pick 也不会被读成「四跳的普查」。腿 B 走到的 entry 总数印成
+`walked=`（`ipc_entry_table_count`），所以 `ownnames=0` 在 `walked=0` 旁边是「表没走到」而不是「表里没有」。
+列名全是新词（`scan=`/`ownnames=`/`walked=`/`probed=`/`scanned=`/`cand=`/`debt=`），因为第十三层那条教训
+——列名与填它的表达式同源——同样适用于名字本身：boot 100 的 `t=` 被两枚生产者写单位不同就是这一格；
+`state=`/`own=`/`ent=`/`set=`/`res=` 已经各有主人，本轮的闸门明文禁止再用它们。两条明细行
+`bbsh`（腿 A 每枚持有者：pid／comm／名字／类型词／`raw=` 原始 bits）与 `bbown`（腿 B 每枚同任务同名
+entry：名字／类型词／`raw=`／`ur=`），类型词旁边一定带 `raw=`，因为 `IE_BITS_TYPE_MASK` 只有 16..20 五位
+而 `MACH_PORT_TYPE_EX_RECEIVE` 是第 21 位——一枚「收权已经搬走、留下发送权」的名字在这里读作 `send`，
+这件事写出来而不是藏起来。
+
+**⑤ 通道与预算。** 三枚 tee 类：`{ "clover r331: bbsend", …, 32, 0, 0, 0 }`、`bbsh` 128、`bbown` 128，
+并按本轮的老规矩把 `r331` 加进每-pass 上限的豁免链——**被上限吃掉的 `hits=0` 与从没数过的 `hits=0`
+必须是两种读数**，否则本轮唯一的新信息会伪装成自己的缺席。卡上两通道都落：先 `clover_emmc_probe_say()`
+（kind-25 无锁中转），后 `printf`（进内核 msgbuf 被 kind-22 滤进卡），这是 r305 之后的家规。
+扫描预算与 r268 在这条节拍下已经花掉的那份同量级：腿 A 每次 fire 最多走 400 个进程、腿 B 走一张
+entry 表，没有新增节拍照。
+
+**⑥ 闸门与负测。** 双闸门 `check-clover.py`：设备仓侧 **EXIT=0**（`~/clover-out/round331-check-repo.log`）、
+`out/clover/tree` 侧 **EXIT=0**（`round331-check-tree.log`，12 archives／22 objects ABI-checked）；
+`verify-clover-payload.py` 对归档负载 **EXIT=0、51 OK／0 FAIL**（`round331-verify.log`），新增 8 枚针脚
+`r331-bbsend`、`r331-bbsend-null`、`r331-bbsh`、`r331-bbown`、`r331-scan-own-only`、`r331-scan-hash-only`、
+`r331-scan-no-holder`、`r331-scan-no-cand`。契约块（`scripts/check-clover.py` 的 Round331 段）钉的是补丁的
+`+` 侧与注释滤掉后的代码行：两形状的主行、两条明细行、`for (pid = 1; pid <= CLOVER_BB_SEMA_PROBE; pid++)`、
+`ipc_hash_lookup(space, (ipc_object_t) port, …)`、`if (base[i].ie_volatile_object != obj)`、
+`ipc_entry_table_count(table)`、四枚锁原语、`ip_reference(port)`／`ip_release(port)`、九枚 `scan=` 字面量、
+`if (rcvq[i] == 0)`、`clover_bb_send_holders_row(task, pid, pick,`，以及槽位清零循环
+（`hp[i] = 0; … hc[i] = '\0';`——一行印 4 槽而两腿只填命中数，剩下的必须是零而不是栈残值，r327/r328 各交过一次学费）。
+keep 侧同样钉住：本轮不许删 r327 的 `bbnow`、r328 的 `bbrcv`、`clover_sema_send_holder(` 与
+`clover_sb_port_mail(task, (mach_port_name_t)hrn[i]`——两列是彼此的对照，删一半就是 r249 那格。
+`LATE_PATCH` 里 r331 必须在 r328 之前反放（本轮的 diff 打在 r328 留下的树上）。
+产物：`~/clover-out/round331-v0.7.42-payload.img` `e7b14b6aebc85d673418e1e72e5bd7562db90b6698c6563655debce6f5696f24`
+（58,720,256 B）。`round331-payload.json` 自证两枚内核哈希——建出来的归一化件
+`kernel_sha256 = 1e5871a24b0dfb9d1fa1c6e4c90d9241d2dadb6ce1fb8aa9b4c19479b59eaf94`（构建原始件
+`d9305939…` 经 amfi＋归一化后；归一化是就地重写，所以 `round331-kernel-amfi.macho` 现在带的是归一化后的字节，
+同内容另存了一份名字相符的 `round331-kernel-normalized.macho`），装进负载的那一枚
+`payload_kernel_sha256 = 0692a048c5f1fbd63d0d043ab1251c861c07ccc4855164cbe656222a36d98f91`。
+它的 `kernel_args` 与 `round328-payload.json` **逐字节相同**（本轮比过），`hardware_tested = False`
+⇒ 这一轮没上过机，boot 114 的对照条件仍然成立。其余哈希与四条负测的对应关系写在
+`round331-build-notes.txt`。**不刷写**：下一刷仍是 `round328-v0.7.39-payload.img`。
+
+**⑦ 预登记：第一枚带 r331 的靴怎么读。** 按序 boot 114＝round328（§Round328 ⑥ 的 A–D）、
+boot 115＝round329（§Round329 ⑧ 与 §Round330 ⑦ 的 T-A/T-B/T-C），r331 最早是 boot 116。判据只看列，
+不看「有没有进桌面」以外的任何推断：
+- **S-A｜** `scan=hash_only` 且 `hits>0` ⇒ 「谁欠 backboardd」第一次有 pid 与 comm，`bbsh` 那几行给出
+  名字与类型词；下一手是那颗持有者任务自己在做什么（把它接到 r262 普查的槽位上，而不是再加列）。
+- **S-B｜** `scan=own_only`（`hits=0`、`ownnames>0`）⇒ 那枚发送权是 backboardd **自己**的：它等的是自己的
+  口，没有任何别的任务能投递给它。这一支把「外部债主」整类假设关掉，下一手回到镜像侧的投递路径与
+  渲染循环（#666），不再是 IPC 等待链。
+- **S-C｜** `scan=no_srights`（`sr=0`）⇒ 「没有任何发送权挂在这枚对象上」，`q=0` 与 `sr=0` 同排时它读成
+  「这枚名字指向的是一个已经没人欠的口」；此时先看 `e=` 与 `obj=` 确认翻译成立，再判 r328 那行的
+  `s=`/`q=` 是不是同一个口径——两行不同口径时**不许**合成一句结论。
+- **S-D｜** `scan=no_holder` 且 `probed=400 walked>0` ⇒ 两条腿都走完、都 0 枚。这是本轮新建的那一支：
+  它在盘上有正对照（同一枚 `sr>0` 就在旁边），因此**不再**是第十三层那种「地平线之外的 0」。落到这一支
+  说明持有者在 pid>400 或在本轮不扫的空间里，下一手是抬 `CLOVER_BB_SEMA_PROBE` 或改扫 `alltasks`，
+  不是加列。
+- **S-E｜** `scan=no_cand`／`no_space`／`notport`／`xlate` ⇒ 本轮没得到读数，读数只关于闸门的选址；按
+  §Round328 ⑥ 的 B/C 先判 hop 本身，再决定 r331 是否需要挪位置。
+- 反例约束（三条）：(1) `hits` 小于 `sr` **不**证「扫描有 bug」，它证的是 `ipc_hash.c` 那条纯发送规则；
+  (2) 一行只有一个 `hop=`，它是 `debt` 里挑的第一枚，不许读成「这一拍只有这一跳」，看 `cand=`/`debt=`；
+  (3) 本行与 r327/r328 两行都来自同一次 fire、同一毫秒段，跨靴的 beat 计数不许参与判读（第十三层
+  「瞬时状态计数不能跨靴当证据」）。
+
+> 这一轮的债里有一条关于闸门自己：verify 侧那 8 枚新针脚本轮**只证了在场，没证会红**——它们的负测要重建内核
+> （删掉补丁里那一行再出一枚镜像），与本轮「不刷写、不动产物」的边界冲突，所以留在册。闸门里做了负测的是
+> 结构性那一族（`+`/`-` 两侧、槽位清零、列名禁则），以及 §Round331b 的四条。
+
+**⑧ 债。** §Round330 ⑧ 写「r331 头两件事」的那两枚**没被本轮做掉**，仍在册（纯注释轮：
+`drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp` 撤回 `int-209`/`int-210` 两枚不可核引文、
+`package/CloverLegacyDisplayProbe.cpp` 注释里「this round closes」改准；四枚 vendored 报告 helper 仍无调用者）。
+本轮新增四枚：(1) 腿 A 的范围由 `CLOVER_BB_SEMA_PROBE=400` 决定，**上界之外有没有持有者本轮不可知**，
+`probed=` 只是把这个地平线印出来而不是关掉它；(2) 腿 B 只走等待者自己的表，别的任务里的
+`SEND|RECEIVE`／send-once 名字看不见——真要覆盖得走 `alltasks`，那是 r262 普查那量级的开销，得先登记预算；
+(3) 每拍最多 4+4 枚明细行，超出 `CLOVER_BB_SEND_MAX` 的持有者被静默丢弃，`hits` 与 `ownnames` 是总数、
+明细是截断的，卡上目前没有「被截断了几枚」这一列；(4) 一行只挑 `debt` 的第一枚，多于一枚欠口的
+hop 在本行里没有独立读数（`debt=` 说有几枚，不说它们是哪些）。
+
+## Round331b（与 v0.7.42 同代，宿主侧）：闸门在自己的负载下变红——把「这台机器当时的调度」从判据里摘出去
+
+**① 症状。** r331 的负载测试跑完后，设备仓闸门 `check-clover.py` 变红一次，句子是
+`the arbiter host model failed … Assertion failed: (pa_read8 (&arbiter, 7, kLdoRegEnable, buf, kPolls,
+&status) == PA_OK), file clover_power_host.cpp, line 470`（那份红字留在 `round331b-evidence/pw-3.log`；
+`pw-1.log`/`pw-2.log` 是同码的两次绿）。这条断言属于 CloverPower 的宿主模型，跟 r331 的 `task.c`
+补丁没有任何共享代码。重跑复现的是**负载相关的 flake**：空载 3 次里 1 红，八枚 busy 子进程下 6 次里 2 红。
+判性先做，不动手：红的是**闸门**，不是本轮的手——但闸门红着不许发版，所以这一格必须结构性修好，
+而不是把预算调到绿为止。
+
+**② 根因是两个钟被当成一个。** 模型里服务 STATUS 的线程用 `usleep (50)` 排出自己的节拍，而 `pa_wait()`
+是按**轮询次数**（`kPolls`）判超时的——第十三层那句「仪器判读的周期必须比它判的事件更快」在这里以
+反面出现：**答案的延迟与读者的耐心是两把尺子**。宿主已经在跑构建时，内核会把那个 50 µs 的睡眠合并成
+毫秒级，而毫秒级比 `kPolls` 次轮询在墙上时间花掉的时间还要长 ⇒ 判据红在「这台机器当时的调度」上，
+而不是红在仲裁器行为上。另外两处是真并发缺陷，不是 flake：`rearm()` 与 `serve()` 会同时碰同一格 STATUS
+（模型没有把自己重武装与派工的顺序排出来），以及新写的确定性格 10b 一开始和扫描线程抢同一格。
+
+**③ 手。** `drivers/CloverPower/tests/clover_power_host.cpp`：服务线程的等待从 `usleep (50)` 换成
+`sched_yield ()`（`#include <sched.h>`），`device()` 把 `serve()` 整段放进新建的 `channelLock` 里、
+`rearm()` 同一把锁，扫尾以 `sched_yield()` 结束；被服务的那把预算改成
+`static const uint32_t kPolls = 100000000;`，无应答与「应答但没有 DONE」两支共用
+`kPollsNoAnswer = 5000`（`neverAnswer` 这一支被合掉，因为它与 10b 是同一件事的两种写法）。
+`scripts/test-clover-power.py` 从此**每轮跑两趟**：一趟空载、一趟 `loaded:<nproc>`——按
+`os.cpu_count()` 起满核 busy 子进程、0.4 s 落位、`timeout=240`、`finally` 收尾杀进程，每趟各自留
+`run-<label>.log`。这样「这条断言在满载下也成立」是**测出来的**，不是假设的。
+
+**④ 闸门读自己的沉默（第十三层第一次用在闸门身上，而不只用在卡上读数）。** 上一段说的 flake 有个更
+难看的形式：如果只把 `kPolls` 调大而不改别的，闸门永远绿，没人知道它当初为什么红。所以这四条新针脚
+每一条都做了负测，逐条报出句子；判法分两种，故意的——禁则（不许 `usleep` 回来）打在**滤掉注释后的代码行**
+上，存在性针脚（`sched_yield`／`kPolls = 100000000`／`kPollsNoAnswer`／`channelLock`）打在全文字面量上：
+- **N1**｜把 `kPolls` 改回 `200000` ⇒ 运行器 **EXIT=1**，`test-clover-power (loaded:10): failed with exit -6`，
+  `Assertion failed: (pa_read (&arbiter, 3, kPmicRev2 & kPmicArbCmdAddrMask, buf, 5, kPolls, &status) == PA_OK),
+  file clover_power_host.cpp, line 419`，而同一趟的空载腿仍 PASS。证据在盘上：
+  `~/clover-out/round331b-evidence/N1-kPolls-200000.log`；恢复后 `after-restore.log` 两腿全 PASS。
+  **这一条把满载腿从「多跑一次」升级成了回归钉**：预算一旦退回旧值，满载立刻变红。
+- **N2**｜把服务线程末尾的 `sched_yield ();` 换成空语句、并把档案注释里那个词一起改掉（针脚搜的是全文，
+  留一枚注释里的同名词就测不出这条针脚）⇒ 闸门 **EXIT=1**，句子
+  `[check-clover] the arbiter host model lost 'sched_yield': the server thread is not runnable again, so its
+  wake latency is the kernel's timer's, not the reader's`（`round331b-evidence/N2-no-sched_yield.log`）。
+- **N3**｜把 `channelLock` 整体改名（仍编译、仍跑绿）⇒ 闸门 **EXIT=1**，句子
+  `[check-clover] the arbiter host model lost 'channelLock': rearm() can interleave with serve() again, and a
+  stale DONE would answer the next transaction out of the previous command's bytes`
+  （`round331b-evidence/N3-no-channelLock.log`）。
+- **N4**｜把 `usleep (50);` 写回服务线程那一句代码 ⇒ 闸门 **EXIT=1**，句子
+  `[check-clover] the arbiter model's fake PMIC sleeps again: its answer would arrive on the kernel's timer
+  while the reader's budget is counted in polls, which is the two-clock mistake round331b was written to
+  close`（`round331b-evidence/N4-usleep-returns.log`）。这条与 N2 是两支不同的针脚：N4 打在**滤掉注释后的
+  代码行**上（第十八层：`usleep` 在本文件两段注释里合法存在，朴素 substring 会放行错误轮次），N2 打在全文
+  字面量上——所以「注释里提到旧写法」不会被误判成「旧写法回来了」。
+- 四次负测之后都从备份恢复并 `cmp -s` 逐字节核对（每次都报 `RESTORED_BYTE_IDENTICAL`），
+  恢复后闸门与运行器再各跑一遍全绿（`round331b-evidence/final-gate.log`、`after-restore.log`）。
+
+**⑤ 结果与账。** `for i in 1..5: test-clover-power.py` ⇒ 5 次 **EXIT=0**（每次含空载腿与 `loaded:10` 腿，
+10/10 绿，约 0.6 s／run，见 `round331b-evidence/pwg-1.log`）。双闸门复跑：设备仓 **EXIT=0**、
+`out/clover/tree` **EXIT=0**。本轮**不碰任何产物代码**——`out/clover/payload/payload.img` 与归档的
+`round331-v0.7.42-payload.img` 逐字节仍是 `e7b14b6a…`，所以不重建负载、不改版本号，v0.7.42 一次发完。
+一句留给下一次的话：这枚 flake 与 r331 无关，但它落在同一个闸门里；闸门里任何一条会随宿主负载变红的
+断言，都在替「判据」做它没答应的采样——现在满载腿在，这类句子至少会被跑出来而不是撞上。

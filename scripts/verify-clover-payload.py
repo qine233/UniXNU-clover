@@ -1283,6 +1283,30 @@ def check_sb_sample(kernel: bytes) -> bool:
                                 b"vs=%u/%llu/%llu log=%u/%u logdrop=%u\n") in kernel,
              "r329-dispstatecut": (b"clover r329: dispstatecut bytes=%d cap=%u fires=%u client=%s\n") in kernel,
 
+             # Round331 asks the question boots 112 and 113 leave open: r328 says the hop's receive queue is
+             # empty and its s= column says send rights exist, so somebody holds one, and no row has ever
+             # named them. The row is pinned in both of its shapes -- the branch that could not resolve the
+             # port prints every column the branch that did prints, so a decoder can tell "no reading" from
+             # "no row" -- because the compiler concatenates the source's three adjacent fragments into one
+             # CString and the link is what the card can actually print. The two disagreement words are
+             # pinned separately: own_only and hash_only are the pair that only exists because leg A walks a
+             # pure-send-only reverse hash (ipc_hash.c's own comment) while leg B walks the waiter's whole
+             # table, so a payload that carries the header but not those literals cannot report the
+             # disagreement this round was built to measure. r327's and r328's rows stay: they are what says
+             # which hop this row is allowed to pick.
+             "r331-bbsend": (b"clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=%llx e=%d sr=%u q=%u "
+                             b"scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u cand=%u "
+                             b"debt=%u\n") in kernel,
+             "r331-bbsend-null": (b"clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=0 e=%d sr=%u q=%u "
+                                  b"scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u "
+                                  b"cand=%u debt=%u\n") in kernel,
+             "r331-bbsh": (b"clover r331: bbsh t=%llu i=%u pid=%u c=%s nm=%x ty=%s raw=%llx\n") in kernel,
+             "r331-bbown": (b"clover r331: bbown t=%llu i=%u nm=%x ty=%s raw=%llx ur=%u\n") in kernel,
+             "r331-scan-own-only": b"own_only" in kernel,
+             "r331-scan-hash-only": b"hash_only" in kernel,
+             "r331-scan-no-holder": b"no_holder" in kernel,
+             "r331-scan-no-cand": b"no_cand" in kernel,
+
              "aks-say-sel": (b"clover r281: aks sel%u n=%u rc=%x\n") in kernel,
              "aks-say-open": (b"clover r281: open %u pid=%d comm=%.16s\n") in kernel,
              "aks-say-call": (b"clover r281: call %u pid=%d comm=%.16s sel=%u rc=%x\n") in kernel,

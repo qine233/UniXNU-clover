@@ -3264,6 +3264,130 @@ def check_board(errors: list) -> str:
                           "own beat, away from every burst, and a row the cap ate reads exactly like a beat "
                           "that never fired -- which are the two answers this round is asking between")
 
+        # Round331. Boots 112 and 113 leave the same hole read from two sides: r328 says the hop's receive
+        # queue is empty while its `s=` says send rights exist, and r327 says that hop's send column is null
+        # because the thread is parked in a receive rather than waiting to post. Somebody holds that right
+        # and no row this port prints has ever named them. r268 came closest and stops at its first hit, so
+        # it can print neither "two holders" nor "zero of 400 probed". Round331 asks outward from the object
+        # on two legs, and the shape this contract protects is the disagreement between them: ipc_hash.c's
+        # own comment above IH_TABLE_HASH says only pure-send entries live in the reverse hash, so leg A is
+        # a lower bound that must print beside ip_srights, while leg B is the full table walk -- the only leg
+        # that can see the SEND|RECEIVE name boot 113 is actually asking about.
+        r331_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r331.patch")),
+                         default=None)
+        if r331_patch is None or not r331_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r331.patch is missing: naming who holds the send "
+                          "right is this round's only hand, and an instrument nobody shipped is a reading "
+                          "nobody can take")
+        else:
+            r331_name = r331_patch.name
+            r331_lines = r331_patch.read_text().splitlines()
+            for earlier, why in (("*-clover-r328.patch", "round331's diff is taken against the tree it left"),
+                                 ("*-clover-r327.patch", "round328's diff is taken against the tree it left"),
+                                 ("*-clover-r326.patch", "round327's diff is taken against the tree it left")):
+                if not any(q.is_file() for q in (REPO / "patches/xnu-clover").glob(earlier)):
+                    errors.append(f"patches/xnu-clover/{earlier} is missing: {why}, and a silent reversal "
+                                  "failure lands on a file this round never touched")
+            load_r331 = REPO.parent / "UniXNU" / "patches" / "xnu" / r331_name
+            if not load_r331.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r331_name} is missing: unixnu loads patches from there, "
+                              "and this repo's copy only ever names the round")
+            elif load_r331.read_bytes() != r331_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r331_name} is not the same bytes as this repo's copy: "
+                              "the shipped image would carry a different row than the one checked here")
+            late_script_r331 = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list_r331 = " ".join(line for line in late_script_r331.splitlines() if "clover-r" in line)
+            if (late_list_r331.find(r331_name) < 0 or
+                    late_list_r331.find(r331_name) > late_list_r331.find("z" * 71 + "-clover-r328.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r331 before r328 in LATE_PATCH: "
+                              "r331 appends its call block after the row r328 prints and puts its helpers "
+                              "above the comment r265 added, so reversing r328 first leaves r331 "
+                              "un-reversible -- and an apply failure in that loop is silent")
+            r331_added = [line[1:] for line in r331_lines if line.startswith("+")]
+            r331_removed = [line[1:] for line in r331_lines if line.startswith("-")]
+            r331_code = [line for line in r331_added
+                         if not line.strip().startswith(('*', '/*', '//'))]
+            for now in (
+                # The header row in both of its shapes. The branch that could not resolve the port prints
+                # every column the branch that did prints: a failing row with fewer columns is a row whose
+                # absence cannot be told from a decoder that dropped them.
+                '"clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=%llx e=%d sr=%u q=%u"',
+                '" scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u cand=%u debt=%u\\n"',
+                '"clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=0 e=%d sr=%u q=%u"',
+                # The two name rows: one per leg, each carrying the raw bits beside the decoded word,
+                # because a literal and the expression it was computed from have to be one reading.
+                '"clover r331: bbsh t=%llu i=%u pid=%u c=%s nm=%x ty=%s raw=%llx\\n"',
+                '"clover r331: bbown t=%llu i=%u nm=%x ty=%s raw=%llx ur=%u\\n"',
+                # Leg A: the kernel's own reverse lookup over every pid, with no early break -- r268's
+                # single-hit stop is exactly the blind spot this round exists to remove.
+                'for (pid = 1; pid <= CLOVER_BB_SEMA_PROBE; pid++) {',
+                'if (ipc_hash_lookup(space, (ipc_object_t) port, &name, &entry)',
+                # Leg B: the full walk of the waiter's own table, on the field ipc_right.c reads for a
+                # racy reader, and the table size it actually walked.
+                'if (base[i].ie_volatile_object != obj) {',
+                'size = (uint32_t) ipc_entry_table_count(table);',
+                # Both legs use the protocol r268 established for a table another cpu can grow.
+                'is_read_lock(space);',
+                'if (is_active(space)) {',
+                'smr_ipc_enter();',
+                'smr_entered_load(&space->is_table)',
+                # The reference held across the scan: without it a port destroyed mid-scan lets a recycled
+                # address read as a holder (r220 wrote down the translate-returns-unreferenced rule).
+                'ip_reference(port);',
+                'ip_release(port);',
+                # The literals only the pair of legs can produce, one per way of not having a reading.
+                '"no_cand"', '"no_space"', '"notport"', '"xlate"', '"no_srights"', '"own_only"',
+                '"hash_only"', '"no_holder"',
+                # The pick: a hop whose receive name is real AND whose queue is empty -- the debt itself.
+                'if (rcvq[i] == 0) {',
+                'clover_bb_send_holders_row(task, pid, pick,'):
+                if not any(now in line for line in r331_added):
+                    errors.append(f"the r331 kernel patch does not add {now[:56]!r}: without it the row "
+                                  "still cannot say who holds the right r328 counted, which is the whole "
+                                  "question boots 112 and 113 leave open")
+            # Every slot array the row prints is zeroed before the walk can fill part of it (r327 for
+            # hrem, r328 for hrn, round331 for its own six); residue would read as a pid or a port name.
+            for zero in ('hp[i] = 0;', 'hn[i] = 0;', 'ht[i] = 0;', 'on[i] = 0;', 'ob[i] = 0;',
+                         "hc[i] = '\\0';"):
+                if not any(zero in line for line in r331_code):
+                    errors.append(f"the r331 patch prints slots it never zeroes ({zero[:12]!r}): the row "
+                                  "prints CLOVER_BB_SEND_MAX of each while the legs fill only hits or "
+                                  "matches, so the rest would be stack residue read as a holder")
+            # r327's send row, r328's receive row and r268's walk are what this row reads: the first two
+            # name the hop it may pick, the third is the leg-A template. None of them may go.
+            for keep in ('"clover r327: bbnow', '"clover r328: bbrcv', 'clover_sema_send_holder(',
+                         'clover_sb_port_mail(task, (mach_port_name_t)hrn[i]',
+                         'strlcpy(rcvown[i], "fail", sizeof(rcvown[i]));'):
+                if any(keep in line for line in r331_removed):
+                    errors.append(f"the r331 patch removes {keep[:56]!r}: the debt pair is what says which "
+                                  "hop this row is allowed to ask about, and half a pair is the r249 shape "
+                                  "-- no row and an empty queue read the same on the card")
+            # One word, one meaning across the whole family of bb rows: `state=` is r327's and r324's,
+            # `own=` is r234's owner name, `ent=` is r308's and r309's entry count. The r331 row calls
+            # the same three ideas scan=, ownnames= and walked=, so the gate holds both halves.
+            if any(('state=%s' in line or 'own=%u' in line or 'ent=%u' in line) for line in r331_code):
+                errors.append("the r331 row writes r327's `state=`, r234's `own=` or r308's `ent=`: two "
+                              "producers writing one column name is how boot 100's `t=` silently changed "
+                              "units, and here the same collision would silently change meaning")
+            for named in ('scan=%s', 'ownnames=%u', 'walked=%u', 'probed=%u', 'scanned=%u', 'cand=%u',
+                          'debt=%u'):
+                if not any(named in line for line in r331_code):
+                    errors.append(f"the r331 row drops {named!r}: the counters are what separate a scan "
+                                  "that found nothing from a scan that never ran, and a row that prints "
+                                  "hits= without them is a zero nobody can grade")
+        for entry in ('{ "clover r331: bbsend", "r331-bbsend", 32, 0, 0, 0 },',
+                      '{ "clover r331: bbsh", "r331-bbsh", 128, 0, 0, 0 },',
+                      '{ "clover r331: bbown", "r331-bbown", 128, 0, 0, 0 },'):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: this row prints a header "
+                              "plus up to four names per leg from inside the census burst, and a list with "
+                              "no budget of its own competes with the burst it is meant to explain")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r331")' not in sdhci_source:
+            errors.append("the r331 rows are not exempt from the per-pass cap: unlike r327/r328 the row's "
+                          "whole content is a count, so a pass that had spent its sixteen pushes would "
+                          "leave `hits=0` indistinguishable from a pass that never got to count -- the "
+                          "exact pair boot 112 could not split")
+
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
         # its own ending, so a silent boot leaves the boot before it on the card and the reader called
@@ -6453,6 +6577,38 @@ def check_board(errors: list) -> str:
             errors.append("the arbiter host model does not drive a v3 fake: the second floor plan would "
                           "be shipped unproven, on the same arithmetic that round183 could not resolve")
         else:
+            # Round331b. The model answers from a second thread while pa_wait() counts its patience in
+            # polls, and those are two clocks: the bound was smaller than a loaded host's wake latency,
+            # so this gate went red over this machine's scheduling and not over the arbiter. Measured on
+            # the way back: the old 200000 fails the loaded leg at a served read (line 419) while the
+            # idle leg passes, and the new bound passes ten of ten with one busy process per core. The
+            # needles below keep the three things that closed it from walking back in -- a runnable
+            # server rather than a coalesced timer, a bound sized for a loaded host, and a runner that
+            # really runs the model loaded. The sleep ban is judged on code lines only, because the two
+            # comments naming the old usleep are the record of why it is gone.
+            harness_source = harness.read_text()
+            harness_code = [line for line in harness_source.splitlines()
+                            if not line.strip().startswith(('//', '*', '/*'))]
+            if any('usleep' in line for line in harness_code):
+                errors.append("the arbiter model's fake PMIC sleeps again: its answer would arrive on "
+                              "the kernel's timer while the reader's budget is counted in polls, which "
+                              "is the two-clock mistake round331b was written to close")
+            for needle, why in (('sched_yield', "the server thread is not runnable again, so its wake "
+                                                  "latency is the kernel's timer's, not the reader's"),
+                                 ('static const uint32_t kPolls = 100000000;', "the served-read bound is "
+                                                  "no longer the one sized for a loaded host"),
+                                 ('kPollsNoAnswer', "the legs that assert the poll ENDS lost their own "
+                                                  "bound, and one number would then be asked to mean "
+                                                  "both a patient read and an impatient one"),
+                                 ('channelLock', "rearm() can interleave with serve() again, and a "
+                                                  "stale DONE would answer the next transaction out of "
+                                                  "the previous command's bytes")):
+                if needle not in harness_source:
+                    errors.append(f"the arbiter host model lost {needle!r}: {why}")
+            if 'os.cpu_count' not in runner.read_text() or 'loaded' not in runner.read_text():
+                errors.append("scripts/test-clover-power.py runs the model only on an idle host again: "
+                              "the promise that a served read answers inside the bound would then be "
+                              "assumed rather than tested, which is what made this gate untrustworthy")
             check = subprocess.run([sys.executable, str(runner)], capture_output=True, text=True)
             if check.returncode:
                 errors.append("the arbiter host model failed: the APID tie-break, the bounded poll or "
@@ -6834,8 +6990,8 @@ def check_board(errors: list) -> str:
     # kernel and added ephemeral-storage; boot 108 read it back and the stall only moved (migration ->
     # chronod), and sheng boots to the desktop without it, so round322 reverts the ADT again: same
     # kernel, ephemeral-storage ABSENT so first-boot migration runs -- the menu names round322.
-    if not board["payload"]["title"].startswith("clover r329:"):
-        errors.append('[payload] title is not "clover r329: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r331:"):
+        errors.append('[payload] title is not "clover r331: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -8020,8 +8176,8 @@ def check_board(errors: list) -> str:
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r329:"):
-        errors.append('[payload] title is not "clover r329: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r331:"):
+        errors.append('[payload] title is not "clover r331: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

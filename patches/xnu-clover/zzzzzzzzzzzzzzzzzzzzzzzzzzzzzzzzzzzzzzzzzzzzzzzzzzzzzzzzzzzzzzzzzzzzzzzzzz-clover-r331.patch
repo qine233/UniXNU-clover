@@ -1,0 +1,375 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12449,7 +12449,337 @@
+ 			is_read_unlock(space);
+ 		}
+ 		proc_rele(pp);
++	}
++}
++
++/*
++ * Round331. The two helpers below ask, for one port object, which tasks hold a right to it -- the
++ * question boots 112 and 113 leave open. r328's row says backboardd's own name is a port whose
++ * receive queue is empty and which has a send right or two (`s=`); r327's row says the same hop's
++ * send column is null, because a thread parked in a receive has no destination. Somebody holds that
++ * send right and no row ever printed who. r268 came closest, for a semaphore, and stopped at the
++ * first answer (`*hit_pid == 0` ends its loop), so it could print neither "two holders" nor "zero of
++ * 400 probed". These keep BOTH legs, because the legs disagree by construction:
++ *
++ *   leg A -- ipc_hash_lookup(space, obj) for every process up to CLOVER_BB_SEMA_PROBE. That is the
++ *     kernel's own reverse lookup, and ipc_hash.c's own comment (the block above IH_TABLE_HASH)
++ *     states which entries are in that hash: pure send rights only. A name that also carries a
++ *     receive right, a send-once (a reply), a dead name or a port set is not in it. So leg A's count
++ *     is a lower bound and must be printed beside ip_srights, never alone -- sr>hits is itself a
++ *     reading ("at least one right lives in an entry the reverse hash does not carry").
++ *   leg B -- a complete walk of the waiter's own table comparing ie_volatile_object against this
++ *     object: the same field ipc_hash.c:239 compares and the same volatile read ipc_right.c uses for
++ *     a racy reader. This is the leg that can answer what boot 113 actually asks: is the one send
++ *     right backboardd's own (one name holding SEND|RECEIVE), in which case no other task can wake it?
++ *
++ * Both legs read tables that another cpu can grow, so each space gets the same protocol r268's walk
++ * uses -- is_read_lock, is_active, an SMR section, table reloaded with smr_entered_load. The object
++ * is held with a reference for the whole scan: ipc_object_translate returns it locked and
++ * unreferenced (the rule r220 wrote down beside clover_sb_port_owner), and without a reference a port
++ * destroyed mid-scan would let a recycled address read as a holder.
++ */
++#define CLOVER_BB_SEND_MAX 4
++
++/*
++ * The word is decoded from IE_BITS_TYPE, the same mask ipc_right.c and r327 use; the raw bits ride
++ * beside it in the row, because a literal and the expression it was computed from must be one reading.
++ * IE_BITS_TYPE_MASK is five bits (16..20) while MACH_PORT_TYPE_EX_RECEIVE is bit 21, so a name whose
++ * receive right moved away and kept a send reads "send" here -- stated rather than hidden.
++ */
++static const char *
++clover_right_type_word(ipc_entry_bits_t bits)
++{
++	switch (IE_BITS_TYPE(bits)) {
++	case MACH_PORT_TYPE_SEND:
++		return "send";
++	case MACH_PORT_TYPE_SEND_RECEIVE:
++		return "send+recv";
++	case MACH_PORT_TYPE_RECEIVE:
++		return "recv";
++	case MACH_PORT_TYPE_SEND_ONCE:
++		return "sendonce";
++	case MACH_PORT_TYPE_PORT_SET:
++		return "pset";
++	case MACH_PORT_TYPE_DEAD_NAME:
++		return "dead";
++	default:
++		return "other";
++	}
++}
++
++/*
++ * Resolve a name in one task's space to a referenced port, and read ip_srights plus the queue length
++ * while translate still holds the port lock. code: 0 port, -1 no space or null name, -2 translated
++ * but not IOT_PORT, positive = the last KERN_* from the translate itself (r303's rule: a helper's
++ * zero and a real zero must not share a literal).
++ */
++static ipc_port_t
++clover_port_obj_held(task_t task, mach_port_name_t name, int *code, uint32_t *srights,
++    uint32_t *msgcount)
++{
++	ipc_space_t space = task->itk_space;
++	ipc_object_t obj = IPC_OBJECT_NULL;
++	ipc_port_t port = IPC_PORT_NULL;
++	kern_return_t kr;
++
++	*code = 0;
++	*srights = 0;
++	*msgcount = 0;
++	if (space == IPC_SPACE_NULL || name == MACH_PORT_NULL) {
++		*code = -1;
++		return IPC_PORT_NULL;
++	}
++	kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_RECEIVE, &obj);
++	if (kr != KERN_SUCCESS) {
++		kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_SEND, &obj);
++	}
++	if (kr != KERN_SUCCESS) {
++		*code = (int) kr;
++		return IPC_PORT_NULL;
++	}
++	if (io_otype(obj) != IOT_PORT) {
++		io_unlock(obj);
++		*code = -2;
++		return IPC_PORT_NULL;
++	}
++	port = (ipc_port_t) obj;
++	*msgcount = port->ip_messages.imq_msgcount;
++	*srights = port->ip_srights;
++	ip_reference(port);
++	io_unlock(obj);
++	return port;
++}
++
++static void
++clover_port_hash_holders(ipc_port_t port, task_t waiter, uint32_t *pidv, uint32_t *nmv,
++    uint64_t *tyv, char *cnmv, uint32_t max, uint32_t *hits, uint32_t *probed,
++    uint32_t *scanned, uint32_t *selfhit)
++{
++	struct proc *pp;
++	task_t task;
++	ipc_space_t space;
++	mach_port_name_t name;
++	ipc_entry_t entry;
++	char comm[16];
++	uint32_t pid;
++	extern struct proc *proc_find(int pid);
++	extern task_t proc_task(struct proc *p);
++	extern int proc_rele(struct proc *p);
++
++	*hits = 0;
++	*probed = 0;
++	*scanned = 0;
++	*selfhit = 0;
++	for (pid = 1; pid <= CLOVER_BB_SEMA_PROBE; pid++) {
++		pp = proc_find((int) pid);
++		if (pp == NULL) {
++			continue;
++		}
++		(*probed)++;
++		task = proc_task(pp);
++		if (task == TASK_NULL) {
++			proc_rele(pp);
++			continue;
++		}
++		space = task->itk_space;
++		if (space != IPC_SPACE_NULL) {
++			(*scanned)++;
++			is_read_lock(space);
++			if (is_active(space)) {
++				smr_ipc_enter();
++				if (ipc_hash_lookup(space, (ipc_object_t) port, &name, &entry)
++				    == TRUE) {
++					comm[0] = '\0';
++					if (proc_name_address(pp) != NULL) {
++						strlcpy(comm, proc_name_address(pp),
++						    sizeof(comm));
++					}
++					if (*hits < max) {
++						pidv[*hits] = pid;
++						nmv[*hits] = (uint32_t) name;
++						tyv[*hits] =
++						    (uint64_t) IE_BITS_TYPE(entry->ie_bits);
++						strlcpy(cnmv + (*hits * 16), comm, 16);
++					}
++					(*hits)++;
++					if (task == waiter) {
++						*selfhit = 1;
++					}
++				}
++				smr_ipc_leave();
++			}
++			is_read_unlock(space);
++		}
++		proc_rele(pp);
++	}
++}
++
++/*
++ * Every name in one space that points at this object, with its raw bits. `entries` is the table size
++ * actually walked, because a match count of zero over a 32-entry table and over a 4096-entry table
++ * are different readings of the same zero, and this is the only leg that sees a SEND|RECEIVE name.
++ */
++static void
++clover_space_obj_names(ipc_space_t space, ipc_object_t obj, uint32_t *nmv, uint64_t *bitsv,
++    uint32_t max, uint32_t *matches, uint32_t *entries)
++{
++	ipc_entry_table_t table;
++	ipc_entry_t base;
++	uint32_t size;
++	uint32_t i;
++
++	*matches = 0;
++	*entries = 0;
++	is_read_lock(space);
++	if (is_active(space)) {
++		smr_ipc_enter();
++		table = smr_entered_load(&space->is_table);
++		if (table != NULL) {
++			base = ipc_entry_table_base(table);
++			size = (uint32_t) ipc_entry_table_count(table);
++			*entries = size;
++			for (i = 0; i < size; i++) {
++				if (base[i].ie_volatile_object != obj) {
++					continue;
++				}
++				if (*matches < max) {
++					nmv[*matches] = (uint32_t) MACH_PORT_MAKE(i,
++					    IE_BITS_GEN(base[i].ie_bits));
++					bitsv[*matches] = (uint64_t) base[i].ie_bits;
++				}
++				(*matches)++;
++			}
++		}
++		smr_ipc_leave();
++	}
++	is_read_unlock(space);
++}
++
++/*
++ * Round331's row. One header plus at most CLOVER_BB_SEND_MAX names from each leg, relay first and
++ * console second like r326/r327/r328, because the boot that has to read this may be a boot whose
++ * kernel ring is already past its horizon. scan= is the verdict of the two legs and carries one
++ * literal per way of not having a reading: no_cand (no hop had a receive name at all, so the scan
++ * never ran and this is not "no debt"), no_space (the waiter has no space any more), xlate (e= is
++ * the KERN_* itself), notport (a
++ * set or a label: a holder list is the wrong question for it), no_srights (the port is live and ip_srights
++ * says nobody can post to it any more -- boot 112's endgame shape), own_only (leg B found names in
++ * the waiter's own space and leg A found none anywhere), hash_only (leg A named holders while leg B
++ * found no name at all in the waiter's own table), holders, no_holder (both legs empty yet sr>0: the
++ * right lives in an entry the reverse hash does not carry and in no name of this space). cand=/debt=
++ * say how many hops were even candidates, because a scan of one picked hop is not a census of four.
++ * `hits` against `sr` is the honesty pair: hits is a lower bound by construction (pure-send entries
++ * only) and sr is the kernel's own count, so hits<sr is a reading about the hash, not about the port.
++ */
++static void
++clover_bb_send_holders_row(task_t task, int pid, int hop, mach_port_name_t name,
++    uint64_t secs, uint32_t cand, uint32_t debt)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	ipc_port_t port;
++	ipc_space_t space = task->itk_space;
++	int code = 0;
++	uint32_t sr = 0;
++	uint32_t mc = 0;
++	uint32_t hp[CLOVER_BB_SEND_MAX];
++	uint32_t hn[CLOVER_BB_SEND_MAX];
++	uint64_t ht[CLOVER_BB_SEND_MAX];
++	char hc[CLOVER_BB_SEND_MAX * 16];
++	uint32_t on[CLOVER_BB_SEND_MAX];
++	uint64_t ob[CLOVER_BB_SEND_MAX];
++	uint32_t hits = 0;
++	uint32_t probed = 0;
++	uint32_t scanned = 0;
++	uint32_t selfhit = 0;
++	uint32_t matches = 0;
++	uint32_t entries = 0;
++	uint32_t i;
++	const char *st;
++	char row[256];
++	int len;
++
++	for (i = 0; i < CLOVER_BB_SEND_MAX; i++) {
++		hp[i] = 0;
++		hn[i] = 0;
++		ht[i] = 0;
++		on[i] = 0;
++		ob[i] = 0;
++	}
++	for (i = 0; i < CLOVER_BB_SEND_MAX * 16; i++) {
++		hc[i] = '\0';
++	}
++
++	st = "";
++	len = 0;
++	port = clover_port_obj_held(task, name, &code, &sr, &mc);
++	if (port == IPC_PORT_NULL) {
++		/*
++		 * The same shape as a row that ran: a branch that prints fewer columns is a branch
++		 * whose absence cannot be told apart from a decoder that dropped them.
++		 */
++		st = (name == MACH_PORT_NULL) ? "no_cand" : ((code == -1) ? "no_space" :
++		    ((code == -2) ? "notport" : "xlate"));
++		len = snprintf(row, sizeof(row),
++		    "clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=0 e=%d sr=%u q=%u"
++		    " scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u cand=%u"
++		    " debt=%u\n",
++		    (unsigned long long)secs, pid, hop, name, code, sr, mc, st, 0u, 0u, 0u,
++		    0u, 0u, 0u, cand, debt);
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
++		return;
++	}
++
++	clover_port_hash_holders(port, task, hp, hn, ht, hc, CLOVER_BB_SEND_MAX, &hits,
++	    &probed, &scanned, &selfhit);
++	if (space != IPC_SPACE_NULL) {
++		clover_space_obj_names(space, (ipc_object_t) port, on, ob,
++		    CLOVER_BB_SEND_MAX, &matches, &entries);
++	}
++
++	st = (sr == 0) ? "no_srights" : ((matches != 0 && hits == 0) ? "own_only" :
++	    ((hits != 0 && matches == 0) ? "hash_only" : (hits != 0 ? "holders" :
++	    "no_holder")));
++	len = snprintf(row, sizeof(row),
++	    "clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=%llx e=%d sr=%u q=%u"
++	    " scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u cand=%u debt=%u\n",
++	    (unsigned long long)secs, pid, hop, name,
++	    (unsigned long long)(uintptr_t)port, code, sr, mc, st, hits, probed,
++	    scanned, selfhit, matches, entries, cand, debt);
++	if (len > 0) {
++		row[sizeof(row) - 1] = '\0';
++		clover_emmc_probe_say(row, (unsigned int)strlen(row));
++		printf("%s", row);
++	}
++	for (i = 0; i < hits && i < CLOVER_BB_SEND_MAX; i++) {
++		len = snprintf(row, sizeof(row),
++		    "clover r331: bbsh t=%llu i=%u pid=%u c=%s nm=%x ty=%s raw=%llx\n",
++		    (unsigned long long)secs, i, hp[i], hc[i * 16], hn[i],
++		    clover_right_type_word((ipc_entry_bits_t)ht[i]),
++		    (unsigned long long)ht[i]);
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
+ 	}
++	for (i = 0; i < matches && i < CLOVER_BB_SEND_MAX; i++) {
++		len = snprintf(row, sizeof(row),
++		    "clover r331: bbown t=%llu i=%u nm=%x ty=%s raw=%llx ur=%u\n",
++		    (unsigned long long)secs, i, on[i],
++		    clover_right_type_word((ipc_entry_bits_t)ob[i]),
++		    (unsigned long long)ob[i],
++		    (uint32_t) IE_BITS_UREFS((ipc_entry_bits_t)ob[i]));
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
++	}
++	ip_release(port);
+ }
+ 
+ /*
+@@ -13905,6 +14235,34 @@
+ 		}
+ 	}
+ 	/*
++	 * Round331. The door r328 just named, asked outward. Pick the first hop whose receive name is
++	 * real AND whose queue is empty -- that combination is the debt itself, a named port with no
++	 * mail inside -- and fall back to no hop rather than asking a port that already has mail. cand
++	 * and debt are counted over every hop so a row with a single pick does not read as a census of
++	 * four, and the scan runs once per fire (leg A walks up to CLOVER_BB_SEMA_PROBE processes for
++	 * it), which is the same budget r268's semaphore holder walk already spends on this cadence.
++	 */
++	{
++		uint32_t cand = 0;
++		uint32_t debt = 0;
++		int pick = -1;
++
++		for (i = 0; i < hn; i++) {
++			if (hrn[i] != 0) {
++				cand++;
++				if (rcvq[i] == 0) {
++					debt++;
++					if (pick < 0) {
++						pick = (int) i;
++					}
++				}
++			}
++		}
++		clover_bb_send_holders_row(task, pid, pick,
++		    (pick >= 0) ? (mach_port_name_t) hrn[pick] : MACH_PORT_NULL, secs,
++		    cand, debt);
++	}
++	/*
+ 	 * Round262. One header plus at most CLOVER_BB_CENSUS rows, once every two
+ 	 * minutes, class `r262-th` on the card. The header carries the totals the
+ 	 * rows cannot: a task with more threads than the cap says so explicitly,

@@ -1203,6 +1203,18 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // budget matches because the cadence is identical (one row per change-gated fire, capped at 96).
   { "clover r328: bbrcv", "r328-bbrcv", 32, 0, 0, 0 },
 
+  // Round331 asks, outward from the port r328 just named, who holds a right to it. Three rows, because the
+  // answer is a list and a list has to say when it is short: one header per fire (32 -- the same cadence and
+  // the same clover_bb_fired cap as r327/r328, so the three rows are each other's control), then at most four
+  // names from the kernel's reverse lookup and at most four names from a complete walk of the waiter's own
+  // table. The two holder classes are 128 because twenty-something fires times four is the arithmetic bound,
+  // and the same arithmetic that sized r295's 128: a class that is exactly the product says nothing when the
+  // product is what the cap ate. The three keys share no prefix (`bbsh` and `bbsend` differ at the fourth
+  // letter), so the containment r329 had to order around does not exist here.
+  { "clover r331: bbsend", "r331-bbsend", 32, 0, 0, 0 },
+  { "clover r331: bbsh", "r331-bbsh", 128, 0, 0, 0 },
+  { "clover r331: bbown", "r331-bbown", 128, 0, 0, 0 },
+
   // Round329 publishes the display client's state on the display's own 30 s beat, and the two rows here are
   // the widest that row can ever be plus the branch that says it did not fit. Order matters and is the only
   // defence: the cut row's token starts with the state row's token, so a table that listed the shorter key
@@ -4883,6 +4895,12 @@ static void teeConsumeLine (uint32_t &pushed)
        // pair and drop the other, which is exactly the shape r249 refuses -- a row the cap ate is
        // indistinguishable from a row the kernel never wrote. The class budget of 32 still bounds it.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r328-bbrcv") ||
+       // Round331 prints from the same burst as r327/r328 and it is the row that turns "nobody sent" into
+       // a named holder or an explicit zero-of-400. Its own per-pass exemption is r249's reason in its
+       // strongest form here: the row's whole content is a count, and a pass that had spent its sixteen
+       // pushes would leave `hits=0` indistinguishable from a pass that never got to count. The header and
+       // the two name classes are exempted together on one token so half a list cannot survive the cap.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r331") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is

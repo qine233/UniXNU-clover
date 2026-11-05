@@ -20,9 +20,18 @@
 //
 // pa_wait() polls STATUS until DONE, exactly as the vendor driver does (VEND:258-284), and a
 // single-threaded model would have nobody to set that bit. The thread is the PMIC. It is also what
-// makes the timeout case real: stop the thread, and the poll bound is the only thing that ends the
-// wait -- which is the path a driver on a dead bus takes, and the one this test can only exercise by
-// killing the server.
+// makes the timeout cases real: stop the thread and the poll bound is the only thing that ends the
+// wait -- a driver on a dead bus -- and a channel marked handled without DONE ends it the way a bus
+// that answers the channel and has nothing to report does. Leg 10 and leg 10b are both on the books
+// because those two shapes are what a `timeout polls=` line on the card has to split apart.
+//
+// Round331b changed this thread's wait from usleep (50) to sched_yield (), and the reason is the same
+// lesson the card-side instruments keep re-learning: the answer's latency and the reader's patience
+// were two different clocks. A timer sleep is coalesced by the kernel, so on a host already running a
+// build the answer could land milliseconds late -- later than 200000 poll iterations take in wall time
+// -- and the gate went red over a scheduling fact about this machine rather than anything about the
+// arbiter. scripts/test-clover-power.py now runs the binary a second time with every core busy, so
+// that claim is tested and not assumed.
 //
 // WHAT THE MODEL DELIBERATELY DOES NOT REPRODUCE
 //
@@ -35,6 +44,7 @@
 // the behaviour under test, not the peripheral's own geometry.
 #include <assert.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -59,10 +69,16 @@ static volatile uint32_t obs[0x80000 / 4];          // EE 0's observer block
 static uint8_t pmicA[0x100];                        // the peripheral behind sid 0 (PM660)
 static uint8_t pmicB[0x100];                        // the peripheral behind sid 2 (PM660L)
 
-static volatile int stopModel, denyNext, failNext, dropNext, neverAnswer;
+static volatile int stopModel, denyNext, failNext, dropNext;
 static volatile unsigned readsServed;
 static volatile uint32_t lastAddr;
 static volatile int lastSid;
+// Round331b. rearm() clears every channel's STATUS and CMD while the fake PMIC thread is scanning,
+// and serve() writes STATUS from a command it read before that clear. Without a lock the two can
+// interleave so that a stale DONE|HANDLED lands after the clear, and the next transaction is answered
+// out of the previous command's bytes -- an assertion that passes on the wrong answer. The mutex is
+// the harness's own; pa_read() and pa_wait() stay exactly as the driver runs them.
+static pthread_mutex_t channelLock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t gModelApidMax;   // the highest APID setMap() has been asked to populate
 static uint32_t gHighApid = 400; // the model's second B3 mapping, low in the v3 band (see setUp)
 
@@ -119,10 +135,6 @@ static void serve (uint32_t apid)
     ch[kPmicArbStatus / 4] = kModelHandled | kPmicArbStatusDone | kPmicArbStatusDropped;
     return;
   }
-  if (neverAnswer) {
-    ch[kPmicArbStatus / 4] = kModelHandled;   // no DONE: the poll has to end this
-    return;
-  }
   uint8_t *periph = periphOf (apid);
   // VEND:376-381 memcpy()s from the register word, so RDATA0 holds the first four bytes with the
   // lowest address in the low byte and RDATA1 continues. That little-endian packing is the exact
@@ -152,10 +164,20 @@ static void *device (void *arg)
     // array for and the driver would have no business mapping on a host either.
     for (uint32_t apid = 0; apid <= gModelApidMax && apid < gL->mapEntries; apid++) {
       if (core[(gL->mapBase + gL->mapStride * apid) / 4]) {
+        pthread_mutex_lock (&channelLock);
         serve (apid);
+        pthread_mutex_unlock (&channelLock);
       }
     }
-    usleep (50);
+    // Round331b: a yield, not a sleep. The thread's wake latency and the reader's patience are two
+    // different clocks, and the model had been relying on the first being shorter than the second:
+    // usleep (50) is a *timer*, which the kernel is free to coalesce, and on a host already running a
+    // kernel build the wake landed milliseconds late -- later than the poll bound spends in wall time.
+    // The read then returns the poll's own exit code while the fake PMIC was merely unscheduled, which
+    // is r305's two-clocks mistake replayed inside a test, and it made this gate red for a reason that
+    // had nothing to do with the arbiter. A runnable thread is scheduled on any free core in
+    // microseconds; the thread only lives for the milliseconds each block below needs it.
+    sched_yield ();
   }
   return NULL;
 }
@@ -164,11 +186,13 @@ static void *device (void *arg)
 // DONE and the model marker) and its latched command.
 static void rearm (void)
 {
+  pthread_mutex_lock (&channelLock);
   for (uint32_t apid = 0; apid <= gModelApidMax && apid < gL->mapEntries; apid++) {
     volatile uint32_t *ch = obs + (gL->obsApidStride * apid) / 4;
     ch[kPmicArbStatus / 4] = 0;
     ch[kPmicArbCmd / 4] = 0;
   }
+  pthread_mutex_unlock (&channelLock);
 }
 
 static void setMap (uint32_t apid, uint32_t ppid, uint32_t owner, bool irqOwner)
@@ -199,7 +223,7 @@ static void setUp (int v3)
   memset((void *) obs, 0, sizeof obs);
   memset(pmicA, 0, sizeof pmicA);
   memset(pmicB, 0, sizeof pmicB);
-  stopModel = denyNext = failNext = dropNext = neverAnswer = 0;
+  stopModel = denyNext = failNext = dropNext = 0;
   readsServed = 0; lastAddr = 0; lastSid = -1;
   core[kPmicArbVersion / 4] = v3 ? 0x30010000 : 0x50010000;   // inside each band's own range
   core[kPmicArbFeatures / 4] = 40;
@@ -227,7 +251,25 @@ static void setUp (int v3)
   pmicB[0x46] = 0x00;
 }
 
-static const uint32_t kPolls = 200000;   // kPmicArbPolls; a host model answers in microseconds
+// Two bounds, because the two legs ask different questions and one number cannot answer both.
+//
+// kPolls is the bound for every transaction the model DOES answer. It is not a claim about the PMIC;
+// it is a claim about this host: the answer comes from a second thread, so the budget is spent by one
+// clock while the answer arrives on another. Round331 measured what the old 200000 meant -- a few
+// hundred microseconds of polling, shorter than a loaded host's wake latency -- and the model went red
+// under a kernel build for a reason that had nothing to do with the arbiter's arithmetic. The number
+// now spans several scheduler quanta, and it stays a number rather than an assumption because
+// scripts/test-clover-power.py runs the binary idle AND with one busy process per core: a bound that a
+// loaded host can outlast fails the gate instead of reading as a driver defect. The budget is only
+// actually spent when something is wrong -- a served read leaves the loop on its first DONE.
+//
+// kPollsNoAnswer is the bound for the two legs that assert the poll ENDS -- leg 10's channel nobody
+// touches, and leg 10b's channel that carries the model's handled marker without DONE. Neither waits
+// on anything this machine has to schedule, so the number stays small on purpose: those legs are
+// about the bound existing, not about a loaded host's wake latency, and a big one here would only
+// make the model slow at saying nothing new.
+static const uint32_t kPolls = 100000000;
+static const uint32_t kPollsNoAnswer = 5000;
 
 int main (void)
 {
@@ -434,8 +476,23 @@ int main (void)
   //     driver calibrates that bound instead of guessing it.
   setUp (0);
   rearm ();
-  assert(pa_read8 (&arbiter, 7, kLdoRegEnable, buf, 5000, &status) == PA_E_POLL);
+  assert(pa_read8 (&arbiter, 7, kLdoRegEnable, buf, kPollsNoAnswer, &status) == PA_E_POLL);
   assert(!(status & kPmicArbStatusDone));
+
+  // 10b. The same bound on a channel that somebody HAS touched. #10 has no server running at all, so
+  //      nothing ever writes that word; here the model's own "this command has been served" bit is
+  //      present without DONE, which is the shape of a bus that answers the channel and has nothing to
+  //      report -- what the card's `timeout polls=` line has to be able to mean. The two legs are not
+  //      duplicates: STATUS is the proof, and a poll that only ended when nobody wrote the word would
+  //      pass #10 and fail here. The harness writes the bit itself instead of waiting for the scanning
+  //      thread to reach this channel on purpose: a claim about pa_wait() must not depend on when this
+  //      machine schedules a second thread, and that coupling is what made this model flaky before
+  //      round331b. The bound is kPollsNoAnswer, spent in full because this read is meant to end.
+  setUp (0);
+  rearm ();
+  obs[(gL->obsApidStride * 7 + kPmicArbStatus) / 4] = kModelHandled;
+  assert(pa_read8 (&arbiter, 7, kLdoRegEnable, buf, kPollsNoAnswer, &status) == PA_E_POLL);
+  assert(!(status & kPmicArbStatusDone) && (status & kModelHandled));
 
   // 11. The same core, run against a v3 arbiter. Everything above is a v5 fake: the map lives at 0x900,
   //     channels are 0x80 apart, and an IRQ claim is bit 24 of a map word. Round313's whole premise is
@@ -479,7 +536,10 @@ int main (void)
   printf ("PASS: arbiter v5 and v3 PPID maps (tie-break, per-EE ownership, band-specific IRQ rule, "
           "refused bands, the one direction a wrong table refuses and the other one it answers with "
           "an APID shifted by 64), owner/ACC-status group indexing, "
-          "per-band channel and access-word arithmetic, command encoding, bounded poll, "
+          "per-band channel and access-word arithmetic, command encoding, both poll bounds "
+          "(kPollsNoAnswer ends a channel nobody touches and one that is marked handled without DONE, "
+          "and every served read answers inside kPolls on a host this script also runs with one busy "
+          "process per core), "
           "denied/failed/dropped split, and the little-endian 5-byte burst across RDATA0/RDATA1\n");
   return 0;
 }
