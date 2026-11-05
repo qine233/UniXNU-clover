@@ -1263,6 +1263,14 @@ def check_sb_sample(kernel: bytes) -> bool:
                             b"o0=%s o1=%s o2=%s o3=%s r0=%x r1=%x r2=%x r3=%x\n") in kernel,
              "r326-bbnow-gone": b"clover r326: bbnow" not in kernel,
              "r325-bbnow-gone": b"clover r325: bbnow" not in kernel,
+             # Round328 adds a row rather than replacing one: boot 113 read r327 back and its literals hold,
+             # but they describe x[3]'s low half -- the send destination -- which is 0 for exactly the threads
+             # that only receive. This row asks the receive column (hrn, the pairing r221 prints as rn=) for
+             # the same hops, and adds the two things a register cannot give: who owns that port and whether
+             # mail already sits in it, with the translate's own return code beside each zero (r303's rule).
+             # r327's row stays, because the pair is the reading.
+             "r328-bbrcv": (b"clover r328: bbrcv t=%llu pid=%d hn=%u rstate=%s rnamed=%u rasked=%u "
+                            b"c=%s.%s.%s.%s v=%x.%x.%x.%x q=%u.%u.%u.%u s=%u.%u.%u.%u e=%d.%d.%d.%d\n") in kernel,
 
              "aks-say-sel": (b"clover r281: aks sel%u n=%u rc=%x\n") in kernel,
              "aks-say-open": (b"clover r281: open %u pid=%d comm=%.16s\n") in kernel,

@@ -1194,6 +1194,14 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // channel and the budget are unchanged: same change-gated fire, capped by clover_bb_fired at 96, and a
   // board that survives to the 1800 s deadline can fire the census a dozen times, so 32 is headroom.
   { "clover r327: bbnow", "r327-bbnow", 32, 0, 0, 0 },
+  // Round328 is a second row, not a rewrite: boot 113 read r327 back and its literals are honest, but they
+  // describe the send column (x[3]'s low half), and a thread parked in a receive has no send destination --
+  // so two nulls and one fail answer a question the row was never positioned to ask. This row asks the
+  // receive column (hrn, the same pairing r221 prints as rn=) for the same hops and adds what a register
+  // cannot give: who owns that port, whether mail already sits in its queue, and whether the helper reached
+  // an object at all. It prints in the same burst as r327, so the two rows are each other's control, and the
+  // budget matches because the cadence is identical (one row per change-gated fire, capped at 96).
+  { "clover r328: bbrcv", "r328-bbrcv", 32, 0, 0, 0 },
 
   // Round313 is the first boot that runs drivers/CloverPower at all -- the instrument shipped in
   // round182 and has never been on a board -- so its lines have no class and no budget of their own
@@ -4858,6 +4866,12 @@ static void teeConsumeLine (uint32_t &pushed)
        // exists -- but the two copies are each other's control, and a console copy the cap ate silently
        // breaks that. The class budget of 32 still bounds it.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r327-bbnow") ||
+       // Round328's receive row prints from the same millisecond band as r327's send row, and the pair is
+       // the reading: one null on the send column means nothing until the receive column says whether that
+       // hop is a door at all. A pass that had already spent its sixteen pushes would keep one half of the
+       // pair and drop the other, which is exactly the shape r249 refuses -- a row the cap ate is
+       // indistinguishable from a row the kernel never wrote. The class budget of 32 still bounds it.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r328-bbrcv") ||
        // Round313's power report is one burst printed while the PMGR tail attaches, and it is the first
        // time this driver has ever run on a board. Exempting both of its classes is the r283 reason in
        // its plainest form: half a report and no report are different readings of the same bus, and a

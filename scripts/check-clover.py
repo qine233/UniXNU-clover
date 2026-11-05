@@ -3160,6 +3160,92 @@ def check_board(errors: list) -> str:
                           "the cap, so a console copy the cap ate silently breaks the two-copy control this "
                           "round's reading depends on")
 
+        # Round328. Boot 113 read r327 back on both channels and its literals hold, but they describe the send
+        # column: x[3]'s low half names where a message goes, so it is 0 for exactly the calls that only wait.
+        # Two nulls and one fail therefore answer a question the row was never positioned to ask, and the
+        # receive name -- hrn, x[5]'s high half, which is what r221 prints as rn= and resolves on this same
+        # boot -- was computed in the same frame and never asked. Round328 adds a second row beside the first
+        # rather than rewriting it, because the two columns are each other's control: the patch must not delete
+        # any of r327's row, and the new row must not write r327's column names for a different source.
+        r328_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r328.patch")),
+                         default=None)
+        if r328_patch is None or not r328_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r328.patch is missing: asking the receive column of "
+                          "each hop is this round's only hand, and an instrument nobody shipped is a reading "
+                          "nobody can take")
+        else:
+            r328_name = r328_patch.name
+            r328_lines = r328_patch.read_text().splitlines()
+            for earlier, why in (("*-clover-r327.patch", "round328's diff is taken against the tree it left"),
+                                 ("*-clover-r326.patch", "round327's diff is taken against the tree it left"),
+                                 ("*-clover-r325.patch", "round326's diff is taken against the tree it left")):
+                if not any(p.is_file() for p in (REPO / "patches/xnu-clover").glob(earlier)):
+                    errors.append(f"patches/xnu-clover/{earlier} is missing: {why}, and a silent reversal "
+                                  "failure lands on a file this round never touched")
+            load_r328 = REPO.parent / "UniXNU" / "patches" / "xnu" / r328_name
+            if not load_r328.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r328_name} is missing: unixnu loads patches from there, "
+                              "and this repo's copy only ever names the round")
+            elif load_r328.read_bytes() != r328_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r328_name} is not the same bytes as this repo's copy: "
+                              "the shipped image would carry a different row than the one checked here")
+            late_script_r328 = (REPO.parent / "UniXNU" / "scripts/build-xnu-4k-baseline.sh").read_text()
+            late_list_r328 = " ".join(line for line in late_script_r328.splitlines() if "clover-r" in line)
+            if (late_list_r328.find(r328_name) < 0 or
+                    late_list_r328.find(r328_name) > late_list_r328.find("z" * 70 + "-clover-r327.patch")):
+                errors.append("build-xnu-4k-baseline.sh does not reverse r328 before r327 in LATE_PATCH: "
+                              "r328 appends its row after the one r327 writes and its slots beside r327's "
+                              "declarations, so removing r327 first leaves r328 un-reversible -- and an apply "
+                              "failure in that loop is silent")
+            r328_added = [line[1:] for line in r328_lines if line.startswith("+")]
+            r328_removed = [line[1:] for line in r328_lines if line.startswith("-")]
+            r328_code = [line for line in r328_added
+                         if not line.strip().startswith(('*', '/*', '//'))]
+            for now in ('"clover r328: bbrcv t=%llu pid=%d hn=%u rstate=%s rnamed=%u rasked=%u"',
+                        'char rcvown[4][24] = { { \'\\0\' } };',
+                        'uint32_t rcvq[4] = { 0, 0, 0, 0 };',
+                        'uint32_t hrn[4] = { 0, 0, 0, 0 };',
+                        'strlcpy(rcvown[i], "null", sizeof(rcvown[i]));',
+                        'strlcpy(rcvown[i], "fail", sizeof(rcvown[i]));',
+                        # Both of the two remaining cause words, as separate needles: the ternary that picks
+                        # them is wrapped across two source lines, and a line break is not a change to which
+                        # literals the row can print. Requiring the pair on one line would make the gate
+                        # re-run red every time someone re-wraps this block.
+                        '"rcv_unresolved"',
+                        '"rcv_null"',
+                        'clover_sb_port_mail(task, (mach_port_name_t)hrn[i], &mc, &sr, &err);',
+                        'char rcv[256];',
+                        'c=%s.%s.%s.%s v=%x.%x.%x.%x q=%u.%u.%u.%u s=%u.%u.%u.%u'):
+                if not any(now in line for line in r328_added):
+                    errors.append(f"the r328 kernel patch does not add {now[:56]!r}: without it the row still "
+                                  "names only the send column, and boot 113 showed that column is empty for "
+                                  "exactly the threads this round asks about")
+            # r327's row is the control for r328's, so both copies of it have to survive this patch untouched.
+            for keep in ('"clover r327: bbnow', 'clover_emmc_probe_say(now', 'clover_sb_port_owner(task, (mach_port_name_t)hrem[i], own327,'):
+                if any(keep in line for line in r328_removed):
+                    errors.append(f"the r328 patch removes {keep[:56]!r}: the send row is the control the "
+                                  "receive row is read against, and a pair where one half is gone is the "
+                                  "r249 shape -- half a reading and no reading look the same on the card")
+            # A row that prints four slots while the walk fills hn of them must zero the rest, or residue is
+            # read as a port name (round327 did this for hrem; round328 repeats it for hrn and its own slots).
+            if any(line.strip().startswith('uint32_t hrn[4];') for line in r328_code):
+                errors.append("the r328 patch leaves uint32_t hrn[4] uninitialised while printing v= four "
+                              "times: the hop walk fills hn of them, and the rest would be stack residue")
+            # One word, one meaning across the pair: r327 publishes state=/named=/asked= for the send column.
+            # The receive column says so in its own names instead of writing the same words from a new source.
+            if any(('state=%s named=%u asked=%u' in line or 'res=%u' in line
+                    or 'set=%u state=%s' in line) for line in r328_code):
+                errors.append("the r328 row reuses r327's `state=/named=/asked=` or r324's `set=` / r326's "
+                              "`res=` column names: two producers writing one column name is how boot 100's "
+                              "`t=` silently changed units")
+        if '{ "clover r328: bbrcv", "r328-bbrcv", 32, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the receive-column row: it prints in the same "
+                          "burst as the census and would compete with it for the per-pass cap")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r328-bbrcv")' not in sdhci_source:
+            errors.append("the r328 receive row is not exempt from the per-pass cap: keeping one half of the "
+                          "send/receive pair and eating the other makes \"the hop has no door\" "
+                          "indistinguishable from \"the row was capped\"")
+
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
         # its own ending, so a silent boot leaves the boot before it on the card and the reader called
@@ -6730,8 +6816,8 @@ def check_board(errors: list) -> str:
     # kernel and added ephemeral-storage; boot 108 read it back and the stall only moved (migration ->
     # chronod), and sheng boots to the desktop without it, so round322 reverts the ADT again: same
     # kernel, ephemeral-storage ABSENT so first-boot migration runs -- the menu names round322.
-    if not board["payload"]["title"].startswith("clover r327:"):
-        errors.append('[payload] title is not "clover r327: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r328:"):
+        errors.append('[payload] title is not "clover r328: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7878,8 +7964,8 @@ def check_board(errors: list) -> str:
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r327:"):
-        errors.append('[payload] title is not "clover r327: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r328:"):
+        errors.append('[payload] title is not "clover r328: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

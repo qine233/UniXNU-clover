@@ -26429,3 +26429,73 @@ presented，没进桌面。另有三枚新的 `r252: miss`：backboardd 在 t=56
 产物（本轮读回的卡上窗口，可引用）：`/Users/zhouzhou/clover-out/clover-log-window-boot113.bin`
 （623,104 B，sha256 `ac24461d33d9b7f8…`）与解码 `/Users/zhouzhou/clover-out/clover-log-window-boot113.bin.txt`
 （1,926 行）。
+
+
+## Round328（v0.7.39）：封行开口问收方向——每一枚 hop 的收名、它的属主、以及口里躺着几封信
+
+**① 本轮的手。** `task.c` 的 `clover_bb_sample()` 里，紧接 r327 那枚 `bbnow` 封行之后、同一个毫秒段带之内，
+新增一行 `clover r328: bbrcv`。它对 hop 走算出的 `hn` 枚线程各问一次**收方向**：
+
+- `hrn[i]`（= `x[5] >> 32`，与 r221 行里 `rn=` 同一枚配对）为 0 ⇒ 该槽直接印 `null`，不问解析器；
+- 否则 `rasked++`，用**同一个函数、同一个 task**（backboardd 自己的空间）调 `clover_sb_port_owner`，
+  拿到名字就印名字并 `rnamed++`，拿不到印 `fail`；
+- 再调 `clover_sb_port_mail(task, hrn[i], &mc, &sr, &err)` 读那枚口的 `imq_msgcount` 与 `srights`，
+  连同 `err` 一起落进 `q=`／`s=`／`e=`——r303 那条规矩在这里是必需的：**helper 的 0 与真正的 0  otherwise
+  是同一个 0**，只有把返回码一起印出来，`q=0` 才分得出「信没来」和「口没翻出来」。
+
+四列名 `c=`（属主名点分）、`v=`（四枚 `hrn` 原字）、`q=`、`s=`、`e=` 一起走**两通道**（驱动中转
+`clover_emmc_probe_say` ＋ `printf` 控制台副本），与 r326/r327 定下的位置、形状一致。`hrn[4]` 这轮显式清零
+（先前是 `uint32_t hrn[4];`）：行印四槽而 hop 走只填 `hn` 枚，剩下的不零就是栈残值——r327 为 `hrem` 学过一次，
+这次轮到 `hrn`。
+
+**② 有意偏离 §Round327 读数⑧ 的预登记三处，都写在盘上而不是写在心里。**
+1. 预登记说 `state=` 的判据改成「发送列或收方向列任一枚给名」。**没改**。r327 那行 `bbnow` 逐字保留，
+   因为它是 boot 112／113 已读回的两通道对照；把收列折进它的 `state=`，同一个词在本靴就同时指两列了
+   （「一枚字不许两义」＋「列名与填它的表达式同源」）。改成 r328 自带 `rstate=`／`rnamed=`／`rasked=`，
+   两列各说各话，判读时并排读。
+2. 预登记说原字列叫 `rcv=`。实际叫 `v=`。原因是同一行已经有 `c=`（名字）和 `q=`（计数），`rcv=` 会被读成
+   「收方向的又一枚计数」；`v=` 与 `c=` 成对（value/name），行内自解释。
+3. 预登记说走 `clover_sb_port_state` 那条翻译腿。实际走 `clover_sb_port_mail`（task.c:11506 已有），
+   因为它本来就带 `int *err` 出参；用前者要自己再造一次错误码，等于给「0 的两种成因」新增一个未被读的分支。
+
+**③ 闸门这一轮红过一次，红在针脚的写法上。** `check-clover` 起初要求补丁里存在一枚单行子串
+`'"rcv_unresolved" : "rcv_null"'`；源码里那三元为了守 84 列折成两行，于是没有哪一条 `+` 行含这枚子串，
+本轮被自己的契约判红。修法不是把 C 折回一行，而是把这枚针脚拆成 `'"rcv_unresolved"'` 与 `'"rcv_null"'`
+两条分别必在——**换行是排版，不是语义**；把契约钉在两枚字面量之间的空白上，下一次无人相关的重排就会判红，
+而重排不会改变这行能印出哪几个词。规则并入第十八层。
+
+**④ 契约与接线。** `zzz`×71 `-clover-r328.patch`（95 行、2 个 hunk：`@@ -13411,8 +13411,22 @@` 声明段、
+`@@ -13828,8 +13842,68 @@` 封行段；sha256 `c35f009f…`）与 `UniXNU/patches/xnu/` 那份逐字节相同，先验证过
+「反打回 r327 树、再正打回 r328」两边都成立才进构建。`build-xnu-4k-baseline.sh` 的 `LATE_PATCH` 把它排在
+r327 **之前**摘除（它的两个 hunk 拿 r327 的行当上下文，先摘 r327 会让 r328 反打不上，而那个循环里的失败是静默的）。
+`CloverSdhci` 新增 tee 类 `{ "clover r328: bbrcv", "r328-bbrcv", 32, 0, 0, 0 }` 与每拍上限豁免
+`teeHasPrefix (…, "r328-bbrcv")`。`verify-clover-payload.py` 加 `r328-bbrcv` 整行针脚，**不加** `r327` 的
+「上一代必须消失」负针脚——本轮是加一行，不是换一行；`r326`/`r325` 两枚负针脚照旧在。
+
+**⑤ 构建与双闸门（本轮真构建，改了 task.c）。** `build kernel` → prelink `kernel.macho` `85146864…`
+→ `patch-clover-amfi.py`（绝对路径 SOURCE，两站点仍在 `0x1ae00e4`/`0x1ae016c`，编码
+`0x34000229→0x14000011`、`0x36000520→0xd503201f`）→ `round328-kernel-amfi.macho` `2907d7c4…`
+→ `normalize-kernel-macho.py`（973 枚 object stamp 归零）→ `round328-kernel-normalized.macho` `0f666cf8…`
+（52,404,224 B）→ `build payload --kernel **绝对路径** --data-ramdisk … --trust-cache …` →
+**`round328-v0.7.39-payload.img` sha256 `3a9eee3e…`**（58,720,256 B）；`payload.json` 自报
+`kernel_sha256=0f666cf8…`＝打进的是归一化那枚。ADT 14,384 B（不动 ephemeral）。
+**boot-args 一字未动**（对照 r327 的 `kernel_args`）⇒ boot 114 与 113 可并排读。
+闸门：`check-clover.py` 仓库侧与 `out/clover/tree` 侧都 **EXIT=0**（12 archives、22 objects ABI-checked）；
+`verify-clover-payload.py` **EXIT=0、51 OK / 0 FAIL**，含 `r328-bbrcv present`、`r327-bbnow present`、
+`r326-bbnow-gone present`、`r325-bbnow-gone present`、`ADT: ephemeral-storage ABSENT`。
+构建成形后先在宿主上把整枚格式串当 CString 找过一遍：**完整一行在镜像里逐字节存在**（第十七层那条「算术与
+字面量可能被优化器折掉」在这里不需要担心，但针脚要能被找到才算数）。
+
+**⑥ boot 114 判读（预登记，四支照 §Round327 读数⑧ 的 A–D，列名换成本轮实际发的）。**
+- **A｜** 任一 hop 的 `c=` 槽给出名字 ⇒ 「backboardd 在等谁」第一次有名字。同刻看那槽的 `q=`：
+  `q>0`＝信已躺在口里没被取（投递/调度这一格）；`q=0` 且 `e=0`＝没人发（欠的是一封不存在的信）。
+  `rnamed>0` 与 `rstate=rcv_owner` 是这一支的自证。
+- **B｜** `c=` 全 `null` 且 `v=` 全 `0` ⇒ 这些 trapped 线程根本没在收，`x16 == -47` 那道闸筛错了对象，
+  下一手回到闸本身，不再加列。
+- **C｜** `rstate=rcv_unresolved`（`rasked>0`、`rnamed=0`）⇒ 解析器对 backboardd 空间整体失效；但注意
+  boot 113 已给出反证的一半（`rem=2e03` 在同一靴被同一函数命名成 `58:backboardd`），所以这一支先查
+  `hrn` 是否落在**另一个空间**（`v=` 原字与 `loc=`/`ro=` 对照），而不是直接判解析器坏。
+- **D｜** 复查与可比性：`r327: bbnow` 应照旧在（两通道）、`r319: last` 正对照应在、
+  `r281 … en=1 armed=1` 应在、`r229: bb`/`r234: sbown` 位置不动；桌面格读
+  `frame#`/`presented=`/`box=`；`e=` 里出现 -1 的槽要与 `c=null` 同排（本轮自己填的哨兵，不是端口的错）。
+  停轮条件仍是「真进 iOS 桌面」，未满足前不许停。

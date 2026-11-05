@@ -1,0 +1,95 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -13411,8 +13411,22 @@
+ 	 */
+ 	uint32_t asked = 0;
+ 	uint32_t named = 0;
++	/*
++	 * Round328. Boot 113 read the send column back and it is the wrong column for a thread parked in a
++	 * receive: x[3]'s low half names where a message goes, so it is 0 for exactly the calls that only wait.
++	 * The name each trapped thread is receiving on is hrn, which the hop walk already fills from x[5]'s high
++	 * half -- the same pairing r221 prints as rn=, which resolves to a live name on this very boot. These
++	 * slots ask it. rasked/rnamed/rstate carry the `r` prefix rather than reusing r327's words: the same
++	 * `state=hop_null` in two rows would name two different columns with one word.
++	 */
++	char rcvown[4][24] = { { '\0' } };
++	uint32_t rcvq[4] = { 0, 0, 0, 0 };
++	uint32_t rcvs[4] = { 0, 0, 0, 0 };
++	int rcve[4] = { 0, 0, 0, 0 };
++	uint32_t rasked = 0;
++	uint32_t rnamed = 0;
+ 	uint64_t htid[4];
+-	uint32_t hrn[4];
++	uint32_t hrn[4] = { 0, 0, 0, 0 };
+ 	uint32_t hrs[4];
+ 	uint32_t hrem[4] = { 0, 0, 0, 0 };
+ 	uint32_t hloc[4];
+@@ -13828,8 +13842,68 @@
+ 			now[sizeof(now) - 1] = '\0';
+ 			clover_emmc_probe_say(now, (unsigned int)strlen(now));
+ 			printf("%s", now);
++		}
++	}
++	/*
++	 * Round328. The receive column of the same hops, asked in the same millisecond band. Boot 113 settled
++	 * that r327's row arrives and that its four literals are honest, and left one question standing: a hop
++	 * whose send-side name is 0 says nothing about who owes it a message, because a thread blocked in a
++	 * receive has no send destination at all. hrn[i] is that receive name, and q/s/e are read off the port it
++	 * becomes, so the row says who owns the door, whether mail is already inside, and whether the number 0
++	 * came from the queue or from a name that never translated (r303's rule: a helper's zero and a real zero
++	 * are otherwise the same zero). The names are dot-joined against a per-hop index order stated by hn, and
++	 * the four raw words ride beside them so a literal and the word it was computed from stay in one row.
++	 */
++	for (i = 0; i < hn; i++) {
++		char own328[24];
++		uint32_t mc = 0;
++		uint32_t sr = 0;
++		int err = -1;
++
++		own328[0] = '\0';
++		if (hrn[i] == 0) {
++			strlcpy(rcvown[i], "null", sizeof(rcvown[i]));
++			rcve[i] = -1;
++			continue;
+ 		}
++		rasked++;
++		clover_sb_port_owner(task, (mach_port_name_t)hrn[i], own328,
++		    sizeof(own328));
++		if (own328[0] == '\0') {
++			strlcpy(rcvown[i], "fail", sizeof(rcvown[i]));
++		} else {
++			strlcpy(rcvown[i], own328, sizeof(rcvown[i]));
++			rnamed++;
++		}
++		clover_sb_port_mail(task, (mach_port_name_t)hrn[i], &mc, &sr, &err);
++		rcvq[i] = mc;
++		rcvs[i] = sr;
++		rcve[i] = err;
+ 	}
++	{
++		extern unsigned int clover_emmc_probe_say(const char *text,
++		    unsigned int length);
++		const char *rst = hn == 0 ? "rcv_none" :
++		    (rnamed != 0 ? "rcv_owner" : (rasked != 0 ? "rcv_unresolved" :
++		    "rcv_null"));
++		char rcv[256];
++		int rl = snprintf(rcv, sizeof(rcv),
++		    "clover r328: bbrcv t=%llu pid=%d hn=%u rstate=%s rnamed=%u rasked=%u"
++		    " c=%s.%s.%s.%s v=%x.%x.%x.%x q=%u.%u.%u.%u s=%u.%u.%u.%u"
++		    " e=%d.%d.%d.%d\n",
++		    (unsigned long long)secs, pid, hn, rst, rnamed, rasked,
++		    rcvown[0][0] ? rcvown[0] : "-", rcvown[1][0] ? rcvown[1] : "-",
++		    rcvown[2][0] ? rcvown[2] : "-", rcvown[3][0] ? rcvown[3] : "-",
++		    hrn[0], hrn[1], hrn[2], hrn[3],
++		    rcvq[0], rcvq[1], rcvq[2], rcvq[3],
++		    rcvs[0], rcvs[1], rcvs[2], rcvs[3],
++		    rcve[0], rcve[1], rcve[2], rcve[3]);
++		if (rl > 0) {
++			rcv[sizeof(rcv) - 1] = '\0';
++			clover_emmc_probe_say(rcv, (unsigned int)strlen(rcv));
++			printf("%s", rcv);
++		}
++	}
+ 	/*
+ 	 * Round262. One header plus at most CLOVER_BB_CENSUS rows, once every two
+ 	 * minutes, class `r262-th` on the card. The header carries the totals the
