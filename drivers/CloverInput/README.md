@@ -141,8 +141,8 @@ What it does not have is the class shape of `docs/drivers/xnu-drivers.md:19-64`,
 `extern "C" void clover_input_run(void)`, chained from `CloverPMGR` after the block
 driver, and the reasons — with the three concrete prerequisites for changing that — are
 `notes/unixnu-doc-conformance.md` §5. Against the worked example it is honest about its own gap:
-`docs/drivers/native-novatek-touch.md:16-37` separates a pure core from a `struct nvt_bus`, and `:130-137`
-makes "write host tests for the pure helpers before the hardware probe" rule 3. Round318 closes that gap:
+`docs/drivers/sheng-novatek-touch.md:18-39` separates a pure core from a `struct nvt_bus`, and `:141-148`
+makes "Run the existing host checks for the reused processing and clock helpers" rule 3. Round318 closes that gap:
 the decode arithmetic now lives in `InputCore.h` with a host model the gate executes, and the MMIO that
 remains in `CloverInput.cpp` reads words and hands them to the layer. The remaining §5 gap is the class
 shape — `notes/unixnu-doc-conformance.md` §5 lists the three prerequisites for changing it.

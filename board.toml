@@ -12,6 +12,18 @@ os_profile = "ipados-17.7.11-21H461"
 description = "Xiaomi Mi Pad 4 8\" LTE (2018)"
 kit = "clover"
 
+# docs/porting/packaging.md: scripts/package.sh reads [package] unixnu and is the one command that
+# packages this board. The two values it needs and that no repository may carry -- the firmware
+# checkout (--uefi / UNIXNU_UEFI) and the platform seed (--unique-chip-id / UNIXNU_UNIQUE_CHIP_ID) --
+# stay outside this file, so the chain documented in README.md is still what produces a flashable
+# image: unixnu release has no step between kernel and payload for this board's AMFI patch and
+# Mach-O normalization, and those two cuts are what the prelinker would otherwise restore.
+[package]
+unixnu = "../UniXNU"
+
+[package.defconfig]
+"ipados-17.7.11-21H461" = "clover_defconfig"
+
 # The unchanged iPad7,1 image, the class every 4 KiB arm64 board in the project uses.
 # Kryo 260 is ARMv8.0 without pointer authentication, so arm64e images cannot run.
 [ipsw]
@@ -222,7 +234,7 @@ loader = "firmware"
 # 12 entry records and 4 beat records all carry its stamp, the newest beat is 1320.098 s and the newest
 # request 1323.814 s, and the deadline slot and both panic markers are still boot 76's -- the r293
 # stamps mean that silence now reads as silence about boot 80 rather than as boot 76's ending.
-title = "clover r333: the swap wait gets a row of its own. Boot 115 read the same stall as boot 113 -- `hot=6:7/3/e00002d5`, `presented=4`, no fifth swap -- and everything the card says about that wait describes the call (arguments, return, done/presented) while nothing describes what the client is waiting on. This round reads the two objects on either side of selector 6: the latched swapID at client+0xf8, the six wake legs at client+0x110 with stride 0xb0, and the two words the family's third and fourth queries test at display+0x16d0/+0x16e0 -- four cells decoded instruction by instruction from this board's own IOMobileFramebuffer image, each read gated on the class size that object was allocated with, so an address this port cannot prove is inside the object prints \\\"off\\\" instead of reading past it. Read before the call and printed after it, with the return in its own column: what the wait holds and what the wait answered are not one reading. gap= and pair= keep the per-swapID history inside the record because boot 115 proved \\\"is this the second call carrying the same swapID\\\" cannot be answered by lining rows up by eye. One column is not what the round was sketched to print: `sent=` where the plan said `notified=` -- the original vsync sender's text is not touched, so the only entry this port can count is its own call site, and the column now names that producer. check-clover.py pins the new tee class pair and the order between them; verify-clover-payload.py pins both row CStrings and, beside them, the stock family's \\\"swap_wait_gated blocked for more than 5 seconds\\\" and \\\"CommandWake didn't happen even after 5 seconds\\\" sentences -- our image carries both, so a boot that dies on that assertion will say so, and a card without the line is a reading rather than a missing tool. Boot 116 is out there running round331; this payload is built, gated and archived for the flash after it."
+title = "clover r334: the tooling moved, the probes did not. The main checkout fast-forwarded to merge 4d380e2, and that merge brings this board three kernel patches it did not have -- sys_work_interval accepting ops 6, 7 and 8 when the caller passes an interval id, a kern_exec block that mounts /private/preboot/Cryptexes/OS for the WebKit and ExtensionKit appexes, and a mac_process block that clears Launch Constraint Violation for owner and cryptex binaries -- plus two patches rewritten in place. All three sit on refusals this port has been reading for forty rounds, so the merge gets a boot of its own before any new column is added: the row the reader greps still says \"clover r333: bbswap\" and only this title says which image ran. Measured before the flash, after naming the two per-build slots (\"LC_UUID\", \"_PrelinkKCID\"): __TEXT_EXEC +1328, __TEXT.__const +304, __cstring +310, __DATA.__data +40, __common +7168, __BOOTDATA.__init_entry_set +24, and __DATA_CONST byte-identical, so this is a behaviour round, not a hash round. Read against boot 117 by the registered branches: if the bbswap rows still land and np0..np5 stay null with zero off, swap stays 0 and pw/ps stay put, the merge is inert on this board and r335 ships as planned; if any of them moves, three added and two rewritten patches arrived in one kernel, so attribution goes back to reverting them one at a time rather than forward to another column. The stock family carries its two five-second assertions in both images and boot 117 printed neither -- if they speak this boot, that is the reading. One instrument note the round was not sketched to write: retiring the kernel work tree is three operations, not one. The build uses out/clover/tree/.cache/xnu-work, that clone carries the headers prepare-xnu-source.py downloads, and archives 01 through 16 compile it before build-xnu-4k-baseline.sh applies any patch."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

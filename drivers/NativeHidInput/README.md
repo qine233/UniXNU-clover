@@ -17,8 +17,8 @@ copy it, and `docs/drivers/xnu-drivers.md:7-14` treats the three companions as o
 Current state: used by the clover HID path -- `package/CloverHidInputProbe.cpp` publishes the device
 behind the `offline-hid-input` gate (its `PE_parse_boot_argn("offline-hid-input", ...)` early return)
 and under the separate `offline-hid-home` switch, and the board ships `sheng-touch-hid=1` for the
-device shape (`board.toml:2337`). `docs/drivers/native-novatek-touch.md:120-128` describes the sequence
-counter this driver reads; the contacts on this board come from the button/HID probe, not a digitizer
+device shape (`board.toml:2337`). `docs/drivers/sheng-novatek-touch.md:120-132` describes the sequence
+counter — there the reader it names is `ShengHidInput`; the contacts on this board come from the button/HID probe, not a digitizer
 matrix, so the counter shape is the reference rather than the source.
 
 ## How this module meets the UniXNU driver documentation

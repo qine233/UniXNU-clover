@@ -147,8 +147,10 @@ with the reasons and the three prerequisites in `notes/unixnu-doc-conformance.md
 Against the five rows of `docs/drivers/xnu-drivers.md:230-239`, this is one of the two clover drivers
 that has all but the last: compile gated, object ABI gated, **host logic gated** — `DspCore.h` is the pure
 decode layer, `tests/clover_dsp_host.cpp` compiles it on the host and `scripts/test-clover-dsp.py` runs
-it, which is rule 3 of `docs/drivers/native-novatek-touch.md:130-137` ("write host tests for the pure
-helpers before the hardware probe") and rule 1 (separate the pure core from a bus struct). Kernel boot
+it, which is rule 3 of `docs/drivers/sheng-novatek-touch.md:141-148` ("Run the existing host checks for
+the reused processing and clock helpers") read together with rule 1 of `:18-39` (separate the pure core
+from a bus struct). The upstream example assumes the helpers are reused from somewhere and already have
+checks; this driver reuses nothing, so the checks are written here. Kernel boot
 and hardware are the on-board loop. Its boot argument is the one instrument this port has deliberately
 left switched off: `"clover-dsp=3"` is commented out in `board.toml:2534`, because reading another
 processor's heap is the level that has to be earned by a log, not assumed — rule 6 of the same six.

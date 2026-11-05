@@ -183,7 +183,8 @@ plist as a personality's record), reached instead as
 What it does have, and what makes it the template rather than the exception, is the fourth test row of
 `docs/drivers/xnu-drivers.md:230-239`: the floor-plan arithmetic is a pure header (`PowerArb.h`),
 `tests/clover_power_host.cpp` compiles it against a fake arbiter on the host, and
-`scripts/test-clover-power.py` runs it — rules 1 and 3 of `docs/drivers/native-novatek-touch.md:130-137`.
+`scripts/test-clover-power.py` runs it — rule 1 of `docs/drivers/sheng-novatek-touch.md:18-39` and
+rule 3 of `:141-148`.
 Round313 is the round that proves the value of that pairing: the v3-vs-v5 direction question ("reading
 the wrong band's table silently shifts every APID instead of failing") was answered by the host model
 before any board was asked, and the vendor sources it rests on are cited slot by slot

@@ -10,7 +10,8 @@
 
 文档正文在 `/Users/zhouzhou/UniXNU/docs`（VitePress 树，`docs/zh/` 是同一套的中文版）。本轮读的是
 `docs/drivers/overview.md`、`docs/drivers/xnu-drivers.md`、`docs/drivers/device-tree-matching.md`、
-`docs/drivers/kexts.md`、`docs/drivers/native-novatek-touch.md`（范例）、`docs/drivers/uefi-drivers.md`、
+`docs/drivers/kexts.md`、`docs/drivers/sheng-novatek-touch.md`（范例；合并 4d380e2 之前叫
+`native-novatek-touch.md`）、`docs/drivers/uefi-drivers.md`、
 `docs/porting/device-repository.md`、`docs/guide/build-kernel.md`。本文所有 `:NN` 行号都取自盘上当前文件，
 可以逐条重放。判定所用的每一条实测命令和它的输出也都写在对应小节里。
 
@@ -41,7 +42,10 @@ builder 脚本进 `[kernel] archives`，`CONFIG_XNU_<NAME>=y` 进 defconfig，�
 匹配键的含义与 probe 顺序见 `device-tree-matching.md:7-18` 与 `:151-159`。
 
 八、测试五档（`xnu-drivers.md:230-239`）：编译、对象 ABI、宿主逻辑、内核启动、硬件。范例给的六条落地规矩
-见 `native-novatek-touch.md:130-137`：纯逻辑与总线分离、常量全部带出处、纯函数先有宿主测试、分级
+见 `sheng-novatek-touch.md:141-148`：纯逻辑与总线分离、常量全部带出处、复用来的纯函数要有宿主检查
+（`6d1fd59`，随合并 `4d380e2` 新到本线；上游原话由「先写宿主测试」改成
+「Run the existing host checks for the reused processing and clock helpers」，本仓不靠它背书——`CloverDsp`、
+`CloverPower`、`CloverInput` 的纯层是本仓自己写的检查，不是复用的）、分级
 boot arg、序号计数器发布快照、默认关闭直到日志证明每一级。
 
 ## 3 逐颗判定
@@ -147,9 +151,10 @@ force_load 那两处。两颗要动开机顺序的活因此可以把风险写小
 版本——「`tree/patches/xnu` 是指向基仓的符号链接，设备仓里叫 `patches/xnu` 的目录会整片盖掉上游补丁而不是
 接上去」。那句话没错，错只错在 `CloverSdhci` 把它推成了「所以加不了 personality」。
 
-## 6 与范例六条对照（`native-novatek-touch.md:130-137`）
+## 6 与范例六条对照（`sheng-novatek-touch.md:141-148`）
 
-第一条（纯逻辑与总线分离）与第三条（纯函数先有宿主测试）：`CloverDsp`（`DspCore.h`）和 `CloverPower`
+第一条（纯逻辑与总线分离）与第三条（复用来的纯函数要有宿主检查；上游原话在 `6d1fd59`（随合并 `4d380e2` 新到本线）后是
+「Run the existing host checks for the reused processing and clock helpers」）：`CloverDsp`（`DspCore.h`）和 `CloverPower`
 （`PowerArb.h`）做到了，而且各有宿主模型并被 `scripts/test-clover-dsp.py`、`scripts/test-clover-power.py`
 当构建闸门；`CloverInput`、`CloverGpu`、`CloverBlock` 三颗既没分离也没有宿主模型——这是本文件里最重的一处
 真缺口，等板子回来有读数打底之后再动。**r316 更新**：那一格不再等板子。`CloverBlock` 交出第三颗

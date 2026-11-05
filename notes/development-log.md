@@ -27487,3 +27487,195 @@ r331 依旧只问了 `pick` 那一枚：#694（逐 hop 都印）的必要性再�
 **⑧ 待发。** boot 118＝`round334-v0.7.48-payload.img`（暂名，以构建产物为准）：一是 #694 那把（`bbsend` 逐 hop 印），
 二是 ⑤ 那把（宿主解 selector 6 的 busy 分支，命名那枚字之后把它读进 r333 的行——先解再改，解不出来就照第十二层把这一格
 写成仪器缺口，不许猜偏移）。判据在写码之前预登记。
+
+> **编号更正（同轮，写于控制轮插入之前那句之后）。** 上游工具链合并落在一枚真会改行为的内核上（见下一节 ②③），
+> 不能与上面这两把探针同靴上路。boot 118 改为**合并控制轮**（标题 `clover r334:`，探针仍是 r333 那一代），
+> 上面这两把顺延到 boot 119（`Round335`）。
+
+## Round334 预登记（boot 118：上游工具链合并的控制轮；判据先于刷写）
+
+**① 本轮唯一的变量是工具链，不是探针。** 主检出 `~/UniXNU` 快进到合并提交 `4d380e2`（origin/main 并进本仓线，
+两处冲突按内容解：`scripts/unixnu/payload.py` 保留 Tools 条目＋本仓那枚「固件真正读的那份 unixnu.toml 必须解析
+并带回本板标题与内核路径」的守卫、`scripts/build-xnu-4k-baseline.sh` 的 LATE_PATCH 台账补上上游两枚的位置）。
+设备仓源码一字未动：`drivers/`、`package/`、`patches/xnu-clover/` 都没有本轮改动。因此探针行仍写
+`clover r333:`（哪代探针），菜单标题写 `clover r334:`（哪枚镜像）——两枚字各管各的，读卡时以标题定靴。
+
+**② 合并给本板内核带的补丁，逐枚点名。** 新增三枚：
+`native-work-interval-instance.patch`（`bsd/kern/sys_work_interval.c`：`arg != NULL && work_interval_id != 0`
+时接受 ops 6/7/8）、`zzyb-native-cryptex-os-view.patch`（`bsd/kern/kern_exec.c`，+158 行：给 WebKit /
+ExtensionKit 的 appex 挂 `/private/preboot/Cryptexes/OS/{System,usr}` 联合挂载）、
+`zzyc-owner-skip-launch-constraints.patch`（`security/mac_process.c`，+10 行：pexpert 门控下清掉 owner/cryptex
+二进制的 Launch Constraint Violation）。修改两枚：`native-lookup-trace.patch`（+24/−18）、
+`offline-component-load-probes.patch`。删除 0 枚。三枚新增都落在这块板子卡住的那几格上（launch 拒绝、
+appex 缺路径、work_interval 被拒），所以这一靴必须先单独看，不许和新探针同轮上路。
+
+**③ 控制量测在刷写之前做完。** r333 内核 `32a608070129024a…` ↔ 合并内核（同一套 AMFI 两刀＋归一化）
+`15b4b5636611982a…`。先点名并排掉每建必变的两格（Mach-O `LC_UUID` 与 `__PRELINK_INFO` 的 `_PrelinkKCID`；
+`normalize-kernel-macho.py` 本轮零化 973 枚 object stamp），再逐段比：
+`__TEXT_EXEC.__text` +1328、`__TEXT.__const` +304、`__TEXT.__cstring` +310、`__DATA.__data` +40、
+`__DATA.__common` +7168、`__BOOTDATA.__init_entry_set` +24；`__DATA_CONST` 八段逐字节同；
+`__PRELINK_INFO.__info` 同尺寸同内容、只平移地址。全表在
+`~/UniXNU/out/migration-clover/step3-tooling-merge-kernel-delta.txt`。结论口径：这是**行为变化轮**，不是哈希轮。
+
+**④ 预登记判据。** 每支都写「成立／不成立／到不了」，读数 0 不许当「没发生」。
+- **M-A 仪器还在（宿主先量）。** 先对**这枚要刷的镜像**逐串 `grep -a -c` 钉住 `clover r333: bbswap`、
+  `clover r333: bbswapcut`、`clover r329: dispstate` 的存在与射程——镜像里有这行 ≠ 本靴有读数。卡上
+  `bbswap` ≥1 枚 ⇒ 可与 boot 117 直接比；0 枚 ⇒ 只能读作「这一靴没走到那次调用」，**不许**读作「合并让等待消失」，
+  那条腿要等 #694 逐 hop 才分得开。
+- **M-B A 支复现。** `np0..np5` 全 `null` 且 0 枚 `off`（整靴零注册）⇒ 合并没动 selector 6 这条腿。
+  任何一枚变 ⇒ 三枚新增里至少一枚动了它，但归不到单枚（见 ⑤）。
+- **M-C `swap=` 仍恒 0** ⇒ latch 仍未被写，`gap=` 继续只是相邻两次调用的间隔。出现非 0 ⇒ 题面从「帧在退休、
+  桌面没进」换成「latch 在动」，下一手全变。
+- **M-D `pw=1 ps=0` 逐枚不变** ⇒ 被查对象还是那一枚；变了先读 `absent=`，别先读结论。
+- **M-E 出厂那两把断言**（`IOMFB: swap_wait_gated blocked for more than 5 seconds…`、
+  `CommandWake didn't happen even after 5 seconds…`）本靴枚数；boot 117 是 0 枚。非 0 是本轮最大的一枚读数——
+  它会自己喊出来，而这正是 §Round332c 钉那两枚字的目的。
+- **M-F 桌面这一格分开数。** `dispstate` 的 `frames=`/`presented=`/`done=` 与那块 `box=305x811..970x1108`
+  是否换形；launch-constraint 与 cryptex 那两枚若起作用，最可能先落在 r186/r250 的用户态「问了什么」与 spawn
+  行上，而不在 swap 行上 —— 两把各数各的，不许拿 swap 的数代答，也不许拿桌面代答 swap。
+- **M-G 复位/死线形状**（`beat`、flight、panic marker 三枚游标）与 boot 117 逐字段对照；AMFI 两刀在**宿主**侧证明
+  还在（本轮构建打印 `cbz w9 -> b` 与 `tbz w0,#0 -> nop` 各一枚，README 第 2 条要求 payload 显式吃 AMFI 内核，
+  照做）。这一支防的是「prelink 把两刀恢复成 stock」那种静默退化。
+
+**⑤ 这一轮答不了的。** 三枚新增 + 两枚修改捆成一枚变量：任何一支变化都归不到单枚补丁。若 M-B/M-C/M-E/M-F 里
+任何一支变了，下一手是**逐枚回退**（一次一枚，从 `patches/xnu/` 移掉那枚重建并对照），不是再加列。
+若四支全不变，则三枚新增对本板 inert，工具链线并进不改变桌面这一格的因果，r335 的探针照原计划上路。
+
+**⑥ 判据不来自被测物。** M-A 的存在与射程在宿主镜像里量；M-G 的两刀在宿主 AMFI 打印与反汇编里量。两支都不从卡上取。
+
+**⑦ 刷写口径。** 只冷刷 `cache`（`mmcblk0p49`），身份闸门 `81ffcaaa`（同时开发的另一台是 `11b5d7c3`，
+不许出现在任何 adb/fastboot 命令里），`--boot-after-flash`，时间线照 §Round330 的四个窗口，
+读数按预登记的 M-A…M-G 逐支写，先落盘再发版。
+
+**⑧ 补丁漂移的修法要拆成三层（本轮实测；以前只当一层）。**
+一是位置：构建用的工作树在**组装树**里（`out/clover/tree/.cache/xnu-work`），不在主检出的 `.cache/`——
+退休主检出那一枚不动构建。二是未跟踪输入：`scripts/prepare-xnu-source.py` 把缺的头**下载进工作树**
+（`EXTERNAL_HEADERS/TrustCache/` 5 枚、`iokit/DriverKit/` 另加 21 枚，在旧克隆里是 `??`），干净克隆没有 ⇒
+archive-07 在 `TrustCache/API.h file not found` 上判红。三是顺序：kernel 步骤先跑 archive-01..16，
+**再**跑 `build-xnu-4k-baseline.sh`，而那些 archive 直接编译工作树里的 XNU 源码 ⇒ 未打补丁的干净克隆让
+`mockfs_fsnode.c:157` 的 `kfree_type` 静态断言判红（那一格正是 `mockfs-typed-allocation.patch` 修的）。
+所以「退休一枚工作树」＝克隆 + 补两枚未跟踪头目录 + 按同一名字顺序重放 140 枚，缺一件就换一种红法。
+另记一枚自己这轮踩的：`git -C <repo> apply <相对路径>` 的相对路径按**仓库目录**解析，诊断循环因此把第一枚补丁
+假报成 FAIL——绝对路径重跑后 140/140 全过，红的是我的探针，不是补丁。
+
+**⑨ 本机 python3.13 曾全盘自旋（2026-11-06 00:34 起，本轮修好）。** 现象是任何 `python3.13` 调用永不返回：
+Homebrew 的解释器本体 `/opt/homebrew/Cellar/python@3.13/3.13.17/…/bin/python3.13`（一个指向
+`/opt/homebrew/bin/python3.13` 的 symlink 路径）被覆盖成 `#!/bin/sh` + `exec /opt/homebrew/bin/python3.13 "$@"`
+——exec 回指同一个 symlink ⇒ 每次调用无限自环。成因签名：并行会话把 shim `cp` 到 `$TMPDIR/pybin/python3`
+这类指向 symlink 的路径上，写穿到了框架里的真身。修法：备份损坏的 launcher（`/tmp/python3.13.selfexec.bak`）、
+`chmod u+w`，改写为 exec 幸存的那枚 app-bundle Mach-O
+（`…/3.13.17/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python`），
+验证 `3.13.17` + `tomllib` 可用、无残留进程；四桩卡住的后台构建随之结束。
+**规范恢复路径留给用户**：`brew reinstall python@3.13`。对本轮的影响口径：这段时间「超时」的两桩 heredoc 调用
+是这台机器的解释器坏了，不是脚本语义问题；修复后同一脚本秒级返回。
+
+**⑩ 构建日志已经不在盘上，哈希改从产物重取。** `/tmp/clover-merge-build2.log`、`/tmp/clover-amfi2.log`
+（连同各自 `.exit`）在本轮写作时已消失——`/tmp` 不是持久引用。因此 ③ 的三枚哈希在发版前对盘上产物重新
+`shasum -a 256` 核对过一遍，逐字相符：`out/clover/kernel/kernel.macho` `e49b480f7ceac231…`、
+`~/clover-out/tooling-merge-kernel-amfi.macho` `15b4b5636611982a…`、
+`~/clover-out/round333-kernel-normalized.macho` `32a608070129024a…`（三枚皆 52 404 224 B）。
+今后判据引用的构建证据一律落在 `~/clover-out/` 或 `out/migration-clover/`，不落在 `/tmp`。
+
+**⑪ 合并还改了一页文档，两枚闸门第一跑就红在它上面。** `git log --diff-filter=R` 指到 `793f852`
+（`docs: document platform structure and component migration`）：`docs/drivers/native-novatek-touch.md`
+被改名成 `docs/drivers/sheng-novatek-touch.md`（154 行）。仓库侧与树侧闸门各判红六处
+`drivers/*/README.md` 的引用——那条规则的判据是「文件在基仓 docs 或本仓里存在」，路径没了就整片红。
+**但只把路径换掉会过闸门而说假话**：新文件同一小节整体下移，且上游改了第 3 条的原话。两枚改动都**确实是这次
+合并带进来的**（判法不是回忆：`git merge-base --is-ancestor <那枚> 4d380e2^1` 对 `793f852`（改名）与
+`6d1fd59`（`docs: make device porting and driver adaptation sequential`，2026-10-25，改第 3 条原话）都返回
+「不在第一父系」⇒ 二者皆随 `4d380e2` 新到本线）。逐处按内容重钉
+（`git show 793f852^:旧文件` 取旧行，再在新文件里按小节定位）：
+`:16-37`（`## Two layers`）→ `:18-39`；`:73-85`（`## Board constants`）→ `:77-89`；`:87-98`
+（`## Probe stages`）→ `:91-102`；`:120-128`（`## HID publication` 的 seq 快照）→ `:120-132`，且那一句
+的读者已从 `NativeHidInput` 改写成 `ShengHidInput`；`:130-137`（`## Adapting the example` 六条）→ `:141-148`，
+第 3 条原话从「write host tests for the pure helpers before the hardware probe」改成
+「Run the existing host checks for the reused processing and clock helpers」——**这条变弱了**（它假设纯层是
+复用来的、检查已存在），所以 `CloverDsp`／`CloverInput`／`notes/unixnu-doc-conformance.md` §6 的措辞按新原话
+重写，并明说本仓的纯层不是复用来的、检查是自己写的。已改：6 处 README + `notes/unixnu-doc-conformance.md`
+三处。**还欠三处编译进内核的源码头注释**（`CloverPower.cpp:11`、`CloverInput.cpp:9`、`CloverDsp.cpp:15`）：
+闸门只判 README，所以它们不会拦；但改 `.cpp` 会打破本轮「发版源码 = 这枚镜像」的单变量前提，
+登记成 #713 随 r335 的重建带走。这一格是第十七层那句「只会被编辑的文件别用行号当针脚」的又一次实测——
+上一轮它打在只被本仓编辑的 `.cpp` 上，这一轮打在只被**上游**编辑的 docs 上。
+
+**⑫ 标题必须带真双引号（boot 35/36 的活体测试），我第一稿把它写没了。** `check-clover.py:5455` 要求
+`board["payload"]["title"]` 里含 `"`——不是禁则，是**强制**：那两靴的标题里的引号让固件侧的 TOML 解析器
+在第一个引号处截断，菜单里没有 OS。r333 的标题有 8 枚，我给 r334 写的那枚 0 枚 ⇒ 两枚标题针脚之外又多一条红。
+改法：`the probe rows still say r333` → `the row the reader greps still says "clover r333: bbswap"`，
+并把 `(LC_UUID and _PrelinkKCID)` 改成 `("LC_UUID", "_PrelinkKCID")`；结果 **1887 枚字、6 枚引号、0 枚反斜杠**，
+长度不超过 boot 117 真读回过的 1908。**判据**：`tomllib.loads(f"title = {json.dumps(t)}")` 回读同值。
+
+**⑬ 闸门红过之后重跑，两枚都 EXIT=0；但 payload 是标题修正前打的，必须重建。** 仓库侧
+`clover ok: … drivers documented: 11, base-repo drivers exempt: 0; citation shapes banned in 34 authored sources`；
+树侧 `clover ok: … 12 archives, 22 objects ABI-checked, kernel read`。重打 payload（内核那枚字节的输入不变，
+仍是 `15b4b563…`）与 boot.img，产物 `payload.img` `7a04b738144a3fcf…`（58 720 256 B）、
+`boot.img` `196b284fc1511961…`（1 613 824 B）。**verify 对归档那枚镜像重跑 EXIT=0，51 条 OK、0 条 FAIL**，
+`unixnu.toml: parses and offers this round's xnu entry OK (title ok, kernel ok, deadline ok)`，
+解出的 `kernel.macho` `b85fc677a885554c…` 与 `payload.json` 的 `payload_kernel_sha256` 逐字同。
+
+**⑭ M-A 在最终镜像上落地（不经卡）。** verify 的 present 列表点名 `r333-bbswap`、`r333-bbswapcut`、
+`r329-dispstate`、`r329-dispstatecut`、`r333-stock-swap-wait-5s`、`r333-stock-command-wake`、`r331-bbsend`
+全在；宿主 `grep -a -c` 对 AMFI 后归一化前那枚 `tooling-merge-kernel-amfi.macho` 另数得
+`clover r333: bbswap ms=` 1／`bbswapcut bytes=` 1／`clover r329: dispstate ms=` 1／`clover r331: bbsend` 3／
+`clover r328: bbrcv` 2、出厂那两句各 1。⇒ M-A 那一支的「仪器还在」成立，卡上枚数与本靴的比值才可比。
+
+**⑮ 跨轮比产物新增一枚每建必变的格子：ADT。** `adt_sha256` r333 `a7da5942…` ↔ r334 `2053ec28…` 变了，
+但 `make-clover-adt.py:219` 是 `("random-seed", os.urandom(64))`。实测：同一串命令行连打两枚
+（`~/clover-out/round334-build/adt-a.dtb`、`adt-b.dtb`，各 14 384 B）→ 逐字节差**只有一处 64 字节游程，
+偏移 396..459（0-based）**，把那一段清零后两枚**逐字节同**。⇒ 排掉清单从两格（`LC_UUID`、`_PrelinkKCID`）
+变三格，第三格是 ADT 的 `/chosen random-seed`。本轮不主张 ADT 变了或没变，只主张除随机种以外没变。
+
+## Round335 预登记（原编号 Round334；boot 119；因插入合并控制轮而顺延）
+
+> 本节下方所有「boot 118」「round334」的编号都写于控制轮插入之前。它的 B 支判据是对着 **boot 117** 的形状
+> 预登记的（`bbswap` 38 枚、`np0..np5` 全 `null`、`swap=` 恒 0、`pw=1 ps=0`），而 boot 119 将跑在**合并之后**的
+> 内核上；因此这些基线值必须在 boot 118 读数回来后逐枚复核再写码——复核不过就按第十二层把那一格改写成仪器缺口，
+> 不许拿着旧靴的数当新靴的分母。
+
+**① 宿主取证先落了盘。** `~/clover-out/round334-forensics/busy-e00002d5.md` 逐条给出 `e00002d5` 的指令链
+（槽 176 → IOCommandGate 槽 29 → `0x678bc5c` 比较 `[display+0x16bc]` → `0x678bf9c` 测 `opt` 的 bit31 →
+`0x678bffc` 存 busy），四份反汇编原文在同目录（`helper-7390.txt`／`slot176-d998.txt`／`action-bc40.txt`／
+`action-bf58.txt` 等），boot 117 那八枚 `selector 6` 行作正对照。**同一趟解出两处此前的误读：**
+`client+0xf8` 不是「从没被写过」——helper 在入口 `0x6773c0 str w8,[x1,#0xf8]` 写、在返回前
+`0x67740c str wzr,[x8,#0xf8]` 清（只有 `[client+0x100]&1` 那支返 `e00002d6` 时留着）；所以 r333 行里
+预调用读到的 `swap=0` 是「上一次调用清掉之后的格子」，不是关于入参的读数。⇒ **撤回 §Round333 ④ 的前半句**
+（「从头到尾没被写过」），保留它的结论（`gap=`/`pair=` 的主语换了）并把它落到新列上：本轮起按 **入参** 记账。
+
+**② 判据 A —— #694 逐 hop（内核侧）。** 同一 fire 里 r328 行若仍是 `hn=4 rnamed=4 v=4403.4703.7203.a703
+q=0.0.0.0 s=0.0.0.0 e=17.17.17.0`，则卡上必须出现 **四枚** `clover r331: bbsend`，`hop=0..3` 与
+`nm=4403/4703/7203/a703` 逐枚对应（与 `v=` 同序，boot 117 的 `hop=0 nm=4403` 已钉住这个对应），每枚同带
+`cand=4 debt=4`，`q=` 与该 hop 在 r328 行里的 `q=` 相同（全 0）。
+
+- **A1（正对照）** `hop=3 nm=a703` 必须 `e=0` 且 `obj=` 非零，`scan=` 是 `holders`/`own_only`/`hash_only`/
+  `no_holder`/`no_srights` 之一——这是两腿第一次打在一个**翻译得通**的端口上。若 `sr=0` 而 `q=0`，那本身就是
+  债的形状（这枚口不收新发送权、队列也空），按 `no_srights` 读，不按失败读。
+- **A2** `hop=0..2` 应仍 `scan=xlate e=17`，逐枚对上 r328 的 `e=17.17.17.0`。
+- **A3（缺陷支）** 少于四枚：按 `cand=` 点数缺哪几枚，记成仪器缺陷（`rnamed=4` 已经说四枚都有名字，所以缺行
+  不是「没名字」）；先查 tee 预算与行数再读内容。**若 hop 1..3 照旧不出现**，只能说明这段循环没进这枚镜像或
+  被预算丢掉——不许读成「那几枚没债」。
+
+**③ 判据 B —— bbswap 行换列（探针侧）。** 行名升 `clover r334: bbswap`，`swap=` 撤掉，换成 `arg=`（入参
+`in[0]`，按 32 位印，因为家族自己 `str w8` 存的是 32 位），并加 `done=`（`display+0x16bc`＝5820）、
+`cur=`（`display+0x1560`）、`list=`（`display+0x1568`），三枚都在调用之前读；`gray` 只出现在
+`absent`/`off`/`null` 三种成因字面量里。`pair=`/`gap=` 改按 `arg=` 记账。
+
+- **B1** 旧串 `clover r333: bbswap` 与 `clover r333: bbswapcut` 必须 0 枚（负针脚）；新串每靴 ≥1 枚。
+- **B2（先写死的判据）** `opt=80000000` 且 `ret=e00002d5` 的每一枚，`arg==done`。若出现一枚 `arg!=done`
+  的 busy 行，它只能是 `-0x82`（`cur` 对象的 `+0x314` 或 `list` 上某节点的 `+0x314` 等于 arg）⇒ 该行
+  `cur=` 或 `list=` 必须非 `null`，且 `pair=again`。
+- **B3（阴性正对照）** `opt=80000001` 且 `arg==done` 的行必须 `ret=0`（boot 117 的 1/2/3/4 四枚如此）；
+  若这四枚里有任何一枚变 busy，说明我把 k==1 分支解错了。
+- **B4** `cur=`/`list=`：本轮**不预登记取值**，只预登记判读规则——若 busy 全由 `arg==done` 解释、且 k==1 同
+  arg 返 0，则「等待＝这枚 swapID 仍是家族的当前 latch」成立，`e00002d5` 不再是端口故事而是显示进度故事；
+  若 `cur=` 常非 null 而 `list=` 常 null，则 pending 链不是这条等待的主语（空判，照样写进读数）。
+- **B5** `pw=1 ps=0` 应 38 枚不变；变了说明被查对象换了一枚，先查 `absent=` 再读结论。
+
+**④ 空判预登记。** `opt=0x1`（bit31 清）**永远** `ret=0`（`0x678c00c` 那一支），不出现就记空判、不记通过；
+`opt=80000003` 走 `k==3` 特殊查询（不经 gate），`ret=0 iff pw!=0 && ps==0`；`e00002d6` 那支只在
+`[client+0x100]&1` 时到得了，出现即第一次见到它，记名不记结论。
+
+**⑤ 读者侧（§Round333 ⑥ 的处置）。** `read-clover-log.py --tee` 末尾印
+`tee lines: N stamped=S glued=G`，`glued` 的判据是行首不是 `[  N.NNNNNN]:`，各举至多三枚的头 80 字节。
+boot 117 至少两枚拼行 ⇒ 本轮若再现，`glued>0`；若为 0，那是「本靴的 msgbuf 没被无换行文本拼过」，也是读数。
+
+**⑥ 判据不来自被测物。** A 支的「四枚」以 `cand=` 为分母；B 支的 `arg==done` 判据来自宿主解出的比较指令，
+不是来自卡上那一行自己；两个 checker 的格式钉与负针脚同轮落地。

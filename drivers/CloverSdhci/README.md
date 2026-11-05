@@ -159,7 +159,7 @@ logic has **no model of its own**. That is this port's largest instrument with n
 the completion criteria, the ring arithmetic and the per-token tee budgets (the `TeeProbeClass` table
 `kTeeProbeClasses`) are the parts that would benefit most from the treatment
 `drivers/CloverDsp/tests/clover_dsp_host.cpp` and `drivers/CloverPower/tests/clover_power_host.cpp`
-give their drivers -- rule 3 of `docs/drivers/native-novatek-touch.md:130-137`. It is open item 3 of
+give their drivers -- rule 3 of `docs/drivers/sheng-novatek-touch.md:141-148`. It is open item 3 of
 `notes/unixnu-doc-conformance.md` §7; what gates this file today instead is `check-clover.py`, whose
 `drivers/CloverSdhci` blocks assert the build/link/argument/schedule triangle (`check-clover.py:625-641`),
 the round198 recovery-BCB line, and one `kTeeProbeClasses` row per reporting round.

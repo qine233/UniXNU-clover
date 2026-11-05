@@ -38,4 +38,4 @@ range, and the splash base this port uses is the device-verified `0x9D400000`, w
 readings and the round that settled them are `notes/clover-device-tree-sources.md` §5, pinned again for
 every build as `SPLASH_BASE` in `scripts/check-clover.py:43`. The instruments
 in this directory are opt-in through their own arguments (`sheng-vsync=<Hz>`, `sheng-fb-gpu=1`,
-`offline-legacy-*`), which is rule 6 of `docs/drivers/native-novatek-touch.md:130-137`.
+`offline-legacy-*`), which is rule 6 of `docs/drivers/sheng-novatek-touch.md:141-148`.
