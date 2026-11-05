@@ -27197,3 +27197,82 @@ notice 只许解释「树不携带」，不许把「被删掉」也咽下去。�
 **⑤ 一处自我修正（也是本轮真正的债）：r332 落盘的那句「两枚闸门都报 `citation shapes banned in 34 authored sources`」是错的。**
 发版时只跑了仓库侧，README 里那一格按「两枚都过」写的。`check-clover.py` 是每轮双闸门的第一枚，判据写错的代价不是红——
 **是下一轮把它当已过的东西再写一遍**。README 的闸门表现在点名这枚 defect、它的形状（cwd-vs-REPO）与修法（路径属性）。
+
+## Round329 读数（boot 115，`round329-v0.7.40-payload.img` `e9c41a1f…`，2026-11-05 无人值守整棒跑完）
+
+**① 这一靴是通路自己跑完的第一靴（时间线第一次给出「什么时候」）。** 21:19:08 起跑：刷写前当场核过
+sha256＝`e9c41a1f…`（与登记的 round329 产物逐字同），写入声明仍是 `cache` 分区单写（`Sending 'cache' 57344 KB OKAY 1.328s`／
+`Writing 'cache' OKAY 0.683s`）。之后 `fastboot reboot` 被接受、板子离开 fastboot，`run-clover-unattended.sh` 一路盯到落回：
+- `round329-boot115-window.bin.timeline.txt`（11,471 B）里 `after-deadline` 那一段在 **elapsed=814 s** 写下 `close:adb`
+  （`1793885565 814 81ffcaaa - close:adb`）⇒ **落回 TWRP 的时刻第一次被量到**，boot 113/114 那两靴欠的就是这一格；
+- 开关各拍了一张 `ioreg -p IOUSB -w0` 全树（`Android@01143000` 在 open 那张里、在 close 那张里没了）；
+- poll 行按 60 s 落在 0/60/120…727，全段 `adb=- fastboot=-` ⇒ 那 814 s 里两把工具都没看见板子（这是关于宿主的陈述，
+  不是关于板子的：第十三层那句「窗口 grep 只证得出在场的」在这里同样适用）。
+读回产物：`round329-boot115-window.bin`（623,104 B）＋ `.txt`（165,885 B）＋ `.landing-sensors.txt`（7,649 B）＋
+`.landing-rawdump-head.bin`（512 B）。解码器认到 `boot 115` 本人（ring slot 0 起 `seq 0 boot 115`）。
+
+**② `clover r329: dispstate` 在本靴落地 10 枚，节拍与两枚触发点都成立。** 逐枚（`ms=`／`fires=`／`seen=`／`client=`／
+`calls=`／`grew=`／`log=`）：349532/11/0/none/-/-/-/9-；379533/12/0/none；**396369/13/1/other**；**396370/14/2/other**；
+413392/15/2/other；**418186/16/3/pid58**（`calls=0`、`grew=-`）；443393/17/3/pid58/`calls=9`/`grew=9`/21-96；
+450494/18/4；473650/19/4/pid58/`calls=26`/`grew=17`/47-96；503651/20/4/pid58/`calls=34`/`grew=8`/63-96。
+节拍腿相邻差 30,039／30,011／29,999 ms（`ms=` 列本身），418186 与 450494 那两枚不是整拍＝**首个客户端 interpose 那枚触发点**
+在同一秒里额外发了一行（396369 与 396370 相隔 1 ms，正是一对）。
+
+**③ §Round329 ⑧ 四支判读。**
+- **A｜成立**：两枚以上拍子落地、间隔 ≈30,000 ⇒ 显示驱动自己的工作循环活着（不经 boot-arg 那一腿也活着）。
+  `grew=` 三次非零（9／17／8）⇒ backboardd 还在问；而同一窗口 `presented=` 从 `2` 走到 `4`、`frames=` 同步 ⇒
+  **「还在问」与「帧还在交」同时成立**，所以欠的那格不在「它不问了」这一支，也不在「下一次 swap 之前」那支——
+  它被顶到「第 4 次之后不再有第 5 次」那一格（与 r322/r332c 从 boot 113 得到的读数同形，本轮第一次有周期列可以并排读）。
+- **B｜不成立（这一支关掉）**：`fires=` 从 11 数到 20，绝不是「只有客户端那一枚」⇒ 循环没在客户端上线后停。
+- **C｜不成立**：10 枚都在，`log=` 最高 63/96、`logdrop=0` ⇒ 本靴的缺席不是预算饥饿。**这条同时给旧读法松了一格**：
+  boot 113 那 55/96 的饥饿在本靴没有复现，`dispstate` 自己也没被吃——但 `log=` 只数 `cloverLog` 那一本，
+  不等于卡上每一行都有余量（第十九层那句仍然算数）。
+- **D｜不成立**：`clover r329: dispstatecut` **0 枚** ⇒ 最长那一枚（含 `s6=` 那串全字）装进了 320 B，
+  与 r330 在宿主侧断言的 `320 ≤ 512-23-1` 相符 ⇒ 收窄列这一手不做。
+
+**④ 三枚新读数（都是第一次有这个列）。**
+- `vs=` 十枚全 `0/0/0`。这一列的生产者在本文件里恒在（`vsyncHz` 与 `vsyncEvents[4]/[1]`），所以**三个零是读数**：
+  本板这颗 legacy 显示对象从头到尾没起过 refresh tick。这与 boot 113 那句「`e00002c7` 是桩、`IOMFBDisplayRefresh` 无读者」
+  不冲突（那条讲的是共享缓存里没人读那枚属性，这条讲的是这颗对象自己的计数器）。
+- `hot=` 从 `8:1/0/00000000`（首个客户端只有 1 枚调用，选择器 8）走到 **`6:7/3/e00002d5`** ⇒ 本靴调用最多的选择器是 **6**，
+  7 次里 3 次失败，最后一次返回 `0xe00002d5`。名字的盘上锚＝本树常量表 `drivers/NativeUfs/tests/RootCommands.cpp:13`
+  与 `RootCommandsArm64.cpp:17`（`kIOReturnBusy=0xe00002d5`）；这两张表是**我们自己抄的 Apple IOReturn 值**，
+  三棵树上都没有 IOKit 头文件，所以「Busy」这个词的出处是这张表，不是厂商头。
+- `s6=`（`%llx %llx %llx -> %08x`＝`sel6_last[0..2]` 加 `selector_status[6]`，见
+  [package/CloverLegacyDisplayProbe.cpp:575-579](file:///Users/zhouzhou/UniXNU-clover/package/CloverLegacyDisplayProbe.cpp#L575-L579)）
+  两次非空：`1 80000000 0 -> e00002d5`（fires=19）与 `3 80000000 0 -> e00002d5`（fires=20）
+  ⇒ 那三枚 `scalarInput` 里第一枚随调用递增（1→3）、第二枚恒 `0x80000000`、第三枚恒 `0`，返回仍是 Busy。
+  这一形状直接顶进 r333 的预登记：`opt=` 那列要印原字而不是按位解析（r332c 的改正仍然算数），
+  并且 r333 现在多了一枚已知输入——**选择器 6 在这颗对象上是以 kIOReturnBusy 失败的**，不是无返回。
+
+**⑤ 防错（本靴的 `t=605` 那两枚不是本靴的）。** `.txt` 的 ring 段里 `clover r328: bbrcv t=605 … hn=3` 与
+`r308: smp-pre t=605` 各出现一次，但它们的槽位标的是 **`boot 114`**（slot 60/61/62；解码器逐槽带 boot id）⇒
+那是上一靴的陈旧槽，不是 boot 115 的读数。本靴自己的那一枚在 slot 57（`boot 115`）：
+`clover r328: bbrcv t=503 pid=58 hn=2 rstate=rcv_owner rnamed=2 rasked=2 c=58:backboardd+ps.58:backboardd+ps.-.-
+v=4503.6403.0.0 q=0.0.0.0 s=0.0.0.0 e=17.17.0.0`，同一毫秒段带里 slot 56 是本靴的
+`clover r327: bbnow t=503 pid=58 fired=1 hn=2 state=hop_null named=0 asked=0 o0=null o1=null`。
+按第十八层/第二十四层读这行：`hn=2` ⇒ 第三、四列的 `-`/`0` 是**根本没问**的声明性零，只有同一行的 `hn=` 能分开它们；
+`e=17.17.0.0` 的前两枚 `17`＝`KERN_INVALID_RIGHT` 来自端口队列 helper 打在 port set 上（结构上没有 `ip_messages`/`ip_srights`），
+`q=0 s=0` 因此不是「口里没信」，而是「这个问题对这一类对象不成立」。**可比性复查成立**：`r327: bbnow` 与 `r328: bbrcv`
+都在（补丁链一字未动，正如 §Round328 读数 ⑧ 预告），且形状与 boot 114 逐列同 ⇒ 换一枚镜像（r328→r329）不改这笔债的形状。
+
+**⑥ 这一靴怎么结束的：与 boot 114 同形（裸复位），而落回时刻现在有数。**
+`flight:` 段：12 枚 entry 记录**全部**由 boot 115 写（`seq 145946..145957`，最新 `t=491588 ms`）、4 枚 beat 也全属本靴
+（最新 `seq 61 @ t=459804 ms`）；**死线记录仍是 boot 108 的**（本靴没写过，`t=1805026 ms seconds=1800`）；
+两枚 panic marker 都 `STALE`（其中一枚明写 `boot 115 never entered the sink`）；无 drain-in、无句子记录。
+内核环里本靴最后一行是 `[503.658378] clover r329: dispstate … fires=20`。⇒ **板钟 503.7 s 停止出声，宿主在 reboot 被接受后
+814 s 看到 TWRP 的 adb**；那 310 s 的差没有任何仪器覆盖（复位本身的时刻不在卡上，也不在这段时间线里），
+不许写成「板子跑了 814 s」，也不许写成「bite 复位」——r283 那条命名腿这靴仍然没成立：
+本靴读回 `clover r283: last reset unnamed … beatmagic=801a082c402c39b2`（≠ `kResetBeatMagic`），
+**并把它按一个点名的存档集数出来**：`~/clover-out/*-window.bin.txt`（80 份）里 `clover r283: last reset unnamed` 23 枚、`last reset kind=` **0 枚**、`beatmagic=3383254414542` **0 枚** ⇒ 这条腿从未成立过，而且这句话现在有一个可以被别人重跑的口径。顺带一处自我修正：§Round328 读数 ⑦ 写的 29:0:0 没点名校验范围，本次按同一形状重数得 23——**同一个论断换一个存档集会换一个数**，所以计数句今后必须带它扫的是哪一批文件（论断本身不变：`kind=` 与心跳 magic 两枚仍是 0）。缺的还是那枚正对照（同靴写后立读、印 `beat_ok=`）。
+桌面格：`box=305x811..970x1108`、`presented=4` ⇒ **停轮条件（真进 iOS 桌面）仍未满足**。
+
+**⑦ 出厂那两枚断言这靴没有喊。** 整份 `.txt` 里 `swap_wait_gated` **0 枚**、`CommandWake didn` **0 枚**
+（r332c 已核实这两句逐字也在我们内核里，计数 3/3、1/1、1/1）。⇒ 本靴不是死在那枚 5 s 断言上；
+这条是「那两枚句子在卡上缺席」，按第十三层只证得出在场的东西——它们若在某靴喊出来，读回通路认得出（同一 msgbuf 通道），
+但今天还没有一枚针脚钉住这句话，已并入 r333 的针脚清单。
+
+**⑧ 下一手。** boot 116＝`round331-v0.7.42-payload.img`（`e7b14b6a…`，本轮读回后已冷刷，判据 §Round331 ⑦ S-A…S-E；
+S-B `own_only` 若成立＝那枚发送权是 backboardd 自己的，「外部债主」整类假设关掉）。r333 那一行
+（`clover r333: bbswap ms= swap= opt= ret= pw= ps= np0..np5 notified= s72= gap= pair=`）的设计输入现在多了
+boot 115 的三条：选择器 6 的调用/失败计数、`opt=` 原字形状（`1/3, 80000000, 0`）与返回 `e00002d5`。
