@@ -9482,6 +9482,14 @@ def check_citation_integrity(errors: list) -> str:
          so a retired label leaves behind a rule and not a gap.
     """
     base = base_repo_root()
+    tree = pathlib.Path.cwd()
+    # Round333. Two ways to be in the tree: run this repository's checker from the assembled tree (the
+    # cwd moves, REPO stays), or run the copy the build drops into out/clover/tree/scripts (REPO becomes
+    # the tree, so cwd == REPO and the first test says "repository"). The second is how the documented
+    # tree-side gate is actually run, and under it cwd-vs-REPO reported a green tree as a broken rule.
+    # `package` is the path property: the device repository authors that directory, so it is a real
+    # directory there, and the assembly replaces it with a symlink to the base repository's package.
+    is_tree = tree != REPO or (REPO / "package").is_symlink()
     scanned = 0
     for pattern in ("drivers/**/*.cpp", "drivers/**/*.h", "package/**/*.cpp", "package/**/*.h"):
         for source in sorted(REPO.glob(pattern)):
@@ -9504,9 +9512,21 @@ def check_citation_integrity(errors: list) -> str:
                    REPO / "drivers/NativeHidInput/NativeHidInput.cpp",
                    REPO / "package/CloverLegacyDisplayProbe.cpp"):
         relative = source.relative_to(REPO)
+        if not source.is_file() and (tree / relative).is_file():
+            source = tree / relative
         if not source.is_file():
-            errors.append(f"{relative} is missing: it is where round332 recorded the citation rule for the "
-                          "vendored display and HID claims, and the twelve retired labels lived in these files")
+            # Round333. The assembled tree does not carry this repository's package directory: out/clover/tree/package
+            # is a symlink to the base repository's package, and the only thing of the display probe that reaches the tree
+            # is the object the link read. A tree run therefore cannot see this source at all, and saying it is missing
+            # would report the shape of the checkout rather than a rule broken -- which is how round332's own gate went
+            # red on a green tree. The repository-side run still judges it, so the notice names who does.
+            if is_tree:
+                print(f"[check-clover] notice: {relative} is not carried by the assembled tree (package is symlinked to "
+                      "the base repository); its citation rule is judged by the run from the device repository",
+                      file=sys.stderr)
+                continue
+            errors.append(f"{relative} is missing: it is where round332 recorded the citation rule for the vendored "
+                          "display and HID claims, and the twelve retired labels lived in these files")
             continue
         text = source.read_text(errors="replace")
         if CITATION_RULE not in text:
@@ -9515,6 +9535,13 @@ def check_citation_integrity(errors: list) -> str:
         if INHERITED_MARKER not in text:
             errors.append(f"{relative} no longer marks anything as an {INHERITED_MARKER!r}: the claims this file "
                           "inherited are still there, and an unmarked assumption reads as a reading")
+    if scanned == 0 and is_tree:
+        # Round333. The tree's `drivers/*` are the base repository's, which this rule exempts, and the device
+        # repository's own sources are not carried here at all -- so the tree run sees none of what it appears to
+        # have scanned. "banned in 0 sources" would read as a clean sweep; it is a scope statement, so say whose
+        # sweep this is (the same rule layer 13 states for the card: absence in the window is not a reading).
+        return ("citation shapes: the assembled tree carries 0 sources this repository authors; "
+                "the run from the device repository is the one that bans them")
     return f"citation shapes banned in {scanned} authored sources"
 
 

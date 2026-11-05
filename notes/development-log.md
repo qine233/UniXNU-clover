@@ -27069,3 +27069,131 @@ panic 块里，`x0` 的两枚格式串（按 VA 解出）是 `NativeLegacyDispla
 **⑧ 本轮欠的两格。** ① 方法的 Apple 名字仍拿不到，除非把 `IOMobileFramebuffer` 用户侧那枚 image 的
 slide 弄到盘上——那是宿主工具的活，不是卡上的；② `main` 镜像（backboardd 自己）的 slide 现在没有任何一行
 能定，所以「第二枚调用阻塞在哪一次会合上」这句话在 r333 之后仍然只能是问题，不是读数。
+
+## Round328 读数（boot 114，`round328-v0.7.39-payload.img` `3a9eee3e…`，读卡时板子已在 TWRP，未重刷）
+
+**① 这一靴是先被读到的，不是先被重刷的。** 04:35 那一棒的写与重启都成功了（`~/clover-out/round328-boot114-unattended.log`，
+932 B：`Sending 'cache' … OKAY`、`Writing 'cache' … OKAY`，失败只在读回：`neither TWRP's adb nor fastboot within 2220s`）。
+用户回来报「已经回到twrp」，`adb devices` 读到 `81ffcaaa recovery`。这时**先只读、不重刷**——
+`run-clover-unattended.sh --skip-recovery --out ~/clover-out/round328-boot114-window.bin`，EXIT=0，依据是卡自己说这一靴已经跑过：
+boot 计数器（sector 1216，kind 24）＝**114**，flight 区 12 枚记录与 4 枚 beat **全部由 boot 114 写**，且 tee 环里就有
+`clover r328:` 的字面行。重刷会把待发清单上这一靴的现场毁掉（第十三层：镜像里有这行≠本靴有读数，反过来也成立——
+本靴已经有读数就别再制造第二个）。产物都在盘上：`round328-boot114-window.bin`（623,104 B）、`.txt`（167,412 B）、
+`.timeline.txt`（3,743 B）、`.landing-sensors.txt`（7,659 B）、读回日志 `round328-boot114-readfirst.log`（168,460 B）。
+同靴命中数（逐枚 `grep -a -c`）：`clover r328` 3、`clover r327` 3、`clover r329` 0、`clover r331` 0
+⇒ 这一靴跑的确实是 round328 那一支，没被后来的镜像污染。
+
+**② 那一行（两通道齐全：tee 环两枚＋内核日志一枚，逐字）。**
+```
+clover r328: bbrcv t=605 pid=58 hn=3 rstate=rcv_owner rnamed=3 rasked=3
+c=58:backboardd+ps.58:backboardd+ps.58:backboardd.- v=4203.7303.a903.0 q=0.0.0.0 s=0.0.0.0 e=17.17.0.0
+```
+同一毫秒段带里 r327 的发送列一字未变（`.txt:1880`，`[605.704569]`）：
+`… state=hop_unresolved named=0 asked=1 o0=null o1=null o2=fail o3=- r0=0 r1=0 r2=4507 r3=0`；r328 在 `[605.704610]`。
+boot 113 那句「发送列是对这类线程错的那一列」在同一靴里第二次成立：同一批 hop，发送列 `named=0`，收列 `rnamed=3`。
+
+**③ 逐字段解码，每个词都指到填它的那一行表达式。**
+- `hn=3` ⇒ 循环 `for (i = 0; i < hn; i++)` 只碰前 3 槽，**第 4 槽是声明性零**（补丁声明段 `rcvq/rcvs/rcve` 都 `= {0,…}`、
+  `hrn[4] = {0,0,0,0}`）。`rcve[3]=0` 既不是 `KERN_SUCCESS` 也不是哨兵 `-1`，它是「没问过」；这一行里能把它读成
+  「没问过」的只有同一行的 `hn=` ⇒ 抄这行必须连 `hn=` 一起抄，单抄 `e=` 四枚会把「没问」读成「翻成功了且没信」。
+- 三枚 `v=` 全非零 ⇒ `rasked=3`；三枚都拿到名字 ⇒ `rnamed=3` ⇒ `rstate=rcv_owner`（`rst` 那三元在补丁里逐字可读）。
+- `e=17` = `KERN_INVALID_RIGHT`——本轮当场数到头文件 `osfmk/mach/kern_return.h:151`，没有转引 r303 的注释。
+- `+ps` 是 `clover_sb_port_owner` 自己打的标记：`task.c:11482` 的 `snprintf(out, outlen, "%d:%s%s", task_pid(owner), comm, pset ? "+ps" : "")`，
+  而 `pset=1` 只在 `io_otype(obj) == IOT_PORT_SET` 那一支置起来（`task.c:11455-11463`）。
+- `q=`/`s=` 是 `clover_sb_port_mail`（`task.c:11506`）读的 `ip_messages.imq_msgcount` 与 `ip_srights`；但该函数在
+  RECEIVE、SEND 两次 `ipc_object_translate` 都失败时把两枚出参留在 0、把 kr 交给 `*err`（`task.c:11513-11531`）
+  ⇒ **`e=17` 那两槽的 `q=0/s=0` 是 helper 的零，不是读数**；只有 `e=0` 那槽的 `q=0 s=0` 是读数。r303 那条规矩在这里正是用来挡住误读的。
+
+**④ 判据落点：A 支成立，且落在 A 里「`q=0` 且 `e=0`」那一小支；B、C 被这行自己的字面排除。**
+- **A｜成立。** `rstate=rcv_owner` 与 `rnamed=3=rasked=3` 是这一支要求的自证，`c=` 三槽都有名字。但要说清楚名字的增量在哪：
+  一枚 blocked-in-receive 的线程，它的 `rcv_name` 的收权就在那线程自己的空间里，而 `clover_sb_port_owner` 先试 SEND、
+  再试 RECEIVE（`task.c:11438-11446`），拿到的必是它自己——所以 `58:backboardd` 本身近乎恒真，**不能当「债主找到了」**。
+  真正的增量是第三槽：**`v=a903` 翻成功（`e=0`）而 `q=0` 且 `s=0`**。按 `clover_sb_port_mail` 注释里写死的判据
+  （r264：`ip_srights` 为 0 意味着「任何任务里都没有代码路径能再往这枚口投递」），这是一枚「没人发」的口——
+  欠的是一封不存在的信，不是投递/调度那一格。
+- **B｜排除，且是被字面排除的。** B 说「trapped 线程根本没在收 ⇒ `x16==-47` 那道闸筛错了对象」。三枚 `hrn` 里两枚是
+  backboardd **自己的 port set**、一枚是它自己的 receive 权，都在它自己空间里翻得动 ⇒ 筛出来的人确实停在收上。
+- **C｜排除。** `rstate=rcv_owner` 而非 `rcv_unresolved`，且 `rnamed=rasked`（解析器对 backboardd 空间没有整体失效）。
+  boot 113 那半条反证（`rem=2e03` 被同一函数命名成 `58:backboardd`）在这里正面复现了一次。
+
+**⑤ 两枚 `+ps` 把问题换了形，而 r328 结构上答不了新形式——这一格写死成缺口，不写成读数。**
+阻塞在 **port set** 上的线程等的是「集合里任意一枚口的任意一封信」。集合对象在本板这代 XNU 里是
+`struct ipc_pset { ipc_object ips_object; waitq_set ips_wqset; klist ips_klist; }`（`osfmk/ipc/ipc_pset.h:77-84`），
+它**没有** `ip_messages`/`ip_srights`——那两个字段属于 `ipc_port`。所以 `clover_sb_port_mail` 对着集合名必然两次 translate
+都失败、必然 `e=17`、必然给 0/0。这不是「没信」，是**问错了对象**。要答「集合里有谁、里面躺着什么」，树里现成的腿是
+`mach_port.c:1268-1287`：`ipc_object_translate(space, name, MACH_PORT_RIGHT_PORT_SET, &psobj)` →
+`ips_object_to_pset()` → `waitq_set_foreach_member_locked(&pset->ips_wqset, ^(struct waitq *wq){ ip_get_receiver_name(ip_from_waitq(wq)) })`
+→ `ips_mq_unlock(pset)`。顺带说清一件旧账：`.cache/xnu-work/osfmk/kern/task.c` 里 `ip_set_members` **0 次命中**、
+本靴卡上 `clover r233` 也 **0 命中** ⇒ 任务清单里那句「r233: port-set members」不是这条腿，别指望复用它。
+
+**⑥ D 支复查（逐条落在 `.txt` 上）＋与 boot 113 并排。**
+- 正对照与旧行齐全：`r327: bbnow` 两通道 3 处；`r319: last` 2 枚（`[381.530001]`、`[500.440844]`，
+  `status=c1343c8 err=0 sda=1 scl=1 vend=8 res=80`）；`clover r281` 37 枚，其中 `wdt … en=1 armed=1`；
+  `r229: bb`（`605.704436`）与 `r234: sbown`（`605.704529`）位置不动，r327 `.704569`、r328 `.704610`、`r262 census` `.704634`。
+- 桌面格：`swap#1..#4 accepted`、`retire#1..#4`、`presented=4`；采样帧从 `frame#0 box=305x887..755x1029`
+  走到 `frame#3/#4/#5 box=305x811..970x1108`（`.txt:1616/1787/1814/1856`）。**与 boot 113 同一枚 `box=`、同一个 `presented=4`**
+  ⇒ 停轮条件（真进 iOS 桌面）仍未满足。
+- D 里「`e=` 出现 -1 的槽要与 `c=null` 同排」这一条**本轮没被检验到**：`hn=3` 且三枚 `hrn` 全非零，`c=null`＋`e=-1`
+  那一型这靴一次没出现 ⇒ 记为「空判」，不许写成通过。哨兵那条腿要等一枚 `hrn==0` 的槽出现才算量过。
+
+**⑦ 这一靴「怎么结束的」在卡上没有仪器（把印象做成计数：29 : 0 : 0）。**
+- 解码器点名两件事：`flight: the deadline record on the card is boot 108's, not boot 114's`；两枚 panic marker 都 `STALE`
+  （boot 111、boot 87）。⇒ boot 114 既没走到 1800 s 死线，也没进 panic 落盘路径。它自己的最后一行是
+  `[605.930356] clover r309: exit … comm=fairplayd.A2`，sdci 侧最新 entry 在 `t=593758 ms`。
+- 唯一能把「非 panic 的复位」说成读数的腿是 r283 的 IMEM 记录格，但它本靴读回
+  `clover r283: last reset unnamed magic=e9881021008109f0 beat=399900110049330 beatcnt=1367141710811 beatmagic=821a082c022c3132`。
+  按 r293 自己写下的分裂（`drivers/CloverSdhci/CloverSdhci.cpp:9981-9990`），`beatmagic != kResetBeatMagic`
+  （`CloverSdhci.cpp:392`＝`0x0033383254414542`）走的是「那格从没持有过我们的心跳」这一支。
+- 把它从一行变成盘子上的总数：存档窗口里 `clover r283: last reset unnamed` **29 枚**、`last reset kind=` **0 枚**、
+  `beatmagic=3383254414542` **0 枚** ⇒ **r283 的复位命名这条腿在本板上从未成立过**。这不能读成「复位没发生」——它是
+  「那格不是我们的」，而「那页不跨复位保留」与「别人在我们读之前写了它」这两支在卡上分不开，因为缺一枚正对照：
+  同一次开机里写完心跳立刻读回并印出 `beat_ok=`。已记为仪器债（新债，未排进 r333 那一行）。
+- 所以结论只到这一步：**boot 114 停在 ≈605 s，离死线还远，卡说不出它是被谁停的**。宿主那句 `neither … within 2220s`
+  同样只证得出宿主没看到，不证板子没落回（r330 那句「时间线只证得出在场的东西」在这里再次适用）。
+
+**⑧ 下一手（本轮读回之后立刻发出，不在事后补写）。** `adb reboot bootloader` → `run-clover-unattended.sh --flash-cache
+~/clover-out/round329-v0.7.40-payload.img --boot-after-flash --out ~/clover-out/round329-boot115-window.bin`；
+刷写前当场核过 sha256＝`e9c41a1f…`（与盘上登记的 round329 产物逐字同），写入声明仍是 `cache` 分区单写。
+判据用 §Round329 ⑧ 的 A–D（`dispstate` 的 30 s 间隔与 `grew=`、只有 `fires=1` 那一枚、`log=`/`logdrop=` 饥饿、`dispstatecut`）。
+可比性那一腿本轮已核过而不是假设：`scripts/build-xnu-4k-baseline.sh:264-266` 的 `LATE_PATCH` 仍依次带
+r331／r328／r327 ⇒ r329 的镜像里 `r327: bbnow` 与 `r328: bbrcv` 都该在；若 boot 115 少了一枚，先当通道的错查，别当行为变了读。
+boot 115 之后按既定顺序才是 `round331-v0.7.42-payload.img`（§Round331 ⑦ S-A…S-E）。
+
+## Round332d（v0.7.44，宿主侧，不刷写）：r332 那道引文闸门在组装树里是红的，而红的是它自己的判据
+
+给 boot 114 落盘之后按惯例跑双闸门，tree 侧 `EXIT=1`。这条红与 r331b 同构：先分清「红的是判据还是这台机器」，
+这一枚既不是产品代码坏了，也不是宿主 flake——**是 r332 那条新闸门选错了「我在不在组装树里」的判据**。
+
+**① 根因（一句话：用错了一把尺子，而且这把尺子恰好在自己身上失灵）。**
+`check_citation_integrity()` 里那段「三枚文件必须都在」的站点，用 `pathlib.Path.cwd() != REPO` 当作「这一次跑在树上」
+的判别式（`REPO = HERE.parents[1]`，`scripts/check-clover.py:35`）。这个写法只覆盖一种跑法：拿**仓库里那枚脚本**去
+`cd out/clover/tree` 跑。tree 侧文档化的标准跑法是另一枚副本——`cd /Users/zhouzhou/UniXNU/out/clover/tree &&
+python3 scripts/check-clover.py`，用的是构建拷进 `tree/scripts/` 的那份。此时 cwd 与 REPO **同时**变成那棵树，
+`cwd != REPO` 永远为假，闸门认定自己是仓库跑，于是要求 `package/CloverLegacyDisplayProbe.cpp` 在位；而组装树的
+`package` 是指向基仓的 symlink（`ls -ld out/clover/tree/package` → `/Users/zhouzhou/UniXNU/package`，那里面只有
+`LICENSE / Scripts / UniXNUPkg / build.sh / compile_flags.txt`），本仓那三枚 `.cpp` 从来没进过这棵树 ⇒ 报 missing。
+**这不是「树上缺文件」，是「树上本来就没有这一类文件」**：闸门把 checkout 的形状读成了被破的规则。
+
+**② 修法（把判据换成路径属性，两处）。**
+- `scripts/check-clover.py`：`is_tree = tree != REPO or (REPO / "package").is_symlink()`。选 `package` 是因为这颗
+  性质由两个 checkout 各自的角色决定、不是巧合：本仓 authored 这个目录 ⇒ 真目录；组装树把它整枚 symlink 到基仓 ⇒ 符号链接。
+  两种跑法（换 cwd 的、跑副本的）都落进同一支。
+- 缺席那一句现在只描述事实、并点名谁判：notice 说「`package/CloverLegacyDisplayProbe.cpp` 不由组装树携带（`package`
+  symlink 到基仓），它的引文规则由仓库侧那一次跑判」。仓库侧那条 error 一字未动。
+
+**③ 顺带把它自己的沉默也说清楚（第十八层第 ⑤ 条的同一格：0 不等于查过）。**
+tree 跑修的判据后 `scanned == 0`——树上的 `drivers/*` 全解析进基仓（被同一条豁免跳过），本仓 authored 源码一枚都不在。
+旧返回串会印成 `citation shapes banned in 0 authored sources`，读起来像「扫过、干净」。改成作用域句：
+`citation shapes: the assembled tree carries 0 sources this repository authors; the run from the device repository is
+the one that bans them`。
+
+**④ 六条负测（`~/clover-out/round332d-gate-evidence/negatives.log`；两条 runs 的原文在同一目录 `repo.log`／`tree.log`）。**
+N1 仓库形 root、三枚文件全缺 ⇒ 3 条 error；N2 同一 root 把 cwd 挪进子目录（旧判据成立的那种跑法）⇒ notice、0 error；
+N3 删规则头 ⇒ 红；N4 换标记短语 ⇒ 红；**N5 树形 checkout（`package` symlink、cwd==REPO，就是修前那枚红）⇒ notice、0 error**；
+**N6 把 symlink 换成一个真的但没有那枚文件的 `package/` 目录（＝真删了 probe）⇒ 仍红**。N6 是这条修法的护栏：
+notice 只许解释「树不携带」，不许把「被删掉」也咽下去。恢复后仓库侧与 tree 侧都 **EXIT=0**（tree 侧仍
+`12 archives, 22 objects ABI-checked, kernel read`）。
+
+**⑤ 一处自我修正（也是本轮真正的债）：r332 落盘的那句「两枚闸门都报 `citation shapes banned in 34 authored sources`」是错的。**
+发版时只跑了仓库侧，README 里那一格按「两枚都过」写的。`check-clover.py` 是每轮双闸门的第一枚，判据写错的代价不是红——
+**是下一轮把它当已过的东西再写一遍**。README 的闸门表现在点名这枚 defect、它的形状（cwd-vs-REPO）与修法（路径属性）。
