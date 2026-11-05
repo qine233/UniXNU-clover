@@ -6909,6 +6909,44 @@ def check_board(errors: list) -> str:
             errors.append("scripts/run-clover-unattended.sh has no %r: without the hop-and-count pair a "
                           "flash that never booted is indistinguishable from a boot that printed nothing"
                           % needle)
+    # Round330 host side. Boots 113 and 114 each ran their full watch window, reported "neither TWRP's
+    # adb nor fastboot" and left nothing on disk behind them, while the board was later found sitting in
+    # recovery holding the boot in question. "When did it come back" therefore has no reading, and the
+    # two candidates that message hides are 2300 s apart: a landing just after the window, or a board
+    # that never enumerated over USB at all. The instrument is one file per run, one section per watch,
+    # each poll's own two answers written when either changes and otherwise once a minute, with the USB
+    # tree captured at open and close. What is asserted below is the part a half-implemented version
+    # would get wrong: a watch that samples only one of the two tools cannot date its own silence,
+    # because the other tool's answer is the reading.
+    for needle in ("timeline_open()", "timeline_poll()", "timeline_close()",
+                   ".timeline.txt", "ioreg -p IOUSB -w0", 'timeline: $TIMELINE',
+                   "watch timeline:"):
+        if needle not in script_text:
+            errors.append("scripts/run-clover-unattended.sh has no %r: a silent watch window would again "
+                          "leave no artifact, and the run could not tell a too-short window from a board "
+                          "that never enumerated" % needle)
+    for label in ("wait-fastboot", "wait-adb", "watch-landing", "after-deadline"):
+        if f'timeline_open {label} ' not in script_text:
+            errors.append(f"scripts/run-clover-unattended.sh opens no timeline section for {label}: that "
+                          "window's silence would be unrecorded, which is the defect round330 removes")
+    for name in ("wait_fastboot", "wait_adb", "watch_landing", "watch_after_deadline"):
+        body = re.search(rf"^{name}\(\) \{{.*?^\}}", script_text, re.S | re.M)
+        if body is None:
+            errors.append(f"scripts/run-clover-unattended.sh has no {name}(): the read-back path lost a "
+                          "watch it is contracted to run")
+            continue
+        text = body.group(0)
+        for needle in ("adb_serial", "fastboot_serial", "timeline_poll", "timeline_close"):
+            if needle not in text:
+                errors.append(f"{name}() does not {needle}: a watch that asks only one of the two tools, "
+                              "or writes nothing, cannot tell a late landing from no landing at all")
+    # The script is the read-back path, and until now its syntax was only ever tested by running it on
+    # the board's clock: a typo costs a 2100 s window and a boot nobody read.
+    syntax = subprocess.run(["bash", "-n", str(REPO / "scripts/run-clover-unattended.sh")],
+                            capture_output=True, text=True)
+    if syntax.returncode:
+        errors.append("scripts/run-clover-unattended.sh does not parse: "
+                      + (syntax.stderr or syntax.stdout)[-700:])
     # Round268's second half: the shared-cache frame decoder, whose two constants decide whether it lies.
     # Scanning image headers one per 0x1000 found 825 of the cache's images and reported most real frames as
     # "in no image"; the cache packs headers every 32 bytes, so the scan has to find each magic occurrence.

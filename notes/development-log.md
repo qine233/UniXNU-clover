@@ -26613,3 +26613,81 @@ r327 **之前**摘除（它的两个 hunk 拿 r327 的行当上下文，先摘 r
 停轮条件仍是「板子真进 iOS 桌面」，未满足不许停。r330 的头两件事已记账：(1) 纯注释轮——
 `NativeLegacyDisplay.cpp` 里 `int-209`/`int-210` 那两枚不可核引文撤回、探针注释里「this round closes」
 改准；(2) 四枚 vendored 报告 helper 的调用者这笔债（本轮另建报告，没有把它们接上）。
+
+## Round330（v0.7.41，宿主侧，不刷写）：给无人值守的静默窗口一份盘上的时间线，并让读者侧从探针源头造出 r329 那一行
+
+**① 本轮的手。** 板子回不来，人不在家，所以这一轮整轮在宿主：改的是**读回通路**本身，一共两刀。
+第一刀在 `scripts/run-clover-unattended.sh`：四个等待窗口（`wait-fastboot`、`wait-adb`、`watch-landing`、
+`after-deadline`）从此每一次轮询都把它拿到的**两个**答案（`adb_serial` 与 `fastboot_serial`）连同 elapsed
+写进一份时间线文件。第二刀在 `scripts/read-clover-log.py --selftest`：round329 的 `dispstate` 行与
+`dispstatecut` 行不再靠人手抄进测试，而是从 `package/CloverLegacyDisplayProbe.cpp` 的格式串 literal
+当场拼出来再逐字节走一遍环形缓冲。内核、负载、`board.toml` 的 `[payload] title`、boot-args 一字未动——
+标题一动就逼着重建 payload，而下一刷仍是 `round328-v0.7.39`、r329 那两行要到 boot 115 才第一次有读数。
+
+**② 为什么静默窗口是真缺口，不是「再等等就好」。** 盘上的证据：
+`~/clover-out/round328-boot114-unattended.log`（932 B）最后一行是
+`[unattended] neither TWRP's adb nor fastboot within 2220s: the deadline did not fire, the panic screen
+never reset, or the reset does not reach this host`，而 `~/clover-out/*.timeline.txt` 那晚一枚都没有。
+卡上有「谁把板子放回 TWRP」的证据（misc 里的 BCB、panic marker、看门狗计数），宿主这边**没有任何东西**
+能回答「它什么时候回来的」。这句话藏着两支相差 2220 s 的候选：落地发生在窗口刚关之后（窗口短了，判据
+该改），和复位根本没打到这台宿主（USB 那一侧从头到尾没人）。第十三层与第十五层在卡上反复交过学费的那条
+毛病，这轮第一次在 shell 里现形：**只在自己的判据成立时才出声的仪器，判不了自己的沉默。**
+
+**③ 仪器的形状。** 一次运行一份文件，`$(basename "$OUT").timeline.txt`，一段一个 watch，段落头写
+label／budget／UTC 打开时刻。列是 `epoch elapsed adb fastboot event`，每行就是那一次轮询自己的两个答案——
+`-` 是「这个工具这一拍说没有」。写行的条件只有两个：任一答案变了，或者距上一行满 60 s，所以它是**时间线**
+不是逐拍记录。收段行带命名结果（`close:adb`／`close:fastboot`／`close:timeout`／`close:neither`），
+开关段各拍一张 `ioreg -p IOUSB -w0` 的 USB 全树（截 60 行）。树而不是名字匹配，是因为要问的是
+「这块板在任何模式下枚举过没有」，而它最可能所在的模式正是那两个工具看不见的模式。四条失败句
+（`die 6` 的两支、`die 5`、`die 2`）与脚本结尾的成功句都点名这份文件，所以「有读数」与「没读数」两次运行
+指向同一个产物。
+
+**④ 读者侧为什么值得从源头造行。** 第十一层说列名和填它的表达式必须同源；r329 那行的列名此刻同时活在
+两个文件里——探针的格式串，和测试里那行手抄。手抄那份会一直绿，直到探针改了一个列名、少了一列，而测试
+读到的仍是旧形状。现在 `--selftest` 读源码、把编译器会拼起来的相邻 literal 拼回来（r329 那行在风格限制下
+就是拆成两半写的）、按 `%llu/%llx/%lld/%08x/%u/%d/%x/%s` 逐个填上代表值，再要求（a）没有 `%` 剩下、
+（b）行宽严格小于从同一文件里正则取出的 `kDispStateRowBytes`、（c）两行都逐字节回到环形缓冲里。
+本轮实测合成行宽 **216 B／63 B**，而 `kDispStateRowBytes=320` 与记录体的块几何
+`512 − len(prefix) 23 − 1 = 488` 被单独断言比较：**探针自己的天花板已经落在一条记录装得下的范围内，
+所以卡永远不会拆散这一行**——这条结论不依赖任何取值。测试里那些值是代表值，不是任何一靴的读数，
+本轮也不拿它们判任何东西。
+
+**⑤ USB 树那一拍当场就有了用。** 本机 `ioreg -p IOUSB -w0` 里躺着一枚
+`QUSB_BULK_SN:F6548A52`——那是高通 diag/EDL 的名字，`adb devices` 与 `fastboot devices` 都看不见它。
+这枚 SN 不是 clover（`81ffcaaa`），所以它**不**说明 boot 114 落在那儿；它说明的是另一件更值钱的事：
+「两把工具都沉默」这一支在 USB 树上是可见的，而这正是旧脚本唯一给不出的那一格。
+
+**⑥ 闸门与自查。** 三条新针脚都做了负测，逐条报出句子：删掉 `timeline_open watch-landing` 那一句 ⇒
+`opens no timeline section for watch-landing`；把 `watch_landing()` 里的 `f=$(fastboot_serial)` 摘掉 ⇒
+`watch_landing() does not fastboot_serial: a watch that asks only one of the two tools, or writes nothing,
+cannot tell a late landing from no landing at all`；给脚本尾部加一句不闭合的 `if` ⇒
+`scripts/run-clover-unattended.sh does not parse`（这条闸门本轮新建：**脚本是读回通路，它的语法以前只
+由「在板子的钟上跑一次」来测，一个 typo 的代价是一整扇 2100 s 的窗没人读**）。三次负测之后从备份恢复，
+`diff -q` 逐字节相同。双闸门：仓库侧 `check-clover.py` **EXIT=0**，`out/clover/tree` 侧 **EXIT=0**
+（12 archives、22 objects ABI-checked）；`verify-clover-payload.py` 对已归档的
+`round329-v0.7.40-payload.img` 重跑 **EXIT=0、0 FAIL**，含 `r329-dispstate present`、
+`r329-dispstatecut present`、`r328-bbrcv present`、`r327-bbnow present` 与 `unixnu.toml … title ok`。
+`read-clover-log.py --selftest` 全绿。空跑实机一遍（不接板子、不写卡）：
+`bash scripts/run-clover-unattended.sh --wait 6 --skip-recovery --out /tmp/r330-run/window.bin` 写出
+1,970 B 的时间线，poll 行落在 elapsed **0／60／120 s**（心跳真的在跳而不是只在变化时写），
+开段里 14 行 USB 树在位。
+
+**⑦ 下一靴安排不变，并给时间线预登记判读法。** boot 114 仍是 `round328-v0.7.39-payload.img`
+（§Round328 ⑥ 的 A–D），boot 115 才是 `round329-v0.7.40-payload.img`（§Round329 ⑧ 的 A–D）；
+用户回来重启板子之前这两支都只能等着。第一次带着时间线的运行怎么读，预登记三支：
+- **T-A｜** 段落里有 `close:adb`／`close:fastboot` ⇒ 「什么时候回来」第一次有了读数，把它的 elapsed
+  跟那靴卡上最新一条 beat 的时间对比，才能说「复位到落 TWRP 的间隔是多少」。
+- **T-B｜** 全段只有 `poll - -` 与一条 `close:neither`，而 close 的 USB 树里**没有**任何一枚看着像这块板
+  的设备（含 `QUSB_BULK`、`USB download`、fastboot 那一类）⇒ 「复位没打到这台宿主」这一支被抬高，
+  下一手问的是卡，不是窗口长度。
+- **T-C｜** 同样全段沉默但 USB 树里出现一枚新的、与 clover 的 SN 有关或高通 diag 形状的设备 ⇒ 窗口不是短的
+  问题，是这台宿主看见的是**另一个模式**的板子；此后判据要按那个模式重列，不许再写成「什么都没回来」。
+- 反例约束：时间线只证得出**在场的**东西（`adb`/`fastboot` 的每次答案、树里每枚设备），证不出「板子带电但
+  没枚举」；因此 T-B 的结论永远是关于宿主的，不是关于板的。这条写在这儿是为了下一次不许把 silence 读成
+  死机。
+
+**⑧ 债。** r331 头两件事仍在册（纯注释轮：`NativeLegacyDisplay.cpp` 撤回 `int-209`/`int-210` 那两枚
+不可核引文、探针注释里「this round closes」改准；四枚 vendored 报告 helper 仍无调用者）。本轮新增两枚：
+(1) 时间线目前只有「写」的一侧被契约钉住，**读的一侧**没有——还没有把这份文件摘要并进每轮读数的工具，
+所以下一靴它仍要靠人 `grep`；(2) `wait_leave_fastboot()` 那 60 s 窗口仍不写时间线（它失败时板子的状态
+是已知的——还在 fastboot——所以本轮故意不扩范围，但这是一种不一致，记下来）。

@@ -144,17 +144,66 @@ adb_serial() {
   # states mean the same thing to this script: there is a shell to dd the log window through.
   adb devices 2>/dev/null | awk 'NR > 1 && ($2 == "device" || $2 == "recovery") {print $1; exit}'
 }
+# Round330 host side. Boots 113 and 114 ended the same way on this host: the watcher ran its whole
+# window, saw neither TWRP's adb nor fastboot, and said so -- while the board later turned out to be
+# sitting in recovery holding the boot in question. So WHO put it back has card evidence (its own BCB
+# and panic markers) and WHEN has none, and the two candidates that message hides are far apart: a
+# landing at 2300 s means this window was too short, while a board that never enumerated over USB at
+# all means the reset did not reach this host. The old loops only spoke when something appeared, so a
+# silent window leaves no artifact behind -- which is the same defect this port keeps finding on the
+# card side, in shell: an instrument that answers only its interesting case cannot date its own silence.
+#
+# One file per run, one section per watch. Each line is that poll's own two answers plus the elapsed
+# seconds, written when either answer changes and otherwise once a minute, so the file is a timeline
+# and not a transcript. The USB tree is captured at open and at close -- the tree, not a name match,
+# because the question is "did this board enumerate in any mode at all", and the modes where it might
+# are exactly the ones the two tools above do not see.
+TIMELINE=""
+TIMELINE_START=0
+TIMELINE_BEAT=0
+TIMELINE_LAST="--"
+timeline_open() {
+  local label=$1 budget=$2
+  TIMELINE="$(dirname "$OUT")/$(basename "$OUT").timeline.txt"
+  { printf '# watch %s budget=%ss opened %s\n' "$label" "$budget" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '# epoch elapsed adb fastboot event\n'; } >> "$TIMELINE" 2>/dev/null
+  TIMELINE_START=$(date +%s); TIMELINE_BEAT=$TIMELINE_START; TIMELINE_LAST="--"
+  printf '# usb at open (%s)\n' "$label" >> "$TIMELINE"
+  ioreg -p IOUSB -w0 2>/dev/null | sed -n '1,60p' >> "$TIMELINE"
+}
+timeline_poll() {
+  local event=$1 adb_now=${2:-} fb_now=${3:-} now state
+  now=$(date +%s); state="${adb_now:--}|${fb_now:--}"
+  if [ "$state" != "$TIMELINE_LAST" ] || [ $(( now - TIMELINE_BEAT )) -ge 60 ]; then
+    printf '%s %s %s %s %s\n' "$now" "$(( now - TIMELINE_START ))" "${adb_now:--}" "${fb_now:--}" \
+      "$event" >> "$TIMELINE" 2>/dev/null
+    TIMELINE_BEAT=$now
+  fi
+  TIMELINE_LAST=$state
+}
+timeline_close() {
+  local result=$1 adb_now=${2:-} fb_now=${3:-} now
+  now=$(date +%s)
+  printf '%s %s %s %s close:%s\n' "$now" "$(( now - TIMELINE_START ))" "${adb_now:--}" "${fb_now:--}" \
+    "$result" >> "$TIMELINE" 2>/dev/null
+  printf '# usb at close (%s)\n' "$result" >> "$TIMELINE"
+  ioreg -p IOUSB -w0 2>/dev/null | sed -n '1,60p' >> "$TIMELINE"
+}
 wait_fastboot() {
   local deadline=$(( $(date +%s) + WAIT ))
-  local found
+  local found a
   say "waiting up to ${WAIT}s for fastboot (the device returns there by itself)"
+  timeline_open wait-fastboot "$WAIT"
   while :; do
-    found=$(fastboot_serial)
+    found=$(fastboot_serial); a=$(adb_serial)
+    timeline_poll poll "$a" "$found"
     if [ -n "$found" ]; then
       say "fastboot: $found"
+      timeline_close fastboot "$a" "$found"
       return 0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
+      timeline_close timeout "$a" ""
       return 1
     fi
     sleep 2
@@ -162,15 +211,20 @@ wait_fastboot() {
 }
 wait_adb() {
   local deadline=$(( $(date +%s) + ADB_WAIT ))
-  local found
+  local found f
   say "waiting up to ${ADB_WAIT}s for recovery adb"
+  timeline_open wait-adb "$ADB_WAIT"
   while :; do
     found=$(adb_serial)
+    f=$(fastboot_serial)
+    timeline_poll poll "$found" "$f"
     if [ -n "$found" ]; then
       say "adb: $found"
+      timeline_close adb "$found" "$f"
       return 0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
+      timeline_close timeout "$found" "$f"
       return 1
     fi
     sleep 2
@@ -192,11 +246,16 @@ wait_leave_fastboot() {
 # reboot), or nothing at all within LANDING_WAIT (2).
 watch_landing() {
   local deadline=$(( $(date +%s) + LANDING_WAIT ))
+  local a f
+  timeline_open watch-landing "$LANDING_WAIT"
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    [ -n "$(adb_serial)" ] && return 0
-    [ -n "$(fastboot_serial)" ] && return 1
+    a=$(adb_serial); f=$(fastboot_serial)
+    timeline_poll poll "$a" "$f"
+    [ -n "$a" ] && { timeline_close adb "$a" "$f"; return 0; }
+    [ -n "$f" ] && { timeline_close fastboot "$a" "$f"; return 1; }
     sleep 2
   done
+  timeline_close neither "" ""
   return 2
 }
 # Round196. After --boot-after-flash the deadline fires inside the payload's own boot, so
@@ -206,17 +265,22 @@ watch_landing() {
 # fastboot, 2 neither).
 watch_after_deadline() {
   local deadline=$(( $(date +%s) + WAIT + DEADLINE_SLACK ))
-  local found
+  local found f
+  timeline_open after-deadline "$(( WAIT + DEADLINE_SLACK ))"
   while :; do
     found=$(adb_serial)
+    f=$(fastboot_serial)
+    timeline_poll poll "$found" "$f"
     if [ -n "$found" ]; then
+      timeline_close adb "$found" "$f"
       return 0
     fi
-    found=$(fastboot_serial)
-    if [ -n "$found" ]; then
+    if [ -n "$f" ]; then
+      timeline_close fastboot "$found" "$f"
       return 1
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
+      timeline_close neither "" ""
       return 2
     fi
     sleep 2
@@ -300,7 +364,7 @@ if [ "$SKIP_RECOVERY" = 0 ] && [ -n "$FLASH_CACHE" ]; then
         say "writing the host's BCB next so the window is still read from TWRP"
         ;;
       *)
-        die 6 "neither TWRP's adb nor fastboot within $(( WAIT + DEADLINE_SLACK ))s: the deadline did not fire, the panic screen never reset, or the reset does not reach this host"
+        die 6 "neither TWRP's adb nor fastboot within $(( WAIT + DEADLINE_SLACK ))s: the deadline did not fire, the panic screen never reset, or the reset does not reach this host; timeline: $TIMELINE"
         ;;
     esac
   else
@@ -310,7 +374,7 @@ fi
 
 if [ "$SKIP_RECOVERY" = 0 ]; then
   if [ -z "$(fastboot_serial)" ]; then
-    wait_fastboot || die 2 "no fastboot after ${WAIT}s; power-cycle and hold Vol- to enter fastboot, then rerun with --skip-recovery off"
+    wait_fastboot || die 2 "no fastboot after ${WAIT}s; power-cycle and hold Vol- to enter fastboot, then rerun with --skip-recovery off; timeline: $TIMELINE"
   fi
   if [ "$ALLOW_BCB" = 0 ]; then
     cat >&2 <<EOF
@@ -346,11 +410,12 @@ EOF
 [unattended]   2. boot TWRP from its own partition, then rerun with --skip-recovery.
 EOF
       exit 4 ;;
-    *) say "neither TWRP's adb nor fastboot within ${LANDING_WAIT}s; the board may be sitting on the panic screen, which resets after 20 s" ;;
+    *) say "neither TWRP's adb nor fastboot within ${LANDING_WAIT}s; the board may be sitting on the panic screen, which resets after 20 s"
+       say "every poll of that window is on disk with its two answers and the USB tree: $TIMELINE" ;;
   esac
 fi
 
-wait_adb || die 5 "no adb in recovery after ${ADB_WAIT}s; TWRP has adbd, so check that recovery actually started (the panel shows its splash)"
+wait_adb || die 5 "no adb in recovery after ${ADB_WAIT}s; TWRP has adbd, so check that recovery actually started (the panel shows its splash); timeline: $TIMELINE"
 
 twrp=$(adb shell getprop ro.twrp.version 2>/dev/null | tr -d '\r')
 device=$(adb shell getprop ro.product.device 2>/dev/null | tr -d '\r')
@@ -493,6 +558,12 @@ boot_id=$(python3 "$decoder" --boot "$OUT" 2>/dev/null | sed -n 's/^boot \([0-9]
 # out of msgbuf -- which it can only do if a line the driver said reached the kernel log at all.
 echo_lines=$(count_records --tee --driver --count "$OUT")
 say "decoded: $OUT.txt ($count report record(s), $verdicts driver verdict line(s), $probe_lines probe line(s), $tee_lines kernel log line(s), boot ${boot_id:-?})"
+# Round330: the watch sections above wrote their own file whether or not they saw anything. Name it
+# on a run that succeeded too, so the same artifact is the reference for both readings -- "the board
+# came back at N seconds" and "the board never enumerated" are answered by the same file.
+timeline_bytes=0
+[ -n "$TIMELINE" ] && [ -f "$TIMELINE" ] && timeline_bytes=$(wc -c < "$TIMELINE" | tr -d ' ')
+say "watch timeline: ${TIMELINE:-none} ($timeline_bytes bytes)"
 # Round268's guard: this run wrote a payload, so the window must be from a boot that ran it. A board
 # that stayed in recovery, a flash that did not land, a reboot that went to Android -- all of them
 # leave the previous boot's window here, and every number in the text above would be real but belong

@@ -83,6 +83,7 @@ a reading.
 import argparse
 import contextlib
 import io
+import re
 import struct
 import sys
 from pathlib import Path
@@ -798,6 +799,59 @@ def build_boot(lba, boot, slot=0, seq=0, kind=BOOT_KIND):
                        boot).ljust(SECTOR, b"\0")
 
 
+def joined_literal(source, anchor):
+    """Round330. The contents of the C string literal that starts at `anchor`, with every adjacent
+    literal folded in the way the compiler folds them, and the two escapes this file's row formats use
+    turned back into characters. A probe's row format is written as two literals because the line is
+    too wide for this repo's style, so a test that pinned one half would be a test that passes while
+    the shipped row renames a column in the other half."""
+    index = source.index(anchor)
+    parts = []
+    while source[index] == '"':
+        end = index + 1
+        while source[end] != '"':
+            end += 2 if source[end] == "\\" else 1
+        parts.append(source[index + 1:end])
+        index = end + 1
+        while index < len(source) and source[index] in " \t\n":
+            index += 1
+    return "".join(parts).replace("\\n", "\n").replace("\\t", "\t")
+
+
+# One sample per conversion, cycled by which occurrence of that conversion it is. The %s values are in
+# the order the row's columns come: a client name, then the counters, the hot-selector triple, the
+# selector-6 argument quad and the three object words. They stand in for readings of the shape boot 113
+# reported for the same quantities; they are not a boot reading, and nothing here is judged on them --
+# the reader is judged on round-tripping a row built from the shipped format string.
+SAMPLE_VALUES = {"%llu": ["512345"], "%llx": ["1", "4", "80000001"], "%lld": ["2"],
+                 "%08x": ["00000000"], "%u": ["18", "1", "7", "96", "0"], "%d": ["333"],
+                 "%x": ["4"],
+                 "%s": ["pid58", "41", "3", "1", "1", "2", "6:20/0/00000000",
+                        "1 4 80000001 -> 00000000", "4", "4", "5"]}
+
+
+def fill_conversions(fmt):
+    """Round330. A row this probe could print, built from the probe's own format string. Conversions
+    are filled left to right in one pass, so a wider conversion is never eaten as a shorter one."""
+    out = []
+    index = 0
+    seen = {}
+    while index < len(fmt):
+        if fmt[index] != "%":
+            out.append(fmt[index])
+            index += 1
+            continue
+        spec = re.match(r"%[-+ #0]*\d*(?:\.\d+)?(?:ll|l|q|z)?[diouxXfeEgGcsA]", fmt[index:]).group(0)
+        values = SAMPLE_VALUES.get(spec)
+        if values is None:
+            raise AssertionError(f"no sample value for {spec} in {fmt!r}")
+        position = seen.get(spec, 0)
+        seen[spec] = position + 1
+        out.append(values[position % len(values)])
+        index += len(spec)
+    return "".join(out)
+
+
 def selftest():
     """Round-trip all three windows, including a wrapped ring of each kind. The rings' geometry is
     asserted rather than trusted from a device frame: the driver computes the LBA of every record from
@@ -849,6 +903,29 @@ def selftest():
                     "[apfs_jhash:146] hash mismatch for 16384 bytes at offset 12128256",
                     "clover r170: check_np pid=12 comm=launchd dyld_flags=0x0",
                     "apfs_mountroot failed: 19"]
+    # Round330: round329's display state row is the widest line this port has ever asked the card to
+    # carry, and both of its shapes have to be readable -- the row itself and the `dispstatecut` the
+    # probe prints when the row would not fit. Neither is retyped here. The row is built from the
+    # probe's own format literal, so a column that the probe renames or drops changes this test's line
+    # too, and its width budget is read from the same `kDispStateRowBytes` the snprintf writes into.
+    # What that buys is the one claim a reader test cannot otherwise make: the reader is checked against
+    # the row the shipped source actually produces, not against a row someone remembered.
+    probe_path = Path(__file__).resolve().parents[1] / "package/CloverLegacyDisplayProbe.cpp"
+    assert probe_path.is_file(), f"{probe_path}: the row this reader is tested against lives there"
+    probe_src = probe_path.read_text()
+    row_cap = int(re.search(r"kDispStateRowBytes\s*=\s*(\d+)", probe_src).group(1))
+    dispstate_row = fill_conversions(joined_literal(probe_src, '"clover r329: dispstate ms='))
+    dispstatecut_row = fill_conversions(joined_literal(probe_src, '"clover r329: dispstatecut bytes='))
+    for name, line in (("dispstate", dispstate_row), ("dispstatecut", dispstatecut_row)):
+        assert "%" not in line, (name, line)
+        assert line.endswith("\n"), (name, line)
+        assert len(line[:-1].encode()) < row_cap, (name, len(line), row_cap)
+        kernel_lines.append(line[:-1])
+    # The probe truncates its row at kDispStateRowBytes, so the row that reaches msgbuf is never wider
+    # than that number. A record is one block -- prefix, body, newline -- so the two caps compared is the
+    # whole of the claim that the card never splits this row: the probe's own ceiling already sits inside
+    # the block, whatever the counters happen to print.
+    assert row_cap <= SECTOR - len(PREFIX) - 1, (row_cap, SECTOR - len(PREFIX) - 1)
     for index, line in enumerate(kernel_lines):
         slot = index
         lba = first_lba + KERNEL_OFFSET + 2 * slot

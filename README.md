@@ -87,6 +87,8 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 | payload 容器不逐字节可复现 | ADT 的 `/chosen/random-seed` 每次重抽（内核本身可复现） | dev-log §Round177 |
 | 构建顺序反着 | `unixnu` 先跑 archives 再跑 XNU，身份戳会删掉 object 让 `nm` 失败；r186 起用一次性 object 预 pass 绕过，没有修 | dev-log §Round186 |
 | 补丁回放名单手写 | 新增补丁若碰到排序在前那条的上下文，必须手动加进 `build-xnu-4k-baseline.sh` 的「先反向」名单 | `AGENTS.md` |
+| 时间线只有「写」的一侧被钉住 | r330 起了 `$(basename "$OUT").timeline.txt`，闸门钉的是四个窗口都写；**读**的一侧还没有工具，判一靴的静默仍要靠人 `grep` 那份文件 | dev-log §Round330 ⑧ |
+| 四枚 vendored 显示报告 helper 仍无调用者 | r329 另建了同源的周期行，这四枚（`prepare_report`/`properties_now`/`state_words`/`clients_dump`）至今零调用 | dev-log §Round329 ②、§Round330 ⑧ |
 
 ## 构建
 
@@ -153,16 +155,20 @@ scripts/run-clover-unattended.sh --out ~/clover-out/roundNNN-log-window.bin \
   驱动判据环 64 槽、内核日志环 512 槽，转圈的环按序号还原先后。
 - **内核 `clover rNNN:` 探针**：每轮换号，`verify-clover-payload.py` 断言新号在、旧号复读形态缺席。
 - **地址翻译**：`scripts/decode-clover-address.py`；`read-clover-log.py` 的 `--selftest` 在闸门里跑。
+- **宿主等待窗口**：`scripts/run-clover-unattended.sh` 每次运行写一份 `$(basename "$OUT").timeline.txt`，
+  一段一个 watch，每行是那一拍自己的 `adb`／`fastboot` 两个答案加 elapsed（变化或满 60 s 才写），
+  开段与收段各带一张 `ioreg -p IOUSB -w0`。它回答的是「什么时候回来的」，卡上那些记录回答的是「谁把它放回来的」。
 
 ## 闸门
 
-| 闸门 | 查什么 | 跑在哪 | r317 实跑 |
+| 闸门 | 查什么 | 跑在哪 | 最近一次实跑 |
 | --- | --- | --- | --- |
 | `scripts/check-clover.py` | 板级预检 + ADT/DT 常量 + 补丁与探针形状 + 驱动宿主模型 | 仓库 | EXIT=0，`drivers documented: 11, base-repo drivers exempt: 0`，12 条 notice 全指向未构建的产物；`test-clover-block.py` 与本轮新增的 `test-clover-gpu.py` 都被这道闸门**跑**而不只是断言存在 |
 | 同一脚本的产物那一半 | 12 枚归档逐枚走对象、核 `docs/drivers/xnu-drivers.md:106-116` 那五个字段、再到链接好的内核里验每颗驱动的导出符号 | **必须在 `out/clover/tree` 里跑** | EXIT=0，`12 archives, 22 objects ABI-checked, kernel read`；`exempt: 11` ——组装树把基仓的 11 颗 `drivers/*`  symlink 进来，r316 起文档闸门只判本仓 authored 的那些 |
 | 同一脚本的文档那一半 | 有源码的 `drivers/*` 必须有 README；README 必须有一段点名文档并至少引一枚**能落地**的 `docs/**.md:行号`；没有 `Info.plist` 的必须说出理由；禁止「本仓 `.cpp`:数字」这种形状 | 仓库即可 | 负向测过：CPU type 改 `0x1000007`、filetype 改 2、换假符号名都报错，带路径的厂商引用不误报；r316 新暴露的一条：本仓 `.cpp` 引用被 `BlockCore.h` 取代，README 改用符号锚点 |
 | `scripts/verify-clover-payload.py` | 归档对镜像：卷内形状 + 逐轮探针断言（含标题必须带双引号，那是 boots 35/36 的转义防线） | 仓库 | EXIT=0，48 行 OK、0 FAIL；`SHNGROOT` 那一枚针脚换成了走查的拒绝标签——优化器把八枚 ASCII 折进立即数，镜像里没有那串字了 |
 | `scripts/verify-userdata-window.py` | 刷 userdata 前的宿主闸门 | 仓库 | 本轮未涉及 |
+| 读回通路那一半（r330 新增） | `run-clover-unattended.sh` 必须过 `bash -n`；四个等待窗口都要开时间线段、并且每一拍同时问 `adb` 与 `fastboot`；`read-clover-log.py --selftest` 里 r329 那两行由探针源码的格式串当场造出来 | 仓库 | 仓库侧与 tree 侧都 **EXIT=0**；三条新针脚逐条负测过（删一段 `timeline_open`、摘掉 `watch_landing()` 的 `fastboot_serial`、尾部加一句不闭合的 `if`），空跑一遍真的写出 1,970 B 时间线、poll 行落在 0/60/120 s |
 
 产物缺席只发 notice，**不会静默通过**——那一格要抓的正是无 `force_load` 链接下「成员安静消失」
 （`configs/clover_defconfig:70` 是被 `build-xnu-4k-baseline.sh:1002` 原样追加的）。
