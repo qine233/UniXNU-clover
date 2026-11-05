@@ -26354,3 +26354,78 @@ ADT 14,384 B。双闸门：`check-clover.py` 仓库侧与 `out/clover/tree` 侧�
 ABI-checked）；`verify-clover-payload.py` **EXIT=0、51 OK / 0 FAIL**，含 `r327-bbnow present`＋
 `r326-bbnow-gone present`＋`r325-bbnow-gone present`＋`ADT: ephemeral-storage ABSENT`。冷刷分区照旧只有 eMMC
 `cache`。
+
+
+## Round327 读数（boot 113，`round327-v0.7.38-payload.img` `9f53fa5d…`，零人工落回 TWRP）
+
+**① 送达与位置（r326 那格第二次成立）。** `clover r327: bbnow` 两通道都在：中转环 slot 59／seq 59／
+boot 113／kind 25，内核环 `[565.436709]`。它在 burst 里的位置与 boot 112 逐字同形——
+`r229: bb` → `r229: sbport` → `r234: sbown` → **`r327: bbnow`** → `r262: census` → `r270: ipi` →
+`r271: cpu` → `r299: smp`。内核环最新一行就是 `r299: smp`，其后 `clover r231: bbhop` 逐跳行 **boot 111／
+112／113 连续三靴 0 枚** ⇒ 切断点没动，r326 选的那一小段仍在切断点之前。
+
+**② 读数本身。**
+```
+clover r327: bbnow t=565 pid=58 fired=1 hn=3 state=hop_unresolved named=0 asked=1
+    o0=null o1=null o2=fail o3=- r0=0 r1=0 r2=7513 r3=0
+```
+逐列：hop 0 与 hop 1 的 `x[3]` 低半 = 0 ⇒ 各印 `null`，没问过解析器；hop 2 的 `x[3]` 低半 = 0x7513 ⇒
+问过（`asked=1`）、没拿到名字（`named=0`）⇒ `fail`；`hn=3` 所以第 4 槽没走 ⇒ `o3=-`、`r3=0`。
+`o3=-` 与 `r0..r3` 里的 0 同排出现，正是本轮要的形状：**「这一跳没有发送对象」「问了没答」「这一跳没走」
+现在是三个词，不再是四枚 `-`**。boot 112 那行四列全 `-` 的读法因此得到更正——它不是「四处都一样」，
+而是这一列本来就只有一种可能落在这里。
+
+**③ §Round327 ⑤ 五支落在哪。** A 不成立（没有任何一列给出服务名）。B 半支成立：`r0=r1=0` 与「这一跳
+没有**发送**对象」同形。C 成立（`state=hop_unresolved`、`asked=1 named=0`）⇒ 判据那句「查解析而不是
+再挪位置」生效，但见下面 ④：解析器不是坏的，坏的是我们只喂了它一列。D 不成立（bbnow 有行）。
+E：桌面仍未进，停轮条件未满足。
+
+**④ 本轮真正的产出：缺席的那一列不是「没有债主」，是「我们没问」。**
+`x[3]` 低半是**发送方向**的目标名，而封行问的只有这一列。同一靴同一帧里另一列才是收方向：
+`clover r221: sbm2 t=561 tid=0x12c … rem=2e03 loc=0 … rn=1e03 rs=4000 … ro=58:backboardd lo=-`
+——这一行同时给出两件事：**正对照**（`rem=2e03` 被 `clover_sb_port_owner` 命名成 `58:backboardd`，
+所以解析器在本靴、在本空间是成立的），以及**列的配对**（`rn=%x` 取 `r[5] >> 32`，与 hop 走跳里
+`hrn[i] = (uint32_t)(x[5] >> 32)` 是同一枚；`rs=%x` 取 `r[6]` 低半＝收缓冲长度）。
+backboardd 的三枚 trapped 线程里两枚 `x[3]` 低半 = 0，形状正是「纯收（无 MACH_SEND）的调用没有发送
+目标」；它们各自等的那个收口在 `hrn[]` 里，已经算好、就在同一帧，**封行没问它**。
+所以「这一跳没有远端」目前只能读成「这一跳没有发送对象」，读不出「backboardd 不欠谁」。
+本轮为此把 `task.c` 里 r221 那行的格式串与实参逐枚对齐重数了一遍——先前一次数错位过一次（把 `dc=`
+当成了 `r[5]` 低半、`rn=` 当成了高半），配对以这次为准。
+
+**⑤ 顺带撤一条旧论断。** r326 ④-1 写下「`hloc = x[3]>>32` 是调用者残值，不是端口名」，依据是 boot 112
+那四枚 `-`。boot 113 给出的对照把这条推翻了一半：同一列在 r221 那行里叫 `loc=`、并且**被同一次解析器
+命名**（`lo=-` 是因为那枚值就是 0，不是因为它无意义）。⇒ 「残值」是从一次缺席推出来的论断，不是读数；
+r327 不用它做判据仍然对（判据不该建在未被证明的列上），但它现在的状态是**未证**，r328 把它和 `hrn`
+一起问，让列的身份由读数决定而不是由禁令决定。
+
+**⑥ 落回与死法（这一格只有一支读得出）。** 卡上 boot 记录 = **boot 113**（刷前那枚是 112，
+`b1a1a86a…` ↔ `ac24461d…`）。`r281: wdt … en=1 armed=1 req=1 pet=60` 最新一枚在 t=546；内核环最新
+t=565.4369；flight 区最新 entry 553.708 s（chronod 的 8 块读，成功）、最新 beat 446.6 s。**本靴没有
+deadline 记录、也没有 panic marker**（卡上两枚 marker 分别是 boot 111 与 boot 87 的 STALE）。四者一起
+只允许一支读法：跑到 ~565 s 停住、既没到 1800 s 死线也没进 sink，是上膛的 WDT 在 t≈578（bark 29 s／
+bite 32 s）咬了复位、misc 里的 BCB 把它送回 TWRP。这是 r324 手 1 的第 4 次零人工落回，也是第一次
+**只有**看门狗解释得通的落回。
+一处宿主侧的账要记清：`run-clover-unattended.sh` 在 2220 s 判「neither TWRP's adb nor fastboot」并退出，
+而 08:08 板子已在 `recovery`、卡上就是 boot 113 ⇒ 落回**发生了、时刻没被抓住**，读数改由手工 `dd` 取。
+「谁带回 TWRP」有卡上证据，「什么时候」没有——这条记成宿主侧仪器债，不构成读数的反证。
+
+**⑦ 桌面这一格。** `r180: frame#3 … box=305x811..970x1108`、`retire#4 done=4 presented=4 frames=4`、
+`client pid=58 selector 6 4 80000001 0 -> 00000000 done=4 presented=4`——与 boot 112 同一枚黑盒、同一个
+presented，没进桌面。另有三枚新的 `r252: miss`：backboardd 在 t=564（就在 fire 前一秒）问
+`DeviceTypeHint`、`Manufacturer`、`NeedsHostState`，板上都没有。这一格不进本轮判据，登记为线索。
+
+**⑧ 下一手 r328（判据先登记）。** 封行不再只问发送列：在**同一段带里**、对 `hn` 枚 hop 各问一次收方向
+`hrn[i]`——属主名（`clover_sb_port_owner`，同一函数、同一 task）＋那枚口的 `imq_msgcount`（走
+`clover_sb_port_state` 已经在用的翻译腿），按成因分 `null`/`fail`/名字，并给出 `rcv=` 原字与 `q=` 计数；
+`state=` 的判据从「hop 0 的发送列给名」改成「发送列或收方向列任一枚给名」。四支：
+- **A** 任一 hop 的收方向被命名 ⇒ 「backboardd 在等谁」第一次有名字，且 `q=` 立刻分岔：`q>0`＝信已经躺
+  在口里没被取（投递/调度问题），`q=0`＝没人发（欠的是一封不存在的信）。
+- **B** 收方向全 `null` ⇒ 这些线程根本没在收（`x16=-47` 那道闸筛错了），下一手回到闸本身。
+- **C** 收方向全 `fail` 而发送列的 0x7513 也 `fail` ⇒ 解析器对 backboardd 空间整体失效，查
+  `clover_sb_port_owner` 的三条翻译腿，而不是再加列。
+- **D** 复查手 1 与可比性：`r281 … en=1 armed=1` 应在、`r319: last` 应在、桌面格看
+  `frame#`/`presented=`/`box=`；停轮条件仍是「真进桌面」。
+
+产物（本轮读回的卡上窗口，可引用）：`/Users/zhouzhou/clover-out/clover-log-window-boot113.bin`
+（623,104 B，sha256 `ac24461d33d9b7f8…`）与解码 `/Users/zhouzhou/clover-out/clover-log-window-boot113.bin.txt`
+（1,926 行）。
