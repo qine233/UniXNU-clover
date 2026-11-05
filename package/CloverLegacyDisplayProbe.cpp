@@ -375,6 +375,13 @@ struct ClientStat {
     uint64_t sel6_first[3],sel6_last[3];uint32_t sel6_distinct;uint64_t sel6_seen[8][3];uint32_t sel6_calls[8],sel6_fails[8],sel6_status[8];
     uint32_t seq_count;struct {uint32_t a,b,c,status,done,presented;} seq[24];
     uintptr_t original_external,original_register;
+    // Round333: the class size this object was allocated with. Every byte the swap-wait row reads out of the
+    // client is gated on it, so a column says "this address is not provably inside the object" instead of
+    // reading whatever follows it.
+    uint32_t classSize;
+    // Round333: per-swapID pairing, the record's whole job being to answer "is this the second call with the
+    // same latched swapID" without the reader having to line two rows up by hand.
+    struct {uint32_t id;uint32_t calls;uint64_t lastMs;} swaps[8];uint32_t swapKinds;
 };
 static ClientStat seenClients[kSeenClients];static unsigned seenClientCount;
 typedef IOReturn (*ExternalFn)(IOUserClient *,uint32_t,IOExternalMethodArguments *,IOExternalMethodDispatch *,OSObject *,void *);
@@ -383,8 +390,129 @@ static ClientStat *statFor(IOUserClient *client) {
     for(unsigned i=0;i<seenClientCount;++i)if(seenClients[i].object==(uintptr_t)client)return &seenClients[i];
     return nullptr;
 }
+/*
+ * Round333. What the swap wait reads out of the two objects, taken before the call and printed after it.
+ *
+ * Why this row exists. Boot 113 and boot 115 both end the same way: `selector 6 ... -> e00002d5` (the family's
+ * own busy return) with no further swap, and every row the card has about this client answers a question about
+ * the *call* -- arguments, return, done/presented -- but none has ever said what the client's own waiting
+ * machinery holds. The stock family that produces that busy return also owns a 5 s assertion
+ * ("swap_wait_gated blocked for more than 5 seconds. Should not happen. Panicking"), so a boot that stalls in
+ * this wait either answers the wait or dies saying so, and today the card cannot tell which half it is missing.
+ *
+ * The four cells below come from the host forensic pass over this board's own IOMobileFramebuffer image
+ * (~/clover-out/round333-forensics/, decoded instruction by instruction, not from any other board's source):
+ *   client+0xf8    the latched swapID, written as a 32-bit word (STR W,[X,#0xf8]) by the same agent that owns
+ *                  the slot array, which is why it is read as a dword and printed unsigned.
+ *   client+0x110   the wake-leg array: stride 0xb0, and the family walks it with
+ *                  `add x8,x8,#0x110` / `movz x10,#0xb0` / `ldr x8,[x8,x9,lsl #4]`, so each slot is read here
+ *                  as the qword at its base. A taken slot returns kIOReturnPortExists (0xe00002dd), so the
+ *                  array is a port table, not a counter.
+ *   +0x16d0/+0x16e0 of the display object (5840/5856) the two words the family's third and fourth special
+ *                  queries test; every reference in the image is LDR W/STR W, so both are dwords, and they are
+ *                  the same pair native_legacy_state_words walks.
+ * The fifth cell is arithmetic, not a read: gap=/pair= are this record's own history, kept so that "the second
+ * call with the same swapID" is a column rather than something a reader has to line up across rows by hand --
+ * which is what boot 115 proved cannot be assumed.
+ *
+ * Column names, each for the expression that fills it (and the reason two of them are not what the round was
+ * first sketched to print):
+ *   ms=      probeNowUs()/1000. `t=` is not used, for r329's reason: this file's `t=` is seconds since the
+ *            first frame and the kernel rows' `t=` is seconds since boot.
+ *   swap=    the dword at client+0xf8, or `off` when 0xfc exceeds ClientStat::classSize -- the address is not
+ *            provably inside this object, which is a different statement from the zero the object could hold.
+ *   opt=     scalarInput[1] in the raw, %llx: bit31 and the low bits are the two halves the family reads
+ *            differently, so the word is printed rather than decoded (boot 113's `80000001` and boot 115's
+ *            `80000000` are both this one word).
+ *   ret=     what the original externalMethod returned for this call.
+ *   pw= ps=  the two queried words, read before the call ran; `absent` says the display object was never
+ *            recorded, `off` says its class size does not reach that offset -- three states, three words.
+ *   np0..np5 the qword at client+0x110+k*0xb0: the value, `null` for a zero word (the family's own test is
+ *            `cmp x8,#0`), or `off` when the slot exceeds the class size.
+ *   sent=    vsyncEvents[1] -- the driver's own count of entering the original vsync sender. The sketch called
+ *            this column notified=; this port cannot count the sender being entered from inside the family
+ *            (its text is not touched), so the column is named for the one producer that does exist. It is the
+ *            same quantity as the beat row's third `vs=` field, read here at event time instead of at the beat.
+ *   s72=     this client's selector-72 entries -- the registration that arms the tick, which no row has ever
+ *            printed. Zero with a non-null `np` is the reading branch B was built for.
+ *   gap=     ms since the previous call carrying this same swapID; `none` for a swapID this record has not
+ *            seen before, `off` when swap= is off, `full` when the eight tracking slots are used up.
+ *   pair=    `first` for that swapID's first call, `again` for any later one, with the same `off`/`full` for
+ *            the two cases where the pairing has no subject.
+ *   pid=     whose client this is. Not in the sketch: with up to eight clients interposed, a row that names
+ *            none of them makes two clients' swap sequences read as one.
+ *
+ * The row is printed with IOLog directly, not through cloverLog: the 96-line budget is per boot and this row
+ * fires once per wait call, so routing it there would let the swap rows spend the budget that the beat row
+ * exists to keep. Its own bound is the tee class, and the tee says out loud when that cap fills.
+ */
+enum {kWakeSlotBase=0x110,kWakeSlotStride=0xb0,kWakeSlots=6,kSwapLatch=0xf8,kSwapWaitRowBytes=320,kSwapTracked=8};
+static const unsigned kQueryOffsets[2]={5840,5856};
+struct SwapWaitPre {
+    uint64_t ms,option;bool latchKnown;uint32_t latch;
+    char latchTxt[16],queryTxt[2][16],slotTxt[kWakeSlots][24];
+};
+static void readSwapWaitState(ClientStat &stat,const uint64_t *in,SwapWaitPre &pre) {
+    memset(&pre,0,sizeof pre);
+    pre.ms=probeNowUs()/1000;pre.option=in[1];
+    const unsigned char *client=reinterpret_cast<const unsigned char *>(stat.object);
+    if(kSwapLatch+4<=stat.classSize) {
+        uint32_t value=0;memcpy(&value,client+kSwapLatch,4);
+        pre.latchKnown=true;pre.latch=value;snprintf(pre.latchTxt,sizeof pre.latchTxt,"%u",value);
+    } else snprintf(pre.latchTxt,sizeof pre.latchTxt,"off");
+    const unsigned char *display=reinterpret_cast<const unsigned char *>(native_legacy_object);
+    for(unsigned q=0;q<2;++q) {
+        if(!display)snprintf(pre.queryTxt[q],sizeof pre.queryTxt[q],"absent");
+        else if(native_legacy_object_size<kQueryOffsets[q]+4)snprintf(pre.queryTxt[q],sizeof pre.queryTxt[q],"off");
+        else {uint32_t value=0;memcpy(&value,display+kQueryOffsets[q],4);snprintf(pre.queryTxt[q],sizeof pre.queryTxt[q],"%x",value);}
+    }
+    for(unsigned k=0;k<kWakeSlots;++k) {
+        unsigned offset=kWakeSlotBase+k*kWakeSlotStride;
+        if(offset+8>stat.classSize){snprintf(pre.slotTxt[k],sizeof pre.slotTxt[k],"off");continue;}
+        uint64_t value=0;memcpy(&value,client+offset,8);
+        if(!value)snprintf(pre.slotTxt[k],sizeof pre.slotTxt[k],"null");
+        else snprintf(pre.slotTxt[k],sizeof pre.slotTxt[k],"%llx",(unsigned long long)value);
+    }
+}
+static void reportSwapWait(ClientStat &stat,const SwapWaitPre &pre,IOReturn status) {
+    const char *gapTxt="off",*pairTxt="off";
+    char gapValue[24];
+    if(pre.latchKnown) {
+        unsigned at=0;
+        while(at<stat.swapKinds && stat.swaps[at].id!=pre.latch)++at;
+        if(at<stat.swapKinds) {
+            uint64_t delta=pre.ms>=stat.swaps[at].lastMs?pre.ms-stat.swaps[at].lastMs:0;
+            snprintf(gapValue,sizeof gapValue,"%llu",(unsigned long long)delta);gapTxt=gapValue;
+            pairTxt="again";
+            stat.swaps[at].calls=stat.swaps[at].calls+1;stat.swaps[at].lastMs=pre.ms;
+        } else if(at<kSwapTracked) {
+            gapTxt="none";pairTxt="first";
+            stat.swaps[at].id=pre.latch;stat.swaps[at].calls=1;stat.swaps[at].lastMs=pre.ms;stat.swapKinds=at+1;
+        } else gapTxt="full",pairTxt="full";
+    }
+    char row[kSwapWaitRowBytes];
+    int length=snprintf(row,sizeof row,
+        "clover r333: bbswap ms=%llu swap=%s opt=%llx ret=%08x pw=%s ps=%s "
+        "np0=%s np1=%s np2=%s np3=%s np4=%s np5=%s sent=%llu s72=%u gap=%s pair=%s pid=%d\n",
+        (unsigned long long)pre.ms,pre.latchTxt,(unsigned long long)pre.option,(unsigned)status,
+        pre.queryTxt[0],pre.queryTxt[1],
+        pre.slotTxt[0],pre.slotTxt[1],pre.slotTxt[2],pre.slotTxt[3],pre.slotTxt[4],pre.slotTxt[5],
+        (unsigned long long)vsyncEvents[1],(unsigned)stat.selector_calls[72],gapTxt,pairTxt,stat.pid);
+    if(length<0 || static_cast<unsigned>(length)>=sizeof row) {
+        char cut[96];
+        snprintf(cut,sizeof cut,"clover r333: bbswapcut bytes=%d cap=%u pid=%d swap=%s\n",
+            length,(unsigned)sizeof row,stat.pid,pre.latchTxt);
+        IOLog("%s",cut);
+        return;
+    }
+    IOLog("%s",row);
+}
 static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExternalMethodArguments *arguments,IOExternalMethodDispatch *dispatch,OSObject *target,void *reference) {
     ClientStat *stat=statFor(client);
+    // Round333 reads the swap-wait state before the call runs, because selector 6 is the call that changes it.
+    SwapWaitPre pre;
+    bool waitCall=stat && selector==6 && arguments && arguments->scalarInput && arguments->scalarInputCount>=3;
+    if(waitCall)readSwapWaitState(*stat,arguments->scalarInput,pre);
     IOReturn status=stat?reinterpret_cast<ExternalFn>(stat->original_external)(client,selector,arguments,dispatch,target,reference):kIOReturnNotAttached;
     if(stat) {
         if(selector==6 && arguments && arguments->scalarInput && arguments->scalarInputCount>=3) {
@@ -406,6 +534,7 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
                 cloverLog("client pid=%d selector 6 %llx %llx %llx -> %08x done=%x presented=%x",stat->pid,
                     (unsigned long long)in[0],(unsigned long long)in[1],(unsigned long long)in[2],(unsigned)status,
                     stat->seq[stat->seq_count-1].done,stat->seq[stat->seq_count-1].presented);
+            reportSwapWait(*stat,pre,status);
         }
         ++stat->calls;if(status)++stat->fails;
         if(selector<kSelectors){
@@ -444,6 +573,7 @@ static void interpose(IOUserClient *client,int pid) {
     if(!copy)return;
     memcpy(copy,vtable,kVtableSlots*sizeof(uintptr_t));
     stat.object=(uintptr_t)client;stat.pid=pid;stat.original_external=copy[168];stat.original_register=copy[175];
+    stat.classSize=(uint32_t)client->getMetaClass()->getClassSize();
     copy[168]=(uintptr_t)&wrappedExternal;copy[175]=(uintptr_t)&wrappedRegister;
     ++seenClientCount;
     *reinterpret_cast<uintptr_t **>(client)=copy;

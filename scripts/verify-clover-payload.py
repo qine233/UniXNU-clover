@@ -1283,6 +1283,23 @@ def check_sb_sample(kernel: bytes) -> bool:
                                 b"vs=%u/%llu/%llu log=%u/%u logdrop=%u\n") in kernel,
              "r329-dispstatecut": (b"clover r329: dispstatecut bytes=%d cap=%u fires=%u client=%s\n") in kernel,
 
+             # Round333 reads the swap-wait state on either side of the call that changes it, from the probe's
+             # own wrapper, and the source's two adjacent fragments reach the card as one CString -- so this is
+             # pinned as the concatenated row, the same way r329's is (round17's rule: pin the outlet the row
+             # has to pass through, not a source line). The cut branch is pinned beside it because it is the
+             # only thing that says the 320-byte record did not quietly eat the row's tail.
+             "r333-bbswap": (b"clover r333: bbswap ms=%llu swap=%s opt=%llx ret=%08x pw=%s ps=%s "
+                             b"np0=%s np1=%s np2=%s np3=%s np4=%s np5=%s sent=%llu s72=%u gap=%s pair=%s "
+                             b"pid=%d\n") in kernel,
+             "r333-bbswapcut": (b"clover r333: bbswapcut bytes=%d cap=%u pid=%d swap=%s\n") in kernel,
+             # The two sentences the stock family owns and this round is measuring against. They are pinned as
+             # CStrings, not as behaviour: what round333 establishes is that our image carries them at the
+             # same counts the stock image does, so a boot that dies inside the 5 s assertion says so out loud
+             # and a card with no such line is a reading rather than a gap in the tooling. Whether a given
+             # boot shouted them is only ever answerable from the card.
+             "r333-stock-swap-wait-5s": b"swap_wait_gated blocked for more than 5 seconds" in kernel,
+             "r333-stock-command-wake": b"CommandWake didn't happen even after 5 seconds" in kernel,
+
              # Round331 asks the question boots 112 and 113 leave open: r328 says the hop's receive queue is
              # empty and its s= column says send rights exist, so somebody holds one, and no row has ever
              # named them. The row is pinned in both of its shapes -- the branch that could not resolve the

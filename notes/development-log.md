@@ -27276,3 +27276,158 @@ v=4503.6403.0.0 q=0.0.0.0 s=0.0.0.0 e=17.17.0.0`，同一毫秒段带里 slot 56
 S-B `own_only` 若成立＝那枚发送权是 backboardd 自己的，「外部债主」整类假设关掉）。r333 那一行
 （`clover r333: bbswap ms= swap= opt= ret= pw= ps= np0..np5 notified= s72= gap= pair=`）的设计输入现在多了
 boot 115 的三条：选择器 6 的调用/失败计数、`opt=` 原字形状（`1/3, 80000000, 0`）与返回 `e00002d5`。
+
+---
+
+## Round331 读数（boot 116，`round331-v0.7.42-payload.img` `e7b14b6a…`，读卡后板子已在 TWRP）
+
+**① 落点。** `~/clover-out/round331-boot116-window.bin.timeline.txt`（15,177 B）：`after-deadline` 那一段开在
+13:37:23Z，`1793886812 969 81ffcaaa - close:adb` ⇒ 重启命令被接受后 **969 s** 宿主见到 TWRP 的 adb
+（boot 115 量的那一枚是 814 s，两把工具同一条通路、同一个开段，可比）。卡上带时间戳的最后一行是
+`831.789679`。这两个数不是同一件事（一枚是宿主经过的秒数，一枚是板子自己的钟），本轮只把它们**并排放**，
+不合成「复位花了多少秒」——那是 §Round330 ⑦ 那条判据没允许的加法。时间线里 `wait-fastboot` 开段两次
+（13:37:16 与 13:37:20），第一次 `close:fastboot` 落在 elapsed 4，第二次落在 0——那是板子本来就在 fastboot
+里，不是它的往返；读数只关于通路，不关于板。
+
+**② r331 自己落在 S-E。** 这一靴卡上的 r331 只有一枚头行（同一次 fire 的两个通道各一枚＋带时间戳一枚）：
+
+```
+clover r331: bbsend t=827 pid=58 hop=0 nm=4003 obj=0 e=17 sr=0 q=0 scan=xlate hits=0 probed=0 scanned=0
+             self=0 ownnames=0 walked=0 cand=4 debt=4
+```
+
+按 §Round331 ⑦ 的字面顺序判：**不是 S-A**（`scan` 不是 `hash_only`）、**不是 S-B**（`own_only` 没成立——注意它
+也**没有**被证伪，见 ③）、**不是 S-C/D**（`probed=0` 与 `scanned=0` 挨着 `hits=0`，所以这个 0 是「没数」而不是
+「数到 0」——第二十一层要求的那枚范围列在这儿干了它该干的活）。**落在 S-E**：`scan=xlate`，读数只关于这一支
+仪器自己的选址。
+
+**③ S-E 里那一枚 17 具体是什么。** 反读 `patches/xnu-clover/…z-clover-r331.patch:87-93`：`clover_port_obj_held()`
+先 `ipc_object_translate(space, name, MACH_PORT_RIGHT_RECEIVE)`，失败再试 `MACH_PORT_RIGHT_SEND`，两次都不成功才把
+`*code` 写成第二次那个 `kern_return_t`，`scan=xlate` 就是这一支。所以 `e=17` = **KERN_INVALID_RIGHT**，
+含义限定在「backboardd 自己的 space 里，这枚名字既翻译不出接收权也翻译不出发送权」。
+同一次 fire 的 r328 那一行却给出了 `rstate=rcv_owner rnamed=4 c=58:backboardd+ps ×4 v=4003.5203.7303.6f07
+q=0.0.0.0 s=0.0.0.0 e=17.17.17.0`——**四枚 hop 名里前三枚连 r328 自己的翻译也是 17，只有第四枚 `e=0`**。
+于是本轮真正学到的一条关于 r331 的事实：**它只翻译 `pick` 挑中的那一枚（hop 0），而这一拍里翻译得通的那枚
+（hop 3）它根本没问。** S-E 那句「先判 hop 本身，再决定 r331 是否需要挪位置」到这里有了具体的下一手，
+而且它不是加列——是把 `pick` 换成逐 hop 都印（`cand=`/`debt=` 已经说明有几枚可印）。
+两行口径不同（一枚走 entry 表认属主，一枚走 `ipc_object_translate`），按 §Round331 ⑦ 反例 (3) 不许合成一句
+结论，本轮就把它们写成两句。
+
+**④ 本轮最大的更正：「画到第 4 步就停」被这一靴推翻。** 卡上 `r180:` 的 swap 序列在 boot 116 走到第 12 次：
+
+```
+716.662853 retire#1 done=1 presented=1 frames=1        716.678094 client pid=86 selector 6 1 1 0 -> 00000000
+732.358339 retire#2 done=2 presented=2 frames=2        732.365987 client pid=86 selector 6 2 80000001 0 -> 00000000
+735.583951 retire#3 done=3 presented=3 frames=3        746.573011 client pid=86 selector 6 3 80000001 0 -> 00000000
+759.633090 retire#4 done=4 presented=4 frames=4        759.655102 client pid=86 selector 6 4 80000001 0 -> 00000000
+```
+
+（`retire#5..#12` 的行不在环里——那些行按首见才印，`r329` 的 `done=/presented=/frames=` 才是持续读数：
+`fires=30 … done=a presented=a`、`fires=31 ms=823801 … done=12 presented=12 frames=12`。）
+**发起这些调用的是 pid 86 = `IOMFB_FDR_Loader`**（卡上 `comm=` 只在一枚 `r188` 行里点名过它一次），
+不是 backboardd。而 pid 58 的记录这靴 `calls=0`。⇒ boot 113/115 那句「第五次 swap 没来」不是这条管线的
+性质，是**那一靴那一位客户端**的性质；同一枚 `box=305x811..970x1108`、同一份显示代码，这一靴 swap 一路退休到
+12。停轮条件（真进 iOS 桌面）仍然没满足，但题面换了：不再是「画到第 4 步就停」，而是「**画面在继续退休、
+桌面那一格却没进**」。#666 的措辞要跟着改。
+
+**⑤ 这一靴同时暴露 `r329` 那行的一处读法陷阱（不是列错，是选记录的那条规则）。** `client=` 列的 Producing
+规则是「取 `pid==58` 那条记录」，boot 116 上它诚实地印了 `client=pid58 calls=0 fails=0 hot=none grew=0`——
+一个按字面读的人会把这行读成「显示客户端整拍没动手」，而这靴真正在动手的客户端在另一条记录里。
+`calls=0` 没错，**错的是「pid58 就是那一位客户端」这个没写在列旁边的假设**。两条处置：① r333 那行落地时把
+设计里没提的 `pid=` 加在行尾（多位客户端时不点名就会把两条序列读成一条）；② 记一笔债：`r329` 的拍行要么
+跟随「本靴选择器 6 调用最多的那条记录」，要么逐客户端各印一枚 `grew=`，r334 之后再定。
+
+**⑥ 出厂那两枚断言这靴也没喊。** 整份 `~/clover-out/round331-boot116-window.bin.txt` 里 `swap_wait_gated`
+**0 枚**、`CommandWake didn` **0 枚**（这两句逐字也在我们内核里，本轮在产物上重数过一次：
+`grep -a -c` 各 1）。⇒ boot 116 不是死在那枚 5 s 断言上。这条是「缺席」，第十三层只证得出在场的东西——
+但从 r333 起这句话有了一枚钉在镜像里的针脚，喊出来的靴子不需要我再猜通路。
+
+**⑦ 下一手。** boot 117＝`round333-v0.7.46-payload.img`（判据 §Round333 ⑦ A–E）。r331 那一支的修正
+（逐 hop 印，而不是只印 `pick`）排在它后面，因为它需要先有一个「哪位客户端在问」都不确定的靴子给它配对。
+
+## Round333（v0.7.46，bbswap 行：在调用两侧读两颗对象）
+
+**① 这轮换的东西。** `package/CloverLegacyDisplayProbe.cpp` 里 `wrappedExternal` 认到 selector 6 时，
+**先读后转再印**：调用之前把「这次等待所依赖的状态」抄进一个局部记录，把调用交给原厂 `externalMethod`，
+返回后连 `ret=` 一起印成一行——第十五层那条（门口状态要在任何写之前读，并且和本次动作的结果分成两组字）。
+行形如 `clover r333: bbswap ms=… swap=… opt=… ret=… pw=… ps=… np0..np5=… sent=… s72=… gap=… pair=… pid=…`，
+超宽时走 `clover r333: bbswapcut bytes= cap= pid= swap=`（第十七层那条：长行不能自己说被切了，
+必须有一枚必经出口）。不走 `cloverLog` 那 96 行预算——这枚行按调用次数印，走进去就会吃掉 `r329` 那行
+存在意义所在的那半本账；它有**自己的 tee 类**，上限满了由 tee 自己的 `capped at` 喊出来。
+
+**② 四格几何来自在盘取证，不是笔记。** `~/clover-out/round333-forensics/`（三份：
+`offset-word-scan-and-strings.txt`／`family-windows-decoded.txt`／`stock-family-word-scan.txt`）里逐条解码：
+`STR W,[X,#0xf8]` 4 枚命中（latched swapID 是 32 位字，且确实写在用户客户端对象里）；唤醒腿那条数组
+`add x8,x8,#0x110`（`91044108`）＋`movz x10,#0xb0`＋`ldr x8,[x8,x9,lsl #4]` ⇒ 基址 `0x110`、步幅 `0xb0`、
+每格读一枚 8 字节字，空格用 `cmp x8,#0` 判，格被占用回 `0xe00002dd`（PortExists）；被查询那两枚字
+`LDR W,[X,#0x16d0]` 7 枚、`LDR W,[X,#0x16e0]` 3 枚且**只以 W 出现** ⇒ 5840/5856 两枚 dword，
+与 `native_legacy_state_words` 走的那段偏移重叠但不相同（那一段是 5808..5872 的逐枚列举，这枚行只点名两枚）。
+**没有任何一格是按名字猜的**，也没有一格来自另一块板子。
+
+**③ 每列一个成因字面量（第十五层／第十八层那条：一枚字不许两义）。**
+`swap=`＝值／`off`（`0xf8+4` 超出 `ClientStat::classSize`——`interpose` 现在把那颗对象的 `getClassSize()`
+记进记录，所有越界判法都用它）；
+`pw=`/`ps=`＝值／`absent`（显示对象从没记到）／`off`（`native_legacy_object_size` 不够大）；
+`np0..np5`＝值／`null`（那格是 0，出厂的判法）／`off`（`0x110+k*0xb0+8` 超出类尺寸）；
+`gap=`＝毫秒／`none`（这个 swapID 本记录第一次见）／`off`（`swap=off`，配对没有主语）／`full`（八枚跟踪槽用完）；
+`pair=`＝`first`/`again`，同一支 `off`/`full`。
+
+**④ 两处偏离 §Round332c ⑦ 的设计，都写在字面上。**
+其一：设计里那枚 `notified=` 落地成 **`sent=`**。原因是可达性，不是口味：`native_legacy_vsync_notify` 是
+`scripts/build-clover-gop-legacy-display.py:210` 绑到 `0xfffffff005796720` 的那位**原厂发送者**，本端口不动它的
+文本，所以数得了的只有「我们自己的调用点进入了它」——生产者是 `NativeLegacyDisplay.cpp:118` 那一处，列名就
+按它写。它与 `r329` 那行的 `vs=` 第三枚同源（同一个 `vsyncEvents[1]`）、不同钟（一枚在拍上、一枚在事件上），
+这层关系写在列旁边的注释里；设计文档里那句「这两枚今天是没有任何一行的仪器」对 `notified=` 是**说错了**，
+`r329` 已经有它，本轮撤回那句。
+其二：行尾加了设计里没有的 `pid=`，理由就是 ⑤/boot 116 那一格。
+
+**⑤ 闸门与负测（第二十二层：闸门也是仪器，针脚要逐条证会红）。** `check-clover.py` 新增一块：两枚 tee 类
+必须在场、**`bbswapcut` 必须排在 `bbswap` 前面**（前缀包含，`teeProbeClass` 取第一枚命中——r313/r329 那条
+判法反过来的形状）、以及逐段豁免必须在场。四条负测（`~/clover-out/round333-gate-evidence/negatives.log`）
+逐条判红、恢复后逐字节相同：N1 删 `r333-bbswap` 类→红在 `has no class`；N2 把两枚换序→红在
+`lists the shorter token first`；N3 摘掉豁免→红在 `not exempt from the per-pass cap`；N4 把标题断言改成别轮→红在
+`title is not "clover r333: …"`。**第一次做这个负测时我的匹配串漏了两格缩进**，断言当场抛异常，
+`drivers/CloverSdhci/CloverSdhci.cpp` 停在 N1 那枚改动上没被恢复——先补一段还原（`git diff --stat` 确认只剩
+本轮该改的五个文件），再把带缩进的常量重跑一遍四支，才写下「恢复后逐字节同」。这条与第二十二层 ⑤ 同构：
+**负测脚本自己也是仪器，它的字符串必须钉在被测文本的真实形状上**，否则红的是脚本而不是判据，而且会把文件
+留在改动状态。
+`verify-clover-payload.py` 新增四枚针脚（`round333-verify.log` 里挂在 `kernel.macho: r217 sb sample linked`
+那组下面，全组 51 枚 OK、0 FAIL）：两枚行 CString（源里相邻的三段被优化器拼成一枚，按拼回来的形状钉）与
+出厂那两句。**它们的可红色是量出来的，不是断言的**：拿上一代 `round331-v0.7.42-payload.img` 走同一枚脚本
+（`round333-gate-evidence/neg-verify-round331.log`），`r333-bbswap`/`r333-bbswapcut` 报缺、整组 FAIL、EXIT=1，
+而两枚出厂句子在**两枚镜像里都 present** ⇒ 那两枚的反证只可能是「家族切片不在预链接里」，不是「本轮没写行」。
+这句话写进注释，因为它是那两枚针脚的射程边界。
+
+**⑥ 产物。** 内核原始件 `b205274f0295e831860fa4dbdac3a38ee396d869f4671747aedf32444fb83270`；打过 AMFI 两处站点的
+`round333-kernel-amfi.macho` `0bc68e3c61b6363db1cc79562798e4acfbb0d8632bc7915c332e889d9afc4e1a`；归一化
+`round333-kernel-normalized.macho` `32a608070129024ad2ced4d7406758aefad899c24ef05fdac919f2635452be57`（973 枚
+对象戳清零）；`round333-payload.json` 自证 `payload_kernel_sha256 28d0f24b…`、`adt_sha256 a7da5942…`；
+负载 `~/clover-out/round333-v0.7.46-payload.img` `7b72720c2e3224012913207ed22b9ff30f5a12a47c9315382c0ce5d10eb4c768`
+（58,720,256 B）。`kernel_args` 与 `round331-payload.json` **逐字节相同**（本轮没加任何 boot-arg）。
+双闸门 EXIT=0（仓库侧 `citation shapes banned in 34 authored sources`；tree 侧 `12 archives, 22 objects
+ABI-checked, kernel read` 并带着 r332d 那句作用域声明），`verify-clover-payload.py` 51 OK／0 FAIL、`title ok`。
+
+**⑦ 预登记：boot 117 怎么读这一行。** 判据只看列。先记一条前置：**这一靴选择器 6 可能根本不是 pid 58 发的**
+（boot 116 是 `IOMFB_FDR_Loader`），所以每枚行先按 `pid=` 分组，再谈 A–D——把两位客户端的序列合起来读是
+④/⑤ 那一格允许的错法。
+- **A｜`np0..np5` 全 `null`** ⇒ 没有一格装着唤醒口，出厂的等待只能靠轮询。定名仍是 §Round329 ⑧ 那一句
+  「我们的类从没让第二枚调用变得有必要」，下一手回投递/渲染循环（#666，措辞按 ④ 改过），不在 IPC 等待链里加列。
+- **A′｜`np` 里有 `off`** ⇒ 本轮的类尺寸防线没够着那几格：读数是关于仪器的，先量 `classSize` 那一格再谈别的。
+- **B｜某枚 `np` 非 `null` 而 `sent=` 恒 0** ⇒ 口在、本端口从没发过。**射程写在这里**：`sent=` 数的是
+  `NativeLegacyDisplay::vsyncTick` 那一处进入原厂发送者的次数，发送者文本没被碰，所以「家族内部自己调用它」
+  这一支不在射程里（④ 第一条）；因此 B 成立只说明「本端口这条腿没跑」，不说明「没有人叫醒过客户端」。
+  下一手是那一位生产者，不是新读数。
+- **C｜`pw=`/`ps=` 在最后一次 `swap=` 之后一枚归零且不再抬起** ⇒ `e00002d5` 是真的状态答案，客户端在等一枚
+  我们没置回去的标志；这时 r327/r328 那对债主行改读为同一件事的另一侧。
+- **D｜同一 `swap=` 的 `gap=` 从几十毫秒跳到 ~5000 以上，并且卡上出现 `swap_wait_gated` 那句** ⇒ 慢在客户端
+  那一侧，死因是出厂那枚 5 秒断言；本板的题从「画不出桌面」换成「让 CommandWake 在 5 秒内发生」，
+  判据要跟着换（第十二层：那时才允许考虑 `sheng-vsync` 这类开关，且先重读 §Round329 ②.2 那一格）。
+- **E｜`s72=`>0 而 `sent=`=0** ⇒ 注册发生过、节拍没起来：这是 `startVsync` 那三条件里的一枚在位而另一枚不在，
+  下一手是「哪枚 boot-arg 不在位」那句话，不是新列（r329 已判 `sheng-vsync` 既非因也非药）。
+- 反例约束：(1) `gap=`/`pair=` 是**本记录**的历史，跨靴不许接（第九层：缺席计数累加只对自己那一靴有效）；
+  (2) 一枚行只说一次调用，`swap=` 相同不等于「客户端在重试同一件事」，要看 `pair=`；
+  (3) `ret=` 与 `pw=`/`ps=` 是两组字，不许用一枚解释另一枚。
+
+**⑧ 本轮欠的格。** ① `classSize` 是元类声明的尺寸，不是分配那一刻的量出来的尺寸——如果哪天 `np` 里冒出
+`off`，先要补的是「这颗对象实际多大」那枚仪器；② `sent=` 的射程（家族内部调用不可数）没有仪器，只有注释；
+③ boot 116 那条「拍行选错记录」的处置还没做（⑤ 说的两选一），本轮只在事件行上补了 `pid=`。

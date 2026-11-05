@@ -3264,6 +3264,26 @@ def check_board(errors: list) -> str:
                           "own beat, away from every burst, and a row the cap ate reads exactly like a beat "
                           "that never fired -- which are the two answers this round is asking between")
 
+        # Round333. The same containment, one round later: "clover r333: bbswap" is a prefix of
+        # "clover r333: bbswapcut" and teeProbeClass returns the first match, so the table order is the only
+        # thing that keeps the cut branch from being filed as the row it says did not fit. The budget is
+        # sized from boot 115's own count (seven selector-6 calls by the last beat row) with headroom, and it
+        # is a class of its own because these rows fire per wait call, from the probe, beside whichever pass
+        # the client happens to arrive in.
+        for entry in ('{ "clover r333: bbswapcut", "r333-bbswapcut", 8, 0, 0, 0 },',
+                      '{ "clover r333: bbswap", "r333-bbswap", 64, 0, 0, 0 },'):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: a per-call row with no budget "
+                              "of its own competes with the burst it lands in, and this row's job is to be the "
+                              "one that survives the boot that stalls in this wait")
+        if sdhci_source.find('{ "clover r333: bbswapcut"') > sdhci_source.find('{ "clover r333: bbswap"'):
+            errors.append("the r333 tee table lists the shorter token first: the cut row would be counted, "
+                          "and reported, as a swap row")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r333-bbswap")' not in sdhci_source:
+            errors.append("the r333 swap-wait rows are not exempt from the per-pass cap: keeping the beat row "
+                          "and eating the event row leaves the reader with the same boot's state and none of "
+                          "its moments, which is the half-pair r249 refuses")
+
         # Round331. Boots 112 and 113 leave the same hole read from two sides: r328 says the hop's receive
         # queue is empty while its `s=` says send rights exist, and r327 says that hop's send column is null
         # because the thread is parked in a receive rather than waiting to post. Somebody holds that right
@@ -6990,8 +7010,8 @@ def check_board(errors: list) -> str:
     # kernel and added ephemeral-storage; boot 108 read it back and the stall only moved (migration ->
     # chronod), and sheng boots to the desktop without it, so round322 reverts the ADT again: same
     # kernel, ephemeral-storage ABSENT so first-boot migration runs -- the menu names round322.
-    if not board["payload"]["title"].startswith("clover r332:"):
-        errors.append('[payload] title is not "clover r332: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r333:"):
+        errors.append('[payload] title is not "clover r333: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -8176,8 +8196,8 @@ def check_board(errors: list) -> str:
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r332:"):
-        errors.append('[payload] title is not "clover r332: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r333:"):
+        errors.append('[payload] title is not "clover r333: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
