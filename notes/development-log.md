@@ -27624,6 +27624,57 @@ Homebrew 的解释器本体 `/opt/homebrew/Cellar/python@3.13/3.13.17/…/bin/py
 偏移 396..459（0-based）**，把那一段清零后两枚**逐字节同**。⇒ 排掉清单从两格（`LC_UUID`、`_PrelinkKCID`）
 变三格，第三格是 ADT 的 `/chosen random-seed`。本轮不主张 ADT 变了或没变，只主张除随机种以外没变。
 
+## Round334 读数（boot 118：控制轮没落回 TWRP，落进了 EDL/QUSB_BULK；读回通路对这一型是瞎的）
+
+> 这一节是 §Round334 预登记（M-A…M-G，控制轮）的读数落盘。结论先行：**控制轮没能给出任何卡上读数**，
+> 因为这一靴的落回不是 boot 115/116/117 那种 TWRP，而是 EDL/QUSB_BULK；`run-clover-unattended.sh` 的
+> dd 读回只在 adb-recovery 或 fastboot 出现时触发，EDL 那型它一次都没撞上。所以 r335 依赖的那几枚基线
+> （38 枚 `bbswap`、`np` 全 null、`swap=`/`pw`/`ps`、r328 的 `hn/rnamed/v/q/e`）**这一板一枚都没复核成**，
+> 按预登记那句「不许拿旧靴的数当新靴的分母」，r335 的代码仍锁在门外。
+
+**① 刷写与重启这一段是干净的。** 冷刷前当场核过：`fastboot getvar product`＝`clover`、`variant`＝`SDM
+EMMC`、序列号 `81ffcaaa`，盘上 `round334-v0.7.48-payload.img` 的 sha256＝`7a04b738144a3fcf…` 与 r334 登记的
+逐字同。`fastboot flash cache` `Sending OKAY 1.328s / Writing OKAY 0.413s`（cache 分区单写），`fastboot
+reboot` 被接受、板子离开 fastboot。这一棒里唯一在场的另一枚设备（另一会话的 `11b5d7c3`）在刷写前已不在 fastboot，
+`fastboot_serial()` 取到的只有 `81ffcaaa`。
+
+**② 落回那一型：`after-deadline` 段两把工具全盲 2221 s，`close:neither`，但收段的 USB 全树里板子在。** 段头与
+poll 行见 `~/clover-out/round334-boot118-window.bin.timeline.txt`：`wait-fastboot` 段 0 s 即 `close:fastboot`
+（＝刷写），`after-deadline` 段从 `elapsed=0` 到 `2177` 每 60 s 一枚 `adb=- fastboot=-`，最后 `2221 … close:neither`。
+关键在于**两端各拍的那张 `ioreg -p IOUSB -w0` 全树**：开段（重启后 0 s，板子还在起）没有板子节点；**收段（2221 s）
+在 `AppleT8132USBXHCI@01000000 → USB Hub@01100000 → USB Hub@01140000` 下出现
+`QUSB_BULK_SN:F6548A52@01143000`**。那个 `@01143000` 端口，正是 boot 114/115/116/117 里 clover 报成
+`MI PAD 4@01143000` 的同一枚物理口。⇒ 这一靴板子**回了宿主的 USB 总线，但以 EDL/QDLoad 下载模式那型**，
+而 adb 与 fastboot 恰好都看不见这一型——这正是 §Round330 那句「板子最可能待的那一型，正是那两把工具看不见的那一型」
+在卡外第一次被时间线当场抓到（此前它只是预登记的假想）。
+
+**③ 归因的地平线（不许 over-claim）。** 时间线用的是 `ioreg -w0`，只给设备名与端口，**不给 VID/PID**；我把这枚
+QUSB_BULK 判成 clover，靠的是 `@01143000` 端口逐靴稳定重合，**不是**靠序列号绑定（EDL 那型报的是芯片组的
+`F6548A52`，不是 Android 的 `81ffcaaa`）。因此这一行证得出「clover 那枚口上出现了一型两工具看不见的下载模式设备」，
+证不出「一定是本板内核自己崩进去的」——一次外部断电/按住 Vol- 也会把板子送进同一枚口的 EDL。落回模式变了是真的
+（115/116/117→TWRP，118→EDL），**为什么变**这一腿没有读数。
+
+**④ 读回通路对 EDL 是瞎的＝本轮抓到的一格仪器缺口。** `watch_after_deadline()` 与它的四个等待窗口只把
+`adb_serial`（含 recovery 态）与 `fastboot_serial` 当「有壳可 dd」，`QUSB_BULK` 谁都不认，于是：卡上那一靴的
+panic/beat/探针全留在 `logdump` 里读不出来，时间线却已经替我们记下它枚举过。**下一手（纯宿主，不需要板子）是把
+这一型命名出来**：`run-clover-unattended.sh` 的收段与判词，当两把工具都沉默但树里出现板子端口的下载模式节点时，
+说「板子在 EDL，没有 adb/fastboot 通道可 dd」而不是笼统的「reset 没到这台的宿主」；`read-clover-log.py` 读者侧那格
+（README 缺口表「时间线只有写的一侧」）是同一条腿的另一半。这两格都不该在拿不到读数时偷偷并进探针轮。
+
+**⑤ 判据落点（对着 M-A…M-G）。** M-A「仪器还在」——**证不了**：present 列表在 r334 产物里由 §Round334 ⑭ 量过
+（`r333-bbswap`/`r329-dispstate`/`r331-bbsend`/出厂两句全在），但那是**镜像里**的在场；boot 118 卡上**零行**，因为
+根本没读回，所以「本靴有没有读数」这一支落空（第十三层：镜像里有≠本靴有读数，这次是连镜像的下游都没到）。
+M-B/M-C/M-D/M-E/M-F 全部依赖卡上枚数与比值——**这一板一个数都没拿到**。M-G（标题 `clover r334`、探针行仍 `r333`）
+同理未验。**判读结论**：boot 118 是一次**落回模式变化的控制轮、无卡上读数**，它顶掉的不是某个探针假设，而是「合并
+不影响落回通路」这个控制轮自己的前提——合并工具链之后，板子不再像 115/116/117 那样落进 TWRP 供 dd。这一格按
+预登记那句改写成仪器缺口（④），r335 的代码继续在门外。
+
+**⑥ 板子现状与下一步。** 判读时（多次复查）板子仍稳定挂在 `QUSB_BULK@01143000`——它没掉电、没拔线，是停在
+EDL。从 EDL 回到 fastboot/recovery 要一次物理电源/按键动作，无人值守取不到。因此 boot 118 这一板到此为止；
+要往下走要么等这块板被物理带回可通信态后**重刷同一枚 r334 对照一次**（控制轮的复现判据本来就是「重刷同一枚镜像看
+落回是否一致」），要么先做 ④ 那两格宿主仪器。本轮不发新镜像（r334 的产物字节不变，只是多了一份落回失败的读数），
+标题与 boot-args 一字未动。
+
 ## Round335 预登记（原编号 Round334；boot 119；因插入合并控制轮而顺延）
 
 > 本节下方所有「boot 118」「round334」的编号都写于控制轮插入之前。它的 B 支判据是对着 **boot 117** 的形状
