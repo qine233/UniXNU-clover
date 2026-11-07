@@ -1226,7 +1226,7 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r329: dispstatecut", "r329-dispstatecut", 8, 0, 0, 0 },
   { "clover r329: dispstate", "r329-dispstate", 96, 0, 0, 0 },
 
-  // Round333 reads the swap-wait state once per selector-6 call, from the probe's own wrapper. Same
+  // Round335 re-keys the swap-wait row on the call's own argument (arg=/done=/cur=/list=, see the probe). Same
   // containment as r329 and the same defence: the cut row's token starts with the state row's token, so the
   // longer key has to be listed first or every `bbswapcut` is counted as a `bbswap`. The budget is boot 115's
   // count times headroom, not an expectation -- that boot had seven selector-6 calls by the last beat row and
@@ -1234,8 +1234,8 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // runaway client crowd out the census rows sharing the pass. If the cap does fill, the tee's own "capped at"
   // line says so; the alternative, routing these rows through the probe's 96-line budget, would let the swap
   // rows spend the budget the beat row exists to keep.
-  { "clover r333: bbswapcut", "r333-bbswapcut", 8, 0, 0, 0 },
-  { "clover r333: bbswap", "r333-bbswap", 64, 0, 0, 0 },
+  { "clover r335: bbswapcut", "r335-bbswapcut", 8, 0, 0, 0 },
+  { "clover r335: bbswap", "r335-bbswap", 64, 0, 0, 0 },
   
   // Round313 is the first boot that runs drivers/CloverPower at all -- the instrument shipped in
   // round182 and has never been on a board -- so its lines have no class and no budget of their own
@@ -4918,13 +4918,13 @@ static void teeConsumeLine (uint32_t &pushed)
        // indistinguishable from a beat that never fired, and the two answer different questions. The class
        // budgets of 32 and 8 still bound it.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r329-dispstate") ||
-       // Round333's swap-wait rows ride the client's own calls, not a burst: a boot that stalls in this wait
+       // Round335's swap-wait rows ride the client's own calls, not a burst: a boot that stalls in this wait
        // prints its last row at the moment it stalls, and that row is the one the whole round is built to
        // read. Dropping it to a pass that had already spent its sixteen pushes would leave the reader with
        // the beat row alone -- which is r249's shape again, half of a pair surviving the cap and looking like
        // a reading. The token also covers the cut branch, which shares the cause. The class budgets of 64 and
        // 8 still bound both.
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r333-bbswap") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r335-bbswap") ||
        // Round313's power report is one burst printed while the PMGR tail attaches, and it is the first
        // time this driver has ever run on a board. Exempting both of its classes is the r283 reason in
        // its plainest form: half a report and no report are different readings of the same bus, and a

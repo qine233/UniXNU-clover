@@ -1371,6 +1371,43 @@ def selftest():
     return 0
 
 
+# Round335's tee-line shape counter. CloverSdhci's tee copies a kernel msgbuf line and
+# CloverSdhci's own teeStampSkip() drops a leading "[ <mono>]:" stamp before it hashes the
+# producer -- so a line the kernel wrote is supposed to arrive on the card with that stamp at
+# its start. Boot 117 proved two of this round's rows did not: an audit text printed without a
+# trailing newline glued the next row onto its tail, and the reader who greps by line lost the
+# glued one entirely. This is the reader-side half of §Round333 ⑥: it cannot tell WHY a line is
+# un-stamped, only that the ring has lost the boundary, and it names at most three heads so the
+# shape is checkable against the card rather than asserted from this file.
+TEE_STAMP = re.compile(r"^\[\s*\d+\.\d+\]:")
+
+
+def tee_glue_summary(records):
+    """Print `tee lines: N stamped=S glued=G` and up to three un-stamped heads, first 80 bytes.
+
+    The count is over records the tee actually said (kind 22), which main has already filtered.
+    A blank body counts as neither: it is a slot the tee left empty, not a row whose boundary
+    was eaten.
+    """
+    stamped = glued = 0
+    heads = []
+    for _slot, _header, content, _problems in records:
+        if content is None:
+            continue
+        body = text_of(content).lstrip("\x00").strip()
+        if not body:
+            continue
+        if TEE_STAMP.match(body):
+            stamped += 1
+        else:
+            glued += 1
+            if len(heads) < 3:
+                heads.append(body[:80])
+    print(f"tee lines: {stamped + glued} stamped={stamped} glued={glued}")
+    for head in heads:
+        print(f"  un-stamped head: {head!r}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1477,6 +1514,8 @@ def main():
         print(f"{path}: no records ({named} slot 0 has no LOG1 magic)", file=sys.stderr)
         return 1
     report(records, newest_only=args.newest, order_by_seq=kind is not None)
+    if args.tee:
+        tee_glue_summary(records)
     return 0
 
 

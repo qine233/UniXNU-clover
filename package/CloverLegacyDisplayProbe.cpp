@@ -419,12 +419,20 @@ static ClientStat *statFor(IOUserClient *client) {
  * first sketched to print):
  *   ms=      probeNowUs()/1000. `t=` is not used, for r329's reason: this file's `t=` is seconds since the
  *            first frame and the kernel rows' `t=` is seconds since boot.
- *   swap=    the dword at client+0xf8, or `off` when 0xfc exceeds ClientStat::classSize -- the address is not
- *            provably inside this object, which is a different statement from the zero the object could hold.
  *   opt=     scalarInput[1] in the raw, %llx: bit31 and the low bits are the two halves the family reads
  *            differently, so the word is printed rather than decoded (boot 113's `80000001` and boot 115's
  *            `80000000` are both this one word).
  *   ret=     what the original externalMethod returned for this call.
+ *   arg=     scalarInput[0], the swapID the CALLER handed in, printed as the 32-bit word the family stores.
+ *            Round333 read `swap=` from client+0xf8 instead; boot 118's helper pass (round334-forensics)
+ *            showed that dword is written at the entry and cleared before the return, so `swap=0` was only
+ *            ever "the last call cleaned it", not the argument -- this column names the input directly.
+ *   done=    the dword at display+0x16bc (5820): the swapID the family has finished presenting. `absent`
+ *            when the display object was never recorded, `off` when its class size does not reach 5820.
+ *   cur=     the dword at display+0x1560 (5472): the swapID currently latched inside the family.
+ *   list=    the dword at display+0x1568 (5480): the pending-chain head the family would retire next.
+ *            done=/cur=/list= are read before the call, same as pw/ps; B2's criterion is arg==done on a
+ *            busy return, so all three must be this boot's own reads, not carried over from a prior row.
  *   pw= ps=  the two queried words, read before the call ran; `absent` says the display object was never
  *            recorded, `off` says its class size does not reach that offset -- three states, three words.
  *   np0..np5 the qword at client+0x110+k*0xb0: the value, `null` for a zero word (the family's own test is
@@ -435,10 +443,10 @@ static ClientStat *statFor(IOUserClient *client) {
  *            same quantity as the beat row's third `vs=` field, read here at event time instead of at the beat.
  *   s72=     this client's selector-72 entries -- the registration that arms the tick, which no row has ever
  *            printed. Zero with a non-null `np` is the reading branch B was built for.
- *   gap=     ms since the previous call carrying this same swapID; `none` for a swapID this record has not
- *            seen before, `off` when swap= is off, `full` when the eight tracking slots are used up.
- *   pair=    `first` for that swapID's first call, `again` for any later one, with the same `off`/`full` for
- *            the two cases where the pairing has no subject.
+ *   gap=     ms since the previous call carrying this same arg (the input swapID, no longer the transient
+ *            latch); `none` for an arg this record has not seen before, `full` when the eight slots are used up.
+ *   pair=    `first` for that arg's first call, `again` for any later one, `full` when the tracking is out of
+ *            slots; the `off` case left with swap=, because arg is an in-parameter and is always known.
  *   pid=     whose client this is. Not in the sketch: with up to eight clients interposed, a row that names
  *            none of them makes two clients' swap sequences read as one.
  *
@@ -446,21 +454,25 @@ static ClientStat *statFor(IOUserClient *client) {
  * fires once per wait call, so routing it there would let the swap rows spend the budget that the beat row
  * exists to keep. Its own bound is the tee class, and the tee says out loud when that cap fills.
  */
-enum {kWakeSlotBase=0x110,kWakeSlotStride=0xb0,kWakeSlots=6,kSwapLatch=0xf8,kSwapWaitRowBytes=320,kSwapTracked=8};
+enum {kWakeSlotBase=0x110,kWakeSlotStride=0xb0,kWakeSlots=6,kSwapWaitRowBytes=320,kSwapTracked=8};
+enum {kDoneOffset=5820,kCurOffset=5472,kListOffset=5480};
 static const unsigned kQueryOffsets[2]={5840,5856};
 struct SwapWaitPre {
-    uint64_t ms,option;bool latchKnown;uint32_t latch;
-    char latchTxt[16],queryTxt[2][16],slotTxt[kWakeSlots][24];
+    uint64_t ms,option;uint32_t arg;
+    char argTxt[16],dispTxt[3][16],queryTxt[2][16],slotTxt[kWakeSlots][24];
 };
+static const unsigned kDisplayOffsets[3]={kDoneOffset,kCurOffset,kListOffset};
 static void readSwapWaitState(ClientStat &stat,const uint64_t *in,SwapWaitPre &pre) {
     memset(&pre,0,sizeof pre);
-    pre.ms=probeNowUs()/1000;pre.option=in[1];
+    pre.ms=probeNowUs()/1000;pre.option=in[1];pre.arg=(uint32_t)in[0];
+    snprintf(pre.argTxt,sizeof pre.argTxt,"%u",pre.arg);
     const unsigned char *client=reinterpret_cast<const unsigned char *>(stat.object);
-    if(kSwapLatch+4<=stat.classSize) {
-        uint32_t value=0;memcpy(&value,client+kSwapLatch,4);
-        pre.latchKnown=true;pre.latch=value;snprintf(pre.latchTxt,sizeof pre.latchTxt,"%u",value);
-    } else snprintf(pre.latchTxt,sizeof pre.latchTxt,"off");
     const unsigned char *display=reinterpret_cast<const unsigned char *>(native_legacy_object);
+    for(unsigned d=0;d<3;++d) {
+        if(!display)snprintf(pre.dispTxt[d],sizeof pre.dispTxt[d],"absent");
+        else if(native_legacy_object_size<kDisplayOffsets[d]+4)snprintf(pre.dispTxt[d],sizeof pre.dispTxt[d],"off");
+        else {uint32_t value=0;memcpy(&value,display+kDisplayOffsets[d],4);snprintf(pre.dispTxt[d],sizeof pre.dispTxt[d],"%x",value);}
+    }
     for(unsigned q=0;q<2;++q) {
         if(!display)snprintf(pre.queryTxt[q],sizeof pre.queryTxt[q],"absent");
         else if(native_legacy_object_size<kQueryOffsets[q]+4)snprintf(pre.queryTxt[q],sizeof pre.queryTxt[q],"off");
@@ -475,33 +487,33 @@ static void readSwapWaitState(ClientStat &stat,const uint64_t *in,SwapWaitPre &p
     }
 }
 static void reportSwapWait(ClientStat &stat,const SwapWaitPre &pre,IOReturn status) {
-    const char *gapTxt="off",*pairTxt="off";
+    const char *gapTxt="none",*pairTxt="first";
     char gapValue[24];
-    if(pre.latchKnown) {
+    {
         unsigned at=0;
-        while(at<stat.swapKinds && stat.swaps[at].id!=pre.latch)++at;
+        while(at<stat.swapKinds && stat.swaps[at].id!=pre.arg)++at;
         if(at<stat.swapKinds) {
             uint64_t delta=pre.ms>=stat.swaps[at].lastMs?pre.ms-stat.swaps[at].lastMs:0;
             snprintf(gapValue,sizeof gapValue,"%llu",(unsigned long long)delta);gapTxt=gapValue;
             pairTxt="again";
             stat.swaps[at].calls=stat.swaps[at].calls+1;stat.swaps[at].lastMs=pre.ms;
         } else if(at<kSwapTracked) {
-            gapTxt="none";pairTxt="first";
-            stat.swaps[at].id=pre.latch;stat.swaps[at].calls=1;stat.swaps[at].lastMs=pre.ms;stat.swapKinds=at+1;
+            stat.swaps[at].id=pre.arg;stat.swaps[at].calls=1;stat.swaps[at].lastMs=pre.ms;stat.swapKinds=at+1;
         } else gapTxt="full",pairTxt="full";
     }
     char row[kSwapWaitRowBytes];
     int length=snprintf(row,sizeof row,
-        "clover r333: bbswap ms=%llu swap=%s opt=%llx ret=%08x pw=%s ps=%s "
+        "clover r335: bbswap ms=%llu opt=%llx ret=%08x arg=%s done=%s cur=%s list=%s pw=%s ps=%s "
         "np0=%s np1=%s np2=%s np3=%s np4=%s np5=%s sent=%llu s72=%u gap=%s pair=%s pid=%d\n",
-        (unsigned long long)pre.ms,pre.latchTxt,(unsigned long long)pre.option,(unsigned)status,
+        (unsigned long long)pre.ms,(unsigned long long)pre.option,(unsigned)status,
+        pre.argTxt,pre.dispTxt[0],pre.dispTxt[1],pre.dispTxt[2],
         pre.queryTxt[0],pre.queryTxt[1],
         pre.slotTxt[0],pre.slotTxt[1],pre.slotTxt[2],pre.slotTxt[3],pre.slotTxt[4],pre.slotTxt[5],
         (unsigned long long)vsyncEvents[1],(unsigned)stat.selector_calls[72],gapTxt,pairTxt,stat.pid);
     if(length<0 || static_cast<unsigned>(length)>=sizeof row) {
         char cut[96];
-        snprintf(cut,sizeof cut,"clover r333: bbswapcut bytes=%d cap=%u pid=%d swap=%s\n",
-            length,(unsigned)sizeof row,stat.pid,pre.latchTxt);
+        snprintf(cut,sizeof cut,"clover r335: bbswapcut bytes=%d cap=%u pid=%d arg=%s\n",
+            length,(unsigned)sizeof row,stat.pid,pre.argTxt);
         IOLog("%s",cut);
         return;
     }

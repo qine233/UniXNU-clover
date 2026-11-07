@@ -12,7 +12,7 @@
 // clover_emmc_run() on purpose -- the heap it reads only means something once the rings that carry its
 // report exist -- and that ordering is the thing docs/drivers/device-tree-matching.md:151-159 cannot
 // express, which is why this is a chained entry point (notes/unixnu-doc-conformance.md §5). Worked-example
-// rules 1 and 3 of docs/drivers/native-novatek-touch.md:130-137 are met: the decode arithmetic is pure in
+// rules 1 and 3 of docs/drivers/sheng-novatek-touch.md:130-137 are met: the decode arithmetic is pure in
 // DspCore.h and host-tested by scripts/test-clover-dsp.py before any hardware touches it.
 //
 // WHY THIS FILE EXISTS

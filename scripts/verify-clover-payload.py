@@ -1288,10 +1288,10 @@ def check_sb_sample(kernel: bytes) -> bool:
              # pinned as the concatenated row, the same way r329's is (round17's rule: pin the outlet the row
              # has to pass through, not a source line). The cut branch is pinned beside it because it is the
              # only thing that says the 320-byte record did not quietly eat the row's tail.
-             "r333-bbswap": (b"clover r333: bbswap ms=%llu swap=%s opt=%llx ret=%08x pw=%s ps=%s "
-                             b"np0=%s np1=%s np2=%s np3=%s np4=%s np5=%s sent=%llu s72=%u gap=%s pair=%s "
-                             b"pid=%d\n") in kernel,
-             "r333-bbswapcut": (b"clover r333: bbswapcut bytes=%d cap=%u pid=%d swap=%s\n") in kernel,
+             "r335-bbswap": (b"clover r335: bbswap ms=%llu opt=%llx ret=%08x arg=%s done=%s cur=%s list=%s "
+                             b"pw=%s ps=%s np0=%s np1=%s np2=%s np3=%s np4=%s np5=%s sent=%llu s72=%u "
+                             b"gap=%s pair=%s pid=%d\n") in kernel,
+             "r335-bbswapcut": (b"clover r335: bbswapcut bytes=%d cap=%u pid=%d arg=%s\n") in kernel,
              # The two sentences the stock family owns and this round is measuring against. They are pinned as
              # CStrings, not as behaviour: what round333 establishes is that our image carries them at the
              # same counts the stock image does, so a boot that dies inside the 5 s assertion says so out loud

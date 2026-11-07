@@ -342,32 +342,32 @@
  		}
  	}
  	/*
-+	 * Round331. The door r328 just named, asked outward. Pick the first hop whose receive name is
-+	 * real AND whose queue is empty -- that combination is the debt itself, a named port with no
-+	 * mail inside -- and fall back to no hop rather than asking a port that already has mail. cand
-+	 * and debt are counted over every hop so a row with a single pick does not read as a census of
-+	 * four, and the scan runs once per fire (leg A walks up to CLOVER_BB_SEMA_PROBE processes for
-+	 * it), which is the same budget r268's semaphore holder walk already spends on this cadence.
++	 * Round331. The door r328 just named, asked outward. r335 / #694 asks EVERY hop
++	 * r328 named, not just the first debt: boot 116 and boot 118 each printed one
++	 * bbsend row whose nm= equalled the picked hop while the only hop that translated
++	 * (e=0) was the fourth, so a scan of one picked hop is not a census of the hops
++	 * this same fire named. cand=/debt= still count over every hop, and leg A's walk
++	 * up to CLOVER_BB_SEMA_PROBE processes is the same budget r268's walk spends.
 +	 */
 +	{
 +		uint32_t cand = 0;
 +		uint32_t debt = 0;
-+		int pick = -1;
 +
 +		for (i = 0; i < hn; i++) {
 +			if (hrn[i] != 0) {
 +				cand++;
 +				if (rcvq[i] == 0) {
 +					debt++;
-+					if (pick < 0) {
-+						pick = (int) i;
-+					}
 +				}
 +			}
 +		}
-+		clover_bb_send_holders_row(task, pid, pick,
-+		    (pick >= 0) ? (mach_port_name_t) hrn[pick] : MACH_PORT_NULL, secs,
-+		    cand, debt);
++
++		for (i = 0; i < hn; i++) {
++			/* the row names its own hop; a null nm prints as no_cand */
++			clover_bb_send_holders_row(task, pid, (int) i,
++			    (hrn[i] != 0) ? (mach_port_name_t) hrn[i] : MACH_PORT_NULL,
++			    secs, cand, debt);
++		}
 +	}
 +	/*
  	 * Round262. One header plus at most CLOVER_BB_CENSUS rows, once every two

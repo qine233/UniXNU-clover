@@ -27724,7 +27724,7 @@ e=17.17.17.0 q=s=0.0.0.0` 与预登记的 A 支形状一致（第四槽 `e=0`＝
   不是「没名字」）；先查 tee 预算与行数再读内容。**若 hop 1..3 照旧不出现**，只能说明这段循环没进这枚镜像或
   被预算丢掉——不许读成「那几枚没债」。
 
-**③ 判据 B —— bbswap 行换列（探针侧）。** 行名升 `clover r334: bbswap`，`swap=` 撤掉，换成 `arg=`（入参
+**③ 判据 B —— bbswap 行换列（探针侧）。** 行名升 `clover r335: bbswap`，`swap=` 撤掉，换成 `arg=`（入参
 `in[0]`，按 32 位印，因为家族自己 `str w8` 存的是 32 位），并加 `done=`（`display+0x16bc`＝5820）、
 `cur=`（`display+0x1560`）、`list=`（`display+0x1568`），三枚都在调用之前读；`gray` 只出现在
 `absent`/`off`/`null` 三种成因字面量里。`pair=`/`gap=` 改按 `arg=` 记账。
@@ -27750,3 +27750,41 @@ boot 117 至少两枚拼行 ⇒ 本轮若再现，`glued>0`；若为 0，那是�
 
 **⑥ 判据不来自被测物。** A 支的「四枚」以 `cand=` 为分母；B 支的 `arg==done` 判据来自宿主解出的比较指令，
 不是来自卡上那一行自己；两个 checker 的格式钉与负针脚同轮落地。
+
+**⑦ 构建与双闸门（r335 实跑，盘上证据在 `~/clover-out/round335-build/`）。** 改了内核（`task.c` 的逐 hop）与
+探针（`CloverLegacyDisplayProbe.cpp` 的换列），所以是重编内核的一轮。链路：
+`build kernel` → prelink `out/clover/kernel/kernel.macho` `ff3fab14103067dc…` →
+`patch-clover-amfi.py`（两刀编码对上：`0x34000229→0x14000011`、`0x36000520→0xd503201f`）→
+`round335-kernel-amfi.macho` `f5f61239bef0ef57…` → `normalize-kernel-macho.py` **不带 `--output`**，
+973 枚 object 戳清零、就地改写那一枚文件（sha 变 `02cc441676f014a3…`，52 404 224 B；r333/r334 各有一枚
+独立 `-normalized.macho`，是因为那两趟给了 `--output`——同一枚脚本两种落法，盘上文件名不同，哈希口径相同）→
+`build payload --kernel 绝对路径 --data-ramdisk … --trust-cache …` EXIT=0 →
+`round335-v0.7.51-payload.img` `19e7bb104b96d40f…`（58 720 256 B）；`payload.json` 自报
+`kernel_sha256 02cc4416…`（＝归一化后那枚）、`payload_kernel_sha256 149555ec…`、
+`adt_sha256 12b2275d…`、卷内 `unixnu.toml` 2884 B。
+闸门：仓库侧 `check-clover.py` **EXIT=0**（`drivers documented: 11, base-repo drivers exempt: 0;
+citation shapes banned in 34 authored sources`）；树侧 `cd out/clover/tree && python3.13 scripts/check-clover.py`
+**EXIT=0**（`12 archives, 22 objects ABI-checked, kernel read`，引文那一半照 r332d 印作用域句）；
+`verify-clover-payload.py` 对**归档那枚**跑 **51 行 OK、0 FAIL、EXIT=0**，其中 `r335-bbswap present`、
+`r335-bbswapcut present` 是本轮新钉的两枚行 CString，`r331-bbsend present` 仍过（头行 CString 未变，变的是
+调用点：`task.c:14258` 那圈 `for (i = 0; i < hn; i++)` 把 `pick` 那一枚换成逐 hop）。
+
+**⑧ 这一轮的构建阻断记一条新的判据（第十二层：控制轮的判据不许产自被它控制的东西）。** 工作树按 §Round334
+那三步退役（`git checkout -- .` 只回退**已跟踪**文件，补丁**创建**的未跟踪文件留在原地，于是 create-hunk 撞
+`already exists in working directory`；要按文件名 `rm` 掉，不许连 `prepare-xnu-source.py` 下载的头部一起删）。
+补一条本轮量到的：**单独跑 `scripts/build-xnu-4k-baseline.sh` 不能作为「预打补丁」的那一步收尾**——它在
+`make` 之前确实把全部补丁重放完了（这才是需要的部分），但它自己的链接一定红，报的是驱动导出符号
+`_native_keyevents_stage`／`_native_verified_block_*` 等 `symbol(s) not found for architecture arm64`、
+`BASELINE2_EXIT=2`，因为 archives 01..16 还没建（那一圈是 `unixnu build kernel` 编排器在 baseline **之前**跑的）。
+所以正确的形状是：reset → baseline（接受它链接失败，只为把树打上）→ `unixnu build kernel`（它自己会再跑一次
+baseline，这一次链接成功）。本轮 `KERNEL3_EXIT=0`、prelink 出 `ff3fab14…`，判据就是这两枚 `*_EXIT=` 写在日志
+末尾那一行——后台包装器报的「exit code 0」是链尾那枚 `echo` 的退出码，不是构建的退出码；本轮 `BASELINE2_EXIT=2`
+就被它盖过一次。今后凡看后台构建一律先 `grep '_EXIT='`，再谈产物。
+
+**⑨ #699 落地并当场量过（不等新靴）。** `read-clover-log.py --tee` 对 **boot 118 的真实存档**
+`~/clover-out/round334-boot118-window.bin` 跑：`tee lines: 512 stamped=507 glued=5`，三条 un-stamped 头 80 字节
+举例里第三枚就是我们自己的行（`clover r221: sbm2 …` 被拼在别的文本后面）——这同时给了这一格的正对照：
+kind-22 记录在驱动环里**每一枚本来都该带 msgbuf 戳**，所以 `stamped=` 是应有形状、`glued=` 是缺陷计数，
+两者相加等于总枚数（512）就是「没有第三种我还没认出来的形状」。证据 `~/clover-out/round335-build/reader-699-on-boot118.log`。
+判据 §⑤ 那一支现在可执行：boot 119 若 `glued>0` 是复现，若 `glued=0` 也是读数（本靴的 msgbuf 没被无换行文本拼过），
+两种都不许写成通过或未通过——它判的是形状，不是成败。

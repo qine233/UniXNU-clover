@@ -3264,23 +3264,23 @@ def check_board(errors: list) -> str:
                           "own beat, away from every burst, and a row the cap ate reads exactly like a beat "
                           "that never fired -- which are the two answers this round is asking between")
 
-        # Round333. The same containment, one round later: "clover r333: bbswap" is a prefix of
-        # "clover r333: bbswapcut" and teeProbeClass returns the first match, so the table order is the only
+        # Round335. The same containment, one round later: "clover r335: bbswap" is a prefix of
+        # "clover r335: bbswapcut" and teeProbeClass returns the first match, so the table order is the only
         # thing that keeps the cut branch from being filed as the row it says did not fit. The budget is
         # sized from boot 115's own count (seven selector-6 calls by the last beat row) with headroom, and it
         # is a class of its own because these rows fire per wait call, from the probe, beside whichever pass
         # the client happens to arrive in.
-        for entry in ('{ "clover r333: bbswapcut", "r333-bbswapcut", 8, 0, 0, 0 },',
-                      '{ "clover r333: bbswap", "r333-bbswap", 64, 0, 0, 0 },'):
+        for entry in ('{ "clover r335: bbswapcut", "r335-bbswapcut", 8, 0, 0, 0 },',
+                      '{ "clover r335: bbswap", "r335-bbswap", 64, 0, 0, 0 },'):
             if entry not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: a per-call row with no budget "
                               "of its own competes with the burst it lands in, and this row's job is to be the "
                               "one that survives the boot that stalls in this wait")
-        if sdhci_source.find('{ "clover r333: bbswapcut"') > sdhci_source.find('{ "clover r333: bbswap"'):
-            errors.append("the r333 tee table lists the shorter token first: the cut row would be counted, "
+        if sdhci_source.find('{ "clover r335: bbswapcut"') > sdhci_source.find('{ "clover r335: bbswap"'):
+            errors.append("the r335 tee table lists the shorter token first: the cut row would be counted, "
                           "and reported, as a swap row")
-        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r333-bbswap")' not in sdhci_source:
-            errors.append("the r333 swap-wait rows are not exempt from the per-pass cap: keeping the beat row "
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r335-bbswap")' not in sdhci_source:
+            errors.append("the r335 swap-wait rows are not exempt from the per-pass cap: keeping the beat row "
                           "and eating the event row leaves the reader with the same boot's state and none of "
                           "its moments, which is the half-pair r249 refuses")
 
@@ -3358,9 +3358,13 @@ def check_board(errors: list) -> str:
                 # The literals only the pair of legs can produce, one per way of not having a reading.
                 '"no_cand"', '"no_space"', '"notport"', '"xlate"', '"no_srights"', '"own_only"',
                 '"hash_only"', '"no_holder"',
-                # The pick: a hop whose receive name is real AND whose queue is empty -- the debt itself.
+                # Round335 (#694) asks EVERY hop r328 named, not the one picked hop: boot 116 and boot 118
+                # each printed a single bbsend row whose nm= equalled the picked hop while the only hop that
+                # translated (e=0) was the fourth. cand=/debt= count over every named hop (the first loop),
+                # and the row call now sits in a second loop that prints one row per hop.
                 'if (rcvq[i] == 0) {',
-                'clover_bb_send_holders_row(task, pid, pick,'):
+                'for (i = 0; i < hn; i++) {',
+                'clover_bb_send_holders_row(task, pid, (int) i,'):
                 if not any(now in line for line in r331_added):
                     errors.append(f"the r331 kernel patch does not add {now[:56]!r}: without it the row "
                                   "still cannot say who holds the right r328 counted, which is the whole "
@@ -7010,10 +7014,12 @@ def check_board(errors: list) -> str:
     # kernel and added ephemeral-storage; boot 108 read it back and the stall only moved (migration ->
     # chronod), and sheng boots to the desktop without it, so round322 reverts the ADT again: same
     # kernel, ephemeral-storage ABSENT so first-boot migration runs -- the menu names round322.
-    # Round334 is the merged-upstream-tooling control round: the probes did not move, only the tree that
-    # compiles them, so the menu has to name the tooling while every card row keeps its r333 token.
-    if not board["payload"]["title"].startswith("clover r334:"):
-        errors.append('[payload] title is not "clover r334: ...": the menu would not name this round')
+    # Round335 is the code round after the merged-tooling control round: two probe columns move (bbswap
+    # gains arg/done/cur/list and drops swap; bbsend now prints every hop), so the menu names round335
+    # while rows this round did not touch keep their own generation tokens (bbsend r331, bbrcv r328,
+    # dispstate r329) -- a card row names its probe generation, the title names the image that ran.
+    if not board["payload"]["title"].startswith("clover r335:"):
+        errors.append('[payload] title is not "clover r335: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -8198,8 +8204,8 @@ def check_board(errors: list) -> str:
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r334:"):
-        errors.append('[payload] title is not "clover r334: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r335:"):
+        errors.append('[payload] title is not "clover r335: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
