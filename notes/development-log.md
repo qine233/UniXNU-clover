@@ -27936,3 +27936,58 @@ beatmagic=801a086e432839b2`，历史那批的 `magic=` 低 32 位反复出现 `0
 **⑤ 刷写闸门（本轮自加的一条硬规矩）。** boot 119 的卡还没读，而冷刷 `cache` 分区正是**覆盖那块卡**的那只手——
 所以在 `--skip-recovery` 读到 boot 119 之前，**任何新镜像都不许刷**（构建与归档照旧可以，r311/r313 那种「不刷写」轮
 是本型的正规形状）。这条写进 README 的缺口表，免得下一轮把它当流程洁癖。
+
+## Round337（v0.7.54，纯宿主仪器轮，不发镜像、不刷写：每一拍都问「板子现在算在哪一型里」）
+
+证据目录 `~/clover-out/round337-gate-evidence/`（七份：两枚闸门原字、十二枚负测、两枚旧产物的新读法、写侧空跑、实时总线类别、r335 归档校验）。
+
+**① 本轮把手：`timeline_poll()` 每一拍问三把工具，不再是两把。** 写侧 `scripts/run-clover-unattended.sh`：
+poll 行从五枚字段升成六枚（`epoch elapsed adb fastboot event class`），并且**类别是在 `timeline_poll()` 里面取的，
+不在四个调用点上传参**——调用点会漏，必经函数漏不掉（这条决定记在闸门注释里，负测 N7 就是「poll 不再取类别」那一支）。
+更关键的是 `state` 现在把类别算进去了：`adb`/`fastboot` 整段都是 `-` 的时候，模式从 `no-node` 换到 `edl` 本身就会写下一行，
+所以「什么时候开始看得见」不需要等 60 s 的节拍兜底。
+`usb_landing_class` 同时多了第四枚答案 `ioreg-fail`：**`ioreg` 空手而归是本机没答上，不是「总线上没有那颗节点」**——
+这是第十三层那枚「没问 ≠ 问到 0」在宿主侧的形状，而它必须与 `no-node` 分开，否则一次工具故障会伪装成一靴的沉默。
+分类器现在被**搬动并执行**：闸门把那枚函数体抠出来、桩掉 `ioreg`，喂四串（空 / `QUSB_BULK_SN:` / `Diag@` / `Mi Pad 4`），
+要求依次得到 `ioreg-fail|edl|diag|no-node`。
+
+**② 读的一侧要能分清「这文件没问」与「问到了空 bus」。** `scripts/read-clover-log.py`：`TIMELINE_ROW` 第六枚字段是**可选的**，
+旧产物照读；每把窗口报 `class-polls=<elapsed>s:<类> …`（只在变化处列，因为写侧本来就只在变化处写行），
+`class-at-open=` 那一枚由**本 run 自己的开段树当场派生**并明说是派生的；收段类别与最近一枚 poll 类别不一致时不再合成一句，
+而是印「它在两次之间变了」。最要紧的一枚字面量是 `TIMELINE_CLASS_ABSENT = "not-asked-by-this-writer"`：
+五枚字段的行**不许**被读成 `no-node`。收段行还补一句 `poll class asked in N/M`，让读者第一眼知道这份产物是哪一代写手留下的。
+
+**③ 旧产物立刻多出来的那一格（不花一次上机）**：`pre-r337-timelines-read-with-the-new-leg.log`——boot 118 与 boot 119 的
+`after-deadline` 段现在都报 `class-at-open=no-node`（派生自它们自己的开段树）而收段是 `edl`。
+**左边界此前是「没有仪器」，现在有了**：板子在 `fastboot reboot` 之后那一拍还不以任何 Qualcomm 模式枚举，2221 s 后在 EDL。
+但两枚 poll 行都是五枚字段（`poll class asked in 0/3`），所以起点仍只夹得住「在这 2221 s 之内」——
+**卡上最后一行是 649.7 s（118）/730 s（117 那一型）**，也就是说最少 1.5 s、最多 2221 s 这段路上没有任何观察。
+r337 之后同类的一靴把这段夹到 poll 节奏（2 s）。
+这格是第十五层「判决路上有一步等硬件」在宿主侧的对偶：**一次会变的量只在收段取一次，得到的不是这个量的读数，是这个量的终值。**
+
+**④ 本轮自己造出来又自己撤掉的读数（写下来，因为它是流程性的错，不是发现）**：第一次采「实时总线类别」时得到 `no-node`，
+而那份产物在 `~/clover-out/round337-gate-evidence/` 里留了 24 秒。原因是我当时正把 `run-clover-unattended.sh` 交给负测脚本改——
+N2/N8 那两支正在把分类器换成 `NOTHING_MATCHES_THIS` / `printf 'no-node'`，而我 `awk` 抠的是**那一刻磁盘上的文件**。
+重取的那份（`live-bus-class-at-r337.txt`）是 `edl`，与 boot 118/119 收段树里的 `QUSB_BULK_SN:F6548A52@01143000` 一致。
+规矩：**跑负测的时候不许把同一批脚本当作仪器用**；要取样就等负测跑完（它逐条还原且 `diff` 自证），或者从 git 的对象里取。
+
+**⑤ 负测第一次判红的正是新加那枚针脚自己**：`ioreg-fail` 那一支最初写成「脚本里得有 `ioreg-fail` 这串字」，
+于是 N8（把 `printf 'ioreg-fail'` 换成 `printf 'no-node'`）**判绿**——因为我在解释这条分支的注释里逐字写了那串字。
+第二十三层「说明禁则的文字不许含被禁的串」的这一版是：**解释一枚字面量的句子会把这枚字面量的存在性针脚喂饱**。
+撤法是上面 ① 末句：把它从「串在场」换成「函数被叫起来、四串桩各回一枚」，N8 随即判红。
+十二支负测（`negatives.log`）逐条判红、逐条还原字节同、还原后闸门重新跑绿；其中 N4 与 N10 是**同一枚子串的两枚站点**，
+所以负测脚本这次改成按第几枚出现来改（`replace_nth()`），因为「只判在不在」的针脚拦得住第一枚漏第二枚，
+而本轮的针脚数的是**枚数**（`closing=$(tail -n 1 "$TIMELINE"` 必须恰有两枚）。
+
+**⑥ 闸门钉住什么**（`scripts/check-clover.py`）：`timeline_poll()` 体内必须有 `usb_landing_class`；
+`[ -z "$tree" ]` 必须在；分类器必须**跑**出四枚形状；两枚静默判决句都必须引用时间线自己的收段行（恰两枚）；
+**不许**有任何 `say`/`die` 句子在打印时重新测树（负针脚，扫 `(?:say|die)[^\n]*$(usb_landing_class)`）；
+读者必须有 `TIMELINE_CLASS_ABSENT` 那枚命名，并且 `class-polls=` / `class-at-open=` / `poll class asked in` 三句都得在。
+两侧闸门 EXIT=0——**这次是先 `unixnu tree` 重装配再跑 tree 侧**（r335b ⑦ 那条规矩第一次被当流程执行，
+四枚脚本两侧 md5 逐字节同：`123eb802…/5bdb709a…/7b9124b1…/cea3fa6b…`）。
+
+**⑦ 下一手没变，也仍不需要新镜像**：boot 119 的卡还没读，且 §Round336 ⑤ 那条硬规矩照在——
+**读回之前不许刷任何新镜像**。r337 不发镜像（内核、负载、boot-args 一字未动；`verify-clover-payload.py` 对 r335 归档重跑
+51 OK / 0 FAIL），下一次上机仍是 `--skip-recovery` 读 boot 119，而**从下一次无人值守运行起**，poll 行自带类别，
+「复位后立刻进 EDL」与「预算走完时才进 EDL」将第一次成为两个可区分的读数。
+板上那一手（PMIC SDAM 换通道）照 §Round336 ④ 排在 boot 119 读回之后，且没钉出 SDM660/PM8998 的 v3 事实之前不写码。

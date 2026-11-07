@@ -1410,7 +1410,12 @@ def tee_glue_summary(records):
 
 
 TIMELINE_WATCH = re.compile(r"^# watch (\S+) budget=(\S+) opened (\S+)")
-TIMELINE_ROW = re.compile(r"^(\d{9,}) (\d+) (\S+) (\S+) (\S+)\s*$")
+# Round337 (#718) puts a sixth field on every poll row: the landing class asked at that poll. The
+# field is optional here because the two runs that motivated it -- boots 118 and 119 -- wrote five,
+# and a five-field row must not be read as "the bus had no Qualcomm node at that moment". It was
+# not asked, which is the third kind of zero and gets its own literal below.
+TIMELINE_ROW = re.compile(r"^(\d{9,}) (\d+) (\S+) (\S+) (\S+)(?: (\S+))?\s*$")
+TIMELINE_CLASS_ABSENT = "not-asked-by-this-writer"
 
 NEITHER_EDL = (
     "no adb and no fastboot, but the USB tree at the close enumerated a Qualcomm bulk node: the "
@@ -1478,6 +1483,26 @@ def timeline_class_from_tree(tree_lines):
     return "no-node"
 
 
+def timeline_class_steps(watch):
+    """Reduce a watch's poll rows to the moments its landing class changed.
+
+    The rows are already only written when something changed or once a minute, so the transitions
+    are the reading and the repeats are not. Returns (steps, last) where `steps` is a list of
+    "elapsed:class" and `last` is the class of the newest poll that asked, or None when no poll of
+    this watch asked at all -- which is the state of every timeline written before round337, and is
+    reported as TIMELINE_CLASS_ABSENT rather than as a bus with no node on it.
+    """
+    steps = []
+    last = None
+    for (elapsed, _adb, _fastboot, landing_class) in watch["polls"]:
+        if landing_class is None:
+            continue
+        if landing_class != last:
+            steps.append(f"{elapsed}s:{landing_class}")
+            last = landing_class
+    return steps, last
+
+
 def timeline_sections(text):
     """Group a timeline file into its watches, keeping the polls that belong to each."""
     watches = []
@@ -1508,12 +1533,13 @@ def timeline_sections(text):
             # A data row also ends a tree capture: ioreg's output and the next poll are adjacent in
             # the file, so nothing but the row's own shape can tell them apart.
             collecting = None
-            _epoch, elapsed, adb, fastboot, event = row.groups()
+            _epoch, elapsed, adb, fastboot, event = row.groups()[:5]
+            landing_class = row.group(6)
             if event.startswith("close:"):
                 current["close"] = {"elapsed": int(elapsed), "adb": adb, "fastboot": fastboot,
                                     "result": event[len("close:"):]}
             elif event == "poll":
-                current["polls"].append((int(elapsed), adb, fastboot))
+                current["polls"].append((int(elapsed), adb, fastboot, landing_class))
             else:
                 current.setdefault("events", []).append((int(elapsed), event))
             continue
@@ -1541,22 +1567,31 @@ def timeline_selftest():
 
     open_fmt = format_of("# watch")
     close_fmt = format_of("close:")
-    poll_fmt = [candidate for candidate in formats
-                if candidate.count("%s") == 5 and "close:" not in candidate
-                and not candidate.startswith("#")][0].replace("\\n", "\n")
+    header_fmt = format_of("# epoch elapsed")
+    polls = [candidate for candidate in formats
+             if "close:" not in candidate and not candidate.startswith("#")]
+    six = [candidate for candidate in polls if candidate.count("%s") == 6]
+    if not six:
+        raise SystemExit("selftest: no 6-field poll printf in run-clover-unattended.sh -- the class "
+                         "column round337 requires is not being written, so the reader would be "
+                         "tested against a shape nobody writes")
+    poll_fmt = six[0].replace("\\n", "\n")
 
     text = (open_fmt % ("after-deadline", "2220", "2026-11-07T02:42:13Z")
-            + "# epoch elapsed adb fastboot event\n"
-            + poll_fmt % ("1794020116", "783", "-", "-", "poll")
-            + poll_fmt % ("1794020176", "843", "81ffcaaa", "-", "poll")
+            + header_fmt
+            + "# usb at open (after-deadline)\n+-o USB Hub@01100000\n"
+            + poll_fmt % ("1794020116", "0", "-", "-", "poll", "no-node")
+            + poll_fmt % ("1794020528", "412", "-", "-", "poll", "edl")
             + close_fmt % ("1794020200", "867", "-", "-", "neither-edl")
             + "# usb at close (neither-edl)\n+-o QUSB_BULK_SN:F6548A52@01143000\n"
             + open_fmt % ("wait-adb", "180", "2026-11-07T01:43:01Z")
-            + "# epoch elapsed adb fastboot event\n"
+            + header_fmt
             + close_fmt % ("1794010000", "0", "81ffcaaa", "-", "adb")
             + "# usb at close (adb)\n+-o Mi Pad 4@0130000f\n"
             + open_fmt % ("watch-brand-new", "60", "2026-11-07T03:00:00Z")
-            + close_fmt % ("1794021000", "5", "-", "-", "neither-no-node")
+            + header_fmt
+            + poll_fmt % ("1794021000", "10", "-", "-", "poll", "edl")
+            + close_fmt % ("1794021000", "55", "-", "-", "neither-no-node")
             + "# usb at close (neither-no-node)\n+-o nothing@01400000\n")
 
     watches = timeline_sections(text)
@@ -1567,6 +1602,9 @@ def timeline_selftest():
     if len(landing["polls"]) != 2 or landing["close"]["result"] != "neither-edl":
         raise SystemExit(f"selftest: the first watch parsed as {landing['polls']} "
                          f"{landing['close']}")
+    if landing["polls"][1][3] != "edl":
+        raise SystemExit(f"selftest: the sixth field did not parse as the landing class: "
+                         f"{landing['polls'][1]}")
     if arrival["close"]["result"] != "adb":
         raise SystemExit("selftest: the second watch's close was not read as adb")
     counts = {}
@@ -1579,6 +1617,13 @@ def timeline_selftest():
     if not any("download mode" in line for line in lines):
         raise SystemExit("selftest: neither-edl did not read as a board that reset into download "
                          "mode -- the reading is what this instrument is for")
+    # The point of the per-poll class: the onset is a time, not a state at the close.
+    if not any("class-polls=0s:no-node 412s:edl" in line for line in lines):
+        raise SystemExit(f"selftest: the class transition was not dated: {lines[0]}")
+    # The newest poll and the close can disagree, and the file has to say which leg is older.
+    if not any("while the newest poll said edl" in line for line in lines):
+        raise SystemExit("selftest: a close class beside a different last-poll class was reported as "
+                         "one state instead of a change between them")
     if "UNKEYED=['watch-brand-new/neither-no-node']" not in lines[-1]:
         raise SystemExit(f"selftest: an unkeyed watch was not named, it was folded in: {lines[-1]}")
     # A class the writer never reports must come from the tree, and must say it was derived.
@@ -1589,8 +1634,23 @@ def timeline_selftest():
     if "class derived from this run's own" not in buffer.getvalue():
         raise SystemExit("selftest: a classless neither was classified without saying the class "
                          "came from the tree rather than from the run")
-    print("timeline selftest: three watches, both close paths, the derived-class note and the "
-          "unkeyed name all ok (samples built from run-clover-unattended.sh's own printf)")
+    # A five-field row is the shape of every timeline written before round337, and it is NOT a
+    # window in which the bus had no Qualcomm node: the question was never asked. This is the same
+    # mistake as reading a zero from a loop bound as a reading, so the literal is asserted here.
+    predating = re.sub(r"^(\d{9,} \d+ \S+ \S+ poll) \S+$", r"\1", text, flags=re.M)
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        timeline_report_from_text(predating, "selftest", {})
+    said = buffer.getvalue()
+    if f"class-polls={TIMELINE_CLASS_ABSENT}" not in said:
+        raise SystemExit(f"selftest: a five-field poll row was read as a class instead of as a "
+                         f"question that was not asked: {said.splitlines()[0]}")
+    if "predates round337" not in said:
+        raise SystemExit("selftest: the summary did not name the writer generation the poll rows "
+                         "come from")
+    print("timeline selftest: three watches, the class transition dated, the close-versus-poll "
+          "change named, both close paths, the derived-class note, the five-field predating shape "
+          "and the unkeyed name all ok (samples built from run-clover-unattended.sh's own printf)")
     return 0
 
 
@@ -1606,10 +1666,26 @@ def timeline_report_from_text(text, source, counts):
         print(f"timeline: {source} has no `# watch` section -- nothing was watched, which is a "
               "reading about this run, not about the board")
         return
+    asked = 0
     for watch in watches:
         close = watch["close"]
         readings = WATCH_READINGS.get(watch["label"], {})
-        seen = sorted({e for (_t, adb, fb) in watch["polls"] for e in (adb, fb) if e != "-"})
+        seen = sorted({e for (_t, adb, fb, _cls) in watch["polls"] for e in (adb, fb) if e != "-"})
+        steps, last_class = timeline_class_steps(watch)
+        if steps:
+            asked += 1
+            class_note = "class-polls=" + " ".join(steps)
+        else:
+            class_note = f"class-polls={TIMELINE_CLASS_ABSENT}"
+        if watch["open_tree"]:
+            class_note += (f" class-at-open={timeline_class_from_tree(watch['open_tree'])}"
+                           " (derived here from the tree that run photographed at open)")
+        if close is not None and close["result"].startswith("neither-"):
+            wanted = close["result"][len("neither-"):]
+            if last_class is not None and last_class != wanted:
+                class_note += (f" (the close classified {wanted} while the newest poll said "
+                               f"{last_class}: the mode changed between the last poll and the close, "
+                               f"{close['elapsed']}s)")
         if close is None:
             label = "open-no-close"
             reading = ("this watch never wrote its close line, so the run ended inside it -- what "
@@ -1630,7 +1706,7 @@ def timeline_report_from_text(text, source, counts):
                     f"{close['elapsed']}s of budget {watch['budget']}{derived}")
         counts[f"{watch['label']}/{label}"] = counts.get(f"{watch['label']}/{label}", 0) + 1
         print(f"watch {watch['label']} opened {watch['opened']} polls={len(watch['polls'])} "
-              f"other-answer-seen={','.join(seen) if seen else 'none'} {tail}: {reading}")
+              f"other-answer-seen={','.join(seen) if seen else 'none'} {class_note} {tail}: {reading}")
     named = " ".join(f"{key}={counts[key]}" for key in sorted(counts)
                      if key.rsplit("/", 1)[1] != "open-no-close"
                      and WATCH_READINGS.get(key.rsplit("/", 1)[0], {})
@@ -1638,7 +1714,10 @@ def timeline_report_from_text(text, source, counts):
     unkeyed = [key for key in sorted(counts)
                if WATCH_READINGS.get(key.rsplit("/", 1)[0], {})
                .get(key.rsplit("/", 1)[1]) is None]
-    print(f"timeline: {len(watches)} watches, closes: {named or 'none'}"
+    predates = ("" if asked else " -- this file predates round337: the landing class exists only "
+                                 "where a tree was photographed at open or close")
+    print(f"timeline: {len(watches)} watches, poll class asked in {asked}/{len(watches)}{predates}, "
+          f"closes: {named or 'none'}"
           + (f" UNKEYED={unkeyed}" if unkeyed else ""))
 
 

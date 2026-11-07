@@ -153,11 +153,35 @@ adb_serial() {
 # silent window leaves no artifact behind -- which is the same defect this port keeps finding on the
 # card side, in shell: an instrument that answers only its interesting case cannot date its own silence.
 #
-# One file per run, one section per watch. Each line is that poll's own two answers plus the elapsed
-# seconds, written when either answer changes and otherwise once a minute, so the file is a timeline
-# and not a transcript. The USB tree is captured at open and at close -- the tree, not a name match,
-# because the question is "did this board enumerate in any mode at all", and the modes where it might
-# are exactly the ones the two tools above do not see.
+# Round337 (#718). The class is now asked at every poll, not only at the close. Boots 118 and 119
+# proved what the close-only version cannot say: the EDL node appeared in the tree photographed at
+# the close, so the board was in download mode at 2221 s, and nothing on this host says when it got
+# there -- "reset straight into EDL" and "sat unenumerated until the budget ran out and only then
+# moved" write the same close line. The sampling sits inside timeline_poll rather than at its four
+# call sites so that no watch can forget it, and because it is part of the state that decides
+# whether a row is written, a mode change is a row even when neither tool changes -- which is the
+# case here: adb and fastboot read `-` through the whole transition.
+usb_landing_class() {
+  local tree
+  tree=$(ioreg -p IOUSB -w0 2>/dev/null)
+  if [ -z "$tree" ]; then
+    # Nothing from the tool is not an empty bus: it is this host failing to answer, and a window
+    # whose polls all read ioreg-fail says the class was never asked, not that no node appeared.
+    printf 'ioreg-fail'
+  elif printf '%s\n' "$tree" | grep -qE 'QUSB_BULK|QPS6000|HS-USB.*9008'; then
+    printf 'edl'
+  elif printf '%s\n' "$tree" | grep -qiE 'diag|qdss|900e'; then
+    printf 'diag'
+  else
+    printf 'no-node'
+  fi
+}
+# One file per run, one section per watch. Each line is that poll's own two answers, the landing
+# class of the USB tree, and the elapsed seconds, written when any of the three changes and
+# otherwise once a minute, so the file is a timeline and not a transcript. The USB tree is captured
+# at open and at close -- the tree, not a name match, because the question is "did this board
+# enumerate in any mode at all", and the modes where it might are exactly the ones the two tools
+# above do not see.
 TIMELINE=""
 TIMELINE_START=0
 TIMELINE_BEAT=0
@@ -166,17 +190,18 @@ timeline_open() {
   local label=$1 budget=$2
   TIMELINE="$(dirname "$OUT")/$(basename "$OUT").timeline.txt"
   { printf '# watch %s budget=%ss opened %s\n' "$label" "$budget" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '# epoch elapsed adb fastboot event\n'; } >> "$TIMELINE" 2>/dev/null
+    printf '# epoch elapsed adb fastboot event class\n'; } >> "$TIMELINE" 2>/dev/null
   TIMELINE_START=$(date +%s); TIMELINE_BEAT=$TIMELINE_START; TIMELINE_LAST="--"
   printf '# usb at open (%s)\n' "$label" >> "$TIMELINE"
   ioreg -p IOUSB -w0 2>/dev/null | sed -n '1,60p' >> "$TIMELINE"
 }
 timeline_poll() {
-  local event=$1 adb_now=${2:-} fb_now=${3:-} now state
-  now=$(date +%s); state="${adb_now:--}|${fb_now:--}"
+  local event=$1 adb_now=${2:-} fb_now=${3:-} now state class
+  now=$(date +%s); class=$(usb_landing_class)
+  state="${adb_now:--}|${fb_now:--}|${class}"
   if [ "$state" != "$TIMELINE_LAST" ] || [ $(( now - TIMELINE_BEAT )) -ge 60 ]; then
-    printf '%s %s %s %s %s\n' "$now" "$(( now - TIMELINE_START ))" "${adb_now:--}" "${fb_now:--}" \
-      "$event" >> "$TIMELINE" 2>/dev/null
+    printf '%s %s %s %s %s %s\n' "$now" "$(( now - TIMELINE_START ))" "${adb_now:--}" "${fb_now:--}" \
+      "$event" "$class" >> "$TIMELINE" 2>/dev/null
     TIMELINE_BEAT=$now
   fi
   TIMELINE_LAST=$state
@@ -250,20 +275,9 @@ wait_leave_fastboot() {
 # Qualcomm bulk node -- the board had reset and this host had seen it, in the one mode neither
 # adb nor fastboot enumerates. So the class of the silent window is read from the tree, which is
 # what timeline_open and timeline_close already photograph, and it goes into the label of the
-# close line and into the verdict sentence. It is not a match on our own serial: the EDL node on
-# this board carries a different hex string than the adb serial, and the question is only "did
-# the board enumerate in some mode at all".
-usb_landing_class() {
-  local tree
-  tree=$(ioreg -p IOUSB -w0 2>/dev/null)
-  if printf '%s\n' "$tree" | grep -qE 'QUSB_BULK|QPS6000|HS-USB.*9008'; then
-    printf 'edl'
-  elif printf '%s\n' "$tree" | grep -qiE 'diag|qdss|900e'; then
-    printf 'diag'
-  else
-    printf 'no-node'
-  fi
-}
+# close line and into the verdict sentence. The classifier itself is usb_landing_class(), defined
+# above timeline_open because round337 put it on every poll; a second definition here would be the
+# one that wins at runtime, which is why this is a comment and not a function.
 watch_landing() {
   local deadline=$(( $(date +%s) + LANDING_WAIT ))
   local a f
@@ -431,8 +445,9 @@ EOF
 [unattended]   2. boot TWRP from its own partition, then rerun with --skip-recovery.
 EOF
       exit 4 ;;
-    *) say "neither TWRP's adb nor fastboot within ${LANDING_WAIT}s; the USB tree at the close of that window is $(usb_landing_class): edl means the board reset into download mode rather than sitting on the panic screen, no-node means nothing enumerated and the panic screen remains the candidate (it resets after 20 s)"
-       say "every poll of that window is on disk with its two answers and the USB tree: $TIMELINE" ;;
+    *) closing=$(tail -n 1 "$TIMELINE" 2>/dev/null | awk '{print $5}')
+       say "neither TWRP's adb nor fastboot within ${LANDING_WAIT}s; that window closed as ${closing:-no-close-line}, quoted from the timeline's own close line rather than measured again here: close:neither-edl means the board reset and this host enumerated it in the one mode these two tools do not see, close:neither-no-node means nothing enumerated at all and the panic screen remains the candidate (it resets after 20 s)"
+       say "every poll of that window is on disk with its two answers, its landing class and the USB tree: $TIMELINE" ;;
   esac
 fi
 

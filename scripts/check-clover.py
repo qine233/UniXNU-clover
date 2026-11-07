@@ -7159,6 +7159,76 @@ def check_board(errors: list) -> str:
                       "the definition -- `def timeline_selftest():` contains the same characters and "
                       "proves nothing): the parser would again be tested only against the writer's "
                       "printf literals in principle, not in fact")
+    # Round337 (#718). The close line says what the bus was at the end of a silent window; boots 118
+    # and 119 showed that this cannot date the change, because the two runs proved only "in EDL by
+    # 2221 s" while the card's last kernel line sat at 649 s and 730 s. So the class is now asked at
+    # every poll, inside timeline_poll() rather than at its four call sites -- a watch cannot forget
+    # a sampling it has no parameter for. Pinned below: that the sampling sits in the one function
+    # every watch must call,
+    # that an empty answer from the host tool is its own class rather than a quiet bus, that both
+    # verdict sentences quote the file instead of re-measuring, and that the reader can tell a poll
+    # row without the column from a poll row that asked and got no-node.
+    poll_body = re.search(r"^timeline_poll\(\) \{.*?^\}", script_text, re.S | re.M)
+    if poll_body is None:
+        errors.append("scripts/run-clover-unattended.sh has no timeline_poll(): the per-poll class has "
+                      "nowhere to live, so the window's silence again has one timestamp instead of a "
+                      "sequence")
+    elif "usb_landing_class" not in poll_body.group(0):
+        errors.append("timeline_poll() does not sample usb_landing_class: a class asked only at the "
+                      "close dates nothing -- the reading this round exists to produce is the moment "
+                      "the mode changed")
+    if '[ -z "$tree" ]' not in script_text:
+        errors.append("usb_landing_class does not test the empty tree before matching names: when "
+                      "ioreg answers nothing this host failed to answer, which is not the same "
+                      "statement as a bus with no Qualcomm node on it -- the third zero of this "
+                      "file's own making")
+    # The classifier is run here rather than read: grepping for the word it emits was tested by
+    # negative case N8 and passed a mutation that deleted the branch, because the word also appears
+    # in the sentence explaining it. Four stubs, one per answer, and the empty one has to come out
+    # as its own class.
+    classifier = re.search(r"^usb_landing_class\(\) \{.*?^\}", script_text, re.S | re.M)
+    if classifier is None:
+        errors.append("scripts/run-clover-unattended.sh has no usb_landing_class() block the gate can "
+                      "run: the class of every poll would again be judged by looking for its name")
+    else:
+        probe = subprocess.run(
+            ["bash", "-c", classifier.group(0) + """
+ioreg() { printf '%s\\n' "$IOUSB_STUB"; }
+for stub in "" "x QUSB_BULK_SN:F6548A52@01143000 y" "x Diag@01144000 y" "x Mi Pad 4@0130000f y"; do
+  IOUSB_STUB="$stub"
+  printf 'STUB[%s] CLASS[%s]\\n' "$stub" "$(usb_landing_class)"
+done
+"""], capture_output=True, text=True)
+        wanted = {"STUB[] CLASS[ioreg-fail]": "the empty answer is this host failing, not a quiet bus",
+                  "STUB[x QUSB_BULK_SN:F6548A52@01143000 y] CLASS[edl]":
+                      "the node boots 118 and 119 enumerated must classify as edl",
+                  "STUB[x Diag@01144000 y] CLASS[diag]": "a diagnostic port is its own class",
+                  "STUB[x Mi Pad 4@0130000f y] CLASS[no-node]":
+                      "a board the two tools do not see here must not be read as edl"}
+        for line, why in wanted.items():
+            if line not in probe.stdout:
+                errors.append(f"usb_landing_class does not return {line}: {why}; stdout was "
+                              f"{probe.stdout.strip()[-300:]!r}")
+    quoted_closes = re.findall(r'closing=\$\(tail -n 1 "\$TIMELINE"', script_text)
+    if len(quoted_closes) != 2:
+        errors.append(f"the verdict sentences quote the timeline's close line in {len(quoted_closes)} "
+                      "of the 2 places that can end silent (watch_landing and watch_after_deadline): "
+                      "the one that does not describes the host at printing time, and the board may "
+                      "have moved by then")
+    remeasured = re.findall(r'(?:say|die)[^\n]*\$\(\s*usb_landing_class', script_text)
+    if remeasured:
+        errors.append("a verdict sentence measures the USB tree again at the moment it prints: "
+                      f"{len(remeasured)} such line(s), the first {remeasured[0][:90]!r} -- the close "
+                      "line is the reading, and this script already knows how to quote it")
+    if 'TIMELINE_CLASS_ABSENT = "not-asked-by-this-writer"' not in reader_text:
+        errors.append("read-clover-log.py has no named literal for a poll row without the class "
+                      "column: five-field rows are every timeline written before round337, and reading "
+                      "them as `no-node` would put a reading on a window where nobody asked")
+    for needle in ("class-polls=", "class-at-open=", "poll class asked in"):
+        if needle not in reader_text:
+            errors.append(f"read-clover-log.py no longer prints {needle!r}: the onset time, the "
+                          "derived-at-open leg and the generation of the writer are the three things "
+                          "this file says that a close label cannot")
     # The script is the read-back path, and until now its syntax was only ever tested by running it on
     # the board's clock: a typo costs a 2100 s window and a boot nobody read.
     syntax = subprocess.run(["bash", "-n", str(REPO / "scripts/run-clover-unattended.sh")],
