@@ -27882,3 +27882,57 @@ tree 侧都 EXIT=0」。r335b 第一次跑 tree 侧确实 EXIT=0——但那次�
 同一个仓库被数了两遍（第二十一层「找到第一枚就停的扫描分不清一枚与一枚也没有」的镜像版：跑了两次检查分不清
 两条判据与一条判据）。顺带一条：`--device` 收的是**目录**，`--device clover` 会被解读成 `/Users/zhouzhou/UniXNU/clover`
 并直接报 `has no board.toml`（TREE_EXIT=1）——写绝对路径。
+
+## Round336（纯宿主取证轮，不发镜像：落回模式为什么从 boot 117 的自动 TWRP 变成 118/119 的 EDL）
+
+证据目录 `~/clover-out/round336-forensics/`（四份文件都可复跑，命令在下面的括号里）。
+
+**① 回归被压成一句：同一扇窗、同一枚预算，答案换了。** `close-labels-by-watch.txt`（awk 把每枚 close 行按它
+所属的 `# watch` 段键住——这正是 #716 读者那半的键法）：
+
+    boot 115  after-deadline -> close:adb     at  814s
+    boot 116  after-deadline -> close:adb     at  969s
+    boot 117  after-deadline -> close:adb     at  890s
+    boot 118  after-deadline -> close:neither at 2221s   (class derived: edl)
+    boot 119  after-deadline -> close:neither at 2221s   (class derived: edl)
+
+所以「板子自己回 TWRP」这件事在 boot 118 起就没有发生过，而不是「回来了但没等到」。118/119 那两枚 `neither` 写在
+分类器落地之前，`edl` 是本 run 自己的 close 树派生的；115/116/117 那三枚根本不是 `neither`，所以这一对比不依赖
+新分类器、也不会被它的派生误差污染。
+
+**② 写的一侧排除掉一半：r198 那枚预上膛行在两代靴上逐字同。** `r198-prearm-rows.txt`：boot 115、117、118 都印
+`CloverSdhci r198: recovery BCB pre-armed rc=100 written=1`——落 TWRP 的那一靴（117）和落 EDL 的那一靴（118）
+里这一行**完全一样**，⇒ 「我们把 recovery 标志写坏了」不是解释（boot 116 的存档里没有这行，是 64 枚驱动环被后续
+行轮转掉，不是没跑；那一靴本来就落回了 TWRP，所以它在这儿只能当缺读，不能当反例）。
+同一趟也排掉 panic 通路：`flight-and-sink-both-stale.txt` 里 117 与 118 都是「卡上的死线记录属于 boot 108」、
+两枚 panic marker 都 `STALE: boot N never entered the sink`、都没有 drain-in／sentence 记录——**两靴都没进过
+panic 通路**，所以落回模式的差异发生在 panic 之外，也就是那一起「静默复位」本身。
+（卡上最后一行的时刻：117  newest entry t=730 054 ms、118 t=637 541 ms——两靴都是先静默复位、后由固件决定去哪。）
+
+**③ 复位来源那一格不是运气不好，是选错了通道——这一格现在量得出来。** `r283-all-sightings.txt`（`grep -rh
+'clover r283' ~/clover-out/*-window.bin.txt`）24 枚 sightings 逐枚判：**0 枚 `kind=`**、**0 枚 record[9] 等于我们
+心跳写的 `BEAT283`（`0033383254414542`）**、**0 枚读到全零**。boot 118 看到的是 `magic=69a0000300a109d0
+beatmagic=801a086e432839b2`，历史那批的 `magic=` 低 32 位反复出现 `00a109d0`（3 次）／`00a909f0`（2 次）、
+`beatmagic=` 共享 `..1a08..` 的字节形状。⇒ 三个候选里只剩一个站得住：既不是「我们的记录在，只是没人命名」（那需要
+`kind=` 或至少需要我们的 BEAT283），也不是「这格每靴被清掉了」（那需要读到 0），而是**这块 IMEM 区间（0x660 起
+160 字节）是固件每靴重写的**——所以 r283 用「上一靴写、下一靴读」命名静默复位这条路**结构上就答不了它要答的问题**，
+而我们的驱动每靴开头还去清它。r293 当年把这枚 `beatmagic=` 加进来的理由正是「让 unnamed 分裂成两种」；今天它分裂成功了，
+答案是「通道不是我们的」，而这条结论必须连着那句一起读：**23/0/0 不是没中奖，是这台仪器问错了对象**。
+（这一条是第十七层「镜像里找得到这串字≠这段算术在镜像里」的复位格版本：针脚在场、字段在场、读数在场，
+但它测的是别人的存储。）
+
+**④ 下一手分两支，都不许多花一次刷写。**
+- **宿主侧（r337，可以做，且不需要板子）**：`timeline_poll()` 每一拍只问 `adb` 与 `fastboot`，而 EDL 恰恰是这两把
+  工具都看不见的那一型——所以「板子什么时候进的 EDL」现在测不出来（117 卡上最后一行 730 s、118 637.5 s，
+  而两靴的 EDL 节点只出现在收段那一刻的树上）。修法与 #716 同形：**每一拍把 `usb_landing_class` 也当第三枚答案
+  记下来**，于是「复位后立刻进 EDL」与「预算走完时才进 EDL」成为两个可区分的读数。这一格不新增上机成本，
+  并且把下一次同类靴的沉默从「关于宿主的判断」升成带时刻的读数。
+- **板上侧（等 boot 119 读回之后）**：换通道——sheng 已经把这条路走通并有宿主模型（`~/UniXNU-sheng/package/BootResetCore.h`：
+  经 SPMI 仲裁器找 SDAM 那颗 APID（PPID `0x071`）、写复位原因格 byte `0x48`、mask `0xfe` shift 1、值 2＝bootloader，
+  配套 `package/tests/boot_reset_host.c`）。它那张表是 SM8550 的**仲裁器 v7** 布局，我们这颗是 **v3**（§Round313 量的），
+  所以照搬之前必须先把 SDM660/PM8998 的 SDAM PPID 与寄存器从我们自己的 DT 与厂商源里钉出来——**没钉出来之前不许写码**，
+  否则就是把「我们的字节」写进别人的另一格。CloverPower 已经有仲裁器与 `readAt()` 通路，缺的是事实不是管道。
+
+**⑤ 刷写闸门（本轮自加的一条硬规矩）。** boot 119 的卡还没读，而冷刷 `cache` 分区正是**覆盖那块卡**的那只手——
+所以在 `--skip-recovery` 读到 boot 119 之前，**任何新镜像都不许刷**（构建与归档照旧可以，r311/r313 那种「不刷写」轮
+是本型的正规形状）。这条写进 README 的缺口表，免得下一轮把它当流程洁癖。
