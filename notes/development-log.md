@@ -28204,3 +28204,48 @@ agreement check: our value is labelled bootloader by the vendor in 1 of 1 rows t
 - 序号是「本通道的 serve 次数」，它是仪器内部的计数，不是仲裁器的属性；`moved=` 那一列是行对自己的对照（0 表示三枚共享字在打印期间没动），不是板上任何状态。
 
 **⑦ 待办**：发布 v0.7.56 → 冷刷 `cache` 作为 boot 120 → 按 §Round339 ② 的 M-A/M-B/M-C/M-E/M-F 判读（M-D 依预登记留到 boot 121，本轮不许提前判）。
+
+## Round339b（#721，纯宿主仪器轮，发版 v0.7.57：boot 120 那趟同时交出两件东西——一条复位起点，和判决句自己印错的那一枚字）
+
+本轮不动板上代码、不重打镜像、不刷写。产物仍是 `round339-v0.7.56-payload.img`，boot 120 卡上那一靴不归本轮改。
+
+**① boot 120 的读数（全部来自无人值守产物与它自己的时间线，不经卡）**
+
+- 身份与写入：`fastboot: 81ffcaaa` ⇒ `fastboot flash cache ~/clover-out/round339-v0.7.56-payload.img`（58,720,256 B，只进 `cache`）⇒ `fastboot reboot` ⇒ `UNATTENDED_EXIT=6`（`~/clover-out/unattended-r339-boot120.log`，11 行）。
+- 时间线：`~/clover-out/clover-log-window.bin.timeline.txt`，本靴那一段是第 105 行 `# watch after-deadline budget=2220s opened 2026-11-07T06:55:15Z`。逐拍类别从 `no-node` 一直拍到 `1794035237 722 - - poll no-node`，下一拍 `1794035241 726 - - poll edl`，收段 `1794036735 2220 - - close:neither-edl`（第 159 行）。
+- ⇒ 本靴确实复位了，**起点夹在 722–726 s**（r337 那枚每拍采样的类别第一次把一型 EDL 落点夹进 4 s 里）。这枚夹值是**这枚宿主看见枚举的那一秒**，不是板子复位的那一秒——时间线只证得出在场的东西（§Round335b ④ 那条口径照用）。
+
+**② §Round339 ② 六支判据的处置（按第二十四层：没被触发的那一支记空判，不记成通过）**
+
+- **M-A：空判。** 它的判据是「死线到点之后自动落 TWRP（`close:adb`，与 boot 117/119 同型）」，而本靴的复位在窗口第 726 s 就发生了——1800 s 死线从没到点，所以「落回模式由谁决定」这一支本轮**没被问过**。预登记里「若落进 fastboot 或 EDL 就撤销 C」那一支同样没被触发：那一支的主语是死线到点后的落点，本靴不是那一次复位。⇒ **C（`0x77665500`）既没被证实也没被证伪**，撤销条件留在原位等下一次死线。
+- **M-B / M-C / M-E：待卡上读数。** 三支都要读 boot 120 的卡（`mark wrote=/before=/after=`、`beatctl … ok=`、`unnamed` 余迹）。EDL 不写存储、也不丢卡，卡上仍是那一靴；读它要把板子带回 TWRP 再 `dd`。本轮按缺席记录，不记成通过，也不记成失败。
+- **M-D：照预登记留给 boot 121**（跨靴判据同靴判不了）。
+- **M-F：已成立且不经板子**——`agreement check: … 1 of 1 rows`，负测 N20 把常量换回 `0x77665501` 判红（§Round339 ⑤ 的实测）。
+
+**③ 同一趟逼出的第二件东西：判决句印了自己那一枚字的反面**
+
+`~/clover-out/unattended-r339-boot120.log:10` 那句原文是「that window closed as **id**」。原因在写侧：`timeline_close()` 在 close 行**下面**拍了 60 行 `ioreg -p IOUSB` 全树，而两枚判决句取的是「文件最后一行的第 5 枚字段」——取到的是那棵树的一枚字段。同一枚文件上两串实测（174 行）：
+
+```
+tail -n 1 "$TIMELINE" | awk '{print $5}'  ->  id
+timeline_last_close()                     ->  close:neither-edl
+```
+
+难看的地方不在脚本，在闸门：r337 钉的是**表达式本身**（`closing=$(tail …` 必在、且恰两枚），于是它把一个错误的表达式忠实地钉住了。这是第十七层那句话的另一半——**存在性针脚能被一枚错的表达式满足；要判行为就得跑那段代码**。同轮里 r337 自己已经因同一个形状改过一次分类器（N8 被解释那枚字面量的注释喂饱），这次是同一枚坑的第二回，而且这回连「串在不在」都对，错的是串算出来的东西。
+
+**④ 改法（三处，全部可在盘上点开）**
+
+- `scripts/run-clover-unattended.sh:221-230` 新增 `timeline_last_close()`：
+  `awk '/^# watch / { line = "" } NF == 5 && $5 ~ /^close:/ { line = $5 } END { if (line) print line }'`。两枚条件都是承重的：`# watch` 头部复位——这枚文件跨轮**追加**，不复位就会把上一窗口的 close 当本窗口的判决（本文件第 1/36 行就是 boot 118/119 那两段的头部）；`NF == 5`——close 行恰五枚字段，poll 行六枚，`ioreg` 树任意枚。
+- 两枚判决点 `:417`（`--boot-after-flash` 的 exit-6）与 `:464`（落点判决）都换成 `closing=$(timeline_last_close)`。句子本身没改口径：仍然只引产物自己的 close，仍然不在判决时重测总线。
+- `scripts/check-clover.py`：r337 那枚「tail 表达式必在」的存在性针脚**撤掉**，换成两件事——
+  1. **禁则**：判决点里出现「从文件尾部取 close」那一型即判红（说明文字不复述被禁串，按第二十三层那枚「说明禁则的文字不许含被禁的串」写）；枚数针脚改成 `closing=$(timeline_last_close)` **恰两枚**。
+  2. **行为探针**：闸门把那枚函数体从发版脚本里抠出来，对三份合成时间线**跑**它——`close 行 + 下面的树` ⇒ `close:neither-edl`；`上一窗口的 close + 本窗口还没收段` ⇒ 空（判决句于是自己说 `no-close-line`，而不是借一枚旧窗口的读数）；`同一窗口两枚 close` ⇒ 取最后一枚。
+- `scripts/test-clover-716-negatives.py`：32 支 → **35 支**。N4/N10 跟着换到新表达式并各带 expect 串（`of the 2 places that can end silent`）；新增 **N33**＝把函数体换回尾部提取那一型（**禁则命不中它**——那枚串不在 `closing=$(` 之后，只有探针判得出）、**N34**＝摘掉 `# watch` 复位（只有第二份样例判得出）、**N35**＝函数改名（`no timeline_last_close() block the gate can run`）。
+- 产物改名到可引用的 durable 名字：负测日志走 `~/clover-out/round339b-timeline/negatives.log`。
+
+**⑤ 边界**
+
+- 本轮没有任何板上行为改变：`git diff --stat drivers/` 为空，`board.toml` 未动，boot-args 未动，镜像未重建。
+- 「板子还在 EDL」这一枚状态本轮只由 `ioreg` 当场看过一次（`F6548A52@01143000`，`adb`/`fastboot` 两把工具都空答）；至于它此后有没有自己离开 EDL、卡上 boot 计数器现在是不是已经超过 120，本轮没有仪器——下一次能读卡的窗口会自己报出来（读卡那趟先看 boot 计数器再判读，按 r293 的陈旧判定）。
+- 判决句现在说的仍是「这两把工具看不见那一型」，不改口成「死线开火了」。

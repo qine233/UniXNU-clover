@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Negative tests for the #716, #718, #719 and #720 needles in scripts/check-clover.py.
+"""Negative tests for the #716, #718, #719, #720 and #720b needles in scripts/check-clover.py.
 
 Each case breaks one shape the gate now pins, runs the gate, and restores in a finally block: a
 negative test that leaves its edit behind is worse than no negative test, because the next gate run
@@ -31,7 +31,7 @@ SDHCI = REPO / "drivers/CloverSdhci/CloverSdhci.cpp"
 PANIC = REPO / "scripts/xnu-panic-screen.c"
 HARNESS = REPO / "drivers/CloverPower/tests/clover_power_host.cpp"
 GATE = REPO / "scripts/check-clover.py"
-LOG = Path.home() / "clover-out/round339-sdimem/negatives.log"
+LOG = Path.home() / "clover-out/round339b-timeline/negatives.log"
 
 SILENT_AFTER = '''      timeline_close "neither-$(usb_landing_class)" "" ""
       return 2
@@ -72,8 +72,9 @@ CASES = [
      "grep -qE 'QUSB_BULK|QPS6000|HS-USB.*9008'", "grep -qE 'NOTHING_MATCHES_THIS'"),
     ("N3 after-deadline left classless", SCRIPT, SILENT_AFTER,
      '      timeline_close neither "" ""\n      return 2\n    fi\n    sleep 2'),
-    ("N4 verdict re-measures instead of quoting the close line", SCRIPT,
-     'closing=$(tail -n 1 "$TIMELINE"', 'closing=$(usb_landing_class'),
+    ("N4 verdict re-measures instead of quoting the close line",
+     [(SCRIPT, 'closing=$(timeline_last_close)', 'closing=$(usb_landing_class)')],
+     "of the 2 places that can end silent"),
     ("N5 reader loses one watch key", READER, '    "wait-adb": {', '    "wait-adb-renamed": {'),
     ("N6 reader stops running its timeline leg", READER, "    timeline_selftest()\n", ""),
     # Round337 (#718).
@@ -83,8 +84,9 @@ CASES = [
      "printf 'ioreg-fail'", "printf 'no-node'"),
     ("N9 poll row drops the class column", SCRIPT,
      POLL_PRINTF, """    printf '%s %s %s %s %s\\n' "$now" "$(( now - TIMELINE_START ))" "${adb_now:--}" "${fb_now:--}" \\"""),
-    ("N10 the second silent verdict stops quoting the file", SCRIPT,
-     'closing=$(tail -n 1 "$TIMELINE"', 'closing=$(usb_landing_class', 2),
+    ("N10 the second silent verdict stops quoting the file",
+     [(SCRIPT, 'closing=$(timeline_last_close)', 'closing=$(usb_landing_class)', 2)],
+     "of the 2 places that can end silent"),
     ("N11 unasked class reads as no-node", READER,
      'TIMELINE_CLASS_ABSENT = "not-asked-by-this-writer"', 'TIMELINE_CLASS_ABSENT = "no-node"'),
     ("N12 reader stops printing the per-poll class", READER,
@@ -177,6 +179,26 @@ CASES = [
     ("N32 the channel's answer is recorded from the shared word again",
      [(HARNESS, "  servedSid[apid] = (int) sid;", "  servedSid[apid] = lastSid;")],
      "shared last-serve word"),
+    # Round339b. Boot 120's own verdict sentence is the reason these three exist: it quoted the end of
+    # the timeline, and the end of the timeline is a row of the USB tree the writer photographs under
+    # the close line. The needle that used to guard that sentence pinned the *expression*, so the
+    # expression could be wrong and the gate stayed green -- which is exactly what happened. The gate
+    # now runs the shipped helper against synthetic timelines, and the cases below break what only a
+    # run can see: the shape of the tail, the reset at each window header, and the helper's existence.
+    # None of them touches a substring the ban searches for, so a green here would mean the probe is
+    # not the thing judging.
+    ("N33 the close is read off the last line of the file again",
+     [(SCRIPT,
+       '''  awk '/^# watch / { line = "" } NF == 5 && $5 ~ /^close:/ { line = $5 } END { if (line) print line }' \\
+    "$TIMELINE" 2>/dev/null''',
+       "  tail -n 1 \"$TIMELINE\" 2>/dev/null | awk '{print $5}'")],
+     "timeline_last_close on close then the tree under it"),
+    ("N34 the scan stops restarting at each window header",
+     [(SCRIPT, '''awk '/^# watch / { line = "" } NF == 5''', '''awk 'NF == 5''')],
+     "timeline_last_close on an older window's close"),
+    ("N35 the helper that quotes the close is gone",
+     [(SCRIPT, "timeline_last_close() {", "timeline_last_close_unused() {")],
+     "no timeline_last_close() block the gate can run"),
 ]
 
 

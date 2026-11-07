@@ -218,6 +218,18 @@ timeline_close() {
   printf '# usb at close (%s)\n' "$result" >> "$TIMELINE"
   ioreg -p IOUSB -w0 2>/dev/null | sed -n '1,60p' >> "$TIMELINE"
 }
+# Round339b. This is the last CLOSE line, not the last line: timeline_close appends the USB tree
+# underneath it, so "tail -n 1" answers with a field of that tree. Both verdict sentences below
+# claim to quote the close rather than re-measure the bus, and boot 120's run printed "closed as id"
+# while doing exactly that -- the sentence was true of its intent and false of its expression.
+# The scan restarts at each "# watch" header, because this file is appended across runs and a close
+# belonging to an older window would otherwise be quoted as this one's verdict. Five fields is the
+# shape of a close line -- the poll rows have six and the tree has whatever ioreg printed -- so the
+# line count is part of the match rather than an afterthought.
+timeline_last_close() {
+  awk '/^# watch / { line = "" } NF == 5 && $5 ~ /^close:/ { line = $5 } END { if (line) print line }' \
+    "$TIMELINE" 2>/dev/null
+}
 wait_fastboot() {
   local deadline=$(( $(date +%s) + WAIT ))
   local found a
@@ -402,7 +414,7 @@ if [ "$SKIP_RECOVERY" = 0 ] && [ -n "$FLASH_CACHE" ]; then
         say "writing the host's BCB next so the window is still read from TWRP"
         ;;
       *)
-        closing=$(tail -n 1 "$TIMELINE" 2>/dev/null | awk '{print $5}')
+        closing=$(timeline_last_close)
         die 6 "neither TWRP's adb nor fastboot within $(( WAIT + DEADLINE_SLACK ))s; that window closed as ${closing:-no-close-line}, quoted from the timeline's own close line because the tree it names was photographed at the close rather than here: neither-edl means the board reset and this host enumerated it, in the one mode these two tools do not see, so this line does NOT leave open whether the deadline fired or whether the reset happened -- what it leaves open is this boot's card read, which needs the board back in TWRP and does not lose the card (rerun with --skip-recovery); neither-no-node means nothing enumerated at all, which is where the three candidates still stand; timeline: $TIMELINE"
         ;;
     esac
@@ -449,7 +461,7 @@ EOF
 [unattended]   2. boot TWRP from its own partition, then rerun with --skip-recovery.
 EOF
       exit 4 ;;
-    *) closing=$(tail -n 1 "$TIMELINE" 2>/dev/null | awk '{print $5}')
+    *) closing=$(timeline_last_close)
        say "neither TWRP's adb nor fastboot within ${LANDING_WAIT}s; that window closed as ${closing:-no-close-line}, quoted from the timeline's own close line rather than measured again here: close:neither-edl means the board reset and this host enumerated it in the one mode these two tools do not see, close:neither-no-node means nothing enumerated at all and the panic screen remains the candidate (it resets after 20 s)"
        say "every poll of that window is on disk with its two answers, its landing class and the USB tree: $TIMELINE" ;;
   esac

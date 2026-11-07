@@ -7251,10 +7251,75 @@ def check_board(errors: list) -> str:
         errors.append(f"the silent path interpolates the class in {len(silent_closes)} of the 2 watches "
                       "that can close silent (watch_landing and watch_after_deadline): one of them would "
                       "still write a classless `neither`, and a reader cannot classify what was not said")
-    if 'closing=$(tail -n 1 "$TIMELINE"' not in script_text:
+    if "closing=$(timeline_last_close)" not in script_text:
         errors.append("the exit-6 verdict does not quote the timeline's own close line: re-measuring the "
                       "tree when the sentence is printed would describe the host at verdict time, and the "
                       "board may have moved on -- the reading is about the close")
+    # Round339b. Boot 120 proved that quoting the file is not the same as quoting the close line: the
+    # writer appends the USB tree underneath the close, so the line at the end of the file is a field of
+    # that tree, and the sentence that claimed to name the close named `id`. That is the shape layer 17
+    # warns about -- a needle pinned to an expression, satisfied by an expression that is wrong. So the
+    # old text needle is now a ban plus a run: the helper is cut out of the shipping script and executed
+    # against synthetic timelines, which is the only way this file can tell `tail -n 1` from a scan that
+    # restarts at each header.
+    quoted_close_ban = re.findall(r'closing=\$\(tail[^\n]*TIMELINE', script_text)
+    if quoted_close_ban:
+        errors.append(f"the verdict sentences extract the close from the end of the file in "
+                      f"{len(quoted_close_ban)} place(s), the first {quoted_close_ban[0][:70]!r}: the "
+                      "close line is not the last line -- timeline_close photographs the USB tree under "
+                      "it, and boot 120's run quoted a field of that tree as its own verdict")
+    closer = re.search(r"^timeline_last_close\(\) \{.*?^\}", script_text, re.S | re.M)
+    if closer is None:
+        errors.append("scripts/run-clover-unattended.sh has no timeline_last_close() block the gate can "
+                      "run: the verdict's reading of its own timeline would again be judged by looking "
+                      "for the characters it happens to contain")
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            # One case per thing the sentence claims. The first is boot 120's own shape: close line,
+            # then a tree whose rows have fields of their own. The second is the append across runs --
+            # the file is never truncated, so a scan without a header reset would quote an older
+            # window's verdict as this one's. The third is the window that never closed: the sentence
+            # must then say `no-close-line`, and a helper that fell through to the last close in the
+            # file would silently upgrade that to a reading.
+            closer_cases = [
+                ("close then the tree under it",
+                 "# watch after-deadline budget=2100s opened X\n"
+                 "# epoch elapsed adb fastboot event class\n"
+                 "1794036000 0 - - poll no-node\n"
+                 "1794036735 2220 - - close:neither-edl\n"
+                 "# usb at close (neither-edl)\n"
+                 "  | +-o F6548A52@01143000  <class IOUSBHostDevice, id 0x100003d11>\n",
+                 "close:neither-edl"),
+                ("an older window's close, this one still open",
+                 "# watch after-deadline budget=2100s opened X\n"
+                 "1794000000 2100 - - close:adb\n"
+                 "# usb at close (adb)\n"
+                 "  | +-o Mi Pad 4@0130000f  <class IOUSBHostDevice, id 1>\n"
+                 "# watch watch-landing budget=900s opened Y\n"
+                 "1794099000 120 - - poll no-node\n",
+                 ""),
+                ("two closes in one window, the last one is this window's",
+                 "# watch after-deadline budget=2100s opened X\n"
+                 "1794036000 0 - - close:neither-no-node\n"
+                 "1794036100 100 - - close:neither-edl\n",
+                 "close:neither-edl"),
+            ]
+            for name, contents, want in closer_cases:
+                path = pathlib.Path(tmp) / "timeline.txt"
+                path.write_text(contents)
+                probe = subprocess.run(
+                    ["bash", "-c", closer.group(0) + f'\nTIMELINE="{path}"\n'
+                     'printf "GOT[%s]\\n" "$(timeline_last_close)"'],
+                    capture_output=True, text=True)
+                got = ""
+                for row in probe.stdout.splitlines():
+                    if row.startswith("GOT[") and row.endswith("]"):
+                        got = row[4:-1]
+                if got != want:
+                    detail = f"; stderr {probe.stderr.strip()[-160]!r}" if probe.stderr else ""
+                    errors.append(f"timeline_last_close on {name} returns {got!r}, expected {want!r}: "
+                                  "the verdict sentence would name something other than this window's "
+                                  f"own close{detail}")
     reader_text = (REPO / "scripts/read-clover-log.py").read_text(encoding="utf-8", errors="replace")
     for label in ("wait-fastboot", "wait-adb", "watch-landing", "after-deadline"):
         if f'"{label}": {{' not in reader_text:
@@ -7316,7 +7381,7 @@ done
             if line not in probe.stdout:
                 errors.append(f"usb_landing_class does not return {line}: {why}; stdout was "
                               f"{probe.stdout.strip()[-300:]!r}")
-    quoted_closes = re.findall(r'closing=\$\(tail -n 1 "\$TIMELINE"', script_text)
+    quoted_closes = re.findall(r'closing=\$\(timeline_last_close\)', script_text)
     if len(quoted_closes) != 2:
         errors.append(f"the verdict sentences quote the timeline's close line in {len(quoted_closes)} "
                       "of the 2 places that can end silent (watch_landing and watch_after_deadline): "
