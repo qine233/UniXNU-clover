@@ -7236,6 +7236,136 @@ done
     if syntax.returncode:
         errors.append("scripts/run-clover-unattended.sh does not parse: "
                       + (syntax.stderr or syntax.stdout)[-700:])
+    # Round338 (#719). The reset record was sized by a comment: round283's author read the unclaimed
+    # IMEM gap as twenty words and the slot grew to exactly what the comment said. The gap is ten.
+    # What is pinned below is not the number -- it is that the number is DERIVED from two device-tree
+    # sources and attributed per word, so the next resize is measured against a map instead of
+    # against somebody's memory of one. The gate runs the script rather than grepping it (round337's
+    # N8 lesson: a substring pin is satisfied by the sentence that explains the substring), and it
+    # counts the children in each archived block itself, so a script that quietly compares the board
+    # tree with a copy of itself is caught by the counts disagreeing.
+    geometry = REPO / "scripts/test-clover-imem-geometry.py"
+    archive = REPO / "notes/sources/sdm660/imem-children.dts"
+    if not archive.is_file():
+        errors.append("notes/sources/sdm660/imem-children.dts is missing: the IMEM child map would "
+                      "again live only in a comment, which is what made round283's twenty words a "
+                      "claim instead of a reading")
+    elif not geometry.is_file():
+        errors.append("scripts/test-clover-imem-geometry.py is missing: nothing would say which "
+                      "child node owns the eight bytes under each word the reset record touches")
+    else:
+        archived = archive.read_text(encoding="utf-8", errors="replace")
+        blocks = re.split(r"^=== SOURCE", archived, flags=re.M)[1:]
+        if len(blocks) != 2:
+            errors.append(f"the IMEM archive carries {len(blocks)} SOURCE blocks, not 2: the map is "
+                          "supposed to be two-source, and one leg of a pair that is not a pair is a "
+                          "single source wearing a claim of independence")
+        else:
+            counted = [len(re.findall(r"^\s*[A-Za-z0-9_,.-]+@[0-9a-fA-F]+ \{", b, re.M)) - 1
+                       for b in blocks]
+            run = subprocess.run([sys.executable, str(geometry)], capture_output=True, text=True)
+            if run.returncode:
+                errors.append("scripts/test-clover-imem-geometry.py exits "
+                              f"{run.returncode}: " + (run.stderr or run.stdout)[-700:])
+            else:
+                report = run.stdout
+                parsed = re.search(r"children parsed: board=(\d+) vendor=(\d+)", report)
+                if parsed is None:
+                    errors.append("the geometry report prints no `children parsed: board= vendor=` "
+                                  "line: the two legs would be unnamed and a reader could not tell "
+                                  "one source from two")
+                elif [int(parsed.group(1)), int(parsed.group(2))] != counted:
+                    errors.append(f"the geometry script reports board={parsed.group(1)} "
+                                  f"vendor={parsed.group(2)} children while the archive holds "
+                                  f"{counted[0]} and {counted[1]}: the script would be parsing one "
+                                  "block twice, which is the round337 N8 shape again -- a check that "
+                                  "asks the same source twice")
+                for needle in ("two-source disagreements=0",
+                               "largest contiguous free run starting at the record offset",
+                               "imem geometry selftest:"):
+                    if needle not in report:
+                        errors.append(f"the geometry report no longer prints {needle!r}: that line is "
+                                      "the free-run size, the independence of the two sources, and "
+                                      "the claim that every word got attributed")
+                rows = re.findall(r"^\[\s*\d+\] {2}0x[0-9a-f]+ {2}(\S+)", report, re.M)
+                declared = re.search(r"(\d+) words touched by this driver", report)
+                if declared is None:
+                    errors.append("the geometry report does not say how many words it probed: a "
+                                  "table without its own row count is a scan whose scope is unknown")
+                elif len(rows) != int(declared.group(1)):
+                    errors.append(f"the geometry table has {len(rows)} rows but declares "
+                                  f"{declared.group(1)} words probed: the unattributed words are the "
+                                  "ones that matter")
+                elif any(row in ("", "UNNAMED") for row in rows):
+                    errors.append("at least one word in the geometry table has no owner: an "
+                                  "unattributed word reads as free space while a child node claims it")
+                span = re.search(r"child nodes the record spans: (.+?) \(asked about", report)
+                if span is None:
+                    errors.append("the geometry report names no cells the record spans and asked "
+                                  "about nothing: the overlap question would be unanswered again")
+        for needle in ("sdam", "PM660"):
+            if needle.lower() not in archived.lower():
+                errors.append(f"the IMEM archive says nothing about {needle}: what this board's tree "
+                              "does NOT declare is as much a fact as what it does, and round336's "
+                              "next hand was planned around a PMIC this board does not carry")
+
+        # The same instrument's second leg: what the words in this window MEAN, taken from the only
+        # kernel that writes them. drivers/CloverSdhci calls 0x77665501 kRestartFastboot on the strength
+        # of a comment about what `reboot bootloader` writes, and round338 found the value in the vendor
+        # table under `other`, the unrecognized-command arm and the no-command arm -- never bootloader.
+        # Pinned so the reading cannot survive by being written down once: the gate counts the writes in
+        # the archived file itself, re-reads the driver's own constant, and refuses a report whose value
+        # came from the report instead of from the source.
+        poweroff = REPO / "notes/sources/sdm660/msm-poweroff.c"
+        note = REPO / "notes/sources/sdm660/dload-and-restart-reason.md"
+        stats = REPO / "notes/sources/sdm660/boot_stats.c"
+        for path, why in ((poweroff, "the restart_reason values would have no authority to be checked "
+                                     "against -- the driver's own comment is not that authority"),
+                          (note, "the EDL and download-mode reading would have no artifact to point "
+                                 "at, and a reading that lives only in a round's prose is the round332 "
+                                 "shape again"),
+                          (stats, "the claim that boot_stats is read-only for the kernel would be a "
+                                  "claim about a file this repository does not hold")):
+            if not path.is_file():
+                errors.append(f"{path.relative_to(REPO)} is missing: {why}")
+        if run.returncode == 0 and poweroff.is_file() and stats.is_file() and note.is_file():
+            writes = re.findall(r"__raw_writel\(\s*(?:0x7766[0-9a-fA-F]{4}|0x0)\s*,\s*"
+                                r"restart_reason\s*\)", poweroff.read_text(encoding="utf-8",
+                                                                            errors="replace"))
+            report_written = re.search(r"restart_reason writes parsed from msm-poweroff\.c: (\d+)",
+                                       report)
+            if report_written is None:
+                errors.append("the geometry report says nothing about how many restart_reason writes "
+                              "it read: a table without its own scope is how `0 rows` means `not asked`")
+            elif int(report_written.group(1)) != len(writes):
+                errors.append(f"the report parsed {report_written.group(1)} restart_reason writes while "
+                              f"the archived vendor file holds {len(writes)}: the table is not being "
+                              "built from the file it names")
+            driver_value = re.search(r"kRestartFastboot\s*=\s*(0x[0-9a-fA-F]+)",
+                                     (REPO / "drivers/CloverSdhci/CloverSdhci.cpp")
+                                     .read_text(encoding="utf-8", errors="replace"))
+            reported_value = re.search(r"this port: kRestartFastboot = (0x[0-9a-fA-F]+)", report)
+            if driver_value and reported_value and \
+                    int(driver_value.group(1), 16) != int(reported_value.group(1), 16):
+                errors.append("the report names a kRestartFastboot value that is not the one "
+                              "drivers/CloverSdhci declares: the comparison would be about a number "
+                              "nobody ships")
+            boot_row = re.search(r"the value the vendor writes for `reboot bootloader`: "
+                                 r"(0x[0-9a-fA-F]+) \(line (\d+)\)", report)
+            if boot_row is None:
+                errors.append("the report no longer names the vendor's bootloader value and the line it "
+                              "came from: that pair is the finding, and without it the next round is "
+                              "back to reading a comment")
+            elif driver_value and boot_row.group(1).lower() == driver_value.group(1).lower():
+                errors.append(f"the vendor's bootloader value and this port's kRestartFastboot are now "
+                              f"the same word ({boot_row.group(1)}): round338's disagreement is closed, "
+                              "which is a reason to re-judge the constant's name and the flash-path "
+                              "claim, not to leave a stale pin green")
+            if re.search(r"\bwritel\b", stats.read_text(encoding="utf-8", errors="replace")):
+                errors.append("the archived boot_stats.c writes something: the note's reading that the "
+                              "kernel only reads those four KPI counters -- and therefore that zeroing "
+                              "them costs this board's own boot timing -- has to be redone")
+
     # Round268's second half: the shared-cache frame decoder, whose two constants decide whether it lies.
     # Scanning image headers one per 0x1000 found 825 of the cache's images and reported most real frames as
     # "in no image"; the cache packs headers every 32 bytes, so the scan has to find each magic occurrence.

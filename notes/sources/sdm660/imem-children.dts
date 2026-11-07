@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// The `qcom,msm-imem@146bf000` node and its eight children, verbatim from two independent sources,
+// archived so drivers/CloverSdhci's IMEM record layout can be checked against the address map
+// instead of against a comment. Round338.
+//
+//   SOURCE 1 -- the board's own flattened tree, decompiled:
+//       ~/uefi-clover/Resources/DTBs/clover.dts lines 5954..6000
+//       file sha256 (first 16) 7bab068da8788fc4
+//     This is the tree the shipping Xiaomi firmware booted with, taken off the device, so it is the
+//     authority for what this board's boot chain declares.
+//   SOURCE 2 -- the vendor kernel's own devicetree include, already in this repository:
+//       notes/sources/sdm660/sdm660.dtsi lines 2358..2404
+//       file sha256 (first 16) 4d84f5169e88d768
+//     (E7G/clover-sdm660-ksb @ 5c81a3faf37e332be5008512c9b2dc2444dbcc01, Xiaomi's 4.19 CAF tree for
+//     this exact tablet; see the provenance header of drivers/CloverPower/PowerRegs.h.)
+//
+// TWO NEGATIVE FACTS, MEASURED, AND BOTH OF THEM CHANGE A NEXT HAND.
+//
+//   (1) This board's own device tree declares no SDAM at all. The command is
+//         grep -c -i sdam ~/uefi-clover/Resources/DTBs/clover.dts
+//     and it prints 0 over the 16,612-line decompiled tree (grep -c '' on the same file). The PMICs the tree names are PM660 and
+//     PM660L -- `qcom,pm660@0` and `qcom,pm660l@2` under the SPMI parent, with duplicate units at
+//     @1 and @3 -- not the PM8998 that an earlier draft of this round's plan assumed. Round336's
+//     board-side next hand said "copy sheng's PMIC SDAM cell, but pin the PM8998 registers first";
+//     the pinning is what this archive is, and its first answer is that the peripheral round336
+//     planned to write to has no node on this board. sheng's BootResetCore.h is SM8550 arbiter v7
+//     and this board's arbiter reads v3 (section Round313), so the SDAM route is not "a different
+//     address" here -- it is a route with no declared door, and that is a negative result to carry
+//     forward, not a step to skip.
+//   (2) What IS declared in the same window, three bytes from the top of it, is `dload_type@1c`
+//     with compatible "qcom,msm-imem-dload-type": one 4-byte cell. This archive first called it "the
+//     download-mode arm cell", on the theory that boots 118 and 119 ending in EDL pointed at a memory
+//     word something arms. Round338 read the vendor code that owns the compatible and that reading is
+//     withdrawn: the only two values it is ever given are 0 and 2 (EMMC_DLOAD_TYPE), which select where
+//     a download ALREADY running goes -- cable or card -- and EDL itself is armed by an SMC into the
+//     secure monitor, whose own DT door ("qcom,msm-imem-emergency_download_mode") matches 0 times in
+//     both sources above. See dload-and-restart-reason.md for the lines, in this directory.
+
+// The two blocks list the same eight children with the same base and length numbers; the literal
+// spelling differs (source 1 prints every cell as a 0x-prefixed word with leading zeros, source 2
+// prints lengths as decimal), which is why scripts/test-clover-imem-geometry.py compares them as
+// integers and not as text. Line numbers here are provenance for a file this repository does not
+// edit; the bytes below are the excerpt, and the checker parses these bytes.
+
+=== SOURCE 1: the board's own decompiled device tree ===========================
+
+		qcom,msm-imem@146bf000 {
+			compatible = "qcom,msm-imem";
+			reg = <0x146bf000 0x1000>;
+			ranges = <0x00 0x146bf000 0x1000>;
+			#address-cells = <0x01>;
+			#size-cells = <0x01>;
+
+			mem_dump_table@10 {
+				compatible = "qcom,msm-imem-mem_dump_table";
+				reg = <0x10 0x08>;
+			};
+
+			dload_type@1c {
+				compatible = "qcom,msm-imem-dload-type";
+				reg = <0x1c 0x04>;
+			};
+
+			restart_reason@65c {
+				compatible = "qcom,msm-imem-restart_reason";
+				reg = <0x65c 0x04>;
+			};
+
+			boot_stats@6b0 {
+				compatible = "qcom,msm-imem-boot_stats";
+				reg = <0x6b0 0x20>;
+			};
+
+			kaslr_offset@6d0 {
+				compatible = "qcom,msm-imem-kaslr_offset";
+				reg = <0x6d0 0x0c>;
+			};
+
+			pil@94c {
+				compatible = "qcom,msm-imem-pil";
+				reg = <0x94c 0xc8>;
+			};
+
+			diag_dload@c8 {
+				compatible = "qcom,msm-imem-diag-dload";
+				reg = <0xc8 0xc8>;
+			};
+
+			ss_mdump@b88 {
+				compatible = "qcom,msm-imem-minidump";
+				reg = <0xb88 0x1c>;
+			};
+		};
+
+=== SOURCE 2: notes/sources/sdm660/sdm660.dtsi =================================
+
+	qcom,msm-imem@146bf000 {
+		compatible = "qcom,msm-imem";
+		reg = <0x146bf000 0x1000>;
+		ranges = <0x0 0x146bf000 0x1000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		mem_dump_table@10 {
+			compatible = "qcom,msm-imem-mem_dump_table";
+			reg = <0x10 8>;
+		};
+
+		dload_type@1c {
+			compatible = "qcom,msm-imem-dload-type";
+			reg = <0x1c 4>;
+		};
+
+		restart_reason@65c {
+			compatible = "qcom,msm-imem-restart_reason";
+			reg = <0x65c 4>;
+		};
+
+		boot_stats@6b0 {
+			compatible = "qcom,msm-imem-boot_stats";
+			reg = <0x6b0 32>;
+		};
+
+		kaslr_offset@6d0 {
+			compatible = "qcom,msm-imem-kaslr_offset";
+			reg = <0x6d0 12>;
+		};
+
+		pil@94c {
+			compatible = "qcom,msm-imem-pil";
+			reg = <0x94c 200>;
+		};
+
+		diag_dload@c8 {
+			compatible = "qcom,msm-imem-diag-dload";
+			reg = <0xc8 200>;
+		};
+
+		ss_mdump@b88 {
+			compatible = "qcom,msm-imem-minidump";
+			reg = <0xb88 28>;
+		};
+	};
+

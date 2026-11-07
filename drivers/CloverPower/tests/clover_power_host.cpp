@@ -271,11 +271,52 @@ static void setUp (int v3)
 static const uint32_t kPolls = 100000000;
 static const uint32_t kPollsNoAnswer = 5000;
 
+// Round338. The byte-pair legs used to be bare assert()s. That is the shape this file has for every
+// question with exactly one right answer, but these six asks have four moving parts -- the poll's own
+// return code, the two bytes, and which fake peripheral says it answered -- and an assert prints only
+// the line it died on. That mattered once measured: one invocation of the gate died at the v3 PM660L
+// line under host load, and nothing in the output separated "the channel arithmetic picked the wrong
+// peripheral" from "this machine starved the model thread between its write of RDATA and its write of
+// DONE". Eight further loaded runs of a variant that printed the operands saw no failure at all, so
+// the cause is not settled -- what is settled is that the next occurrence will name itself.
+// Round338. The burst legs used to be bare assert()s. That is this file's shape for every question with
+// exactly one right answer, but these six asks have four moving parts at once -- the poll's own return
+// code, the byte or bytes, which fake peripheral says it answered, and the STATUS word -- and an assert
+// prints only the line it died on. That cost something measurable: one run of the gate died at the v3
+// PM660L line under host load, and nothing in its output separated "the channel arithmetic picked the
+// wrong peripheral" (a driver defect, a finding) from "this machine starved the model thread between its
+// write of RDATA and its write of DONE" (a property of this host, not of the arbiter). Eight further
+// loaded runs of a variant that printed the operands saw no failure, so the cause is NOT settled here --
+// what is settled is that the next occurrence has to name which operand differed.
+static void require_burst (const char *where, int rc, uint32_t reported, const uint8_t *bytes,
+                           const uint8_t *want, unsigned count, int wantSid)
+{
+  unsigned i;
+  if (rc == PA_OK && lastSid == wantSid) {
+    for (i = 0; i < count; ++i) {
+      if (bytes[i] != want[i]) break;
+    }
+    if (i == count) return;
+  }
+  fprintf (stderr, "%s: rc=%d want PA_OK=%d status=%#x lastSid=%d wantSid=%d served=%u lastAddr=%#x bytes=",
+           where, rc, PA_OK, reported, lastSid, wantSid, (unsigned) readsServed, (unsigned) lastAddr);
+  for (i = 0; i < count; ++i) {
+    fprintf (stderr, "%02x ", bytes[i]);
+  }
+  fprintf (stderr, "want ");
+  for (i = 0; i < count; ++i) {
+    fprintf (stderr, "%02x ", want[i]);
+  }
+  fprintf (stderr, "\n");
+  assert (0);
+}
+
 int main (void)
 {
   struct pa_scan r;
   uint8_t buf[8];
   uint32_t status = 0;
+  int rc = PA_OK;
 
   // 1. The PPID formula itself. Four named PPIDs the driver looks up, and the arithmetic that has to
   //    produce them from the DT's (sid, base address) pair -- get the shift wrong and every lookup
@@ -416,9 +457,11 @@ int main (void)
   //    just the values -- word-first versus byte-first is invisible in a hex dump of the register and
   //    decisive in the report.
   rearm ();
-  assert(pa_read (&arbiter, 3, kPmicRev2 & kPmicArbCmdAddrMask, buf, 5, kPolls, &status) == PA_OK);
-  assert(buf[0] == 0x01 && buf[1] == 0x00 && buf[2] == 0x02);
-  assert(buf[3] == kPmicTypeValue && buf[4] == kPm660Subtype);
+  rc = pa_read (&arbiter, 3, kPmicRev2 & kPmicArbCmdAddrMask, buf, 5, kPolls, &status);
+  {
+    const uint8_t identity[5] = { 0x01, 0x00, 0x02, kPmicTypeValue, kPm660Subtype };
+    require_burst ("v5 identity burst", rc, status, buf, identity, 5, (int) kSidPm660);
+  }
   // The reported STATUS keeps the model's own bit 8, and that is worth asserting rather than
   // masking away: pa_status_code() only reads bits 0..3, so an arbiter that reports something else in
   // STATUS cannot change the verdict. lastAddr and lastSid say which peripheral the transaction
@@ -439,13 +482,20 @@ int main (void)
   // A read through the PM660L's own APID has to see the PM660L's bytes. There is no such mapping in
   // this model -- that is case 4 -- so use B3's high APID, which the map puts on sid 2.
   rearm ();
-  assert(pa_read (&arbiter, 400, 0x40, buf, 2, kPolls, &status) == PA_OK);
-  assert(buf[0] == 0xc0 && buf[1] == 0x0b && lastSid == (int) kSidPm660l);
+  rc = pa_read (&arbiter, 400, 0x40, buf, 2, kPolls, &status);
+  {
+    const uint8_t b3[2] = { 0xc0, 0x0b };
+    require_burst ("v5 B3 through the PM660L APID", rc, status, buf, b3, 2, (int) kSidPm660l);
+  }
   // And A11's enable comes from the sid-0 side, ON with EN0 following, which is the pair the driver
   // decodes as state=ON follow=01.
   rearm ();
-  assert(pa_read8 (&arbiter, 7, kLdoRegEnable, buf, kPolls, &status) == PA_OK);
-  assert(buf[0] == 0x81 && (buf[0] & kLdoEnableMask) && lastSid == (int) kSidPm660);
+  rc = pa_read8 (&arbiter, 7, kLdoRegEnable, buf, kPolls, &status);
+  {
+    const uint8_t a11[1] = { 0x81 };
+    require_burst ("v5 A11 enable", rc, status, buf, a11, 1, (int) kSidPm660);
+  }
+  assert(buf[0] & kLdoEnableMask);
 
   // 9. The three error bits stay three. DONE plus DENIED is an ownership answer, DONE plus FAILURE is
   //    a bus problem, DONE plus DROPPED means the arbiter never put it on the bus -- and a code that
@@ -514,18 +564,27 @@ int main (void)
   assert(r.words == 512 && r.mapped == 6 && r.irq_none == 0 && r.apid == 3);
   pthread_create(&thread, NULL, device, NULL);
   rearm ();
-  assert(pa_read (&arbiter, 3, kPmicRev2 & kPmicArbCmdAddrMask, buf, 5, kPolls, &status) == PA_OK);
-  assert(buf[0] == 0x01 && buf[1] == 0x00 && buf[2] == 0x02);
-  assert(buf[3] == kPmicTypeValue && buf[4] == kPm660Subtype && lastSid == (int) kSidPm660);
+  rc = pa_read (&arbiter, 3, kPmicRev2 & kPmicArbCmdAddrMask, buf, 5, kPolls, &status);
+  {
+    const uint8_t identity[5] = { 0x01, 0x00, 0x02, kPmicTypeValue, kPm660Subtype };
+    require_burst ("v3 identity burst", rc, status, buf, identity, 5, (int) kSidPm660);
+  }
   // The APID that reaches the PM660L side is the low one under this band's map -- 12, where v5 put it
   // at 400 -- and the byte pair still has to come back from pmicB, which is the assertion that says
   // the channel arithmetic picked the right peripheral rather than the right-looking offset.
   rearm ();
-  assert(pa_read (&arbiter, 12, 0x40, buf, 2, kPolls, &status) == PA_OK);
-  assert(buf[0] == 0xc0 && buf[1] == 0x0b && lastSid == (int) kSidPm660l);
+  rc = pa_read (&arbiter, 12, 0x40, buf, 2, kPolls, &status);
+  {
+    const uint8_t b3[2] = { 0xc0, 0x0b };
+    require_burst ("v3 B3 through the PM660L APID", rc, status, buf, b3, 2, (int) kSidPm660l);
+  }
   rearm ();
-  assert(pa_read8 (&arbiter, 7, kLdoRegEnable, buf, kPolls, &status) == PA_OK);
-  assert(buf[0] == 0x81 && (buf[0] & kLdoEnableMask) && lastSid == (int) kSidPm660);
+  rc = pa_read8 (&arbiter, 7, kLdoRegEnable, buf, kPolls, &status);
+  {
+    const uint8_t a11[1] = { 0x81 };
+    require_burst ("v3 A11 enable", rc, status, buf, a11, 1, (int) kSidPm660);
+  }
+  assert(buf[0] & kLdoEnableMask);
   stopModel = 1; pthread_join(thread, NULL);
   // A v3 channel is 0x8000 apart, so APID 7's block starts at 0x38000 of the observer window. If the
   // driver ever used the v5 stride under a v3 version word, it would be polling a command register

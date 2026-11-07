@@ -27932,6 +27932,9 @@ beatmagic=801a086e432839b2`，历史那批的 `magic=` 低 32 位反复出现 `0
   配套 `package/tests/boot_reset_host.c`）。它那张表是 SM8550 的**仲裁器 v7** 布局，我们这颗是 **v3**（§Round313 量的），
   所以照搬之前必须先把 SDM660/PM8998 的 SDAM PPID 与寄存器从我们自己的 DT 与厂商源里钉出来——**没钉出来之前不许写码**，
   否则就是把「我们的字节」写进别人的另一格。CloverPower 已经有仲裁器与 `readAt()` 通路，缺的是事实不是管道。
+  > **§Round338 ④ 就地改正这两枚前提**：这颗板的树里 **PMIC 是 PM660/PM660L，没有 PM8998**，且 `grep -c -i sdam` 在 16,612 行的
+  > `clover.dts` 上印 **0**——所以这一手不是「地址不同」，是**这条通道在本板没有声明的门**。上面那句「没钉出来之前不许写码」
+  > 现在有了答案，钉出来的结果是阴性结论，照 §Round338 ⑥ 收成「一枚名字错了、一个消费者没被命名」，不许再当步骤跳过。
 
 **⑤ 刷写闸门（本轮自加的一条硬规矩）。** boot 119 的卡还没读，而冷刷 `cache` 分区正是**覆盖那块卡**的那只手——
 所以在 `--skip-recovery` 读到 boot 119 之前，**任何新镜像都不许刷**（构建与归档照旧可以，r311/r313 那种「不刷写」轮
@@ -27991,3 +27994,136 @@ N2/N8 那两支正在把分类器换成 `NOTHING_MATCHES_THIS` / `printf 'no-nod
 51 OK / 0 FAIL），下一次上机仍是 `--skip-recovery` 读 boot 119，而**从下一次无人值守运行起**，poll 行自带类别，
 「复位后立刻进 EDL」与「预算走完时才进 EDL」将第一次成为两个可区分的读数。
 板上那一手（PMIC SDAM 换通道）照 §Round336 ④ 排在 boot 119 读回之后，且没钉出 SDM660/PM8998 的 v3 事实之前不写码。
+> 这一句的两枚前提后来都由 §Round338 ④ 改成在盘读数（本板 PMIC 是 PM660/PM660L、树上 `sdam` 计数 0），
+> 且那句「读回之前不许刷」的硬闸门由 §Round338b ① 结掉（boot 119 已读回）。
+
+## Round338（#719，纯宿主事实轮，发版为 v0.7.55：不发镜像、不写驱动码、不刷写——把 §Round336 排在板内的那一手换成在盘读数）
+
+证据目录 `~/clover-out/round338-sdam-facts/`（八份：几何仪器原字、r283 sightings 重归因、心跳正对照那一腿、
+仲裁器负载腿、实时总线类别、闸门原字、二十一支负测）＋ `~/clover-out/round338-boot119-readback/`（本轮内 boot 119
+读回的推导三份，见 §Round338b）。
+
+**① 厂商源先落到盘上，因为「没钉出来之前不许写码」这条规矩要有可核的落点。**
+新增 `notes/sources/sdm660/msm-poweroff.c`（734 行，sha256 前 16 `febf2eccb8526a4e`）、`boot_stats.c`（105 行，`4fd7113b1755f4dc`）、
+`qpnp-power-on.h`（142 行，`c6c27856db96ea9c`）。`imem-children.dts` 那两源八子节点上一轮已在盘，本轮把它从「注释里的断言」
+变成一台可复跑仪器的输入。**归档的规矩这轮才第一次被写全**：`notes/sources/sdm660/dload-and-restart-reason.md` 的出处段
+只点本仓在盘的文件，不在盘上的树一律显式标成「未归档」——上一轮的出处句里混着一条只存在于别人机器上的路径。
+
+**② 几何仪器量出来的不是「二十枚字」，是「二十枚里有六枚不是我们的」。**
+`scripts/test-clover-imem-geometry.py` 逐枚给每一枚字找主人，两源各数一次，报
+`children parsed: board=8 vendor=8; two-source disagreements=0`（整数比较，不按文本；两源的拼写本来就不一样）。
+`restart_reason@65c` 占 4 字节 ⇒ 空隙从 `0x660` 起；记录声明 20 枚字、跨 `0x660..0x6ff`；
+**从记录偏移起最大连续空闲段 = 80 字节 = 10 枚字**；20 枚里 6 枚的八个字节不是全空闲（其中 2 枚是本驱动带下标的写、
+4 枚只被读），记录跨过 `boot_stats@6b0` 与 `kaslr_offset@6d0` 两颗子节点。第 15 枚（`0x6d8`）印成 `free|kaslr_offset@6d0`
+——它是那把尺子唯一肯说「这一格两边都沾」的一枚。r283 那条记录按注释定过尺寸，注释当时说二十枚；**下一手收缩记录的分母从此是 10，不是谁的记性**。
+配套两条硬事实：`boot_stats.c` 在本仓归档里 `writel` 计数为 0（内核只 `readl_relaxed`），所以那格是**固件写、我们读**；
+`store_kaslr_offset()`（`msm-poweroff.c:274-290`）在 `CONFIG_RANDOMIZE_BASE` 下往 `kaslr_offset@6d0` 写 `0xdead4ead`＋slide。
+而驱动的 boot-start 是无条件 `for (i = 0; i < 20; ++i) record[i] = 0;`——**它清的那 20 枚里有四枚是别人的**。这是第五层「混血记录」在这颗板子上的具体地址。
+
+**③ §Round336 那两列 `beat=`/`beatcnt=` 的主语在这轮被改掉了（不是改口径，是改对象）。**
+`r283-sightings-reattributed.txt`：24 枚 sightings 的 `words[10]` min=`395,308,790,008,836` max=`502,588,483,132,858`，
+`words[11]` 极差 `5,888,802,820` ticks ＝ 本板 19,267,584 Hz 下的 305.6 s，两者比值跨靴 min 289.0 / max 367.6 / stdev 15.1
+——**不是同一枚钟的两种看法**。而 `words[10]`=0x6b0、`words[11]`=0x6b8 正落在 `boot_stats@6b0`（`reg = <0x6b0 0x20>`，两源都声明）里，
+所以那两列读的是 boot_stats 的格子，一格两个写手（我们的心跳每拍 +1、固件 owns 这格）。这同时解释 r336 那个「全零」判据为什么两头都定不了罪：
+零要两个写手同时不写。`words[9]`=0x6a8 **确实**在两源都未认领的空闲段里，而印它的那 19 枚里 0 枚等于 `BEAT283`。
+
+**④ 两枚阴性，两枚都会改下一手：这颗板上没有 SDAM，PMIC 也不是 PM8998。**
+`grep -c -i sdam ~/uefi-clover/Resources/DTBs/clover.dts` 在 16,612 行的反编译树上印 **0**；这棵树在 SPMI 下声明的外设是
+`qcom,pm660@0` 与 `qcom,pm660l@2`（另有 @1/@3 重复单元）。§Round336 ④ 排的那一手写的是「照 sheng 换 PMIC SDAM 通道，先把 PM8998 的寄存器钉住」，
+**这轮的回答是：那条路在这颗上没有声明的门**。sheng 的 `BootResetCore.h` 是 SM8550 仲裁器 v7、本板读 v3（§Round313），
+所以这不是「换个地址」，是一整支要换题面。流水日志里那两处（本节上方 §Round336 末段与 §Round337 ⑦）已就地按新事实改正并指向本节，
+不在新章节里假装它们从来没写过 PM8998。
+
+**⑤ 本轮自己撤回自己的一条（写下来是因为它是「猜得像读数」的形状）。**
+`imem-children.dts` 上一版把 `dload_type@1c` 写成「EDL 上膛格，厂商内核用 `drivers/soc/qcom/dload_mode.c` 驱动它」。读了 `msm-poweroff.c` 之后：
+那颗文件在 clover 4.19 CAF 树里**不存在**（`ls | grep -ci dload_mode` = 0），`+0x1c` 是**下载目的地**选择（`EMMC_DLOAD_TYPE 0x2` 在 :388、
+清 0 在 :390、回读在 :362-366、按 compatible 映射在 :311），与「进不进 EDL」无关。EDL 那一支是 `enable_emergency_dload_mode()`
+（:202-227）＝ `scm_set_dload_mode(SCM_EDLOAD_MODE, 0)`，**一条 SMC 进 TrustZone**；它的内存腿要
+`qcom,msm-imem-emergency_download_mode`，而 `emergency`/`download_mode` 在 `sdm660.dtsi`（2,941 行）与 `clover.dts`（16,612 行）里都数到 0
+（`dload` 数到 4，全是上面这些）。⇒ 归档里那段已改成撤回声明并指向新笔记。**这不证明 EDL 不可达，只证明它不是一条设备树地址线。**
+
+**⑥ `kRestartFastboot` 的名字与厂商给它的标签不一致，而且这条现在由仪器每次实跑判。**
+`reason_table()` 把 12 枚 `__raw_writel(…, restart_reason)` 逐枚归臂（cmd 串 7、`in_panic` 1、无条件 `else` 2、无分支开口的 2，其中 1 枚在 `#if 0` 里）：
+`0x77665501` 出现三枚（`:557` 标 `other`、`:572`/`:580` 两处无条件 else），**厂商把 `reboot bootloader` 写的是 `0x77665500`（:522）**；
+报告原字 `agreement check: our value is labelled bootloader by the vendor in 0 of 3 rows that write it (asked about 12 writes, 1 of them compiled out)`。
+这证到哪一步：我们的常量**命名**错了，而且这枚值的真实语义是「其它/没认出的命令/没给命令」。**这不证** fastboot 落回是别的原因——
+PMIC `PON_SOFT_RB_SPARE` 那条通道本仓一次没读过，而 boot 118/119 落 EDL 发生在我们根本没跑到那一步的靴子上。结论收成一句：一枚名字错了，一个消费者没被命名。
+
+**⑦ 本轮造出来又自己修掉的仪器（两处都是同一枚错的两版）。**
+`reason_table()` 第一版「往上找最近的一行像条件的」把 `:580` 那枚无条件 `} else {` 的写标成了 `in_panic`——**它会把 `0x77665501` 报成 panic 值，
+正是这张表存在的目的所要避免的那件事**。第二版改成「最近的分支开口」，又给 `:690` 那枚探针写挂上了一支作用域已经关闭的 else。
+第三版按**大括号深度归属**：记录每枚开口的体深度，取深度等于该写所在深度的最近一枚开口；条件编译栈不闭合或结束时花括号不为 0 就直接 raise。
+教训并进仪器那一层：**一枚标签要从包住这行写的分支里取，不能从最近的一行、也不能从最近一枚「长得像分支」的一行取。**
+
+**⑧ 仲裁器宿主模型那枚 flake：没复现，但从今往后它自己点名操作数。**
+`~/clover-out/round338-sdam-facts/arbiter-harness-load-flake.txt` 记四段：观察（16 次闸门调用里 1 次整枚 gate 返回 1，
+红在 `clover_power_host.cpp:525` 那枚 v3「B3 走 PM660L APID」的断言上，连带 N10/N13 两支被别人的错判红＝r331b 形状）；
+复现尝试（诊断副本满载跑 8 次，8/8 exit 0、零 DIAG 行；改动落地后 idle 与 loaded:10 两趟都过）；本轮改了什么（六枚 burst 走
+`require_burst()`，红之前把 `rc/status/lastSid/served/lastAddr/bytes/want` 全印出来）；以及**负测证明它会为自己的原因红**：
+把一枚期望字节翻成 `0xc0→0xbf` 后 `exit 134` 并印 `v3 B3 through the PM660L APID: rc=0 … bytes=c0 0b want bf 0b`。
+下一枚红的读法也写进去了：`lastSid != wantSid` 或字节错而 lastSid 对＝算术问题活着；`rc == PA_E_POLL`＝这台机器；
+字节错而 lastSid 对且 rc 正常＝模型在 RDATA 可见之前发了 DONE，那是 harness 的内存序问题，要 harness 自己回答。
+
+**⑨ 闸门与负测**。`scripts/check-clover.py` 这轮加四枚针脚：几何脚本**被跑起来**而不是被 grep（r337 N8 的教训：子串针脚会被「解释那枚子串的句子」喂饱）、
+两源子节点数由闸门自己数再与脚本报的 `board= vendor=` 比、驱动常量从 `drivers/CloverSdhci/CloverSdhci.cpp` 读出来与报告里那枚比、
+以及「厂商叫 `bootloader` 的那一枚若等于我们的 `kRestartFastboot` 就判红」（把本轮的分歧留成回归钉）。
+`scripts/test-clover-716-negatives.py` 加 N17–N21：删归档／在 `boot_stats.c` 注入 `writel`／把几何脚本的模式收窄到只剩 `0x7766…`（数到 11 而文件有 12）／
+把常量换成 `0x77665500u` 并同时钉住闸门那一行／把 harness 期望字节翻错。整套 **21 支逐条为自己那条原因判红、逐条字节还原**（`negatives.log` 末行 0 problem）。
+两侧闸门：先 `unixnu tree --device /Users/zhouzhou/UniXNU-clover`（TREE_EXIT=0，因为本轮改了 `scripts/*`），
+仓库侧 `check-clover.py` EXIT=0（`citation shapes banned in 34 authored sources`），树侧 EXIT=0（`12 archives, 22 objects ABI-checked`）；
+`verify-clover-payload.py` 对 **r335 归档那枚**重跑 **51 OK / 0 FAIL**——本轮没有新镜像，内核／负载／boot-args 一字未动。
+
+**⑩ 下一手从此有了分母**（要一次刷写才看得见，属 r339 之后的可刷写轮）：IMEM 记录按实测的 10 枚空闲字收缩、
+boot-start 别再清 `boot_stats`/`kaslr_offset` 那四枚、`kRestartFastboot` 要么改名要么换值（换值会改变板上落回模式，正是需要预登记判据的那种改动），
+外加 r336 欠的那枚正对照：写 `restart_reason@65c` 之前与之后各读一次、当场印出来。
+
+## Round338b 读数（boot 119 的卡读回来了：§Round335 四支判据第一次全部判得成，那条刷写闸门从此关闭）
+
+证据 `~/clover-out/round338-boot119-readback/`（`bbswap-and-factory-rows.txt`、`presented-per-boot.txt`、
+`verify-r335-archive-after-readback.txt`），产物 `~/clover-out/round335-boot119-window.bin{,.txt,.timeline.txt}`。
+
+**① 通路是 13 秒落回，不是 2221 秒沉默。** 今天 10:42 那一趟跑到 `after-deadline` 的 `close:neither`（2221 s）为止；
+13:04 这一趟板子已在 fastboot（`product: clover`、`serialno: 81ffcaaa` 先核过），走 `--allow-misc-bcb` 且**不带** `--flash-cache`，
+`watch-landing` 那一段 13 s 落进 TWRP 的 adb，dd 只读取卡。卡上 boot 计数 sector 印 **119** ⇒ 这是 boot 119 自己写的数，不是重刷的靴。
+r337 那枚分类器第一次在真通路上被跑到：poll 行六枚字段、两枚 `no-node`（TWRP 枚举成 `MI PAD 4@01143000`，不是任何 Qualcomm 节点，所以 `no-node` 是正读）。
+**§Round336 ⑤ 那条「读回 boot 119 之前不许刷任何新镜像」的硬闸门到本节为止结掉。**
+
+**② A 支（#694 逐 hop）：判据的前提这靴变了，所以 A1 记空判。**
+本靴 r328 行是 `hn=3 rnamed=3 rasked=3 v=4603.7203.400b.0 … e=17.17.17.0`——**不是 boot 117/118 的 4**。
+A2 成立：`hop=0/1/2` 三枚全 `scan=xlate e=17 sr=0 q=0`，`nm=` 依次 `4603/7203/400b`，与本靴 `v=` 的前三枚同序，逐枚对上 `e=17.17.17`。
+A3 的读法是「行数 = `cand=`」：每 fire 3 枚候选、卡上 3 枚行 × 3 次 fire = 9 枚，**没有缺行**，那个 0 是 hop 数真的少了一枚，不是被预算吃掉。
+A1（`hop=3` 那枚翻译得通的正对照）**前提没成立**，按第二十四层记空判、不记通过。`probed=0 scanned=0 hits=0` 照在 ⇒ S-E 那支（两条 translate 都不通）第三次复现。
+
+**③ B 支（本轮真正的收获）：`e00002d5` 第一次有了它自己的解释形状，而且是两条不同生产者的腿。**
+4 枚 `clover r335: bbswap`、旧串 `clover r333: bbswap`/`bbswapcut` 各 0 枚（B1 的负针脚过）。逐枚：
+
+| ms | opt | ret | arg | done | cur | list |
+|---|---|---|---|---|---|---|
+| 545915 | 80000003 | 00000000 | 0 | 0 | 0 | 0 |
+| 564340 | 1 | 00000000 | 1 | 1 | 0 | 0 |
+| 564406 | **80000000** | **e00002d5** | 1 | 1 | 0 | 0 |
+| 567619 | 80000001 | 00000000 | 2 | 2 | 0 | 0 |
+
+B2 成立（唯一那枚 busy 行 `arg==done`），**B3 成立**（`opt=80000001` 且 `arg==done` 那枚返 0），④ 那三支也各有读数：
+`opt=0x1` 那枚返 0（这一支第一次不是空判）、`opt=80000003` 走特殊查询返 0 且 `pw=1 ps=0` 与判据同形、`e00002d6` 0 枚（记名不记结论）。
+第二条腿不是我们自己的打印：厂商侧那行 `clover r180: client pid=58 selector 6 1 80000000 0 -> e00002d5 done=1 presented=1`
+把同一个调用的 **arg=1、opt=0x80000000** 独立报了一遍，四枚 1:1 全对上（`arg` 4/4、`opt` 4/4）。
+`cur=0`（`display+0x1560`）与 `list=0`（`+0x1568`）在 4/4 枚里都为零，所以 B4 那一支的读数是：
+**这枚 swapID 已经被 retire（done==arg，厂商自己那行也报 `done=1 presented=1`），而家族既没有当前对象也没有 pending 链**——
+`e00002d5` 不是「帧还在飞」，是「latch 停在那个数上、而链是空的」。`pw=1 ps=0` 与 `sent=0`、`np0..np5` 全 `null` 都照 boot 117 的形状复现。
+
+**④ 我自己差点犯的一格（不写掉它就等于把它留给下一轮）**：我拿 boot 117 那 38 枚旧行的 `swap=` 反推调用计数器，想用它复核 B2——
+旧列**恒 0**，反推出来的计数器也恒 0，于是 `counter==done` 对每一枚平凡成立。那不是复核，是「拿 A 问 A 自己」（第二十四层那一枚）。
+所以 B2 只由本靴判；旧靴没有 `done=` 这一列，结构上判不了，`arg=` 与 `swap=` 也不是同一个量（一个是入参、一个是调用后的 latch）。
+
+**⑤ 桌面这一格：boot 119 走得比 117/116 短，而且短的地方正好在这段之后。**
+`presented-per-boot.txt`（枚数按产物里印出的十六进制原字比，不做十进制换算；周期行 30 s 一枚，所以它是下界）：
+boot 116 周期行 max `12/12`、boot 117 `00/00`（另有 8 枚厂商行 max `04/04`，且本档案里那枚最后周期行是被拼行切的，解析不出）、
+boot 118 `02/02`＋厂商 `04/04`、**boot 119 `01/01`＋厂商 `02/02`**。本靴最后一枚周期 `dispstate` 在 565.0 s，之后卡上到 583.7 s 结束。
+⑤ 读者侧：`tee lines: 512 stamped=501 glued=11`，501+11 = 512 ⇒ 没有我还没认出的第三种形状；11 枚胶合里举例三枚中含我们自己的 `clover r221: sbm2` 行。
+本靴静默复位照旧：死线记录仍是 boot 108 的、两枚 panic marker 全 STALE、无 drain-in、无句子行。
+
+**⑥ 由此排到下一轮的（要板子，按 §Round336 ⑤ 关闭后可以刷）**：① 的收缩与 ② 的命名改动；
+③ 那一格缺的仪器是「`done` 停在 arg 上时，谁会把它推进」——现在知道 retire 已经发生（presented=2），
+所以 `e00002d5` 的等待方与退休方不是同一枚 latch，题面从「帧没退休」换成「退休了但 latch 没人推进」，
+这条要在镜像里问 `display+0x16bc` 的写手，宿主侧已能解码（`scripts/decode-clover-slide.py` 命名帧）。
