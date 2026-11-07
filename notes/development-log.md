@@ -27788,3 +27788,97 @@ kind-22 记录在驱动环里**每一枚本来都该带 msgbuf 戳**，所以 `s
 两者相加等于总枚数（512）就是「没有第三种我还没认出来的形状」。证据 `~/clover-out/round335-build/reader-699-on-boot118.log`。
 判据 §⑤ 那一支现在可执行：boot 119 若 `glued>0` 是复现，若 `glued=0` 也是读数（本靴的 msgbuf 没被无换行文本拼过），
 两种都不许写成通过或未通过——它判的是形状，不是成败。
+
+## Round335 读数（boot 119：又是 EDL，卡没读回来；四支判据全部记「未判」，本轮转宿主侧 r335b）
+
+**① 这一跑怎么结束的，只引用盘上文件。** `~/clover-out/round335-boot119-unattended.log`（1,326 B）以
+`UNATTENDED_EXIT=6` 收。时间线 `~/clover-out/round335-boot119-window.bin.timeline.txt`（11,824 B）三段：
+两枚 `wait-fastboot` 各在 0 s／4 s 以 `close:fastboot` 收（`81ffcaaa`，刷写通路本来就该走通的那两棒），
+`after-deadline` 段 37 拍 poll 逐拍都是 `- -`（两把工具同时为空），收段那一行是
+
+    1794021554 2221 - - close:neither
+
+而它下面那张 `# usb at close (neither)` 全树里，最里一层挂着
+`QUSB_BULK_SN:F6548A52@01143000`。2221 s 对 2220 s 预算——和 boot 118 的 `close:neither` 同一枚溢出形状，
+同一枚 EDL 节点。**所以本靴落进的是 §Round330 ⑦ 的 T-B（板子复位、被宿主枚举进下载模式），不是 T-A（晚落回）、
+也不是 T-C（从没枚举）。**
+
+**② 四支判据一律记「未判」，不记阴性、不记通过。** §Round335 的 A 支（#694 逐 hop 四枚 `clover r331: bbsend`）、
+B 支（#698 `clover r335: bbswap` 的 `arg=`/`done=`/`cur=`/`list=` 与 B1–B5）、④ 那三枚空判预登记、⑤ 的胶合计数，
+主语**全是卡上文本**；本靴的卡一次没读回来 ⇒ 这四格现在没有任何一支被支持或被排除，写「0 枚」也不许，
+因为那 0 枚产自「没问」而不是「问了说没有」（第十三层：窗口 grep 只证得出在场的东西）。
+未判不丢东西：卡还在板上，boot 计数器已经是 119，带回 TWRP 后 `--skip-recovery` 一次 dd 就读到——boot 118
+正是这样读回的（那一靴也先 `close:neither`，物理带回 TWRP 后卡上确实有它那一板的行）。
+
+**③ 这一格不是仪器失败，但它是仪器的沉默。** 时间线本身答对了它该答的：两分廿一秒里宿主既没看见 adb 也没看见
+fastboot，且收段那一刻总线上有一枚高通 bulk 节点。问题在于这句话当时是**我从那张树里推断出来的**，产物自己只
+写到 `close:neither` 为止：类别（EDL／Diag／什么都没落）在宿主的判读里，不在读回通路的字里。同一个 `neither`
+字符串在三种情况下都会写出来——板子进 EDL、板子落进 diag/qdss、板子这次真的什么都没枚举（那才是「复位没发生或
+没到这宿主的线上」）——而这三者关于本靴卡读的含义完全不同：前两枚意味着「卡读得到，只是要人去把它带回 TWRP」，
+第三枚意味着「这一板可能根本没跑起来」。⇒ 记成 #716，本轮做掉。
+
+**④ 下一手。** 物理侧：长按电源把板子从 EDL 带回 TWRP（boot 118 同一手，我在 5 分钟的复拍里确认它不会自己回来），
+然后 `run-clover-unattended.sh --skip-recovery --out ~/clover-out/round335-boot119-window.bin` 读回，按 §Round335
+预登记逐格判。EDL 侧的读写（firehose 刷写／memdump）本轮**不做**：那是不可逆的写通路，也不是本项目用过的通路。
+托管期间物理那一手做不到 ⇒ 转宿主侧 r335b。
+
+## Round335b（#716：读回通路的沉默现在自己说出它是哪一种沉默；纯宿主轮，不发镜像）
+
+**① 写侧：沉默收段带上它自己的类别。** `scripts/run-clover-unattended.sh` 新增 `usb_landing_class()`，
+按收段那一刻的 USB 全树返回 `edl`（`QUSB_BULK|QPS6000|HS-USB.*9008`）／`diag`（`diag|qdss|900e`）／`no-node`
+（三枚都不在）。`watch_landing()` 与 `watch_after_deadline()` 两枚静默收段都改成
+`timeline_close "neither-$(usb_landing_class)" "" ""`，卡上那行从此是 `close:neither-edl`。
+为什么只有这两枚：另外两枚等待窗（`wait-fastboot`/`wait-adb`）本来就有自己的成功句与失败句，它们不会静默收段；
+把类别塞进四枚里，等于让一格里出现两个生产者（第十八层：被删的字与必在的字要分清是谁写的）。
+
+**② 判决句不许重新测量。** exit-6 那句现在先 `closing=$(tail -n 1 "$TIMELINE" | awk '{print $5}')`，
+再把这一串引回句子里（`that window closed as ${closing:-no-close-line}, quoted from the timeline's own
+close line`）。原来那一句是「the board may be sitting on the panic screen」——一个关于板的猜测；
+现在它是关于**那次收段**的读数。判据不许在打印时重测总线（第二十二层同源：判决时重测描述的是判决那刻的宿主，
+而板子可能早就动了；r334 控制轮里这类「事后重测」已判过一次）。`no-close-line` 那一支也留着：引不到就明说引不到。
+
+**③ 读侧：每个 label 要说清它排除到哪一层。** `scripts/read-clover-log.py` 新增 `WATCH_READINGS`，按
+**（watch，close 后缀）** 两枚键住：同一个 `neither-edl` 在 `watch-landing` 与 `after-deadline` 说的是两个不同的
+结论（前者＝死线到点前板子就复位了，后者＝死线过了、两把工具都没等到、但板子落在下载模式），所以判据按 watch 分键，
+不按 label 分键（第二十五层：一列的含义依赖另一列取值时，按那一列分键）。`no-node` 那一支的句子只说到宿主：
+「这一板可能根本没跑起来，也可能复位没到这条线上」，不许写成关于板的结论。
+
+**④ 旧产物不许因为「当时没写类别」而被咽掉。** boot 118/119 两份时间线里的 `close:neither` 是修正之前写下的。
+读者现在从**同一次运行自己那张 `usb at close` 树**派生类别，并在句子里明说是派生的：
+`(class derived from this run's own \`usb at close\` tree, not reported by it)`。
+派生而不是「补写」：产物里的字一个没改，读出来的是这份文件本来就带着的证据；而「不是它报的」这一句必须留着，
+否则读者会以为写侧当年就分了型（第十八层：契约说的必须是产物自己说的）。真的没有 close 行时印
+`UNKEYED=[watch-name/label]`，不猜。
+
+**⑤ 实测，不是断言。** 三条真实读数（都在 `~/clover-out/round335b-gate-evidence/`）：
+`boot118-timeline-read.log` 与 `boot119-timeline-read.log` 各自把那一枚 classless `close:neither` 读成
+`after-deadline/neither-edl=1` 并带派生说明；`live-usb-tree-at-r335b.txt` 是判据写下那一刻的总线全树，
+`usb_landing_class()` 实时返回 `edl`（板子现在仍躺在下载模式里）⇒ 分类器不是只对着两份旧文件调出来的。
+三条阴性对照同轮跑过：摘掉 `QUSB_BULK` 那支 grep ⇒ `no-node`；把 `QPS6000` 换成 `diag` ⇒ `diag`；
+三枚都不在 ⇒ `no-node`。`scripts/test-clover-716-negatives.py` 六条负测逐条判红、还原后逐字节同、并各跑一遍
+证明恢复后 EXIT=0（`negatives.log`）：N1 删函数、N2 不找 bulk 节点、N3 `after-deadline` 留成无类别（闸门数得出
+「两枚静默等待里只有 1 枚带了类别」）、N4 判决句改回重测、N5 读者摘掉 `wait-adb` 那把键、N6 读者不再跑时间线那段。
+**N6 第一次翻车翻在闸门上**：针脚原本是 `"timeline_selftest()" in reader_text`，被 `def timeline_selftest():`
+那行逐字满足 ⇒ 把函数删空、留个定义也能过。改成锚在调用行上的 `^    timeline_selftest\(\)$`。
+这是第二十二层那句「存在性针脚与禁则不能同一种判法」的又一枚实例，也是本轮唯一一处**针脚自己**判绿了错的东西。
+
+**⑥ 闸门钉住了什么。** `check-clover.py` 现在要求：`^usb_landing_class\(\) \{` 在、`QUSB_BULK` 在、
+`timeline_close "neither-$(usb_landing_class)" "" ""` **恰好两枚**、`closing=$(tail -n 1 "$TIMELINE"` 在、
+`WATCH_READINGS` 四把 watch 键逐一在、以及上面那枚锚死的调用行。`bash -n` 那一腿照旧跑（第二十一轮立的规矩：
+这颗脚本的语法以前只由「在被测对象的钟上跑一次」来测）。双闸门与负载校验本轮都重跑过：
+`check-clover.py` EXIT=0（15 条 notice，全指向未构建的产物）、`read-clover-log.py --selftest` EXIT=0 且新增一行
+`timeline selftest: three watches, both close paths, the derived-class note and the unkeyed name all ok`、
+`verify-clover-payload.py` 对 r335 那枚归档 51 行 OK／EXIT=0（产物一字未动，纯宿主轮不是哈希轮，第二十三层）。
+
+**⑦ tree 侧那一跑差点又是一句「过闸门而说假话」，是本轮自己踩出来的。** 本仓 README 那一格历来写「仓库侧与
+tree 侧都 EXIT=0」。r335b 第一次跑 tree 侧确实 EXIT=0——但那次判的是**陈旧的副本**：`out/clover/tree/scripts/`
+是 `scripts/unixnu/tree.py:92` 装配时从基仓与设备仓**拷**进去的（不是 symlink），纯宿主轮没有构建，所以 tree 里
+那份 `check-clover.py` 停在 r335 构建那一刻（`usb_landing_class` 0 处）、`run-clover-unattended.sh` 停在 11-05
+（同样 0 处）。两侧都绿，绿的是同一句判据在两台机器上——其中一台根本没装这条判据。
+处置：`/opt/homebrew/bin/python3.13 ./unixnu tree --device /Users/zhouzhou/UniXNU-clover`（TREE_EXIT=0）重装配，
+再跑 tree 侧 ⇒ `check-clover.py` 的 #716 针脚数与设备仓逐字同（`usb_landing_class` 4 处）、`read-clover-log.py`
+与设备仓 `md5` 逐字节同（`533f32bd…`）、tree 侧 EXIT=0。
+⇒ **今后凡是只改 `scripts/*` 的宿主轮，跑 tree 侧之前必须先来一次 `unixnu tree`**；否则那一格写的「两侧」只是
+同一个仓库被数了两遍（第二十一层「找到第一枚就停的扫描分不清一枚与一枚也没有」的镜像版：跑了两次检查分不清
+两条判据与一条判据）。顺带一条：`--device` 收的是**目录**，`--device clover` 会被解读成 `/Users/zhouzhou/UniXNU/clover`
+并直接报 `has no board.toml`（TREE_EXIT=1）——写绝对路径。

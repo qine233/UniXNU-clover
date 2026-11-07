@@ -7124,6 +7124,41 @@ def check_board(errors: list) -> str:
             if needle not in text:
                 errors.append(f"{name}() does not {needle}: a watch that asks only one of the two tools, "
                               "or writes nothing, cannot tell a late landing from no landing at all")
+    # Round335 (#716). "Neither tool answered" is not one outcome, and the two runs that proved it are
+    # boots 118 and 119: both closed their after-deadline watch with `neither`, both said "the deadline
+    # did not fire, the panic screen never reset, or the reset does not reach this host", and both had
+    # already photographed a USB tree at that close enumerating QUSB_BULK -- a reset this host did see,
+    # in the one mode those two tools do not read. The half that was missing was not the tree, it was
+    # the verdict sentence: the tree was on disk and nothing quoted it. So the class is now measured by
+    # the writer and named in the close label, and what is pinned below is the part a half-fix would
+    # get wrong: a class re-measured when the sentence is printed is a claim about the moment of
+    # printing, not about the moment of the close.
+    if not re.search(r"^usb_landing_class\(\) \{", script_text, re.M):
+        errors.append("scripts/run-clover-unattended.sh has no usb_landing_class(): the silent window "
+                      "would again be one undivided outcome")
+    if "QUSB_BULK" not in script_text:
+        errors.append("usb_landing_class does not look for QUSB_BULK: that is the node the two silent "
+                      "runs of boots 118 and 119 enumerated, and it is what the classifier is for")
+    silent_closes = re.findall(r'timeline_close "neither-\$\(usb_landing_class\)" "" ""', script_text)
+    if len(silent_closes) != 2:
+        errors.append(f"the silent path interpolates the class in {len(silent_closes)} of the 2 watches "
+                      "that can close silent (watch_landing and watch_after_deadline): one of them would "
+                      "still write a classless `neither`, and a reader cannot classify what was not said")
+    if 'closing=$(tail -n 1 "$TIMELINE"' not in script_text:
+        errors.append("the exit-6 verdict does not quote the timeline's own close line: re-measuring the "
+                      "tree when the sentence is printed would describe the host at verdict time, and the "
+                      "board may have moved on -- the reading is about the close")
+    reader_text = (REPO / "scripts/read-clover-log.py").read_text(encoding="utf-8", errors="replace")
+    for label in ("wait-fastboot", "wait-adb", "watch-landing", "after-deadline"):
+        if f'"{label}": {{' not in reader_text:
+            errors.append(f"read-clover-log.py registers no reading for the {label} watch: a close label "
+                          "with no key is counted as UNKEYED, and the point of that file is that each of "
+                          "its lines says what it excludes")
+    if not re.search(r"^    timeline_selftest\(\)$", reader_text, re.M):
+        errors.append("read-clover-log.py --selftest does not run its timeline leg (the call line, not "
+                      "the definition -- `def timeline_selftest():` contains the same characters and "
+                      "proves nothing): the parser would again be tested only against the writer's "
+                      "printf literals in principle, not in fact")
     # The script is the read-back path, and until now its syntax was only ever tested by running it on
     # the board's clock: a typo costs a 2100 s window and a boot nobody read.
     syntax = subprocess.run(["bash", "-n", str(REPO / "scripts/run-clover-unattended.sh")],

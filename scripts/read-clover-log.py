@@ -1365,6 +1365,7 @@ def selftest():
     said = out.getvalue()
     assert "clocks unreadable" in said, said
     assert "1129076301" not in said and "1129075571250" not in said, said
+    timeline_selftest()
     print("read-clover-log selftest: report window, both rings, flight region, wrap order, "
           "ring kinds, bad records, the r302 verdict signatures, the r305 clock pair, the r310 "
           "sink-door words and the older-payload clock guard all ok")
@@ -1408,6 +1409,239 @@ def tee_glue_summary(records):
         print(f"  un-stamped head: {head!r}")
 
 
+TIMELINE_WATCH = re.compile(r"^# watch (\S+) budget=(\S+) opened (\S+)")
+TIMELINE_ROW = re.compile(r"^(\d{9,}) (\d+) (\S+) (\S+) (\S+)\s*$")
+
+NEITHER_EDL = (
+    "no adb and no fastboot, but the USB tree at the close enumerated a Qualcomm bulk node: the "
+    "board reset into download mode, which is a reset this host did see. So this does not leave "
+    "open whether the deadline fired or whether the board reset; it leaves open this boot's card "
+    "read, which needs the board back in TWRP and does not lose the card")
+NEITHER_DIAG = ("no adb and no fastboot, but the tree at the close enumerated a diagnostic port: "
+                "the board reset into a mode these two tools do not read")
+NEITHER_NO_NODE = ("no adb, no fastboot and no Qualcomm node at the close: whether the deadline "
+                   "fired, whether the panic screen is being displayed, and whether the board "
+                   "enumerated at all all stay open")
+TWRP_NOT_RUNNING = ("either recovery never started or its adbd never started; a board showing "
+                    "TWRP's splash with no adb is the second, and that is a host-side USB question")
+
+# The same close token means different things in different watches: `fastboot` in wait-fastboot is
+# an arrival (the board is in the bootloader, which is what that wait asks for), while `fastboot`
+# in a landing watch is a verdict about the reset -- the board rebooted normally instead of taking
+# the recovery command in misc. So the reading is keyed by the watch, and the key it used is
+# printed. An unlisted label is counted as `other`, named, and never folded into a known reading.
+WATCH_READINGS = {
+    # Arrival: was the board ever in this mode during the window.
+    "wait-fastboot": {
+        "fastboot": "the board enumerated in fastboot during this window",
+        "timeout": "neither tool saw the board for the whole budget: it is in a mode fastboot does "
+                   "not answer, or off, or hung before the bootloader",
+    },
+    "wait-adb": {
+        "adb": "recovery's adbd came up: the board is in TWRP",
+        "timeout": f"no adb within the budget; {TWRP_NOT_RUNNING}",
+    },
+    # Landing: what the board did after a reset this script asked for.
+    "watch-landing": {
+        "adb": "the board reset and misc held a recovery command, so it landed in TWRP",
+        "fastboot": "the board reset again into fastboot rather than recovery",
+        "neither-edl": NEITHER_EDL,
+        "neither-diag": NEITHER_DIAG,
+        "neither-no-node": NEITHER_NO_NODE,
+    },
+    "after-deadline": {
+        "adb": "the deadline's own reset landed in TWRP: the payload ran and misc held a recovery "
+               "command",
+        "fastboot": "the board came back to fastboot: it reset, and misc held no recovery command",
+        "neither-edl": NEITHER_EDL,
+        "neither-diag": NEITHER_DIAG,
+        "neither-no-node": NEITHER_NO_NODE,
+    },
+}
+# run-clover-unattended.sh names a watch it knows nothing else about with these three prefixes
+# only if it changes; an unknown watch label is reported as unkeyed rather than guessed at.
+WATCH_UNKEYED = "no reading registered for this watch/close pair"
+
+
+def timeline_class_from_tree(tree_lines):
+    """Classify a landing from the USB tree the run photographed at its close.
+
+    This is the second leg, not a replacement: runs from before the close line carried a class are
+    classified here and said to come from the tree, so a derived reading is never mistaken for one
+    the run reported itself.
+    """
+    text = "\n".join(tree_lines)
+    if re.search(r"QUSB_BULK|QPS6000|HS-USB.*9008", text):
+        return "edl"
+    if re.search(r"(?i)diag|qdss|900e", text):
+        return "diag"
+    return "no-node"
+
+
+def timeline_sections(text):
+    """Group a timeline file into its watches, keeping the polls that belong to each."""
+    watches = []
+    current = None
+    collecting = None
+    for line in text.splitlines():
+        header = TIMELINE_WATCH.match(line)
+        if header:
+            current = {"label": header.group(1), "budget": header.group(2),
+                       "opened": header.group(3), "polls": [], "close": None,
+                       "open_tree": [], "close_tree": []}
+            watches.append(current)
+            collecting = None
+            continue
+        if line.startswith("# usb at open"):
+            collecting = "open_tree"
+            continue
+        if line.startswith("# usb at close"):
+            collecting = "close_tree"
+            continue
+        if line.startswith("#"):
+            collecting = None
+            continue
+        if current is None:
+            continue
+        row = TIMELINE_ROW.match(line)
+        if row:
+            # A data row also ends a tree capture: ioreg's output and the next poll are adjacent in
+            # the file, so nothing but the row's own shape can tell them apart.
+            collecting = None
+            _epoch, elapsed, adb, fastboot, event = row.groups()
+            if event.startswith("close:"):
+                current["close"] = {"elapsed": int(elapsed), "adb": adb, "fastboot": fastboot,
+                                    "result": event[len("close:"):]}
+            elif event == "poll":
+                current["polls"].append((int(elapsed), adb, fastboot))
+            else:
+                current.setdefault("events", []).append((int(elapsed), event))
+            continue
+        if collecting:
+            current[collecting].append(line)
+    return watches
+
+
+def timeline_selftest():
+    """Build a timeline from the writer's own format strings and check what the reader says.
+
+    The samples are not typed out here: they come from the printf literals in
+    run-clover-unattended.sh, so a format change on the writer's side is a failure here rather than
+    a file that keeps parsing a shape nobody writes any more.
+    """
+    writer = Path(__file__).resolve().parent / "run-clover-unattended.sh"
+    script = writer.read_text(errors="replace")
+    formats = re.findall(r"printf '(#[^']*?)'\n?", script) + re.findall(r"printf '([^']*?)'\n?", script)
+
+    def format_of(needle):
+        for candidate in formats:
+            if needle in candidate:
+                return candidate.replace("\\n", "\n")
+        raise SystemExit(f"selftest: no printf in {writer} contains {needle!r}")
+
+    open_fmt = format_of("# watch")
+    close_fmt = format_of("close:")
+    poll_fmt = [candidate for candidate in formats
+                if candidate.count("%s") == 5 and "close:" not in candidate
+                and not candidate.startswith("#")][0].replace("\\n", "\n")
+
+    text = (open_fmt % ("after-deadline", "2220", "2026-11-07T02:42:13Z")
+            + "# epoch elapsed adb fastboot event\n"
+            + poll_fmt % ("1794020116", "783", "-", "-", "poll")
+            + poll_fmt % ("1794020176", "843", "81ffcaaa", "-", "poll")
+            + close_fmt % ("1794020200", "867", "-", "-", "neither-edl")
+            + "# usb at close (neither-edl)\n+-o QUSB_BULK_SN:F6548A52@01143000\n"
+            + open_fmt % ("wait-adb", "180", "2026-11-07T01:43:01Z")
+            + "# epoch elapsed adb fastboot event\n"
+            + close_fmt % ("1794010000", "0", "81ffcaaa", "-", "adb")
+            + "# usb at close (adb)\n+-o Mi Pad 4@0130000f\n"
+            + open_fmt % ("watch-brand-new", "60", "2026-11-07T03:00:00Z")
+            + close_fmt % ("1794021000", "5", "-", "-", "neither-no-node")
+            + "# usb at close (neither-no-node)\n+-o nothing@01400000\n")
+
+    watches = timeline_sections(text)
+    if len(watches) != 3:
+        raise SystemExit(f"selftest: timeline parse saw {len(watches)} watches, not 3")
+    landing, arrival, unkeyed = watches
+    # The tree capture must not eat the rows that follow it: polls are counted, not collected.
+    if len(landing["polls"]) != 2 or landing["close"]["result"] != "neither-edl":
+        raise SystemExit(f"selftest: the first watch parsed as {landing['polls']} "
+                         f"{landing['close']}")
+    if arrival["close"]["result"] != "adb":
+        raise SystemExit("selftest: the second watch's close was not read as adb")
+    counts = {}
+    import io
+    import contextlib
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        timeline_report_from_text(text, "selftest", counts)
+    lines = buffer.getvalue().splitlines()
+    if not any("download mode" in line for line in lines):
+        raise SystemExit("selftest: neither-edl did not read as a board that reset into download "
+                         "mode -- the reading is what this instrument is for")
+    if "UNKEYED=['watch-brand-new/neither-no-node']" not in lines[-1]:
+        raise SystemExit(f"selftest: an unkeyed watch was not named, it was folded in: {lines[-1]}")
+    # A class the writer never reports must come from the tree, and must say it was derived.
+    derived_text = text.replace('close:neither-edl', 'close:neither')
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        timeline_report_from_text(derived_text, "selftest", {})
+    if "class derived from this run's own" not in buffer.getvalue():
+        raise SystemExit("selftest: a classless neither was classified without saying the class "
+                         "came from the tree rather than from the run")
+    print("timeline selftest: three watches, both close paths, the derived-class note and the "
+          "unkeyed name all ok (samples built from run-clover-unattended.sh's own printf)")
+    return 0
+
+
+def timeline_report(path, counts=None):
+    """Say what each watch of a host-side run proved, including which watches never closed."""
+    with open(path, "r", errors="replace") as handle:
+        timeline_report_from_text(handle.read(), str(path), counts if counts is not None else {})
+
+
+def timeline_report_from_text(text, source, counts):
+    watches = timeline_sections(text)
+    if not watches:
+        print(f"timeline: {source} has no `# watch` section -- nothing was watched, which is a "
+              "reading about this run, not about the board")
+        return
+    for watch in watches:
+        close = watch["close"]
+        readings = WATCH_READINGS.get(watch["label"], {})
+        seen = sorted({e for (_t, adb, fb) in watch["polls"] for e in (adb, fb) if e != "-"})
+        if close is None:
+            label = "open-no-close"
+            reading = ("this watch never wrote its close line, so the run ended inside it -- what "
+                       "the board did afterwards is not in this file")
+            tail = f"last poll at {watch['polls'][-1][0] if watch['polls'] else 'none'}s"
+        else:
+            label = close["result"]
+            derived = ""
+            if label not in readings and label.startswith("neither"):
+                # Runs from before the close line carried a class: classify from the tree that run
+                # already photographed, and say that is where the class came from.
+                label = f"neither-{timeline_class_from_tree(watch['close_tree'])}"
+                derived = " (class derived from this run's own `usb at close` tree, not reported by it)"
+                reading = readings.get(label, WATCH_UNKEYED)
+            else:
+                reading = readings.get(label, WATCH_UNKEYED)
+            tail = (f"closed with adb={close['adb']} fastboot={close['fastboot']} at "
+                    f"{close['elapsed']}s of budget {watch['budget']}{derived}")
+        counts[f"{watch['label']}/{label}"] = counts.get(f"{watch['label']}/{label}", 0) + 1
+        print(f"watch {watch['label']} opened {watch['opened']} polls={len(watch['polls'])} "
+              f"other-answer-seen={','.join(seen) if seen else 'none'} {tail}: {reading}")
+    named = " ".join(f"{key}={counts[key]}" for key in sorted(counts)
+                     if key.rsplit("/", 1)[1] != "open-no-close"
+                     and WATCH_READINGS.get(key.rsplit("/", 1)[0], {})
+                     .get(key.rsplit("/", 1)[1]) is not None)
+    unkeyed = [key for key in sorted(counts)
+               if WATCH_READINGS.get(key.rsplit("/", 1)[0], {})
+               .get(key.rsplit("/", 1)[1]) is None]
+    print(f"timeline: {len(watches)} watches, closes: {named or 'none'}"
+          + (f" UNKEYED={unkeyed}" if unkeyed else ""))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1445,10 +1679,26 @@ def main():
                         help="print only the newest record")
     parser.add_argument("--selftest", action="store_true",
                         help="round-trip all three windows in memory and exit (no card needed)")
+    parser.add_argument("--timeline", action="store_true",
+                        help="read the host's own timeline instead of the card: the positional is "
+                             "the log window path and the timeline is that path plus "
+                             ".timeline.txt, or pass the timeline file itself. Each watch is "
+                             "reported with its polls, its close label and what that label excludes")
     args = parser.parse_args()
 
     if args.selftest:
         return selftest()
+
+    if args.timeline:
+        candidate = Path(args.dump)
+        if candidate.suffix == ".txt":
+            timeline_path = candidate
+        else:
+            timeline_path = candidate.parent / f"{candidate.name}.timeline.txt"
+        if not timeline_path.is_file():
+            raise SystemExit(f"no timeline at {timeline_path}")
+        timeline_report(timeline_path)
+        return 0
 
     path = Path(args.dump)
     if not path.is_file():

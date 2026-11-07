@@ -244,6 +244,26 @@ wait_leave_fastboot() {
 # After a reboot command has been accepted and the board has left fastboot, what comes
 # up decides what the command meant: TWRP's adb (0), fastboot again (1, i.e. an ordinary
 # reboot), or nothing at all within LANDING_WAIT (2).
+#
+# Round335 (#716). "Nothing at all" is not one outcome. boots 118 and 119 both closed their
+# after-deadline watch with `neither` while the USB tree taken at that same close enumerated a
+# Qualcomm bulk node -- the board had reset and this host had seen it, in the one mode neither
+# adb nor fastboot enumerates. So the class of the silent window is read from the tree, which is
+# what timeline_open and timeline_close already photograph, and it goes into the label of the
+# close line and into the verdict sentence. It is not a match on our own serial: the EDL node on
+# this board carries a different hex string than the adb serial, and the question is only "did
+# the board enumerate in some mode at all".
+usb_landing_class() {
+  local tree
+  tree=$(ioreg -p IOUSB -w0 2>/dev/null)
+  if printf '%s\n' "$tree" | grep -qE 'QUSB_BULK|QPS6000|HS-USB.*9008'; then
+    printf 'edl'
+  elif printf '%s\n' "$tree" | grep -qiE 'diag|qdss|900e'; then
+    printf 'diag'
+  else
+    printf 'no-node'
+  fi
+}
 watch_landing() {
   local deadline=$(( $(date +%s) + LANDING_WAIT ))
   local a f
@@ -255,7 +275,7 @@ watch_landing() {
     [ -n "$f" ] && { timeline_close fastboot "$a" "$f"; return 1; }
     sleep 2
   done
-  timeline_close neither "" ""
+  timeline_close "neither-$(usb_landing_class)" "" ""
   return 2
 }
 # Round196. After --boot-after-flash the deadline fires inside the payload's own boot, so
@@ -280,7 +300,7 @@ watch_after_deadline() {
       return 1
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      timeline_close neither "" ""
+      timeline_close "neither-$(usb_landing_class)" "" ""
       return 2
     fi
     sleep 2
@@ -364,7 +384,8 @@ if [ "$SKIP_RECOVERY" = 0 ] && [ -n "$FLASH_CACHE" ]; then
         say "writing the host's BCB next so the window is still read from TWRP"
         ;;
       *)
-        die 6 "neither TWRP's adb nor fastboot within $(( WAIT + DEADLINE_SLACK ))s: the deadline did not fire, the panic screen never reset, or the reset does not reach this host; timeline: $TIMELINE"
+        closing=$(tail -n 1 "$TIMELINE" 2>/dev/null | awk '{print $5}')
+        die 6 "neither TWRP's adb nor fastboot within $(( WAIT + DEADLINE_SLACK ))s; that window closed as ${closing:-no-close-line}, quoted from the timeline's own close line because the tree it names was photographed at the close rather than here: neither-edl means the board reset and this host enumerated it, in the one mode these two tools do not see, so this line does NOT leave open whether the deadline fired or whether the reset happened -- what it leaves open is this boot's card read, which needs the board back in TWRP and does not lose the card (rerun with --skip-recovery); neither-no-node means nothing enumerated at all, which is where the three candidates still stand; timeline: $TIMELINE"
         ;;
     esac
   else
@@ -410,7 +431,7 @@ EOF
 [unattended]   2. boot TWRP from its own partition, then rerun with --skip-recovery.
 EOF
       exit 4 ;;
-    *) say "neither TWRP's adb nor fastboot within ${LANDING_WAIT}s; the board may be sitting on the panic screen, which resets after 20 s"
+    *) say "neither TWRP's adb nor fastboot within ${LANDING_WAIT}s; the USB tree at the close of that window is $(usb_landing_class): edl means the board reset into download mode rather than sitting on the panic screen, no-node means nothing enumerated and the panic screen remains the candidate (it resets after 20 s)"
        say "every poll of that window is on disk with its two answers and the USB tree: $TIMELINE" ;;
   esac
 fi
