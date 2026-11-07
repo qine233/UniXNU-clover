@@ -28413,3 +28413,101 @@ sdhci geometry: OK
 
 **⑦ 边界。** 本轮没有板上行为改变（r341 之后仓库只动文档）。上面 ④ 的分母说的是「过去的归档里这行在场与否」，不是「卡上现在有什么」；boot 120 的 IMEM 记录本身本轮没读到，也不可能在读回通路上读到——那格属板上通路，属 boot 122。
 
+
+## Round342（#727–#730，代码轮，发版 v0.7.60：一次性读数有了周期性写够不着的家）
+
+**① boot 121 ＝ r341 那枚镜像的控制轮，预登记的「仍缺席」成立，而且这一次卡自己说出了原因。** 读回产物 `~/clover-out/boot121-card.bin`（623,104 B）与解码本 `~/clover-out/boot121-card.txt`（1912 行）。计数器（扇区 1216，lba 13321432，kind 24）报 **boot 121**、`ok`（解码本 `:1879`）。驱动区 `[64,192)` 当场数出来的七列：
+
+| 列 | 读数 | 读法 |
+|---|---|---|
+| 解出的记录 | 64 | 区域填满 |
+| 在场 `seq` | **8..71** | 本靴写了 **72** 笔，64 枚槽 ⇒ `seq 0..7` 被本靴自己最后八笔盖掉 |
+| 槽号 | 0..63，64 枚互不相同 | 一枚槽一笔，没有重复归属 |
+| kinds | `{21: 50, 25: 14}` | 判据与中转共用同一枚游标（与 boot 120 的 `{21:52, 25:12}` 同构） |
+| 归属 boot | `{121: 64}` | 一靴一圈，没混进别靴 |
+| `slot == seq % 64` 的反例 | **0** | 同余仍在 ⇒ 这枚镜像确实是 round342 之前的算术 |
+| header 问题 | **0** | lba / slot 字 / total / sum / prefix / 换行逐枚核过 |
+
+四枚被钉的行头在整份解码本里各 **0** 枚：`clover r283: last reset`、`clover r339: beatctl`、`clover r339: mark`、`CloverSdhci r174: verdict ring armed`。⇒ §Round339 读数 ⑥ 预登记的那一支（「boot 121 预期仍缺席；若反而在场，先核 `seq` 最大值，不许读成修好了」）**按原判读成立**：`seq` 最大值 71 ≥ 64，环转过圈，缺席属算术。M-B/M-C/M-E 继续记**空判**（第二十四层），M-D 继续留 boot 123。
+
+**新读者第一次在真卡上说话，而且说的是「这张卡什么都没声明」。** 解码本 `:144`：
+
+```
+[ring rule] no r174 arming row lies anywhere in this ring, so this card declares nothing: an image before round342 pinned that row, read by round341's congruence
+```
+
+这一句是本轮读者侧那支腿的产物：它**按行头在整个环里找**那条上膛行（不是去规则指派的那枚槽里找——第一版就是那么写的，那是循环论证：用待验的规则去找验证规则所需的读数），找不到就把「无声明」与「有声明但槽位不对」分成两句话。boot 121 落在前一句，于是读者退回 round341 的同余语义读这张卡，并且**明说自己退回了**。按第十八层，这枚「缺席的命名」比 0 枚 grep 命中强：它把「仪器没问」与「问了、卡上没有」分开了。
+
+**② 这一手改了什么。** 选的是 §Round339 读数 ⑥ 两条候选里的后一条（钉槽），不是 r319 那条节拍重发：钉槽不新增环压力、不改任何已有行的文本。
+
+- **纯层** `drivers/CloverSdhci/SdhciLogCore.h`：`kRingPinnedSlots = 4`，四枚行头字面量 `kPinHeadLastReset` / `kPinHeadBeatCtl` / `kPinHeadMark` / `kPinHeadRingArmed` 进 `kPinHeads[]`（长度由 `sizeof` 派生，不另打一份数）；新增 `sdhci_pin_index(text, length, which)`——只对驱动环按行头前缀认领，返回槽号或 −1；`sdhci_ring_slot(which, cursor, pin)` 分两支：`pin >= 0` 直接返回 `pin`，否则 `floor + cursor % (kRingCardSlots[which] - floor)`，`floor` 驱动环 4、内核环 0。`sdhci_ring_lba()` 与 `sdhci_build_header()` 收**同一枚** `pin`（一处算、两处用，不许各自再算一遍）。
+- **驱动** `drivers/CloverSdhci/CloverSdhci.cpp`：`ringWriteRecord()` 先 `const int pin = sdhci_pin_index (text, length, which);` 再把它同时交给 lba 与表头；上膛行升成 `CloverSdhci r174: verdict ring armed lba=%u slots=%u pinned=%u`，`pinned=` 由 `kRingPinnedSlots` 填。
+- **为什么钉四枚而预登记写的是三枚**：第四枚正是**声明这套布局的那一行本身**。三枚一次性行需要家，而读者要判「这张卡用的是哪套规则」只能靠上膛行——它自己若还在滚动支里，就同样会被本靴后来的写盖掉，于是读者永远读不到声明、永远退回旧语义。boot 121 的 `:144` 就是这件事的实证。⇒ 四枚是**闭合**所需的最小枚数，不是加了一枚富余。
+- **区域不动**：驱动区仍是 `[64,192)` 64 枚槽，内核环 `[192,1216)` 512 枚槽**一枚未钉、同余不变**，窗口仍是 1217 扇区 / 623,104 B。所以 r340 的铺砖腿（10 段恰好铺满 `[0,1217)`）与 r341 的窗口算术**不破**，变的只是区域内部的划分与表头第 7 枚字的派生。
+- **读者** `scripts/read-clover-log.py`：`PINNED_SLOTS = 4` 与 `PINNED_HEADS`（按槽序）；`card_pinned(data, first_lba)` 返回 `(声明值或 None, 为什么)`，五种沉默各有自己的句子（无行 / 有行无 `pinned=` 列 / 两枚声明互相矛盾 / 声明与表长不符 / 声明落在不该落的槽）；`decode(..., pinned=None)` 拿到声明后，遇到空槽 `continue` 而不是 `break`（**空的钉住槽是一次具名缺席，不是环的尽头**），并新增两条问题句：钉住的行坐在别的槽里、某枚钉住槽里坐着没人钉给它的行。`pinned=None` 时语义与 round341 逐字相同——旧卡照旧读得动，boot 121 就是正对照。
+
+**③ 负测逼出的两枚仪器缺陷（都由本轮的负测当场抓到，不是事后想起来的）。**
+
+- **N60 第一次「红而不为自己红」。** 它把两枚声明里的行头一起改名（层与读者一致地改），只有卡能看出那枚行失去了家。第一次跑它确实红了，但闸门转发的理由里**没有它自己的名字**：`scripts/test-clover-sdhci.py` 用 `(stdout+stderr)[-N:]` 转发宿主模型的输出，而 `check-clover.py` 又把具名问题截到前六条——两处上限叠在一起，恰好把「a pinned slot held no record」那一条切掉。这正是第三十一层那句「闸门转发被测脚本输出用 tail ＝自己把说清哪颗文件动了那几条切掉」的第二次发作。修法两处：runner 改成**按名字**逐条转发（`fail(f'the sdhci host model named: {line}')`，只有模型什么都没点名时才退回尾段），闸门去掉六条上限（每条仍限 150 字符）。修后 N60 报 `a pinned slot held no record`。
+- **`card_pinned()` 第一版是循环论证。** 它去 `sdhci_ring_slot()` 指派的那枚槽里找上膛行——而「指派到哪枚槽」正是待验的规则。改成按行头扫整个环之后，N65（读者按槽号而不是按行头认声明行）才判得红。**同一格的一般形状**：拿待验的规则去取验证它所需的读数，得到的永远是自洽。
+
+整套 **68 支、`0 problem(s)`**（`~/clover-out/round342-pinned-slots/negatives.stdout` 末行；逐支判词与还原记录在 `negatives.log`）。r342 新增的九支逐条 RED（exit 1）**且点名自己**，还原后 `gate exit=0, file byte-identical`：
+
+| 支 | 破坏 | 它自己的判词 |
+|---|---|---|
+| N60 | 两枚声明一起改名（只有卡看得见） | `a pinned slot held no record` |
+| N61 | 滚动模数穿过钉住的槽 | `this is a bound, a cursor rule or a checksum that the host model proves` |
+| N62 | 表里四枚行头而 `kRingPinnedSlots` 写 3 | `the pinned table lists 4 heads while kRingPinnedSlots is 3` |
+| N63 | 读者的钉住枚数离开层的 | `the pinned layout is four numbers, not one` |
+| N64 | 读者退回 342 之前「遇到第一个缺口就停」 | `does not walk the ring with round342's own semantics` |
+| N65 | 读者按槽号而不是按行头认声明行 | `does not identify the declaring row by its own head` |
+| N66 | 读者没有「环里根本没有声明行」那句话 | `has no sentence for a ring that holds no declaring row` |
+| N67 | 那条环规则腿写了但从不被跑 | `does not run its ring-rule leg` |
+| N68 | 只在层里改名，读者的表指向没人写的行 | `the reader pins heads the layer does not` |
+
+N62 是本轮真正拦下过一次事故的那一支：`kRingPinnedSlots = 3` 配四枚 entries 的表**编译得过、闸门的存在性针脚也全绿**，后果是第四枚（上膛行）静默掉回滚动支——正是 ② 里说的那件必须闭合的事。按第三十二层，枚数与表是两枚决策，所以要有一支负测把它们分开。
+
+**④ 构建与闸门读数：这是一枚哈希轮，而且位移是量出来的。**
+
+- 树重装配（改过 `scripts/*` ⇒ 第二十六层）：`unixnu tree --device /Users/zhouzhou/UniXNU-clover` 从 `/Users/zhouzhou/UniXNU` 跑；五枚脚本与纯层在仓库与树两处 sha256 逐字节同。（那趟 `TREE_EXIT=` 印成空串是 zsh 没有 `PIPESTATUS` 的**测量假象**，不是构建失败——重装配的证据换成上面那组哈希。）
+- 双闸门 **两侧 EXIT=0**：仓库侧 `DT 40 addresses against 230 device-tree nodes; 107 inline asm statements separated; drivers documented: 11, base-repo drivers exempt: 0; citation shapes banned in 36 authored sources`；树侧 `12 archives, 22 objects ABI-checked, kernel read`（`exempt: 22`，`citation shapes: the assembled tree carries 0 sources this repository authors`）。日志 `round342-pinned-slots/gate-repo.log`、`gate-tree.log`。
+- 内核 `out/clover/kernel/kernel.macho` sha256 `2f0bf1e74af3ec9af01a1093716bee39d456ec8be2e4ecaa17ec6bd83e21fe90`（52,404,224 B）。**与 r341 逐段比**：`__TEXT_EXEC,__text` 8,612,528 → 8,613,500（**+972 B**）、`__TEXT,__cstring` 1,029,575 → 1,029,622（**+47 B**），合计 **+1019 B**。⇒ r340 那句「纯注释轮不改产物哈希」的论证在这一轮有了对照：真正改行为的轮，位移就是这两枚数。
+- AMFI 两刀对上：`0x34000229→0x14000011`（文件 `0x1ae00e4`，VA `0xfffffff004ab40e4`）、`0x36000520→0xd503201f`（文件 `0x1ae016c`，VA `0xfffffff004ab416c`）⇒ `round342-kernel-amfi.macho` sha `d83dab76cd4718a9dbc94bc9376f9a64371107953ec8f9e6e8fa32836747925d`；归一化 **973** 枚 object 戳清零 ⇒ `round342-kernel-normalized.macho` sha `ff652788602a5cc67276932d19b2dcdc0d3fbc20a54c68d6496600a772d03500`（两枚均 52,404,224 B）。
+- payload **EXIT=0** ⇒ `~/clover-out/round342-v0.7.60-payload.img` sha `c61da28866f059a63dd6eb75738fb1279b99bb479243b06021f93596e8285697`（58,720,256 B）；`payload.json` 自报 `kernel_sha256 ff652788…`（＝归一化后那枚）、`payload_kernel_sha256 bbcfde4b…`、`adt_sha256 34e3981c…`（14,384 B）、trustcache `7c369ce0…` 与 data ramdisk `614b8356…` 两枚未动；卷内 `unixnu.toml` 2756 B（sha `44b79712…`）。
+- `verify-clover-payload.py` **EXIT=0，51 行 OK、0 FAIL**，含 `unixnu.toml: parses and offers this round's xnu entry OK (title ok, kernel ok, deadline ok)` 与 `build-varying fields normalized OK (973/973 object stamps blank, 1 LC_UUID, 1 KCID)`；`verdict rings and log tee linked OK (verdict ring armed lba= present, …)`。
+- **显示档案按 AGENTS.md 在新内核存在之后重审了一次**（`out/clover/tree` 里跑 `build-clover-gop-legacy-display.py`，EXIT=0）：`build-report.json` 的 `kernel_sha256` 正是 `2f0bf1e7…`（本轮这枚，不是上一轮那枚），两枚对象哈希 `compiled_object_sha256 0b5188bb752f2b3f…`、`late_object_sha256 0abcc574be7a5341…`，`193 original bindings, 24 owned entries, 154 inherited native entries`。**另外量了一格「已链接进 payload 的那枚档案是否仍合格」**：`nm -n` 取两枚内核（`round341-kernel-normalized.macho` 与 `round342-kernel-amfi.macho`）里全部 `IOMobileFramebuffer` 符号，各 **184** 枚，`diff` **0 行** ⇒ Apple family 文本的地址一枚没动，+972 B 全部落在它之后。`archive_sha256 faf23131…` 按 AGENTS.md 的口径**不是证据**（`ar` 每跑一次盖一次 mtime）。
+
+**⑤ 同一趟读到的主线证据（boot 121 的显示那一格，与 120 不同形）。**
+
+- 整份卡上 `clover r335: bbswap` **只有 1 枚**（解码本 `:1657`）：`ms=680217 opt=80000003 ret=00000000 arg=0 done=0 cur=0 list=0 pw=1 ps=0 np0..np5=null sent=0 s72=0 gap=none pair=first pid=86`——这是**那支查询跑通的正对照**（§Round332c 认出来的第一枚选择器组合）。第二条腿是厂商自己那行（`:1654`，早 39 µs）：`clover r180: client pid=86 selector 6 0 80000003 0 -> 00000000 done=0 presented=0`，四枚字段逐枚对上。
+- **查询之后到复位之间没有任何 swap 调用，而这一次缺席是有地平线的读数**：内核 tee 环 510 枚带戳行、跨度 **305.256..708.496 s**；比那枚查询（680.219473 s）更新的记录 **71** 枚（跨度 680.2195..708.4962 s），环有 **512** 枚槽 ⇒ 这 28 s 里若真发生过一次 swap，它的行比查询新、且 71 ≪ 512，**不可能被盖掉**。所以「没有」是读数，不是地平线假象（第一层／第十三层）。⇒ boot 121 停在「客户端问了一次查询、然后没交帧」，而 boot 120 走到了 `arg=2 done=2 presented=2`。两靴不同形，n=2，不建因果。
+- `clover r329: dispstate` 17 枚，`client=` 分布 **`none` 11 / `other` 1 / `pid58` 5**，`presented=` 全份 18 处**全是 0**（17 枚拍行＋厂商那行）。#695 那格欠的处置在这里第三次显形：真正发调用的是 pid 86，而拍行选到的要么是 `none` 要么是闲着的 pid 58 ⇒ **这 17 枚拍行答不了「桌面交到第几帧」**，能答的只有厂商那行与 bbswap 行。
+- `CloverSdhci r175: tee` 普查 12 枚（正好 `kTeeCensusMax = 12`），**r341 那两列第一次在卡上有读数**：首枚 `seen=264 kept=71 throttled=13 lap=0 idx=24576 cut=1 bound=320`、末枚 `seen=3198 kept=740 throttled=57 lap=4 idx=64049 cut=2 bound=320`。`lap=4` 与内核环跨度从 305 s 起（而不是 0 s）同向 ⇒ 那枚环转过四圈，`cut=` 数的是被切的行。按第九层「新字段要说出哪代镜像带着它」：这两列从 **boot 121** 起在场，boot 120 那份没有。
+- flight：12 枚 entry 记录（`seq 137819..137830`），全部 boot 121 所写。
+
+**⑥ 预登记 boot 122（r342 这枚镜像，冷刷 `cache`）。** 判据在看卡之前写定：
+
+- **P-A（闭合的正对照）**：`CloverSdhci r174: verdict ring armed … pinned=4` 必须在场，且**坐在槽 3**；读者的 `[ring rule]` 行必须从「什么都没声明」变成**读到声明 4**。若它仍报无声明，先查它是不是被钉住的第四枚本身没写（`sdhciSay` 在卡上膛前只进 RAM 暂存环），不许读成「仪器没跑」。
+- **P-B（三行同时在场）**：`clover r283: last reset`（named 或 unnamed 两支之一）、`clover r339: beatctl`、`clover r339: mark` 必须**同时**在场，分别坐槽 0/1/2。这是 §Round339 读数 ⑥ 登记的判据原文，也是 M-B/M-C/M-E 第一次真正判得动的那次读回。**只在场一两枚不算通过**：那说明钉住支认领了行头但写失败，要按 `sdhciSay` 的返回码分岔。
+- **P-C（算术真的变了）**：驱动区里 `slot == seq % 64` 必须**出现反例**（滚动支现在是 `4 + cursor % 60`），且反例只出现在滚动支；钉住的四枚槽里 `seq` 与槽号无关。若 0 枚反例，说明这枚镜像没带上本轮的层，先核 `pinned=` 那枚字。
+- **P-D（区域没破）**：驱动区仍解出 ≤64 枚、槽号仍全在 `[0,64)`、header 问题 0、内核环 512 枚且同余不变、窗口仍 1217 扇区。这一支是 r340/r341 两条腿的回归钉。
+- **P-E（M-A 仍可能是空判）**：若本靴同样没到 1800 s 死线、两枚 panic marker 仍 STALE，则「落回模式由谁决定」继续记空判，`kRestartBootloader = 0x77665500` 继续既没证实也没证伪。**不许因为 P-B 成立就把 M-A 一起记成通过**——它们的主语不同。
+- **M-D 留 boot 123**：它要判的是本靴那条 `clover r283` 行读回来的**上一靴**写进 IMEM 的记录，同靴判不了跨靴。boot 122 若 P-B 成立，boot 123 才第一次有判它的材料。
+
+**⑦ 边界。** 本轮改的是**读数存放的位置**，不是任何一颗外设的行为：驱动环区域、窗口几何、内核环、tee 预算、boot-args 一枚未动（`board.toml` 只换 `[payload].title`）。⑤ 那格的两靴不同形属观察，n=2，本轮不据此改主线假设。④ 的 +1019 B 是产物差分，不是板上读数；boot 122 的卡还没读，P-A…P-E 全部**未判**。
+
+**⑧ 顺手结掉的一笔记录债：`porting.toml` 从 Round318/323 起就没跟上代码，而闸门是 fail-fast 的，所以它只报得出第一枚。** AGENTS.md 要求发版前跑 `porting-record.py check --device . --base <上一枚>`，本轮真跑了，于是把欠账量了出来（读数在 `~/clover-out/round342-pinned-slots/porting-debt.log`，用**闸门自己的** `check_changes()` 判，不是我另写一套宽松匹配）：
+
+| 量 | r341（`dea39a4` 对 `23652de`） | r342（工作树对 `dea39a4`） |
+|---|---|---|
+| 变更文件 | 13 | 12 |
+| 没有属主的文件 | **3**（`test-clover-716-negatives.py`、`test-clover-sdhci.py`、`test-clover-sdhci-geometry.py`） | 0 |
+| 欠 `findings`/`evidence` 的 (文件, 属主) 对 | **15** | 0 |
+| 欠账的 area | **10** 枚：audio/configuration/diagnostics/firmware/gpu/input/memory/network/packaging/storage | 同十枚全部已付 |
+| `check_changes()` | **FAIL** | **PASS** |
+
+- **为什么以前没被发现**：近几轮只往 diagnostics 的 `next_action` 追加一条，而闸门判的是 `findings` 或 `evidence` 变没变 ⇒ `next_action` 写得再全都算没写。`board.toml` 一枚文件被九个 area 的 `paths` 同时认领，于是每轮只要动标题就欠九笔。
+- **本轮怎么付的**：十枚 area 各追加一条 `Round342 …` finding（写的是**本轮实测**：标题位移、+972/+47 B、钉槽那手与两张卡的读数、payload/verify 哈希链、读者那一半与两枚仪器缺陷），三枚脚本各补进属主的 `paths`（两枚 sdhci runner 归 storage、负测电池归 diagnostics）。`validate()` 与文件存在性也一并过。
+- **一枚仪器读数要更正**：闸门那句 `board.toml: update <area> findings or evidence` 里的 `<area>` **不是定值**——`owners` 是 `set`，字符串哈希每进程一变，先撞上谁就报谁（我这趟报 `network`，上一趟报 `firmware`）。所以「按闸门报的那一枚去补」永远补不完；正确读法是**把 15 对全枚举出来**（上面那张表就是枚举结果，不是 fail-fast 的第一枚）。这与第二十一层同格：一个判决只印它撞上的第一枚，就得把探测范围与总数并排印出来。
+- **历史那笔不回填**：r341 的 15 对属已发布的 commit，本轮不去改它的记录（改了要重打已推送的 tag＝force 操作）。债记在这里，r342 起闸门真绿。
+

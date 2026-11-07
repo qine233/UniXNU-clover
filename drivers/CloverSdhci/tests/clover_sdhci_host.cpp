@@ -80,6 +80,25 @@ struct FakeCard {
     writes++;
     return true;
   }
+
+  // Reading the window back the way the host's dd does: an absolute lba, a word index inside the
+  // header sector. Round342's case needs it because the claim is about what survives on the card, not
+  // about what the writer intended.
+  uint32_t word (uint32_t lba, uint32_t index) const
+  {
+    const uint64_t at = (uint64_t) (lba - first_lba) * sdhciLogSectorBytes + 4u * index;
+    uint32_t value = 0;
+    if (at + 4u <= window.size ()) {
+      std::memcpy (&value, &window[at], 4u);
+    }
+    return value;
+  }
+
+  char byte (uint32_t lba, uint32_t index) const
+  {
+    const uint64_t at = (uint64_t) (lba - first_lba) * sdhciLogSectorBytes + index;
+    return at < window.size () ? (char) window[at] : 0;
+  }
 };
 
 // ------------------------------------------------------------------ the staging ring, replayed
@@ -123,12 +142,16 @@ struct StagingRing {
     while (flushed < kRingFlushPerPass[which] && pending) {
       const uint32_t slot = sdhci_ram_slot (write_cursor - pending);
       const std::string &line = text[slot];
-      const uint32_t lba = sdhci_ring_lba (card.first_lba, which, cursor);
+      const uint32_t length = (uint32_t) line.size ();
+      // The same one local the driver reads: the row decides its own home before the sector is chosen,
+      // and the header's slot word and the lba are both derived from that single answer.
+      const int pin = sdhci_pin_index (line.c_str (), length, which);
+      const uint32_t lba = sdhci_ring_lba (card.first_lba, which, cursor, pin);
       uint32_t header[sdhciLogBlockWords] = {0};
-      sdhci_build_header (header, lba, which, cursor, seq, boot_id, kind, line.c_str (),
-                          (uint32_t) line.size ());
+      sdhci_build_header (header, lba, which, cursor, seq, boot_id, kind, pin, line.c_str (),
+                          length);
       std::vector<uint8_t> block (sdhciLogSectorBytes, 0);
-      sdhci_build_text (block.data (), line.c_str (), (uint32_t) line.size ());
+      sdhci_build_text (block.data (), line.c_str (), length);
       if (!card.write (lba, header, accept) ||
           !card.write (lba + 1, block.data (), accept)) {
         break;                       // a refusal stops this ring for this pass, cursor unmoved
@@ -138,7 +161,7 @@ struct StagingRing {
       written++;
       pending--;
       flushed++;
-      slots_written.push_back (sdhci_ring_slot (which, cursor - 1));
+      slots_written.push_back (sdhci_ring_slot (which, cursor - 1, pin));
     }
     return flushed != 0;
   }
@@ -313,20 +336,29 @@ static void case_wrap (void)
   check ("every accepted row reached the card", driver.written, 200u);
   check ("nothing was dropped when the flush kept up", driver.dropped, 0u);
   check ("the card cursor advanced once per record", driver.cursor, 200u);
-  // 200 records into a 64-slot ring is three laps plus eight: the first slot is written four times and
-  // the newest row is the one a reader sees there.
-  check ("the ring wrapped three times over", driver.cursor / kRingCardSlots[kRingDriver], 3u);
-  check ("the slot the wrap landed on", sdhci_ring_slot (kRingDriver, 199),
-         199u % kRingCardSlots[kRingDriver]);
-  const uint32_t lba_0 = sdhci_ring_lba (card.first_lba, kRingDriver, 0);
-  const uint32_t lba_64 = sdhci_ring_lba (card.first_lba, kRingDriver, 64);
-  check ("record 64 reuses record 0's sector", lba_64, lba_0);
+  // Round342 changed the denominator here. None of these 200 rows is a pinned row, so they turn in the
+  // 60 slots the pinned four leave: three laps plus twenty, and the sector that repeats record 0's is
+  // record 60's -- not record 64's, which is what round341's arithmetic said and what made boot 120
+  // lose its first four rows. Both halves are checked, because the second one is the fact that the
+  // reader's old `(slot, seq)` congruence assumption can no longer tell.
+  const uint32_t rolling_slots = kRingCardSlots[kRingDriver] - kRingPinnedSlots;
+  check ("the rolling part of the ring wrapped three times", driver.cursor / rolling_slots, 3u);
+  check ("the slot the wrap landed on", sdhci_ring_slot (kRingDriver, 199, -1),
+         kRingPinnedSlots + 199u % rolling_slots);
+  const uint32_t lba_0 = sdhci_ring_lba (card.first_lba, kRingDriver, 0, -1);
+  const uint32_t lba_60 = sdhci_ring_lba (card.first_lba, kRingDriver, 60, -1);
+  const uint32_t lba_64 = sdhci_ring_lba (card.first_lba, kRingDriver, 64, -1);
+  check ("record 60 reuses record 0's sector", lba_60, lba_0);
+  if (lba_64 == lba_0) {
+    fail ("record 64 landed on record 0's sector: the pinned slots are not out of the modulus");
+  }
   check ("the sequence word is what orders a wrapped ring", driver.seq, 200u);
   // dropped= is printed, not only checked: scripts/test-clover-sdhci.py names it as the leg that says a
   // card ring whose flush keeps up loses nothing, and a number a reader cannot reach is not a reading.
-  std::printf ("case wrap written=%u dropped=%u passes=%u first_slot_lba=%u reused_lba=%u laps=%u\n",
-               driver.written, driver.dropped, passes, lba_0, lba_64,
-               driver.cursor / kRingCardSlots[kRingDriver]);
+  std::printf ("case wrap written=%u dropped=%u passes=%u first_slot_lba=%u reused_lba=%u laps=%u "
+               "not_reused_lba=%u pinned=%u\n",
+               driver.written, driver.dropped, passes, lba_0, lba_60,
+               driver.cursor / rolling_slots, lba_64, kRingPinnedSlots);
 }
 
 static void case_kernel_wrap (void)
@@ -343,16 +375,116 @@ static void case_kernel_wrap (void)
     kernel.flush (card, 341, 0, true);
   }
   check ("the kernel ring took every row", kernel.written, 1000u);
-  check ("the kernel ring's slot after 999 records", sdhci_ring_slot (kRingKernel, 999),
+  // The kernel ring has no pinned slots: round342's floor is a property of the driver's ring, and a
+  // tee copy of a pinned sentence -- which is what every sdhciSay line also becomes -- stays in the
+  // ring that wraps on its own 512. -1 here is that rule being applied, not a placeholder.
+  check ("the kernel ring's slot after 999 records", sdhci_ring_slot (kRingKernel, 999, -1),
          999u % kRingCardSlots[kRingKernel]);
+  const std::string kernel_copy = "clover r339: mark wrote=1 before=2 after=1";
+  if (sdhci_pin_index (kernel_copy.c_str (), (uint32_t) kernel_copy.size (), kRingKernel) != -1) {
+    fail ("a kernel-ring copy of a pinned row was given a pinned slot");
+  }
   // The kernel ring must not reach into the boot record's sector: that is the one place where a wrap
   // that was off by one ring would erase the boot id instead of a row nobody would notice.
-  const uint32_t last = sdhci_ring_lba (card.first_lba, kRingKernel, 999);
+  const uint32_t last = sdhci_ring_lba (card.first_lba, kRingKernel, 999, -1);
   std::printf ("case kernel_wrap written=%u last_lba_offset=%u boot_record=%u\n", kernel.written,
                last - card.first_lba, kBootRecordOffset);
   if (last - card.first_lba >= kBootRecordOffset) {
     fail ("a kernel-ring record landed on or past the boot record's sector");
   }
+}
+
+static void case_pinned_slots (void)
+{
+  // Round342's whole claim, run rather than argued: four one-shot rows, then enough periodic rows that
+  // round341's arithmetic erased them -- boot 120 wrote 68 records and its card kept seq 4..67. The
+  // pins are the four heads the layer names, in the order clover_unattended_begin and the arming block
+  // print them.
+  FakeCard card (kBootRecordOffset + 1);
+  StagingRing driver (kRingDriver);
+  const std::string pins[kRingPinnedSlots] = {
+    "clover r283: last reset kind=1 pid=2 aux=3 pc=4 cnt=5 beat=6 beatcnt=7 beatmagic=8 text=x",
+    "clover r339: beatctl wrote=1 read=1 magic_wrote=2 magic_read=2 ok=1",
+    "clover r339: mark wrote=77665500 before=0 after=77665500",
+    "CloverSdhci r174: verdict ring armed lba=13320280 slots=64 pinned=4",
+  };
+  for (uint32_t i = 0; i < kRingPinnedSlots; i++) {
+    driver.push (pins[i]);
+  }
+  for (uint32_t i = 0; i < 200; i++) {
+    driver.push ("clover r342 periodic " + std::to_string (i));
+    if (i % 4 == 3) {
+      driver.flush (card, 342, 0, true);
+    }
+  }
+  while (driver.pending) {
+    driver.flush (card, 342, 0, true);
+  }
+  uint32_t in_pinned = 0;
+  for (size_t i = 0; i < driver.slots_written.size (); i++) {
+    if (driver.slots_written[i] < kRingPinnedSlots) {
+      in_pinned++;
+    }
+  }
+  // kRingPinnedSlots, not zero: the only records allowed in those slots are the pinned rows themselves,
+  // one write each this boot.
+  check ("records that landed in a pinned slot", in_pinned, (uint64_t) kRingPinnedSlots);
+  uint32_t heads_read = 0;
+  for (uint32_t i = 0; i < kRingPinnedSlots; i++) {
+    const uint32_t header_lba = card.first_lba + kRingOffset[kRingDriver] +
+                                kRingSectorsPerRecord * i;
+    const uint32_t text_lba = header_lba + 1;
+    if (card.word (header_lba, kWordMagic0) != kLogMagic0 ||
+        card.word (header_lba, kWordMagic1) != kLogMagic1) {
+      fail ("a pinned slot held no record");
+      continue;
+    }
+    if (card.word (header_lba, kWordSlot) != i) {
+      fail ("a pinned record's slot word disagrees with the sector it was written to");
+    }
+    if (card.word (header_lba, kWordBoot) != 342u) {
+      fail ("a pinned record was not this boot's");
+    }
+    uint32_t j = 0;
+    for (; j < pins[i].size () && j < kVerdictTextBytes; j++) {
+      if (card.byte (text_lba, kLogPrefixLength + j) != pins[i][j]) {
+        break;
+      }
+    }
+    if (j == pins[i].size ()) {
+      heads_read++;
+    } else {
+      fail ("a pinned slot held a row other than the one its head names");
+    }
+  }
+  check ("pinned rows read back from the card", heads_read, (uint64_t) kRingPinnedSlots);
+  // The other half of what the reader has to learn: seq is still the clock, but it no longer predicts
+  // the slot. Pinned record 2 is seq 2 and slot 2 only because the pins were the first three writes;
+  // the first periodic record is seq 4 in slot 4, and seq 64 lands in slot 8 rather than slot 0.
+  const uint32_t periodic_seq = kRingPinnedSlots;
+  check ("the first periodic record's slot",
+         sdhci_ring_slot (kRingDriver, periodic_seq, -1),
+         kRingPinnedSlots + periodic_seq % (kRingCardSlots[kRingDriver] - kRingPinnedSlots));
+  if (sdhci_ring_slot (kRingDriver, 64, -1) == sdhci_ring_slot (kRingDriver, 0, -1)) {
+    fail ("cursor 64 landed where cursor 0 landed, so the pinned slots are inside the modulus");
+  }
+  // A second boot overwrites the same pinned slots -- that is the point of a fixed home -- and word 9
+  // is what makes the older sighting a statement about the boot that ended rather than this one.
+  StagingRing next (kRingDriver);
+  for (uint32_t i = 0; i < kRingPinnedSlots; i++) {
+    next.push (pins[i]);
+  }
+  while (next.pending) {
+    next.flush (card, 343, 0, true);
+  }
+  const uint32_t header_lba0 = card.first_lba + kRingOffset[kRingDriver];
+  check ("the pinned slot followed the second boot's id",
+         card.word (header_lba0, kWordBoot), 343u);
+  std::printf ("case pinned_slots pinned=%u ring=%u periodic=%u read_back=%u seq64_slot=%u "
+               "seq0_slot=%u\n",
+               kRingPinnedSlots, kRingCardSlots[kRingDriver],
+               kRingCardSlots[kRingDriver] - kRingPinnedSlots, heads_read,
+               sdhci_ring_slot (kRingDriver, 64, -1), sdhci_ring_slot (kRingDriver, 0, -1));
 }
 
 static void case_ram_drop (void)
@@ -513,7 +645,7 @@ static void case_filter (void)
   for (uint32_t i = 0; i < sdhciLogBlockWords; i++) {
     header[i] = 0xdeadbeefu;
   }
-  sdhci_build_header (header, 13320280u, kRingDriver, 3, 7, boot, 0, text, 7);
+  sdhci_build_header (header, 13320280u, kRingDriver, 3, 7, boot, 0, -1, text, 7);
   // The reader's belief rule, replayed: it recomputes the sum over the bytes the SECTOR holds and
   // compares what it finds with word 4. A writer that sums the bytes before filtering them produces a
   // record that is on the card whole and undecodable, which is why round341 moved the filter into
@@ -567,16 +699,34 @@ static void case_window (const char *path)
   FakeCard card (kBootRecordOffset + 1);
   StagingRing driver (kRingDriver);
   StagingRing kernel (kRingKernel);
-  const uint32_t boot_id = 341;
+  const uint32_t boot_id = 342;
 
+  // Round342: the four pinned rows are pushed first, the way a real boot prints them, because the
+  // window the reader decodes has to look like a card written by a pinning driver. Without them the
+  // ring's first slots are empty, and the reader's new walk -- which names an empty pinned slot
+  // instead of ending the ring there -- has nothing to be tested against.
+  const std::string host_pins[kRingPinnedSlots] = {
+    "clover r283: last reset kind=1 pid=2 aux=3 pc=4 cnt=5 beat=6 beatcnt=7 beatmagic=8 text=x",
+    "clover r339: beatctl wrote=1 read=1 magic_wrote=2 magic_read=2 ok=1",
+    "clover r339: mark wrote=77665500 before=0 after=77665500",
+    "CloverSdhci r174: verdict ring armed lba=13320280 slots=64 pinned=4",
+  };
+  for (uint32_t i = 0; i < kRingPinnedSlots; i++) {
+    driver.push (host_pins[i]);
+  }
+  // Numbered by the seq each row will be written with, not by push order: the pinned rows take the
+  // first sequence numbers, and the reader's leg that says "the content is the row its seq names"
+  // checks exactly that identity. Naming them 0.. would have made the leg's first finding a numbering
+  // disagreement inside the model.
   for (uint32_t i = 0; i < 70; i++) {
-    driver.push ("CloverSdhci r341: host row " + std::to_string (i));
+    driver.push ("CloverSdhci r341: host row " +
+                 std::to_string (kRingPinnedSlots + i));
   }
   // One row carries control bytes on purpose. The byte sum is the one place where the writer's filter
   // and the writer's own checksum have to agree, and across 60,986 archived ring records not one row
   // ever did carry a control byte -- so the reading "undecodable" and the reading "nothing to disagree
   // about" were the same number, 0, with nothing to tell them apart.
-  driver.push (std::string ("CloverSdhci r341: host row 70 tab\tx07\x07high\xff end"));
+  driver.push (std::string ("CloverSdhci r341: host row 74 tab\tx07\x07high\xff end"));
   // Flushed as it is filled, the way the beat does it, so the ring the reader decodes is deep rather
   // than limited by the 128-slot staging depth.
   for (uint32_t i = 0; i < 600; i++) {
@@ -656,6 +806,7 @@ int main (int argc, char **argv)
   case_fits ();
   case_wrap ();
   case_kernel_wrap ();
+  case_pinned_slots ();
   case_ram_drop ();
   case_refused ();
   case_relay ();

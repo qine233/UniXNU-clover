@@ -485,7 +485,7 @@ static uint32_t gVerdictFirst = 0;       // the logfs window's first LBA; both r
 static uint32_t gRingWrite[kRingCount];     // next RAM slot to fill
 static uint32_t gRingPending[kRingCount];   // RAM slots holding text not yet on the card
 static uint32_t gRingDropped[kRingCount];   // records the ring overwrote before they could flush
-static uint32_t gRingCursor[kRingCount];    // card slot counter; slot = cursor % kRingCardSlots
+static uint32_t gRingCursor[kRingCount];    // card slot counter; sdhci_ring_slot() owns the mapping
 static uint32_t gRingSeq[kRingCount];       // stamped in word 8 so a wrapped ring stays ordered
 static uint32_t gRingWritten[kRingCount];
 static volatile uint32_t gRingBusy[kRingCount];
@@ -3858,13 +3858,14 @@ extern "C" unsigned int clover_emmc_probe_say (const char *text, unsigned int le
 static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length,
                              uint32_t kind = 0)
 {
-  const uint32_t lba = sdhci_ring_lba (gVerdictFirst, which, gRingCursor[which]);
+  const int pin = sdhci_pin_index (text, length, which);
+  const uint32_t lba = sdhci_ring_lba (gVerdictFirst, which, gRingCursor[which], pin);
   uint32_t words = 0, status = 0;
   for (uint32_t i = 0; i < kBlockWords; i++) {
     gRingBlock[i] = 0;
   }
   sdhci_build_header (gRingBlock, lba, which, gRingCursor[which], gRingSeq[which], gBootId,
-                      kind, text, length);
+                      kind, pin, text, length);
   uint32_t rsp = 0, rstatus = 0, polls = 0;
   // Round305: name the channel before writing it, so a refusal says which one (21 driver verdicts,
   // 22 the tee's kernel rows, 25 the relayed probe lines).
@@ -8095,8 +8096,14 @@ static void coldBringUp (bool fullReset, unsigned probeMode)
               // The three lines every earlier round's reader looks for, said from here rather than
               // from the report they used to sit in: the ring addresses they name are now logdump's,
               // and they are armed on a mode-21 boot for the first time.
-              sdhciSay ("CloverSdhci r174: verdict ring armed lba=%u slots=%u\n",
-                        gVerdictFirst + kRingOffset[kRingDriver], kRingCardSlots[kRingDriver]);
+              // Round342 adds `pinned=` to the driver's line. Under round341's arithmetic a boot that
+              // writes 64 records erases its own seq 3, and seq 3 is where this row sat, so the card
+              // could not say how its own ring was laid out: the reader had to apply the pinned rule
+              // the current tree happens to hold and hope the card was written by this generation. Now
+              // the row is pinned to a slot rolling writes cannot reach, and it declares the rule.
+              sdhciSay ("CloverSdhci r174: verdict ring armed lba=%u slots=%u pinned=%u\n",
+                        gVerdictFirst + kRingOffset[kRingDriver], kRingCardSlots[kRingDriver],
+                        kRingPinnedSlots);
               sdhciSay ("CloverSdhci r176: kernel ring armed lba=%u slots=%u\n",
                         gVerdictFirst + kRingOffset[kRingKernel], kRingCardSlots[kRingKernel]);
               // gTeeIndex stays at zero on purpose: the lines this port needs most -- the

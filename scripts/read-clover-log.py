@@ -97,6 +97,19 @@ VERDICT_SLOTS = 64    # round174's ring, grown by round176 because the tee no lo
 VERDICT_OFFSET = 64   # sectors past the log window start, clear of the report/panic blocks
 KERNEL_SLOTS = 512    # round176's ring: a whole boot of allowlisted kernel text
 KERNEL_OFFSET = 192   # 64 + 2 * VERDICT_SLOTS: immediately after the driver's ring
+# Round342. The driver ring's first slots belong to named rows and nothing else writes them; the
+# periodic rows turn in the rest. The consequence for this file is that `slot == seq % slots` stops
+# being an identity, so a ring's wrap can no longer be read out of the slot column alone -- seq still
+# orders the records, slot no longer predicts them. The heads are in slot order, and the count comes
+# from the card's own r174 row wherever there is one: which rule a card's sectors follow is a fact
+# about that card, not about the tree that happens to be reading it.
+PINNED_SLOTS = 4
+PINNED_HEADS = [
+    "clover r283: last reset",
+    "clover r339: beatctl",
+    "clover r339: mark",
+    "CloverSdhci r174: verdict ring armed",
+]
 FLIGHT_ENTRY_OFFSET = 32   # round210: the gap the report window and the driver's ring leave
 FLIGHT_ENTRY_SLOTS = 12
 FLIGHT_BEAT_OFFSET = 56    # four one-block beats, 4 s apart, at the end of that gap
@@ -174,11 +187,84 @@ def producer(content):
     return "driver" if content.startswith(DRIVER_PREFIX) else "kernel"
 
 
-def decode(data, first_lba, slots=REPORT_SLOTS, base_sector=0, expect_kind=None):
+def pinned_slot (content):
+    """Which pinned slot a row owns by its own head, or None.
+
+    The head, not the seq: on a card whose arming printed a different number of rows the cursor moves
+    and the row does not, and a reader that keyed slots by position would quietly rename every pinned
+    row. Rows longer than a record are clamped by the writer, so a prefix test is the same test the
+    writer made when it chose the slot.
+    """
+    if content is None:
+        return None
+    text = content.decode ("latin-1") if isinstance (content, (bytes, bytearray)) else content
+    for index, head in enumerate (PINNED_HEADS[:PINNED_SLOTS]):
+        if text.startswith (head):
+            return index
+    return None
+
+
+def card_pinned (data, first_lba):
+    """(declared_pinned_or_None, why). Read from the card's own r174 row, wherever that row lies.
+
+    None is not a failure and not a gap: it says this card was written by an image that had no pinned
+    slots and no column, which is round341's arithmetic and is read that way. A declaration that
+    disagrees with this file's table is the case that has to be said out loud, because applying today's
+    rule to yesterday's card produces records in the wrong homes with every field intact.
+
+    The row is found by its head and not by the slot the pinned rule would give it. That was the first
+    version, and it is circular: which slot holds the declaration is exactly the question the
+    declaration answers. It also mis-spoke, because boot 121's slot 3 held the boot's seq 67 -- a probe
+    tail line -- and the sentence printed for it named the r174 row. The walk asked for is round342's,
+    which covers all 64 slots instead of stopping at the first gap: round341's walk would end the scan
+    at an empty pinned slot and could not see a declaration living past it.
+    """
+    head = next ((h for h in PINNED_HEADS if h.startswith ("CloverSdhci r174")), None)
+    if head is None:
+        return None, "this file pins no r174 row, so it has no declaration to read"
+    head_slot = PINNED_HEADS.index (head)
+    if len (data) < (VERDICT_OFFSET + 2 * VERDICT_SLOTS) * SECTOR:
+        return None, "the window does not reach the end of the driver ring, so no row in it is in scope"
+    rows = [(slot, content.decode ("latin-1"))
+            for slot, _, content, _ in decode (data, first_lba, slots=VERDICT_SLOTS,
+                                               base_sector=VERDICT_OFFSET,
+                                               expect_kind=(21, PROBE_KIND),
+                                               pinned=PINNED_SLOTS)
+            if content is not None and content.startswith (head.encode ("latin-1"))]
+    if not rows:
+        return None, ("no r174 arming row lies anywhere in this ring, so this card declares nothing: "
+                      "an image before round342 pinned that row, read by round341's congruence")
+    declared = [(slot, re.search (r"pinned=(\d+)", text)) for slot, text in rows]
+    values = {int (found.group (1)) for _, found in declared if found}
+    if not values:
+        return None, (f"the ring's r174 row (slot {rows[0][0]}) carries no pinned= column: a "
+                      "pre-round342 image, read by round341's congruence")
+    if len (values) > 1:
+        return None, (f"the ring holds the r174 row in slots {sorted (slot for slot, _ in rows)} with "
+                      f"different declarations {sorted (values)}: no slot rule follows from this card")
+    value = next (iter (values))
+    if value != PINNED_SLOTS:
+        return None, (f"the card declares {value} pinned slots and this reader pins "
+                      f"{PINNED_SLOTS}: the ring would be read by a rule the writer did not follow")
+    if [slot for slot, _ in rows] != [head_slot]:
+        return value, (f"the declaration was read from slots {[slot for slot, _ in rows]}, not the "
+                      f"{head_slot} this file's table pins that head to: the rows keep their names, but "
+                      "this card was laid out by a writer whose table differs from this one")
+    return value, None
+
+
+def decode(data, first_lba, slots=REPORT_SLOTS, base_sector=0, expect_kind=None, pinned=None):
     """[(slot, header dict, text bytes or None, problems [str])] in slot order.
 
     The writers scan forward and stop at the first header without the magic, so a
     gap ends the window: later slots are not records of this boot.
+
+    `pinned` is the count this card declares for round342's pinned slots. Given, the walk covers the
+    ring's whole slot count -- an empty pinned slot is a named absence rather than an end -- and every
+    record is asked which home it owns: a pinned row anywhere but its own slot is a card that was read
+    by the wrong rule, and a non-pinned row inside the pinned range is a writer that ignored the rule.
+    Absent (a pre-round342 card, or a card that declares nothing readable), round341's single
+    forward-scan semantics stay exactly as they were, because that is the rule that card was written by.
 
     `expect_kind` is what a ring's own records must say in word 5. Round176 made the
     two rings the same shape in every other field, so the kind is the only thing in a
@@ -203,7 +289,12 @@ def decode(data, first_lba, slots=REPORT_SLOTS, base_sector=0, expect_kind=None)
         magic0, magic1, lba, total, checksum, kind, body, slot_word, seq, boot = \
             struct.unpack_from("<10I", block)
         if (magic0, magic1) != MAGIC:
-            break
+            if pinned is None:
+                break
+            # A pinned slot whose row was never written this boot is an empty slot with a name, not a
+            # gap that ends the ring: round341's walk would have stopped here and reported the whole
+            # ring as the four records before it, which reads as a boot that printed almost nothing.
+            continue
         problems = []
         want_lba = first_lba + base_sector + 2 * slot
         if lba != want_lba:
@@ -233,6 +324,12 @@ def decode(data, first_lba, slots=REPORT_SLOTS, base_sector=0, expect_kind=None)
                 problems.append(f"sum {checksum:#x} != {computed:#x}")
         elif not any(text):
             problems.append("text block empty")
+        if pinned is not None:
+            owner = pinned_slot (content)
+            if owner is not None and slot != owner:
+                problems.append (f"pinned row {owner} sits in slot {slot}")
+            elif owner is None and slot < pinned:
+                problems.append (f"slot {slot} is pinned and holds a row nobody pinned to it")
         records.append((slot, {
             "lba": lba,
             "total": total,
@@ -858,6 +955,57 @@ def fill_conversions(fmt):
     return "".join(out)
 
 
+def card_pinned_selftest():
+    """The ring-rule discovery, judged on windows built here rather than on a card.
+
+    Round342's first version asked slot 3 -- the slot the pinned rule gives the arming row -- whether
+    the card declared pinned slots, which assumes the answer to the question it was asking. Boot 121's
+    card showed what that costs: slot 3 held that boot's seq 67, a probe tail line, and the sentence
+    printed for it named the r174 row. These six windows are the shapes a real card has been seen in:
+    the declaration at home (round342), the declaration rolled elsewhere without the column (boot 120,
+    v0.7.56), and no declaration at all because the same boot erased it (boot 121, v0.7.59).
+    """
+    armed = "CloverSdhci r174: verdict ring armed lba=13320280 slots=64 pinned=4"
+    armed_old = "CloverSdhci r174: verdict ring armed lba=13320280 slots=64"
+    rolling = "clover r331: bbsend t=707 pid=58 hop=0 nm=4303 obj=0 e=17 sr=0"
+    probe_tail = "CloverSdhci r307: probe why=tail calls=137841"
+
+    def window(rows):
+        data = bytearray((VERDICT_OFFSET + 2 * VERDICT_SLOTS) * SECTOR)
+        for slot, kind, text, seq in rows:
+            record = build_record(kind, slot, LOG_WINDOW_FIRST_LBA + VERDICT_OFFSET + 2 * slot,
+                                  text, seq=seq, boot=121)
+            start = (VERDICT_OFFSET + 2 * slot) * SECTOR
+            data[start:start + len(record)] = record
+        return bytes(data)
+
+    def check(rows):
+        return card_pinned(window(rows), LOG_WINDOW_FIRST_LBA)
+
+    value, why = check([(3, 21, armed, 3), (4, 21, rolling, 4)])
+    assert (value, why) == (PINNED_SLOTS, None), (value, why)
+
+    value, why = check([(4, 21, armed_old, 3), (3, 25, probe_tail, 67)])
+    assert value is None and "carries no pinned= column" in why and "slot 4" in why, (value, why)
+
+    value, why = check([(3, 25, probe_tail, 67), (4, 21, rolling, 4)])
+    assert value is None and "no r174 arming row" in why, (value, why)
+    assert "the card's r174 row" not in why, (
+        f"the sentence names a row this window does not hold: {why!r} -- boot 121's card is the "
+        "reading that proved a slot is not a row")
+
+    value, why = check([(3, 21, armed.replace("pinned=4", "pinned=2"), 3)])
+    assert value is None and "declares 2 pinned slots" in why, (value, why)
+
+    value, why = check([(5, 21, armed, 3), (3, 25, probe_tail, 67)])
+    assert value == PINNED_SLOTS and why and "slots [5]" in why, (value, why)
+
+    value, why = check([(3, 21, armed, 3), (7, 21, armed.replace("pinned=4", "pinned=6"), 71)])
+    assert value is None and "different declarations" in why, (value, why)
+    return True
+
+
+
 def selftest():
     """Round-trip all three windows, including a wrapped ring of each kind. The rings' geometry is
     asserted rather than trusted from a device frame: the driver computes the LBA of every record from
@@ -1384,9 +1532,11 @@ def selftest():
     assert "clocks unreadable" in said, said
     assert "1129076301" not in said and "1129075571250" not in said, said
     timeline_selftest()
+    card_pinned_selftest()
     print("read-clover-log selftest: report window, both rings, flight region, wrap order, "
           "ring kinds, bad records, the r302 verdict signatures, the r305 clock pair, the r310 "
-          "sink-door words and the older-payload clock guard all ok")
+          "sink-door words, the older-payload clock guard, and the ring rule read from the "
+          "declaring row wherever that row lies -- all ok")
     return 0
 
 
@@ -1848,7 +1998,13 @@ def main():
         need = (base + 2 * slots) * SECTOR
         if len(data) < need:
             raise SystemExit(f"{path} is {len(data)} bytes; the {window} needs {need}")
-    records = decode(data, args.first_lba, slots=slots, base_sector=base, expect_kind=kind)
+    pinned = None
+    if base == VERDICT_OFFSET and slots == VERDICT_SLOTS:
+        pinned, why = card_pinned (data, args.first_lba)
+        if why:
+            print (f"[ring rule] {why}", file=sys.stderr)
+    records = decode(data, args.first_lba, slots=slots, base_sector=base, expect_kind=kind,
+                     pinned=pinned)
     if args.probe:
         records = of_kind(records, PROBE_KIND)
     if args.driver:

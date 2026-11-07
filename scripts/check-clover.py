@@ -555,7 +555,8 @@ def check_board(errors: list) -> str:
         "static const uint32_t kFlightPanicOffset = 61;",
         "static const uint32_t kFlightDrainOffset = 63;",
         "static const uint32_t kFlightMarkerMagic = 0x434C564Du;",
-        "return cursor % kRingCardSlots[which];",
+        "return floor + cursor % (kRingCardSlots[which] - floor);",
+        "static const uint32_t kRingPinnedSlots = 4;",
         "header[kWordBoot] = boot_id;",
     ))
     sdhci_layer = REPO / "drivers/CloverSdhci/SdhciLogCore.h"
@@ -7181,8 +7182,8 @@ def check_board(errors: list) -> str:
     # gains arg/done/cur/list and drops swap; bbsend now prints every hop), so the menu names round335
     # while rows this round did not touch keep their own generation tokens (bbsend r331, bbrcv r328,
     # dispstate r329) -- a card row names its probe generation, the title names the image that ran.
-    if not board["payload"]["title"].startswith("clover r341:"):
-        errors.append('[payload] title is not "clover r341: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r342:"):
+        errors.append('[payload] title is not "clover r342: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -8147,8 +8148,14 @@ done
                        # offset table gives -- words 7, 8 and 9 and the lba of round174's claim. The
                        # positions themselves are pinned against the reader by scripts/test-clover-sdhci-
                        # geometry.py's fourth leg, which is a comparison rather than a substring.
-                       "const uint32_t lba = sdhci_ring_lba (gVerdictFirst, which, gRingCursor[which]);",
+                       # Round342 adds the third argument to both: the row's own pin, read once into one
+                       # local before the sector is chosen. A record whose slot came from a second answer
+                       # to the same question would sit in one sector and name another, and the reader
+                       # would call the older of the two corrupt.
+                       "const int pin = sdhci_pin_index (text, length, which);",
+                       "const uint32_t lba = sdhci_ring_lba (gVerdictFirst, which, gRingCursor[which], pin);",
                        "sdhci_build_header (gRingBlock, lba, which, gRingCursor[which], gRingSeq[which], gBootId,",
+                       "kind, pin, text, length);",
                        "static void flushVerdictRing (void)",
                        'IOLog ("%s\\n", line);',
                        "gVerdictFirst = entryLdFirst;",
@@ -8261,8 +8268,12 @@ done
                        "static const uint32_t kRingRamSlots = 128;",
                        "static char gRingText[kRingCount][kRingRamSlots][kVerdictTextBytes];",
                        # Word 7 is the slot the ring's own cursor rule lands this record in; round341 put
-                       # that rule in the layer, and the model's wrap leg is what shows the driver obeys it.
-                       "return cursor % kRingCardSlots[which];",
+                       # that rule in the layer, and the model's wrap leg is what shows the driver obeys
+                       # it. Round342 put a floor under it -- the driver ring's first slots belong to the
+                       # rows named in kPinHeads -- so the un-floored form is the bug this needle now
+                       # catches, and negative case N61 is what proves it.
+                       "return floor + cursor % (kRingCardSlots[which] - floor);",
+                       "static const uint32_t kRingPinnedSlots = 4;",
                        "static void flushRing (uint32_t which)",
                        "flushRing (kRingDriver);",
                        "flushRing (kRingKernel);",
@@ -8595,7 +8606,8 @@ done
         core_text = sdhci_core.read_text()
         for needle in ("return pending >= kRingRamSlots ? 1u : 0u;",
                        "return write_cursor % kRingRamSlots;",
-                       "return cursor % kRingCardSlots[which];",
+                       "return floor + cursor % (kRingCardSlots[which] - floor);",
+                       "const uint32_t floor = (which == kRingDriver) ? kRingPinnedSlots : 0u;",
                        "return length > kRecordBodyBytes ? kRecordBodyBytes : length;",
                        "return kLogPrefixLength + body + 1u;",
                        "return kind ? kind : ((which == kRingKernel) ? 22u : 21u);",
@@ -8676,8 +8688,11 @@ done
         if run.returncode:
             named = [line[len("PROBLEM "):].strip() for line in run.stdout.splitlines()
                      if line.startswith("PROBLEM ")]
+            # Every name, not the first six: the cap was a horizon, and round342's N60 broke a leg whose
+            # sentence the model prints last -- the gate was red and the reading it was red for had been
+            # cut off. Each line is still bounded, and the model's checks are a fixed set.
             detail = "\n      named: " + " | ".join(
-                line if len(line) < 150 else line[:147] + "..." for line in named[:6]) if named else \
+                line if len(line) < 150 else line[:147] + "..." for line in named) if named else \
                 "\n      (no PROBLEM line: the script died before naming anything)\n" + \
                 (run.stdout + run.stderr)[-500:]
             errors.append("the sdhci record layer's host model failed" + detail)
@@ -8759,6 +8774,69 @@ done
             errors.append("scripts/read-clover-log.py still keeps 0x09 and 0x0b through 0x1f as "
                           "original: those 22 bytes are the writer's to replace, and a reader that "
                           "prints them as text invents what the card never held")
+
+    # Round342's reader homes. The pinned layout is one number and one table, and before this block
+    # the reader held its own copies of both and nothing compared them: N60/N61/N62 all mutate the
+    # layer, so a reader pinning three slots beside a card that pins four decoded rows into homes the
+    # writer never gave them, with every header field intact. The comparison reads both files' own
+    # declarations -- no count and no head is retyped here, which would be the fourth copy of the
+    # thing this leg exists to keep single.
+    #
+    # The second half is what boot 121's card made into a claim. card_pinned used to open the slot the
+    # pinned rule gives the arming row and ask that row which rule the card follows -- the question
+    # folded into the answer -- and on a pre-342 card slot 3 held that boot's seq 67, a probe tail
+    # line, so the sentence printed for it named a row it had never identified. A declaration is now
+    # found by its head over the whole ring, which means the walk it asks for cannot be the pre-342
+    # one that stops at the first gap: hence the walk's own argument is the needle, and the lookup it
+    # replaced is banned as a shape.
+    if reader_sample is not None and sdhci_layer_text:
+        layer_pins = re.search(r"^static const uint32_t kRingPinnedSlots = (\d+);",
+                               sdhci_layer_text, re.M)
+        reader_pins = re.search(r"^PINNED_SLOTS = (\d+)", reader_src, re.M)
+        layer_heads = re.findall(r'static const char kPinHead\w+\[\] = "([^"]+)";', sdhci_layer_text)
+        heads_block = re.search(r"PINNED_HEADS = \[(.*?)\n\]", reader_src, re.S)
+        reader_heads = re.findall(r'^\s+"([^"]+)",', heads_block.group (1), re.M) if heads_block else []
+        if layer_pins is None or reader_pins is None:
+            errors.append(f"the pinned count is not declared where it is judged (layer "
+                          f"{'ok' if layer_pins else 'missing'}, reader "
+                          f"{'ok' if reader_pins else 'missing'}): one number, three homes is a claim "
+                          "only three parseable declarations can keep")
+        else:
+            counts = (int (layer_pins.group (1)), int (reader_pins.group (1)),
+                      len (layer_heads), len (reader_heads))
+            if len (set (counts)) != 1:
+                errors.append(f"the pinned layout is four numbers, not one: layer declares "
+                              f"{counts[0]} slots and {counts[2]} heads, this reader pins {counts[1]} "
+                              f"slots and {counts[3]} heads -- a card read with a floor its writer did "
+                              "not use lands rows in homes nobody wrote")
+            if layer_heads and reader_heads and layer_heads != reader_heads:
+                errors.append(f"the reader pins heads the layer does not ({set (reader_heads) - set (layer_heads)}) "
+                              f"or not the layer's ({set (layer_heads) - set (reader_heads)}): slot "
+                              "numbers are assigned by row identity, so a renamed head is a row without "
+                              "a home")
+        discovery = reader_src.split ("def card_pinned (data, first_lba):")[-1].split ("\ndef ")[0]
+        # Judged on code lines: this function's own comment says what the shape it replaced did, and a
+        # ban that reads prose is fed by the sentence that explains the bug.
+        discovery_code = discovery.split ('"""\n', 1)[-1]
+        discovery_code = "\n".join (line for line in discovery_code.splitlines ()
+                                    if not line.lstrip ().startswith ("#"))
+        if "pinned=PINNED_SLOTS)" not in discovery_code:
+            errors.append("card_pinned does not walk the ring with round342's own semantics: the "
+                          "pre-342 walk stops at the first empty slot, so a declaration living past one "
+                          "is invisible to the function whose job is to find it")
+        if "content.startswith (head.encode" not in discovery_code:
+            errors.append("card_pinned does not identify the declaring row by its own head: boot 121's "
+                          "slot 3 held that boot's seq 67, and a slot is not a row -- asking the slot "
+                          "which rule the card follows is the question folded into the answer")
+        if "no r174 arming row" not in discovery_code:
+            errors.append("card_pinned has no sentence for a ring that holds no declaring row: that is "
+                          "the shape boot 121's card arrived in, its arming row erased by the very "
+                          "arithmetic this round replaces, and silence there reads as a gap in the card")
+        if "    card_pinned_selftest()\n" not in reader_src:
+            errors.append("scripts/read-clover-log.py --selftest does not run its ring-rule leg (the "
+                          "call line, not the definition -- `def card_pinned_selftest():` carries the "
+                          "same characters and proves nothing): which row declares the layout would be "
+                          "measured only by whichever card the next reader happens to have")
 
     # Round186. launchd panics with "required boot task executable not found" and neither the panel nor
     # the card says which path its posix_spawn() looked up. The kernel is the only place that knows, and
@@ -9095,8 +9173,8 @@ done
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r341:"):
-        errors.append('[payload] title is not "clover r341: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r342:"):
+        errors.append('[payload] title is not "clover r342: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

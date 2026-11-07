@@ -123,6 +123,20 @@ static const uint32_t kRingSectorsPerRecord = 2;   // header sector then text se
 // Records flushed per guarded pass, per ring. Two block writes each, and a flush must not hold the
 // guard long: eight is 16 writes, which at the round159 rates is a few milliseconds.
 static const uint32_t kRingFlushPerPass[kRingCount] = {4, 8};
+// Round342. The driver's card ring is 64 slots and a boot writes more than 64 records in it, so the
+// first records of a boot are erased by its own later ones: boot 120's card held driver seq 4..67 and
+// the three one-shot rows -- seq 0,1,2 -- were gone, which is why round339's M-B/M-C/M-E could not be
+// judged from a card at all. The fix is not fewer periodic writes; it is a home they cannot reach. The
+// first kRingPinnedSlots slots of the driver ring belong to the rows named below and to nothing else,
+// and rolling writes turn in the rest. One number, three homes: this layer, the reader's window walk,
+// and the gate's needle.
+//
+// The fourth pinned row is the ring's own declaration, and it is pinned for the same reason the three
+// readings are: under round341's arithmetic a boot that writes 64 records erases its own seq 3, which
+// is where "CloverSdhci r174: verdict ring armed" lived -- so the card could not say how its own ring
+// was laid out. That is what `pinned=` on that row is for: the reader applies a slot rule the card
+// declares rather than one it guesses from the current tree.
+static const uint32_t kRingPinnedSlots = 4;
 
 static const uint32_t kBootRecordOffset = 192 + 2 * 512;   // one record past the kernel ring
 static const uint32_t kBootKind = 24;
@@ -221,18 +235,73 @@ static inline uint32_t sdhci_record_kind_word (uint32_t kind, uint32_t which)
   return kind ? kind : ((which == kRingKernel) ? 22u : 21u);
 }
 
+// Which row owns which pinned slot. The name is taken from the row's own text, not from the cursor,
+// because the cursor is a fact about what else this boot happened to print first: if a fourth one-shot
+// row is ever added before these three, a position rule would hand its slot to the new row, the three
+// readings would move, and the card would still look internally consistent. By identity, a row that is
+// not on this list cannot take a pinned slot, and a row on it cannot miss one -- and the r283 row's two
+// arms ("kind=" and "unnamed") share the head that is listed, so whichever arm fires owns slot 0.
+static const char kPinHeadLastReset[] = "clover r283: last reset";
+static const char kPinHeadBeatCtl[] = "clover r339: beatctl";
+static const char kPinHeadMark[] = "clover r339: mark";
+static const char kPinHeadRingArmed[] = "CloverSdhci r174: verdict ring armed";
+static const char *const kPinHeads[kRingPinnedSlots] = {
+  kPinHeadLastReset, kPinHeadBeatCtl, kPinHeadMark, kPinHeadRingArmed
+};
+static const uint32_t kPinHeadLengths[kRingPinnedSlots] = {
+  static_cast<uint32_t> (sizeof (kPinHeadLastReset) - 1),
+  static_cast<uint32_t> (sizeof (kPinHeadBeatCtl) - 1),
+  static_cast<uint32_t> (sizeof (kPinHeadMark) - 1),
+  static_cast<uint32_t> (sizeof (kPinHeadRingArmed) - 1)
+};
+
+// -1 unless this line is one of the pinned rows in the driver's own ring. sdhciSay's lines also reach
+// the kernel ring through the tee, so the caller's `which` is part of the question, not a detail: a
+// tee copy of the same sentence is a second voice about the same boot, and it belongs to a ring that
+// wraps on its own 512.
+static inline int sdhci_pin_index (const char *text, uint32_t length, uint32_t which)
+{
+  if (which != kRingDriver) {
+    return -1;
+  }
+  for (uint32_t i = 0; i < kRingPinnedSlots; i++) {
+    const uint32_t head = kPinHeadLengths[i];
+    if (length < head) {
+      continue;
+    }
+    uint32_t j = 0;
+    for (; j < head; j++) {
+      if (text[j] != kPinHeads[i][j]) {
+        break;
+      }
+    }
+    if (j == head) {
+      return static_cast<int> (i);
+    }
+  }
+  return -1;
+}
+
 // Where a ring's cursor lands, given the window's first LBA. Slot index alone stops being time once a
 // ring has more records than slots, which is why word 8 exists and why this is one expression and not
 // two (the writer's lba and the reader's window walk have to disagree loudly, not quietly).
-static inline uint32_t sdhci_ring_slot (uint32_t which, uint32_t cursor)
+// Round342 splits it into two shapes: a pinned row keeps its own slot forever, and a rolling write
+// turns in the slots below it that are left over. The consequence the reader has to carry is that
+// `slot == seq % depth` is no longer an identity -- seq is still the clock, slot is no longer derivable
+// from seq alone.
+static inline uint32_t sdhci_ring_slot (uint32_t which, uint32_t cursor, int pin)
 {
-  return cursor % kRingCardSlots[which];
+  if (pin >= 0) {
+    return static_cast<uint32_t> (pin);
+  }
+  const uint32_t floor = (which == kRingDriver) ? kRingPinnedSlots : 0u;
+  return floor + cursor % (kRingCardSlots[which] - floor);
 }
 
-static inline uint32_t sdhci_ring_lba (uint32_t first_lba, uint32_t which, uint32_t cursor)
+static inline uint32_t sdhci_ring_lba (uint32_t first_lba, uint32_t which, uint32_t cursor, int pin)
 {
   return first_lba + kRingOffset[which] +
-         kRingSectorsPerRecord * sdhci_ring_slot (which, cursor);
+         kRingSectorsPerRecord * sdhci_ring_slot (which, cursor, pin);
 }
 
 // The ten words, in the order the reader unpacks them, for a caller that already knows its kind and its
@@ -259,13 +328,15 @@ static inline void sdhci_build_words (uint32_t *header, uint32_t lba, uint32_t k
 
 // Fill the header sector's ten words and the text sector, in the order the reader unpacks them. The
 // caller zeroes neither buffer: this writes all kRecordHeaderWords words and exactly one sector of text,
-// so a stale word cannot survive in a position this record did not assign.
+// so a stale word cannot survive in a position this record did not assign. `pin` is the caller's answer
+// to sdhci_pin_index and has to be the same answer it used for the lba: a record whose slot word came
+// from a different pin than the sector it sits in is a record the reader calls corrupt.
 static inline void sdhci_build_header (uint32_t *header, uint32_t lba, uint32_t which,
                                       uint32_t cursor, uint32_t seq, uint32_t boot_id,
-                                      uint32_t kind, const char *text, uint32_t length)
+                                      uint32_t kind, int pin, const char *text, uint32_t length)
 {
   sdhci_build_words (header, lba, sdhci_record_kind_word (kind, which),
-                     sdhci_ring_slot (which, cursor), seq, boot_id, text, length);
+                     sdhci_ring_slot (which, cursor, pin), seq, boot_id, text, length);
 }
 
 // The panic screen's report record. Its slot comes from the scan that chose it, not from a cursor, and

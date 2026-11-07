@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Negative tests for the #716, #718, #719, #720, #720b and #653 needles in scripts/check-clover.py.
+"""Negative tests for the #716, #718, #719, #720, #720b, #653 and #728 needles in scripts/check-clover.py.
 
 Each case breaks one shape the gate now pins, runs the gate, and restores in a finally block: a
 negative test that leaves its edit behind is worse than no negative test, because the next gate run
@@ -35,7 +35,7 @@ SDHCI_GEOMETRY = REPO / "scripts/test-clover-sdhci-geometry.py"
 PANIC = REPO / "scripts/xnu-panic-screen.c"
 HARNESS = REPO / "drivers/CloverPower/tests/clover_power_host.cpp"
 GATE = REPO / "scripts/check-clover.py"
-LOG = Path.home() / "clover-out/round341-sdhci-core/negatives.log"
+LOG = Path.home() / "clover-out/round342-pinned-slots/negatives.log"
 
 SILENT_AFTER = '''      timeline_close "neither-$(usb_landing_class)" "" ""
       return 2
@@ -317,14 +317,64 @@ CASES = [
     # N59 removes the line carrying its denominator, because a leg whose scan size nobody prints could
     # be scanning nothing and reporting clean.
     ("N58 the driver keeps a local from a layer call that nothing reads",
-     [(SDHCI, "  const uint32_t lba = sdhci_ring_lba (gVerdictFirst, which, gRingCursor[which]);",
+     [(SDHCI, "  const uint32_t lba = sdhci_ring_lba (gVerdictFirst, which, gRingCursor[which], pin);",
        "  const uint32_t body = sdhci_record_body (length);\n"
-       "  const uint32_t lba = sdhci_ring_lba (gVerdictFirst, which, gRingCursor[which]);")],
+       "  const uint32_t lba = sdhci_ring_lba (gVerdictFirst, which, gRingCursor[which], pin);")],
      "the local body is declared from a call into the layer and never read again"),
     ("N59 the locals leg stops printing what it scanned",
      [(SDHCI_GEOMETRY, '"driver locals: {len (locals_declared)} bound from a layer call',
        '"driver localities: {len (locals_declared)} bound from a layer call')],
      "printed no driver locals line"),
+    # Round342's registered cases. The instrument being judged is a slot rule, so each case breaks one
+    # link and asks which leg notices. N60 renames a pinned head in the layer AND in the reader, so the
+    # two declarations still agree and no textual leg can see it: the row the model pushes under its old
+    # name no longer matches a head, lands rolling, and the pinned slot stays empty. Only the model's
+    # read-back can say that. N68 renames it in the layer alone, which is the cross-file leg's own
+    # disagreement -- the first version of N60 did this and was red for that leg, not for the model, so
+    # the two shapes are registered separately rather than one case wearing the other's sentence.
+    # N61 leaves the pins in place but lets the rolling modulus run through them, which is the quiet
+    # direction (a pinned row is overwritten by a periodic one and both words still look legal). N62
+    # moves the count away from the table, the one-number-three-homes leg's own disagreement.
+    ("N60 a pinned head is renamed in both declarations, so only the card can see the row lose its home",
+     [(SDHCI_LAYER, 'static const char kPinHeadMark[] = "clover r339: mark";',
+       'static const char kPinHeadMark[] = "clover r339: markx";'),
+      (READER, '    "clover r339: mark",', '    "clover r339: markx",')],
+     "a pinned slot held no record"),
+    ("N61 the rolling modulus runs through the pinned slots",
+     [(SDHCI_LAYER, "  return floor + cursor % (kRingCardSlots[which] - floor);",
+       "  return floor + cursor % kRingCardSlots[which];")],
+     "this is a bound, a cursor rule or a checksum that the host model proves"),
+    ("N62 the pinned count and the pinned table are two decisions",
+     [(SDHCI_LAYER, "static const uint32_t kRingPinnedSlots = 4;",
+       "static const uint32_t kRingPinnedSlots = 3;")],
+     "the pinned table lists 4 heads while kRingPinnedSlots is 3"),
+    # The same arithmetic seen from the reader's side: the pinned layout lives in four declarations
+    # across two files, and N61/N62/N68 mutate the layer alone. None of them can make a reader whose
+    # own count disagrees with the layer go red.
+    ("N63 the reader's pinned count moves away from the layer's",
+     [(READER, "PINNED_SLOTS = 4", "PINNED_SLOTS = 3")],
+     "the pinned layout is four numbers, not one"),
+    # The second half is boot 121's card: the reader used to open the slot the rule gives the arming
+    # row and ask that row which rule the card follows. Each case below breaks one link of the
+    # replacement and expects the gate to name that link -- the phrase is the gate's own sentence, so
+    # a red that came from a traceback quoting the reader would not count.
+    ("N64 the reader walks the ring with the pre-342 semantics that stop at the first gap",
+     [(READER, "pinned=PINNED_SLOTS)", "pinned=None)")],
+     "does not walk the ring with round342's own semantics"),
+    ("N65 the reader picks the declaring row by its slot instead of its head",
+     [(READER, 'content.startswith (head.encode ("latin-1"))', "slot == head_slot")],
+     "does not identify the declaring row by its own head"),
+    ("N66 the reader has no sentence for a card that holds no declaring row",
+     [(READER, '"no r174 arming row lies anywhere in this ring, so this card declares nothing: "',
+       '"the ring holds nothing that declares itself, so this card says nothing: "')],
+     "has no sentence for a ring that holds no declaring row"),
+    ("N67 the reader's ring-rule leg is written but never run",
+     [(READER, "    card_pinned_selftest()\n", "")],
+     "does not run its ring-rule leg"),
+    ("N68 a pinned head is renamed in the layer alone, so the reader's table names a row nobody writes",
+     [(SDHCI_LAYER, 'static const char kPinHeadMark[] = "clover r339: mark";',
+       'static const char kPinHeadMark[] = "clover r339: markx";')],
+     "the reader pins heads the layer does not"),
 ]
 
 

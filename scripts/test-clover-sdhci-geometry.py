@@ -416,13 +416,19 @@ if driver_window and byte_asks and driver_window * SECTOR not in byte_asks:
 # .cpp alone, because the layer has no business naming a write.
 sectors_per_record = scalar (layer_code, "kRingSectorsPerRecord", "the layer")
 k_record_header_words = scalar (layer_code, "kRecordHeaderWords", "the layer")
+pinned_slots = scalar (layer_code, "kRingPinnedSlots", "the layer")
 if re.search (r"return first_lba \+ kRingOffset\[which\] \+\s*"
-              r"kRingSectorsPerRecord \* sdhci_ring_slot \(which, cursor\);", layer_code) is None \
-        or re.search (r"return cursor % kRingCardSlots\[which\];", layer_code) is None \
+              r"kRingSectorsPerRecord \* sdhci_ring_slot \(which, cursor, pin\);", layer_code) is None \
+        or re.search (r"return floor \+ cursor % \(kRingCardSlots\[which\] - floor\);",
+                      layer_code) is None \
+        or re.search (r"const uint32_t floor = \(which == kRingDriver\) \? kRingPinnedSlots : 0u;",
+                      layer_code) is None \
         or sectors_per_record != 2:
     fail ("the writer's record address is no longer first_lba + kRingOffset[r] + "
-          "2 * (cursor % slots): the arithmetic in this script is a claim about a formula that "
-          "may have moved, and a moved formula is exactly what the roundtrip cannot see")
+          "2 * sdhci_ring_slot (which, cursor, pin) with the rolling branch "
+          "floor + cursor % (slots - floor) and that floor named only for the driver's ring: the "
+          "arithmetic in this script is a claim about a formula that may have moved, and a moved "
+          "formula is exactly what the roundtrip cannot see")
 body_clamp = scalar (layer_code, "kRecordBodyBytes", "the layer")
 shape = [
     ("the length field is clamped through the layer's own bound",
@@ -518,11 +524,75 @@ def layer_body (name):
 
 ring_body = layer_body ("sdhci_build_header")
 for derivation in ("sdhci_build_words (", "sdhci_record_kind_word (kind, which)",
-                   "sdhci_ring_slot (which, cursor)"):
+                   "sdhci_ring_slot (which, cursor, pin)"):
     if derivation not in ring_body:
         fail (f"the ring builder no longer passes {derivation} to the ten-word builder: the record's kind "
               "and slot would come from somewhere else, and the two literals that say which ring a record "
               "belongs to would be unread")
+
+# --- leg 4c: round342's pinned slots, read from the three places that must say one number ---
+# The count is one number with three homes (layer, reader, card) and the heads are a second table with
+# two. A pinned row that the reader does not know about is a row the reader files as a rolling one, and
+# a rolling record the layer does not know about is a record that lands in a pinned slot and is read as
+# whichever pinned row that slot's head names -- which is a wrong answer that looks exactly like a
+# reading. Both directions are checked here, and the driver's own declaration is the third voice: the
+# r174 row prints the number it uses, so a card says which generation's arithmetic its own slots follow.
+pinned_decl = re.findall (r"static const char \*const kPinHeads\[kRingPinnedSlots\] = \{(.*?)\};",
+                          layer_code, re.S)
+if pinned_slots is None:
+    fail ("the layer declares no kRingPinnedSlots: the pinned count would be this script's number, not "
+          "the writer's, and a ring read by a rule nobody wrote is the round319 silence on the way in")
+elif len (pinned_decl) != 1:
+    fail (f"the layer's pinned-head table is declared in {len (pinned_decl)} places, expected exactly "
+          "one: two tables can disagree, and the pinned slot is the only place a reader looks")
+else:
+    table_names = [n.strip () for n in pinned_decl[0].split (",") if n.strip ()]
+    head_literals = dict (re.findall (r'static const char (kPinHead\w+)\[\] = "([^"]*)";', layer_code))
+    unnamed = [n for n in table_names if n not in head_literals]
+    if unnamed:
+        fail (f"the pinned table lists {unnamed}, which the layer declares no literal for: the slot "
+              "would be named by an identifier nobody can match against the card's bytes")
+        layer_heads = []
+    else:
+        layer_heads = [head_literals[n] for n in table_names]
+        missing = sorted (set (head_literals) - set (table_names))
+        if missing:
+            fail (f"the layer declares pinned literals {missing} that no table lists: the rows would "
+                  "be pinned to nothing, which is boot 120's absence with a name attached")
+    if len (table_names) != pinned_slots:
+        fail (f"the pinned table lists {len (table_names)} heads while kRingPinnedSlots is "
+              f"{pinned_slots}: the count and the table are the same decision written twice, and a row "
+              "with no head has no home")
+    declared = re.search (r"sdhciSay \(\"CloverSdhci r174: verdict ring armed lba=%u slots=%u "
+                          r"pinned=%u", driver_code)
+    if declared is None:
+        fail ("the driver no longer declares its pinned count on the card in the r174 row: a reader "
+              "would apply this tree's rule to a card written under another one, and the disagreement "
+              "would be invisible")
+    if "kRingPinnedSlots);" not in driver_code:
+        fail ("the r174 row's pinned column is no longer filled from kRingPinnedSlots: the declaration "
+              "would be a typed number, which is a fourth copy of the count")
+    reader_pinned = re.findall (r"^PINNED_SLOTS = (\d+)", reader_text, re.M)
+    reader_heads = re.findall (r"^PINNED_HEADS = \[(.*?)\]", reader_text, re.S | re.M)
+    if not reader_pinned:
+        fail ("the reader declares no PINNED_SLOTS at module level: the walk of the driver ring would "
+              "keep using seq modulo slots, which is round341's rule and stops being true the moment a "
+              "slot is pinned")
+    else:
+        int_pinned = int (reader_pinned[0])
+        if int_pinned != pinned_slots:
+            fail (f"the reader pins {int_pinned} slots and the layer pins {pinned_slots}: the card's "
+                  "first records would be read as a different row than the one written there")
+        if layer_heads and len (reader_heads) != 1:
+            fail (f"the reader's pinned-head list is declared in {len (reader_heads)} places, expected "
+                  "one")
+        elif layer_heads:
+            r_heads = [h.strip ().strip ('"\'') for h in reader_heads[0].replace ("\n", " ").split (",")
+                       if h.strip ()]
+            if r_heads != layer_heads:
+                fail (f"the reader names {r_heads} where the layer pins {layer_heads}: a row can be "
+                      "filed in a slot the writer never assigned, or a pinned row can be read as a "
+                      "rolling one and erased by the next lap")
 panic_body = layer_body ("sdhci_build_panic_header")
 for derivation in ("sdhci_build_words (", "kPanicKind"):
     if derivation not in panic_body:

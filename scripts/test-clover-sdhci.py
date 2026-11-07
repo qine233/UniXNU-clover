@@ -108,12 +108,19 @@ def main () -> int:
         return 1
     run = subprocess.run ([str (BIN), str (WINDOW)], capture_output=True, text=True)
     if run.returncode:
-        # Indented on the way in. The gate names a failing leg by the lines this script itself prints
-        # with a PROBLEM prefix, and the binary's check lines arrive with the same prefix: unindented,
-        # the seven of them crowd the leg's own sentence out of the gate's window and round341's N45
-        # was judged by something other than the tee leg it was written to test.
-        fail ('the sdhci host model reported failures:\n' +
-              '\n'.join ('  | ' + line for line in run.stdout.splitlines ())[-1500:])
+        # By name, one line each. Round341 indented these behind a '  | ' prefix and tailed the whole
+        # report to 1500 characters so they would not crowd the gate's window; round342's N60 then went
+        # red with the model's own sentence -- "a pinned slot held no record" -- nowhere in the gate's
+        # output, because the gate names a leg by the PROBLEM lines this script prints and an indented
+        # line is not one. The crowding was the gate's six-line cap, so that cap is gone and the names
+        # come through. The tail survives only for a model that died before naming anything.
+        named = [line[len ('PROBLEM '):].strip () for line in run.stdout.splitlines ()
+                 if line.startswith ('PROBLEM ')]
+        for line in named:
+            fail (f'the sdhci host model named: {line}')
+        if not named:
+            fail ('the sdhci host model reported failures and named none of them:\n' +
+                  '\n'.join ('  | ' + line for line in run.stdout.splitlines ())[-1500:])
     if 'sdhci host model: OK' not in run.stdout:
         fail ('the sdhci host model printed no "sdhci host model: OK" line: a crash would look the same '
               'as a pass to anyone reading only its exit code')
@@ -143,11 +150,31 @@ def main () -> int:
     expect (cases, 'fits', 'row_bound', 320, 'the writer\'s line bound, under both')
 
     # ---- a wrapped card ring: reuse is by slot, order is by seq
+    # Round342 makes these three numbers derived rather than typed: the ring's base sector, the pinned
+    # count and the window's first LBA are read out of the two files that declare them, because a needle
+    # that copies the geometry is a fourth copy of it and goes green when the copy agrees with itself.
     expect (cases, 'wrap', 'written', 200, 'every accepted row reached the card')
     expect (cases, 'wrap', 'dropped', 0, 'nothing was dropped while the flush kept up')
-    expect (cases, 'wrap', 'laps', 3, '200 records into 64 slots is three laps plus eight')
-    expect (cases, 'wrap', 'first_slot_lba', 13320280, 'the driver ring starts at sector 64')
-    expect (cases, 'wrap', 'reused_lba', 13320280, 'and record 64 lands on record 0\'s sector')
+    expect (cases, 'wrap', 'laps', 3, '200 rolling records into the slots the pins leave is three laps')
+    reader_source = READER.read_text ()
+    ring_pins = re.search (r'\bkRingPinnedSlots\s*=\s*(\d+)', HEADER.read_text ())
+    ring_base = re.search (r'\bkRingOffset\[kRingCount\]\s*=\s*\{(\d+)', HEADER.read_text ())
+    window_lba = re.search (r'^LOG_WINDOW_FIRST_LBA = (\d+)', reader_source, re.M)
+    if not (ring_pins and ring_base and window_lba):
+        fail (f'the wrap leg could not read its own geometry (pinned={bool (ring_pins)}, '
+              f'ring offset={bool (ring_base)}, window lba={bool (window_lba)}): the sectors it checks '
+              'would be this script\'s numbers, not the writer\'s and not the reader\'s')
+    else:
+        pins = int (ring_pins.group (1))
+        want_first = int (window_lba.group (1)) + int (ring_base.group (1)) + 2 * pins
+        expect (cases, 'wrap', 'pinned', pins, 'the model pinned the count the layer declares')
+        expect (cases, 'wrap', 'first_slot_lba', want_first,
+                'the first rolling record lands past the pinned slots')
+        expect (cases, 'wrap', 'reused_lba', want_first,
+                'and one rolling lap later, the same sector is written again')
+        expect (cases, 'wrap', 'not_reused_lba', want_first + 2 * (pins + 64 % (64 - pins) - pins),
+                'record 64 does not land on record 0\'s sector: round341 read it as a reuse, and that '
+                'reading is what erased boot 120\'s pinned rows')
     expect (cases, 'kernel_wrap', 'written', 1000, 'the kernel ring took every row it was given')
     expect (cases, 'kernel_wrap', 'last_lba_offset', 1166,
             '999 records into 512 slots ends at sector 192 + 2*54, short of the boot record at 1216')
@@ -257,7 +284,7 @@ def main () -> int:
     boot_id = cases.get ('window', {}).get ('boot', 0)
     first_lba = reader.LOG_WINDOW_FIRST_LBA
     driver = reader.decode (win, first_lba, slots=reader.VERDICT_SLOTS, base_sector=reader.VERDICT_OFFSET,
-                            expect_kind=(21, 25))
+                            expect_kind=(21, 25), pinned=reader.PINNED_SLOTS)
     kernel = reader.decode (win, first_lba, slots=reader.KERNEL_SLOTS, base_sector=reader.KERNEL_OFFSET,
                             expect_kind=22)
     if len (driver) != reader.VERDICT_SLOTS:
@@ -296,28 +323,46 @@ def main () -> int:
     counts = {'driver': cases['window']['driver_written'],
               'kernel': cases['window']['kernel_written']}
     strides = {'driver': reader.VERDICT_SLOTS, 'kernel': reader.KERNEL_SLOTS}
+    # Round342 splits this leg by ring. The kernel ring still turns in all of its 512 slots, so seq
+    # modulo slots predicts where a record sits; the driver ring's first PINNED_SLOTS slots are claimed
+    # by named rows, and every other record turns in what is left. Keeping one formula for both would
+    # have made the pinned rows the anomaly -- which is exactly how boot 120's card came to be read as
+    # "four records missing and nothing to say why".
+    pins = {'driver': reader.PINNED_SLOTS, 'kernel': 0}
     markers = {'driver': 'host row ', 'kernel': 'kernel row '}
+
+    def expected_slot (seq, content, stride, pinned):
+        if pinned:
+            owner = reader.pinned_slot (content)
+            return owner if owner is not None else pinned + seq % (stride - pinned)
+        return seq % stride
+
     for name, records in (('driver', driver), ('kernel', kernel)):
         total, stride = counts[name], strides[name]
+        pinned = pins[name]
         if not records:
             continue                     # the two count legs above already named this
-        misplaced = [(slot, record['seq']) for slot, record, _, _ in records
-                     if record['seq'] % stride != slot]
+        misplaced = [(slot, record['seq']) for slot, record, content, _ in records
+                     if expected_slot (record['seq'], content, stride, pinned) != slot]
         if misplaced:
             fail (f'{len (misplaced)} {name} records sit where their seq does not put them, first at '
-                  f'slot {misplaced[0][0]} seq {misplaced[0][1]}: the ring is addressed by seq modulo its '
-                  'slot count, and this is the leg that says the writer agrees')
-        if records[0][1]['seq'] != newest_seq (0, total, stride):
+                  f'slot {misplaced[0][0]} seq {misplaced[0][1]}: the ring is addressed by its own slot '
+                  'rule ({pinned} pinned of {stride}), and this is the leg that says the writer agrees')
+        if pinned == 0 and records[0][1]['seq'] != newest_seq (0, total, stride):
             fail (f'slot 0 of the {name} ring holds seq {records[0][1]["seq"]}, expected the newest seq '
                   f'congruent to 0 below {total}, {newest_seq (0, total, stride)}: the sequence word is '
                   'the only thing that orders a wrapped ring')
         # Content follows seq: a row that reached the wrong slot, or a writer that stamped one row and
         # stored another, breaks this before any of the geometry legs has to be re-read. The two rows the
         # model truncated on purpose carry filler instead of a marker, so they are the at-bound leg's
-        # business, not this one's.
+        # business, not this one's. Pinned slots are a third exemption and it is the point of round342:
+        # a pinned row is named by its own head, never by the marker, and it keeps its slot whatever its
+        # seq says -- checking the congruence there would ask the pinned rows to be the bug they replaced.
         mismatched = []
         for slot, record, content, _ in records:
             if content is None or record['body'] == line_bytes:
+                continue
+            if pinned and reader.pinned_slot (content) is not None:
                 continue
             text = reader.text_of (content)
             named = re.search (markers[name] + r'(\d+)', text)
@@ -338,7 +383,8 @@ def main () -> int:
     # this row is the first reading that separates the two answers. Its own dot substitutions are what
     # say the filter ran, and the `dirty` leg above is what says the sum agreed with the stored bytes.
     control = [(slot, reader.text_of (content)) for slot, record, content, _ in driver
-               if content is not None and 'host row 70 tab' in reader.text_of (content)]
+               if content is not None and
+               'host row %d tab' % (reader.PINNED_SLOTS + 70) in reader.text_of (content)]
     if len (control) != 1:
         fail (f'{len (control)} driver records carry control bytes, expected the 1 the model pushes: '
               'without it the byte-sum leg only ever sees rows that could not disagree')
