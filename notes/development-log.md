@@ -28127,3 +28127,80 @@ boot 118 `02/02`＋厂商 `04/04`、**boot 119 `01/01`＋厂商 `02/02`**。本�
 ③ 那一格缺的仪器是「`done` 停在 arg 上时，谁会把它推进」——现在知道 retire 已经发生（presented=2），
 所以 `e00002d5` 的等待方与退休方不是同一枚 latch，题面从「帧没退休」换成「退休了但 latch 没人推进」，
 这条要在镜像里问 `display+0x16bc` 的写手，宿主侧已能解码（`scripts/decode-clover-slide.py` 命名帧）。
+
+## Round339 预登记（boot 120；板上代码手：IMEM 记录收缩到实测的 10 枚字、心跳格子搬出 `boot_stats`、复位那一枚按厂商标签改名换值、并补两枚欠的仪器）
+
+本轮是 §Round336 ⑤ 关闭之后第一次允许冷刷的一轮，所以判据先写在代码之前。**分母全部来自 §Round338 那台几何仪器**（`scripts/test-clover-imem-geometry.py` 的原字），不来自谁的记性。
+
+**① 改哪四件事**
+
+- **A 尺寸**：记录从注释里的「twenty words」收成仪器量出来的 **10 枚**（`0x660..0x6af`，`largest contiguous free run starting at the record offset: 80 bytes = 10 words`），新增 `kResetRecordWords = 10`；boot-start 那句无条件清零只许清这 10 枚与新心跳格子那两枚，**结构上碰不到 `0x6b0..0x6db`**（`boot_stats@6b0` 的 0x20 与 `kaslr_offset@6d0` 的 0xc——r338 表里 `[10]..[14]` 那五枚正是它家的）。
+- **B 搬家**：`beat count`/`beat CNTVCT` 从 `record[10]/[11]`（＝`0x6b0`/`0x6b8`，boot_stats 的格子）搬到 `kResetBeatOffset = 0x6e0`（几何表里 `[16]/[17]` 两枚 `free`，且 `0x6e0 > 0x6db` ⇒ 不与 `kaslr_offset` 重叠、也不落在 `[15]` 那枚 `free|kaslr_offset@6d0` 的含糊格上）。`beatmagic=` 仍在 `record[9]`（`0x6a8`，r338 确认它在未认领的空闲段里）。⇒ §Round338 ③ 那句「`beat=`/`beatcnt=` 的主语不是本驱动的心跳」从这一刻起落到代码上：这两列读回来的东西真的是我们写的。
+- **C 改名换值**：`kRestartFastboot = 0x77665501` → `kRestartBootloader = 0x77665500`，因为厂商 12 枚写里 `reboot bootloader` 那枚是 `0x77665500`（`msm-poweroff.c:522`），而 `0x77665501` 的三枚分别标成 `other@557` 与两处无条件 else（r338 ⑥：`0 of 3 rows`）。
+- **D 两枚欠的仪器**（都走 `sdhciSay`，不经 tee 环）：`clover r339: mark wrote=%llx before=%llx after=%llx`——门口那枚字要在任何写之前读，并与本次动作的结果分成两组字（第十五层）；`clover r339: beatctl wrote=%llx read=%llx magic_wrote=%llx magic_read=%llx ok=%d`——r336 欠的那枚正对照：写心跳格与 magic，**同一口气读回**，本靴就判，不等下一靴。
+
+**② 判据（boot 120 只判这六支）**
+
+- **M-A（换值那一支，本轮唯一可能改变板上行为的动作）**：r195 实测本板 XBL **不理这枚字**（panic 在 SRAM 留了 `fb=1`，板子仍进 Android），所以预登记的是「**落回模式必须仍由 misc BCB 决定，不许因换值而变**」。判法＝无人值守那趟自己的 `close:` 后缀与 boot 117/119 同型（`close:adb`，自动落 TWRP）。若落进 fastboot 或 EDL，那一手就是 XBL 认了 `0x77665500` ⇒ **撤销 C、保留 A/B/D**，并把「XBL 读这枚字」记成新的板上事实（那会同时把 r196 那句「IMEM 那枚不跨复位」升级成有内容）。
+- **M-B**：`mark` 行允许 `before != after`（上一靴留的字，或本来就不保持）；判据是既有那条：`after != wrote` 时 `clover_fastboot_reason` 必须仍为 null（panic 屏不许写它）。本轮只是把「之前」那一枚补上，不改这支的行为。
+- **M-C**：`beatctl` 的 `ok=` 三支各占一条，不许合并——`ok=1` ⇒ r336 那句「19 枚里 0 枚等于 `BEAT283`」第一次配上「我们确实写得进去」的另一半；`ok=0` ⇒ 那格连同靴写后都不保持 ⇒ 整个 r283 跨靴记录要按「IMEM 这 160 字节对本内核也是只读错觉」重写（比 r336 更强的一手，值得单独一轮）；**0 枚 `beatctl` 行** ⇒ 仪器缺陷，先查 `sdhciSay` 环与预算，不许读成「心跳没跑」。
+- **M-D**：下一靴（boot 121）的 `clover r283` 行若 `beatmagic=` 恰为 `0033383254414542` 且 `beat=` 是本靴心跳的数量级，就是**这条通道第一次真正成立**（r336 数的 24/0/0 那格换了主语）。同靴判不了跨靴 ⇒ 这一支按预登记留给下一次读回，**本轮不许提前判**。
+- **M-E**：`unnamed` 那一支照旧允许出现，且照 r338 ③ 读成「问的是别人的存储」的余迹，不读成「没中奖」。
+- **M-F（回归钉，不经板子，先写下来因为它才是 C 的落地证明）**：r338 那枚针脚钉的是分歧（厂商叫 `bootloader` 的行**不等于**我们的常量）。本轮换值把分歧关掉，所以针脚要**反转成要求一致**：几何报告必须印 `agreement check: … N of N rows`，且负测里「把常量换回 `0x77665501`」必须判红。不许只删针脚不留新针脚。
+
+**③ 不做什么**：不动 `misc` BCB 通路（r196/r198 的形状照旧）；不碰 PMIC 那条通道（r338 ④ 的阴性结论照在——没有声明的门不写码）；不引入新 boot-arg；不读 `sdam`（本板没有）。
+
+**④ 判据不来自被测物**：M-C 的 `ok=` 由写入值与读回值当场比；M-A 的落回模式由无人值守产物自己的 `close:` 行给出；M-F 的分母来自在盘的那枚 `:522` 行；A/B 的地址范围来自两源逐枚对齐的几何表，而不是注释。
+
+**⑤ 落地与实测（构建、双闸门、负测都已完成；刷写排在发布之后）**
+
+代码位置（四件事各一处，全部可在盘上点开）：
+
+- A 尺寸：`drivers/CloverSdhci/CloverSdhci.cpp:413` `kResetRecordWords = 10`，清零循环 `:10049` 按它计数，`:10052` 单独清心跳格那一枚。
+- B 搬家：`:414` `kResetBeatOffset = 0x6e0`，指针 `:10010`，`beat[0]`/`beat[1]` 取代 `record[10]`/`record[11]`。
+- C 改名换值：`:386` `kRestartBootloader = 0x77665500u`；同一枚字面量在 `scripts/xnu-panic-screen.c:87` `#define BOOTLOADER_WORD 0x77665500u`——两枚写手共用一个字，N23 钉「两枚不一致必红」。
+- D 两枚欠的仪器：`:10064` `clover r339: beatctl wrote=%llx read=%llx magic_wrote=%llx magic_read=%llx ok=%d`；`:10081` `clover r339: mark wrote=%x before=%x after=%x`。两枚都走 `sdhciSay`，不经 tee 环。
+
+分母读数（`scripts/test-clover-imem-geometry.py` 本轮当场跑，`GEO_EXIT=0`）：
+
+```
+reset record: offset 0x660, 10 words touched by this driver (zeroing loop 10, layout comment 10, highest indexed word 9), span 0x660..0x6af
+heartbeat cell: offset 0x6e0, 2 words touched by this driver (zeroed at arm time 1, highest indexed word 1), span 0x6e0..0x6ef
+agreement check: our value is labelled bootloader by the vendor in 1 of 1 rows that write it (asked about 12 writes, 1 of them compiled out)
+```
+
+⇒ **M-F 的「针脚反转成要求一致」成立**，且印的是 `1 of 1`（r338 那版是 `0 of 3`）。预登记里「负测把常量换回 `0x77665501` 必须判红」= 第 **N20** 支（"the port's word moves back to the arm the vendor does not label it under"），实测判红并自报其名。
+
+负测：`scripts/test-clover-716-negatives.py` 现 **32 支、0 problem(s)**（`~/clover-out/round339-sdimem/negatives.log`）。本轮新增 13 支（N20–N32）：N20 复位值、N21 逐 burst 字节命名自己、N22 驱动里第二枚复位名字、N23 两枚写手不同字、N24 心跳搬回 `boot_stats`、N25 哨兵不写、N26 门口那枚只在写之后读、N27 几何仪器不再看心跳格、N28 心跳格压在 `boot_stats` 上、N29 清零循环回到注释 supplied 的字面量，N30/N31/N32 见 ⑥。
+
+仪器自己的两处修正（都是本轮被逼出来的，不是美化）：
+
+1. **N23 的 expect 串一开始写的不是针脚真正印出的那一句**，于是它报「RED, but not for itself」。改的是 expect，不是针脚——针脚那句是「…while the driver arms it with…」。
+2. **还原那一腿过去用一个布尔覆盖两种失败**：闸门仍红（关于这台机器或关于更早一次案例）与文件没还原（关于这个 harness 在撒谎）。现拆成两枚：`still mutated:` 点名文件，另加 `first_failure()` 印整条红项含尾部 6 行详情，不再 `first[:240]` 切掉模型的 stderr。⑥ 之所以能定因，全靠这一格先被加宽——`/tmp/neg-rerun2.log` 那条 `RESTORE BROKEN: gate exit=1, restored files byte-identical` 就是这个新形状第一次把「红的是闸门、文件是干净的」两句分开说。
+
+双闸门与产物：仓库侧 `EXIT=0`；`scripts/` 有改动 ⇒ 重跑 `unixnu tree`（`TREE_EXIT=0`）后组装树侧 `EXIT=0`（12 archives / 22 objects ABI-checked）。`verify-clover-payload.py` 对归档那枚 0 FAIL，`r217 sb sample` 的针脚列表里新增两枚在场（`r339-beatctl present, r339-mark present`），`unixnu.toml` 报 `title ok, kernel ok, deadline ok`。
+产物 `~/clover-out/round339-v0.7.56-payload.img` 58,720,256 B、`df39e617585f64f5a6fee1f217e5afd16ae0dd1f62af2ad0ebab84278fd7da76`；`payload.json` 自证 `kernel_sha256 2d2825c2…`／`payload_kernel_sha256 21bb41cb…`／`adt_sha256 18c8782a…`。
+③ 那句「不引入新 boot-arg」当场可核：`git diff --stat board.toml` = **1 insertion / 1 deletion**，唯一改动是 `[payload] title` 一行；`kernel_args` 与 r335 同串。
+
+**⑥ r338 明写「the cause is NOT settled here」的那一格结掉了，而且红的是仪器自己**
+
+结论先说：既不是「通道算术选错外设」（驱动缺陷），也不是「这台机器在 RDATA 与 DONE 两次写之间饿死了模型线程」（宿主属性）——**是假 PMIC 把自己承诺的答案还没可见就把 DONE 立起来了**。改在 `drivers/CloverPower/tests/clover_power_host.cpp`（模型），`PowerArb.h` 与驱动行为一字未动，所以本轮板上那六支判据不受它影响。
+
+过程与逐格读数：
+
+- 复现率：负测整套跑到一半出现 1 problem（`/tmp/neg-rerun2.log`，29 支里 1 支），单跑闸门 **24 趟里 1 趟**红（`/tmp/gfail_20.txt`，同一趟里那句 `Assertion failed: (0), function require_burst, file clover_power_host.cpp, line 353`）。
+- 那一行原本不可读：`v3 A11 enable: rc=0 want PA_OK=0 status=0x101 lastSid=0 wantSid=0 served=2 lastAddr=0x46 bytes=81 want 81`——三枚操作数全说「正常」，只有断言行号知道它死了。这正是 r338 注释猜的「拼行之后它们描述的是后一次 serve」，但当时证不了。
+- 第一步把共享字换成**按通道的记录**（`:83` `servedSeq[512]`、`:84` `servedSid[512]`、`:85` `servedAddr[512]`；`:135` 每次 serve 自增本通道序号；`periphOf` 仍写 `lastSid` 但不再是谁读它的唯一来源），并在每一次读之前先取 `asked = servedSeq[APID]`。满载重跑 4000 趟：**347 趟失败**（`/tmp/res_raw.txt`，`grep -c "Assertion failed"` = 347），`reason=` 当场分成两支——
+  `no serve answered this ask` **240** 枚：DONE 读到了，可这个通道一次 serve 都没跑过；
+  `another peripheral says it answered this channel` **107** 枚：序号 +1 了，可本通道的 `servedSid` 还写着上一颗外设。
+  两支是同一个缺陷的两面：**旗子先于答案可见**，只是差的那一格不同（一格连序号都没动，另一格序号动了但身份没动）。
+- 修：四枚含 `kPmicArbStatusDone` 的存之前各放一枚 `__atomic_thread_fence(__ATOMIC_RELEASE)`（`:140/147/153/179`），读者侧 `require_burst()` 在任何快照之前 `__atomic_thread_fence(__ATOMIC_ACQUIRE)`（`:321`）。**同一负载条件（10 颗 hog 占满 10 核）500 趟：`loaded_runs=500 failures=0`**（`/tmp/r339-postfix.log`）。
+- 按 r331b 立的规矩「不许把预算调到绿为止，要补针脚并逐条负测」：闸门新增两枚计数针脚 + 三枚存在性针脚 + 一枚禁则（`:6700` DONE 存的次数必须等于 release 的次数，差一枚判红；`:6709` 必须有 acquire；禁 `servedSid[apid] = lastSid;`；`servedSeq[512]`、`const uint32_t asked = servedSeq[`、`no serve answered this ask`、`moved=` 必在），逐条负测 = **N30/N31/N32**，三条各判红一次，还原后 `gate exit=0, file byte-identical`。
+
+边界（本轮能说什么、不能说什么）：
+
+- 这是**模型**的缺陷。被它判过的板上诉求（「一次 served read 在 `kPolls` 预算内答复」）方向从未因此改变，因为两支失败都不是驱动造成的；但它一度让闸门能红在不是判据的东西上，所以 r338 那次「v3 PM660L 行在负载下死掉」的读数**不可引用**，只能重测。
+- r331b 那句「凡有『等硬件/等线程』的判据都要在满载下跑一遍」第一次给出定量收益：这个竞争空载 4000 趟撞不到，满载 4000 趟撞 347 次。
+- 序号是「本通道的 serve 次数」，它是仪器内部的计数，不是仲裁器的属性；`moved=` 那一列是行对自己的对照（0 表示三枚共享字在打印期间没动），不是板上任何状态。
+
+**⑦ 待办**：发布 v0.7.56 → 冷刷 `cache` 作为 boot 120 → 按 §Round339 ② 的 M-A/M-B/M-C/M-E/M-F 判读（M-D 依预登记留到 boot 121，本轮不许提前判）。

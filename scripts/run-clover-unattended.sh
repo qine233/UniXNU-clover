@@ -6,7 +6,11 @@
 #     time has passed without the timer interrupt being served; the message starts
 #     with "clover r147: unattended deadline".
 #   * CloverSdhci maps IMEM's restart-reason cell at boot (0x146bf000 + 0x65c),
-#     writes 0x77665501 ("bootloader") and publishes it to the panic screen only
+#     writes the word the vendor kernel reserves for `reboot bootloader` (0x77665500;
+#     scripts/test-clover-imem-geometry.py reads that pairing out of the archived
+#     msm-poweroff.c every gate run -- the value this comment quoted before round339
+#     is the one that same table labels the unrecognized-command arm) and publishes
+#     it to the panic screen only
 #     after the read-back agreed. Round195 proved this XBL does not consult that
 #     word: the panic left fb=1 in SRAM and the board came up in Android. Since
 #     round196 the panic path also writes a boot-recovery BCB into misc, which is

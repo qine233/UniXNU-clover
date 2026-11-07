@@ -1370,6 +1370,16 @@ def check_sb_sample(kernel: bytes) -> bool:
                                     b"cnt=%llu beat=%llu beatcnt=%llu beatmagic=%llx text=%s\n") in kernel,
              "reset-record-unnamed": (b"clover r283: last reset unnamed magic=%llx beat=%llu "
                                       b"beatcnt=%llu beatmagic=%llx\n") in kernel,
+             # Round339's two new outlets, pinned because this round's board-side claim is that the
+             # readings exist in the image and not only in the source. The control keeps all five
+             # columns: wrote=/read= answer for the heartbeat cell and magic_wrote=/magic_read= for the
+             # record's word 9, and a payload carrying only the first pair could not tell "this kernel
+             # cannot keep a word in IMEM" from "the firmware rewrote the other one". The mark row is
+             # pinned because before= is about the boot that ended while after= is about this store --
+             # a build that printed one column twice is the shape round336 had.
+             "r339-beatctl": (b"clover r339: beatctl wrote=%llx read=%llx magic_wrote=%llx "
+                              b"magic_read=%llx ok=%d\n") in kernel,
+             "r339-mark": b"clover r339: mark wrote=%x before=%x after=%x\n" in kernel,
              # Round289: boot 74 and boot 75 both ended in `Kernel data abort.` and both were read as a pc plus
              # an lr that resolves to nothing, because the 480-byte panic record stops before esr, far, fp and
              # sp -- and the trace lives only in these rows. A payload without them would meet the next fatal

@@ -267,6 +267,9 @@ volatile uint32_t *clover_fastboot_reason = nullptr;
 // reached by the panic screen through the patcher (IMEM_NOTE), which resolves this function's
 // address rather than the slot's, so the layout stays in one place.
 volatile uint64_t *clover_imem_record = nullptr;
+// Round339: the heartbeat's own two words, inside the measured free run and outside every declared
+// child node. Published by the same arm as the record, so a boot that could not map IMEM has neither.
+volatile uint64_t *clover_imem_beat = nullptr;
 void clover_imem_note (unsigned int kind, unsigned long pid, unsigned long aux, unsigned long pc,
                        const char *text);
 void clover_imem_heartbeat (void);
@@ -363,33 +366,59 @@ static volatile uint32_t gLogWindowFirst = 0;
 static volatile uint32_t gLogWindowSectors = 0;
 
 // Round147, unattended boot. clover.dtb has restart_reason@65c under qcom,msm-imem@146bf000, and
-// the stock kernel's `reboot bootloader` writes 0x77665501 there before its PSCI reset; XBL reads
-// that word on the way up and comes back in fastboot instead of Android. IMEM is SRAM, so arming
-// the cell touches no partition and no card: unlike a `misc` BCB it costs nothing and cannot be
-// left half-written. This driver owns the mapping because the panic screen is freestanding and
-// cannot map anything; it publishes the cell's address only after the read-back below agrees.
+// the stock kernel's `reboot bootloader` writes 0x77665500 there before its PSCI reset; XBL on this
+// board does not consult the word (round195: the panic path left its mark in SRAM and the board came
+// back in Android), so this value is a statement to whoever does read the cell, not a lever. IMEM is
+// SRAM, so arming the cell touches no partition and no card: unlike a `misc` BCB it costs nothing
+// and cannot be left half-written. This driver owns the mapping because the panic screen is
+// freestanding and cannot map anything; it publishes the cell's address only after the read-back
+// below agrees.
+//
+// Round339 changes the word's name and value. scripts/test-clover-imem-geometry.py reads every
+// __raw_writel(..., restart_reason) out of the archived vendor msm-poweroff.c and attributes each
+// one to the branch that lexically contains it: 0x77665501 appears three times and the vendor labels
+// those rows `other` (:557) and unconditional else (:572, :580) -- reboot commands this kernel does
+// not recognise -- while `reboot bootloader` is 0x77665500 (:522). The old name claimed the second
+// one and carried the first.
 static const uint64_t kImemPhys = 0x146bf000ULL;
 static const uint64_t kImemSize = 0x1000ULL;
 static const uint32_t kRestartReasonOffset = 0x65c;
-static const uint32_t kRestartFastboot = 0x77665501u;
+static const uint32_t kRestartBootloader = 0x77665500u;
 static OSSharedPtr<IOMemoryMap> gImemMap;
 
-// Round283, who reset the board. clover.dtb claims restart_reason@65c (4 bytes) and boot_stats@6b0
-// (0x20), leaving 0x660..0x6af -- twenty words -- unclaimed by any child node. XBL on this board
-// ignores the restart-reason cell (round195), so nothing in the boot chain writes here and the words
-// survive a warm reset. A record in this gap is the only reading that does not need the card:
-// rounds 280/281 showed the flight ring can sit 11 s behind the last kernel line when the card is
-// wedged, so "the log stopped" is not the same as "the board stopped".
+// Round283, who reset the board. The gap below is measured, not asserted: the child map archived in
+// notes/sources/sdm660/imem-children.dts -- the board's own decompiled tree and the vendor sdm660.dtsi,
+// compared as integers -- leaves restart_reason@65c ending at 0x660 and the next node starting at
+// boot_stats@6b0, so 0x660..0x6af is the largest contiguous free run from the record offset:
+// 80 bytes, TEN 64-bit words. The comment that sized this record at twenty words was wrong by that
+// much, and words 10 and 11 -- which the heartbeat used to own -- are inside boot_stats' 0x20 cell,
+// which the firmware writes as well. That is why the two heartbeat counters moved to their own free
+// cell below rather than staying where they were.
 //
-// Layout, twenty 64-bit words, little endian:
-//   0 magic | 1 kind | 2 pid | 3 aux | 4 pc | 5 CNTVCT | 6..8 text[24]
-//   9 beat magic | 10 beat count | 11 beat CNTVCT | 12..19 zero
-// The first writer wins (kind 1 halt, 2 restart, 3 reboot(2), 4 panic screen); the heartbeat owns
-// words 9..11 and never touches the magic, so a boot can end either with a named reset (kind != 0)
-// or with only a heartbeat (the reset did not pass through any hook this kernel knows).
+// XBL on this board ignores the restart-reason cell (round195), and round336 measured that the
+// firmware rewrites this region every boot, so nothing here is promised to survive a reset; the row
+// prints what was found, and the write-then-read control below says whether this kernel can write it
+// at all. A record here is still worth keeping because it needs no card: rounds 280/281 showed the
+// flight ring can sit 11 s behind the last kernel line when the card is wedged, so "the log stopped"
+// is not the same as "the board stopped".
+//
+// Layout, ten 64-bit words at 0x660, little endian:
+//   0 magic | 1 kind | 2 pid | 3 aux | 4 pc | 5 CNTVCT | 6..8 text[24] | 9 beat magic
+// plus two words at the beat cell (0x6e0): 0 beat count | 1 beat CNTVCT.
+// The first writer wins (kind 1 halt, 2 restart, 3 reboot(2), 4 panic screen); the heartbeat owns the
+// magic in word 9 and its own cell, and never touches the record magic, so a boot can end either with
+// a named reset (kind != 0) or with only a heartbeat (the reset did not pass through any hook this
+// kernel knows).
 static const uint32_t kResetRecordOffset = 0x660;
+static const uint32_t kResetRecordWords = 10;
+static const uint32_t kResetBeatOffset = 0x6e0;
 static const uint64_t kResetRecordMagic = 0x00333832564f4c43ULL;   // "CLOV283" as stored bytes
 static const uint64_t kResetBeatMagic = 0x0033383254414542ULL;     // "BEAT283" as stored bytes
+// Round339's positive control writes this into the heartbeat's CNTVCT word at arm time and reads it
+// back in the same breath. It is shaped like the beat magic so a stale cell cannot produce it by
+// accident, and it differs from BEAT283 by one field so a value left by an older image is not
+// mistaken for it. The next tick overwrites the word, so the control costs no reading.
+static const uint64_t kResetBeatSentinel = 0x0039333354414542ULL;   // "BEAT339" as stored bytes
 
 // Round196. The IMEM word above reads back on this board but the reset that follows does not
 // consult it: round195's panic left fb=1 in SRAM and the board came up in Android, not fastboot.
@@ -9925,16 +9954,20 @@ extern "C" void clover_imem_note (unsigned int kind, unsigned long pid, unsigned
 }
 
 // One timer tick, no card: the last CNTVCT here is the last moment the board executed the clock's
-// interrupt path. Words 9..11 only, so the reset writer's magic and text are never disturbed.
+// interrupt path. Round339 moved these two counters out of the record itself: word 9 keeps the
+// heartbeat's magic, and the numbers live in their own free cell at kResetBeatOffset, because words
+// 10 and 11 of the record sat inside boot_stats@6b0 -- a cell the firmware owns and writes, which is
+// how round336's beat=/beatcnt= columns ended up reading somebody else's counter.
 extern "C" void clover_imem_heartbeat (void)
 {
   volatile uint64_t *record = clover_imem_record;
-  if (record == nullptr) {
+  volatile uint64_t *beat = clover_imem_beat;
+  if (record == nullptr || beat == nullptr) {
     return;
   }
   record[9] = kResetBeatMagic;
-  record[10] = record[10] + 1;
-  record[11] = imemCounter ();
+  beat[0] = beat[0] + 1;
+  beat[1] = imemCounter ();
   __asm__ volatile ("dsb st" ::: "memory");
 }
 
@@ -9974,10 +10007,11 @@ extern "C" void clover_unattended_begin (void)
   // push happens before the ring is armed (gVerdictFirst is still zero), so the line stays pending
   // in RAM and is the first record the drain writes once the window is known.
   volatile uint64_t *record = reinterpret_cast<volatile uint64_t *> (base + kResetRecordOffset);
+  volatile uint64_t *beat = reinterpret_cast<volatile uint64_t *> (base + kResetBeatOffset);
   const uint64_t recordMagic = record[0];
   const uint64_t beatMagic = record[9];
-  const uint64_t beats = record[10];
-  const uint64_t beatCounter = record[11];
+  const uint64_t beats = beat[0];
+  const uint64_t beatCounter = beat[1];
   if (recordMagic == kResetRecordMagic) {
     char text[25];
     const volatile unsigned char *bytes = reinterpret_cast<const volatile unsigned char *> (record + 6);
@@ -10007,24 +10041,53 @@ extern "C" void clover_unattended_begin (void)
            static_cast<unsigned long long> (beatCounter),
            static_cast<unsigned long long> (beatMagic));
   }
-  for (unsigned int i = 0; i < 20; ++i) {
+  // Round339. The loop used to run over twenty words, which is what a comment said the gap was; the
+  // geometry instrument says the free run from this offset is ten words and that words 10..14 belong
+  // to boot_stats@6b0 while 0x6d0..0x6db belongs to kaslr_offset@6d0. Zeroing those was this driver
+  // erasing the firmware's boot statistics and the vendor kernel's KASLR slide every boot, so the
+  // count now comes from kResetRecordWords and the heartbeat's own cell is cleared explicitly.
+  for (unsigned int i = 0; i < kResetRecordWords; ++i) {
     record[i] = 0;
   }
+  beat[0] = 0;
+  // Round336 owed this one: the row has been printing beatmagic= for six rounds and every sighting
+  // said 0 of 19 rows carried BEAT283, which was read as "the channel is not ours" -- a claim about
+  // the cell that had no counter-claim of "we did write it". Writing a value no timer can produce
+  // and reading it back here, before clover_imem_beat is published so no tick can interleave, is that
+  // counter-claim. ok=1 makes the cross-boot absence a statement about the firmware; ok=0 says this
+  // kernel cannot keep a word here at all, which retires the whole record rather than re-guessing it.
+  beat[1] = kResetBeatSentinel;
+  record[9] = kResetBeatMagic;
+  __asm__ volatile ("dsb sy" ::: "memory");
+  const uint64_t controlRead = beat[1];
+  const uint64_t magicRead = record[9];
+  sdhciSay ("clover r339: beatctl wrote=%llx read=%llx magic_wrote=%llx magic_read=%llx ok=%d\n",
+            static_cast<unsigned long long> (kResetBeatSentinel),
+            static_cast<unsigned long long> (controlRead),
+            static_cast<unsigned long long> (kResetBeatMagic),
+            static_cast<unsigned long long> (magicRead),
+            controlRead == kResetBeatSentinel && magicRead == kResetBeatMagic ? 1 : 0);
   clover_imem_record = record;
+  clover_imem_beat = beat;
   __asm__ volatile ("dsb sy" ::: "memory");
   volatile uint32_t *cell = reinterpret_cast<volatile uint32_t *> (base + kRestartReasonOffset);
-  cell[0] = kRestartFastboot;
+  // Round339 reads the cell before arming it. The value found there is about the boot that ended,
+  // not about this write, and printing it after the store would fold the two into one word: the
+  // same mistake round315 named for every other doorway state on this board.
+  const uint32_t before = cell[0];
+  cell[0] = kRestartBootloader;
   __asm__ volatile ("dsb sy" ::: "memory");
   const uint32_t readback = cell[0];
-  if (readback != kRestartFastboot) {
+  sdhciSay ("clover r339: mark wrote=%x before=%x after=%x\n", kRestartBootloader, before, readback);
+  if (readback != kRestartBootloader) {
     // A cell that does not hold the word is not a cell the panic screen should write either.
-    IOLog ("clover r148: unattended mark %x read back %x\n", kRestartFastboot, readback);
+    IOLog ("clover r148: unattended mark %x read back %x\n", kRestartBootloader, readback);
     return;
   }
   clover_fastboot_reason = cell;
   gUnattendedArmed = 1;
   IOLog ("clover r148: unattended mark %x -> %x deadline=%us\n",
-         kRestartFastboot, readback, seconds);
+         kRestartBootloader, readback, seconds);
 }
 
 extern "C" void clover_emmc_run (void)

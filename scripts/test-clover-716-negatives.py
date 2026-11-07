@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Negative tests for the #716, #718 and #719 needles in scripts/check-clover.py.
+"""Negative tests for the #716, #718, #719 and #720 needles in scripts/check-clover.py.
 
 Each case breaks one shape the gate now pins, runs the gate, and restores in a finally block: a
 negative test that leaves its edit behind is worse than no negative test, because the next gate run
@@ -28,9 +28,10 @@ IMEM_ARCHIVE = REPO / "notes/sources/sdm660/imem-children.dts"
 POWEROFF_ARCHIVE = REPO / "notes/sources/sdm660/msm-poweroff.c"
 BOOT_STATS_ARCHIVE = REPO / "notes/sources/sdm660/boot_stats.c"
 SDHCI = REPO / "drivers/CloverSdhci/CloverSdhci.cpp"
+PANIC = REPO / "scripts/xnu-panic-screen.c"
 HARNESS = REPO / "drivers/CloverPower/tests/clover_power_host.cpp"
 GATE = REPO / "scripts/check-clover.py"
-LOG = Path.home() / "clover-out/round338-sdam-facts/negatives.log"
+LOG = Path.home() / "clover-out/round339-sdimem/negatives.log"
 
 SILENT_AFTER = '''      timeline_close "neither-$(usb_landing_class)" "" ""
       return 2
@@ -112,12 +113,10 @@ CASES = [
     ("N19 the report's write count is not the file's",
      [(GEOMETRY, '(0x7766[0-9a-fA-F]{4}|0x0)', '(0x7766[0-9a-fA-F]{4})')],
      "while the archived vendor file holds"),
-    ("N20 the port's word becomes the vendor's bootloader value",
-     [(SDHCI, "static const uint32_t kRestartFastboot = 0x77665501u;",
-       "static const uint32_t kRestartFastboot = 0x77665500u;"),
-      (GATE, '"static const uint32_t kRestartFastboot = 0x77665501u;",',
-       '"static const uint32_t kRestartFastboot = 0x77665500u;",')],
-     "round338's disagreement is closed"),
+    ("N20 the port's word moves back to the arm the vendor does not label it under",
+     [(SDHCI, "static const uint32_t kRestartBootloader = 0x77665500u;",
+       "static const uint32_t kRestartBootloader = 0x77665501u;")],
+     "labels only"),
     # Round338's other instrument: a burst leg that dies has to say which operand differed. This
     # breaks one expected byte in the arbiter model and judges the GATE OUTPUT, not just its exit
     # code -- a red gate is not the same thing as a gate that names what it saw.
@@ -125,6 +124,59 @@ CASES = [
      [(HARNESS, "    const uint8_t b3[2] = { 0xc0, 0x0b };",
        "    const uint8_t b3[2] = { 0xbf, 0x0b };", 2)],
      "v3 B3 through the PM660L APID: rc=0"),
+    # Round339 (#720). Round338 left the naming and the geometry as readings; this round made them
+    # requirements about the code, so each case below breaks a requirement rather than a string that
+    # describes one. N20 is the nail the rename needed: the value the vendor labels `other` has to
+    # turn the gate red by itself, not because a quote moved with it.
+    ("N22 a second restart-reason name stays in the driver",
+     [(SDHCI, "static const uint32_t kRestartBootloader = 0x77665500u;",
+       "static const uint32_t kRestartBootloader = 0x77665500u;\n"
+       "static const uint32_t kRestartLegacyFastboot = 0x77665501u;")],
+     "restart-reason values"),
+    ("N23 the two writers of the restart cell disagree on the word",
+     [(PANIC, "#define BOOTLOADER_WORD 0x77665500u", "#define BOOTLOADER_WORD 0x77665502u")],
+     "one column would then mean two different previous boots"),
+    ("N24 the heartbeat counter moves back into a firmware-owned word",
+     [(SDHCI, "  beat[0] = beat[0] + 1;", "  record[10] = record[10] + 1;")],
+     "clover_imem_heartbeat writes record[10]"),
+    ("N25 the arm-time control stops writing the sentinel",
+     [(SDHCI, "  beat[1] = kResetBeatSentinel;", "  beat[1] = kResetBeatMagic;")],
+     "CloverSdhci.cpp lacks 'beat[1] = kResetBeatSentinel"),
+    ("N26 the restart cell is read only after it is marked",
+     [(SDHCI, "  const uint32_t before = cell[0];\n  cell[0] = kRestartBootloader;",
+       "  cell[0] = kRestartBootloader;\n  const uint32_t before = cell[0];")],
+     "is read after it is written"),
+    ("N27 the geometry instrument stops looking at the heartbeat cell",
+     [(GEOMETRY, '    out["beat_write_words"] = sorted({int(m.group(1)) for m in '
+                 'BEAT_WORDS.finditer(text)})',
+       '    out["beat_write_words"] = []')],
+     "no beat[N] store was found"),
+    ("N28 the heartbeat cell moves onto boot_stats",
+     [(SDHCI, "static const uint32_t kResetBeatOffset = 0x6e0;",
+       "static const uint32_t kResetBeatOffset = 0x6b0;")],
+     "free bytes start there"),
+    ("N29 the zeroing loop goes back to a literal the comment supplied",
+     [(SDHCI, "  for (unsigned int i = 0; i < kResetRecordWords; ++i) {",
+       "  for (unsigned int i = 0; i < 20; ++i) {")],
+     "sits inside the record's own span"),
+    # Round339's second instrument, added while the suite was being run: the arbiter host model was
+    # itself the thing going red, and this time it could say which of its own promises broke. Each case
+    # below breaks one of the three halves of that answer -- the release in front of every DONE store,
+    # the acquire in front of the reading of the record, and the record being the channel's own rather
+    # than a word every serve writes. None of them changes what the model computes, so a green here
+    # would mean the gate is not judging the publication order at all.
+    ("N30 a DONE store loses its release",
+     [(HARNESS, "  __atomic_thread_fence (__ATOMIC_RELEASE);\n  ch[kPmicArbStatus / 4] = kModelHandled "
+                "| kPmicArbStatusDone;",
+       "  ch[kPmicArbStatus / 4] = kModelHandled | kPmicArbStatusDone;")],
+     "times and releases"),
+    ("N31 the burst leg stops taking the reader's half of the pair",
+     [(HARNESS, "__atomic_thread_fence (__ATOMIC_ACQUIRE);",
+       "__atomic_thread_fence (__ATOMIC_SEQ_CST);")],
+     "has no acquire"),
+    ("N32 the channel's answer is recorded from the shared word again",
+     [(HARNESS, "  servedSid[apid] = (int) sid;", "  servedSid[apid] = lastSid;")],
+     "shared last-serve word"),
 ]
 
 
@@ -132,6 +184,28 @@ def run_gate():
     result = subprocess.run([sys.executable, str(REPO / "scripts/check-clover.py")],
                             capture_output=True, text=True)
     return result.returncode, result.stdout + result.stderr
+
+
+def first_failure(out):
+    """The whole first red entry of a gate run, detail lines included.
+
+    The arbiter leg prints its own sentence and then the tail of the model's output, so a report cut
+    to one line says "a host model failed" and leaves the next round to guess which of its legs. The
+    tail is the reading.
+    """
+    lines = out.splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith("[check-clover] "):
+            continue
+        if any(mark in line for mark in ("notice:", "clover ok", "host model: PASS")):
+            continue
+        detail = []
+        for following in lines[index + 1:]:
+            if following.startswith("[check-clover] "):
+                break
+            detail.append(following)
+        return "\n      ".join(([line[:300]] + detail[-6:])[:7])
+    return ""
 
 
 def replace_nth(text, old, new, occurrence):
@@ -183,10 +257,7 @@ def main():
             continue
         try:
             code, out = run_gate()
-            first = next((line for line in out.splitlines()
-                          if line.startswith("[check-clover] ")
-                          and "notice:" not in line and "clover ok" not in line
-                          and "host model: PASS" not in line), "")
+            first = first_failure(out)
             if code == 0:
                 problems += 1
                 lines.append(f"{name}: GREEN (exit 0) -- the needle does not judge")
@@ -197,7 +268,7 @@ def main():
             else:
                 lines.append(f"{name}: RED (exit {code})"
                              + (f" and named itself ({expect!r})" if expect else "")
-                             + f"\n    {first[:240]}")
+                             + f"\n    {first}")
         except Exception as error:
             problems += 1
             lines.append(f"{name}: EXCEPTION {error}")
@@ -209,10 +280,19 @@ def main():
                 else:
                     path.write_text(text)
         code, out = run_gate()
-        if code != 0 or any(path.read_text(encoding="utf-8", errors="replace") != text
-                            for path, text in originals.items() if text is not None):
+        # One boolean used to cover two different failures: a gate that stayed red after the sources
+        # went back (a claim about this machine, or about a case that ran before it) and a file the
+        # restore did not actually put back (a claim that this harness is lying about cleaning up).
+        still_mutated = [path.name for path, text in originals.items()
+                         if text is not None
+                         and path.read_text(encoding="utf-8", errors="replace") != text]
+        if code != 0 or still_mutated:
             problems += 1
-            lines.append(f"    RESTORE BROKEN: exit={code}")
+            first = first_failure(out)
+            files = ("still mutated: " + ", ".join(still_mutated)) if still_mutated \
+                else "byte-identical"
+            lines.append(f"    RESTORE BROKEN: gate exit={code}, restored files {files}"
+                         + (f"\n      {first}" if code else ""))
         else:
             lines.append("    restored: gate exit=0, file byte-identical")
     LOG.write_text("\n".join(lines) + "\n")

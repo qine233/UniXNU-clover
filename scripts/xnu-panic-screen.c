@@ -76,12 +76,15 @@ struct ctx {
  * address here, not the cell's: the cell is volatile (never written to eMMC) and
  * only exists once that driver has run, so a panic before it leaves the pointer
  * zero and the board resets normally instead of writing to a guess.
- * 0x77665501 is "bootloader" in the low cell XBL reads on this board; the stock
- * kernel writes the same word for `reboot bootloader`. */
+ * Round339 re-labels this word and takes §Round195's measurement into the comment: XBL on this board
+ * does NOT consult the cell (round195's panic left its mark in SRAM and the board came up in Android),
+ * so writing it is a statement to whoever reads it later, not a lever. The value is the one the stock
+ * kernel writes for `reboot bootloader` (notes/sources/sdm660/msm-poweroff.c:522); 0x77665501 is what
+ * it writes for a command it does not recognise, which is what the name this macro used carried. */
 #ifndef FASTBOOT_REASON
 #define FASTBOOT_REASON 0UL
 #endif
-#define FASTBOOT_WORD 0x77665501u
+#define BOOTLOADER_WORD 0x77665500u
 
 /* Round283: the same driver publishes a record slot in IMEM's unclaimed gap at 0x660, and this
  * note is the function that fills it. The patcher resolves clover_imem_note and passes its address
@@ -161,8 +164,7 @@ static void clean_seeded (volatile struct vc_info *v)
 
 static int mapped (u64 a);
 
-/* Ask the board for fastboot on the next reset: write FASTBOOT_WORD into the
- * restart-reason cell the driver published, then read it back. Returns 1 only
+/* Mark the restart-reason cell before the reset that follows, then read it back. Returns 1 only
  * when the cell actually holds the word afterwards, which is what the screen's
  * fb= line reports. Both addresses are queried first: FASTBOOT_REASON lives in
  * the driver's data, which may not be mapped if the panic happened before that
@@ -178,10 +180,10 @@ static int fastboot_mark (void)
   if ((u64)cell == 0 || !mapped ((u64)cell)) {
     return 0;
   }
-  *cell = FASTBOOT_WORD;
+  *cell = BOOTLOADER_WORD;
   __asm__ volatile ("dsb sy" : : : "memory");
   __asm__ volatile ("dmb sy" : : : "memory");
-  return *cell == FASTBOOT_WORD;
+  return *cell == BOOTLOADER_WORD;
 }
 
 /* Wait `seconds` (on the 19.2 MHz counter) and reboot through PSCI. The reason
@@ -639,7 +641,7 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
     hex (&g, "\nSCTLR=", sctlr);
   }
   /* Whether the reset that follows will land in fastboot. 1 means the reason
-   * cell read back FASTBOOT_WORD, 0 means no cell this boot (the driver did not
+   * cell read back BOOTLOADER_WORD, 0 means no cell this boot (the driver did not
    * run) and the reset is an ordinary one. Round194 draws it before the sink, so
    * the record on the card carries it: round193's two deadline panics were the
    * same image and only the second was reported to have come back to fastboot,

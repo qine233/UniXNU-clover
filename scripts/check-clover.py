@@ -3914,15 +3914,25 @@ def check_board(errors: list) -> str:
 
         # Round283 asks the question boot 69 left open: which software path, if any, resets the board.
         # The r281 read showed the APSS watchdog never armed and the card's last write 11 s older than
-        # the kernel's last line, so the answer has to live somewhere the reset cannot take away. The
-        # slot is twenty words in IMEM's unclaimed 0x660 gap -- the same cache-inhibited page the
-        # restart-reason cell already uses -- and the contract is first-writer-wins so the panic
-        # screen's message survives a later restart hook. The heartbeat is a separate writer that
-        # never touches words 0..8, which is what keeps a named reset from being overwritten by the
-        # pulse that follows it.
+        # the kernel's last line, so the answer has to live somewhere the reset cannot take away.
+        # Round338 measured the slot instead of describing it: the free run from 0x660 is ten 64-bit
+        # words, and the contract is first-writer-wins so the panic screen's message survives a later
+        # restart hook. Round339 moved the two heartbeat counters into their own free cell at 0x6e0,
+        # which is a separate writer that never touches the record's words 0..8 -- that is what keeps
+        # a named reset from being overwritten by the pulse that follows it.
         if "static const uint32_t kResetRecordOffset = 0x660;" not in sdhci_source:
             errors.append("CloverSdhci.cpp does not place the reset record at 0x660: the slot has to be "
                           "inside the already-mapped IMEM page, in the gap the DT leaves unclaimed")
+        if "static const uint32_t kResetRecordWords = 10;" not in sdhci_source:
+            errors.append("CloverSdhci.cpp does not size the record at the ten words round338 measured: "
+                          "the twenty-word comment it replaced reached into boot_stats@6b0, which the "
+                          "firmware owns, and the wiping loop wrote zeros there every boot")
+        if "static const uint32_t kResetBeatOffset = 0x6e0;" not in sdhci_source:
+            errors.append("CloverSdhci.cpp declares no heartbeat cell offset: the two counters have to "
+                          "live somewhere the geometry report says is free, not in the record's words")
+        if "volatile uint64_t *clover_imem_beat = nullptr;" not in sdhci_source:
+            errors.append("CloverSdhci.cpp publishes no heartbeat pointer: the arm-time control below "
+                          "and the tick both address the cell, and one of them would be guessing")
         if "static const uint64_t kResetRecordMagic = 0x00333832564f4c43ULL;" not in sdhci_source:
             errors.append("CloverSdhci.cpp's reset-record magic is not the r283 word: a record read back "
                           "under a different magic is a slot another writer owns")
@@ -3938,22 +3948,39 @@ def check_board(errors: list) -> str:
             errors.append("CloverSdhci.cpp lacks clover_imem_note or clover_imem_heartbeat: the kernel's "
                           "reset hooks and ArmCpu both call them by name")
         else:
-            beat_body = sdhci_source[beat_at:beat_at + 900]
-            if "record[9] = kResetBeatMagic;" not in beat_body or \
-                    "record[10] = record[10] + 1;" not in beat_body or \
-                    "record[11] = imemCounter ();" not in beat_body:
-                errors.append("clover_imem_heartbeat does not write exactly words 9..11: any other index "
-                              "would race the one-shot reset record")
-            for index in ("record[0]", "record[1]", "record[2]"):
+            # A ban is judged on the code lines only: the function is followed by a comment that
+            # names the words it no longer writes, and a substring test over the raw text would
+            # have read that explanation as a violation.
+            beat_end = sdhci_source.find("\n}", beat_at)
+            beat_body = "\n".join(line.split("//")[0] for line in
+                                  sdhci_source[beat_at:beat_end].splitlines())
+            for needle in ("record[9] = kResetBeatMagic;", "beat[0] = beat[0] + 1;",
+                           "beat[1] = imemCounter ();"):
+                if needle not in beat_body:
+                    errors.append(f"clover_imem_heartbeat does not write {needle!r}: the pulse is the "
+                                  "only thing that says how far the timer got, and a heartbeat that "
+                                  "writes nothing reads as a boot that never ticked")
+            for index in ("record[0]", "record[1]", "record[2]", "record[3]", "record[4]",
+                          "record[5]", "record[6]", "record[7]", "record[8]",
+                          "record[10]", "record[11]"):
                 if index in beat_body:
-                    errors.append(f"clover_imem_heartbeat writes {index}: the pulse must not disturb the "
-                                  "reset record it runs beside")
+                    errors.append(f"clover_imem_heartbeat writes {index}: the pulse must not disturb "
+                                  "the reset record it runs beside, and record[10] and record[11] are "
+                                  "boot_stats' own bytes -- the pair this round moved out of")
         read_at = sdhci_source.find("clover r283: last reset kind=")
-        clear_at = sdhci_source.find("for (unsigned int i = 0; i < 20; ++i) {")
-        arm_at = sdhci_source.find("clover_imem_record = record;")
-        if not (0 <= read_at < clear_at < arm_at):
-            errors.append("clover_unattended_begin does not read the record, clear twenty words and only "
-                          "then arm the pointer: a later order would erase the reading before it is printed")
+        clear_at = sdhci_source.find("for (unsigned int i = 0; i < kResetRecordWords; ++i) {")
+        control_at = sdhci_source.find('sdhciSay ("clover r339: beatctl')
+        arm_at = sdhci_source.find("clover_imem_beat = beat;")
+        if not (0 <= read_at < clear_at < control_at < arm_at):
+            errors.append("clover_unattended_begin does not read the record, clear the ten words, run "
+                          "the write-then-read control and only then arm the pointers: any other order "
+                          "either erases the reading before it is printed, or lets a timer tick land "
+                          "between the sentinel write and its read-back and call the tick's number the "
+                          "control's")
+        if "beat[0] = 0;" not in sdhci_source[clear_at:control_at]:
+            errors.append("the boot-start clear does not reset the heartbeat counter: the record would "
+                          "be this boot's and the count the next boot reads would still be the "
+                          "previous one's, which is the round336 reading that made beat= unusable")
         # The named row's format string is split across two lines by the C source, so the contract
         # matches each literal segment as it appears rather than a joined form no file can contain.
         for needle in ("\"clover r283: last reset kind=%llu pid=%llu aux=%llx pc=%llx cnt=%llu \"",
@@ -3979,6 +4006,36 @@ def check_board(errors: list) -> str:
         if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r283")' not in sdhci_source:
             errors.append("the r283 line is not exempt from the per-pass push cap: a capped round would "
                           "read exactly like a boot whose slot was never touched")
+
+        # Round339's two instruments. The first is the positive control round336 owed: the row has
+        # printed beatmagic= for six rounds and every sighting said no row carried the heartbeat's
+        # own magic, which was read as a verdict about the cell while nothing ever said this kernel
+        # can keep a word there. The second reads the doorway state before the write, because the
+        # value the cell holds on arrival is about the boot that ended, not about this store.
+        for needle in ('sdhciSay ("clover r339: beatctl wrote=%llx read=%llx magic_wrote=%llx '
+                       'magic_read=%llx ok=%d\\n"',
+                       'sdhciSay ("clover r339: mark wrote=%x before=%x after=%x\\n"',
+                       "beat[1] = kResetBeatSentinel;",
+                       "const uint64_t controlRead = beat[1];",
+                       "const uint32_t before = cell[0];",
+                       "const uint32_t readback = cell[0];"):
+            if needle not in sdhci_source:
+                errors.append(f"CloverSdhci.cpp lacks {needle[:56]!r}: either the control or the "
+                              "doorway reading it belongs to is gone, and the absence of a heartbeat "
+                              "would again be evidence with no counter-claim beside it")
+        if sdhci_source.find("const uint32_t before = cell[0];") > \
+                sdhci_source.find("cell[0] = kRestartBootloader;"):
+            errors.append("the restart-reason cell is read after it is written: before= would then "
+                          "print this boot's own mark and the row would say nothing about the boot "
+                          "that ended")
+        if sdhci_source.find("const uint32_t readback = cell[0];") < \
+                sdhci_source.find("const uint32_t before = cell[0];"):
+            errors.append("the restart-reason read-back is placed before the store: after= would "
+                          "measure the previous boot again, and the two columns would be one column")
+        if "if (readback != kRestartBootloader) {" not in sdhci_source:
+            errors.append("arming does not stop when the cell refuses the word: the panic screen is "
+                          "given the published pointer only after a successful read-back, and a cell "
+                          "that will not hold a value is not a cell to mark at panic time")
 
         arm_cpu_source = (REPO / "drivers/ArmCpu/ArmCpu.cpp").read_text()
         if 'extern "C" void clover_imem_heartbeat (void);' not in arm_cpu_source or \
@@ -6629,6 +6686,56 @@ def check_board(errors: list) -> str:
                                                   "the previous command's bytes")):
                 if needle not in harness_source:
                     errors.append(f"the arbiter host model lost {needle!r}: {why}")
+            # Round339 separated the two hypotheses round331b had left standing next to each other. The
+            # answer was neither: the model's own fake PMIC stored DONE ahead of the answer it was
+            # supposed to have placed first, so a poll could return success while the channel still
+            # described the ask before it. Once the leg judged from per-APID records and a snapshot, it
+            # could say so -- and said it 347 times out of 4000 loaded runs, split between a sequence
+            # that had not advanced and a peripheral that had not been asked. With the release/acquire
+            # pair in place the same 4000 runs under twelve external spinners printed nothing at all, so
+            # the interleaving the channelLock guards against was not what was left over. The pins below
+            # hold each half of that measurement: every DONE store has a release in front of it, the
+            # reader of the evidence has its acquire, and the evidence is the channel's own record
+            # rather than a word that every serve in the model writes.
+            done_stores = sum(1 for line in harness_code
+                              if re.search(r"ch\[kPmicArbStatus / 4\] = .*kPmicArbStatusDone", line))
+            releases = sum(1 for line in harness_code
+                           if "__atomic_thread_fence (__ATOMIC_RELEASE);" in line)
+            if releases != done_stores:
+                errors.append(f"the fake PMIC stores DONE {done_stores} times and releases {releases} "
+                              "times: the answer has to become visible before the flag that says it is, "
+                              "and one un-fenced store is the shape that answered 347 of 4000 loaded "
+                              "runs out of the previous ask")
+            if "__atomic_thread_fence (__ATOMIC_ACQUIRE);" not in harness_source:
+                errors.append("require_burst() has no acquire: it reads the channel's record after the "
+                              "poll returned, and without the reader's half of the pair the record it "
+                              "prints can be older than the DONE it is reporting on")
+            if "servedSid[apid] = lastSid;" in harness_source:
+                errors.append("a channel's answered-by record is being filled from the model's shared "
+                              "last-serve word again: two serves write that one word and every burst "
+                              "leg asks about one of them, which is how round338's row could print three "
+                              "operands that all agreed and still die")
+            for needle, why in (('static volatile uint32_t servedSeq[512];',
+                                 "the model has no per-channel answer count, so \"this channel was "
+                                 "served for this ask\" is once again a claim about a shared word"),
+                                ('servedSid[apid] = (int) sid;',
+                                 "the per-channel peripheral record is not being filled from serve()'s "
+                                 "own decoded command, which is the only version of it that is about "
+                                 "this transaction"),
+                                ('const uint32_t asked = servedSeq[',
+                                 "the burst legs no longer read their channel's sequence before the "
+                                 "command goes out, so there is only one reading left to judge from "
+                                 "and it cannot tell a fresh answer from a stale DONE"),
+                                ('no serve answered this ask',
+                                 "the leg that separates \"this channel was never served\" from \"a "
+                                 "different peripheral answered it\" is gone, and those are the two "
+                                 "readings round339 was built to tell apart"),
+                                ('moved=',
+                                 "the row no longer says whether the words it printed moved while it "
+                                 "was being written, which is the only thing that makes an agreeing "
+                                 "triple trustworthy")):
+                if needle not in harness_source:
+                    errors.append(f"the arbiter host model lost {needle!r}: {why}")
             if 'os.cpu_count' not in runner.read_text() or 'loaded' not in runner.read_text():
                 errors.append("scripts/test-clover-power.py runs the model only on an idle host again: "
                               "the promise that a served read answers inside the bound would then be "
@@ -7018,8 +7125,8 @@ def check_board(errors: list) -> str:
     # gains arg/done/cur/list and drops swap; bbsend now prints every hop), so the menu names round335
     # while rows this round did not touch keep their own generation tokens (bbsend r331, bbrcv r328,
     # dispstate r329) -- a card row names its probe generation, the title names the image that ran.
-    if not board["payload"]["title"].startswith("clover r335:"):
-        errors.append('[payload] title is not "clover r335: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r339:"):
+        errors.append('[payload] title is not "clover r339: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7288,21 +7395,79 @@ done
                                       "the free-run size, the independence of the two sources, and "
                                       "the claim that every word got attributed")
                 rows = re.findall(r"^\[\s*\d+\] {2}0x[0-9a-f]+ {2}(\S+)", report, re.M)
-                declared = re.search(r"(\d+) words touched by this driver", report)
-                if declared is None:
-                    errors.append("the geometry report does not say how many words it probed: a "
-                                  "table without its own row count is a scan whose scope is unknown")
-                elif len(rows) != int(declared.group(1)):
-                    errors.append(f"the geometry table has {len(rows)} rows but declares "
-                                  f"{declared.group(1)} words probed: the unattributed words are the "
-                                  "ones that matter")
-                elif any(row in ("", "UNNAMED") for row in rows):
-                    errors.append("at least one word in the geometry table has no owner: an "
-                                  "unattributed word reads as free space while a child node claims it")
-                span = re.search(r"child nodes the record spans: (.+?) \(asked about", report)
+                beat_rows = re.findall(r"^b\[\s*\d+\] {2}0x[0-9a-f]+ {2}(\S+)", report, re.M)
+                declared = re.search(r"reset record: offset (0x[0-9a-f]+), (\d+) words touched",
+                                     report)
+                beat_declared = re.search(r"heartbeat cell: offset (0x[0-9a-f]+), (\d+) words touched",
+                                          report)
+                if declared is None or beat_declared is None:
+                    errors.append("the geometry report does not give both cells their own row count: "
+                                  "a table without its own scope is a scan whose denominator is unknown")
+                else:
+                    record_at = int(declared.group(1), 16)
+                    record_words = int(declared.group(2))
+                    beat_at = int(beat_declared.group(1), 16)
+                    beat_words = int(beat_declared.group(2))
+                    if len(rows) != record_words:
+                        errors.append(f"the geometry table has {len(rows)} record rows but declares "
+                                      f"{declared.group(2)} words probed: the unattributed words are "
+                                      "the ones that matter")
+                    if len(beat_rows) != beat_words:
+                        errors.append(f"the geometry table has {len(beat_rows)} heartbeat rows but "
+                                      f"declares {beat_declared.group(2)} words touched: the cell "
+                                      "round339 moved the counters into would be listed at a different "
+                                      "width than it is claimed")
+                    if any(row in ("", "UNNAMED") for row in rows + beat_rows):
+                        errors.append("at least one word in the geometry table has no owner: an "
+                                      "unattributed word reads as free space while a child node claims it")
+                    beat_free = re.search(r"largest contiguous free run starting at the heartbeat "
+                                          r"cell: (\d+) bytes", report)
+                    if beat_free is None:
+                        errors.append("the report says nothing about the free run at the heartbeat "
+                                      "cell: that cell is this round's claim, and a claim nobody "
+                                      "re-measured is the twenty-word comment again")
+                    elif int(beat_free.group(1)) < beat_words * 8:
+                        errors.append(f"the heartbeat cell at {beat_declared.group(1)} is "
+                                      f"{beat_declared.group(2)} words but only {beat_free.group(1)} "
+                                      "free bytes start there: the counters would sit on a child node "
+                                      "the firmware owns, which is the exact thing round338 found in "
+                                      "the record's own words 10 and 11")
+                    gap = re.search(r"gap between the two cells: (\d+) bytes = (\d+) words; owners "
+                                    r"in the gap: (.+?) \(asked about (\d+) words, named (\d+)\)",
+                                    report)
+                    if gap is None:
+                        errors.append("the geometry report prints no gap between the record and the "
+                                      "heartbeat cell: the reason the record stops at ten words is the "
+                                      "territory between them, and without it the resize is an "
+                                      "assertion again")
+                    elif int(gap.group(1)) != beat_at - (record_at + record_words * 8):
+                        errors.append(f"the gap line reports {gap.group(1)} bytes but the two cells' "
+                                      f"own offsets and widths put {(beat_at - record_at - record_words * 8)} "
+                                      "bytes between them: the addresses in this report are not "
+                                      "describing one layout")
+                    elif int(gap.group(2)) != int(gap.group(4)):
+                        errors.append(f"the gap line says {gap.group(2)} words and then asks about "
+                                      f"{gap.group(4)}: a count and its denominator disagreeing is "
+                                      "how `0 named` becomes `0 asked`")
+                    elif gap.group(3) == "none":
+                        errors.append("nothing in the tree claims the bytes between the two cells, so "
+                                      "the split into two cells is not the reading the tree gives -- "
+                                      "either the gap has become free (and the record could be one "
+                                      "cell again, which is a decision to re-register rather than a "
+                                      "silent edit) or the map changed under this round")
+                span = re.search(r"child nodes the record spans: (.+?) \(asked about (\d+) words, "
+                                 r"named (\d+)\)", report)
                 if span is None:
                     errors.append("the geometry report names no cells the record spans and asked "
                                   "about nothing: the overlap question would be unanswered again")
+                elif declared is not None and int(span.group(2)) != record_words:
+                    errors.append(f"the overlap line asks about {span.group(2)} words while the "
+                                  f"record itself is declared at {declared.group(2)}: the two lines "
+                                  "would be describing different footprints")
+                elif declared is not None and span.group(1) != "none":
+                    errors.append(f"the record spans {span.group(1)} again: round339 resized it to the "
+                                  "run round338 measured, and a record that reaches a child node is "
+                                  "this driver wiping the firmware's own counters every boot")
         for needle in ("sdam", "PM660"):
             if needle.lower() not in archived.lower():
                 errors.append(f"the IMEM archive says nothing about {needle}: what this board's tree "
@@ -7310,9 +7475,12 @@ done
                               "next hand was planned around a PMIC this board does not carry")
 
         # The same instrument's second leg: what the words in this window MEAN, taken from the only
-        # kernel that writes them. drivers/CloverSdhci calls 0x77665501 kRestartFastboot on the strength
-        # of a comment about what `reboot bootloader` writes, and round338 found the value in the vendor
-        # table under `other`, the unrecognized-command arm and the no-command arm -- never bootloader.
+        # kernel that writes them. Round338 ran it against the name and value drivers/CloverSdhci used
+        # then and found the vendor table putting that value under `other`, the unrecognized-command
+        # arm and the no-command arm -- never under `bootloader`; round339 changed the constant to the
+        # value the vendor does write for that command. From here this is a requirement, and the way
+        # it is enforced is by counting the rows rather than by naming the retired spelling: the
+        # strings the check forbids are therefore never written out in this file.
         # Pinned so the reading cannot survive by being written down once: the gate counts the writes in
         # the archived file itself, re-reads the driver's own constant, and refuses a report whose value
         # came from the report instead of from the source.
@@ -7341,26 +7509,79 @@ done
                 errors.append(f"the report parsed {report_written.group(1)} restart_reason writes while "
                               f"the archived vendor file holds {len(writes)}: the table is not being "
                               "built from the file it names")
-            driver_value = re.search(r"kRestartFastboot\s*=\s*(0x[0-9a-fA-F]+)",
-                                     (REPO / "drivers/CloverSdhci/CloverSdhci.cpp")
-                                     .read_text(encoding="utf-8", errors="replace"))
-            reported_value = re.search(r"this port: kRestartFastboot = (0x[0-9a-fA-F]+)", report)
-            if driver_value and reported_value and \
-                    int(driver_value.group(1), 16) != int(reported_value.group(1), 16):
-                errors.append("the report names a kRestartFastboot value that is not the one "
-                              "drivers/CloverSdhci declares: the comparison would be about a number "
-                              "nobody ships")
+            driver_text_now = (REPO / "drivers/CloverSdhci/CloverSdhci.cpp").read_text(
+                encoding="utf-8", errors="replace")
+            declared_names = sorted({n for n in re.findall(
+                r"static const uint32_t (kRestart\w*) = 0x[0-9a-fA-F]+u?;", driver_text_now)
+                if not n.endswith("Offset")})
+            if len(declared_names) != 1:
+                errors.append(f"the driver declares {len(declared_names)} restart-reason value "
+                              "constants: the geometry instrument asks the vendor table about one, so "
+                              "a second name in the same file means the report and the code are not "
+                              "talking about the same word")
+                declared_name = None
+            else:
+                declared_name = declared_names[0]
+                stale_names = sorted({n for n in re.findall(r"\bkRestart\w*\b", driver_text_now)
+                                      if n != declared_name and not n.endswith("Offset")})
+                if stale_names:
+                    errors.append(f"the driver still carries {stale_names} next to the constant the "
+                                  "instrument verifies: a retired name left in the file is a claim "
+                                  "about the vendor's labelling that nothing checks any more")
+            driver_value = re.search(
+                rf"static const uint32_t {declared_name} = (0x[0-9a-fA-F]+)u?;",
+                driver_text_now) if declared_name else None
+            reported_name = re.search(r"this port: (\w+) = (0x[0-9a-fA-F]+)", report)
+            if reported_name is None:
+                errors.append("the report no longer names this port's restart-reason value: the "
+                              "comparison would have no subject")
+            elif declared_name and reported_name.group(1) != declared_name:
+                errors.append(f"the report asks about {reported_name.group(1)} while the driver "
+                              f"declares {declared_name}: the two are different claims about the "
+                              "same cell")
+            if driver_value and reported_name and \
+                    int(driver_value.group(1), 16) != int(reported_name.group(2), 16):
+                errors.append("the report names a value that is not the one drivers/CloverSdhci "
+                              "declares: the comparison would be about a number nobody ships")
             boot_row = re.search(r"the value the vendor writes for `reboot bootloader`: "
                                  r"(0x[0-9a-fA-F]+) \(line (\d+)\)", report)
             if boot_row is None:
                 errors.append("the report no longer names the vendor's bootloader value and the line it "
                               "came from: that pair is the finding, and without it the next round is "
                               "back to reading a comment")
-            elif driver_value and boot_row.group(1).lower() == driver_value.group(1).lower():
-                errors.append(f"the vendor's bootloader value and this port's kRestartFastboot are now "
-                              f"the same word ({boot_row.group(1)}): round338's disagreement is closed, "
-                              "which is a reason to re-judge the constant's name and the flash-path "
-                              "claim, not to leave a stale pin green")
+            elif driver_value and boot_row.group(1).lower() != driver_value.group(1).lower():
+                errors.append(f"this port's restart-reason value ({driver_value.group(1)}) is no longer "
+                              f"the vendor's bootloader value ({boot_row.group(1)}): round338 measured "
+                              "that disagreement and round339 closed it, so a new one is either a "
+                              "deliberate re-judgement or the constant moved by accident")
+            # The agreement sentence is the closure itself: every live vendor row that writes this
+            # value has to label it bootloader. Round338 printed this as a reading (0 of 3); the
+            # sentence stays in the report as a count pair so a future round can see which of the two
+            # arms moved, and the gate is what changed from reporting to requiring.
+            agreement = re.search(r"agreement check: our value is labelled bootloader by the vendor "
+                                  r"in (\d+) of (\d+) rows that write it", report)
+            if agreement is None:
+                errors.append("the geometry report prints no agreement count: without `N of M` the "
+                              "closure cannot be re-opened by a later round, which is the shape this "
+                              "gate had in round338 and is exactly what it is now checking")
+            elif int(agreement.group(2)) == 0 or int(agreement.group(1)) != int(agreement.group(2)):
+                errors.append(f"the agreement line reads {agreement.group(1)} of "
+                              f"{agreement.group(2)}: the value this port writes is not labelled "
+                              "bootloader in every live vendor row that carries it")
+            panic_text = (REPO / "scripts/xnu-panic-screen.c").read_text(encoding="utf-8",
+                                                                        errors="replace")
+            word_macros = sorted({m.group(1) for m in re.finditer(r"#define (\w+WORD)\s+0x",
+                                                                 panic_text)})
+            if word_macros != ["BOOTLOADER_WORD"]:
+                errors.append(f"the panic screen declares the word macros {word_macros}: the cell has "
+                              "one meaning per boot and two writers, so a second name there is the "
+                              "round339 rename half-done")
+            screen_word = re.search(r"#define BOOTLOADER_WORD\s+(0x[0-9a-fA-F]+)u", panic_text)
+            if screen_word and driver_value and \
+                    screen_word.group(1).lower() != driver_value.group(1).lower():
+                errors.append(f"the panic screen marks the cell with {screen_word.group(1)} while the "
+                              f"driver arms it with {driver_value.group(1)}: one column would then "
+                              "mean two different previous boots depending on which writer got there")
             if re.search(r"\bwritel\b", stats.read_text(encoding="utf-8", errors="replace")):
                 errors.append("the archived boot_stats.c writes something: the note's reading that the "
                               "kernel only reads those four KPI counters -- and therefore that zeroing "
@@ -8439,8 +8660,8 @@ done
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r335:"):
-        errors.append('[payload] title is not "clover r335: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r339:"):
+        errors.append('[payload] title is not "clover r339: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -8970,8 +9191,28 @@ done
          "static const uint32_t kRestartReasonOffset = 0x65c;",
          "the cell would not be the one clover.dtb's restart_reason@65c names"),
         ("drivers/CloverSdhci/CloverSdhci.cpp",
-         "static const uint32_t kRestartFastboot = 0x77665501u;",
-         "the word would not be the one the stock kernel writes for reboot bootloader"),
+         "static const uint32_t kRestartBootloader = 0x77665500u;",
+         "the word would not be the one the archived vendor kernel writes for `reboot bootloader`, "
+         "which is the row scripts/test-clover-imem-geometry.py counts and prints with its line"),
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         "static const uint32_t kResetRecordWords = 10;",
+         "the record's size would live only in prose again, and the wiping loop would have no "
+         "denominator the geometry instrument could check the measured free run against"),
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         "static const uint32_t kResetBeatOffset = 0x6e0;",
+         "the heartbeat counters would have no address to ask the device tree about, which is how "
+         "they ended up inside boot_stats in the first place"),
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         'sdhciSay ("clover r339: beatctl wrote=%llx read=%llx magic_wrote=%llx magic_read=%llx '
+         'ok=%d\\n"',
+         "the cell's write-then-read control would be gone: six rounds of beatmagic= columns have "
+         "been read as \"not our channel\" with nothing on the other side saying this kernel can "
+         "keep a word there at all"),
+        ("drivers/CloverSdhci/CloverSdhci.cpp",
+         'sdhciSay ("clover r339: mark wrote=%x before=%x after=%x\\n"',
+         "the restart-reason doorway would again be read only after the store, folding the previous "
+         "boot's value into this one -- the shape round315 named for every other doorway state on "
+         "this board"),
         ("drivers/CloverSdhci/CloverSdhci.cpp",
          'PE_parse_boot_argn ("clover-unattended"',
          "the driver would never arm from the round's own boot argument"),
@@ -9008,8 +9249,10 @@ done
          "mapped() must read PAR_EL1 after the translation; kept as one statement, "
          "not as the semicolon form that only Darwin would cut"),
         ("scripts/xnu-panic-screen.c",
-         "#define FASTBOOT_WORD 0x77665501u",
-         "the screen would mark the cell with something XBL does not read as fastboot"),
+         "#define BOOTLOADER_WORD 0x77665500u",
+         "the screen and the driver would mark the same cell with two different words, and "
+         "round195 measured that XBL here reads neither -- the one thing a mismatched pair can "
+         "still do is make the value a later reader finds mean two different writers"),
         ("scripts/xnu-panic-screen.c",
          "#define PANIC_RESET_SECONDS 20",
          "the screen would keep parking instead of resetting after a bounded wait"),

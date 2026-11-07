@@ -73,6 +73,16 @@ static volatile int stopModel, denyNext, failNext, dropNext;
 static volatile unsigned readsServed;
 static volatile uint32_t lastAddr;
 static volatile int lastSid;
+// Round339. readsServed, lastAddr and lastSid describe the most recent serve of ANY channel, so they
+// cannot answer "which peripheral answered THIS burst" -- under host load the model was caught
+// asserting exactly that (measured: 4 failures in 3000 loaded runs, every one at a byte-pair leg, each
+// printing an operand triple that agreed because the shared words had moved again by the time the row
+// was assembled). These three arrays are indexed by APID: a channel's own record of how many commands
+// it was served, and what the last one reached. require_burst() asks those, and asks the sequence both
+// before the transaction and after it, so an answer read out of a stale DONE has nowhere to hide.
+static volatile uint32_t servedSeq[512];
+static volatile int servedSid[512];
+static volatile uint32_t servedAddr[512];
 // Round331b. rearm() clears every channel's STATUS and CMD while the fake PMIC thread is scanning,
 // and serve() writes STATUS from a command it read before that clear. Without a lock the two can
 // interleave so that a stale DONE|HANDLED lands after the clear, and the next transaction is answered
@@ -94,10 +104,11 @@ static struct pa_arbiter arbiter = { core, cnfg, obs, kPmicArbEe, &pa_layout_v5 
 
 // Which fake peripheral an APID reaches: the PPID's slave-ID nibble, the same nibble kPpidOf() put
 // in bits 11:8 and the same one the driver's four target PPIDs differ by.
-static uint8_t *periphOf (uint32_t apid)
+static uint8_t *periphOf (uint32_t apid, uint32_t *sidOut)
 {
   uint32_t map = core[(gL->mapBase + gL->mapStride * apid) / 4];
   uint32_t sid = pa_ppid_of (map) >> 8;
+  *sidOut = sid;
   lastSid = (int) sid;
   return sid == kSidPm660l ? pmicB : pmicA;
 }
@@ -120,22 +131,32 @@ static void serve (uint32_t apid)
   // read-only. If either ever grows one, the host test is where it is caught.
   assert(op == kPmicArbReadOp);
   lastAddr = addr;
+  servedAddr[apid] = addr;
+  servedSeq[apid] = servedSeq[apid] + 1;
   if (denyNext) {
     // The failure bit is added when the harness asked for both, which is the only way to ask the
     // arbiter logic what it does when an answer is simultaneously a denial and a fault.
+    // Round339: the answer has to be visible before the flag that says it is. See the success path.
+  __atomic_thread_fence (__ATOMIC_RELEASE);
     ch[kPmicArbStatus / 4] = kModelHandled | kPmicArbStatusDone | kPmicArbStatusDenied |
                              (failNext ? kPmicArbStatusFailure : 0U);
     return;
   }
   if (failNext) {
+    // Round339: the answer has to be visible before the flag that says it is. See the success path.
+  __atomic_thread_fence (__ATOMIC_RELEASE);
     ch[kPmicArbStatus / 4] = kModelHandled | kPmicArbStatusDone | kPmicArbStatusFailure;
     return;
   }
   if (dropNext) {
+    // Round339: the answer has to be visible before the flag that says it is. See the success path.
+  __atomic_thread_fence (__ATOMIC_RELEASE);
     ch[kPmicArbStatus / 4] = kModelHandled | kPmicArbStatusDone | kPmicArbStatusDropped;
     return;
   }
-  uint8_t *periph = periphOf (apid);
+  uint32_t sid = 0;
+  uint8_t *periph = periphOf (apid, &sid);
+  servedSid[apid] = (int) sid;
   // VEND:376-381 memcpy()s from the register word, so RDATA0 holds the first four bytes with the
   // lowest address in the low byte and RDATA1 continues. That little-endian packing is the exact
   // thing the identity burst depends on; assembling it big-endian here would make pa_read() look
@@ -151,6 +172,11 @@ static void serve (uint32_t apid)
   }
   ch[kPmicArbRdata0 / 4] = word0;
   ch[kPmicArbRdata1 / 4] = word1;
+  // Round339. The answer and the flag that says the answer is there have to become visible in that
+  // order, and two plain volatile stores give no such promise: 347 of 4000 loaded runs recorded DONE
+  // while this channel's own sequence and peripheral still described the ask before it, which is the
+  // shape round338's unreadable row was. The reader's half is the acquire in require_burst().
+  __atomic_thread_fence (__ATOMIC_RELEASE);
   ch[kPmicArbStatus / 4] = kModelHandled | kPmicArbStatusDone;
   readsServed++;
 }
@@ -225,6 +251,9 @@ static void setUp (int v3)
   memset(pmicB, 0, sizeof pmicB);
   stopModel = denyNext = failNext = dropNext = 0;
   readsServed = 0; lastAddr = 0; lastSid = -1;
+  memset((void *) servedSeq, 0, sizeof servedSeq);
+  memset((void *) servedSid, 0, sizeof servedSid);
+  memset((void *) servedAddr, 0, sizeof servedAddr);
   core[kPmicArbVersion / 4] = v3 ? 0x30010000 : 0x50010000;   // inside each band's own range
   core[kPmicArbFeatures / 4] = 40;
   setMap (3, kPpidPm660Revid, 0, false);
@@ -277,29 +306,60 @@ static const uint32_t kPollsNoAnswer = 5000;
 // the line it died on. That mattered once measured: one invocation of the gate died at the v3 PM660L
 // line under host load, and nothing in the output separated "the channel arithmetic picked the wrong
 // peripheral" from "this machine starved the model thread between its write of RDATA and its write of
-// DONE". Eight further loaded runs of a variant that printed the operands saw no failure at all, so
-// the cause is not settled -- what is settled is that the next occurrence will name itself.
-// Round338. The burst legs used to be bare assert()s. That is this file's shape for every question with
-// exactly one right answer, but these six asks have four moving parts at once -- the poll's own return
-// code, the byte or bytes, which fake peripheral says it answered, and the STATUS word -- and an assert
-// prints only the line it died on. That cost something measurable: one run of the gate died at the v3
-// PM660L line under host load, and nothing in its output separated "the channel arithmetic picked the
-// wrong peripheral" (a driver defect, a finding) from "this machine starved the model thread between its
-// write of RDATA and its write of DONE" (a property of this host, not of the arbiter). Eight further
-// loaded runs of a variant that printed the operands saw no failure, so the cause is NOT settled here --
-// what is settled is that the next occurrence has to name which operand differed.
-static void require_burst (const char *where, int rc, uint32_t reported, const uint8_t *bytes,
-                           const uint8_t *want, unsigned count, int wantSid)
+// DONE". Round339 settled which of the two it was, and the answer is neither: the fake PMIC published
+// DONE before the answer it promises with DONE became visible, so under load 347 of 4000 runs polled a
+// flag whose own channel record still described the previous transaction (240 of them a channel that had
+// not been served at all, 107 a different peripheral). Two fixes, in order: the instrument now asks each
+// channel's own record, which is what made the two shapes separable, and serve() now puts a release
+// before every DONE store to match the acquire below.
+static void require_burst (const char *where, uint32_t apid, uint32_t asked_seq, int rc,
+                           uint32_t reported, const uint8_t *bytes, const uint8_t *want,
+                           unsigned count, int wantSid)
 {
-  unsigned i;
-  if (rc == PA_OK && lastSid == wantSid) {
-    for (i = 0; i < count; ++i) {
-      if (bytes[i] != want[i]) break;
-    }
-    if (i == count) return;
+  unsigned i, first_diff;
+  const char *reason;
+  // The other half of serve()'s release: this is the reader's side of the promise, and it is what
+  // makes the three words below about the transaction that just ended rather than about whichever
+  // store of the fake PMIC happened to land first.
+  __atomic_thread_fence (__ATOMIC_ACQUIRE);
+  // Round339. Every operand is read once, into locals, before anything is printed, and what is read is
+  // this channel's own record -- not the model's last-serve-everywhere words. The old shape could
+  // print a triple that agreed (measured: rc=0, lastSid=0 against wantSid=0, bytes=81 against want 81)
+  // and still die, because the words it printed had moved on while the row was being assembled.
+  const uint32_t seq_seen = servedSeq[apid];
+  const int sid_seen = servedSid[apid];
+  const uint32_t addr_seen = servedAddr[apid];
+  const int whole_sid = lastSid;
+  const unsigned whole_served = (unsigned) readsServed;
+  const uint32_t whole_addr = (uint32_t) lastAddr;
+  first_diff = count;
+  for (i = 0; i < count; ++i) {
+    if (bytes[i] != want[i]) { first_diff = i; break; }
   }
-  fprintf (stderr, "%s: rc=%d want PA_OK=%d status=%#x lastSid=%d wantSid=%d served=%u lastAddr=%#x bytes=",
-           where, rc, PA_OK, reported, lastSid, wantSid, (unsigned) readsServed, (unsigned) lastAddr);
+  if (rc == PA_OK && seq_seen == asked_seq + 1 && sid_seen == wantSid && first_diff == count) return;
+  if (rc != PA_OK) {
+    reason = "the poll did not return PA_OK";
+  } else if (seq_seen == asked_seq) {
+    reason = "no serve answered this ask, so the DONE read belongs to an earlier transaction";
+  } else if (seq_seen != asked_seq + 1) {
+    reason = "this channel was served more than once for one ask";
+  } else if (sid_seen != wantSid) {
+    reason = "another peripheral says it answered this channel";
+  } else {
+    reason = "a byte differs";
+  }
+  fprintf (stderr, "%s: rc=%d want PA_OK=%d status=%#x apid=%u seq_asked=%u seq_now=%u"
+                  " servedSid=%d wantSid=%d servedAddr=%#x reason=%s",
+           where, rc, PA_OK, reported, apid, asked_seq, seq_seen, sid_seen, wantSid, addr_seen,
+           reason);
+  if (first_diff != count) {
+    fprintf (stderr, " byte=%u got=%02x want=%02x", first_diff, bytes[first_diff], want[first_diff]);
+  }
+  // moved= is the row's own control on itself: 0 means the three shared words did not change while it
+  // was being written, so what it printed is what the judgement saw.
+  fprintf (stderr, " moved=%u bytes=",
+           (unsigned) ((lastSid != whole_sid) + ((unsigned) readsServed != whole_served) +
+                       ((uint32_t) lastAddr != whole_addr)));
   for (i = 0; i < count; ++i) {
     fprintf (stderr, "%02x ", bytes[i]);
   }
@@ -457,10 +517,11 @@ int main (void)
   //    just the values -- word-first versus byte-first is invisible in a hex dump of the register and
   //    decisive in the report.
   rearm ();
-  rc = pa_read (&arbiter, 3, kPmicRev2 & kPmicArbCmdAddrMask, buf, 5, kPolls, &status);
   {
+    const uint32_t asked = servedSeq[3];
+    rc = pa_read (&arbiter, 3, kPmicRev2 & kPmicArbCmdAddrMask, buf, 5, kPolls, &status);
     const uint8_t identity[5] = { 0x01, 0x00, 0x02, kPmicTypeValue, kPm660Subtype };
-    require_burst ("v5 identity burst", rc, status, buf, identity, 5, (int) kSidPm660);
+    require_burst ("v5 identity burst", 3, asked, rc, status, buf, identity, 5, (int) kSidPm660);
   }
   // The reported STATUS keeps the model's own bit 8, and that is worth asserting rather than
   // masking away: pa_status_code() only reads bits 0..3, so an arbiter that reports something else in
@@ -482,18 +543,20 @@ int main (void)
   // A read through the PM660L's own APID has to see the PM660L's bytes. There is no such mapping in
   // this model -- that is case 4 -- so use B3's high APID, which the map puts on sid 2.
   rearm ();
-  rc = pa_read (&arbiter, 400, 0x40, buf, 2, kPolls, &status);
   {
+    const uint32_t asked = servedSeq[400];
+    rc = pa_read (&arbiter, 400, 0x40, buf, 2, kPolls, &status);
     const uint8_t b3[2] = { 0xc0, 0x0b };
-    require_burst ("v5 B3 through the PM660L APID", rc, status, buf, b3, 2, (int) kSidPm660l);
+    require_burst ("v5 B3 through the PM660L APID", 400, asked, rc, status, buf, b3, 2, (int) kSidPm660l);
   }
   // And A11's enable comes from the sid-0 side, ON with EN0 following, which is the pair the driver
   // decodes as state=ON follow=01.
   rearm ();
-  rc = pa_read8 (&arbiter, 7, kLdoRegEnable, buf, kPolls, &status);
   {
+    const uint32_t asked = servedSeq[7];
+    rc = pa_read8 (&arbiter, 7, kLdoRegEnable, buf, kPolls, &status);
     const uint8_t a11[1] = { 0x81 };
-    require_burst ("v5 A11 enable", rc, status, buf, a11, 1, (int) kSidPm660);
+    require_burst ("v5 A11 enable", 7, asked, rc, status, buf, a11, 1, (int) kSidPm660);
   }
   assert(buf[0] & kLdoEnableMask);
 
@@ -564,25 +627,28 @@ int main (void)
   assert(r.words == 512 && r.mapped == 6 && r.irq_none == 0 && r.apid == 3);
   pthread_create(&thread, NULL, device, NULL);
   rearm ();
-  rc = pa_read (&arbiter, 3, kPmicRev2 & kPmicArbCmdAddrMask, buf, 5, kPolls, &status);
   {
+    const uint32_t asked = servedSeq[3];
+    rc = pa_read (&arbiter, 3, kPmicRev2 & kPmicArbCmdAddrMask, buf, 5, kPolls, &status);
     const uint8_t identity[5] = { 0x01, 0x00, 0x02, kPmicTypeValue, kPm660Subtype };
-    require_burst ("v3 identity burst", rc, status, buf, identity, 5, (int) kSidPm660);
+    require_burst ("v3 identity burst", 3, asked, rc, status, buf, identity, 5, (int) kSidPm660);
   }
   // The APID that reaches the PM660L side is the low one under this band's map -- 12, where v5 put it
   // at 400 -- and the byte pair still has to come back from pmicB, which is the assertion that says
   // the channel arithmetic picked the right peripheral rather than the right-looking offset.
   rearm ();
-  rc = pa_read (&arbiter, 12, 0x40, buf, 2, kPolls, &status);
   {
+    const uint32_t asked = servedSeq[12];
+    rc = pa_read (&arbiter, 12, 0x40, buf, 2, kPolls, &status);
     const uint8_t b3[2] = { 0xc0, 0x0b };
-    require_burst ("v3 B3 through the PM660L APID", rc, status, buf, b3, 2, (int) kSidPm660l);
+    require_burst ("v3 B3 through the PM660L APID", 12, asked, rc, status, buf, b3, 2, (int) kSidPm660l);
   }
   rearm ();
-  rc = pa_read8 (&arbiter, 7, kLdoRegEnable, buf, kPolls, &status);
   {
+    const uint32_t asked = servedSeq[7];
+    rc = pa_read8 (&arbiter, 7, kLdoRegEnable, buf, kPolls, &status);
     const uint8_t a11[1] = { 0x81 };
-    require_burst ("v3 A11 enable", rc, status, buf, a11, 1, (int) kSidPm660);
+    require_burst ("v3 A11 enable", 7, asked, rc, status, buf, a11, 1, (int) kSidPm660);
   }
   assert(buf[0] & kLdoEnableMask);
   stopModel = 1; pthread_join(thread, NULL);
