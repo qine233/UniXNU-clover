@@ -80,6 +80,9 @@ REBOOT_BOOTLOADER=0
 DECODE=1
 # The boot counter the card itself holds before a declared flash; empty when unreadable.
 PRE_BOOT=""
+# Round343 (#732). Which board this run is about. Empty means "resolve it from the bus", and the
+# resolution refuses to guess when the bus holds more than one -- see require_serial below.
+SERIAL=${ANDROID_SERIAL:-}
 
 say() { printf '[unattended] %s\n' "$*" >&2; }
 warn() { printf '[unattended] WARNING: %s\n' "$*" >&2; }
@@ -100,6 +103,10 @@ Options:
                          a bootloader that quietly turned it into an ordinary reboot
                          only shows that once the payload's own 1800 s deadline resets)
   --out PATH             dump file (default ~/clover-out/clover-log-window.bin)
+  --serial SERIAL        the board this run is about (default: $ANDROID_SERIAL, else the
+                         only board on the bus; two boards and no --serial is a refusal,
+                         not a coin toss -- every write and every window below is filtered
+                         by it)
   --flash-cache IMG      cold-flash IMG to the cache partition before recovery;
                          this is an eMMC write and is printed before it runs
   --boot-after-flash     after flashing, reboot normally and watch for the deadline's
@@ -123,6 +130,7 @@ while [ $# -gt 0 ]; do
     --adb-wait) ADB_WAIT=$2; shift 2 ;;
     --landing-wait) LANDING_WAIT=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
+    --serial) SERIAL=$2; shift 2 ;;
     --flash-cache) FLASH_CACHE=$2; shift 2 ;;
     --boot-after-flash) BOOT_AFTER_FLASH=1; shift ;;
     --allow-misc-bcb) ALLOW_BCB=1; shift ;;
@@ -138,15 +146,46 @@ command -v fastboot >/dev/null || die 2 "fastboot is not on PATH"
 command -v adb >/dev/null || die 2 "adb is not on PATH"
 mkdir -p "$(dirname "$OUT")" || die 2 "cannot create $(dirname "$OUT")"
 
+# Round343 (#732). Both tools list the whole bus and both used to answer with the first usable row,
+# while every write below (`fastboot flash cache`, `fastboot flash misc`, `adb reboot bootloader`)
+# carries no -s at all and so goes wherever ANDROID_SERIAL names -- or, with that unset and two
+# boards present, wherever fastboot's own first-match lands. Detection and the write were two
+# decisions. They are now one: the serial is resolved out loud before anything is touched, and
+# exported so the tools filter by the same name the watchers do.
+device_candidates() {
+  { fastboot devices 2>/dev/null | awk '$2 == "fastboot" {print $1}'
+    adb devices 2>/dev/null | awk 'NR > 1 && ($2 == "device" || $2 == "recovery") {print $1}'
+  } | sort -u
+}
+# Never call this from inside $(fastboot_serial) or $(adb_serial): die there exits only the command
+# substitution's subshell, the caller reads an empty string, and the run reports "the board never
+# enumerated" -- sending the next round to look at the device instead of at this host's own bus.
+require_serial() {
+  if [ -z "$SERIAL" ]; then
+    local found count
+    found=$(device_candidates)
+    count=$(printf '%s\n' "$found" | grep -c . || true)
+    if [ "$count" -gt 1 ]; then
+      die 2 "more than one board is on the bus and no --serial was given; refusing to pick one:"$'\n'"$(printf '  %s\n' $found)"
+    fi
+    [ "$count" -eq 1 ] && SERIAL=$found
+  fi
+  if [ -n "$SERIAL" ]; then
+    export ANDROID_SERIAL="$SERIAL"
+  fi
+  return 0
+}
 fastboot_serial() {
-  fastboot devices 2>/dev/null | awk '$2 == "fastboot" {print $1; exit}'
+  fastboot devices 2>/dev/null |
+    awk -v want="$SERIAL" '$2 == "fastboot" && (want == "" || $1 == want) {print $1; exit}'
 }
 adb_serial() {
   # TWRP's adbd reports the state as "recovery", not "device". Round147 through round184 matched only
   # "device" here, so a board sitting in TWRP looked like a board that never booted recovery -- the
   # 180 s wait in the first round184 flash test timed out with recovery already on the USB bus. Both
   # states mean the same thing to this script: there is a shell to dd the log window through.
-  adb devices 2>/dev/null | awk 'NR > 1 && ($2 == "device" || $2 == "recovery") {print $1; exit}'
+  adb devices 2>/dev/null |
+    awk -v want="$SERIAL" 'NR > 1 && ($2 == "device" || $2 == "recovery") && (want == "" || $1 == want) {print $1; exit}'
 }
 # Round330 host side. Boots 113 and 114 ended the same way on this host: the watcher ran its whole
 # window, saw neither TWRP's adb nor fastboot, and said so -- while the board later turned out to be
@@ -236,6 +275,7 @@ wait_fastboot() {
   say "waiting up to ${WAIT}s for fastboot (the device returns there by itself)"
   timeline_open wait-fastboot "$WAIT"
   while :; do
+    require_serial
     found=$(fastboot_serial); a=$(adb_serial)
     timeline_poll poll "$a" "$found"
     if [ -n "$found" ]; then
@@ -256,6 +296,7 @@ wait_adb() {
   say "waiting up to ${ADB_WAIT}s for recovery adb"
   timeline_open wait-adb "$ADB_WAIT"
   while :; do
+    require_serial
     found=$(adb_serial)
     f=$(fastboot_serial)
     timeline_poll poll "$found" "$f"
@@ -277,6 +318,7 @@ wait_adb() {
 wait_leave_fastboot() {
   local deadline=$(( $(date +%s) + 60 ))
   while :; do
+    require_serial
     [ -z "$(fastboot_serial)" ] && return 0
     [ "$(date +%s)" -ge "$deadline" ] && return 1
     sleep 1
@@ -299,6 +341,7 @@ watch_landing() {
   local a f
   timeline_open watch-landing "$LANDING_WAIT"
   while [ "$(date +%s)" -lt "$deadline" ]; do
+    require_serial
     a=$(adb_serial); f=$(fastboot_serial)
     timeline_poll poll "$a" "$f"
     [ -n "$a" ] && { timeline_close adb "$a" "$f"; return 0; }
@@ -318,6 +361,7 @@ watch_after_deadline() {
   local found f
   timeline_open after-deadline "$(( WAIT + DEADLINE_SLACK ))"
   while :; do
+    require_serial
     found=$(adb_serial)
     f=$(fastboot_serial)
     timeline_poll poll "$found" "$f"
@@ -356,6 +400,11 @@ make_bcb() {
   [ "$(wc -c < "$path" | tr -d ' ')" = "$BCB_SIZE" ]
 }
 
+# Round343 (#732). Resolved before the first call that could write, and said out loud: a run whose
+# board was picked by first-match keeps no record of which board its reading belongs to. An empty
+# bus is not a refusal -- the watchers below resolve it on their first poll, by the same rule.
+require_serial
+say "board: ${SERIAL:-unresolved, nothing on the bus yet}"
 say "contract: clover-unattended=<s> deadline, panic writes a boot-recovery BCB into misc and resets after 20 s"
 
 # A device already sitting in TWRP is the shortest path: dump from it. This also
@@ -571,9 +620,14 @@ decoder="$(cd "$(dirname "$0")" && pwd)/read-clover-log.py"
   echo "== report and panic window"
   python3 "$decoder" "$OUT"
   echo "== verdict ring (driver lines and relayed probe lines, sectors 64..191)"
-  python3 "$decoder" --verdict "$OUT" 2>/dev/null || echo "    no verdict records: this boot predates round174"
+  # Round343: the reader says which slot rule it applied on every read of this ring, on stderr. The
+  # 2>/dev/null this leg used to carry threw that sentence away, so the one card that agreed with the
+  # reader (boot 122) left no product naming the rule it was read by -- the criterion was satisfied by
+  # an artifact nobody kept. Merged here, not sliced: the same stream carries the decoder's own reason
+  # when a ring is empty, which the fallback below used to replace with a guess about the boot's age.
+  python3 "$decoder" --verdict "$OUT" 2>&1 || echo "    no verdict records: this boot predates round174"
   echo "== probe lines (round212 relay from the kernel, kind 25)"
-  python3 "$decoder" --probe "$OUT" 2>/dev/null || echo "    no probe lines: this boot predates round212 or no kill was issued"
+  python3 "$decoder" --probe "$OUT" 2>&1 || echo "    no probe lines: this boot predates round212 or no kill was issued"
   echo "== kernel-log ring (lines the tee copied out of msgbuf, sectors 192..1215)"
   python3 "$decoder" --tee "$OUT" 2>/dev/null || echo "    no kernel-log records: this boot predates round176"
   # Round292. The flight region carries CPU0's four-second beat and the last twelve block requests, each

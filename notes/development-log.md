@@ -28106,10 +28106,10 @@ A1（`hop=3` 那枚翻译得通的正对照）**前提没成立**，按第二十
 
 B2 成立（唯一那枚 busy 行 `arg==done`），**B3 成立**（`opt=80000001` 且 `arg==done` 那枚返 0），④ 那三支也各有读数：
 `opt=0x1` 那枚返 0（这一支第一次不是空判）、`opt=80000003` 走特殊查询返 0 且 `pw=1 ps=0` 与判据同形、`e00002d6` 0 枚（记名不记结论）。
-第二条腿不是我们自己的打印：厂商侧那行 `clover r180: client pid=58 selector 6 1 80000000 0 -> e00002d5 done=1 presented=1`
-把同一个调用的 **arg=1、opt=0x80000000** 独立报了一遍，四枚 1:1 全对上（`arg` 4/4、`opt` 4/4）。
+~~第二条腿不是我们自己的打印：厂商侧那行~~ **改正（§Round342 读数 ⑥/⑦）**：那行 `clover r180: client pid=58 selector 6 1 80000000 0 -> e00002d5 done=1 presented=1`
+**是本探针自己的 `cloverLog`**（`package/CloverLegacyDisplayProbe.cpp:546`，前缀由 `cloverLog` 加），不是厂商的行；它读的 `done`/`presented` 就是 `+0x16bc` 与它的抄件 `+0x16c0`，所以「四枚 1:1 全对上」只证得出同一次调用被本探针印了两遍，**不构成第二条腿**。
 `cur=0`（`display+0x1560`）与 `list=0`（`+0x1568`）在 4/4 枚里都为零，所以 B4 那一支的读数是：
-**这枚 swapID 已经被 retire（done==arg，厂商自己那行也报 `done=1 presented=1`），而家族既没有当前对象也没有 pending 链**——
+~~**这枚 swapID 已经被 retire（done==arg，厂商自己那行也报 `done=1 presented=1`）**~~ **撤回（§Round342 读数 ⑦）：这一格改记「未判」**——`done==arg` 说的是闩锁里装着这枚 ID，`presented` 是它的抄件，要判「那条路径跑过」得看 `fc=`（旧名 `frames=`，`+0xfc`）有没有前进，而当时没人拿它当判据。**而家族既没有当前对象也没有 pending 链**这一半仍是读数（`cur`/`list` 存的是指针，零即空）——
 `e00002d5` 不是「帧还在飞」，是「latch 停在那个数上、而链是空的」。`pw=1 ps=0` 与 `sent=0`、`np0..np5` 全 `null` 都照 boot 117 的形状复现。
 
 **④ 我自己差点犯的一格（不写掉它就等于把它留给下一轮）**：我拿 boot 117 那 38 枚旧行的 `swap=` 反推调用计数器，想用它复核 B2——
@@ -28479,9 +28479,9 @@ N62 是本轮真正拦下过一次事故的那一支：`kRingPinnedSlots = 3` �
 
 **⑤ 同一趟读到的主线证据（boot 121 的显示那一格，与 120 不同形）。**
 
-- 整份卡上 `clover r335: bbswap` **只有 1 枚**（解码本 `:1657`）：`ms=680217 opt=80000003 ret=00000000 arg=0 done=0 cur=0 list=0 pw=1 ps=0 np0..np5=null sent=0 s72=0 gap=none pair=first pid=86`——这是**那支查询跑通的正对照**（§Round332c 认出来的第一枚选择器组合）。第二条腿是厂商自己那行（`:1654`，早 39 µs）：`clover r180: client pid=86 selector 6 0 80000003 0 -> 00000000 done=0 presented=0`，四枚字段逐枚对上。
+- 整份卡上 `clover r335: bbswap` **只有 1 枚**（解码本 `:1657`）：`ms=680217 opt=80000003 ret=00000000 arg=0 done=0 cur=0 list=0 pw=1 ps=0 np0..np5=null sent=0 s72=0 gap=none pair=first pid=86`——这是**那支查询跑通的正对照**（§Round332c 认出来的第一枚选择器组合）。~~第二条腿是厂商自己那行~~ **改正（§Round342 读数 ⑥）**：那行（`:1654`，早 39 µs）`clover r180: client pid=86 selector 6 0 80000003 0 -> 00000000 done=0 presented=0` 是**本探针自己**在 `CloverLegacyDisplayProbe.cpp:546` 的 `cloverLog`，四枚字段对上只证得出同一次调用印了两遍，不是第二条腿。
 - **查询之后到复位之间没有任何 swap 调用，而这一次缺席是有地平线的读数**：内核 tee 环 510 枚带戳行、跨度 **305.256..708.496 s**；比那枚查询（680.219473 s）更新的记录 **71** 枚（跨度 680.2195..708.4962 s），环有 **512** 枚槽 ⇒ 这 28 s 里若真发生过一次 swap，它的行比查询新、且 71 ≪ 512，**不可能被盖掉**。所以「没有」是读数，不是地平线假象（第一层／第十三层）。⇒ boot 121 停在「客户端问了一次查询、然后没交帧」，而 boot 120 走到了 `arg=2 done=2 presented=2`。两靴不同形，n=2，不建因果。
-- `clover r329: dispstate` 17 枚，`client=` 分布 **`none` 11 / `other` 1 / `pid58` 5**，`presented=` 全份 18 处**全是 0**（17 枚拍行＋厂商那行）。#695 那格欠的处置在这里第三次显形：真正发调用的是 pid 86，而拍行选到的要么是 `none` 要么是闲着的 pid 58 ⇒ **这 17 枚拍行答不了「桌面交到第几帧」**，能答的只有厂商那行与 bbswap 行。
+- `clover r329: dispstate` 17 枚，`client=` 分布 **`none` 11 / `other` 1 / `pid58` 5**，`presented=` 全份 18 处**全是 0**（17 枚拍行＋本探针 `:546` 那行；旧文误记为「厂商那行」，见 §Round342 读数 ⑥）。#695 那格欠的处置在这里第三次显形：真正发调用的是 pid 86，而拍行选到的要么是 `none` 要么是闲着的 pid 58 ⇒ **这 17 枚拍行答不了「桌面交到第几帧」**，能答的只有 `:546` 那行与 bbswap 行。
 - `CloverSdhci r175: tee` 普查 12 枚（正好 `kTeeCensusMax = 12`），**r341 那两列第一次在卡上有读数**：首枚 `seen=264 kept=71 throttled=13 lap=0 idx=24576 cut=1 bound=320`、末枚 `seen=3198 kept=740 throttled=57 lap=4 idx=64049 cut=2 bound=320`。`lap=4` 与内核环跨度从 305 s 起（而不是 0 s）同向 ⇒ 那枚环转过四圈，`cut=` 数的是被切的行。按第九层「新字段要说出哪代镜像带着它」：这两列从 **boot 121** 起在场，boot 120 那份没有。
 - flight：12 枚 entry 记录（`seq 137819..137830`），全部 boot 121 所写。
 
@@ -28510,4 +28510,118 @@ N62 是本轮真正拦下过一次事故的那一支：`kRingPinnedSlots = 3` �
 - **本轮怎么付的**：十枚 area 各追加一条 `Round342 …` finding（写的是**本轮实测**：标题位移、+972/+47 B、钉槽那手与两张卡的读数、payload/verify 哈希链、读者那一半与两枚仪器缺陷），三枚脚本各补进属主的 `paths`（两枚 sdhci runner 归 storage、负测电池归 diagnostics）。`validate()` 与文件存在性也一并过。
 - **一枚仪器读数要更正**：闸门那句 `board.toml: update <area> findings or evidence` 里的 `<area>` **不是定值**——`owners` 是 `set`，字符串哈希每进程一变，先撞上谁就报谁（我这趟报 `network`，上一趟报 `firmware`）。所以「按闸门报的那一枚去补」永远补不完；正确读法是**把 15 对全枚举出来**（上面那张表就是枚举结果，不是 fail-fast 的第一枚）。这与第二十一层同格：一个判决只印它撞上的第一枚，就得把探测范围与总数并排印出来。
 - **历史那笔不回填**：r341 的 15 对属已发布的 commit，本轮不去改它的记录（改了要重打已推送的 tag＝force 操作）。债记在这里，r342 起闸门真绿。
+
+## Round342 读数（boot 122 的卡读回来了：四枚一次性行第一次同时在场，而同一趟读出的三枚列名是错的）
+
+产物全部在盘上，读数引的是它们而不是这一段的转述：`~/clover-out/round342-boot122-window.bin`（623104 B / 1217 扇区）、同名 `.txt`（解码本）、`.pre-flash`（boot 121 的卡，本轮的负对照）、`~/clover-out/round342-boot122-census/{census.py,census.stdout.txt,display-rows.py,display-rows.txt,flight.txt,bbswap-rows.txt}`、`~/clover-out/round342-boot122-runner.log`。普查脚本两条腿按构造不同：腿 A 走 `read-clover-log.py` 的 `decode()`（带 kind 过滤与钉槽规则），腿 B 只按 `<10I` 读原始头、不滤 kind、不认钉槽规则 ⇒ 两腿不一致才是信息，一致不是复核（第二十一层）。
+
+**① 预登记五条逐条判（原文在 §Round342 ⑥，看卡之前写定）。**
+
+| 判据 | 读数 | 判 |
+|---|---|---|
+| **P-A** 声明行在场且坐槽 3 | 槽 3 `seq 4` `CloverSdhci r174: verdict ring armed lba=13320280 slots=64 pinned=4`；四个行头各 **1 命中 / 搜遍 64 枚**（`census.stdout.txt:20-24`） | **成立** |
+| **P-A 读者那一半** | `card_pinned(boot122) → (4, None)`；`card_pinned(boot121) → (None, "no r174 arming row lies anywhere in this ring…")`（`:6` 与 `:42`） | **成立，但判据措辞有缺陷，见 ②** |
+| **P-B** 三行同时在场，分坐槽 0/1/2 | 槽 0 `seq 0` `clover r283: last reset unnamed magic=e9a80040002909b0 beat=17615993598978`；槽 1 `seq 1` `clover r339: beatctl wrote=39333354414542 read=39333354414542`；槽 2 `seq 2` `clover r339: mark wrote=77665500 before=8b22f8f after=77665500`。`filled=4 of 4`、`named-empty slots=[]`（`:16-19`） | **成立**（三枚同时，不是「在场一两枚」） |
+| **P-C** 滚动支出现同余反例 | 滚动 60 枚：`slot==seq%64` **0 枚成立 / 60 枚反例**；滚动槽集合恰为 `[4,63]`；前八枚 `(4,60),(5,61),(6,62),(7,63),(8,64),(9,65),(10,66),(11,67)`；越界槽 `[]`；钉住四枚的 `seq` 是 `0,1,2,4`，与槽号无关（`:25-30`） | **成立** |
+| **P-D** 区域没破 | 驱动 64/64（两腿各 64，`leg-A-only=[] leg-B-only=[]`，共有槽字段分歧 0，header 问题 0），槽号全在 `[0,64)` 且唯一；内核环 512/512、同余 512 成立 / 0 反例、`seq 1330..1841`、`kinds=[22]`；窗口 1217 扇区；boot 记录 `{'boot':122,'lba':13321432,'problems':[]}`（`:1-3,8-14,32-38`） | **成立** |
+| **P-E** M-A 仍空判 | 本靴**没写死线记录**（卡上那枚是 boot 108 的，`t=1805026 ms`）；两枚 panic marker 都 STALE（boot 111 `t=700237 ms magic=yes gates=0x7 probe=8/8`、boot 87 `t=1803044 ms rc=112 magic=absent`）；无 drain-in、无 sentence；最新 entry `t=631586 ms`（`flight.txt`） | **按原文成立 ⇒ M-A 继续空判**，`0x77665500` 既没证实也没证伪 |
+
+**② P-A 的判据措辞缺陷：正确的卡产不出预登记要的那行字。** 原文要求「读者的 `[ring rule]` 行必须从『什么都没声明』变成**读到声明 4**」。但发版读者 `scripts/read-clover-log.py:2001-2005` 只在 `why` 非空时印那行——`card_pinned` 在声明坐在自己家槽上时返回 `(4, None)`，于是**一张正确的卡上它沉默**。这不是仪器没跑，是判据要了一条由「不一致」驱动的输出。本轮的处置：直接调 `card_pinned` 量声明本身，并拿 boot 121 的卡当负对照（它返回 `None` 且 `why` 非空，两态分得开）。**仪器债记在这里并在 r343 付**：那行改成无条件印它这一趟用的声明与来源，让「读到了 4」和「什么都没读到」都有一枚字（第二十七层：自己的 magic 要正对照；第十三层：读数=0/缺席时要有正对照）。
+
+**③ 一枚新的算术读数：缺席的 `seq` 恰好等于被挤掉的那四枚。** 驱动环 `seq min=0 max=67`，64 枚不同值，`absent=[3,5,6,7]`（`census.stdout.txt:15`）。钉住支认领了 `seq 0,1,2,4`，滚动支拿到其余 64 笔写进 60 枚滚动槽 ⇒ 最旧的四笔滚动写（`seq 3,5,6,7`）被盖掉，数目与位置都对上。**这是 r342 那手成立的定量形式**：一枚写了 68 笔驱动记录的靴子，四枚一次性行一枚没丢。卡自己分不清「被盖掉」与「从没写过」（只有写手的 cursor 能分），所以这句是算术推断＋数目吻合，不是直接读数；负对照那侧 boot 121 是 `absent=[]`、64 枚滚动全同余（`:51,57-60`），两态在同一套算法下分得开。
+
+**④ 宿主侧一枚读数要交代：这趟 USB 上挂着两块板。** `adb devices` / `fastboot devices` 同时列出 clover（`81ffcaaa`）与 odin，而 `run-clover-unattended.sh:141-149` 两个函数都是 `awk … {print $1; exit}`——**取第一枚，没有 `--serial`**。本轮没有改正在跑的脚本（第二十八层：正在被负测/正在跑的文件同一时刻不是仪器），而是在 `/tmp/clover-boot122-shim/{adb,fastboot}` 放了两个只放行 `81ffcaaa` 的 PATH shim，读回与刷写都经它。⇒ 这趟的读数属 clover 无误，但**脚本本身仍会选错板**，债 #732 在 r343 付（真 `--serial`，默认 `ANDROID_SERIAL`，多于一枚且没指定就 die 2 而不是猜）。
+
+**⑤ boot 122 的显示主线（与 120/121 又不同形，n=3，不建因果）。** 针脚全部从生产者的格式串取，来源与计数并排印在 `display-rows.txt`（第十九层／第三十二层：列名与填它的表达式同源；上一版我自己用 `clover r333: bbswap` 当针脚量出「0 枚」，那是**针脚错**不是缺席，已改正为 `r335`）。
+
+- `clover r335: bbswap` **8 枚**、`bbswapcut` **0 枚**，全份搜过 1942 行；八枚全是 `pid=87`，且 `cur=0 list=0 pw=1 ps=0 np0..np5=null sent=0 s72=0` 逐枚相同（`bbswap-rows.txt`）。按 `opt` 排：`80000003/arg=0/ret=0`（612312 ms，**那支查询跑通的正对照**）、`1/arg=1/ret=0`（617537）、`80000000/arg=1/ret=e00002d5/gap=1`（617538）、`80000001/arg=2/ret=0`（620823）、`80000000/arg=2/ret=e00002d5/gap=5209`（626032）、`80000001/arg=3/ret=0`（631776 与 640983，`gap=9207`）、`80000000/arg=3/ret=e00002d5/gap=2924`（643907）。
+- **三枚 busy 行都是 `arg==done` 且 `cur=0 list=0`** ⇒ 按 §Round334 那张 opt/k 表，busy 只能来自 `in[0]==[fb+0x16bc]` 那一支，**不是对象匹配那一支**（对象与 pending 链都是空）。这是一枚挤掉假设的阴性读数。
+- `clover r180: swap#… accepted` **4 枚**（614.703750 / 617.544369 / 626.033259 / 643.917159 s），request 恒为 `fffffff356fa8000`，surface 三枚 `fffffff5237ba428` 夹一枚 `fffffff5237ba7e0`。
+- `clover r329: dispstate` **12 枚**、`dispstatecut` **0 枚**（fires 12..24，ms 379708..623541）；`client=` 走 `none → other → pid58`；最后一枚完整行 `done=2 presented=2 frames=2 vs=0/0/0 log=48/96 logdrop=0`。fires=22 那枚被一条无换行的 `Sandbox: … MobileBackup` 审计文本拼行切尾（第二十五层：行到了卡上≠独占一行）。**#695 那格第四次显形**：真正发调用的是 pid 87，拍行选到的是闲着的 pid 58 ⇒ 这 12 枚拍行的客户端列答不了「桌面交到第几帧」。
+- `CloverSdhci r175: tee` 普查 **12 枚**：首枚 `seen=264 kept=71 throttled=13 lap=0 cut=1 bound=320`、末枚 `seen=3222 kept=735 throttled=63 lap=4 idx=66525 cut=2 bound=320`。
+- 出厂那两句 5 s 断言（`swap_wait_gated blocked for more than 5 seconds` / `CommandWake didn't happen even after 5 seconds`）**各 0 枚**，而它们的针脚射程在 r333 已量过（两枚镜像都 present）⇒ 这一靴没死在那枚断言上。
+
+**⑥ 同一趟逼出的四枚改正：三枚列名与一枚归属（r343 的设计依据）。** 把闩锁 `+0x16bc` 的写手函数整段反汇编读完（`~/clover-out/latch-16bc-forensics/writer-func-a96c.txt`，448 条指令，`0xfffffff00678a96c..0xfffffff00678b068`），得到的不是「名字不好听」，是**三枚列名各自的主语都错了**：
+
+| 列（旧名） | 读的偏移 | 反汇编里那枚字是什么 | 新名 |
+|---|---|---|---|
+| `done=` | `0x16bc` = 5820 | `0x678ae7c str w9,[x8,#0x16bc]`，`w9=[[fb+0x1560]+0x314]`，守卫是 `[cur+0x32c] ∈ {0,15}`（`0x678ae38..0x678ae68`）⇒ **当前 swap 对象的 ID 被闩进这枚字**，不是「已呈现完的 swapID」 | `latch=` |
+| `presented=` | `0x16c0` = 5824 | `0x678ae9c ldr w8,[x9,#0x16bc]` → `0x678aea0 str w8,[x9,#0x16c0]`，守卫 `[cur+0x34c]==4` ⇒ **它就是闩锁的抄件** | `copy=` |
+| `frames=` | `0xfc` = 252 | `0x678ab70..0x678ab78`：`ldr w8,[x0,#0xfc]; add w8,#1; str w8,[x0,#0xfc]`，同一函数在 current 非空时每跑一次自增一枚 ⇒ **这才是那条路径跑过几次的计数** | `fc=` |
+| `cur=` / `list=` | `0x1560` / `0x1568` | 两处都是 `ldr x8,[x8,#0x1560]` 后再解引用 ⇒ 存的是**指针**，本探针 `memcpy` 4 字节印的是它的低 dword；`cur=0` 的意思是**当前对象为空**，不是「swapID 0」 | 名留，注释改正 |
+
+- **`presented==done` 恒等是同源，不是第二条腿**（第二十四层／第三十四层同格）。卡上八枚镜像行与十二枚拍行里两列逐枚相等，正是 `0x678aea0` 那枚抄写的预期结果 ⇒ 它不能作为「帧真的呈现了」的佐证。**主线题面要据此改口**：#666 写的「boot 116 swap 一路 retire 到 #12、`presented=12`」，实际量到的是**闩锁推进到 12**；本仓至今**没有任何一枚呈现计数**。最接近真计数的是 `fc=`（旧名 `frames=`），boot 122 在 fires=24 那枚读到 **2**。
+- **那枚函数的形状是完成/退休路径**，证据是它写完闩锁之后紧接着做三件事：`0x678af98..0x678afa8` 经 current 对象自己的 vtable `+0x28` 放掉它、`0x678afb0 str xzr,[x8,#0x1560]` 把当前对象清空、`0x678afb4..0x678afd0` 经 `[fb+0x1608]` 的 vtable `+0x108` 从 `fb+0x1568` 那条链取下一枚。而 `0x678aa58` 在 `[fb+0x1560]==0` 时直接跳到 `0x678afe0`，整段主体（含闩锁写与那枚自增）都不跑。**没证的两个口子**：守卫里 `+0x32c` 的 0 与 15 是什么状态没命名；`+0xfc` 是否只有这一个写手没查（本轮扫描只针对 `+0x16bc`）。
+- **写手数目的下界要照抄**：`+0x16bc` 的扫描给出「可见写手恰一枚」，但同一份产物自己声明了三条下界——152 枚寄存器偏移 store 未定值、第三条腿只认一种编码、`memcpy`/`memset`/accessor 类写手在所有腿之外。所以这句是**可见写手一枚**，不是「全世界只有这一枚」。
+- **vtable 槽号不许断言**：`vtable-base-check.txt` 的 adrp+add 物化那条腿是**空的**，而候选基址 `0x6fc7728` 落在 `AppleUSBDeviceMux` 的 range 里、槽 176 那枚指针 `0x6fc7ca8` 落在 `AppleMobileDispH9G` 的 range 里 ⇒ 基址未定，`vtable-slot.txt:10` 那句「writer is slot 150」**本轮不引用**（它旁边那句 `control: slot176 read back at slot 176` 是循环论证，也不引用）。下一手要换一条腿：在 `__DATA/__DATA_CONST` 里搜原始 qword 等于 `base+0x10`/`base+0x18` 的重定位指针，而不是 adrp+add。
+- **一枚归属改正**：`clover r180: client pid=… selector 6 … -> … done=… presented=…` **不是厂商的行**，是本探针 `package/CloverLegacyDisplayProbe.cpp:546` 自己的 `cloverLog`（前缀 `clover r180:` 由 `cloverLog` 加）。全仓 `grep 'selector 6 '` 在 `.cpp/.h/.mm/.c` 里只有这一处生产者。§Round338b（`:28112`）与 §Round342 ⑤（`:28482`/`:28484`）三处把它写成「厂商自己那行／厂商那行」，本轮就地改正；它作为「第二条腿」的地位同时作废——它读的是同两枚偏移，且其中一枚是另一枚的抄件。
+
+**⑦ 撤回一条已落盘的论断。** §Round338b 读 boot 119 时写的「**这枚 swapID 已经被 retire（`done==arg`，厂商自己那行也报 `done=1 presented=1`）**」（`:28112`）撤回：`done==arg` 说的是**闩锁里装着这枚 ID**，而 `presented` 是它的抄件、那行是我们自己的——三枚支撑没有一枚指向「已退休」。按 ⑥ 的反汇编，闩锁写与「放掉 current＋清空 `+0x1560`」在同一条路径上相邻，所以「这条路径跑过」是**可能**的读法，但要判它得看 `fc=` 有没有前进，而那枚列当时叫 `frames=` 且没人拿它当判据。**boot 119 那一格改记「未判」**，不是改记成相反结论。
+
+**⑧ 边界。** 本轮（r342 的读回）没有改任何板上代码：⑥ 的四枚改正是**读数**，落地属 r343。⑤ 的三靴不同形属观察，n=3，不据此改主线假设。M-A 按 P-E 保持空判，**没有因为 P-B 成立就一起记成通过**；M-D 留 boot 123（它要判的是本靴 `clover r283` 行读回来的**上一靴**写进 IMEM 的记录，boot 122 的 P-B 成立才让 boot 123 第一次有材料）。
+
+
+## Round343（#733–#736，代码轮，发版 v0.7.61：三枚显示列名按填它的偏移改名，两条宿主仪器债一起付）
+
+**① 这一手改了什么。** §Round342 读数 ⑥ 把闩锁 `+0x16bc` 的写手函数（`0xfffffff00678a96c`，整段反汇编已归档 `~/clover-out/latch-16bc-forensics/writer-func-a96c.txt`）读完，得到的不是「名字不好听」，是三枚列名各自的主语都错了。本轮把那三枚改正**落地到探针**，并把 boot 122 逼出的两条宿主仪器债（#732 选板、#735 环规则沉默）一起付。改名依据逐条：
+
+| 列（旧名） | 偏移 | 反汇编里那枚字 | 新名 | 为什么 |
+|---|---|---|---|---|
+| `done=` | `0x16bc`=5820 | `0x678ae7c str w9,[x8,#0x16bc]`，`w9=[[fb+0x1560]+0x314]` | `latch=` | 当前 swap 对象的 ID 被**闩**进这枚字，不是「已呈现完的 swapID」 |
+| `presented=` | `0x16c0`=5824 | `0x678ae9c ldr w8,[x9,#0x16bc]`→`0x678aea0 str w8,[x9,#0x16c0]` | `copy=` | 它就是闩锁的**抄件**，同源，不是第二条腿 |
+| `frames=` | `0xfc`=252 | `0x678ab70 ldr w8,[x0,#0xfc];add #1;str` | `fc=` | 完成路径每跑一次自增一枚，**这才是真计数** |
+| `cur=`/`list=` | `0x1560`/`0x1568` | 两处 `ldr x8,[x8,#0x1560]` 后再解引用 | 名留、注释改正 | 存的是**指针**，`cur=0`＝当前对象为空，不是「swapID 0」 |
+
+- **bbswap 行补两枚字**：旧行只印 `done=`（＝latch），本轮改名 `latch=` 并**新增 `copy=`/`fc=`**，于是两枚显示行（dispstate 与 bbswap）现在读**同三枚字**、各经自己的缓冲。`SwapWaitPre.dispTxt` 从 `[3][16]` 扩到 `[5][16]`，`readSwapWaitState` 的循环 `d<3`→`d<5`，`kDisplayOffsets` 从 3 枚扩到 5 枚 `{kLatchOffset,kCopyOffset,kFcOffset,kCurOffset,kListOffset}`。
+- **主线题面据此改口**（#666）：过去读成「boot 116 swap retire 到 #12、`presented=12`」的，实际量到的是**闩锁推进到 12**；`presented==done` 恒等是 `0x678aea0` 那枚抄写的预期结果，**不能**当「帧真的呈现了」的佐证。本仓至今没有任何一枚呈现计数，最接近的是 `fc=`，boot 122 在 fires=24 那枚读到 **2**。
+
+**② 代码落地（逐文件）。**
+
+- `package/CloverLegacyDisplayProbe.cpp`：三枚全局改名（`native_legacy_retired_generation/presented_generation/retired_frames`→`native_legacy_latch/latch_copy/fc`）；`enum {kLatchOffset=5820,kCopyOffset=5824,kFcOffset=252,kCurOffset=5472,kListOffset=5480}`；`ClientStat.seq` 结构字段 `{done,presented}`→`{latch,copy,fc}`；`retire#`/`scanout#`/`s6#` dump/`clover_report` 尾巴全部改名；两枚行 token 升 `clover r343:`。
+- `drivers/CloverSdhci/CloverSdhci.cpp`：`kTeeProbeClasses` 四枚 token `r329-dispstate{,cut}`/`r335-bbswap{,cut}`→`r343-`（预算不动：dispstate 96／cut 8、bbswap 64／cut 8）；两枚 per-pass-cap 豁免前缀 `teeHasPrefix(...,"r343-dispstate")`/`"r343-bbswap"`；注释交代 r343 改名。
+- `drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp`：节拍注释里的行名 `clover r329: dispstate`→`clover r343: dispstate`。
+- `scripts/verify-clover-payload.py`：四枚 pin 的 CString 升 r343，dispstate 换 `latch=%s copy=%s fc=%s`，bbswap 补 copy=/fc=。
+- `scripts/read-clover-log.py`：selftest 从探针**自己的字面量**建两枚显示行族，各族读**自己的** enum 天花板（`kDispStateRowBytes`/`kSwapWaitRowBytes`），并按名断言三列 `("latch=","copy=","fc=")` 在场——改名若不同步改 selftest 的针脚，这一支就红。
+- `board.toml`：`[payload].title` 升 r343，正文写清写手 `0x678a96c`、三枚偏移、boot 122 的重读（`done=2 presented=2 frames=2`＠fires=24，`presented==done` 因 `copy==latch`，`fc` 停在 2）、偏移链闸门与两条宿主仪器。
+
+**③ 偏移链闸门（#736）：列名 → snprintf 操作数 → 缓冲下标 → 偏移常量 → 反汇编量到的数，逐环走。** 闸门把 `measured = {"latch":5820,"copy":5824,"fc":252,"cur":5472,"list":5480}` 钉死，读探针的 `enum {kLatchOffset=...}` 行与 `kDisplayOffsets[5]={...}` 表，沿 bbswap 行的**列名→操作数→`dispTxt[slot]`→偏移常量→measured 那枚数**走一遍，把链印在判决旁边：
+
+```
+[check-clover] notice: r343 swap-row offset chain: latch=<pre.dispTxt[0]> copy=<pre.dispTxt[1]> fc=<pre.dispTxt[2]> cur=<pre.dispTxt[3]> list=<pre.dispTxt[4]>; table kLatchOffset=5820 kCopyOffset=5824 kFcOffset=252 kCurOffset=5472 kListOffset=5480; 22 columns against 22 operands
+```
+
+dispstate 行那一半按**链接**钉：`memcpy(&latchValue,object+kLatchOffset,4);` 与 `snprintf(latch,sizeof latch,"%x",latchValue);latchTxt=latch;` 逐环在场，且 `latchTxt,copyTxt,fcTxt,` 的操作数顺序断言死。**只禁代码行**上的 `done=%s`/`presented=%s`/`frames=%s`（`probe_code` 已剥掉 `*`/`/*`/`//` 开头的行），所以解释这条禁令的注释里出现这些词不算违例（第二十三层）。**一枚列名改了而操作数没跟着动，这条链就断在断的那一环，闸门红着点名是哪一环。**
+
+**④ 两条宿主仪器债一起付。**
+
+- **#732（选板）**：boot 122 那趟 USB 上挂着 clover 与 odin 两块板，而 `run-clover-unattended.sh` 的 `fastboot_serial()`/`adb_serial()` 都是 `awk …{print $1;exit}`——取第一枚、没有 `--serial`，同时所有写（`fastboot flash cache/misc`、`adb reboot bootloader`）都不带 `-s`，只认 `ANDROID_SERIAL`。**检测与写是两枚决策**，于是刷的板与读回的窗可能属两块不同的板而报告里一行都不说。本轮把它合成一枚：新增 `--serial`／`SERIAL=${ANDROID_SERIAL:-}`、`device_candidates()`（fastboot＋adb device/recovery，`sort -u`）、`require_serial()`（多于一枚候选且没指定就 `die 2` 并列出候选，否则认领唯一枚并 `export ANDROID_SERIAL`），两个 selector 加 `awk -v want="$SERIAL"` 过滤，`require_serial` 在顶层（配 `say "board: …"`）与五枚 watcher 里各调一次。**不在 `$(...)` 里调**——那样子 shell 的退出码只杀掉命令替换，调用方读到空串，一趟歧义总线会被报成「板子没枚举出来」。
+- **#735（环规则沉默）**：boot 122 是**同意读者**的那张卡，却一行 `[ring rule]` 都没产——因为 round342 的读者只在 `card_pinned` 返回抱怨时印那句，沉默恰好满足了为那靴写的判据（「说出它用的声明」）。本轮加 `ring_rule_sentence(pinned, why)`，**两支都印**、各自点名规则与来源（声明卡→`round342 pinned=N`／来源「卡自己的 r174 上膛行」；无声明卡→`round341 congruence`／来源「本读者的 fallback」），`main()` 改成无条件 `print(...)`（原 `if why:`）。runner 的 verdict/probe 两条腿 `2>/dev/null`→`2>&1`，那句才进得了归档。**仪器只答它担心的那一支，就答不了自己的沉默**（第二十七层：自己的 magic 要正对照）。
+
+**⑤ 负测电池 90 支（N69–N90 新增 22 支），全 RED、全点名自己、还原后逐字节同。** 判词与还原记录在 `~/clover-out/round343-column-names/negatives.log`（末行 `N90 … restored: gate exit=0, file byte-identical`）。新增支覆盖三处：偏移链（改一枚偏移常量、拆一环链、把列名与操作数错配）、两条宿主仪器（选板 refusal 不触发／在 `$(...)` 里调／watcher 不 resolve；环规则某一支沉默／call site 被条件包回去）、以及 selftest 针脚（reader 不再按名要 `latch=`/`copy=`、探针带回 `frames=%s`）。逐支 RED（exit 1）且还原 `gate exit=0, file byte-identical`。末两支：
+
+| 支 | 破坏 | 它自己的判词 |
+|---|---|---|
+| N89 | reader selftest 不再按名要 `copy=` | `does not print copy=` |
+| N90 | 探针带回 `frames=%s`（那列的生产者是另一枚偏移） | `the r343 probe prints 'frames=%s'` |
+
+**⑥ 构建与闸门读数：这是一枚哈希轮。**
+
+- 树重装配（改过 `scripts/*` ⇒ 第二十六层）：`unixnu tree --device /Users/zhouzhou/UniXNU-clover` 从 `/Users/zhouzhou/UniXNU` 跑；五枚脚本与纯层 `SdhciLogCore.h`、两枚驱动源在仓库与树两处 sha256 逐字节同（`package/CloverLegacyDisplayProbe.cpp` 与 `board.toml` 不进树——树的 `package` 符号链接到底仓，其引文规则由仓库侧那一趟判）。
+- 双闸门**两侧 EXIT=0**（日志 `gate-repo.log`/`gate-tree.log`）：仓库侧 `DT 40 addresses against 230 device-tree nodes; 107 inline asm; drivers documented: 11; citation shapes banned in 36 authored sources`，并印出 ③ 那条偏移链 notice（22 列对 22 操作数）；树侧 `12 archives, 22 objects ABI-checked, kernel read`（`exempt: 22`，`citation shapes: the assembled tree carries 0 sources this repository authors`）。
+- 内核 `out/clover/kernel/kernel.macho` sha256 `c1fdca42bdd49fab42de85dbbeeaabe902bb825a6f79f6e9d086bd92ec211c4c`（52,404,224 B）。
+- AMFI 两刀对上：`0x34000229→0x14000011`（文件 `0x1ae00e4`／VA `0xfffffff004ab40e4`）、`0x36000520→0xd503201f`（文件 `0x1ae016c`／VA `0xfffffff004ab416c`）⇒ `round343-kernel-amfi.macho` sha `8073b0bd18c7aab1cd293d63a40d41ecdb0abbd852cff577e47a0b728751da45`；归一化 **973** 枚 object 戳清零 ⇒ `round343-kernel-normalized.macho` sha `6f35207175feee23819229d4702462452fa7026b044d20606b04cb87a23d3caa`（两枚均 52,404,224 B）。
+- payload **EXIT=0** ⇒ `round343-v0.7.61-payload.img` sha `11b5c1dde687165e41cfc289a813a0c7fdb4329b371b4e49cc7594a7d367892a`（58,720,256 B）；`payload.json` 自报 `kernel_sha256 6f352071…`（＝归一化后那枚）、`payload_kernel_sha256 e976fb74…`、`adt_sha256 955d3403…`、trustcache `7c369ce0…` 与 data ramdisk `614b8356…` 两枚未动。
+- `verify-clover-payload.py` **EXIT=0，51 行 OK、0 FAIL**（`verify.log`），四枚 r343 token 全 present（`r343-dispstate/dispstatecut/bbswap/bbswapcut`）。
+- **显示档案按 AGENTS.md 在新内核存在之后重审了一次**（`out/clover/tree` 里跑 `build-clover-gop-legacy-display.py`，EXIT=0，`/tmp/r343-disp-audit.txt`）：`display-build-report.json` 的 `kernel_sha256` 正是 `c1fdca42…`（本轮这枚，不是上一轮那枚），`compiled_object_sha256 0b5188bb…`、`late_object_sha256 0abcc574…`、`virtual_entries 358`、`guarded_backend_leaves [211,245,246,306,307,338,345]`、`original_instructions_modified False`、`device_observed False`、`display_presented False`；`193 original bindings, 24 owned entries, 154 inherited native entries`。探针带 r343 的改名（含 `s6#` dump 现在印 `[5820]=%x [5824]=%x [252]=%x`、`clover_report` 尾巴 `latch=%x copy=%x frames=%u`）`-Werror` 干净编过（14 枚 sign-conversion warning 属既有）。
+
+**⑦ 预登记 boot 123（#737，r343 这枚镜像，冷刷 `cache`）。** 判据在看卡之前写定：
+
+- **Q-A（改名的行真上了卡）**：`clover r343: dispstate` 与 `clover r343: bbswap` 必须在场，且 dispstate 印 `latch= copy= fc=`、bbswap 印 `latch= copy= fc= cur= list=`；旧 token `r329:`/`r335:` 与旧列名 `done=`/`presented=`/`frames=` **必须 0 枚**。若旧名仍在场，说明刷进去的不是本轮镜像，先核 payload sha。
+- **Q-B（`copy=` 恒等 `latch=`＝同源）**：每一枚 bbswap/dispstate 行里 `copy` 与 `latch` 逐枚相等——这是 `0x678aea0` 那枚抄写的预期，**不是**第二条腿。若某枚 `copy≠latch`，那才是要追的新信息（要么抄写有守卫没跑到，要么读时机跨了那枚 store）。
+- **Q-C（`fc=` 是不是真随 swap 前进）**：这是本轮改口要判的那一格——`fc=`（旧 `frames=`）在完成路径每跑一次自增。若 boot 123 有 accepted swap 而 `fc=` 随之上升，则它是**真计数**、可当「退休路径跑过几次」的佐证；若 `fc=` 钉着不动而 latch 在推进，则完成路径根本没跑，「帧在退休」这个读法要再改口。**这一支是 #666 主线题面能不能立在 `fc=` 上的判据。**
+- **Q-D（新行宽从卡量，不假设）**：bbswap 现在多两枚字，行更宽；从卡上量 `clover r343: bbswap` 与 `dispstate` 的实际字节宽，核对没有触发 `bbswapcut`/`dispstatecut`（cut 行 0 枚＝没被 320 字节记录切尾）。
+- **M-D（跨靴，boot 122 的 P-B 成立才第一次有材料）**：本靴那条 `clover r283: last reset` 行读回来的，是**上一靴（boot 122）**写进 IMEM 的记录；判它写没写、magic 对不对。同靴判不了跨靴，所以留到 123。
+- **M-A 仍空判**：若本靴同样没到 1800 s 死线、两枚 panic marker 仍 STALE，则「落回模式由谁决定」继续记空判，`kRestartBootloader=0x77665500` 继续既没证实也没证伪。**不许因为 Q-A/Q-B 成立就把 M-A 一起记成通过**——主语不同。
+
+**⑧ 边界。** 本轮改的是**三枚列名与 bbswap 的两枚新增字**，不是任何一颗外设的行为：偏移、kind、clamp、环几何、tee 预算、boot-args 一枚未动（`board.toml` 只换 `[payload].title`）。两条宿主仪器（#732/#735）改的是读回通路的**说话方式**，不改板上写什么。⑥ 的哈希是产物，不是板上读数；boot 123 的卡还没读，Q-A…Q-D 与 M-D 全部**未判**。③ 那条偏移链闸门只证「列名与填它的表达式同源」，**不证**那枚偏移在 stock 内核里的语义——语义的依据是 §Round342 读数 ⑥ 的反汇编，已归档。
 

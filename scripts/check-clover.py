@@ -3295,42 +3295,42 @@ def check_board(errors: list) -> str:
             errors.append("the r328 receive row is not exempt from the per-pass cap: keeping one half of the "
                           "send/receive pair and eating the other makes \"the hop has no door\" "
                           "indistinguishable from \"the row was capped\"")
-        # Round329. Two classes, and the order between them is the only thing that keeps the longer key
-        # reachable: "clover r329: dispstate" is a prefix of "clover r329: dispstatecut", and teeProbeClass
+        # Round329's beat row, r343's head. Two classes, and the order between them is the only thing that keeps the longer key
+        # reachable: "clover r343: dispstate" is a prefix of "clover r343: dispstatecut", and teeProbeClass
         # returns the first match, so a table that listed the state row first would send every cut row into
         # the state row's budget -- r313's containment lesson read the other way (the wrong table answers
         # instead of refusing).
-        for entry in ('{ "clover r329: dispstatecut", "r329-dispstatecut", 8, 0, 0, 0 },',
-                      '{ "clover r329: dispstate", "r329-dispstate", 96, 0, 0, 0 },'):
+        for entry in ('{ "clover r343: dispstatecut", "r343-dispstatecut", 8, 0, 0, 0 },',
+                      '{ "clover r343: dispstate", "r343-dispstate", 96, 0, 0, 0 },'):
             if entry not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: a beat row with no budget of "
                               "its own competes with the burst it happens to land in, and this row's whole "
                               "job is to be readable when nothing else is happening")
-        if sdhci_source.find('{ "clover r329: dispstatecut"') > sdhci_source.find('{ "clover r329: dispstate"'):
-            errors.append("the r329 tee table lists the shorter token first: the cut row would be counted, "
+        if sdhci_source.find('{ "clover r343: dispstatecut"') > sdhci_source.find('{ "clover r343: dispstate"'):
+            errors.append("the r343 tee table lists the shorter token first: the cut row would be counted, "
                           "and reported, as a state row")
-        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r329-dispstate")' not in sdhci_source:
-            errors.append("the r329 state row is not exempt from the per-pass cap: it fires on the display's "
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r343-dispstate")' not in sdhci_source:
+            errors.append("the r343 state row is not exempt from the per-pass cap: it fires on the display's "
                           "own beat, away from every burst, and a row the cap ate reads exactly like a beat "
                           "that never fired -- which are the two answers this round is asking between")
 
-        # Round335. The same containment, one round later: "clover r335: bbswap" is a prefix of
-        # "clover r335: bbswapcut" and teeProbeClass returns the first match, so the table order is the only
+        # Round335's swap row, r343's head. The same containment: "clover r343: bbswap" is a prefix of
+        # "clover r343: bbswapcut" and teeProbeClass returns the first match, so the table order is the only
         # thing that keeps the cut branch from being filed as the row it says did not fit. The budget is
         # sized from boot 115's own count (seven selector-6 calls by the last beat row) with headroom, and it
         # is a class of its own because these rows fire per wait call, from the probe, beside whichever pass
         # the client happens to arrive in.
-        for entry in ('{ "clover r335: bbswapcut", "r335-bbswapcut", 8, 0, 0, 0 },',
-                      '{ "clover r335: bbswap", "r335-bbswap", 64, 0, 0, 0 },'):
+        for entry in ('{ "clover r343: bbswapcut", "r343-bbswapcut", 8, 0, 0, 0 },',
+                      '{ "clover r343: bbswap", "r343-bbswap", 64, 0, 0, 0 },'):
             if entry not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: a per-call row with no budget "
                               "of its own competes with the burst it lands in, and this row's job is to be the "
                               "one that survives the boot that stalls in this wait")
-        if sdhci_source.find('{ "clover r335: bbswapcut"') > sdhci_source.find('{ "clover r335: bbswap"'):
-            errors.append("the r335 tee table lists the shorter token first: the cut row would be counted, "
+        if sdhci_source.find('{ "clover r343: bbswapcut"') > sdhci_source.find('{ "clover r343: bbswap"'):
+            errors.append("the r343 tee table lists the shorter token first: the cut row would be counted, "
                           "and reported, as a swap row")
-        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r335-bbswap")' not in sdhci_source:
-            errors.append("the r335 swap-wait rows are not exempt from the per-pass cap: keeping the beat row "
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r343-bbswap")' not in sdhci_source:
+            errors.append("the r343 swap-wait rows are not exempt from the per-pass cap: keeping the beat row "
                           "and eating the event row leaves the reader with the same boot's state and none of "
                           "its moments, which is the half-pair r249 refuses")
 
@@ -7178,12 +7178,13 @@ def check_board(errors: list) -> str:
     # kernel and added ephemeral-storage; boot 108 read it back and the stall only moved (migration ->
     # chronod), and sheng boots to the desktop without it, so round322 reverts the ADT again: same
     # kernel, ephemeral-storage ABSENT so first-boot migration runs -- the menu names round322.
-    # Round335 is the code round after the merged-tooling control round: two probe columns move (bbswap
-    # gains arg/done/cur/list and drops swap; bbsend now prints every hop), so the menu names round335
-    # while rows this round did not touch keep their own generation tokens (bbsend r331, bbrcv r328,
-    # dispstate r329) -- a card row names its probe generation, the title names the image that ran.
-    if not board["payload"]["title"].startswith("clover r342:"):
-        errors.append('[payload] title is not "clover r342: ...": the menu would not name this round')
+    # Round343 is a probe-column round: three display columns are renamed to the offset that fills them
+    # (the stock latch writer stores 0x16bc, copies it to 0x16c0, and counts 0xfc), and the swap row gains
+    # the count column so both display rows read the same three words. The menu names round343 while rows
+    # this round did not touch keep their own generation tokens (bbsend r331, bbrcv r328) -- a card row
+    # names its probe generation, the title names the image that ran.
+    if not board["payload"]["title"].startswith("clover r343:"):
+        errors.append('[payload] title is not "clover r343: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -7458,6 +7459,130 @@ done
             errors.append(f"read-clover-log.py no longer prints {needle!r}: the onset time, the "
                           "derived-at-open leg and the generation of the writer are the three things "
                           "this file says that a close label cannot")
+    # Round343 (#732). Which board a run is about used to be two decisions. The watchers answered with
+    # the first usable row of the two device lists, while every write below carries no -s and so goes
+    # wherever ANDROID_SERIAL names -- with that unset and a second board on the bus, wherever
+    # fastboot's own first match lands. The flash and the window could then belong to different boards
+    # and no line of the report would say so. The decision is now made once, before anything is
+    # touched, and exported so the tools filter by the same name the watchers do.
+    #
+    # Run, not grepped, for the reason N8 gave: the sentence that explains a branch contains that
+    # branch's own words. The four functions and the SERIAL default line are lifted out of the shipping
+    # script and run against eight synthesized buses; die and the two tools are stubs, so the refusal
+    # is observable as an exit code and a candidate list rather than as a word in a comment.
+    serial_fns = ("device_candidates", "require_serial", "fastboot_serial", "adb_serial")
+    serial_blocks = {name: re.search(r"^" + name + r"\(\) \{.*?^\}", script_text, re.S | re.M)
+                     for name in serial_fns}
+    serial_default = re.search(r"^SERIAL=\$\{ANDROID_SERIAL:-\}$", script_text, re.M)
+    serial_absent = [name for name, block in serial_blocks.items() if block is None]
+    if serial_absent or serial_default is None:
+        errors.append("scripts/run-clover-unattended.sh cannot be asked which board it is about: "
+                      f"missing function block(s) {serial_absent}, SERIAL default line "
+                      f"{'present' if serial_default else 'absent'} -- the watchers would again answer "
+                      "with the first row on the bus while the writes go wherever the environment says")
+    else:
+        harness = (serial_default.group(0) + "\n"
+                   + "\n".join(serial_blocks[name].group(0) for name in serial_fns) + """
+die() { local code=$1; shift; printf 'DIE[%s] %s\\n' "$code" "$*" >&2; exit "$code"; }
+fastboot() { printf '%s\\n' "$FB_STUB"; }
+adb() { printf '%s\\n' "$ADB_STUB"; }
+# stands where the script's own --serial case stands: after the default, before the first tool call
+[ -n "${SERIAL_ARG:-}" ] && SERIAL=$SERIAL_ARG
+require_serial
+# EXPORT is read by an exec'd child, because that is what adb and fastboot are: a variable merely
+# assigned in this shell is invisible to them, and a subshell would inherit it and hide the difference.
+printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
+  "$(/bin/bash -c 'printf "%s" "${ANDROID_SERIAL:-}"')" "$(fastboot_serial)" "$(adb_serial)"
+""")
+        attached = "List of devices attached"
+        both_boards = {"FB_STUB": "81ffcaaa fastboot", "ADB_STUB": attached + "\n0123456789 recovery"}
+        fixtures = [
+            {"name": "one board in fastboot, nothing declared",
+             "env": {"FB_STUB": "81ffcaaa fastboot", "ADB_STUB": attached}, "rc": 0,
+             "out": ["SERIAL[81ffcaaa] EXPORT[81ffcaaa] FB[81ffcaaa] ADB[]"],
+             "why": "the only board on the bus has to be adopted by name and exported, or the writes "
+                    "below still go wherever the environment says instead of where the watcher answered"},
+            {"name": "one board in recovery only, nothing declared",
+             "env": {"FB_STUB": "", "ADB_STUB": attached + "\n81ffcaaa recovery"}, "rc": 0,
+             "out": ["SERIAL[81ffcaaa] EXPORT[81ffcaaa] FB[] ADB[81ffcaaa]"],
+             "why": "a run that starts in TWRP resolves its board the same way; recovery is a shell to "
+                    "dd through and therefore a candidate"},
+            {"name": "two boards, nothing declared", "env": both_boards, "rc": 2,
+             "err": ["more than one board", "81ffcaaa", "0123456789"],
+             "why": "two candidates and no declaration is a refusal that names both, not a coin toss "
+                    "whose loser is a declared eMMC write"},
+            {"name": "two boards, --serial names the one in recovery",
+             "env": dict(both_boards, SERIAL_ARG="0123456789"), "rc": 0,
+             "out": ["SERIAL[0123456789] EXPORT[0123456789] FB[] ADB[0123456789]"],
+             "why": "the declared board is in recovery and the other is in fastboot, so a watcher that "
+                    "stops at the first row answers with the board this run is NOT about -- and the "
+                    "fastboot selector must then answer with nothing, not with the other board"},
+            {"name": "two boards, ANDROID_SERIAL names the one in fastboot",
+             "env": dict(both_boards, ANDROID_SERIAL="81ffcaaa"), "rc": 0,
+             "out": ["SERIAL[81ffcaaa] EXPORT[81ffcaaa] FB[81ffcaaa] ADB[]"],
+             "why": "the environment's declaration is the same decision as --serial, and it is the one "
+                    "the writes already obeyed before this round"},
+            {"name": "a declared serial that is not on the bus",
+             "env": {"FB_STUB": "81ffcaaa fastboot", "ADB_STUB": attached, "SERIAL_ARG": "0123456789"},
+             "rc": 0, "out": ["SERIAL[0123456789] EXPORT[0123456789] FB[] ADB[]"],
+             "why": "an absent declared board reads as absent: adopting the one that did enumerate "
+                    "would flash a board nobody named"},
+            {"name": "an empty bus", "env": {"FB_STUB": "", "ADB_STUB": attached}, "rc": 0,
+             "out": ["SERIAL[] EXPORT[] FB[] ADB[]"],
+             "why": "nothing on the bus is not a refusal -- the board is still coming, and the watchers "
+                    "resolve it on a later poll by this same rule"},
+            {"name": "a board adb cannot talk to",
+             "env": {"FB_STUB": "", "ADB_STUB": attached + "\n81ffcaaa unauthorized"}, "rc": 0,
+             "out": ["SERIAL[] EXPORT[] FB[] ADB[]"],
+             "why": "unauthorized is not a shell to dd the window through, so it is not a candidate and "
+                    "must not be adopted as the run's board"},
+        ]
+        for case in fixtures:
+            probe = subprocess.run(["/bin/bash", "-c", harness], capture_output=True, text=True,
+                                   env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", **case["env"]})
+            said = probe.stdout + probe.stderr
+            problems = []
+            if probe.returncode != case["rc"]:
+                problems.append(f"exit {probe.returncode}, expected {case['rc']}")
+            for needle in case.get("out", []):
+                if needle not in probe.stdout:
+                    problems.append(f"stdout never carries {needle!r}")
+            for needle in case.get("err", []):
+                if needle not in probe.stderr:
+                    problems.append(f"stderr never carries {needle!r}")
+            if problems:
+                errors.append(f"board-selection probe [{case['name']}]: " + "; ".join(problems)
+                              + f" -- {case['why']}; the probe said {said.strip()[-300:]!r}")
+    # The guard has to run in the script's own shell. Inside $(fastboot_serial) a refusal exits only
+    # that subshell, the caller reads an empty string, and the run reports that the board never
+    # enumerated -- which sends the next round to look at the device instead of at this host's bus.
+    if "$(require_serial" in script_text:
+        errors.append("scripts/run-clover-unattended.sh resolves the board inside a command "
+                      "substitution: the refusal's exit code dies with that subshell and the caller "
+                      "reads an empty answer, so an ambiguous bus is reported as a board that never came")
+    if not re.search(r"^require_serial$", script_text, re.M):
+        errors.append("scripts/run-clover-unattended.sh never resolves the board at top level: the "
+                      "first write would run before any declaration was made or refused")
+    for watch in ("wait_fastboot", "wait_adb", "wait_leave_fastboot", "watch_landing",
+                  "watch_after_deadline"):
+        body = re.search(r"^" + watch + r"\(\) \{.*?^\}", script_text, re.S | re.M)
+        if body is None or "require_serial" not in body.group(0):
+            errors.append(f"{watch}() does not resolve the board on its polls: a run that started with "
+                          "an empty bus adopts nothing, and every later poll is then a first-match "
+                          "answer again")
+    for needle in ("--serial) SERIAL=$2; shift 2 ;;", "--serial SERIAL", 'export ANDROID_SERIAL="$SERIAL"'):
+        if needle not in script_text:
+            errors.append(f"scripts/run-clover-unattended.sh has no {needle!r}: the declaration, its "
+                          "documented entry point and the export that makes the writes obey it are "
+                          "three links, and the probe above only exercises the middle one")
+    # A selector may still stop at the first row -- but only the first row that matches the declared
+    # serial. Judged on code lines, so the sentence above describing the old shape cannot satisfy it.
+    unfiltered = [line.strip() for line in script_text.splitlines()
+                  if not line.strip().startswith("#")
+                  and "{print $1; exit}" in line and "want" not in line]
+    if unfiltered:
+        errors.append("a device selector stops at the first usable row without comparing it to the "
+                      f"declared serial: {len(unfiltered)} such line(s), the first {unfiltered[0][:110]!r}")
     # The script is the read-back path, and until now its syntax was only ever tested by running it on
     # the board's clock: a typo costs a 2100 s window and a boot nobody read.
     syntax = subprocess.run(["bash", "-n", str(REPO / "scripts/run-clover-unattended.sh")],
@@ -8837,6 +8962,46 @@ done
                           "call line, not the definition -- `def card_pinned_selftest():` carries the "
                           "same characters and proves nothing): which row declares the layout would be "
                           "measured only by whichever card the next reader happens to have")
+        # Round343 (#735). Boot 122 is the card that agreed with the reader, and it produced no
+        # [ring rule] line at all: the sentence was printed only when card_pinned returned a
+        # complaint. The criterion written for that boot asked the reader to name the declaration it
+        # used, and silence satisfied it. An instrument that answers only the branch it is worried
+        # about cannot answer its own silence -- and a card read by the fallback must never be
+        # mistaken for a card read by its own declaration. Both branches print, each naming its rule
+        # and where that rule came from. The call site is pinned as the two adjacent lines, because
+        # a conditional wrapped around the second one is the whole defect and neither line alone
+        # shows it.
+        if "def ring_rule_sentence (pinned, why):" not in reader_src:
+            errors.append("read-clover-log.py has no ring_rule_sentence(): the rule a read applied "
+                          "would again be printed only on the branch that complains, so the card that "
+                          "agrees leaves no product naming the declaration it was read by")
+        if not re.search(r"^        pinned, why = card_pinned \(data, args\.first_lba\)\n"
+                         r"        print \(ring_rule_sentence \(pinned, why\), file=sys\.stderr\)$",
+                         reader_src, re.M):
+            errors.append("read-clover-log.py does not print the ring rule unconditionally beside the "
+                          "call that computes it: the two lines have to be adjacent, because a "
+                          "condition wrapped around the print is exactly the silence boot 122 "
+                          "satisfied its criterion with")
+        for needle in ("round341 congruence (slot == seq % slots)", "this reader's fallback",
+                       "the card's own r174 arming row", "two different rules printed the same sentence",
+                       "the reader would report its own assumption as the card's declaration",
+                       "the driver ring has to say which rule read it, on every read"):
+            if needle not in reader_src:
+                errors.append(f"read-clover-log.py has no {needle!r}: the two branches have to name "
+                              "different rules and the selftest has to read the real main() to see "
+                              "them -- a helper-only test cannot notice the print being made "
+                              "conditional again")
+        # The sentence goes to stderr, and the read-back path used to throw that stream away on this
+        # very leg. An unconditional print with no archived product is the same silence one layer up.
+        if '--verdict "$OUT" 2>&1' not in script_text:
+            errors.append("scripts/run-clover-unattended.sh does not keep the decoder's stderr on the "
+                          "verdict leg: the ring-rule sentence is printed there, so the run would "
+                          "again leave no product naming the rule its window was read by")
+        if re.search(r'--verdict "\$OUT" 2>/dev/null', script_text):
+            errors.append("scripts/run-clover-unattended.sh discards the verdict leg's stderr: that "
+                          "stream carries both the ring-rule sentence and the decoder's own reason "
+                          "for an empty ring, and the fallback line replaces the second with a guess "
+                          "about the boot's age")
 
     # Round186. launchd panics with "required boot task executable not found" and neither the panel nor
     # the card says which path its posix_spawn() looked up. The kernel is the only place that knows, and
@@ -9173,8 +9338,8 @@ done
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r342:"):
-        errors.append('[payload] title is not "clover r342: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r343:"):
+        errors.append('[payload] title is not "clover r343: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -9636,9 +9801,9 @@ done
     if probe.is_file():
         probe_code = [line for line in probe_text.splitlines()
                       if not line.strip().startswith(('*', '/*', '//'))]
-        for now in ('"clover r329: dispstate ms=%llu fires=%u seen=%u client=%s calls=%s fails=%s regall=%s regs=%s grew=%s "',
-                    '"hot=%s s6=%s done=%s presented=%s frames=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\\n"',
-                    '"clover r329: dispstatecut bytes=%d cap=%u fires=%u client=%s\\n"',
+        for now in ('"clover r343: dispstate ms=%llu fires=%u seen=%u client=%s calls=%s fails=%s regall=%s regs=%s grew=%s "',
+                    '"hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\\n"',
+                    '"clover r343: dispstatecut bytes=%d cap=%u fires=%u client=%s\\n"',
                     'static volatile uint32_t cloverLogDropped;',
                     'cloverLogDropped=cloverLogDropped+1;return;',
                     'uint32_t regCalls;',
@@ -9653,16 +9818,16 @@ done
         # Every column that describes a client must have a literal for "there was no such client to read",
         # and that literal is `-`, not 0: a zero would print the same for a client that asked nothing.
         if not probe_code or 'const char *callsTxt="-"' not in probe_text:
-            errors.append("the r329 row prints client columns with no literal for the case where no pid-58 "
+            errors.append("the r343 row prints client columns with no literal for the case where no pid-58 "
                           "client exists: `-` and 0 are two different answers and r327 already paid for "
                           "collapsing them")
         # Negative needles. The row must not take a name another producer already owns, and must not spend a
         # column on a word that is a pure function of a column beside it (round8's rule: a field whose value
         # is fixed by the row is not a reading).
-        for banned in ('"clover r329: dispstate t=', '"clover r329: dispstate us=',
+        for banned in ('"clover r343: dispstate t=', '"clover r343: dispstate us=',
                        'dispstate %s state=', 'state=%s grew=', 'set=%u state=%s'):
             if any(banned in line for line in probe_code):
-                errors.append(f"the r329 row carries {banned[:40]!r}: `t=` is this file's seconds-since-first-frame "
+                errors.append(f"the r343 row carries {banned[:40]!r}: `t=` is this file's seconds-since-first-frame "
                               "and the kernel rows' seconds-since-boot, so the beat names its own unit `ms=`; "
                               "and a word that restates a column beside it is not a reading")
         interpose_body = probe_text.split('static void interpose(IOUserClient *client,int pid) {')[1] \
@@ -9670,6 +9835,103 @@ done
         if 'reportDisplayState();' not in interpose_body.split('\n}')[0]:
             errors.append("interpose() does not fire the state row: without a row printed from the client's own "
                           "arrival there is nothing to tell a lost beat from a lost channel")
+        # Round343 (#736). Three columns are now named for the offset that fills them, and a pin that
+        # only asks for the string `latch=` is satisfied by a row printing `latch=` from the wrong
+        # operand -- round339b paid for exactly that. So the swap row's whole chain is walked here:
+        # column name -> snprintf operand -> the index of the buffer that operand reads -> the offset
+        # constant at that index -> the number measured in the stock kernel's latch writer. Each link
+        # is read from its own declaration line, and the chain is printed beside the verdict so a red
+        # names the link that moved. The numbers are not this gate's to derive: they come from
+        # ~/clover-out/latch-16bc-forensics/writer-func-a96c.txt, where 0x678ae7c stores [cur+0x314]
+        # into [fb+0x16bc], 0x678aea0 copies that into [fb+0x16c0], and 0x678ab78 increments [fb+0xfc].
+        measured = {"latch": 5820, "copy": 5824, "fc": 252, "cur": 5472, "list": 5480}
+        enum_line = next((line for line in probe_code if line.startswith("enum {kLatchOffset=")), "")
+        offset_values = dict((name, int(value))
+                             for name, value in re.findall(r"(k\w+Offset)=(\d+)", enum_line))
+        table_line = next((line for line in probe_code if "kDisplayOffsets[5]={" in line), "")
+        table = re.findall(r"k\w+Offset", table_line.split("{", 1)[1]) if "{" in table_line else []
+        head = '"clover r343: bbswap ms='
+        start = next((index for index, line in enumerate(probe_code) if head in line), None)
+        if start is None or not enum_line or len(table) != 5:
+            errors.append("the r343 swap row's offset chain is not declared: the row needs its own "
+                          "format literal, an `enum {kLatchOffset=...}` line and a five-entry "
+                          "kDisplayOffsets table, or a column name cannot be tied to the storage it reads")
+        else:
+            literal = ""
+            index = start
+            while index < len(probe_code):
+                literal += "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', probe_code[index]))
+                if probe_code[index].rstrip().endswith(","):
+                    break
+                index += 1
+            operands = []
+            for line in probe_code[index + 1:]:
+                last = line.rstrip().endswith(");")
+                operands += [part.strip() for part in (line[:line.rfind(")")] if last else line).split(",")
+                             if part.strip()]
+                if last:
+                    break
+            columns = re.findall(r"(\w+)=%", literal)
+            if len(columns) != len(operands):
+                errors.append(f"the r343 swap row has {len(columns)} columns and {len(operands)} operands: "
+                              "every conversion in this row takes one operand, so a mismatch means the "
+                              "column names and the values under them are no longer the same list")
+            else:
+                chain = []
+                for position, column in enumerate(columns):
+                    if column not in measured:
+                        continue
+                    operand = operands[position]
+                    name = "k" + column.capitalize() + "Offset"
+                    slot = table.index(name) if name in table else -1
+                    want_index = f"pre.dispTxt[{slot}]"
+                    chain.append(f"{column}=<{operand}>")
+                    if operand != want_index:
+                        errors.append(f"the r343 swap row prints {column}= from {operand}, not from "
+                                      f"{want_index}: the column is named for an offset, so the operand "
+                                      "under it has to be the buffer that offset fills")
+                for position, name in enumerate(table):
+                    column = name[1:-6].lower()
+                    if column not in measured:
+                        errors.append(f"kDisplayOffsets[{position}] is {name}, which names no column of "
+                                      "the r343 swap row: the table's order is the row's order")
+                    elif offset_values.get(name) != measured[column]:
+                        errors.append(f"{name} is {offset_values.get(name)}, but the stock kernel's latch "
+                                      f"writer stores {column} at {measured[column]} "
+                                      f"(0x{measured[column]:x}): the column would name a different word")
+                    elif f"pre.dispTxt[{position}]" not in operands:
+                        errors.append(f"kDisplayOffsets[{position}] ({name}) fills no operand of the "
+                                      "r343 swap row: the table and the row disagree about how many "
+                                      "words are read")
+                print(f"[check-clover] notice: r343 swap-row offset chain: {' '.join(chain)}; table "
+                      f"{' '.join(f'{n}={offset_values.get(n)}' for n in table)}; "
+                      f"{len(columns)} columns against {len(operands)} operands")
+            # The state row reaches the same three words through its own buffers, so its chain is
+            # pinned link by link on the declaration lines: the memcpy that reads the offset, the
+            # snprintf that fills the text, and the operand order under the column order.
+            for column in ("latch", "copy", "fc"):
+                name = "k" + column.capitalize() + "Offset"
+                for needle in (f"memcpy(&{column}Value,object+{name},4);",
+                               f'snprintf({column},sizeof {column},"%x",{column}Value);{column}Txt={column};'):
+                    if not any(needle in line for line in probe_code):
+                        errors.append(f"the r343 state row does not fill {column}= through {needle!r}: "
+                                      "the column would be named for an offset it no longer reads")
+            state_head = '"hot=%s s6=%s latch=%s copy=%s fc=%s'
+            if not any(state_head in line for line in probe_code):
+                errors.append("the r343 state row does not print latch= copy= fc= in that order: the "
+                              "three columns are the same three words the swap row reads, and a reader "
+                              "comparing the two rows needs them in the same order")
+            if not any("latchTxt,copyTxt,fcTxt," in line for line in probe_code):
+                errors.append("the r343 state row's operands are not latchTxt,copyTxt,fcTxt in that "
+                              "order: the column names and the buffers under them would be two lists")
+            # The old names are banned on code lines only. `frames=%u` in the r180 checkpoint tail and
+            # `done=%lldms` in the offer row are other producers' columns and stay legal; what must not
+            # come back is one of those three words printed as a %s beside the offset-named columns.
+            for banned in ("done=%s", "presented=%s", "frames=%s"):
+                if any(banned in line for line in probe_code):
+                    errors.append(f"the r343 probe prints {banned!r}: that word named a column whose "
+                                  "producer is a different offset, and `presented` was the latch copied "
+                                  "to +0x16c0 -- a second name for a column beside it, not a second leg")
 
     driver_text = display_driver.read_text() if display_driver.is_file() else ""
     if driver_text:

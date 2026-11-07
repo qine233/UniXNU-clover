@@ -108,7 +108,7 @@ volatile uint64_t native_legacy_swap_request,native_legacy_swap_surface;
 volatile uint32_t native_legacy_transfer_calls;
 volatile int native_legacy_transfer_status=-1;
 volatile uint64_t native_legacy_transfer_bytes,native_legacy_transfer_request;
-volatile uint64_t native_legacy_retirement_calls,native_legacy_retired_generation,native_legacy_presented_generation,native_legacy_retired_frames;
+volatile uint64_t native_legacy_retirement_calls,native_legacy_latch,native_legacy_latch_copy,native_legacy_fc;
 volatile uint64_t native_legacy_retired_current,native_legacy_retired_pending;
 // Swaps retired by the driver the moment the GPU client took the frame, and copies that then failed. The driver owns
 // the storage (its own extern "C" block at the top of that file defines both words and writes them), so this
@@ -301,8 +301,8 @@ void native_legacy_transfer_observed(IOReturn status,const void *request,uint64_
     native_legacy_transfer_status=status;native_legacy_transfer_request=(uintptr_t)request;native_legacy_transfer_bytes=bytes;
     if(status==kIOReturnSuccess) {
         if(native_legacy_transfer_calls<=4)
-            cloverLog("scanout#%u ok bytes=%llu retired=%llu frames=%llu",native_legacy_transfer_calls,(unsigned long long)bytes,
-                (unsigned long long)native_legacy_retirement_calls,(unsigned long long)native_legacy_retired_frames);
+            cloverLog("scanout#%u ok bytes=%llu retired=%llu fc=%llu",native_legacy_transfer_calls,(unsigned long long)bytes,
+                (unsigned long long)native_legacy_retirement_calls,(unsigned long long)native_legacy_fc);
     } else
         cloverLog("scanout#%u FAILED status=%08x prepare=%u tries=%u bytes=%llu",native_legacy_transfer_calls,(unsigned)status,
             native_legacy_prepare_reason,native_legacy_prepare_attempts,(unsigned long long)bytes);
@@ -318,15 +318,17 @@ void native_legacy_gpu_fallback_observed(int status) {
 }
 void native_legacy_retirement_observed(IOService *display) {
     const unsigned char *bytes=reinterpret_cast<const unsigned char *>(display);
-    uint64_t current=0,pending=0;uint32_t completed=0,presented=0,frames=0;
+    uint64_t current=0,pending=0;uint32_t latch=0,copy=0,fc=0;
     memcpy(&current,bytes+5472,8);memcpy(&pending,bytes+5480,8);
-    memcpy(&completed,bytes+5820,4);memcpy(&presented,bytes+5824,4);memcpy(&frames,bytes+252,4);
+    // +0x16c0 is assigned from +0x16bc one instruction after the latch store (0x678aea0), so copy= is the same
+    // quantity and not a second leg; +0xfc is the counter the completion path increments once per run (0x678ab70).
+    memcpy(&latch,bytes+5820,4);memcpy(&copy,bytes+5824,4);memcpy(&fc,bytes+252,4);
     native_legacy_retired_current=current;native_legacy_retired_pending=pending;
-    native_legacy_retired_generation=completed;native_legacy_presented_generation=presented;native_legacy_retired_frames=frames;
+    native_legacy_latch=latch;native_legacy_latch_copy=copy;native_legacy_fc=fc;
     native_legacy_retirement_calls=native_legacy_retirement_calls+1;
     if(native_legacy_retirement_calls<=4)
-        cloverLog("retire#%llu done=%x presented=%x frames=%x current=%llx pending=%llx",
-            (unsigned long long)native_legacy_retirement_calls,completed,presented,frames,
+        cloverLog("retire#%llu latch=%x copy=%x fc=%x current=%llx pending=%llx",
+            (unsigned long long)native_legacy_retirement_calls,latch,copy,fc,
             (unsigned long long)current,(unsigned long long)pending);
 }
 // The display object's properties as they are now (the registration copy below predates setDisplayRefreshProperties and
@@ -373,7 +375,7 @@ struct ClientStat {
     uint32_t regCalls;
     struct {uint32_t type;uint64_t port;uint32_t ref,status;} reg[kRegEvents];
     uint64_t sel6_first[3],sel6_last[3];uint32_t sel6_distinct;uint64_t sel6_seen[8][3];uint32_t sel6_calls[8],sel6_fails[8],sel6_status[8];
-    uint32_t seq_count;struct {uint32_t a,b,c,status,done,presented;} seq[24];
+    uint32_t seq_count;struct {uint32_t a,b,c,status,latch,copy,fc;} seq[24];
     uintptr_t original_external,original_register;
     // Round333: the class size this object was allocated with. Every byte the swap-wait row reads out of the
     // client is gated on it, so a column says "this address is not provably inside the object" instead of
@@ -395,7 +397,7 @@ static ClientStat *statFor(IOUserClient *client) {
  *
  * Why this row exists. Boot 113 and boot 115 both end the same way: `selector 6 ... -> e00002d5` (the family's
  * own busy return) with no further swap, and every row the card has about this client answers a question about
- * the *call* -- arguments, return, done/presented -- but none has ever said what the client's own waiting
+ * the *call* -- arguments, return, latch/copy -- but none has ever said what the client's own waiting
  * machinery holds. The stock family that produces that busy return also owns a 5 s assertion
  * ("swap_wait_gated blocked for more than 5 seconds. Should not happen. Panicking"), so a boot that stalls in
  * this wait either answers the wait or dies saying so, and today the card cannot tell which half it is missing.
@@ -427,12 +429,19 @@ static ClientStat *statFor(IOUserClient *client) {
  *            Round333 read `swap=` from client+0xf8 instead; boot 118's helper pass (round334-forensics)
  *            showed that dword is written at the entry and cleared before the return, so `swap=0` was only
  *            ever "the last call cleaned it", not the argument -- this column names the input directly.
- *   done=    the dword at display+0x16bc (5820): the swapID the family has finished presenting. `absent`
- *            when the display object was never recorded, `off` when its class size does not reach 5820.
- *   cur=     the dword at display+0x1560 (5472): the swapID currently latched inside the family.
- *   list=    the dword at display+0x1568 (5480): the pending-chain head the family would retire next.
- *            done=/cur=/list= are read before the call, same as pw/ps; B2's criterion is arg==done on a
- *            busy return, so all three must be this boot's own reads, not carried over from a prior row.
+ *   latch=   the dword at display+0x16bc (5820): the swapID the family's completion path last stored there.
+ *            `absent` when the display object was never recorded, `off` when its class size does not reach
+ *            5820. Round335 called this done= and read it as "finished presenting"; the one visible writer
+ *            (0x678ae7c) stores [[fb+0x1560]+0x314] under a [cur+0x32c] state test, so it is a latch.
+ *   copy=    the dword at display+0x16c0 (5824), which that same function assigns from +0x16bc at 0x678aea0:
+ *            one quantity in two columns, NOT an independent leg. Round335 called it presented=.
+ *   fc=      the dword at display+0xfc (252), incremented once per completion-path run at 0x678ab70. This is
+ *            the second leg; round329 printed it as frames=, naming a frame count this port does not have.
+ *   cur=     the low dword of the qword at display+0x1560 (5472): a POINTER to the current swap object, so
+ *            `0` says there is no current object, not "swapID 0 is the current one".
+ *   list=    the low dword of the qword at display+0x1568 (5480): the pending-chain head POINTER, same reading.
+ *            latch=/copy=/fc=/cur=/list= are read before the call, same as pw/ps; B2's criterion is arg==latch
+ *            on a busy return, so all five must be this boot's own reads, not carried over from a prior row.
  *   pw= ps=  the two queried words, read before the call ran; `absent` says the display object was never
  *            recorded, `off` says its class size does not reach that offset -- three states, three words.
  *   np0..np5 the qword at client+0x110+k*0xb0: the value, `null` for a zero word (the family's own test is
@@ -455,20 +464,20 @@ static ClientStat *statFor(IOUserClient *client) {
  * exists to keep. Its own bound is the tee class, and the tee says out loud when that cap fills.
  */
 enum {kWakeSlotBase=0x110,kWakeSlotStride=0xb0,kWakeSlots=6,kSwapWaitRowBytes=320,kSwapTracked=8};
-enum {kDoneOffset=5820,kCurOffset=5472,kListOffset=5480};
+enum {kLatchOffset=5820,kCopyOffset=5824,kFcOffset=252,kCurOffset=5472,kListOffset=5480};
 static const unsigned kQueryOffsets[2]={5840,5856};
 struct SwapWaitPre {
     uint64_t ms,option;uint32_t arg;
-    char argTxt[16],dispTxt[3][16],queryTxt[2][16],slotTxt[kWakeSlots][24];
+    char argTxt[16],dispTxt[5][16],queryTxt[2][16],slotTxt[kWakeSlots][24];
 };
-static const unsigned kDisplayOffsets[3]={kDoneOffset,kCurOffset,kListOffset};
+static const unsigned kDisplayOffsets[5]={kLatchOffset,kCopyOffset,kFcOffset,kCurOffset,kListOffset};
 static void readSwapWaitState(ClientStat &stat,const uint64_t *in,SwapWaitPre &pre) {
     memset(&pre,0,sizeof pre);
     pre.ms=probeNowUs()/1000;pre.option=in[1];pre.arg=(uint32_t)in[0];
     snprintf(pre.argTxt,sizeof pre.argTxt,"%u",pre.arg);
     const unsigned char *client=reinterpret_cast<const unsigned char *>(stat.object);
     const unsigned char *display=reinterpret_cast<const unsigned char *>(native_legacy_object);
-    for(unsigned d=0;d<3;++d) {
+    for(unsigned d=0;d<5;++d) {
         if(!display)snprintf(pre.dispTxt[d],sizeof pre.dispTxt[d],"absent");
         else if(native_legacy_object_size<kDisplayOffsets[d]+4)snprintf(pre.dispTxt[d],sizeof pre.dispTxt[d],"off");
         else {uint32_t value=0;memcpy(&value,display+kDisplayOffsets[d],4);snprintf(pre.dispTxt[d],sizeof pre.dispTxt[d],"%x",value);}
@@ -503,16 +512,16 @@ static void reportSwapWait(ClientStat &stat,const SwapWaitPre &pre,IOReturn stat
     }
     char row[kSwapWaitRowBytes];
     int length=snprintf(row,sizeof row,
-        "clover r335: bbswap ms=%llu opt=%llx ret=%08x arg=%s done=%s cur=%s list=%s pw=%s ps=%s "
+        "clover r343: bbswap ms=%llu opt=%llx ret=%08x arg=%s latch=%s copy=%s fc=%s cur=%s list=%s pw=%s ps=%s "
         "np0=%s np1=%s np2=%s np3=%s np4=%s np5=%s sent=%llu s72=%u gap=%s pair=%s pid=%d\n",
         (unsigned long long)pre.ms,(unsigned long long)pre.option,(unsigned)status,
-        pre.argTxt,pre.dispTxt[0],pre.dispTxt[1],pre.dispTxt[2],
+        pre.argTxt,pre.dispTxt[0],pre.dispTxt[1],pre.dispTxt[2],pre.dispTxt[3],pre.dispTxt[4],
         pre.queryTxt[0],pre.queryTxt[1],
         pre.slotTxt[0],pre.slotTxt[1],pre.slotTxt[2],pre.slotTxt[3],pre.slotTxt[4],pre.slotTxt[5],
         (unsigned long long)vsyncEvents[1],(unsigned)stat.selector_calls[72],gapTxt,pairTxt,stat.pid);
     if(length<0 || static_cast<unsigned>(length)>=sizeof row) {
         char cut[96];
-        snprintf(cut,sizeof cut,"clover r335: bbswapcut bytes=%d cap=%u pid=%d arg=%s\n",
+        snprintf(cut,sizeof cut,"clover r343: bbswapcut bytes=%d cap=%u pid=%d arg=%s\n",
             length,(unsigned)sizeof row,stat.pid,pre.argTxt);
         IOLog("%s",cut);
         return;
@@ -538,14 +547,14 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
                 auto &entry=stat->seq[stat->seq_count++];
                 entry.a=(uint32_t)in[0];entry.b=(uint32_t)in[1];entry.c=(uint32_t)in[2];entry.status=(uint32_t)status;
                 const unsigned char *object=reinterpret_cast<const unsigned char *>(native_legacy_object);
-                entry.done=entry.presented=0;
-                if(object){memcpy(&entry.done,object+5820,4);memcpy(&entry.presented,object+5824,4);}
+                entry.latch=entry.copy=entry.fc=0;
+                if(object){memcpy(&entry.latch,object+kLatchOffset,4);memcpy(&entry.copy,object+kCopyOffset,4);memcpy(&entry.fc,object+kFcOffset,4);}
             }
             if(at>=0){++stat->sel6_calls[at];if(status)++stat->sel6_fails[at];stat->sel6_status[at]=(uint32_t)status;}
             if(at>=0 && stat->seq_count && stat->seq_count<=8)
-                cloverLog("client pid=%d selector 6 %llx %llx %llx -> %08x done=%x presented=%x",stat->pid,
+                cloverLog("client pid=%d selector 6 %llx %llx %llx -> %08x latch=%x copy=%x fc=%x",stat->pid,
                     (unsigned long long)in[0],(unsigned long long)in[1],(unsigned long long)in[2],(unsigned)status,
-                    stat->seq[stat->seq_count-1].done,stat->seq[stat->seq_count-1].presented);
+                    stat->seq[stat->seq_count-1].latch,stat->seq[stat->seq_count-1].copy,stat->seq[stat->seq_count-1].fc);
             reportSwapWait(*stat,pre,status);
         }
         ++stat->calls;if(status)++stat->fails;
@@ -612,8 +621,8 @@ unsigned native_legacy_clients_dump(char *out,unsigned cap) {
             at+=snprintf(out+at,cap-at,"  sel6 args %llx %llx %llx: %u calls %u fails last %x\n",(unsigned long long)stat.sel6_seen[k][0],
                 (unsigned long long)stat.sel6_seen[k][1],(unsigned long long)stat.sel6_seen[k][2],stat.sel6_calls[k],stat.sel6_fails[k],stat.sel6_status[k]);
         for(unsigned k=0;k<stat.seq_count && at+90<cap;++k)
-            at+=snprintf(out+at,cap-at,"  s6#%u %x %x %x -> %x [5820]=%x [5824]=%x\n",k,stat.seq[k].a,stat.seq[k].b,stat.seq[k].c,
-                stat.seq[k].status,stat.seq[k].done,stat.seq[k].presented);
+            at+=snprintf(out+at,cap-at,"  s6#%u %x %x %x -> %x [5820]=%x [5824]=%x [252]=%x\n",k,stat.seq[k].a,stat.seq[k].b,stat.seq[k].c,
+                stat.seq[k].status,stat.seq[k].latch,stat.seq[k].copy,stat.seq[k].fc);
         unsigned n=0;
         for(unsigned selector=0;selector<kSelectors && at+40<cap;++selector) {
             if(!stat.selector_calls[selector])continue;
@@ -672,9 +681,10 @@ void native_legacy_client_observed(IOReturn status,IOUserClient *client) {
  *   s6=        the last selector-6 wait: sel6_last (the three 64-bit scalarInput words the call itself
  *              carried, same memcpy as the event row) with selector_status[6], the last return the same
  *              walk recorded. Conditioned on selector_calls[6], the count that fills both.
- *   done= presented= frames=   the display object's words at 5820/5824/252 -- the same three offsets,
- *              read the same way, that retire# prints at event time. Here they are read every fire, so
- *              "presented is still 4" keeps being said after the event row has aged out of the ring.
+ *   latch= copy= fc=   the display object's words at 5820/5824/252 -- the same three offsets, read the same
+ *              way, that retire# prints at event time. copy= is +0x16bc's own copy (stored at 0x678aea0), so
+ *              it is not a second leg; fc= is the completion-path counter at +0xfc. Here they are read every
+ *              fire, so "the latch is still 4" keeps being said after the event row has aged out of the ring.
  *   vs=        <hz>/<started>/<sent> from vsyncHz and vsyncEvents[4]/[1]. A producer that always exists
  *              in this file, so vs=0/0/0 is a reading: on this boot the refresh tick was never started.
  *   log= logdrop=   cloverLogLines against kCloverLogBudget, and the lines that budget refused. Without
@@ -687,7 +697,7 @@ void native_legacy_client_observed(IOReturn status,IOUserClient *client) {
  * that shows no row at all never got the client, and the tee's own cap message says which.
  *
  * The row is never emitted half-written: 320 bytes is the card's record width and a longer line is
- * truncated rather than split, so a too-wide row prints `clover r329: dispstatecut` with the width it
+ * truncated rather than split, so a too-wide row prints `clover r343: dispstatecut` with the width it
  * needed instead. That row is the arithmetic's mandatory outlet -- the long row cannot say it was cut.
  */
 static uint32_t dispstateFires,dispstatePreviousCalls;
@@ -699,8 +709,8 @@ static void reportDisplayState(void) {
     for(unsigned c=0;c<seenClientCount;++c)if(seenClients[c].pid==58){stat=&seenClients[c];break;}
     const char *clientTxt=stat?"pid58":(seenClientCount?"other":"none");
     const char *callsTxt="-",*failsTxt="-",*regsTxt="-",*regallTxt="-",*grewTxt="-",*hotTxt="-",*s6Txt="-";
-    const char *doneTxt="-",*presentedTxt="-",*framesTxt="-";
-    char calls[16],fails[16],regs[16],regall[16],grew[16],hot[40],s6[96],done[16],presented[16],frames[16];
+    const char *latchTxt="-",*copyTxt="-",*fcTxt="-";
+    char calls[16],fails[16],regs[16],regall[16],grew[16],hot[40],s6[96],latch[16],copy[16],fc[16];
     if(stat) {
         snprintf(calls,sizeof calls,"%u",stat->calls);callsTxt=calls;
         snprintf(fails,sizeof fails,"%u",stat->fails);failsTxt=fails;
@@ -723,24 +733,24 @@ static void reportDisplayState(void) {
     }
     const unsigned char *object=reinterpret_cast<const unsigned char *>(native_legacy_object);
     if(object) {
-        uint32_t completed=0,shown=0,frameCount=0;
-        memcpy(&completed,object+5820,4);memcpy(&shown,object+5824,4);memcpy(&frameCount,object+252,4);
-        snprintf(done,sizeof done,"%x",completed);doneTxt=done;
-        snprintf(presented,sizeof presented,"%x",shown);presentedTxt=presented;
-        snprintf(frames,sizeof frames,"%x",frameCount);framesTxt=frames;
+        uint32_t latchValue=0,copyValue=0,fcValue=0;
+        memcpy(&latchValue,object+kLatchOffset,4);memcpy(&copyValue,object+kCopyOffset,4);memcpy(&fcValue,object+kFcOffset,4);
+        snprintf(latch,sizeof latch,"%x",latchValue);latchTxt=latch;
+        snprintf(copy,sizeof copy,"%x",copyValue);copyTxt=copy;
+        snprintf(fc,sizeof fc,"%x",fcValue);fcTxt=fc;
     }
     char row[kDispStateRowBytes];
     const uint64_t now=probeNowUs();
     int length=snprintf(row,sizeof row,
-        "clover r329: dispstate ms=%llu fires=%u seen=%u client=%s calls=%s fails=%s regall=%s regs=%s grew=%s "
-        "hot=%s s6=%s done=%s presented=%s frames=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\n",
+        "clover r343: dispstate ms=%llu fires=%u seen=%u client=%s calls=%s fails=%s regall=%s regs=%s grew=%s "
+        "hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\n",
         (unsigned long long)(now/1000),dispstateFires,seenClientCount,clientTxt,
-        callsTxt,failsTxt,regallTxt,regsTxt,grewTxt,hotTxt,s6Txt,doneTxt,presentedTxt,framesTxt,
+        callsTxt,failsTxt,regallTxt,regsTxt,grewTxt,hotTxt,s6Txt,latchTxt,copyTxt,fcTxt,
         vsyncHz,(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[1],
         (unsigned)cloverLogLines,(unsigned)kCloverLogBudget,(unsigned)cloverLogDropped);
     if(length<0 || static_cast<unsigned>(length)>=sizeof row) {
         char cut[96];
-        snprintf(cut,sizeof cut,"clover r329: dispstatecut bytes=%d cap=%u fires=%u client=%s\n",
+        snprintf(cut,sizeof cut,"clover r343: dispstatecut bytes=%d cap=%u fires=%u client=%s\n",
             length,(unsigned)sizeof row,dispstateFires,clientTxt);
         IOLog("%s",cut);
         return;
@@ -820,7 +830,7 @@ __attribute__((noreturn,noinline)) void native_legacy_backend_guard(unsigned slo
 // The whole state of this instrument on one line, for the log ring and for any later reader.
 unsigned native_legacy_clover_report(char *out,unsigned cap) {
     if(!out || !cap)return 0;
-    unsigned at=snprintf(out,cap,"stage=%u meta=%d init=%x size=%u parent=%u obj=%llx nub=%llx video %ux%u row=%u depth=%u display=%llu rot=%u scale=%u base=%llx bytes=%llx gop %ux%u map=%llx va=%llx pa=%llx len=%llu reg=%u dt=%u surface=%d found=%u start=%x probe=%u pm=%u/%x swap=%u %u/%u accept=%u reject=%u scanout=%u/%08x/%llu retire=%llu done=%x shown=%x frames=%u copy=%llu last=%llums",
+    unsigned at=snprintf(out,cap,"stage=%u meta=%d init=%x size=%u parent=%u obj=%llx nub=%llx video %ux%u row=%u depth=%u display=%llu rot=%u scale=%u base=%llx bytes=%llx gop %ux%u map=%llx va=%llx pa=%llx len=%llu reg=%u dt=%u surface=%d found=%u start=%x probe=%u pm=%u/%x swap=%u %u/%u accept=%u reject=%u scanout=%u/%08x/%llu retire=%llu latch=%x copy=%x frames=%u copies=%llu last=%llums",
         native_legacy_stage,native_legacy_meta_status,native_legacy_init_result,native_legacy_object_size,native_legacy_parent_match,
         (unsigned long long)native_legacy_object,(unsigned long long)native_legacy_nub,
         native_legacy_video_width,native_legacy_video_height,native_legacy_video_row_bytes,native_legacy_video_depth,
@@ -833,8 +843,8 @@ unsigned native_legacy_clover_report(char *out,unsigned cap) {
         native_legacy_swap_validation_calls,native_legacy_swap_validation_result,native_legacy_swap_validation_reason,
         native_legacy_swap_accepted_count,native_legacy_swap_rejected_count,native_legacy_transfer_calls,
         (unsigned)native_legacy_transfer_status,(unsigned long long)native_legacy_transfer_bytes,
-        (unsigned long long)native_legacy_retirement_calls,(unsigned)native_legacy_retired_generation,
-        (unsigned)native_legacy_presented_generation,native_legacy_frame_count,(unsigned long long)native_legacy_copy_n,
+        (unsigned long long)native_legacy_retirement_calls,(unsigned)native_legacy_latch,
+        (unsigned)native_legacy_latch_copy,native_legacy_frame_count,(unsigned long long)native_legacy_copy_n,
         (unsigned long long)(counterFrequency()?native_legacy_copy_last*1000/counterFrequency():0));
     return at;
 }

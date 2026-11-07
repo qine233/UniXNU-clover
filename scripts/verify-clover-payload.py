@@ -1278,20 +1278,20 @@ def check_sb_sample(kernel: bytes) -> bool:
              # quietly swallowing the row's tail, and a binary that carries one and not the other cannot
              # say which half of that promise it broke. r327's and r328's rows stay: this round adds a
              # neighbour, it does not replace either.
-             "r329-dispstate": (b"clover r329: dispstate ms=%llu fires=%u seen=%u client=%s calls=%s fails=%s "
-                                b"regall=%s regs=%s grew=%s hot=%s s6=%s done=%s presented=%s frames=%s "
+             "r343-dispstate": (b"clover r343: dispstate ms=%llu fires=%u seen=%u client=%s calls=%s fails=%s "
+                                b"regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s "
                                 b"vs=%u/%llu/%llu log=%u/%u logdrop=%u\n") in kernel,
-             "r329-dispstatecut": (b"clover r329: dispstatecut bytes=%d cap=%u fires=%u client=%s\n") in kernel,
+             "r343-dispstatecut": (b"clover r343: dispstatecut bytes=%d cap=%u fires=%u client=%s\n") in kernel,
 
              # Round333 reads the swap-wait state on either side of the call that changes it, from the probe's
              # own wrapper, and the source's two adjacent fragments reach the card as one CString -- so this is
              # pinned as the concatenated row, the same way r329's is (round17's rule: pin the outlet the row
              # has to pass through, not a source line). The cut branch is pinned beside it because it is the
              # only thing that says the 320-byte record did not quietly eat the row's tail.
-             "r335-bbswap": (b"clover r335: bbswap ms=%llu opt=%llx ret=%08x arg=%s done=%s cur=%s list=%s "
-                             b"pw=%s ps=%s np0=%s np1=%s np2=%s np3=%s np4=%s np5=%s sent=%llu s72=%u "
-                             b"gap=%s pair=%s pid=%d\n") in kernel,
-             "r335-bbswapcut": (b"clover r335: bbswapcut bytes=%d cap=%u pid=%d arg=%s\n") in kernel,
+             "r343-bbswap": (b"clover r343: bbswap ms=%llu opt=%llx ret=%08x arg=%s latch=%s copy=%s fc=%s "
+                             b"cur=%s list=%s pw=%s ps=%s np0=%s np1=%s np2=%s np3=%s np4=%s np5=%s "
+                             b"sent=%llu s72=%u gap=%s pair=%s pid=%d\n") in kernel,
+             "r343-bbswapcut": (b"clover r343: bbswapcut bytes=%d cap=%u pid=%d arg=%s\n") in kernel,
              # The two sentences the stock family owns and this round is measuring against. They are pinned as
              # CStrings, not as behaviour: what round333 establishes is that our image carries them at the
              # same counts the stock image does, so a boot that dies inside the 5 s assertion says so out loud

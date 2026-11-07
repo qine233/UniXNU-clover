@@ -33,9 +33,10 @@ SDHCI_MODEL = REPO / "drivers/CloverSdhci/tests/clover_sdhci_host.cpp"
 SDHCI_TEST = REPO / "scripts/test-clover-sdhci.py"
 SDHCI_GEOMETRY = REPO / "scripts/test-clover-sdhci-geometry.py"
 PANIC = REPO / "scripts/xnu-panic-screen.c"
+PROBE = REPO / "package/CloverLegacyDisplayProbe.cpp"
 HARNESS = REPO / "drivers/CloverPower/tests/clover_power_host.cpp"
 GATE = REPO / "scripts/check-clover.py"
-LOG = Path.home() / "clover-out/round342-pinned-slots/negatives.log"
+LOG = Path.home() / "clover-out/round343-column-names/negatives.log"
 
 SILENT_AFTER = '''      timeline_close "neither-$(usb_landing_class)" "" ""
       return 2
@@ -375,6 +376,99 @@ CASES = [
      [(SDHCI_LAYER, 'static const char kPinHeadMark[] = "clover r339: mark";',
        'static const char kPinHeadMark[] = "clover r339: markx";')],
      "the reader pins heads the layer does not"),
+    # Round343 (#735). The reader's ring-rule leg above is an existence-and-shape test: it proves the
+    # sentence exists and names both branches. It cannot prove the sentence is *printed*, and boot 122
+    # is the card that showed the difference -- the criterion asked which declaration the read used and
+    # silence satisfied it. These three break the printing, the fallback's source name and the fallback's
+    # refusal to claim a count. Each expects the reader's own assertion sentence, which runs before the
+    # shape pins, so a red from the pins instead would mean the behavioral leg did not judge.
+    ("N69 the ring-rule sentence goes back to printing only on the branch it worries about",
+     [(READER, "        print (ring_rule_sentence (pinned, why), file=sys.stderr)",
+       "        if why:\n            print (ring_rule_sentence (pinned, why), file=sys.stderr)")],
+     "the driver ring has to say which rule read it, on every read"),
+    ("N70 the fallback names the card as its source, so an assumption reads as a declaration",
+     [(READER, 'source = "this reader\'s fallback: the card declares nothing readable"',
+       'source = "the card\'s own r174 arming row"')],
+     "the reader would report its own assumption as the card's declaration"),
+    ("N71 the fallback prints a pinned count this card never declared",
+     [(READER, 'used = "round341 congruence (slot == seq % slots)"',
+       'used = f"round341 congruence pinned={pinned} (slot == seq % slots)"')],
+     "the fallback sentence claims a pinned count"),
+    # Round343 (#732). Detection and the write were two decisions: the selectors answered with the first
+    # usable row while every flash carried no -s and went wherever the environment named. The probe runs
+    # the four functions against a synthesized bus, so these expect the fixture's own name -- an exit 1
+    # from a shape pin instead would mean the probe never noticed the wrong board being answered for.
+    ("N72 the fastboot selector goes back to first-match and ignores the declared serial",
+     [(SCRIPT, '    awk -v want="$SERIAL" \'$2 == "fastboot" && (want == "" || $1 == want) {print $1; exit}\'',
+       '    awk \'$2 == "fastboot" {print $1; exit}\'')],
+     "board-selection probe [two boards, --serial names the one in recovery]"),
+    ("N73 an ambiguous bus is no longer refused",
+     [(SCRIPT, '    if [ "$count" -gt 1 ]; then', '    if [ "$count" -gt 99 ]; then')],
+     "board-selection probe [two boards, nothing declared]"),
+    # A variable merely assigned in this shell is still visible to this shell, which is how the first
+    # draft of this fixture passed a mutation that broke the export. The probe reads EXPORT through an
+    # exec'd child because adb and fastboot are exec'd children.
+    ("N74 the resolved serial is assigned but not exported, so the tools never see it",
+     [(SCRIPT, '    export ANDROID_SERIAL="$SERIAL"', '    ANDROID_SERIAL="$SERIAL"')],
+     "board-selection probe [one board in fastboot, nothing declared]"),
+    ("N75 a watch resolves the board only at startup, not on its own polls",
+     [(SCRIPT, "    require_serial\n    a=$(adb_serial); f=$(fastboot_serial)",
+       "    a=$(adb_serial); f=$(fastboot_serial)")],
+     "watch_landing() does not resolve the board on its polls"),
+    ("N76 the refusal is moved into a command substitution, where its exit code dies with the subshell",
+     [(SCRIPT, "    found=$(fastboot_serial); a=$(adb_serial)",
+       "    found=$(require_serial; fastboot_serial); a=$(adb_serial)")],
+     "resolves the board inside a command substitution"),
+    ("N77 the verdict leg discards the decoder's stderr, so the ring-rule sentence is never archived",
+     [(SCRIPT, 'python3 "$decoder" --verdict "$OUT" 2>&1',
+       'python3 "$decoder" --verdict "$OUT" 2>/dev/null')],
+     "does not keep the decoder's stderr on the verdict leg"),
+    ("N78 the top-level resolution is dropped, so the first write runs before any declaration",
+     [(SCRIPT, 'require_serial\nsay "board:', 'say "board:')],
+     "never resolves the board at top level"),
+    # Round343 (#736). The swap row's column names are walked down to the offset that fills them, so
+    # each link of that chain gets its own break: the declaration, the operand count, the operand a
+    # column reads, the table's names, the table's numbers, the table's reach, the state row's three
+    # memcpy/snprintf/order pins, and the three banned old names.
+    ("N79 the swap row's offset enum is renamed, so no column can be tied to its storage",
+     [(PROBE, "enum {kLatchOffset=5820,kCopyOffset=5824,kFcOffset=252,kCurOffset=5472,kListOffset=5480};",
+       "enum {kzzLatchOffset=5820,kCopyOffset=5824,kFcOffset=252,kCurOffset=5472,kListOffset=5480};")],
+     "offset chain is not declared"),
+    ("N80 the swap row drops one operand, so the columns and the values under them are two lists",
+     [(PROBE, "pre.queryTxt[0],pre.queryTxt[1],", "pre.queryTxt[0],")],
+     "every conversion in this row takes one operand"),
+    ("N81 the swap row's latch= and copy= operands are transposed, so latch= reads the copy buffer",
+     [(PROBE, "pre.argTxt,pre.dispTxt[0],pre.dispTxt[1],pre.dispTxt[2],pre.dispTxt[3],pre.dispTxt[4],",
+       "pre.argTxt,pre.dispTxt[1],pre.dispTxt[0],pre.dispTxt[2],pre.dispTxt[3],pre.dispTxt[4],")],
+     "prints latch= from pre.dispTxt[1]"),
+    ("N82 the offset table names an offset no column reads, so the table's order is not the row's",
+     [(PROBE, "kDisplayOffsets[5]={kLatchOffset,kCopyOffset,kFcOffset,kCurOffset,kListOffset};",
+       "kDisplayOffsets[5]={kLatchOffset,kCopyOffset,kZzOffset,kCurOffset,kListOffset};")],
+     "names no column of the r343 swap row"),
+    ("N83 kLatchOffset is off by one, so the column would name a word the writer never stored there",
+     [(PROBE, "enum {kLatchOffset=5820,kCopyOffset=5824", "enum {kLatchOffset=5821,kCopyOffset=5824")],
+     "the stock kernel's latch writer stores"),
+    ("N84 the list= operand is repointed, so the table's fifth entry fills no operand of the row",
+     [(PROBE, "pre.dispTxt[3],pre.dispTxt[4],", "pre.dispTxt[3],pre.queryTxt[0],")],
+     "fills no operand of the r343 swap row"),
+    ("N85 the state row's latch memcpy reads the copy offset, so latch= is named for an offset it drops",
+     [(PROBE, "memcpy(&latchValue,object+kLatchOffset,4);", "memcpy(&latchValue,object+kCopyOffset,4);")],
+     "does not fill latch= through"),
+    ("N86 the state row prints copy= before fc= is swapped, so the two display rows disagree on order",
+     [(PROBE, '"hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u', '"hot=%s s6=%s latch=%s fc=%s copy=%s vs=%u')],
+     "does not print latch= copy= fc= in that order"),
+    ("N87 the state row's operands are latchTxt,fcTxt,copyTxt, so the names and buffers are two lists",
+     [(PROBE, "s6Txt,latchTxt,copyTxt,fcTxt,", "s6Txt,latchTxt,fcTxt,copyTxt,")],
+     "operands are not latchTxt,copyTxt,fcTxt"),
+    ("N88 the swap row brings back done=%s, a word whose producer is a different offset",
+     [(PROBE, "arg=%s latch=%s copy=%s fc=%s cur=%s", "arg=%s done=%s copy=%s fc=%s cur=%s")],
+     "prints 'done=%s'"),
+    ("N89 the swap row brings back presented=%s, the latch copied -- a second name for a column beside it",
+     [(PROBE, "latch=%s copy=%s fc=%s cur=%s", "latch=%s presented=%s fc=%s cur=%s")],
+     "prints 'presented=%s'"),
+    ("N90 the swap row brings back frames=%s, which named the count the port never presented",
+     [(PROBE, "fc=%s cur=%s list=%s pw=%s", "fc=%s frames=%s list=%s pw=%s")],
+     "prints 'frames=%s'"),
 ]
 
 

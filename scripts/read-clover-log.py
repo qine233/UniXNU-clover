@@ -86,6 +86,7 @@ import io
 import re
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
 PREFIX = b"unixnu clover emmc log\n"
@@ -251,6 +252,26 @@ def card_pinned (data, first_lba):
                       f"{head_slot} this file's table pins that head to: the rows keep their names, but "
                       "this card was laid out by a writer whose table differs from this one")
     return value, None
+
+
+def ring_rule_sentence (pinned, why):
+    """The rule this read applied and where it came from, said on every read of the driver ring.
+
+    Round342's reader printed [ring rule] only when card_pinned returned a complaint, so boot 122 --
+    the card that agreed -- produced no line at all, and the criterion written for that boot asked the
+    reader to name the declaration it used. Silence satisfied it. An instrument that answers only the
+    branch it is worried about cannot answer its own silence, so both branches print and each names
+    the rule it applied: a card read by the fallback is then never mistaken for a card read by its own
+    declaration, which is the difference between "the writer pinned four slots" and "this reader
+    assumed congruence because it could find nothing to read".
+    """
+    if pinned is None:
+        used = "round341 congruence (slot == seq % slots)"
+        source = "this reader's fallback: the card declares nothing readable"
+    else:
+        used = f"round342 pinned={pinned} (rolling floor {pinned})"
+        source = "the card's own r174 arming row"
+    return f"[ring rule] used={used} source={source} check={'agrees' if not why else why}"
 
 
 def decode(data, first_lba, slots=REPORT_SLOTS, base_sector=0, expect_kind=None, pinned=None):
@@ -1002,6 +1023,60 @@ def card_pinned_selftest():
 
     value, why = check([(3, 21, armed, 3), (7, 21, armed.replace("pinned=4", "pinned=6"), 71)])
     assert value is None and "different declarations" in why, (value, why)
+
+    # The sentence is judged at the outlet it has to pass through -- main()'s own print -- and not by
+    # calling ring_rule_sentence here. A call site put back behind a complaint-only condition leaves
+    # that function perfectly correct and the agreeing card perfectly silent, which is the defect this
+    # leg exists for: boot 122's criterion asked the reader to name the declaration it used, and the
+    # reader named nothing because nothing was wrong. The homes are laid out from this file's own head
+    # table so a renamed head cannot leave the fixture pointing at a slot nobody pins.
+    r174_head = next(h for h in PINNED_HEADS if h.startswith("CloverSdhci r174"))
+
+    def laid_out(arming, extra):
+        return [(slot, 21, arming if head.startswith(r174_head) else head, slot)
+                for slot, head in enumerate(PINNED_HEADS)] + extra
+
+    def read_ring(rows):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "window.bin"
+            path.write_bytes(window(rows))
+            argv, out, err = sys.argv, io.StringIO(), io.StringIO()
+            sys.argv = ["read-clover-log.py", str(path), "--verdict"]
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = main()
+            finally:
+                sys.argv = argv
+        return code, out.getvalue(), err.getvalue()
+
+    def rule_line(err):
+        lines = [line for line in err.splitlines() if line.startswith("[ring rule]")]
+        assert len(lines) == 1, (err, "the driver ring has to say which rule read it, on every read: "
+                                 "zero lines is the silence that satisfied boot 122's criterion and "
+                                 "two is a sentence printed by two different callers")
+        return lines[0]
+
+    code, out, err = read_ring(laid_out(armed, [(4, 21, rolling, 4)]))
+    assert code == 0 and out, (code, out, err)
+    agrees = rule_line(err)
+    assert f"pinned={PINNED_SLOTS}" in agrees and "r174" in agrees and "check=agrees" in agrees, (
+        agrees, "a card that declares its own layout was read and the sentence does not name that "
+                "declaration: the reading would then be indistinguishable from an assumed one")
+
+    code, out, err = read_ring(laid_out(probe_tail, [(4, 21, rolling, 4)]))
+    assert code == 0 and out, (code, out, err)
+    fallback = rule_line(err)
+    assert "round341 congruence" in fallback and "fallback" in fallback, (
+        fallback, "a card that declares nothing was read by the fallback and the sentence does not "
+                  "say so: the reader would report its own assumption as the card's declaration")
+    assert "no r174 arming row" in fallback, (
+        fallback, "the fallback sentence drops the reason it fell back, so a card whose arming row "
+                  "was erased reads the same as a card that never had one")
+    assert "pinned=" not in fallback, (
+        fallback, "the fallback sentence claims a pinned count: this card declared no layout, and a "
+                  "number printed here is the reader's own arithmetic wearing the card's name")
+    assert agrees != fallback, (agrees, "two different rules printed the same sentence: the reader "
+                                "cannot then tell a card that declared its layout from one it assumed")
     return True
 
 
@@ -1077,19 +1152,38 @@ def selftest():
     probe_path = Path(__file__).resolve().parents[1] / "package/CloverLegacyDisplayProbe.cpp"
     assert probe_path.is_file(), f"{probe_path}: the row this reader is tested against lives there"
     probe_src = probe_path.read_text()
-    row_cap = int(re.search(r"kDispStateRowBytes\s*=\s*(\d+)", probe_src).group(1))
-    dispstate_row = fill_conversions(joined_literal(probe_src, '"clover r329: dispstate ms='))
-    dispstatecut_row = fill_conversions(joined_literal(probe_src, '"clover r329: dispstatecut bytes='))
-    for name, line in (("dispstate", dispstate_row), ("dispstatecut", dispstatecut_row)):
-        assert "%" not in line, (name, line)
-        assert line.endswith("\n"), (name, line)
-        assert len(line[:-1].encode()) < row_cap, (name, len(line), row_cap)
-        kernel_lines.append(line[:-1])
-    # The probe truncates its row at kDispStateRowBytes, so the row that reaches msgbuf is never wider
-    # than that number. A record is one block -- prefix, body, newline -- so the two caps compared is the
-    # whole of the claim that the card never splits this row: the probe's own ceiling already sits inside
-    # the block, whatever the counters happen to print.
-    assert row_cap <= SECTOR - len(PREFIX) - 1, (row_cap, SECTOR - len(PREFIX) - 1)
+    # Round343: the swap-wait row joins the state row here, and each family's ceiling is read from its
+    # own enum declaration rather than from one number shared by both. The two rows renamed three
+    # columns to the offsets that produce them (0x16bc latch, 0x16c0 copy, 0xfc fc) and the swap row
+    # gained fc=, so a reader tested against a remembered six-column row would keep passing while the
+    # board printed something else. Building from the literal makes the rename change this test's line;
+    # naming the three columns makes the rename a claim this test can fail.
+    for cap_name, head, cut_head, columns in (
+            ("kDispStateRowBytes", '"clover r343: dispstate ms=', '"clover r343: dispstatecut bytes=',
+             ("latch=", "copy=", "fc=")),
+            ("kSwapWaitRowBytes", '"clover r343: bbswap ms=', '"clover r343: bbswapcut bytes=',
+             ("latch=", "copy=", "fc="))):
+        declaration = re.search(r"^enum \{[^\n]*\b" + cap_name + r"\s*=\s*(\d+)", probe_src, re.M)
+        assert declaration, f"{cap_name} is not declared on an enum line of {probe_path.name}"
+        row_cap = int(declaration.group(1))
+        row = fill_conversions(joined_literal(probe_src, head))
+        cut_row = fill_conversions(joined_literal(probe_src, cut_head))
+        for name, line in ((head, row), (cut_head, cut_row)):
+            assert "%" not in line, (name, line)
+            assert line.endswith("\n"), (name, line)
+            assert len(line[:-1].encode()) < row_cap, (name, len(line), row_cap)
+            kernel_lines.append(line[:-1])
+        for column in columns:
+            assert column in row, (
+                f"{head} does not print {column}: the column is named for the offset that fills it, "
+                "so a reader that never asks for it cannot tell the rename from a drop")
+        # The probe truncates its row at its own ceiling, so the row that reaches msgbuf is never wider
+        # than that number. A record is one block -- prefix, body, newline -- so the two caps compared is
+        # the whole of the claim that the card never splits this row: the probe's own ceiling already sits
+        # inside the block, whatever the counters happen to print. The sample-built width above is not the
+        # worst case -- the %s operands are buffers of 16 and 24 bytes -- and the worst case is why the cut
+        # row exists; its width on the card is a boot reading, not a number this test may assume.
+        assert row_cap <= SECTOR - len(PREFIX) - 1, (cap_name, row_cap, SECTOR - len(PREFIX) - 1)
     for index, line in enumerate(kernel_lines):
         slot = index
         lba = first_lba + KERNEL_OFFSET + 2 * slot
@@ -1535,8 +1629,11 @@ def selftest():
     card_pinned_selftest()
     print("read-clover-log selftest: report window, both rings, flight region, wrap order, "
           "ring kinds, bad records, the r302 verdict signatures, the r305 clock pair, the r310 "
-          "sink-door words, the older-payload clock guard, and the ring rule read from the "
-          "declaring row wherever that row lies -- all ok")
+          "sink-door words, the older-payload clock guard, the ring rule read from the "
+          "declaring row wherever that row lies, the r343 sentence that says which rule read "
+          "this ring on both the declaring and the declaring-nothing card, and both display row "
+          "families built from the probe's own literals with each family's own ceiling and the "
+          "three offset-named columns asked for by name -- all ok")
     return 0
 
 
@@ -2001,8 +2098,7 @@ def main():
     pinned = None
     if base == VERDICT_OFFSET and slots == VERDICT_SLOTS:
         pinned, why = card_pinned (data, args.first_lba)
-        if why:
-            print (f"[ring rule] {why}", file=sys.stderr)
+        print (ring_rule_sentence (pinned, why), file=sys.stderr)
     records = decode(data, args.first_lba, slots=slots, base_sector=base, expect_kind=kind,
                      pinned=pinned)
     if args.probe:

@@ -142,7 +142,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(vsyncTimer);
         OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
     }
-    // Round329's state beat. The instrument row this drives (clover r329: dispstate) is the display client's
+    // Round329's state beat. The instrument row this drives (clover r343: dispstate) is the display client's
     // state published on a schedule rather than beside an event, and the schedule is the whole point: every other
     // row about this client prints on a first sighting, so after the frame flow stops the channel goes quiet and
     // quiet reads two ways. It is deliberately not gated on a boot argument -- an instrument whose cadence depends
