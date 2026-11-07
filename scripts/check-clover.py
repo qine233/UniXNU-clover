@@ -8351,6 +8351,94 @@ done
             if check.returncode:
                 errors.append("read-clover-log.py --selftest failed: the decoder and the driver's "
                               "record layout no longer agree\n" + (check.stdout + check.stderr)[-700:])
+    # Round340 (#653). The same geometry is typed in three files -- CloverSdhci.cpp writes the rings,
+    # read-clover-log.py re-declares the numbers to read them, run-clover-unattended.sh dd's a third
+    # copy of the size -- and every needle above this one checks that a *string* is present in one
+    # file. A gate here could stay green while the driver's table and the reader's copy disagreed by
+    # two sectors, and the card would answer that with silence: no records, no error, no name. So the
+    # gate runs the comparison and reads its report, and it does not type the numbers itself -- it
+    # requires that the three files' numbers agree with each other in the line the script prints.
+    geometry = next((base / "scripts/test-clover-sdhci-geometry.py"
+                     for base in (REPO, pathlib.Path.cwd())
+                     if (base / "scripts/test-clover-sdhci-geometry.py").is_file()), None)
+    if geometry is None:
+        errors.append("scripts/test-clover-sdhci-geometry.py is missing: the driver's card layout, "
+                      "the reader's re-typed copy of it and the host's dd size would again be three "
+                      "tables nobody compares, and a record written where the reader does not look "
+                      "would read as a boot that said nothing")
+    else:
+        check = subprocess.run([sys.executable, str(geometry)], capture_output=True, text=True)
+        if check.returncode:
+            # The script names every disagreement it found on its own PROBLEM lines, so the gate
+            # forwards those by name rather than the tail of a blob: a mutation of the ring table
+            # produces five problems and one of them is the sentence that says which file moved,
+            # and a tail cut at N characters keeps whichever of them happened to be printed last.
+            named = [line[len("PROBLEM "):].strip() for line in check.stderr.splitlines()
+                     if line.startswith("PROBLEM ")]
+            summary = next((line.strip() for line in check.stderr.splitlines()
+                            if line.startswith("sdhci geometry:")), "sdhci geometry: no summary line")
+            detail = "\n      " + summary
+            if named:
+                detail += "\n      named: " + " | ".join(
+                    line if len(line) < 150 else line[:147] + "..." for line in named[:6])
+            else:
+                detail += "\n      (no PROBLEM line: the script died before naming anything)\n"                           + (check.stdout + check.stderr)[-500:]
+            errors.append("the sdhci geometry agreement failed: the writer's card layout, the "
+                          "reader's copy, the host's window or the record shape are not one "
+                          "geometry any more" + detail)
+        else:
+            out = check.stdout
+            pair = re.search(r"pairwise agreement: (\d+) of (\d+) names both files declare", out)
+            if pair is None:
+                errors.append("the geometry script reported no pairwise denominator: an agreement "
+                              "over an unknown number of names is the same silence as no check")
+            elif int(pair.group(1)) != int(pair.group(2)):
+                errors.append(f"the geometry script agreed on only {pair.group(1)} of "
+                              f"{pair.group(2)} shared names and still exited 0")
+            elif int(pair.group(2)) < 20:
+                errors.append(f"the pairwise leg compares {pair.group(2)} names, below the 20 this "
+                              "board's tables hold: two files that both stopped declaring a number "
+                              "would agree about nothing and report a smaller denominator")
+            for needle, why in (
+                    ("region tiling: driver exact",
+                     "the driver's own regions no longer tile the window the driver writes into"),
+                    ("reader exact",
+                     "the reader's own regions no longer tile the window the reader demands"),
+                    ("roundtrip: 4 records",
+                     "the leg that exercises the reader's decode() instead of its numbers did not "
+                     "run: a stubbed roundtrip exits 0 and says nothing about the card"),
+                    ("decode as 0 and one sector later as 0",
+                     "the roundtrip's two controls went missing, so the leg would pass on any "
+                     "geometry that finds the records, including one that finds them everywhere"),
+                    ("rings asked with {0: (21, 25), 1: (22,)}",
+                     "the reader's main path no longer asks the driver ring for verdicts *and* "
+                     "relayed probes, or the kernel ring for anything but kind 22 -- and the "
+                     "roundtrip picks both kinds itself, so only this line says what the board's "
+                     "own reader will accept")):
+                if needle not in out:
+                    errors.append(f"the geometry script printed no {needle!r}: {why}")
+            window = re.search(r"driver needs (\S+) sectors, reader demands (\S+), "
+                               r"host reads \[([^\]]*)\] and asserts bytes \[([^\]]*)\]", out)
+            if window is None:
+                errors.append("the geometry script printed no dd window line: the third copy of "
+                              "the size would be unchecked rather than checked and disagreed")
+            else:
+                want = window.group(1)
+                if want == "None" or window.group(2) != want:
+                    errors.append(f"the writer needs {want} sectors and the reader demands "
+                                  f"{window.group(2)}: the two tables disagree about the end of the "
+                                  "card, and a short window is a missing reading that names nothing")
+                read = [value for value in window.group(3).split(", ") if value]
+                if read != [want]:
+                    errors.append(f"the host reads {read} sectors while the geometry needs "
+                                  f"{want}: the run would stop short of a ring, or read sectors "
+                                  "no writer claims, and the byte assert would call that an error "
+                                  "in the card")
+                if want.isdigit() and f"{int(want) * 512}" not in window.group(4):
+                    errors.append(f"the host asserts byte counts [{window.group(4)}] for a window "
+                                  "of the size it does not read: a short dd would be reported as a "
+                                  "bad partition rather than as a short read")
+
     unattended = next((base / "scripts/run-clover-unattended.sh"
                        for base in (REPO, pathlib.Path.cwd())
                        if (base / "scripts/run-clover-unattended.sh").is_file()), None)

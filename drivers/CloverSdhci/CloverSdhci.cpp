@@ -474,7 +474,7 @@ static const uint32_t kRingDriver = 0;   // what CloverSdhci measured (round174'
 static const uint32_t kRingKernel = 1;   // what the kernel said (round175's tee, round176's ring)
 static const uint32_t kRingCount = 2;
 static const uint32_t kVerdictTextBytes = 320;
-static const uint32_t kRingRamSlots = 128;   // staging depth; deeper than either card ring
+static const uint32_t kRingRamSlots = 128;   // staging depth: deeper than the driver's card ring, shallower than the kernel's
 static const uint32_t kRingCardSlots[kRingCount] = {64, 512};
 static const uint32_t kRingOffset[kRingCount] = {64, 192};   // sectors past logfs start
 // Round212: the boot id's home, one record past the kernel ring (sector 1216). It is not part of

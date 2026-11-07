@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Negative tests for the #716, #718, #719, #720 and #720b needles in scripts/check-clover.py.
+"""Negative tests for the #716, #718, #719, #720, #720b and #653 needles in scripts/check-clover.py.
 
 Each case breaks one shape the gate now pins, runs the gate, and restores in a finally block: a
 negative test that leaves its edit behind is worse than no negative test, because the next gate run
@@ -28,10 +28,11 @@ IMEM_ARCHIVE = REPO / "notes/sources/sdm660/imem-children.dts"
 POWEROFF_ARCHIVE = REPO / "notes/sources/sdm660/msm-poweroff.c"
 BOOT_STATS_ARCHIVE = REPO / "notes/sources/sdm660/boot_stats.c"
 SDHCI = REPO / "drivers/CloverSdhci/CloverSdhci.cpp"
+SDHCI_GEOMETRY = REPO / "scripts/test-clover-sdhci-geometry.py"
 PANIC = REPO / "scripts/xnu-panic-screen.c"
 HARNESS = REPO / "drivers/CloverPower/tests/clover_power_host.cpp"
 GATE = REPO / "scripts/check-clover.py"
-LOG = Path.home() / "clover-out/round339b-timeline/negatives.log"
+LOG = Path.home() / "clover-out/round340-geometry/negatives.log"
 
 SILENT_AFTER = '''      timeline_close "neither-$(usb_landing_class)" "" ""
       return 2
@@ -199,6 +200,35 @@ CASES = [
     ("N35 the helper that quotes the close is gone",
      [(SCRIPT, "timeline_last_close() {", "timeline_last_close_unused() {")],
      "no timeline_last_close() block the gate can run"),
+
+    # #653's geometry agreement. Each of these is one leg of the comparison, and the expect is the
+    # sentence only that leg prints: a red gate that came from any other leg would not say which of
+    # the three files moved, which is the whole claim the round exists to make.
+    ("N36 the driver's ring table moves against the reader's copy",
+     [(SDHCI, "kRingOffset[kRingCount] = {64, 192}", "kRingOffset[kRingCount] = {64, 194}")],
+     "the driver says [64, 194]"),
+    ("N37 the reader's kernel ring shrinks under its own derived offsets",
+     [(READER, "KERNEL_SLOTS = 512", "KERNEL_SLOTS = 256")],
+     "the reader says [64, 256]"),
+    ("N38 the host dd's a sector short of the geometry",
+     [(SCRIPT, "by-name/logdump bs=512 count=1217", "by-name/logdump bs=512 count=1216")],
+     "the host reads [1216, 1217] sectors"),
+    ("N39 the reader's table is parsed out of the driver's file",
+     [(SDHCI_GEOMETRY, 'READER = REPO / "scripts/read-clover-log.py"',
+       'READER = REPO / "drivers/CloverSdhci/CloverSdhci.cpp"')],
+     "declares no VERDICT_OFFSET"),
+    ("N40 the roundtrip leg is stubbed and the script still exits 0",
+     [(SDHCI_GEOMETRY, "roundtrip = None\nif all (value is not None",
+       "roundtrip = None\nif False and all (value is not None")],
+     "printed no 'roundtrip: 4 records'"),
+    ("N41 the staging-depth comment claims a number the table does not give",
+     [(SDHCI, "// staging depth: deeper than the driver's card ring, shallower than the kernel's",
+       "// staging depth; deeper than either card ring")],
+     "kRingRamSlots says 128 is staging depth"),
+    ("N42 the reader's main path asks the kernel ring for somebody else's kind",
+     [(READER, "slots, base, kind, window = KERNEL_SLOTS, KERNEL_OFFSET, 22,",
+       "slots, base, kind, window = KERNEL_SLOTS, KERNEL_OFFSET, 23,")],
+     "the driver writes kind 22 to the kernel ring"),
 ]
 
 

@@ -28249,3 +28249,51 @@ timeline_last_close()                     ->  close:neither-edl
 - 本轮没有任何板上行为改变：`git diff --stat drivers/` 为空，`board.toml` 未动，boot-args 未动，镜像未重建。
 - 「板子还在 EDL」这一枚状态本轮只由 `ioreg` 当场看过一次（`F6548A52@01143000`，`adb`/`fastboot` 两把工具都空答）；至于它此后有没有自己离开 EDL、卡上 boot 计数器现在是不是已经超过 120，本轮没有仪器——下一次能读卡的窗口会自己报出来（读卡那趟先看 boot 计数器再判读，按 r293 的陈旧判定）。
 - 判决句现在说的仍是「这两把工具看不见那一型」，不改口成「死线开火了」。
+
+## Round340（#653，纯主机轮，发版 v0.7.58：卡的几何今天有三个文件各打了一份字，本轮把它变成一次测量）
+
+本轮板上代码只动一行注释、不重打镜像、不刷写（板子在 EDL，宿主侧继续）。新产物只有 `scripts/test-clover-sdhci-geometry.py` 与它在闸门里的那一段。
+
+**① 题面：同一枚几何被抄了三份，而三处针脚各自只证自己那一串在不在**
+
+`drivers/CloverSdhci/CloverSdhci.cpp:473-492` 写环（`kRingCardSlots = {64, 512}`、`kRingOffset = {64, 192}`、`kBootRecordOffset = 192 + 2 * 512`），`scripts/read-clover-log.py:96-140` 把同一组数**用另一套名字再打一遍**（`VERDICT_/KERNEL_/BOOT_`），`scripts/run-clover-unattended.sh:376/551` 再第三次打窗口大小（`count=1217`、`623104`）。闸门里早就有 `bs=512 count=1217`、`DUMP_SECTORS = BOOT_OFFSET + 1` 这些针脚，但它们各自只回答「这一串在我这个文件里在不在」。**没有一条腿比过这三张表说的是不是同一件事。**写侧错两枚扇区，卡上就是「这条记录从没被写过」——读侧不会报错，因为读侧看见的是别人的扇区；这正是 r319 那 512 槽 tee 环被读成「没有行」、r191 那窗口算术被读成「没有判词」的形状，只是这次坑在写的一侧。
+
+**② 五腿，按「两条腿只有按构造不一致才值得都留」来切**
+
+实跑读数（`python3 scripts/test-clover-sdhci-geometry.py`，本轮全绿）：
+
+```
+pairwise agreement: 22 of 22 names both files declare; driver-only 3 (ring_flush_per_pass, ring_ram_slots, verdict_text_bytes); reader-only 0 ()
+region tiling: driver exact over 1217 sectors, reader exact over 1217 sectors; the reader's window is one sector past its own boot record
+dd window: driver needs 1217 sectors, reader demands 1217, host reads [1217] and asserts bytes [623104]
+record shape: 8 writer lines, 11 header words, 2 reader unpacks, rings asked with {0: (21, 25), 1: (22,)}
+roundtrip: 4 records built from the driver's arithmetic read back by the reader's decode() with problems=0; the same records two sectors earlier decode as 0 and one sector later as 0
+sdhci geometry: OK
+```
+
+1. **pairwise**：两侧都声明的名字逐个比，数从各自文件的语法里读出来（读者那份的派生名 `BOOT_OFFSET`/`DUMP_SECTORS` 由读者自己的算术解出，脚本不替它算）。分母与两侧各自缺席的名字都印出来，不假设。
+2. **tiling**：每侧自己的区域表必须把窗口**恰好铺满**——按起始扇区排序后，每一段的结尾就是下一段的开头，最后一段结尾就是窗口。实测本板 10 段恰好铺满 `[0, 1217)`（报告窗 0..32、entry 32..44、text 44..56、beat 56..60、deadline 60..61、panic 61..63、drain 63..64、驱动环 64..192、内核环 192..1216、boot 记录 1216..1217）。**重叠**＝两个写手一格＝boot 91 那一型从几何变动里再来一遍；**空隙**＝窗口里有人不认领的扇区。
+3. **words**：驱动那行注释里写的是关于数的话，本轮把它当成被测量对象：`deeper than either card ring` 必须在数上成立，`shallower than the kernel's` 必须 `< 512`。注释若改成一句没法核的话，本轮判红（而不是放过）。
+4. **shape**：记录算术的八枚写侧行、11 枚 header 字的位置、读者两处 `<10I` 解包、两环被问的 kind——钉的是第 5 腿将要复刻的那套算式，免得复刻一件已经搬走的东西。
+5. **roundtrip**：按驱动的算式当场造 4 枚记录，再 `importlib` 载入读者、用**读者自己的** `decode()` 与读者自己的偏移读回来；两支对照（早两枚扇区、晚一枚扇区）必须都读不到，这一腿才不是「只要能读到就算对」。
+
+**③ 两件本轮真的读出来的东西**
+
+- **注释与它旁边的数相反**：`kRingRamSlots = 128` 那句写着「deeper than either card ring」，而 `kRingCardSlots = {64, 512}`——128 比驱动环深、比内核环浅。已按实测改正为 `deeper than the driver's card ring, shallower than the kernel's`。这一改是**一行换一行、总行数 10140 → 10140**（`git diff --numstat` 实测 `1 1`），所以连 r332 那一格唯一已知的每建必变项（`panic()` 折进 `__LINE__`）都不动：本轮不改产物哈希。这句是**论证不是测量**——本轮没重建，证伪它的办法就在下一轮重建的 `__TEXT_EXEC` 差分上。
+- **窗口大小的三处副本从此由一条腿比**：`dd window:` 那行不是印三个数让人看，而是判「读者要的＝驱动要的＝宿主读的」以及「宿主断言的字节数＝窗口扇区数 × 512」。改任何一处而没改另两处，本轮判红。
+
+**④ 仪器的两次自证（都是本轮第一次跑出来的，形状属第三十层）**
+
+1. **kind 那枚针脚被读者自己的 `--selftest` 喂饱**：第一版取「`(VERDICT_SLOTS, VERDICT_OFFSET, (21, X))`」用的是无锚 `re.search`，而 `read-clover-log.py:952` 的自检里有一模一样的句式。变异「主路径 `(21, PROBE_KIND)` → `(21, 26)`」第一次**判不出红**——脚本判的是自检那一行。改法：钉到主路径那句赋值本身（`slots, base, kind, window = …`）并要求恰一枚；随后这支变异如实判红。同批发现 roundtrip 的两条腿（造记录与问读者）用的是同一份 kind 表，**按构造一致**，所以再加第三条腿：驱动 word 5 那句 `((which == kRingKernel) ? 22 : 21)` 里读出的两枚数必须等于读者主路径问的两枚数（这支是第十七层「凡按构造自洽的腿不算第二条腿」的直接处置）。
+2. **解析错文件时脚本抛 traceback 而不是报缺失**：把 `READER` 指到驱动 `.cpp` 上，第一版在打印那行崩在 `None:#x`。这不只是难看——traceback 会让负测「红得对但不为它自己红」。改了两处：所有区域算术先拒 None（不再 `None + int`），打印走 `shown()`。现在这支变异交出 29 条具名问题，第一条就是 `the reader declares no VERDICT_OFFSET`。
+
+第三枚坑在**闸门自己身上**，由负测的第一遍当场逼出：N36（驱动环偏移 192→194）与 N39（读者的解析指到驱动 `.cpp`）两支**判红了，却不为自己红**——闸门转发脚本输出用的是 `(stdout + stderr)[-900:]`，而这两支分别交出 5 条与 29 条 `PROBLEM` 行，**尾部截断恰好把「说出是哪颗文件动了」的那一条切掉**。改成按名字转发：解析 `PROBLEM` 前缀、送它前六条加上 `sdhci geometry: N problem(s)` 汇总行，只有脚本一行 `PROBLEM` 都没印（＝死在命名之前）才退回尾巴。这是第二十二层「闸门也是仪器」的直接续篇：**转发读数的方式本身是一枚量程设置**，「取末尾 N 个字符」默认丢掉的正是条数最多、信息最密那几条。
+
+**⑤ 负测（七枚新 case，N36–N42）与它们的 expect**
+
+每枚都要求闸门那句话**只可能由这一条腿印出**（光看 exit 1 只证明有东西判了红）：环偏移移动 ⇒「the driver says [64, 194]」；读者内核环缩 ⇒「the reader says [64, 256]」；宿主少读一枚扇区 ⇒「the host reads [1216, 1217] sectors」；解析指错文件 ⇒「declares no VERDICT_OFFSET」；roundtrip 腿被 stub ⇒「printed no 'roundtrip: 4 records'」；注释回滚成旧话 ⇒「kRingRamSlots says 128 is staging depth」；主路径内核环问成 kind 23 ⇒「the driver writes kind 22 to the kernel ring」。
+
+**⑥ 边界：本轮证不出什么**
+
+- 这张表证的是**三张表说的是同一件事**，不证卡上真按这些地址写着记录——那仍然只有把 boot 120 的卡读回来才答得出（#722，要把板子带回 TWRP）。换句话说：本轮关掉的是「几何抄了三份、没人比过」这枚仪器债，没开任何新的板上读数。
+- 本轮没有把 CloverSdhci 抽成纯层头（#653 原题面），因为抽出来的算术如果只由它自己复刻的测试来判，就还是「拿 A 问 A」；先把三个文件之间那层比较做实，才是本轮能交的那条腿。
