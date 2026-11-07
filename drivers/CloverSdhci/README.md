@@ -128,6 +128,75 @@ The three windows (host, GCC, IMEM) are mapped `kIOMapAnywhere | kIOMapInhibitCa
 photograph nobody is there to take. Its `elr=`/PC fields still name the stuck instruction for
 `scripts/decode-clover-address.py`.
 
+## The bus-free layer, and the seven things it turned up (round341)
+
+Round341 moved every decision this driver makes *about a record* into `SdhciLogCore.h`: the window's
+geometry (the two card rings' slot counts and offsets, the staging ring's own count, the boot record's
+sector), the ten header words and their positions, the body clamp, the printable filter, the byte sum,
+which slot a cursor lands in, whether a ring was full, whether a relay slot was still unconsumed, and
+how a kernel line gets assembled under its bound. What stayed in `CloverSdhci.cpp` is the part that
+cannot be modelled: register reads, the completion poll, IOKit objects, and every
+`CloverSdhci rNNN:` string, so boots 41 through 120 remain byte-comparable.
+
+`tests/clover_sdhci_host.cpp` drives it under `scripts/test-clover-sdhci.py`, and the build gate **runs**
+that test rather than reading it: it writes a whole 1217-sector window, reads it back with
+`scripts/read-clover-log.py` -- the same decoder used on a real card -- and checks the wrap by
+`(slot, seq)`, the boot id in word 9, the at-bound control rows, one row carrying a tab and two high
+bytes, and a two-sectors-early control that must find nothing. `scripts/test-clover-sdhci-geometry.py`
+is what keeps the layer's numbers and the reader's copy one arithmetic (round340's five legs, now
+pointed at the layer instead of at the `.cpp`, with leg 4b added by this round -- see finding 7).
+
+Writing the layer down, and then banning the copies left behind, produced four findings. Each carries
+its own denominator, measured over the archived readings before the change:
+
+1. The probe relay's `dropped=` counted `seq >= kProbeSlots` -- a position, not a backlog -- while
+   §Round304 registered it as slots overwritten between flushes. 575 archived probe rows, largest
+   `seen` 62 against 64 slots, `dropped` 0 in every one: latent. The model now runs the relay at 200
+   rows with and without a consumer and prints both rules.
+2. A kernel line longer than the 320-byte bound destroyed the byte that arrived when the buffer was
+   full and assembled the rest as a second row -- which the allowlist drops without a word -- while the
+   constant's comment said the line was truncated, not split. 631 of 104,819 archived kind-22 records
+   have `body` exactly 320: live. The rule is now `sdhci_tee_feed()`, and the census row prints
+   `cut=` and `bound=`.
+3. The writer summed the text as it arrived and stored it through the printable filter, so one control
+   byte makes an intact record one no decode believes. 106 usable windows, 6,714 driver-ring and 54,272
+   kernel-ring records, 0 mismatches: latent. The sum now runs over the stored bytes.
+4. `panicAppendText` spelled the ten words, the 480 clamp and that same sum a second time, several
+   thousand lines from the ring path. 1,686 kind-20 records, 0 mismatches, 0 filtered bytes: latent --
+   and nothing in the extraction walked there. This one was found by the ban written to catch it, which
+   is the gate doing the job round340 gave it. The path now calls `sdhci_build_panic_header()`.
+
+The last three are not about the card. They are about the instruments this round had to change to see
+the card at all, and each of them says which reading would otherwise have been a false green:
+
+5. `scripts/test-clover-sdhci-geometry.py` parsed the ring table with an unanchored search, and the
+   file it searched contains a comment two lines above the declaration that restates the same numbers.
+   Editing only the declaration left the reading on the prose, so the leg reported three-way agreement
+   about a table nobody had changed. Found by negative N36, which went "red, but not for itself": the
+   gate failed on its own existence needle while the geometry script stayed green. The parse is now
+   anchored to the declaration line, N54 pins the anchor by removing it and moving the prose alone, and
+   the gate's red headline names the file it actually searched (it had been naming `CloverSdhci.cpp`
+   for a line the layer carries).
+6. `read-clover-log.py`'s `text_of` kept `0x09 <= byte < 0x7f` while `sdhci_record_byte` keeps a newline
+   and printable ASCII: the reader presented 22 control bytes as original text that the writer had
+   already replaced, and its own docstring named the filler as a space. The two sets now meet in one
+   measurement: `case keepset` prints the writer's answer for all 256 inputs as a 64-hex mask, and
+   `scripts/test-clover-sdhci.py` computes the same mask by asking `text_of` the same 256 questions.
+   Over 91 window-sized archives (53,785 decoded records) not one stored body holds a byte in the
+   affected set, so no reading already on disk changes -- the fix is about what the reader is allowed
+   to claim, not about what the card holds. Three needles and three negatives (N55 mask, N56 ban,
+   N57 the model's row) keep the two sides asking the same question.
+7. The extraction left `const uint32_t body = sdhci_record_body (length);` behind in `ringWriteRecord`,
+   and the first build of this round died on `-Wunused-variable` at archive 11 with every leg above
+   green. Neither this gate nor the geometry script compiles `CloverSdhci.cpp` -- the host model
+   compiles the layer and the model -- so a leftover in the driver's own translation unit was a
+   question nobody had been asked. Leg 4b of the geometry script asks it (every local bound to a layer
+   call must be read again inside the block that declares it, attributed by brace depth, and an
+   unbalanced file is judged red rather than guessed at), `check-clover.py` requires the denominator it
+   prints, and N58/N59 judge both halves. `sdhci_record_body` also left the gate's call-needle list:
+   its clamp now has one home, and a driver that called it as well would be the fourth copy the ban
+   above is written against.
+
 ## How this driver meets the UniXNU driver documentation
 
 Layer and wiring are the documented ones: this is a built-in XNU driver, not a kext
@@ -137,8 +206,8 @@ and `porting/device-repository.md:90-113` prescribe, and the object ABI of
 `docs/drivers/xnu-drivers.md:106-116` is enforced rather than promised -- `build-arm-driver.py:120,129`
 refuses anything whose magic/CPU/subtype/filetype is not `(0xfeedfacf, 0x100000c, 0, 1)` or whose
 build version is not platform 2 at minimum OS `0x110000`. The layout of `docs/drivers/xnu-drivers.md:7-14`
-is the driver's own three files (`CloverSdhci.cpp`, `SdhciRegs.h`, this README) with no `.inf` and no
-`Info.plist`; the missing plist is the correct shape here, because `:14` treats the plist as the record
+is the driver's own files (`CloverSdhci.cpp`, `SdhciRegs.h`, `SdhciLogCore.h`, `tests/clover_sdhci_host.cpp`,
+this README) with no `.inf` and no `Info.plist`; the missing plist is the correct shape here, because `:14` treats the plist as the record
 of a personality and this driver has none to record. Its addresses are board constants pinned to the
 device's own tree exactly as `docs/drivers/xnu-drivers.md:215` prescribes for a device below the
 `arm-io` range (`kSdhciHostPhys` / `kSdhciHostSize` at `SdhciRegs.h:30-31`, `sdhci@c0c4000`).

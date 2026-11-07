@@ -529,6 +529,51 @@ def check_board(errors: list) -> str:
         errors.append(f"board.toml did not parse: {error}")
         return "board.toml unreadable"
 
+    # Round341 (#653) moved CloverSdhci's card geometry and record arithmetic into the header the driver
+    # includes, drivers/CloverSdhci/SdhciLogCore.h, so the sixth driver has a pure layer the host model
+    # can drive. That leaves every older assertion here asking "does the shipped path know ..." about a
+    # line that is still shipped but no longer in the .cpp. SDHCI_IN_LAYER names those lines -- one
+    # table, so the choice of file is not a judgement made at each call site -- and sdhci_shipped is the
+    # pair read together. A *ban* is different: it forbids a line in one file, and those keep reading
+    # CloverSdhci.cpp alone. scripts/test-clover-sdhci-geometry.py is what pins the lines in the layer
+    # against the reader's copy of the same numbers; this table only says where a needle looks.
+    sdhci_layer_lines = frozenset((
+        "static const uint32_t kRingCardSlots[kRingCount] = {64, 512};",
+        "static const uint32_t kRingOffset[kRingCount] = {64, 192};",
+        "static const uint32_t kRingFlushPerPass[kRingCount] = {4, 8};",
+        "static const uint32_t kRingDriver = 0;",
+        "static const uint32_t kRingKernel = 1;",
+        "static const uint32_t kRingRamSlots = 128;",
+        "static const uint32_t kBootRecordOffset = 192 + 2 * 512;",
+        "static const uint32_t kBootKind = 24;",
+        "static const uint32_t kProbeKind = 25;",
+        "static const uint32_t kFlightEntryOffset = 32;",
+        "static const uint32_t kFlightTextOffset = 44;",
+        "static const uint32_t kFlightTextSlots = 12;",
+        "static const uint32_t kFlightBeatOffset = 56;",
+        "static const uint32_t kFlightDeadlineOffset = 60;",
+        "static const uint32_t kFlightPanicOffset = 61;",
+        "static const uint32_t kFlightDrainOffset = 63;",
+        "static const uint32_t kFlightMarkerMagic = 0x434C564Du;",
+        "return cursor % kRingCardSlots[which];",
+        "header[kWordBoot] = boot_id;",
+    ))
+    sdhci_layer = REPO / "drivers/CloverSdhci/SdhciLogCore.h"
+    sdhci_layer_text = sdhci_layer.read_text() + "\n" if sdhci_layer.is_file() else ""
+    sdhci_shipped = sdhci_layer_text
+
+    def sdhci_subject (needle, driver_text, driver_name):
+        """(the text a CloverSdhci presence needle is judged against, the file to name when it misses).
+
+        One lookup for both, so a red line cannot point at a file that was never searched. Round341's
+        N36 printed "CloverSdhci.cpp lacks static const uint32_t kRingOffset..." about a mutation the
+        layer carries: the routing table had already picked the right file, and the message named
+        another one, which sends the next reader to a source where nothing is missing.
+        """
+        if needle in sdhci_layer_lines:
+            return sdhci_layer_text + driver_text, "drivers/CloverSdhci/SdhciLogCore.h"
+        return driver_text, driver_name
+
     if board["board"]["name"] != "clover" or board["board"]["soc"] != "SDM660":
         errors.append("board.toml does not describe clover / SDM660")
     # Round158. scripts/porting-record.py (the required CI check sheng runs) compares
@@ -753,6 +798,10 @@ def check_board(errors: list) -> str:
         # deadline produces -- reset the board with the last lines still in RAM. The drain is asserted
         # as source, not as an argument: it is a property of the sink the panic path already calls.
         sdhci_source = (REPO / "drivers/CloverSdhci/CloverSdhci.cpp").read_text()
+        # The shipped path is this file plus the layer it includes (see sdhci_layer_lines above): a
+        # needle that asks what the kernel runs has to read both, and a needle that forbids a line reads
+        # only this one.
+        sdhci_shipped = sdhci_shipped + sdhci_source
         sink = sdhci_source.find("extern \"C\" unsigned int clover_emmc_panic_append "
                                  "(const char *text, unsigned int length)")
         # Round301 grew the sink's body (the panic-text copy sits ahead of every card write), so these
@@ -4635,7 +4684,7 @@ def check_board(errors: list) -> str:
                        '"CloverSdhci r301: panic copy rc=%u chars=%u said=%u\\n"',
                        'gPanicAppendRc < 100'):
             if needle not in sdhci_source:
-                errors.append(f"drivers/CloverSdhci lacks {needle[:64]!r}: without the copy a boot that "
+                errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp lacks {needle[:64]!r}: without the copy a boot that "
                               "reaches the panic sink still leaves the card without a name, which is the "
                               "shape boots 89 and 90 are")
         # The copy has to be taken before anything that can refuse, and said before the drain's flushes.
@@ -4687,8 +4736,9 @@ def check_board(errors: list) -> str:
                        '(event == kFlightEventText) || (event == kFlightEventDrainIn);',
                        'flightWrite (kFlightEventText, 3, 0, gPanicStashLength, extra,',
                        '"CloverSdhci r302: blind ok=%u chars=%u total=%u slot=%u\\n"'):
-            if needle not in sdhci_source:
-                errors.append(f"drivers/CloverSdhci lacks {needle[:64]!r}: without the owned buffer, the "
+            subject, where = sdhci_subject (needle, sdhci_source, "drivers/CloverSdhci/CloverSdhci.cpp")
+            if needle not in subject:
+                errors.append(f"{where} lacks {needle[:64]!r}: without the owned buffer, the "
                               "signature and the blind write, boot 91's shape stays on the card as a "
                               "reading and the sentence still needs a second chance to reach it")
         # The signature has to be laid down before the transfer starts and after the extras, or a record
@@ -4994,7 +5044,7 @@ def check_board(errors: list) -> str:
         for needle in ('pioFail (1, 0, 0, lba);',
                        'pioFail (2, status, 0, lba);',
                        'gPioAttempt = 100 + event;',
-                       'gPioAttempt = kind ? kind : ((which == kRingKernel) ? 22u : 21u);',
+                       'gPioAttempt = sdhci_record_kind_word (kind, which);',
                        'gPioAttempt = 20;',
                        'gPioAttempt = 0;'):
             if needle not in sdhci_source:
@@ -5399,8 +5449,9 @@ def check_board(errors: list) -> str:
                        'static const uint32_t kFlightEventDrainIn = 7;',
                        'gPanicDrainInOk = flightPanicDrainIn () ? 1u : 0u;',
                        '"CloverSdhci r309: drain legs in=%u boot=%u host=%x probe=%u\\n"'):
-            if needle not in sdhci_source:
-                errors.append(f"drivers/CloverSdhci has no {needle[:52]!r}: boot 99 found no drain row of any "
+            subject, where = sdhci_subject (needle, sdhci_source, "drivers/CloverSdhci/CloverSdhci.cpp")
+            if needle not in subject:
+                errors.append(f"{where} has no {needle[:52]!r}: boot 99 found no drain row of any "
                               "kind on a boot whose panic marker is on the card, and the only way that stops "
                               "being a candidate is a record written before the drain reads a gate, by the "
                               "path round302 proved needs no host ticket")
@@ -5735,7 +5786,7 @@ def check_board(errors: list) -> str:
                        "static bool teeNagSource (const char *line, uint32_t length, uint32_t *hash)",
                        "CloverSdhci r229: tee filter fl=%u nag=%u exit kept=%u dropped=%u comms=%u\\n"):
             if needle not in sdhci_source:
-                errors.append(f"drivers/CloverSdhci lacks {needle[:52]!r}: the ring would again "
+                errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp lacks {needle[:52]!r}: the ring would again "
                               "spend half its records on the three producers r229 filters out, "
                               "and a late start would not name which one filled it")
         # Round230: boot 18 re-ran the census and the ring's biggest resident had become CloverBlock's
@@ -5744,7 +5795,7 @@ def check_board(errors: list) -> str:
                        'teeHasPrefix (body, rest, "CloverBlock r190: sync-in ")',
                        "CloverSdhci r230: tee sync-in=%u sync-out=%u dropped=%u\\n"):
             if needle not in sdhci_source:
-                errors.append(f"drivers/CloverSdhci lacks {needle[:52]!r}: the sync metronome would "
+                errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp lacks {needle[:52]!r}: the sync metronome would "
                               "again take half the ring, and a ring that starts late could not say "
                               "how many of its records the filter held back")
         if "CloverSdhci r212: panic tail lines=%u unseen=%u bufx=%d tee=%u boot=%u" not in sdhci_source:
@@ -5777,8 +5828,10 @@ def check_board(errors: list) -> str:
                  "before it was ever written"),
                 ("CloverSdhci r212: boot id=%u record=%u probe slots=%u text=%u",
                  "no arming line names the boot id: a card could not say which boot wrote it"),
-                ("gRingBlock[9] = gBootId;",
-                 "two-block records do not carry the boot id in word 9"),
+                ("header[kWordBoot] = boot_id;",
+                 "two-block records do not carry the boot id in word 9 (the name-to-position table "
+                 "is scripts/test-clover-sdhci-geometry.py's leg 4; this only says the writer fills "
+                 "the word the reader unpacks last)"),
                 ('extern "C" unsigned int clover_emmc_probe_say (const char *text, unsigned int length)',
                  "no probe entry point: the kernel's kill-point lines could only reach msgbuf, "
                  "which the panic a minute later has already overwritten"),
@@ -5797,8 +5850,9 @@ def check_board(errors: list) -> str:
                  "the drain never flushes a ring directly, so a dead tee takes both rings with it"),
                 ("slot = minSeqSlot;",
                  "the panic window still refuses when full instead of rotating the oldest slot")):
-            if needle not in sdhci_source:
-                errors.append(f"drivers/CloverSdhci lacks {needle[:48]!r}: {why}")
+            subject, where = sdhci_subject (needle, sdhci_source, "drivers/CloverSdhci/CloverSdhci.cpp")
+            if needle not in subject:
+                errors.append(f"{where} lacks {needle[:48]!r}: {why}")
         # The round209 early return is the specific defect round212 removes; naming it keeps a
         # future edit from putting the gate back where it hid the one silence that mattered.
         tail = sdhci_source[sdhci_source.find("static void panicTailRead (void)"):
@@ -5820,8 +5874,9 @@ def check_board(errors: list) -> str:
                  "no exit records the result of the request just finished"),
                 ("extern \"C\" void clover_emmc_flight_beat (void)",
                  "no beat entry point for the timer to call")):
-            if needle not in sdhci_source:
-                errors.append(f"drivers/CloverSdhci lacks {needle[:40]}...: {why}")
+            subject, where = sdhci_subject (needle, sdhci_source, "drivers/CloverSdhci/CloverSdhci.cpp")
+            if needle not in subject:
+                errors.append(f"{where} lacks {needle[:40]}...: {why}")
         # Round213: the beat must never wait, so it takes the host with one compare-and-swap; and a
         # holder whose stage has not moved has to be recovered by that same beat, or the one request
         # that stopped still costs the boot (r212: every later reader and the panic sink queued
@@ -5840,7 +5895,7 @@ def check_board(errors: list) -> str:
                 ("dropHostTicket (token);",
                  "the beat releases with the request's release, which would erase the holder's stage")):
             if needle not in sdhci_source:
-                errors.append(f"drivers/CloverSdhci lacks {needle[:44]!r}: {why}")
+                errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp lacks {needle[:44]!r}: {why}")
         armcpu_source = (REPO / "drivers/ArmCpu/ArmCpu.cpp").read_text()
         if "clover_emmc_flight_beat ();" not in armcpu_source:
             errors.append("drivers/ArmCpu never calls the round210 beat: nothing would sample the "
@@ -5882,8 +5937,9 @@ def check_board(errors: list) -> str:
                 ("__atomic_load_n (&gHostOwner, __ATOMIC_ACQUIRE)",
                  "the panic marker does not read the live host owner, which is the one gate its "
                  "return code cannot express")):
-            if needle not in sdhci_source:
-                errors.append(f"drivers/CloverSdhci lacks {needle[:52]!r}: {why}")
+            subject, where = sdhci_subject (needle, sdhci_source, "drivers/CloverSdhci/CloverSdhci.cpp")
+            if needle not in subject:
+                errors.append(f"{where} lacks {needle[:52]!r}: {why}")
         deadline_call = armcpu_source.find("clover_emmc_flight_deadline (")
         panic_call = armcpu_source.find('panic ("clover r148:')
         if deadline_call < 0:
@@ -7125,8 +7181,8 @@ def check_board(errors: list) -> str:
     # gains arg/done/cur/list and drops swap; bbsend now prints every hop), so the menu names round335
     # while rows this round did not touch keep their own generation tokens (bbsend r331, bbrcv r328,
     # dispstate r329) -- a card row names its probe generation, the title names the image that ran.
-    if not board["payload"]["title"].startswith("clover r339:"):
-        errors.append('[payload] title is not "clover r339: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r341:"):
+        errors.append('[payload] title is not "clover r341: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -8085,16 +8141,21 @@ done
                        "static uint32_t verdictFormat (char *out, uint32_t cap, const char *fmt, va_list args)",
                        "static void sdhciSay (const char *fmt, ...)",
                        "static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length,",
-                       "gRingBlock[9] = gBootId;",
+                       # Round341: the ten words are the layer's to place now. What the driver still owns,
+                       # and what these two lines are the evidence for, is that the record it builds
+                       # carries *this* ring's cursor, sequence and boot id at the address the ring's own
+                       # offset table gives -- words 7, 8 and 9 and the lba of round174's claim. The
+                       # positions themselves are pinned against the reader by scripts/test-clover-sdhci-
+                       # geometry.py's fourth leg, which is a comparison rather than a substring.
+                       "const uint32_t lba = sdhci_ring_lba (gVerdictFirst, which, gRingCursor[which]);",
+                       "sdhci_build_header (gRingBlock, lba, which, gRingCursor[which], gRingSeq[which], gBootId,",
                        "static void flushVerdictRing (void)",
-                       "gRingBlock[5] = kind ? kind : ((which == kRingKernel) ? 22 : 21);",
-                       "gRingBlock[8] = gRingSeq[which];",
-                       "const uint32_t lba = gVerdictFirst + kRingOffset[which] +",
                        'IOLog ("%s\\n", line);',
                        "gVerdictFirst = entryLdFirst;",
                        "gVerdictReady = 1;"):
-            if needle not in text:
-                errors.append(f"{sdhci_r174.name} lacks {needle[:44]}...: round174's formatter, its "
+            subject, where = sdhci_subject (needle, text, sdhci_r174.name)
+            if needle not in subject:
+                errors.append(f"{where} lacks {needle[:44]}...: round174's formatter, its "
                               "kind 21 record, or the arming that lets a verdict reach the card is gone")
         # A verdict printed only to the panel is a verdict that has to win a race with the next line.
         if "IOLog (\"CloverSdhci r" in text:
@@ -8143,8 +8204,9 @@ done
                        "kernelRingPush (gTeeLine + start, length - start);",
                        "gTeeReady = 1;",
                        '"CloverSdhci r175: tee armed bufc=%p size=%d bufx=%d\\n"'):
-            if needle not in text:
-                errors.append(f"{sdhci_r174.name} lacks {needle[:44]}...: round175's kernel log tee, "
+            subject, where = sdhci_subject (needle, text, sdhci_r174.name)
+            if needle not in subject:
+                errors.append(f"{where} lacks {needle[:44]}...: round175's kernel log tee, "
                               "its validation, or the ring-only push it depends on is gone")
         if text.count("teeKernelLog ();") < 3:
             errors.append(f"{sdhci_r174.name} drains the kernel log from fewer than three guarded "
@@ -8198,15 +8260,18 @@ done
                        "static const uint32_t kRingKernel = 1;",
                        "static const uint32_t kRingRamSlots = 128;",
                        "static char gRingText[kRingCount][kRingRamSlots][kVerdictTextBytes];",
-                       "gRingBlock[7] = gRingCursor[which] % kRingCardSlots[which];",
+                       # Word 7 is the slot the ring's own cursor rule lands this record in; round341 put
+                       # that rule in the layer, and the model's wrap leg is what shows the driver obeys it.
+                       "return cursor % kRingCardSlots[which];",
                        "static void flushRing (uint32_t which)",
                        "flushRing (kRingDriver);",
                        "flushRing (kRingKernel);",
                        "ringPush (kRingDriver, line, length);",
                        '"CloverSdhci r176: kernel ring armed lba=%u slots=%u\\n"',
                        "static const uint32_t kTeeCensusMax = 12;"):
-            if needle not in text:
-                errors.append(f"{sdhci_r174.name} lacks {needle[:44]}...: round176's ring split, its "
+            subject, where = sdhci_subject (needle, text, sdhci_r174.name)
+            if needle not in subject:
+                errors.append(f"{where} lacks {needle[:44]}...: round176's ring split, its "
                               "per-ring flush budget, or the arming that lets kernel text reach the card is gone")
         # One ring per producer means the ring is no longer single-indexed anywhere: the round174/175
         # names have to be gone, or a line would be pushed to a buffer nothing flushes.
@@ -8252,8 +8317,9 @@ done
                        "gPanicLogReady = 1;",
                        "gVerdictReady = 1;",
                        "gTeeReady = 1;"):
-            if needle not in text:
-                errors.append(f"{sdhci_r174.name} lacks {needle[:44]}...: round185's logdump window, the "
+            subject, where = sdhci_subject (needle, text, sdhci_r174.name)
+            if needle not in subject:
+                errors.append(f"{where} lacks {needle[:44]}...: round185's logdump window, the "
                               "GPT name match that finds it, or the arming that makes any of the rings "
                               "writable is gone")
         # The position is the whole point: arming has to be in the entry walk, ahead of the instrument
@@ -8417,6 +8483,26 @@ done
                      "own reader will accept")):
                 if needle not in out:
                     errors.append(f"the geometry script printed no {needle!r}: {why}")
+            # Leg 4b's denominator, required by name rather than as a substring: the board's -Werror
+            # archive step is the only thing that has ever reported a leftover local, and it reports it
+            # by refusing to build -- two days after the round that created it. A scan of zero
+            # declarations would exit 0 and say the driver TU is clean, which is the same silence as
+            # this leg not existing.
+            local_leg = re.search (r"driver locals: (\d+) bound from a layer call, (\d+) unread "
+                                   r"in their own block, braces balanced=(\w+)", out)
+            if local_leg is None:
+                errors.append("the geometry script printed no driver locals line: neither this gate "
+                              "nor that script compiles drivers/CloverSdhci/CloverSdhci.cpp, so the "
+                              "one shape the build dies on and the host model cannot see would again "
+                              "be a question nobody asked")
+            elif int(local_leg.group(1)) == 0:
+                errors.append(f"the driver locals leg found {local_leg.group(1)} declarations to "
+                              "judge: a scan over nothing is a pass about an empty file, and the "
+                              "driver calls the layer in more places than that")
+            elif int(local_leg.group(2)) != 0 or local_leg.group(3) != "True":
+                errors.append(f"the driver locals leg reports {local_leg.group(2)} unread locals with "
+                              f"braces balanced={local_leg.group(3)} and still exits 0: the leg that "
+                              "names the build-breaking shape has to fail when it finds it")
             window = re.search(r"driver needs (\S+) sectors, reader demands (\S+), "
                                r"host reads \[([^\]]*)\] and asserts bytes \[([^\]]*)\]", out)
             if window is None:
@@ -8477,6 +8563,202 @@ done
                 errors.append(f"{unattended.name} lacks {needle[:40]}...: the host would wait for the "
                               "wrong adb state, gate a good dump on dd's own stderr, or read the "
                               "partition the kernel mounted instead of the log window")
+
+    # Round341 (#653, conformance §7 gap 3's sixth driver). CloverSdhci is the driver every other
+    # reading reaches the host through, and until this round none of its record arithmetic could be
+    # asked a question without a boot. SdhciLogCore.h now holds the window's geometry, the record's
+    # arithmetic, the staging rings' two decisions, the relay's backlog predicate and the kernel line
+    # assembler's bound; tests/clover_sdhci_host.cpp drives them at rates the board has never produced
+    # and scripts/test-clover-sdhci.py reads the model's own window back with scripts/read-clover-log.py.
+    # The failure mode of a split like this is the second copy left behind, and this round's two
+    # corrections were both in a predicate, so all four faces are asserted: (a) the layer still holds
+    # each decision, (b) the driver calls each of them, (c) the driver declares no geometry again and
+    # contains neither replaced expression, (d) the gate runs the model and reads its report by field.
+    sdhci_core = REPO / "drivers/CloverSdhci/SdhciLogCore.h"
+    # The driver's own text, named apart from the `text` the shell-script block above binds: the same
+    # needle can be present in both files, and a gate that asks the wrong one answers "yes" to a
+    # question about a different artefact -- which is this round's eleventh layer pointed at the gate.
+    sdhci_drv = next((base / "drivers/CloverSdhci/CloverSdhci.cpp"
+                      for base in (REPO, pathlib.Path.cwd())
+                      if (base / "drivers/CloverSdhci/CloverSdhci.cpp").is_file()), None)
+    if sdhci_drv is None:
+        errors.append("drivers/CloverSdhci/CloverSdhci.cpp is missing: the pure layer would have no "
+                      "shipped caller to compare its answers against")
+        sdhci_drv_text = ""
+    else:
+        sdhci_drv_text = sdhci_drv.read_text()
+    if not sdhci_core.is_file():
+        errors.append("drivers/CloverSdhci/SdhciLogCore.h is missing: the card's record arithmetic "
+                      "would again be provable only on a board, which is the reason two of this "
+                      "round's three findings went unnoticed across 80 boots")
+    else:
+        core_text = sdhci_core.read_text()
+        for needle in ("return pending >= kRingRamSlots ? 1u : 0u;",
+                       "return write_cursor % kRingRamSlots;",
+                       "return cursor % kRingCardSlots[which];",
+                       "return length > kRecordBodyBytes ? kRecordBodyBytes : length;",
+                       "return kLogPrefixLength + body + 1u;",
+                       "return kind ? kind : ((which == kRingKernel) ? 22u : 21u);",
+                       "sum += (uint32_t) sdhci_record_byte ((uint8_t) text[i]);",
+                       "header[kWordSum] = sdhci_record_sum (text, body);",
+                       "return (uint32_t) (seq - consumed) >= kProbeSlots ? 1u : 0u;",
+                       "return partial < kVerdictTextBytes ? kSdhciTeeStore : kSdhciTeeOverflow;",
+                       "return truncated ? kSdhciTeeEmitCut : kSdhciTeeEmit;"):
+            if needle not in core_text:
+                errors.append(f"drivers/CloverSdhci/SdhciLogCore.h lacks {needle!r}: this is a bound, "
+                              "a cursor rule or a checksum that the host model proves and the board "
+                              "would no longer be running")
+        for needle in ('kSdhciTeeEmitCut = 2', 'kSdhciTeeOverflow = 3', 'sdhci_record_byte',
+                       'sdhci_relay_overwrote_unconsumed', 'sdhci_tee_stamp_skip'):
+            if needle not in core_text:
+                errors.append(f"drivers/CloverSdhci/SdhciLogCore.h lacks {needle!r}: the four-way "
+                              "answer the line assembler gives and the backlog predicate are the two "
+                              "things this round's findings turned into code")
+        # `sdhci_ring_slot` is deliberately absent: the driver reaches it through `sdhci_ring_lba` and
+        # `sdhci_build_header`, so a call needle here would be satisfied only by a third copy of the
+        # cursor rule. What pins it is scripts/test-clover-sdhci-geometry.py reading it out of the two
+        # layer functions' own bodies.
+        # `sdhci_record_body` left this list the same way it left the driver: the first build after the
+        # extraction failed on the local that had held it, and deleting the local was right -- the clamp
+        # is applied inside `sdhci_build_header` and `sdhci_build_text`, so a driver that called the
+        # bound as well would be the fourth copy this round's ban is written against. Its reachability
+        # claim is still carried, by the two needles above that name those builders as the exits the
+        # shipped path has to go through.
+        for needle in ("sdhci_ram_full (", "sdhci_ram_slot (", "sdhci_ring_lba (",
+                       "sdhci_build_header (", "sdhci_build_panic_header (", "sdhci_build_text (",
+                       "sdhci_record_kind_word (",
+                       "sdhci_relay_overwrote_unconsumed (", "sdhci_tee_feed (",
+                       "sdhci_tee_stamp_skip ("):
+            if needle not in sdhci_drv_text:
+                errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp does not call {needle!r}: the "
+                              "pure layer would be dead code the model passes and the kernel ignores")
+        # A second copy, or the old rule kept beside the new one, is the failure mode. The full list of
+        # geometry names is compared where they now live by scripts/test-clover-sdhci-geometry.py's
+        # own leg; these are the three whose return would still print a plausible row.
+        for gone in ("static const uint32_t kRingCardSlots",
+                     "static const uint32_t kRingOffset",
+                     "static const uint32_t kBootRecordOffset",
+                     "if (seq >= kProbeSlots) {",
+                     "gTeePartial < kTeeLineBytes",
+                     "sum += static_cast<uint8_t> (text[i]);"):
+            if gone in sdhci_drv_text:
+                errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp still carries {gone!r}: the "
+                              "shipped path and the modelled path would be two answers to one "
+                              "question, and the card cannot say which one wrote the row")
+        # The sentence the overflow branch used to explain itself described a split. Both cannot be
+        # true, and the behaviour is what the model measures, so the description is refused here
+        # rather than quoted: it is the only wording that was ever correct for the old branch.
+        if re.search(r"hand over what fits and start the next", sdhci_drv_text):
+            errors.append("drivers/CloverSdhci/CloverSdhci.cpp still describes the long-line branch "
+                          "as continuing the message in a second row: round341 made it truncate and "
+                          "count, and a comment that says otherwise is a sentence the next round "
+                          "would trust as a measurement")
+        for needle in ("static uint32_t gTeeTruncated = 0;", "static uint32_t gTeeCut = 0;",
+                       '" cut=%u bound=%u\\n",', "gTeeCut++;"):
+            if needle not in sdhci_drv_text:
+                errors.append(f"drivers/CloverSdhci/CloverSdhci.cpp lacks {needle!r}: without the "
+                              "truncated state and its count, a kernel row that arrived with its tail "
+                              "missing is indistinguishable from a row that was whole")
+
+    sdhci_model = REPO / "drivers/CloverSdhci/tests/clover_sdhci_host.cpp"
+    sdhci_runner = next((base / "scripts/test-clover-sdhci.py"
+                         for base in (REPO, pathlib.Path.cwd())
+                         if (base / "scripts/test-clover-sdhci.py").is_file()), None)
+    if sdhci_runner is None:
+        errors.append("scripts/test-clover-sdhci.py is missing: the record layer would be a header "
+                      "nobody compiles outside the kernel, which is the same as arithmetic nobody "
+                      "asked a question about")
+    elif not sdhci_model.is_file():
+        errors.append("drivers/CloverSdhci/tests/clover_sdhci_host.cpp is missing: the host model has "
+                      "nothing to drive SdhciLogCore.h against")
+    else:
+        run = subprocess.run([sys.executable, str(sdhci_runner)], capture_output=True, text=True)
+        if run.returncode:
+            named = [line[len("PROBLEM "):].strip() for line in run.stdout.splitlines()
+                     if line.startswith("PROBLEM ")]
+            detail = "\n      named: " + " | ".join(
+                line if len(line) < 150 else line[:147] + "..." for line in named[:6]) if named else \
+                "\n      (no PROBLEM line: the script died before naming anything)\n" + \
+                (run.stdout + run.stderr)[-500:]
+            errors.append("the sdhci record layer's host model failed" + detail)
+        else:
+            report = next((line for line in run.stdout.splitlines()
+                           if line.startswith("sdhci host model cases=")), None)
+            if report is None:
+                errors.append("the sdhci host model printed no summary line beginning 'sdhci host "
+                              "model cases=': an exit code without a report is a silence, and this "
+                              "round's findings are readings, not a compile")
+            else:
+                # Hyphenated, because two of the five fields the model names are `at-bound` and
+                # `control-mismatches`: a `(\w+)` here silently truncates both to `bound` and
+                # `mismatches`, the named-field loop then reports them missing, and the numeric
+                # comparisons below read the *other* keys -- a gate that is red for the wrong reason
+                # is this round's twenty-second layer pointed back at itself.
+                fields = dict(re.findall(r"([a-z][a-z0-9-]*)=(\d+)", report))
+                for name, why in (("cases", "the number of measured cases is the model's own "
+                                             "denominator"),
+                                  ("driver", "how many driver-ring records the reader could decode "
+                                             "out of the model's window"),
+                                  ("kernel", "how many kernel-ring records it decoded"),
+                                  ("at-bound", "the rows that arrived at the writer's line bound"),
+                                  ("control-mismatches", "the shifted-window control's complaints")):
+                    if name not in fields:
+                        errors.append(f"the sdhci host model's summary names no {name}: {why}")
+                if int(fields.get("cases", "0")) < 9:
+                    errors.append(f"the sdhci host model measured {fields.get('cases')} cases, below "
+                                  "the 9 this layer's decisions need: a case that stopped printing "
+                                  "would otherwise look like a case that passed")
+                if fields.get("at-bound") != "2":
+                    errors.append("the sdhci host model's window holds "
+                                  f"{fields.get('at-bound')} rows at the line bound, not 2: the "
+                                  "truncation control never ran, and a bound that reads 0 is the "
+                                  "same silence as a boot that printed nothing long")
+                if int(fields.get("control-mismatches", "0")) == 0:
+                    errors.append("the sdhci host model's two-sectors control found nothing to "
+                                  "complain about: the reader would accept a window written at any "
+                                  "base, which is the defect class round340 named")
+
+    # The reader's own sample row for the tee's state line is now built from the driver's format
+    # literal (round330's mechanism, round341's columns): a test that retyped the six-column row would
+    # keep passing after the row gained the truncation count, and the reader would be judged on a row
+    # no image prints.
+    reader_sample = next((base / "scripts/read-clover-log.py"
+                          for base in (REPO, pathlib.Path.cwd())
+                          if (base / "scripts/read-clover-log.py").is_file()), None)
+    if reader_sample is not None:
+        reader_src = reader_sample.read_text()
+        for needle in ('"CloverSdhci r175: tee seen=', "fill_conversions(joined_literal(sdhci_src,",
+                       'for column in ("cut=", "bound="):'):
+            if needle not in reader_src:
+                errors.append(f"scripts/read-clover-log.py lacks {needle[:46]!r}...: the tee's state "
+                              "row would be tested against a row someone remembered rather than the "
+                              "row the shipped source produces")
+
+    # Round341's sixth finding, and the one thing the extraction turned up that no record could show:
+    # the reader's byte filter kept every byte from 0x09 to 0x7e, so it presented 0x09 and 0x0b through
+    # 0x1f -- 22 of them, 0x0a excepted -- as original text, where sdhci_record_byte had already stored
+    # a '.' for them before a record was ever built, and its docstring named the filler as a space. The model
+    # now prints the writer's keep-set as one 64-hex mask and scripts/test-clover-sdhci.py computes the
+    # same mask from text_of, so the judgement runs (its PROBLEM line fails the run above) rather than
+    # being a substring here; these needles only say both sides still ask the same question. The wide
+    # range is banned as a shape, not as a value: a reader that keeps it presents a byte as original
+    # text the writer cannot have stored.
+    if sdhci_runner is not None and sdhci_model.is_file() and reader_sample is not None:
+        keepset_rows = ((sdhci_model, ('"case keepset keepmask=%s kept=%u filler=%u\\n"',
+                                       "mask[c / 8] |= (uint8_t) (1u << (c % 8));")),
+                        (sdhci_runner, ("r'case keepset keepmask=([0-9a-f]{64}) kept=(\\d+) "
+                                        "filler=(\\d+)'", "reader_hex != keepset.group (1)"),),
+                        (reader_sample, ("byte == 0x0A or 0x20 <= byte < 0x7F else 0x2E",)))
+        for path, keepset_needles in keepset_rows:
+            keepset_src = path.read_text()
+            for needle in keepset_needles:
+                if needle not in keepset_src:
+                    errors.append(f"{path.name} lacks {needle!r}: the keep-set leg would compare two "
+                                  "sets nobody assembled, which is the silence round341 ended")
+        if "0x09 <= byte < 0x7F" in reader_src:
+            errors.append("scripts/read-clover-log.py still keeps 0x09 and 0x0b through 0x1f as "
+                          "original: those 22 bytes are the writer's to replace, and a reader that "
+                          "prints them as text invents what the card never held")
 
     # Round186. launchd panics with "required boot task executable not found" and neither the panel nor
     # the card says which path its posix_spawn() looked up. The kernel is the only place that knows, and
@@ -8813,8 +9095,8 @@ done
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r339:"):
-        errors.append('[payload] title is not "clover r339: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r341:"):
+        errors.append('[payload] title is not "clover r341: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

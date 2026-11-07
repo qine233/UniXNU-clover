@@ -28297,3 +28297,119 @@ sdhci geometry: OK
 
 - 这张表证的是**三张表说的是同一件事**，不证卡上真按这些地址写着记录——那仍然只有把 boot 120 的卡读回来才答得出（#722，要把板子带回 TWRP）。换句话说：本轮关掉的是「几何抄了三份、没人比过」这枚仪器债，没开任何新的板上读数。
 - 本轮没有把 CloverSdhci 抽成纯层头（#653 原题面），因为抽出来的算术如果只由它自己复刻的测试来判，就还是「拿 A 问 A」；先把三个文件之间那层比较做实，才是本轮能交的那条腿。
+
+## Round341（#653/#723-#726，代码轮，发版 v0.7.59：本仓第六颗纯层落地，而「写下禁则」这一步替我们找出了第四枚板上缺陷）
+
+本轮不刷写（板子在 EDL，boot 120 的卡仍等人工带回 TWRP，#722）。做的是 #653 的原题面：把 `drivers/CloverSdhci/CloverSdhci.cpp` 里**关于一枚记录的全部判断**搬进无总线的 `SdhciLogCore.h`（375 行），驱动与 `tests/clover_sdhci_host.cpp`（669 行）编同一份算术，`scripts/test-clover-sdhci.py`（424 行）驱动那台宿主模型，闸门**跑**这个测试而不是 grep 它。`.cpp` 从 10140 行降到 10083 行（`git diff --numstat` 实测 -57），留下的只有寄存器读、完成轮询、IOKit 对象与每一枚 `CloverSdhci rNNN:` 字符串——所以 boots 41…120 的读数仍然逐字可比。
+
+**① 题面：算术有两份的地方，判词就只有一枚说真话**
+
+抽层之前，同一个「一枚记录」的问题在这颗驱动里至少被回答过两次：环地址算术（`.cpp` vs 读者的第二张表，r340 已比过）、`panicAppendText` 的十字与 480 截断（`.cpp` 内部两处），以及写手存的字节集与读者 `text_of` 保留的字节集。r340 那一轮把「抄了三份」做成了**一次测量**，但它自己仍然靠散文读那张表——本轮的第一枚仪器缺陷就是从那儿长出来的。抽层的价值不在少写代码，在于**把可以建模的部分搬进一台能满载跑的模型**：环溢出、中转积压、行切分、字节替换这四件事在板上要等几千枚 record 才偶发一次，在模型里是可以按 200 行/趟造出来的。
+
+**② 两条腿的产物与它们的读数**
+
+宿主模型（`/opt/homebrew/bin/python3.13 scripts/test-clover-sdhci.py`，本轮全绿）：
+
+```
+sdhci host model: OK
+sdhci host model cases=13 driver=64 kernel=512 at-bound=2 control-mismatches=64
+```
+
+13 例 = `geometry` `window` `fits` `wrap` `kernel_wrap` `relay` `ram_drop` `refused` `stamp` `filter` `tee_cut` `keepset` `panic`。其中 `case relay` 把中转环在**有消费者/无消费者**两种排空下各跑 200 行、把旧位置规则与新距离规则的计数并排印出来；`case tee_cut` 印 `rows_new= cut= bytes_lost_new= rows_old= bytes_lost_old= bound=`；`case keepset` 把写手对全部 256 个输入的答案打成 64 位十六进制掩码，脚本 `scripts/test-clover-sdhci.py` 拿读者的 `text_of` 问同一 256 个问题、算同一枚掩码来比。
+
+几何脚本从 r340 的五腿变七腿（新增 4b 与把 4 的针脚指向层）：
+
+```
+pairwise agreement: 22 of 22 names both files declare; driver-only 3 (ring_flush_per_pass, ring_ram_slots, verdict_text_bytes); reader-only 0 ()
+region tiling: driver exact over 1217 sectors, reader exact over 1217 sectors; the reader's window is one sector past its own boot record
+dd window: driver needs 1217 sectors, reader demands 1217, host reads [1217] and asserts bytes [623104]
+record shape: 6 layer lines + 2 write lines, 10 of 10 header words, 2 reader unpacks, rings asked with {0: (21, 25), 1: (22,)}
+driver locals: 2 bound from a layer call, 0 unread in their own block, braces balanced=True
+roundtrip: 4 records built from the writer's arithmetic read back by the reader's decode() with problems=0; the same records two sectors earlier decode as 0 and one sector later as 0
+sdhci geometry: OK
+```
+
+闸门真的**跑**了模型一遍：写满一整窗 1217 扇区、再拿读卡用的 `scripts/read-clover-log.py` 解回来，判 (slot, seq) 环绕、word 9 的 boot id、at-bound 控制行、带一枚 tab 与两枚高位字的那行，以及一枚早两扇区的控制（必须什么都找不到）。
+
+**③ 七件本轮查出的事，各自的分母在改动之前的归档读数里量**
+
+板上四件：
+
+1. **中转积压数错了对象**：probe 中继的 `dropped=` 数的是 `seq >= kProbeSlots`——**位置**，不是积压；而 §Round304 把它登记成「两次 flush 之间被覆盖的槽」。575 枚归档 probe 行里最大 `seen=62`（槽 64），`dropped` 每一枚都是 0 ⇒ **潜伏**，不撤回任何过去的读数。规则现在是 `sdhci_relay_overwrote_unconsumed()`。
+2. **超长内核行是被切碎，不是被截断**：越过 320 字节界的那一行会**吃掉缓冲满时刚到的那一枚字节**，并把剩下的当第二行装配——而 allowlist 一声不响地把第二行丢掉；常量自己的注释写的却是「截断」。104,819 枚归档 kind-22 记录里 **631 枚 `body` 恰为 320** ⇒ **这一支是活的**：历史上被当完整消息读的那一半，其实是丢了一个字节的碎片。规则搬进 `sdhci_tee_feed()`，普查行加 `cut=` 与 `bound=`。
+3. **和数在过滤之前算**：写手按到达顺序累加文本、却把过滤之后的字节存进卡，所以**一枚控制字节就足以让一整枚记录变成「没人信的记录」**。106 扇可用窗口、6,714 枚驱动环 + 54,272 枚内核环记录：**0 处不符** ⇒ 潜伏。和数现在跑在存下来的字节上。
+4. **`panicAppendText` 把十字、480 界与同一枚和数在离环路径几千行之外又打了一遍**：同一批窗口里 1,686 枚 kind-20 记录，0 处不符、0 枚被过滤字节 ⇒ 潜伏，**而且抽层时没有任何一条腿走到那儿**。这一枚是由「为抓它而写的禁则」找到的——闸门替本轮干了活。该路径现在调 `sdhci_build_panic_header()`。
+
+仪器侧三件：
+
+5. **几何表是从散文里读的**：`test-clover-sdhci-geometry.py` 用无锚 `re.search` 解析环表，而它搜的那段文本上两行就有一句**重述这张表的注释**。只改声明而不动注释，读数照旧——腿报「三方一致」，判的是一句话。由 N36 当场逼出（**红了，但不为自己红**：闸门因自己的存在性针脚失败，几何脚本却全绿）。改法：锚到声明那一行本身，另加 N54「拆掉锚 + 只动注释」两支编辑，红才意味着腿读了一句散文；顺带把闸门红线的文件名改成它真正搜过的那件（红线写着 `.cpp`，人却被送去一件什么都没有的文件）。
+6. **读者与写手的字节集是两套**：`text_of` 保留 `0x09 <= byte < 0x7f`，写手保留换行与可打印 ASCII——读者把 **22 枚控制字节**（`0x09` 与 `0x0b..0x1f`）当成原文呈现，而它自己的 docstring 说的是「补空格」。**在盘上的读数没有一枚变**：91 枚整窗归档（53,785 枚解出的记录）里，**0 枚存下来的 body 含受影响集合中的字节**，0 条文本改样——这枚改的是读者**被允许说什么**，不是卡上有什么。判法换成 `case keepset` 的掩码比对（行为），另加对旧表达式的禁则（形状）与 N55/N56/N57 三支各判一条腿。
+7. **抽层留下了一枚没人读的局部变量**：`ringWriteRecord` 里 `const uint32_t body = sdhci_record_body (length);` 搬完算术就成了死值，本轮第一次构建**停在 archive 11 的 `-Werror,-Wunused-variable`**，而上面每一条腿全绿。原因是**这颗板上文件的翻译单位既不被闸门编译、也不被几何脚本编译**（模型只编译层与模型自己）。处置分三块：删掉那枚局部；几何脚本加腿 4b（每一枚 `const T name = sdhci_* (...);` 必须在**声明它的那个块**里被再读到，按大括号深度归属、括号不闭合就判红而不猜），闸门要求它印出的分母，`check-clover.py` 里那条 `sdhci_record_body (` 的调用针脚**撤掉**（它的界如今只有一个家，驱动再调一次就是禁则要反的第四份抄件——可达性由那两枚 builder 出口针脚继续承载）；N58/N59 两支分别判「局部留下」与「腿不再印它扫了什么」。
+
+**④ 仪器的自我纠正（三处，形状属第二十八/三十一层）**
+
+1. **N55 第一次红了，但不为自己红**：改完读者字节集后，这支变异判红、闸门却先在另一条针脚上失败。查下去发现**是本轮比较自己的 bug**：模型印 `keepmask` 是先印 mask[0]（管输入 0..7 那一枚），`int(hexc, 16)` 却把它放到了整数的最高位——**按位镜像**，于是 xor 的 popcount 报成 191（真实 1）。改成 `int.from_bytes(..., 'little')` 并在注释里点名这枚错法，N55 才开始为自己红。**教训：掩码也是一种数，读它的约定必须和写它的约定同源。**
+2. **读者的自检行抛裸 `AssertionError`**：第一处红来自 `read-clover-log.py --selftest`，它把一枚记录元组摔在闸门脸上（第三十一层：仪器崩溃≠仪器报错，负测会「红得对但不为它自己红」）。现在那句 assert 印一句**点名这枚字节规则**的话，并指出整套 256 输入由 `test-clover-sdhci.py` 的 keepset 腿判。
+3. **说明禁则的文字含被禁的串**：把 `0x09 <= byte < 0x7F` 抄进错误消息，闸门第一次跑就红在自己逐字引用被禁句子的那行——被禁的东西恰好只有写在注释里才说得清。改法是把引用换成**描述**（「still keeps 0x09 and 0x0b through 0x1f」），这也是本轮第二次撞上第二十三层那一格。
+
+**⑤ 落地与实测**
+
+- 板上代码：`SdhciLogCore.h` 新（375 行），`CloverSdhci.cpp` 10140 → 10083 行；`tests/clover_sdhci_host.cpp` 新（669 行），`scripts/test-clover-sdhci.py` 新（424 行）。十枚字的位置、两环 kind、480/320 两枚界、窗口几何**一字未动**，`CloverSdhci r175: tee seen=…` 普查行仍走同一 token、只在尾部追加 `cut=` 与 `bound=`（§Round304 的字节可比性不破）。
+- 产物：`round341-kernel-amfi.macho` `d2b2a030e0a08b05…`，normalized `f6aeb92dbf3360c5…`，`round341-v0.7.59-payload.img` 58,720,256 B sha256 `a733c3293c1c932de0699f86fe184997ad4f436be6f8920930253d02c510596d`；prelink `7bda4ee1…`。`verify-clover-payload.py` EXIT=0（title ok / kernel ok / deadline ok）。
+- **本轮是哈希轮**：与 r339 那枚镜像并排比 Mach-O 分节，实测 `__TEXT,__text` 8,612,312 → 8,612,528（**+216 B**）、`__cstring` **+16 B**（新的两列 `cut=%u bound=%u`）。本轮改了板上算术与普查行，所以不像 r340 那样声明「哈希不动」——**这句是量出来的，不是推的**。
+- 闸门：仓库侧 `check-clover.py` EXIT=0，重装配树后树侧 EXIT=0；负测 59 支 0 problem（N53 那条「层不在盘上」为 NOT-TESTED-类例外保留了原形状，本轮没有把任何一支判成通过而实为未测）。
+
+**⑥ 边界：本轮证不出什么**
+
+- 上面七个分母全部来自**改动之前的归档读数**——它们说的是「过去的读数里有没有被这些缺陷污染的痕迹」，不是「卡上现在有什么」。2 号是唯一一枚在归档里看得见痕迹的（631/104,819 枚 `body=320`），本轮**没有**声称知道这 631 枚各丢了哪一枚字节；`cut=` 从下一个带这枚字段的靴子起才开始数。
+- 本轮写这一段时板还在 EDL；**同一轮里板子自己回到了 fastboot，boot 120 的卡已经读回**，读数与六支判据的处置单独立在下面的 §Round339 读数（boot 120）一节，#722 由此关闭。那两列 `cut=`/`bound=` 与 `keepmask` 的对照仍属**下一枚带回的卡才判得动**的仪器（boot 120 跑的是 v0.7.56，不带这两列）。
+- 纯层的 13 例满载跑覆盖的是环与装配的**算术**，不含寄存器时序、卡重初始化与 IOKit 生命周期——那部分仍然只有上机才答得出，本轮不声称搬过去了。
+
+## Round339 读数（boot 120 的卡于 round341 这趟读回：六支判据里四支一起缺席，而缺席的原因是量出来的，不是推的）
+
+**① 怎么读的，以及为什么这趟不算刷写。** 板子自己离开了 EDL，回到 fastboot（`fastboot devices` = `81ffcaaa`，`adb` 空答）。读回走 `./scripts/run-clover-unattended.sh --allow-misc-bcb --out ~/clover-out/round341-boot120-window.bin`：那条路只往 `misc` 写那枚 2048 字节的 BCB（`command=boot-recovery`），**不碰 `logdump`、不碰 `cache`**，所以 boot 120 那一靴的两环原样留在卡上。约 14 s 落 TWRP，`dd bs=512 count=1217` 取回 623,104 B，EXIT=0。产物 `round341-boot120-window.bin`（解码本 1942 行、`.timeline.txt` 7,370 B）。
+
+**② 卡上有什么。** 计数器（扇区 1216）报 **boot 120** ✓（读卡先看它，按 r293 的陈旧判定）。驱动区（扇区 64..191）64 枚槽**全是**本靴的：52 枚 kind-21 + 12 枚 kind-25，在场 `seq` 是 **4..67**。内核区 512 枚 kind-22 全 boot 120。报告区 16 枚，最晚的 panic-20 属 boot 60，死线记录属 **boot 108**（t=1805026 ms）；两枚 panic marker 都判 **STALE**（boot 111 与 boot 87）。最后四笔写落在槽 0..3：`seq 64`、`65` = `clover r331: bbsend hop=1/hop=2`（`t=620 pid=58`，六枚 hop 全 `scan=xlate hits=0 probed=0 walked=0 cand=3 debt=3`），`seq 66` = `clover r308: smp-pre ... reg=8 start=7 run=8`，`seq 67` = `CloverSdhci r307: probe why=tail calls=132615`。⇒ 本靴结束在「pid 58 的 hop 扫描」里，与宿主时间线夹出的 722–726 s 复位同向。flight：12 枚 entry 记录（`seq 132623..132634`，最新 t=608326 ms）、4 枚 beat（最新 `seq 94`，t=594108 ms，与最新 entry 差 14,218 ms），全部 boot 120 所写。
+
+**③ §Round339 ② 六支逐支的处置。**
+
+- **M-A：仍空判，而卡把「为什么空」钉住了。** 判据的主语是「1800 s 死线到点之后落哪一型」。本靴**没写死线记录**（卡上那枚是 boot 108 的），**两枚 panic marker 皆 STALE** ⇒ 复位既没到死线、也没进 panic 落盘通路，与 r339b 的 722–726 s 夹值一致。⇒ C（`kRestartBootloader = 0x77665500`）继续既没证实也没证伪，「若落进 fastboot/EDL 就撤销 C」那支的撤销条件留在原位等下一次死线。
+- **M-B / M-C / M-E：三支一起缺席**——`clover r339: mark` 0 枚、`clover r339: beatctl` 0 枚、`clover r283: last reset`（named 与 unnamed 两支一起）0 枚。M-C 预登记的第三支（「0 枚 `beatctl` ⇒ 仪器缺陷，先查 `sdhciSay` 环与预算，不许读成心跳没跑」）当场成立；原因见 ④，它既不是环满也不是预算，是**槽号算术**。按第二十四层记空判，不记成通过也不记成失败。
+- **M-D：结构上同样读不到。** 它要判的正是本靴那条 `clover r283` 行（读回来的是上一靴写进 IMEM 的记录），而那枚行在缺席三行里。预登记「同靴判不了跨靴、留给下一次读回」仍然成立，但本轮要把它改口改到位：**不修 ④ 那一格，M-D 在任何一枚活过 68 笔驱动写的靴子上都判不成**——boot 121 极可能还是这样（预登记在 ⑥）。
+- **M-F：已成立**（不经板子：`agreement check: … 1 of 1 rows` + 负测 N20 换回 `0x77665501` 判红，§Round339 ⑤）。
+
+**④ 缺席的原因：一次性读数被同一靴的周期性写盖掉，而槽号就是这件事的算术。** `sdhci_ring_slot()` 是 `cursor % kRingCardSlots[which]`（`drivers/CloverSdhci/SdhciLogCore.h:229`，驱动环那一档是 64，`:120`），而 `ringWriteRecord()` 里 `gRingCursor[which]` 与 `gRingSeq[which]` 每笔**成功**写各 +1（`drivers/CloverSdhci/CloverSdhci.cpp:3882-3883`，两枚字在 `:3866` 一起进表头）⇒ 一靴之内 **`slot == seq % 64`**。那三行都出自 `clover_unattended_begin()` 的 `sdhciSay`（`:9969` named、`:9982` unnamed、`:10007` beatctl、`:10024` mark），而这枚函数由 `drivers/CloverPMGR/CloverPMGR.cpp:254` 调用，排在 `clover_emmc_run()` **之前**（开机次序写在 `notes/unixnu-doc-conformance.md:110`）——那时卡还没上膛，行只进 RAM 暂存环（`kRingRamSlots = 128`，`SdhciLogCore.h:119`），上膛之后按序补写，于是它们就是本靴的 **`seq 0..2`、槽 0..2**。卡上在场的 `seq` 是 4..67：**68 笔成功写、64 枚槽 ⇒ 第 65..68 笔（`seq 64..67`）恰好落回槽 0..3**。所以缺席的不是「没写」，是「写了，被本靴自己最后四笔盖掉」。
+   分母来自 96 份能解出驱动环的在盘归档窗口（脚本当场数 `seq` 与行的在场，不来自记性）：
+   - 环**转过**的 **50 份**（本靴最大 `seq ≥ 64`）：`clover r283` 行在场 **0 / 50**；
+   - 环**没转**的 **46 份**：在场 **31**；其余 15 份的 boot 号是 3..70，那正是这枚行还不能进环的年代（驱动环副本随 round284 才加，boot 70 跑的是 round283 那一支）。
+   两个方向都干净：**「这行缺席」与「这一靴的驱动环转过一圈」在 96 份里同真同假**。这枚就是第二十一层那句「每个计数都要与它的探测范围并排印」在这一格的样子——`slots=64` 不是容量上限，是**这一靴的地平线**；而 `seq` 是卡上本来就有的、能自证地平线的第三枚字（`CloverSdhci r174: verdict ring armed … slots=64` 在旁边印着它自己的分母）。
+
+**⑤ 同一趟顺带读到的主线证据（桌面那一格，boot 120）**
+
+- 五枚 `clover r335: bbswap`：t=583.608 `opt=80000003 ret=0 arg=0 done=0`（这是那支查询跑通的正对照）→ 587.289 `opt=1 ret=0 arg=1 done=1` → 587.290 `opt=80000000 ret=e00002d5 … cur=0 list=0 pw=1 ps=0 sent=0 gap=1 pair=again` → 594.348 `opt=80000001 ret=0 arg=2 done=2` → 618.110 `opt=80000000 ret=e00002d5 … gap=23765 pair=again`。**latch 从 `arg=1` 走到 `arg=2`，而 `cur=0`/`list=0` 全程不动**，两次失败都落在 `0x80000000` 这一档——与 boot 119（§Round335 读数）同形，第二靴复现。`gap=` 那一列继续按第二十五层的口径读：`done=` 相邻两次调用之间的间隔，一枚 1 ms、一枚 23,765 ms，都不是「等待时长」。
+- `clover r329: dispstate` 最后一枚（t=594.320）：`fires=23 seen=4 client=pid58 calls=26 fails=16 grew=17 hot=6:3/1/e00002d5 s6=1 80000000 0 -> e00002d5 done=2 presented=2 frames=2 log=47/96 logdrop=0` ⇒ 厂商那句 `selector 6 1 80000000 0 -> e00002d5` 在卡上第二次逐字复现；桌面这靴到 `presented=2`（boot 116 曾印 `12`）。`client=` 仍选的是 pid 58，那格欠的处置没变（#695）。
+- boot 120 的 `CloverSdhci r175: tee …` 普查行 12 枚（正好是 `kTeeCensusMax = 12` 那一档），最后一枚 `seq 45`：`seen=2950 kept=668 throttled=59 lap=5 idx=38137 size=131072`，**没有 `cut=`/`bound=`**。按第九层那句「新字段要说出哪代镜像带着它」：boot 120 跑的是 v0.7.56，那两列从 boot 121 才开始数。
+
+**⑤b 纯层与真机并排（README 那行欠的，本轮结掉）。** 判法用**同一把尺子量两枚产物**：`importlib` 载入 `scripts/read-clover-log.py`，对模型的 `build/clover-sdhci-host/r341-window.bin` 与卡上的 `round341-boot120-window.bin` 各跑 `decode()` 三个区域（report / 驱动区 / 内核区，都按读者自己的 `VERDICT_OFFSET=64`、`KERNEL_OFFSET=192`、`BOOT_OFFSET=1216`）：
+
+| 列 | 模型的窗口 | boot 120 的卡 | 读法 |
+|---|---|---|---|
+| 驱动区解出的记录 | 64 | 64 | 两环都**填满**——这是「模型写的窗口形状＝卡上被读的窗口形状」那一列 |
+| 驱动区 header 问题数 | 0 | 0 | lba / slot 字 / total / sum / prefix / 换行逐枚核过，两边都无一枚不一致 |
+| 驱动区 kinds | `{21: 64}` | `{21: 52, 25: 12}` | **唯一不相等的那一列，而且原因已知**：中转（kind 25）与驱动判据共用同一枚游标（`ringWriteRecord` 的 `which` 是环不是生产者），模型的 `window` 例只灌 kind 21。这一列不许相等，要的是它把 ④ 说的那件事写进同一张表 |
+| 内核区解出的记录 | 512 | 512 | 满了，且问题数 0 / 0 |
+| 本窗口最大 `seq` | 70 | 67 | **两边都转过了圈**（≥64）——④ 那格不是卡特有的，模型自己也复现了它，所以这条地平线属算术，不属这颗卡 |
+| 归属 boot | 341（全部槽） | 120（全部槽） | 一枚窗口＝一靴，没有混进别靴的槽（报告区除外：模型只写 1 枚，卡上 16 枚是跨靴攒下来的，那一区按前进扫描选槽，本来就不是一靴一圈） |
+| 计数器记录 | boot 341 | boot 120 | `decode_boot` 两处都解出且 `problems=[]`（第一遍我把基址传成了 `F+BOOT_OFFSET`，那枚 `lba != 13322648` 是**读法错**，不是产物错——按第二十二层，先分清红的是判据还是这台机器） |
+
+⇒ README 的 CloverSdhci 那一行「欠一次真机并排」由这七列替掉：除 kinds 那一列（原因写在旁边）之外逐列相等，且两枚产物都自己证明了「转过圈的一次性读数读不到」。
+
+
+**⑥ 下一手（r342 的板上手）：一次性读数要有周期性写够不着的家。** 候选两条：把快照存进静态数组、节拍上重发原字（r319 那一手），或**把驱动环的前几枚槽钉住**、周期性写只在剩下的槽里转。选后者，理由是它不新增环压力、也不改变任何已有行的文本：驱动区 `[64,192)` 这枚**区域**不变，所以 r340/r341 的铺砖腿与窗口算术**不破**，变的只是区域内部的划分——`slot` 的算法分两支（钉住支按行号，滚动支 `floor + cursor % (64 - floor)`），`seq` 与 `slot` 从此不再同余（这条要写进读者侧，因为它现在拿 `(slot, seq)` 判环绕）。判据先登记：
+   - 钉住的枚数是**一枚数、三个家**（层、读者、闸门），按第三十二层要一支「只改散文不改声明」的负测；
+   - 负测三支：把某枚一次性行放回滚动支（它必须被后来的写盖掉，红）、把滚动写的上界抬高到吃进钉住的槽（红）、拆掉读者 `(slot,seq)` 判据里那条同余假设（红）；
+   - 落地后 boot 122 的卡上，`clover r283` / `r339: beatctl` / `r339: mark` 三行必须**同时在场**——这既是 ④ 的正对照，也是 §Round339 的 M-B/M-C/M-E 第一次真正判得动的那次读回；M-D 同靴判不了，继续留给 123。
+   - **预登记 boot 121（r341 那枚镜像，控制轮）**：它同样会转圈，所以 M-D/④ 那三行**预期仍然缺席**；若在没上这手仪器之前它们反而在场，说明本靴的驱动写不足 64 笔，那就回头核 `seq` 的最大值，不许把「在场」读成「修好了」。
+
+**⑦ 边界。** 本轮没有板上行为改变（r341 之后仓库只动文档）。上面 ④ 的分母说的是「过去的归档里这行在场与否」，不是「卡上现在有什么」；boot 120 的 IMEM 记录本身本轮没读到，也不可能在读回通路上读到——那格属板上通路，属 boot 122。
+

@@ -273,9 +273,15 @@ def decode_boot(data, first_lba):
 
 
 def text_of(content):
-    """The body as text. The writer stores one space for control bytes, so this is
-    already printable, but a byte outside ASCII is replaced instead of guessed."""
-    return bytes(byte if 0x09 <= byte < 0x7F else 0x2E for byte in content).decode("ascii")
+    """The body as text, filtered by exactly the rule that wrote it.
+
+    sdhci_record_byte keeps a newline and printable ASCII and stores a '.' for everything else, so a
+    byte outside that set cannot be on the card; anything this function kept anyway would be presented
+    as original text the writer never stored. scripts/test-clover-sdhci.py's keepset leg compares this
+    against the mask the host model reads out of that layer function, so the two sets cannot drift
+    apart again with only a docstring to notice.
+    """
+    return bytes(byte if byte == 0x0A or 0x20 <= byte < 0x7F else 0x2E for byte in content).decode("ascii")
 
 
 def of_kind(records, kinds):
@@ -883,10 +889,20 @@ def selftest():
     dump += build_record(19, 0, first_lba, "bring-up report", boot=boot_id)
     dump += build_record(20, 1, first_lba + 2, "panic line", boot=boot_id)
     dump += bytes((VERDICT_OFFSET - 4) * SECTOR)          # gap before the driver ring: not records
+    # Round341: the tee's state row is built from the driver's own format literal, the way round330
+    # built the display row. Round341 appended two columns to it (cut= and bound=), and a sample typed
+    # here would have kept reading the six-column row the board stopped printing this round.
+    sdhci_path = Path(__file__).resolve().parents[1] / "drivers/CloverSdhci/CloverSdhci.cpp"
+    sdhci_src = sdhci_path.read_text()
+    tee_row = fill_conversions(joined_literal(sdhci_src, '"CloverSdhci r175: tee seen='))
+    assert "%" not in tee_row, tee_row
+    assert tee_row.endswith("\n"), tee_row
+    for column in ("cut=", "bound="):
+        assert column in tee_row, (column, tee_row)
     driver_lines = ["CloverSdhci r174: verdict ring armed lba=13320280 slots=64",
                     "CloverSdhci r176: kernel ring armed lba=13320408 slots=512",
                     "CloverSdhci r166: readcheck lba=13320216 sample=32 trusted=1",
-                    "CloverSdhci r175: tee seen=512 kept=300 throttled=12 lap=0 idx=8192 size=65536",
+                    tee_row[:-1],
                     "CloverSdhci r169: block guard waited 31 ms"]
     for index, line in enumerate(driver_lines):
         # Slots 0..4 with seq 5..9: a ring that wrapped, so slot order is not time order.
@@ -941,7 +957,9 @@ def selftest():
     assert [r[1]["kind"] for r in reports] == [19, 20], reports
     assert all(not r[3] for r in reports), reports
     assert all(r[1]["boot"] == boot_id for r in reports), reports
-    assert text_of(reports[0][2]) == "bring-up report", reports[0]
+    assert text_of(reports[0][2]) == "bring-up report", (
+        f"text_of rewrote a byte the writer stores as itself: {reports[0][2]!r} reads back as "
+        f"{text_of(reports[0][2])!r}; scripts/test-clover-sdhci.py's keepset leg names the whole set")
 
     def ring(slots, base, expect_kind):
         return sorted(decode(data, first_lba, slots=slots, base_sector=base,

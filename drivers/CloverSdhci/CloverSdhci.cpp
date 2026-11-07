@@ -243,6 +243,12 @@
 // them. Reading the pair here, in the writer, is what turns the difference into a measurement.
 #include <kern/clock.h>
 #include "SdhciRegs.h"
+// Round341: the record layer -- the window's geometry, the record's arithmetic, the staging rings'
+// policy and the kernel line assembler's bounds live there so a host can drive them without a card
+// (drivers/CloverSdhci/SdhciLogCore.h, scripts/test-clover-sdhci.py). This file has no copy of any of
+// those numbers; scripts/test-clover-sdhci-geometry.py compares that file against the reader and the
+// unattended dd, and refuses the tree when the three disagree.
+#include "SdhciLogCore.h"
 
 extern "C" {
 // Raw readings, for the offline decoder and for any later panic screen line. The order is
@@ -435,14 +441,9 @@ static const uint32_t kBcbBlocks = 2;   // command/status/recovery/stage fit in 
 // what a previous one wrote, without writing anything itself. Mode 19 appends: slot k is two
 // blocks at 2k, and the scan stops at the first header without the magic, so each boot's record
 // lands beside the last one instead of on top of it.
-static const char kLogPrefix[] = "unixnu clover emmc log\n";
-static const uint32_t kLogPrefixLength = sizeof (kLogPrefix) - 1;
-// Mode 19 treats logfs start as a sequence of fixed two-block slots: header at 2k, text at 2k+1.
-// The scan is bounded, so a partition whose slots are all taken reports "ap f=" instead of
-// quietly wrapping onto the oldest record.
-static const uint32_t kLogMagic0 = 0x554e5855u;
-static const uint32_t kLogMagic1 = 0x31474f4cu;
-static const uint32_t kLogSlots = 16;
+//
+// The prefix, both magic words and kLogSlots are declared in SdhciLogCore.h (round341), together with
+// the ten header positions this file now fills by name instead of by index.
 // Round174: the verdict ring. Every round since r165 has had the same ending -- the one line that
 // decides the next round was on the screen for a moment and then scrolled off, so a frame came back
 // with `disk5: general error` but not `write cache ... off=`, or with the panic but not the
@@ -470,26 +471,14 @@ static const uint32_t kLogSlots = 16;
 // the tee's state lines are still said there), and the kernel log gets a ring of its own 512 records
 // deep at sector 192. A whole boot's allowlisted kernel text is a few hundred lines, which fits;
 // the driver's readings cannot be pushed out of them any more, and the host reads both with one dd.
-static const uint32_t kRingDriver = 0;   // what CloverSdhci measured (round174's ring)
-static const uint32_t kRingKernel = 1;   // what the kernel said (round175's tee, round176's ring)
-static const uint32_t kRingCount = 2;
-static const uint32_t kVerdictTextBytes = 320;
-static const uint32_t kRingRamSlots = 128;   // staging depth: deeper than the driver's card ring, shallower than the kernel's
-static const uint32_t kRingCardSlots[kRingCount] = {64, 512};
-static const uint32_t kRingOffset[kRingCount] = {64, 192};   // sectors past logfs start
-// Round212: the boot id's home, one record past the kernel ring (sector 1216). It is not part of
-// either ring: it is rewritten in place once per boot, before any record that carries its number,
-// and the host reads it in the same dd window that reads the rings.
-static const uint32_t kBootRecordOffset = 192 + 2 * 512;
-static const uint32_t kBootKind = 24;
-// Round212: the probe ring's records keep a kind of their own. They share the driver ring's card
-// slots -- 64 records of two blocks -- but not its origin: a kind-21 row is a line the driver said,
-// and telling the host which of the two RAM rings it came from is the difference between "the
-// kernel read this out of msgbuf" and "the kernel wrote this into our BSS before it died".
-static const uint32_t kProbeKind = 25;
-// Records flushed per guarded pass, per ring. Two block writes each, and a flush must not hold the
-// guard long: eight is 16 writes, which at the round159 rates is a few milliseconds.
-static const uint32_t kRingFlushPerPass[kRingCount] = {4, 8};
+// The rings' geometry -- which ring is which, how deep the staging rings are, how many records each
+// card ring holds, where each starts in the window, how many records one guarded pass flushes, where
+// the boot record sits (round212: one record past the kernel ring, sector 1216, rewritten in place once
+// per boot before any record carries its number), and which kind word says which producer (a kind-21
+// row is a line the driver said, a kind-25 row is one the kernel wrote into our BSS before it died) --
+// is declared once in SdhciLogCore.h (round341) and compared there against scripts/read-clover-log.py
+// and the unattended dd by scripts/test-clover-sdhci-geometry.py (round340). What stays here is the
+// state the rings own.
 static char gRingText[kRingCount][kRingRamSlots][kVerdictTextBytes];
 static uint32_t gRingLength[kRingCount][kRingRamSlots];
 static uint32_t gVerdictFirst = 0;       // the logfs window's first LBA; both rings live in it
@@ -518,9 +507,8 @@ static uint32_t gBootId = 0;
 // last and compared on read, so a drain that races a writer skips the one record rather than
 // writing half of it. Round228 doubles the ring from 32: r228's dump adds four lines per kill, and
 // one generation's kill can now carry r207/r208/r211/r226 plus three generations' dumps before a
-// drain runs.
-static const uint32_t kProbeSlots = 64;
-static const uint32_t kProbeTextBytes = 256;
+// drain runs. kProbeSlots and kProbeTextBytes are declared in SdhciLogCore.h (round341), next to the
+// predicate that decides whether a hand-out still has an unread row in front of it.
 static char gProbeText[kProbeSlots][kProbeTextBytes];
 static uint32_t gProbeArm[kProbeSlots];   // slot number + 1; written after the text, read as a seal
 static volatile uint32_t gProbeSeq = 0;   // next slot number to hand out
@@ -631,19 +619,11 @@ static uint32_t probeWhySlot (const char *why)
 //
 // Gated on clover-unattended: a shipped boot pays nothing for a diagnostic this driver does not
 // need after the port reaches the desktop.
-static const uint32_t kFlightEntryOffset = 32;   // sectors past logfs start; 12 one-block records
-static const uint32_t kFlightEntrySlots = 12;
-static const uint32_t kFlightBeatOffset = 56;    // four one-block records, 4 s apart
-static const uint32_t kFlightBeatSlots = 4;
 // Round236: the two sectors the beat leaves unused. The deadline record is written from the timer
 // interrupt before panic(), so the fact that the deadline fired reaches the card even when the panic
 // sink cannot (boot 24's frame: no kind-20 record, empty BCB, and the card busy recovering). The
 // panic marker is written on both sides of the report append, so an empty report window names the
 // gate that refused instead of leaving a silence that looks like a card failure.
-static const uint32_t kFlightDeadlineOffset = 60; // one record, one write, once per boot
-static const uint32_t kFlightDeadlineSlots = 1;
-static const uint32_t kFlightPanicOffset = 61;    // enter and exit, one sector each
-static const uint32_t kFlightPanicSlots = 2;
 // Round302: boot 91's panic slot is a hybrid -- event/dir 5/3 with eight extras that were never
 // written, while the same record's header names a live 8-block request from osanalyt, and boot 88
 // carries the identical shape. That is only reachable because every flight event builds its record
@@ -660,8 +640,10 @@ static const uint32_t kFlightPanicSlots = 2;
 // the slot count, the window base computed once), and it is what this append has never done:
 // panicAppendText() reads all sixteen report slots before writing one of them, and boot 90 lost its
 // sentence exactly there (append_rc=2 on that read, one attempt, no retry).
-static const uint32_t kFlightTextOffset = 44;     // twelve one-block records, one per boot
-static const uint32_t kFlightTextSlots = 12;
+// The flight region's geometry -- where each of its six record kinds starts in the window and how many
+// slots each owns, plus kFlightKind and the marker magic -- is declared in SdhciLogCore.h (round341)
+// and compared there against the reader and the unattended dd (scripts/test-clover-sdhci-geometry.py).
+// What stays here is the vocabulary: which event a flight record names.
 static const uint32_t kFlightEventText = 6;
 /*
  * Round309: the one sector 32..63 still without an owner becomes the drain's own first breath.
@@ -674,11 +656,7 @@ static const uint32_t kFlightEventText = 6;
  * never got here shows the previous boot's record, and the decoder is told to say STALE rather than
  * to print it as this ending.
  */
-static const uint32_t kFlightDrainOffset = 63;    // one record, written before the drain's own gates
-static const uint32_t kFlightDrainSlots = 1;
 static const uint32_t kFlightEventDrainIn = 7;
-static const uint32_t kFlightMarkerMagic = 0x434C564Du;   // 'CLVM', the flight verdict magic
-static const uint32_t kFlightKind = 23;
 static const uint32_t kFlightEventRead = 1;
 static const uint32_t kFlightEventWrite = 2;
 static const uint32_t kFlightEventBeat = 3;
@@ -1346,6 +1324,15 @@ static volatile uint32_t gTeeReady = 0;         // arms round176's kernel-log ri
 static uint32_t gTeeIndex = 0;                  // next byte of msgbuf to consume
 static uintptr_t gTeeBuffer = 0;                // msg_bufc the cursor belongs to
 static uint32_t gTeePartial = 0;                // bytes held for a line that has not ended yet
+// Round341: a kernel line longer than one record is truncated, and both halves of that fact have to
+// reach the card. `gTeeTruncated` is the assembler's one-bit state (the line in progress has already
+// filled a record, so everything up to its newline is discarded); `gTeeCut` counts the lines that were
+// truncated, which is what separates "this row is the whole message" from "this row is its first 320
+// bytes" for a reader that has no other evidence. Before this round the discarded remainder left no
+// trace at all: the row was counted in `kept=` and the tail only lived on in `seen=` minus `kept=`,
+// which cannot say which of the ring's rows it touched.
+static uint32_t gTeeTruncated = 0;              // the line in progress already filled a record
+static uint32_t gTeeCut = 0;                    // kernel lines truncated to one record's text
 static char gTeeLine[kTeeLineBytes];
 static uint32_t gTeeSeen = 0;                   // complete lines examined
 static uint32_t gTeeKept = 0;                   // lines put into the ring
@@ -2019,8 +2006,11 @@ static void cmd13Sweep (void)
 static const uint32_t kEmmcOcr = 0x40FF8080;
 static const uint32_t kIdentifyDivider = 255;
 static const uint32_t kCmd1Retries = 200;
-// One 512-byte block is 128 32-bit FIFO words; the buffer register is 32-bit access only.
-static const uint32_t kBlockWords = 128;
+// One 512-byte block is 128 32-bit FIFO words; the buffer register is 32-bit access only. Round341:
+// the count comes from the record layer's sector size (SdhciLogCore.h's sdhciLogSectorBytes), because
+// the sector the FIFO moves and the sector a record header occupies are the same 512 bytes and must
+// not be able to disagree about it.
+static const uint32_t kBlockWords = sdhciLogBlockWords;
 // Round156: how many blocks one CMD18 asks for. It used to be 32 -- 16 KiB, small enough that the
 // FIFO drain stays inside a single deadline. Round171 raises it to 128 once the batch is usable:
 // the r169 and r170 frames show the batch never being trusted, so every read runs the single-block
@@ -3779,14 +3769,14 @@ static void ringPush (uint32_t which, const char *line, uint32_t length)
   if (length > kVerdictTextBytes) {
     length = kVerdictTextBytes;
   }
-  if (gRingPending[which] == kRingRamSlots) {
+  if (sdhci_ram_full (gRingPending[which])) {
     // Full: the oldest unread line gives its slot to the newest one. Which reading was dropped is
     // counted, so a frame whose ring wrapped says so instead of looking like a quiet boot.
     gRingWrite[which]++;
     gRingPending[which]--;
     gRingDropped[which]++;
   }
-  const uint32_t slot = gRingWrite[which] % kRingRamSlots;
+  const uint32_t slot = sdhci_ram_slot (gRingWrite[which]);
   for (uint32_t i = 0; i < length; i++) {
     gRingText[which][slot][i] = line[i];
   }
@@ -3841,7 +3831,13 @@ extern "C" unsigned int clover_emmc_probe_say (const char *text, unsigned int le
   }
   const uint32_t seq = __atomic_fetch_add (&gProbeSeq, 1u, __ATOMIC_RELAXED);
   const uint32_t slot = seq % kProbeSlots;
-  if (seq >= kProbeSlots) {
+  // Round341: this count is a backlog, not a position. What was here was `seq >= kProbeSlots` -- true
+  // of every hand-out after the ring's sixty-fourth whatever the consumers did, including the beat and
+  // the block tails round304 added precisely so the relay does not have to wait for a panic. The field
+  // has always been read, and documented, as "a row was overwritten before anything drained it", and
+  // only the distance to the consume cursor can say that.
+  if (sdhci_relay_overwrote_unconsumed (seq,
+        static_cast<uint32_t> (__atomic_load_n (&gProbeNext, __ATOMIC_RELAXED)))) {
     __atomic_fetch_add (&gProbeDropped, 1u, __ATOMIC_RELAXED);
   }
   for (uint32_t i = 0; i < length; i++) {
@@ -3862,56 +3858,23 @@ extern "C" unsigned int clover_emmc_probe_say (const char *text, unsigned int le
 static bool ringWriteRecord (uint32_t which, const char *text, uint32_t length,
                              uint32_t kind = 0)
 {
-  const uint32_t body = length > 480 ? 480 : length;
-  const uint32_t total = kLogPrefixLength + body + 1;
-  uint32_t sum = 0;
-  for (uint32_t i = 0; i < kLogPrefixLength; i++) {
-    sum += static_cast<uint8_t> (kLogPrefix[i]);
-  }
-  for (uint32_t i = 0; i < body; i++) {
-    sum += static_cast<uint8_t> (text[i]);
-  }
-  sum += static_cast<uint8_t> ('\n');
-
-  const uint32_t lba = gVerdictFirst + kRingOffset[which] +
-                       2 * (gRingCursor[which] % kRingCardSlots[which]);
+  const uint32_t lba = sdhci_ring_lba (gVerdictFirst, which, gRingCursor[which]);
   uint32_t words = 0, status = 0;
   for (uint32_t i = 0; i < kBlockWords; i++) {
     gRingBlock[i] = 0;
   }
-  gRingBlock[0] = kLogMagic0;
-  gRingBlock[1] = kLogMagic1;
-  gRingBlock[2] = lba;
-  gRingBlock[3] = total;
-  gRingBlock[4] = sum;
-  gRingBlock[5] = kind ? kind : ((which == kRingKernel) ? 22 : 21);
-  gRingBlock[6] = body;
-  gRingBlock[7] = gRingCursor[which] % kRingCardSlots[which];
-  gRingBlock[8] = gRingSeq[which];
-  gRingBlock[9] = gBootId;
+  sdhci_build_header (gRingBlock, lba, which, gRingCursor[which], gRingSeq[which], gBootId,
+                      kind, text, length);
   uint32_t rsp = 0, rstatus = 0, polls = 0;
   // Round305: name the channel before writing it, so a refusal says which one (21 driver verdicts,
   // 22 the tee's kernel rows, 25 the relayed probe lines).
-  gPioAttempt = kind ? kind : ((which == kRingKernel) ? 22u : 21u);
+  gPioAttempt = sdhci_record_kind_word (kind, which);
   if (!writePioBlock (lba, gRingBlock, words, status)) {
     return false;
   }
   waitCardReady (rsp, rstatus, polls);
 
-  uint8_t *block = reinterpret_cast<uint8_t *> (gRingBlock);
-  for (uint32_t i = 0; i < 512; i++) {
-    block[i] = 0;
-  }
-  for (uint32_t i = 0; i < kLogPrefixLength; i++) {
-    block[i] = static_cast<uint8_t> (kLogPrefix[i]);
-  }
-  for (uint32_t i = 0; i < body; i++) {
-    uint8_t c = static_cast<uint8_t> (text[i]);
-    block[kLogPrefixLength + i] =
-        (c == '\n') ? static_cast<uint8_t> ('\n')
-                    : (c >= 0x20 && c < 0x7f) ? c : static_cast<uint8_t> ('.');
-  }
-  block[kLogPrefixLength + body] = '\n';
+  sdhci_build_text (reinterpret_cast<uint8_t *> (gRingBlock), text, length);
   if (!writePioBlock (lba + 1, gRingBlock, words, status)) {
     return false;
   }
@@ -3944,11 +3907,11 @@ static uint32_t bootIdClaim (uint32_t lba)
   for (uint32_t i = 0; i < kBlockWords; i++) {
     gRingBlock[i] = 0;
   }
-  gRingBlock[0] = kLogMagic0;
-  gRingBlock[1] = kLogMagic1;
-  gRingBlock[2] = lba;
-  gRingBlock[5] = kBootKind;
-  gRingBlock[9] = boot;
+  gRingBlock[kWordMagic0] = kLogMagic0;
+  gRingBlock[kWordMagic1] = kLogMagic1;
+  gRingBlock[kWordLba] = lba;
+  gRingBlock[kWordKind] = kBootKind;
+  gRingBlock[kWordBoot] = boot;
   gPioAttempt = 24;    // round305: the boot-id block is its own channel
   if (!writePioBlock (lba, gRingBlock, words, status)) {
     return boot;
@@ -4478,21 +4441,7 @@ static uint32_t gTeeNagKept[kTeeNagSources];
 // after a "[ <mono>]: " timestamp so different sources do not hash to their stamp's digits.
 static uint32_t teeStampSkip (const char *line, uint32_t length)
 {
-  if (!length || line[0] != '[') {
-    return 0;
-  }
-  uint32_t i = 0;
-  while (i < length && line[i] != ']') {
-    i++;
-  }
-  if (i >= length) {
-    return 0;
-  }
-  i++;
-  while (i < length && (line[i] == ':' || line[i] == ' ')) {
-    i++;
-  }
-  return i;
+  return sdhci_tee_stamp_skip (line, length);
 }
 
 // The value of comm=<name> in a line, as length bytes into `out`; zero if the line has no comm=
@@ -5023,6 +4972,7 @@ static void teeKernelLog (void)
               reinterpret_cast<void *> (gTeeBuffer), reinterpret_cast<void *> (base), index);
     index = 0;
     gTeePartial = 0;
+    gTeeTruncated = 0;
   }
   gTeeBuffer = base;
   if (index >= sizeu) {
@@ -5046,16 +4996,30 @@ static void teeKernelLog (void)
       index = 0;
     }
     scanned++;
-    if (c == '\n') {
-      teeConsumeLine (pushed);
-    } else if (gTeePartial < kTeeLineBytes) {
-      gTeeLine[gTeePartial] = c;
-      gTeePartial++;
-    } else {
-      // A line longer than a record: hand over what fits and start the next one. Splitting it would
-      // put half a message on the card twice, which reads like two different events.
-      teeConsumeLine (pushed);
-      gTeePartial = 0;
+    // Round341: the bound and its consequences are SdhciLogCore.h's sdhci_tee_feed, so the host model
+    // drives the same decision the board does. What it fixes is the overflow branch, which used to hand
+    // over the 320 bytes it had, drop the byte that arrived at the bound, and reset -- so the rest of
+    // the same kernel message assembled as a *second* row the allowlist then rejected, and one byte was
+    // destroyed with nothing on the card naming either fact.
+    switch (sdhci_tee_feed (static_cast<uint8_t> (c), gTeePartial, gTeeTruncated)) {
+      case kSdhciTeeStore:
+        gTeeLine[gTeePartial] = c;
+        gTeePartial++;
+        break;
+      case kSdhciTeeOverflow:
+        gTeeTruncated = 1;
+        break;
+      case kSdhciTeeEmitCut:
+        gTeeCut++;
+        teeConsumeLine (pushed);   // resets gTeePartial
+        gTeeTruncated = 0;
+        break;
+      case kSdhciTeeEmit:
+        teeConsumeLine (pushed);
+        gTeeTruncated = 0;
+        break;
+      default:
+        break;                     // kSdhciTeeDrop: a byte past the bound, or an empty line
     }
   }
   gTeeIndex = index;
@@ -5064,8 +5028,14 @@ static void teeKernelLog (void)
     gTeeNextReport = gTeeSeen + 256;
     if (gTeeCensus < kTeeCensusMax) {
       gTeeCensus++;
-      teeSay ("CloverSdhci r175: tee seen=%u kept=%u throttled=%u lap=%u idx=%u size=%u\n",
-                gTeeSeen, gTeeKept, gTeeThrottled, gTeeLap, gTeeIndex, sizeu);
+      // Round341 appends the truncation count, in front of nothing that was already here: a reader
+      // that cannot see which of the kernel ring's rows are whole messages cannot use them to decide
+      // whether a probe ran. `cut=` is the number, kVerdictTextBytes is the bound it was cut to, and
+      // both come out of the same layer that does the cutting.
+      teeSay ("CloverSdhci r175: tee seen=%u kept=%u throttled=%u lap=%u idx=%u size=%u"
+              " cut=%u bound=%u\n",
+                gTeeSeen, gTeeKept, gTeeThrottled, gTeeLap, gTeeIndex, sizeu,
+                gTeeCut, kVerdictTextBytes);
     }
   }
 }
@@ -9575,9 +9545,10 @@ static unsigned int panicMarkRecovery (void)
 // and gets a status instead of a reset. There is deliberately no read-back here: the next boot's
 // mode 20 is the reader, and a failure now must not hang the only screen this board has.
 //
-// Body is capped at 480 bytes so prefix + body + newline fits one block. Returns 100 + slot after
-// both blocks were written, or 1, 2, 4 or 5 naming the stage that refused. (3 used to mean "window
-// full"; round212 rotates instead, so it is never returned.)
+// Body is capped at SdhciLogCore.h's kRecordBodyBytes so prefix + body + newline fits one block, which
+// is the same clamp the two rings' records pass through and the reader's own ceiling check compares.
+// Returns 100 + slot after both blocks were written, or 1, 2, 4 or 5 naming the stage that refused.
+// (3 used to mean "window full"; round212 rotates instead, so it is never returned.)
 static unsigned int panicAppendText (const char *text, unsigned int length)
 {
   if (!gPanicLogReady || !gHost || !gPanicLogFirst || !text) {
@@ -9610,35 +9581,20 @@ static unsigned int panicAppendText (const char *text, unsigned int length)
   if (slot >= kLogSlots) {
     slot = minSeqSlot;
   }
-  if (length > 480) {
-    length = 480;
-  }
-  const uint32_t body = length;
-  const uint32_t total = kLogPrefixLength + body + 1;
-  uint32_t sum = 0;
-  for (uint32_t i = 0; i < kLogPrefixLength; i++) {
-    sum += static_cast<uint8_t> (kLogPrefix[i]);
-  }
-  for (uint32_t i = 0; i < body; i++) {
-    sum += static_cast<uint8_t> (text[i]);
-  }
-  sum += static_cast<uint8_t> ('\n');
-
+  // Round341: the record is SdhciLogCore.h's, words and all. This was the driver's second copy of the
+  // arithmetic -- its own clamp literal, its own prefix/body/newline sum over the bytes as they ARRIVE
+  // while the sector two blocks down holds them filtered -- which is the same divergence the ring path
+  // had and, unlike that one, was not found by reading the .cpp region this round's extraction touched.
+  // Measured before the change: 1,686 kind-20 records over the 106 archived windows, 0 sum mismatches,
+  // none storing a filtered byte, so no past panic reading is retracted.
   const uint32_t lba = gPanicLogFirst + 2 * slot;
+  // The builder fills the ten words the reader unpacks; the rest of this block keeps the value the last
+  // write left in it, which is what every earlier record of this window did with its own tail, so the
+  // sector is zeroed here as it was before the arithmetic moved.
   for (uint32_t i = 0; i < kBlockWords; i++) {
     gWriteBlock[i] = 0;
   }
-  gWriteBlock[0] = kLogMagic0;
-  gWriteBlock[1] = kLogMagic1;
-  gWriteBlock[2] = lba;
-  gWriteBlock[3] = total;
-  gWriteBlock[4] = sum;
-  gWriteBlock[5] = 20;   // written by the panic screen, not by a report pass
-  gWriteBlock[6] = body;
-  gWriteBlock[7] = slot;
-  gWriteBlock[8] = maxSeq + 1;   // this record's turn in the rotating window
-  gWriteBlock[9] = gBootId;
-
+  sdhci_build_panic_header (gWriteBlock, lba, slot, maxSeq + 1, gBootId, text, length);
   uint32_t rsp = 0, rstatus = 0, polls = 0;
   gPioAttempt = 20;    // round305: the panic screen's own sentence, kind 20
   bool headerOk = writePioBlock (lba, gWriteBlock, words, status);
@@ -9647,20 +9603,7 @@ static unsigned int panicAppendText (const char *text, unsigned int length)
     return 4;
   }
 
-  uint8_t *block = reinterpret_cast<uint8_t *> (gWriteBlock);
-  for (uint32_t i = 0; i < 512; i++) {
-    block[i] = 0;
-  }
-  for (uint32_t i = 0; i < kLogPrefixLength; i++) {
-    block[i] = static_cast<uint8_t> (kLogPrefix[i]);
-  }
-  for (uint32_t i = 0; i < body; i++) {
-    uint8_t c = static_cast<uint8_t> (text[i]);
-    block[kLogPrefixLength + i] =
-        (c == '\n') ? static_cast<uint8_t> ('\n')
-                    : (c >= 0x20 && c < 0x7f) ? c : static_cast<uint8_t> ('.');
-  }
-  block[kLogPrefixLength + body] = '\n';
+  sdhci_build_text (reinterpret_cast<uint8_t *> (gWriteBlock), text, length);
   bool textOk = writePioBlock (lba + 1, gWriteBlock, words, status);
   waitCardReady (rsp, rstatus, polls);
   if (!textOk) {

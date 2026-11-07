@@ -28,11 +28,14 @@ IMEM_ARCHIVE = REPO / "notes/sources/sdm660/imem-children.dts"
 POWEROFF_ARCHIVE = REPO / "notes/sources/sdm660/msm-poweroff.c"
 BOOT_STATS_ARCHIVE = REPO / "notes/sources/sdm660/boot_stats.c"
 SDHCI = REPO / "drivers/CloverSdhci/CloverSdhci.cpp"
+SDHCI_LAYER = REPO / "drivers/CloverSdhci/SdhciLogCore.h"
+SDHCI_MODEL = REPO / "drivers/CloverSdhci/tests/clover_sdhci_host.cpp"
+SDHCI_TEST = REPO / "scripts/test-clover-sdhci.py"
 SDHCI_GEOMETRY = REPO / "scripts/test-clover-sdhci-geometry.py"
 PANIC = REPO / "scripts/xnu-panic-screen.c"
 HARNESS = REPO / "drivers/CloverPower/tests/clover_power_host.cpp"
 GATE = REPO / "scripts/check-clover.py"
-LOG = Path.home() / "clover-out/round340-geometry/negatives.log"
+LOG = Path.home() / "clover-out/round341-sdhci-core/negatives.log"
 
 SILENT_AFTER = '''      timeline_close "neither-$(usb_landing_class)" "" ""
       return 2
@@ -204,8 +207,11 @@ CASES = [
     # #653's geometry agreement. Each of these is one leg of the comparison, and the expect is the
     # sentence only that leg prints: a red gate that came from any other leg would not say which of
     # the three files moved, which is the whole claim the round exists to make.
+    # N36 and N41 name SdhciLogCore.h, not CloverSdhci.cpp: round341 moved both texts into the layer,
+    # and the harness reported them as NOT TESTED rather than passing a mutation it never applied. A
+    # needle whose subject moved is an instrument debt, so it has to be re-pinned in the same round.
     ("N36 the driver's ring table moves against the reader's copy",
-     [(SDHCI, "kRingOffset[kRingCount] = {64, 192}", "kRingOffset[kRingCount] = {64, 194}")],
+     [(SDHCI_LAYER, "kRingOffset[kRingCount] = {64, 192}", "kRingOffset[kRingCount] = {64, 194}")],
      "the driver says [64, 194]"),
     ("N37 the reader's kernel ring shrinks under its own derived offsets",
      [(READER, "KERNEL_SLOTS = 512", "KERNEL_SLOTS = 256")],
@@ -222,13 +228,103 @@ CASES = [
        "roundtrip = None\nif False and all (value is not None")],
      "printed no 'roundtrip: 4 records'"),
     ("N41 the staging-depth comment claims a number the table does not give",
-     [(SDHCI, "// staging depth: deeper than the driver's card ring, shallower than the kernel's",
+     [(SDHCI_LAYER, "// staging depth: deeper than the driver's card ring, shallower than the kernel's",
        "// staging depth; deeper than either card ring")],
      "kRingRamSlots says 128 is staging depth"),
     ("N42 the reader's main path asks the kernel ring for somebody else's kind",
      [(READER, "slots, base, kind, window = KERNEL_SLOTS, KERNEL_OFFSET, 22,",
        "slots, base, kind, window = KERNEL_SLOTS, KERNEL_OFFSET, 23,")],
      "the driver writes kind 22 to the kernel ring"),
+
+    # Round341 (#653, the sixth pure layer). Four of these are the findings themselves put back: each
+    # mutation restores the expression the round replaced, so a green gate would mean the model never
+    # measured the difference between the two rules -- which is round330's rule that a negative has to
+    # re-run the wrong code, not a synonym of it. The rest judge the split's own failure modes: a second
+    # copy in the driver, a layer nobody calls, an instrument that stops printing its new column, and a
+    # reader whose bound silently moves against the writer's clamp.
+    ("N43 the checksum goes back to summing the bytes as they arrive",
+     [(SDHCI_LAYER, "    sum += (uint32_t) sdhci_record_byte ((uint8_t) text[i]);",
+       "    sum += (uint32_t) (uint8_t) text[i];")],
+     "case filter sum_agrees=0"),
+    ("N44 the relay's dropped= counts a position again",
+     [(SDHCI_LAYER, "  return (uint32_t) (seq - consumed) >= kProbeSlots ? 1u : 0u;",
+       "  return seq >= kProbeSlots ? 1u : 0u;")],
+     "case relay drained_dropped=136"),
+    ("N45 the tee's long line goes back to splitting and destroying",
+     [(SDHCI_LAYER, "    return truncated ? kSdhciTeeEmitCut : kSdhciTeeEmit;",
+       "    return truncated ? kSdhciTeeStore : kSdhciTeeEmit;")],
+     "case tee_cut cut=0"),
+    ("N46 the panic record's kind moves off the reader's expectation",
+     [(SDHCI_LAYER, "static const uint32_t kPanicKind = 20;",
+       "static const uint32_t kPanicKind = 21;")],
+     "case panic kind=21"),
+    ("N47 the driver keeps a second copy of the ring's slot table",
+     [(SDHCI, "static const uint32_t kTeeCensusMax = 12;",
+       "static const uint32_t kRingCardSlots[kRingCount] = {64, 512};\n"
+       "static const uint32_t kTeeCensusMax = 12;")],
+     "still carries 'static const uint32_t kRingCardSlots'"),
+    ("N48 the panic sink's own copy of the byte sum comes back",
+     [(SDHCI, "  sdhci_build_panic_header (gWriteBlock, lba, slot, maxSeq + 1, gBootId, text, length);",
+       "  for (uint32_t i = 0; i < length; i++) { sum += static_cast<uint8_t> (text[i]); }\n"
+       "  sdhci_build_panic_header (gWriteBlock, lba, slot, maxSeq + 1, gBootId, text, length);")],
+     "still carries 'sum += static_cast<uint8_t> (text[i]);'"),
+    ("N49 the panic path stops calling the layer",
+     [(SDHCI, "  sdhci_build_panic_header (gWriteBlock, lba,",
+       "  panicWriteWords (gWriteBlock, lba,")],
+     "does not call 'sdhci_build_panic_header ('"),
+    ("N50 the tee census stops printing its truncation count",
+     [(SDHCI, '              " cut=%u bound=%u\\n",', '              "\\n",')],
+     'lacks \'" cut=%u bound=%u'),
+    ("N51 the reader's body bound moves against the writer's clamp",
+     [(READER, "        if body > 480:", "        if body > 400:")],
+     "the writer clamps a body at 480 while the reader's own bounds say"),
+    ("N52 the reader's tee sample row is re-typed instead of derived",
+     [(READER, '    for column in ("cut=", "bound="):', '    for column in ():')],
+     'lacks \'for column in ("cut=", "bound="):\''),
+    ("N53 the pure layer is not on disk at all",
+     [(SDHCI_LAYER, None, None)],
+     "SdhciLogCore.h is missing"),
+    # N36 found this while it was being written, so it stays as a case: the geometry script's array
+    # parser was unanchored and matched a comment two lines above the table that restates it. Only
+    # un-anchoring the parser does not turn the gate red -- with the real table and the prose agreeing
+    # the reading is still right -- so the second edit moves the prose alone. Red then means the leg
+    # read a number out of a sentence, which is round328's shape (prose is not a number's source).
+    ("N54 the ring table is parsed from the comment that quotes it, not the declaration",
+     [(SDHCI_GEOMETRY,
+       r'    found = re.search (rf"^\s*(?:static const \w+ )?\b{name}\s*(?:\[[^\]]*\])?\s*=\s*\{{([^}}]*)\}}",',
+       r'    found = re.search (rf"\b{name}\s*(?:\[[^\]]*\])?\s*=\s*\{{([^}}]*)\}}",'),
+      (SDHCI_LAYER, "kRingOffset = {64, 192}", "kRingOffset = {64, 193}")],
+     "the driver says [64, 193]"),
+    # Round341's sixth finding: the reader's byte filter and the writer's were different sets. The two
+    # legs judge it two ways, so each needs its own case -- the mask comparison (behaviour, run) and the
+    # ban on the old expression (a shape). N55 moves the reader's range one byte so only the mask can
+    # see it; N56 puts the deleted expression back so the ban must be the one that says so; N57 renames
+    # the model's row, because a leg that stopped printing must not look like a leg that disagrees.
+    ("N55 the reader's byte range narrows against the writer's keep-set",
+     [(READER, "byte == 0x0A or 0x20 <= byte < 0x7F", "byte == 0x0A or 0x21 <= byte < 0x7F")],
+     "the reader and the writer disagree about 1 of 256 bytes"),
+    ("N56 the reader goes back to keeping the control bytes the writer replaces",
+     [(READER, "byte == 0x0A or 0x20 <= byte < 0x7F", "0x09 <= byte < 0x7F")],
+     "still keeps 0x09 and 0x0b through 0x1f"),
+    ("N57 the model stops printing its keep-set mask",
+     [(SDHCI_MODEL, '"case keepset keepmask=%s kept=%u filler=%u\\n"',
+       '"case keepset-renamed keepmask=%s kept=%u filler=%u\\n"')],
+     "printed no case keepset"),
+    # The defect the build caught and this suite did not: round341's extraction left the local that had
+    # held the body clamp behind, -Werror stopped archive 11, and every case above stayed green because
+    # neither the gate nor the geometry script compiles the driver's own translation unit. Leg 4b asks
+    # the question, so N58 puts the dead local back -- the script has to name it, not merely fail -- and
+    # N59 removes the line carrying its denominator, because a leg whose scan size nobody prints could
+    # be scanning nothing and reporting clean.
+    ("N58 the driver keeps a local from a layer call that nothing reads",
+     [(SDHCI, "  const uint32_t lba = sdhci_ring_lba (gVerdictFirst, which, gRingCursor[which]);",
+       "  const uint32_t body = sdhci_record_body (length);\n"
+       "  const uint32_t lba = sdhci_ring_lba (gVerdictFirst, which, gRingCursor[which]);")],
+     "the local body is declared from a call into the layer and never read again"),
+    ("N59 the locals leg stops printing what it scanned",
+     [(SDHCI_GEOMETRY, '"driver locals: {len (locals_declared)} bound from a layer call',
+       '"driver localities: {len (locals_declared)} bound from a layer call')],
+     "printed no driver locals line"),
 ]
 
 
