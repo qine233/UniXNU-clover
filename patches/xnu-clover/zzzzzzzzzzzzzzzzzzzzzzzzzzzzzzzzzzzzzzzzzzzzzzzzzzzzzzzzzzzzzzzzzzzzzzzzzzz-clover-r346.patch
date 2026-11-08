@@ -1,0 +1,241 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12653,6 +12653,98 @@
+ 		smr_ipc_leave();
+ 	}
+ 	is_read_unlock(space);
++}
++
++/*
++ * Round346. Round331/328 asked each hop for its receive queue and read four e=17 and four q=0.
++ * That was not a queue reading: a name whose entry holds MACH_PORT_TYPE_PORT_SET has neither a
++ * receive nor a send right, so ipc_object_translate refuses both legs and both zeros belong to a
++ * translate that never happened. The set itself is reachable with MACH_PORT_RIGHT_PORT_SET, and
++ * the members are the queues the thread is actually waiting on. This walks that set and copies
++ * each member's object, imq_msgcount, ip_srights and imq_receiver_name under the lock the
++ * translate returns; the set's own waitq address lets the row say whether the sampled thread's
++ * wait_event is this set (the receiver), and nothing is retained past the copy. Member ports are
++ * not re-locked: the set lock is the one the member walk already runs under.
++ */
++#define CLOVER_BB_PSET_MAX 8
++struct clover_bbpset_snap {
++	ipc_port_t ports[CLOVER_BB_PSET_MAX];
++	uint32_t cnts[CLOVER_BB_PSET_MAX];
++	uint32_t srs[CLOVER_BB_PSET_MAX];
++	uint32_t rns[CLOVER_BB_PSET_MAX];
++};
++static int
++clover_bb_hop_pset(task_t task, int pid, int hop, mach_port_name_t name,
++    uint64_t secs, uint64_t we)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	ipc_space_t space = task->itk_space;
++	ipc_object_t obj = IPC_OBJECT_NULL;
++	kern_return_t kr;
++	__block struct clover_bbpset_snap snap;
++	__block uint32_t stored = 0;
++	__block uint32_t all = 0;
++	uint64_t wqaddr;
++	uint32_t i;
++	char row[220];
++	int len;
++
++	if (space == IPC_SPACE_NULL || name == MACH_PORT_NULL) {
++		return 0;
++	}
++	kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_PORT_SET, &obj);
++	if (kr != KERN_SUCCESS) {
++		return 0;
++	}
++	if (io_otype(obj) != IOT_PORT_SET) {
++		io_unlock(obj);
++		return 0;
++	}
++	wqaddr = (uint64_t)(uintptr_t)&((ipc_pset_t)obj)->ips_wqset;
++	waitq_set_foreach_member_locked(&((ipc_pset_t)obj)->ips_wqset,
++	    ^(struct waitq *wq) {
++		ipc_port_t port = ip_from_waitq(wq);
++
++		all++;
++		if (stored < CLOVER_BB_PSET_MAX) {
++			snap.ports[stored] = port;
++			snap.cnts[stored] = port->ip_messages.imq_msgcount;
++			snap.srs[stored] = port->ip_srights;
++			snap.rns[stored] = port->ip_messages.imq_receiver_name;
++			stored++;
++		}
++	});
++	io_unlock(ips_to_object((ipc_pset_t)obj));
++	/*
++	 * One header states the set and which thread is waiting on it; one row per member states the
++	 * queue. `n=` is how many rows follow and `all=` how many members existed, so a capped walk
++	 * says so instead of looking complete.
++	 */
++	len = snprintf(row, sizeof(row),
++	    "clover r346: bbset2 t=%llu pid=%d hop=%d nm=%x o=%llx n=%u all=%u"
++	    " we=%llx wq=%llx match=%u\n",
++	    (unsigned long long)secs, pid, hop, name,
++	    (unsigned long long)(uintptr_t)obj, stored, all,
++	    (unsigned long long)we, (unsigned long long)wqaddr,
++	    (we == wqaddr) ? 1u : 0u);
++	if (len > 0) {
++		row[sizeof(row) - 1] = '\0';
++		clover_emmc_probe_say(row, (unsigned int)strlen(row));
++		printf("%s", row);
++	}
++	for (i = 0; i < stored; i++) {
++		len = snprintf(row, sizeof(row),
++		    "clover r346: bbsm t=%llu hop=%d i=%u rn=%x o=%llx q=%u sr=%u\n",
++		    (unsigned long long)secs, hop, i, snap.rns[i],
++		    (unsigned long long)(uintptr_t)snap.ports[i], snap.cnts[i],
++		    snap.srs[i]);
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
++	}
++	return 1;
+ }
+ 
+ /*
+@@ -12668,12 +12760,15 @@
+  * found no name at all in the waiter's own table), holders, no_holder (both legs empty yet sr>0: the
+  * right lives in an entry the reverse hash does not carry and in no name of this space). cand=/debt=
+  * say how many hops were even candidates, because a scan of one picked hop is not a census of four.
++ * Round346 split that pair: debt is now a translate that succeeded and left an empty queue, while
++ * unread is a translate that failed; `scan=pset` marks the hop whose name resolved as a port set,
++ * which r346's bbset2/bbsm rows then open.
+  * `hits` against `sr` is the honesty pair: hits is a lower bound by construction (pure-send entries
+  * only) and sr is the kernel's own count, so hits<sr is a reading about the hash, not about the port.
+  */
+ static void
+ clover_bb_send_holders_row(task_t task, int pid, int hop, mach_port_name_t name,
+-    uint64_t secs, uint32_t cand, uint32_t debt)
++    uint64_t secs, uint32_t cand, uint32_t debt, uint32_t unread, uint64_t we)
+ {
+ 	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
+ 	ipc_port_t port;
+@@ -12713,18 +12808,23 @@
+ 	len = 0;
+ 	port = clover_port_obj_held(task, name, &code, &sr, &mc);
+ 	if (port == IPC_PORT_NULL) {
++		int pset = 0;
++
+ 		/*
+ 		 * The same shape as a row that ran: a branch that prints fewer columns is a branch
+ 		 * whose absence cannot be told apart from a decoder that dropped them.
+ 		 */
++		if (code == (int)KERN_INVALID_RIGHT && name != MACH_PORT_NULL) {
++			pset = clover_bb_hop_pset(task, pid, hop, name, secs, we);
++		}
+ 		st = (name == MACH_PORT_NULL) ? "no_cand" : ((code == -1) ? "no_space" :
+-		    ((code == -2) ? "notport" : "xlate"));
++		    ((code == -2) ? "notport" : (pset ? "pset" : "xlate")));
+ 		len = snprintf(row, sizeof(row),
+ 		    "clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=0 e=%d sr=%u q=%u"
+ 		    " scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u cand=%u"
+-		    " debt=%u\n",
++		    " debt=%u unread=%u\n",
+ 		    (unsigned long long)secs, pid, hop, name, code, sr, mc, st, 0u, 0u, 0u,
+-		    0u, 0u, 0u, cand, debt);
++		    0u, 0u, 0u, cand, debt, unread);
+ 		if (len > 0) {
+ 			row[sizeof(row) - 1] = '\0';
+ 			clover_emmc_probe_say(row, (unsigned int)strlen(row));
+@@ -12745,10 +12845,11 @@
+ 	    "no_holder")));
+ 	len = snprintf(row, sizeof(row),
+ 	    "clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=%llx e=%d sr=%u q=%u"
+-	    " scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u cand=%u debt=%u\n",
++	    " scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u cand=%u debt=%u"
++	    " unread=%u\n",
+ 	    (unsigned long long)secs, pid, hop, name,
+ 	    (unsigned long long)(uintptr_t)port, code, sr, mc, st, hits, probed,
+-	    scanned, selfhit, matches, entries, cand, debt);
++	    scanned, selfhit, matches, entries, cand, debt, unread);
+ 	if (len > 0) {
+ 		row[sizeof(row) - 1] = '\0';
+ 		clover_emmc_probe_say(row, (unsigned int)strlen(row));
+@@ -13763,6 +13864,17 @@
+ 	uint32_t hid[4];
+ 	uint64_t hto[4];
+ 	uint64_t hop[4];
++	/*
++	 * Round346. The hop order is the order the task's thread list happened to be walked in, so
++	 * four trapped threads said nothing about which was the main runloop thread and which were
++	 * auxiliary receivers. These are the scheduler's own per-thread facts: wait_event names what
++	 * the thread is parked on, continuation names the kernel function it will resume in, and pc
++	 * is the user address it was in when it entered the trap. A set receiver's wait_event is the
++	 * set's own waitq, which r346's bbset2 row compares against.
++	 */
++	uint64_t hwe[4];
++	uint64_t hcont[4];
++	uint64_t hpc[4];
+ 	uint64_t utid[6];
+ 	uint64_t ucont[6];
+ 	uint64_t upc[6];
+@@ -13946,6 +14058,9 @@
+ 		hid[hn] = (uint32_t)(x[4] >> 32);
+ 		hto[hn] = x[7];
+ 		hop[hn] = x[1];
++		hwe[hn] = (uint64_t)(uintptr_t)thr->wait_event;
++		hcont[hn] = (uint64_t)(uintptr_t)thr->continuation;
++		hpc[hn] = pc;
+ 		hn++;
+ 	}
+ 	/*
+@@ -14243,23 +14358,50 @@
+ 	 * up to CLOVER_BB_SEMA_PROBE processes is the same budget r268's walk spends.
+ 	 */
+ 	{
++		extern unsigned int clover_emmc_probe_say(const char *text,
++		    unsigned int length);
+ 		uint32_t cand = 0;
+ 		uint32_t debt = 0;
++		uint32_t unread = 0;
+ 
++		/*
++		 * Round346. debt and empty-queue were one number, and boot 125's four e=17 hops counted
++		 * as four debts: a translate that failed leaves q=0 behind, which is not the queue saying
++		 * zero. debt now needs a translate that succeeded (rcve==0) and an empty queue; unread
++		 * counts the failures. The two numbers together still add up to cand, so a hop cannot
++		 * leave the census by changing which side of the split it lands on.
++		 */
+ 		for (i = 0; i < hn; i++) {
+ 			if (hrn[i] != 0) {
+ 				cand++;
+-				if (rcvq[i] == 0) {
+-					debt++;
++				if (rcve[i] == 0) {
++					if (rcvq[i] == 0) {
++						debt++;
++					}
++				} else {
++					unread++;
+ 				}
+ 			}
+ 		}
+ 
+ 		for (i = 0; i < hn; i++) {
++			char hoprow[176];
++			int hl;
++
++			hl = snprintf(hoprow, sizeof(hoprow),
++			    "clover r346: bbhop t=%llu hop=%u tid=%llx we=%llx cont=%llx"
++			    " pc=%llx\n", (unsigned long long)secs, i,
++			    (unsigned long long)htid[i], (unsigned long long)hwe[i],
++			    (unsigned long long)hcont[i], (unsigned long long)hpc[i]);
++			if (hl > 0) {
++				hoprow[sizeof(hoprow) - 1] = '\0';
++				clover_emmc_probe_say(hoprow, (unsigned int)strlen(hoprow));
++				printf("%s", hoprow);
++			}
+ 			/* the row names its own hop; a null nm prints as no_cand */
+ 			clover_bb_send_holders_row(task, pid, (int) i,
+ 			    (hrn[i] != 0) ? (mach_port_name_t) hrn[i] : MACH_PORT_NULL,
+-			    secs, cand, debt);
++			    secs, cand, debt, unread, hwe[i]);
+ 		}
+ 	}
+ 	/*

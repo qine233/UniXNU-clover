@@ -28936,3 +28936,46 @@ flight 12 条、verdict 64 条、kernel 环 512 行全部是 boot 125 写的。*
 ① 对每个翻译为 `PORT_SET` 的 hop，列出成员（对象、`imq_msgcount`、`ip_srights`、成员名）与 set 的接收线程；
 ② 打印被采样线程的 continuation/调用者，把「主线程」与「辅助接收线程」分开（现在只按线程顺序取前四个）；
 ③ 改 `debt` 的口径：只在 `err==0` 时把 `rcvq==0` 记作债，另设 `unread=` 计数，否则「读不到」和「没有」在同一个数字里。
+
+## Round346 ①–③：把 port set 打开（r346 三行 + debt/unread 拆口径）
+
+**要做的三件（boot 125 判读留下的仪器债）。** ① 对每个翻译为 `PORT_SET` 的 hop，列出成员（对象、`imq_msgcount`、
+`ip_srights`、成员名）与 set 的接收线程；② 打印被采样线程的 continuation/调用者，把主 runloop 线程与辅助接收线程分开
+（旧形状只按线程顺序取前四个，`r229` 的 hops 看不出谁是谁）；③ 把 `debt` 拆成「翻译成功且队列空」与「翻译失败」两个数。
+
+**改动（内核侧，`patches/xnu/…-clover-r346.patch`，加在 r331 之后）。**
+- `clover_bb_hop_pset()`：`ipc_object_translate(..., MACH_PORT_RIGHT_PORT_SET)` → `io_otype==IOT_PORT_SET` →
+  `waitq_set_foreach_member_locked(&pset->ips_wqset, …)` 在 set 锁下拷出每个成员口的 `imq_msgcount` / `ip_srights` /
+  `imq_receiver_name`（上限 8 个，`all=` 仍数全部），解锁后打印。set 的 waitq 地址与 hop 线程的 `wait_event` 并排，
+  `match=1` 表示这个被采样线程就是等在该 set 上的收方。
+- 新行：`clover r346: bbset2 t= pid= hop= nm= o= n= all= we= wq= match=`；成员行
+  `clover r346: bbsm t= hop= i= rn= o= q= sr=`；线程行
+  `clover r346: bbhop t= hop= tid= we= cont= pc=`（每 hop 一行，与端口状态无关）。
+- `clover r331: bbsend` 两种形状都加 `unread=%u`；`scan=pset` 是新的翻译分类。调用方：
+  `rcve[i]==0 && rcvq[i]==0` 才记 `debt`，`rcve[i]!=0` 记 `unread`，两者相加仍等于 `cand`。
+- driver：三个 tee 类 `r346-bbhop`(128) / `r346-bbset2`(32) / `r346-bbsm`(128)，token `r346` 进每-pass 豁免链（与 r331 同理：
+  头被留下、成员被吃掉，会把「set 是收方」读成「set 是空的」）。
+- 宿主：`prepare-clover-tree.py` 不再从 `tree/patches/xnu` 推基仓（format 2 里该路径一旦设备仓带系列就指向设备仓），
+  改为设备仓同级 `UniXNU`，且只在 `drivers/SoftwareAES` 真的存在时接受；两处候选路径都印在失败信息里。
+
+**构建链（本轮）。** `build kernel` 重新克隆并整串重放 141 枚补丁（r346 应用成功）→ prelink `4f14be28…`（52,477,952 B）
+→ `patch-clover-amfi.py`（两刀仍在 VA `0xfffffff004ab40e4`/`0xfffffff004ab416c`，文件偏移 `0x1af20e4`/`0x1af216c`；
+又比 r345 多 `0x2000`，是同因的路径/字符串变长）→ `round346-kernel-amfi.macho` `0c8bdd3d…` → `normalize-kernel-macho.py`
+（973 枚 object 戳清零）→ `round346-kernel-normalized.macho` `6c1feb14…` → `unixnu build payload`（seed `0x81ffcaaa`，
+带 `--data-ramdisk` 与 `--trust-cache`）→ `round346-v0.7.63-payload.img` `a718621e…`（58,720,256 B）。
+`payload.json`：`kernel_sha256 6c1feb14…`、`payload_kernel_sha256 387cf820…`、`adt_sha256 b8b14e81…`。
+
+**闸门。** 仓库侧 `check-clover.py` **EXIT=0**（`ADT 14384 bytes, 8 cores`，`drivers documented: 11`）。镜像侧
+`verify-clover-payload.py` **EXIT=0，51 OK / 0 FAIL**；新增三枚针脚 `r346-bbhop` / `r346-bbset2` / `r346-bbsm` 全 present，
+`r331-bbsend` 两种形状按拼接后的整条 CString（含 `unread=%u`）重钉。**负测 9 支**（`~/clover-out/round346-negatives.log`）：
+补丁缺席、基仓副本字节不同、系列缺席、r346 排在 r331 前、少 bbsm 行、删掉 r328 保留行、tee 类缺席、豁免缺席、标题代号，
+逐支按各自理由变红，文件逐字节还原（两仓 r346 补丁 sha256 `8ad229c3…` 相同）。
+
+**预登记：boot 126（本镜像）的四支判读。**
+- **R-A（预期）**：四跳 `scan=pset`、`debt=0 unread=4`；每个 hop 有 `bbset2`，`n≥1`，随后 `bbsm` 行给出成员名/队列/发送权；
+  被采样线程的 `we=` 与 set 的 `wq=` 相等 → `match=1`。含义：set 非空，下一问变成「哪个成员的 `sr>0` 且 `q>0`」。
+- **R-B**：仍是 `scan=xlate`、无 `bbset2` ⇒ 这一靴的四个名字不是 port set（与 boot 125 的 `+ps` 相矛盾，线程集合变了）；
+  这时 `unread=4 debt=0` 仍然成立，但「set 成员」这一问没有对象。
+- **R-C**：`bbset2` 在而 `n=0` ⇒ set 存在但没有成员（空集），与「非空但没人投递」是两种故障。
+- **R-D**：`bbhop` 的 `cont=` 若四枚同一函数，则四跳走同一等待路径；若分叉，结合 `pc=`（宿主用共享缓存切片把用户地址
+  落到函数名）可把主 runloop 线程与辅助接收线程分开。`debt+unread==cand` 是每行自带的算术控制。

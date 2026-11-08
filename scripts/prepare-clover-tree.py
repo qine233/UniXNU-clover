@@ -60,11 +60,25 @@ compat.symlink_to(Path('..') / 'native-aes' / 'libSoftwareAES.a')
 # the driver-documentation gate a README clause citation, and it is not a driver this port authored.
 aes = tree / 'drivers' / 'NativeAES'
 if not (aes.is_symlink() or aes.exists()):
-    # tree/patches/xnu is the base repository's patch directory, so two levels up is its root.
-    base = (tree / 'patches' / 'xnu').resolve().parents[1]
-    upstream = base / 'drivers' / 'SoftwareAES'
-    if not upstream.is_dir():
-        sys.exit(f'{upstream}: the base repository carries no SoftwareAES driver to link as NativeAES')
+    # The base repository is the device repository's sibling in the documented layout, not whatever
+    # tree/patches/xnu resolves to: format 2 symlinks that path from the device repository as soon as
+    # the device carries its own series. Each candidate is accepted only if it really holds the
+    # driver, so a relocated checkout reports every path it tried instead of linking the wrong tree.
+    tried = []
+    candidates = [Path(device).resolve().parent / 'UniXNU']
+    try:
+        candidates.append((tree / 'patches' / 'xnu').resolve().parents[1])
+    except (IndexError, OSError):
+        pass
+    upstream = None
+    for base in candidates:
+        path = base / 'drivers' / 'SoftwareAES'
+        tried.append(str(path))
+        if path.is_dir():
+            upstream = path
+            break
+    if upstream is None:
+        sys.exit('no base repository with drivers/SoftwareAES (tried: ' + ', '.join(tried) + ')')
     aes.symlink_to(upstream, target_is_directory=True)
     linked.append('NativeAES')
 

@@ -1318,12 +1318,21 @@ def check_sb_sample(kernel: bytes) -> bool:
              # which hop this row is allowed to pick.
              "r331-bbsend": (b"clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=%llx e=%d sr=%u q=%u "
                              b"scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u cand=%u "
-                             b"debt=%u\n") in kernel,
+                             b"debt=%u unread=%u\n") in kernel,
              "r331-bbsend-null": (b"clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=0 e=%d sr=%u q=%u "
                                   b"scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u "
-                                  b"cand=%u debt=%u\n") in kernel,
+                                  b"cand=%u debt=%u unread=%u\n") in kernel,
              "r331-bbsh": (b"clover r331: bbsh t=%llu i=%u pid=%u c=%s nm=%x ty=%s raw=%llx\n") in kernel,
              "r331-bbown": (b"clover r331: bbown t=%llu i=%u nm=%x ty=%s raw=%llx ur=%u\n") in kernel,
+             # Round346 opens the sets r331 could only count. bbhop is the thread identity the hop order
+             # could not carry; bbset2 states the set and whether the sampled thread's wait_event is that
+             # set; bbsm is one member queue each. All three are pinned because a payload that carries the
+             # split bbsend row but not the rows the split points at has turned "unread" into a dead end.
+             "r346-bbhop": (b"clover r346: bbhop t=%llu hop=%u tid=%llx we=%llx cont=%llx pc=%llx\n")
+                           in kernel,
+             "r346-bbset2": (b"clover r346: bbset2 t=%llu pid=%d hop=%d nm=%x o=%llx n=%u all=%u "
+                             b"we=%llx wq=%llx match=%u\n") in kernel,
+             "r346-bbsm": (b"clover r346: bbsm t=%llu hop=%d i=%u rn=%x o=%llx q=%u sr=%u\n") in kernel,
              "r331-scan-own-only": b"own_only" in kernel,
              "r331-scan-hash-only": b"hash_only" in kernel,
              "r331-scan-no-holder": b"no_holder" in kernel,

@@ -1222,6 +1222,17 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r331: bbsh", "r331-bbsh", 128, 0, 0, 0 },
   { "clover r331: bbown", "r331-bbown", 128, 0, 0, 0 },
 
+  // Round346 opens the port sets r331 could only count. `bbhop` is one row per trapped thread -- its
+  // wait_event, continuation and pc -- because the hop order is the task's thread order and four rows
+  // said nothing about which thread was the runloop and which were auxiliary receivers; 128 is the
+  // arithmetic bound (4 hops x 32 change-gated fires, the r331 cadence). `bbset2` is the set header
+  // (32, same cadence) and `bbsm` one row per member (128 = 4 hops x 8 members x the fires a boot that
+  // reaches the 1800 s deadline can produce). The three keys share no prefix, so the table has no
+  // containment to order around.
+  { "clover r346: bbhop", "r346-bbhop", 128, 0, 0, 0 },
+  { "clover r346: bbset2", "r346-bbset2", 32, 0, 0, 0 },
+  { "clover r346: bbsm", "r346-bbsm", 128, 0, 0, 0 },
+
   // Round329 publishes the display client's state on the display's own 30 s beat; round344 (#695) makes that
   // row name the record it picked (`pick=`) and adds a per-record row, so the heads below are r344's for both
   // display families and r343's only for the swap row. Order matters and is the only defence: within a family
@@ -4898,6 +4909,12 @@ static void teeConsumeLine (uint32_t &pushed)
        // pushes would leave `hits=0` indistinguishable from a pass that never got to count. The header and
        // the two name classes are exempted together on one token so half a list cannot survive the cap.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r331") ||
+       // Round346 prints in that same burst, and its three rows are one reading: bbhop says which thread
+       // is parked where, bbset2 says the hop is a set and whether that thread's wait_event is the set,
+       // and bbsm rows are the queues the set holds. A pass cap that kept the header and dropped the
+       // members would leave "the set is the receiver" indistinguishable from "the set is empty", so the
+       // whole token is exempted; the class budgets of 128/32/128 still bound it.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r346") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is

@@ -3468,6 +3468,91 @@ def check_board(errors: list) -> str:
                           "leave `hits=0` indistinguishable from a pass that never got to count -- the "
                           "exact pair boot 112 could not split")
 
+        # Round346. Boot 125 read four hops as e=17 with q=0 and r331 counted them as four debts; a port
+        # set has neither a receive nor a send right, so both zeros belonged to a translate that never
+        # ran. The hand is three readings: the set's members (object, queue, send rights, member name),
+        # the sampled thread's own continuation/waiter (the hop order is just the task's thread order),
+        # and debt split from unread so "could not read" stops sharing a number with "empty". The gate
+        # holds the patch, its identity in both repositories, its place in the series, and the counters
+        # that keep the split honest.
+        r346_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r346.patch")),
+                         default=None)
+        if r346_patch is None or not r346_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r346.patch is missing: opening the port sets is "
+                          "this round's only hand, and an instrument nobody shipped is a reading nobody "
+                          "can take")
+        else:
+            r346_name = r346_patch.name
+            r346_lines = r346_patch.read_text().splitlines()
+            load_r346 = REPO.parent / "UniXNU" / "patches" / "xnu" / r346_name
+            if not load_r346.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r346_name} is missing: unixnu loads patches from there, "
+                              "and this repo's copy only ever names the round")
+            elif load_r346.read_bytes() != r346_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r346_name} is not the same bytes as this repo's copy: "
+                              "the shipped image would carry a different row than the one checked here")
+            series_text = (REPO / "patches/xnu/series").read_text()
+            series_line = f"arch:../../../patches/xnu/{r346_name}"
+            r331_prev = max((p.name for p in (REPO / "patches/xnu-clover").glob("*-clover-r331.patch")),
+                            default="")
+            if series_line not in series_text:
+                errors.append(f"patches/xnu/series does not apply {r346_name}: the patch exists and the "
+                              "kernel would be built without it, which is the quietest way to lose a round")
+            elif r331_prev == "" or series_text.find(r331_prev) < 0:
+                errors.append("patches/xnu/series no longer applies r331: r346 edits the row r331 adds, "
+                              "so the series cannot be read as the ordered history this round assumes")
+            elif series_text.find(series_line) < series_text.find(r331_prev):
+                errors.append("patches/xnu/series applies r346 before r331: r346 edits the row r331 adds, "
+                              "so the other order leaves the bbsend line unable to take its new columns")
+            r346_added = [line[1:] for line in r346_lines if line.startswith("+")]
+            r346_removed = [line[1:] for line in r346_lines
+                            if line.startswith("-") and not line.startswith("--- ")]
+            for now in (
+                # The set walk: the same member iteration and lock discipline r234 established, on the
+                # object the translate returns.
+                'ipc_object_translate(space, name, MACH_PORT_RIGHT_PORT_SET, &obj)',
+                'waitq_set_foreach_member_locked(&((ipc_pset_t)obj)->ips_wqset,',
+                'io_unlock(ips_to_object((ipc_pset_t)obj));',
+                'snap.cnts[stored] = port->ip_messages.imq_msgcount;',
+                'snap.srs[stored] = port->ip_srights;',
+                'snap.rns[stored] = port->ip_messages.imq_receiver_name;',
+                # The three rows and the thread identity the hop order could not carry.
+                '"clover r346: bbhop t=%llu hop=%u tid=%llx we=%llx cont=%llx"',
+                '"clover r346: bbset2 t=%llu pid=%d hop=%d nm=%x o=%llx n=%u all=%u"',
+                '"clover r346: bbsm t=%llu hop=%d i=%u rn=%x o=%llx q=%u sr=%u\\n"',
+                'hwe[hn] = (uint64_t)(uintptr_t)thr->wait_event;',
+                'hcont[hn] = (uint64_t)(uintptr_t)thr->continuation;',
+                'hpc[hn] = pc;',
+                # The split: debt needs a successful translate, unread counts the failures, and the
+                # pset literal is what makes an e=17 row point at a set instead of a broken name.
+                'if (rcve[i] == 0) {',
+                'unread++;',
+                '(pset ? "pset" : "xlate")',
+                'pset = clover_bb_hop_pset(task, pid, hop, name, secs, we);',
+                'debt=%u unread=%u\\n"'):
+                if not any(now in line for line in r346_added):
+                    errors.append(f"the r346 kernel patch does not add {now[:56]!r}: without it the "
+                                  "e=17 hops stay four unreadable queues counted as four empty ones, "
+                                  "which is the misreading boot 125 invites")
+            # r327's and r328's rows and the r331 debt pair are what this round is graded against; a
+            # diff that removes one of them is not the additive instrument this round claims to be.
+            for keep in ('"clover r327: bbnow', '"clover r328: bbrcv',
+                         'clover_bb_send_holders_row(task, pid, (int) i,'):
+                if any(keep in line for line in r346_removed):
+                    errors.append(f"the r346 patch removes {keep[:56]!r}: the hop census and the row it "
+                                  "feeds are the control this round's split is read against")
+        for entry in ('{ "clover r346: bbhop", "r346-bbhop", 128, 0, 0, 0 },',
+                      '{ "clover r346: bbset2", "r346-bbset2", 32, 0, 0, 0 },',
+                      '{ "clover r346: bbsm", "r346-bbsm", 128, 0, 0, 0 },'):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: the member rows are a "
+                              "list, and a list with no budget of its own competes with the burst it "
+                              "is meant to explain")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r346")' not in sdhci_source:
+            errors.append("the r346 rows are not exempt from the per-pass cap: keeping bbset2 and eating "
+                          "bbsm would leave 'the set is the receiver' indistinguishable from 'the set "
+                          "holds nothing', which is the half-pair r249 refuses")
+
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
         # its own ending, so a silent boot leaves the boot before it on the card and the reader called
@@ -7189,8 +7274,11 @@ def check_board(errors: list) -> str:
     # the count column so both display rows read the same three words. The menu names round343 while rows
     # this round did not touch keep their own generation tokens (bbsend r331, bbrcv r328) -- a card row
     # names its probe generation, the title names the image that ran.
-    if not board["payload"]["title"].startswith("clover r344:"):
-        errors.append('[payload] title is not "clover r344: ...": the menu would not name this round')
+    # Round346 is the same shape: the bbsend row keeps its r331 token and gains unread=, while the rows
+    # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
+    # them. The menu names round346.
+    if not board["payload"]["title"].startswith("clover r346:"):
+        errors.append('[payload] title is not "clover r346: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -9344,8 +9432,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r344:"):
-        errors.append('[payload] title is not "clover r344: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r346:"):
+        errors.append('[payload] title is not "clover r346: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
