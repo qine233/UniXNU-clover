@@ -29157,3 +29157,24 @@ r347: bbsmhold hop=1 i=5 j=0 pid=177 c=com.apple.datam nm=2d17 ty=send raw=10000
 **r349 构建与闸门。** 144 枚补丁重放 → prelink `488a2967…` → amfi `50ee33ec…`（两刀 VA 不变）→ normalized
 `2c455f7a…`（973 戳）→ `round349-v0.7.66-payload.img` `e831a65d…`（58,720,256 B）。`payload.json`：kernel `2c455f7a…`、
 payload_kernel `fefb176e…`、adt `c284181f…`。仓库 EXIT=0；镜像 EXIT=0、51 组 OK / 0 FAIL（`r349-holdth`、`r349-holdt` present）。
+
+## Round349 读数（boot 129：持钥者自己停在接收里）
+
+**这一靴。** 冷刷 `round349-v0.7.66-payload.img`，计数 128→129；`bbsmhold` 三行（launchd / SpringBoard /
+com.apple.datam，分别持 `13b03` / `3807` / `2e03` 的发送权），三行 `holdth` 与两行 `holdt`：
+
+| holder | holdth | holdt（trap 线程） |
+|---|---|---|
+| pid 1 launchd | th=7 wait=7 run=0 **m2=0** | 无（没有线程在 mach_msg2） |
+| pid 27 SpringBoard | th=7 wait=7 run=0 **m2=1** | `tid=12c st=1 we=0 cont=fffffff0072622ac pc=1d51dcb58 rn=1e03 rem=4203` |
+| pid 172 datamigrator | th=7 wait=7 run=0 **m2=1** | `tid=4ea st=41 we=0 cont=…2622ac pc=1d51dcb58 rn=2903 rem=5303` |
+
+**判读。**
+1. **S-A 成立**：`holdth/holdt` 落地；`cont=ipc_mqueue_receive_continue`（与 hop 同一地址）说明两个被采样的持钥线程
+   **都在接收路径上**；`rn=` 是它们自己空间里的收口（SpringBoard `1e03`、datamigrator `2903`），`rem=` 是另一个名字
+   （`4203`/`5303`），**不等于它们持有的 door**（`3807`/`2e03`）。
+2. **S-B**：SpringBoard `m2=1`、`run=0`、`wait=7`——七条线程全在等，唯一在 trap 的那条是在等收，不是在发。
+3. **S-C 成立**：三行 `bbsmhold` 对应三行 `holdth`；`holdt` 只给 trap 线程（2 行），不是缺行。
+4. **#666 的新题面**：SpringBoard 有 backboardd 的钥匙，但它自己**停在 `1e03` 这个收口上等人叫醒**。下一问不再是
+   「SpringBoard 为什么不发」，而是「**谁应该叫醒 SpringBoard 的 `1e03`**」——把同一个 holder 普查（r331 的两条腿）
+   套到 `rn` 指向的那个口上，读出发送权持有者与 `ip_mscount`。
