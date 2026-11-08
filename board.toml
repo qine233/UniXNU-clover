@@ -2682,6 +2682,11 @@ psci_method = "smc"
 # datamigrator skips migration (the boot 107 desktop stall), while packed_data_ramdisk alone still only
 # controls whether PackedRAMDisk joins the memory map.
 packed_data_ramdisk = false
+# Round322's revert, expressed in format 2's vocabulary: generate() writes /chosen/ephemeral-storage
+# whenever a data ramdisk is present and this is false, and the board that boots to the desktop
+# (sheng) declares persistent_data=true with no ephemeral-storage so first-boot data migration runs
+# against the card's real /private/var window. verify-clover-payload.py asserts the key is ABSENT.
+persistent_data = true
 ipad_identity = true
 unique_chip_id = "required"
 

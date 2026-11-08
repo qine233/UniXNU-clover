@@ -2141,9 +2141,20 @@ def report(image: pathlib.Path) -> int:
 
 
 def main() -> int:
+    global LOCAL_KERNEL, TREE, PMGR_REPORT
     ap = argparse.ArgumentParser()
     ap.add_argument("image", nargs="*", type=pathlib.Path, default=[XNU_PAYLOAD])
+    # Format 2 builds into out/<device>/<profile>/<defconfig>/, so the tree and the kernel the
+    # payload was built from cannot be the format-1 paths above. Both stay defaulted for the
+    # format-1 pipeline and are named explicitly for a format-2 build.
+    ap.add_argument("--kernel", type=pathlib.Path, default=LOCAL_KERNEL,
+                    help="the prelink/normalized kernel the payload was built from")
+    ap.add_argument("--tree", type=pathlib.Path, default=TREE,
+                    help="the assembled build tree (for the PMGR audit report)")
     args = ap.parse_args()
+    LOCAL_KERNEL = args.kernel
+    TREE = args.tree
+    PMGR_REPORT = TREE / "build/clover-pmgr/build-report.json"
     return min(1, sum(report(image) != 0 for image in args.image))
 
 

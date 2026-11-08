@@ -54,6 +54,20 @@ if compat.is_symlink() or compat.exists():
     compat.unlink()
 compat.symlink_to(Path('..') / 'native-aes' / 'libSoftwareAES.a')
 
+# build-arm-driver.py NativeAES resolves its source as drivers/NativeAES/NativeAES.cpp (the format-1
+# directory name), and the driver itself is the base repository's SoftwareAES component. Link it
+# from there rather than vendoring a second copy into this repository: a vendored driver would owe
+# the driver-documentation gate a README clause citation, and it is not a driver this port authored.
+aes = tree / 'drivers' / 'NativeAES'
+if not (aes.is_symlink() or aes.exists()):
+    # tree/patches/xnu is the base repository's patch directory, so two levels up is its root.
+    base = (tree / 'patches' / 'xnu').resolve().parents[1]
+    upstream = base / 'drivers' / 'SoftwareAES'
+    if not upstream.is_dir():
+        sys.exit(f'{upstream}: the base repository carries no SoftwareAES driver to link as NativeAES')
+    aes.symlink_to(upstream, target_is_directory=True)
+    linked.append('NativeAES')
+
 print('prepare-clover-tree: linked ' + (', '.join(linked) or 'none')
       + '; already in the tree: ' + (', '.join(present) or 'none')
       + '; AES link ' + str(compat.relative_to(tree)))

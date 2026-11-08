@@ -10162,7 +10162,16 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
         print("[check-clover] notice: no [[bootimg.dtb_node]]; the appended device tree "
               "already declares the splash region")
 
-    named = board["kernel"]["archives"] + board["firmware"].get("preflight", []) + [adt["tool"]]
+    # Format 2 replaces the ADT generator with a device-tree source, so there is no [adt].tool to
+    # name; the source itself takes its place in the "board names a file it must carry" list.
+    tree_source = board.get("device_tree", {}).get("source")
+    if tree_source:
+        relative = tree_source.split(":", 1)[-1]
+        if not (REPO / relative).is_file():
+            errors.append(f"board.toml [device_tree].source names {tree_source}, which is not "
+                          f"{relative} in this repository")
+    named = board["kernel"]["archives"] + board["firmware"].get("preflight", []) + (
+        [adt["tool"]] if adt.get("tool") else [])
     if board["payload"].get("skip_setup_tool"):
         named.append(board["payload"]["skip_setup_tool"])
     from_tree = pathlib.Path.cwd() != REPO

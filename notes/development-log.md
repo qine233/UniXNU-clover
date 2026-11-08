@@ -28818,3 +28818,26 @@ catalog 已链的不动），并把 `build/software-aes/libSoftwareAES.a` 指到
 本轮的 `8cf17e02` 还没有走 AMFI → normalize → payload，也没有双闸门与刷写。下一手：用 `8cf17e02` 走完
 `patch-clover-amfi.py` → `normalize-kernel-macho.py` → `unixnu payload`，再跑 `check-clover.py` /
 `verify-clover-payload.py`；双闸门绿后再决定要不要在这个分支上冷刷一次。
+
+## sheng-port ③（format 2 的 AMFI → normalize → payload，双闸门绿）
+
+**产物（`~/clover-out/sheng-port-format2/`）。** prelink `8cf17e02…` → `patch-clover-amfi.py` → `ea9b813b…`
+（两刀落在 VA `0xfffffff004ab40e4`/`0xfffffff004ab416c`；**文件偏移比 r344 多 0xE000**——正好是 __cstring 因路径变长而
+多出的 57,344 B，VA 一模一样，这是路径归因的最直接旁证）→ `normalize-kernel-macho.py --output` → `8448d439…`
+（973 枚 object 戳清零）→ `unixnu payload` → `format2-payload.img` `7a431525…`（56 MiB，58,720,256 B）。
+payload.json：`kernel_sha256 8448d439…`、`payload_kernel_sha256 de4d5c4d…`、`adt_sha256 0fbed136…`。
+
+**两个契约修正（不是绕过）。** ① `generate()` 在有 data ramdisk 且 `persistent_data` 不为真时会写
+`/chosen/ephemeral-storage=1`；r322 的结论是这一键必须**缺席**（sheng 就是 persistent_data=true、无 ephemeral-storage），
+所以 `[payload.adt]` 加 `persistent_data = true`——闸门当场从 FAIL 变 OK，说明旧的 ADT 口径被 format 2 的默认行为
+反转了，这是迁移必须显式表态的一处。② `verify-clover-payload.py` 有两个 format 1 硬路径（`--kernel` 比的本地内核、
+`--tree` 读 PMGR 审计报告），加两个默认值不变的可选参数；format 2 传新内核与新树。
+**闸门。** 仓库侧 `check-clover.py` **EXIT=0**（`drivers documented: 11`，`ADT 14384 bytes, 8 cores`）；payload 侧
+**EXIT=0，51 项全 OK、0 FAIL、0 SKIPPED**。`check-clover.py` 另外修了两处 schema 2 假设：`[adt].tool` 不存在时改用
+`[device_tree].source` 做「板子点名的文件必须在仓里」这一条；`drivers/NativeAES` 不再 vendor 进设备仓（它是 base 的
+SoftwareAES，vendor 进来会欠驱动文档闸门一条 README 引用），改由 `prepare-clover-tree.py` 从
+`<base>/drivers/SoftwareAES` 链成 `tree/drivers/NativeAES`。
+
+**未做。** 还没有 `unixnu bootimg`（format 2 的 [bootimg] 段尚未在分支上验证）也没有冷刷。下一步若继续：bootimg →
+冷刷 cache → 读回，判两件预登记的事：① `arm-io` 窗口由 GIC/GICR 的 reg 算出 `+0x00C00000`（r343 的旧 ADT 是
+`+0x01000000`，4 MiB 差）；② format 2 的 ADT 上 `/chosen` 的 root-matching/persistent 语义是否让首靴行为与 r344 一致。
