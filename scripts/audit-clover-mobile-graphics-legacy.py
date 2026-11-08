@@ -30,8 +30,13 @@ import struct
 import sys
 
 BASE = pathlib.Path("/Users/zhouzhou/UniXNU")
-KERNEL = BASE / "out/clover/kernel/kernel.macho"
-PLAN = BASE / "out/clover/kernel/kernel.json"
+TREE = pathlib.Path(__file__).resolve().parents[1]
+# Format 2 keeps the prelink output under out/<device>/<profile>/<defconfig>/kernel, so the kernel
+# under audit is the one the caller names first, then the tree's sibling, then the format-1 path.
+KERNEL = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else (
+    TREE.parent / "kernel/kernel.macho" if (TREE.parent / "kernel/kernel.macho").is_file()
+    else BASE / "out/clover/kernel/kernel.macho")
+PLAN = KERNEL.with_name("kernel.json")
 OUT = pathlib.Path(__file__).resolve().parents[1] / "build/display-analysis/clover-mobile-graphics-legacy-abi.json"
 FAMILY = "com.apple.iokit.IOMobileGraphicsFamily"
 

@@ -28771,3 +28771,50 @@ include 必须写 `/include/ "sdm660.dtsi"`，`#include` 直接语法错。
 **未做**：内核还没在 format 2 下重建（本轮 payload 用的是 format 1 那枚 normalized kernel，正好把「ADT 换法」与
 「内核构建换法」分开）；ADT 逐字节对比未完成（旧 ADT 14384 B 的 `dtc -I dtb` 报 `incorrect magic`，说明它不是裸 FDT，
 需要按 UniXNU 的 ADT 包装层来解）；未刷写。分支已提交 `48bce5b`。
+
+## sheng-port ②（format 2 下重建内核：8cf17e02，与 r344 的 07988f06 逐项归因）
+
+**结论先说。** format 2 下的 `./unixnu kernel` 通过，prelink 内核 sha256 `8cf17e02…`，**与 r344 的 `07988f06…` 不同**，
+但差异已完整归因到两件事，XNU 输入本身逐字节相同：① 内核对 229 条源路径字符串（`__cstring` 里，不是 DWARF——这枚内核
+没有调试段）记录构建树的绝对路径，format 2 的 out 布局把 tree 从 `out/clover/tree` 搬到
+`out/clover/ipados-17.7.11-21H461/clover/tree`，每条多 31 B；② 内核版本串里的构建时间（r344 `Fri Nov  6 00:32:22`，
+本次 `Sun Nov  8 17:06:13`，等长）。两项之外没有任何差异：
+把两枚内核的所有 ≥6 B 可打印串取出来、把两种 tree 前缀都换成同一个占位符后比较，**串多重集完全相同（155,560 条）**，
+只剩 3 条版本串不同；段表里唯一的尺寸差也在 `__cstring`（+6,641 B），其余全是 16 KiB 对齐填充。
+
+**为什么「输入相同」这句话有证据。** 在 pristine `d8b80295` 上按字母序应用 base 的 138 枚补丁 + XnuPrelink 的 2 枚，
+得到的工作树与 r344 那棵 `.cache/xnu-work` **逐文件 sha256 相同（0 差异）**，只多出 `prepare-xnu-source.py` 放的 26 个
+公开头文件。format 2 这一轮跑完后再比一次：新树 vs 旧树 **0 差异、0 新增**。所以两次构建的源码输入是同一棵树。
+
+**旧 series 为什么错，以及它是怎么错的。** 上一格把 `patch_series` 设成 arch+os+device，device 只留了 11 枚
+「LATE 名单之外」的补丁（`c4d76b7`）。那个读法把 format 1 的反转循环当成了生效的：循环从 r331 这枚补丁开始，
+而 round335 重写过 r331 的补丁文件，所以 `git apply --reverse --check` 在**第一条就失败**，后续每一条都因为
+上下文属于更晚的补丁而被跳过——整个 LATE 段是空操作。证据不在推理里，在卡上：boot 124 的窗口里 r308 beat/smp、
+r309 cen/exit/latch、r327 bbnow、r328 bbrcv、r331 bbown/bbsend 全部还在，而这些行只有内核侧补丁能印。
+旧工作树的 `osfmk/kern/task.c` 比 pristine 多 5,630 行，也是同一件事。
+**所以正确的 series = 全部 140 枚**（138 base + 2 kit），按 format 1 wildcard 的字母序；`zzz-boot-progress` 留在里面
+（本板 `XNU_BOOT_PROGRESS=n`，它的钩子在编译期消失，但旧树确实带着它）。把 arch 系列再叠进来是**错的**：
+它只有 56 枚、漏掉 `native-smp-secondary`（8 核！）与 `sheng-platform-power`，而且带着 3 枚更晚的补丁
+（`native-4k-signature-hash-cache`、`offline-owner-root-binding-audit`、`offline-owner-systemos-mount`），
+它们的 hunk 与 clover 诊断链冲突，叠加后从 r226 起就 apply 失败。两个坑都在 `patches/xnu/series` 的注释里。
+
+**路径前缀只锚得到 profile 根，没有 base 根。** `profiles.resolve_path()` 认 `arch/soc/os/device/component` 五种前缀，
+base 仓根没有前缀。`arch:` 根是 `<repo>/profiles/arch/arm64`，上溯三级就是仓根，所以 base 补丁写成
+`arch:../../../patches/xnu/NAME`——不假设两个仓库是兄弟目录（`../../../UniXNU/...` 会）。
+
+**另外三处 format 2 的硬契约（本轮踩的）。** ① schema 2 只把 catalog 选中的组件链进 `tree/drivers`，本板的
+`Clover*`/`NativeAES`/`NativeMobileDisplay`/`NativeHidInput`/`NativeKeyStoreEvents` 不在 catalog 里，全被过滤掉；
+新增 `scripts/prepare-clover-tree.py` 作为 archives 第一条，把 `$UNIXNU_DEVICE/drivers/*` 链进 tree（先到先得，
+catalog 已链的不动），并把 `build/software-aes/libSoftwareAES.a` 指到 `../native-aes/libSoftwareAES.a`——format 1 靠
+`sync_outputs` 的 legacy_outputs 造这个别名，format 2 因为 SoftwareAES 没被选中而不造，可链接步固定读这个路径。
+`build-arm-driver.py NativeAES` 的输出目录仍是 `build/native-aes`（设备脚本的格式 1 表），绑定步用
+`--objects-dir build/native-aes`，两处对齐。② 显示归档要读「本板已产出的 prelink 内核」才能审计，而它自己就是
+链进内核的归档——首轮有鸡生蛋问题；把 r344 的 `out/clover/kernel/{kernel.macho,kernel.json}` 拷进 format 2 的
+`kernel/` 作种即可，之后每轮自然收敛。③ `audit-clover-mobile-graphics-legacy.py` 硬编码 format 1 的
+`out/clover/kernel/kernel.macho`；改成「参数 > tree 的兄弟 kernel > format 1 路径」，`kernel.json` 取同目录，
+否则 format 2 会拿旧树的内核去审计新树的内核（本次第一遍就是这么红的）。
+
+**未做。** payload 仍用 r344 那枚 normalized 内核（`2d1019c2…`）构建过的 format 2 payload（`sheng-port ①` 里已 dry-run）；
+本轮的 `8cf17e02` 还没有走 AMFI → normalize → payload，也没有双闸门与刷写。下一手：用 `8cf17e02` 走完
+`patch-clover-amfi.py` → `normalize-kernel-macho.py` → `unixnu payload`，再跑 `check-clover.py` /
+`verify-clover-payload.py`；双闸门绿后再决定要不要在这个分支上冷刷一次。

@@ -71,14 +71,23 @@ windows = [
 [kernel]
 defconfig = "clover_defconfig"
 config_fragments = ["arch:configs/common.config", "soc:configs/sdm660.config", "os:configs/ipados.config"]
-patch_series = ["arch:patches/xnu/series", "device:patches/xnu/series"]
+# The device series is the whole set: the format-1 tree carried every base patch, and the arch
+# series is a 56-entry subset that also misses native-smp-secondary. Listing both would apply
+# most patches twice. patches/xnu/series explains why the LATE_PATCH loop did not trim it.
+patch_series = ["device:patches/xnu/series"]
 archives = [
+  # Format 2 links only catalog components into tree/drivers and drops the legacy output alias the
+  # AES link reads; this port's drivers are device-local sources the catalog does not carry. The step
+  # runs first so every archive below finds its source, and the two catalog components stay
+  # `component:` entries so the order is the format-1 order (the assembler's automatic component pass
+  # would otherwise prepend them).
+  "prepare-clover-tree.py",
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
-  "build-arm-driver.py ArmDTPlatform",
-  "build-arm-driver.py ArmCpu",
+  "component:ArmDTPlatform",
+  "component:ArmCpu",
   "build-arm-driver.py NativeAES",
-  "build-native-aes-bindings.py",
+  "build-native-aes-bindings.py --objects-dir build/native-aes",
   "build-mockfs-fixture.py",
   "build-libpthread-kernel.py",
   "build-clover-gop-legacy-display.py",
@@ -2715,3 +2724,9 @@ button-names = ["hold", "voldown", "volup"]
 
 [adt.buttons.u32]
 home-button-type = 2
+
+[components]
+# Only catalog components this tree has recipes for. The device drivers are archives
+# (CloverSdhci, CloverInput, CloverPower, CloverDsp, CloverGpu, the display pair), not
+# catalog entries, so they stay in [kernel].archives.
+include = ["ArmDTPlatform", "ArmCpu", "XnuPrelink", "DarwinBoot"]

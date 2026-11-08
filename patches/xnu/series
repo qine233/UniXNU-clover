@@ -1,84 +1,169 @@
-# XnuPrelink's two OS-profile patches, named here because the OS series also carries
-# zzz-boot-progress, which this board skips (XNU_BOOT_PROGRESS=n) and which conflicts
-# with the arch layer in bsd_init.c.
+# Clover's XNU patch series (format 2).
+#
+# What this board's kernel is built from is the whole set the format-1 tree accumulated: every
+# base patch plus the two XnuPrelink patches, in the alphabetical order the format-1 build applied
+# them. That is not an accident of history worth trimming here. The format-1 build's LATE_PATCH
+# loop (scripts/build-xnu-4k-baseline.sh) tries to reverse the newest clover diagnostics before
+# each build, but its first entry is the r331 patch, and round335 rewrote that patch after it had
+# been applied -- so the reverse check fails on the first entry, every later reverse is skipped
+# for want of that context, and the loop is a no-op. The shipped r344 kernel still prints the
+# r308/r309/r327/r328/r331 rows (boot 124's card), so those kernel patches are inside the image,
+# not reverted. Listing them here says what the build actually does instead of relying on a loop
+# that silently does nothing.
+#
+# Replaying exactly these 140 patches on a pristine d8b80295 checkout reproduces the r344 XNU work
+# tree with zero differing files (the only extra files are the public headers
+# scripts/prepare-xnu-source.py adds).
+#
+# Do not swap this for the arch profile series plus the device patches: the arch series is a
+# 56-entry subset that misses native-smp-secondary (8 CPUs) and sheng-platform-power, and it also
+# carries three newer patches (native-4k-signature-hash-cache, offline-owner-root-binding-audit,
+# offline-owner-systemos-mount) whose hunks collide with the clover diagnostics, so that
+# combination stops applying at r226. This file is self-contained for the same reason.
+#
+# Paths: `arch:` is the arch profile root (<repo>/profiles/arch/arm64); three levels up is the
+# repository root, so `arch:../../../patches/xnu/NAME` is <repo>/patches/xnu/NAME. The two
+# kit patches come from the XnuPrelink component. boot-progress stays even though this board
+# builds XNU_BOOT_PROGRESS=n: the r344 tree had it applied and its hooks compile away when the
+# flag is off.
+
+arch:../../../patches/xnu/apple-only-cpu-tunables.patch
+arch:../../../patches/xnu/architectural-timer-entry.patch
+arch:../../../patches/xnu/armvirt-platform-personality.patch
+arch:../../../patches/xnu/cxx-flag-dependencies.patch
+arch:../../../patches/xnu/disabled-deferred-reclaim.patch
+arch:../../../patches/xnu/external-archive-dependencies.patch
+arch:../../../patches/xnu/kernel-sdk-root.patch
+arch:../../../patches/xnu/local-availability.patch
+arch:../../../patches/xnu/mockfs-intermediate-lookup.patch
+arch:../../../patches/xnu/mockfs-memory-device-width.patch
+arch:../../../patches/xnu/mockfs-statfs.patch
+arch:../../../patches/xnu/mockfs-test-file.patch
+arch:../../../patches/xnu/mockfs-typed-allocation.patch
+arch:../../../patches/xnu/native-4k-bootstrap-capacity.patch
+arch:../../../patches/xnu/native-4k-signature-hash-cache.patch
+arch:../../../patches/xnu/native-4k-user-abi.patch
+arch:../../../patches/xnu/native-aes-personality.patch
+arch:../../../patches/xnu/native-arm-pan.patch
+arch:../../../patches/xnu/native-dt-panic-region.patch
+arch:../../../patches/xnu/native-lookup-trace.patch
+arch:../../../patches/xnu/native-priv-work-interval.patch
+arch:../../../patches/xnu/native-quiet-managed-page-report.patch
+arch:../../../patches/xnu/native-smp-secondary.patch
+arch:../../../patches/xnu/native-text-fixup.patch
+arch:../../../patches/xnu/native-trust-cache-runtime.patch
+arch:../../../patches/xnu/native-union-getattrlistbulk.patch
+arch:../../../patches/xnu/native-union-lower-directory.patch
+arch:../../../patches/xnu/native-work-interval-instance.patch
+arch:../../../patches/xnu/native-work-interval-soft-fail.patch
+arch:../../../patches/xnu/native-work-interval-trace.patch
+arch:../../../patches/xnu/non-apple-cache-monitor.patch
+arch:../../../patches/xnu/non-apple-iommu-bootstrap.patch
+arch:../../../patches/xnu/non-apple-pmap-field.patch
+arch:../../../patches/xnu/null-root-media.patch
+arch:../../../patches/xnu/offline-component-load-probes.patch
+arch:../../../patches/xnu/offline-legacy-start.patch
+arch:../../../patches/xnu/offline-native-gpu-broker.patch
+arch:../../../patches/xnu/offline-owner-boot-manifest.patch
+arch:../../../patches/xnu/offline-owner-cache-carrier.patch
+arch:../../../patches/xnu/offline-owner-root-binding-audit.patch
+arch:../../../patches/xnu/offline-owner-root-crypto-probe.patch
+arch:../../../patches/xnu/offline-owner-systemos-mount.patch
+arch:../../../patches/xnu/offline-owner-z-air-init.patch
+arch:../../../patches/xnu/offline-pgz-alignment-probe.patch
+arch:../../../patches/xnu/pgz-aligned-validation.patch
+arch:../../../patches/xnu/public-entitlements-header.patch
+arch:../../../patches/xnu/published-freezer-condition.patch
+arch:../../../patches/xnu/sheng-platform-power.patch
+arch:../../../patches/xnu/source-corecrypto14-bootstrap.patch
+arch:../../../patches/xnu/source-machine-layer.patch
+arch:../../../patches/xnu/source-pthread-bootstrap.patch
+arch:../../../patches/xnu/zzw-native-adreno-sandbox-grant.patch
+arch:../../../patches/xnu/zzwb-native-sandbox-grant-set-properties.patch
+arch:../../../patches/xnu/zzx-pmap-sync-64bit-pa.patch
+arch:../../../patches/xnu/zzy-clover-dyld-cache-skip.patch
+arch:../../../patches/xnu/zzy-clover-exec-sig-bytes.patch
+arch:../../../patches/xnu/zzy-clover-owner-root-trust.patch
+arch:../../../patches/xnu/zzy-clover-root-mount-why.patch
+arch:../../../patches/xnu/zzy-clover-shared-region-why2.patch
+arch:../../../patches/xnu/zzy-clover-shared-region-why3.patch
+arch:../../../patches/xnu/zzy-clover-shared-region-why4.patch
+arch:../../../patches/xnu/zzy-clover-shared-region-why5.patch
+arch:../../../patches/xnu/zzy-clover-systemos-mount.patch
+arch:../../../patches/xnu/zzy-native-gpu-addon-mount.patch
+arch:../../../patches/xnu/zzy-staged-system-apps.patch
+arch:../../../patches/xnu/zzyb-native-cryptex-os-view.patch
+arch:../../../patches/xnu/zzyc-owner-skip-launch-constraints.patch
+arch:../../../patches/xnu/zzz-boot-progress.patch
+arch:../../../patches/xnu/zzz-clover-mac-exec-probe.patch
+arch:../../../patches/xnu/zzzz-clover-spawn-why.patch
+arch:../../../patches/xnu/zzzzz-clover-syswhy.patch
+arch:../../../patches/xnu/zzzzz-clover-syswhy2.patch
+arch:../../../patches/xnu/zzzzz-clover-syswhy3.patch
+arch:../../../patches/xnu/zzzzz-clover-syswhy4.patch
+arch:../../../patches/xnu/zzzzzz-clover-crash-why.patch
+arch:../../../patches/xnu/zzzzzzz-clover-user-brk-why.patch
+arch:../../../patches/xnu/zzzzzzzz-clover-sb-sample.patch
+arch:../../../patches/xnu/zzzzzzzzz-clover-peer-sample.patch
+arch:../../../patches/xnu/zzzzzzzzzz-clover-p1-sample.patch
+arch:../../../patches/xnu/zzzzzzzzzzz-clover-r226.patch
+arch:../../../patches/xnu/zzzzzzzzzzzz-clover-r227.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzz-clover-r228.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzz-clover-r229.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzz-clover-r230.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzz-clover-r231.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzz-clover-r232.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzz-clover-r233.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzz-clover-r234.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzz-clover-r235.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzz-clover-r236.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzz-clover-r237.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzz-clover-r238.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzz-clover-r239.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r243.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r244.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r245.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r246.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r247.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r250.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r251.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r252.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r254.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r262.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r263.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r264.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r265.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r266.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r267.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r268.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r269.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r270.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r271.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r273.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r274.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r275.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r276.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r277.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r283.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r289.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r295.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r296.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r297.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r298.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r299.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r300.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r303.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r304.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r305.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r306.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r307.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r308.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r309.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r324.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r325.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r326.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r327.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r328.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r331.patch
 component:XnuPrelink/patches/xnu-10063.141.1-security-init.patch
 component:XnuPrelink/patches/xnu-10063.141.1-sparse-index.patch
-../xnu-clover/zzy-clover-dyld-cache-skip.patch
-../xnu-clover/zzy-clover-exec-sig-bytes.patch
-../xnu-clover/zzy-clover-owner-root-trust.patch
-../xnu-clover/zzy-clover-root-mount-why.patch
-../xnu-clover/zzy-clover-shared-region-why2.patch
-../xnu-clover/zzy-clover-shared-region-why3.patch
-../xnu-clover/zzy-clover-shared-region-why4.patch
-../xnu-clover/zzy-clover-shared-region-why5.patch
-../xnu-clover/zzy-clover-systemos-mount.patch
-../xnu-clover/zzz-clover-mac-exec-probe.patch
-../xnu-clover/zzzz-clover-spawn-why.patch
-../xnu-clover/zzzzz-clover-syswhy.patch
-../xnu-clover/zzzzz-clover-syswhy2.patch
-../xnu-clover/zzzzz-clover-syswhy3.patch
-../xnu-clover/zzzzz-clover-syswhy4.patch
-../xnu-clover/zzzzzz-clover-crash-why.patch
-../xnu-clover/zzzzzzz-clover-user-brk-why.patch
-../xnu-clover/zzzzzzzz-clover-sb-sample.patch
-../xnu-clover/zzzzzzzzz-clover-peer-sample.patch
-../xnu-clover/zzzzzzzzzz-clover-p1-sample.patch
-../xnu-clover/zzzzzzzzzzz-clover-r226.patch
-../xnu-clover/zzzzzzzzzzzz-clover-r227.patch
-../xnu-clover/zzzzzzzzzzzzz-clover-r228.patch
-../xnu-clover/zzzzzzzzzzzzzz-clover-r229.patch
-../xnu-clover/zzzzzzzzzzzzzz-clover-r230.patch
-../xnu-clover/zzzzzzzzzzzzzzz-clover-r231.patch
-../xnu-clover/zzzzzzzzzzzzzzzz-clover-r232.patch
-../xnu-clover/zzzzzzzzzzzzzzzzz-clover-r233.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzz-clover-r234.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzz-clover-r235.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzz-clover-r236.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzz-clover-r237.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzz-clover-r238.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzz-clover-r239.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r243.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r244.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r245.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r246.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r247.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r250.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r251.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r252.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r254.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r262.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r263.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r264.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r265.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r266.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r267.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r268.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r269.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r270.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r271.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r273.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r274.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r275.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r276.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r277.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r283.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r289.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r295.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r296.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r297.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r298.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r299.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r300.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r303.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r304.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r305.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r306.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r307.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r308.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r309.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r324.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r325.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r326.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r327.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r328.patch
-../xnu-clover/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r331.patch
