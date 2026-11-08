@@ -29560,3 +29560,36 @@ base-bytes、local-bytes、series-missing、series-order、mscount-read、branch
 `-		    " debt=%u unread=%u\n",` 那行从删行改成保留，验「只换一支分支结尾」会被
 removed-pin 抓住——两分支同形是这一轮的点）、bbonceh-row、tee-class、exemption、title；每支红
 于自己的理由，恢复字节一致（三份副本 md5 复验 `93eda62a…`）。
+
+**读数（boot 135，`round355-v0.7.73-payload.img`）。** 仪器在跑，形状全对，但叶子那腿没遇到叶子：
+
+1. **闸门①（burst 跑完）过**：全文 0 枚 `abt`；`r327: bbnow t=562 pid=58 fired=1 hn=3
+   state=hop_null`；bbsend 每火 3 行（hop=0/1/2）且两通道都带新尾
+   `so=… ms=… once=… och=… ocp=… ocs=…`；r346–r352 行 177 枚在场。正对照成立：同帧
+   `clover r352: onceh t=562 pid=27 j=1 hpid=58 c=backboardd nm=14b0b ty=sendonce raw=bc40001`
+   ＋`r350: holdrn … rn=1e03 … sr=1 ms=1 so=1 own=1 once=1 och=1 ocp=127 ocs=127`
+   ——boot 134 的 Y-A 在本靴原样复现，so=/once= 读数通路工作正常。
+2. **闸门②（叶子）缺席 ⇒ 按预登记控制腿判，不判 Z**：本火 backboardd 的三枚 hop 全是 set
+   （`v=4e03.6703.8203.0`，`e=17.17.17.0`，`c=…+ps.+ps.+ps.-`），
+   `cand=3 debt=0 unread=3`——没有一枚 e=0 的端口叶子，bbsend 那三行的 so/ms/once 是
+   helper 的零（set 对象无 ip_* 字段），不许读成读数。boot 134 是 `cand=4 debt=1`（一枚端口
+   +三枚 set）；**每建必变的是 hop 身份，可比的是形状**——本靴的停相位比 134 更早也更纯：
+   backboardd 欠的是三枚集合，不是一枚叶子口。
+3. **集合这一侧把环直接照出来了**（r346/r347/r349 既有仪器，本靴首次在三 set 形状上读满）：
+   hop1 的 `6703` n=7 成员里 `9203` 是 `sr=5 ms=0 own=1 hits=4`，持有者点名
+   launchd（`nm=13a03`）与 SpringBoard（`nm=5507`）等；逐持有者普查 `holdth`：
+   SpringBoard `th=10 wait=10 run=0 m2=1`，`holdt` 那枚 trap 线程 `rn=1e03 rem=3a03`，
+   而它 `1e03` 的回复权持有者又是 backboardd（第 1 条的 onceh）。**SpringBoard 阻塞在
+   mach_msg2 上等自己的 1e03，而这枚口的 send-once 在 backboardd 手里；backboardd 阻塞在
+   集合上等任何一封经 9203 成员的来信，而 9203 的发送权里有 SpringBoard 一枚**——环在两方
+   之间闭合，两头都不先发。另一枚细节：`pid=155 rn=2903` 的 onceh 点名
+   `hpid=201 c=com.apple.migra`（r349 时代 datamigrator 先例的同族形状）。
+4. **本靴怎么结束的**：卡上最后一枚行 562.x s、flight 环 558.9 s 后静默；无本靴死线记录
+   （卡上那枚仍属 boot 108）、两枚 panic marker 全 STALE（seq0 boot=124、seq1 boot=87）
+   ⇒ 没进 sink；板子自己回 fastboot 且 misc 无 recovery 命令＝静默复位家族再现。读回走
+   二次 `--allow-misc-bcb`（只写 2048 B BCB，不动 cache）。
+
+**下一手（r356 题面，暂记，正式预登记在 §Round356）**：环既然闭在「两头都不先发」，能拆它的
+新事实只剩一枚——SpringBoard 那枚 trap 线程的 `rem=3a03`：它在 mach_msg2 里**要发往**的那口。
+r355 的 obj_held＋once 普查这套手，挪到持有者任务的 rem 名字上（在 SpringBoard 自己空间里
+翻译 3a03，读 q/sr/ms/so 与该口队列），把「信在途/没发/发往别处」切开。
