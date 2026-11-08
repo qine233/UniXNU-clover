@@ -29273,3 +29273,18 @@ root `614b8356…`、trust `7c369ce0…` 与 r350 逐字节同）→ `round351-v
 补丁两仓同字节 `9a61671f52f1…`。10 条负测全绿并逐字节还原（`~/clover-out/round351-negatives.log`）：
 patch-missing / base-bytes / series-missing / series-order / row-missing / urefs-missing / removed-keep /
 tee-entry / tee-exempt / title。
+
+## Round351 读数（boot 131）：门链这一靴没出现，r351 的手没有执行
+
+**帧。** 卡上窗口 `boot 131`，`tee lines: 512 stamped=509 glued=3`；boot 计数 130 → 131。
+**门链没有解析**：`r327: bbnow t=660 pid=58 fired=1 hn=3 state=hop_unresolved named=0 asked=1 o0=null o1=null o2=fail
+o3=- r0=0 r1=0 r2=5d0b r3=0`。整靴 `bbset2`/`bbsm`/`bbsmh`/`holdth`/`holdt`/`holdrn`/`holdrnow` **均为 0 行**；
+`r346: bbhop` 只有 hop=0 两枚（tee 与 report 各一），`bbsend` 全无。boot 130 同一 t=660 的三次 fire 则是
+`bbset2 4603 n=3` / `6e03 n=7` + 十枚 `bbsm` + 2 个 `holdrn` 对象。
+**判读。** X-A/X-B/X-C 三条**均未到达**：不是仪器缺席，而是 r350/r351 的 pset 阶段在 `hop_unresolved` 上被门控，没有对象可开。
+**X 的控制腿自己先红了**：预登记的「`bbsend/bbset2/bbsm` 形状与 130 同比」不成立，boot 131 的 backboardd 在 t=660
+不在那两张 set 上。`r2=5d0b` 是唯一解析到的 hop 名（且 translate 失败），`o0/o1=null` 表示前两跳没有收名可追随。
+**结论与下一手。** 先不改代码：同一枚 `round351-v0.7.68-payload.img` 再冷刷一次（boot 132，控制轮），判
+「boot 130 的门链是稳定拓扑，131 是偶发」还是「130 之后拓扑已变」。若 boot 132 仍 `hop_unresolved`，则下一轮把
+fire 条件从「签名变化 + 心跳」扩到逐跳记录 `o=`/`r=`/`state=` 的每次 fire 快照，并让 pset 阶段在 hop 未解析时也印一行自证
+（而不是静默跳过），再谈 X-A…X-C。若 boot 132 复现 130 的形状，则继续判 `holdrnow` 的 bits。
