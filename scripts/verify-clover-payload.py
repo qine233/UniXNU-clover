@@ -1278,10 +1278,15 @@ def check_sb_sample(kernel: bytes) -> bool:
              # quietly swallowing the row's tail, and a binary that carries one and not the other cannot
              # say which half of that promise it broke. r327's and r328's rows stay: this round adds a
              # neighbour, it does not replace either.
-             "r343-dispstate": (b"clover r343: dispstate ms=%llu fires=%u seen=%u client=%s calls=%s fails=%s "
-                                b"regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s "
-                                b"vs=%u/%llu/%llu log=%u/%u logdrop=%u\n") in kernel,
-             "r343-dispstatecut": (b"clover r343: dispstatecut bytes=%d cap=%u fires=%u client=%s\n") in kernel,
+             "r344-dispstate": (b"clover r344: dispstate ms=%llu fires=%u seen=%u client=%s pick=%s grewn=%s "
+                               b"p58=%s calls=%s fails=%s regall=%s regs=%s grew=%s hot=%s s6=%s "
+                               b"latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\n") in kernel,
+             "r344-dispstatecut": (b"clover r344: dispstatecut bytes=%d cap=%u fires=%u client=%s\n") in kernel,
+             # Round344's per-record rows: the reference prints every record, this port prints one card record
+             # per line, so both the row and the branch that says it did not fit are pinned as CStrings.
+             "r344-dispclient": (b"clover r344: dispclient idx=%u pid=%d calls=%u fails=%u regall=%u regs=%u "
+                                b"grew=%u hot=%s s6=%s\n") in kernel,
+             "r344-dispclientcut": (b"clover r344: dispclientcut bytes=%d cap=%u idx=%u pid=%d\n") in kernel,
 
              # Round333 reads the swap-wait state on either side of the call that changes it, from the probe's
              # own wrapper, and the source's two adjacent fragments reach the card as one CString -- so this is

@@ -1222,17 +1222,22 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r331: bbsh", "r331-bbsh", 128, 0, 0, 0 },
   { "clover r331: bbown", "r331-bbown", 128, 0, 0, 0 },
 
-  // Round329 publishes the display client's state on the display's own 30 s beat (r343 renamed its columns,
-  // so the heads below are r343's), and the two rows here are
-  // the widest that row can ever be plus the branch that says it did not fit. Order matters and is the only
-  // defence: the cut row's token starts with the state row's token, so a table that listed the shorter key
-  // first would send every `dispstatecut` into the `dispstate` budget -- the same containment r313 met with
-  // two address tables, where reading the wrong one answers instead of refusing. 96 is arithmetic, not
-  // optimism: the unattended deadline is 1800 s, so the beat can fire at most sixty times, and the probe
-  // fires one extra row for each client it interposes (at most eight). 8 for the cut branch, which the
-  // probe expects never to reach and prints only if the row outgrows the 320-byte record.
-  { "clover r343: dispstatecut", "r343-dispstatecut", 8, 0, 0, 0 },
-  { "clover r343: dispstate", "r343-dispstate", 96, 0, 0, 0 },
+  // Round329 publishes the display client's state on the display's own 30 s beat; round344 (#695) makes that
+  // row name the record it picked (`pick=`) and adds a per-record row, so the heads below are r344's for both
+  // display families and r343's only for the swap row. Order matters and is the only defence: within a family
+  // the cut row's token starts with the row's token, so a table that listed the shorter key first would send
+  // every `dispstatecut` into the `dispstate` budget -- the same containment r313 met with two address tables,
+  // where reading the wrong one answers instead of refusing. 96 is arithmetic, not optimism: the unattended
+  // deadline is 1800 s, so the beat can fire at most sixty times, and the probe fires one extra row for each
+  // client it interposes (at most eight). 8 for the cut branches, which the probe expects never to reach and
+  // prints only if a row outgrows its own ceiling. The per-record rows get 128: boot 123 showed five records,
+  // one of them asking every frame, and a row is printed only when a record is new or grew since its own last
+  // sample, so 128 covers a boot that keeps waking records without letting a chatty client crowd out the
+  // census rows sharing the pass.
+  { "clover r344: dispclientcut", "r344-dispclientcut", 8, 0, 0, 0 },
+  { "clover r344: dispclient", "r344-dispclient", 128, 0, 0, 0 },
+  { "clover r344: dispstatecut", "r344-dispstatecut", 8, 0, 0, 0 },
+  { "clover r344: dispstate", "r344-dispstate", 96, 0, 0, 0 },
 
   // Round335 re-keys the swap-wait row on the call's own argument; r343 names the display words for their
   // producers (arg=/latch=/copy=/fc=/cur=/list=, see the probe) and carries the heads below. Same
@@ -4896,9 +4901,10 @@ static void teeConsumeLine (uint32_t &pushed)
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is
-       // indistinguishable from a beat that never fired, and the two answer different questions. The class
-       // budgets of 32 and 8 still bound it.
-       teeHasPrefix (probe->name, teeStringLength (probe->name), "r343-dispstate") ||
+       // indistinguishable from a beat that never fired, and the two answer different questions. Round344's
+       // per-record rows (and both families' cut branches) are fired by the same beat, so one token covers
+       // the whole display group; the class budgets of 96, 128 and 8 still bound it.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r344-disp") ||
        // Round335's swap-wait rows ride the client's own calls, not a burst: a boot that stalls in this wait
        // prints its last row at the moment it stalls, and that row is the one the whole round is built to
        // read. Dropping it to a pass that had already spent its sixteen pushes would leave the reader with

@@ -36,7 +36,7 @@ PANIC = REPO / "scripts/xnu-panic-screen.c"
 PROBE = REPO / "package/CloverLegacyDisplayProbe.cpp"
 HARNESS = REPO / "drivers/CloverPower/tests/clover_power_host.cpp"
 GATE = REPO / "scripts/check-clover.py"
-LOG = Path.home() / "clover-out/round343-column-names/negatives.log"
+LOG = Path.home() / "clover-out/round344-dispclient/negatives.log"
 
 SILENT_AFTER = '''      timeline_close "neither-$(usb_landing_class)" "" ""
       return 2
@@ -455,7 +455,7 @@ CASES = [
      [(PROBE, "memcpy(&latchValue,object+kLatchOffset,4);", "memcpy(&latchValue,object+kCopyOffset,4);")],
      "does not fill latch= through"),
     ("N86 the state row prints copy= before fc= is swapped, so the two display rows disagree on order",
-     [(PROBE, '"hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u', '"hot=%s s6=%s latch=%s fc=%s copy=%s vs=%u')],
+     [(PROBE, 's6=%s latch=%s copy=%s fc=%s vs=%u', 's6=%s latch=%s fc=%s copy=%s vs=%u')],
      "does not print latch= copy= fc= in that order"),
     ("N87 the state row's operands are latchTxt,fcTxt,copyTxt, so the names and buffers are two lists",
      [(PROBE, "s6Txt,latchTxt,copyTxt,fcTxt,", "s6Txt,latchTxt,fcTxt,copyTxt,")],

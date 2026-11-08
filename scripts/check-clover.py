@@ -3295,24 +3295,30 @@ def check_board(errors: list) -> str:
             errors.append("the r328 receive row is not exempt from the per-pass cap: keeping one half of the "
                           "send/receive pair and eating the other makes \"the hop has no door\" "
                           "indistinguishable from \"the row was capped\"")
-        # Round329's beat row, r343's head. Two classes, and the order between them is the only thing that keeps the longer key
-        # reachable: "clover r343: dispstate" is a prefix of "clover r343: dispstatecut", and teeProbeClass
-        # returns the first match, so a table that listed the state row first would send every cut row into
-        # the state row's budget -- r313's containment lesson read the other way (the wrong table answers
-        # instead of refusing).
-        for entry in ('{ "clover r343: dispstatecut", "r343-dispstatecut", 8, 0, 0, 0 },',
-                      '{ "clover r343: dispstate", "r343-dispstate", 96, 0, 0, 0 },'):
+        # Round329's beat row, r344's head. Two families now -- the state row and round344's per-record row --
+        # each with a cut branch, and the order within a family is the only thing that keeps the longer key
+        # reachable: "clover r344: dispstate" is a prefix of "clover r344: dispstatecut", and teeProbeClass
+        # returns the first match, so a table that listed the row first would send every cut row into the
+        # row's budget -- r313's containment lesson read the other way (the wrong table answers instead of
+        # refusing). The per-record family's budget is 128 because boot 123 showed five records on one boot
+        # and the row is printed only when a record is new or grew.
+        for entry in ('{ "clover r344: dispclientcut", "r344-dispclientcut", 8, 0, 0, 0 },',
+                      '{ "clover r344: dispclient", "r344-dispclient", 128, 0, 0, 0 },',
+                      '{ "clover r344: dispstatecut", "r344-dispstatecut", 8, 0, 0, 0 },',
+                      '{ "clover r344: dispstate", "r344-dispstate", 96, 0, 0, 0 },'):
             if entry not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: a beat row with no budget of "
                               "its own competes with the burst it happens to land in, and this row's whole "
                               "job is to be readable when nothing else is happening")
-        if sdhci_source.find('{ "clover r343: dispstatecut"') > sdhci_source.find('{ "clover r343: dispstate"'):
-            errors.append("the r343 tee table lists the shorter token first: the cut row would be counted, "
-                          "and reported, as a state row")
-        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r343-dispstate")' not in sdhci_source:
-            errors.append("the r343 state row is not exempt from the per-pass cap: it fires on the display's "
-                          "own beat, away from every burst, and a row the cap ate reads exactly like a beat "
-                          "that never fired -- which are the two answers this round is asking between")
+        for family in ('dispstate', 'dispclient'):
+            if sdhci_source.find(f'{{ "clover r344: {family}cut"') > sdhci_source.find(f'{{ "clover r344: {family}"'):
+                errors.append(f"the r344 tee table lists the shorter {family} token first: the cut row would be "
+                              "counted, and reported, as the row it says did not fit")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r344-disp")' not in sdhci_source:
+            errors.append("the r344 display rows are not exempt from the per-pass cap: they fire on the "
+                          "display's own beat, away from every burst, and a row the cap ate reads exactly "
+                          "like a beat that never fired -- which are the two answers this round is asking "
+                          "between")
 
         # Round335's swap row, r343's head. The same containment: "clover r343: bbswap" is a prefix of
         # "clover r343: bbswapcut" and teeProbeClass returns the first match, so the table order is the only
@@ -7183,8 +7189,8 @@ def check_board(errors: list) -> str:
     # the count column so both display rows read the same three words. The menu names round343 while rows
     # this round did not touch keep their own generation tokens (bbsend r331, bbrcv r328) -- a card row
     # names its probe generation, the title names the image that ran.
-    if not board["payload"]["title"].startswith("clover r343:"):
-        errors.append('[payload] title is not "clover r343: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r344:"):
+        errors.append('[payload] title is not "clover r344: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -9338,8 +9344,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r343:"):
-        errors.append('[payload] title is not "clover r343: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r344:"):
+        errors.append('[payload] title is not "clover r344: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -9801,35 +9807,45 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     if probe.is_file():
         probe_code = [line for line in probe_text.splitlines()
                       if not line.strip().startswith(('*', '/*', '//'))]
-        for now in ('"clover r343: dispstate ms=%llu fires=%u seen=%u client=%s calls=%s fails=%s regall=%s regs=%s grew=%s "',
-                    '"hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\\n"',
-                    '"clover r343: dispstatecut bytes=%d cap=%u fires=%u client=%s\\n"',
+        for now in ('"clover r344: dispstate ms=%llu fires=%u seen=%u client=%s pick=%s grewn=%s p58=%s calls=%s fails=%s "',
+                    '"regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\\n"',
+                    '"clover r344: dispstatecut bytes=%d cap=%u fires=%u client=%s\\n"',
+                    '"clover r344: dispclient idx=%u pid=%d calls=%u fails=%u regall=%u regs=%u grew=%u hot=%s s6=%s\\n"',
+                    '"clover r344: dispclientcut bytes=%d cap=%u idx=%u pid=%d\\n"',
                     'static volatile uint32_t cloverLogDropped;',
                     'cloverLogDropped=cloverLogDropped+1;return;',
                     'uint32_t regCalls;',
                     '++stat->regCalls;',
                     'extern "C" void native_legacy_display_state_beat(void) {reportDisplayState();}',
-                    'const char *clientTxt=stat?"pid58":(seenClientCount?"other":"none");',
-                    'enum {kDispStateRowBytes=320};'):
+                    'enum {kDispStateRowBytes=384,kDispClientRowBytes=320};'):
             if not any(now in line for line in probe_code):
                 errors.append(f"package/CloverLegacyDisplayProbe.cpp does not carry {now[:60]!r}: without it "
                               "the client's state is still only printed beside a first event, and boot 113's "
                               "silence stays ambiguous")
-        # Every column that describes a client must have a literal for "there was no such client to read",
-        # and that literal is `-`, not 0: a zero would print the same for a client that asked nothing.
-        if not probe_code or 'const char *callsTxt="-"' not in probe_text:
-            errors.append("the r343 row prints client columns with no literal for the case where no pid-58 "
-                          "client exists: `-` and 0 are two different answers and r327 already paid for "
-                          "collapsing them")
-        # Negative needles. The row must not take a name another producer already owns, and must not spend a
-        # column on a word that is a pure function of a column beside it (round8's rule: a field whose value
-        # is fixed by the row is not a reading).
-        for banned in ('"clover r343: dispstate t=', '"clover r343: dispstate us=',
-                       'dispstate %s state=', 'state=%s grew=', 'set=%u state=%s'):
-            if any(banned in line for line in probe_code):
-                errors.append(f"the r343 row carries {banned[:40]!r}: `t=` is this file's seconds-since-first-frame "
-                              "and the kernel rows' seconds-since-boot, so the beat names its own unit `ms=`; "
-                              "and a word that restates a column beside it is not a reading")
+        # Round344 (#695). Boot 123 is the reason: five records were interposed and the state row printed
+        # `client=pid58 calls=0` while the others were the ones asking. The rule this gate protects is that
+        # the row may not go back to choosing a record by a literal pid, and that the record it does choose
+        # must be answerable and the unchosen ones must still be reachable on the card:
+        #   - no `pid==58` in the picker (boot 116's busy caller was pid 86 and would be invisible again);
+        #   - `pick=` is printed, so the choice has a reason on the card rather than in a comment;
+        #   - pid 58's own growth survives as `p58=`, because boots 115/116/117 were read through it;
+        #   - every record that is new or grew gets its own `dispclient` row, which is the reference's
+        #     whole answer (its clients_dump prints them all) cut to one card record per line.
+        if any('for(unsigned c=0;c<seenClientCount;++c)if(seenClients[c].pid==58)' in line
+               for line in probe_code):
+            errors.append("the display state row still picks its record by the literal pid 58: boot 116's "
+                          "selector-6 caller was pid 86 and the row described the idle record instead. "
+                          "The only pid-58 test left is allowed to be the one that fills `p58=`")
+        if 'pick=%s' not in probe_text or 'statPrior?"g":"t"' not in probe_text:
+            errors.append("the r344 state row does not print the number it picked by (`pick=` with its `g`/`t` "
+                          "unit): a row that selects by a number it never shows cannot be read")
+        if 'p58=%s' not in probe_text or 'snprintf(p58,sizeof p58,"%u",seenClients[c].calls-dispstateReportedCalls[c]);' not in probe_text:
+            errors.append("the r344 state row lost pid 58's own growth (`p58=`): boots 115/116/117 were read "
+                          "through pid-58 columns and `client=` no longer means pid 58")
+        if 'if(!dispstateReported[c] || delta[c])reportDisplayClient(c,delta[c]);' not in probe_text:
+            errors.append("the r344 probe does not print a per-record row for every new or grown record: then "
+                          "the state row's choice is the only view of the boot's other clients, which is "
+                          "exactly what boot 123 showed hiding behind `client=pid58`")
         interpose_body = probe_text.split('static void interpose(IOUserClient *client,int pid) {')[1] \
             if 'static void interpose(IOUserClient *client,int pid) {' in probe_text else ''
         if 'reportDisplayState();' not in interpose_body.split('\n}')[0]:
@@ -9916,9 +9932,9 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
                     if not any(needle in line for line in probe_code):
                         errors.append(f"the r343 state row does not fill {column}= through {needle!r}: "
                                       "the column would be named for an offset it no longer reads")
-            state_head = '"hot=%s s6=%s latch=%s copy=%s fc=%s'
+            state_head = 'grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s'
             if not any(state_head in line for line in probe_code):
-                errors.append("the r343 state row does not print latch= copy= fc= in that order: the "
+                errors.append("the r344 state row does not print latch= copy= fc= in that order: the "
                               "three columns are the same three words the swap row reads, and a reader "
                               "comparing the two rows needs them in the same order")
             if not any("latchTxt,copyTxt,fcTxt," in line for line in probe_code):

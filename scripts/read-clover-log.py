@@ -1158,9 +1158,16 @@ def selftest():
     # gained fc=, so a reader tested against a remembered six-column row would keep passing while the
     # board printed something else. Building from the literal makes the rename change this test's line;
     # naming the three columns makes the rename a claim this test can fail.
+    # Round344 adds a third family (the per-record row) and three columns to the state row that only
+    # exist to answer "which record is this row about, and what did the others do": `pick=` (the number
+    # the picker chose by, with its `g`/`t` unit), `grewn=` (records that grew) and `p58=` (pid 58's own
+    # growth, kept so the boots read through pid-58 columns stay readable). A reader that dropped those
+    # three would still print a row, so they are named here rather than left to the sample line.
     for cap_name, head, cut_head, columns in (
-            ("kDispStateRowBytes", '"clover r343: dispstate ms=', '"clover r343: dispstatecut bytes=',
-             ("latch=", "copy=", "fc=")),
+            ("kDispStateRowBytes", '"clover r344: dispstate ms=', '"clover r344: dispstatecut bytes=',
+             ("latch=", "copy=", "fc=", "pick=", "grewn=", "p58=")),
+            ("kDispClientRowBytes", '"clover r344: dispclient idx=', '"clover r344: dispclientcut bytes=',
+             ("grew=", "hot=", "s6=")),
             ("kSwapWaitRowBytes", '"clover r343: bbswap ms=', '"clover r343: bbswapcut bytes=',
              ("latch=", "copy=", "fc="))):
         declaration = re.search(r"^enum \{[^\n]*\b" + cap_name + r"\s*=\s*(\d+)", probe_src, re.M)
@@ -1631,9 +1638,10 @@ def selftest():
           "ring kinds, bad records, the r302 verdict signatures, the r305 clock pair, the r310 "
           "sink-door words, the older-payload clock guard, the ring rule read from the "
           "declaring row wherever that row lies, the r343 sentence that says which rule read "
-          "this ring on both the declaring and the declaring-nothing card, and both display row "
-          "families built from the probe's own literals with each family's own ceiling and the "
-          "three offset-named columns asked for by name -- all ok")
+          "this ring on both the declaring and the declaring-nothing card, and all three display row "
+          "families built from the probe's own literals -- the state row with its picker, the per-record "
+          "row, and the swap row -- each with its own ceiling and every offset-named and picker column "
+          "asked for by name -- all ok")
     return 0
 
 

@@ -28620,8 +28620,115 @@ dispstate 行那一半按**链接**钉：`memcpy(&latchValue,object+kLatchOffset
 - **Q-B（`copy=` 恒等 `latch=`＝同源）**：每一枚 bbswap/dispstate 行里 `copy` 与 `latch` 逐枚相等——这是 `0x678aea0` 那枚抄写的预期，**不是**第二条腿。若某枚 `copy≠latch`，那才是要追的新信息（要么抄写有守卫没跑到，要么读时机跨了那枚 store）。
 - **Q-C（`fc=` 是不是真随 swap 前进）**：这是本轮改口要判的那一格——`fc=`（旧 `frames=`）在完成路径每跑一次自增。若 boot 123 有 accepted swap 而 `fc=` 随之上升，则它是**真计数**、可当「退休路径跑过几次」的佐证；若 `fc=` 钉着不动而 latch 在推进，则完成路径根本没跑，「帧在退休」这个读法要再改口。**这一支是 #666 主线题面能不能立在 `fc=` 上的判据。**
 - **Q-D（新行宽从卡量，不假设）**：bbswap 现在多两枚字，行更宽；从卡上量 `clover r343: bbswap` 与 `dispstate` 的实际字节宽，核对没有触发 `bbswapcut`/`dispstatecut`（cut 行 0 枚＝没被 320 字节记录切尾）。
-- **M-D（跨靴，boot 122 的 P-B 成立才第一次有材料）**：本靴那条 `clover r283: last reset` 行读回来的，是**上一靴（boot 122）**写进 IMEM 的记录；判它写没写、magic 对不对。同靴判不了跨靴，所以留到 123。
+- **M-D（跨靴）**：本靴那条 `clover r283: last reset` 行读回来的，是**上一靴（boot 122）**写进 IMEM 的记录。**期望值在读卡之前从代码算定**（`drivers/CloverSdhci/CloverSdhci.cpp:389-427` 的常量＋`:9913-9924` 的心跳＋`:10001-10012` 的清零与哨兵）：boot 122 先把 `record[0..9]` 全清零、再写 `record[9]=kResetBeatMagic`（`0x0033383254414542`）与 `beat[1]=kResetBeatSentinel`（`0x0039333354414542`），此后每枚心跳把 `beat[0]` 自增、把 `beat[1]` 覆盖成 CNTVCT。所以 boot 123 那行若**扛过了复位**，四枚字必须是：`magic=0`（清零留下的，除非有复位钩子命名过它 ⇒ 走 unnamed 分支）、`beatmagic=33383254414542`、`beatcnt=39333354414542`（一枚心跳都没跑）或一枚 CNTVCT 量级的数（跑过）、`beat=` 该心跳枚数。**判据**：`beatmagic` 等于那串十六进制 ⇒ 格子是我们的且扛过复位，M-D 成立；`beatmagic` 是别的值（如 boot 122 读到的 `801a182d422c11b0`）⇒ 格子扛不过复位，整枚跨靴记录退役，不再猜第三个偏移。**为什么这一支只能留到 123**：boot 122 自己读到的四枚字全是垃圾，但那是 boot 121 留下的，而 boot 121 是 r341 控制轮、那三枚一次性行如期缺席 ⇒ 「boot 121 写没写」本身不可知，垃圾读数不能定性。boot 122 不同：它的 `clover r339: beatctl … ok=1` 行**在卡上**（`~/clover-out/round342-boot122-window.bin.txt`），同靴写读都成立，所以 123 读到的就是「boot 122 确实写过之后，格子扛没扛住」的答案。
 - **M-A 仍空判**：若本靴同样没到 1800 s 死线、两枚 panic marker 仍 STALE，则「落回模式由谁决定」继续记空判，`kRestartBootloader=0x77665500` 继续既没证实也没证伪。**不许因为 Q-A/Q-B 成立就把 M-A 一起记成通过**——主语不同。
 
-**⑧ 边界。** 本轮改的是**三枚列名与 bbswap 的两枚新增字**，不是任何一颗外设的行为：偏移、kind、clamp、环几何、tee 预算、boot-args 一枚未动（`board.toml` 只换 `[payload].title`）。两条宿主仪器（#732/#735）改的是读回通路的**说话方式**，不改板上写什么。⑥ 的哈希是产物，不是板上读数；boot 123 的卡还没读，Q-A…Q-D 与 M-D 全部**未判**。③ 那条偏移链闸门只证「列名与填它的表达式同源」，**不证**那枚偏移在 stock 内核里的语义——语义的依据是 §Round342 读数 ⑥ 的反汇编，已归档。
+**⑧ 边界。** 本轮改的是**三枚列名与 bbswap 的两枚新增字**，不是任何一颗外设的行为：偏移、kind、clamp、环几何、tee 预算、boot-args 一枚未动（`board.toml` 只换 `[payload].title`）。两条宿主仪器（#732/#735）改的是读回通路的**说话方式**，不改板上写什么。⑥ 的哈希是产物，不是板上读数；boot 123 的读数已落下一节（Q-A…Q-D 成立、M-D 反支、M-A 仍空判）。③ 那条偏移链闸门只证「列名与填它的表达式同源」，**不证**那枚偏移在 stock 内核里的语义——语义的依据是 §Round342 读数 ⑥ 的反汇编，已归档。boot 123 的卡已读回，读数见下一节。
 
+## §Round343 读数（boot 123，r343 镜像）
+
+**① 怎么读回来的。** 冷刷 `cache` 后 `fastboot reboot`，板子在**前 780 s 一帧都没枚举**（timeline 的 `poll no-node` 17 拍），**836 s 那拍第一次是 `edl`**（24 拍 `poll edl` 到窗口关）⇒ 起点夹在 (780, 836] s，而 payload 自己的 `flight` 最新 entry 在 `t=756575 ms` ⇒ 是一起**静默复位**，远早于 1800 s 死线。板子随后**自己离开 EDL 回到 fastboot**（boot 120 同一手；守望 900 s 超时后单拍复查已是 `fastboot 81ffcaaa`，`QUSB_BULK_SN:F6548A52` 消失）。读回走 `--allow-misc-bcb`：只往 `misc` 写那枚 2048 字节 BCB（`command=boot-recovery`），**不碰 logdump／cache**，所以 boot 123 的两环原样在卡上；`dd bs=512 count=1217` 取回 623,104 B，解码 1947 行（16 报告记录／64 驱动判据行／13 探针行／512 内核行），boot 123。产物 `~/clover-out/round343-boot123/round343-boot123-window.bin{,.txt,.timeline.txt}`。
+
+**② Q-A 成立**：`clover r343: dispstate` **12** 枚、`clover r343: bbswap` **19** 枚，`dispstatecut`／`bbswapcut` 各 **0** 枚（320 B 记录装得下新列，行没被切）；旧 token `clover r329:`／`clover r335:` 各 **0** 枚，旧列名 `done=`／`presented=`／`frames=` 各 **0** 枚 ⇒ 卡上是本轮镜像、旧名已在代码里消失（`check-clover.py` 的 code-line 禁令与卡一致）。
+
+**③ Q-B／Q-D 成立**：31 枚行逐枚 `copy==latch`——dispstate 的 `0/0`、`3/3`、`6/6`，bbswap 的 `4/4`…`9/9`；没有一枚 `copy≠latch`。⇒ `+0x16c0` 那枚抄写与 `+0x16bc` 同源，**不是第二条腿**，§Round342 的反汇编判断在板上成立。
+
+**④ Q-C 成立（带一条界线）**：`fc=` 随 accepted swap 前进——dispstate 侧 `fc=0 → 3 → 6`（同窗口 `calls=31`、`hot=6:6/2`），bbswap 侧 `fc=4,5,…,9` 与 `arg=`／`latch=` 同步。⇒ 完成路径每跑一次 `fc=` 就自增，「帧在退休」这个读法站得住。**界线**：这三枚字在本靴**逐行数值相同**（latch==copy==fc），所以卡上的值只能证明 `fc=` **与 latch 同进**，**不能**证明它与 latch 是两枚独立的计数器——「独立」的依据仍是 r343 的反汇编（`0x678ab70/78` 与 `0x678ae7c` 两处不同的 store），不是本靴的读数。#666 主线因此可以立在 `fc=` 上，但要说清它证的是「同进」而非「独立」。
+
+**⑤ 本靴的 swap 形状（#666 的现材料）**：每帧两枚 selector 6——`opt=80000001` → `00000000`（accepted，把 `arg=` 写进 latch），紧接 `opt=80000000` → `e00002d5`（busy），间隔 `gap=3…43 ms`；`arg=` 逐帧递增 4→9。`pair=`／`gap=` 在第 8 枚之后变 `full` 是 r333 那张 8 槽配对表**饱和**，不是设备状态。`np0..np5` 全 `null`、`sent=0`、`s72=0`、`vs=0/0/0` ⇒ 唤醒腿整靴没有口，与 boot 117 同（A 支）。桌面格 `box=305x811..970x1108`、`pixels=45460`、`copy#4 88 ms`，与 113／115／116／117 **同一枚**。出厂那两句 5 s 断言（`swap_wait_gated`／`CommandWake didn't`）各 **0** 枚。⇒ 本靴不是死在 5 s 断言上，题面仍是「帧在退休、桌面没进」。
+
+**⑥ #695 在本靴有了直接证据**：`r180` 的 client 行给出本靴 **5 条**记录——pid **58／86／87／56／74**；而 12 枚 dispstate 全部印 `client=pid58`。更硬的是 fires=23–27 那五枚：`seen=1..4` 而 `client=pid58 calls=0 fails=0`——**行在描述一条闲着的记录，同时场上已有 1–4 条别的记录**。这就是 #695（r329 的选记录规则）在板上第一次被读数钉住，处置放到 r344。
+
+**⑦ M-D 反支（跨靴告负，但成因有界）**：boot 122 同靴写读成立（卡上有 `clover r339: beatctl … ok=1`，`magic_read=33383254414542`），读卡前从代码算定的期望是 boot 123 读回 `magic=0`＋`beatmagic=33383254414542`。**实际读回**：`clover r283: last reset unnamed magic=6c880000008109f8 beat=17595727400924365962 beatcnt=13553039920694509589 beatmagic=801a086e002c2330`——四枚字都是**固件形状**的值，没有一枚是我们的。⇒ 按预登记，`beatmagic` 不等于那串十六进制 ⇒ **格子扛不过复位，整枚跨靴记录退役**，不再猜第三个偏移。**有界**：本靴的落回是 **EDL**，所以观测到的只是「一次落进 EDL 的复位之后，这四枚格子是固件的」。究竟是 EDL 入口自己重填了 0x660/0x6a8/0x6e0/0x6e8 那一段，还是这些格子本来就扛不过任何复位，**本靴分不开**；判它需要「写完之后落 TWRP 或 fastboot、下一靴再读」的一次靴。boot 122 自己读到的也是 `801a182d422c11b0` 这类形状 ⇒ 固件形状的读数早于本靴，不是本靴的偶然。
+
+**⑧ M-A 仍空判（主语不同，不许借 Q-A/Q-B 记通过）**：卡上的 deadline 记录是 **boot 108 的**（`t=1805026 ms, seconds=1800`）——boot 123 从没写过一枚（`flight` 自己说的），因为它 756 s 就复位了；两枚 panic marker 都 **STALE**（boot 111／boot 87，`boot 123 never entered the sink`）⇒ 既没到死线也没进 panic sink。落回模式（EDL）由谁决定，仍然既没证实也没证伪。
+
+**⑨ 下一手**：r344 ＝ #695（`client=` 的选记录规则）。sheng 的先例已查定：它不选记录、`native_legacy_clients_dump()` 逐条全印（`~/UniXNU-sheng/package/LegacyDisplayProbe.cpp:367`），而那枚 helper 在我们仓里 r180 起零调用者。我们的通道是一条记录 512 B（正文 ≤488 B），所以正形是「每条记录一行、按增长发」，见 memory `unixnu-clover-display.md` 的 #695 段。
+
+
+## Round344（#695 处置 ＋ 读回通路把它认出来；待发 v0.7.62）
+
+**① 这一轮修的是什么。** r329 的拍行把「客户端状态」写死成 `pid==58` 那一条记录（`reportDisplayState()` 里的
+`for(...)if(seenClients[c].pid==58)`）。boot 116 里发 selector 6 的是 pid 86，boot 123 里场上有 5 条记录
+（pid 58/86/87/56/74）而 12 枚行全部印 `client=pid58`、fires=23–27 那五枚还印 `calls=0`——**行在描述一条闲着的
+记录，同时场上已有 1–4 条别的记录**。这不是「挑得不好」，是**挑**本身就是那个缺陷。
+
+**② 正形照 sheng，不照我的猜测。** sheng 全仓没有 `pid==58` 这种选择：它的 `native_legacy_clients_dump()`
+（`~/UniXNU-sheng/package/LegacyDisplayProbe.cpp:367`）遍历 `seenClientCount` **逐条全印**，由 `BootLog.c:470`
+拉进一份报告。我们仓的同一枚 helper（`package/CloverLegacyDisplayProbe.cpp:612`）从 r180 vendored 进来后
+**零调用者**——本仓没有 BootLog。通道不同：一条卡记录 512 B（前缀 23 + 正文 + 换行 ⇒ 正文 ≤488 B），所以
+sheng 的多行报告在这里压成**一条记录一行**。
+
+**③ 落地形状。** 两件一起做，缺一件都还是「选择即缺陷」：
+- 拍行保留「描述一条记录」的列，但**选**变成数据驱动并把依据印出来：`pick=<n>g|t`（`g`＝自上次采样以来的增长，
+  `t`＝该记录还没有上一份采样、`n` 是总调用数），选最大者，同分看总调用数，再同分看记录序；`client=pid<N>`/`none`。
+  新增 `grewn=`（自上次 fire 有几条记录增长；一条都没有上一份采样时印 `-`）与 `p58=`（pid 58 自己的增长；无该记录或
+  无上一份采样时印 `-`）——**后者的存在理由**是 boot 115/116/117 都是靠 pid-58 列读的，`client=` 不再等于 pid 58 之后
+  那条读法必须留一个口。
+- 新增 `clover r344: dispclient idx= pid= calls= fails= regall= regs= grew= hot= s6=`，**每条记录一行**，
+  在该记录「新出现」或「自上次采样有增长」时发。拍行挑谁都不再能把别的记录藏起来。
+- 三枚显示字（`latch=/copy=/fc=`）**不进** per-record 行：它们是每靴全局的，拍行每次都读。
+
+**④ 预算与天花板（从代码算，不是估）。** 拍行上限 320 → **384**（仍在 512−23−1=488 之内，一记录装得下）；
+per-record 行上限 **320**，两族各有 cut 分支（`dispstatecut`／`dispclientcut`）。tee 类：`r344-dispstate` 96、
+`r344-dispstatecut` 8、`r344-dispclient` **128**、`r344-dispclientcut` 8；豁免前缀合成一枚 `r344-disp`（两族都挂在
+显示自己的 30 s 拍上，被 per-pass cap 吃掉与被拍没响不可分——r281/r319 的理由）。**bbswap 一族形状未动，token 仍是
+`clover r343:`**——规矩是「token＝最后一次改这行形状的那一轮」。
+**⑤ 闸门（三条新的，都是本轮自己付过的账）。** (a) 拍行**不许**再出现旧的 pid-58 选择式（负针脚钉的是整句
+`for(unsigned c=0;c<seenClientCount;++c)if(seenClients[c].pid==58)`，因为 `p58=` 那一腿合法地要测 pid 58）；
+(b) 必须印 `pick=` 且带 `g`/`t` 单位（「按一个不印出来的数选」没法读）；(c) 必须对每条新/增长的记录印
+`dispclient` 行（否则拍行的选择仍是别的客户端唯一的视图）。读者自检把**第三族**也纳进来：三族各自的上限从其
+enum 声明读，`pick=`/`grewn=`/`p58=` 按名字问。verify 把四枚 CString（两行＋两 cut）钉进内核字节。
+
+**⑥ 预登记 boot 124（r344 镜像）。** 判据在看卡之前写定：
+- **R-A（新行在场）**：`clover r344: dispstate` 与 `clover r344: dispclient` 必须同时在场；旧 token `clover r343: dispstate`
+  **必须 0 枚**（bbswap 仍是 `clover r343:`，它的在场是**正**对照，证明卡是本轮镜像而非没刷进去）。
+- **R-B（选择可读）**：每枚拍行 `pick=` 非 `-` 时，`client=` 必须是 `pid<N>` 且 N 与**同 fire 的 dispclient 行**里
+  `grew` 最大的那条一致（同 fire 不许出现「拍行说 A、per-record 行说 B 在长」）。`pick=` 以 `t` 结尾时 `grew=` 必须是 `-`。
+- **R-C（#695 被关掉）**：若本靴 `seen>=2`，必须至少有一枚拍行 `client=pid` 不等于 58（boot 123 的缺陷形态）；
+  否则要能从 `grewn=`/`p58=` 读出「除 pid 58 外没有记录在动」这个**读数**，而不是读到 `-`。
+- **R-D（不切尾）**：`dispstatecut`／`dispclientcut` 各 0 枚，且从卡上量两族行的实际字节宽。
+- **M-A 仍按空判**；M-D 已在 §Round343 读数 ⑦ 结（跨靴记录退役），本轮**不再重开**。
+
+**⑦ 边界。** 不改偏移／kind／clamp／环几何／节拍；`native_legacy_clients_dump` 那枚 vendored helper 仍不接
+（本轮另建同源行，没把它拉进来）。boot 123 的两条读数（`copy==latch`、`fc=` 随 latch 前进）是本轮**不动的既有事实**。
+
+## §对照 sheng（2026-11-08，只读审计；未删除任何东西）
+
+**如何取得**：两侧都从 `git show HEAD:` 读（clover `9b73302`／sheng `08cde20`），避开正在被负测原地修改的工作树。
+**结论先行**：sheng 用 **schema_version=2** 的仓库形状，clover 是**旧式单文件** board.toml。所以「照搬 sheng」在仓
+这一层等价于把 clover 迁到 format 2——这正是本文件里挂了很久的**迁移 步1–步9（#703–#712）**，不是另起一个工程。
+
+| 轴 | clover（v0.7.61, HEAD `9b73302`） | sheng（HEAD `08cde20`） | 可搬? |
+|---|---|---|---|
+| board.toml | 224,881 B，无 `schema_version` | 5,017 B，`schema_version = 2` | 搬（格式） |
+| 段 | board／package／ipsw／userdata／kernel(.prelink)／firmware／bootimg.image／payload(.adt) | board／userdata／kernel／firmware／payload(.install,.adt)／bootimg／device_tree／components／adt | 搬（格式） |
+| `[ipsw]` | Apple restore URL＋product iPad7,1＋sha256＋device_class j120ap | **无** | clover 独有，留 |
+| userdata | 512 B 扇区，15795488–122142686 | 4096 B，3094592–64007162 | 各板各值 |
+| kernel.archives | 16 条脚本 | 24 条，含 `component:ArmDTPlatform`／`ArmCpu`／`SoftwareAES`／`ShengUfs`／`VirtioMmioBlock`／`RamBlock`／`Adreno740`／`ShengHidInput`／`AppleKeyStoreState` | 机制搬，条目按硬件换 |
+| config fragments | 无（单一 `clover_defconfig`） | `arch:common.config`＋`soc:sm8550.config`＋`os:ipados.config` | 搬，要写 `soc:sdm660.config` |
+| patch series | board.toml 无声明，走 `patches/xnu-clover` | 四层 `arch/soc/os/device` 各自的 `series` | 搬，要拆 clover 的补丁 |
+| components | 无（archives 直接列脚本） | 19 个组件（含 `VerifiedRoot`／`XnuPrelink`／`GopFramebuffer`／`AdrenoMetal`／`AirNir`／`Ath12kWifi`／`QcomGeniSpi`／`ShengNovatekTouch`） | 机制搬；`Adreno740/Metal`→A512、`Ath12kWifi`→BCM 不能搬 |
+| device tree | 无 `[device_tree]`；ADT 由 `make-clover-adt.py` 生成，`[payload.adt]` 是固定键值 | `[device_tree].source = device:dts/sheng.dts`＋`[adt]` 声明式表（product/buttons/defaults） | 搬（dts 换 sdm660 的） |
+| payload | 56 MiB，`CLOVERESP`，34 枚 kernel_args，`entry_probe_reset_*` 五枚 | 208 MiB，`SHENGESP`，48 枚 kernel_args，`[payload.install]` 装机流 | 格式搬；大小/args 各板 |
+| 根块设备 | eMMC：CloverSdhci→CloverBlock，`rd=`/`md0s39` 一整套 | UFS：`ShengUfs`＋`VirtioMmioBlock`/`RamBlock`，`native-ufs-root=1` | **不能搬**（硬件） |
+| 数据/装机器 | `seed-data-skip-setup.py`＋第一靴迁移 | `sheng-data-persist`／`sheng-staged-apps`／装机确认流 | 流程可搬，键要重写 |
+| 信任链 | `trust_cache_sha256`（56 B 单模块＋61,408 B 三模块） | `VerifiedRoot` 组件 | 机制可搬 |
+| 显示 | `NativeLegacyDisplay`（vendored）＋`CloverLegacyDisplayProbe`＋`build-clover-gop-legacy-display.py` | `build-gop-legacy-display.py`＋`GopFramebuffer`＋`Adreno740/Metal` | 探针已同源；GPU 面不能搬 |
+| 仪器 | **clover 独有**：卡上 kind-22/24/25 环＋tee／verdict、346 行 `read-clover-log.py`、IMEM 复位记录、unattended 死线、EDL/TWRP 落回采样、纯层闸门（SdhciLogCore/GpuCore/BlockCore…） | 无同类（sheng 走 boot-progress 屏） | **不搬，留** |
+
+**代价（按迁移 步1–9 的既有点数）**：步1 记录配置、步2 SoC 公共仓（sdm660）、步3 组件 ID 对齐、步4 board.toml→format 2、
+步5 ADT→DTS、步6 defconfig/fetch/status/tree 解析、步7 固件接入、步8 依序构建、步9 porting/CI/发布清单。每步都能
+单独过闸门、单独回滚；**不存在**「一次清空再照抄」也能过的捷径——sheng 的 UFS/Adreno740/Ath12k 在 clover 上没有对应硬件。
+
+**本轮不动的东西**：main 与 v0.2.x–v0.7.x 全部 tag 一字未改；工作树里只有 r344（#695 仪器）那 8 个文件。真要重置按
+「全保留、另开分支」——分支名建议 `sheng-port`，main 不动。
+
+**⑧ 构建与产物（#738，`round344-dispclient/`）。** 负测两遍：第一遍 **90 例 1 问题**（N86 因格式串改名 NOT TESTED），修掉后第二遍 **90 例 0 问题**
+（每条都 RED 且按自身原因变红）。内核 `kernel.macho` `07988f06fe22…` → AMFI 两刀命中（`0x34000229→0x14000011`、
+`0x36000520→0xd503201f`）→ `round344-kernel-amfi.macho` `eff61913118b…` → normalize（973 枚 object stamp 归零）→
+`round344-kernel-normalized.macho` `2d1019c2e49f…` → payload `round344-v0.7.62-payload.img` **`ff2f3355a5d7dc65…`**（56 MiB）。
+inputs：trust-cache `build/clover-trust/trustcache.bundle` `7c369ce0…`（与 board.toml 钉的一致）、data ramdisk
+`round150-scratch-data.img` `614b8356…`（与 r343 记录同）、seed `0x81ffcaaa`、`--uefi ~/mu-clover`。
+`verify-clover-payload.py` **EXIT=0，51 项 OK、0 FAIL**；双闸门 repo／tree 都 **EXIT=0**（tree 侧 12 archives、22 objects ABI-checked）。
+payload 里新增的四枚 CString（`dispstate`／`dispstatecut`／`dispclient`／`dispclientcut`）由 verify 的字节针脚确认在场。

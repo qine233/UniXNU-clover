@@ -665,17 +665,29 @@ void native_legacy_client_observed(IOReturn status,IOUserClient *client) {
  *   fires=     this row's own ordinal, incremented before formatting, so the cut branch and the row
  *              share one numbering and a gap in the numbering is a gap in the schedule.
  *   seen=      seenClientCount, written by the unconditional `interpose` path.
- *   client=    which record the client columns below describe: `pid58` (backboardd's own record),
- *              `other` (clients were seen, none is pid 58) or `none` (no client yet). When it is not
- *              `pid58` every client column prints `-`, because `-` is the difference between "nobody was
- *              there to ask" and the zero that a client that asked nothing would print (r327's rule).
+ *   client=    which record the client columns below describe, printed as `pid<N>` of the record the picker
+ *              chose (`pick=`) or `none` while no client has been interposed. When it is `none` every client
+ *              column prints `-`, because `-` is the difference between "nobody was there to ask" and the
+ *              zero that a client that asked nothing would print (r327's rule). Round344 (#695) replaced a
+ *              hardcoded pid 58 here: boot 123 had five records and this row kept describing the idle one.
+ *   pick=      the score the picker used, with its unit: `<n>g` = that record grew by n since this row last
+ *              sampled it, `<n>t` = the record had no earlier sample, so n is its total calls (a different
+ *              quantity, which is why the suffix is there and why `grew=` prints `-` in that case). The
+ *              selection is the largest score, ties broken by total calls, then by record order; `-` = no
+ *              record to pick. Printing it is what makes `client=` answerable -- a row that selects by a
+ *              number it never shows cannot be read.
+ *   grewn=     how many records grew since this row's last fire; `-` while no record has an earlier sample
+ *              (the first fire of the boot), for the same reason `grew=` is `-` there.
+ *   p58=       pid 58's own growth since this row's last sample of it; `-` while there is no pid-58 record
+ *              or it has no earlier sample. Boots 115/116/117 were read through pid58's columns, and this
+ *              column keeps that reading available after `client=` stopped meaning pid 58.
  *   calls=     ClientStat::calls -- externalMethod entries, counted with no cap.
  *   fails=     the same walk's nonzero returns.
  *   regall=    ClientStat::regCalls: every registerNotificationPort call. `regs=` counts only what the
  *              record kept (kRegEvents slots), so the two together separate "registered once" from
  *              "registered eleven times and filled the slots".
- *   grew=      calls minus the calls this row printed last fire; `-` on the first fire of a client,
- *              because there is no earlier sample to subtract and total-calls is a different quantity.
+ *   grew=      the selected record's calls minus the calls this row printed for it last fire; `-` when that
+ *              record has no earlier sample, because total-calls is a different quantity.
  *   hot=       the selector with the most calls this boot, as `<selector>:<calls>/<fails>/<last status>`,
  *              or `none` while every selector count is zero.
  *   s6=        the last selector-6 wait: sel6_last (the three 64-bit scalarInput words the call itself
@@ -696,40 +708,98 @@ void native_legacy_client_observed(IOReturn status,IOUserClient *client) {
  * arrival and nothing after has lost the beat (the display's work loop stopped running), while a boot
  * that shows no row at all never got the client, and the tee's own cap message says which.
  *
- * The row is never emitted half-written: 320 bytes is the card's record width and a longer line is
- * truncated rather than split, so a too-wide row prints `clover r343: dispstatecut` with the width it
- * needed instead. That row is the arithmetic's mandatory outlet -- the long row cannot say it was cut.
+ * Round344 adds a second row, `clover r344: dispclient idx= pid= calls= fails= regall= regs= grew= hot= s6=`,
+ * one record per line, printed for every record that is new or that grew since its own last sample -- the
+ * shape the reference uses (it dumps all records into one report) cut down to one card record per line. The
+ * state row still prints one record's columns, but it no longer decides *which* record the boot is about
+ * without saying so: `pick=` is the number it chose by, and the per-record rows mean nothing can be hidden
+ * behind that choice.
+ *
+ * The row is never emitted half-written: 384 bytes is this row's ceiling and a longer line is truncated
+ * rather than split, so a too-wide row prints `clover r344: dispstatecut` with the width it needed instead.
+ * That row is the arithmetic's mandatory outlet -- the long row cannot say it was cut. Both ceilings sit
+ * inside one card record (512 - 23-byte prefix - 1 = 488), so the card never splits either row.
  */
-static uint32_t dispstateFires,dispstatePreviousCalls;
-static bool dispstateHasPrevious;
-enum {kDispStateRowBytes=320};
+static uint32_t dispstateFires;
+enum {kDispStateRowBytes=384,kDispClientRowBytes=320};
+static uint32_t dispstateReportedCalls[kSeenClients];
+static bool dispstateReported[kSeenClients];
+static void formatHotFor(const ClientStat &s,char *out,unsigned cap) {
+    unsigned best=0;uint32_t bestCalls=0;
+    for(unsigned k=0;k<kSelectors;++k)if(s.selector_calls[k]>bestCalls){bestCalls=s.selector_calls[k];best=k;}
+    if(bestCalls)snprintf(out,cap,"%u:%u/%u/%08x",best,bestCalls,s.selector_fails[best],s.selector_status[best]);
+    else snprintf(out,cap,"none");
+}
+static bool formatSel6For(const ClientStat &s,char *out,unsigned cap) {
+    if(!s.selector_calls[6])return false;
+    snprintf(out,cap,"%llx %llx %llx -> %08x",(unsigned long long)s.sel6_last[0],
+        (unsigned long long)s.sel6_last[1],(unsigned long long)s.sel6_last[2],s.selector_status[6]);
+    return true;
+}
+// Round344 (#695). Boot 123 is why this row exists: five records were interposed (pid 58/86/87/56/74) and the
+// state row printed `client=pid58 calls=0` five times while the other records were the ones asking. The fix is
+// the reference's own answer, not a better picker: sheng's native_legacy_clients_dump() prints every record
+// (package/LegacyDisplayProbe.cpp:367) and its BootLog pulls that into one report. This port has no report
+// buffer -- one card record is 512 bytes, so one line per record is the shape that fits, and a record is
+// printed when it is new or when it grew since its own last sample. Nothing here selects a record to hide.
+static void reportDisplayClient(unsigned index,uint32_t grew) {
+    const ClientStat &s=seenClients[index];
+    char hot[40],s6[96];
+    formatHotFor(s,hot,sizeof hot);
+    const bool hasSel6=formatSel6For(s,s6,sizeof s6);
+    char row[kDispClientRowBytes];
+    int length=snprintf(row,sizeof row,
+        "clover r344: dispclient idx=%u pid=%d calls=%u fails=%u regall=%u regs=%u grew=%u hot=%s s6=%s\n",
+        index,s.pid,s.calls,s.fails,s.regCalls,s.regs,grew,hot,hasSel6?s6:"-");
+    if(length<0 || static_cast<unsigned>(length)>=sizeof row) {
+        char cut[96];
+        snprintf(cut,sizeof cut,"clover r344: dispclientcut bytes=%d cap=%u idx=%u pid=%d\n",
+            length,(unsigned)sizeof row,index,s.pid);
+        IOLog("%s",cut);
+        return;
+    }
+    IOLog("%s",row);
+}
 static void reportDisplayState(void) {
     dispstateFires=dispstateFires+1;
-    const ClientStat *stat=nullptr;
-    for(unsigned c=0;c<seenClientCount;++c)if(seenClients[c].pid==58){stat=&seenClients[c];break;}
-    const char *clientTxt=stat?"pid58":(seenClientCount?"other":"none");
+    // One delta per record, computed the same way for the picker and for the per-record rows. A record with no
+    // earlier sample has reportedCalls==0, so its delta is its total -- that is what `pick=` marks with `t`.
+    uint32_t delta[kSeenClients];
+    unsigned best=0,grown=0,sampled=0;
+    bool have=false;uint32_t bestPick=0,bestTotal=0;
+    for(unsigned c=0;c<seenClientCount;++c) {
+        const ClientStat &s=seenClients[c];
+        delta[c]=s.calls-dispstateReportedCalls[c];
+        if(dispstateReported[c]) {++sampled;if(delta[c])++grown;}
+        if(!have || delta[c]>bestPick || (delta[c]==bestPick && s.calls>bestTotal)) {
+            have=true;best=c;bestPick=delta[c];bestTotal=s.calls;
+        }
+    }
+    const ClientStat *stat=have?&seenClients[best]:nullptr;
+    const bool statPrior=have && dispstateReported[best];
+    char client[16],pick[24];
+    if(stat)snprintf(client,sizeof client,"pid%d",stat->pid);else snprintf(client,sizeof client,"none");
+    if(!stat)snprintf(pick,sizeof pick,"-");
+    else snprintf(pick,sizeof pick,"%u%s",bestPick,statPrior?"g":"t");
     const char *callsTxt="-",*failsTxt="-",*regsTxt="-",*regallTxt="-",*grewTxt="-",*hotTxt="-",*s6Txt="-";
-    const char *latchTxt="-",*copyTxt="-",*fcTxt="-";
+    const char *latchTxt="-",*copyTxt="-",*fcTxt="-",*grewnTxt="-",*p58Txt="-";
     char calls[16],fails[16],regs[16],regall[16],grew[16],hot[40],s6[96],latch[16],copy[16],fc[16];
+    char grewn[8],p58[16];
     if(stat) {
         snprintf(calls,sizeof calls,"%u",stat->calls);callsTxt=calls;
         snprintf(fails,sizeof fails,"%u",stat->fails);failsTxt=fails;
         snprintf(regs,sizeof regs,"%u",stat->regs);regsTxt=regs;
         snprintf(regall,sizeof regall,"%u",stat->regCalls);regallTxt=regall;
-        if(dispstateHasPrevious) {
-            snprintf(grew,sizeof grew,"%lld",(long long)(stat->calls-dispstatePreviousCalls));grewTxt=grew;
+        if(statPrior) {snprintf(grew,sizeof grew,"%u",bestPick);grewTxt=grew;}
+        formatHotFor(*stat,hot,sizeof hot);hotTxt=hot;
+        if(formatSel6For(*stat,s6,sizeof s6))s6Txt=s6;
+    }
+    if(sampled) {snprintf(grewn,sizeof grewn,"%u",grown);grewnTxt=grewn;}
+    for(unsigned c=0;c<seenClientCount;++c) {
+        if(seenClients[c].pid==58 && dispstateReported[c]) {
+            snprintf(p58,sizeof p58,"%u",seenClients[c].calls-dispstateReportedCalls[c]);
+            p58Txt=p58;break;
         }
-        unsigned best=0;uint32_t bestCalls=0;
-        for(unsigned k=0;k<kSelectors;++k)if(stat->selector_calls[k]>bestCalls){bestCalls=stat->selector_calls[k];best=k;}
-        if(bestCalls)snprintf(hot,sizeof hot,"%u:%u/%u/%08x",best,bestCalls,stat->selector_fails[best],stat->selector_status[best]);
-        else snprintf(hot,sizeof hot,"none");
-        hotTxt=hot;
-        if(stat->selector_calls[6]) {
-            snprintf(s6,sizeof s6,"%llx %llx %llx -> %08x",(unsigned long long)stat->sel6_last[0],
-                (unsigned long long)stat->sel6_last[1],(unsigned long long)stat->sel6_last[2],stat->selector_status[6]);
-            s6Txt=s6;
-        }
-        dispstatePreviousCalls=stat->calls;dispstateHasPrevious=true;
     }
     const unsigned char *object=reinterpret_cast<const unsigned char *>(native_legacy_object);
     if(object) {
@@ -742,20 +812,27 @@ static void reportDisplayState(void) {
     char row[kDispStateRowBytes];
     const uint64_t now=probeNowUs();
     int length=snprintf(row,sizeof row,
-        "clover r343: dispstate ms=%llu fires=%u seen=%u client=%s calls=%s fails=%s regall=%s regs=%s grew=%s "
-        "hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\n",
-        (unsigned long long)(now/1000),dispstateFires,seenClientCount,clientTxt,
+        "clover r344: dispstate ms=%llu fires=%u seen=%u client=%s pick=%s grewn=%s p58=%s calls=%s fails=%s "
+        "regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\n",
+        (unsigned long long)(now/1000),dispstateFires,seenClientCount,client,pick,grewnTxt,p58Txt,
         callsTxt,failsTxt,regallTxt,regsTxt,grewTxt,hotTxt,s6Txt,latchTxt,copyTxt,fcTxt,
         vsyncHz,(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[1],
         (unsigned)cloverLogLines,(unsigned)kCloverLogBudget,(unsigned)cloverLogDropped);
     if(length<0 || static_cast<unsigned>(length)>=sizeof row) {
         char cut[96];
-        snprintf(cut,sizeof cut,"clover r343: dispstatecut bytes=%d cap=%u fires=%u client=%s\n",
-            length,(unsigned)sizeof row,dispstateFires,clientTxt);
+        snprintf(cut,sizeof cut,"clover r344: dispstatecut bytes=%d cap=%u fires=%u client=%s\n",
+            length,(unsigned)sizeof row,dispstateFires,client);
         IOLog("%s",cut);
-        return;
+    } else {
+        IOLog("%s",row);
     }
-    IOLog("%s",row);
+    // The per-record rows and the bookkeeping do not live under the state row's width. A boot whose state
+    // row is always cut is exactly the boot that needs the records it cannot see, and an early return here
+    // would leave reportedCalls frozen, so every fire would re-print every record as new.
+    for(unsigned c=0;c<seenClientCount;++c) {
+        if(!dispstateReported[c] || delta[c])reportDisplayClient(c,delta[c]);
+        dispstateReportedCalls[c]=seenClients[c].calls;dispstateReported[c]=true;
+    }
 }
 // The driver's beat calls this; it is also called once from the first client interposed, from below.
 extern "C" void native_legacy_display_state_beat(void) {reportDisplayState();}
