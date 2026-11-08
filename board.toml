@@ -255,12 +255,13 @@ loader = "firmware"
 # and counts 0xfc, so `presented` was the latch copied -- a second name for the word beside it, not the
 # presentation counter this port never had. The gate walks the rename down to the measured number.
 #
-# Round355's case: boot 134 answered "who owes SpringBoard" (backboardd holds the send-once reply), and
-# the next link -- who owes backboardd -- read sr=0 on its leaf hop. ip_srights counts SEND only, so a
-# send-once holder is invisible to both r331 legs by construction; the same blind spot boot 132 proved
-# on the door. The gate pins the so=/ms= snapshot read, the once columns on both bbsend branches and
-# the bbonceh naming rows down to the r352 function they call.
-title = "clover r355: boot 134's leaf hop read no_srights, which is not \"nobody can wake it\" -- ip_srights counts SEND only and both r331 legs are blind to a send-once holder by construction. This round reads ip_sorights and ip_mscount into the bbsend row under the same translate lock (so=/ms=, both branches carry the columns so an eaten branch cannot look like a ran one), reuses r352's cross-space SEND_ONCE walk on the already-referenced leaf port (once=/och=/ocp=/ocs=), and names each holder with clover r355: bbonceh rows. The next boot reads the four Z branches on the e=0 leaf: holder named, in-flight or outside the cap, never armed (ms=0), consumed (ms>0). Nothing else moved: no row, offset, kind, clamp, ring geometry or cadence."
+# Round356's case: boot 135 closed the ring -- SpringBoard's trapped thread waits on rn (receive leg,
+# read full by r350/r351, its send-once holder named backboardd) while backboardd waits on a reply owed
+# by a SpringBoard leg. The one column that could break the mutual hold, rem=x3, was captured in r349
+# and never translated. The gate pins the SEND-first translate order, the same r355 snapshot columns on
+# the holder's own space, the skip=same row (a silent skip would read as "no trapped thread"), and the
+# holdrsh naming pair down to the legs r355 and r352 already provide.
+title = "clover r356: boot 135 read the receive leg of SpringBoard's trapped thread and left the send destination unasked -- rem=x3 was captured in r349, no leg ever translated it, and the ring \"neither side posts first\" can only be broken by what that name holds. This round runs the r355 snapshot on rem in the holder's own space: translate SEND first (a destination usually carries no receive right), then RECEIVE and PORT_SET, and print clover r356: holdrs with q=/sr=/ms=/so=/once= plus ty= and o=; a triple failure prints e=, and rem == rn prints skip=same so a same-name row cannot read as a missing one. The SEND_ONCE census (r352's walk) names each holder in clover r356: holdrsh rows and ip_release keeps r355's discipline. The next boot reads the four W branches on SpringBoard's rem: letter queued and untaken, send right dead, in-flight or pure receive (rem a bystander), or the name gone. Nothing else moved: no row, offset, kind, clamp, ring geometry or cadence."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

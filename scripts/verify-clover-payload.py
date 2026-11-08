@@ -1382,6 +1382,19 @@ def check_sb_sample(kernel: bytes) -> bool:
              # row, these rows say who they counted.
              "r355-bbonceh": (b"clover r355: bbonceh t=%llu pid=%d hop=%d i=%u hpid=%u c=%s nm=%x "
                               b"ty=%s raw=%llx\n") in kernel,
+             # Round356 asks the send destination SpringBoard's trapped thread carries beside the rn
+             # the receive legs already read: one main row per rem, an e= row when nothing translates,
+             # a skip=same row when rem is rn (absence must not read as "no trapped thread"), and the
+             # naming rows for the send-once holders the census found.
+             "r356-holdrs": (b"clover r356: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x ty=%d o=%llx"
+                             b" q=%u sr=%u ms=%u so=%u own=%u hits=%u probed=%u scanned=%u"
+                             b" once=%u och=%u ocp=%u ocs=%u n=%u\n") in kernel,
+             "r356-holdrs-error": (b"clover r356: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x "
+                                   b"e=%d\n") in kernel,
+             "r356-holdrs-skip": (b"clover r356: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x "
+                                  b"skip=same\n") in kernel,
+             "r356-holdrsh": (b"clover r356: holdrsh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s "
+                              b"raw=%llx\n") in kernel,
              # Round354 keeps the four heavy helpers out of clover_bb_sample's frame. noinline is a
              # source attribute, but what boot 133 died on was the link: the helpers' frames accreted
              # into one 10912-byte frame and the beat thread's 16 KB stack overflowed. Each helper

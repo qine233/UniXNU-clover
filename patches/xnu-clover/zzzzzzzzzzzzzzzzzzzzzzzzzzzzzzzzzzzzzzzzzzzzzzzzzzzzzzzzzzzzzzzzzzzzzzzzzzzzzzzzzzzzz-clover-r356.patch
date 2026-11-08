@@ -1,0 +1,159 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12925,6 +12925,131 @@
+ }
+ 
+ /*
++ * Round356. Boot 135 closed the ring on the receive leg and left the send leg unasked: SpringBoard's
++ * trapped thread carries rem=x3 beside the rn holder_door already opens, and no leg has ever translated
++ * it in the holder's own space. This runs the same three legs on that name -- translate SEND first
++ * (a destination usually holds no receive right), then the r355 locked snapshot q/sr/ms/so, then the
++ * SEND_ONCE walk -- so "the letter is queued there", "the right is gone" and "rem is a bystander"
++ * print as three different readings instead of one silence.
++ */
++static void __attribute__((noinline))
++clover_bb_holder_send(task_t task, int pid, int hop, int i, int j,
++    mach_port_name_t rem, uint64_t secs)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	ipc_space_t space = task->itk_space;
++	ipc_object_t obj = IPC_OBJECT_NULL;
++	kern_return_t kr;
++	uint32_t q = 0;
++	uint32_t sr = 0;
++	uint32_t ms = 0;
++	uint32_t so = 0;
++	uint32_t own = 0;
++	uint32_t hits = 0;
++	uint32_t probed = 0;
++	uint32_t scanned = 0;
++	uint32_t selfhit = 0;
++	uint32_t matches = 0;
++	uint32_t entries = 0;
++	__block uint32_t members = 0;
++	uint32_t hp[4];
++	uint32_t hn[4];
++	uint64_t ht[4];
++	char hc[64];
++	uint32_t on[4];
++	uint64_t ob[4];
++	uint32_t sp[4];
++	uint32_t sn[4];
++	uint64_t sb[4];
++	char sc[64];
++	uint32_t once = 0;
++	uint32_t once_probed = 0;
++	uint32_t once_scanned = 0;
++	uint32_t k;
++	int ty = -1;
++	char row[256];
++	int len;
++
++	if (space == IPC_SPACE_NULL || rem == MACH_PORT_NULL) {
++		return;
++	}
++	kr = ipc_object_translate(space, rem, MACH_PORT_RIGHT_SEND, &obj);
++	if (kr != KERN_SUCCESS) {
++		kr = ipc_object_translate(space, rem, MACH_PORT_RIGHT_RECEIVE, &obj);
++	}
++	if (kr != KERN_SUCCESS) {
++		kr = ipc_object_translate(space, rem, MACH_PORT_RIGHT_PORT_SET, &obj);
++		if (kr != KERN_SUCCESS) {
++			len = snprintf(row, sizeof(row),
++			    "clover r356: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x e=%d\n",
++			    (unsigned long long)secs, hop, i, j, pid, rem, (int)kr);
++			if (len > 0) {
++				row[sizeof(row) - 1] = '\0';
++				clover_emmc_probe_say(row, (unsigned int)strlen(row));
++				printf("%s", row);
++			}
++			return;
++		}
++	}
++	if (io_otype(obj) == IOT_PORT) {
++		ipc_port_t port = (ipc_port_t)obj;
++
++		ty = 0;
++		q = port->ip_messages.imq_msgcount;
++		sr = port->ip_srights;
++		ms = port->ip_mscount;
++		so = port->ip_sorights;
++		clover_port_hash_holders(port, task, hp, hn, ht, hc, 4, &hits, &probed,
++		    &scanned, &selfhit);
++		clover_space_obj_names(space, obj, on, ob, 4, &matches, &entries);
++		own = matches;
++		io_reference(obj);
++		io_unlock(obj);
++		clover_port_once_holders(obj, sp, sn, sb, sc, 4, &once, &once_probed,
++		    &once_scanned);
++	} else if (io_otype(obj) == IOT_PORT_SET) {
++		ipc_pset_t pset = (ipc_pset_t)obj;
++
++		ty = 1;
++		waitq_set_foreach_member_locked(&pset->ips_wqset, ^(struct waitq *wq) {
++			(void)wq;
++			members++;
++		});
++		io_unlock(obj);
++	} else {
++		ty = 2;
++		io_unlock(obj);
++	}
++	len = snprintf(row, sizeof(row),
++	    "clover r356: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x ty=%d o=%llx"
++	    " q=%u sr=%u ms=%u so=%u own=%u hits=%u probed=%u scanned=%u"
++	    " once=%u och=%u ocp=%u ocs=%u n=%u\n",
++	    (unsigned long long)secs, hop, i, j, pid, rem, ty,
++	    (unsigned long long)(uintptr_t)obj, q, sr, ms, so, own, hits, probed, scanned,
++	    once, once, once_probed, once_scanned, members);
++	if (len > 0) {
++		row[sizeof(row) - 1] = '\0';
++		clover_emmc_probe_say(row, (unsigned int)strlen(row));
++		printf("%s", row);
++	}
++	for (k = 0; ty == 0 && k < once && k < 4; k++) {
++		len = snprintf(row, sizeof(row),
++		    "clover r356: holdrsh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s raw=%llx\n",
++		    (unsigned long long)secs, pid, j, sp[k], sc + k * 16, sn[k],
++		    clover_right_type_word((ipc_entry_bits_t)sb[k]),
++		    (unsigned long long)sb[k]);
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
++	}
++	if (ty == 0) {
++		io_release(obj);
++	}
++}
++
++/*
+  * Round349. Boot 128 named the holders of the set members (launchd and SpringBoard hold send rights
+  * to backboardd's door 9103) but a name is still not an explanation. This samples the holder itself
+  * in the same fire: every thread's state, and for the threads in the mach_msg2 trap their receive
+@@ -13047,6 +13172,24 @@
+ 			clover_bb_holder_door(task, pid, hop, i, j,
+ 			    (mach_port_name_t)r_rn[k], secs);
+ 		}
++		/*
++		 * Round356. The send destination the same trapped thread carries was captured in r349 and
++		 * never asked: two names, one leg. rem == rn still gets a row -- as skip=same -- because a
++		 * silent skip would read exactly like "no trapped thread at all" to the decoder.
++		 */
++		if (r_rem[k] != 0 && r_rem[k] == r_rn[k]) {
++			len = snprintf(row, sizeof(row),
++			    "clover r356: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x skip=same\n",
++			    (unsigned long long)secs, hop, i, j, pid, r_rem[k]);
++			if (len > 0) {
++				row[sizeof(row) - 1] = '\0';
++				clover_emmc_probe_say(row, (unsigned int)strlen(row));
++				printf("%s", row);
++			}
++		} else if (r_rem[k] != 0) {
++			clover_bb_holder_send(task, pid, hop, i, j,
++			    (mach_port_name_t)r_rem[k], secs);
++		}
+ 	}
+ 	task_deallocate(task);
+ }

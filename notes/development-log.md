@@ -29593,3 +29593,66 @@ removed-pin 抓住——两分支同形是这一轮的点）、bbonceh-row、tee
 新事实只剩一枚——SpringBoard 那枚 trap 线程的 `rem=3a03`：它在 mach_msg2 里**要发往**的那口。
 r355 的 obj_held＋once 普查这套手，挪到持有者任务的 rem 名字上（在 SpringBoard 自己空间里
 翻译 3a03，读 q/sr/ms/so 与该口队列），把「信在途/没发/发往别处」切开。
+
+## Round356：把 r355 的快照挪到持有者自己的发送名上——SpringBoard 要发往的 `rem` 是什么
+
+**为什么。** boot 135 把环照满：SpringBoard 的 trap 线程停在 mach_msg2（`x16==-47`、`m2=1`），
+`rn=1e03`（收方向，r350/r351 已读满：sr=1 ms=1 so=1 once=1，onceh 点名 backboardd）与
+`rem=3a03`（x3，发送方向，**至今没有任何一条腿问过它**）。环是「两头都不先发」，能拆它的下一枚
+事实就是 rem：SpringBoard 若真带着 MACH_SEND 选项阻塞，那封信要么在途、要么发不出去、要么 rem
+根本是陪跑参数（纯 RCV）。三支各有各的下一手，读数之前不选边。
+
+**改动（一层：探针）。** task.c 里 r351 的 holdrn 腿旁边照形状加 holdrs 腿：对每枚已捕的 trap
+线程（rows≤2），取 `r_rem[k]`，rem==0 不问（行不印）；rem==rn 印一行
+`clover r356: holdrs … skip=same`（缺席不能和「同一枚口」同形）；否则走 r355 的
+`clover_port_obj_held(holder_task, rem, &code, &sr, &mc, &so, &ms)`——注意属主是持有者自己的
+任务（SpringBoard 的空间），不是 pid 58——拿到引用端口后按 bbsend 叶子腿同一形状印
+`q= sr= ms= so= once= och= ocp= ocs=`＋`ty=`/`o=`，`e=` 只在翻译失败时给；再对 so>=1 的
+叶子跑 r352 普查，明细行 `clover r356: holdrsh t= pid= i= hpid= c= nm= ty= raw=`（每火至多
+2×2 枚）。`ip_release(port)` 与 r355 同一门第。
+- driver：tee 类 `r356-holdrs`(64) 与 `r356-holdrsh`(64)（一行一列，成对豁免，r355 的理由原样），
+  token `r356` 进每-pass 豁免链。
+- 栈纪律：holdrs 腿复用 r355 的局部暂存（同一函数、同一 fire 内），预期帧涨幅 ≤ r355 的量级；
+  构建后 objdump 复量，超预算照 r354 兜底。
+
+**预登记：boot 136（r356 镜像）判读。** 先判闸门①burst 跑完（bbnow、bbsend 每火行数=`cand=`、
+r346–r352 行在场、0 abt）；正对照＝同帧 `r350: holdrn` 仍点名 `rn=1e03 sr=1 ms=1 so=1 once=1
+och=1`、`r352: onceh hpid=58 backboardd`（认形状不认名字）。再认 SpringBoard 那行的 rem
+（boot 135 叫 3a03，每建必变）：
+- **W-A**：`q>=1` ⇒ 信已经躺在 rem 队列里、收件人不来取 ⇒ 下一问＝rem 口的 receive 属主是谁、
+  它的线程在干什么（r349 holdth 的形状反向用）。
+- **W-B**：`q=0、e=0、sr=0` ⇒ 这口上连发送权都没了而线程还堵着 ⇒ 发不出去（权死/被搬）；
+  下一手＝读该口 dead-name/nsrequest 通知队列。
+- **W-C**：`q=0、sr>=1` 且线程仍 `m2=1` 堵着 ⇒ 信在途或选项纯 RCV（rem 是陪跑）；下一手＝读该
+  线程 msg 的 option 位（opt= 列），把「在途」与「没发」切开。
+- **W-D**：翻译失败（`e=` 非零）⇒ rem 在 SpringBoard 空间里指的东西已经不在 ⇒ 那封信从没发到
+  这、或这口已随环销毁；下一手＝对照同线程 holdrn 腿的存活形状。
+- `skip=same` 全印而 rem!=rn 行缺席 ⇒ 捕到的 trap 线程只有收方向名字，先按 r264 的 x3 解码复核，
+  不判 W。
+- 控制腿：闸门①不过 ⇒ 按 r354 栈判据处理，不判 W；本靴 hop 形状与 135 同（全 set）⇒ 集合侧
+  r347 行照旧读，叶子/holdrs 谁在场判谁。
+
+**构建。** `python3.13 ./unixnu build kernel` 过；补丁 `zzzz…85z…-clover-r356.patch`
+（md5 `6ed0925555e85e3a3554971a58c4d185`）三份副本字节一致，正/反 apply 皆验（正向打在 r355 重放态
+`/tmp/r355chk` 上与编辑态逐字节相同，反向还原回 r355 基线逐字节相同）；构建日志本身就是全 series
+重放的证据（r355 行之后应用 r356 行，整趟过）。
+- 中途纠了一处真错：手写函数插入时把 Round349 文档注释的 `/*` 头与首行拆进了新增块，工作树一度是
+  「函数闭合括号后紧跟裸注释续行」的断注释形状——真编译会挂，闸门当时还抓不到（它只读补丁文本）。
+  修好后重生成补丁：最终形状**纯增加、零删行**，Round349 注释原样留在上下文；闸门的
+  「r356 不许删行」断言因此有据。
+- 栈纪律（构建后 `task.o` 反汇编复量）：`clover_bb_sample` 序言 0x60 + chkstk 0x1490 = 0x14F0 = 5360 B，
+  与 r355 持平（本轮没往 sample 帧里加东西）；新腿 `clover_bb_holder_send` = 0x60 + 0x390 = 0x3F0 =
+  1008 B，与 holder_door 同形；最深链 ≈12.9 KB < 16 KB，r354 的 noinline 兜底未触发。
+- AMFI→normalize→payload 全链 format 2：输入 `out/clover/ipados-17.7.11-21H461/clover/kernel/kernel.macho`
+  （md5 `f79718b1…`，52,482,048 B），两刀在文件偏移 `0x1af30e4`/`0x1af316c`（VA 不变，比 r355 挪
+  `0x1000`，同因文本长大）；amfi sha256 `bb4a6817…` → normalized `75acbb9c…`（973 枚戳清零）→
+  `round356-v0.7.75-payload.img`（sha256 `310793c9…`，58,720,256 B）。
+- `verify-clover-payload.py --kernel <normalized> --tree <tree>` EXIT=0，四枚新针脚
+  `r356-holdrs`/`r356-holdrs-error`/`r356-holdrs-skip`/`r356-holdrsh` 全在场；check-clover 仓内 EXIT=0。
+
+**负测。** 15 支（`~/clover-out/round356-negatives.log`，all-negatives-pass）：patch-missing、
+base-bytes、local-bytes、series-missing、series-order（r356 挪到 r355 之前）、removed-line（把一枚
+增加行重标成删行，验「纯增加」断言）、send-first（摘掉 SEND 先翻译那一刀）、holdrs-row、skip-row、
+holdrsh-row、call-site（摘掉 `rem==rn` 等值判断，skip 腿与普查腿会塌成一支）、tee-class、tee-order
+（holdrs 与 holdrsh 对调——first-match 匹配器要求长名在前）、exemption、title；每支红于自己的理由，
+恢复字节一致（三份副本 md5 复验 `6ed09255…`）。

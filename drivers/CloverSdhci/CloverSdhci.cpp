@@ -1256,6 +1256,14 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // holder per fire, four hops and four holders at most, so 64 is the arithmetic bound.
   { "clover r355: bbonceh", "r355-bbonceh", 64, 0, 0, 0 },
 
+  // Round356 runs the r355 snapshot on the send destination the trapped holder thread carries
+  // beside its receive name: `holdrs` is one row per translated name (or one skip=same row when
+  // rem == rn), `holdrsh` names at most four send-once holders per row. Two trapped threads per
+  // holder, six holders per fire, so 64 each is the arithmetic bound; the `holdrsh` class is
+  // listed first because teeProbeClass returns the first match and "holdrs" prefix-matches it.
+  { "clover r356: holdrsh", "r356-holdrsh", 64, 0, 0, 0 },
+  { "clover r356: holdrs", "r356-holdrs", 64, 0, 0, 0 },
+
   // Round349 follows each named holder into its own task in the same fire: `holdth` is the
   // per-task summary (threads, waiters, runners, trapped) and `holdt` at most two trapped threads
   // with their receive name, send destination and continuation. Six holders per fire at most, so
@@ -4973,6 +4981,7 @@ static void teeConsumeLine (uint32_t &pushed)
        // bbonceh names its holder, so a cap that kept the count and ate the name would recreate the
        // blind spot this round exists to close.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r355") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r356") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is
