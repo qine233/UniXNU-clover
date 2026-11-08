@@ -1,3 +1,5 @@
+schema_version = 2
+
 # Board description of the Xiaomi Mi Pad 4 8" LTE (clover, SDM660).
 # Hardware constants come from two device trees that agree with each other (mainline
 # sdm660-xiaomi-clover and Xiaomi's CAF clover kernel) and from facts/<serial>-<stamp>/,
@@ -6,6 +8,7 @@
 [board]
 name = "clover"
 soc = "SDM660"
+soc_source = "sdm660"
 # Round158. scripts/porting-record.py requires this key to equal device.os_profile in
 # porting.toml; it is the OS profile the board is built against, not a new build input.
 os_profile = "ipados-17.7.11-21H461"
@@ -67,6 +70,8 @@ windows = [
 
 [kernel]
 defconfig = "clover_defconfig"
+config_fragments = ["arch:configs/common.config", "soc:configs/sdm660.config", "os:configs/ipados.config"]
+patch_series = ["arch:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu/series"]
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
@@ -2645,7 +2650,6 @@ kernel_args = [
 ]
 
 [payload.adt]
-tool = "scripts/make-clover-adt.py"
 chip_id = "0x13d"
 # The low bank is 0x80000000-0x100000000; PIL, venus, the splash and the firmware FD
 # leave 0xa0000000-0x100000000, so 1 GiB is the largest obviously free request.
@@ -2671,3 +2675,43 @@ psci_method = "smc"
 packed_data_ramdisk = false
 ipad_identity = true
 unique_chip_id = "required"
+
+[device_tree]
+source = "device:dts/clover.dts"
+include_dirs = ["soc:dts"]
+
+
+[adt]
+
+[adt.product]
+
+[adt.product.string]
+product-name = "iPad Pro (12.9-inch) (2nd generation)"
+model = "iPad7,1"
+product-description = "iPad Pro (12.9-inch) (2nd generation)"
+artwork-device-idiom = "pad"
+artwork-display-gamut = "sRGB"
+compatible-device-fallback = "iPad6,7"
+
+[adt.product.u32]
+artwork-device-subtype = 2732
+artwork-scale-factor = 2
+thin-bezel = 1
+
+[adt.defaults]
+
+[adt.defaults.u32]
+sleep-disabled = 1
+"kern.maxvnodes" = 66560
+
+[adt.buttons]
+
+[adt.buttons.string]
+compatible = "buttons"
+device_type = "buttons"
+
+[adt.buttons.strings]
+button-names = ["hold", "voldown", "volup"]
+
+[adt.buttons.u32]
+home-button-type = 2

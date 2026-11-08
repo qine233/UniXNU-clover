@@ -30,3 +30,8 @@ path = "arch/arm64/boot/dts/vendor/qcom"
 # sdm660-mtp-clover.dts       qcom,board-id = <11 0>, pm660 + pm660l
 # xiaomi/mi/clover/clover-overlay.dtsi   cont_splash_mem = <0x0 0x9d500000 0x0 0x02400000>
 # xiaomi/mi/clover/dsi-panel-nt51021-boe-video.dtsi   1200x1920 at 107x172 mm, so 8 inch
+
+[[source]]
+name = "sdm660"
+kind = "soc"
+local = "/Users/zhouzhou/UniXNU-sdm660-common"

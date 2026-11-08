@@ -1,0 +1,23 @@
+/dts-v1/;
+
+// Xiaomi Mi Pad 4 LTE (clover, SDM660). The SoC resources live in the sdm660
+// profile (include_dirs = ["soc:dts"]); this file adds the board identity and
+// exports exactly the nodes this port's ADT has always carried. Nothing else is
+// described here on purpose: the drivers reach peripherals through the fixed
+// addresses in their own *_Regs.h, not through device-tree matching, and the
+// twelve ADT nodes this port has shipped since round180 (device-tree, chosen,
+// cpus, psci, arm-io+intc, defaults, options, product, buttons, memory-map,
+// manifest-properties) are all that anything reads.
+/include/ "sdm660.dtsi"
+
+/ {
+	model = "Xiaomi Mi Pad 4 LTE";
+	compatible = "xiaomi,clover-lte", "qcom,sdm660";
+};
+
+// The one exported hardware node: generate() builds /arm-io out of every node
+// carrying unixnu,adt-name, and the GIC is the only register window the ADT has
+// ever published there. Its physical base also fixes the arm-io window.
+&intc {
+	unixnu,adt-name = "intc";
+};
