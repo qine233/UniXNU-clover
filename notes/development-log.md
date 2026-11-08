@@ -29656,3 +29656,50 @@ base-bytes、local-bytes、series-missing、series-order（r356 挪到 r355 之�
 holdrsh-row、call-site（摘掉 `rem==rn` 等值判断，skip 腿与普查腿会塌成一支）、tee-class、tee-order
 （holdrs 与 holdrsh 对调——first-match 匹配器要求长名在前）、exemption、title；每支红于自己的理由，
 恢复字节一致（三份副本 md5 复验 `6ed09255…`）。
+
+**读数（boot 136，`round356-v0.7.75-payload.img`，全解码 `~/clover-out/round356-boot136-decoded.txt`）。**
+这一靴答了 W 支，而且带回一条四支判据之外的信息：
+
+1. **闸门①（burst 跑完）过**：全文 0 枚 `abt`；`r327: bbnow t=763 pid=58 fired=1 hn=4 state=hop_null`；
+   这一火 `r331: bbsend` 四支 hop（0/1/2/3，`cand=4`）齐；r346–r352 行在场。正对照成立：同帧
+   `clover r350: holdrn t=763 hop=2 i=2 j=1 pid=27 rn=903 … sr=1 ms=1 so=1 own=1 once=1 och=1`
+   ＋`clover r352: onceh t=763 pid=27 j=1 hpid=58 c=backboardd nm=ce0b ty=sendonce raw=b040001`
+   ——boot 134 的 Y-A 在 135、136 两靴原样复现，欠 backboardd 回复这一边稳定。
+2. **`skip=same` 一支未印**：三腿 `rem != rn` 全在场（pid 27 一腿、pid 174 两腿同名），
+   r264 的 x3 解码复核腿不需要动。
+3. **SpringBoard 那行落在 W-C**：`clover r356: holdrs t=763 hop=2 i=2 j=1 pid=27 rem=5303 ty=0
+   o=fffffff58814fe80 q=0 sr=1 ms=0 so=1 own=1 hits=1 probed=141 scanned=141 once=0 och=0 ocp=141
+   ocs=141 n=0`。逐支排除：W-A 否（`q=0`，rem 队列里没有躺着的信）；W-B 否（`sr=1`，发送权活着）；
+   W-D 否（SEND 先翻译即中，`ty=0`，本轮 0 枚 `e=` 行）；剩下 **W-C：`q=0` 且 `sr>=1` 而线程仍堵**
+   ——信曾在队列里、已被取走，rem 要么是在途，要么是这封 trap 的陪跑名。boot 135 的 `3a03` 换成
+   `5303`，「每建必变」兑现。pid 174 的 rem=5507（`o=fffffff5880d91a0`）逐列同形，形状是模式不是孤例。
+4. **四支之外的新信息：`so=1` 而普查 `once=0`（`ocs==ocp==141` 全扫完）**。对 rem 这枚口，
+   跨空间 SEND_ONCE 普查（就是 boot 134 在 903 上点名 backboardd 那一把）一支都没找到——权不在任何
+   任务的名表里。XNU 里口对象上的 send-once 只由「某封信发送时把该口的 receive 名写进了
+   msgh_local_port」产生，这枚权住在**那封信的 kmsg 里**，被用掉或丢弃之前不进任何 ipc_entry。
+   所以 `q=0`＋`so=1`＋`once=0` 合起来说的是：**rem 口的 receive 属主自己发出过一封信、把这枚口当回复
+   端口，而那封信还活着（躺在别的队列或别的线程的在途 kmsg 里）**。下一问因此不是 opt=  alone：
+   **谁持有 `fffffff58814fe80` 的 receive 权**（`port->ip_receiver` 的属主任务 pid/comm）。若它就是
+   pid 58 backboardd，环从两跳变三跳：SpringBoard→(5303 被 backboardd 收走)→backboardd 自己的那封
+   未回的信→第三个队列。
+
+**预登记：boot 137（r357 镜像）判读。** 仪器＝在 holdrs 行上加 `opt=`（trap 帧里 mach_msg2 的选项字，
+r264 的解码位置直接复用），并在 `ty==0` 腿下读 `port->ip_receiver` 的属主任务，印
+`clover r357: holdrr t=… rem=… rpid=%d c=…`（rpid==-1 表示 receiver 是 kernel_task/空，也照印）。
+先判闸门①（同上：0 abt、每火 bbsend 行数=cand、holdrn/onceh 正对照在场），再看 SpringBoard 的 5303
+等价腿（rem 名每建必变）：
+- **V-A**：`opt` 无 SEND 位 ⇒ 这封 trap 纯收，rem 是陪跑名；「在途」那半就此排除，题面全部挪到
+  receive 属主（V-B/V-C 那腿）。
+- **V-B**：`rpid==58` ⇒ 环的第三边坐实在 backboardd 自己身上——它收了 SpringBoard 的信、自己又欠着
+  一封以 5303 为回复口的信没回；下一手＝顺着 backboardd 那封在途/排队信找落点队列（r331 bbsend 四腿
+  本轮全读 `scan=pset e=17`，pset 侧 r347 形状先照旧读）。
+- **V-C**：`rpid` 是别的任务 ⇒ 环里出现新节点，下一手＝对它跑 r355 快照（它的 rn/rem 各一腿）。
+- 控制腿：闸门①不过 ⇒ 按 r354 栈判据，不判 V；若 `opt=` 或 `holdrr` 整支缺席（tee 预算/胶合断），
+  先按 N86 规矩修读者与针脚再判。
+
+**落回与窗口（本轮实况）。** boot 136 的内核日志停在 `t=773.653 s`、驱动 beat 行停在 `t=659.9 s`：
+这靴在 **约 780 s 处复位，没走到 1800 s 死线**——flight 死线记录还是 boot 108 的、panic marker 两槽
+STALE（boot 136 从没进过 sink），复位落 fastboot、misc 无 recovery 命令。与 boot 99/108 那族静默
+复位同型（`r283: last reset unnamed` 行在场，`r339: beatctl … ok=1` 正对照在场）。读回按用户指示改走
+「宿主写 BCB 回 TWRP」：重跑 `run-clover-unattended.sh --allow-misc-bcb`（不重刷 cache，只写 2048 字节
+misc），设备现停在 TWRP。对判读无损：三腿 holdrs 都诞生在 t=763 那一火，已在环里被节拍 flush 落盘。
