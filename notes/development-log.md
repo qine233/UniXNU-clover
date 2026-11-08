@@ -28891,3 +28891,48 @@ flight 12 条、verdict 64 条、kernel 环 512 行全部是 boot 125 写的。*
 且行为与 r344 同一形状（同一条 backboardd 停链、同样 8 核、同样的探针行）。**剩余差异只有 `[adt]` 声明与
 `generate()` 不支持的 `/cpus` 两枚键**，后者内核不使用（CPU 号取 MPIDR）。下一手的题面回到主线 #666：backboardd 那四跳 `e=17 debt=4`
 与静默复位时机；迁移本身不再挡路。
+
+## 逐跳解 backboardd 的 e=17 / debt=4（boot 125 的 r327/r328/r331 三行）
+
+**结论先说。** `e=17` 是 `KERN_INVALID_RIGHT`，但在这四跳上它**不是**「死名」，而是「这个名字是 **port set**，探针却按 port 去翻译」；
+`debt=4` 也**不是**「四笔债」，是「四个队列读不到」。所以 boot 125 的四跳并没有证明 backboardd 被一笔缺回复的 send 卡住；
+相反，它证明被采样的四个线程都是 backboardd 自己停在接收里的线程，收信口是它自己的 port set。
+
+**逐跳（boot 125，t=481，pid=58）：**
+
+| hop | nm | 入口右类型 | RECEIVE 翻译 | SEND 翻译 | r328 的 owner | q / s | 判读 |
+|---|---|---|---|---|---|---|---|
+| 0 | 0x5203 | **PORT_SET 0x80000** | 17 | 17 | `58:backboardd+ps` | 未读到 / 未读到 | 名字是 backboardd 自己的 port set，不是 port |
+| 1 | 0x4303 | PORT_SET 0x80000 | 17 | 17 | `58:backboardd+ps` | 未读到 / 未读到 | 同上 |
+| 2 | 0x6303 | PORT_SET 0x80000 | 17 | 17 | `58:backboardd+ps` | 未读到 / 未读到 | 同上 |
+| 3 | 0x8403 | PORT_SET 0x80000 | 17 | 17 | `58:backboardd+ps` | 未读到 / 未读到 | 同上 |
+
+**每一步的源码依据。**
+1. `hrn[i]` 是被采样线程自己寄存器 `x5` 高半（`task.c:13942`），即该线程**自己空间里**的接收名；被采样的四个线程都属于 pid 58
+   （r328 的 `c=` 四个 `58:backboardd+ps`），所以名字在 backboardd 的空间里。
+2. `clover_port_obj_held()`（`task.c:12517`）先 `ipc_object_translate(..., MACH_PORT_RIGHT_RECEIVE)`，失败再试 `SEND`；
+   两次都失败就把 `kern_return_t` 原样写进 `e=`。`17` 就是 `KERN_INVALID_RIGHT`：入口存在，但持有的既不是接收权也不是发送权。
+3. 右类型只有四选一：`SEND 0x10000`、`RECEIVE 0x20000`、`SEND_ONCE 0x40000`、`PORT_SET 0x80000`、`DEAD_NAME 0x100000`
+   （`osfmk/mach/port.h:270-274,286-288`）。`clover_sb_port_owner()`（`task.c` 里）在 SEND/RECEIVE 都失败后**第三次按 `MACH_PORT_RIGHT_PORT_SET`
+   翻译**，只有成功且 `io_otype==IOT_PORT_SET` 才在 owner 名后加 `+ps`——所以 r328 那四个 `58:backboardd+ps` 就是「这是 backboardd 自己的
+   port set」的直接读数。**死名不会走到 `+ps` 这一支**（它按 PORT_SET 翻译会失败），因此 e=17 在这里不是死名。
+4. `q=`/`sr=` 的 0 是**初始化值**：`clover_port_obj_held()` 在翻译失败时直接返回 `IPC_PORT_NULL`，`msgcount`/`ip_srights` 从未被读
+   （`task.c:12532-12538` 只读成功翻译后的 port）。r328 把每跳的 `e=` 并排印出来，正是为了让这组 0 不能当读数用。
+5. `scan=xlate` 是 r331 自己的字面量分类：两腿都没跑，`e=` 本身就是 `KERN_*`。所以 `hits/probed/scanned/self/ownnames/walked`
+   全 0 不是「没找到持有者」，是「没有做这件事」。
+6. `cand=4`：四跳的 `hrn` 都非 0。`debt=4`：r331 的调用方把 `rcvq[i]==0` 记为一笔债（`task.c` 里 `if (rcvq[i] == 0) debt++;`），
+   而四个 `rcvq` 都是 `clover_sb_port_mail` 在 port set 上翻译失败留下的 0 ⇒ **debt=4 是「四跳的队列读不到」，不是「四跳欠消息」**。
+   r328 同一帧的 `e=17.17.17.17` 就是这条口径的旁证。
+7. r327 的发送腿同帧全是 null（`state=hop_null named=0 asked=0 o0..o3=null`）：四跳的 `x3` 低半（发送目的地）都是 0 ⇒ 它们是
+   **纯接收**，不是「停在 send 等回复」。这也解释了为什么「逐跳追发送链」在这里追到的是自家 port set。
+
+**和 boot 124（r344）的对照。** 同一形状：三跳 e=17（port set）、第四跳 **e=0**——那是一个真的 port，`q=0 s=0`，owner 是
+`58:backboardd`（无 `+ps`）。也就是说 r344 也从未有过「四笔债」：三跳不可翻译、一跳可翻译但队列空、无发送权。boot 125 只是
+把第四跳也换成了一个 port set（线程集合变了）。**两靴都不支持「四跳 send 债」这个读法。**
+
+**这条读数关掉了什么、打开了什么。** 关掉：「backboardd 被一笔缺回复的 send 卡住、欠主在四跳里」——采样的四跳是接收线程，
+`debt` 是读不到的零。打开：真正的问题在**这四/三个 port set 上**——哪个 set 是主 runloop 的接收集、它的成员里有没有一个
+本应投递 UI/显示事务却从未投递的发送者。下一轮（仪器债）应做三件：
+① 对每个翻译为 `PORT_SET` 的 hop，列出成员（对象、`imq_msgcount`、`ip_srights`、成员名）与 set 的接收线程；
+② 打印被采样线程的 continuation/调用者，把「主线程」与「辅助接收线程」分开（现在只按线程顺序取前四个）；
+③ 改 `debt` 的口径：只在 `err==0` 时把 `rcvq==0` 记作债，另设 `unread=` 计数，否则「读不到」和「没有」在同一个数字里。
