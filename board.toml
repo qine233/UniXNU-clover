@@ -71,7 +71,7 @@ windows = [
 [kernel]
 defconfig = "clover_defconfig"
 config_fragments = ["arch:configs/common.config", "soc:configs/sdm660.config", "os:configs/ipados.config"]
-patch_series = ["arch:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu/series"]
+patch_series = ["arch:patches/xnu/series", "device:patches/xnu/series"]
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
