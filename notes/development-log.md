@@ -28732,3 +28732,19 @@ inputs：trust-cache `build/clover-trust/trustcache.bundle` `7c369ce0…`（与 
 `round150-scratch-data.img` `614b8356…`（与 r343 记录同）、seed `0x81ffcaaa`、`--uefi ~/mu-clover`。
 `verify-clover-payload.py` **EXIT=0，51 项 OK、0 FAIL**；双闸门 repo／tree 都 **EXIT=0**（tree 侧 12 archives、22 objects ABI-checked）。
 payload 里新增的四枚 CString（`dispstate`／`dispstatecut`／`dispclient`／`dispclientcut`）由 verify 的字节针脚确认在场。
+
+## §Round344 读数（boot 124，r344 镜像）
+
+**① 怎么读的。** 冷刷 `cache` 后 `fastboot reboot`；卡上 boot 计数从 123 走到 **124**（解码器自己说的：`the boot count moved: 123 -> 124`），16 报告／64 驱动行／**16 探针行**／512 内核行。落回是 **TWRP**（`TWRP's adb came up … the pre-armed BCB landed it in recovery`），与 boot 123 的 EDL 不同；deadline 记录仍是 boot 108 的（本靴没到 1800 s），`r283` 又读到 `magic=6c881000048019d0`（不是我们的）⇒ M-D 的反支复现一次，结论不变。
+
+**② R-A 成立。** `clover r344: dispstate` **10** 枚、`clover r344: dispclient` **10** 枚；旧头 `clover r343: dispstate` **0** 枚；`clover r343: bbswap` **31** 枚在场＝正对照（证明卡是本轮镜像）。
+
+**③ R-B 成立（逐字对齐）。** 同一 fire 的拍行 `pick=` 与 `dispclient` 的 `grew=` 逐枚相等：`pick=9g`↔`grew=9`、`21g`↔`21`、`3g`↔`3`、`25g`↔`25`、`20g`↔`20`。`pick=` 以 `t` 结尾时 `grew=` 印 `-` 的那条（首采样）在本靴没有出现——五枚记录的首采样都落在拍行尚未选中它们的那几拍，所以本靴只证了 `g` 支；`t` 支仍是读代码与 selftest 的结论。
+
+**④ R-C 成立（#695 被关掉）。** fires=25／26 两枚拍行 `client=pid86`（boot 123 里这两拍会是 `client=pid58 calls=0`），随后 fires=27 起 pid 58 开始增长、行自动跟随成 `client=pid58 pick=9g p58=9`；fires=26 的 `p58=-` 正确表示「pid 58 刚被采样、还没有上一份」而不是 0。`dispclient` 把五枚记录逐条印出（idx0..4 = pid 86／87／58／56／74），其中四条 `grew=0` 之后再没重印——「新或增长才印」的规则按设计工作。
+
+**⑤ R-D 成立（从卡上量）。** 两族 cut 行各 **0** 枚；实测拍行 184–**304** B（上限 384），逐记录行 89–**129** B（上限 320），都在一记录的 488 B 正文之内。
+
+**⑥ M-A 仍空判。** 本靴落 TWRP、deadline 记录缺席、panic marker 未判（不在本次范围）⇒ 落回模式由谁决定依旧未定；**不许因为 R-A…R-D 成立就把它记成通过**。
+
+**⑦ 下一手。** sheng 薄迁移（分支 `sheng-port`）：`~/UniXNU-sdm660-common` 骨架已建；board DTS 只需 memory／cpus／psci／一枚 `unixnu,adt-name="intc"`，`arm-io` 的 `ranges` 由 `arm_io_window()` 算（取整规则待钉），`defaults/options/product/buttons` 走 `[adt]` 表。
