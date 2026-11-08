@@ -29358,3 +29358,49 @@ adt `96093cb3…`。双闸门绿（51 OK/0 FAIL，`r352-onceh`、`r350-holdrn` �
 **boot 133 的状态。** r352 已刷入 cache 并启动，板子在 1800 s 死线前以 **EDL** 落地（timeline 的 close 行）；
 卡上 boot 133 的窗口未被覆盖，读回只差板子回到 TWRP。当前 EDL 持续（`QUSB_BULK_SN:F6548A52` 在 USB 上），
 后台继续轮询；返回 fastboot 即写 BCB 落 TWRP，返回 adb 即 `--skip-recovery` 读卡。
+
+## Round352 读数（boot 133）：采样器第一火就内核栈溢出，Y-A…Y-C 无法判
+
+**读回。** 用户手动把板子从 EDL 开进 fastboot；host 写 misc BCB（`boot-recovery`，2048 B）后 `fastboot reboot`，
+板子落 TWRP（`adb devices` = `81ffcaaa recovery`）。`run-clover-unattended.sh --serial 81ffcaaa --skip-recovery`
+读回 boot 133 窗口（`~/clover-out/clover-log-window.bin.txt`，1932 行；boot 计数 132→133）。cache 仍是 r352 镜像
+（`d2861fe9…`），未被覆盖。
+
+**关键事实：这不是「onceh 缺席」，是 burst 没跑完就死了。** 内核环最后一行（slot 431，seq 1967）是：
+
+```
+[761.1009560]: clover r289: abt pid=0 tid=0x12e pc=fffffff00773df30 lr=fffffff0078861e4
+  fp=fffffff6f1238040 sp=fffffff6f1237f00 esr=96000047 far=fffffff6f1237f70 cpsr=80000204
+  kstack=fffffff6f1238000..fffffff6f123c000
+```
+
+- `esr=0x96000047`：EL1 数据中止，DFSC=0b000111＝**translation fault level 3**，WnR=1＝**写**。
+- `far=…7f70` 落在 `kstack` 底（`…8000`）**下方** 0x90；`sp=…7f00` 已低于栈底 0x100 ⇒ **内核栈溢出**，
+  不是别的内存错。栈只有 `0xc000-0x8000=0x4000`＝16 KB。
+- 宿主用本轮未剥离内核（`nm -n`，运行时 VA 无需 slide；正对照 `cont=fffffff0072622ac` 精确落
+  `_ipc_mqueue_receive_continue`）落地：`pc=_oslog_stream+0x4`、`lr=_log_payload_send+0x44`。反汇编
+  `_oslog_stream`：`+0 sub sp,sp,#0xc0`、`+4 stp x26,x25,[sp,#0x70]`——正是这条 `stp` 写 `sp+0x70=…7f70` 触中止，
+  与 far/sp 逐字对上。即 **printf 路径**（beat 线程在采样器里 printf）把栈压穿。
+
+**时序。** 这是本靴采样器**第一火**（`clover_bb_enters=1` 的 `cen-in t=761` 在 probe 环；`bb … f=1 hops=4`）。
+`latch t=738 name=2607`（本靴 door 名换成 2607，rn=3e03）→ `bb t=761.1009438` → `sbport bb t=761.1009490`
+（两条都落卡）→ 7 µs 后 `abt t=761.1009560`。`bbnow`/`bbrcv`/`r346`/`r347`/`r349`/`r350`/`r351`/`r352` 一行都没有：
+执行停在 sbport 行之后、bbnow 之前。此后 wdt/peer/sbport 周期行全停，flight  entry 停在 t=750 s、beat 停在 t=655 s，
+板子约 wall 864 s 静默复位进 EDL（与 boot 123 的 836 s 同形，**不是** 1800 s 死线）。全停＝beat 线程栈穿后内核中止。
+
+**根因（宿主反汇编量出）。** `clover_bb_sample` 序言：`stp d11,d10,[sp,#-0x80]!` + `__chkstk_darwin(w9=0x2a20)`
++ `sub sp,#0x2000` + `sub sp,#0xa20` ⇒ 单帧 **0x2aa0＝10912 B**。16 KB 栈减去这帧与 beat 线程框，只剩约 5 KB
+给被调链；printf→log_payload_send→oslog_stream 还要 ~5.7 KB，压穿。为什么 r351（boot 132）没穿而 r352 穿：
+`_clover_bb_holder_door / _holder_sample / _hop_pset / _clover_port_once_holders` 在符号表里**都没有独立符号**
+（只有各自的 `___…_block_invoke`）⇒ 它们被**内联进 `clover_bb_sample`**，帧逐轮累加；r352 给 holder_door 加的
+`sp[4]/sn[4]/sb[4]/sc[64]` 与 once_holders 的局部把这帧顶过了 16 KB 线。census 维度本身没变
+（`CLOVER_BB_CENSUS=20`、`CLOVER_BB_SEMA_NAME=20`）。
+
+**判读。** Y-A/Y-B/Y-C **均不可判**：`onceh`/`holdrn once=` 一行都没产出，不是「once=0」也不是「och=0」，
+是 burst 在到达 r350 之前就栈溢出中止。控制腿（holdrn/holdth 行数、bbsend/bbset2 形状） likewise 缺席。
+r352 的探针逻辑未被证伪，也未被证实——它根本没跑到。下一手必须先修栈，再重读 r352 的问题。
+
+**下一手（r354）。** 把采样器的栈占用降回 16 KB 以内并留出余量：给四枚重助手
+（`clover_port_once_holders`、`clover_bb_holder_door`、`clover_bb_holder_sample`、`clover_bb_hop_pset`）加
+`__attribute__((noinline))`，停止把它们的帧内联累加进 `clover_bb_sample`；重建后量 bb_sample 帧，若仍逼近上限
+再把 census 暂存数组移到单写者静态缓冲（beat 线程是唯一调用者，顺序执行）。修好后重刷重读，按 Y-A…Y-C 判。
