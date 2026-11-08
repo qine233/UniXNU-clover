@@ -3674,6 +3674,64 @@ def check_board(errors: list) -> str:
                     errors.append(f"the r348 patch still adds {bug!r}: a char where %s needs a pointer "
                                   "is exactly boot 127's FAR 0x6c")
 
+        # Round349. Boot 128 named the holders of set members (launchd and SpringBoard hold send rights
+        # to member 9103), but a name is not an explanation. The hand samples the holder's own task in
+        # the same fire: clover r349: holdth is the thread census of that task and clover r349: holdt
+        # at most two trapped threads with their receive name, send destination and continuation.
+        # The gate holds the patch identity, its place after r348, the try-locked sample and the two
+        # row shapes, because a holder row without what its owner was doing is the shape this port
+        # keeps paying for.
+        r349_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r349.patch")),
+                         default=None)
+        if r349_patch is None or not r349_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r349.patch is missing: sampling the holder is "
+                          "this round's only hand, and an instrument nobody shipped is a reading nobody "
+                          "can take")
+        else:
+            r349_name = r349_patch.name
+            r349_lines = r349_patch.read_text().splitlines()
+            load_r349 = REPO.parent / "UniXNU" / "patches" / "xnu" / r349_name
+            if not load_r349.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r349_name} is missing: unixnu loads patches from "
+                              "there, and this repo's copy only ever names the round")
+            elif load_r349.read_bytes() != r349_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r349_name} is not the same bytes as this repo's "
+                              "copy: the shipped image would carry a different sample than the one checked")
+            series_text = (REPO / "patches/xnu/series").read_text()
+            series_line = f"arch:../../../patches/xnu/{r349_name}"
+            r348_prev = max((p.name for p in (REPO / "patches/xnu-clover").glob("*-clover-r348.patch")),
+                            default="")
+            if series_line not in series_text:
+                errors.append(f"patches/xnu/series does not apply {r349_name}: the sample exists and the "
+                              "kernel would be built without it")
+            elif r348_prev == "" or series_text.find(r348_prev) < 0:
+                errors.append("patches/xnu/series no longer applies r348: r349 calls into the holder "
+                              "loop r347/r348 left, so the series cannot be read as the ordered history")
+            elif series_text.find(series_line) < series_text.find(r348_prev):
+                errors.append("patches/xnu/series applies r349 before r348: the argv fix must land first "
+                              "or the census still aborts before the holder loop can call out")
+            r349_added = [line[1:] for line in r349_lines if line.startswith("+")]
+            for now in (
+                'clover_bb_holder_sample((int)hp[j], hop, (int)i, (int)j,',
+                'if (!lck_mtx_try_lock(&task->lock)) {',
+                'lck_mtx_unlock(&task->lock);',
+                'task_deallocate(task);',
+                '"clover r349: holdth t=%llu hop=%d i=%u j=%u pid=%d door=%x th=%u"',
+                '"clover r349: holdt t=%llu hop=%d i=%u j=%u pid=%d tid=%llx st=%x"',
+                'x16 != (uint64_t)-47',
+                'rem = (uint64_t)saved_state64(ss)->x[3];'):
+                if not any(now in line for line in r349_added):
+                    errors.append(f"the r349 kernel patch does not add {now[:56]!r}: without it the "
+                                  "holder row stays a name with no state behind it")
+        for entry in ('{ "clover r349: holdth", "r349-holdth", 64, 0, 0, 0 },',
+                      '{ "clover r349: holdt", "r349-holdt", 64, 0, 0, 0 },'):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: the holder samples land "
+                              "inside the r347 burst and need their own budget")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r349")' not in sdhci_source:
+            errors.append("the r349 rows are not exempt from the per-pass cap: half a holder sample is "
+                          "the half-pair r249 refuses")
+
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
         # its own ending, so a silent boot leaves the boot before it on the card and the reader called
@@ -7399,8 +7457,8 @@ def check_board(errors: list) -> str:
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
     # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
     # the menu names round347.
-    if not board["payload"]["title"].startswith("clover r348:"):
-        errors.append('[payload] title is not "clover r348: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r349:"):
+        errors.append('[payload] title is not "clover r349: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -9554,8 +9612,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r348:"):
-        errors.append('[payload] title is not "clover r348: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r349:"):
+        errors.append('[payload] title is not "clover r349: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

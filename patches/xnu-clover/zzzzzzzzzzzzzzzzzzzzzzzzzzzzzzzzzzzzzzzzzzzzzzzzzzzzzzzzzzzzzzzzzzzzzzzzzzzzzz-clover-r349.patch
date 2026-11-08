@@ -1,0 +1,137 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12669,6 +12669,121 @@
+  * send right (the r331 legs, run member by member) and prints ip_mscount beside it; the references
+  * are dropped after the rows, because a member can be destroyed between the walk and the asks.
+  */
++/*
++ * Round349. Boot 128 named the holders of the set members (launchd and SpringBoard hold send rights
++ * to backboardd's door 9103) but a name is still not an explanation. This samples the holder itself
++ * in the same fire: every thread's state, and for the threads in the mach_msg2 trap their receive
++ * name (x5 high), send destination (x3 low) and continuation, so the reader can tell "the holder is
++ * parked in a receive of its own" from "the holder is running and simply not posting" and from "the
++ * holder is blocked sending to a different name". The holder task is locked with try_lock and
++ * sampled only as a summary plus at most two trapped threads; nothing is retained.
++ */
++static void
++clover_bb_holder_sample(int pid, int hop, int i, int j, mach_port_name_t door,
++    uint64_t secs)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	extern struct proc *proc_find(int pid);
++	extern task_t proc_task(struct proc *p);
++	extern int proc_rele(struct proc *p);
++	struct proc *p;
++	task_t task;
++	thread_t thr;
++	uint32_t th = 0;
++	uint32_t wait = 0;
++	uint32_t run = 0;
++	uint32_t m2 = 0;
++	uint64_t r_tid[2];
++	uint64_t r_we[2];
++	uint64_t r_cont[2];
++	uint64_t r_pc[2];
++	uint32_t r_st[2];
++	uint32_t r_rn[2];
++	uint32_t r_rem[2];
++	uint32_t rows = 0;
++	uint32_t k;
++	char row[220];
++	int len;
++
++	if (pid <= 0) {
++		return;
++	}
++	p = proc_find(pid);
++	if (p == NULL) {
++		return;
++	}
++	task = proc_task(p);
++	if (task == TASK_NULL) {
++		proc_rele(p);
++		return;
++	}
++	if (!lck_mtx_try_lock(&task->lock)) {
++		proc_rele(p);
++		return;
++	}
++	queue_iterate(&task->threads, thr, thread_t, task_threads) {
++		arm_saved_state_t *ss;
++		uint64_t x16 = 0;
++		uint64_t rn = 0;
++		uint64_t rem = 0;
++
++		th++;
++		if ((thr->state & TH_WAIT) != 0) {
++			wait++;
++		}
++		if ((thr->state & TH_RUN) != 0 && (thr->state & TH_WAIT) == 0) {
++			run++;
++		}
++		ss = get_user_regs(thr);
++		if (ss == NULL || (uintptr_t)ss == (uintptr_t)-1 || is_saved_state32(ss)) {
++			continue;
++		}
++		x16 = (uint64_t)saved_state64(ss)->x[16];
++		if (x16 != (uint64_t)-47) {
++			continue;
++		}
++		m2++;
++		rn = (uint64_t)saved_state64(ss)->x[5] >> 32;
++		rem = (uint64_t)saved_state64(ss)->x[3];
++		if (rows < 2) {
++			r_tid[rows] = thr->thread_id;
++			r_st[rows] = thr->state;
++			r_we[rows] = (uint64_t)(uintptr_t)thr->wait_event;
++			r_cont[rows] = (uint64_t)(uintptr_t)thr->continuation;
++			r_pc[rows] = (uint64_t)get_saved_state_pc(ss);
++			r_rn[rows] = (uint32_t)rn;
++			r_rem[rows] = (uint32_t)rem;
++			rows++;
++		}
++	}
++	lck_mtx_unlock(&task->lock);
++	task_deallocate(task);
++	proc_rele(p);
++	len = snprintf(row, sizeof(row),
++	    "clover r349: holdth t=%llu hop=%d i=%u j=%u pid=%d door=%x th=%u"
++	    " wait=%u run=%u m2=%u\n",
++	    (unsigned long long)secs, hop, i, j, pid, door, th, wait, run, m2);
++	if (len > 0) {
++		row[sizeof(row) - 1] = '\0';
++		clover_emmc_probe_say(row, (unsigned int)strlen(row));
++		printf("%s", row);
++	}
++	for (k = 0; k < rows; k++) {
++		len = snprintf(row, sizeof(row),
++		    "clover r349: holdt t=%llu hop=%d i=%u j=%u pid=%d tid=%llx st=%x"
++		    " we=%llx cont=%llx pc=%llx rn=%x rem=%x\n",
++		    (unsigned long long)secs, hop, i, j, pid,
++		    (unsigned long long)r_tid[k], r_st[k],
++		    (unsigned long long)r_we[k], (unsigned long long)r_cont[k],
++		    (unsigned long long)r_pc[k], r_rn[k], r_rem[k]);
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
++	}
++}
++
+ #define CLOVER_BB_PSET_MAX 8
+ struct clover_bbpset_snap {
+ 	ipc_port_t ports[CLOVER_BB_PSET_MAX];
+@@ -12812,6 +12927,12 @@
+ 				clover_emmc_probe_say(row, (unsigned int)strlen(row));
+ 				printf("%s", row);
+ 			}
++			/*
++			 * Round349: sample the holder in the same fire, so "the right exists" is followed by
++			 * what the right's owner is doing at that instant.
++			 */
++			clover_bb_holder_sample((int)hp[j], hop, (int)i, (int)j,
++			    (mach_port_name_t)hn[j], secs);
+ 		}
+ 	}
+ 	for (i = 0; i < stored; i++) {

@@ -29130,3 +29130,30 @@ r347: bbsmhold hop=1 i=5 j=0 pid=177 c=com.apple.datam nm=2d17 ty=send raw=10000
 3. **下一问因此变成**：SpringBoard 有这个门却**没有投递**——是它自己卡在别处，还是它根本不知道要发？
    下一轮应在同一拍里采样**持有者**（pid 27 / pid 1 / pid 177）的线程：它们各自在等什么、continuation 是什么、
    是否有 `mach_msg2` 的远端名等于 `7003`。这把「门有钥匙」推进到「钥匙在谁手里、那个人当时在做什么」。
+
+## Round349：同一拍采样门的持有者（pid 27 / 1 / 177）
+
+**为什么。** boot 128 的 `bbsmhold` 把 `9103` 的 key holder 读成了 `launchd` 与 `SpringBoard`。名字本身不解释
+「为什么没投递」；要区分「持有者自己卡在接收」、「持有者不在跑」、「持有者在往别的名字发」，必须在同一拍看它的线程。
+
+**改动（`patches/xnu/…-clover-r349.patch`，接在 r348 之后）。**
+- 新增 `clover_bb_holder_sample(pid, hop, i, j, door, secs)`：`proc_find` → `task` → `lck_mtx_try_lock`（拿不到就放弃并返回），
+  遍历线程统计 `th=/wait=/run=`，对 `x16==-47`（mach_msg2 trap）的线程记 `m2=`，取最多两枚的
+  `tid/st/we/cont/pc` 与 `rn=x5>>32`、`rem=x3`（发送目的地）；解锁后 `task_deallocate` + `proc_rele`。
+- 行：`clover r349: holdth t= hop= i= j= pid= door= th= wait= run= m2=` 与
+  `clover r349: holdt t= hop= i= j= pid= tid= st= we= cont= pc= rn= rem=`（最多两行）。
+- 调用点：每印出一行 `bbsmhold` 就采样该 holder（最多 2 个/成员）；`door=` 用 bbsmhold 已印的 `nm=`。
+- driver：tee 类 `r349-holdth` / `r349-holdt`（各 64），token `r349` 进每-pass 豁免链。
+- 宿主闸门 10 条负测（补丁缺席/字节不同/系列缺席/顺序、调用点、try_lock、行串、tee 类、豁免、标题）逐条按自己理由红并
+  逐字节还原（`~/clover-out/round349-negatives.log`）。
+
+**预登记：boot 129（r349 镜像）的三支判读。**
+- **S-A**：`holdth` 给出 SpringBoard（pid 27）的线程总数与 `wait=/run=/m2=`；`holdt` 的行里若出现 `rem==door`
+  （`7003`）⇒ 它正卡在向这扇门的发送上；若 `rn` 是别的口、`rem` 是别的名字 ⇒ 它在自己的接收里。
+- **S-B**：`m2=0` 且 `run>0` ⇒ 持有者在跑但没进 mach_msg2（不是被门卡住的；下一步转向用户态它在算什么）。
+- **S-C（控制）**：`bbsmhold`/`bbsmh` 与 boot 128 同形状（9103 的 sr/ms/own/hits 不变）；`holdth` 行数等于
+  `bbsmhold` 行数（每行一次采样），缺行即 tee 预算或锁失败。
+
+**r349 构建与闸门。** 144 枚补丁重放 → prelink `488a2967…` → amfi `50ee33ec…`（两刀 VA 不变）→ normalized
+`2c455f7a…`（973 戳）→ `round349-v0.7.66-payload.img` `e831a65d…`（58,720,256 B）。`payload.json`：kernel `2c455f7a…`、
+payload_kernel `fefb176e…`、adt `c284181f…`。仓库 EXIT=0；镜像 EXIT=0、51 组 OK / 0 FAIL（`r349-holdth`、`r349-holdt` present）。

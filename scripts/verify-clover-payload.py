@@ -1341,6 +1341,12 @@ def check_sb_sample(kernel: bytes) -> bool:
                             b"own=%u hits=%u probed=%u scanned=%u\n") in kernel,
              "r347-bbsmhold": (b"clover r347: bbsmhold t=%llu hop=%d i=%u j=%u pid=%u c=%s "
                                b"nm=%x ty=%s raw=%llx\n") in kernel,
+             # Round349 follows the named holder into its own task: holdth is the census of that task
+             # and holdt at most two trapped threads with their receive name and send destination.
+             "r349-holdth": (b"clover r349: holdth t=%llu hop=%d i=%u j=%u pid=%d door=%x th=%u "
+                             b"wait=%u run=%u m2=%u\n") in kernel,
+             "r349-holdt": (b"clover r349: holdt t=%llu hop=%d i=%u j=%u pid=%d tid=%llx st=%x "
+                            b"we=%llx cont=%llx pc=%llx rn=%x rem=%x\n") in kernel,
              "r331-scan-own-only": b"own_only" in kernel,
              "r331-scan-hash-only": b"hash_only" in kernel,
              "r331-scan-no-holder": b"no_holder" in kernel,

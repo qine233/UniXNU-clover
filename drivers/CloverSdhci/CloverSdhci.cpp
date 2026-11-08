@@ -1241,6 +1241,13 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r347: bbsmh", "r347-bbsmh", 64, 0, 0, 0 },
   { "clover r347: bbsmhold", "r347-bbsmhold", 64, 0, 0, 0 },
 
+  // Round349 follows each named holder into its own task in the same fire: `holdth` is the
+  // per-task summary (threads, waiters, runners, trapped) and `holdt` at most two trapped threads
+  // with their receive name, send destination and continuation. Six holders per fire at most, so
+  // 64 each is the arithmetic bound; they ride the r347 burst and are exempt for the same reason.
+  { "clover r349: holdth", "r349-holdth", 64, 0, 0, 0 },
+  { "clover r349: holdt", "r349-holdt", 64, 0, 0, 0 },
+
   // Round329 publishes the display client's state on the display's own 30 s beat; round344 (#695) makes that
   // row name the record it picked (`pick=`) and adds a per-record row, so the heads below are r344's for both
   // display families and r343's only for the swap row. Order matters and is the only defence: within a family
@@ -4927,6 +4934,9 @@ static void teeConsumeLine (uint32_t &pushed)
        // the two legs found and how many names in the waiter's own table point at the member, and the
        // holder rows are those names. Dropping one half on a full pass is r249's shape again.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r347") ||
+       // Round349's holder samples are the second half of the r347 statement: the name without what
+       // its owner is doing is exactly the "who, not why" shape this port keeps paying for.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r349") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is
