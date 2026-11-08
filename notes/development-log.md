@@ -29703,3 +29703,28 @@ STALE（boot 136 从没进过 sink），复位落 fastboot、misc 无 recovery �
 复位同型（`r283: last reset unnamed` 行在场，`r339: beatctl … ok=1` 正对照在场）。读回按用户指示改走
 「宿主写 BCB 回 TWRP」：重跑 `run-clover-unattended.sh --allow-misc-bcb`（不重刷 cache，只写 2048 字节
 misc），设备现停在 TWRP。对判读无损：三腿 holdrs 都诞生在 t=763 那一火，已在环里被节拍 flush 落盘。
+
+## Round357 —— 问 rem 口的 receive 属主是谁（holdrr + op= 列）
+
+**题面。** boot 136 判在 W-C：SpringBoard 的 `rem` 队列空、发送权活着，而那次全 141 空间的
+SEND_ONCE 普查在名表里找不到 `so=1` 的那枚回复权——XNU 的 send-once 由发送时写进
+`msgh_local_port` 的名字产生，住在收方的 kmsg 里，不进任何 ipc_entry。所以「谁欠 SpringBoard 回复」
+的下一层答案是：**rem 口的 receive 属主自己发出过一封信、以这枚口当回复口，而那封信未回**。
+本轮把两件事搬到同一腿上问：(a) `clover_bb_holder_send` 在 `ty==0` 腿下按 r220 owner 的锁纪律读
+`ip_get_receiver(port)` 与 `ip_receiver_name`，把 receiver space 落成任务（`is_task`），pid 用
+proc_find 全表指针比对照出（r331 的 house 路数），印 `clover r357: holdrr`；(b) 主行加 `op=%llx`——
+`struct mach_msg2_trap_args` 的第二槽（`options`，落在 x2），把「这封 trap 在发」与「纯收、rem 是
+陪跑名」切开。行全部重打 r357 标（同名行换了列就是第九层，旧读者不许碰新数）。
+
+**预登记：boot 137（r357 镜像）判读。** 先判闸门①（0 abt、每火 bbsend 行数=`cand=`、r350 holdrn
+仍点名 `sr=1 ms=1 so=1 once=1 och=1` 形状＋r352 onceh 点名 hpid=58；认形状不认名字）。再认
+SpringBoard 的 rem 腿（名字每建必变）：
+- **U-A**：`op` 无发送位（既无 legacy `MACH_SEND_MSG`=0x1，也无 `MACH64_SEND_MSG`=0x10000）
+  ⇒ 这次 trap 纯收，rem 只是信头里的陪跑名；「没发」坐实，环的下一问全在收腿（Y-A 已答），rem 腿结案。
+- **U-B**：`op` 有发送位且 `rpid==58` ⇒ rem 的收方就是 backboardd：它收了 SpringBoard 的信、
+  自己又发着一封以该口为回复口的信未回 ⇒ 环三边坐实；下一手＝追 backboardd 那封信坐在哪个队列。
+- **U-C**：`op` 有发送位且 `rpid` 是别的任务 ⇒ 环里出现新节点；下一手＝对它跑 r355 快照。
+- **U-D**：`rstate=2`（无 receiver space，死名）⇒ 信只能落 dead-name 通知；记下来，下一手看 ip_newsync。
+- 控制腿：`op` 词不像合法 option64（除 MACH64/MACH 位外全是高位噪声）⇒ x2 映射错，一切不判，
+  按 r264 的先例回宿主重解；`holdrr` 缺席而 `holdrs` 在场 ⇒ tee 预算/前缀顺序问题（holdrsh 必须
+  排在 holdrr 前、holdrr 排在 holdrs 前——first-match）；闸门①不过 ⇒ r354 栈判据，不判 U。
