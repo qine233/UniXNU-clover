@@ -65,7 +65,7 @@ result = "Device-verified constants and the two source trees they come from"
 [[area]]
 id = "cpu"
 status = "implemented"
-components = []
+components = ["ArmCpu", "ArmDTPlatform"]
 paths = ["drivers/ArmCpu/**", "scripts/make-clover-adt.py", "scripts/build-arm-driver.py"]
 inputs = ["Eight Kryo 260 cores: cpu0 to cpu3 at MPIDR 0x0..0x3 (A53), cpu4 to cpu7 at 0x100..0x103 (A73).", "GIC distributor and CPU interface on SDM660; timer INTID 19; PSCI method SMC."]
 configuration = ["The ADT enables all eight CPUs with cpu_regs = 0x0,0x1,0x2,0x3,0x100,0x101,0x102,0x103.", "kernel_args selects armcpu-timer-intid=19, and since round299 also armcpu-smp=1 plus armcpu-self-ipi=1. The secondary-core gate is spelled armcpu-smp because round299 renamed it out of the source board's name (it was sheng-smp, which is why eleven boots of this board's args never mentioned it and reg stayed 1). armcpu-self-ipi is passed as an enabler, not a hypothesis: osfmk/kern/machine.c clears SIGPdisabled only when a core takes its first IPI, so without it cpu_signal() keeps skipping a freshly started core -- r270's sent=0 recv=0 therefore only shows the scheduler never asked, and the two are told apart by the driver's own step counters versus r270's sgi= bits. armcpu-spi-ipi stays absent because its hardcoded SPI IPI numbers 1008..1015 are above this GIC's range (boot 74's panic screen read GICD_TYPER=0x7b04f3, ITLinesNumber=19, i.e. SPIs end at INTID 671); armcpu-smp-remote-gic is deliberately absent too, because this board's GICR base and stride are read from its own ADT and nothing in r299 needs a second redistributor mapping. The tick-count watchdog that ships with ArmCpu is disarmed unless clover-unattended= is passed."]
@@ -377,7 +377,7 @@ result = "Builds and runs drivers/CloverPower/tests/clover_power_host.cpp -- a p
 [[area]]
 id = "packaging"
 status = "implemented"
-components = []
+components = ["DarwinBoot", "XnuPrelink"]
 paths = ["board.toml", "scripts/build-clover-block.py", "scripts/patch-clover-amfi.py", "scripts/normalize-kernel-macho.py", "scripts/patch-xnu-entry-probe.py", "scripts/xnu-panic-screen.c", "scripts/verify-clover-payload.py", "patches/xnu-clover/**"]
 inputs = ["Prelinked kernel, generated ADT, three-module trust cache, mockfs root image, platform seed and uefi-clover firmware."]
 configuration = ["The payload volume is 56 MiB, FAT with 512-byte clusters; loader = firmware.", "patches/xnu-clover/*.patch are applied to the shared XNU tree before the kernel build; they are not applied by the payload step.", "panic_screen = true and entry_probe_reset_delay = 15 patch the payload copy of the kernel with the panic screen and the timed reset."]

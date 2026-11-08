@@ -29404,3 +29404,52 @@ r352 的探针逻辑未被证伪，也未被证实——它根本没跑到。下
 （`clover_port_once_holders`、`clover_bb_holder_door`、`clover_bb_holder_sample`、`clover_bb_hop_pset`）加
 `__attribute__((noinline))`，停止把它们的帧内联累加进 `clover_bb_sample`；重建后量 bb_sample 帧，若仍逼近上限
 再把 census 暂存数组移到单写者静态缓冲（beat 线程是唯一调用者，顺序执行）。修好后重刷重读，按 Y-A…Y-C 判。
+
+## Round354：修 beat 线程栈溢出——四枚 noinline ＋ 36 枚暂存数组搬 BSS
+
+**题面。** boot 133 的读数（上一节）把 r352 的 Y-A…Y-C 全部悬空：采样器第一火就在 printf 路径上压穿
+16 KB 内核栈。本轮只修栈，不动任何行、偏移、kind、clamp、环几何或节拍；修好后重读 r352 的问题。
+
+**两手，第二手是被测量逼出来的。**
+1. 给 `clover_port_once_holders`、`clover_bb_holder_door`、`clover_bb_holder_sample`、`clover_bb_hop_pset`
+   各加 `__attribute__((noinline))`，让每枚助手拥有自己的帧，不再内联累加进 `clover_bb_sample`。
+   第一枚 r354 内核编成后宿主量帧（lldb 序言）：bb_sample 只从 0x2aa0（10912 B）降到 **0x2700（9984 B）**——
+   助手帧虽然独立了（nm 见四枚独立 text 符号：hop_pset 0x440、holder_sample 0x250、holder_door 0x3f0、
+   once_holders 0xa0），采样器自己的局部仍近 10 KB；加上 holder 链与 ~5.9 KB printf 路径，最深链仍 ≈18.5 KB > 16 KB。
+   **noinline 单独不够，这是量出来的，不是猜的。**
+2. 执行预登记的后手：把 `clover_bb_sample` 里 **36 枚普查/用户帧暂存数组**改成 `static`（BSS）：
+   u* 14 枚（utid/ucont/upc/ux0…ux3/ufp/ulr/usp[6]、uframes[6][10]、ucallers[6][10]、ufn[6]、ust[6]）
+   ＋ c* 22 枚（ctid/cwe/ccont/cpc/cdl/cm2/crn/csn/crem/cloc/cto/cown/cctx 等 uint64[20]、cst/chint/cak/csp/cot
+   uint32[20]、csc int32[20]、csem uint8[20]、cwho[20][20]、cport ipc_port_t[20]），约 4.6 KB 移出帧。
+   安全性：唯一调用者是 beat 线程（task.c 的 clover_bb_beat），助手不收这些数组，所有消费者由 `i < cn` / `i < un`
+   门控——单写者顺序执行，静态化不引入竞态。标量 dl_ns/crx/ctm 留在帧上。
+
+**补丁形状。** r354 补丁＝4 枚 noinline 属性 ＋ 36 枚存储类翻转 ＋ 一段注释；删 40 行（4 行裸存储类＋36 行
+tab 前缀声明）、加 40 行，别无其他。基线用程序化回退（mkbase.py 逐名 regex、每处断言命中 1）退回真 r352 态，
+再 `git apply -R` 旧补丁、`diff -u` 重生；正向 apply＋cmp 逐字节相同、反向 `--check` 通过。三处同字节安装
+（`patches/xnu/`、`patches/xnu-clover/`、主仓 `UniXNU/patches/xnu/`），md5 `f865b85465ec2b0a45c0e480c5ecbbd7`；
+series 坐在 r352 之后（83 个 z）。
+
+**契约。** check-clover.py r354 块：三处字节一致、series 在场且后于 r352、四对 noinline 字面量、36 枚
+`+\tstatic <decl>` 逐枚在场、删除行集合恰为 4 裸存储类＋36 声明；verify 用 nm 断言四枚助手各有独立 text 符号。
+标题升 r354（两手都写进标题）。
+
+**最终帧预算（第二枚 r354 内核实测）。** bb_sample 序言 `stp …,[sp,#-0x60]!` ＋ `__chkstk_darwin(w9=0x1480)`
+⇒ 单帧 **0x14e0＝5344 B**；hop_pset 0x440（1088）、holder_sample 0x250（592）、holder_door 0x3f0（1008）、
+once_holders 0xa0（160）。最深链 bb_sample→holder_sample→holder_door→printf ≈ 5344+592+1008+5900 ≈ **12.8 KB**，
+距 16 KB 上限留 ~3.5 KB 余量。
+
+**构建与闸门。** prelink `bd355fee…`；AMFI 两处编码照旧（0x34000229→0x14000011、0x36000520→0xd503201f），
+amfi `5038eb47…`；normalized `b8cdab01…`；payload `7f00c648…`（58,720,256 B）。check-clover 与 verify 双绿
+（verify 报 r354-noinline-onceh/door/sample/pset 四符号 present）。归档
+`~/clover-out/sheng-port-format2/round354-{kernel-amfi,kernel-normalized}.macho`、`round354-payload.json`、
+`round354-v0.7.71-payload.img`。
+
+**预登记 boot 134。** 先判「burst 跑完」：bbnow/r346–r352 行恢复、无 abt；再按 r352 原三支判——
+Y-A：`903 … once>=1` 且 onceh 点名非 pid 27 的持有者；Y-B：once>=1 但 onceh 0 行；
+Y-C：once=0（与 boot 132 的 so=1 不符，需另查）。
+
+**负测（r352 同款 ad-hoc，9 例）。** 逐条破坏 r354 闸门规则：补丁缺席、主仓字节漂移、本地字节漂移、
+series 缺席、series 顺序倒置、once_holders 丢 noinline、ctid 不搬 static、删除集多一行、标题降级——
+每例 exit=1 且红在自己的原因上，随后字节级还原（三处补丁 md5 复核一致）。
+日志：`~/clover-out/round354-negatives.log`，末行 `all-negatives-pass`。

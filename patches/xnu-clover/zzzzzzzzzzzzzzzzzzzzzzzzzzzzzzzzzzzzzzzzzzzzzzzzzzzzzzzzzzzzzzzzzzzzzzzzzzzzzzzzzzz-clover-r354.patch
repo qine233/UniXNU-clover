@@ -1,0 +1,135 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12405,7 +12405,7 @@
+  * one-shot holder becomes a name instead of an inference. probed= and scanned= are separate from
+  * hits= so a cap cannot look like a no, the same honesty pair the hash leg prints.
+  */
+-static void
++static void __attribute__((noinline))
+ clover_port_once_holders(ipc_object_t obj, uint32_t *pidv, uint32_t *nmv, uint64_t *bitsv,
+     char *cnmv, uint32_t max, uint32_t *hits, uint32_t *probed, uint32_t *scanned)
+ {
+@@ -12761,7 +12761,7 @@
+  * rights, make-send count and holder names. A port set is counted (n members) but its members are not
+  * opened here, so one row stays bounded; the translate's kr is printed when it fails.
+  */
+-static void
++static void __attribute__((noinline))
+ clover_bb_holder_door(task_t task, int pid, int hop, int i, int j,
+     mach_port_name_t rn, uint64_t secs)
+ {
+@@ -12926,7 +12926,7 @@
+  * holder is blocked sending to a different name". The holder task is locked with try_lock and
+  * sampled only as a summary plus at most two trapped threads; nothing is retained.
+  */
+-static void
++static void __attribute__((noinline))
+ clover_bb_holder_sample(int pid, int hop, int i, int j, mach_port_name_t door,
+     uint64_t secs)
+ {
+@@ -13052,7 +13052,7 @@
+ 	uint32_t rns[CLOVER_BB_PSET_MAX];
+ 	uint32_t mss[CLOVER_BB_PSET_MAX];
+ };
+-static int
++static int __attribute__((noinline))
+ clover_bb_hop_pset(task_t task, int pid, int hop, mach_port_name_t name,
+     uint64_t secs, uint64_t we)
+ {
+@@ -14348,25 +14348,28 @@
+ 	uint64_t hwe[4];
+ 	uint64_t hcont[4];
+ 	uint64_t hpc[4];
+-	uint64_t utid[6];
+-	uint64_t ucont[6];
+-	uint64_t upc[6];
+-	uint64_t ux0[6];
+-	uint64_t ux1[6];
+-	uint64_t ux2[6];
+-	uint64_t ux3[6];
+-	uint64_t ufp[6];
+-	uint64_t ulr[6];
+-	uint64_t usp[6];
+-	uint64_t uframes[6][10];
++	/* Round354: static, not frame. Boot 133 overflowed the beat thread's 16 KB stack on the
++	 * first fire; these scratch arrays are written and read only by this one sequential caller,
++	 * and every consumer is gated by un/cn, so they live in BSS instead of the frame. */
++	static uint64_t utid[6];
++	static uint64_t ucont[6];
++	static uint64_t upc[6];
++	static uint64_t ux0[6];
++	static uint64_t ux1[6];
++	static uint64_t ux2[6];
++	static uint64_t ux3[6];
++	static uint64_t ufp[6];
++	static uint64_t ulr[6];
++	static uint64_t usp[6];
++	static uint64_t uframes[6][10];
+ 	/*
+ 	 * Round239. The frame that owns a return address is where that function
+ 	 * pushed its callee-saved registers, so the walker reports it next to the
+ 	 * address. A running block's pointer is only reachable from its own frame.
+ 	 */
+-	uint64_t ucallers[6][10];
+-	uint32_t ufn[6];
+-	uint32_t ust[6];
++	static uint64_t ucallers[6][10];
++	static uint32_t ufn[6];
++	static uint32_t ust[6];
+ 	uint32_t un = 0;
+ 	uint32_t uall = 0;
+ 	uint64_t run_tid = 0;
+@@ -14382,31 +14385,31 @@
+ 	int act;
+ 	int same;
+ 	int have_run = 0;
+-	uint64_t ctid[CLOVER_BB_CENSUS];
+-	uint64_t cwe[CLOVER_BB_CENSUS];
+-	uint64_t ccont[CLOVER_BB_CENSUS];
+-	uint64_t cpc[CLOVER_BB_CENSUS];
+-	uint64_t cdl[CLOVER_BB_CENSUS];
++	static uint64_t ctid[CLOVER_BB_CENSUS];
++	static uint64_t cwe[CLOVER_BB_CENSUS];
++	static uint64_t ccont[CLOVER_BB_CENSUS];
++	static uint64_t cpc[CLOVER_BB_CENSUS];
++	static uint64_t cdl[CLOVER_BB_CENSUS];
+ 	uint64_t dl_ns;
+-	uint64_t cm2[CLOVER_BB_CENSUS];
+-	uint64_t crn[CLOVER_BB_CENSUS];
+-	uint64_t csn[CLOVER_BB_CENSUS];
+-	uint64_t crem[CLOVER_BB_CENSUS];
+-	uint64_t cloc[CLOVER_BB_CENSUS];
+-	uint64_t cto[CLOVER_BB_CENSUS];
++	static uint64_t cm2[CLOVER_BB_CENSUS];
++	static uint64_t crn[CLOVER_BB_CENSUS];
++	static uint64_t csn[CLOVER_BB_CENSUS];
++	static uint64_t crem[CLOVER_BB_CENSUS];
++	static uint64_t cloc[CLOVER_BB_CENSUS];
++	static uint64_t cto[CLOVER_BB_CENSUS];
+ 	uint32_t crx = 0;
+ 	uint32_t ctm = 0;
+-	uint32_t cst[CLOVER_BB_CENSUS];
+-	uint32_t chint[CLOVER_BB_CENSUS];
+-	uint32_t cak[CLOVER_BB_CENSUS];
+-	uint64_t cown[CLOVER_BB_CENSUS];
+-	uint64_t cctx[CLOVER_BB_CENSUS];
+-	int32_t csc[CLOVER_BB_CENSUS];
+-	uint32_t csp[CLOVER_BB_CENSUS];
+-	uint32_t cot[CLOVER_BB_CENSUS];
+-	uint8_t csem[CLOVER_BB_CENSUS];
+-	char cwho[CLOVER_BB_CENSUS][CLOVER_BB_SEMA_NAME];
+-	ipc_port_t cport[CLOVER_BB_CENSUS];
++	static uint32_t cst[CLOVER_BB_CENSUS];
++	static uint32_t chint[CLOVER_BB_CENSUS];
++	static uint32_t cak[CLOVER_BB_CENSUS];
++	static uint64_t cown[CLOVER_BB_CENSUS];
++	static uint64_t cctx[CLOVER_BB_CENSUS];
++	static int32_t csc[CLOVER_BB_CENSUS];
++	static uint32_t csp[CLOVER_BB_CENSUS];
++	static uint32_t cot[CLOVER_BB_CENSUS];
++	static uint8_t csem[CLOVER_BB_CENSUS];
++	static char cwho[CLOVER_BB_CENSUS][CLOVER_BB_SEMA_NAME];
++	static ipc_port_t cport[CLOVER_BB_CENSUS];
+ 	int csrhost_done = 0;
+ 	uint32_t cn = 0;
+ 	uint32_t call = 0;

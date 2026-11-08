@@ -3905,6 +3905,82 @@ def check_board(errors: list) -> str:
             errors.append("the r352 rows are not exempt from the per-pass cap: a count without the "
                           "names it counted is the half-pair r249 refuses")
 
+        # Round354. Boot 133's sampler fired once (t=761) and died in oslog_stream's frame push:
+        # esr=96000047 is an EL1 write translation fault and sp/far sat below the beat thread's
+        # 16 KB kstack base. The r352 image's clover_bb_sample frame measured 0x2aa0 (10912 B)
+        # because the four heavy helpers had no independent symbols -- the compiler inlined them
+        # and accreted their frames into the sampler's. The fix is four noinline attributes and
+        # nothing else; the gate pins exactly that, so a future round cannot quietly re-inline.
+        r354_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r354.patch")),
+                         default=None)
+        if r354_patch is None or not r354_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r354.patch is missing: the beat thread would "
+                          "overflow its 16 KB stack on the first sampler fire again")
+        else:
+            r354_name = r354_patch.name
+            r354_text = r354_patch.read_text()
+            load_r354 = REPO.parent / "UniXNU" / "patches" / "xnu" / r354_name
+            local_r354 = REPO / "patches/xnu" / r354_name
+            if not load_r354.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r354_name} is missing: unixnu loads patches from "
+                              "there, and this repo's copy only ever names the round")
+            elif load_r354.read_bytes() != r354_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r354_name} is not the same bytes as this repo's "
+                              "copy: the shipped image would carry a different stack fix")
+            if not local_r354.is_file() or local_r354.read_bytes() != r354_patch.read_bytes():
+                errors.append(f"patches/xnu/{r354_name} is missing or differs: the series line loads "
+                              "that copy, so the gate must pin the bytes it actually applies")
+            series_text = (REPO / "patches/xnu/series").read_text()
+            series_line = f"arch:../../../patches/xnu/{r354_name}"
+            r352_prev = max((p.name for p in (REPO / "patches/xnu-clover").glob("*-clover-r352.patch")),
+                            default="")
+            if series_line not in series_text:
+                errors.append(f"patches/xnu/series does not apply {r354_name}: the noinline fix "
+                              "exists and the kernel would be built without it")
+            elif r352_prev == "" or series_text.find(r352_prev) < 0:
+                errors.append("patches/xnu/series no longer applies r352: r354 keeps the once-holder "
+                              "walk it added, so the series cannot be read as the ordered history")
+            elif series_text.find(series_line) < series_text.find(r352_prev):
+                errors.append("patches/xnu/series applies r354 before r352: the helpers r354 marks "
+                              "noinline do not all exist yet at that point")
+            for pair in (
+                '+static void __attribute__((noinline))\n clover_port_once_holders(',
+                '+static void __attribute__((noinline))\n clover_bb_holder_door(',
+                '+static void __attribute__((noinline))\n clover_bb_holder_sample(',
+                '+static int __attribute__((noinline))\n clover_bb_hop_pset('):
+                if pair not in r354_text:
+                    errors.append(f"the r354 kernel patch does not carry {pair.splitlines()[1][1:40]!r} "
+                                  "under its noinline attribute: that helper's frame would keep "
+                                  "accreting into the sampler's")
+            # The noinline cut alone left clover_bb_sample's frame at 0x2700 (9984 B, measured on
+            # the first r354 build): with the holder chain and the ~5.9 KB printf path that still
+            # overflows the 16 KB stack. The census and user-frame scratch arrays therefore move to
+            # BSS -- the beat thread is the only caller and every consumer is gated by cn/un -- so
+            # the patch must carry exactly those 36 storage-class flips and nothing else.
+            r354_moved = (
+                [f"uint64_t {n}[6];" for n in ("utid", "ucont", "upc", "ux0", "ux1", "ux2", "ux3",
+                                              "ufp", "ulr", "usp")]
+                + ["uint64_t uframes[6][10];", "uint64_t ucallers[6][10];",
+                   "uint32_t ufn[6];", "uint32_t ust[6];"]
+                + [f"uint64_t {n}[CLOVER_BB_CENSUS];" for n in ("ctid", "cwe", "ccont", "cpc", "cdl",
+                                                               "cm2", "crn", "csn", "crem", "cloc",
+                                                               "cto", "cown", "cctx")]
+                + [f"uint32_t {n}[CLOVER_BB_CENSUS];" for n in ("cst", "chint", "cak", "csp", "cot")]
+                + ["int32_t csc[CLOVER_BB_CENSUS];", "uint8_t csem[CLOVER_BB_CENSUS];",
+                   "char cwho[CLOVER_BB_CENSUS][CLOVER_BB_SEMA_NAME];",
+                   "ipc_port_t cport[CLOVER_BB_CENSUS];"])
+            for decl in r354_moved:
+                if f"+\tstatic {decl}" not in r354_text:
+                    errors.append(f"the r354 kernel patch does not move {decl!r} to static: the "
+                                  "sampler frame stays near the 16 KB stack limit")
+            r354_removed = [line[1:] for line in r354_text.splitlines()
+                            if line.startswith("-") and not line.startswith("---")]
+            if sorted(r354_removed) != sorted(["static void"] * 3 + ["static int"]
+                                              + ["\t" + d for d in r354_moved]):
+                errors.append("the r354 patch removes something other than the four bare storage-class "
+                              "lines and the 36 scratch-array declarations: this round is four "
+                              "attributes, 36 static flips and nothing else")
+
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
         # its own ending, so a silent boot leaves the boot before it on the card and the reader called
@@ -7630,8 +7706,8 @@ def check_board(errors: list) -> str:
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
     # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
     # the menu names round347.
-    if not board["payload"]["title"].startswith("clover r352:"):
-        errors.append('[payload] title is not "clover r352: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r354:"):
+        errors.append('[payload] title is not "clover r354: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -9785,8 +9861,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r352:"):
-        errors.append('[payload] title is not "clover r352: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r354:"):
+        errors.append('[payload] title is not "clover r354: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

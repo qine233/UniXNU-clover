@@ -996,6 +996,18 @@ def check_sb_sample(kernel: bytes) -> bool:
     on the dying task's lock and then reading a state that had already been released, so the next
     frame is decided by lines printed before the kill."""
     label = "kernel.macho: r217 sb sample linked"
+    # Round354's fix is a link fact, not a string: boot 133 died on the beat thread's 16 KB stack
+    # because the four heavy helpers were inlined into clover_bb_sample's 10912-byte frame. Each
+    # helper has to own an independent text symbol in the linked kernel, or the frames accrete
+    # again the first time the sampler fires.
+    r354_syms = set()
+    if LOCAL_KERNEL.exists():
+        nm = subprocess.run(["nm", str(LOCAL_KERNEL)], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True)
+        for line in nm.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[1] in "tTsS":
+                r354_syms.add(parts[2])
     found = {"sbs": (b"clover r217: sbs t=%llu pid=%d n=%u c=%u%s%s\n") in kernel,
              "busy": (b"clover r217: sbthr busy=1 pid=%d budget=%u\n") in kernel,
              "killsrc": (b"clover r218: killsrc upc=%016llx ulr=%016llx code=") in kernel,
@@ -1363,6 +1375,14 @@ def check_sb_sample(kernel: bytes) -> bool:
              # Round352 names the SEND_ONCE holders the two send-right legs cannot index.
              "r352-onceh": (b"clover r352: onceh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s "
                             b"raw=%llx\n") in kernel,
+             # Round354 keeps the four heavy helpers out of clover_bb_sample's frame. noinline is a
+             # source attribute, but what boot 133 died on was the link: the helpers' frames accreted
+             # into one 10912-byte frame and the beat thread's 16 KB stack overflowed. Each helper
+             # owning an independent text symbol is the linked proof the accretion stopped.
+             "r354-noinline-onceh": "_clover_port_once_holders" in r354_syms,
+             "r354-noinline-door": "_clover_bb_holder_door" in r354_syms,
+             "r354-noinline-sample": "_clover_bb_holder_sample" in r354_syms,
+             "r354-noinline-pset": "_clover_bb_hop_pset" in r354_syms,
              "r331-scan-own-only": b"own_only" in kernel,
              "r331-scan-hash-only": b"hash_only" in kernel,
              "r331-scan-no-holder": b"no_holder" in kernel,
