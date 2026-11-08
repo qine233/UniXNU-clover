@@ -28748,3 +28748,26 @@ payload 里新增的四枚 CString（`dispstate`／`dispstatecut`／`dispclient`
 **⑥ M-A 仍空判。** 本靴落 TWRP、deadline 记录缺席、panic marker 未判（不在本次范围）⇒ 落回模式由谁决定依旧未定；**不许因为 R-A…R-D 成立就把它记成通过**。
 
 **⑦ 下一手。** sheng 薄迁移（分支 `sheng-port`）：`~/UniXNU-sdm660-common` 骨架已建；board DTS 只需 memory／cpus／psci／一枚 `unixnu,adt-name="intc"`，`arm-io` 的 `ranges` 由 `arm_io_window()` 算（取整规则待钉），`defaults/options/product/buttons` 走 `[adt]` 表。
+
+## sheng-port ①（format 2 薄迁移：board.toml／feeds／dts／series）
+
+**做了什么。** 从 `74e6629` 开 `sheng-port`。四件：`board.toml` 加 `schema_version = 2`／`[board].soc_source = "sdm660"`／
+`[kernel].config_fragments`（arch+soc+os）与 `patch_series`（arch+os+device）／`[device_tree]`／`[adt]` 的
+product·defaults·buttons 三张表（值逐条抄自 `make-clover-adt.py:284-320`，含 `button-names` 的 strings 型）；
+`feeds.toml` 加 `[[source]] kind="soc" name="sdm660" local=~/UniXNU-sdm660-common`；`patches/xnu/series` 79 行、
+按文件名顺序（`zzy(NN)` 前缀编码的就是这个序）；`dts/clover.dts` 只写 model／compatible／内存之外什么都不描述，
+硬件节点只有一枚 `&intc { unixnu,adt-name = "intc"; }`。
+**为什么这么小**：现有 ADT 只有 12 个节点名，且驱动用 `*_Regs.h` 的固定地址、不按 DT 匹配——外设不需要进 DTS。
+
+**两处踩到的契约。** ① `[components]` **不能**在 board 里写空的 `include = []`：数组是替换而非合并，空列表会把
+profile 的组件集抹掉，随后 `component:XnuPrelink/...` 解析失败（删掉这一段即恢复）。② dtc 不走 C 预处理器，
+include 必须写 `/include/ "sdm660.dtsi"`，`#include` 直接语法错。
+**另一条从源码读出的硬约束**：`arm-io` 的窗口由 `arm_io_window(hardware)` 按导出节点的 reg 取整算（GIC 在
+0x17A00000/GICR 0x17B00000+0x100000 ⇒ base 0x17000000、size 0xC00000），而 r343 的旧 ADT 是 0x17000000+0x1000000；
+这 4 MiB 差是**预期差异**，要等第一次 format 2 的靴子读回才判它有没有影响。
+
+**已验证到哪。** `./unixnu status --json` 通过，补丁计划里 79 枚设备补丁全部解析到（`dev` 系列）；`payload --dry-run`
+端到端通过：`clover.dts` + `sdm660.dtsi` 经 dtc 编译成 `hardware.dtb`，`generate()` 生成 ADT，产出 56 MiB payload。
+**未做**：内核还没在 format 2 下重建（本轮 payload 用的是 format 1 那枚 normalized kernel，正好把「ADT 换法」与
+「内核构建换法」分开）；ADT 逐字节对比未完成（旧 ADT 14384 B 的 `dtc -I dtb` 报 `incorrect magic`，说明它不是裸 FDT，
+需要按 UniXNU 的 ADT 包装层来解）；未刷写。分支已提交 `48bce5b`。
