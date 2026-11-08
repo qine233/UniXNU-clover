@@ -3779,13 +3779,72 @@ def check_board(errors: list) -> str:
                 if not any(now in line for line in r350_added):
                     errors.append(f"the r350 kernel patch does not add {now[:56]!r}: without it the "
                                   "holder's receive port stays a number with no sender behind it")
-        for entry in ('{ "clover r350: holdrn", "r350-holdrn", 64, 0, 0, 0 },',
-                      '{ "clover r350: holdrnh", "r350-holdrnh", 64, 0, 0, 0 },'):
+        for entry in ('{ "clover r350: holdrn", "r350-holdrn", 128, 0, 0, 0 },',
+                      '{ "clover r350: holdrnh", "r350-holdrnh", 128, 0, 0, 0 },'):
             if entry not in sdhci_source:
                 errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: the port reading rides "
                               "the r349 burst and needs its own budget")
         if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r350")' not in sdhci_source:
             errors.append("the r350 rows are not exempt from the per-pass cap: half a port reading is "
+                          "the half-pair r249 refuses")
+
+        # Round351. Boot 130's two holdrn rows read own=1 hits=0 with sr=1 and sr=0, and the reverse
+        # hash indexes pure-send entries only: a SEND|RECEIVE entry in the waiter's own table is
+        # invisible to both r331 legs. This round prints the bits of every name the waiter's own
+        # table points at the object (bbsmown in the set walk, holdrnow from the holder sample),
+        # opens every trapped thread's receive name instead of only the first, and names four send
+        # holders instead of two.
+        r351_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r351.patch")),
+                         default=None)
+        if r351_patch is None or not r351_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r351.patch is missing: without it own=1 hits=0 "
+                          "sr=1 stays indistinguishable from a holder the hash cannot see")
+        else:
+            r351_name = r351_patch.name
+            r351_lines = r351_patch.read_text().splitlines()
+            load_r351 = REPO.parent / "UniXNU" / "patches" / "xnu" / r351_name
+            if not load_r351.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r351_name} is missing: unixnu loads patches from "
+                              "there, and this repo's copy only ever names the round")
+            elif load_r351.read_bytes() != r351_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r351_name} is not the same bytes as this repo's "
+                              "copy: the shipped image would carry different port bits")
+            series_text = (REPO / "patches/xnu/series").read_text()
+            series_line = f"arch:../../../patches/xnu/{r351_name}"
+            r350_prev = max((p.name for p in (REPO / "patches/xnu-clover").glob("*-clover-r350.patch")),
+                            default="")
+            if series_line not in series_text:
+                errors.append(f"patches/xnu/series does not apply {r351_name}: the bits reading exists "
+                              "and the kernel would be built without it")
+            elif r350_prev == "" or series_text.find(r350_prev) < 0:
+                errors.append("patches/xnu/series no longer applies r350: r351 extends the holder "
+                              "sample r350 added, so the series cannot be read as the ordered history")
+            elif series_text.find(series_line) < series_text.find(r350_prev):
+                errors.append("patches/xnu/series applies r351 before r350: there is no opened port "
+                              "to print the owner bits of yet")
+            r351_added = [line[1:] for line in r351_lines if line.startswith("+")]
+            r351_removed = [line[1:] for line in r351_lines if line.startswith("-") and not line.startswith("---")]
+            for now in (
+                'so = port->ip_sorights;',
+                '" q=%u sr=%u ms=%u so=%u own=%u hits=%u probed=%u scanned=%u n=%u\\n"',
+                'clover_space_obj_names(space, obj, on, ob, 4, &matches, &entries);',
+                '"clover r351: holdrnow t=%llu pid=%d j=%u i=%u nm=%x ty=%s raw=%llx ur=%u\\n"',
+                '"clover r351: bbsmown t=%llu hop=%d i=%u j=%u nm=%x ty=%s"',
+                '(uint32_t)IE_BITS_UREFS((ipc_entry_bits_t)ob[j]));',
+                'for (k = 0; k < rows; k++) {'):
+                if not any(now in line for line in r351_added):
+                    errors.append(f"the r351 kernel patch does not add {now[:56]!r}: the own-entry "
+                                  "bits are the only leg that can see a SEND|RECEIVE name")
+            if not any('(mach_port_name_t)r_rn[0], secs);' in line for line in r351_removed):
+                errors.append("the r351 patch does not remove the first-trapped-thread-only call: a "
+                              "door matching the second trapped name would read as never waited on")
+        for entry in ('{ "clover r351: bbsmown", "r351-bbsmown", 64, 0, 0, 0 },',
+                      '{ "clover r351: holdrnow", "r351-holdrnow", 64, 0, 0, 0 },'):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: the bits rows ride "
+                              "the r347/r350 burst and need their own budget")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r351")' not in sdhci_source:
+            errors.append("the r351 rows are not exempt from the per-pass cap: half a bits reading is "
                           "the half-pair r249 refuses")
 
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
@@ -7513,8 +7572,8 @@ def check_board(errors: list) -> str:
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
     # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
     # the menu names round347.
-    if not board["payload"]["title"].startswith("clover r350:"):
-        errors.append('[payload] title is not "clover r350: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r351:"):
+        errors.append('[payload] title is not "clover r351: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -9668,8 +9727,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r350:"):
-        errors.append('[payload] title is not "clover r350: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r351:"):
+        errors.append('[payload] title is not "clover r351: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

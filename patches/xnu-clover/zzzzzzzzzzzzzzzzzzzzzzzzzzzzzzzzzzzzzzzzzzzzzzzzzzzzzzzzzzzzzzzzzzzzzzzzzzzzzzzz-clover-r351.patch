@@ -1,0 +1,166 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12688,6 +12688,7 @@
+ 	uint32_t q = 0;
+ 	uint32_t sr = 0;
+ 	uint32_t ms = 0;
++	uint32_t so = 0;
+ 	uint32_t own = 0;
+ 	uint32_t hits = 0;
+ 	uint32_t probed = 0;
+@@ -12696,12 +12697,12 @@
+ 	uint32_t matches = 0;
+ 	uint32_t entries = 0;
+ 	__block uint32_t members = 0;
+-	uint32_t hp[2];
+-	uint32_t hn[2];
+-	uint64_t ht[2];
+-	char hc[32];
+-	uint32_t on[1];
+-	uint64_t ob[1];
++	uint32_t hp[4];
++	uint32_t hn[4];
++	uint64_t ht[4];
++	char hc[64];
++	uint32_t on[4];
++	uint64_t ob[4];
+ 	uint32_t k;
+ 	int ty = -1;
+ 	char row[256];
+@@ -12735,9 +12736,10 @@
+ 		q = port->ip_messages.imq_msgcount;
+ 		sr = port->ip_srights;
+ 		ms = port->ip_mscount;
+-		clover_port_hash_holders(port, task, hp, hn, ht, hc, 2, &hits, &probed,
++		so = port->ip_sorights;
++		clover_port_hash_holders(port, task, hp, hn, ht, hc, 4, &hits, &probed,
+ 		    &scanned, &selfhit);
+-		clover_space_obj_names(space, obj, on, ob, 1, &matches, &entries);
++		clover_space_obj_names(space, obj, on, ob, 4, &matches, &entries);
+ 		own = matches;
+ 		io_unlock(obj);
+ 	} else if (io_otype(obj) == IOT_PORT_SET) {
+@@ -12755,17 +12757,37 @@
+ 	}
+ 	len = snprintf(row, sizeof(row),
+ 	    "clover r350: holdrn t=%llu hop=%d i=%u j=%u pid=%d rn=%x ty=%d o=%llx"
+-	    " q=%u sr=%u ms=%u own=%u hits=%u probed=%u scanned=%u n=%u\n",
++	    " q=%u sr=%u ms=%u so=%u own=%u hits=%u probed=%u scanned=%u n=%u\n",
+ 	    (unsigned long long)secs, hop, i, j, pid, rn, ty,
+-	    (unsigned long long)(uintptr_t)obj, q, sr, ms, own, hits, probed, scanned,
++	    (unsigned long long)(uintptr_t)obj, q, sr, ms, so, own, hits, probed, scanned,
+ 	    members);
+ 	if (len > 0) {
+ 		row[sizeof(row) - 1] = '\0';
+ 		clover_emmc_probe_say(row, (unsigned int)strlen(row));
+ 		printf("%s", row);
+ 	}
+-	for (k = 0; ty == 0 && k < hits && k < 2; k++) {
++	/*
++	 * Round351. The reverse hash indexes pure-send entries only, so "own=1 hits=0 sr=1" is not
++	 * "nobody holds the right": a SEND|RECEIVE entry in the waiter's own table looks exactly like
++	 * that from the two r331 legs. The bits of every name this space points at the object with are
++	 * the missing reading, and they say whether the one send right is the waiter's own combined
++	 * entry or a receive-only entry whose sender is somewhere the hash cannot see.
++	 */
++	for (k = 0; ty == 0 && k < matches && k < 4; k++) {
+ 		len = snprintf(row, sizeof(row),
++		    "clover r351: holdrnow t=%llu pid=%d j=%u i=%u nm=%x ty=%s raw=%llx ur=%u\n",
++		    (unsigned long long)secs, pid, j, k, on[k],
++		    clover_right_type_word((ipc_entry_bits_t)ob[k]),
++		    (unsigned long long)ob[k],
++		    (uint32_t)IE_BITS_UREFS((ipc_entry_bits_t)ob[k]));
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
++	}
++	for (k = 0; ty == 0 && k < hits && k < 4; k++) {
++		len = snprintf(row, sizeof(row),
+ 		    "clover r350: holdrnh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s\n",
+ 		    (unsigned long long)secs, pid, j, hp[k], hc + k * 16, hn[k],
+ 		    clover_right_type_word((ipc_entry_bits_t)ht[k]));
+@@ -12891,12 +12913,15 @@
+ 		}
+ 	}
+ 	/*
+-	 * Round350 opens the port the first trapped holder is receiving on, so the reader can name who
+-	 * holds a send right to that port and whether the right was ever made.
++	 * Round351 opens every captured trapped thread's receive name, not only the first. Boot 130's
++	 * two-trap holder had a second thread on a different name, and "the first trapped thread" was
++	 * an arbitrary pick: a door that matches the second name would have read as never waited on.
+ 	 */
+-	if (rows > 0 && r_rn[0] != 0) {
+-		clover_bb_holder_door(task, pid, hop, i, j,
+-		    (mach_port_name_t)r_rn[0], secs);
++	for (k = 0; k < rows; k++) {
++		if (r_rn[k] != 0) {
++			clover_bb_holder_door(task, pid, hop, i, j,
++			    (mach_port_name_t)r_rn[k], secs);
++		}
+ 	}
+ 	task_deallocate(task);
+ }
+@@ -12997,12 +13022,12 @@
+ 	 * drained reads ms>0 with q=0. Members are held on the references taken under the set lock.
+ 	 */
+ 	for (i = 0; i < stored; i++) {
+-		uint32_t hp[2];
+-		uint32_t hn[2];
+-		uint64_t ht[2];
+-		char hc[32];
+-		uint32_t on[1];
+-		uint64_t ob[1];
++		uint32_t hp[4];
++		uint32_t hn[4];
++		uint64_t ht[4];
++		char hc[64];
++		uint32_t on[4];
++		uint64_t ob[4];
+ 		uint32_t hits = 0;
+ 		uint32_t probed = 0;
+ 		uint32_t scanned = 0;
+@@ -13014,11 +13039,11 @@
+ 		if (snap.srs[i] == 0) {
+ 			continue;
+ 		}
+-		clover_port_hash_holders(snap.ports[i], task, hp, hn, ht, hc, 2, &hits,
++		clover_port_hash_holders(snap.ports[i], task, hp, hn, ht, hc, 4, &hits,
+ 		    &probed, &scanned, &selfhit);
+ 		if (space != IPC_SPACE_NULL) {
+ 			clover_space_obj_names(space, (ipc_object_t)snap.ports[i], on, ob,
+-			    1, &matches, &entries);
++			    4, &matches, &entries);
+ 		}
+ 		len = snprintf(row, sizeof(row),
+ 		    "clover r347: bbsmh t=%llu hop=%d i=%u rn=%x o=%llx ms=%u sr=%u"
+@@ -13031,8 +13056,27 @@
+ 			clover_emmc_probe_say(row, (unsigned int)strlen(row));
+ 			printf("%s", row);
+ 		}
+-		for (j = 0; j < hits && j < 2; j++) {
++		/*
++		 * Round351: the same bits reading as holdrnow, on the set member. `own` here is the
++		 * receiving task's own table, so a SEND|RECEIVE entry means backboardd's ip_srights
++		 * includes its own combined name and `hits=0` is not a missing holder.
++		 */
++		for (j = 0; j < matches && j < 4; j++) {
+ 			len = snprintf(row, sizeof(row),
++			    "clover r351: bbsmown t=%llu hop=%d i=%u j=%u nm=%x ty=%s"
++			    " raw=%llx ur=%u\n",
++			    (unsigned long long)secs, hop, i, j, on[j],
++			    clover_right_type_word((ipc_entry_bits_t)ob[j]),
++			    (unsigned long long)ob[j],
++			    (uint32_t)IE_BITS_UREFS((ipc_entry_bits_t)ob[j]));
++			if (len > 0) {
++				row[sizeof(row) - 1] = '\0';
++				clover_emmc_probe_say(row, (unsigned int)strlen(row));
++				printf("%s", row);
++			}
++		}
++		for (j = 0; j < hits && j < 4; j++) {
++			len = snprintf(row, sizeof(row),
+ 			    "clover r347: bbsmhold t=%llu hop=%d i=%u j=%u pid=%u c=%s"
+ 			    " nm=%x ty=%s raw=%llx\n",
+ 			    (unsigned long long)secs, hop, i, j, hp[j],

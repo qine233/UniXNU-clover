@@ -1241,6 +1241,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r347: bbsmh", "r347-bbsmh", 64, 0, 0, 0 },
   { "clover r347: bbsmhold", "r347-bbsmhold", 64, 0, 0, 0 },
 
+  // Round351 prints the bits of every name the waiter's own table points at the port with. The
+  // reverse hash does not index a SEND|RECEIVE entry, so own=1/hits=0/sr=1 without these rows is
+  // indistinguishable from a right held where the hash cannot see it. One row per own name.
+  { "clover r351: bbsmown", "r351-bbsmown", 64, 0, 0, 0 },
+  { "clover r351: holdrnow", "r351-holdrnow", 64, 0, 0, 0 },
+
   // Round349 follows each named holder into its own task in the same fire: `holdth` is the
   // per-task summary (threads, waiters, runners, trapped) and `holdt` at most two trapped threads
   // with their receive name, send destination and continuation. Six holders per fire at most, so
@@ -1250,9 +1256,10 @@ static TeeProbeClass kTeeProbeClasses[] = {
 
   // Round350 opens the port the first trapped holder is receiving on: `holdrn` is that port's queue,
   // send rights, make-send count, own names and two reverse-hash counts; `holdrnh` the holder names.
-  // They ride the same burst, one pair per holder sample at most.
-  { "clover r350: holdrn", "r350-holdrn", 64, 0, 0, 0 },
-  { "clover r350: holdrnh", "r350-holdrnh", 64, 0, 0, 0 },
+  // Round351 opens every trapped thread's name and prints the own-entry bits (`holdrnow`), so the
+  // sample can run to four doors per holder and four names per door; 128 keeps two boot fires whole.
+  { "clover r350: holdrn", "r350-holdrn", 128, 0, 0, 0 },
+  { "clover r350: holdrnh", "r350-holdrnh", 128, 0, 0, 0 },
 
   // Round329 publishes the display client's state on the display's own 30 s beat; round344 (#695) makes that
   // row name the record it picked (`pick=`) and adds a per-record row, so the heads below are r344's for both
@@ -4946,6 +4953,10 @@ static void teeConsumeLine (uint32_t &pushed)
        // Round350's pair names who could wake the holder; both halves print together or the name has
        // no counterpart, which is the half-pair r249 refuses.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r350") ||
+       // Round351's bits rows are the key to the r347/r350 pair: the header legs cannot see a
+       // SEND|RECEIVE entry, so the bits row turns "own=1 hits=0 sr=1" into a self-send or an
+       // invisible holder. Exempt for the same reason as the pair they explain.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r351") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is

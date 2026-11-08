@@ -29209,3 +29209,67 @@ libpthread 把自己的入口改名、链接 `_pthread_start` undefined。**最�
 重编并写回 `startup.o.json`（工具链的既有机制），再正常构建 → prelink `9ab28b77…` → amfi `194588bf…`（两刀 VA 不变）→
 normalized `cb323aa8…`（973 戳）→ `round350-v0.7.67-payload.img`（见上）。仓库 EXIT=0；镜像 EXIT=0、51 组 OK/0 FAIL
 （`r350-holdrn`、`r350-holdrnh` present）。
+
+## Round350 读数（boot 130）：两枚收口都是 port，但「own=1 hits=0」还没有解释
+
+**帧。** 卡上窗口 `boot 130`，`tee lines: 512 stamped=507 glued=5`；`bbsend` 与 128/129 同比：
+`hop0 nm=4603 e=17 scan=pset debt=1 unread=2 / hop1 nm=6e03 e=17 scan=pset / hop2 nm=380b e=0 sr=0 q=0 scan=no_srights ownnames=1`。
+`bbset2` 仍是 `4603 n=3 all=3`、`6e03 n=7 all=7`，十个成员 `q=0`。
+
+**W-A（成立）。** `holdrn` 共 6 行 = 3 次 fire × 2 枚，只涉及两个不同对象：
+| pid | rn | ty | o | q | sr | ms | own | hits | 判读 |
+|---|---|---|---|---|---|---|---|---|---|
+| 27 SpringBoard | `903` | 0 port | `fffffff4c6e282a0` | 0 | 1 | 1 | 1 | 0 | 有 1 枚 send right，但反查哈希在 127 个 task 里一个名字都没找到 |
+| 186 datamigrator | `7d53` | 0 port | `fffffff4c6ef3e80` | 0 | 0 | 0 | 1 | 0 | `ms=0`：这个收口**从未 make-send 过**，不可能有发送者 |
+
+**W-B 未出现**（两次都是 port，不是 set）；**W-C 成立**：`holdrn` 的 2 个对象正好对应有 trap 线程的两行 `holdth`
+（launchd `th=7 wait=7 m2=0` 无 trap ⇒ 没有 `holdrn`），没有 `e=` 行；`bbsend` 的 `debt/unread` 分离保持了 126 的读数。
+`holdrnh` **一行也没有**，因为 `hits=0`。
+
+**为什么 `own=1 hits=0 sr=1` 不是结论。** 反查哈希只索引纯 send 条目：`ipc_hash_insert()` 只在
+（a）receive 权被移走、条目变 `EX_RECEIVE`（`ipc_right.c:1392/1844/2297`），或（b）新建纯 send 条目（`ipc_right.c:2998`）时被调用；
+同一空间里 `SEND|RECEIVE` 的合并条目**不进** `is_hashtable`，所以 `ipc_hash_lookup()`（`ipc_hash.c:102`）看不见它。
+`clover_space_obj_names()` 的整表扫描确实找到 1 个名字（`own=1`），但 r350 只印了计数、没印那条目的 `ie_bits`。
+因此 SpringBoard 的 `sr=1` 仍有两种可能：**自己那条 SEND|RECEIVE**（自己是唯一发送者），或 **receive-only 条目 + 别处的
+send 权落在哈希看不见的地方**。datamigrator 的 `sr=0 ms=0` 则已闭合：没有发送权，也没有发送权存在过。
+
+**#666 的题面收窄。** 「谁该叫醒 SpringBoard 的 1e03」在 boot 130 的形态下先是：那个口是否只有一个自持的发送权。
+若是，它是一条只可能被自己写入的收口，不是桌面缺席的那把锁。
+
+## Round351：印出属主条目的真实 bits，并打开每个 trap 线程
+
+**为什么。** r350 之后，`own=1 hits=0 sr=1` 是这轮唯一的空白；而 `holdt` 只保留 2 个 trap 线程、`holdrn` 只开第一枚
+（boot 130 的 datamigrator 第二枚 `rn=2903` 从未被打开）。两处截断都可能把「等在 door 上」误读成「等在无关口上」。
+
+**改动（`patches/xnu/…-clover-r351.patch`，接在 r350 之后）。**
+- `clover_bb_holder_door()`：port 分支加 `so = port->ip_sorights`；own 名字上限 1→4；新增
+  `clover r351: holdrnow t= pid= j= i= nm= ty= raw= ur=`（每条目一行，`IE_BITS_UREFS` 是 urefs）；
+  `holdrnh` 上限 2→4；`holdrn` 行加 `so=`。
+- `clover_bb_holder_sample()`：对**每个** trap 线程的 `rn` 调 `holder_door`（不再只 `r_rn[0]`）。
+- `clover_bb_hop_pset()`：两条腿的数组 2/1→4；新增 `clover r351: bbsmown t= hop= i= j= nm= ty= raw= ur=`；
+  `bbsmhold` 上限 2→4。
+- driver：tee 类 `r351-bbsmown` / `r351-holdrnow`（各 64）；`r350-holdrn`/`r350-holdrnh` 预算 64→128；token `r351` 进豁免链。
+- 宿主闸门：补丁双仓同一字节、series 顺序（r350 后）、必需增行（`ip_sorights`、两种 bits 行、max=4、
+  “every trapped thread” 循环）、必需删行（`(mach_port_name_t)r_rn[0], secs);` 的旧调用）、tee 类、豁免、标题 r351。
+
+**预登记：boot 131（r351 镜像）的三支判读。**
+- **X-A**：SpringBoard `903` 的 `holdrnow` 给出 `ty=send|receive raw=0x30000`（SEND|RECEIVE，`ur>=2`）⇒ 那 1 枚 send right
+  是它自己的合并条目，`hits=0` 不是丢名字；该收口**没有外部发送者**，「叫醒 1e03」在端口层无解，下一步转回 #666 的渲染/呈现线。
+- **X-B**：SpringBoard `903` 的 `holdrnow` 是纯 `receive`（`raw=0x20000`）且 `hits=0` ⇒ 发送权确实落在反查表之外
+  （在途消息/内核持有），下一轮按端口描述符的持有者去查，而不是再扫 task 空间。
+- **X-C**：`bbsmown` 在 hop0 的 `4703/4e03/4503`（`sr=1 hits=0 own=1`）上重复 X-A 的读法；若三条都是 SEND|RECEIVE，
+  则 backboardd 的三个 set 成员全是自持，`debt=1` 是「没有别人要发」，而不是「发送者藏起来了」。
+- 控制：`holdrn` 行数 == 有 trap 线程的 `holdth` 行数 × trap 线程数（r350 是 2 个对象；r351 应覆盖 datamigrator 的
+  第二枚 `rn`）；`e=` 只在翻译失败时出现；`bbsend/bbset2/bbsm` 形状与 130 同比。
+
+**r351 构建与闸门。** 145 枚补丁重放（tree 后 `task.c` 两处 `clover r351` 在场）→ prelink `93ae25fb69e1…`（52,480,000 B）→
+`patch-clover-amfi.py`（两刀仍在 VA `0xfffffff004ab40e4`/`0xfffffff004ab416c`，文件偏移 `0x1af20e4`/`0x1af216c`；
+`7b9ca59236ca…`）→ `normalize-kernel-macho.py`（973 枚戳，`d82fad1a9db8…`）→ payload（`--kernel` normalized、
+`--data-ramdisk build/clover-root/launchd.macho`、`--trust-cache build/clover-trust/trustcache.bundle`、
+`--unique-chip-id 81ffcaaa`、`--uefi ~/mu-clover`；tree 重装配会丢掉 tree 内的 root/trust，改用设备仓 `build/` 下的同哈希产物，
+root `614b8356…`、trust `7c369ce0…` 与 r350 逐字节同）→ `round351-v0.7.68-payload.img` `97623deea6be…`（58,720,256 B）。
+`payload.json`：kernel `d82fad1a…`、payload_kernel `dd342657…`、adt `531cb986…`（标题变了，ADT 随之变，符合前几轮）。
+仓库闸门 **EXIT=0**；镜像闸门 **EXIT=0，51 OK / 0 FAIL**（`r351-bbsmown`、`r351-holdrnow` present）。
+补丁两仓同字节 `9a61671f52f1…`。10 条负测全绿并逐字节还原（`~/clover-out/round351-negatives.log`）：
+patch-missing / base-bytes / series-missing / series-order / row-missing / urefs-missing / removed-keep /
+tee-entry / tee-exempt / title。
