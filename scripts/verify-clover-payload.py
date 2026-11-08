@@ -1332,7 +1332,15 @@ def check_sb_sample(kernel: bytes) -> bool:
                            in kernel,
              "r346-bbset2": (b"clover r346: bbset2 t=%llu pid=%d hop=%d nm=%x o=%llx n=%u all=%u "
                              b"we=%llx wq=%llx match=%u\n") in kernel,
-             "r346-bbsm": (b"clover r346: bbsm t=%llu hop=%d i=%u rn=%x o=%llx q=%u sr=%u\n") in kernel,
+             "r346-bbsm": (b"clover r346: bbsm t=%llu hop=%d i=%u rn=%x o=%llx q=%u sr=%u ms=%u\n")
+                          in kernel,
+             # Round347 asks the members with send rights who holds them. bbsmh is the two legs' counts
+             # (own= names in the waiter's own table, hits= reverse-hash names) and bbsmhold the names
+             # themselves; ip_mscount rides beside sr so "a right nobody ever sent through" is readable.
+             "r347-bbsmh": (b"clover r347: bbsmh t=%llu hop=%d i=%u rn=%x o=%llx ms=%u sr=%u "
+                            b"own=%u hits=%u probed=%u scanned=%u\n") in kernel,
+             "r347-bbsmhold": (b"clover r347: bbsmhold t=%llu hop=%d i=%u j=%u pid=%u c=%s "
+                               b"nm=%x ty=%s raw=%llx\n") in kernel,
              "r331-scan-own-only": b"own_only" in kernel,
              "r331-scan-hash-only": b"hash_only" in kernel,
              "r331-scan-no-holder": b"no_holder" in kernel,

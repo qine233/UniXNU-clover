@@ -29014,3 +29014,36 @@ flight 12 条、verdict 64 条、kernel 环 512 行全部是 boot 125 写的。*
 **预登记四支的落点。** **R-A 主体成立、两支偏离**（`n≥1`、`bbsm` 在场；`debt=1` 而非 0、`match=0` 而非 1，理由见上）。
 **R-B 不成立**（没有 `xlate` 行）。**R-C 不成立**（`n=3/7`，不是空集）。**R-D 成立且比预登记更细**：hop 0/1 同一 continuation，
 hop 2 无 continuation——分出的不是「主/辅接收线程」，而是「阻塞在接收」与「在 trap 里运行」。
+
+## Round347：对 sr>0 的 set 成员做 holder 普查并读 ip_mscount
+
+**为什么。** boot 126 的两个 set 给了 10 个成员口、9 个 `sr>0`、10 个队列全空；`a903` 真口 `sr=0` 无人能投递。
+「有门没人发」与「有门、钥匙在谁手里、是否用过」是两件事，后者才能把 #666 推进到「谁应该发而没发」。
+
+**改动（`patches/xnu/…-clover-r347.patch`，接在 r346 之后）。**
+- 成员遍历时在 **set 锁内** 多拷 `ip_mscount`，并对每个落槽的成员口 `ip_reference()`——普查要在解锁后跑，而成员口
+  可能在缝隙里被销毁，引用必须在锁内拿。行尾统一 `ip_release()`。
+- 解锁后，对每个 `sr>0` 的成员跑 r331 已有的两条腿：`clover_port_hash_holders`（内核反向表，纯发送权，`hits=` 是下界）
+  与 `clover_space_obj_names`（backboardd 自己空间里的名字数 `own=`）。
+- 新行：`clover r347: bbsmh t= hop= i= rn= o= ms= sr= own= hits= probed= scanned=`，每成员一行；
+  `clover r347: bbsmhold t= hop= i= j= pid= c= nm= ty= raw=`，最多两枚持有者。`r346: bbsm` 增加 `ms=`。
+  `ms=0 && sr>0` = 钥匙存在但从未用过；`ms>0 && q=0` = 用过、信被取走。
+- driver：tee 类 `r347-bbsmh`(64) / `r347-bbsmhold`(64)，token `r347` 进每-pass 豁免链。
+- 宿主闸门 11 条负测（补丁缺席/字节不同/系列缺席/顺序、两行缺席、引用与释放缺席、删 r346 行、tee 类、豁免、标题），
+  逐条按自己理由红并按字节还原（`~/clover-out/round347-negatives.log`，两仓补丁 sha256 `01910470…`）。
+
+**构建与闸门（r347）。** 142 枚补丁重放 → prelink `73539233…`（52,480,000 B）→ `patch-clover-amfi.py`（两刀仍是
+VA `0xfffffff004ab40e4`/`0xfffffff004ab416c`，文件偏移 `0x1af20e4`/`0x1af216c`）→ `round347-kernel-amfi.macho` `abdd4c01…`
+→ `normalize-kernel-macho.py --output`（973 枚戳）→ `round347-kernel-normalized.macho` `f101e3d0…` → payload
+`round347-v0.7.64-payload.img` `f6188f9b…`（58,720,256 B）。`payload.json`：kernel `f101e3d0…`、payload_kernel `a072a69c…`、
+adt `4a9363b6…`。仓库闸门 **EXIT=0**；镜像闸门 **EXIT=0，51 OK / 0 FAIL**（`r347-bbsmh`、`r347-bbsmhold` present）。
+
+**预登记：boot 127（r347 镜像）的四支判读。**
+- **H-A（预期）**：每个 `sr>0` 成员有 `bbsmh`，`ms=` 给出该口历史上被制造/传递过的发送权次数；`9203`（sr=6）应出现
+  至少一枚 `bbsmhold`（`c=` 是 pid 的命令名）。若 9 个成员全部 `ms=0`，则这些发送权**从未被使用**——「有门没人发」
+  的具体含义是钥匙发出去过但一次都没投递。
+- **H-B**：`own>0` 的成员是 backboardd 自己持有发送权的门（自投递形）；此时下一步问它的用户态调用者。
+- **H-C**：`hits=0` 而 `sr>0`（含 `own=0`）＝发送权在一个反向表不带、且本空间无名的 entry 里（右类型是 EX_RECEIVE 等），
+  这是 r331 的 `no_holder` 在成员级的复现。
+- **H-D（控制）**：`bbsend cand=3 debt=1 unread=2` 与 set 成员数（3/7）必须与 boot 126 同形状；若 hop 数或 set 数变了，
+  成员普查的样本也跟着变，行数不是同比。

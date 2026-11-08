@@ -1,0 +1,117 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12664,7 +12664,10 @@
+  * each member's object, imq_msgcount, ip_srights and imq_receiver_name under the lock the
+  * translate returns; the set's own waitq address lets the row say whether the sampled thread's
+  * wait_event is this set (the receiver), and nothing is retained past the copy. Member ports are
+- * not re-locked: the set lock is the one the member walk already runs under.
++ * not re-locked: the set lock is the one the member walk already runs under. Round347 takes one
++ * reference per member under that lock, then asks every member with ip_srights>0 who holds the
++ * send right (the r331 legs, run member by member) and prints ip_mscount beside it; the references
++ * are dropped after the rows, because a member can be destroyed between the walk and the asks.
+  */
+ #define CLOVER_BB_PSET_MAX 8
+ struct clover_bbpset_snap {
+@@ -12672,6 +12675,7 @@
+ 	uint32_t cnts[CLOVER_BB_PSET_MAX];
+ 	uint32_t srs[CLOVER_BB_PSET_MAX];
+ 	uint32_t rns[CLOVER_BB_PSET_MAX];
++	uint32_t mss[CLOVER_BB_PSET_MAX];
+ };
+ static int
+ clover_bb_hop_pset(task_t task, int pid, int hop, mach_port_name_t name,
+@@ -12711,6 +12715,13 @@
+ 			snap.cnts[stored] = port->ip_messages.imq_msgcount;
+ 			snap.srs[stored] = port->ip_srights;
+ 			snap.rns[stored] = port->ip_messages.imq_receiver_name;
++			snap.mss[stored] = port->ip_mscount;
++			/*
++			 * Round347: the member is about to be asked who holds its send right after the set
++			 * lock is dropped, and a member port can be destroyed in that gap. The set lock is the
++			 * last instant at which a reference can be taken without racing a recycled address.
++			 */
++			ip_reference(port);
+ 			stored++;
+ 		}
+ 	});
+@@ -12734,16 +12745,78 @@
+ 	}
+ 	for (i = 0; i < stored; i++) {
+ 		len = snprintf(row, sizeof(row),
+-		    "clover r346: bbsm t=%llu hop=%d i=%u rn=%x o=%llx q=%u sr=%u\n",
++		    "clover r346: bbsm t=%llu hop=%d i=%u rn=%x o=%llx q=%u sr=%u ms=%u\n",
+ 		    (unsigned long long)secs, hop, i, snap.rns[i],
+ 		    (unsigned long long)(uintptr_t)snap.ports[i], snap.cnts[i],
+-		    snap.srs[i]);
++		    snap.srs[i], snap.mss[i]);
+ 		if (len > 0) {
+ 			row[sizeof(row) - 1] = '\0';
+ 			clover_emmc_probe_say(row, (unsigned int)strlen(row));
+ 			printf("%s", row);
+ 		}
+ 	}
++	/*
++	 * Round347. Boot 126 read nine of ten member ports holding send rights with every queue empty,
++	 * which says the doors exist but not who was handed the key. Each member with ip_srights>0 is
++	 * asked outward on the two legs r331 already uses: the kernel's reverse hash (pure-send entries
++	 * only, so hits is a lower bound) and a complete walk of the waiter's own table (own= is the
++	 * count, which answers whether backboardd is the sender). ip_mscount rides beside them: a right
++	 * that exists and has never been sent reads ms=0 with sr>0, while a door that has been used and
++	 * drained reads ms>0 with q=0. Members are held on the references taken under the set lock.
++	 */
++	for (i = 0; i < stored; i++) {
++		uint32_t hp[2];
++		uint32_t hn[2];
++		uint64_t ht[2];
++		char hc[32];
++		uint32_t on[1];
++		uint64_t ob[1];
++		uint32_t hits = 0;
++		uint32_t probed = 0;
++		uint32_t scanned = 0;
++		uint32_t selfhit = 0;
++		uint32_t matches = 0;
++		uint32_t entries = 0;
++		uint32_t j;
++
++		if (snap.srs[i] == 0) {
++			continue;
++		}
++		clover_port_hash_holders(snap.ports[i], task, hp, hn, ht, hc, 2, &hits,
++		    &probed, &scanned, &selfhit);
++		if (space != IPC_SPACE_NULL) {
++			clover_space_obj_names(space, (ipc_object_t)snap.ports[i], on, ob,
++			    1, &matches, &entries);
++		}
++		len = snprintf(row, sizeof(row),
++		    "clover r347: bbsmh t=%llu hop=%d i=%u rn=%x o=%llx ms=%u sr=%u"
++		    " own=%u hits=%u probed=%u scanned=%u\n",
++		    (unsigned long long)secs, hop, i, snap.rns[i],
++		    (unsigned long long)(uintptr_t)snap.ports[i], snap.mss[i],
++		    snap.srs[i], matches, hits, probed, scanned);
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
++		for (j = 0; j < hits && j < 2; j++) {
++			len = snprintf(row, sizeof(row),
++			    "clover r347: bbsmhold t=%llu hop=%d i=%u j=%u pid=%u c=%s"
++			    " nm=%x ty=%s raw=%llx\n",
++			    (unsigned long long)secs, hop, i, j, hp[j],
++			    hc[j * 16], hn[j],
++			    clover_right_type_word((ipc_entry_bits_t)ht[j]),
++			    (unsigned long long)ht[j]);
++			if (len > 0) {
++				row[sizeof(row) - 1] = '\0';
++				clover_emmc_probe_say(row, (unsigned int)strlen(row));
++				printf("%s", row);
++			}
++		}
++	}
++	for (i = 0; i < stored; i++) {
++		ip_release(snap.ports[i]);
++	}
+ 	return 1;
+ }
+ 

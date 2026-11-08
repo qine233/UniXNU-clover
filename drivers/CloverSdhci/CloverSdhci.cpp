@@ -1233,6 +1233,14 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r346: bbset2", "r346-bbset2", 32, 0, 0, 0 },
   { "clover r346: bbsm", "r346-bbsm", 128, 0, 0, 0 },
 
+  // Round347 asks each member port with ip_srights>0 who holds its send right, on the same two legs
+  // r331 uses, and prints ip_mscount beside it. `bbsmh` is one header per such member (64: at most 8
+  // members per set x the fire cap), `bbsmhold` up to two names per member (64). They print in the
+  // r346 burst, so a cap that kept the header and ate the names would leave "the door has a key
+  // holder" indistinguishable from "nobody was found".
+  { "clover r347: bbsmh", "r347-bbsmh", 64, 0, 0, 0 },
+  { "clover r347: bbsmhold", "r347-bbsmhold", 64, 0, 0, 0 },
+
   // Round329 publishes the display client's state on the display's own 30 s beat; round344 (#695) makes that
   // row name the record it picked (`pick=`) and adds a per-record row, so the heads below are r344's for both
   // display families and r343's only for the swap row. Order matters and is the only defence: within a family
@@ -4915,6 +4923,10 @@ static void teeConsumeLine (uint32_t &pushed)
        // members would leave "the set is the receiver" indistinguishable from "the set is empty", so the
        // whole token is exempted; the class budgets of 128/32/128 still bound it.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r346") ||
+       // Round347's two rows ride the same burst and are one reading: the header says how many holders
+       // the two legs found and how many names in the waiter's own table point at the member, and the
+       // holder rows are those names. Dropping one half on a full pass is r249's shape again.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r347") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is

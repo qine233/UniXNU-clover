@@ -3553,6 +3553,79 @@ def check_board(errors: list) -> str:
                           "bbsm would leave 'the set is the receiver' indistinguishable from 'the set "
                           "holds nothing', which is the half-pair r249 refuses")
 
+        # Round347. Boot 126 read nine of ten member ports holding send rights with every queue empty,
+        # which says the doors exist but not who was handed a key. The hand asks each sr>0 member, on
+        # the two legs r331 already uses, who holds the send right, and prints ip_mscount beside it: a
+        # right that exists and has never been sent reads ms=0 with sr>0, a door that has been used and
+        # drained reads ms>0 with q=0. The gate holds the patch and its identity, the member reference
+        # taken under the set lock (the ask happens after the lock is dropped), the two row shapes and
+        # the release that keeps the reference from outliving the walk.
+        r347_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r347.patch")),
+                         default=None)
+        if r347_patch is None or not r347_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r347.patch is missing: the member holder census "
+                          "is this round's hand, and an instrument nobody shipped is a reading nobody "
+                          "can take")
+        else:
+            r347_name = r347_patch.name
+            r347_lines = r347_patch.read_text().splitlines()
+            load_r347 = REPO.parent / "UniXNU" / "patches" / "xnu" / r347_name
+            if not load_r347.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r347_name} is missing: unixnu loads patches from there, "
+                              "and this repo's copy only ever names the round")
+            elif load_r347.read_bytes() != r347_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r347_name} is not the same bytes as this repo's copy: "
+                              "the shipped image would carry a different row than the one checked here")
+            series_text = (REPO / "patches/xnu/series").read_text()
+            series_line = f"arch:../../../patches/xnu/{r347_name}"
+            r346_prev = max((p.name for p in (REPO / "patches/xnu-clover").glob("*-clover-r346.patch")),
+                            default="")
+            if series_line not in series_text:
+                errors.append(f"patches/xnu/series does not apply {r347_name}: the patch exists and the "
+                              "kernel would be built without it, which is the quietest way to lose a round")
+            elif r346_prev == "" or series_text.find(r346_prev) < 0:
+                errors.append("patches/xnu/series no longer applies r346: r347 edits the member walk r346 "
+                              "added, so the series cannot be read as the ordered history this round assumes")
+            elif series_text.find(series_line) < series_text.find(r346_prev):
+                errors.append("patches/xnu/series applies r347 before r346: r347 edits the member walk and "
+                              "the bbsm row r346 adds, so the other order has nothing to attach to")
+            r347_added = [line[1:] for line in r347_lines if line.startswith("+")]
+            r347_removed = [line[1:] for line in r347_lines
+                            if line.startswith("-") and not line.startswith("--- ")]
+            for now in (
+                # The reference has to be taken where the port is still protected by the set lock.
+                'ip_reference(port);',
+                'snap.mss[stored] = port->ip_mscount;',
+                # The ask runs after the unlock, on both legs r331 established.
+                'clover_port_hash_holders(snap.ports[i], task, hp, hn, ht, hc, 2, &hits,',
+                'clover_space_obj_names(space, (ipc_object_t)snap.ports[i], on, ob,',
+                # The two row shapes and the release that bounds the reference.
+                '"clover r347: bbsmh t=%llu hop=%d i=%u rn=%x o=%llx ms=%u sr=%u"',
+                '"clover r347: bbsmhold t=%llu hop=%d i=%u j=%u pid=%u c=%s"',
+                'ip_release(snap.ports[i]);',
+                'if (snap.srs[i] == 0) {',
+                'ms=%u\\n"'):
+                if not any(now in line for line in r347_added):
+                    errors.append(f"the r347 kernel patch does not add {now[:56]!r}: without it the "
+                                  "members with send rights stay doors with no named key holder, which "
+                                  "is what boot 126 could not answer")
+            # bbsm is re-keyed (it gains ms=), so only the set header and the member walk must survive.
+            for keep in ('"clover r346: bbset2',
+                         'waitq_set_foreach_member_locked(&((ipc_pset_t)obj)->ips_wqset,'):
+                if any(keep in line for line in r347_removed):
+                    errors.append(f"the r347 patch removes {keep[:56]!r}: the set walk and its rows are "
+                                  "what the member census is read against")
+        for entry in ('{ "clover r347: bbsmh", "r347-bbsmh", 64, 0, 0, 0 },',
+                      '{ "clover r347: bbsmhold", "r347-bbsmhold", 64, 0, 0, 0 },'):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: the holder rows are a "
+                              "list per member, and a burst with no budget of its own competes with the "
+                              "member rows it means to explain")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r347")' not in sdhci_source:
+            errors.append("the r347 rows are not exempt from the per-pass cap: keeping bbsmh and eating "
+                          "bbsmhold would leave 'the member has a key holder' indistinguishable from "
+                          "'nobody was found', which is the half-pair r249 refuses")
+
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
         # its own ending, so a silent boot leaves the boot before it on the card and the reader called
@@ -7276,9 +7349,10 @@ def check_board(errors: list) -> str:
     # names its probe generation, the title names the image that ran.
     # Round346 is the same shape: the bbsend row keeps its r331 token and gains unread=, while the rows
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
-    # them. The menu names round346.
-    if not board["payload"]["title"].startswith("clover r346:"):
-        errors.append('[payload] title is not "clover r346: ...": the menu would not name this round')
+    # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
+    # the menu names round347.
+    if not board["payload"]["title"].startswith("clover r347:"):
+        errors.append('[payload] title is not "clover r347: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -9432,8 +9506,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r346:"):
-        errors.append('[payload] title is not "clover r346: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r347:"):
+        errors.append('[payload] title is not "clover r347: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
