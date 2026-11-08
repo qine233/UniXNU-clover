@@ -29453,3 +29453,13 @@ Y-C：once=0（与 boot 132 的 so=1 不符，需另查）。
 series 缺席、series 顺序倒置、once_holders 丢 noinline、ctid 不搬 static、删除集多一行、标题降级——
 每例 exit=1 且红在自己的原因上，随后字节级还原（三处补丁 md5 复核一致）。
 日志：`~/clover-out/round354-negatives.log`，末行 `all-negatives-pass`。
+
+**记录债（发版前闸门，本轮结清）。** `porting-record.py check --device . --base v0.7.70` 先红在
+validate：`components without an area: ['ArmCpu', 'ArmDTPlatform', 'DarwinBoot', 'XnuPrelink']`。
+逐 tag 复核：v0.7.69/v0.7.70/HEAD 同红，最后一枚 validate-OK 是 v0.7.62——债生于 r346（v0.7.63
+把四枚 catalog 组件加进 board include 而 porting.toml 没认领），不是本轮新欠。按 sheng 的归属认领：
+cpu 收 ArmCpu+ArmDTPlatform，packaging 收 DarwinBoot+XnuPrelink。validate 绿后，闸门自己的
+`check_changes()` 又枚举出 16 笔 (file, owner)：board.toml 欠九个区、两枚 r354 补丁欠 packaging/storage、
+两个 checker 欠 diagnostics/firmware/packaging，而 `patches/xnu/**` 整个无主——firmware 区现在认领它
+（series 行加载的就是那份拷贝）。每区补一条 r354 findings 结清，读数在
+`~/clover-out/round354-porting-debt.log`，末次 `check --base v0.7.70` EXIT=0（13 areas）。
