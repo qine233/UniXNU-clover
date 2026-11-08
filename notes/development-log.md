@@ -28868,3 +28868,26 @@ kernel 的工作树已证明与 r344 逐文件相同，故先审 ADT。
 没进加载。但手改 FAT 的镜像本身不可信（目录项时间戳/簇链都变了），所以这次失败**不能**用来支持或否定 ADT 假设；
 对照作废，改为直接刷工具链重建的修正版。**下一手**：修正版 payload 冷刷 cache → 读回，判据是卡上出现**新的 boot id**
 （不再等于 124）且 `counters`/`beat` 由本次启动写出。
+
+## sheng-port ⑤（修正版 payload 的 boot 125：迁移第一次真正落到卡上）
+
+**判据成立。** 修掉 ADT 那一组键后，冷刷 `format2-payload-adtfix.img`，卡上 boot counter 从 124 走到 **125**；
+flight 12 条、verdict 64 条、kernel 环 512 行全部是 boot 125 写的。**上一靴（124→124）的「卡上完全没动」由此有了反证：
+不是内核/启动通路坏，而是 ADT 少键让 AMFI/平台身份那一层没起来，存储路径拿到的输入不对。**
+
+**boot 125 的形状（与 r344 的 boot 124 对齐）。**
+- 驱动上膛 `arming_offset≈11.9 s`；beat 48–51 落在 t=330/335/359/448 s；最后一次 entry t=469 s；kernel 环最后一行 t=481 s。
+- `clover r271: cpu t=481 real=8 max=8 reg=8 start=7 run=8` —— 八核全在，SMP 补丁在 format 2 内核里生效（旧读法若只留 11 枚补丁会丢这枚）。
+- `clover r299: smp t=481 req=1 con=1 run=7 …`；`r270 ipi sent=256204 recv=256082`。
+- 桌面主线同形状：`r327 bbnow t=481 pid=58 fired=1 hn=4`、`r328 bbrcv … rstate=rcv_owner rnamed=4 c=58:backboardd+…`、`r331 bbsend 四跳 e=17 debt=4`；
+  `r262 census pid=58 threads=16 wait=16`。r344 的 dispclient/dispstate 行也在（7/11 条）。
+- **没有** `cs_enforcement_disable` 的缺席投诉（卡上的 tee 本来会滤掉它；屏上那行不再出现是上一格 ADT 修正的直接结果候选，判据仍是下一靴屏读）。
+
+**停点。** 这一靴在 t≈481 s 后不再有 I/O，随后**静默复位**回 fastboot：`the board came back to fastboot: its reset ran, but misc held no recovery command`；
+卡上没有 boot 125 的 deadline 记录（记录仍是 boot 108 的），也没有 boot 125 进 panic sink 的标记。即它没走到 1800 s 死线，
+是 r288–r294 那条「约 8 分钟静默复位」的老现象，不是 format 2 新引入的。与 r344 的差别只在**这一靴的复位时机**（r344 的 boot 124 活到了 1800 s）。
+
+**结论。** 迁移的可执行目标已达成：format 2 下内核构建、AMFI、归一化、payload、双闸门、冷刷、读回全部走通，
+且行为与 r344 同一形状（同一条 backboardd 停链、同样 8 核、同样的探针行）。**剩余差异只有 `[adt]` 声明与
+`generate()` 不支持的 `/cpus` 两枚键**，后者内核不使用（CPU 号取 MPIDR）。下一手的题面回到主线 #666：backboardd 那四跳 `e=17 debt=4`
+与静默复位时机；迁移本身不再挡路。
