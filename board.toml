@@ -2697,6 +2697,39 @@ include_dirs = ["soc:dts"]
 
 [adt]
 
+# Per-adapter identity and security tuple. Format 1's make-clover-adt.py wrote these as literals
+# (scripts/make-clover-adt.py:232-267,337); generate() only adds what the [adt] tables name, so
+# they have to be declared here or the ADT loses them. amfi-only-platform-code is the one AMFI
+# refuses to start without (the comment at that line), and osenvironment is what kern_csr.c,
+# kern_mib.c and vm_compressor.c read. display-* is the splash the legacy display path reads
+# (base 0x9d400000 is the reserved-memory node's own address).
+[adt.root]
+
+[adt.root.u32]
+board-id = 12
+
+[adt.chosen]
+
+[adt.chosen.string]
+osenvironment = "main"
+crypto-hash-method = "sha2-384"
+
+[adt.chosen.u32]
+certificate-production-status = 0
+effective-production-status-ap = 0
+certificate-security-mode = 1
+effective-security-mode-sep = 1
+amfi-only-platform-code = 1
+debug-enabled = 1
+display-width = 1200
+display-height = 1920
+display-stride = 4800
+display-scale = 2
+display-rotation = 270
+
+[adt.chosen.u64]
+display-base = "0x9d400000"
+
 [adt.product]
 
 [adt.product.string]

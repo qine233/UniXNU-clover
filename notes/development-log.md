@@ -28841,3 +28841,30 @@ SoftwareAES，vendor 进来会欠驱动文档闸门一条 README 引用），改
 **未做。** 还没有 `unixnu bootimg`（format 2 的 [bootimg] 段尚未在分支上验证）也没有冷刷。下一步若继续：bootimg →
 冷刷 cache → 读回，判两件预登记的事：① `arm-io` 窗口由 GIC/GICR 的 reg 算出 `+0x00C00000`（r343 的旧 ADT 是
 `+0x01000000`，4 MiB 差）；② format 2 的 ADT 上 `/chosen` 的 root-matching/persistent 语义是否让首靴行为与 r344 一致。
+
+## sheng-port ④（ADT 契约核对：generate() 漏掉的那一组键）
+
+**首靴（boot 125 候选）的两个读数。** ① 屏上出现 `can't has cs_enforcement_disable`（`AppleMobileFileIntegrity.cpp:55`），
+r344 的 boot 124 窗口里没有这一行；② 读回卡上的窗口与 r344 的 boot 124 窗口**逐字节相同**（`cmp` 无差异），即这一靴
+**什么都没写到卡上**，CloverSdhci 没上膛。两条独立信号指向同一件事：内核拿到的不是 r344 那套输入。
+payload 的 `unixnu.toml`（含 2439 B 的 `args=`）与 r344 **逐字节相同**，所以差异只能在 ADT 或 kernel；
+kernel 的工作树已证明与 r344 逐文件相同，故先审 ADT。
+
+**ADT 逐键对比（解码器按 devicetree.py 的 `node()` TLV：u32 nprops、u32 nchild、32 B 键、u32 长度、4 B 对齐）。** 旧 ADT 14384 B
+与 format 2 的 14096 B 之间，format 2 **少了**：`/chosen` 的 `debug-enabled=1`、`display-base=0x9d400000`、
+`display-width=1200`、`display-height=1920`、`display-stride=4800`、`display-scale=2`、`display-rotation=270`、
+`osenvironment="main"`、证书/安全模式四枚、`crypto-hash-method="sha2-384"`、`amfi-only-platform-code=1`；以及
+`/device-tree/board-id=12`。这些在 format 1 里是 `scripts/make-clover-adt.py:232-267,337` 的**字面量**，而 schema 2 的
+`devicetree.generate()` 只写 `[adt]` 表里点名的键——**迁移丢的是 board.toml 未声明的那一组，不是生成器不写**。
+`amfi-only-platform-code` 那一行的旧注释原话是「AMFI 没有它拒绝启动」，与屏上那行同源。
+
+**修正。** board.toml 加 `[adt.root].u32 board-id = 12`、`[adt.chosen].string osenvironment/crypto-hash-method`、
+`[adt.chosen].u32` 的证书四枚＋`amfi-only-platform-code/debug-enabled/display-*`、`[adt.chosen].u64 display-base`。
+重建后 ADT 与 r344 只剩：`compatible` 多一个 `xiaomi,clover-lte`（板级 DTS 自己带的，有意保留）、`random-seed` 256 vs 64
+（10063 内核读前 64）、`text-fixups`（本板补丁需要）、`cpus/cpuN` 的 `cpu-id`/`fixed-frequency-khz`（`generate()` 不写，
+内核从 MPIDR 取 CPU 号，不使用这两个键）。修正版 payload **双闸门绿**（repo 0；payload 51 OK / 0 FAIL）。
+
+**一个无效的对照。** 为分离 ADT 变量，我用 `mcopy -o` 把 r344 的 ADT 塞进 format 2 payload 做对照靴；那一靴停在 UEFI、
+没进加载。但手改 FAT 的镜像本身不可信（目录项时间戳/簇链都变了），所以这次失败**不能**用来支持或否定 ADT 假设；
+对照作废，改为直接刷工具链重建的修正版。**下一手**：修正版 payload 冷刷 cache → 读回，判据是卡上出现**新的 boot id**
+（不再等于 124）且 `counters`/`beat` 由本次启动写出。
