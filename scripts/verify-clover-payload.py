@@ -1327,13 +1327,16 @@ def check_sb_sample(kernel: bytes) -> bool:
              # pure-send-only reverse hash (ipc_hash.c's own comment) while leg B walks the waiter's whole
              # table, so a payload that carries the header but not those literals cannot report the
              # disagreement this round was built to measure. r327's and r328's rows stay: they are what says
-             # which hop this row is allowed to pick.
+             # which hop this row is allowed to pick. Round355 extends both shapes with so=/ms=/once=/
+             # och=/ocp=/ocs= -- the same columns on both branches is the point, so the pins are the two
+             # full new strings, not prefixes: a payload where only one branch grew would pass a prefix.
              "r331-bbsend": (b"clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=%llx e=%d sr=%u q=%u "
                              b"scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u cand=%u "
-                             b"debt=%u unread=%u\n") in kernel,
+                             b"debt=%u unread=%u so=%u ms=%u once=%u och=%u ocp=%u ocs=%u\n") in kernel,
              "r331-bbsend-null": (b"clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=0 e=%d sr=%u q=%u "
                                   b"scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u "
-                                  b"cand=%u debt=%u unread=%u\n") in kernel,
+                                  b"cand=%u debt=%u unread=%u so=%u ms=%u once=%u och=%u ocp=%u ocs=%u\n")
+                                  in kernel,
              "r331-bbsh": (b"clover r331: bbsh t=%llu i=%u pid=%u c=%s nm=%x ty=%s raw=%llx\n") in kernel,
              "r331-bbown": (b"clover r331: bbown t=%llu i=%u nm=%x ty=%s raw=%llx ur=%u\n") in kernel,
              # Round346 opens the sets r331 could only count. bbhop is the thread identity the hop order
@@ -1375,6 +1378,10 @@ def check_sb_sample(kernel: bytes) -> bool:
              # Round352 names the SEND_ONCE holders the two send-right legs cannot index.
              "r352-onceh": (b"clover r352: onceh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s "
                             b"raw=%llx\n") in kernel,
+             # Round355 names the same kind of holder on the bbsend leaf: the counts ride the r331
+             # row, these rows say who they counted.
+             "r355-bbonceh": (b"clover r355: bbonceh t=%llu pid=%d hop=%d i=%u hpid=%u c=%s nm=%x "
+                              b"ty=%s raw=%llx\n") in kernel,
              # Round354 keeps the four heavy helpers out of clover_bb_sample's frame. noinline is a
              # source attribute, but what boot 133 died on was the link: the helpers' frames accreted
              # into one 10912-byte frame and the beat thread's 16 KB stack overflowed. Each helper

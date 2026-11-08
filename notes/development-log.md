@@ -29504,3 +29504,59 @@ clover r352: onceh t=1597 pid=27 j=1 hpid=58 c=backboardd nm=c46b ty=sendonce ra
 **这一靴怎么结束。** 卡上死线记录仍属 boot 108、两枚 panic marker 全 STALE（124/87）⇒ boot 134 没进
 panic sink、没到 1800 s 死线就自行复位落 fastboot；flight 最新 entry t=1595680 ms、最新 beat t=1526022 ms
 （gap 69.7 s）。复位来源那一腿不在本轮判据里，沿用 r339 线的既有题面。
+
+## Round355：把 SEND_ONCE 普查套到 bbsend 的叶子上——backboardd 欠的那一跳是谁
+
+**为什么。** boot 134 把链读成 SpringBoard ←(sendonce c46b) backboardd ←(hop_unresolved) 下一跳；
+r355 的题面就是这下一跳。叶子行 `bbsend hop=3 nm=6903 e=0 sr=0 q=0 scan=no_srights` 的 sr 是
+`ip_srights`，它**只数 SEND**；send-once 计在 `ip_sorights`，而 bbsend 的两条腿都看不见 send-once
+（反查哈希只收纯 send 条目，own 扫描只看等待者自己那一个空间）。同拍 `bbown` 已证该口在 pid 58
+空间里是纯 receive（`raw=3820000 ur=0`），所以「sr=0」不等于「没人能发」：唯一可能的唤醒源是一枚
+别处持有的 send-once（盲区正中 r352 已验证的形状），或者根本没人上过膛。`ip_mscount` 恰好把这两种
+分开：ms=0 是从未 make-send（setup 侧没造回复权），ms>0 是上过膛而权已消费/销毁。
+
+**改动（`patches/xnu/…-clover-r355.patch`，接在 r354 之后）。**
+- `clover_port_obj_held()` 加两个出参 `uint32_t *sorights, uint32_t *mscount`，在与 sr/q 同一把
+  port 锁下读（同一快照）；函数内先清零，translate 失败的两支与 notport 支都留 0。唯一调用者是
+  `clover_bb_send_holders_row`。
+- `clover_bb_send_holders_row()`：obj_held 返回的 port **已带引用**（锁内 ip_reference），所以直接
+  传给 r352 的 `clover_port_once_holders()`，不再额外 io_reference（这是与 r352 调用点的差别：那边
+  translate 不带引用）。两支行（port==NULL 与正常）行尾都加 `so=%u ms=%u once=%u och=%u ocp=%u ocs=%u`
+  （同形规则：缺席不能和「没跑」同形）；新增 `clover r355: bbonceh t= pid= hop= i= hpid= c= nm= ty= raw=`
+  明细行（每火最多 4 枚）；`ip_release(port)` 不变。
+- driver：tee 类 `r355-bbonceh`(64)，token `r355` 进每-pass 豁免链（计数与点名不许被帽拆开）。
+- 栈纪律：send_holders_row 加 ~140 B 暂存数组，once_holders 已是 noinline（160 B 独立帧）。构建后
+  量帧；最深链若超 16 KB 则给 send_holders_row 补 noinline 重建（r354 同款兜底）。
+
+**预登记：boot 135（r355 镜像）的四支判读。** 先判「burst 跑完」：bbnow/bbsend 仍 4 行/火、
+r346–r352 行在场、全文 0 abt；同帧正对照＝r352 `onceh` 仍点名 backboardd（pid 27 那枚
+`sr=1 ms=1 so=1 own=1 once=1 och=1` 形状行；rn 每靴可变，认形状不认名字）。再认叶子——**e=0 且
+bbown 纯 recv 的那枚 hop**（nm 每靴可变，boot 134 叫 6903）——按它的 so/ms/once 判：
+- **Z-A**：`so>=1` 且 `bbonceh` 点名一个 **hpid!=58** 的持有者（进程名可读、`ocs==probed` 无截断）
+  ⇒ 该进程欠 backboardd 这一跳；下一问＝它为什么还没发（r349 holder_sample 已有其形状）。
+- **Z-B**：`so>=1` 但 `och=0` 且 `ocs==probed`（167 个空间全扫完仍无）⇒ 权在途 kmsg 里或在 pid 400
+  cap 外；下一手＝读在途消息描述符或扩 cap（boot 134 的 pid 57 `so=1 once=0` 已是此形的先例）。
+- **Z-C**：`so=0 ms=0` ⇒ 这枚口从未 make-send，回复权根本没被造出来；bug 在 setup 侧，下一手＝
+  追谁本该往这枚口 make-send（对照 datamigrator 7d53 的 ms=0 结案形状）。
+- **Z-D**：`so=0 ms>0` ⇒ 上过膛而权已消费/销毁而 q=0：回复发过但没落进这枚队列（或发往别处）；
+  下一手＝追 ip_mscount/ip_sorights 的增减点与这枚口的 nsrequest/dead-name 通知。
+- 控制腿：若叶子行整支缺席（hn<4 或全 pset），先按 r346 的 cand/debt/unread 对账判采样相位，
+  不判 Z；burst 没跑完（abt 出现或行数跌）先按 r354 的栈判据处理，也不判 Z。
+
+**构建。** `python3.13 ./unixnu build kernel` 过；补丁 `zzzz…84z…-clover-r355.patch`
+（md5 `93eda62a9ea3d35badbc5421bb0a61f9`）三份副本字节一致，正/反 apply 皆验，全 series 在纯净
+xnu 上重放（applied=60 skipped=89）与 /tmp/r355work 字节相同。构建后量帧：`clover_bb_sample`
+0x14f0＝5360 B（只比 r354 的 5344 涨 16 B，编译器槽位复用），最深链 ≈12.9 KB < 16 KB，r354 的
+noinline 兜底未触发。AMFI→normalize→payload 全链走 **format 2 路径**
+（`out/clover/ipados-17.7.11-21H461/clover/kernel/kernel.macho`；README 旧引用的
+`out/clover/kernel/kernel.macho` 是 format-1 遗留、不含 r346–r355 文本，第一轮产物已作废重做）：
+amfi `c396e84c…` → normalized `2297c971…` → payload `round355-v0.7.73-payload.img`
+（sha256 `8ae5669b627d0c65083d9da95948c03e2c1104d84273a0e7cb5966289bb57bba`，58,720,256 B）。
+verify-clover-payload.py 按 format 2 要 `--kernel <normalized> --tree <assembled tree>`，EXIT=0，
+`r355-bbonceh` 与四枚 r354 noinline 符号都在；check-clover 仓内/检出双过。
+
+**负测。** 11 支（`~/clover-out/round355-negatives.log`，all-negatives-pass）：patch-missing、
+base-bytes、local-bytes、series-missing、series-order、mscount-read、branch-ending-kept（把
+`-		    " debt=%u unread=%u\n",` 那行从删行改成保留，验「只换一支分支结尾」会被
+removed-pin 抓住——两分支同形是这一轮的点）、bbonceh-row、tee-class、exemption、title；每支红
+于自己的理由，恢复字节一致（三份副本 md5 复验 `93eda62a…`）。

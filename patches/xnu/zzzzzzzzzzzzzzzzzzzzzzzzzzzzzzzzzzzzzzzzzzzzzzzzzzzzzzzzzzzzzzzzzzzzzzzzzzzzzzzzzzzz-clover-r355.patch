@@ -1,0 +1,131 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12596,10 +12596,13 @@
+  * while translate still holds the port lock. code: 0 port, -1 no space or null name, -2 translated
+  * but not IOT_PORT, positive = the last KERN_* from the translate itself (r303's rule: a helper's
+  * zero and a real zero must not share a literal).
++ * Round355 adds ip_sorights and ip_mscount to the same locked snapshot: ip_srights counts SEND only,
++ * so a leaf reading sr=0 can still have a send-once holder neither r331 leg can see, and mscount
++ * separates "never armed" (ms=0) from "armed then consumed" (ms>0).
+  */
+ static ipc_port_t
+ clover_port_obj_held(task_t task, mach_port_name_t name, int *code, uint32_t *srights,
+-    uint32_t *msgcount)
++    uint32_t *msgcount, uint32_t *sorights, uint32_t *mscount)
+ {
+ 	ipc_space_t space = task->itk_space;
+ 	ipc_object_t obj = IPC_OBJECT_NULL;
+@@ -12609,6 +12612,8 @@
+ 	*code = 0;
+ 	*srights = 0;
+ 	*msgcount = 0;
++	*sorights = 0;
++	*mscount = 0;
+ 	if (space == IPC_SPACE_NULL || name == MACH_PORT_NULL) {
+ 		*code = -1;
+ 		return IPC_PORT_NULL;
+@@ -12629,6 +12634,8 @@
+ 	port = (ipc_port_t) obj;
+ 	*msgcount = port->ip_messages.imq_msgcount;
+ 	*srights = port->ip_srights;
++	*sorights = port->ip_sorights;
++	*mscount = port->ip_mscount;
+ 	ip_reference(port);
+ 	io_unlock(obj);
+ 	return port;
+@@ -13249,12 +13256,21 @@
+ 	int code = 0;
+ 	uint32_t sr = 0;
+ 	uint32_t mc = 0;
++	uint32_t so = 0;
++	uint32_t ms = 0;
+ 	uint32_t hp[CLOVER_BB_SEND_MAX];
+ 	uint32_t hn[CLOVER_BB_SEND_MAX];
+ 	uint64_t ht[CLOVER_BB_SEND_MAX];
+ 	char hc[CLOVER_BB_SEND_MAX * 16];
+ 	uint32_t on[CLOVER_BB_SEND_MAX];
+ 	uint64_t ob[CLOVER_BB_SEND_MAX];
++	uint32_t sp[CLOVER_BB_SEND_MAX];
++	uint32_t sn[CLOVER_BB_SEND_MAX];
++	uint64_t sb[CLOVER_BB_SEND_MAX];
++	char sc[CLOVER_BB_SEND_MAX * 16];
++	uint32_t once = 0;
++	uint32_t once_probed = 0;
++	uint32_t once_scanned = 0;
+ 	uint32_t hits = 0;
+ 	uint32_t probed = 0;
+ 	uint32_t scanned = 0;
+@@ -13279,7 +13295,7 @@
+ 
+ 	st = "";
+ 	len = 0;
+-	port = clover_port_obj_held(task, name, &code, &sr, &mc);
++	port = clover_port_obj_held(task, name, &code, &sr, &mc, &so, &ms);
+ 	if (port == IPC_PORT_NULL) {
+ 		int pset = 0;
+ 
+@@ -13295,9 +13311,9 @@
+ 		len = snprintf(row, sizeof(row),
+ 		    "clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=0 e=%d sr=%u q=%u"
+ 		    " scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u cand=%u"
+-		    " debt=%u unread=%u\n",
++		    " debt=%u unread=%u so=%u ms=%u once=%u och=%u ocp=%u ocs=%u\n",
+ 		    (unsigned long long)secs, pid, hop, name, code, sr, mc, st, 0u, 0u, 0u,
+-		    0u, 0u, 0u, cand, debt, unread);
++		    0u, 0u, 0u, cand, debt, unread, so, ms, 0u, 0u, 0u, 0u);
+ 		if (len > 0) {
+ 			row[sizeof(row) - 1] = '\0';
+ 			clover_emmc_probe_say(row, (unsigned int)strlen(row));
+@@ -13312,6 +13328,14 @@
+ 		clover_space_obj_names(space, (ipc_object_t) port, on, ob,
+ 		    CLOVER_BB_SEND_MAX, &matches, &entries);
+ 	}
++	/*
++	 * Round355. sr=0 does not mean nobody can post: ip_srights counts SEND only, and both legs
++	 * above are blind to SEND_ONCE (the hash indexes pure-send entries, the own scan looks at
++	 * one space). The r352 walk names the one-shot holder on this leaf too. obj_held already
++	 * took the reference under the port lock, so no extra io_reference here.
++	 */
++	clover_port_once_holders((ipc_object_t) port, sp, sn, sb, sc, CLOVER_BB_SEND_MAX,
++	    &once, &once_probed, &once_scanned);
+ 
+ 	st = (sr == 0) ? "no_srights" : ((matches != 0 && hits == 0) ? "own_only" :
+ 	    ((hits != 0 && matches == 0) ? "hash_only" : (hits != 0 ? "holders" :
+@@ -13319,10 +13343,11 @@
+ 	len = snprintf(row, sizeof(row),
+ 	    "clover r331: bbsend t=%llu pid=%d hop=%d nm=%x obj=%llx e=%d sr=%u q=%u"
+ 	    " scan=%s hits=%u probed=%u scanned=%u self=%u ownnames=%u walked=%u cand=%u debt=%u"
+-	    " unread=%u\n",
++	    " unread=%u so=%u ms=%u once=%u och=%u ocp=%u ocs=%u\n",
+ 	    (unsigned long long)secs, pid, hop, name,
+ 	    (unsigned long long)(uintptr_t)port, code, sr, mc, st, hits, probed,
+-	    scanned, selfhit, matches, entries, cand, debt, unread);
++	    scanned, selfhit, matches, entries, cand, debt, unread, so, ms, once, once,
++	    once_probed, once_scanned);
+ 	if (len > 0) {
+ 		row[sizeof(row) - 1] = '\0';
+ 		clover_emmc_probe_say(row, (unsigned int)strlen(row));
+@@ -13347,6 +13372,23 @@
+ 		    clover_right_type_word((ipc_entry_bits_t)ob[i]),
+ 		    (unsigned long long)ob[i],
+ 		    (uint32_t) IE_BITS_UREFS((ipc_entry_bits_t)ob[i]));
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
++	}
++	/*
++	 * Round355. The one-shot holders of this leaf, named the way r352 names the door's: the
++	 * so=/once= counts without these rows would leave the debtor a number, not a process.
++	 */
++	for (i = 0; i < once && i < CLOVER_BB_SEND_MAX; i++) {
++		len = snprintf(row, sizeof(row),
++		    "clover r355: bbonceh t=%llu pid=%d hop=%d i=%u hpid=%u c=%s nm=%x ty=%s"
++		    " raw=%llx\n",
++		    (unsigned long long)secs, pid, hop, i, sp[i], sc + i * 16, sn[i],
++		    clover_right_type_word((ipc_entry_bits_t)sb[i]),
++		    (unsigned long long)sb[i]);
+ 		if (len > 0) {
+ 			row[sizeof(row) - 1] = '\0';
+ 			clover_emmc_probe_say(row, (unsigned int)strlen(row));

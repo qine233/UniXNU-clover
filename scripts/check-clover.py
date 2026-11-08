@@ -3981,6 +3981,71 @@ def check_board(errors: list) -> str:
                               "lines and the 36 scratch-array declarations: this round is four "
                               "attributes, 36 static flips and nothing else")
 
+        # Round355. Boot 134's leaf hop read no_srights, but ip_srights counts SEND only and both
+        # r331 legs are blind to SEND_ONCE by construction, so that zero cannot rule out a one-shot
+        # holder. The hand reads ip_sorights/ip_mscount under the same translate lock, runs r352's
+        # cross-space walk on the referenced leaf port, and names each holder in bbonceh rows.
+        r355_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r355.patch")),
+                         default=None)
+        if r355_patch is None or not r355_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r355.patch is missing: no_srights would keep "
+                          "reading as \"nobody can wake it\" while a send-once holder stays invisible")
+        else:
+            r355_name = r355_patch.name
+            r355_text = r355_patch.read_text()
+            load_r355 = REPO.parent / "UniXNU" / "patches" / "xnu" / r355_name
+            local_r355 = REPO / "patches/xnu" / r355_name
+            if not load_r355.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r355_name} is missing: unixnu loads patches from "
+                              "there, and this repo's copy only ever names the round")
+            elif load_r355.read_bytes() != r355_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r355_name} is not the same bytes as this repo's "
+                              "copy: the shipped image would carry a different leaf reading")
+            if not local_r355.is_file() or local_r355.read_bytes() != r355_patch.read_bytes():
+                errors.append(f"patches/xnu/{r355_name} is missing or differs: the series line loads "
+                              "that copy, so the gate must pin the bytes it actually applies")
+            series_text = (REPO / "patches/xnu/series").read_text()
+            series_line = f"arch:../../../patches/xnu/{r355_name}"
+            r354_prev = max((p.name for p in (REPO / "patches/xnu-clover").glob("*-clover-r354.patch")),
+                            default="")
+            if series_line not in series_text:
+                errors.append(f"patches/xnu/series does not apply {r355_name}: the so=/ms= snapshot "
+                              "and the leaf once-walk exist and the kernel would be built without them")
+            elif r354_prev == "" or series_text.find(r354_prev) < 0:
+                errors.append("patches/xnu/series no longer applies r354: r355 extends the noinline "
+                              "walk r354 secured, so the series cannot be read as the ordered history")
+            elif series_text.find(series_line) < series_text.find(r354_prev):
+                errors.append("patches/xnu/series applies r355 before r354: it calls "
+                              "clover_port_once_holders, whose stack safety r354's noinline cut provides")
+            r355_added = [line[1:] for line in r355_text.splitlines() if line.startswith("+")]
+            r355_removed = [line[1:] for line in r355_text.splitlines()
+                            if line.startswith("-") and not line.startswith("---")]
+            for now in (
+                'Round355 adds ip_sorights and ip_mscount to the same locked snapshot',
+                'uint32_t *msgcount, uint32_t *sorights, uint32_t *mscount)',
+                '*sorights = port->ip_sorights;',
+                '*mscount = port->ip_mscount;',
+                'port = clover_port_obj_held(task, name, &code, &sr, &mc, &so, &ms);',
+                'clover_port_once_holders((ipc_object_t) port, sp, sn, sb, sc, CLOVER_BB_SEND_MAX,',
+                '" debt=%u unread=%u so=%u ms=%u once=%u och=%u ocp=%u ocs=%u\\n"',
+                '" unread=%u so=%u ms=%u once=%u och=%u ocp=%u ocs=%u\\n"',
+                '"clover r355: bbonceh t=%llu pid=%d hop=%d i=%u hpid=%u c=%s nm=%x ty=%s"'):
+                if not any(now in line for line in r355_added):
+                    errors.append(f"the r355 kernel patch does not add {now[:60]!r}: without it the "
+                                  "send-once holder on the leaf stays a count no leg can name")
+            for gone in ('" debt=%u unread=%u\\n"', '" unread=%u\\n"'):
+                if not any(gone in line for line in r355_removed):
+                    errors.append(f"the r355 patch does not replace the bbsend branch ending {gone!r}: "
+                                  "a branch that prints fewer columns cannot be told from one the "
+                                  "decoder dropped")
+        for entry in ('{ "clover r355: bbonceh", "r355-bbonceh", 64, 0, 0, 0 },',):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: the leaf once rows "
+                              "ride the r331 burst and need their own budget")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r355")' not in sdhci_source:
+            errors.append("the r355 rows are not exempt from the per-pass cap: a count without the "
+                          "names it counted is the half-pair r249 refuses")
+
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
         # its own ending, so a silent boot leaves the boot before it on the card and the reader called
@@ -7706,8 +7771,8 @@ def check_board(errors: list) -> str:
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
     # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
     # the menu names round347.
-    if not board["payload"]["title"].startswith("clover r354:"):
-        errors.append('[payload] title is not "clover r354: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r355:"):
+        errors.append('[payload] title is not "clover r355: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -9861,8 +9926,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r354:"):
-        errors.append('[payload] title is not "clover r354: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r355:"):
+        errors.append('[payload] title is not "clover r355: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

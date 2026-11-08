@@ -1251,6 +1251,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // SEND_ONCE ones, which neither the reverse hash nor the owner's one-space scan indexes.
   { "clover r352: onceh", "r352-onceh", 64, 0, 0, 0 },
 
+  // Round355 runs that same walk on the leaf hop of the bbsend family: sr=0 cannot see a
+  // send-once holder, and these rows name the one that owes backboardd's reply. One row per
+  // holder per fire, four hops and four holders at most, so 64 is the arithmetic bound.
+  { "clover r355: bbonceh", "r355-bbonceh", 64, 0, 0, 0 },
+
   // Round349 follows each named holder into its own task in the same fire: `holdth` is the
   // per-task summary (threads, waiters, runners, trapped) and `holdt` at most two trapped threads
   // with their receive name, send destination and continuation. Six holders per fire at most, so
@@ -4964,6 +4969,10 @@ static void teeConsumeLine (uint32_t &pushed)
        // Round352's once-holder rows are the answer half of the r351 note: the row says how many
        // SEND_ONCE names point at the door and these name them, so a full pass must not split them.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r352") ||
+       // Round355 puts the same pair on the bbsend leaf: so=/once= count the one-shot right and
+       // bbonceh names its holder, so a cap that kept the count and ate the name would recreate the
+       // blind spot this round exists to close.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r355") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is

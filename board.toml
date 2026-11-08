@@ -254,7 +254,13 @@ loader = "firmware"
 # (~/clover-out/round342-boot122-census/display-rows.txt): the writer stores 0x16bc, copies it to 0x16c0
 # and counts 0xfc, so `presented` was the latch copied -- a second name for the word beside it, not the
 # presentation counter this port never had. The gate walks the rename down to the measured number.
-title = "clover r354: boot 133 never reached the once-holder rows because the beat thread overflowed its 16 KB kernel stack on the first sampler fire: the four heavy helpers were inlined into clover_bb_sample, whose frame measured 0x2aa0 (10912 B), and the printf chain pushed the total past the stack base (ESR 0x96000047 in oslog_stream's frame push, sp and far below the kstack base). This round marks clover_port_once_holders, clover_bb_holder_door, clover_bb_holder_sample and clover_bb_hop_pset noinline so each owns its own frame (\"noinline proves itself as an independent text symbol in the linked kernel\"), and because that cut alone still left the sampler frame at 0x2700 (9984 B, measured), it also moves the 36 census/user-frame scratch arrays to single-writer static buffers -- the beat thread is the only caller and every consumer is gated by cn/un. The next boot re-reads r352's Y-A...Y-C. Nothing else moved: no row, offset, kind, clamp, ring geometry or cadence."
+#
+# Round355's case: boot 134 answered "who owes SpringBoard" (backboardd holds the send-once reply), and
+# the next link -- who owes backboardd -- read sr=0 on its leaf hop. ip_srights counts SEND only, so a
+# send-once holder is invisible to both r331 legs by construction; the same blind spot boot 132 proved
+# on the door. The gate pins the so=/ms= snapshot read, the once columns on both bbsend branches and
+# the bbonceh naming rows down to the r352 function they call.
+title = "clover r355: boot 134's leaf hop read no_srights, which is not \"nobody can wake it\" -- ip_srights counts SEND only and both r331 legs are blind to a send-once holder by construction. This round reads ip_sorights and ip_mscount into the bbsend row under the same translate lock (so=/ms=, both branches carry the columns so an eaten branch cannot look like a ran one), reuses r352's cross-space SEND_ONCE walk on the already-referenced leaf port (once=/och=/ocp=/ocs=), and names each holder with clover r355: bbonceh rows. The next boot reads the four Z branches on the e=0 leaf: holder named, in-flight or outside the cap, never armed (ms=0), consumed (ms>0). Nothing else moved: no row, offset, kind, clamp, ring geometry or cadence."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
