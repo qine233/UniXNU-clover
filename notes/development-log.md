@@ -28979,3 +28979,38 @@ flight 12 条、verdict 64 条、kernel 环 512 行全部是 boot 125 写的。*
 - **R-C**：`bbset2` 在而 `n=0` ⇒ set 存在但没有成员（空集），与「非空但没人投递」是两种故障。
 - **R-D**：`bbhop` 的 `cont=` 若四枚同一函数，则四跳走同一等待路径；若分叉，结合 `pc=`（宿主用共享缓存切片把用户地址
   落到函数名）可把主 runloop 线程与辅助接收线程分开。`debt+unread==cand` 是每行自带的算术控制。
+
+## Round346 读数（boot 126：两个 port set 打开，第三跳是没人能投递的真端口）
+
+**这一靴。** 冷刷 `round346-v0.7.63-payload.img`（`a718621e…`），引导计数 125→126，flight/verdict/kernel 环全由 126 写；
+8 核在线（`r271 real=8 … run=8`、`r299 smp run=7`）。t≈557 s 后无 I/O，随后**静默复位回 fastboot**（misc 无内核 BCB，
+宿主脚本按既有规矩自己写 BCB 进 TWRP 读回；未到 1800 s 死线）。与 boot 125 同一停点形状。
+
+**hop 表（t=562，pid=58，hn=3，cand=3 debt=1 unread=2 —— 三者相加成立）。**
+
+| hop | tid/state | nm | 翻译 | cont | 读数 |
+|---|---|---|---|---|---|
+| 0 | 415 / WAIT | `4303` | set | `fffffff0072622ac` | 3 成员：`5103` sr=1、`4403` sr=1、`5203` sr=1，**q 全 0** |
+| 1 | 418 / WAIT | `7103` | set | `fffffff0072622ac` | 7 成员：`6c07` sr=**0**、`6813` sr=1、`6a07` sr=1、`ff07` sr=1、`e377` sr=1、`9203` sr=**6**、`de13` sr=2，**q 全 0** |
+| 2 | 4e0 / **RUN** | `a903` | port | `0` | `obj=fffffff35bd97200`，`sr=0 q=0`，`scan=no_srights`，`ownnames=1`（`ty=recv raw=3020000 ur=0`，backboardd 自己持收权），`probed=137 scanned=137 hits=0` |
+
+**逐条判读。**
+1. **`cont=fffffff0072622ac` 就是 `_ipc_mqueue_receive_continue`**（本轮内核 `nm` 当场量的地址）。hop 0/1 是接收线程这件事，
+   从寄存器落到了符号名上，不再靠 hop 顺序猜。
+2. **`bbset2` 的 `n=/all=` 与 `bbsm` 行落地**：两个 set 不是空的（3 与 7 个成员），`all=n`（没有截断）。
+3. **`match=0` 是「wait_event 已被清 0」的读数，不是「这不是收方」**：两枚线程的 `we=0` 而 `cont=` 非零 ⇒ 采样时它们已被唤醒、
+   正走向 continuation；`r229` 同一行里 state=1（WAIT）。所以 match 这一列在本靴表达的是「线程已不在 waitq 上」，
+   而 continuation 才是「它从哪条等待路径回来」的证据。**预登记 R-A 的 match=1 没有成立，成立的是它的主体（成员表）。**
+4. **第三跳换了性质**：hop 2 是**真的 receive 口**（`e=0`、owner `58:backboardd` 无 `+ps`），但 `sr=0` 且 137 个进程里 0 个持有发送权
+   ⇒ **没有人能往这个口投递**；它的 `cont=0`/state=4 说明线程当时在 trap 里运行（不是阻塞），这也解释了它为何是 `e=0`。
+5. **`debt`/`unread` 拆开之后**：`debt=1` 是 hop 2（翻译成功、队列空），`unread=2` 是两个 set，`cand=3`。boot 125 的 `debt=4`
+   在这个口径下不会再出现——那四个零被分成「两次没读到 + 一次/两次空队列」。
+6. **集合是每靴重建的**：boot 125 的 hop 0 名 `5203`，在 boot 126 成了 set `4303` 的成员；boot 125 的 `4303/7103/8403` 也不是
+   本靴的 set 名。名字空间里的编号不能跨靴比。
+7. **对 #666 的题面**：这里不是「没有发送权」，而是「**有发送权、没人发**」——10 个成员端口里 9 个 `sr>0`（`9203` 有 6 枚），
+   但 10 个队列全空；唯一没人能发的口（`a903`）是 backboardd 自己的收口。下一问应落在**成员**上：谁持有这些 `sr>0` 端口的
+   发送权（复用 `clover_port_hash_holders`），以及它们的 `ip_mscount`（这枚发送权是否曾经被制造/传递过）。
+
+**预登记四支的落点。** **R-A 主体成立、两支偏离**（`n≥1`、`bbsm` 在场；`debt=1` 而非 0、`match=0` 而非 1，理由见上）。
+**R-B 不成立**（没有 `xlate` 行）。**R-C 不成立**（`n=3/7`，不是空集）。**R-D 成立且比预登记更细**：hop 0/1 同一 continuation，
+hop 2 无 continuation——分出的不是「主/辅接收线程」，而是「阻塞在接收」与「在 trap 里运行」。
