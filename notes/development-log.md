@@ -29312,3 +29312,30 @@ backboardd 自己。② 每个 trap 线程都开了：chronod 两枚（`1f03/330
 **#666 的下一问（收窄后的原题）。** 「谁该叫醒 SpringBoard 的收口」的答案在这帧是：没有第二个 *send right* 持有者，
 但有一枚 **send-once** 权（`so=1`）在反查表之外。send-once 是 iOS 里一次性回复（MIG reply / 事件回调）的典型持有形式；
 点名它的持有者是下一支仪器（r352：对每个 task 的整张 entry 表做 object 匹配，只收 SEND_ONCE 类型）。
+
+## Round352：跨全部空间点名 SEND_ONCE 持有者
+
+**为什么。** boot 132 的 `holdrnow` 把 SpringBoard 的 `903` 读成 SEND|RECEIVE 自持（`raw=0x3430001 ur=1`），
+但同一行 `so=1`：还有一枚 send-once 权。反查哈希的注释与实现都只收纯 send（receive/send-once/port-set/dead-name 不进表），
+r351 的整表扫描只看 holder 自己那一个空间，所以这枚一次性权的持有者对两条腿都是盲区。
+
+**改动（`patches/xnu/…-clover-r352.patch`，接在 r351 之后）。**
+- 新增 `clover_port_once_holders(obj, …)`：对 pid 1..400 的每个 task，`is_read_lock`→`smr_ipc_enter`→遍历整张 entry 表，
+  取 `ie_volatile_object == obj` 且 `IE_BITS_TYPE & MACH_PORT_TYPE_SEND_ONCE` 的条目，记 pid/name/raw/comm；
+  `hits/probed/scanned` 分开，封顶不能看起来像「没有」。
+- `clover_bb_holder_door()` 的 port 分支在 `io_unlock` 前 `io_reference(obj)`（translate 不带引用），解锁后跑扫描，
+  行尾加 `once= och= ocp= ocs=`；新增 `clover r352: onceh t= pid= j= hpid= c= nm= ty= raw=`（最多 4 枚），打印完 `io_release(obj)`。
+- driver：tee 类 `r352-onceh`(64)，token `r352` 进每-pass 豁免链。
+- 宿主闸门 11 条负测（补丁缺席/字节/系列缺席/顺序、掩码行、onceh 行、旧行删除、release、tee 类、豁免、标题）逐条红并逐字节还原。
+
+**构建。** 146 枚补丁重放 → prelink `adec5357…` → amfi `410c8cdd…`（两刀 VA 不变）→ normalized `1cabfb4a…`（973 戳）→
+`round352-v0.7.69-payload.img` `d2861fe9…`（58,720,256 B）；payload.json kernel `1cabfb4a…`、payload_kernel `81b5ecc3…`、
+adt `96093cb3…`。双闸门绿（51 OK/0 FAIL，`r352-onceh`、`r350-holdrn` 在场）；负测 11 绿
+（`~/clover-out/round352-negatives.log`）。补丁两仓同字节 `acec0e1a…`。
+
+**预登记：boot 133（r352 镜像）的三支判读。**
+- **Y-A**：`holdrn` 的 `903` 行 `once>=1`，且 `onceh` 点名一个 **不是 pid 27** 的持有者（进程名可读）⇒ 一次性回复的
+  持有者被找到；该名字就是「谁该叫醒 SpringBoard 的收口」的答案，下一步问它为什么还没发。
+- **Y-B**：`once>=1` 但 `onceh` 0 行（`ocs`=400 而 `och=0`）⇒ 该权在 pid 400 之外或已随消息在途；下一步扩 cap 或读在途描述符。
+- **Y-C**：`903` 行 `once=0`（与 132 的 `so=1` 不符）⇒ send-once 已被消费或行取自另一相位；控制腿是 `holdrn` 行数、
+  `holdth` 行数与 132 同比，以及 `bbsend/bbset2` 形状。

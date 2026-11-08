@@ -1,0 +1,162 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12394,6 +12394,90 @@
+  * the way round266's stack walks do.
+  */
+ #define CLOVER_BB_SEMA_PROBE 400
++
++/*
++ * Round352. Both r331 legs are blind to SEND_ONCE by construction: the reverse hash indexes pure send
++ * entries only (its own comment says receive, send-once, port-set and dead-name are not entered), and
++ * r351's own-table scan looked at the waiter's one space. Boot 132 read SpringBoard's receive name as
++ * SEND|RECEIVE with its own single send right (raw 0x3430001, ur=1) while ip_sorights=1, so the only
++ * remaining candidate wake source is a send-once right held in some other space. This walks every
++ * process's entry table for names whose object is this port and keeps the SEND_ONCE ones, so the
++ * one-shot holder becomes a name instead of an inference. probed= and scanned= are separate from
++ * hits= so a cap cannot look like a no, the same honesty pair the hash leg prints.
++ */
++static void
++clover_port_once_holders(ipc_object_t obj, uint32_t *pidv, uint32_t *nmv, uint64_t *bitsv,
++    char *cnmv, uint32_t max, uint32_t *hits, uint32_t *probed, uint32_t *scanned)
++{
++	struct proc *pp;
++	task_t task;
++	ipc_space_t space;
++	ipc_entry_table_t table;
++	ipc_entry_t base;
++	uint32_t size;
++	uint32_t pid;
++	uint32_t i;
++	char comm[16];
++	extern struct proc *proc_find(int pid);
++	extern task_t proc_task(struct proc *p);
++	extern int proc_rele(struct proc *p);
++
++	*hits = 0;
++	*probed = 0;
++	*scanned = 0;
++	for (pid = 1; pid <= CLOVER_BB_SEMA_PROBE; pid++) {
++		pp = proc_find((int)pid);
++		if (pp == NULL) {
++			continue;
++		}
++		(*probed)++;
++		task = proc_task(pp);
++		if (task == TASK_NULL) {
++			proc_rele(pp);
++			continue;
++		}
++		space = task->itk_space;
++		if (space == IPC_SPACE_NULL) {
++			proc_rele(pp);
++			continue;
++		}
++		(*scanned)++;
++		is_read_lock(space);
++		if (is_active(space)) {
++			smr_ipc_enter();
++			table = smr_entered_load(&space->is_table);
++			if (table != NULL) {
++				base = ipc_entry_table_base(table);
++				size = (uint32_t) ipc_entry_table_count(table);
++				for (i = 0; i < size; i++) {
++					if (base[i].ie_volatile_object != obj) {
++						continue;
++					}
++					if ((IE_BITS_TYPE(base[i].ie_bits) &
++					    MACH_PORT_TYPE_SEND_ONCE) == MACH_PORT_TYPE_NONE) {
++						continue;
++					}
++					comm[0] = '\0';
++					if (proc_name_address(pp) != NULL) {
++						strlcpy(comm, proc_name_address(pp),
++						    sizeof(comm));
++					}
++					if (*hits < max) {
++						pidv[*hits] = pid;
++						nmv[*hits] = (uint32_t) MACH_PORT_MAKE(i,
++						    IE_BITS_GEN(base[i].ie_bits));
++						bitsv[*hits] = (uint64_t) base[i].ie_bits;
++						strlcpy(cnmv + (*hits * 16), comm, 16);
++					}
++					(*hits)++;
++				}
++			}
++			smr_ipc_leave();
++		}
++		is_read_unlock(space);
++		proc_rele(pp);
++	}
++}
+ 
+ /*
+  * Round271. Eight because that is what the ADT declares for this board and what round270's
+@@ -12703,6 +12787,13 @@
+ 	char hc[64];
+ 	uint32_t on[4];
+ 	uint64_t ob[4];
++	uint32_t sp[4];
++	uint32_t sn[4];
++	uint64_t sb[4];
++	char sc[64];
++	uint32_t once = 0;
++	uint32_t once_probed = 0;
++	uint32_t once_scanned = 0;
+ 	uint32_t k;
+ 	int ty = -1;
+ 	char row[256];
+@@ -12741,7 +12832,14 @@
+ 		    &scanned, &selfhit);
+ 		clover_space_obj_names(space, obj, on, ob, 4, &matches, &entries);
+ 		own = matches;
++		/*
++		 * The SEND_ONCE walk runs after the object lock is dropped, so the scan takes its own
++		 * reference while the object is still locked and active (translate returns no ref).
++		 */
++		io_reference(obj);
+ 		io_unlock(obj);
++		clover_port_once_holders(obj, sp, sn, sb, sc, 4, &once, &once_probed,
++		    &once_scanned);
+ 	} else if (io_otype(obj) == IOT_PORT_SET) {
+ 		ipc_pset_t pset = (ipc_pset_t)obj;
+ 
+@@ -12757,10 +12855,11 @@
+ 	}
+ 	len = snprintf(row, sizeof(row),
+ 	    "clover r350: holdrn t=%llu hop=%d i=%u j=%u pid=%d rn=%x ty=%d o=%llx"
+-	    " q=%u sr=%u ms=%u so=%u own=%u hits=%u probed=%u scanned=%u n=%u\n",
++	    " q=%u sr=%u ms=%u so=%u own=%u hits=%u probed=%u scanned=%u"
++	    " once=%u och=%u ocp=%u ocs=%u n=%u\n",
+ 	    (unsigned long long)secs, hop, i, j, pid, rn, ty,
+ 	    (unsigned long long)(uintptr_t)obj, q, sr, ms, so, own, hits, probed, scanned,
+-	    members);
++	    once, once, once_probed, once_scanned, members);
+ 	if (len > 0) {
+ 		row[sizeof(row) - 1] = '\0';
+ 		clover_emmc_probe_say(row, (unsigned int)strlen(row));
+@@ -12797,6 +12896,25 @@
+ 			printf("%s", row);
+ 		}
+ 	}
++	/*
++	 * Round352. The one-shot holders the two send-right legs cannot see. `hips` is in the row as
++	 * once/och/ocp/ocs; these rows name each one so the candidate waker is a process, not a count.
++	 */
++	for (k = 0; ty == 0 && k < once && k < 4; k++) {
++		len = snprintf(row, sizeof(row),
++		    "clover r352: onceh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s raw=%llx\n",
++		    (unsigned long long)secs, pid, j, sp[k], sc + k * 16, sn[k],
++		    clover_right_type_word((ipc_entry_bits_t)sb[k]),
++		    (unsigned long long)sb[k]);
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
++	}
++	if (ty == 0) {
++		io_release(obj);
++	}
+ }
+ 
+ /*

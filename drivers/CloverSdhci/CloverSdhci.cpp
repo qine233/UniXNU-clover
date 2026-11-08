@@ -1247,6 +1247,10 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r351: bbsmown", "r351-bbsmown", 64, 0, 0, 0 },
   { "clover r351: holdrnow", "r351-holdrnow", 64, 0, 0, 0 },
 
+  // Round352 walks every task's entry table for names whose object is the door and keeps the
+  // SEND_ONCE ones, which neither the reverse hash nor the owner's one-space scan indexes.
+  { "clover r352: onceh", "r352-onceh", 64, 0, 0, 0 },
+
   // Round349 follows each named holder into its own task in the same fire: `holdth` is the
   // per-task summary (threads, waiters, runners, trapped) and `holdt` at most two trapped threads
   // with their receive name, send destination and continuation. Six holders per fire at most, so
@@ -4957,6 +4961,9 @@ static void teeConsumeLine (uint32_t &pushed)
        // SEND|RECEIVE entry, so the bits row turns "own=1 hits=0 sr=1" into a self-send or an
        // invisible holder. Exempt for the same reason as the pair they explain.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r351") ||
+       // Round352's once-holder rows are the answer half of the r351 note: the row says how many
+       // SEND_ONCE names point at the door and these name them, so a full pass must not split them.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r352") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is

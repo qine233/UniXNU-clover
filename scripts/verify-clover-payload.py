@@ -1350,8 +1350,8 @@ def check_sb_sample(kernel: bytes) -> bool:
              # Round350 opens the port the holder is receiving on: holdrn is that port (or set) with
              # its counters, holdrnh the holder names.
              "r350-holdrn": (b"clover r350: holdrn t=%llu hop=%d i=%u j=%u pid=%d rn=%x ty=%d o=%llx"
-                             b" q=%u sr=%u ms=%u so=%u own=%u hits=%u probed=%u scanned=%u n=%u\n")
-                            in kernel,
+                             b" q=%u sr=%u ms=%u so=%u own=%u hits=%u probed=%u scanned=%u"
+                             b" once=%u och=%u ocp=%u ocs=%u n=%u\n") in kernel,
              "r350-holdrnh": (b"clover r350: holdrnh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s\n")
                              in kernel,
              # Round351 prints the bits of every name the waiter's own table points at the port
@@ -1360,6 +1360,9 @@ def check_sb_sample(kernel: bytes) -> bool:
                               b"ur=%u\n") in kernel,
              "r351-holdrnow": (b"clover r351: holdrnow t=%llu pid=%d j=%u i=%u nm=%x ty=%s "
                                b"raw=%llx ur=%u\n") in kernel,
+             # Round352 names the SEND_ONCE holders the two send-right legs cannot index.
+             "r352-onceh": (b"clover r352: onceh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s "
+                            b"raw=%llx\n") in kernel,
              "r331-scan-own-only": b"own_only" in kernel,
              "r331-scan-hash-only": b"hash_only" in kernel,
              "r331-scan-no-holder": b"no_holder" in kernel,
