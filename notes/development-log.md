@@ -29098,3 +29098,35 @@ EXIT=0，51 OK / 0 FAIL（行针脚与 r347 相同，因为格式串没变）。
 - **F-B**：`bbsmhold` 没出现而 `bbsmh` 齐全 ⇒ 不是崩溃，而是 tee 预算/过滤把它吃了；用同一帧的 `r331: bbsh`
   （若 hit>0）作对照。
 - **F-C（控制）**：卡上不再有 `clover r289: abt` 的新记录；若仍有，PC/FAR 必须与 127 不同（同一缺陷复现则说明修错）。
+
+## Round347 读数补（boot 128：r348 修复后普查跑完，holder 名单落地）
+
+**这一靴。** 冷刷 `round348-v0.7.65-payload.img`，计数 127→128，`hn=3`（两 set + 一个真口）：`cand=3 debt=1 unread=2`，
+`r262 census pid=58 threads=19 wait=17 run=2`、8 核在线。**卡上没有任何新的 `clover r289: abt`**（F-C 成立）。
+
+**两个 set 与成员（r346 bbset2 + r347 bbsmh/bbsmhold，t=766）：**
+
+| set | 成员读数 |
+|---|---|
+| `4e03`（3） | 全部 `q=0 sr=1 ms=1 own=1 hits=0`（backboardd 自己的空间各持一枚，制造过一次） |
+| `6303`（7） | `6803` 0/1/1/1/0；**`9103` 0/6/0/1/5**；`ec03` 0/1/1/1/0；`cd07` 0/1/1/1/0；**`e003` 0/2/1/1/1**；`2d0b` 0/1/1/1/0；（另有一成员 `sr=0`，无 bbsmh） |
+
+`bbsmhold` 名单（这是上一轮崩溃丢掉的那一列，现在读到了）：
+
+```
+r347: bbsmhold hop=1 i=2 j=0 pid=1   c=launchd       nm=11f03 ty=send raw=10000
+r347: bbsmhold hop=1 i=2 j=1 pid=27  c=SpringBoard   nm=7003  ty=send raw=10000
+r347: bbsmhold hop=1 i=5 j=0 pid=177 c=com.apple.datam nm=2d17 ty=send raw=10000
+```
+
+第三跳 `650f` 仍是真 receive 口，`sr=0`、145 个进程里 0 个持有发送权。
+
+**判读。**
+1. **F-A 成立**：普查跑完，全部 `sr>0` 成员都有 `bbsmh`，重门 `9103` 的 4/5 个 holder 中读到 2 个（上限 2 行），
+   `e003` 的 1 个 holder 读到；`own=1` 说明 backboardd 自己的空间里也有一个名字指向它。
+2. **#666 的直接线索**：**SpringBoard（pid 27）持有 backboardd 的 `9103` 门的发送权**（它空间里的名字是 `7003`，
+   右类型 `send`）；launchd 也持有一枚。`9103` 的 `ip_mscount=0` 而 `sr=6`——六枚发送权、制造计数为零，
+   这与「制造过一次的门」（其它成员 `ms=1`）是两种历史。
+3. **下一问因此变成**：SpringBoard 有这个门却**没有投递**——是它自己卡在别处，还是它根本不知道要发？
+   下一轮应在同一拍里采样**持有者**（pid 27 / pid 1 / pid 177）的线程：它们各自在等什么、continuation 是什么、
+   是否有 `mach_msg2` 的远端名等于 `7003`。这把「门有钥匙」推进到「钥匙在谁手里、那个人当时在做什么」。
