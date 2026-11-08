@@ -29463,3 +29463,44 @@ cpu 收 ArmCpu+ArmDTPlatform，packaging 收 DarwinBoot+XnuPrelink。validate �
 两个 checker 欠 diagnostics/firmware/packaging，而 `patches/xnu/**` 整个无主——firmware 区现在认领它
 （series 行加载的就是那份拷贝）。每区补一条 r354 findings 结清，读数在
 `~/clover-out/round354-porting-debt.log`，末次 `check --base v0.7.70` EXIT=0（13 areas）。
+
+## Round354 读数（boot 134）：burst 跑完，Y-A 成立——SEND_ONCE 持有者是 backboardd
+
+**刷写与落点。** 冷刷 cache（`round354-v0.7.71-payload.img`，58,720,256 B，写 1.775 s）→ `fastboot reboot` →
+板子自行复位落 fastboot（misc 无 recovery 命令）→ 宿主写 BCB → TWRP adb → 读卡，timeline `close:adb`，
+boot 计数 sector＝**134**。产物：`~/clover-out/clover-log-window.bin{,.txt,.timeline.txt}`、
+`/tmp/r354-flash-boot134.log`。
+
+**第一腿：burst 跑完（成立）。** `bbnow` 恢复（`t=1597 pid=58 fired=1 hn=4 state=hop_unresolved`），
+r346 `bbhop/bbset2/bbsm`、r350 `holdrn`、r351 `holdrnow/bbsmown`、r352 `onceh` 全部在场；全文 **0 枚 abt**；
+`tee lines: 512 stamped=512 glued=0`。boot 133 的栈溢出不再现——5344 B 单帧＋12.8 KB 最深链的预算在真机上成立。
+
+**第二腿：Y-A 成立。** SpringBoard 那枚收口本靴名 **a03**（boot 132 叫 903；名字每靴变，认的是
+`pid=27`＋`sr=1 ms=1 so=1 own=1` 这组形状，本靴 pid=27 的 holdrn 只此一行）：
+
+```
+clover r350: holdrn t=1597 hop=2 i=2 j=1 pid=27 rn=a03 ty=0 o=fffffff36469c660 q=0 sr=1 ms=1 so=1 own=1 hits=0 probed=167 scanned=167 once=1 och=1 ocp=167 ocs=167 n=0
+clover r352: onceh t=1597 pid=27 j=1 hpid=58 c=backboardd nm=c46b ty=sendonce raw=6b840001
+```
+
+`once=1 ≥ 1`，`onceh` 点名 **hpid=58 backboardd**（非 pid 27，进程名可读），`ocs=167=probed=scanned` ⇒
+167 个 task 全扫完、无截断，`och=1` 恰一枚持有者。**「谁该叫醒 SpringBoard 的收口」的答案：backboardd
+持着那枚一次性回复权（它自己空间里叫 c46b），还没发。** 按 r352 预登记，下一问＝它为什么还没发。
+
+**同帧附带两笔（记名，都不是预登记问题）。**
+- pid=174（`com.apple.datam`，r347 `bbsmhold` 点名）的 `rn=2903` 也 `once=1 och=1`，onceh 点名
+  **hpid=400 `com.apple.migra`**（`nm=2b03 ty=sendonce raw=3840001`）——第二枚一次性回复权在 migration 系手里。
+- pid=57 `rn=1107`：`so=1` 但 `once=0 och=0 ocs=167`——端口对象上有 send-once 计数而 167 个空间的
+  entry 表都没有这枚权 ⇒ 它在任何任务表之外（在途消息里，或已消费而对象计数未减）。这一支不是本轮题面，记名不判。
+
+**与 backboardd 自身读数拼起来。** 同拍 `bbnow state=hop_unresolved named=0 asked=1 o3=fail r3=720b`；
+`bbsend hop=3 nm=6903 obj=fffffff36463b4c0 e=0 sr=0 q=0 scan=no_srights walked=341 cand=4 debt=1 unread=3`。
+⇒ 链是 **SpringBoard ←(sendonce c46b) backboardd ←(hop_unresolved) 下一跳**：backboardd 不是「忘了发」，
+是它自己也卡在别人身上。r355 的题面收窄为：backboardd 欠的那一跳（`no_srights`／`cand=4 debt=1 unread=3`）是谁。
+
+**显示主线同拍没变。** `dispstate fires=56 client=pid58 fc=0x235`，selector 6 仍 `e00002d5`/`00000000` 交替、
+`vs=0/0/0`（#666 题面不动：帧在退休、桌面没进）。
+
+**这一靴怎么结束。** 卡上死线记录仍属 boot 108、两枚 panic marker 全 STALE（124/87）⇒ boot 134 没进
+panic sink、没到 1800 s 死线就自行复位落 fastboot；flight 最新 entry t=1595680 ms、最新 beat t=1526022 ms
+（gap 69.7 s）。复位来源那一腿不在本轮判据里，沿用 r339 线的既有题面。
