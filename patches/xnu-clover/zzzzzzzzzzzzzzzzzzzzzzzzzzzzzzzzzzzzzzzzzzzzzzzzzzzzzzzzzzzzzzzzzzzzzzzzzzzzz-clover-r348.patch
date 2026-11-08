@@ -1,0 +1,20 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12804,7 +12804,7 @@
+ 			    "clover r347: bbsmhold t=%llu hop=%d i=%u j=%u pid=%u c=%s"
+ 			    " nm=%x ty=%s raw=%llx\n",
+ 			    (unsigned long long)secs, hop, i, j, hp[j],
+-			    hc[j * 16], hn[j],
++			    hc + j * 16, hn[j],
+ 			    clover_right_type_word((ipc_entry_bits_t)ht[j]),
+ 			    (unsigned long long)ht[j]);
+ 			if (len > 0) {
+@@ -12931,7 +12931,7 @@
+ 	for (i = 0; i < hits && i < CLOVER_BB_SEND_MAX; i++) {
+ 		len = snprintf(row, sizeof(row),
+ 		    "clover r331: bbsh t=%llu i=%u pid=%u c=%s nm=%x ty=%s raw=%llx\n",
+-		    (unsigned long long)secs, i, hp[i], hc[i * 16], hn[i],
++		    (unsigned long long)secs, i, hp[i], hc + i * 16, hn[i],
+ 		    clover_right_type_word((ipc_entry_bits_t)ht[i]),
+ 		    (unsigned long long)ht[i]);
+ 		if (len > 0) {

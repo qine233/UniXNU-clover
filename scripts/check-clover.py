@@ -3626,6 +3626,54 @@ def check_board(errors: list) -> str:
                           "bbsmhold would leave 'the member has a key holder' indistinguishable from "
                           "'nobody was found', which is the half-pair r249 refuses")
 
+        # Round348. Boot 127 printed the first holder row and then aborted in ___doprnt at FAR 0x6c:
+        # bbsmhold passed hc[j * 16], one character, where %s needs the address. The same latent shape
+        # sat in r331's bbsh row and had never printed because its hits were zero on every earlier
+        # boot. This gate exists so a later edit cannot put the element form back: the patch must
+        # remove both element-form arguments and add both address forms, and no added line may carry
+        # the element form again.
+        r348_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r348.patch")),
+                         default=None)
+        if r348_patch is None or not r348_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r348.patch is missing: the argv fix that keeps "
+                          "the holder census from aborting in ___doprnt is this round's only hand")
+        else:
+            r348_name = r348_patch.name
+            r348_lines = r348_patch.read_text().splitlines()
+            load_r348 = REPO.parent / "UniXNU" / "patches" / "xnu" / r348_name
+            if not load_r348.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r348_name} is missing: unixnu loads patches from "
+                              "there, and this repo's copy only ever names the round")
+            elif load_r348.read_bytes() != r348_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r348_name} is not the same bytes as this repo's "
+                              "copy: the shipped image would carry a different argv than the one checked")
+            series_text = (REPO / "patches/xnu/series").read_text()
+            series_line = f"arch:../../../patches/xnu/{r348_name}"
+            r347_prev = max((p.name for p in (REPO / "patches/xnu-clover").glob("*-clover-r347.patch")),
+                            default="")
+            if series_line not in series_text:
+                errors.append(f"patches/xnu/series does not apply {r348_name}: the fix exists and the "
+                              "kernel would be built without it")
+            elif r347_prev == "" or series_text.find(r347_prev) < 0:
+                errors.append("patches/xnu/series no longer applies r347: r348 edits the arguments r347 "
+                              "added, so the series cannot be read as the ordered history assumed here")
+            elif series_text.find(series_line) < series_text.find(r347_prev):
+                errors.append("patches/xnu/series applies r348 before r347: there is nothing to fix yet")
+            r348_added = [line[1:] for line in r348_lines if line.startswith("+")]
+            r348_removed = [line[1:] for line in r348_lines
+                            if line.startswith("-") and not line.startswith("--- ")]
+            for fixed in ('hc + j * 16', 'hc + i * 16'):
+                if not any(fixed in line for line in r348_added):
+                    errors.append(f"the r348 patch does not add {fixed!r}: the %s argument stays an "
+                                  "integer and ___doprnt dereferences it as an address")
+            for bug in ('hc[j * 16],', 'hc[i * 16],'):
+                if not any(bug in line for line in r348_removed):
+                    errors.append(f"the r348 patch does not remove {bug!r}: the element-form argument "
+                                  "this round was built to take out is still in the tree")
+                if any(bug in line for line in r348_added):
+                    errors.append(f"the r348 patch still adds {bug!r}: a char where %s needs a pointer "
+                                  "is exactly boot 127's FAR 0x6c")
+
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
         # its own ending, so a silent boot leaves the boot before it on the card and the reader called
@@ -7351,8 +7399,8 @@ def check_board(errors: list) -> str:
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
     # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
     # the menu names round347.
-    if not board["payload"]["title"].startswith("clover r347:"):
-        errors.append('[payload] title is not "clover r347: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r348:"):
+        errors.append('[payload] title is not "clover r348: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -9506,8 +9554,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r347:"):
-        errors.append('[payload] title is not "clover r347: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r348:"):
+        errors.append('[payload] title is not "clover r348: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
