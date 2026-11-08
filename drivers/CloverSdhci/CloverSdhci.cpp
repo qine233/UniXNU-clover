@@ -1248,6 +1248,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r349: holdth", "r349-holdth", 64, 0, 0, 0 },
   { "clover r349: holdt", "r349-holdt", 64, 0, 0, 0 },
 
+  // Round350 opens the port the first trapped holder is receiving on: `holdrn` is that port's queue,
+  // send rights, make-send count, own names and two reverse-hash counts; `holdrnh` the holder names.
+  // They ride the same burst, one pair per holder sample at most.
+  { "clover r350: holdrn", "r350-holdrn", 64, 0, 0, 0 },
+  { "clover r350: holdrnh", "r350-holdrnh", 64, 0, 0, 0 },
+
   // Round329 publishes the display client's state on the display's own 30 s beat; round344 (#695) makes that
   // row name the record it picked (`pick=`) and adds a per-record row, so the heads below are r344's for both
   // display families and r343's only for the swap row. Order matters and is the only defence: within a family
@@ -4937,6 +4943,9 @@ static void teeConsumeLine (uint32_t &pushed)
        // Round349's holder samples are the second half of the r347 statement: the name without what
        // its owner is doing is exactly the "who, not why" shape this port keeps paying for.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r349") ||
+       // Round350's pair names who could wake the holder; both halves print together or the name has
+       // no counterpart, which is the half-pair r249 refuses.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r350") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is

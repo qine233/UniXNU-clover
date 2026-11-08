@@ -29178,3 +29178,34 @@ com.apple.datam，分别持 `13b03` / `3807` / `2e03` 的发送权），三行 `
 4. **#666 的新题面**：SpringBoard 有 backboardd 的钥匙，但它自己**停在 `1e03` 这个收口上等人叫醒**。下一问不再是
    「SpringBoard 为什么不发」，而是「**谁应该叫醒 SpringBoard 的 `1e03`**」——把同一个 holder 普查（r331 的两条腿）
    套到 `rn` 指向的那个口上，读出发送权持有者与 `ip_mscount`。
+
+## Round350：把 holder 普查套到它自己的收口上
+
+**为什么。** boot 129 的三行 `holdt` 说明持钥者都在自己的接收里：SpringBoard 唯一 trap 线程 `rn=1e03`、
+`cont=ipc_mqueue_receive_continue`、`rem=4203`（不是它持的 door `3807`）。「谁该叫醒 1e03」才是下一问。
+
+**改动（`patches/xnu/…-clover-r350.patch`，接在 r349 之后）。**
+- 新增 `clover_bb_holder_door(task, pid, hop, i, j, rn, secs)`：在**holder 自己的空间**按
+  RECEIVE→SEND→PORT_SET 翻译 `rn`；port 读 `q/sr/ms` 并跑 r331 两条腿，set 只数成员（`waitq_set_foreach_member_locked`
+  计数，不展开），其它类型只报 `ty`；翻译失败印 `e=<kr>`。
+- 行：`clover r350: holdrn t= hop= i= j= pid= rn= ty= o= q= sr= ms= own= hits= probed= scanned= n=` 与
+  `clover r350: holdrnh t= pid= j= hpid= c= nm= ty=`（最多两枚 holder）。
+- `clover_bb_holder_sample()` 在解锁前 `task_reference(task)`（翻译在锁外做），打印完 `holdt` 后用第一枚 trap 线程的
+  `rn` 调用 `clover_bb_holder_door()`，最后 `task_deallocate()`。
+- driver：tee 类 `r350-holdrn` / `r350-holdrnh`（各 64），token `r350` 进每-pass 豁免链。
+- 宿主闸门 10 条负测（补丁缺席/字节不同/系列缺席/顺序、调用点、reference、行串、tee 类、豁免、标题）逐条按自己理由红并
+  逐字节还原（`~/clover-out/round350-negatives.log`）。
+
+**预登记：boot 130（r350 镜像）的三支判读。**
+- **W-A**：`holdrn` 出现且 `rn` 解析为 port（`ty=0`），给出 `q/sr/ms/own/hits` 与至多两枚 `holdrnh` 名字——
+  这就是「谁应该叫醒 SpringBoard 的 1e03」的候选人清单。
+- **W-B**：`rn` 解析为 set（`ty=1`，`n=` 成员数）⇒ SpringBoard 等的是一组口，下一步要展开 set（与 r346 同一手法）。
+- **W-C（控制）**：`holdrn` 行数 == 有 trap 线程的 `holdth` 行数；`e=` 只在翻译失败时出现；`bbsend` 形状与 128/129 同比。
+
+**r350 构建（含两处 build 坑）。** 144 枚补丁重放 → prelink **第一次编译失败**：`members++` 在 block 内写捕获变量，缺 `__block`；
+补丁改 `__block uint32_t members = 0;` 后，又因第一轮失败留下的 `link.filelist` 指向未产出的 `kern_task.o`，libpthread 归档报
+`Unavailable real kernel imports: ['_current_task']`；随后试图用 checkpoint 内核补符号，反而把 `_pthread_start` 带进“内核名集合”，
+libpthread 把自己的入口改名、链接 `_pthread_start` undefined。**最终的修法**：删掉 checkpoint、删 `startup.o` 让 bootstrap pass
+重编并写回 `startup.o.json`（工具链的既有机制），再正常构建 → prelink `9ab28b77…` → amfi `194588bf…`（两刀 VA 不变）→
+normalized `cb323aa8…`（973 戳）→ `round350-v0.7.67-payload.img`（见上）。仓库 EXIT=0；镜像 EXIT=0、51 组 OK/0 FAIL
+（`r350-holdrn`、`r350-holdrnh` present）。

@@ -1,0 +1,144 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12670,6 +12670,114 @@
+  * are dropped after the rows, because a member can be destroyed between the walk and the asks.
+  */
+ /*
++ * Round350. Boot 129 sampled the key holders and found both of them parked in receives of their own:
++ * SpringBoard's only trapped thread waits on its own name, not on backboardd's door. So the question
++ * moved one step outward again: who is supposed to wake that receive port? This runs the r331 legs on
++ * the port the sampled thread is receiving on, in the holder's own space, and prints its queue, send
++ * rights, make-send count and holder names. A port set is counted (n members) but its members are not
++ * opened here, so one row stays bounded; the translate's kr is printed when it fails.
++ */
++static void
++clover_bb_holder_door(task_t task, int pid, int hop, int i, int j,
++    mach_port_name_t rn, uint64_t secs)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	ipc_space_t space = task->itk_space;
++	ipc_object_t obj = IPC_OBJECT_NULL;
++	kern_return_t kr;
++	uint32_t q = 0;
++	uint32_t sr = 0;
++	uint32_t ms = 0;
++	uint32_t own = 0;
++	uint32_t hits = 0;
++	uint32_t probed = 0;
++	uint32_t scanned = 0;
++	uint32_t selfhit = 0;
++	uint32_t matches = 0;
++	uint32_t entries = 0;
++	__block uint32_t members = 0;
++	uint32_t hp[2];
++	uint32_t hn[2];
++	uint64_t ht[2];
++	char hc[32];
++	uint32_t on[1];
++	uint64_t ob[1];
++	uint32_t k;
++	int ty = -1;
++	char row[256];
++	int len;
++
++	if (space == IPC_SPACE_NULL || rn == MACH_PORT_NULL) {
++		return;
++	}
++	kr = ipc_object_translate(space, rn, MACH_PORT_RIGHT_RECEIVE, &obj);
++	if (kr != KERN_SUCCESS) {
++		kr = ipc_object_translate(space, rn, MACH_PORT_RIGHT_SEND, &obj);
++	}
++	if (kr != KERN_SUCCESS) {
++		kr = ipc_object_translate(space, rn, MACH_PORT_RIGHT_PORT_SET, &obj);
++		if (kr != KERN_SUCCESS) {
++			len = snprintf(row, sizeof(row),
++			    "clover r350: holdrn t=%llu hop=%d i=%u j=%u pid=%d rn=%x e=%d\n",
++			    (unsigned long long)secs, hop, i, j, pid, rn, (int)kr);
++			if (len > 0) {
++				row[sizeof(row) - 1] = '\0';
++				clover_emmc_probe_say(row, (unsigned int)strlen(row));
++				printf("%s", row);
++			}
++			return;
++		}
++	}
++	if (io_otype(obj) == IOT_PORT) {
++		ipc_port_t port = (ipc_port_t)obj;
++
++		ty = 0;
++		q = port->ip_messages.imq_msgcount;
++		sr = port->ip_srights;
++		ms = port->ip_mscount;
++		clover_port_hash_holders(port, task, hp, hn, ht, hc, 2, &hits, &probed,
++		    &scanned, &selfhit);
++		clover_space_obj_names(space, obj, on, ob, 1, &matches, &entries);
++		own = matches;
++		io_unlock(obj);
++	} else if (io_otype(obj) == IOT_PORT_SET) {
++		ipc_pset_t pset = (ipc_pset_t)obj;
++
++		ty = 1;
++		waitq_set_foreach_member_locked(&pset->ips_wqset, ^(struct waitq *wq) {
++			(void)wq;
++			members++;
++		});
++		io_unlock(obj);
++	} else {
++		ty = 2;
++		io_unlock(obj);
++	}
++	len = snprintf(row, sizeof(row),
++	    "clover r350: holdrn t=%llu hop=%d i=%u j=%u pid=%d rn=%x ty=%d o=%llx"
++	    " q=%u sr=%u ms=%u own=%u hits=%u probed=%u scanned=%u n=%u\n",
++	    (unsigned long long)secs, hop, i, j, pid, rn, ty,
++	    (unsigned long long)(uintptr_t)obj, q, sr, ms, own, hits, probed, scanned,
++	    members);
++	if (len > 0) {
++		row[sizeof(row) - 1] = '\0';
++		clover_emmc_probe_say(row, (unsigned int)strlen(row));
++		printf("%s", row);
++	}
++	for (k = 0; ty == 0 && k < hits && k < 2; k++) {
++		len = snprintf(row, sizeof(row),
++		    "clover r350: holdrnh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s\n",
++		    (unsigned long long)secs, pid, j, hp[k], hc + k * 16, hn[k],
++		    clover_right_type_word((ipc_entry_bits_t)ht[k]));
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
++	}
++}
++
++/*
+  * Round349. Boot 128 named the holders of the set members (launchd and SpringBoard hold send rights
+  * to backboardd's door 9103) but a name is still not an explanation. This samples the holder itself
+  * in the same fire: every thread's state, and for the threads in the mach_msg2 trap their receive
+@@ -12756,8 +12864,8 @@
+ 			rows++;
+ 		}
+ 	}
++	task_reference(task);
+ 	lck_mtx_unlock(&task->lock);
+-	task_deallocate(task);
+ 	proc_rele(p);
+ 	len = snprintf(row, sizeof(row),
+ 	    "clover r349: holdth t=%llu hop=%d i=%u j=%u pid=%d door=%x th=%u"
+@@ -12781,7 +12889,16 @@
+ 			clover_emmc_probe_say(row, (unsigned int)strlen(row));
+ 			printf("%s", row);
+ 		}
++	}
++	/*
++	 * Round350 opens the port the first trapped holder is receiving on, so the reader can name who
++	 * holds a send right to that port and whether the right was ever made.
++	 */
++	if (rows > 0 && r_rn[0] != 0) {
++		clover_bb_holder_door(task, pid, hop, i, j,
++		    (mach_port_name_t)r_rn[0], secs);
+ 	}
++	task_deallocate(task);
+ }
+ 
+ #define CLOVER_BB_PSET_MAX 8

@@ -1347,6 +1347,12 @@ def check_sb_sample(kernel: bytes) -> bool:
                              b"wait=%u run=%u m2=%u\n") in kernel,
              "r349-holdt": (b"clover r349: holdt t=%llu hop=%d i=%u j=%u pid=%d tid=%llx st=%x "
                             b"we=%llx cont=%llx pc=%llx rn=%x rem=%x\n") in kernel,
+             # Round350 opens the port the holder is receiving on: holdrn is that port (or set) with
+             # its counters, holdrnh the holder names.
+             "r350-holdrn": (b"clover r350: holdrn t=%llu hop=%d i=%u j=%u pid=%d rn=%x ty=%d o=%llx"
+                             b" q=%u sr=%u ms=%u own=%u hits=%u probed=%u scanned=%u n=%u\n") in kernel,
+             "r350-holdrnh": (b"clover r350: holdrnh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s\n")
+                             in kernel,
              "r331-scan-own-only": b"own_only" in kernel,
              "r331-scan-hash-only": b"hash_only" in kernel,
              "r331-scan-no-holder": b"no_holder" in kernel,
