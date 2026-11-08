@@ -29339,3 +29339,22 @@ adt `96093cb3…`。双闸门绿（51 OK/0 FAIL，`r352-onceh`、`r350-holdrn` �
 - **Y-B**：`once>=1` 但 `onceh` 0 行（`ocs`=400 而 `och=0`）⇒ 该权在 pid 400 之外或已随消息在途；下一步扩 cap 或读在途描述符。
 - **Y-C**：`903` 行 `once=0`（与 132 的 `so=1` 不符）⇒ send-once 已被消费或行取自另一相位；控制腿是 `holdrn` 行数、
   `holdth` 行数与 132 同比，以及 `bbsend/bbset2` 形状。
+
+## Round353（host-only）：无人值守脚本不再能被「无 fastboot 的 misc 写」挂死
+
+**为什么。** r352 冷刷的读回窗口以 `close:neither-edl` 关闭（卡上窗口在，板子复位进了 EDL，
+`~/clover-out/clover-log-window.bin.timeline.txt` 连续 `poll edl`）。在此之前的控制轮（boot 132）暴露了另一个缺陷：
+`watch_after_deadline` 判成「回到 fastboot」后，板子已在检查与写入之间回到 TWRP 的 adb，于是
+`fastboot flash misc` 停在 `< waiting for 81ffcaaa>` **35 分钟**，直到人工终止。无设备的等待不是慢写，不能挂住整个循环。
+
+**改动（`scripts/run-clover-unattended.sh`，无镜像变化）。**
+- 新增 `fb_bounded <secs> <fastboot args>`：`perl -e 'alarm; exec'` 包住 fastboot（SIGALRM 跨 exec 有效；
+  无设备时 3 s 实测 `rc=142` 退出，不再无限等）。
+- 写 misc 前**重查当前模式**：无 fastboot 但 adb 在 ⇒ 打印「已在 recovery，跳过 host BCB，直接读本窗口」并置
+  `SKIP_RECOVERY=1`；两者都无 ⇒ `die 2` 并给出电源键/Vol- 的下一步，不再尝试写。
+- `fastboot flash misc` 限 90 s、`fastboot reboot` 限 60 s；cache 写仍不限时（避免截断一次真正的分区写）。
+- `bash -n` 通过；有界包装用无设备场景实测 3 s 退出。
+
+**boot 133 的状态。** r352 已刷入 cache 并启动，板子在 1800 s 死线前以 **EDL** 落地（timeline 的 close 行）；
+卡上 boot 133 的窗口未被覆盖，读回只差板子回到 TWRP。当前 EDL 持续（`QUSB_BULK_SN:F6548A52` 在 USB 上），
+后台继续轮询；返回 fastboot 即写 BCB 落 TWRP，返回 adb 即 `--skip-recovery` 读卡。
