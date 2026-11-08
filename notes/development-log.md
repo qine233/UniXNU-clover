@@ -29288,3 +29288,27 @@ o3=- r0=0 r1=0 r2=5d0b r3=0`。整靴 `bbset2`/`bbsm`/`bbsmh`/`holdth`/`holdt`/`
 「boot 130 的门链是稳定拓扑，131 是偶发」还是「130 之后拓扑已变」。若 boot 132 仍 `hop_unresolved`，则下一轮把
 fire 条件从「签名变化 + 心跳」扩到逐跳记录 `o=`/`r=`/`state=` 的每次 fire 快照，并让 pset 阶段在 hop 未解析时也印一行自证
 （而不是静默跳过），再谈 X-A…X-C。若 boot 132 复现 130 的形状，则继续判 `holdrnow` 的 bits。
+
+## Round351 读数（boot 132 控制轮）：bits 落地，send-once 浮出
+
+**帧。** 同一枚 `round351-v0.7.68-payload.img` 第二次冷刷（boot 132），门链**复现**，r351 的手执行：
+`bbsend hop0 nm=4703 e=17 scan=pset / hop1 nm=6503 e=17 scan=pset cand=2 debt=0 unread=2`。
+boot 131 的 `hop_unresolved` 因此是**偶发相位**，不是拓扑改变；同一 t≈584/660 的采样在两次靴里落在不同的 mach_msg2 相位。
+
+**X-A（成立，但要加一句）。** SpringBoard `holdrn pid=27 rn=903 ty=0 q=0 sr=1 ms=1 so=1 own=1 hits=0`，
+`holdrnow nm=903 ty=send+recv raw=0x3430001 ur=1`：那 1 枚 send right **就是它自己那条合并条目**，反查哈希看不见它是设计而不是丢失。
+**但 `so=1`**：这个口上还有一枚 **send-once** 权在别处——两条腿（纯 send 哈希、属主整表）都按构造不索引 SEND_ONCE，所以
+「没有外部叫醒者」只能改成「没有外部 *send right* 持有者；有一枚 send-once 持有者尚未点名」。
+
+**X-B（成立）。** `bbsmown hop0 i=1 nm=4903 ty=recv raw=0x3420000 ur=0`（`sr=1` 但自己表里只有收名，`hits=0`）、
+`hop1 i=1 nm=6f0b ty=recv raw=0xb020000 ur=0`：发送权存在且制造过一次，但不在任何 task 的纯 send 条目里——在途消息或内核持有。
+**X-C（成立）。** hop0 三成员混合：`4803 send+recv`、`4903 recv`、`4603 send+recv`；`backboardd` 自己的成员多数是 SEND|RECEIVE 自持。
+
+**新出现的形状。** ① r351 的上限 4 让重门 `hop1 i=3`（`sr=5 ms=0 own=1 hits=4`）**点全了四枚 holder**：
+launchd(pid 1)、SpringBoard(27)、**chronod(110)**、datamigrator(157)；`bbsmown i=3 nm=9703 ty=send+recv ur=1` 说明第 5 枚是
+backboardd 自己。② 每个 trap 线程都开了：chronod 两枚（`1f03/3303`，均 SEND|RECEIVE）、datamigrator 两枚（`2903` SEND|RECEIVE
+与 **`f03` ty=1 set n=4**——r350 预登记的 W-B 分支第一次出现）。③ `holdrn` 行数 == 有 trap 的 `holdth` 行数 × trap 线程数。
+
+**#666 的下一问（收窄后的原题）。** 「谁该叫醒 SpringBoard 的收口」的答案在这帧是：没有第二个 *send right* 持有者，
+但有一枚 **send-once** 权（`so=1`）在反查表之外。send-once 是 iOS 里一次性回复（MIG reply / 事件回调）的典型持有形式；
+点名它的持有者是下一支仪器（r352：对每个 task 的整张 entry 表做 object 匹配，只收 SEND_ONCE 类型）。
