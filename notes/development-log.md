@@ -29756,3 +29756,54 @@ call-site、signature、doc-token、removed-count、tee-class、tee-order、exem
   「读不存在的文件」上；`holdrr` 那段片段同时命中文档注释与行字面量，断言在变异前就拦下。
   两支都已改（还原先看存在性、片段带 `t=%llu` 收到唯一命中），并且循环改成「一支抛异常不带走全轮」，
   还原放进 finally。
+
+**读数（boot 137，`round357-v0.7.77-payload.img` sha `43496d3e…`）。** 证据产物
+`~/clover-out/round357-boot137-decoded.txt`（自 `clover-log-window.bin.txt` 切出），跑日志
+`round357-flash-boot137.log` / `round357-readback-boot137.log`。
+- **闸门①过**：0 枚 abt；t=523 一次火里 bbsend 恰 3 行＝`cand=3`（hop=0 `nm=5203`、hop=1 `nm=6303`
+  都 `e=17 scan=pset`＝`KERN_INVALID_RIGHT`，那两行的 so/ms/once 是 helper 的零，不许当读数；
+  hop=2 `nm=730b obj=fffffff8061326a0 scan=no_srights walked=341 ownnames=1 cand=3 debt=1 unread=2`）；
+  r350 holdrn `pid=27 rn=903 sr=1 ms=1 so=1 once=1 och=1 ocs==ocp=127`＋r352 onceh `hpid=58 c=backboardd`
+  （pid 27 那枚 `nm=cf03`）＝Y-A 第四次复现。r357 的成对性成立：4 枚 distinct `holdrs` 各配 1 枚
+  `holdrr`（各 3 份拷贝，12:12），0 枚 `skip=same`、0 枚 `e=`。
+- **本轮的问题答出来了**：SpringBoard 的 `rem=150b`（`ty=0 q=0 sr=1 ms=0 so=1 once=0`）的 receive 属主
+  读作 `rnm=2507 rstate=0 rpid=58 c=backboardd`。`rstate=0` 是「receiver space 经 `is_task` 落成真任务」，
+  不是内核空间也不是死名；而 r221 那条完全独立的腿在同一靴把同一个名字报成 `ro=58:backboardd`
+  ⇒ **两腿同名才算点名**，这与 boot 134/135/136 靠 onceh 单腿指认相比是多一枚独立证据。
+  陪跑腿各按形状记名：pid=110 `rem=7203`（`q=6 sr=7`）与 pid=151 `rem=4303`（`q=1 sr=2`）都
+  `rstate=2 rpid=-2 c=none`＝口上没有 receiver space（U-D 那一支的形状），但它们不是 SpringBoard 的主腿，
+  不判。
+- **仪器缺陷是自己那一列抓出来的（控制腿按预登记触发）**：四枚主行 `op` 全 `0`。题面把
+  `mach_msg2_trap_args` 的第二槽当作 options，但这块板的 trap unpacking 早在 r264 验过：
+  `x2 = msgh_bits|send_size`、`x3 = remote|local`，**选项字在 x1**（r221 的 `op=` 取 `r[1]`，同靴值是
+  `0x40700420e`/`0x403914207`/`0x200000003` 这类带 0x2 位的字）。所以 `op=0` 的诚实读法只是
+  「bits=0 且 send_size=0」，不能读成「选项字没有发送位」⇒ 按 §Round357 的控制腿，
+  U-A/U-B/U-C 的**字面**判据一律不判。
+- **但同一靴已有数据把实质答了（宿主交叉读，不需新代码）**：
+  `clover r221: sbm2 t=515/526/544 tid=0x12d op=40700420e b=0 sz=0 rem=150b rn=903 ro=58:backboardd`
+  ——同一线程、同一 `rem`，其选项字低 32 位 `0x…e` 的 `MACH_SEND_MSG`(0x1) **为 0**，`sz=0` ⇒
+  这枚 trap **纯收**，`rem=150b` 只是信头里的陪跑名 ⇒ **U-A 的实质成立，rem 腿结案**；
+  `rpid=58` 那一半（U-B 的点名）也成立，但 U-B 要求「op 有发送位 且 rpid==58」，前半不成立，
+  所以记为「U-A 实质／U-B 名字」，不记为某一支完整命中。
+- **环因此定形**：SpringBoard 主线程（tid 0x12d）收在 `rn=903` 上等回信，回复权 `cf03` 在
+  backboardd 手里未发；backboardd 不是「不发」而是自己卡在 hop=2 `nm=730b`（名表 `no_srights`，
+  与 rem 当年同型）。`rem` 不是环的一边。
+- 本靴 ~553 s 后静默复位落 fastboot（卡上死线记录仍 boot 108、panic marker 全 STALE＝没进 sink），
+  二次 `--allow-misc-bcb` 从 TWRP 读卡；tee `512 stamped=506 glued=6`。boot 135/136/137 三靴同型，
+  「静默早复位＋宿主 BCB 读回」已是这条线的常态读法，不是事故。
+
+**下一手（r358 题面，预登记）。** 两支，一支修列、一支问新问题：
+- (a) **修槽位**：`op=` 改从 **x1** 读 option64（r221 的 `r[1]` 已在这块板上验过），把现在误读 x2 的
+  那一列改名 `bs=`（bits|send_size）。两列各指各的生产者，一靴之内自证；行字面量随之重打 r358 标。
+- (b) **问 730b**：把 r357 的 receiver 点名腿（`ip_get_receiver`/`ip_get_receiver_name` ＋ proc_find）
+  打到 **backboardd 自己的 hop 名**上，先 `clover r358: hoprr` 点名 `nm=730b` 那枚口的收方 task。
+  理由：`no_srights` 在 rem 那次也没答出「谁欠谁」，是 receiver 那一问问出来的。
+- **预登记 boot 138（r358 镜像）判读 V-A…V-D**：先判闸门①（0 abt、每火 bbsend 行数＝`cand=`、
+  r350 holdrn 的 `sr=1 ms=1 so=1 once=1 och=1` 形状＋r352 onceh 点名 hpid=58；认形状不认名字），再认
+  `hoprr`：
+  - **V-A**：730b 的收方＝SpringBoard（pid 27）⇒ 自环闭合，backboardd 等的那封信的收方正是等它回信的人；
+    下一手回到「信有没有落进 903 的队列」而不是谁持有权利。
+  - **V-B**：收方是第三个 task ⇒ 环出现新节点，下一手＝对它跑 r355 快照。
+  - **V-C**：`rstate=2`（无 receiver space）⇒ backboardd 等的是死名，下一手看 `ip_newsync`/dead-name 通知。
+  - **控制**：`bs=` 与 `op=`（x1）同靴对不上 r221 的 `b=/sz=/op=` ⇒ 槽位仍未修对，V 一律不判；
+    `hoprr` 缺席而 `bbsend` 在场 ⇒ tee 预算/前缀顺序问题（`hoprr` 必须先于 `bbsend` 之外的同类前缀）。
