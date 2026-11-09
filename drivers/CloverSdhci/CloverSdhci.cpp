@@ -1300,6 +1300,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // 8507. One row per hop per fire, four hops at most, so 64 is the arithmetic bound.
   { "clover r360: rembits", "r360-rembits", 64, 0, 0, 0 },
 
+  // Round361 splits the answer into two rows: remkobj names the port's kernel object family (kotype 29
+  // is an IOKit connect, 30 an IOKit object) and remcall carries the trapped message's header and first
+  // body words, where an io_connect_method selector lives. One pair per hop per fire.
+  { "clover r361: remkobj", "r361-remkobj", 64, 0, 0, 0 },
+  { "clover r361: remcall", "r361-remcall", 64, 0, 0, 0 },
+
   // Round349 follows each named holder into its own task in the same fire: `holdth` is the
   // per-task summary (threads, waiters, runners, trapped) and `holdt` at most two trapped threads
   // with their receive name, send destination and continuation. Six holders per fire at most, so
@@ -5029,6 +5035,9 @@ static void teeConsumeLine (uint32_t &pushed)
        // Round360's rembits row is the answer half of r327's fail: the owner leg said it could not
        // name the destination, this says what the destination is.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r360") ||
+       // Round361's pair is one reading: the object family without the method it is waiting for, or
+       // the reverse, is the half-pair r249 refuses.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r361") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is

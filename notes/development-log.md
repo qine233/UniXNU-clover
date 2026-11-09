@@ -30047,3 +30047,80 @@ pin 全在场）；`check-clover.py` EXIT=0；17 支负测全绿并逐字节还�
   那个 selector；U-B `kotype` 是其他内核对象（如 host/exception/ledger）⇒ 记录该对象并转内核内部等待；
   U-C 读不到 ⇒ 先修读取腿（kobject 不可安全解引用时只印指针，不猜）。
 - 控制：`kotype`/`kobj` 只在 `ent==1 && io_otype==IOT_PORT` 时出现；`rembits` 行数 == `asked=`。
+
+
+## Round361 —— 点名内核对象，以及它在等的方法
+
+**题面。** boot 141 的 `rembits` 把 r360 的 fail 翻成：640b 是普通发送权，收方空间没有 task
+（`rnm=1 rstate=1 rpid=-1 c=kspace`）⇒ 环的最后一跳是**内核对象**，不是用户态对等方。下一问两件：
+(a) 那个对象是什么（`ip_kotype`/`ip_kobject`：`IKOT_IOKIT_CONNECT`=29、`IKOT_IOKIT_OBJECT`=30）；
+(b) 它等的是哪个方法（trap 的消息头＋消息体前两字；`io_connect_method` 的 selector 就是体第 0 字，
+见 `iokit/Kernel/IOUserClient.cpp:5403` 的 `is_io_connect_method(connection, selector, …)`）。
+
+**改动（`osfmk/kern/task.c`）。** `clover_bb_rem_bits` 加 `msg` 参数，新增两行（r360 的 `rembits` 行原样
+保留）：
+- `clover r361: remkobj`：`kotype=/kobj=`＋`sr/so/q/rnm/rstate/rpid/c`（对象族与同一枚口的计数并排）；
+- `clover r361: remcall`：`io=`（copyin 返回码）＋`id/b/sz/rem/loc/vou/m0/m1`（24 字节头＋体前两字）。
+`clover_bb_sample` 的 hop 捕获加 `hmsg[hn] = x[0]` 并把它传给 rem_bits（x[0] 是 r221 一直在用的 msgh
+指针；copyin 在空间锁释放之后跑，失败也出行、只带 `io=`）。删行 5 枚（3 枚注释重排＋签名＋调用点），
+闸门钉住这个数；纯增之外的改动只有这 5 行。
+
+**预登记（boot 142，r361 镜像）。** 先判闸门①（0 abt、每火 bbsend 行数=cand=、r350 holdrn
+`sr=1 ms=1 so=1 once=1 och=1`＋r352 onceh 点名 hpid=58；认形状不认名字）。再判：
+- **U-A**：`kotype=29` 或 `30`（IOKit connect/object）⇒ backboardd 卡在 IOKit user client 上，
+  `m0=` 就是 selector，与 r329 的 `hot=6 → e00002d5` 对表；下一手是补那个方法或它该返回的码。
+- **U-B**：`kotype` 是其他内核对象（host/exception/ledger/thread…）⇒ 记录对象族并转内核内部等待。
+- **U-C**：`io=0` 但 `m0=0`，或 `io!=0` ⇒ 消息读不到或不是 IOKit 形态，先修读取腿，不判。
+- **控制**：`remkobj`/`remcall` 行数 == 同火 r327 的 `asked=`（有 send destination 的 hop 数）；
+  `kotype` 只在 `ent==1 && IOT_PORT` 时出现；`io` 只在 `msg!=0` 时出现；`remcall.id` 应与同线程
+  r221 的 `h=` 头一致；闸门①不过 ⇒ r354 栈判据，不判 U。
+- **栈**：`clover_bb_rem_bits` 仍 noinline；构建后量帧，最深链 <16 KB。
+
+**构建（三遍，同一轮重切）。**
+1. 第一遍在本函数上停机：`ip_kobject(port)` 在本 XNU 里**不是函数**（`ip_kobject` 只是
+   `ipc_port` 的字段），编译报 `call to undeclared function 'ip_kobject'`；改成
+   `port->ip_kobject`（task.c:11905 的既有读法）。这次停机还把 `task.o` 删了，于是下一次
+   `unixnu build kernel` 在 archive-09 撞上 `xnu_symbols.kernel_names` 的
+   `Unavailable real kernel imports: ['_current_task']`（它读 link.filelist 里仍存在的目标文件）——
+   用 `UNIXNU_PATCH_LIST=skip bash scripts/build-xnu-4k-baseline.sh` 单独跑一遍内核 pass 把
+   `task.o` 复原（**注意：直接跑那一遍不带 driver 的 `EXTRA_MAKE_ARGS`，archive 符号会缺，不能当成品**），
+   再走 driver。
+2. 第二遍（payload `1962835b…`，boot 142）读到 `remcall io=14`（EFAULT）两行——`copyin` 用的是
+   **节拍线程自己的 map**，不是被采样任务的 map；同靴 r221 的 `h=` 对 SpringBoard 的地址仍然正常，
+   对 backboardd 的地址就 14，正好把这条分开。改成 `copyinmap(task->map, …)`（task.c:11964 已声明）。
+3. 第三遍（最终）：补丁 md5 `017a64f3a8dfa71a0e3fe77072d90537`（三份同字节，增 46／删 5）；
+   kernel md5 `d358c934` / sha256 `a6b7c255…`（52,482,048 B）；AMFI `ba3b2c7e…`（两刀仍在
+   `0x1af70e4`/`0x1af716c`）；normalize `4f26d10a…`（973 戳）；`round361b-v0.7.82-payload.img`
+   sha256 `ee4b8d21…`（58,720,256 B）。`clover_bb_rem_bits` 帧 0x240、`self_sample` 0x250、
+   `bb_sample` 0x14F0——最深链 ≈6.4 KB。两闸门 EXIT=0（51 OK／0 FAIL），16 支负测全绿
+   （`round361-negatives.log`）。
+
+**读数（boot 143，`round361b-v0.7.82-payload.img` sha `ee4b8d21…`）。** 证据
+`~/clover-out/round361-boot143-decoded.txt`；日志 `round361-flash-boot143.log`。这一靴活到 ≈1692 s
+（比前几靴都长），一火在 t=1692。
+- **U-A 的对象那一半成立**：`remkobj pid=58 hop=3 i=3 nm=a707 kotype=29 kobj=fffffff4ea63eb30
+  sr=2 so=0 q=0 rnm=1 rstate=1 rpid=-1 c=kspace`。`IKOT_IOKIT_CONNECT`=29（`osfmk/kern/ipc_kobject.h:116`）
+  ⇒ **backboardd 卡在一个 IOKit user client 连接口上**；收方仍是内核空间（`rstate=1`），所以回信的一方
+  是内核 IOKit 对象，不是任何用户态守护进程。这是本轮要答的那一半，也是环的最后一跳落到我们这一侧的
+  直接证据。
+- **U-A 的方法那一半没判**：`remcall io=0 id=0 b=0 sz=975d979e rem=7 loc=975ea0b2 vou=7 m0=0 m1=0`。
+  `copyinmap` 这次成功（`io=0`，不是上一遍的 14），但读出来的头**不像一个 mach 头**（`b=0` 而
+  `sz=975d979e`、`rem=7`），与同一靴 r221 在别的线程上读到的 `h=1513.28.203.1ed33.0.ca8` 不是同一形状。
+  按预登记 U-C：消息读不到/不是 IOKit 形态 ⇒ **不判**。缺的是把指针本身印出来并与 r221 的 `h=` 对照，
+  以及确认这条 trap 的 `x[0]`（`mach_msg2_trap_args.data`）在这一刻是否仍是发送缓冲；下一轮补这两列。
+- 其余控制：本靴 `onceh` 3 枚（Y-A 第九靴）、`census pid=58` 这一火读 `threads=20 wait=19 run=1`；
+  `bbrcv hn=4`（`4303/4603/6903` 三个 pset＋`6707` 一个端口，全 `rstate=rcv_owner`）。
+- 显示与落回：本靴活到 1692 s，最后静默复位、宿主 BCB 进 TWRP；`box`/`fc` 行在这一火没进窗。
+
+**下一手（r362 题面，预登记）。**
+- (a) **把指针印出来**：`remcall` 加 `p=%llx`（`mach_msg2_trap_args.data`）与 `r221` 同线程的 `h=`
+  对照；若 `p` 指向的 8 字与 r221 读出的头不同，说明这条 trap 的 data 不是发送缓冲（可能是接收缓冲），
+  则改读 `x7`（timeout 槽以外的第六槽）或从 trap 的 `msgh_bits_and_send_size` 反推。
+- (b) **按 kotype=29 直接点 IOKit 对象**：用 `ipc_kobject_get_raw`/`port->ip_kobject` 旁的对象头
+  （若可安全读）取 `OSObject` 的 meta 名，或把 `kobj` 指针交给宿主在 `IOMobileFramebufferUserClient`/
+  `IOUserClient` 的 vtable 里对照——这条不依赖消息读取，能把「哪个 user client」先定下来。
+- 预登记 V-A…V-C：V-A `kobj` 对上 `IOMobileFramebufferUserClient` ⇒ 最后一跳是我们已经链接的显示
+  user client，下一手补它的 selector 6/8 分支；V-B 对上别的 user client ⇒ 记录类名并转该 kext；
+  V-C 对象头不可安全读 ⇒ 只留指针，改用宿主符号表比对，不猜。
+- 控制：`remcall` 行数 == `asked=`；`p` 只在 `ent==1 && ty!=0` 时出现；`io=0` 时 `m0/m1` 必须与
+  r221 同线程的 `h=` 第三、四字（remote/local）自洽，否则不判。

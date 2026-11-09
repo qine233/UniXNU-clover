@@ -1416,6 +1416,13 @@ def check_sb_sample(kernel: bytes) -> bool:
              "r360-rembits": (b"clover r360: rembits t=%llu pid=%d hop=%d i=%u nm=%x ent=%d ty=%s "
                               b"raw=%llx ur=%u o=%llx sr=%u so=%u ms=%u q=%u rnm=%x rstate=%d "
                               b"rpid=%d c=%s\n") in kernel,
+             # Round361 names the kernel object behind that port (kotype 29/30 is the IOKit family) and
+             # the call it waits for: the trapped message's header plus its first two body words, where
+             # an io_connect_method selector lives.
+             "r361-remkobj": (b"clover r361: remkobj t=%llu pid=%d hop=%d i=%u nm=%x kotype=%u "
+                              b"kobj=%llx sr=%u so=%u q=%u rnm=%x rstate=%d rpid=%d c=%s\n") in kernel,
+             "r361-remcall": (b"clover r361: remcall t=%llu pid=%d hop=%d i=%u nm=%x io=%d id=%x b=%x "
+                              b"sz=%x rem=%x loc=%x vou=%x m0=%x m1=%x\n") in kernel,
              # Round354 keeps the four heavy helpers out of clover_bb_sample's frame. noinline is a
              # source attribute, but what boot 133 died on was the link: the helpers' frames accreted
              # into one 10912-byte frame and the beat thread's 16 KB stack overflowed. Each helper
