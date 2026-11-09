@@ -4126,6 +4126,107 @@ def check_board(errors: list) -> str:
             errors.append("the r356 rows are not exempt from the per-pass cap: a count without the "
                           "names it counted is the half-pair r249 refuses")
 
+        # Round357. Boot 136 read W-C on SpringBoard's rem: sr=1 alive and so=1 set, yet the once-walk
+        # found no ipc_entry holder in any of the 141 spaces -- a send-once right is created at send time
+        # from msgh_local_port and lives inside the receiving kmsg, so no name table can name its holder.
+        # What CAN be named is the port's receiver: the leg reads ip_get_receiver and
+        # ip_get_receiver_name under the translate lock (r220's discipline), resolves the owning task
+        # with the proc_find pointer walk (r331's census legs) and prints clover r357: holdrr, and the
+        # main row carries op= -- the options word the trapped thread holds in x2, mach_msg2_trap_args'
+        # second slot -- so "this call is sending" and "pure receive, rem rode along" cannot print as
+        # one silence.
+        r357_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r357.patch")),
+                         default=None)
+        if r357_patch is None or not r357_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r357.patch is missing: rem's receiver would "
+                          "stay unnamed, which is the one question boot 136's so=1/once=0 left open")
+        else:
+            r357_name = r357_patch.name
+            r357_text = r357_patch.read_text()
+            load_r357 = REPO.parent / "UniXNU" / "patches" / "xnu" / r357_name
+            local_r357 = REPO / "patches/xnu" / r357_name
+            if not load_r357.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r357_name} is missing: unixnu loads patches from "
+                              "there, and this repo's copy only ever names the round")
+            elif load_r357.read_bytes() != r357_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r357_name} is not the same bytes as this repo's "
+                              "copy: the shipped image would carry a different receiver reading")
+            if not local_r357.is_file() or local_r357.read_bytes() != r357_patch.read_bytes():
+                errors.append(f"patches/xnu/{r357_name} is missing or differs: the series line loads "
+                              "that copy, so the gate must pin the bytes it actually applies")
+            series_text = (REPO / "patches/xnu/series").read_text()
+            series_line = f"arch:../../../patches/xnu/{r357_name}"
+            r356_prev = max((p.name for p in (REPO / "patches/xnu-clover").glob("*-clover-r356.patch")),
+                            default="")
+            if series_line not in series_text:
+                errors.append(f"patches/xnu/series does not apply {r357_name}: the receiver leg "
+                              "exists in the source and the kernel would be built without it")
+            elif r356_prev == "" or series_text.find(r356_prev) < 0:
+                errors.append("patches/xnu/series no longer applies r356: r357 re-tokens the rows "
+                              "r356 introduced, so the series cannot be read as the ordered history")
+            elif series_text.find(series_line) < series_text.find(r356_prev):
+                errors.append("patches/xnu/series applies r357 before r356: the receiver leg reads "
+                              "the rem snapshot r356's patch created")
+            r357_added = [line[1:] for line in r357_text.splitlines() if line.startswith("+")]
+            r357_removed = [line[1:] for line in r357_text.splitlines()
+                            if line.startswith("-") and not line.startswith("---")]
+            for now in (
+                'Round357. Boot 136 read W-C on that name',
+                'mach_port_name_t rem, uint64_t opt, uint64_t secs)',
+                'recv = ip_get_receiver(port);',
+                'rnm = (uint32_t)ip_get_receiver_name(port);',
+                'owner = recv->is_task;',
+                '"clover r357: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x ty=%d o=%llx"',
+                '" once=%u och=%u ocp=%u ocs=%u op=%llx n=%u\\n"',
+                '"clover r357: holdrr t=%llu hop=%d i=%u j=%u pid=%d rem=%x rnm=%x rstate=%d"',
+                'for (pid2 = 1; pid2 <= CLOVER_BB_SEMA_PROBE; pid2++) {',
+                'if (proc_task(pp2) == owner) {',
+                'task_deallocate(owner);',
+                '"clover r357: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x e=%d\\n"',
+                '"clover r357: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x skip=same\\n"',
+                '"clover r357: holdrsh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s raw=%llx\\n"',
+                'r_opt[rows] = (uint64_t)saved_state64(ss)->x[2];',
+                '(mach_port_name_t)r_rem[k], r_opt[k], secs);'):
+                if not any(now in line for line in r357_added):
+                    errors.append(f"the r357 kernel patch does not add {now[:60]!r}: without it "
+                                  "the receiver of SpringBoard's send destination stays unnamed")
+            # Round357 is not pure addition: it re-tokens the four row literals r356 introduced, the
+            # helper's signature and its call site. The removed set is exactly those replaced lines --
+            # pin each one, and pin the count, because a deletion beyond the re-tokening would be a
+            # previous round's reading the next boot cannot re-make.
+            for gone in (
+                '    mach_port_name_t rem, uint64_t secs)',
+                '\t\t\t    "clover r356: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x e=%d\\n",',
+                '\t    "clover r356: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x ty=%d o=%llx"',
+                '\t    " once=%u och=%u ocp=%u ocs=%u n=%u\\n",',
+                '\t    once, once, once_probed, once_scanned, members);',
+                '\t\t    "clover r356: holdrsh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s raw=%llx\\n",',
+                '\t\t\t    "clover r356: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x skip=same\\n",',
+                '\t\t\t    (mach_port_name_t)r_rem[k], secs);'):
+                if gone not in r357_removed:
+                    errors.append(f"the r357 patch does not replace {gone.strip()[:56]!r}: a row "
+                                  "family still on the r356 token would outrun the tee classes and "
+                                  "the needles pinned with it")
+            if len(r357_removed) != 8:
+                errors.append(f"the r357 patch removes {len(r357_removed)} lines, not the 8 the "
+                              "re-tokening accounts for: every further deletion is a reading the "
+                              "next boot cannot re-make")
+        for entry in ('{ "clover r357: holdrsh", "r357-holdrsh", 64, 0, 0, 0 },',
+                      '{ "clover r357: holdrr", "r357-holdrr", 64, 0, 0, 0 },',
+                      '{ "clover r357: holdrs", "r357-holdrs", 64, 0, 0, 0 },'):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: the receiver leg's "
+                              "rows need their own budgets and the trio is one reading")
+        # teeProbeClass answers with the FIRST prefix match and "holdrs" prefix-matches "holdrsh",
+        # so the longer name must be listed first or the naming rows spend the main row's budget.
+        if not 0 <= sdhci_source.find('"clover r357: holdrsh"') <                 sdhci_source.find('"clover r357: holdrs"'):
+            errors.append("the r357 tee classes are not ordered holdrsh before holdrs: the matcher "
+                          "returns the first prefix match, so holdrsh rows would eat the holdrs "
+                          "budget and the naming pair would starve")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r357")' not in sdhci_source:
+            errors.append("the r357 rows are not exempt from the per-pass cap: a holdrs row without "
+                          "its holdrr pair is boot 136's blind spot reopened")
+
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
         # its own ending, so a silent boot leaves the boot before it on the card and the reader called
@@ -7851,8 +7952,8 @@ def check_board(errors: list) -> str:
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
     # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
     # the menu names round347.
-    if not board["payload"]["title"].startswith("clover r356:"):
-        errors.append('[payload] title is not "clover r356: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r357:"):
+        errors.append('[payload] title is not "clover r357: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -10006,8 +10107,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r356:"):
-        errors.append('[payload] title is not "clover r356: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r357:"):
+        errors.append('[payload] title is not "clover r357: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

@@ -1264,6 +1264,18 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r356: holdrsh", "r356-holdrsh", 64, 0, 0, 0 },
   { "clover r356: holdrs", "r356-holdrs", 64, 0, 0, 0 },
 
+  // Round357 re-tokens the holder_send family (the rows below carry the r357 name now, so the two
+  // r356 classes above are dead matchers kept only for the record) and splits one reading into a
+  // third row: `holdrr` names the receive-right owner of the send destination -- one row per
+  // translated rem, the same arithmetic bound as its holdrs parent -- and the pair that must never
+  // be split by a pass cap is the holdrs row and the holdrr row printed from the same rem.
+  // Order is load-bearing: teeProbeClass answers with the first prefix match, and "holdrs"
+  // prefix-matches "holdrsh", so the longest name is listed first; "holdrr" diverges at the
+  // seventh character and is prefix-safe either way.
+  { "clover r357: holdrsh", "r357-holdrsh", 64, 0, 0, 0 },
+  { "clover r357: holdrr", "r357-holdrr", 64, 0, 0, 0 },
+  { "clover r357: holdrs", "r357-holdrs", 64, 0, 0, 0 },
+
   // Round349 follows each named holder into its own task in the same fire: `holdth` is the
   // per-task summary (threads, waiters, runners, trapped) and `holdt` at most two trapped threads
   // with their receive name, send destination and continuation. Six holders per fire at most, so
@@ -4982,6 +4994,7 @@ static void teeConsumeLine (uint32_t &pushed)
        // blind spot this round exists to close.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r355") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r356") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r357") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is

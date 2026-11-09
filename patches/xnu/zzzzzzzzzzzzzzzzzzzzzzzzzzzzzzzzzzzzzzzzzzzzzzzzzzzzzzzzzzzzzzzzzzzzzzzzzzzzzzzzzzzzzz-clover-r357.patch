@@ -1,0 +1,165 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12931,10 +12931,20 @@
+  * (a destination usually holds no receive right), then the r355 locked snapshot q/sr/ms/so, then the
+  * SEND_ONCE walk -- so "the letter is queued there", "the right is gone" and "rem is a bystander"
+  * print as three different readings instead of one silence.
++ *
++ * Round357. Boot 136 read W-C on that name -- q=0, sr=1, and the once-walk found no ipc_entry holder
++ * for so=1 across all 141 spaces. A send-once right is created at send time from the message's
++ * msgh_local_port and lives inside the receiving kmsg, so the holder of that right cannot be named
++ * from a name table at all: what can be named is the port's receiver. This reads ip_get_receiver and
++ * ip_receiver_name under the translate lock (r220's discipline), resolves the receiving task through
++ * the proc_find pointer walk (r331's census legs), and prints clover r357: holdrr; the option word
++ * the trapped thread carries in x2 (struct mach_msg2_trap_args' second slot) rides the main row as
++ * op=, because "this call is sending" and "this call only receives, rem is a header bystander" must
++ * not print as one silence either.
+  */
+ static void __attribute__((noinline))
+ clover_bb_holder_send(task_t task, int pid, int hop, int i, int j,
+-    mach_port_name_t rem, uint64_t secs)
++    mach_port_name_t rem, uint64_t opt, uint64_t secs)
+ {
+ 	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
+ 	ipc_space_t space = task->itk_space;
+@@ -12967,6 +12977,17 @@
+ 	uint32_t once_scanned = 0;
+ 	uint32_t k;
+ 	int ty = -1;
++	ipc_space_t recv = IPC_SPACE_NULL;
++	task_t owner = TASK_NULL;
++	uint32_t rnm = 0;
++	int rstate = -1;
++	int rpid = -3;
++	int pid2;
++	struct proc *pp2;
++	char rc[16];
++	extern struct proc *proc_find(int pid);
++	extern task_t proc_task(struct proc *p);
++	extern int proc_rele(struct proc *p);
+ 	char row[256];
+ 	int len;
+ 
+@@ -12981,7 +13002,7 @@
+ 		kr = ipc_object_translate(space, rem, MACH_PORT_RIGHT_PORT_SET, &obj);
+ 		if (kr != KERN_SUCCESS) {
+ 			len = snprintf(row, sizeof(row),
+-			    "clover r356: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x e=%d\n",
++			    "clover r357: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x e=%d\n",
+ 			    (unsigned long long)secs, hop, i, j, pid, rem, (int)kr);
+ 			if (len > 0) {
+ 				row[sizeof(row) - 1] = '\0';
+@@ -13003,6 +13024,17 @@
+ 		    &scanned, &selfhit);
+ 		clover_space_obj_names(space, obj, on, ob, 4, &matches, &entries);
+ 		own = matches;
++		recv = ip_get_receiver(port);
++		rnm = (uint32_t)ip_get_receiver_name(port);
++		if (recv == IPC_SPACE_NULL) {
++			rstate = 2;
++		} else if (recv->is_task == TASK_NULL) {
++			rstate = 1;
++		} else {
++			owner = recv->is_task;
++			task_reference(owner);
++			rstate = 0;
++		}
+ 		io_reference(obj);
+ 		io_unlock(obj);
+ 		clover_port_once_holders(obj, sp, sn, sb, sc, 4, &once, &once_probed,
+@@ -13021,20 +13053,57 @@
+ 		io_unlock(obj);
+ 	}
+ 	len = snprintf(row, sizeof(row),
+-	    "clover r356: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x ty=%d o=%llx"
++	    "clover r357: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x ty=%d o=%llx"
+ 	    " q=%u sr=%u ms=%u so=%u own=%u hits=%u probed=%u scanned=%u"
+-	    " once=%u och=%u ocp=%u ocs=%u n=%u\n",
++	    " once=%u och=%u ocp=%u ocs=%u op=%llx n=%u\n",
+ 	    (unsigned long long)secs, hop, i, j, pid, rem, ty,
+ 	    (unsigned long long)(uintptr_t)obj, q, sr, ms, so, own, hits, probed, scanned,
+-	    once, once, once_probed, once_scanned, members);
++	    once, once, once_probed, once_scanned, (unsigned long long)opt, members);
+ 	if (len > 0) {
+ 		row[sizeof(row) - 1] = '\0';
+ 		clover_emmc_probe_say(row, (unsigned int)strlen(row));
+ 		printf("%s", row);
+ 	}
++	if (ty == 0) {
++		rc[0] = '\0';
++		if (owner != TASK_NULL) {
++			for (pid2 = 1; pid2 <= CLOVER_BB_SEMA_PROBE; pid2++) {
++				pp2 = proc_find(pid2);
++				if (pp2 == NULL) {
++					continue;
++				}
++				if (proc_task(pp2) == owner) {
++					rpid = pid2;
++					if (proc_name_address(pp2) != NULL) {
++						strlcpy(rc, proc_name_address(pp2), sizeof(rc));
++					}
++					proc_rele(pp2);
++					break;
++				}
++				proc_rele(pp2);
++			}
++			task_deallocate(owner);
++			owner = TASK_NULL;
++		} else if (rstate == 1) {
++			rpid = -1;
++			strlcpy(rc, "kspace", sizeof(rc));
++		} else if (rstate == 2) {
++			rpid = -2;
++			strlcpy(rc, "none", sizeof(rc));
++		}
++		len = snprintf(row, sizeof(row),
++		    "clover r357: holdrr t=%llu hop=%d i=%u j=%u pid=%d rem=%x rnm=%x rstate=%d"
++		    " rpid=%d c=%s\n",
++		    (unsigned long long)secs, hop, i, j, pid, rem, rnm, rstate, rpid, rc);
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
++	}
+ 	for (k = 0; ty == 0 && k < once && k < 4; k++) {
+ 		len = snprintf(row, sizeof(row),
+-		    "clover r356: holdrsh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s raw=%llx\n",
++		    "clover r357: holdrsh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s raw=%llx\n",
+ 		    (unsigned long long)secs, pid, j, sp[k], sc + k * 16, sn[k],
+ 		    clover_right_type_word((ipc_entry_bits_t)sb[k]),
+ 		    (unsigned long long)sb[k]);
+@@ -13080,6 +13149,7 @@
+ 	uint32_t r_st[2];
+ 	uint32_t r_rn[2];
+ 	uint32_t r_rem[2];
++	uint64_t r_opt[2];
+ 	uint32_t rows = 0;
+ 	uint32_t k;
+ 	char row[220];
+@@ -13133,6 +13203,7 @@
+ 			r_pc[rows] = (uint64_t)get_saved_state_pc(ss);
+ 			r_rn[rows] = (uint32_t)rn;
+ 			r_rem[rows] = (uint32_t)rem;
++			r_opt[rows] = (uint64_t)saved_state64(ss)->x[2];
+ 			rows++;
+ 		}
+ 	}
+@@ -13179,7 +13250,7 @@
+ 		 */
+ 		if (r_rem[k] != 0 && r_rem[k] == r_rn[k]) {
+ 			len = snprintf(row, sizeof(row),
+-			    "clover r356: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x skip=same\n",
++			    "clover r357: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x skip=same\n",
+ 			    (unsigned long long)secs, hop, i, j, pid, r_rem[k]);
+ 			if (len > 0) {
+ 				row[sizeof(row) - 1] = '\0';
+@@ -13188,7 +13259,7 @@
+ 			}
+ 		} else if (r_rem[k] != 0) {
+ 			clover_bb_holder_send(task, pid, hop, i, j,
+-			    (mach_port_name_t)r_rem[k], secs);
++			    (mach_port_name_t)r_rem[k], r_opt[k], secs);
+ 		}
+ 	}
+ 	task_deallocate(task);

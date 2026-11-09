@@ -29728,3 +29728,31 @@ SpringBoard 的 rem 腿（名字每建必变）：
 - 控制腿：`op` 词不像合法 option64（除 MACH64/MACH 位外全是高位噪声）⇒ x2 映射错，一切不判，
   按 r264 的先例回宿主重解；`holdrr` 缺席而 `holdrs` 在场 ⇒ tee 预算/前缀顺序问题（holdrsh 必须
   排在 holdrr 前、holdrr 排在 holdrs 前——first-match）；闸门①不过 ⇒ r354 栈判据，不判 U。
+
+**构建。** `python3.13 /Users/zhouzhou/UniXNU/unixnu build kernel` 过；补丁
+`zzzz…86z…-clover-r357.patch`（md5 `c9effda98357714531c9bafc78c61ec8`）三份副本字节一致
+（`UniXNU-clover/patches/xnu-clover`、`UniXNU-clover/patches/xnu`、`UniXNU/patches/xnu` 复验同 md5），
+`patches/xnu/series` 把它排在 r356 之后——r357 读的是 r356 那一刀造出来的 rem 快照，顺序倒了就是空读。
+- 这一轮不是纯增加：它把 r356 的四枚行字面量、函数签名与调用点重打 r357 标，删行恰好 8 枚。
+  闸门的「删行必须 == 8」因此有据：第 9 枚删除就是上一轮的一次读数，下一靴无法重做。
+- 栈纪律（构建后 `task.o` 反汇编复量）：`clover_bb_sample` 序言 0x60 + 0x1000 + 0x490 = 0x14F0 =
+  5360 B，与 r355/r356 逐位相同（本轮没往 sample 帧里加东西）；收腿 `clover_bb_holder_send` =
+  0x60 + 0x3c0 = 0x420 = 1056 B，比 r356 的 0x3F0 涨 48 B＝recv/owner/rnm/rstate/rpid/pid2/pp2 七枚
+  标量加 `rc[16]` 那一枚名字缓冲；最深链 ≈12.9 KB < 16 KB，r354 的 noinline 兜底未触发。
+- AMFI→normalize→payload 全链 format 2：输入 `out/clover/ipados-17.7.11-21H461/clover/kernel/kernel.macho`
+  （md5 `6b5ec90a…`，52,482,048 B），两刀仍在文件偏移 `0x1af30e4`/`0x1af316c`（VA 不变，与 r356 同位——
+  本轮改的是 task.c 中段，没顶动 AMFI 之前的段）；amfi sha256 `1649fd75…` → normalized `ab77dae8…`
+  （973 枚戳清零）→ `round357-v0.7.77-payload.img`（sha256 `43496d3e…`，58,720,256 B）。
+- `verify-clover-payload.py --kernel <normalized> --tree <tree>` EXIT=0（48 项 OK），五枚新针脚
+  `r357-holdrs`/`r357-holdrs-error`/`r357-holdrs-skip`/`r357-holdrr`/`r357-holdrsh` 全在场；
+  `check-clover.py` 在设备仓内 EXIT=0（它在 tree 外才把通用构件算给基座仓，跑错目录会假红）。
+
+**负测。** 26 支（`~/clover-out/round357-negatives.log`）：patch-missing、base-bytes、local-bytes、
+series-missing、series-order、receiver-leg、receiver-name、owner-task、pid-walk、proc-task、
+release-owner、holdrr-row、holdrs-row、op-column、skip-row、error-row、holdrsh-row、opt-capture、
+call-site、signature、doc-token、removed-count、tee-class、tee-order、exemption、title；每支红于自己
+的理由，跑完逐字节还原（三份补丁副本 md5 复验 `c9effda9…`、基线 `check-clover` EXIT=0）。
+- 夹具自己交了两笔学费：`patch-missing` 删掉文件后 `restore()` 拿 `read_bytes()` 比较，先崩在
+  「读不存在的文件」上；`holdrr` 那段片段同时命中文档注释与行字面量，断言在变异前就拦下。
+  两支都已改（还原先看存在性、片段带 `t=%llu` 收到唯一命中），并且循环改成「一支抛异常不带走全轮」，
+  还原放进 finally。
