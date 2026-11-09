@@ -1,0 +1,266 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index c67b73a..fd1edb9 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -13273,6 +13273,84 @@ clover_bb_holder_sample(int pid, int hop, int i, int j, mach_port_name_t door,
+ 	task_deallocate(task);
+ }
+ 
++/*
++ * Round359. Boot 138's backboardd waited on two port sets (4103 with three members, 6203 with
++ * seven) instead of the leaf port r358 went looking for, so hoprr never ran. r347 resolves every
++ * member with a send right and names who can post to it; what it never says is whose receive right
++ * each member is. This reads ip_get_receiver/ip_get_receiver_name on the member the walk already
++ * holds under its own reference (r220's lock discipline, the same legs as r358) and prints
++ * clover r359: psmrcv, one row per member with sr>0. A member whose receiver is not the waiting
++ * task means the set crosses task boundaries; a member whose receiver is the waiter and whose
++ * senders were named in the same fire is the ring drawn as one row.
++ */
++static void __attribute__((noinline))
++clover_bb_member_receiver(ipc_port_t port, int pid, int hop, uint32_t i,
++    mach_port_name_t name, uint32_t sr, uint32_t ms, uint64_t secs)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	extern struct proc *proc_find(int pid);
++	extern task_t proc_task(struct proc *p);
++	extern int proc_rele(struct proc *p);
++	ipc_space_t recv;
++	task_t owner = TASK_NULL;
++	uint32_t rnm = 0;
++	int rstate = -1;
++	int rpid = -3;
++	int pid2;
++	struct proc *pp;
++	char rc[16];
++	char row[220];
++	int len;
++
++	rc[0] = '\0';
++	io_lock(port);
++	recv = ip_get_receiver(port);
++	rnm = (uint32_t)ip_get_receiver_name(port);
++	if (recv == IPC_SPACE_NULL) {
++		rstate = 2;
++	} else if (recv->is_task == TASK_NULL) {
++		rstate = 1;
++	} else {
++		owner = recv->is_task;
++		task_reference(owner);
++		rstate = 0;
++	}
++	io_unlock(port);
++	if (owner != TASK_NULL) {
++		for (pid2 = 1; pid2 <= CLOVER_BB_SEMA_PROBE; pid2++) {
++			pp = proc_find(pid2);
++			if (pp == NULL) {
++				continue;
++			}
++			if (proc_task(pp) == owner) {
++				rpid = pid2;
++				if (proc_name_address(pp) != NULL) {
++					strlcpy(rc, proc_name_address(pp), sizeof(rc));
++				}
++				proc_rele(pp);
++				break;
++			}
++			proc_rele(pp);
++		}
++		task_deallocate(owner);
++	} else if (rstate == 1) {
++		rpid = -1;
++		strlcpy(rc, "kspace", sizeof(rc));
++	} else if (rstate == 2) {
++		rpid = -2;
++		strlcpy(rc, "none", sizeof(rc));
++	}
++	len = snprintf(row, sizeof(row),
++	    "clover r359: psmrcv t=%llu pid=%d hop=%d i=%u nm=%x sr=%u ms=%u rnm=%x"
++	    " rstate=%d rpid=%d c=%s\n",
++	    (unsigned long long)secs, pid, hop, i, name, sr, ms, rnm, rstate, rpid, rc);
++	if (len > 0) {
++		row[sizeof(row) - 1] = '\0';
++		clover_emmc_probe_say(row, (unsigned int)strlen(row));
++		printf("%s", row);
++	}
++}
++
+ #define CLOVER_BB_PSET_MAX 8
+ struct clover_bbpset_snap {
+ 	ipc_port_t ports[CLOVER_BB_PSET_MAX];
+@@ -13403,6 +13481,12 @@ clover_bb_hop_pset(task_t task, int pid, int hop, mach_port_name_t name,
+ 			clover_emmc_probe_say(row, (unsigned int)strlen(row));
+ 			printf("%s", row);
+ 		}
++		/*
++		 * Round359. r347 named who can post to this member; this names whose port it is. The
++		 * member is already held by the reference the set walk took, so no second translate.
++		 */
++		clover_bb_member_receiver(snap.ports[i], pid, hop, i,
++		    (mach_port_name_t)snap.rns[i], snap.srs[i], snap.mss[i], secs);
+ 		/*
+ 		 * Round351: the same bits reading as holdrnow, on the set member. `own` here is the
+ 		 * receiving task's own table, so a SEND|RECEIVE entry means backboardd's ip_srights
+@@ -14628,6 +14712,150 @@ clover_r309_cen_out(const char *why, uint64_t secs, int pid)
+ 	}
+ }
+ 
++#define CLOVER_BB_SELF_ROWS 4
++/*
++ * Round359. Boot 138's census read backboardd as 19 threads / 11 wait / 8 run: not the 18/1 shape
++ * earlier boots showed, so "blocked" is no longer the word, and the next question is what those
++ * eight runnable threads are executing and what the trapped ones wait on. This samples the waiter
++ * itself with r349's legs -- try-lock, thread state, wait event, continuation, user PC, and the
++ * rn/rem of a mach_msg2 trap -- and prints clover r359: bbth (the totals) plus at most four bbt
++ * rows, preferring trapped threads, then runnable, then waiting. The bound is enforced inside
++ * every pass: boot 139 ran this with ten trapped threads and a pass-only bound, and the ten stores
++ * walked past the four slots and corrupted the row (tid= read the continuation pointer). A PC is a
++ * snapshot taken under the task lock while other cpus run the thread; it names a place, not a
++ * duration.
++ */
++static void __attribute__((noinline))
++clover_bb_self_sample(int pid, uint64_t secs)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	extern struct proc *proc_find(int pid);
++	extern task_t proc_task(struct proc *p);
++	extern int proc_rele(struct proc *p);
++	struct proc *p;
++	task_t task;
++	thread_t thr;
++	uint32_t th = 0;
++	uint32_t wait = 0;
++	uint32_t run = 0;
++	uint32_t m2 = 0;
++	uint64_t rtid[CLOVER_BB_SELF_ROWS];
++	uint64_t rwe[CLOVER_BB_SELF_ROWS];
++	uint64_t rcont[CLOVER_BB_SELF_ROWS];
++	uint64_t rpc[CLOVER_BB_SELF_ROWS];
++	uint32_t rst[CLOVER_BB_SELF_ROWS];
++	uint32_t rrn[CLOVER_BB_SELF_ROWS];
++	uint32_t rrem[CLOVER_BB_SELF_ROWS];
++	const char *rcls[CLOVER_BB_SELF_ROWS];
++	uint32_t rows = 0;
++	uint32_t pass;
++	uint32_t k;
++	char row[240];
++	int len;
++
++	if (pid <= 0) {
++		return;
++	}
++	p = proc_find(pid);
++	if (p == NULL) {
++		return;
++	}
++	task = proc_task(p);
++	if (task == TASK_NULL) {
++		proc_rele(p);
++		return;
++	}
++	if (!lck_mtx_try_lock(&task->lock)) {
++		proc_rele(p);
++		return;
++	}
++	queue_iterate(&task->threads, thr, thread_t, task_threads) {
++		arm_saved_state_t *ss;
++
++		th++;
++		if ((thr->state & TH_WAIT) != 0) {
++			wait++;
++		}
++		if ((thr->state & TH_RUN) != 0 && (thr->state & TH_WAIT) == 0) {
++			run++;
++		}
++		ss = get_user_regs(thr);
++		if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1 && !is_saved_state32(ss) &&
++		    (uint64_t)saved_state64(ss)->x[16] == (uint64_t)-47) {
++			m2++;
++		}
++	}
++	for (pass = 0; pass < 3 && rows < CLOVER_BB_SELF_ROWS; pass++) {
++		queue_iterate(&task->threads, thr, thread_t, task_threads) {
++			arm_saved_state_t *ss;
++			uint64_t x16 = 0;
++			uint64_t rn = 0;
++			uint64_t rem = 0;
++			uint64_t pc = 0;
++			int trapped = 0;
++			int runnable;
++
++			ss = get_user_regs(thr);
++			if (ss != NULL && (uintptr_t)ss != (uintptr_t)-1 &&
++			    !is_saved_state32(ss)) {
++				x16 = (uint64_t)saved_state64(ss)->x[16];
++				trapped = (x16 == (uint64_t)-47);
++				rn = (uint64_t)saved_state64(ss)->x[5] >> 32;
++				rem = (uint64_t)saved_state64(ss)->x[3];
++				pc = (uint64_t)get_saved_state_pc(ss);
++			}
++			runnable = ((thr->state & TH_RUN) != 0 &&
++			    (thr->state & TH_WAIT) == 0);
++			if (pass == 0 && !trapped) {
++				continue;
++			}
++			if (pass == 1 && (!runnable || trapped)) {
++				continue;
++			}
++			if (pass == 2 && (trapped || runnable)) {
++				continue;
++			}
++			if (rows >= CLOVER_BB_SELF_ROWS) {
++				break;
++			}
++			rtid[rows] = thr->thread_id;
++			rst[rows] = thr->state;
++			rwe[rows] = (uint64_t)(uintptr_t)thr->wait_event;
++			rcont[rows] = (uint64_t)(uintptr_t)thr->continuation;
++			rpc[rows] = pc;
++			rrn[rows] = trapped ? (uint32_t)rn : 0;
++			rrem[rows] = trapped ? (uint32_t)rem : 0;
++			rcls[rows] = trapped ? "m2" : (runnable ? "run" : "wait");
++			rows++;
++		}
++	}
++	task_reference(task);
++	lck_mtx_unlock(&task->lock);
++	proc_rele(p);
++	len = snprintf(row, sizeof(row),
++	    "clover r359: bbth t=%llu pid=%d th=%u wait=%u run=%u m2=%u\n",
++	    (unsigned long long)secs, pid, th, wait, run, m2);
++	if (len > 0) {
++		row[sizeof(row) - 1] = '\0';
++		clover_emmc_probe_say(row, (unsigned int)strlen(row));
++		printf("%s", row);
++	}
++	for (k = 0; k < rows; k++) {
++		len = snprintf(row, sizeof(row),
++		    "clover r359: bbt t=%llu pid=%d j=%u cls=%s tid=%llx st=%x we=%llx"
++		    " cont=%llx pc=%llx rn=%x rem=%x\n",
++		    (unsigned long long)secs, pid, k, rcls[k],
++		    (unsigned long long)rtid[k], rst[k],
++		    (unsigned long long)rwe[k], (unsigned long long)rcont[k],
++		    (unsigned long long)rpc[k], rrn[k], rrem[k]);
++		if (len > 0) {
++			row[sizeof(row) - 1] = '\0';
++			clover_emmc_probe_say(row, (unsigned int)strlen(row));
++			printf("%s", row);
++		}
++	}
++}
++
+ static void
+ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ {
+@@ -15224,6 +15452,12 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 			    (hrn[i] != 0) ? (mach_port_name_t) hrn[i] : MACH_PORT_NULL,
+ 			    secs, cand, debt, unread, hwe[i]);
+ 		}
++		/*
++		 * Round359. The fire named every hop; this samples the waiter itself, because boot 138
++		 * read backboardd as 19 threads / 11 wait / 8 run and the ring's next question is what
++		 * those runnable threads are executing.
++		 */
++		clover_bb_self_sample(pid, secs);
+ 	}
+ 	/*
+ 	 * Round262. One header plus at most CLOVER_BB_CENSUS rows, once every two

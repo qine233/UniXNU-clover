@@ -1400,6 +1400,15 @@ def check_sb_sample(kernel: bytes) -> bool:
                               b"raw=%llx\n") in kernel,
              "r358-hoprr": (b"clover r358: hoprr t=%llu pid=%d hop=%d nm=%x rnm=%x rstate=%d "
                             b"rpid=%d c=%s\n") in kernel,
+             # Round359 asks the two questions boot 138's set shape left: whose receive right each
+             # set member is (psmrcv, on the member the r347 walk already references) and what the
+             # waiting task's own threads -- 19 of them, 11 wait / 8 run -- are executing (bbth and
+             # at most four bbt rows, preferring trapped then runnable then waiting).
+             "r359-psmrcv": (b"clover r359: psmrcv t=%llu pid=%d hop=%d i=%u nm=%x sr=%u ms=%u "
+                             b"rnm=%x rstate=%d rpid=%d c=%s\n") in kernel,
+             "r359-bbth": (b"clover r359: bbth t=%llu pid=%d th=%u wait=%u run=%u m2=%u\n") in kernel,
+             "r359-bbt": (b"clover r359: bbt t=%llu pid=%d j=%u cls=%s tid=%llx st=%x we=%llx "
+                          b"cont=%llx pc=%llx rn=%x rem=%x\n") in kernel,
              # Round354 keeps the four heavy helpers out of clover_bb_sample's frame. noinline is a
              # source attribute, but what boot 133 died on was the link: the helpers' frames accreted
              # into one 10912-byte frame and the beat thread's 16 KB stack overflowed. Each helper

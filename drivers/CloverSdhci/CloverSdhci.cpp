@@ -1287,6 +1287,14 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r358: holdrs", "r358-holdrs", 64, 0, 0, 0 },
   { "clover r358: hoprr", "r358-hoprr", 64, 0, 0, 0 },
 
+  // Round359 asks two questions on boot 138's shape: `psmrcv` names the receive owner of each
+  // port-set member r347 already resolved (up to eight members per set hop), and `bbth`/`bbt` sample
+  // the waiting task itself -- one header plus at most four threads. "bbth" must be listed before
+  // "bbt": the first-prefix matcher would otherwise send the header into the per-thread budget.
+  { "clover r359: bbth", "r359-bbth", 64, 0, 0, 0 },
+  { "clover r359: bbt", "r359-bbt", 64, 0, 0, 0 },
+  { "clover r359: psmrcv", "r359-psmrcv", 64, 0, 0, 0 },
+
   // Round349 follows each named holder into its own task in the same fire: `holdth` is the
   // per-task summary (threads, waiters, runners, trapped) and `holdt` at most two trapped threads
   // with their receive name, send destination and continuation. Six holders per fire at most, so
@@ -5010,6 +5018,9 @@ static void teeConsumeLine (uint32_t &pushed)
        // row and the holders row describe one object, so a pass cap that kept one and ate the other
        // would turn a named ring into a number again.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r358") ||
+       // Round359's member receivers and thread rows are one reading with the set walk and the fire:
+       // a pass cap that kept the members and ate whose they are would restore the blind spot.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r359") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is

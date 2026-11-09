@@ -269,7 +269,15 @@ loader = "firmware"
 # is msgh_bits|send_size. The gate pins both columns, the re-token to r358, and that hoprr reads the
 # port the bbsend row already resolved -- one translate, so the receiver and the holders describe one
 # object rather than two samplings that can disagree.
-title = "clover r358: boot 137 answered r357's question and caught r357's own column: rem=150b's receiver is 58:backboardd (two independent legs), and backboardd itself sits at hop=2 nm=730b with scan=no_srights, the shape rem had before r357 pointed the leg at it. This round fixes op= to read x1 -- the mach_msg2 option word per r264's unpacking and r221's op= -- and gives the x2 word (msgh_bits|send_size) its own name bs=; it also moves the receiver leg onto the hop the bbsend row already resolved, printing clover r358: hoprr with rnm=/rstate=/rpid=/c= for 730b, so the column that said \"header bystander\" now says \"receiver owner\" instead. rstate=1 is a kernel space, 2 a dead receiver, -3 a task the walk could not name. The r357 row family is re-tokened; nothing else moved: no offset, kind, clamp, ring geometry or cadence."
+#
+# Round359's case: boot 138 proved r358's slot fix (holdrs op=40700420e bs=0 matches r221's op for
+# the same thread) but never reached hoprr, because backboardd's two hops were port sets (4103 x3,
+# 6203 x7, scan=pset), not the leaf port r358 went looking for. This round asks the next two
+# questions on that shape: whose receive right each set member is (psmrcv, on the member the r347
+# walk already holds by reference), and what backboardd's own 19 threads -- 11 wait, 8 run, not the
+# old 18/1 -- are executing (bbth plus at most four bbt rows carrying state, wait event,
+# continuation and user PC).
+title = "clover r359: boot 138 found backboardd waiting on two port sets (4103 with 3 members, 6203 with 7) rather than the leaf port r358 went looking for, so hoprr never ran -- while the same boot proved r358's slot fix: four holdrs rows read op=40700420e bs=0, the same pair r221's independent leg reports for tid 0x12d. This round asks the next two questions on that shape: whose receive right each set member is (clover r359: psmrcv, reading ip_get_receiver and ip_get_receiver_name on the member the r347 walk already holds by reference, with sr=/ms=/rnm=/rstate=/rpid=/c= -- a member whose receiver is not the waiter crosses a task boundary), and what backboardd's own 19 threads (11 wait, 8 run) are executing (clover r359: bbth plus at most four bbt rows carrying state, wait event, continuation and user PC, preferring \"trapped\" then \"runnable\" then \"waiting\"). Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

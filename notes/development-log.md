@@ -29898,3 +29898,86 @@ removed-count、tee-class、tee-order、exemption、title；每支红于自己�
   ⇒ 环外还有一跳；S-C `rstate=2` ⇒ 死名；S-D `holdth` 显示 backboardd 的 runner 停在
   `mach_msg2` ⇒ 它自己也在等下一封。控制腿：`9403` 的两名持有者必须与 r347 的 `bbsmhold` 同名；
   `hoprr` 若再缺席，行里必须先有 `scan=pset` 才允许记「结构缺席」。
+
+
+## Round359 —— 集合成员的收方属主 + backboardd 自己的线程
+
+**题面。** boot 138 给了两个事实：r358 的槽位修对了（四枚 holdrs `op=40700420e bs=0` 与 r221 逐字同），
+但 `hoprr` 没执行——backboardd 的两个 hop 都翻成端口集合（`4103`×3、`6203`×7，`scan=pset`），没有端口可
+点名；同一靴 `r262 census pid=58 threads=19 wait=11 run=8`（不是 109/110 的 18/1）。下一问问两件：
+(a) 每个有发送权的集合成员，**收方属主**是谁（r347 只说了谁能发，没说这口是谁的收口）；
+(b) backboardd **自己**那 19 条线程在跑什么、等什么。
+
+**改动（`osfmk/kern/task.c`）。**
+- 新 `clover_bb_member_receiver(port, pid, hop, i, name, sr, ms, secs)`：在 `clover_bb_hop_pset`
+  已持有引用的成员上，`io_lock` 下读 `ip_get_receiver`/`ip_get_receiver_name`（r220 的锁纪律），
+  proc_find 指针走查落 pid 与 comm，印 `clover r359: psmrcv`
+  （`nm=/sr=/ms=/rnm=/rstate=/rpid=/c=`），只对 `sr>0` 的成员各一枚（与 bbsmh 一一对应）。
+- 新 `clover_bb_self_sample(pid, secs)`：对等待者自己 `try_lock` 后遍历线程，印 `clover r359: bbth`
+  （`th/wait/run/m2`）＋最多 4 枚 `clover r359: bbt`（`cls=trapped|run|wait`、`tid/st/we/cont/pc/rn/rem`），
+  优先级 trapped → runnable → waiting；PC 是锁内快照，只指位置、不指时长。
+- 调用点：pset 循环里 bbsmh 之后；`clover_bb_sample` 的 bbsend 循环之后。
+- 纯增：删行 0（闸门钉住这个 0）。
+
+**预登记（boot 139，r359 镜像）。** 先判闸门①（0 abt、每火 bbsend 行数=cand=、r350 holdrn
+`sr=1 ms=1 so=1 once=1 och=1`＋r352 onceh 点名 hpid=58；认形状不认名字）。再判：
+- **S-A**：等价成员（boot 138 的 `9403`）的 `psmrcv rpid=58`（收方是等待者自己）且 `bbsmhold` 的持有者含
+  SpringBoard ⇒ 集合成员是 backboardd 自己的收口，环＝「SpringBoard 能发、被回信挡住」在同一集合里闭合；
+  下一手＝那封请求坐在哪个队列（bbrcv/bbsm 的 q=）。
+- **S-B**：`psmrcv rpid` 是第三个 task（launchd/chronod/…）⇒ 集合跨任务，环外还有一跳；下一手＝对那个
+  task 跑 r355/r357 快照。
+- **S-C**：`psmrcv rstate=2`（无 receiver space）⇒ 死名，记录并转 dead-name 通知。
+- **S-D**：`bbth run=0` 或全部 `bbt cls=m2` ⇒ 与 r262 census 的 19/11/8 矛盾——先按「两次采样不同刻」记，
+  不判「它停了」。
+- **控制**：`psmrcv` 行数 == 同火 `bbsmh` 行数；`bbth.pid == bbsend.pid`；`bbt` ≤4 且 `j` 唯一；
+  `psmrcv`/`bbth` 缺席而行在场 ⇒ tee 预算/前缀（`bbth` 必须先于 `bbt`，否则表头吃进每线程预算）；
+  闸门①不过 ⇒ r354 栈判据，不判 S。
+- **栈预算**：两个新函数都 `noinline`；构建后在 `task.o` 上量帧，最深链必须 <16 KB（r354 的教训）。
+
+**构建（两遍，同一轮重切）。** 第一遍 r359 初版：kernel md5 `9dd7ee49`、AMFI `980d109b`、normalize
+`31309079`、payload `3d6f5f59…`（boot 139）。那一靴的 `bbth` 读 `m2=10`，而 `CLOVER_BB_SELF_ROWS`
+只有 4——**pass 里没有边界**，10 次写越过 4 槽，行里的 `tid` 读成 `cont` 指针（`tid=fffffff0072622ac`）、
+`j` 打到 7。这不是读数，是仪器故障；按 r354 的先例当场修：`if (rows >= CLOVER_BB_SELF_ROWS) break;`
+放进每 pass 的线程循环里，重生成补丁（同轮、同 r359 标，非新轮）、重建、重刷。
+最终：补丁 md5 `1a6e19b44d20537918796200d0784632`（三份同字节，纯增 234 行、删 0）；kernel md5
+`293d1f0f` / sha256 `3ac5456c…`（52,482,048 B）；AMFI `a995cf70…`（两刀仍在 `0x1af30e4`/`0x1af316c`）；
+normalize `6afe2821…`（973 戳）；`round359b-v0.7.80-payload.img` sha256 `dc71b711…`（58,720,256 B）。
+`payload.json` 自证 `kernel_sha256 6afe2821…` / `payload_kernel_sha256 dda4928e…`。
+两函数帧：`clover_bb_member_receiver` 0x1d0、`clover_bb_self_sample` 0x250（修后）、`clover_bb_sample`
+仍是 0x14F0——最深链 ≈6 KB，16 KB 预算内。`verify-clover-payload.py` EXIT=0（51 OK／0 FAIL，r359 三枚
+pin 全在场）；`check-clover.py` EXIT=0；17 支负测全绿并逐字节还原（`round359-negatives.log`）。
+
+**读数（boot 140，`round359b-v0.7.80-payload.img` sha `dc71b711…`）。** 证据产物
+`~/clover-out/round359-boot140-decoded.txt`；日志 `round359-flash-boot140.log`。
+- **闸门①过**：一火 bbsend 4 行＝`cand=4`（hop 0/1/2 是 pset，hop 3 是端口 `nm=7007 e=0
+  scan=no_srights so=1`）；r350 holdrn pid=27 `rn=a03 q=0 sr=1 ms=1 so=1 once=1`（同一采样里另一
+  对象 `rn=5e07 sr=0` 也印）＋r352 onceh `hpid=58 nm=1510f`（Y-A 第七靴复现）。
+- **S-A 成立**：三个集合共 17 个成员，`psmrcv` 全部 `rpid=58 c=backboardd` ⇒ 集合没有跨任务；
+  hop=2 i=1 的 `a003`（`sr=5 ms=0`）持有者是 launchd `nm=12103`、SpringBoard `nm=150b`、
+  chronod `nm=2207`、com.apple.datamigrator `nm=2d07`，`hits=4` 四条反查腿全中；`ms=0` ⇒
+  这些发送权**一次都没用过**。环因此在同一集合里闭合：SpringBoard 能发 `a003`、从没发；
+  backboardd 在等 `a003`。
+- **S-D 不按字面成立，但形状更硬**：`bbth th=19 wait=18 run=1 m2=11`（采样瞬间），
+  `r262 census threads=22 wait=21 run=1 hidden=2`；四枚 `bbt` 全 `cls=m2`，`rn=5203/5003/6603/7007`
+  （前三枚是端口集合、第四枚是端口），其中 tid=`4d2` 一枚 `rem=8507`。⇒ boot 138 的 `8 runnable`
+  是一个刻面，不是稳态；这一靴 backboardd 几乎全停。
+- **r358 的 hoprr 第一次执行**（boot 139/140 的 hop=3 是端口）：`hoprr pid=58 hop=3 nm=7007
+  rnm=7007 rstate=0 rpid=58 c=backboardd` ⇒ 那枚叶子口也是 backboardd 自己的收口，`so=1 sr=0`
+  ⇒ 只有 send-once 回复权能进来。
+- `r327 bbnow hn=4 state=hop_unresolved o3=fail r3=8507`：hop 3 的**发送目的地** 8507 的属主解析失败
+  ——`clover_sb_port_owner` 的 SEND/RECEIVE/PSET 三条腿都翻不动它，最可能是 send-once 权，也就是
+  「先把回信发给回复权、再继续收 7007」那种服务循环的那一半。
+- **显示**：本靴 `client=pid58`（backboardd 自己成了显示客户端，`p58=29`）、`calls=41 fails=20`、
+  `hot=6:11/5/e00002d5`、`latch=copy=fc=5`、`box=305x811..970x1108` 未变、`vs=0/0/0`。
+- **落回**：最新卡记录 `t=573 s`，之后静默复位、宿主 BCB 进 TWRP（无 panic sink）。
+
+**下一手（r360 题面，预登记）。**
+- (a) **读 8507 的条目位**：用 r351 的 `bbsmown` 腿在 backboardd 自己的空间里读 `8507` 的 `ty=`/`raw=`/
+  `ur=`；若 `ty=sendonce`，则 tid=`4d2` 是「回信后继续收」的服务线程，环不在 backboardd 的收，
+  而在「SpringBoard 等的那封回信为什么没发出去」。
+- (b) **把 send-once 普查打到 `a003` 的四个持有者上**：尤其 SpringBoard 的 `150b`，确认它手里的发送权
+  是不是同一枚口的 send-once 回复权——若是，则 `a003 ms=0` 与 SpringBoard 的阻塞是同一件事的两面。
+- 预登记 T-A…T-C：T-A `8507 ty=sendonce` ⇒ 服务循环成立、下一手转 SpringBoard 侧；T-B `8507` 是
+  send 且 `ur>0` ⇒ 它在等服务端取信，环仍在收；T-C 读不到（`e=`）⇒ 记名不判。
+  控制腿：`bbsmown` 行数 == 同火 `8507` 所在 hop 的 `bbown`/`bbsm` 行；`hoprr` 再缺席必须先有
+  `scan=pset` 或 `hop_null` 才能记「结构缺席」。
