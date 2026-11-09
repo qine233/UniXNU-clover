@@ -1421,8 +1421,8 @@ def check_sb_sample(kernel: bytes) -> bool:
              # an io_connect_method selector lives.
              "r361-remkobj": (b"clover r361: remkobj t=%llu pid=%d hop=%d i=%u nm=%x kotype=%u "
                               b"kobj=%llx sr=%u so=%u q=%u rnm=%x rstate=%d rpid=%d c=%s\n") in kernel,
-             "r361-remcall": (b"clover r361: remcall t=%llu pid=%d hop=%d i=%u nm=%x io=%d id=%x b=%x "
-                              b"sz=%x rem=%x loc=%x vou=%x m0=%x m1=%x\n") in kernel,
+             "r362-remcall": (b"clover r362: remcall t=%llu pid=%d hop=%d i=%u nm=%x p=%llx io=%d "
+                              b"id=%x b=%x sz=%x rem=%x loc=%x vou=%x m0=%x m1=%x\n") in kernel,
              # Round354 keeps the four heavy helpers out of clover_bb_sample's frame. noinline is a
              # source attribute, but what boot 133 died on was the link: the helpers' frames accreted
              # into one 10912-byte frame and the beat thread's 16 KB stack overflowed. Each helper

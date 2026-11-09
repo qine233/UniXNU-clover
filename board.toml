@@ -288,7 +288,12 @@ loader = "firmware"
 # last hop of the ring is a kernel object and the call it is waiting for is a method, not a userspace
 # peer. remkobj names the ip_kotype/ip_kobject family and remcall reads the message's first words;
 # the selector of an io_connect_method call is body word 0.
-title = "clover r361: boot 141 put the last hop on a kernel-space port -- 640b is a plain send right whose receiver space has no task (rnm=1, rstate=1, c=kspace), so backboardd's trap is a request to a kernel object with the reply awaited on its own 8107. This round names the object and the call: clover r361: remkobj prints ip_kotype/ip_kobject beside the counters (IKOT_IOKIT_CONNECT 29 and IKOT_IOKIT_OBJECT 30 name the family), and clover r361: remcall copyins the first eight words of the trapped thread's message and prints io=/id=/b=/sz=/rem=/loc=/vou=/m0=/m1= -- for an io_connect_method call m0 is the selector, so \"waiting on a kernel port\" becomes \"waiting for this method\". Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
+#
+# Round362's case: boot 143 read kotype=29 (an IOKit connect port) but remcall's words were not a
+# message header, so the pointer itself has to be printed before the selector is judged. The same
+# round fixes the landing rule: a reset must come back to TWRP without a key press, so the misc BCB
+# is written by default after --boot-after-flash, retried, and an Android adb is asked for recovery.
+title = "clover r362: boot 143 named the last hop as an IOKit connect port (kotype=29) and left the method unread because remcall's eight words were not a message header. This round prints the trap's data pointer (\"p=\") beside those words, so the read can be checked against r221's h= for the same thread before any selector is judged. It also fixes the landing rule the maintainer asked for: a boot that resets must come back to TWRP without a key press, so --boot-after-flash authorises the 2048-byte misc BCB, the write is retried when it does not take, and an Android adb is asked for recovery instead of being read as a landing. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

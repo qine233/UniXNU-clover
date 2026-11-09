@@ -1,0 +1,19 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 6b7c36f..4fa86fc 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -15005,10 +15005,10 @@ clover_bb_rem_bits(task_t task, int pid, int hop, uint32_t i, mach_port_name_t r
+ 		int ioerr = (int)copyinmap(task->map, (vm_map_offset_t)msg, hdr, sizeof(hdr));
+ 
+ 		len = snprintf(row, sizeof(row),
+-		    "clover r361: remcall t=%llu pid=%d hop=%d i=%u nm=%x io=%d id=%x b=%x"
+-		    " sz=%x rem=%x loc=%x vou=%x m0=%x m1=%x\n",
+-		    (unsigned long long)secs, pid, hop, i, rem, ioerr, hdr[5], hdr[0],
+-		    hdr[1], hdr[2], hdr[3], hdr[4], hdr[6], hdr[7]);
++		    "clover r362: remcall t=%llu pid=%d hop=%d i=%u nm=%x p=%llx io=%d id=%x"
++		    " b=%x sz=%x rem=%x loc=%x vou=%x m0=%x m1=%x\n",
++		    (unsigned long long)secs, pid, hop, i, rem, (unsigned long long)msg,
++		    ioerr, hdr[5], hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[6], hdr[7]);
+ 		if (len > 0) {
+ 			row[sizeof(row) - 1] = '\0';
+ 			clover_emmc_probe_say(row, (unsigned int)strlen(row));

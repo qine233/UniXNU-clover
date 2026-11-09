@@ -30124,3 +30124,69 @@ pin 全在场）；`check-clover.py` EXIT=0；17 支负测全绿并逐字节还�
   V-C 对象头不可安全读 ⇒ 只留指针，改用宿主符号表比对，不猜。
 - 控制：`remcall` 行数 == `asked=`；`p` 只在 `ent==1 && ty!=0` 时出现；`io=0` 时 `m0/m1` 必须与
   r221 同线程的 `h=` 第三、四字（remote/local）自洽，否则不判。
+
+
+## Round362 —— 印出 trap 的 data 指针；并把「崩溃后回 TWRP」改成无人值守规则
+
+**题面。** boot 143 把最后一跳点名成 `kotype=29`（IOKit 连接口），但 `remcall` 的八个字不是
+mach 头形状（`b=0 sz=975d979e rem=7`），同靴 r221 在别的线程上读到 `h=1513.28.203.1ed33.0.ca8`。
+所以先要把 trap 的 `data` 指针（`p=`）印出来，才能判「这是不是发送缓冲」。同时用户提出：
+**崩溃后应该自动回 TWRP**，这几次测试都是手动进的 fastboot。
+
+**改动（两部分）。**
+1. 内核（`osfmk/kern/task.c`）：`remcall` 重打 r362 标并加 `p=%llx`（`mach_msg2_trap_args.data`，
+   `osfmk/mach/mach_traps.h:466`），其余列不动；删 4 行（行字面量与参数行各两行）。
+2. 宿主（`scripts/run-clover-unattended.sh`）：
+   - `adb_serial()` 只认 `state == recovery`；新增 `adb_android_serial()`。Android 的 `device`
+     以前会被当成「landing in recovery」，读的却是 Android 的窗口——这正是要人工介入的那一类。
+   - `watch_landing` / `watch_after_deadline` 见到 Android 就 `adb reboot recovery`，继续等。
+   - `--boot-after-flash` **默认授权** 2048 字节 misc BCB（写入前照旧打印分区与命令），并把
+     「写 BCB → reboot → 等 TWRP」改成最多 `RECOVERY_RETRIES=3` 次的循环：misc 写失败、reboot
+     失败、BCB 没生效（又回 fastboot）、或两种模式都没出现，都重试而不是退出。
+   - 保留原有失败文案与退出码语义（3/4/6），只是重试后才报。
+
+**预登记（boot 144，r362 镜像）。**
+- **W-A**：`remcall p=<非零>` 且 `io=0`，且同一线程的 r221 `h=` 与 `m0/m1` 对得上 ⇒ 头读取成立，
+  下一手判 selector（IOKit connect 的 selector 在体第 0 字）。
+- **W-B**：`p` 非零但读出的头仍不是 mach 形状，且与 r221 的 `h=` 不同 ⇒ 这条 trap 的 `data` 不是
+  发送缓冲（可能是接收缓冲或已切换），下一手改从 `x7`/`msgh_bits` 反推，不判 selector。
+- **W-C**：`p=0` ⇒ 该 trap 没有 data（纯收），`remcall` 不该出现；记录并检查 hop 捕获。
+- **落回规则**：boot 144 的 reset 之后必须**不经人手**到 TWRP；若仍回 fastboot，脚本应在
+  `RECOVERY_RETRIES` 内重写 BCB 并落地；若落到 Android，脚本应 `adb reboot recovery`。
+  控制：日志里每次 misc 写都带分区与命令；TWRP 起来后 `misc block 0 command=''`。
+
+**构建。** 补丁 md5 `16416fbc6c88c4899e8b14d073ee20a1`（三份同字节，增 4／删 4）；kernel md5
+`e7f09638` / sha256 `e35ecc9a…`（52,482,048 B）；AMFI `e063a541…`（两刀仍在
+`0x1af70e4`/`0x1af716c`）；normalize `d1d3df79…`（973 戳）；`round362-v0.7.83-payload.img`
+sha256 `3bd7fc70…`（58,720,256 B）。两闸门 EXIT=0（51 OK／0 FAIL）；闸门另有四枚宿主针脚
+（`adb_serial` 只认 recovery、`--boot-after-flash` 默认授权、`RECOVERY_RETRIES`、Android 的
+`adb reboot recovery` 句子），15 支负测（`round362-negatives.log`）。
+
+**读数（boot 144，`round362-v0.7.83-payload.img` sha `3bd7fc70…`）：这一靴没回来。**
+日志 `round362-flash-boot144.log`：`--boot-after-flash` 起跑、冷刷 cache、payload 起来后
+**35 分钟窗口内既无 TWRP 的 adb 也无 fastboot**，收段是 `close:neither-edl`；随后 `ioreg` 确认
+`QUSB_BULK_SN:F6548A52` —— 板子停在 **EDL**。这不是本轮仪器的问题，也不是 BCB 的问题（BCB 是给
+bootloader 读的，EDL 在 bootloader 之前）；EDL 只有上电复位能退出，宿主这几把工具都看不见它。
+`remcall p=` 的判读因此**待**：卡上 boot 144 的窗口还在，一次电源循环（长按电源 ~10 s）之后，
+不管落在 TWRP 还是 fastboot，都能把这一靴读出来（TWRP 直接 `--skip-recovery`；fastboot 则脚本的
+BCB 写会接手）。
+
+**落回规则的修复（本轮的宿主半边）。**
+- `adb_serial()` 只认 `state == recovery`；新增 `adb_android_serial()`。此前 Android 的 `device`
+  会被当成「landing in recovery」，读的却是 Android 的窗口——这正是要人工介入的那一类。
+- `watch_landing` / `watch_after_deadline` 见到 Android 就 `adb reboot recovery`，继续等。
+- `--boot-after-flash` 默认授权 2048 字节 misc BCB（写入前照旧打印分区与命令），并把
+  「写 BCB → reboot → 等 TWRP」改成 `RECOVERY_RETRIES=3` 次循环：misc 写失败、reboot 失败、
+  BCB 没生效又回 fastboot、或两种模式都没出现，都重试而不是退出。
+- **EDL 快速判定**：两次 watch 每 2 s 读一次 `usb_landing_class()`，连续 5 次 `edl` 就收段并返回 3，
+  脚本立即以退出码 7 报「板子在 EDL，需要一次电源循环」，不再白等 35 分钟。
+- 这三条都进了闸门针脚（`recovery`/`device` 两个 matcher、`ALLOW_BCB=1`、`RECOVERY_RETRIES`、
+  Android 那句话），因此负测能逐条打红。
+
+**下一手（r363 题面）。**
+- (a) 电源循环后先读 boot 144：`remcall p=` 与同线程 r221 的 `h=` 对照，判 W-A/W-B/W-C。
+- (b) 若 W-A 成立，把 `m0`（`io_connect_method` 的 selector）与 `kobj` 对到具体 user client，
+  再决定补哪个方法分支。
+- (c) EDL 的可恢复性：宿主目前没有 SDM660 的 firehose loader。若能在本机拿到
+  `prog_firehose_ddr.elf`（Mi Pad 4 的 fastboot 包里），`edl reset` 就能把 EDL 变成一次自动复位，
+  「崩溃后回 TWRP」才算真正闭环；否则 EDL 落回永远需要一次人工电源循环，这条要写进 limits。

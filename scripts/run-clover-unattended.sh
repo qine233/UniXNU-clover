@@ -63,6 +63,8 @@ set -u
 WAIT=2100
 ADB_WAIT=180
 LANDING_WAIT=2100
+# Round362: a BCB that did not take is retried rather than ending the run.
+RECOVERY_RETRIES=${RECOVERY_RETRIES:-3}
 # Round202. The payload's deadline is 1800 s of its own uptime (round228 moved it from 900),
 # not 1800 s of the host's wall clock: after the reboot it still has to reach that instant,
 # sit on the panic screen for its reset delay, boot the bootloader and start TWRP's adb.
@@ -113,7 +115,9 @@ Options:
                          landing: TWRP's adb (the panic path wrote its own BCB into
                          misc) or fastboot (it did not, and this script then writes
                          the BCB itself so the window is still read)
-  --allow-misc-bcb       consent to flashing a 2048-byte Android BCB
+  --allow-misc-bcb       consent to flashing a 2048-byte Android BCB (--boot-after-flash
+                         implies it: a round that boots a payload unattended is asking for the
+                         landing that reads it, and the write is declared before it runs)
                          (command=boot-recovery) into the misc partition so the
                          bootloader boots recovery next; no other partition is
                          written
@@ -132,7 +136,7 @@ while [ $# -gt 0 ]; do
     --out) OUT=$2; shift 2 ;;
     --serial) SERIAL=$2; shift 2 ;;
     --flash-cache) FLASH_CACHE=$2; shift 2 ;;
-    --boot-after-flash) BOOT_AFTER_FLASH=1; shift ;;
+    --boot-after-flash) BOOT_AFTER_FLASH=1; ALLOW_BCB=1; shift ;;
     --allow-misc-bcb) ALLOW_BCB=1; shift ;;
     --skip-recovery) SKIP_RECOVERY=1; shift ;;
     --reboot-bootloader) REBOOT_BOOTLOADER=1; shift ;;
@@ -182,10 +186,20 @@ fastboot_serial() {
 adb_serial() {
   # TWRP's adbd reports the state as "recovery", not "device". Round147 through round184 matched only
   # "device" here, so a board sitting in TWRP looked like a board that never booted recovery -- the
-  # 180 s wait in the first round184 flash test timed out with recovery already on the USB bus. Both
-  # states mean the same thing to this script: there is a shell to dd the log window through.
+  # 180 s wait in the first round184 flash test timed out with recovery already on the USB bus.
+  # Round362 narrows it back to "recovery" only: the Android image reports "device", and round195
+  # measured a reset that came up in Android. Treating that as a landing was the silent misread this
+  # script keeps paying for -- the window read afterwards is then Android's, not this build's. The
+  # Android state gets its own helper and one action: ask it for recovery.
   adb devices 2>/dev/null |
-    awk -v want="$SERIAL" 'NR > 1 && ($2 == "device" || $2 == "recovery") && (want == "" || $1 == want) {print $1; exit}'
+    awk -v want="$SERIAL" 'NR > 1 && $2 == "recovery" && (want == "" || $1 == want) {print $1; exit}'
+}
+# Round362. The other end of the same distinction: an adb shell that is Android, not TWRP. The
+# script used to count it as a recovery landing and then fail in the block read; now it is named and
+# the only thing done to it is `adb reboot recovery`.
+adb_android_serial() {
+  adb devices 2>/dev/null |
+    awk -v want="$SERIAL" 'NR > 1 && $2 == "device" && (want == "" || $1 == want) {print $1; exit}'
 }
 # Round353 host side. Boot 132's control flash ended with the landing read as fastboot, then
 # `fastboot flash misc` sat in "< waiting for 81ffcaaa>" for 35 minutes because the board had
@@ -349,7 +363,7 @@ wait_leave_fastboot() {
 # one that wins at runtime, which is why this is a comment and not a function.
 watch_landing() {
   local deadline=$(( $(date +%s) + LANDING_WAIT ))
-  local a f
+  local a f edl=0
   timeline_open watch-landing "$LANDING_WAIT"
   while [ "$(date +%s)" -lt "$deadline" ]; do
     require_serial
@@ -357,6 +371,24 @@ watch_landing() {
     timeline_poll poll "$a" "$f"
     [ -n "$a" ] && { timeline_close adb "$a" "$f"; return 0; }
     [ -n "$f" ] && { timeline_close fastboot "$a" "$f"; return 1; }
+    # Round362. EDL is not a slow landing, it is an unreachable one: this host can see the
+    # QUSB_BULK node and neither tool can talk to it, and no amount of waiting changes that.
+    # Ten seconds of it is reported as its own outcome instead of a 35-minute silence.
+    if [ "$(usb_landing_class)" = edl ]; then
+      edl=$(( edl + 1 ))
+      if [ "$edl" -ge 5 ]; then
+        timeline_close edl "$a" "$f"
+        return 3
+      fi
+    else
+      edl=0
+    fi
+    android=$(adb_android_serial)
+    if [ -n "$android" ]; then
+      say "android is up on $android, not recovery: asking it for the recovery the payload boot wants"
+      timeline_poll android "$a" "$f"
+      adb -s "$android" reboot recovery >/dev/null 2>&1 || true
+    fi
     sleep 2
   done
   timeline_close "neither-$(usb_landing_class)" "" ""
@@ -369,7 +401,7 @@ watch_landing() {
 # fastboot, 2 neither).
 watch_after_deadline() {
   local deadline=$(( $(date +%s) + WAIT + DEADLINE_SLACK ))
-  local found f
+  local found f edl=0
   timeline_open after-deadline "$(( WAIT + DEADLINE_SLACK ))"
   while :; do
     require_serial
@@ -383,6 +415,22 @@ watch_after_deadline() {
     if [ -n "$f" ]; then
       timeline_close fastboot "$found" "$f"
       return 1
+    fi
+    # Round362: the same early EDL verdict as watch_landing -- see the note there.
+    if [ "$(usb_landing_class)" = edl ]; then
+      edl=$(( edl + 1 ))
+      if [ "$edl" -ge 5 ]; then
+        timeline_close edl "$found" "$f"
+        return 3
+      fi
+    else
+      edl=0
+    fi
+    android=$(adb_android_serial)
+    if [ -n "$android" ]; then
+      say "android is up on $android, not recovery: asking it for the recovery the payload boot wants"
+      timeline_poll android "$found" "$f"
+      adb -s "$android" reboot recovery >/dev/null 2>&1 || true
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
       timeline_close "neither-$(usb_landing_class)" "" ""
@@ -473,6 +521,16 @@ if [ "$SKIP_RECOVERY" = 0 ] && [ -n "$FLASH_CACHE" ]; then
         say "the board came back to fastboot: its reset ran, but misc held no recovery command"
         say "writing the host's BCB next so the window is still read from TWRP"
         ;;
+      3)
+        cat >&2 <<EOF
+[unattended] the board is in EDL (QUSB_BULK): the reset landed it in the one mode neither
+[unattended] adb nor fastboot can talk to, and no host write can bring it back. The card still
+[unattended] holds boot 144's window and misc still holds the payload's pre-armed recovery BCB,
+[unattended] so a power cycle (hold power ~10 s) is the whole recovery: the next boot should
+[unattended] come up in TWRP by itself, or in fastboot where this script's BCB write takes over.
+[unattended] Rerun this script with --skip-recovery once TWRP is up; nothing was lost.
+EOF
+        exit 7 ;;
       *)
         closing=$(timeline_last_close)
         die 6 "neither TWRP's adb nor fastboot within $(( WAIT + DEADLINE_SLACK ))s; that window closed as ${closing:-no-close-line}, quoted from the timeline's own close line because the tree it names was photographed at the close rather than here: neither-edl means the board reset and this host enumerated it, in the one mode these two tools do not see, so this line does NOT leave open whether the deadline fired or whether the reset happened -- what it leaves open is this boot's card read, which needs the board back in TWRP and does not lose the card (rerun with --skip-recovery); neither-no-node means nothing enumerated at all, which is where the three candidates still stand; timeline: $TIMELINE"
@@ -496,8 +554,22 @@ if [ "$SKIP_RECOVERY" = 0 ]; then
     fi
   fi
   if [ "$SKIP_RECOVERY" = 0 ]; then
-  if [ "$ALLOW_BCB" = 0 ]; then
-    cat >&2 <<EOF
+  # Round362. The landing rule the user asked for: a boot that resets must come back to TWRP
+  # without anyone holding a key. Round198 already pre-arms the BCB in the payload, but these
+  # boards have kept coming back to fastboot instead (the crash path this XBL takes does not
+  # consult misc), and every one of those rounds needed the host's 2048-byte BCB by hand. The
+  # write is therefore the default whenever a payload is booted unattended, it is declared
+  # before it runs, and it is retried: a BCB that did not take is one more write, not the end
+  # of the run.
+  BCB="$(dirname "$OUT")/clover-bcb-recovery.img"
+  attempt=1
+  while :; do
+    if [ -z "$(fastboot_serial)" ]; then
+      say "no fastboot for the BCB write on attempt ${attempt}: waiting up to ${WAIT}s for the board to come back"
+      wait_fastboot || die 2 "no fastboot after ${WAIT}s; the board is in neither recovery nor fastboot, so the BCB cannot be written and nothing was read; timeline: $TIMELINE"
+    fi
+    if [ "$ALLOW_BCB" = 0 ]; then
+      cat >&2 <<EOF
 [unattended] refusing to write the recovery boot command without consent.
 [unattended] Declared eMMC write: a 2048-byte Android BCB with command
 [unattended] "$BCB_COMMAND" is flashed into the misc partition, and nothing else.
@@ -505,35 +577,72 @@ if [ "$SKIP_RECOVERY" = 0 ]; then
 [unattended] the payload. Rerun with --allow-misc-bcb to allow exactly that, or boot
 [unattended] TWRP yourself and rerun with --skip-recovery.
 EOF
-    exit 3
-  fi
-  BCB="$(dirname "$OUT")/clover-bcb-recovery.img"
-  make_bcb "$BCB" || die 3 "could not write a ${BCB_SIZE}-byte BCB image at $BCB"
-  say "declared eMMC write: fastboot flash misc $BCB (${BCB_SIZE} bytes, command='$BCB_COMMAND', the misc partition only)"
-  fb_bounded 90 flash misc "$BCB" || die 2 "fastboot flash misc failed or no fastboot appeared within 90 s: the misc partition may now hold a truncated BCB"
-  say "rebooting into the recovery the BCB names: fastboot reboot"
-  fb_bounded 60 reboot >/dev/null 2>&1 || die 2 "fastboot reboot failed"
-  wait_leave_fastboot || die 6 "the board never left fastboot after 'fastboot reboot': it is still the same boot, so nothing was read"
-  say "the board left fastboot; watching up to ${LANDING_WAIT}s for TWRP's adb"
-  watch_landing
-  landing=$?
-  case $landing in
-    0) say "landed in recovery: adb $(adb_serial)" ;;
-    1)
-      cat >&2 <<EOF
-[unattended] the BCB did not take: the board came back to fastboot and TWRP's adb
-[unattended] never appeared, so the payload booted and its own deadline reset it.
-[unattended] Nothing was read. Fallbacks, in order:
+      exit 3
+    fi
+    make_bcb "$BCB" || die 3 "could not write a ${BCB_SIZE}-byte BCB image at $BCB"
+    if [ "$attempt" = 1 ]; then
+      say "declared eMMC write: fastboot flash misc $BCB (${BCB_SIZE} bytes, command='$BCB_COMMAND', the misc partition only; --boot-after-flash authorises this auto-recovery write)"
+    else
+      say "declared eMMC write (retry ${attempt}/${RECOVERY_RETRIES}): fastboot flash misc $BCB (${BCB_SIZE} bytes, command='$BCB_COMMAND', the misc partition only)"
+    fi
+    if ! fb_bounded 90 flash misc "$BCB"; then
+      if [ "$attempt" -ge "$RECOVERY_RETRIES" ]; then
+        die 2 "fastboot flash misc failed or no fastboot appeared within 90 s on the last attempt: the misc partition may now hold a truncated BCB; timeline: $TIMELINE"
+      fi
+      say "the misc write was not accepted on attempt ${attempt}; waiting for fastboot and retrying"
+      wait_fastboot || true
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+    say "rebooting into the recovery the BCB names: fastboot reboot"
+    if ! fb_bounded 60 reboot >/dev/null 2>&1; then
+      say "fastboot reboot was not accepted on attempt ${attempt}; waiting for fastboot and retrying"
+      wait_fastboot || true
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+    wait_leave_fastboot || die 6 "the board never left fastboot after 'fastboot reboot': it is still the same boot, so nothing was read"
+    say "the board left fastboot; watching up to ${LANDING_WAIT}s for TWRP's adb (attempt ${attempt}/${RECOVERY_RETRIES})"
+    watch_landing
+    landing=$?
+    case $landing in
+      0) say "landed in recovery: adb $(adb_serial)"; break ;;
+      1)
+        if [ "$attempt" -lt "$RECOVERY_RETRIES" ]; then
+          say "the BCB did not take on attempt ${attempt}: the board is in fastboot again, writing it once more"
+          attempt=$(( attempt + 1 ))
+          sleep 3
+          continue
+        fi
+        cat >&2 <<EOF
+[unattended] the BCB did not take after ${RECOVERY_RETRIES} attempts: the board came back to
+[unattended] fastboot and TWRP's adb never appeared, so the payload booted and its own
+[unattended] reset landed it here. Nothing was read. Fallbacks, in order:
 [unattended]   1. power-cycle (IMEM is volatile, a power cycle clears the reason),
-[unattended]      hold Vol- while powering on to reach fastboot, then rerun this
-[unattended]      script with --allow-misc-bcb;
+[unattended]      hold Vol- while powering on to reach fastboot, then rerun this script;
 [unattended]   2. boot TWRP from its own partition, then rerun with --skip-recovery.
 EOF
-      exit 4 ;;
-    *) closing=$(timeline_last_close)
-       say "neither TWRP's adb nor fastboot within ${LANDING_WAIT}s; that window closed as ${closing:-no-close-line}, quoted from the timeline's own close line rather than measured again here: close:neither-edl means the board reset and this host enumerated it in the one mode these two tools do not see, close:neither-no-node means nothing enumerated at all and the panic screen remains the candidate (it resets after 20 s)"
-       say "every poll of that window is on disk with its two answers, its landing class and the USB tree: $TIMELINE" ;;
-  esac
+        exit 4 ;;
+      3)
+        cat >&2 <<EOF
+[unattended] the board is in EDL (QUSB_BULK) after the BCB reboot: unreachable from this host.
+[unattended] A power cycle (hold power ~10 s) is the whole recovery; misc still holds the
+[unattended] recovery BCB unless TWRP has already cleared it, so the next boot should come up in
+[unattended] TWRP or in fastboot. Nothing was lost: the card keeps the window.
+EOF
+        exit 7 ;;
+      *) closing=$(timeline_last_close)
+         say "neither TWRP's adb nor fastboot within ${LANDING_WAIT}s on attempt ${attempt}; that window closed as ${closing:-no-close-line}, quoted from the timeline's own close line rather than measured again here: close:neither-edl means the board reset and this host enumerated it in the one mode these two tools do not see, close:neither-no-node means nothing enumerated at all, and the panic screen remains the candidate (it resets after 20 s)"
+         say "every poll of that window is on disk with its two answers, its landing class and the USB tree: $TIMELINE"
+         if [ "$attempt" -lt "$RECOVERY_RETRIES" ]; then
+           say "attempt ${attempt} closed in neither mode; waiting for the board and retrying the BCB"
+           wait_fastboot || die 2 "no fastboot after ${WAIT}s and no recovery adb either: the board is in a mode this host cannot write to; timeline: $TIMELINE"
+           attempt=$(( attempt + 1 ))
+           continue
+         fi
+         exit 4 ;;
+    esac
+  done
   fi
 fi
 
