@@ -261,7 +261,15 @@ loader = "firmware"
 # and never translated. The gate pins the SEND-first translate order, the same r355 snapshot columns on
 # the holder's own space, the skip=same row (a silent skip would read as "no trapped thread"), and the
 # holdrsh naming pair down to the legs r355 and r352 already provide.
-title = "clover r357: boot 136 read W-C on SpringBoard's rem -- sr=1 alive, so=1 set, and the once-walk found no ipc_entry holder in any of the 141 spaces, because a send-once right is created at send time from msgh_local_port and lives inside the receiving kmsg, which no name table can point at. What can be named is the port's receiver: this leg reads ip_get_receiver and ip_get_receiver_name under r356's translate lock (r220's discipline), resolves the receiving task through the proc_find pointer walk (r331's census legs) and prints clover r357: holdrr with rnm=/rstate=/rpid=/c= -- rstate=1 is a kernel space, 2 a dead receiver, -3 a task the walk could not name. The main row gains op=, the options word the trapped thread carries in x2 (mach_msg2_trap_args' second slot), cutting \"the call is sending\" from \"pure receive, rem rode along\"; if rpid says 58 the ring is a three-hop and backboardd's turn comes round again. The r356 row family is re-tokened, nothing else moved: no offset, kind, clamp, ring geometry or cadence."
+#
+# Round358's case: boot 137 named rem's receiver (58:backboardd, two independent legs agreeing) and
+# left backboardd itself at hop=2 nm=730b with scan=no_srights, which is exactly the shape rem had
+# before r357 pointed a receiver leg at it. The same boot's control leg also caught where the option
+# word is read from: on this board x1 carries option64 (r264's unpacking, and r221's op=), while x2
+# is msgh_bits|send_size. The gate pins both columns, the re-token to r358, and that hoprr reads the
+# port the bbsend row already resolved -- one translate, so the receiver and the holders describe one
+# object rather than two samplings that can disagree.
+title = "clover r358: boot 137 answered r357's question and caught r357's own column: rem=150b's receiver is 58:backboardd (two independent legs), and backboardd itself sits at hop=2 nm=730b with scan=no_srights, the shape rem had before r357 pointed the leg at it. This round fixes op= to read x1 -- the mach_msg2 option word per r264's unpacking and r221's op= -- and gives the x2 word (msgh_bits|send_size) its own name bs=; it also moves the receiver leg onto the hop the bbsend row already resolved, printing clover r358: hoprr with rnm=/rstate=/rpid=/c= for 730b, so the column that said \"header bystander\" now says \"receiver owner\" instead. rstate=1 is a kernel space, 2 a dead receiver, -3 a task the walk could not name. The r357 row family is re-tokened; nothing else moved: no offset, kind, clamp, ring geometry or cadence."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

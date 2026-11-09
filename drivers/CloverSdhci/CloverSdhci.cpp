@@ -1276,6 +1276,17 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r357: holdrr", "r357-holdrr", 64, 0, 0, 0 },
   { "clover r357: holdrs", "r357-holdrs", 64, 0, 0, 0 },
 
+  // Round358 fixes the holder_send family's option column -- op= now reads x1, the slot r264's
+  // unpacking and r221's op= measured, and x2's msgh_bits|send_size rides as bs= -- and re-tokens
+  // the family again, so the r357 classes above are dead matchers kept for the record. It also
+  // moves the receiver leg onto the hop bbsend already resolved: `hoprr` names that port's
+  // receive-right owner, one row per translated hop per fire. Order stays load-bearing the same
+  // way: "holdrsh" must be listed before "holdrs" or the naming rows eat the main row's budget.
+  { "clover r358: holdrsh", "r358-holdrsh", 64, 0, 0, 0 },
+  { "clover r358: holdrr", "r358-holdrr", 64, 0, 0, 0 },
+  { "clover r358: holdrs", "r358-holdrs", 64, 0, 0, 0 },
+  { "clover r358: hoprr", "r358-hoprr", 64, 0, 0, 0 },
+
   // Round349 follows each named holder into its own task in the same fire: `holdth` is the
   // per-task summary (threads, waiters, runners, trapped) and `holdt` at most two trapped threads
   // with their receive name, send destination and continuation. Six holders per fire at most, so
@@ -4995,6 +5006,10 @@ static void teeConsumeLine (uint32_t &pushed)
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r355") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r356") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r357") ||
+       // Round358 re-tokens that same pair and adds hoprr on the hop bbsend resolved: the receiver
+       // row and the holders row describe one object, so a pass cap that kept one and ate the other
+       // would turn a named ring into a number again.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r358") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is

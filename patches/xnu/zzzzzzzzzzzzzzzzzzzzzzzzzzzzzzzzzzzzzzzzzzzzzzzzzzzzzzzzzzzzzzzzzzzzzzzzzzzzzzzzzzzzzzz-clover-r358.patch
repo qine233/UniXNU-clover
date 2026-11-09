@@ -1,0 +1,204 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index fc0bdcc..c67b73a 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -12937,14 +12937,19 @@ clover_bb_holder_door(task_t task, int pid, int hop, int i, int j,
+  * msgh_local_port and lives inside the receiving kmsg, so the holder of that right cannot be named
+  * from a name table at all: what can be named is the port's receiver. This reads ip_get_receiver and
+  * ip_receiver_name under the translate lock (r220's discipline), resolves the receiving task through
+- * the proc_find pointer walk (r331's census legs), and prints clover r357: holdrr; the option word
+- * the trapped thread carries in x2 (struct mach_msg2_trap_args' second slot) rides the main row as
+- * op=, because "this call is sending" and "this call only receives, rem is a header bystander" must
+- * not print as one silence either.
++ * the proc_find pointer walk (r331's census legs), and prints clover r357: holdrr.
++ *
++ * Round358 fixes this family's own column, which boot 137 caught with its control leg: the trapped
++ * thread carries the option word in x1 -- r264 measured this board's unpacking as x2 = msgh_bits |
++ * send_size and x3 = remote | local, and r221 reads its op= from r[1] -- so op= now reads x1 and
++ * the x2 word keeps its own name bs=. "this call is sending" and "this call only receives, rem is a
++ * header bystander" must not print as one silence, and neither must the option word and the bit
++ * field. The row family is re-tokened to r358 because a column that changed meaning may not keep
++ * arriving under the name the old reader trusts.
+  */
+ static void __attribute__((noinline))
+ clover_bb_holder_send(task_t task, int pid, int hop, int i, int j,
+-    mach_port_name_t rem, uint64_t opt, uint64_t secs)
++    mach_port_name_t rem, uint64_t opt, uint64_t bs, uint64_t secs)
+ {
+ 	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
+ 	ipc_space_t space = task->itk_space;
+@@ -13002,7 +13007,7 @@ clover_bb_holder_send(task_t task, int pid, int hop, int i, int j,
+ 		kr = ipc_object_translate(space, rem, MACH_PORT_RIGHT_PORT_SET, &obj);
+ 		if (kr != KERN_SUCCESS) {
+ 			len = snprintf(row, sizeof(row),
+-			    "clover r357: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x e=%d\n",
++			    "clover r358: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x e=%d\n",
+ 			    (unsigned long long)secs, hop, i, j, pid, rem, (int)kr);
+ 			if (len > 0) {
+ 				row[sizeof(row) - 1] = '\0';
+@@ -13053,12 +13058,13 @@ clover_bb_holder_send(task_t task, int pid, int hop, int i, int j,
+ 		io_unlock(obj);
+ 	}
+ 	len = snprintf(row, sizeof(row),
+-	    "clover r357: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x ty=%d o=%llx"
++	    "clover r358: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x ty=%d o=%llx"
+ 	    " q=%u sr=%u ms=%u so=%u own=%u hits=%u probed=%u scanned=%u"
+-	    " once=%u och=%u ocp=%u ocs=%u op=%llx n=%u\n",
++	    " once=%u och=%u ocp=%u ocs=%u op=%llx bs=%llx n=%u\n",
+ 	    (unsigned long long)secs, hop, i, j, pid, rem, ty,
+ 	    (unsigned long long)(uintptr_t)obj, q, sr, ms, so, own, hits, probed, scanned,
+-	    once, once, once_probed, once_scanned, (unsigned long long)opt, members);
++	    once, once, once_probed, once_scanned, (unsigned long long)opt,
++	    (unsigned long long)bs, members);
+ 	if (len > 0) {
+ 		row[sizeof(row) - 1] = '\0';
+ 		clover_emmc_probe_say(row, (unsigned int)strlen(row));
+@@ -13092,7 +13098,7 @@ clover_bb_holder_send(task_t task, int pid, int hop, int i, int j,
+ 			strlcpy(rc, "none", sizeof(rc));
+ 		}
+ 		len = snprintf(row, sizeof(row),
+-		    "clover r357: holdrr t=%llu hop=%d i=%u j=%u pid=%d rem=%x rnm=%x rstate=%d"
++		    "clover r358: holdrr t=%llu hop=%d i=%u j=%u pid=%d rem=%x rnm=%x rstate=%d"
+ 		    " rpid=%d c=%s\n",
+ 		    (unsigned long long)secs, hop, i, j, pid, rem, rnm, rstate, rpid, rc);
+ 		if (len > 0) {
+@@ -13103,7 +13109,7 @@ clover_bb_holder_send(task_t task, int pid, int hop, int i, int j,
+ 	}
+ 	for (k = 0; ty == 0 && k < once && k < 4; k++) {
+ 		len = snprintf(row, sizeof(row),
+-		    "clover r357: holdrsh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s raw=%llx\n",
++		    "clover r358: holdrsh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s raw=%llx\n",
+ 		    (unsigned long long)secs, pid, j, sp[k], sc + k * 16, sn[k],
+ 		    clover_right_type_word((ipc_entry_bits_t)sb[k]),
+ 		    (unsigned long long)sb[k]);
+@@ -13150,6 +13156,7 @@ clover_bb_holder_sample(int pid, int hop, int i, int j, mach_port_name_t door,
+ 	uint32_t r_rn[2];
+ 	uint32_t r_rem[2];
+ 	uint64_t r_opt[2];
++	uint64_t r_bs[2];
+ 	uint32_t rows = 0;
+ 	uint32_t k;
+ 	char row[220];
+@@ -13203,7 +13210,8 @@ clover_bb_holder_sample(int pid, int hop, int i, int j, mach_port_name_t door,
+ 			r_pc[rows] = (uint64_t)get_saved_state_pc(ss);
+ 			r_rn[rows] = (uint32_t)rn;
+ 			r_rem[rows] = (uint32_t)rem;
+-			r_opt[rows] = (uint64_t)saved_state64(ss)->x[2];
++			r_opt[rows] = (uint64_t)saved_state64(ss)->x[1];
++			r_bs[rows] = (uint64_t)saved_state64(ss)->x[2];
+ 			rows++;
+ 		}
+ 	}
+@@ -13250,7 +13258,7 @@ clover_bb_holder_sample(int pid, int hop, int i, int j, mach_port_name_t door,
+ 		 */
+ 		if (r_rem[k] != 0 && r_rem[k] == r_rn[k]) {
+ 			len = snprintf(row, sizeof(row),
+-			    "clover r357: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x skip=same\n",
++			    "clover r358: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x skip=same\n",
+ 			    (unsigned long long)secs, hop, i, j, pid, r_rem[k]);
+ 			if (len > 0) {
+ 				row[sizeof(row) - 1] = '\0';
+@@ -13259,7 +13267,7 @@ clover_bb_holder_sample(int pid, int hop, int i, int j, mach_port_name_t door,
+ 			}
+ 		} else if (r_rem[k] != 0) {
+ 			clover_bb_holder_send(task, pid, hop, i, j,
+-			    (mach_port_name_t)r_rem[k], r_opt[k], secs);
++			    (mach_port_name_t)r_rem[k], r_opt[k], r_bs[k], secs);
+ 		}
+ 	}
+ 	task_deallocate(task);
+@@ -13441,6 +13449,82 @@ clover_bb_hop_pset(task_t task, int pid, int hop, mach_port_name_t name,
+ 	return 1;
+ }
+ 
++/*
++ * Round358. Boot 137 named the receiver of SpringBoard's send destination (58:backboardd) and left
++ * backboardd itself stuck at hop=2 nm=730b with scan=no_srights -- exactly the shape rem had before
++ * r357 pointed the receiver leg at it. The bbsend row already resolves and references that hop's
++ * port in the waiter's own space, so the receiver leg needs no new translation: this reads
++ * ip_get_receiver and ip_get_receiver_name under the port's own lock (r220's discipline), resolves
++ * the receiving task with the proc_find pointer walk (r357's legs) and prints clover r358: hoprr.
++ * A hop that resolved as a port set never reaches here -- its members are r347's question, and a
++ * set has no receiver to name.
++ */
++static void __attribute__((noinline))
++clover_bb_hop_receiver(ipc_port_t port, int pid, int hop, mach_port_name_t name, uint64_t secs)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	extern struct proc *proc_find(int pid);
++	extern task_t proc_task(struct proc *p);
++	extern int proc_rele(struct proc *p);
++	ipc_space_t recv;
++	task_t owner = TASK_NULL;
++	uint32_t rnm = 0;
++	int rstate = -1;
++	int rpid = -3;
++	int pid2;
++	struct proc *pp;
++	char rc[16];
++	char row[200];
++	int len;
++
++	rc[0] = '\0';
++	io_lock(port);
++	recv = ip_get_receiver(port);
++	rnm = (uint32_t)ip_get_receiver_name(port);
++	if (recv == IPC_SPACE_NULL) {
++		rstate = 2;
++	} else if (recv->is_task == TASK_NULL) {
++		rstate = 1;
++	} else {
++		owner = recv->is_task;
++		task_reference(owner);
++		rstate = 0;
++	}
++	io_unlock(port);
++	if (owner != TASK_NULL) {
++		for (pid2 = 1; pid2 <= CLOVER_BB_SEMA_PROBE; pid2++) {
++			pp = proc_find(pid2);
++			if (pp == NULL) {
++				continue;
++			}
++			if (proc_task(pp) == owner) {
++				rpid = pid2;
++				if (proc_name_address(pp) != NULL) {
++					strlcpy(rc, proc_name_address(pp), sizeof(rc));
++				}
++				proc_rele(pp);
++				break;
++			}
++			proc_rele(pp);
++		}
++		task_deallocate(owner);
++	} else if (rstate == 1) {
++		rpid = -1;
++		strlcpy(rc, "kspace", sizeof(rc));
++	} else if (rstate == 2) {
++		rpid = -2;
++		strlcpy(rc, "none", sizeof(rc));
++	}
++	len = snprintf(row, sizeof(row),
++	    "clover r358: hoprr t=%llu pid=%d hop=%d nm=%x rnm=%x rstate=%d rpid=%d c=%s\n",
++	    (unsigned long long)secs, pid, hop, name, rnm, rstate, rpid, rc);
++	if (len > 0) {
++		row[sizeof(row) - 1] = '\0';
++		clover_emmc_probe_say(row, (unsigned int)strlen(row));
++		printf("%s", row);
++	}
++}
++
+ /*
+  * Round331's row. One header plus at most CLOVER_BB_SEND_MAX names from each leg, relay first and
+  * console second like r326/r327/r328, because the boot that has to read this may be a boot whose
+@@ -13567,6 +13651,11 @@ clover_bb_send_holders_row(task_t task, int pid, int hop, mach_port_name_t name,
+ 		clover_emmc_probe_say(row, (unsigned int)strlen(row));
+ 		printf("%s", row);
+ 	}
++	/*
++	 * Round358: this hop's own receiver, not its holders. bbsend said nobody can post here any
++	 * more; who is parked on the other side is the next question the ring needs answered.
++	 */
++	clover_bb_hop_receiver(port, pid, hop, name, secs);
+ 	for (i = 0; i < hits && i < CLOVER_BB_SEND_MAX; i++) {
+ 		len = snprintf(row, sizeof(row),
+ 		    "clover r331: bbsh t=%llu i=%u pid=%u c=%s nm=%x ty=%s raw=%llx\n",

@@ -1382,21 +1382,24 @@ def check_sb_sample(kernel: bytes) -> bool:
              # row, these rows say who they counted.
              "r355-bbonceh": (b"clover r355: bbonceh t=%llu pid=%d hop=%d i=%u hpid=%u c=%s nm=%x "
                               b"ty=%s raw=%llx\n") in kernel,
-             # Round357 re-tokens the r356 family and answers what boot 136's W-C left open: the
-             # send-once right lives in a kmsg no name table can point at, so the row names the port's
-             # receiver instead (holdrr), and the main row carries op=, the options word the trapped
-             # thread holds in x2, which cuts "the call is sending" from "pure receive, rem rode along".
-             "r357-holdrs": (b"clover r357: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x ty=%d o=%llx"
+             # Round358 fixes that family's option column and re-tokens it: boot 137's control leg
+             # caught op= reading x2, but this board carries option64 in x1 (r264's unpacking, r221's
+             # op=) and msgh_bits|send_size in x2, so op= now reads x1 and x2 rides as bs=. The
+             # receiver leg moves onto the hop bbsend already resolved (hoprr), so backboardd's own
+             # 730b is named instead of counted.
+             "r358-holdrs": (b"clover r358: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x ty=%d o=%llx"
                              b" q=%u sr=%u ms=%u so=%u own=%u hits=%u probed=%u scanned=%u"
-                             b" once=%u och=%u ocp=%u ocs=%u op=%llx n=%u\n") in kernel,
-             "r357-holdrs-error": (b"clover r357: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x "
+                             b" once=%u och=%u ocp=%u ocs=%u op=%llx bs=%llx n=%u\n") in kernel,
+             "r358-holdrs-error": (b"clover r358: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x "
                                    b"e=%d\n") in kernel,
-             "r357-holdrs-skip": (b"clover r357: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x "
+             "r358-holdrs-skip": (b"clover r358: holdrs t=%llu hop=%d i=%u j=%u pid=%d rem=%x "
                                   b"skip=same\n") in kernel,
-             "r357-holdrr": (b"clover r357: holdrr t=%llu hop=%d i=%u j=%u pid=%d rem=%x rnm=%x "
+             "r358-holdrr": (b"clover r358: holdrr t=%llu hop=%d i=%u j=%u pid=%d rem=%x rnm=%x "
                              b"rstate=%d rpid=%d c=%s\n") in kernel,
-             "r357-holdrsh": (b"clover r357: holdrsh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s "
+             "r358-holdrsh": (b"clover r358: holdrsh t=%llu pid=%d j=%u hpid=%u c=%s nm=%x ty=%s "
                               b"raw=%llx\n") in kernel,
+             "r358-hoprr": (b"clover r358: hoprr t=%llu pid=%d hop=%d nm=%x rnm=%x rstate=%d "
+                            b"rpid=%d c=%s\n") in kernel,
              # Round354 keeps the four heavy helpers out of clover_bb_sample's frame. noinline is a
              # source attribute, but what boot 133 died on was the link: the helpers' frames accreted
              # into one 10912-byte frame and the beat thread's 16 KB stack overflowed. Each helper

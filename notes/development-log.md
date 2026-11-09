@@ -29807,3 +29807,94 @@ call-site、signature、doc-token、removed-count、tee-class、tee-order、exem
   - **V-C**：`rstate=2`（无 receiver space）⇒ backboardd 等的是死名，下一手看 `ip_newsync`/dead-name 通知。
   - **控制**：`bs=` 与 `op=`（x1）同靴对不上 r221 的 `b=/sz=/op=` ⇒ 槽位仍未修对，V 一律不判；
     `hoprr` 缺席而 `bbsend` 在场 ⇒ tee 预算/前缀顺序问题（`hoprr` 必须先于 `bbsend` 之外的同类前缀）。
+
+
+## Round358 —— 修 r357 自己的槽位（op=x1、bs=x2），把收方腿打到 backboardd 的 hop 名 730b
+
+**题面。** boot 137 的判读（上一节读数）留下两支：一支是仪器缺陷，一支是新问题。
+- (a) **槽位**：r357 把 `mach_msg2_trap_args` 的第二槽当成选项字，但 r264 早就在这块板上量过
+  unpacking：`x2 = msgh_bits | send_size`、`x3 = remote | local`，选项字在 **x1**（r221 的 `op=`
+  取 `r[1]`，同靴值 `0x40700420e` 一类）。四枚 `op=0` 的诚实读法只是「bits=0 且 send_size=0」，
+  U-A/U-B/U-C 的字面判据因此不判。r358 把 `op=` 改读 x1（option64），x2 那枚字改名 `bs=`，
+  两列各指各的生产者，一靴之内与 r221 的 `op=/b=/sz=` 自证。
+- (b) **新问题**：boot 137 已点名 SpringBoard 的 `rem=150b` 收方是 `58:backboardd`（两条独立腿同名），
+  而 backboardd 自己卡在 hop=2 `nm=730b`（`scan=no_srights`）——正是 rem 在 r357 之前那一型。
+  `no_srights` 在 rem 那次也没答出「谁欠谁」，是 receiver 那一问问出来的。r358 把 r357 的
+  `ip_get_receiver`/`ip_get_receiver_name` ＋ proc_find 点名腿挪到 **bbsend 已经解析并引用住的**
+  hop 端口上，印 `clover r358: hoprr`（`nm=/rnm=/rstate=/rpid=/c=`），不另做一次 translate：
+  收方与持有者说的是同一个对象，不是两次可能互相矛盾的采样。
+
+**改动（源码，`osfmk/kern/task.c`）。**
+- `clover_bb_holder_send` 签名加 `uint64_t bs`；主行 `op=%llx bs=%llx n=%u`，`op` 来自 x1、`bs` 来自 x2。
+- `clover_bb_holder_sample` 的捕获槽从一枚变两枚：`r_opt[rows]=x[1]`、`r_bs[rows]=x[2]`，
+  调用点带两枚。
+- 新函数 `clover_bb_hop_receiver(ipc_port_t port, ...)`：`io_lock(port)` 下读
+  `ip_get_receiver`/`ip_get_receiver_name`（r220 的锁纪律），`rstate` 三档（0 真任务 / 1 内核空间 /
+  2 无 receiver space），解锁后按 r357 的 proc_find 指针走查落 pid 与 comm；端口引用由
+  `clover_port_obj_held` 提供，函数自己不再取引用、也不释放。
+- `clover_bb_send_holders_row` 在 bbsend 主行之后、明细行之前调用它——只有 translate 成 IOT_PORT
+  的 hop 会走到，pset 的成员仍是 r347 的问题。
+- 行族重打 r358 标（列义变了，旧读者不许碰新数），删行恰好 14 枚：4 枚 r357 注释里「选项字在 x2」
+  的旧句、签名、7 枚 r357 行字面量/参数行、调用点。注释里新增一段把 x1/x2 的出处写死。
+
+**预登记。** boot 138（r358 镜像）判 V-A…V-D，见 §Round357 末「下一手（r358 题面，预登记）」；
+本轮补一条同靴正对照：四枚 `holdrs` 的 `op=` 应与同一线程 r221 的 `op=` 同名（带 0x2 位的字），
+`bs=` 应与 r221 的 `b=`/`sz=` 对得上——这是槽位修对的第二条腿，也是控制腿。
+
+**构建。** `python3.13 ~/UniXNU/unixnu build kernel` EXIT=0：prelink md5 `9a61ddca` / sha256 `6b1f8366…`
+（52,482,048 B），两处 AMFI 刀仍在文件偏移 `0x1af30e4`/`0x1af316c`（VA 与 r357 同位）→ amfi
+`1ea400c5…` → `normalize-kernel-macho.py`（973 枚戳）`a5993fc6…` → `round358-v0.7.79-payload.img`
+（`43d6448a…`，58,720,256 B）。`payload.json` 自证 `kernel_sha256 a5993fc6…`、`payload_kernel_sha256
+db48e145…`、trust `7c369ce0…`、seed `614b8356…`。`verify-clover-payload.py` EXIT=0（51 OK／0 FAIL，
+r358 六枚 pin 全在场）。补丁三份字节同 md5 `62a005d23185ec35185f3812ef9c9728`；series 排在 r357 之后；
+`check-clover.py` EXIT=0（设备仓内）。
+
+**负测。** 23 支（`~/clover-out/round358-negatives.log`）：patch-missing、base-bytes、local-bytes、
+series-missing、series-order、hoprr-row、receiver-leg、receiver-name、owner-task、pid-walk、
+release-owner、holdrr-row、holdrs-row、op-column、opt-slot、bs-slot、call-site、signature、
+removed-count、tee-class、tee-order、exemption、title；每支红于自己的理由，跑完逐字节还原（md5 复验），
+基线 EXIT=0。夹具交了两笔学费：首遍 `pid-walk` 的替换针脚没打中（patch 行首有 `+`，`str.replace`
+静默 no-op），改成单行唯一命中并断言 `count==1`；`receiver-name`/`owner-task`/`release-owner` 三支
+首遍也绿，因为闸门只钉了 `ip_get_receiver` 没钉它下游三腿，补钉后全红——负测抓的是闸门自己的针脚数。
+
+**读数（boot 138，`round358-v0.7.79-payload.img` sha `43d6448a…`）。** 证据产物
+`~/clover-out/round358-boot138-decoded.txt`；跑日志 `round358-flash-boot138.log` /
+`round358-readback-boot138.log`。
+- **闸门①过**：0 枚 abt；t=726 一火 bbsend 恰 2 行＝`cand=2`；r350 holdrn `rn=1e03 sr=1 ms=1 so=1 once=1
+  och=1`＋r352 onceh `hpid=58 c=backboardd nm=3613`（Y-A 第六靴复现）。
+- **(a) 槽位修对了，同一靴的 r221 独立作证**：四枚 `holdrs` 的 `op=40700420e bs=0`，与
+  `r221: sbm2 t=605 tid=0x12d op=40700420e b=0 sz=0 rem=1003 rn=1e03` 逐字对上——同一线程两分钟后
+  仍拿着同一枚选项字，x1/x2 两个槽位一靴之内自证。r357 的 `op=0` 按控制腿撤回。
+- **(b) hoprr 没有执行，原因是结构不是预算**：本靴 backboardd 的两个 hop 都翻成 `IOT_PORT_SET`
+  （`bbsend hop=0 nm=4103 … scan=pset`、`hop=1 nm=6203 … scan=pset`，两行 `e=17`），而
+  `clover_bb_hop_receiver` 只挂在 `io_otype(obj)==IOT_PORT` 那一支 ⇒ 没有端口可点名。`hoprr` 0 行、
+  `bbsend` 在场，缺席的形状写在同一行（`scan=pset`），不属于预登记的「tee 预算/前缀」那支。
+  **V-A/V-B/V-C 前提不成立，不判**——这与 r357 的 A1（hop 身份每建必变）是同一类「题面随靴变」，
+  不是仪器坏。
+- **本靴换出来的形状**：backboardd 等的是两个端口集合——`4103` 三成员（`4f03` send+recv、`4e03` 只收、
+  `5003` send+recv）、`6203` 七成员（`6d07`、`6007` 只收、`9707` send+recv ur=2、`9403` `sr=5 ms=0`
+  两名具名发送持有者 launchd `nm=13803` 与 SpringBoard `nm=5503`、`10c03`、`c803`、`6807`）。同一火
+  SpringBoard 的 trap（tid 0x12d）是**纯收**（op 无 SEND 位、b=0 sz=0）在 `rn=1e03` 等回信、`rem=4303`、
+  回复权 `3613` 在 backboardd 手里；而 `r229: sbport bb nm=4303 cnt=0 ql=6` ⇒ 那封请求已经不在
+  backboardd 的队列里（它收下了），回复权却仍未用掉 ⇒ **不是没收到，是没收口**。
+  `r262 census pid=58 threads=19 wait=11 run=8`：backboardd 不是全停（8 条可运行），与此前
+  `wait=18 run=1` 的靴不同 ⇒「阻塞」这个词本靴不能再用。
+- **显示**：`seen=4`、pid=86 的 `calls=33..46 fails=18..21`、`hot=6:7/3/e00002d5`、
+  `s6=6 80000000 0 -> e00002d5`、`fc=4`（末枚采样 `grew=12`），`box=305x811..970x1108` 未变——
+  还在进度盒，不在桌面；`vs=0/0/0` 十枚照旧。
+- **落回**：最新卡记录 `t=725.029 s`（beat `k=704 s`，`stage_pid=27`），之后静默复位、无 panic sink
+  （死线记录仍 boot 108、两枚 marker 全 STALE）。宿主 BCB 第一刷没落进 TWRP（脚本退出码 4），
+  手写 2048 字节 misc + reboot 后落地——属 §Round330 ⑦ 那一族，不是本轮仪器的问题。
+
+**下一手（r359 题面，预登记）。** hoprr 要的是「端口 hop」，本靴 backboardd 的两个 hop 都是集合，
+所以两支：
+- (a) **把收方腿挂到集合成员上**：r346/r347 已经逐成员解析并持有引用，对每个 `sr>0` 的成员点名
+  `ip_get_receiver`/`ip_get_receiver_name`；`9403` 已经是「launchd 与 SpringBoard 都能发、backboardd 在等」
+  的那一枚，它的收方属主把环再收一圈。
+- (b) **问 backboardd 自己**：它收下请求却不回，19 条线程（11 wait / 8 run）在等什么、跑什么——
+  把 r349 的 `holdth`/`holdt` 腿打到 `pid=58` 自己身上（不是它的 hop），用同一套 thread state ＋
+  user PC 读数回答「8 条 runnable 在跑什么」。
+- 预登记 S-A…S-D 待写：S-A 集合成员收方是 SpringBoard ⇒ 环在同一集合里闭合；S-B 收方是 launchd/其他
+  ⇒ 环外还有一跳；S-C `rstate=2` ⇒ 死名；S-D `holdth` 显示 backboardd 的 runner 停在
+  `mach_msg2` ⇒ 它自己也在等下一封。控制腿：`9403` 的两名持有者必须与 r347 的 `bbsmhold` 同名；
+  `hoprr` 若再缺席，行里必须先有 `scan=pset` 才允许记「结构缺席」。
