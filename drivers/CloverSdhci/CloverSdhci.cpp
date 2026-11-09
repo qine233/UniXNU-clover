@@ -1295,6 +1295,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r359: bbt", "r359-bbt", 64, 0, 0, 0 },
   { "clover r359: psmrcv", "r359-psmrcv", 64, 0, 0, 0 },
 
+  // Round360 reads the hop's send destination as an entry in the waiter's own table: a send-once
+  // right has a destination and no receiver, which is why the owner walk printed fail for boot 140's
+  // 8507. One row per hop per fire, four hops at most, so 64 is the arithmetic bound.
+  { "clover r360: rembits", "r360-rembits", 64, 0, 0, 0 },
+
   // Round349 follows each named holder into its own task in the same fire: `holdth` is the
   // per-task summary (threads, waiters, runners, trapped) and `holdt` at most two trapped threads
   // with their receive name, send destination and continuation. Six holders per fire at most, so
@@ -5021,6 +5026,9 @@ static void teeConsumeLine (uint32_t &pushed)
        // Round359's member receivers and thread rows are one reading with the set walk and the fire:
        // a pass cap that kept the members and ate whose they are would restore the blind spot.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r359") ||
+       // Round360's rembits row is the answer half of r327's fail: the owner leg said it could not
+       // name the destination, this says what the destination is.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r360") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is

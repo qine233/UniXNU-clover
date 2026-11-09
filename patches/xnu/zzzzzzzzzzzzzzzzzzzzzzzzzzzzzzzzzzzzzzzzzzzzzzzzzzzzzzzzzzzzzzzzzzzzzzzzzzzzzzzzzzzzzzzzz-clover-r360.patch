@@ -1,0 +1,144 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index fd1edb9..b7fde51 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -14856,6 +14856,125 @@ clover_bb_self_sample(int pid, uint64_t secs)
+ 	}
+ }
+ 
++/*
++ * Round360. Boot 140's r327 row ended in `o3=fail r3=8507`: hop 3's send destination could not be
++ * named, because clover_sb_port_owner translates SEND, then RECEIVE, then PORT_SET, and a send-once
++ * right answers none of the three -- its holder names a destination, not a receiver. The name is
++ * still an entry in the waiter's own table, so this reads that entry's bits (type word, urefs, the
++ * object) and, when the object is a port, its counters and the port's receiver. Boot 140's shape is
++ * the case this exists for: a service thread that would reply to the client's send-once right and
++ * then keep receiving, and a reply right that no receiver walk can name.
++ */
++static void __attribute__((noinline))
++clover_bb_rem_bits(task_t task, int pid, int hop, uint32_t i, mach_port_name_t rem,
++    uint64_t secs)
++{
++	extern unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
++	extern struct proc *proc_find(int pid);
++	extern task_t proc_task(struct proc *p);
++	extern int proc_rele(struct proc *p);
++	ipc_space_t space = task->itk_space;
++	ipc_space_t recv = IPC_SPACE_NULL;
++	ipc_entry_t entry = NULL;
++	ipc_object_t obj = IPC_OBJECT_NULL;
++	task_t owner = TASK_NULL;
++	uint64_t bits = 0;
++	uint32_t ur = 0;
++	uint32_t sr = 0;
++	uint32_t so = 0;
++	uint32_t ms = 0;
++	uint32_t q = 0;
++	uint32_t rnm = 0;
++	int rstate = -1;
++	int rpid = -3;
++	int ent = -1;
++	int ty = -1;
++	int pid2;
++	struct proc *pp;
++	char rc[16];
++	char row[260];
++	int len;
++
++	rc[0] = '\0';
++	if (space == IPC_SPACE_NULL || rem == MACH_PORT_NULL) {
++		return;
++	}
++	is_read_lock(space);
++	if (!is_active(space)) {
++		ent = -2;
++	} else {
++		entry = ipc_entry_lookup(space, rem);
++		if (entry == NULL) {
++			ent = 0;
++		} else {
++			ent = 1;
++			bits = (uint64_t)entry->ie_bits;
++			obj = entry->ie_object;
++			ty = (int)IE_BITS_TYPE(entry->ie_bits);
++			ur = (uint32_t)IE_BITS_UREFS(entry->ie_bits);
++		}
++	}
++	if (ent == 1 && obj != IPC_OBJECT_NULL) {
++		io_lock(obj);
++		if (io_otype(obj) == IOT_PORT) {
++			ipc_port_t port = (ipc_port_t)obj;
++
++			sr = port->ip_srights;
++			so = port->ip_sorights;
++			ms = port->ip_mscount;
++			q = port->ip_messages.imq_msgcount;
++			recv = ip_get_receiver(port);
++			rnm = (uint32_t)ip_get_receiver_name(port);
++			if (recv != IPC_SPACE_NULL && recv->is_task != TASK_NULL) {
++				owner = recv->is_task;
++				task_reference(owner);
++				rstate = 0;
++			} else if (recv == IPC_SPACE_NULL) {
++				rstate = 2;
++			} else {
++				rstate = 1;
++			}
++		}
++		io_unlock(obj);
++	}
++	is_read_unlock(space);
++	if (owner != TASK_NULL) {
++		for (pid2 = 1; pid2 <= CLOVER_BB_SEMA_PROBE; pid2++) {
++			pp = proc_find(pid2);
++			if (pp == NULL) {
++				continue;
++			}
++			if (proc_task(pp) == owner) {
++				rpid = pid2;
++				if (proc_name_address(pp) != NULL) {
++					strlcpy(rc, proc_name_address(pp), sizeof(rc));
++				}
++				proc_rele(pp);
++				break;
++			}
++			proc_rele(pp);
++		}
++		task_deallocate(owner);
++	} else if (rstate == 1) {
++		rpid = -1;
++		strlcpy(rc, "kspace", sizeof(rc));
++	} else if (rstate == 2) {
++		rpid = -2;
++		strlcpy(rc, "none", sizeof(rc));
++	}
++	len = snprintf(row, sizeof(row),
++	    "clover r360: rembits t=%llu pid=%d hop=%d i=%u nm=%x ent=%d ty=%s raw=%llx"
++	    " ur=%u o=%llx sr=%u so=%u ms=%u q=%u rnm=%x rstate=%d rpid=%d c=%s\n",
++	    (unsigned long long)secs, pid, hop, i, rem, ent,
++	    (ty < 0) ? "-" : clover_right_type_word((ipc_entry_bits_t)bits), bits, ur,
++	    (unsigned long long)(uintptr_t)obj, sr, so, ms, q, rnm, rstate, rpid, rc);
++	if (len > 0) {
++		row[sizeof(row) - 1] = '\0';
++		clover_emmc_probe_say(row, (unsigned int)strlen(row));
++		printf("%s", row);
++	}
++}
++
+ static void
+ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ {
+@@ -15318,6 +15437,13 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 			strlcpy(hopown[i], own327, sizeof(hopown[i]));
+ 			named++;
+ 		}
++		/*
++		 * Round360. The owner can stay unnamed even when the name is live: a send-once
++		 * right has a destination, not a receiver. Its entry bits are in this table either
++		 * way, and they are what tells the two shapes apart.
++		 */
++		clover_bb_rem_bits(task, pid, (int)i, (uint32_t)i,
++		    (mach_port_name_t)hrem[i], secs);
+ 	}
+ 	{
+ 		extern unsigned int clover_emmc_probe_say(const char *text,

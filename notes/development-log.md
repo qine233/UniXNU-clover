@@ -29981,3 +29981,69 @@ pin 全在场）；`check-clover.py` EXIT=0；17 支负测全绿并逐字节还�
   send 且 `ur>0` ⇒ 它在等服务端取信，环仍在收；T-C 读不到（`e=`）⇒ 记名不判。
   控制腿：`bbsmown` 行数 == 同火 `8507` 所在 hop 的 `bbown`/`bbsm` 行；`hoprr` 再缺席必须先有
   `scan=pset` 或 `hop_null` 才能记「结构缺席」。
+
+
+## Round360 —— 读 hop 的发送目的地：send-once 权只有目的地、没有收方
+
+**题面。** boot 140 的 `r327: bbnow … o3=fail r3=8507` 是那一靴唯一未解析的名字：hop 3 的发送目的地
+8507。`clover_sb_port_owner` 走 SEND→RECEIVE→PORT_SET 三条腿，而 send-once 权**有目的地、没有收方**，
+三条腿都翻不动它；但这个名字仍是等待者自己表里的一个 entry，位（类型字、urefs、对象）就在那里。
+（r359 预登记的第二支——对 `a003` 持有者做 send-once 普查——boot 140 已经用 `bbsmhold ty=send raw=10000`
+×4 答了：四枚都是普通发送权，不是回复权；本轮不再加仪器。）
+
+**改动（`osfmk/kern/task.c`）。** 新 `clover_bb_rem_bits(task, pid, hop, i, rem, secs)`：
+`is_read_lock` 下 `ipc_entry_lookup` 取 `ie_bits`/`ie_object`（ent=1；无名字 0；空间死 -2），对象是
+端口时在 `io_lock` 下读 `ip_srights`/`ip_sorights`/`ip_mscount`/`imq_msgcount` 与
+`ip_get_receiver`/`ip_get_receiver_name`（r220 的锁纪律），解锁后 proc_find 走查落 pid 与 comm，印
+`clover r360: rembits`：`ent=/ty=/raw=/ur=/o=/sr=/so=/ms=/q=/rnm=/rstate=/rpid=/c=`。调用点在
+`clover_bb_sample` 的 r327 hop 循环里、每个 `hrem[i] != 0` 的 hop 一枚。纯增：删行 0。
+
+**预登记（boot 141，r360 镜像）。** 先判闸门①（0 abt、每火 bbsend 行数=cand=、r350 holdrn
+`sr=1 ms=1 so=1 once=1 och=1`＋r352 onceh 点名 hpid=58；认形状不认名字）。再判：
+- **T-A**：该 hop 的 `ty=sendonce` ⇒ 那枚线程是「先把回信发给客户的回复权、再继续收自己的门」的服务
+  循环；环在 SpringBoard 侧（它等的那封回信为什么没发），不在 backboardd 的收。
+- **T-B**：`ty=send`（或 send+recv）且 `ur>0` ⇒ 目的是普通发送权，队列满或收方不取；环仍在收侧。
+- **T-C**：`ent=0` ⇒ 死名，发送半会得错误码，线程实际停在收半。
+- **控制**：`rembits` 行数 == 同火 r327 的 `asked=`（有 rem 的 hop 数）；`ty=` 必是四类之一
+  （send/sendonce/recv/send+recv），`-` 只许出现在 `ent<0`；`rstate`/`rpid` 只在对象是端口时有意义；
+  闸门①不过 ⇒ r354 栈判据，不判 T。
+- **栈**：`clover_bb_rem_bits` noinline；构建后量帧，最深链必须 <16 KB。
+
+**构建。** 补丁 md5 `8b071802b0c20a03d763d5dba42ce69d`（三份同字节，纯增 126 行、删 0）；kernel md5
+`47163537` / sha256 `1574099c…`（52,482,048 B）；AMFI `dcdf0d76…`——两刀仍在同一 VA，**文件偏移移到
+`0x1af70e4`/`0x1af716c`**（本轮代码把布局推后 0x4000，报告里记这个位移而不是假装没动）；normalize
+`65f17e13…`（973 戳）；`round360-v0.7.81-payload.img` sha256 `ff555d5e…`（58,720,256 B）。
+`clover_bb_rem_bits` 帧 0x1f0、`self_sample` 0x250、`bb_sample` 0x14F0——最深链 ≈6.2 KB。
+`verify-clover-payload.py` EXIT=0（51 OK／0 FAIL，r360 一枚 pin 在场）；`check-clover.py` EXIT=0；
+16 支负测全绿并逐字节还原（`round360-negatives.log`）。
+
+**读数（boot 141，`round360-v0.7.81-payload.img` sha `ff555d5e…`）。** 证据
+`~/clover-out/round360-boot141-decoded.txt`；日志 `round360-flash-boot141.log`。
+- **闸门①过**：一火 bbsend 3 行＝`cand=3`（hop 0/1 是 pset；hop 2 是端口 `nm=8107 e=0
+  scan=no_srights so=1 ms=0`）；r350 holdrn `rn=b03 sr=1 ms=1 so=1 once=1 och=1`＋r352 onceh
+  `hpid=58 nm=f673`（Y-A 第八靴）。
+- **T-B 成立，且多出一层**：`r327` 本靴 `hn=3 asked=1 o2=fail r2=640b`，`rembits` 只有一枚与之对应
+  （控制腿：行数 1 == asked 1）：`ent=1 ty=send raw=b810001 ur=1 o=fffffff46f4d1920 sr=2 so=0 ms=1
+  q=0 rnm=1 rstate=1 rpid=-1 c=kspace`。⇒ 640b 是**普通发送权**（不是 send-once），队列空、`ms=1`、
+  收方不是一个 task 而是一个**没有 task 的空间（内核空间，`rnm=1`）**，所以 r327 的 owner 腿三条都
+  翻不动它——那是结构性 fail，不是名字丢了。
+- **环的形状因此换了性质**：hop 2 的 trap 是「向内核对象 640b 发请求 ＋ 在自己的 8107 上收回信」
+  （`so=1 sr=0 q=0`：8107 只有一枚 send-once 回复权、没有发送权）。也就是说 backboardd 卡在**一次
+  同步内核调用**上，回信的一方不是 SpringBoard，而是内核对象；`rstate=1` 把「用户态对等方不回信」这一类
+  假设整个顶掉。最可能是 IOKit user client 的端口（`ip_kotype`/`ip_kobject` 还没读，那是下一手）。
+- `r262 census pid=58 threads=20 wait=19 run=1`；`holdrn` 里 SpringBoard 的 `rn=b03 ... once=1 och=1`
+  与上一靴同形；本靴 `onceh` 三枚跨三个持有者（com.apple.migra pid=142、SpringBoard pid=27 等）。
+- 显示：`client=pid86`、`calls=58 fails=24`、`hot=6:19/9/e00002d5`、`s6=9`、`latch=copy=fc=a`、
+  `box=305x811..970x1108` 未变、`vs=0/0/0`。
+- 落回：最新卡记录 `t=445 s`（本靴一火在 441 s）、之后静默复位，宿主 BCB 进 TWRP——比前几靴更早。
+
+**下一手（r361 题面，预登记）。**
+- (a) **点名 640b 的内核对象**：`rembits` 再加两列——`kotype=`（`ip_kotype`）与 `kobj=`（`ip_kobject`
+  指针），并在对象是 IOKit 时尝试它的 class 名（若 kobject 头可读）。若 `kotype` 指向 IOKit user client，
+  环的最后一跳就落到我们自己的驱动上，而不是 Apple 的守护进程。
+- (b) **读那次同步调用的方法号**：从 trap 的 msgh_bits/msg 头（或 `x1` 的 option 与消息体第一字）取
+  selector/id，和 r329 的 `hot=`（选择器 6 的 `e00002d5`）对表；同一条 IPC 会给出「谁该回、回什么」。
+- 预登记 U-A…U-C：U-A `kotype=ikcu`（或 IOKit）⇒ backboardd 卡在我们驱动的 user client 上，下一手是补
+  那个 selector；U-B `kotype` 是其他内核对象（如 host/exception/ledger）⇒ 记录该对象并转内核内部等待；
+  U-C 读不到 ⇒ 先修读取腿（kobject 不可安全解引用时只印指针，不猜）。
+- 控制：`kotype`/`kobj` 只在 `ent==1 && io_otype==IOT_PORT` 时出现；`rembits` 行数 == `asked=`。

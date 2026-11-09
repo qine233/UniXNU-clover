@@ -180,3 +180,4 @@ component:XnuPrelink/patches/xnu-10063.141.1-security-init.patch
 component:XnuPrelink/patches/xnu-10063.141.1-sparse-index.patch
 arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r358.patch
 arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r359.patch
+arch:../../../patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-clover-r360.patch

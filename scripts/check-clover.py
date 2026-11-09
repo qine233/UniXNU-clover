@@ -4413,6 +4413,72 @@ def check_board(errors: list) -> str:
             errors.append("the r359 rows are not exempt from the per-pass cap: a member's receive "
                           "owner without its bbsmh row is the same split reading")
 
+        # Round360. Boot 140's r327 ended at o3=fail r3=8507: the hop's send destination had no
+        # owner because a send-once right names a destination, not a receiver, and the owner leg
+        # only walks SEND/RECEIVE/PORT_SET. The name is still an entry in the waiter's own table,
+        # so this reads its bits -- type word, urefs, object -- and, when it is a port, its counters
+        # and receiver. "A reply right to a client" and "an ordinary send to a full queue" must not
+        # come out as the same fail. The patch is pure addition.
+        r360_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r360.patch")),
+                         default=None)
+        if r360_patch is None or not r360_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r360.patch is missing: the send destination "
+                          "boot 140 could not name would stay a bare fail")
+        else:
+            r360_name = r360_patch.name
+            r360_text = r360_patch.read_text()
+            load_r360 = REPO.parent / "UniXNU" / "patches" / "xnu" / r360_name
+            local_r360 = REPO / "patches/xnu" / r360_name
+            if not load_r360.is_file():
+                errors.append(f"UniXNU/patches/xnu/{r360_name} is missing: unixnu loads patches from "
+                              "there, and this repo's copy only ever names the round")
+            elif load_r360.read_bytes() != r360_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r360_name} is not the same bytes as this repo's "
+                              "copy: the shipped image would carry a different reading")
+            if not local_r360.is_file() or local_r360.read_bytes() != r360_patch.read_bytes():
+                errors.append(f"patches/xnu/{r360_name} is missing or differs: the series line loads "
+                              "that copy, so the gate must pin the bytes it actually applies")
+            series_text = (REPO / "patches/xnu/series").read_text()
+            series_line = f"arch:../../../patches/xnu/{r360_name}"
+            r359_prev = max((p.name for p in (REPO / "patches/xnu-clover").glob("*-clover-r359.patch")),
+                            default="")
+            if series_line not in series_text:
+                errors.append(f"patches/xnu/series does not apply {r360_name}: the bits leg exists "
+                              "in the source and the kernel would be built without it")
+            elif r359_prev == "" or series_text.find(r359_prev) < 0:
+                errors.append("patches/xnu/series no longer applies r359: r360 reads the hop names "
+                              "that round's rows produced")
+            elif series_text.find(series_line) < series_text.find(r359_prev):
+                errors.append("patches/xnu/series applies r360 before r359: the bits leg answers the "
+                              "fail that round printed")
+            r360_added = [line[1:] for line in r360_text.splitlines() if line.startswith("+")]
+            r360_removed = [line[1:] for line in r360_text.splitlines()
+                            if line.startswith("-") and not line.startswith("---")]
+            for now in (
+                'Round360. Boot 140',
+                'clover_bb_rem_bits(task_t task, int pid, int hop, uint32_t i, mach_port_name_t rem,',
+                'clover_bb_rem_bits(task, pid, (int)i, (uint32_t)i,',
+                '"clover r360: rembits t=%llu pid=%d hop=%d i=%u nm=%x ent=%d ty=%s raw=%llx"',
+                'entry = ipc_entry_lookup(space, rem);',
+                'ty = (int)IE_BITS_TYPE(entry->ie_bits);',
+                'ur = (uint32_t)IE_BITS_UREFS(entry->ie_bits);',
+                'so = port->ip_sorights;',
+                'recv = ip_get_receiver(port);'):
+                if not any(now in line for line in r360_added):
+                    errors.append(f"the r360 kernel patch does not add {now[:60]!r}: the destination "
+                                  "would stay an unnamed fail")
+            if len(r360_removed) != 0:
+                errors.append(f"the r360 patch removes {len(r360_removed)} lines, not the 0 a pure "
+                              "addition accounts for: every removal is a reading the next boot cannot "
+                              "re-make")
+        for entry in ('{ "clover r360: rembits", "r360-rembits", 64, 0, 0, 0 },',):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: the destination's bits "
+                              "need their own budget")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r360")' not in sdhci_source:
+            errors.append("the r360 rows are not exempt from the per-pass cap: a fail without the "
+                          "bits behind it is the same silence this round closes")
+
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
         # its own ending, so a silent boot leaves the boot before it on the card and the reader called
@@ -8138,8 +8204,8 @@ def check_board(errors: list) -> str:
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
     # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
     # the menu names round347.
-    if not board["payload"]["title"].startswith("clover r359:"):
-        errors.append('[payload] title is not "clover r359: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r360:"):
+        errors.append('[payload] title is not "clover r360: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -10293,8 +10359,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r359:"):
-        errors.append('[payload] title is not "clover r359: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r360:"):
+        errors.append('[payload] title is not "clover r360: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
