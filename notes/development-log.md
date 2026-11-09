@@ -30190,3 +30190,43 @@ BCB 写会接手）。
 - (c) EDL 的可恢复性：宿主目前没有 SDM660 的 firehose loader。若能在本机拿到
   `prog_firehose_ddr.elf`（Mi Pad 4 的 fastboot 包里），`edl reset` 就能把 EDL 变成一次自动复位，
   「崩溃后回 TWRP」才算真正闭环；否则 EDL 落回永远需要一次人工电源循环，这条要写进 limits。
+
+
+## Round363 —— EDL 的自动复位（拿 loader），以及 boot 144 的指针读数
+
+**背景。** boot 144 的 payload 复位落在 EDL（`QUSB_BULK_SN:F6548A52`）：EDL 在 bootloader 之前，
+BCB 与 adb/fastboot 都够不到它，宿主的唯一出口是 firehose reset。用户明确要求把这条也做成无人值守，
+并让我「去拿 loader」。
+
+**loader 与工具（宿主输入，不进仓库）。** 本机 `~/Downloads/odin_images_OS1.0.3.0.UKMCNXM_14.0/images/`
+下已有 Mi Pad 4 的 `prog_firehose_ddr.elf`（919,176 B），拷到 `~/clover-out/edl/`；工具用
+[bkerler/edl](https://github.com/bkerler/edl) 的 `edl.py`，同目录。依赖：`pyusb`、`pyserial`、`docopt`、
+`pycryptodomex`（不是 `pycryptodome`）、`lxml`、`colorama`、`capstone`、`qrcode`、`requests`、`passlib`，
+外加 Homebrew 的 `libusb`（pyusb 的后端；缺它时报 `NoBackendError: No backend available`）。
+`edl.py --help` 与 `reset [--resetmode=mode]` 已在宿主上跑通；无 EDL 设备时它会轮询等设备，所以
+runner 里的调用必须**限时**。
+
+**改动（仅宿主，`scripts/run-clover-unattended.sh`）。**
+- `EDL_TOOL`/`EDL_LOADER`/`EDL_RESET`/`EDL_RESET_TIMEOUT` 四个可覆盖的变量；
+- `edl_reset()`：仅在工具与 loader 都在时执行，打印「reset only, no partition write」，
+  后台跑 `python3 "$EDL_TOOL" --loader="$EDL_LOADER" reset`，最多等 60 s；超时/失败保留观察窗口；
+- 两次 watch 的 EDL 分支：连续 5 次 `QUSB_BULK` 后先试 `edl_reset()`，成功就继续等（板子会被复位），
+  失败才按原来的退出码 7 收段。缺 loader 时打印一句「still needs a power cycle」，不静默。
+- 没有新的内核补丁、没有新镜像、title 仍叫 r362（卡上跑的仍是 r362 那一枚）。
+
+**boot 144 的指针读数（r362 镜像，`3bd7fc70…`）。** 证据 `~/clover-out/clover-log-window.bin.txt`
+（[`round362-resume-readback.log`](/Users/zhouzhou/clover-out/round362-resume-readback.log) 的落地是
+host BCB → TWRP，随后 `--skip-recovery` 读回）。
+- `remkobj pid=58 hop=2 i=2 nm=6507 kotype=29 kobj=fffffff5469502a8 sr=2 so=0 q=0 rnm=1 rstate=1 rpid=-1 c=kspace`
+  —— 与 boot 143 同形，`kotype=29`（IKOT_IOKIT_CONNECT）复现。
+- `remcall pid=58 hop=2 i=2 nm=6507 p=16ff8e490 io=0 id=1 b=0 sz=0 rem=6ff8f65c loc=1 vou=6ff8f610
+  m0=9146c504 m1=1`。`io=0` 说明**指针读成功**（不是 r361 的 EFAULT），但八个字仍不是 mach 头
+  （`b=0`、`sz=0`、`id=1`、`m0=0x9146c504` 都不像头＋体第 0 字）⇒ 预登记 W-B：这条 trap 的 `data`
+  不是发送缓冲，或消息在读取时已被内核改写。
+- 因此 selector 仍**不判**。下一手（r364）：把 r221 的采样挪到 backboardd 的这条线程（同 tid），让它
+  用自己那套 `r[0]` copyin 读同一个指针；两边逐字对照才能判「p 是什么」。其次再试 `x7`/`x4` 与
+  `p-24`/`p+24` 的窗口。
+
+**闸门与负测。** 闸门新增七枚宿主针脚（`edl_reset()`、两个默认路径、超时、`--loader=... reset`、
+禁用句、缺 loader 句），EXIT=0。负测：在 r362 的 15 支上补 `edl-helper`/`edl-default-tool`/
+`edl-no-loader-say`/`edl-timeout` 四支（`round363-negatives.log`）。

@@ -47,6 +47,14 @@ ARMv8.0，无指针认证），跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 2
 **要上机**，排在桌面这一格之后。`plist` 列的「✗（已说明）」意思是文档 `xnu-drivers.md:14` 把 `Info.plist`
 当 personality 的记录——没有 personality 就没有该记录的东西，闸门要求 README 把这句写出来，写不出来就 FAIL。
 
+## 落回规则（崩溃 → TWRP）
+
+| # | 落回 | 现状 | 下一手 |
+| --- | --- | --- | --- |
+| 1 | 正常 reset / 静默复位 → fastboot | 宿主 `--boot-after-flash` 默认授权 2048 字节 misc BCB 并重试 3 次，脚本自己把它送进 TWRP（r362） | 无 |
+| 2 | reset → Android | `adb_serial` 只认 recovery；Android 的 `device` 会被 `adb reboot recovery` 领回（r362） | 无 |
+| 3 | reset → EDL（QUSB_BULK） | EDL 在 bootloader 之前，BCB 够不到；宿主用 Mi Pad 4 的 `prog_firehose_ddr.elf` ＋ bkerler/edl 的 `edl.py reset` 自动复位（r363，工具在 `~/clover-out/edl/`） | 首次真实 EDL 上机验证；缺 loader 时仍要一次电源循环 |
+
 ## 距离 iOS 桌面还差什么
 
 | # | 缺口 | 现状（一句话） | 下一步 | 出处 |

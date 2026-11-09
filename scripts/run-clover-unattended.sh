@@ -65,6 +65,15 @@ ADB_WAIT=180
 LANDING_WAIT=2100
 # Round362: a BCB that did not take is retried rather than ending the run.
 RECOVERY_RETRIES=${RECOVERY_RETRIES:-3}
+# Round363. An EDL landing (QUSB_BULK) is below both tools and below the BCB: the only exit is a
+# firehose reset. The tool and its loader are host inputs rather than repository files -- the loader
+# is a signed vendor blob -- so they are looked up at run time and the reset is skipped, loudly, when
+# either is missing. The loader is only ever used with the `reset` command: this path writes no
+# partition.
+EDL_TOOL=${EDL_TOOL:-$HOME/clover-out/edl/edl.py}
+EDL_LOADER=${EDL_LOADER:-$HOME/clover-out/edl/prog_firehose_ddr.elf}
+EDL_RESET=${EDL_RESET:-1}
+EDL_RESET_TIMEOUT=${EDL_RESET_TIMEOUT:-60}
 # Round202. The payload's deadline is 1800 s of its own uptime (round228 moved it from 900),
 # not 1800 s of the host's wall clock: after the reboot it still has to reach that instant,
 # sit on the panic screen for its reset delay, boot the bootloader and start TWRP's adb.
@@ -361,6 +370,30 @@ wait_leave_fastboot() {
 # close line and into the verdict sentence. The classifier itself is usb_landing_class(), defined
 # above timeline_open because round337 put it on every poll; a second definition here would be the
 # one that wins at runtime, which is why this is a comment and not a function.
+# Round363. One firehose reset, bounded. The tool polls for the device under the EDL transport, so a
+# run without a loader can otherwise sit in it forever; the caller keeps watching either way.
+edl_reset() {
+  [ "$EDL_RESET" = 1 ] || { say "EDL: automatic reset is disabled (EDL_RESET=0)"; return 1; }
+  if [ ! -f "$EDL_TOOL" ] || [ ! -f "$EDL_LOADER" ]; then
+    say "EDL: no firehose tool/loader at $EDL_TOOL and $EDL_LOADER, so this landing still needs a power cycle"
+    return 1
+  fi
+  say "EDL: issuing a firehose reset with $(basename "$EDL_LOADER") (declared: reset only, no partition write)"
+  : > "$OUT.edl-reset.log"
+  python3 "$EDL_TOOL" --loader="$EDL_LOADER" reset >> "$OUT.edl-reset.log" 2>&1 &
+  local pid=$! waited=0
+  while [ "$waited" -lt "$EDL_RESET_TIMEOUT" ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"
+      return $?
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  kill "$pid" 2>/dev/null
+  say "EDL: the firehose reset did not answer within ${EDL_RESET_TIMEOUT}s; keeping the watch open"
+  return 1
+}
 watch_landing() {
   local deadline=$(( $(date +%s) + LANDING_WAIT ))
   local a f edl=0
@@ -377,8 +410,13 @@ watch_landing() {
     if [ "$(usb_landing_class)" = edl ]; then
       edl=$(( edl + 1 ))
       if [ "$edl" -ge 5 ]; then
-        timeline_close edl "$a" "$f"
-        return 3
+        if edl_reset; then
+          say "EDL: the firehose reset was accepted; keeping the watch open for the boot it makes"
+          edl=0
+        else
+          timeline_close edl "$a" "$f"
+          return 3
+        fi
       fi
     else
       edl=0
@@ -420,8 +458,13 @@ watch_after_deadline() {
     if [ "$(usb_landing_class)" = edl ]; then
       edl=$(( edl + 1 ))
       if [ "$edl" -ge 5 ]; then
-        timeline_close edl "$found" "$f"
-        return 3
+        if edl_reset; then
+          say "EDL: the firehose reset was accepted; keeping the watch open for the boot it makes"
+          edl=0
+        else
+          timeline_close edl "$found" "$f"
+          return 3
+        fi
       fi
     else
       edl=0

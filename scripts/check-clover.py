@@ -4619,6 +4619,19 @@ def check_board(errors: list) -> str:
             if needle not in runner_text:
                 errors.append(f"scripts/run-clover-unattended.sh has no {needle!r}: the reset would "
                               "not come back to TWRP unattended, or an Android adb would read as one")
+        # Round363. EDL is below the bootloader, so neither the BCB nor either tool reaches it: only a
+        # firehose reset does. The vendor loader is a host input, so the reset is skipped with a sentence
+        # when it is missing and never writes a partition when it runs.
+        for needle in ('edl_reset() {',
+                       'EDL_TOOL=${EDL_TOOL:-$HOME/clover-out/edl/edl.py}',
+                       'EDL_LOADER=${EDL_LOADER:-$HOME/clover-out/edl/prog_firehose_ddr.elf}',
+                       'EDL_RESET_TIMEOUT=${EDL_RESET_TIMEOUT:-60}',
+                       '"$EDL_TOOL" --loader="$EDL_LOADER" reset',
+                       'EDL: automatic reset is disabled',
+                       'EDL: no firehose tool/loader at'):
+            if needle not in runner_text:
+                errors.append(f"scripts/run-clover-unattended.sh has no {needle!r}: an EDL landing "
+                              "would still need a power cycle nobody can perform unattended")
 
         # Round293 makes every card reading name the boot that wrote it. Boot 79's frame is the reason:
         # the deadline slot and the panic slots are the two groups a boot only overwrites when it reaches
