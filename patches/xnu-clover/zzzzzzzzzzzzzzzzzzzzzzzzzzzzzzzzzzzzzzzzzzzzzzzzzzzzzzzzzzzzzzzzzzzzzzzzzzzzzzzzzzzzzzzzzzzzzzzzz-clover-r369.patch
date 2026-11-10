@@ -1,0 +1,60 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 23a5d72..4fa5da9 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11147,7 +11147,12 @@ clover_sb_note_current(void)
+ 		clover_sb_gen++;
+ 		clover_sb_pid = 0;
+ 		clover_sb_last_reply = MACH_PORT_NULL;
+-		clover_bb_target_pid = 0;
++		/*
++		 * Round369. The target pid is deliberately NOT cleared here any more. Boot 148 and 150 both
++		 * show why the old clear is wrong: the default latch set 58 once, this path zeroed it on the
++		 * next generation change, and the boot then fired once and never again. The pid is re-checked
++		 * with proc_find in the beat's latch, so a dead target is skipped rather than used.
++		 */
+ 		clover_bb_target_name = MACH_PORT_NULL;
+ 		clover_bb_mark_obj = 0;
+ 		clover_sb_last_secs = 0;
+@@ -11323,30 +11328,9 @@ clover_bb_beat_thread(void *param, wait_result_t wres)
+ 			 */
+ 			clover_r308_beat_row(secs);
+ 		}
+-		/*
+-		 * Round368. Boot 148's latch fired once at t=180 (r229 pid=58, hops=0) and every later
+-		 * r308 row read target=0 again: the global is cleared by the generation-change path and by
+-		 * nothing that re-arms it reliably, so a single fire is all a boot gets. The fire therefore
+-		 * uses a local target and re-resolves backboardd when the global is zero; the global stays
+-		 * what the r324 row reports, and the sample walks the local pid.
+-		 */
+-		{
+-			int fire_pid = clover_bb_target_pid;
+-			extern struct proc *proc_find(int pid);
+-			extern int proc_rele(struct proc *p);
+-
+-			if (fire_pid == 0) {
+-				struct proc *pfire = proc_find(58);
+-
+-				if (pfire != NULL) {
+-					fire_pid = 58;
+-					proc_rele(pfire);
+-				}
+-			}
+-			if (fire_pid == 0) {
+-				goto clover_beat_no_fire;
+-			}
+-			clover_bb_sample(fire_pid, sb, clover_bb_target_name, secs);
++		if (clover_bb_target_pid != 0) {
++			clover_bb_sample(clover_bb_target_pid, sb,
++			    clover_bb_target_name, secs);
+ 			/*
+ 			 * Round324. The answer boot 109 could not get: who backboardd blocks on, re-stated
+ 			 * every beat on the relay that survives, not once in the burst the tail dropped. The
+@@ -11379,7 +11363,6 @@ clover_bb_beat_thread(void *param, wait_result_t wres)
+ 				}
+ 			}
+ 		}
+-clover_beat_no_fire:
+ 		task_deallocate(sb);
+ 	}
+ }

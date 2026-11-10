@@ -30362,3 +30362,36 @@ t=180 那一次采样、且那次 backboardd 恰好 `hops=0`。
 - **Z1-C**：`target` 仍只在 t=… 出现一次 ⇒ `proc_find(58)` 失败或 `goto` 路径被误触发，先查
   `r229` 的 `gone/notask` 早期返回。
 - 控制：`r308 target` 与 `r229 pid` 同靴一致；`fired` 单调增；`bbsend` 行数 == `cand=`。
+
+**读数（boot 149，r368 镜像 `585a9e14…`）：这一靴只活到 ≈167 s。** 卡上最新 flight 记录
+`t=167088 ms`，最后一条 `dispstate ms=169184 fires=5 seen=0 client=none`；`abt` 0 枚。唯一一枚 beat
+是 `t=179 target=58 ent=0 fired=0`（行在采样之前打，随后 `r229 t=179 pid=58 hops=0`），之后无更多
+120 s 心跳行——不是闩锁没开，是**这一靴没活到下一次心跳**。Z1-A/B/C 均**不判**。落回是 fastboot，
+宿主 BCB 送进 TWRP；`r198: recovery BCB pre-armed rc=100 written=1` 记下 pre-arm 的返回码。
+boot 148（r367）活到 1200+ s，boot 149（r368）167 s——**一个点是噪声还是 r368 引起，要靠 boot 150
+同一镜像复跑对照**（已重刷 r368，判据：若再次 <200 s 死，回退 r367 并查 `goto` 路径；若活过 600 s，
+按噪声记）。
+
+
+## Round369 —— 回退 r368，把「目标被清掉」修在真正那行
+
+**控制实验。** boot 149 与 boot 150 都是 r368 镜像，两靴都在 **≈170 s** 停（`flight: newest entry
+t=167088 / t=170952 ms`，`abt` 0 枚），而 boot 148（r367）活到 1200+ s。两次同型 ⇒ 不是噪声：
+r368 的「局部 target + 每 20 s 重解析」改动与早期死亡相关，先回退。
+
+**改动（`osfmk/kern/task.c`）。**
+1. fire 块恢复成 `if (clover_bb_target_pid != 0) clover_bb_sample(clover_bb_target_pid, sb, …)`，
+   删掉局部 `fire_pid`、`goto clover_beat_no_fire`（r368 的 26 行）；
+2. 默认闩锁（r367）保留；
+3. **真正的问题**：`clover_sb_note_current()` 的 generation-change 分支里 `clover_bb_target_pid = 0;`
+   删掉——boot 148/150 都是「默认闩锁设 58 一次 → 下一次 generation change 清 0 → 整靴只采一次」。
+   pid 在 beat 的闩锁里仍用 `proc_find` 复查，死目标会被跳过而不是被使用。
+   net diff：增 9／删 26。
+
+**预登记（boot 151，r369 镜像）。**
+- **W2-A**：`r308` 的 target 在靴内持续为 58、`ent` 单调增、`r229` 多枚，且活过 600 s ⇒ 回退正确、
+  目标持久化生效；若某拍 hop 带 send destination，`rembody` 出 selector。
+- **W2-B**：仍 ~170 s 死 ⇒ r368 不是死因（是那一带的存储/其它），转查 r307/r309 与 `r198 rc=100`。
+- **W2-C**：target 仍只出现一次 ⇒ generation-change 还有第二处清零，或默认闩锁被别的路径覆盖。
+- 控制：boot 151 的存活时间先与 boot 148（1200+ s）/149/150（~170 s）比；`r308 target=58` 与
+  `r229 pid=58` 同靴一致。
