@@ -1,0 +1,31 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 075d8f0..ebbaaf7 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11278,6 +11278,26 @@ clover_bb_beat_thread(void *param, wait_result_t wres)
+ 			continue;
+ 		}
+ 		task_reference(sb);
++		/*
++		 * Round367. The fire has always needed clover_bb_target_pid, and that latch only opens when
++		 * the sampled task's send destination happens to resolve to backboardd. Boot 147's window
++		 * proves the cost: the sampler ran (r221 on tid 0x6dd, destination 132:lsd) but the target
++		 * never latched, so ent=0 fired=0 for 1800 s and the one boot that reached its deadline had
++		 * no burst at all. Backboardd is the debtor this port is about, so when nothing named it,
++		 * sample backboardd itself: the walk then reads its own hops, which is where the IOKit
++		 * request lives.
++		 */
++		if (clover_bb_target_pid == 0) {
++			extern struct proc *proc_find(int pid);
++			extern int proc_rele(struct proc *p);
++			struct proc *p58 = proc_find(58);
++
++			if (p58 != NULL) {
++				clover_bb_target_pid = 58;
++				clover_bb_target_name = MACH_PORT_NULL;
++				proc_rele(p58);
++			}
++		}
+ 		secs = clover_now_seconds();
+ 		if (last_beat == 0 || secs >= last_beat + 120) {
+ 			last_beat = secs;

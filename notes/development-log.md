@@ -30314,3 +30314,28 @@ r366 读 `p+24` 起 8 个字（`rembody`），并在 `hdr[0] & MACH_SEND_MSG` �
 `SAHARA_RESET_REQ`，**被接受**（`SAHARA reset accepted`），板子自己复位并由预置 BCB 落进 TWRP——
 全程没有按键。这条已接进 runner 的 `edl_reset()`：USB 复位 → 2 s → `SAHARA_RESET_REQ`，仍然只
 reset、不写任何分区，闸门钉住两句。
+
+
+## Round367 —— 让 burst 在「没人把 backboardd 当目的地」的靴上也开火
+
+**题面。** boot 147 那一靴活到 1800 s 死线（`clover r148: unattended deadline` 十几枚、最新记录
+`t=1805 s`），可整靴 **`r308: beat target=0 ent=0 fired=0`**：采样器跑了（`r221` 15 枚，tid 0x6dd，
+`rem=4903 ro=132:lsd`），但目标闩锁只在「被采样任务的发送目的地解析成 backboardd」时才开，
+这一靴的目的地是 `lsd`，于是**一次 burst 都没有**。r366 的 `rembody` 在 boot 147 里因此零行
+（不是读坏了，是根本没走到）。
+
+**改动（`osfmk/kern/task.c`）。** `clover_bb_beat_thread`：拿到 `clover_sb_task` 之后、开火之前，
+若 `clover_bb_target_pid == 0`，用 `proc_find(58)` 把目标直接设成 backboardd（`proc_rele` 立刻放），
+并清 `clover_bb_target_name`。不取 task 引用、不换 `clover_sb_task`——采样用 pid 走 `proc_find`，
+`sb` 只用于债名上下文，所以这条默认闩锁不改引用纪律。纯增、删 0。
+
+**预登记（boot 148，r367 镜像）。**
+- **Y1-A**：`r229: bb t=… pid=58` 与 `bbsend` 行出现（default latch 生效），且 hop 里出现
+  send destination ⇒ `remcall`/`rembody` 有行；若 `rembody` 的 `w[0]` 是小整数 ⇒ 那就是 selector，
+  与 `kotype=29` 的 user client 对表；若 `w` 是文本/plist 形状，按 in-band 结构记。
+- **Y1-B**：default latch 生效但 hop 全是 pset（`asked=0`）⇒ 本靴 backboardd 不在 IOKit 调用上，
+  记录并等下一靴（形态问题，不是仪器问题）。
+- **Y1-C**：`r308` 仍 `target=0` ⇒ latch 代码没生效（`proc_find(58)` 失败或编译路径没到），
+  先查 `r229` 是否有 `gone`/`notask` 早期返回。
+- 控制：`r308 target=58` 与 `r229 pid=58` 必须同一靴；`ent>0` 且 `fired>0`；`bbsend cand=` 与
+  bbsend 行数相等。
