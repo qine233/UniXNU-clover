@@ -30464,3 +30464,20 @@ boot 154（r360，无默认闩锁）活到 750 s。r371 修了任务错配，死
   与 `r198 rc=100`。
 - **W3-C**：活到 600 s、在第一次采样（t≈600）立刻死 ⇒ 样本路径致死，按 `clover_bb_sample` 的内部分段
   （proc_find → 锁 → 线程走表 → copyinmap）逐段二分。
+
+
+**读数（boot 156，r372 镜像 `590f8ea8…`）—— 门控实验判 W3-A/C，且第一次拿到 user client 的类。**
+
+- 靴活过 170 s、活过 600 s（`r308 beat t=540 target=58`），**门控成立**：没有 t≈180 的早采样就不早死
+  ⇒ 之前的 167–173 s 死是**首次采样**触发的。
+- 第一次采样在 `t=603`（`r229 t=603 pid=58 … hops=4`，这是第一次在 backboardd 自己身上看到 **4 跳**），
+  随即卡写停在 `t=621886 ms`（≈621 s，采样后 ~18 s）⇒ **采样路径本身致死**（W3-C），但数据已落盘。
+- **`remkobj` 第一次出真行**：
+  `t=603 pid=58 hop=3 i=3 nm=6703 kotype=29 kobj=fffffff320931238 vp=fffffff0071cf878 sr=2 so=0 q=0
+  rnm=1 rstate=1 rpid=-1 c=kspace`。
+  宿主解码：`vp=fffffff0071cf878` = **`__ZTV10IOMachPort + 0x10`**——`IOMachPort` 正是
+  `iokit/Kernel/IOUserClient.cpp:150` 里「把 OSObject 映到端口」的包装类，kotype 29 的 user client 连接口
+  就挂在它上面。这与 boot 145 的 `client#3 pid=58 class=IOMobileFramebufferUserClient status=0` 对上了：
+  **backboardd 自己的一枚线程在向它自己的 IOMobileFramebuffer user client 口发送并阻塞**。
+- 下一步：①把 IOMachPort 的映射跟到真正的 client 对象（它的哈希链里存着 OSObject），②修采样路径
+  （对 backboardd 的线程走表会在 ~18 s 后致死，需要逐段二分），③解 1372 字节请求的 selector。
