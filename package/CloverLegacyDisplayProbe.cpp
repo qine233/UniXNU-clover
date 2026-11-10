@@ -186,6 +186,20 @@ volatile uint32_t native_legacy_frame_kind[NATIVE_LEGACY_FRAMES];
 volatile uint32_t native_legacy_frame_time[NATIVE_LEGACY_FRAMES];
 volatile uint64_t native_legacy_frame_stats[NATIVE_LEGACY_FRAMES][5];
 static uint64_t frameEpoch;
+/*
+ * Presentation time only: the content scans stay budgeted to the first frames, but whether a frame was
+ * presented at all must keep being answered, or a boot that stopped presenting looks like a boot whose
+ * scans were merely spent.
+ */
+void native_legacy_frame_presented(unsigned kind) {
+    uint64_t now,frequency;
+    __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(now));__asm__ volatile("mrs %0, cntfrq_el0":"=r"(frequency));
+    if(!frameEpoch)frameEpoch=now;
+    native_legacy_last_kind=kind;
+    native_legacy_last_time=frequency?(uint32_t)((now-frameEpoch)/frequency):0;
+    native_legacy_last_box[0]=0;native_legacy_last_box[1]=0;
+    native_legacy_last_box[2]=0;native_legacy_last_box[3]=0;
+}
 void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uint64_t miny,uint64_t maxx,uint64_t maxy) {
     uint32_t n=native_legacy_frame_count;
     uint64_t now,frequency;

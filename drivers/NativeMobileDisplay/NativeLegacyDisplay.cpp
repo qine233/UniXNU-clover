@@ -31,6 +31,7 @@ extern "C" uint32_t native_legacy_surface_format(OSObject *),native_legacy_surfa
 extern "C" void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uint64_t miny,uint64_t maxx,uint64_t maxy);
 extern "C" void native_legacy_frame_colors_observed(const uint32_t *colors,const uint64_t *counts,uint64_t other);
 extern "C" void native_legacy_swap_validation_observed(bool,unsigned,const void *,const void *);
+extern "C" void native_legacy_frame_presented(unsigned kind);
 // The surface of a rejected swap, as the validator read it: width, height, format, planes, stride, allocation, descriptor length.
 extern "C" void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t,uint32_t,uint64_t,uint64_t,uint64_t);
 extern "C" bool native_legacy_prepare_scanout(void);
@@ -270,6 +271,8 @@ public:
     // one frame late, a still screen holding the previous frame until the next touch -- is an inherited claim, no record in this repository, and
     // boot 113, the only window on disk with swap/retire rows, is serialized, so it can neither confirm the lag nor name its cause.
     // A retirement inside a kick only asks the running kick to loop.
+    unsigned kickSeen=0;
+    unsigned surfaceMiss=0;
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
         armVsync();
@@ -284,8 +287,20 @@ public:
     }
     void kickOnce() {
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
-        if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
+        /*
+         * A row every 64th entry says which of the gates stops the kick late in a boot: the panel froze
+         * at t=125 s while the client kept calling swap, and every candidate reason is one of these.
+         */
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
+        if(request && (kickSeen % 64)==0)
+            IOLog("clover r379: kick#%u en=%u tr=%u pm=%u bm=%u pr=%u rq=%u va=%u\n",kickSeen,enabled,
+                (unsigned)transferred,(unsigned)logicalPM,(unsigned)(bootMapping!=nullptr),(unsigned)primary,
+                (unsigned)(request!=nullptr),(unsigned)(request&&isValidated(request)));
+        else if(!request && (kickSeen % 64)==0)
+            IOLog("clover r379: kick#%u en=%u tr=%u pm=%u bm=%u pr=%u rq=0\n",kickSeen,enabled,
+                (unsigned)transferred,(unsigned)logicalPM,(unsigned)(bootMapping!=nullptr),(unsigned)primary);
+        kickSeen++;
+        if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
         if(!request || !isValidated(request))return;
         // This bounded first-frame transfer preserves the original queue's
         // resource ownership. Separately gated retirement follows the copy;
@@ -320,7 +335,17 @@ public:
             finishTransfer(request);
             return;
         }
-        if(!surface->metaCast("IOSurface"))return;
+        if(!surface->metaCast("IOSurface")) {
+            /*
+             * A request whose surface is not an IOSurface was dropped silently, so a boot that stops
+             * presenting looks identical to one that keeps swapping. Name the object instead.
+             */
+            if((surfaceMiss++ % 64)==0) {
+                const OSMetaClass *meta=surface->getMetaClass();
+                IOLog("clover r380: surface-miss #%u class=%s\n",surfaceMiss,meta?meta->getClassName():"?");
+            }
+            return;
+        }
         IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
         PE_Video video={};
         uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
@@ -450,6 +475,7 @@ public:
         // Only after the real copy and store barrier: select the actual pending head and let the unchanged family release it and wake
         // waiters. This reports memory scanout completion, not a panel vblank or hardware fence.
         if(!retireSwap(request,force))return;
+        native_legacy_frame_presented(0);
         // The unchanged family has retired this generation and released its current reference. Permit the next independently validated
         // single pending frame. Keep the latch set while completion can reenter this method, and whenever retirement remains disabled.
         transferred=false;

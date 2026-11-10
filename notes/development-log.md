@@ -30611,3 +30611,28 @@ dispstate ms=1791590 … last=0@125s:305x811..970x1108 … latch=243 copy=243 fc
 客户端的 swap 循环仍在跑、驱动计数器仍在涨，但可见内容 28 分钟没变。下一支要查：125 s 时谁停了
 （`kickOnce` 的分支/`transferred`/surface 校验），以及 CoreAnimation 在没有 GPU 的路径上是否根本
 不再产出新 surface——这决定「写 GPU 驱动」是不是桌面路的必要条件。
+
+
+## Round378–381 —— 修正：「面板冻结」是扫描预算的假象；真正停的是**客户端在 ≈459 s 不再提交 swap**
+
+- r378：`kickOnce` 每 64 次进出一行（`en/tr/pm/bm/pr`）；boot 162：末段全是 `en=1 tr=0 pm=1 bm=1 pr=1`，
+  **四个门都开着**，kick 不是被门挡住的。
+- r379：行里加 `rq=`（有没有 pending request）与 `va=`（validation 是否通过）；boot 163：
+  末段全是 `rq=1 va=1` ⇒ **请求在、校验过**，kickOnce 不是被这两个挡住的。
+- r380：`!surface->metaCast("IOSurface")` 的静默返回加 `surface-miss` 行；boot 164：0 行 ⇒ 不是非
+  IOSurface 被丢。
+- r381：新增 `native_legacy_frame_presented()`（**不受 32 帧扫描预算限制**，每次 retire 都更新时间），
+  `dispstate` 的 `last=` 现在表示「最后一次真正呈现」。
+- **读数（boot 165，r381 镜像 `c484c443…`）**：
+  ```
+  dispstate ms=1252248 … last=0@433s:0x0..0x0 … calls=1202 … latch=128 copy=128 fc=128
+  dispstate ms=1799816 … last=0@459s:0x0..0x0 … calls=1266 … latch=138 copy=138 fc=138
+  ```
+  - 最后一次呈现是 **t≈459 s**；此后 `latch/copy/fc` 冻在 0x138；
+  - 客户端调用数也冻在 **1266**（`pick=0g grew=0`）——**客户端在 ≈459 s 之后彻底停止提交 swap**；
+  - 但系统仍在跑：尾部有 `bluetoothd/PerfPowerService/fairplayd` 在 t=1511–1514 s 正常退出，
+    `r238 ulock` 显示 backboardd（pid 58）在 t=1767 s 仍等在锁上（age≈993）。
+
+**修正。** 之前「面板 125 s 冻结」是 `scanBudget`（只扫前 32 帧）的假象；r381 的无预算时间戳证明
+**画面在 ≈459 s 前一直在更新**（比 32 帧多得多），停的是**客户端**。下一支：查 459 s 前后
+backboardd/SpringBoard 为什么不再提交 swap（r238 的锁等待、lsd 队列、或某次调用失败后的退避）。

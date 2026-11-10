@@ -16,6 +16,22 @@
 
 ## 逐轮报告（倒序）
 
+### r378–r381 — 修正：「面板冻结」是扫描预算假象；客户端在 ≈459 s 停摆
+
+- **改动**：
+  - r378：`kickOnce` 每 64 次打 `en/tr/pm/bm/pr`；
+  - r379：加 `rq/va`（请求/校验）；
+  - r380：非 IOSurface 的静默返回加 `surface-miss` 行；
+  - r381：`native_legacy_frame_presented()` 每次 retire 更新时间（不受 32 帧扫描预算限制）。
+- **读数**：
+  - boot 162：`kick#… en=1 tr=0 pm=1 bm=1 pr=1` ⇒ 四个门全开；
+  - boot 163：`kick#… rq=1 va=1` ⇒ 请求在、校验过；
+  - boot 164：`surface-miss` 0 行；
+  - boot 165：`last=0@459s`、`latch/copy/fc=0x138`、`calls=1266` 冻住 ⇒ **客户端在 ≈459 s 后不再提交
+    swap**；系统仍在跑（bluetoothd 等在 t≈1511 s 正常退出，backboardd 在 t=1767 s 等锁）。
+- **修正**：之前「面板 125 s 冻结」是 `scanBudget` 假象；画面在 459 s 前持续更新，停的是客户端。
+- **下一支**：查 backboardd/SpringBoard 在 459 s 前后为何停（锁等待、lsd 队列、调用失败退避）。
+
 ### r376/r377 — 面板内容自 t≈125 s 冻结（桌面问题的真实卡点）
 
 - **改动（board 侧，无新 XNU patch）**：
