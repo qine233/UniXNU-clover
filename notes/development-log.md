@@ -30567,3 +30567,23 @@ dispstate ms=600635 … hot=6:23/11/e00002d5 latch=c copy=c fc=c vs=0/0/0
 「selector 5/6、IOMachPort、IOMobileFramebufferUserClient」这些关键身份已经拿到 ⇒
 **主线从「采样取证」转向「显示侧修复」**：不再依赖采样器，改在显示驱动/探针里读 swap 队列
 （`transferred`、`kickOnce` 四个门、selector 72/register 的返回码）。
+
+
+## Round375 —— 关掉采样器：靴活满 1800 s 死线，显示侧第一次拿到整靴数据
+
+**改动（`osfmk/kern/task.c`）。** 采样开火默认关闭，只有 boot arg `clover-bbsample=1` 才开；
+`beat` 仍跑、`r308` 行仍在。patch `<103z>-…-r375.patch`，md5 `0c1ac26e…`。
+
+**读数（boot 159，r375 镜像 `767325f2…`）——整靴 1800 s：**
+- `flight: newest entry t=1805079 ms`、`clover r148: unattended deadline` 14 枚 ⇒ **自主跑到死线**，
+  证明「~170 s / ~610 s 的早死」全部来自采样执行；
+- `dispstate ms=1800139 … client=pid86 calls=3078 fails=779 regall=0 regs=0
+  hot=6:1529/764/e00002d5 latch=2fd copy=2fd fc=2fd vs=0/0/0`：
+  - **swap 真的在 retire：fc=0x2fd=765 帧 / 1800 s（≈0.43 fps）**；
+  - selector 6：1529 次调用、764 次 Busy —— **恰好一半**；
+  - `regall=0 regs=0` 依旧：**没有任何 vsync/端口注册**；
+- 50% Busy 的形状说明队列是「每次新提交推进上一帧」：调用 N 回 Busy（上一帧还在 transfer），
+  kick 退休它；调用 N+1 被接受。⇒ **显示不是瓶颈，客户端的提交节奏（~2.3 s/次）才是**。
+
+**判读。** 桌面帧管线是活的、但极慢（0.43 fps），且没有任何 vsync 注册；下一支从
+「客户端为什么 ~2.3 s 才提交一次」与「selector 72/register 为什么从未发生」入手，而不是再改 swap。

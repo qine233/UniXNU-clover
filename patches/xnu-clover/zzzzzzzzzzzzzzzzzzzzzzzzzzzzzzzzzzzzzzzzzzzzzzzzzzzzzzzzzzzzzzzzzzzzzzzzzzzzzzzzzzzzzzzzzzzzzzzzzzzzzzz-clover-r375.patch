@@ -1,0 +1,35 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index d6b4df0..01c2519 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11260,6 +11260,8 @@ clover_r308_beat_row(uint64_t secs)
+ 	printf("%s", row);
+ }
+ 
++static int clover_bb_sample_enabled = -1;
++
+ static void
+ clover_bb_beat_thread(void *param, wait_result_t wres)
+ {
+@@ -11335,7 +11337,20 @@ clover_bb_beat_thread(void *param, wait_result_t wres)
+ 		 * near 170 s with the gate in place says the sample is not the cause, and a boot that runs
+ 		 * to 600 s and dies at the first sample says it is.
+ 		 */
+-		if (clover_bb_target_pid != 0 && secs >= 600) {
++		/*
++		 * Round375. Boots 156 and 158 both stopped 11-18 s after the gated sample -- the execution of
++		 * the walk is fatal to a boot regardless of what it reads -- while the identities the walk was
++		 * built for are already in hand (selector 5 with 1288 bytes, selector 6 swap, IOMachPort,
++		 * IOMobileFramebufferUserClient). The walk is therefore off by default and only runs when the
++		 * boot arg asks for it, so the display probes get a full boot instead of losing every one.
++		 */
++		if (clover_bb_sample_enabled < 0) {
++			int enabled = 0;
++
++			PE_parse_boot_argn("clover-bbsample", &enabled, sizeof(enabled));
++			clover_bb_sample_enabled = enabled ? 1 : 0;
++		}
++		if (clover_bb_sample_enabled != 0 && clover_bb_target_pid != 0 && secs >= 600) {
+ 			clover_bb_sample(clover_bb_target_pid, sb,
+ 			    clover_bb_target_name, secs);
+ 			/*

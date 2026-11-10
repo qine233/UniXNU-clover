@@ -4752,6 +4752,40 @@ def check_board(errors: list) -> str:
             errors.append("the r366 rows are not exempt from the per-pass cap: a body without its "
                           "header is the same half-pair r249 refuses")
 
+        # Round375. The walk is fatal to a boot, so it is off by default and only runs on request.
+        r375_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r375.patch")),
+                         default=None)
+        if r375_patch is None or not r375_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r375.patch is missing: a boot would lose its "
+                          "display readings to the walk again")
+        else:
+            r375_name = r375_patch.name
+            r375_text = r375_patch.read_text()
+            load_r375 = REPO.parent / "UniXNU" / "patches" / "xnu" / r375_name
+            local_r375 = REPO / "patches/xnu" / r375_name
+            if not load_r375.is_file() or load_r375.read_bytes() != r375_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r375_name} is missing or differs: the shipped "
+                              "image would carry other bytes")
+            if not local_r375.is_file() or local_r375.read_bytes() != r375_patch.read_bytes():
+                errors.append(f"patches/xnu/{r375_name} is missing or differs: the series line loads "
+                              "that copy, so the gate must pin the bytes it actually applies")
+            series_text = (REPO / "patches/xnu/series").read_text()
+            series_line = f"arch:../../../patches/xnu/{r375_name}"
+            r374_prev = max((p.name for p in (REPO / "patches/xnu-clover").glob("*-clover-r374.patch")),
+                            default="")
+            if series_line not in series_text:
+                errors.append(f"patches/xnu/series does not apply {r375_name}: the off switch exists "
+                              "in the source and the kernel would be built without it")
+            elif r374_prev == "" or series_text.find(series_line) < series_text.find(r374_prev):
+                errors.append("patches/xnu/series does not apply r375 after r374")
+            r375_added = [line[1:] for line in r375_text.splitlines() if line.startswith("+")]
+            for now in ('static int clover_bb_sample_enabled = -1;',
+                        'PE_parse_boot_argn("clover-bbsample", &enabled, sizeof(enabled));',
+                        'if (clover_bb_sample_enabled != 0 && clover_bb_target_pid != 0 && secs >= 600) {'):
+                if not any(now in line for line in r375_added):
+                    errors.append(f"the r375 kernel patch does not add {now[:56]!r}: the walk would "
+                                  "still run by default")
+
         # Round374. The blocked hop is read beside the frame counter at display+252.
         r374_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r374.patch")),
                          default=None)
@@ -8833,8 +8867,8 @@ def check_board(errors: list) -> str:
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
     # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
     # the menu names round347.
-    if not board["payload"]["title"].startswith("clover r374:"):
-        errors.append('[payload] title is not "clover r374: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r375:"):
+        errors.append('[payload] title is not "clover r375: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -10988,8 +11022,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r374:"):
-        errors.append('[payload] title is not "clover r374: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r375:"):
+        errors.append('[payload] title is not "clover r375: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

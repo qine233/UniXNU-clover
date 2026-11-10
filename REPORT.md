@@ -16,6 +16,20 @@
 
 ## 逐轮报告（倒序）
 
+### r375 — 关掉采样器：靴活满 1800 s 死线，显示侧第一次拿到整靴数据
+
+- **改动**：采样开火默认关闭（boot arg `clover-bbsample=1` 才开）。patch `<103z>-…-r375.patch`，
+  md5 `0c1ac26e…`，payload `767325f2…`，tag **v0.7.96**。
+- **读数（boot 159，整靴 1800 s）**：
+  - `flight: newest entry t=1805079 ms`＋14 枚 deadline 行 ⇒ **自主跑到死线**；此前 ~170 s/~610 s
+    的早死全部来自采样执行；
+  - `dispstate ms=1800139 … client=pid86 calls=3078 fails=779 regall=0 regs=0 hot=6:1529/764/e00002d5
+    latch=2fd copy=2fd fc=2fd` ⇒ **swap 在 retire：765 帧/1800 s（≈0.43 fps）**，selector 6 恰好
+    一半 Busy；
+  - `regall=0 regs=0`：没有任何 vsync/端口注册。
+- **判读**：显示管线是活的但极慢；50% Busy 的「新提交推进上一帧」形状说明**瓶颈是客户端提交节奏**
+  （~2.3 s/次），不是 swap 本身。下一支查「客户端为什么这么慢」与「selector 72/register 为何从未发生」。
+
 ### r374 — 帧计数进 remdisp；确认「采样器执行本身致死」
 
 - **改动**：`remdisp` 追加 `fc=`（display+252）。patch `<102z>-…-r374.patch`，md5 `c130254c…`，
