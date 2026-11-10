@@ -318,7 +318,10 @@ loader = "firmware"
 #
 # Round370's case: boot 145 shows backboardd opened an IOMobileFramebufferUserClient and blocked in a
 # call our wrapper never saw, so the kobject's vptr is printed and mapped to a class on the host.
-title = "clover r370: boot 145 showed backboardd opened an IOMobileFramebufferUserClient (client#3 pid=58, status=0) and then blocked in a 1372-byte call whose selector our wrapper never saw, so the next question is which class the port's kobject is. For kotype 29/30 this round reads the object's vptr under the port lock and prints vp= beside \"kobj\"; the legacy display's vtable is a symbol in this kernel, so the host maps the address to a class without calling into the object. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
+#
+# Round371's case: the default latch samples backboardd by pid while the beat's \"sb\" names SpringBoard,
+# and the sampler now uses the sampled task when the two differ.
+title = "clover r371: boots 149-153 all stopped at about 170 s right after the first default-latch sample, while boot 148 took one sample and ran to 1805 s and the r360 control ran past ten minutes -- so this round fixes the sample's task mismatch: the default latch walks backboardd by pid while the beat's \"sb\" still names the task whose trap opened the beat, and every port name read below is an index in the sampled task's space. When task_pid(sb_task) is not the sampled pid, the sampler now uses the sampled task. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
