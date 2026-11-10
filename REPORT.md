@@ -16,6 +16,16 @@
 
 ## 逐轮报告（倒序）
 
+### r374 — 帧计数进 remdisp；确认「采样器执行本身致死」
+
+- **改动**：`remdisp` 追加 `fc=`（display+252）。patch `<102z>-…-r374.patch`，md5 `c130254c…`，
+  payload `e01bd634…`，tag **v0.7.95**。
+- **读数（boot 158）**：没有 `remdisp` 行（采样没抓到 send），最新 flight `t=611232 ms` ⇒
+  采样后 ~11 s 复位；`dispstate … pick=0 p58=0 calls=9 fails=6 regall=0 latch=0 copy=0 fc=0`。
+- **判读**：boot 156（hops=4，采样后 18 s 死）＋ boot 158（无 send，采样后 11 s 死）⇒
+  **采样器执行本身致死**，与数据无关。关键身份（selector 5/6、IOMachPort、
+  IOMobileFramebufferUserClient）已拿到 ⇒ **主线转向显示侧修复，不再依赖采样器**。
+
 ### r373 — 阻塞拍读显示状态：powered=1，Busy 另有来源
 
 - **改动**：hop 块读 `native_legacy_object+5808` 起 16 字 → `remdisp` 行。patch
@@ -106,8 +116,9 @@
 4. **副作用**：采样器跑完后 ~18 s 复位——先用 `t≥600` 门控拿数据，随后按
    `proc_find → 锁 → 线程走表 → copyinmap` 逐段二分。
 
-## 下一轮（r374）
+## 下一轮（r375）
 
-- 在 `wrappedRegister`（selector 72）上打一行不受 96 行预算限制的专用行，记录 `port/type/ref/status`；
-- 在 `kickOnce()` 入口打 `logicalPM/bootMapping/primary/transferred/kicking` 五个门的值；
-- 内核侧 `remdisp` 追加 `latch/copy/fc` 三字（偏移已在探针里用过），把「阻塞拍」与「帧推进」对齐。
+- 显示侧（不再用采样器）：在 `wrappedRegister`/`wrappedExternal` 里记录 selector 72 与 register
+  的返回码、`kickOnce()` 的 `logicalPM/bootMapping/primary/transferred` 四个门；
+- 若 selector 72 从未被调用 ⇒ 查 backboardd 为何不做 vsync 注册（可能要先让 selector 6 成功返回）；
+- 采样器致死作为独立问题排期（分段门控：proc_find → 锁 → 线程走表 → copyinmap）。

@@ -327,7 +327,9 @@ loader = "firmware"
 #
 # Round373's case: the powered word in the display state must be set before the swap stops answering
 # Busy; the sixteen words are read at the blocked hop.
-title = "clover r373: the display driver comment says the original wait selector answers kIOReturnBusy forever until the powered word at display+5840 is written, and this port does write it, yet the dispatch still answers Busy about half the time. At the moment a thread is blocked on the IOMobileFramebuffer user client port, this round reads the sixteen state words at display+5808 and prints them as \"remdisp\", so the word that decides Busy is read beside the hop instead of being inferred. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
+#
+# Round374's case: the blocked hop is read beside the frame counter at display+252.
+title = "clover r374: r373 read the display state at the blocked hop and found the powered word set, so the swap Busy comes from elsewhere; this round adds the frame counter at display+252 to the same row, so the blocked hop is read beside how far the swap queue has advanced (\"d=\" already carries latch and copy at +5820/+5824). Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

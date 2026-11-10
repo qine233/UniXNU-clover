@@ -30550,3 +30550,20 @@ dispstate ms=600635 … hot=6:23/11/e00002d5 latch=c copy=c fc=c vs=0/0/0
 **判读。** 「powered 没写 → 永远 Busy」被排除（5840=1）。Busy 的第二来源指向 **vsync 注册/武装缺失**
 （regall=0），下一支验：selector 72 的返回码与 `kickOnce()` 的 `logicalPM/bootMapping/primary/transferred`
 四个门在阻塞拍各自的值。
+
+
+## Round374 —— 帧计数进 remdisp；但这一靴没抓到 send，而且「采样必死」再确认
+
+**改动（`osfmk/kern/task.c`）。** `remdisp` 追加 `fc=`（display+252），与已有的 `d=`（+5808 起，
+含 latch=+5820、copy=+5824）对齐。patch `<102z>-…-r374.patch`，md5 `c130254c…`。
+
+**读数（boot 158，r374 镜像 `e01bd634…`）。**
+- 没有 `remdisp` 行：这一靴的采样（t≈600）没有抓到 send hop；
+- 最新 flight 记录 `t=611232 ms` ⇒ **采样后约 11 s 又复位**，即使这一靴的 hop 数据是空的；
+- `dispstate ms=622563 … pick=0 p58=0 calls=9 fails=6 regall=0 regs=0 latch=0 copy=0 fc=0`。
+
+**判读。** 结合 boot 156（hops=4 后 18 s 死）与 158（无 send 也 11 s 死）：
+**采样器的执行本身致死，与抓到什么无关**。继续用采样器拿数据每轮都要赔一靴，而
+「selector 5/6、IOMachPort、IOMobileFramebufferUserClient」这些关键身份已经拿到 ⇒
+**主线从「采样取证」转向「显示侧修复」**：不再依赖采样器，改在显示驱动/探针里读 swap 队列
+（`transferred`、`kickOnce` 四个门、selector 72/register 的返回码）。

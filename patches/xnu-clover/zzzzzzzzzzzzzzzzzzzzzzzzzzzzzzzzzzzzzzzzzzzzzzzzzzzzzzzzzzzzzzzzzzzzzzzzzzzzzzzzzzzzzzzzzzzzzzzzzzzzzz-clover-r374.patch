@@ -1,0 +1,24 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index f092116..d6b4df0 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -15052,12 +15052,15 @@ clover_bb_rem_bits(task_t task, int pid, int hop, uint32_t i, mach_port_name_t r
+ 				}
+ 				{
+ 					char drow[320];
+-					int dl = snprintf(drow, sizeof(drow),
+-					    "clover r373: remdisp t=%llu pid=%d nm=%x d=%x.%x.%x.%x.%x.%x.%x.%x"
+-					    ".%x.%x.%x.%x.%x.%x.%x.%x\n",
++					uint32_t fcw = 0;
++					int dl;
++					memcpy(&fcw, (const void *)(dobj + 252), sizeof(uint32_t));
++					dl = snprintf(drow, sizeof(drow),
++					    "clover r374: remdisp t=%llu pid=%d nm=%x d=%x.%x.%x.%x.%x.%x.%x.%x"
++					    ".%x.%x.%x.%x.%x.%x.%x.%x fc=%x\n",
+ 					    (unsigned long long)secs, pid, rem, sw[0], sw[1], sw[2], sw[3],
+ 					    sw[4], sw[5], sw[6], sw[7], sw[8], sw[9], sw[10], sw[11],
+-					    sw[12], sw[13], sw[14], sw[15]);
++					    sw[12], sw[13], sw[14], sw[15], fcw);
+ 					if (dl > 0) {
+ 						drow[sizeof(drow) - 1] = '\0';
+ 						clover_emmc_probe_say(drow, (unsigned int)strlen(drow));
