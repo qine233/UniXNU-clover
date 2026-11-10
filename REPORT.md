@@ -16,6 +16,20 @@
 
 ## 逐轮报告（倒序）
 
+### r373 — 阻塞拍读显示状态：powered=1，Busy 另有来源
+
+- **改动**：hop 块读 `native_legacy_object+5808` 起 16 字 → `remdisp` 行。patch
+  `<101z>-…-r373.patch`，md5 `746a1cc6…`，payload `64f2adcf…`，tag **v0.7.94**。
+- **读数（boot 157）**：
+  `remdisp t=602 pid=58 nm=630b d=4b0.780.e.d.d.ff000000.0.1.1.0.0.0.0.0.0.0`
+  → **+5840（powered）= 1**，`announcePoweredByFirmware()` 生效；
+  `dispstate ms=600635 hot=6:23/11/e00002d5 latch=c copy=c fc=c vs=0/0/0`；
+  `regall=0 regs=0` 依旧。
+- **判读**：「powered 没写 ⇒ 永远 Busy」被排除。Busy 的第二来源指向 **vsync 客户端注册缺失
+  （selector 72 从未成功）**：`armVsync()` 武装不了，交换只在新提交时 kick，前一帧未转完就回 Busy。
+- **下一支**：读 selector 72 的返回码与 `kickOnce()` 的 `logicalPM/bootMapping/primary/transferred`
+  四个门在阻塞拍的值。
+
 ### r372 — 门控实验：早死是「第一次采样」，并且第一次拿到 selector 身份
 
 - **改动**：beat 开火条件加 `secs >= 600`（`osfmk/kern/task.c`）。patch
@@ -92,9 +106,8 @@
 4. **副作用**：采样器跑完后 ~18 s 复位——先用 `t≥600` 门控拿数据，随后按
    `proc_find → 锁 → 线程走表 → copyinmap` 逐段二分。
 
-## 下一轮（r373）
+## 下一轮（r374）
 
-- 在 `package/CloverLegacyDisplayProbe.cpp` 里给 selector 6 增加一行专用：每次调用打
-  `opt/ret/pw/ps/transferred/cur`（不受 96 行预算限制，按 selector-6 前 16 次），并在
-  `NativeLegacyDisplay.cpp` 的 swap 队列里补 `transferred` 与 `pending` 的读数；
-- 同时把 selector 5 的 in-band 头 32 字节打进 `rembody`（内核侧，`p+24` 起 32 字）。
+- 在 `wrappedRegister`（selector 72）上打一行不受 96 行预算限制的专用行，记录 `port/type/ref/status`；
+- 在 `kickOnce()` 入口打 `logicalPM/bootMapping/primary/transferred/kicking` 五个门的值；
+- 内核侧 `remdisp` 追加 `latch/copy/fc` 三字（偏移已在探针里用过），把「阻塞拍」与「帧推进」对齐。

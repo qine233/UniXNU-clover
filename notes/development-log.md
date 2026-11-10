@@ -30527,3 +30527,26 @@ r180: swap#1..#3 accepted request=fffffff32106b000 surface=fffffff406e13428/37e0
 **这改写了主线的落点**：不是补一个缺失的 user client 方法，而是**让 legacy 交换不再回 Busy**
 （`IOMobileFramebufferLegacy` 的 swap 在上一帧未完成/队列满时回 Busy）。下一支读 swap 的入参
 （`pw/ps` 与 surface 状态）和 `latch/copy/fc` 的推进条件，把 Busy 的产生条件钉死。
+
+
+## Round373 —— 在阻塞那一拍读显示状态：powered=1，Busy 另有来源
+
+**改动（`osfmk/kern/task.c`）。** 在 hop 块（`ent==1 && obj!=NULL`）里读 `native_legacy_object+5808`
+起 16 个字，成 `clover r373: remdisp` 行，经 tee 上卡。patch `<101z>-…-r373.patch`，md5 `746a1cc6…`。
+
+**读数（boot 157，r373 镜像 `64f2adcf…`）。**
+```
+remdisp t=602 pid=58 nm=630b d=4b0.780.e.d.d.ff000000.0.1.1.0.0.0.0.0.0.0
+remcall t=602 … nm=630b id=b31 sz=55c rem=630b loc=a903 m0=0 m1=1
+remkobj t=602 … kotype=29 vp=fffffff0071cf878   (IOMachPort)
+dispstate ms=600635 … hot=6:23/11/e00002d5 latch=c copy=c fc=c vs=0/0/0
+```
+- 状态字：`+5808=0x4b0 +5812=0x780 +5816=0xe +5820=d +5824=d +5828=ff000000 +5836=1 +5840=1`
+  → **powered 字（5840）= 1**，`announcePoweredByFirmware()` 生效；
+- 但 selector 6 仍一半回 `kIOReturnBusy`；`latch/copy/fc=12`（600 s 才 12 帧）；
+- `r333` 的 `regall=0 regs=0` 一直没变：**没有任何 vsync 客户端注册（selector 72）** ⇒
+  `armVsync()` 无法武装，交换只在客户端新提交时被 kick，前一帧未转完就回 Busy。
+
+**判读。** 「powered 没写 → 永远 Busy」被排除（5840=1）。Busy 的第二来源指向 **vsync 注册/武装缺失**
+（regall=0），下一支验：selector 72 的返回码与 `kickOnce()` 的 `logicalPM/bootMapping/primary/transferred`
+四个门在阻塞拍各自的值。

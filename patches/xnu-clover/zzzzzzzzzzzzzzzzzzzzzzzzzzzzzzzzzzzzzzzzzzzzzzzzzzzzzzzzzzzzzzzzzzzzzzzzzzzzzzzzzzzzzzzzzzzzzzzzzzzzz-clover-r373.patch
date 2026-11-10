@@ -1,0 +1,49 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 75c2aaa..f092116 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -15031,8 +15031,43 @@ clover_bb_rem_bits(task_t task, int pid, int hop, uint32_t i, mach_port_name_t r
+ 		printf("%s", row);
+ 	}
+ 	if (ent == 1 && obj != IPC_OBJECT_NULL) {
++		/*
++		 * Round373. The display driver's own comment says the original wait selector answers
++		 * kIOReturnBusy forever until the powered word (display+5840) is written, and this port writes
++		 * it from announcePoweredByFirmware(). The dispatch still answers Busy about half the time, so
++		 * the sixteen state words at display+5808 are read here, at the moment a thread is blocked on
++		 * the IOMobileFramebuffer user client port.
++		 */
++		{
++			extern volatile uintptr_t native_legacy_object;
++			uintptr_t dobj = __atomic_load_n(&native_legacy_object, __ATOMIC_ACQUIRE);
++
++			if (dobj != 0) {
++				uint32_t sw[16];
++				int wi;
++
++				for (wi = 0; wi < 16; wi++) {
++					memcpy(&sw[wi], (const void *)(dobj + 5808 + (uintptr_t)wi * 4),
++					    sizeof(uint32_t));
++				}
++				{
++					char drow[320];
++					int dl = snprintf(drow, sizeof(drow),
++					    "clover r373: remdisp t=%llu pid=%d nm=%x d=%x.%x.%x.%x.%x.%x.%x.%x"
++					    ".%x.%x.%x.%x.%x.%x.%x.%x\n",
++					    (unsigned long long)secs, pid, rem, sw[0], sw[1], sw[2], sw[3],
++					    sw[4], sw[5], sw[6], sw[7], sw[8], sw[9], sw[10], sw[11],
++					    sw[12], sw[13], sw[14], sw[15]);
++					if (dl > 0) {
++						drow[sizeof(drow) - 1] = '\0';
++						clover_emmc_probe_say(drow, (unsigned int)strlen(drow));
++						printf("%s", drow);
++					}
++				}
++			}
++		}
+ 		len = snprintf(row, sizeof(row),
+-		    "clover r370: remkobj t=%llu pid=%d hop=%d i=%u nm=%x kotype=%u kobj=%llx"
++"clover r370: remkobj t=%llu pid=%d hop=%d i=%u nm=%x kotype=%u kobj=%llx"
+ 		    " vp=%llx sr=%u so=%u q=%u rnm=%x rstate=%d rpid=%d c=%s\n",
+ 		    (unsigned long long)secs, pid, hop, i, rem, kotype,
+ 		    (unsigned long long)kobj, (unsigned long long)vptr, sr, so, q, rnm,
