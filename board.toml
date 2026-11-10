@@ -331,7 +331,9 @@ loader = "firmware"
 # Round374's case: the blocked hop is read beside the frame counter at display+252.
 #
 # Round375's case: the walk is off by default so a boot can reach its own display readings.
-title = "clover r375: boots 156 and 158 both stopped 11-18 s after the gated sample, so executing the walk is fatal to a boot regardless of what it reads, while the identities it was built for are already in hand. The walk is now off by default and runs only when the \"clover-bbsample\" boot arg asks for it, so the display probes get full boots. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
+#
+# Round376 logs every 128th frame so the panel content late in a boot is readable.
+title = "clover r376: A boot that reaches its deadline only ever logged its first six frames, so the \"panel content\" late in a boot was unknown. This round logs every 128th frame as well, giving snapshots of what is on screen at about 2, 4, 6, 8, 10 and 12 minutes -- enough to say whether the visible content changes from the boot progress state at all. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

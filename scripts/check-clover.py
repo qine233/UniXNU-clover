@@ -4752,6 +4752,12 @@ def check_board(errors: list) -> str:
             errors.append("the r366 rows are not exempt from the per-pass cap: a body without its "
                           "header is the same half-pair r249 refuses")
 
+        # Round376. The first six frames were the only content rows, so what the panel shows late in a boot
+        # was unknown. Every 128th frame is logged as well.
+        if "(n>=128 && (n%128)==0)" not in (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text():
+            errors.append("package/CloverLegacyDisplayProbe.cpp does not log every 128th frame: the panel "
+                          "content late in a boot would stay unread")
+
         # Round375. The walk is fatal to a boot, so it is off by default and only runs on request.
         r375_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r375.patch")),
                          default=None)
@@ -8867,8 +8873,8 @@ def check_board(errors: list) -> str:
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
     # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
     # the menu names round347.
-    if not board["payload"]["title"].startswith("clover r375:"):
-        errors.append('[payload] title is not "clover r375: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r376:"):
+        errors.append('[payload] title is not "clover r376: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -11022,8 +11028,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r375:"):
-        errors.append('[payload] title is not "clover r375: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r376:"):
+        errors.append('[payload] title is not "clover r376: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

@@ -179,6 +179,9 @@ static void recordRejectedSwap(unsigned reason,const void *request,const void *s
 // since the first frame. A per-frame record shows the animation cadence and when the OS blanks the panel.
 #define NATIVE_LEGACY_FRAMES 32
 volatile uint32_t native_legacy_frame_count;
+/* The latest presented frame, kept every frame so a periodic row can say what the panel holds late. */
+volatile uint32_t native_legacy_last_kind,native_legacy_last_time;
+volatile uint64_t native_legacy_last_box[4];
 volatile uint32_t native_legacy_frame_kind[NATIVE_LEGACY_FRAMES];
 volatile uint32_t native_legacy_frame_time[NATIVE_LEGACY_FRAMES];
 volatile uint64_t native_legacy_frame_stats[NATIVE_LEGACY_FRAMES][5];
@@ -194,8 +197,16 @@ void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uin
         native_legacy_frame_stats[n][0]=count;native_legacy_frame_stats[n][1]=minx;native_legacy_frame_stats[n][2]=miny;
         native_legacy_frame_stats[n][3]=maxx;native_legacy_frame_stats[n][4]=maxy;
     }
+    native_legacy_last_kind=kind;
+    native_legacy_last_time=frequency?(uint32_t)((now-frameEpoch)/frequency):0;
+    native_legacy_last_box[0]=minx;native_legacy_last_box[1]=miny;
+    native_legacy_last_box[2]=maxx;native_legacy_last_box[3]=maxy;
     native_legacy_frame_count=n+1;
-    if(n<6)
+    /*
+     * Every 128th frame after the opening burst is logged too, so a boot that runs to its deadline says
+     * what the panel is showing late instead of only what the first six frames showed.
+     */
+    if(n<6 || (n>=128 && (n%128)==0))
         cloverLog("frame#%u kind=%u t=%us pixels=%llu box=%llux%llu..%llux%llu",n,kind,(unsigned)(frequency?(now-frameEpoch)/frequency:0),
             (unsigned long long)count,(unsigned long long)minx,(unsigned long long)miny,(unsigned long long)maxx,(unsigned long long)maxy);
 }
@@ -782,7 +793,8 @@ static void reportDisplayState(void) {
     if(!stat)snprintf(pick,sizeof pick,"-");
     else snprintf(pick,sizeof pick,"%u%s",bestPick,statPrior?"g":"t");
     const char *callsTxt="-",*failsTxt="-",*regsTxt="-",*regallTxt="-",*grewTxt="-",*hotTxt="-",*s6Txt="-";
-    const char *latchTxt="-",*copyTxt="-",*fcTxt="-",*grewnTxt="-",*p58Txt="-";
+    const char *latchTxt="-",*copyTxt="-",*fcTxt="-",*grewnTxt="-",*p58Txt="-",*lastTxt="-";
+    char lastValue[96];
     char calls[16],fails[16],regs[16],regall[16],grew[16],hot[40],s6[96],latch[16],copy[16],fc[16];
     char grewn[8],p58[16];
     if(stat) {
@@ -808,14 +820,20 @@ static void reportDisplayState(void) {
         snprintf(latch,sizeof latch,"%x",latchValue);latchTxt=latch;
         snprintf(copy,sizeof copy,"%x",copyValue);copyTxt=copy;
         snprintf(fc,sizeof fc,"%x",fcValue);fcTxt=fc;
+        snprintf(lastValue,sizeof lastValue,"%u@%us:%llux%llu..%llux%llu",(unsigned)native_legacy_last_kind,
+            (unsigned)native_legacy_last_time,(unsigned long long)native_legacy_last_box[0],
+            (unsigned long long)native_legacy_last_box[1],(unsigned long long)native_legacy_last_box[2],
+            (unsigned long long)native_legacy_last_box[3]);
+        lastTxt=lastValue;
     }
     char row[kDispStateRowBytes];
     const uint64_t now=probeNowUs();
     int length=snprintf(row,sizeof row,
         "clover r344: dispstate ms=%llu fires=%u seen=%u client=%s pick=%s grewn=%s p58=%s calls=%s fails=%s "
+        "last=%s "
         "regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\n",
         (unsigned long long)(now/1000),dispstateFires,seenClientCount,client,pick,grewnTxt,p58Txt,
-        callsTxt,failsTxt,regallTxt,regsTxt,grewTxt,hotTxt,s6Txt,latchTxt,copyTxt,fcTxt,
+        callsTxt,failsTxt,lastTxt,regallTxt,regsTxt,grewTxt,hotTxt,s6Txt,latchTxt,copyTxt,fcTxt,
         vsyncHz,(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[1],
         (unsigned)cloverLogLines,(unsigned)kCloverLogBudget,(unsigned)cloverLogDropped);
     if(length<0 || static_cast<unsigned>(length)>=sizeof row) {

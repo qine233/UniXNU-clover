@@ -16,6 +16,21 @@
 
 ## 逐轮报告（倒序）
 
+### r376/r377 — 面板内容自 t≈125 s 冻结（桌面问题的真实卡点）
+
+- **改动（board 侧，无新 XNU patch）**：
+  - r376：每第 128 帧也打 `frame#` 行（payload `929af8c2…`）；
+  - r377：新增 `last=<kind>@<t>s:<box>` 进 `dispstate`（payload `1e4f473f…`）。
+- **读数（boot 161，整靴 1800 s）**：
+  ```
+  dispstate ms=1239520 … last=0@125s:305x811..970x1108 … latch=11d copy=11d fc=11d
+  dispstate ms=1791590 … last=0@125s:305x811..970x1108 … latch=243 copy=243 fc=243
+  ```
+  ⇒ **屏幕最后呈现的帧停在 t=125 s**（box 305x811..970x1108，拷贝帧），此后 28 分钟没变；
+  同靴客户端仍调 swap 2334 次（593 Busy）、`fc` 涨到 577。
+- **判读**：不是「帧率低」，是**面板在 125 s 冻结**。下一支：查 125 s 时 `kickOnce` 的哪个分支停了，
+  以及没有 GPU 时 CoreAnimation 是否不再产出新 surface——这决定 GPU 驱动是否为桌面路的必要条件。
+
 ### r375 — 关掉采样器：靴活满 1800 s 死线，显示侧第一次拿到整靴数据
 
 - **改动**：采样开火默认关闭（boot arg `clover-bbsample=1` 才开）。patch `<103z>-…-r375.patch`，

@@ -30587,3 +30587,27 @@ dispstate ms=600635 … hot=6:23/11/e00002d5 latch=c copy=c fc=c vs=0/0/0
 
 **判读。** 桌面帧管线是活的、但极慢（0.43 fps），且没有任何 vsync 注册；下一支从
 「客户端为什么 ~2.3 s 才提交一次」与「selector 72/register 为什么从未发生」入手，而不是再改 swap。
+
+
+## Round376/377 —— 面板内容自 t≈125 s 起冻结：整靴最后呈现的帧就是第 125 秒那帧
+
+**改动（board 侧，无新 XNU patch）。**
+- r376：`native_legacy_frame_observed` 除前 6 帧外，每第 128 帧也打一行；
+- r377：新增 `native_legacy_last_kind/last_time/last_box`，每帧更新；`dispstate` 行加 `last=<kind>@<t>s:<box>`
+  （放在两个被闸门钉住的行字面量之间，保持原字面量完整）。
+- r376 payload `929af8c2…`，r377 payload `1e4f473f…`。
+
+**读数（boot 161，r377 镜像 `1e4f473f…`，整靴 1800 s）：**
+```
+dispstate ms=1239520 … last=0@125s:305x811..970x1108 … latch=11d copy=11d fc=11d
+dispstate ms=1791590 … last=0@125s:305x811..970x1108 … latch=243 copy=243 fc=243
+```
+- **`last` 从 t=125 s 起再没变过**：整靴最后呈现的帧就是 125 s 的那一帧（kind=0 拷贝，box=305x811..970x1108）；
+- 与此同时 `fc` 从 0x11d 涨到 0x243（577 次退休）、客户端仍调用 swap 2334 次（593 次 Busy）；
+- `frame_observed` 在 125 s 之后**一次都没被调用**（否则 `last_time` 会更新）⇒ 后来的退休没有走
+  `kickOnce` 的拷贝/空白分支，屏幕内容**冻在 125 s**。
+
+**判读。** 桌面问题的真实卡点不是「帧率低」，而是**面板在 125 s 冻住**：boot 进度画面之后 UI 不再更新，
+客户端的 swap 循环仍在跑、驱动计数器仍在涨，但可见内容 28 分钟没变。下一支要查：125 s 时谁停了
+（`kickOnce` 的分支/`transferred`/surface 校验），以及 CoreAnimation 在没有 GPU 的路径上是否根本
+不再产出新 surface——这决定「写 GPU 驱动」是不是桌面路的必要条件。
