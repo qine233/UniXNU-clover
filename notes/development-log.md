@@ -30339,3 +30339,26 @@ reset、不写任何分区，闸门钉住两句。
   先查 `r229` 是否有 `gone`/`notask` 早期返回。
 - 控制：`r308 target=58` 与 `r229 pid=58` 必须同一靴；`ent>0` 且 `fired>0`；`bbsend cand=` 与
   bbsend 行数相等。
+
+
+## Round368 —— 让采样器的「目标」不再只能开一次
+
+**题面。** boot 148（r367 镜像）的窗口只有 10 枚 probe 行：`r308: beat t=180 target=58 ent=0
+fired=0`、同拍 `r229: bb t=180 pid=58 ... hops=0`，而 t=913/1033/1157 的三枚 beat 又回到
+`target=0`。也就是说默认闩锁**只开了一次**：`clover_sb_note_current()` 的 generation-change 分支
+（task.c:11150）会把 `clover_bb_target_pid` 清 0，而闩锁那一段没有把它重新拉回来，于是整靴只有
+t=180 那一次采样、且那次 backboardd 恰好 `hops=0`。
+
+**改动（`osfmk/kern/task.c`）。** 把开火条件从「全局 target 非 0」改成「局部 target」：beat 里先取
+`fire_pid = clover_bb_target_pid`，为 0 时用 `proc_find(58)` 重新解析 backboardd；解析失败就跳开
+这一次 fire（`goto clover_beat_no_fire`，不动引用纪律），成功则**每 20 s 采样一次**。`r324` 行仍报
+全局值。删 3 行（旧 fire 守卫）、增 46 行。
+
+**预登记（boot 149，r368 镜像）。**
+- **Z1-A**：`r308` 的 target 在靴内多次为 58 且 `ent>0 fired>0`，`r229` 多枚 ⇒ 采样持续；若其中某拍
+  hop 带 send destination，则 `remcall`/`rembody` 出现，`rembody w[0]` 即 selector（与 `kotype=29`
+  的 user client 对表）。
+- **Z1-B**：采样持续但所有拍 hop 全是 pset ⇒ backboardd 这一靴基本停在集合上；记录，等下一靴。
+- **Z1-C**：`target` 仍只在 t=… 出现一次 ⇒ `proc_find(58)` 失败或 `goto` 路径被误触发，先查
+  `r229` 的 `gone/notask` 早期返回。
+- 控制：`r308 target` 与 `r229 pid` 同靴一致；`fired` 单调增；`bbsend` 行数 == `cand=`。

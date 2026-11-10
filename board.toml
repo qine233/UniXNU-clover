@@ -309,7 +309,10 @@ loader = "firmware"
 # Round367's case: boot 147 reached its deadline with the sampler never latched (ent=0 fired=0), so
 # the one long boot had no burst. When nothing names backboardd as a destination, the beat samples
 # backboardd itself; its own hops are where the IOKit request lives.
-title = "clover r367: boot 147 reached its 1800 s deadline with ent=0 fired=0 -- the sampler ran (r221 on tid 0x6dd, destination 132:lsd) but the target latch never opened, because it only opens when the sampled task's send destination resolves to backboardd. This round samples \"backboardd\" itself when nothing named it: if the target is still zero when the beat fires, pid 58 is latched and the walk reads its own hops, which is where the IOKit request lives. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
+#
+# Round368's case: boot 148's latch fired once and later beats read target=0 again, so the fire now
+# uses a local target and re-resolves backboardd before every sample.
+title = "clover r368: boot 148's default latch fired once at t=180 (r229 pid=58, hops=0) and every later r308 row read target=0 again -- the global is cleared by the generation-change path and nothing re-arms it, so a boot gets one sample. The beat now carries a local target: when the global is zero it re-resolves backboardd through proc_find before the fire, so the walk of its own \"hops\" runs every 20 s instead of once. The r324 row keeps reporting the global, and a failed resolve skips the fire without touching the reference discipline. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

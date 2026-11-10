@@ -4752,6 +4752,56 @@ def check_board(errors: list) -> str:
             errors.append("the r366 rows are not exempt from the per-pass cap: a body without its "
                           "header is the same half-pair r249 refuses")
 
+        # Round368. Boot 148's default latch fired once and later beats read target=0 again, so the
+        # fire carries a local target and re-resolves backboardd before every sample.
+        r368_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r368.patch")),
+                         default=None)
+        if r368_patch is None or not r368_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r368.patch is missing: a boot would again get "
+                          "one sample and then silence")
+        else:
+            r368_name = r368_patch.name
+            r368_text = r368_patch.read_text()
+            load_r368 = REPO.parent / "UniXNU" / "patches" / "xnu" / r368_name
+            local_r368 = REPO / "patches/xnu" / r368_name
+            if not load_r368.is_file() or load_r368.read_bytes() != r368_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r368_name} is missing or differs: the shipped "
+                              "image would carry other bytes")
+            if not local_r368.is_file() or local_r368.read_bytes() != r368_patch.read_bytes():
+                errors.append(f"patches/xnu/{r368_name} is missing or differs: the series line loads "
+                              "that copy, so the gate must pin the bytes it actually applies")
+            series_text = (REPO / "patches/xnu/series").read_text()
+            series_line = f"arch:../../../patches/xnu/{r368_name}"
+            r367_prev = max((p.name for p in (REPO / "patches/xnu-clover").glob("*-clover-r367.patch")),
+                            default="")
+            if series_line not in series_text:
+                errors.append(f"patches/xnu/series does not apply {r368_name}: the local target "
+                              "exists in the source and the kernel would be built without it")
+            elif r367_prev == "" or series_text.find(series_line) < series_text.find(r367_prev):
+                errors.append("patches/xnu/series does not apply r368 after r367: the local target "
+                              "extends the latch that round added")
+            r368_added = [line[1:] for line in r368_text.splitlines() if line.startswith("+")]
+            r368_removed = [line[1:] for line in r368_text.splitlines()
+                            if line.startswith("-") and not line.startswith("---")]
+            for now in ('int fire_pid = clover_bb_target_pid;',
+                        'struct proc *pfire = proc_find(58);',
+                        'if (fire_pid == 0) {',
+                        'goto clover_beat_no_fire;',
+                        'clover_beat_no_fire:'):
+                if not any(now in line for line in r368_added):
+                    errors.append(f"the r368 kernel patch does not add {now[:56]!r}: the beat would "
+                                  "fire once and stop")
+            for gone in ('\t\tif (clover_bb_target_pid != 0) {',
+                         '\t\t\tclover_bb_sample(clover_bb_target_pid, sb,',
+                         '\t\t\t    clover_bb_target_name, secs);'):
+                if gone not in r368_removed:
+                    errors.append(f"the r368 patch does not replace {gone.strip()[:52]!r}: the fire "
+                                  "guard is still the global one")
+            if len(r368_removed) != 3:
+                errors.append(f"the r368 patch removes {len(r368_removed)} lines, not the 3 the "
+                              "fire guard re-shape accounts for")
+
+
         # Round367. Boot 147 reached its deadline with ent=0 fired=0: the target latch only opens when
         # a sampled send destination resolves to backboardd, so the long boot had no burst. When
         # nothing named it, the beat samples backboardd itself.
@@ -8554,8 +8604,8 @@ def check_board(errors: list) -> str:
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
     # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
     # the menu names round347.
-    if not board["payload"]["title"].startswith("clover r367:"):
-        errors.append('[payload] title is not "clover r367: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r368:"):
+        errors.append('[payload] title is not "clover r368: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -10709,8 +10759,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r367:"):
-        errors.append('[payload] title is not "clover r367: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r368:"):
+        errors.append('[payload] title is not "clover r368: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
