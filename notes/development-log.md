@@ -30262,3 +30262,24 @@ please reboot the device"。**一次电源循环仍是唯一出口**；`remwin` 
 EDL 尝试就死在这），以及本地 `edl.py` 的 `CLOVER_SAHARA_RESET=1` 支路（在 memory-debug 模式下改发
 `SAHARA_RESET_REQ` 而不是 dump）；runner 已改用这两处，闸门也钉住。**是否能在 0x900E 下真正复位，
 下一次 EDL 落回才是它的第一次考试**；若 SAHARA_RESET_REQ 被拒，这条就写进 limits（电源循环仍是必需的）。
+
+
+## Round365 —— 不读内存了，读 trap 自己的寄存器
+
+**题面。** boot 144 的 `remcall`：指针读成功，八个字却不像 mach 头（`b=0 sz=0 id=1 m0=9146c504`）。
+如果这条 trap 本来就是**纯收**，`data` 指向的是还没填的接收缓冲，八个字当然不是头——这与「发送缓冲
+读坏了」是两种完全不同的读法，而区分它们不需要再读内存：`mach_msg2_trap_args` 的 `options` 在 x1
+（`MACH_SEND_MSG`=0x1、`MACH_RCV_MSG`=0x2 都在里面），x4 = voucher|id，x6 = rcv_size|priority。
+
+**改动（`osfmk/kern/task.c`）。** hop 捕获加 `hx4[hn]=x[4]`、`hx6[hn]=x[6]`；在 r327 的 hop 循环里、
+`rem_bits` 之后印 `clover r365: remtrap`（`op=`(x1) `x4=` `x6=` `x7=`）。纯增、删 0。
+
+**预登记（boot 146，r365 镜像）。**
+- **X-A**：`op` 的 `MACH_SEND_MSG`(0x1) 位为 0 ⇒ 这条 trap 纯收；boot 144 的「不是头」是接收缓冲的
+  正常形状，`rem` 只是陪跑名——`rem` 腿整类假设（backboardd 向内核对象发请求）**撤回**，下一手改问
+  「它等的这封消息谁来发」。
+- **X-B**：`op` 有发送位 ⇒ 它在发，缓冲却读不出头：`p` 在这一刻不是发送缓冲（或内核已改写过），
+  下一手转内核 kmsg / `p±` 更远的窗。
+- **X-C**：`op` 为 0（x1 空）⇒ 该 trap 的 unpacking 与 r264 不符，先记仪器问题，不判。
+- 控制：`remtrap` 行数 == 本火 hop 数；`x4`/`x6`/`x7` 与 r221 同线程的 `h=` 后三字（voucher/id、
+  desc/rcv、rcv_size）应能对上；闸门①照旧先判。

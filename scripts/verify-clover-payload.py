@@ -1427,6 +1427,9 @@ def check_sb_sample(kernel: bytes) -> bool:
              # with its own error, because boot 144's first eight words were not a mach header.
              "r364-remwin": (b"clover r364: remwin t=%llu pid=%d hop=%d i=%u nm=%x p=%llx "
                              b"b=%x.%x.%x.%x ib=%d f=%x.%x.%x.%x if=%d\n") in kernel,
+             # Round365 prints the trap's own words: option64, voucher|id, rcv_size|priority.
+             "r365-remtrap": (b"clover r365: remtrap t=%llu pid=%d hop=%u i=%u nm=%x op=%llx x4=%llx "
+                              b"x6=%llx x7=%llx\n") in kernel,
              # Round354 keeps the four heavy helpers out of clover_bb_sample's frame. noinline is a
              # source attribute, but what boot 133 died on was the link: the helpers' frames accreted
              # into one 10912-byte frame and the beat thread's 16 KB stack overflowed. Each helper

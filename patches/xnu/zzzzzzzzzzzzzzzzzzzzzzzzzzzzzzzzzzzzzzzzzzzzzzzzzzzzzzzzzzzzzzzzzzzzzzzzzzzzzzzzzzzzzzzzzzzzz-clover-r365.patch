@@ -1,0 +1,47 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 40800ee..18253e6 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -15094,6 +15094,8 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 	uint32_t hrs[4];
+ 	uint32_t hrem[4] = { 0, 0, 0, 0 };
+ 	uint64_t hmsg[4] = { 0, 0, 0, 0 };
++	uint64_t hx4[4] = { 0, 0, 0, 0 };
++	uint64_t hx6[4] = { 0, 0, 0, 0 };
+ 	uint32_t hloc[4];
+ 	uint32_t hid[4];
+ 	uint64_t hto[4];
+@@ -15292,6 +15294,8 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 		hrs[hn] = (uint32_t)x[6];
+ 		hrem[hn] = (uint32_t)x[3];
+ 		hmsg[hn] = x[0];
++		hx4[hn] = x[4];
++		hx6[hn] = x[6];
+ 		hloc[hn] = (uint32_t)(x[3] >> 32);
+ 		hid[hn] = (uint32_t)(x[4] >> 32);
+ 		hto[hn] = x[7];
+@@ -15514,6 +15518,24 @@ clover_bb_sample(int pid, task_t sb_task, mach_port_name_t name, uint64_t secs)
+ 		 */
+ 		clover_bb_rem_bits(task, pid, (int)i, (uint32_t)i,
+ 		    (mach_port_name_t)hrem[i], hmsg[i], secs);
++		/*
++		 * Round365. Boot 144's message buffer held words that no mach header explains. The trap's
++		 * own registers say what it is without reading memory at all: x1 is option64 (MACH_SEND_MSG
++		 * and MACH_RCV_MSG live there), x4 is voucher|id, x6 is rcv_size|priority. A send trap with
++		 * an unfilled buffer and a receive trap are different readings, and until now only x3 was
++		 * printed beside the buffer.
++		 */
++		len = snprintf(line, sizeof(line),
++		    "clover r365: remtrap t=%llu pid=%d hop=%u i=%u nm=%x op=%llx x4=%llx"
++		    " x6=%llx x7=%llx\n",
++		    (unsigned long long)secs, pid, i, i, hrem[i],
++		    (unsigned long long)hop[i], (unsigned long long)hx4[i],
++		    (unsigned long long)hx6[i], (unsigned long long)hto[i]);
++		if (len > 0) {
++			line[sizeof(line) - 1] = '\0';
++			clover_emmc_probe_say(line, (unsigned int)strlen(line));
++			printf("%s", line);
++		}
+ 	}
+ 	{
+ 		extern unsigned int clover_emmc_probe_say(const char *text,
