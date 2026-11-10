@@ -30506,3 +30506,24 @@ first selector=12/50/55/68/84 … status=e00002c7
 下一支：把 selector 5 的 in-band 首 32 字节和 selector 6 的 `pw/ps` 状态一起打出来，确认 selector 6
 的 `e00002d5` 是否就是 backboardd 反复重试的那一个；采样致死则按 proc_find → 锁 → 线程走表 →
 copyinmap 逐段门控。
+
+
+**`e00002d5` 解出来了：`kIOReturnBusy`（`iokit/IOKit/IOReturn.h:168`，"Device Busy"）。**
+
+把 boot 156 的交换状态与 selector 表放在一起：
+
+```
+dispstate ms=602042 hot=6:20/9/00000000  latch=a copy=a fc=a vs=0/0/0
+dispstate ms=617718 hot=6:23/11/e00002d5 latch=b copy=b fc=b vs=0/0/0
+dispstate ms=633828 hot=6:31/15/e00002d5 latch=10 copy=10 fc=10 vs=0/0/0
+r180: swap#1..#3 accepted request=fffffff32106b000 surface=fffffff406e13428/37e0
+```
+
+- **selector 6 是 swap**，31 次调用里 **15 次回 `kIOReturnBusy`**，其余成功；
+- swap 确实在 retire（`latch/copy/fc=10`），但到 633 s 才 10 帧（≈1 帧/分钟）；
+- 所以「缺方法」这一支可以收掉：**方法在、也回包了，回的是 Busy**。backboardd 的 send+receive
+  就是在等这个时好时坏的 swap 回信；它反复重试，桌面被拖到几乎不前进。
+
+**这改写了主线的落点**：不是补一个缺失的 user client 方法，而是**让 legacy 交换不再回 Busy**
+（`IOMobileFramebufferLegacy` 的 swap 在上一帧未完成/队列满时回 Busy）。下一支读 swap 的入参
+（`pw/ps` 与 surface 状态）和 `latch/copy/fc` 的推进条件，把 Busy 的产生条件钉死。
