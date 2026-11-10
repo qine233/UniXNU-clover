@@ -72,6 +72,12 @@ RECOVERY_RETRIES=${RECOVERY_RETRIES:-3}
 # partition.
 EDL_TOOL=${EDL_TOOL:-$HOME/clover-out/edl/edl.py}
 EDL_LOADER=${EDL_LOADER:-$HOME/clover-out/edl/prog_firehose_ddr.elf}
+# The loader and the tool need a python with pyusb/docopt/pycryptodomex; the system python on this
+# host is 3.9 and does not have them, which is how the first EDL attempt died at "No module named
+# 'docopt'". Prefer the interpreter the tooling was installed into.
+if [ -z "${EDL_PYTHON:-}" ]; then
+  if [ -x /opt/homebrew/bin/python3.13 ]; then EDL_PYTHON=/opt/homebrew/bin/python3.13; else EDL_PYTHON=python3; fi
+fi
 EDL_RESET=${EDL_RESET:-1}
 EDL_RESET_TIMEOUT=${EDL_RESET_TIMEOUT:-60}
 # Round202. The payload's deadline is 1800 s of its own uptime (round228 moved it from 900),
@@ -380,7 +386,11 @@ edl_reset() {
   fi
   say "EDL: issuing a firehose reset with $(basename "$EDL_LOADER") (declared: reset only, no partition write)"
   : > "$OUT.edl-reset.log"
-  python3 "$EDL_TOOL" --loader="$EDL_LOADER" reset >> "$OUT.edl-reset.log" 2>&1 &
+  # Round364: a board that reset with a dump request enumerates as Sahara memory-debug (PID 0x900E)
+  # and the stock tool answers that by dumping gigabytes of RAM. The local copy honours this env and
+  # sends SAHARA_RESET_REQ instead, which is the only host command that leaves that mode.
+  CLOVER_SAHARA_RESET=1 "$EDL_PYTHON" "$EDL_TOOL" --loader="$EDL_LOADER" reset --resetmode=reset \
+    >> "$OUT.edl-reset.log" 2>&1 &
   local pid=$! waited=0
   while [ "$waited" -lt "$EDL_RESET_TIMEOUT" ]; do
     if ! kill -0 "$pid" 2>/dev/null; then

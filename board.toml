@@ -293,7 +293,11 @@ loader = "firmware"
 # message header, so the pointer itself has to be printed before the selector is judged. The same
 # round fixes the landing rule: a reset must come back to TWRP without a key press, so the misc BCB
 # is written by default after --boot-after-flash, retried, and an Android adb is asked for recovery.
-title = "clover r362: boot 143 named the last hop as an IOKit connect port (kotype=29) and left the method unread because remcall's eight words were not a message header. This round prints the trap's data pointer (\"p=\") beside those words, so the read can be checked against r221's h= for the same thread before any selector is judged. It also fixes the landing rule the maintainer asked for: a boot that resets must come back to TWRP without a key press, so --boot-after-flash authorises the 2048-byte misc BCB, the write is retried when it does not take, and an Android adb is asked for recovery instead of being read as a landing. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
+#
+# Round364's case: boot 144's pointer read succeeded but the first eight words were not a mach header.
+# The header is either behind or ahead of that address; the two neighbouring windows are read rather
+# than guessed, and the selector stays unjudged until one of them shows a mach header.
+title = "clover r364: boot 144 read the trap's data pointer (io=0) but its eight words were not a message header, so this round reads the two neighbouring windows instead of guessing which one holds the header: four words at p-16 and four at p+32, each with its own io= so a failed read is a row and not a silence. The same boot repeats kotype=29, so the object is still an IOKit connect port; the selector stays unjudged until a window shows a mach header (\"bits\" with SEND set, a size, a body word small enough to be a \"selector\"). Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

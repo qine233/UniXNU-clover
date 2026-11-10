@@ -4604,6 +4604,55 @@ def check_board(errors: list) -> str:
             errors.append("the r362 rows are not exempt from the per-pass cap: the pointer without the "
                           "row it explains is the same half-pair r249 refuses")
 
+        # Round364. Boot 144's pointer read succeeded but its eight words were not a mach header, so the
+        # two neighbouring windows are read rather than guessed; a failed window keeps its own io=.
+        r364_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r364.patch")),
+                         default=None)
+        if r364_patch is None or not r364_patch.is_file():
+            errors.append("patches/xnu-clover/*-clover-r364.patch is missing: the header would stay "
+                          "unfound and the selector unjudged")
+        else:
+            r364_name = r364_patch.name
+            r364_text = r364_patch.read_text()
+            load_r364 = REPO.parent / "UniXNU" / "patches" / "xnu" / r364_name
+            local_r364 = REPO / "patches/xnu" / r364_name
+            if not load_r364.is_file() or load_r364.read_bytes() != r364_patch.read_bytes():
+                errors.append(f"UniXNU/patches/xnu/{r364_name} is missing or differs: the shipped "
+                              "image would carry other bytes")
+            if not local_r364.is_file() or local_r364.read_bytes() != r364_patch.read_bytes():
+                errors.append(f"patches/xnu/{r364_name} is missing or differs: the series line loads "
+                              "that copy, so the gate must pin the bytes it actually applies")
+            series_text = (REPO / "patches/xnu/series").read_text()
+            series_line = f"arch:../../../patches/xnu/{r364_name}"
+            r363_prev = max((p.name for p in (REPO / "patches/xnu-clover").glob("*-clover-r362.patch")),
+                            default="")
+            if series_line not in series_text:
+                errors.append(f"patches/xnu/series does not apply {r364_name}: the windows exist in "
+                              "the source and the kernel would be built without them")
+            elif r363_prev == "" or series_text.find(series_line) < series_text.find(r363_prev):
+                errors.append("patches/xnu/series does not apply r364 after the r362 family: the "
+                              "windows extend the pointer row")
+            r364_added = [line[1:] for line in r364_text.splitlines() if line.startswith("+")]
+            r364_removed = [line[1:] for line in r364_text.splitlines()
+                            if line.startswith("-") and not line.startswith("---")]
+            for now in ('"clover r364: remwin t=%llu pid=%d hop=%d i=%u nm=%x p=%llx"',
+                        '" b=%x.%x.%x.%x ib=%d f=%x.%x.%x.%x if=%d\\n"',
+                        'int io3 = (int)copyinmap(task->map, (vm_map_offset_t)(msg - 16), back,',
+                        'int io4 = (int)copyinmap(task->map, (vm_map_offset_t)(msg + 32), fwd,'):
+                if not any(now in line for line in r364_added):
+                    errors.append(f"the r364 kernel patch does not add {now[:56]!r}: the header window "
+                                  "would stay unread")
+            if len(r364_removed) != 0:
+                errors.append(f"the r364 patch removes {len(r364_removed)} lines, not the 0 a pure "
+                              "addition accounts for")
+        for entry in ('{ "clover r364: remwin", "r364-remwin", 64, 0, 0, 0 },',):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: the window row needs "
+                              "its own budget")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r364")' not in sdhci_source:
+            errors.append("the r364 rows are not exempt from the per-pass cap: a window without the "
+                          "pointer it belongs to is the same half-pair r249 refuses")
+
         # Round362, host half. The maintainer's rule: a boot that resets comes back to TWRP without a
         # key press. Three properties carry it, and each one has failed in a measured way: an Android
         # adb is not a recovery landing (round195's reset came up in Android and the window read after
@@ -4626,6 +4675,8 @@ def check_board(errors: list) -> str:
                        'EDL_TOOL=${EDL_TOOL:-$HOME/clover-out/edl/edl.py}',
                        'EDL_LOADER=${EDL_LOADER:-$HOME/clover-out/edl/prog_firehose_ddr.elf}',
                        'EDL_RESET_TIMEOUT=${EDL_RESET_TIMEOUT:-60}',
+                       'CLOVER_SAHARA_RESET=1 "$EDL_PYTHON"',
+                       'EDL_PYTHON=/opt/homebrew/bin/python3.13',
                        '"$EDL_TOOL" --loader="$EDL_LOADER" reset',
                        'EDL: automatic reset is disabled',
                        'EDL: no firehose tool/loader at'):
@@ -8358,8 +8409,8 @@ def check_board(errors: list) -> str:
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
     # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
     # the menu names round347.
-    if not board["payload"]["title"].startswith("clover r362:"):
-        errors.append('[payload] title is not "clover r362: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r364:"):
+        errors.append('[payload] title is not "clover r364: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -10513,8 +10564,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r362:"):
-        errors.append('[payload] title is not "clover r362: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r364:"):
+        errors.append('[payload] title is not "clover r364: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

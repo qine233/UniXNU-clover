@@ -1423,6 +1423,10 @@ def check_sb_sample(kernel: bytes) -> bool:
                               b"kobj=%llx sr=%u so=%u q=%u rnm=%x rstate=%d rpid=%d c=%s\n") in kernel,
              "r362-remcall": (b"clover r362: remcall t=%llu pid=%d hop=%d i=%u nm=%x p=%llx io=%d "
                               b"id=%x b=%x sz=%x rem=%x loc=%x vou=%x m0=%x m1=%x\n") in kernel,
+             # Round364 reads the windows around that pointer: four words behind and four ahead, each
+             # with its own error, because boot 144's first eight words were not a mach header.
+             "r364-remwin": (b"clover r364: remwin t=%llu pid=%d hop=%d i=%u nm=%x p=%llx "
+                             b"b=%x.%x.%x.%x ib=%d f=%x.%x.%x.%x if=%d\n") in kernel,
              # Round354 keeps the four heavy helpers out of clover_bb_sample's frame. noinline is a
              # source attribute, but what boot 133 died on was the link: the helpers' frames accreted
              # into one 10912-byte frame and the beat thread's 16 KB stack overflowed. Each helper

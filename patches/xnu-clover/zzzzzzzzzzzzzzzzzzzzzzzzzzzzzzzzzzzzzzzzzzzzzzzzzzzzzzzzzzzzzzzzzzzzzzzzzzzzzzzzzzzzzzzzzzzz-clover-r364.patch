@@ -1,0 +1,44 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 4fa86fc..40800ee 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -15002,6 +15002,8 @@ clover_bb_rem_bits(task_t task, int pid, int hop, uint32_t i, mach_port_name_t r
+ 	}
+ 	if (msg != 0) {
+ 		uint32_t hdr[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++		uint32_t back[4] = { 0, 0, 0, 0 };
++		uint32_t fwd[4] = { 0, 0, 0, 0 };
+ 		int ioerr = (int)copyinmap(task->map, (vm_map_offset_t)msg, hdr, sizeof(hdr));
+ 
+ 		len = snprintf(row, sizeof(row),
+@@ -15014,6 +15016,30 @@ clover_bb_rem_bits(task_t task, int pid, int hop, uint32_t i, mach_port_name_t r
+ 			clover_emmc_probe_say(row, (unsigned int)strlen(row));
+ 			printf("%s", row);
+ 		}
++		/*
++		 * Round364. Boot 144's pointer read succeeded (io=0) but its first eight words were not a
++		 * mach header. The header is either behind or ahead of that address, so the two neighbouring
++		 * windows are read instead of guessed: four words at p-16 and four at p+32. Both reads hand
++		 * back their own error; a window that failed is a row with io=, not a silence.
++		 */
++		if (msg >= 16) {
++			int io3 = (int)copyinmap(task->map, (vm_map_offset_t)(msg - 16), back,
++			    sizeof(back));
++			int io4 = (int)copyinmap(task->map, (vm_map_offset_t)(msg + 32), fwd,
++			    sizeof(fwd));
++
++			len = snprintf(row, sizeof(row),
++			    "clover r364: remwin t=%llu pid=%d hop=%d i=%u nm=%x p=%llx"
++			    " b=%x.%x.%x.%x ib=%d f=%x.%x.%x.%x if=%d\n",
++			    (unsigned long long)secs, pid, hop, i, rem,
++			    (unsigned long long)msg, back[0], back[1], back[2], back[3], io3,
++			    fwd[0], fwd[1], fwd[2], fwd[3], io4);
++			if (len > 0) {
++				row[sizeof(row) - 1] = '\0';
++				clover_emmc_probe_say(row, (unsigned int)strlen(row));
++				printf("%s", row);
++			}
++		}
+ 	}
+ }
+ 

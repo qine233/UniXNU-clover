@@ -30230,3 +30230,35 @@ host BCB → TWRP，随后 `--skip-recovery` 读回）。
 **闸门与负测。** 闸门新增七枚宿主针脚（`edl_reset()`、两个默认路径、超时、`--loader=... reset`、
 禁用句、缺 loader 句），EXIT=0。负测：在 r362 的 15 支上补 `edl-helper`/`edl-default-tool`/
 `edl-no-loader-say`/`edl-timeout` 四支（`round363-negatives.log`）。
+
+
+## Round364 —— p 的两个邻窗：头到底在不在指针下面
+
+**题面。** boot 144 的 `remcall p=16ff8e490 io=0 id=1 b=0 sz=0 rem=6ff8f65c loc=1 vou=6ff8f610
+m0=9146c504 m1=1`：指针读成功，但八个字不是 mach 头。头要么在 p 前面、要么在 p 后面，要么这个指针
+根本不是消息缓冲。与其猜，读两个邻窗。
+
+**改动（`osfmk/kern/task.c`）。** `rem_bits` 在 `remcall` 之后新增 `clover r364: remwin`：`copyinmap`
+读 `p-16` 与 `p+32` 各四个字，两个读各有自己的 `ib=`/`if=`（失败也是行，不是沉默）；纯增、删 0。
+
+**预登记（boot 145，r364 镜像）。**
+- **W1-A**：任一窗出现 mach 头形状（`b=` 带 SEND 位、`sz>0`、体首字小到像 selector）⇒ 头找到了；
+  下一手按该窗偏移取 selector，并对照 `kobj` 的 user client 类。
+- **W1-B**：两窗都不是头，且 `ib/if=0`（读成功）⇒ 这个 `p` 不是发送缓冲；下一手转去读内核手里
+  那封已拷贝的 kmsg（或在 r221 侧对同一 tid 取 `r[0]`），不再在用户缓冲上找。
+- **W1-C**：`ib`/`if` 非零 ⇒ 邻页不可读（页边界），记录并不判。
+- 控制：`remwin` 行数 == `remcall` 行数（有 p 的 hop 各一枚）；`p-16` 窗的最后一字应与 `remcall`
+  的 `b/sz` 相接（同一次 copyinmap 的相邻区间）；闸门①照旧先判。
+
+**构建与落回（boot 145）。** 补丁 md5 `e27d78da1c238fe267e41c72a67c8d35`（三份同字节，增 20／删 0）；
+kernel md5 `4467ba3e` / sha256 `6dc4fa47…`；AMFI `d7bda6f3…`；normalize `7911da04…`；
+`round364-v0.7.85-payload.img` sha256 `343689a8…`（58,720,256 B）；两闸门 EXIT=0，13 支负测全绿
+（`round364-negatives.log`）。
+这一靴又没回来：**Sahara memory-debug**（PID **0x900E**）——比 EDL 还低一档，`edl.py` 对它默认
+是把整片 RAM dump 出来（本机当场写了 2.1 GB 的 `DDRCS*.BIN`，已删），而 `reset --resetmode=reset`
+在 dump 模式下不被受理；手动跑的那次还把 Sahara 弄进 `USBError(32)`／"Device is in Sahara error state,
+please reboot the device"。**一次电源循环仍是唯一出口**；`remwin` 的读数待（卡上 boot 145 的窗口还在）。
+工具侧当场修了两处：`EDL_PYTHON`（默认 `/opt/homebrew/bin/python3.13`；系统 3.9 没有 docopt，第一次
+EDL 尝试就死在这），以及本地 `edl.py` 的 `CLOVER_SAHARA_RESET=1` 支路（在 memory-debug 模式下改发
+`SAHARA_RESET_REQ` 而不是 dump）；runner 已改用这两处，闸门也钉住。**是否能在 0x900E 下真正复位，
+下一次 EDL 落回才是它的第一次考试**；若 SAHARA_RESET_REQ 被拒，这条就写进 limits（电源循环仍是必需的）。

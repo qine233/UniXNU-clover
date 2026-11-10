@@ -1308,6 +1308,9 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // Round362 re-tokens the call row and adds the data pointer, so the r361 class above is a dead
   // matcher kept for the record: the pointer is what makes the header read verifiable.
   { "clover r362: remcall", "r362-remcall", 64, 0, 0, 0 },
+  // Round364 reads the windows around the trap's data pointer; the row is its own generation because
+  // the address is what it is about.
+  { "clover r364: remwin", "r364-remwin", 64, 0, 0, 0 },
 
   // Round349 follows each named holder into its own task in the same fire: `holdth` is the
   // per-task summary (threads, waiters, runners, trapped) and `holdt` at most two trapped threads
@@ -5042,6 +5045,7 @@ static void teeConsumeLine (uint32_t &pushed)
        // the reverse, is the half-pair r249 refuses.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r361") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r362") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r364") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is
