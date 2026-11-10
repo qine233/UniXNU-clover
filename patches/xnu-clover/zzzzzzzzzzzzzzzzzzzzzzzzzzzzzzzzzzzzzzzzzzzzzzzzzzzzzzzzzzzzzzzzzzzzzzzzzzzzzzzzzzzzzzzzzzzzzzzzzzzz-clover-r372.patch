@@ -1,0 +1,20 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index dca3667..75c2aaa 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -11328,7 +11328,14 @@ clover_bb_beat_thread(void *param, wait_result_t wres)
+ 			 */
+ 			clover_r308_beat_row(secs);
+ 		}
+-		if (clover_bb_target_pid != 0) {
++		/*
++		 * Round372. The run of boots that died at about 170 s all died right after the first sample
++		 * at t~180, and the r360 control without the default latch ran to 750 s, so the sample is
++		 * the remaining suspect. This gate holds the fire until t=600 s: a boot that still stops
++		 * near 170 s with the gate in place says the sample is not the cause, and a boot that runs
++		 * to 600 s and dies at the first sample says it is.
++		 */
++		if (clover_bb_target_pid != 0 && secs >= 600) {
+ 			clover_bb_sample(clover_bb_target_pid, sb,
+ 			    clover_bb_target_name, secs);
+ 			/*
