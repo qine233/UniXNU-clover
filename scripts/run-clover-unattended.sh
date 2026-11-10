@@ -384,8 +384,23 @@ edl_reset() {
     say "EDL: no firehose tool/loader at $EDL_TOOL and $EDL_LOADER, so this landing still needs a power cycle"
     return 1
   fi
-  say "EDL: issuing a firehose reset with $(basename "$EDL_LOADER") (declared: reset only, no partition write)"
+  say "EDL: clearing the Sahara error state with a USB port reset, then resetting the SoC (declared: reset only, no partition write)"
   : > "$OUT.edl-reset.log"
+  # Round366. A dump-mode landing that was interrupted sits in a Sahara error state that refuses
+  # even SAHARA_RESET_REQ; a USB port reset on the Qualcomm node clears that state (measured on
+  # 2026-11-10: after it, SAHARA_RESET_REQ was accepted and the board came up in TWRP, no hand
+  # involved). This is a reset of the USB device, not of the board, and it writes nothing.
+  "$EDL_PYTHON" - >> "$OUT.edl-reset.log" 2>&1 <<'PYRESET'
+import usb.core
+for d in usb.core.find(find_all=True):
+    if d.idVendor == 0x05c6:
+        try:
+            d.reset()
+            print("usb reset sent")
+        except Exception as exc:
+            print("usb reset failed:", exc)
+PYRESET
+  sleep 2
   # Round364: a board that reset with a dump request enumerates as Sahara memory-debug (PID 0x900E)
   # and the stock tool answers that by dumping gigabytes of RAM. The local copy honours this env and
   # sends SAHARA_RESET_REQ instead, which is the only host command that leaves that mode.

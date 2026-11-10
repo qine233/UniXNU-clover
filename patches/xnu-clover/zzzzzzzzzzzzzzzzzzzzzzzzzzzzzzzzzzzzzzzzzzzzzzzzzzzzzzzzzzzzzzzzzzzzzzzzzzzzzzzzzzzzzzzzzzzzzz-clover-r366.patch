@@ -1,0 +1,35 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 18253e6..075d8f0 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -15022,6 +15022,30 @@ clover_bb_rem_bits(task_t task, int pid, int hop, uint32_t i, mach_port_name_t r
+ 		 * windows are read instead of guessed: four words at p-16 and four at p+32. Both reads hand
+ 		 * back their own error; a window that failed is a row with io=, not a silence.
+ 		 */
++		/*
++		 * Round366. Boot 145 finally read a real header at p: bits 0x1513 (remote COPY_SEND, local
++		 * MAKE_SEND_ONCE), size 0x55c, remote 0x6f0f (the IOKit connect port), local 0x6b07 (the
++		 * reply port), id 0xb31, and the body begins 0, 1. A 1372-byte request to a user client with
++		 * a reply port is a synchronous IOKit call, and what it asks for is in the body: eight words
++		 * from p+24 are printed here so the selector and the in-band structure stop being guesses.
++		 */
++		if (ioerr == 0 && (hdr[0] & 0x1) != 0) {
++			uint32_t body[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++			int iob = (int)copyinmap(task->map, (vm_map_offset_t)(msg + 24), body,
++			    sizeof(body));
++
++			len = snprintf(row, sizeof(row),
++			    "clover r366: rembody t=%llu pid=%d hop=%d i=%u nm=%x p=%llx io=%d"
++			    " w=%x.%x.%x.%x.%x.%x.%x.%x\n",
++			    (unsigned long long)secs, pid, hop, i, rem,
++			    (unsigned long long)msg, iob, body[0], body[1], body[2], body[3],
++			    body[4], body[5], body[6], body[7]);
++			if (len > 0) {
++				row[sizeof(row) - 1] = '\0';
++				clover_emmc_probe_say(row, (unsigned int)strlen(row));
++				printf("%s", row);
++			}
++		}
+ 		if (msg >= 16) {
+ 			int io3 = (int)copyinmap(task->map, (vm_map_offset_t)(msg - 16), back,
+ 			    sizeof(back));

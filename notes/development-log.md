@@ -30283,3 +30283,34 @@ EDL 尝试就死在这），以及本地 `edl.py` 的 `CLOVER_SAHARA_RESET=1` �
 - **X-C**：`op` 为 0（x1 空）⇒ 该 trap 的 unpacking 与 r264 不符，先记仪器问题，不判。
 - 控制：`remtrap` 行数 == 本火 hop 数；`x4`/`x6`/`x7` 与 r221 同线程的 `h=` 后三字（voucher/id、
   desc/rcv、rcv_size）应能对上；闸门①照旧先判。
+
+
+## Round364/365 读数（boot 145/146）——头找到了，而且第一次读懂了请求
+
+**boot 145（r364 镜像，`343689a8…`）。** 电源循环后板子回 fastboot，宿主 BCB 送进 TWRP 读回。
+- **W1-A 成立**：`remcall pid=58 hop=2 i=2 nm=6f0f p=16f7a6490 io=0 id=b31 b=1513 sz=55c rem=6f0f
+  loc=6b07 vou=0 m0=0 m1=1` —— 这是一枚**合法的 mach 头**：`bits=0x1513`（remote=COPY_SEND、
+  local=MAKE_SEND_ONCE）、`size=0x55c`（1372 B）、remote `0x6f0f`、local `0x6b07`（回复口）、
+  `id=0xb31`，体首两字 `0,1`。`remwin` 的 `b=0.0.6f7a764c.6f0f`／`f=5.0.508.9e4603c7` 两窗都读成功
+  （`ib=if=0`），头就在 `p` 上。
+- 同一火 `remkobj nm=6f0f kotype=29 kobj=fffffff6f4f55ac0 sr=2 so=0 q=0 rnm=1 rstate=1 c=kspace`：
+  **backboardd 正在向一个 IOKit 连接口发一封 1372 字节的同步请求，回复口是它自己的 6b07**。
+  boot 144 那八个字之所以不是头，是因为那一拍的线程不在 send 上（同一 hop 的形态每靴在变）。
+- 结论：**W1-B/W1-C 都不成立**；W1-A 成立，下一问是「这封 1372 字节的请求要什么方法」。
+
+**boot 146（r365 镜像，`d079c76a…`）。** 这一靴的 `hn=2`，两个 hop **都是端口集合**（4403、6303），
+`asked=0` —— 没有 send destination，`remtrap`/`remcall`/`remwin` 都没行可印。**X-A/X-B/X-C 因此
+不判**（前提缺席，与 r358/r359 的「形态每靴变」同型）。这不是仪器坏了：`bbth` 3 行、`onceh` 3 枚、
+`bbsend` 4 行（cand=2）都在。
+
+**r366 的动机。** boot 145 的请求体首字 `m0=0`、`m1=1`（selector=0？还是体里的第一个 64 位量？）。
+`io_connect_method` 的 MIG 体按参数顺序排（`is_io_connect_method(connection, selector, …)`，
+`iokit/Kernel/IOUserClient.cpp:5403`），selector 应在体首 4 字节；但 1372 B 的体说明还有 in-band 结构。
+r366 读 `p+24` 起 8 个字（`rembody`），并在 `hdr[0] & MACH_SEND_MSG` 时才印——只在真的发送时问。
+
+**落回规则的收口（本轮最重要的工程收获）。** Sahara memory-debug（0x900E）的板子此前只能人工电源循环。
+本轮实测出一条纯宿主路径：**libusb 端口复位**（`idVendor==0x05c6` 的 `d.reset()`）先清掉
+`USBError(32)` 的 Sahara error state，随后本地 `edl.py` 的 `CLOVER_SAHARA_RESET=1` 支路发
+`SAHARA_RESET_REQ`，**被接受**（`SAHARA reset accepted`），板子自己复位并由预置 BCB 落进 TWRP——
+全程没有按键。这条已接进 runner 的 `edl_reset()`：USB 复位 → 2 s → `SAHARA_RESET_REQ`，仍然只
+reset、不写任何分区，闸门钉住两句。

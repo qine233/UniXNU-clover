@@ -301,7 +301,11 @@ loader = "firmware"
 # Round365's case: the buffer read is inconclusive, so the trap is identified from its own registers
 # instead -- x1 option64, x4 voucher|id, x6 rcv_size|priority -- and a receive-only trap stops looking
 # like a send whose buffer failed to parse.
-title = "clover r365: the words at boot 144's data pointer are not a mach header, so this round stops reading memory to settle what the trap is and prints its own registers instead: x1 (option64, where MACH_SEND_MSG and MACH_RCV_MSG live), x4 (voucher|id) and x6 (rcv_size|priority) ride a clover r365: remtrap row beside the hop. A \"receive-only\" trap and a \"send\" trap with an unfilled buffer are different readings, and x1 is what tells them apart without guessing at the buffer. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
+#
+# Round366's case: boot 145 read a valid header at p, so the trap is a real 1372-byte IOKit
+# request with a reply port; the method it asks for lives in the body, and eight body words are
+# printed so the selector stops being a guess.
+title = "clover r366: boot 145 finally read a real header at the trap's pointer -- bits 0x1513 (remote COPY_SEND, local MAKE_SEND_ONCE), size 0x55c, remote 0x6f0f (the IOKit connect port), local 0x6b07 (the \"reply port\"), id 0xb31 -- so backboardd is making a 1372-byte synchronous IOKit request with a reply port. This round reads the body: eight words from p+24 under clover r366: rembody, so the selector and the in-band structure stop being guesses. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

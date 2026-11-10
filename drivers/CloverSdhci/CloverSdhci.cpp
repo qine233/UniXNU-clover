@@ -1314,6 +1314,8 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // Round365 prints the trap's option/voucher/rcv-size words themselves; the row is its own
   // generation because it answers what the buffer could not.
   { "clover r365: remtrap", "r365-remtrap", 64, 0, 0, 0 },
+  // Round366 prints the body of the request the header describes; the selector is its first word.
+  { "clover r366: rembody", "r366-rembody", 64, 0, 0, 0 },
 
   // Round349 follows each named holder into its own task in the same fire: `holdth` is the
   // per-task summary (threads, waiters, runners, trapped) and `holdt` at most two trapped threads
@@ -5050,6 +5052,7 @@ static void teeConsumeLine (uint32_t &pushed)
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r362") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r364") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r365") ||
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r366") ||
        // Round329's state row rides no burst at all: it fires on the display's own 30 s work-loop beat, so
        // it lands beside whatever else happens to share that pass. This is r281's and r319's case exactly --
        // for a row whose whole job is to say "the client is quiet now", a pass cap that ate the row is
