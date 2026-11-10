@@ -30481,3 +30481,28 @@ boot 154（r360，无默认闩锁）活到 750 s。r371 修了任务错配，死
   **backboardd 自己的一枚线程在向它自己的 IOMobileFramebuffer user client 口发送并阻塞**。
 - 下一步：①把 IOMachPort 的映射跟到真正的 client 对象（它的哈希链里存着 OSObject），②修采样路径
   （对 backboardd 的线程走表会在 ~18 s 后致死，需要逐段二分），③解 1372 字节请求的 selector。
+
+
+**同一靴的 selector 表（r180 行，pid=58 自己的 client）——1372 字节请求的身份对上了。**
+
+boot 156 的窗口里 backboardd 对 IOMobileFramebufferUserClient 的调用：
+
+```
+first selector=5  args=1288/0 scalar=0/0 status=00000000   ← in-band 1288 字节，成功
+first selector=6  args=0/0    scalar=3/0 status=00000000    ← swap
+hot=6:23/11/e00002d5 s6=b 80000000 0 -> e00002d5            ← 有时成功、有时 e00002d5
+first selector=3  args=0/0    scalar=2/1 status=e00002bc
+first selector=27 args=0/3084 scalar=0/0 status=e00002c7
+first selector=12/50/55/68/84 … status=e00002c7
+```
+
+`1288 = 0x508`，与 `rembody` 的 `w4=0x508` **完全相等**；1372 = 24（头）+ 4（selector）+ 56（其它字段）
++ 1288（in-band）。⇒ **那封 1372 字节的请求是 selector 5、in-band 1288 字节的调用**，`remtraps` 的
+`op=200000003`（send+receive）就是它在等回信。
+
+所以「缺方法」这一假设需要修正：selector 5 在本靴**返回 0（成功）**；阻塞是 send+receive 在等回信
+那一瞬被采样到的形态。真正异常的是 **selector 6 间歇性 `e00002d5`** 与一批 selector 的 `e00002c7`
+（unsupported），以及采样之后 ~18 s 的复位（采样路径致死）。
+下一支：把 selector 5 的 in-band 首 32 字节和 selector 6 的 `pw/ps` 状态一起打出来，确认 selector 6
+的 `e00002d5` 是否就是 backboardd 反复重试的那一个；采样致死则按 proc_find → 锁 → 线程走表 →
+copyinmap 逐段门控。
