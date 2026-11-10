@@ -1419,8 +1419,9 @@ def check_sb_sample(kernel: bytes) -> bool:
              # Round361 names the kernel object behind that port (kotype 29/30 is the IOKit family) and
              # the call it waits for: the trapped message's header plus its first two body words, where
              # an io_connect_method selector lives.
-             "r361-remkobj": (b"clover r361: remkobj t=%llu pid=%d hop=%d i=%u nm=%x kotype=%u "
-                              b"kobj=%llx sr=%u so=%u q=%u rnm=%x rstate=%d rpid=%d c=%s\n") in kernel,
+             "r370-remkobj": (b"clover r370: remkobj t=%llu pid=%d hop=%d i=%u nm=%x kotype=%u "
+                              b"kobj=%llx vp=%llx sr=%u so=%u q=%u rnm=%x rstate=%d rpid=%d c=%s\n")
+                             in kernel,
              "r362-remcall": (b"clover r362: remcall t=%llu pid=%d hop=%d i=%u nm=%x p=%llx io=%d "
                               b"id=%x b=%x sz=%x rem=%x loc=%x vou=%x m0=%x m1=%x\n") in kernel,
              # Round364 reads the windows around that pointer: four words behind and four ahead, each

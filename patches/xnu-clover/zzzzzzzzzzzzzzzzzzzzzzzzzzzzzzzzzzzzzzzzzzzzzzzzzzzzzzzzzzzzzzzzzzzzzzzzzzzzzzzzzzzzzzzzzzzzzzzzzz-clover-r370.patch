@@ -1,0 +1,43 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 4fa5da9..aed7291 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -14923,6 +14923,7 @@ clover_bb_rem_bits(task_t task, int pid, int hop, uint32_t i, mach_port_name_t r
+ 	uint32_t rnm = 0;
+ 	uint32_t kotype = 0;
+ 	uint64_t kobj = 0;
++	uint64_t vptr = 0;
+ 	int rstate = -1;
+ 	int rpid = -3;
+ 	int ent = -1;
+@@ -14963,6 +14964,15 @@ clover_bb_rem_bits(task_t task, int pid, int hop, uint32_t i, mach_port_name_t r
+ 			q = port->ip_messages.imq_msgcount;
+ 			kotype = (uint32_t)ip_kotype(port);
+ 			kobj = (uint64_t)(uintptr_t)port->ip_kobject;
++			/*
++			 * Round370. The port's kobject is an IOKit object for kotype 29/30, and an OSObject's
++			 * vptr is its first word. Reading it under the port lock names the class on the host by
++			 * address: the legacy display's vtable is a symbol in this kernel, so vp= turns "some
++			 * user client" into "which one" without calling into the object.
++			 */
++			if (kotype == 29 || kotype == 30) {
++				vptr = *(const uint64_t *)(uintptr_t)kobj;
++			}
+ 			recv = ip_get_receiver(port);
+ 			rnm = (uint32_t)ip_get_receiver_name(port);
+ 			if (recv != IPC_SPACE_NULL && recv->is_task != TASK_NULL) {
+@@ -15015,10 +15025,11 @@ clover_bb_rem_bits(task_t task, int pid, int hop, uint32_t i, mach_port_name_t r
+ 	}
+ 	if (ent == 1 && obj != IPC_OBJECT_NULL) {
+ 		len = snprintf(row, sizeof(row),
+-		    "clover r361: remkobj t=%llu pid=%d hop=%d i=%u nm=%x kotype=%u kobj=%llx"
+-		    " sr=%u so=%u q=%u rnm=%x rstate=%d rpid=%d c=%s\n",
++		    "clover r370: remkobj t=%llu pid=%d hop=%d i=%u nm=%x kotype=%u kobj=%llx"
++		    " vp=%llx sr=%u so=%u q=%u rnm=%x rstate=%d rpid=%d c=%s\n",
+ 		    (unsigned long long)secs, pid, hop, i, rem, kotype,
+-		    (unsigned long long)kobj, sr, so, q, rnm, rstate, rpid, rc);
++		    (unsigned long long)kobj, (unsigned long long)vptr, sr, so, q, rnm,
++		    rstate, rpid, rc);
+ 		if (len > 0) {
+ 			row[sizeof(row) - 1] = '\0';
+ 			clover_emmc_probe_say(row, (unsigned int)strlen(row));

@@ -30395,3 +30395,30 @@ r368 的「局部 target + 每 20 s 重解析」改动与早期死亡相关，�
 - **W2-C**：target 仍只出现一次 ⇒ generation-change 还有第二处清零，或默认闩锁被别的路径覆盖。
 - 控制：boot 151 的存活时间先与 boot 148（1200+ s）/149/150（~170 s）比；`r308 target=58` 与
   `r229 pid=58` 同靴一致。
+
+
+## Round370 —— 用 kobject 的 vptr 点名 user client；但最近每靴都死在 ≈167 s
+
+**改动（`osfmk/kern/task.c`）。** `remkobj` 加 `vp=`：kotype 29/30 时在端口锁内读 kobject 的第一个字
+（OSObject 的 vptr），宿主可用 `decode-clover-address.py` 把它映回类名（`__ZTV19NativeLegacyDisplay`
+这类 vtable 在核里是符号），从而把「某个 user client」变成「哪个类」——不再需要调用对象本身。
+行字面量重打 r370 标，删 3 行。
+
+**读数（boot 153，r370 镜像 `8b676909…`）：没有 remkobj 行。** 这一靴同样在 **≈167 s** 停
+（`flight` 最新 `t=167641 ms`），第一枚 beat 在 `t=179 target=58`、`r229 t=179`，之后无行；落回是
+silent reset → fastboot（宿主 BCB 才进 TWRP），不是 panic；电池 99%、温度 31.8 °C，排除供电/热。
+
+**这一串早死的证据（同一晚、不同镜像）：**
+
+| boot | 镜像 | 最新 flight 记录 |
+| --- | --- | --- |
+| 148 | r367 | 1805073 ms（≈1805 s） |
+| 149 | r368 | 167088 ms |
+| 150 | r368 | 170952 ms |
+| 151 | r369 | 171700 ms |
+| 152 | r367（对照） | 173023 ms |
+| 153 | r370 | 167641 ms |
+
+r368/r369/r370 全死、连 r367 的对照靴也死 ⇒ **不是某一轮代码**。下一步是对照：刷 r360 的旧镜像
+（`3bd7fc70…`）或把采样器关掉，看它是否也停在 ≈170 s——若是，则是环境/存储/电源一侧；若否，
+嫌疑落在 `clover_bb_sample` 首次调用后的某条路径（含它的 16 KB 栈与 `clover_sb_task` 引用）。

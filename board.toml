@@ -315,7 +315,10 @@ loader = "firmware"
 #
 # Round369's case: boots 149 and 150 both died at ~170 s with the r368 image, so the local target is
 # reverted and the target is kept across generation changes instead.
-title = "clover r369: boots 149 and 150 (both r368 images) died at about 170 s, twice in a row, so r368's local fire target is reverted: the beat fires the global target again and the \"fix\" moves to the line that actually lost it -- the generation-change path no longer clears clover_bb_target_pid. The pid is still re-checked through proc_find in the default latch, so a dead target is skipped instead of used. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
+#
+# Round370's case: boot 145 shows backboardd opened an IOMobileFramebufferUserClient and blocked in a
+# call our wrapper never saw, so the kobject's vptr is printed and mapped to a class on the host.
+title = "clover r370: boot 145 showed backboardd opened an IOMobileFramebufferUserClient (client#3 pid=58, status=0) and then blocked in a 1372-byte call whose selector our wrapper never saw, so the next question is which class the port's kobject is. For kotype 29/30 this round reads the object's vptr under the port lock and prints vp= beside \"kobj\"; the legacy display's vtable is a symbol in this kernel, so the host maps the address to a class without calling into the object. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
