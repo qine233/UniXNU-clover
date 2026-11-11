@@ -32,6 +32,8 @@ extern "C" void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64
 extern "C" void native_legacy_frame_colors_observed(const uint32_t *colors,const uint64_t *counts,uint64_t other);
 extern "C" void native_legacy_swap_validation_observed(bool,unsigned,const void *,const void *);
 extern "C" void native_legacy_frame_presented(unsigned kind);
+extern "C" volatile uint32_t native_legacy_screen_nonblack=0,native_legacy_screen_sampled=0;
+extern "C" volatile uint64_t native_legacy_screen_hash=0;
 // The surface of a rejected swap, as the validator read it: width, height, format, planes, stride, allocation, descriptor length.
 extern "C" void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t,uint32_t,uint64_t,uint64_t,uint64_t);
 extern "C" bool native_legacy_prepare_scanout(void);
@@ -150,7 +152,21 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // on a flag the reading is about is the r327 shape again -- and it runs on this object's work loop, so the row
     // is stamped by the display's clock, not by another subsystem's.
     IOTimerEventSource *stateTimer=nullptr;
+    void sampleScreen() {
+        if(!bootMapping)return;
+        volatile uint32_t *fb=reinterpret_cast<volatile uint32_t *>(bootMapping->getVirtualAddress());
+        uint64_t bytes=bootMapping->getLength();
+        if(!fb||bytes<4096)return;
+        uint64_t n=bytes/4;
+        uint64_t step=n/4096;if(!step)step=1;
+        uint32_t nonblack=0,sampled=0;uint64_t hash=0;
+        for(uint64_t i=0;i<n;i+=step){uint32_t px=fb[i];if(px)nonblack++;hash=hash*1315423911ull+px;sampled++;}
+        native_legacy_screen_nonblack=nonblack;
+        native_legacy_screen_sampled=sampled;
+        native_legacy_screen_hash=hash;
+    }
     static void stateBeatFired(OSObject *owner,IOTimerEventSource *) {
+        static_cast<NativeLegacyDisplay *>(owner)->sampleScreen();
         native_legacy_display_state_beat();
         static_cast<NativeLegacyDisplay *>(owner)->armStateBeat();
     }

@@ -68,6 +68,11 @@ static volatile uint32_t cloverLogLines;
 // event happened after line 96" -- and the r329 row is read beside both. Counted here, at the one
 // place that knows it dropped something, and published as `logdrop=` on the periodic row.
 static volatile uint32_t cloverLogDropped;
+/* Screen statistics sampled by the driver's state beat: non-black samples, samples, and a hash. */
+extern "C" volatile uint32_t native_legacy_screen_nonblack,native_legacy_screen_sampled;
+extern "C" volatile uint64_t native_legacy_screen_hash;
+/* Selector 6 entries minus returns: a positive value is a swap still inside the call. */
+static volatile uint32_t sel6Enter,sel6Exit;
 enum {kCloverLogBudget=96};
 static void cloverLog(const char *format,...) __attribute__((format(printf,1,2)));
 static void cloverLog(const char *format,...) {
@@ -559,7 +564,9 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
     SwapWaitPre pre;
     bool waitCall=stat && selector==6 && arguments && arguments->scalarInput && arguments->scalarInputCount>=3;
     if(waitCall)readSwapWaitState(*stat,arguments->scalarInput,pre);
+    if(selector==6)sel6Enter=sel6Enter+1;
     IOReturn status=stat?reinterpret_cast<ExternalFn>(stat->original_external)(client,selector,arguments,dispatch,target,reference):kIOReturnNotAttached;
+    if(selector==6)sel6Exit=sel6Exit+1;
     if(stat) {
         if(selector==6 && arguments && arguments->scalarInput && arguments->scalarInputCount>=3) {
             const uint64_t *in=arguments->scalarInput;
@@ -844,10 +851,11 @@ static void reportDisplayState(void) {
     const uint64_t now=probeNowUs();
     int length=snprintf(row,sizeof row,
         "clover r344: dispstate ms=%llu fires=%u seen=%u client=%s pick=%s grewn=%s p58=%s calls=%s fails=%s "
-        "last=%s "
+        "last=%s s6if=%u scr=%u/%u/%llx "
         "regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\n",
         (unsigned long long)(now/1000),dispstateFires,seenClientCount,client,pick,grewnTxt,p58Txt,
-        callsTxt,failsTxt,lastTxt,regallTxt,regsTxt,grewTxt,hotTxt,s6Txt,latchTxt,copyTxt,fcTxt,
+        callsTxt,failsTxt,lastTxt,(unsigned)(sel6Enter-sel6Exit),(unsigned)native_legacy_screen_nonblack,
+        (unsigned)native_legacy_screen_sampled,(unsigned long long)native_legacy_screen_hash,regallTxt,regsTxt,grewTxt,hotTxt,s6Txt,latchTxt,copyTxt,fcTxt,
         vsyncHz,(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[1],
         (unsigned)cloverLogLines,(unsigned)kCloverLogBudget,(unsigned)cloverLogDropped);
     if(length<0 || static_cast<unsigned>(length)>=sizeof row) {

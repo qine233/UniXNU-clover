@@ -30636,3 +30636,21 @@ dispstate ms=1791590 … last=0@125s:305x811..970x1108 … latch=243 copy=243 fc
 **修正。** 之前「面板 125 s 冻结」是 `scanBudget`（只扫前 32 帧）的假象；r381 的无预算时间戳证明
 **画面在 ≈459 s 前一直在更新**（比 32 帧多得多），停的是**客户端**。下一支：查 459 s 前后
 backboardd/SpringBoard 为什么不再提交 swap（r238 的锁等待、lsd 队列、或某次调用失败后的退避）。
+
+
+## Round382/383 —— `s6if=0`（没有卡在调用里的 swap）＋ 屏幕采样器：画面被内核控制台文字占据
+
+- r382：`wrappedExternal` 记 selector 6 的「进−出」，`dispstate` 加 `s6if=`。boot 166：
+  `s6if=0` 全靴（没有 swap 卡在调用里）、`last=0@879s`、调用数冻在 1467 ⇒ 客户端**自己停了**；
+- r383：驱动状态拍里对 GOP 帧缓冲按步长采样（4096 点），发布 `native_legacy_screen_nonblack/sampled/hash`，
+  `dispstate` 加 `scr=<非黑>/<采样>/<hash>`。boot 167：
+  ```
+  scr=1679/4100/5ae1c335bfc08e27（41% 非黑）
+  scr=1458/4100/cedf687dbf5324fe
+  scr=1432/4100/635989a7b84f870c
+  ```
+  - **41% 非黑**且 **hash 每拍都变** ⇒ 帧缓冲一直在被改写；
+  - 但 `last=0@345s`、调用数冻在 363 ⇒ **不是合成器的帧**，而是**内核控制台文字**（`-v` 启动日志）
+    在往 GOP 帧缓冲上写；
+- 判读：屏幕上是「引导日志/进度」而不是桌面；合成器停摆的链条仍是 SpringBoard→lsd（ql=6 未排空）
+  与 backboardd 的锁等待。
