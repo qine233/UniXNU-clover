@@ -661,3 +661,8 @@ r410 只加了一次写：`VREF_TEST_CFG` 的 BIT8|BIT12。这一靴**又挂死*
 这给出更窄的下一步：先确认这两颗预编译驱动是否被 `clover.fdf`/`clover.dsc` 包含并运行；若在跑，
 UEFI 侧可以用 PMIC 路径核对 S3/S5 的状态；GPU 的 `vdd_gfx` 仍走 CPR4（MMIO `0x05061000`），
 而 CPR4 的角编程才是那块真正的开关。
+
+
+**fdf 检查（同日）**：`clover.fdf:91` 用 `!include QcomPkg/Extra.fdf.inc` 引入 Qualcomm 的驱动清单，
+`SPMIDxe`/`PmicDxe` 属于 `Binaries/clover/QcomPkg/Drivers/` 那一套预编译。所以固件侧下一步是：
+在 `Extra.fdf.inc`（或该 include 展开后的清单）里确认这两个驱动的包含与顺序，再谈 CPR4。
