@@ -262,6 +262,9 @@ static void waitMs (uint32_t ms)
 //   [12] sub-transfers run, [13] sub-transfers that timed out, [14] NACK count,
 //   [15] the last verdict code (see the note at each site).
 volatile uint64_t clover_input_observation[16];
+/* The HID device's touch frame: published the way its own synthetic frame does (seqlock). */
+extern "C" volatile uint32_t native_touch_seq, native_touch_count;
+extern "C" volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
 
 // Round319: the last sub-transfer's raw words, latched so package/CloverHidInputProbe.cpp can re-say
 // the r318 detail on its 120 s beat after the one-time rows are overwritten by the tee's ring (the
@@ -846,6 +849,44 @@ static void goodixReset (uint8_t address)
 // (GTP_ADDR_LENGTH 2, and gt9xx.c:1225 builds {REG >> 8, REG & 0xff}); EDT/FocalTech uses one.
 // The first transaction asked of each is the smallest real read its own driver does, so a NACK
 // here means the address is empty, not that a made-up probe failed.
+/*
+ * Round400. The touch report: read the point buffer at kGtRegCoords, decode it with the same function
+ * the host model runs, and publish it as the HID device's frame. Two records per read is a first
+ * report; the vendor reads more only when its own count says so.
+ */
+static void touchReport (uint8_t address)
+{
+  const uint8_t reg[2] = { static_cast<uint8_t> (kGtRegCoords >> 8),
+                           static_cast<uint8_t> (kGtRegCoords & 0xff) };
+  uint8_t data[1 + 2 * kGtPointBytes] = { 0 };
+  struct InputTouchReport report;
+  uint32_t i;
+
+  if (!chipRead (address, reg, 2, data, sizeof (data), "touch report")) {
+    return;
+  }
+  input_goodix_report (data, sizeof (data), kGtMaxTouch, &report);
+  native_touch_seq = native_touch_seq + 1;
+  __asm__ volatile ("dmb ish" ::: "memory");
+  native_touch_count = report.count;
+  for (i = 0; i < report.count && i < 12; i++) {
+    native_touch_xs[i] = report.point[i].x;
+    native_touch_ys[i] = report.point[i].y;
+    native_touch_ids[i] = report.point[i].id;
+  }
+  __asm__ volatile ("dmb ish" ::: "memory");
+  native_touch_seq = native_touch_seq + 1;
+  IOLog ("clover r400: touch valid=%u points=%u id0=%u x0=%u y0=%u id1=%u x1=%u y1=%u seq=%u\n",
+         (unsigned) report.valid, (unsigned) report.count,
+         report.count ? (unsigned) report.point[0].id : 0u,
+         report.count ? (unsigned) report.point[0].x : 0u,
+         report.count ? (unsigned) report.point[0].y : 0u,
+         report.count > 1 ? (unsigned) report.point[1].id : 0u,
+         report.count > 1 ? (unsigned) report.point[1].x : 0u,
+         report.count > 1 ? (unsigned) report.point[1].y : 0u,
+         (unsigned) native_touch_seq);
+}
+
 static void probeCandidate (uint8_t address, const char *name, bool isGoodix)
 {
   uint8_t reg[2];
@@ -1034,6 +1075,9 @@ extern "C" void clover_input_run (void)
   clover_input_observation[12] = gXfersRun;
   clover_input_observation[13] = gXfersTimeout;
   clover_input_observation[14] = gXfersNack;
+  if (mode == 4 && clover_input_observation[9]) {
+    touchReport (static_cast<uint8_t> (kGtAddr));
+  }
   // The tee in CloverSdhci picks these lines out of msgbuf on the next block operation, so this
   // call is a courtesy, not the commit. Boot continues either way.
   clover_emmc_flush_cache ();

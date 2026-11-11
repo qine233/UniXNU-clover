@@ -2542,7 +2542,7 @@ kernel_args = [
   # (package/TouchProbe.cpp:29, package/BootLog.c:340-356): drivers hold state, one writer re-says it,
   # and no reading depends on having spoken late. Nothing is re-run -- one bus transaction set per boot,
   # many readings of it.
-  "clover-input=3",
+  "clover-input=4",
   # Round286 takes the GPU line from reading to power-on, beside the desktop as the user asked.
   # "Write an Adreno driver" is still not the next step; this round powers and clocks the core and
   # then identifies it, and stops there. The sequence mirrors the vendor's: vote gcc_gpu_cfg_ahb
