@@ -763,8 +763,8 @@ def check_board(errors: list) -> str:
         # instrument nobody scheduled, and one that leaves because a later round rewrote the list is
         # the I2C question silently unasked again; mode 3 is the only mode that actually asks the
         # panel something, so that is the string this round owns.
-        if "clover-input=4" not in board["payload"]["kernel_args"]:
-            errors.append("kernel_args no longer carries clover-input=4: round259 resumed drivers/"
+        if "clover-input=3" not in board["payload"]["kernel_args"]:
+            errors.append("kernel_args no longer carries clover-input=3: round259 resumed drivers/"
                           "CloverInput in the same flight as the synthetic digitizer frame, because "
                           "real fingers and synthetic fingers are two halves of one question -- and a "
                           "NACK is a valid answer there (round183's), so the instrument is not a risk "

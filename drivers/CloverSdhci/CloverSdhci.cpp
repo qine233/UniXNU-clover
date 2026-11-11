@@ -1150,6 +1150,11 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // GPUCC window answered at 0x1000-range offsets and not at 0x9000 -- which is a fact about the
   // window, and would be invisible if the row shared a budget with the one that proves it.
   { "clover r291: ", "r291-gpu", 32, 0, 0, 0 },
+  // Round403: the LDO sequence's own rows need classes of their own or the tee drops them -- the r291
+  // beat row is what made "the sequence never ran" and "the tee ate the row" look identical.
+  { "clover r389: ", "r389-gpu", 64, 0, 0, 0 },
+  { "clover r403: ", "r403-gpu", 64, 0, 0, 0 },
+  { "clover r405: ", "r405-gpu", 64, 0, 0, 0 },
   // Round294 widens the rail reading to the whole LDO block, on the same schedule and with its own class
   // for the same reason r291 gave: a boot that printed the three words and not the thirteen says the
   // census was capped, not that the page is silent -- and the census is the baseline the next round's

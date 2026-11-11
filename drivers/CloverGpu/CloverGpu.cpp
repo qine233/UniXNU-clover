@@ -108,6 +108,9 @@ static volatile uint32_t *clover_gpu_memacc;
 static IOTimerEventSource *clover_gpu_timer;
 static bool clover_gpu_powered;
 static uint32_t clover_gpu_fires;
+/* Round403: whether the LDO sequence ran and what it read back, so the beat can say it. */
+static uint32_t clover_gpu_ldo_ran;
+static uint32_t clover_gpu_ldo_vref_after, clover_gpu_ldo_ctrl_after;
 
 static unsigned
 clover_gpu_uptime_seconds(void)
@@ -205,6 +208,7 @@ clover_gpu_ldo_bringup(unsigned t)
     if (window == NULL) {
         return;
     }
+    clover_gpu_ldo_ran = 1;
     val = (400000U - 375000U) / 5000U;      /* GET_VREF((:266)): the DT's minimum, 400 mV */
     vref = clover_gpu_read(window, kGpuccLdoVref);
     base = (vref & ~0x7fU) | (val & 0x7fU);
@@ -261,6 +265,8 @@ clover_gpu_ldo_bringup(unsigned t)
     ctl &= ~(1U << 6); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
     ctl &= ~(1U << 8); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
     ctl &= ~(1U << 4); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    clover_gpu_ldo_vref_after = clover_gpu_read(window, kGpuccLdoVref);
+    clover_gpu_ldo_ctrl_after = clover_gpu_read(window, kGpuccLdoCtrl);
     printf("clover r389: gpu t=%u ldo prog uv=%u val=%u ready=%u vref=%08x ctrl=%08x sts=%08x\n",
         t, 400000U, (unsigned) val, (unsigned) ready,
         (unsigned) clover_gpu_read(window, kGpuccLdoVref),
@@ -488,6 +494,10 @@ clover_gpu_report_branches(unsigned t, const char *stage)
 static void
 clover_gpu_report_ldo(unsigned t, const char *stage)
 {
+    /* Round405: prove the row can reach the card from the function that already does. */
+    printf("clover r405: gpu t=%u ran=%u vfa=%08x cfa=%08x\n", t,
+        (unsigned) clover_gpu_ldo_ran, (unsigned) clover_gpu_ldo_vref_after,
+        (unsigned) clover_gpu_ldo_ctrl_after);
     uint32_t vref   = clover_gpu_read(clover_gpu_gpucc, kGpuccLdoVref);
     uint32_t ctrl   = clover_gpu_read(clover_gpu_gpucc, kGpuccLdoCtrl);
     uint32_t sts    = clover_gpu_read(clover_gpu_gpucc, kGpuccLdoStatus);
@@ -509,11 +519,14 @@ clover_gpu_report_ldo(unsigned t, const char *stage)
     gpu_ldo_decode_ctrl(ctrl, &bits);
 
     printf("clover r291: gpu t=%u ldo %s vref=%08x val=%u uv=%u ctrl=%08x byp=%u pdn=%u "
-        "cpr_byp=%u sts=%08x ready=%u settled=%u cx_on=%u gx_on=%u\n", t, stage,
+        "cpr_byp=%u sts=%08x ready=%u settled=%u cx_on=%u gx_on=%u ran=%u vfa=%08x cfa=%08x\n",
+        t, stage,
         (unsigned) vref, (unsigned) corner.val, (unsigned) corner.uv, (unsigned) ctrl,
         (unsigned) bits.bypass, (unsigned) bits.pdn, (unsigned) bits.cpr_bypass, (unsigned) sts,
         (unsigned) gpu_ldo_status_ready(sts), (unsigned) gpu_ldo_status_settled(sts),
-        (unsigned) gpu_gdsc_pwr_on(cxhw), (unsigned) gpu_gdsc_pwr_on(gx));
+        (unsigned) gpu_gdsc_pwr_on(cxhw), (unsigned) gpu_gdsc_pwr_on(gx),
+        (unsigned) clover_gpu_ldo_ran, (unsigned) clover_gpu_ldo_vref_after,
+        (unsigned) clover_gpu_ldo_ctrl_after);
 }
 
 // Round294 widens that reading to the whole LDO block the vendor driver names, because boot 78 answered
@@ -773,7 +786,15 @@ clover_gpu_power_on(unsigned t)
     clover_gpu_report_gpucc(t, false);
 
     {
-        clover_gpu_ldo_bringup(t);
+        /*
+         * Round407. Boots 173-179 hung while the log was still scrolling, and the only write this
+         * round added before the GDSC open is the LDO sequence. It is called out by the r291 row's
+         * ran= flag, so a boot that shows ran=0 is this line not running; the sequence itself stays
+         * compiled until a boot proves it is not what hangs the bus.
+         */
+        if (0) {
+            clover_gpu_ldo_bringup(t);
+        }
         bool cx_on = clover_gpu_gdsc_on(clover_gpu_gpucc, kGpuccGdscCx, kGpuccCxHwCtrl, true);
         bool gx_on = clover_gpu_gdsc_on(clover_gpu_gpucc, kGpuccGdscGx, kGpuccGdscGx, false);
         uint32_t cx   = clover_gpu_read(clover_gpu_gpucc, kGpuccGdscCx);
@@ -826,6 +847,9 @@ clover_gpu_say(OSObject *owner, IOTimerEventSource *sender)
     } else {
         // Steady state: the post-write readback and the gated chipid, repeated so a long boot that
         // rotates the ring out never loses the verdict.
+        printf("clover r403: gpu t=%u ldo ran=%u vref_after=%08x ctrl_after=%08x\n", t,
+            (unsigned) clover_gpu_ldo_ran, (unsigned) clover_gpu_ldo_vref_after,
+            (unsigned) clover_gpu_ldo_ctrl_after);
         clover_gpu_report_branches(t, "beat");
         clover_gpu_report_ldo(t, "beat");
         clover_gpu_report_ldo_words(t, "beat");
