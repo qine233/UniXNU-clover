@@ -222,5 +222,10 @@
 #define kGpuCpRbRptrAddrHi  0x805U
 #define kGpuCpRbRptr        0x806U
 #define kGpuCpRbWptr        0x807U
+#define kGpuCpMeCntl        0x832U
+#define kGpuCpPfpInstrBaseLo 0x835U
+#define kGpuCpPfpInstrBaseHi 0x836U
+#define kGpuCpPm4InstrBaseLo 0x838U
+#define kGpuCpPm4InstrBaseHi 0x839U
 
 #endif // CLOVER_GPU_GPUREGS_H

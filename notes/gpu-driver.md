@@ -37,3 +37,23 @@
 - 再把 3 的 ring 几何与 PM4 包头写成纯函数（type4/type7、包长、`CP_RB_*` 偏移），同样 host 测试；
 - 4 的 ME_INIT 序列在一个函数里逐行对应 `adreno_a5xx.c` 的行号注释；
 - 这些都不碰硬件；等板子回来只需要把它们接到 CloverGpu 的 MMIO 层。
+
+
+## r390–r394 的落地情况
+
+| 层 | 状态 | 位置 |
+| --- | --- | --- |
+| 微码 blob 解析 / PM4 头 / type4 拆分 | 已实现 + host 测试 | `GpuCore.h`、`tests/clover_gpu_host.cpp` |
+| CP ring 几何 / RB_CNTL / 指针回绕 | 已实现 + host 测试 | `GpuCore.h`、`GpuRegs.h` |
+| ME_INIT 9 dwords | 已实现 + host 测试 | `GpuCore.h` |
+| 微码嵌入 | 生成器 + 空默认头 | `scripts/make-clover-gpu-ucode.py`、`drivers/CloverGpu/ucode_a530.h` |
+| CP 启动（ring/微码基址/ME_HALT/ME_INIT/RPTR 轮询） | 已实现，编译通过；无 blob 时打 `cp start skipped ucode=absent` | `CloverGpu.cpp` |
+
+**还缺（按依赖顺序）**：
+
+1. **微码文件**：从设备 `/vendor/firmware/a530_pfp.fw`、`a530_pm4.fw`（TWRP adb 可 `cat`），跑
+   `scripts/make-clover-gpu-ucode.py` 覆盖 `ucode_a530.h` —— 之后 CP 启动路径即完整；
+2. **SMMU**：`adreno_iommu.c` + `ArmSmmu4K` kit；在 CP 起来之前用物理地址是可行的（当前实现），
+   页表化是让 IOSurface/IB 能被 GPU 读的前提；
+3. **提交/fence/IRQ**：`adreno_ringbuffer.c` 的 submit + `CP_EVENT_WRITE` timestamp + `A5XX_RBBM_INT_*`；
+4. **Metal 用户态**：`IOGPUDeviceUserClient`（`IOGPUFamily` kext）——最后一步。

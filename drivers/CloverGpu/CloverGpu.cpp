@@ -75,11 +75,13 @@
 #include <IOKit/IODeviceMemory.h>
 // IOMemoryMap is declared in IOMemoryDescriptor.h in this SDK; there is no IOMemoryMap.h.
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 #include <kern/clock.h>
+#include "ucode_a530.h"
 #include "GpuCore.h"
 #include "GpuRegs.h"
 
@@ -98,6 +100,9 @@ static IOMemoryMap *clover_gpu_memacc_map;
 static volatile uint32_t *clover_gpu_gcc;
 static volatile uint32_t *clover_gpu_gpucc;
 static volatile uint32_t *clover_gpu_core;
+/* Forward: the CP start is defined below its caller (round394). */
+static bool clover_gpu_cp_start(unsigned t);
+static bool clover_gpu_ucode_present(void);
 static volatile uint32_t *clover_gpu_memacc;
 static IOTimerEventSource *clover_gpu_timer;
 static bool clover_gpu_powered;
@@ -590,30 +595,116 @@ clover_gpu_report_chipid(unsigned t)
         printf("clover r286: gpu t=%u chipid=%08x expect=%08x ok=%u\n", t,
             (unsigned) chipid, (unsigned) kGpuChipidValue,
             (unsigned) (chipid == kGpuChipidValue));
+        if (chipid == kGpuChipidValue) {
+            clover_gpu_cp_start(t);
+        }
     }
 }
 
 // The write phase, run once per boot. It prints its own rows; on any refusal it returns without
 // setting clover_gpu_powered, so the next timer fire retries the whole sequence. The writes are
 // idempotent, so a retry after a partial failure redoes safe work.
+/* The microcode blobs scripts/make-clover-gpu-ucode.py emits; weak, so a build without it still links. */
+
+
+/*
+ * Round394. Starting the CP: ring, microcode bases, ME_HALT, ME_INIT, and the read pointer.
+ *
+ * The vendor's order is a5xx_rb_start() (adreno_a5xx.c:1999): RPTR_ADDR, RB_CNTL, RB_BASE, the two
+ * instruction bases (a5xx_microcode_load, :1789), CP_ME_CNTL=0 (:2026), then a5xx_send_me_init(). With
+ * no IOMMU context yet the GPU sees physical addresses, which is the state the block boots in, so the
+ * descriptors below are allocated contiguous and their physical addresses go into the registers.
+ */
+static IOBufferMemoryDescriptor *clover_gpu_ring_md;
+static IOBufferMemoryDescriptor *clover_gpu_rptr_md;
+static IOBufferMemoryDescriptor *clover_gpu_pfp_md;
+static IOBufferMemoryDescriptor *clover_gpu_pm4_md;
+
+static bool
+clover_gpu_cp_start (unsigned t)
+{
+    GpuFwBlob pfp, pm4;
+    uint32_t packets[9];
+    volatile uint32_t *ring;
+    uint64_t ring_addr, rptr_addr;
+    unsigned i;
+
+    if (clover_gpu_core == NULL) {
+        return false;
+    }
+    if (!clover_gpu_ucode_present () ||
+        !gpu_fw_parse (clover_gpu_pfp_blob, clover_gpu_pfp_size, &pfp) ||
+        !gpu_fw_parse (clover_gpu_pm4_blob, clover_gpu_pm4_size, &pm4)) {
+        printf ("clover r394: gpu t=%u cp start skipped ucode=absent\n", t);
+        return false;
+    }
+    if (clover_gpu_ring_md == NULL) {
+        clover_gpu_ring_md = IOBufferMemoryDescriptor::withCapacity (kGpuRingBytes,
+            kIODirectionInOut, true);
+        clover_gpu_rptr_md = IOBufferMemoryDescriptor::withCapacity (4096,
+            kIODirectionInOut, true);
+        clover_gpu_pfp_md = IOBufferMemoryDescriptor::withCapacity (pfp.bytes,
+            kIODirectionInOut, true);
+        clover_gpu_pm4_md = IOBufferMemoryDescriptor::withCapacity (pm4.bytes,
+            kIODirectionInOut, true);
+    }
+    if (clover_gpu_ring_md == NULL || clover_gpu_rptr_md == NULL ||
+        clover_gpu_pfp_md == NULL || clover_gpu_pm4_md == NULL) {
+        printf ("clover r394: gpu t=%u cp start skipped alloc=no\n", t);
+        return false;
+    }
+    memcpy (clover_gpu_pfp_md->getBytesNoCopy (), pfp.ucode, pfp.bytes);
+    memcpy (clover_gpu_pm4_md->getBytesNoCopy (), pm4.ucode, pm4.bytes);
+    ring_addr = clover_gpu_ring_md->getPhysicalAddress ();
+    rptr_addr = clover_gpu_rptr_md->getPhysicalAddress ();
+    clover_gpu_write (clover_gpu_core, kGpuCpRbRptrAddrLo, (uint32_t) rptr_addr);
+    clover_gpu_write (clover_gpu_core, kGpuCpRbRptrAddrHi, (uint32_t) (rptr_addr >> 32));
+    clover_gpu_write (clover_gpu_core, kGpuCpRbCntl, gpu_rb_cntl_default ());
+    clover_gpu_write (clover_gpu_core, kGpuCpRbBase, (uint32_t) ring_addr);
+    clover_gpu_write (clover_gpu_core, kGpuCpRbBaseHi, (uint32_t) (ring_addr >> 32));
+    {
+        const uint64_t pfp_addr = clover_gpu_pfp_md->getPhysicalAddress ();
+        const uint64_t pm4_addr = clover_gpu_pm4_md->getPhysicalAddress ();
+
+        clover_gpu_write (clover_gpu_core, kGpuCpPfpInstrBaseLo, (uint32_t) pfp_addr);
+        clover_gpu_write (clover_gpu_core, kGpuCpPfpInstrBaseHi, (uint32_t) (pfp_addr >> 32));
+        clover_gpu_write (clover_gpu_core, kGpuCpPm4InstrBaseLo, (uint32_t) pm4_addr);
+        clover_gpu_write (clover_gpu_core, kGpuCpPm4InstrBaseHi, (uint32_t) (pm4_addr >> 32));
+    }
+    clover_gpu_write (clover_gpu_core, kGpuCpMeCntl, 0);
+    gpu_me_init_packets (0U, packets);
+    ring = (volatile uint32_t *) clover_gpu_ring_md->getBytesNoCopy ();
+    for (i = 0; i < 9; i++) {
+        ring[i] = packets[i];
+    }
+    clover_gpu_write (clover_gpu_core, kGpuCpRbWptr, 9);
+    for (i = 0; i < 2000; i++) {
+        if (clover_gpu_read (clover_gpu_core, kGpuCpRbRptr) == 9U) {
+            break;
+        }
+        IODelay (1000);
+    }
+    {
+        const uint32_t rptr = clover_gpu_read (clover_gpu_core, kGpuCpRbRptr);
+        const bool idle = (rptr == 9U);
+
+        printf ("clover r394: gpu t=%u cp start ring=%llx rptr=%u idle=%u pfp=%d pm4=%d\n", t,
+            (unsigned long long) ring_addr, (unsigned) rptr, (unsigned) idle,
+            (int) pfp.words, (int) pm4.words);
+        return idle;
+    }
+}
+
 /*
  * Round393. The microcode the CP needs before ME_INIT can run. scripts/make-clover-gpu-ucode.py emits
  * both arrays from the device's a530_pfp.fw / a530_pm4.fw; a build that has not run it still links,
  * because the weak defaults below are empty and the loader says so instead of starting a CP with no
  * microcode.
  */
-extern "C" const unsigned char clover_gpu_pfp_blob[] __attribute__((weak));
-extern "C" const unsigned char clover_gpu_pm4_blob[] __attribute__((weak));
-extern "C" const size_t clover_gpu_pfp_size __attribute__((weak));
-extern "C" const size_t clover_gpu_pm4_size __attribute__((weak));
 
 static bool
 clover_gpu_ucode_present (void)
 {
-    /* A weak data symbol that nothing defined has address zero; ask the sizes, not the arrays. */
-    if (&clover_gpu_pfp_size == NULL || &clover_gpu_pm4_size == NULL) {
-        return false;
-    }
     return clover_gpu_pfp_size > 4 && clover_gpu_pm4_size > 4;
 }
 
