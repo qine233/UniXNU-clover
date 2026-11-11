@@ -600,3 +600,20 @@ clover r389: gpu t=%u ldo prog uv=400000 val=5 ready=%u vref=%08x ctrl=%08x sts=
 - 因此「之前整段序列挂死」不是 CTRL 位的问题，而是那一版的顺序/等待；而这颗 GFX 轨的
   `PDN` 状态由 **CPR/固件侧**持有，AP 翻不动。
 - 下一步只能从固件侧（`uefi-clover` 交接前把 GPU 轨/GX 打开）或 CPR4 角编程（需要新源码）进入。
+
+
+## 8. sheng（SM8550）的 GPU 电源与 clover 的结构差异（2026-11-12，读 UniXNU-sm8550-common）
+
+`UniXNU-sm8550-common` 已拉到本地（`~/UniXNU-sm8550-common`）。它的 GPU 相关代码只有：
+
+- `kits/Sm8550Platform/ShengGmu.c`、`ShengGmuCommandDb.c`、`ShengGmuVotes.h` —— **GMU 固件与票**；
+- `kits/Sm8550Platform/ShengGpuSmmu.c` —— GPU 的 SMMU 上下文。
+
+**没有**任何 GFX 轨 / CPR / LDO 的编程代码。原因不是遗漏，是结构：SM8550 的 GPU 有 **GMU**，
+轨与频率由 GMU/RPMh 侧管，AP 只负责把 GMU 固件装起来并投票（`sheng-gpu-power=9` 就是这个策略的开关）。
+
+clover 的 Adreno 512 **没有 GMU**（`notes/gpu-bringup.md` §5 早已记录），所以 sheng 这条路在 clover 上
+没有对应物：AP 必须自己开轨，而我们的实测（§7）说 CTRL/PDN 不接受 AP 写。结论因此是：
+
+- sheng 的做法**不适用于** clover；
+- clover 的轨只能由**固件侧**（`uefi-clover` 交接前）或 CPR4 角编程打开。
