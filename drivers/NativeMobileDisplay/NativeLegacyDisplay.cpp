@@ -409,6 +409,21 @@ public:
             source->getLength(),sourceStride,width,height)) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
         }
+        /*
+         * The CPU path retires like the GPU hand-off does: the family's swap completes before the copy,
+         * so the next submission is accepted instead of answered busy. The map above holds the frame's
+         * memory, so the copy outlives the family's release.
+         */
+        bool cpuRetired=false;
+        {
+            unsigned earlyCpu=1;
+            PE_parse_boot_argn("sheng-early-retire",&earlyCpu,sizeof(earlyCpu));
+            if(earlyCpu==1 && retireSwap(request,true)) {
+                memory->retain();
+                cpuRetired=true;
+                native_legacy_early_retires=native_legacy_early_retires+1;
+            }
+        }
         // The two content scans read every pixel again; they only describe the first frames (the probe keeps 32).
         if(scanBudget) {
             --scanBudget;
@@ -453,7 +468,14 @@ public:
         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
         OSSafeReleaseNULL(source);transferred=true;
         native_legacy_transfer_observed(kIOReturnSuccess,request,length);
-        finishTransfer(request);
+        if(cpuRetired) {
+            memory->release();
+            native_legacy_frame_presented(0);
+            transferred=false;
+            kickSwapQueue();
+        } else {
+            finishTransfer(request);
+        }
     }
     // The GPU client reported its copy (status 0) or lost it. Success retires the swap like a finished copy; anything else uses the CPU copy.
     void finishGpuSwap(int status) {
@@ -491,8 +513,19 @@ public:
             const OriginalLegacySwapRequest *head=pendingSwapRequest();
             unsigned why=(head==nullptr)?1U:((head==request)?2U:3U);
             if((retireMiss++ % 64)==0)
-                IOLog("clover r386: retire-miss #%u why=%u req=%llx head=%llx\n",retireMiss,why,
+                IOLog("clover r387: retire-miss #%u why=%u req=%llx head=%llx\n",retireMiss,why,
                     (unsigned long long)(uintptr_t)request,(unsigned long long)(uintptr_t)head);
+            if(why==2) {
+                /*
+                 * The family's own head is this request and it still refuses to activate it, which leaves
+                 * the queue permanently full: every later swap answers busy and the stream stops. The
+                 * head is the current swap, so completing it directly is the one path that can drain it.
+                 */
+                IOMobileFramebufferLegacy::completeCurrentSwap();
+                removeValidated(request);
+                native_legacy_retirement_observed(this);
+                return true;
+            }
             removeValidated(request);
             return false;
         }

@@ -30715,3 +30715,21 @@ dispstate ms=1795261 … calls=1155 fails=15 last=0@1179s tx=284@1179s s6f=283 f
 **判读。** 丢弃陈旧校验只让帧流多跑了 ~200 s，没解掉根因：家族的 pending 头被 `activate` 拒绝后，
 它自己也不会再被 kick 转移（我们已把校验丢掉），于是队列永久占住、每次新 swap 都回 Busy。
 下一支：在 `activate` 失败时尝试直接 `completeCurrentSwap()`（不 activate）把队列强行排空，看帧流是否恢复。
+
+
+## Round387/388 —— 照 sheng 的做法试「提前退休」，仍停在 803–1051 s
+
+**sheng 怎么处理这类问题（读其仓库）：** sheng 的显示**不走 CPU 拷贝的稳态**——`sheng-fb-gpu=1` 时
+`kickOnce` 把帧交给 GPU 客户端（`native_gop_gpu_offer`），并在**交接时提前退休**（`sheng-early-retire`），
+所以它不碰家族 pending/activate 队列的 CPU 路径。其 `LegacyDisplayProbe.cpp` 只有 585 行，是纯记账，
+真正呈现由 Adreno740/AdrenoMetal 完成。
+
+**clover 的两次尝试：**
+- r387：`activateOnlyPendingSwap` 拒绝且头就是本请求（why=2）时，直接 `completeCurrentSwap()` 强行排空；
+  boot 171：`tx` 284→**606**，但仍在 1051 s 停；
+- r388：把 sheng 的「提前退休」搬到 CPU 路径——拿到 surface 的映射后先 `retireSwap(request,true)`、
+  再拷贝（`memory->retain()` 保证内存活到拷贝完）；boot 172：`tx=345@803s`，**没有改善**。
+
+**判读。** 家族队列的停摆与退休时机无关，而是 pending 头在某次竞态后不再可激活；sheng 用 GPU
+路径绕过了它。clover 没有 GPU，等价物只能是**板级 user client**（自己处理 selector 6 的提交与回包，
+完全不进家族队列）或拿到家族的队列状态机。下一步按前者做。

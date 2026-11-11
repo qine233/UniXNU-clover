@@ -16,6 +16,16 @@
 
 ## 逐轮报告（倒序）
 
+### r387/r388 — 照 sheng 的「提前退休」搬到 CPU 路径，仍停在 803–1051 s
+
+- **sheng 的做法**：`sheng-fb-gpu=1` 时把帧交给 GPU 客户端（`native_gop_gpu_offer`）并在交接时提前退休，
+  不进入家族 CPU 路径的 pending/activate 队列；其 `LegacyDisplayProbe.cpp` 只有 585 行纯记账。
+- **clover 的尝试**：
+  - r387：why=2（头即本请求但 activate 拒绝）时直接 `completeCurrentSwap()`：`tx` 284→606，仍 1051 s 停；
+  - r388：CPU 路径提前退休（先 retire 再拷贝，`memory->retain()`）：`tx=345@803s`，无改善。
+- **判读**：停摆与退休时机无关，是家族 pending 头竞态；sheng 用 GPU 路径绕过。clover 无 GPU，
+  下一步只能做**板级 user client**（自己处理 selector 6，不进家族队列）。
+
 ### r384 — Busy→Success：客户端不再退避，但退休这一步仍失败
 
 - **改动**：selector 6 的 `kIOReturnBusy` 在 wrapper 里改回 success（`s6f=` 计数）。payload `7ec4269a…`。
