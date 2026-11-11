@@ -813,6 +813,13 @@ static void check_touch_report(void)
     CHECK (report.count == 0, "a buffer shorter than its own count is refused");
 
     CHECK (input_goodix_clear_value () == 0, "the buffer is cleared with a zero byte");
+    CHECK_EQ (input_axis_from_raw (0, kGtRawMaxX, 30480), 0, "raw zero maps to axis zero");
+    CHECK_EQ (input_axis_from_raw (kGtRawMaxX / 2, kGtRawMaxX, 30480), 15240, "half of the raw grid is half the axis");
+    CHECK_EQ (input_axis_from_raw (kGtRawMaxX, kGtRawMaxX, 30480), 30480, "the raw end is the axis end");
+    CHECK_EQ (input_axis_from_raw (kGtRawMaxX + 100, kGtRawMaxX, 30480), 30480,
+              "a value past the raw grid clamps to the axis end, it does not wrap");
+    CHECK_EQ (input_axis_from_raw (kGtRawMaxX - 1, kGtRawMaxX, 30480), 30465,
+              "the last raw step stays inside the axis, not equal to its end");
 }
 
 int main(void)

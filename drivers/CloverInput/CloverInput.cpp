@@ -858,20 +858,20 @@ static void touchReport (uint8_t address)
 {
   const uint8_t reg[2] = { static_cast<uint8_t> (kGtRegCoords >> 8),
                            static_cast<uint8_t> (kGtRegCoords & 0xff) };
-  uint8_t data[1 + 2 * kGtPointBytes] = { 0 };
+  uint8_t data[1 + 6 * kGtPointBytes] = { 0 };
   struct InputTouchReport report;
   uint32_t i;
 
   if (!chipRead (address, reg, 2, data, sizeof (data), "touch report")) {
     return;
   }
-  input_goodix_report (data, sizeof (data), kGtMaxTouch, &report);
+  input_goodix_report (data, sizeof (data), 6, &report);
   native_touch_seq = native_touch_seq + 1;
   __asm__ volatile ("dmb ish" ::: "memory");
   native_touch_count = report.count;
   for (i = 0; i < report.count && i < 12; i++) {
-    native_touch_xs[i] = report.point[i].x;
-    native_touch_ys[i] = report.point[i].y;
+    native_touch_xs[i] = input_axis_from_raw (report.point[i].x, kGtRawMaxX, 30480);
+    native_touch_ys[i] = input_axis_from_raw (report.point[i].y, kGtRawMaxY, 20320);
     native_touch_ids[i] = report.point[i].id;
   }
   __asm__ volatile ("dmb ish" ::: "memory");

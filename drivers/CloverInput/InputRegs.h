@@ -412,6 +412,10 @@
 #define kGtRegSensorId      0x814aU         // GTP_REG_SENSOR_ID: 1 byte, valid < 0x06 (gt9xx.c:688)
 #define kGtRegCoords        0x814eU         // READ_COOR_ADDR: the point report, later round
 #define kGtVersionLen       6U
+// CTP_CFG_GROUP0 (gt9xx.h:191): the blob's bytes 2..3 are X output max 0x0800 = 2048 and bytes 4..5
+// are Y output max 0x076a = 1898 -- the raw grid the chip reports, not a rounded power of two.
+#define kGtRawMaxX          2048U
+#define kGtRawMaxY          1898U
 #define kGtPidValidMax      6U              // sensor_id >= 0x06 means "no config was sent"
 
 // EDT/FocalTech addressing (MAIN edt-ft5x06.c: EDT_NAME_LEN 23 at line 71, and

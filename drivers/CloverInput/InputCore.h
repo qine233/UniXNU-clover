@@ -906,6 +906,23 @@ static inline void input_goodix_report(const uint8_t *data, uint32_t len, uint32
     out->count = count;
 }
 
+// Raw Goodix coordinates are the panel's own grid; the HID device's axes are 30480 x 20320
+// (drivers/NativeHidInput/NativeHidInput.cpp:167). The map is a scale with both ends clamped: a
+// coordinate outside the raw grid is the panel's edge, not a wrapped value, and the 64-bit multiply
+// keeps a 12-bit raw value times a 30480 axis exact before the divide.
+static inline int32_t input_axis_from_raw(uint32_t raw, uint32_t raw_max, uint32_t axis_max)
+{
+    uint64_t scaled;
+    if (raw_max == 0 || axis_max == 0) {
+        return 0;
+    }
+    if (raw >= raw_max) {
+        return (int32_t) axis_max;
+    }
+    scaled = (uint64_t) raw * (uint64_t) axis_max;
+    return (int32_t) (scaled / (uint64_t) raw_max);
+}
+
 // The vendor clears the buffer by writing a zero byte to the same register (gt9xx.c:365-366), so a
 // report that is read but never cleared is served again -- the reason a host sees one touch as many.
 static inline uint8_t input_goodix_clear_value(void)
