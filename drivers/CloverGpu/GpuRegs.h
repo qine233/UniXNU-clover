@@ -212,4 +212,15 @@
 #define kGpuChipid          0x10200U
 #define kGpuChipidValue     0x05010200U
 
+// The CP ring, from a5xx_reg.h:52-58 (sha256 c1b2ebe4d067). These are the registers the ring bring-up
+// writes once microcode is loaded: BASE/BASE_HI take the ring's GPU address, CNTL the block size,
+// RPTR_ADDR_LO/HI the read-pointer word, and WPTR is the doorbell the host advances.
+#define kGpuCpRbBase        0x800U
+#define kGpuCpRbBaseHi      0x801U
+#define kGpuCpRbCntl        0x802U
+#define kGpuCpRbRptrAddrLo  0x804U
+#define kGpuCpRbRptrAddrHi  0x805U
+#define kGpuCpRbRptr        0x806U
+#define kGpuCpRbWptr        0x807U
+
 #endif // CLOVER_GPU_GPUREGS_H

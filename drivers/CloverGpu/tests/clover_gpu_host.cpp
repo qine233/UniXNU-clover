@@ -319,6 +319,25 @@ main (void)
             "a capped row would accuse a page that was never read");
 
     // -----------------------------------------------------------------------
+    // 15. The CP ring: geometry and the control word.
+    // -----------------------------------------------------------------------
+    {
+        expect (kGpuRingBytes == 32768U && kGpuRingDwords == 8192U,
+                "KGSL_RB_SIZE is 32 KiB and KGSL_RB_DWORDS is 8192");
+        expect (gpu_rb_cntl_default () == 0x20CU,
+                "A5XX_CP_RB_CNTL_DEFAULT with this ring is 0x20C: ilog2(4)=2 in bits 8-12 and "
+                "ilog2(4096)=12 in bits 0-5");
+        expect (gpu_ring_space (0U, 0U) == kGpuRingDwords - 1U,
+                "an empty ring leaves one dword of room, so a full ring is never seen as empty");
+        expect (gpu_ring_space (4U, 0U) == kGpuRingDwords - 5U, "four written dwords cost four of room");
+        expect (gpu_ring_space (0U, 1U) == 0U,
+                "a wrapped pointer pair is a difference, not a subtraction: (0-1)&8191 is 8191 used, so "
+                "no room is left");
+        expect (gpu_ring_advance (kGpuRingDwords - 2U, 4U) == 2U, "advance wraps inside the ring");
+        expect (gpu_ring_advance (0U, 1U) == 1U, "one dword advances the write pointer by one");
+    }
+
+    // -----------------------------------------------------------------------
     // 14. The flashables: firmware blob shape and PM4 headers.
     // -----------------------------------------------------------------------
     {

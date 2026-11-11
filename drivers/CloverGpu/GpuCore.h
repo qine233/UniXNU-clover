@@ -596,6 +596,56 @@ gpu_fw_packet_count (uint32_t words)
 }
 
 // ---------------------------------------------------------------------------
+// The CP ring: geometry and the control word
+// ---------------------------------------------------------------------------
+
+// `KGSL_RB_SIZE` and `KGSL_RB_DWORDS` (adreno_ringbuffer.h:17, :23): 32 KiB, 8192 dwords.
+static const uint32_t kGpuRingBytes = 32U * 1024U;
+static const uint32_t kGpuRingDwords = kGpuRingBytes / 4U;
+
+// ilog2 for a power of two, the shape the vendor macro uses. Zero is not a power of two and returns 0
+// rather than an underflow; callers below only ever pass powers of two.
+static inline uint32_t
+gpu_ilog2 (uint32_t value)
+{
+    uint32_t result = 0;
+
+    while (value > 1U) {
+        value >>= 1;
+        result++;
+    }
+    return result;
+}
+
+// `A5XX_CP_RB_CNTL_DEFAULT` (adreno_a5xx.h:137):
+//   ((ilog2(4) << 8) & 0x1F00) | (ilog2(KGSL_RB_DWORDS >> 1) & 0x3F)
+// with this board's ring that is 0x20C -- block size 4 dwords in bits 8-12, and the read-pointer block
+// size (log2 of half the ring) in bits 0-5.
+static inline uint32_t
+gpu_rb_cntl_default (void)
+{
+    return ((gpu_ilog2 (4U) << 8) & 0x1F00U) |
+        (gpu_ilog2 (kGpuRingDwords >> 1) & 0x3FU);
+}
+
+// The ring is circular in dwords: the host may write while the read pointer leaves at least one dword
+// of room, or the CP would see a full ring as empty. Returns the writable dwords.
+static inline uint32_t
+gpu_ring_space (uint32_t wptr, uint32_t rptr)
+{
+    const uint32_t used = (wptr - rptr) & (kGpuRingDwords - 1U);
+
+    return (kGpuRingDwords - 1U) - used;
+}
+
+// Advance the write pointer by words, wrapping inside the ring.
+static inline uint32_t
+gpu_ring_advance (uint32_t wptr, uint32_t words)
+{
+    return (wptr + words) & (kGpuRingDwords - 1U);
+}
+
+// ---------------------------------------------------------------------------
 // The chipid gate: which refusal a row has to name
 // ---------------------------------------------------------------------------
 
