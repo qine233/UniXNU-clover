@@ -229,6 +229,17 @@ clover_gpu_ldo_bringup(unsigned t)
      * half that hung. Each write now prints the step and the word before it, so a boot that stops has
      * its last row pointing at the exact bit that stopped it.
      */
+    /*
+     * Round410. VREF_TEST_CFG has been zero on every boot, so ENABLE_LDO_STATUS (BIT8|BIT12) and the
+     * autobypass bit were never set. One write to that word, read back before anything else, tests
+     * whether the ignored control writes were a missing enable.
+     */
+    {
+        const uint32_t tcfg = clover_gpu_read(window, kGpuccLdoVrefTest);
+        clover_gpu_write(window, kGpuccLdoVrefTest, tcfg | (1U << 8) | (1U << 12));
+        printf("clover r410: gpu t=%u vref_test before=%08x after=%08x\n", t,
+            (unsigned) tcfg, (unsigned) clover_gpu_read(window, kGpuccLdoVrefTest));
+    }
     ctl = clover_gpu_read(window, kGpuccLdoCtrl);
 #define CLOVER_LDO_STEP(n, expr) \
     do { \
