@@ -791,6 +791,41 @@ static bool chipRead (uint8_t address, const uint8_t *reg, uint32_t regLen, uint
   return finishTransfer ();
 }
 
+// Round401. The write half of the bus, which the report path needs: the vendor clears the point buffer
+// by writing a zero byte to the same register it read (gt9xx.c:365-366), and a report that is read but
+// never cleared is served again -- one touch arriving as many frames. The tag bytes are the same
+// builder chipRead() uses with the STOP variant, because this is the last and only block.
+static bool chipWrite (uint8_t address, const uint8_t *reg, uint32_t regLen, const uint8_t *data,
+                       uint32_t dataLen, const char *why)
+{
+  if (!input_read_request_ok (regLen, dataLen)) {
+    IOLog ("clover r181: %s refused, reg=%u len=%u outside one block\n", why, regLen, dataLen);
+    return false;
+  }
+  if (!bringUpCore ()) {
+    return false;
+  }
+  uint8_t wire[kQupMaxTagsLen + 2 + 8];
+  if (regLen + dataLen > sizeof (wire) - kQupMaxTagsLen) {
+    return false;
+  }
+  const uint32_t wireLen = input_write_tags (address, regLen + dataLen, 1, wire, sizeof (wire));
+  if (wireLen != kQupMaxTagsLen) {
+    return false;
+  }
+  for (uint32_t i = 0; i < regLen; i++) {
+    wire[kQupMaxTagsLen + i] = reg[i];
+  }
+  for (uint32_t i = 0; i < dataLen; i++) {
+    wire[kQupMaxTagsLen + regLen + i] = data[i];
+  }
+  Segment write { wire, wireLen + regLen + dataLen, nullptr, 0, true, true };
+  if (!runSegment (write, why)) {
+    return false;
+  }
+  return finishTransfer ();
+}
+
 // A bare "does this address ACK?" ping with no data after it is deliberately NOT provided: in a v2
 // DATAWR/DATARD tag a byte count of 0 does not mean zero, it means 256 (i2c-qup.c:600-608, where
 // qup_i2c_get_data_len() == QUP_READ_LIMIT is encoded as 0), so the smallest honest question this
@@ -876,6 +911,11 @@ static void touchReport (uint8_t address)
   }
   __asm__ volatile ("dmb ish" ::: "memory");
   native_touch_seq = native_touch_seq + 1;
+  {
+    const uint8_t clear = input_goodix_clear_value ();
+
+    chipWrite (address, reg, 2, &clear, 1, "touch clear");
+  }
   IOLog ("clover r400: touch valid=%u points=%u id0=%u x0=%u y0=%u id1=%u x1=%u y1=%u seq=%u\n",
          (unsigned) report.valid, (unsigned) report.count,
          report.count ? (unsigned) report.point[0].id : 0u,
