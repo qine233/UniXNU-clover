@@ -215,6 +215,15 @@
 // The CP ring, from a5xx_reg.h:52-58 (sha256 c1b2ebe4d067). These are the registers the ring bring-up
 // writes once microcode is loaded: BASE/BASE_HI take the ring's GPU address, CNTL the block size,
 // RPTR_ADDR_LO/HI the read-pointer word, and WPTR is the doorbell the host advances.
+// The GPU's SMMU, from the DT's `kgsl_smmu` node (notes/gpu-bringup.md §1): SMMUv2 at 0x05040000,
+// 64 KiB, with the identification registers at the head of the window. Only the first page is mapped
+// by the read-only probe: the context banks are written in a later step, once the tables exist.
+#define kSmmuPhys           0x05040000ULL
+#define kSmmuSize           0x1000U
+#define kSmmuIdr0           0x000U
+#define kSmmuIdr1           0x004U
+#define kSmmuIdr2           0x008U
+
 #define kGpuCpRbBase        0x800U
 #define kGpuCpRbBaseHi      0x801U
 #define kGpuCpRbCntl        0x802U

@@ -5216,6 +5216,7 @@ def check_board(errors: list) -> str:
                     ("IODeviceMemory::withRange(kGccPhys, kGccSize)", "CloverGpu.cpp", gpu_source),
                     ("IODeviceMemory::withRange(kGpuccPhys, kGpuccSize)", "CloverGpu.cpp", gpu_source),
                     ("IODeviceMemory::withRange(kGpuPhys, kGpuSize)", "CloverGpu.cpp", gpu_source),
+                    ("IODeviceMemory::withRange(kSmmuPhys, kSmmuSize)", "CloverGpu.cpp", gpu_source),
                     ("clover_gpu_set_bits(clover_gpu_gcc, kGccGpuCfgAhb, 1);", "CloverGpu.cpp", gpu_source),
                     ("clover_gpu_gdsc_on(clover_gpu_gpucc, kGpuccGdscCx, kGpuccCxHwCtrl, true);",
                      "CloverGpu.cpp", gpu_source),
@@ -5381,12 +5382,15 @@ def check_board(errors: list) -> str:
             # Round311 adds the one window the arithmetic says is genuinely separate: 0x01fcf004 is above
             # GCC's end (0x00100000+0x94000 = 0x194000) and nowhere near the two GPU pages, so it cannot
             # ride an existing mapping -- and its own DT node says how big it is (reg = <0x1fcf004 0x4>).
-            # The count is the checkable form of "four windows, each the extent its node declares".
-            if gpu_source.count("IODeviceMemory::withRange(") != 4:
+            # The count is the checkable form of "five windows, each the extent its node declares".
+            # Round402 adds the one the SMMU line needs: the DT's own `kgsl_smmu` node puts SMMUv2 at
+            # 0x05040000 with a 64 KiB extent, separate from the two GPUCC pages and from the core.
+            if gpu_source.count("IODeviceMemory::withRange(") != 5:
                 errors.append(f"CloverGpu.cpp opens {gpu_source.count('IODeviceMemory::withRange(')} windows, "
-                              "not 4: GCC, GPUCC, the GPU core and round311's MEM_ACC node are the only "
-                              "extents this line may map, the LDO registers stay inside the GPUCC extent the "
-                              "DT declares, and a fifth window means a register whose node nobody checked")
+                              "not 5: GCC, GPUCC, the GPU core, round311's MEM_ACC node and round402's SMMU "
+                              "node are the only extents this line may map, the LDO registers stay inside "
+                              "the GPUCC extent the DT declares, and a sixth window means a register whose "
+                              "node nobody checked")
 
             # Round317. Conformance §7 gap 3's other half: every decision this line reads out of a word
             # moved into GpuCore.h so a host can prove it, and the pins follow the code, not the file. What

@@ -100,6 +100,7 @@ static IOMemoryMap *clover_gpu_memacc_map;
 static volatile uint32_t *clover_gpu_gcc;
 static volatile uint32_t *clover_gpu_gpucc;
 static volatile uint32_t *clover_gpu_core;
+static volatile uint32_t *clover_gpu_smmu;
 /* Forward: the CP start is defined below its caller (round394). */
 static bool clover_gpu_cp_start(unsigned t);
 static bool clover_gpu_ucode_present(void);
@@ -288,6 +289,28 @@ clover_gpu_open_gpucc(void)
         clover_gpu_gpucc = (volatile uint32_t *) clover_gpu_gpucc_map->getVirtualAddress();
     }
     return clover_gpu_gpucc;
+}
+
+/*
+ * Round402. The SMMU's identification registers, read before anything writes a context: the ID values
+ * are the arm-smmu driver's own capability test, and reading them is the check that the window answers
+ * at all. Gated behind the same CX power the GPU core read needs.
+ */
+static volatile uint32_t *
+clover_gpu_open_smmu(void)
+{
+    IODeviceMemory *memory;
+
+    if (clover_gpu_smmu != NULL) {
+        return clover_gpu_smmu;
+    }
+    memory = IODeviceMemory::withRange(kSmmuPhys, kSmmuSize);
+    if (memory == NULL) {
+        return NULL;
+    }
+    clover_gpu_smmu = (volatile uint32_t *) memory->map(kIOMapAnywhere | kIOMapInhibitCache);
+    memory->release();
+    return clover_gpu_smmu;
 }
 
 // The GPU core window, mapped only after both power polls and the branch vote read on. Until then a
@@ -596,6 +619,12 @@ clover_gpu_report_chipid(unsigned t)
             (unsigned) chipid, (unsigned) kGpuChipidValue,
             (unsigned) (chipid == kGpuChipidValue));
         if (chipid == kGpuChipidValue) {
+            if (clover_gpu_open_smmu() != NULL) {
+                printf("clover r402: gpu t=%u smmu idr0=%08x idr1=%08x idr2=%08x\n", t,
+                    (unsigned) clover_gpu_read(clover_gpu_smmu, kSmmuIdr0),
+                    (unsigned) clover_gpu_read(clover_gpu_smmu, kSmmuIdr1),
+                    (unsigned) clover_gpu_read(clover_gpu_smmu, kSmmuIdr2));
+            }
             clover_gpu_cp_start(t);
         }
     }
