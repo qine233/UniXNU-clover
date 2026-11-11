@@ -777,6 +777,44 @@ static void check_time(void)
     }
 }
 
+static void check_touch_report(void)
+{
+    uint8_t buf[1 + 2 * kGtPointBytes] = {0};
+    struct InputTouchReport report;
+
+    buf[0] = kGtBufferValid | 2;
+    buf[1] = 3; buf[2] = 0x23; buf[3] = 0x01; buf[4] = 0x56; buf[5] = 0x04;
+    buf[9] = 4; buf[10] = 0xbc; buf[11] = 0x0a; buf[12] = 0xef; buf[13] = 0x0d;
+    input_goodix_report (buf, sizeof (buf), kGtMaxTouch, &report);
+    CHECK (report.valid == 1 && report.count == 2, "a valid buffer with two points decodes two");
+    CHECK (report.point[0].id == 3 && report.point[0].x == 0x0123 && report.point[0].y == 0x0456,
+           "a record is id, then x and y little-endian");
+    CHECK (report.point[1].id == 4 && report.point[1].x == 0x0abc && report.point[1].y == 0x0def,
+           "the second record starts eight bytes after the first");
+
+    buf[0] = 0x00;
+    input_goodix_report (buf, sizeof (buf), kGtMaxTouch, &report);
+    CHECK (report.valid == 0 && report.count == 0, "a zero status is no buffer, not zero fingers");
+
+    buf[0] = kGtBufferValid;
+    input_goodix_report (buf, sizeof (buf), kGtMaxTouch, &report);
+    CHECK (report.valid == 1 && report.count == 0, "the valid bit with no count is an empty report");
+
+    buf[0] = 0x02;
+    input_goodix_report (buf, sizeof (buf), kGtMaxTouch, &report);
+    CHECK (report.valid == 0 && report.count == 0,
+           "a count without the valid bit is stale data, not touches");
+
+    buf[0] = kGtBufferValid | 8;
+    input_goodix_report (buf, sizeof (buf), 4, &report);
+    CHECK (report.count == 0, "more points than the caller accepts is refused, not truncated");
+
+    input_goodix_report (buf, 5, kGtMaxTouch, &report);
+    CHECK (report.count == 0, "a buffer shorter than its own count is refused");
+
+    CHECK (input_goodix_clear_value () == 0, "the buffer is cleared with a zero byte");
+}
+
 int main(void)
 {
     check_pin_map();
@@ -794,6 +832,7 @@ int main(void)
     check_request_bounds();
     check_identification();
     check_time();
+    check_touch_report();
 
     if (g_failures) {
         printf("FAIL: %d of %d checks in clover_input_host.cpp\n", g_failures, g_checks);

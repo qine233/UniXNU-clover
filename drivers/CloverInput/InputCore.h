@@ -845,6 +845,74 @@ static inline int input_goodix_sensor_id_valid(uint8_t sensor_id)
     return sensor_id < kGtPidValidMax ? 1 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// Touch reports: the point buffer and its records
+// ---------------------------------------------------------------------------
+
+// gt9xx.h:335 and :354 -- sixteen possible ids and the buffer-valid bit. gt9xx.c:360-400 reads twelve
+// bytes from kGtRegCoords: the vendor's [0..1] are the register address it sent, so a driver that
+// strips them reads the status at [0], the first record at [1], and eight bytes per record after that.
+// A record is id, x low/high, y low/high, size low/high, reserved (:395-397).
+#define kGtMaxTouch         16U
+#define kGtBufferValid      0x80U
+#define kGtPointBytes       8U
+
+struct InputTouchPoint {
+    uint8_t id;
+    uint16_t x;
+    uint16_t y;
+};
+
+struct InputTouchReport {
+    uint32_t valid;          // the buffer-valid bit, so "no data" and "zero fingers" stay apart
+    uint32_t count;          // points decoded, 0 when the buffer is invalid or refused
+    struct InputTouchPoint point[kGtMaxTouch];
+};
+
+static inline void input_goodix_report(const uint8_t *data, uint32_t len, uint32_t max_points,
+                                       struct InputTouchReport *out)
+{
+    uint32_t state;
+    uint32_t count;
+    uint32_t i;
+
+    if (out == 0) {
+        return;
+    }
+    out->valid = 0;
+    out->count = 0;
+    if (data == 0 || len < 1U) {
+        return;
+    }
+    state = data[0];
+    out->valid = (state & kGtBufferValid) ? 1u : 0u;
+    if (!out->valid) {
+        return;
+    }
+    count = state & 0x0fU;
+    if (count > max_points || count > kGtMaxTouch) {
+        return;
+    }
+    if (len < 1U + count * kGtPointBytes) {
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        const uint8_t *record = data + 1U + i * kGtPointBytes;
+
+        out->point[i].id = record[0];
+        out->point[i].x = (uint16_t) (record[1] | ((uint16_t) record[2] << 8));
+        out->point[i].y = (uint16_t) (record[3] | ((uint16_t) record[4] << 8));
+    }
+    out->count = count;
+}
+
+// The vendor clears the buffer by writing a zero byte to the same register (gt9xx.c:365-366), so a
+// report that is read but never cleared is served again -- the reason a host sees one touch as many.
+static inline uint8_t input_goodix_clear_value(void)
+{
+    return 0U;
+}
+
 // edt-ft5x06-mainline.c:846-900: an M06 answers the 0xBB read with a leading response byte, so "EP0"
 // starts at [1]; an M12 starts at [0]. The test the driver makes is on the letter E in either case.
 static inline int input_ft_is_m06(const uint8_t *name, uint32_t len)
