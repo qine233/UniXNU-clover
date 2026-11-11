@@ -617,3 +617,19 @@ clover 的 Adreno 512 **没有 GMU**（`notes/gpu-bringup.md` §5 早已记录�
 
 - sheng 的做法**不适用于** clover；
 - clover 的轨只能由**固件侧**（`uefi-clover` 交接前）或 CPR4 角编程打开。
+
+
+## 9. 下一步实验（已从现有读数缩小到一次写入）
+
+§7 说 CTRL 写被忽略。r294 行本来就把 LDO 的十三个字打上卡了，boot 173/180/181 的都一样：
+除 `w1c=80000038`（PWRSWITCH_CTRL）与 `w24=0000000d`（LDO_STATUS1）外全为 0 —— 于是
+`VREF_TEST_CFG`（w14，偏移 0x9014）里的 `ENABLE_LDO_STATUS_BIT`（BIT8|BIT12）与 `AUTOBYPASS`
+（BIT20）**当前都是 0**。
+
+一次写入实验足以判定：把 `w14` 的 BIT8|BIT12 置位（只写这一个字，不碰 CTRL），回读确认后
+再写一次 CTRL：
+
+- 若 CTRL 这次能写进去（`cfa` 变化）⇒ 「CTRL 被忽略」的原因是状态使能未开，轨可由此路径打开；
+- 若 CTRL 仍不变 ⇒ 被忽略与 w14 无关，回到 RPM/CPR 那条线。
+
+写 w14 是这颗块里唯一还没试过的「使能」位，且 r294 的基线已证明它当前为 0，所以这一次写有明确的前后对照。
