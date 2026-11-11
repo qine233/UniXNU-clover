@@ -596,6 +596,27 @@ clover_gpu_report_chipid(unsigned t)
 // The write phase, run once per boot. It prints its own rows; on any refusal it returns without
 // setting clover_gpu_powered, so the next timer fire retries the whole sequence. The writes are
 // idempotent, so a retry after a partial failure redoes safe work.
+/*
+ * Round393. The microcode the CP needs before ME_INIT can run. scripts/make-clover-gpu-ucode.py emits
+ * both arrays from the device's a530_pfp.fw / a530_pm4.fw; a build that has not run it still links,
+ * because the weak defaults below are empty and the loader says so instead of starting a CP with no
+ * microcode.
+ */
+extern "C" const unsigned char clover_gpu_pfp_blob[] __attribute__((weak));
+extern "C" const unsigned char clover_gpu_pm4_blob[] __attribute__((weak));
+extern "C" const size_t clover_gpu_pfp_size __attribute__((weak));
+extern "C" const size_t clover_gpu_pm4_size __attribute__((weak));
+
+static bool
+clover_gpu_ucode_present (void)
+{
+    /* A weak data symbol that nothing defined has address zero; ask the sizes, not the arrays. */
+    if (&clover_gpu_pfp_size == NULL || &clover_gpu_pm4_size == NULL) {
+        return false;
+    }
+    return clover_gpu_pfp_size > 4 && clover_gpu_pm4_size > 4;
+}
+
 static void
 clover_gpu_power_on(unsigned t)
 {
