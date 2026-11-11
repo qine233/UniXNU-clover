@@ -224,35 +224,38 @@ clover_gpu_ldo_bringup(unsigned t)
         }
         IODelay(10);
     }
-    /* enable_ldo_mode(): BHS under SW, LDO under GDSC, pre-on override, no bypass, LDO source (:325) */
+    /*
+     * Round409. The voltage write took (vref=5, 400 mV) without hanging, so the CTRL sequence is the
+     * half that hung. Each write now prints the step and the word before it, so a boot that stops has
+     * its last row pointing at the exact bit that stopped it.
+     */
     ctl = clover_gpu_read(window, kGpuccLdoCtrl);
-    ctl |= (1U << 0);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    ctl &= ~(1U << 4); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    ctl |= (1U << 7);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    ctl &= ~(1U << 6); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    ctl |= (1U << 9);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    ctl &= ~(1U << 8); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    /* switch_mode_to_ldo(): fake ack, LDO source, BHS both halves, SW control, bypass, power on (:498) */
-    ctl |= (1U << 8);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    ctl |= (1U << 9);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    ctl |= (1U << 1);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    ctl |= (1U << 2);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    ctl |= (1U << 0);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    ctl |= (1U << 4);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    ctl |= (1U << 6);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    ctl &= ~(1U << 5); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
-    /* ldo_update_voltage() again, then power the BHS down and hand the rail to the GDSC (:297) */
-    clover_gpu_write(window, kGpuccLdoVref, base);
-    clover_gpu_write(window, kGpuccLdoVref, base | (1U << 31));
-    clover_gpu_write(window, kGpuccLdoVref, base);
-    for (i = 0; i < 50; i++) {
-        sts = clover_gpu_read(window, kGpuccLdoStatus);
-        if ((sts & ((1U << 2) | (1U << 4))) != 0) {
-            ready = true;
-            break;
-        }
-        IODelay(10);
-    }
+#define CLOVER_LDO_STEP(n, expr) \
+    do { \
+        printf("clover r409: gpu t=%u ctl step=%u before=%08x\n", t, (unsigned) (n), (unsigned) ctl); \
+        expr; \
+        clover_gpu_write(window, kGpuccLdoCtrl, ctl); \
+    } while (0)
+    CLOVER_LDO_STEP(1, ctl |= (1U << 0));
+    CLOVER_LDO_STEP(2, ctl &= ~(1U << 4));
+    CLOVER_LDO_STEP(3, ctl |= (1U << 7));
+    CLOVER_LDO_STEP(4, ctl &= ~(1U << 6));
+    CLOVER_LDO_STEP(5, ctl |= (1U << 9));
+    CLOVER_LDO_STEP(6, ctl &= ~(1U << 8));
+    CLOVER_LDO_STEP(7, ctl |= (1U << 8));
+    CLOVER_LDO_STEP(8, ctl |= (1U << 9));
+    CLOVER_LDO_STEP(9, ctl |= (1U << 1));
+    CLOVER_LDO_STEP(10, ctl |= (1U << 2));
+    CLOVER_LDO_STEP(11, ctl |= (1U << 0));
+    CLOVER_LDO_STEP(12, ctl |= (1U << 4));
+    CLOVER_LDO_STEP(13, ctl |= (1U << 6));
+    CLOVER_LDO_STEP(14, ctl &= ~(1U << 5));
+    CLOVER_LDO_STEP(15, ctl &= ~(1U << 1));
+    CLOVER_LDO_STEP(16, ctl &= ~(1U << 2));
+    CLOVER_LDO_STEP(17, ctl &= ~(1U << 6));
+    CLOVER_LDO_STEP(18, ctl &= ~(1U << 8));
+    CLOVER_LDO_STEP(19, ctl &= ~(1U << 4));
+#undef CLOVER_LDO_STEP
     ctl &= ~(1U << 1); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
     ctl &= ~(1U << 2); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
     for (i = 0; i < 50; i++) {
@@ -792,9 +795,7 @@ clover_gpu_power_on(unsigned t)
          * ran= flag, so a boot that shows ran=0 is this line not running; the sequence itself stays
          * compiled until a boot proves it is not what hangs the bus.
          */
-        if (0) {
-            clover_gpu_ldo_bringup(t);
-        }
+        clover_gpu_ldo_bringup(t);
         bool cx_on = clover_gpu_gdsc_on(clover_gpu_gpucc, kGpuccGdscCx, kGpuccCxHwCtrl, true);
         bool gx_on = clover_gpu_gdsc_on(clover_gpu_gpucc, kGpuccGdscGx, kGpuccGdscGx, false);
         uint32_t cx   = clover_gpu_read(clover_gpu_gpucc, kGpuccGdscCx);

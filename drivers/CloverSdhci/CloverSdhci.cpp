@@ -1155,6 +1155,7 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r389: ", "r389-gpu", 64, 0, 0, 0 },
   { "clover r403: ", "r403-gpu", 64, 0, 0, 0 },
   { "clover r405: ", "r405-gpu", 64, 0, 0, 0 },
+  { "clover r409: ", "r409-gpu", 64, 0, 0, 0 },
   // Round294 widens the rail reading to the whole LDO block, on the same schedule and with its own class
   // for the same reason r291 gave: a boot that printed the three words and not the thirteen says the
   // census was capped, not that the page is silent -- and the census is the baseline the next round's

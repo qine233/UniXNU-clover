@@ -589,3 +589,14 @@ clover r389: gpu t=%u ldo prog uv=400000 val=5 ready=%u vref=%08x ctrl=%08x sts=
 若 `ready=0` 或 `gx_on` 仍 0 ⇒ 序列/角值来源有问题，回到 CPR4 fuse（`0x00784000`）那条线；
 另记「这一靴是否活到 1800 s 死线」——r290 的 rbcpr/rbbmtimer 两票曾与连续早死相关，LDO 写也按同一
 怀疑标准记录。
+
+
+## 7. r408/r409：电压能写、CTRL 不接受 AP 写（2026-11-12 上机）
+
+- **boot 181（只写 VREF）**：`r291 … vref=00000005 val=5 uv=400000 … ran=1 vfa=00000005 cfa=80000038`，
+  板子**自己落回 TWRP**（不挂死）⇒ 电压寄存器可写、写后回读生效；
+- **boot 182（逐位写 CTRL，每步先打 `r409 ctl step=`）**：`cfa=80000038` 与写前**完全相同**，
+  也不挂死 ⇒ **CTRL（PWRSWITCH_CTRL）不接受 AP 写**；
+- 因此「之前整段序列挂死」不是 CTRL 位的问题，而是那一版的顺序/等待；而这颗 GFX 轨的
+  `PDN` 状态由 **CPR/固件侧**持有，AP 翻不动。
+- 下一步只能从固件侧（`uefi-clover` 交接前把 GPU 轨/GX 打开）或 CPR4 角编程（需要新源码）进入。
