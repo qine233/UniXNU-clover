@@ -72,3 +72,18 @@
    然后 `CP_RB_BASE` 等寄存器改用 IOVA；
 4. IRQ：GIC_SPI 329（global）/330（context）/331（secure），先只要 330；
 5. 验收：CP 启动时 `CP_RB_RPTR` 前进且 SMMU 无 fault（`SMMU_CB_FSR` 读 0），再把地址从物理换成 IOVA。
+
+
+### SMMU 的具体接入点（`ArmSmmu4K` 的 API 已核对）
+
+kit 把「建表」和「编上下文寄存器」都做成了纯函数，正好是我们缺的两块：
+
+1. `ArmSmmu4KBuild()`（`ArmSmmu4K.h`）→ 建 4K 叶子页表，返回 `ArmSmmu4KResult`（含 `mair`、`start_level`）；
+2. `ArmSmmu4KEncodeContext()`（`ArmSmmu4KContext.h`）→ 把 `ArmSmmu4KContextConfig`（lower/upper 表 +
+   `id0/id2` + `asid` + `coherent_walk` + `stall_on_fault`）+ `ArmSmmu4KContextImage`
+   （`cbar/cba2r/tcr/tcr2/mair0/1/sctlr/ttbr0/1`）编成寄存器值；
+3. `ArmSmmu4KBindMmio()` + `ArmSmmu4KProgram*` 负责真正写 bank（含 poll budget）；
+4. `ArmSmmu4KCompareContext` 可把读出与期望逐字段比对——**上机验收**就用它。
+
+接入顺序：`[components].include` 加 `ArmSmmu4K` → 页表池（连续 4K）→ `Build` → `EncodeContext`
+→ `Program`；然后 `CP_RB_BASE` 等改用 IOVA。验收判据仍是「`CP_RB_RPTR` 前进且 `CB_FSR` 为 0」。
