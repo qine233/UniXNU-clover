@@ -318,6 +318,32 @@ main (void)
             "zero words read has its own shape: a report of 'as expected' produced from nothing is how "
             "a capped row would accuse a page that was never read");
 
+    // -----------------------------------------------------------------------
+    // 14. The flashables: firmware blob shape and PM4 headers.
+    // -----------------------------------------------------------------------
+    {
+        const uint8_t blob[12] = {0x11,0x22,0x33,0x44, 0xef,0xbe,0xad,0xde, 0x01,0x00,0x00,0x00};
+        GpuFwBlob fw;
+        expect (gpu_fw_parse (blob, sizeof (blob), &fw),
+                "a 12-byte blob with four skipped bytes parses");
+        expect (fw.version == 0xdeadbeefU && fw.bytes == 8 && fw.words == 2,
+                "the version is the first word after the skipped date word, like _load_firmware()'s "
+                "*(unsigned int *)&fw->data[4]");
+        expect (!gpu_fw_parse (blob, 4, &fw), "four bytes is only the skipped word: not a blob");
+        expect (!gpu_fw_parse (blob, 6, &fw), "a size that is not whole words is not a blob");
+        expect (!gpu_fw_parse (nullptr, 12, &fw), "no data is not a blob");
+        expect (gpu_pm4_parity (0U) == 1U, "odd parity of zero is one, the vendor table's own value");
+        expect (gpu_pm4_type4 (0U, 0U) == 0x48000080U,
+                "type4 with opcode 0 and count 0 is 4<<28 plus both parity bits");
+        expect (gpu_pm4_type7 (0U, 0U) == 0x70808000U,
+                "type7 with opcode 0 and count 0 is 7<<28 plus both parity bits");
+        expect (kGpuType4MaxPayload == 127U,
+                "TYPE4_MAX_PAYLOAD is PM4_TYPE4_PKT_SIZE_MAX (128) minus the header word");
+        expect (gpu_fw_packet_count (0U) == 0U && gpu_fw_packet_count (127U) == 1U &&
+                gpu_fw_packet_count (128U) == 2U,
+                "a payload split at the type4 limit: 128 words take two packets");
+    }
+
     if (checks != 0) {
         printf ("FAIL: %d GPU core assertions did not hold\n", checks);
         return 1;

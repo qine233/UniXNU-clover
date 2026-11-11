@@ -525,6 +525,77 @@ gpu_ahb_gate_open (uint32_t ahb_word)
 }
 
 // ---------------------------------------------------------------------------
+// The a5xx flashables: the firmware blob's shape and the PM4 packet headers
+// ---------------------------------------------------------------------------
+
+// `_load_firmware()` (adreno_a5xx.c:2045) skips the blob's first four bytes, copies the rest as the
+// ucode, and takes the version from the first copied word. The file is a request_firmware blob whose
+// leading word is the firmware's date/format word, not part of the microcode. A size that is not a
+// whole number of words, or has nothing after the skipped word, is not a blob and must not be read as
+// one -- the driver would otherwise hand the CP a truncated stream.
+struct GpuFwBlob {
+    uint32_t version;
+    const uint8_t *ucode;
+    size_t bytes;
+    uint32_t words;
+};
+
+static inline uint32_t
+gpu_le32 (const uint8_t *p)
+{
+    return static_cast<uint32_t> (p[0]) | (static_cast<uint32_t> (p[1]) << 8) |
+        (static_cast<uint32_t> (p[2]) << 16) | (static_cast<uint32_t> (p[3]) << 24);
+}
+
+static inline bool
+gpu_fw_parse (const uint8_t *data, size_t size, GpuFwBlob *out)
+{
+    if (data == nullptr || out == nullptr || size <= 4 || (size & 3) != 0) {
+        return false;
+    }
+    out->ucode = data + 4;
+    out->bytes = size - 4;
+    out->words = static_cast<uint32_t> (out->bytes / 4);
+    out->version = gpu_le32 (data + 4);
+    return out->words != 0;
+}
+
+// `pm4_calc_odd_parity_bit()` (adreno_pm4types.h:155) and the two header builders (:178, :186). The
+// parity bit is inside the header, so a header whose count and opcode parities are wrong is a packet
+// the CP rejects -- there is no recovering it at submit time.
+static inline uint32_t
+gpu_pm4_parity (uint32_t val)
+{
+    return (0x9669U >> (0xfU & (val ^ (val >> 4) ^ (val >> 8) ^ (val >> 12) ^
+        (val >> 16) ^ (val >> 20) ^ (val >> 24) ^ (val >> 28)))) & 1U;
+}
+
+static inline uint32_t
+gpu_pm4_type4 (uint32_t opcode, uint32_t count)
+{
+    return (4U << 28) | (count & 0x7ffU) | (gpu_pm4_parity (count) << 7) |
+        ((opcode & 0x3ffffU) << 8) | (gpu_pm4_parity (opcode) << 27);
+}
+
+static inline uint32_t
+gpu_pm4_type7 (uint32_t opcode, uint32_t count)
+{
+    return (7U << 28) | (count & 0x3fffU) | (gpu_pm4_parity (count) << 15) |
+        ((opcode & 0x7fU) << 16) | (gpu_pm4_parity (opcode) << 23);
+}
+
+// The type4 payload limit (`TYPE4_MAX_PAYLOAD`, adreno_a5xx.c:613): max packet size minus the header
+// word. A firmware load larger than this has to be split, and the split count is what the driver's
+// command buffer sizes itself from.
+static const uint32_t kGpuType4MaxPayload = 127;
+
+static inline uint32_t
+gpu_fw_packet_count (uint32_t words)
+{
+    return words == 0 ? 0 : (words + kGpuType4MaxPayload - 1) / kGpuType4MaxPayload;
+}
+
+// ---------------------------------------------------------------------------
 // The chipid gate: which refusal a row has to name
 // ---------------------------------------------------------------------------
 
