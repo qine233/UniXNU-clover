@@ -87,3 +87,23 @@ kit 把「建表」和「编上下文寄存器」都做成了纯函数，正好�
 
 接入顺序：`[components].include` 加 `ArmSmmu4K` → 页表池（连续 4K）→ `Build` → `EncodeContext`
 → `Program`；然后 `CP_RB_BASE` 等改用 IOVA。验收判据仍是「`CP_RB_RPTR` 前进且 `CB_FSR` 为 0」。
+
+
+## 与官方 GPU 文档对照（unixnu.com/zh/porting/gpu，2026-11-12）
+
+官方页**通篇只讲 Adreno740**，运行路径是
+`Metal → AdrenoMetal → metal2vulkan → Turnip → Darwin KMD → Adreno740 → A740`，并明确写：
+
+> 其他 GPU 代际需要先实现**对应内核后端和编译器支持**，再选择前端。
+
+对 clover（Adreno 512，a5xx）逐项核对：
+
+| 官方步骤 | clover 的对应 | 结论 |
+| --- | --- | --- |
+| 1. 匹配代际与 OS ABI | A740 接口；a5xx 无此接口 | **不匹配** |
+| 2. 电源与固件（GMU） | a5xx 无 GMU，靠 CPR/LDO；实测 CTRL 不可写 | **无对应物**（§7–§10 已测） |
+| 3. 内存与提交（SMMU/ring/fence） | CloverGpu 已有 CP ring/ME_INIT/SMMU 识别，但缺轨 | 卡在轨 |
+| 4. 构建 Metal（Turnip/AdrenoMetal） | Turnip 是 a6xx+；无 a5xx Vulkan 后端，更无 a5xx Metal 前端 | **不存在** |
+
+结论：**官方 GPU/Metal 路径在 clover 上不可用**——它假设 GMU 与 A740 编译器栈。a5xx 既没有
+GMU（轨开不了），也没有 Turnip/AdrenoMetal 前端。要桌面，只能回到显示/合成器那条线。
