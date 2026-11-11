@@ -30654,3 +30654,24 @@ backboardd/SpringBoard 为什么不再提交 swap（r238 的锁等待、lsd 队�
     在往 GOP 帧缓冲上写；
 - 判读：屏幕上是「引导日志/进度」而不是桌面；合成器停摆的链条仍是 SpringBoard→lsd（ql=6 未排空）
   与 backboardd 的锁等待。
+
+
+## Round384 —— 把 Busy 改回 Success：客户端不再退避，但帧仍不呈现（卡在 retireSwap）
+
+**改动（probe）。** `wrappedExternal` 里 selector 6 若返回 `kIOReturnBusy`，改回 `kIOReturnSuccess`
+（计数 `s6f=` 进 `dispstate`）。payload `7ec4269a…`。
+
+**读数（boot 168，r384 镜像）：**
+```
+dispstate ms=1275081 … calls=414 fails=15 hot=6:197/0/00000000 s6f=98  last=0@479s fc=63
+dispstate ms=1793136 … calls=966 fails=15 hot=6:473/0/00000000 s6f=236 last=0@997s fc=ed
+```
+- selector 6 的失败数从 `~half` 变成 **0**（`fails` 不再随调用增长），`s6f` 到 236 ⇒ **客户端不再把 Busy
+  当退避，调用数从 363 涨到 966**；
+- 但 `last`（最后一次真正呈现）只到 997 s，`fc` 到 0xed=237 后不再涨；
+- `kick#… rq=1 va=1` 依旧（pending 请求有效、四门全开），**surface-miss/scanout FAILED/retire# 都是 0 行**
+  ⇒ 卡点在 `finishTransfer` 的 `retireSwap()` 失败（它失败时是静默 return，不经过 `frame_presented`）。
+
+**判读。** 「Busy 让客户端退避」被排除；真正的堵点是**退休那一步**（`retireSwap` 对 pending 请求失败）。
+下一支：在 `finishTransfer` 的 `retireSwap` 失败分支打一行（带请求指针/家族队列状态），并把
+「Busy 时先 kick 再退休」做成可测的改法。

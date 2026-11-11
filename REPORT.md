@@ -16,6 +16,14 @@
 
 ## 逐轮报告（倒序）
 
+### r384 — Busy→Success：客户端不再退避，但退休这一步仍失败
+
+- **改动**：selector 6 的 `kIOReturnBusy` 在 wrapper 里改回 success（`s6f=` 计数）。payload `7ec4269a…`。
+- **读数（boot 168）**：`hot=6:473/0/00000000`（selector 6 失败=0）、`s6f=236`、调用数 363→966、
+  `last=0@997s`、`fc=0xed`；`kick#… rq=1 va=1` 依旧，`surface-miss/scanout FAILED/retire#` 全 0 行。
+- **判读**：客户端退避被排除；堵点在 `finishTransfer` 的 `retireSwap()` 失败（静默 return）。
+  下一支：给 retireSwap 失败分支加行，并试「Busy 时先 kick 再退休」。
+
 ### r382/r383 — 没有卡住的 swap；屏幕采样器显示画面被内核控制台占据
 
 - **改动**：r382 加 `s6if=`（selector 6 进−出）；r383 驱动状态拍采样 GOP 帧缓冲（4096 点），

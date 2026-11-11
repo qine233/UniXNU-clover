@@ -73,6 +73,8 @@ extern "C" volatile uint32_t native_legacy_screen_nonblack,native_legacy_screen_
 extern "C" volatile uint64_t native_legacy_screen_hash;
 /* Selector 6 entries minus returns: a positive value is a swap still inside the call. */
 static volatile uint32_t sel6Enter,sel6Exit;
+/* Selector 6 answers kIOReturnBusy that were returned to the client as success. */
+static volatile uint32_t sel6Forced;
 enum {kCloverLogBudget=96};
 static void cloverLog(const char *format,...) __attribute__((format(printf,1,2)));
 static void cloverLog(const char *format,...) {
@@ -567,6 +569,11 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
     if(selector==6)sel6Enter=sel6Enter+1;
     IOReturn status=stat?reinterpret_cast<ExternalFn>(stat->original_external)(client,selector,arguments,dispatch,target,reference):kIOReturnNotAttached;
     if(selector==6)sel6Exit=sel6Exit+1;
+    /*
+     * A busy swap is a retryable answer the compositor may treat as a backoff. Hand it success instead
+     * so the loop keeps submitting, and count the substitutions so the row says how many were made.
+     */
+    if(selector==6 && status==kIOReturnBusy) { sel6Forced=sel6Forced+1; status=kIOReturnSuccess; }
     if(stat) {
         if(selector==6 && arguments && arguments->scalarInput && arguments->scalarInputCount>=3) {
             const uint64_t *in=arguments->scalarInput;
@@ -851,10 +858,10 @@ static void reportDisplayState(void) {
     const uint64_t now=probeNowUs();
     int length=snprintf(row,sizeof row,
         "clover r344: dispstate ms=%llu fires=%u seen=%u client=%s pick=%s grewn=%s p58=%s calls=%s fails=%s "
-        "last=%s s6if=%u scr=%u/%u/%llx "
+        "last=%s s6if=%u s6f=%u scr=%u/%u/%llx "
         "regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\n",
         (unsigned long long)(now/1000),dispstateFires,seenClientCount,client,pick,grewnTxt,p58Txt,
-        callsTxt,failsTxt,lastTxt,(unsigned)(sel6Enter-sel6Exit),(unsigned)native_legacy_screen_nonblack,
+        callsTxt,failsTxt,lastTxt,(unsigned)(sel6Enter-sel6Exit),(unsigned)sel6Forced,(unsigned)native_legacy_screen_nonblack,
         (unsigned)native_legacy_screen_sampled,(unsigned long long)native_legacy_screen_hash,regallTxt,regsTxt,grewTxt,hotTxt,s6Txt,latchTxt,copyTxt,fcTxt,
         vsyncHz,(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[1],
         (unsigned)cloverLogLines,(unsigned)kCloverLogBudget,(unsigned)cloverLogDropped);
