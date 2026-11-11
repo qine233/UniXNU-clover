@@ -646,6 +646,35 @@ gpu_ring_advance (uint32_t wptr, uint32_t words)
 }
 
 // ---------------------------------------------------------------------------
+// The end-of-pipeline timestamp: the fence a submission retires on
+// ---------------------------------------------------------------------------
+
+// `CACHE_FLUSH_TS` is 4 (a3xx_reg.h:37) and the packet is `cp_mem_packet(CP_EVENT_WRITE, 3, 1)` --
+// type7 with count 3+1 (adreno_ringbuffer.c:704): the event word, the 64-bit destination address, then
+// the timestamp. Before the ring starts, the dirty bit (bit 31) is the vendor's way of saying the
+// written timestamp must be visible to the CPU; it is passed in rather than assumed.
+static const uint32_t kGpuCacheFlushTs = 4U;
+
+struct GpuTsPacket {
+    uint32_t words[5];
+    uint32_t count;
+};
+
+static inline GpuTsPacket
+gpu_eop_timestamp (uint64_t addr, uint32_t timestamp, bool dirty)
+{
+    GpuTsPacket out;
+
+    out.count = 5U;
+    out.words[0] = gpu_pm4_type7 (0x46U, 4U);   /* CP_EVENT_WRITE, four payload words */
+    out.words[1] = kGpuCacheFlushTs | (dirty ? (1U << 31) : 0U);
+    out.words[2] = static_cast<uint32_t> (addr & 0xffffffffU);
+    out.words[3] = static_cast<uint32_t> (addr >> 32);
+    out.words[4] = timestamp;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Ring allocation: where the next command stream goes
 // ---------------------------------------------------------------------------
 

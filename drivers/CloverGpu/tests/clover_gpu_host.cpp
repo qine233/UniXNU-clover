@@ -319,6 +319,26 @@ main (void)
             "a capped row would accuse a page that was never read");
 
     // -----------------------------------------------------------------------
+    // 18. The end-of-pipeline timestamp packet.
+    // -----------------------------------------------------------------------
+    {
+        GpuTsPacket ts = gpu_eop_timestamp (0x1122334455667788ULL, 0x2aU, true);
+        expect (ts.count == 5U, "the timestamp packet is five dwords");
+        expect ((ts.words[0] & 0xF0000000U) == 0x70000000U && ((ts.words[0] >> 16) & 0x7FU) == 0x46U,
+                "type7 header with CP_EVENT_WRITE");
+        expect ((ts.words[0] & 0x3FFFU) == 4U, "the header's count is the four payload words");
+        expect ((ts.words[1] & 0x7FFFFFFFU) == 4U,
+                "the event word is CACHE_FLUSH_TS, with the dirty bit clear in the low bits");
+        expect (ts.words[1] == (4U | (1U << 31)) && ts.words[1] != 4U,
+                "the dirty bit is bit 31 and the test turns it on rather than assuming it");
+        expect (ts.words[2] == 0x55667788U && ts.words[3] == 0x11223344U,
+                "the 64-bit address is split low then high");
+        expect (ts.words[4] == 0x2aU, "the timestamp is the last payload word");
+        GpuTsPacket clean = gpu_eop_timestamp (0, 1, false);
+        expect (clean.words[1] == 4U, "without the dirty bit the event word is just CACHE_FLUSH_TS");
+    }
+
+    // -----------------------------------------------------------------------
     // 17. Ring allocation: the vendor's tail/head/full rules.
     // -----------------------------------------------------------------------
     {
