@@ -288,6 +288,7 @@ public:
     // boot 113, the only window on disk with swap/retire rows, is serialized, so it can neither confirm the lag nor name its cause.
     // A retirement inside a kick only asks the running kick to loop.
     unsigned kickSeen=0;
+    unsigned retireMiss=0;
     unsigned surfaceMiss=0;
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
@@ -480,7 +481,21 @@ public:
         PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));
         PE_parse_boot_argn("offline-legacy-cpu-present",&cpuPresent,sizeof(cpuPresent));
         if(!(retire==1 || cpuPresent==1 || force))return false;
-        if(!activateOnlyPendingSwap(request))return false;
+        if(!activateOnlyPendingSwap(request)) {
+            /*
+             * Three shapes, one silent return: the family has no pending head (1), the head is this very
+             * request yet it refuses to activate it (2), or a different request is the head (3). The
+             * cached validation is dropped so the next request can be accepted instead of the kick
+             * looping on a request the family no longer owns.
+             */
+            const OriginalLegacySwapRequest *head=pendingSwapRequest();
+            unsigned why=(head==nullptr)?1U:((head==request)?2U:3U);
+            if((retireMiss++ % 64)==0)
+                IOLog("clover r386: retire-miss #%u why=%u req=%llx head=%llx\n",retireMiss,why,
+                    (unsigned long long)(uintptr_t)request,(unsigned long long)(uintptr_t)head);
+            removeValidated(request);
+            return false;
+        }
         removeValidated(request);
         IOMobileFramebufferLegacy::completeCurrentSwap();
         native_legacy_retirement_observed(this);

@@ -30696,3 +30696,22 @@ dispstate ms=1791660 … calls=890 last=0@966s tx=218@966s s6f=217 fc=da
 **判读。** 这是家族队列状态与我们缓存请求之间的错位。下一支：把 `activateOnlyPendingSwap` 失败的
 返回分成「请求不是头 / 家族没有 pending / 家族已退休」三种情况各打一行，再决定是丢缓存请求重试，
 还是直接对家族真正的 pending 头做 force-retire。
+
+
+## Round386 —— 拆分退休失败＋丢弃陈旧校验：帧流延长到 1179 s，但仍会停
+
+**改动（driver）。** `retireSwap` 里 `activateOnlyPendingSwap` 失败时：按三种形态打 `retire-miss`
+（why=1 无 pending、2 头即本请求仍拒、3 另一个头），并 `removeValidated(request)` 丢弃陈旧校验。
+payload `4e86e41a…`。
+
+**读数（boot 170）：**
+```
+dispstate ms=1795261 … calls=1155 fails=15 last=0@1179s tx=284@1179s s6f=283 fc=11c
+```
+- `tx`/`last` 一起停在 284@**1179 s**（上一靴是 966 s，再上一靴 296 s）——停摆时刻逐靴变长，
+  说明这是**累积/竞态**，不是固定阈值；
+- 客户端仍在调用（1155 次、selector 6 失败 0、`s6f=283`）。
+
+**判读。** 丢弃陈旧校验只让帧流多跑了 ~200 s，没解掉根因：家族的 pending 头被 `activate` 拒绝后，
+它自己也不会再被 kick 转移（我们已把校验丢掉），于是队列永久占住、每次新 swap 都回 Busy。
+下一支：在 `activate` 失败时尝试直接 `completeCurrentSwap()`（不 activate）把队列强行排空，看帧流是否恢复。
