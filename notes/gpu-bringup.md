@@ -650,3 +650,14 @@ r410 只加了一次写：`VREF_TEST_CFG` 的 BIT8|BIT12。这一靴**又挂死*
 
 1. 固件侧（ABL/RPM）在交接前把 GPU 轨打开——需要新增 SPMI/RPM 客户端，属独立工程；
 2. 或者接受 a5xx 在这颗板上没有可用的轨控制，GPU 线到此为止，桌面回到显示/合成器那条线。
+
+
+## 11. 固件侧其实有 SPMI/PMIC 驱动（2026-11-12，读 mu-clover）
+
+`~/mu-clover/Binaries/clover/QcomPkg/Drivers/` 里有 **`SPMIDxe.efi`** 与 **`PmicDxeLa.efi`**
+（Qualcomm 预编译），所以在 UEFI 运行时**已经存在 SPMI 与 PMIC 的访问能力**——上一轮说的「没有 SPMI/RPM 客户端」
+要更正为「有 SPMI/PMIC 驱动，但缺 RPM/CPR 那条请求通道」。
+
+这给出更窄的下一步：先确认这两颗预编译驱动是否被 `clover.fdf`/`clover.dsc` 包含并运行；若在跑，
+UEFI 侧可以用 PMIC 路径核对 S3/S5 的状态；GPU 的 `vdd_gfx` 仍走 CPR4（MMIO `0x05061000`），
+而 CPR4 的角编程才是那块真正的开关。
