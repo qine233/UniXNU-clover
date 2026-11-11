@@ -666,3 +666,11 @@ UEFI 侧可以用 PMIC 路径核对 S3/S5 的状态；GPU 的 `vdd_gfx` 仍走 C
 **fdf 检查（同日）**：`clover.fdf:91` 用 `!include QcomPkg/Extra.fdf.inc` 引入 Qualcomm 的驱动清单，
 `SPMIDxe`/`PmicDxe` 属于 `Binaries/clover/QcomPkg/Drivers/` 那一套预编译。所以固件侧下一步是：
 在 `Extra.fdf.inc`（或该 include 展开后的清单）里确认这两个驱动的包含与顺序，再谈 CPR4。
+
+
+**更正（同日，读 DeviceBuild.py）**：`Binaries/clover/QcomPkg/Drivers/` 属于 **xbl 分区**（厂商 bootloader），
+不是 Mu-Silicium 的 UEFI FV（`DeviceBuild.py:62` 的注释写明）。所以我们构建的 UEFI **没有** SPMIDxe/PmicDxe——
+它们只存在于被替换掉的厂商 XBL 里。
+
+要让固件侧拿到 SPMI/PMIC，只有一条：把这两个预编译 DXE（同 SoC、同 EFI 格式）作为 binary module
+加进我们的 FV，并确认它们能在 Mu 的 DXE 环境里加载；之后才谈 PMIC 读或 CPR4。
