@@ -646,6 +646,56 @@ gpu_ring_advance (uint32_t wptr, uint32_t words)
 }
 
 // ---------------------------------------------------------------------------
+// ME_INIT: the nine dwords the CP is started with
+// ---------------------------------------------------------------------------
+
+// The mask is `CP_INIT_MASK` (adreno_a5xx.c:1894): max-context, error detection, header dump, default
+// reset state and ucode workarounds, i.e. BIT(0)|BIT(1)|BIT(2)|BIT(3)|BIT(5) = 0x2F.
+static const uint32_t kGpuCpInitMask = 0x2FU;
+
+// `_set_ordinals()` (adreno_a5xx.c:1899) writes the mask and then one field per set bit, in bit order.
+// a512 is not in `_me_init_ucode_workarounds()`'s list (:1853), so its workaround word is the default
+// zero; the caller passes it so the A530-shaped value (0x0B) is testable beside it.
+static inline void
+gpu_me_init_dwords (uint32_t workaround, uint32_t out[8])
+{
+    unsigned at = 0;
+
+    out[at++] = kGpuCpInitMask;                 /* enabled ordinal mask */
+    if ((kGpuCpInitMask & (1U << 0)) != 0) {    /* MAX_CONTEXT */
+        out[at++] = 0x00000003U;
+    }
+    if ((kGpuCpInitMask & (1U << 1)) != 0) {    /* ERROR_DETECTION_CONTROL */
+        out[at++] = 0x20000000U;
+    }
+    if ((kGpuCpInitMask & (1U << 2)) != 0) {    /* HEADER_DUMP: address, then enable/size */
+        out[at++] = 0x00000000U;
+        out[at++] = 0x00000000U;
+    }
+    if ((kGpuCpInitMask & (1U << 4)) != 0) {    /* DRAWCALL_FILTER_RANGE: start, then end */
+        out[at++] = 0x00000000U;
+        out[at++] = 0x00000000U;
+    }
+    if ((kGpuCpInitMask & (1U << 5)) != 0) {    /* UCODE_WORKAROUND_MASK */
+        out[at++] = workaround;
+    }
+    while (at < 8U) {                           /* `_set_ordinals` pads with zeros */
+        out[at++] = 0U;
+    }
+}
+
+// `a5xx_send_me_init()` (adreno_a5xx.c:1969) allocates nine dwords: the CP_ME_INIT type7 header with
+// count 8, then the eight payload words. This is the whole startup packet -- no other writes are part
+// of it, and a header whose count disagrees with the payload size is a CP that reads the next command
+// as payload.
+static inline void
+gpu_me_init_packets (uint32_t workaround, uint32_t out[9])
+{
+    out[0] = gpu_pm4_type7 (0x48U, 8U);         /* CP_ME_INIT (adreno_pm4types.h:26) */
+    gpu_me_init_dwords (workaround, out + 1);
+}
+
+// ---------------------------------------------------------------------------
 // The chipid gate: which refusal a row has to name
 // ---------------------------------------------------------------------------
 

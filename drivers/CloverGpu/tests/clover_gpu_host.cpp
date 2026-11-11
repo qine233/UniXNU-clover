@@ -319,6 +319,29 @@ main (void)
             "a capped row would accuse a page that was never read");
 
     // -----------------------------------------------------------------------
+    // 16. ME_INIT: the nine startup dwords.
+    // -----------------------------------------------------------------------
+    {
+        uint32_t packets[9] = {0};
+        gpu_me_init_packets (0U, packets);      /* a512: the default workaround word */
+        expect ((packets[0] & 0xF0000000U) == 0x70000000U, "ME_INIT starts with a type7 header");
+        expect (((packets[0] >> 16) & 0x7FU) == 0x48U, "the opcode is CP_ME_INIT's 0x48");
+        expect ((packets[0] & 0x3FFFU) == 8U, "the header's count is the eight payload words");
+        expect (packets[1] == 0x2FU,
+                "the mask is 0x2F: max-context, error detection, header dump, default reset state and "
+                "ucode workarounds");
+        expect (packets[2] == 0x00000003U, "MAX_CONTEXT writes three");
+        expect (packets[3] == 0x20000000U, "ERROR_DETECTION_CONTROL writes the protected-mode word");
+        expect (packets[4] == 0U && packets[5] == 0U, "HEADER_DUMP writes address and enable/size as zero");
+        expect (packets[6] == 0U, "a512's ucode workaround word is the default zero");
+        expect (packets[7] == 0U && packets[8] == 0U, "the rest of the eight words is padded with zeros");
+        uint32_t a530[9] = {0};
+        gpu_me_init_packets (0x0BU, a530);
+        expect (a530[6] == 0x0BU && a530[8] == 0U,
+                "the A530-shaped workaround lands in the same word, not shifted by its value");
+    }
+
+    // -----------------------------------------------------------------------
     // 15. The CP ring: geometry and the control word.
     // -----------------------------------------------------------------------
     {
