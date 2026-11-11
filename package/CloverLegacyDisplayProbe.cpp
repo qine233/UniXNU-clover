@@ -75,6 +75,8 @@ extern "C" volatile uint64_t native_legacy_screen_hash;
 static volatile uint32_t sel6Enter,sel6Exit;
 /* Selector 6 answers kIOReturnBusy that were returned to the client as success. */
 static volatile uint32_t sel6Forced;
+/* Successful scanout transfers and the time of the last one. */
+static volatile uint32_t transferOkCount,transferOkTime;
 enum {kCloverLogBudget=96};
 static void cloverLog(const char *format,...) __attribute__((format(printf,1,2)));
 static void cloverLog(const char *format,...) {
@@ -329,6 +331,13 @@ void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes) {
 }
 void native_legacy_transfer_observed(IOReturn status,const void *request,uint64_t bytes) {
     native_legacy_transfer_calls=native_legacy_transfer_calls+1;
+    if(status==kIOReturnSuccess) {
+        uint64_t now,frequency;
+        __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(now));__asm__ volatile("mrs %0, cntfrq_el0":"=r"(frequency));
+        if(!frameEpoch)frameEpoch=now;
+        transferOkCount=transferOkCount+1;
+        transferOkTime=frequency?(uint32_t)((now-frameEpoch)/frequency):0;
+    }
     if(status==kIOReturnSuccess)native_legacy_swap_stage(2);
     native_legacy_transfer_status=status;native_legacy_transfer_request=(uintptr_t)request;native_legacy_transfer_bytes=bytes;
     if(status==kIOReturnSuccess) {
@@ -858,10 +867,10 @@ static void reportDisplayState(void) {
     const uint64_t now=probeNowUs();
     int length=snprintf(row,sizeof row,
         "clover r344: dispstate ms=%llu fires=%u seen=%u client=%s pick=%s grewn=%s p58=%s calls=%s fails=%s "
-        "last=%s s6if=%u s6f=%u scr=%u/%u/%llx "
+        "last=%s tx=%u@%us s6if=%u s6f=%u scr=%u/%u/%llx "
         "regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\n",
         (unsigned long long)(now/1000),dispstateFires,seenClientCount,client,pick,grewnTxt,p58Txt,
-        callsTxt,failsTxt,lastTxt,(unsigned)(sel6Enter-sel6Exit),(unsigned)sel6Forced,(unsigned)native_legacy_screen_nonblack,
+        callsTxt,failsTxt,lastTxt,(unsigned)transferOkCount,(unsigned)transferOkTime,(unsigned)(sel6Enter-sel6Exit),(unsigned)sel6Forced,(unsigned)native_legacy_screen_nonblack,
         (unsigned)native_legacy_screen_sampled,(unsigned long long)native_legacy_screen_hash,regallTxt,regsTxt,grewTxt,hotTxt,s6Txt,latchTxt,copyTxt,fcTxt,
         vsyncHz,(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[1],
         (unsigned)cloverLogLines,(unsigned)kCloverLogBudget,(unsigned)cloverLogDropped);

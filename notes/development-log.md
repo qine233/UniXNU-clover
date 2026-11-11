@@ -30675,3 +30675,24 @@ dispstate ms=1793136 … calls=966 fails=15 hot=6:473/0/00000000 s6f=236 last=0@
 **判读。** 「Busy 让客户端退避」被排除；真正的堵点是**退休那一步**（`retireSwap` 对 pending 请求失败）。
 下一支：在 `finishTransfer` 的 `retireSwap` 失败分支打一行（带请求指针/家族队列状态），并把
 「Busy 时先 kick 再退休」做成可测的改法。
+
+
+## Round385 —— 拷贝与退休同时停在 966 s：客户端还在调，但转移一次都没完成
+
+**改动（probe）。** `native_legacy_transfer_observed` 成功时记录计数与时间，`dispstate` 加 `tx=<次>@<t>s`。
+payload `7f236395…`。
+
+**读数（boot 169，r385 镜像）：**
+```
+dispstate ms=1151318 … calls=146 last=0@296s tx=32@296s s6f=31  fc=20
+dispstate ms=1758240 … calls=802 last=0@933s tx=196@933s s6f=195 fc=c4
+dispstate ms=1791660 … calls=890 last=0@966s tx=218@966s s6f=217 fc=da
+```
+- **`tx`（成功拷贝）与 `fc`/`last`（成功退休）同步停在 218@966 s**；
+- 客户端仍在调用（890 次）、selector 6 失败 0、`s6f=217`；
+- `kick#… rq=1 va=1` 依旧 ⇒ **kick 有请求、校验过，但转移一次都没完成**：卡在
+  `retireSwap → activateOnlyPendingSwap(request)` 失败（家族认为该请求不是可激活的 pending 头）。
+
+**判读。** 这是家族队列状态与我们缓存请求之间的错位。下一支：把 `activateOnlyPendingSwap` 失败的
+返回分成「请求不是头 / 家族没有 pending / 家族已退休」三种情况各打一行，再决定是丢缓存请求重试，
+还是直接对家族真正的 pending 头做 force-retire。
