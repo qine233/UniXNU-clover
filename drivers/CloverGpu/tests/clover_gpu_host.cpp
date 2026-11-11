@@ -319,6 +319,38 @@ main (void)
             "a capped row would accuse a page that was never read");
 
     // -----------------------------------------------------------------------
+    // 17. Ring allocation: the vendor's tail/head/full rules.
+    // -----------------------------------------------------------------------
+    {
+        GpuRingAllocResult r = gpu_ring_alloc (0U, 0U, 9U);
+        expect (r.kind == GPU_RING_ALLOC_OK && r.offset == 0U && r.new_wptr == 9U,
+                "nine dwords at an empty ring start at zero and leave wptr at nine");
+        r = gpu_ring_alloc (kGpuRingDwords - 4U, 100U, 9U);
+        expect (r.kind == GPU_RING_ALLOC_WRAP && r.offset == 0U && r.new_wptr == 9U &&
+                r.nop_words == 3U,
+                "a tail that cannot hold nine dwords gets a three-word NOP filler and a wrap to the "
+                "head, which only happens when the head is behind the write pointer");
+        r = gpu_ring_alloc (100U, 0U, 9U);
+        expect (r.kind == GPU_RING_ALLOC_OK && r.offset == 100U,
+                "a tail that can hold them allocates in place");
+        r = gpu_ring_alloc (0U, 10U, 9U);
+        expect (r.kind == GPU_RING_ALLOC_OK && r.offset == 0U && r.new_wptr == 9U,
+                "with the reader ahead of the writer, nine dwords fit at the head");
+        r = gpu_ring_alloc (kGpuRingDwords - 4U, 5U, 9U);
+        expect (r.kind == GPU_RING_ALLOC_FULL,
+                "the tail cannot hold it and the head is inside the request: the allocator refuses "
+                "rather than overwrite the reader");
+        r = gpu_ring_alloc (0U, 0U, 0U);
+        expect (r.kind == GPU_RING_ALLOC_FULL, "zero dwords is not an allocation");
+        r = gpu_ring_alloc (0U, 0U, kGpuRingDwords);
+        expect (r.kind == GPU_RING_ALLOC_FULL, "a ring-sized request cannot be placed at all");
+        expect (gpu_ring_submit_done (9U, 9U) && !gpu_ring_submit_done (9U, 8U),
+                "a submission is done only when the read pointer equals the write pointer");
+        expect (gpu_ring_submit_done (0U, kGpuRingDwords - 1U) == false,
+                "a wrapped pair is not equal and so is not done");
+    }
+
+    // -----------------------------------------------------------------------
     // 16. ME_INIT: the nine startup dwords.
     // -----------------------------------------------------------------------
     {

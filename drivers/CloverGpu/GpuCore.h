@@ -646,6 +646,68 @@ gpu_ring_advance (uint32_t wptr, uint32_t words)
 }
 
 // ---------------------------------------------------------------------------
+// Ring allocation: where the next command stream goes
+// ---------------------------------------------------------------------------
+
+// `adreno_ringbuffer_allocspace()` (adreno_ringbuffer.c:207). The vendor's rules, in its own order:
+// enough room toward the end (leaving two dwords); otherwise, if the tail cannot hold it, a CP_NOP
+// filler and a wrap to zero when the head has room; otherwise no space. The two-dword margin is the
+// vendor's `KGSL_RB_DWORDS - 2`, not a number invented here.
+enum GpuRingAlloc {
+    GPU_RING_ALLOC_OK = 0,     // dwords fit at wptr
+    GPU_RING_ALLOC_WRAP,       // a NOP filler then a wrap to the head
+    GPU_RING_ALLOC_FULL        // neither tail nor head can hold it
+};
+
+struct GpuRingAllocResult {
+    GpuRingAlloc kind;
+    uint32_t offset;           // where the caller writes
+    uint32_t new_wptr;         // the write pointer after the write
+    uint32_t nop_words;        // the CP_NOP payload length when kind is WRAP, else 0
+};
+
+static inline GpuRingAllocResult
+gpu_ring_alloc (uint32_t wptr, uint32_t rptr, uint32_t words)
+{
+    GpuRingAllocResult out = {GPU_RING_ALLOC_FULL, 0U, wptr, 0U};
+    const uint32_t dwords = kGpuRingDwords;
+
+    if (words == 0U || words >= dwords) {
+        return out;
+    }
+    if (rptr <= wptr) {
+        if (wptr + words <= dwords - 2U) {
+            out.kind = GPU_RING_ALLOC_OK;
+            out.offset = wptr;
+            out.new_wptr = (wptr + words) % dwords;
+            return out;
+        }
+        if (words < rptr) {
+            out.kind = GPU_RING_ALLOC_WRAP;
+            out.offset = 0U;
+            out.new_wptr = words;
+            out.nop_words = dwords - wptr - 1U;
+            return out;
+        }
+    }
+    if (wptr + words < rptr) {
+        out.kind = GPU_RING_ALLOC_OK;
+        out.offset = wptr;
+        out.new_wptr = (wptr + words) % dwords;
+        return out;
+    }
+    return out;
+}
+
+// A submission is complete when the CP's read pointer has caught up with the host's write pointer.
+// Both live in the same dword ring, so the comparison is equality after masking, never `<`.
+static inline bool
+gpu_ring_submit_done (uint32_t wptr, uint32_t rptr)
+{
+    return rptr == wptr;
+}
+
+// ---------------------------------------------------------------------------
 // ME_INIT: the nine dwords the CP is started with
 // ---------------------------------------------------------------------------
 
