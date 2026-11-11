@@ -25,7 +25,7 @@
 | `CloverPower` | PM660/PM660L、SPMI、时钟与电源域 | 已实现 |
 | `CloverInput` | I2C/QUP 总线；Goodix GT9xx 触摸报表（`clover-input=4`） | 已实现（持续读取待补） |
 | `NativeMobileDisplay` + 包内探针 | GOP 显示与交换路径 | 已实现（合成器停摆待查） |
-| `CloverGpu` | Adreno 512：上电、chipid、微码、CP 启动、SMMU 识别 | 进行中 |
+| `CloverGpu` | Adreno 512：微码、PM4/ring/ME_INIT、CP 启动、SMMU 识别；LDO 电压可写、CTRL/PDN 不可写（轨归 CPR/固件侧） | 进行中 |
 | `CloverDsp` | ADSP 探针 | 仅探针 |
 | `NativeHidInput` / `NativeKeyStoreEvents` | HID 与按键、钥匙串事件 | 已实现 |
 | 网络（Wi-Fi/BT） | — | 未开始 |
