@@ -57,3 +57,18 @@
    页表化是让 IOSurface/IB 能被 GPU 读的前提；
 3. **提交/fence/IRQ**：`adreno_ringbuffer.c` 的 submit + `CP_EVENT_WRITE` timestamp + `A5XX_RBBM_INT_*`；
 4. **Metal 用户态**：`IOGPUDeviceUserClient`（`IOGPUFamily` kext）——最后一步。
+
+
+## SMMU 集成（下一步，依赖 `ArmSmmu4K` kit）
+
+板上事实（notes/gpu-bringup.md §1）：SMMUv2 在 `0x05040000 + 0x10000`，3 级页表；上下文 bank 0 = user
+（gpu-offset `0x48000`），bank 2 = secure；中断 `GIC_SPI 329/330/331`。
+
+1. 在 `board.toml` 的组件里加 `ArmSmmu4K`（它与 `Adreno740` 同源，sheng 的 GPU 也依赖它）；
+2. CloverGpu 分配一段连续页作页表池，用 `ArmSmmu4KBuild()`（`kits/ArmSmmu4K/ArmSmmu4K.h`）为
+   ring / RPTR / ucode / IB / memstore 建 IOVA 映射；它的约束写在头文件里：只建 4K 叶子、排序不重叠、
+   `mair` 由调用者用返回的 `result.mair`（NC 在 index 0、WB/WA 在 index 1）；
+3. 用 MMIO 写 SMMU 全局（SCTLR/TTBR0/TCR/MAIR）与 bank 0 的 CBAR/SCTLR/TTBR0/TCR/MAIR，使能翻译，
+   然后 `CP_RB_BASE` 等寄存器改用 IOVA；
+4. IRQ：GIC_SPI 329（global）/330（context）/331（secure），先只要 330；
+5. 验收：CP 启动时 `CP_RB_RPTR` 前进且 SMMU 无 fault（`SMMU_CB_FSR` 读 0），再把地址从物理换成 IOVA。
