@@ -180,6 +180,88 @@ clover_gpu_gdsc_on(volatile uint32_t *gpucc, uint32_t gdscr_offset, uint32_t sta
     return clover_gpu_poll_pwr_on(gpucc, status_offset);
 }
 
+/*
+ * Round389. The GFX rail was never programmed: boot 78 and boot 81 read vref=0, pdn=1 and every
+ * sdm660_ldo_config[] word zero, and GX cannot leave its domain while vdd_gfx sits at the reset
+ * corner with the LDO powered down. This walks the vendor's own order from
+ * notes/sources/sdm660/msm_gfx_ldo.c -- enable_ldo_mode() (:325) then switch_mode_to_ldo() (:498) --
+ * at the DT's minimum voltage (400 mV, sdm660-regulator.dtsi:528), then reads the rail back. The
+ * sequence is gated on clover-gpu-ldo=1 so a boot that does not ask for it writes nothing here.
+ */
+static void
+clover_gpu_ldo_bringup(unsigned t)
+{
+    volatile uint32_t *window = clover_gpu_gpucc;
+    uint32_t vref, ctl, sts, val, base;
+    bool ready = false;
+    unsigned i;
+
+    if (window == NULL) {
+        return;
+    }
+    val = (400000U - 375000U) / 5000U;      /* GET_VREF((:266)): the DT's minimum, 400 mV */
+    vref = clover_gpu_read(window, kGpuccLdoVref);
+    base = (vref & ~0x7fU) | (val & 0x7fU);
+    /* configure_ldo_voltage(): value, update pulse, then drop it again (:268-294) */
+    clover_gpu_write(window, kGpuccLdoVref, base);
+    clover_gpu_write(window, kGpuccLdoVref, base | (1U << 31));
+    clover_gpu_write(window, kGpuccLdoVref, base);
+    for (i = 0; i < 50; i++) {
+        sts = clover_gpu_read(window, kGpuccLdoStatus);
+        if ((sts & ((1U << 2) | (1U << 4))) != 0) {
+            ready = true;
+            break;
+        }
+        IODelay(10);
+    }
+    /* enable_ldo_mode(): BHS under SW, LDO under GDSC, pre-on override, no bypass, LDO source (:325) */
+    ctl = clover_gpu_read(window, kGpuccLdoCtrl);
+    ctl |= (1U << 0);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl &= ~(1U << 4); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl |= (1U << 7);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl &= ~(1U << 6); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl |= (1U << 9);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl &= ~(1U << 8); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    /* switch_mode_to_ldo(): fake ack, LDO source, BHS both halves, SW control, bypass, power on (:498) */
+    ctl |= (1U << 8);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl |= (1U << 9);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl |= (1U << 1);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl |= (1U << 2);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl |= (1U << 0);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl |= (1U << 4);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl |= (1U << 6);  clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl &= ~(1U << 5); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    /* ldo_update_voltage() again, then power the BHS down and hand the rail to the GDSC (:297) */
+    clover_gpu_write(window, kGpuccLdoVref, base);
+    clover_gpu_write(window, kGpuccLdoVref, base | (1U << 31));
+    clover_gpu_write(window, kGpuccLdoVref, base);
+    for (i = 0; i < 50; i++) {
+        sts = clover_gpu_read(window, kGpuccLdoStatus);
+        if ((sts & ((1U << 2) | (1U << 4))) != 0) {
+            ready = true;
+            break;
+        }
+        IODelay(10);
+    }
+    ctl &= ~(1U << 1); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl &= ~(1U << 2); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    for (i = 0; i < 50; i++) {
+        sts = clover_gpu_read(window, kGpuccLdoStatus);
+        if ((sts & (1U << 1)) == 0) {
+            break;
+        }
+        IODelay(10);
+    }
+    ctl &= ~(1U << 6); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl &= ~(1U << 8); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    ctl &= ~(1U << 4); clover_gpu_write(window, kGpuccLdoCtrl, ctl);
+    printf("clover r389: gpu t=%u ldo prog uv=%u val=%u ready=%u vref=%08x ctrl=%08x sts=%08x\n",
+        t, 400000U, (unsigned) val, (unsigned) ready,
+        (unsigned) clover_gpu_read(window, kGpuccLdoVref),
+        (unsigned) clover_gpu_read(window, kGpuccLdoCtrl),
+        (unsigned) clover_gpu_read(window, kGpuccLdoStatus));
+}
+
 // Lazy, and remembered: GPUCC is only mapped once the GCC row says its AHB vote is on. A map that
 // fails is retried on the next fire because that failure can be the platform map settling, and the
 // cost of a retry is one map attempt every two minutes.
@@ -550,6 +632,7 @@ clover_gpu_power_on(unsigned t)
     clover_gpu_report_gpucc(t, false);
 
     {
+        clover_gpu_ldo_bringup(t);
         bool cx_on = clover_gpu_gdsc_on(clover_gpu_gpucc, kGpuccGdscCx, kGpuccCxHwCtrl, true);
         bool gx_on = clover_gpu_gdsc_on(clover_gpu_gpucc, kGpuccGdscGx, kGpuccGdscGx, false);
         uint32_t cx   = clover_gpu_read(clover_gpu_gpucc, kGpuccGdscCx);

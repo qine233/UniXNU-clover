@@ -572,3 +572,20 @@ clover r291: gpu t=617 ldo beat vref=00000000 val=0 uv=375000 ctrl=80000038 byp=
    解码 `boot104-tee.txt` `13b0ef0f6b9063c3…`；同帧的 r317 判形 `shape=list-never-written comparable=8 agree=1
    differ=7 dead=0 map_ok=1 control=1` 见 dev-log §Round318 ⑬。下一格仍按第 6 条：先钉「读一个已发的 level 读哪儿」，
    不是先写驱动。
+
+
+## 6. r389：GFX LDO 上电序列已实现（2026-11-11，等 boot 173 读数）
+
+按 §5.9 的结论（LDO 自上次上电起未编程、`pdn=1`、`vref=0`），`drivers/CloverGpu/CloverGpu.cpp` 新增
+`clover_gpu_ldo_bringup()`：按 `notes/sources/sdm660/msm_gfx_ldo.c` 的厂商顺序走 `configure_ldo_voltage()`
+→ `enable_ldo_mode()`（:325）→ `switch_mode_to_ldo()`（:498），电压取 DT 下限 400 mV（`val=5`），
+`PWRSWITCH_STATUS` 的 ready/settled 各等 50×10 µs。行：
+
+```
+clover r389: gpu t=%u ldo prog uv=400000 val=5 ready=%u vref=%08x ctrl=%08x sts=%08x
+```
+
+随后照旧开 CX/GX GDSC。**预登记判据**：`gx_on` 从 0 翻 1 且同拍 `cx_on=1`（正对照）⇒ 轨这一格结掉；
+若 `ready=0` 或 `gx_on` 仍 0 ⇒ 序列/角值来源有问题，回到 CPR4 fuse（`0x00784000`）那条线；
+另记「这一靴是否活到 1800 s 死线」——r290 的 rbcpr/rbbmtimer 两票曾与连续早死相关，LDO 写也按同一
+怀疑标准记录。
