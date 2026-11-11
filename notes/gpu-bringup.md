@@ -674,3 +674,9 @@ UEFI 侧可以用 PMIC 路径核对 S3/S5 的状态；GPU 的 `vdd_gfx` 仍走 C
 
 要让固件侧拿到 SPMI/PMIC，只有一条：把这两个预编译 DXE（同 SoC、同 EFI 格式）作为 binary module
 加进我们的 FV，并确认它们能在 Mu 的 DXE 环境里加载；之后才谈 PMIC 读或 CPR4。
+
+
+**更正（同日，第一次真实构建）**：`cloverPkg/Include/APRIORI.inc:91` 与 `DXE.inc:63` **本来就**包含
+`Binaries/clover/QcomPkg/Drivers/SPMIDxe/SPMIDxe.inf`；我把它再加一遍时 GenFv 直接报
+「the 40th file and 79th file have the same file GUID 2a7b4bef-…」。所以固件**一直有 SPMI/PMIC 能力**，
+上一段的「没有 SPMI 客户端」是我读漏了 `.inc`，已改回。真正的缺口仍然只是 **vdd_gfx 的 CPR4 所有权**。
