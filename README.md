@@ -47,9 +47,9 @@
 
 | 闸门 | 最近一次 | 结果 |
 | --- | --- | --- |
-| `check-clover.py` | r415 | EXIT=0 |
-| `verify-clover-payload.py` | r415 | EXIT=0，51 OK / 0 FAIL |
-| 负测（比对盘上产物，不动活树） | r415 | 12/12 |
+| `check-clover.py` | r416 | EXIT=0 |
+| `verify-clover-payload.py` | r416 | EXIT=0，51 OK / 0 FAIL |
+| 负测（r416 五支） | r416 | 5/5 |
 
 ## 已知缺口
 

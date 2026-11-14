@@ -3336,6 +3336,31 @@ def check_board(errors: list) -> str:
             errors.append("the r414 panel row is not exempt from the per-pass cap: it fires on the display's "
                           "own beat beside the state row, and a row the cap ate reads like a beat that never "
                           "fired")
+        # Round416's second row of the same beat: what the panel is made of (lit/alpha/box) and when the real
+        # selector-6 failures happened. Same containment rule as r414's pair, and its own class because its
+        # budget must not eat the row it explains.
+        for entry in ('{ "clover r416: panelboxcut", "r416-panelboxcut", 8, 0, 0, 0 },',
+                      '{ "clover r416: panelbox", "r416-panelbox", 96, 0, 0, 0 },'):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: the panelbox row would "
+                              "compete with the panel row for one budget")
+        if sdhci_source.find('{ "clover r416: panelboxcut"') > sdhci_source.find('{ "clover r416: panelbox"'):
+            errors.append("the r416 tee table lists the shorter panelbox token first: every panelboxcut would "
+                          "be counted, and reported, as the row it says did not fit")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r416-panelbox")' not in sdhci_source:
+            errors.append("the r416 panelbox row is not exempt from the per-pass cap")
+        probe_source = (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text()
+        driver_source = (REPO / "drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp").read_text()
+        for needle, haystack in (
+                ('"clover r416: panelbox ms=%llu fires=%u lit=%u/%u a0=%u a255=%u box=%s s6fail=%u '
+                 'first=%llus last=%llus\\n"', probe_source),
+                # Two readings, two producers: the box is the display driver's sample pass, the failure clock
+                # is the probe's interposer, and the row is only honest if both exist.
+                ('native_legacy_screen_lit=lit;native_legacy_screen_alpha0=alpha0;', driver_source),
+                ('if(!sel6FailCount)sel6FailFirstUs=whenUs;', probe_source)):
+            if needle not in haystack:
+                errors.append(f"the r416 panelbox instrumentation lacks {needle[:48]!r}: the row, the box "
+                              "writer and the failure clock are three readings and each has to exist")
 
         # Round335's swap row, r343's head. The same containment: "clover r343: bbswap" is a prefix of
         # "clover r343: bbswapcut" and teeProbeClass returns the first match, so the table order is the only
@@ -8903,8 +8928,8 @@ def check_board(errors: list) -> str:
     # generation, the title names the image that ran. The reason is a measurement, not a preference: 204
     # archived state rows (211 of 620) end mid-column at the tee's 320-byte line bound, and the columns in the cut part
     # are the ones that say whether the channel is alive.
-    if not board["payload"]["title"].startswith("clover r415:"):
-        errors.append('[payload] title is not "clover r415: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r416:"):
+        errors.append('[payload] title is not "clover r416: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -11058,8 +11083,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r415:"):
-        errors.append('[payload] title is not "clover r415: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r416:"):
+        errors.append('[payload] title is not "clover r416: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

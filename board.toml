@@ -341,7 +341,7 @@ loader = "firmware"
 # Round415's case: boots 186 and 187 both stopped while the console was still scrolling, on the GPU
 # probe's own rows -- the card held nothing but this boot's counter, so the stop is before the first
 # block request. The GPU is a parallel line; the display line does not need it.
-title = "clover r415: Boots 186 and 187 both stopped at t=14 s on the GPU probe's GDSC/LDO rows: the console stops right after them and the card holds nothing but the boot counter, which places the stop before the first block request. The GPU line is a parallel one and the display line does not need it, so this boot runs with clover-gpu=0 and keeps every r414 reading intact. The probe also carried a comment promising a \"clover-gpu-ldo\" gate that was never compiled, so the sequence that boots 173-179 and this pair stopped on had no way to be turned off."
+title = "clover r416: Boot 188 answered \"is the channel alive\" (428 copies, 0 refusals, panel mostly black) and left \"why is it black\" open, so this round adds a second row to the same beat: lit= counts samples whose RGB is non-zero, a0=/a255= count the alpha extremes, box= is the lit pixels bounds in the display own geometry, and s6fail= now carries the first and last time a real selector-6 failure happened -- boot 188 count was already constant at the ring horizon, so it could never date them. No behaviour changed: the copy path, the refusals and the Busy conversion are exactly as r415 shipped."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

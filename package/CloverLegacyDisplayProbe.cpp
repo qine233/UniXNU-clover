@@ -84,6 +84,12 @@ extern "C" volatile uint64_t native_legacy_screen_color_other;
 static volatile uint32_t sel6Enter,sel6Exit;
 /* Selector 6 answers kIOReturnBusy that were returned to the client as success. */
 static volatile uint32_t sel6Forced;
+// Round416: the same beat's second row. The screen words are the driver's; the failure clock is this file's,
+// because boot 188's fails=15 was already constant at the ring's first row and a count can never date it.
+extern "C" volatile uint32_t native_legacy_screen_lit,native_legacy_screen_alpha0,native_legacy_screen_alpha255;
+extern "C" volatile uint32_t native_legacy_screen_box[4],native_legacy_screen_box_seen;
+static volatile uint32_t sel6FailCount;
+static volatile uint64_t sel6FailFirstUs,sel6FailLastUs;
 /* Successful scanout transfers and the time of the last one. */
 static volatile uint32_t transferOkCount,transferOkTime;
 /* Round414: the failures, which until now were only ever printed on the early-only log channel. The last
@@ -603,6 +609,12 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
      * so the loop keeps submitting, and count the substitutions so the row says how many were made.
      */
     if(selector==6 && status==kIOReturnBusy) { sel6Forced=sel6Forced+1; status=kIOReturnSuccess; }
+    if(selector==6 && status) {
+        const uint64_t whenUs=probeNowUs();
+        if(!sel6FailCount)sel6FailFirstUs=whenUs;
+        sel6FailLastUs=whenUs;
+        sel6FailCount=sel6FailCount+1;
+    }
     if(stat) {
         if(selector==6 && arguments && arguments->scalarInput && arguments->scalarInputCount>=3) {
             const uint64_t *in=arguments->scalarInput;
@@ -916,6 +928,31 @@ static void reportPanelState(uint64_t now) {
         IOLog("%s",cut);
     } else {
         IOLog("%s",row);
+    }
+    /*
+     * Round416's second row of this beat. `col=` says the panel is mostly black; it cannot say whether the
+     * surface is empty or the copy missed the content. lit= and box= separate those two, a0=/a255= say whether
+     * the alpha channel was written at all, and s6fail/first/last date the selector-6 failures that the count
+     * alone leaves undated.
+     */
+    char box[40];
+    if(native_legacy_screen_box_seen)snprintf(box,sizeof box,"%ux%u..%ux%u",(unsigned)native_legacy_screen_box[0],
+        (unsigned)native_legacy_screen_box[1],(unsigned)native_legacy_screen_box[2],(unsigned)native_legacy_screen_box[3]);
+    else snprintf(box,sizeof box,"-");
+    char boxRow[kPanelRowBytes];
+    int boxLen=snprintf(boxRow,sizeof boxRow,
+        "clover r416: panelbox ms=%llu fires=%u lit=%u/%u a0=%u a255=%u box=%s s6fail=%u first=%llus last=%llus\n",
+        (unsigned long long)(now/1000),dispstateFires,(unsigned)native_legacy_screen_lit,
+        (unsigned)native_legacy_screen_sampled,(unsigned)native_legacy_screen_alpha0,
+        (unsigned)native_legacy_screen_alpha255,box,(unsigned)sel6FailCount,
+        (unsigned long long)(sel6FailFirstUs/1000000ULL),(unsigned long long)(sel6FailLastUs/1000000ULL));
+    if(boxLen<0 || static_cast<unsigned>(boxLen)>=sizeof boxRow) {
+        char boxCut[96];
+        snprintf(boxCut,sizeof boxCut,"clover r416: panelboxcut bytes=%d cap=%u fires=%u\n",
+            boxLen,(unsigned)sizeof boxRow,dispstateFires);
+        IOLog("%s",boxCut);
+    } else {
+        IOLog("%s",boxRow);
     }
 }
 static void reportDisplayState(void) {

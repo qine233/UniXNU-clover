@@ -1322,6 +1322,12 @@ def check_sb_sample(kernel: bytes) -> bool:
              "r414-panel": (b"clover r414: panel ms=%llu fires=%u txa=%u txf=%u txe=%s txs=%s txd=%s col=%s "
                             b"oth=%u vs=%u/%llu/%llu log=%u/%u logdrop=%u\n") in kernel,
              "r414-panelcut": (b"clover r414: panelcut bytes=%d cap=%u fires=%u txa=%u\n") in kernel,
+             # Round416's second row of the same beat: what the panel is made of (lit/alpha/box) and when the
+             # real selector-6 failures happened. The failure clock is written in the interposer, so pinning
+             # the format string alone would pin a row that could never print a date.
+             "r416-panelbox": (b"clover r416: panelbox ms=%llu fires=%u lit=%u/%u a0=%u a255=%u box=%s "
+                               b"s6fail=%u first=%llus last=%llus\n") in kernel,
+             "r416-panelboxcut": (b"clover r416: panelboxcut bytes=%d cap=%u fires=%u\n") in kernel,
              # Round344's per-record rows: the reference prints every record, this port prints one card record
              # per line, so both the row and the branch that says it did not fit are pinned as CStrings.
              "r344-dispclient": (b"clover r344: dispclient idx=%u pid=%d calls=%u fails=%u regall=%u regs=%u "

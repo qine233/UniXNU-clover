@@ -31046,3 +31046,48 @@ state rows」改正为「211 of 620」。内核**未重建**（拷贝仍是 `rou
 而面板上画的是**黑**（不透明黑 + 全透明黑占绝大多数）。「tx 停摆」在这一靴没有复现，桌面仍未起来：
 下一支的问题从「通道还活着吗」变成「黑帧为什么是黑的」——`col=` 与 `scr=` 已经在答这一格，
 下一步要看的是第 5 个颜色（alpha=0 的白）来自哪一段像素，以及 `calls=1731 fails=15` 那 15 次 selector 6 失败的时刻。
+
+
+## Round416 —— 黑帧的三问：面板上有没有亮像素（在哪）、alpha 写了没有、那 15 次失败是什么时候
+
+**为什么加它。** boot 188 已经把「通道活着」定下来了（428 次拷贝、0 拒绝、`txa==tx`），但 `col=` 只说「以黑为主」，
+而**空 surface** 与**画在别处**在颜色直方图上同形；`fails=15` 又在环的最早一行就已恒定，计数本身不能给时刻。
+
+**改动（只加读数，不动行为）。**
+- 驱动 `NativeLegacyDisplay::sampleScreen` 的同一遍采样里多出三个量：`lit`（`px & 0x00ffffff` 非零的样本数）、
+  `alpha0`/`alpha255`（alpha 两端），以及亮像素在 `lastWidth/lastHeight` 几何下的包围盒（`screenGeometryWidth/Height`
+  在条带与拷贝两条路里都记下）。发布为 `native_legacy_screen_lit/alpha0/alpha255/box[4]/box_seen`。
+- 探针 `interpose` 把 selector 6 的**真失败**（Busy 被改写成 Success **之后**仍非零）记 `sel6FailCount/FirstUs/LastUs`。
+- 同一拍新增第三行 `clover r416: panelbox ms= fires= lit=<n>/<sampled> a0= a255= box=<a>x<b>..<c>x<d> s6fail= first= last=`，
+  尺寸超界时走 `clover r416: panelboxcut`。
+- 驱动 tee 新类 `r416-panelbox`（96、每拍豁免）与 `r416-panelboxcut`；`check-clover` 钉类顺序、豁免前缀、
+  行格式串、两个写侧（驱动里的 `native_legacy_screen_lit=lit;…alpha0=alpha0;`、探针里的 `if(!sel6FailCount)…`）；
+  `verify-clover-payload` 钉两条 CString。负测 `round416-negatives.py` 五支：类顺序、豁免、行形状、box 写侧、失败时钟，
+  每支都要闸门点名并逐字节还原。
+
+**boot 189 判据（刷机前写定）：**
+- **X-A（仪器自证）**：`panelbox` 行与同一拍 `panel` 行 `fires=` 成对；`lit+（不亮的样本数）≤ sampled`；两个 `*cut` 为 0。
+- **X-B（空/偏）**：`box=-` 且 `lit=0` ⇒ **surface 里一个亮像素都没有**（合成器提交的是全透明的空 surface）；
+  `box=` 非 `-` ⇒ 内容在图上，接下来看它是否落在屏外/被裁剪（`screen_box` 与 `w/h` 比）。
+- **X-C（alpha）**：`a0=` 与 `a255=` 之和若 ≈ sampled，说明 alpha 被写过；两者都接近 0 说明整块像 **RGB 被写过、alpha 没写**。
+- **X-D（失败时刻）**：`s6fail` 应仍是 15 左右，`first/last` 落在**环地平线之前**（< ~1330 s）——这是对 boot 188
+  「fails 恒定」的正面补充；若 `first/last` 出现在晚期，则「早期失败」这个判读被推翻。
+- **X-E（不回归）**：`txa==tx` 与 `txf=0` 仍成立；`col=` 四色仍在。
+
+**boot 189 读数（`round416-boot189-window.bin`，TWRP 读回 EXIT=0）：仪器到位，但这一靴的窗口只到 568 s。**
+
+- **X-A 过**：9 条 `panelbox` 与 9 条 `panel` **`fires=` 逐拍相同**（8…15、18），两个 `*cut` 为 0。
+- **X-B 判不了，原因在仪器**：`lit=529/4100`、`a0=3990`、`a255=110`（三者相加 = 采样数 4100），
+  但 `box=-`。`box` 依赖 `screenGeometryWidth/Height`，而这两个字只在**条带路径或拷贝路径**里写——
+  这一靴到窗口结束 `txa=0`（一次传输都没有），所以几何仍是 0、包围盒无从计算。**下一版要把几何改成与传输无关的来源**
+  （framebuffer 的 boot args / ADT），否则「没有传输时问不出内容在哪」这一格永远空。
+- **X-C 有答案**：alpha 确实被写过——`a0+a255=4100` 全部落在两端；`col=00000000/3571` 的多数像素是**全透明黑**，
+  529 个非零 RGB 里绝大多数 alpha=0。这与「帧缓冲里仍是对 UEFI 画的东西」一致：UEFI 不写 alpha，所以 `a0` 端占满。
+- **X-D 空判**：`s6fail=0 first=0s last=0s`，这一靴到 568 s 还没有一次 selector 6 失败（也可能还没有 selector 6 调用）。
+- **窗口为什么只到 568 s**：`flight` 里的死线记录是 `boot=189 … elapsed=1800.004s`（板子跑满了），
+  但内核环最新一行是 568 s，之后**没有新行可泵**——这是这一族已经见过的「静默停摆」（117/118 是 730/637 s），
+  与 r416 的读数改动无关（本轮只加采样，不动行为；boot 188 的同一份 tee 跑到了 1805 s）。
+  对照之下 boot 188 的第一帧在 ~837 s，所以 189 的窗口**根本没走到有帧的那一段**。
+
+**判读（本轮只到这一格）：** r416 的三列都按设计出现在卡上、能配对；「黑帧为什么黑」的正面回答仍差一靴——
+需要一靴的 tee 覆盖到第一帧之后（boot 188 是 837 s 起）。下一靴（190）用同一枚镜像，只换窗口运气。

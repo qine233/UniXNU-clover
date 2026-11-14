@@ -1362,6 +1362,8 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // rather than a wider r344-dispstate budget because the two rows answer different questions and a cap that
   // ate one must not be able to eat the other -- boot 171 lost the tail of all 22 state rows, and the row that
   // would have said so was the one being cut.
+  { "clover r416: panelboxcut", "r416-panelboxcut", 8, 0, 0, 0 },
+  { "clover r416: panelbox", "r416-panelbox", 96, 0, 0, 0 },
   { "clover r414: panelcut", "r414-panelcut", 8, 0, 0, 0 },
   { "clover r414: panel", "r414-panel", 96, 0, 0, 0 },
 
@@ -5079,6 +5081,7 @@ static void teeConsumeLine (uint32_t &pushed)
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r344-disp") ||
        // Round414's panel row rides that same beat and exists because the state row's tail was being cut
        // downstream: a pass cap that ate it would reproduce exactly the silence it was added to remove.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r416-panelbox") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r414-panel") ||
        // Round335's swap-wait rows ride the client's own calls, not a burst: a boot that stalls in this wait
        // prints its last row at the moment it stalls, and that row is the one the whole round is built to

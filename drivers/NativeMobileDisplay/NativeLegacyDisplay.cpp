@@ -33,6 +33,12 @@ extern "C" void native_legacy_frame_colors_observed(const uint32_t *colors,const
 extern "C" void native_legacy_swap_validation_observed(bool,unsigned,const void *,const void *);
 extern "C" void native_legacy_frame_presented(unsigned kind);
 extern "C" volatile uint32_t native_legacy_screen_nonblack=0,native_legacy_screen_sampled=0;
+// Round416: what the panel is made of, per beat. `lit` counts samples whose RGB is non-zero (opaque black is
+// not lit), a0/a255 count the alpha extremes, and screen_box is the sampled lit pixels' bounds in the display's
+// own geometry -- the three answers a colour histogram cannot give.
+volatile uint32_t native_legacy_screen_lit=0,native_legacy_screen_alpha0=0,native_legacy_screen_alpha255=0;
+volatile uint32_t native_legacy_screen_box[4]={0,0,0,0},native_legacy_screen_box_seen=0;
+static volatile uint32_t screenGeometryWidth=0,screenGeometryHeight=0;
 extern "C" volatile uint64_t native_legacy_screen_hash=0;
 // Round414: what the panel actually holds, per state beat. The eight slots are the first eight distinct colours
 // met in the sample pass, in first-seen order; `other` counts the samples whose colour is in none of them. The
@@ -166,13 +172,19 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(!fb||bytes<4096)return;
         uint64_t n=bytes/4;
         uint64_t step=n/4096;if(!step)step=1;
-        uint32_t nonblack=0,sampled=0;uint64_t hash=0;
+        uint32_t nonblack=0,sampled=0;uint64_t hash=0,lit=0,alpha0=0,alpha255=0,x0=0,x1=0,y0=0,y1=0;int seen=0;
         uint32_t colors[8]={0,0,0,0,0,0,0,0};uint64_t counts[8]={0,0,0,0,0,0,0,0};
         uint32_t used=0;uint64_t other=0;
         for(uint64_t i=0;i<n;i+=step){
             uint32_t px=fb[i];
             if(px)nonblack++;
             hash=hash*1315423911ull+px;sampled++;
+            if(px&0x00ffffffU){lit=lit+1;
+                if(screenGeometryWidth&&screenGeometryHeight){uint32_t x=(uint32_t)(i%screenGeometryWidth),y=(uint32_t)(i/screenGeometryWidth);
+                    if(!seen){x0=x1=x;y0=y1=y;seen=1;}
+                    else {if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y;}}}
+            if(((px>>24)&0xffU)==0)alpha0=alpha0+1;
+            else if(((px>>24)&0xffU)==255)alpha255=alpha255+1;
             uint32_t slot=0;
             while(slot<used && colors[slot]!=px)slot++;
             if(slot<used)counts[slot]=counts[slot]+1;
@@ -187,6 +199,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             native_legacy_screen_color_counts[k]=counts[k];
         }
         native_legacy_screen_color_other=other;
+        native_legacy_screen_lit=lit;native_legacy_screen_alpha0=alpha0;native_legacy_screen_alpha255=alpha255;
+        native_legacy_screen_box[0]=x0;native_legacy_screen_box[1]=y0;native_legacy_screen_box[2]=x1;native_legacy_screen_box[3]=y1;
+        native_legacy_screen_box_seen=(uint32_t)seen;
     }
     static void stateBeatFired(OSObject *owner,IOTimerEventSource *) {
         static_cast<NativeLegacyDisplay *>(owner)->sampleScreen();
@@ -354,7 +369,7 @@ public:
         if(!surface) {
             // Validated blank swap (all layers disabled over black): solid-fill the actual GOP.
             PE_Video blank={};
-            uint32_t bw=0,bh=0;getDisplayDimensions(&bw,&bh);
+            uint32_t bw=0,bh=0;getDisplayDimensions(&bw,&bh);screenGeometryWidth=bw;screenGeometryHeight=bh;
             uint64_t blankLength=(uint64_t)bw*bh*4;
             if(PE_current_console(&blank) || blank.v_baseAddr!=bootMapping->getPhysicalAddress() ||
                blank.v_width!=bw || blank.v_height!=bh || blank.v_depth!=32 || blank.v_rotate ||
@@ -393,6 +408,7 @@ public:
         PE_Video video={};
         const int consoleRc=PE_current_console(&video);
         uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+        screenGeometryWidth=width;screenGeometryHeight=height;
         uint64_t length=(uint64_t)width*height*4;
         uint64_t sourceStride=native_legacy_surface_stride(surface);
         uint64_t allocation=native_legacy_surface_allocation(surface);
