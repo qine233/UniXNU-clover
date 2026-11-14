@@ -31320,3 +31320,31 @@ OS 盘原样搬来，而那张盘的分区/容器正好同尺寸，所以容器�
 - **X-C**：`frame#` 行多于一条、`flog=` 随拍增长、`fd=0`（W-A…W-D 的正式读数在这一靴补上）；
 - **X-D**：不回归——`txa==tx`、`txf=0`、`panelbox`/`panel` 每拍成对；落回仍由 BCB 进 TWRP，
   若进 EDL，runner 复位后必须回 TWRP。
+
+### boot 197 读数（r420 第一靴）——新镜像少了第三个窗口，内核以 `datawin 2` 停下
+
+**这一靴的大部分「读数」不是它的。** 窗口 512 条内核记录里 464 条属于 boot 196，只有 48 条属于
+boot 197；`ENOSPC`、`client=none`、`flog=0` 全部来自陈旧槽。boot 197 自己的最后一条是 16.8 s 的
+`CloverSdhci r172: first dma read lba=15795488 blocks=8 ms=0`，随后 panic（marker `k=17s`，
+`append_rc=110`，sentence 缺失）。**verdict 槽 10 留下了那句话**：
+
+    CloverBlock r137: datawin 2
+
+r137 的 `datawin` 是清单校验的第 7 步：`clover-apfs=3` 的 boot 模式要求 SHNGROOT 里有三个窗口
+（`OS`、`SystemOS`、`Data`），而 r420 的镜像只从 round128 的两窗口布局重建。round159 之后设备上跑的
+镜像在末尾追加了 32 MiB 的 APFS Data 种子（卷 UUID `FC1A580E-2D67-48FC-B8CF-87422A319340`），
+r198 的恢复（`round159-userdata-root.sparse.img`，19 个 sparse 段）就带着它。少一项就在挂根之前停下，
+这是设计如此：manifest 缺 Data 的根挂上去，`/private/var` 也永远没有种子。
+
+**修复（同一镜像，不重做窗口）：** `scripts/append-data-window.py`
+`--image round420-userdata-root.img --seed build/owner-data/owner-data-32.cdr`
+`--seed-json build/owner-data/seed.json`：Data 追加在 0x65b800000（= 旧镜像末尾），
+flags=0（可写），sha256 `ef00c083…`，`image_bytes` 27,304,919,040 → 27,338,473,472，脚本的
+按 CloverBlock 读法的回读 PASS。随后重做 all-RAW sparse 并逐块校验。
+
+**boot 198 判据（刷写前写定）：**
+
+- **X-A'**：不再出现 `CloverBlock r137: datawin`；内核记录属于 boot 198 的比例显著上升（> 48 条）；
+- **X-B'**：`disk5s1` 的 ENOSPC 消失或 `free_blocks` 远离 214（放大后的容器 24.0 GB、18.2 GB 空闲）；
+- **X-C'**：`dispstate` 出现 `seen>0 client=pidNN`、`tx` 增长，`frame#` 行多于一条且 `flog=` 增长；
+- **X-D'**：`txa==tx`、`txf=0`、`panelbox`/`panel` 成对；落回 TWRP（EDL 也须由 runner 复位回 TWRP）。
