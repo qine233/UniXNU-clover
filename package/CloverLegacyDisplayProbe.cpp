@@ -74,7 +74,7 @@ extern "C" volatile uint64_t native_legacy_screen_hash;
 /* Round414: what the panel holds, not just whether it changed. The driver's sample pass fills eight slots with
  * the first eight distinct colours it meets and counts each; `other` counts samples outside all eight. The hash
  * above says the frame is different, which is not a reading of the frame -- and r376's colour rows are printed
- * once per 128 frames at event time, so they age out of the log ring's window long before the panel is worth
+ * once per 16 frames at event time (round417: 128 was too sparse -- boot 190 window held none), so they age out of the log ring's window long before the panel is worth
  * reading. The driver owns the storage (its extern "C" block at the top of that file), so this unit only names
  * them; a definition here would be a duplicate symbol in the forced-load archive. */
 extern "C" volatile uint32_t native_legacy_screen_colors[8];
@@ -244,10 +244,10 @@ void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uin
     native_legacy_last_box[2]=maxx;native_legacy_last_box[3]=maxy;
     native_legacy_frame_count=n+1;
     /*
-     * Every 128th frame after the opening burst is logged too, so a boot that runs to its deadline says
+     * Every 16th frame after the opening burst is logged too, so a boot that runs to its deadline says
      * what the panel is showing late instead of only what the first six frames showed.
      */
-    if(n<6 || (n>=128 && (n%128)==0))
+    if(n<6 || (n>=16 && (n%16)==0))
         cloverLog("frame#%u kind=%u t=%us pixels=%llu box=%llux%llu..%llux%llu",n,kind,(unsigned)(frequency?(now-frameEpoch)/frequency:0),
             (unsigned long long)count,(unsigned long long)minx,(unsigned long long)miny,(unsigned long long)maxx,(unsigned long long)maxy);
 }

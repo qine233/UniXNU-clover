@@ -710,6 +710,9 @@ public:
             valid=width==video.v_width && height==video.v_height;
             if(valid) {
                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;
+                // Round417. The panelbox geometry belongs to the boot loader's console, not to a transfer:
+                // boot 189 made no transfer (txa=0) and the box came out empty although the samples were there.
+                screenGeometryWidth=(uint32_t)video.v_width;screenGeometryHeight=(uint32_t)video.v_height;
                 // Board note (clover, round180): the base module claimed the main display only for the literal
                 // kPEGraphicsMode value 1. On ARM v_display is not a mode enumeration at all -- pexpert/arm/boot.h
                 // calls it a "Display Code (if applicable)" and pe_init.c:537 branches on it as a boolean

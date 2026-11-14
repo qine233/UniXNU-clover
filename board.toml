@@ -341,7 +341,7 @@ loader = "firmware"
 # Round415's case: boots 186 and 187 both stopped while the console was still scrolling, on the GPU
 # probe's own rows -- the card held nothing but this boot's counter, so the stop is before the first
 # block request. The GPU is a parallel line; the display line does not need it.
-title = "clover r416: Boot 188 answered \"is the channel alive\" (428 copies, 0 refusals, panel mostly black) and left \"why is it black\" open, so this round adds a second row to the same beat: lit= counts samples whose RGB is non-zero, a0=/a255= count the alpha extremes, box= is the lit pixels bounds in the display own geometry, and s6fail= now carries the first and last time a real selector-6 failure happened -- boot 188 count was already constant at the ring horizon, so it could never date them. No behaviour changed: the copy path, the refusals and the Busy conversion are exactly as r415 shipped."
+title = "clover r417: Boot 190 said the frame buffer is full -- box spans 2x2..1198x1910, lit is about 13 percent white pixels on opaque black -- so the black is content, not an empty surface. Two instrument debts are paid here: the \"panelbox\" geometry now comes from the boot console instead of the transfer path, because boot 189 made no transfer and its box came out empty; and the frame row fires every 16th frame instead of every 128th, because a 500 second window held none of the old rows. The copy path, the refusals and the Busy conversion are untouched."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

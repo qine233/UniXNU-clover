@@ -4796,9 +4796,17 @@ def check_board(errors: list) -> str:
 
         # Round376. The first six frames were the only content rows, so what the panel shows late in a boot
         # was unknown. Every 128th frame is logged as well.
-        if "(n>=128 && (n%128)==0)" not in (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text():
-            errors.append("package/CloverLegacyDisplayProbe.cpp does not log every 128th frame: the panel "
+        if "(n>=16 && (n%16)==0)" not in (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text():
+            errors.append("package/CloverLegacyDisplayProbe.cpp does not log every 16th frame: the panel "
                           "content late in a boot would stay unread")
+
+        # Round417. The panelbox box has to exist before the first transfer, or a boot that has not presented
+        # yet answers with an empty column: boot 189 made no transfer and its box was '-'. The geometry is the
+        # boot loader's console size, taken in startHardware where the mapping is accepted.
+        if "screenGeometryWidth=(uint32_t)video.v_width;screenGeometryHeight=(uint32_t)video.v_height;" not in (
+                REPO / "drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp").read_text():
+            errors.append("the panelbox geometry is not taken from the boot console: a beat before the first "
+                          "transfer would still compute no box")
 
         # Round375. The walk is fatal to a boot, so it is off by default and only runs on request.
         r375_patch = max((p for p in (REPO / "patches/xnu-clover").glob("*-clover-r375.patch")),
@@ -8928,8 +8936,8 @@ def check_board(errors: list) -> str:
     # generation, the title names the image that ran. The reason is a measurement, not a preference: 204
     # archived state rows (211 of 620) end mid-column at the tee's 320-byte line bound, and the columns in the cut part
     # are the ones that say whether the channel is alive.
-    if not board["payload"]["title"].startswith("clover r416:"):
-        errors.append('[payload] title is not "clover r416: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r417:"):
+        errors.append('[payload] title is not "clover r417: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -11083,8 +11091,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r416:"):
-        errors.append('[payload] title is not "clover r416: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r417:"):
+        errors.append('[payload] title is not "clover r417: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
