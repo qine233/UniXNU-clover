@@ -31239,3 +31239,37 @@ EDL 落点（boot 117/118/119/191 之后）。
 
 结论：`client=none` 是靴间方差（189 与 193 同型），不是 r419 引入的。要让 W-A…W-D 真正可判，必须拿到
 一靴客户端连上的读数；同一枚 payload 再冷起一次（boot 194）即可，不改任何代码。
+
+### boot 194 读数（r419 同镜像重复靴）——客户端仍未连上，且窗口把根卷写满这件事说了出来
+
+**产物：** `~/clover-out/unattended-r419-boot194.log`、`round419-boot194-window.bin`（`.txt`/`.timeline.txt`）。
+boot counter 读到 `boot 194`。
+
+**判据结果同 boot 193：** 七拍 `panelbox` 全是 `flog=0 fd=0`；`dispstate` 七拍全是 `seen=0 client=none`、
+`tx=0@0s`、`copy=0 fc=0`。W-A 不成立（0 条帧行），W-B/W-C 无法测量，W-D 只在 `txa==tx==0` 的弱形式上成立。
+
+**这一靴比 193 多说了一件事：** 内核日志从 ~208 s 到 236 s 连续出现
+`fs_tx_enter_internal:27549: disk5s1 launchd: ENOSPC: ttype INSERT num_blocks 163 free_blocks 214 ...`（窗口内 97 条）。
+launchd 的 boot task（`finish-obliteration`、`detect-installed-roots`、`xpcroleaccountd` 等）照常触发，但根卷
+`disk5s1` 只剩 **214 个空闲块**（约 856 KiB），事务分配失败。用户态在跑、能 spawn，但写不下去。
+
+**ENOSPC 是旧病，不是 r419 引入的：**
+
+| boot | 轮次 | ENOSPC 行 | `client=` | 帧拷贝 |
+| --- | --- | --- | --- | --- |
+| 186 | r414c | 97 | — | — |
+| 188 | r415 | 34 | — | — |
+| 189 | r416 | 16 | `none` | 0 |
+| 190 | r416 | 16 | `pid58` | 大量 |
+| 191 | r417 | 237 | `pid58` | 大量 |
+| 192 | r418 | 8 | `pid86` | 355 |
+| 193 | r419 | 20 | `none` | 0 |
+| 194 | r419 | 97 | `none` | 0 |
+
+ENOSPC 条数与客户端是否连上没有单调关系（191 有 237 条仍连上 pid58），所以两个 r419 靴的 `client=none` 仍是
+靴间方差；但根卷余量（214 块）是一个**已量到的、会挡住桌面**的独立缺口，记为下一轮候选。r419 的记录器还要
+再取一靴（boot 195）才有第一次真正的读数。
+
+**这一靴的结尾：** panic sink 在 t=205300 ms 写了自已的 entry/after 两条 marker（`boot=194`、`append_rc=108`），
+但没有 deadline 记录、没有 sentence；内核日志继续写到 236 s；随后静默复位，TWRP 的 adb 起来（runner 报
+`TWRP's adb came up`）。没有 EDL 落点。
