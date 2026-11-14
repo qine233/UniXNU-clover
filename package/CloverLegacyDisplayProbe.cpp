@@ -107,6 +107,23 @@ static void cloverLog(const char *format,...) {
     if(length<0)return;
     IOLog("%s %s\n",cloverRound,line);
 }
+/*
+ * Round419. The frame row rode cloverLog, so the 96-line budget that protects the ring stopped it: boot 192 ran
+ * 355 copies and printed exactly one frame row, because that budget had been spent elsewhere long before. Frames
+ * are already rate-limited by their own cadence (every 16th), so they get their own cap and their own drop count,
+ * and the drop count is printed on the panelbox row -- a cap is only honest if the card says it was hit.
+ */
+static uint32_t frameLines,frameDropped;
+static void cloverLogFrame(const char *format,...) {
+    if(frameLines>=256){frameDropped=frameDropped+1;return;}
+    frameLines=frameLines+1;
+    char line[320];
+    va_list arguments;va_start(arguments,format);
+    int length=vsnprintf(line,sizeof(line),format,arguments);
+    va_end(arguments);
+    if(length<0)return;
+    IOLog("%s %s\n",cloverRound,line);
+}
 extern "C" {
 volatile uint32_t native_legacy_stage;
 volatile int native_legacy_meta_status=-1;
@@ -248,7 +265,7 @@ void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uin
      * what the panel is showing late instead of only what the first six frames showed.
      */
     if(n<6 || (n>=16 && (n%16)==0))
-        cloverLog("frame#%u kind=%u t=%us pixels=%llu box=%llux%llu..%llux%llu",n,kind,(unsigned)(frequency?(now-frameEpoch)/frequency:0),
+        cloverLogFrame("frame#%u kind=%u t=%us pixels=%llu box=%llux%llu..%llux%llu",n,kind,(unsigned)(frequency?(now-frameEpoch)/frequency:0),
             (unsigned long long)count,(unsigned long long)minx,(unsigned long long)miny,(unsigned long long)maxx,(unsigned long long)maxy);
 }
 volatile uint32_t native_legacy_frame_colors[8][4];
@@ -261,7 +278,7 @@ void native_legacy_frame_colors_observed(const uint32_t *colors,const uint64_t *
     for(unsigned i=0;i<4;++i){native_legacy_frame_colors[n][i]=colors[i];native_legacy_frame_color_counts[n][i]=counts[i];}
     native_legacy_frame_color_other[n]=other;
     if(n<4)
-        cloverLog("frame#%u colours %08x/%llu %08x/%llu %08x/%llu %08x/%llu other=%llu",n,colors[0],(unsigned long long)counts[0],
+        cloverLogFrame("frame#%u colours %08x/%llu %08x/%llu %08x/%llu %08x/%llu other=%llu",n,colors[0],(unsigned long long)counts[0],
             colors[1],(unsigned long long)counts[1],colors[2],(unsigned long long)counts[2],colors[3],(unsigned long long)counts[3],
             (unsigned long long)other);
 }
@@ -941,11 +958,13 @@ static void reportPanelState(uint64_t now) {
     else snprintf(box,sizeof box,"-");
     char boxRow[kPanelRowBytes];
     int boxLen=snprintf(boxRow,sizeof boxRow,
-        "clover r416: panelbox ms=%llu fires=%u lit=%u/%u a0=%u a255=%u box=%s s6fail=%u first=%llus last=%llus\n",
+        "clover r416: panelbox ms=%llu fires=%u lit=%u/%u a0=%u a255=%u box=%s s6fail=%u first=%llus last=%llus "
+        "flog=%u fd=%u\n",
         (unsigned long long)(now/1000),dispstateFires,(unsigned)native_legacy_screen_lit,
         (unsigned)native_legacy_screen_sampled,(unsigned)native_legacy_screen_alpha0,
         (unsigned)native_legacy_screen_alpha255,box,(unsigned)sel6FailCount,
-        (unsigned long long)(sel6FailFirstUs/1000000ULL),(unsigned long long)(sel6FailLastUs/1000000ULL));
+        (unsigned long long)(sel6FailFirstUs/1000000ULL),(unsigned long long)(sel6FailLastUs/1000000ULL),
+        (unsigned)frameLines,(unsigned)frameDropped);
     if(boxLen<0 || static_cast<unsigned>(boxLen)>=sizeof boxRow) {
         char boxCut[96];
         snprintf(boxCut,sizeof boxCut,"clover r416: panelboxcut bytes=%d cap=%u fires=%u\n",

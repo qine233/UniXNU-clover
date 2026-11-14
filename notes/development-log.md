@@ -31186,3 +31186,20 @@ throttled 12 条——帧行自 r180 起就走通用 `clover r` token，**从来
 - **两件事要说清**：① `panelbox` 的 `box` 仍铺满整屏而帧行的 `box` 只有一条带——两者量的不是同一件事：
   帧行量**这一次拷贝的 surface**，`panelbox` 量**启动帧缓冲**，后者里还留着 UEFI 控制台的白字（alpha=0 那 394 个）；
   ② `kind=0` 是这一帧的类别，逐帧值仍要按探针里的枚举读，不能凭这个名字猜。
+
+
+## Round419 —— 帧行不再和 `cloverLog` 共用一个预算
+
+**读数逼出的原因。** boot 192 跑了 355 次拷贝，卡上却只有 **一条** 帧行（`frame#16 t=100s`）。查代码：帧行走的是
+`cloverLog`，而它有一条 `kCloverLogBudget = 96` 的全局行预算（`log=66/96` 这类读数就是这条），预算花完就静默丢——
+所以「类 + 豁免」只解决了 tee 那一层，`cloverLog` 这一层还在。
+
+**改动（只加读数）。** 探针里加 `cloverLogFrame()`：自己的 256 行上限、自己的丢弃计数 `frameDropped`，不占
+`kCloverLogBudget`；两条帧行（`kind=` 与 `colours`）都改走它。`panelbox` 行尾追加 `flog=<lines> fd=<drops>`——
+**上限只有在卡上说了自己被撞到才算诚实**。
+
+**boot 193 判据（刷机前写定）：**
+- **W-A**：窗口内 `frame#` 行**多于一条**，且 `flog=` 随拍增长；若 `fd=` 非零则说明 256 上限也撞到了（正常不应）；
+- **W-B**：`frame#` 行的 `pixels=`/`box=` 随时间变化（若一直同一组数，说明合成器在重复提交同一帧）；
+- **W-C**：`kind=0/1` 的分布——`kind=1` 是清屏路径、`kind=0` 是真 surface 拷贝（`NativeLegacyDisplay.cpp:387/496`）；
+- **W-D**：`txa==tx`、`txf=0`、`panelbox`/`panel` 每拍成对，不回归。

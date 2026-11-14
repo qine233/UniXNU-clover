@@ -341,7 +341,7 @@ loader = "firmware"
 # Round415's case: boots 186 and 187 both stopped while the console was still scrolling, on the GPU
 # probe's own rows -- the card held nothing but this boot's counter, so the stop is before the first
 # block request. The GPU is a parallel line; the display line does not need it.
-title = "clover r418: Boot 191 ran 517 copies with no refusals and still kept no frame row on the card, because that row had never had a tee class of its own and the per-pass cap dropped it. This round gives \"frame#\" its own class and exemption, so a window without frame rows now says the copy path did not run instead of the tee spending the pass elsewhere. Nothing else moved: the copy path, the geometry source and the panelbox row are exactly as r417 shipped."
+title = "clover r419: Boot 192 ran 355 copies and kept exactly one frame row, because that row rode the cloverLog 96-line budget and the budget had been spent elsewhere. Frames are already rate-limited by their own cadence, so this round gives them their own 256-line cap and prints its drop count on the \"panelbox\" row: a cap is only honest if the card says it was hit."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
