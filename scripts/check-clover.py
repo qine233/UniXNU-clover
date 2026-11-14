@@ -3360,6 +3360,16 @@ def check_board(errors: list) -> str:
             if needle not in probe_source:
                 errors.append(f"the frame row still rides a shared budget: {needle!r} is missing, and boot 192 "
                               "printed one frame row for 355 copies")
+        # Round421. Boot 199 logged eleven frame rows with no drop, and none survived to the 1800 s deadline:
+        # they had rotated out of the 512-line ring. The periodic panelbox row now carries the last frame, set
+        # on both the blank path and the real-copy path, so every beat says what was last painted.
+        for needle in ('static uint64_t lastFramePixels;static uint32_t lastFrameOrdinal;',
+                       'lastFramePixels=0;lastFrameOrdinal=native_legacy_frame_count;',
+                       'lastFramePixels=count;lastFrameOrdinal=n+1;',
+                       '"flog=%u fd=%u lfk=%u lfp=%llu lfb=%llux%llu..%llux%llu lft=%us lfn=%u'):
+            if needle not in probe_source:
+                errors.append(f"the panelbox row does not carry the last frame: {needle!r} is missing, and "
+                              "boot 199 lost all eleven frame rows to ring rotation")
         driver_source = (REPO / "drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp").read_text()
         for needle, haystack in (
                 ('"clover r416: panelbox ms=%llu fires=%u lit=%u/%u a0=%u a255=%u box=%s s6fail=%u '
@@ -8957,8 +8967,8 @@ def check_board(errors: list) -> str:
     # generation, the title names the image that ran. The reason is a measurement, not a preference: 204
     # archived state rows (211 of 620) end mid-column at the tee's 320-byte line bound, and the columns in the cut part
     # are the ones that say whether the channel is alive.
-    if not board["payload"]["title"].startswith("clover r419:"):
-        errors.append('[payload] title is not "clover r419: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r421:"):
+        errors.append('[payload] title is not "clover r421: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -11112,8 +11122,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r419:"):
-        errors.append('[payload] title is not "clover r419: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r421:"):
+        errors.append('[payload] title is not "clover r421: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

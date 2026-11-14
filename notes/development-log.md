@@ -31394,3 +31394,23 @@ flags=0（可写），sha256 `ef00c083…`，`image_bytes` 27,304,919,040 → 27
 **r421（下一轮）：** 探针在每次帧路径里记住最后一帧的 `kind/pixels/box/t`，由每 30 s 的
 `panelbox` 行以 `lfk=/lfp=/lfb=/lft=` 打印。这样无论环怎么轮转，死线那一刻的每拍行都带着「最后
 一帧」的读数，W-A…W-D 才真正可判。
+
+## Round421 —— 最后一帧挂在每拍的 `panelbox` 行上
+
+**读数逼出的原因。** boot 199 里 `flog=11 fd=0`：帧行记录器工作正常，但那些行写在 msgbuf、由 tee 抄进
+512 行的内核环，到 1800 s 死线时早已轮转出去。`panelbox` 行每 30 s 一拍、必然留在环里，所以把「最后一
+帧」放到它上面：`lfk=`（kind）、`lfp=`（pixels）、`lfb=`（box）、`lft=`（秒，自帧纪元）、`lfn=`（序号，
+0 = 还没有帧）。两条路径都写这份状态——`native_legacy_frame_presented`（清屏/blank）与
+`native_legacy_frame_observed`（真 surface 拷贝），所以「最后一次呈现是哪种」也在读数里。
+
+**改动（只加读数）。** 探针 `package/CloverLegacyDisplayProbe.cpp`：两个静态量
+`lastFramePixels,lastFrameOrdinal`，两处赋值，`panelbox` 行尾追加五个字段。`board.toml` 标题升 r421；
+`check-clover.py` 新增四条针脚（两个静态量、两处赋值、行尾格式），`verify-clover-payload.py` 的
+`r416-panelbox` 针脚跟到新行尾。
+
+**boot 200 判据（刷写前写定）：**
+
+- **Z-A**：`panelbox` 行里 `lfn` 随拍增长（或至少 >0），`lfk` 在 0/1 之间出现观测到的取值；
+- **Z-B**：`lfp`/`lfb` 随时间变化——若一直是同一组数且 `lfn` 不涨，说明客户端停止提交；
+- **Z-C**：`flog` 大于 1、`fd=0`，且 `ENOSPC` 仍为 0；`client=`/`tx` 不回归；
+- **Z-D**：死线落回 TWRP（EDL 也必须由 runner 复位回 TWRP）。

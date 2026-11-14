@@ -226,6 +226,13 @@ volatile uint32_t native_legacy_frame_count;
 /* The latest presented frame, kept every frame so a periodic row can say what the panel holds late. */
 volatile uint32_t native_legacy_last_kind,native_legacy_last_time;
 volatile uint64_t native_legacy_last_box[4];
+/*
+ * Round421. The frame rows are rate-limited and, at a 1800 s deadline, have long rotated out of the
+ * 512-line kernel ring by the time the card is read (boot 199: flog=11, zero rows retained). The
+ * periodic panelbox row is what survives, so it carries the last frame: kind, pixel count, box, its
+ * time since the frame epoch, and its ordinal. lfn=0 means no frame has been observed yet.
+ */
+static uint64_t lastFramePixels;static uint32_t lastFrameOrdinal;
 volatile uint32_t native_legacy_frame_kind[NATIVE_LEGACY_FRAMES];
 volatile uint32_t native_legacy_frame_time[NATIVE_LEGACY_FRAMES];
 volatile uint64_t native_legacy_frame_stats[NATIVE_LEGACY_FRAMES][5];
@@ -243,6 +250,7 @@ void native_legacy_frame_presented(unsigned kind) {
     native_legacy_last_time=frequency?(uint32_t)((now-frameEpoch)/frequency):0;
     native_legacy_last_box[0]=0;native_legacy_last_box[1]=0;
     native_legacy_last_box[2]=0;native_legacy_last_box[3]=0;
+    lastFramePixels=0;lastFrameOrdinal=native_legacy_frame_count;
 }
 void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uint64_t miny,uint64_t maxx,uint64_t maxy) {
     uint32_t n=native_legacy_frame_count;
@@ -259,6 +267,7 @@ void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uin
     native_legacy_last_time=frequency?(uint32_t)((now-frameEpoch)/frequency):0;
     native_legacy_last_box[0]=minx;native_legacy_last_box[1]=miny;
     native_legacy_last_box[2]=maxx;native_legacy_last_box[3]=maxy;
+    lastFramePixels=count;lastFrameOrdinal=n+1;
     native_legacy_frame_count=n+1;
     /*
      * Every 16th frame after the opening burst is logged too, so a boot that runs to its deadline says
@@ -959,12 +968,15 @@ static void reportPanelState(uint64_t now) {
     char boxRow[kPanelRowBytes];
     int boxLen=snprintf(boxRow,sizeof boxRow,
         "clover r416: panelbox ms=%llu fires=%u lit=%u/%u a0=%u a255=%u box=%s s6fail=%u first=%llus last=%llus "
-        "flog=%u fd=%u\n",
+        "flog=%u fd=%u lfk=%u lfp=%llu lfb=%llux%llu..%llux%llu lft=%us lfn=%u\n",
         (unsigned long long)(now/1000),dispstateFires,(unsigned)native_legacy_screen_lit,
         (unsigned)native_legacy_screen_sampled,(unsigned)native_legacy_screen_alpha0,
         (unsigned)native_legacy_screen_alpha255,box,(unsigned)sel6FailCount,
         (unsigned long long)(sel6FailFirstUs/1000000ULL),(unsigned long long)(sel6FailLastUs/1000000ULL),
-        (unsigned)frameLines,(unsigned)frameDropped);
+        (unsigned)frameLines,(unsigned)frameDropped,(unsigned)native_legacy_last_kind,
+        (unsigned long long)lastFramePixels,(unsigned long long)native_legacy_last_box[0],
+        (unsigned long long)native_legacy_last_box[1],(unsigned long long)native_legacy_last_box[2],
+        (unsigned long long)native_legacy_last_box[3],(unsigned)native_legacy_last_time,(unsigned)lastFrameOrdinal);
     if(boxLen<0 || static_cast<unsigned>(boxLen)>=sizeof boxRow) {
         char boxCut[96];
         snprintf(boxCut,sizeof boxCut,"clover r416: panelboxcut bytes=%d cap=%u fires=%u\n",
