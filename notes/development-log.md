@@ -31203,3 +31203,39 @@ throttled 12 条——帧行自 r180 起就走通用 `clover r` token，**从来
 - **W-B**：`frame#` 行的 `pixels=`/`box=` 随时间变化（若一直同一组数，说明合成器在重复提交同一帧）；
 - **W-C**：`kind=0/1` 的分布——`kind=1` 是清屏路径、`kind=0` 是真 surface 拷贝（`NativeLegacyDisplay.cpp:387/496`）；
 - **W-D**：`txa==tx`、`txf=0`、`panelbox`/`panel` 每拍成对，不回归。
+
+### boot 193 读数（r419，冷刷 cache）——现象缺席，判据无法测量
+
+**产物：** `~/clover-out/unattended-r419-boot193.log`、`round419-boot193-window.bin`（及 `.txt` 解码、
+`.timeline.txt`、`.edl-reset.log`）。boot counter 读到 `boot 193`。
+
+**五拍 panelbox 一致：** 48/78/108/138/168 s 五次打印，`flog=0 fd=0`——帧行记录器一次都没被调用。
+`dispstate` 同时给出原因：**五次全是 `seen=0 client=none`、`tx=0@0s`、`copy=0 fc=0`**，`panel` 行
+`txa=0 txf=0`。也就是说这一靴从头到尾没有显示客户端连上、没有一次 surface 拷贝——**r419 要测的现象
+本身没有发生**。
+
+**W-A…W-D 判读：**
+- **W-A（`frame#` 多于一条）**：不成立——窗口内 0 条。归因不是记录器：`cloverLogFrame` 只在两条帧行里被
+  调用，而 `flog=0` 说明它没被调用过；记录器改动不可能阻止拷贝（且本轮没有动拷贝路径）。
+- **W-B / W-C**：无法测量（没有帧行可看）。
+- **W-D（不回归）**：只在弱形式上成立——`txa==tx==0`，`panelbox`/`panel` 每拍成对；但没有传输，`txf=0`
+  这条腿没有被真正考到。
+
+**这一靴的结尾：** flight 区最新 entry `t=176089 ms`，此后本靴**没有**写 deadline 记录、没有进 panic
+sink（卡上两条 panic marker 与 deadline 记录都是 boot 192/185/190 的陈旧字）、没有 sentence 记录；
+板子静默复位后以 QUSB_BULK（Sahara）出现在主机上，runner 用端口复位 + SoC 复位把它送回 TWRP
+（`edl-reset.log`：`SAHARA reset accepted`，只复位、不写分区）。这是第三次由本靴外部的静默复位导致的
+EDL 落点（boot 117/118/119/191 之后）。
+
+**对照（同类现象在前几靴的比例）：**
+
+| boot | 轮次 | `client=`（末拍） | 帧拷贝 | 结尾 |
+| --- | --- | --- | --- | --- |
+| 189 | r416 | `none` | 0 | 跑满窗口 |
+| 190 | r416 | `pid58` | 大量 | 跑满窗口 |
+| 191 | r417 | `pid58` | 大量 | EDL → TWRP |
+| 192 | r418 | `pid86` | 355 | 跑满窗口 |
+| 193 | r419 | `none` | 0 | 176 s 静默复位 → EDL → TWRP |
+
+结论：`client=none` 是靴间方差（189 与 193 同型），不是 r419 引入的。要让 W-A…W-D 真正可判，必须拿到
+一靴客户端连上的读数；同一枚 payload 再冷起一次（boot 194）即可，不改任何代码。
