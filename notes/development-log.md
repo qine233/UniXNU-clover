@@ -31374,3 +31374,23 @@ flags=0（可写），sha256 `ef00c083…`，`image_bytes` 27,304,919,040 → 27
 - **Y-B**：`client=` 保持出现，`calls` 增长、`fails` 不再停在 1，`tx` 增长；
 - **Y-C**：`frame#` 行出现且 `flog=` 增长（W-A…W-D 的正式读数）；
 - **Y-D**：死线落回 TWRP，不回归。
+
+### boot 199 读数（r420 第三靴，1 GiB Data 种子）——ENOSPC 归零，帧行有了但被环轮转掉
+
+**产物：** `~/clover-out/unattended-r420-boot199.log`、`round420-boot199-window.bin`（`.txt`/`.timeline.txt`）。
+
+- **Y-A 成立**：`ENOSPC` **0 条**，`free_blocks` 不再出现。1 GiB 的 Data 种子（UUID 仍是
+  `FC1A580E…`）把 `/private/var` 的写墙拿掉了。
+- **Y-B 成立**：`seen=7 client=pid86`，`calls` 3316、`fails` 停在 15，`tx` 从 192@384s 一路涨到
+  **824@1190s**，之后不再增长（客户端在 1190 s 停止提交）。
+- **Y-C 半成立**：`flog=11 fd=0`——`cloverLogFrame` 被调用 11 次、256 行上限没撞到；但窗口里
+  `frame#` 行是 **0 条**：这些行写在 msgbuf，tee 抄进 512 行内核环，到 1800 s 时早就被轮转掉了。
+  也就是说 r419 的记录器是对的，缺的是「把最后一条留在会被读到的位置」。
+- **面板内容变了**：`panelbox` 的 `a0/a255` 从 boot 198 的 3998/102（几乎全透明）变成
+  1200–2300 / 1800–2800（大量不透明像素），`lit` 416–449/4100。合成器确实在画东西，只是
+  客户端 1190 s 后停手。
+- **Y-D 成立**：deadline 1800.004 s，BCB 落 TWRP。
+
+**r421（下一轮）：** 探针在每次帧路径里记住最后一帧的 `kind/pixels/box/t`，由每 30 s 的
+`panelbox` 行以 `lfk=/lfp=/lfb=/lft=` 打印。这样无论环怎么轮转，死线那一刻的每拍行都带着「最后
+一帧」的读数，W-A…W-D 才真正可判。
