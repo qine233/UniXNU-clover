@@ -31348,3 +31348,29 @@ flags=0（可写），sha256 `ef00c083…`，`image_bytes` 27,304,919,040 → 27
 - **X-B'**：`disk5s1` 的 ENOSPC 消失或 `free_blocks` 远离 214（放大后的容器 24.0 GB、18.2 GB 空闲）；
 - **X-C'**：`dispstate` 出现 `seen>0 client=pidNN`、`tx` 增长，`frame#` 行多于一条且 `flog=` 增长；
 - **X-D'**：`txa==tx`、`txf=0`、`panelbox`/`panel` 成对；落回 TWRP（EDL 也须由 runner 复位回 TWRP）。
+
+### boot 198 读数（r420 第二靴）——三窗口通过、跑满死线，新墙是 32 MiB 的 Data 种子
+
+**产物：** `~/clover-out/unattended-r420-boot198.log`、`round420-boot198-window.bin`（`.txt`/`.timeline.txt`）。
+
+- **X-A' 成立**：512/512 条内核记录都属于 boot 198（193–197 那种「大半是陈旧槽」没有了）；
+  `datawin` 只在 boot 197 的陈旧 panic 槽里出现一次。清单三窗口（OS / SystemOS / Data）通过。
+- **X-B' 部分成立**：OS 容器的 ENOSPC 消失；`disk5s1` 的 280 条 ENOSPC 现在来自 **Data 窗口自己的
+  32 MiB 容器**（`free_blocks 12..14`，写请求落在卡 LBA 69,125,4xx = 镜像 0x65b80000 = Data 窗口）。
+- **X-C' 部分成立**：`dispstate` 出现 `seen=8 client=pid99`（自 boot 192 以来第一次有显示客户端），
+  但 `calls=2 fails=1`、`tx=0@0s`、`copy=0`；`frame#` 0 条、`flog=0`。客户端开了口就停在第一次调用。
+- **X-D' 成立**：`panel`/`panelbox` 每拍成对，`txa=0 txf=0`；deadline 在 1800.005 s 按预案触发，
+  BCB 把板子送回 TWRP（`TWRP's adb came up`）。
+
+**对策（r420c）：** 把 Data 种子从 32 MiB 放大到 1 GiB，**保持卷 UUID `FC1A580E-2D67-48FC-B8CF-
+87422A319340`**（`diskutil apfs resizeContainer disk23 1g`，实测 UUID 不变，空余 995.9 MB）。
+镜像里 Data 项同偏移（0x65b80000）改为 1 GiB，sha256 `cbcecf4a109b…`，flags=0，`image_bytes`
+27,304,919,040 → 28,378,660,864。这是 round198 当初「32 MiB → 1 GiB」的同一步，只是当时没有把
+步骤写进脚本。
+
+**boot 199 判据：**
+
+- **Y-A**：`free_blocks` 远离 12，ENOSPC 显著减少或消失；
+- **Y-B**：`client=` 保持出现，`calls` 增长、`fails` 不再停在 1，`tx` 增长；
+- **Y-C**：`frame#` 行出现且 `flog=` 增长（W-A…W-D 的正式读数）；
+- **Y-D**：死线落回 TWRP，不回归。
