@@ -607,3 +607,24 @@ result = "The r153 frame printed the cache open/read rows and both dyld_v1 arm64
 kind = "source"
 reference = "scripts/check-cs-blob-structure.py"
 result = "Host replica of cs_validate_csblob: replays the kernels code-signature blob structure rules against a real Mach-O and names the ubc_subr.c line that rejects it"
+
+[[area.evidence]]
+kind = "host"
+reference = "notes/development-log.md"
+command = "python3.13 clover-out/round414b-rowcensus.py  # over 44 archived card readings in ~/clover-out"
+revision = "611a539229c93bb11df4ec4eea42dacf8bf150dd"
+result = "620 display state rows in the archived card readings, 211 with an incomplete tail column and 207 pinned at exactly 304 visible characters (max body 304); per boot 171 is 22/22, 172 and 174-179 are 20/20 each, 170 is 20/21 and 180-183 are zero, so the cut is width-driven. Log: ~/clover-out/round414b-rowcensus.log."
+
+[[area.evidence]]
+kind = "host"
+reference = "notes/development-log.md"
+command = "python3.13 clover-out/round414b-skipcensus.py  # needle mov w8,#1 ; strb w8,[x1,#0xd0] over every round* kernel"
+revision = "611a539229c93bb11df4ec4eea42dacf8bf150dd"
+result = "468 archived kernels: 259 carry the dyld-cache-skip needle and 209 do not, including every kernel from r376 to r389, r402 to r410 and the pre-fix r414; r414b carries it once. Log: ~/clover-out/round414b-skipcensus.log."
+
+[[area.evidence]]
+kind = "host"
+reference = "notes/development-log.md"
+command = "python3 scripts/verify-clover-payload.py ~/clover-out/round414c-payload.img; python3.13 ~/clover-out/round414c-negatives.py"
+revision = "611a539229c93bb11df4ec4eea42dacf8bf150dd"
+result = "round414c-payload.img (d4a8533b5fb2927c4ffa93669fd5edbe56184381d7af92945ca2ecda3014d16a, 58,720,256 bytes) verifies 51 OK / 0 FAIL and the 12-case negative suite reports all-negatives-pass with default-payload-is-this-build True."
