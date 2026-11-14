@@ -3319,6 +3319,23 @@ def check_board(errors: list) -> str:
                           "display's own beat, away from every burst, and a row the cap ate reads exactly "
                           "like a beat that never fired -- which are the two answers this round is asking "
                           "between")
+        # Round414's panel row: the same beat, a separate class. It carries the columns the state row lost when
+        # its ceiling came down to the tee's line budget (vs=/log=/logdrop=) plus the transfer refusals and the
+        # panel's colours. A separate class is the point: boot 171 lost the tail of all 22 of its state rows,
+        # and the row that would have said so was the one being cut, so the two must not share a budget.
+        for entry in ('{ "clover r414: panelcut", "r414-panelcut", 8, 0, 0, 0 },',
+                      '{ "clover r414: panel", "r414-panel", 96, 0, 0, 0 },'):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: the panel row would compete "
+                              "with the state row for one budget, and a cap that ate it reproduces the "
+                              "silence it was added to remove")
+        if sdhci_source.find('{ "clover r414: panelcut"') > sdhci_source.find('{ "clover r414: panel"'):
+            errors.append("the r414 tee table lists the shorter panel token first: every panelcut would be "
+                          "counted, and reported, as the row it says did not fit")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r414-panel")' not in sdhci_source:
+            errors.append("the r414 panel row is not exempt from the per-pass cap: it fires on the display's "
+                          "own beat beside the state row, and a row the cap ate reads like a beat that never "
+                          "fired")
 
         # Round335's swap row, r343's head. The same containment: "clover r343: bbswap" is a prefix of
         # "clover r343: bbswapcut" and teeProbeClass returns the first match, so the table order is the only
@@ -8877,8 +8894,14 @@ def check_board(errors: list) -> str:
     # that open the set (bbhop, bbset2, bbsm) carry r346 because that is the generation that produced
     # them. Round347 keeps r346's set rows and adds bbsmh/bbsmhold for the members with send rights;
     # the menu names round347.
-    if not board["payload"]["title"].startswith("clover r376:"):
-        errors.append('[payload] title is not "clover r376: ...": the menu would not name this round')
+    # Round414 moves the menu because the image's display reading changed shape: the state row loses its
+    # vs=/log=/logdrop= tail to a second row on the same beat, and that row is new. The rows this round did
+    # not touch keep their own tokens (dispstate/dispclient r344, bbswap r343) -- a card row names its probe
+    # generation, the title names the image that ran. The reason is a measurement, not a preference: 204
+    # archived state rows end mid-column at the tee's 320-byte line bound, and the columns in the cut part
+    # are the ones that say whether the channel is alive.
+    if not board["payload"]["title"].startswith("clover r414:"):
+        errors.append('[payload] title is not "clover r414: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -11032,8 +11055,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r376:"):
-        errors.append('[payload] title is not "clover r376: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r414:"):
+        errors.append('[payload] title is not "clover r414: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -11496,7 +11519,7 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
         probe_code = [line for line in probe_text.splitlines()
                       if not line.strip().startswith(('*', '/*', '//'))]
         for now in ('"clover r344: dispstate ms=%llu fires=%u seen=%u client=%s pick=%s grewn=%s p58=%s calls=%s fails=%s "',
-                    '"regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\\n"',
+                    '"regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s\\n"',
                     '"clover r344: dispstatecut bytes=%d cap=%u fires=%u client=%s\\n"',
                     '"clover r344: dispclient idx=%u pid=%d calls=%u fails=%u regall=%u regs=%u grew=%u hot=%s s6=%s\\n"',
                     '"clover r344: dispclientcut bytes=%d cap=%u idx=%u pid=%d\\n"',
@@ -11505,11 +11528,77 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
                     'uint32_t regCalls;',
                     '++stat->regCalls;',
                     'extern "C" void native_legacy_display_state_beat(void) {reportDisplayState();}',
-                    'enum {kDispStateRowBytes=384,kDispClientRowBytes=320};'):
+                    'enum {kDispStateRowBytes=300,kDispClientRowBytes=300};',
+                    '"clover r414: panel ms=%llu fires=%u txa=%u txf=%u txe=%s txs=%s txd=%s col=%s oth=%u "',
+                    '"vs=%u/%llu/%llu log=%u/%u logdrop=%u\\n"',
+                    '"clover r414: panelcut bytes=%d cap=%u fires=%u txa=%u\\n"',
+                    'enum {kPanelRowBytes=300};',
+                    'reportPanelState(now);'):
             if not any(now in line for line in probe_code):
                 errors.append(f"package/CloverLegacyDisplayProbe.cpp does not carry {now[:60]!r}: without it "
                               "the client's state is still only printed beside a first event, and boot 113's "
                               "silence stays ambiguous")
+        # Round414. The state row's ceiling used to be 384 and the comment beside it claimed both rows sat
+        # inside one card record (512 - 23 - 1 = 488). The card record was never the narrowest thing on the
+        # path: the kernel ring's tee assembles a line at kVerdictTextBytes and that count includes the msgbuf
+        # stamp, so 304 characters of payload survive a 16-character stamp and the rest is discarded. Measured
+        # over the archived cards: 204 of the 232 dispstate rows that lost their tail end at exactly 303 or 304
+        # characters, and from boot 170 onward every state row of every boot was cut -- boot 171 lost all 22.
+        # The row's own 384 ceiling could not see it, so `dispstatecut` printed zero times on those boots.
+        # This leg reads the tee's bound from the header that owns it and refuses any probe row ceiling that
+        # does not leave room for the stamp, which is the check that would have caught the defect on the host.
+        log_core = REPO / "drivers/CloverSdhci/SdhciLogCore.h"
+        if log_core.is_file():
+            bound = re.search(r"\bkVerdictTextBytes\s*=\s*(\d+)", log_core.read_text())
+            if not bound:
+                errors.append("drivers/CloverSdhci/SdhciLogCore.h no longer declares kVerdictTextBytes: the "
+                              "probe's row ceilings are checked against that number, and without it the "
+                              "check silently stops asking whether a row fits the line the tee keeps")
+            else:
+                # 17 is the widest stamp this board can produce: "[", five-digit seconds, ".", six fractional
+                # digits, "]: ". The unattended deadline is 1800 s, so four digits is what a boot actually
+                # prints; the fifth is the margin, not a reading.
+                tee_line = int(bound.group(1))
+                for cap_name in ("kDispStateRowBytes", "kDispClientRowBytes", "kPanelRowBytes",
+                                 "kSwapWaitRowBytes"):
+                    declaration = re.search(r"^enum \{[^\n]*\b" + cap_name + r"\s*=\s*(\d+)", probe_text, re.M)
+                    if not declaration:
+                        errors.append(f"package/CloverLegacyDisplayProbe.cpp does not declare {cap_name} as a "
+                                      "literal on an enum line: the row-width leg reads the number from there")
+                        continue
+                    cap = int(declaration.group(1))
+                    if cap + 17 > tee_line:
+                        errors.append(f"{cap_name}={cap} leaves no room for the msgbuf stamp inside the tee's "
+                                      f"{tee_line}-character line ({cap}+17>{tee_line}): the row would be cut "
+                                      "downstream where the probe's own cut branch cannot see it, which is "
+                                      "how boot 171 lost the tail of all 22 state rows while dispstatecut "
+                                      "printed zero times")
+        # The refusals have to be counted where they happen, not only printed on the 96-line early channel.
+        # Boot 171 spent 66 of those 96 lines long before the panel was worth reading, so `tx=` (successes)
+        # was the only transfer number that survived -- and a boot whose copies all fail reads exactly like a
+        # boot whose client stopped asking.
+        for now in ('static volatile uint32_t transferFailCount,transferFailStatus,transferFailSite,transferFailDetail;',
+                    'transferFailCount=transferFailCount+1;'):
+            if now not in probe_text:
+                errors.append(f"package/CloverLegacyDisplayProbe.cpp does not carry {now[:60]!r}: the scanout "
+                              "refusals are then only ever printed on the early-only log channel, and a boot "
+                              "whose copies all fail is indistinguishable from one whose client stopped asking")
+        driver_text = display_driver.read_text() if display_driver.is_file() else ""
+        for now in ('extern "C" volatile uint32_t native_legacy_screen_colors[8]',
+                    'extern "C" volatile uint64_t native_legacy_screen_color_counts[8]',
+                    'extern "C" volatile uint64_t native_legacy_screen_color_other',
+                    'native_legacy_screen_color_other=other;'):
+            if now not in driver_text:
+                errors.append(f"drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp does not carry {now[:60]!r}: "
+                              "the panel row then prints colours nothing samples, and `scr=`'s hash is again "
+                              "the only late-boot reading of the frame -- it says the frame changed, not into "
+                              "what")
+        # The surface-miss refusal is the driver's own call, so it is pinned here rather than in the probe:
+        # site 10 is the branch r414 added, and a counter nothing increments prints txf=0 forever.
+        if 'native_legacy_transfer_observed(kIOReturnBadArgument,request,0,10,0);' not in driver_text:
+            errors.append("drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp does not report the surface-miss "
+                          "refusal as site 10: the panel row's txf=/txs= then cannot name the one branch this "
+                          "round added, and a boot refused there reads as a boot nobody asked")
         # Round344 (#695). Boot 123 is the reason: five records were interposed and the state row printed
         # `client=pid58 calls=0` while the others were the ones asking. The rule this gate protects is that
         # the row may not go back to choosing a record by a literal pid, and that the record it does choose
@@ -11625,7 +11714,12 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
                 errors.append("the r344 state row does not print latch= copy= fc= in that order: the "
                               "three columns are the same three words the swap row reads, and a reader "
                               "comparing the two rows needs them in the same order")
-            if not any("latchTxt,copyTxt,fcTxt," in line for line in probe_code):
+            # r414 ends the state row at fc=, so the three buffers are now the last operands and the list
+            # closes with `);` instead of continuing into vs=/log=/logdrop=. Both shapes are the same claim
+            # -- the three names sit under the three columns in that order -- so both are accepted, and a
+            # list that merely contains the three words somewhere is not.
+            if not any("latchTxt,copyTxt,fcTxt," in line or "latchTxt,copyTxt,fcTxt);" in line
+                       for line in probe_code):
                 errors.append("the r343 state row's operands are not latchTxt,copyTxt,fcTxt in that "
                               "order: the column names and the buffers under them would be two lists")
             # The old names are banned on code lines only. `frames=%u` in the r180 checkpoint tail and
@@ -12397,8 +12491,15 @@ def mach_object_abi(blob: bytes) -> str | None:
 
 
 def kernel_image() -> pathlib.Path | None:
-    for candidate in (pathlib.Path.cwd().parent / "kernel/kernel.macho",
-                      REPO.parent / "UniXNU/out/clover/kernel/kernel.macho"):
+    out = REPO.parent / "UniXNU/out/clover"
+    # format2 put the build under out/clover/<os-profile>/clover/. The pre-migration
+    # out/clover/kernel/kernel.macho is still on disk from the last build that used it, so
+    # naming it here checks link presence against a months-old kernel and reports its symbols
+    # ABSENT for an image that has them.
+    candidates = [pathlib.Path.cwd().parent / "kernel/kernel.macho"]
+    candidates += sorted(out.glob("*/clover/kernel/kernel.macho"),
+                         key=lambda path: path.stat().st_mtime, reverse=True)
+    for candidate in candidates:
         if candidate.is_file():
             return candidate
     return None

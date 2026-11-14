@@ -1,7 +1,7 @@
 # UniXNU-clover
 
 小米平板 4 8 英寸 LTE（2018，代号 `clover`）的 XNU 移植：4 GB / SDM660（Kryo 260，ARMv8.0，无指针认证），
-跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。配套固件仓库 `uefi-clover`。
+跑原封不动的 **iPad7,1 / iPadOS 17.7.11 / 21H461** 4 KiB 页镜像。配套固件检出 `mu-clover`。
 
 过程记录不放在这里：逐轮的取证、推翻与判读在 [`notes/development-log.md`](notes/development-log.md)
 （`§RoundNNN`），每轮摘要见 [`REPORT.md`](REPORT.md)，结构化记录见 [`porting.toml`](porting.toml)。
@@ -24,7 +24,7 @@
 | `CloverSdhci` | eMMC（SDHCI/ADMA2）与日志 tee | 已实现 |
 | `CloverPower` | PM660/PM660L、SPMI、时钟与电源域 | 已实现 |
 | `CloverInput` | I2C/QUP 总线；Goodix GT9xx 触摸报表（`clover-input=4`） | 已实现（持续读取待补） |
-| `NativeMobileDisplay` + 包内探针 | GOP 显示与交换路径 | 已实现（合成器停摆待查） |
+| `NativeMobileDisplay` + 包内探针 | GOP 显示与交换路径 | 已实现（r414 前状态行尾列被 tee 切掉，队列判读待重取） |
 | `CloverGpu` | Adreno 512：微码、PM4/ring/ME_INIT、CP 启动、SMMU 识别；LDO 电压可写、CTRL/PDN 不可写（轨归 CPR/固件侧） | 进行中 |
 | `CloverDsp` | ADSP 探针 | 仅探针 |
 | `NativeHidInput` / `NativeKeyStoreEvents` | HID 与按键、钥匙串事件 | 已实现 |
@@ -35,17 +35,35 @@
 
 | 步骤 | 状态 |
 | --- | --- |
-| 固件（`uefi-clover`） | 通 |
+| 固件（`mu-clover`） | 通 |
 | 内核入口与平台服务 | 通 |
 | 存储（APFS 卷挂载） | 通 |
 | 用户态（launchd 起的守护进程集） | 通 |
 | 点亮屏幕（GOP 路径首帧） | 通 |
-| SpringBoard / 合成器 | 卡住：backboardd 的 IOKit 交换在约 966 s 后停止 |
+| SpringBoard / 合成器 | 卡住：`tx` 停摆时刻逐靴变长（296→966→1179 s）；boot 185 到 1606 s 才有显示客户端、`tx=0` 全程 |
 | 桌面 | 未到 |
+
+## 闸门
+
+| 闸门 | 最近一次 | 结果 |
+| --- | --- | --- |
+| `check-clover.py` | r414c | EXIT=0 |
+| `verify-clover-payload.py` | r414c | EXIT=0，51 OK / 0 FAIL |
+| 负测（比对盘上产物，不动活树） | r414c | 12/12 |
+
+## 已知缺口
+
+| 缺口 | 影响 | 处置 |
+| --- | --- | --- |
+| `patches.py prepare()` 信任自己的签名戳 | 签名写定后工作树漂移不再复核；r376–r414 丢了 `zzy-clover-dyld-cache-skip.patch` | 已补回；审计用**正向** `git apply --check` |
+| tee 行界 320 含 msgbuf 戳 | 正文只活 304 字符，状态行尾列（`vs=`/`log=`/`logdrop=`）被切 | r414 四处天花板改 300 + 新增 `panel` 行 |
+| 短行行首胶合 | 前一条无换行时粘住下一行行首 | 与切尾分开处置，未修 |
+| GFX 轨归 CPR/固件侧 | AP 写不动 CTRL/PDN，a5xx 无 GMU 可照搬 | GPU 线停在此处 |
 
 ## 构建
 
-需要 UniXNU 检出（`../UniXNU`）与 `uefi-clover` 产物。
+需要 UniXNU 检出（`../UniXNU`）与 `mu-clover` 检出（`{uefi}/Common/Mu`、`Silicon/Qualcomm`、
+`Silicium-ACPI` 三个包路径只有它有；旧的 `uefi-clover` 是半成品）。
 
 ```sh
 # 内核
@@ -55,7 +73,7 @@ python3.13 ./unixnu build kernel --device ../UniXNU-clover
 python3 ../UniXNU-clover/scripts/patch-clover-amfi.py <kernel> <out>
 python3 ../UniXNU-clover/scripts/normalize-kernel-macho.py <amfi>
 python3.13 ./unixnu build payload --device ../UniXNU-clover --unique-chip-id 81ffcaaa \
-  --uefi ../uefi-clover --kernel <normalized> \
+  --uefi ../mu-clover --kernel <normalized> \
   --data-ramdisk ../UniXNU-clover/build/clover-root/launchd.macho \
   --trust-cache ../UniXNU-clover/build/clover-trust/trustcache.bundle
 ```

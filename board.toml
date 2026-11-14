@@ -333,7 +333,10 @@ loader = "firmware"
 # Round375's case: the walk is off by default so a boot can reach its own display readings.
 #
 # Round376 logs every 128th frame so the panel content late in a boot is readable.
-title = "clover r376: A boot that reaches its deadline only ever logged its first six frames, so the \"panel content\" late in a boot was unknown. This round logs every 128th frame as well, giving snapshots of what is on screen at about 2, 4, 6, 8, 10 and 12 minutes -- enough to say whether the visible content changes from the boot progress state at all. Nothing else moved: no offset, kind, clamp, ring geometry or cadence."
+#
+# Round414's case: the state row's tail was cut at the tee's own line bound, and the columns lost were
+# the ones that say whether the channel is still alive.
+title = "clover r414: The state row was being cut downstream at the tee's 320-byte line bound, and the columns lost (vs=/log=/logdrop=) are the ones that say whether the channel is alive -- 211 of 620 archived state rows end mid-column, 207 of them pinned at exactly 304 visible characters, and every row of boots 171-179 was cut while boot 170 lost 20 of 21. This round moves them onto a second row (\"clover r414: panel\") fired by the same beat, adds the transfer refusal's own status/site/detail beside the success count, and prints the panel's four most-sampled colours so late-boot content is a reading rather than a hash. All four display row ceilings become 300, checked against the tee's bound plus the widest msgbuf stamp."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

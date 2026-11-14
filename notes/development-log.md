@@ -30733,3 +30733,220 @@ dispstate ms=1795261 … calls=1155 fails=15 last=0@1179s tx=284@1179s s6f=283 f
 **判读。** 家族队列的停摆与退休时机无关，而是 pending 头在某次竞态后不再可激活；sheng 用 GPU
 路径绕过了它。clover 没有 GPU，等价物只能是**板级 user client**（自己处理 selector 6 的提交与回包，
 完全不进家族队列）或拿到家族的队列状态机。下一步按前者做。
+
+
+## Round389–413 —— 补记（指针节）：这 25 轮实际走的是 GPU 与触摸两条线
+
+r388 的「下一步做板级 user client」**没有执行**。翻 commit 题名（`git log 4c78093..60b283a`）可以看到
+实际分岔：主线转去 UEFI/GPU 与触摸，显示队列那条线停在 r388 的判读上，直到 r414 才回来。
+这一节只做索引，不重述每轮；细节在各 commit 与 `notes/` 的专题文档里。
+
+**GPU 线（a5xx，Adreno 512）：**
+- `4c78093` r389：照厂商实现 GFX LDO 上电序列，由 `clover-gpu` 开关控制；
+- `e5079b3` 归档厂商 a5xx 驱动源 + 写 GPU 实施计划；`fd44345` 可刷层（固件 blob 形状 + PM4 头，宿主测试）；
+- `6673c97` CP ring 几何与控制字；`e8ad9f4` ME_INIT 九个 dword；`626ce2b`/`4f25151` 两枚 a5xx 微码的
+  嵌入生成器（来源记在案）；`f0d8720` ring 分配器 tail/head/full 规则；
+- `42450a6` **r394：真启动 CP**——ring、微码基址、ME_HALT、ME_INIT、读指针轮询；
+- `29e31d6` 流水线末端时间戳包（CACHE_FLUSH_TS 已有来源）；`0b7a249`/`6e49d23`/`3e12487` SMMU：
+  集成计划、ArmSmmu4K API 钉死、只读识别；
+- `ee8ded6`/`e57ee1a` **GFX LDO 的写序列就是挂住启动的那一手**：电压写得进，控制寄存器写不进；
+- `d2cbfe3` sheng 的 GPU 供电由 GMU 拥有，a5xx 没有 GMU ⇒ 那条路不能照搬；
+- `3cfa8f4` **r410**：重试控制序列前先置 VREF_TEST_CFG 的 status-enable 位；
+- `273bb0f`/`81aa149`/`2e7de07`/`f587c42`/`ca99d0a`/`60b283a` 六轮纯取证：GFX 轨不是 AP 可写块；
+  UEFI 确实带 SPMI/PMIC 驱动但没有 RPM 请求通路；那些驱动在厂商 xbl 里、不在我们的 FV；
+  **官方 GPU 路径是 A740 专用，对 a5xx 不适用**。
+
+**触摸线（Goodix）：** `37c4402` 点缓冲解码器 → `4c954a2` `clover-input=4` 读点缓冲并经 HID 发布 →
+`684c80b` 六条记录映射到 HID 轴（原始网格从 config blob 读） → `3bfa106` 读完清报告。
+
+**判读。** 这两条线的产出都在盘上，但**都不是「进桌面」那一格**：GPU 线卡在 GFX 轨的拥有权（AP 写不动），
+触摸线是桌面之后的事。r414 回到显示线时发现，挡在判读前面的不是驱动，是**仪器本身**。
+
+
+## Round414 —— 撤回两个论断：真因是 tee 的 320 字节行界，切掉的正是「通道还活着吗」那三列
+
+**先撤回。** 此前两条写进注释/判读的话是错的：
+1. 「`cloverLog` 的行到不了卡」——错。到得了；到不了的是**超过 96 行预算之后**的行，而预算耗尽这件事
+   本来有 `logdrop=` 列在说，只是那一列被切掉了（见下）。内核日志环是 **512 槽滚动窗口**，旧行被覆盖
+   不是「没送达」。
+2. 「`tx` 冻结」——错。`tx` 与 `last` 在 boots 170–179 里逐靴变长（296→966→1179 s），是累积/竞态；
+   而 r414 普查发现，那些靴的**状态行尾列全被切**，所以「冻结」的一部分观感来自读不到尾列。
+
+**真因（量出来的，不是猜的）。** 卡记录正文界是 480（`SdhciLogCore.h kRecordBodyBytes`），但**路径上最窄的
+不是卡记录**：内核环的 tee 按 `kVerdictTextBytes = 320` 组行，**这个数含内核前置的 msgbuf 戳**
+（`[ 1790.633354]: ` 16 字符），所以只有 **304 字符正文**活下来，其余丢到换行并计一次截断。
+状态行自己的天花板是 384，永远看不见这次截断 ⇒ `dispstatecut` 在「每拍都被切」的靴上打印 **0 次**。
+
+**普查（可复现：`clover-out/round414b-rowcensus.py` → `round414b-rowcensus.log`）。** 判据＝去掉戳后
+尾列 `logdrop=<数字>` 是否完整；只取卡读数文件（tee  dump / flash / readback / run），排除闸门日志：
+```
+files=44 rows=620 cut=211 pinned-at-304=207 maxlen=304
+boot169: 14/22   boot170: 20/21   boot171: 22/22
+boot172/174/175/176/177/178/179: 各 20/20
+```
+- **boots 170–179 共 9 靴（无 173）几乎全切**；boot 171 的 22 行里 21 行正好 304、1 行 303，
+  尾巴停在 `log=66/96` 或 `log=66`，而格式写的是 `log=66/96 logdrop=0`
+  （`clover-out/round387-flash-boot171.log`）；
+- 被切掉的三列 `vs=` / `log=` / `logdrop=` **恰好就是「通道还活着吗」**：vsync 有没有起、预算用了多少、
+  拒了多少行。**一行丢掉了自己的预算列，就无法说出自己被切了。**
+
+**反例（同一支仪器的正对照）。** `clover-out/restore-verify-boot184.log`（文件名 184，卡上 boot counter
+与 flight 都写 **boot=185**）：16 行 dispstate，**0 行被切，最长 266**。所以切尾是**宽度驱动**，不是普遍故障。
+这靴的读数还是另一个 regime：
+```
+ms=1591446 fires=52 seen=0 client=none … tx=0@0s s6f=0
+ms=1606596 fires=53 seen=1 client=pid86 … calls=0 fails=0 tx=0@0s
+ms=1806324 fires=64 seen=5 client=pid99 … calls=2 fails=1 tx=0@0s
+```
+**到 1591 s 都没有显示客户端**，1606 s 才出现第一个，全程 `tx=0`；1800 s 死线到点复位。
+
+**另一处独立缺陷：短行胶合。** 同一靴有一行是
+`Protobox: DumpPanic(49) deny(1) syscall-mig 46clover r344: dispstate …`——前一条没换行，
+把行首胶住了。这是 r335 记过的行首胶合，与 304 切尾**不是同一件事**，要分开处置。
+
+**改动（probe / driver / 读者 / 闸门）。**
+- `package/CloverLegacyDisplayProbe.cpp`：四处行天花板 **384/320/320/320 → 全 300**
+  （300 + 17 字符最宽戳 = 317 < 320）；`vs=`/`log=`/`logdrop=` 挪到新的第二行；
+- 新增 **`clover r414: panel`**，同一拍触发、带同一个 `fires=` 序号（两行可在卡上对齐，不用猜时间戳）：
+  `txa=`（全部 scanout 观测，成功+拒绝）、`txf=`（拒绝数，另一条路径独立计数，两路可以 visibly 打架）、
+  `txe=/txs=/txd=`（最后一次拒绝的 IOReturn / 站点 / 站点详情，站点 1–10 是驱动自己的编号）、
+  `col=`（面板采样最多的四种颜色 `<%08x>/<count>`，`oth=` 是八槽之外的采样数）、以及挪来的三列；
+  自己的 `clover r414: panelcut` 出口——**被切的那部分不能报告自己被切**；
+- `native_legacy_transfer_observed()` 签名加 `site`/`detail`，失败路径开始计数（此前失败只走 96 行预算的
+  `cloverLog`，boot 171 早就用完了）；
+- `scripts/read-clover-log.py`：行宽按 **tee 的界**校验，不再按卡记录的界；
+- 两个 checker 加 `r414-panel` / `r414-panelcut` 针脚。
+
+**判读。** 这一轮不改显示逻辑，只把「读不到」和「没发生」分开。r388 之后所有关于队列停摆的判读都建立在
+被切尾的行上，**必须重读**：下一靴先拿完整的 `panel` 行，再谈队列。
+
+
+## Round414b —— 两枚闸门针脚指向死文件；顺带查出 r376 起丢了一枚内核补丁
+
+**闸门先红了，红得有道理。** r414 首次 `verify-clover-payload.py` **EXIT=1**，两条 FAIL
+（`clover-out/round414-verify-payload.log`）：
+```
+probe patch localized  FAIL (length 52551680 vs 52420608)
+dyld cache hash skip   FAIL (prepare branch ABSENT, skipped store ABSENT, hash accept ABSENT)
+```
+两条是**两个不同的病**，别混：
+
+**病一：闸门默认指向 format2 迁移前的死文件。** format2 把产物挪到
+`out/clover/<os-profile>/clover/…`，但旧路径 `out/clover/{kernel,payload,tree}/` 里**还留着 11-08 最后一次
+用旧布局构建的文件**。两个 checker 的默认都指着旧路径 ⇒ 拿几个月前的内核去查针脚，然后报 ABSENT，
+**而且不说自己读的是陈旧文件**。四枚 `r354-noinline-*` 的 ABSENT 与 `probe patch localized` 的长度不符
+都是这一病。修法（两处，都删掉旧布局回退）：
+- `scripts/verify-clover-payload.py`：新增 `built(relative)`，按 `*/clover/<relative>` glob 取 mtime 最新；
+  `XNU_PAYLOAD` / `LOCAL_KERNEL` / `TREE` 三个默认全走它；`check_sb_sample` 的 `nm` 改成把**待验镜像的字节**
+  落到临时文件再读，不再读默认；
+- `scripts/check-clover.py:kernel_image()`：同样按 os-profile newest-first 发现。
+
+**病二（真回归）：`zzy-clover-dyld-cache-skip.patch` 声明在 series 里，但工作树里没有。**
+series 第 84 行 / `xnu-patches.list` 第 55 行（共 168 枚）都在，`.cache/xnu-work` 里却没有它。
+机制：`board.toml:77 patch_series` → `scripts/unixnu/kernel.py:187` 设 `UNIXNU_PATCH_LIST` ⇒
+`build-xnu-4k-baseline.sh:38` 跳过脚本自带的 LATE_PATCH 重放；而 `scripts/unixnu/patches.py prepare()`
+**只在签名变化时**（源路径 + xnu commit + 每枚补丁路径/sha256）或 `.git` 缺失时才重新克隆重放。
+**签名写完以后树再漂移，就永远不再复核。**
+
+**三种审计法，两错一对（记下来免得再犯）：**
+| 方法 | 结果 | 为什么错/对 |
+| --- | --- | --- |
+| 反向 `git apply --check` 逐枚 | 报 83 枚「缺失」 | 反向检查**依赖顺序**，不能当普查 |
+| 新增行是否存在 | 0 枚可疑 | 通用行别处也有，判据太弱 |
+| **正向 `git apply --check` 成功** | **恰好 1/168** | 能正向打上 ⇒ 该补丁**不在树里** |
+
+**这枚补丁干什么（r164 引入）：** 跳过「从 16K 签名的 dyld 共享缓存推导 4K 认证符」——否则整个多 GB 文件
+必须先读完，第一页才能映射。以本港口的存储速率，那是**几十分钟**。
+
+**逐轮普查（`clover-out/round414b-skipcensus.py` → `round414b-skipcensus.log`）。** 针脚＝补丁自己那条
+被跳过的 store（`mov w8,#1 ; strb w8,[x1,#0xd0]`，8 字节指令）：
+```
+images=468 present=259 absent=209
+PRESENT: r164-r375（r365 单轮例外）, r414(=r414b)
+ABSENT : r163(早于补丁), r365, r376-r389, r402-r410, r414(修前)
+```
+⇒ **自 r376 起连续缺失**。format2 迁移的提交都在 2026-11-08（`48bce5b`/`c4d76b7`/`5341f07`/`4c6398c`/`3def636`）。
+
+**假设（明确标注为假设，未证）：** 没有这枚 skip，每靴都要先读完多 GB 才能映射第一页 dyld 缓存 ⇒
+可能就是「客户端迟到/永不出现」那个 regime 的成因。**支持它的现成读数**：boot 185 刷的是
+`round388-v0.7.109-payload.img`（`restore-verify-boot184.log` 首行），而 r388 内核**ABSENT**；
+该靴 1591 s 无客户端、`tx=0` 全程。这是**同板同根卷的 A/B 前半**，后半就是 r414b 这一靴。
+
+**r414b 构建链（全部 EXIT=0，产物在 `clover-out/`）：**
+| 步 | 产物 | sha256 |
+| --- | --- | --- |
+| kernel | `round414b-build-kernel.log` | `ed855818…`（52551680 B） |
+| AMFI | `round414b-kernel-amfi.macho` | `899a285a…`（偏移 `0x1b040e4`/`0x1b0416c`） |
+| normalize | `round414b-kernel-normalized.macho` | `e6b785ec…`（973 枚戳归零） |
+| payload | `round414b-payload.img` | `5595354d…`（56 MiB） |
+
+UEFI 检出歧义已解：README:58 写的 `../uefi-clover` 是**旧的半成品**（只有 Binaries/BootShim/Platforms/
+Resources/scripts）；`board.toml` 要的 `{uefi}/Common/Mu`、`{uefi}/Silicon/Qualcomm`、`{uefi}/Silicium-ACPI`
+只有 `/Users/zhouzhou/mu-clover` 有 ⇒ 本轮用 `--uefi /Users/zhouzhou/mu-clover`。
+
+**双闸门 + 负测：**
+- `round414b-check-clover.log` **EXIT=0**；
+- `round414b-verify-payload.log` **EXIT=0，48 OK / 0 FAIL**（`probe patch localized OK (7016 bytes in 35 runs,
+  sha256 4bc2e214…)`、`dyld cache hash skip OK`、四枚 `r354-noinline-*` 全在、`r414-panel`/`panelcut` 全在）；
+- `round414b-negatives.py` → `round414b-negatives.log` **12/12 PASS**，全部比对盘上产物、不动活树：
+  修前 r414 内核与 11-08 旧内核**都能把闸门打红**，本轮内核打绿；`check_sb_sample` 旧字节 False / 新字节 True；
+  `check_dyld_cache_skip` 两者都 True（**正对照**：证明这枚针脚不是恒红）；四个默认全部解析到 os-profile 下，
+  且 `XNU_PAYLOAD` 与本轮归档镜像**逐字节相同**。
+
+
+## 插曲 —— TWRP 格式化 data：iOS 根卷被抹，已按批准重写回
+
+用户在 TWRP 看到「data 已加密」提示后格式化了 data。本板的 `userdata`（`mmcblk0p64`，first_lba
+`0xf10520` = 15795488）装的是 **iOS 根卷**，不是 Android 的 /data ⇒ **根卷被抹掉**。
+`boot`/`recovery`/`cache` 不受影响。经用户批准（「刷，恢复 iOS 根卷」）重写 `userdata`：
+`clover-out/restore-userdata-2.log` **19/19 段全 OKAY，Total time 281.894s，EXIT=0**。
+boot 185 就是重写后的验证靴（读数见 §Round414 反例段）。
+**仍欠一刀**：回 TWRP 后重读 LBA 15795488（`adb exec-out dd bs=512 skip=15795488 count=8`）
+与宿主镜像的「4096 字节里 4057 非零」形状对比，确认根卷真在盘上。
+
+
+## Round414b 预登记 —— boot 186 判据（刷机前写定，读数回来后不得改口）
+
+镜像：`clover-out/round414b-payload.img`（`5595354d…`），冷刷 **cache only**，
+读回走 `run-clover-unattended.sh --allow-misc-bcb`（二次 BCB）。**不进 EDL，要正常回 TWRP。**
+
+**第一组：仪器自证（不成立则本轮读数全部作废，先修仪器）**
+- **V-A** 卡上出现 `clover r414: panel` 行，且 `fires=` 能与同拍 `dispstate` 对齐；
+- **V-B** `dispstate` 与 `panel` 两行**尾列完整**（`logdrop=<数字>` 在场），正文 ≤300；
+- **V-C** `dispstatecut` / `panelcut` **打印 0 次**；若非 0，它报的 `bytes=` 就是下一轮要削的宽度；
+- **V-D** `log=`/`logdrop=` 第一次可读 ⇒ 能判「行缺席」是预算拒绝还是事件没发生。
+
+**第二组：dyld-skip 假设的 A/B 后半（对照＝boot 185，r388 镜像，ABSENT）**
+- **V-E** 首个显示客户端出现时刻 **显著早于 1606 s**（boot 185 是 `seen=0` 到 1591 s）⇒ 假设得到支持；
+- **V-F** 若仍在 ~1600 s 之后才出现客户端、且 `tx=0` 全程 ⇒ **假设被否**，「客户端迟到」与这枚补丁无关，
+  下一支回到 r388 的板级 user client；
+- **V-G** 若客户端早到但 `tx` 仍停在某个时刻 ⇒ 两件事是**两个病**，队列停摆照 r386–r388 的线继续。
+
+**第三组：第一次能读到的新事实（无论 A/B 结论如何都要落盘）**
+- **V-H** `txa - tx` 与 `txf` 是否一致；不一致就是两条计数路径有一条错，先修计数；
+- **V-I** `txs=`/`txe=`/`txd=` 指出拷贝停在**哪一站**（1–10）——这是 r386 以来第一次能把
+  「拷贝失败」变成「拷贝在这里失败」；
+- **V-J** `col=` 四种主色 + `oth=`：面板到底显示了什么。r376 的颜色行是事件时打印、早被 512 槽窗口覆盖，
+  所以晚期靴此前**没有任何颜色读数**。
+
+**判停条件不变**：板子真进 iOS 桌面。破坏性/不可逆动作仍先问。
+
+
+## Round414c —— 标题里两个数字被我自己的复测推翻；镜像重出，判据一字不动
+
+**改的是什么。** 不是代码，是 `board.toml` 的 `[payload].title` 里那句读数。r414 写标题时用的是
+先前摘要里的统计（「204 条断行」「boots 170–179 每一行都被切」），而 r414b 用
+`clover-out/round414b-rowcensus.py` 在 44 份存档卡读数上重算得到的是：**620 行中 211 行断行，
+其中 207 行正好卡在 304 个可见字符**；按靴拆开是 boot171 22/22、boots 172/174–179 各 20/20、
+**boot170 是 20/21**（不是每一行）。「204」和「每一行」两处都与产物不符，标题是会被
+`verify-clover-payload.py` 从镜像里读回来的东西，所以它必须跟着产物改，而不是留在存档里。
+
+**重出链。** 内核不变（仍是 `round414b-kernel-normalized.macho`，`e6b785ec…`），只重打 payload：
+`clover-out/round414c-payload.img`，**`d4a8533b5fb2927c4ffa93669fd5edbe56184381d7af92945ca2ecda3014d16a`**，
+58,720,256 字节（构建 `round414c-build-payload.log` EXIT=0）。三道闸门：
+`round414c-check-clover.log` EXIT=0、`round414c-verify-payload.log` EXIT=0（0 FAIL，标题项通过）、
+`round414c-negatives.log` 12/12 PASS（`default-payload-is-this-build: True`）。
+
+**判据不动。** 上一节的 V-A…V-J 原样有效；变的只有镜像身份：**boot 186 请刷
+`clover-out/round414c-payload.img`（`d4a8533b…`），不是 `5595354d…` 那枚**。两次构建的
+`unixnu.toml` 差异只有标题串，行内容与探针代码完全相同。

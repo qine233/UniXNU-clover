@@ -1355,6 +1355,16 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r344: dispstatecut", "r344-dispstatecut", 8, 0, 0, 0 },
   { "clover r344: dispstate", "r344-dispstate", 96, 0, 0, 0 },
 
+  // Round414's panel row is fired by the same beat as the state row and carries the columns that row lost when
+  // its ceiling came down to the tee's line budget, plus the transfer refusals and the panel's colours. Same
+  // containment, same defence, same arithmetic: the cut key is longer and listed first, 96 covers sixty beats
+  // and eight interposed clients, 8 is for a branch the probe expects never to reach. It is a separate class
+  // rather than a wider r344-dispstate budget because the two rows answer different questions and a cap that
+  // ate one must not be able to eat the other -- boot 171 lost the tail of all 22 state rows, and the row that
+  // would have said so was the one being cut.
+  { "clover r414: panelcut", "r414-panelcut", 8, 0, 0, 0 },
+  { "clover r414: panel", "r414-panel", 96, 0, 0, 0 },
+
   // Round335 re-keys the swap-wait row on the call's own argument; r343 names the display words for their
   // producers (arg=/latch=/copy=/fc=/cur=/list=, see the probe) and carries the heads below. Same
   // containment as r329 and the same defence: the cut row's token starts with the state row's token, so the
@@ -5067,6 +5077,9 @@ static void teeConsumeLine (uint32_t &pushed)
        // per-record rows (and both families' cut branches) are fired by the same beat, so one token covers
        // the whole display group; the class budgets of 96, 128 and 8 still bound it.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r344-disp") ||
+       // Round414's panel row rides that same beat and exists because the state row's tail was being cut
+       // downstream: a pass cap that ate it would reproduce exactly the silence it was added to remove.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r414-panel") ||
        // Round335's swap-wait rows ride the client's own calls, not a burst: a boot that stalls in this wait
        // prints its last row at the moment it stalls, and that row is the one the whole round is built to
        // read. Dropping it to a pass that had already spent its sixteen pushes would leave the reader with

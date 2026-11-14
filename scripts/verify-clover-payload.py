@@ -25,15 +25,28 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 import tomllib
 
-XNU_PAYLOAD = pathlib.Path("/Users/zhouzhou/UniXNU/out/clover/payload/payload.img")
+OUT = pathlib.Path("/Users/zhouzhou/UniXNU/out/clover")
+
+
+def built(relative: str) -> pathlib.Path:
+    """The newest os-profile build of `relative`. format2 moved every product under
+    out/clover/<os-profile>/clover/, and the pre-migration paths still hold files from the last
+    build that used them: a default naming those reads a months-old kernel and calls its needles
+    ABSENT without ever saying the file it read was stale."""
+    hits = list(OUT.glob(f"*/clover/{relative}"))
+    return max(hits, key=lambda path: path.stat().st_mtime) if hits else OUT / relative
+
+
+XNU_PAYLOAD = built("payload/payload.img")
 LOCAL_ROOT = pathlib.Path("/Users/zhouzhou/UniXNU-clover/build/clover-root/launchd.macho")
 LOCAL_CACHE = pathlib.Path("/Users/zhouzhou/UniXNU-clover/build/clover-trust/trustcache.bundle")
-LOCAL_KERNEL = pathlib.Path("/Users/zhouzhou/UniXNU/out/clover/kernel/kernel.macho")
+LOCAL_KERNEL = built("kernel/kernel.macho")
 # The assembled build tree: scripts/build-clover-pmgr.py records the original-PMGR addresses it
 # audited here, and kits/NativePrelink (a symlink into the UniXNU base) parses Mach-O for it.
-TREE = pathlib.Path("/Users/zhouzhou/UniXNU/out/clover/tree")
+TREE = built("tree")
 PMGR_REPORT = TREE / "build/clover-pmgr/build-report.json"
 # Round177: the tool that turns the three fields a link cannot reproduce into functions of the rest of
 # the kernel, so two builds of one tree are one file. Imported by path, not copied, so the checker and
@@ -999,15 +1012,19 @@ def check_sb_sample(kernel: bytes) -> bool:
     # Round354's fix is a link fact, not a string: boot 133 died on the beat thread's 16 KB stack
     # because the four heavy helpers were inlined into clover_bb_sample's 10912-byte frame. Each
     # helper has to own an independent text symbol in the linked kernel, or the frames accrete
-    # again the first time the sampler fires.
+    # again the first time the sampler fires. nm has to read the kernel this image ships: the
+    # LOCAL_KERNEL default is the pre-os-profile layout path, which still holds a months-old
+    # kernel on disk and reported all four symbols ABSENT for a good image.
     r354_syms = set()
-    if LOCAL_KERNEL.exists():
-        nm = subprocess.run(["nm", str(LOCAL_KERNEL)], stdout=subprocess.PIPE,
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = pathlib.Path(tmp) / "kernel.macho"
+        staged.write_bytes(kernel)
+        nm = subprocess.run(["nm", str(staged)], stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, text=True)
-        for line in nm.stdout.splitlines():
-            parts = line.split()
-            if len(parts) == 3 and parts[1] in "tTsS":
-                r354_syms.add(parts[2])
+    for line in nm.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[1] in "tTsS":
+            r354_syms.add(parts[2])
     found = {"sbs": (b"clover r217: sbs t=%llu pid=%d n=%u c=%u%s%s\n") in kernel,
              "busy": (b"clover r217: sbthr busy=1 pid=%d budget=%u\n") in kernel,
              "killsrc": (b"clover r218: killsrc upc=%016llx ulr=%016llx code=") in kernel,
@@ -1290,10 +1307,21 @@ def check_sb_sample(kernel: bytes) -> bool:
              # quietly swallowing the row's tail, and a binary that carries one and not the other cannot
              # say which half of that promise it broke. r327's and r328's rows stay: this round adds a
              # neighbour, it does not replace either.
+             # Round414 moves vs=/log=/logdrop= off this row onto the panel row beside it: the state row's
+             # tail was being cut downstream at the tee's 320-byte line bound, and the three columns that
+             # said whether the channel was still alive were the ones in the cut part. The pin follows the
+             # format, so a binary that kept the old tail fails here rather than on the card.
              "r344-dispstate": (b"clover r344: dispstate ms=%llu fires=%u seen=%u client=%s pick=%s grewn=%s "
-                               b"p58=%s calls=%s fails=%s regall=%s regs=%s grew=%s hot=%s s6=%s "
-                               b"latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\n") in kernel,
+                               b"p58=%s calls=%s fails=%s last=%s tx=%u@%us s6if=%u s6f=%u scr=%u/%u/%llx "
+                               b"regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s\n") in kernel,
              "r344-dispstatecut": (b"clover r344: dispstatecut bytes=%d cap=%u fires=%u client=%s\n") in kernel,
+             # Round414's panel row: the second half of the same beat, carrying the columns the state row
+             # could no longer hold plus the failure accounting and the panel's own colours. Pinned as the
+             # concatenated CString for the same reason r343's row is, and its cut branch beside it -- a row
+             # cannot report its own truncation from inside the truncated part.
+             "r414-panel": (b"clover r414: panel ms=%llu fires=%u txa=%u txf=%u txe=%s txs=%s txd=%s col=%s "
+                            b"oth=%u vs=%u/%llu/%llu log=%u/%u logdrop=%u\n") in kernel,
+             "r414-panelcut": (b"clover r414: panelcut bytes=%d cap=%u fires=%u txa=%u\n") in kernel,
              # Round344's per-record rows: the reference prints every record, this port prints one card record
              # per line, so both the row and the branch that says it did not fit are pinned as CStrings.
              "r344-dispclient": (b"clover r344: dispclient idx=%u pid=%d calls=%u fails=%u regall=%u regs=%u "
@@ -1523,7 +1551,8 @@ def check_sb_sample(kernel: bytes) -> bool:
              # word, the driver's own uV decode, and its own settling bits. Without this row the round asks
              # about a rail the image cannot read.
              "gpu-row-ldo": (b"clover r291: gpu t=%u ldo %s vref=%08x val=%u uv=%u ctrl=%08x byp=%u pdn=%u "
-                             b"cpr_byp=%u sts=%08x ready=%u settled=%u cx_on=%u gx_on=%u\n") in kernel,
+                             b"cpr_byp=%u sts=%08x ready=%u settled=%u cx_on=%u gx_on=%u ran=%u "
+                             b"vfa=%08x cfa=%08x\n") in kernel,
              # Round294's census: the whole LDO block, in one row. Pinned as the compiler merges the two
              # segments, which is the shape the shipped image carries -- the source splits it across lines.
              "gpu-row-ldo-census": (b"clover r294: gpu t=%u ldo words %s w00=%08x w04=%08x w08=%08x "

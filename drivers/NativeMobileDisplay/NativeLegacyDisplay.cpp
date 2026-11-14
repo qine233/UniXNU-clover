@@ -34,10 +34,17 @@ extern "C" void native_legacy_swap_validation_observed(bool,unsigned,const void 
 extern "C" void native_legacy_frame_presented(unsigned kind);
 extern "C" volatile uint32_t native_legacy_screen_nonblack=0,native_legacy_screen_sampled=0;
 extern "C" volatile uint64_t native_legacy_screen_hash=0;
+// Round414: what the panel actually holds, per state beat. The eight slots are the first eight distinct colours
+// met in the sample pass, in first-seen order; `other` counts the samples whose colour is in none of them. The
+// non-black count and the hash say the frame changed, not what it changed into, and the early-frame colour rows
+// that used to answer that fall outside the log ring's window long before the panel is worth reading.
+extern "C" volatile uint32_t native_legacy_screen_colors[8]={0,0,0,0,0,0,0,0};
+extern "C" volatile uint64_t native_legacy_screen_color_counts[8]={0,0,0,0,0,0,0,0};
+extern "C" volatile uint64_t native_legacy_screen_color_other=0;
 // The surface of a rejected swap, as the validator read it: width, height, format, planes, stride, allocation, descriptor length.
 extern "C" void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t,uint32_t,uint64_t,uint64_t,uint64_t);
 extern "C" bool native_legacy_prepare_scanout(void);
-extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
+extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t,unsigned,uint32_t);
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
 extern "C" void native_legacy_retirement_observed(IOService *);
 // GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
@@ -160,10 +167,26 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         uint64_t n=bytes/4;
         uint64_t step=n/4096;if(!step)step=1;
         uint32_t nonblack=0,sampled=0;uint64_t hash=0;
-        for(uint64_t i=0;i<n;i+=step){uint32_t px=fb[i];if(px)nonblack++;hash=hash*1315423911ull+px;sampled++;}
+        uint32_t colors[8]={0,0,0,0,0,0,0,0};uint64_t counts[8]={0,0,0,0,0,0,0,0};
+        uint32_t used=0;uint64_t other=0;
+        for(uint64_t i=0;i<n;i+=step){
+            uint32_t px=fb[i];
+            if(px)nonblack++;
+            hash=hash*1315423911ull+px;sampled++;
+            uint32_t slot=0;
+            while(slot<used && colors[slot]!=px)slot++;
+            if(slot<used)counts[slot]=counts[slot]+1;
+            else if(used<8){colors[used]=px;counts[used]=1;used=used+1;}
+            else other=other+1;
+        }
         native_legacy_screen_nonblack=nonblack;
         native_legacy_screen_sampled=sampled;
         native_legacy_screen_hash=hash;
+        for(uint32_t k=0;k<8;++k) {
+            native_legacy_screen_colors[k]=colors[k];
+            native_legacy_screen_color_counts[k]=counts[k];
+        }
+        native_legacy_screen_color_other=other;
     }
     static void stateBeatFired(OSObject *owner,IOTimerEventSource *) {
         static_cast<NativeLegacyDisplay *>(owner)->sampleScreen();
@@ -336,52 +359,77 @@ public:
             if(PE_current_console(&blank) || blank.v_baseAddr!=bootMapping->getPhysicalAddress() ||
                blank.v_width!=bw || blank.v_height!=bh || blank.v_depth!=32 || blank.v_rotate ||
                !native_legacy_surface_bounds(bw,bh,blank.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
-                native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
+                native_legacy_transfer_observed(kIOReturnNotReady,request,0,1,0);return;
             }
-            if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+            if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0,2,0);return;}
             if(!native_legacy_fill_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U)) {
-                native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+                native_legacy_transfer_observed(kIOReturnBadArgument,request,0,3,0);return;
             }
             __asm__ volatile("dsb sy" ::: "memory");
             shadowValid=false;
             transferred=true;
             native_legacy_frame_observed(1,0,0,0,0,0);
             {const uint32_t colors[4]={0xff000000U,0,0,0};const uint64_t counts[4]={(uint64_t)bw*bh,0,0,0};native_legacy_frame_colors_observed(colors,counts,0);}
-            native_legacy_transfer_observed(kIOReturnSuccess,request,blankLength);
+            native_legacy_transfer_observed(kIOReturnSuccess,request,blankLength,0,0);
             finishTransfer(request);
             return;
         }
         if(!surface->metaCast("IOSurface")) {
             /*
              * A request whose surface is not an IOSurface was dropped silently, so a boot that stops
-             * presenting looks identical to one that keeps swapping. Name the object instead.
+             * presenting looks identical to one that keeps swapping. Name the object instead, and count
+             * the drop: the 1-in-64 row below is an early-boot reading, and the log ring only keeps the
+             * last few hundred seconds of a boot, so late drops were invisible.
              */
             if((surfaceMiss++ % 64)==0) {
                 const OSMetaClass *meta=surface->getMetaClass();
                 IOLog("clover r380: surface-miss #%u class=%s\n",surfaceMiss,meta?meta->getClassName():"?");
             }
+            native_legacy_transfer_observed(kIOReturnBadArgument,request,0,10,0);
             return;
         }
         IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
         PE_Video video={};
+        const int consoleRc=PE_current_console(&video);
         uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
         uint64_t length=(uint64_t)width*height*4;
         uint64_t sourceStride=native_legacy_surface_stride(surface);
         uint64_t allocation=native_legacy_surface_allocation(surface);
-        if(!memory || !memory->metaCast("IOMemoryDescriptor") || !native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength()) ||
-           native_legacy_surface_width(surface)<width || native_legacy_surface_height(surface)<height ||
-           !nativeBgra(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) ||
-           PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() ||
-           video.v_width!=width || video.v_height!=height || video.v_depth!=32 || video.v_rotate ||
-           !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
-            native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
+        /*
+         * The same thirteen refusals, one bit each, kept because the bitmask is cheap and the chain was
+         * not: a short-circuit guard could only ever say "not ready". Round414 corrects the reason this
+         * was written. The claim was that a boot stopping here is indistinguishable from one stopping
+         * anywhere else; the tx series in boot 171 (215@403s -> 606@1051s, +391 over 647 s) and boot 172
+         * (33@237s -> 345@803s) shows the copy never stopped at all, so this guard is not the blocker and
+         * the bit pattern is a description of the refusals that do happen, not a search for the stop.
+         * Every getter below is a pure read of an already-validated IOSurface, so evaluating all of them
+         * costs nothing the chain did not already pay on the failing path.
+         */
+        uint32_t refuse=0;
+        if(!memory)refuse|=1u<<0;
+        else {
+            if(!memory->metaCast("IOMemoryDescriptor"))refuse|=1u<<1;
+            if(!native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength()))refuse|=1u<<2;
+        }
+        if(native_legacy_surface_width(surface)<width)refuse|=1u<<3;
+        if(native_legacy_surface_height(surface)<height)refuse|=1u<<4;
+        if(!nativeBgra(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)))refuse|=1u<<5;
+        if(consoleRc)refuse|=1u<<6;
+        if(video.v_baseAddr!=bootMapping->getPhysicalAddress())refuse|=1u<<7;
+        if(video.v_width!=width)refuse|=1u<<8;
+        if(video.v_height!=height)refuse|=1u<<9;
+        if(video.v_depth!=32)refuse|=1u<<10;
+        if(video.v_rotate)refuse|=1u<<11;
+        if(!native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength()))refuse|=1u<<12;
+        if(refuse) {
+            native_legacy_transfer_observed(kIOReturnNotReady,request,0,4,refuse);return;
         }
         // The diagnostic renderer repaints the page over the scanout until it is told the system owns the display, so both transfer paths
         // prepare the scanout before writing pixels. The GPU half of that sentence is an inherited claim, no record in this repository -- and
         // on this board there is no GPU transfer to prepare for: native_legacy_gpu_offer returns false without a hand-off presenter.
         if(!gpuBypass) {
-            if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+            if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0,5,0);return;}
         }
         if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
@@ -402,12 +450,12 @@ public:
         }
         IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
-            OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
+            OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0,6,0);return;
         }
         if(!native_legacy_copy_layout(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
             bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
             source->getLength(),sourceStride,width,height)) {
-            OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+            OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0,7,0);return;
         }
         /*
          * The CPU path retires like the GPU hand-off does: the family's swap completes before the copy,
@@ -435,7 +483,7 @@ public:
                 native_legacy_frame_colors_observed(colors,counts,other);
         }
         if(!native_legacy_prepare_scanout()) {
-            OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
+            OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0,8,0);return;
         }
         uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
         uint64_t stored=UINT64_MAX;
@@ -460,14 +508,14 @@ public:
             if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                 source->getLength(),sourceStride,width,height)) {
-                OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+                OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0,9,0);return;
             }
             stored=length;
         }
         __asm__ volatile("dsb sy" ::: "memory");
         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
         OSSafeReleaseNULL(source);transferred=true;
-        native_legacy_transfer_observed(kIOReturnSuccess,request,length);
+        native_legacy_transfer_observed(kIOReturnSuccess,request,length,0,0);
         if(cpuRetired) {
             memory->release();
             native_legacy_frame_presented(0);
@@ -486,12 +534,12 @@ public:
             // The swap retired when the client took it; its copy ending only releases the next frame. A failed copy loses this frame
             // (the next one takes the CPU copy).
             gpuRetired=false;
-            if(status==0)native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
+            if(status==0)native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength,0,0);
             else {native_legacy_early_failures=native_legacy_early_failures+1;native_legacy_gpu_fallback_observed(status);gpuBypass=true;}
             transferred=false;kickSwapQueue();return;
         }
         if(status==0) {
-            native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
+            native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength,0,0);
             finishTransfer(request,true);return;
         }
         native_legacy_gpu_fallback_observed(status);

@@ -1163,11 +1163,22 @@ def selftest():
     # the picker chose by, with its `g`/`t` unit), `grewn=` (records that grew) and `p58=` (pid 58's own
     # growth, kept so the boots read through pid-58 columns stay readable). A reader that dropped those
     # three would still print a row, so they are named here rather than left to the sample line.
+    # Round414 adds a fourth family (the panel row) and takes three columns off the state row: vs=, log= and
+    # logdrop= moved because the state row was 317 characters and the tee keeps 304 of the stamped line, so
+    # the tail -- exactly those three -- never reached the card. The panel row carries them plus the transfer
+    # refusals (txa/txf/txe/txs/txd) and the panel's colours (col/oth), so the columns are named here too.
+    log_core_path = Path(__file__).resolve().parents[1] / "drivers/CloverSdhci/SdhciLogCore.h"
+    assert log_core_path.is_file(), f"{log_core_path}: the line bound these rows are checked against lives there"
+    tee_bound = re.search(r"\bkVerdictTextBytes\s*=\s*(\d+)", log_core_path.read_text())
+    assert tee_bound, "kVerdictTextBytes is not declared in SdhciLogCore.h"
+    tee_line = int(tee_bound.group(1))
     for cap_name, head, cut_head, columns in (
             ("kDispStateRowBytes", '"clover r344: dispstate ms=', '"clover r344: dispstatecut bytes=',
              ("latch=", "copy=", "fc=", "pick=", "grewn=", "p58=")),
             ("kDispClientRowBytes", '"clover r344: dispclient idx=', '"clover r344: dispclientcut bytes=',
              ("grew=", "hot=", "s6=")),
+            ("kPanelRowBytes", '"clover r414: panel ms=', '"clover r414: panelcut bytes=',
+             ("txa=", "txf=", "txe=", "txs=", "txd=", "col=", "oth=", "vs=", "log=", "logdrop=")),
             ("kSwapWaitRowBytes", '"clover r343: bbswap ms=', '"clover r343: bbswapcut bytes=',
              ("latch=", "copy=", "fc="))):
         declaration = re.search(r"^enum \{[^\n]*\b" + cap_name + r"\s*=\s*(\d+)", probe_src, re.M)
@@ -1184,12 +1195,19 @@ def selftest():
             assert column in row, (
                 f"{head} does not print {column}: the column is named for the offset that fills it, "
                 "so a reader that never asks for it cannot tell the rename from a drop")
-        # The probe truncates its row at its own ceiling, so the row that reaches msgbuf is never wider
-        # than that number. A record is one block -- prefix, body, newline -- so the two caps compared is
-        # the whole of the claim that the card never splits this row: the probe's own ceiling already sits
-        # inside the block, whatever the counters happen to print. The sample-built width above is not the
-        # worst case -- the %s operands are buffers of 16 and 24 bytes -- and the worst case is why the cut
-        # row exists; its width on the card is a boot reading, not a number this test may assume.
+        # Round414 replaces the bound this leg used to assert. It compared the probe's ceiling against one
+        # card record (SECTOR - len(PREFIX) - 1 = 488) and concluded the card never splits the row. The card
+        # record was never the narrowest thing on the path: the tee assembles the kernel's line at
+        # kVerdictTextBytes and that count includes the msgbuf stamp, so the row plus the stamp is what has
+        # to fit. 17 is the widest stamp this board can produce ("[", five-digit seconds, ".", six fractional
+        # digits, "]: "); a boot prints four digits, the fifth is margin. Measured on the archived cards, 204
+        # dispstate rows end at exactly 303 or 304 characters and from boot 170 on every state row of every
+        # boot was cut -- the old 384 ceiling let the row past its own cut branch, and the tee cut it where
+        # nothing counted. The number is read from the header that owns it, so a tee that changes its line
+        # bound changes this test instead of quietly invalidating it. The sample-built width above is still
+        # not the worst case (the %s operands are buffers of 16 and 24 bytes); the worst case is why the cut
+        # row exists, and its width on the card is a boot reading, not a number this test may assume.
+        assert row_cap + 17 <= tee_line, (cap_name, row_cap, tee_line)
         assert row_cap <= SECTOR - len(PREFIX) - 1, (cap_name, row_cap, SECTOR - len(PREFIX) - 1)
     for index, line in enumerate(kernel_lines):
         slot = index
@@ -1638,10 +1656,11 @@ def selftest():
           "ring kinds, bad records, the r302 verdict signatures, the r305 clock pair, the r310 "
           "sink-door words, the older-payload clock guard, the ring rule read from the "
           "declaring row wherever that row lies, the r343 sentence that says which rule read "
-          "this ring on both the declaring and the declaring-nothing card, and all three display row "
+          "this ring on both the declaring and the declaring-nothing card, and all four display row "
           "families built from the probe's own literals -- the state row with its picker, the per-record "
-          "row, and the swap row -- each with its own ceiling and every offset-named and picker column "
-          "asked for by name -- all ok")
+          "row, the panel row, and the swap row -- each with its own ceiling, every offset-named and "
+          "picker column asked for by name, and every ceiling checked against the tee's own line bound "
+          "read from SdhciLogCore.h rather than against this card record's -- all ok")
     return 0
 
 

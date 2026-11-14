@@ -71,12 +71,24 @@ static volatile uint32_t cloverLogDropped;
 /* Screen statistics sampled by the driver's state beat: non-black samples, samples, and a hash. */
 extern "C" volatile uint32_t native_legacy_screen_nonblack,native_legacy_screen_sampled;
 extern "C" volatile uint64_t native_legacy_screen_hash;
+/* Round414: what the panel holds, not just whether it changed. The driver's sample pass fills eight slots with
+ * the first eight distinct colours it meets and counts each; `other` counts samples outside all eight. The hash
+ * above says the frame is different, which is not a reading of the frame -- and r376's colour rows are printed
+ * once per 128 frames at event time, so they age out of the log ring's window long before the panel is worth
+ * reading. The driver owns the storage (its extern "C" block at the top of that file), so this unit only names
+ * them; a definition here would be a duplicate symbol in the forced-load archive. */
+extern "C" volatile uint32_t native_legacy_screen_colors[8];
+extern "C" volatile uint64_t native_legacy_screen_color_counts[8];
+extern "C" volatile uint64_t native_legacy_screen_color_other;
 /* Selector 6 entries minus returns: a positive value is a swap still inside the call. */
 static volatile uint32_t sel6Enter,sel6Exit;
 /* Selector 6 answers kIOReturnBusy that were returned to the client as success. */
 static volatile uint32_t sel6Forced;
 /* Successful scanout transfers and the time of the last one. */
 static volatile uint32_t transferOkCount,transferOkTime;
+/* Round414: the failures, which until now were only ever printed on the early-only log channel. The last
+ * refusal's status, call site and site detail are kept so the periodic row can name where the copy stopped. */
+static volatile uint32_t transferFailCount,transferFailStatus,transferFailSite,transferFailDetail;
 enum {kCloverLogBudget=96};
 static void cloverLog(const char *format,...) __attribute__((format(printf,1,2)));
 static void cloverLog(const char *format,...) {
@@ -329,7 +341,7 @@ void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes) {
             (unsigned long long)native_legacy_copy_n,frequency?(unsigned long long)(ticks*1000/frequency):0ULL,
             (unsigned long long)bytes,frequency?(unsigned long long)(native_legacy_copy_max*1000/frequency):0ULL);
 }
-void native_legacy_transfer_observed(IOReturn status,const void *request,uint64_t bytes) {
+void native_legacy_transfer_observed(IOReturn status,const void *request,uint64_t bytes,unsigned site,uint32_t detail) {
     native_legacy_transfer_calls=native_legacy_transfer_calls+1;
     if(status==kIOReturnSuccess) {
         uint64_t now,frequency;
@@ -337,6 +349,9 @@ void native_legacy_transfer_observed(IOReturn status,const void *request,uint64_
         if(!frameEpoch)frameEpoch=now;
         transferOkCount=transferOkCount+1;
         transferOkTime=frequency?(uint32_t)((now-frameEpoch)/frequency):0;
+    } else {
+        transferFailCount=transferFailCount+1;
+        transferFailStatus=(uint32_t)status;transferFailSite=site;transferFailDetail=detail;
     }
     if(status==kIOReturnSuccess)native_legacy_swap_stage(2);
     native_legacy_transfer_status=status;native_legacy_transfer_request=(uintptr_t)request;native_legacy_transfer_bytes=bytes;
@@ -345,8 +360,8 @@ void native_legacy_transfer_observed(IOReturn status,const void *request,uint64_
             cloverLog("scanout#%u ok bytes=%llu retired=%llu fc=%llu",native_legacy_transfer_calls,(unsigned long long)bytes,
                 (unsigned long long)native_legacy_retirement_calls,(unsigned long long)native_legacy_fc);
     } else
-        cloverLog("scanout#%u FAILED status=%08x prepare=%u tries=%u bytes=%llu",native_legacy_transfer_calls,(unsigned)status,
-            native_legacy_prepare_reason,native_legacy_prepare_attempts,(unsigned long long)bytes);
+        cloverLog("scanout#%u FAILED status=%08x site=%u detail=%x prepare=%u tries=%u bytes=%llu",native_legacy_transfer_calls,(unsigned)status,
+            site,detail,native_legacy_prepare_reason,native_legacy_prepare_attempts,(unsigned long long)bytes);
 }
 bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
     return gpuHandoffPresenter && native_gop_gpu_offer(gpuHandoffPresenter,display,memory,stride,width,height);
@@ -504,7 +519,12 @@ static ClientStat *statFor(IOUserClient *client) {
  * fires once per wait call, so routing it there would let the swap rows spend the budget that the beat row
  * exists to keep. Its own bound is the tee class, and the tee says out loud when that cap fills.
  */
-enum {kWakeSlotBase=0x110,kWakeSlotStride=0xb0,kWakeSlots=6,kSwapWaitRowBytes=320,kSwapTracked=8};
+// Round414: kSwapWaitRowBytes was 320, which is the tee's whole line budget with nothing left for the msgbuf
+// stamp, so a row at this ceiling was cut downstream where this file's own cut branch could not see it. 300 is
+// the same bound the state and panel rows use. It costs this row nothing: the widest of the 308 bbswap rows on
+// the archived cards is 203 characters (boot 169), and the cut branch below still answers the wider operand
+// case -- six 16-hex-digit `np` slots can push the format past any ceiling, which is why the outlet exists.
+enum {kWakeSlotBase=0x110,kWakeSlotStride=0xb0,kWakeSlots=6,kSwapWaitRowBytes=300,kSwapTracked=8};
 enum {kLatchOffset=5820,kCopyOffset=5824,kFcOffset=252,kCurOffset=5472,kListOffset=5480};
 static const unsigned kQueryOffsets[2]={5840,5856};
 struct SwapWaitPre {
@@ -745,11 +765,36 @@ void native_legacy_client_observed(IOReturn status,IOUserClient *client) {
  *              way, that retire# prints at event time. copy= is +0x16bc's own copy (stored at 0x678aea0), so
  *              it is not a second leg; fc= is the completion-path counter at +0xfc. Here they are read every
  *              fire, so "the latch is still 4" keeps being said after the event row has aged out of the ring.
- *   vs=        <hz>/<started>/<sent> from vsyncHz and vsyncEvents[4]/[1]. A producer that always exists
- *              in this file, so vs=0/0/0 is a reading: on this boot the refresh tick was never started.
- *   log= logdrop=   cloverLogLines against kCloverLogBudget, and the lines that budget refused. Without
- *              logdrop= a row missing from the card cannot be told from an event that arrived after line
- *              96, and boot 113 spent 55 of those 96 lines.
+ *   vs= log= logdrop=   moved to the r414 panel row below in round414, unchanged in meaning: <hz>/<started>/
+ *              <sent> from vsyncHz and vsyncEvents[4]/[1] (a producer that always exists in this file, so
+ *              vs=0/0/0 is a reading), and cloverLogLines against kCloverLogBudget with the lines that budget
+ *              refused. They left this row for width, not for relevance: the row was 317 characters and the
+ *              tee keeps 304 of the stamped line, so the tail -- which was exactly these three columns --
+ *              never reached the card. A row that loses its own budget columns cannot say it was cut.
+ *
+ * Round414 adds a third row on the same beat, `clover r414: panel`, carrying what this row lost plus the two
+ * things the boot could not otherwise be read for:
+ *   txa=       native_legacy_transfer_calls: every scanout observation, success or refusal. `tx=` on the state
+ *              row counts successes only, so `txa - tx` is the refusal total -- and until this row existed the
+ *              refusals were only ever printed by cloverLog, whose 96-line budget boot 171 had already spent
+ *              (`log=66/96`) long before the panel was worth reading.
+ *   txf=       transferFailCount, the same refusals counted at the one place that sees them. Printed beside
+ *              txa so the two ways of reaching the number can disagree visibly rather than silently.
+ *   txe= txs= txd=   the last refusal's IOReturn status, its call site, and that site's detail word. The sites
+ *              are the driver's own numbering: 1 blank console/bounds, 2 blank prepare_scanout, 3 blank
+ *              fill_pixels, 4 the surface compound guard (txd is its 13-bit refusal mask), 5 pre-copy
+ *              prepare_scanout, 6 source map, 7 copy_layout, 8 post-retire prepare_scanout, 9 copy_pixels,
+ *              10 a surface that is not an IOSurface. `-` while nothing has been refused. This is what turns
+ *              "the copy failed" into "the copy failed here", which is the question the round is about.
+ *   col=       the four most-sampled colours of the panel as `<%08x>/<count>` pairs, most first, from the
+ *              driver's eight first-seen slots; `oth=` counts the samples outside all eight. `scr=` on the
+ *              state row says the frame changed (nonblack/sampled/hash); this says what it changed into.
+ *              `-` while no sample has been taken. r376's colour rows answer this at event time and age out
+ *              of the ring's window, so a late boot had no colour reading at all.
+ *   vs= log= logdrop=   as above, now on a row whose width they fit inside.
+ *
+ * The panel row has its own ceiling and its own `clover r414: panelcut` outlet, for the same reason: a row
+ * cannot report its own truncation from inside the truncated part.
  *
  * Two trigger sites, one producer: the driver's 30 s work-loop beat, and the first client interposed.
  * The second is not a cadence, it is the discriminator -- a boot that shows fires=1 at the client's
@@ -763,13 +808,27 @@ void native_legacy_client_observed(IOReturn status,IOUserClient *client) {
  * without saying so: `pick=` is the number it chose by, and the per-record rows mean nothing can be hidden
  * behind that choice.
  *
- * The row is never emitted half-written: 384 bytes is this row's ceiling and a longer line is truncated
- * rather than split, so a too-wide row prints `clover r344: dispstatecut` with the width it needed instead.
- * That row is the arithmetic's mandatory outlet -- the long row cannot say it was cut. Both ceilings sit
- * inside one card record (512 - 23-byte prefix - 1 = 488), so the card never splits either row.
+ * Round414 corrects the ceiling this row is written against, and the correction is a measurement, not a
+ * preference. The comment that used to stand here said both rows sit inside one card record
+ * (512 - 23-byte prefix - 1 = 488) and therefore cannot be split. Two things were wrong with that. The card
+ * record's body bound is 480, not 488 (SdhciLogCore.h kRecordBodyBytes), and -- the one that mattered -- the
+ * record is not the narrowest thing on the path. The kernel ring's tee assembles a line at kVerdictTextBytes
+ * = 320 characters, and that count includes the msgbuf stamp the kernel prepends (`[ 1790.633354]: ` is 16
+ * characters), so 304 characters of the row survive and the rest is discarded up to the newline and counted
+ * as one truncation. Boot 171's card is the reading (clover-out/round387-flash-boot171.log): all 22 of its
+ * dispstate rows have an incomplete tail column, 21 of them at exactly 304 visible characters and one at
+ * 303, and they end `log=66/96` or `log=66` where this format writes `log=66/96 logdrop=0`. The row's own
+ * 384 ceiling never noticed, so `dispstatecut` printed zero times on a boot that was cut on every fire --
+ * which is precisely the ambiguity the cut row exists to remove.
+ *
+ * Both ceilings are therefore 300: 300 + a 17-character stamp (five-digit seconds, the widest this board's
+ * unattended window can produce) is 317, inside the 320 the tee keeps. A row that still does not fit prints
+ * `clover r344: dispstatecut` with the width it needed, and that row is the arithmetic's mandatory outlet --
+ * the long row cannot say it was cut. The width is checked by scripts/read-clover-log.py against the tee's
+ * own bound rather than against the card record's, so a row grown past 300 fails on the host.
  */
 static uint32_t dispstateFires;
-enum {kDispStateRowBytes=384,kDispClientRowBytes=320};
+enum {kDispStateRowBytes=300,kDispClientRowBytes=300};
 static uint32_t dispstateReportedCalls[kSeenClients];
 static bool dispstateReported[kSeenClients];
 static void formatHotFor(const ClientStat &s,char *out,unsigned cap) {
@@ -807,6 +866,57 @@ static void reportDisplayClient(unsigned index,uint32_t grew) {
         return;
     }
     IOLog("%s",row);
+}
+enum {kPanelRowBytes=300};
+// Round414: the four most-sampled colours, most first. The driver's eight slots are in first-seen order, which
+// is not importance order -- the first sample of a boot can be a stray pixel -- so the pick is by count and a
+// slot with no samples is skipped rather than printed as black. Counts print as %u because the sample pass
+// bounds them: its stride is n/4096 and at least 1, so at most 8191 samples are taken and neither a colour
+// count nor `oth` can exceed that. 64 bytes holds four `%08x/%u` pairs at that bound (55 characters), so this
+// row's width is bounded by its own operands rather than by a hope about the readings.
+static void formatPanelColors(char *out,unsigned cap) {
+    uint32_t colors[8];uint64_t counts[8];
+    for(unsigned k=0;k<8;++k) {colors[k]=native_legacy_screen_colors[k];counts[k]=native_legacy_screen_color_counts[k];}
+    unsigned order[8],used=0;
+    for(unsigned k=0;k<8;++k)if(counts[k])order[used++]=k;
+    for(unsigned i=0;i<used;++i)
+        for(unsigned j=i+1;j<used;++j)
+            if(counts[order[j]]>counts[order[i]]) {unsigned swap=order[i];order[i]=order[j];order[j]=swap;}
+    if(!used) {snprintf(out,cap,"-");return;}
+    unsigned at=0;
+    for(unsigned i=0;i<used && i<4;++i) {
+        int written=snprintf(out+at,cap-at,"%s%08x/%u",i?" ":"",colors[order[i]],(unsigned)counts[order[i]]);
+        if(written<0 || static_cast<unsigned>(written)>=cap-at)break;
+        at+=static_cast<unsigned>(written);
+    }
+}
+// The second half of the state beat. `fires=` is dispstateFires, the same ordinal the state row prints, so the
+// two rows of one beat are joinable on the card without a timestamp guess.
+static void reportPanelState(uint64_t now) {
+    char col[64],txe[16],txs[8],txd[16];
+    formatPanelColors(col,sizeof col);
+    const char *txeTxt="-",*txsTxt="-",*txdTxt="-";
+    if(transferFailCount) {
+        snprintf(txe,sizeof txe,"%08x",(unsigned)transferFailStatus);txeTxt=txe;
+        snprintf(txs,sizeof txs,"%u",(unsigned)transferFailSite);txsTxt=txs;
+        snprintf(txd,sizeof txd,"%x",(unsigned)transferFailDetail);txdTxt=txd;
+    }
+    char row[kPanelRowBytes];
+    int length=snprintf(row,sizeof row,
+        "clover r414: panel ms=%llu fires=%u txa=%u txf=%u txe=%s txs=%s txd=%s col=%s oth=%u "
+        "vs=%u/%llu/%llu log=%u/%u logdrop=%u\n",
+        (unsigned long long)(now/1000),dispstateFires,(unsigned)native_legacy_transfer_calls,
+        (unsigned)transferFailCount,txeTxt,txsTxt,txdTxt,col,(unsigned)native_legacy_screen_color_other,
+        vsyncHz,(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[1],
+        (unsigned)cloverLogLines,(unsigned)kCloverLogBudget,(unsigned)cloverLogDropped);
+    if(length<0 || static_cast<unsigned>(length)>=sizeof row) {
+        char cut[96];
+        snprintf(cut,sizeof cut,"clover r414: panelcut bytes=%d cap=%u fires=%u txa=%u\n",
+            length,(unsigned)sizeof row,dispstateFires,(unsigned)native_legacy_transfer_calls);
+        IOLog("%s",cut);
+    } else {
+        IOLog("%s",row);
+    }
 }
 static void reportDisplayState(void) {
     dispstateFires=dispstateFires+1;
@@ -868,12 +978,10 @@ static void reportDisplayState(void) {
     int length=snprintf(row,sizeof row,
         "clover r344: dispstate ms=%llu fires=%u seen=%u client=%s pick=%s grewn=%s p58=%s calls=%s fails=%s "
         "last=%s tx=%u@%us s6if=%u s6f=%u scr=%u/%u/%llx "
-        "regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s vs=%u/%llu/%llu log=%u/%u logdrop=%u\n",
+        "regall=%s regs=%s grew=%s hot=%s s6=%s latch=%s copy=%s fc=%s\n",
         (unsigned long long)(now/1000),dispstateFires,seenClientCount,client,pick,grewnTxt,p58Txt,
         callsTxt,failsTxt,lastTxt,(unsigned)transferOkCount,(unsigned)transferOkTime,(unsigned)(sel6Enter-sel6Exit),(unsigned)sel6Forced,(unsigned)native_legacy_screen_nonblack,
-        (unsigned)native_legacy_screen_sampled,(unsigned long long)native_legacy_screen_hash,regallTxt,regsTxt,grewTxt,hotTxt,s6Txt,latchTxt,copyTxt,fcTxt,
-        vsyncHz,(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[1],
-        (unsigned)cloverLogLines,(unsigned)kCloverLogBudget,(unsigned)cloverLogDropped);
+        (unsigned)native_legacy_screen_sampled,(unsigned long long)native_legacy_screen_hash,regallTxt,regsTxt,grewTxt,hotTxt,s6Txt,latchTxt,copyTxt,fcTxt);
     if(length<0 || static_cast<unsigned>(length)>=sizeof row) {
         char cut[96];
         snprintf(cut,sizeof cut,"clover r344: dispstatecut bytes=%d cap=%u fires=%u client=%s\n",
@@ -882,6 +990,7 @@ static void reportDisplayState(void) {
     } else {
         IOLog("%s",row);
     }
+    reportPanelState(now);
     // The per-record rows and the bookkeeping do not live under the state row's width. A boot whose state
     // row is always cut is exactly the boot that needs the records it cannot see, and an early return here
     // would leave reportedCalls frozen, so every fire would re-print every record as new.
