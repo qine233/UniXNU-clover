@@ -341,7 +341,7 @@ loader = "firmware"
 # Round415's case: boots 186 and 187 both stopped while the console was still scrolling, on the GPU
 # probe's own rows -- the card held nothing but this boot's counter, so the stop is before the first
 # block request. The GPU is a parallel line; the display line does not need it.
-title = "clover r417: Boot 190 said the frame buffer is full -- box spans 2x2..1198x1910, lit is about 13 percent white pixels on opaque black -- so the black is content, not an empty surface. Two instrument debts are paid here: the \"panelbox\" geometry now comes from the boot console instead of the transfer path, because boot 189 made no transfer and its box came out empty; and the frame row fires every 16th frame instead of every 128th, because a 500 second window held none of the old rows. The copy path, the refusals and the Busy conversion are untouched."
+title = "clover r418: Boot 191 ran 517 copies with no refusals and still kept no frame row on the card, because that row had never had a tee class of its own and the per-pass cap dropped it. This round gives \"frame#\" its own class and exemption, so a window without frame rows now says the copy path did not run instead of the tee spending the pass elsewhere. Nothing else moved: the copy path, the geometry source and the panelbox row are exactly as r417 shipped."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

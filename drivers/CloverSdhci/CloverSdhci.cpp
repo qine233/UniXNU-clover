@@ -1352,7 +1352,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   // census rows sharing the pass.
   { "clover r344: dispclientcut", "r344-dispclientcut", 8, 0, 0, 0 },
   { "clover r344: dispclient", "r344-dispclient", 128, 0, 0, 0 },
-  { "clover r344: dispstatecut", "r344-dispstatecut", 8, 0, 0, 0 },
+    // Round418. The frame row was the oldest producer with no class of its own: it rides the generic clover r token,
+  // so the per-pass cap could drop it and boot 191's window held none of a row that fires every 16th frame. Its
+  // own class, and its own exemption, are what make "no frame row" mean the copy path did not run rather than the
+  // tee spent the pass elsewhere.
+  { "clover r180: frame#", "r180-frame", 96, 0, 0, 0 },
+{ "clover r344: dispstatecut", "r344-dispstatecut", 8, 0, 0, 0 },
   { "clover r344: dispstate", "r344-dispstate", 96, 0, 0, 0 },
 
   // Round414's panel row is fired by the same beat as the state row and carries the columns that row lost when
@@ -5081,6 +5086,7 @@ static void teeConsumeLine (uint32_t &pushed)
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r344-disp") ||
        // Round414's panel row rides that same beat and exists because the state row's tail was being cut
        // downstream: a pass cap that ate it would reproduce exactly the silence it was added to remove.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r180-frame") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r416-panelbox") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r414-panel") ||
        // Round335's swap-wait rows ride the client's own calls, not a burst: a boot that stalls in this wait

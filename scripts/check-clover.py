@@ -3362,6 +3362,17 @@ def check_board(errors: list) -> str:
                 errors.append(f"the r416 panelbox instrumentation lacks {needle[:48]!r}: the row, the box "
                               "writer and the failure clock are three readings and each has to exist")
 
+        # Round418. The frame row is the oldest producer and had never had a class: boot 191 shows the cost, a
+        # window with zero frame rows while txa ran 351 to 517 and the cadence was every 16th frame. The class and
+        # its exemption are what turn that absence into "the copy path did not run".
+        if '{ "clover r180: frame#", "r180-frame", 96, 0, 0, 0 },' not in sdhci_source:
+            errors.append("drivers/CloverSdhci has no class for the frame row: it rides the generic token and the "
+                          "per-pass cap can drop it, which boot 191 measured")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r180-frame")' not in sdhci_source:
+            errors.append("the frame row is not exempt from the per-pass cap")
+        if '"frame#%u kind=%u t=%us pixels=%llu box=%llux%llu..%llux%llu"' not in (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text():
+            errors.append("the probe no longer prints the frame row the r180 class is named for")
+
         # Round335's swap row, r343's head. The same containment: "clover r343: bbswap" is a prefix of
         # "clover r343: bbswapcut" and teeProbeClass returns the first match, so the table order is the only
         # thing that keeps the cut branch from being filed as the row it says did not fit. The budget is
@@ -8936,8 +8947,8 @@ def check_board(errors: list) -> str:
     # generation, the title names the image that ran. The reason is a measurement, not a preference: 204
     # archived state rows (211 of 620) end mid-column at the tee's 320-byte line bound, and the columns in the cut part
     # are the ones that say whether the channel is alive.
-    if not board["payload"]["title"].startswith("clover r417:"):
-        errors.append('[payload] title is not "clover r417: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r418:"):
+        errors.append('[payload] title is not "clover r418: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -11091,8 +11102,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r417:"):
-        errors.append('[payload] title is not "clover r417: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r418:"):
+        errors.append('[payload] title is not "clover r418: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

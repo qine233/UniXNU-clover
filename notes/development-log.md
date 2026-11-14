@@ -31149,3 +31149,40 @@ panel ms=1764 txa=180 txf=0 col=ff000000/2451 00000000/1107 00ffffff/503 fffffff
 - **落地**：死线记录 `boot=191 elapsed=1800.000s`，复位落在 **EDL**（`QUSB_BULK`，timeline 1883 s 记 `poll edl`）；
   脚本用 Sahara 端口复位 + SoC 复位（声明 reset-only、不写分区）把它带回 TWRP，随后读回成功。
   这是 boot 118/119 之后第三次「死线复位落 EDL」，与 r417 的读数改动无关（本轮只动几何来源与帧行节奏）。
+
+
+## Round418 —— 给 `frame#` 行自己的 tee 类与每趟豁免
+
+**为什么。** boot 191 里 `txa` 从 351 跑到 517（跨过多个 16 的倍数），窗口内 `frame#` 行却是 **0 条**，同一窗口
+throttled 12 条——帧行自 r180 起就走通用 `clover r` token，**从来没有自己的类**，于是被判成「配额里的普通行」。
+这也让「没有帧行」有两种读法：拷贝没跑，或配额花在别处；r414 的 `panel` 行就是为了这件事拆出来的，帧行当时漏了。
+
+**改动（只有 tee 表与契约）。** `CloverSdhci.cpp` 的 tee 表加
+`{ "clover r180: frame#", "r180-frame", 96, 0, 0, 0 },`（放在 `r344-dispstatecut` 之前，避免被任何更短 token 先匹配），
+并在每趟豁免列表里加 `teeHasPrefix(..., "r180-frame")`；`check-clover` 钉住三类：类存在、豁免存在、探针仍在打
+`frame#%u kind=%u t=%us pixels=...` 这行字面量。内核未动其它代码。
+
+**boot 192 判据（刷机前写定）：**
+- **Z-A**：窗口里至少一条 `frame#` 行，且 `frame#` 行的 `kind=`/`pixels=`/`box=` 与同拍或相邻拍的
+  `panelbox`/`col=` 不矛盾（帧行是事件时、panelbox 是拍时，`box` 允许位移，`pixels` 与 `lit+alpha` 量级要一致）；
+- **Z-B**：若窗口按 `txa` 明明跨过多个 16 的倍数而 `frame#` 仍 0 条，则「类 + 豁免」不是答案，下一支要查
+  `IOLog → msgbuf` 这一段（帧行走的是内核 printf，不是驱动 teeSay）；
+- **Z-C**：`txa==tx`、`txf=0`、`s6fail=0`、`panel`/`panelbox` 每拍成对，不回归。
+
+**boot 192 读数（`round418-boot192-window.bin`）：帧行终于上卡，且它指的是一个**有界元素**。**
+
+```
+[1241.350594]: clover r180: frame#16 kind=0 t=100s pixels=45460 box=305x811..970x1108
+[1227.863332]: clover r416: panelbox ms=1227854 fires=43 lit=433/4100 a0=1897 a255=2203 box=0x7..1192x1913
+[1227.863296]: clover r414: panel     ms=1227854 fires=43 txa=14 txf=0 col=ff000000/2164 00000000/1503 00ffffff/394 ffffffff/33 oth=2
+[1795.481204]: clover r414: panel     ms=1795476 fires=61 txa=355 txf=0 col=ff000000/2450 00000000/1198 00ffffff/410 ffffffff/37 oth=1
+```
+
+- **Z-A 过**：窗口里出现 `frame#16`——**类 + 豁免就是那条堵住它的东西**（boot 191 同条件 0 条）。
+- **Z-C 过**：`txa=355`、`txf=0`；19 条 `panelbox` 与 `panel` 每拍成对；`col=` 四色齐。
+- **白字被点名了（第一版）**：帧行自带的 `pixels=45460 box=305x811..970x1108`——**包围盒是约 665×297 的一条带**，
+  不是整屏；它与此前 r226/r228 记过的 backboardd 进度区 `box=305x887..755x1029`、`pixels=41586` 同族，
+  所以面板上的白内容是**启动期的一个进度/提示元素**，不是桌面。
+- **两件事要说清**：① `panelbox` 的 `box` 仍铺满整屏而帧行的 `box` 只有一条带——两者量的不是同一件事：
+  帧行量**这一次拷贝的 surface**，`panelbox` 量**启动帧缓冲**，后者里还留着 UEFI 控制台的白字（alpha=0 那 394 个）；
+  ② `kind=0` 是这一帧的类别，逐帧值仍要按探针里的枚举读，不能凭这个名字猜。
