@@ -31273,3 +31273,50 @@ ENOSPC 条数与客户端是否连上没有单调关系（191 有 237 条仍连�
 **这一靴的结尾：** panic sink 在 t=205300 ms 写了自已的 entry/after 两条 marker（`boot=194`、`append_rc=108`），
 但没有 deadline 记录、没有 sentence；内核日志继续写到 236 s；随后静默复位，TWRP 的 adb 起来（runner 报
 `TWRP's adb came up`）。没有 EDL 落点。
+
+### boot 195 / 196 读数与一个被撤回的假设——题面是根容器只有 214 个空闲块
+
+**boot 195（r419 第三靴）：** 仍然七拍 `flog=0 fd=0`、`seen=0 client=none`、`tx=0`。ENOSPC 98 行，
+`free_blocks 212..214`。
+
+**boot 196（r418 对照，同板同分区）：** 依旧 `client=none`、0 帧、ENOSPC 25 行、`free_blocks 212..214`。
+两代镜像四连靴（193/194/195/196）同一形态，**r419 内核被排除**；问题在设备上的根容器状态。
+
+**先前的「NXSB 被清零」结论撤回。** 那次比对把宿主 seek 放在非 4 KiB 对齐的 1,065,984，而设备读的是
+块 260（1,064,960）。按块重比：块 253–267（含 `NXSB` 所在块 260）以及 OS/SystemOS 窗口的多点抽样
+**全部 MATCH**。userdata 上的容器字节没有被写坏，也没有发生任何修复性写入。
+
+**真正的读数：** 卡上每靴都写同一句
+
+    fs_tx_enter_internal:27549: disk5s1 launchd: ENOSPC: ttype INSERT num_blocks 163
+    free_blocks 214 ... threshold_blocks 100
+
+宿主机上只读挂上 OS 窗口：容器 `Size 6077546496 B`，`Capacity In Use 5718396928`，**只有一个卷**
+（DawnUpdate21H461...OS，role System，Sealed: No），**没有 Data 卷**。round128 的镜像把 IPSW 的
+OS 盘原样搬来，而那张盘的分区/容器正好同尺寸，所以容器从来就没有余量；`163` 块的事务在
+`free_blocks 214`、`threshold_blocks 100` 下必然被拒。launchd 的 boot task 写不进去 → 卡住 →
+`unnamed` 静默复位（约 200 s）。boot 192 只是尚未被检查点写满的少数几次之一。
+
+### r420 的容器：24.0 GB + Data 卷（宿主侧已做，坏块修复从未需要）
+
+1. 从 round128 镜像抽出 OS 窗口（6,077,580,800 B），扩到目标大小并重写 GPT 尾部
+   （`scripts/make-clover-userdata-enlarged.py --patch-gpt`）。
+2. `diskutil apfs resizeContainer disk20s1 24g`（**实测 `0` 会报 -69519，必须显式给尺寸**）：
+   容器 6.1 GB → 24.0 GB，`Capacity Not Allocated 18.2 GB`。
+3. `diskutil apfs addVolume disk21 APFS Data -role D`：新增 `Data` 卷（role Data，Case-insensitive）。
+4. 把窗口文件裁回容器尾部并再次修 GPT；新窗口 24,000,034,304 B，sha256 `cba2b72fdaa6…`。
+5. `scripts/make-clover-userdata-enlarged.py --original round128-userdata-root.img --window … \
+   --output round420-userdata-root.img --verify`：外壳镜像 27,304,919,040 B（25.43 GiB），
+   清单 v1 count=2，OS `24,000,034,304 @1 MiB`，SystemOS `3,303,014,400 @24,001,904,640`
+   （sha256 `b4908cde…`，与 round128 报告一致），两个窗口复核 MATCH，清单自哈希 MATCH。
+6. `scripts/make-clover-sparse.py` 产出 all-RAW sparse（`round420-userdata-root.sparse.img`），
+   逐块校验。
+
+**boot 197 判据（刷写前写定）：**
+
+- **X-A**：landing 前内核日志不再出现 `disk5s1 ... ENOSPC ... threshold_blocks 100`（允许 0–2 条过渡），
+  或 `free_blocks` 读数远离 214；
+- **X-B**：`dispstate` 出现 `seen>0 client=pidNN`，且 `tx` 增长；
+- **X-C**：`frame#` 行多于一条、`flog=` 随拍增长、`fd=0`（W-A…W-D 的正式读数在这一靴补上）；
+- **X-D**：不回归——`txa==tx`、`txf=0`、`panelbox`/`panel` 每拍成对；落回仍由 BCB 进 TWRP，
+  若进 EDL，runner 复位后必须回 TWRP。
