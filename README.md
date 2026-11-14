@@ -25,7 +25,7 @@
 | `CloverPower` | PM660/PM660L、SPMI、时钟与电源域 | 已实现 |
 | `CloverInput` | I2C/QUP 总线；Goodix GT9xx 触摸报表（`clover-input=4`） | 已实现（持续读取待补） |
 | `NativeMobileDisplay` + 包内探针 | GOP 显示与交换路径 | 已实现（r414 前状态行尾列被 tee 切掉，队列判读待重取） |
-| `CloverGpu` | Adreno 512：微码、PM4/ring/ME_INIT、CP 启动、SMMU 识别；LDO 电压可写、CTRL/PDN 不可写（轨归 CPR/固件侧） | 进行中 |
+| `CloverGpu` | Adreno 512：微码、PM4/ring/ME_INIT、CP 启动、SMMU 识别；LDO 电压可写、CTRL/PDN 不可写（轨归 CPR/固件侧）。r415 起主线靴以 `clover-gpu=0` 运行：该探针在 boot 186/187 于自己的 GDSC/LDO 行之后挂住（`clover-gpu-ldo` 那道门只写在注释里） | 进行中（主线暂停用） |
 | `CloverDsp` | ADSP 探针 | 仅探针 |
 | `NativeHidInput` / `NativeKeyStoreEvents` | HID 与按键、钥匙串事件 | 已实现 |
 | 网络（Wi-Fi/BT） | — | 未开始 |
@@ -40,16 +40,16 @@
 | 存储（APFS 卷挂载） | 通 |
 | 用户态（launchd 起的守护进程集） | 通 |
 | 点亮屏幕（GOP 路径首帧） | 通 |
-| SpringBoard / 合成器 | 卡住：`tx` 停摆时刻逐靴变长（296→966→1179 s）；boot 185 到 1606 s 才有显示客户端、`tx=0` 全程 |
+| SpringBoard / 合成器 | 未到桌面。boot 188（r415，GPU 探针关）：显示通道第一帧 ~837 s、到死线仍在拷贝（428 次、0 拒绝），面板以不透明黑/全透明黑为主（`col=`）；boot 186/187 曾在 GPU 探针之后极早停 |
 | 桌面 | 未到 |
 
 ## 闸门
 
 | 闸门 | 最近一次 | 结果 |
 | --- | --- | --- |
-| `check-clover.py` | r414c | EXIT=0 |
-| `verify-clover-payload.py` | r414c | EXIT=0，51 OK / 0 FAIL |
-| 负测（比对盘上产物，不动活树） | r414c | 12/12 |
+| `check-clover.py` | r415 | EXIT=0 |
+| `verify-clover-payload.py` | r415 | EXIT=0，51 OK / 0 FAIL |
+| 负测（比对盘上产物，不动活树） | r415 | 12/12 |
 
 ## 已知缺口
 

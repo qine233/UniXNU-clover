@@ -336,7 +336,12 @@ loader = "firmware"
 #
 # Round414's case: the state row's tail was cut at the tee's own line bound, and the columns lost were
 # the ones that say whether the channel is still alive.
-title = "clover r414: The state row was being cut downstream at the tee's 320-byte line bound, and the columns lost (vs=/log=/logdrop=) are the ones that say whether the channel is alive -- 211 of 620 archived state rows end mid-column, 207 of them pinned at exactly 304 visible characters, and every row of boots 171-179 was cut while boot 170 lost 20 of 21. This round moves them onto a second row (\"clover r414: panel\") fired by the same beat, adds the transfer refusal's own status/site/detail beside the success count, and prints the panel's four most-sampled colours so late-boot content is a reading rather than a hash. All four display row ceilings become 300, checked against the tee's bound plus the widest msgbuf stamp."
+#
+
+# Round415's case: boots 186 and 187 both stopped while the console was still scrolling, on the GPU
+# probe's own rows -- the card held nothing but this boot's counter, so the stop is before the first
+# block request. The GPU is a parallel line; the display line does not need it.
+title = "clover r415: Boots 186 and 187 both stopped at t=14 s on the GPU probe's GDSC/LDO rows: the console stops right after them and the card holds nothing but the boot counter, which places the stop before the first block request. The GPU line is a parallel one and the display line does not need it, so this boot runs with clover-gpu=0 and keeps every r414 reading intact. The probe also carried a comment promising a \"clover-gpu-ldo\" gate that was never compiled, so the sequence that boots 173-179 and this pair stopped on had no way to be turned off."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -2564,7 +2569,7 @@ kernel_args = [
   # The RCG command word (0x1070) is deliberately NOT reprogrammed -- a branch enable and a rate
   # this round did not set are two different answers -- and the GPU core (0x05000000) is mapped only
   # behind the gate. Design and decision criteria: notes/gpu-bringup.md.
-  "clover-gpu=1",
+  "clover-gpu=0",
   # Round313 resumes drivers/CloverPower, and the mode it resumes in is 1 rather than the 3 round182
   # shipped with. Mode 1 maps the arbiter's windows, reads its version word and walks its APID map, and
   # starts no transaction at all: the observer command word is read as whatever the boot left there and

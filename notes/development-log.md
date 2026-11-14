@@ -30950,3 +30950,99 @@ boot 185 就是重写后的验证靴（读数见 §Round414 反例段）。
 **判据不动。** 上一节的 V-A…V-J 原样有效；变的只有镜像身份：**boot 186 请刷
 `clover-out/round414c-payload.img`（`d4a8533b…`），不是 `5595354d…` 那枚**。两次构建的
 `unixnu.toml` 差异只有标题串，行内容与探针代码完全相同。
+
+
+## Round414d —— boot 186：卡上只有计数器一笔，这一靴在第一次块请求之前就停了（读回，判 V-A…V-J 失败）
+
+**读回（14:51，`round414c-boot186-window.bin`，脚本 EXIT=0，落地 TWRP）：** 窗口解出 16 条报告记录、
+64 条驱动判据行、46 条 probe 行、512 条内核日志行，**boot 计数器 = 186**，其余记录**全部是 boot 185 的**。
+判据如下，且这些都是产物上的事实，不是推断：
+
+- `grep 'r414: panel '` → **0 行**；`grep 'r344: dispstate '` → 16 行，与 13:34 那次 boot 185 读回**逐行 diff 相同**；
+- 内核环最新一行是 `[1816.920988]`（boot 185），flight 区「12 entry + 1 beat + 2 panic marker + drain-in」
+  全部 `boot 185`，解码器四处都打了 `STALE: boot 186 never wrote one`；
+- 计数器扇区（lba 13321432）本身完好：`UXNULOG1`，kind 24，计数 `0xba`=186。
+
+**时间线（同一份 timeline，不是回忆）：** 14:46:13 开 wait-fastboot → 14:46:16 起 after-deadline 窗 →
+**14:51:44 以 `close:fastboot` 收段（elapsed 327 s）**——也就是板子被手动带到 fastboot 的时刻。
+
+**判读。** 计数器在 `coldBringUp` 里由 `bootIdClaim()` 写成，紧接其后的就是三枚 arming 行（r185/r174/r176）、
+`r212 boot id=`、以及 `panicMarkRecovery()` 的 misc 写；这些全在 RAM 里，**要等第一次块请求的尾巴才落卡**。
+所以「计数器有、其余全无」只有一个形状：**这一靴走完了 GPT 走查、写了计数器，然后到第一次块请求之前就没有再前进**
+（无 flight entry、无内核环、无 verdict 落卡），在 327 s 里没有做过一次块 I/O。它不是「仪器没扣扳机」，
+是这一靴自己停在了那里。**预登记的 V-A…V-J 一条也判不了**，只能记成「本轮读数为空 + 一个新的早停现象」。
+
+**已排除的两支（用产物排除，不用猜测）：**
+- **不是读错了分区**：读回的 56 MiB 与 `round414c-payload.img` 逐块比，14,336 块里只有 7 块不同，且差异都是
+  「镜像为 0、卡上是 FAT 元数据/旧文件簇」这一类（0x0 头的 3 字节、0x68000/0xd6000 的 FAT 链、尾三块的旧数据），
+  主体与内核都在——**闪写是好的**（`round414c-cache-readback.bin`，sha256 `5741dd41…`）；
+- **不是读回时点太早**：脚本在 TWRP 起来之后才 dd，且 boot 185 的 16 条 dispstate 行与上一次读回逐字节相同，
+  说明这份窗口就是 185 留下的原样。
+
+**下一支（boot 187）：** 同一枚 `round414c-payload.img` 再冷刷一次。若 187 跑满并落回，则 186 是「卡在一次写里」
+（最可能是计数器之后那笔 misc BCB 的 raw 写——它是 13:46 userdata 重写 19 段之后的第一靴）；若 187 同样静默早停，
+则取 r388 那枚（boot 185 跑过、已知能跑满）做对照，把「本轮代码」与「板/卡」分开。
+
+**Round414d 补记：boot 187 复现，且屏幕把停点钉在了 GPU 探针之后。**
+第二靴（同一枚 `round414c-payload.img`，14:57 起）与 186 完全同形：窗口里 `boot 185` 626 处、`boot 187` 只有计数器 7 处、
+`clover r414: panel` **0 行**；脚本 15:03 以 `close:adb` 收段（TWRP 由 BCB 带回）。两靴 2/2。
+
+用户拍下的屏（照片读数，不是推断）停止在 GPU 探针自己的那族行上：`r405 ldo post`、`r251/r254 ldo words post`、
+`r409 cft step 1…19`、`r286/r317 ldo verdict pass shape=partial move=13/13 … dead=0`，之后控制台再无一行。
+这族行**打印完了**，所以停点不在 LDO 序列里，而在它之后（`clover_gpu_gdsc_on` 那一对开 GDSC/时钟的写，及其后的 CP 启动）。
+与卡上「一笔块 I/O 都没有」一致：GPU 探针在 `bsd_init` 里、根卷挂载之前，卡上自然只剩更早写的计数器。
+
+**同轮查出的第二件事（驱动自己的注释与代码不一致）。** `clover_gpu_ldo_bringup()` 的注释写着
+「该序列由 `clover-gpu-ldo=1` 把关，没要求的靴不写这里」，而全仓 `grep` 只有这一行注释提到 `gpu-ldo`——
+**这道门从未编译进去**，只要 `clover-gpu=1` 它就跑。r407 的注释自己记过 boots 173–179 就是被它挂住的。
+两件事合起来说明：r414 之前的 25 轮 GPU 工作把一条已知会挂启动的写序列无条件接进了每一次 `clover-gpu=1` 的靴，
+而这条线是并行线，主线并不需要它。
+
+
+## Round415 —— 把 GPU 探针从主线上摘掉（`clover-gpu=0`），判据预登记
+
+**改动。** `board.toml` 只动两处：`kernel_args` 的 `clover-gpu=1` → `0`（探针本身是 opt-in，见
+`CloverGpu.cpp:72`「absent, this touches no register and creates no timer」），以及 `[payload] title` 升到 r415 并把
+上面两件事写进去（标题里仍保留一对引号，喂 `check-clover` 的转义闸门）。`check-clover.py` 的 `clover-gpu` 针脚从
+「必须恰为 1」改成「恰一枚、取 0 或 1」，注释写明 1 = GPU 线的靴、0 = 主线的靴；同文件里那句过时的「204 archived
+state rows」改正为「211 of 620」。内核**未重建**（拷贝仍是 `round414b-kernel-normalized.macho`，`e6b785ec…`），
+所以 r414 的显示改动一行未动。
+产物：`round415-payload.img` = **`0f2aec9ca48792e92456f62c996ffbe5fc4eeeadc09a74ff37231f78629bf878`**，
+58,720,256 字节；`round415-check-clover.log` EXIT=0、`round415-verify-payload.log` EXIT=0（51 OK / 0 FAIL）、
+`round415-negatives.log` 12/12。
+
+**boot 188 判据（刷机前写定）：**
+- **W-A**：控制台越过 `gpu t=14` 那一族之后**继续打印**（下一次上屏的内容不再是 r405/r409），即早停不再出现；
+- **W-B**：卡上出现 **boot 188** 的 flight entry（第一次块请求），且内核环里出现 boot 188 的 `clover r180:`/`r344 dispstate`
+  行——这是「这一靴真的挂上了根卷」的证据，与 186/187 的「只有计数器」正相反；
+- **W-C**：V-A…V-J 在 boot 188 上重判（panel 行在场且与 `fires=` 对得上、两行尾巴 ≤300、两个 `*cut` 为 0）。
+- **W-D（反证支）**：若 188 仍静默早停，则「GPU 探针」不是唯一凶手，下一支取 `round388-v0.7.109-payload.img`
+  （boot 185 跑过、能跑满）做板/卡对照，再取「只回退 r414 显示探针」的镜像做代码对照。
+
+**boot 188 读数（`round415-boot188-window.bin`，15:49 落回 TWRP，脚本 EXIT=0）：三条预登记全部落地。**
+
+- **W-A 过了**：控制台不再停在 `gpu t=14` 那一族；板子跑满死线——`flight: deadline fired after 1800 s at t=1804264 ms boot=188`，
+  `stage=0` marker `boot=188`，drain `probe=14/14`。
+- **W-B 过了**：`flight: 4 records, all written by boot 188`（第一批块请求回来了），内核环 **595 处 boot 188**；
+  与 186/187 的「只有计数器」正相反。
+- **W-C 判了**（`round414c-judge-boot186.py` 对 188 窗口）：`dispstate=16 panel=16 dispstatecut=0 panelcut=0`、
+  **16/16 两条都完整、最长 285**（上限 300）、panel 与 state 的 `fires=` 逐拍成对 ⇒ **V-A…V-D 全 PASS**。
+
+**V-A…V-J 逐条：**
+- V-A/V-B/V-C/V-D：见上，四行全过；这是 r344 以来第一次在卡上看到**完整**的显示状态行（此前 211/620 行都断在 304）。
+- V-H（`txa` 对 `tx`）：**16 拍全部 `txa==tx`**（203/203 … 428/428），`txf=0`——这一靴没有一次传输被拒；
+- V-I：`txe/txs/txd` 全 `-`，**空判**（拒绝分支没跑过，不算通过）；
+- V-J（颜色）：`col=ff000000/2132 00000000/1510 00ffffff/411 ffffffff/43 oth=0`（最后一拍）——
+  **面板以不透明白与全透明黑为主**，另有 411 个 alpha=0 的白色、43 个纯白。注意 `scr=<n>/4100` 数的是「像素非零」，
+  所以 `ff000000`（不透明黑）也算 non-black（末拍 2590/4100）；`col=` 才是「面板显示成什么」的那一列。
+- **V-E/V-F/V-G（dyld-skip 的 A/B）**：有了。`tx=203@495s` 的含义按探针自己的定义是「最后一次成功拷贝距第一帧
+  495 s」，而两拍相减得 `frameEpoch ≈ 837 s`：**这一靴的第一帧在 ~837 s，到 1805 s 仍在拷贝（428 次）**；
+  boot 185（该补丁 ABSENT 的 r388 内核）到 1606 s 才有客户端、`tx=0@0s` 全程。**但要写清这是相关性不是单变量对照**：
+  188 的内核与 185 差的不止这一枚补丁（还有 r389–413 的 GPU 代码与本轮 r414 的显示探针），所以能说的是
+  「带这枚补丁的内核上，显示通道在 837 s 就起来了」，不能说「是这枚补丁让它起来的」。
+
+**判读。** 本轮三件事全部落地：① 极早停的名字是 **GPU 探针**（同内核关掉它即跑满）；② r414 的行**完整上卡**，
+`panel`/`dispstate` 成对、无切行；③ 显示通道在这一靴是**活的且无拒绝**——428 次拷贝、0 次拒绝、持续到死线，
+而面板上画的是**黑**（不透明黑 + 全透明黑占绝大多数）。「tx 停摆」在这一靴没有复现，桌面仍未起来：
+下一支的问题从「通道还活着吗」变成「黑帧为什么是黑的」——`col=` 与 `scr=` 已经在答这一格，
+下一步要看的是第 5 个颜色（alpha=0 的白）来自哪一段像素，以及 `calls=1731 fails=15` 那 15 次 selector 6 失败的时刻。

@@ -5561,11 +5561,14 @@ def check_board(errors: list) -> str:
         if gpu_built and flags.get("SHENG_PMGR", "n") not in ("y", "1"):
             errors.append("CloverGpu is scheduled from sheng_pmgr_run(), which CONFIG_XNU_SHENG_PMGR="
                           f"{flags.get('SHENG_PMGR', 'n')} does not compile into the kernel")
+        # Round415. The probe is opt-in (CloverGpu.cpp:72: absent, it touches no register), and r415
+        # boots the main line with it off because boots 186 and 187 both stopped on its GDSC/LDO rows
+        # before the first block request. Two values are legal and they mean the two lines: 1 is the GPU
+        # line's boot, 0 is the main line's. Anything else -- or a second clover-gpu arg -- is noise.
         gpu_args = [item for item in board["payload"]["kernel_args"] if item.startswith("clover-gpu")]
-        if gpu_built and gpu_args != ["clover-gpu=1"]:
-            errors.append(f"kernel_args carries {gpu_args!r} for clover-gpu: the probe has one mode (power "
-                          "the GDSCs and clocks, read back, identify) and absence means no mapping, so "
-                          "anything else is noise or a second instrument nobody wrote")
+        if gpu_built and gpu_args not in (["clover-gpu=0"], ["clover-gpu=1"]):
+            errors.append(f"kernel_args carries {gpu_args!r} for clover-gpu: the probe is opt-in and has "
+                          "exactly two legal values, 1 for the GPU line's boot and 0 for the main line's")
         if '{ "clover r286: ", "r286-gpu", 64, 0, 0, 0 },' not in sdhci_source:
             errors.append("drivers/CloverSdhci has no class for the GPU rows: an unbudgeted producer drops "
                           "them silently, and this round's reading is the row itself")
@@ -8898,10 +8901,10 @@ def check_board(errors: list) -> str:
     # vs=/log=/logdrop= tail to a second row on the same beat, and that row is new. The rows this round did
     # not touch keep their own tokens (dispstate/dispclient r344, bbswap r343) -- a card row names its probe
     # generation, the title names the image that ran. The reason is a measurement, not a preference: 204
-    # archived state rows end mid-column at the tee's 320-byte line bound, and the columns in the cut part
+    # archived state rows (211 of 620) end mid-column at the tee's 320-byte line bound, and the columns in the cut part
     # are the ones that say whether the channel is alive.
-    if not board["payload"]["title"].startswith("clover r414:"):
-        errors.append('[payload] title is not "clover r414: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r415:"):
+        errors.append('[payload] title is not "clover r415: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -11055,8 +11058,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r414:"):
-        errors.append('[payload] title is not "clover r414: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r415:"):
+        errors.append('[payload] title is not "clover r415: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

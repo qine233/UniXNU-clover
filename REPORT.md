@@ -4,17 +4,38 @@
 正式的过程记录仍在 `notes/development-log.md`，结构化记录在 `porting.toml`；本文件只保留
 「这一轮改了什么、读到了什么、下一轮做什么」。
 
-## 当前状态（2026-11-10 夜）
+## 当前状态（2026-11-14，v0.7.111）
 
-- 板子：Mi Pad 4（clover，SDM660），串口 `81ffcaaa`；最近一次运行镜像 **r372（v0.7.93）**。
-- 主线卡点：**backboardd 自己的线程在向它自己的 IOMobileFramebuffer user client 口做
-  send+receive 同步调用，selector 6（swap）间歇性回 `kIOReturnBusy`（0xe00002d5）**，桌面帧率
-  被拖到 ≈1 帧/分钟。
-- 已排除：缺方法（方法在、也回包）、GPU（不需要，见 §结论）、供电/温度（99%、31.8 °C）。
-- 已知副作用：**诊断采样器跑一次后约 18 s 板子会 silent reset**；门控到 `t≥600 s` 可避开早死，
-  但每次拿数据仍要赔一靴。
+- 板子：Mi Pad 4（clover，SDM660），串口 `81ffcaaa`；本轮运行镜像 **r414c（v0.7.111，`d4a8533b`）**。
+- 主线卡点：显示行已完整（r414/r415），通道活着（boot 188：428 次拷贝、0 拒绝），但面板画的是**黑**；
+  同时 GPU 探针在 186/187 把启动挂在 t=14 s，主线自 r415 起以 `clover-gpu=0` 运行。
+- 已排除：tee 丢行（boot 185 零切行是反例）、缺方法（selector 6 有回包）、GPU（CPU 软解路线不变）。
+- 副产：r376 起内核一直缺 `zzy-clover-dyld-cache-skip.patch`，本轮补回；两枚闸门默认值原先指向
+  11-08 的遗留目录，已改到 `out/<profile>/...`。
+- 下一靴：**boot 186**，判 dev-log §Round414b 预登记的 V-A…V-J。
 
 ## 逐轮报告（倒序）
+
+### r415 — 极早停是 GPU 探针；显示行第一次完整上卡（v0.7.112）
+
+- **186/187 的形状**：两靴的控制台都停在 GPU 探针自己的行之后，卡上只有本靴计数器（窗口其余全是 boot 185）。
+- **处置**：主线靴改 `clover-gpu=0`（探针本就 opt-in），内核不动；同时记下 `clover-gpu-ldo` 那道门只写在注释里。
+- **boot 188**：跑满 1800 s 死线；16 条 `panel` + 16 条 `dispstate` 全部完整（最长 285 ≤ 300），
+  `txa==tx` 每一拍、`txf=0`；第一帧 ~837 s、到 1805 s 仍在拷贝（428 次）；
+  `col=ff000000/2132 00000000/1510 00ffffff/411 ffffffff/43` ⇒ 面板以黑为主。
+- **判读**：通道活着且无拒绝，桌面仍未起；下一支问「黑帧为什么是黑的」，用 `col=`/`scr=` 与那 15 次 selector 6 失败的时刻。
+
+### r414 / r414b / r414c — 状态行尾列是被行界切的；panel 行拆出来（v0.7.111）
+
+- **测量**：`kVerdictTextBytes=320` **含** msgbuf 戳（16–17 字符），正文只活 304。44 份存档卡读数
+  620 行里 211 行断行、207 行正好卡在 304；按靴：171=22/22、172/174–179 各 20/20、170=20/21、180–183=0
+  ⇒ 宽度驱动，不是靴驱动（boot 185 零切、最长 266 是反例）。
+- **改动**：四处行界 300；新增 `clover r414: panel ms= fires= txa= txf= txe= txs= txd= col= oth= vs= log= logdrop=`；
+  `txa` 记尝试、`txf` 记拒绝并带站点；`col=` 给八色中采样最多的四色 + 其余计数。
+- **同轮修**：`verify-clover-payload.py`/`check-clover.py` 的默认路径改指 profile 目录；补回 dyld-skip 补丁
+  （468 枚内核普查：259 present / 209 absent，r376–r389 与 r402–r410 全缺）。
+- **闸门**：check-clover EXIT=0、verify 51 OK / 0 FAIL、负测 12/12。
+- **下一轮**：boot 186 读回，判 V-A…V-J（仪器自证 A–D、dyld-skip A/B E–G、新列 H–J）。
 
 ### r387/r388 — 照 sheng 的「提前退休」搬到 CPU 路径，仍停在 803–1051 s
 
