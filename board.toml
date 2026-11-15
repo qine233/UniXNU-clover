@@ -2729,7 +2729,7 @@ kernel_args = [
   # that cannot return by itself cannot be read by scripts/run-clover-unattended.sh at all -- its landing
   # is the deadline panic's own BCB, nothing else. 1800 s is round228's value again: past the census gate
   # (fires beyond 1500 s) and the GPU rows on the ring, inside the resets the board survives.
-  "clover-unattended=1200",
+  "clover-unattended=3600",
   # Round193. Round192's frame ends with `watchdogd[97] exited -- exit reason namespace 2
   # subcode 0x5 description: none` and the panic-path syncs right behind it, after the same job
   # died the same way twice before (pids 52, 92, 97, each `rv=0x5 ns=2 code=0x5`). ns 2 is
