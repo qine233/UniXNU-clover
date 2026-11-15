@@ -346,7 +346,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r424: The r423 marker did not stop data migration (boot 208 still produced four datamigrator stackshots), so this round takes the blocker out instead: the Data volume's launchd disabled.plist marks com.apple.locationd and com.apple.fairplayd.A2 disabled, so the CoreLocationMigrator's synchronous XPC fails fast instead of waiting on a throttled fairplayd. Deadline 1800 s. Round423 had already moved the one-hour stall from the display path to first-boot migration: CoreLocationMigrator waited 42 minutes on locationd, which waited on launchd-throttled fairplayd.A2; the DataMigration.plist LastSystemVersion=21H461 written then is still present but is not the gate."
+title = "clover r425: Boot 209 finished data migration (datamigrator exited 0 after 38 s with locationd and fairplayd.A2 disabled) and the panel left the Apple logo for the first time, but it went all black and the board never rebooted, which is what iOS does before showing the lock screen. The migration state lives in mobile/Library/Preferences/com.apple.migration.plist, not com.apple.DataMigration.plist; boot 209 wrote DMLastMigrationResults success=false there, so every boot still re-runs migration. This round flips that success to true so the next boot skips migration, and sets the deadline back to 1200 s."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -2729,7 +2729,7 @@ kernel_args = [
   # that cannot return by itself cannot be read by scripts/run-clover-unattended.sh at all -- its landing
   # is the deadline panic's own BCB, nothing else. 1800 s is round228's value again: past the census gate
   # (fires beyond 1500 s) and the GPU rows on the ring, inside the resets the board survives.
-  "clover-unattended=1800",
+  "clover-unattended=1200",
   # Round193. Round192's frame ends with `watchdogd[97] exited -- exit reason namespace 2
   # subcode 0x5 description: none` and the panic-path syncs right behind it, after the same job
   # died the same way twice before (pids 52, 92, 97, each `rv=0x5 ns=2 code=0x5`). ns 2 is

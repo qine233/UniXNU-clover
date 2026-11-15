@@ -31638,3 +31638,35 @@ memory-debug 落点，端口复位 + `SAHARA_RESET_REQ` 被接受后回 TWRP；�
   `DMLastMigrationResults`/`LastSystemVersion` 之外的新键，或 launchd 不再每靴起迁移）；
 - **N-C**：屏离开 `lit=82/4100` 的标志形状（`lfb` 或 `col=` 改变）；
 - **N-D**：不回归——`txa` 增长、死线 1800 s 回落 TWRP。
+
+### boot 209 读数（r424，1800 s）——迁移**跑完了**（exit 0），屏首次离开启动标志变全黑；状态域找到了
+
+**产物。** `unattended-r424-boot209-readback.log` EXIT=0、`clover-log-window.bin.txt`（boot 209）、
+`round424-data-boot209.img`（1 GiB，sha256 `b4e16c6c…`）。
+
+**四条判据。**
+- **N-A 名义失败、实质前进**：比 boot 208 多 4 份 spindump（16:11:49 `unsupported screen class`、
+  16:13:58 `SystemAppMigrator`、16:15:58 `PreferencesMigrator` 被 30 s watchdog、
+  16:16:34 `sbmigrator`）；**16:24:29 datamigrator [401] `exited due to exit(0), ran for 38264ms`** ——
+  迁移进程跑完退出，16:16:34 之后不再有 spindump。locationd/fairplayd 的 lookup 已按 disabled 失败
+  （`failed lookup: com.apple.locationd.synchronous` / `com.apple.fairplayd.versioned`），CoreLocation 那类
+  42 分钟挂起**消失**。
+- **N-B 改了对象**：boot 209 的 `mobile/Library/Preferences/com.apple.migration.plist` 现在写
+  `DMLastMigrationResults = { buildVersion = "21H461", success = false }`、`DMUserDataDisposition = {…}`、
+  `LastSystemVersion = "21H461"`。⇒ **真正的状态域是 `com.apple.migration.plist`**，r423 写的
+  `com.apple.DataMigration.plist` 不是它（那个文件在本靴里也不见了）。`success=false` 正是「每靴重跑迁移」的
+  直接原因。
+- **N-C 成立（第一次）**：`panelbox` 从 `lit=82/4100` 的标志形状变成 **`lit=0/4100`、`col=ff000000/4100`、
+  `box=-`、`lfp=0`**——整屏不透明黑；`pc`/`txa` 冻在 1302，显示客户端在 ~1300 s 后不再提交。
+  SpringBoard（pid 27）在 16:24:15 仍活着（`locationd.synchronous`/`PurplePPTServer` lookup 失败），
+  没有退出记录。真实 iOS 在首启迁移完成后会**重启一次**再进锁屏；本靴没有重启，黑屏持续到 1800 s 死线。
+- **N-D 成立**：deadline 1800.014 s；落 EDL（QUSB 0x900e），Sahara reset 回 TWRP。
+
+**r425（预登记）。** 把 `com.apple.migration.plist` 的
+`DMLastMigrationResults.success` 改为 **true**（保留 buildVersion/LastSystemVersion），让下一靴
+`DMIsMigrationNeeded` 直接返回假；其余不动，payload 只改死线回 1200 s。判据：
+- **P-A**：boot 210 没有新的 `stacks+com.apple.datamigrator-*.ips`（与 boot 209 清单 diff 为 0），
+  且 launchd 里没有 `datamigrator` 新 pid；
+- **P-B**：屏不是全黑：`lit>0` 或 `col=` 出现非 `ff000000` 的颜色（锁屏时钟/壁纸）；
+- **P-C**：SpringBoard 在迁移完成后的重启靴里继续活着且提交帧（`pc` 增长）；
+- **P-D**：不回归——死线 1200 s 回落 TWRP。
