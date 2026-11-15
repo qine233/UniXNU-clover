@@ -31515,6 +31515,11 @@ SiriAUSP/KonaSynthesizer，各 2–3 次）——这是锁屏壁纸管线的正�
 （52,551,680 B）；payload `round422-v0.7.126-payload.img` `8b2ae85e…cbcb`（58,720,256 B），
 `payload.json` 自报 kernel `3584a42e…`、payload_kernel `022b7205…`、adt `77830e52…`、trust `7c369ce0…`、data `614b8356…`。
 
+**快速判读变体（v0.7.127）。** boot 201 的问题（静音后屏上是不是真 iOS 帧）在前几分钟就有答案，
+所以另出一枚只改 ADT 的 payload：`board.toml` 的 `clover-unattended` 1800→300，内核不重编
+（payload `7aaa3155…`，adt `df95c5e2…`，镜像闸门 EXIT=0）。runner 用 `--wait 900`，每轮从
+~35 分钟降到 ~8 分钟；需要长窗口时仍可回到 1800 s。
+
 **放行依据（本轮起弃用 check-clover.py）。** 用户要求停止使用 `check-clover.py`：它一跑就把
 Python 驻留内存推到十几到三十几 GB（单独调用 `check_board` 的实测峰值只有 33 MB，说明炸点在
 它串起的整套子进程/检查链路，不在单个算术）。本轮起放行改为：
