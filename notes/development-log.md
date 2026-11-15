@@ -31549,3 +31549,92 @@ Python 驻留内存推到十几到三十几 GB（单独调用 `check_board` 的�
 
 **内存纪律。** 本轮新增板上代码只使用静态数组（`gridCells[240]`）与栈缓冲（`grid[241]`、
 `gridRow[300]`），没有堆分配，也没有 new/IOBuffer；探针把 grid 拷到局部再打印，避免读到半更新行。
+
+
+## Round423 —— 一小时停机不是显示：`datamigrator` 卡在 CoreLocation 插件，Data 卷被标记为已迁移
+
+**题面翻转。** r422 把屏上内容读成「黑 + 稀疏白、静置 47 分钟」，一直按显示队列查。本轮先把
+**Data 卷本身**读回宿主机（`adb exec-out dd`，userdata 偏移 26040 MiB，1 GiB，34 s，
+`round423-data-live.img` sha256 `90a4e53e…`），只读挂载后直接读用户态证据：
+
+- `/log/com.apple.xpc.launchd/launchd.log` **正好覆盖 boot 207 的一小时**（16:00:36 起、17:00:05 止）；
+- `/mobile/Library/Logs/CrashReporter/stacks+com.apple.datamigrator-*.ips`：21 份 spindump，从 16:10 到 16:56；
+- 最后一份的 `reason` 原句：
+  `PRECAUTIONARY stackshot - migration might be hung or deadlocked. Plugin: com.apple.locationd.migrator (CoreLocationMigrator.migrator) (42 minutes) (overall migration start 12463003625) (erase)`；
+- 同一份里 locationd（pid 63）的 `turnstileInfo`/`waitInfo`：
+  `thread 1830: blocked on 1815, hops: 1` / `thread 1830: queue processed by thread 1815` /
+  `thread 1815: mach_msg send on intransit port 0x… (com.apple.fairplayd.versioned (service throttled by launchd))`，
+  且 `portlabels = {"1":"com.apple.locationd.synchronous","2":"com.apple.fairplayd.versioned (service throttled by launchd)"}`。
+
+⇒ **环是用户态的**：`fairplayd.A2` 每 ~10 s 起一次、exit(0)、被 launchd 节流（launchd.log 里 329 次
+`service throttled`）；locationd 的同步发送卡在这枚被节流的端口上；locationd 的队列因此停摆；
+CoreLocationMigrator 的同步调用等 42 分钟；datamigrator 永不完成；SpringBoard 一直停在启动标志。
+显示侧同一小时 `txa` 每秒约 6 次、`lfp=45460`/`lfb=305x811..970x1108` 不变——**通道健康，内容不变**。
+
+**同时撤回一条旧读法。** r217/r218 的 `sbpc` 四帧（`_mach_msg2_internal ← _mach_msg_overwrite ← _mach_msg
+← libdispatch`）用共享缓存 slide `0x94cc000` 解出来是 **libdispatch 的 mach 端口收包线程**，不是 UI 主线程；
+「SpringBoard 主线程等 backboardd 回信」不能由这几行支撑。
+
+**改法（只动 Data 卷的 6 个块级对象之一，不动 OS 卷、不动内核）。**
+DataMigration 的状态文件是 `/private/var/mobile/Library/Preferences/com.apple.DataMigration.plist`
+（缓存里同时有 `LastSystemVersion`、`DMLastMigrationResults`、`DMMigrationPluginResults`、
+`DMMigrationRebootCount` 与 `/var/mobile/Library/Preferences/com.apple.DataMigration.plist` 路径；该文件在板上**不存在**，
+所以每次启动都判定需要迁移）。宿主上：
+
+1. `fsck_apfs -fy round423-data-fix.img`（以普通用户直接修镜像文件）把「13 处 minor issues」修好；
+2. `hdiutil attach -readwrite -mountroot /tmp`（**`diskutil mount` 会把它按只读挂**，这是本次踩到的坑）；
+3. 建 `com.apple.DataMigration.plist` = `{ LastSystemVersion = "21H461" }`，0600，owner 501；
+4. `adb shell "dd of=/dev/block/by-name/userdata bs=1048576 seek=26040 count=1024"` 写回，
+   读回逐字节相同（`round423-data-readback.img`；捕获文件尾多出的 90 字节是 toybox dd 的统计文字，
+   不是盘上内容）。
+
+**构建。** 内核未变（仍 `round422-kernel-normalized.macho`），只重打 payload：`title` 升 r423、
+`clover-unattended=1200`。`round423-v0.7.133-payload-1200s.img` sha256 `86e51cae…`；
+`verify-clover-payload.py` EXIT=0（0 FAIL）。commit `ddc7c30`、tag `v0.7.133` 已推送。
+
+**预登记（boot 208 判据，刷写前写定）。**
+- **M-A**：新靴的 launchd.log 里没有新的 `stacks+com.apple.datamigrator-*.ips`（时间戳属于本靴），且
+  `com.apple.DataMigration.plist` 仍为 `LastSystemVersion=21H461`；
+- **M-B**：屏内容离开启动标志：`panelbox` 的 `lit/lfb` 不再是 `82/4100` + `305x811..970x1108` 的静置形状，
+  `col=` 出现壁纸/锁屏的多色；若仍是同一形状 ⇒ 迁移被跳过但没有推进到锁屏，下一支查 SpringBoard 启动条件；
+- **M-C**：`datamigrator` 不再在 spindump 里出现（或出现的时间戳属于上一靴）；
+- **M-D**：不回归——`txa` 增长、`txf=0`、死线 1200.00 s 触发并落回 TWRP。
+
+**判停条件不变**：板子真进 iOS 桌面。破坏性写盘仍先问（本轮写的是 1 GiB Data 窗口，已有整段备份）。
+
+### boot 208 读数（r423，1200 s 死线）——**迁移没有被跳过**；`LastSystemVersion` 不是那道门
+
+**产物。** `unattended-r423-boot208-readback.log` EXIT=0、`clover-log-window.bin.txt`（boot 208）、
+`round423-data-boot208.img`（1 GiB，sha256 `ceccec5f…`）。死线 **1200.005 s**，落回 TWRP（中间一次 Sahara
+memory-debug 落点，端口复位 + `SAHARA_RESET_REQ` 被接受后回 TWRP；其间 `edl.py` 的
+`CLOVER_SARAHA_RESET` 分支没有生效、误入 DDR dump，已清理 `edl/memory/` 并还原脚本——这条宿主工具的
+缺陷记在这里，别下次再踩）。
+
+**判据逐条。**
+- **M-A 不成立**：`com.apple.DataMigration.plist` 确实在 Data 卷上（`LastSystemVersion=21H461`，0600、501），
+  但 launchd 仍起了迁移：`/mobile/Library/Logs/CrashReporter` 里比 boot 207 多出 **4 份**
+  `stacks+com.apple.datamigrator-*.ips`（16:10:24、16:12:24、16:15:16、16:15:40），reason 分别是
+  `unsupported screen class`、`SystemAppMigrator`、`sbmigrator`、`CoreLocationMigrator (2 minutes)`。
+  所以 `DMIsMigrationNeeded` 读的不是这个键/域（或不止它）。
+- **M-B 不成立**：1200 s 内 `panelbox` 从 1154 s 到 1214 s 始终 `lit=82/4100 a0=0 a255=4100
+  box=314x823..970x1104 lfp=45460 lfb=305x811..970x1108`，`col=ff000000/4018 ffffffff/74`；
+  与 boot 207 的启动标志逐字段相同。
+- **M-C 不成立**：见上，4 份新 spindump 都属于 boot 208（wall clock 每靴从 16:00 重置，不能只看时间；
+  用「与 boot 207 的 live 镜像做文件清单 diff」判的）。
+- **M-D 成立**：`txa` 1154 s 2756 → 1214 s 3143、`txf=0`；死线 1200 s 准时。
+
+**反汇编（宿主，dyld 缓存）。** `DMIsMigrationNeeded` @ `0x1d21d22e0` 只做两件事：
+取一个单例（类引用 `0x1ea6f4eb8`），非空则调 `0x1d21db960`（ObjC 选择器存根，selref `0x1ea6f4bd8`）
+并返回其结果；空则打日志（字符串 `0x1ea6f3570`）返回 0。选择器名字在 chained-fixup 的
+`__objc_selrefs` 里，本轮没有继续解；结论够用：`LastSystemVersion` 不是它的输入。
+
+**下一支（r424，预登记）。** 不再猜状态键，直接拆掉阻塞者：在 Data 卷的
+`db/com.apple.xpc.launchd/disabled.plist` 里把 **`com.apple.locationd`** 与 **`com.apple.fairplayd.A2`**
+置 true（两者都不进内核、不改 OS 卷），让 CoreLocationMigrator 的同步 XPC 立即失败而不是等 42 分钟，
+迁移其余插件走完后由 DM 自己写状态。死线回到 1800 s。
+判据：
+- **N-A**：boot 209 的 `stacks+com.apple.datamigrator-*.ips` 文件数不再增加（与 boot 208 清单 diff 为 0）；
+- **N-B**：`mobile/Library/Preferences/com.apple.DataMigration.plist` 在靴内被 DM 更新（出现
+  `DMLastMigrationResults`/`LastSystemVersion` 之外的新键，或 launchd 不再每靴起迁移）；
+- **N-C**：屏离开 `lit=82/4100` 的标志形状（`lfb` 或 `col=` 改变）；
+- **N-D**：不回归——`txa` 增长、死线 1800 s 回落 TWRP。
