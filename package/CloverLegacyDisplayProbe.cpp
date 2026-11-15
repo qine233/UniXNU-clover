@@ -88,6 +88,10 @@ static volatile uint32_t sel6Forced;
 // because boot 188's fails=15 was already constant at the ring's first row and a count can never date it.
 extern "C" volatile uint32_t native_legacy_screen_lit,native_legacy_screen_alpha0,native_legacy_screen_alpha255;
 extern "C" volatile uint32_t native_legacy_screen_box[4],native_legacy_screen_box_seen;
+/* Round422: the same pass's spatial thumbnail -- 16x15 cells of lit density, one hex digit each, row-major
+ * from the top-left. col= says what colours the panel holds; this says where they sit. The driver owns the
+ * storage for the same reason it owns the colour slots. */
+extern "C" volatile char native_legacy_screen_grid[241];
 static volatile uint32_t sel6FailCount;
 static volatile uint64_t sel6FailFirstUs,sel6FailLastUs;
 /* Successful scanout transfers and the time of the last one. */
@@ -233,14 +237,18 @@ volatile uint64_t native_legacy_last_box[4];
  * time since the frame epoch, and its ordinal. lfn=0 means no frame has been observed yet.
  */
 static uint64_t lastFramePixels;static uint32_t lastFrameOrdinal;
+// Round422: a presentation is counted, and the last observed frame stays. The old body zeroed the box and
+// pixels after every copy, so boot 200 read lfp=0 lfb=0x0..0x0 lfn=32 on every beat while tx ran to 736 --
+// the columns described the instrument, not the panel. lfk/lft still date the presentation itself.
+static volatile uint64_t presentedCount;
 volatile uint32_t native_legacy_frame_kind[NATIVE_LEGACY_FRAMES];
 volatile uint32_t native_legacy_frame_time[NATIVE_LEGACY_FRAMES];
 volatile uint64_t native_legacy_frame_stats[NATIVE_LEGACY_FRAMES][5];
 static uint64_t frameEpoch;
 /*
- * Presentation time only: the content scans stay budgeted to the first frames, but whether a frame was
- * presented at all must keep being answered, or a boot that stopped presenting looks like a boot whose
- * scans were merely spent.
+ * Presentation time and count: the content scans are budgeted (first 32, then one in 64), but whether a
+ * frame was presented at all must keep being answered, or a boot that stopped presenting looks like a boot
+ * whose scans were merely spent. The observed fields belong to frame_observed and are not touched here.
  */
 void native_legacy_frame_presented(unsigned kind) {
     uint64_t now,frequency;
@@ -248,9 +256,7 @@ void native_legacy_frame_presented(unsigned kind) {
     if(!frameEpoch)frameEpoch=now;
     native_legacy_last_kind=kind;
     native_legacy_last_time=frequency?(uint32_t)((now-frameEpoch)/frequency):0;
-    native_legacy_last_box[0]=0;native_legacy_last_box[1]=0;
-    native_legacy_last_box[2]=0;native_legacy_last_box[3]=0;
-    lastFramePixels=0;lastFrameOrdinal=native_legacy_frame_count;
+    presentedCount=presentedCount+1;
 }
 void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uint64_t miny,uint64_t maxx,uint64_t maxy) {
     uint32_t n=native_legacy_frame_count;
@@ -906,6 +912,7 @@ static void reportDisplayClient(unsigned index,uint32_t grew) {
     IOLog("%s",row);
 }
 enum {kPanelRowBytes=300};
+enum {kPanelGridRowBytes=300};
 // Round414: the four most-sampled colours, most first. The driver's eight slots are in first-seen order, which
 // is not importance order -- the first sample of a boot can be a stray pixel -- so the pick is by count and a
 // slot with no samples is skipped rather than printed as black. Counts print as %u because the sample pass
@@ -968,7 +975,7 @@ static void reportPanelState(uint64_t now) {
     char boxRow[kPanelRowBytes];
     int boxLen=snprintf(boxRow,sizeof boxRow,
         "clover r416: panelbox ms=%llu fires=%u lit=%u/%u a0=%u a255=%u box=%s s6fail=%u first=%llus last=%llus "
-        "flog=%u fd=%u lfk=%u lfp=%llu lfb=%llux%llu..%llux%llu lft=%us lfn=%u\n",
+        "flog=%u fd=%u lfk=%u lfp=%llu lfb=%llux%llu..%llux%llu lft=%us lfn=%u pc=%llu\n",
         (unsigned long long)(now/1000),dispstateFires,(unsigned)native_legacy_screen_lit,
         (unsigned)native_legacy_screen_sampled,(unsigned)native_legacy_screen_alpha0,
         (unsigned)native_legacy_screen_alpha255,box,(unsigned)sel6FailCount,
@@ -976,7 +983,8 @@ static void reportPanelState(uint64_t now) {
         (unsigned)frameLines,(unsigned)frameDropped,(unsigned)native_legacy_last_kind,
         (unsigned long long)lastFramePixels,(unsigned long long)native_legacy_last_box[0],
         (unsigned long long)native_legacy_last_box[1],(unsigned long long)native_legacy_last_box[2],
-        (unsigned long long)native_legacy_last_box[3],(unsigned)native_legacy_last_time,(unsigned)lastFrameOrdinal);
+        (unsigned long long)native_legacy_last_box[3],(unsigned)native_legacy_last_time,(unsigned)lastFrameOrdinal,
+        (unsigned long long)presentedCount);
     if(boxLen<0 || static_cast<unsigned>(boxLen)>=sizeof boxRow) {
         char boxCut[96];
         snprintf(boxCut,sizeof boxCut,"clover r416: panelboxcut bytes=%d cap=%u fires=%u\n",
@@ -984,6 +992,27 @@ static void reportPanelState(uint64_t now) {
         IOLog("%s",boxCut);
     } else {
         IOLog("%s",boxRow);
+    }
+    /*
+     * Round422's third row of this beat. col= says the panel is mostly black with sparse white; it cannot
+     * say whether that is a centered blob, a top band, a dot matrix or text. g= is the sample pass's lit
+     * density as 16x15 hex cells, row-major from the top-left, so the shape is on the card beside the
+     * colours it is made of. The grid is copied before printing: the driver's beat writes it, and a row
+     * half-updated mid-print would be a shape nobody painted.
+     */
+    char grid[241];
+    for(unsigned c=0;c<240;++c)grid[c]=native_legacy_screen_grid[c];
+    grid[240]=0;
+    char gridRow[kPanelGridRowBytes];
+    int gridLen=snprintf(gridRow,sizeof gridRow,"clover r422: panelgrid ms=%llu fires=%u g=%s\n",
+        (unsigned long long)(now/1000),dispstateFires,grid);
+    if(gridLen<0 || static_cast<unsigned>(gridLen)>=sizeof gridRow) {
+        char gridCut[96];
+        snprintf(gridCut,sizeof gridCut,"clover r422: panelgridcut bytes=%d cap=%u fires=%u\n",
+            gridLen,(unsigned)sizeof gridRow,dispstateFires);
+        IOLog("%s",gridCut);
+    } else {
+        IOLog("%s",gridRow);
     }
 }
 static void reportDisplayState(void) {

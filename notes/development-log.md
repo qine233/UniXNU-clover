@@ -31490,3 +31490,40 @@ SiriAUSP/KonaSynthesizer，各 2–3 次）——这是锁屏壁纸管线的正�
   横条纹（文字）/ 全 0（黑屏），并对照相邻拍是否变化；
 - **AA-C**：`lfn` 在 32 之后仍增长（晚期扫描生效），`lfp/lfb` 不再恒零，`pc` 随拍增长；
 - **AA-D**：`ENOSPC=0`、`client=`/`tx` 不回归、死线落回 TWRP。
+- **AA-E（修手，新增）：** 首次真实 surface 拷贝后出现一条 `clover r422: consolemute first=1`；
+  此后 `col=` 不再是「黑 + 满屏白字」，`panelgrid` 应给出稳定形状（锁屏/桌面/动画），而不是
+  每拍变化的文字行。
+
+**修手：按 santoni 的控制台接管（本轮唯一行为改动）。** boot 200 的 `col=` 是黑底 + 约 10%
+白色、`box` 几乎全屏、每拍变化，且本板没有串口（UART 节点不存在，`switch_to_serial_console`
+无法生效）。这与「内核 kprintf 每 30 s 把 dispstate/panel/panelbox 三行长文本画进同一块物理
+帧缓冲」完全一致：视频控制台经 `vcputc → console_write_char` 写 `vinfo.v_baseaddr`，而这个
+地址与 `bootMapping` 是同一块扫描内存，于是每次日志都把 iOS 帧覆盖成文字。santoni 的对应做法
+是 iOS 帧一到就停控制台绘制（`fConsShown=false` + console mute）。clover 的实现：首次真实
+`copy_layout` 成功后把 `disableConsoleOutput` 置 1（一次性）。msgbuf 在 console sink 之前写入
+（`subr_prf.c` 先 `log_putc_locked` 再 `console_write_char`），所以 tee 的读数一条不少；panic
+屏是补丁直接按 vc_info 画像素，不经过 console sink。新增 tee 类 `r422-consolemute`（8 行）。
+
+**构建与放行（r422）。** 首次 `build kernel` 在 archive 链接阶段失败：
+`_native_legacy_screen_grid (needed by NativeLegacyDisplay.late) is defined by no archive member` ——
+驱动侧只写了 `extern` 声明，没有定义。把驱动那行改成带初始化的 C 链接定义
+（`extern "C" volatile char native_legacy_screen_grid[241]={0};`）后重建通过。加入控制台静音后
+最终产物（含控制台静音、环偏移回到 192 后重建）：prelink `kernel.macho` sha256 `82336cb7…9316`；
+`patch-clover-amfi.py` 两刀仍落在 VA `0xfffffff004ab40e4`/`0xfffffff004ab416c`
+（`0x34000229→0x14000011`、`0x36000520→0xd503201f`），`round422-kernel-amfi.macho` `afced1f9…42a0`；
+`normalize-kernel-macho.py` 清零 973 枚 object 戳，`round422-kernel-normalized.macho` `3584a42e…ab0c`
+（52,551,680 B）；payload `round422-v0.7.126-payload.img` `8b2ae85e…cbcb`（58,720,256 B），
+`payload.json` 自报 kernel `3584a42e…`、payload_kernel `022b7205…`、adt `77830e52…`、trust `7c369ce0…`、data `614b8356…`。
+
+**放行依据（本轮起弃用 check-clover.py）。** 用户要求停止使用 `check-clover.py`：它一跑就把
+Python 驻留内存推到十几到三十几 GB（单独调用 `check_board` 的实测峰值只有 33 MB，说明炸点在
+它串起的整套子进程/检查链路，不在单个算术）。本轮起放行改为：
+① `verify-clover-payload.py` 对最终 payload 与 normalized kernel —— **EXIT=0，48 项 OK / 0 FAIL**，
+其中 `r422-panelgrid`、`r422-panelgridcut` 均 present；
+② 对 r422 的 11 条源码针脚做定点 `grep -F` 核对，全部命中（存储/观测写者/`presentedCount`/
+`pc=` 格式尾/两条 panelgrid 格式/probe extern/驱动定义/格子算式/终止符/晚扫描/tee 两条目/豁免），
+并确认旧的 `lastFramePixels=0;lastFrameOrdinal=native_legacy_frame_count;` 已从 probe 消失；
+③ 依赖 `check-clover.py` 的 90 例负测套件不再整跑（每例会拉起整套检查器，正是内存炸点）。
+
+**内存纪律。** 本轮新增板上代码只使用静态数组（`gridCells[240]`）与栈缓冲（`grid[241]`、
+`gridRow[300]`），没有堆分配，也没有 new/IOBuffer；探针把 grid 拷到局部再打印，避免读到半更新行。

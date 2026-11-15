@@ -1180,7 +1180,12 @@ def selftest():
             ("kPanelRowBytes", '"clover r414: panel ms=', '"clover r414: panelcut bytes=',
              ("txa=", "txf=", "txe=", "txs=", "txd=", "col=", "oth=", "vs=", "log=", "logdrop=")),
             ("kSwapWaitRowBytes", '"clover r343: bbswap ms=', '"clover r343: bbswapcut bytes=',
-             ("latch=", "copy=", "fc="))):
+             ("latch=", "copy=", "fc=")),
+            # Round422's grid row is the one row whose operand is a fixed 240-character buffer, so its
+            # sample-built width is meaningless (the %s sample is six characters). The worst case is
+            # asserted below from the cap the probe declares, not from a remembered number.
+            ("kPanelGridRowBytes", '"clover r422: panelgrid ms=', '"clover r422: panelgridcut bytes=',
+             ("g=",))):
         declaration = re.search(r"^enum \{[^\n]*\b" + cap_name + r"\s*=\s*(\d+)", probe_src, re.M)
         assert declaration, f"{cap_name} is not declared on an enum line of {probe_path.name}"
         row_cap = int(declaration.group(1))
@@ -1209,6 +1214,16 @@ def selftest():
         # row exists, and its width on the card is a boot reading, not a number this test may assume.
         assert row_cap + 17 <= tee_line, (cap_name, row_cap, tee_line)
         assert row_cap <= SECTOR - len(PREFIX) - 1, (cap_name, row_cap, SECTOR - len(PREFIX) - 1)
+    # The grid operand is fixed at 240 cells, so only a constructed row is a width reading. Ten digits of
+    # milliseconds is 115 days of uptime and four digits of fires is more beats than the budget allows;
+    # both are stated so the arithmetic fails loudly if the row grows a column or the cap shrinks.
+    grid_decl = re.search(r"^enum \{[^\n]*\bkPanelGridRowBytes\s*=\s*(\d+)", probe_src, re.M)
+    assert grid_decl, f"kPanelGridRowBytes is not declared on an enum line of {probe_path.name}"
+    grid_cap = int(grid_decl.group(1))
+    grid_row = ("clover r422: panelgrid ms=" + "9" * 10 + " fires=" + "9" * 4 +
+                " g=" + "f" * 240 + "\n")
+    assert len(grid_row[:-1].encode()) < grid_cap, (len(grid_row), grid_cap)
+    assert grid_cap + 17 <= tee_line, (grid_cap, tee_line)
     for index, line in enumerate(kernel_lines):
         slot = index
         lba = first_lba + KERNEL_OFFSET + 2 * slot
@@ -1656,11 +1671,12 @@ def selftest():
           "ring kinds, bad records, the r302 verdict signatures, the r305 clock pair, the r310 "
           "sink-door words, the older-payload clock guard, the ring rule read from the "
           "declaring row wherever that row lies, the r343 sentence that says which rule read "
-          "this ring on both the declaring and the declaring-nothing card, and all four display row "
+          "this ring on both the declaring and the declaring-nothing card, and all five display row "
           "families built from the probe's own literals -- the state row with its picker, the per-record "
-          "row, the panel row, and the swap row -- each with its own ceiling, every offset-named and "
-          "picker column asked for by name, and every ceiling checked against the tee's own line bound "
-          "read from SdhciLogCore.h rather than against this card record's -- all ok")
+          "row, the panel row, the swap row, and the panel grid with its fixed 240-cell operand -- each "
+          "with its own ceiling, every offset-named and picker column asked for by name, and every "
+          "ceiling checked against the tee's own line bound read from SdhciLogCore.h rather than "
+          "against this card record's -- all ok")
     return 0
 
 

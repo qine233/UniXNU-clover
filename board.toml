@@ -341,7 +341,12 @@ loader = "firmware"
 # Round415's case: boots 186 and 187 both stopped while the console was still scrolling, on the GPU
 # probe's own rows -- the card held nothing but this boot's counter, so the stop is before the first
 # block request. The GPU is a parallel line; the display line does not need it.
-title = "clover r421: Boot 199 ran 824 surfaces with no ENOSPC line left, and the eleven frame rows it logged had rotated out of the 512-line ring by the deadline. The periodic \"panelbox\" row now carries the last frame's kind, pixels, box, time and ordinal, so every beat says what the client last painted instead of only that it painted."
+#
+# Round422's case: boot 200 painted to the 1800 s deadline (tx still growing, col= refreshed every beat)
+# but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
+# density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
+# every copy, and one frame in 64 keeps being scanned after the opening budget.
+title = "clover r422: Boot 200 painted to the deadline but not the desktop: col= reads black plus sparse white every beat, which cannot tell a centered blob from a top band from a dot matrix. The new \"panelgrid\" row carries the lit density as 16x15 hex cells, the panelbox row keeps the last scanned frame instead of zeroing it after every copy (pc= counts presentations), and one frame in 64 stays scanned after the opening 32. The same round takes santoni's console take-over: the first real surface copy silences the video console, which had been painting kernel rows into the same physical framebuffer and was the black-and-white text on the panel."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

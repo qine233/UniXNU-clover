@@ -3350,6 +3350,7 @@ def check_board(errors: list) -> str:
         if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r416-panelbox")' not in sdhci_source:
             errors.append("the r416 panelbox row is not exempt from the per-pass cap")
         probe_source = (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text()
+        driver_source = (REPO / "drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp").read_text()
         # Round419. Boot 192 ran 355 copies and kept exactly one frame row: the row rode the cloverLog 96-line
         # budget, which had been spent elsewhere. Frames are rate-limited by their own cadence, so they get their
         # own cap, and the panelbox row carries the drop count -- a cap without a reading is a silence.
@@ -3363,14 +3364,56 @@ def check_board(errors: list) -> str:
         # Round421. Boot 199 logged eleven frame rows with no drop, and none survived to the 1800 s deadline:
         # they had rotated out of the 512-line ring. The periodic panelbox row now carries the last frame, set
         # on both the blank path and the real-copy path, so every beat says what was last painted.
+        # Round422 corrects what "last frame" means: boot 200 read lfp=0 lfb=0x0..0x0 lfn=32 on every beat
+        # while tx ran to 736, because frame_presented zeroed the observed fields after every copy. The
+        # presentation is now counted (pc=) and the observed fields belong to frame_observed alone; the
+        # zeroing literal must be gone, or the columns describe the instrument again.
         for needle in ('static uint64_t lastFramePixels;static uint32_t lastFrameOrdinal;',
-                       'lastFramePixels=0;lastFrameOrdinal=native_legacy_frame_count;',
                        'lastFramePixels=count;lastFrameOrdinal=n+1;',
-                       '"flog=%u fd=%u lfk=%u lfp=%llu lfb=%llux%llu..%llux%llu lft=%us lfn=%u'):
+                       'presentedCount=presentedCount+1;',
+                       '"flog=%u fd=%u lfk=%u lfp=%llu lfb=%llux%llu..%llux%llu lft=%us lfn=%u pc=%llu'):
             if needle not in probe_source:
                 errors.append(f"the panelbox row does not carry the last frame: {needle!r} is missing, and "
-                              "boot 199 lost all eleven frame rows to ring rotation")
-        driver_source = (REPO / "drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp").read_text()
+                              "boot 200's lf* columns described the zeroing, not the panel")
+        if 'lastFramePixels=0;lastFrameOrdinal=native_legacy_frame_count;' in probe_source:
+            errors.append("frame_presented still zeroes the observed fields: boot 200 read lfp=0 lfn=32 on "
+                          "every beat while tx ran to 736, and the zeroing is what made the columns lie")
+        # Round422. col= says which colours the panel holds, not where they sit: boot 200's black plus sparse
+        # white could be a centered blob, a top band, a dot matrix or text. The grid row is the sample pass's
+        # lit density as 16x15 hex cells, fired on the same beat, with its own class and exemption for the
+        # same reason r414/r416 have theirs -- a cap that ate the shape must not eat the colours it explains.
+        for entry in ('{ "clover r422: panelgridcut", "r422-panelgridcut", 8, 0, 0, 0 },',
+                      '{ "clover r422: panelgrid", "r422-panelgrid", 96, 0, 0, 0 },'):
+            if entry not in sdhci_source:
+                errors.append(f"drivers/CloverSdhci has no class {entry[:46]!r}: the panelgrid row would "
+                              "compete with the panel rows for one budget")
+        if sdhci_source.find('{ "clover r422: panelgridcut"') > sdhci_source.find('{ "clover r422: panelgrid"'):
+            errors.append("the r422 tee table lists the shorter panelgrid token first: every panelgridcut "
+                          "would be counted, and reported, as the row it says did not fit")
+        if 'teeHasPrefix (probe->name, teeStringLength (probe->name), "r422-panelgrid")' not in sdhci_source:
+            errors.append("the r422 panelgrid row is not exempt from the per-pass cap: it fires on the "
+                          "display's own beat, and a row the cap ate reads like a beat that never fired")
+        for needle in ('"clover r422: panelgrid ms=%llu fires=%u g=%s\\n"',
+                       '"clover r422: panelgridcut bytes=%d cap=%u fires=%u\\n"',
+                       'extern "C" volatile char native_legacy_screen_grid[241];'):
+            if needle not in probe_source:
+                errors.append(f"the r422 panelgrid instrumentation lacks {needle[:48]!r}: the row, its cut "
+                              "branch and the grid it reads are three readings and each has to exist")
+        # The grid's writer is the driver's sample pass: cells accumulate where the lit samples land, and
+        # the quantisation is against the pass's own share so the digits mean density, not raw counts.
+        for needle in ('extern "C" volatile char native_legacy_screen_grid[241]={0};',
+                       'uint32_t cell=(y*15/screenGeometryHeight)*16+(x*16/screenGeometryWidth);',
+                       'native_legacy_screen_grid[c]="0123456789abcdef"[level];',
+                       'native_legacy_screen_grid[240]=0;'):
+            if needle not in driver_source:
+                errors.append(f"the r422 grid writer lacks {needle[:48]!r}: the row would print a shape "
+                              "nothing samples")
+        # The late scan: boot 200's scans ended at frame 32 while the client ran to 736, so one frame in 64
+        # keeps being scanned after the opening budget -- otherwise lfn freezes and the late lf* columns
+        # describe frame 32 forever.
+        if 'else if((++lateScanTick&63)==0)contentScan=true;' not in driver_source:
+            errors.append("the content scans still end at the opening budget: boot 200's lfn froze at 32 "
+                          "while tx ran to 736, and the late frames were never scanned")
         for needle, haystack in (
                 ('"clover r416: panelbox ms=%llu fires=%u lit=%u/%u a0=%u a255=%u box=%s s6fail=%u '
                  'first=%llus last=%llus "', probe_source),
@@ -8967,8 +9010,8 @@ def check_board(errors: list) -> str:
     # generation, the title names the image that ran. The reason is a measurement, not a preference: 204
     # archived state rows (211 of 620) end mid-column at the tee's 320-byte line bound, and the columns in the cut part
     # are the ones that say whether the channel is alive.
-    if not board["payload"]["title"].startswith("clover r421:"):
-        errors.append('[payload] title is not "clover r421: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r422:"):
+        errors.append('[payload] title is not "clover r422: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -11122,8 +11165,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r421:"):
-        errors.append('[payload] title is not "clover r421: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r422:"):
+        errors.append('[payload] title is not "clover r422: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:

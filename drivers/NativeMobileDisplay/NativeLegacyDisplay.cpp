@@ -47,9 +47,21 @@ extern "C" volatile uint64_t native_legacy_screen_hash=0;
 extern "C" volatile uint32_t native_legacy_screen_colors[8]={0,0,0,0,0,0,0,0};
 extern "C" volatile uint64_t native_legacy_screen_color_counts[8]={0,0,0,0,0,0,0,0};
 extern "C" volatile uint64_t native_legacy_screen_color_other=0;
+// Round422: where the lit samples sit, not just how many. The same sample pass buckets each lit sample into
+// 16 columns x 15 rows of the console geometry and quantises each cell to one hex digit (0 = no lit sample,
+// f = the cell's full share), row-major from the top-left, 240 characters plus the terminator. Boot 200's
+// col= said black plus sparse white but could not tell a centered blob from a top band from a dot matrix.
+extern "C" volatile char native_legacy_screen_grid[241]={0};
 // The surface of a rejected swap, as the validator read it: width, height, format, planes, stride, allocation, descriptor length.
 extern "C" void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t,uint32_t,uint64_t,uint64_t,uint64_t);
 extern "C" bool native_legacy_prepare_scanout(void);
+// Round422, after santoni's console take-over: the kernel video console paints into the same physical
+// framebuffer bootMapping points at, so every kprintf after the first iOS frame lands on top of it. This
+// board has no serial console to switch to (board.toml: the UART node does not exist), so the only way to
+// stop the text overpainting the panel is the console sink's own gate. msgbuf is written before the console
+// sink (subr_prf.c: log_putc_locked then console_write_char), so the tee keeps every reading.
+extern "C" int disableConsoleOutput;
+static bool consoleSilenced=false;
 extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t,unsigned,uint32_t);
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
 extern "C" void native_legacy_retirement_observed(IOService *);
@@ -83,6 +95,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
     uint32_t scanBudget=32;
+    uint32_t lateScanTick=0;
     void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
     bool primary=false;
     bool logicalPM=false;
@@ -175,6 +188,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         uint32_t nonblack=0,sampled=0;uint64_t hash=0,lit=0,alpha0=0,alpha255=0,x0=0,x1=0,y0=0,y1=0;int seen=0;
         uint32_t colors[8]={0,0,0,0,0,0,0,0};uint64_t counts[8]={0,0,0,0,0,0,0,0};
         uint32_t used=0;uint64_t other=0;
+        // Static, not stack: the beat thread's stack is the one r354 had to rescue, and 240 cells belong to
+        // the pass, not to the call. Only this work loop ever runs sampleScreen.
+        static uint32_t gridCells[240];
+        for(uint32_t c=0;c<240;++c)gridCells[c]=0;
         for(uint64_t i=0;i<n;i+=step){
             uint32_t px=fb[i];
             if(px)nonblack++;
@@ -182,7 +199,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             if(px&0x00ffffffU){lit=lit+1;
                 if(screenGeometryWidth&&screenGeometryHeight){uint32_t x=(uint32_t)(i%screenGeometryWidth),y=(uint32_t)(i/screenGeometryWidth);
                     if(!seen){x0=x1=x;y0=y1=y;seen=1;}
-                    else {if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y;}}}
+                    else {if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y;}
+                    uint32_t cell=(y*15/screenGeometryHeight)*16+(x*16/screenGeometryWidth);
+                    if(cell<240)gridCells[cell]=gridCells[cell]+1;}}
             if(((px>>24)&0xffU)==0)alpha0=alpha0+1;
             else if(((px>>24)&0xffU)==255)alpha255=alpha255+1;
             uint32_t slot=0;
@@ -202,6 +221,16 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         native_legacy_screen_lit=lit;native_legacy_screen_alpha0=alpha0;native_legacy_screen_alpha255=alpha255;
         native_legacy_screen_box[0]=x0;native_legacy_screen_box[1]=y0;native_legacy_screen_box[2]=x1;native_legacy_screen_box[3]=y1;
         native_legacy_screen_box_seen=(uint32_t)seen;
+        // One hex digit per cell: the cell's lit count against its expected share of the pass (sampled/240),
+        // so a fully lit cell reads f and an empty one 0 whatever the stride is. No geometry, no cells: the
+        // grid then stays all-zero, which is the honest answer, not a fabricated shape.
+        uint32_t perCell=sampled/240;if(!perCell)perCell=1;
+        for(uint32_t c=0;c<240;++c){
+            uint32_t level=(gridCells[c]*16)/(perCell+1);
+            if(level>15)level=15;
+            native_legacy_screen_grid[c]="0123456789abcdef"[level];
+        }
+        native_legacy_screen_grid[240]=0;
     }
     static void stateBeatFired(OSObject *owner,IOTimerEventSource *) {
         static_cast<NativeLegacyDisplay *>(owner)->sampleScreen();
@@ -473,6 +502,15 @@ public:
             source->getLength(),sourceStride,width,height)) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0,7,0);return;
         }
+        // Round422, santoni's console take-over: this copy just put the first real iOS frame into the scanout
+        // buffer, so the text console must stop painting there. It paints through vcputc -> console_write_char
+        // into the same physical buffer, and every later kprintf would scroll over the frame again. The gate is
+        // one-way; msgbuf was already written, so every row below still reaches the card.
+        if(!consoleSilenced) {
+            consoleSilenced=true;
+            disableConsoleOutput=1;
+            IOLog("clover r422: consolemute first=1\n");
+        }
         /*
          * The CPU path retires like the GPU hand-off does: the family's swap completes before the copy,
          * so the next submission is accepted instead of answered busy. The map above holds the frame's
@@ -488,9 +526,13 @@ public:
                 native_legacy_early_retires=native_legacy_early_retires+1;
             }
         }
-        // The two content scans read every pixel again; they only describe the first frames (the probe keeps 32).
-        if(scanBudget) {
-            --scanBudget;
+        // The two content scans read every pixel again. The opening burst keeps the first 32 frames; after it
+        // one frame in 64 is still scanned (r422), because boot 200's lf* froze at frame 32 while tx ran to 736:
+        // a budget that ends is not a panel that stopped, and the late reading must keep being produced.
+        bool contentScan=false;
+        if(scanBudget) {--scanBudget;contentScan=true;}
+        else if((++lateScanTick&63)==0)contentScan=true;
+        if(contentScan) {
             uint64_t scan[5];
             if(native_legacy_frame_scan(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,scan))
                 native_legacy_frame_observed(0,scan[0],scan[1],scan[2],scan[3],scan[4]);

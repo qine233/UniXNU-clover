@@ -1327,8 +1327,17 @@ def check_sb_sample(kernel: bytes) -> bool:
              # the format string alone would pin a row that could never print a date.
              "r416-panelbox": (b"clover r416: panelbox ms=%llu fires=%u lit=%u/%u a0=%u a255=%u box=%s "
                                b"s6fail=%u first=%llus last=%llus flog=%u fd=%u lfk=%u lfp=%llu "
-                               b"lfb=%llux%llu..%llux%llu lft=%us lfn=%u\n") in kernel,
+                               b"lfb=%llux%llu..%llux%llu lft=%us lfn=%u pc=%llu\n") in kernel,
              "r416-panelboxcut": (b"clover r416: panelboxcut bytes=%d cap=%u fires=%u\n") in kernel,
+             # Round422's shape row and its cut branch: boot 200's col= was black plus sparse white on every
+             # beat, which cannot tell a centered blob from a top band from a dot matrix. The grid is the
+             # sample pass's lit density as 16x15 hex cells, so the row must exist in the binary that samples.
+             "r422-panelgrid": (b"clover r422: panelgrid ms=%llu fires=%u g=%s\n") in kernel,
+             "r422-panelgridcut": (b"clover r422: panelgridcut bytes=%d cap=%u fires=%u\n") in kernel,
+             # Round422's fix, after santoni's console take-over: the first real surface copy silences the
+             # text console, because it paints into the same physical framebuffer and was scrolling kernel
+             # rows over every iOS frame. Pinned as a CString so a binary without the gate fails here.
+             "r422-consolemute": (b"clover r422: consolemute first=1\n") in kernel,
              # Round344's per-record rows: the reference prints every record, this port prints one card record
              # per line, so both the row and the branch that says it did not fit are pinned as CStrings.
              "r344-dispclient": (b"clover r344: dispclient idx=%u pid=%d calls=%u fails=%u regall=%u regs=%u "

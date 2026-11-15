@@ -1372,6 +1372,15 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r414: panelcut", "r414-panelcut", 8, 0, 0, 0 },
   { "clover r414: panel", "r414-panel", 96, 0, 0, 0 },
 
+  // Round422's third row of the same beat: the lit-density grid, 240 hex cells of spatial shape beside the
+  // colours the panel row already carries. Same containment, same defence, same arithmetic as r414/r416:
+  // the cut key is longer and listed first, 96 covers sixty beats, 8 is for the branch the probe expects
+  // never to reach. Its own class because a cap that ate the shape must not be able to eat the colours it
+  // explains, and boot 200 is the reason the shape exists -- col= alone could not name what was painted.
+  { "clover r422: consolemute", "r422-consolemute", 8, 0, 0, 0 },
+  { "clover r422: panelgridcut", "r422-panelgridcut", 8, 0, 0, 0 },
+  { "clover r422: panelgrid", "r422-panelgrid", 96, 0, 0, 0 },
+
   // Round335 re-keys the swap-wait row on the call's own argument; r343 names the display words for their
   // producers (arg=/latch=/copy=/fc=/cur=/list=, see the probe) and carries the heads below. Same
   // containment as r329 and the same defence: the cut row's token starts with the state row's token, so the
@@ -5089,6 +5098,10 @@ static void teeConsumeLine (uint32_t &pushed)
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r180-frame") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r416-panelbox") ||
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r414-panel") ||
+       // Round422's grid row rides that same beat: it is the spatial half of the colour reading, and a pass
+       // cap that ate it would leave boot 200's question (what is painted, not just which colours) unanswered
+       // in exactly the boots that run long enough to ask it. The class budgets of 96 and 8 still bound it.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r422-panelgrid") ||
        // Round335's swap-wait rows ride the client's own calls, not a burst: a boot that stalls in this wait
        // prints its last row at the moment it stalls, and that row is the one the whole round is built to
        // read. Dropping it to a pass that had already spent its sixteen pushes would leave the reader with

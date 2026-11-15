@@ -40,16 +40,16 @@
 | 存储（APFS 卷挂载） | 通 |
 | 用户态（launchd 起的守护进程集） | 通 |
 | 点亮屏幕（GOP 路径首帧） | 通 |
-| SpringBoard / 合成器 | 未到桌面。boot 199/200（r420/r421）：ENOSPC=0，客户端到死线仍在提交（tx 824@1190s / 736@1091s 仍增长），`col=` 每拍刷新：黑底+少量白、`oth≤3`——不是桌面壁纸；SpringBoard/backboardd 活着。「1190 s 停手」已撤回（lf* 是仪器缺陷）。题面：屏上画的是什么 → r422 panelgrid |
+| SpringBoard / 合成器 | 未到桌面。boot 199/200（r420/r421）：ENOSPC=0，客户端到死线仍在提交（tx 824@1190s / 736@1091s 仍增长）。boot 200 的 `col=` 是黑底+约 10% 白、`box` 全屏、每拍变化——与内核控制台每 30 s 把三行长日志画进同一块物理帧缓冲吻合；r422 在首次真实拷贝后静音视频控制台（santoni 式），同时加 panelgrid 形状读数 |
 | 桌面 | 未到 |
 
 ## 闸门
 
 | 闸门 | 最近一次 | 结果 |
 | --- | --- | --- |
-| `check-clover.py` | r421 | EXIT=0 |
-| `verify-clover-payload.py` | r421 | EXIT=0 |
-| 负测（r416 五支） | r416 | 5/5 |
+| `check-clover.py` | r422 | 已停用（用户要求；整跑把 Python 驻留推到十几–三十几 GB） |
+| `verify-clover-payload.py` | r422 | EXIT=0（48 OK / 0 FAIL） |
+| 源码针脚定点核对 | r422 | 11/11 命中 |
 
 ## 已知缺口
 
@@ -81,7 +81,6 @@ python3.13 ./unixnu build payload --device ../UniXNU-clover --unique-chip-id 81f
 ## 门禁与测试
 
 ```sh
-python3.13 scripts/check-clover.py                      # 全量门禁
 python3.13 scripts/verify-clover-payload.py <payload>   # payload 逐项校验
 python3.13 scripts/test-clover-gpu.py                   # GPU 决策层 host 测试
 python3.13 scripts/test-clover-input.py                 # 输入决策层 host 测试
