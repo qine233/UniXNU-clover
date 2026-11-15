@@ -31520,6 +31520,12 @@ SiriAUSP/KonaSynthesizer，各 2–3 次）——这是锁屏壁纸管线的正�
 （payload `7aaa3155…`，adt `df95c5e2…`，镜像闸门 EXIT=0）。runner 用 `--wait 900`，每轮从
 ~35 分钟降到 ~8 分钟；需要长窗口时仍可回到 1800 s。
 
+**BCB 坑（boot 201 之后）。** 死线 panic 会在 misc 写 `boot-recovery`。之后若直接
+`fastboot flash cache` + `fastboot reboot`，bootloader 读到的仍是那条命令，于是**回到 TWRP，
+XNU 根本没启动**（这一轮的“无新窗口/全部读卡失败”就是这个）。先 `fastboot flash misc` 一个
+2048 B 全零镜像（只清 `bootloader_message.command` 与前 2 KiB，不动用户数据），再 reboot 才
+会启动 XNU。变体：v0.7.129（无 `-v`，600 s，payload `ae0284fb…`）。
+
 **放行依据（本轮起弃用 check-clover.py）。** 用户要求停止使用 `check-clover.py`：它一跑就把
 Python 驻留内存推到十几到三十几 GB（单独调用 `check_board` 的实测峰值只有 33 MB，说明炸点在
 它串起的整套子进程/检查链路，不在单个算术）。本轮起放行改为：
