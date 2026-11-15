@@ -31414,3 +31414,79 @@ flags=0（可写），sha256 `ef00c083…`，`image_bytes` 27,304,919,040 → 27
 - **Z-B**：`lfp`/`lfb` 随时间变化——若一直是同一组数且 `lfn` 不涨，说明客户端停止提交；
 - **Z-C**：`flog` 大于 1、`fd=0`，且 `ENOSPC` 仍为 0；`client=`/`tx` 不回归；
 - **Z-D**：死线落回 TWRP（EDL 也必须由 runner 复位回 TWRP）。
+
+### boot 200 读数（r421，跑满 1800 s）——屏一直在画，画的不是桌面；lf* 是仪器缺陷不是停手
+
+**产物：** `~/clover-out/round421-boot200-window.bin`（`.bin.txt`/`.timeline.txt`）、
+`unattended-r421-boot200-readback.log`（EXIT=0）。隔夜 runner 的监视进程在 ~02:16 被杀
+（`unattended-r421-boot200.log` 只有 10 行、停在 watching），但板子自己跑满了死线并落回 TWRP；
+宿主没有休眠（UURemote PreventUserIdleSystemSleep 持锁 39 h）。读回用 `--skip-recovery` 只读模式。
+
+**Z-A/Z-B 的名义读数与真相。** 每拍 `panelbox` 都是 `lfk=0 lfp=0 lfb=0x0..0x0 lfn=32`，`lft`
+381→1091 s 增长。按预登记字面这像「客户端停在第 32 帧」，但逐行读源码后确认这是**仪器缺陷**：
+
+- `native_legacy_frame_presented(0)` 在**每一次**真实拷贝/退休之后都被调用
+  （`NativeLegacyDisplay.cpp:537` 的 early-retire 路径与 `:606` 的 `finishTransfer→retireSwap`），
+  它把 `last_box`/`lastFramePixels` 清零、`lastFrameOrdinal=frame_count`。所以 lf* 永远是
+  「最近一次转移的清零标记」，不是「最后一帧的内容」。
+- 内容扫描被 `scanBudget=32`（`NativeLegacyDisplay.cpp:85`）限死在前 32 帧，`lfn=32` 是预算耗尽。
+- `flog=11` = 7 条帧行（n=0..5,16）+ 4 条颜色行（n<4），`fd=0`，与 256 行上限无关。
+
+**撤回（boot 199 节）：** 「客户端在 1190 s 停止提交新帧」是错的。boot 199 `tx=824@1190s`、
+boot 200 `tx=736@1091s` 都是**最后一拍采样时仍在增长**；`panelbox` 的 `lit`/`box` 每拍在变，
+一直到 1783 s。客户端从未停手，r421 的 lf* 仪器也没有能力报告晚期内容。
+
+**Z-C 成立：** `flog=11>1`、`fd=0`、`ENOSPC=0`；`dispstate client=pid58 calls=875→2963 fails=15
+tx=214@381s→736@1091s`（本靴最忙客户端是 backboardd pid58，boot 199 是 pid86，选择器按增长挑）。
+
+**Z-D 成立：** `deadline fired after 1800 s at t=1804262 ms boot=200 elapsed=1800.001s`；
+panic marker `gates=0x7(armed,bcb,text) probe=97/97`，seq1 rc=112、seq2 rc=0，drain-in
+append_rc=112，落回 TWRP。
+
+**屏上画的是什么——col= 每拍都在，之前没读它。** `sampleScreen()`
+（`NativeLegacyDisplay.cpp:168`）每 30 s 全帧采样一次并刷新八色槽，所以 r414 `panel` 行的
+`col=` 本来就是**晚期内容读数**，不需要等新仪器。boot 200 全部 26 拍（fires=39..64，
+1071→1783 s）的颜色构成稳定为：
+
+| 颜色 | 含义 | 占比范围 |
+| --- | --- | --- |
+| `ff000000` | 不透明黑 | 45–85% |
+| `00000000` | 全透明黑 | 8–42% |
+| `00ffffff` | 白（alpha=0） | 5–12% |
+| `ffffffff` | 不透明白 | ~1% |
+| `oth` | 八色之外 | 0–3 |
+
+`scr=` 哈希每拍不同（内容在动），`box≈0x2..1198x1915` 几乎全屏，`lit=332–447/4100`。
+**结论：黑底 + 少量白色内容、铺满全屏、逐拍变化——这不是桌面**（桌面壁纸必有大量彩色，
+`oth` 不会 ≤3）。候选：开机动画、锁屏/设置助理一类单色 UI、或合成器只产出了黑白。
+
+**生命周期佐证。** SpringBoard（pid27）在 t=1194/1570 s 仍在发 mach 消息
+（`sbm2 op=200000003 b=1513 sz=28`），backboardd（pid58）每 ~120 s 一条；`killsig` 只回收了
+壁纸 Poster 扩展（HelloPosterExten/GradientPosterEx/PhotosPosterProv/CollectionsPoste/
+SiriAUSP/KonaSynthesizer，各 2–3 次）——这是锁屏壁纸管线的正常行为，没有 SpringBoard 被杀。
+
+**题面更新：** 从「客户端为什么停手」（已撤回）变成「**屏上画的到底是什么**」。col= 只有颜色
+统计没有空间布局，分不开「居中的 logo」「横条文字」「图标网格」。r422 加粗粒度亮度网格。
+
+## Round422 —— 屏内容的空间形状：panelgrid 缩略图 + lf* 语义修正
+
+**设计（只加读数）。**
+
+1. **panelgrid（主仪器）：** `sampleScreen()` 已在走全帧，顺手把 lit 样本累进 16 列 × 15 行
+   的粗格；每格量化成一个 hex 字符（0–f = 该格 lit 占比）。驱动存
+   `native_legacy_screen_grid[241]`，探针每拍打一条 `clover r422: panelgrid ms= fires= g=<240 字符>`
+   （独立行，300 天花板内）。居中亮块 = 开机动画；顶部横带 = 锁屏时钟；规则点阵 = 图标网格；
+   横条纹 = 文字屏。sheng 没有这件仪器（它的 LegacyDisplayProbe 无 grid/luma/thumbnail），
+   这是本板新增的只读读数，不改任何行为。
+2. **lf* 语义修正：** `frame_presented` 不再清零观测字段，改为只增 `presentedCount`；
+   `panelbox` 尾加 `pc=`（呈现次数），lf* 保留最后一次**内容扫描**的 kind/pixels/box/t。
+3. **晚期扫描：** `scanBudget` 耗尽后改为每 64 帧扫一次（`frameScanGate` 计数），让 lf* 在
+   死线前仍更新；颜色行仍只记前 8 帧不变。
+
+**boot 201 判据（刷写前写定）：**
+
+- **AA-A**：`panelgrid` 行每拍出现，`g=` 恰 240 个 hex 字符、无 `panelgridcut`；
+- **AA-B**：按网格形状判内容——居中亮块（动画）/ 顶部横带（锁屏）/ 规则点阵（桌面图标）/
+  横条纹（文字）/ 全 0（黑屏），并对照相邻拍是否变化；
+- **AA-C**：`lfn` 在 32 之后仍增长（晚期扫描生效），`lfp/lfb` 不再恒零，`pc` 随拍增长；
+- **AA-D**：`ENOSPC=0`、`client=`/`tx` 不回归、死线落回 TWRP。

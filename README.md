@@ -40,15 +40,15 @@
 | 存储（APFS 卷挂载） | 通 |
 | 用户态（launchd 起的守护进程集） | 通 |
 | 点亮屏幕（GOP 路径首帧） | 通 |
-| SpringBoard / 合成器 | 未到桌面。boot 188（r415，GPU 探针关）：显示通道第一帧 ~837 s、到死线仍在拷贝（428 次、0 拒绝），面板以不透明黑/全透明黑为主（`col=`）；boot 186/187 曾在 GPU 探针之后极早停 |
+| SpringBoard / 合成器 | 未到桌面。boot 199/200（r420/r421）：ENOSPC=0，客户端到死线仍在提交（tx 824@1190s / 736@1091s 仍增长），`col=` 每拍刷新：黑底+少量白、`oth≤3`——不是桌面壁纸；SpringBoard/backboardd 活着。「1190 s 停手」已撤回（lf* 是仪器缺陷）。题面：屏上画的是什么 → r422 panelgrid |
 | 桌面 | 未到 |
 
 ## 闸门
 
 | 闸门 | 最近一次 | 结果 |
 | --- | --- | --- |
-| `check-clover.py` | r416 | EXIT=0 |
-| `verify-clover-payload.py` | r416 | EXIT=0，51 OK / 0 FAIL |
+| `check-clover.py` | r421 | EXIT=0 |
+| `verify-clover-payload.py` | r421 | EXIT=0 |
 | 负测（r416 五支） | r416 | 5/5 |
 
 ## 已知缺口
