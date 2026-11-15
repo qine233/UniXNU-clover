@@ -1181,7 +1181,6 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # originals by the sha256 of their unwrapped IM4P payloads.
 trust_cache_sha256 = ["7c369ce09adb8caf2549454b0cdf1abf43b0fe96a850b694288ee59a9c893950"]
 kernel_args = [
-  "-v",
   "serial=3",
   "debug=0x14e",
   "kt_fixed_zones=120",
