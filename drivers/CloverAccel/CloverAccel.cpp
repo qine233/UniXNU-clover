@@ -42,6 +42,13 @@ static volatile uint32_t gAccelReads;
 static uint32_t gAccelSelectors[3];
 static char gAccelReader[17];
 static char gAccelClient[17];
+// Round437: the first opener name alone could not tell the render server from the media server. Every
+// open is counted under its process name; the table is tiny because the interesting boot has < 4.
+struct CloverAccelOpenRow { char name[17]; uint32_t opens; };
+static CloverAccelOpenRow gAccelOpenBy[6];
+static uint32_t gAccelOpenNames;
+static uint32_t gAccelOpenOther;
+static uint32_t gAccelSelCalls[16];
 
 class AGXDeviceUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(AGXDeviceUserClient)
@@ -65,6 +72,24 @@ bool AGXDeviceUserClient::initWithTask(task_t owningTask, void *securityID, UInt
 	if (__atomic_add_fetch(&gAccelOpens, 1, __ATOMIC_RELAXED) == 1) {
 		strlcpy(gAccelClient, name, sizeof(gAccelClient));
 	}
+	{
+		uint32_t slot = gAccelOpenNames;
+		for (uint32_t i = 0; i < gAccelOpenNames; i++) {
+			if (!strcmp(gAccelOpenBy[i].name, name)) {
+				slot = i;
+				break;
+			}
+		}
+		if (slot < gAccelOpenNames) {
+			__atomic_add_fetch(&gAccelOpenBy[slot].opens, 1, __ATOMIC_RELAXED);
+		} else if (slot < (uint32_t)(sizeof gAccelOpenBy / sizeof gAccelOpenBy[0])) {
+			strlcpy(gAccelOpenBy[slot].name, name, sizeof gAccelOpenBy[slot].name);
+			__atomic_store_n(&gAccelOpenBy[slot].opens, 1, __ATOMIC_RELAXED);
+			__atomic_store_n(&gAccelOpenNames, slot + 1, __ATOMIC_RELEASE);
+		} else {
+			__atomic_add_fetch(&gAccelOpenOther, 1, __ATOMIC_RELAXED);
+		}
+	}
 	IOLog("CloverAccel r434: user client opened by %s type %u\n", name, type);
 	return true;
 }
@@ -87,6 +112,9 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
 	uint32_t calls = __atomic_add_fetch(&gAccelCalls, 1, __ATOMIC_RELAXED);
 	if (calls <= 3) {
 		gAccelSelectors[calls - 1] = selector;
+	}
+	if (selector < (sizeof gAccelSelCalls / sizeof gAccelSelCalls[0])) {
+		__atomic_add_fetch(&gAccelSelCalls[selector], 1, __ATOMIC_RELAXED);
 	}
 	if (calls <= 32) {
 		char name[17] = "?";
@@ -238,20 +266,58 @@ extern "C" void clover_accel_state(uint32_t *published, uint32_t *fail, uint32_t
 
 extern "C" unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
 
+extern "C" void clover_accel_clients(char *out, uint32_t length)
+{
+	if (!out || !length) {
+		return;
+	}
+	size_t used = 0;
+	out[0] = 0;
+	uint32_t names = __atomic_load_n(&gAccelOpenNames, __ATOMIC_ACQUIRE);
+	for (uint32_t i = 0; i < names && used + 24 < length; i++) {
+		uint32_t count = __atomic_load_n(&gAccelOpenBy[i].opens, __ATOMIC_RELAXED);
+		int n = snprintf(out + used, length - used, "%s%s:%u", used ? "," : "",
+		    gAccelOpenBy[i].name, (unsigned)count);
+		if (n <= 0) {
+			break;
+		}
+		used += (size_t)n;
+	}
+	uint32_t other = __atomic_load_n(&gAccelOpenOther, __ATOMIC_RELAXED);
+	if (other && used + 20 < length) {
+		int n = snprintf(out + used, length - used, "%sother:%u", used ? "," : "", (unsigned)other);
+		if (n > 0) {
+			used += (size_t)n;
+		}
+	}
+	if (!used) {
+		strlcpy(out, "-", length);
+	}
+}
+
+extern "C" uint32_t clover_accel_selector_calls(uint32_t selector)
+{
+	return selector < (sizeof gAccelSelCalls / sizeof gAccelSelCalls[0])
+	    ? __atomic_load_n(&gAccelSelCalls[selector], __ATOMIC_RELAXED) : 0;
+}
+
 extern "C" void clover_accel_report(void)
 {
 	uint32_t pub = 0, fail = 0, reads = 0, opens = 0, calls = 0, sel[3] = { 0, 0, 0 };
 	uint32_t entries = 0, inited = 0, disabled = 0;
-	char reader[17] = "-", client[17] = "-";
-	char line[192];
+	char reader[17] = "-", client[17] = "-", by[96] = "-";
+	char line[256];
 
 	clover_accel_state(&pub, &fail, &reads, &opens, &calls, reader, sizeof(reader),
 	    client, sizeof(client), sel, &entries, &inited, &disabled);
+	clover_accel_clients(by, sizeof(by));
 	int n = snprintf(line, sizeof(line),
-	    "clover r434: accel pub=%u fail=%u ent=%u init=%u dis=%u reads=%u rdr=%s opens=%u cli=%s calls=%u sel=%u,%u,%u\n",
+	    "clover r434: accel pub=%u fail=%u ent=%u init=%u dis=%u reads=%u rdr=%s opens=%u cli=%s calls=%u sel=%u,%u,%u by=%s selc=%u,%u,%u\n",
 	    (unsigned)pub, (unsigned)fail, (unsigned)entries, (unsigned)inited, (unsigned)disabled,
 	    (unsigned)reads, reader, (unsigned)opens, client, (unsigned)calls,
-	    (unsigned)sel[0], (unsigned)sel[1], (unsigned)sel[2]);
+	    (unsigned)sel[0], (unsigned)sel[1], (unsigned)sel[2], by,
+	    (unsigned)clover_accel_selector_calls(0), (unsigned)clover_accel_selector_calls(1),
+	    (unsigned)clover_accel_selector_calls(2));
 	if (n > 0) {
 		if ((unsigned)n >= sizeof(line)) {
 			n = (int)sizeof(line) - 1;

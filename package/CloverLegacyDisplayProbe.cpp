@@ -46,6 +46,9 @@ extern "C" void clover_accel_state(uint32_t *published, uint32_t *fail, uint32_t
     uint32_t *opens, uint32_t *calls, char *reader, uint32_t readerLength, char *client,
     uint32_t clientLength, uint32_t *selectors, uint32_t *entries, uint32_t *inited,
     uint32_t *disabled);
+// Round437: who opened, and how often each of the first selectors was asked.
+extern "C" void clover_accel_clients(char *out, uint32_t length);
+extern "C" uint32_t clover_accel_selector_calls(uint32_t selector);
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
 #include <machine/machine_routines.h>
@@ -1103,13 +1106,16 @@ static void reportDisplayState(void) {
     // and "the accelerator was never published" would read identically.
     {
         uint32_t aPub=0,aFail=0,aReads=0,aOpens=0,aCalls=0,aSel[3]={0,0,0},aEnt=0,aInit=0,aDis=0;
-        char aReader[17]="-",aClient[17]="-";
+        char aReader[17]="-",aClient[17]="-",aBy[96]="-";
         clover_accel_state(&aPub,&aFail,&aReads,&aOpens,&aCalls,aReader,sizeof aReader,
                            aClient,sizeof aClient,aSel,&aEnt,&aInit,&aDis);
+        clover_accel_clients(aBy,sizeof aBy);
         clover_accel_report();
-        IOLog("clover r434: accel pub=%u fail=%u reads=%u rdr=%s opens=%u cli=%s calls=%u sel=%u,%u,%u ent=%u init=%u dis=%u\n",
+        IOLog("clover r434: accel pub=%u fail=%u reads=%u rdr=%s opens=%u cli=%s calls=%u sel=%u,%u,%u by=%s selc=%u,%u,%u ent=%u init=%u dis=%u\n",
               (unsigned)aPub,(unsigned)aFail,(unsigned)aReads,aReader,(unsigned)aOpens,aClient,
-              (unsigned)aCalls,(unsigned)aSel[0],(unsigned)aSel[1],(unsigned)aSel[2],
+              (unsigned)aCalls,(unsigned)aSel[0],(unsigned)aSel[1],(unsigned)aSel[2],aBy,
+              (unsigned)clover_accel_selector_calls(0),(unsigned)clover_accel_selector_calls(1),
+              (unsigned)clover_accel_selector_calls(2),
               (unsigned)aEnt,(unsigned)aInit,(unsigned)aDis);
     }
     reportPanelState(now);
