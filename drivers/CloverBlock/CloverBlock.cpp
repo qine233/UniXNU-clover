@@ -191,6 +191,11 @@ uint32_t clover_emmc_block_write (uint32_t lba, const uint32_t *words, uint32_t 
 // took on this card.
 uint32_t clover_emmc_flush_cache (void);
 void clover_emmc_cache_stats (uint32_t *size, uint32_t *on, uint32_t *flushes);
+// Provided by drivers/CloverAccel. Round434 publishes the IOAcceleratorES shell Metal's discovery
+// looks for once the storage tree this run proves is standing; the class registration happens
+// inside that call (scripts/build-clover-accel.py strips its __mod_init_func entry).
+void clover_accel_run (void);
+void clover_accel_report (void);
 // The kernel's own block-device vnode constructor (bsd/vfs/vfs_subr.c). dev_t is the composite
 // major<<24|minor this file passes; the vnode is never touched, and it stays for boot lifetime
 // exactly as it would when it becomes the root vnode.
@@ -2373,6 +2378,12 @@ extern "C" void clover_block_run(void)
     prepareApfsBoot(whole);
     IOLog("CloverBlock r159: boot os=%u+%u system=%u+%u data=%u+%u fires=%u deferred=1\n",
           osFirst, osSectors, systemFirst, systemSectors, dataFirst, dataSectors, fires);
+    // Round434 boot call site. The tail of this function belongs to the steps 5-9 path, which this
+    // branch returns before; publishing the accelerator shell after the root media exists and before
+    // the kernel returns to mountroot is the only place the boot path reaches. The latch in
+    // clover_accel_run() keeps the tail call harmless for the other modes.
+    clover_accel_run();
+    clover_accel_report();
     return;
   }
   whole = publishWindow(osFirst, osSectors, false, &device);
@@ -2514,6 +2525,12 @@ extern "C" void clover_block_run(void)
   IOLog("CloverBlock r137: auto p=%u %s>%s %u:%u bd=1 map=1 fires=%u\n", partitions, foundName,
         kRootAlias, bsdMajor->unsigned32BitValue(),
         bsdMinor->unsigned32BitValue(), fires);
+
+  // Round434. The accelerator shell belongs to this same late hand-off: the storage tree above is
+  // where every userspace service loads from, and Metal's discovery only runs after launchd starts.
+  // Publishing here, once, puts IOAcceleratorES in the registry before backboardd ever matches it.
+  clover_accel_run();
+  clover_accel_report();
 }
 
 // ---------------------------------------------------------------- the post-vfsinit hand-off

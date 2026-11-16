@@ -1,0 +1,269 @@
+// clover r434: the accelerator shell Metal's discovery looks for.
+//
+// Metal finds a device by IOServiceMatching("IOAcceleratorES") and then reads
+// MetalPluginName from that service to load /System/Library/Extensions/<name>.bundle.
+// This board has no Apple GPU, so the service is ours: it answers the discovery,
+// names the metal2vulkan plugin, and hands every user-client call to a stub whose
+// class is deliberately named AGXDeviceUserClient (the name the stock sandbox
+// profiles allow the render server to open).
+//
+// IOGPUFamily is removed from the prelink roots for this round: it owns the
+// IOAcceleratorES name and its base has no operational overrides, so the class
+// below is the same IOService-shaped object Metal expects (mondrian measured
+// that shape with its empty accelerator). The board probe publishes it once.
+#include <IOKit/IOService.h>
+#include <IOKit/IOUserClient.h>
+#include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IOKitKeys.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSBoolean.h>
+#include <pexpert/pexpert.h>
+#include <string.h>
+#include <libkern/libkern.h>
+
+extern "C" void proc_selfname(char *, int);
+// scripts/build-clover-accel.py strips __DATA,__mod_init_func and globalizes this symbol: the
+// class registration runs here, once, instead of at libkern init.
+extern "C" void clover_accel_static_init(void) __asm__("__GLOBAL__sub_I_CloverAccel.cpp");
+
+static volatile uint32_t gAccelEntries;
+static volatile uint32_t gAccelInited;
+static volatile uint32_t gAccelDisabled;
+static volatile uint32_t gAccelPublished;
+static volatile uint32_t gAccelFail;
+static volatile uint32_t gAccelCalls;
+static volatile uint32_t gAccelOpens;
+static volatile uint32_t gAccelReads;
+static uint32_t gAccelSelectors[3];
+static char gAccelReader[17];
+static char gAccelClient[17];
+
+class AGXDeviceUserClient : public IOUserClient {
+	OSDeclareDefaultStructors(AGXDeviceUserClient)
+public:
+	bool initWithTask(task_t owningTask, void *securityID, UInt32 type,
+	    OSDictionary *properties) APPLE_KEXT_OVERRIDE;
+	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
+};
+OSDefineMetaClassAndStructors(AGXDeviceUserClient, IOUserClient)
+
+bool AGXDeviceUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type,
+    OSDictionary *properties)
+{
+	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
+		return false;
+	}
+	char name[17] = "?";
+	proc_selfname(name, sizeof(name));
+	if (__atomic_add_fetch(&gAccelOpens, 1, __ATOMIC_RELAXED) == 1) {
+		strlcpy(gAccelClient, name, sizeof(gAccelClient));
+	}
+	IOLog("CloverAccel r434: user client opened by %s type %u\n", name, type);
+	return true;
+}
+
+IOReturn AGXDeviceUserClient::clientClose(void)
+{
+	terminate();
+	return kIOReturnSuccess;
+}
+
+IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+    IOExternalMethodDispatch *dispatch __unused, OSObject *target __unused, void *reference __unused)
+{
+	for (uint32_t i = 0; i < args->scalarOutputCount && i < 16; i++) {
+		args->scalarOutput[i] = 0;
+	}
+	if (args->structureOutput != NULL && args->structureOutputSize > 0) {
+		bzero(args->structureOutput, args->structureOutputSize);
+	}
+	uint32_t calls = __atomic_add_fetch(&gAccelCalls, 1, __ATOMIC_RELAXED);
+	if (calls <= 3) {
+		gAccelSelectors[calls - 1] = selector;
+	}
+	if (calls <= 32) {
+		char name[17] = "?";
+		proc_selfname(name, sizeof(name));
+		IOLog("CloverAccel r434: %s selector %u answered (%u in, %u out)\n",
+		    name, selector, args->scalarInputCount, args->scalarOutputCount);
+	}
+	return kIOReturnSuccess;
+}
+
+class IOAcceleratorES : public IOService {
+	OSDeclareDefaultStructors(IOAcceleratorES)
+public:
+	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
+	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+	OSObject *copyProperty(const OSSymbol *key) const APPLE_KEXT_OVERRIDE;
+	OSObject *copyProperty(const OSString *key) const APPLE_KEXT_OVERRIDE;
+	OSObject *copyProperty(const char *key) const APPLE_KEXT_OVERRIDE;
+};
+OSDefineMetaClassAndStructors(IOAcceleratorES, IOService)
+
+bool IOAcceleratorES::start(IOService *provider)
+{
+	if (!IOService::start(provider)) {
+		return false;
+	}
+	setProperty(kIOUserClientClassKey, "AGXDeviceUserClient");
+	setProperty("MetalPluginName", "NativeAdrenoMetal");
+	setProperty("IOAcceleratorStub", kOSBooleanTrue);
+	registerService();
+	IOLog("CloverAccel r434: IOAcceleratorES published, MetalPluginName NativeAdrenoMetal\n");
+	return true;
+}
+
+IOReturn IOAcceleratorES::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+    OSDictionary *properties, IOUserClient **handler)
+{
+	AGXDeviceUserClient *client = OSTypeAlloc(AGXDeviceUserClient);
+	if (!client) {
+		return kIOReturnNoMemory;
+	}
+	if (!client->initWithTask(owningTask, securityID, type, properties)) {
+		client->release();
+		return kIOReturnError;
+	}
+	if (!client->attach(this)) {
+		client->release();
+		return kIOReturnError;
+	}
+	if (!client->start(this)) {
+		client->detach(this);
+		client->release();
+		return kIOReturnError;
+	}
+	*handler = client;
+	return kIOReturnSuccess;
+}
+
+static void note_read(const char *key)
+{
+	if (key && !strcmp(key, "MetalPluginName")) {
+		uint32_t reads = __atomic_add_fetch(&gAccelReads, 1, __ATOMIC_RELAXED);
+		char name[17] = "?";
+		proc_selfname(name, sizeof(name));
+		if (reads == 1) {
+			strlcpy(gAccelReader, name, sizeof(gAccelReader));
+		}
+		if (reads <= 16) {
+			IOLog("CloverAccel r434: MetalPluginName read by %s (%u)\n", name, reads);
+		}
+	}
+}
+
+OSObject *IOAcceleratorES::copyProperty(const OSSymbol *key) const
+{
+	note_read(key ? key->getCStringNoCopy() : nullptr);
+	return IORegistryEntry::copyProperty(key);
+}
+OSObject *IOAcceleratorES::copyProperty(const OSString *key) const
+{
+	note_read(key ? key->getCStringNoCopy() : nullptr);
+	return IORegistryEntry::copyProperty(key);
+}
+OSObject *IOAcceleratorES::copyProperty(const char *key) const
+{
+	note_read(key);
+	return IORegistryEntry::copyProperty(key);
+}
+
+extern "C" void clover_accel_run(void)
+{
+	// Round434b: a plain latch made "never called", "disabled" and "published" read the same
+	// through the beat, which is the one thing the shell exists to tell apart. Each stage keeps
+	// its own counter instead; the beat prints all four.
+	__atomic_add_fetch(&gAccelEntries, 1, __ATOMIC_RELAXED);
+	uint32_t enabled = 1;
+	PE_parse_boot_argn("clover-accel", &enabled, sizeof(enabled));
+	if (!enabled) {
+		__atomic_add_fetch(&gAccelDisabled, 1, __ATOMIC_RELAXED);
+		IOLog("CloverAccel r434: disabled by clover-accel=0\n");
+		return;
+	}
+	if (__atomic_exchange_n(&gAccelInited, 1, __ATOMIC_ACQ_REL) == 0) {
+		clover_accel_static_init();
+	}
+	if (__atomic_load_n(&gAccelPublished, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&gAccelFail, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	IOPlatformExpert *platform = IOService::getPlatform();
+	IOAcceleratorES *accel = OSTypeAlloc(IOAcceleratorES);
+	if (!platform || !accel || !accel->init(nullptr) ||
+	    !accel->attach(platform) || !accel->start(platform)) {
+		__atomic_add_fetch(&gAccelFail, 1, __ATOMIC_RELAXED);
+		IOLog("CloverAccel r434: publish failed (platform %d accel %d)\n",
+		    platform != nullptr, accel != nullptr);
+		if (accel) {
+			accel->release();
+		}
+		return;
+	}
+	__atomic_store_n(&gAccelPublished, 1, __ATOMIC_RELEASE);
+}
+
+// Read by the display state beat (package/CloverLegacyDisplayProbe.cpp) so the shell's own
+// counters survive the 512-line kernel ring: the publish happens tens of seconds before the
+// first user process, and its IOLog lines are gone long before anyone reads the card.
+// Round434e: the display beat's copy of this row never reached the card (the kernel ring is a
+// class-budget ring and the old slots survived), so the publish point writes its own line into the
+// driver's probe ring instead. That ring is drained by the driver every beat, and a 17-second line
+// is exactly what it is for. This is the reading that separates "never called" from "disabled"
+// from "published".
+extern "C" void clover_accel_state(uint32_t *published, uint32_t *fail, uint32_t *reads,
+    uint32_t *opens, uint32_t *calls, char *reader, uint32_t readerLength, char *client,
+    uint32_t clientLength, uint32_t *selectors, uint32_t *entries, uint32_t *inited,
+    uint32_t *disabled);
+
+extern "C" unsigned int clover_emmc_probe_say(const char *text, unsigned int length);
+
+extern "C" void clover_accel_report(void)
+{
+	uint32_t pub = 0, fail = 0, reads = 0, opens = 0, calls = 0, sel[3] = { 0, 0, 0 };
+	uint32_t entries = 0, inited = 0, disabled = 0;
+	char reader[17] = "-", client[17] = "-";
+	char line[192];
+
+	clover_accel_state(&pub, &fail, &reads, &opens, &calls, reader, sizeof(reader),
+	    client, sizeof(client), sel, &entries, &inited, &disabled);
+	int n = snprintf(line, sizeof(line),
+	    "clover r434: accel pub=%u fail=%u ent=%u init=%u dis=%u reads=%u rdr=%s opens=%u cli=%s calls=%u sel=%u,%u,%u\n",
+	    (unsigned)pub, (unsigned)fail, (unsigned)entries, (unsigned)inited, (unsigned)disabled,
+	    (unsigned)reads, reader, (unsigned)opens, client, (unsigned)calls,
+	    (unsigned)sel[0], (unsigned)sel[1], (unsigned)sel[2]);
+	if (n > 0) {
+		if ((unsigned)n >= sizeof(line)) {
+			n = (int)sizeof(line) - 1;
+		}
+		clover_emmc_probe_say(line, (unsigned)n);
+	}
+}
+
+extern "C" void clover_accel_state(uint32_t *published, uint32_t *fail, uint32_t *reads,
+    uint32_t *opens, uint32_t *calls, char *reader, uint32_t readerLength, char *client,
+    uint32_t clientLength, uint32_t *selectors, uint32_t *entries, uint32_t *inited,
+    uint32_t *disabled)
+{
+	*published = __atomic_load_n(&gAccelPublished, __ATOMIC_ACQUIRE);
+	*fail = __atomic_load_n(&gAccelFail, __ATOMIC_ACQUIRE);
+	*reads = __atomic_load_n(&gAccelReads, __ATOMIC_ACQUIRE);
+	*opens = __atomic_load_n(&gAccelOpens, __ATOMIC_ACQUIRE);
+	*calls = __atomic_load_n(&gAccelCalls, __ATOMIC_ACQUIRE);
+	if (reader && readerLength) {
+		strlcpy(reader, gAccelReader[0] ? gAccelReader : "-", readerLength);
+	}
+	if (client && clientLength) {
+		strlcpy(client, gAccelClient[0] ? gAccelClient : "-", clientLength);
+	}
+	for (uint32_t i = 0; i < 3; i++) {
+		selectors[i] = gAccelSelectors[i];
+	}
+	*entries = __atomic_load_n(&gAccelEntries, __ATOMIC_ACQUIRE);
+	*inited = __atomic_load_n(&gAccelInited, __ATOMIC_ACQUIRE);
+	*disabled = __atomic_load_n(&gAccelDisabled, __ATOMIC_ACQUIRE);
+}

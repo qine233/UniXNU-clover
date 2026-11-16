@@ -55,6 +55,12 @@ EMMC_IMPORTS = {
     '_clover_emmc_flush_cache',
     '_clover_emmc_cache_stats',
 }
+# Round434: resolved when the kernel links libCloverAccel.a next to this archive. CloverBlock's
+# run is the only place the accelerator shell is published, so the import is part of the contract.
+ACCEL_IMPORTS = {
+    '_clover_accel_run',
+    '_clover_accel_report',
+}
 # Everything IOBlockStorageDevice owns on iOS: the four macOS-only deprecated virtuals are
 # compiled out by TARGET_OS_OSX, and APPLE_KEXT_VTABLE_PADDING is 0, so the slot list is exactly
 # these plus getMetaClass and the destructor.
@@ -158,10 +164,11 @@ for index in range(count):
 defined = {name for name, _, kind in symbols if kind & 0x0e == 0x0e}
 undefined = {name for name, _, kind in symbols if kind & 0x0e == 0x00 and kind & 0x01}
 
-unexpected = sorted(undefined - set(BASE_ALIASES) - EMMC_IMPORTS - set(native_names))
+unexpected = sorted(undefined - set(BASE_ALIASES) - EMMC_IMPORTS - ACCEL_IMPORTS - set(native_names))
 require(not unexpected, f'Unresolved imports outside the audited bindings: {unexpected}')
 require(set(BASE_ALIASES) <= undefined, 'Compiler no longer emits the aliased base lifecycle calls')
 require(EMMC_IMPORTS <= undefined, f'CloverSdhci imports changed: {sorted(undefined & EMMC_IMPORTS)}')
+require(ACCEL_IMPORTS <= undefined, f'CloverAccel import changed: {sorted(undefined & ACCEL_IMPORTS)}')
 for alias, target in BASE_ALIASES.items():
     require(target in native_names, f'Alias target {target} is not exported by the reference kernel')
 
@@ -224,6 +231,7 @@ report = {'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
           'reference_sha256': hashlib.sha256(reference).hexdigest(),
           'base_aliases': BASE_ALIASES,
           'emmc_imports': sorted(EMMC_IMPORTS),
+          'accel_imports': sorted(ACCEL_IMPORTS),
           'virtual_entries': len(entries),
           'required_overrides': list(REQUIRED),
           'runtime_qualified': False}

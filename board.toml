@@ -98,6 +98,7 @@ archives = [
   "build-arm-driver.py CloverPower",
   "build-arm-driver.py CloverDsp",
   "build-arm-driver.py CloverGpu",
+  "build-clover-accel.py",
 ]
 
 [kernel.prelink]
@@ -123,7 +124,9 @@ roots = [
   "com.apple.iokit.IOAudio2Family",
   "com.apple.iokit.IOCECFamily",
   "com.apple.iokit.IOCryptoAcceleratorFamily",
-  "com.apple.iokit.IOGPUFamily",
+  # Round434 takes IOGPUFamily out: it owns the IOAcceleratorES class name, and this round's
+  # drivers/CloverAccel defines that same IOService-shaped class for Metal's discovery to find.
+  # Nothing else in the set depends on it; gpu-bringup.md §6 records the measurement.
   "com.apple.iokit.IOHDCPFamily",
   "com.apple.iokit.IOMobileGraphicsFamily",
   "com.apple.iokit.IOReportFamily",
@@ -346,7 +349,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r433: software Vulkan reaches the board: Mesa lavapipe (27.0.0-devel, LLVM 23.1.4 statically linked) is cross-built for arm64-apple-ios17.0 and signed with 4 KiB pages (cdhash d611c65b); metal2vulkan's own host selftest is cross-built as the offline air-init program (cdhash ae89adb0), opens that dylib and runs compute/render/import, writing /private/var/tmp/v3.log. Both cdhashes join the owner trust module."
+title = "clover r434: the accelerator shell Metal's discovery looks for is published by the kernel: drivers/CloverAccel defines IOAcceleratorES over IOService, names MetalPluginName=NativeAdrenoMetal and hands user-client opens to a stub called AGXDeviceUserClient. IOGPUFamily leaves the prelink roots so the name is ours; the payload boots the real userland again (no offline-air-init)."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -2455,7 +2458,10 @@ kernel_args = [
   # last frame and then went to sleep. Three presses starting at this uptime say which it is: a
   # sleeping device wakes and presents its lock screen; a stalled renderer does not.
   "offline-hid-poke-uptime=300",
-  "offline-air-init=1",
+  # Round434: offline-air-init=1 is deliberately absent. The accelerator shell exists for
+  # backboardd's discovery walk, and the air-init payload exits pid 1 before launchd ever runs.
+  # The r433 gate program is still built (scripts/make-clover-jit-probe.py) for the next time a
+  # userspace-only reading is wanted; this round boots the real userland.
   # sheng-touch-hid=1 is not a touch experiment here, it is the device SHAPE: it is what the vendored
   # driver reads (drivers/NativeHidInput/NativeHidInput.cpp:291) to append the digitizer collection to
   # the report descriptor and to set Built-In/DisplayIntegrated/DigitizerCollectionDispatch on the

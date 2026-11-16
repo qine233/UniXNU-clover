@@ -38,6 +38,14 @@
 #include <kern/clock.h>
 #include <kern/task.h>
 #include <sys/proc.h>
+
+// Round434, providers/CloverAccel: the accelerator shell's counters, read on the display's own
+// state beat so they survive the kernel ring. See drivers/CloverAccel/CloverAccel.cpp.
+extern "C" void clover_accel_report(void);
+extern "C" void clover_accel_state(uint32_t *published, uint32_t *fail, uint32_t *reads,
+    uint32_t *opens, uint32_t *calls, char *reader, uint32_t readerLength, char *client,
+    uint32_t clientLength, uint32_t *selectors, uint32_t *entries, uint32_t *inited,
+    uint32_t *disabled);
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
 #include <machine/machine_routines.h>
@@ -1086,6 +1094,23 @@ static void reportDisplayState(void) {
         IOLog("%s",cut);
     } else {
         IOLog("%s",row);
+    }
+    // Round434: the accelerator shell publishes tens of seconds before the first user process, so its
+    // own IOLog lines are long gone from the 512-line kernel ring by the time the card is read. The
+    // same beat that already survives r344/r414/r416/r422 carries the shell's counters: whether the
+    // service started, whether anything read MetalPluginName (and who), whether a user client opened,
+    // and the first selectors it was asked. Without these four, "Metal did not find the accelerator"
+    // and "the accelerator was never published" would read identically.
+    {
+        uint32_t aPub=0,aFail=0,aReads=0,aOpens=0,aCalls=0,aSel[3]={0,0,0},aEnt=0,aInit=0,aDis=0;
+        char aReader[17]="-",aClient[17]="-";
+        clover_accel_state(&aPub,&aFail,&aReads,&aOpens,&aCalls,aReader,sizeof aReader,
+                           aClient,sizeof aClient,aSel,&aEnt,&aInit,&aDis);
+        clover_accel_report();
+        IOLog("clover r434: accel pub=%u fail=%u reads=%u rdr=%s opens=%u cli=%s calls=%u sel=%u,%u,%u ent=%u init=%u dis=%u\n",
+              (unsigned)aPub,(unsigned)aFail,(unsigned)aReads,aReader,(unsigned)aOpens,aClient,
+              (unsigned)aCalls,(unsigned)aSel[0],(unsigned)aSel[1],(unsigned)aSel[2],
+              (unsigned)aEnt,(unsigned)aInit,(unsigned)aDis);
     }
     reportPanelState(now);
     // The per-record rows and the bookkeeping do not live under the state row's width. A boot whose state

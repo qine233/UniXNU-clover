@@ -802,6 +802,7 @@ static const uint32_t kTeeLineBytes = kVerdictTextBytes;   // a longer line is t
 static const char *const kTeeAllowlist[] = {
   "clover r",             // this port's own probes (r151/r153/r155/r170), whatever they print
   "CloverBlock",          // the volume/owner driver
+  "CloverAccel",          // the accelerator shell's own publish/client lines (round434)
   "apfs", "APFS",         // container scan, jhash, ntree reads
   "decmpfs",              // compressed-data read failures
   "load code signature",  // the error 4 that has been killing every process since r162
@@ -1380,6 +1381,12 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r422: consolemute", "r422-consolemute", 8, 0, 0, 0 },
   { "clover r422: panelgridcut", "r422-panelgridcut", 8, 0, 0, 0 },
   { "clover r422: panelgrid", "r422-panelgrid", 96, 0, 0, 0 },
+
+  // Round434's accelerator row rides the same beat: publish/read/open/call counters from the shell
+  // Metal's discovery looks for. The publish happens before the first user process, so the shell's
+  // own IOLog lines are long gone from a 512-line ring by readback; this row is the durable copy.
+  // 96 covers sixty beats, and it is exempt for the same reason the display rows are.
+  { "clover r434: accel", "r434-accel", 96, 0, 0, 0 },
 
   // Round335 re-keys the swap-wait row on the call's own argument; r343 names the display words for their
   // producers (arg=/latch=/copy=/fc=/cur=/list=, see the probe) and carries the heads below. Same
@@ -5102,6 +5109,10 @@ static void teeConsumeLine (uint32_t &pushed)
        // cap that ate it would leave boot 200's question (what is painted, not just which colours) unanswered
        // in exactly the boots that run long enough to ask it. The class budgets of 96 and 8 still bound it.
        teeHasPrefix (probe->name, teeStringLength (probe->name), "r422-panelgrid") ||
+       // Round434's accelerator row rides that same beat and exists because the shell publishes
+       // tens of seconds before any reader exists: a pass cap that ate it would make "Metal never
+       // looked" and "the accelerator never started" the same reading. 96 still bounds it.
+       teeHasPrefix (probe->name, teeStringLength (probe->name), "r434-accel") ||
        // Round335's swap-wait rows ride the client's own calls, not a burst: a boot that stalls in this wait
        // prints its last row at the moment it stalls, and that row is the one the whole round is built to
        // read. Dropping it to a pass that had already spent its sixteen pushes would leave the reader with

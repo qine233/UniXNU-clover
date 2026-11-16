@@ -2195,7 +2195,7 @@ def report(image: pathlib.Path) -> int:
                      "kernel": xnu.get("path") == "Payloads/kernel.macho",
                      "deadline": "clover-unattended=" in xnu.get("args", ""),
                      "poke": "offline-hid-poke-uptime=" in xnu.get("args", ""),
-                     "air-init": "offline-air-init=1" in xnu.get("args", "")}
+                     "air-init": "offline-air-init=1" not in xnu.get("args", "")}
             same = all(parts.values())
             ok &= same
             print(f"{label:42} {'OK' if same else 'FAIL'} "

@@ -27,6 +27,7 @@
 | `NativeMobileDisplay` + 包内探针 | GOP 显示与交换路径 | 已实现（r414 前状态行尾列被 tee 切掉，队列判读待重取） |
 | `CloverGpu` | Adreno 512：微码、PM4/ring/ME_INIT、CP 启动、SMMU 识别；LDO 电压可写、CTRL/PDN 不可写（轨归 CPR/固件侧）。r415 起主线靴以 `clover-gpu=0` 运行：该探针在 boot 186/187 于自己的 GDSC/LDO 行之后挂住（`clover-gpu-ldo` 那道门只写在注释里） | 进行中（主线暂停用） |
 | `CloverDsp` | ADSP 探针 | 仅探针 |
+| `CloverAccel` | 发布 `IOAcceleratorES`（`MetalPluginName=NativeAdrenoMetal`，用户客户端 `AGXDeviceUserClient` 存根），供 Metal 发现插件；IOGPUFamily 退出预链 | 已实现（r434，待读数） |
 | `NativeHidInput` / `NativeKeyStoreEvents` | HID 与按键、钥匙串事件 | 已实现 |
 | 网络（Wi-Fi/BT） | — | 未开始 |
 | 音频（ADSP/LPASS/codec） | — | 未开始 |

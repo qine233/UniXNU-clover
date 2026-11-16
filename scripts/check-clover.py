@@ -715,6 +715,56 @@ def check_board(errors: list) -> str:
             errors.append("[kernel] archives builds CloverBlock but kernel_args does not select "
                           "clover-emmc=21, the only mode that publishes the block device")
 
+        # round434, the accelerator shell. libCloverAccel.a survives the link because CloverBlock's
+        # run names clover_accel_run() at its tail; if either half is dropped the service Metal's
+        # discovery matches simply never exists, and every composed frame stays blank for a reason
+        # nothing on the card would name. IOGPUFamily owns the same class name, so it has to be out
+        # of the prelink roots, and the payload has to boot the real userland (no air-init) or the
+        # discovery never runs.
+        accel_builder = any("build-clover-accel.py" in entry for entry in board["kernel"]["archives"])
+        if "libCloverAccel.a" in text and not accel_builder:
+            errors.append("the defconfig links libCloverAccel.a but [kernel] archives omits "
+                          "build-clover-accel.py, so that archive does not exist")
+        if accel_builder and "libCloverAccel.a" not in text:
+            errors.append("[kernel] archives builds CloverAccel but the defconfig does not link "
+                          "libCloverAccel.a, so clover_accel_run() is undefined")
+        if accel_builder:
+            block_text = (REPO / "drivers/CloverBlock/CloverBlock.cpp").read_text()
+            if "clover_accel_run();" not in block_text:
+                errors.append("CloverBlock's run never calls clover_accel_run(): the archive would "
+                              "stay linked but publish nothing")
+            roots = board["kernel"]["prelink"]["roots"]
+            if "com.apple.iokit.IOGPUFamily" in roots:
+                errors.append("the prelink roots still carry IOGPUFamily: it registers the "
+                              "IOAcceleratorES class name this round defines")
+            accel_source = (REPO / "drivers/CloverAccel/CloverAccel.cpp").read_text()
+            for needle in ("OSDefineMetaClassAndStructors(IOAcceleratorES, IOService)",
+                           "MetalPluginName", "AGXDeviceUserClient",
+                           "clover_accel_static_init", "clover_accel_state", "clover_accel_report",
+                           "gAccelPublished"):
+                if needle not in accel_source:
+                    errors.append(f"drivers/CloverAccel/CloverAccel.cpp lacks {needle[:32]}: the "
+                                  "shell would not answer discovery the way the title says")
+            accel_script = (REPO / "scripts/build-clover-accel.py").read_text()
+            for needle in ("--remove-section=__DATA,__mod_init_func", "--globalize-symbol="):
+                if needle not in accel_script:
+                    errors.append(f"scripts/build-clover-accel.py lacks {needle[:32]}: the late "
+                                  "registration it exists for is not performed")
+            # The shell's counters have to survive the ring. The publish lands before the first user
+            # process, so an IOLog-only reading is gone by readback; the display beat carries it.
+            probe_source = (REPO / "package/CloverLegacyDisplayProbe.cpp").read_text()
+            for needle in ("clover r434: accel pub=%u", "clover_accel_state(",
+                           "ent=%u init=%u dis=%u"):
+                if needle not in probe_source:
+                    errors.append(f"CloverLegacyDisplayProbe.cpp lacks {needle[:32]}: the shell's "
+                                  "counters would not survive the 512-line kernel ring")
+            sdhci_source = (REPO / "drivers/CloverSdhci/CloverSdhci.cpp").read_text()
+            for needle in ('{ "clover r434: accel", "r434-accel", 96, 0, 0, 0 },',
+                           '"r434-accel"', '"CloverAccel"'):
+                if needle not in sdhci_source:
+                    errors.append(f"CloverSdhci's tee lacks {needle[:32]}: the accelerator row has "
+                                  "no class or no exemption and a pass cap could swallow it")
+
         # round184 parks the three instruments. The goal moved: the question is no longer what the
         # touch bus, the PMIC rails or the shared heap say, it is how to get iPadOS onto its own
         # screen. Each of these three spends boot time and bus risk on a question that is not that
@@ -9012,8 +9062,8 @@ def check_board(errors: list) -> str:
     # generation, the title names the image that ran. The reason is a measurement, not a preference: 204
     # archived state rows (211 of 620) end mid-column at the tee's 320-byte line bound, and the columns in the cut part
     # are the ones that say whether the channel is alive.
-    if not board["payload"]["title"].startswith("clover r433:"):
-        errors.append('[payload] title is not "clover r433: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r434:"):
+        errors.append('[payload] title is not "clover r434: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -11167,8 +11217,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r433:"):
-        errors.append('[payload] title is not "clover r433: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r434:"):
+        errors.append('[payload] title is not "clover r434: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -11423,9 +11473,16 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
                                   "a JIT gate that the program does not implement")
         else:
             errors.append("scripts/clover-jit-probe.S is absent: the only userspace JIT gate has no source")
+        # Round434 returns the payload to the real userland: the accelerator shell is only useful
+        # to backboardd, which cannot run under the air-init program. The deadline stays so the
+        # board still lands in TWRP for the readback.
         args_text = " ".join(board["payload"].get("kernel_args", []))
-        if "offline-air-init=1" not in args_text:
-            errors.append("board.toml lacks offline-air-init=1: the air-init program would never be exec'd")
+        if "offline-air-init=1" in args_text:
+            errors.append("board.toml still passes offline-air-init=1: the payload would exit pid 1 "
+                          "before launchd or backboardd ever matched IOAcceleratorES")
+        if "clover-unattended=" not in args_text:
+            errors.append("board.toml lacks clover-unattended=<seconds>: the board would never come "
+                          "back to TWRP for the readback")
 
     # The step has to sit in the recipe between the AMFI patch and the payload build: normalising
     # first would let the patcher move bytes the identity fields had already hashed, and the shipped

@@ -713,3 +713,15 @@ Metal 发现并加载 metal2vulkan 插件**。宿主取证如下（都在 `round
 顺序：先 B 拿到“AMFI 是否放行 ad-hoc kext、host_kext_request 是否可达”两枚读数；
 若被拒再走 A。插件 bundle 与 lavapipe dylib 必须进 **OS 卷**（r433 已证 Data 卷 mmap 被沙箱拒），
 OS 卷在 `round420-userdata-root.img` 的 APFS 容器里，宿主挂起编辑后只把改动块 dd 回 userdata。
+
+**r434 的实现（已构建，读数见 development-log §Round434）**：两条路都没走——上面第 1 条的
+「撞名」是前提判断错了。`OSRuntimeInitializeCPP` 只在 libkern init 时执行**内核映像自己的**
+`__mod_init_func`；预链 kext 的类要等各自 kext start 才注册。所以把壳做进一个**内核 archive**、
+让它在 `CloverBlock` 的 run 尾部（`clover_accel_run()`）才注册自己的 metaclass，就与 IOGPUFamily
+的加载时机无关；只要 IOGPUFamily 不在预链 roots 里，`IOAcceleratorES` 这个名字就是空的。
+`drivers/CloverAccel/CloverAccel.cpp` 因此是一个普通的 `IOAcceleratorES : IOService`（mondrian
+k60 的 0212 形状），没有 IOGPUFamily 的未导出虚函数可继承，也没有构造/析构别名。构建脚本
+`scripts/build-clover-accel.py` 仍然剥掉 `__mod_init_func` 并把 `__GLOBAL__sub_I_CloverAccel.cpp`
+全局化，由 `clover_accel_run()` 显式调用——这与 CloverBlock 的晚注册同形，但基类就在内核里，
+所以不需要 `preModLoad`/`postModLoad`。`offline-iogpu-load` 不在 boot args 里，IOGPUFamily
+不会被运行时加载回来。
