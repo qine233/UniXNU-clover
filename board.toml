@@ -349,7 +349,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r440: the accelerator beat separates the plugin's mark domains. Boot 235 read by=backboardd:45,iconservicesagen:72,PhotosPosterProv:36 with the panel still on the boot-flag shape, and the r439 row (from the raw window) read bbc=4 bbh=706f,7073,7074,7029 -- the 0x7fff/0x7000|char streamText characters, not stage marks. This kernel keeps 0x68xx stage marks in their own four-slot history (sth=), accumulates the streamText characters per process into the last line it streamed (bbtxt=), and prints a third beat row clover r440: acceltxt. No boot argument, plugin, trust or userdata change."
+title = "clover r442: the synthetic tap moves where the UI needs it. Boot 237 proved the JIT-fallback library creates the Metal device in backboardd (sth=6801,6814,6802,6803); the compositor then presented alpha-255 frames to 213 s and stopped at 280 s with an empty surface. This round gives the tap generator a point (offline-hid-tap-x/-y, driver axes 30480x20320) and a burst count per 120 s beat, and sets it on Setup's bottom-right Continue (26670,18838), 4 taps per beat, 12 in all, to see whether the first screen advances now that rendering works."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -2453,6 +2453,13 @@ kernel_args = [
   # validator has accepted two swaps; three Home presses, then silence.
   "offline-hid-input=1",
   "offline-hid-home=1",
+  # Round442: the tap point and how many taps land per 120 s beat. The driver's own axes are
+  # 30480 x 20320; (26670, 18838) is the bottom-right button of a 1200x1920 panel, the one Setup's
+  # hello screen puts "Continue" on. Four taps 200 ms apart per beat, twelve in all.
+  "offline-hid-tap=12",
+  "offline-hid-tap-x=26670",
+  "offline-hid-tap-y=18838",
+  "offline-hid-tap-burst=4",
   # Round426. Boot 210 reached a full userland (221 processes at t=939 s) but the display had only
   # eight presentations, the last at 146 s and all black -- the shape of a device that painted its
   # last frame and then went to sleep. Three presses starting at this uptime say which it is: a

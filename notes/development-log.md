@@ -32500,3 +32500,29 @@ pid58），说明这一靴里 backboardd 以新 pid 起来（或重启过）；�
 带 alpha 255 的帧，随后 surface 变全透明并停止。下一支不再查“设备能不能造”，而是把 UI 从 hello
 往前推：合成点击已经有实现（`offline-hid-tap=<预算>`，120 s 一拍、面板中心、按 50 ms 抬起），
 r442 给它加坐标参数并把频率改快，以便点到画面里的按钮。
+
+### §Round442（v0.7.157）：合成点击可指坐标、可连击
+
+**为什么现在做。** boot 237 已证明 backboardd 的 Metal 设备成立（`sth=6801,6814,6802,6803`），
+合成器出过 alpha 255 的帧；剩下的表面停在 hello（`lit=81 box=314x823..970x1067`）后转空。
+r435 的点击生成器固定打面板中心、120 s 一拍，点不到 Setup 的按钮。
+
+**驱动侧（`package/CloverHidInputProbe.cpp`）。** `publishTouchFrame` 的落点改为可配置
+`gTapX/gTapY`（驱动自身轴 30480 x 20320）；新增启动参数：
+`offline-hid-tap-x=`、`offline-hid-tap-y=`（越界忽略，保持中心）、`offline-hid-tap-burst=1..8`
+（每个 120 s 拍连发几击，击间 200 ms）；预算 `offline-hid-tap=` 仍按单击计数，发完自停。
+
+**board.toml。** `offline-hid-tap=12`、`offline-hid-tap-x=26670`（≈1050 px）、
+`offline-hid-tap-y=18838`（≈1780 px，1200x1920 面板的右下按钮）、`offline-hid-tap-burst=4`：
+四个 120 s 拍上各 4 击，共计 12 击。
+
+**构建。** prelink `40d399b8…`；AMFI `8f9074bc…`（两刀照旧）；normalized `8d21f5d1…`；
+payload `round442-v0.7.157-payload.img` `fb179e31…`，verify **EXIT=0，51 OK / 0 FAIL**。
+03:45:23 写 cache，boot 238。
+
+**预登记（boot 238）。**
+- **S-A**：`clover r435: tap budget=` 行显示预算从 12 递减、`reports` 同步增加（每次按/抬都进 HID 栈）；
+- **S-B**：`panelbox` 离开 hello 形状（`box` 改变或出现新的 `lit`/颜色）⇒ 点击被 Setup 接受且新页被渲染；
+  若仍是同一 `lit=81` 形状到最后，则 HID 设备被忽略或坐标未命中（下一支按 y 轴翻转点一次，再换中心）；
+- **S-C**：`sth` 仍以 `6802/6803` 收尾（设备稳定）；若回退到 `68f2`，说明设备创建在重启后的实例里失败，单独处理；
+- **S-D**：死线 1200 s 落回 TWRP/EDL 中转，按既有回收。

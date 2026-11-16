@@ -165,12 +165,18 @@ void *gTouchContext = nullptr;
 
 // The driver's own axis maxima (30480 x 20320, drivers/NativeHidInput/NativeHidInput.cpp:167), so
 // slot 0 lands in the middle of the panel after transformCoordinate() rather than at an edge.
+// Round442: the centre point is right for a "does the stack take a finger at all" probe, but Setup's
+// first screen only moves when its own button is hit. The point and the number of taps per beat are
+// boot arguments (`offline-hid-tap-x/-y/-burst`), in the driver's own axis units (30480 x 20320).
+static uint32_t gTapX = 15240;
+static uint32_t gTapY = 10160;
+static uint32_t gTapBurst = 1;
 void publishTouchFrame(unsigned down) {
     native_touch_seq = native_touch_seq + 1;                      // odd: a writer is inside
     __asm__ volatile("dmb ish" ::: "memory");
     native_touch_count = down ? 1 : 0;
-    native_touch_xs[0] = 15240;
-    native_touch_ys[0] = 10160;
+    native_touch_xs[0] = gTapX;
+    native_touch_ys[0] = gTapY;
     native_touch_ids[0] = 1;
     __asm__ volatile("dmb ish" ::: "memory");
     native_touch_seq = native_touch_seq + 1;                      // even: readable as a whole frame
@@ -315,14 +321,22 @@ extern "C" __attribute__((noinline)) void native_hid_live_checkpoint(IOService *
             if (PE_parse_boot_argn("offline-hid-tap", &budget, sizeof(budget)) && budget) {
                 gTapBudget = budget;
             }
+            unsigned x = 0, y = 0;
+            if (PE_parse_boot_argn("offline-hid-tap-x", &x, sizeof(x)) && x && x <= 30480) gTapX = x;
+            if (PE_parse_boot_argn("offline-hid-tap-y", &y, sizeof(y)) && y && y <= 20320) gTapY = y;
+            unsigned burst = 0;
+            if (PE_parse_boot_argn("offline-hid-tap-burst", &burst, sizeof(burst)) && burst > 0 && burst <= 8) gTapBurst = burst;
         }
         if (gTouchSink != nullptr && lastService != 0 && gTapBudget != 0) {
-            __atomic_sub_fetch(&gTapBudget, 1, __ATOMIC_RELAXED);
-            publishTouchFrame(1);
-            gTouchSink(gTouchContext);
-            IOSleep(50);
-            publishTouchFrame(0);
-            gTouchSink(gTouchContext);
+            for (uint32_t i = 0; i < gTapBurst && gTapBudget != 0; i++) {
+                __atomic_sub_fetch(&gTapBudget, 1, __ATOMIC_RELAXED);
+                publishTouchFrame(1);
+                gTouchSink(gTouchContext);
+                IOSleep(50);
+                publishTouchFrame(0);
+                gTouchSink(gTouchContext);
+                if (i + 1 < gTapBurst) IOSleep(150);
+            }
         }
         if (gTouchSink != nullptr && lastService != 0 && clover_hid_touch_frames == 0) {
             clover_hid_touch_frames = clover_hid_touch_frames + 1;
