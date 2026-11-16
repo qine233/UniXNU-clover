@@ -1342,6 +1342,10 @@ def check_sb_sample(kernel: bytes) -> bool:
              # image this payload carries, or a boot that sets the argument still has an instrument that
              # never reads it (boot 210: eight presentations, last at 146 s, then no client calls).
              "r426-hid-poke": (b"offline-hid-poke-uptime") in kernel,
+             # Round430's real userspace host: the kernel must carry the air-init hook and its Data path,
+             # or the boot argument names a program nothing execs (r429's mistake, one layer up).
+             "r430-air-init": (b"/private/var/tmp/air-native") in kernel
+                               and (b"offline signed AIR instrument exec failed") in kernel,
              # Round344's per-record rows: the reference prints every record, this port prints one card record
              # per line, so both the row and the branch that says it did not fit are pinned as CStrings.
              "r344-dispclient": (b"clover r344: dispclient idx=%u pid=%d calls=%u fails=%u regall=%u regs=%u "
@@ -2190,7 +2194,8 @@ def report(image: pathlib.Path) -> int:
             parts = {"title": xnu.get("title") == board["payload"]["title"],
                      "kernel": xnu.get("path") == "Payloads/kernel.macho",
                      "deadline": "clover-unattended=" in xnu.get("args", ""),
-                     "poke": "offline-hid-poke-uptime=" in xnu.get("args", "")}
+                     "poke": "offline-hid-poke-uptime=" in xnu.get("args", ""),
+                     "air-init": "offline-air-init=1" in xnu.get("args", "")}
             same = all(parts.values())
             ok &= same
             print(f"{label:42} {'OK' if same else 'FAIL'} "

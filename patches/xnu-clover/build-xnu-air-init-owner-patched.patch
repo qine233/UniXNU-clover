@@ -1,0 +1,18 @@
+diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
+index 2b5374e..68bb83e 100755
+--- a/scripts/build-xnu-4k-baseline.sh
++++ b/scripts/build-xnu-4k-baseline.sh
+@@ -791,7 +791,12 @@ if [ "$NATIVE_AIR_INIT" != 0 ] && [ "$NATIVE_AIR_INIT" != 1 ]; then
+   echo 'XNU_NATIVE_AIR_INIT must be 0 or 1' >&2
+   exit 1
+ fi
+-if [ "$NATIVE_AIR_INIT" = 1 ] && { [ "$OWNER_CACHE_MOUNT" != 1 ] || [ "$OWNER_DATA_MOUNT" != 1 ] || [ "$OWNER_ROOT_TRUST" != 1 ]; }; then
++# A board may patch the owner mounts into kern_exec.c for that translation unit alone (clover does,
++# in zzy-clover-systemos-mount.patch) while the command line keeps -DXNU_OWNER_*=0. It then declares
++# XNU_NATIVE_AIR_INIT_OWNER_PATCHED=1 and answers for the mounts itself; the air-init block needs
++# only the SystemOS and Data mounts that patch defines, not the virtio root-trust escape hatch.
++if [ "$NATIVE_AIR_INIT" = 1 ] && [ "${XNU_NATIVE_AIR_INIT_OWNER_PATCHED:-0}" != 1 ] && \
++   { [ "$OWNER_CACHE_MOUNT" != 1 ] || [ "$OWNER_DATA_MOUNT" != 1 ] || [ "$OWNER_ROOT_TRUST" != 1 ]; }; then
+   echo 'Offline AIR init requires the actual owner root, SystemOS and scratch Data path' >&2
+   exit 1
+ fi

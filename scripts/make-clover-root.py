@@ -70,6 +70,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / 'build/clover-root')
     parser.add_argument('--sdk', help='iPhoneOS SDK path (default: xcrun --sdk iphoneos)')
+    parser.add_argument('--trust-extra', type=Path, action='append', default=[],
+                        help='another signed Mach-O whose cdhash joins the owner trust module '
+                             '(repeatable; r430 uses it for /private/var/tmp/air-native)')
     args = parser.parse_args()
 
     sdk = args.sdk or run(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path']).strip()
@@ -101,9 +104,23 @@ def main():
     if not page or int(page[1]) != PAGE_SIZE:
         raise SystemExit(f'CodeDirectory page size is {page and page[1]}, not {PAGE_SIZE}')
     cdhash = bytes.fromhex(match[1])
+    extra_hashes = []
+    for extra in args.trust_extra:
+        run(['codesign', '--verify', '--strict', str(extra)])
+        extra_details = run(['codesign', '--display', '--verbose=4', str(extra)])
+        extra_match = re.search(r'^CDHash=([0-9a-f]{40})$', extra_details, re.M)
+        if not extra_match:
+            raise SystemExit(f'{extra} carries no CDHash')
+        extra_page = re.search(r'^Page size=(\d+)$', extra_details, re.M)
+        if not extra_page or int(extra_page[1]) != PAGE_SIZE:
+            raise SystemExit(f'{extra} is signed for page size {extra_page and extra_page[1]}, not {PAGE_SIZE}')
+        extra_hashes.append(bytes.fromhex(extra_match[1]))
 
     module_id = uuid.uuid5(uuid.NAMESPACE_URL, f'{IDENTIFIER}:{cdhash.hex()}')
-    module = struct.pack('<I16sI', 2, module_id.bytes, 1) + cdhash + bytes([2, 0, 0, 0])
+    # The loader requires a module's entries in ascending cdhash order.
+    entries = sorted([cdhash] + extra_hashes)
+    module = struct.pack('<I16sI', 2, module_id.bytes, len(entries)) + b''.join(
+        entry + bytes([2, 0, 0, 0]) for entry in entries)
     bundle = struct.pack('<2I', 1, 8) + module
     (out / 'trustcache.bundle').write_bytes(bundle)
 
@@ -111,11 +128,14 @@ def main():
     if image[:4] not in (b'\xcf\xfa\xed\xfe',):
         raise SystemExit('the init program is not a 64-bit Mach-O')
     report = {
-        'purpose': 'init program of the md0/mockfs root; exits, so the kernel reports initproc exited',
+        'purpose': 'static EL0 program shipped as launchd.macho and as the SystemOS/Data seed; it has '
+                   'not been pid 1 since r137 (the bootstrapper is the OS volume launchd), so a probe '
+                   'that must run belongs in the air-init program instead',
         'source': str(SOURCE.relative_to(ROOT)),
         'launchd_sha256': hashlib.sha256(image).hexdigest(),
         'launchd_bytes': len(image),
         'cdhash': cdhash.hex(),
+        'extra_cdhashes': [h.hex() for h in extra_hashes],
         'trust_module_uuid': str(module_id),
         'own_bundle_sha256': hashlib.sha256(bundle).hexdigest(),
         'own_bundle_bytes': len(bundle),
@@ -126,7 +146,10 @@ def main():
     (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     print(f'launchd.macho {len(image)} bytes sha256 {report["launchd_sha256"][:16]}… '
           f'cdhash {cdhash.hex()}')
-    print(f'own trust module bundle {len(bundle)} bytes sha256 {report["own_bundle_sha256"][:16]}…')
+    print(f'own trust module bundle {len(bundle)} bytes sha256 {report["own_bundle_sha256"][:16]}… '
+          f'entries {len(entries)}')
+    for extra, digest in zip(args.trust_extra, extra_hashes):
+        print(f'  trusted extra {extra} cdhash {digest.hex()}')
     print('boot trust cache: python3 scripts/make-clover-trust-bundle.py')
     return 0
 

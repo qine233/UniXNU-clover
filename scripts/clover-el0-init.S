@@ -424,79 +424,10 @@ _start:
   // that follows it is self-contained and needs no banner on the panel.
   cbnz x23, _exit_now
 
-  // Round429: the JIT gate. The CPU software-Vulkan route needs the Metal
-  // frontend's process to map pages writable and executable; if this kernel
-  // refuses that under cs_enforcement_disable=1, the whole JIT family is out.
-  // The exit status is the reading (the panic text carries it). Variant A is an
-  // RWX mmap and a call into it; variant B is the realistic shape, RW then
-  // mprotect(RX), and it only runs once A worked. 1010 = both worked; 1000+e =
-  // A's mmap failed with errno e; 1010+e = B's mmap failed; 1020+e = B's
-  // mprotect was refused. A trap inside either call is the third reading and
-  // shows as the kernel's own exception, not as a status. XNU sets
-  // SCTLR_EL1.UCI (arm64/proc_reg.h:645), so dc/ic at EL0 are legal here.
-  mov x0, #0
-  mov x1, #4096
-  mov x2, #7                        // PROT_READ|PROT_WRITE|PROT_EXEC
-  mov x3, #0x1002                   // MAP_ANON|MAP_PRIVATE
-  mov x4, #-1
-  mov x5, #0
-  mov x16, #197                     // SYS_mmap
-  svc #0x80
-  b.cs 1f
-  mov x24, x0
-  movz w9, #0x03c0                  // the instruction to call: ret (0xd65f03c0)
-  movk w9, #0xd65f, lsl #16
-  str w9, [x24]
-  dc cvau, x24
-  ic ivau, x24
-  dsb sy
-  isb
-  blr x24
-  b 2f                              // variant A worked; measure the RX path too
-1:
-  and x0, x0, #31
-  add x0, x0, #1000
-  b 9f
-
-2:
-  mov x0, #0
-  mov x1, #4096
-  mov x2, #3                        // PROT_READ|PROT_WRITE
-  mov x3, #0x1002
-  mov x4, #-1
-  mov x5, #0
-  mov x16, #197
-  svc #0x80
-  b.cs 3f
-  mov x24, x0
-  movz w9, #0x03c0
-  movk w9, #0xd65f, lsl #16
-  str w9, [x24]
-  mov x0, x24
-  mov x1, #4096
-  mov x2, #5                        // PROT_READ|PROT_EXEC
-  mov x16, #74                      // SYS_mprotect
-  svc #0x80
-  b.cs 4f
-  dc cvau, x24
-  ic ivau, x24
-  dsb sy
-  isb
-  blr x24
-  mov x0, #1010
-  b 9f
-3:
-  and x0, x0, #31
-  add x0, x0, #1010
-  b 9f
-4:
-  and x0, x0, #31
-  add x0, x0, #1020
-9:
-  mov x16, #1                       // SYS_exit: the panic text is the channel
-  svc #0x80
-  b _checkpoint
-
+  // Round430: the userspace JIT gate does not live here. Since r137 removed rd=md0 this
+  // program is not pid 1; the bootstrapper is the OS volume's /sbin/launchd. The probe
+  // that does run is scripts/clover-jit-probe.S, exec'd by the offline-air-init hook as
+  // /private/var/tmp/air-native. What r429 added here was never executed (boot 212).
 
   // The mach probe, in the exec'd copy only.
   //

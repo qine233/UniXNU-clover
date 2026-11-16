@@ -346,7 +346,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r429: Can this kernel run code a userspace process just wrote? The init program now measures that before it execs anything and exits with the answer: 1010 means an RWX mmap and a call into it worked and so did RW then mprotect(RX); 1000+e, 1010+e and 1020+e name the refusing step and its errno. This is the V2 gate of the CPU software-Vulkan route (Metal through metal2vulkan into a software Vulkan): a JIT renderer needs exactly those mappings, so a refusal here closes the whole \"JIT family\" before any host build."
+title = "clover r430: r429 measured nothing: since r137 the bootstrapper is the OS volume's own launchd, not the static init, so boot 212 was an ordinary system boot (1216 s, deadline fired). The JIT gate moves to the kernel's offline-air-init hook, which execs /private/var/tmp/air-native as pid 1. That program tries an RWX mmap, RW then mprotect(RX), and RWX with MAP_JIT, and exits with an eight-bit status: 0x00 both shapes work; 0x3f only MAP_JIT; 0x40|e, 0x80|e and 0xc0|e name the refusing step and errno. A refusal here closes the whole \"JIT family\" before any host build."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -1179,7 +1179,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # launchd was a MAC label-update refusal on a root whose /sbin/launchd had no cdhash in the
 # 56-byte one-module bundle; scripts/make-clover-trust-bundle.py joins them and pins the
 # originals by the sha256 of their unwrapped IM4P payloads.
-trust_cache_sha256 = ["3a33e55955289b57fdd375f6cd699c5809baaec905bfb104811aed7319ddd476"]
+trust_cache_sha256 = ["8497a1a3c081e61e06f27b9a2bd00b79772aee0d26431989b55f690cc0417581"]
 kernel_args = [
   "serial=3",
   "debug=0x14e",
@@ -2455,6 +2455,7 @@ kernel_args = [
   # last frame and then went to sleep. Three presses starting at this uptime say which it is: a
   # sleeping device wakes and presents its lock screen; a stalled renderer does not.
   "offline-hid-poke-uptime=300",
+  "offline-air-init=1",
   # sheng-touch-hid=1 is not a touch experiment here, it is the device SHAPE: it is what the vendored
   # driver reads (drivers/NativeHidInput/NativeHidInput.cpp:291) to append the digitizer collection to
   # the report descriptor and to set Built-In/DisplayIntegrated/DigitizerCollectionDispatch on the

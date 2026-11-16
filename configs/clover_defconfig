@@ -45,6 +45,15 @@ CONFIG_XNU_SHENG_PMGR=y
 # [kernel] archives), which regenerates the ABI header from scripts/audit-clover-mobile-graphics-legacy.py
 # and pins every original-class binding to instructions it re-reads out of out/clover/kernel/kernel.macho.
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
+# Round430: the V2 gate has to run in a real userspace process. Since r137 the bootstrapper
+# is the OS volume's /sbin/launchd, so the r429 probe in clover-el0-init.S never executed.
+# This key compiles the DEVELOPMENT-only offline-air-init hook, which execs
+# /private/var/tmp/air-native (Data volume) as pid 1; the boot arg is offline-air-init=1.
+CONFIG_XNU_NATIVE_AIR_INIT=y
+# The owner SystemOS/Data mounts this board needs are defined inside kern_exec.c by
+# zzy-clover-systemos-mount.patch; the command line keeps them 0 because the virtio root-trust
+# escape hatch is deliberately off. This key tells the build the patch answers for them.
+CONFIG_XNU_NATIVE_AIR_INIT_OWNER_PATCHED=y
 # Kryo 260 (Cortex-A73/A53 derivatives) is ARMv8.0 and has no PSTATE.PAN: with
 # this on, the kernel's first `msr pan, #1` in arm_init raises an undefined
 # instruction at 0x79aff58, before arm_vm_init.

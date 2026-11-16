@@ -41,15 +41,16 @@
 | 用户态（launchd 起的守护进程集） | 通 |
 | 点亮屏幕（GOP 路径首帧） | 通 |
 | SpringBoard / 合成器 | 未到桌面。boot 211：补按 Home 生效（presses 3→6），presentation 8→31 到 345 s，客户端 backboardd（calls=148 fails=19），但每帧仍全黑。**黑屏定因**：`AegirPoster` 崩溃栈落在 `CLKUIMetalQuadView → NUNICalliopeResourceManager`，断言 `pipelineState != nil` 失败（SIGABRT）——Metal render pipeline 创建返回 nil，锁屏时钟/星空渲染器自杀并被反复重启。路线改为 Metal 前端 → metal2vulkan → CPU 软件 Vulkan；r429 先测它能否成立的前提：设备上 RWX / RW→mprotect(RX) 映射与执行（见下） |
-| 桌面 | 未到（卡在 Metal pipeline 创建）。r429 的 JIT 闸门在 boot 212 读数，1010 才继续 V1 宿主构建 |
+| JIT 前提（V2） | **通**（r430，boot 215）：RWX mmap 成功但执行 SIGBUS（W^X strip）；RW→`mprotect(RX)`→执行并返回，exit 0。宿主是 air-init 的 pid 1（ad-hoc 签名、无 entitlement；backboardd 的平台进程策略待对照） |
+| 桌面 | 未到（卡在 Metal pipeline 创建）。V2 已过：软件 Vulkan 可用 W^X 写时切换；下一步 V1 宿主自测 |
 
 ## 闸门
 
 | 闸门 | 最近一次 | 结果 |
 | --- | --- | --- |
-| `check-clover.py` | r429 | EXIT=0（ADT 14,384 B、8 cores）。整跑仍按用户要求不常开；本轮为标题/探针/trust 哈希改动定点跑 |
-| `verify-clover-payload.py` | r429 | EXIT=0（0 FAIL；scratch-data == signed root，trustcache == published bundle） |
-| 源码针脚定点核对 | r429 | init 里 5 枚 JIT 闸门针脚全中（另 r422 的 11 枚仍按原位） |
+| `check-clover.py` | r430 | EXIT=0（ADT 14,384 B、8 cores）。整跑仍按用户要求不常开；本轮为 air-init 键/探针/trust 改动定点跑 |
+| `verify-clover-payload.py` | r430 | EXIT=0（0 FAIL；`air-init ok`，scratch-data == signed root，trustcache == published bundle） |
+| 源码针脚定点核对 | r430 | 探针里 6 枚针脚全中；board 的 `offline-air-init=1` 断言在场 |
 
 ## 已知缺口
 
@@ -68,6 +69,10 @@
 ```sh
 # 内核
 python3.13 ./unixnu build kernel --device ../UniXNU-clover
+
+# r430 起的 air-init 内核：基仓 scripts/build-xnu-4k-baseline.sh 需要
+# patches/xnu-clover/build-xnu-air-init-owner-patched.patch 的逃生键
+# (XNU_NATIVE_AIR_INIT_OWNER_PATCHED=1)；本板的 owner 挂载在 board 补丁里按翻译单元强开。
 
 # AMFI 补丁 + 归一化 + payload
 python3 ../UniXNU-clover/scripts/patch-clover-amfi.py <kernel> <out>

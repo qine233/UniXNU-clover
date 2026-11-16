@@ -31897,3 +31897,104 @@ cdhash `e7933bde90c5a42fd7ff331cbbd30e47ec2e3acd`；`build/clover-root/trustcach
 
 这一靴**故意不进用户态**：init 在 exec 前就退出，panic 文本是唯一产物；读回后下一轮把探针
 摘掉（或挪到独立 boot-arg）再继续。
+
+### boot 212 读数（r429）——探针**没跑**；静态 init 早已不是 pid 1
+
+**产物。** `unattended-r429-boot212.log`（EXIT=0）、`clover-log-window.bin.txt`（boot 212），
+payload `round429-v0.7.141-payload.img` sha256 `d1ae04c0…`；启动前卡上 boot 211，
+跑完后 211→212，确认这一窗就是本轮镜像写的。
+
+**读数（反证）。**
+
+- 全窗 **没有** `[clover] el0 init:` 那行，也没有 `initproc failed to start … exit status`；
+  没有被我们截停的早退 panic。
+- 反过来，系统完整跑到 t=1216 s：`backboardd`、`SpringBoard`、`bluetoothd[366]`（r309 exit 行）、
+  `xpcproxy[368]` 都在；`clover r234` 的 bb 行到 t=1215 s 还在写。
+- flight 区这次明确有 **`deadline fired after 1200 s at t=1204261 ms`**
+  （`elapsed=1200.002s freq=19200000`），并落了 panic 与 BCB，板子正常回 TWRP。
+  ⇒ boot 210/211 的「死线检查没执行」不是必然，而是迁移 I/O 把 callout 按住的那两靴才有的形状。
+
+**为什么探针没跑（定因）。** r137 删掉了 `rd=md0`，根换成 CloverBlock 发布的 APFS OS 卷；
+`load_init_program` 执行的是 OS 卷上的 `/sbin/launchd`（Apple 原封 launchd），
+`scratch-data.img`/`launchd.macho` 只在 SystemOS/Data 挂载的 seed 形状里出现，**不再被 exec 成 pid 1**。
+r429 把探针加在 `scripts/clover-el0-init.S`，等于加在一个当前启动链不会执行的文件里：
+镜像内容、trust cache、闸门全对，唯独没有宿主去跑它。**这是本轮的方法错误，不是内核拒绝。**
+
+**附带发现：退出码只有 8 位。** panic 文本里 `WEXITSTATUS(rv)` 是 `rv & 0xff`
+（`bsd/kern/kern_exit.c:1936`），所以 r429 设计的 1010 / 1000+e 到了卡上会被截成 242 / (232+e)。
+下一版状态码必须 ≤255，按「类别高 2 位 + errno 低 6 位」编码。
+
+**改正后的宿主（r430）。** 本树已有现成钩子：`load_init_program` 在 DEVELOPMENT 构建里支持
+`offline-air-init=1`，从 **`/private/var/tmp/air-native`**（Data 卷）exec 我们的程序作 pid 1。
+它要求 `XNU_NATIVE_AIR_INIT=1` 且 OWNER_CACHE_MOUNT/OWNER_DATA_MOUNT/OWNER_ROOT_TRUST 都为 1
+（三者本板已满足；`build-xnu-4k-baseline.sh:789-803`）。因此 r430：
+
+1. 编一枚独立静态探针（`scripts/clover-jit-probe.S`），沿用 r429 的两种映射形状并补
+   `MAP_JIT`（`0x800`）作为第三腿；状态码改成 8 位：`0x10`＝RWX 与 RW→mprotect(RX) 都通，
+   `0x20|e`＝B 的 mmap 拒、`0x30|e`＝B 的 mprotect 拒、`0x40`＝仅 RWX+MAP_JIT 通、
+   `0x50|e`＝MAP_JIT 也拒；e 取 errno 低 6 位。
+2. 把探针的 cdhash 加进 owner trust 模块（同一 bundle 可带多个 entry），否则 AMFI 拒 exec。
+3. 探针放进 Data 卷 `/private/var/tmp/air-native`（0755），备份 1 GiB 镜像后再写回。
+4. 启动参数加 `offline-air-init=1`，内核按 `XNU_NATIVE_AIR_INIT` 重编。
+
+这一靴仍会**故意不进用户态**：探针一退，panic 文本就是读数。
+
+### §Round430（V2 闸门，boot 213–215）：air-init 宿主成立；RWX 可映射但不可执行，RW→mprotect(RX) 可执行
+
+**实现。** 新程序 `scripts/clover-jit-probe.S` + `scripts/make-clover-jit-probe.py`，由
+`offline-air-init=1` 从 Data 卷 `/private/var/tmp/air-native` exec 成 pid 1。探针把每一步写进
+`/private/var/tmp/jit-probe.log`（先 `open`，失败只让日志变成空操作），因为 fault 不产生退出码：
+
+- A：`mmap(RWX, ANON|PRIVATE)` → 写 `ret` → `dc cvau`/`ic ivau` → `blr`；
+- B：`mmap(RW)` → 写 → `mprotect(RX)` → 刷缓存 → `blr`；
+- C：B 不通时试 `MAP_JIT`（`0x800`）的 RWX 腿。
+
+**构建坑（必须记住）。** `build-xnu-4k-baseline.sh` 的 air-init 门要求**命令行**上
+`OWNER_CACHE_MOUNT/OWNER_DATA_MOUNT/OWNER_ROOT_TRUST` 全为 1，可本板的 owner 挂载是在
+`patches/xnu-clover/zzy-clover-systemos-mount.patch` 里对 `kern_exec.c` 这一个翻译单元
+`#undef`/`#define` 强开的，命令行按设计是 0，root-trust 更是故意不开（它要 virtio 的
+`native_verified_block_root_authorized`）。所以给上游脚本加了一个显式逃生键
+`XNU_NATIVE_AIR_INIT_OWNER_PATCHED=1`（`CONFIG_XNU_NATIVE_AIR_INIT_OWNER_PATCHED=y`）：
+板子在补丁里自己回答这两个挂载，air-init 只要这两条，不需要 root-trust。
+这一处改的是 `~/UniXNU/scripts/build-xnu-4k-baseline.sh`（本地基仓；上游推送仍是本地-only），
+每趟 `tree.assemble` 会把它复制进 tree。
+
+**构建与闸门（r430）。** 内核重建（air-init 键触发 `kern_exec.o` 重编）：prelink
+`0a97c8cd…` → AMFI `3b412587…` → normalized `b9ae452b…`（52,551,680 B，973 枚戳清零）。
+探针 v1 `34480 B` / cdhash `cfb40e09…`（W^X 版；r430 早期一版 `78c87b84…` 只测 A）。
+owner trust 模块改成两个 entry（launchd `4f63be63…` + air-native），按加载器要求升序排列；
+boot trust `8497a1a3…`（61,432 B，owner(2) static(2478) system(76)）。
+payload `round430-v0.7.142-payload.img`（58,720,256 B）：
+`scratch-data.img == signed root`、`trustcache == published bundle`，
+`verify-clover-payload.py` EXIT=0（`title ok, kernel ok, deadline ok, poke ok, air-init ok`；
+`r430-air-init` 针脚在场），`check-clover.py` EXIT=0。
+Data 卷：`/private/var/tmp/air-native` 0755，sha256 与签名件一致；
+整段 1 GiB 备份 `round430-data-before.img`（`cf4bd842…`）。
+
+**逐靴读数。**
+
+- **boot 213（探针 v1，`78c87b84…`）**：`exec pid=1 ppid=0 t=23s comm=air-native`，
+  206 ms 后 `exit rv=0xa ns=2 code=0xa`、`sig=10`、`crit … sigcrash=1`。
+  panic 文本：`initproc failed to start -- exit reason namespace 2 subcode 0xa`。
+  ⇒ 进程被 **SIGBUS** 打死，不是正常退出。
+- **boot 214（加了日志）**：`jit-probe.log` 为
+  `start / A mmap ok / A wrote ok / A flush ok / A call ok`，**没有 `A ret`**；
+  内核侧同样是 23.7 s exec、23.9 s SIGBUS。⇒ `mmap(RWX)` 成功、写与刷缓存成功，
+  **执行那条 `ret` 时 fault**。内核把这一页的执行权静默剥掉了（W^X strip），
+  映射本身仍返回成功——所以“mmap 成功”不等于“能执行”。
+- **boot 215（跳过 A 的调用，改测 B）**：日志完整到
+  `A mmap ok … B mmap ok / B prot ok / B call ok / B ret ok`，
+  内核 `exit rv=0x0 ns=-1`，panic 文本
+  `initproc failed to start -- no exit reason available -- (signal 0, exit status 0)`。
+  ⇒ **RW → `mprotect(PROT_READ|EXEC)` → 调用返回**，W^X 切换形状成立；MAP_JIT 腿没用到。
+
+**判读（预登记 Q-A…Q-E）。** Q-A 的“都通”不成立（RWX 执行 SIGBUS），但 Q-E 的
+“写了却不可执行”只覆盖 A；B 通过，等于 **JIT 家族没有关闭**：软件 Vulkan 可以用
+`RW → mprotect(RX)` 的写时切换，不必依赖 MAP_JIT/entitlement。
+边界：这枚探针是 **pid 1 + ad-hoc 签名 + 无 entitlement**（与将来独立 helper 的形状一致），
+不是 backboardd 那种平台进程；`map_disallow_new_exec`/CS_HARD 的平台策略还没在
+backboardd 上量过。若 V1 之后要在 backboardd 内跑，还要补一次平台进程的对照；
+或按计划把 Vulkan 放进独立 helper，backboardd 只留 IPC stub。
+
+**下一步。** V1 宿主自测：在 macOS 上把 SwiftShader/lavapipe 塞进 metal2vulkan 的
+`options.loader`，先跑 compute/render/import；V1 通过再决定 helper 进程的 IPC 形状。
