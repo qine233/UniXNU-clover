@@ -346,7 +346,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r425: Boot 209 finished data migration (datamigrator exited 0 after 38 s with locationd and fairplayd.A2 disabled) and the panel left the Apple logo for the first time, but it went all black and the board never rebooted, which is what iOS does before showing the lock screen. The migration state lives in mobile/Library/Preferences/com.apple.migration.plist, not com.apple.DataMigration.plist; boot 209 wrote DMLastMigrationResults success=false there, so every boot still re-runs migration. This round flips that success to true so the next boot skips migration, and sets the deadline back to 1200 s."
+title = "clover r426: Boot 210 re-ran data migration even though DMLastMigrationResults is success=true (four migrator plugins were watchdogged between t=740 s and t=994 s), so that key is not the gate; the same boot reached a full userland (221 processes at t=939 s) while the panel had only eight presentations, the last at 146 s and all black, and no deadline record landed although the card's kernel rows run to t=1216 s (the deadline check sits after rtclock_intr in the timer handler, and the driver's beats stop at k=1199 s). This round adds offline-hid-poke-uptime=300: three Home presses at t=300 s decide between a device that went to sleep after painting its last black frame (it wakes and presents its lock screen) and a renderer that never presented again (nothing changes)."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -2450,6 +2450,11 @@ kernel_args = [
   # validator has accepted two swaps; three Home presses, then silence.
   "offline-hid-input=1",
   "offline-hid-home=1",
+  # Round426. Boot 210 reached a full userland (221 processes at t=939 s) but the display had only
+  # eight presentations, the last at 146 s and all black -- the shape of a device that painted its
+  # last frame and then went to sleep. Three presses starting at this uptime say which it is: a
+  # sleeping device wakes and presents its lock screen; a stalled renderer does not.
+  "offline-hid-poke-uptime=300",
   # sheng-touch-hid=1 is not a touch experiment here, it is the device SHAPE: it is what the vendored
   # driver reads (drivers/NativeHidInput/NativeHidInput.cpp:291) to append the digitizer collection to
   # the report descriptor and to set Built-In/DisplayIntegrated/DigitizerCollectionDispatch on the

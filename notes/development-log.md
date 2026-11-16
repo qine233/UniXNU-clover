@@ -31670,3 +31670,79 @@ memory-debug 落点，端口复位 + `SAHARA_RESET_REQ` 被接受后回 TWRP；�
 - **P-B**：屏不是全黑：`lit>0` 或 `col=` 出现非 `ff000000` 的颜色（锁屏时钟/壁纸）；
 - **P-C**：SpringBoard 在迁移完成后的重启靴里继续活着且提交帧（`pc` 增长）；
 - **P-D**：不回归——死线 1200 s 回落 TWRP。
+
+### boot 210 读数（r425，1200 s）——`success=true` 没跳过迁移；系统已到完整用户态，屏仍是 8 帧全黑；死线因定时器路径没落卡
+
+**产物。** `round425-data-boot210.img`（1 GiB，sha256 `fbfee65b…`）、
+`clover-log-window.bin.txt`（boot 210，boot 210 读回时 `round425-data-fix.img` 已在板上跑过一靴）。
+本轮板子 40 分钟没落回（`NO_LANDING_40M`），后由主机在 QUSB 0x900e 上做端口复位 + 强制
+`SAHARA_RESET_REQ` 回 TWRP（`edl.py` 第 322 行临时改成 `if True:`，用后已还原——与 r423 同一手法）。
+
+**四条判据。**
+- **P-A 不成立**：与 boot 209 的 CrashReporter 清单 diff，boot 210 多出 **8 份**
+  `stacks+com.apple.datamigrator-*.ips`（设备时钟 16:10:24–16:16:34），reason 为
+  `SystemAppMigrator (2 minutes)`、`sbmigrator (2 minutes)`、`CoreLocationMigrator (2 minutes)`、
+  `PreferencesMigrator - Got Watchdogged … after 30 seconds`，以及两份 `unsupported screen class`。
+  `mobile/Library/Preferences/com.apple.migration.plist` 仍是 r425 写下的
+  `DMLastMigrationResults = { buildVersion = "21H461", success = true }`（文件没被改回去）。
+  ⇒ **`DMLastMigrationResults.success` 也不是 `DMIsMigrationNeeded` 的门**；迁移在 boot 210 里又跑了一遍。
+- **P-B 不成立**：1200 s 前后 `panel=… col=ff000000/4100 oth=0`、
+  `panelbox … lit=0/4100 a0=0 a255=4100 box=- … lfp=0 lfb=0x0..0x0 lft=146s lfn=8 pc=8`、
+  `panelgrid` 240 个 hex 单元全 0。屏内容全黑。
+- **P-C 不成立**：这一靴只有 **8 次** presentation（`pc=8`、`lfn=8`），最后一次在帧纪元的 **146 s**，
+  且那帧像素数 0（全黑）；`dispstate` 的 `client=pid84 calls=53 fails=16` 从 ~916 s 到 1216 s
+  逐拍不变——显示客户端在 146 s 之后再没提交过。
+- **P-D 不成立**：flight 区没有 boot 210 的 deadline 记录（只有 boot 205 的陈旧 panic marker）；
+  卡上内核行一直写到 **t=1216 s**（`sbown` 每 4 s 一行到 1216.08 s，`panelbox` 到 1216.273 s），
+  说明 1200 s 死线没有被执行；板子最终落在 EDL，不是 TWRP。
+
+**这一靴相反方向的读数：系统比以往任何一靴都完整。**
+16:15:39 的迁移 precautionary stackshot 里 `processByPid` 有 **221 个进程**：SpringBoard(27)、
+backboardd(58)、PosterBoard、splashboardd、homed、installd、locationd(63)、datamigrator(165)、
+migrationpluginwrapper(331) 全在；`frontmostPids=[27]`。也就是说迁移还在 watchdog 里报「2 minutes」时，
+用户态已经完整起来，锁屏/桌面服务都在跑，屏却没有再被提交。
+
+**死线为什么没咬。** `drivers/ArmCpu/ArmCpu.cpp` 的检查在定时器中断里、且在 `rtclock_intr(0)` **之后**：
+
+```
+rtclock_intr (0);            // 先走 XNU 的 callout
+... clover_imem_heartbeat ();
+if (gUnattendedSeconds != 0 …) { if (now - gTick0Counter >= …) panic(...) }
+```
+
+而 flight 的 `beat` 记录（同样在中断里、也在 `rtclock_intr` 之后）最后一枚是 `k=1199s`（t=1187.564 s），
+之后 4 枚槽位再没有新 beat；内核行却继续到 1216 s。⇒ 1187.6 s 之后 `rtclock_intr` 没有返回过
+（或中断服务被卡在 callout 锁上），死线检查根本没被执行到。`beat` 之后的 tee 行能落卡，是驱动
+在自己的线程里补的，不是中断路径。这条把「死线 + panic sink」从「一定会落 TWRP」降级为
+「卡被迁移的 I/O 按住时不保证」——宿主必须在 40 分钟内做 EDL 回收，否则无人值守会停在这里。
+
+**宿主侧的旁证：iOS 自己的 unified log 在 Data 卷上。**
+`db/diagnostics/`（69 MiB，`Persist/*.tracev3`）被整段复制出来；宿主的 `/usr/bin/log` 读不了
+iOS 17 的 tracev3（报 archive corrupt），但 `strings` 已经能看到 SpringBoard/backboardd 的行：
+`class=IOMobileFramebufferUserClient`、`IOMobileFramebufferLegacy::…`、
+`logicalScreenClass: WKZ`、`RoleLockScreen/0-0`、`ScreenOn monitoring start`、
+`com.apple.BacklightServices`、`UIBacklightEnvironment`、`isBlankEntry`。
+⇒ 显示链被 iOS 打开过、锁屏角色存在、背光/屏幕状态机在动；缺的是「谁在 146 s 之后不再提交」。
+
+**r426（预登记）。** 不再改状态键。给 HID 探针加一个按时刻补按 Home 的闸：
+`offline-hid-poke-uptime=300`，在开机 300 s 起、每 2 s 一次共 3 次（用 CNTPCT，探针自己的
+`native_hid_input_requested()` 里发，仍经原 IOHIDDevice/backboardd 通路）。判据：
+- **T-A**：`clover r255: beat` 里 `presses` 在 ~300 s 的拍上从 3 增到 ≥4（补按被发放）；
+- **T-B**：`pc=/lfn=` 在补按之后继续增长（presentation > 8，`lft` > 146 s）；
+- **T-C**：补按之后 `panelbox` 的 `lit>0` 或 `col=` 出现非 `ff000000`（锁屏被画出来）；
+- **T-D**：若 T-B 不成立 ⇒ 不是「睡着」，下一支查 backboardd 的 render server 状态与 SpringBoard 的
+  lock-screen scene（tracev3 解码仍是候选）。
+
+死线仍 1200 s；宿主回收 EDL 的手工步骤记在 r426 的跑法里，下一支再把它脚本化。
+
+**构建与放行（r426）。** `build kernel -D ~/UniXNU-clover -j 8` EXIT=0：
+prelink `kernel.macho` sha256 `3daea766…`；`patch-clover-amfi.py` 两刀落 VA
+`0xfffffff004ab40e4`/`0xfffffff004ab416c`（`0x34000229→0x14000011`、`0x36000520→0xd503201f`），
+`round426-kernel-amfi.macho` `30ab376f…`；`normalize-kernel-macho.py` 清零 973 枚戳，
+`round426-kernel-normalized.macho` `1b122334…`。payload 首打漏了 `--data-ramdisk/--trust-cache`
+（verify 报 `scratch-data.img MISSING`、`kernel.macho.trustcache MISSING`，与 r245 同一个坑），
+补上 `build/clover-root/launchd.macho` 与 `build/clover-trust/trustcache.bundle` 后
+`round426-v0.7.136-payload-1200s.img` `0559c083…`（58,720,256 B）。
+`verify-clover-payload.py` EXIT=0、0 FAIL，`unixnu.toml` 报 `title ok, kernel ok, deadline ok, poke ok`；
+新针脚 `r426-hid-poke`（内核里有 `offline-hid-poke-uptime`）与 payload 参数
+`offline-hid-poke-uptime=300` 已写进两道闸门（`verify-clover-payload.py`、`check-clover.py`）。

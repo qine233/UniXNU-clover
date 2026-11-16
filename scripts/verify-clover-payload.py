@@ -1338,6 +1338,10 @@ def check_sb_sample(kernel: bytes) -> bool:
              # text console, because it paints into the same physical framebuffer and was scrolling kernel
              # rows over every iOS frame. Pinned as a CString so a binary without the gate fails here.
              "r422-consolemute": (b"clover r422: consolemute first=1\n") in kernel,
+             # Round426's late Home press: the argument name the probe parses has to exist in the kernel
+             # image this payload carries, or a boot that sets the argument still has an instrument that
+             # never reads it (boot 210: eight presentations, last at 146 s, then no client calls).
+             "r426-hid-poke": (b"offline-hid-poke-uptime") in kernel,
              # Round344's per-record rows: the reference prints every record, this port prints one card record
              # per line, so both the row and the branch that says it did not fit are pinned as CStrings.
              "r344-dispclient": (b"clover r344: dispclient idx=%u pid=%d calls=%u fails=%u regall=%u regs=%u "
@@ -2185,7 +2189,8 @@ def report(image: pathlib.Path) -> int:
             xnu = next((entry for entry in parsed.get("entry", []) if entry.get("type") == "xnu"), {})
             parts = {"title": xnu.get("title") == board["payload"]["title"],
                      "kernel": xnu.get("path") == "Payloads/kernel.macho",
-                     "deadline": "clover-unattended=" in xnu.get("args", "")}
+                     "deadline": "clover-unattended=" in xnu.get("args", ""),
+                     "poke": "offline-hid-poke-uptime=" in xnu.get("args", "")}
             same = all(parts.values())
             ok &= same
             print(f"{label:42} {'OK' if same else 'FAIL'} "

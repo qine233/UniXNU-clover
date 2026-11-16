@@ -7440,6 +7440,7 @@ def check_board(errors: list) -> str:
             probe_text = hid_probe.read_text()
             for needle in ('PE_parse_boot_argn("offline-hid-input", &enabled, sizeof enabled)',
                            'PE_parse_boot_argn("offline-hid-home", &home, sizeof home)',
+                           'PE_parse_boot_argn("offline-hid-poke-uptime", &poke, sizeof poke)',
                            'OSKextLoadKextWithIdentifier("com.apple.iokit.IOHIDFamily")',
                            'IOService::serviceMatching("IOHIDResource")',
                            'clover_hid_class_sizes[4] != 208',
@@ -7589,7 +7590,8 @@ def check_board(errors: list) -> str:
                 errors.append(f"scripts/build-clover-hid-input.py lacks {needle[:56]!r}: the subclass "
                               "would be compiled against a claim nobody re-read from this board's own "
                               "image, which is how a vtable slot ends up pointing at the wrong method")
-        for argument in ("offline-hid-input=1", "offline-hid-home=1", "sheng-touch-hid=1"):
+        for argument in ("offline-hid-input=1", "offline-hid-home=1", "offline-hid-poke-uptime=300",
+                         "sheng-touch-hid=1"):
             if argument not in board["payload"]["kernel_args"]:
                 errors.append(f"[payload] kernel_args has no {argument}: the instrument stays dark and "
                               "the boot reads back the same silence round254 left")

@@ -86,6 +86,14 @@ volatile uint32_t clover_hid_touch_frames;
 extern "C" bool native_hid_input_requested(void) {
     static uint32_t budget;
     static bool configured;
+    // Round426: the automatic budget above is spent in the first seconds of a boot, and boot 210
+    // showed what that leaves: eight presentations, the last at 146 s and all black, then no client
+    // calls for the rest of a boot whose userland was fully up. One reading that decides between
+    // "the device went to sleep" and "the renderer never presented" is a Home press late in the
+    // boot: a sleeping device wakes on it and presents its lock screen. offline-hid-poke-uptime=<s>
+    // grants three presses two seconds apart starting at that uptime; the presses then stop, because
+    // a device that keeps pressing nobody asked for is a fake input source.
+    static uint64_t pokeFirst, pokeNext, pokeLeft, pokeFrequency;
     if (native_legacy_transfer_calls < 2) { return false; }
     if (!configured) {
         configured = true;
@@ -94,14 +102,37 @@ extern "C" bool native_hid_input_requested(void) {
         if (PE_parse_boot_argn("offline-hid-auto-home-count", &requested, sizeof requested) && requested <= 8) {
             budget = requested;
         }
+        unsigned poke = 0;
+        if (PE_parse_boot_argn("offline-hid-poke-uptime", &poke, sizeof poke) && poke > 0 && poke <= 86400) {
+            uint64_t now;
+            __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(pokeFrequency));
+            __asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(now));
+            if (pokeFrequency != 0) {
+                pokeFirst = now + (uint64_t)poke * pokeFrequency;
+                pokeNext = pokeFirst;
+                pokeLeft = 3;
+            }
+        }
     }
     // boot 44 counted 1086 of these and the line called them presses, which is how a reader would
     // learn that the device had hammered the compositor a thousand times when in fact three grants
     // were ever made. Ask and grant are two numbers now, because only the pair says the cap worked.
     uint32_t asked = __atomic_fetch_add(&clover_hid_requests, 1, __ATOMIC_RELAXED);
-    if (asked >= budget) { return false; }
-    __atomic_fetch_add(&clover_hid_presses, 1, __ATOMIC_RELAXED);
-    return true;
+    if (asked < budget) {
+        __atomic_fetch_add(&clover_hid_presses, 1, __ATOMIC_RELAXED);
+        return true;
+    }
+    if (pokeLeft != 0 && pokeFrequency != 0) {
+        uint64_t now;
+        __asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(now));
+        if (now >= pokeNext) {
+            pokeLeft--;
+            pokeNext = now + 2 * pokeFrequency;
+            __atomic_fetch_add(&clover_hid_presses, 1, __ATOMIC_RELAXED);
+            return true;
+        }
+    }
+    return false;
 }
 
 extern "C" void native_hid_input_observed(unsigned event, int result) {
