@@ -694,3 +694,11 @@ reference = "notes/development-log.md"
 command = "python3 scripts/verify-clover-payload.py ~/clover-out/round414c-payload.img; python3.13 ~/clover-out/round414c-negatives.py"
 revision = "611a539229c93bb11df4ec4eea42dacf8bf150dd"
 result = "round414c-payload.img (d4a8533b5fb2927c4ffa93669fd5edbe56184381d7af92945ca2ecda3014d16a, 58,720,256 bytes) verifies 51 OK / 0 FAIL and the 12-case negative suite reports all-negatives-pass with default-payload-is-this-build True."
+
+[[area.evidence]]
+kind = "host"
+reference = "notes/development-log.md"
+command = "PATH=~/.cargo/bin:~/UniXNU/build/shims:$PATH python3 ~/UniXNU/scripts/build-adreno-metal-plugin.py --no-replay; hdiutil attach -readwrite ~/clover-out/round436-os-window.img; ditto NativeAdrenoMetal.bundle /Volumes/DawnUpdate.../System/Library/Extensions/; fastboot flash userdata ~/clover-out/round436-userdata-root.img"
+revision = "4938bde"
+result = "The plugin bundle (cdhash 84ee487a, lavapipe ba7fd84d) is installed in the OS window and the 84 changed 1 MiB blocks are written back to a cloned userdata image whose SHNGROOT manifest carries the new OS sha256 11fab551; the owner trust module grows 2 -> 4 and the merged bundle is 61480 B / 5841ec97. The r436 payload (2e9ac25f) verifies 48 OK / 0 FAIL. No on-board reading yet: after the first `fastboot flash userdata` aborted with `Failed reading from userdata`, the bootloader stopped answering every fastboot command (getvar, flash misc, reboot), so the round ends waiting for a physical reset."
+
