@@ -42,6 +42,11 @@
 ## 里程碑
 
 1. **V1 宿主自测（r431：compute/render 通，import 待 V3）**：metal2vulkan 的宿主桥（`build-adreno-metal-bridge.py --target host`）+ Chrome 157 的 arm64 SwiftShader，在 macOS 上 `compute_bad 0`、`render_bad 0`；无拷贝 import 需要 `VK_EXT_external_memory_host`，SwiftShader 不提供 ⇒ 归入 V3。
+   **r432 把 V3 的宿主半边补齐**：Mesa lavapipe（27.0.0-devel，LLVM 23.1.4）+ 一个导出
+   `vkGetInstanceProcAddr` 的 40 行 shim，`bridge_smoke` 得 `code 0 stage 0 compute_bad 0
+   render_bad 0 import_bad 0`。lavapipe 宣告 `EXT_external_memory_host`、4 KiB 对齐、
+   `memoryTypeBits=1`，缓冲导入无拷贝；宿主页上的图像走驱动的影子拷贝
+   （`metal2vulkan-degrade-shadowed-texture`）。软件 Vulkan 的选择定为 lavapipe。
 2. **V2 设备 JIT 门**：一个最小 kext 侧/用户态探针，确认受控进程能有可执行映射；记录 errno。
    **r430 通过（boot 213–215）**：宿主是 `offline-air-init` 从 Data 卷 exec 的
    `/private/var/tmp/air-native`（`scripts/clover-jit-probe.S`，ad-hoc 签名、无 entitlement）。
@@ -49,6 +54,9 @@
    **RW → `mprotect(PROT_READ|EXEC)` → 调用正常返回**，进程 exit 0。⇒ JIT 用 W^X 写时切换即可，
    不必 MAP_JIT。待补：backboardd 这类平台进程的同一组读数（或按计划走独立 helper + IPC stub）。
 3. **V3 导入门**：软件 Vulkan 的 host-memory 导入接上 IOSurface 语义，采样非黑。
+   宿主半边 r432 已过（缓冲导入无拷贝）。剩下的半边是设备：宿主构建的
+   `libvulkan_lvp.dylib` 依赖 macOS 的 `libLLVM.23.1.dylib`，必须用 iPhoneOS 17 SDK
+   交叉编 Mesa/LLVM（或把 LLVM 静态进 dylib），再按 sheng 的 bundle 形状改名、签名、进卷。
 4. **装配**：按 sheng 的插件 bundle 形状打包 `libvulkan_freedreno.dylib`（换成软件实现），
    ad-hoc 签名 4 KiB 页，进 clover 的 OS 卷（root 认证已按 r138 跳过）。
 5. **上机判据**：`AegirPoster` 不再 SIGABRT（无新 `AegirPoster-*.ips`）；`panelbox` 出现非黑

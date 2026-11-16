@@ -32044,3 +32044,84 @@ msg 'no-copy buffer: Unsupported(... feature: HostMemory ... Extension(ExtExte�
 需要 V3：要么找到/构建宣告 `VK_EXT_external_memory_host` 的软件 Vulkan（lavapipe 待验），
 要么在我们自己的软件 Vulkan 里用“导入+按需拷贝”语义补上，要么把 Vulkan 放进独立 helper
 并用共享内存传画布。V1 不再阻塞 V2；桌面渲染的真正门槛已收敛到 V3 的导入语义。
+
+### §Round432（V3 宿主门）：lavapipe 带 `VK_EXT_external_memory_host`，metal2vulkan 三档全过（compute/render/import 均 `_bad 0`）
+
+**题面。** r431 把 no-copy import 卡在 `feature: HostMemory`：SwiftShader 没宣告
+`VK_EXT_external_memory_host`。V3 的第一个问题是：换一个宣告该扩展的软件 Vulkan，
+metal2vulkan 的 import 步骤能不能在宿主上直接过。选定 Mesa lavapipe（llvmpipe）。
+
+**源码与配置事实（先行核对）。** `/Users/zhouzhou/clover-out/mesa-src` 是 Mesa
+**27.0.0-devel**（`intel-lgci-fdo-gitlab-mirror/mesa.mesa` 的 gh-proxy tarball）。在
+`lvp_device.c` 里逐条读到：`.EXT_external_memory_host = true`（:259）、
+`.minImportedHostPointerAlignment = 4096`、`lvp_GetMemoryHostPointerPropertiesEXT`
+返回 `memoryTypeBits = 1`、导入后 `mem->map = mem->vk.host_ptr`（即无拷贝）。
+配置只留 Vulkan：
+
+```
+meson setup mesa-build mesa-src --prefix=…/lavapipe \
+  -Dvulkan-drivers=swrast -Dgallium-drivers=llvmpipe -Dplatforms= \
+  -Dglx=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
+  -Degl=disabled -Dbuild-tests=false -Dllvm=enabled -Dvideo-codecs=
+```
+
+LLVM 23.1.4（`/opt/homebrew/opt/llvm@23`），`glslang 16.6.0`（configure 第一遍在
+`meson.build:740` 报 `glslangValidator not found`，装上后 EXIT=0）。
+
+**构建阻断与修法。** 第一遍 `ninja` 在自定义命令里全线失败，错误形如
+`/opt/homebrew/bin/meson: line 2: import: command not found`。原因是 ninja 用
+`/bin/sh -c`（本机 bash 3.2），而 bash 对 shebang 指向
+`/opt/homebrew/opt/python@3.13/bin/python3.13` 的脚本 execve 返回 ENOENT，于是回退成
+按 shell 解释；同一路径在 zsh 下正常。修法不动 Homebrew 文件：写
+`~/clover-out/bin/meson`（`#!/bin/zsh` + `exec /opt/homebrew/bin/meson "$@"`），把
+`build.ninja` 里 55 处 `/opt/homebrew/bin/meson` 换成该包装脚本。随后 783/783 编完，
+产出 `libvulkan_lvp.dylib`（13,311,008 B）。
+
+**接缝。** metal2vulkan 把 `options.loader` 当 Vulkan loader dlopen，只问
+`vkGetInstanceProcAddr`；lavapipe 是 ICD，导出的是 `vk_icdGetInstanceProcAddr`。
+写了一个 40 行的 shim（`vk_loader_shim.c`）：导出 `vkGetInstanceProcAddr` 与
+`vk_icdGetInstanceProcAddr`，首次调用时按 `CLOVER_VK_LOADER`（缺省
+`libvulkan_lvp.dylib`）dlopen 并转发。同一枚 `bridge_smoke` 不动：
+
+```
+CLOVER_VK_LOADER=…/libvulkan_lvp.dylib \
+  bridge_smoke …/libvulkan_lvp_shim.dylib …/cache
+```
+
+**读数。** `selftest-lavapipe.log`：`mark 6501/6502/6503/6504/6505/650f` 全到，末行
+
+```
+code 0 stage 0 compute_bad 0 render_bad 0 import_bad 0 qc 0 kernels 0/0 pairs 0/0 msg ''
+```
+
+设备名 `llvmpipe (LLVM 23.1.4, 128 bits)`。compare 与 render 的 `_bad 0` 与 r431
+一致；**import 第一次过**。运行时降级行里与导入相关的一条是
+`metal2vulkan-degrade-shadowed-texture`：64×64 RGBA8Unorm 的缓冲字节是导入的宿主页，
+而它的 usage 含 RenderTarget/ShaderWrite，lavapipe 对“宿主页上的图像”仍按
+“每次使用前拷进图像、写后拷回”处理（VUID-VkImageCreateInfo-pNext-01443）。
+也就是说**缓冲导入是无拷贝的，图像挂在宿主页上则由驱动做影子拷贝**——语义正确，
+只是多一次拷贝；这对首帧目标可接受。
+
+**判读。** V3 的宿主语义成立：`VK_EXT_external_memory_host` + 4 KiB 对齐 +
+`memoryTypeBits=1` 足以让 metal2vulkan 的无拷贝缓冲导入返回成功。软件 Vulkan 的选择
+定为 **lavapipe**，不再考虑 SwiftShader（除非只做 compute/render 的对照）。
+
+**产物（都在盘上）。**
+
+| 文件 | sha256 | 说明 |
+| --- | --- | --- |
+| `~/clover-out/round432-selftest-lavapipe.log` | `29796c77…` | 6501–650f，`code 0 stage 0 … import_bad 0` |
+| `~/clover-out/round432-libvulkan_lvp.dylib` | `d797aa1c…` | 13,311,008 B；`otool -L` 依赖 macOS 的 `libLLVM.23.1.dylib` |
+| `~/clover-out/round432-libvulkan_lvp_shim.dylib` | `c1dbad87…` | arm64 shim，导出 `_vkGetInstanceProcAddr` |
+| `~/clover-out/round432-vk_loader_shim.c` | `6ec3c847…` | shim 源码 |
+| `~/clover-out/round432-mesa-build.log` | `913aa6c7…` | 783/783；仅 ld 的重复库警告 |
+
+**下一手（V3 的设备半边）。** 宿主 `libvulkan_lvp.dylib` 不能直接进设备：它链接
+macOS 的 `libLLVM.23.1.dylib`（百 MB 级、macOS libSystem/libc++ ABI）。需要：
+
+1. 用 iPhoneOS 17 SDK 交叉编 Mesa（swrast/llvmpipe）与 LLVM；或把 LLVM 静态进
+   dylib、只留 iOS 允许的依赖；
+2. 按 sheng 的插件 bundle 形状改名 `libvulkan_freedreno.dylib`、`strip -x`、
+   ad-hoc 签名 4 KiB 页，放进 clover 的 OS 卷；
+3. 上机判据：无新 `AegirPoster-*.ips`；`panelbox` 出现非黑 `col=`/`lit>0`；
+   presentation 数继续增长。
