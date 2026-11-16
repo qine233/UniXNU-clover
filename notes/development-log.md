@@ -32526,3 +32526,21 @@ payload `round442-v0.7.157-payload.img` `fb179e31…`，verify **EXIT=0，51 OK 
   若仍是同一 `lit=81` 形状到最后，则 HID 设备被忽略或坐标未命中（下一支按 y 轴翻转点一次，再换中心）；
 - **S-C**：`sth` 仍以 `6802/6803` 收尾（设备稳定）；若回退到 `68f2`，说明设备创建在重启后的实例里失败，单独处理；
 - **S-D**：死线 1200 s 落回 TWRP/EDL 中转，按既有回收。
+
+### §Round442 读数（boot 238）——点击被 HID 栈接受，合成器多出 37 帧
+
+```
+clover r435: tap budget=4 frames=1 reports=66   →   tap budget=0 frames=1 reports=74
+clover r440: acceltxt stc=4 sth=6801,6814,6802,6803 bbtxt=P0 ee00002e2
+clover r344: dispstate ... client=pid58 ... tx=69@295s ... last=0@295s (空矩形)
+clover r416: panelbox ... fires≥35 全部 lit=0/4100 a0=4100 a255=0 box=-
+```
+
+**S-A 成立。** 预算 12 击全部发放（最后两行：budget 4→0），`reports` 66→74（每击按/抬各一笔），
+HID 栈确实收了我们的数字化仪报告。**S-B 不可判于本窗口**：驱动环在 ~928 s 之前已被 tee 覆盖，
+窗口里最早的 `panelbox` 是 fire 35，此时已是空面。**但合成器行为变了**：r441 是 `tx=32@280s`，
+r442 是 `tx=69@295s`——点击多带来 37 帧 presentation，说明输入引起了画面活动，只是尾部仍是
+`a0=4100` 的空 surface。**S-C 成立**：`sth` 仍以 `6802,6803` 收尾，设备稳定。
+
+**下一支（r443）**：把早期 `panelbox` 留在环里（收紧 tee 类别或给显示拍单独配额），并在点击后
+读出 120–300 s 段的屏幕形状，判断 Setup 是否翻页；若翻页，继续用坐标扫按钮，否则改点中心/翻转 y。
