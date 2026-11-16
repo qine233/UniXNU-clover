@@ -32289,3 +32289,25 @@ EDL 组合键 + `~/clover-out/edl/edl.py reset`，只 reset 不写分区）。�
 | `~/clover-out/round436-v0.7.149-payload.img` | 本靴 payload，sha256 `2e9ac25f…`，verify 48 OK / 0 FAIL |
 | `~/clover-out/round436-verify-payload.log` | 上面的 verify 原文 |
 | `~/clover-out/round436-os-changed-idx.txt`、`round436-os-changed.json` | 84 块差异读数 |
+
+### §Round436b 读数（boot 232，用户对照：去掉合成点击）
+
+用户提出对照：把 `offline-hid-tap` 去掉，看 hello 是否自己变化。r436b 只改这一个启动参数与标题，插件、trust、userdata 都是 r436 的；cache 写入后 boot 232 落回 TWRP，logdump 窗口 623,104 B（`~/clover-out/round436b-window.bin`，`--boot` 报 boot 232）。
+
+**accel 行（本轮主读数，成立）：**
+
+```
+clover r434: accel pub=1 fail=0 reads=6 rdr=mediaserverd opens=45 cli=mediaserverd calls=265 sel=0,1,2 ent=1 init=1 dis=0
+```
+
+`opens` 从 27 一路涨到 45，`calls` 265，`sel=0,1,2`——插件 `NativeAdrenoMetal.bundle` 确实被加载，`AGXDeviceUserClient` 被用户态反复打开并由 stub 全部应答。首个打开者是 `mediaserverd`（不是 backboardd；当前仪器只记首开者）。这是 r434 以来第一次 `opens>0`。
+
+**屏幕行：** hello 有内容时 `tx` 从 5 涨到 **24**，最后一帧 **342 s**（`tx=24@342s`）；之后 `lfb=0x0..0x0`、`lit=0/4100`、`box=-`、panelgrid 全零，背光仍亮（用户描述“纯黑、背光亮”）。合成器在 342 s 之后不再交新帧，不是息屏（息屏会关背光），也不是合成点击（本轮没有点击，`tap budget=0 frames=1 reports=2` 只是探针自报）。
+
+**判读：**
+- 点击对照成立：hello 之后转黑与合成点击无关，Setup 自己切走，下一屏没有被合成出来；
+- Metal 发现链已完整：IOAcceleratorES → MetalPluginName → 插件 → 用户客户端；
+- 仍是黑：backboardd 是否打开插件未知（首开者是 mediaserverd），且 stub 对所有 selector 只回零。r437 的仪器按进程统计 opens 与每个 selector 的调用数，先把“渲染服务器到底开没开、问了什么”变成读数。
+
+**产物：** `round436b-v0.7.150-payload.img`（`9e7ef1d2…`，verify 48 OK / 0 FAIL）、`round436b-window.bin`（623,104 B）、`round436b-boot232-rows.txt`（24 行 accel/dispstate 摘录）。
+
