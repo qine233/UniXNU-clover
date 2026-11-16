@@ -31746,3 +31746,37 @@ prelink `kernel.macho` sha256 `3daea766…`；`patch-clover-amfi.py` 两刀落 V
 `verify-clover-payload.py` EXIT=0、0 FAIL，`unixnu.toml` 报 `title ok, kernel ok, deadline ok, poke ok`；
 新针脚 `r426-hid-poke`（内核里有 `offline-hid-poke-uptime`）与 payload 参数
 `offline-hid-poke-uptime=300` 已写进两道闸门（`verify-clover-payload.py`、`check-clover.py`）。
+
+### boot 211 读数（r426，1200 s）——补按**发放了**（presses 3→6），presentation 8→31 且最后到 345 s，但每一帧仍是纯黑；客户端是 backboardd
+
+**产物。** `unattended-r426-boot211-readback.log` EXIT=0、`round426-boot211-window.txt`（boot 211 窗口，
+512 行覆盖 858.9–1215.0 s）。落回 TWRP 的方式是**上一靴预置在 misc 的 BCB**（runner 原话：
+`TWRP's adb came up … the board reset and the pre-armed BCB landed it in recovery`），不是本靴的 panic：
+flight 区没有 boot 211 的 deadline 记录，panic marker 仍是 boot 205 的陈旧记录。
+落回时间与死线一致（flight 的 entry 写到 t=1204.3 s、beat 到 k=1214），说明 1187 s 之后的中断路径
+行为与 boot 210 相同；`rtclock_intr` 之后的行仍没机会执行。
+
+**四条判据。**
+- **T-A 成立**：`clover r255: beat` 两行，`presses=3 asks=196`（t=859.6 s）→ `presses=6 asks=315`
+  （t=979.1 s）。补按的三次都发了；`transfer=12→14`，HID 通路仍是 `touch=1 reports=2 sinks=1,1`。
+- **T-B 成立（部分）**：`dispstate` 的 `client=pid58`（**backboardd**）`calls=148 fails=19`，
+  `latch=1f copy=1f fc=1f`，`panelbox` 的 `lfn=31 pc=31`、`lft=345s`、`txa=31`。boot 210 是 8 帧、
+  146 s；这一靴多出的 23 帧与 300 s 的补按同时段，说明唤醒/补按确实让客户端又提交了。
+- **T-C 不成立**：1105/1135/1165/1195 s 四拍全是 `col=ff000000/4100 oth=0`、`lit=0/4100`、
+  `a0=0 a255=4100`、`panelgrid` 240 格全 0。**backboardd 提交的是纯黑帧**，不是“没有帧”。
+- **T-D 分岔改写**：不是“睡着了”，也不是“客户端死掉”，而是**合成器在画黑**。T-D 的分支因此从
+  “查 render server 状态”收窄为“查合成器/场景的内容来源”。
+
+**iOS 自己的日志旁证（Data 卷 `db/diagnostics`，宿主导出到 `/private/tmp/clover210.logarchive`）。**
+strings 里已见：`Service stub created for com.apple.springboard.SBRendererService`、`springboard.SBRenderer`、
+`RoleLockScreen/0-0`、`com.apple.WallpaperKit.CollectionsPoster`、`scale: 2.0, logicalScreenClass: WKZ`、
+`ScreenOn monitoring start`、`UIBacklightEnvironment`、`isBlankEntry`、`unsupportedProductTypes`。
+⇒ SpringBoard 的 renderer service 与锁屏壁纸 poster 都起了；宿主 `/usr/bin/log` 读不了 iOS 17 tracev3
+（报 corrupt/incomplete），要拿语义得用一个真解码器（或在板侧把关键 os_log 行落盘）。
+
+**下一支候选（未发）。** 三个方向按代价排序：
+1. 在驱动侧给“客户端提交的 IOSurface”补一个**非黑内容**读数：当前 `panelbox` 只看扫描缓冲，
+   `dispstate` 只有 calls/fails；要区分“backboardd 合成出黑”与“surface 本身有内容但拷贝丢”，
+   需要读 surface 的像素采样并和 scanout 分别记；
+2. 板侧落地关键 os_log：把 backboardd/SpringBoard 的 render/blank 行经 launchd 写到 Data（不改渲染）；
+3. 宿主装 tracev3 解码器（mac_apt/UnifiedLogs），离线读 300–400 s 的 SBRenderer/WallpaperKit。
