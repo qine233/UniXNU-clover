@@ -44,21 +44,30 @@ static char gAccelReader[17];
 static char gAccelClient[17];
 // Round437: the first opener name alone could not tell the render server from the media server. Every
 // open is counted under its process name; the table is tiny because the interesting boot has < 4.
-struct CloverAccelOpenRow { char name[17]; uint32_t opens; };
+struct CloverAccelOpenRow { char name[17]; uint32_t opens; uint32_t textPos; char text[64]; };
 static CloverAccelOpenRow gAccelOpenBy[6];
 static uint32_t gAccelOpenNames;
 static uint32_t gAccelOpenOther;
 static uint32_t gAccelSelCalls[16];
 // Round439: the plugin's progress markers are IOServiceOpen calls of type 0x4147<value>, not
 // external methods (NativeAdrenoUserTest.h Gpu::mark), so r437's selector counters could not see
-// them and every mark landed in the per-name open count. Classify the type instead: the last mark
-// names the step the published device reached, and backboardd's first four marks are its path
-// (0x6800 entered, 0x6801 Turnip found, 0x6810+i cache dir served, 0x6802/0x6803 device made).
+// them and every mark landed in the per-name open count. Classify the type instead. bbh keeps the
+// last four marks of backboardd, not the first four: 0x6800 entered, 0x6801 Turnip found, 0x6810+i
+// cache dir served, 0x6802/0x6803 device made, but every mark also shares the type field with the
+// 0x7fff/0x7000|char text stream, which floods it (boot 235's bbh read "ost)").
 static uint32_t gAccelMarks;
 static uint32_t gAccelMarkLast;
 static char gAccelMarkName[17];
 static uint32_t gAccelBBMarkCount;
 static uint32_t gAccelBBMarks[4];
+// Round440: the four-slot history was flushed by streamText -- a report line leaves as 0x7fff then
+// one 0x7000|char mark per character (NativeAdrenoUserTest.h), so boot 235's bbh held "ost)". Keep
+// the two domains apart: the 0x68xx stage marks in their own four-slot history, and the text lines
+// in a per-process buffer (0x7fff/0x7ffe restart, 0x70xx appends). The last line a process streamed
+// is its own words about what the plugin was doing.
+static uint32_t gAccelBBStageCount;
+static uint32_t gAccelBBStages[4];
+static char gAccelBBText[64];
 
 class AGXDeviceUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(AGXDeviceUserClient)
@@ -94,6 +103,8 @@ bool AGXDeviceUserClient::initWithTask(task_t owningTask, void *securityID, UInt
 			__atomic_add_fetch(&gAccelOpenBy[slot].opens, 1, __ATOMIC_RELAXED);
 		} else if (slot < (uint32_t)(sizeof gAccelOpenBy / sizeof gAccelOpenBy[0])) {
 			strlcpy(gAccelOpenBy[slot].name, name, sizeof gAccelOpenBy[slot].name);
+			gAccelOpenBy[slot].textPos = 0;
+			gAccelOpenBy[slot].text[0] = 0;
 			__atomic_store_n(&gAccelOpenBy[slot].opens, 1, __ATOMIC_RELAXED);
 			__atomic_store_n(&gAccelOpenNames, slot + 1, __ATOMIC_RELEASE);
 		} else {
@@ -105,6 +116,24 @@ bool AGXDeviceUserClient::initWithTask(task_t owningTask, void *securityID, UInt
 		__atomic_add_fetch(&gAccelMarks, 1, __ATOMIC_RELAXED);
 		__atomic_store_n(&gAccelMarkLast, value, __ATOMIC_RELAXED);
 		strlcpy(gAccelMarkName, name, sizeof(gAccelMarkName));
+		CloverAccelOpenRow *row = nullptr;
+		for (uint32_t i = 0; i < (uint32_t)(sizeof gAccelOpenBy / sizeof gAccelOpenBy[0]); i++) {
+			if (!strcmp(gAccelOpenBy[i].name, name)) {
+				row = &gAccelOpenBy[i];
+				break;
+			}
+		}
+		if (row) {
+			if (value == 0x7fff || value == 0x7ffe) {
+				row->textPos = 0;
+				row->text[0] = 0;
+			} else if (value >= 0x7000 && value <= 0x70ff) {
+				if (row->textPos < sizeof(row->text) - 1) {
+					row->text[row->textPos++] = (char)(value & 0xff);
+					row->text[row->textPos] = 0;
+				}
+			}
+		}
 		if (!strcmp(name, "backboardd")) {
 			uint32_t count = gAccelBBMarkCount;
 			if (count < (sizeof gAccelBBMarks / sizeof gAccelBBMarks[0])) {
@@ -115,6 +144,21 @@ bool AGXDeviceUserClient::initWithTask(task_t owningTask, void *securityID, UInt
 				gAccelBBMarks[1] = gAccelBBMarks[2];
 				gAccelBBMarks[2] = gAccelBBMarks[3];
 				gAccelBBMarks[3] = value;
+			}
+			if ((value & 0xff00u) == 0x6800u) {
+				uint32_t n = gAccelBBStageCount;
+				if (n < (sizeof gAccelBBStages / sizeof gAccelBBStages[0])) {
+					gAccelBBStages[n] = value;
+					__atomic_store_n(&gAccelBBStageCount, n + 1, __ATOMIC_RELEASE);
+				} else {
+					gAccelBBStages[0] = gAccelBBStages[1];
+					gAccelBBStages[1] = gAccelBBStages[2];
+					gAccelBBStages[2] = gAccelBBStages[3];
+					gAccelBBStages[3] = value;
+				}
+			}
+			if (row) {
+				strlcpy(gAccelBBText, row->text, sizeof(gAccelBBText));
 			}
 		}
 	}
@@ -370,6 +414,16 @@ extern "C" void clover_accel_report(void)
 	char marks[128];
 	clover_accel_marks(marks, sizeof(marks));
 	n = snprintf(line, sizeof(line), "clover r439: accelmk %s\n", marks);
+	if (n > 0) {
+		if ((unsigned)n >= sizeof(line)) {
+			n = (int)sizeof(line) - 1;
+		}
+		clover_emmc_probe_say(line, (unsigned)n);
+	}
+	n = snprintf(line, sizeof(line), "clover r440: acceltxt stc=%u sth=%04x,%04x,%04x,%04x bbtxt=%s\n",
+	    (unsigned)__atomic_load_n(&gAccelBBStageCount, __ATOMIC_ACQUIRE),
+	    (unsigned)gAccelBBStages[0], (unsigned)gAccelBBStages[1],
+	    (unsigned)gAccelBBStages[2], (unsigned)gAccelBBStages[3], gAccelBBText);
 	if (n > 0) {
 		if ((unsigned)n >= sizeof(line)) {
 			n = (int)sizeof(line) - 1;

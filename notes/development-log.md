@@ -32384,3 +32384,49 @@ pipeline pack 导入；`0x6Exx` 是 framebuffer 分支补丁（arm64e 才有）�
   插件按 27 形状运行，需回到插件版本）；
 - **P-D**：`panelbox` 是否离开 `lit=82` 启动标志形状（桌面/锁屏才有意义）；
 - **P-E**：死线 1200 s 落回 TWRP（非 EDL memory-dump；若仍 EDL，先 USB 端口复位 + SAHARA reset）。
+
+### §Round439 读数（boot 235）——`bbh` 是「最后四个」，而且被文本字符淹没
+
+**accel 行：**
+
+```
+clover r434: accel pub=1 fail=0 reads=4 rdr=backboardd opens=153 cli=backboardd calls=0 sel=0,0,0 by=backboardd:45,iconservicesagen:72,PhotosPosterProv:36 selc=0,0,0 ent=1 init=1 dis=0
+```
+
+backboardd 仍是 45 次打开（与 boot 234 相同）；iconservicesagen 72 次、PhotosPosterProv 36 次——
+后者是第一次出现在表里，说明墙体（poster）进程也加载了插件。窗内仍 `calls=0`（publish 模式不打
+externalMethod），`panelbox` 到 658 s 仍是启动标志形状（`lit=82/4100`，`lft` 658 s）。
+
+**r439 行（`read-clover-log.py` 没打印，从原始窗口 grep 得到；行在卡上，解码器侧欠一条 kind-25 通道）：**
+
+```
+clover r439: accelmk mks=153 lmk=7029 mkn=PhotosPosterProv bbc=4 bbh=706f,7073,7074,7029
+```
+
+**判读与更正。** `bbh` 实现是「最近四个打点」，不是「最早四个」；`0x70xx` 是 `streamText` 的
+字符流（`NativeAdrenoUserTest.h`：先 `0x7fff`，再每字符一个 `0x7000|char`），所以 backboardd 的
+四格被字符覆盖成 `o s t )`——它在**流一行文本**，但把这行文本当成阶段序列的仪器看不见。
+r439 的预登记 P-B（`bbh` 以 `6800,6801` 开头）因此不成立，且不是插件没跑，而是仪器把两个域混在一起。
+
+### §Round440（v0.7.154）：把打点域分开，收 backboardd 的文本行
+
+**驱动侧。** `CloverAccelOpenRow` 每进程加 `textPos/text[64]`；`0x7fff`/`0x7ffe` 重新开始，
+`0x7001..0x70ff` 追加字符；`0x68xx`（阶段域）另存 backboardd 的最近四槽 `sth=`；
+`bbc/bbh` 保留（现在只作“最近打点”的原始证据）。拍上第三行：
+
+```
+clover r440: acceltxt stc=<n> sth=<hhhh>,<hhhh>,<hhhh>,<hhhh> bbtxt=<最近一次 streamText 行>
+```
+
+**构建。** prelink `5112b834…`；AMFI `7cfd3263…`（两刀 VA 不变，文件偏移 `0x1b0b0e4`/`0x1b0b16c`）；
+normalized `b8217ea5…`（974 戳）；payload `round440-v0.7.154-payload.img` `e2e0a156…`，
+`verify-clover-payload.py` **EXIT=0，51 OK / 0 FAIL**。02:26:27 写 cache 并重启（boot 236）。
+
+**预登记（boot 236）。**
+- **Q-A**：`acceltxt` 行出现，`bbtxt` 非空——插件自己的话第一次变成读数；
+- **Q-B**：`sth` 若含 `6803` ⇒ backboardd 的 publish 设备造出并交回；`68f2` ⇒ 没造出；
+  `68f1` ⇒ 没找到 Turnip；若 `stc=0` ⇒ 阶段域一次都没打（publish 分支根本没进）；
+- **Q-C**：`bbtxt` 内容（如 `PUB no device: …`、`problem …`、telemetry 行）直接给出失败原因；
+- **Q-D**：屏仍是 `lit=82` 启动标志形状（touch 之前预期如此）；若离开，记下新形状；
+- **Q-E**：死线 1200 s 落点（EDL memory-dump 属已知中转，端口复位 + `CLOVER_SAHARA_RESET=1`
+  `edl.py reset` 回 TWRP；注意变量名是 SAHARA 不是 SARAHA）。
