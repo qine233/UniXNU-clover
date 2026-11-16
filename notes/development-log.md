@@ -31780,3 +31780,29 @@ strings 里已见：`Service stub created for com.apple.springboard.SBRendererSe
    需要读 surface 的像素采样并和 scanout 分别记；
 2. 板侧落地关键 os_log：把 backboardd/SpringBoard 的 render/blank 行经 launchd 写到 Data（不改渲染）；
 3. 宿主装 tracev3 解码器（mac_apt/UnifiedLogs），离线读 300–400 s 的 SBRenderer/WallpaperKit。
+
+### iOS unified log 解码（r426 后的宿主侧工具）
+
+Data 卷的 `db/diagnostics` 是 Apple log archive 的形状；宿主 `/usr/bin/log` 解不了 iOS 17 的
+tracev3（corrupt/incomplete）。改用 Mandiant `macos-UnifiedLogs` v0.7.0 的预编译
+`unifiedlog_iterator`（aarch64 macOS，sha256 `bf5c4a34…`）：
+
+1. 从 `db/diagnostics` 拷 `Persist/ HighVolume/ Signpost/ Special/ timesync/`；
+2. 从 `db/uuidtext` 拷 `uuidtext/`（145 MiB，`dsc/` 子目录设备侧已带，4 个文件，magic `dsch`）；
+3. `unifiedlog_iterator -m log-archive -i <archive> -o out.jsonl`（69 MiB → 2.3 GB，~17 s）。
+
+每条 JSONL 带 `timestamp`（`1970-01-01T00:MM:SS` = 开机时刻）、`boot_uuid`、`message`、`evidence`。
+
+**靴别必须按 `boot_uuid` 分。** boot 210 的 boot_uuid 是 `0BA709F9C3BC444EA4DA48F9E38D87DF`，
+其日志覆盖 uptime **15–346 s**（268,896 行）：322 s 有
+`Successfully spawned backboardd[58] because speculative`，与 `panelbox` 的 `lft=345s` 对得上；
+这一靴**没有** scene-create 杀进程。`0x8badf00d … scene-create watchdog transgression`
+（`com.apple.purplebuddy`、`WallpaperKit.CollectionsPoster`、`chrono.WidgetRenderer-Default`）
+属于 `4F954802…`（12 次，日志止于 211 s）与 `0DBFBFB6…`（6 次，止于 202 s）两靴，
+**不能记在 boot 210/211 头上**。
+
+**已知缺口**：约 2.1M/2.5M 行仍是 `Unknown shared string message`——共享字符串（DSC）没有解出来，
+即便 `uuidtext/dsc/<32hex>` 已按格式摆好、magic 也匹配。要看清 SpringBoard/backboardd 的
+渲染/场景语义，下一支要么修 v0.7.0 的 DSC `uuid_index`/offset 解析，要么在板侧把关键 os_log 行落盘。
+宿主工具与产物：`/tmp/ulog/unifiedlog_iterator-v0.7.0-aarch64-apple-darwin/`、
+`/private/tmp/clover210hq.logarchive`、`/tmp/clover210.jsonl`。

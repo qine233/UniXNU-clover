@@ -40,15 +40,15 @@
 | 存储（APFS 卷挂载） | 通 |
 | 用户态（launchd 起的守护进程集） | 通 |
 | 点亮屏幕（GOP 路径首帧） | 通 |
-| SpringBoard / 合成器 | 未到桌面。boot 199/200（r420/r421）：ENOSPC=0，客户端到死线仍在提交（tx 824@1190s / 736@1091s 仍增长）。boot 200 的 `col=` 是黑底+约 10% 白、`box` 全屏、每拍变化——与内核控制台每 30 s 把三行长日志画进同一块物理帧缓冲吻合；r422 在首次真实拷贝后静音视频控制台（santoni 式），同时加 panelgrid 形状读数 |
+| SpringBoard / 合成器 | 未到桌面。boot 209：迁移 exit 0 后屏首次离开启动标志、全黑，显示客户端 1302 次后停。boot 210：系统 221 进程全在，屏只 8 帧、最后 146 s 全黑，1200 s 死线因 `rtclock_intr` 后检查未执行而没落卡。boot 211（r426 补按 Home 3 次）：`presses` 3→6，presentation 8→31、最后 345 s，客户端是 backboardd（calls=148 fails=19），但每帧仍 `col=ff000000`、`lit=0`、grid 全 0——**合成器提交的就是黑 surface**（r426 读数已落 dev-log）。Data 上的 iOS unified log 已能用 unifiedlog_iterator 离线解（见 memory） |
 | 桌面 | 未到 |
 
 ## 闸门
 
 | 闸门 | 最近一次 | 结果 |
 | --- | --- | --- |
-| `check-clover.py` | r422 | 已停用（用户要求；整跑把 Python 驻留推到十几–三十几 GB） |
-| `verify-clover-payload.py` | r422 | EXIT=0（48 OK / 0 FAIL） |
+| `check-clover.py` | r426 | 已停用（用户要求；整跑把 Python 驻留推到十几–三十几 GB）；r426 新增的探针针脚与 boot arg 已写进脚本 |
+| `verify-clover-payload.py` | r426 | EXIT=0（51 OK / 0 FAIL） |
 | 源码针脚定点核对 | r422 | 11/11 命中 |
 
 ## 已知缺口
