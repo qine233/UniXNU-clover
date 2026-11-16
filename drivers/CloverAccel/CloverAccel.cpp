@@ -18,13 +18,18 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSBoolean.h>
 #include <pexpert/pexpert.h>
+#include <libkern/c++/OSMetaClass.h>
+#include <mach/kmod.h>
 #include <string.h>
 #include <libkern/libkern.h>
 
 extern "C" void proc_selfname(char *, int);
-// scripts/build-clover-accel.py strips __DATA,__mod_init_func and globalizes this symbol: the
-// class registration runs here, once, instead of at libkern init.
-extern "C" void clover_accel_static_init(void) __asm__("__GLOBAL__sub_I_CloverAccel.cpp");
+extern kmod_info_t g_kernel_kmod_info;
+// CloverBlock's shape is not optional here: the OSMetaClass constructor refuses a class whose
+// mod load handle has not been created, even when the superclass is kernel-resident. Boot 226
+// printed "preModLoad() wasn't called for class IOAcceleratorES" and then took a data abort at
+// the class name, which is why the shell never published and the display beat stopped.
+extern void clover_accel_static_init(void) __asm__("__GLOBAL__sub_I_CloverAccel.cpp");
 
 static volatile uint32_t gAccelEntries;
 static volatile uint32_t gAccelInited;
@@ -186,7 +191,18 @@ extern "C" void clover_accel_run(void)
 		return;
 	}
 	if (__atomic_exchange_n(&gAccelInited, 1, __ATOMIC_ACQ_REL) == 0) {
+		void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+		if (!handle) {
+			__atomic_add_fetch(&gAccelFail, 1, __ATOMIC_RELAXED);
+			IOLog("CloverAccel r434: preModLoad refused the class\n");
+			return;
+		}
 		clover_accel_static_init();
+		if (OSMetaClass::postModLoad(handle)) {
+			__atomic_add_fetch(&gAccelFail, 1, __ATOMIC_RELAXED);
+			IOLog("CloverAccel r434: postModLoad refused the class\n");
+			return;
+		}
 	}
 	if (__atomic_load_n(&gAccelPublished, __ATOMIC_ACQUIRE) ||
 	    __atomic_load_n(&gAccelFail, __ATOMIC_ACQUIRE)) {
