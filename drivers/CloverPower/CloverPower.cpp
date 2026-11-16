@@ -143,6 +143,7 @@ extern "C" {
 // these lines on the next block operation anyway. It is called on every exit path so that a later
 // round, running after bring-up, gets a real commit for free.
 uint32_t clover_emmc_flush_cache (void);
+unsigned int clover_emmc_probe_say (const char *text, unsigned int length);
 }
 
 // ------------------------------------------------------------------ the windows
@@ -1031,6 +1032,25 @@ extern "C" void clover_power_run (void)
 
   IOLog ("clover r182: done xfers=%u fail=%u timeout=%u denied=%u polls=%u\n",
          gXactRun, gXactFail, gXactTimeout, gXactDenied, gPolls);
+  // Round435. The mode-3 rail lines are said at ~17 s, and the tee does not reach msgbuf until the
+  // first block operation much later; a 128 KiB buffer has lapped them by then. Push the four values
+  // into the driver's probe ring as well, which survives to the deadline dump.
+  {
+    char rail[128];
+    int n = snprintf (rail, sizeof (rail),
+        "clover r435: touch rails a11 en=%02x uv=%u | b3 en=%02x uv=%u | xfers=%u fail=%u\n",
+        static_cast<unsigned> (clover_power_observation[kRails[0].enableSlot]),
+        static_cast<unsigned> (clover_power_observation[kRails[0].uvSlot]),
+        static_cast<unsigned> (clover_power_observation[kRails[1].enableSlot]),
+        static_cast<unsigned> (clover_power_observation[kRails[1].uvSlot]),
+        gXactRun, gXactFail);
+    if (n > 0) {
+      if (static_cast<unsigned> (n) >= sizeof (rail)) {
+        n = static_cast<int> (sizeof (rail)) - 1;
+      }
+      clover_emmc_probe_say (rail, static_cast<unsigned> (n));
+    }
+  }
   clover_power_observation[14] = (static_cast<uint64_t> (gXactRun) << 16) | gXactFail;
   clover_power_observation[15] = kStepComplete;
   // The tee in CloverSdhci picks these lines out of msgbuf on the next block operation, so this call is

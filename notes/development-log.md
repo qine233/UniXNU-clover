@@ -32215,3 +32215,77 @@ split dispatch、device color conversion、宿主页图像的 shadowed texture�
    写回只需把改动的 1 MiB 块 dd 回 `userdata`；
 2. backboardd 的平台沙箱策略与我们的 pid 1 不同，要在它里面跑还得量一次；
    若同样拒绝，就走独立 helper + IPC stub（sheng 的 `HostMetalCommandServer` 形状）。
+
+### §Round436（Metal 插件装入 OS 卷；宿主全部就绪，最后一棒被 XBL 的 fastboot 卡死挡住）
+
+r435 的读数把题面缩到一行：`clover r434: accel pub=1 fail=0 ent=1 init=1 dis=0 reads=6/7 rdr=mediaserverd|backboardd opens=0 cli=- calls=0 sel=0,0,0`。
+外壳发布了，Metal 的发现也读了 `MetalPluginName`，但没有任何进程打开 `AGXDeviceUserClient` —— 因为 `NativeAdrenoMetal.bundle`
+在根卷上不存在。r436 把插件和 lavapipe 真正放进 OS 卷，并把它们的 cdhash 收进启动 trust cache。
+
+**插件构建（宿主）。** 把 `round433-libvulkan_freedreno.dylib`（lavapipe，56,959,280 B）复制为
+`~/UniXNU/build/mesa-tu-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib`，让
+`scripts/build-adreno-metal-plugin.py --no-replay` 把它当作 Turnip 收进 bundle。宿主没有 `glslc`，
+`build/shims/glslc` 用 `glslangValidator` + `spirv-opt` 顶替（只在本次 PATH 里生效，不改上游脚本）；
+Vulkan 头用 `~/clover-out/mesa-src/include/vulkan` 软链到 `.cache/mesa-work/include`。
+`drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm` 的 `readTask`/`writeTask`/`patchFramebufferBranch`
+只在 `__arm64e__` 分支使用，arm64/iOS17 构建被 `-Werror,-Wunused-function` 判红；把三者一起收进
+`#if defined(__arm64e__)` 后通过。产物 cdhash：bundle exec `84ee487a…`、bundle 内 dylib `ba7fd84d…`、
+adrenoprobed `8ab3638a…`（本轮不用 daemon）。
+
+**trust cache。** 不改 Apple 的两个模块，只在 clover 自有模块上追加：原 2 条
+（`1f524a5e…` air-native、`4f63be63…` launchd）→ 4 条（+`84ee487a…`、+`ba7fd84d…`），排序后重建；
+`make-clover-trust-bundle.py` 重新拼三段 bundle，61480 B，sha256
+`5841ec97efef9655865b80af8d4cea397bf9d7b48ab248cfe1f05e38e28199fc`。`board.toml` 的
+`trust_cache_sha256` 与 `title` 升到 r436，`check-clover.py` 的标题断言两处同步。
+
+**OS 卷安装。** `hdiutil attach -readwrite` 克隆 `round436-os-window.img`（`Sealed: No`），
+`ditto` 把 `NativeAdrenoMetal.bundle`（72 MB，含 exec 18,722,784 B 与 lavapipe 56,959,264 B）放到
+`/System/Library/Extensions/`，`codesign --verify --strict` 通过。OS 窗口新 sha256
+`11fab5511e59c16ca91ee618888b002714f1d1b0f279a7dae4885e00c2440f87`。
+
+**写回 userdata。** 与 `round420-os-window-grow.img` 按 1 MiB 比对：84 块变化（84 MiB，块号 0 起
+0/163/216…5847）。克隆 `round420-userdata-root.img` 为 `round436-userdata-root.img`，把 84 块写到
+`1 MiB + i*1 MiB`，再更新 SHNGROOT：entry 0 的布局是 name[32] / off(+32) / size(+40) / bs(+48,
+512) / kind(+52) / sha256(+56..88)；把 OS 摘要换成新值并重算 `[4064:4096]` 的清单尾。84/84 块读回
+与源一致，清单尾校验通过。镜像 28,378,660,864 B，sha256 `58324182…`。
+
+**payload 构建的两个坑（已修）。** 只跑 `./unixnu payload` 会拿 `out/.../kernel/kernel.macho`
+——那是 prelink 件，AMFI 两刀还是 stock，且不带 `--data-ramdisk/--trust-cache`，于是 verify 报
+`kernel.macho.trustcache MISSING` 与 `AMFI exec hook allows FAIL (r163 stock, r164 stock)`。
+正确链路：把 `round435b-kernel-amfi.macho`（含 `clover r435: touch rails` 与 `tap budget`，是
+CloverPower 修好后的那枚；`round435-kernel-amfi.macho` 里没有 touch rails 行）归一化为
+`round436-kernel-normalized.macho`，再
+`./unixnu payload --kernel <abs> --data-ramdisk build/clover-root/launchd.macho --trust-cache build/clover-trust/trustcache.bundle`。
+重打后 trustcache 61,480 B / sha `5841ec97…`，`trustcache == published bundle OK`，
+`AMFI exec hook allows OK`，verify 48 OK / 0 FAIL；`r436-hid-poke` 在场，标题 ok。
+
+**刷写（被挡住）。** 板子在 TWRP（adb `81ffcaaa`）→ `adb reboot bootloader` → fastboot 可见。
+`fastboot flash userdata round436-userdata-root.img` 立即报
+`fastboot: error: Failed reading from userdata`（主机侧，传输开始前）；改
+`fastboot -S 256M flash …` 与 `-v` 后进程 0 CPU 停了 15 分钟、没有任何输出，杀掉后再看：
+`fastboot devices` 仍能看到设备，但 `getvar product` / `getvar partition-size:userdata` 均超时；
+随后 2048 B 的 `boot-recovery` BCB（`fastboot flash misc`）与 `fastboot reboot` 也都不响应。
+结论：第一次中止的 sparse 下载把 XBL 的 fastboot 命令循环留在了半会话状态，后续命令不再被处理。
+没有任何进度输出，不能假设 userdata 已被写入；需要一次物理复位（长按电源 ~10 s；仍不回来则
+EDL 组合键 + `~/clover-out/edl/edl.py reset`，只 reset 不写分区）。复位后重试。
+
+**下一靴预登记（复位后照此判读）。**
+- **A1**：`clover r434: accel … opens>0 cli=backboardd calls>0 sel=…`。这是本轮唯一主判据。
+- **A2**：`MetalPluginName` 的读次数仍在（rdr 仍为 mediaserverd/backboardd），证明发现链没被插件安装破坏。
+- **A3**：Setup 的 hello 被四次点击后，第二屏不再是纯黑（哪怕是一帧非黑也算）。
+- **A4**：`clover r435: touch rails a11 en=… uv=… | b3 en=…` 行出现（r435b 内核自带）。
+- 若 A1 不成立：先读内核里 AMFI 的 `dlopen/plugin` 拒绝行，确认 `cs_enforcement_disable=1` 是否覆盖
+  用户态 dlopen 的签名检查；再决定是否需要 `AMFI` 侧放行或把插件改成平台签名形状。
+
+**盘上产物。**
+
+| 文件 | 说明 |
+| --- | --- |
+| `~/UniXNU/build/adreno-metal-plugin/NativeAdrenoMetal.bundle` | 插件包，cdhash `84ee487a…`，内含 lavapipe `ba7fd84d…` |
+| `~/UniXNU-clover/build/clover-trust/trustcache.bundle` | 61480 B，sha256 `5841ec97…`（owner 4 条） |
+| `~/clover-out/round436-os-window.img` | 装好插件的 OS 窗口，sha256 `11fab551…` |
+| `~/clover-out/round436-userdata-root.img` | 84 块已写回、清单已更新的 userdata，sha256 `58324182…` |
+| `~/clover-out/round436-kernel-normalized.macho` | r435b AMFI 件归一化（974 枚戳清零） |
+| `~/clover-out/round436-v0.7.149-payload.img` | 本靴 payload，sha256 `2e9ac25f…`，verify 48 OK / 0 FAIL |
+| `~/clover-out/round436-verify-payload.log` | 上面的 verify 原文 |
+| `~/clover-out/round436-os-changed-idx.txt`、`round436-os-changed.json` | 84 块差异读数 |

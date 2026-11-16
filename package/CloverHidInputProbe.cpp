@@ -74,6 +74,7 @@ volatile int clover_hid_results[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 volatile uint32_t clover_hid_published, clover_hid_property_seen, clover_hid_presses, clover_hid_requests;
 volatile uint32_t clover_hid_sink_touch, clover_hid_sink_buttons;
 volatile uint32_t clover_hid_touch_frames;
+static volatile uint32_t gTapBudget;
 }
 
 // The driver asks this before it sends anything, so a device that exists before the panel does
@@ -305,6 +306,24 @@ extern "C" __attribute__((noinline)) void native_hid_live_checkpoint(IOService *
         // IOWorkLoop.cpp:572), so this is synchronous and the counters are readable on the same line
         // as the send; the sleep is between the two frames so the press lasts 50 ms instead of being
         // folded into one report by a reader that catches both seqlock values in one go.
+        // Round435. A boot argument turns the beat into a small tap generator at the panel centre.
+        // It exists because the glass is still unproven (CloverInput's Goodix probe is NACK) and the
+        // first Setup Assistant screen is otherwise a dead end; the tap count is the budget, so this
+        // cannot become a device that keeps inventing fingers after the round is over.
+        if (gTapBudget == 0) {
+            unsigned budget = 0;
+            if (PE_parse_boot_argn("offline-hid-tap", &budget, sizeof(budget)) && budget) {
+                gTapBudget = budget;
+            }
+        }
+        if (gTouchSink != nullptr && lastService != 0 && gTapBudget != 0) {
+            __atomic_sub_fetch(&gTapBudget, 1, __ATOMIC_RELAXED);
+            publishTouchFrame(1);
+            gTouchSink(gTouchContext);
+            IOSleep(50);
+            publishTouchFrame(0);
+            gTouchSink(gTouchContext);
+        }
         if (gTouchSink != nullptr && lastService != 0 && clover_hid_touch_frames == 0) {
             clover_hid_touch_frames = clover_hid_touch_frames + 1;
             publishTouchFrame(1);
@@ -318,6 +337,11 @@ extern "C" __attribute__((noinline)) void native_hid_live_checkpoint(IOService *
                clover_hid_published, clover_hid_property_seen, clover_hid_presses, clover_hid_requests,
                clover_hid_touch_frames, native_touch_hid_reports,
                clover_hid_sink_touch, clover_hid_sink_buttons, native_legacy_transfer_calls);
+        if (gTapBudget != 0 || clover_hid_touch_frames != 0) {
+            printf("clover r435: tap budget=%u frames=%u reports=%u\n",
+                   (unsigned)gTapBudget, (unsigned)clover_hid_touch_frames,
+                   (unsigned)native_touch_hid_reports);
+        }
         // Round260, and it is the whole point of this line: the touch bus instrument has its answer
         // sixteen minutes into the boot and the card ring has forgotten it by the time anyone reads
         // the card, so the answer is re-published from the state the driver already keeps. Every

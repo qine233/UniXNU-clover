@@ -349,7 +349,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r434: the accelerator shell Metal's discovery looks for is published by the kernel: drivers/CloverAccel defines IOAcceleratorES over IOService, names MetalPluginName=NativeAdrenoMetal and hands user-client opens to a stub called AGXDeviceUserClient. IOGPUFamily leaves the prelink roots so the name is ours; the payload boots the real userland again (no offline-air-init)."
+title = "clover r436: the Metal plugin now sits in the OS volume. r435 left opens=0 because IOAcceleratorES named a bundle that was nowhere on the root; this payload carries the same kernel and boot args, and its trust cache gains the plugin and lavapipe cdhashes (owner module 4). The reading is opens>0 with cli=backboardd and calls>0."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -1182,7 +1182,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # launchd was a MAC label-update refusal on a root whose /sbin/launchd had no cdhash in the
 # 56-byte one-module bundle; scripts/make-clover-trust-bundle.py joins them and pins the
 # originals by the sha256 of their unwrapped IM4P payloads.
-trust_cache_sha256 = ["d1788040b7a4ef4565e64cebaeba7f218a85088698efc8a60e6e9f3e862f7de2"]
+trust_cache_sha256 = ["5841ec97efef9655865b80af8d4cea397bf9d7b48ab248cfe1f05e38e28199fc"]
 kernel_args = [
   "serial=3",
   "debug=0x14e",
@@ -2458,6 +2458,9 @@ kernel_args = [
   # last frame and then went to sleep. Three presses starting at this uptime say which it is: a
   # sleeping device wakes and presents its lock screen; a stalled renderer does not.
   "offline-hid-poke-uptime=300",
+  # Round435: four centre taps at the HID beat cadence, so the Setup Assistant "hello" screen can be
+  # advanced without glass (Goodix is still NACK). The counter is the budget; it stops by itself.
+  "offline-hid-tap=4",
   # Round434: offline-air-init=1 is deliberately absent. The accelerator shell exists for
   # backboardd's discovery walk, and the air-init payload exits pid 1 before launchd ever runs.
   # The r433 gate program is still built (scripts/make-clover-jit-probe.py) for the next time a
@@ -2633,7 +2636,7 @@ kernel_args = [
   # readings whether the panel's rails were ever on. It never panics. The lines reach the card on the
   # tee's next block pass, as every instrument's do -- a boot that hangs before then still gets them out
   # through the watchdog's panic drain.
-  "clover-power=1",
+  "clover-power=3",
   # Round183 puts drivers/CloverDsp on the SMEM heap, and mode 3 is the one worth booting for: it is
   # mode 1 (the heap) plus mode 2 (who is on the other side of it) plus the two image scans, and the
   # question 排期 5 was blocked on -- is the ADSP already up? -- only has an answer when all three are

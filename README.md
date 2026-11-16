@@ -27,7 +27,7 @@
 | `NativeMobileDisplay` + 包内探针 | GOP 显示与交换路径 | 已实现（r414 前状态行尾列被 tee 切掉，队列判读待重取） |
 | `CloverGpu` | Adreno 512：微码、PM4/ring/ME_INIT、CP 启动、SMMU 识别；LDO 电压可写、CTRL/PDN 不可写（轨归 CPR/固件侧）。r415 起主线靴以 `clover-gpu=0` 运行：该探针在 boot 186/187 于自己的 GDSC/LDO 行之后挂住（`clover-gpu-ldo` 那道门只写在注释里） | 进行中（主线暂停用） |
 | `CloverDsp` | ADSP 探针 | 仅探针 |
-| `CloverAccel` | 发布 `IOAcceleratorES`（`MetalPluginName=NativeAdrenoMetal`，用户客户端 `AGXDeviceUserClient` 存根），供 Metal 发现插件；IOGPUFamily 退出预链 | 已实现（r434，待读数） |
+| `CloverAccel` | 发布 `IOAcceleratorES`（`MetalPluginName=NativeAdrenoMetal`，用户客户端 `AGXDeviceUserClient` 存根），供 Metal 发现插件；IOGPUFamily 退出预链 | 已实现（r434 发布；r436 把 `NativeAdrenoMetal.bundle` 装进 OS 卷，待量 `opens>0`） |
 | `NativeHidInput` / `NativeKeyStoreEvents` | HID 与按键、钥匙串事件 | 已实现 |
 | 网络（Wi-Fi/BT） | — | 未开始 |
 | 音频（ADSP/LPASS/codec） | — | 未开始 |
@@ -43,6 +43,7 @@
 | 点亮屏幕（GOP 路径首帧） | 通 |
 | SpringBoard / 合成器 | 未到桌面。boot 211：补按 Home 生效（presses 3→6），presentation 8→31 到 345 s，客户端 backboardd（calls=148 fails=19），但每帧仍全黑。**黑屏定因**：`AegirPoster` 崩溃栈落在 `CLKUIMetalQuadView → NUNICalliopeResourceManager`，断言 `pipelineState != nil` 失败（SIGABRT）——Metal render pipeline 创建返回 nil，锁屏时钟/星空渲染器自杀并被反复重启。路线改为 Metal 前端 → metal2vulkan → CPU 软件 Vulkan；r429 先测它能否成立的前提：设备上 RWX / RW→mprotect(RX) 映射与执行（见下） |
 | JIT 前提（V2） | **通**（r430，boot 215）：RWX mmap 成功但执行 SIGBUS（W^X strip）；RW→`mprotect(RX)`→执行并返回，exit 0。宿主是 air-init 的 pid 1（ad-hoc 签名、无 entitlement；backboardd 的平台进程策略待对照） |
+| Metal 插件装载（r436） | 宿主侧完成：`NativeAdrenoMetal.bundle`（含 lavapipe，4 KiB ad-hoc）装进 OS 卷 `/System/Library/Extensions`，owner trust 4 条；84 个 1 MiB 块写回 userdata 镜像并更新 SHNGROOT 摘要。待板子复位后刷入量 `accel opens>0 / cli= / calls=` |
 | V1 宿主自测 | **通（compute/render）**（r431）：metal2vulkan 的宿主桥 + Chrome 的 arm64 SwiftShader；`compute_bad 0`、`render_bad 0`；no-copy **import** 停在没有 `VK_EXT_external_memory_host`（V3 题面） |
 | V3 宿主导入 | **通**（r432）：Mesa lavapipe（27.0.0-devel，LLVM 23.1.4）+ 40 行 `vkGetInstanceProcAddr` shim；`code 0 stage 0 compute_bad 0 render_bad 0 import_bad 0`。缓冲导入无拷贝；宿主页上的图像由驱动影子拷贝（`degrade-shadowed-texture`） |
 | V3 设备（pid 1） | **通**（r433）：LLVM 23.1.4 与 lavapipe 交叉编到 iOS（arm64/17.0，LLVM 静态）；把 lavapipe 静态链进 metal2vulkan 自测、把它自己的路径当 loader，`code 0 stage 0 compute_bad 0 render_bad 0 import_bad 0`，`exit 0`。两个坑：沙箱拒绝 mmap Data 卷里的 dylib（只能加载已映射映像/系统卷），`os_jit_allowed()` 只认 MAP_JIT（改成 RW→mprotect RX 后通过） |
