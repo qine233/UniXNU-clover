@@ -349,7 +349,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r436: the Metal plugin now sits in the OS volume. r435 left opens=0 because IOAcceleratorES named a bundle that was nowhere on the root; this payload carries the same kernel and boot args, and its trust cache gains the plugin and lavapipe cdhashes (owner module 4). The reading is opens>0 with cli=backboardd and calls>0."
+title = "clover r436b: the same r436 payload with the synthetic taps removed. The user asked for the control: if the screen leaves hello without the four HID taps, the advance was not ours; if it stays, the earlier second screen came from the taps. Only kernel_args and the title move; userdata, plugin and trust cache are unchanged."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -2460,7 +2460,6 @@ kernel_args = [
   "offline-hid-poke-uptime=300",
   # Round435: four centre taps at the HID beat cadence, so the Setup Assistant "hello" screen can be
   # advanced without glass (Goodix is still NACK). The counter is the budget; it stops by itself.
-  "offline-hid-tap=4",
   # Round434: offline-air-init=1 is deliberately absent. The accelerator shell exists for
   # backboardd's discovery walk, and the air-init payload exits pid 1 before launchd ever runs.
   # The r433 gate program is still built (scripts/make-clover-jit-probe.py) for the next time a
