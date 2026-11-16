@@ -680,3 +680,36 @@ UEFI 侧可以用 PMIC 路径核对 S3/S5 的状态；GPU 的 `vdd_gfx` 仍走 C
 `Binaries/clover/QcomPkg/Drivers/SPMIDxe/SPMIDxe.inf`；我把它再加一遍时 GenFv 直接报
 「the 40th file and 79th file have the same file GUID 2a7b4bef-…」。所以固件**一直有 SPMI/PMIC 能力**，
 上一段的「没有 SPMI 客户端」是我读漏了 `.inc`，已改回。真正的缺口仍然只是 **vdd_gfx 的 CPR4 所有权**。
+
+## 6. r434 的设备壳：发现链已量清，两条实现路
+
+r433 证明 lavapipe 在 pid 1 里能跑完 metal2vulkan 自测；剩下的第一道门是**让 backboardd 的
+Metal 发现并加载 metal2vulkan 插件**。宿主取证如下（都在 `round430-kernel-normalized.macho`
+与 XNU 源码里核对）：
+
+1. **预链集合固定 38 枚 kext**，`com.apple.iokit.IOGPUFamily` 在其中；
+   `AGXAccelerator` / `AGXDeviceUserClient` / `IOAcceleratorES` 的类名都在它镜像里。
+   没有独立的 AGX kext。⇒ `IOAcceleratorES` 的 metaclass 在 boot 时存在，
+   **壳必须是它的子类**；在内核里自带同名类会和 IOGPUFamily 撞。
+2. `IOMobileFramebuffer` 与 `IOSurface` 都不依赖 IOGPUFamily；现有显示路径不受这条线影响。
+3. sheng 的形状（可直接照）：`AGXAccelerator : IOAcceleratorES`（`OriginalAcceleratorABI.h`
+   只借祖先布局）、`newUserClient` 开一个**故意取名 `AGXDeviceUserClient`** 的连接、
+   `MetalPluginName` 指向 `/System/Library/Extensions/<name>.bundle`。
+4. **kext 加载闸门**：`OSKext::sLoadEnabled` 默认 true（只在关机置 false）；真正的门是
+   `mac_kext_check_load`（AMFI）。本板已有 `cs_enforcement_disable=1`（XNU 把它翻成
+   `CS_CONFIG_ALLOW_ANY_SIGNATURE|ENFORCEMENT_DISABLED|GET_OUT_OF_MY_WAY`），
+   AMFI 的 kext 检查是否读同一组位**未验**。
+5. **运行时加载接口**：`host_priv.defs` 的 `kext_request`（routine 361），请求是
+   XML plist：`Kext Request Predicate`+参数；iOS 没有 `kextload` 工具，要自己拼 mach 消息，
+   且要先拿到 `host_priv` 端口。
+
+两条实现路：
+
+| 路 | 做法 | 风险 | 判据 |
+| --- | --- | --- | --- |
+| A（推荐） | 给 `kits/NativePrelink/emit_prelink.py` 加“自备 kext 输入”，把壳和 IOGPUFamily 一起并进 kernelcache，boot 时随预链 kext start | 要动 prelink 工具与 kernel 构建；段/绑定/地址要按它的模型走 | kernel 日志出现壳的 `start` 行；registry 里有 `IOAcceleratorES` 子类服务 |
+| B（先验） | 壳做成独立 kext，air-init 用 `host_kext_request` 从 Data 卷加载 | AMFI 可能拒；host_priv 权限未知 | `kext_request` 的 `op_result`；加载失败的错误码就是读数 |
+
+顺序：先 B 拿到“AMFI 是否放行 ad-hoc kext、host_kext_request 是否可达”两枚读数；
+若被拒再走 A。插件 bundle 与 lavapipe dylib 必须进 **OS 卷**（r433 已证 Data 卷 mmap 被沙箱拒），
+OS 卷在 `round420-userdata-root.img` 的 APFS 容器里，宿主挂起编辑后只把改动块 dd 回 userdata。
