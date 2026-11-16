@@ -1182,7 +1182,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # launchd was a MAC label-update refusal on a root whose /sbin/launchd had no cdhash in the
 # 56-byte one-module bundle; scripts/make-clover-trust-bundle.py joins them and pins the
 # originals by the sha256 of their unwrapped IM4P payloads.
-trust_cache_sha256 = ["5841ec97efef9655865b80af8d4cea397bf9d7b48ab248cfe1f05e38e28199fc"]
+trust_cache_sha256 = ["de191b865f6cd5322df1b43b00d2c0ba3cc6b1943de1c89b1bcf825ec0533d30"]
 kernel_args = [
   "serial=3",
   "debug=0x14e",

@@ -32430,3 +32430,49 @@ normalized `b8217ea5…`（974 戳）；payload `round440-v0.7.154-payload.img` 
 - **Q-D**：屏仍是 `lit=82` 启动标志形状（touch 之前预期如此）；若离开，记下新形状；
 - **Q-E**：死线 1200 s 落点（EDL memory-dump 属已知中转，端口复位 + `CLOVER_SAHARA_RESET=1`
   `edl.py reset` 回 TWRP；注意变量名是 SAHARA 不是 SARAHA）。
+
+### §Round441（v0.7.155）：把带 W^X JIT 回退补丁的 Vulkan 库换进 bundle
+
+**boot 236 的读数把 r440 的三个问题一次回答完：**
+
+```
+clover r440: acceltxt stc=3 sth=6800,6801,68f2,0000 bbtxt=PUB no device: device: OutOfMemory(Host)
+clover r439: accelmk mks=117 lmk=7029 mkn=iconservicesagen bbc=4 bbh=706f,7073,7074,7029
+clover r434: accel pub=1 fail=0 reads=4 rdr=backboardd opens=117 by=backboardd:45,iconservicesagen:72 calls=0
+```
+
+Q-A/Q-B 成立：publish 分支走过 `0x6800`（进入）、`0x6801`（找到库），在 `0x68f2`（无设备）停下；
+Q-C 给出原因：`PUB no device: device: OutOfMemory(Host)` —— metal2vulkan 的
+`Device::system_default_with` 把 lavapipe 的 `VK_ERROR_OUT_OF_HOST_MEMORY` 原样带出。
+Q-D：`panelbox` 仍是 `lit=82` 启动标志形状，`lft` 到 658 s。Q-E：死线落回 TWRP（boot 236 没有 EDR 中转）。
+
+**宿主取证：装进 OS 卷的库是「没有 JIT 回退补丁」的那一份。**
+bundle 里 `libvulkan_freedreno.dylib` sha256 `8155bab3…`；r433e 在板上自测成功的那份是
+`ba9fffda…`（`os_misc.c` 的 `os_probe_jit_allowed` 先试 `MAP_JIT` RWX，失败再试
+RW→`mprotect(RX)`，见 §Round433）。r433 的日志正好是同一句话：`llvmpipe: JIT is not permitted`
+→ `VK_ERROR_OUT_OF_HOST_MEMORY`。两者对得上：不是内存不够，是库没有走 W^X 分支。
+
+**r441 的做法。**
+1. 复制 bundle，换成 `round433e-libvulkan_freedreno.dylib`；dylib 与 bundle 都用
+   `--pagesize 4096` 重新 ad-hoc 签名（`codesign --verify --strict` 过）。新 cdhash：
+   exec `25afaf73…`、dylib `3df2008e…`。
+2. 把两条 cdhash 追加进 owner trust 模块（先按 loader 的要求把条目升序排好；不排序
+   `make-clover-trust-bundle.py` 会以 "would be refused by the boot loader" 拒收），
+   重建 bundle：61,528 B sha256 `de191b86…`（owner 6 条：air-native、launchd、旧插件两条、
+   新 exec、新 dylib）。`board.toml` 的 `trust_cache_sha256` 同步。
+3. payload 用同一枚 r440 normalized 内核重打：`round441-v0.7.155-payload.img` `58fa9f61…`。
+4. OS 窗口：`hdiutil attach -readwrite` 会被 macOS 按 System 角色挂成只读；改用
+   `diskutil unmount` 后 `diskutil mount -mountOptions rw` 即得到可写挂载（不需要 sudo）。
+   换掉 `/System/Library/Extensions/NativeAdrenoMetal.bundle`，`codesign --verify --strict` 过；
+   `.publish`/`.clients` 标记保留。`round441-os-window.img` sha256 `11991f06…`。
+5. 与 `round438-os-window.img` 按 1 MiB 比对：86 块变化；写入 `round438-userdata-root.img`
+   的克隆（off=1 MiB + i MiB），并把 SHNGROOT entry 0 的 OS 摘要换成 `11991f06…`、重算清单尾
+   `5063addd…`。`round441-userdata-root.img` sha256 `ba1fb8b0…`（28,378,660,864 B）。
+
+**预登记（boot 237）。**
+- **R-A**：`acceltxt` 的 `sth` 不再以 `68f2` 收尾；若出现 `6810+i`/`6802`/`6803` ⇒ JIT 假设成立；
+  若仍是 `68f2` 且 `bbtxt` 仍是 `OutOfMemory(Host)` ⇒ 不是 JIT 探测，转查 `lvp_physical_device_init`
+  的 screen 创建（下一步在插件里把 `nmb_last_warning` 也流出来）；
+- **R-B**：`bbtxt` 变为其他内容（pipeline/telemetry 行）也视为设备已造出；
+- **R-C**：`panelbox` 是否离开 `lit=82`（有 touch 之前不强求）；
+- **R-D**：死线 1200 s 落点；TWRP 或 EDL 中转都按既有手法回收。
