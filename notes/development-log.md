@@ -32476,3 +32476,27 @@ RW→`mprotect(RX)`，见 §Round433）。r433 的日志正好是同一句话：
 - **R-B**：`bbtxt` 变为其他内容（pipeline/telemetry 行）也视为设备已造出；
 - **R-C**：`panelbox` 是否离开 `lit=82`（有 touch 之前不强求）；
 - **R-D**：死线 1200 s 落点；TWRP 或 EDL 中转都按既有手法回收。
+
+### §Round441 读数（boot 237）——**JIT 假设成立，backboardd 第一次造出 Metal 设备**
+
+```
+clover r440: acceltxt stc=4 sth=6801,6814,6802,6803 bbtxt=P0 ee00002e2
+clover r434: accel pub=1 fail=0 reads=4 rdr=backboardd opens=209 cli=backboardd calls=0 by=backboardd:42,iconservicesagen:167
+clover r344: dispstate ... client=pid86 ... tx=32@280s ... scr=0/4100/0 ...
+clover r416: panelbox ... lit=81/4100 a0=0 a255=4100 box=314x823..970x1067 ... → lit=0/4100 a0=4100 box=-
+```
+
+**R-A 成立。** `sth=6801,6814,6802,6803`：找到库 → `0x6814`（第 5 个缓存目录即开即用）→
+`0x6802` 设备造出 → `0x6803` 交回发现链。`bbtxt` 不再是 "PUB no device"（是一条以 `P0` 开头的
+状态/telemetry 行，被 63 字符窗口截断）。r441 的因果判断被读数证实：此前是**库没有 W^X JIT 回退**，
+不是内存不足。
+
+**屏。** 169 s 时 `tx=28`、`scr=4100/4100`（全部 alpha 255），内容矩形 `305x838..970x1108`；
+213 s `scr=0/4100`（整面 alpha 0），280 s 最后一帧 `tx=32` 后不再 present。`panelbox` 在窗口内
+先见到 `lit=81 box=314x823..970x1067`，随后 `lit=0 a0=4100 box=-`。客户端是 **pid86**（不是
+pid58），说明这一靴里 backboardd 以新 pid 起来（或重启过）；窗口起点 928 s，之前的退出行已被环覆盖。
+
+**判读。** Metal 前端 → metal2vulkan → lavapipe 的**设备创建**在 backboardd 里成立；合成器确实出了
+带 alpha 255 的帧，随后 surface 变全透明并停止。下一支不再查“设备能不能造”，而是把 UI 从 hello
+往前推：合成点击已经有实现（`offline-hid-tap=<预算>`，120 s 一拍、面板中心、按 50 ms 抬起），
+r442 给它加坐标参数并把频率改快，以便点到画面里的按钮。
