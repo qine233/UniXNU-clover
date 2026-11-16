@@ -31998,3 +31998,49 @@ backboardd 上量过。若 V1 之后要在 backboardd 内跑，还要补一次�
 
 **下一步。** V1 宿主自测：在 macOS 上把 SwiftShader/lavapipe 塞进 metal2vulkan 的
 `options.loader`，先跑 compute/render/import；V1 通过再决定 helper 进程的 IPC 形状。
+
+### §Round431（V1 宿主自测）：SwiftShader 上 compute/render 都过，no-copy import 停在没有 host-memory 扩展
+
+**工具链（宿主侧，本次新装）。**
+
+- Rust 1.98.0（`rustup`，`~/.cargo/bin`）；`llvm-as` 用 Homebrew LLVM 23。
+- metal2vulkan 源按 pin `624bab3918de5b978e1101517abca2b4fa426565` 检出到
+  `~/UniXNU/.cache/gpu-reference/metal2vulkan`。直连 GitHub 只有 ~2 MB/min、源仓 316 MB，
+  改用 `gh-proxy` 后一次拉完（1.7 GiB 检出，30 枚 bridge 记录补丁由构建脚本逐枚核对）。
+- `build-adreno-metal-bridge.py --target host`（`CARGO_BUILD_JOBS=4`）通过：
+  `build/adreno-metal-bridge/host/libadreno_metal_bridge.a` **222,742,792 B**，
+  sha256 `ab355a01…`；日志 `round431-bridge-host-build.log`。
+- 软件 Vulkan：Chrome 157 自带 `libvk_swiftshader.dylib`（universal，arm64 版导出
+  `vkGetInstanceProcAddr`；`vkCreateInstance`/`vkEnumerateInstanceVersion` 可解析）。
+  归档在 `~/clover-out/swiftshader/`。
+- 播放器：`bridge/bridge_smoke.cpp` 链接该静态库，`./bridge_smoke <swiftshader> <cache>`
+  直接调 `nmb_selftest`；产物 `round431-bridge_smoke`（sha256 `c4cd6ef9…`）。
+
+**读数（`round431-selftest-swiftshader.log`）。**
+
+```
+mark 6501                          # device open
+mark 6502                          # library from AIR
+mark 6503                          # compute
+mark 6504                          # render
+mark 6505                          # import
+code 6505 stage 6505 compute_bad 0 render_bad 0 import_bad 0 ...
+msg 'no-copy buffer: Unsupported(... feature: HostMemory ... Extension(ExtExte…'
+```
+
+- 设备名 `SwiftShader Device (LLVM 10.0.0)`；compute 的 1000 个线程结果
+  **`compute_bad 0`**（每个值都等于 `3*i`），render 的四边形像素 **`render_bad 0`**。
+  也就是说 Metal 前端 → metal2vulkan → 软件 Vulkan 的**计算与渲染路径在 CPU 上是真跑的、
+  结果正确**，不是“建了对象没提交”。
+- 唯一失败是 **import**：它要求无拷贝缓冲的 `HostMemory` 特性，SwiftShader 没有宣告
+  `VK_EXT_external_memory_host`（dylib 里只有字符串，没有该扩展的可导入内存类型/特性）。
+  ⇒ 这是 **V3 的题面**，不是 JIT/映射问题：r430 已证明 W^X 写时切换在设备上可用。
+- 运行时自报的降级（都可预期）：float tininess after rounding、无
+  `VK_KHR_pipeline_binary`（驱动侧 pipeline cache 仍保留）、device denormals、
+  fast-math rewrites、native NaN encoding、split dispatch、device color conversion。
+  它们不改变 compute/render 的 `_bad 0`。
+
+**判读。** V1 的“金属前端能在 CPU Vulkan 上跑通”成立；no-copy import（IOSurface 路径）
+需要 V3：要么找到/构建宣告 `VK_EXT_external_memory_host` 的软件 Vulkan（lavapipe 待验），
+要么在我们自己的软件 Vulkan 里用“导入+按需拷贝”语义补上，要么把 Vulkan 放进独立 helper
+并用共享内存传画布。V1 不再阻塞 V2；桌面渲染的真正门槛已收敛到 V3 的导入语义。

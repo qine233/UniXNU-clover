@@ -41,7 +41,7 @@
 
 ## 里程碑
 
-1. **V1 宿主自测**：metal2vulkan runtime + 软件 Vulkan，在 macOS 上渲出 compute/render/import 三步 OK。
+1. **V1 宿主自测（r431：compute/render 通，import 待 V3）**：metal2vulkan 的宿主桥（`build-adreno-metal-bridge.py --target host`）+ Chrome 157 的 arm64 SwiftShader，在 macOS 上 `compute_bad 0`、`render_bad 0`；无拷贝 import 需要 `VK_EXT_external_memory_host`，SwiftShader 不提供 ⇒ 归入 V3。
 2. **V2 设备 JIT 门**：一个最小 kext 侧/用户态探针，确认受控进程能有可执行映射；记录 errno。
    **r430 通过（boot 213–215）**：宿主是 `offline-air-init` 从 Data 卷 exec 的
    `/private/var/tmp/air-native`（`scripts/clover-jit-probe.S`，ad-hoc 签名、无 entitlement）。

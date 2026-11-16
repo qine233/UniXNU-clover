@@ -42,7 +42,8 @@
 | 点亮屏幕（GOP 路径首帧） | 通 |
 | SpringBoard / 合成器 | 未到桌面。boot 211：补按 Home 生效（presses 3→6），presentation 8→31 到 345 s，客户端 backboardd（calls=148 fails=19），但每帧仍全黑。**黑屏定因**：`AegirPoster` 崩溃栈落在 `CLKUIMetalQuadView → NUNICalliopeResourceManager`，断言 `pipelineState != nil` 失败（SIGABRT）——Metal render pipeline 创建返回 nil，锁屏时钟/星空渲染器自杀并被反复重启。路线改为 Metal 前端 → metal2vulkan → CPU 软件 Vulkan；r429 先测它能否成立的前提：设备上 RWX / RW→mprotect(RX) 映射与执行（见下） |
 | JIT 前提（V2） | **通**（r430，boot 215）：RWX mmap 成功但执行 SIGBUS（W^X strip）；RW→`mprotect(RX)`→执行并返回，exit 0。宿主是 air-init 的 pid 1（ad-hoc 签名、无 entitlement；backboardd 的平台进程策略待对照） |
-| 桌面 | 未到（卡在 Metal pipeline 创建）。V2 已过：软件 Vulkan 可用 W^X 写时切换；下一步 V1 宿主自测 |
+| V1 宿主自测 | **通（compute/render）**（r431）：metal2vulkan 的宿主桥 + Chrome 的 arm64 SwiftShader；`compute_bad 0`、`render_bad 0`；no-copy **import** 停在没有 `VK_EXT_external_memory_host`（V3 题面） |
+| 桌面 | 未到（卡在 Metal pipeline 创建）。V2 已过；V1 的 frontend 计算/渲染已跑通。下一步 V3：导入语义 |
 
 ## 闸门
 
