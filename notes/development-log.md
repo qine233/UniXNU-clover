@@ -31809,7 +31809,8 @@ tracev3（corrupt/incomplete）。改用 Mandiant `macos-UnifiedLogs` v0.7.0 的
 
 ### 黑屏的直接原因（宿主取证）：Metal pipeline 创建返回 nil，锁屏渲染器 assert 自杀
 
-Data 的 `mobile/Library/Logs/CrashReporter/AegirPoster-*.ips`（bug_type 309，6 份，uptime ~1020 s）
+Data 上留存的 `mobile/Library/Logs/CrashReporter/AegirPoster-*.ips`（bug_type 309，6 份，uptime ~1020 s；
+这份报告属于哪一靴未再细分——它给出的是渲染器的失败形状，不依赖靴号）
 给出完整栈，faulting thread 是 `com.apple.main-thread`：
 
 ```
