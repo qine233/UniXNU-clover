@@ -54,11 +54,16 @@
    **RW → `mprotect(PROT_READ|EXEC)` → 调用正常返回**，进程 exit 0。⇒ JIT 用 W^X 写时切换即可，
    不必 MAP_JIT。待补：backboardd 这类平台进程的同一组读数（或按计划走独立 helper + IPC stub）。
 3. **V3 导入门**：软件 Vulkan 的 host-memory 导入接上 IOSurface 语义，采样非黑。
-   宿主半边 r432 已过（缓冲导入无拷贝）。剩下的半边是设备：宿主构建的
-   `libvulkan_lvp.dylib` 依赖 macOS 的 `libLLVM.23.1.dylib`，必须用 iPhoneOS 17 SDK
-   交叉编 Mesa/LLVM（或把 LLVM 静态进 dylib），再按 sheng 的 bundle 形状改名、签名、进卷。
+   宿主半边 r432 已过（缓冲导入无拷贝）。**设备半边 r433 过**：LLVM 23.1.4 与 lavapipe
+   交叉编到 iOS，把 lavapipe 静态链进 metal2vulkan 自测、以自身路径当 loader，板上得
+   `code 0 stage 0 compute_bad 0 render_bad 0 import_bad 0`、`exit 0`。两个设备侧前提：
+   `os_jit_allowed()` 要接受 W^X（RW→mprotect RX，LLVM 的 SectionMemoryManager 就用它）；
+   沙箱只放行已加载映像与系统卷的 mmap ⇒ 插件/dylib 必须进 **OS 卷**，Data 卷不行。
 4. **装配**：按 sheng 的插件 bundle 形状打包 `libvulkan_freedreno.dylib`（换成软件实现），
-   ad-hoc 签名 4 KiB 页，进 clover 的 OS 卷（root 认证已按 r138 跳过）。
+   ad-hoc 签名 4 KiB 页，放进 clover 的 **OS 卷** `/usr/lib` 或插件 bundle（沙箱要求）；
+   OS 卷在 `round420-userdata-root.img` 的 APFS 容器里，宿主挂起编辑后只把改动的 1 MiB
+   块 dd 回 `userdata`。backboardd 的平台沙箱还要单独量；若同样拦 mmap，就走独立
+   helper + IPC stub。
 5. **上机判据**：`AegirPoster` 不再 SIGABRT（无新 `AegirPoster-*.ips`）；`panelbox` 出现非黑
    `col=`/`lit>0`；presentation 数继续增长。
 

@@ -44,15 +44,16 @@
 | JIT 前提（V2） | **通**（r430，boot 215）：RWX mmap 成功但执行 SIGBUS（W^X strip）；RW→`mprotect(RX)`→执行并返回，exit 0。宿主是 air-init 的 pid 1（ad-hoc 签名、无 entitlement；backboardd 的平台进程策略待对照） |
 | V1 宿主自测 | **通（compute/render）**（r431）：metal2vulkan 的宿主桥 + Chrome 的 arm64 SwiftShader；`compute_bad 0`、`render_bad 0`；no-copy **import** 停在没有 `VK_EXT_external_memory_host`（V3 题面） |
 | V3 宿主导入 | **通**（r432）：Mesa lavapipe（27.0.0-devel，LLVM 23.1.4）+ 40 行 `vkGetInstanceProcAddr` shim；`code 0 stage 0 compute_bad 0 render_bad 0 import_bad 0`。缓冲导入无拷贝；宿主页上的图像由驱动影子拷贝（`degrade-shadowed-texture`） |
-| 桌面 | 未到（卡在 Metal pipeline 创建）。V2、V1、V3 宿主门都已过；下一手是把 lavapipe 交叉编到 iOS（LLVM 依赖）并打包 `libvulkan_freedreno.dylib` 进 OS 卷，上机看 `AegirPoster` 是否还 SIGABRT |
+| V3 设备（pid 1） | **通**（r433）：LLVM 23.1.4 与 lavapipe 交叉编到 iOS（arm64/17.0，LLVM 静态）；把 lavapipe 静态链进 metal2vulkan 自测、把它自己的路径当 loader，`code 0 stage 0 compute_bad 0 render_bad 0 import_bad 0`，`exit 0`。两个坑：沙箱拒绝 mmap Data 卷里的 dylib（只能加载已映射映像/系统卷），`os_jit_allowed()` 只认 MAP_JIT（改成 RW→mprotect RX 后通过） |
+| 桌面 | 未到（卡在 Metal pipeline 创建）。V2、V1、V3（宿主+设备 pid 1）都已过；下一手：把 `libvulkan_freedreno.dylib`/插件放进 **OS 卷** `/usr/lib`（沙箱只放行系统卷），再量 backboardd 的平台沙箱；不行就走独立 helper + IPC |
 
 ## 闸门
 
 | 闸门 | 最近一次 | 结果 |
 | --- | --- | --- |
-| `check-clover.py` | r430 | EXIT=0（ADT 14,384 B、8 cores）。整跑仍按用户要求不常开；本轮为 air-init 键/探针/trust 改动定点跑 |
-| `verify-clover-payload.py` | r430 | EXIT=0（0 FAIL；`air-init ok`，scratch-data == signed root，trustcache == published bundle） |
-| 源码针脚定点核对 | r430 | 探针里 6 枚针脚全中；board 的 `offline-air-init=1` 断言在场 |
+| `check-clover.py` | r433 | 未整跑（按用户要求）；标题与 trust pin 用定点 grep 核过 |
+| `verify-clover-payload.py` | r433 | EXIT=0（0 FAIL；`air-init ok`，scratch-data == signed root，trustcache == owner+static+system bundle） |
+| 源码针脚定点核对 | r433 | 板上 `v3.log` 6501–650f 全到、`code 0 stage 0 … import_bad 0`；`r433 stat/dlopen` 行给出沙箱与 JIT 判据 |
 
 ## 已知缺口
 

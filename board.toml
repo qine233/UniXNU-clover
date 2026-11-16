@@ -346,7 +346,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r430: r429 measured nothing: since r137 the bootstrapper is the OS volume's own launchd, not the static init, so boot 212 was an ordinary system boot (1216 s, deadline fired). The JIT gate moves to the kernel's offline-air-init hook, which execs /private/var/tmp/air-native as pid 1. That program tries an RWX mmap, RW then mprotect(RX), and RWX with MAP_JIT, and exits with an eight-bit status: 0x00 both shapes work; 0x3f only MAP_JIT; 0x40|e, 0x80|e and 0xc0|e name the refusing step and errno. A refusal here closes the whole \"JIT family\" before any host build."
+title = "clover r433: software Vulkan reaches the board: Mesa lavapipe (27.0.0-devel, LLVM 23.1.4 statically linked) is cross-built for arm64-apple-ios17.0 and signed with 4 KiB pages (cdhash d611c65b); metal2vulkan's own host selftest is cross-built as the offline air-init program (cdhash ae89adb0), opens that dylib and runs compute/render/import, writing /private/var/tmp/v3.log. Both cdhashes join the owner trust module."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -1179,7 +1179,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # launchd was a MAC label-update refusal on a root whose /sbin/launchd had no cdhash in the
 # 56-byte one-module bundle; scripts/make-clover-trust-bundle.py joins them and pins the
 # originals by the sha256 of their unwrapped IM4P payloads.
-trust_cache_sha256 = ["8497a1a3c081e61e06f27b9a2bd00b79772aee0d26431989b55f690cc0417581"]
+trust_cache_sha256 = ["d1788040b7a4ef4565e64cebaeba7f218a85088698efc8a60e6e9f3e862f7de2"]
 kernel_args = [
   "serial=3",
   "debug=0x14e",

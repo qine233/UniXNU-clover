@@ -32125,3 +32125,93 @@ macOS 的 `libLLVM.23.1.dylib`（百 MB 级、macOS libSystem/libc++ ABI）。�
    ad-hoc 签名 4 KiB 页，放进 clover 的 OS 卷；
 3. 上机判据：无新 `AegirPoster-*.ips`；`panelbox` 出现非黑 `col=`/`lit>0`；
    presentation 数继续增长。
+
+### §Round433（V3 设备门）：lavapipe 在板上跑通 metal2vulkan 自测，compute/render/import 全部 `_bad 0`
+
+**题面。** r432 在宿主上证明了 lavapipe 的导入语义。设备侧先要回答：交叉编出来的
+lavapipe（LLVM 23.1.4，iOS arm64）能不能在这块 SDM660 上真的建 instance、建 device、
+编译着色器并把无拷贝导入跑完。
+
+**宿主构建（可复现的输入）。**
+
+- LLVM **23.1.4** 从 `llvmorg-23.1.4` tarball 交叉编到 `CMAKE_SYSTEM_NAME=iOS`、
+  `arm64-apple-ios17.0`、只留 AArch64、静态库。LLVM 的 CMake 用
+  `CMAKE_SYSTEM_NAME MATCHES "Darwin"` 判断平台，iOS 不匹配，误加了 ELF 的
+  `-Wl,-z,defs`/`--gc-sections`；本地补两处（`HandleLLVMOptions.cmake:339`、
+  `AddLLVM.cmake:384`）把 `iOS` 加进条件后 783/783 编完。112 个 `.a` 用
+  `libtool -static` 合成 `libLLVMAll.a`（121 MB），Mesa 的 `llvm-config` 用一个
+  脚本代答（iOS 版 llvm-config 跑不起来）。
+- Mesa **27.0.0-devel**：`meson --cross-file`（clang/clang++ 指向 `xcrun --sdk iphoneos`），
+  只留 `vulkan-drivers=swrast`、`gallium-drivers=llvmpipe`、`platforms=`、`llvm=enabled`、
+  `shared-llvm=disabled`、`cpp_rtti=false`。首次失败是 cross file 缺 `objc`；
+  组件列表少了 `engine`/`coroutines`；最后都补上后配置通过。
+- 构建期还踩了同一个 bash/meson 坑：ninja 用 `/bin/sh`（bash 3.2），它 execve
+  homebrew python 的 shebang 返回 ENOENT，于是把 meson 当 shell 读；用 zsh 包装
+  `~/clover-out/bin/meson` 并改写 `build.ninja` 后继续。
+- 产物 `libvulkan_lvp.dylib`：65 MB，只依赖 iOS 的 `libz/libSystem/libexpat/libc++`
+  （LLVM 已静态进 dylib）；`LC_BUILD_VERSION platform IOS minos 17.0`。
+  给 metal2vulkan 需要的 loader 入口补了三行 `vkGetInstanceProcAddr → vk_icdGetInstanceProcAddr`
+  转发（`clover_loader_entry.c`），4 KiB 页 ad-hoc 签名。
+
+**设备侧一：dylib 加载被沙箱拦下。** 把 dylib 和 selftest 放 Data 卷
+`/private/var/tmp`，trust cache 收进两个 cdhash，payload 冷刷后自测跑到 `mark 6501`
+就报 `LoaderNotFound`。给外壳加 `dlerror` 预检后读数很具体：
+
+```
+r433 stat 0 errno 0 size 56959280
+r433 dlopen 0 msg '... (file system sandbox blocked mmap() of '/private/var/tmp/libvulkan_freedreno.dylib')'
+```
+
+换到 `/private/var/mobile/Media` 也一样被拦；`data` 卷上的文件 mmap 被沙箱禁止，
+只有已被内核映射的主程序本身和系统卷里的库不受限。
+
+**设备侧二：把 lavapipe 静态链进自测，用自身当 loader。** 用 Mesa 的最终链接行
+（`liblavapipe_st` force_load + gallium/llvmpipe/vulkan_util/spirv/nir + `libLLVMAll`）
+把 lavapipe 链进 bridge_smoke，并把 `options.loader` 指向
+`/private/var/tmp/air-native` 自己：dyld 对已加载的主映像直接返回 handle，不再 mmap
+新文件，`dlsym("vkGetInstanceProcAddr")` 命中（`r433 self dlopen 1`、`self dlsym 1`）。
+这次进了 device 创建，但 llvmpipe 自报：
+
+```
+MESA: info: llvmpipe: JIT is not permitted in this process
+... VK_ERROR_OUT_OF_HOST_MEMORY
+```
+
+判据在 `os_misc.c: os_probe_jit_allowed()`：它只试 `MAP_JIT` 的 RWX 映射。这台内核
+的 r430 读数正好相反——RWX 可映射但执行 SIGBUS，**RW→`mprotect(RX)` 可执行**，
+而 LLVM 的 `SectionMemoryManager` 本来就是按这个形状分配的。补丁把探测改成先试
+`MAP_JIT`，失败再试 RW→mprotect(RX)，成功即认为 JIT 可用。
+
+**最终读数（`round433e-v3.log`，boot 保底）。** `mark 6501 → 6505 → 650f` 全到：
+
+```
+code 0 stage 0 compute_bad 0 render_bad 0 import_bad 0 qc 0 kernels 0/0 pairs 0/0 msg ''
+r433 exit 0
+```
+
+设备 `llvmpipe (LLVM 23.1.4, 128 bits)`；与宿主 r432 相同的降级行
+（float tininess、无 `VK_KHR_pipeline_binary`、device denormals/fast-math/native NaN、
+split dispatch、device color conversion、宿主页图像的 shadowed texture）全部出现，
+不改变 `_bad 0`。**Metal 前端 → metal2vulkan → lavapipe 的 compute、render、
+无拷贝 import 在板上的 CPU 上第一次全部正确返回。**
+
+**产物（都在盘上）。**
+
+| 文件 | sha256 | 说明 |
+| --- | --- | --- |
+| `~/clover-out/round433e-v3.log` | `d1a7d5bf…` | 板上 `v3.log` 原样；6501–650f，`code 0 stage 0 … import_bad 0`，`exit 0` |
+| `~/clover-out/round433e-v3-smoke` | `b1f98b6f…` | 91,386,928 B；静态链接 lavapipe 的自测，`_vkGetInstanceProcAddr` 导出，4 KiB ad-hoc（cdhash `1f524a5e…`） |
+| `~/clover-out/round433e-libvulkan_freedreno.dylib` | `ba9fffda…` | 65 MB；带 W^X JIT 探测补丁的 iOS dylib（cdhash `2191337b…`），供下一步装进 OS 卷 |
+| `~/clover-out/round433e-v0.7.145-payload.img` | `051fc8f1…` | 本靴 `cache`；owner trust 含 `air-native` cdhash |
+| `~/clover-out/round433b-v3.log` | `c1021e71…` | 预检：`dlopen` 被沙箱拒绝（`/private/var/tmp`），`LoaderNotFound` |
+| `~/clover-out/round433c-v3.log` | `d3097926…` | 三路径尝试：`tmp` 与 `mobile/Media` 都被 `file system sandbox blocked mmap()` 拒绝 |
+| `~/clover-out/round433d-v3.log` | `249865a4…` | 静态链接 + 自身 dlopen 成功；llvmpipe 报 `JIT is not permitted in this process` |
+
+**判读与下一步。** V3 的语义面（导入）和运行面（JIT）都成立；剩下的不是算法而是**装载位置**：
+
+1. 沙箱只放行“已加载映像”和系统卷的 mmap。要把 `libvulkan_freedreno.dylib`（或把
+   lavapipe 静态链进去的插件）放进 OS 卷的 `/usr/lib`（sheng 的插件也是从 OS 卷里的
+   bundle 加载）。OS 卷在 `round420-userdata-root.img` 的 APFS 容器里，宿主可挂起编辑，
+   写回只需把改动的 1 MiB 块 dd 回 `userdata`；
+2. backboardd 的平台沙箱策略与我们的 pid 1 不同，要在它里面跑还得量一次；
+   若同样拒绝，就走独立 helper + IPC stub（sheng 的 `HostMetalCommandServer` 形状）。
