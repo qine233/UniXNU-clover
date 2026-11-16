@@ -9012,8 +9012,8 @@ def check_board(errors: list) -> str:
     # generation, the title names the image that ran. The reason is a measurement, not a preference: 204
     # archived state rows (211 of 620) end mid-column at the tee's 320-byte line bound, and the columns in the cut part
     # are the ones that say whether the channel is alive.
-    if not board["payload"]["title"].startswith("clover r422:"):
-        errors.append('[payload] title is not "clover r422: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r429:"):
+        errors.append('[payload] title is not "clover r429: ...": the menu would not name this round')
     # The instrument's readings only leave the device if the card-backed ring exists, so the order of
     # the tail calls in sheng_pmgr_run() is part of the contract, not an implementation detail.
     pmgr_source = (REPO / "drivers/CloverPMGR/CloverPMGR.cpp").read_text()
@@ -11167,8 +11167,8 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
     # the early return gets a line so a skipped commit cannot be mistaken for a missing one.
     # Round322: this second title needle rides the r192 block and must agree with the one above --
     # both read board["payload"]["title"], so both must name the round the card will carry.
-    if not board["payload"]["title"].startswith("clover r422:"):
-        errors.append('[payload] title is not "clover r422: ...": the menu would not name this round')
+    if not board["payload"]["title"].startswith("clover r429:"):
+        errors.append('[payload] title is not "clover r429: ...": the menu would not name this round')
     for needle in ("CloverSdhci r192: commit skipped size=%u on=%u (once)\\n",
                    "const bool cacheOn = cacheSize != 0 && cacheCtrlBefore != 0;"):
         if needle not in block_source:
@@ -11413,6 +11413,14 @@ printf 'SERIAL[%s] EXPORT[%s] FB[%s] ADB[%s]\\n' "$SERIAL" \
                 errors.append("the shipped launchd.macho would be refused by the validator's own "
                               "structure rules, so 'cs_blob 85' is not a host replica problem\n"
                               + (check.stdout + check.stderr)[-500:])
+        init_source = REPO / "scripts/clover-el0-init.S"
+        if init_source.is_file():
+            init_text = init_source.read_text()
+            for needle in ("Round429: the JIT gate", "SYS_mprotect", "ic ivau, x24",
+                           "mov x2, #7", "mov x2, #5"):
+                if needle not in init_text:
+                    errors.append(f"clover-el0-init.S lacks {needle[:24]}: the JIT gate would be "
+                                  "named in the round title without being in the program that boots")
     # The step has to sit in the recipe between the AMFI patch and the payload build: normalising
     # first would let the patcher move bytes the identity fields had already hashed, and the shipped
     # image would be its own normalisation's neighbour again.

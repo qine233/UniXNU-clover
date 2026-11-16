@@ -43,6 +43,8 @@
 
 1. **V1 宿主自测**：metal2vulkan runtime + 软件 Vulkan，在 macOS 上渲出 compute/render/import 三步 OK。
 2. **V2 设备 JIT 门**：一个最小 kext 侧/用户态探针，确认受控进程能有可执行映射；记录 errno。
+   **r429 已实现并上膛**：`scripts/clover-el0-init.S` 在 exec 前做 RWX、RW→mprotect(RX) 两种
+   映射并 `blr` 进去，退出码 1010 / 1000+e / 1010+e / 1020+e 就是读数；读回在 boot 212。
 3. **V3 导入门**：软件 Vulkan 的 host-memory 导入接上 IOSurface 语义，采样非黑。
 4. **装配**：按 sheng 的插件 bundle 形状打包 `libvulkan_freedreno.dylib`（换成软件实现），
    ad-hoc 签名 4 KiB 页，进 clover 的 OS 卷（root 认证已按 r138 跳过）。

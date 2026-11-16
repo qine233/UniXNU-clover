@@ -31839,3 +31839,61 @@ clover 目前只有 `CloverGpu` 的寄存器只读探针（`clover-gpu=0`），�
 **结论（本轮定性）**：CPU-only 的“软解顶桌面”阶段已到证据边界——显示通路、输入通路、合成器调度都通，
 卡在 Metal pipeline 创建。下一阶段回 GPU 区：为 Adreno 512 提供 Metal/GL 渲染栈（优先照 santoni 的
 Mesa/IR3 形状，A5xx 同族；sheng 的 A7xx AdrenoMetal 只能作结构参考）。
+
+### §Round429（V2 闸门）：设备上能不能执行刚写下的代码？
+
+**为什么先测这一门。** r427 把黑屏定在 Metal render pipeline 创建返回 nil，r428 选定
+「Metal 前端 → metal2vulkan → CPU 软件 Vulkan」。软件 Vulkan（SwiftShader/lavapipe）是 JIT：
+它必须先 `mmap` 一段可写内存、把生成的指令写进去，再让 CPU 执行。如果本内核在
+`cs_enforcement_disable=1` 下仍拒绝可执行映射，这条路线整族作废，宿主编译再重也没意义。
+所以 V1 之前先做 V2：用我们自己的 init（pid 1）一靴就能读到答案。
+
+**实现。** `scripts/clover-el0-init.S` 在 banner 之后、mach 探针之前加一段探针：
+
+- A：`mmap(0,4096,PROT_READ|WRITE|EXEC,MAP_ANON|PRIVATE,-1,0)`，写入 `ret`（`0xd65f03c0`），
+  `dc cvau` + `ic ivau` + `dsb sy` + `isb`，`blr` 过去；
+- B（A 成功才跑，这是 JIT 更常见的形状）：`mmap(PROT_READ|WRITE)`，写 `ret`，
+  `mprotect(page,4096,PROT_READ|EXEC)`，同样刷缓存后 `blr`。
+
+退出码就是读数（`SYS_exit`；pid 1 退出后内核 panic 文本带 `exit status`）：
+
+| 退出码 | 含义 |
+| --- | --- |
+| 1010 | A 与 B 都成功：RWX mmap、调用、RW→mprotect(RX)、调用都通 |
+| 1000+e | A 的 RWX mmap 被拒，errno=e（B 未跑） |
+| 1010+e | A 通，B 的 RW mmap 被拒，errno=e |
+| 1020+e | A 通，B 的 mprotect(RX) 被拒，errno=e |
+| 内核异常而非状态 | 写进去的指令没能执行（看 ESR/ELR/FAR） |
+
+`dc cvau`/`ic ivau` 在 EL0 是合法的：本树 `osfmk/arm64/proc_reg.h:645` 的
+`SCTLR_EL1_DEFAULT` 含 `SCTLR_UCI_ENABLED`（bit 26）。
+
+**构建与闸门（r429）。** init 重编：`launchd.macho` 35,888 B sha256 `8795865c…`，
+cdhash `e7933bde90c5a42fd7ff331cbbd30e47ec2e3acd`；`build/clover-root/trustcache.bundle`
+随之更新。**踩到一个坑**：`build/clover-trust/trustcache.bundle` 还是 10 月的旧 bundle
+（`7c369ce0…`，owner 模块 cdhash 是 `4f63be63…`），新 init 不在里面；不重跑
+`make-clover-trust-bundle.py` 就直接打 payload，AMFI 会拒绝 exec，探针根本不会跑。
+重跑后 boot trust bundle = `3a33e559…`（owner(1)/static(2478)/system(76)），
+`board.toml [payload] trust_cache_sha256` 同步改。
+
+内核不重建，复用 r426 归一化件 `1b122334…`。payload
+`round429-v0.7.141-payload.img` sha256 `d1ae04c0…`（58,720,256 B），
+`scratch-data.img == signed root`、`kernel.macho.trustcache == published bundle`。
+`verify-clover-payload.py` EXIT=0；`check-clover.py` EXIT=0（ADT 14,384 B、8 cores）。
+两道闸门新增本轮针脚：标题以 `clover r429:` 开头，init 源里必须有
+`Round429: the JIT gate` / `SYS_mprotect` / `ic ivau, x24` / `mov x2, #7` / `mov x2, #5`。
+
+**预登记（boot 212，本轮镜像）。**
+
+- **Q-A**：退出码 **1010** ⇒ JIT 形状成立，继续 V1（宿主把 SwiftShader/lavapipe 塞到
+  `metal2vulkan` 的 `options.loader` 后面，先跑 `nmb_selftest`）。
+- **Q-B**：**1000+e** ⇒ 仅 RWX 被拒；下一支只走 RW→RX（若 B 也未跑，先补 B 的独立退出码）。
+- **Q-C**：**1010+e** ⇒ RW 匿名映射都被拒，先看 errno（12 ENOMEM / 22 EINVAL / 1 EPERM）。
+- **Q-D**：**1020+e** ⇒ `mprotect(PROT_EXEC)` 被拒；JIT 需 MAP_JIT + entitlement 或内核放宽，
+  先查 `vm_map_protect` 里那道门。
+- **Q-E**：内核异常（data/instruction abort）而不是状态 ⇒ 写了但不可执行，按 ESR/ELR 定性。
+- **Q-F**：没有 `initproc failed to start … exit status` 的 panic 文本 ⇒ 先怀疑 payload/trust：
+  确认 `scratch-data.img` 与 trustcache 是上面两枚哈希。
+
+这一靴**故意不进用户态**：init 在 exec 前就退出，panic 文本是唯一产物；读回后下一轮把探针
+摘掉（或挪到独立 boot-arg）再继续。

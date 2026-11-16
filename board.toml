@@ -346,7 +346,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r426: Boot 210 re-ran data migration even though DMLastMigrationResults is success=true (four migrator plugins were watchdogged between t=740 s and t=994 s), so that key is not the gate; the same boot reached a full userland (221 processes at t=939 s) while the panel had only eight presentations, the last at 146 s and all black, and no deadline record landed although the card's kernel rows run to t=1216 s (the deadline check sits after rtclock_intr in the timer handler, and the driver's beats stop at k=1199 s). This round adds offline-hid-poke-uptime=300: three Home presses at t=300 s decide between a device that went to sleep after painting its last black frame (it wakes and presents its lock screen) and a renderer that never presented again (nothing changes)."
+title = "clover r429: Can this kernel run code a userspace process just wrote? The init program now measures that before it execs anything and exits with the answer: 1010 means an RWX mmap and a call into it worked and so did RW then mprotect(RX); 1000+e, 1010+e and 1020+e name the refusing step and its errno. This is the V2 gate of the CPU software-Vulkan route (Metal through metal2vulkan into a software Vulkan): a JIT renderer needs exactly those mappings, so a refusal here closes the whole \"JIT family\" before any host build."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -1179,7 +1179,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # launchd was a MAC label-update refusal on a root whose /sbin/launchd had no cdhash in the
 # 56-byte one-module bundle; scripts/make-clover-trust-bundle.py joins them and pins the
 # originals by the sha256 of their unwrapped IM4P payloads.
-trust_cache_sha256 = ["7c369ce09adb8caf2549454b0cdf1abf43b0fe96a850b694288ee59a9c893950"]
+trust_cache_sha256 = ["3a33e55955289b57fdd375f6cd699c5809baaec905bfb104811aed7319ddd476"]
 kernel_args = [
   "serial=3",
   "debug=0x14e",

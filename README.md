@@ -40,16 +40,16 @@
 | 存储（APFS 卷挂载） | 通 |
 | 用户态（launchd 起的守护进程集） | 通 |
 | 点亮屏幕（GOP 路径首帧） | 通 |
-| SpringBoard / 合成器 | 未到桌面。boot 211：补按 Home 生效（presses 3→6），presentation 8→31 到 345 s，客户端 backboardd（calls=148 fails=19），但每帧仍全黑。**黑屏定因**：`AegirPoster` 崩溃栈落在 `CLKUIMetalQuadView → NUNICalliopeResourceManager`，断言 `pipelineState != nil` 失败（SIGABRT）——Metal render pipeline 创建返回 nil，锁屏时钟/星空渲染器自杀并被反复重启。⇒ 需要 GPU/Metal 渲染栈（参考 santoni 的 Mesa/IR3 A5xx 形状） |
-| 桌面 | 未到（卡在 Metal pipeline 创建；下一步回 GPU 区） |
+| SpringBoard / 合成器 | 未到桌面。boot 211：补按 Home 生效（presses 3→6），presentation 8→31 到 345 s，客户端 backboardd（calls=148 fails=19），但每帧仍全黑。**黑屏定因**：`AegirPoster` 崩溃栈落在 `CLKUIMetalQuadView → NUNICalliopeResourceManager`，断言 `pipelineState != nil` 失败（SIGABRT）——Metal render pipeline 创建返回 nil，锁屏时钟/星空渲染器自杀并被反复重启。路线改为 Metal 前端 → metal2vulkan → CPU 软件 Vulkan；r429 先测它能否成立的前提：设备上 RWX / RW→mprotect(RX) 映射与执行（见下） |
+| 桌面 | 未到（卡在 Metal pipeline 创建）。r429 的 JIT 闸门在 boot 212 读数，1010 才继续 V1 宿主构建 |
 
 ## 闸门
 
 | 闸门 | 最近一次 | 结果 |
 | --- | --- | --- |
-| `check-clover.py` | r426 | 已停用（用户要求；整跑把 Python 驻留推到十几–三十几 GB）；r426 新增的探针针脚与 boot arg 已写进脚本 |
-| `verify-clover-payload.py` | r426 | EXIT=0（51 OK / 0 FAIL） |
-| 源码针脚定点核对 | r422 | 11/11 命中 |
+| `check-clover.py` | r429 | EXIT=0（ADT 14,384 B、8 cores）。整跑仍按用户要求不常开；本轮为标题/探针/trust 哈希改动定点跑 |
+| `verify-clover-payload.py` | r429 | EXIT=0（0 FAIL；scratch-data == signed root，trustcache == published bundle） |
+| 源码针脚定点核对 | r429 | init 里 5 枚 JIT 闸门针脚全中（另 r422 的 11 枚仍按原位） |
 
 ## 已知缺口
 
