@@ -349,7 +349,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r437: the accelerator now counts its clients. r436b showed opens=45 calls=265 sel=0,1,2 with mediaserverd as the first opener, while the panel went black after 342 s with backlight on; this kernel adds by=<name>:<opens> and selc=0,1,2 so the beat separates the render server from the media server and names what each selector is asked. No boot argument, plugin, trust or userdata change."
+title = "clover r439: the accelerator classifies its opens by type. Boot 234 with the publish marker read by=backboardd:45,mediaserverd:36 but calls=0 selc=0,0,0, because the plugin's progress markers are IOServiceOpen calls of type 0x4147<value> (Gpu::mark), not external methods; this kernel counts those as mks/lmk/mkn and keeps backboardd's own sequence bbh=0x6800,0x6801,0x6810+i,0x6802/0x6803, so the next beat names the publish step. No boot argument, plugin, trust or userdata change."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

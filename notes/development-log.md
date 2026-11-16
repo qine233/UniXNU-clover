@@ -32311,3 +32311,76 @@ clover r434: accel pub=1 fail=0 reads=6 rdr=mediaserverd opens=45 cli=mediaserve
 
 **产物：** `round436b-v0.7.150-payload.img`（`9e7ef1d2…`，verify 48 OK / 0 FAIL）、`round436b-window.bin`（623,104 B）、`round436b-boot232-rows.txt`（24 行 accel/dispstate 摘录）。
 
+
+### §Round438 读数（boot 234，publish/clients 标记 + r437 的 `by=`）
+
+**镜像。** 在 `round436-os-window.img` 的 `/System/Library/Extensions/` 下加两个标记文件：
+`NativeAdrenoMetal.publish`（`1\n`）与 `NativeAdrenoMetal.clients`（`*\n`），8 个 1 MiB 块变化，
+克隆 userdata 写回并更新 SHNGROOT 的 OS 摘要（`0730022f…`）与清单尾；
+`round438-userdata-root.img` sha256 `7b9547b7…`（28,378,660,864 B）。
+
+**写盘（TWRP adb）。** `adb push` 直写 `/dev/block/mmcblk0p64`，106.2 MB/s，254.9 s；
+0/22890/24500/26000 MiB 四个抽点与源镜像逐字节同。清 `misc`（mmcblk0p50 前 2048 B）后重启。
+
+**accel 行（boot 234）：**
+
+```
+clover r434: accel pub=1 fail=0 reads=2 rdr=mediaserverd opens=81 cli=backboardd calls=0 sel=0,0,0 by=backboardd:45,mediaserverd:36 selc=0,0,0 ent=1 init=1 dis=0
+```
+
+`by=` 从 875 s 到 1208 s 不变：backboardd **45 次**、mediaserverd **36 次**。沙箱没有拦
+backboardd 的打开（否则不会计入 opens），r436 主判据 A1 的一半在 r438 成立且更强；
+但 `calls=0`、`sel=0,0,0`、`selc=0,0,0`——publish 模式下没有任何 externalMethod 调用。
+
+**仪器缺口（本轮结论）。** `NativeAdrenoUserTest.h` 的 `Gpu::mark` 是
+`IOServiceOpen(port, task, 0x4147<value>, &c)` **打开用户客户端**再关闭，不是 externalMethod；
+窗口里保留的 `CloverAccel r434: user client opened by iconservicesagen type 1095200826`
+就是 `0x4147703a`（0x7Kvv 读数标记）。r437 的 `selc` 只数 selector 0..2，`by=` 又把打点混进普通
+open 计数，所以 publish 模式的进展完全不可见。不是插件没跑，是仪器看不见。
+
+**屏。** `dispstate` 最后 present `tx=625@186s`；`panelbox` 在 905–1208 s 始终
+`lit=82/4100 a0=0 a255=4100 box=314x823..970x1104 lfb=305x811..970x1108`，`lft` 从 156 s 推进到
+488 s（`lfn` 38→66、`pc` 625→2236）；与 boot 207/208 的启动标志形状逐字段相同——屏停在启动标志，
+合成器仍在定时翻同一帧，不是息屏也不是纯黑。SpringBoard（pid 27）持续向 backboardd 的端口发消息；
+iconservicesagent 每次打开加速器后 `sig=11`，在窗口末尾重复出现。全靴到 1215 s 仍在跑；
+之后落 EDL Sahara memory-dump（0x900E），端口复位 + `SAHARA_RESET_REQ` 回 TWRP。
+
+**判读。** 发布分支确实被走到（publish 标记生效），backboardd 与 mediaserverd 都打开了壳；
+壳没有沙箱门问题；下一步不是 Grant 补丁，而是把“发布走到哪一步”变成读数。r439 因此只加仪器。
+
+### §Round439（v0.7.153）：按 open 的 type 分类打点，backboardd 四步序列上拍
+
+**驱动侧（`drivers/CloverAccel/CloverAccel.cpp`）。** `initWithTask` 里对
+`(type & 0xffff0000) == 0x41470000` 的打开计入 `gAccelMarks / gAccelMarkLast / gAccelMarkName`；
+名字为 `backboardd` 的再维护 4 槽序列 `gAccelBBMarks[4]`（满后左移，保留最近四次）。
+新增 `clover_accel_marks()` 与拍上第二行：
+
+```
+clover r439: accelmk mks=<n> lmk=<hhhh> mkn=<name> bbc=<n> bbh=<hhhh>,<hhhh>,<hhhh>,<hhhh>
+```
+
+插件打点的含义（`NativeAdrenoMetalPlugin.mm`）：`0x6800` 进入 publish 分支、`0x6801` 找到 Turnip、
+`0x6810+i` 第 i 个缓存目录即开即用、`0x6802` 设备已造出、`0x6803` 已交回发现链；失败
+`0x68f1` 无 Turnip、`0x68f2` 无设备；`0x6Axx` 是渲染服务器的深帧缓冲/压缩读数位；`0x6Cxx` 是
+pipeline pack 导入；`0x6Exx` 是 framebuffer 分支补丁（arm64e 才有）。
+
+**构建。** prelink `kernel.macho` sha256 `947ec0e7…`；`patch-clover-amfi.py` 两刀 VA
+`0xfffffff004ab40e4`/`0xfffffff004ab416c`（文件偏移 `0x1b0b0e4`/`0x1b0b16c`，代码增长把偏移推后
+0x6000），`round439-kernel-amfi.macho` `42aa884d…`；`normalize-kernel-macho.py` 清零 974 枚戳，
+`round439-kernel-normalized.macho` `f48b586d…`。payload（`--kernel` normalized、
+`--data-ramdisk build/clover-root/launchd.macho`、`--trust-cache build/clover-trust/trustcache.bundle`、
+`--unique-chip-id 81ffcaaa`、`--uefi ~/mu-clover`）`round439-v0.7.153-payload.img` sha256
+`9dc30e09…`。`verify-clover-payload.py` **EXIT=0，51 OK / 0 FAIL**（trustcache 61,480 B
+`5841ec97…`，`trustcache == published bundle OK`、`AMFI exec hook allows OK`、title ok）。
+01:54:36 写 cache（`fastboot flash cache` 1.7 s）并重启，进入 boot 235。
+
+**预登记（boot 235 判据）。**
+- **P-A**：拍上有 `clover r439: accelmk` 行，`mks>0`、`mkn` 为已知进程——证明打点被看见；
+- **P-B**：`bbh` 四槽按插件顺序给出：以 `6800,6801,…` 开头说明 backboardd 真的进了 publish；
+  末项 `6803` ⇒ 设备造出并交回；`68f2` ⇒ 设备没造出（看 `6810+i` 与 lavapipe/Turnip 路径）；
+  `68f1` ⇒ 没找到 Turnip；若 `bbc=0` ⇒ backboardd 根本没加载插件（与 `by=` 的 45 次矛盾时优先信 bbh）；
+- **P-C**：`lmk` 若出现 `703a` 之类 `0x7Kvv` ⇒ 是 `readTask` 的深帧缓冲读数，说明渲染服务器已在
+  读 framebuffer 布局（该分支只在 `__arm64e__` 构建里，iPadOS 17 的 QuartzCore 不该走到，若出现说明
+  插件按 27 形状运行，需回到插件版本）；
+- **P-D**：`panelbox` 是否离开 `lit=82` 启动标志形状（桌面/锁屏才有意义）；
+- **P-E**：死线 1200 s 落回 TWRP（非 EDL memory-dump；若仍 EDL，先 USB 端口复位 + SAHARA reset）。

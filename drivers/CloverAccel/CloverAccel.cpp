@@ -49,6 +49,16 @@ static CloverAccelOpenRow gAccelOpenBy[6];
 static uint32_t gAccelOpenNames;
 static uint32_t gAccelOpenOther;
 static uint32_t gAccelSelCalls[16];
+// Round439: the plugin's progress markers are IOServiceOpen calls of type 0x4147<value>, not
+// external methods (NativeAdrenoUserTest.h Gpu::mark), so r437's selector counters could not see
+// them and every mark landed in the per-name open count. Classify the type instead: the last mark
+// names the step the published device reached, and backboardd's first four marks are its path
+// (0x6800 entered, 0x6801 Turnip found, 0x6810+i cache dir served, 0x6802/0x6803 device made).
+static uint32_t gAccelMarks;
+static uint32_t gAccelMarkLast;
+static char gAccelMarkName[17];
+static uint32_t gAccelBBMarkCount;
+static uint32_t gAccelBBMarks[4];
 
 class AGXDeviceUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(AGXDeviceUserClient)
@@ -88,6 +98,24 @@ bool AGXDeviceUserClient::initWithTask(task_t owningTask, void *securityID, UInt
 			__atomic_store_n(&gAccelOpenNames, slot + 1, __ATOMIC_RELEASE);
 		} else {
 			__atomic_add_fetch(&gAccelOpenOther, 1, __ATOMIC_RELAXED);
+		}
+	}
+	if ((type & 0xffff0000u) == 0x41470000u) {
+		uint32_t value = type & 0xffffu;
+		__atomic_add_fetch(&gAccelMarks, 1, __ATOMIC_RELAXED);
+		__atomic_store_n(&gAccelMarkLast, value, __ATOMIC_RELAXED);
+		strlcpy(gAccelMarkName, name, sizeof(gAccelMarkName));
+		if (!strcmp(name, "backboardd")) {
+			uint32_t count = gAccelBBMarkCount;
+			if (count < (sizeof gAccelBBMarks / sizeof gAccelBBMarks[0])) {
+				gAccelBBMarks[count] = value;
+				__atomic_store_n(&gAccelBBMarkCount, count + 1, __ATOMIC_RELEASE);
+			} else {
+				gAccelBBMarks[0] = gAccelBBMarks[1];
+				gAccelBBMarks[1] = gAccelBBMarks[2];
+				gAccelBBMarks[2] = gAccelBBMarks[3];
+				gAccelBBMarks[3] = value;
+			}
 		}
 	}
 	IOLog("CloverAccel r434: user client opened by %s type %u\n", name, type);
@@ -301,6 +329,21 @@ extern "C" uint32_t clover_accel_selector_calls(uint32_t selector)
 	    ? __atomic_load_n(&gAccelSelCalls[selector], __ATOMIC_RELAXED) : 0;
 }
 
+extern "C" void clover_accel_marks(char *out, uint32_t length)
+{
+	if (!out || !length) {
+		return;
+	}
+	char name[17] = "-";
+	strlcpy(name, gAccelMarkName[0] ? gAccelMarkName : "-", sizeof(name));
+	snprintf(out, length, "mks=%u lmk=%04x mkn=%s bbc=%u bbh=%04x,%04x,%04x,%04x",
+	    (unsigned)__atomic_load_n(&gAccelMarks, __ATOMIC_RELAXED),
+	    (unsigned)__atomic_load_n(&gAccelMarkLast, __ATOMIC_RELAXED), name,
+	    (unsigned)__atomic_load_n(&gAccelBBMarkCount, __ATOMIC_ACQUIRE),
+	    (unsigned)gAccelBBMarks[0], (unsigned)gAccelBBMarks[1],
+	    (unsigned)gAccelBBMarks[2], (unsigned)gAccelBBMarks[3]);
+}
+
 extern "C" void clover_accel_report(void)
 {
 	uint32_t pub = 0, fail = 0, reads = 0, opens = 0, calls = 0, sel[3] = { 0, 0, 0 };
@@ -318,6 +361,15 @@ extern "C" void clover_accel_report(void)
 	    (unsigned)sel[0], (unsigned)sel[1], (unsigned)sel[2], by,
 	    (unsigned)clover_accel_selector_calls(0), (unsigned)clover_accel_selector_calls(1),
 	    (unsigned)clover_accel_selector_calls(2));
+	if (n > 0) {
+		if ((unsigned)n >= sizeof(line)) {
+			n = (int)sizeof(line) - 1;
+		}
+		clover_emmc_probe_say(line, (unsigned)n);
+	}
+	char marks[128];
+	clover_accel_marks(marks, sizeof(marks));
+	n = snprintf(line, sizeof(line), "clover r439: accelmk %s\n", marks);
 	if (n > 0) {
 		if ((unsigned)n >= sizeof(line)) {
 			n = (int)sizeof(line) - 1;
