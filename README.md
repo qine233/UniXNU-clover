@@ -40,8 +40,8 @@
 | 存储（APFS 卷挂载） | 通 |
 | 用户态（launchd 起的守护进程集） | 通 |
 | 点亮屏幕（GOP 路径首帧） | 通 |
-| SpringBoard / 合成器 | 未到桌面。boot 209：迁移 exit 0 后屏首次离开启动标志、全黑，显示客户端 1302 次后停。boot 210：系统 221 进程全在，屏只 8 帧、最后 146 s 全黑，1200 s 死线因 `rtclock_intr` 后检查未执行而没落卡。boot 211（r426 补按 Home 3 次）：`presses` 3→6，presentation 8→31、最后 345 s，客户端是 backboardd（calls=148 fails=19），但每帧仍 `col=ff000000`、`lit=0`、grid 全 0——**合成器提交的就是黑 surface**（r426 读数已落 dev-log）。Data 上的 iOS unified log 已能用 unifiedlog_iterator 离线解（见 memory） |
-| 桌面 | 未到 |
+| SpringBoard / 合成器 | 未到桌面。boot 211：补按 Home 生效（presses 3→6），presentation 8→31 到 345 s，客户端 backboardd（calls=148 fails=19），但每帧仍全黑。**黑屏定因**：`AegirPoster` 崩溃栈落在 `CLKUIMetalQuadView → NUNICalliopeResourceManager`，断言 `pipelineState != nil` 失败（SIGABRT）——Metal render pipeline 创建返回 nil，锁屏时钟/星空渲染器自杀并被反复重启。⇒ 需要 GPU/Metal 渲染栈（参考 santoni 的 Mesa/IR3 A5xx 形状） |
+| 桌面 | 未到（卡在 Metal pipeline 创建；下一步回 GPU 区） |
 
 ## 闸门
 

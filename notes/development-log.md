@@ -31806,3 +31806,35 @@ tracev3（corrupt/incomplete）。改用 Mandiant `macos-UnifiedLogs` v0.7.0 的
 渲染/场景语义，下一支要么修 v0.7.0 的 DSC `uuid_index`/offset 解析，要么在板侧把关键 os_log 行落盘。
 宿主工具与产物：`/tmp/ulog/unifiedlog_iterator-v0.7.0-aarch64-apple-darwin/`、
 `/private/tmp/clover210hq.logarchive`、`/tmp/clover210.jsonl`。
+
+### 黑屏的直接原因（宿主取证）：Metal pipeline 创建返回 nil，锁屏渲染器 assert 自杀
+
+Data 的 `mobile/Library/Logs/CrashReporter/AegirPoster-*.ips`（bug_type 309，6 份，uptime ~1020 s）
+给出完整栈，faulting thread 是 `com.apple.main-thread`：
+
+```
+libsystem_kernel  __pthread_kill
+libsystem_pthread pthread_kill
+libsystem_c       abort
+libsystem_c       __assert_rtn
+NanoUniverse      -[NUNICalliopeResourceManager _generatePipelineVshName:fshName:config:blend0:blend1:pixelFormat0:pixelFormat1:].cold.1
+NanoUniverse      -[NUNICalliopeResourceManager renderOffscreenPipelineForStarfield]
+NanoUniverse      -[NUNICalliopeRenderer _renderOffscreenBackgroundWithRenderEncoder:frameBufferIndex:]
+ClockKitUI        -[CLKUIMetalQuadView _snapshotTextureInRect:scale:time:withAdditionalPasses:]
+ClockKitUI        -[CLKUIMetalQuadView snapshotInRect:scale:time:]
+AegirPoster       …
+```
+
+`exception` 是 `EXC_CRASH / SIGABRT`、`termination` 是 `Abort trap: 6`。共享缓存里这条选择器旁边的
+断言字符串原样是 **`pipelineState != nil`**（`dyld_shared_cache_arm64.35` 偏移 392706）。
+⇒ iOS 侧的 Metal 调用**走到了创建 render pipeline**，`newRenderPipelineStateWithDescriptor:` 返回 nil，
+NUNICalliope（锁屏时钟/星空壁纸）`assert` 失败 → abort；SpringBoard 反复重启它（16:17:03–09 六次）。
+这与 `panelbox` 的读数同向：backboardd 在提交帧，但合成器没有可用的渲染管线，交出来的是黑 surface。
+
+**参考仓的共同点（不是巧合）**：sheng（已进桌面）用 **Adreno740 + AdrenoMetal** 的 GPU 实现；
+santoni（已进 iOS UI）用 **CA/GLES → EAGL → Mesa/IR3 → msm → A505**。两边的 UI 都是真 GPU 路径。
+clover 目前只有 `CloverGpu` 的寄存器只读探针（`clover-gpu=0`），没有 IOAccelerator/Metal 设备。
+
+**结论（本轮定性）**：CPU-only 的“软解顶桌面”阶段已到证据边界——显示通路、输入通路、合成器调度都通，
+卡在 Metal pipeline 创建。下一阶段回 GPU 区：为 Adreno 512 提供 Metal/GL 渲染栈（优先照 santoni 的
+Mesa/IR3 形状，A5xx 同族；sheng 的 A7xx AdrenoMetal 只能作结构参考）。
