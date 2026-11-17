@@ -950,8 +950,10 @@ static void formatPanelColors(char *out,unsigned cap) {
 // beats from the first minutes (where the synthetic taps land) are gone by the time the card is read.
 // Keep the shapes themselves: every distinct lit/box state replaces nothing, and the row printed on
 // each beat carries the last six, so one surviving row answers "what was on screen at 120-300 s".
+// Round444: six slots kept only the newest changes, and by readback the first minutes (where the taps
+// land) had been evicted. Keep 32 and print both ends: `a=` the earliest six, `b=` the latest six.
 struct PanelHistEntry { uint32_t t, lit, x0, y0, x1, y1; };
-static PanelHistEntry gPanelHist[6];
+static PanelHistEntry gPanelHist[32];
 static uint32_t gPanelHistCount;
 static void notePanelHist(uint64_t now) {
     const uint32_t t = (uint32_t)(now / 1000);
@@ -973,19 +975,24 @@ static void notePanelHist(uint64_t now) {
     }
 }
 static void reportPanelHist(void) {
-    char hist[192];
-    size_t used = 0;
-    int n = snprintf(hist, sizeof hist, "clover r443: panelhist n=%u", (unsigned)gPanelHistCount);
-    if (n < 0) return;
-    used = (size_t)n;
-    for (uint32_t i = 0; i < gPanelHistCount && used < sizeof hist; i++) {
-        n = snprintf(hist + used, sizeof hist - used, " %u:%x:%x,%x,%x,%x", (unsigned)gPanelHist[i].t,
-            (unsigned)gPanelHist[i].lit, (unsigned)gPanelHist[i].x0, (unsigned)gPanelHist[i].y0,
-            (unsigned)gPanelHist[i].x1, (unsigned)gPanelHist[i].y1);
-        if (n <= 0 || used + (size_t)n >= sizeof hist) break;
-        used += (size_t)n;
+    const uint32_t count = gPanelHistCount;
+    for (uint32_t part = 0; part < 2; part++) {
+        if (part == 1 && count <= 6) break;
+        const uint32_t start = part == 0 ? 0 : count - 6;
+        const uint32_t end = part == 0 ? (count < 6 ? count : 6) : count;
+        char hist[192];
+        int n = snprintf(hist, sizeof hist, "clover r444: panelhist %c= n=%u", part == 0 ? 'a' : 'b', (unsigned)count);
+        if (n < 0) return;
+        size_t used = (size_t)n;
+        for (uint32_t i = start; i < end && used < sizeof hist; i++) {
+            n = snprintf(hist + used, sizeof hist - used, " %u:%x:%x,%x,%x,%x", (unsigned)gPanelHist[i].t,
+                (unsigned)gPanelHist[i].lit, (unsigned)gPanelHist[i].x0, (unsigned)gPanelHist[i].y0,
+                (unsigned)gPanelHist[i].x1, (unsigned)gPanelHist[i].y1);
+            if (n <= 0 || used + (size_t)n >= sizeof hist) break;
+            used += (size_t)n;
+        }
+        IOLog("%s\n", hist);
     }
-    IOLog("%s\n", hist);
 }
 // The second half of the state beat. `fires=` is dispstateFires, the same ordinal the state row prints, so the
 // two rows of one beat are joinable on the card without a timestamp guess.

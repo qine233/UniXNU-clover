@@ -349,7 +349,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r443: the display beat carries its own shape history. Boot 238 spent all 12 taps and raised presentations to tx=69@295s, but the 512-line ring had already wrapped past the 120-300 s beats by readback time. Each beat now appends one compact record (t, lit, box) whenever the panel shape changes and prints the last six on a clover r443: panelhist row, so any surviving row answers what the first minutes looked like. The tap point and budget are unchanged from r442."
+title = "clover r444: the shape history prints both ends. Boot 239's panelhist kept only the newest six changes (full-panel content at 478-568 s, hello at 603-638 s, empty at 954 s), so the beats where the taps landed had been evicted. The history is 32 slots now and each beat prints two rows: panelhist a= the earliest six, panelhist b= the latest six, same row width. Tap point and budget unchanged."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

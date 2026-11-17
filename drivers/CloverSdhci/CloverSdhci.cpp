@@ -1373,6 +1373,8 @@ static TeeProbeClass kTeeProbeClasses[] = {
     // Round443. The shape history: six compact samples of (t, lit, box) on every beat, so a row that
     // survives a wrapped ring still says what the first minutes looked like. Sixty beats at most.
   { "clover r443: panelhist", "r443-panelhist", 96, 0, 0, 0 },
+    // Round444 splits the history into its two ends (`a=` earliest, `b=` latest), two rows per beat.
+  { "clover r444: panelhist", "r444-panelhist", 128, 0, 0, 0 },
   { "clover r414: panelcut", "r414-panelcut", 8, 0, 0, 0 },
   { "clover r414: panel", "r414-panel", 96, 0, 0, 0 },
 
