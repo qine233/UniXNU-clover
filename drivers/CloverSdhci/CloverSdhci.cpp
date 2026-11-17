@@ -1375,6 +1375,8 @@ static TeeProbeClass kTeeProbeClasses[] = {
   { "clover r443: panelhist", "r443-panelhist", 96, 0, 0, 0 },
     // Round444 splits the history into its two ends (`a=` earliest, `b=` latest), two rows per beat.
   { "clover r444: panelhist", "r444-panelhist", 128, 0, 0, 0 },
+    // Round445 prints five rows per beat (ends plus the middle in thirds), so 5 x 60 = 300.
+  { "clover r445: panelhist", "r445-panelhist", 320, 0, 0, 0 },
   { "clover r414: panelcut", "r414-panelcut", 8, 0, 0, 0 },
   { "clover r414: panel", "r414-panel", 96, 0, 0, 0 },
 

@@ -75,6 +75,11 @@ volatile uint32_t clover_hid_published, clover_hid_property_seen, clover_hid_pre
 volatile uint32_t clover_hid_sink_touch, clover_hid_sink_buttons;
 volatile uint32_t clover_hid_touch_frames;
 static volatile uint32_t gTapBudget;
+// Round445: boot 240 spent all twelve taps between 120 s and 360 s, while the panel was still the
+// console's text and the compositor's first paint came ~250 s later (boot 239 painted hello at 603 s).
+// `offline-hid-tap-after=<s>` holds the taps until that uptime, so the finger lands on the screen the
+// Setup Assistant is actually showing.
+static volatile uint32_t gTapAfter;
 }
 
 // The driver asks this before it sends anything, so a device that exists before the panel does
@@ -326,8 +331,12 @@ extern "C" __attribute__((noinline)) void native_hid_live_checkpoint(IOService *
             if (PE_parse_boot_argn("offline-hid-tap-y", &y, sizeof(y)) && y && y <= 20320) gTapY = y;
             unsigned burst = 0;
             if (PE_parse_boot_argn("offline-hid-tap-burst", &burst, sizeof(burst)) && burst > 0 && burst <= 8) gTapBurst = burst;
+            unsigned after = 0;
+            if (PE_parse_boot_argn("offline-hid-tap-after", &after, sizeof(after))) gTapAfter = after;
         }
-        if (gTouchSink != nullptr && lastService != 0 && gTapBudget != 0) {
+        const uint64_t tapUptime = frequency ? now / frequency : 0;
+        if (gTouchSink != nullptr && lastService != 0 && gTapBudget != 0 &&
+            tapUptime >= (uint64_t)__atomic_load_n(&gTapAfter, __ATOMIC_RELAXED)) {
             for (uint32_t i = 0; i < gTapBurst && gTapBudget != 0; i++) {
                 __atomic_sub_fetch(&gTapBudget, 1, __ATOMIC_RELAXED);
                 publishTouchFrame(1);
@@ -352,9 +361,11 @@ extern "C" __attribute__((noinline)) void native_hid_live_checkpoint(IOService *
                clover_hid_touch_frames, native_touch_hid_reports,
                clover_hid_sink_touch, clover_hid_sink_buttons, native_legacy_transfer_calls);
         if (gTapBudget != 0 || clover_hid_touch_frames != 0) {
-            printf("clover r435: tap budget=%u frames=%u reports=%u\n",
+            printf("clover r435: tap budget=%u frames=%u reports=%u after=%u t=%llu\n",
                    (unsigned)gTapBudget, (unsigned)clover_hid_touch_frames,
-                   (unsigned)native_touch_hid_reports);
+                   (unsigned)native_touch_hid_reports,
+                   (unsigned)__atomic_load_n(&gTapAfter, __ATOMIC_RELAXED),
+                   (unsigned long long)(frequency ? now / frequency : 0));
         }
         // Round260, and it is the whole point of this line: the touch bus instrument has its answer
         // sixteen minutes into the boot and the card ring has forgotten it by the time anyone reads

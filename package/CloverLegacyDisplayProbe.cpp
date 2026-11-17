@@ -974,14 +974,39 @@ static void notePanelHist(uint64_t now) {
         gPanelHist[gPanelHistCount - 1] = entry;
     }
 }
+// Round445: the two ends left the middle of a 27-entry history unreadable on boot 240, which is
+// exactly where the taps land. Print the ends and split everything between them into three rows:
+// a= first six, 1=/2=/3= the middle in thirds, b= last six. Five rows a beat, six entries a row.
 static void reportPanelHist(void) {
     const uint32_t count = gPanelHistCount;
-    for (uint32_t part = 0; part < 2; part++) {
-        if (part == 1 && count <= 6) break;
-        const uint32_t start = part == 0 ? 0 : count - 6;
-        const uint32_t end = part == 0 ? (count < 6 ? count : 6) : count;
+    if (!count) {
+        return;
+    }
+    for (uint32_t part = 0; part < 5; part++) {
+        uint32_t start, end;
+        char label;
+        if (part == 0) {
+            start = 0;
+            end = count < 6 ? count : 6;
+            label = 'a';
+        } else if (part == 4) {
+            start = count > 6 ? count - 6 : 0;
+            end = count;
+            label = 'b';
+        } else {
+            if (count <= 12) {
+                continue;
+            }
+            const uint32_t middle = count - 12;
+            start = 6 + middle * (part - 1) / 3;
+            end = 6 + middle * part / 3;
+            label = (char)('0' + part);
+        }
+        if (start >= end) {
+            continue;
+        }
         char hist[192];
-        int n = snprintf(hist, sizeof hist, "clover r444: panelhist %c= n=%u", part == 0 ? 'a' : 'b', (unsigned)count);
+        int n = snprintf(hist, sizeof hist, "clover r445: panelhist %c= n=%u", label, (unsigned)count);
         if (n < 0) return;
         size_t used = (size_t)n;
         for (uint32_t i = start; i < end && used < sizeof hist; i++) {

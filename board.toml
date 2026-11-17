@@ -349,7 +349,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r444: the shape history prints both ends. Boot 239's panelhist kept only the newest six changes (full-panel content at 478-568 s, hello at 603-638 s, empty at 954 s), so the beats where the taps landed had been evicted. The history is 32 slots now and each beat prints two rows: panelhist a= the earliest six, panelhist b= the latest six, same row width. Tap point and budget unchanged."
+title = "clover r445: the accelerator grants the hand-off open, and the taps wait for the screen. Boot 240 streamed \"P0 ee00002e2\": the plugin's 0x4148 hand-off open was refused at is_io_service_open_extended's sandbox gate, because the shell published no NativeSandboxGrantProcess; it now names sheng's four processes and counts the hand-off opens (grant=/ho= on the accel row). The shape history prints five rows a beat (ends plus the middle in thirds). Taps start at 480 s (offline-hid-tap-after), burst 2, because boot 240 spent all twelve between 120 and 360 s while the panel was still console text."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,
@@ -2459,7 +2459,8 @@ kernel_args = [
   "offline-hid-tap=12",
   "offline-hid-tap-x=26670",
   "offline-hid-tap-y=18838",
-  "offline-hid-tap-burst=4",
+  "offline-hid-tap-burst=2",
+  "offline-hid-tap-after=480",
   # Round426. Boot 210 reached a full userland (221 processes at t=939 s) but the display had only
   # eight presentations, the last at 146 s and all black -- the shape of a device that painted its
   # last frame and then went to sleep. Three presses starting at this uptime say which it is: a

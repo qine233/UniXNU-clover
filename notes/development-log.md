@@ -32603,3 +32603,50 @@ T-B 因此“形状变化”成立，但**点击窗口（120–480 s）的样本
   不同 ⇒ 点击后页面确实换过；若从第一拍起就是 hello，则点击未被采用；
 - **U-C**：`b=` 末尾是否出现空面（`lit=0`，box `ffff`）；
 - **U-D**：死线 1200 s 落点按既有手法回收。
+
+### §Round444 读数（boot 240，v0.7.161、窗口 `round444-boot240-window.bin` d80abe19）
+
+```
+clover r444: panelhist a= n=27 48482:241:0,5,4a8,77b 78492:22f:0,5,4a4,77b 108502:25b:0,3,4a4,77b
+                                 138512:1d5:0,3,4ae,77b 168524:1f7:0,4,4a4,77b 198536:231:0,6,4a6,77b
+clover r444: panelhist b= n=27 694982:1e8:0,2,4a4,77b 724993:1fe:0,2,4a4,77b 758568:1f0:0,3,4a8,77b
+                                 793522:1f6:0,2,4a4,77b 823534:217:0,7,4ae,77b 853538:0:ffff,ffff,ffff,ffff
+clover r435: tap budget=4 frames=1 reports=66      → budget=0 frames=1 reports=74
+clover r434: accel … opens=42 cli=backboardd calls=0 selc=0,0,0
+clover r439: accelmk mks=26 lmk=6803 mkn=backboardd bbh=6a38,6814,6802,6803
+clover r440: acceltxt stc=4 sth=6801,6814,6802,6803 bbtxt=P0 ee00002e2
+```
+
+`panelbox` 只剩 916–1202 s 的 11 行，全 `lit=0 a0=4100 box=-`（早期行已被 512 行的环吃掉）。
+
+**判读。**
+- **U-A 成立**：两行都在，`a=` 覆盖 48–198 s。
+- **U-B 部分不可判，已见段否定"点击生效"**：`a=` 只到 198 s；240/360/480 s 的点击拍落在没有打印的中段。已见的 48–198 s 全是**整屏内容**（`lit` 469–603，box 覆盖 0,3..0x4a4,0x77b），与 boot 239 的 hello（`lit` 74–82，box 314,823..970,1104）不同；`b=` 的 695–823 s 仍是整屏（`lit` 488–535）。点击行显示十二击在 120–360 s 就花完（budget 12→4→0，reports 66→74），那时屏还是整屏内容，hello 尚未出现。
+- **U-C 成立**：`b=` 末尾 853.5 s 出现空面（`lit=0`、box `ffff`），比 boot 239 的 954 s 早约 100 s。
+- **U-D 成立**：1200 s 死线落 Sahara memory-dump（0x900E），USB 端口复位 + `CLOVER_SAHARA_RESET=1 edl.py reset` 回收进 TWRP。
+
+**新读数：`bbtxt=P0 ee00002e2`。** `NativeMetalBridgePhase.h:106` 的 `P0 e%x` 是
+`serveScanout` 打开加速器 hand-off 连接（type `0x4148`）的返回值：`0xe00002e2` =
+`kIOReturnNotPermitted`，由 `is_io_service_open_extended` 的沙箱门
+（`.cache/xnu-work/iokit/Kernel/IOUserClient.cpp:4763`）在 `newUserClient` 之前返回。
+`native_sandbox_grant()` 认服务属性 `NativeSandboxGrantProcess`；sheng 的
+`GpuPowerProbe.cpp:1245` 在加速器上写 `backboardd,iconservicesagent,WidgetRenderer_Default,PosterBoard`。
+我们的壳从未设这个属性——`0x4147` 的打点打开能过，真正要用的 `0x4148` 被拒。
+
+### §Round445（v0.7.163）：给 hand-off 打开授权，并把点击等到屏上
+
+**做法。**
+1. `IOAcceleratorES::start` 设 `NativeSandboxGrantProcess`（sheng 的四个进程名）；
+   `grant=` 为发布时自证，`ho=` 数到达 `newUserClient` 的 `0x4148` 打开（此前恒 0）。
+2. `panelhist` 改五行：`a=` 最早六条、`1=/2=/3=` 中段三等分、`b=` 最新六条，
+   27 条历史全部可读；tee 类 `r445-panelhist` 预算 320。
+3. 点击加 `offline-hid-tap-after` 门（本轮 480 s；`burst=2`，预算 12），
+   boot 240 的十二击全花在整屏内容的早期，这轮让手指落在 Setup 真出来的时段；
+   点击行带 `after= t=` 自证。
+
+**预登记（boot 241）。**
+- **V-A**：accel 行 `grant=1` 且 `ho≥1`——hand-off 打开到达我们的 `newUserClient`；
+- **V-B**：`acceltxt` 不再出现 `P0`；若仍是 `P0`，记下返回值，说明授权名与实际进程不符；
+- **V-C**：`panelbox` 的 `lft` 是否越过 250 s、`tx` 是否继续增长（scanout 开始供帧）；
+- **V-D**：点击行 `after=480`，且 `a/1/2/3/b` 五行里 480 s 之后的形状与 198 s 前不同；
+- **V-E**：死线 1200 s 落点按既有手法回收。

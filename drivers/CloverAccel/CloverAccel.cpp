@@ -68,6 +68,13 @@ static uint32_t gAccelBBMarks[4];
 static uint32_t gAccelBBStageCount;
 static uint32_t gAccelBBStages[4];
 static char gAccelBBText[64];
+// Round445: the plugin's scanout hand-off opens type 0x4148, and boot 240 streamed "P0 ee00002e2" --
+// kIOReturnNotPermitted from is_io_service_open_extended's sandbox gate (XNU IOUserClient.cpp:4763),
+// which the native driver answers by naming its grant processes in NativeSandboxGrantProcess. The
+// shell published no such property, so the render server's real open never reached newUserClient.
+// gAccelGrant is the publish-time self-proof; gAccelHandoff counts 0x4148 opens that reach us now.
+static uint32_t gAccelGrant;
+static volatile uint32_t gAccelHandoff;
 
 class AGXDeviceUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(AGXDeviceUserClient)
@@ -110,6 +117,9 @@ bool AGXDeviceUserClient::initWithTask(task_t owningTask, void *securityID, UInt
 		} else {
 			__atomic_add_fetch(&gAccelOpenOther, 1, __ATOMIC_RELAXED);
 		}
+	}
+	if (type == 0x4148u) {
+		__atomic_add_fetch(&gAccelHandoff, 1, __ATOMIC_RELAXED);
 	}
 	if ((type & 0xffff0000u) == 0x41470000u) {
 		uint32_t value = type & 0xffffu;
@@ -217,6 +227,11 @@ bool IOAcceleratorES::start(IOService *provider)
 	setProperty(kIOUserClientClassKey, "AGXDeviceUserClient");
 	setProperty("MetalPluginName", "NativeAdrenoMetal");
 	setProperty("IOAcceleratorStub", kOSBooleanTrue);
+	// Round445: the same list sheng's GpuPowerProbe names. Without it the hand-off open below was
+	// refused by the sandbox gate, and the plugin streamed "P0 ee00002e2" (kIOReturnNotPermitted).
+	setProperty("NativeSandboxGrantProcess",
+	    "backboardd,iconservicesagent,WidgetRenderer_Default,PosterBoard");
+	__atomic_store_n(&gAccelGrant, 1, __ATOMIC_RELEASE);
 	registerService();
 	IOLog("CloverAccel r434: IOAcceleratorES published, MetalPluginName NativeAdrenoMetal\n");
 	return true;
@@ -399,12 +414,14 @@ extern "C" void clover_accel_report(void)
 	    client, sizeof(client), sel, &entries, &inited, &disabled);
 	clover_accel_clients(by, sizeof(by));
 	int n = snprintf(line, sizeof(line),
-	    "clover r434: accel pub=%u fail=%u ent=%u init=%u dis=%u reads=%u rdr=%s opens=%u cli=%s calls=%u sel=%u,%u,%u by=%s selc=%u,%u,%u\n",
+	    "clover r434: accel pub=%u fail=%u ent=%u init=%u dis=%u reads=%u rdr=%s opens=%u cli=%s calls=%u sel=%u,%u,%u by=%s selc=%u,%u,%u grant=%u ho=%u\n",
 	    (unsigned)pub, (unsigned)fail, (unsigned)entries, (unsigned)inited, (unsigned)disabled,
 	    (unsigned)reads, reader, (unsigned)opens, client, (unsigned)calls,
 	    (unsigned)sel[0], (unsigned)sel[1], (unsigned)sel[2], by,
 	    (unsigned)clover_accel_selector_calls(0), (unsigned)clover_accel_selector_calls(1),
-	    (unsigned)clover_accel_selector_calls(2));
+	    (unsigned)clover_accel_selector_calls(2),
+	    (unsigned)__atomic_load_n(&gAccelGrant, __ATOMIC_ACQUIRE),
+	    (unsigned)__atomic_load_n(&gAccelHandoff, __ATOMIC_ACQUIRE));
 	if (n > 0) {
 		if ((unsigned)n >= sizeof(line)) {
 			n = (int)sizeof(line) - 1;
