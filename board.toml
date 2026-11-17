@@ -349,7 +349,7 @@ loader = "firmware"
 # but the colours -- black plus sparse white -- cannot say what is painted. The grid row carries the lit
 # density as 16x15 hex cells so the shape is readable; the panelbox lf* columns stop being zeroed after
 # every copy, and one frame in 64 keeps being scanned after the opening budget.
-title = "clover r442: the synthetic tap moves where the UI needs it. Boot 237 proved the JIT-fallback library creates the Metal device in backboardd (sth=6801,6814,6802,6803); the compositor then presented alpha-255 frames to 213 s and stopped at 280 s with an empty surface. This round gives the tap generator a point (offline-hid-tap-x/-y, driver axes 30480x20320) and a burst count per 120 s beat, and sets it on Setup's bottom-right Continue (26670,18838), 4 taps per beat, 12 in all, to see whether the first screen advances now that rendering works."
+title = "clover r443: the display beat carries its own shape history. Boot 238 spent all 12 taps and raised presentations to tx=69@295s, but the 512-line ring had already wrapped past the 120-300 s beats by readback time. Each beat now appends one compact record (t, lit, box) whenever the panel shape changes and prints the last six on a clover r443: panelhist row, so any surviving row answers what the first minutes looked like. The tap point and budget are unchanged from r442."
 # The round below still stands as written: round289 changed no configuration key and added no boot
 # arg; its kernel half is patches/xnu-clover/zzzz...z-clover-r289.patch copied into
 # ~/UniXNU/patches/xnu/, its driver half is the r289-abt tee class with the per-pass cap exemption,

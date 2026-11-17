@@ -32544,3 +32544,30 @@ r442 是 `tx=69@295s`——点击多带来 37 帧 presentation，说明输入引
 
 **下一支（r443）**：把早期 `panelbox` 留在环里（收紧 tee 类别或给显示拍单独配额），并在点击后
 读出 120–300 s 段的屏幕形状，判断 Setup 是否翻页；若翻页，继续用坐标扫按钮，否则改点中心/翻转 y。
+
+### §Round443（v0.7.159）：显示拍自带形状历史
+
+**为什么。** boot 238 点击全部发放（`reports 66→74`）、presentation 从 `tx=32@280s` 涨到
+`tx=69@295s`，但 512 槽内核环在 ~928 s 前就已被 exit/sbown 等噪声翻页，120–300 s 的 `panelbox`
+根本留不到读回。
+
+**做法（`package/CloverLegacyDisplayProbe.cpp`）。** 每拍把 `(t, lit, box)` 与上一次比较，不同则
+追加进 6 槽历史（满则左移）；每拍打印一行
+
+```
+clover r443: panelhist n=<k> <t>:<lit>:<x0>,<y0>,<x1>,<y1> ...
+```
+
+坐标用十六进制。这样任何一条在环上活下来的拍行都带着最近六个**不同的**屏幕形状，覆盖点击前后。
+`CloverSdhci.cpp` 的 tee 类别表加 `r443-panelhist`（96 预算），与 panelbox 独立。
+
+**构建。** prelink `963355dd…`；AMFI `99d700fb…`；normalized `38515cc3…`；
+payload `round443-v0.7.159-payload.img` `7d4e0da7…`，verify **EXIT=0，51 OK / 0 FAIL**。
+08:05:43 写 cache，boot 239。
+
+**预登记（boot 239）。**
+- **T-A**：出现 `clover r443: panelhist` 行，`n>0`；
+- **T-B**：历史里在 120–300 s 段是否出现与 hello 不同的形状（新 `lit`/`box`）。若出现 ⇒ 点击翻页、
+  渲染链路完整；若六个样本全是 hello 或空面 ⇒ HID 点击未被 Setup 采纳（改点中心/翻转 y/改用键盘导航）；
+- **T-C**：`sth` 仍以 `6802,6803` 收尾；
+- **T-D**：死线 1200 s 落点，按既有手法回收（EDL memory-dump 需端口复位 + SAHARA reset）。

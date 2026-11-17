@@ -946,6 +946,47 @@ static void formatPanelColors(char *out,unsigned cap) {
         at+=static_cast<unsigned>(written);
     }
 }
+// Round443: the kernel ring keeps 512 lines and exits/sbown fill it long before a late readback, so the
+// beats from the first minutes (where the synthetic taps land) are gone by the time the card is read.
+// Keep the shapes themselves: every distinct lit/box state replaces nothing, and the row printed on
+// each beat carries the last six, so one surviving row answers "what was on screen at 120-300 s".
+struct PanelHistEntry { uint32_t t, lit, x0, y0, x1, y1; };
+static PanelHistEntry gPanelHist[6];
+static uint32_t gPanelHistCount;
+static void notePanelHist(uint64_t now) {
+    const uint32_t t = (uint32_t)(now / 1000);
+    const uint32_t lit = (uint32_t)native_legacy_screen_lit;
+    const uint32_t x0 = native_legacy_screen_box_seen ? (uint32_t)native_legacy_screen_box[0] : 0xffffu;
+    const uint32_t y0 = native_legacy_screen_box_seen ? (uint32_t)native_legacy_screen_box[1] : 0xffffu;
+    const uint32_t x1 = native_legacy_screen_box_seen ? (uint32_t)native_legacy_screen_box[2] : 0xffffu;
+    const uint32_t y1 = native_legacy_screen_box_seen ? (uint32_t)native_legacy_screen_box[3] : 0xffffu;
+    if (gPanelHistCount) {
+        const PanelHistEntry &last = gPanelHist[gPanelHistCount - 1];
+        if (last.lit == lit && last.x0 == x0 && last.y0 == y0 && last.x1 == x1 && last.y1 == y1) return;
+    }
+    PanelHistEntry entry = {t, lit, x0, y0, x1, y1};
+    if (gPanelHistCount < sizeof gPanelHist / sizeof gPanelHist[0]) {
+        gPanelHist[gPanelHistCount++] = entry;
+    } else {
+        for (uint32_t i = 1; i < gPanelHistCount; i++) gPanelHist[i - 1] = gPanelHist[i];
+        gPanelHist[gPanelHistCount - 1] = entry;
+    }
+}
+static void reportPanelHist(void) {
+    char hist[192];
+    size_t used = 0;
+    int n = snprintf(hist, sizeof hist, "clover r443: panelhist n=%u", (unsigned)gPanelHistCount);
+    if (n < 0) return;
+    used = (size_t)n;
+    for (uint32_t i = 0; i < gPanelHistCount && used < sizeof hist; i++) {
+        n = snprintf(hist + used, sizeof hist - used, " %u:%x:%x,%x,%x,%x", (unsigned)gPanelHist[i].t,
+            (unsigned)gPanelHist[i].lit, (unsigned)gPanelHist[i].x0, (unsigned)gPanelHist[i].y0,
+            (unsigned)gPanelHist[i].x1, (unsigned)gPanelHist[i].y1);
+        if (n <= 0 || used + (size_t)n >= sizeof hist) break;
+        used += (size_t)n;
+    }
+    IOLog("%s\n", hist);
+}
 // The second half of the state beat. `fires=` is dispstateFires, the same ordinal the state row prints, so the
 // two rows of one beat are joinable on the card without a timestamp guess.
 static void reportPanelState(uint64_t now) {
@@ -1004,6 +1045,8 @@ static void reportPanelState(uint64_t now) {
     } else {
         IOLog("%s",boxRow);
     }
+    notePanelHist(now);
+    reportPanelHist();
     /*
      * Round422's third row of this beat. col= says the panel is mostly black with sparse white; it cannot
      * say whether that is a centered blob, a top band, a dot matrix or text. g= is the sample pass's lit
